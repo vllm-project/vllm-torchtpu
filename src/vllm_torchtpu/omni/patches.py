@@ -204,6 +204,9 @@ def _patch_wan_ffn_gelu_fence() -> None:
     logger.info("Applied TPU patch: fusion fence after Wan FFN GELU.")
 
 
+_D2H_STREAM_PATCHED = "_tpu_d2h_stream_patched"
+
+
 def _patch_diffusion_worker_d2h_stream() -> None:
     # -------------------------------------------------------------------------
     # TODO: Remove once vLLM-Omni creates the D2H stream of
@@ -226,19 +229,19 @@ def _patch_diffusion_worker_d2h_stream() -> None:
     # -------------------------------------------------------------------------
     from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
 
-    if hasattr(WorkerProc, "_tpu_orig_async_output_loop"):
-        return
     orig_async_output_loop = getattr(WorkerProc, "_async_output_loop", None)
     if orig_async_output_loop is None:
         logger.warning(
             "Skipping TPU patch: vLLM-Omni WorkerProc has no _async_output_loop."
         )
         return
-    WorkerProc._tpu_orig_async_output_loop = orig_async_output_loop
+    if getattr(orig_async_output_loop, _D2H_STREAM_PATCHED, False):
+        return
 
     def _tpu_async_output_loop(self: Any) -> None:
         orig_async_output_loop(_CurrentDeviceWorkerProxy(self))
 
+    setattr(_tpu_async_output_loop, _D2H_STREAM_PATCHED, True)
     WorkerProc._async_output_loop = _tpu_async_output_loop
     logger.info("Applied TPU patch: diffusion D2H stream on the current device.")
 
