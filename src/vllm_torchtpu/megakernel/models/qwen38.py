@@ -62,7 +62,8 @@ class Qwen38InnerGeometry(Qwen35Geometry):
 
     def check(self, ex: ExecSpec) -> None:
         R, B, T, M = ex.R, ex.B, ex.T, ex.M
-        assert self.L % self.att_every == 0 and self.NH % R == 0 and R % self.NKV == 0
+        assert self.att_every > self.L or self.L % self.att_every == 0
+        assert self.NH % R == 0 and R % self.NKV == 0
         assert self.E % R == 0 and B * self.TOPK <= 640 and 1 <= B <= M <= 64
         assert self.E % 128 == 0 and self.E <= 1024 and (R & (R - 1)) == 0
         assert T >= 1 and B % T == 0, (B, T)
@@ -110,14 +111,15 @@ class Qwen38Geometry:
         """Shared-expert width padded so each rank's slice is a 128 multiple."""
         return rup(self.IS, 128 * R)
 
-    def inner(self, R: int, L: int = SEGMENT_LAYERS) -> Qwen35Geometry:
+    def inner(self, R: int, L: int = SEGMENT_LAYERS, head: bool = False) -> Qwen35Geometry:
         """Sublayer geometry seen by the GDN / MoE / o_proj blocks.
 
-        A one-layer (tail) segment has no GDN layer: `att_every=1`.
+        A one-layer (tail) segment has no GDN layer (`att_every=1`); a head
+        segment is all GDN layers (`att_every = L + 1`, so `NGDN = L`).
         """
         return Qwen38InnerGeometry(
             L=L,
-            att_every=self.att_every if L > 1 else 1,
+            att_every=L + 1 if head else (self.att_every if L > 1 else 1),
             H=self.H,
             NH=self.NH,
             NKV=self.NKV,
@@ -179,15 +181,23 @@ class Qwen38MoE(MoEBlock):
         return dataclasses.replace(mp, H=g.H, CH=ch)
 
 
-def segment_spec(g: Qwen38Geometry, R: int, *, L: int = SEGMENT_LAYERS) -> ModelSpec:
-    """`ModelSpec` of one segment kernel (`L` kernel layers, QSA o_proj first)."""
-    gi = g.inner(R, L)
+def segment_spec(
+    g: Qwen38Geometry, R: int, *, L: int = SEGMENT_LAYERS, head: bool = False
+) -> ModelSpec:
+    """`ModelSpec` of one segment kernel (`L` kernel layers, QSA o_proj first).
+
+    `head=True`: `L` linear-attention layers and no QSA output projection (the
+    layers before the first QSA layer).
+    """
+    gi = g.inner(R, L, head)
     hc = dict(inner_geometry=gi, nhc=g.NHC, lowrank=g.LOWRANK)
     qsa = HCSublayer(QSAOutBlock(), mix=False, ar_slot=0, **hc)
     moe = HCSublayer(
         Qwen38MoE(geometry=gi, moe_tp=False), ar_slot=1, emit_residual=True, **hc
     )
-    if L == 1:
+    if head:
+        mixer: Any = HCSublayer(Qwen38GDN(geometry=gi), ar_slot=0, **hc)
+    elif L == 1:
         mixer: Any = qsa
     else:
         gdn = HCSublayer(Qwen38GDN(geometry=gi), ar_slot=0, **hc)

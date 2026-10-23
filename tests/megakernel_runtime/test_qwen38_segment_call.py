@@ -64,16 +64,17 @@ _spec = importlib.util.spec_from_file_location(
 _gst = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_gst)
 
-R, L, NS = 2, 4, 2
+import pytest  # noqa: E402
+
+R, NS = 2, 2
 B = NS * T_VERIFY
-NL = L - 1
-NMB = 1 + NL * NS * T_VERIFY  # block 0 = null
+NMB = 1 + 3 * NS * T_VERIFY  # block 0 = null; up to 3 GDN layers
 POOL_SHAPE = (NMB * 4, 128, 1, 4, 256)
 G = qwen38.TINY
 TILES = Tiles(bank=1 << 20, nbd=10, nbe=8, ebank=512 << 10, vmem_mib=64)
 
 
-def _blocks():
+def _blocks(NL):
     """ckpt [NL, NS, T] distinct per (layer, request, token); reads at offset 2."""
     ck = 1 + np.arange(NL * NS * T_VERIFY, dtype=np.int32).reshape(NL, NS, T_VERIFY)
     off = np.zeros((NL, NMB), np.int32)
@@ -83,9 +84,11 @@ def _blocks():
     return ck, off
 
 
-def test_segment_call_matches_reference_and_writes_checkpoints():
+@pytest.mark.parametrize("L,head", [(4, False), (2, True)])
+def test_segment_call_matches_reference_and_writes_checkpoints(L, head):
+    NL = L if head else L - 1
     rng = np.random.default_rng(0)
-    ck, off = _blocks()
+    ck, off = _blocks(NL)
     raws = []
     for _ in range(R):
         raw = np.zeros(POOL_SHAPE, np.uint8)
@@ -98,8 +101,8 @@ def test_segment_call_matches_reference_and_writes_checkpoints():
             )
         raws.append(raw)
     ex = ExecSpec(R=R, B=B, T=T_VERIFY, ctx=128, interpret=True, tiles=TILES)
-    spec = qwen38.segment_spec(G, R, L=L)
-    inp = random_segment_inputs(jax.random.PRNGKey(5), G, ex, L, gain=0.25)
+    spec = qwen38.segment_spec(G, R, L=L, head=head)
+    inp = random_segment_inputs(jax.random.PRNGKey(5), G, ex, L, gain=0.25, head=head)
 
     # The reference reads the same initial states the kernel gathers.
     conv0 = np.zeros((R, NL, NS, 3, 1280), np.float32)
@@ -111,12 +114,12 @@ def test_segment_call_matches_reference_and_writes_checkpoints():
                 rec0[r, l, s], conv0[r, l, s] = ssm, conv
     inp.st_l = {"conv": jnp.asarray(conv0), "rec": jnp.asarray(rec0).astype(jnp.bfloat16)}
     ref, ref_states = segment_reference(
-        G, ex, inp.x, inp.hc, inp.w_l, inp.st_l, inp.attn, inp.o_proj, L=L
+        G, ex, inp.x, inp.hc, inp.w_l, inp.st_l, inp.attn, inp.o_proj, L=L, head=head
     )
 
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
     tp, rep = NamedSharding(mesh, P("tp")), NamedSharding(mesh, P())
-    w_mk, _, _ = pack_segment(spec, G, ex, inp)
+    w_mk, _, _ = pack_segment(spec, G, ex, inp, head=head)
     flat = []
     for name in kernel.build(spec, ex)[1]["plan"].w_names:
         v = w_mk[name]
@@ -140,10 +143,12 @@ def test_segment_call_matches_reference_and_writes_checkpoints():
 
     layout = gs.Qwen38GdnPoolLayout(pool_shape=POOL_SHAPE, pool_dtype="float8_e4m3fn")
     fn, in_specs, out_specs, donate = build_segment_call(
-        mesh, G, L, B, layout, interpret=True, tiles=TILES
+        mesh, G, L, B, layout, interpret=True, tiles=TILES, head=head
     )
-    assert len(in_specs) == 2 + len(flat) + 1 + len(meta) and donate == (2 + len(flat),)
-    res, new_pool = jax.jit(fn)(hidden, attn, *flat, pool, *meta)
+    lead = (hidden,) if head else (hidden, attn)
+    assert len(in_specs) == len(lead) + len(flat) + 1 + len(meta)
+    assert donate == (len(lead) + len(flat),)
+    res, new_pool = jax.jit(fn)(*lead, *flat, pool, *meta)
 
     res0 = np.asarray(res.reshape(R, B, -1)[0], np.float32)
     refn = np.asarray(ref, np.float32)

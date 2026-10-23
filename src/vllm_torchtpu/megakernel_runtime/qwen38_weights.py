@@ -100,18 +100,38 @@ def _shared(mlp: Any, g: Any, ex: ExecSpec) -> tuple[torch.Tensor, torch.Tensor]
     return sh13.contiguous(), sh2.contiguous()
 
 
+def head_groups(model: Any, g: Qwen38Geometry) -> list[list[int]]:
+    """Layers before the first QSA layer, split so a PLE layer starts a group."""
+    groups: list[list[int]] = []
+    for i in range(g.att_every - 1):
+        if not groups or model.model.layers[i].ple is not None:
+            groups.append([])
+        groups[-1].append(i)
+    return groups
+
+
 def pack_segment_operands(
-    model: Any, g: Qwen38Geometry, s: int, spec: ModelSpec, ex: ExecSpec
+    model: Any,
+    g: Qwen38Geometry,
+    s: int,
+    spec: ModelSpec,
+    ex: ExecSpec,
+    layer_ids: list[int] | None = None,
+    head: bool = False,
 ) -> list[torch.Tensor]:
-    """This rank's segment-`s` weight operands, flattened in `plan.w_names` order."""
+    """This rank's segment-`s` (or head group `layer_ids`) weight operands.
+
+    Flattened in `plan.w_names` order.
+    """
     p = planner.plan(spec, ex)
     L = spec.config.L
-    layers = [model.model.layers[i] for i in segment_layers(g, s)]
+    ids = segment_layers(g, s) if layer_ids is None else layer_ids
+    layers = [model.model.layers[i] for i in ids]
     assert len(layers) == L, (len(layers), L)
-    gi = g.inner(ex.R, L)
-    lay = GDNBlock.lin_in_layout(gi, ex) if L > 1 else None
+    gi = g.inner(ex.R, L, head)
+    gdn = layers if head else layers[1:]
+    lay = GDNBlock.lin_in_layout(gi, ex) if gdn else None
     q = layers[0]
-    gdn = layers[1:]
     dev = q.mlp.gate.weight.device
     W = g.NHC * g.H
 
@@ -123,10 +143,11 @@ def pack_segment_operands(
             sm[name] = torch.zeros((L, p.smalls_layout[name][1]), dtype=torch.float32, device=dev)
         sm[name][j, : val.numel()] = val.reshape(-1).float()
 
-    inj = q.attn_hyper_connection.block_inject_weight.weight.data.t()
-    w["qsa_out_hinj"] = F.pad(inj, (0, 128 - g.NHC))[None]
-    w["o_proj"] = kn(q.self_attn.o_proj, g.NH // ex.R * g.HD, g.H)[None]
-    row("qsa_out_hcn", 0, q.attn_hyper_connection.hc_norm.weight.data)
+    if not head:
+        inj = q.attn_hyper_connection.block_inject_weight.weight.data.t()
+        w["qsa_out_hinj"] = F.pad(inj, (0, 128 - g.NHC))[None]
+        w["o_proj"] = kn(q.self_attn.o_proj, g.NH // ex.R * g.HD, g.H)[None]
+        row("qsa_out_hcn", 0, q.attn_hyper_connection.hc_norm.weight.data)
 
     if gdn:
         hcs = [_hc_mix_operands(layer.attn_hyper_connection, g) for layer in gdn]
@@ -135,7 +156,7 @@ def pack_segment_operands(
             w[f"gdn_hup{b}"] = torch.stack([h[1][b] for h in hcs])
         w["lin_in"] = torch.stack([_lin_in(layer.linear_attn, gi, ex) for layer in gdn])
         w["lin_out"] = torch.stack([kn(layer.linear_attn.out_proj, lay.Z, g.H) for layer in gdn])
-        for j, layer in enumerate(gdn, start=1):
+        for j, layer in enumerate(gdn, start=L - len(gdn)):
             la = layer.linear_attn
             row("gdn_hcn", j, layer.attn_hyper_connection.hc_norm.weight.data)
             row("in_s", j, torch.ones(lay.NLI, device=dev))

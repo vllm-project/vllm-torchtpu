@@ -14,7 +14,8 @@
 """Flat, positional form of the Qwen3.8 segment step for runtime bridges.
 
 `make_flat_segment_step` wraps `kernel.make_step` in a function of positional
-arrays only — `(pos, hidden, attn, *weights, *states)` — returning
+arrays only — `(pos, hidden, attn, *weights, *states)` (`attn` is ignored by a
+head segment, which has no attention input) — returning
 `(residual, *new_states)`, with one `PartitionSpec` per input and output, so a
 runtime can call it through an SPMD bridge. Weights are the per-layer operands
 in `plan.w_names` order with per-layer tuples (routed experts) expanded.
@@ -53,6 +54,7 @@ def make_flat_segment_step(mesh: Any, spec: ModelSpec, ex: ExecSpec):
     ]
     n_w = sum(max(c, 1) for _, c in layout)
     has_gdn = all(s in p.s_names for s in GDN_STATES)
+    has_attn = bool(kernel.extra_inputs(spec, info["exec"]))
     states = GDN_STATES if has_gdn else ()
     outs = (RESIDUAL_OUT, *GDN_CKPTS) if has_gdn else (RESIDUAL_OUT,)
 
@@ -66,7 +68,8 @@ def make_flat_segment_step(mesh: Any, spec: ModelSpec, ex: ExecSpec):
             else:
                 weights[name] = flat[i]
                 i += 1
-        _, new = step(pos, hidden, weights, dict(zip(states, st)), attn)
+        extra = (attn,) if has_attn else ()
+        _, new = step(pos, hidden, weights, dict(zip(states, st)), *extra)
         return tuple(new[k] for k in outs)
 
     in_specs = (P(), P("tp"), P("tp")) + (P("tp"),) * (n_w + len(states))

@@ -98,10 +98,12 @@ def build_segment_call(
     *,
     interpret: bool = False,
     tiles: Tiles | None = None,
+    head: bool = False,
 ) -> tuple[Any, tuple, tuple, tuple]:
     """`(fn, in_specs, out_specs, donate_argnums)` of segment kind `L` at `B` rows.
 
-    `interpret` / `tiles` are for CPU tests (Pallas interpret mode, small rings).
+    `head=True`: an all-GDN head segment; `fn(hidden, *weights, pool, *meta)`
+    (no attention input). `interpret` / `tiles` are for CPU tests.
     """
     R = mesh.size
     ex = ExecSpec(
@@ -112,7 +114,9 @@ def build_segment_call(
         tiles=segment_tiles(B) if tiles is None else tiles,
         interpret=interpret,
     )
-    fn, _, _, n_w = make_flat_segment_step(mesh, qwen38.segment_spec(g, R, L=L), ex)
+    fn, _, _, n_w = make_flat_segment_step(
+        mesh, qwen38.segment_spec(g, R, L=L, head=head), ex
+    )
     M, NS = ex.M, B // T_VERIFY
     tp, rep = P("tp"), P()
     pad = jax.shard_map(
@@ -127,7 +131,7 @@ def build_segment_call(
     )
     unpad = jax.shard_map(lambda r: r[:B], mesh=mesh, in_specs=tp, out_specs=tp, check_vma=False)
     pos = jnp.zeros((B,), jnp.int32)
-    if L == 1:
+    if L == 1 and not head:
 
         def tail(hidden, attn, *w):
             x, at = pad(hidden, attn)
@@ -162,6 +166,13 @@ def build_segment_call(
         res, conv_ck, rec_ck = fn(pos, x, at, *w, conv, rec)
         return unpad(res), scatter(pool, conv_ck, rec_ck, wb)
 
-    n_meta = GDN_META * (L - 1)
+    n_meta = GDN_META * (L if head else L - 1)
+    if head:
+
+        def head_segment(hidden, *rest):
+            return segment(hidden, hidden, *rest)
+
+        in_specs = (tp,) + (tp,) * n_w + (tp,) + (rep,) * n_meta
+        return head_segment, in_specs, (tp, tp), (1 + n_w,)
     in_specs = (tp, tp) + (tp,) * n_w + (tp,) + (rep,) * n_meta
     return segment, in_specs, (tp, tp), (2 + n_w,)

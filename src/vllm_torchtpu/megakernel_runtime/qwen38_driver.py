@@ -21,7 +21,9 @@ model. Per segment call, in one SPMD op: gather the segment's three GDN
 layers' states from the unified pool, run the kernel, scatter the per-token
 GDN checkpoints back (pool donated, updated in place).
 
-Enable with `VLLM_TPU_MEGAKERNEL=1` (or `buckets=4:8:16:32`).
+Enable with `VLLM_TPU_MEGAKERNEL=1`; comma-separated options `buckets=4:8:16:32:64`,
+`head=0` (keep the layers before the first QSA layer stock), `check=N` (shadow
+the first N eligible steps against the stock model).
 """
 
 from __future__ import annotations
@@ -44,7 +46,7 @@ from .driver import (
 )
 from .exported_bridge import sharded_jax_callable
 from .qwen38_segment_call import T_VERIFY, build_segment_call, segment_tiles
-from .qwen38_weights import pack_segment_operands, segment_layers
+from .qwen38_weights import head_groups, pack_segment_operands, segment_layers
 
 logger = init_logger(__name__)
 
@@ -56,6 +58,13 @@ def _parse_buckets(raw: str) -> tuple[int, ...]:
         if part.startswith("buckets="):
             return tuple(sorted(int(b) for b in part[len("buckets=") :].split(":")))
     return DEFAULT_BUCKETS
+
+
+def _parse_flag(raw: str, key: str, default: bool) -> bool:
+    for part in raw.split(","):
+        if part.startswith(key + "="):
+            return part[len(key) + 1 :].strip().lower() in ("1", "true", "on", "yes")
+    return default
 
 
 def _parse_check(raw: str) -> int:
@@ -75,11 +84,15 @@ class _SegmentKind:
     count, so the compiled torch program never branches on the token count.
     """
 
-    def __init__(self, mesh: Any, g: Any, L: int, layout: Any, write: bool) -> None:
+    def __init__(
+        self, mesh: Any, g: Any, L: int, layout: Any, write: bool, head: bool = False
+    ) -> None:
         self.mesh, self.g, self.L, self.layout, self.write = mesh, g, L, layout, write
-        self.has_gdn = L > 1
+        self.head = head
+        self.has_gdn = head or L > 1
         self._calls: dict[int, Any] = {}
-        name = f"qwen38_mk::seg_l{L}" + ("" if write else "_shadow")
+        self.tag = f"{'head' if head else 'seg'}_l{L}" + ("" if write else "_shadow")
+        name = f"qwen38_mk::{self.tag}"
         has_gdn = self.has_gdn
 
         @torch.library.custom_op(name, mutates_args=())
@@ -90,6 +103,8 @@ class _SegmentKind:
             gdn_io: list[torch.Tensor],
         ) -> list[torch.Tensor]:
             call = self.callable_for(int(hidden.shape[0]))
+            if head:
+                return list(call(hidden, *weights, *gdn_io))
             return list(call(hidden, attn, *weights, *gdn_io))
 
         @op.register_fake
@@ -104,10 +119,10 @@ class _SegmentKind:
     def callable_for(self, B: int) -> Any:
         if B not in self._calls:
             full, in_specs, outs, donate = build_segment_call(
-                self.mesh, self.g, self.L, B, self.layout, self.write
+                self.mesh, self.g, self.L, B, self.layout, self.write, head=self.head
             )
             self._calls[B] = sharded_jax_callable(
-                f"qwen38_mk::seg_l{self.L}_b{B}" + ("" if self.write else "_shadow"),
+                f"qwen38_mk::{self.tag}_b{B}",
                 full,
                 mesh=self.mesh,
                 input_partition_specs=in_specs,
@@ -128,6 +143,7 @@ class Qwen38Segments(nn.Module):
         buckets: tuple[int, ...],
         *,
         shared: Qwen38Segments | None = None,
+        head: bool = True,
     ) -> None:
         super().__init__()
         self.write_ckpts = shared is None
@@ -136,10 +152,11 @@ class Qwen38Segments(nn.Module):
         self.buckets = buckets
         self.layers = model.model.layers
         self.n_seg = g.L // g.att_every
-        self.kinds: dict[int, _SegmentKind] = {}
+        self.head_groups = head_groups(model, g) if head else []
+        self.kinds: dict[tuple[int, bool], _SegmentKind] = {}
         if shared is not None:
             # A shadow view: same operands, GDN checkpoints not written.
-            self.n_w = shared.n_w
+            self.n_w, self.n_hw = shared.n_w, shared.n_hw
             for name, buf in shared.named_buffers():
                 self.register_buffer(name, buf, persistent=False)
             self._shared = shared
@@ -155,6 +172,15 @@ class Qwen38Segments(nn.Module):
             self.n_w.append(len(ops))
             for i, t in enumerate(ops):
                 self.register_buffer(f"w{s}_{i}", t, persistent=False)
+        self.n_hw: list[int] = []
+        for h, group in enumerate(self.head_groups):
+            L = len(group)
+            ex = ExecSpec(R=R, B=buckets[0], T=T_VERIFY, ctx=128, tiles=segment_tiles(buckets[0]))
+            spec = qwen38.segment_spec(g, R, L=L, head=True)
+            ops = pack_segment_operands(model, g, -1, spec, ex, layer_ids=group, head=True)
+            self.n_hw.append(len(ops))
+            for i, t in enumerate(ops):
+                self.register_buffer(f"h{h}_{i}", t, persistent=False)
         self.pool = None
         self.layout = None
 
@@ -178,14 +204,20 @@ class Qwen38Segments(nn.Module):
             self.pool = base
             self.layout = Qwen38GdnPoolLayout.from_pool(base)
         for L in sorted({len(segment_layers(self.g, s)) for s in range(self.n_seg)}):
-            self.kinds[L] = _SegmentKind(self.mesh, self.g, L, self.layout, self.write_ckpts)
+            self.kinds[(L, False)] = _SegmentKind(
+                self.mesh, self.g, L, self.layout, self.write_ckpts
+            )
+        for L in sorted({len(gr) for gr in self.head_groups}):
+            self.kinds[(L, True)] = _SegmentKind(
+                self.mesh, self.g, L, self.layout, self.write_ckpts, head=True
+            )
 
-    def _gdn_meta(self, s: int) -> list[torch.Tensor]:
+    def _gdn_meta(self, layer_ids: list[int]) -> list[torch.Tensor]:
         from vllm.forward_context import get_forward_context
 
         md_all = get_forward_context().attn_metadata
         meta: list[torch.Tensor] = []
-        for i in segment_layers(self.g, s)[1:]:
+        for i in layer_ids:
             md = md_all[self.layers[i].linear_attn.prefix]
             meta += [
                 md.mamba_state_indices.to(torch.int32),
@@ -197,14 +229,23 @@ class Qwen38Segments(nn.Module):
         return meta
 
     def forward(self, s: int, hidden: torch.Tensor, attention: torch.Tensor) -> torch.Tensor:
-        L = len(segment_layers(self.g, s))
-        kind = self.kinds[L]
+        ids = segment_layers(self.g, s)
+        kind = self.kinds[(len(ids), False)]
         w = [getattr(self, f"w{s}_{i}") for i in range(self.n_w[s])]
         if kind.has_gdn:
-            res, pool = kind.op(hidden, attention, w, [self.pool, *self._gdn_meta(s)])
+            res, pool = kind.op(hidden, attention, w, [self.pool, *self._gdn_meta(ids[1:])])
             self.pool.copy_(pool)
         else:
             (res,) = kind.op(hidden, attention, w, [])
+        return res
+
+    def head(self, h: int, hidden: torch.Tensor) -> torch.Tensor:
+        """Head group `h` (layers before the first QSA layer) in one kernel call."""
+        ids = self.head_groups[h]
+        kind = self.kinds[(len(ids), True)]
+        w = [getattr(self, f"h{h}_{i}") for i in range(self.n_hw[h])]
+        res, pool = kind.op(hidden, hidden, w, [self.pool, *self._gdn_meta(ids)])
+        self.pool.copy_(pool)
         return res
 
 
@@ -213,11 +254,11 @@ class Qwen38SegmentDriver:
 
     takes_model_kwargs = True
 
-    def __init__(self, runner: Any, buckets: tuple[int, ...]) -> None:
+    def __init__(self, runner: Any, buckets: tuple[int, ...], head: bool = True) -> None:
         self.buckets = buckets
         self.g = qwen38.FULL
         self.mesh = _build_tp_rank_mesh(8, getattr(runner, "mesh", None))
-        self.segments = Qwen38Segments(runner.model, self.g, self.mesh, buckets)
+        self.segments = Qwen38Segments(runner.model, self.g, self.mesh, buckets, head=head)
         self.program = None
         self.check_left = 0
         self.shadow = None
@@ -241,7 +282,7 @@ class Qwen38SegmentDriver:
         if reasons:
             logger.warning("Qwen3.8 megakernel disabled: %s", "; ".join(reasons))
             return None
-        drv = cls(runner, _parse_buckets(raw))
+        drv = cls(runner, _parse_buckets(raw), head=_parse_flag(raw, "head", True))
         drv.check_left = _parse_check(raw)
         logger.info(
             "Qwen3.8 segment megakernel enabled, verify buckets %s, shadow checks %d",
@@ -262,7 +303,12 @@ class Qwen38SegmentDriver:
         )
         if self.check_left > 0:
             shadow_seg = Qwen38Segments(
-                runner.model, self.g, self.mesh, self.buckets, shared=self.segments
+                runner.model,
+                self.g,
+                self.mesh,
+                self.buckets,
+                shared=self.segments,
+                head=bool(self.segments.head_groups),
             )
             shadow_seg.bind_pool()
             self.shadow = Qwen4ExpSegmentModel(

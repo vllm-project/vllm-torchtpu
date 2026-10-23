@@ -68,6 +68,7 @@ def random_segment_inputs(
     gain: float = 1.0,
     zero: tuple[str, ...] = (),
     router_gain: float = 1.0,
+    head: bool = False,
 ) -> SegmentInputs:
     """Random inputs whose sublayers each move the residual visibly.
 
@@ -78,7 +79,7 @@ def random_segment_inputs(
     """
     R, B = ex.R, ex.B
     keys = jax.random.split(key, 7)
-    pos, _, w_l, st_l = qwen35.random_logical_inputs(keys[0], g.inner(R, L), ex)
+    pos, _, w_l, st_l = qwen35.random_logical_inputs(keys[0], g.inner(R, L, head), ex)
     gains = {"e2_s": 2000.0 * gain, "sh2_s": 400.0 * gain, "lin_out_s": 50.0 * gain}
     # `zero` silences a sublayer kind ("gdn", "moe") to isolate the others.
     for k in {"gdn": ("lin_out_s",), "moe": ("e2_s", "sh2_s")}.get(zero[0], ()) if zero else ():
@@ -89,7 +90,7 @@ def random_segment_inputs(
     w_l["router"] = (w_l["router"].astype(F32) * router_gain).astype(w_l["router"].dtype)
     hc = {
         "qsa_out": _hc_params(keys[1], g, 1),
-        "gdn": _hc_params(keys[2], g, L - 1),
+        "gdn": _hc_params(keys[2], g, L if head else L - 1),
         "moe": _hc_params(keys[3], g, L),
     }
     K = g.NH // R * g.HD
@@ -128,31 +129,33 @@ def _rows(arr: jax.Array, rows: tuple[int, ...], L: int) -> jax.Array:
 
 
 def pack_segment(
-    spec: ModelSpec, g: Qwen38Geometry, ex: ExecSpec, inp: SegmentInputs
+    spec: ModelSpec, g: Qwen38Geometry, ex: ExecSpec, inp: SegmentInputs, head: bool = False
 ) -> tuple[dict[str, Any], dict[str, Any], Any]:
     """`(weights, states, attn)` per-rank operands (leading `R`, not yet folded)."""
     R, B, T, L = ex.R, ex.B, ex.T, spec.config.L
     w_l, st_l, hc = inp.w_l, inp.st_l, inp.hc
     W = g.NHC * g.H
     weights = {
-        "o_proj": inp.o_proj[:, None],
         "router": _rep(w_l["router"], R),
         "sh13": w_l["sh13"],
         "sh2": w_l["sh2"],
         "e13": tuple(w_l["e13"][:, j] for j in range(L)),
         "e2": tuple(w_l["e2"][:, j] for j in range(L)),
         "es": jnp.concatenate([w_l["e13_s"], w_l["e2_s"]], axis=-1)[:, :, :, None, :],
-        **hc_weight_arrays("qsa_out", hc["qsa_out"], g, R, mix=False),
         **hc_weight_arrays("moe", hc["moe"], g, R, mix=True),
     }
     smalls: dict[str, Any] = {
-        "qsa_out_hcn": _rows(_rep(hc["qsa_out"]["norm"], R), (0,), L),
         "moe_hcn": hc["moe"]["norm"],
         **{k: w_l[k] for k in ("post_norm", "sh_gate", "sh13_s", "sh2_s", "ecopy") if k in w_l},
     }
+    if not head:
+        weights["o_proj"] = inp.o_proj[:, None]
+        weights.update(hc_weight_arrays("qsa_out", hc["qsa_out"], g, R, mix=False))
+        smalls["qsa_out_hcn"] = _rows(_rep(hc["qsa_out"]["norm"], R), (0,), L)
     states: dict[str, Any] = {}
-    if L > 1:
-        gdn_rows = tuple(range(1, L))
+    n_gdn = L if head else L - 1
+    if n_gdn > 0:
+        gdn_rows = tuple(range(L - n_gdn, L))
         weights.update(
             lin_in=w_l["lin_in"],
             lin_out=w_l["lin_out"],
@@ -164,17 +167,17 @@ def pack_segment(
             out_s=_rows(w_l["lin_out_s"], gdn_rows, L),
             **{k: _rows(w_l[k], gdn_rows, L) for k in ("conv", "alog", "dtb", "gnorm")},
         )
-        lay = GDNBlock.lin_in_layout(g.inner(R, L), ex)
+        lay = GDNBlock.lin_in_layout(g.inner(R, L, head), ex)
         if T > 1:
             hr = rup(3 + T, 8)
             conv = jnp.pad(st_l["conv"], ((0, 0),) * 3 + ((0, hr - 3), (0, 0)))
         else:
             cr = rup(3 * B, 8)
-            c3 = jnp.swapaxes(st_l["conv"], 2, 3).reshape(R, L - 1, 3 * B, lay.QKV)
+            c3 = jnp.swapaxes(st_l["conv"], 2, 3).reshape(R, n_gdn, 3 * B, lay.QKV)
             conv = jnp.pad(c3, ((0, 0), (0, 0), (0, cr - 3 * B), (0, 0)))
         states["conv"] = conv.astype(F32)
         states["rec"] = (
-            st_l["rec"].reshape(R, L - 1, ex.NS * lay.vh, lay.KD, lay.VD).astype(BF16)
+            st_l["rec"].reshape(R, n_gdn, ex.NS * lay.vh, lay.KD, lay.VD).astype(BF16)
         )
     assert W == spec.config.H
     attn = jnp.pad(inp.attn, ((0, 0), (0, ex.M - B), (0, 0)))

@@ -51,25 +51,27 @@ def segment_reference(
     *,
     L: int,
     moe_inputs: list | None = None,
+    head: bool = False,
 ) -> tuple[jax.Array, dict[str, Any]]:
     """Return `(new residual [B, NHC*H], {gdn_idx: new GDN states})`.
 
     `moe_inputs`, when a list, receives each layer's MoE input `[B, H]`.
     """
-    gi = g.inner(ex.R, L)
+    gi = g.inner(ex.R, L, head)
     nhc, eps = g.NHC, g.eps
     x = x[: ex.B]
     gdn_states: dict[int, Any] = {}
     for j in range(L):
-        if j == 0:
+        if j == 0 and not head:
             p = _layer(hc["qsa_out"], 0)
             xn = hc_normalize(x, p["norm"], nhc, eps)
             delta, _ = QSAOutBlock().reference({"attn": attn, "o_proj": o_proj}, None)
         else:
-            p = _layer(hc["gdn"], j - 1)
+            o = j if head else j - 1
+            p = _layer(hc["gdn"], o)
             mixed, xn = hc_mix(x, p, nhc=nhc, eps=eps)
-            delta, gdn_states[j - 1] = gdn_reference(
-                w_l, mixed, st_l, g=gi, ex=ex, gdn_idx=j - 1, layer_idx=j
+            delta, gdn_states[o] = gdn_reference(
+                w_l, mixed, st_l, g=gi, ex=ex, gdn_idx=o, layer_idx=j
             )
         x = hc_combine(delta, x, xn, p, nhc=nhc)
         p = _layer(hc["moe"], j)
