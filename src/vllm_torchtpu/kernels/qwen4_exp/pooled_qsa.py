@@ -846,7 +846,10 @@ def select_blocks(
                 seq_lens,
                 expand_pages(pages),
                 cu,
-                distribution,
+                # Every sequence through the mixed pass: with per-token scores
+                # it scores a 1-token request exactly as the decode passes do,
+                # and the two decode launches are empty on verify steps.
+                distribution.at[:2].set(0),
                 k=block_topk,
                 compression_ratio=ratio,
                 num_kv_pages_per_block=(decode_kv_block // rows,)
@@ -855,6 +858,7 @@ def select_blocks(
                 decode_req_batch_size=8 if len(q) >= 8 else 4,
                 enable_early_exit=True,
                 components=qsa_indexing(ratio - 1, per_token_scores=True),
+                decode_passes=False,
             ),
         )
     if len(query) <= chunk_size:

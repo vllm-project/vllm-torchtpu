@@ -1135,6 +1135,7 @@ def _effective_row_lengths(
         "uniform_q_len",
         "components",
         "topk_backend",
+        "decode_passes",
     ),
 )
 def streamindex_topk(
@@ -1166,8 +1167,13 @@ def streamindex_topk(
     uniform_q_len: int | None = None,
     components: indexing.StreamIndexComponents | None = None,
     topk_backend: TopKBackend = _DEFAULT_TOPK_BACKEND,
+    decode_passes: bool = True,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
+
+    ``decode_passes=False`` emits only the mixed pass. The caller must then pass
+    ``distribution = [0, 0, n]``, so the mixed pass covers every sequence; this
+    drops two launches that are empty when no sequence is a 1-token decode.
 
     Args:
       q: concatenated all sequences' queries.
@@ -1478,6 +1484,18 @@ def streamindex_topk(
 
     def _pass_specs(decode_batch_end):
         """`run_scores_kernel` kwargs for the passes over the batch."""
+        mixed = dict(
+            num_kv_pages_per_block=num_kv_pages_per_blocks[2],
+            num_queries_per_block=num_queries_per_blocks[2],
+            buffer_count=buffer_counts[2],
+            start_seq_idx=distribution[1],
+            end_seq_idx=distribution[2],
+            static_q_len=None,
+            seq_batch_size=1,
+            case=MlaCase.MIXED,
+        )
+        if not decode_passes:
+            return (mixed,)
         decode_cfg = dict(
             num_kv_pages_per_block=num_kv_pages_per_blocks[0],
             num_queries_per_block=num_queries_per_blocks[0],
@@ -1523,16 +1541,7 @@ def streamindex_topk(
                 **decode_cfg,
             ),
             *uniform,
-            dict(
-                num_kv_pages_per_block=num_kv_pages_per_blocks[2],
-                num_queries_per_block=num_queries_per_blocks[2],
-                buffer_count=buffer_counts[2],
-                start_seq_idx=distribution[1],
-                end_seq_idx=distribution[2],
-                static_q_len=None,
-                seq_batch_size=1,
-                case=MlaCase.MIXED,
-            ),
+            mixed,
         )
 
     def _pass_metadata(spec, chunk_starts, chunk_tokens):
@@ -1599,56 +1608,61 @@ def streamindex_topk(
         assert scores is not None
         return scores
 
+    # Step-level metadata, built outside the early-exit `lax.cond`: it reads only
+    # seq_lens / cu_q_lens / distribution, which every layer of a step shares, so
+    # XLA can CSE it across layers. A cond branch is opaque to CSE, and inside one
+    # every QSA layer rebuilt it.
+    # Raw f32 bits, not f32. The SparseCore top-k compares bits, and this is
+    # the dtype it wants to read, so nothing has to reformat HBM scores.
+    out_dtype = jnp.int32
+    max_num_tokens = q.shape[0]
+
+    # TODO: we shall sort the sequences by length, so that multiple decode
+    # sequences in one batch have similar lengths to reduce waste of compute.
+    # With the same batch size, the longest sequence will determine number of
+    # blocks to run computation for.
+    decode_batch_end = (
+        jnp.array(0)
+        if max_num_seqs < decode_req_batch_size
+        else distribution[0] // decode_req_batch_size * decode_req_batch_size
+    )
+
+    num_positions = max(num_sublanes_total * 128, k)
+    eff_row_lengths = _effective_row_lengths(
+        seq_lens=seq_lens,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+        num_tokens=max_num_tokens,
+        num_positions=num_positions,
+        compression_ratio=compression_ratio,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+        interleave_c=interleave_c,
+        components=components,
+    )
+
+    if chunk_tokens is None or max_num_tokens % chunk_tokens:
+        num_chunks, chunk_len = 1, max_num_tokens
+    else:
+        num_chunks, chunk_len = max_num_tokens // chunk_tokens, chunk_tokens
+
+    chunk_starts = (
+        (None,)
+        if num_chunks == 1
+        else tuple(m * chunk_len for m in range(num_chunks))
+    )
+    passes = tuple(
+        (spec, _pass_metadata(spec, chunk_starts, chunk_len))
+        for spec in _pass_specs(decode_batch_end)
+    )
+
     def _common_path(_):
-        # Raw f32 bits, not f32. The SparseCore top-k compares bits, and this is
-        # the dtype it wants to read, so nothing has to reformat HBM scores.
-        out_dtype = jnp.int32
-        max_num_tokens = q.shape[0]
-
-        # TODO: we shall sort the sequences by length, so that multiple decode
-        # sequences in one batch have similar lengths to reduce waste of compute.
-        # With the same batch size, the longest sequence will determine number of
-        # blocks to run computation for.
-        decode_batch_end = (
-            jnp.array(0)
-            if max_num_seqs < decode_req_batch_size
-            else distribution[0] // decode_req_batch_size * decode_req_batch_size
-        )
-
-        num_positions = max(num_sublanes_total * 128, k)
-        eff_row_lengths = _effective_row_lengths(
-            seq_lens=seq_lens,
-            cu_q_lens=cu_q_lens,
-            distribution=distribution,
-            num_tokens=max_num_tokens,
-            num_positions=num_positions,
-            compression_ratio=compression_ratio,
-            cp_rank=cp_rank,
-            cp_size=cp_size,
-            interleave_c=interleave_c,
-            components=components,
-        )
-
-        if chunk_tokens is None or max_num_tokens % chunk_tokens:
-            num_chunks, chunk_len = 1, max_num_tokens
-        else:
-            num_chunks, chunk_len = max_num_tokens // chunk_tokens, chunk_tokens
-
         # Ids count from 1, so the 0 is never a real group: a single chunk has no
         # pair to annotate and takes the `None` branch below both times.
         group_base = 0
         if num_chunks > 1 and topk_backend.overlaps_scoring:
             group_base = config.reserve_scheduling_group_ids(num_chunks - 1)
 
-        chunk_starts = (
-            (None,)
-            if num_chunks == 1
-            else tuple(m * chunk_len for m in range(num_chunks))
-        )
-        passes = tuple(
-            (spec, _pass_metadata(spec, chunk_starts, chunk_len))
-            for spec in _pass_specs(decode_batch_end)
-        )
         topk_idxs = []
         topk_scores_list = []
         for m in range(num_chunks):
