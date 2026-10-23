@@ -37,6 +37,7 @@ from vllm_torchtpu.omni.attention import (
     TpuSDPAImpl,
 )
 from vllm_torchtpu.omni.patches import (
+    _VOCODER_CPU_INIT_PATCHED,
     _patch_diffusion_startup_warmup_sync,
     _patch_ltx2_vocoder_cpu_init,
     apply_omni_model_specific_patches,
@@ -569,8 +570,9 @@ def test_ltx2_vocoder_cpu_init_patch(monkeypatch):
 
     apply_omni_model_specific_patches.cache_clear()
     apply_omni_model_specific_patches()
-    assert ltx2_components._tpu_orig_load_component is _load_component
     patched = ltx2_components._load_component
+    assert patched is not _load_component
+    assert getattr(patched, _VOCODER_CPU_INIT_PATCHED, False)
 
     load_kwargs = {"local_files_only": True, "dtype": torch.float32, "revision": None}
     with torch.device("meta"):
