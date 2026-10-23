@@ -11,19 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Command-line entrypoint for decode roofline planning and module breakdown."""
+"""Command-line entrypoint for decode roofline planning, breakdown, and gap analysis."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import sys
+from collections.abc import Sequence
 from dataclasses import asdict, replace
 from pathlib import Path
 
 from .chips import CHIPS
+from .gap import compare_measured
 from .geometry import from_hf_config
 from .modules import Dtypes, Parallel, StepShape
+from .recipe import plan_from_serve_args
 from .serving import plan
 from .step import spec_cycle_floor, step_floor
 
@@ -33,10 +36,18 @@ _KV_BYTES: dict[str, float] = {"bf16": 2.0, "fp8": 1.0}
 _STATE_BYTES: dict[str, float] = {"fp32": 4.0, "bf16": 2.0}
 
 
-def _add_common_args(p: argparse.ArgumentParser) -> None:
+def _explicit_flags(argv: Sequence[str]) -> set[str]:
+    out: set[str] = set()
+    for tok in argv:
+        if tok.startswith("--"):
+            out.add(tok.split("=", 1)[0])
+    return out
+
+
+def _add_common_args(p: argparse.ArgumentParser, *, tp_required: bool = True) -> None:
     p.add_argument("--config", required=True, help="Path to HF config.json")
     p.add_argument("--chip", default="tpu7x", choices=sorted(CHIPS))
-    p.add_argument("--tp", type=int, required=True)
+    p.add_argument("--tp", type=int, required=tp_required, default=None)
     p.add_argument("--context", type=int, default=0)
     p.add_argument("--kv-split", type=int, default=1)
     p.add_argument("--kv-merge", default="ag_rs", choices=("ag_rs", "exchange"))
@@ -68,7 +79,8 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the roofline plan or explain subcommand."""
+    """Run the roofline plan, explain, or gap subcommand."""
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(prog="python -m vllm_torchtpu.roofline")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -84,32 +96,80 @@ def main(argv: list[str] | None = None) -> int:
     p_exp.add_argument("--rows-per-seq", type=int, default=1)
     p_exp.add_argument("--spec-window", type=int, default=0)
 
-    args = parser.parse_args(argv)
-    if args.tp <= 0:
-        raise ValueError(f"--tp must be >= 1, got {args.tp}")
+    p_gap = sub.add_parser("gap")
+    _add_common_args(p_gap, tp_required=False)
+    p_gap.add_argument("--measured", required=True, help="Path to measured JSON")
+    p_gap.add_argument(
+        "--serve-args",
+        default=None,
+        help="Path to JSON with 'argv' and 'env' from vllm serve",
+    )
+    p_gap.add_argument("--batch", type=int, default=1)
+    p_gap.add_argument("--rows-per-seq", type=int, default=1)
+    p_gap.add_argument("--spec-window", type=int, default=0)
+    p_gap.add_argument("--fail-on-sub-floor", action="store_true")
+
+    args = parser.parse_args(raw_argv)
+    explicit = _explicit_flags(raw_argv)
+
     cfg = json.loads(Path(args.config).read_text())
     geom = from_hf_config(cfg)
     chip = CHIPS[args.chip]
     if args.ici_bw_gbps is not None:
         chip = replace(chip, ici_bw=args.ici_bw_gbps * 1e9)
-    par = Parallel(
-        tp=args.tp,
-        kv_split=args.kv_split,
-        kv_merge=args.kv_merge,
-        moe=args.moe,
-        moe_dispatch=args.moe_dispatch,
-        residual=args.residual,
-        ar_algo=args.ar_algo,
-    )
-    dt = Dtypes(
-        w_dense=_WEIGHT_BYTES[args.weight_dtype],
-        w_expert=_EXPERT_BYTES[args.expert_dtype],
-        w_aux=_WEIGHT_BYTES[args.aux_dtype],
-        kv=_KV_BYTES[args.kv_dtype],
-        state=_STATE_BYTES[args.state_dtype],
-        act=args.act,
-    )
     lat_s = (args.collective_latency_us or 0.0) * 1e-6
+
+    if args.cmd == "gap" and args.serve_args is not None:
+        recipe_raw = json.loads(Path(args.serve_args).read_text())
+        r_par, r_dt = plan_from_serve_args(
+            recipe_raw.get("argv", ()), recipe_raw.get("env", {})
+        )
+        checks = (
+            ("--tp", args.tp, r_par.tp),
+            ("--kv-split", args.kv_split, r_par.kv_split),
+            ("--kv-merge", args.kv_merge, r_par.kv_merge),
+            ("--moe", args.moe, r_par.moe),
+            ("--moe-dispatch", args.moe_dispatch, r_par.moe_dispatch),
+            ("--residual", args.residual, r_par.residual),
+            ("--ar-algo", args.ar_algo, r_par.ar_algo),
+            ("--kv-dtype", _KV_BYTES[args.kv_dtype], r_dt.kv),
+        )
+        for flag_name, cli_val, rec_val in checks:
+            if flag_name in explicit and cli_val != rec_val:
+                sys.stderr.write(
+                    f"Conflicting {flag_name}: CLI={cli_val!r} "
+                    f"vs serve-args={rec_val!r}\n"
+                )
+                return 2
+        par = r_par
+        dt = replace(
+            r_dt,
+            w_dense=_WEIGHT_BYTES[args.weight_dtype],
+            w_expert=_EXPERT_BYTES[args.expert_dtype],
+            w_aux=_WEIGHT_BYTES[args.aux_dtype],
+            state=_STATE_BYTES[args.state_dtype],
+            act=args.act,
+        )
+    else:
+        if args.tp is None or args.tp <= 0:
+            raise ValueError(f"--tp must be >= 1, got {args.tp}")
+        par = Parallel(
+            tp=args.tp,
+            kv_split=args.kv_split,
+            kv_merge=args.kv_merge,
+            moe=args.moe,
+            moe_dispatch=args.moe_dispatch,
+            residual=args.residual,
+            ar_algo=args.ar_algo,
+        )
+        dt = Dtypes(
+            w_dense=_WEIGHT_BYTES[args.weight_dtype],
+            w_expert=_EXPERT_BYTES[args.expert_dtype],
+            w_aux=_WEIGHT_BYTES[args.aux_dtype],
+            kv=_KV_BYTES[args.kv_dtype],
+            state=_STATE_BYTES[args.state_dtype],
+            act=args.act,
+        )
 
     if args.cmd == "plan":
         concs = [int(x) for x in args.concurrency.split(",") if x.strip()]
@@ -142,6 +202,56 @@ def main(argv: list[str] | None = None) -> int:
                 f"{r.output_tput_ceil_per_chip:>25.1f}  {r.flag:<7}\n"
             )
             sys.stdout.write(line)
+        return 0
+
+    if args.cmd == "gap":
+        measured_raw = json.loads(Path(args.measured).read_text())
+        if args.spec_window > 0:
+            sf = spec_cycle_floor(
+                geom,
+                chip,
+                par,
+                args.batch,
+                args.context,
+                args.spec_window,
+                dt,
+                collective_latency_s=lat_s,
+            )
+        else:
+            sf = step_floor(
+                geom=geom,
+                chip=chip,
+                par=par,
+                shape=StepShape(
+                    batch=args.batch,
+                    rows_per_seq=args.rows_per_seq,
+                    context=args.context,
+                ),
+                dt=dt,
+                collective_latency_s=lat_s,
+            )
+        rep = compare_measured(sf, chip, measured_raw, collective_latency_s=lat_s)
+        if args.json:
+            sys.stdout.write(json.dumps(asdict(rep)) + "\n")
+        else:
+            sys.stdout.write(
+                f"{'module':<12}  {'floor_ms':>9}  {'measured_ms':>11}  "
+                f"{'gap_ms':>8}  {'util':>7}  {'gap_share':>9}  {'status':<20}\n"
+            )
+            for m in rep.modules:
+                sys.stdout.write(
+                    f"{m.name:<12}  {m.floor_ms:>9.3f}  {m.measured_ms:>11.3f}  "
+                    f"{m.gap_ms:>8.3f}  {m.achieved_util * 100:>6.1f}%  "
+                    f"{m.gap_share * 100:>8.1f}%  {m.status:<20}\n"
+                )
+            sys.stdout.write(
+                f"TOTAL         {rep.hard_floor_ms:>9.3f}  "
+                f"{rep.measured_step_ms:>11.3f}  {rep.total_gap_ms:>8.3f}  "
+                f"{rep.achieved_step_util * 100:>6.1f}%  "
+                f"unattrib={rep.unattributed_ms:.3f}ms  {rep.status}\n"
+            )
+        if args.fail_on_sub_floor and rep.status == "SUB_FLOOR_MODEL_BUG":
+            return 2
         return 0
 
     if args.spec_window > 0:

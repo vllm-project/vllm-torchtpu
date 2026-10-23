@@ -23,6 +23,7 @@ from .adapter import (
 )
 from .chips import CHIPS, ChipSpec
 from .collectives import Collective
+from .gap import ModuleGap, StepGapReport, compare_measured, normalize_measured
 from .geometry import ModelGeometry, from_hf_config
 from .modules import (
     Dtypes,
@@ -33,6 +34,7 @@ from .modules import (
     experts_touched,
     pass_costs,
 )
+from .recipe import plan_from_serve_args
 from .serving import ConcurrencyRow, plan
 from .step import StepFloor, spec_cycle_floor, step_floor
 
@@ -43,18 +45,23 @@ __all__ = [
     "Dtypes",
     "ModelGeometry",
     "ModuleCost",
+    "ModuleGap",
     "Parallel",
     "PlanReconciliation",
     "ConcurrencyRow",
     "StepFloor",
+    "StepGapReport",
     "StepShape",
+    "compare_measured",
     "ep_busiest_experts",
     "experts_touched",
     "floor_for_profile",
     "floor_from_plan",
     "from_hf_config",
+    "normalize_measured",
     "pass_costs",
     "plan",
+    "plan_from_serve_args",
     "reconcile_plan_vs_standalone",
     "spec_cycle_floor",
     "step_floor",
