@@ -33,7 +33,7 @@ def prepare_swa_metadata(
     """Return request page metadata, explicit bounds, and physical write records.
 
     Block table entries are allocator block IDs. Stride/offset are in BF16
-    512-feature record units and must preserve whole word pages. Starts and
+    512-feature record units and must preserve whole BF16 pages. Starts and
     positions obey csa2's contiguous-request contract; noncausal requests have
     at most 64 queries. Minimum visibility carries replay/window-start state.
     Bounds are passed to csa2 ONLY for noncausal calls; causal visibility stays
