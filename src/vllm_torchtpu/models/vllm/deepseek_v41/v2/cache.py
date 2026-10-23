@@ -6,6 +6,7 @@ from typing import Any, Protocol, cast
 
 import jax
 import torch
+from vllm.v1.core.kv_cache_utils import unify_kv_cache_spec_page_size
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
 from vllm.v1.worker.utils import allocate_kv_cache as allocate_upstream_kv_cache
 
@@ -91,6 +92,9 @@ def budget_native_swa(
     if not swa_layers:
         return specs
     assert all(isinstance(spec, AttentionSpec) for spec in specs.values())
+    # Grow logical blocks before adding typed-owner padding. Otherwise the
+    # uniform padded size prevents upstream from packing small compressed pages.
+    specs = unify_kv_cache_spec_page_size(specs)
     attention_specs = cast(dict[str, AttentionSpec], specs)
     # Cache groups may overlay the same block IDs. Different native layouts
     # need separate storage, even though the scheduler still shares those IDs.

@@ -5,7 +5,17 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.v1.kv_cache_interface import MLAAttentionSpec
+from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
+from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheSpec,
+    KVCacheTensor,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
+)
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels, csa2_adapter
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import cache as cache_module
@@ -31,28 +41,25 @@ def test_native_swa_allocation_budgets_overlaid_groups_and_binds_pages(
     swa_layers = frozenset(("swa", "swa_alias"))
     specs = cache_module.budget_native_swa(specs, swa_layers)
     assert cache_module.budget_native_swa(specs, swa_layers) == specs
-    page_bytes = (1024 + 512) * page_size
+    page_bytes = 2 * 1024 * page_size
     assert {spec.page_size_bytes for spec in specs.values()} == {page_bytes}
-    views = {
-        name: torch.empty((blocks, 1, page_size, 512), dtype=spec.dtype, device="meta")
-        for name, spec in specs.items()
-    }
-    monkeypatch.setattr(cache_module, "allocate_upstream_kv_cache", lambda *a: views)
+    assert specs["main"].block_size == 2 * page_size
     if split:
         monkeypatch.setattr(
             cache_module, "SPARSECORE_MAX_POOL_BYTES", 2 * page_size * 1024
         )
-    config = SimpleNamespace(
+    config = KVCacheConfig(
         num_blocks=blocks,
         kv_cache_groups=[
-            SimpleNamespace(kv_cache_spec=spec) for spec in specs.values()
+            KVCacheGroupSpec(layer_names=[name], kv_cache_spec=spec)
+            for name, spec in specs.items()
         ],
         kv_cache_tensors=[
-            SimpleNamespace(
+            KVCacheTensor(
                 size=blocks * page_bytes,
                 block_stride=page_bytes,
                 offset=0,
-                layer_stride=0,
+                layer_stride=blocks * page_bytes,
                 layers=[name],
             )
             for name in specs
@@ -61,7 +68,7 @@ def test_native_swa_allocation_budgets_overlaid_groups_and_binds_pages(
     materialized = cache_module.materialize_upstream_kv_cache(
         config,
         "cpu",
-        SimpleNamespace(is_layer_compact=True),
+        KVCacheLayout.LBHNC,
         word_rows=True,
         csa2_layers=frozenset(("main",)),
         native_swa_layers=swa_layers,
@@ -75,9 +82,12 @@ def test_native_swa_allocation_budgets_overlaid_groups_and_binds_pages(
         for bank in banks
     )
     assert sum(bank.nbytes for bank in materialized.raw_tensors) == (
-        blocks * page_bytes + blocks * page_size * 4
+        blocks * page_bytes + blocks * specs["main"].num_states * 4
     )
-    assert materialized.native_raw_cache["main"].dtype == torch.int32
+    main = materialized.native_raw_cache["main"]
+    main_banks = main if isinstance(main, tuple) else (main,)
+    assert all(bank.dtype == torch.int32 for bank in main_banks)
+    assert sum(bank.nbytes for bank in main_banks) == blocks * page_size * 1024
     cache = PagedCacheRows(raw, materialized.native_cache_layouts["swa"])
     for i, bank in enumerate(banks):
         bank.fill_(i + 1)
@@ -90,6 +100,82 @@ def test_native_swa_allocation_budgets_overlaid_groups_and_binds_pages(
         cache.row_indices(indices * page_size), indices * page_size
     )
     torch.testing.assert_close(cache.pages(indices), indices)
+
+
+@pytest.mark.cpu_test
+def test_native_swa_budget_admits_million_token_context():
+    """Typed SWA owners must not erase compressed-page packing at admission."""
+    specs: dict[str, KVCacheSpec] = {
+        f"swa.{layer}": SlidingWindowMLASpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.bfloat16,
+            sliding_window=128,
+        )
+        for layer in range(43)
+    }
+    native_swa = frozenset(f"swa.{layer}" for layer in range(2, 40))
+    for layer, ratio in ((2, 2), (8, 2), (14, 2), (20, 1)):
+        for kind, width, dtype in (
+            ("main", 512, torch.uint8),
+            ("index", 128, torch.bfloat16),
+        ):
+            specs[f"{kind}.{layer}"] = MLAAttentionSpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=width,
+                dtype=dtype,
+                tokens_per_state=ratio,
+            )
+        if ratio == 2:
+            specs[f"ring.{layer}"] = CircularBufferSpec(
+                block_size=8,
+                num_kv_heads=1,
+                head_size=1024,
+                head_size_v=0,
+                dtype=torch.float32,
+            )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            max_model_len=1048576, original_max_model_len=1048576
+        ),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1, decode_context_parallel_size=1
+        ),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        attention_config=SimpleNamespace(hisparse_config=None),
+        speculative_config=None,
+        cache_config=SimpleNamespace(
+            num_gpu_blocks_override=None,
+            prefix_cache_retention_interval=None,
+            get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBHNC,
+        ),
+        max_in_flight_tokens=4096,
+        num_prefill_lookahead_tokens=0,
+    )
+    budgeted = cache_module.budget_native_swa(specs, native_swa)
+    assert cache_module.budget_native_swa(budgeted, native_swa) == budgeted
+    # Use the real startup admission check from the failing serving run.
+    caches = get_kv_cache_configs(config, [budgeted], [24 << 30])
+    assert caches[0].num_blocks > 0
+    assert config.model_config.max_model_len == 1048576
+    assert budgeted["main.2"].block_size == 128
+    assert budgeted["index.2"].block_size == 256
+    assert budgeted["swa.2"].block_size == 32
+    assert budgeted["ring.2"].block_size == 8
+    assert cache_module.budget_native_swa(specs, frozenset()) is specs
+    # Check full-model owner sizing without allocating multi-GiB CPU buffers.
+    materialized = cache_module.materialize_upstream_kv_cache(
+        caches[0],
+        "meta",
+        KVCacheLayout.LBHNC,
+        word_rows=True,
+        csa2_layers=frozenset(f"main.{layer}" for layer in (2, 8, 14, 20)),
+        native_swa_layers=native_swa,
+    )
+    assert len(materialized.kv_caches) == len(specs)
+    assert sum(raw.nbytes for raw in materialized.raw_tensors) <= 30 << 30
 
 
 @pytest.mark.cpu_test
