@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 import os
 import subprocess
 import sys
@@ -41,6 +42,7 @@ from vllm_torchtpu.omni.attention import (
     TpuSDPAImpl,
 )
 from vllm_torchtpu.omni.patches import (
+    _BWE_FILTER_CPU_RESTORE_PATCHED,
     _D2H_STREAM_PATCHED,
     _SDPA_FALLBACK_PATCHED,
     _VOCODER_CPU_INIT_PATCHED,
@@ -718,3 +720,99 @@ def test_ltx2_vocoder_cpu_init_patch(monkeypatch):
 
     _patch_ltx2_vocoder_cpu_init()
     assert ltx2_components._load_component is patched
+
+
+def _upstream_restore_ltx_bwe_resampler_filter(vocoder):
+    # Copy of vllm-omni v0.32.0rc1 ltx2_runtime._restore_ltx_bwe_resampler_filter
+    # (ltx2_runtime.py:81-110); vllm_omni is mocked here, so the real module
+    # cannot be imported.
+    resampler = getattr(vocoder, "resampler", None)
+    current_filter = getattr(resampler, "filter", None)
+    ratio = getattr(resampler, "ratio", None)
+    kernel_size = getattr(resampler, "kernel_size", None)
+    if (
+        not isinstance(current_filter, torch.Tensor)
+        or not isinstance(ratio, int)
+        or not isinstance(kernel_size, int)
+    ):
+        return
+    if current_filter is getattr(resampler, "_ltx_restored_filter", None):
+        return
+    rolloff = 0.99
+    lowpass_filter_width = 6
+    width = math.ceil(lowpass_filter_width / rolloff)
+    if kernel_size != 2 * width * ratio + 1:
+        return
+    device = current_filter.device
+    time_axis = torch.arange(kernel_size, device=device, dtype=torch.float32)
+    time_axis = (time_axis / ratio - width) * rolloff
+    time_clamped = time_axis.clamp(-lowpass_filter_width, lowpass_filter_width)
+    window = torch.cos(time_clamped * math.pi / lowpass_filter_width / 2).square()
+    filter_value = (torch.sinc(time_axis) * window * rolloff / ratio).reshape(1, 1, -1)
+    resampler.filter = filter_value
+    resampler._ltx_restored_filter = filter_value
+
+
+class _FakeBweResampler(torch.nn.Module):
+    def __init__(self, device, kernel_size=29):
+        super().__init__()
+        self.ratio = 2
+        self.kernel_size = kernel_size
+        bf16 = torch.empty(1, 1, kernel_size, dtype=torch.bfloat16, device=device)
+        self.register_buffer("filter", bf16, persistent=False)
+
+
+def test_ltx2_bwe_filter_cpu_restore_patch(monkeypatch):
+    calls = []  # (filter device seen by upstream, filter after upstream)
+
+    def _restore(vocoder):
+        device = vocoder.resampler.filter.device.type
+        _upstream_restore_ltx_bwe_resampler_filter(vocoder)
+        calls.append((device, vocoder.resampler.filter))
+
+    ltx2_runtime = types.ModuleType("ltx2_runtime")
+    ltx2_runtime._restore_ltx_bwe_resampler_filter = _restore
+    ltx2_components = types.ModuleType("ltx2_components")
+    ltx2_components._load_component = lambda *args, **kwargs: None
+    ltx2 = vllm_omni_mock.diffusion.models.ltx2
+    monkeypatch.setattr(ltx2, "ltx2_runtime", ltx2_runtime)
+    monkeypatch.setattr(ltx2, "ltx2_components", ltx2_components)
+
+    _patch_ltx2_vocoder_cpu_init()
+    patched = ltx2_runtime._restore_ltx_bwe_resampler_filter
+    assert patched is not _restore
+    assert getattr(patched, _BWE_FILTER_CPU_RESTORE_PATCHED, False)
+    _patch_ltx2_vocoder_cpu_init()
+    assert ltx2_runtime._restore_ltx_bwe_resampler_filter is patched
+
+    # A CPU filter goes straight to upstream.
+    cpu_vocoder = types.SimpleNamespace(resampler=_FakeBweResampler("cpu"))
+    patched(cpu_vocoder)
+    want = cpu_vocoder.resampler.filter
+    assert calls == [("cpu", want)] and want.dtype == torch.float32
+
+    # Off CPU ("meta" stands in for TPU), upstream rebuilds on CPU and the
+    # FP32 result moves to the filter's device as the restored filter.
+    resampler = _FakeBweResampler("meta")
+    vocoder = types.SimpleNamespace(resampler=resampler)
+    patched(vocoder)
+    assert calls[-1][0] == "cpu" and torch.equal(calls[-1][1], want)
+    restored = resampler.filter
+    assert restored.device.type == "meta" and restored.dtype == torch.float32
+    assert restored.shape == want.shape
+    assert resampler._buffers["filter"] is restored
+    assert resampler._ltx_restored_filter is restored
+
+    # The next decode hits upstream's identity check: nothing is rebuilt.
+    patched(vocoder)
+    assert calls[-1] == ("meta", restored)
+    assert resampler.filter is restored
+    assert resampler._ltx_restored_filter is restored
+
+    # Upstream's early return (unexpected kernel size) leaves the filter alone.
+    other = _FakeBweResampler("meta", kernel_size=31)
+    original = other.filter
+    patched(types.SimpleNamespace(resampler=other))
+    assert calls[-1][0] == "cpu"
+    assert other.filter is original
+    assert not hasattr(other, "_ltx_restored_filter")
