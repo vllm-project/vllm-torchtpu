@@ -777,6 +777,15 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             )
         except Exception:
             return None
+        if any(
+            isinstance(getattr(layer, "impl", None), PallasMLAttentionBackendImpl)
+            and getattr(layer, "use_sparse", False)
+            for layer in attn_layers
+        ):
+            raise NotImplementedError(
+                "sparse MLA is not supported by export; supported: "
+                "dense MLA (e.g. DeepSeek-V2, DeepSeek-V3, Kimi-K2)"
+            )
         per_layer: list[list[api.ShapeDtypeStruct]] = []
         for layer in attn_layers:
             impl = getattr(layer, "impl", None)
