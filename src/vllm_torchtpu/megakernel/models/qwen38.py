@@ -189,13 +189,18 @@ def segment_spec(
     *,
     L: int = SEGMENT_LAYERS,
     head: bool = False,
+    pool_gdn: bool = False,
 ) -> ModelSpec:
     """`ModelSpec` of one segment kernel (`L` kernel layers, QSA o_proj first).
 
     `head=True`: `L` linear-attention layers and no QSA output projection (the
-    layers before the first QSA layer).
+    layers before the first QSA layer). `pool_gdn=True`: the GDN layers read
+    their states from the model's unified pool (`qwen38_gdn_pool`).
     """
-    gdn_cls = Qwen38GDN
+    if pool_gdn:
+        from .qwen38_gdn_pool import Qwen38PoolGDN as gdn_cls
+    else:
+        gdn_cls = Qwen38GDN
     gi = g.inner(R, L, head)
     hc = dict(inner_geometry=gi, nhc=g.NHC, lowrank=g.LOWRANK)
     qsa = HCSublayer(QSAOutModule(), mix=False, ar_slot=0, **hc)
