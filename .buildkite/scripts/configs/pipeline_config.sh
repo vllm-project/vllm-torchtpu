@@ -37,8 +37,9 @@ export PR_TPU_JOBS_PER_AUTHOR=40
 upload_with_priority() {
   local yaml_file=$1
   local JOB_PRIORITY=$2
-  local capped
-  local filter=(cat)
+  local config_dir capped
+  config_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local filter=(python3 "${config_dir}/../select_pr_tests.py" --filter-yaml)
   echo "--- :pipeline: Uploading $yaml_file with priority ${JOB_PRIORITY:-$PRIORITY_DEFAULT}"
   # build.env("NIGHTLY") is evaluated by Buildkite against the build's initial
   # environment, so a NIGHTLY=1 set by bootstrap.sh (for the run-full-ci label)
