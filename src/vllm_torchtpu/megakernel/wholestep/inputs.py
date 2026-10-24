@@ -146,10 +146,11 @@ def wholestep_reference(
                 )
                 kvs.append(jnp.concatenate([kk, vv], axis=-1))
                 if "ring" in d:  # stage C: the step's own tokens and group
+                    dl = layer_view(d, o_att)
                     if r == 0:
-                        ssel = step_selection(g, ex, d, mixed, o_att, d["budget"])
+                        ssel = step_selection(g, ex, dl, mixed, o_att, d["budget"])
                         step_out.append(ssel)
-                    attn = step_attention(g, ex, d, ssel["sel"], q, gate, kk, vv, r).reshape(B, -1)
+                    attn = step_attention(g, ex, dl, ssel["sel"], q, gate, kk, vv, r).reshape(B, -1)
                     delta = delta + jnp.dot(
                         attn.astype(BF16), d["o_proj"][r, o_att], preferred_element_type=F32
                     )
@@ -329,6 +330,11 @@ def add_carrier(key: int, d: dict[str, Any], width: int = 256, mp: int = 0) -> d
     `[pages, 16, 2, width]` (row 2i+j of a page = carrier row i, half j; lanes >= 128 zero),
     pages shuffled per request, `cktab [requests, max_groups // 32]`."""
     ck = np.asarray(d["ck"].astype(F32))
+    if ck.ndim == 4:  # per-layer keys: one carrier, pages disjoint across layers
+        n_att = ck.shape[0]
+        ck = ck.reshape(-1, *ck.shape[2:])
+    else:
+        n_att = 0
     nreq, G, D = ck.shape
     ppr = G // 32
     rng = np.random.default_rng(key + 23)
@@ -344,23 +350,34 @@ def add_carrier(key: int, d: dict[str, Any], width: int = 256, mp: int = 0) -> d
     for q in range(nreq):
         car[tab[q], :, :D] = ck[q].reshape(ppr, 32, D)
     carrier = jnp.asarray(car, BF16).reshape(-1, 16, 2, width)
-    return {**d, "carrier": carrier, "cktab": jnp.asarray(mtab)}
+    cktab = jnp.asarray(mtab)
+    if n_att:
+        cktab = cktab.reshape(n_att, nreq // n_att, -1)
+    return {**d, "carrier": carrier, "cktab": cktab}
+
+
+def _flat(x: Any) -> Any:
+    """Per-layer `[n_att, requests, …]` tables -> `[n_att * requests, …]` (row = o * nreq + q)."""
+    return x.reshape(-1, *x.shape[2:])
 
 
 def extras_b(d: dict[str, Any], mesh: Mesh, R: int) -> tuple:
     tp, rep = NamedSharding(mesh, P("tp")), NamedSharding(mesh, P())
+    pl_ = d.get("per_layer")
     ck = (
-        (jax.device_put(kernel.fold(_rep(d["carrier"], R)), tp), jax.device_put(d["cktab"], rep))
+        (jax.device_put(kernel.fold(_rep(d["carrier"], R)), tp),
+         jax.device_put(_flat(d["cktab"]) if pl_ else d["cktab"], rep))
         if "carrier" in d
         else (jax.device_put(kernel.fold(_rep(d["ck"], R)), tp),)
     )
+    assert not pl_ or "carrier" in d, "per-layer metadata needs the served key layout"
     return (
         jax.device_put(kernel.fold(d["pool"]), tp),
         *ck,
         jax.device_put(d["nvis"], rep),
         jax.device_put(d["tail"], rep),
-        jax.device_put(d["mtab"], rep),
-        jax.device_put(jnp.asarray([d["off"]], jnp.int32), rep),
+        jax.device_put(_flat(d["mtab"]) if pl_ else d["mtab"], rep),
+        jax.device_put(d["off"] if pl_ else jnp.asarray([d["off"]], jnp.int32), rep),
         jax.device_put(jnp.asarray([1.0, 1.0], F32), rep),
         jax.device_put(kernel.fold(_rep(d["rope"], R)), tp),
     )
@@ -487,6 +504,45 @@ def extras_c(d: dict[str, Any], mesh: Mesh, R: int) -> tuple:
     tp, rep = NamedSharding(mesh, P("tp")), NamedSharding(mesh, P())
     return extras_b(d, mesh, R) + (
         jax.device_put(d["ctxq"], rep),
-        jax.device_put(kernel.fold(_rep(d["ring"], R)), tp),
+        jax.device_put(kernel.fold(_rep(_flat(d["ring"]) if d.get("per_layer") else d["ring"], R)), tp),
         jax.device_put(kernel.fold(_rep(d["rope_ck"], R)), tp),
     )
+
+
+# ------------------------------------------------------------ per-layer metadata (served packing)
+PER_LAYER_KEYS = ("ck", "mtab", "ring", "off", "cktab")
+
+
+def layer_view(d: dict[str, Any], o: int) -> dict[str, Any]:
+    """`d` with the per-layer tables of QSA layer `o` (identity without per-layer metadata)."""
+    if not d.get("per_layer"):
+        return d
+    return {**d, **{k: d[k][o] for k in PER_LAYER_KEYS if k in d}}
+
+
+def add_per_layer(key: int, g: Qwen38Geometry, ex: ExecSpec, d: dict[str, Any], L: int) -> dict:
+    """Different keys, main page tables, rings and head-pair offsets per QSA layer, pages disjoint
+    across layers in one pool (the served pool packs layers into shared pages)."""
+    from .indexer import IDX_DIM
+
+    R, nreq = ex.R, ex.M // ex.T
+    n_att = len(att_layers(g, L, d.get("first", "gdn")))
+    pps = d["mtab"].shape[1]
+    rng = np.random.default_rng(key + 31)
+    k = jax.random.split(jax.random.PRNGKey(key + 31), 3)
+    ck = jnp.concatenate(
+        [d["ck"][None], jax.random.normal(k[0], (n_att - 1,) + d["ck"].shape, F32).astype(BF16)]
+    )
+    ring = jnp.concatenate(
+        [d["ring"][None],
+         jax.random.normal(k[1], (n_att - 1,) + d["ring"].shape, F32).astype(BF16)]
+    ) if "ring" in d else None
+    mtab = (rng.permutation(n_att * nreq * pps) + 1).reshape(n_att, nreq, pps).astype(np.int32)
+    pool = jax.random.normal(
+        k[2], (R, n_att * nreq * pps + 1, 128, 1, 4, g.HD), F32
+    ).astype(jnp.float8_e4m3fn)
+    out = {**d, "per_layer": True, "ck": ck, "mtab": jnp.asarray(mtab), "pool": pool,
+           "off": jnp.asarray([(o + 1) % 2 for o in range(n_att)], jnp.int32)}
+    if ring is not None:
+        out["ring"] = ring
+    return out

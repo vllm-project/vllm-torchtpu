@@ -90,7 +90,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         nreq = ex.M // ex.T
         return super().extra_inputs(g, ex) + [
             ExtraInput(CTXQ, "smem", (nreq,), I32),
-            ExtraInput(RING, "hbm", (nreq, 8, ix.IDX_DIM), BF16),
+            ExtraInput(RING, "hbm", (self.meta_rows(ex), 8, ix.IDX_DIM), BF16),  # per layer
             ExtraInput(ROPE_CK, "hbm", (nreq, 1, 128), F32),
         ]
 
@@ -113,7 +113,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         """Compressed key of request `q`'s group completed this step; writes its outputs."""
         ex, scr, g, T = ctx.ex, ctx.scr, ctx.g, ctx.ex.T
         c0 = ctx.extra[CTXQ][q]
-        for src, dst, i in ((ctx.extra[RING].at[q], scr["qc_ring"], 0),
+        for src, dst, i in ((ctx.extra[RING].at[self.row_base(ctx, l) + q], scr["qc_ring"], 0),
                             (ctx.extra[ROPE_CK].at[q], scr["qc_rope"], 1)):
             cp = pltpu.make_async_copy(src, dst, scr["qc_sem"].at[i])
             cp.start()
@@ -151,7 +151,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             cp.wait()
         return ck, p3 // 4
 
-    def _recent_tile(self, ctx: Any, q: int) -> None:
+    def _recent_tile(self, ctx: Any, l: Any, q: int) -> None:
         """K / V of the 8 positions from `4 (ctx // 4)`: old members from the pool, the step's
         tokens FP8-quantised from `qf_kv` (stock write-then-read)."""
         ex, scr, T = ctx.ex, ctx.scr, ctx.ex.T
@@ -159,7 +159,8 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         ga = c0 // 4
         per_page = ctx.extra[POOL].shape[1] // MICRO
         shift = per_page.bit_length() - 1
-        micro = ctx.extra[MTAB][q, ga >> shift] * per_page + (ga & (per_page - 1))
+        qb = self.row_base(ctx, l) + q
+        micro = ctx.extra[MTAB][qb, ga >> shift] * per_page + (ga & (per_page - 1))
         cp = pltpu.make_async_copy(
             ctx.extra[POOL].at[micro >> shift, pl.ds((micro & (per_page - 1)) * MICRO, MICRO)],
             scr["qc_old"],
@@ -168,7 +169,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         cp.start()
         cp.wait()
         sk, sv = ctx.extra[SCALES][0], ctx.extra[SCALES][1]
-        k8, v8 = _unpack_kv(scr["qc_old"], ctx.extra[OFFSET][0], ex.interpret)
+        k8, v8 = _unpack_kv(scr["qc_old"], self.offset(ctx, l), ex.interpret)
         pad = jnp.zeros((4, 256), F32)
         k_old = jnp.concatenate([k8.astype(F32) * sk, pad], axis=0)
         v_old = jnp.concatenate([v8.astype(F32) * sv, pad], axis=0)
@@ -208,7 +209,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         )
         for q in range(nreq):
             qr = scr["qi_q"][q].astype(BF16)
-            self._score_request(ctx, q, qr)
+            self._score_request(ctx, q, qr, self.row_base(ctx, l))
             ck, gc = self._new_group(ctx, l, q, raw[q * T : (q + 1) * T])
             s_new = ix.score_rows(qr, jnp.broadcast_to(ck.astype(BF16), (8, ix.IDX_DIM)))[:, :1]
             rows = slice(q * T, (q + 1) * T)
@@ -216,7 +217,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             scr["qi_s"][rows] = jnp.where(
                 gid == gc, s_new.reshape(T, 1, 1, 1), scr["qi_s"][rows]
             )
-            self._recent_tile(ctx, q)
+            self._recent_tile(ctx, l, q)
         rid = jax.lax.broadcasted_iota(I32, (MB, 1, 1), 0)
         nv = jnp.zeros((MB, 1, 1), I32)
         for r in range(MB):
@@ -308,8 +309,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             out, g0, pre = attend_row_mapped(
                 r, g0, pre, nrows=ex.MB, pool=ctx.extra[POOL], ring=scr["qf_ring"],
                 sems=scr["qf_ring_sem"], pages=scr["qi_ids"], kv_len=scr["qi_kvl"],
-                table=ctx.extra[MTAB], rows_per_req=T, q=scr["qf_q"][r], gate=scr["qf_g"][r],
-                off=ctx.extra[OFFSET][0], scale_k=ctx.extra[SCALES][0],
+                table=ctx.extra[MTAB], rows_per_req=T, table_row_base=self.row_base(ctx, l),
+                q=scr["qf_q"][r], gate=scr["qf_g"][r],
+                off=self.offset(ctx, l), scale_k=ctx.extra[SCALES][0],
                 scale_v=ctx.extra[SCALES][1], sm_scale=g.HD**-0.5, interpret=ex.interpret,
                 recent=(scr["qc_rk"][q], scr["qc_rv"][q], ok(srow), ok(scol)),
             )

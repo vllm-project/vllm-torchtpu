@@ -398,3 +398,34 @@ def test_last_layer_with_tail_in_one_call():
     clear = (top2[:, 1] - top2[:, 0]) > 5e-2  # the residual carries one layer of drift
     assert clear.sum() >= ex.B - 2, top2
     np.testing.assert_array_equal(got[clear], np.asarray(want)[clear])
+
+
+def test_step_with_per_layer_metadata_matches_reference():
+    """Served packing: every QSA layer has its own compressed keys, main page table, raw ring and
+    head-pair offset (pages disjoint in one pool); the kernel indexes them by layer ordinal."""
+    R, T = 2, 4
+    ex = ExecSpec(R=R, B=2 * T, T=T, ctx=128, interpret=True, tiles=_TILES)
+    d = wi.random_wholestep_inputs(23, G, ex, L, budget=BUDGET, n_pages=PAGES, identical_experts=True)
+    d = wi.add_indexer_inputs(23, G, ex, d, L, max_groups=MAX_GROUPS, ctx=CTX_C)
+    d = wi.add_step_inputs(23, G, ex, d, L, ctx=CTX_C)
+    d = wi.add_per_layer(23, G, ex, d, L)
+    d = wi.add_carrier(23, d)
+    ref, _ = wi.wholestep_reference(G, ex, d, L)
+    d.pop("_step_out")
+    pps = d["mtab"].shape[-1]
+    idx = dict(max_groups=MAX_GROUPS, pages_per_seq=pps, carrier="bf16", chunk_pages=32,
+               n_layers=L // G.att_every)
+    spec = wholestep_spec(G, R, L=L, qsa=dict(budget=BUDGET), step=True, indexed=idx)
+    w_mk, states = wi.pack_wholestep(spec, G, ex, d, L)
+    mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
+    pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(mesh, ex, d["inp"].pos, d["inp"].x, w_mk, states)
+    step, _ = kernel.make_step(mesh, spec, ex)
+    _, outs = step(pos_mk, hid_mk, w_mk, st_mk, *wi.extras_c(d, mesh, R))
+    res = np.asarray(outs[RESIDUAL_OUT].reshape(R, ex.M, -1)[:, : ex.B], np.float32)
+    refn = np.asarray(ref, np.float32)
+    assert float(np.std(refn - np.asarray(d["inp"].x[: ex.B], np.float32))) > 0.05
+    _assert_within_budget(res[:, T : 2 * T], refn[T : 2 * T])  # select-all rows: strict
+    scale, k = float(np.abs(refn).mean()), np.sqrt(2 * L / 8)
+    for r in range(R):
+        dd = np.abs(res[r, :T] - refn[:T])
+        assert dd.mean() < 3e-2 * k * scale, (r, dd.mean() / scale)

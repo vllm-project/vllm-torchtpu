@@ -44,6 +44,7 @@ def attend_row_mapped(
     kv_len: Any,
     table: Any,
     rows_per_req: int,
+    table_row_base: Any = 0,
     q: jax.Array,
     gate: jax.Array,
     off: Any,
@@ -107,7 +108,7 @@ def attend_row_mapped(
         to the last one; tokens past the row's length are masked below.
         """
         out = []
-        rq = row // rows_per_req
+        rq = table_row_base + row // rows_per_req
         for j in range(TILE // MICRO):
             gid = pages[row, jnp.minimum(t * (TILE // MICRO) + j, ncols - 1)]
             v = table[rq, gid >> shift] * per_page + (gid & (per_page - 1))

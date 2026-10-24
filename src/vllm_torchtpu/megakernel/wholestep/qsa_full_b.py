@@ -68,6 +68,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         chunk_pages: int = 32,
         manager_pages: int = 0,
         ck_lanes: int = 0,
+        n_layers: int = 0,
         **kw: Any,
     ) -> None:
         """`carrier`: "" = prototype contiguous keys `[requests, max_groups, 128]`; "fp8" = the
@@ -77,12 +78,15 @@ class QSAFullIndexedBlock(QSAFullBlock):
         (CPU interpret: same layout, no in-kernel bitcast). `manager_pages` > 0: `qsa_cktab` holds
         manager pages of that many contiguous kernel pages (served 1664-token pages: 13) and each
         is one DMA (P4: per-kernel-page DMAs are issue-bound); `ck_lanes` = 128 reads only the
-        real lanes of each carrier row."""
+        real lanes of each carrier row. `n_layers` > 0: per-QSA-layer metadata — the main-pool and
+        key tables are `[n_layers * requests, …]` (row = layer ordinal * requests + request) and the
+        head-pair offset `[n_layers]`, as the served pool packs layers into shared pages."""
         super().__init__(**kw)
         assert max_groups % 1024 == 0, max_groups  # whole (8, 128) score tiles per row
         self.max_groups, self.pps, self.debug = max_groups, pages_per_seq, debug
         self.carrier, self.ck_width = carrier, ck_width
         self.mp, self.ck_lanes = manager_pages, ck_lanes or ck_width
+        self.n_layers = n_layers
         self.chunk_pages = chunk_pages if carrier else max_groups // GPK
         assert (max_groups // GPK) % self.chunk_pages == 0, (max_groups, self.chunk_pages)
         assert (self.chunk_pages * GPK) % 128 == 0 and (max_groups // 128) % 8 == 0
@@ -115,20 +119,35 @@ class QSAFullIndexedBlock(QSAFullBlock):
     def smalls(self, g: Any, ex: ExecSpec) -> list[SmallField]:
         return super().smalls(g, ex) + [SmallField("qsa_iqn", ix.IDX_DIM)]
 
+    def meta_rows(self, ex: ExecSpec) -> int:
+        """Rows of the per-request tables: requests, times the QSA layers if per-layer."""
+        return ex.M // ex.T * max(1, self.n_layers)
+
+    def row_base(self, ctx: Any, l: Any) -> Any:
+        """This layer's first table row (0 without per-layer metadata)."""
+        if not self.n_layers:
+            return 0
+        return ctx.stream.sp.block_ord(l, self.name) * (ctx.ex.M // ctx.ex.T)
+
+    def offset(self, ctx: Any, l: Any) -> Any:
+        if not self.n_layers:
+            return ctx.extra[OFFSET][0]
+        return ctx.extra[OFFSET][ctx.stream.sp.block_ord(l, self.name)]
+
     def extra_inputs(self, g: Any, ex: ExecSpec) -> list[ExtraInput]:
-        nreq = ex.M // ex.T
+        nreq, rows = ex.M // ex.T, self.meta_rows(ex)
         return [
             ExtraInput(POOL, "hbm"),
             *(
                 [ExtraInput(CK, "hbm"), ExtraInput(
-                    CKTAB, "smem", (nreq, self.max_groups // GPK // (self.mp or 1)), I32)]
+                    CKTAB, "smem", (rows, self.max_groups // GPK // (self.mp or 1)), I32)]
                 if self.carrier
                 else [ExtraInput(CK, "hbm", (nreq, self.max_groups, ix.IDX_DIM), BF16)]
             ),
             ExtraInput(NVIS, "smem", (ex.M,), I32),
             ExtraInput(TAIL, "smem", (ex.M,), I32),
-            ExtraInput(MTAB, "smem", (nreq, self.pps), I32),
-            ExtraInput(OFFSET, "smem", (1,), I32),
+            ExtraInput(MTAB, "smem", (rows, self.pps), I32),
+            ExtraInput(OFFSET, "smem", (max(1, self.n_layers),), I32),
             ExtraInput(SCALES, "smem", (2,), F32),
             ExtraInput(ROPE, "hbm", (ex.M, 128), F32),
         ]
@@ -161,7 +180,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         ]
 
     # ------------------------------------------------------------ in kernel
-    def _score_request(self, ctx: Any, q: int, qr: jax.Array) -> None:
+    def _score_request(self, ctx: Any, q: int, qr: jax.Array, base: Any = 0) -> None:
         """Scores of request `q`'s `T` rows into `qi_s[q*T : (q+1)*T]` (chunk-major)."""
         scr, T = ctx.scr, ctx.ex.T
         rows = slice(q * T, (q + 1) * T)
@@ -178,11 +197,11 @@ class QSAFullIndexedBlock(QSAFullBlock):
         lanes = pl.ds(0, W)
 
         def copies(c: Any, s: Any) -> list[Any]:
-            tab = ctx.extra[CKTAB]
+            tab, qb = ctx.extra[CKTAB], base + q
             if MP:  # one DMA per manager page of MP contiguous kernel pages
                 return [
                     pltpu.make_async_copy(
-                        ctx.extra[CK].at[pl.ds(tab[q, c * (CH // MP) + m] * MP, MP), :, :, lanes],
+                        ctx.extra[CK].at[pl.ds(tab[qb, c * (CH // MP) + m] * MP, MP), :, :, lanes],
                         ring.at[s, pl.ds(m * MP, MP)],
                         sems.at[s],
                     )
@@ -190,7 +209,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
                 ]
             return [
                 pltpu.make_async_copy(
-                    ctx.extra[CK].at[tab[q, c * CH + p], :, :, lanes], ring.at[s, p], sems.at[s]
+                    ctx.extra[CK].at[tab[qb, c * CH + p], :, :, lanes], ring.at[s, p], sems.at[s]
                 )
                 for p in range(CH)
             ]
@@ -234,8 +253,9 @@ class QSAFullIndexedBlock(QSAFullBlock):
                 for h in range(ix.IDX_HEADS):
                     i = t * ix.IDX_HEADS + h
                     scr["qi_q"][q, i : i + 1, :] = iq[h][q * T + t : q * T + t + 1]
+        base = self.row_base(ctx, l)
         for q in range(nreq):
-            self._score_request(ctx, q, scr["qi_q"][q].astype(BF16))
+            self._score_request(ctx, q, scr["qi_q"][q].astype(BF16), base)
         rid = jax.lax.broadcasted_iota(I32, (MB, 1, 1), 0)
         nv = jnp.zeros((MB, 1, 1), I32)
         for r in range(MB):
@@ -314,9 +334,10 @@ class QSAFullIndexedBlock(QSAFullBlock):
                 kv_len=scr["qi_kvl"],
                 table=ctx.extra[MTAB],
                 rows_per_req=ex.T,
+                table_row_base=self.row_base(ctx, l),
                 q=scr["qf_q"][r],
                 gate=scr["qf_g"][r],
-                off=ctx.extra[OFFSET][0],
+                off=self.offset(ctx, l),
                 scale_k=ctx.extra[SCALES][0],
                 scale_v=ctx.extra[SCALES][1],
                 sm_scale=g.HD**-0.5,
