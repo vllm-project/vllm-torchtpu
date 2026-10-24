@@ -187,7 +187,6 @@ def kernel(
     cu_q_lens_ref,  # [max_num_seqs + 1]
     start_end_seq_idx_ref,  # [3] (start_seq, end_seq, chunk_token_start)
     metadata_ref,  # MetadataRef
-    cp_rank_ref,  # [1]
     # Input
     q_hbm_ref,  # Shape: [max_num_tokens, num_q_heads, head_dim], Memory: HBM
     indexer_weights_hbm_ref,  # Shape: [max_num_tokens, num_q_heads], Memory: HBM
@@ -198,16 +197,11 @@ def kernel(
     # HBM scores, [chunk_tokens, num_sublanes_total, 128]: (out,), or
     # (donated_in, out) after the first pass. Only the last is ever read.
     *score_refs,
-    compression_ratio: int,
-    static_q_len: int | None,
     bkv_p: int,
     bq_sz: int,
     seq_batch_size: int,
     buffer_count: int = 3,
-    case: MlaCase = MlaCase.MIXED,
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
-    cp_size: int = 1,
-    interleave_c: int = 1,
     chunk_idx: int = 0,
 ):
     """Executes the n-buffered Pallas scoring pipeline for StreamIndex Top-K."""
@@ -1319,7 +1313,6 @@ def streamindex_topk(
             cu_q_lens,
             jnp.array([start_seq_idx, end_seq_idx, chunk_start], jnp.int32),
             pass_meta,
-            jnp.asarray([cp_rank], jnp.int32),
         )
 
         num_scalar_prefetch = len(scalar_prefetches)
@@ -1337,16 +1330,11 @@ def streamindex_topk(
             pl.pallas_call(
                 functools.partial(
                     kernel,
-                    compression_ratio=compression_ratio,
-                    static_q_len=static_q_len,
                     bq_sz=bq_sz,
                     bkv_p=bkv_p,
                     seq_batch_size=seq_batch_size,
                     buffer_count=buffer_count,
-                    case=case,
                     kv_layout=kv_layout,
-                    cp_size=cp_size,
-                    interleave_c=interleave_c,
                     chunk_idx=chunk_idx,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
