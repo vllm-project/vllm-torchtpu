@@ -194,10 +194,9 @@ def rewrite_moe_schedule(blob: bytes) -> bytes | None:
                 sequence.instruction_ids if sequence is not None else list(by_id)
             )
         }
-        # Order preceding multi-SC completions before advancing an AG.
+        # Order independent multi-SC completions before advancing an AG.
         # Independent offloads otherwise can straddle the split-SC submissions
         # and stall libtpu's resource-aware scheduler in a full serving graph.
-        instruction_positions = {n: i for i, n in enumerate(by_id)}
         multicore_done = []
         for node in comp.instructions:
             if node.opcode != "async-done" or len(node.operand_ids) != 1:
@@ -257,11 +256,9 @@ def rewrite_moe_schedule(blob: bytes) -> bytes | None:
                     comp_changed = changed = True
             activation_deps = _ancestors(activation, by_id)
             for done in multicore_done:
-                if (
-                    instruction_positions[done.id]
-                    < instruction_positions[activation.id]
-                    and done.id not in activation_deps
-                ):
+                # Serialized instruction order is not execution order. edge()
+                # rejects downstream completions that would create a cycle.
+                if done.id not in activation_deps:
                     edge(done, activation)
             activation_deps = _ancestors(activation, by_id)
             # Only this metadata producer's router nodes; prior layers and

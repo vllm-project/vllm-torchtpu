@@ -532,7 +532,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             and self.n_local_heads == 64
         )
         self._csa2 = bool(self.compress_ratio) and csa2_supported
-        self.swa_cache_layer._tpu_swa_words = self._csa2
+        self.swa_cache_layer._tpu_native_swa = self._csa2
         if self.compress_ratio:
             logger.info_once(
                 "DeepSeek-V4.1 attention backend: %s",
@@ -1449,6 +1449,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     self.compress_ratio,
                     self.scale,
                     non_causal,
+                    decoder=self._ced_decoder,
                 )
                 output.copy_(result)
                 return None
