@@ -168,20 +168,37 @@ def _signature(graph: fx.GraphModule) -> tuple:
     return tuple(shape(value) for value in _placeholder_values(graph))
 
 
-def _symint_symbols(graph: fx.GraphModule) -> tuple:
-    """Per placeholder: the sympy symbol of a SymInt, else None.
+def _symint_sources(graph: fx.GraphModule) -> tuple:
+    """Per placeholder: where a SymInt's value comes from, else None.
 
-    Aligned with :func:`_signature`. A SymInt whose expression is not a bare
-    symbol also maps to None, so it can only ever match by position.
+    Aligned with :func:`_signature`. Symbol names are allocation order within
+    one trace's ShapeEnv (the token count is ``s16`` in one trace and ``s72``
+    in the next), so a SymInt is identified by the Dynamo source of its root
+    symbol instead -- ``L['input_ids'].size()[0]`` in every trace of the same
+    forward -- together with its expression in that root. The expression is
+    resolved through the ShapeEnv's replacements first, so a derived or
+    guard-introduced symbol maps to the root it stands for. A SymInt that does
+    not resolve to exactly one sourced root symbol maps to None, which only
+    ever matches by position.
     """
+    env = trace_shape_env(graph)
+    root_name = sympy.Symbol("root", integer=True)
 
-    def symbol(value: Any) -> Any:
-        if isinstance(value, torch.SymInt):
-            expr = value.node.expr
-            return expr if isinstance(expr, sympy.Symbol) else None
-        return None
+    def source(value: Any) -> Any:
+        if not isinstance(value, torch.SymInt) or env is None:
+            return None
+        expr = env.replace(value.node.expr)
+        free = expr.free_symbols
+        if len(free) != 1:
+            return None
+        (root,) = free
+        sources = env.var_to_sources.get(root)
+        if not sources:
+            return None
+        name = sources[0].name  # a property in recent torch, a method before
+        return (name() if callable(name) else name, str(expr.subs(root, root_name)))
 
-    return tuple(symbol(value) for value in _placeholder_values(graph))
+    return tuple(source(value) for value in _placeholder_values(graph))
 
 
 def symint_permutation(
@@ -193,9 +210,10 @@ def symint_permutation(
     where a SymInt placeholder sits: FX orders a subgraph's placeholders by first
     use, and a specialized branch can first touch the token count later. Returns
     None unless that is the only difference: every non-SymInt input in the same
-    order, and the SymInts matched one to one by sympy symbol identity.
+    order, and the SymInts matched one to one by source (see
+    :func:`_symint_sources`).
     """
-    (old_sig, old_syms), (new_sig, new_syms) = old, new
+    (old_sig, old_srcs), (new_sig, new_srcs) = old, new
     if len(old_sig) != len(new_sig):
         return None
     old_rest = [i for i, v in enumerate(old_sig) if v != "SymInt"]
@@ -204,20 +222,21 @@ def symint_permutation(
         return None
     old_ints = [i for i, v in enumerate(old_sig) if v == "SymInt"]
     new_ints = [i for i, v in enumerate(new_sig) if v == "SymInt"]
-    symbols = [old_syms[i] for i in old_ints]
-    new_by_symbol = {new_syms[i]: i for i in new_ints}
+    keys = [old_srcs[i] for i in old_ints]
+    new_by_key = {new_srcs[i]: i for i in new_ints}
     if (
-        any(sym is None for sym in symbols)
-        or len(set(symbols)) != len(symbols)
-        or len(new_by_symbol) != len(new_ints)
-        or set(symbols) != set(new_by_symbol)
+        any(key is None for key in keys)
+        or None in new_by_key
+        or len(set(keys)) != len(keys)
+        or len(new_by_key) != len(new_ints)
+        or set(keys) != set(new_by_key)
     ):
         return None
     perm = [0] * len(old_sig)
     for o, n in zip(old_rest, new_rest):
         perm[o] = n
     for o in old_ints:
-        perm[o] = new_by_symbol[old_syms[o]]
+        perm[o] = new_by_key[old_srcs[o]]
     return perm
 
 
@@ -259,18 +278,21 @@ class BucketExecutables:
         found = self._runnables.get((cache_dir, key))
         if found is None:
             return None
-        runnable, signature, symbols = found
+        runnable, signature, sources = found
         new_signature = _signature(graph)
         if signature == new_signature:
             return runnable
-        perm = symint_permutation(
-            (signature, symbols), (new_signature, _symint_symbols(graph))
-        )
+        new_sources = _symint_sources(graph)
+        perm = symint_permutation((signature, sources), (new_signature, new_sources))
         if perm is not None:
-            moved = [(o, n) for o, n in enumerate(perm) if o != n]
+            moved = [
+                (o, n, sources[o]) if sources[o] is not None else (o, n)
+                for o, n in enumerate(perm)
+                if o != n
+            ]
             logger.info(
                 "[shape-variants] %s adopted by trace %d with SymInt placeholders "
-                "permuted (old index <- new index): %s",
+                "permuted (old index <- new index[, source]): %s",
                 key,
                 self.traces,
                 moved,
@@ -298,7 +320,7 @@ class BucketExecutables:
         self._runnables[(cache_dir, key)] = (
             runnable,
             _signature(graph),
-            _symint_symbols(graph),
+            _symint_sources(graph),
         )
 
     def needs_retrace(self, size: int) -> bool:

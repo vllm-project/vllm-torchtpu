@@ -3,13 +3,13 @@
 
 Two traces of a split backbone can take the same inputs with a SymInt
 placeholder at a different position (FX orders placeholders by first use).
-The hand-over matches SymInts by sympy symbol and permutes the arguments;
-any other difference still refuses.
+The hand-over matches SymInts by the Dynamo source of their root symbol and
+permutes the arguments; any other difference still refuses.
 """
 
-import sympy
 import torch
 from torch import fx
+from torch._dynamo.source import LocalSource, TensorProperty, TensorPropertySource
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
@@ -18,25 +18,35 @@ from vllm_torchtpu.compilation import shape_variants
 KEY = "artifact_compile_range_4_4_subgraph_0"
 
 
-def _symint(env: ShapeEnv, name: str, hint: int) -> torch.SymInt:
-    symbol = sympy.Symbol(name, integer=True, positive=True)
-    return env.create_symintnode(symbol, hint=hint)
+def _size_source(name: str) -> TensorPropertySource:
+    return TensorPropertySource(LocalSource(name), TensorProperty.SIZE, 0)
 
 
 def _graph(
-    order: tuple[str, ...], *, y_dtype=torch.float32, n_name="s72"
+    order: tuple[str, ...],
+    *,
+    y_dtype=torch.float32,
+    n_source="input_ids",
+    via=None,
 ) -> fx.GraphModule:
     """A graph computing x * n + y with its placeholders in ``order``.
 
-    Each graph gets its own ShapeEnv, as each Dynamo trace does; the token
-    symbol keeps its name across them.
+    Each graph gets its own ShapeEnv, as each Dynamo trace does. ``n`` is the
+    size of ``n_source``; with ``via``, it is first allocated for that other
+    source and replaced by the ``n_source`` symbol, as Dynamo does when a guard
+    equates two sizes.
     """
     env = ShapeEnv()
     mode = FakeTensorMode(shape_env=env)
+    root = env.create_symbol(4, _size_source(n_source))
+    symbol = root
+    if via is not None:
+        symbol = env.create_symbol(4, _size_source(via))
+        env._set_replacement(symbol, root, "guard equated the two sizes")
     meta = {
         "x": mode.from_tensor(torch.zeros(4, 8)),
         "y": mode.from_tensor(torch.zeros(4, 8, dtype=y_dtype)),
-        "n": _symint(env, n_name, 4),
+        "n": env.create_symintnode(symbol, hint=4),
     }
     graph = fx.Graph()
     nodes = {}
@@ -56,45 +66,52 @@ def _args(graph: fx.GraphModule, x, y, n):
     return [values[node.name] for node in graph.graph.nodes if node.op == "placeholder"]
 
 
-def test_permuted_symint_is_handed_over_and_matches_a_fresh_compile():
-    first = _graph(("x", "n", "y"))
-    second = _graph(("x", "y", "n"))
+def _handed(first: fx.GraphModule, second: fx.GraphModule):
     session = shape_variants.BucketExecutables()
     session.put(None, KEY, first, first)
+    return session.get(None, KEY, second)
 
-    adopted = session.get(None, KEY, second)
-    assert adopted is not None and adopted is not first
+
+def test_permuted_symint_is_handed_over_and_matches_a_fresh_compile():
+    second = _graph(("x", "y", "n"))
+    adopted = _handed(_graph(("x", "n", "y")), second)
+    assert adopted is not None
 
     x, y = torch.randn(4, 8), torch.randn(4, 8)
-    got = adopted(*_args(second, x, y, 3))
-    fresh = second(*_args(second, x, y, 3))
-    assert torch.equal(got, fresh)
+    # Without the permutation this would compute x * y + n.
+    assert torch.equal(
+        adopted(*_args(second, x, y, 3)), second(*_args(second, x, y, 3))
+    )
+
+
+def test_a_replaced_symbol_resolves_to_its_root_source():
+    # The new trace allocated the size for another tensor first; a guard then
+    # replaced it by the input_ids size. Its symbol name differs, its root
+    # source does not.
+    second = _graph(("x", "y", "n"), via="positions")
+    adopted = _handed(_graph(("x", "n", "y")), second)
+    x, y = torch.randn(4, 8), torch.randn(4, 8)
+    assert torch.equal(
+        adopted(*_args(second, x, y, 5)), second(*_args(second, x, y, 5))
+    )
 
 
 def test_identical_signature_hands_over_the_same_runnable():
     first = _graph(("x", "n", "y"))
-    session = shape_variants.BucketExecutables()
-    session.put(None, KEY, first, first)
-    assert session.get(None, KEY, _graph(("x", "n", "y"))) is first
+    assert _handed(first, _graph(("x", "n", "y"))) is first
+
+
+def _refused(second: fx.GraphModule) -> bool:
+    try:
+        _handed(_graph(("x", "n", "y")), second)
+    except shape_variants.ShapeSpecializationError as exc:
+        return "inputs differ" in str(exc)
+    return False
 
 
 def test_a_real_input_difference_still_refuses():
-    session = shape_variants.BucketExecutables()
-    session.put(None, KEY, _graph(("x", "n", "y")), lambda *a: None)
-    try:
-        session.get(None, KEY, _graph(("x", "y", "n"), y_dtype=torch.bfloat16))
-    except shape_variants.ShapeSpecializationError as exc:
-        assert "inputs differ" in str(exc)
-    else:
-        raise AssertionError("a dtype difference was handed over")
+    assert _refused(_graph(("x", "y", "n"), y_dtype=torch.bfloat16))
 
 
-def test_a_symbol_only_one_trace_has_still_refuses():
-    session = shape_variants.BucketExecutables()
-    session.put(None, KEY, _graph(("x", "n", "y")), lambda *a: None)
-    try:
-        session.get(None, KEY, _graph(("x", "y", "n"), n_name="s80"))
-    except shape_variants.ShapeSpecializationError:
-        pass
-    else:
-        raise AssertionError("SymInts with different symbols were matched")
+def test_a_symint_from_another_source_still_refuses():
+    assert _refused(_graph(("x", "y", "n"), n_source="positions"))
