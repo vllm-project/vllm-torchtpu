@@ -14,6 +14,8 @@
 """Small-batch decode host-overhead trims (IX track 3). Every switch is
 default-off and read from ``os.environ`` (not ``envs.py``, so the
 compile-cache key is unchanged). None changes what the device computes.
+``VLLM_TPU_T3_HOST=1`` turns every trim on; an explicitly set per-trim
+variable (``=0`` or ``=1``) wins over it.
 
 * ``VLLM_TPU_T3_AOT_SKIP_GUARDS=1``: once a vLLM ``@support_torch_compile``
   module (here the MTP draft step-0 and fused-loop programs) has run its
@@ -36,7 +38,9 @@ logger = init_logger(__name__)
 
 
 def _flag(name: str) -> bool:
-    return os.environ.get(name, "0").strip().lower() in ("1", "true", "on", "yes")
+    """``name`` if set, else the master switch ``VLLM_TPU_T3_HOST``."""
+    raw = os.environ.get(name, os.environ.get("VLLM_TPU_T3_HOST", "0"))
+    return raw.strip().lower() in ("1", "true", "on", "yes")
 
 
 AOT_SKIP_GUARDS = _flag("VLLM_TPU_T3_AOT_SKIP_GUARDS")
