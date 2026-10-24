@@ -242,14 +242,27 @@ class GDNConfig:
     # wrapper sizes the tile against the same factor.
     DEFAULT_VMEM_FRACTION: ClassVar[float] = 0.80
     WINDOWED_VMEM_FRACTION: ClassVar[float] = 0.90
+    # Cap decode tiles at 16 sequences: larger tiles increase per-slot state DMA
+    # descriptors and register spills without reducing per-slot compute.
+    DECODE_TILE_SIZES: ClassVar[tuple[int, ...]] = (16, 8, 4, 2, 1)
+    MIXED_TILE_SIZES: ClassVar[tuple[int, ...]] = (128, 64, 32, 16, 8, 4, 2, 1)
 
     @classmethod
-    def get_vmem_limit_bytes(cls, window_size: int = 1) -> int:
+    def get_vmem_limit_bytes(
+        cls,
+        window_size: int = 1,
+        vmem_capacity_bytes: int | None = None,
+    ) -> int:
         """Returns the VMEM limit for a kernel keeping window_size checkpoints."""
+        capacity = (
+            pltpu.get_tpu_info().vmem_capacity_bytes
+            if vmem_capacity_bytes is None
+            else vmem_capacity_bytes
+        )
         fraction = (
             cls.WINDOWED_VMEM_FRACTION if window_size > 1 else cls.DEFAULT_VMEM_FRACTION
         )
-        return int(fraction * pltpu.get_tpu_info().vmem_capacity_bytes)
+        return int(fraction * capacity)
 
     def get_scratch_shape_dict(self) -> dict[str, Any]:
         conv_shape = (self.seq_tile_size, self.prev_kernel_size, 1, self.dim_size)

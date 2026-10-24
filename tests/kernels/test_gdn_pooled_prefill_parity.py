@@ -47,7 +47,6 @@ BENCH_KERNEL_SIZE = 4
 BENCH_DIM = BENCH_N_KQ * BENCH_D_K * 2 + BENCH_N_V * BENCH_D_V
 BENCH_NUM_TOKENS = 4096
 BENCH_ITERATIONS = 5
-BENCH_DECODE_TILE_SIZE = 4
 BENCH_KBS, BENCH_LANES = 256, 256
 BENCH_PAYLOAD = (1, 4)
 BENCH_TOK_BYTES = int(np.prod(BENCH_PAYLOAD) * BENCH_LANES * np.dtype(np.int8).itemsize)
@@ -143,7 +142,6 @@ def _benchmark_common_args(qkv, b, a, conv_weight, conv_bias, a_log, dt_bias):
         d_k=BENCH_D_K,
         d_v=BENCH_D_V,
         kernel_size=BENCH_KERNEL_SIZE,
-        decode_tile_size=BENCH_DECODE_TILE_SIZE,
     )
 
 
@@ -225,7 +223,7 @@ class TestProductionShapeDenseVsUnifiedPool:
 
     This reproduces the Qwen3.5-397B GDN geometry used by the end-to-end DP
     prefill benchmark: 16 KQ heads, 64 V heads, 128-d head dimensions, 4096
-    tokens, a 4352-token unified-pool manager block, and decode_tile_size=4.
+    tokens, a 4352-token unified-pool manager block.
     Dense and pooled modes receive identical activations, weights, and logical
     initial states. Each mode runs one five-iteration single-JIT warmup,
     followed by a fresh five-iteration single-JIT timed run.

@@ -20,7 +20,6 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.gdn.v3 import (
     compute_conv1d,
     compute_gdn,
@@ -31,9 +30,6 @@ from vllm_torchtpu.kernels.gdn.v3 import (
     tiling,
     vmem_ldst,
 )
-from vllm_torchtpu.logger import init_logger
-
-logger = init_logger(__name__)
 
 
 def inner_kernel(
@@ -397,9 +393,8 @@ def fused_conv1d_gdn(
     prefill_only: bool = False,
     zero_initialize_out: bool = True,
     compute_precision: jnp.dtype = jnp.float32.dtype,
-    # TODO(kyuyeunk): Calculate tile size based on input dimensions.
-    decode_tile_size: int = 4,
-    mixed_tile_size: int = 64,
+    decode_tile_size: int | None = None,
+    mixed_tile_size: int | None = None,
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array, jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
@@ -468,10 +463,12 @@ def fused_conv1d_gdn(
         zero_initialize_out: Whether to zero-initialize the output buffer before
             executing non-batched sequences.
         compute_precision: Computation precision dtype.
-        decode_tile_size: Tile size along sequence dimension for decode sequences.
-            Ignored when TPU_ENABLE_GDN_DYNAMIC_TILING is set.
-        mixed_tile_size: Tile size along token/chunk dimension for prefill/mixed
-            sequences. Ignored when TPU_ENABLE_GDN_DYNAMIC_TILING is set.
+        decode_tile_size: Optional tile size override along the sequence
+            dimension for decode/verify sequences. When None, sized dynamically
+            by `tiling.get_tile_sizes`.
+        mixed_tile_size: Optional tile size override along the token/chunk
+            dimension for prefill/mixed sequences. When None, sized dynamically
+            by `tiling.get_tile_sizes`.
 
     Returns:
         (new_conv_state, new_recurrent_state): Updated convolution state cache and
@@ -552,66 +549,32 @@ def fused_conv1d_gdn(
     num_lanes = pltpu.get_tpu_info().num_lanes
     packing = 4 // act_in_dtype.itemsize
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
-    decode_tile_size = min(decode_tile_size, batch_size)
-    mixed_tile_size = min(mixed_tile_size, batch_size)
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
     window_size = num_spec_tokens + 1
     decode_vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
 
-    # KDA stays on static tiles until the VMEM estimate models its gate.
-    if envs.TPU_ENABLE_GDN_DYNAMIC_TILING and not is_kda:
-        decode_tile_size, mixed_tile_size = tiling.get_tile_sizes(
-            batch_size=batch_size,
-            num_seqs=num_seqs,
-            padded_batch_size=padded_batch_size,
-            n_kq=n_kq,
-            n_v=n_v,
-            d_k=d_k,
-            d_v=d_v,
-            kernel_size=kernel_size,
-            conv_state_dim_size=dim if conv_state is None else conv_state.shape[-1],
-            act_out_dtype=act_out_dtype,
-            recurrent_state_dtype=(
-                jnp.float32 if recurrent_state is None else recurrent_state.dtype
-            ),
-            num_lanes=num_lanes,
-            decode_vmem_limit_bytes=decode_vmem_limit_bytes,
-            mixed_vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(),
-            window_size=window_size,
-        )
-        logger.info_once(
-            "GDN dynamic tiling: num_seqs=%d batch=%d window=%d -> T=%d C=%d",
-            num_seqs,
-            batch_size,
-            window_size,
-            decode_tile_size,
-            mixed_tile_size,
-        )
-    else:
-        # Each sequence holds 1 input state slot plus `window` output
-        # checkpoint slots per buffer in VMEM. Shrink the tile so the
-        # double-buffered windows fit in roughly half the scoped-VMEM budget.
-        window = num_spec_tokens + 1
-        num_buffers = config.GDNConfig.__dataclass_fields__["num_buffers"].default
-        state_positions = 1 + window
-        recurrent_bytes_per_seq = state_positions * n_v * d_k * d_v * 4
-        bytes_per_seq = (
-            # Recurrent checkpoints (fp32) — the dominant term.
-            recurrent_bytes_per_seq
-            # Conv checkpoints (fp32).
-            + state_positions * (kernel_size - 1) * dim * 4
-            # qkv (fp32), b/a (fp32), out (act_out).
-            + window * (dim * 4 + 2 * aligned_num_v_heads * 4 + n_v * d_v * 2)
-        )
-        spec_tile_budget = (decode_vmem_limit_bytes // 2) // num_buffers
-        decode_tile_size = max(
-            1, min(decode_tile_size, spec_tile_budget // bytes_per_seq)
-        )
-
-    if num_spec_tokens > 0 and is_kda:
-        # KDA verify keeps one sequence per tile until multi-sequence KDA
-        # verify tiles are sized by a KDA-aware VMEM estimate.
-        decode_tile_size = 1
+    decode_tile_size, mixed_tile_size = tiling.get_tile_sizes(
+        batch_size=batch_size,
+        num_seqs=num_seqs,
+        padded_batch_size=padded_batch_size,
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+        conv_state_dim_size=dim if conv_state is None else conv_state.shape[-1],
+        act_out_dtype=act_out_dtype,
+        recurrent_state_dtype=(
+            jnp.float32 if recurrent_state is None else recurrent_state.dtype
+        ),
+        num_lanes=num_lanes,
+        decode_vmem_limit_bytes=decode_vmem_limit_bytes,
+        mixed_vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(),
+        window_size=window_size,
+        decode_tile_size=decode_tile_size,
+        mixed_tile_size=mixed_tile_size,
+        attention_mode=attention_mode,
+    )
 
     batch_padding_size = padded_batch_size - batch_size
     num_v_padding_size = aligned_num_v_heads - n_v
