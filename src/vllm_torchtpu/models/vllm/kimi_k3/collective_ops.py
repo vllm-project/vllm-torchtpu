@@ -17,6 +17,7 @@ from functools import lru_cache
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 import torch
 from jax.sharding import PartitionSpec as P
 from vllm.distributed import get_tp_group
@@ -255,8 +256,7 @@ def _mesh_and_tables():
     return mesh, ring_tables(list(mesh.devices.flat), owners)
 
 
-@lru_cache(maxsize=4)
-def _build_token_op(world_size, gather):
+def _token_groups(world_size):
     mesh, tables = _mesh_and_tables()
     owners = tuple(int(i) for i in tables[0, 2])
     if world_size == 2:
@@ -265,6 +265,12 @@ def _build_token_op(world_size, gather):
         groups = (tuple(sorted(range(32), key=lambda i: owners[i])),)
     else:
         raise ValueError("K3 SP token collectives require TP2 or TP32")
+    return mesh, groups
+
+
+@lru_cache(maxsize=4)
+def _build_token_op(world_size, gather):
+    mesh, groups = _token_groups(world_size)
 
     def collective(x: jax.Array) -> jax.Array:
         def local(part):
@@ -300,6 +306,57 @@ def _build_token_op(world_size, gather):
     return op
 
 
+@lru_cache(maxsize=4)
+def _build_local_rows_op(world_size):
+    """This rank's `T / W` row block of a replicated `[T, d]` activation.
+
+    The inverse of the token all-gather: block i goes to the device at
+    position i of its axis_index_group, which is where the all-gather puts
+    that device's rows. The position is read at run time, so every rank traces
+    the same program. Slicing with the Python `rank_in_group` instead bakes
+    the rank into the traced graph: each rank then builds a different HLO for
+    every SP bucket, and under TPU_PARALLEL_PRECOMPILE no rank can load a
+    bucket another rank already put in the compile cache.
+
+    The position comes from an all_to_all of `arange(W)` (each device receives
+    W copies of its own position), not from `lax.axis_index`: that lowers to
+    `partition-id`, which the SPMD partitioner rejects when torch_tpu
+    recompiles the module through its jax.export bridge.
+    """
+    mesh, groups = _token_groups(world_size)
+
+    def local_rows(x: jax.Array) -> jax.Array:
+        def local(full):
+            rows = full.shape[0] // world_size
+            mine = jax.lax.all_to_all(
+                jnp.arange(world_size, dtype=jnp.int32),
+                "k3_sp",
+                0,
+                0,
+                tiled=True,
+                axis_index_groups=groups,
+            )
+            return jax.lax.dynamic_slice_in_dim(full, mine[0] * rows, rows, axis=0)
+
+        return jax.shard_map(
+            local,
+            mesh=mesh,
+            in_specs=P(None, None),
+            out_specs=P("k3_sp", None),
+            check_vma=False,
+        )(x)
+
+    op = sharded_jax_op(
+        f"pallas::kimi_token_{world_size}_local",
+        local_rows,
+        mesh=mesh,
+        input_partition_specs=(P(None, None),),
+        output_partition_specs=P("k3_sp", None),
+    )
+    op.register_fake(lambda x: x.new_empty((x.shape[0] // world_size, x.shape[1])))
+    return op
+
+
 class TokenShardCollectives:
     """Gather/scatter token shards over TP2 or TP32 without concrete allocations."""
 
@@ -316,6 +373,14 @@ class TokenShardCollectives:
     def reduce_scatter(self, x, dim):
         assert dim == 0
         return self.rs(x)
+
+    def local_rows(self, x):
+        """Replicated `[T, d]` -> this rank's `[T / W, d]` block.
+
+        Built on first use: only KimiModel's TP32 group calls it, while the
+        TP2 groups the MLP layers build never do.
+        """
+        return _build_local_rows_op(self.world_size)(x)
 
 
 class FusedPrefillCollectives:
