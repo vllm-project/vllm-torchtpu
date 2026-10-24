@@ -277,3 +277,33 @@ def test_step_tokens_match_stock_semantics():
     for r in range(res.shape[0]):
         dd = np.abs(res[r, :T] - ref[:T])
         assert dd.mean() < 3e-2 * k * scale, (r, dd.mean() / scale, dd.max(axis=1) / scale)
+
+
+def test_step_with_served_key_layout_matches_contiguous():
+    """Stage C reading the served compressed-key layout (32-group kernel pages, two BF16 keys per
+    carrier row, 256 lanes, shuffled pages, streamed 32 pages per chunk; the BF16 view here, the
+    FP8 carrier on TPU) gives the same residual as the contiguous-key kernel, bit for bit."""
+    from vllm_torchtpu.megakernel.wholestep.qsa_full_c import CK_NEW
+
+    T, R = 4, 2
+    ex = ExecSpec(R=R, B=2 * T, T=T, ctx=128, interpret=True, tiles=_TILES)
+    d = wi.random_wholestep_inputs(17, G, ex, L, budget=BUDGET, n_pages=PAGES, identical_experts=True)
+    maxg = 2 * MAX_GROUPS  # two 32-page chunks per request: exercises the double-buffered ring
+    d = wi.add_indexer_inputs(17, G, ex, d, L, max_groups=maxg, ctx=CTX_C)
+    d = wi.add_step_inputs(17, G, ex, d, L, ctx=CTX_C)
+    mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
+    pps = d["mtab"].shape[1]
+    outs = []
+    for carrier in ("", "bf16"):
+        dd = wi.add_carrier(17, d) if carrier else d
+        idx = dict(max_groups=maxg, pages_per_seq=pps, carrier=carrier, chunk_pages=32)
+        spec = wholestep_spec(G, R, L=L, qsa=dict(budget=BUDGET), step=True, indexed=idx)
+        w_mk, states = wi.pack_wholestep(spec, G, ex, dd, L)
+        pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(
+            mesh, ex, dd["inp"].pos, dd["inp"].x, w_mk, states
+        )
+        step, _ = kernel.make_step(mesh, spec, ex)
+        _, o = step(pos_mk, hid_mk, w_mk, st_mk, *wi.extras_c(dd, mesh, R))
+        outs.append((np.asarray(o[RESIDUAL_OUT], np.float32), np.asarray(o[CK_NEW], np.float32)))
+    np.testing.assert_array_equal(outs[0][0], outs[1][0])
+    np.testing.assert_array_equal(outs[0][1], outs[1][1])

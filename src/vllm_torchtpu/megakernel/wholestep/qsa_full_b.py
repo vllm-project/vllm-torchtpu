@@ -43,6 +43,8 @@ from .attend import attend_row_mapped
 from .qsa_full import OFFSET, POOL, ROPE, SCALES, QSAFullBlock
 
 CK = "qsa_ck"
+CKTAB = "qsa_cktab"  # [requests, max_groups // 32] kernel pages of the FP8 carrier
+GPK = 32  # groups per compressed-key kernel page
 NVIS = "qsa_nvis"  # [M] complete groups visible per row (len // 4)
 TAIL = "qsa_tail"  # [M] tokens of the row's partial group (len % 4)
 MTAB = "qsa_mtab"  # [requests, pages_per_seq] main-pool page table
@@ -56,11 +58,31 @@ class QSAFullIndexedBlock(QSAFullBlock):
     """`QSAFullBlock` + in-kernel indexer and selection."""
 
     def __init__(
-        self, *, max_groups: int, pages_per_seq: int, debug: bool = False, **kw: Any
+        self,
+        *,
+        max_groups: int,
+        pages_per_seq: int,
+        debug: bool = False,
+        carrier: str = "",
+        ck_width: int = 256,
+        chunk_pages: int = 32,
+        **kw: Any,
     ) -> None:
+        """`carrier`: "" = prototype contiguous keys `[requests, max_groups, 128]`; "fp8" = the
+        served FP8 carrier `[kernel_pages, 16, 4, ck_width]` (32 groups per kernel page, two BF16
+        keys per carrier row), paged by `qsa_cktab [requests, max_groups // 32]` and streamed
+        `chunk_pages` pages per chunk; "bf16" = its BF16 view `[kernel_pages, 16, 2, ck_width]`
+        (CPU interpret: same layout, no in-kernel bitcast)."""
         super().__init__(**kw)
         assert max_groups % 1024 == 0, max_groups  # whole (8, 128) score tiles per row
         self.max_groups, self.pps, self.debug = max_groups, pages_per_seq, debug
+        self.carrier, self.ck_width = carrier, ck_width
+        self.chunk_pages = chunk_pages if carrier else max_groups // GPK
+        assert (max_groups // GPK) % self.chunk_pages == 0 and (self.chunk_pages * GPK) % 1024 == 0
+
+    @property
+    def n_chunks(self) -> int:
+        return self.max_groups // GPK // self.chunk_pages
 
     def outputs(self, g: Any, ex: ExecSpec) -> list[StateDecl]:
         out = super().outputs(g, ex)
@@ -89,7 +111,11 @@ class QSAFullIndexedBlock(QSAFullBlock):
         nreq = ex.M // ex.T
         return [
             ExtraInput(POOL, "hbm"),
-            ExtraInput(CK, "hbm", (nreq, self.max_groups, ix.IDX_DIM), BF16),
+            *(
+                [ExtraInput(CK, "hbm"), ExtraInput(CKTAB, "smem", (nreq, self.max_groups // GPK), I32)]
+                if self.carrier
+                else [ExtraInput(CK, "hbm", (nreq, self.max_groups, ix.IDX_DIM), BF16)]
+            ),
             ExtraInput(NVIS, "smem", (ex.M,), I32),
             ExtraInput(TAIL, "smem", (ex.M,), I32),
             ExtraInput(MTAB, "smem", (nreq, self.pps), I32),
@@ -101,9 +127,19 @@ class QSAFullIndexedBlock(QSAFullBlock):
     def scratch(self, g: Any, ex: ExecSpec, plan: Any) -> list[ScratchReq]:
         G, S, K, MB = self.max_groups, self.max_groups // 128, self.budget, ex.MB
         return super().scratch(g, ex, plan) + [
-            ScratchReq("qi_ck", pltpu.VMEM((G, ix.IDX_DIM), BF16)),
+            *(
+                [
+                    ScratchReq("qi_ring", pltpu.VMEM(
+                        (2, self.chunk_pages, 16, 4 if self.carrier == "fp8" else 2, self.ck_width),
+                        jnp.float8_e4m3fn if self.carrier == "fp8" else BF16,
+                    )),
+                    ScratchReq("qi_ring_sem", pltpu.SemaphoreType.DMA((2,))),
+                ]
+                if self.carrier
+                else [ScratchReq("qi_ck", pltpu.VMEM((G, ix.IDX_DIM), BF16))]
+            ),
             ScratchReq("qi_q", pltpu.VMEM((MB // ex.T, ex.T * ix.IDX_HEADS, ix.IDX_DIM), F32)),
-            ScratchReq("qi_s", pltpu.VMEM((MB, S, 128), F32)),
+            ScratchReq("qi_s", pltpu.VMEM((MB, self.n_chunks, S // self.n_chunks, 128), F32)),
             ScratchReq("qi_th", pltpu.VMEM((MB, 1, 128), I32)),
             ScratchReq("qi_tm", pltpu.VMEM((MB, 1, 128), I32)),
             ScratchReq("qi_nv", pltpu.VMEM((MB, 1, 128), I32)),
@@ -116,6 +152,53 @@ class QSAFullIndexedBlock(QSAFullBlock):
         ]
 
     # ------------------------------------------------------------ in kernel
+    def _score_request(self, ctx: Any, q: int, qr: jax.Array) -> None:
+        """Scores of request `q`'s `T` rows into `qi_s[q*T : (q+1)*T]` (chunk-major)."""
+        scr, T = ctx.scr, ctx.ex.T
+        rows = slice(q * T, (q + 1) * T)
+        if not self.carrier:
+            cp = pltpu.make_async_copy(ctx.extra[CK].at[q], scr["qi_ck"], scr["qi_sem"].at[0])
+            cp.start()
+            cp.wait()
+            st = ix.score_rows(qr, scr["qi_ck"][...])  # [T, G]
+            scr["qi_s"][rows, 0] = st.reshape(T, self.max_groups // 128, 128)
+            return
+        CH, NC, W = self.chunk_pages, self.n_chunks, self.ck_width
+        CG = CH * GPK
+        ring, sems = scr["qi_ring"], scr["qi_ring_sem"]
+
+        def copies(c: Any, s: Any) -> list[Any]:
+            return [
+                pltpu.make_async_copy(
+                    ctx.extra[CK].at[ctx.extra[CKTAB][q, c * CH + p]], ring.at[s, p], sems.at[s]
+                )
+                for p in range(CH)
+            ]
+
+        for cp in copies(0, 0):
+            cp.start()
+
+        def chunk(c: Any, carry: Any) -> Any:
+            s = jax.lax.rem(c, 2)
+
+            @pl.when(c + 1 < NC)
+            def _():
+                for cp in copies(c + 1, 1 - s):
+                    cp.start()
+
+            # One wait for the whole slot (the page copies add up to its bytes).
+            pltpu.make_async_copy(ring.at[s], ring.at[s], sems.at[s]).wait()
+            if self.carrier == "fp8":  # the stock BF16KeyReader read: ref bitcast FP8 -> BF16
+                keys = ring.at[s].bitcast(BF16)[...]
+            else:
+                keys = ring[s]
+            keys = keys.reshape(CG, W)[:, : ix.IDX_DIM]
+            st = ix.score_rows(qr, keys)  # [T, CG]
+            scr["qi_s"][rows, c] = st.reshape(T, CG // 128, 128)
+            return carry
+
+        jax.lax.fori_loop(0, NC, chunk, 0)
+
     def _select(self, ctx: Any, l: Any, slot: Any) -> None:
         ex, scr, g = ctx.ex, ctx.scr, ctx.g
         MB, T, K, G = ex.MB, ex.T, self.budget, self.max_groups
@@ -132,11 +215,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
                     i = t * ix.IDX_HEADS + h
                     scr["qi_q"][q, i : i + 1, :] = iq[h][q * T + t : q * T + t + 1]
         for q in range(nreq):
-            cp = pltpu.make_async_copy(ctx.extra[CK].at[q], scr["qi_ck"], scr["qi_sem"].at[0])
-            cp.start()
-            cp.wait()
-            st = ix.score_rows(scr["qi_q"][q].astype(BF16), scr["qi_ck"][...])  # [T, G]
-            scr["qi_s"][q * T : (q + 1) * T] = st.reshape(T, S, 128)
+            self._score_request(ctx, q, scr["qi_q"][q].astype(BF16))
         rid = jax.lax.broadcasted_iota(I32, (MB, 1, 1), 0)
         nv = jnp.zeros((MB, 1, 1), I32)
         for r in range(MB):
@@ -145,7 +224,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
             jax.lax.broadcasted_iota(I32, (MB, S, 128), 1) * 128
             + jax.lax.broadcasted_iota(I32, (MB, S, 128), 2)
         )
-        bits = jnp.where(ids < nv, pltpu.bitcast(scr["qi_s"][...], I32), -1)
+        bits = jnp.where(ids < nv, pltpu.bitcast(scr["qi_s"][...].reshape(MB, S, 128), I32), -1)
         thr, tmax = ix.thresholds(bits, ids, nv, K, G)
         scr["qi_th"][...] = jnp.broadcast_to(thr, (MB, 1, 128))
         scr["qi_tm"][...] = jnp.broadcast_to(tmax, (MB, 1, 128))
@@ -156,7 +235,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
 
         def row(r: Any, carry: Any) -> Any:
             nvr = scr["qi_nv"][r][:, :1]
-            b = jnp.where(lid < nvr, pltpu.bitcast(scr["qi_s"][r], I32), -1)
+            b = jnp.where(lid < nvr, pltpu.bitcast(scr["qi_s"][r].reshape(S, 128), I32), -1)
             scr["qi_id"][r] = ix.compact_row(
                 b, scr["qi_th"][r][:, :1], scr["qi_tm"][r][:, :1], nvr, K, consts
             )

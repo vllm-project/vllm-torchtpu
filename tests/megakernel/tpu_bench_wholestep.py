@@ -65,10 +65,12 @@ def _fold_put(x: Any, mesh: Mesh) -> Any:
     return jax.tree.map(lambda a: jax.device_put(kernel.fold(a), tp), x)
 
 
-def run(g, B, T, L, mesh, chains, budget, identical, nbd, nbe, tiny=False, slots=8) -> dict:
+def run(g, B, T, L, mesh, chains, budget, identical, nbd, nbe, tiny=False, slots=8, gain=1.0,
+        small=False) -> dict:
     R = mesh.size
     tiles = (
-        Tiles(bank=1 << 20, nbd=10, nbe=8, ebank=512 << 10, vmem_mib=64) if tiny else tiles_for(B, nbd, nbe)
+        Tiles(bank=1 << 20, nbd=10, nbe=8, ebank=512 << 10, vmem_mib=64)
+        if (tiny or small) else tiles_for(B, nbd, nbe)
     )
     ex = ExecSpec(R=R, B=B, T=T, ctx=128, tiles=tiles, interpret=tiny)
     spec = wholestep_spec(g, R, L=L, qsa=dict(budget=budget, slots=slots))
@@ -76,7 +78,7 @@ def run(g, B, T, L, mesh, chains, budget, identical, nbd, nbe, tiny=False, slots
 
     def gen(key):
         d = wi.random_wholestep_inputs(
-            7, g, ex, L, budget=budget, n_pages=n_pages, identical_experts=identical
+            7, g, ex, L, budget=budget, n_pages=n_pages, identical_experts=identical, gain=gain
         )
         d.pop("off")
         d.pop("budget")
@@ -142,6 +144,7 @@ def run(g, B, T, L, mesh, chains, budget, identical, nbd, nbe, tiny=False, slots
     slope, icpt = np.polyfit(np.array(list(best), float), np.array(list(best.values()), float), 1)
     return {
         "rows": B, "T": T, "L": L, "budget": budget, "identical_experts": identical, "slots": slots,
+        "gain": gain, "geom": "tiny" if (tiny or small) else "full",
         "tiles": str(info["exec"].resolved_tiles), "compile_s": round(compile_s, 1),
         "parity": parity, "dev_us_per_call": round(slope * 1e6, 1),
         "dev_intercept_us": round(icpt * 1e6, 1),
@@ -203,9 +206,12 @@ def main() -> None:
     ap.add_argument("--tiny", action="store_true", help="CPU interpret smoke run")
     ap.add_argument("--slots", type=int, default=8, help="attention ring slots")
     ap.add_argument("--compile-only", action="store_true", help="shapes only: compile time / fit")
+    ap.add_argument("--gain", type=float, default=1.0, help="sublayer output gain (smaller at H=2560)")
+    ap.add_argument("--small", action="store_true",
+                    help="TINY geometry compiled on 2 real TPU cores (the CPU test's config)")
     a = ap.parse_args()
-    devs = jax.devices()[:2] if a.tiny else jax.devices()
-    g = qwen38.TINY if a.tiny else qwen38.FULL
+    devs = jax.devices()[:2] if (a.tiny or a.small) else jax.devices()
+    g = qwen38.TINY if (a.tiny or a.small) else qwen38.FULL
     print("devices", len(devs), devs[0].device_kind, "jax", jax.__version__, flush=True)
     mesh = Mesh(np.array(devs), ("tp",))
     out = []
@@ -221,7 +227,8 @@ def main() -> None:
                 continue
             for ident in a.identical:
                 try:
-                    r = run(g, B, a.T, L, mesh, a.chains, a.budget, bool(ident), a.nbd, a.nbe, a.tiny, a.slots)
+                    r = run(g, B, a.T, L, mesh, a.chains, a.budget, bool(ident), a.nbd, a.nbe, a.tiny, a.slots,
+                            a.gain, a.small)
                 except Exception as e:  # noqa: BLE001 — report and continue
                     r = {"rows": B, "L": L, "identical": ident, "error": f"{type(e).__name__}: {e}"[:3000]}
                 print("RESULT", json.dumps(r), flush=True)

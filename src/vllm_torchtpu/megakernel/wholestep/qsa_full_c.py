@@ -200,17 +200,22 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 for h in range(ix.IDX_HEADS):
                     i = t * ix.IDX_HEADS + h
                     scr["qi_q"][q, i : i + 1, :] = iq[h][q * T + t : q * T + t + 1]
-        lane = jax.lax.broadcasted_iota(I32, (1, G), 1)
+        NC = self.n_chunks
+        gid = (
+            jax.lax.broadcasted_iota(I32, (T, NC, S // NC, 128), 1) * (G // NC)
+            + jax.lax.broadcasted_iota(I32, (T, NC, S // NC, 128), 2) * 128
+            + jax.lax.broadcasted_iota(I32, (T, NC, S // NC, 128), 3)
+        )
         for q in range(nreq):
-            cp = pltpu.make_async_copy(ctx.extra[CK].at[q], scr["qi_ck"], scr["qi_sem"].at[0])
-            cp.start()
-            cp.wait()
             qr = scr["qi_q"][q].astype(BF16)
-            st = ix.score_rows(qr, scr["qi_ck"][...])  # [T, G]
+            self._score_request(ctx, q, qr)
             ck, gc = self._new_group(ctx, l, q, raw[q * T : (q + 1) * T])
             s_new = ix.score_rows(qr, jnp.broadcast_to(ck.astype(BF16), (8, ix.IDX_DIM)))[:, :1]
-            st = jnp.where(lane == gc, s_new, st)  # the completed group's fresh key
-            scr["qi_s"][q * T : (q + 1) * T] = st.reshape(T, S, 128)
+            rows = slice(q * T, (q + 1) * T)
+            # The completed group's fresh key replaces its stale cached column.
+            scr["qi_s"][rows] = jnp.where(
+                gid == gc, s_new.reshape(T, 1, 1, 1), scr["qi_s"][rows]
+            )
             self._recent_tile(ctx, q)
         rid = jax.lax.broadcasted_iota(I32, (MB, 1, 1), 0)
         nv = jnp.zeros((MB, 1, 1), I32)
@@ -220,7 +225,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             jax.lax.broadcasted_iota(I32, (MB, S, 128), 1) * 128
             + jax.lax.broadcasted_iota(I32, (MB, S, 128), 2)
         )
-        bits = jnp.where(ids < nv, pltpu.bitcast(scr["qi_s"][...], I32), -1)
+        bits = jnp.where(ids < nv, pltpu.bitcast(scr["qi_s"][...].reshape(MB, S, 128), I32), -1)
         thr, tmax = ix.thresholds(bits, ids, nv, K, G)
         scr["qi_th"][...] = jnp.broadcast_to(thr, (MB, 1, 128))
         scr["qi_tm"][...] = jnp.broadcast_to(tmax, (MB, 1, 128))
@@ -232,7 +237,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         def row(r: Any, carry: Any) -> Any:
             nvr = scr["qi_nv"][r][:, :1]
             ga = ctx.extra[CTXQ][r // T] // 4
-            b = jnp.where(lid < nvr, pltpu.bitcast(scr["qi_s"][r], I32), -1)
+            b = jnp.where(lid < nvr, pltpu.bitcast(scr["qi_s"][r].reshape(S, 128), I32), -1)
             th, tm = scr["qi_th"][r][:, :1], scr["qi_tm"][r][:, :1]
             ov = nvr > K
             sel = (ov & ((b > th) | ((b == th) & (lid <= tm)))) | (~ov & (b >= 0))

@@ -303,11 +303,32 @@ def indexer_selection(
     return jnp.asarray(pages), jnp.asarray(kvl)
 
 
+def add_carrier(key: int, d: dict[str, Any], width: int = 256) -> dict[str, Any]:
+    """The served compressed-key layout for `d["ck"]`: kernel pages of 32 groups, BF16 view
+    `[pages, 16, 2, width]` (row 2i+j of a page = carrier row i, half j; lanes >= 128 zero),
+    pages shuffled per request, `cktab [requests, max_groups // 32]`."""
+    ck = np.asarray(d["ck"].astype(F32))
+    nreq, G, D = ck.shape
+    ppr = G // 32
+    rng = np.random.default_rng(key + 23)
+    tab = (rng.permutation(nreq * ppr) + 1).reshape(nreq, ppr).astype(np.int32)
+    car = np.zeros((nreq * ppr + 1, 32, width), np.float32)
+    for q in range(nreq):
+        car[tab[q], :, :D] = ck[q].reshape(ppr, 32, D)
+    carrier = jnp.asarray(car, BF16).reshape(-1, 16, 2, width)
+    return {**d, "carrier": carrier, "cktab": jnp.asarray(tab)}
+
+
 def extras_b(d: dict[str, Any], mesh: Mesh, R: int) -> tuple:
     tp, rep = NamedSharding(mesh, P("tp")), NamedSharding(mesh, P())
+    ck = (
+        (jax.device_put(kernel.fold(_rep(d["carrier"], R)), tp), jax.device_put(d["cktab"], rep))
+        if "carrier" in d
+        else (jax.device_put(kernel.fold(_rep(d["ck"], R)), tp),)
+    )
     return (
         jax.device_put(kernel.fold(d["pool"]), tp),
-        jax.device_put(kernel.fold(_rep(d["ck"], R)), tp),
+        *ck,
         jax.device_put(d["nvis"], rep),
         jax.device_put(d["tail"], rep),
         jax.device_put(d["mtab"], rep),
