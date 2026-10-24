@@ -1651,12 +1651,22 @@ def streamindex_topk(
         if num_chunks == 1
         else tuple(m * chunk_len for m in range(num_chunks))
     )
-    passes = tuple(
-        (spec, _pass_metadata(spec, chunk_starts, chunk_len))
-        for spec in _pass_specs(decode_batch_end)
-    )
+
+    def _passes():
+        return tuple(
+            (spec, _pass_metadata(spec, chunk_starts, chunk_len))
+            for spec in _pass_specs(decode_batch_end)
+        )
+
+    # Single-chunk calls (decode / verify) build the pass schedules here, where
+    # XLA can CSE them across layers. Chunked calls annotate scheduling groups
+    # (SC top-k of chunk g overlapping scoring of g + 1); hoisting their
+    # schedules out of the branch leaves unannotated ops inside a group, which
+    # XLA rejects ("annotation groups with gaps"), so they stay inside.
+    hoisted = _passes() if num_chunks == 1 else None
 
     def _common_path(_):
+        passes = hoisted if hoisted is not None else _passes()
         # Ids count from 1, so the 0 is never a real group: a single chunk has no
         # pair to annotate and takes the `None` branch below both times.
         group_base = 0
