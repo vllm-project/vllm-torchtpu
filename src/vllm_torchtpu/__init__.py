@@ -59,6 +59,12 @@ def _patch_vllm_compact_mamba_streaming_input() -> None:
     InputProcessor.process_inputs = process_inputs
 
 
+def _patch_vllm_raiden_pd_completion() -> None:
+    from vllm_torchtpu.core.raiden_pd import patch_scheduler_init
+
+    patch_scheduler_init()
+
+
 def _patch_vllm_hybrid_kv_load_failure_recovery() -> None:
     """Backport hybrid KV cache load failure recovery from vLLM #50388.
 

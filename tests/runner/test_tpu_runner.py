@@ -927,8 +927,8 @@ def test_get_finished_kv_transfers_drains_invalid_block_ids(
     ):
         result = TPUModelRunner.get_finished_kv_transfers(runner, scheduler_output)
 
-    assert result == ({"sent"}, {"loaded"}, {"jobs": []}, {41, 43}, 2, stats)
-    assert result[-1] is stats
+    assert result == ({"sent"}, {"loaded"}, {"jobs": []}, {41, 43}, 2, stats, set())
+    assert result[5] is stats
     if isinstance(leaf_stats, TpuKVConnectorStats):
         assert leaf_stats.data["runner_cpu_issue_seconds"] == cpu_samples
         assert leaf_stats.data["runner_device_elapsed_seconds"] == device_samples
@@ -964,6 +964,54 @@ def test_no_forward_output_preserves_invalid_block_ids():
     assert output.kv_connector_output.invalid_block_ids == {41, 43}
     if tpu_runner._KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP:
         assert output.kv_connector_output.invalid_block_group_index == 2
+
+
+def test_get_finished_kv_transfers_plumbs_transfer_results_failed_recving():
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        KVConnectorBase_V1,
+        KVConnectorTransferResults,
+    )
+
+    connector = MagicMock(spec=KVConnectorBase_V1)
+    connector.get_transfer_results.return_value = KVConnectorTransferResults(
+        finished_sending={"sent"},
+        finished_recving={"loaded", "failed-load"},
+        failed_recving={"failed-load"},
+    )
+    connector.get_block_ids_with_load_errors.return_value = set()
+    connector.build_connector_worker_meta.return_value = None
+    connector.get_kv_connector_stats.return_value = None
+    runner = SimpleNamespace(
+        maybe_setup_kv_connector=MagicMock(),
+        _stage_timing=MagicMock(),
+    )
+    runner._stage_timing.take_samples.return_value = ([], [])
+    runner.get_finished_kv_transfers = TPUModelRunner.get_finished_kv_transfers.__get__(
+        runner
+    )
+    scheduler_output = SimpleNamespace(finished_req_ids={"done"})
+
+    with (
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=True
+        ),
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group",
+            return_value=connector,
+        ),
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.dist_utils.get_raiden_inline_load",
+            return_value=False,
+        ),
+    ):
+        output = TPUModelRunner.kv_connector_no_forward(
+            runner, scheduler_output, SimpleNamespace()
+        )
+
+    connector.get_transfer_results.assert_called_once_with({"done"})
+    assert output.kv_connector_output.finished_sending == {"sent"}
+    assert output.kv_connector_output.finished_recving == {"loaded", "failed-load"}
+    assert output.kv_connector_output.failed_recving == {"failed-load"}
 
 
 def test_build_kv_connector_output_supports_vllm_023():

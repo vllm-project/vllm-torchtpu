@@ -55,6 +55,7 @@ from vllm.distributed.kv_transfer import (
     has_kv_transfer_group,
     kv_transfer_state,
 )
+from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiKVConnectorStats,
 )
@@ -444,6 +445,7 @@ def _build_kv_connector_output(
     invalid_block_ids: set[int],
     invalid_block_group_index: int | None,
     kv_connector_stats: Any | None = None,
+    failed_recving: set[str] | None = None,
 ) -> KVConnectorOutput:
     """Build a connector output across the vLLM 0.23 API boundary.
 
@@ -460,6 +462,8 @@ def _build_kv_connector_output(
         "invalid_block_ids": invalid_block_ids,
         "kv_connector_stats": kv_connector_stats,
     }
+    if failed_recving:
+        kwargs["failed_recving"] = failed_recving
     if _KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP:
         kwargs["invalid_block_group_index"] = invalid_block_group_index
     return KVConnectorOutput(**kwargs)
@@ -1197,11 +1201,22 @@ class TPUModelRunner(GPUModelRunner):
     def get_finished_kv_transfers(self, scheduler_output):
         if not has_kv_transfer_group():
             self._stage_timing.take_samples()
-            return None, None, None, set(), None, None
+            return None, None, None, set(), None, None, set()
         kv_connector = get_kv_transfer_group()
-        finished_sending, finished_recving = kv_connector.get_finished(
-            scheduler_output.finished_req_ids
-        )
+        if isinstance(
+            kv_connector, KVConnectorBase
+        ) or "get_transfer_results" in getattr(kv_connector, "__dict__", {}):
+            transfer_results = kv_connector.get_transfer_results(
+                scheduler_output.finished_req_ids
+            )
+            finished_sending = transfer_results.finished_sending
+            finished_recving = transfer_results.finished_recving
+            failed_recving = transfer_results.failed_recving
+        else:
+            finished_sending, finished_recving = kv_connector.get_finished(
+                scheduler_output.finished_req_ids
+            )
+            failed_recving = set()
         invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
         invalid_block_group_index = (
             kv_connector.get_block_ids_with_load_errors_group_index()
@@ -1238,6 +1253,7 @@ class TPUModelRunner(GPUModelRunner):
             invalid_block_ids,
             invalid_block_group_index,
             kv_connector_stats,
+            failed_recving,
         )
 
     def kv_connector_no_forward(
@@ -1256,7 +1272,9 @@ class TPUModelRunner(GPUModelRunner):
             invalid_block_ids,
             invalid_block_group_index,
             kv_connector_stats,
+            *extra,
         ) = self.get_finished_kv_transfers(scheduler_output)
+        failed_recving = extra[0] if extra else set()
         kv_connector_output = _build_kv_connector_output(
             finished_sending=finished_sending,
             finished_recving=finished_recving,
@@ -1264,6 +1282,7 @@ class TPUModelRunner(GPUModelRunner):
             invalid_block_ids=invalid_block_ids,
             invalid_block_group_index=invalid_block_group_index,
             kv_connector_stats=kv_connector_stats,
+            failed_recving=failed_recving,
         )
         if kv_connector_output.is_empty():
             return EMPTY_MODEL_RUNNER_OUTPUT
@@ -5005,7 +5024,9 @@ class TPUModelRunner(GPUModelRunner):
             invalid_block_ids,
             invalid_block_group_index,
             kv_connector_stats,
+            *extra,
         ) = self.get_finished_kv_transfers(scheduler_output)
+        failed_recving = extra[0] if extra else set()
 
         kv_connector_output = (
             None
@@ -5014,6 +5035,7 @@ class TPUModelRunner(GPUModelRunner):
                 and finished_recving is None
                 and kv_worker_meta is None
                 and not invalid_block_ids
+                and not failed_recving
                 and kv_connector_stats is None
             )
             else _build_kv_connector_output(
@@ -5023,6 +5045,7 @@ class TPUModelRunner(GPUModelRunner):
                 invalid_block_ids=invalid_block_ids,
                 invalid_block_group_index=invalid_block_group_index,
                 kv_connector_stats=kv_connector_stats,
+                failed_recving=failed_recving,
             )
         )
 
@@ -7762,12 +7785,15 @@ class TPUModelRunner(GPUModelRunner):
             invalid_block_ids,
             invalid_block_group_index,
             kv_connector_stats,
+            *extra,
         ) = self.get_finished_kv_transfers(scheduler_output)
+        failed_recving = extra[0] if extra else set()
         if (
             finished_sending is None
             and finished_recving is None
             and kv_worker_meta is None
             and not invalid_block_ids
+            and not failed_recving
             and kv_connector_stats is None
         ):
             return EMPTY_MODEL_RUNNER_OUTPUT
@@ -7779,6 +7805,7 @@ class TPUModelRunner(GPUModelRunner):
             invalid_block_ids=invalid_block_ids,
             invalid_block_group_index=invalid_block_group_index,
             kv_connector_stats=kv_connector_stats,
+            failed_recving=failed_recving,
         )
         return output
 
