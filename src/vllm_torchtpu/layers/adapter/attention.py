@@ -1159,7 +1159,13 @@ class PallasAttentionBackendImpl(AttentionImpl):
         value: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        *,
+        dcp_duplicate_o_proj: bool = False,
     ) -> torch.Tensor:
+        q_dcp_replicated = (
+            self.dcp_world_size > 1
+            and query.shape[1] == self.num_heads * self.dcp_world_size
+        )
         return _forward_with_dcp(
             layer=layer,
             query=query,
@@ -1175,6 +1181,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
             dcp_rank=self.dcp_rank,
             kv_layout=self.kv_layout,
             decode_query_size=self.decode_query_size,
+            q_dcp_replicated=q_dcp_replicated,
+            dcp_duplicate_o_proj=dcp_duplicate_o_proj,
         )
 
     def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
@@ -1464,7 +1472,18 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # For determine_available_memory case.
         if kv_cache.numel() == 0:
             if output is None:
-                output = torch.ones_like(query)
+                use_dup = self.dcp_world_size > 1 and (
+                    bool(getattr(layer, "dcp_duplicate_o_proj", False))
+                    or bool(getattr(self, "dcp_duplicate_o_proj", False))
+                )
+                out_heads = (
+                    self.num_heads * self.dcp_world_size if use_dup else self.num_heads
+                )
+                if query.dim() == 3:
+                    out_shape = (query.shape[0], out_heads, self.head_size)
+                else:
+                    out_shape = (query.shape[0], out_heads * self.head_size)
+                output = torch.ones(out_shape, dtype=query.dtype, device=query.device)
             return output
 
         query_dim = query.dim()
@@ -1480,10 +1499,19 @@ class PallasAttentionBackendImpl(AttentionImpl):
         else:
             k_len, k_compute_dim = key.shape
 
-        assert q_compute_dim == self.head_size * self.num_heads
-        assert k_compute_dim == self.head_size * self.num_kv_heads
+        local_q_dim = self.head_size * self.num_heads
+        if (
+            self.dcp_world_size > 1
+            and query.numel() == k_len * local_q_dim * self.dcp_world_size
+        ):
+            q_len = k_len
+            q_compute_dim = local_q_dim * self.dcp_world_size
+            query = query.view(q_len, q_compute_dim // self.head_size, self.head_size)
+        else:
+            assert q_compute_dim == local_q_dim
+            query = query.view(q_len, self.num_heads, self.head_size)
 
-        query = query.view(q_len, self.num_heads, self.head_size)
+        assert k_compute_dim == self.head_size * self.num_kv_heads
         key = key.view(k_len, self.num_kv_heads, self.head_size)
         value = value.view(k_len, self.num_kv_heads, self.head_size)
         assert key.shape == value.shape
@@ -1536,15 +1564,31 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     "DCP attention does not support attention sinks or "
                     "the bundled KV cache path."
                 )
+            dcp_duplicate_o_proj = self.dcp_world_size > 1 and bool(
+                getattr(layer, "dcp_duplicate_o_proj", False)
+                or getattr(self, "dcp_duplicate_o_proj", False)
+                or (
+                    output is not None
+                    and output.numel()
+                    == k_len * self.num_heads * self.dcp_world_size * self.head_size
+                )
+            )
             outputs = self._run_dcp_forward(
-                layer, query, key, value, kv_cache, attn_metadata
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                dcp_duplicate_o_proj=dcp_duplicate_o_proj,
             )
             if outputs.shape[-1] > self.head_size:
                 outputs = outputs[..., : self.head_size]
             if query_dim == 2:
-                outputs = outputs.reshape(q_len, self.num_heads * self.head_size)
+                out_num_heads = outputs.shape[1]
+                outputs = outputs.reshape(q_len, out_num_heads * self.head_size)
             if output is not None:
-                output.copy_(outputs)
+                output.copy_(outputs.view_as(output))
             return outputs
 
         use_pcp_streaming = is_pcp_streaming_attention_metadata(attn_metadata)
