@@ -627,6 +627,7 @@ class TpuPlatform(Platform):
         # default) are registered in the scheduler process, which resolves the
         # backend for KV offloading without instantiating model layers.
         import vllm_torchtpu.layers.adapter.attention  # noqa: F401
+        import vllm_torchtpu.layers.adapter.layernorm  # noqa: F401
 
         if attn_selector_config.use_mla:
             selected_backend = AttentionBackendEnum.FLASH_ATTN_MLA
