@@ -170,6 +170,15 @@ When opening a pull request, please select the appropriate category prefix from 
 ### Reviewer Routing
 GitHub automatically requests reviews from the owners in `.github/CODEOWNERS` of the files a PR changes, and a PR needs an approval from a code owner of each area it touches before it can merge.
 
+### Merging with Auto-merge
+A PR can merge only after it has the code-owner approvals above and its required checks pass: pre-commit, DCO, the `ready` label, and TPU CI. Instead of waiting to press the merge button, turn on auto-merge, and GitHub squash-merges the PR as soon as both are true:
+
+```bash
+gh pr merge <PR_NUMBER> --squash --auto
+```
+
+Auto-merge skips no approval or check. Anyone with write access can turn it on, so a maintainer turns it on for a PR from a fork. A push from someone without write access turns it off again. To turn it off yourself, run `gh pr merge <PR_NUMBER> --disable-auto`.
+
 ---
 
 ## 7. Policy on AI-Assisted Code
