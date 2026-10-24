@@ -462,3 +462,17 @@ def test_gmm_v2_int4_packed_matches_reference():
 
     assert actual.shape == (batch_size, out_size)
     _assert_allclose(actual, expected, atol=3e-1, rtol=3e-1)
+
+
+def test_default_gmm_block_sizes_512_groups_ep1():
+    from vllm_torchtpu.kernels.megablox import tuned_block_sizes
+
+    tm_20k, tk_20k, tn_20k = tuned_block_sizes.get_default_gmm_block_sizes(
+        20480, 1024, 4096, 512
+    )
+    assert (tm_20k, tk_20k, tn_20k) == (512, 1024, 2048)
+
+    tm_8k, tk_8k, tn_8k = tuned_block_sizes.get_default_gmm_block_sizes(
+        8192, 1024, 4096, 512
+    )
+    assert (tm_8k, tk_8k, tn_8k) == (256, 1024, 2048)
