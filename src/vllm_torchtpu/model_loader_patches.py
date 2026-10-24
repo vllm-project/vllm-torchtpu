@@ -72,6 +72,11 @@ logger = init_logger(__name__)
 # (``ffn.experts.<e>.w1.scale``), 47 GiB across all 384 experts.
 _EXPERT_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale", ".scale")
 
+# ``source.is_unused_weight`` of the ``DefaultModelLoader._get_weights_iterator``
+# pass in flight, so ``_should_skip_weight_tpu`` drops those tensors before
+# ``get_tensor`` reads them.
+_active_is_unused_weight: Callable[[str], bool] | None = None
+
 
 def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
     from vllm.model_executor.model_loader.ep_weight_filter import parse_expert_id
@@ -92,8 +97,11 @@ def _should_skip_weight_tpu(
     Same contract as upstream (``local_expert_ids=None`` means no
     filtering), but the suffix allowlist also covers the compressed-tensors
     MXFP4 ``.weight_packed`` and ``.weight_scale`` names, so non-local
-    experts are skipped before their bytes are read.
+    experts are skipped before their bytes are read. Also skips weights
+    marked unused by the active model's ``is_unused_checkpoint_weight``.
     """
+    if _active_is_unused_weight is not None and _active_is_unused_weight(weight_name):
+        return True
     if local_expert_ids is None:
         return False
     return _should_skip(weight_name, local_expert_ids)
@@ -527,6 +535,10 @@ def patch_default_loader_ep_weight_filter() -> None:
                 ),
             )
             safetensors_load_strategy = "lazy"
+        elif safetensors_load_strategy is None and _active_is_unused_weight is not None:
+            # Auto mode prefetches whole files on NFS/Lustre, unused tensors
+            # included; lazy reads only the tensors that are not skipped.
+            safetensors_load_strategy = "lazy"
         return original_iterator(
             hf_weights_files,
             use_tqdm_on_load,
@@ -535,12 +547,35 @@ def patch_default_loader_ep_weight_filter() -> None:
             **kwargs,
         )
 
+    original_get_weights_iterator = (
+        default_loader.DefaultModelLoader._get_weights_iterator
+    )
+
+    @functools.wraps(original_get_weights_iterator)
+    def _get_weights_iterator(self, source):
+        is_unused = source.is_unused_weight
+        if is_unused is None:
+            return original_get_weights_iterator(self, source)
+
+        def _guarded():
+            global _active_is_unused_weight
+            prev = _active_is_unused_weight
+            _active_is_unused_weight = is_unused
+            try:
+                yield from original_get_weights_iterator(self, source)
+            finally:
+                _active_is_unused_weight = prev
+
+        return _guarded()
+
     weight_utils.safetensors_weights_iterator = safetensors_weights_iterator
     default_loader.safetensors_weights_iterator = safetensors_weights_iterator
+    default_loader.DefaultModelLoader._get_weights_iterator = _get_weights_iterator
     weight_utils._tpu_ep_filter_patch = True
     logger.info(
         "Applied TPU patch: EP weight filter covers "
-        ".weight_packed/.weight_scale/.scale, and prefetch reads only "
+        ".weight_packed/.weight_scale/.scale, skips unused checkpoint "
+        "tensors before read, and prefetch reads only "
         "local tensors (DefaultModelLoader)."
     )
 
