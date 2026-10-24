@@ -622,6 +622,9 @@ def _make_dspark_vllm_config(
 
 
 def _patch_dspark_env(monkeypatch: pytest.MonkeyPatch):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import dspark_sampling
+
+    monkeypatch.setattr(dspark_sampling, "initialize_collapse", MagicMock)
     fake_cur_cfg = SimpleNamespace(
         additional_config={},
         engram_config=None,
@@ -854,3 +857,68 @@ def test_dspark_load_weights(monkeypatch: pytest.MonkeyPatch):
     assert "model.confidence_head.proj.weight" in loaded2
     assert "model.layers.0.ffn.experts.w13_weight_scale_inv" in loaded2
     assert draft_lm2.model.confidence_head is not None
+
+
+def test_decode_sampler_uses_standard_logits_without_copying_lm_weight(monkeypatch):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import dspark_sampling
+
+    model = v2_dspark.DSparkDeepseekV41ForCausalLM.__new__(
+        v2_dspark.DSparkDeepseekV41ForCausalLM
+    )
+    nn.Module.__init__(model)
+    weight = torch.empty((129280, 5120), dtype=torch.bfloat16, device="meta")
+    model.lm_head = SimpleNamespace(weight=weight)
+    embedding = torch.empty((129280, 256), dtype=torch.bfloat16, device="meta")
+    markov_weight = torch.empty_like(embedding)
+    model.model = SimpleNamespace(
+        markov_head=SimpleNamespace(
+            markov_w1=SimpleNamespace(weight=embedding),
+            markov_w2=SimpleNamespace(weight=markov_weight),
+        )
+    )
+    logits = torch.empty((240, 129280), dtype=torch.bfloat16, device="meta")
+    compute_logits = MagicMock(return_value=logits)
+    monkeypatch.setattr(model, "compute_logits", compute_logits)
+    tokens = torch.zeros((48, 5), dtype=torch.int64)
+    sample = MagicMock(return_value=tokens)
+    monkeypatch.setattr(dspark_sampling, "initialize_samples", lambda: sample)
+    sampler = model.prepare_tpu_draft_sampler(
+        tp_size=1, block_size=5, sample_from_anchor=True
+    )
+    assert sampler is not None
+    assert model.lm_head.weight is weight
+    # Preparation must not attach any persistent tensor representation.
+    assert not any(isinstance(value, torch.Tensor) for value in vars(model).values())
+    hidden = torch.arange(240, dtype=torch.bfloat16)[:, None].expand(240, 5120)
+    input_ids = torch.arange(240)
+    assert sampler(hidden, input_ids, 5) is tokens
+    torch.testing.assert_close(
+        compute_logits.call_args.args[0][:, 0],
+        torch.arange(240, dtype=torch.bfloat16).view(48, 5).T.reshape(-1),
+    )
+    actual_logits, actual_embedding, actual_weight, anchors = sample.call_args.args
+    assert actual_logits is logits
+    assert actual_embedding is embedding
+    assert actual_weight is markov_weight
+    torch.testing.assert_close(anchors, input_ids[::5])
+    assert sampler(hidden[:235], input_ids[:235], 5) is None
+    assert compute_logits.call_count == 1
+    compute_logits.return_value = logits.float()
+    assert sampler(hidden, input_ids, 5) is None
+    assert sample.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "tp_size,block_size,anchor", [(2, 5, True), (1, 4, True), (1, 5, False)]
+)
+def test_decode_sampler_preserves_other_configurations(tp_size, block_size, anchor):
+    model = v2_dspark.DSparkDeepseekV41ForCausalLM.__new__(
+        v2_dspark.DSparkDeepseekV41ForCausalLM
+    )
+    nn.Module.__init__(model)
+    assert (
+        model.prepare_tpu_draft_sampler(
+            tp_size=tp_size, block_size=block_size, sample_from_anchor=anchor
+        )
+        is None
+    )

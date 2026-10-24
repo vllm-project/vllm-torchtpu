@@ -246,3 +246,71 @@ def test_draft_precompile_keeps_context_kv_on_target_buckets():
     proposer._dummy_draft_forward.assert_called_once_with(
         num_tokens=40, use_max_model_len=True, sync=True
     )
+
+
+@pytest.mark.parametrize("has_sampler", [False, True])
+def test_model_sampler_prepared_after_parent_weight_sharing(has_sampler):
+    from vllm_torchtpu.spec_decode.dflash import DFlashProposer
+
+    proposer = _make_proposer({"dspark_noise_token_id": 7, **_LAYER_IDS})
+    proposer.runner.mesh.size = 1
+    model = SimpleNamespace(
+        compute_draft_logits=None,
+        markov_embed=None,
+        markov_bias=None,
+        map_draft_to_target=None,
+        has_own_lm_head=False,
+        has_own_embed_tokens=False,
+    )
+    sampler = mock.Mock()
+    if has_sampler:
+        model.prepare_tpu_draft_sampler = mock.Mock(return_value=sampler)
+    target = object()
+
+    def share_weights(actual_target):
+        assert actual_target is target
+        proposer.draft_model = model
+
+    with mock.patch.object(DFlashProposer, "load_model", side_effect=share_weights):
+        proposer.load_model(target)
+    if has_sampler:
+        model.prepare_tpu_draft_sampler.assert_called_once_with(
+            tp_size=1, block_size=4, sample_from_anchor=True
+        )
+        assert proposer._decode_samples is sampler
+    else:
+        assert proposer._decode_samples is None
+
+
+@pytest.mark.parametrize("sampler_mode", ["absent", "unsupported", "supported"])
+def test_model_sampler_fallback_retains_vocab_remapping_and_hidden(sampler_mode):
+    import inspect
+
+    proposer = _make_proposer({"dspark_noise_token_id": 7, **_LAYER_IDS})
+    hidden = torch.arange(16, dtype=torch.float32).view(8, 2)
+    logits = torch.tensor([[0.0, 1.0, 0.0]]).expand(8, 3)
+    proposer.draft_model = SimpleNamespace(
+        model=lambda **kwargs: hidden,
+        compute_draft_logits=lambda x: logits,
+        markov_embed=lambda ids: ids,
+        markov_bias=lambda ids: torch.zeros((ids.shape[0], 3)),
+        map_draft_to_target=lambda ids: ids + 7,
+    )
+    expected = torch.full((2, 4), 8, dtype=torch.int64)
+    if sampler_mode != "absent":
+        if sampler_mode == "supported":
+            expected = torch.full((2, 4), 9, dtype=torch.int64)
+        proposer._decode_samples = mock.Mock(
+            return_value=expected if sampler_mode == "supported" else None
+        )
+    ids = torch.zeros(8, dtype=torch.int64)
+    tokens, actual_hidden = inspect.unwrap(DSparkProposer._dflash_forward_and_sample)(
+        proposer, ids, ids, 4
+    )
+    torch.testing.assert_close(tokens, expected)
+    assert actual_hidden is hidden
+    if sampler_mode != "absent":
+        proposer._decode_samples.assert_called_once()
+        args = proposer._decode_samples.call_args.args
+        torch.testing.assert_close(args[0], hidden)
+        assert args[1] is ids and args[2] == 4

@@ -366,7 +366,7 @@ def _swa_attention(q, pool, records, sink, scale):
     )
 
 
-def paged_attention_jax(
+def _general_paged_attention_jax(
     q: jax.Array,
     swa_pool: jax.Array,
     main_pool: jax.Array,
@@ -392,6 +392,54 @@ def paged_attention_jax(
     )
     denominator += jnp.exp(sink.astype(jnp.float32)[None] - maximum)
     return (numerator / denominator[..., None]).astype(q.dtype)
+
+
+def paged_attention_jax(
+    q: jax.Array,
+    swa_pool: jax.Array,
+    main_pool: jax.Array,
+    swa_records: jax.Array,
+    main_records: jax.Array,
+    sink: jax.Array,
+    scale: float,
+    gathered: jax.Array | None = None,
+) -> jax.Array:
+    if (
+        q.shape == (240, 64, 512)
+        and q.dtype == jnp.bfloat16
+        and swa_records.shape == (240, 192)
+        and main_records.shape[1] == 0
+        and isinstance(swa_pool, tuple)
+        and scale == 512**-0.5
+    ):
+        shared = jnp.all(swa_records.reshape(48, 5, 192) == swa_records[::5, None, :])
+        return jax.lax.cond(
+            shared,
+            lambda _: _shared_draft_attention(q, swa_pool, swa_records, sink),
+            lambda _: _general_paged_attention_jax(
+                q, swa_pool, main_pool, swa_records, main_records, sink, scale, gathered
+            ),
+            None,
+        )
+    return _general_paged_attention_jax(
+        q, swa_pool, main_pool, swa_records, main_records, sink, scale, gathered
+    )
+
+
+def _shared_draft_attention(q, pool, records, sink):
+    from vllm_torchtpu.kernels.shared_record_attention import shared_record_attention
+
+    requests = q.shape[0] // 5
+    pieces = split_pieces(q.reshape(requests, 320, 512), 4)
+    shared = records[::5]
+    kv = gather_cache_pieces(pool, shared.reshape(-1), 512).reshape(
+        4, requests, 192, 128
+    )
+    kv = jnp.where((shared >= 0)[None, :, :, None], kv, 0)
+    mask = jnp.pad((shared >= 0).astype(jnp.int32), ((0, 0), (0, 64)))[:, None, :]
+    return shared_record_attention(
+        mask, pieces, kv, jnp.tile(sink, 5)[:, None]
+    ).reshape(q.shape)
 
 
 def _compact_selected(records: jax.Array) -> jax.Array:

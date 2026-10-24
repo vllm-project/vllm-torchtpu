@@ -590,6 +590,9 @@ def _make_dspark_vllm_config(
 
 
 def _patch_dspark_env(monkeypatch: pytest.MonkeyPatch):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import dspark_sampling
+
+    monkeypatch.setattr(dspark_sampling, "initialize_collapse", MagicMock)
     fake_cur_cfg = SimpleNamespace(
         additional_config={},
         engram_config=None,
