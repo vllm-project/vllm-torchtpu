@@ -1,0 +1,56 @@
+#!/bin/bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# shellcheck disable=SC2034  # Variables are sourced by run_benchmarks.sh
+# Nightly sweep for Qwen3.5-35B-A3B-FP8 with TP=8, the throughput layout on
+# v7x-8. TP=4 (qwen3.5-35b-fp8-tp4-ep) uses 4 of the 8 TensorCores, so each
+# rank streams 64 of the 256 experts every decode step; TP=8 halves that.
+# Measured at 1k/1k c64 on one tpu7x-2x2x1 node: 7309 vs 5963 output tok/s
+# and 7.70 vs 9.68 ms median TPOT (median of 3 interleaved runs each).
+MODEL="Qwen/Qwen3.5-35B-A3B-FP8"
+TENSOR_PARALLELISM=8
+DATA_PARALLELISM=1
+ENABLE_EP=true
+QUANTIZATION="fp8"
+ISL_OSL_CONFIGS="1024:1024"
+CONCURRENCY_OPTIONS="64"
+# The most this config ever runs at once is lm-eval's 128 concurrent requests
+# (the benchmark runs 64), so the 256 and 512 sequence buckets the default of
+# 512 adds are compiled at boot and never used: 30-50s per boot.
+MAX_NUM_SEQS=128
+RANDOM_RANGE_RATIO="0.8"
+GPU_MEMORY_UTILIZATION=0.9
+
+# Force greedy decoding for a deterministic perf measurement. Without this,
+# `vllm bench serve` sends no temperature, so the server applies Qwen3.5-35B's
+# generation_config.json (do_sample=true, temperature 1.0, top_p 0.95,
+# top_k 20 -> non-greedy).
+BENCHMARK_TEMPERATURE=0
+
+# Route MoE token movement through the SparseCore ragged_gather / gather_reduce
+# path. The plain-JAX (SC=0) path regressed ~1.7pp on mmlu_pro after PR #371
+# added the ragged_gather_v2 defaults (two consecutive CI runs at 0.7564 and
+# 0.7521 vs the pre-#371 8ed931c5 sample at 0.7771), despite the SC=0 fused_moe
+# HLO being byte-identical between v1 and v2 selection in local repro across
+# 33 shape buckets. Enabling SC=1 routes 35B through the same path already
+# quality-validated on Qwen3.5-397B DP=8 (local mmlu_pro 0.8264 near baseline
+# 0.8321). Also picks up the ~26-43% MoE-routing perf improvement from
+# ragged_gather_v2 (PR #371 kernel benchmarks).
+export USE_MOE_SPARSE_CORE=1
+
+# Extra arguments for vllm serve
+EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--block-size 256 --limit-mm-per-prompt {\"image\":0,\"video\":0} --default-chat-template-kwargs {\"enable_thinking\":false}"
+MMLU_PRO_DISABLE_MULTITURN_ARGS=true
+EVAL_TOLERANCE="0.02"
