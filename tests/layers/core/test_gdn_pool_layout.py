@@ -42,6 +42,80 @@ def test_qwen35_layout_includes_conv_tile_padding(
     assert layout.required_bytes == (ssm_tokens + conv_tokens) * 1024
 
 
+@pytest.mark.parametrize("prepared", [False, True])
+def test_pooled_prepared_input_crosses_real_shard_map(monkeypatch, prepared):
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput
+    from vllm_torchtpu.layers.core import gdn_attention
+
+    mesh = jax.sharding.Mesh(np.array(jax.devices("cpu")[:1]), ("model",))
+    projection = jnp.arange(4 * 512, dtype=jnp.bfloat16).reshape(4, 512)
+    qkv = (
+        Conv1DInput(projection.astype(jnp.float32)[:, None, :], projection.dtype)
+        if prepared
+        else projection
+    )
+    pool = jnp.zeros((3, 256, 1, 4, 256), jnp.int8)
+    specs, plans = [], []
+    shard_map = jax.shard_map
+
+    def record_map(*args, **kwargs):
+        specs.append(kwargs["in_specs"][0])
+        return shard_map(*args, **kwargs)
+
+    def fused(inputs, b, a, conv, recurrent, *args, **kwargs):
+        assert conv is None and recurrent is None
+        assert kwargs["state_source"].shape == pool.shape
+        plan = kwargs["state_plan"]
+        plans.append(plan)
+        assert plan.stride == 1
+        assert plan.recurrent.nrows == 128
+        assert plan.conv.row0 == 128 and plan.conv.nrows == 4
+        assert plan.conv.view_dtype == jnp.bfloat16
+        values = inputs.values[:, 0] if isinstance(inputs, Conv1DInput) else inputs
+        dtype = inputs.output_dtype if isinstance(inputs, Conv1DInput) else inputs.dtype
+        return kwargs["state_source"], values[:, :256].astype(dtype)
+
+    monkeypatch.setattr(jax, "shard_map", record_map)
+    monkeypatch.setattr(gdn_attention.gdn_v3_wrapper, "fused_conv1d_gdn", fused)
+    new_pool, output = gdn_attention.run_jax_gdn_attention_pooled(
+        qkv,
+        jnp.zeros((4, 2)),
+        jnp.zeros((4, 2)),
+        pool,
+        jnp.zeros((512, 1, 4)),
+        None,
+        jnp.zeros(2),
+        jnp.zeros(2),
+        jnp.array([1], jnp.int32),
+        jnp.array([0, 4], jnp.int32),
+        jnp.array([0, 1, 1], jnp.int32),
+        jnp.array([4], jnp.int32),
+        n_kq=1,
+        n_v=2,
+        d_k=128,
+        d_v=128,
+        kernel_size=4,
+        pool_block_tokens=256,
+        mesh=mesh,
+    )
+    assert plans and len(specs) == 1
+    if prepared:
+        assert isinstance(specs[0], Conv1DInput)
+        assert specs[0].values == P(None, None, "model")
+        assert specs[0].output_dtype == projection.dtype
+        assert jax.tree.structure(specs[0]) == jax.tree.structure(qkv)
+    else:
+        assert specs[0] == P(None, "model")
+    assert output.dtype == projection.dtype
+    np.testing.assert_array_equal(output, np.asarray(projection)[:, :256])
+    np.testing.assert_array_equal(new_pool, pool)
+
+
 @pytest.mark.parametrize(
     ("ssm_bytes", "conv_bytes", "token_bytes", "ssm_tokens", "conv_tokens"),
     [

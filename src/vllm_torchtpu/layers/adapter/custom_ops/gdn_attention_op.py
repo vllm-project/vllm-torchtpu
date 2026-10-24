@@ -709,6 +709,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     ) -> jax.Array | Conv1DInput:
         """Stateless trace-time hook; overrides must also be static methods.
 
+        Only the pooled non-PCP operator calls this hook. Dense and PCP
+        operators keep their existing input preparation.
         Use only the operands and mesh. Instance-dependent preparation needs
         an explicit immutable configuration in the shared operator key.
         """

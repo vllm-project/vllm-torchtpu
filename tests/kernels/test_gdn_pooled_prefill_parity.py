@@ -30,7 +30,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 from vllm_torchtpu.kernels.gdn.v3 import wrapper
+from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput
+from vllm_torchtpu.kernels.qwen4_exp.gdn_input import compact_qkv_input
 from vllm_torchtpu.layers.core import gdn_attention
 
 pytestmark = pytest.mark.tpu_test
@@ -91,6 +94,120 @@ def _benchmark_unwords(words, pool):
     """Inverse of `_benchmark_mgr_words`."""
     moved = words.reshape(*pool.shape[:-2], pool.shape[-1], 1).view(pool.dtype)
     return jnp.moveaxis(moved, -2, -1).reshape(pool.shape)
+
+
+@pytest.mark.parametrize("ssm_dtype", [jnp.bfloat16, jnp.float32])
+def test_prepared_pooled_prefill_then_decode(ssm_dtype, monkeypatch):
+    """Compare prepared and ordinary input through the real pooled bridge."""
+    from vllm import envs as vllm_envs
+
+    monkeypatch.setattr(vllm_envs, "VLLM_KV_CACHE_LAYOUT", "NHD")
+    n_kq, n_v, dim, width = 16, 48, 128, 10240
+    block_size, token_bytes, slots = 128, 1024, 3
+    layout = derive_pooled_gdn_state_layout(
+        ssm_bytes=n_v * dim * dim * jnp.dtype(ssm_dtype).itemsize,
+        conv_bytes=3 * width * jnp.dtype(jnp.float32).itemsize,
+        token_bytes=token_bytes,
+    )
+    manager_tokens = (
+        (layout.required_tokens + block_size - 1) // block_size * block_size
+    )
+    split = manager_tokens // block_size
+    raw = np.empty((slots, manager_tokens * token_bytes), np.uint8)
+    # Finite, nonzero initial states with distinct active/inactive owners.
+    for slot in range(slots):
+        raw[slot].fill((0x34, 0x3C, 0x35)[slot])
+    pool_shape = (slots * split, block_size, 1, 4, 256)
+
+    def make_pool():
+        return jax.lax.bitcast_convert_type(
+            jnp.array(raw.reshape(pool_shape), copy=True), jnp.float8_e4m3fn
+        )
+
+    rng = np.random.default_rng(54)
+
+    def normal(shape, dtype=jnp.bfloat16):
+        return jnp.asarray(rng.normal(0, 0.02, shape), dtype)
+
+    weight, bias = normal((width, 1, 4)), normal((width,))
+    a_log = normal((n_v,), jnp.float32)
+    dt_bias = normal((n_v,), jnp.float32) - 2
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("model",))
+
+    @functools.partial(jax.jit, static_argnames=("prepared",), donate_argnums=(0,))
+    def run(pool, qkv, b, a, context, *, prepared):
+        count = qkv.shape[0]
+        inputs = Conv1DInput(compact_qkv_input(qkv), qkv.dtype) if prepared else qkv
+        return gdn_attention.run_jax_gdn_attention_pooled(
+            inputs,
+            b,
+            a,
+            pool,
+            weight,
+            bias,
+            a_log,
+            dt_bias,
+            jnp.array([1, 2], jnp.int32),
+            jnp.array([0, count, count], jnp.int32),
+            jnp.array([0, 1, 1] if count > 1 else [1, 1, 1], jnp.int32),
+            jnp.array([context + count, 0], jnp.int32),
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=dim,
+            d_v=dim,
+            kernel_size=4,
+            pool_block_tokens=manager_tokens,
+            mesh=mesh,
+            recurrent_state_dtype=ssm_dtype,
+        )
+
+    def typed_rows(region, dtype):
+        # Inverse Mosaic's second-minor byte planes, independent of pool readers.
+        size = np.dtype(dtype).itemsize
+        packed = region.reshape(-1, size, 256).transpose(0, 2, 1).copy()
+        return packed.view(dtype).reshape(-1, 256)
+
+    def read_states(bits):
+        ssm_bytes = bits[1, : layout.ssm_tokens * token_bytes]
+        if ssm_dtype == jnp.bfloat16:
+            words = typed_rows(ssm_bytes, np.uint32).reshape(n_v, dim // 2, dim)
+            values = np.empty((n_v, dim, dim), np.uint16)
+            values[:, 0::2] = (words & 65535).astype(np.uint16)
+            values[:, 1::2] = (words >> 16).astype(np.uint16)
+            recurrent = values.view(jnp.bfloat16)
+        else:
+            recurrent = typed_rows(ssm_bytes, np.float32).reshape(n_v, dim, dim)
+        begin = layout.ssm_tokens * token_bytes
+        conv_bytes = bits[1, begin : begin + layout.conv_tokens * token_bytes]
+        conv = typed_rows(conv_bytes, np.float32)[: 3 * width // 256].reshape(
+            3, width
+        )
+        return conv, recurrent
+
+    ordinary, prepared = make_pool(), make_pool()
+    context = 256
+    for count in (128, 1, 1, 1):
+        qkv, b, a = normal((count, width)), normal((count, n_v)), normal((count, n_v))
+        ordinary, expected = run(ordinary, qkv, b, a, context, prepared=False)
+        prepared, actual = run(prepared, qkv, b, a, context, prepared=True)
+        assert actual.dtype == expected.dtype == qkv.dtype
+        np.testing.assert_array_equal(actual, expected)
+        bits = [
+            np.asarray(jax.lax.bitcast_convert_type(p, jnp.uint8)).reshape(slots, -1)
+            for p in (ordinary, prepared)
+        ]
+        np.testing.assert_array_equal(bits[0], bits[1])
+        for value in bits:
+            np.testing.assert_array_equal(value[[0, 2]], raw[[0, 2]])
+        for got, want in zip(read_states(bits[1]), read_states(bits[0])):
+            assert got.dtype == want.dtype
+            assert np.isfinite(got.astype(np.float32)).all()
+            np.testing.assert_array_equal(got, want)
+        assert not np.array_equal(bits[0][1], raw[1]), "active state was not updated"
+        print(
+            f"pooled prepared parity: ssm={jnp.dtype(ssm_dtype)}, tokens={count}, exact"
+        )
+        context += count
 
 
 def _benchmark_write_states(pool, recurrent, conv):

@@ -21,15 +21,19 @@ from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput
 
 
 @pytest.mark.parametrize("prepared", [False, True])
+@pytest.mark.parametrize("projection_dtype", [jnp.bfloat16, jnp.float32])
 def test_prepared_input_preserves_output_dtype_and_default_conversion(
-    monkeypatch, prepared
+    monkeypatch, prepared, projection_dtype
 ):
     from types import SimpleNamespace
 
     class InputsPrepared(Exception):
         pass
 
-    def stop_before_kernel(**kwargs):
+    configs = []
+
+    def stop_before_kernel(kernel, **kwargs):
+        configs.append(kernel.keywords["cfg"])
         raise InputsPrepared
 
     original_pad = jnp.pad
@@ -45,8 +49,8 @@ def test_prepared_input_preserves_output_dtype_and_default_conversion(
         "get_tpu_info",
         lambda: SimpleNamespace(num_lanes=128, vmem_capacity_bytes=128 * 1024**2),
     )
-    monkeypatch.setattr(wrapper.memory_ref, "ConvWeightsRef", stop_before_kernel)
-    qkv = jnp.zeros((128, 384), jnp.bfloat16)
+    monkeypatch.setattr(wrapper.pl, "pallas_call", stop_before_kernel)
+    qkv = jnp.zeros((128, 384), projection_dtype)
     if prepared:
         qkv = Conv1DInput(qkv.astype(jnp.float32)[:, None, :], qkv.dtype)
     with pytest.raises(InputsPrepared):
@@ -71,3 +75,26 @@ def test_prepared_input_preserves_output_dtype_and_default_conversion(
             kernel_size=4,
         )
     assert pad_dtypes[0] == jnp.float32
+    assert len(configs) == 1
+    assert configs[0].dtypes.act_in == jnp.float32
+    assert configs[0].dtypes.act_out == projection_dtype
+
+
+@pytest.mark.parametrize(
+    "shape,dtype",
+    [((8, 384), jnp.float32), ((8, 2, 384), jnp.float32), ((8, 1, 384), jnp.bfloat16)],
+)
+def test_prepared_input_reports_invalid_shape_and_dtype(shape, dtype):
+    value = jnp.zeros(shape, dtype)
+    with pytest.raises(ValueError) as error:
+        wrapper.fused_conv1d_gdn(
+            Conv1DInput(value, jnp.bfloat16),
+            *([None] * 12),
+            n_kq=1,
+            n_v=1,
+            d_k=128,
+            d_v=128,
+            kernel_size=4,
+        )
+    assert f"shape={shape}" in str(error.value)
+    assert f"dtype={value.dtype}" in str(error.value)
