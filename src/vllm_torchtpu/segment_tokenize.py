@@ -201,6 +201,8 @@ def patch_renderer_segment_tokenize() -> None:
         return
     orig = cls._tokenize_prompt
     max_cached = envs.VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS
+    verify = envs.VLLM_TPU_SEGMENT_TOKENIZE_VERIFY
+    stats = {"checked": 0, "mismatched": 0}
 
     def _tokenize_prompt(self, prompt, params):
         kwargs = params.get_encode_kwargs()
@@ -218,6 +220,33 @@ def patch_renderer_segment_tokenize() -> None:
         ):
             # Over-long prompt: keep the tokenizer's own truncation semantics.
             return orig(self, prompt, params)
+        if verify:
+            # Shadow check (VLLM_TPU_SEGMENT_TOKENIZE_VERIFY): also run the
+            # full tokenization and serve it, so a mismatch is logged but
+            # never reaches the engine.
+            full = orig(self, prompt, params)
+            stats["checked"] += 1
+            if list(full["prompt_token_ids"]) != ids:
+                stats["mismatched"] += 1
+                ref = list(full["prompt_token_ids"])
+                first = next(
+                    (i for i, (a, b) in enumerate(zip(ids, ref)) if a != b),
+                    min(len(ids), len(ref)),
+                )
+                logger.warning(
+                    "VLLM_TPU_SEGMENT_TOKENIZE verify: mismatch (%d vs %d "
+                    "tokens, first difference at %d)",
+                    len(ids),
+                    len(ref),
+                    first,
+                )
+            if stats["checked"] % 100 == 0:
+                logger.info(
+                    "VLLM_TPU_SEGMENT_TOKENIZE verify: %d checked, %d mismatched",
+                    stats["checked"],
+                    stats["mismatched"],
+                )
+            return full
         return self._build_tokens_prompt(ids, prompt, offset_mapping=None)
 
     cls._tokenize_prompt = _tokenize_prompt
