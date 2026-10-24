@@ -120,3 +120,20 @@ def test_resolve_with_env_vars(monkeypatch):
     assert standard["host_tracer_level"] == 1
     assert standard["device_tracer_level"] == 2
     assert advanced["tpu_trace_mode"] == "TRACE_COMPUTE_AND_SYNC"
+
+
+def test_resolve_with_profiler_options_env(monkeypatch):
+    monkeypatch.setenv(
+        "TPU_PROFILER_OPTIONS", "python_tracer_level:0;tpu_trace_mode:TRACE_ALL;"
+    )
+    _, standard, advanced = resolve_profile_dir_and_opts("/tmp/base")
+    assert standard["python_tracer_level"] == 0
+    assert standard["host_tracer_level"] == 2
+    assert advanced["tpu_trace_mode"] == "TRACE_ALL"
+
+    # A request's own options override the environment.
+    _, standard, advanced = resolve_profile_dir_and_opts(
+        "/tmp/base", "python_tracer_level:1;tpu_trace_mode:TRACE_COMPUTE;"
+    )
+    assert standard["python_tracer_level"] == 1
+    assert advanced["tpu_trace_mode"] == "TRACE_COMPUTE"
