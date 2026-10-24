@@ -3408,6 +3408,10 @@ class Eagle3Proposer:
             return False
         num_reqs = int(getattr(chunk, "num_reqs", 0) or 0)
         qsl = getattr(chunk, "query_start_loc_np", None)
+        memo = (self, mk, chunk, attn_metadata, num_tokens, num_reqs, qsl)
+        hit = host_trims.mtp_step0_memo_get(*memo)
+        if hit is not None:
+            return hit
         K = self.speculative_config.num_speculative_tokens
         if (
             num_reqs == 0
@@ -3418,7 +3422,9 @@ class Eagle3Proposer:
             or not np.all(np.diff(qsl[: num_reqs + 1]) == K + 1)
         ):
             return mk.note_step("s0_mixed", False)
-        return mk.use_for_step(attn_metadata, num_tokens, step0=True)
+        ok = mk.use_for_step(attn_metadata, num_tokens, step0=True)
+        host_trims.mtp_step0_memo_put(*memo, ok)
+        return ok
 
     def precompile(self) -> None:
         """Precompile the draft-side @torch.compile wrapper subgraphs.

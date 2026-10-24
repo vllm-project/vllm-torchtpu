@@ -26,6 +26,8 @@ with :func:`configure` when the runner is built:
   (``vllm_torchtpu._qx_fastcall``; it only acts when
   ``tpu_compile.fast_compiled_call`` is on);
 * the AOT guard skip of the MTP draft programs (:func:`maybe_skip_aot_guards`);
+* the memo of the draft megakernel's step-0 decision
+  (:func:`mtp_step0_memo_get` / :func:`mtp_step0_memo_put`);
 * the KV connector's stats polled every :data:`CONN_STATS_EVERY_ON` steps
   instead of every step;
 * cached answers for process-constant predicates: the KV connector's transport
@@ -188,6 +190,83 @@ def maybe_skip_aot_guards(module: Any) -> bool:
 
 def _reset_for_tests() -> None:
     _done.clear()
+
+
+def _mtp_key(
+    mk: Any, chunk: Any, attn_metadata: Any, num_tokens: int, num_reqs: int, qsl: Any
+) -> tuple[Any, ...] | None:
+    """Everything the draft megakernel's step-0 decision reads: the
+    megakernel and whether it is bound, the request count, the chunk's
+    query_start_loc prefix, the token count, and the shapes of the step-0
+    attention metadata (seq_lens, query_start_loc, block_tables numel). None
+    for a step it can't memoize (a position override, no metadata)."""
+    attn_ctx = getattr(chunk, "attn_ctx", None)
+    if qsl is None or getattr(attn_ctx, "position_ids_override", None) is not None:
+        return None
+    md = attn_metadata.get(mk.layer_name) if isinstance(attn_metadata, dict) else None
+    if md is None:
+        return None
+    try:
+        return (
+            id(mk),
+            bool(getattr(mk, "bound", False)),
+            int(num_reqs),
+            int(num_tokens),
+            tuple(int(x) for x in qsl[: num_reqs + 1]),
+            tuple(md.seq_lens.shape),
+            tuple(md.query_start_loc.shape),
+            int(md.block_tables.numel()),
+        )
+    except Exception:  # noqa: BLE001 - an unexpected stand-in: no memo
+        return None
+
+
+def mtp_step0_memo_get(
+    owner: Any,
+    mk: Any,
+    chunk: Any,
+    attn_metadata: Any,
+    num_tokens: int,
+    num_reqs: int,
+    qsl: Any,
+) -> bool | None:
+    """Under the batch-1 rule, the step-0 decision `owner` (the drafter) took
+    for these inputs before, counted again in the megakernel's step mix; None
+    on a miss or with the rule off."""
+    if not ENABLED:
+        return None
+    memo = owner.__dict__.get("_mtp_step0_memo")
+    if not memo:
+        return None
+    key = _mtp_key(mk, chunk, attn_metadata, num_tokens, num_reqs, qsl)
+    hit = memo.get(key) if key is not None else None
+    if hit is None:
+        return None
+    ok, note_key = hit
+    mk.note_step(note_key, ok)
+    return ok
+
+
+def mtp_step0_memo_put(
+    owner: Any,
+    mk: Any,
+    chunk: Any,
+    attn_metadata: Any,
+    num_tokens: int,
+    num_reqs: int,
+    qsl: Any,
+    ok: bool,
+) -> None:
+    """Under the batch-1 rule, remember the step-0 decision for these inputs
+    (at most 256 entries per drafter)."""
+    if not ENABLED:
+        return
+    key = _mtp_key(mk, chunk, attn_metadata, num_tokens, num_reqs, qsl)
+    if key is None:
+        return
+    memo = owner.__dict__.setdefault("_mtp_step0_memo", {})
+    if len(memo) < 256:
+        memo[key] = (bool(ok), f"s0_n{int(num_tokens)}")
 
 
 _DEFAULT_GC_THRESH = gc.get_threshold()

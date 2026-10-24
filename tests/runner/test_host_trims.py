@@ -446,3 +446,86 @@ def test_the_runner_applies_the_rule_when_it_is_built():
     assert "host_trims.configure(self.vllm_config)" in inspect.getsource(
         tr.TPUModelRunner.__init__
     )
+
+
+# --- the draft megakernel's step-0 decision memo ----------------------------------
+
+
+class _StepMD:
+    def __init__(self, n_seqs: int, bt_numel: int) -> None:
+        self.seq_lens = torch.zeros(n_seqs)
+        self.query_start_loc = torch.zeros(n_seqs + 1)
+        self.block_tables = torch.zeros(bt_numel)
+
+
+class _DraftMk:
+    layer_name = "L"
+    bound = True
+
+    def __init__(self) -> None:
+        self.notes: list[tuple[str, bool]] = []
+        self.calls = 0
+
+    def note_step(self, key: str, run: bool) -> bool:
+        self.notes.append((key, run))
+        return run
+
+    def use_for_step(self, attn_metadata, num_rows, *, step0):
+        self.calls += 1
+        md = attn_metadata["L"]
+        ok = num_rows <= 8 and md.block_tables.numel() % md.seq_lens.shape[0] == 0
+        return self.note_step(f"s0_n{num_rows}", ok)
+
+
+def _verify_chunk(qsl, override=None):
+    import numpy as np
+
+    return types.SimpleNamespace(
+        num_reqs=len(qsl) - 1,
+        query_start_loc_np=np.asarray(qsl),
+        attn_ctx=types.SimpleNamespace(position_ids_override=override),
+    )
+
+
+def _drafter(mk):
+    """A proposer whose step-0 decision (`_use_mtp_mk_step0`) is the real one."""
+    from tests.spec_decode.test_eagle3 import _make_proposer
+
+    proposer = _make_proposer(method="mtp")
+    proposer.speculative_config.num_speculative_tokens = 3
+    proposer._mtp_mk, proposer._mtp_mk_step0 = mk, object()
+    return proposer
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_mtp_step0_memo_replays_the_decision_under_the_rule(monkeypatch, enabled):
+    monkeypatch.setattr(host_trims, "ENABLED", enabled)
+    mk = _DraftMk()
+    drafter = _drafter(mk)
+    md = {"L": _StepMD(1, 64)}
+    c = _verify_chunk([0, 4])
+    assert [drafter._use_mtp_mk_step0(c, md, 4) for _ in range(5)] == [True] * 5
+    # Every decision is counted in the megakernel's step mix, memoized or not.
+    assert len(mk.notes) == 5 and mk.notes[-1] == ("s0_n4", True)
+    assert mk.calls == (1 if enabled else 5)
+    if not enabled:
+        assert "_mtp_step0_memo" not in drafter.__dict__
+        return
+    # Any input of the decision changing misses the memo and recomputes.
+    assert drafter._use_mtp_mk_step0(c, md, 16) is False and mk.calls == 2
+    assert drafter._use_mtp_mk_step0(c, {"L": _StepMD(1, 63)}, 4) is True
+    assert mk.calls == 3
+    assert drafter._use_mtp_mk_step0(c, {"L": _StepMD(2, 63)}, 4) is False
+    assert mk.calls == 4
+    override = _verify_chunk([0, 4], override=object())
+    assert drafter._use_mtp_mk_step0(override, md, 4) is False  # mixed: XLA
+    assert mk.calls == 4 and mk.notes[-1] == ("s0_mixed", False)
+    assert drafter._use_mtp_mk_step0(_verify_chunk([0, 4, 8]), md, 8) is True
+    assert mk.calls == 5
+    # A partial request is a mixed step: never memoized, never admitted.
+    assert drafter._use_mtp_mk_step0(_verify_chunk([0, 4, 6]), md, 8) is False
+    assert mk.calls == 5
+    # Another megakernel (re-attached) does not see this one's decisions.
+    other = _DraftMk()
+    drafter._mtp_mk = other
+    assert drafter._use_mtp_mk_step0(c, md, 4) is True and other.calls == 1
