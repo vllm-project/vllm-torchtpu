@@ -26,7 +26,7 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.mla import kv_cache_utils
 from vllm_torchtpu.kernels.mla.sparse import dsa_gather, native_sc_gather
 
-DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+DEFAULT_VMEM_LIMIT_BYTES = 60 * 1024 * 1024
 TENSORCORE_CACHE_LAYOUT = "tensorcore"
 SPARSECORE_CACHE_LAYOUT = "sparsecore"
 DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE = 64
