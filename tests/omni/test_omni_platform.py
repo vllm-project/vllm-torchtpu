@@ -60,6 +60,13 @@ def cleanup_mock_omni():
             del sys.modules[mod_name]
 
 
+@pytest.fixture(autouse=True)
+def stub_qk_norm_rope_op(monkeypatch):
+    # The Wan patch builds the Pallas op when it is applied; stub it like
+    # test_tpu_flash_attention_backend stubs _flash_attention_op.
+    monkeypatch.setattr(omni_rope, "_qk_norm_rope_op", MagicMock())
+
+
 def test_register_omni_tpu_platform(monkeypatch):
     monkeypatch.setattr("vllm_torchtpu.omni.get_num_chips", lambda: 0)
     assert register_omni_tpu_platform() is None

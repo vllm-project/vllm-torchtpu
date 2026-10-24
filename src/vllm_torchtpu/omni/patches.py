@@ -247,21 +247,30 @@ def _patch_wan_fused_qk_norm_rope() -> None:
     # rotates them. XLA splits this into a row-reduction fusion for the norm
     # statistics, an apply fusion and the RoPE fusion, each streaming the
     # (tokens, 5120) q and k through HBM; the row reduction also runs well
-    # below HBM bandwidth. Together ~0.78 ms per block at 8190 tokens per
-    # core on v7x. A Pallas kernel that reads q and k once and writes them
-    # once takes 0.23 ms and is closer to an f64 reference (single rounding).
+    # below HBM bandwidth. On v7x this costs ~0.78 ms per block at 8190
+    # tokens per core. The patched forward runs a Pallas kernel that reads q
+    # and k once and writes them once (f32 row statistics, the bf16-rounded
+    # norm output, the pair-swap rotation on the MXU) for the bf16 calls it
+    # supports; other calls keep vLLM-Omni's forward. On 8190 x 5120 q and k
+    # it takes 0.23 ms against 2.31 ms for the torch path, and is closer to
+    # an f64 reference (max |err| 0.0188 against 0.0293). Wan2.2-I2V-A14B at
+    # 480x832x81 on 8 cores (CFG 2 x Ulysses 4): 0.907 -> 0.885 s/step.
+    # (A lane-roll pair swap instead of the MXU takes 0.30 ms.)
     # -------------------------------------------------------------------------
     from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
         WanSelfAttention,
     )
 
     from vllm_torchtpu.omni.rope import (
+        _qk_norm_rope_op,
         can_fuse_qk_norm_rope,
         wan_self_attention_fused,
     )
 
     if hasattr(WanSelfAttention, "_tpu_orig_forward"):
         return
+    # Build the op outside any compiled region.
+    _qk_norm_rope_op()
     WanSelfAttention._tpu_orig_forward = WanSelfAttention.forward
 
     def _fused_self_attention_forward(
