@@ -38,6 +38,13 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     dcp_sc_compact,
     metadata,
 )
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    components as indexing,
+)
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
+    SparseCoreTopK,
+    TopKBackend,
+)
 
 try:
     from vllm_torchtpu.logger import init_logger
@@ -51,6 +58,7 @@ KVLayout = config.KVLayout
 DEFAULT_BUFFER_COUNT = config.DEFAULT_BUFFER_COUNT
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 DCP_AXIS_NAME = "dcp"
+_DEFAULT_TOPK_BACKEND = SparseCoreTopK()
 
 cp_local_to_global = metadata.cp_local_to_global
 cp_local_length = metadata.cp_local_length
@@ -203,6 +211,7 @@ def kernel(
     buffer_count: int = 3,
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
     chunk_idx: int = 0,
+    components: indexing.StreamIndexComponents | None = None,
 ):
     """Executes the n-buffered Pallas scoring pipeline for StreamIndex Top-K."""
     scores_hbm_ref = score_refs[-1]
@@ -225,7 +234,9 @@ def kernel(
             kv_packing,
             _,
         ) = cache_kv_hbm_ref.shape
-        page_size = page_size_per_kv_packing * kv_packing
+        page_size = page_size_per_kv_packing * (
+            kv_packing if components is None else components.keys.packing
+        )
         kv_sublane_groups = None
         kv_head_dim_groups = None
 
@@ -512,7 +523,13 @@ def kernel(
         bkvs = []
         bkv_scales = []
         for batch_idx in range(seq_batch_size):
-            if seq_along_lane:
+            if components is not None:
+                keys, scales = components.keys.read(
+                    bkv_vmem.at[batch_idx], bkv_sz, head_dim
+                )
+                bkvs.append(keys)
+                bkv_scales.append(scales)
+            elif seq_along_lane:
                 # Keys and scales come straight out of the packed block in their MXU
                 # and lane layouts respectively; see `seq_along_lane_block_rows`.
                 rows = seq_along_lane_block_rows(bkv_vmem)
@@ -633,9 +650,17 @@ def kernel(
                 )
 
         else:
-            groups_per_chunk = lane_chunk // kv_packing
+            groups_per_chunk = lane_chunk // (
+                kv_packing if components is None else components.keys.packing
+            )
 
             def load_chunk(c):
+                if components is not None:
+                    return components.keys.read(
+                        bkv_vmem.at[0, pl.ds(c * groups_per_chunk, groups_per_chunk)],
+                        lane_chunk,
+                        head_dim,
+                    )
                 blk = bkv_vmem[0, pl.ds(c * groups_per_chunk, groups_per_chunk)]
                 flat = blk.reshape(lane_chunk, blk.shape[-1])
                 keys = pltpu.bitcast(flat[:, :head_dim], jnp.float8_e4m3fn)
@@ -1002,6 +1027,7 @@ def _effective_row_lengths(
     cp_rank: jax.Array | int = 0,
     cp_size: int = 1,
     interleave_c: int = 1,
+    components: indexing.StreamIndexComponents | None = None,
 ) -> jax.Array:  # i32[num_tokens]
     """Visible compressed KV positions per token row of the score matrix.
 
@@ -1019,8 +1045,12 @@ def _effective_row_lengths(
     q_len = cu_q_lens[seq_ids + 1] - q_start
     seq_len = seq_lens[seq_ids]
     token_pos = seq_len - q_len + (token_ids - q_start)
+    if components is not None:
+        token_pos = components.schedule.positions(token_pos)
     kv_len = seq_len // compression_ratio
     visible = jnp.minimum(kv_len, token_pos // compression_ratio + 1)
+    if components is not None:
+        visible = components.schedule.visible_lengths(visible)
     visible = cp_local_length(visible, cp_rank, cp_size, interleave_c)
     valid = token_ids < cu_q_lens[num_seqs]
     return jnp.where(valid, jnp.minimum(visible, num_positions), 0)
@@ -1043,6 +1073,8 @@ def _effective_row_lengths(
         "interleave_size",
         "return_scores",
         "uniform_q_len",
+        "components",
+        "topk_backend",
     ),
 )
 def streamindex_topk(
@@ -1072,6 +1104,8 @@ def streamindex_topk(
     interleave_size: int = 1,
     return_scores: bool = False,
     uniform_q_len: int | None = None,
+    components: indexing.StreamIndexComponents | None = None,
+    topk_backend: TopKBackend = _DEFAULT_TOPK_BACKEND,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1137,6 +1171,14 @@ def streamindex_topk(
         what makes a cross-rank merge possible. A local top-k over a sharded KV
         axis is not the global top-k, so the merge needs the scores the same way
         the DCP attention kernels need an LSE output.
+
+      components: Optional static key reader and schedule for HEAD_ALONG_SUBLANE.
+        Composed schedules always use the scoring path, even with early exit enabled.
+        None retains the
+        original packed-key reader and metadata traversal.
+      topk_backend: Static selector for the score-bit buffers. The default keeps
+        SparseCore selection and chunk overlap. A backend without overlap uses
+        the same scoring chunks without cross-engine scheduling annotations.
 
     Returns:
       Top-K indices (rank-local when `cp_size > 1`, global compressed positions
@@ -1211,6 +1253,13 @@ def streamindex_topk(
     prepared_indexer_weights = prepare_index_weights(indexer_weights, original_dtype)
     q = prepare_q_inputs(q)
     head_dim = q.shape[-1]
+    if components is not None:
+        components.keys.validate(cache_kv, head_dim, kv_layout)
+        components.schedule.validate(compression_ratio)
+        if kv_layout != KVLayout.HEAD_ALONG_SUBLANE:
+            raise NotImplementedError(
+                "StreamIndex components require HEAD_ALONG_SUBLANE layout."
+            )
 
     if kv_layout == KVLayout.SEQ_ALONG_LANE:
         total_num_pages, kv_sublane_groups, kv_packing, page_size = cache_kv.shape
@@ -1229,7 +1278,9 @@ def streamindex_topk(
             )
     else:
         _, page_size_per_kv_packing, kv_packing, _ = cache_kv.shape
-        page_size = page_size_per_kv_packing * kv_packing
+        page_size = page_size_per_kv_packing * (
+            kv_packing if components is None else components.keys.packing
+        )
     pages_per_seq = page_indices.shape[0] // max_num_seqs
 
     for bkv_p in num_kv_pages_per_blocks:
@@ -1336,6 +1387,7 @@ def streamindex_topk(
                     buffer_count=buffer_count,
                     kv_layout=kv_layout,
                     chunk_idx=chunk_idx,
+                    components=components,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=num_scalar_prefetch,
@@ -1478,8 +1530,12 @@ def streamindex_topk(
                 seq_lens,
                 page_indices,
                 cu_q_lens,
-                pass_meta=pass_meta,
-                chunk_idx=chunk_idx,
+                pass_meta=(
+                    pass_meta
+                    if components is None
+                    else components.schedule.chunk_metadata(pass_meta, chunk_idx)
+                ),
+                chunk_idx=chunk_idx if components is None else 0,
                 chunk_token_start=chunk_token_start,
                 chunk_tokens=chunk_tokens,
                 out_dtype=out_dtype,
@@ -1516,6 +1572,7 @@ def streamindex_topk(
             cp_rank=cp_rank,
             cp_size=cp_size,
             interleave_c=interleave_c,
+            components=components,
         )
 
         if chunk_tokens is None or max_num_tokens % chunk_tokens:
@@ -1526,7 +1583,7 @@ def streamindex_topk(
         # Ids count from 1, so the 0 is never a real group: a single chunk has no
         # pair to annotate and takes the `None` branch below both times.
         group_base = 0
-        if num_chunks > 1:
+        if num_chunks > 1 and topk_backend.overlaps_scoring:
             group_base = config.reserve_scheduling_group_ids(num_chunks - 1)
 
         chunk_starts = (
@@ -1544,8 +1601,14 @@ def streamindex_topk(
             # Group g holds chunk g's SparseCore top-k and chunk g+1's TensorCore
             # scoring, so the scheduler emits `sc(g).start, tc(g+1), sc(g).done`.
             # Chunk 0's scoring and the last top-k have no partner.
-            tc_group = None if m == 0 else group_base + m - 1
-            sc_group = None if m == num_chunks - 1 else group_base + m
+            tc_group = (
+                group_base + m - 1 if m > 0 and topk_backend.overlaps_scoring else None
+            )
+            sc_group = (
+                group_base + m
+                if m < num_chunks - 1 and topk_backend.overlaps_scoring
+                else None
+            )
 
             start = m * chunk_len
             scores = _scores_for_chunk(
@@ -1564,25 +1627,20 @@ def streamindex_topk(
                     constant_values=BITS_NEG_INF,
                 )
 
+            selected = topk_backend.select(
+                scores,
+                k,
+                row_lengths=eff_row_lengths[start : start + chunk_len],
+                scheduling_group_id=sc_group,
+                return_scores=return_scores,
+            )
             if return_scores:
-                chunk_topk_idxs, chunk_topk_scores = sparsecore_topk(
-                    scores,
-                    k,
-                    row_lengths=eff_row_lengths[start : start + chunk_len],
-                    write_empty_rows=True,
-                    scheduling_group_id=sc_group,
-                    return_scores=True,
-                )
+                assert isinstance(selected, tuple)
+                chunk_topk_idxs, chunk_topk_scores = selected
                 topk_scores_list.append(chunk_topk_scores)
             else:
-                chunk_topk_idxs = sparsecore_topk(
-                    scores,
-                    k,
-                    row_lengths=eff_row_lengths[start : start + chunk_len],
-                    write_empty_rows=True,
-                    scheduling_group_id=sc_group,
-                    return_scores=False,
-                )
+                assert isinstance(selected, jax.Array)
+                chunk_topk_idxs = selected
             topk_idxs.append(chunk_topk_idxs)
 
         out = topk_idxs[0] if len(topk_idxs) == 1 else jnp.concatenate(topk_idxs)
@@ -1624,7 +1682,9 @@ def streamindex_topk(
         s_idx = jnp.arange(k, dtype=jnp.int32)[None, :]
         return jnp.where(s_idx <= max_valid_idx[:, None], s_idx, -1)
 
-    if not enable_early_exit:
+    # A custom schedule can change both visibility and DMA coverage. Its
+    # protocol does not promise equivalence to score-free prefix enumeration.
+    if not enable_early_exit or components is not None:
         return _common_path(None)
     return jax.lax.cond(
         jnp.max(seq_lens) // compression_ratio <= k,
