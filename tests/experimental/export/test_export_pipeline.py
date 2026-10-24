@@ -1273,6 +1273,30 @@ def test_layer_state_specs_declare_the_mla_latent_cache(
     assert kv.shape == (16, 1024 // packing, packing, 640)
 
 
+def test_layer_state_specs_reject_sparse_mla() -> None:
+    from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackendImpl
+
+    indexer_cache = SimpleNamespace(impl=None)
+    sparse_mla = SimpleNamespace(
+        impl=object.__new__(PallasMLAttentionBackendImpl),
+        head_size=576,
+        num_kv_heads=1,
+        kv_cache_quantized_dtype=None,
+        use_sparse=True,
+    )
+    exportable = SimpleNamespace(
+        _export_config=SimpleNamespace(
+            dtype="bf16", num_blocks=16, block_size=1024, tensor_parallel_size=1
+        ),
+        _attention_layers=lambda: [indexer_cache, sparse_mla],
+    )
+    with pytest.raises(
+        NotImplementedError,
+        match="sparse MLA is not supported by export",
+    ):
+        universal_adapter.UniversalVllmExportableLLM._layer_state_specs(exportable)
+
+
 @pytest.fixture
 def clean_launch_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for key in (
