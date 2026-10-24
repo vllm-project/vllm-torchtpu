@@ -166,11 +166,6 @@
       "concise_description": "`list[float | int | tuple[str, str, float]]` is not assignable to dict value type `float | int`"
     },
     {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector_stats.py",
-      "name": "unbound-name",
-      "concise_description": "`descriptors` may be uninitialized"
-    },
-    {
       "path": "src/vllm_torchtpu/distributed/pcp_rank_order.py",
       "name": "missing-attribute",
       "concise_description": "No attribute `tpu` in module `torch`"

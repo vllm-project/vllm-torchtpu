@@ -6117,6 +6117,50 @@ class TestTPUConnectorStats(unittest.TestCase):
             metrics.observe(mock_data_extra, engine_idx=0)
             assert push_counter._value.get() == 1124.0
 
+    def _build_prom_metrics(self) -> TpuKVConnectorPromMetrics:
+        registry = CollectorRegistry()
+        return TpuKVConnectorPromMetrics(
+            vllm_config=MagicMock(),
+            metric_types={
+                Gauge: partial(Gauge, registry=registry),
+                Counter: partial(Counter, registry=registry),
+                Histogram: partial(Histogram, registry=registry),
+            },
+            labelnames=["model_name", "engine"],
+            per_engine_labelvalues={0: ["my_model", "0"]},
+        )
+
+    def test_raiden_metric_setup_error_surfaces_instead_of_unbound_local(self):
+        with (
+            patch(
+                "vllm_torchtpu.distributed.utils.configure_raiden_telemetry",
+                side_effect=RuntimeError("boom"),
+            ),
+            pytest.raises(RuntimeError, match="boom"),
+        ):
+            self._build_prom_metrics()
+
+    def test_raiden_metric_metadata_failure_registers_no_dynamic_metrics(self):
+        mock_telemetry = MagicMock(spec=["get_metric_metadata"])
+        mock_telemetry.get_metric_metadata.side_effect = RuntimeError("no metadata")
+
+        with (
+            patch(
+                "vllm_torchtpu.distributed.utils.get_raiden_telemetry_module",
+                return_value=mock_telemetry,
+            ),
+            patch("vllm_torchtpu.distributed.utils.configure_raiden_telemetry"),
+            patch(
+                "vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats.logger"
+            ) as mock_logger,
+        ):
+            metrics = self._build_prom_metrics()
+
+        assert metrics.dynamic_metrics == {}
+        mock_logger.warning.assert_called_once_with(
+            "Failed to load TPU Raiden telemetry descriptors: %s", ANY
+        )
+
     def test_get_raiden_metric_definitions_with_none_labelnames(self):
         mock_telemetry = MagicMock()
         mock_desc1 = MagicMock()
