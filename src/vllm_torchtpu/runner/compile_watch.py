@@ -9,7 +9,7 @@ and the vllm_torchtpu frame that triggered it:
 
     Post-warmup compile #3 (12/76, 219 ms) from tpu_runner.py:2746 _apply_async_token_substitution
 
-``VLLM_TPU_LOG_POST_WARMUP_COMPILES=0`` turns it off.
+Off by default; ``VLLM_TPU_LOG_POST_WARMUP_COMPILES=1`` turns it on.
 """
 
 import time

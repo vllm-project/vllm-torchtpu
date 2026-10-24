@@ -1276,6 +1276,8 @@ class Eagle3Proposer:
     def _device_constant(self, key, build) -> torch.Tensor:
         """A small read-only device tensor that depends only on `key` (e.g.
         the request count), uploaded once instead of every step."""
+        if not envs.VLLM_TPU_PROPOSE_DEVICE_CONSTANTS:
+            return build().to(self.runner.device)
         cache = self.__dict__.setdefault("_device_constants", {})
         t = cache.get(key)
         if t is None:
