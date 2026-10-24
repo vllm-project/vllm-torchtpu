@@ -558,21 +558,19 @@ class DFlashProposer:
         return extra_chunks
 
     @torch.no_grad()
-    def prepare_prefill_handoff(self) -> None:
-        """Build draft context without proposing tokens on a PD producer.
+    def update_context(self) -> None:
+        """Update draft context KV without proposing tokens.
 
-        The caller must materialize cache writes before publishing the handoff.
-        Missing aux states are an error here: transferring target KV alone is
-        insufficient to resume DFlash/DSpark on the consumer.
+        Producers must materialize cache writes before publishing a handoff.
         """
         chunks = self.draft_chunks
         if not chunks:
-            raise RuntimeError("PD context update requires captured prefill chunks.")
+            raise RuntimeError("Draft context update requires captured prefill chunks.")
         for chunk in chunks:
             aux = chunk.aux_hidden_states
             if aux is None or (isinstance(aux, (list, tuple)) and not aux):
                 raise RuntimeError(
-                    "PD context update requires target aux hidden states."
+                    "Draft context update requires target aux hidden states."
                 )
         self._update_context_kv(chunks)
 

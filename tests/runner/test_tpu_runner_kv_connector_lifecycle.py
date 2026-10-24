@@ -25,6 +25,8 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncTPUCopyState,
     AsyncTPUModelRunnerOutput,
 )
+from vllm_torchtpu.spec_decode.dflash import DFlashProposer
+from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 
 
 def _recording_connector(events: list[str]) -> MagicMock:
@@ -54,6 +56,11 @@ def _recording_connector(events: list[str]) -> MagicMock:
     return connector
 
 
+class _RunnerState(SimpleNamespace):
+    _draft_context_only = TPUModelRunner._draft_context_only
+    _scheduled_seq_len = TPUModelRunner._scheduled_seq_len
+
+
 def _fake_runner(method, is_async, verify, propose, fence=False):
     """The runner state sample_tokens reads for one request sampling token 7
     (drafting token 8 when async)."""
@@ -63,7 +70,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
         has_structured_output_requests=False,
     )
     async_source = ([torch.tensor([7, 8])], {0: 0}, None, {"r0": 1})
-    runner = SimpleNamespace(
+    runner = _RunnerState(
         _pp_wave=None,
         execute_model_state=SimpleNamespace(
             scheduler_output=scheduler_output,
@@ -239,3 +246,120 @@ def test_spec_kv_fence_runs_after_drafter_before_connector_save(is_async):
     assert output.sampled_token_ids == [[7]]
     expected = ["draft", "fence", "rearm"] if is_async else ["draft", "rearm"]
     assert events == expected + ["save", "poll", "clear"]
+
+
+@pytest.mark.parametrize("drafter_type", [DFlashProposer, DSparkProposer])
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize(
+    "partial_prefill,proposals_needed", [(False, True), (True, False), (True, True)]
+)
+def test_dflash_partial_prefill_saves_context_without_async_draft_bootstrap(
+    is_async, partial_prefill, proposals_needed, drafter_type
+):
+    events = []
+
+    def record_proposal(**kwargs):
+        events.append("draft")
+        return [torch.tensor([[8]])] if is_async else None
+
+    propose = MagicMock(side_effect=record_proposal)
+    runner = _fake_runner("mtp", is_async, False, propose)
+    drafter = drafter_type.__new__(drafter_type)
+    drafter.update_context = MagicMock(side_effect=lambda: events.append("context"))
+    runner.drafter = runner._async_drafter = drafter
+    runner._dp_step_draft_proposals_needed = proposals_needed
+    runner.input_batch.generators = {}
+    runner._assemble_async_prefill_bootstrap = MagicMock(
+        return_value=([torch.tensor([7, 8])], {0: 0}, None, {"r0": 1})
+    )
+    if partial_prefill:
+        runner.requests["r0"].num_tokens = 10
+    runner._update_placeholder = MagicMock(
+        return_value={} if partial_prefill else {"r0": 0}
+    )
+    connector = _recording_connector(events)
+    with (
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=True
+        ),
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group",
+            return_value=connector,
+        ),
+        patch.object(AsyncTPUCopyState, "from_device_chunks", side_effect=_host_copy),
+    ):
+        output = TPUModelRunner.sample_tokens(runner, None)
+    if is_async:
+        output = output.get_output()
+    assert output.sampled_token_ids == ([[]] if partial_prefill else [[7]])
+    assert events == [
+        "draft" if proposals_needed else "context",
+        "save",
+        "poll",
+        "clear",
+    ]
+    assert propose.call_count == int(proposals_needed)
+    assert runner._assemble_async_prefill_bootstrap.call_count == int(
+        is_async and proposals_needed
+    )
+    if is_async and partial_prefill:
+        assert runner._pre_async_results.req_id_to_index_copy == {}
+        assert runner._pre_async_results.request_seq_lens == []
+        if not proposals_needed:
+            assert runner._pre_async_results.num_draft_per_req is None
+            assert runner._pre_async_results.spec_decode_num_rejected_tokens is None
+
+
+@pytest.mark.parametrize(
+    "is_async,pd_producer,fence,proposals_needed",
+    [
+        (False, False, False, False),
+        (True, False, False, False),
+        (False, True, False, True),
+        (False, True, False, False),
+        (False, False, True, False),
+        (True, False, True, False),
+    ],
+)
+def test_context_only_cache_writes_precede_connector_save(
+    is_async, pd_producer, fence, proposals_needed
+):
+    events = []
+    propose = MagicMock()
+    runner = _fake_runner("mtp", is_async, False, propose, fence=fence)
+    drafter = DFlashProposer.__new__(DFlashProposer)
+    drafter.update_context = lambda: events.append("context")
+    runner.drafter = runner._async_drafter = drafter
+    runner._is_dspark_pd_producer = pd_producer
+    runner._dp_step_draft_proposals_needed = proposals_needed
+    runner.input_batch.generators = {}
+    runner.requests["r0"].num_tokens = 10
+    connector = _recording_connector(events)
+
+    def host_copy(chunks, lengths, spec_logprobs=None):
+        state = _host_copy(chunks, lengths, spec_logprobs)
+        state.fence_pending_device_work = lambda: events.append("rearm")
+        return state
+
+    with (
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=True
+        ),
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group",
+            return_value=connector,
+        ),
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.synchronize_tensors",
+            side_effect=lambda: events.append("sync"),
+        ),
+        patch.object(AsyncTPUCopyState, "from_device_chunks", side_effect=host_copy),
+    ):
+        output = TPUModelRunner.sample_tokens(runner, None)
+    if is_async:
+        output = output.get_output()
+    assert output.sampled_token_ids == [[]]
+    assert events == ["context"] + (["sync"] if pd_producer else []) + (
+        ["rearm"] if fence else []
+    ) + ["save", "poll", "clear"]
+    propose.assert_not_called()
