@@ -982,7 +982,12 @@ def _pooled_qsa(
         pool = write_main_cache(pool, rows_packed, page, logical, valid, **slot_kw)
     ring_rows = math.ceil(compress_ratio / 8) * 8
     ring_elements = ring_rows * raw.shape[-1]
-    read_state = read_ring_and_tags_concurrent if fused else read_ring_and_tags
+    # A RING_DMA_BATCH override keeps the ring reads on the batched reader.
+    read_state = (
+        read_ring_and_tags_concurrent
+        if fused and not envs.VLLM_TPU_QSA_RING_DMA_BATCH
+        else read_ring_and_tags
+    )
     ring, tags = read_state(pool, ring_ids, ring_elements, ring_rows * 2)
     ring = ring.reshape(len(ring_ids), ring_rows, -1)
     tags = tags.reshape(len(ring_ids), ring_rows, 2)
