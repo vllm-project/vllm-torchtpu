@@ -325,6 +325,7 @@ class Qwen38SegmentDriver:
         self.seq = 0  # try_forward calls, to compare the step sequence across ranks
         self.mk_calls = 0
         self.sync = False  # `sync=1`: wait for the first calls' outputs and log it (bisecting)
+        self.warm = False  # `warm=1`: host barriers around the first (compiling) call
 
     @classmethod
     def maybe_create(cls, runner: Any) -> Qwen38SegmentDriver | None:
@@ -361,6 +362,7 @@ class Qwen38SegmentDriver:
             drv.segments.mk_segments = segs
         drv.mtp = _parse_flag(raw, "mtp", False)
         drv.sync = _parse_flag(raw, "sync", False)
+        drv.warm = _parse_flag(raw, "warm", False)
         logger.info(
             "Qwen3.8 segment megakernel enabled, verify buckets %s, shadow checks %d, hier %s, rings %s, head %s",
             drv.buckets,
@@ -493,6 +495,44 @@ class Qwen38SegmentDriver:
         self.check_left -= 1
         return stock
 
+    def _tp_barrier(self, what: str) -> None:
+        import time
+
+        import torch.distributed as dist
+        from vllm.distributed.parallel_state import get_tp_group
+
+        t0 = time.time()
+        dist.barrier(group=get_tp_group().cpu_group)
+        logger.info("qwen38 megakernel tp barrier %s: %.2f s", what, time.time() - t0)
+
+    def _log_program_fingerprint(self) -> None:
+        """md5 of each compiled segment-program artifact of this rank (are all ranks' programs the same?)."""
+        import glob
+        import hashlib
+
+        from vllm.distributed.parallel_state import get_tp_group
+
+        r = get_tp_group().rank_in_group
+        files = sorted(
+            glob.glob(f"/root/vllm-torchtpu-cache/vllm/torch_compile_cache/*/rank_{r}_*/model_mk_segments/*")
+        )
+        import os
+
+        marks = []
+        for f in files:
+            h = hashlib.md5()
+            parts = [f] if os.path.isfile(f) else sorted(
+                os.path.join(d, n) for d, _, ns in os.walk(f) for n in ns
+            )
+            for part in parts:
+                try:
+                    with open(part, "rb") as fh:
+                        h.update(fh.read())
+                except OSError:
+                    continue
+            marks.append(f"{f.rsplit('/', 1)[-1]}={h.hexdigest()[:10]}")
+        logger.info("qwen38 megakernel program fingerprint rank %d: %s", r, " ".join(marks) or "no artifacts")
+
     def _log_gdn_meta(self) -> None:
         """Host-side ranges of the first GDN layer's metadata and the pool block count."""
         try:
@@ -551,6 +591,9 @@ class Qwen38SegmentDriver:
             if self.mk_calls <= 2:
                 self._log_gdn_meta()
         kw = dict(model_kwargs or {})
+        first_warm = self.warm and self.mk_calls == 1
+        if first_warm:
+            self._tp_barrier("before the first (compiling) call")
         try:
             if self.check_left > 0 and self.shadow is not None:
                 out = self._shadow_step(runner, input_ids, positions, kw)
@@ -565,6 +608,12 @@ class Qwen38SegmentDriver:
             return False, None
         if isinstance(out, (list, tuple)):
             out = tuple(out)
+        if first_warm:
+            from torch_tpu._internal import sync as tpu_sync
+
+            tpu_sync.synchronize(list(out) if isinstance(out, tuple) else [out], wait=True)
+            self._log_program_fingerprint()
+            self._tp_barrier("after the first call finished on device")
         if self.sync and self.mk_calls <= 4:
             import time
 
