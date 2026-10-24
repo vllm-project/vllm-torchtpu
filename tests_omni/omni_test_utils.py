@@ -79,3 +79,59 @@ def high_freq_energy(img: np.ndarray) -> float:
         - img[1:-1, 2:]
     )
     return float(np.abs(laplacian).mean())
+
+
+def metrics(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
+    """Compute cosine similarity, relative L2 error, and max absolute error in fp64."""
+    actual_flat = actual.detach().cpu().double().flatten()
+    expected_flat = expected.detach().cpu().double().flatten()
+    diff = actual_flat - expected_flat
+    norm_product = actual_flat.norm() * expected_flat.norm()
+    cos = torch.dot(actual_flat, expected_flat) / norm_product.clamp_min(1e-30)
+    return {
+        "cos": float(cos),
+        "rel_l2": float(diff.norm() / expected_flat.norm().clamp_min(1e-30)),
+        "max_abs": float(diff.abs().max()),
+    }
+
+
+def assert_within_bf16_noise(
+    *,
+    ref: torch.Tensor,
+    ref_bf16: torch.Tensor,
+    tpu_fp32: torch.Tensor,
+    tpu_bf16: torch.Tensor,
+    fp32_ratio: float,
+    bf16_ratio: float,
+    floor: float = 1e-3,
+) -> dict[str, object]:
+    """Assert TPU fp32 and bf16 outputs match the CPU fp32 reference.
+
+    Both TPU error budgets are normalized against the CPU bf16 reference error
+    so depth and conditioning sensitivity cancel out across components.
+    """
+    ref_bf16_metrics = metrics(ref_bf16, ref)
+    tpu_fp32_metrics = metrics(tpu_fp32, ref)
+    tpu_bf16_metrics = metrics(tpu_bf16, ref)
+    ref_bf16_err = ref_bf16_metrics["rel_l2"]
+    denom = max(ref_bf16_err, 1e-30)
+    results: dict[str, object] = {
+        "diffusers_cpu_bf16": ref_bf16_metrics,
+        "omni_tpu_fp32": tpu_fp32_metrics,
+        "omni_tpu_bf16": tpu_bf16_metrics,
+        "fp32_ratio": tpu_fp32_metrics["rel_l2"] / denom,
+        "bf16_ratio": tpu_bf16_metrics["rel_l2"] / denom,
+    }
+    fp32_budget = max(fp32_ratio * ref_bf16_err, floor)
+    bf16_budget = max(bf16_ratio * ref_bf16_err, floor)
+    assert tpu_fp32_metrics["rel_l2"] <= fp32_budget, results
+    assert tpu_bf16_metrics["rel_l2"] <= bf16_budget, results
+    return results
+
+
+def assert_all_loaded(loaded: set[str], module: torch.nn.Module) -> None:
+    """Assert that every parameter of ``module`` was populated by ``load_weights``."""
+    missing = {name for name, _ in module.named_parameters()} - loaded
+    assert not missing, (
+        f"vllm-omni parameters not loaded from checkpoint: {sorted(missing)[:10]}"
+    )

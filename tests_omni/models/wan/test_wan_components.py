@@ -89,65 +89,17 @@ from vllm_omni.diffusion.models.wan2_2.wan2_2_vace_transformer import (
     WanVACETransformer3DModel,
 )
 
-from vllm_torchtpu.logger import init_logger
+from tests_omni.omni_test_utils import assert_all_loaded, assert_within_bf16_noise
 from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
 from vllm_torchtpu.omni.rope import can_fuse_qk_norm_rope
 
-logger = init_logger(__name__)
 pytestmark = [pytest.mark.omni]
-
-
-def _metrics(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
-    actual_flat = actual.detach().cpu().double().flatten()
-    expected_flat = expected.detach().cpu().double().flatten()
-    diff = actual_flat - expected_flat
-    norm_product = actual_flat.norm() * expected_flat.norm()
-    cos = torch.dot(actual_flat, expected_flat) / norm_product.clamp_min(1e-30)
-    return {
-        "cos": float(cos),
-        "rel_l2": float(diff.norm() / expected_flat.norm().clamp_min(1e-30)),
-        "max_abs": float(diff.abs().max()),
-    }
-
-
-def _record(record_property, name: str, **data) -> None:
-    """Log metrics and attach them to the JUnit report."""
-    logger.info("[wan-parity] %s: %s", name, data)
-    record_property(name, data)
 
 
 # Relative to diffusers' own CPU bf16 rel_l2, TPU fp32 is 0.52-0.62x (MXU uses
 # bf16 passes while non-matmul ops stay fp32) and TPU bf16 is 1.00-1.28x.
 FP32_ERR_RATIO = 0.65
 BF16_ERR_RATIO = 1.35
-BF16_ERR_FLOOR = 1e-3
-
-
-def _assert_parity(
-    record_property,
-    name: str,
-    *,
-    ref: torch.Tensor,
-    ref_bf16: torch.Tensor,
-    tpu_fp32: torch.Tensor,
-    tpu_bf16: torch.Tensor,
-) -> None:
-    """Assert omni-on-TPU matches the fp32 CPU reference.
-
-    Both fp32 and bf16 errors are budgeted relative to the error of diffusers'
-    own bf16 run, cancelling out per-component depth and conditioning.
-    """
-    results = {
-        "diffusers_cpu_bf16": _metrics(ref_bf16, ref),
-        "omni_tpu_fp32": _metrics(tpu_fp32, ref),
-        "omni_tpu_bf16": _metrics(tpu_bf16, ref),
-    }
-    _record(record_property, name, **results)
-    ref_bf16_err = results["diffusers_cpu_bf16"]["rel_l2"]
-    fp32_budget = max(FP32_ERR_RATIO * ref_bf16_err, BF16_ERR_FLOOR)
-    bf16_budget = max(BF16_ERR_RATIO * ref_bf16_err, BF16_ERR_FLOOR)
-    assert results["omni_tpu_fp32"]["rel_l2"] <= fp32_budget, results
-    assert results["omni_tpu_bf16"]["rel_l2"] <= bf16_budget, results
 
 
 @pytest.fixture(scope="module")
@@ -190,10 +142,7 @@ def _load_omni(model: torch.nn.Module, weights) -> None:
         parent, ((f"transformer.{name}", tensor) for name, tensor in weights)
     )
     loaded = {name.removeprefix("transformer.") for name in loaded}
-    missing = {name for name, _ in model.named_parameters()} - loaded
-    assert not missing, (
-        f"vllm-omni params not loaded from checkpoint: {sorted(missing)[:10]}"
-    )
+    assert_all_loaded(loaded, model)
 
 
 def _make_inputs(
@@ -386,7 +335,7 @@ TINY_TRANSFORMER_VARIANTS = {
 
 @pytest.mark.parametrize("arch", list(TINY_TRANSFORMER_VARIANTS))
 @torch.no_grad()
-def test_wan_tiny_transformer_parity(arch, omni_ctx, tmp_path, record_property):
+def test_wan_tiny_transformer_parity(arch, omni_ctx, tmp_path):
     """vllm-omni transformer on TPU, loaded from a diffusers state dict,
     matches the diffusers forward pass on CPU."""
     variant = TINY_TRANSFORMER_VARIANTS[arch]
@@ -415,13 +364,13 @@ def test_wan_tiny_transformer_parity(arch, omni_ctx, tmp_path, record_property):
         omni_model = omni_model.to(device="tpu").eval()
         tpu[dtype] = omni_model(**_to_omni(inputs, dtype), return_dict=False)[0]
 
-    _assert_parity(
-        record_property,
-        f"tiny-{arch}",
+    assert_within_bf16_noise(
         ref=ref,
         ref_bf16=ref_bf16,
         tpu_fp32=tpu[torch.float32],
         tpu_bf16=tpu[torch.bfloat16],
+        fp32_ratio=FP32_ERR_RATIO,
+        bf16_ratio=BF16_ERR_RATIO,
     )
 
 
@@ -464,7 +413,7 @@ def _run_vae(vae, video: torch.Tensor, latents: torch.Tensor, dtype) -> dict:
 
 @pytest.mark.parametrize("variant", list(TINY_VAE_VARIANTS))
 @torch.no_grad()
-def test_wan_tiny_vae_parity(variant, omni_ctx, record_property):
+def test_wan_tiny_vae_parity(variant, omni_ctx):
     """vllm-omni VAE on TPU matches diffusers on CPU for encode (mode) and decode."""
     z_dim = TINY_VAE_VARIANTS[variant]["z_dim"]
     config = {
@@ -494,25 +443,25 @@ def test_wan_tiny_vae_parity(variant, omni_ctx, record_property):
     }
 
     for output in ("mode", "decode"):
-        _assert_parity(
-            record_property,
-            f"tiny-vae-{variant}-{output}",
+        assert_within_bf16_noise(
             ref=ref[output],
             ref_bf16=ref_bf16[output],
             tpu_fp32=tpu[torch.float32][output],
             tpu_bf16=tpu[torch.bfloat16][output],
+            fp32_ratio=FP32_ERR_RATIO,
+            bf16_ratio=BF16_ERR_RATIO,
         )
 
     # Whole-video metrics can average away an error confined to a single frame
     # (e.g. frame 0 causal-conv padding).
     for frame in range(ref["decode"].shape[2]):
-        _assert_parity(
-            record_property,
-            f"tiny-vae-{variant}-decode-f{frame}",
+        assert_within_bf16_noise(
             ref=ref["decode"][:, :, frame],
             ref_bf16=ref_bf16["decode"][:, :, frame],
             tpu_fp32=tpu[torch.float32]["decode"][:, :, frame],
             tpu_bf16=tpu[torch.bfloat16]["decode"][:, :, frame],
+            fp32_ratio=FP32_ERR_RATIO,
+            bf16_ratio=BF16_ERR_RATIO,
         )
 
 
@@ -544,9 +493,7 @@ _TINY_CLIP_CONFIG = dict(
 WAN_TEXT_LEN = 512  # encode_prompt pads every prompt to max_sequence_length
 
 
-def _assert_hf_encoder_parity(
-    record_property, name: str, model_cls, path, forward
-) -> None:
+def _assert_hf_encoder_parity(model_cls, path, forward) -> None:
     """Load a saved encoder the way the pipelines do, from_pretrained(torch_dtype)
     then .to(device), on CPU and TPU in fp32 and bf16; check TPU against CPU."""
     outputs = {}
@@ -554,18 +501,18 @@ def _assert_hf_encoder_parity(
         for dtype in (torch.float32, torch.bfloat16):
             model = model_cls.from_pretrained(path, torch_dtype=dtype).to(device)
             outputs[device, dtype] = forward(model.eval(), device).float().cpu()
-    _assert_parity(
-        record_property,
-        name,
+    assert_within_bf16_noise(
         ref=outputs["cpu", torch.float32],
         ref_bf16=outputs["cpu", torch.bfloat16],
         tpu_fp32=outputs["tpu", torch.float32],
         tpu_bf16=outputs["tpu", torch.bfloat16],
+        fp32_ratio=FP32_ERR_RATIO,
+        bf16_ratio=BF16_ERR_RATIO,
     )
 
 
 @torch.no_grad()
-def test_wan_tiny_umt5_parity(tmp_path, record_property):
+def test_wan_tiny_umt5_parity(tmp_path):
     """UMT5 text encoder on TPU vs CPU, on the prompt tokens encode_prompt keeps."""
     config = UMT5Config(**_TINY_UMT5_CONFIG)
     torch.manual_seed(0)
@@ -588,13 +535,11 @@ def test_wan_tiny_umt5_parity(tmp_path, record_property):
         hidden = outputs.last_hidden_state
         return torch.cat([hidden[row, :n] for row, n in enumerate(seq_lens)])
 
-    _assert_hf_encoder_parity(
-        record_property, "tiny-umt5", UMT5EncoderModel, tmp_path, forward
-    )
+    _assert_hf_encoder_parity(UMT5EncoderModel, tmp_path, forward)
 
 
 @torch.no_grad()
-def test_wan_tiny_clip_parity(tmp_path, record_property):
+def test_wan_tiny_clip_parity(tmp_path):
     """CLIP vision encoder on TPU vs CPU, on the penultimate hidden states that
     Wan2.1 I2V passes to the transformer."""
     torch.manual_seed(0)
@@ -608,9 +553,7 @@ def test_wan_tiny_clip_parity(tmp_path, record_property):
         pixel_inputs = pixel_values.to(device=device, dtype=model.dtype)
         return model(pixel_inputs, output_hidden_states=True).hidden_states[-2]
 
-    _assert_hf_encoder_parity(
-        record_property, "tiny-clip", CLIPVisionModel, tmp_path, forward
-    )
+    _assert_hf_encoder_parity(CLIPVisionModel, tmp_path, forward)
 
 
 class TestWanFreshTimestepPatch:
