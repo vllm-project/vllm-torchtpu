@@ -148,9 +148,10 @@ def embed_multimodal_chunked(
     """Run `embed_fn` on multimodal kwargs, splitting large videos into chunks.
 
     When several video items are batched into one encoder call, the batch is
-    likewise segmented per item, so we split it back into per-item forwards and
-    chunk each item that is too large. `pixel_values_videos` is concatenated
-    on the patch axis; the grid is stacked one row per item; other stacked
+    likewise segmented per item, so we group consecutive items that fit within
+    `max_patches` into sub-batch forwards and temporally chunk any individual
+    item that exceeds `max_patches`. `pixel_values_videos` is concatenated on
+    the patch axis; the grid is stacked one row per item; other stacked
     per-item fields are indexed by item. This is bit-exact for the same reason
     the temporal split is.
 
@@ -213,38 +214,50 @@ def embed_multimodal_chunked(
 
     # Single item: chunk it in place (no batch to split).
     if num_items == 1:
-        return [
-            _encode_video_item(embed_fn, pixel_key, grid_key, mm_kwargs, max_patches)
-        ]
+        return _encode_video_item(embed_fn, pixel_key, grid_key, mm_kwargs, max_patches)
 
-    # Multiple items batched together: split per item, then chunk each.
-    timestamps = mm_kwargs.get("timestamps")
+    # Multiple items batched together: group consecutive items that fit within
+    # `max_patches` into a single sub-batch forward, and temporally chunk any
+    # individual item that exceeds `max_patches` on its own.
     logger.debug(
-        "[mm_encoder chunk] %d video items, %d patches > budget %d; encoding per item",
+        "[mm_encoder chunk] %d video items, %d patches > budget %d; "
+        "encoding in sub-batches",
         num_items,
         total_patches,
         max_patches,
     )
 
-    outputs = []
+    outputs: list[torch.Tensor] = []
     row = 0
-    for i, num_patches in enumerate(per_item_patches):
-        item_kwargs = dict(mm_kwargs)
-        item_kwargs[pixel_key] = pixels[row : row + num_patches]
-        item_kwargs[grid_key] = grid[i : i + 1]
-        if timestamps is not None:
-            item_kwargs["timestamps"] = _select_item_timestamps(timestamps, i)
-        # Index any other stacked per-item field (shape[0] == num_items).
+    start = 0
+    while start < num_items:
+        end = start + 1
+        sub_patches = per_item_patches[start]
+        if sub_patches <= max_patches:
+            while (
+                end < num_items and sub_patches + per_item_patches[end] <= max_patches
+            ):
+                sub_patches += per_item_patches[end]
+                end += 1
+
+        sub_kwargs = dict(mm_kwargs)
+        sub_kwargs[pixel_key] = pixels[row : row + sub_patches]
+        # Slice every per-item field (grid, timestamps, and any other stacked
+        # tensor or list/tuple of length `num_items`).
         for key, val in mm_kwargs.items():
-            if key in (pixel_key, grid_key, "timestamps"):
+            if key == pixel_key:
                 continue
             shape = getattr(val, "shape", None)
-            if shape and len(shape) >= 1 and shape[0] == num_items:
-                item_kwargs[key] = val[i : i + 1]
-        outputs.append(
-            _encode_video_item(embed_fn, pixel_key, grid_key, item_kwargs, max_patches)
+            if (shape and len(shape) >= 1 and shape[0] == num_items) or (
+                isinstance(val, (list, tuple)) and len(val) == num_items
+            ):
+                sub_kwargs[key] = val[start:end]
+
+        outputs.extend(
+            _encode_video_item(embed_fn, pixel_key, grid_key, sub_kwargs, max_patches)
         )
-        row += num_patches
+        row += sub_patches
+        start = end
     return outputs
 
 
@@ -254,20 +267,19 @@ def _encode_video_item(
     grid_key: str,
     item_kwargs: dict[str, Any],
     max_patches: int,
-) -> torch.Tensor:
-    """Encode one video item, splitting into chunks when patch count exceeds budget.
+) -> "MultiModalEmbeddings":
+    """Encode a sub-batch or single video item, chunking if it exceeds budget.
 
     Args:
         embed_fn: The multimodal embedding function to call for each chunk.
         pixel_key: Keyword argument name for the video pixel values tensor.
         grid_key: Keyword argument name for the video grid shape tensor.
-        item_kwargs: Multimodal keyword arguments for a single video item
-            (with grid shaped `[1, 3]`).
+        item_kwargs: Multimodal keyword arguments for a single video item or
+            a sub-batch of items that fit within `max_patches`.
         max_patches: Maximum number of patches allowed per vision forward pass.
 
     Returns:
-        Encoded multimodal embedding tensor concatenated across chunks along the
-        token axis.
+        Encoded multimodal embeddings for the item(s).
     """
     grid = item_kwargs[grid_key]
     grid_list = grid.tolist() if hasattr(grid, "tolist") else list(grid)
@@ -281,7 +293,9 @@ def _encode_video_item(
     rows_per_t = h * w
     chunk_t = max(1, max_patches // rows_per_t)
     if t <= chunk_t:
-        return embed_fn(**item_kwargs)[0]
+        out = embed_fn(**item_kwargs)
+        synchronize_tensors(list(out), wait=False)
+        return out
 
     pixels = item_kwargs[pixel_key]
     timestamps = item_kwargs.get("timestamps")
@@ -322,39 +336,17 @@ def _encode_video_item(
         synchronize_tensors(out[0], wait=False)
         chunk_outs.append(out[0])
 
-    return torch.cat(chunk_outs, dim=0)
-
-
-def _select_item_timestamps(timestamps: Any, i: int) -> Any:
-    """Select item `i`'s timestamps from a batched group.
-
-    Batching stacks a fixed-length timestamps tensor to `[num_items, T]` and
-    keeps variable-length ones (the common video case) as a list with one entry
-    per item. Returns item `i` in the same shape a single-item forward expects;
-    passes anything else through unchanged.
-
-    Args:
-        timestamps: Batched timestamps, either as a stacked tensor or a list
-            with one element per item.
-        i: Index of the item to select.
-
-    Returns:
-        The timestamps for item `i`.
-    """
-    if hasattr(timestamps, "ndim") and timestamps.ndim >= 2:
-        return timestamps[i : i + 1]
-    if isinstance(timestamps, (list, tuple)):
-        return timestamps[i]
-    return timestamps
+    return [torch.cat(chunk_outs, dim=0)]
 
 
 def _slice_timestamps(timestamps: Any, start: int, end: int) -> Any:
-    """Slice a per-temporal-patch timestamps field to `[start, end)`.
+    """Slice a single item's timestamps field to `[start, end)` along time.
 
     The vision encoder itself ignores timestamps, but the input schema may
     carry/validate them, so keep the length consistent with each chunk's
-    temporal extent. Handles a 1D tensor, a batched `[1, T]` tensor, and
-    nested Python lists; passes anything else through unchanged.
+    temporal extent. Handles a 1D tensor, a batched `[1, T]` tensor, flat
+    lists, and a 1-element list wrapping a tensor or list; passes anything
+    else through unchanged.
 
     Args:
         timestamps: Timestamps field for the single item being chunked.
@@ -364,12 +356,10 @@ def _slice_timestamps(timestamps: Any, start: int, end: int) -> Any:
     Returns:
         Sliced timestamps covering the range `[start, end)`.
     """
-    if hasattr(timestamps, "ndim"):  # torch/np tensor
-        if timestamps.ndim == 1:
-            return timestamps[start:end]
+    if hasattr(timestamps, "ndim") and timestamps.ndim >= 1:
         return timestamps[..., start:end]
     if isinstance(timestamps, (list, tuple)):
-        if len(timestamps) == 1 and isinstance(timestamps[0], (list, tuple)):
-            return type(timestamps)([timestamps[0][start:end]])
+        if len(timestamps) == 1 and not isinstance(timestamps[0], (int, float)):
+            return type(timestamps)([_slice_timestamps(timestamps[0], start, end)])
         return timestamps[start:end]
     return timestamps
