@@ -596,7 +596,10 @@ def stage3_fa_raiden_id_fields(
 # VLLM_TPU_T3_ENV_CACHE=1 (default off): the per-step connector hot path asks
 # these process-constant env predicates several times per decode step; cache
 # each one's first answer for the life of the process.
-_T3_ENV_CACHE = os.environ.get("VLLM_TPU_T3_ENV_CACHE", "0") == "1"
+_T3_ENV_CACHE = (
+    os.environ.get("VLLM_TPU_T3_ENV_CACHE", os.environ.get("VLLM_TPU_T3_HOST", "0"))
+    == "1"
+)
 _t3_env_cache: dict[str, bool] = {}
 
 
