@@ -1166,6 +1166,7 @@ def test_layer_state_specs_declare_kv_and_recurrent_state(
             "_is_recurrent_layer",
             side_effect=lambda m: m is recurrent,
         ),
+        mock.patch.object(universal_adapter, "_check_recurrent_layer_supported"),
         mock.patch(
             "vllm.model_executor.layers.mamba.mamba_utils.is_conv_state_dim_first",
             return_value=False,

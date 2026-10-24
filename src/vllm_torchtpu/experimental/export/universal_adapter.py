@@ -474,6 +474,24 @@ def _is_recurrent_layer(layer: Any) -> bool:
     return isinstance(layer, MambaBase)
 
 
+def _check_recurrent_layer_supported(layer: Any) -> None:
+    """Raises unless export can bind `layer`'s state and drive its forward.
+
+    Export binds a recurrent layer's state as a conv/recurrent pair and hands
+    it the gated-delta-net style metadata, which only `GatedDeltaNetAttention`
+    layers read. Other recurrent layers (Mamba mixers, ShortConv) keep other
+    states and expect their own metadata type.
+    """
+    from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
+
+    if not isinstance(layer, GatedDeltaNetAttention):
+        raise NotImplementedError(
+            f"recurrent layer {type(layer).__name__} is not supported by export; "
+            "supported: GatedDeltaNetAttention (gated delta net linear attention, "
+            "e.g. Qwen3-Next)"
+        )
+
+
 def _recurrent_state_specs(
     layer: Any, num_blocks: int, tp_size: int
 ) -> list[api.ShapeDtypeStruct]:
@@ -781,6 +799,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                     ]
                 )
             elif _is_recurrent_layer(layer):
+                _check_recurrent_layer_supported(layer)
                 per_layer.append(
                     _recurrent_state_specs(
                         layer, cfg.num_blocks, cfg.tensor_parallel_size
