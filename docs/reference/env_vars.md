@@ -31,6 +31,12 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `TPU_DCP_LSE_MERGE_A2A` | `False` | Uses all-to-all LSE merge for Decode Context Parallelism when token count is below `TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS` (`64`). |
 | `TPU_TOKEN_BUCKET_EXTRA` | `[]` | Comma-separated list of additional token padding bucket sizes to precompile. |
 | `TPU_TOKEN_BUCKET_LINEAR` | `False` | Uses linearly spaced token compilation buckets instead of exponential buckets. |
+| `TPU_MICROBATCH_FACTOR` | `1` | Number of token-axis micro-batch windows per decoder stage (`1` = disabled, `2` = 2-window overlap). |
+| `TPU_MICROBATCH_MIN_TOKENS` | `1024` | Minimum bucket token count for micro-batching; smaller buckets run unsplit. |
+| `TPU_MICROBATCH_MERGE_MOE` | `True` | Merges the routed-expert MoE kernel across micro-batch windows into a single call per layer. |
+| `TPU_MICROBATCH_LAYERWISE` | `False` | Shortcut for `TPU_MICROBATCH_SCHEDULE="layerwise"` (runs each window through an entire decoder layer before the next window). |
+| `TPU_MICROBATCH_SCHEDULE` | `""` | Micro-batch execution schedule (`""`, `"stagewise"`, `"layerwise"`, or `"staggered"`). |
+| `TPU_MICROBATCH_FENCE` | `"substage"` | XLA `optimization_barrier` fencing policy between micro-batch windows/stages (`"none"`, `"window"`, `"stage"`, or `"substage"`). |
 
 ---
 

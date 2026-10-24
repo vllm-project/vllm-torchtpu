@@ -194,6 +194,12 @@ if TYPE_CHECKING:
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
+    TPU_MICROBATCH_FACTOR: int = 1
+    TPU_MICROBATCH_MIN_TOKENS: int = 1024
+    TPU_MICROBATCH_MERGE_MOE: bool = True
+    TPU_MICROBATCH_LAYERWISE: bool = False
+    TPU_MICROBATCH_SCHEDULE: str = ""
+    TPU_MICROBATCH_FENCE: str = "substage"
 
 
 def env_with_choices(
@@ -1149,6 +1155,38 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # copies it automatically to DP/Ray engine-core actors.
     "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS": env_nonnegative_int(
         "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS", 8
+    ),
+    # Number of token-axis micro-batch windows per decoder stage (1 = disabled).
+    "TPU_MICROBATCH_FACTOR": env_nonnegative_int("TPU_MICROBATCH_FACTOR", 1),
+    # Minimum bucket token count for micro-batching; smaller buckets run unsplit.
+    "TPU_MICROBATCH_MIN_TOKENS": env_nonnegative_int("TPU_MICROBATCH_MIN_TOKENS", 1024),
+    # Merge the routed-expert MoE kernel across micro-batch windows into one call.
+    "TPU_MICROBATCH_MERGE_MOE": env_bool("TPU_MICROBATCH_MERGE_MOE", default=True),
+    # Shortcut for TPU_MICROBATCH_SCHEDULE="layerwise" (full-layer windowing).
+    "TPU_MICROBATCH_LAYERWISE": env_bool("TPU_MICROBATCH_LAYERWISE", default=False),
+    # Micro-batch execution schedule:
+    #   "" (default): resolves to "layerwise" if TPU_MICROBATCH_LAYERWISE=1,
+    #                 "staggered" if USE_MOE_FUSED_EP_KERNEL=1, else "stagewise"
+    #   "stagewise": split each decoder stage across windows (optional merged MoE)
+    #   "layerwise": run each window through an entire decoder layer before next
+    #   "staggered": interleave compute and collective sub-stages across windows
+    #   "attn_only": split only Attention across windows; run MLP/MoE unsplit
+    "TPU_MICROBATCH_SCHEDULE": env_with_choices(
+        "TPU_MICROBATCH_SCHEDULE",
+        "",
+        ["", "stagewise", "layerwise", "staggered", "attn_only"],
+        case_sensitive=False,
+    ),
+    # Optimization-barrier fencing policy between micro-batch windows/stages:
+    #   "none": no optimization_barrier fences
+    #   "window": fence each window's output tensor at stage/layer boundaries
+    #   "stage": coupled fence across windows at stage boundaries against fusion
+    #   "substage": coupled diamond fence between compute and collective sub-stages
+    "TPU_MICROBATCH_FENCE": env_with_choices(
+        "TPU_MICROBATCH_FENCE",
+        "substage",
+        ["none", "window", "stage", "substage"],
+        case_sensitive=False,
     ),
 }
 

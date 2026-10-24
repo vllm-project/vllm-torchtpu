@@ -116,3 +116,32 @@ vllm serve Qwen/Qwen3.5-397B-A17B-FP8 \
   --kv-cache-dtype fp8 \
   --max-model-len 65536
 ```
+
+---
+
+## 6. Token-Window Micro-Batching (`TPU_MICROBATCH_FACTOR`)
+
+For large-batch prefill and mixed-prefill workloads on `Qwen3.5` / `Qwen3-Next` models (`TP=8`, `DP=4, TP=2`, or `DP=8, TP=1` with `--enable-expert-parallel`), token-window micro-batching splits static token buckets (`T >= TPU_MICROBATCH_MIN_TOKENS`) into `N` windows (`TPU_MICROBATCH_FACTOR=2`) and inserts coupled XLA `optimization_barrier` fences (`TPU_MICROBATCH_FENCE=substage`) to overlap one window's collective communication (`all-reduce`, `all-gather`, `reduce-scatter`, and SparseCore MoE dispatch/combine) with the other window's TensorCore compute:
+
+| Environment Variable | Default | Description |
+| :--- | :--- | :--- |
+| `TPU_MICROBATCH_FACTOR` | `1` | Number of token windows (`2` enables 2-window staggered micro-batching; `1` disables). |
+| `TPU_MICROBATCH_MIN_TOKENS` | `1024` | Minimum padded token bucket size to split (`buckets < TPU_MICROBATCH_MIN_TOKENS` execute unsplit). |
+| `TPU_MICROBATCH_FENCE` | `"substage"` | XLA `optimization_barrier` placement (`"substage"`, `"stage"`, `"window"`, or `"none"`). |
+| `TPU_MICROBATCH_MERGE_MOE` | `True` | When `True`, concatenates dispatched tokens across windows so `fused_moe_gmm` executes once per layer; set to `0` at large per-window token budgets (`>= 1,024` tokens/window) where `fused_moe_gmm` is MXU compute-bound to overlap Window 0 MoE combine collectives with Window 1 MoE compute. |
+| `TPU_MICROBATCH_SCHEDULE` | `""` | Execution schedule across windows (`""` / `"stagewise"`, `"staggered"`, or `"layerwise"`). |
+
+```bash
+export TPU_MICROBATCH_FACTOR=2
+export TPU_MICROBATCH_MIN_TOKENS=2048
+export TPU_MICROBATCH_FENCE=substage
+export TPU_MICROBATCH_MERGE_MOE=0
+
+vllm serve Qwen/Qwen3.5-397B-A17B-FP8 \
+  --tensor-parallel-size 8 \
+  --enable-expert-parallel \
+  --quantization fp8 \
+  --kv-cache-dtype fp8 \
+  --max-model-len 10240 \
+  --max-num-batched-tokens 16384
+```
