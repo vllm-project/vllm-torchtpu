@@ -44,6 +44,8 @@ T_VERIFY = 4
 # (`VLLM_TPU_MEGAKERNEL=...,hier=N,rings=E:D` sets them; rings for every bucket).
 DEFAULT_HIER = 2
 DEFAULT_RINGS: tuple[int, int] | None = None
+# `VLLM_TPU_MEGAKERNEL=...,gdnclamp=1`: block ids outside the pool go to the null block 0.
+CLAMP_BLOCKS = False
 
 
 def ring_depths(B: int) -> tuple[int, int]:
@@ -90,12 +92,17 @@ def _fit(x: Any, n: int) -> Any:
     return x
 
 
-def gdn_blocks(meta: Any, NS: int, write: bool) -> tuple[Any, Any, Any]:
+def gdn_blocks(
+    meta: Any, NS: int, write: bool, n_blocks: int | None = None
+) -> tuple[Any, Any, Any]:
     """`(read [NL,NS], write [NL,NS,T], has_state [NL,NS])` block ids from GDN metadata.
 
     Requests past the live ones (and every write when `write` is False) point
-    at the null block 0.
+    at the null block 0; with `n_blocks`, so does any id outside `[0, n_blocks)`.
     """
+
+    def inside(x):
+        return x if n_blocks is None else jnp.where((x >= 0) & (x < n_blocks), x, 0)
 
 
     rbs, wbs, his = [], [], []
@@ -107,8 +114,8 @@ def gdn_blocks(meta: Any, NS: int, write: bool) -> tuple[Any, Any, Any]:
         q_len = qsl[1:] - qsl[:-1]
         live = q_len > 0
         rb = jnp.take_along_axis(ck, off[st][:, None], axis=1)[:, 0]
-        rbs.append(jnp.where(live, rb, 0))
-        wbs.append(jnp.where(live[:, None] & write, ck, 0))
+        rbs.append(inside(jnp.where(live, rb, 0)))
+        wbs.append(inside(jnp.where(live[:, None] & write, ck, 0)))
         his.append(live & ((_fit(seq, NS) - q_len) > 0))
     return jnp.stack(rbs), jnp.stack(wbs), jnp.stack(his)
 
@@ -194,7 +201,9 @@ def build_segment_call(
         states: tuple = ()
         if has_gdn:
             pool, meta = args[n_lead + n_w], args[n_lead + n_w + 1 :]
-            rb, wb, hi = gdn_blocks(meta, NS, write)
+            rb, wb, hi = gdn_blocks(
+                meta, NS, write, layout.pool_shape[0] // layout.split if CLAMP_BLOCKS else None
+            )
             if pool_gdn:
                 named.update(gdn_pool=pool, gdn_rb=rb, gdn_hi=hi.astype(jnp.int32))
             else:

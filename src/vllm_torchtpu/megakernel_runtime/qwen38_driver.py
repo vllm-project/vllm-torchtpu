@@ -348,6 +348,7 @@ class Qwen38SegmentDriver:
         hier = _parse_int(raw, "hier")
         if hier is not None:
             qwen38_segment_call.DEFAULT_HIER = hier
+        qwen38_segment_call.CLAMP_BLOCKS = _parse_flag(raw, "gdnclamp", False)
         for part in raw.split(","):
             if part.startswith("rings="):
                 e, d = part[len("rings=") :].split(":")
@@ -360,7 +361,7 @@ class Qwen38SegmentDriver:
             drv.buckets,
             drv.check_left,
             qwen38_segment_call.DEFAULT_HIER,
-            qwen38_segment_call.DEFAULT_RINGS or "per bucket",
+            f"{qwen38_segment_call.DEFAULT_RINGS or 'per bucket'}, gdnclamp {qwen38_segment_call.CLAMP_BLOCKS}",
             bool(drv.segments.head_groups),
         )
         return drv
@@ -487,6 +488,28 @@ class Qwen38SegmentDriver:
         self.check_left -= 1
         return stock
 
+    def _log_gdn_meta(self) -> None:
+        """Host-side ranges of the first GDN layer's metadata and the pool block count."""
+        try:
+            from vllm.forward_context import get_forward_context
+
+            seg = self.segments
+            layer = next(l for l in seg.layers if l.layer_type == "linear_attention")
+            md = get_forward_context().attn_metadata[layer.linear_attn.prefix]
+            parts = []
+            for name in ("mamba_state_indices", "mamba_slot_read_offsets", "mamba_ckpt_indices",
+                         "query_start_loc", "seq_lens"):
+                t = getattr(md, name).detach().to("cpu").to(torch.int64)
+                parts.append(f"{name}{tuple(t.shape)}[{int(t.min())},{int(t.max())}]")
+            lay = seg.layout
+            logger.info(
+                "qwen38 megakernel gdn meta: %s; pool blocks %d",
+                " ".join(parts),
+                lay.pool_shape[0] // lay.split,
+            )
+        except Exception as exc:
+            logger.info("qwen38 megakernel gdn meta: unavailable (%s)", exc)
+
     def _note(self, key: str) -> None:
         self.stats[key] = self.stats.get(key, 0) + 1
         n = sum(self.stats.values())
@@ -520,6 +543,8 @@ class Qwen38SegmentDriver:
                 "qwen38 megakernel call %d at step seq %d: rows=%d n_req=%d",
                 self.mk_calls, self.seq, rows, n_req,
             )
+            if self.mk_calls <= 2:
+                self._log_gdn_meta()
         kw = dict(model_kwargs or {})
         try:
             if self.check_left > 0 and self.shadow is not None:
