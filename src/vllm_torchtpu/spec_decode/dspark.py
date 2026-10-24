@@ -38,6 +38,7 @@ class DSparkProposer(DFlashProposer):
         hf_dict = hf_config.to_dict() if hasattr(hf_config, "to_dict") else {}
 
         super().__init__(runner, vllm_config)
+        self._decode_samples = None
 
         if not self.dflash_config.get("target_layer_ids"):
             raise ValueError(
@@ -114,6 +115,16 @@ class DSparkProposer(DFlashProposer):
                     "Qwen3DSpark/Gemma4DSpark-family model."
                 )
 
+        # Optional model capability, initialized after target weight sharing.
+        # Returning None keeps the standard DSpark sampling contract.
+        prepare = getattr(self.draft_model, "prepare_tpu_draft_sampler", None)
+        if prepare is not None:
+            self._decode_samples = prepare(
+                tp_size=self.runner.mesh.size,
+                block_size=self.block_size,
+                sample_from_anchor=self.sample_from_anchor,
+            )
+
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _dflash_forward_and_sample(
         self,
@@ -138,6 +149,11 @@ class DSparkProposer(DFlashProposer):
 
         padded_num_reqs = hidden.shape[0] // block_size
         valid_hidden = hidden[: padded_num_reqs * block_size]
+
+        if self._decode_samples is not None:
+            tokens = self._decode_samples(valid_hidden, input_ids, block_size)
+            if tokens is not None:
+                return tokens, hidden
 
         # Draft-vocab logits for every slot; the Markov bias is added in
         # draft space and ids are remapped to target vocab after argmax.

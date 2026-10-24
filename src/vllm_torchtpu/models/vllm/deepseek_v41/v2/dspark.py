@@ -121,6 +121,10 @@ class DSparkDeepseekV41Model(nn.Module):
         initialize_cache_ops()
         initialize_delayed_mhc()
         initialize_mhc_post()
+        from .dspark_sampling import initialize_collapse
+
+        self._boundary_collapse = initialize_collapse()
+
         initialize_paged_attention()
         initialize_indexer()
 
@@ -292,6 +296,13 @@ class DSparkDeepseekV41Model(nn.Module):
                 )
         hidden_states = post(hidden_states, residual, post_mix, res_mix)
         assert pre_mix is not None
+        if (
+            hidden_states.shape == (240, 4, 5120)
+            and hidden_states.dtype == torch.bfloat16
+            and pre_mix.shape == (240, 4)
+            and pre_mix.dtype == torch.float32
+        ):
+            return self._boundary_collapse(hidden_states.flatten(1), pre_mix)
         return collapse(hidden_states, pre_mix)
 
 
@@ -354,6 +365,57 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.model(input_ids, positions, inputs_embeds)
+
+    def prepare_tpu_draft_sampler(
+        self, *, tp_size: int, block_size: int, sample_from_anchor: bool
+    ):
+        """Prepare fused sampling after the target LM weight is shared.
+
+        None means the proposer retains its ordinary logits/Markov path.
+        The returned sampler may also return None for an unsupported bucket.
+        """
+        from .dspark_sampling import initialize_samples
+
+        self._decode_samples = None
+        if not (tp_size == 1 and sample_from_anchor and block_size == 5):
+            return None
+        assert self.lm_head is not None
+        weight = cast(torch.Tensor, self.lm_head.weight)
+        markov = self.model.markov_head
+        if not (
+            weight.shape == (129280, 5120)
+            and weight.dtype == torch.bfloat16
+            and markov.markov_w2.weight.shape == (129280, 256)
+            and markov.markov_w2.weight.dtype == torch.bfloat16
+            and markov.markov_w1.weight.shape == (129280, 256)
+            and markov.markov_w1.weight.dtype == torch.bfloat16
+        ):
+            return None
+        self._decode_samples = initialize_samples()
+        return self._sample_decode
+
+    def _sample_decode(
+        self, hidden: torch.Tensor, input_ids: torch.Tensor, block_size: int
+    ) -> torch.Tensor | None:
+        if (
+            hidden.shape != (240, 5120)
+            or hidden.dtype != torch.bfloat16
+            or block_size != 5
+        ):
+            return None
+        slot_hidden = hidden.view(48, 5, 5120).transpose(0, 1).reshape(240, 5120)
+        logits = self.compute_logits(slot_hidden)
+        if logits.shape != (240, 129280) or logits.dtype != torch.bfloat16:
+            return None
+        markov = self.model.markov_head
+        anchors = input_ids[:240].view(48, 5)[:, 0]
+        assert self._decode_samples is not None
+        return self._decode_samples(
+            logits,
+            markov.markov_w1.weight,
+            markov.markov_w2.weight,
+            anchors,
+        )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Base logits U_k = lm_head(norm(head_hidden))."""
