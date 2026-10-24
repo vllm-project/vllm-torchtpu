@@ -53,7 +53,9 @@ logger = init_logger(__name__)
 
 # With the C1 tiles the kernel beats stock through 64 rows (mk/kernel_work/
 # mk-row-slope/report.md vs mk/stock-segment-vs-rows.md); 64 is the margin case.
-DEFAULT_BUCKETS = (4, 8, 16, 32, 64)
+# 24 and 48 are serving token buckets too (TPU_TOKEN_BUCKET_EXTRA); without them
+# 24-/48-row verify steps (6 or 12 requests) run stock.
+DEFAULT_BUCKETS = (4, 8, 16, 24, 32, 48, 64)
 
 
 def _parse_buckets(raw: str) -> tuple[int, ...]:
