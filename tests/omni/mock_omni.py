@@ -173,6 +173,13 @@ class _MockWanSelfAttention(torch.nn.Module):
         return "native"
 
 
+class _MockWorkerProc:
+    """vLLM-Omni's diffusion WorkerProc with its async output loop."""
+
+    def _async_output_loop(self):
+        pass
+
+
 vllm_omni_mock = MagicMock()
 vllm_omni_mock.platforms.interface.OmniPlatform = _MockOmniPlatform
 vllm_omni_mock.platforms.interface.OmniPlatformEnum = _MockOmniPlatformEnum
@@ -191,6 +198,7 @@ vllm_omni_mock.diffusion.layers.norm.RMSNorm = _MockRMSNorm
 _wan2_2 = vllm_omni_mock.diffusion.models.wan2_2
 _wan2_2.wan2_2_transformer.ColumnParallelGELU = _MockColumnParallelGELU
 _wan2_2.wan2_2_transformer.WanSelfAttention = _MockWanSelfAttention
+vllm_omni_mock.diffusion.worker.diffusion_worker.WorkerProc = _MockWorkerProc
 
 sys.modules["vllm_omni"] = vllm_omni_mock
 sys.modules["vllm_omni.platforms"] = vllm_omni_mock.platforms
@@ -230,3 +238,7 @@ sys.modules["vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer"] = (
 sys.modules["vllm_omni.diffusion.layers"] = vllm_omni_mock.diffusion.layers
 sys.modules["vllm_omni.diffusion.layers.rope"] = vllm_omni_mock.diffusion.layers.rope
 sys.modules["vllm_omni.diffusion.layers.norm"] = vllm_omni_mock.diffusion.layers.norm
+sys.modules["vllm_omni.diffusion.worker"] = vllm_omni_mock.diffusion.worker
+sys.modules["vllm_omni.diffusion.worker.diffusion_worker"] = (
+    vllm_omni_mock.diffusion.worker.diffusion_worker
+)
