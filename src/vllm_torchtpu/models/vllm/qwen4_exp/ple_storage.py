@@ -61,8 +61,10 @@ class ResidentPLETable(Qwen4ExpPLETable):
         if self.output_dtype != torch.bfloat16:
             raise ValueError("Compact PLE storage requires BF16 model activations")
         self.register_buffer("table", torch.empty(0, dtype=torch.uint8))
+        # This shard's first row, an operand of the lookup (see build_raw_lookup_op).
+        self.register_buffer("vocab_start", torch.zeros(1, dtype=torch.int32))
         self._raw_lookup: (
-            Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None
+            Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor] | None
         ) = None
 
     def allocate_embedding_weight(
@@ -145,15 +147,18 @@ class ResidentPLETable(Qwen4ExpPLETable):
             self.weight.detach().view(carrier).reshape(-1, 128).to(self.table.device)
         )
         self.weight.data = torch.empty(0, dtype=self.storage_dtype, device="cpu")
+        self.vocab_start = torch.tensor(
+            [self.shard_indices.org_vocab_start_index],
+            dtype=torch.int32,
+            device=self.table.device,
+        )
         self._raw_lookup = build_raw_lookup_op(
-            self.shard_indices.org_vocab_start_index,
-            self.shard_indices.num_org_elements,
-            self.embedding_dim,
+            self.shard_indices.num_org_elements, self.embedding_dim
         )
 
     def lookup_raw(self, ids: torch.Tensor) -> torch.Tensor:
         assert self._finalized and self._raw_lookup is not None
-        return self._raw_lookup(self.table, ids)
+        return self._raw_lookup(self.table, ids, self.vocab_start)
 
     def decode(self, raw: torch.Tensor) -> torch.Tensor:
         assert self._finalized and self._decode is not None

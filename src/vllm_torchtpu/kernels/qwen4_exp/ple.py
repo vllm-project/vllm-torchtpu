@@ -42,14 +42,16 @@ def _bf16(x):
     return jax.lax.optimization_barrier(x.astype(jnp.bfloat16))
 
 
-def resident_lookup_raw(
-    table, ids, *, vocab_start: int, local_rows: int, head_dim: int
-):
+def resident_lookup_raw(table, ids, vocab_start, *, local_rows: int, head_dim: int):
     """Owner-masked integer bits [T,heads*head_dim]: INT8/FP8 or INT16/BF16.
 
     Use the validated eight-token chunks: unbounded full-table gathers failed
     in the original FP8 lowering probes. Pad/crop only the queries, keeping
     the persistent table unchanged.
+
+    ``vocab_start`` (an int or an int32 array of one element) is this shard's
+    first row. As an array it is an operand rather than a constant, so every
+    TP rank compiles the same program and can replay another rank's.
     """
     token_count, heads = ids.shape
     embedding_dim = heads * head_dim
@@ -59,10 +61,11 @@ def resident_lookup_raw(
     padded = jnp.pad(
         ids.astype(jnp.int32), ((0, (-token_count) % 8), (0, 0)), constant_values=-1
     )
+    start = jnp.asarray(vocab_start, jnp.int32).reshape(())
 
     def gather(chunk):
-        owned = (chunk >= vocab_start) & (chunk < vocab_start + local_rows)
-        local = jnp.where(owned, chunk - vocab_start, 0)
+        owned = (chunk >= start) & (chunk < start + local_rows)
+        local = jnp.where(owned, chunk - start, 0)
         bits = compact_rows(table, local, head_dim=head_dim)
         bits = jnp.where(owned[..., None], bits, jnp.zeros((), table.dtype))
         return jax.lax.bitcast_convert_type(bits, carrier)
@@ -86,7 +89,7 @@ def resident_lookup(
         resident_lookup_raw(
             table,
             ids,
-            vocab_start=vocab_start,
+            vocab_start,
             local_rows=local_rows,
             head_dim=head_dim,
         ),

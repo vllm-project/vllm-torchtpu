@@ -19,22 +19,25 @@ from vllm_torchtpu.kernels.qwen4_exp.pool import (
 
 
 @functools.cache
-def build_raw_lookup_op(vocab_start: int, local_rows: int, head_dim: int):
-    def fn(table: jax.Array, ids: jax.Array) -> jax.Array:
+def build_raw_lookup_op(local_rows: int, head_dim: int):
+    """The shard's first row is the int32[1] operand ``vocab_start``, not part
+    of the op: a rank-specific op name or constant would make every TP rank
+    trace a different graph (TPU_PRECOMPILE_PEER_REPLAY could not share it).
+    """
+
+    def fn(table: jax.Array, ids: jax.Array, vocab_start: jax.Array) -> jax.Array:
         return resident_lookup_raw(
             table,
             ids,
-            vocab_start=vocab_start,
+            vocab_start,
             local_rows=local_rows,
             head_dim=head_dim,
         )
 
-    op = pallas.jax_op(
-        f"qwen4_exp::ple_raw_lookup_{vocab_start}_{local_rows}_{head_dim}", fn
-    )
+    op = pallas.jax_op(f"qwen4_exp::ple_raw_lookup_{local_rows}_{head_dim}", fn)
 
     @op.register_fake
-    def fake(table, ids):
+    def fake(table, ids, vocab_start):
         dtype = torch.int16 if table.dtype == torch.int16 else torch.int8
         return table.new_empty((ids.shape[0], ids.shape[1] * head_dim), dtype=dtype)
 
