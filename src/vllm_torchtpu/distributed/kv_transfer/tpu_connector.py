@@ -389,8 +389,9 @@ class _Stage3LoadMeta:
     group_block_ids: list[list[int]] | None = None
     # Prefix-aware load: tokens satisfied by the decode-local prefix cache
     # and excluded from the transfer. local_block_ids then holds only the
-    # suffix pages; the source store clips its plan at
-    # skip_tokens * token_bytes of the FA global destination byte space.
+    # suffix pages; the source store clips its plan at the prefix's bytes
+    # of each tag's global destination byte space (FA: skip_tokens *
+    # token_bytes; GLM: the skipped pages times the tag's page bytes).
     skip_tokens: int = 0
     # Full local hit: nothing to transfer; the worker only releases the
     # producer's request-block registration instead of pulling.
@@ -5774,6 +5775,38 @@ class TPURaidenConnectorWorker:
             )
             return skip_tokens * token_bytes
 
+    def _stage3_cache_skip_bytes(
+        self, cache_tags: list[str], skip_tokens: int
+    ) -> tuple[list[int], int]:
+        """Per-tag dst_skip_bytes of a prefix-aware suffix pull over the KV
+        cache tags, and the skip to log.
+
+        Every GLM lowering (replicated rows, DCP rows, DCP identity) puts a
+        request's destination page p at p * live_bytes_per_block of its tag's
+        global destination byte space, and one destination page holds one
+        scheduler block (block_size * dcp tokens). A GLM clip is then the
+        cached page count times each tag's own page bytes, which differ per
+        tag; the logged skip is their sum, the bytes each destination rank
+        does not pull. FA tags share one token-byte clip.
+        """
+        if not _use_raiden_glm_admission():
+            fa_skip_bytes = self._stage3_fa_skip_bytes(skip_tokens)
+            return [fa_skip_bytes] * len(cache_tags), fa_skip_bytes
+        dcp_size = max(
+            int(self.vllm_config.parallel_config.decode_context_parallel_size), 1
+        )
+        page_tokens = int(self.vllm_config.cache_config.block_size) * dcp_size
+        if skip_tokens % page_tokens:
+            raise ValueError(
+                "GLM prefix must cover whole scheduler blocks: "
+                f"skip_tokens={skip_tokens}, page_tokens={page_tokens}"
+            )
+        prefix_pages = skip_tokens // page_tokens
+        tag_skips = [
+            prefix_pages * self._stage3_row_geometry[tag][0] for tag in cache_tags
+        ]
+        return tag_skips, sum(tag_skips)
+
     def _stage_stage3_submit_task(
         self, pending: _Stage3PendingSubmit, synchronous: bool
     ) -> _Stage3SubmitTask | None:
@@ -5840,17 +5873,19 @@ class TPURaidenConnectorWorker:
                     transfer_tags.append(tag)
                     dst_blocks.append(int(mamba_state_block_ids[ordinal]))
                     dst_counts.append(1)
-            # Prefix-aware suffix pull: clip the FA global destination
-            # byte space at the locally-cached prefix; GDN state classes
-            # are not prefix-decomposable and always transfer whole
-            # (skip 0). Omit the kwarg entirely when there is no clip so
-            # skip-free requests stay byte-identical on the wire.
+            # Prefix-aware suffix pull: clip each KV cache tag's global
+            # destination byte space at the locally-cached prefix; GDN
+            # state classes are not prefix-decomposable and always transfer
+            # whole (skip 0). Omit the kwarg entirely when there is no clip
+            # so skip-free requests stay byte-identical on the wire.
             skip_tokens = req_meta.skip_tokens
             fa_skip_bytes = 0
             clip_kwargs: dict[str, Any] = {}
             if skip_tokens > 0:
-                fa_skip_bytes = self._stage3_fa_skip_bytes(skip_tokens)
-                clip_kwargs["dst_skip_bytes"] = [fa_skip_bytes] * fa_tag_count + [0] * (
+                tag_skips, fa_skip_bytes = self._stage3_cache_skip_bytes(
+                    transfer_tags[:fa_tag_count], skip_tokens
+                )
+                clip_kwargs["dst_skip_bytes"] = tag_skips + [0] * (
                     len(transfer_tags) - fa_tag_count
                 )
             dst_mem_type = self._raiden_hbm_memory_type()
@@ -6380,17 +6415,19 @@ class TPURaidenConnectorWorker:
                     transfer_tags.append(tag)
                     dst_blocks.append(int(mamba_state_block_ids[ordinal]))
                     dst_counts.append(1)
-            # Prefix-aware suffix pull: clip the FA global destination
-            # byte space at the locally-cached prefix; GDN state classes
-            # are not prefix-decomposable and always transfer whole
-            # (skip 0). Omit the kwarg entirely when there is no clip so
-            # skip-free requests stay byte-identical on the wire.
+            # Prefix-aware suffix pull: clip each KV cache tag's global
+            # destination byte space at the locally-cached prefix; GDN
+            # state classes are not prefix-decomposable and always transfer
+            # whole (skip 0). Omit the kwarg entirely when there is no clip
+            # so skip-free requests stay byte-identical on the wire.
             skip_tokens = int(getattr(req_meta, "skip_tokens", 0) or 0)
             fa_skip_bytes = 0
             clip_kwargs: dict[str, Any] = {}
             if skip_tokens > 0:
-                fa_skip_bytes = self._stage3_fa_skip_bytes(skip_tokens)
-                clip_kwargs["dst_skip_bytes"] = [fa_skip_bytes] * fa_tag_count + [0] * (
+                tag_skips, fa_skip_bytes = self._stage3_cache_skip_bytes(
+                    transfer_tags[:fa_tag_count], skip_tokens
+                )
+                clip_kwargs["dst_skip_bytes"] = tag_skips + [0] * (
                     len(transfer_tags) - fa_tag_count
                 )
             start_submit = time.perf_counter()

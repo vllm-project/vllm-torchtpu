@@ -3728,6 +3728,113 @@ class TestTPURaidenConnectorWorker:
             [50, 51, 52, 53, 11, 11] if hybrid else [50, 51, 52, 53]
         )
 
+    @staticmethod
+    def _glm_dcp16_consumer(facade):
+        worker = _make_raiden_worker(
+            is_producer=False, block_size=256, tp_rank=0, tp_size=16
+        )
+        worker.vllm_config.parallel_config.decode_context_parallel_size = 16
+        worker._raiden_work_unit = MagicMock()
+        # Each GLM tag has its own page bytes.
+        worker._stage3_row_geometry = {
+            "mla.nope": (131072, 512),
+            "mla.rope": (32768, 512),
+            "dsa.idx": (33792, 528),
+        }
+        worker._stage3_source_facades["prefill-controller.test:27000"] = facade
+        return worker
+
+    @staticmethod
+    def _glm_load(uuid, local_block_ids, skip_tokens=0):
+        return _Stage3LoadMeta(
+            uuid=uuid,
+            source_req_id=f"src-{uuid}",
+            local_block_ids=local_block_ids,
+            num_tokens=4 * 4096 - 1,
+            src_controller_address="prefill-controller.test:27000",
+            src_job_name="prefill",
+            src_engine_id="producer-engine",
+            src_data_replica_idx=0,
+            src_parallelism=16,
+            skip_tokens=skip_tokens,
+        )
+
+    @contextlib.contextmanager
+    def _glm_submit_env(self, worker):
+        with (
+            patch(f"{_MOD}._use_raiden_glm_admission", return_value=True),
+            patch.object(
+                worker,
+                "_require_stage3_controller",
+                return_value=(MagicMock(), "10.0.0.2:28000"),
+            ),
+            patch.object(
+                worker, "_stage3_source_work_units", return_value=[MagicMock()]
+            ),
+            patch.object(worker, "_raiden_hbm_memory_type", MagicMock(return_value=3)),
+            # GLM has no FA pools: the FA token-byte clip must not be consulted.
+            patch.object(
+                worker, "_stage3_fa_token_bytes", side_effect=AssertionError("FA")
+            ),
+        ):
+            yield
+
+    @pytest.mark.parametrize("synchronous", [False, True])
+    def test_glm_stage3_consumer_clip_skips_cached_pages_per_tag(self, synchronous):
+        """A GLM suffix pull clips every tag at the cached scheduler blocks
+        (4096 tokens each at DCP16) times that tag's own page bytes, on the
+        queued and on the inline submit; a skip-free pull sends no clip."""
+        facade = MagicMock()
+        facade.start_transfer.return_value = True
+        worker = self._glm_dcp16_consumer(facade)
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_load["dst-suffix"] = self._glm_load(
+            997, [52, 53], skip_tokens=2 * 4096
+        )
+        meta.reqs_to_load["dst-full"] = self._glm_load(998, [50, 51, 52, 53])
+
+        with self._glm_submit_env(worker):
+            worker._submit_stage3_loads(meta, MagicMock(), synchronous=synchronous)
+            _flush_stage3_submits(worker)
+
+        assert facade.start_transfer.call_count == 2
+        by_uuid = {
+            call.kwargs["uuid"]: call.kwargs
+            for call in facade.start_transfer.call_args_list
+        }
+        tags = ["mla.nope", "mla.rope", "dsa.idx"]
+        clipped = by_uuid[997]
+        assert clipped["transfer_pool_tags"] == tags
+        assert clipped["dst_skip_bytes"] == [2 * 131072, 2 * 32768, 2 * 33792]
+        assert clipped["dst_device_block_ids"] == [52, 53] * 3
+        assert clipped["dst_block_counts"] == [2, 2, 2]
+        assert clipped["num_tokens"] == 4 * 4096 - 1
+        unclipped = by_uuid[998]
+        assert unclipped["transfer_pool_tags"] == tags
+        assert "dst_skip_bytes" not in unclipped
+        assert unclipped["dst_device_block_ids"] == [50, 51, 52, 53] * 3
+        assert worker._failed_recving == set()
+
+    @pytest.mark.parametrize("synchronous", [False, True])
+    def test_glm_stage3_consumer_rejects_a_partial_page_clip(self, synchronous):
+        """A GLM prefix must be whole scheduler blocks: anything else fails
+        the load before the controller is contacted."""
+        facade = MagicMock()
+        facade.start_transfer.return_value = True
+        worker = self._glm_dcp16_consumer(facade)
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_load["dst-misaligned"] = self._glm_load(
+            999, [52, 53], skip_tokens=2 * 4096 - 256
+        )
+
+        with self._glm_submit_env(worker):
+            worker._submit_stage3_loads(meta, MagicMock(), synchronous=synchronous)
+            _flush_stage3_submits(worker)
+
+        facade.start_transfer.assert_not_called()
+        assert "dst-misaligned" in worker._failed_recving
+        assert worker._failed_block_ids >= {52, 53}
+
     @pytest.mark.parametrize(("tp_rank", "tp_size"), [(0, 1), (0, 2), (1, 2)])
     @pytest.mark.parametrize("report_completion", [False, True])
     def test_stage3_release_only_meta_cancels_producer_registration(

@@ -10,7 +10,7 @@ transport is involved.
 
 import math
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -28,7 +28,15 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
 from vllm_torchtpu.kernels.mla import kv_cache_utils as kvu
 
 from .raiden_test_utils import glm_named_kv_caches
-from .test_glm_dcp_spans import _FILLER, _TOKEN_BYTES, _dcp_owner_slots, _token_bytes
+from .test_glm_dcp_spans import (
+    _FILLER,
+    _TOKEN_BYTES,
+    _dcp_owner_slots,
+    _decode_tag_skips,
+    _global_span_pieces,
+    _suffix_cases,
+    _token_bytes,
+)
 from .test_tpu_connector import _MOD, _make_raiden_scheduler, _make_raiden_worker
 
 # ---------------------------------------------------------------------------
@@ -140,6 +148,95 @@ def test_identity_spans_land_where_the_decode_writer_puts_each_token(
         tokens = np.flatnonzero(page != kvu.OOB_PAGE)
         byte_index = slot[tokens, None] * _TOKEN_BYTES + np.arange(_TOKEN_BYTES)
         landed = dst[rank][page[tokens, None], byte_index]
+        np.testing.assert_array_equal(landed, _token_bytes(tokens, 0))
+
+
+@pytest.mark.parametrize(
+    "page_tokens,dcp,interleave,num_tokens,prefix_blocks", _suffix_cases(_CASES)
+)
+def test_identity_suffix_pull_lands_past_a_cached_prefix(
+    page_tokens, dcp, interleave, num_tokens, prefix_blocks
+):
+    """Decode prefix caching over the identity transfer: the decode already
+    holds the first prefix_blocks scheduler blocks and pulls only the rest,
+    into its newly allocated pages, with the per-tag clip its worker
+    computes. The rope pool's pages are a quarter of the nope pool's, so one
+    shared clip would misplace one of them."""
+    num_blocks = math.ceil(num_tokens / (page_tokens * dcp))
+    num_pages = 2 * num_blocks + 3
+    rng = np.random.default_rng(num_tokens + prefix_blocks)
+    src_ids = [int(i) for i in rng.permutation(num_pages)[:num_blocks]]
+    # The decode's table: adopted cache pages, then the suffix it pulls into.
+    dst_ids = [int(i) for i in rng.permutation(num_pages)[:num_blocks]]
+    cached_ids, suffix_ids = dst_ids[:prefix_blocks], dst_ids[prefix_blocks:]
+    live = {"mla.nope": page_tokens * _TOKEN_BYTES, "mla.rope": page_tokens * 2}
+    skips = _decode_tag_skips(
+        live,
+        page_tokens=page_tokens,
+        dcp=dcp,
+        skip_tokens=prefix_blocks * page_tokens * dcp,
+    )
+    assert skips == {tag: prefix_blocks * size for tag, size in live.items()}
+    # Producer pages: the nope pool as its DCP writer fills it, the rope pool
+    # opaque (identity ships whole pages, whatever their layout).
+    src = {
+        "mla.nope": _writer_pages(
+            _dcp_owner_slots(
+                num_tokens, page_tokens, dcp, interleave, src_ids, num_pages
+            ),
+            num_pages,
+            live["mla.nope"],
+        ),
+        "mla.rope": [
+            rng.integers(0, 256, (num_pages, live["mla.rope"]), dtype=np.uint8)
+            for _ in range(dcp)
+        ],
+    }
+    for tag, size in live.items():
+        for rank in range(dcp):
+            # The decode's cache holds the prefix as the producer computed it.
+            dst = np.zeros((num_pages, size), dtype=np.uint8)
+            dst[cached_ids] = src[tag][rank][src_ids[:prefix_blocks]]
+            coverage = [[] for _ in suffix_ids]
+            registration = lower_glm_dcp_identity_spans(
+                tag=tag,
+                num_tokens=num_tokens,
+                page_tokens=page_tokens,
+                dcp_size=dcp,
+                dcp_rank=rank,
+                live_bytes_per_block=size,
+                block_ids=src_ids,
+            )
+            for span in registration.spans:
+                src_page = src[tag][rank][
+                    registration.block_ids[span.src_block_ordinal]
+                ]
+                for index, in_page, offset, take in _global_span_pieces(
+                    span, live=size, tag_skip=skips[tag]
+                ):
+                    assert index < len(suffix_ids), "span past the suffix pages"
+                    dst[suffix_ids[index], in_page : in_page + take] = src_page[
+                        offset : offset + take
+                    ]
+                    coverage[index].append((in_page, in_page + take))
+            # Every suffix page arrives whole, exactly once.
+            for index, intervals in enumerate(coverage):
+                assert sorted(intervals) == [(0, size)], f"{tag} page {index}"
+            np.testing.assert_array_equal(dst[dst_ids], src[tag][rank][src_ids])
+            untouched = np.setdiff1d(np.arange(num_pages), dst_ids)
+            assert not dst[untouched].any()
+
+    # Every token, cached or pulled, sits where the decode's writer reads it.
+    nope = live["mla.nope"]
+    owners = _dcp_owner_slots(
+        num_tokens, page_tokens, dcp, interleave, dst_ids, num_pages
+    )
+    for rank, (page, slot) in enumerate(owners):
+        dst = np.zeros((num_pages, nope), dtype=np.uint8)
+        dst[dst_ids] = src["mla.nope"][rank][src_ids]
+        tokens = np.flatnonzero(page != kvu.OOB_PAGE)
+        byte_index = slot[tokens, None] * _TOKEN_BYTES + np.arange(_TOKEN_BYTES)
+        landed = dst[page[tokens, None], byte_index]
         np.testing.assert_array_equal(landed, _token_bytes(tokens, 0))
 
 
@@ -560,6 +657,52 @@ def test_tp_over_dcp_decode_requires_matching_identity_producer(overrides, accep
         assert error is None
     else:
         assert "DCP identity" in error
+
+
+@pytest.mark.parametrize("prefix_aware", [True, False])
+def test_decode_prefix_hit_pulls_only_the_uncached_scheduler_blocks(prefix_aware):
+    """Decode prefix caching: a local hit of two 4096-token DCP16 blocks
+    leaves only the rest to pull, into the newly allocated pages. With
+    TPU_RAIDEN_PREFIX_AWARE_LOAD off (the default) the whole payload is
+    pulled into every page, the hit's adopted pages included."""
+    prompt_tokens = 4 * 4096
+    request = MagicMock()
+    request.request_id = "dst-req"
+    request.num_prompt_tokens = prompt_tokens
+    request.num_computed_tokens = 0
+    request.prompt_token_ids = [0] * prompt_tokens
+    request.kv_transfer_params = _load_params(num_tokens=prompt_tokens - 1)
+    blocks = MagicMock()
+    blocks.get_block_ids.return_value = ([50, 51, 52, 53],)
+    with (
+        patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+        patch(
+            f"{_MOD}.tpu_envs.TPU_RAIDEN_PREFIX_AWARE_LOAD", prefix_aware, create=True
+        ),
+        patch(f"{_MOD}._prefix_aware_load_supported", return_value=True),
+        patch(f"{_MOD}.dist_utils.get_raiden_inline_load", return_value=False),
+        patch(f"{_MOD}._use_raiden_glm_admission", return_value=True),
+        patch(f"{_MOD}._raiden_glm_dcp_identity", return_value=True),
+    ):
+        decode = _make_raiden_scheduler(
+            is_producer=False, block_size=256, tp_size=16, enable_prefix_caching=True
+        )
+        parallel = decode.vllm_config.parallel_config
+        parallel.decode_context_parallel_size = 16
+        parallel.cp_kv_cache_interleave_size = 4
+        matched, is_async = decode.get_num_new_matched_tokens(request, 2 * 4096)
+        decode.update_state_after_alloc(request, blocks, matched)
+
+    assert (matched, is_async) == (2 * 4096 - 1, True)
+    load = decode.reqs_to_load["dst-req"]
+    assert load.num_tokens == prompt_tokens - 1
+    assert not load.release_only
+    if prefix_aware:
+        assert load.skip_tokens == 2 * 4096
+        assert load.local_block_ids == [52, 53]
+    else:
+        assert load.skip_tokens == 0
+        assert load.local_block_ids == [50, 51, 52, 53]
 
 
 # ---------------------------------------------------------------------------
