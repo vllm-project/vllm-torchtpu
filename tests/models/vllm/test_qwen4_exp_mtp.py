@@ -275,6 +275,8 @@ def test_predictor_fuses_upstream_inputs_and_returns_both_streams(monkeypatch):
     cfg = NS(model_config=NS(hf_text_config=text), additional_config={})
     with torch.device("cpu"):
         predictor = mtp.Qwen4ExpMultiTokenPredictor(cfg, ["mtp.layers.2"])
+    # The draft serves every token bucket from one graph.
+    assert predictor.layers[0].self_attn.single_graph
     predictor = predictor.to(torch.bfloat16)
     for p in predictor.parameters():
         p.data.normal_(0, 0.2)

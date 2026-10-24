@@ -282,6 +282,9 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         # lane p % ring_size), which keeps speculative rejections from
         # evicting accepted members of the partial compression group.
         self.ring_size = (self.compress_ratio + 7) // 8 * 8
+        # Set by a module whose graph is traced once for every token bucket (the
+        # MTP draft): ops must not choose their structure by the token count.
+        self.single_graph = False
         kv_size = min(tp_size, self.total_num_kv_heads)
         kv_rank = tp_rank // max(tp_size // self.total_num_kv_heads, 1)
         with torch.device(device or "cpu"), set_default_torch_dtype(torch.bfloat16):
@@ -418,10 +421,13 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             group = get_tp_group()
             assert int(group.world_size) == self.tp_size
             assert int(group.rank_in_group) == self.tp_rank
+            # The all-to-all merge is chosen by the token count while tracing;
+            # a single-graph module (the MTP draft) always all-gathers.
+            a2a_min_tokens = envs.VLLM_TPU_QSA_INDEXER_SHARD_A2A_MIN_TOKENS
+            if self.single_graph:
+                a2a_min_tokens = 0
             self._shard_op = partial(
-                build_pooled_qsa_shard_op(
-                    group, envs.VLLM_TPU_QSA_INDEXER_SHARD_A2A_MIN_TOKENS
-                ),
+                build_pooled_qsa_shard_op(group, a2a_min_tokens),
                 kv_heads=self.num_kv_heads,
                 **keywords,
             )
@@ -432,9 +438,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 )
 
                 self._shard_select_op = partial(
-                    build_pooled_qsa_shard_select_op(
-                        group, envs.VLLM_TPU_QSA_INDEXER_SHARD_A2A_MIN_TOKENS
-                    ),
+                    build_pooled_qsa_shard_select_op(group, a2a_min_tokens),
                     **keywords,
                 )
 

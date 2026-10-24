@@ -159,6 +159,11 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             prefill_norm_tile=int(tiles.get("hc_prefill_norm_tile", 0)),
             prefill_full_tile=int(tiles.get("hc_prefill_full_tile", 0)),
         )
+        # The draft is traced once for every token bucket (see
+        # draft_additional_config): its attention must not choose its
+        # structure by the token count either.
+        for layer in self.layers:
+            layer.self_attn.single_graph = True
         # Set by the Qwen3.8 megakernel driver before the first trace: the
         # layer's o_proj, both HCs and the MoE as one tail-kernel call.
         self.mk_tail: nn.Module | None = None
