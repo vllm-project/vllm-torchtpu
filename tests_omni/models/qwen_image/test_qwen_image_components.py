@@ -17,8 +17,8 @@ Tested components:
 - QwenEmbedRope and QwenEmbedLayer3DRope: TPU RoPE frequency generation parity
   vs CPU under torch.inference_mode() (including the txt_freqs clone patch).
 - RotaryEmbedding: Cross-attention q/k rotation parity vs float64 CPU reference.
-- TpuSDPAImpl: Unmasked joint attention parity (the production path for
-  batch-1 requests) vs float64 CPU reference.
+- TpuSDPAImpl and TpuFlashAttentionImpl: Unmasked joint attention parity (the
+  production path for batch-1 requests) vs float64 CPU reference.
 """
 
 import math
@@ -36,7 +36,7 @@ from tests_omni.omni_test_utils import (
     NUMERIC_MISMATCH_PATTERN,
     assert_numerical_parity,
 )
-from vllm_torchtpu.omni.attention import TpuSDPAImpl
+from vllm_torchtpu.omni.attention import TpuFlashAttentionImpl, TpuSDPAImpl
 from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
 
 pytestmark = [pytest.mark.omni]
@@ -213,9 +213,10 @@ def _unmasked_sdpa_reference(q, k, v, scale):
 
 
 class TestQwenJointAttention:
-    """Test TpuSDPAImpl with Qwen joint text+image attention configuration."""
+    """Test the TPU attention impls with Qwen joint text+image attention shapes."""
 
-    def test_qwen_joint_attention_numeric_parity_on_tpu(self):
+    @pytest.mark.parametrize("impl_cls", [TpuSDPAImpl, TpuFlashAttentionImpl])
+    def test_qwen_joint_attention_numeric_parity_on_tpu(self, impl_cls):
         torch.manual_seed(42)
         batch_size = 1
         num_heads = 24
@@ -225,7 +226,7 @@ class TestQwenJointAttention:
         # Production scale: text=256, target=1024, condition=4096 => total 5376
         seq_len = 5376
 
-        impl = TpuSDPAImpl(
+        impl = impl_cls(
             num_heads=num_heads,
             head_size=head_size,
             softmax_scale=scale,
@@ -260,9 +261,8 @@ class TestQwenJointAttention:
         assert tpu_out.shape == (batch_size, seq_len, num_heads, head_size)
         assert torch.all(torch.isfinite(tpu_out_cpu))
 
-        assert_numerical_parity(
-            tpu_out_cpu, ref_out, atol=1e-3, rtol=1e-2
-        )  # Measured max abs error: 0.000482
+        # Measured max abs error: TpuSDPAImpl 0.000482, TpuFlashAttentionImpl 0.000714
+        assert_numerical_parity(tpu_out_cpu, ref_out, atol=1e-3, rtol=1e-2)
 
         # Bitwise replay test
         tpu_out_2 = impl.forward(q_tpu, k_tpu, v_tpu, attn_metadata=attn_metadata)
@@ -270,7 +270,7 @@ class TestQwenJointAttention:
         torch.testing.assert_close(tpu_out_cpu, tpu_out_2_cpu, atol=0.0, rtol=0.0)
 
         # Must-fail control: doubling the softmax scale
-        impl_bad = TpuSDPAImpl(
+        impl_bad = impl_cls(
             num_heads=num_heads, head_size=head_size, softmax_scale=scale * 2.0
         )
         tpu_out_bad = impl_bad.forward(q_tpu, k_tpu, v_tpu, attn_metadata=attn_metadata)
