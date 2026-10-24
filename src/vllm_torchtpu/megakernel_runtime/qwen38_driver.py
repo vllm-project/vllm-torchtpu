@@ -314,6 +314,7 @@ class Qwen38SegmentDriver:
         self.shadow = None
         self.stats: dict[str, int] = {}
         self.mtp = False
+        self.cfg = None
 
     @classmethod
     def maybe_create(cls, runner: Any) -> Qwen38SegmentDriver | None:
@@ -343,6 +344,25 @@ class Qwen38SegmentDriver:
         )
         return drv
 
+    def _segment_config(self, runner: Any) -> Any:
+        """The runner's config with `compile_sizes` cut to the megakernel buckets.
+
+        vLLM traces a compiled module once and builds that graph for every
+        compile size. The segment program shares the stock model's
+        hyper-connection code, which branches at its prefill tile (128 rows),
+        so a trace at a megakernel bucket cannot serve 128+. The program only
+        ever runs at the buckets, so it compiles only those (the drafter
+        likewise compiles under its own copy of the config).
+        """
+        import copy
+
+        cfg = copy.copy(runner.vllm_config)
+        cc = copy.copy(runner.vllm_config.compilation_config)
+        paddings = set(int(x) for x in (cc.compile_sizes or []))
+        cc.compile_sizes = sorted(b for b in self.buckets if not paddings or b in paddings)
+        object.__setattr__(cfg, "compilation_config", cc)
+        return cfg
+
     def _contexts(self, runner: Any, tag: str) -> Any:
         """The contexts the runner builds its main model under (config, mesh, tag)."""
         import contextlib
@@ -356,19 +376,19 @@ class Qwen38SegmentDriver:
 
         stack = contextlib.ExitStack()
         stack.enter_context(set_model_tag(tag))
-        stack.enter_context(
-            set_vllm_model_wrapper_context(mesh=runner.mesh, vllm_config=runner.vllm_config)
-        )
-        stack.enter_context(set_current_vllm_config(runner.vllm_config))
+        cfg = getattr(self, "cfg", None) or runner.vllm_config
+        stack.enter_context(set_vllm_model_wrapper_context(mesh=runner.mesh, vllm_config=cfg))
+        stack.enter_context(set_current_vllm_config(cfg))
         return stack
 
     def bind_and_warmup(self, runner: Any) -> None:
         from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpSegmentModel
 
         self.segments.bind_pool()
+        self.cfg = self._segment_config(runner)
         with self._contexts(runner, "model_mk_segments"):
             self.program = Qwen4ExpSegmentModel(
-                vllm_config=runner.vllm_config,
+                vllm_config=self.cfg,
                 prefix="model_mk_segments",
                 backbone=runner.model.model,
                 segments=self.segments,
@@ -387,7 +407,7 @@ class Qwen38SegmentDriver:
             shadow_seg.bind_pool()
             with self._contexts(runner, "model_mk_segments_shadow"):
                 self.shadow = Qwen4ExpSegmentModel(
-                    vllm_config=runner.vllm_config,
+                    vllm_config=self.cfg,
                     prefix="model_mk_segments_shadow",
                     backbone=runner.model.model,
                     segments=shadow_seg,
