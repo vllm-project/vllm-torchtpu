@@ -30,6 +30,7 @@ from torch_tpu._internal.pallas import pallas
 # `ref.bitcast(jnp.int32)` folds into one word row inside the kernel.
 WORD_BYTES = 4
 TILE_LANE_BYTES = 128  # lane width of a TensorCore tile, in bytes
+PACKED_ROPE_BYTES = 64  # fp8 bytes per token under TPU_SPARSE_MLA_PACKED_ROPE
 
 # Sentinels for tokens that must not be written. JAX drops out-of-bounds
 # scatters; the Pallas writers predicate on the sign instead.
@@ -104,6 +105,9 @@ class SparseMLAKVCacheSpec:
     page_size: int
     head_dim: int
     kv_packing: int
+    # ROPE/SPARSECORE only: a token takes `head_dim` bytes rather than a
+    # padded `TILE_LANE_BYTES` row, so several tokens share each lane row.
+    packed_rope: bool = False
 
     @classmethod
     def create(
@@ -114,12 +118,37 @@ class SparseMLAKVCacheSpec:
         page_size: int,
         head_dim: int,
         kv_packing: int = 4,
+        packed_rope: bool = False,
     ) -> "SparseMLAKVCacheSpec":
         """Builds a spec with the kernel's page/head-dim padding applied."""
+        unpadded_head_dim = head_dim
         num_pages, packed_page_size, kv_packing, head_dim = get_kv_cache_shape(
             num_pages, page_size, head_dim, None, kv_packing
         )
         page_size = packed_page_size * kv_packing
+
+        if packed_rope:
+            if (
+                cache_type is not KVCacheType.ROPE
+                or layout is not KVCacheLayout.SPARSECORE
+            ):
+                raise ValueError(
+                    "packed rope needs a ROPE cache in the SparseCore layout, got "
+                    f"{cache_type.value}/{layout.value}"
+                )
+            if unpadded_head_dim != PACKED_ROPE_BYTES:
+                raise ValueError(
+                    f"packed rope expects unpadded head_dim == {PACKED_ROPE_BYTES}B, "
+                    f"got {unpadded_head_dim}B"
+                )
+            head_dim = unpadded_head_dim
+            row_bytes = WORD_BYTES * TILE_LANE_BYTES
+            if row_bytes % head_dim or page_size % (row_bytes // head_dim):
+                raise ValueError(
+                    f"packed rope head_dim {head_dim} must divide {row_bytes} "
+                    f"and page_size {page_size} must hold whole "
+                    f"{row_bytes}-byte rows"
+                )
 
         if layout is KVCacheLayout.SPARSECORE:
             assert head_dim % WORD_BYTES == 0, (
@@ -144,6 +173,7 @@ class SparseMLAKVCacheSpec:
             page_size=page_size,
             head_dim=head_dim,
             kv_packing=kv_packing,
+            packed_rope=packed_rope,
         )
 
     @property
@@ -160,6 +190,11 @@ class SparseMLAKVCacheSpec:
         return self.head_dim
 
     @property
+    def tokens_per_row(self) -> int:
+        """Tokens sharing one `TILE_LANE_BYTES`-word row of a ROPE/SC cache."""
+        return WORD_BYTES * TILE_LANE_BYTES // self.token_bytes
+
+    @property
     def shape(self) -> tuple[int, ...]:
         if self.cache_type is KVCacheType.NOPE:
             if self.layout is KVCacheLayout.TENSORCORE:
@@ -171,6 +206,15 @@ class SparseMLAKVCacheSpec:
                 )
             return (self.num_pages, self.page_size, self.head_dim // WORD_BYTES)
         if self.cache_type is KVCacheType.ROPE:
+            if self.packed_rope:
+                # `tokens_per_row` tokens of `head_dim // WORD_BYTES` words
+                # each fill one lane row, so the minor dim stays a full 128
+                # lanes and the tiled HBM allocation carries no padding.
+                return (
+                    self.num_pages,
+                    self.page_size // self.tokens_per_row,
+                    TILE_LANE_BYTES,
+                )
             if self.layout is KVCacheLayout.TENSORCORE:
                 return (
                     self.num_pages,

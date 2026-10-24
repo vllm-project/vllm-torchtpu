@@ -132,6 +132,7 @@ if TYPE_CHECKING:
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "sparsecore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "sparsecore"
+    TPU_SPARSE_MLA_PACKED_ROPE: bool = False
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
     TPU_NODE_ID: int = 0
@@ -463,6 +464,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SPARSE_MLA_ROPE_LAYOUT": env_with_choices(
         "TPU_SPARSE_MLA_ROPE_LAYOUT", "sparsecore", ["sparsecore", "tensorcore"]
     ),
+    # Store each token's 64-byte fp8 RoPE key in 64 bytes instead of a padded
+    # 128-byte row (eight tokens per 128-word row), cutting the sparse MLA
+    # latent cache from 640 to 576 B/token. SparseCore layouts only; the
+    # gather expands the rows back to the padded format the attention kernel
+    # reads. Changes the cache layout: a disagg pair must agree on it. On the
+    # Raiden pipeline->DCP path, rope tokens per row become 8, so
+    # glm_dcp_chunk_bytes rejects cp_kv_cache_interleave_size=4 at registration
+    # (requires a multiple of 8).
+    "TPU_SPARSE_MLA_PACKED_ROPE": env_bool("TPU_SPARSE_MLA_PACKED_ROPE", default=False),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS": lambda: os.getenv("JAX_PLATFORMS", "").lower(),
     # TPU accelerator type (e.g., "v5litepod-16", "v4-8")

@@ -1766,10 +1766,26 @@ class PallasMLAttentionBackend(AttentionBackend):
         """The (nope, rope) specs for one sparse-MLA layer."""
         rope_dim = PallasMLAttentionBackend._DS_MLA_ROPE_HEAD_DIM
         kv_packing = get_dtype_packing(_resolve_kv_cache_dtype(cache_dtype_str))
+        nope_layout = KVCacheLayout(envs.TPU_SPARSE_MLA_NOPE_LAYOUT)
+        rope_layout = KVCacheLayout(envs.TPU_SPARSE_MLA_ROPE_LAYOUT)
+        packed_rope = envs.TPU_SPARSE_MLA_PACKED_ROPE
+        if packed_rope and (
+            nope_layout is not KVCacheLayout.SPARSECORE
+            or rope_layout is not KVCacheLayout.SPARSECORE
+        ):
+            # Only the native SparseCore gather reads packed rope rows; the
+            # TensorCore dsa_gather and masked-dense paths assume one padded
+            # 128-byte row per token.
+            raise ValueError(
+                "TPU_SPARSE_MLA_PACKED_ROPE=1 requires "
+                "TPU_SPARSE_MLA_NOPE_LAYOUT=sparsecore and "
+                "TPU_SPARSE_MLA_ROPE_LAYOUT=sparsecore, got "
+                f"{nope_layout.value} and {rope_layout.value}"
+            )
         return (
             SparseMLAKVCacheSpec.create(
                 KVCacheType.NOPE,
-                KVCacheLayout(envs.TPU_SPARSE_MLA_NOPE_LAYOUT),
+                nope_layout,
                 num_blocks,
                 block_size,
                 head_size - rope_dim,
@@ -1777,13 +1793,31 @@ class PallasMLAttentionBackend(AttentionBackend):
             ),
             SparseMLAKVCacheSpec.create(
                 KVCacheType.ROPE,
-                KVCacheLayout(envs.TPU_SPARSE_MLA_ROPE_LAYOUT),
+                rope_layout,
                 num_blocks,
                 block_size,
                 rope_dim,
                 kv_packing,
+                packed_rope=packed_rope,
             ),
         )
+
+    @staticmethod
+    def get_sparse_kv_cache_page_size_bytes(
+        block_size: int,
+        head_size: int,
+        cache_dtype_str: str | torch.dtype = "auto",
+    ) -> int:
+        """Bytes per block of one sparse-MLA layer's (nope, rope) caches.
+
+        Equal to `get_kv_cache_page_size_bytes` (one 128-lane-padded latent
+        row per token) unless `TPU_SPARSE_MLA_PACKED_ROPE` drops the rope
+        padding.
+        """
+        specs = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            1, block_size, head_size, cache_dtype_str
+        )
+        return sum(math.prod(spec.shape) * spec.torch_dtype.itemsize for spec in specs)
 
     @staticmethod
     def get_kv_cache_page_size_bytes(

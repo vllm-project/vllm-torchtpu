@@ -126,6 +126,16 @@ class SparseMLAScatterTest(parameterized.TestCase):
             )
             for name, cache_type, layout, head_dim in _LIVE_SPECS
         }
+        # TPU_SPARSE_MLA_PACKED_ROPE: 64 bytes per token, eight to a row.
+        specs["rope_sc_packed"] = SparseMLAKVCacheSpec.create(
+            KVCacheType.ROPE,
+            KVCacheLayout.SPARSECORE,
+            num_pages,
+            page_size,
+            ROPE_DIM,
+            KV_PACKING,
+            packed_rope=True,
+        )
         page, slot = kv_cache_utils.get_page_and_slot(
             num_tokens,
             jnp.asarray(seq_lens),
@@ -208,6 +218,13 @@ class SparseMLAScatterTest(parameterized.TestCase):
     def test_scatter_rope_sc(self, num_seqs, tokens_per_seq, max_seq_len, num_pages):
         inp = self._generate_inputs(num_seqs, tokens_per_seq, max_seq_len, num_pages)
         self._check_scatter(inp, "rope_sc", inp["k_pe"], inp["k_pe_u8"])
+
+    @parameterized.named_parameters(*_SCENARIOS)
+    def test_scatter_rope_sc_packed(
+        self, num_seqs, tokens_per_seq, max_seq_len, num_pages
+    ):
+        inp = self._generate_inputs(num_seqs, tokens_per_seq, max_seq_len, num_pages)
+        self._check_scatter(inp, "rope_sc_packed", inp["k_pe"], inp["k_pe_u8"])
 
     def test_nope_sparsecore_is_byte_identical_to_tensorcore(self):
         """`pack_tokens` reproduces the TC sublane fold, so the two nope

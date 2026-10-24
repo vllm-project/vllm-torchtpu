@@ -1061,6 +1061,7 @@ def prepare_outputs(
         "live_gather_all_chunks",
         "topk_cap",
         "lse_lane_dense",
+        "packed_rope",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -1069,7 +1070,7 @@ def sparse_ragged_paged_attention(
     # SparseCore: u32[pages, page_size, 128].
     cache_kv_nope: jax.Array,
     # TensorCore: u8[pages, page_size/4, 4, 128].
-    # SparseCore: u32[pages, page_size/4, 128].
+    # SparseCore: u32[pages, page_size/4, 128] (page_size/8 with packed_rope).
     cache_kv_rope: jax.Array,
     topk_indices: jax.Array,  # i32[max_num_tokens, csa_topk]
     page_indices: jax.Array | None,  # i32[max_num_seqs * pages_per_seq]
@@ -1095,6 +1096,7 @@ def sparse_ragged_paged_attention(
     topk_cap: int | None = None,
     q_pe: jax.Array | None = None,
     lse_lane_dense: bool = False,
+    packed_rope: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -1159,6 +1161,10 @@ def sparse_ragged_paged_attention(
       lse_lane_dense: With `return_lse`, carry the log-sum-exp as f32[tokens,
         heads] through the kernel instead of f32[tokens, heads, 1] (lane-padded
         tiles). Same values.
+      packed_rope: SparseCore layout only. `cache_kv_rope` stores each token's
+        rope in 16 words, eight tokens per row
+        (`SparseMLAKVCacheSpec.packed_rope`); the gather expands it to the
+        padded rows the attention body reads, so the scores are unchanged.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -1170,6 +1176,8 @@ def sparse_ragged_paged_attention(
             f"{SPARSECORE_CACHE_LAYOUT!r}, got {cache_layout!r}"
         )
     sparsecore_layout = cache_layout == SPARSECORE_CACHE_LAYOUT
+    # Tokens per ROPE cache row: four padded 128-byte rows, or eight packed.
+    rope_tokens_per_row = 8 if packed_rope else 4
     if sparsecore_layout:
         if (
             cache_kv_nope.dtype != jnp.uint32
@@ -1185,9 +1193,12 @@ def sparse_ragged_paged_attention(
             or cache_kv_rope.shape[-1] != 128
         ):
             raise ValueError(
-                "sparsecore ROPE cache must be uint32[pages,page_size/4,128]"
+                "sparsecore ROPE cache must be uint32"
+                f"[pages,page_size/{rope_tokens_per_row},128]"
             )
     else:
+        if packed_rope:
+            raise ValueError("packed_rope needs the sparsecore cache layout")
         if (
             cache_kv_nope.dtype != jnp.uint8
             or cache_kv_nope.ndim != 4
@@ -1204,14 +1215,14 @@ def sparse_ragged_paged_attention(
             raise ValueError(
                 "tensorcore ROPE cache must be uint8[pages,page_size/4,4,128]"
             )
-    if cache_kv_nope.size != 4 * cache_kv_rope.size:
+    if cache_kv_nope.size != rope_tokens_per_row * cache_kv_rope.size:
         raise ValueError(
             f"NOPE cache size ({cache_kv_nope.size}) must be exactly "
-            f"4 * ROPE cache size ({cache_kv_rope.size})"
+            f"{rope_tokens_per_row} * ROPE cache size ({cache_kv_rope.size})"
         )
     if (
         cache_kv_nope.shape[0] != cache_kv_rope.shape[0]
-        or cache_kv_nope.shape[1] != 4 * cache_kv_rope.shape[1]
+        or cache_kv_nope.shape[1] != rope_tokens_per_row * cache_kv_rope.shape[1]
     ):
         raise ValueError(
             "NOPE and ROPE caches must have matching page counts and page geometry"
@@ -1360,6 +1371,7 @@ def sparse_ragged_paged_attention(
             ),
             q_pe=q_pe,
             lse_lane_dense=lse_lane_dense,
+            packed_rope=packed_rope,
         )
         if return_lse:
             q, lse = result
@@ -1433,7 +1445,7 @@ def sparse_attention_chunk(
     # SparseCore: u32[pages, page_size, 128].
     cache_kv_nope: jax.Array,
     # TensorCore: u8[pages, page_size/4, 4, 128].
-    # SparseCore: u32[pages, page_size/4, 128].
+    # SparseCore: u32[pages, page_size/4, 128] (page_size/8 with packed_rope).
     cache_kv_rope: jax.Array,
     kv_lens: jax.Array,  # i32[max_num_tokens]
     physical_indices: jax.Array | None,  # i32[max_num_tokens, csa_topk]
@@ -1461,6 +1473,7 @@ def sparse_attention_chunk(
     window_indices: jax.Array | None = None,
     q_pe: jax.Array | None = None,
     lse_lane_dense: bool = False,
+    packed_rope: bool = False,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -1481,6 +1494,8 @@ def sparse_attention_chunk(
     (unpadded, nope a multiple of 128) and `q_pe` its rope part; the kernel
     joins them in VMEM and the output (aliasing `q`) is `nope` wide.
     `lse_lane_dense`: `lse` is f32[max_num_tokens, num_q_heads].
+    `packed_rope` (SparseCore layout only): the rope cache holds 16 words per
+    token; the gather returns the same padded rows either way.
     """
     return_lse = lse is not None
     if topk_override is not None:
@@ -1493,6 +1508,8 @@ def sparse_attention_chunk(
     sparsecore_layout = cache_layout == SPARSECORE_CACHE_LAYOUT
     if topk_cap is not None and not sparsecore_layout:
         raise ValueError("topk_cap requires the sparsecore cache layout")
+    if packed_rope and not sparsecore_layout:
+        raise ValueError("packed_rope requires the sparsecore cache layout")
     if topk_cap is not None and (topk_cap % GATHER_ATOM_ROWS or topk % topk_cap):
         raise ValueError(
             f"topk_cap ({topk_cap}) must be a multiple of {GATHER_ATOM_ROWS} "
@@ -1732,6 +1749,7 @@ def sparse_attention_chunk(
                 serve_pipelined=sparsecore_gather_pipelined,
                 num_live_indices=num_live_capped,
                 live_multiple=kernel_batch_size * topk_cap,
+                packed_rope=packed_rope,
             )
         )
         gathered_nope_buffer = gathered_nope_buffer.reshape(
@@ -1763,6 +1781,7 @@ def sparse_attention_chunk(
                 atoms_per_batch=gather_atoms,
                 wait_mode=sparsecore_gather_wait_mode,
                 serve_pipelined=sparsecore_gather_pipelined,
+                packed_rope=packed_rope,
                 **live_kwargs,
             )
         )
