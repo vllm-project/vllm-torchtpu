@@ -109,6 +109,7 @@ if TYPE_CHECKING:
     TPU_PP_LAZY_PUSH: bool = False
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
+    TPU_ROPE_IN_GRAPH: bool = True
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
@@ -794,6 +795,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Materialize the rotary cos_sin caches with a row-major ({1,0}) device
     # layout at load, May cost more HBM due to padding.
     "TPU_ROPE_CACHE_ROW_MAJOR": env_bool("TPU_ROPE_CACHE_ROW_MAJOR", default=False),
+    # Compute rotary cos/sin in-graph from positions instead of gathering them
+    # from cos_sin_cache, for rotary modules whose cache depends only on
+    # inv_freq (plain, Llama3, NTK). Other variants keep their cache.
+    # TODO: Delete the cached path for these modules (this flag, and the
+    # cos_sin_cache handling of TPU_ROPE_CACHE_TRUNCATE and
+    # TPU_ROPE_CACHE_ROW_MAJOR for them) once in-graph RoPE has been stable as
+    # the default. Delete with it the load-time comparison against the cache,
+    # the correction table and the inv_freq candidates: they only keep the
+    # in-graph values bitwise equal to the cache, whose last-bit differences
+    # are ordinary floating-point rounding, not errors.
+    "TPU_ROPE_IN_GRAPH": env_bool("TPU_ROPE_IN_GRAPH", default=True),
     "TPU_MOE_HASH_TABLE_ROW_MAJOR": env_bool(
         "TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False
     ),

@@ -5232,6 +5232,13 @@ class TPUModelRunner(GPUModelRunner):
             if self._pp_topk_buffer is not None:
                 # -1 is "no token": a row of it attends to nothing.
                 self._pp_topk_buffer.fill_(-1)
+        # TODO: Make this unconditional and delete the cos_sin_cache path for the
+        # patched rotary modules once in-graph RoPE has been stable as the default,
+        # together with the cache comparison and correction table it uses.
+        if envs.TPU_ROPE_IN_GRAPH:
+            runner_utils.patch_in_graph_rotary_embedding(
+                self.model, self.model_config.dtype
+            )
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches()
         if envs.TPU_ROPE_CACHE_ROW_MAJOR:
