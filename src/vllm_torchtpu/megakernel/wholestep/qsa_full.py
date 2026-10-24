@@ -119,12 +119,13 @@ class QSAFullBlock(Block):
         return [
             ScratchReq("qf_ring", pltpu.VMEM((self.slots, TILE, 1, 4, 256), f8)),
             ScratchReq("qf_ring_sem", pltpu.SemaphoreType.DMA((self.slots,))),
-            ScratchReq("qf_q", pltpu.VMEM((ex.MB, nh, g.HD), BF16)),
-            ScratchReq("qf_g", pltpu.VMEM((ex.MB, nh, g.HD), BF16)),
-            ScratchReq("qf_t", pltpu.VMEM((2 * nh, ex.MB, g.HD), BF16)),
+            # F32 (BF16-valued): rows are written by static single-row stores, which a packed
+            # BF16 tile or a strided per-head DMA does not lower to (Mosaic tile alignment).
+            ScratchReq("qf_q", pltpu.VMEM((ex.MB, nh, g.HD), F32)),
+            ScratchReq("qf_g", pltpu.VMEM((ex.MB, nh, g.HD), F32)),
             ScratchReq("qf_kv", pltpu.VMEM((ex.MB, 2 * g.HD), BF16)),
             ScratchReq("qf_rope", pltpu.VMEM((ex.MB, 128), F32)),
-            ScratchReq("qf_sem", pltpu.SemaphoreType.DMA((2 * nh + 2,))),
+            ScratchReq("qf_sem", pltpu.SemaphoreType.DMA((2,))),
         ]
 
     # ------------------------------------------------------------ in kernel
@@ -134,7 +135,7 @@ class QSAFullBlock(Block):
         ex, scr, g = ctx.ex, ctx.scr, ctx.g
         nh, hd, rot = self.nh(g, ex), g.HD, self.rot
         rc = pltpu.make_async_copy(
-            ctx.extra[ROPE].at[pl.ds(0, ex.MB)], scr["qf_rope"], scr["qf_sem"].at[2 * nh]
+            ctx.extra[ROPE].at[pl.ds(0, ex.MB)], scr["qf_rope"], scr["qf_sem"].at[0]
         )
         rc.start()
         with ctx.stream.segment(lazy=False):
@@ -145,32 +146,20 @@ class QSAFullBlock(Block):
         qn, kn = ctx.sm(slot, "qsa_qn"), ctx.sm(slot, "qsa_kn")
         for h in range(nh):
             q = rmsnorm(y[:, 2 * h * hd : (2 * h + 1) * hd], qn, g.eps, zero_centered=True)
-            scr["qf_t"][2 * h] = main_rope(q, cos, sin, rot).astype(BF16)
-            scr["qf_t"][2 * h + 1] = y[:, (2 * h + 1) * hd : (2 * h + 2) * hd].astype(BF16)
+            q = main_rope(q, cos, sin, rot)
+            gt = y[:, (2 * h + 1) * hd : (2 * h + 2) * hd]
+            for r in range(ex.MB):  # head-major -> [MB, nh, HD] by static single-row stores
+                scr["qf_q"][r, h : h + 1, :] = q[r : r + 1]
+                scr["qf_g"][r, h : h + 1, :] = gt[r : r + 1]
         k0 = 2 * nh * hd
         k = rmsnorm(y[:, k0 : k0 + hd], kn, g.eps, zero_centered=True)
         scr["qf_kv"][:, :hd] = main_rope(k, cos, sin, rot).astype(BF16)
         scr["qf_kv"][:, hd:] = y[:, k0 + hd : k0 + 2 * hd].astype(BF16)
-        # Head-major [MB, HD] -> row-major [MB, nh, HD] by local DMA (strided dst).
-        cps = []
-        for h in range(nh):
-            for j, dst in enumerate(("qf_q", "qf_g")):
-                cps.append(
-                    pltpu.make_async_copy(
-                        scr["qf_t"].at[2 * h + j],
-                        scr[dst].at[:, h],
-                        scr["qf_sem"].at[2 * h + j],
-                    )
-                )
         o = ctx.stream.sp.block_ord(l, self.name)
         kv = pltpu.make_async_copy(
-            scr["qf_kv"], ctx.O[KV_NEW].at[o, pl.ds(0, ex.MB)], scr["qf_sem"].at[2 * nh + 1]
+            scr["qf_kv"], ctx.O[KV_NEW].at[o, pl.ds(0, ex.MB)], scr["qf_sem"].at[1]
         )
         kv.start()
-        for c in cps:
-            c.start()
-        for c in cps:
-            c.wait()
         return kv
 
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741

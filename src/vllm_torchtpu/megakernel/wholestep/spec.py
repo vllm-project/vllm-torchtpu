@@ -46,8 +46,13 @@ def wholestep_spec(
     L: int = 8,
     pool_gdn: bool = False,
     qsa: dict[str, Any] | None = None,
+    indexed: dict[str, Any] | None = None,
 ) -> ModelSpec:
-    """`L` (a multiple of `att_every`) layers starting at a group boundary (layer 0 = GDN)."""
+    """`L` (a multiple of `att_every`) layers starting at a group boundary (layer 0 = GDN).
+
+    `indexed`: `QSAFullIndexedBlock` options (`max_groups`, `pages_per_seq`) — the indexer,
+    top-K and compaction run in-kernel instead of taking a selection as input.
+    """
     assert L % g.att_every == 0, (L, g.att_every)
     if pool_gdn:
         from ..models.qwen38_gdn_pool import Qwen38PoolGDN as gdn_cls
@@ -56,7 +61,13 @@ def wholestep_spec(
     gi = g.inner(R, L)
     hc = dict(inner_geometry=gi, nhc=g.NHC, lowrank=g.LOWRANK)
     gdn = HCSublayer(gdn_cls(geometry=gi), ar_slot=0, **hc)
-    attn = HCSublayer(QSAFullBlock(**(qsa or {})), ar_slot=0, **hc)
+    if indexed is not None:  # stage B: the indexer and selection in-kernel
+        from .qsa_full_b import QSAFullIndexedBlock
+
+        qsa_block: Any = QSAFullIndexedBlock(**indexed, **(qsa or {}))
+    else:
+        qsa_block = QSAFullBlock(**(qsa or {}))
+    attn = HCSublayer(qsa_block, ar_slot=0, **hc)
     # Counts are per cycle (period = att_every): branch 0 runs at l % period < c0.
     mixer = SwitchSlot("mixer", branches=(gdn, attn), branch_counts=(g.att_every - 1, 1))
     moe = HCSublayer(Qwen38MoE(geometry=gi, moe_tp=False), ar_slot=1, emit_residual=True, **hc)

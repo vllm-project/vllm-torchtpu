@@ -1,0 +1,305 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Random whole-step inputs, their packing, and the chained pure-JAX reference.
+
+Shared by the CPU kernel-vs-reference test and the on-TPU whole-step benchmark.
+GDN / MoE weights and states come from `random_segment_inputs`; the QSA layers
+add the fused `q|gate|k|v` projection, `o_proj`, q / k norms, an FP8 paged pool
+with per-row micro-page ids and lengths, and per-row RoPE rows.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import jax
+import jax.numpy as jnp
+import ml_dtypes
+import numpy as np
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
+
+from .. import kernel
+from ..blocks.gdn import GDNBlock
+from ..blocks.gdn.reference import gdn_reference
+from ..blocks.hc.reference import hc_combine, hc_mix
+from ..blocks.moe.reference import moe_reference
+from ..blocks.qsa_attn.block import MICRO, reference_rows
+from ..exec_spec import ExecSpec
+from ..models.qwen38 import Qwen38Geometry
+from ..models.qwen38_inputs import _hc_params, _rep, _rows, hc_weight_arrays, random_segment_inputs
+from ..models.qwen38_pack import pack_weights
+from ..ops import BF16, F32, rnd, rup
+from .qsa_full import project_reference, qkvg_width
+
+EXTRA_NAMES = ["qsa_pool", "qsa_pages", "qsa_kvlen", "qsa_off", "qsa_scales", "qsa_rope"]
+
+
+def att_layers(g: Qwen38Geometry, L: int) -> tuple[int, ...]:
+    return tuple(j for j in range(L) if j % g.att_every == g.att_every - 1)
+
+
+def random_wholestep_inputs(
+    key: int,
+    g: Qwen38Geometry,
+    ex: ExecSpec,
+    L: int,
+    *,
+    budget: int,
+    n_pages: int,
+    kv_len: list[int] | None = None,
+    off: int = 1,
+    router_gain: float = 4.0,
+    zero: tuple[str, ...] = (),
+    identical_experts: bool = False,
+    gain: float = 1.0,
+) -> dict[str, Any]:
+    """`kv_len` per row (default: `4 * budget + 3`, the full selection plus a partial group)."""
+    R = ex.R
+    nh, hd = g.NH // R, g.HD
+    inp = random_segment_inputs(
+        jax.random.PRNGKey(key), g, ex, L, router_gain=router_gain, zero=zero, gain=gain
+    )
+    if identical_experts:
+        # Every routed expert of a layer is the same expert, so a 1-ulp router flip cannot
+        # change the output: the strict half of the MoE parity gate.
+        for n in ("e13", "e13_s", "e2", "e2_s"):
+            w = inp.w_l[n]
+            inp.w_l[n] = jnp.broadcast_to(w[0:1, :, 0:1], w.shape)
+    k = jax.random.split(jax.random.PRNGKey(key + 1), 8)
+    n_att = len(att_layers(g, L))
+    n_gdn = L - n_att
+    hc = {
+        "gdn": {n: v[:n_gdn] for n, v in inp.hc["gdn"].items()},
+        "qsa_full": _hc_params(k[0], g, n_att),
+        "moe": inp.hc["moe"],
+    }
+    qkvg = (jax.random.normal(k[1], (R, n_att, g.H, qkvg_width(nh, hd)), F32) * 0.06).astype(BF16)
+    o_proj = (jax.random.normal(k[2], (R, n_att, nh * hd, g.H), F32) * 0.05 * gain).astype(BF16)
+    qn = jax.random.normal(k[3], (n_att, hd), F32) * 0.05
+    kn = jax.random.normal(k[4], (n_att, hd), F32) * 0.05
+    rng = np.random.default_rng(key)
+    pool = jax.random.normal(k[5], (R, n_pages, 128, 1, 4, hd), F32).astype(jnp.float8_e4m3fn)
+    pages = jnp.asarray(
+        rng.permutation(n_pages * 128 // MICRO)[: ex.M * (budget + 1)].reshape(ex.M, budget + 1)
+        if n_pages * 128 // MICRO >= ex.M * (budget + 1)
+        else rng.integers(0, n_pages * 128 // MICRO, size=(ex.M, budget + 1)),
+        jnp.int32,
+    )
+    if kv_len is None:
+        kv_len = [4 * budget + 3] * ex.B
+    kvl = jnp.asarray((list(kv_len) + [0] * ex.M)[: ex.M], jnp.int32)
+    pos = rng.integers(0, 1 << 17, size=(ex.M,))
+    inv = 1.0 / (g.theta ** (np.arange(0, g.ROT, 2) / g.ROT))
+    ang = pos[:, None] * inv[None, :]
+    rope = np.zeros((ex.M, 128), np.float32)  # host-only (traceable under jit): ml_dtypes BF16
+    rope[:, : g.ROT // 2] = np.cos(ang).astype(ml_dtypes.bfloat16).astype(np.float32)
+    rope[:, g.ROT // 2 : g.ROT] = np.sin(ang).astype(ml_dtypes.bfloat16).astype(np.float32)
+    return dict(
+        inp=inp, hc=hc, qkvg=qkvg, o_proj=o_proj, qn=qn, kn=kn, pool=pool, pages=pages,
+        kv_len=kvl, rope=jnp.asarray(rope), off=off, budget=budget,
+    )
+
+
+def wholestep_reference(
+    g: Qwen38Geometry, ex: ExecSpec, d: dict[str, Any], L: int
+) -> tuple[jax.Array, jax.Array]:
+    """`(residual [B, NHC*H], K/V rows [R, n_att, B, 2*HD])`."""
+    R, B, nhc, eps = ex.R, ex.B, g.NHC, g.eps
+    nh, hd = g.NH // R, g.HD
+    gi = g.inner(R, L)
+    inp, hc = d["inp"], d["hc"]
+    x = inp.x[:B]
+    o_att = o_gdn = 0
+    kv_new = []
+    for j in range(L):
+        if j % g.att_every == g.att_every - 1:
+            p = {n: v[o_att] for n, v in hc["qsa_full"].items()}
+            mixed, xn = hc_mix(x, p, nhc=nhc, eps=eps)
+            delta, kvs = 0.0, []
+            for r in range(R):
+                q, gate, kk, vv = project_reference(
+                    mixed, d["qkvg"][r, o_att], d["qn"][o_att], d["kn"][o_att], d["rope"][:B],
+                    nh=nh, hd=hd, rot=g.ROT, eps=eps,
+                )
+                kvs.append(jnp.concatenate([kk, vv], axis=-1))
+                if "idx_w" in d and r == 0:  # replicated indexer: one selection for all ranks
+                    pages, kvl = indexer_selection(g, ex, d, mixed, o_att, d["budget"])
+                elif "idx_w" not in d:
+                    pages, kvl = d["pages"][:B], d["kv_len"][:B]
+                attn = reference_rows(
+                    q, gate, d["pool"][r], pages, kvl,
+                    off=d["off"], scale_k=1.0, scale_v=1.0, sm_scale=hd**-0.5,
+                ).reshape(B, -1)
+                delta = delta + jnp.dot(
+                    attn.astype(BF16), d["o_proj"][r, o_att], preferred_element_type=F32
+                )
+            kv_new.append(jnp.stack(kvs))
+            o_att += 1
+        else:
+            p = {n: v[o_gdn] for n, v in hc["gdn"].items()}
+            mixed, xn = hc_mix(x, p, nhc=nhc, eps=eps)
+            delta, _ = gdn_reference(
+                inp.w_l, mixed, inp.st_l, g=gi, ex=ex, gdn_idx=o_gdn, layer_idx=j
+            )
+            o_gdn += 1
+        x = hc_combine(delta, x, xn, p, nhc=nhc)
+        p = {n: v[j] for n, v in hc["moe"].items()}
+        mixed, xn = hc_mix(x, p, nhc=nhc, eps=eps)
+        delta, _ = moe_reference(inp.w_l, mixed, None, g=gi, ex=ex, layer_idx=j)
+        x = hc_combine(delta, x, xn, p, nhc=nhc)
+    return x, jnp.stack(kv_new, axis=1)
+
+
+def pack_wholestep(
+    spec: Any, g: Qwen38Geometry, ex: ExecSpec, d: dict[str, Any], L: int
+) -> tuple[dict, dict]:
+    """`(weights, states)` per-rank operands (leading `R`, not yet folded)."""
+    R, T = ex.R, ex.T
+    hc, w_l, st_l = d["hc"], d["inp"].w_l, d["inp"].st_l
+    att_rows = att_layers(g, L)
+    gdn_rows = tuple(j for j in range(L) if j not in att_rows)
+    weights = {
+        "router": _rep(w_l["router"], R),
+        "sh13": w_l["sh13"],
+        "sh2": w_l["sh2"],
+        "e13": tuple(w_l["e13"][:, j] for j in range(L)),
+        "e2": tuple(w_l["e2"][:, j] for j in range(L)),
+        "es": jnp.concatenate([w_l["e13_s"], w_l["e2_s"]], axis=-1)[:, :, :, None, :],
+        **hc_weight_arrays("moe", hc["moe"], g, R, mix=True),
+        "qkvg": d["qkvg"],
+        "o_proj": d["o_proj"],
+        **hc_weight_arrays("qsa_full", hc["qsa_full"], g, R, mix=True),
+        **({"idx_w": _rep(d["idx_w"], R)} if "idx_w" in d else {}),
+        "lin_in": w_l["lin_in"],
+        "lin_out": w_l["lin_out"],
+        **hc_weight_arrays("gdn", hc["gdn"], g, R, mix=True),
+    }
+    smalls = {
+        "moe_hcn": hc["moe"]["norm"],
+        **{k: w_l[k] for k in ("post_norm", "sh_gate", "sh13_s", "sh2_s", "ecopy") if k in w_l},
+        "qsa_full_hcn": _rows(_rep(hc["qsa_full"]["norm"], R), att_rows, L),
+        "qsa_qn": _rows(_rep(d["qn"], R), att_rows, L),
+        "qsa_kn": _rows(_rep(d["kn"], R), att_rows, L),
+        **({"qsa_iqn": _rows(_rep(d["iqn"], R), att_rows, L)} if "iqn" in d else {}),
+        "gdn_hcn": _rows(_rep(hc["gdn"]["norm"], R), gdn_rows, L),
+        "in_s": _rows(w_l["lin_in_s"], gdn_rows, L),
+        "out_s": _rows(w_l["lin_out_s"], gdn_rows, L),
+        **{k: _rows(w_l[k], gdn_rows, L) for k in ("conv", "alog", "dtb", "gnorm")},
+    }
+    lay = GDNBlock.lin_in_layout(g.inner(R, L), ex)
+    hr = rup(3 + T, 8)
+    conv = jnp.pad(st_l["conv"], ((0, 0),) * 3 + ((0, hr - 3), (0, 0)))
+    states = {
+        "conv": conv.astype(F32),
+        "rec": st_l["rec"].reshape(R, len(gdn_rows), ex.NS * lay.vh, lay.KD, lay.VD).astype(BF16),
+    }
+    return pack_weights(spec, ex, weights, smalls), states
+
+
+def extras(d: dict[str, Any], mesh: Mesh, R: int) -> tuple:
+    """Kernel extra inputs in `EXTRA_NAMES` order: HBM extras folded per rank, SMEM replicated."""
+    tp, rep = NamedSharding(mesh, P("tp")), NamedSharding(mesh, P())
+    return (
+        jax.device_put(kernel.fold(d["pool"]), tp),
+        jax.device_put(d["pages"], rep),
+        jax.device_put(d["kv_len"], rep),
+        jax.device_put(jnp.asarray([d["off"]], jnp.int32), rep),
+        jax.device_put(jnp.asarray([1.0, 1.0], F32), rep),
+        jax.device_put(kernel.fold(_rep(d["rope"], R)), tp),
+    )
+
+
+# ------------------------------------------------------------ stage B (in-kernel indexer)
+EXTRA_NAMES_B = [
+    "qsa_pool", "qsa_ck", "qsa_nvis", "qsa_tail", "qsa_mtab", "qsa_off", "qsa_scales", "qsa_rope"
+]
+
+
+def add_indexer_inputs(
+    key: int, g: Qwen38Geometry, ex: ExecSpec, d: dict[str, Any], L: int, *,
+    max_groups: int, ctx: list[int],
+) -> dict[str, Any]:
+    """Indexer weights, per-request compressed keys, lengths and a shuffled main page table.
+
+    `ctx[q]`: tokens of request `q` before this step; its `T` verify rows see `ctx + t + 1`.
+    Replaces `pool` with one large enough for `requests x pages_per_seq` pages.
+    """
+    from .indexer import IDX_DIM
+
+    R, T, M = ex.R, ex.T, ex.M
+    nreq = M // T
+    n_att = len(att_layers(g, L))
+    k = jax.random.split(jax.random.PRNGKey(key + 7), 4)
+    idx_w = (jax.random.normal(k[0], (n_att, g.H, 5 * IDX_DIM), F32) * 0.06).astype(BF16)
+    iqn = jax.random.normal(k[1], (n_att, IDX_DIM), F32) * 0.05
+    ck = jax.random.normal(k[2], (nreq, max_groups, IDX_DIM), F32).astype(BF16)
+    pps = -(-max_groups * 4 // 128)
+    rng = np.random.default_rng(key + 7)
+    mtab = (rng.permutation(nreq * pps) + 1).reshape(nreq, pps).astype(np.int32)
+    lens = np.zeros((M,), np.int32)
+    for q in range(nreq):
+        for t in range(T):
+            if q * T + t < ex.B:
+                lens[q * T + t] = ctx[q % len(ctx)] + t + 1
+    pool = jax.random.normal(k[3], (R, nreq * pps + 1, 128, 1, 4, g.HD), F32).astype(
+        jnp.float8_e4m3fn
+    )
+    return {
+        **d, "idx_w": idx_w, "iqn": iqn, "ck": ck, "mtab": jnp.asarray(mtab), "pool": pool,
+        "nvis": jnp.asarray(lens // 4), "tail": jnp.asarray(lens % 4), "max_groups": max_groups,
+    }
+
+
+def indexer_selection(
+    g: Qwen38Geometry, ex: ExecSpec, d: dict[str, Any], mixed: jax.Array, o_att: int, K: int
+) -> tuple[jax.Array, jax.Array]:
+    """Reference `(micro-page ids [B, K+1], kv_len [B])` of one QSA layer from its mixed input."""
+    from .indexer import IDX_HEADS, index_query, score_rows, topk_reference
+
+    B, T = ex.B, ex.T
+    y = rnd(jnp.dot(mixed.astype(BF16), d["idx_w"][o_att], preferred_element_type=F32))
+    rope = d["rope"][:B]
+    cos, sin = rope[:, : g.ROT // 2], rope[:, g.ROT // 2 : g.ROT]
+    iq = index_query(y, d["iqn"][o_att], cos, sin, g.ROT, g.eps, jax.lax.bitcast_convert_type)
+    pages = np.zeros((B, K + 1), np.int32)
+    kvl = np.zeros((B,), np.int32)
+    mtab = np.asarray(d["mtab"])
+    per_page = 128 // 4
+    for q in range(-(-B // T)):
+        rows = range(q * T, min(B, (q + 1) * T))
+        qr = jnp.stack([jnp.stack([iq[h][r] for h in range(IDX_HEADS)]) for r in rows])
+        st = np.asarray(score_rows(qr.reshape(-1, qr.shape[-1]).astype(BF16), d["ck"][q]))
+        for i, r in enumerate(rows):
+            n, tail = int(d["nvis"][r]), int(d["tail"][r])
+            sel = sorted(topk_reference(st[i], n, K))  # the kernel emits ascending ids
+            gids = sel + ([n] if tail else [])
+            for j, gid in enumerate(gids):
+                pages[r, j] = mtab[q, gid // per_page] * per_page + gid % per_page
+            kvl[r] = 4 * len(sel) + tail
+    return jnp.asarray(pages), jnp.asarray(kvl)
+
+
+def extras_b(d: dict[str, Any], mesh: Mesh, R: int) -> tuple:
+    tp, rep = NamedSharding(mesh, P("tp")), NamedSharding(mesh, P())
+    return (
+        jax.device_put(kernel.fold(d["pool"]), tp),
+        jax.device_put(kernel.fold(_rep(d["ck"], R)), tp),
+        jax.device_put(d["nvis"], rep),
+        jax.device_put(d["tail"], rep),
+        jax.device_put(d["mtab"], rep),
+        jax.device_put(jnp.asarray([d["off"]], jnp.int32), rep),
+        jax.device_put(jnp.asarray([1.0, 1.0], F32), rep),
+        jax.device_put(kernel.fold(_rep(d["rope"], R)), tp),
+    )
