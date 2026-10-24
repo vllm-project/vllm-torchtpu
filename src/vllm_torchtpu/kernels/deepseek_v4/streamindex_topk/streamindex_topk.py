@@ -1136,6 +1136,7 @@ def _effective_row_lengths(
         "components",
         "topk_backend",
         "decode_passes",
+        "hoist_step_metadata",
     ),
 )
 def streamindex_topk(
@@ -1168,8 +1169,13 @@ def streamindex_topk(
     components: indexing.StreamIndexComponents | None = None,
     topk_backend: TopKBackend = _DEFAULT_TOPK_BACKEND,
     decode_passes: bool = True,
+    hoist_step_metadata: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
+
+    ``hoist_step_metadata=True`` builds the step-level metadata (and the pass
+    schedules of a single-chunk call) outside the early-exit ``lax.cond``, so
+    XLA can CSE them across the layers of a step.
 
     ``decode_passes=False`` emits only the mixed pass. The caller must then pass
     ``distribution = [0, 0, n]``, so the mixed pass covers every sequence; this
@@ -1608,38 +1614,34 @@ def streamindex_topk(
         assert scores is not None
         return scores
 
-    # Step-level metadata, built outside the early-exit `lax.cond`: it reads only
-    # seq_lens / cu_q_lens / distribution, which every layer of a step shares, so
-    # XLA can CSE it across layers. A cond branch is opaque to CSE, and inside one
-    # every QSA layer rebuilt it.
     # Raw f32 bits, not f32. The SparseCore top-k compares bits, and this is
     # the dtype it wants to read, so nothing has to reformat HBM scores.
     out_dtype = jnp.int32
     max_num_tokens = q.shape[0]
 
-    # TODO: we shall sort the sequences by length, so that multiple decode
-    # sequences in one batch have similar lengths to reduce waste of compute.
-    # With the same batch size, the longest sequence will determine number of
-    # blocks to run computation for.
-    decode_batch_end = (
-        jnp.array(0)
-        if max_num_seqs < decode_req_batch_size
-        else distribution[0] // decode_req_batch_size * decode_req_batch_size
-    )
-
-    num_positions = max(num_sublanes_total * 128, k)
-    eff_row_lengths = _effective_row_lengths(
-        seq_lens=seq_lens,
-        cu_q_lens=cu_q_lens,
-        distribution=distribution,
-        num_tokens=max_num_tokens,
-        num_positions=num_positions,
-        compression_ratio=compression_ratio,
-        cp_rank=cp_rank,
-        cp_size=cp_size,
-        interleave_c=interleave_c,
-        components=components,
-    )
+    def _step_metadata():
+        # TODO: we shall sort the sequences by length, so that multiple decode
+        # sequences in one batch have similar lengths to reduce waste of compute.
+        # With the same batch size, the longest sequence will determine number of
+        # blocks to run computation for.
+        decode_batch_end = (
+            jnp.array(0)
+            if max_num_seqs < decode_req_batch_size
+            else distribution[0] // decode_req_batch_size * decode_req_batch_size
+        )
+        eff_row_lengths = _effective_row_lengths(
+            seq_lens=seq_lens,
+            cu_q_lens=cu_q_lens,
+            distribution=distribution,
+            num_tokens=max_num_tokens,
+            num_positions=max(num_sublanes_total * 128, k),
+            compression_ratio=compression_ratio,
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+            interleave_c=interleave_c,
+            components=components,
+        )
+        return decode_batch_end, eff_row_lengths
 
     if chunk_tokens is None or max_num_tokens % chunk_tokens:
         num_chunks, chunk_len = 1, max_num_tokens
@@ -1647,26 +1649,33 @@ def streamindex_topk(
         num_chunks, chunk_len = max_num_tokens // chunk_tokens, chunk_tokens
 
     chunk_starts = (
-        (None,)
-        if num_chunks == 1
-        else tuple(m * chunk_len for m in range(num_chunks))
+        (None,) if num_chunks == 1 else tuple(m * chunk_len for m in range(num_chunks))
     )
 
-    def _passes():
+    def _passes(decode_batch_end):
         return tuple(
             (spec, _pass_metadata(spec, chunk_starts, chunk_len))
             for spec in _pass_specs(decode_batch_end)
         )
 
-    # Single-chunk calls (decode / verify) build the pass schedules here, where
-    # XLA can CSE them across layers. Chunked calls annotate scheduling groups
-    # (SC top-k of chunk g overlapping scoring of g + 1); hoisting their
-    # schedules out of the branch leaves unannotated ops inside a group, which
-    # XLA rejects ("annotation groups with gaps"), so they stay inside.
-    hoisted = _passes() if num_chunks == 1 else None
+    # Step-level metadata reads only seq_lens / cu_q_lens / distribution, which
+    # every layer of a step shares. A cond branch is opaque to CSE, so inside the
+    # early-exit branch every QSA layer rebuilds it; outside, XLA keeps one.
+    # Only single-chunk calls (decode / verify) hoist their pass schedules too:
+    # chunked calls annotate scheduling groups (SC top-k of chunk g overlapping
+    # scoring of g + 1), and schedules hoisted out of the branch leave
+    # unannotated ops inside a group, which XLA rejects ("annotation groups with
+    # gaps").
+    step_meta = _step_metadata() if hoist_step_metadata else None
+    hoisted = (
+        _passes(step_meta[0]) if step_meta is not None and num_chunks == 1 else None
+    )
 
     def _common_path(_):
-        passes = hoisted if hoisted is not None else _passes()
+        decode_batch_end, eff_row_lengths = (
+            step_meta if step_meta is not None else _step_metadata()
+        )
+        passes = hoisted if hoisted is not None else _passes(decode_batch_end)
         # Ids count from 1, so the 0 is never a real group: a single chunk has no
         # pair to annotate and takes the `None` branch below both times.
         group_base = 0

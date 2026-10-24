@@ -407,3 +407,64 @@ def test_single_token_block_only_on_single_token_steps(monkeypatch, tokens, expe
     with jax.sharding.use_abstract_mesh(mesh):
         text = select.trace(*args).lower(lowering_platforms=("tpu",)).as_text()
     assert f"StreamIdxTC-d-bq_1-bkvp_{expect}" in text
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ("VLLM_TPU_QSA_INDEXER_HOIST_META",),
+        ("VLLM_TPU_QSA_INDEXER_MIXED_ONLY",),
+        ("VLLM_TPU_QSA_INDEXER_HOIST_META", "VLLM_TPU_QSA_INDEXER_MIXED_ONLY"),
+    ],
+)
+@pytest.mark.parametrize("case", sorted(CASES))
+def test_indexer_step_flags_keep_the_selection(monkeypatch, interpret, case, flags):
+    """Hoisting the step metadata and scoring every request in the mixed pass
+    select exactly the blocks the default shared stream selects."""
+    q_lens, context, tokens = CASES[case]
+    args = inputs(len(case), q_lens, context, tokens, "integer")
+    # The reference top-k runs on CPU; unlike capture_scores, keep the
+    # early-exit cond the hoist moves the step metadata out of.
+    monkeypatch.setattr(
+        pooled_qsa,
+        "streamindex_topk",
+        functools.partial(streamindex.streamindex_topk, topk_backend=ReferenceTopK()),
+    )
+    monkeypatch.setattr(pooled_qsa, "decode_query_chunk_size", lambda pages: 1 << 20)
+    monkeypatch.setenv("VLLM_TPU_QSA_DECODE_QUERY_BLOCK", "4")
+    monkeypatch.setenv("VLLM_TPU_QSA_DECODE_KV_BLOCK", "256")
+    expected = select(args)
+    for flag in flags:
+        monkeypatch.setenv(flag, "1")
+    np.testing.assert_array_equal(select(args), expected)
+
+
+def test_mixed_only_lowers_without_decode_passes(monkeypatch):
+    """VLLM_TPU_QSA_INDEXER_MIXED_ONLY drops the one-token decode passes."""
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    monkeypatch.setenv("VLLM_TPU_QSA_DECODE_QUERY_BLOCK", "4")
+    monkeypatch.setenv("VLLM_TPU_QSA_DECODE_KV_BLOCK", "1024")
+    monkeypatch.setenv("VLLM_TPU_QSA_INDEXER_MIXED_ONLY", "1")
+    shape = jax.ShapeDtypeStruct
+    args = (
+        shape((32, 4, 128), jnp.bfloat16),
+        shape((64, 512, 1, 2, 256), jnp.bfloat16),
+        shape((32,), jnp.int32),
+        shape((64, 16), jnp.int32),
+        shape((32,), jnp.int32),
+        shape((65,), jnp.int32),
+        shape((64,), jnp.int32),
+    )
+    select_fn = jax.jit(
+        functools.partial(pooled_qsa.select_blocks, ratio=RATIO, block_topk=512)
+    )
+    mesh = jax.sharding.AbstractMesh(
+        (1,),
+        ("x",),
+        abstract_device=jax.sharding.AbstractDevice("TPU7x", 1, "tpu"),
+    )
+    with jax.sharding.use_abstract_mesh(mesh):
+        text = select_fn.trace(*args).lower(lowering_platforms=("tpu",)).as_text()
+    assert "StreamIdxTC-m-bq_4-bkvp_32" in text
+    assert "StreamIdxTC-d" not in text

@@ -831,6 +831,7 @@ def select_blocks(
                     f"{name} must be a positive multiple of 128 "
                     f"and of {rows} compressed keys per page, got {block}"
                 )
+        mixed_only = envs.VLLM_TPU_QSA_INDEXER_MIXED_ONLY
         return _select_shared_stream(
             query,
             starts,
@@ -846,10 +847,11 @@ def select_blocks(
                 seq_lens,
                 expand_pages(pages),
                 cu,
-                # Every sequence through the mixed pass: with per-token scores
-                # it scores a 1-token request exactly as the decode passes do,
-                # and the two decode launches are empty on verify steps.
-                distribution.at[:2].set(0),
+                # VLLM_TPU_QSA_INDEXER_MIXED_ONLY: every sequence through the
+                # mixed pass. With per-token scores it scores a 1-token request
+                # exactly as the decode passes do, and the two decode launches
+                # are empty on verify steps.
+                distribution.at[:2].set(0) if mixed_only else distribution,
                 k=block_topk,
                 compression_ratio=ratio,
                 num_kv_pages_per_block=(decode_kv_block // rows,)
@@ -858,7 +860,8 @@ def select_blocks(
                 decode_req_batch_size=8 if len(q) >= 8 else 4,
                 enable_early_exit=True,
                 components=qsa_indexing(ratio - 1, per_token_scores=True),
-                decode_passes=False,
+                decode_passes=not mixed_only,
+                hoist_step_metadata=envs.VLLM_TPU_QSA_INDEXER_HOIST_META,
             ),
         )
     if len(query) <= chunk_size:

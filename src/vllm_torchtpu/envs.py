@@ -107,6 +107,8 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_RING_DMA_BATCH: int = 0
     VLLM_TPU_GDN_HOIST_READ_OFFSETS: bool = False
     VLLM_TPU_QSA_BF16_REDUCE_PRECISION: bool = False
+    VLLM_TPU_QSA_INDEXER_HOIST_META: bool = False
+    VLLM_TPU_QSA_INDEXER_MIXED_ONLY: bool = False
     VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
@@ -571,6 +573,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fuses into neighbouring ops instead of running as its own fusion.
     "VLLM_TPU_QSA_BF16_REDUCE_PRECISION": env_bool(
         "VLLM_TPU_QSA_BF16_REDUCE_PRECISION", default=False
+    ),
+    # Qwen4-exp QSA indexer: build StreamIndex's step-level metadata (and the
+    # pass schedules of decode / verify calls) outside the early-exit cond, so
+    # XLA computes them once per step instead of once per QSA layer.
+    "VLLM_TPU_QSA_INDEXER_HOIST_META": env_bool(
+        "VLLM_TPU_QSA_INDEXER_HOIST_META", default=False
+    ),
+    # Qwen4-exp QSA indexer on decode / verify steps: score every request in the
+    # mixed pass and drop the two one-token decode passes (empty on verify
+    # steps). Bypasses VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK on one-token steps.
+    "VLLM_TPU_QSA_INDEXER_MIXED_ONLY": env_bool(
+        "VLLM_TPU_QSA_INDEXER_MIXED_ONLY", default=False
     ),
     # Qwen4-exp QSA decode/verify attention: run the decode rows (and the
     # decode prefix of mixed steps) on the fused sparse GQA decode kernel
