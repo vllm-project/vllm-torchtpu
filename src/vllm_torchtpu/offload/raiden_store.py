@@ -250,8 +250,9 @@ class Admission:
     # success may cover torn bytes. The finalizer treats the admission as
     # failed regardless of the poll verdict.
     poisoned: bool = False
-    # Loads only: owning request and destination device block IDs, reported
-    # through get_block_ids_with_load_errors on failure.
+    # Loads only: owning request and destination device block IDs. A failed
+    # load reaches vLLM by req_id (failed_recving); the block IDs only fill
+    # FinishedJob.failed_device_block_ids, the record of what it left unwritten.
     req_id: str | None = None
     dst_device_block_ids: list[int] = field(default_factory=list)
     # Loads only: the sub-hashes fetched via read_remote — from a peer or the

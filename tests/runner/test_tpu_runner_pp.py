@@ -151,6 +151,7 @@ class TestIntermediateStageSampleTokens:
         runner.get_finished_kv_transfers.return_value = (
             {"r1"},
             None,
+            set(),
             None,
             set(),
             None,
@@ -170,6 +171,7 @@ class TestIntermediateStageSampleTokens:
         runner.get_finished_kv_transfers.return_value = (
             None,
             None,
+            set(),
             None,
             set(),
             None,
