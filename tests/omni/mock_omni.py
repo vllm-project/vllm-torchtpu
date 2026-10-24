@@ -55,6 +55,14 @@ class _MockOmniPlatform:
     def get_torch_device(self):
         return None
 
+    @classmethod
+    def init_diffusion_worker_vllm_config(cls, vllm_config):
+        return None
+
+    @classmethod
+    def init_diffusion_model_runner_runtime(cls, vllm_config, od_config, device):
+        return None
+
 
 class _MockSDPABackend:
     @classmethod

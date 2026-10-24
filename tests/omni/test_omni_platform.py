@@ -13,12 +13,14 @@
 # limitations under the License.
 import os
 import sys
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
 
 from .mock_omni import (  # isort: split
+    _MockColumnParallelGELU,
     _MockRMSNorm,
     _MockRotaryEmbeddingWan,
     vllm_omni_mock,
@@ -27,6 +29,9 @@ from .mock_omni import (  # isort: split
 import vllm_omni
 from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
 
+from vllm_torchtpu import patch_registry
+from vllm_torchtpu.omni import patches as omni_patches
+from vllm_torchtpu.omni import platform as omni_platform
 from vllm_torchtpu.omni import register_omni_tpu_platform
 from vllm_torchtpu.omni import rope as omni_rope
 from vllm_torchtpu.omni.attention import (
@@ -36,9 +41,13 @@ from vllm_torchtpu.omni.attention import (
     TpuSDPAImpl,
 )
 from vllm_torchtpu.omni.patches import (
+    _extend_async_output_timeout,
+    _patch_diffusion_ipc_cpu_pack,
     _patch_diffusion_startup_warmup_sync,
-    apply_omni_model_specific_patches,
-    apply_omni_tpu_patches,
+    _patch_qwen_image_rope_txt_freqs_clone,
+    _patch_wan_ffn_gelu_fence,
+    _patch_wan_fused_qk_norm_rope,
+    _patch_wan_pair_swap_rope,
 )
 from vllm_torchtpu.omni.platform import OmniTpuPlatform
 from vllm_torchtpu.omni.rope import (
@@ -50,6 +59,15 @@ from vllm_torchtpu.omni.rope import (
 )
 
 pytestmark = pytest.mark.omni
+
+_WAN = SimpleNamespace(model_class_name="WanPipeline")
+_QWEN_IMAGE = SimpleNamespace(model_class_name="QwenImagePipeline")
+_WAN_MODULES = (
+    "vllm_omni.diffusion.layers.rope",
+    "vllm_omni.diffusion.models.wan2_2.wan2_2_transformer",
+    "vllm_omni.diffusion.models.wan2_2.wan2_2_vace_transformer",
+    "vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer",
+)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -89,6 +107,119 @@ def test_platform_attributes():
         mock_dev.assert_called_once_with("tpu")
 
 
+def test_backend_selection_imports_no_model_module(monkeypatch):
+    for name in (*_WAN_MODULES, "vllm_omni.diffusion.models.qwen_image"):
+        monkeypatch.setitem(sys.modules, name, None)
+    assert (
+        OmniTpuPlatform.get_diffusion_attn_backend_cls(None, 64)
+        == "vllm_torchtpu.omni.attention.TpuFlashAttentionBackend"
+    )
+
+
+@pytest.mark.parametrize(
+    "model_class_name",
+    ["LingBotWorldCausalDMDPipeline", "FluxPipeline", None],
+)
+def test_model_patches_skip_other_models(monkeypatch, model_class_name):
+    # Another model's patch neither imports its module nor completes, so it
+    # still runs if this process loads that model later.
+    for name in (*_WAN_MODULES, "vllm_omni.diffusion.models.qwen_image"):
+        monkeypatch.setitem(sys.modules, name, None)
+    od_config = SimpleNamespace(model_class_name=model_class_name)
+    assert _patch_qwen_image_rope_txt_freqs_clone(od_config=od_config) is False
+    assert _patch_wan_ffn_gelu_fence(od_config=od_config) is False
+    assert _patch_qwen_image_rope_txt_freqs_clone(od_config=None) is False
+
+
+def test_diffusion_model_load_patches_only_the_served_model(monkeypatch):
+    monkeypatch.setattr(patch_registry, "_applied", set())
+    qwen_ropes = (
+        qwen_image_transformer.QwenEmbedRope,
+        qwen_image_transformer.QwenEmbedLayer3DRope,
+    )
+    qwen_forwards = [rope_cls.forward for rope_cls in qwen_ropes]
+    for rope_cls in qwen_ropes:
+        monkeypatch.setattr(rope_cls, "forward", rope_cls.forward)
+    gelu_forward = _MockColumnParallelGELU.forward
+    monkeypatch.setattr(_MockColumnParallelGELU, "forward", gelu_forward)
+    with monkeypatch.context() as blocked:
+        # Wan modules are unimportable here, so loading Qwen-Image only
+        # succeeds if no Wan patch imports them.
+        for name in _WAN_MODULES:
+            blocked.setitem(sys.modules, name, None)
+        OmniTpuPlatform.init_diffusion_model_runner_runtime(
+            None, _QWEN_IMAGE, torch.device("cpu")
+        )
+    assert all(
+        rope_cls.forward is not forward
+        for rope_cls, forward in zip(qwen_ropes, qwen_forwards, strict=True)
+    )
+    assert _MockColumnParallelGELU.forward is gelu_forward
+
+    OmniTpuPlatform.init_diffusion_model_runner_runtime(None, _WAN, torch.device("cpu"))
+    assert _MockColumnParallelGELU.forward is not gelu_forward
+
+
+@pytest.mark.parametrize(
+    ("od_config", "logged_name"),
+    [
+        (SimpleNamespace(model_class_name="FluxPipeline"), "FluxPipeline"),
+        (SimpleNamespace(model_class_name=None), None),
+        (None, None),
+    ],
+)
+def test_model_load_logs_unpatched_pipeline(monkeypatch, od_config, logged_name):
+    monkeypatch.setattr(patch_registry, "_applied", set())
+    info = MagicMock()
+    monkeypatch.setattr(omni_patches.logger, "info", info)
+    OmniTpuPlatform.init_diffusion_model_runner_runtime(
+        None, od_config, torch.device("cpu")
+    )
+    info.assert_called_once_with(
+        "No model-specific TPU diffusion patch applies to pipeline %s.", logged_name
+    )
+
+
+def test_model_load_does_not_log_patched_pipeline(monkeypatch):
+    monkeypatch.setattr(patch_registry, "_applied", set())
+    for rope_cls in (
+        qwen_image_transformer.QwenEmbedRope,
+        qwen_image_transformer.QwenEmbedLayer3DRope,
+    ):
+        monkeypatch.setattr(rope_cls, "forward", rope_cls.forward)
+    info = MagicMock()
+    monkeypatch.setattr(omni_patches.logger, "info", info)
+    OmniTpuPlatform.init_diffusion_model_runner_runtime(
+        None, _QWEN_IMAGE, torch.device("cpu")
+    )
+    assert (
+        call(
+            "No model-specific TPU diffusion patch applies to pipeline %s.",
+            "QwenImagePipeline",
+        )
+        not in info.call_args_list
+    )
+
+
+@pytest.mark.parametrize(
+    ("entered_stages", "warns"),
+    [
+        (set(), True),
+        ({"diffusion_worker"}, True),
+        ({"diffusion_model_load"}, False),
+        ({"worker_init"}, False),
+    ],
+)
+def test_backend_selection_warns_without_model_load_stage(
+    monkeypatch, entered_stages, warns
+):
+    monkeypatch.setattr(patch_registry, "_entered_stages", entered_stages)
+    warning_once = MagicMock()
+    monkeypatch.setattr(omni_platform.logger, "warning_once", warning_once)
+    OmniTpuPlatform.get_diffusion_attn_backend_cls(None, 64)
+    assert warning_once.call_count == int(warns)
+
+
 def test_rope_pair_swap_matches_native():
     torch.manual_seed(0)
     rope = _MockRotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
@@ -111,10 +242,13 @@ def test_rope_pair_swap_matches_native():
     )
 
 
-def test_rope_patch_installed():
+def test_rope_patch_installed(monkeypatch):
     from unittest.mock import MagicMock
 
-    apply_omni_model_specific_patches()
+    monkeypatch.setattr(
+        _MockRotaryEmbeddingWan, "forward", _MockRotaryEmbeddingWan.forward
+    )
+    _patch_wan_pair_swap_rope()
     assert _MockRotaryEmbeddingWan.forward is rotary_embedding_wan_forward
     # Interleaved half-dim calls use apply_rotary_pair_swap (bit-exact in bf16).
     rope = _MockRotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
@@ -235,7 +369,7 @@ def test_wan_ffn_gelu_fence(monkeypatch):
 
     from vllm_torchtpu.omni import patches
 
-    apply_omni_model_specific_patches()
+    _patch_wan_ffn_gelu_fence(od_config=_WAN)
     ffn = ColumnParallelGELU(8, 16)
     x = torch.randn(3, 8)
     want = torch.nn.functional.gelu(ffn.proj(x), approximate="tanh")
@@ -392,10 +526,11 @@ def test_vllm_omni_is_mocked():
     "rope_cls_name",
     ["QwenEmbedRope", "QwenEmbedLayer3DRope"],
 )
-def test_qwen_image_rope_txt_freqs_clone(rope_cls_name):
-    apply_omni_model_specific_patches()
-
+def test_qwen_image_rope_txt_freqs_clone(monkeypatch, rope_cls_name):
     rope_cls = getattr(qwen_image_transformer, rope_cls_name)
+    monkeypatch.setattr(rope_cls, "forward", rope_cls.forward)
+    _patch_qwen_image_rope_txt_freqs_clone(od_config=_QWEN_IMAGE)
+
     rope = rope_cls()
 
     vid_freqs, txt_freqs = rope.forward([(1, 2, 2)], [3], torch.device("cpu"))
@@ -416,8 +551,7 @@ def test_safe_pack_tensor_if_large():
     orig_pack = MagicMock()
     ipc._pack_tensor_if_large = orig_pack
 
-    apply_omni_model_specific_patches.cache_clear()
-    apply_omni_model_specific_patches()
+    _patch_diffusion_ipc_cpu_pack()
 
     cpu_tensor = torch.empty(1, device="cpu")
     tpu_tensor = MagicMock()
@@ -436,12 +570,11 @@ def test_safe_pack_tensor_if_large():
 
 
 def test_omni_tpu_patches_configuration():
-    # Call the undecorated body so the run-once cache is left alone, and
-    # restore the process-global state it edits (env var).
+    # Restore the process-global state the patch edits (env var).
     orig = torch.nn.functional.interpolate
     with patch.dict(os.environ):
         os.environ.pop("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", None)
-        apply_omni_tpu_patches.__wrapped__()
+        _extend_async_output_timeout()
         assert os.environ["VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT"] == "1800.0"
         assert torch.nn.functional.interpolate is orig
 
@@ -544,5 +677,5 @@ def test_wan_self_attention_patch_falls_back_on_f32():
         WanSelfAttention,
     )
 
-    apply_omni_model_specific_patches()
+    _patch_wan_fused_qk_norm_rope(od_config=_WAN)
     assert WanSelfAttention()(torch.ones(1, 3, 8)) == "native"
