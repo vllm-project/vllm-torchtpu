@@ -211,6 +211,7 @@ sys.modules["vllm_omni.diffusion.attention.backends.sdpa"] = (
     vllm_omni_mock.diffusion.attention.backends.sdpa
 )
 sys.modules["vllm_omni.diffusion.models"] = vllm_omni_mock.diffusion.models
+sys.modules["vllm_omni.diffusion.models.ltx2"] = vllm_omni_mock.diffusion.models.ltx2
 sys.modules["vllm_omni.diffusion.models.qwen_image"] = (
     vllm_omni_mock.diffusion.models.qwen_image
 )

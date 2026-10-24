@@ -80,6 +80,7 @@ def apply_omni_model_specific_patches() -> None:
     _patch_diffusion_startup_warmup_sync()
     _patch_wan_fused_qk_norm_rope()
     _patch_wan_fresh_timestep()
+    _patch_ltx2_vocoder_cpu_init()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -340,3 +341,49 @@ def _wrap_fresh_timestep(cls: type) -> None:
 
     setattr(_fresh_timestep_forward, _FRESH_TIMESTEP_PATCHED, True)
     cls.forward = _fresh_timestep_forward
+
+
+_VOCODER_CPU_INIT_PATCHED = "_tpu_vocoder_cpu_init_patched"
+
+
+def _patch_ltx2_vocoder_cpu_init() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove once torch_tpu implements kaiser_window or vLLM-Omni builds
+    # the vocoder on CPU.
+    #
+    # Problem: DiffusersPipelineLoader._init_from_load_format constructs the
+    #   pipeline under a `with torch.device("tpu:N"):` context. LTX-2.3 and
+    #   LTX-2.5 use Diffusers LTX2VocoderWithBWE (`act_fn="snakebeta"`,
+    #   `antialias=True`), whose __init__ builds AntiAliasAct1d -> UpSample1d
+    #   -> kaiser_sinc_filter1d and calls torch.kaiser_window(...) on the
+    #   active default device before weights are loaded, failing on TPU with
+    #   `DispatchStub: missing kernel for tpu`.
+    # Fix: Constructing the vocoder on CPU (matching text_encoder and
+    #   latent_upsampler in ltx2_components.py) builds the filter buffers on
+    #   the host before _place_aux_components moves the module to
+    #   pipeline.device.
+    # Effect: LTX-2.3 loads on TPU.
+    # -------------------------------------------------------------------------
+    from vllm_omni.diffusion.models.ltx2 import ltx2_components
+
+    if getattr(ltx2_components._load_component, _VOCODER_CPU_INIT_PATCHED, False):
+        return
+    orig_load_component = ltx2_components._load_component
+
+    def _cpu_vocoder_load_component(
+        component_cls: Any,
+        model: str,
+        subfolder: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if subfolder == "vocoder":
+            with torch.device("cpu"):
+                return orig_load_component(
+                    component_cls, model, subfolder, *args, **kwargs
+                )
+        return orig_load_component(component_cls, model, subfolder, *args, **kwargs)
+
+    setattr(_cpu_vocoder_load_component, _VOCODER_CPU_INIT_PATCHED, True)
+    ltx2_components._load_component = _cpu_vocoder_load_component
+    logger.info("Applied TPU patch: CPU-context init for LTX-2 vocoder.")
