@@ -505,6 +505,24 @@ class TestTpuPlatform:
         with pytest.raises(NotImplementedError, match="unified KV pool"):
             TpuPlatform.check_and_update_config(vllm_config)
 
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_rejects_attention_free_apc(
+        self, mock_prepare_env, mock_apply_patches, vllm_config
+    ):
+        vllm_config.model_config.is_hybrid = False
+        vllm_config.model_config.is_attention_free = True
+        vllm_config.cache_config.block_size = 16
+        vllm_config.cache_config.enable_prefix_caching = True
+
+        with pytest.raises(
+            NotImplementedError,
+            match="Prefix caching on attention-free Mamba models",
+        ):
+            TpuPlatform.check_and_update_config(vllm_config)
+
     @patch.dict("os.environ", {"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "0"})
     @patch("vllm_torchtpu.patch_registry.apply")
     @patch(

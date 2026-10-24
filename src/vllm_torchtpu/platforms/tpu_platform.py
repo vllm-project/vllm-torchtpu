@@ -915,6 +915,11 @@ class TpuPlatform(Platform):
         cache_config = vllm_config.cache_config
 
         is_hybrid = model_config.is_hybrid if model_config is not None else False
+        is_attention_free = (
+            getattr(model_config, "is_attention_free", False) is True
+            if model_config is not None
+            else False
+        )
         if (
             vllm_config.speculative_config is not None
             and scheduler_config.async_scheduling
@@ -949,6 +954,15 @@ class TpuPlatform(Platform):
                     "unified KV pool; remove "
                     "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0."
                 )
+        if (
+            is_attention_free
+            and cache_config.enable_prefix_caching
+            and not is_decode_bench
+        ):
+            raise NotImplementedError(
+                "Prefix caching on attention-free Mamba models is not yet "
+                "supported on TPU."
+            )
 
         parallel_config = vllm_config.parallel_config
         parallel_config.worker_cls = "vllm_torchtpu.worker.tpu_worker.TPUWorker"
