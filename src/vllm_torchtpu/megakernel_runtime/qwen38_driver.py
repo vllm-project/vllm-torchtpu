@@ -355,6 +355,9 @@ class Qwen38SegmentDriver:
                 qwen38_segment_call.DEFAULT_RINGS = (int(e), int(d))
         drv = cls(runner, _parse_buckets(raw), head=_parse_flag(raw, "head", True))
         drv.check_left = _parse_check(raw)
+        segs = _parse_int(raw, "segs")
+        if segs is not None:
+            drv.segments.mk_segments = segs
         drv.mtp = _parse_flag(raw, "mtp", False)
         logger.info(
             "Qwen3.8 segment megakernel enabled, verify buckets %s, shadow checks %d, hier %s, rings %s, head %s",

@@ -550,8 +550,28 @@ class Qwen4ExpBackbone(nn.Module):
         # graph is rejected, so the default (0) must not touch it.
         cap = getattr(segment_call, "attention_rows", 0)
         in_kernel = bool(cap) and int(hidden.shape[0]) <= cap
+        # `mk_segments`: segments from this index on run their stock layers
+        # (a config int, not a shape; for bisecting the served program).
+        n_mk = getattr(segment_call, "mk_segments", None)
+        n_mk = len(qsa_layers) if n_mk is None else int(n_mk)
+        ends = qsa_layers[1:] + [len(layers)]
         for s, i in enumerate(qsa_layers):
             layer = layers[i]
+            if s >= n_mk:
+                for stock in layers[i : ends[s]]:
+                    hidden = stock(
+                        hidden,
+                        positions64,
+                        ids64,
+                        query_start_loc,
+                        ngram_context,
+                        state_slots,
+                        context_lens,
+                        valid_tokens,
+                        main_block_table,
+                        compressed_block_table,
+                    )
+                continue
             block, _ = layer.attn_hyper_connection.mix(hidden)
             if in_kernel:
                 attention = layer.self_attn.select_for_kernel(block, positions64, metadata)
