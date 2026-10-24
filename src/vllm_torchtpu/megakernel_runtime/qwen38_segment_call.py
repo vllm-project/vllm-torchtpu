@@ -133,15 +133,17 @@ def build_segment_call(
     `interpret` / `tiles` are for CPU tests.
     """
     R = mesh.size
+    has_gdn = head or L > 1
     ex = ExecSpec(
         R=R,
         B=B,
-        T=T_VERIFY,
+        # Without GDN layers the token grouping is irrelevant (the MTP draft
+        # tail can see any row count).
+        T=T_VERIFY if has_gdn or B % T_VERIFY == 0 else 1,
         ctx=128,
         tiles=segment_tiles(B) if tiles is None else tiles,
         interpret=interpret,
     )
-    has_gdn = head or L > 1
     pool_gdn = pool_gdn and has_gdn
     spec = qwen38.segment_spec(g, R, L=L, head=head, pool_gdn=pool_gdn)
     fn, _, _, n_w = make_flat_segment_step(mesh, spec, ex)

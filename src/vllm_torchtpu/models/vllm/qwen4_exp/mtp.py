@@ -190,8 +190,11 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         context = (seq_lens - (starts[1:] - starts[:-1])).to(torch.int64)
         tables = cast(torch.Tensor, metadata.block_tables)
         tail = self.mk_tail
-        count = int((rows if rows is not None else hidden).shape[0])
-        if tail is not None and count in tail.buckets:
+        # No branch on the token count: vLLM rejects a traced graph that does
+        # (ShapeSpecializationError). The tail op resolves concrete rows itself;
+        # the driver attaches it only when step 0 uses draft rows, so the
+        # all-token path below is the fused loop's (<= request capacity rows).
+        if tail is not None:
             # Stock attention (caches written for every token), then the kernel.
             block, _ = layer.attn_hyper_connection.mix(hidden)
             qsa_md = QSAMetadata(

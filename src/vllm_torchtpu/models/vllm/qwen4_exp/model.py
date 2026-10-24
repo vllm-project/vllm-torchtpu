@@ -546,7 +546,10 @@ class Qwen4ExpBackbone(nn.Module):
         )
         # Small buckets run the QSA sparse attention inside the segment kernel:
         # the stock op then stops after the indexer (`select_for_kernel`).
-        in_kernel = int(hidden.shape[0]) <= getattr(segment_call, "attention_rows", 0)
+        # Only read the token count when enabled: a branch on it in a traced
+        # graph is rejected, so the default (0) must not touch it.
+        cap = getattr(segment_call, "attention_rows", 0)
+        in_kernel = bool(cap) and int(hidden.shape[0]) <= cap
         for s, i in enumerate(qsa_layers):
             layer = layers[i]
             block, _ = layer.attn_hyper_connection.mix(hidden)
