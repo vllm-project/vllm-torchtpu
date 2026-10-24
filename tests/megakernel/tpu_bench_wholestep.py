@@ -149,6 +149,47 @@ def run(g, B, T, L, mesh, chains, budget, identical, nbd, nbe, tiny=False, slots
     }
 
 
+def compile_only(g, B, T, L, mesh, budget, nbd, nbe, slots=8) -> dict:
+    """Lower + compile the L-layer kernel from shapes only (no weights allocated): compile
+    time and whether the program fits, e.g. at L = 48 (the whole model)."""
+    R = mesh.size
+    ex = ExecSpec(R=R, B=B, T=T, ctx=128, tiles=tiles_for(B, nbd, nbe))
+    spec = wholestep_spec(g, R, L=L, qsa=dict(budget=budget, slots=slots))
+    n_pages = -(-(ex.M * (budget + 1) * 4) // 128) + 1
+
+    def build(key):
+        d = wi.random_wholestep_inputs(7, g, ex, L, budget=budget, n_pages=n_pages)
+        w, st = wi.pack_wholestep(spec, g, ex, d, L)
+        hid = jnp.broadcast_to(
+            jnp.pad(d["inp"].x, ((0, ex.M - B), (0, 0)))[None], (R, ex.M, d["inp"].x.shape[-1])
+        )
+        ext = (
+            kernel.fold(d["pool"]), d["pages"], d["kv_len"], jnp.asarray([1], jnp.int32),
+            jnp.asarray([1.0, 1.0], jnp.float32), kernel.fold(jnp.broadcast_to(d["rope"][None], (R,) + d["rope"].shape)),
+        )
+        return d["inp"].pos, kernel.fold(hid), jax.tree.map(kernel.fold, w), jax.tree.map(kernel.fold, st), ext
+
+    shapes = jax.eval_shape(build, 0)
+    tp, rep = NamedSharding(mesh, P("tp")), NamedSharding(mesh, P())
+    pos_s, hid_s, w_s, st_s, ext_s = shapes
+    with_sh = lambda t, sh: jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype, sharding=sh), t)  # noqa: E731
+    ext_sh = tuple(
+        with_sh(e, tp if i in (0, 5) else rep) for i, e in enumerate(ext_s)
+    )
+    step, info = kernel.make_step(mesh, spec, ex)
+    t0 = time.perf_counter()
+    lowered = jax.jit(step).lower(
+        with_sh(pos_s, rep), with_sh(hid_s, tp), with_sh(w_s, tp), with_sh(st_s, tp), *ext_sh
+    )
+    t1 = time.perf_counter()
+    lowered.compile()
+    t2 = time.perf_counter()
+    return {
+        "rows": B, "L": L, "compile_only": True, "lower_s": round(t1 - t0, 1),
+        "compile_s": round(t2 - t1, 1), "tiles": str(info["exec"].resolved_tiles),
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--rows", type=int, nargs="+", default=[8])
@@ -161,6 +202,7 @@ def main() -> None:
     ap.add_argument("--nbe", type=int, default=None)
     ap.add_argument("--tiny", action="store_true", help="CPU interpret smoke run")
     ap.add_argument("--slots", type=int, default=8, help="attention ring slots")
+    ap.add_argument("--compile-only", action="store_true", help="shapes only: compile time / fit")
     a = ap.parse_args()
     devs = jax.devices()[:2] if a.tiny else jax.devices()
     g = qwen38.TINY if a.tiny else qwen38.FULL
@@ -169,6 +211,14 @@ def main() -> None:
     out = []
     for L in a.layers:
         for B in a.rows:
+            if a.compile_only:
+                try:
+                    r = compile_only(g, B, a.T, L, mesh, a.budget, a.nbd, a.nbe, a.slots)
+                except Exception as e:  # noqa: BLE001
+                    r = {"rows": B, "L": L, "compile_only": True, "error": f"{type(e).__name__}: {e}"[:3000]}
+                print("RESULT", json.dumps(r), flush=True)
+                out.append(r)
+                continue
             for ident in a.identical:
                 try:
                     r = run(g, B, a.T, L, mesh, a.chains, a.budget, bool(ident), a.nbd, a.nbe, a.tiny, a.slots)

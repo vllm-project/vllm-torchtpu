@@ -47,6 +47,7 @@ def wholestep_spec(
     pool_gdn: bool = False,
     qsa: dict[str, Any] | None = None,
     indexed: dict[str, Any] | None = None,
+    step: bool = False,
 ) -> ModelSpec:
     """`L` (a multiple of `att_every`) layers starting at a group boundary (layer 0 = GDN).
 
@@ -61,10 +62,14 @@ def wholestep_spec(
     gi = g.inner(R, L)
     hc = dict(inner_geometry=gi, nhc=g.NHC, lowrank=g.LOWRANK)
     gdn = HCSublayer(gdn_cls(geometry=gi), ar_slot=0, **hc)
-    if indexed is not None:  # stage B: the indexer and selection in-kernel
+    if indexed is not None and step:  # stage C: + the step's own tokens and group
+        from .qsa_full_c import QSAFullStepBlock
+
+        qsa_block: Any = QSAFullStepBlock(**indexed, **(qsa or {}))
+    elif indexed is not None:  # stage B: the indexer and selection in-kernel
         from .qsa_full_b import QSAFullIndexedBlock
 
-        qsa_block: Any = QSAFullIndexedBlock(**indexed, **(qsa or {}))
+        qsa_block = QSAFullIndexedBlock(**indexed, **(qsa or {}))
     else:
         qsa_block = QSAFullBlock(**(qsa or {}))
     attn = HCSublayer(qsa_block, ar_slot=0, **hc)

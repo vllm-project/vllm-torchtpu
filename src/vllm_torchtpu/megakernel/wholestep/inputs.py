@@ -40,7 +40,7 @@ from ..exec_spec import ExecSpec
 from ..models.qwen38 import Qwen38Geometry
 from ..models.qwen38_inputs import _hc_params, _rep, _rows, hc_weight_arrays, random_segment_inputs
 from ..models.qwen38_pack import pack_weights
-from ..ops import BF16, F32, rnd, rup
+from ..ops import BF16, F32, rmsnorm, rnd, rup
 from .qsa_full import project_reference, qkvg_width
 
 EXTRA_NAMES = ["qsa_pool", "qsa_pages", "qsa_kvlen", "qsa_off", "qsa_scales", "qsa_rope"]
@@ -123,6 +123,8 @@ def wholestep_reference(
     x = inp.x[:B]
     o_att = o_gdn = 0
     kv_new = []
+    step_out: list = []
+    d["_step_out"] = step_out
     for j in range(L):
         if j % g.att_every == g.att_every - 1:
             p = {n: v[o_att] for n, v in hc["qsa_full"].items()}
@@ -134,6 +136,15 @@ def wholestep_reference(
                     nh=nh, hd=hd, rot=g.ROT, eps=eps,
                 )
                 kvs.append(jnp.concatenate([kk, vv], axis=-1))
+                if "ring" in d:  # stage C: the step's own tokens and group
+                    if r == 0:
+                        ssel = step_selection(g, ex, d, mixed, o_att, d["budget"])
+                        step_out.append(ssel)
+                    attn = step_attention(g, ex, d, ssel["sel"], q, gate, kk, vv, r).reshape(B, -1)
+                    delta = delta + jnp.dot(
+                        attn.astype(BF16), d["o_proj"][r, o_att], preferred_element_type=F32
+                    )
+                    continue
                 if "idx_w" in d and r == 0:  # replicated indexer: one selection for all ranks
                     pages, kvl = indexer_selection(g, ex, d, mixed, o_att, d["budget"])
                 elif "idx_w" not in d:
@@ -193,6 +204,7 @@ def pack_wholestep(
         "qsa_qn": _rows(_rep(d["qn"], R), att_rows, L),
         "qsa_kn": _rows(_rep(d["kn"], R), att_rows, L),
         **({"qsa_iqn": _rows(_rep(d["iqn"], R), att_rows, L)} if "iqn" in d else {}),
+        **({"qsa_ikn": _rows(_rep(d["ikn"], R), att_rows, L)} if "ikn" in d else {}),
         "gdn_hcn": _rows(_rep(hc["gdn"]["norm"], R), gdn_rows, L),
         "in_s": _rows(w_l["lin_in_s"], gdn_rows, L),
         "out_s": _rows(w_l["lin_out_s"], gdn_rows, L),
@@ -302,4 +314,130 @@ def extras_b(d: dict[str, Any], mesh: Mesh, R: int) -> tuple:
         jax.device_put(jnp.asarray([d["off"]], jnp.int32), rep),
         jax.device_put(jnp.asarray([1.0, 1.0], F32), rep),
         jax.device_put(kernel.fold(_rep(d["rope"], R)), tp),
+    )
+
+
+# ------------------------------------------------------------ stage C (the step's own tokens)
+EXTRA_NAMES_C = EXTRA_NAMES_B + ["qsa_ctx", "qsa_ring", "qsa_rope_ck"]
+
+
+def add_step_inputs(key: int, g: Qwen38Geometry, ex: ExecSpec, d: dict[str, Any], L: int,
+                    *, ctx: list[int]) -> dict[str, Any]:
+    """Raw index-key ring, request contexts, the completed groups' RoPE rows, k-norm weights."""
+    from .indexer import IDX_DIM
+
+    nreq = ex.M // ex.T
+    n_att = len(att_layers(g, L))
+    k = jax.random.split(jax.random.PRNGKey(key + 11), 2)
+    ctxq = np.array([ctx[q % len(ctx)] for q in range(nreq)], np.int32)
+    ring = jax.random.normal(k[0], (nreq, 8, IDX_DIM), F32).astype(BF16)
+    ikn = jax.random.normal(k[1], (n_att, IDX_DIM), F32) * 0.05
+    j0 = ctxq + (3 - ctxq % 4) % 4 - 3  # first position of the group completed this step
+    inv = 1.0 / (g.theta ** (np.arange(0, g.ROT, 2) / g.ROT))
+    ang = j0[:, None] * inv[None, :]
+    rope_ck = np.zeros((nreq, 1, 128), np.float32)
+    rope_ck[:, 0, : g.ROT // 2] = np.cos(ang).astype(ml_dtypes.bfloat16).astype(np.float32)
+    rope_ck[:, 0, g.ROT // 2 : g.ROT] = np.sin(ang).astype(ml_dtypes.bfloat16).astype(np.float32)
+    return {**d, "ctxq": jnp.asarray(ctxq), "ring": ring, "ikn": ikn, "rope_ck": jnp.asarray(rope_ck)}
+
+
+def step_selection(g: Qwen38Geometry, ex: ExecSpec, d: dict[str, Any], mixed: jax.Array,
+                   o_att: int, K: int) -> dict[str, Any]:
+    """Stock semantics of one QSA layer's indexer with the step's own group (rank-independent):
+    per request the completed group's key and new ring, per row the selected group set."""
+    from .indexer import IDX_DIM, IDX_HEADS, index_query, index_rope, score_rows, topk_reference
+
+    B, T = ex.B, ex.T
+    bc = jax.lax.bitcast_convert_type
+    y = rnd(jnp.dot(mixed.astype(BF16), d["idx_w"][o_att], preferred_element_type=F32))
+    rope = d["rope"][:B]
+    cos, sin = rope[:, : g.ROT // 2], rope[:, g.ROT // 2 : g.ROT]
+    iq = index_query(y, d["iqn"][o_att], cos, sin, g.ROT, g.eps, bc)
+    raw = y[:, 4 * IDX_DIM : 5 * IDX_DIM]
+    out = {"ck": {}, "ring": {}, "sel": {}}
+    for q in range(-(-B // T)):
+        c0 = int(d["ctxq"][q])
+        p3 = c0 + (3 - c0 % 4) % 4
+        ring = d["ring"][q].astype(F32)
+        acc = None
+        for j in range(4):
+            pos = p3 - 3 + j
+            m = raw[q * T + pos - c0][None] if pos >= c0 else ring[pos % 8][None]
+            acc = m if acc is None else acc + m
+        pooled = rnd(acc * 0.25)
+        rc = d["rope_ck"][q]
+        ck = index_rope(
+            rmsnorm(pooled, d["ikn"][o_att], g.eps, zero_centered=True),
+            rc[:, : g.ROT // 2], rc[:, g.ROT // 2 : g.ROT], g.ROT, bc,
+        ).astype(BF16)
+        end = c0 + T
+        new_ring = np.array(ring)
+        for p in range(end - 8, end):
+            if p >= c0:
+                new_ring[p % 8] = np.asarray(raw[q * T + p - c0])
+        out["ck"][q], out["ring"][q] = ck, jnp.asarray(new_ring).astype(BF16)
+        rows = range(q * T, min(B, (q + 1) * T))
+        qr = jnp.stack([jnp.stack([iq[h][r] for h in range(IDX_HEADS)]) for r in rows])
+        qr = qr.reshape(-1, qr.shape[-1]).astype(BF16)
+        st = np.array(score_rows(qr, d["ck"][q]))
+        st[:, p3 // 4] = np.asarray(score_rows(qr, jnp.broadcast_to(ck, (8, IDX_DIM))))[:, 0]
+        for i, r in enumerate(rows):
+            out["sel"][r] = set(topk_reference(st[i], int(d["nvis"][r]), K))
+    return out
+
+
+def step_attention(g: Qwen38Geometry, ex: ExecSpec, d: dict[str, Any], sel: dict[str, Any],
+                   q: jax.Array, gate: jax.Array, kk: jax.Array, vv: jax.Array, r_: int) -> jax.Array:
+    """Per-rank stock attention of every row: selected groups older than the step from the
+    pool, the step's own tokens FP8 write-then-read, the partial group causal."""
+    from .qsa_full_c import quant_fp8
+
+    B, T = ex.B, ex.T
+    pool = d["pool"][r_]
+    off, per_page = d["off"], 128 // MICRO
+    mtab = np.asarray(d["mtab"])
+    sm = g.HD**-0.5
+    outs = []
+    for r in range(B):
+        qi = r // T
+        c0, p_r = int(d["ctxq"][qi]), int(d["ctxq"][qi]) + r % T
+        n_r = int(d["nvis"][r])
+        keys, vals = [], []
+
+        def token(pos):
+            if pos >= c0:  # the step's own token: FP8 write-then-read
+                t = qi * T + pos - c0
+                return quant_fp8(kk[t].astype(F32), 1.0), quant_fp8(vv[t].astype(F32), 1.0)
+            gid = pos // 4
+            mic = mtab[qi, gid // per_page] * per_page + gid % per_page
+            row = pool[mic // per_page, (mic % per_page) * MICRO + pos % 4, 0]
+            return row[2 * off].astype(F32), row[2 * off + 1].astype(F32)
+
+        groups = sorted(sel[r])
+        for gid in groups:
+            if gid < c0 // 4 or gid < n_r:
+                for pos in range(4 * gid, 4 * gid + 4):
+                    k_, v_ = token(pos)
+                    keys.append(k_), vals.append(v_)
+        if (p_r + 1) % 4:  # the row's partial group
+            for pos in range(4 * n_r, p_r + 1):
+                k_, v_ = token(pos)
+                keys.append(k_), vals.append(v_)
+        if not keys:
+            outs.append(jnp.zeros(q[r].shape, F32))
+            continue
+        K_, V_ = jnp.stack(keys), jnp.stack(vals)
+        s = jnp.einsum("hd,td->ht", q[r].astype(F32), K_) * sm
+        attn = jax.nn.softmax(s, axis=-1) @ V_
+        gt = jax.nn.sigmoid(gate[r].astype(F32)).astype(BF16).astype(F32)
+        outs.append((attn.astype(BF16).astype(F32) * gt).astype(BF16).astype(F32))
+    return jnp.stack(outs)
+
+
+def extras_c(d: dict[str, Any], mesh: Mesh, R: int) -> tuple:
+    tp, rep = NamedSharding(mesh, P("tp")), NamedSharding(mesh, P())
+    return extras_b(d, mesh, R) + (
+        jax.device_put(d["ctxq"], rep),
+        jax.device_put(kernel.fold(_rep(d["ring"], R)), tp),
+        jax.device_put(kernel.fold(_rep(d["rope_ck"], R)), tp),
     )

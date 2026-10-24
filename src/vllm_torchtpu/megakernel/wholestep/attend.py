@@ -53,11 +53,16 @@ def attend_row_mapped(
     interpret: bool,
     fold: bool = False,
     ablate: str = "",
+    recent: tuple[jax.Array, jax.Array, jax.Array, jax.Array] | None = None,
 ) -> tuple[jax.Array, Any, Any]:
     """`attend_row` over GROUP ids: `pages[row, col]` holds a request-local group id `v`
     (what the in-kernel indexer selects), mapped at DMA-issue time to the pool's micro-page
     `table[row // rows_per_req, v >> log2(per_page)] * per_page + (v & (per_page - 1))`.
     One extra SMEM load per copy instead of a separate id-translation pass.
+
+    `recent = (k [n, 256], v [n, 256], valid [1, n], valid [n, 1])`: tokens held in VMEM (the step's own
+    tokens and the old members of their groups, already dequantized) merged into the same
+    online softmax after the pool tiles; a row with no pool tokens still attends them.
 
     Gated sparse attention of row `r`: `([nh, 256]` F32, next `g0`, next `pre`).
 
@@ -197,12 +202,24 @@ def attend_row_mapped(
         jnp.zeros((nh, 1), F32),
         jnp.zeros((nh, dim), F32),
     )
-    _, l, acc = jax.lax.fori_loop(0, ntiles, tile, init)
+    m, l, acc = jax.lax.fori_loop(0, ntiles, tile, init)
+    has = length > 0
+    if recent is not None:
+        kr, vr, ok, ok_col = recent  # row and column masks (Mosaic has no i1 transpose)
+        sc = jax.lax.dot_general(qf, kr, (((1,), (1,)), ((), ())), preferred_element_type=F32)
+        sc = jnp.where(ok, sc * (1.0 if fold else sm_scale), -jnp.inf)
+        m_new = jnp.maximum(m, jnp.max(sc, axis=-1, keepdims=True))
+        safe = jnp.where(m_new == -jnp.inf, 0.0, m_new)
+        p = jnp.where(ok, jnp.exp(sc - safe), 0.0)
+        alpha = jnp.where(m == -jnp.inf, 0.0, jnp.exp(m - safe))
+        l = l * alpha + jnp.sum(p, axis=-1, keepdims=True)
+        acc = acc * alpha + jnp.dot(p, jnp.where(ok_col, vr, 0.0), preferred_element_type=F32)
+        has = has | (jnp.sum(ok.astype(I32)) > 0)
     attn = acc / jnp.where(l > 0, l, 1.0) * (scale_v if fold else 1.0)
     gated = (
         attn.astype(BF16).astype(F32) * jax.nn.sigmoid(gate.astype(F32)).astype(BF16).astype(F32)
     ).astype(BF16).astype(F32)
     pre_next = jnp.where(cross, jnp.minimum(nslots - 1, ntiles_next), 0)
-    return jnp.where(length > 0, gated, 0.0), g0 + ntiles, pre_next
+    return jnp.where(has, gated, 0.0), g0 + ntiles, pre_next
 
 

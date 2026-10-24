@@ -196,3 +196,84 @@ def test_selection_check_catches_an_off_by_one_id(monkeypatch):
     monkeypatch.setattr(ix, "compact_row", lambda *a, **k: orig(*a, **k) + 1)
     with pytest.raises(AssertionError):
         test_in_kernel_selection_exact_on_its_own_queries()
+
+
+# --------------------------------------------------------------------- stage C
+CTX_C = [3001, 100]  # request 0: g_a holds one old token; request 1: g_a starts at the step
+
+
+def _run_c(key: int = 17, T: int = 4):
+    from vllm_torchtpu.megakernel.wholestep.qsa_full_b import DBG_IDS, DBG_IQ
+    from vllm_torchtpu.megakernel.wholestep.qsa_full_c import CK_NEW, RING_NEW
+
+    R = 2
+    ex = ExecSpec(R=R, B=2 * T, T=T, ctx=128, interpret=True, tiles=_TILES)
+    d = wi.random_wholestep_inputs(key, G, ex, L, budget=BUDGET, n_pages=PAGES, identical_experts=True)
+    d = wi.add_indexer_inputs(key, G, ex, d, L, max_groups=MAX_GROUPS, ctx=CTX_C)
+    d = wi.add_step_inputs(key, G, ex, d, L, ctx=CTX_C)
+    ref, _ = wi.wholestep_reference(G, ex, d, L)
+    steps = d.pop("_step_out")
+    pps = d["mtab"].shape[1]
+    spec = wholestep_spec(
+        G, R, L=L, qsa=dict(budget=BUDGET), step=True,
+        indexed=dict(max_groups=MAX_GROUPS, pages_per_seq=pps, debug=True),
+    )
+    w_mk, states = wi.pack_wholestep(spec, G, ex, d, L)
+    mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
+    pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(mesh, ex, d["inp"].pos, d["inp"].x, w_mk, states)
+    assert [x.name for x in kernel.extra_inputs(spec, ex)] == wi.EXTRA_NAMES_C
+    step, _ = kernel.make_step(mesh, spec, ex)
+    _, outs = step(pos_mk, hid_mk, w_mk, st_mk, *wi.extras_c(d, mesh, R))
+    B, n_att, nreq = ex.B, L // G.att_every, ex.M // T
+    res = np.asarray(outs[RESIDUAL_OUT].reshape(R, ex.M, -1)[:, :B], np.float32)
+    ck = np.asarray(outs[CK_NEW], np.float32).reshape(R, n_att, nreq, -1)[0]
+    ring = np.asarray(outs[RING_NEW], np.float32).reshape(R, n_att, nreq, 8, -1)[0]
+    iq = np.asarray(outs[DBG_IQ], np.float32).reshape(R, n_att, ex.M, -1)[0, :, :B]
+    ids = np.asarray(outs[DBG_IDS]).reshape(R, n_att, ex.M, -1)[0, :, :B]
+    x0 = np.asarray(d["inp"].x[:B], np.float32)
+    return res, np.asarray(ref, np.float32), x0, ck, ring, steps, iq, ids, d
+
+
+def test_step_selection_exact_on_its_own_queries():
+    """Strict: the pool-path ids are the stock selection (from the kernel's own queries and
+    its own completed-group key) restricted to groups older than the step, every row/layer."""
+    from vllm_torchtpu.megakernel.wholestep.indexer import score_rows, topk_reference
+
+    _, _, _, ck, _, _, iq, ids, d = _run_c()
+    T = 4
+    for o in range(iq.shape[0]):
+        for r in range(iq.shape[1]):
+            q = r // T
+            c0 = int(d["ctxq"][q])
+            p3 = c0 + (3 - c0 % 4) % 4
+            qr = jnp.asarray(iq[o, r].reshape(4, -1), BF16)
+            st = np.array(score_rows(qr, d["ck"][q]))[0]
+            st[p3 // 4] = np.asarray(
+                score_rows(qr, jnp.broadcast_to(jnp.asarray(ck[o, q], BF16), (8, ck.shape[-1])))
+            )[0, 0]
+            n = int(d["nvis"][r])
+            want = {i for i in topk_reference(st, n, BUDGET) if i < c0 // 4}
+            got = set(ids[o, r, : len(want)].tolist())
+            assert got == want, (o, r, len(got ^ want))
+
+
+def test_step_tokens_match_stock_semantics():
+    """Stage C: the completed group's key and the new ring rows equal the stock write for
+    every request and QSA layer (bf16-close: their inputs carry the residual's drift); the
+    residual, with every row's own tokens attended from VMEM, is inside the depth-scaled budget
+    on select-all rows (request 1). Top-K rows (request 0, 750 groups -> 64) are not held to
+    the per-row budget: a 1-ulp drift of the index query flips boundary groups there (the
+    selection itself is exact on the kernel's own queries, the strict test above); only their
+    mean error is bounded, at 3x the depth-scaled mean budget."""
+    res, ref, x, ck, ring, steps, _, _, _ = _run_c()
+    assert float(np.std(ref - x)) > 0.05
+    for o, s in enumerate(steps):
+        for q in range(len(CTX_C)):
+            np.testing.assert_allclose(ck[o, q], np.asarray(s["ck"][q], np.float32)[0], atol=0.1, rtol=0.05)
+            np.testing.assert_allclose(ring[o, q], np.asarray(s["ring"][q], np.float32), atol=0.1, rtol=0.05)
+    T = 4
+    _assert_within_budget(res[:, T : 2 * T], ref[T : 2 * T])
+    scale, k = float(np.abs(ref).mean()), np.sqrt(2 * L / 8)
+    for r in range(res.shape[0]):
+        dd = np.abs(res[r, :T] - ref[:T])
+        assert dd.mean() < 3e-2 * k * scale, (r, dd.mean() / scale, dd.max(axis=1) / scale)
