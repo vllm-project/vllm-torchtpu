@@ -647,18 +647,6 @@ def test_d2h_stream_patch_is_idempotent(worker_proc):
     assert worker_proc._async_output_loop is patched_loop
 
 
-def test_d2h_stream_patch_skips_missing_loop(monkeypatch):
-    cls = type("WorkerProc", (), {})
-    _install_worker_proc(monkeypatch, cls)
-    warnings = []
-    monkeypatch.setattr("vllm_torchtpu.omni.patches.logger.warning", warnings.append)
-
-    _patch_diffusion_worker_d2h_stream()
-
-    assert len(warnings) == 1
-    assert not hasattr(cls, "_async_output_loop")
-
-
 def test_d2h_stream_patch_targets_real_worker_proc():
     # Runs in a fresh interpreter because tests/omni mock vllm_omni in
     # sys.modules. Skipped when no importable vLLM-Omni is on the path.

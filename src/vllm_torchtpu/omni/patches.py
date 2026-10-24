@@ -229,12 +229,7 @@ def _patch_diffusion_worker_d2h_stream() -> None:
     # -------------------------------------------------------------------------
     from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
 
-    orig_async_output_loop = getattr(WorkerProc, "_async_output_loop", None)
-    if orig_async_output_loop is None:
-        logger.warning(
-            "Skipping TPU patch: vLLM-Omni WorkerProc has no _async_output_loop."
-        )
-        return
+    orig_async_output_loop = WorkerProc._async_output_loop
     if getattr(orig_async_output_loop, _D2H_STREAM_PATCHED, False):
         return
 
