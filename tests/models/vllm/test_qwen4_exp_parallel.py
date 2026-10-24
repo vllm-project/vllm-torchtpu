@@ -937,6 +937,9 @@ def test_decoder_zeroes_unwritten_padding_before_standard_moe():
         def combine(self, block, residual):
             return block
 
+        def combine_mix(self, block, residual, next_hc):
+            return next_hc.mix(self.combine(block, residual))
+
     layer = Qwen4ExpDecoderLayer.__new__(Qwen4ExpDecoderLayer)
     nn.Module.__init__(layer)
     layer.ple = None

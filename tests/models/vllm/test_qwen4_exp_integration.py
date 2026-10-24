@@ -69,7 +69,14 @@ def test_native_qsa_and_ple_lift_initial_dense_model_limits():
 @pytest.mark.parametrize(
     "section,field,value,message",
     [
-        (None, "speculative_config", SimpleNamespace(method="mtp"), "MTP"),
+        # Native MTP is admitted (test_qwen4_exp_mtp covers its limits); any
+        # other speculative method stays closed.
+        (
+            None,
+            "speculative_config",
+            SimpleNamespace(method="eagle", num_speculative_tokens=1),
+            "only method='mtp'",
+        ),
         ("parallel_config", "pipeline_parallel_size", 2, "PP/CP1"),
         ("parallel_config", "prefill_context_parallel_size", 2, "PP/CP1"),
         ("parallel_config", "decode_context_parallel_size", 2, "PP/CP1"),
@@ -103,6 +110,10 @@ class _FakeSublayer(nn.Module):
         self.calls.append(args)
         return torch.tanh(self.proj(hidden))
 
+    def forward_with_indices(self, hidden, *args, rows=None, reduce=True):
+        """QSA's entry point: (output, selected), here without selection."""
+        return self.forward(hidden, *args), None
+
 
 def _hc(*, use_combine=True):
     return qwen4_model.GatedResidual(
@@ -125,6 +136,7 @@ def backbone():
         nn.Module.__init__(result)
         result.hc_count = HC
         result.host_ple_index = None
+        result.emit_mtp_hidden = False
         result.embed_tokens = nn.Embedding(VOCAB, HIDDEN)
         result.layers = nn.ModuleList()
         for kind in ("linear_attention", "full_attention"):
