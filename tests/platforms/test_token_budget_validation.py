@@ -148,6 +148,19 @@ def test_budget_within_compile_sizes_is_accepted(
             8192,
             id="pcp4",
         ),
+        # A budget that pcp does not divide: the hint rounds up, since
+        # 4096 rows x 4 = 16384 tokens would still be short of 16385.
+        pytest.param(
+            [4096],
+            16385,
+            4,
+            True,
+            None,
+            "--max-num-batched-tokens (16385)",
+            16384,
+            4097,
+            id="pcp4-budget-not-divisible",
+        ),
     ],
 )
 def test_budget_above_compile_sizes_raises(

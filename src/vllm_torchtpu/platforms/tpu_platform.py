@@ -29,6 +29,7 @@ import vllm.envs as vllm_envs
 from torch_tpu._internal import compile as _register_tpu_backend  # noqa: F401
 from torch_tpu._internal.utils import hardware
 from vllm.platforms.interface import Platform, PlatformEnum
+from vllm.utils.math_utils import cdiv
 
 from vllm_torchtpu import envs, patch_registry
 from vllm_torchtpu.logger import init_logger
@@ -1419,7 +1420,8 @@ def _validate_token_budget_fits_compile_sizes(vllm_config: VllmConfig) -> None:
         budget_flag, budget = "--max-num-scheduled-tokens", scheduled
     if budget <= limit:
         return
-    min_compile_size = -(-budget // pcp)  # ceil(budget / pcp) rows per rank.
+    # Rounded up: the hint must pass this check, largest * pcp >= budget.
+    min_compile_size = cdiv(budget, pcp)
     raise ValueError(
         f"{budget_flag} ({budget}) exceeds the largest compile_sizes entry "
         f"({largest} x {pcp} prefill context parallel ranks = {limit} tokens), "
