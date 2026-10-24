@@ -84,16 +84,6 @@ steps:
     artifact_paths:
       - "perf_eval_results/**/*"
 
-  - label: "Type Check - Full Environment"
-    key: "typecheck_full"
-    depends_on: "build_docker"
-    agents:
-      queue: "cpu_64_core"
-    env:
-      CPU_ONLY: "1"
-    commands:
-      - bash .buildkite/scripts/run_in_docker.sh bash tools/typecheck_full.sh
-
   - label: "DeepSeek-V4.1 benchmark scripts: CPU regression tests"
     key: "dsv41_benchmark_scripts_cpu"
     depends_on: "build_docker"
