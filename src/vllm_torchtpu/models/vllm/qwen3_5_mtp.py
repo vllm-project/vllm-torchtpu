@@ -21,6 +21,8 @@ from vllm.model_executor.models import qwen3_5_mtp as upstream
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.sequence import IntermediateTensors
 
+from vllm_torchtpu.model_loader_patches import SupportsCheckpointTensorFilter
+
 # Upstream's forward, kept for the drift pin in test_qwen3_next_patch.py.
 UPSTREAM_PREDICTOR_FORWARD = upstream.Qwen3_5MultiTokenPredictor.forward
 
@@ -82,7 +84,21 @@ def _predictor_forward(
 cast(Any, upstream.Qwen3_5MultiTokenPredictor).forward = _predictor_forward
 
 
-class Qwen3_5MTP(upstream.Qwen3_5MTP):
+class _DraftCheckpointTensors(SupportsCheckpointTensorFilter):
+    """Names the checkpoint tensors upstream `Qwen3_5MTP.load_weights` reads."""
+
+    shared_checkpoint_keys: tuple[str, ...] = ()
+
+    def is_checkpoint_tensor_used(self, name: str) -> bool:
+        """Reports whether the draft's `load_weights` reads checkpoint tensor `name`.
+
+        Upstream keeps the `mtp.` tensors, the embedding and the head, so the
+        sharded Run:AI loader skips fetching the target's layers for the draft.
+        """
+        return name.startswith("mtp.") or "embed_tokens" in name or "lm_head" in name
+
+
+class Qwen3_5MTP(upstream.Qwen3_5MTP, _DraftCheckpointTensors):
     """Upstream's draft, admitted under pipeline parallelism.
 
     vLLM's config check requires every model under a pipeline to satisfy
@@ -97,7 +113,7 @@ class Qwen3_5MTP(upstream.Qwen3_5MTP):
     supports_pp: ClassVar[Literal[True]] = True
 
 
-class Qwen3_5MoeMTP(upstream.Qwen3_5MoeMTP):
+class Qwen3_5MoeMTP(upstream.Qwen3_5MoeMTP, _DraftCheckpointTensors):
     """The MoE draft, admitted under pipeline parallelism; see `Qwen3_5MTP`."""
 
     supports_pp: ClassVar[Literal[True]] = True

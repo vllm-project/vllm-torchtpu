@@ -38,6 +38,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadataBuilderContext,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.model_loader_patches import checkpoint_tensor_filter
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
@@ -959,6 +960,11 @@ class Eagle3Proposer:
                 )
 
             cast(Any, model).load_weights = load_weights
+            # The sharded Run:AI loader does not stream the borrowed modules'
+            # tensors either.
+            filtered = checkpoint_tensor_filter(model)
+            if filtered is not None:
+                filtered.shared_checkpoint_keys = shared_keys
             try:
                 model_loader.load_weights(model, draft_model_config)
             finally:

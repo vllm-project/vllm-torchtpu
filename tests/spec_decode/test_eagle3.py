@@ -2698,11 +2698,16 @@ def test_mtp_draft_borrows_target_head_before_loading_weights(
     weights stream in, and only the checkpoint copies of borrowed modules are
     skipped: a draft that keeps its own lm_head still loads it. A
     DeepSeek-style draft keeps its head at ``model.layers.<N>.shared_head.head``
-    and must not load that checkpoint copy over the borrowed target head."""
+    and must not load that checkpoint copy over the borrowed target head.
+    The sharded Run:AI loader's fetch plan skips the same borrowed tensors."""
     import vllm.model_executor.model_loader.utils as loader_utils
     from vllm.model_executor.model_loader import base_loader
 
     import vllm_torchtpu.spec_decode.eagle3 as e3
+    from vllm_torchtpu.model_loader_patches import (
+        SupportsCheckpointTensorFilter,
+        _unused_checkpoint_tensor_predicate,
+    )
 
     proposer = _make_proposer(draft_tp=1, method="mtp")
     proposer.runner = SimpleNamespace(mesh=object())
@@ -2727,6 +2732,10 @@ def test_mtp_draft_borrows_target_head_before_loading_weights(
     class Draft(torch.nn.Module):
         has_own_embed_tokens = False
         has_own_lm_head = own_lm_head
+        shared_checkpoint_keys: tuple[str, ...] = ()
+
+        def is_checkpoint_tensor_used(self, name: str) -> bool:
+            return True
 
         def __init__(self):
             super().__init__()
@@ -2759,13 +2768,15 @@ def test_mtp_draft_borrows_target_head_before_loading_weights(
 
     class _Loader:
         def load_weights(self, model, model_config):
-            model.load_weights(
-                [
-                    ("model.embed_tokens.weight", 1),
-                    (head_name, 2),
-                    ("model.layers.92.mlp.gate.weight", 3),
-                ]
-            )
+            weights = [
+                ("model.embed_tokens.weight", 1),
+                (head_name, 2),
+                ("model.layers.92.mlp.gate.weight", 3),
+            ]
+            is_unused = _unused_checkpoint_tensor_predicate(model)
+            assert is_unused is not None
+            seen["fetched"] = [name for name, _ in weights if not is_unused(name)]
+            model.load_weights(weights)
 
     processed = []
     monkeypatch.setattr(loader_utils, "initialize_model", lambda **kw: Draft())
@@ -2795,5 +2806,10 @@ def test_mtp_draft_borrows_target_head_before_loading_weights(
     if own_lm_head:
         expected = [head_name] + expected
     assert seen["names"] == expected
+    assert seen["fetched"] == expected
+    assert isinstance(proposer.draft_model, SupportsCheckpointTensorFilter)
+    assert ("lm_head" in proposer.draft_model.shared_checkpoint_keys) is (
+        head_style == "lm_head" and not own_lm_head
+    )
     assert processed == [proposer.draft_model]
     assert "load_weights" not in proposer.draft_model.__dict__

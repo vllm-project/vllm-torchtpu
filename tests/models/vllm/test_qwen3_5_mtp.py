@@ -15,6 +15,7 @@
 from vllm.model_executor.models import ModelRegistry
 from vllm.model_executor.models.interfaces import supports_pp
 
+from vllm_torchtpu.model_loader_patches import SupportsCheckpointTensorFilter
 from vllm_torchtpu.models.vllm import register_models
 from vllm_torchtpu.models.vllm.qwen3_5_mtp import Qwen3_5MoeMTP, Qwen3_5MTP
 
@@ -85,3 +86,45 @@ def test_predictor_forward_embeds_on_a_non_first_pipeline_rank(monkeypatch):
     assert calls == [("layer", None)]
     # fc adds embedding (1) and hidden (2); norm adds the residual again.
     assert torch.equal(out, torch.full((3, 2), 6.0))
+
+
+def test_draft_tensor_predicate_matches_upstream_load_weights(monkeypatch):
+    """The sharded loader fetches exactly what upstream's load_weights reads."""
+    import torch
+    from vllm.model_executor.models import qwen3_5_mtp as upstream
+
+    names = (
+        "mtp.fc.weight",
+        "mtp.layers.0.mlp.experts.3.up_proj.weight",
+        "mtp.layers.0.mlp.experts.3.up_proj.weight_scale_inv",
+        "mtp.norm.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.91.mlp.gate.weight",
+        "model.norm.weight",
+        "model.embed_tokens.weight",
+        "model.language_model.embed_tokens.weight",
+        "lm_head.weight",
+    )
+    read: list[str] = []
+
+    class RecordingLoader:
+        def __init__(self, module):
+            pass
+
+        def load_weights(self, weights, mapper=None):
+            read.extend(name for name, _ in weights)
+
+    drafts = []
+    for cls in (Qwen3_5MTP, Qwen3_5MoeMTP):
+        draft = cls.__new__(cls)
+        torch.nn.Module.__init__(draft)
+        assert isinstance(draft, SupportsCheckpointTensorFilter)
+        assert draft.shared_checkpoint_keys == ()
+        drafts.append(draft)
+
+    monkeypatch.setattr(upstream, "AutoWeightsLoader", RecordingLoader)
+    for name in names:
+        read.clear()
+        upstream.Qwen3_5MTP.load_weights(None, [(name, None)])
+        for draft in drafts:
+            assert draft.is_checkpoint_tensor_used(name) == bool(read), name
