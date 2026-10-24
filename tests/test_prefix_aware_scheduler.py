@@ -25,6 +25,7 @@ from vllm.v1.request import RequestStatus
 
 from vllm_torchtpu.core import prefix_change_log
 from vllm_torchtpu.core.prefix_aware_scheduler import PrefixAwareScheduler
+from vllm_torchtpu.runner import host_trims
 
 
 def _make_request(
@@ -497,6 +498,10 @@ def _init_with(monkeypatch, kv_transfer_config, calls=None):
 
     calls = [] if calls is None else calls
     monkeypatch.setattr(AsyncScheduler, "__init__", fake_init)
+    # schedule() runs the engine core's host hook with the scheduler's config,
+    # which configures process-wide state; its own test covers it
+    # (test_prefix_aware_scheduler_host_hook.py).
+    monkeypatch.setattr(host_trims, "on_scheduler_step", lambda vllm_config: None)
     monkeypatch.setattr(
         PrefixAwareScheduler, "_enable_memo_xstep", lambda self: calls.append("memo")
     )

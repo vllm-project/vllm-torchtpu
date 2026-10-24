@@ -557,6 +557,20 @@ class PrefixAwareScheduler(AsyncScheduler):
         return cached
 
     def schedule(self, *args, **kwargs):
+        from vllm_torchtpu.runner import host_trims
+
+        # The engine core's host hook, before the KV-role branch so every
+        # engine runs it (the decode legs are kv_consumer engines). Its first
+        # call configures this process from the engine's config; then it
+        # applies the process-wide tpu_runner settings (gc_freeze,
+        # switch_interval_us) when either is set. With TP > 1 the workers run
+        # in their own processes, so this is how the settings reach the engine
+        # core. Only with an engine config: a scheduler built field by field
+        # (test stand-ins) has none to configure the process from.
+        vllm_config = getattr(self, "vllm_config", None)
+        if vllm_config is not None:
+            host_trims.on_scheduler_step(vllm_config)
+
         if not self._is_kv_consumer:
             # Off a decode leg: the warmest-first admission alone, unless
             # tpu_scheduler.promote_warmest=false asks for FCFS admission.
