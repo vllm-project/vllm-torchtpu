@@ -105,6 +105,7 @@ from vllm.v1.kv_offload.base import (
     RequestOffloadingContext,
     ScheduleEndContext,
     TransferResult,
+    get_offload_group_idx,
 )
 from vllm.v1.kv_offload.config import OffloadingConfig
 
@@ -425,6 +426,15 @@ class RaidenOffloadingManager(OffloadingManager):
         # probes the directory itself.
         self._inflight_store_keys: set[OffloadKey] = set()
 
+        # Per request: keys whose load failed (could not pin, or the transfer
+        # failed). That request's lookups answer MISS for them so it
+        # recomputes instead of retrying the same failing load every step.
+        self._unloadable: dict[str, set[OffloadKey]] = {}
+        # Requests between on_new_request and on_request_finished. A load can
+        # finalize after its request finished (vLLM signals the finish while
+        # transfers are still in flight); recording that failure would leak.
+        self._live_req_ids: set[str] = set()
+
         # Peer and storage-tier location slices cached from lookups and
         # consumed during `prepare_load`.
         self._remote_slices: dict[bytes, object] = {}
@@ -561,9 +571,16 @@ class RaidenOffloadingManager(OffloadingManager):
     # -- OffloadingManager contract --------------------------------------
 
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
+        self._live_req_ids.add(req_context.req_id)
         return RequestOffloadingContext()
 
+    def on_request_finished(self, req_context: ReqContext) -> None:
+        self._live_req_ids.discard(req_context.req_id)
+        self._unloadable.pop(req_context.req_id, None)
+
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        if key in self._unloadable.get(req_context.req_id, ()):
+            return LookupResult.MISS
         if key in self._inflight_store_keys:
             return LookupResult.HIT_PENDING
         sub_hashes = self._sub_hashes(key)
@@ -712,13 +729,20 @@ class RaidenOffloadingManager(OffloadingManager):
                 # cleanly and the blocks recompute.
                 if local_hashes:
                     self._store.release(local_hashes)
+                lost_key = keys[idx // self._device_block_size_factor]
+                num_unloadable = self._record_unloadable(
+                    req_context.req_id, keys, {lost_key}
+                )
                 logger.warning(
                     "TPURaidenOffloadingConnector: prepare_load lost sub-block "
                     "%d of %d for request %s to eviction; the load job will fail "
-                    "cleanly and the blocks recompute",
+                    "cleanly, the blocks recompute, and this request is not "
+                    "offered %d of its %d keys again",
                     idx + 1,
                     len(sub_hashes),
                     req_context.req_id,
+                    num_unloadable,
+                    len(keys),
                 )
                 return RaidenLoadStoreSpec(keys, pinned=False)
             idx = resolved_to
@@ -1033,6 +1057,7 @@ class RaidenOffloadingManager(OffloadingManager):
             # Nothing in flight: immediately terminal. The finalizer keeps
             # HOST entries intact, deletes freshly installed REMOTE entries
             # (landing blocks freed, the registry keeps the peer mapping),
+            # and marks the failed keys unloadable for this request,
             # matching a polled failure.
             self._finalize(admission)
 
@@ -1094,6 +1119,8 @@ class RaidenOffloadingManager(OffloadingManager):
                 )
             )
         else:
+            if admission.failed:
+                self._mark_unloadable(admission)
             self._finished.append(
                 FinishedJob(
                     job_id=admission.job_id,
@@ -1105,6 +1132,70 @@ class RaidenOffloadingManager(OffloadingManager):
                     ),
                 )
             )
+
+    def _mark_unloadable(self, admission: Admission) -> None:
+        """Stop offering this load's failed keys to the request that owns it.
+
+        Starts from the keys with a failed sub-hash (see `_record_unloadable`
+        for what else is recorded). A poisoned-only admission is not marked;
+        its source was fine, its destination was reclaimed.
+        """
+        failed = set(admission.failed_sub_hashes)
+        failed_keys = {
+            key
+            for key in admission.keys
+            if any(sub_hash in failed for sub_hash in self._sub_hashes(key))
+        }
+        if not failed_keys:
+            return
+        num_unloadable = self._record_unloadable(
+            admission.req_id, admission.keys, failed_keys
+        )
+        if not num_unloadable:
+            return
+        logger.warning(
+            "TPURaidenOffloadingConnector: load job %d failed; request %s is not "
+            "offered %d of its %d keys again and recomputes them",
+            admission.job_id,
+            admission.req_id,
+            num_unloadable,
+            len(admission.keys),
+        )
+
+    def _record_unloadable(
+        self,
+        req_id: str | None,
+        keys: list[OffloadKey],
+        failed_keys: set[OffloadKey],
+    ) -> int:
+        """Record a failed load's keys as unloadable for `req_id`.
+
+        `keys` is the load as the offloading scheduler built it: each KV cache
+        group's chunks in order. A group with a failed key is recorded from
+        that key to the end of the group. The keys before it stay loadable, so
+        on the retry step the request reloads that prefix (the scheduler frees
+        the blocks this load landed) and recomputes from the failure. The keys
+        after it are recorded too: a sliding-window group's load can start one
+        chunk before the window its lookup checked, and recording only that
+        chunk would leave the checked window a hit, offering the same load
+        again. Groups without a failed key, and other requests, keep hitting.
+
+        Nothing is recorded once the request finished: no on_request_finished
+        would come to clear it. Returns the number of keys recorded.
+        """
+        if req_id is None or req_id not in self._live_req_ids:
+            return 0
+        failed_groups: set[int] = set()
+        unloadable: list[OffloadKey] = []
+        for key in keys:
+            group_idx = get_offload_group_idx(key)
+            if key in failed_keys:
+                failed_groups.add(group_idx)
+            if group_idx in failed_groups:
+                unloadable.append(key)
+        if unloadable:
+            self._unloadable.setdefault(req_id, set()).update(unloadable)
+        return len(unloadable)
 
     def _poll_once(self) -> None:
         if not self._admissions:

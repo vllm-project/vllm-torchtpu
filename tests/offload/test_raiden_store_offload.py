@@ -73,11 +73,17 @@ from vllm.v1.kv_offload.base import (
     Medium,
     OffloadKey,
     ReqContext,
+    make_offload_key,
 )
 
 
 def _key(n: int) -> bytes:
     return b"hash_%04d" % n
+
+
+def _group_key(n: int, group_idx: int) -> OffloadKey:
+    # A key as the offloading scheduler builds it: block hash + KV cache group.
+    return make_offload_key(b"hash_%04d" % n, group_idx)
 
 
 def _ctx(req_id: str = "req") -> ReqContext:
@@ -886,6 +892,119 @@ class TestLoadJobLifecycle(unittest.TestCase):
         (finished_job,) = self.manager.poll_finished_jobs()
         self.assertFalse(finished_job.success)
         self.assertEqual(finished_job.failed_device_block_ids, [10])
+
+    def test_request_is_not_offered_a_load_it_could_not_pin_again(self):
+        # Key 5 is gone by the time prepare_load runs: r1 is not offered it
+        # again, while other requests still hit what is resident.
+        self.manager.on_new_request(_ctx("r1"))
+        self.assertEqual(self.manager.lookup(_key(0), _ctx("r1")), LookupResult.HIT)
+        spec = self.manager.prepare_load([_key(0), _key(5)], _ctx("r1"))
+        self.assertFalse(spec.pinned)
+        self.assertEqual(self.manager._unloadable, {"r1": {_key(5)}})
+        self.assertEqual(self.manager.lookup(_key(0), _ctx("r2")), LookupResult.HIT)
+        self.manager.on_request_finished(_ctx("r1"))
+        self.assertEqual(self.manager._unloadable, {})
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+    def test_pin_failure_keeps_the_resident_prefix_of_its_group(self):
+        # Keys 0-2 of a prefix group are resident, key 3 is gone: on the retry
+        # r1 reloads keys 0-2 and recomputes only from key 3.
+        keys = [_group_key(n, group_idx=0) for n in range(4)]
+        for key in keys[:3]:
+            seed_host_entries(self.store, key)
+        self.manager.on_new_request(_ctx("r1"))
+        spec = self.manager.prepare_load(keys, _ctx("r1"))
+        self.assertFalse(spec.pinned)
+        for key in keys[:3]:
+            self.assertEqual(self.manager.lookup(key, _ctx("r1")), LookupResult.HIT)
+        self.assertEqual(self.manager._unloadable, {"r1": {keys[3]}})
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+    def test_pin_failure_before_a_checked_window_marks_the_window(self):
+        # A sliding-window group (1) loads one chunk (key 4) before the window
+        # its lookup checked (keys 5-6). With key 4 gone, recording key 4 alone
+        # would leave the window a hit and the same load offered again.
+        other = _group_key(0, group_idx=0)
+        lead, *window = [_group_key(n, group_idx=1) for n in (4, 5, 6)]
+        for key in (other, *window):
+            seed_host_entries(self.store, key)
+        self.manager.on_new_request(_ctx("r1"))
+        spec = self.manager.prepare_load([other, lead, *window], _ctx("r1"))
+        self.assertFalse(spec.pinned)
+        self.assertEqual(self.manager.lookup(other, _ctx("r1")), LookupResult.HIT)
+        for key in window:
+            self.assertEqual(self.manager.lookup(key, _ctx("r1")), LookupResult.MISS)
+            self.assertEqual(self.manager.lookup(key, _ctx("r2")), LookupResult.HIT)
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+    def test_pin_failure_records_nothing_for_an_unknown_request(self):
+        self.manager.prepare_load([_key(0), _key(5)], _ctx("r1"))
+        self.assertEqual(self.manager._unloadable, {})
+
+    def test_request_is_not_offered_a_load_whose_launch_failed_again(self):
+        # load() refuses the launch; the HOST entries stay intact, so without
+        # a record r1's next lookup would offer the same load again.
+        self.manager.on_new_request(_ctx("r1"))
+        self.store.fail_load = True
+        self.manager.prepare_load([_key(0), _key(1)], _ctx("r1"))
+        self.manager.submit_load_job(3, [_key(0), _key(1)], [10, 11], "r1")
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertFalse(finished_job.success)
+        self.assertEqual(self.manager.lookup(_key(0), _ctx("r1")), LookupResult.MISS)
+        self.assertEqual(self.manager.lookup(_key(1), _ctx("r1")), LookupResult.MISS)
+        self.assertEqual(self.manager.lookup(_key(0), _ctx("r2")), LookupResult.HIT)
+        self.manager.on_request_finished(_ctx("r1"))
+        self.assertEqual(self.manager.lookup(_key(0), _ctx("r1")), LookupResult.HIT)
+
+    def test_request_is_not_offered_the_failed_part_of_a_polled_load_again(self):
+        # Only the second key's transfer fails. The first precedes it in the
+        # same KV cache group, so r1 may still load it.
+        keys = [_group_key(n, group_idx=0) for n in range(2)]
+        for key in keys:
+            seed_host_entries(self.store, key)
+        self.manager.on_new_request(_ctx("r1"))
+        self.manager.prepare_load(keys, _ctx("r1"))
+        self.manager.submit_load_job(3, keys, [10, 11], "r1")
+        self.store.complete_load(sub_hashes(keys[0]))
+        self.store.complete_load(sub_hashes(keys[1]), success=False)
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertFalse(finished_job.success)
+        self.assertEqual(self.manager.lookup(keys[0], _ctx("r1")), LookupResult.HIT)
+        self.assertEqual(self.manager.lookup(keys[1], _ctx("r1")), LookupResult.MISS)
+        self.assertEqual(self.manager.lookup(keys[1], _ctx("r2")), LookupResult.HIT)
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+    def test_failed_transfer_marks_the_rest_of_its_group(self):
+        # Only the transfer of key 4 (the chunk a sliding-window group loads
+        # before its checked window, keys 5-6) fails. The window is recorded
+        # with it; group 0, whose transfer landed, stays loadable.
+        other = _group_key(0, group_idx=0)
+        lead, *window = [_group_key(n, group_idx=1) for n in (4, 5, 6)]
+        keys = [other, lead, *window]
+        for key in keys:
+            seed_host_entries(self.store, key)
+        self.manager.on_new_request(_ctx("r1"))
+        self.manager.prepare_load(keys, _ctx("r1"))
+        self.manager.submit_load_job(3, keys, [10, 11, 12, 13], "r1")
+        for key in keys:
+            self.store.complete_load(sub_hashes(key), success=key != lead)
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertFalse(finished_job.success)
+        self.assertEqual(self.manager.lookup(other, _ctx("r1")), LookupResult.HIT)
+        self.assertEqual(self.manager._unloadable, {"r1": {lead, *window}})
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+    def test_load_failing_after_its_request_finished_records_nothing(self):
+        # vLLM signals on_request_finished while a load may still be in
+        # flight; its later failure must not leave a record nobody clears.
+        self.manager.on_new_request(_ctx("r1"))
+        self.manager.prepare_load([_key(0)], _ctx("r1"))
+        self.manager.submit_load_job(3, [_key(0)], [10], "r1")
+        self.manager.on_request_finished(_ctx("r1"))
+        self.store.complete_load(sub_hashes(_key(0)), success=False)
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertFalse(finished_job.success)
+        self.assertEqual(self.manager._unloadable, {})
 
 
 class TestTouchAndMisc(unittest.TestCase):
@@ -1914,6 +2033,38 @@ class TestRemoteReadFlow(unittest.TestCase):
         for h in sub_hashes(key):
             self.assertNotIn(h, self.store.entries)
             self.assertIn(h, self.store.global_entries)
+
+    def test_request_is_not_offered_a_peer_read_whose_launch_failed_again(self):
+        # The registry still names the peer after a failed launch.
+        key = _key(1)
+        seed_global_entries(self.store, key)
+        self.manager.on_new_request(_ctx("r1"))
+        self.assertEqual(self.manager.lookup(key, _ctx("r1")), LookupResult.HIT)
+        self.manager.prepare_load([key], _ctx("r1"))
+        self.store.fail_read_remote = True
+        self.manager.submit_load_job(7, [key], [5], "r1")
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertFalse(finished_job.success)
+        self.assertEqual(self.manager.lookup(key, _ctx("r1")), LookupResult.MISS)
+        self.assertEqual(self.manager.lookup(key, _ctx("r2")), LookupResult.HIT)
+
+    def test_mixed_job_marks_only_the_peer_keys_whose_read_failed(self):
+        # The local key precedes the failed peer key in the same KV cache
+        # group, so it stays loadable.
+        local_key, remote_key = (_group_key(n, group_idx=0) for n in (1, 2))
+        seed_host_entries(self.store, local_key)
+        seed_global_entries(self.store, remote_key)
+        self.manager.on_new_request(_ctx("r1"))
+        self.manager.lookup(local_key, _ctx("r1"))
+        self.manager.lookup(remote_key, _ctx("r1"))
+        self.manager.prepare_load([local_key, remote_key], _ctx("r1"))
+        self.manager.submit_load_job(7, [local_key, remote_key], [5, 6], "r1")
+        self.store.complete_load(sub_hashes(local_key))
+        self.store.complete_remote_read(sub_hashes(remote_key), success=False)
+        (finished_job,) = self.manager.poll_finished_jobs()
+        self.assertFalse(finished_job.success)
+        self.assertEqual(self.manager.lookup(local_key, _ctx("r1")), LookupResult.HIT)
+        self.assertEqual(self.manager.lookup(remote_key, _ctx("r1")), LookupResult.MISS)
 
     def test_stale_stash_degenerates_to_local_load(self):
         # Keys promoted to local before prepare_load are routed to load() instead of
