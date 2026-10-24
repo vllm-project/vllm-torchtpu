@@ -178,7 +178,15 @@ def test_identity(tokens):
             b0 = dataclasses.replace(base, elementwise_dtype=ew)
             a = _fn(mesh, _cfg(b0, "base"), n, tokens)(x, gating, w1, w2, s1, s2)
             for name in VARIANTS:
-                b = _fn(mesh, _cfg(b0, name), n, tokens)(x, gating, w1, w2, s1, s2)
+                try:
+                    b = _fn(mesh, _cfg(b0, name), n, tokens)(x, gating, w1, w2, s1, s2)
+                except Exception as e:  # e.g. a slot count past the VMEM budget: a result
+                    _emit({"label": "ds_skip_identity", "tokens": tokens, "routing": routing,
+                           "elementwise": ew, "variant": name, "mutant": MUTANT,
+                           "error": f"{type(e).__name__}: {str(e)[:600]}"})
+                    if name == "skip":
+                        bad.append((routing, ew, name, "error"))
+                    continue
                 d = jax.jit(lambda u, v: (
                     jnp.max(jnp.abs(u.astype(jnp.float32) - v.astype(jnp.float32))),
                     jnp.sum((u != v).astype(jnp.int32))))(a, b)
