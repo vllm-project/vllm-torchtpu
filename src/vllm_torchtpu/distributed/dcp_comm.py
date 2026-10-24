@@ -17,7 +17,80 @@ from __future__ import annotations
 
 from typing import Any, Literal, overload
 
+import jax
+import jax.numpy as jnp
 import torch
+from torch_tpu._internal import pallas
+
+
+def _jax_dcp_rescale_and_transpose(
+    output: jax.Array,
+    lse: jax.Array,
+    merged_lse: jax.Array,
+) -> jax.Array:
+    """Fused rescale, NaN-safe masking, downcast, and transpose for DCP merge."""
+    weight = jnp.exp(lse - merged_lse)[..., None]
+    weighted = output.astype(jnp.float32) * weight
+    weighted = jnp.where(weight > 0, weighted, 0.0).astype(output.dtype)
+    return jnp.swapaxes(weighted, 0, 1)
+
+
+_dcp_rescale_and_transpose_op = pallas.jax_op(
+    "pallas::dcp_rescale_and_transpose",
+    _jax_dcp_rescale_and_transpose,
+)
+
+
+def _fake_dcp_rescale_and_transpose(
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    merged_lse: torch.Tensor,
+) -> torch.Tensor:
+    num_tokens, num_heads, head_dim = output.shape
+    return torch.empty(
+        (num_heads, num_tokens, head_dim),
+        dtype=output.dtype,
+        device=output.device,
+    )
+
+
+_dcp_rescale_and_transpose_op.register_fake(_fake_dcp_rescale_and_transpose)
+
+
+def _jax_dcp_rescale_and_transpose_f32(
+    output: jax.Array,
+    lse: jax.Array,
+    merged_lse: jax.Array,
+) -> jax.Array:
+    """Fused rescale, NaN-safe masking, and transpose in float32 for DCP merge."""
+    weight = jnp.exp(lse - merged_lse)[..., None]
+    weighted = output.astype(jnp.float32) * weight
+    weighted = jnp.where(weight > 0, weighted, 0.0)
+    return jnp.swapaxes(weighted, 0, 1)
+
+
+_dcp_rescale_and_transpose_f32_op = pallas.jax_op(
+    "pallas::dcp_rescale_and_transpose_f32",
+    _jax_dcp_rescale_and_transpose_f32,
+)
+
+
+def _fake_dcp_rescale_and_transpose_f32(
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    merged_lse: torch.Tensor,
+) -> torch.Tensor:
+    num_tokens, num_heads, head_dim = output.shape
+    return torch.empty(
+        (num_heads, num_tokens, head_dim),
+        dtype=torch.float32,
+        device=output.device,
+    )
+
+
+_dcp_rescale_and_transpose_f32_op.register_fake(
+    _fake_dcp_rescale_and_transpose_f32
+)
 
 
 @overload
@@ -72,17 +145,38 @@ def cp_lse_ag_out_rs(
     lses = group.all_gather(lse.unsqueeze(0).contiguous(), dim=0)
     merged_lse = torch.logsumexp(lses, dim=0)
 
-    # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
-    weight = torch.exp(lse - merged_lse).unsqueeze(-1)
-    weighted = output.to(torch.float32) * weight
-    weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
+    if output.device.type == "tpu":
+        # Fused JAX XLA op computes weights, NaN-masks, downcasts, and transposes
+        # to [H * group, T, D] in a single pass to eliminate intermediate HBM
+        # writes and relayout overhead. Reduce-scatter on dim=0 scatters the
+        # leading head dimension directly.
+        if rs_dtype is not None:
+            weighted = _dcp_rescale_and_transpose_op(output, lse, merged_lse)
+            if weighted.dtype != rs_dtype:
+                weighted = weighted.to(rs_dtype)
+        else:
+            weighted = _dcp_rescale_and_transpose_f32_op(output, lse, merged_lse)
+        merged = (
+            group.reduce_scatter(weighted.contiguous(), dim=0)
+            .to(output.dtype)
+            .transpose(0, 1)
+            .contiguous()
+        )
+    else:
+        # CPU / non-TPU fallback
+        # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
+        weight = torch.exp(lse - merged_lse).unsqueeze(-1)
+        weighted = output.to(torch.float32) * weight
+        weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
 
-    if rs_dtype is not None:
-        weighted = weighted.to(rs_dtype)
-    merged = group.reduce_scatter(weighted.contiguous(), dim=1).to(output.dtype)
+        if rs_dtype is not None:
+            weighted = weighted.to(rs_dtype)
+        merged = group.reduce_scatter(weighted.contiguous(), dim=1).to(output.dtype)
+
     if not return_lse:
         return merged
 
     heads = merged.shape[1]
     start = int(group.rank_in_group) * heads
     return merged, merged_lse[:, start : start + heads]
+
