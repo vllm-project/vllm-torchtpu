@@ -236,8 +236,10 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
                 dma_entry.wb_hbm[...] = dst_hbm
                 dma_entry.set_flags(dma_sz, wb_val)
 
-        if cfgs.bkv_p_new < cfgs.bkv_p:
-            # General decode path for any bkv_p_new
+        if cfgs.bkv_p_new < cfgs.bkv_p or (
+            cfgs.mode == configs.RpaCase.DECODE and cfgs.serve.decode_query_size >= 1
+        ):
+            # General decode path for any bkv_p_new (including decode_query_size=1)
             curr_vmem = bkv_sz_cache
             curr_rem = new_sz
 

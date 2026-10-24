@@ -112,6 +112,7 @@ def _pallas_rpa_kernel_dcp(
     """
     import jax.numpy as jnp
 
+    decode_query_size = max(int(decode_query_size), 1)
     cp_rank_arr = jnp.array([cp_rank_val], dtype=jnp.int32)
     output, new_kv_cache, lse = _batched_rpa_wrapper.ragged_paged_attention(
         queries=query,
@@ -211,6 +212,7 @@ def build_dcp_kernels(
     # The adapter uses batched_rpa's equivalent enum. Normalize here so both
     # entry points bind LONGCTX's enum and share ops for the same layout.
     kv_layout = _batched_rpa_configs.KVLayout(kv_layout)
+    decode_query_size = max(int(decode_query_size), 1)
     base_key = (
         sliding_window,
         sm_scale,
