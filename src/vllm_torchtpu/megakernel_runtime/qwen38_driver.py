@@ -324,6 +324,7 @@ class Qwen38SegmentDriver:
         self.cfg = None
         self.seq = 0  # try_forward calls, to compare the step sequence across ranks
         self.mk_calls = 0
+        self.sync = False  # `sync=1`: wait for the first calls' outputs and log it (bisecting)
 
     @classmethod
     def maybe_create(cls, runner: Any) -> Qwen38SegmentDriver | None:
@@ -359,6 +360,7 @@ class Qwen38SegmentDriver:
         if segs is not None:
             drv.segments.mk_segments = segs
         drv.mtp = _parse_flag(raw, "mtp", False)
+        drv.sync = _parse_flag(raw, "sync", False)
         logger.info(
             "Qwen3.8 segment megakernel enabled, verify buckets %s, shadow checks %d, hier %s, rings %s, head %s",
             drv.buckets,
@@ -563,6 +565,16 @@ class Qwen38SegmentDriver:
             return False, None
         if isinstance(out, (list, tuple)):
             out = tuple(out)
+        if self.sync and self.mk_calls <= 4:
+            import time
+
+            from torch_tpu._internal import sync as tpu_sync
+
+            t0 = time.time()
+            tpu_sync.synchronize(list(out) if isinstance(out, tuple) else [out], wait=True)
+            logger.info(
+                "qwen38 megakernel call %d done on device after %.2f s", self.mk_calls, time.time() - t0
+            )
         return True, out
 
 
