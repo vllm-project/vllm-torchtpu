@@ -94,6 +94,7 @@ if TYPE_CHECKING:
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     TPU_MOE_HIER_RS: str | None = None
+    TPU_MOE_HIER_RS_FP8_STATIC_SCALE: float | None = None
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
@@ -740,7 +741,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_MOE_ROUTER_TOPK", "rowmax", ["sort", "rowmax"]
     ),
     # Remove once hierrs_tc becomes the MoE combine's default or is retired.
-    "TPU_MOE_HIER_RS": env_with_choices("TPU_MOE_HIER_RS", None, ["bf16"]),
+    # fp8 runs every shape on the micro-batched kernel; fp8_stream needs
+    # TPU_MOE_HIER_RS_FP8_STATIC_SCALE.
+    "TPU_MOE_HIER_RS": env_with_choices(
+        "TPU_MOE_HIER_RS", None, ["bf16", "fp8", "fp8_stream"]
+    ),
+    # Unset: per-chunk dynamic scaling. Set: static, calibrated to the model.
+    "TPU_MOE_HIER_RS_FP8_STATIC_SCALE": lambda: (
+        float(v) if (v := os.getenv("TPU_MOE_HIER_RS_FP8_STATIC_SCALE")) else None
+    ),
     # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
     # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
     # program, instead of bracketing the per-rank compute with vLLM's

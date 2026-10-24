@@ -17,6 +17,7 @@ The EP mesh is in ascending device id, but `group.reduce_scatter` hands rank r
 the r-th row block, so mesh index i must receive the block of the rank there.
 """
 
+import functools
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -66,6 +67,9 @@ def make_reduce_scatter_fn(
     order: tuple[int, ...],
     *,
     axis_name: str,
+    fp8_comm: bool = False,
+    fp8_static_scale: float | None = None,
+    fp8_min_rows: int | None = None,
     stream: bool = True,
     stream_min_rows: int = STREAM_MIN_ROWS,
 ):
@@ -92,12 +96,27 @@ def make_reduce_scatter_fn(
         blocks = part.reshape(num_devices, rows // num_devices, hidden)
         return blocks[perm].reshape(rows, hidden)
 
+    stream_fn = None
+    if stream and not fp8_comm:
+        stream_fn = reduce_scatter_stream_local
+    elif stream and fp8_static_scale is not None:
+        stream_fn = functools.partial(
+            reduce_scatter_stream_local,
+            fp8_comm=True,
+            fp8_static_scale=fp8_static_scale,
+        )
+
     def local(part: jax.Array) -> jax.Array:
         rows = part.shape[0]
-        if stream and rows >= stream_min_rows and supports_stream(rows):
-            return reduce_scatter_stream_local(part, axis_name=axis_name, order=order)
+        if stream_fn is not None and rows >= stream_min_rows and supports_stream(rows):
+            return stream_fn(part, axis_name=axis_name, order=order)
         return hierarchical_reduce_scatter_local(
-            permute(part), num_devices=num_devices, axis_name=axis_name
+            permute(part),
+            num_devices=num_devices,
+            axis_name=axis_name,
+            fp8_comm=fp8_comm,
+            fp8_static_scale=fp8_static_scale,
+            fp8_min_rows=fp8_min_rows,
         )
 
     def reduce_scatter(x: jax.Array) -> jax.Array:
@@ -142,7 +161,14 @@ def prebuild_hier_reduce_scatter() -> bool:
     order = ep_rank_order()
     ep = get_ep_group()
     assert mesh is not None and order is not None and ep is not None
-    reduce_scatter = make_reduce_scatter_fn(mesh, order, axis_name=EP_AXIS_NAME)
+    reduce_scatter = make_reduce_scatter_fn(
+        mesh,
+        order,
+        axis_name=EP_AXIS_NAME,
+        fp8_comm=wire in ("fp8", "fp8_stream"),
+        fp8_static_scale=envs.TPU_MOE_HIER_RS_FP8_STATIC_SCALE,
+        stream=wire != "fp8",
+    )
     op = sharded_jax_op(
         OP_NAME,
         reduce_scatter,
@@ -155,9 +181,10 @@ def prebuild_hier_reduce_scatter() -> bool:
     _ARMED = _Armed(op=op, ranks=tuple(int(r) for r in ep.ranks))
     logger.info_once(
         "MoE combine reduce-scatter runs on hierrs_tc: %d devices, wire=%s, "
-        "rank at each mesh index=%s.",
+        "fp8 static scale=%s, rank at each mesh index=%s.",
         num_devices,
         wire,
+        envs.TPU_MOE_HIER_RS_FP8_STATIC_SCALE,
         order,
     )
     return True

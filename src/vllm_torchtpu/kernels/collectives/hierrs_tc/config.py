@@ -20,29 +20,41 @@ import jax
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 
+FP8_E4M3_MAX = 448.0
+# 128 f32 lanes = 512 B, the minimum DMA inner slice.
+SCALE_LANE = 128
+# Per-device rows before the scatter; below this FP8's quantize cost outweighs
+# the halved wire bytes on tpu7x-8.
+FP8_COMM_MIN_ROWS = 2048
+
 
 def next_multiple_of(val: int, multiple: int) -> int:
     return ((val + multiple - 1) // multiple) * multiple
 
 
-_MB_STAGE_TARGET_BYTES = 2 << 20
+# The FP8 wire pays a fixed quantize/staging cost per micro-batch, so it wants
+# fewer, larger stages.
+_MB_STAGE_TARGET_BYTES = {False: 2 << 20, True: 8 << 20}  # by fp8_comm
 # Above this, hc_chunk_size shrinks to a single vector width at hidden 4096.
 _MAX_MICRO_BATCHES = 8
 # At one micro-batch the kernel can return the previous call's result: nothing
 # orders an accumulate's write of running_sum_ref before the next phase-2
 # start reads it, and a second iteration hides that by timing. Only visible
-# with a fresh input per call.
+# with a fresh input per call. On the FP8 wire the quantize pass sits between
+# the two instead; re-validate mb=1 if it moves.
 _MIN_SAFE_MICRO_BATCHES = 2
 _MIN_LANES_PER_HC_CHUNK = 512
 
 
 def pick_num_micro_batches(
-    local_seq_len: int, hidden_dim_size: int, itemsize: int
+    local_seq_len: int, hidden_dim_size: int, itemsize: int, fp8_comm: bool
 ) -> int:
-    stages = (local_seq_len * hidden_dim_size * itemsize) // _MB_STAGE_TARGET_BYTES
+    stage_bytes = _MB_STAGE_TARGET_BYTES[bool(fp8_comm)]
+    stages = (local_seq_len * hidden_dim_size * itemsize) // stage_bytes
     mb = 1 << max(0, stages.bit_length() - 1)
     mb = min(mb, max(1, hidden_dim_size // _MIN_LANES_PER_HC_CHUNK))
-    mb = max(mb, _MIN_SAFE_MICRO_BATCHES)
+    if not fp8_comm:
+        mb = max(mb, _MIN_SAFE_MICRO_BATCHES)
     return int(min(max(mb, 1), _MAX_MICRO_BATCHES))
 
 
@@ -65,6 +77,10 @@ class Config:
     hidden_dim_size: int
     local_seq_len: int  # after padding
     dtype: jnp.dtype
+    fp8_comm: bool = False
+    # None: per-chunk dynamic scale. 16 is calibrated for Qwen3.5-397B: its
+    # range (448 / 16 = 28) is ~2x the largest activation seen.
+    fp8_static_scale: float | None = None
     _num_micro_batches: int | None = None
 
     def __post_init__(self):
@@ -104,6 +120,7 @@ class Config:
             self.local_seq_len,
             self.hidden_dim_size,
             jnp.dtype(self.dtype).itemsize,
+            self.fp8_comm,
         )
 
     @property
@@ -129,3 +146,8 @@ class Config:
     @property
     def packing_factor(self) -> int:
         return 4 // jnp.dtype(self.dtype).itemsize
+
+    @property
+    def skip_scale_dma(self) -> bool:
+        # A static scale is a constant on both ends, so it is never sent.
+        return self.fp8_comm and self.fp8_static_scale is not None
