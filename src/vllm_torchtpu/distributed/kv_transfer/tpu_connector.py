@@ -3962,12 +3962,12 @@ class TPURaidenConnectorWorker:
             )
         if tp_size == 1 and pcp_size == 1 and dp_size == 1 and pp_size in (2, 4, 8):
             return f"pp{pp_size}_decode"
-        if pcp_size != 1 or tp_size not in (1, 2) or dp_size not in (2, 4, 8, 16):
+        if pcp_size != 1 or tp_size not in (1, 2, 4) or dp_size not in (2, 4, 8, 16):
             raise ValueError(
                 "Raiden Qwen3.5 admission topology dp{N}_decode or "
-                "dp{N}tp2_decode requires kv_consumer with "
+                "dp{N}tp{2,4}_decode requires kv_consumer with "
                 "prefill_context_parallel_size=1, tensor_parallel_size in "
-                "(1, 2), data_parallel_size in (2, 4, 8, 16); got "
+                "(1, 2, 4), data_parallel_size in (2, 4, 8, 16); got "
                 f"prefill_context_parallel_size={pcp_size}, "
                 f"tensor_parallel_size={tp_size}, "
                 f"data_parallel_size={dp_size}"
