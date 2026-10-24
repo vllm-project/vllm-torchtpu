@@ -464,21 +464,37 @@ def recurrent_gdn(
     out_list = []
     new_state_list = []
 
-    for idx in range(cfg.seq_tile_size):
-        out, state = recurrent_gdn_per_seq(
-            q_compact[idx],
-            k_compact[idx],
-            k_compact_t[idx],
-            v_compact[idx],
-            gating_log[idx],
-            beta[idx],
-            state_prev[idx],
-            cfg,
-        )
-        out_list.append(out)
-        new_state_list.append(state)
+    batch_dot_dims = (((3,), (2,)), ((0, 1), (0, 1)))
+    state = state_prev
+    for c_idx in range(cfg.chunk_size):
+        q_curr = jnp.repeat(q_compact[:, :, c_idx], cfg.v_per_kq_head, axis=1)
+        k_curr = jnp.repeat(k_compact[:, :, c_idx], cfg.v_per_kq_head, axis=1)
+        v_curr = v_compact[:, :, c_idx]
+        k_curr_t = jnp.repeat(k_compact_t[:, :, c_idx], cfg.v_per_kq_head, axis=1)
+        beta_curr = beta[:, :, c_idx]
+        gating_curr = gating_log[:, :, c_idx]
 
-    out = jnp.stack(out_list, axis=0)
-    new_recurrent_state = jnp.stack(new_state_list, axis=0)
+        state_updated = state * gating_curr
+        v_updated = jax.lax.dot_general(
+            k_curr,
+            state_updated,
+            dimension_numbers=batch_dot_dims,
+            preferred_element_type=jnp.float32,
+        ).astype(cfg.dtypes.compute)
+        v_diff = v_curr - v_updated
+        v_new = beta_curr * v_diff
+        state = state_updated + k_curr_t * v_new
+        out = jax.lax.dot_general(
+            q_curr,
+            state,
+            dimension_numbers=batch_dot_dims,
+            preferred_element_type=jnp.float32,
+        ).astype(cfg.dtypes.compute)
+        out_list.append(out[:, :, 0, :])
+        if c_idx >= cfg.chunk_size - cfg.window_size:
+            new_state_list.append(state)
+
+    out = jnp.stack(out_list, axis=1)
+    new_recurrent_state = jnp.stack(new_state_list, axis=1)
 
     return out, new_recurrent_state

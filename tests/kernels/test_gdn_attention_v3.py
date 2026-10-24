@@ -1651,3 +1651,89 @@ class GDNAttentionTest(parameterized.TestCase):
                     np.testing.assert_allclose(
                         rec_out[slot], rec_ref[slot], rtol=3e-2, atol=3e-2
                     )
+
+    def test_recurrent_gdn_batched_matches_per_seq_reference(self):
+        from types import SimpleNamespace
+
+        from vllm_torchtpu.kernels.gdn.v3 import compute_gdn as cg
+
+        cfg = SimpleNamespace(
+            seq_tile_size=8,
+            chunk_size=4,
+            window_size=4,
+            num_k_heads=2,
+            num_v_heads=6,
+            v_per_kq_head=3,
+            kq_head_dim=128,
+            v_head_dim=128,
+            dtypes=SimpleNamespace(compute=jnp.float32),
+        )
+        rng = jax.random.PRNGKey(7)
+        k1, k2, k3, k4, k5, k6, k7 = jax.random.split(rng, 7)
+        real_sizes = jnp.array([4, 3, 4, 2, 4, 1, 4, 4], dtype=jnp.int32)
+        q = jax.random.normal(k1, (8, 2, 4, 1, 128), dtype=jnp.bfloat16)
+        k = jax.random.normal(k2, (8, 2, 4, 1, 128), dtype=jnp.bfloat16)
+        v = jax.random.normal(k3, (8, 6, 4, 1, 128), dtype=jnp.bfloat16)
+        b = jax.random.normal(k4, (8, 1, 4, 1, 8), dtype=jnp.float32)
+        a = jax.random.normal(k5, (8, 1, 4, 1, 8), dtype=jnp.float32)
+        a_log = jax.random.normal(k6, (1, 1, 1, 1, 8), dtype=jnp.float32)
+        dt_bias = jax.random.normal(k7, (1, 1, 1, 1, 8), dtype=jnp.float32)
+        state_prev = jnp.ones((8, 6, 128, 128), dtype=jnp.float32) * 0.05
+
+        out_batched, state_batched = cg.recurrent_gdn(
+            real_sizes, q, k, v, b, a, state_prev, a_log, dt_bias, cfg
+        )
+
+        mask_dtype = cg.get_mask_dtype(cfg.dtypes.compute)
+        iota = jax.lax.broadcasted_iota(
+            mask_dtype, (cfg.seq_tile_size, 1, cfg.chunk_size, 1, 1), 2
+        )
+        mask = iota < real_sizes.reshape(-1, 1, 1, 1, 1).astype(mask_dtype)
+        q_c = cg.l2_norm(jnp.where(mask, q.astype(cfg.dtypes.compute), 0)) * (
+            cfg.kq_head_dim**-0.5
+        )
+        k_c = cg.l2_norm(jnp.where(mask, k.astype(cfg.dtypes.compute), 0))
+        k_c_t = cg.fused_transpose_broadcast(k_c, src_dim=4, dst_dim=3)
+        v_c = jnp.where(mask, v.astype(cfg.dtypes.compute), 0)
+        beta_c = jnp.where(mask, jax.nn.sigmoid(b.astype(cfg.dtypes.compute)), 0)
+        gating_c = jnp.exp(
+            jnp.where(
+                mask,
+                -jnp.exp(a_log)
+                * jax.nn.softplus(a.astype(cfg.dtypes.compute) + dt_bias),
+                0,
+            )
+        )
+        beta_c = cg.fused_transpose_broadcast(beta_c, src_dim=4, dst_dim=1)[
+            :, : cfg.num_v_heads
+        ]
+        gating_c = cg.fused_transpose_broadcast(gating_c, src_dim=4, dst_dim=1)[
+            :, : cfg.num_v_heads
+        ]
+        ref_outs, ref_states = zip(
+            *[
+                cg.recurrent_gdn_per_seq(
+                    q_c[idx],
+                    k_c[idx],
+                    k_c_t[idx],
+                    v_c[idx],
+                    gating_c[idx],
+                    beta_c[idx],
+                    state_prev[idx],
+                    cfg,
+                )
+                for idx in range(cfg.seq_tile_size)
+            ]
+        )
+        np.testing.assert_allclose(
+            np.asarray(out_batched, np.float32),
+            np.asarray(jnp.stack(ref_outs, axis=0), np.float32),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        np.testing.assert_allclose(
+            np.asarray(state_batched, np.float32),
+            np.asarray(jnp.stack(ref_states, axis=0), np.float32),
+            rtol=1e-5,
+            atol=1e-5,
+        )
