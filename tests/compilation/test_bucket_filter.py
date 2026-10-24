@@ -19,7 +19,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.forward_context import set_forward_context
 
-from vllm_torchtpu.compilation import bucket_filter
+from vllm_torchtpu.compilation import bucket_filter, shape_variants
 
 TP = 8
 # 960: under the floor. 1040: over it, but its shard is not row-aligned.
@@ -58,27 +58,32 @@ class Sharded(nn.Module):
 
 
 class Router(nn.Module):
-    """Qwen4ExpForCausalLM.forward's routing, with the real eligibility rule."""
+    """Qwen4ExpForCausalLM's routing, with the real eligibility rule."""
 
     def __init__(self, config: VllmConfig) -> None:
         super().__init__()
         from vllm_torchtpu.models.vllm.qwen4_exp import sequence_parallel as sp
 
-        self.sp = sp
         with set_current_vllm_config(config):
-            self.replicated = Replicated(vllm_config=config)
-            self.sharded = Sharded(vllm_config=config, backbone=self.replicated)
+            self.replicated, self.sharded = self.build(config)
+        eligible = partial(sp.sequence_parallel_eligible, tp_size=TP)
+        bucket_filter.assign(self.sharded, eligible)
+        bucket_filter.assign(self.replicated, lambda n: not eligible(n))
+
+    def build(self, config: VllmConfig) -> tuple[nn.Module, nn.Module]:
+        replicated = Replicated(vllm_config=config)
+        return replicated, Sharded(vllm_config=config, backbone=replicated)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        eligible = partial(self.sp.sequence_parallel_eligible, tp_size=TP)
-        if eligible(x.shape[0]):
-            with bucket_filter.serving(eligible), set_model_tag("sharded"):
+        serves_sharded = bucket_filter.assigned(self.sharded)
+        if serves_sharded(x.shape[0]):
+            with bucket_filter.serving(serves_sharded), set_model_tag("sharded"):
                 return self.sharded(x)
-        with bucket_filter.serving(lambda n: not eligible(n)):
+        with bucket_filter.serving(bucket_filter.assigned(self.replicated)):
             return self.replicated(x)
 
 
-def _prepare(cache_root):
+def _prepare(cache_root, router=Router):
     os.environ["QWEN4_EXP_PREFILL_SP"] = "1"
     os.environ["QWEN4_EXP_PREFILL_SP_MIN_TOKENS"] = "1024"
     sv.BUCKETS[:] = BUCKETS
@@ -86,7 +91,7 @@ def _prepare(cache_root):
 
     vllm_torchtpu._patch_vllm_bucket_filter()
     config, backend = sv.prepare(cache_root)
-    return config, backend, Router(config)
+    return config, backend, router(config)
 
 
 def _serve_all(router, config):
@@ -135,6 +140,66 @@ def _one_copy_of_the_weights(cache_root):
 
 def test_the_sharded_graph_registers_no_second_copy_of_the_weights(tmp_path):
     sv.in_child(partial(_one_copy_of_the_weights, str(tmp_path)))
+
+
+@support_torch_compile(dynamic_arg_dims={"x": 0})
+class TieredReplicated(nn.Module):
+    """Branches on the token count, so the ladder retraces it at 960."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        waves = 2 if x.shape[0] >= 512 else 1
+        return torch.cat([sv.WAVE(chunk) for chunk in torch.chunk(x, waves)])
+
+
+@support_torch_compile(dynamic_arg_dims={"x": 0})
+class TieredSharded(nn.Module):
+    """Branches on the shard length, so the ladder retraces it at 4096 -- the
+    last bucket, after the replicated module's last one."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        tokens = x.shape[0]
+        torch._check(tokens % TP == 0)
+        shards = x.reshape(TP, tokens // TP, x.shape[1]).unbind(0)
+        per_shard = 2 if tokens // TP >= 512 else 1
+        return torch.cat([sv.WAVE(s) for s in shards for _ in range(per_shard)])
+
+
+class TieredRouter(Router):
+    def build(self, config: VllmConfig) -> tuple[nn.Module, nn.Module]:
+        return TieredReplicated(vllm_config=config), TieredSharded(vllm_config=config)
+
+
+def _ladder(router, config):
+    """TPUModelRunner._precompile_backbone over the router."""
+    with set_current_vllm_config(config), shape_variants.warmup() as tracked:
+        for bucket in BUCKETS:
+            if tracked.needs_retrace(bucket):
+                shape_variants.retrace(router, config, bucket)
+            with set_forward_context({}, config):
+                router(torch.zeros(bucket, sv.HIDDEN))
+        assert not tracked.refused
+
+
+def _a_retrace_keeps_the_other_graph(cache_root):
+    config, backend, router = _prepare(cache_root, TieredRouter)
+    _ladder(router, config)
+    compiled = list(backend.compiled)
+    # Served after the ladder (spec-decode warmup, decode): no new trace.
+    served = _serve_all(router, config)
+    assert backend.compiled == compiled, backend.compiled[len(compiled) :]
+    expected = {16: 1, 960: 2, 1040: 2, 2048: TP, 4096: 2 * TP}
+    assert served == {b: (b, w) for b, w in expected.items()}, served
+    assert sorted(compiled) == sorted(served.values()), compiled
+
+
+def test_a_retrace_for_one_graph_keeps_the_other_graph_live(tmp_path):
+    sv.in_child(partial(_a_retrace_keeps_the_other_graph, str(tmp_path)))
 
 
 def test_unfiltered_outside_a_routed_call():

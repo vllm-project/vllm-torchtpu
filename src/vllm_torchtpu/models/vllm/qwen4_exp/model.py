@@ -14,6 +14,7 @@
 """Checkpoint-native text backbone with explicit TPU state/input ownership."""
 
 from collections.abc import Iterable, Sequence
+from functools import partial
 from pathlib import Path
 from typing import cast
 
@@ -816,11 +817,28 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         self.pd_gdn_qk_pair_layout = envs.TPU_GDN_CONV_QK_PAIR_LAYOUT
         self.config = vllm_config.model_config.hf_text_config
         self.model = Qwen4ExpBackbone(vllm_config)
-        self.model_sp = (
-            Qwen4ExpBackboneSP(vllm_config=vllm_config, backbone=self.model)
-            if sp.enabled(sp.tp_world_size())
-            else None
-        )
+        self.model_sp = None
+        tp_size = sp.tp_world_size()
+        if sp.enabled(tp_size):
+            self.model_sp = Qwen4ExpBackboneSP(
+                vllm_config=vllm_config, backbone=self.model
+            )
+            rows = sp.shard_rows(
+                tile
+                for hc in self.model.modules()
+                if isinstance(hc, GatedResidual)
+                for tile in (
+                    2 * hc.prefill_full_tile,
+                    hc.prefill_up_tile,
+                    hc.prefill_norm_tile,
+                )
+            )
+            eligible = partial(
+                sp.sequence_parallel_eligible, tp_size=tp_size, rows=rows
+            )
+            # One rule for the router, both bucket filters and retraces.
+            bucket_filter.assign(self.model_sp, eligible)
+            bucket_filter.assign(self.model, lambda n: not eligible(n))
         self.lm_head = ParallelLMHead(
             self.config.vocab_size, self.config.hidden_size, prefix="lm_head"
         )
@@ -830,18 +848,11 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         # The route reads the padded bucket size outside both compiled graphs.
         if self.model_sp is None:
             return self.model(input_ids, positions, inputs_embeds, **kwargs)
-        tp_size = sp.tp_world_size()
-        if sp.sequence_parallel_eligible(input_ids.shape[0], tp_size):
-            with (
-                bucket_filter.serving(
-                    lambda n: sp.sequence_parallel_eligible(n, tp_size)
-                ),
-                set_model_tag("backbone_sp"),
-            ):
+        serves_sp = bucket_filter.assigned(self.model_sp)
+        if serves_sp(input_ids.shape[0]):
+            with bucket_filter.serving(serves_sp), set_model_tag("backbone_sp"):
                 return self.model_sp(input_ids, positions, inputs_embeds, **kwargs)
-        with bucket_filter.serving(
-            lambda n: not sp.sequence_parallel_eligible(n, tp_size)
-        ):
+        with bucket_filter.serving(bucket_filter.assigned(self.model)):
             return self.model(input_ids, positions, inputs_embeds, **kwargs)
 
     def embed_input_ids(self, input_ids):
