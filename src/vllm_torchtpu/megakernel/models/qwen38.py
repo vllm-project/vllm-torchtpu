@@ -33,7 +33,10 @@ import dataclasses
 from dataclasses import dataclass
 from typing import Any
 
+from ..decls import REQUIRED, _lookup_raw_key
+from ..errors import MegakernelConfigError
 from ..exec_spec import ExecSpec
+from ..model_def import ModelDef, register_model
 from ..modules.gdn import GDNModule
 from ..modules.hc import HCSublayer
 from ..modules.moe import MoEModule
@@ -221,3 +224,104 @@ FULL = Qwen38Geometry()
 TINY = Qwen38Geometry(
     L=8, H=256, NH=6, KH=4, VH=12, E=128, TOPK=4, I=128, IS=128, LOWRANK=64
 )
+
+
+# Qwen38Geometry field -> HF `text_config` key.
+_HF_FIELDS = {
+    "L": "num_hidden_layers",
+    "att_every": "full_attention_interval",
+    "H": "hidden_size",
+    "NH": "num_attention_heads",
+    "NKV": "num_key_value_heads",
+    "HD": "head_dim",
+    "KH": "linear_num_key_heads",
+    "VH": "linear_num_value_heads",
+    "KD": "linear_key_head_dim",
+    "VD": "linear_value_head_dim",
+    "E": "num_experts",
+    "TOPK": "num_experts_per_tok",
+    "I": "moe_intermediate_size",
+    "IS": "shared_expert_intermediate_size",
+    "NHC": "hc_count",
+    "LOWRANK": "hc_lowrank",
+    "eps": "rms_norm_eps",
+    "theta": "rope_theta",
+}
+_FLOAT_FIELDS = ("eps", "theta")
+
+DEFAULT_HF_CONFIG = {
+    **{key: getattr(FULL, f) for f, key in _HF_FIELDS.items()},
+    "partial_rotary_factor": FULL.ROT / FULL.HD,
+}
+QWEN38_FLASH_MODEL_NAME = "qwen3_8_flash"
+
+
+def geometry_from_hf(hf_config: Any) -> Qwen38Geometry:
+    """`Qwen38Geometry` of a Qwen3.8-Flash HF config (or its `text_config`)."""
+    vals: dict[str, Any] = {}
+    for f, key in _HF_FIELDS.items():
+        v = _lookup_raw_key(hf_config, key)
+        if v is REQUIRED:
+            raise MegakernelConfigError(f"Qwen3.8-Flash hf_config has no {key!r}")
+        vals[f] = float(v) if f in _FLOAT_FIELDS else int(v)
+    rot = _lookup_raw_key(hf_config, "partial_rotary_factor")
+    if rot is REQUIRED:
+        raise MegakernelConfigError(
+            "Qwen3.8-Flash hf_config has no 'partial_rotary_factor'"
+        )
+    return Qwen38Geometry(ROT=int(vals["HD"] * float(rot)), **vals)
+
+
+# Qwen3.8 registers one ModelDef per checkpoint family. This is Flash
+# (qwen4_exp: hyper-connections, QSA attention cores outside the kernel). The
+# 2.4T Qwen3.8 MoE, a whole-model Qwen3.5-style ModelDef registered under its
+# Qwen3_5Moe* architectures, sits beside it.
+@register_model(
+    name=QWEN38_FLASH_MODEL_NAME,
+    hf_architectures=("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM"),
+    hf_model_type=("qwen4_exp", "qwen4_exp_text"),
+)
+class Qwen38Flash(ModelDef):
+    """Qwen3.8-Flash-Next: one kernel call per segment between QSA cores."""
+
+    segment_composed = True
+    default_hf_config = DEFAULT_HF_CONFIG
+
+    @classmethod
+    def derive_geometry(
+        cls,
+        hf_config: Any = None,
+        *,
+        moe_tp: bool | None = None,
+        e_slots: int | None = None,
+    ) -> Qwen38Geometry:
+        if moe_tp or e_slots is not None:
+            raise MegakernelConfigError("Qwen3.8-Flash segments are EP-only")
+        return geometry_from_hf(cls._effective_hf_config(hf_config))
+
+    @classmethod
+    def to_model_spec(
+        cls,
+        hf_config_or_geom: Any = None,
+        *,
+        gdn_module: Any = None,
+        moe_tp: bool | None = None,
+        e_slots: int | None = None,
+        R: int = 8,
+        L: int = SEGMENT_LAYERS,
+        head: bool = False,
+    ) -> ModelSpec:
+        """`ModelSpec` of one segment kernel; see `segment_spec`."""
+        if gdn_module is not None:
+            raise MegakernelConfigError("Qwen3.8-Flash segments pick their GDN")
+        g = hf_config_or_geom
+        if not isinstance(g, Qwen38Geometry):
+            g = cls.derive_geometry(g, moe_tp=moe_tp, e_slots=e_slots)
+        return segment_spec(g, R, L=L, head=head)
+
+    @classmethod
+    def pool_layout(cls, hf_config_or_geom: Any = None, *, R: int) -> Any:
+        raise MegakernelConfigError(
+            "Qwen3.8-Flash segments read the serving model's unified pool; the "
+            "library derives no PoolLayout for them"
+        )

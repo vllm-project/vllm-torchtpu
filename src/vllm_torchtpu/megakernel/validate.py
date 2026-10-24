@@ -159,6 +159,21 @@ def _infer_static_layers(cls: Any, from_hf: FromHF) -> int | None:
     return None
 
 
+def _validate_segment_composed(cls: Any, name: str, base_cls: type) -> None:
+    """A segment-composed model brings its own geometry, specs and pool layout."""
+    for meth in ("derive_geometry", "to_model_spec", "pool_layout"):
+        if getattr(cls, meth).__func__ is getattr(base_cls, meth).__func__:
+            raise MegakernelConfigError(
+                f"register_model({name!r}): a segment-composed model must "
+                f"override {meth}"
+            )
+    if cls.default_hf_config is not None:
+        try:
+            cls.derive_geometry(cls.default_hf_config)
+        except MegakernelConfigError as exc:
+            raise MegakernelConfigError(f"register_model({name!r}): {exc}") from exc
+
+
 def validate_model_def(
     cls: Any,
     name: str,
@@ -173,6 +188,9 @@ def validate_model_def(
         raise MegakernelConfigError(
             f"register_model({name!r}): {cls.__name__} must subclass ModelDef"
         )
+    if getattr(cls, "segment_composed", False):
+        _validate_segment_composed(cls, name, base_cls)
+        return
     from_hf = cls._from_hf_decl()
     for req_key in ("hidden", "layers", "eps"):
         if req_key not in from_hf.fields:

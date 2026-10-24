@@ -20,6 +20,7 @@ from . import (
     qwen35_pool,
     qwen35_profile,
     qwen35_weights,
+    qwen38,
 )
 
 __all__ = [
@@ -29,4 +30,5 @@ __all__ = [
     "qwen35_pool",
     "qwen35_profile",
     "qwen35_weights",
+    "qwen38",
 ]

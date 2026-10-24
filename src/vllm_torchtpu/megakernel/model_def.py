@@ -69,6 +69,12 @@ class ModelDef:
     default_hf_config: ClassVar[Mapping[str, Any] | None] = None
     pool_layout_override: ClassVar[Callable[..., PoolLayout] | None] = None
     geometry_cls: ClassVar[type[ModelGeometry]] = ModelGeometry
+    # A segment-composed model runs as several kernel calls per step (e.g. one
+    # per span between attention cores that run outside the kernel), so it has
+    # no whole-model `schedule`. It overrides `derive_geometry`,
+    # `to_model_spec` and `pool_layout` itself, and whole-model drivers refuse
+    # it.
+    segment_composed: ClassVar[bool] = False
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -121,7 +127,7 @@ class ModelDef:
         *,
         moe_tp: bool | None = None,
         e_slots: int | None = None,
-    ) -> ModelGeometry:
+    ) -> Any:
         """Derive `ModelGeometry` from `cls.geometry`, bindings, and `schedule`."""
         return derive_model_geometry(cls, hf_config, moe_tp=moe_tp, e_slots=e_slots)
 

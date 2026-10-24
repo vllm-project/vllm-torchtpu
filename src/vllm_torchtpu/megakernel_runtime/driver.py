@@ -944,7 +944,13 @@ class MegakernelDriver:
 
     @classmethod
     def _model_def(cls) -> type[ModelDef]:
-        return get_model(cls._model_name)
+        mdef = get_model(cls._model_name)
+        if mdef.segment_composed:
+            raise MegakernelConfigError(
+                f"{mdef.name!r} is segment-composed; {cls.__name__} runs "
+                "whole-model kernels"
+            )
+        return mdef
 
     def __init__(
         self,
