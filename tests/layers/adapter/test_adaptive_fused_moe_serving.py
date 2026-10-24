@@ -115,6 +115,7 @@ def make_layer(fp4):
     layer.routed_scaling_factor = 1.0
     layer.moe_config = SimpleNamespace(
         experts_per_token=2,
+        swiglu_limit=None,
         moe_parallel_config=SimpleNamespace(
             use_ep=True, pcp_size=1, is_sequence_parallel=False
         ),

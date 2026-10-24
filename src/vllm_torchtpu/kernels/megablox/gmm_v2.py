@@ -38,12 +38,26 @@ def swigluoai(
     return (up + 1.0) * glu
 
 
+# DeepSeek-V4's swiglu_limit. The bare "silu_and_mul_with_clamp" activation
+# means this value, so the kernels that only match that name keep working.
+DEFAULT_SWIGLU_CLAMP_LIMIT = 10.0
+_CLAMPED_SILU = "silu_and_mul_with_clamp"
+
+
+def clamped_silu_activation(limit: float) -> str:
+    """Encode a clamped SiLU-and-mul with this limit as an activation string."""
+    if float(limit) == DEFAULT_SWIGLU_CLAMP_LIMIT:
+        return _CLAMPED_SILU
+    return f"{_CLAMPED_SILU}:{float(limit)}"
+
+
 def silu_and_mul_with_clamp(
-    gate: jax.Array, up: jax.Array, limit: float = 10.0
+    gate: jax.Array, up: jax.Array, limit: float = DEFAULT_SWIGLU_CLAMP_LIMIT
 ) -> jax.Array:
-    """Activation used in some models DeepSeek V4."""
-    # The limit value is from DSV4's config.
-    # TODO: pass limit from model config, instead of hardcoding here.
+    """SiLU-and-mul with gate clamped above and up clamped to +-limit."""
+    # TODO: two callers still use the default rather than the model's limit:
+    # the DeepSeek-V4 MXFP4 override (quantization/mxfp4.py) and the fused
+    # EP v2 kernel (kernels/fused_moe/v2/kernel.py _apply_act).
     gate = jnp.clip(gate, max=limit)
     up = jnp.clip(up, min=-limit, max=limit)
     return jax.nn.silu(gate) * up
@@ -114,6 +128,9 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None):
             return swigluoai(acc_gate, acc_up)
         case "silu_and_mul_with_clamp":
             return silu_and_mul_with_clamp(acc_gate, acc_up)
+        case str() if fuse_act.startswith(f"{_CLAMPED_SILU}:"):
+            limit = float(fuse_act.split(":")[1])
+            return silu_and_mul_with_clamp(acc_gate, acc_up, limit)
         case str() if fuse_act.startswith("situ:"):
             _, beta, linear_beta = fuse_act.split(":")
             linear_beta = None if linear_beta == "none" else float(linear_beta)

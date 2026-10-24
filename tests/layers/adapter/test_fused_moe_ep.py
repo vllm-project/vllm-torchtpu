@@ -62,6 +62,7 @@ def _layer(experts=4, hidden=8, inter=16, **overrides):
         routed_scaling_factor=1.0,
         moe_config=SimpleNamespace(
             experts_per_token=2,
+            swiglu_limit=None,
             moe_parallel_config=SimpleNamespace(
                 use_ep=True, pcp_size=1, is_sequence_parallel=False
             ),
@@ -812,6 +813,7 @@ def _nvfp4_checkpoint_layer(hidden=512, inter=512, use_ep=True):
     layer.global_num_experts = _STUB_EP
     layer.moe_config = SimpleNamespace(
         experts_per_token=2,
+        swiglu_limit=None,
         moe_parallel_config=SimpleNamespace(
             use_ep=use_ep, pcp_size=1, is_sequence_parallel=False
         ),

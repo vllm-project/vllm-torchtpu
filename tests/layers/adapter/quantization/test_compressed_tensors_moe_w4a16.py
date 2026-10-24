@@ -150,6 +150,7 @@ class FakeRoutedExperts(RoutedExperts):
         # RoutedExperts.__init__
         torch.nn.Module.__init__(self)
         self.moe_config = MagicMock()
+        self.moe_config.swiglu_limit = None
         self.moe_config.experts_per_token = experts_per_token
         self.moe_config.moe_parallel_config = MagicMock()
         self.moe_config.moe_parallel_config.use_ep = False
@@ -314,6 +315,7 @@ class TestW4MoECorrectness:
     def test_custom_routing_called(self, device):
         """W4 MoE apply_monolithic should use custom_routing_function when present."""
         layer = MagicMock()
+        layer.moe_config.swiglu_limit = None
         layer.moe_config.experts_per_token = 2
         layer.moe_config.moe_parallel_config.use_ep = False
         layer.renormalize = True
