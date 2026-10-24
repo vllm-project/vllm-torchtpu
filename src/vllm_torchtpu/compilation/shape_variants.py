@@ -168,6 +168,59 @@ def _signature(graph: fx.GraphModule) -> tuple:
     return tuple(shape(value) for value in _placeholder_values(graph))
 
 
+def _symint_symbols(graph: fx.GraphModule) -> tuple:
+    """Per placeholder: the sympy symbol of a SymInt, else None.
+
+    Aligned with :func:`_signature`. A SymInt whose expression is not a bare
+    symbol also maps to None, so it can only ever match by position.
+    """
+
+    def symbol(value: Any) -> Any:
+        if isinstance(value, torch.SymInt):
+            expr = value.node.expr
+            return expr if isinstance(expr, sympy.Symbol) else None
+        return None
+
+    return tuple(symbol(value) for value in _placeholder_values(graph))
+
+
+def symint_permutation(
+    old: tuple[tuple, tuple], new: tuple[tuple, tuple]
+) -> list[int] | None:
+    """For each input of the old trace, where it sits among the new one's.
+
+    Two traces of one split graph can take the same inputs and differ only in
+    where a SymInt placeholder sits: FX orders a subgraph's placeholders by first
+    use, and a specialized branch can first touch the token count later. Returns
+    None unless that is the only difference: every non-SymInt input in the same
+    order, and the SymInts matched one to one by sympy symbol identity.
+    """
+    (old_sig, old_syms), (new_sig, new_syms) = old, new
+    if len(old_sig) != len(new_sig):
+        return None
+    old_rest = [i for i, v in enumerate(old_sig) if v != "SymInt"]
+    new_rest = [i for i, v in enumerate(new_sig) if v != "SymInt"]
+    if [old_sig[i] for i in old_rest] != [new_sig[i] for i in new_rest]:
+        return None
+    old_ints = [i for i, v in enumerate(old_sig) if v == "SymInt"]
+    new_ints = [i for i, v in enumerate(new_sig) if v == "SymInt"]
+    symbols = [old_syms[i] for i in old_ints]
+    new_by_symbol = {new_syms[i]: i for i in new_ints}
+    if (
+        any(sym is None for sym in symbols)
+        or len(set(symbols)) != len(symbols)
+        or len(new_by_symbol) != len(new_ints)
+        or set(symbols) != set(new_by_symbol)
+    ):
+        return None
+    perm = [0] * len(old_sig)
+    for o, n in zip(old_rest, new_rest):
+        perm[o] = n
+    for o in old_ints:
+        perm[o] = new_by_symbol[old_syms[o]]
+    return perm
+
+
 def graph_signature(graph: fx.GraphModule) -> tuple:
     """:func:`_signature`, for callers outside this module.
 
@@ -195,7 +248,7 @@ class BucketExecutables:
 
     def __init__(self) -> None:
         self._runnables: dict[
-            tuple[str | None, str], tuple[Callable[..., Any], tuple]
+            tuple[str | None, str], tuple[Callable[..., Any], tuple, tuple]
         ] = {}
         self.refused: set[int] = set()
         self.traces = 0
@@ -206,16 +259,34 @@ class BucketExecutables:
         found = self._runnables.get((cache_dir, key))
         if found is None:
             return None
-        runnable, signature = found
-        if signature != _signature(graph):
-            raise ShapeSpecializationError(
-                f"{key} was compiled by another trace of this model whose "
-                f"inputs differ ({signature} vs {_signature(graph)}). The "
-                "graph is split, so its subgraph boundaries move with the "
-                "specialization and a bucket cannot be handed between traces; "
-                "unset TPU_KERNEL_ITER_MODE to serve this model."
+        runnable, signature, symbols = found
+        new_signature = _signature(graph)
+        if signature == new_signature:
+            return runnable
+        perm = symint_permutation(
+            (signature, symbols), (new_signature, _symint_symbols(graph))
+        )
+        if perm is not None:
+            moved = [(o, n) for o, n in enumerate(perm) if o != n]
+            logger.info(
+                "[shape-variants] %s adopted by trace %d with SymInt placeholders "
+                "permuted (old index <- new index): %s",
+                key,
+                self.traces,
+                moved,
             )
-        return runnable
+
+            def adopted(*args: Any, **kwargs: Any) -> Any:
+                return runnable(*[args[n] for n in perm], **kwargs)
+
+            return adopted
+        raise ShapeSpecializationError(
+            f"{key} was compiled by another trace of this model whose "
+            f"inputs differ ({signature} vs {new_signature}). The "
+            "graph is split, so its subgraph boundaries move with the "
+            "specialization and a bucket cannot be handed between traces; "
+            "unset TPU_KERNEL_ITER_MODE to serve this model."
+        )
 
     def put(
         self,
@@ -224,7 +295,11 @@ class BucketExecutables:
         graph: fx.GraphModule,
         runnable: Callable[..., Any],
     ) -> None:
-        self._runnables[(cache_dir, key)] = (runnable, _signature(graph))
+        self._runnables[(cache_dir, key)] = (
+            runnable,
+            _signature(graph),
+            _symint_symbols(graph),
+        )
 
     def needs_retrace(self, size: int) -> bool:
         """Whether a graph refused this bucket and no trace has built it yet.
