@@ -5780,6 +5780,7 @@ class TestTPUConnectorStats(unittest.TestCase):
             "kv_pull_time": [1200.0, 5400.0, 12000.0],
             "mb_transferred": [128.0, 256.0, 2048.0],
             "num_failed_transfers": [0, 1, 2],
+            "num_evicted_blocks": [2, 5],
         }
 
         self.metrics.observe(mock_data, engine_idx=0)
@@ -5925,6 +5926,10 @@ class TestTPUConnectorStats(unittest.TestCase):
     def test_prometheus_counter_num_failed_transfers(self):
         counter = self.metrics.counter_tpu_num_failed_transfers[0]
         assert counter._value.get() == 3.0
+
+    def test_prometheus_counter_kv_cache_evictions(self):
+        counter = self.metrics.counter_kv_cache_evictions[0]
+        assert counter._value.get() == 7.0
 
     def test_tpu_stats_aggregation_queue_lengths(self):
         stats = TpuKVConnectorStats()
