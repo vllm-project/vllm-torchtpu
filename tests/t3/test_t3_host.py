@@ -140,6 +140,16 @@ def test_memo_mode_env_parsing():
     assert qx._parse_memo_mode("Check") == "check"
 
 
+def test_master_switch_and_explicit_override(monkeypatch):
+    monkeypatch.delenv("VLLM_TPU_T3_AOT_SKIP_GUARDS", raising=False)
+    monkeypatch.delenv("VLLM_TPU_T3_HOST", raising=False)
+    assert t3_host._flag("VLLM_TPU_T3_AOT_SKIP_GUARDS") is False
+    monkeypatch.setenv("VLLM_TPU_T3_HOST", "1")
+    assert t3_host._flag("VLLM_TPU_T3_AOT_SKIP_GUARDS") is True
+    monkeypatch.setenv("VLLM_TPU_T3_AOT_SKIP_GUARDS", "0")
+    assert t3_host._flag("VLLM_TPU_T3_AOT_SKIP_GUARDS") is False
+
+
 def test_memo_cleared_when_cache_entries_change(memo_on):
     w = _wrapped(_fn_scale)
     x = torch.arange(6.0)
