@@ -170,6 +170,8 @@ When opening a pull request, please select the appropriate category prefix from 
 ### Reviewer Routing
 GitHub automatically requests reviews from the owners in `.github/CODEOWNERS` of the files a PR changes, and a PR needs an approval from a code owner of each area it touches before it can merge.
 
+Because GitHub asks *every* owner of every area, the Reviewer Balancer workflow then trims a new PR to one owner per area: the owner with the fewest open review requests in the repository. It withdraws the other pending code-owner requests of those areas and leaves a comment saying whom it picked and why. While a branch ruleset requires review from code owners, GitHub keeps automatically requested owners and the comment says so instead. Any owner of an area may still approve it, you may request anyone else by hand, and the `no-reviewer-balance` label opts a PR out. To see the picks for your branch before opening a PR, run `scripts/find_owners.py --balance`.
+
 ---
 
 ## 7. Policy on AI-Assisted Code
