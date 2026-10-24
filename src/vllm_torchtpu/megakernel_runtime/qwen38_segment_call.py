@@ -40,6 +40,12 @@ from .qwen38_scatter import scatter_gdn_ckpts_fast
 T_VERIFY = 4
 
 
+# All-reduce mode and (expert, dense) ring slots when the caller passes none
+# (`VLLM_TPU_MEGAKERNEL=...,hier=N,rings=E:D` sets them; rings for every bucket).
+DEFAULT_HIER = 2
+DEFAULT_RINGS: tuple[int, int] | None = None
+
+
 def ring_depths(B: int) -> tuple[int, int]:
     """(expert, dense) ring slots per bucket.
 
@@ -64,8 +70,8 @@ def segment_tiles(
     tiling) are the same for all buckets. `hier=2` by default (C1: lower
     all-reduce growth per row, frees VMEM for the expert ring).
     """
-    nbe, nbd = rings or ring_depths(B)
-    h = 2 if hier is None else hier
+    nbe, nbd = rings or DEFAULT_RINGS or ring_depths(B)
+    h = DEFAULT_HIER if hier is None else hier
     return Tiles(ebank=2 << 20, nbe=nbe, nbd=nbd, vmem_mib=62, hier=h).with_blocks(
         {"moe": {"pipe_ep": True, "moe_unroll": True}}
     )

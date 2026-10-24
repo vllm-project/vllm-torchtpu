@@ -77,6 +77,13 @@ def _parse_check(raw: str) -> int:
     return 0
 
 
+def _parse_int(raw: str, key: str) -> int | None:
+    for part in raw.split(","):
+        if part.startswith(key + "="):
+            return int(part[len(key) + 1 :])
+    return None
+
+
 def pool_layout_of(pool: torch.Tensor) -> Any:
     """`Qwen38GdnPoolLayout` of a torch pool tensor (shape and dtype name only)."""
     from .qwen38_gdn_state import Qwen38GdnPoolLayout
@@ -315,6 +322,8 @@ class Qwen38SegmentDriver:
         self.stats: dict[str, int] = {}
         self.mtp = False
         self.cfg = None
+        self.seq = 0  # try_forward calls, to compare the step sequence across ranks
+        self.mk_calls = 0
 
     @classmethod
     def maybe_create(cls, runner: Any) -> Qwen38SegmentDriver | None:
@@ -334,13 +343,25 @@ class Qwen38SegmentDriver:
         if reasons:
             logger.warning("Qwen3.8 megakernel disabled: %s", "; ".join(reasons))
             return None
+        from . import qwen38_segment_call
+
+        hier = _parse_int(raw, "hier")
+        if hier is not None:
+            qwen38_segment_call.DEFAULT_HIER = hier
+        for part in raw.split(","):
+            if part.startswith("rings="):
+                e, d = part[len("rings=") :].split(":")
+                qwen38_segment_call.DEFAULT_RINGS = (int(e), int(d))
         drv = cls(runner, _parse_buckets(raw), head=_parse_flag(raw, "head", True))
         drv.check_left = _parse_check(raw)
         drv.mtp = _parse_flag(raw, "mtp", False)
         logger.info(
-            "Qwen3.8 segment megakernel enabled, verify buckets %s, shadow checks %d",
+            "Qwen3.8 segment megakernel enabled, verify buckets %s, shadow checks %d, hier %s, rings %s, head %s",
             drv.buckets,
             drv.check_left,
+            qwen38_segment_call.DEFAULT_HIER,
+            qwen38_segment_call.DEFAULT_RINGS or "per bucket",
+            bool(drv.segments.head_groups),
         )
         return drv
 
@@ -483,6 +504,7 @@ class Qwen38SegmentDriver:
     ) -> tuple[bool, Any]:
         if self.program is None or inputs_embeds is not None or intermediate_tensors is not None:
             return False, None
+        self.seq += 1
         ok, n_req, t_seq, reason = MegakernelDriver._inspect_step_detail(None, None, runner)
         rows = int(input_ids.shape[0])
         if not ok or t_seq != T_VERIFY:
@@ -492,6 +514,12 @@ class Qwen38SegmentDriver:
             self._note(f"stock_rows{rows}_n{n_req}")
             return False, None
         self._note(f"mk_b{rows}")
+        self.mk_calls += 1
+        if self.mk_calls <= 4:
+            logger.info(
+                "qwen38 megakernel call %d at step seq %d: rows=%d n_req=%d",
+                self.mk_calls, self.seq, rows, n_req,
+            )
         kw = dict(model_kwargs or {})
         try:
             if self.check_left > 0 and self.shadow is not None:
