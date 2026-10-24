@@ -1115,6 +1115,37 @@ def _pallas_impl(kv_dtype: torch.dtype | None) -> Any:
     return impl
 
 
+def _bare_layer(cls_path: str) -> Any:
+    module_name, cls_name = cls_path.rsplit(".", 1)
+    module = __import__(module_name, fromlist=[cls_name])
+    return object.__new__(getattr(module, cls_name))
+
+
+@pytest.mark.parametrize(
+    "cls_path",
+    [
+        "vllm.model_executor.layers.mamba.mamba_mixer2.MambaMixer2",
+        "vllm.model_executor.layers.mamba.short_conv.ShortConv",
+        "vllm.model_executor.layers.mamba.mamba_mixer.MambaMixer",
+    ],
+)
+def test_layer_state_specs_reject_unsupported_recurrent_layers(cls_path: str) -> None:
+    layer = _bare_layer(cls_path)
+    exportable = SimpleNamespace(
+        _export_config=SimpleNamespace(
+            dtype="bf16", num_blocks=16, block_size=32, tensor_parallel_size=1
+        ),
+        _attention_layers=lambda: [layer],
+    )
+    cls_name = cls_path.rsplit(".", 1)[1]
+    with pytest.raises(
+        NotImplementedError,
+        match=rf"recurrent layer {cls_name} is not supported by export; "
+        r"supported: GatedDeltaNetAttention",
+    ):
+        universal_adapter.UniversalVllmExportableLLM._layer_state_specs(exportable)
+
+
 @pytest.mark.parametrize("kv_dtype", [None, torch.float8_e4m3fn])
 def test_layer_state_specs_declare_kv_and_recurrent_state(
     kv_dtype: torch.dtype | None,
