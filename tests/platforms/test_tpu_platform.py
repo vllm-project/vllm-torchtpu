@@ -195,6 +195,113 @@ def test_prepare_singlehost_tpu_env_keeps_inherited_slice_bootstrap(monkeypatch)
     assert os.environ["TORCH_TPU_TOPOLOGY"] == "2,2,1,2"
 
 
+_V6E_TOPOLOGY = {1: "1,1,1", 4: "2,2,1", 8: "2,4,1"}
+
+
+def _patch_v6e_hardware(num_devices, **topology_kwargs):
+    """Patch torch_tpu's hardware scan to look like a v6e host."""
+    return (
+        patch.object(tpu_platform.hardware, "get_tpu_topology", **topology_kwargs),
+        patch.object(
+            tpu_platform.hardware, "get_tpu_device_name", return_value="TPU v6e"
+        ),
+        patch.object(
+            tpu_platform.hardware,
+            "_scan_pci_tpus",
+            create=True,
+            return_value=(num_devices, _V6E_TOPOLOGY),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "num_devices, suggestion",
+    [(4, "e.g. tensor_parallel_size=4"), (8, "e.g. tensor_parallel_size=4")],
+)
+def test_get_tpu_topology_explains_unsupported_world_size(num_devices, suggestion):
+    """torch_tpu has no v6e topology for 2 devices; name the valid sizes."""
+    lookup, name, scan = _patch_v6e_hardware(
+        num_devices,
+        side_effect=RuntimeError("No TPU topology found for count: 2"),
+    )
+    with lookup, name, scan, pytest.raises(ValueError) as excinfo:
+        TpuPlatform._get_tpu_topology(2)
+
+    message = str(excinfo.value)
+    assert "TPU v6e cannot run a single-host world size of 2" in message
+    assert "Supported per-host device counts on TPU v6e: 1, 4, 8" in message
+    assert f"(this host has {num_devices})" in message
+    assert suggestion in message
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+
+
+def test_get_tpu_topology_omits_sizes_above_host_chip_count():
+    lookup, name, scan = _patch_v6e_hardware(
+        1, side_effect=RuntimeError("No TPU topology found for count: 2")
+    )
+    with lookup, name, scan, pytest.raises(ValueError) as excinfo:
+        TpuPlatform._get_tpu_topology(2)
+
+    message = str(excinfo.value)
+    assert "choose sizes whose product is one of 1." in message
+    assert "e.g." not in message
+
+
+def test_get_tpu_topology_message_survives_scan_failure():
+    lookup, name, scan = _patch_v6e_hardware(
+        4, side_effect=RuntimeError("No TPU topology found for count: 2")
+    )
+    with lookup, name, scan as mock_scan, pytest.raises(ValueError) as excinfo:
+        mock_scan.side_effect = OSError("no /sys")
+        TpuPlatform._get_tpu_topology(2)
+
+    message = str(excinfo.value)
+    assert "TPU v6e cannot run a single-host world size of 2" in message
+    assert "product of the parallel sizes" in message
+
+
+def test_get_tpu_topology_message_survives_device_name_failure():
+    lookup, name, scan = _patch_v6e_hardware(
+        4, side_effect=RuntimeError("No TPU topology found for count: 2")
+    )
+    with lookup, name as mock_name, scan, pytest.raises(ValueError) as excinfo:
+        mock_name.side_effect = RuntimeError("no device name")
+        TpuPlatform._get_tpu_topology(2)
+
+    message = str(excinfo.value)
+    assert "This TPU cannot run a single-host world size of 2" in message
+    assert "Supported per-host device counts on This TPU: 1, 4, 8" in message
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+
+
+def test_get_tpu_topology_valid_and_missing_device():
+    lookup, name, scan = _patch_v6e_hardware(4, return_value="2,2,1")
+    with lookup, name, scan:
+        assert TpuPlatform._get_tpu_topology(4) == "2,2,1"
+
+    lookup, name, scan = _patch_v6e_hardware(0, return_value=None)
+    with lookup, name, scan, pytest.raises(ValueError, match="No TPU devices found"):
+        TpuPlatform._get_tpu_topology(4)
+
+
+def test_prepare_singlehost_tpu_env_skips_lookup_with_explicit_topology(
+    monkeypatch,
+):
+    """An explicit TORCH_TPU_TOPOLOGY bypasses the lookup and its error."""
+    monkeypatch.setenv("TORCH_TPU_TOPOLOGY", "1,2,1")
+    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "localhost:1,localhost:2")
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "29457")
+    lookup, name, scan = _patch_v6e_hardware(
+        4, side_effect=RuntimeError("No TPU topology found for count: 2")
+    )
+    with lookup as mock_lookup, name, scan:
+        TpuPlatform._prepare_singlehost_tpu_env(2)
+
+    mock_lookup.assert_not_called()
+    assert os.environ["TORCH_TPU_TOPOLOGY"] == "1,2,1"
+
+
 @pytest.mark.parametrize("inherited_endpoint", [False, True])
 def test_singlehost_workers_share_native_endpoint_with_filestore(
     monkeypatch, tmp_path, inherited_endpoint

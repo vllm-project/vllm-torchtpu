@@ -556,7 +556,13 @@ class TpuPlatform(Platform):
     @classmethod
     def _get_tpu_topology(cls, world_size: int) -> str:
         """Return the torch_tpu-reported topology for the requested world size."""
-        topology = hardware.get_tpu_topology(world_size)
+        try:
+            topology = hardware.get_tpu_topology(world_size)
+        except RuntimeError as error:
+            # torch_tpu only knows sub-slice topologies for some device counts
+            # per generation (v6e: 1, 4 and 8, no 2), and raises an opaque
+            # "No TPU topology found for count: N" for the rest.
+            raise ValueError(_unsupported_world_size_message(world_size)) from error
         if topology is None:
             raise ValueError("No TPU devices found.")
         return topology
@@ -1381,3 +1387,45 @@ def _configure_sequence_parallel_moe(vllm_config: VllmConfig) -> None:
             tp,
         )
     cc.compile_sizes = cast(list[int | str], kept)
+
+
+def _unsupported_world_size_message(world_size: int) -> str:
+    """Explain a world size torch_tpu has no single-host topology for.
+
+    The supported counts come from torch_tpu's own per-generation topology
+    table (read through its PCI scan), so the message stays in sync with the
+    pinned wheel instead of a copy of the table here.
+    """
+    try:
+        device_name = hardware.get_tpu_device_name()
+    except Exception:  # The message must not mask the original error.
+        device_name = "This TPU"
+    message = (
+        f"{device_name} cannot run a single-host world size of {world_size}: "
+        f"torch_tpu has no TPU topology for {world_size} devices on this "
+        "generation."
+    )
+    try:
+        # Private torch_tpu helper: it returns the topology table that
+        # get_tpu_topology looks the world size up in.
+        num_devices, topology_map = hardware._scan_pci_tpus()
+        supported = sorted(topology_map or ())
+    except Exception:  # The message must not mask the original error.
+        return message + (
+            " The world size is the product of the parallel sizes; choose "
+            "sizes whose product the TPU generation supports."
+        )
+    usable = [n for n in supported if n <= num_devices] or supported
+    message += (
+        f" Supported per-host device counts on {device_name}: "
+        f"{', '.join(map(str, supported))} (this host has {num_devices})."
+        " The world size is the product of the parallel sizes (for example "
+        "tensor_parallel_size x data_parallel_size, or for vLLM-Omni "
+        "diffusion cfg_parallel_size x ulysses_degree x ring_degree x "
+        "tensor_parallel_size); choose sizes whose product is one of "
+        f"{', '.join(map(str, usable))}"
+    )
+    larger = [n for n in usable if n > world_size]
+    if larger:
+        message += f", e.g. tensor_parallel_size={larger[0]}"
+    return message + "."
