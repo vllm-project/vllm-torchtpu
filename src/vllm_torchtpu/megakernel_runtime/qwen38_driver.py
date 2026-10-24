@@ -45,6 +45,7 @@ from .driver import (
     register_megakernel_driver,
 )
 from .exported_bridge import make_typed_step_wrapper, sharded_jax_callable
+from .qwen38_mtp_tail import MtpTailKind
 from .qwen38_segment_call import T_VERIFY, build_segment_call, segment_tiles
 from .qwen38_weights import head_groups, pack_segment_operands, segment_layers
 
@@ -312,11 +313,12 @@ class Qwen38Segments(nn.Module):
 class MtpTail(nn.Module):
     """The MTP draft layer after attention (o_proj, both HCs, MoE) as one tail-kernel call.
 
-    Reuses the main model's `(1, False)` segment kind, so no second torch op is
-    registered; owns the draft layer's packed operands as buffers.
+    Its own op (`MtpTailKind`): the draft reaches the tail at every rows count it
+    is traced at, and counts past the buckets run in largest-bucket chunks.
+    Owns the draft layer's packed operands as buffers.
     """
 
-    def __init__(self, draft: Any, g: Any, mesh: Any, kind: _SegmentKind, buckets: tuple[int, ...]):
+    def __init__(self, draft: Any, g: Any, mesh: Any, kind: MtpTailKind, buckets: tuple[int, ...]):
         super().__init__()
         object.__setattr__(self, "kind", kind)
         self.buckets = buckets
@@ -329,7 +331,7 @@ class MtpTail(nn.Module):
 
     def forward(self, hidden: torch.Tensor, attention: torch.Tensor) -> torch.Tensor:
         w = [getattr(self, f"w_{i}") for i in range(self.n_w)]
-        (res,) = self.kind.op(hidden, attention, w, [])
+        (res,) = self.kind.op(hidden, attention, w)
         return res
 
 
@@ -491,7 +493,10 @@ class Qwen38SegmentDriver:
             logger.warning("Qwen3.8 MTP tail: draft o_proj %s is not TP-sharded like the target", tuple(o_proj.shape))
             return
         try:
-            tail = MtpTail(draft, self.g, self.mesh, self.segments.kinds[(1, False)], self.buckets)
+            kind = MtpTailKind(
+                self.mesh, self.g, self.segments.layout, self.segments.write_ckpts, max(self.buckets)
+            )
+            tail = MtpTail(draft, self.g, self.mesh, kind, self.buckets)
         except Exception:
             logger.exception("Qwen3.8 MTP tail: packing failed; draft stays stock")
             return
