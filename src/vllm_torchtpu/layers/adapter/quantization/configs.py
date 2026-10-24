@@ -67,6 +67,8 @@ if TYPE_CHECKING:
         weight_scale_inv: torch.nn.Parameter
         weight_scale_2: torch.nn.Parameter
         logical_widths: list[int]
+        input_size_per_partition: int
+        output_size_per_partition: int
         weight_block_size: tuple[int, int] | int
         scheme: CompressedTensorsScheme
         _tpu_online_fp8_processed: bool

@@ -442,6 +442,7 @@ class TpuPlatform(Platform):
         "fp8",
         "mxfp4",
         "modelopt_fp4",
+        "modelopt_mxfp8",
         "deepseek_v4_fp8",
     ]
 
