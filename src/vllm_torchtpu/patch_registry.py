@@ -77,6 +77,7 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_disable_compile_ranges", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_piecewise_backend", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_reset_compile_wrapper", _ACTIVE),
+    Patch("vllm_torchtpu:_patch_vllm_bucket_filter", _ACTIVE),
     # MoE routing and collectives.
     Patch("vllm_torchtpu:_patch_sequence_parallel_moe_admission", _ACTIVE),
     Patch("vllm_torchtpu:_patch_expert_map_host_lookup", _ACTIVE),
