@@ -1167,6 +1167,118 @@ def test_ple_storage_reuses_common_checkpoint_loader(
     assert not list(tmp_path.iterdir())
 
 
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
+def test_resident_ple_owns_runtime_shard_offset(monkeypatch, fp8):
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.ple_storage import ResidentPLETable
+
+    _set_tp(monkeypatch, 0, 1)
+    dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
+    checkpoint = (torch.arange(64 * 4) % 17).reshape(64, 4).to(dtype)
+    tables = []
+    for rank in (0, 1, 0):  # Recreating a table must not reuse another's device state.
+        with set_default_torch_dtype(torch.bfloat16):
+            table = ResidentPLETable(
+                64,
+                4,
+                embedding_method=Qwen4ExpPLEEmbeddingMethod.from_quant_config(
+                    None, "ple", "float8_e4m3fn" if fp8 else None
+                ),
+                padding_size=16,
+                prefix="ple",
+                parallel_group=SimpleNamespace(rank_in_group=rank, world_size=2),
+            )
+        keys = set(table.state_dict())
+        assert "_vocab_start" not in keys
+        offset = dict(table.named_buffers())["_vocab_start"]
+        assert offset.dtype == torch.int32 and offset.shape == ()
+        assert offset.device == table.table.device == torch.device("cpu")
+        assert offset.item() == rank * 32
+        table.weight_loader(table.weight, checkpoint, 0)
+        if fp8:
+            table.get_parameter("weight_scale").data.fill_(0.25)
+        table.finalize_weights()
+        table.finalize_weights()
+        assert set(table.state_dict()) == keys
+        lookup = table._raw_lookup
+        table._apply(lambda tensor: tensor.clone())
+        assert table._vocab_start is not offset
+        assert table._vocab_start.item() == rank * 32
+        assert table._raw_lookup is lookup
+        tables.append(table)
+    assert all(table._raw_lookup is tables[0]._raw_lookup for table in tables)
+    assert len({table._vocab_start.data_ptr() for table in tables}) == 3
+    seen = []
+
+    def record(owner, ids, offset):
+        seen.append((owner, ids, offset))
+        return ids
+
+    table = tables[1]
+    monkeypatch.setattr(table, "_raw_lookup", record)
+    ids = torch.tensor([[31, 32, 63, -1]], dtype=torch.int32)
+    for _ in range(2):
+        assert table.lookup_raw(ids) is ids
+        assert seen[-1] == (table.table, ids, table._vocab_start)
+    assert seen[0][2] is seen[1][2]
+    tables[0].to("meta")
+    assert tables[0]._vocab_start.device == tables[0].table.device
+    assert tables[0]._vocab_start.dtype == torch.int32
+    # Finalization must also bind the scalar if only the table's device was set.
+    with set_default_torch_dtype(torch.bfloat16):
+        other = ResidentPLETable(
+            64,
+            4,
+            embedding_method=Qwen4ExpPLEEmbeddingMethod.from_quant_config(None, "ple"),
+            padding_size=16,
+            prefix="ple",
+            parallel_group=SimpleNamespace(rank_in_group=0, world_size=2),
+        )
+    other.table = torch.empty(0, dtype=torch.uint8, device="meta")
+    other.weight_loader(other.weight, checkpoint.to(torch.bfloat16), 0)
+    other.finalize_weights()
+    assert other._vocab_start.device == other.table.device == torch.device("meta")
+    assert other._raw_lookup is tables[2]._raw_lookup
+
+
+@pytest.mark.parametrize("carrier", [torch.int16, torch.uint8])
+def test_resident_ple_runtime_offset_fake_fullgraph(carrier):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from vllm_torchtpu.layers.adapter.custom_ops.ple_op import build_raw_lookup_op
+
+    op = build_raw_lookup_op(32, 4)
+    assert op is build_raw_lookup_op(32, 4)
+    graphs = []
+
+    def backend(graph, inputs):
+        graphs.append(graph)
+        return graph.forward
+
+    torch._dynamo.reset()
+    try:
+        with FakeTensorMode():
+            table = torch.empty(1, 128, dtype=carrier)
+            ids = torch.empty(3, 2, dtype=torch.int32)
+            run = torch.compile(op, backend=backend, fullgraph=True, dynamic=False)
+            for start in (0, 32):
+                offset = torch.tensor(start, dtype=torch.int32)
+                result = run(table, ids, offset)
+                assert result.shape == (3, 8)
+                assert result.dtype == (
+                    torch.int16 if carrier == torch.int16 else torch.int8
+                )
+        assert len(graphs) == 1
+        calls = [node for node in graphs[0].graph.nodes if node.op == "call_function"]
+        assert len(calls) == 1
+        assert "qwen4_exp.ple_raw_lookup_32_4" in str(calls[0].target)
+        assert len(calls[0].args) == 3
+        assert all(arg.op == "placeholder" for arg in calls[0].args)
+    finally:
+        torch._dynamo.reset()
+
+
 def test_ple_storage_rejects_missing_and_duplicate_rows(monkeypatch):
     from vllm.utils.torch_utils import set_default_torch_dtype
 
@@ -1213,8 +1325,8 @@ def test_ple_native_adapter_reuses_common_math_and_checkpoint(
     group = Group()
     parallel = PLEParallel(group, group, embedding_across_dp=False)
 
-    def raw_lookup(start, rows, width):
-        def run(table, ids):
+    def raw_lookup(rows, width):
+        def run(table, ids, start):
             result = table.reshape(rows, width)[ids.clamp(0, rows - 1)].clone()
             result[(ids < 0) | (ids >= rows)] = 0
             return result.flatten(-2)

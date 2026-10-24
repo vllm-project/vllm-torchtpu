@@ -211,10 +211,13 @@ def _main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--worker", action="store_true")
     args = parser.parse_args()
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    # Apply production defaults before launcher preparation or worker device init.
+    import vllm_torchtpu  # noqa: F401
+
     if args.worker:
         _worker(args.tp, args.out)
         return
-    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
     from tests.distributed.tpu_test_utils import prepare_tpu_environment
 
     prepare_tpu_environment(world_size=8)
