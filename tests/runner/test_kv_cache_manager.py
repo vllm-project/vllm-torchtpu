@@ -203,6 +203,7 @@ class TestKVCacheManager:
         self.runner.runner_only_attn_layers = set()
         self.runner.enforce_eager = False
         self.runner.speculative_config = None
+        self.runner.pcp_manager = None
         # Slots per request in the mamba pool (1 without spec decode).
         self.runner._mamba_slot_stride = 1
 
