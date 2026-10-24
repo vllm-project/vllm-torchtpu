@@ -81,6 +81,9 @@
 /src/vllm_torchtpu/structured_decoding/ @maxwillzq @silkyarora
 /tests/structured_decoding/ @maxwillzq @silkyarora
 
+# B023 kernel ratchet baseline (tools/check_b023_baseline.py)
+/tools/b023_baseline.txt @qizzzh @angelayi @colin2328 @QiliangCui @caojx-google @Nanfang-Li @yinlin09 @mrjunwan-lang @maxwillzq @yunyao-gg
+
 # Docker Configuration
 /docker/ @QiliangCui @theminghuang
 
