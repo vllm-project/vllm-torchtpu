@@ -401,31 +401,14 @@ def _gdn_conv_regions(
     row_stride = local_dim * itemsize
     key_bytes = geometry.key_head_dim * itemsize
     value_bytes = geometry.value_head_dim * itemsize
-    qk_bytes = 2 * geometry.local_key_heads * key_bytes
     if tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT:
-        # QK pair-blocked layout: the rank-local Q and K rows share whole
-        # pool tokens ([Q-pair, K-pair] per token), so the transferable
-        # unit is the combined QK block followed by the V block — two
-        # contiguous extents per tap.  Full-width states store the rank
-        # blocks in rank order, which the pooled kernel's rows_perm maps
-        # back to the logical [Q | K | V] row order.
-        return (
-            RegionSpec(
-                name="gdn_conv_qk",
-                offset_bytes=0,
-                stride_bytes=row_stride,
-                unit_bytes=qk_bytes,
-                num_units=taps,
-                units_per_stride=1,
-            ),
-            RegionSpec(
-                name="gdn_conv_v",
-                offset_bytes=qk_bytes,
-                stride_bytes=row_stride,
-                unit_bytes=value_bytes,
-                num_units=taps,
-                units_per_stride=geometry.local_value_heads,
-            ),
+        # The pooled GDN kernel reads conv rows in [Q | K | V] order with
+        # no row permutation, so a pair-blocked transfer would mix up Q and
+        # K channels. With fp32 conv, each rank's Q and K slices are whole
+        # 1,024-B tiles up to an 8-way head split.
+        raise ManifestError(
+            "TPU_GDN_CONV_QK_PAIR_LAYOUT is not readable by the pooled GDN "
+            "kernel; unset it to use the per-segment conv layout"
         )
     q_offset = 0
     k_offset = geometry.local_key_heads * key_bytes
@@ -479,6 +462,29 @@ def _gdn_ssm_regions(
     )
 
 
+def gdn_state_unit_bytes(manifest: PoolManifest) -> dict[str, int]:
+    """Per-head byte width of each GDN state region, keyed by region name.
+
+    A region's unit is one head's slice (per tap for the conv regions), so
+    the widths follow the state dtypes and head dims but not how the heads
+    are sharded: a producer and its differently sharded consumers agree,
+    while peers on different conv or SSM state dtypes do not. Empty when the
+    manifest holds no GDN state.
+    """
+    widths: dict[str, int] = {}
+    for pool in manifest.pools:
+        if not pool.tag.startswith((TAG_GDN_CONV, TAG_GDN_SSM)):
+            continue
+        for region in pool.regions:
+            width = int(region.unit_bytes)
+            if widths.setdefault(region.name, width) != width:
+                raise ManifestError(
+                    f"GDN pools disagree on the {region.name} unit width: "
+                    f"{widths[region.name]} vs {width}"
+                )
+    return dict(sorted(widths.items()))
+
+
 # ---------------------------------------------------------------------------
 # Manifest builder.
 # ---------------------------------------------------------------------------
@@ -503,7 +509,7 @@ def _pooled_gdn_state_views(
     """Derive logical ``(conv, ssm)`` descriptors from a unified raw pool.
 
     The state geometry is tied to the pooled GDN kernel's byte model
-    (``gdn_pool_layout`` — the same helpers ``_build_v3_pool_state_plan``
+    (``gdn_pool_layout`` — the same helpers the pooled slot sizing
     uses), NOT to the layer's declared MambaSpec shapes or Conv dtype.  The
     pooled kernel never reads those declarations, so only the kernel model
     describes the geometry and Conv bytes that actually move; a declaration
