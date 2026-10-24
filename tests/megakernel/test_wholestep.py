@@ -34,7 +34,7 @@ from vllm_torchtpu.megakernel.blocks.hc import RESIDUAL_OUT
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
 from vllm_torchtpu.megakernel.models import qwen38
 from vllm_torchtpu.megakernel.models.qwen38_pack import shard_step_inputs
-from vllm_torchtpu.megakernel.ops import BF16
+from vllm_torchtpu.megakernel.ops import BF16, F32
 from vllm_torchtpu.megakernel.wholestep import inputs as wi
 from vllm_torchtpu.megakernel.wholestep.qsa_full import KV_NEW
 from vllm_torchtpu.megakernel.wholestep.spec import wholestep_spec
@@ -334,3 +334,37 @@ def test_qsa_first_layout_matches_reference():
     res = np.asarray(outs[RESIDUAL_OUT].reshape(R, ex.M, -1)[:, : ex.B], np.float32)
     assert float(np.std(np.asarray(ref) - np.asarray(d["inp"].x[: ex.B], np.float32))) > 0.05
     _assert_within_budget(res, np.asarray(ref, np.float32))
+
+
+def test_tail_greedy_tokens_match_reference():
+    """Final HC mixer + lm_head + per-rank top token + argmax over ranks = the stock greedy
+    verify (argmax of the full logits, ties to the lower index)."""
+    from vllm_torchtpu.megakernel.models.qwen38_inputs import _hc_params, hc_weight_arrays
+    from vllm_torchtpu.megakernel.wholestep.tail import (
+        TOP, greedy_tokens, tail_reference, tail_spec,
+    )
+
+    R, T, V = 2, 4, 384
+    ex = ExecSpec(R=R, B=2 * T, T=T, ctx=128, interpret=True, tiles=_TILES)
+    k = jax.random.split(jax.random.PRNGKey(5), 3)
+    hc = _hc_params(k[0], G, 1)
+    lm = (jax.random.normal(k[1], (R, G.H, V), F32) * 0.05).astype(BF16)
+    x = jax.random.normal(k[2], (ex.B, G.NHC * G.H), F32).astype(BF16)
+    want, logits = tail_reference(x, {n: v[0] for n, v in hc.items()}, lm, nhc=G.NHC, eps=G.eps)
+    spec = tail_spec(G, R, vocab_shard=V)
+    from vllm_torchtpu.megakernel.models.qwen38_pack import pack_weights
+
+    w = {"lm_head": lm[:, None], **hc_weight_arrays("tail", hc, G, R, mix=True)}
+    sm = {"tail_hcn": jnp.broadcast_to(hc["norm"][None], (R, 1, hc["norm"].shape[-1]))}
+    w_mk = pack_weights(spec, ex, w, sm)
+    mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
+    pos = jnp.zeros((ex.M,), jnp.int32)
+    pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(mesh, ex, pos, x, w_mk, {})
+    step, _ = kernel.make_step(mesh, spec, ex)
+    _, outs = step(pos_mk, hid_mk, w_mk, st_mk)
+    got = np.asarray(greedy_tokens(outs[TOP], R, ex.M))[: ex.B]
+    # Exact unless the reference's own top-2 gap is within rounding of the kernel's logits.
+    top2 = np.sort(np.asarray(logits), axis=-1)[:, -2:]
+    clear = (top2[:, 1] - top2[:, 0]) > 1e-2
+    assert clear.sum() >= ex.B - 1
+    np.testing.assert_array_equal(got[clear], np.asarray(want)[clear])
