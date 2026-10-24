@@ -434,12 +434,14 @@ def fused_conv1d_gdn(
             structure as `states`.
         out: Fused output tensor.
     """
-    prepared_qkv = isinstance(qkv, Conv1DInput)
     if isinstance(qkv, Conv1DInput):
         act_out_dtype = qkv.output_dtype
         qkv = qkv.values
         if qkv.ndim != 3 or qkv.shape[1] != 1 or qkv.dtype != jnp.float32:
-            raise ValueError("Conv1DInput requires FP32 [tokens, 1, features]")
+            raise ValueError(
+                "Conv1DInput requires FP32 [tokens, 1, features]; "
+                f"got shape={qkv.shape}, dtype={qkv.dtype}"
+            )
     else:
         act_out_dtype = qkv.dtype
 
@@ -464,8 +466,7 @@ def fused_conv1d_gdn(
             f"state; got conv={conv_dtype} recurrent={recurrent_dtype}."
         )
 
-    if not prepared_qkv:
-        qkv = qkv.astype(jnp.float32)
+    qkv = qkv.astype(jnp.float32)
     b = b.astype(jnp.float32)
     a = a.astype(jnp.float32)
 
