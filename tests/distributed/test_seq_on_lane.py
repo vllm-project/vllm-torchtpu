@@ -281,25 +281,28 @@ def test_fa_lowering_reassembles_each_destination_shard(
         )
         assert registration.dst_space_version == 1
         assert registration.tag == "fa"
-        assert len(registration.spans) == len(owned) * dst_shards
+        assert sum(s.count for s in registration.spans) == len(owned) * dst_shards
         assert registration.declared_bytes == len(owned) * geometry.kernel_page_bytes
         total_declared += registration.declared_bytes
         for span in registration.spans:
-            assert span.count == 1 and span.dst_block_index == 0
+            assert span.count >= 1 and span.dst_block_index == 0
             assert span.size_bytes == shard_bytes
             shard = 0 if dst_shards == 1 else span.dst_unit_ordinal
             if dst_shards == 1:
                 assert span.dst_unit_ordinal is None
             else:
                 assert 0 <= span.dst_unit_ordinal < dst_shards
-            assert span.dst_offset_bytes % shard_bytes == 0
-            global_kp = span.dst_offset_bytes // shard_bytes
-            assert written[shard][global_kp] == 0, "exactly-once coverage"
-            written[shard][global_kp] = 1
             source = blocks[span.src_block_ordinal]
-            assembled[shard][
-                span.dst_offset_bytes : span.dst_offset_bytes + shard_bytes
-            ] = source[span.src_offset_bytes : span.src_offset_bytes + shard_bytes]
+            for step in range(span.count):
+                src_off = span.src_offset_bytes + step * span.src_stride_bytes
+                dst_off = span.dst_offset_bytes + step * span.dst_stride_bytes
+                assert dst_off % shard_bytes == 0
+                global_kp = dst_off // shard_bytes
+                assert written[shard][global_kp] == 0, "exactly-once coverage"
+                written[shard][global_kp] = 1
+                assembled[shard][dst_off : dst_off + shard_bytes] = source[
+                    src_off : src_off + shard_bytes
+                ]
     # Every shard's request-global space is fully covered and holds, at
     # kernel page c, the head-pairs [d*H2/S, (d+1)*H2/S) of chunk c.
     pairs_per_shard = geometry.kv_rows // dst_shards
@@ -334,8 +337,13 @@ def test_fa_lowering_tail_ships_a_whole_kernel_page():
         dst_shards=2,
         block_ids=[9],
     )
-    last = max(registration.spans, key=lambda s: s.dst_offset_bytes)
-    assert last.dst_offset_bytes == 255 * 64 * 1024
+    last = max(
+        registration.spans,
+        key=lambda s: s.dst_offset_bytes + (s.count - 1) * s.dst_stride_bytes,
+    )
+    assert (
+        last.dst_offset_bytes + (last.count - 1) * last.dst_stride_bytes
+    ) == 255 * 64 * 1024
     assert last.size_bytes == 64 * 1024
     assert registration.declared_bytes == 32 * 128 * 1024
 
@@ -355,15 +363,16 @@ def test_fa_lowering_source_packing_across_blocks():
         block_ids=[4, 5],
     )
     shard0 = [s for s in registration.spans if s.dst_unit_ordinal == 0]
-    assert [s.src_block_ordinal for s in shard0] == [0] * 8 + [1] * 8
-    assert [s.src_offset_bytes for s in shard0][:3] == [0, 128 * 1024, 2 * 128 * 1024]
-    assert shard0[8].src_offset_bytes == 0  # first kernel page of block 1
+    assert [s.src_block_ordinal for s in shard0] == [0, 1]
+    assert [s.count for s in shard0] == [8, 8]
+    assert [s.src_stride_bytes for s in shard0] == [128 * 1024, 128 * 1024]
+    assert shard0[1].src_offset_bytes == 0  # first kernel page of block 1
     shard1 = [s for s in registration.spans if s.dst_unit_ordinal == 1]
     assert [
         s.src_offset_bytes - t.src_offset_bytes for s, t in zip(shard1, shard0)
-    ] == [64 * 1024] * 16
+    ] == [64 * 1024] * 2
     assert [s.dst_offset_bytes // (64 * 1024) for s in shard0] == [
-        2 + 8 * i for i in range(16)
+        2 + 64 * i for i in range(2)
     ]
 
 
@@ -717,26 +726,27 @@ def test_geometry_generalizes_to_256_lane_pages():
         dst_shards=2,
         block_ids=[7],
     )
-    # Rank 3 owns global pages 3, 11, 19, ...: 17 pages x 2 shards.
-    assert len(registration.spans) == 17 * 2
+    # Rank 3 owns global pages 3, 11, 19: 17 pages coalesce to 1 span per shard.
+    assert len(registration.spans) == 2
     first, second = registration.spans[:2]
     assert (
         first.src_block_ordinal,
         first.src_offset_bytes,
         first.dst_offset_bytes,
         first.size_bytes,
+        first.count,
+        first.src_stride_bytes,
+        first.dst_stride_bytes,
         first.dst_unit_ordinal,
-    ) == (0, 0, 3 * 128 * 1024, 128 * 1024, 0)
+    ) == (0, 0, 3 * 128 * 1024, 128 * 1024, 17, 256 * 1024, 8 * 128 * 1024, 0)
     assert (
         second.src_offset_bytes,
         second.dst_offset_bytes,
+        second.count,
+        second.src_stride_bytes,
+        second.dst_stride_bytes,
         second.dst_unit_ordinal,
-    ) == (128 * 1024, 3 * 128 * 1024, 1)
-    third = registration.spans[2]
-    assert (third.src_offset_bytes, third.dst_offset_bytes) == (
-        256 * 1024,
-        11 * 128 * 1024,
-    )
+    ) == (128 * 1024, 3 * 128 * 1024, 17, 256 * 1024, 8 * 128 * 1024, 1)
     assert registration.declared_bytes == 17 * 256 * 1024
     with pytest.raises(sol.SeqOnLaneError, match="interleave"):
         sol.lower_fa_spans_sol(

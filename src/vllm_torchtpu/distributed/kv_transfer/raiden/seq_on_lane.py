@@ -452,6 +452,7 @@ def lower_fa_spans_sol(
         interleave_tokens=interleave_tokens,
     )
     spans: list[PoolByteSpan] = []
+    last_idx_by_unit: dict[int | None, int] = {}
     final_kp = (num_tokens - 1) // kp_tokens
     local_kp = 0
     for start, end in ranges:
@@ -476,20 +477,58 @@ def lower_fa_spans_sol(
                 ):
                     continue
                 dst_page_bytes = (dst_end - dst_start) * geometry.pair_bytes
+                src_offset = (
+                    in_block_kp * geometry.kernel_page_bytes
+                    + (head_start - src_start) * geometry.pair_bytes
+                )
+                dst_offset = (global_kp // dst_dcp_size) * dst_page_bytes + (
+                    head_start - dst_start
+                ) * geometry.pair_bytes
+                size_bytes = (head_end - head_start) * geometry.pair_bytes
+                unit_ord = shard if dst_shards > 1 else None
+                prev_idx = last_idx_by_unit.get(unit_ord)
+                if prev_idx is not None:
+                    prev = spans[prev_idx]
+                    src_step = src_offset - (
+                        prev.src_offset_bytes + (prev.count - 1) * prev.src_stride_bytes
+                    )
+                    dst_step = dst_offset - (
+                        prev.dst_offset_bytes + (prev.count - 1) * prev.dst_stride_bytes
+                    )
+                    if (
+                        prev.src_block_ordinal == block_ordinal
+                        and prev.size_bytes == size_bytes
+                        and src_step > 0
+                        and dst_step > 0
+                        and (
+                            prev.count == 1
+                            or (
+                                src_step == prev.src_stride_bytes
+                                and dst_step == prev.dst_stride_bytes
+                            )
+                        )
+                    ):
+                        spans[prev_idx] = PoolByteSpan(
+                            src_block_ordinal=prev.src_block_ordinal,
+                            src_offset_bytes=prev.src_offset_bytes,
+                            dst_block_index=prev.dst_block_index,
+                            dst_offset_bytes=prev.dst_offset_bytes,
+                            size_bytes=prev.size_bytes,
+                            count=prev.count + 1,
+                            src_stride_bytes=src_step,
+                            dst_stride_bytes=dst_step,
+                            dst_unit_ordinal=prev.dst_unit_ordinal,
+                        )
+                        continue
+                last_idx_by_unit[unit_ord] = len(spans)
                 spans.append(
                     PoolByteSpan(
                         src_block_ordinal=block_ordinal,
-                        src_offset_bytes=(
-                            in_block_kp * geometry.kernel_page_bytes
-                            + (head_start - src_start) * geometry.pair_bytes
-                        ),
+                        src_offset_bytes=src_offset,
                         dst_block_index=0,
-                        dst_offset_bytes=(
-                            (global_kp // dst_dcp_size) * dst_page_bytes
-                            + (head_start - dst_start) * geometry.pair_bytes
-                        ),
-                        size_bytes=(head_end - head_start) * geometry.pair_bytes,
-                        dst_unit_ordinal=(shard if dst_shards > 1 else None),
+                        dst_offset_bytes=dst_offset,
+                        size_bytes=size_bytes,
+                        dst_unit_ordinal=unit_ord,
                     )
                 )
             local_kp += 1
