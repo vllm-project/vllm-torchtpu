@@ -105,6 +105,8 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK: int = 256
     VLLM_TPU_QSA_RING_SELECT: bool = False
     VLLM_TPU_QSA_RING_DMA_BATCH: int = 0
+    VLLM_TPU_GDN_HOIST_READ_OFFSETS: bool = False
+    VLLM_TPU_QSA_BF16_REDUCE_PRECISION: bool = False
     VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
@@ -563,6 +565,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # power of two <= N that divides the request rows.
     "VLLM_TPU_QSA_RING_DMA_BATCH": env_nonnegative_int(
         "VLLM_TPU_QSA_RING_DMA_BATCH", 0
+    ),
+    # Qwen4-exp QSA: round to BF16 with lax.reduce_precision instead of the
+    # integer bit trick. Same RNE; the boundary stays observable to XLA and
+    # fuses into neighbouring ops instead of running as its own fusion.
+    "VLLM_TPU_QSA_BF16_REDUCE_PRECISION": env_bool(
+        "VLLM_TPU_QSA_BF16_REDUCE_PRECISION", default=False
     ),
     # Qwen4-exp QSA decode/verify attention: run the decode rows (and the
     # decode prefix of mixed steps) on the fused sparse GQA decode kernel
