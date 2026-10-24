@@ -12,6 +12,7 @@
 # CI/CD and Build Configuration
 /.buildkite/ @QiliangCui @theminghuang
 /.github/ @QiliangCui @theminghuang
+/.github/CODEOWNERS @QiliangCui @theminghuang @qizzzh @Nanfang-Li @kyuyeunk
 
 # Release tooling: vllm-torchtpu-release runs it with the Docker Hub token and
 # PyPI publishing rights (.buildkite/release/README.md).
