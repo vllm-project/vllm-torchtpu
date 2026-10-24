@@ -12,6 +12,7 @@ from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import (
     pooled_qsa_shard_attend_rows_step,
     pooled_qsa_shard_attend_step,
     pooled_qsa_shard_merge,
+    pooled_qsa_shard_pages_step,
     pooled_qsa_shard_select_rows_step,
     pooled_qsa_shard_select_step,
     pooled_qsa_step,
@@ -510,6 +511,26 @@ def _merge_op():
     return merge
 
 
+def _exchange_candidates(candidates, tp_group, a2a_min_tokens, merge_op, ratio, topk):
+    """Cross the TP group with every rank's local top-k candidates.
+
+    Returns ``(gathered, merged)``: ``[ranks, tokens, k, 2]`` candidates, or,
+    for steps of at least ``a2a_min_tokens`` tokens (0: never), ``[tokens, k]``
+    blocks merged per 1/TP token block after an all-to-all and all-gathered.
+    """
+    world = int(tp_group.world_size)
+    tokens = candidates.shape[0]
+    # Fixed at trace time: each token bucket compiles its own graph.
+    if a2a_min_tokens and tokens >= a2a_min_tokens and tokens % world == 0:
+        received = _all_to_all(
+            candidates.reshape(world, tokens // world, *candidates.shape[1:]),
+            tp_group,
+        )
+        blocks = merge_op(received, ratio, topk)
+        return _all_gather_ranks(blocks, tp_group).reshape(tokens, -1), True
+    return _all_gather_ranks(candidates, tp_group), False
+
+
 def build_pooled_qsa_shard_op(tp_group, a2a_min_tokens: int = 0):
     """``build_pooled_qsa_op`` with the indexer split across ``tp_group``.
 
@@ -544,19 +565,9 @@ def build_pooled_qsa_shard_op(tp_group, a2a_min_tokens: int = 0):
         )
         pool.copy_(updated)
         ratio, topk = kwargs["compress_ratio"], kwargs["token_topk"]
-        tokens = candidates.shape[0]
-        # Fixed at trace time: each token bucket compiles its own graph.
-        if a2a_min_tokens and tokens >= a2a_min_tokens and tokens % world == 0:
-            received = _all_to_all(
-                candidates.reshape(world, tokens // world, *candidates.shape[1:]),
-                tp_group,
-            )
-            blocks = merge_op(received, ratio, topk)
-            gathered = _all_gather_ranks(blocks, tp_group).reshape(tokens, -1)
-            merged = True
-        else:
-            gathered = _all_gather_ranks(candidates, tp_group)
-            merged = False
+        gathered, merged = _exchange_candidates(
+            candidates, tp_group, a2a_min_tokens, merge_op, ratio, topk
+        )
         attend_kwargs = {
             name: kwargs[name]
             for name in ("k_scale", "v_scale", "main_slot", "max_query_len")
@@ -581,5 +592,77 @@ def build_pooled_qsa_shard_op(tp_group, a2a_min_tokens: int = 0):
         )
         pool.copy_(updated)
         return output, selected
+
+    return run
+
+
+@functools.cache
+def _shard_pages_op():
+    pages = pallas.jax_op(
+        "qwen4_exp::pooled_qsa_shard_pages", pooled_qsa_shard_pages_step
+    )
+
+    @pages.register_fake
+    def pages_fake(
+        q,
+        gate,
+        lengths,
+        req,
+        main_table,
+        context,
+        gathered,
+        compress_ratio,
+        token_topk,
+        page_size,
+        merged=False,
+    ):
+        tokens = q.shape[0]
+        return (
+            q.new_empty(q.shape, dtype=torch.bfloat16),
+            gate.new_empty(gate.shape, dtype=torch.bfloat16),
+            lengths.new_empty((tokens, token_topk // compress_ratio + 1)),
+            lengths.new_empty((tokens,)),
+        )
+
+    return pages
+
+
+def build_pooled_qsa_shard_select_op(tp_group, a2a_min_tokens: int = 0):
+    """``build_pooled_qsa_select_op`` with the indexer split across ``tp_group``
+    (as ``build_pooled_qsa_shard_op``): returns ``(q, gate, pages, kv_lens)``
+    for an attention computed in the Qwen3.8 segment megakernel."""
+    world = int(tp_group.world_size)
+    rank = int(tp_group.rank_in_group)
+    # Build the Pallas ops now, at layer construction (see build_pooled_qsa_shard_op).
+    select, _ = _shard_ops(False)
+    merge_op = _merge_op()
+    pages_op = _shard_pages_op()
+
+    def run(*args, **kwargs):
+        args = list(args)
+        for index in (8, 11, 12, 13, 14, 15):
+            args[index] = args[index].to(torch.int32)
+        pool = args[10]
+        updated, q, gate, lengths, req, starts, candidates = select(
+            *args, shard_rank=rank, shard_size=world, **kwargs
+        )
+        pool.copy_(updated)
+        ratio, topk = kwargs["compress_ratio"], kwargs["token_topk"]
+        gathered, merged = _exchange_candidates(
+            candidates, tp_group, a2a_min_tokens, merge_op, ratio, topk
+        )
+        return pages_op(
+            q,
+            gate,
+            lengths,
+            req,
+            args[14],
+            args[12],
+            gathered,
+            ratio,
+            topk,
+            pool.shape[1],
+            merged=merged,
+        )
 
     return run

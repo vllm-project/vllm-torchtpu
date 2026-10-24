@@ -302,3 +302,58 @@ def test_shard_steps_compose_to_the_pooled_step(sharded_stand_ins, rows, merged)
     np.testing.assert_array_equal(np.asarray(out), np.asarray(want_out))
     for got, expected in zip(np.asarray(selected), np.asarray(want_selected)):
         np.testing.assert_array_equal(np.sort(got), np.sort(expected))
+
+
+@pytest.mark.parametrize("merged", [False, True])
+def test_shard_pages_compose_to_the_select_step(sharded_stand_ins, monkeypatch, merged):
+    """select -> gather -> pages equals the megakernel's replicated select step."""
+    from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_kernel
+
+    def gather_page_ids(page_indices, seq_page_ids, seq_ids, max_num_seqs, **_):
+        # CPU: the page-table lookup without the Pallas kernel.
+        table = page_indices.reshape(max_num_seqs, -1)
+        logical = jnp.clip(seq_page_ids, 0, table.shape[1] - 1)
+        return jnp.take_along_axis(table[seq_ids], logical, axis=1)
+
+    monkeypatch.setattr(sparse_kernel, "gather_page_ids", gather_page_ids)
+    head, pool, tail = mtp_rows._inputs(False, mtp_rows.STARTS, mtp_rows.CONTEXT)
+    options = dict(mtp_rows.OPTIONS, token_topk=256)
+    want_pool, want_q, want_gate, want_pages, want_lens = jax.jit(
+        lambda *args: pooled_qsa.pooled_qsa_select_step(*args, **options)
+    )(*head, pool, *tail)
+
+    size = 4
+    results = [
+        jax.jit(
+            lambda *args, rank=rank: pooled_qsa.pooled_qsa_shard_select_step(
+                *args, shard_rank=rank, shard_size=size, **options
+            )
+        )(*head, pool, *tail)
+        for rank in range(size)
+    ]
+    new_pool, q, gate, lengths, req, _, _ = results[0]
+    np.testing.assert_array_equal(
+        np.asarray(new_pool).view(np.uint8), np.asarray(want_pool).view(np.uint8)
+    )
+    gathered = jnp.stack([result[-1] for result in results])
+    if merged:
+        gathered = pooled_qsa.pooled_qsa_shard_merge(gathered, 4, 256)
+    got_q, got_gate, got_pages, got_lens = jax.jit(
+        lambda *args: pooled_qsa.pooled_qsa_shard_pages_step(
+            *args,
+            compress_ratio=4,
+            token_topk=256,
+            page_size=pool.shape[1],
+            merged=merged,
+        )
+    )(q, gate, lengths, req, tail[3], tail[1], gathered)
+    for got, want in ((got_q, want_q), (got_gate, want_gate)):
+        np.testing.assert_array_equal(
+            np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16)
+        )
+    np.testing.assert_array_equal(np.asarray(got_lens), np.asarray(want_lens))
+    # The merge may order a row's pages differently; the MK attends the set.
+    np.testing.assert_array_equal(
+        np.sort(np.asarray(got_pages), axis=1),
+        np.sort(np.asarray(want_pages), axis=1),
+    )

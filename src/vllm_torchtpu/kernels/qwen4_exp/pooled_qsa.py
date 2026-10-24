@@ -1664,6 +1664,51 @@ def pooled_qsa_shard_attend_rows_step(
     )
 
 
+def pooled_qsa_shard_pages_step(
+    q: jax.Array,
+    gate: jax.Array,
+    lengths: jax.Array,
+    req: jax.Array,
+    main_table: jax.Array,
+    context: jax.Array,
+    gathered: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    page_size: int,
+    merged: bool = False,
+) -> tuple[jax.Array, ...]:
+    """Finish ``pooled_qsa_shard_select_step`` for the segment megakernel.
+
+    Merges the gathered candidates as ``pooled_qsa_shard_attend_step`` does and
+    returns ``pooled_qsa_select_step``'s attention inputs ``(q, gate, pages,
+    kv_lens)`` instead of attending.
+    """
+    block_topk = token_topk // compress_ratio
+
+    def merge(_):
+        if merged:
+            return gathered
+        return pooled_qsa_shard_merge(gathered, compress_ratio, token_topk)
+
+    blocks = jax.lax.cond(
+        jnp.max(lengths) // compress_ratio <= block_topk,
+        lambda _: visible_blocks(lengths, compress_ratio, block_topk),
+        merge,
+        None,
+    )
+    table = main_table.reshape(len(context), -1)[req]
+    pages, kv_lens, _, _ = virtual_page_metadata(
+        blocks, lengths, table, ratio=compress_ratio, page_size=page_size
+    )
+    heads = q.shape[1]
+    return (
+        q.astype(jnp.bfloat16),
+        gate.reshape(len(q), heads, -1).astype(jnp.bfloat16),
+        pages.astype(jnp.int32),
+        kv_lens.astype(jnp.int32),
+    )
+
+
 def pooled_qsa_step(
     qgate: jax.Array,
     key: jax.Array,

@@ -407,6 +407,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             self._select_op = partial(build_pooled_qsa_select_op(), **keywords)
         self.main_slot = max(main_slot, 0)
         self._shard_op = None
+        self._shard_select_op = None
         if envs.VLLM_TPU_QSA_INDEXER_SHARD and self.tp_size > 1:
             from vllm.distributed import get_tp_group
 
@@ -424,6 +425,18 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 kv_heads=self.num_kv_heads,
                 **keywords,
             )
+            if self._select_op is not None:
+                # The megakernel's select op, with the indexer sharded too.
+                from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
+                    build_pooled_qsa_shard_select_op,
+                )
+
+                self._shard_select_op = partial(
+                    build_pooled_qsa_shard_select_op(
+                        group, envs.VLLM_TPU_QSA_INDEXER_SHARD_A2A_MIN_TOKENS
+                    ),
+                    **keywords,
+                )
 
     def get_kv_cache_spec(self, vllm_config):
         return get_qsa_cache_specs(self.config, self.tp_size, self.cache_dtype)[0]
@@ -654,7 +667,10 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 "select_for_kernel needs VLLM_TPU_MEGAKERNEL set at construction "
                 "(the select op is not built lazily inside forward)"
             )
-        q, gate, pages, kv_lens = self._select_op(
+        select = self._select_op
+        if getattr(self, "_shard_select_op", None) is not None:
+            select = self._shard_select_op
+        q, gate, pages, kv_lens = select(
             self.q_proj(hidden),
             self.k_proj(hidden),
             self.v_proj(hidden),
