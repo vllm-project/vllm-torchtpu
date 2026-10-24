@@ -609,6 +609,23 @@ class TestTpuPlatform:
         assert vllm_config.scheduler_config.max_num_scheduled_tokens is None
 
     @pytest.mark.parametrize(
+        "compile_sizes",
+        [["cudagraph_capture_sizes"], [16, "cudagraph_capture_sizes"]],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_rejects_string_compile_sizes(
+        self, mock_prepare_env, mock_apply_patches, vllm_config, compile_sizes
+    ):
+        # TPU never expands vLLM's "cudagraph_capture_sizes" placeholder.
+        vllm_config.compilation_config.compile_sizes = compile_sizes
+
+        with pytest.raises(ValueError, match="compile_sizes entries must be integers"):
+            TpuPlatform.check_and_update_config(vllm_config)
+
+    @pytest.mark.parametrize(
         ("linear", "max_model_len", "added"),
         [
             (False, 32768, []),

@@ -29,7 +29,6 @@ import vllm.envs as vllm_envs
 from torch_tpu._internal import compile as _register_tpu_backend  # noqa: F401
 from torch_tpu._internal.utils import hardware
 from vllm.platforms.interface import Platform, PlatformEnum
-from vllm.utils.math_utils import cdiv
 
 from vllm_torchtpu import envs, patch_registry
 from vllm_torchtpu.logger import init_logger
@@ -803,6 +802,15 @@ class TpuPlatform(Platform):
                 ),
             )
         else:
+            # TPU never expands vLLM's "cudagraph_capture_sizes" placeholder
+            # (no static graph mode), and the runner needs integer buckets.
+            if strings := [
+                s for s in compilation_config.compile_sizes if isinstance(s, str)
+            ]:
+                raise ValueError(
+                    f"compile_sizes entries must be integers on TPU, got {strings}. "
+                    "List the token sizes to compile instead."
+                )
             compilation_config.compile_sizes = sorted(compilation_config.compile_sizes)
 
         if envs.TPU_MOE_SEQUENCE_PARALLEL:
@@ -1399,33 +1407,45 @@ def _validate_token_budget_fits_compile_sizes(vllm_config: VllmConfig) -> None:
     vLLM's scheduler bounds a step by max_num_batched_tokens and, when it is
     smaller, by max_num_scheduled_tokens. vLLM fills max_num_scheduled_tokens
     from max_num_batched_tokens under speculative decoding, so a set value
-    does not mean the user chose it. Under prefill context parallelism a
-    compile size counts rows per rank, so a step may hold pcp times as many
-    tokens.
+    does not mean the user chose it.
+
+    Under prefill context parallelism a compile size counts rows on one rank.
+    The runner deals a step's tokens to ranks in chunks of
+    cp_kv_cache_interleave_size, round-robin from rank 0
+    (pcp_local_token_counts), so rank 0 holds the most rows and is the one
+    that must fit.
 
     Raises:
-        ValueError: if the per-step budget exceeds the largest compile size
-            times the prefill context parallel size.
+        ValueError: if a step of the full budget could put more rows on one
+            rank than the largest compile size.
     """
     cc = vllm_config.compilation_config
     sc = vllm_config.scheduler_config
-    if not cc.compile_sizes or any(isinstance(s, str) for s in cc.compile_sizes):
+    if not cc.compile_sizes:
         return
-    pcp = max(1, int(vllm_config.parallel_config.prefill_context_parallel_size))
+    pc = vllm_config.parallel_config
+    pcp = max(1, int(pc.prefill_context_parallel_size))
+    interleave = max(1, int(pc.cp_kv_cache_interleave_size)) if pcp > 1 else 1
+    cycle = pcp * interleave
     largest = max(int(s) for s in cc.compile_sizes)
-    limit = largest * pcp
+    # The largest step whose rank-0 rows fit `largest`.
+    limit = (largest // interleave) * cycle + largest % interleave
     budget_flag, budget = "--max-num-batched-tokens", sc.max_num_batched_tokens
     scheduled = sc.max_num_scheduled_tokens
     if scheduled is not None and scheduled < budget:
         budget_flag, budget = "--max-num-scheduled-tokens", scheduled
     if budget <= limit:
         return
-    # Rounded up: the hint must pass this check, largest * pcp >= budget.
-    min_compile_size = cdiv(budget, pcp)
+    # Rank-0 rows of a full-budget step: the smallest compile size that fits.
+    min_compile_size = (budget // cycle) * interleave + min(budget % cycle, interleave)
+    layout = (
+        f", {pcp} prefill context parallel ranks, interleave {interleave}"
+        if pcp > 1
+        else ""
+    )
     raise ValueError(
-        f"{budget_flag} ({budget}) exceeds the largest compile_sizes entry "
-        f"({largest} x {pcp} prefill context parallel ranks = {limit} tokens), "
-        f"so a step could have no compiled size to pad to. Set {budget_flag} "
-        f"to at most {limit}, or add a compile size of at least "
-        f"{min_compile_size}."
+        f"{budget_flag} ({budget}) exceeds the largest step that fits "
+        f"compile_sizes (largest entry {largest}{layout}: {limit} tokens), so "
+        f"a step could have no compiled size to pad to. Set {budget_flag} to "
+        f"at most {limit}, or add a compile size of at least {min_compile_size}."
     )
