@@ -701,6 +701,10 @@ class PrefixAwareScheduler(AsyncScheduler):
         return cached
 
     def schedule(self, *args, **kwargs):
+        from vllm_torchtpu.runner import host_trims
+
+        host_trims.on_scheduler_step(self.vllm_config)
+
         connector = getattr(self, "connector", None)
         if connector is not None:
             poll_fn = getattr(connector, "poll_and_complete_transfers", None)
