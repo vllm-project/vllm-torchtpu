@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import sys
+from typing import Any
 from unittest import mock
 
 import jax
@@ -483,6 +484,125 @@ class GDNStatePipelineRaceTest(parameterized.TestCase):
         finally:
             mosaic_interpret._clear_shared_memory = orig_clear
             pltpu.reset_tpu_interpret_mode_state()
+
+    @parameterized.named_parameters(
+        dict(
+            testcase_name="conv_state_bf16",
+            kernel_conv_state_dtype=jnp.bfloat16,
+        ),
+        dict(
+            testcase_name="conv_weight_bf16",
+            kernel_conv_weight_dtype=jnp.bfloat16,
+        ),
+        dict(
+            testcase_name="conv_state_and_weight_bf16",
+            kernel_conv_state_dtype=jnp.bfloat16,
+            kernel_conv_weight_dtype=jnp.bfloat16,
+        ),
+    )
+    def test_kernel_storage_dtypes_interpret_parity(self, **kernel_dtypes):
+        """Mixed decode + multi-tile continuing prefill under bf16 storage dtypes."""
+        kwargs = _continuing_batch_kwargs(
+            lengths=[1, 1, 1, 1, 3, 4],
+            num_decodes=4,
+            n_kq=1,
+            n_v=2,
+        )
+        states_ref, output_ref = gdn_attention_ref(**kwargs)
+
+        kernel_dtypes = {k: jnp.dtype(v) for k, v in kernel_dtypes.items()}
+        mesh = AbstractMesh(
+            (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
+        )
+        pltpu.reset_tpu_interpret_mode_state()
+        try:
+            with (
+                use_abstract_mesh(mesh),
+                mock.patch.object(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", False),
+                pltpu.force_tpu_interpret_mode(
+                    pltpu.InterpretParams(skip_floating_point_ops=False)
+                ),
+            ):
+                states, output = wrapper.fused_conv1d_gdn(
+                    **kwargs,
+                    decode_tile_size=2,
+                    mixed_tile_size=1,
+                    **kernel_dtypes,
+                )
+                jax.block_until_ready((states, output))
+        finally:
+            pltpu.reset_tpu_interpret_mode_state()
+
+        np.testing.assert_allclose(output, output_ref, rtol=2e-2, atol=2e-2)
+        for state, state_ref in zip(states, states_ref, strict=True):
+            np.testing.assert_allclose(state, state_ref, rtol=2e-2, atol=2e-2)
+
+    def test_kernel_act_dtype_must_be_float32(self):
+        """The kernel's activation loads only handle 32-bit elements."""
+        kwargs = _continuing_batch_kwargs(
+            lengths=[1, 1, 2],
+            num_decodes=2,
+            n_kq=1,
+            n_v=2,
+        )
+        with self.assertRaisesRegex(ValueError, "kernel_act_dtype"):
+            wrapper.fused_conv1d_gdn(
+                **kwargs,
+                kernel_act_dtype=jnp.dtype(jnp.bfloat16),
+            )
+
+
+def _continuing_batch_kwargs(
+    *,
+    lengths: list[int] | None = None,
+    num_decodes: int = 8,
+    n_kq: int = 2,
+    n_v: int = 8,
+) -> dict[str, Any]:
+    """A mixed decode + prefill batch whose sequences continue a prior context.
+
+    `seq_lens` exceeds the query lengths, so the kernel reads the conv and
+    recurrent states from their slots instead of starting from zero. Inputs are
+    float32 so that the kernel's own storage casts are what gets exercised.
+    """
+    kq_head_dim, v_head_dim, kernel_size = 128, 128, 4
+    if lengths is None:
+        lengths = [1] * 8 + [128, 128, 256]
+    max_reqs = len(lengths)
+    num_tokens = sum(lengths)
+    dim = 2 * n_kq * kq_head_dim + n_v * v_head_dim
+    # Slot 0 is the null block for padded tokens.
+    num_blocks = max_reqs + 1
+
+    rngs = iter(jax.random.split(jax.random.key(5), 10))
+
+    def normal(*shape: int) -> jax.Array:
+        return jax.random.normal(next(rngs), shape)
+
+    q_loc = jnp.array(np.cumsum([0] + lengths), dtype=jnp.int32)
+    query_lens = q_loc[1:] - q_loc[:-1]
+
+    return dict(
+        qkv=normal(num_tokens, dim),
+        b=normal(num_tokens, n_v),
+        a=normal(num_tokens, n_v),
+        conv_state=normal(num_blocks, kernel_size - 1, dim) * 0.5,
+        recurrent_state=normal(num_blocks, n_v, kq_head_dim, v_head_dim) * 0.1,
+        conv_weight=normal(dim, 1, kernel_size),
+        conv_bias=normal(dim),
+        a_log=normal(n_v),
+        dt_bias=normal(n_v),
+        query_start_loc=q_loc,
+        state_indices=jnp.arange(1, max_reqs + 1, dtype=jnp.int32),
+        distribution=jnp.array([num_decodes, max_reqs, max_reqs], jnp.int32),
+        # context_len = 16 for every sequence, so has_initial_state is True.
+        seq_lens=(query_lens + 16).astype(jnp.int32),
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=kq_head_dim,
+        d_v=v_head_dim,
+        kernel_size=kernel_size,
+    )
 
 
 @pytest.mark.tpu_test
@@ -1073,6 +1193,41 @@ class GDNAttentionTest(parameterized.TestCase):
         # reference; Step B (continuation) must match the second half.
         np.testing.assert_allclose(output_a, output_ref[:half], rtol=2e-2, atol=2e-2)
         np.testing.assert_allclose(output_b, output_ref[half:], rtol=2e-2, atol=2e-2)
+
+    @parameterized.named_parameters(
+        dict(
+            testcase_name="conv_state_bf16",
+            kernel_conv_state_dtype=jnp.bfloat16,
+        ),
+        dict(
+            testcase_name="conv_weight_bf16",
+            kernel_conv_weight_dtype=jnp.bfloat16,
+        ),
+        dict(
+            testcase_name="conv_state_and_weight_bf16",
+            kernel_conv_state_dtype=jnp.bfloat16,
+            kernel_conv_weight_dtype=jnp.bfloat16,
+        ),
+    )
+    def test_kernel_storage_dtypes_match_reference(self, **kernel_dtypes):
+        """Storage dtype overrides match the float32 eager reference."""
+        kwargs = _continuing_batch_kwargs()
+        states_ref, output_ref = gdn_attention_ref(**kwargs)
+
+        kernel_dtypes = {k: jnp.dtype(v) for k, v in kernel_dtypes.items()}
+        states, output = wrapper.fused_conv1d_gdn(**kwargs, **kernel_dtypes)
+
+        np.testing.assert_allclose(output, output_ref, rtol=2e-2, atol=2e-2)
+        for state, state_ref in zip(states, states_ref, strict=True):
+            np.testing.assert_allclose(state, state_ref, rtol=2e-2, atol=2e-2)
+
+    def test_kernel_act_dtype_must_be_float32(self):
+        """The kernel's activation loads only handle 32-bit elements."""
+        with self.assertRaisesRegex(ValueError, "kernel_act_dtype"):
+            wrapper.fused_conv1d_gdn(
+                **_continuing_batch_kwargs(),
+                kernel_act_dtype=jnp.dtype(jnp.bfloat16),
+            )
 
     def test_dynamic_tiling_with_mixed_and_decode_parity(self):
         """Verifies dynamic tiling matches static output and state."""
