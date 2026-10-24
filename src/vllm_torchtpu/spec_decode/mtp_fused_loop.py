@@ -31,15 +31,13 @@ which ``support_torch_compile`` cannot read.
 """
 
 import inspect
-from typing import Any, Protocol, cast
+from typing import Any, Protocol
 
 import torch
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.sequence import IntermediateTensors
-
-from vllm_torchtpu.spec_decode.utils import draft_greedy_tokens
 
 
 class MtpDraftModel(Protocol):
@@ -98,7 +96,9 @@ class _MtpFusedLoop(nn.Module):
                 last_hidden, hidden_states = out
             else:
                 last_hidden = hidden_states = out
-            input_ids = draft_greedy_tokens(cast(nn.Module, self.mtp), last_hidden)
+            input_ids = (
+                self.mtp.compute_logits(last_hidden).argmax(dim=-1).to(torch.int32)
+            )
             tokens.append(input_ids)
         return tuple(tokens)
 

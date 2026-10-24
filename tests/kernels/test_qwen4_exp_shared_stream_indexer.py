@@ -373,3 +373,37 @@ def test_shared_stream_lowers_to_one_query_block_per_request(
         text = select.trace(*args).lower(lowering_platforms=("tpu",)).as_text()
     assert f"StreamIdxTC-m-bq_{query_block}-bkvp_{kv_block // 32}" in text
     assert "StreamIdxTC-d-bq_1-bkvp_8" in text
+
+
+@pytest.mark.parametrize("tokens,expect", [(32, 32), (64, 8)])
+def test_single_token_block_only_on_single_token_steps(monkeypatch, tokens, expect):
+    """VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK sizes the one-token decode pass on
+    steps of at most one token per request; verify steps keep 256 keys."""
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    monkeypatch.setenv("VLLM_TPU_QSA_DECODE_QUERY_BLOCK", "4")
+    monkeypatch.setenv("VLLM_TPU_QSA_DECODE_KV_BLOCK", "1024")
+    monkeypatch.setenv("VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK", "1024")
+    shape = jax.ShapeDtypeStruct
+    args = (
+        shape((tokens, 4, 128), jnp.bfloat16),
+        shape((64, 512, 1, 2, 256), jnp.bfloat16),
+        shape((tokens,), jnp.int32),
+        shape((32, 16), jnp.int32),
+        shape((tokens,), jnp.int32),
+        shape((33,), jnp.int32),
+        shape((32,), jnp.int32),
+    )
+    select = jax.jit(
+        functools.partial(
+            pooled_qsa.select_blocks, ratio=RATIO, block_topk=512, max_query_len=4
+        )
+    )
+    mesh = jax.sharding.AbstractMesh(
+        (1,),
+        ("x",),
+        abstract_device=jax.sharding.AbstractDevice("TPU7x", 1, "tpu"),
+    )
+    with jax.sharding.use_abstract_mesh(mesh):
+        text = select.trace(*args).lower(lowering_platforms=("tpu",)).as_text()
+    assert f"StreamIdxTC-d-bq_1-bkvp_{expect}" in text

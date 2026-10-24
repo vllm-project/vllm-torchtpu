@@ -46,7 +46,6 @@ from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _force_draft_tp1,
     dp_lockstep_num_reqs,
-    draft_greedy_tokens,
     iter_mtp_shared_heads,
     maybe_share_embeddings,
     maybe_share_lm_head,
@@ -1263,7 +1262,9 @@ class Eagle3Proposer:
             # No draft->target mapping table. Upstream compute_logits then asserts
             # the head is already target-vocab-width, so plain argmax yields
             # target ids.
-            return draft_greedy_tokens(self.draft_model, hidden)
+            return (
+                self.draft_model.compute_logits(hidden).argmax(dim=-1).to(torch.int32)
+            )
         draft_id = self.draft_model.logits_processor(
             self.draft_model.lm_head, hidden
         ).argmax(dim=-1)

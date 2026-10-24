@@ -813,7 +813,15 @@ def select_blocks(
     query_block = envs.VLLM_TPU_QSA_DECODE_QUERY_BLOCK
     if query_block:
         kv_block = envs.VLLM_TPU_QSA_DECODE_KV_BLOCK
-        decode_kv_block = envs.VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK
+        # The larger single-token block only pays on steps whose requests
+        # carry one token (MTP draft rows, plain decode). On verify steps the
+        # one-token decode passes are empty and a larger block makes them
+        # slower, so they keep the 256-key block.
+        decode_kv_block = (
+            envs.VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK
+            if len(query) <= len(context)
+            else 256
+        )
         for name, block in (
             ("VLLM_TPU_QSA_DECODE_KV_BLOCK", kv_block),
             ("VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK", decode_kv_block),

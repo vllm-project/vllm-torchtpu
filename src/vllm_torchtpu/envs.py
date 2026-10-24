@@ -101,7 +101,6 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_QUERY_BLOCK: int = 0
     VLLM_TPU_QSA_DECODE_KV_BLOCK: int = 1024
     VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK: int = 256
-    VLLM_TPU_MTP_DRAFT_TOP_TOKENS: bool = False
     VLLM_TPU_QSA_RING_SELECT: bool = False
     VLLM_TPU_QSA_RING_DMA_BATCH: int = 0
     VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
@@ -538,17 +537,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_DECODE_KV_BLOCK": env_nonnegative_int(
         "VLLM_TPU_QSA_DECODE_KV_BLOCK", 1024
     ),
-    # Compressed keys per KV block for the one-token requests of that pass
-    # (decode rows, MTP draft rows); exact selection at any block size. Only
-    # read when VLLM_TPU_QSA_DECODE_QUERY_BLOCK > 0.
+    # Compressed keys per KV block for the one-token requests of that pass on
+    # steps of at most one token per request (MTP draft rows, plain decode);
+    # verify steps keep 256. Exact selection at any block size. Only read
+    # when VLLM_TPU_QSA_DECODE_QUERY_BLOCK > 0.
     "VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK": env_nonnegative_int(
         "VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK", 256
-    ),
-    # MTP/Eagle drafts: greedy draft tokens from the vocabulary-parallel
-    # argmax (LogitsProcessor.get_top_tokens: per-rank argmax, (value, index)
-    # pairs exchanged) instead of all-gathering the draft logits. Same tokens.
-    "VLLM_TPU_MTP_DRAFT_TOP_TOKENS": env_bool(
-        "VLLM_TPU_MTP_DRAFT_TOP_TOKENS", default=False
     ),
     # Qwen4-exp pooled QSA: request row r owns ring row r, so the indexer
     # update's whole-row ring/tag gathers and final scatter become selects.
