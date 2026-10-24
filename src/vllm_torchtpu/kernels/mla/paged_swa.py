@@ -46,25 +46,12 @@ def write_swa_pages(
         capacity = bank.shape[0] * page_size
         valid = (records >= max(base, page_size)) & (records < base + capacity)
         local = jnp.where(valid, records - base, capacity)
-        flat = bank.reshape(-1, 512)
-
-        def scatter(owner, *, local=local):
-            return owner.at[local].set(values, mode="drop", unique_indices=True)
-
-        if records.size <= capacity:
-            # A contiguous request can publish the whole range in one update.
-            # Keep padded tokens unchanged, including their BF16 neighbours.
-            def contiguous(owner, *, local=local, valid=valid):
-                previous = jax.lax.dynamic_slice(owner, (local[0], 0), values.shape)
-                update = jnp.where(valid[:, None], values, previous)
-                return jax.lax.dynamic_update_slice(owner, update, (local[0], 0))
-
-            consecutive = (local[0] + records.size <= capacity) & jnp.all(
-                (~valid) | (local == local[0] + jnp.arange(records.size))
+        # Keep one paged owner for both publication and attention. Returning
+        # flat and paged views across a conditional can copy the entire pool.
+        result.append(
+            bank.at[local // page_size, local % page_size].set(
+                values, mode="drop", unique_indices=True
             )
-            updated = jax.lax.cond(consecutive, contiguous, scatter, flat)
-        else:
-            updated = scatter(flat)
-        result.append(updated.reshape(bank.shape))
+        )
         base += capacity
     return (result[0], result[1]) if isinstance(pages, tuple) else result[0]

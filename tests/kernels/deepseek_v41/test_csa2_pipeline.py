@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v41.csa2 import pipeline as pipeline_module
@@ -180,6 +181,44 @@ def test_native_swa_publication_preserves_bf16_bits():
     actual = jax.lax.bitcast_convert_type(updated, jnp.uint16).reshape(-1, 512)
     np.testing.assert_array_equal(actual[records], bits)
     np.testing.assert_array_equal(actual[jnp.array([16, 18, 30, 33])], 0)
+
+
+def test_native_swa_shared_owner_avoids_pool_sized_temporaries():
+    if jax.default_backend() != "tpu":
+        pytest.skip("Requires TPU buffer assignment")
+
+    def read_page(pages_ref, output_ref):
+        output_ref[...] = pages_ref[0, :, :]
+
+    read = pl.pallas_call(
+        read_page,
+        out_shape=jax.ShapeDtypeStruct((32, 512), jnp.bfloat16),
+        in_specs=[pl.BlockSpec((1, 32, 512), lambda i: (1, 0, 0))],
+        grid=(1,),
+    )
+
+    def update_and_read(pages, records, values):
+        outputs = []
+        for layer in range(3):
+            pages = write_swa_pages(pages, records, values + layer)
+            outputs.append(read(pages))
+        return pages, jnp.stack(outputs)
+
+    pages = jnp.zeros((1024, 32, 512), jnp.bfloat16)
+    pool_bytes = pages.nbytes
+    records = jnp.arange(288, dtype=jnp.int32) * 2 + 32
+    values = jnp.ones((288, 512), jnp.bfloat16)
+    compiled = (
+        jax.jit(update_and_read, donate_argnums=(0,))
+        .lower(pages, records, values)
+        .compile()
+    )
+    _, outputs = compiled(pages, records, values)
+    expected = np.zeros((3, 32, 512), dtype=np.float32)
+    expected[:, ::2] = np.arange(1, 4)[:, None, None]
+    np.testing.assert_array_equal(outputs, expected)
+    # An attention read followed by another write must reuse the shared owner.
+    assert compiled.memory_analysis().temp_size_in_bytes < pool_bytes
 
 
 @pytest.fixture
