@@ -219,3 +219,30 @@ def test_duplicate_main_rows_keep_last_writer(interpret):
         if valid[i]:
             expected[2, int(offset[i]), :, 2:] = raw(rows)[i, :, :2]
     np.testing.assert_array_equal(raw(write(pool, rows)), expected)
+
+
+def test_rings_stay_on_separate_writer(interpret, monkeypatch):
+    """Stopgap: the fused kernel leaves ring/tag writes to write_ring_and_tags.
+
+    Serving hung on its first warmup forward when the fused kernel also wrote
+    the rings; with the rings on the separate writer it serves.
+    """
+    fused_ids, ring_calls = [], []
+    original_fused = fused_kv_write.fused_layer_write
+    original_ring = pooled_qsa.write_ring_and_tags
+
+    def fused(*args, **kwargs):
+        fused_ids.append(len(kwargs["ring_ids"]))
+        return original_fused(*args, **kwargs)
+
+    def ring(pool, ring, tags, ids):
+        ring_calls.append(ids)
+        return original_ring(pool, ring, tags, ids)
+
+    monkeypatch.setattr(pooled_qsa, "fused_layer_write", fused)
+    monkeypatch.setattr(pooled_qsa, "write_ring_and_tags", ring)
+    rng = np.random.default_rng(11)
+    args = make_step(rng, [4, 4], [5, 9], jnp.float8_e4m3fn)
+    run(monkeypatch, True, args, main_slot=1, max_query_len=4)
+    assert len(fused_ids) == 1
+    assert len(ring_calls) == 1

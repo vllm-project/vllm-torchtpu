@@ -1032,10 +1032,18 @@ def _pooled_qsa(
             comp_values=values,
             ring=ring.reshape(len(ids), -1),
             tags=tags.reshape(len(ids), -1),
-            ring_ids=ids,
+            # Stopgap: the served model hangs on its first warmup forward
+            # when this kernel also writes the rings (it serves with any one
+            # region on the separate writers; the kernel alone does not
+            # hang). Keep the rings on write_ring_and_tags until the
+            # interaction is understood.
+            ring_ids=jnp.zeros_like(ids),
             run_starts=starts[:-1],
             run_lengths=starts[1:] - starts[:-1],
             run_length=max_query_len,
+        )
+        pool = write_ring_and_tags(
+            pool, ring.reshape(len(ids), -1), tags.reshape(len(ids), -1), ids
         )
     else:
         pool = write_compressed(
