@@ -24,7 +24,7 @@ import pytest
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
     SparseCoreTopK,
 )
-from vllm_torchtpu.kernels.qwen4_exp import decode_indexer, pooled_qsa, qsa_rpa
+from vllm_torchtpu.kernels.qwen4_exp import decode_indexer, pooled_qsa
 from vllm_torchtpu.kernels.qwen4_exp.qsa import _token_metadata
 
 
@@ -172,61 +172,6 @@ def test_default_is_original_sparsecore_and_jit_backend_identity(monkeypatch):
     fn.clear_cache()
 
 
-def test_nonpooled_step_passes_original_request_geometry_and_backend(monkeypatch):
-    backend = ReferenceTopK()
-    seen = []
-
-    def select(q, cache, lengths, table, req, **kwargs):
-        seen.append(kwargs)
-        return jnp.full((len(q), 16), -1, jnp.int32)
-
-    monkeypatch.setattr(qsa_rpa, "select_decode_blocks", select)
-    monkeypatch.setattr(
-        qsa_rpa,
-        "qsa_attention",
-        lambda q, gate, blocks, lengths, table, cache, starts, **kw: (
-            jnp.zeros_like(q),
-            cache,
-        ),
-    )
-    tokens = 4
-    norm = jnp.zeros((128,), jnp.bfloat16)
-    starts = jnp.array([0, 3, 4], jnp.int32)
-    context = jnp.array([0, 0], jnp.int32)
-    # Real producer, scatter and ring/compression update, only selector and
-    # attention boundaries recorded here; hardware tests cover their arithmetic.
-    qsa_rpa.qsa_step(
-        jnp.ones((tokens, 256), jnp.bfloat16),
-        jnp.ones((tokens, 128), jnp.bfloat16),
-        jnp.ones((tokens, 128), jnp.bfloat16),
-        jnp.ones((tokens, 256), jnp.bfloat16),
-        norm,
-        norm,
-        norm,
-        norm,
-        jnp.arange(tokens, dtype=jnp.int32),
-        jnp.tile(jnp.array([[1, 0]], jnp.bfloat16), (8, 1)),
-        jnp.zeros((2, 128, 1, 2, 128), jnp.bfloat16),
-        jnp.zeros((2, 32, 1, 128), jnp.bfloat16),
-        jnp.zeros((2, 8, 128), jnp.bfloat16),
-        jnp.zeros((2, 8, 2), jnp.int32),
-        starts,
-        context,
-        jnp.arange(2, dtype=jnp.int32),
-        jnp.array([[0], [1]], jnp.int32),
-        jnp.array([[0], [1]], jnp.int32),
-        compress_ratio=4,
-        token_topk=64,
-        norm_eps=1e-6,
-        rotary_dim=2,
-        topk_backend=backend,
-    )
-    assert len(seen) == 1
-    assert seen[0]["topk_backend"] is backend
-    assert seen[0]["starts"] is starts
-    assert seen[0]["context"] is context
-
-
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("tokens,requests", [(4, 8), (8, 8), (128, 8), (512, 8)])
 @pytest.mark.parametrize("alternate", [False, True])
@@ -289,8 +234,7 @@ def test_native_factories_accept_default_and_bound_backend_without_backend_init(
     initialized = torch.tpu.is_initialized()
     clients = tuple(xla_bridge._backends)
     for name, fn in [
-        ("pooled", pooled_qsa.pooled_qsa_step),
-        ("nonpooled", qsa_rpa.qsa_step),
+        ("compact_pooled", pooled_qsa.compact_pooled_qsa_step),
     ]:
         for label, core in [
             ("default", fn),
@@ -302,19 +246,29 @@ def test_native_factories_accept_default_and_bound_backend_without_backend_init(
     assert tuple(xla_bridge._backends) == clients
 
 
-def test_pooled_step_forwards_backend_before_attention(monkeypatch):
+@pytest.mark.parametrize("tokens", [1, 4])
+def test_pooled_step_forwards_geometry_and_backend_before_attention(
+    monkeypatch, tokens
+):
     backend = ReferenceTopK()
     seen = []
 
     def select(query, pool, lengths, table, req, starts, context, **kwargs):
-        seen.append(kwargs["topk_backend"])
+        seen.append(
+            (kwargs["topk_backend"], starts, context, kwargs["vmem_limit_bytes"])
+        )
         return jnp.full((len(query), 16), -1, jnp.int32)
 
     # Record just the indexer boundary. The native lifecycle test separately
     # executes the real cache I/O and full attention on TPU.
     monkeypatch.setattr(pooled_qsa, "select_blocks", select)
     monkeypatch.setattr(pooled_qsa, "write_main_cache", lambda pool, *a: pool)
-    monkeypatch.setattr(pooled_qsa, "write_compressed", lambda pool, *a: pool)
+
+    def write_compressed(pool, *args, logical_block_size):
+        assert logical_block_size == 128
+        return pool
+
+    monkeypatch.setattr(pooled_qsa, "write_compressed", write_compressed)
     monkeypatch.setattr(pooled_qsa, "write_ring_and_tags", lambda pool, *a: pool)
     monkeypatch.setattr(
         pooled_qsa,
@@ -332,21 +286,31 @@ def test_pooled_step_forwards_backend_before_attention(monkeypatch):
             pool,
         ),
     )
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        pooled_qsa.pltpu,
+        "get_tpu_info",
+        lambda: SimpleNamespace(vmem_capacity_bytes=16 * 1024**2),
+    )
     norm = jnp.zeros((128,), jnp.bfloat16)
-    pooled_qsa.pooled_qsa_step(
-        jnp.ones((1, 256), jnp.bfloat16),
-        jnp.ones((1, 128), jnp.bfloat16),
-        jnp.ones((1, 128), jnp.bfloat16),
-        jnp.ones((1, 256), jnp.bfloat16),
+    starts = jnp.array([0, tokens, tokens], jnp.int32)
+    context = jnp.zeros((2,), jnp.int32)
+    pooled_qsa.compact_pooled_qsa_step(
+        jnp.ones((tokens, 256), jnp.bfloat16),
+        jnp.ones((tokens, 128), jnp.bfloat16),
+        jnp.ones((tokens, 128), jnp.bfloat16),
+        jnp.ones((tokens, 256), jnp.bfloat16),
         norm,
         norm,
         norm,
         norm,
-        jnp.array([0], jnp.int32),
+        jnp.arange(tokens, dtype=jnp.int32),
         jnp.tile(jnp.array([[1, 0]], jnp.bfloat16), (8, 1)),
         jnp.zeros((4, 128, 1, 2, 128), jnp.bfloat16),
-        jnp.array([0, 1, 1], jnp.int32),
-        jnp.zeros((2,), jnp.int32),
+        jnp.zeros((4, 16, 1, 2, 128), jnp.bfloat16),
+        starts,
+        context,
         jnp.array([3, 0], jnp.int32),
         jnp.array([[1], [0]], jnp.int32),
         jnp.array([[2], [0]], jnp.int32),
@@ -356,4 +320,6 @@ def test_pooled_step_forwards_backend_before_attention(monkeypatch):
         rotary_dim=2,
         topk_backend=backend,
     )
-    assert seen == [backend]
+    assert len(seen) == 1
+    assert seen[0][0] is backend and seen[0][1] is starts and seen[0][2] is context
+    assert seen[0][3] == 16 * 1024**2
