@@ -80,6 +80,7 @@ def apply_omni_model_specific_patches() -> None:
     _patch_diffusion_startup_warmup_sync()
     _patch_wan_fused_qk_norm_rope()
     _patch_wan_fresh_timestep()
+    _patch_sdpa_fallback_dispatch()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -340,3 +341,36 @@ def _wrap_fresh_timestep(cls: type) -> None:
 
     setattr(_fresh_timestep_forward, _FRESH_TIMESTEP_PATCHED, True)
     cls.forward = _fresh_timestep_forward
+
+
+_SDPA_FALLBACK_PATCHED = "_tpu_sdpa_fallback_patched"
+
+
+def _patch_sdpa_fallback_dispatch() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove once vLLM-Omni's AttentionImpl.forward dispatches
+    # out-of-tree platforms instead of raising NotImplementedError.
+    #
+    # Problem: Attention builds `sdpa_fallback` from vLLM-Omni's SDPAImpl,
+    #   whatever the selected backend. AttentionImpl.forward picks
+    #   forward_cuda/_npu/... from the platform and raises NotImplementedError
+    #   on TPU, so every sdpa_fallback call fails there.
+    # Fix: SDPAImpl.forward is replaced by TpuSDPAImpl.forward, which runs
+    #   SDPAImpl._forward_impl with broadcast key masks, as forward_cuda does.
+    # Effect: sdpa_fallback calls run on TPU instead of raising
+    #   NotImplementedError. LTX-2's _LTX2ParallelAttention sends masked calls
+    #   to sdpa_fallback: with sequence parallelism the audio latents are
+    #   padded to a multiple of the SP size, so audio self-attention and
+    #   audio-to-video cross-attention carry a key-padding mask. SANA-Video,
+    #   LingBot-Video and SenseNova-U1 also call sdpa_fallback.
+    # -------------------------------------------------------------------------
+    from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
+
+    from vllm_torchtpu.omni.attention import TpuSDPAImpl
+
+    if getattr(SDPAImpl.forward, _SDPA_FALLBACK_PATCHED, False):
+        return
+    # The flag lands on TpuSDPAImpl.forward, the function shared by both classes.
+    setattr(TpuSDPAImpl.forward, _SDPA_FALLBACK_PATCHED, True)
+    SDPAImpl.forward = TpuSDPAImpl.forward
+    logger.info("Applied TPU patch: SDPAImpl.forward routes to TpuSDPAImpl.")

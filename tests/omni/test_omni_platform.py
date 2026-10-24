@@ -13,6 +13,7 @@
 # limitations under the License.
 import os
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -25,6 +26,7 @@ from .mock_omni import (  # isort: split
 )
 
 import vllm_omni
+from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
 
 from vllm_torchtpu.omni import register_omni_tpu_platform
@@ -36,7 +38,9 @@ from vllm_torchtpu.omni.attention import (
     TpuSDPAImpl,
 )
 from vllm_torchtpu.omni.patches import (
+    _SDPA_FALLBACK_PATCHED,
     _patch_diffusion_startup_warmup_sync,
+    _patch_sdpa_fallback_dispatch,
     apply_omni_model_specific_patches,
     apply_omni_tpu_patches,
 )
@@ -546,3 +550,40 @@ def test_wan_self_attention_patch_falls_back_on_f32():
 
     apply_omni_model_specific_patches()
     assert WanSelfAttention()(torch.ones(1, 3, 8)) == "native"
+
+
+def test_sdpa_fallback_routes_to_tpu_sdpa(monkeypatch):
+    # Upstream AttentionImpl.forward raises on out-of-tree platforms; after
+    # the patch, sdpa_fallback (a plain SDPAImpl) runs PyTorch SDPA.
+    def _raise_oot(self, query, key, value, attn_metadata=None):
+        raise NotImplementedError("No forward implementation for platform: oot")
+
+    monkeypatch.setattr(SDPAImpl, "forward", _raise_oot)
+    fallback = SDPAImpl(num_heads=2, head_size=8, softmax_scale=0.3)
+    torch.manual_seed(0)
+    q, k, v = (torch.randn(2, 5, 2, 8) for _ in range(3))
+    with pytest.raises(NotImplementedError):
+        fallback.forward(q, k, v)
+
+    apply_omni_model_specific_patches.cache_clear()
+    apply_omni_model_specific_patches()
+    assert getattr(SDPAImpl.forward, _SDPA_FALLBACK_PATCHED, False)
+    assert SDPAImpl.forward is TpuSDPAImpl.forward
+
+    keep = torch.tensor([[1, 1, 1, 1, 1], [1, 1, 1, 0, 0]])
+    for mask in (None, keep.bool(), keep.float()):
+        meta = None if mask is None else SimpleNamespace(attn_mask=mask)
+        scores = torch.einsum("bqhd,bkhd->bhqk", q.double(), k.double()) * 0.3
+        if mask is not None:
+            scores = scores.masked_fill(~keep.bool()[:, None, None, :], -torch.inf)
+        want = torch.einsum("bhqk,bkhd->bqhd", scores.softmax(-1), v.double())
+        torch.testing.assert_close(
+            fallback.forward(q, k, v, meta), want.float(), rtol=1e-5, atol=1e-5
+        )
+
+    # Installing again returns at the flag check, before the info log.
+    infos = []
+    monkeypatch.setattr("vllm_torchtpu.omni.patches.logger.info", infos.append)
+    _patch_sdpa_fallback_dispatch()
+    assert infos == []
+    assert SDPAImpl.forward is TpuSDPAImpl.forward
