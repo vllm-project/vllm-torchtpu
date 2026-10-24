@@ -28,8 +28,8 @@ from vllm_torchtpu.kernels.qwen4_exp.pool import pooled_short_conv
 
 
 @functools.cache
-def build_raw_lookup_op(vocab_start: int, local_rows: int, head_dim: int):
-    def fn(table: jax.Array, ids: jax.Array) -> jax.Array:
+def build_raw_lookup_op(local_rows: int, head_dim: int):
+    def fn(table: jax.Array, ids: jax.Array, vocab_start: jax.Array) -> jax.Array:
         return resident_lookup_raw(
             table,
             ids,
@@ -38,12 +38,10 @@ def build_raw_lookup_op(vocab_start: int, local_rows: int, head_dim: int):
             head_dim=head_dim,
         )
 
-    op = pallas.jax_op(
-        f"qwen4_exp::ple_raw_lookup_{vocab_start}_{local_rows}_{head_dim}", fn
-    )
+    op = pallas.jax_op(f"qwen4_exp::ple_raw_lookup_{local_rows}_{head_dim}", fn)
 
     @op.register_fake
-    def fake(table, ids):
+    def fake(table, ids, vocab_start):
         dtype = torch.int16 if table.dtype == torch.int16 else torch.int8
         return table.new_empty((ids.shape[0], ids.shape[1] * head_dim), dtype=dtype)
 

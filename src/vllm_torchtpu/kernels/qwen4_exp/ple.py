@@ -55,7 +55,7 @@ def _bf16(x):
 
 
 def resident_lookup_raw(
-    table, ids, *, vocab_start: int, local_rows: int, head_dim: int
+    table, ids, *, vocab_start: int | jax.Array, local_rows: int, head_dim: int
 ):
     """Owner-masked integer bits [T,heads*head_dim]: INT8/FP8 or INT16/BF16."""
     token_count, heads = ids.shape

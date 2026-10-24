@@ -158,6 +158,17 @@ class ResidentPLETable(_LoadedPLETable):
     def allocate_embedding_weight(self, num_embeddings, embedding_dim, dtype):
         weight = super().allocate_embedding_weight(num_embeddings, embedding_dim, dtype)
         self.register_buffer("table", torch.empty(0, dtype=torch.uint8))
+        # Keep the shard offset as data rather than a rank-specialized constant
+        # in graphs containing collectives. It moves with this table.
+        self.register_buffer(
+            "_vocab_start",
+            torch.tensor(
+                self.shard_indices.org_vocab_start_index,
+                dtype=torch.int32,
+                device="cpu",
+            ),
+            persistent=False,
+        )
         self._raw_lookup = None
         return weight
 
@@ -168,16 +179,16 @@ class ResidentPLETable(_LoadedPLETable):
         self.table = (
             self.weight.detach().view(carrier).reshape(-1, 128).to(self.table.device)
         )
+        self._vocab_start = self._vocab_start.to(self.table.device)
         self.weight.data = torch.empty(0, dtype=self.storage_dtype, device="cpu")
         self._raw_lookup = build_raw_lookup_op(
-            self.shard_indices.org_vocab_start_index,
             self.shard_indices.num_org_elements,
             self.embedding_dim,
         )
 
     def lookup_raw(self, ids: torch.Tensor) -> torch.Tensor:
         assert self._finalized and self._raw_lookup is not None
-        return self._raw_lookup(self.table, ids)
+        return self._raw_lookup(self.table, ids, self._vocab_start)
 
     def local_rows(self, ids: torch.Tensor) -> torch.Tensor:
         rows = self.decode(self.lookup_raw(ids))
