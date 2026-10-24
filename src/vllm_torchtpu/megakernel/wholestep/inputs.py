@@ -46,8 +46,10 @@ from .qsa_full import project_reference, qkvg_width
 EXTRA_NAMES = ["qsa_pool", "qsa_pages", "qsa_kvlen", "qsa_off", "qsa_scales", "qsa_rope"]
 
 
-def att_layers(g: Qwen38Geometry, L: int) -> tuple[int, ...]:
-    return tuple(j for j in range(L) if j % g.att_every == g.att_every - 1)
+def att_layers(g: Qwen38Geometry, L: int, first: str = "gdn") -> tuple[int, ...]:
+    """Kernel layers that are QSA layers: the last of each cycle, or the first (`first="qsa"`)."""
+    at = 0 if first == "qsa" else g.att_every - 1
+    return tuple(j for j in range(L) if j % g.att_every == at)
 
 
 def random_wholestep_inputs(
@@ -125,8 +127,9 @@ def wholestep_reference(
     kv_new = []
     step_out: list = []
     d["_step_out"] = step_out
+    att = set(att_layers(g, L, d.get("first", "gdn")))
     for j in range(L):
-        if j % g.att_every == g.att_every - 1:
+        if j in att:
             p = {n: v[o_att] for n, v in hc["qsa_full"].items()}
             mixed, xn = hc_mix(x, p, nhc=nhc, eps=eps)
             delta, kvs = 0.0, []
@@ -179,7 +182,7 @@ def pack_wholestep(
     """`(weights, states)` per-rank operands (leading `R`, not yet folded)."""
     R, T = ex.R, ex.T
     hc, w_l, st_l = d["hc"], d["inp"].w_l, d["inp"].st_l
-    att_rows = att_layers(g, L)
+    att_rows = att_layers(g, L, d.get("first", "gdn"))
     gdn_rows = tuple(j for j in range(L) if j not in att_rows)
     weights = {
         "router": _rep(w_l["router"], R),

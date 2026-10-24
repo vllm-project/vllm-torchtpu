@@ -312,3 +312,25 @@ def test_step_with_served_key_layout_matches_contiguous():
     for o in outs[1:]:
         np.testing.assert_array_equal(outs[0][0], o[0])
         np.testing.assert_array_equal(outs[0][1], o[1])
+
+
+def test_qsa_first_layout_matches_reference():
+    """Model layers 3..10 (cycle QSA, GDN, GDN, GDN): the layout that lets the head (layers 0-2,
+    PLE before layer 1) stay a separate call while every QSA layer is in the whole-step kernel."""
+    R, T = 2, 4
+    ex = ExecSpec(R=R, B=2 * T, T=T, ctx=128, interpret=True, tiles=_TILES)
+    d = wi.random_wholestep_inputs(
+        11, G, ex, L, budget=BUDGET, n_pages=PAGES, kv_len=KV_LEN, identical_experts=True
+    )
+    d["first"] = "qsa"
+    ref, _ = wi.wholestep_reference(G, ex, d, L)
+    d.pop("_step_out", None)
+    spec = wholestep_spec(G, R, L=L, qsa=dict(budget=BUDGET), first="qsa")
+    w_mk, states = wi.pack_wholestep(spec, G, ex, d, L)
+    mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
+    pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(mesh, ex, d["inp"].pos, d["inp"].x, w_mk, states)
+    step, _ = kernel.make_step(mesh, spec, ex)
+    _, outs = step(pos_mk, hid_mk, w_mk, st_mk, *wi.extras(d, mesh, R))
+    res = np.asarray(outs[RESIDUAL_OUT].reshape(R, ex.M, -1)[:, : ex.B], np.float32)
+    assert float(np.std(np.asarray(ref) - np.asarray(d["inp"].x[: ex.B], np.float32))) > 0.05
+    _assert_within_budget(res, np.asarray(ref, np.float32))

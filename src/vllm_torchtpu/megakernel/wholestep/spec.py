@@ -48,6 +48,7 @@ def wholestep_spec(
     qsa: dict[str, Any] | None = None,
     indexed: dict[str, Any] | None = None,
     step: bool = False,
+    first: str = "gdn",
 ) -> ModelSpec:
     """`L` (a multiple of `att_every`) layers starting at a group boundary (layer 0 = GDN).
 
@@ -73,8 +74,13 @@ def wholestep_spec(
     else:
         qsa_block = QSAFullBlock(**(qsa or {}))
     attn = HCSublayer(qsa_block, ar_slot=0, **hc)
-    # Counts are per cycle (period = att_every): branch 0 runs at l % period < c0.
-    mixer = SwitchSlot("mixer", branches=(gdn, attn), branch_counts=(g.att_every - 1, 1))
+    # Counts are per cycle (period = att_every): branch 0 runs at l % period < c0. `first="qsa"`
+    # starts the kernel at a QSA layer (model layers 3 .. 3+L-1: the cycle QSA, GDN, GDN, GDN),
+    # so the head (layers 0-2, with PLE before layer 1) can stay a separate call.
+    if first == "qsa":
+        mixer = SwitchSlot("mixer", branches=(attn, gdn), branch_counts=(1, g.att_every - 1))
+    else:
+        mixer = SwitchSlot("mixer", branches=(gdn, attn), branch_counts=(g.att_every - 1, 1))
     moe = HCSublayer(Qwen38MoE(geometry=gi, moe_tp=False), ar_slot=1, emit_residual=True, **hc)
     return ModelSpec(
         name=WHOLESTEP,
