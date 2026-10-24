@@ -28,6 +28,7 @@ from jax.experimental import topologies
 from jax.sharding import Mesh
 
 from vllm_torchtpu.megakernel import kernel
+from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.models import qwen35
 from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES, baseline_tiles
@@ -153,7 +154,7 @@ def test_m1_qwen35_pack_and_step_vs_logical_reference(
     )
 
 
-@pytest.mark.parametrize("B", [96, 128])
+@pytest.mark.parametrize("B", [96, pytest.param(128, marks=pytest.mark.slow)])
 def test_m1_qwen35_rows_above_64_vs_logical_reference(B: int):
     """Above the former 64-row / 640-routing cap: B rows x TOPK=10 routings."""
     T, R = 4, 1
@@ -181,6 +182,12 @@ def test_m1_qwen35_rows_above_64_vs_logical_reference(B: int):
     )
     ex = ExecSpec(B=B, T=T, R=R, ctx=256, tiles=tiles, interpret=True)
 
+    # Negative controls: ceilings above 128 rows or TOPK > 128 must still fail.
+    with pytest.raises(MegakernelConfigError, match="Invalid E="):
+        dataclasses.replace(g, TOPK=129).check(ex)
+    with pytest.raises(MegakernelConfigError, match="Invalid E="):
+        g.check(ExecSpec(B=132, T=T, R=R, ctx=256, tiles=tiles, interpret=True))
+
     key = jax.random.PRNGKey(7 + B)
     pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(key, g, ex)
     ref_hid, _ = qwen35.reference_step(g, ex, pos, hid_l, w_l, st_l)
@@ -195,6 +202,7 @@ def test_m1_qwen35_rows_above_64_vs_logical_reference(B: int):
     out_hid, _ = step(pos_mk, hid_mk, w_mk, st_mk)
     out = kernel.unfold(out_hid, R)[0, :B].astype(F32)
     assert jnp.allclose(out, ref_hid.astype(F32), atol=2e-2, rtol=2e-2)
+    jax.clear_caches()
 
 
 @pytest.mark.slow
