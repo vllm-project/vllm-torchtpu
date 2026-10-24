@@ -77,6 +77,69 @@ def test_token_cap_dispatch(monkeypatch, tokens, expert_parallel):
     assert start == (192 if expert_parallel else None)
 
 
+@pytest.mark.parametrize("prefill_kernel", [False, True])
+@pytest.mark.parametrize("tokens", [256, 257, 4096])
+def test_prefill_kernel_serves_buckets_above_the_cap(
+    monkeypatch, tokens, prefill_kernel
+):
+    """prefill_kernel=True: buckets above the cap run the prefill kernel, with
+    the layer's expert range, ungated shared expert and routed scale; False,
+    the GMM fallback as before. FUSED_MOE_PREFILL_KERNEL is off by default."""
+    monkeypatch.delenv("FUSED_MOE_PREFILL_KERNEL", raising=False)
+    assert envs.FUSED_MOE_PREFILL_KERNEL is False
+    calls = []
+
+    def kernel(rank, x, *args, **kwargs):
+        calls.append(("kernel",))
+        return x
+
+    def gmm(*args, topk, **kwargs):
+        calls.append(("gmm",))
+        return args[0]
+
+    def prefill(x, *args, expert_start, routed_scale, **kwargs):
+        calls.append(("prefill", args[8], expert_start, routed_scale))
+        return x
+
+    monkeypatch.setattr(bridge, "_kernel_body", kernel)
+    monkeypatch.setattr(bridge, "_gmm_layer", gmm)
+    monkeypatch.setattr(bridge, "fused_moe_prefill", prefill)
+    monkeypatch.setattr(bridge, "plan_blocks", lambda *a, **k: None)
+    monkeypatch.setattr(bridge, "plan_weight_ring", lambda *a, **k: (None, 3))
+    w = np.zeros((1, 1), np.float32)
+    bridge._layer(
+        np.array([[3, 192]], np.int32),
+        np.zeros((tokens, H), np.float32),
+        *([w] * 9),
+        np.zeros((tokens, 2), np.float32),
+        np.zeros((tokens, 2), np.int32),
+        n_ranks=8,
+        topk=2,
+        expert_parallel=True,
+        max_tokens=256,
+        shared_gated=False,
+        routed_scale=2.5,
+        prefill_kernel=prefill_kernel,
+    )
+    if tokens <= 256:
+        assert calls == [("kernel",)]
+    elif prefill_kernel:
+        assert calls == [("prefill", None, 192, 2.5)]
+    else:
+        assert calls == [("gmm",)]
+
+
+def test_prefill_kernel_serves_tp_experts_only(monkeypatch):
+    """FUSED_MOE_PREFILL_KERNEL arms the prefill kernel for TP-expert layers
+    only; EP layers keep the GMM path above the cap."""
+    monkeypatch.delenv("FUSED_MOE_PREFILL_KERNEL", raising=False)
+    assert not bridge._serves_prefill_kernel(expert_parallel=False)
+    assert not bridge._serves_prefill_kernel(expert_parallel=True)
+    monkeypatch.setenv("FUSED_MOE_PREFILL_KERNEL", "1")
+    assert bridge._serves_prefill_kernel(expert_parallel=False)
+    assert not bridge._serves_prefill_kernel(expert_parallel=True)
+
+
 class DeepseekV2MLP(torch.nn.Module):
     """Same class name and layout as vLLM's (the admission keys on both)."""
 
