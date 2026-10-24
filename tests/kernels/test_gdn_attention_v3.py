@@ -24,7 +24,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.gdn.v3 import config, tiling, wrapper
+from vllm_torchtpu.kernels.gdn.v3 import compute_gdn, config, tiling, wrapper
 
 
 def _l2_normalize(x: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
@@ -483,6 +483,134 @@ class GDNStatePipelineRaceTest(parameterized.TestCase):
         finally:
             mosaic_interpret._clear_shared_memory = orig_clear
             pltpu.reset_tpu_interpret_mode_state()
+
+
+class GDNRecurrentDecodeFusionTest(parameterized.TestCase):
+    """CPU checks for single-token decode [k, q] projection fusion."""
+
+    def test_recurrent_gdn_fused_qk_decode_contraction(self):
+        """Decode recurrence fuses [k, q] state contractions into one dot_general."""
+        seq_tile = 4
+        n_kq, n_v, d_k, d_v = 2, 8, 128, 128
+        dim = 2 * n_kq * d_k + n_v * d_v
+        dtypes = config.Dtypes(
+            act_in=jnp.dtype(jnp.float32),
+            act_out=jnp.dtype(jnp.bfloat16),
+            compute=jnp.dtype(jnp.float32),
+            recurrent_state=jnp.dtype(jnp.float32),
+            conv_state=jnp.dtype(jnp.float32),
+        )
+        cfg = config.GDNConfig(
+            mode=config.GDNMode.BATCHED,
+            dtypes=dtypes,
+            batch_size=seq_tile,
+            dim_size=dim,
+            kernel_size=4,
+            tile_size=seq_tile,
+            num_kq_heads=n_kq,
+            num_v_heads=n_v,
+            kq_head_dim=d_k,
+            v_head_dim=d_v,
+            window_size=1,
+        )
+        mesh = AbstractMesh(
+            (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
+        )
+        with use_abstract_mesh(mesh):
+            aligned_v = cfg.aligned_num_v_heads
+            rngs = iter(jax.random.split(jax.random.key(7), 8))
+            real_sizes = jnp.array([1, 1, 0, 1], dtype=jnp.int32)
+            q_compact = jax.random.normal(
+                next(rngs), (seq_tile, n_kq, 1, 1, d_k), dtype=jnp.float32
+            )
+            k_compact = jax.random.normal(
+                next(rngs), (seq_tile, n_kq, 1, 1, d_k), dtype=jnp.float32
+            )
+            v_compact = jax.random.normal(
+                next(rngs), (seq_tile, n_v, 1, 1, d_v), dtype=jnp.float32
+            )
+            b_compact = jax.random.normal(
+                next(rngs), (seq_tile, 1, 1, 1, aligned_v), dtype=jnp.float32
+            )
+            a_compact = jax.random.normal(
+                next(rngs), (seq_tile, 1, 1, 1, aligned_v), dtype=jnp.float32
+            )
+            state_prev = jax.random.normal(
+                next(rngs), (seq_tile, n_v, d_k, d_v), dtype=jnp.float32
+            )
+            a_log = jax.random.normal(next(rngs), (aligned_v,), dtype=jnp.float32)
+            dt_bias = jax.random.normal(next(rngs), (aligned_v,), dtype=jnp.float32)
+            args = (
+                real_sizes,
+                q_compact,
+                k_compact,
+                v_compact,
+                b_compact,
+                a_compact,
+                state_prev,
+                a_log,
+                dt_bias,
+                cfg,
+            )
+
+            jaxpr = jax.make_jaxpr(compute_gdn.recurrent_gdn, static_argnums=(9,))(
+                *args
+            )
+            dot_eqns = [
+                eqn for eqn in jaxpr.jaxpr.eqns if eqn.primitive.name == "dot_general"
+            ]
+            self.assertLen(dot_eqns, 1)
+            self.assertEqual(dot_eqns[0].invars[0].aval.shape, (seq_tile * n_v, 2, d_k))
+            self.assertEqual(
+                dot_eqns[0].invars[1].aval.shape, (seq_tile * n_v, d_k, d_v)
+            )
+
+            out_fused, state_fused = compute_gdn.recurrent_gdn(*args)
+
+            mask = (real_sizes > 0).reshape(seq_tile, 1, 1, 1, 1)
+            q_m = compute_gdn.l2_norm(jnp.where(mask, q_compact, 0.0)) * (d_k**-0.5)
+            k_m = compute_gdn.l2_norm(jnp.where(mask, k_compact, 0.0))
+            k_t = compute_gdn.fused_transpose_broadcast(k_m, src_dim=4, dst_dim=3)
+            v_m = jnp.where(mask, v_compact, 0.0)
+            beta = jnp.where(mask, jax.nn.sigmoid(b_compact), 0.0)
+            gating_log = jnp.exp(
+                jnp.where(
+                    mask,
+                    -jnp.exp(a_log.reshape(1, 1, 1, 1, -1))
+                    * jax.nn.softplus(a_compact + dt_bias.reshape(1, 1, 1, 1, -1)),
+                    0.0,
+                )
+            )
+            beta = compute_gdn.fused_transpose_broadcast(beta, src_dim=4, dst_dim=1)[
+                :, :n_v
+            ]
+            gating_log = compute_gdn.fused_transpose_broadcast(
+                gating_log, src_dim=4, dst_dim=1
+            )[:, :n_v]
+
+            ref_outs, ref_states = [], []
+            for idx in range(seq_tile):
+                o_i, s_i = compute_gdn.recurrent_gdn_per_seq(
+                    q_m[idx],
+                    k_m[idx],
+                    k_t[idx],
+                    v_m[idx],
+                    gating_log[idx],
+                    beta[idx],
+                    state_prev[idx],
+                    cfg,
+                )
+                ref_outs.append(o_i)
+                ref_states.append(s_i)
+            out_ref = jnp.stack(ref_outs, axis=0)
+            state_ref = jnp.stack(ref_states, axis=0)
+
+            np.testing.assert_allclose(out_fused, out_ref, rtol=1e-5, atol=1e-5)
+            np.testing.assert_allclose(state_fused, state_ref, rtol=1e-5, atol=1e-5)
+            np.testing.assert_allclose(out_fused[2], 0.0, rtol=0.0, atol=0.0)
+            np.testing.assert_allclose(
+                state_fused[2, 0], state_prev[2], rtol=0.0, atol=0.0
+            )
 
 
 @pytest.mark.tpu_test
