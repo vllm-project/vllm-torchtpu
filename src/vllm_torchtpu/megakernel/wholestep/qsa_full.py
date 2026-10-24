@@ -112,7 +112,10 @@ class QSAFullBlock(Block):
         ]
 
     def shared_widths(self, g: Any, ex: ExecSpec) -> dict[str, int]:
-        return {"xb2": self.nh(g, ex) * g.HD}
+        # `acc` holds every dmatmul output: the fused projection is the widest here (5 * 128
+        # for the indexer projection); other blocks (GDN) may need more, the planner takes the max.
+        nh = self.nh(g, ex)
+        return {"xb2": nh * g.HD, "acc": max(qkvg_width(nh, g.HD), 5 * 128)}
 
     def scratch(self, g: Any, ex: ExecSpec, plan: Any) -> list[ScratchReq]:
         nh, f8 = self.nh(g, ex), jnp.float8_e4m3fn

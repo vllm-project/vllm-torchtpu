@@ -49,18 +49,19 @@ def wholestep_spec(
     indexed: dict[str, Any] | None = None,
     step: bool = False,
     first: str = "gdn",
+    tail: dict[str, Any] | None = None,
 ) -> ModelSpec:
     """`L` (a multiple of `att_every`) layers starting at a group boundary (layer 0 = GDN).
 
     `indexed`: `QSAFullIndexedBlock` options (`max_groups`, `pages_per_seq`) — the indexer,
     top-K and compaction run in-kernel instead of taking a selection as input.
     """
-    assert L % g.att_every == 0, (L, g.att_every)
+    assert L % g.att_every == 0 or (L == 1 and first == "qsa"), (L, g.att_every)
     if pool_gdn:
         from ..models.qwen38_gdn_pool import Qwen38PoolGDN as gdn_cls
     else:
         gdn_cls = Qwen38GDN
-    gi = g.inner(R, L)
+    gi = g.inner(R, L)  # L = 1: one QSA layer, no GDN
     hc = dict(inner_geometry=gi, nhc=g.NHC, lowrank=g.LOWRANK)
     gdn = HCSublayer(gdn_cls(geometry=gi), ar_slot=0, **hc)
     if indexed is not None and step:  # stage C: + the step's own tokens and group
@@ -77,13 +78,21 @@ def wholestep_spec(
     # Counts are per cycle (period = att_every): branch 0 runs at l % period < c0. `first="qsa"`
     # starts the kernel at a QSA layer (model layers 3 .. 3+L-1: the cycle QSA, GDN, GDN, GDN),
     # so the head (layers 0-2, with PLE before layer 1) can stay a separate call.
-    if first == "qsa":
+    if L == 1:  # the last model layer (47): QSA only
+        mixer: Any = attn
+    elif first == "qsa":
         mixer = SwitchSlot("mixer", branches=(attn, gdn), branch_counts=(1, g.att_every - 1))
     else:
         mixer = SwitchSlot("mixer", branches=(gdn, attn), branch_counts=(g.att_every - 1, 1))
     moe = HCSublayer(Qwen38MoE(geometry=gi, moe_tp=False), ar_slot=1, emit_residual=True, **hc)
+    slots: tuple = (mixer, moe)
+    if tail is not None:  # + final HC mixer, lm_head, per-rank greedy top token (L = 1 only)
+        from .tail import GreedyHead
+
+        assert L == 1, L
+        slots = slots + (HCSublayer(GreedyHead(**tail), allreduce=False, **hc),)
     return ModelSpec(
         name=WHOLESTEP,
         config=Qwen38ResidualGeometry(L=L, H=g.NHC * g.H, eps=g.eps),
-        layer_type=LayerType(name=QWEN38_SEGMENT, slots=(mixer, moe)),
+        layer_type=LayerType(name=QWEN38_SEGMENT, slots=slots),
     )

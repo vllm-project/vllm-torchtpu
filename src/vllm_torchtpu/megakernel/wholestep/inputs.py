@@ -66,6 +66,8 @@ def random_wholestep_inputs(
     zero: tuple[str, ...] = (),
     identical_experts: bool = False,
     gain: float = 1.0,
+    first: str = "gdn",
+    vocab_shard: int = 0,
 ) -> dict[str, Any]:
     """`kv_len` per row (default: `4 * budget + 3`, the full selection plus a partial group)."""
     R = ex.R
@@ -80,7 +82,7 @@ def random_wholestep_inputs(
             w = inp.w_l[n]
             inp.w_l[n] = jnp.broadcast_to(w[0:1, :, 0:1], w.shape)
     k = jax.random.split(jax.random.PRNGKey(key + 1), 8)
-    n_att = len(att_layers(g, L))
+    n_att = len(att_layers(g, L, first))
     n_gdn = L - n_att
     hc = {
         "gdn": {n: v[:n_gdn] for n, v in inp.hc["gdn"].items()},
@@ -108,10 +110,14 @@ def random_wholestep_inputs(
     rope = np.zeros((ex.M, 128), np.float32)  # host-only (traceable under jit): ml_dtypes BF16
     rope[:, : g.ROT // 2] = np.cos(ang).astype(ml_dtypes.bfloat16).astype(np.float32)
     rope[:, g.ROT // 2 : g.ROT] = np.sin(ang).astype(ml_dtypes.bfloat16).astype(np.float32)
-    return dict(
+    out = dict(
         inp=inp, hc=hc, qkvg=qkvg, o_proj=o_proj, qn=qn, kn=kn, pool=pool, pages=pages,
-        kv_len=kvl, rope=jnp.asarray(rope), off=off, budget=budget,
+        kv_len=kvl, rope=jnp.asarray(rope), off=off, budget=budget, first=first,
     )
+    if vocab_shard:  # the decode tail after the last layer (final HC mixer + lm_head)
+        out["hc"]["tail"] = _hc_params(k[6], g, 1)
+        out["lm_head"] = (jax.random.normal(k[7], (R, g.H, vocab_shard), F32) * 0.05).astype(BF16)
+    return out
 
 
 def wholestep_reference(
@@ -196,9 +202,15 @@ def pack_wholestep(
         "o_proj": d["o_proj"],
         **hc_weight_arrays("qsa_full", hc["qsa_full"], g, R, mix=True),
         **({"idx_w": _rep(d["idx_w"], R)} if "idx_w" in d else {}),
-        "lin_in": w_l["lin_in"],
-        "lin_out": w_l["lin_out"],
-        **hc_weight_arrays("gdn", hc["gdn"], g, R, mix=True),
+        **(
+            {"lin_in": w_l["lin_in"], "lin_out": w_l["lin_out"],
+             **hc_weight_arrays("gdn", hc["gdn"], g, R, mix=True)}
+            if gdn_rows else {}
+        ),
+        **(
+            {"lm_head": d["lm_head"][:, None], **hc_weight_arrays("tail", hc["tail"], g, R, mix=True)}
+            if "lm_head" in d else {}
+        ),
     }
     smalls = {
         "moe_hcn": hc["moe"]["norm"],
@@ -208,11 +220,17 @@ def pack_wholestep(
         "qsa_kn": _rows(_rep(d["kn"], R), att_rows, L),
         **({"qsa_iqn": _rows(_rep(d["iqn"], R), att_rows, L)} if "iqn" in d else {}),
         **({"qsa_ikn": _rows(_rep(d["ikn"], R), att_rows, L)} if "ikn" in d else {}),
-        "gdn_hcn": _rows(_rep(hc["gdn"]["norm"], R), gdn_rows, L),
-        "in_s": _rows(w_l["lin_in_s"], gdn_rows, L),
-        "out_s": _rows(w_l["lin_out_s"], gdn_rows, L),
-        **{k: _rows(w_l[k], gdn_rows, L) for k in ("conv", "alog", "dtb", "gnorm")},
+        **(
+            {"gdn_hcn": _rows(_rep(hc["gdn"]["norm"], R), gdn_rows, L),
+             "in_s": _rows(w_l["lin_in_s"], gdn_rows, L),
+             "out_s": _rows(w_l["lin_out_s"], gdn_rows, L),
+             **{k: _rows(w_l[k], gdn_rows, L) for k in ("conv", "alog", "dtb", "gnorm")}}
+            if gdn_rows else {}
+        ),
+        **({"tail_hcn": _rows(_rep(hc["tail"]["norm"], R), (L - 1,), L)} if "lm_head" in d else {}),
     }
+    if not gdn_rows:
+        return pack_weights(spec, ex, weights, smalls), {}
     lay = GDNBlock.lin_in_layout(g.inner(R, L), ex)
     hr = rup(3 + T, 8)
     conv = jnp.pad(st_l["conv"], ((0, 0),) * 3 + ((0, hr - 3), (0, 0)))

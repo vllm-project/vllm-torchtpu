@@ -368,3 +368,33 @@ def test_tail_greedy_tokens_match_reference():
     clear = (top2[:, 1] - top2[:, 0]) > 1e-2
     assert clear.sum() >= ex.B - 1
     np.testing.assert_array_equal(got[clear], np.asarray(want)[clear])
+
+
+def test_last_layer_with_tail_in_one_call():
+    """Model layer 47 (QSA + MoE) and the decode tail (final HC mixer, lm_head, per-rank top
+    token) in one kernel call: tokens equal the stock greedy pick on the reference residual."""
+    from vllm_torchtpu.megakernel.wholestep.tail import TOP, greedy_tokens, tail_reference
+
+    R, T, V = 2, 4, 384
+    ex = ExecSpec(R=R, B=2 * T, T=T, ctx=128, interpret=True, tiles=_TILES)
+    d = wi.random_wholestep_inputs(
+        19, G, ex, 1, budget=BUDGET, n_pages=PAGES, kv_len=KV_LEN, identical_experts=True,
+        first="qsa", vocab_shard=V,
+    )
+    d["lm_head"] = (d["lm_head"].astype(F32) * 10).astype(BF16)  # spread the top-2 logit gaps
+    ref, _ = wi.wholestep_reference(G, ex, d, 1)
+    d.pop("_step_out", None)
+    want, logits = tail_reference(
+        ref, {n: v[0] for n, v in d["hc"]["tail"].items()}, d["lm_head"], nhc=G.NHC, eps=G.eps
+    )
+    spec = wholestep_spec(G, R, L=1, qsa=dict(budget=BUDGET), first="qsa", tail=dict(vocab_shard=V))
+    w_mk, states = wi.pack_wholestep(spec, G, ex, d, 1)
+    mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
+    pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(mesh, ex, d["inp"].pos, d["inp"].x, w_mk, states)
+    step, _ = kernel.make_step(mesh, spec, ex)
+    _, outs = step(pos_mk, hid_mk, w_mk, st_mk, *wi.extras(d, mesh, R))
+    got = np.asarray(greedy_tokens(outs[TOP], R, ex.M))[: ex.B]
+    top2 = np.sort(np.asarray(logits), axis=-1)[:, -2:]
+    clear = (top2[:, 1] - top2[:, 0]) > 5e-2  # the residual carries one layer of drift
+    assert clear.sum() >= ex.B - 2, top2
+    np.testing.assert_array_equal(got[clear], np.asarray(want)[clear])
