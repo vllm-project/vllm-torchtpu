@@ -823,8 +823,8 @@ def test_qrep_local_view_matches_the_head_all_gather_order(monkeypatch):
         )
 
 
-def _run_qrep_wrapper(rank_in_group, is_sparse=True):
-    """Run the MLA wrapper forward under query replication; return its mla_attn mock."""
+def _run_qrep_wrapper(rank_in_group, is_sparse=True, run_forward=True):
+    """Build (and optionally run) the MLA wrapper under query replication."""
     group_size, local_heads, num_tokens = 4, 2, 3
     wrapper = VllmMultiHeadLatentAttentionWrapper.__new__(
         VllmMultiHeadLatentAttentionWrapper
@@ -862,11 +862,12 @@ def _run_qrep_wrapper(rank_in_group, is_sparse=True):
     )
     wrapper.o_proj = lambda value: (value, None)
 
-    VllmMultiHeadLatentAttentionWrapper.forward(
-        wrapper,
-        positions=torch.arange(num_tokens),
-        hidden_states=torch.ones((num_tokens, 8), dtype=torch.bfloat16),
-    )
+    if run_forward:
+        VllmMultiHeadLatentAttentionWrapper.forward(
+            wrapper,
+            positions=torch.arange(num_tokens),
+            hidden_states=torch.ones((num_tokens, 8), dtype=torch.bfloat16),
+        )
 
     return wrapper
 
@@ -901,12 +902,54 @@ def test_mla_wrapper_qrep_dead_shard_is_rank_independent():
     """A rank-dependent slice of the dead shard bakes the rank into the traced
     graph, so every rank traces a different program and precompile peer replay
     refuses every peer artifact."""
+    from vllm_torchtpu.compilation.tpu_compiler import _graph_fingerprint
+
     passed = []
     for rank in (0, 2):
         wrapper = _run_qrep_wrapper(rank_in_group=rank)
         passed.append(wrapper.mla_attn.call_args.args[0])
     for got, want in zip(passed[1], passed[0]):
         torch.testing.assert_close(got, want)
+
+    def _trace_fingerprint(rank: int, *, is_sparse: bool) -> str | None:
+        torch._dynamo.reset()
+        wrapper = _run_qrep_wrapper(
+            rank_in_group=rank, is_sparse=is_sparse, run_forward=False
+        )
+        if is_sparse:
+            wrapper.mla_attn = lambda _q, kv_c, k_pe, **kw: (
+                kw["q_dcp_replicated"][0].sum(dim=(-1, -2), keepdim=False).unsqueeze(-1)
+                + kv_c[:, :1]
+                + k_pe[:, 0, :1]
+            )
+        else:
+            wrapper.mla_attn = lambda q, kv_c, k_pe, **_kw: (
+                q[0].sum(dim=(-1, -2), keepdim=False).unsqueeze(-1)
+                + kv_c[:, :1]
+                + k_pe[:, 0, :1]
+            )
+        captured = []
+
+        def _capture(gm, _example_inputs):
+            captured.append(_graph_fingerprint(gm))
+            return gm.forward
+
+        compiled = torch.compile(wrapper.forward, backend=_capture, fullgraph=True)
+        compiled(
+            positions=torch.arange(3),
+            hidden_states=torch.ones((3, 8), dtype=torch.bfloat16),
+        )
+        assert len(captured) == 1 and captured[0] is not None
+        return captured[0]
+
+    assert _trace_fingerprint(0, is_sparse=True) == _trace_fingerprint(
+        2, is_sparse=True
+    )
+    # Negative control: when the per-rank slice is live (dense layer), ranks 0
+    # and 2 bake different slice offsets into the FX graph.
+    assert _trace_fingerprint(0, is_sparse=False) != _trace_fingerprint(
+        2, is_sparse=False
+    )
 
 
 def test_mla_wrapper_qrep_dense_layer_keeps_its_rank_block():
