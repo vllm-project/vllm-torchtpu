@@ -288,6 +288,99 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(monkeypatch, 
     assert captured["context_kwargs"]["num_tokens_across_dp"].tolist() == [128] * 8
 
 
+@pytest.mark.parametrize("tokens", [8, 16])
+@pytest.mark.parametrize("live_count", [1, 2])
+def test_native_kwargs_match_warmup_profile_and_idle(monkeypatch, tokens, live_count):
+    from contextlib import nullcontext
+
+    from torch.utils._pytree import tree_flatten
+
+    from tests.runner.qwen4_pool_test_utils import prepare_native_pool_inputs
+    from tests.runner.test_qwen4_exp_compact_pool import (
+        compact_config,
+        native_allocation,
+    )
+    from vllm_torchtpu.models.vllm.qwen4_exp import inputs
+
+    monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")
+    cfg = compact_config(kv="bfloat16", length=128)
+    _, specs, plan, owners = native_allocation(cfg)
+    rows = [
+        [
+            [row + 1] * group.kv_cache_spec.max_num_blocks_per_req(cfg, 128)
+            for group in plan.kv_cache_groups
+        ]
+        for row in range(live_count)
+    ]
+    scheduled = [3] + [1] * (live_count - 1)
+    runner, real, _ = prepare_native_pool_inputs(
+        cfg, plan, rows, list(range(2, 2 + live_count)), scheduled, tokens
+    )
+    padded_rows = real["state_slots"].shape[0]
+    captured = []
+
+    def forward(**kwargs):
+        captured.append(kwargs["model_kwargs"])
+        return torch.zeros(tokens, cfg.model_config.hf_text_config.hidden_size), None
+
+    # Capture forwards as in the profile test; input construction stays real.
+    monkeypatch.setattr(inputs, "set_forward_context", lambda *a, **kw: nullcontext())
+    monkeypatch.setattr(
+        inputs, "set_vllm_model_wrapper_context", lambda **kw: nullcontext()
+    )
+    monkeypatch.setattr(inputs, "synchronize_tensors", lambda tensor: None)
+    runner.forward_model = forward
+    runner.parallel_config.tensor_parallel_size = 1
+    runner.scheduler_config.max_num_seqs = cfg.scheduler_config.max_num_seqs
+    runner._dp_num_tokens_across_dp = lambda n: torch.full((8,), n, dtype=torch.int32)
+    runner.max_model_len = cfg.model_config.max_model_len
+    adapter = Qwen4ExpAdapter(runner)
+    allocate = Mock()
+    adapter.cache = NS(
+        allocate=allocate,
+        pages=plan.num_blocks,
+        dummy_metadata=lambda metadata, active: {name: metadata for name in specs},
+    )
+    runner.input_batch.num_reqs = 0
+    adapter.dummy_run(tokens, padded_rows)
+    adapter.dummy_run(tokens, padded_rows, profile_prefix=7)
+    runner.input_batch.num_reqs = live_count
+    adapter.dummy_run(tokens, padded_rows, dp_lockstep=True)
+    assert allocate.call_count == 2
+    assert owners.raw_tensors
+    assert len(captured) == 3
+    warm, profile, idle = captured
+    assert real["valid_tokens"].sum().item() == sum(scheduled)
+    assert warm["valid_tokens"].all() and profile["valid_tokens"].all()
+    assert not idle["valid_tokens"].any()
+    assert not torch.equal(real["valid_tokens"], warm["valid_tokens"])
+    keys = {
+        "query_start_loc",
+        "ngram_context",
+        "state_slots",
+        "context_lens",
+        "valid_tokens",
+        "main_block_table",
+        "compressed_block_table",
+    }
+    reference_leaves, reference_tree = tree_flatten(real)
+    for kwargs in (real, warm, profile, idle):
+        assert set(kwargs) == keys
+        assert kwargs["main_block_table"] is kwargs["compressed_block_table"]
+        leaves, tree = tree_flatten(kwargs)
+        assert tree == reference_tree
+        for expected, actual in zip(reference_leaves, leaves):
+            assert isinstance(expected, torch.Tensor) and isinstance(
+                actual, torch.Tensor
+            )
+            assert (actual.shape, actual.dtype, actual.device, actual.stride()) == (
+                expected.shape,
+                expected.dtype,
+                expected.device,
+                expected.stride(),
+            )
+
+
 def test_async_history_reads_committed_prefix_after_reorder_and_row_reuse():
     # The runner substitutes the pending token at context on device. PLE's
     # history must stop BEFORE that slot, whose CPU value is still -1.
