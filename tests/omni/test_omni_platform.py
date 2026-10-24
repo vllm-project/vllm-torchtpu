@@ -19,12 +19,15 @@ import pytest
 import torch
 
 from .mock_omni import (  # isort: split
+    _mock_apply_split_rotary_emb,
+    _mock_ltx2_rope_cls,
     _MockRMSNorm,
     _MockRotaryEmbeddingWan,
     vllm_omni_mock,
 )
 
 import vllm_omni
+from vllm_omni.diffusion.models.ltx2 import ltx2_transformer
 from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
 
 from vllm_torchtpu.omni import register_omni_tpu_platform
@@ -37,6 +40,7 @@ from vllm_torchtpu.omni.attention import (
 )
 from vllm_torchtpu.omni.patches import (
     _patch_diffusion_startup_warmup_sync,
+    _patch_ltx2_split_rope,
     apply_omni_model_specific_patches,
     apply_omni_tpu_patches,
 )
@@ -46,6 +50,7 @@ from vllm_torchtpu.omni.rope import (
     apply_rotary_pair_swap,
     can_fuse_qk_norm_rope,
     rotary_embedding_wan_forward,
+    split_rope_natural_tables,
     wan_self_attention_fused,
 )
 
@@ -546,3 +551,152 @@ def test_wan_self_attention_patch_falls_back_on_f32():
 
     apply_omni_model_specific_patches()
     assert WanSelfAttention()(torch.ones(1, 3, 8)) == "native"
+
+
+@pytest.fixture
+def table_syncs(monkeypatch):
+    """Records the patch's synchronize_tensors calls instead of syncing."""
+    syncs = []
+
+    def record(tensors, wait):
+        syncs.append(tensors)
+
+    monkeypatch.setattr("vllm_torchtpu.utils.synchronize_tensors", record)
+    return syncs
+
+
+@pytest.fixture
+def ltx2(monkeypatch, table_syncs):
+    """The mocked LTX-2 transformer module with _patch_ltx2_split_rope applied.
+
+    The patch is installed on a fresh rope class; the module attributes it
+    replaces are restored after the test.
+    """
+    for name, value in (
+        ("LTX2AudioVideoRotaryPosEmbed", _mock_ltx2_rope_cls()),
+        ("apply_split_rotary_emb", _mock_apply_split_rotary_emb),
+        ("get_tensor_model_parallel_world_size", lambda: 1),
+        ("get_tensor_model_parallel_rank", lambda: 0),
+    ):
+        monkeypatch.setattr(ltx2_transformer, name, value)
+    _patch_ltx2_split_rope()
+    return ltx2_transformer
+
+
+def _ltx2_coords(batch=2, tokens=5):
+    # (B, 3, T, 2) patch bounds, the input of LTX2AudioVideoRotaryPosEmbed.
+    return 10 * torch.rand(batch, 3, tokens, 2)
+
+
+def _upstream_rope_forward(rope, coords, device=None, out_dtype=None):
+    # The unpatched forward: _mock_ltx2_rope_cls() builds a new class per call.
+    return _mock_ltx2_rope_cls().forward(rope, coords, device, out_dtype)
+
+
+@pytest.mark.parametrize(
+    "x_dtype,table_dtype,tol",
+    [
+        (torch.float32, torch.float32, 1e-6),
+        (torch.bfloat16, torch.bfloat16, None),
+        (torch.bfloat16, None, None),  # f32 tables (no out_dtype)
+    ],
+)
+def test_ltx2_split_rope_matches_upstream(ltx2, x_dtype, table_dtype, tol):
+    # The patched rope and apply_split_rotary_emb give upstream's rotation
+    # with its per-head (B, H, T, D/2) tables, in x.dtype.
+    torch.manual_seed(0)
+    rope = ltx2.LTX2AudioVideoRotaryPosEmbed(heads=3, head_dim=8)
+    coords = _ltx2_coords()
+    tables = rope(coords, out_dtype=table_dtype)
+    assert tables[0].shape == (2, 1, 5, 3 * 8)
+    x = torch.randn(2, 5, 3 * 8, dtype=x_dtype)
+    out = ltx2.apply_split_rotary_emb(x, tables, head_dim=8)
+
+    upstream_tables = _upstream_rope_forward(rope, coords, None, table_dtype)
+    assert upstream_tables[0].shape == (2, 3, 5, 8 // 2)  # (B, H, T, D/2)
+    want = _mock_apply_split_rotary_emb(x, upstream_tables, head_dim=8)
+    assert out.dtype == x_dtype
+    torch.testing.assert_close(out, want.to(x_dtype), rtol=tol, atol=tol)
+
+
+def test_ltx2_split_rope_tensor_parallel_lanes(ltx2, monkeypatch):
+    # _slice_rope_for_tp leaves the (B, 1, T, H * D) tables whole; rank 1 of
+    # 2 rotates its two local heads with heads 2 and 3 of the tables.
+    torch.manual_seed(0)
+    rope = ltx2.LTX2AudioVideoRotaryPosEmbed(heads=4, head_dim=8)
+    coords = _ltx2_coords()
+    tables = rope(coords)
+    cos, sin = _upstream_rope_forward(rope, coords)
+    monkeypatch.setattr(ltx2, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(ltx2, "get_tensor_model_parallel_rank", lambda: 1)
+    x = torch.randn(2, 5, 2 * 8)
+    out = ltx2.apply_split_rotary_emb(x, tables, head_dim=8)
+    want = _mock_apply_split_rotary_emb(x, (cos[:, 2:], sin[:, 2:]), head_dim=8)
+    torch.testing.assert_close(out, want, rtol=1e-6, atol=1e-6)
+
+    monkeypatch.setattr(ltx2, "get_tensor_model_parallel_world_size", lambda: 3)
+    with pytest.raises(ValueError, match="tensor-parallel"):
+        ltx2.apply_split_rotary_emb(x, tables, head_dim=8)
+
+
+def test_ltx2_split_rope_passes_other_tables_through(ltx2):
+    torch.manual_seed(0)
+    coords = _ltx2_coords()
+    rope = ltx2.LTX2AudioVideoRotaryPosEmbed(rope_type="interleaved")
+    upstream = _upstream_rope_forward(rope, coords)
+    for got, want in zip(rope(coords), upstream, strict=True):
+        assert torch.equal(got, want)
+
+    # (B, H, T, D/2) tables, also with a single head, use upstream's function.
+    for heads, head_dim in ((3, 8), (1, 24)):
+        rope = ltx2.LTX2AudioVideoRotaryPosEmbed(heads=heads, head_dim=head_dim)
+        tables = _upstream_rope_forward(rope, coords)
+        x = torch.randn(2, 5, heads * head_dim)
+        torch.testing.assert_close(
+            ltx2.apply_split_rotary_emb(x, tables, head_dim=head_dim),
+            _mock_apply_split_rotary_emb(x, tables, head_dim=head_dim),
+            rtol=0,
+            atol=0,
+        )
+
+    # Installing again keeps the single wrapper.
+    forward = ltx2.LTX2AudioVideoRotaryPosEmbed.forward
+    apply_split_rotary_emb = ltx2.apply_split_rotary_emb
+    _patch_ltx2_split_rope()
+    assert ltx2.LTX2AudioVideoRotaryPosEmbed.forward is forward
+    assert ltx2.apply_split_rotary_emb is apply_split_rotary_emb
+
+
+def test_ltx2_split_rope_tables_reused(ltx2, table_syncs):
+    # The original forward runs, and the tables are synced, once per coords
+    # tensor, coords version, device and out_dtype.
+    torch.manual_seed(0)
+    rope = ltx2.LTX2AudioVideoRotaryPosEmbed()
+    coords = _ltx2_coords()
+    cpu, bf16, f32 = torch.device("cpu"), torch.bfloat16, torch.float32
+    tables = rope(coords, device=cpu, out_dtype=bf16)
+    assert rope(coords, device=cpu, out_dtype=bf16) is tables
+    assert (rope.calls, len(table_syncs)) == (1, 1)
+    rope(coords.clone(), device=cpu, out_dtype=bf16)
+    rope(coords, device=cpu, out_dtype=f32)
+    stale = rope(coords, out_dtype=f32)
+    assert rope(coords, out_dtype=f32) is stale
+    assert (rope.calls, len(table_syncs)) == (4, 4)
+
+    coords.add_(1.0)  # bumps the version counter
+    fresh = rope(coords, out_dtype=f32)
+    assert rope.calls == 5
+    want = split_rope_natural_tables(*_upstream_rope_forward(rope, coords, None, f32))
+    assert torch.equal(fresh[0], want[0]) and torch.equal(fresh[1], want[1])
+    assert not torch.equal(fresh[0], stale[0])
+
+    # Inference tensors have no version counter; they are keyed on identity.
+    with torch.inference_mode():
+        coords = _ltx2_coords()
+    tables = rope(coords)
+    assert rope(coords) is tables
+
+    rope = ltx2.LTX2AudioVideoRotaryPosEmbed(rope_type="interleaved")
+    rope(coords)
+    rope(coords)
+    assert rope.calls == 2
