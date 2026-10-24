@@ -990,19 +990,36 @@ class TestTPUConnectorScheduler:
         assert not delay
         assert params is None
 
-    def test_producer_not_length_capped_returns_no_delay(self):
+    @pytest.mark.parametrize(
+        "status",
+        [
+            RequestStatus.RUNNING,
+            RequestStatus.FINISHED_ABORTED,
+            RequestStatus.FINISHED_IGNORED,
+            RequestStatus.FINISHED_ERROR,
+        ],
+    )
+    def test_producer_unsuccessful_finish_returns_no_metadata(self, status):
         req = MagicMock()
-        req.status = RequestStatus.RUNNING
+        req.status = status
         delay, params = self.producer.request_finished(req, [1, 2])
         assert not delay
         assert params is None
+        assert self.producer.build_connector_meta().reqs_to_send == {}
 
+    @pytest.mark.parametrize(
+        "status",
+        [
+            RequestStatus.FINISHED_LENGTH_CAPPED,
+            RequestStatus.FINISHED_STOPPED,
+        ],
+    )
     @patch(f"{_MOD}.get_uuid", return_value=777)
     @patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=30)
-    def test_producer_finished_all_full_blocks(self, _timeout, _uuid):
+    def test_producer_finished_all_full_blocks(self, _timeout, _uuid, status):
         req = MagicMock()
         req.request_id = "p-full"
-        req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        req.status = status
         req.num_computed_tokens = 32  # 32 % 16 == 0 → all_full=True
 
         delay, params = self.producer.request_finished(req, [3, 4])
@@ -1015,14 +1032,24 @@ class TestTPUConnectorScheduler:
         assert params["remote_block_ids"] == [3, 4]
         assert params["remote_host"] == "127.0.0.1"
         assert params["remote_port"] == 9100
+        assert req.status == status
 
+    @pytest.mark.parametrize(
+        "status",
+        [
+            RequestStatus.FINISHED_LENGTH_CAPPED,
+            RequestStatus.FINISHED_STOPPED,
+        ],
+    )
     @patch(f"{_MOD}.get_uuid", return_value=888)
     @patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=30)
-    def test_producer_finished_trailing_partial_block_is_dropped(self, _timeout, _uuid):
+    def test_producer_finished_trailing_partial_block_is_dropped(
+        self, _timeout, _uuid, status
+    ):
         """Trailing partial block must not be transferred: last id excluded."""
         req = MagicMock()
         req.request_id = "p-partial"
-        req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        req.status = status
         req.num_computed_tokens = 33  # 33 % 16 != 0 → last block is partial
 
         delay, params = self.producer.request_finished(req, [5, 6, 7])
@@ -1032,11 +1059,18 @@ class TestTPUConnectorScheduler:
         assert send.local_block_ids == [5, 6]  # [7] dropped
         assert params["remote_block_ids"] == [5, 6]
 
-    def test_producer_finished_only_partial_block_returns_no_delay(self):
+    @pytest.mark.parametrize(
+        "status",
+        [
+            RequestStatus.FINISHED_LENGTH_CAPPED,
+            RequestStatus.FINISHED_STOPPED,
+        ],
+    )
+    def test_producer_finished_only_partial_block_returns_no_delay(self, status):
         """When the sole block is partial, no transfer is triggered."""
         req = MagicMock()
         req.request_id = "p-tiny"
-        req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        req.status = status
         req.num_computed_tokens = 5  # 5 % 16 != 0
 
         delay, params = self.producer.request_finished(req, [8])
@@ -1100,6 +1134,76 @@ class TestTPURaidenConnectorScheduler:
     def setup_method(self):
         self.consumer = _make_raiden_scheduler(is_producer=False)
         self.producer = _make_raiden_scheduler(is_producer=True)
+
+    @pytest.mark.parametrize("local_hit", [0, 16, 32])
+    @pytest.mark.parametrize("inline", [False, True])
+    @pytest.mark.parametrize("prefix_aware", [False, True])
+    def test_stage3_prefill_is_consumed_once_across_preemption(
+        self, local_hit, inline, prefix_aware
+    ):
+        from vllm.sampling_params import SamplingParams
+        from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+        from vllm.v1.core.kv_cache_utils import KVCacheBlock
+        from vllm.v1.request import Request
+
+        req = Request("decode", [1] * 33, SamplingParams(max_tokens=128), None)
+        req.kv_transfer_params = {
+            "req_id": "prefill",
+            "uuid": 42,
+            "num_tokens": 32,
+            "src_controller_address": "source.test:27000",
+            "src_job_name": "prefill",
+            "src_engine_id": "prefill-engine",
+            "src_data_replica_idx": 0,
+            "src_parallelism": 4,
+            "dst_tp_size": 1,
+            "dst_dcp_size": 1,
+            "other_connector_data": {"key": "preserved"},
+        }
+        blocks = KVCacheBlocks(
+            ([KVCacheBlock(101), KVCacheBlock(102)], [KVCacheBlock(201)])
+        )
+        consumer = self.consumer
+        consumer._stage3_prefix_aware_load_enabled = prefix_aware
+        consumer._stage3_mamba_group_indices = [1]
+        with (
+            patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden"),
+            patch(f"{_MOD}.dist_utils.get_raiden_inline_load", return_value=inline),
+        ):
+            # A cache query is not an admission: failed allocation may retry it.
+            for _ in range(2):
+                assert consumer.get_num_new_matched_tokens(req, local_hit) == (
+                    32 - local_hit,
+                    local_hit < 32 and not inline,
+                )
+            consumer.update_state_after_alloc(req, blocks, 32 - local_hit)
+            first_loads = consumer.build_connector_meta().reqs_to_load
+            if local_hit == 32 and not prefix_aware:
+                # Without prefix-aware loads, a full local hit leaves the
+                # producer registration to its TTL, but consumes remote intent.
+                assert first_loads == {}
+            else:
+                first = first_loads["decode"]
+                assert first.source_req_id == "prefill"
+                assert first.release_only == (local_hit == 32)
+
+            # Resuming a completed pull must not issue a release or another pull.
+            req.num_computed_tokens = 32
+            consumer.update_state_after_alloc(req, blocks, 0)
+            assert consumer.build_connector_meta().reqs_to_load == {}
+            req.append_output_token_ids([7, 8])
+            for _ in range(2):
+                req.status = RequestStatus.PREEMPTED
+                req.num_computed_tokens = 0
+                req.num_preemptions += 1
+                # Recompute the prompt and generated tokens locally; the old
+                # P registration and first receive notification are consumed.
+                assert consumer.get_num_new_matched_tokens(req, 0) == (0, False)
+                consumer.update_state_after_alloc(req, blocks, 0)
+                assert consumer.build_connector_meta().reqs_to_load == {}
+            assert req.kv_transfer_params["other_connector_data"] == {
+                "key": "preserved"
+            }
 
     def test_stage3_mamba_truncation_happens_at_admission(self):
         producer = _make_raiden_scheduler(is_producer=True)
@@ -1264,7 +1368,32 @@ class TestTPURaidenConnectorScheduler:
     def test_get_finished_count_uses_vllm_world_size(self):
         assert self.consumer.get_finished_count() == 0
 
-    def test_stage3_producer_transfers_committed_mamba_checkpoint(self):
+    @pytest.mark.parametrize(
+        "status",
+        [
+            RequestStatus.RUNNING,
+            RequestStatus.FINISHED_ABORTED,
+            RequestStatus.FINISHED_IGNORED,
+            RequestStatus.FINISHED_ERROR,
+        ],
+    )
+    def test_stage3_unsuccessful_finish_returns_no_metadata(self, status):
+        req = MagicMock()
+        req.status = status
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden"):
+            delay, params = self.producer.request_finished(req, [1, 2])
+            assert not delay
+            assert params is None
+            assert self.producer.build_connector_meta().reqs_to_send == {}
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            RequestStatus.FINISHED_LENGTH_CAPPED,
+            RequestStatus.FINISHED_STOPPED,
+        ],
+    )
+    def test_stage3_producer_transfers_committed_mamba_checkpoint(self, status):
         producer = _make_raiden_scheduler(is_producer=True, block_size=16, pcp_size=1)
         producer._stage3_mamba_group_indices = [1]
         producer._stage3_mamba_num_speculative_blocks = 3
@@ -1272,7 +1401,7 @@ class TestTPURaidenConnectorScheduler:
         req.request_id = "mtp-producer"
         req.num_prompt_tokens = 17
         req.num_computed_tokens = 16
-        req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        req.status = status
         req.kv_transfer_params = None
 
         with (
@@ -1300,9 +1429,80 @@ class TestTPURaidenConnectorScheduler:
         assert delay
         assert meta.reqs_to_send[req.request_id].mamba_state_block_ids == [11]
 
+    @pytest.mark.parametrize(
+        ("hybrid", "prompt_tokens", "expected_delay"),
+        (
+            (True, 1, False),
+            (True, 2, True),
+            (True, 3, True),
+            (True, 2048, True),
+            (False, 3, False),
+            (False, 2048, False),
+            (False, 2049, True),
+        ),
+    )
+    def test_stage3_short_request_transfer_is_hybrid_only(
+        self, hybrid, prompt_tokens, expected_delay
+    ):
+        producer = _make_raiden_scheduler(is_producer=True, block_size=768, pcp_size=8)
+        producer.vllm_config.parallel_config.cp_kv_cache_interleave_size = 256
+        consumer = _make_raiden_scheduler(block_size=4608)
+        if hybrid:
+            producer._stage3_mamba_group_indices = [1]
+            consumer._stage3_mamba_group_indices = [1]
+        req = SimpleNamespace(
+            request_id="short",
+            prompt_token_ids=[0] * prompt_tokens,
+            _all_token_ids=[0] * prompt_tokens,
+            num_prompt_tokens=prompt_tokens,
+            kv_transfer_params=None,
+            status=RequestStatus.FINISHED_LENGTH_CAPPED,
+        )
+        with (
+            patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden"),
+            patch(
+                f"{_MOD}.tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS",
+                "prefill-controller.test:27000",
+            ),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 8),
+            patch(f"{_MOD}.dist_utils.get_raiden_inline_load", return_value=False),
+        ):
+            producer.on_new_request(req)
+            req.num_computed_tokens = req.num_prompt_tokens
+            delay, params = producer.request_finished(
+                req, [100], mamba_block_ids=[[17]] if hybrid else None
+            )
+            assert delay is expected_delay
+            if not expected_delay:
+                assert params == {}
+                assert producer.build_connector_meta().reqs_to_send == {}
+                return
+
+            send = producer.build_connector_meta().reqs_to_send[req.request_id]
+            assert send.num_tokens == params["num_tokens"] == prompt_tokens - 1
+            assert send.local_block_ids == [100]
+            assert send.mamba_state_block_ids == ([17] if hybrid else None)
+            req.kv_transfer_params = params
+            matched, is_async = consumer.get_num_new_matched_tokens(req, 0)
+            assert (matched, is_async) == (prompt_tokens - 1, True)
+            blocks = MagicMock()
+            blocks.get_block_ids.return_value = ([200], [27])
+            consumer.update_state_after_alloc(req, blocks, matched)
+            load = consumer.build_connector_meta().reqs_to_load[req.request_id]
+            assert load.num_tokens == prompt_tokens - 1
+            assert load.local_block_ids == [200]
+            assert load.mamba_state_block_ids == ([27] if hybrid else None)
+
     @pytest.mark.parametrize("num_computed_tokens", (65_023, 65_024))
+    @pytest.mark.parametrize(
+        "status",
+        [
+            RequestStatus.FINISHED_LENGTH_CAPPED,
+            RequestStatus.FINISHED_STOPPED,
+        ],
+    )
     def test_v3_stage3_finish_keeps_partial_page_and_exact_token_count(
-        self, num_computed_tokens
+        self, num_computed_tokens, status
     ):
         producer = _make_raiden_scheduler(is_producer=True, block_size=4096, pcp_size=8)
         req = MagicMock()
@@ -1313,7 +1513,7 @@ class TestTPURaidenConnectorScheduler:
         req.prompt_token_ids = [0] * 65_024
         req.num_prompt_tokens = 65_024
         req.num_computed_tokens = num_computed_tokens
-        req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        req.status = status
         # Under PCP8 each scheduler block represents 8 physical 4096-token
         # pages. Every PCP rank sees this same two-ID block-table prefix.
         block_ids = [100, 101]
@@ -1371,6 +1571,7 @@ class TestTPURaidenConnectorScheduler:
             first_meta.reqs_to_send[req.request_id].expiration_time == 1_700_000_030.0
         )
         assert duplicate_meta.reqs_to_send == {}
+        assert req.status == status
 
     @pytest.mark.parametrize("num_computed_tokens", [32_775, 32_768])
     def test_v3_stage3_finish_trims_blocks_past_the_transfer_prefix(
@@ -4254,6 +4455,22 @@ class TestTPURaidenConnectorWorker:
                 "was cancelled for req_id=src-late, uuid=1003",
                 True,
             ),
+            (
+                "Remote Controller Server execution failed: Request block registration "
+                "was cancelled for req_id=another-source, uuid=1003",
+                False,
+            ),
+            (
+                "Remote Controller Server execution failed: Request block registration "
+                "was cancelled for req_id=src-late, uuid=1004",
+                False,
+            ),
+            (
+                "Remote Controller Server execution failed: Raiden remote native "
+                "execution failed: Request block registration was cancelled for "
+                "req_id=src-late, uuid=1003",
+                False,
+            ),
             ("connection closed after receiver arming", False),
             (
                 "Control RPC connection failed before sending request to "
@@ -4304,6 +4521,8 @@ class TestTPURaidenConnectorWorker:
     @pytest.mark.parametrize(
         "error_text",
         [
+            "Remote Controller Server execution failed: Request block "
+            "registration was cancelled for req_id=src-late, uuid=1003",
             "Control RPC connection failed before sending request to "
             "prefill-controller.test:27000",
         ],

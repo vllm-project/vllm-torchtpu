@@ -1313,9 +1313,12 @@ class TPUConnectorScheduler:
         if not self.is_producer:
             return False, None
 
-        # max_tokens is forced to 1 by the proxy on P, so the only way the
-        # prefill finishes cleanly is length cap.
-        if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
+        # EOS/stop tokens can finish prefill even with max_tokens=1. Both
+        # successful finish statuses must publish KV transfer metadata.
+        if request.status not in (
+            RequestStatus.FINISHED_LENGTH_CAPPED,
+            RequestStatus.FINISHED_STOPPED,
+        ):
             return False, None
 
         # Only transfer full blocks; let D re-prefill the trailing partial
@@ -1749,12 +1752,13 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         if not self._admit_kv_transfer_params(request):
             return
 
-        if _use_raiden_stage3_transport():
-            self._update_stage3_state_after_alloc(request, blocks, num_external_tokens)
-            return
-
         params = request.kv_transfer_params
         assert params is not None
+        if _use_raiden_stage3_transport():
+            if params.get("_remote_kv_processed"):
+                return
+            self._update_stage3_state_after_alloc(request, blocks, num_external_tokens)
+            return
         if num_external_tokens > 0:
             # D must pull the WHOLE prefill payload: P publishes it under one
             # uuid with no partial-pull, so load into every allocated block.
@@ -1845,8 +1849,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 and int(request.num_computed_tokens) == 0
             ):
                 self._enqueue_stage3_release(request)
-                if request.kv_transfer_params is not None:
-                    request.kv_transfer_params["_remote_kv_processed"] = True
+            if request.kv_transfer_params is not None:
+                request.kv_transfer_params["_remote_kv_processed"] = True
             return
         params = request.kv_transfer_params
         assert params is not None
@@ -6030,9 +6034,6 @@ class TPURaidenConnectorWorker:
         if outcome.error is not None:
             exc = outcome.error
             missing_registration = "Missing producer block registration" in str(exc)
-            cancelled_registration = "Request block registration was cancelled" in str(
-                exc
-            )
             aborted = destination_req_id in self._stage3_finished_loads_pending_cleanup
             if (
                 missing_registration
@@ -6058,6 +6059,16 @@ class TPURaidenConnectorWorker:
                     )
                 self._stage3_pending_submits[destination_req_id] = pending
                 return
+            cancelled_registration = (
+                str(exc)
+                == (
+                    "Remote Controller Server execution failed: Request block "
+                    "registration was cancelled for "
+                    f"req_id={source_req_id}, uuid={uuid}"
+                )
+                and destination_req_id not in self._stage3_controller_accepted
+                and destination_req_id not in self._stage3_pending_controller_failures
+            )
             unsent_connection_failure = (
                 str(exc)
                 == (
@@ -6354,6 +6365,7 @@ class TPURaidenConnectorWorker:
                 clip_kwargs["dst_skip_bytes"] = [fa_skip_bytes] * fa_tag_count + [0] * (
                     len(transfer_tags) - fa_tag_count
                 )
+            dst_mem_type = self._raiden_hbm_memory_type()
             start_submit = time.perf_counter()
             controller_contacted = True
             accepted = self._start_stage3_transfer_with_d5_retry(
@@ -6365,7 +6377,7 @@ class TPURaidenConnectorWorker:
                 # local scheduler lifecycle key.
                 req_id=source_req_id,
                 dst_device_block_ids=dst_blocks,
-                dst_mem_type=self._raiden_hbm_memory_type(),
+                dst_mem_type=dst_mem_type,
                 use_block_chunks=True,
                 src_controller_address=src_controller_address,
                 dst_controller_address=dst_controller_address,
