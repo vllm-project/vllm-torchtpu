@@ -209,6 +209,7 @@ class KVCacheManager:
 
     def __init__(self, runner: TPUModelRunner) -> None:
         self.runner = runner
+        self.model_adapter = None
         self.ds_v4 = DsV4KVCacheAllocator(runner)
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
@@ -219,6 +220,8 @@ class KVCacheManager:
             KVCacheSpec: A dictionary mapping layer names to their KV cache
             format. Layers that do not need KV cache are not included.
         """
+        if self.model_adapter is not None:
+            return self.model_adapter.get_kv_cache_spec()
         layers = get_layers_from_vllm_config(
             self.runner.vllm_config,
             (AttentionLayerBase, MambaBase),  # type: ignore[type-abstract]
@@ -1313,6 +1316,9 @@ class KVCacheManager:
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
+        if self.model_adapter is not None:
+            self.model_adapter.initialize_kv_cache(kv_cache_config)
+            return
         assert kv_cache_config.num_blocks is not None, (
             "KVCacheConfig.num_blocks must be resolved by the scheduler"
         )
