@@ -98,18 +98,26 @@ DECODE_CASES = {
 
 
 @pytest.mark.parametrize(
-    "case,query_block,kv_block,data,size",
+    "case,query_block,kv_block,single_kv_block,data,size",
     [
         (case, *mode, data, 8)
         for case in sorted(DECODE_CASES)
-        for mode in ((0, 0), (4, 256), (4, 1024))
+        # The last mode is the serving recipe's set at conc >= 16.
+        for mode in ((0, 0, 256), (4, 256, 256), (4, 1024, 256), (4, 1024, 1024))
         for data in ("integer", "normal")
     ]
     # A TP size that does not divide the table width.
-    + [("ragged_1_to_4", 4, 1024, "integer", 3)],
+    + [("ragged_1_to_4", 4, 1024, 1024, "integer", 3)],
 )
 def test_sharded_decode_matches_replicated(
-    monkeypatch, reference_kernel, case, query_block, kv_block, data, size
+    monkeypatch,
+    reference_kernel,
+    case,
+    query_block,
+    kv_block,
+    single_kv_block,
+    data,
+    size,
 ):
     q_lens, context, tokens = DECODE_CASES[case]
     args = inputs(len(case) + size, q_lens, context, tokens, data)
@@ -117,6 +125,7 @@ def test_sharded_decode_matches_replicated(
     if query_block:
         monkeypatch.setenv("VLLM_TPU_QSA_DECODE_QUERY_BLOCK", str(query_block))
         monkeypatch.setenv("VLLM_TPU_QSA_DECODE_KV_BLOCK", str(kv_block))
+        monkeypatch.setenv("VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK", str(single_kv_block))
     else:
         monkeypatch.delenv("VLLM_TPU_QSA_DECODE_QUERY_BLOCK", raising=False)
     max_query_len = max(q_lens)
