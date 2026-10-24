@@ -41,6 +41,7 @@ from vllm.v1.kv_cache_interface import MambaSpec
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
+from . import sequence_parallel as sp
 from .config import (
     gdn_cache_spec,
     num_speculative_tokens,
@@ -58,7 +59,6 @@ from .ple_storage import SharedPLEOptions
 from .pool_layout import POOLED_GDN_CONV_STATE_DTYPE
 from .pooled_ple import Qwen4ExpPooledPLE
 from .qsa import QSAMetadata, Qwen4ExpQSA
-from . import sequence_parallel as sp
 
 
 def _parameter_storage_key(parameter):
