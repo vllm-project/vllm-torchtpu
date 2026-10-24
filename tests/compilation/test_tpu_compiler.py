@@ -490,6 +490,61 @@ class TestTpuCompilerCache:
             is None
         )
 
+    @staticmethod
+    def _save(path, monkeypatch):
+        from vllm_torchtpu.compilation import shape_variants
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        monkeypatch.setattr(shape_variants, "graph_signature", lambda graph: ())
+        return TpuCompilerAdaptor()._save_handle(
+            "k", str(path), "entry", graph=None, was_wrapped=False, fingerprint=None
+        )
+
+    def test_failed_save_keeps_the_old_artifact_and_no_temp_file(
+        self, tmp_path, monkeypatch
+    ):
+        import pickle
+
+        path = tmp_path / "artifact"
+        path.write_bytes(b"previous")
+
+        def torn_dump(obj, f):
+            f.write(b"partial")
+            raise OSError("disk full")
+
+        monkeypatch.setattr(pickle, "dump", torn_dump)
+        assert self._save(path, monkeypatch) is False
+        assert path.read_bytes() == b"previous"
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["artifact"]
+
+    def test_concurrent_saves_of_one_key_use_separate_temp_files(
+        self, tmp_path, monkeypatch
+    ):
+        """Two writers of one key must not share a temp file."""
+        temps = []
+        real_replace = os.replace
+        monkeypatch.setattr(
+            os,
+            "replace",
+            lambda src, dst: (temps.append(src), real_replace(src, dst))[1],
+        )
+        path = tmp_path / "artifact"
+        assert self._save(path, monkeypatch)
+        assert self._save(path, monkeypatch)
+
+        assert len(set(temps)) == 2
+        assert f"{path}.tmp" not in temps
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["artifact"]
+
+    def test_saved_artifact_keeps_the_default_file_mode(self, tmp_path, monkeypatch):
+        """Other users of a shared cache read artifacts, so the file gets the
+        mode a plain open() would give it under the current umask."""
+        plain = tmp_path / "plain"
+        plain.write_bytes(b"")
+        path = tmp_path / "artifact"
+        assert self._save(path, monkeypatch)
+        assert path.stat().st_mode == plain.stat().st_mode
+
     def test_compiler_initialize_cache(self):
         """Verify that TpuCompilerAdaptor sets cache_dir accurately."""
         from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
