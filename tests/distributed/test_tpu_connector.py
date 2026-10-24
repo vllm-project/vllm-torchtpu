@@ -2905,6 +2905,200 @@ class TestTPURaidenConnectorWorker:
 
         assert hints == [fa_pages + 3] * 7 + [fa_pages] + [0, 0]
 
+    @staticmethod
+    def _window_manifest(stride: int = 1 << 20):
+        """Two bounded storages: storage 0 stages FA pages plus one GDN
+        group's state block, storage 1 only FA pages."""
+        groups = (
+            SimpleNamespace(layer_names=("fa.0", "fa.1")),
+            SimpleNamespace(layer_names=("gdn.0",)),
+        )
+
+        def pool(tag, layer_name, storage_index):
+            return SimpleNamespace(
+                tag=tag,
+                layer_name=layer_name,
+                storage_index=storage_index,
+                block_stride_bytes=stride,
+            )
+
+        manifest = SimpleNamespace(
+            pools=[
+                pool("fa", "fa.0", 0),
+                pool("gdn.conv.g0", "gdn.0", 0),
+                pool("gdn.ssm.g0", "gdn.0", 0),
+                pool("fa", "fa.1", 1),
+            ]
+        )
+        return manifest, groups
+
+    def test_raiden_staging_budget_windows_fa_pages_on_the_consumer(self):
+        worker = _make_raiden_worker(
+            tp_rank=0, tp_size=1, is_producer=False, block_size=16
+        )
+        # max_model_len 64 / block 16: four FA pages per max-length request.
+        assert worker._max_request_blocks() == 4
+        manifest, groups = self._window_manifest(stride=1 << 20)
+        # 12 MiB over two bounded storages = 6 one-MiB slots each; two
+        # leases make 3 slots per sub-transfer; storage 0 keeps one for its
+        # state block, so the window is 2 FA pages (the smallest storage
+        # window wins).
+        with (
+            patch(f"{_MOD}._windowed_load_supported", return_value=True),
+            patch(f"{_MOD}.dist_utils.get_raiden_pool_staging_leases", return_value=2),
+            patch(
+                f"{_MOD}.dist_utils.get_raiden_pool_staging_budget_mb",
+                return_value=12,
+            ),
+        ):
+            hints = worker._raiden_staging_blocks_per_pool(manifest, groups)
+        assert worker._stage3_fa_window_blocks == 2
+        assert hints == [3, 3, 3, 2]
+
+    def test_raiden_staging_window_override_and_unsupported_client(self):
+        worker = _make_raiden_worker(
+            tp_rank=0, tp_size=1, is_producer=False, block_size=16
+        )
+        manifest, groups = self._window_manifest()
+        # An explicit window overrides the budget-derived one.
+        with (
+            patch(f"{_MOD}._windowed_load_supported", return_value=True),
+            patch(
+                f"{_MOD}.dist_utils.get_raiden_pool_staging_window_blocks",
+                return_value=3,
+            ),
+            patch(
+                f"{_MOD}.dist_utils.get_raiden_pool_staging_budget_mb",
+                return_value=12,
+            ),
+        ):
+            hints = worker._raiden_staging_blocks_per_pool(manifest, groups)
+        assert worker._stage3_fa_window_blocks == 3
+        assert hints == [4, 4, 4, 3]
+        # A window at least as large as the request is no window at all.
+        with (
+            patch(f"{_MOD}._windowed_load_supported", return_value=True),
+            patch(
+                f"{_MOD}.dist_utils.get_raiden_pool_staging_window_blocks",
+                return_value=4,
+            ),
+        ):
+            hints = worker._raiden_staging_blocks_per_pool(manifest, groups)
+        assert worker._stage3_fa_window_blocks == 0
+        assert hints == [5, 5, 5, 4]
+        # Without client support the arena must keep whole-request leases:
+        # a shrunk arena with no window would refuse every long request.
+        with (
+            patch(f"{_MOD}._windowed_load_supported", return_value=False),
+            patch(
+                f"{_MOD}.dist_utils.get_raiden_pool_staging_budget_mb",
+                return_value=12,
+            ),
+            patch(f"{_MOD}.logger.warning") as warning,
+        ):
+            hints = worker._raiden_staging_blocks_per_pool(manifest, groups)
+        assert worker._stage3_fa_window_blocks == 0
+        assert hints == [5, 5, 5, 4]
+        warning.assert_called_once()
+
+    def test_raiden_staging_budget_ignored_by_producers_and_fails_when_tiny(self):
+        producer = _make_raiden_worker(
+            tp_rank=0, tp_size=1, is_producer=True, block_size=16
+        )
+        manifest, groups = self._window_manifest()
+        with (
+            patch(f"{_MOD}._windowed_load_supported", return_value=True),
+            patch(
+                f"{_MOD}.dist_utils.get_raiden_pool_staging_budget_mb",
+                return_value=12,
+            ),
+        ):
+            hints = producer._raiden_staging_blocks_per_pool(manifest, groups)
+        assert producer._stage3_fa_window_blocks == 0
+        assert hints == [5, 5, 5, 4]
+
+        consumer = _make_raiden_worker(
+            tp_rank=0, tp_size=1, is_producer=False, block_size=16
+        )
+        # 2 MiB over two storages holds one slot each: not even one FA page
+        # next to storage 0's state block.
+        with (
+            patch(f"{_MOD}._windowed_load_supported", return_value=True),
+            patch(f"{_MOD}.dist_utils.get_raiden_pool_staging_leases", return_value=1),
+            patch(
+                f"{_MOD}.dist_utils.get_raiden_pool_staging_budget_mb",
+                return_value=2,
+            ),
+            pytest.raises(ValueError, match="TPU_RAIDEN_POOL_STAGING_BUDGET_MB"),
+        ):
+            consumer._raiden_staging_blocks_per_pool(manifest, groups)
+
+    @pytest.mark.parametrize("hybrid", [False, True])
+    def test_stage3_consumer_window_kwarg_only_for_requests_over_the_window(
+        self, hybrid
+    ):
+        worker = _make_raiden_worker(
+            is_producer=False, block_size=1024, tp_rank=0, tp_size=1
+        )
+        worker._stage3_state_group_count = 1 if hybrid else 0
+        worker._stage3_fa_window_blocks = 2
+        worker._raiden_work_unit = MagicMock()
+        facade = MagicMock()
+        facade.start_transfer.return_value = True
+        worker._stage3_source_facades["prefill-controller.test:27000"] = facade
+        common = dict(
+            num_tokens=4095,
+            src_controller_address="prefill-controller.test:27000",
+            src_job_name="prefill",
+            src_engine_id="producer-engine",
+            src_data_replica_idx=0,
+            src_parallelism=8,
+            mamba_state_block_ids=[11] if hybrid else None,
+        )
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_load["dst-long"] = _Stage3LoadMeta(
+            uuid=1997,
+            source_req_id="src-long",
+            local_block_ids=[50, 51, 52, 53],
+            **common,
+        )
+        meta.reqs_to_load["dst-short"] = _Stage3LoadMeta(
+            uuid=1998,
+            source_req_id="src-short",
+            local_block_ids=[60, 61],
+            **common,
+        )
+
+        with (
+            patch.object(
+                worker,
+                "_require_stage3_controller",
+                return_value=(MagicMock(), "10.0.0.2:28000"),
+            ),
+            patch.object(
+                worker, "_stage3_source_work_units", return_value=[MagicMock()]
+            ),
+            patch.object(worker, "_raiden_hbm_memory_type", MagicMock(return_value=3)),
+            patch.object(worker, "_stage3_fa_token_bytes", return_value=64),
+        ):
+            worker._submit_stage3_loads(meta, MagicMock())
+            _flush_stage3_submits(worker)
+
+        assert facade.start_transfer.call_count == 2
+        by_uuid = {
+            call.kwargs["uuid"]: call.kwargs
+            for call in facade.start_transfer.call_args_list
+        }
+        # Four FA pages over a two-page window: every FA tag gets the window,
+        # state tags none (they ride whole in the last sub-transfer).
+        long = by_uuid[1997]
+        assert long["dst_window_blocks"] == ([2, 0, 0] if hybrid else [2])
+        assert long["dst_device_block_ids"] == (
+            [50, 51, 52, 53, 11, 11] if hybrid else [50, 51, 52, 53]
+        )
+        # A request that fits one window stays byte-identical on the wire.
+        assert "dst_window_blocks" not in by_uuid[1998]
+
     def test_v2_stage3_startup_registration_payload_golden(self):
         cases = (
             # role, dp rank, transfer rank, unit replica, data/listener hosts

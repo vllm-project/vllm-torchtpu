@@ -751,6 +751,29 @@ def _prefix_aware_load_enabled() -> bool:
     return _prefix_aware_load_requested() and _prefix_aware_load_supported()
 
 
+@lru_cache(maxsize=1)
+def _windowed_load_supported() -> bool:
+    """Whether the installed reshard client can request bounded-staging
+    windows (dst_window_blocks: the source controller then pulls a request
+    as a chain of sub-transfers).
+
+    Without it the consumer must keep whole-request staging leases: a
+    window the controller cannot honour would leave a request's lease larger
+    than its arena.
+    """
+    try:
+        from tpu_sync.api.torch import reshard_client as _reshard_client
+
+        return bool(getattr(_reshard_client, "SUPPORTS_DST_WINDOW_BLOCKS", False))
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning(
+            "Could not probe tpu-sync dst_window_blocks support; the pool "
+            "staging arena keeps whole-request leases: %s",
+            exc,
+        )
+        return False
+
+
 def _use_raiden_connector(vllm_config: VllmConfig) -> bool:
     if _use_raiden_stage3_transport():
         return True
@@ -2614,6 +2637,11 @@ class TPURaidenConnectorWorker:
         self.named_kv_caches: dict[str, Any] | None = None
         self._raiden_admission_summary: dict[str, Any] | None = None
         self._raiden_manifest: Any | None = None
+        # Bounded-staging sub-transfer window: full-attention destination
+        # pages one sub-transfer may carry (0 = whole request). Derived at
+        # pool admission from TPU_RAIDEN_POOL_STAGING_BUDGET_MB /
+        # _WINDOW_BLOCKS; requested from the source controller per load.
+        self._stage3_fa_window_blocks = 0
         self._raiden_layout_fingerprint: str | None = None
         self._raiden_layout_fingerprint_payload: dict[str, Any] | None = None
         self._raiden_controller_facade: Any | None = None
@@ -5814,6 +5842,16 @@ class TPURaidenConnectorWorker:
                 clip_kwargs["dst_skip_bytes"] = [fa_skip_bytes] * fa_tag_count + [0] * (
                     len(transfer_tags) - fa_tag_count
                 )
+            # Bounded-staging window: a request with more FA pages than
+            # one lease holds is pulled as a chain of sub-transfers (the
+            # source controller slices every paged tag identically; state
+            # tags ride whole in the last one). Requests that fit stay
+            # byte-identical on the wire.
+            window_blocks = int(self._stage3_fa_window_blocks)
+            if 0 < window_blocks < max(dst_counts[:fa_tag_count], default=0):
+                clip_kwargs["dst_window_blocks"] = [window_blocks] * fa_tag_count + [
+                    0
+                ] * (len(transfer_tags) - fa_tag_count)
             dst_mem_type = self._raiden_hbm_memory_type()
         except Exception as exc:  # pylint: disable=broad-except
             # Local staging failed before any controller contact, so no
@@ -7009,6 +7047,11 @@ class TPURaidenConnectorWorker:
             for layer_name in getattr(group, "layer_names", ()):
                 group_of_layer[str(layer_name)] = index
         fa_pages = int(self._max_request_blocks())
+        # A consumer under a staging budget leases one sub-transfer window
+        # of FA pages instead of a whole max-length request.
+        window = self._raiden_fa_window_blocks(manifest, kv_cache_groups)
+        if 0 < window < fa_pages:
+            fa_pages = window
         # storage -> {block table: blocks one transfer touches from it}
         tables_by_storage: dict[int, dict[Any, int]] = {}
         full_mirror: set[int] = set()
@@ -7036,6 +7079,98 @@ class TPURaidenConnectorWorker:
             else:
                 hints.append(sum(tables_by_storage[storage].values()))
         return hints
+
+    def _raiden_fa_window_blocks(self, manifest: Any, kv_cache_groups: Any) -> int:
+        """Full-attention destination pages one sub-transfer may carry on
+        this consumer, or 0 for whole-request transfers.
+
+        TPU_RAIDEN_POOL_STAGING_WINDOW_BLOCKS sets it directly; otherwise
+        TPU_RAIDEN_POOL_STAGING_BUDGET_MB (per rank, over every bounded
+        storage) is split evenly across the storages that stage FA pages:
+        each storage's share holds ``leases`` sub-transfers of ``window``
+        FA pages plus one state block per GDN group sharing the storage, and
+        the smallest storage window wins (all FA tags are sliced alike).
+        Producers never window: the consumer requests windows, and a
+        producer's arena must hold whatever slice it is asked to send. A
+        window needs the installed reshard client to encode it; otherwise
+        the arena keeps whole-request leases (a shrunk arena with no window
+        would refuse every long request).
+        """
+        if self.is_producer:
+            return 0
+        explicit = int(dist_utils.get_raiden_pool_staging_window_blocks())
+        budget_bytes = int(dist_utils.get_raiden_pool_staging_budget_mb()) * (1024**2)
+        if explicit <= 0 and budget_bytes <= 0:
+            self._stage3_fa_window_blocks = 0
+            return 0
+        if not _windowed_load_supported():
+            logger.warning(
+                "Raiden pool staging budget/window requested but the installed "
+                "tpu_sync cannot chain sub-transfers (no dst_window_blocks); "
+                "keeping whole-request staging leases"
+            )
+            self._stage3_fa_window_blocks = 0
+            return 0
+        fa_pages = int(self._max_request_blocks())
+        if explicit > 0:
+            window = explicit
+        else:
+            from vllm_torchtpu.distributed.kv_transfer.raiden import (
+                pool_manifest as rpm,
+            )
+
+            leases = max(1, int(dist_utils.get_raiden_pool_staging_leases()))
+            group_of_layer: dict[str, int] = {}
+            for index, group in enumerate(kv_cache_groups or ()):
+                for layer_name in getattr(group, "layer_names", ()):
+                    group_of_layer[str(layer_name)] = index
+            # storage -> (stride bytes, has FA, state block tables)
+            strides: dict[int, int] = {}
+            fa_storages: set[int] = set()
+            state_tables: dict[int, set[Any]] = {}
+            opaque: set[int] = set()
+            for pool in manifest.pools:
+                tag = str(pool.tag)
+                storage = int(pool.storage_index)
+                strides[storage] = max(
+                    strides.get(storage, 0), int(pool.block_stride_bytes)
+                )
+                layer_name = str(pool.layer_name)
+                table = group_of_layer.get(layer_name, layer_name)
+                if tag.startswith(rpm.TAG_FA):
+                    fa_storages.add(storage)
+                elif tag.startswith(rpm.TAG_GDN_CONV) or tag.startswith(
+                    rpm.TAG_GDN_SSM
+                ):
+                    state_tables.setdefault(storage, set()).add(table)
+                else:
+                    opaque.add(storage)
+            bounded = {s for s in strides if s not in opaque}
+            fa_bounded = sorted(fa_storages & bounded)
+            if not fa_bounded:
+                self._stage3_fa_window_blocks = 0
+                return 0
+            share = budget_bytes // len(bounded)
+            window = fa_pages
+            for storage in fa_bounded:
+                slots = share // max(1, strides[storage])
+                per_lease = slots // leases
+                state_blocks = len(state_tables.get(storage, ()))
+                window = min(window, per_lease - state_blocks)
+            if window < 1:
+                raise ValueError(
+                    "TPU_RAIDEN_POOL_STAGING_BUDGET_MB="
+                    f"{dist_utils.get_raiden_pool_staging_budget_mb()} cannot "
+                    f"hold {leases} sub-transfer(s) of one full-attention page "
+                    f"plus state on each of {len(bounded)} bounded storages "
+                    f"(largest stride {max(strides[s] for s in fa_bounded)} B); "
+                    "raise the budget or lower TPU_RAIDEN_POOL_STAGING_LEASES"
+                )
+        window = int(window)
+        if window >= fa_pages:
+            window = 0
+        self._stage3_fa_window_blocks = window
+        return window
 
     def _register_raiden_pools(
         self, engine: Any, manifest: Any, kv_cache_groups: Any
@@ -7075,12 +7210,15 @@ class TPURaidenConnectorWorker:
             logger.info(
                 "Raiden host staging mode=%s leases=%s "
                 "bounded_bytes_per_shard=%s full_mirror_bytes_per_shard=%s "
-                "storages=%d",
+                "storages=%d sub_transfer_window_fa_pages=%d "
+                "(max_request_fa_pages=%d)",
                 staging.get("mode"),
                 staging.get("leases"),
                 staging.get("bounded_storage_bytes_per_shard"),
                 staging.get("full_storage_bytes_per_shard"),
                 len(staging.get("storages") or ()),
+                int(self._stage3_fa_window_blocks),
+                int(self._max_request_blocks()),
             )
         else:
             logger.info("Raiden host staging mode=full (legacy tpu_sync)")
