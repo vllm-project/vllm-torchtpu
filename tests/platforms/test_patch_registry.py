@@ -390,11 +390,17 @@ def test_sequence_parallel_moe_admission(monkeypatch):
     )
     assert not ParallelConfig.use_sequence_parallel_moe.fget(cfg_tp1)
 
-    # EP=True, TP=8, DP=2 -> False
-    cfg_dp2 = Mock(
-        enable_expert_parallel=True, tensor_parallel_size=8, data_parallel_size=2
+    # EP=True, TP=8, DP=0 -> False
+    cfg_dp0 = Mock(
+        enable_expert_parallel=True, tensor_parallel_size=8, data_parallel_size=0
     )
-    assert not ParallelConfig.use_sequence_parallel_moe.fget(cfg_dp2)
+    assert not ParallelConfig.use_sequence_parallel_moe.fget(cfg_dp0)
+
+    # EP=True, TP=2, DP=4 -> True
+    cfg_dp4_tp2 = Mock(
+        enable_expert_parallel=True, tensor_parallel_size=2, data_parallel_size=4
+    )
+    assert ParallelConfig.use_sequence_parallel_moe.fget(cfg_dp4_tp2)
 
     # EP=True, TP=8, DP=1 -> True
     cfg_sp = Mock(

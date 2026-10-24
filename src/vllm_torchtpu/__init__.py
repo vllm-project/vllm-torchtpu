@@ -566,7 +566,7 @@ def _patch_sequence_parallel_moe_admission() -> None:
         ParallelConfig.use_sequence_parallel_moe = property(
             lambda self: self.enable_expert_parallel
             and self.tensor_parallel_size > 1
-            and self.data_parallel_size == 1
+            and self.data_parallel_size >= 1
         )
     else:
         ParallelConfig.use_sequence_parallel_moe = property(lambda self: False)
