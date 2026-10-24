@@ -293,8 +293,9 @@ def test_ple_gate_sequence_parallel_matches_tp(tp2):
         (True, 1024, 512, 8, False),
         (True, 1024, 1056, 8, False),  # shard would not be 8-row aligned
         (True, 1024, 8192, 1, False),
-        (True, 0, 64, 8, True),
-        (True, 0, 32, 8, False),
+        (True, 0, 64, 8, False),  # decode buckets stay under the 1024 floor
+        (True, 0, 1088, 8, True),
+        (True, 2048, 1088, 8, False),
     ],
 )
 def test_sequence_parallel_eligibility(
