@@ -84,6 +84,33 @@ def _parse_int(raw: str, key: str) -> int | None:
     return None
 
 
+def _pallas_tp_mesh(runner: Any) -> Any:
+    """The 8-device `tp` mesh every Pallas kernel in the served program uses.
+
+    torch_tpu binds partition p to TP rank p and requires all Pallas kernels in
+    one compiled program to share a device assignment; the runner's mesh can
+    list the devices in ICI ring order instead (e.g. [0, 1, 4, 5, 6, 7, 2, 3]),
+    which put the megakernel's remote DMAs on the wrong peers. Fall back to the
+    runner's mesh only without torch_tpu (CPU tests).
+    """
+    try:
+        import numpy as np
+        from torch_tpu._internal.pallas import get_pallas_mesh
+
+        mesh = get_pallas_mesh(axis_names=("tp",))
+        if int(mesh.devices.size) == 8:
+            runner_mesh = getattr(runner, "mesh", None)
+            logger.info(
+                "Qwen3.8 megakernel mesh %s (runner mesh %s)",
+                [getattr(d, "id", d) for d in mesh.devices.flat],
+                None if runner_mesh is None else [getattr(d, "id", d) for d in np.asarray(runner_mesh.devices).flat],
+            )
+            return mesh
+    except Exception as exc:
+        logger.debug("get_pallas_mesh unavailable (%s); using the runner mesh", exc)
+    return _build_tp_rank_mesh(8, getattr(runner, "mesh", None))
+
+
 def pool_layout_of(pool: torch.Tensor) -> Any:
     """`Qwen38GdnPoolLayout` of a torch pool tensor (shape and dtype name only)."""
     from .qwen38_gdn_state import Qwen38GdnPoolLayout
@@ -314,7 +341,7 @@ class Qwen38SegmentDriver:
     def __init__(self, runner: Any, buckets: tuple[int, ...], head: bool = True) -> None:
         self.buckets = buckets
         self.g = qwen38.FULL
-        self.mesh = _build_tp_rank_mesh(8, getattr(runner, "mesh", None))
+        self.mesh = _pallas_tp_mesh(runner)
         self.segments = Qwen38Segments(runner.model, self.g, self.mesh, buckets, head=head)
         self.program = None
         self.check_left = 0
