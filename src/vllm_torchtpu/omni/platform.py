@@ -38,6 +38,8 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     # Diffusion worker world size recorded by set_device (see dist_backend).
     _worker_world_size: int = 1
+    # vLLM-Omni reads its VLLM_OMNI_* knobs directly and has no registry.
+    external_env_var_prefixes: tuple[str, ...] = ("VLLM_OMNI_",)
 
     @property
     def dist_backend(self) -> str:
