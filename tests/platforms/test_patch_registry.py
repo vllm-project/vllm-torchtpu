@@ -246,6 +246,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "maybe_patch_qwen2",
     ]
     assert "patch_moe_expert_write_staging" in stages["worker_init"]
+    assert "patch_host_uploads" in stages["worker_init"]
     for names in (stages["platform_activation"], stages["worker_init"]):
         assert names.index("_patch_vllm_force_v1_runner_tpu") < names.index(
             "_patch_vllm_config_triton_tpu"

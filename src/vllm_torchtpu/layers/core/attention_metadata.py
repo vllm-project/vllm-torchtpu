@@ -395,9 +395,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             ]
             # Flatten on CPU before H2D to avoid device-side
             # as_strided/reshape materialization on every decode step.
-            block_tables_dev = block_tables.reshape(-1).to(
-                runner.device, non_blocking=True
-            )
+            block_tables_dev = runner._upload(block_tables.reshape(-1))
             input_positions = runner.position_ids
 
         mamba_ckpt_indices = None
@@ -539,7 +537,7 @@ def stage_block_table_uploads(
             offset += num_reqs_padded * target_num_blocks
     # Dummy runs keep the zeroed scratch: same staged layout, null blocks.
 
-    staged_dev = flat.to(runner.device, non_blocking=True)
+    staged_dev = runner._upload(flat)
 
     # One compiled program splits the staged tensor into per-group tables
     # and derives every unified-pool mamba group's state/checkpoint indices

@@ -112,10 +112,12 @@ def _make_self(
         cache_config=SimpleNamespace(block_size=BLOCK_SIZE),
         block_size=BLOCK_SIZE,
         device="cpu",
+        _staging_sources=[],
         mamba_slot_read_offsets=read_offsets,
         _pending_mamba_state_copies=[],
         input_batch=input_batch,
     )
+    ns._upload = TPUModelRunner._upload.__get__(ns)
     # Padding/expansion/source-selection helpers the collector calls on
     # self; bind the real implementations onto the stand-in. The static and
     # class methods are already callable as-is.

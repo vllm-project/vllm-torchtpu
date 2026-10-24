@@ -36,9 +36,10 @@ from vllm.model_executor.layers.pooler.seqwise.methods import (
 )
 from vllm.model_executor.layers.pooler.seqwise.poolers import SequencePooler
 from vllm.utils.math_utils import cdiv
-from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
+
+from vllm_torchtpu.runner import host_uploads
 
 
 class PromptTokenIdsTensor(torch.Tensor):
@@ -103,14 +104,10 @@ class TPUMeanPool(SequencePoolingMethod):
             if num_seqs == 0:
                 return hidden_states.new_empty((0, hidden_size), dtype=torch.float32)
 
-            if isinstance(prompt_lens_cpu, torch.Tensor):
-                prompt_lens = prompt_lens_cpu.to(
-                    device=hidden_states.device, dtype=torch.int64, non_blocking=True
-                )
-            else:
-                prompt_lens = async_tensor_h2d(
-                    prompt_lens_cpu, device=hidden_states.device, dtype=torch.int64
-                )
+            prompt_lens = host_uploads.upload(
+                torch.as_tensor(prompt_lens_cpu, dtype=torch.int64),
+                hidden_states.device,
+            )
             segment_ids = torch.repeat_interleave(
                 torch.arange(num_seqs, device=hidden_states.device, dtype=torch.long),
                 prompt_lens,
@@ -536,7 +533,7 @@ def static_pool(
 
 
 def _to_device(array: np.ndarray, device: torch.device | str) -> torch.Tensor:
-    return torch.from_numpy(array).to(device, non_blocking=True)
+    return host_uploads.upload(torch.from_numpy(array), device)
 
 
 def build_static_pool_inputs(

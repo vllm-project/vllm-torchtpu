@@ -143,7 +143,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
-from vllm_torchtpu.runner import greedy_top_tokens
+from vllm_torchtpu.runner import greedy_top_tokens, host_uploads
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kernel_block_table import install_kernel_block_tables
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
@@ -780,8 +780,7 @@ class TPUModelRunner(GPUModelRunner):
         # Per-width reusable buffers for that per-step reset; see
         # `_read_offset_reset_scratch`.
         self._read_offset_scratch: dict[
-            tuple[int, str],
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+            tuple[int, str], tuple[torch.Tensor, torch.Tensor]
         ] = {}
         # DecodeBench fills local state instead of transferring manager blocks,
         # so it can retain the compact request-indexed Mamba layout.
@@ -997,16 +996,19 @@ class TPUModelRunner(GPUModelRunner):
         # ragged paged attention (in-window query rows never attend).
         self._combined_request_distribution_cpu = torch.zeros(6, dtype=torch.int32)
         self._decode_device_cache_key: tuple | None = None
-        # Snapshot of the in-flight uploads from the host staging tensors
-        # (input_ids_cpu, positions_cpu, seq_lens_cpu, ...); the next chunk
-        # waits on it before rewriting them.
+        # Fence over the uploads issued so far: the host staging tensors
+        # (input_ids_cpu, positions_cpu, seq_lens_cpu, ...) and the held
+        # sources; the next chunk waits on it before rewriting or releasing them.
         self._input_staging_fence: Any = None
+        self._staging_sources: list[torch.Tensor] = []
+        self._fenced_staging_sources: list[torch.Tensor] = []
+        host_uploads.set_uploader(self._upload, self.device, self._hold)
         self._cached_query_start_loc: torch.Tensor | None = None
         self._cached_logits_indices: torch.Tensor | None = None
         self._cached_request_distribution: torch.Tensor | None = None
         # Last upload per `_upload_unless_unchanged` slot:
-        # (key, device tensor, host source).
-        self._h2d_reuse: dict[str, tuple[tuple, torch.Tensor, torch.Tensor]] = {}
+        # (key, device tensor).
+        self._h2d_reuse: dict[str, tuple[tuple, torch.Tensor]] = {}
 
         self.speculative_config = self.vllm_config.speculative_config
         speculative_config = self.speculative_config
@@ -1786,7 +1788,7 @@ class TPUModelRunner(GPUModelRunner):
                 slot = self._free_mamba_slots.pop()
                 self._mamba_slot_by_req_id[req_id] = slot
             indices[i] = slot
-        return indices.to(self.device, non_blocking=True)
+        return self._upload(indices)
 
     def _build_mamba_copy_plan(
         self,
@@ -2015,9 +2017,7 @@ class TPUModelRunner(GPUModelRunner):
                 dsts_g = [d for _, d in pairs]
                 spec_dsts.extend(dsts_g)
                 src_t = self._spec_seed_sources(state_srcs, ckpt_rows, new_owners)
-                dst_t = torch.tensor(dsts_g, dtype=torch.int32).to(
-                    self.device, non_blocking=True
-                )
+                dst_t = self._upload(torch.tensor(dsts_g, dtype=torch.int32))
                 src_t, dst_t = self._expand_pool_split(src_t, dst_t)
                 key = tuple(id(raw) for raw in raws)
                 entry = per_raw_dev.setdefault(key, (raws, [], []))
@@ -2040,8 +2040,8 @@ class TPUModelRunner(GPUModelRunner):
 
         if spec_seed and spec_dsts:
             # The seeded checkpoint is checkpoint 0 of the new group.
-            dst_t = torch.tensor(self._pad_to_bucket(spec_dsts), dtype=torch.long).to(
-                self.device, non_blocking=True
+            dst_t = self._upload(
+                torch.tensor(self._pad_to_bucket(spec_dsts), dtype=torch.long)
             )
             assert self.mamba_slot_read_offsets is not None
             _rollback_offsets_seed(self.mamba_slot_read_offsets, dst_t)
@@ -2051,11 +2051,11 @@ class TPUModelRunner(GPUModelRunner):
             # forward that reads the buffer). Padding with (0, 0) null-block
             # self-copies keeps the shapes on the seed-copy bucket ladder.
             offset_pairs = self._pad_to_bucket(offset_pairs, pad=(0, 0))
-            src_t = torch.tensor([s for s, _ in offset_pairs], dtype=torch.long).to(
-                self.device, non_blocking=True
+            src_t = self._upload(
+                torch.tensor([s for s, _ in offset_pairs], dtype=torch.long)
             )
-            dst_t = torch.tensor([d for _, d in offset_pairs], dtype=torch.long).to(
-                self.device, non_blocking=True
+            dst_t = self._upload(
+                torch.tensor([d for _, d in offset_pairs], dtype=torch.long)
             )
             _rollback_offsets_migrate(self.mamba_slot_read_offsets, src_t, dst_t)
 
@@ -2065,11 +2065,11 @@ class TPUModelRunner(GPUModelRunner):
             self._pending_mamba_state_copies.append((raws, src_t, dst_t))
 
         for raws, srcs, dsts in per_raw.values():
-            src_t = torch.tensor(self._pad_to_bucket(srcs), dtype=torch.int32).to(
-                self.device, non_blocking=True
+            src_t = self._upload(
+                torch.tensor(self._pad_to_bucket(srcs), dtype=torch.int32)
             )
-            dst_t = torch.tensor(self._pad_to_bucket(dsts), dtype=torch.int32).to(
-                self.device, non_blocking=True
+            dst_t = self._upload(
+                torch.tensor(self._pad_to_bucket(dsts), dtype=torch.int32)
             )
             self._pending_mamba_state_copies.append((raws, src_t, dst_t))
 
@@ -2135,21 +2135,15 @@ class TPUModelRunner(GPUModelRunner):
         """
         offsets = self.mamba_slot_read_offsets
         assert offsets is not None
-        state_t = torch.tensor(state_srcs, dtype=torch.long).to(
-            self.device, non_blocking=True
-        )
-        ckpt_t = torch.tensor(ckpt_rows, dtype=torch.int32).to(
-            self.device, non_blocking=True
-        )
+        state_t = self._upload(torch.tensor(state_srcs, dtype=torch.long))
+        ckpt_t = self._upload(torch.tensor(ckpt_rows, dtype=torch.int32))
         off = offsets[state_t].long().clamp_(0, ckpt_t.shape[1] - 1)
         # PD and prefix-cache restores provide committed state in checkpoint 0.
         # A recycled source block can retain another request's MTP offset.
         # The first-forward reset clears the destination, after this source
         # selection, so ignore that stale offset here without mutating the
         # source block (which may be shared). Live requests retain their offset.
-        new_owner_t = torch.tensor(new_owners, dtype=torch.bool).to(
-            self.device, non_blocking=True
-        )
+        new_owner_t = self._upload(torch.tensor(new_owners, dtype=torch.bool))
         off = torch.where(new_owner_t, 0, off)
         return ckpt_t.gather(1, off.unsqueeze(1)).squeeze(1)
 
@@ -2194,11 +2188,11 @@ class TPUModelRunner(GPUModelRunner):
                 for block_copy in copies
             ]
             mgr_pairs = self._pad_to_bucket(mgr_pairs, pad=(0, 0))
-            mgr_src_t = torch.tensor([s for s, _ in mgr_pairs], dtype=torch.long).to(
-                self.device, non_blocking=True
+            mgr_src_t = self._upload(
+                torch.tensor([s for s, _ in mgr_pairs], dtype=torch.long)
             )
-            mgr_dst_t = torch.tensor([d for _, d in mgr_pairs], dtype=torch.long).to(
-                self.device, non_blocking=True
+            mgr_dst_t = self._upload(
+                torch.tensor([d for _, d in mgr_pairs], dtype=torch.long)
             )
             _rollback_offsets_migrate(read_offsets, mgr_src_t, mgr_dst_t)
 
@@ -2209,12 +2203,8 @@ class TPUModelRunner(GPUModelRunner):
             for j in range(split)
         ]
         pairs = self._pad_to_bucket(pairs, pad=(0, 0))
-        src_t = torch.tensor([src for src, _ in pairs], dtype=torch.int32).to(
-            self.device, non_blocking=True
-        )
-        dst_t = torch.tensor([dst for _, dst in pairs], dtype=torch.int32).to(
-            self.device, non_blocking=True
-        )
+        src_t = self._upload(torch.tensor([src for src, _ in pairs], dtype=torch.int32))
+        dst_t = self._upload(torch.tensor([dst for _, dst in pairs], dtype=torch.int32))
         self._copy_mamba_state_blocks(self.kv_cache_raw_tensors, src_t, dst_t)
 
     def _dense_kv_copy_supported(self) -> bool:
@@ -2284,12 +2274,8 @@ class TPUModelRunner(GPUModelRunner):
                 for j in range(split)
             ]
             pairs = self._pad_to_bucket(pairs, pad=(0, 0))
-            src_t = torch.tensor([s for s, _ in pairs], dtype=torch.int32).to(
-                self.device, non_blocking=True
-            )
-            dst_t = torch.tensor([d for _, d in pairs], dtype=torch.int32).to(
-                self.device, non_blocking=True
-            )
+            src_t = self._upload(torch.tensor([s for s, _ in pairs], dtype=torch.int32))
+            dst_t = self._upload(torch.tensor([d for _, d in pairs], dtype=torch.int32))
             copy_pool_blocks(pools, src_t, dst_t)
 
     def _precompile_dense_kv_cache_block_copies(self) -> None:
@@ -2438,12 +2424,12 @@ class TPUModelRunner(GPUModelRunner):
                     constant_values=-1,
                 )
 
-                cur_input_indices = torch.from_numpy(
-                    padded_token_in_tpu_cur_input_indices
-                ).to(self.device, non_blocking=True)
-                pre_next_tokens_indices = torch.from_numpy(
-                    padded_token_in_tpu_pre_next_tokens_indices
-                ).to(self.device, non_blocking=True)
+                cur_input_indices = self._upload(
+                    torch.from_numpy(padded_token_in_tpu_cur_input_indices)
+                )
+                pre_next_tokens_indices = self._upload(
+                    torch.from_numpy(padded_token_in_tpu_pre_next_tokens_indices)
+                )
                 self._cached_subst_key = subst_key
                 self._cached_cur_input_indices = cur_input_indices
                 self._cached_pre_next_tokens_indices = pre_next_tokens_indices
@@ -2463,12 +2449,12 @@ class TPUModelRunner(GPUModelRunner):
                 constant_values=-1,
             )
 
-            cur_input_indices = torch.from_numpy(
-                padded_token_in_tpu_cur_input_indices
-            ).to(self.device, non_blocking=True)
-            pre_next_tokens_indices = torch.from_numpy(
-                padded_token_in_tpu_pre_next_tokens_indices
-            ).to(self.device, non_blocking=True)
+            cur_input_indices = self._upload(
+                torch.from_numpy(padded_token_in_tpu_cur_input_indices)
+            )
+            pre_next_tokens_indices = self._upload(
+                torch.from_numpy(padded_token_in_tpu_pre_next_tokens_indices)
+            )
 
         return _substitute_placeholder_token(
             input_ids,
@@ -3127,9 +3113,7 @@ class TPUModelRunner(GPUModelRunner):
             request_major_input_ids_cpu_padded.narrow(
                 0, 0, layout_plan.global_num_tokens
             ).copy_(request_major_input_ids_cpu)
-            request_major_input_ids = request_major_input_ids_cpu_padded.to(
-                self.device, non_blocking=True
-            )
+            request_major_input_ids = self._upload(request_major_input_ids_cpu_padded)
         local_total_num_scheduled_tokens = layout_plan.local_num_tokens
         local_padded_total_num_scheduled_tokens = layout_plan.local_padded_num_tokens
         local_token_slice = layout_plan.token_slice
@@ -3138,31 +3122,23 @@ class TPUModelRunner(GPUModelRunner):
             self.input_ids_cpu[
                 total_num_scheduled_tokens:padded_total_num_scheduled_tokens
             ] = 0
-        self.input_ids = self.input_ids_cpu[local_token_slice].to(
-            self.device, non_blocking=True
-        )
+        self.input_ids = self._upload(self.input_ids_cpu[local_token_slice])
         if self.uses_mrope:
             if layout_plan.kind is SequenceLayoutKind.ALL:
                 self.mrope_positions.cpu[
                     :, total_num_scheduled_tokens:padded_total_num_scheduled_tokens
                 ] = 0
-            self.position_ids = self.mrope_positions.cpu[:, local_token_slice].to(
-                self.device, non_blocking=True
+            self.position_ids = self._upload(
+                self.mrope_positions.cpu[:, local_token_slice]
             )
         else:
-            self.position_ids = self.positions_cpu[local_token_slice].to(
-                self.device, non_blocking=True
-            )
+            self.position_ids = self._upload(self.positions_cpu[local_token_slice])
         if use_max_model_len:
-            seq_lens = self.seq_lens_cpu[: self.num_reqs_max_model_len].to(
-                self.device, non_blocking=True
-            )
+            seq_lens = self._upload(self.seq_lens_cpu[: self.num_reqs_max_model_len])
             target_num_reqs = self.num_reqs_max_model_len
         else:
             assert self.num_reqs_most_model_len is not None
-            seq_lens = self.seq_lens_cpu[: self.num_reqs_most_model_len].to(
-                self.device, non_blocking=True
-            )
+            seq_lens = self._upload(self.seq_lens_cpu[: self.num_reqs_most_model_len])
             target_num_reqs = self.num_reqs_most_model_len
 
         # Async spec: seq_lens/positions were advanced optimistically (every
@@ -3279,15 +3255,13 @@ class TPUModelRunner(GPUModelRunner):
             if spec_decode_metadata is not None:
                 logits_indices = spec_decode_metadata.final_logits_indices
             elif layout_plan.logits_indices_cpu is not None:
-                logits_indices = layout_plan.logits_indices_cpu.to(
-                    self.device, non_blocking=True
-                )
+                logits_indices = self._upload(layout_plan.logits_indices_cpu)
             else:
                 # Indices at which we sample (positions of last token in the
                 # sequence). Padded to avoid recompiling when `num_reqs` varies.
-                logits_indices = (
+                logits_indices = self._upload(
                     self.query_start_loc_cpu[1 : padded_num_reqs + 1] - 1
-                ).to(self.device, non_blocking=True)
+                )
 
             # For the V3 kernel, request_distribution is
             # [decode_end, prefill_end, mixed_end]. We put decode requests first,
@@ -3310,9 +3284,7 @@ class TPUModelRunner(GPUModelRunner):
                 self._request_distribution_cpu[0] = chunk_num_decode
                 self._request_distribution_cpu[1] = chunk_static_verify_end
                 self._request_distribution_cpu[2] = num_reqs
-                request_distribution = self._request_distribution_cpu.to(
-                    self.device, non_blocking=True
-                )
+                request_distribution = self._upload(self._request_distribution_cpu)
             else:
                 # Replaced below by a view of the combined RPA + GDN upload;
                 # uploading it here as well would be thrown away.
@@ -3360,11 +3332,11 @@ class TPUModelRunner(GPUModelRunner):
                     not hasattr(self, "_cached_comb_dev")
                     or getattr(self, "_cached_comb_key", None) != chunk_comb_key
                 ):
-                    self._cached_comb_dev = combined.to(self.device, non_blocking=True)
+                    self._cached_comb_dev = self._upload(combined)
                     self._cached_comb_key = chunk_comb_key
                 combined_device = self._cached_comb_dev
             else:
-                combined_device = combined.to(self.device, non_blocking=True)
+                combined_device = self._upload(combined)
             request_distribution = combined_device[0:3]
             mamba_request_distribution = combined_device[3:6]
         assert request_distribution is not None
@@ -3435,24 +3407,46 @@ class TPUModelRunner(GPUModelRunner):
             layout_plan,
         )
 
-    def _record_input_staging_fence(self) -> None:
-        """Fence the uploads issued from the reusable host staging tensors.
+    def _upload(self, host: torch.Tensor) -> torch.Tensor:
+        """`host.to(self.device, non_blocking=True)`, holding `host` until a
+        staging fence recorded after this upload has been waited on.
 
-        Every `.to(self.device, non_blocking=True)` of a staging tensor keeps
-        reading its host memory until the transfer completes, and the same
-        tensors are rewritten by the next chunk's input preparation. The
-        event is recorded before the forward is dispatched, so waiting on it
-        never waits for the forward itself.
+        A non-blocking upload keeps reading its host memory until the transfer
+        executes behind whatever the device is still running; a temporary that
+        was freed meanwhile has its memory reused by then. A non-contiguous
+        source is copied first, so the held tensor is the one the copy reads.
+        """
+        host = host.contiguous()
+        dev = host.to(self.device, non_blocking=True)
+        self._staging_sources.append(host)
+        return dev
+
+    def _hold(self, host: torch.Tensor) -> None:
+        """Keep `host` until a staging fence recorded after now is waited on."""
+        self._staging_sources.append(host)
+
+    def _record_input_staging_fence(self) -> None:
+        """Fence the uploads issued so far.
+
+        Every `_upload` keeps reading its host memory until the transfer
+        completes; the reusable staging tensors are rewritten by the next
+        chunk's input preparation and the uploaded temporaries are released
+        by the wait. Uploads issued after this record (sampling, draft
+        walks) wait for the next fence. The event is recorded before the
+        forward is dispatched, so waiting on it never waits for the forward.
         """
         fence = torch.tpu.Event()
         fence.record()
         self._input_staging_fence = fence
+        self._fenced_staging_sources.extend(self._staging_sources)
+        self._staging_sources = []
 
     def _wait_input_staging_fence(self) -> None:
         fence = self._input_staging_fence
         if fence is not None:
             fence.synchronize()
             self._input_staging_fence = None
+            self._fenced_staging_sources.clear()
 
     def _upload_unless_unchanged(self, slot: str, host: torch.Tensor) -> torch.Tensor:
         """`host.to(self.device)`, reusing `slot`'s previous upload when the
@@ -3461,15 +3455,13 @@ class TPUModelRunner(GPUModelRunner):
         Spec-decode steps miss the decode-only cache in `_prepare_inputs`, yet
         in steady decode most of their small index tensors repeat step after
         step. One entry per slot keeps memory bounded however the values vary.
-        The entry also holds `host`, so a temporary array stays alive while its
-        non-blocking upload may still be reading it.
         """
         key = (host.dtype, tuple(host.shape), host.numpy().tobytes())
         prev = self._h2d_reuse.get(slot)
         if prev is not None and prev[0] == key:
             return prev[1]
-        dev = host.to(self.device, non_blocking=True)
-        self._h2d_reuse[slot] = (key, dev, host)
+        dev = self._upload(host)
+        self._h2d_reuse[slot] = (key, dev)
         return dev
 
     def _execute_mm_encoder(
@@ -3726,6 +3718,7 @@ class TPUModelRunner(GPUModelRunner):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        self._wait_input_staging_fence()
         # Update cached state
         self._update_states(scheduler_output)
         if self.scheduler_config.async_scheduling:
@@ -3917,7 +3910,7 @@ class TPUModelRunner(GPUModelRunner):
             ):
                 # Nothing substituted this chunk, so the host drafts are real.
                 spec_decode_metadata.draft_token_ids = (
-                    spec_decode_metadata.upload_deferred_draft_token_ids(self.device)
+                    spec_decode_metadata.upload_deferred_draft_token_ids(self._upload)
                 )
             draft_input_ids_src = input_ids
 
@@ -4238,10 +4231,16 @@ class TPUModelRunner(GPUModelRunner):
             self.input_batch.num_computed_tokens_cpu_tensor[start_index:end_index]
             + num_scheduled_tokens_cpu
         )
+        # Passed in, so upstream does not upload its own host temporary.
+        query_start_loc = np.zeros(len(num_scheduled_tokens_np) + 1, dtype=np.int64)
+        np.cumsum(num_scheduled_tokens_np, out=query_start_loc[1:])
+        query_start_loc_device = self._upload(torch.from_numpy(query_start_loc))
         pooling_metadata.build_pooling_cursor(
             num_scheduled_tokens_np=num_scheduled_tokens_np,
             seq_lens_cpu=seq_lens_cpu,
-            device=self.device,
+            # Upstream compares devices exactly; "tpu" != "tpu:0".
+            device=query_start_loc_device.device,
+            query_start_loc_gpu=query_start_loc_device,
         )
         pooler_output = cast(VllmModelForPooling, self.model).pooler(
             hidden_states=unpadded_hidden_states,
@@ -4386,7 +4385,7 @@ class TPUModelRunner(GPUModelRunner):
         self._mamba_offset_seeded.intersection_update(self.requests)
 
         width = groups[0].shape[0]
-        keep, keep_dev, null = self._read_offset_reset_scratch(width, groups[0].device)
+        keep, null = self._read_offset_reset_scratch(width, groups[0].device)
         keep.zero_()
         any_new = False
         for i in range(min(num_reqs, max(0, len(req_ids) - start_index))):
@@ -4400,15 +4399,15 @@ class TPUModelRunner(GPUModelRunner):
         # Skip only when no rank can disagree; see the docstring.
         if not any_new and not self._dp_lockstep_enabled():
             return
-        keep_dev.copy_(keep, non_blocking=True)
+        keep_dev = self._upload(keep)
         # Stack groups and reset offsets across all groups in one compiled program.
         stacked = torch.stack(groups) if len(groups) > 1 else groups[0].unsqueeze(0)
         _reset_read_offsets(self.mamba_slot_read_offsets, keep_dev, stacked, null)
 
     def _read_offset_reset_scratch(
         self, width: int, device: torch.device
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Reusable `(keep_cpu, keep_dev, null)` of length `width`.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reusable `(keep_cpu, null)`; `keep_cpu` has length `width`.
 
         `_reset_read_offsets_for_new_requests` runs on every step, so its
         working set is allocated once per width rather than per step. Width
@@ -4423,7 +4422,6 @@ class TPUModelRunner(GPUModelRunner):
         if entry is None:
             entry = (
                 torch.zeros(width, dtype=torch.bool),
-                torch.zeros(width, dtype=torch.bool, device=device),
                 torch.zeros((), dtype=torch.int32, device=device),
             )
             self._read_offset_scratch[key] = entry
@@ -5221,6 +5219,8 @@ class TPUModelRunner(GPUModelRunner):
             )
         validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
+        if self.supports_mm_inputs:
+            host_uploads.hold_encoder_metadata_uploads(self.model)
         if self.is_pooling_model:
             self._resolve_static_pooler()
         if self.parallel_config.pipeline_parallel_size > 1:
@@ -5481,6 +5481,9 @@ class TPUModelRunner(GPUModelRunner):
         stage must then run the same sequence of forwards, and the caller
         settles the hand-off afterwards.
         """
+        # Like a real chunk: the previous chunk's uploads may still read the
+        # host staging tensors this run rewrites.
+        self._wait_input_staging_fence()
         kv_cache_initialized = self.kv_cache_config is not None
         profiling = profile_prefix is not None
 
@@ -5656,6 +5659,7 @@ class TPUModelRunner(GPUModelRunner):
                 if self._pp_topk_buffer is not None:
                     inputs.append(self._pp_topk_buffer)
                 synchronize_tensors(inputs)
+            self._record_input_staging_fence()
             started = time.perf_counter()
             out, _ = self.forward_model(
                 input_ids=input_ids,
@@ -7812,9 +7816,9 @@ class TPUModelRunner(GPUModelRunner):
         )
 
         return (
-            temps_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
-            top_k_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
-            top_p_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
+            self._upload(temps_cpu.unsqueeze(1)),
+            self._upload(top_k_cpu.unsqueeze(1)),
+            self._upload(top_p_cpu.unsqueeze(1)),
         )
 
     def _topk_candidate_blocks(self) -> int:

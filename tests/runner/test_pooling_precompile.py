@@ -812,13 +812,16 @@ def _fake_pool_chunk_runner(runner_mod, spec, pooler, prompt_lens, computed):
     from vllm_torchtpu.runner.tpu_pooling import build_pooling_metadata
 
     batch.get_pooling_metadata = lambda: build_pooling_metadata(batch, requests)
-    return SimpleNamespace(
+    runner = SimpleNamespace(
         input_batch=batch,
         requests=requests,
         _static_pooler_spec=spec,
         model=SimpleNamespace(pooler=pooler),
         device=torch.device("cpu"),
+        _staging_sources=[],
     )
+    runner._upload = runner_mod.TPUModelRunner._upload.__get__(runner)
+    return runner
 
 
 @pytest.mark.parametrize("use_static", [True, False])
@@ -844,3 +847,55 @@ def test_runner_pool_chunk_gates_chunked_last(use_static):
     assert rows[0] is None
     ref = torch.nn.functional.normalize(hidden[9].float(), dim=-1)
     torch.testing.assert_close(rows[1].float().cpu(), ref, atol=1e-6, rtol=0)
+
+
+def test_eager_pool_chunk_holds_the_query_start_offsets():
+    """The eager path hands the pooling cursor its token offsets through the
+    runner's `_upload`, so upstream does not upload a host temporary."""
+    runner_mod = _import_runner()
+    pooler = _embed_pooler("LAST")
+    runner = _fake_pool_chunk_runner(runner_mod, None, pooler, [10, 4], [0, 0])
+    sched = SimpleNamespace(
+        num_scheduled_tokens=dict(zip(runner.input_batch.req_ids, [6, 4]))
+    )
+    runner_mod.TPUModelRunner._pool_chunk(
+        runner, sched, _padded_hidden([6, 4], 16), 0, 2, 16, 8, None, None
+    )
+    offsets = [t.tolist() for t in runner._staging_sources if t.dtype == torch.int64]
+    assert [0, 6, 10] in offsets
+
+
+def test_eager_pool_chunk_offsets_device_matches_an_indexless_runner_device(
+    monkeypatch,
+):
+    """The runner's device has no index ("tpu") while uploaded tensors report
+    one ("tpu:0"); upstream compares the two exactly."""
+    runner_mod = _import_runner()
+    pooler = _embed_pooler("LAST")
+    runner = _fake_pool_chunk_runner(runner_mod, None, pooler, [10, 4], [0, 0])
+    seen = {}
+    meta_cls = type(runner.input_batch.get_pooling_metadata())
+    original = meta_cls.build_pooling_cursor
+
+    def build(self, *args, device, query_start_loc_gpu=None, **kwargs):
+        seen["device"] = device
+        seen["offsets_device"] = query_start_loc_gpu.device
+        return original(
+            self,
+            *args,
+            device=device,
+            query_start_loc_gpu=query_start_loc_gpu,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(meta_cls, "build_pooling_cursor", build)
+    # CPU tensors report plain "cpu", so "cpu:0" plays the runner device that
+    # an uploaded tensor's device does not compare equal to.
+    runner.device = torch.device("cpu", 0)
+    sched = SimpleNamespace(
+        num_scheduled_tokens=dict(zip(runner.input_batch.req_ids, [6, 4]))
+    )
+    runner_mod.TPUModelRunner._pool_chunk(
+        runner, sched, _padded_hidden([6, 4], 16), 0, 2, 16, 8, None, None
+    )
+    assert seen["device"] == seen["offsets_device"]

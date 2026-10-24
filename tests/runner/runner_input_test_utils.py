@@ -109,12 +109,23 @@ def _make_runner(
     runner.arange_np = np.arange(max_num_tokens, dtype=np.int64)
     runner._request_distribution_cpu = torch.zeros(3, dtype=torch.int32)
     runner._decode_device_cache_key = None
-    # The staging-tensor fence is recorded by execute_model; these tests
-    # call _prepare_inputs directly, so the wait must find an empty fence.
+    # execute_model waits on the staging fence before it rewrites any host
+    # staging tensor; the fake starts without one.
     runner._input_staging_fence = None
+    runner._staging_sources = []
+    runner._fenced_staging_sources = []
+    runner._upload = types.MethodType(TPUModelRunner._upload, runner)
     runner._wait_input_staging_fence = types.MethodType(
         TPUModelRunner._wait_input_staging_fence, runner
     )
+
+    # The host has no TPU events: a record moves the held uploads under the
+    # fence as the runner's does, without recording one.
+    def record_input_staging_fence():
+        runner._fenced_staging_sources.extend(runner._staging_sources)
+        runner._staging_sources = []
+
+    runner._record_input_staging_fence = record_input_staging_fence
     runner._cached_query_start_loc = None
     runner._cached_logits_indices = None
     runner._cached_request_distribution = None

@@ -37,8 +37,12 @@ class TestAttentionMetadataBuilderPlumbing:
         max_num_blocks_per_req=4,
         max_num_reqs=4,
     ):
+        from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
         runner = MagicMock()
         runner.device = torch.device("cpu")
+        runner._staging_sources = []
+        runner._upload = TPUModelRunner._upload.__get__(runner)
         runner.block_size = 16
         runner.max_num_reqs = max_num_reqs
         runner.most_model_len = most_model_len

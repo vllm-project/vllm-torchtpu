@@ -1391,6 +1391,8 @@ class TestAttentionMetadataBuilder:
     ):
         runner = MagicMock()
         runner.device = torch.device("cpu")
+        runner._staging_sources = []
+        runner._upload = TPUModelRunner._upload.__get__(runner)
         runner.block_size = 16
         runner.max_num_reqs = max_num_reqs
         runner.most_model_len = most_model_len
@@ -1623,6 +1625,8 @@ class TestCompactMambaSlotPool:
     def _make_runner(self, max_num_reqs=4, mamba_num_blocks=5, slot_stride=1):
         runner = MagicMock(spec=TPUModelRunner)
         runner.device = torch.device("cpu")
+        runner._staging_sources = []
+        runner._upload = TPUModelRunner._upload.__get__(runner)
         runner.max_num_reqs = max_num_reqs
         # Slots per request: 1 without spec decode, num_spec + 1 with it.
         runner._mamba_slot_stride = slot_stride
@@ -2186,6 +2190,9 @@ class TestReadOffsetsClearedOnReallocation:
     def _make_runner(self, num_blocks=8, width=2, lockstep=False):
         runner = MagicMock(spec=TPUModelRunner)
         runner.mamba_slot_read_offsets = torch.zeros(num_blocks, dtype=torch.int32)
+        runner.device = runner.mamba_slot_read_offsets.device
+        runner._staging_sources = []
+        runner._upload = TPUModelRunner._upload.__get__(runner)
         runner._mamba_offset_seeded = set()
         runner._read_offset_scratch = {}
         runner._dp_lockstep_enabled = lambda: lockstep
@@ -2319,6 +2326,8 @@ class TestUnifiedReadOffsetMigration:
         # size; with cp=1 the two coincide here.
         runner._mamba_state_block_size = block_size
         runner.device = torch.device("cpu")
+        runner._staging_sources = []
+        runner._upload = TPUModelRunner._upload.__get__(runner)
         runner.mamba_slot_read_offsets = torch.zeros(16, dtype=torch.int32)
         runner._mamba_state_pos = {}
         runner.scheduler_config = SimpleNamespace(async_scheduling=False)
@@ -2624,15 +2633,25 @@ class _FakeTpuEvent:
 
 
 class TestInputStagingFence:
-    """A chunk records a fence after uploading from the reusable host staging
-    tensors; the next chunk synchronizes on it before rewriting them, once."""
+    """A chunk records a fence after uploading its inputs; the next chunk
+    synchronizes on it before rewriting the host staging tensors, once, and
+    only then releases the host tensors that fence covers."""
+
+    @staticmethod
+    def _runner():
+        return SimpleNamespace(
+            device="cpu",
+            _input_staging_fence=None,
+            _staging_sources=[],
+            _fenced_staging_sources=[],
+        )
 
     def test_record_then_wait_synchronizes_once(self, monkeypatch):
         _FakeTpuEvent.instances.clear()
         monkeypatch.setattr(
             torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
         )
-        runner = SimpleNamespace(_input_staging_fence=None)
+        runner = self._runner()
         TPUModelRunner._record_input_staging_fence(runner)
         fence = runner._input_staging_fence
         assert fence is _FakeTpuEvent.instances[-1]
@@ -2647,9 +2666,77 @@ class TestInputStagingFence:
         monkeypatch.setattr(
             torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
         )
-        runner = SimpleNamespace(_input_staging_fence=None)
+        runner = self._runner()
         TPUModelRunner._wait_input_staging_fence(runner)
         assert runner._input_staging_fence is None
+
+    def test_upload_holds_the_source_until_a_later_fence_is_waited(self, monkeypatch):
+        """An uploaded temporary must not be freed (and its memory reused)
+        before the transfer has read it. Only a fence recorded after the
+        upload says so: an upload issued after a record (sampling, a draft
+        walk) stays held across that fence's wait, until the next one."""
+        runner = self._runner()
+        fenced_at_sync = []
+
+        class _Event(_FakeTpuEvent):
+            def synchronize(self):
+                fenced_at_sync.append([id(t) for t in runner._fenced_staging_sources])
+                super().synchronize()
+
+        monkeypatch.setattr(torch, "tpu", SimpleNamespace(Event=_Event), raising=False)
+
+        def held():
+            return [id(t) for t in runner._staging_sources] + [
+                id(t) for t in runner._fenced_staging_sources
+            ]
+
+        before = torch.tensor([3, 1, 2], dtype=torch.int32)
+        dev = TPUModelRunner._upload(runner, before)
+        assert torch.equal(dev.cpu(), before)
+        TPUModelRunner._wait_input_staging_fence(runner)  # no fence yet
+        assert held() == [id(before)]
+        TPUModelRunner._record_input_staging_fence(runner)
+        after = torch.tensor([7], dtype=torch.int32)
+        TPUModelRunner._upload(runner, after)
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert held() == [id(after)]
+        TPUModelRunner._record_input_staging_fence(runner)
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert held() == []
+        # Each wait still held its fence's tensors while synchronizing.
+        assert fenced_at_sync == [[id(before)], [id(after)]]
+
+    def test_a_non_contiguous_source_is_held_as_the_copy_read(self):
+        """The device copy reads a contiguous host tensor; that tensor, not the
+        strided view, is the one held until the fence."""
+        runner = self._runner()
+        rows = torch.arange(12, dtype=torch.int32).reshape(3, 4)
+        view = rows[:, 1:3]
+        dev = TPUModelRunner._upload(runner, view)
+        assert torch.equal(dev.cpu(), view)
+        (held,) = runner._staging_sources
+        assert held.is_contiguous() and torch.equal(held, view)
+        # On the CPU stand-in the "upload" is the held tensor itself.
+        assert dev.data_ptr() == held.data_ptr()
+
+    def test_a_newer_fence_covers_an_unwaited_one(self, monkeypatch):
+        """Two records without a wait: the newer fence covers both uploads."""
+        monkeypatch.setattr(
+            torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+        )
+        runner = self._runner()
+        first = torch.tensor([1], dtype=torch.int32)
+        second = torch.tensor([2], dtype=torch.int32)
+        TPUModelRunner._upload(runner, first)
+        TPUModelRunner._record_input_staging_fence(runner)
+        TPUModelRunner._upload(runner, second)
+        TPUModelRunner._record_input_staging_fence(runner)
+        assert [id(t) for t in runner._fenced_staging_sources] == [
+            id(first),
+            id(second),
+        ]
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert runner._fenced_staging_sources == []
 
 
 class TestAsyncSpecDecodeTokenAccounting:
@@ -2967,7 +3054,8 @@ def test_upload_unless_unchanged_reuses_only_identical_values(device):
     """Spec steps reuse the previous upload of a small tensor while its values
     repeat. New values, dtype or shape upload again, and slots never share an
     entry."""
-    runner = SimpleNamespace(device=device, _h2d_reuse={})
+    runner = SimpleNamespace(device=device, _h2d_reuse={}, _staging_sources=[])
+    runner._upload = lambda host: TPUModelRunner._upload(runner, host)
 
     def upload(slot, host):
         return TPUModelRunner._upload_unless_unchanged(runner, slot, host)

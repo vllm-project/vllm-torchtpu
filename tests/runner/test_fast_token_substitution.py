@@ -44,10 +44,12 @@ def test_substitution_disabled_by_default():
     runner = SimpleNamespace(
         _fast_token_substitution=False,
         device=torch.device("cpu"),
+        _staging_sources=[],
         _pre_async_results=SimpleNamespace(
             next_tokens_tpu=torch.tensor([101, 102, 103, 104], dtype=torch.int64)
         ),
     )
+    runner._upload = TPUModelRunner._upload.__get__(runner)
     input_ids = torch.tensor([-1, -1, -1, -1], dtype=torch.int32)
     cur_indices = np.array([0, 1, 2, 3], dtype=np.int32)
     pre_indices = np.array([0, 1, 2, 3], dtype=np.int32)
@@ -68,10 +70,12 @@ def test_substitution_enabled_fast_path():
     runner = SimpleNamespace(
         _fast_token_substitution=True,
         device=torch.device("cpu"),
+        _staging_sources=[],
         _pre_async_results=SimpleNamespace(
             next_tokens_tpu=torch.tensor([201, 202, 203, 204], dtype=torch.int64)
         ),
     )
+    runner._upload = TPUModelRunner._upload.__get__(runner)
     input_ids = torch.tensor([-1, -1, -1, -1], dtype=torch.int32)
     cur_indices = np.array([0, 1, 2, 3], dtype=np.int32)
     pre_indices = np.array([0, 1, 2, 3], dtype=np.int32)

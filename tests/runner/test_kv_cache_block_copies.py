@@ -37,6 +37,7 @@ def _runner_with_raw_tensors(raw_tensors):
     runner._unified_kv_layout = bool(raw_tensors)
     runner.kv_cache_raw_tensors = raw_tensors
     runner._install_spec_token_room_guard = lambda: None
+    runner._staging_sources = []
     return runner
 
 
@@ -139,12 +140,14 @@ def test_page_local_copy_expands_split_and_updates_every_pool(monkeypatch):
         _pool_block_split=3,
         _pad_to_bucket=TPUModelRunner._pad_to_bucket,
         device="cpu",
+        _staging_sources=[],
         mamba_slot_read_offsets=None,
         bm_pool_layout=None,
     )
     fake._copy_mamba_state_blocks = TPUModelRunner._copy_mamba_state_blocks.__get__(
         fake
     )
+    fake._upload = TPUModelRunner._upload.__get__(fake)
     calls = []
 
     def cpu_page_copy(raws, src, dst):
@@ -218,11 +221,13 @@ def test_apply_kv_cache_block_copies_migrates_mamba_offsets(monkeypatch):
         _pool_block_split=2,
         _pad_to_bucket=TPUModelRunner._pad_to_bucket,
         device="cpu",
+        _staging_sources=[],
         bm_pool_layout=None,
     )
     fake._copy_mamba_state_blocks = TPUModelRunner._copy_mamba_state_blocks.__get__(
         fake
     )
+    fake._upload = TPUModelRunner._upload.__get__(fake)
     migrated = []
 
     def mock_migrate(read_offsets, src_t, dst_t):
@@ -263,11 +268,13 @@ def test_precompile_mamba_state_seed_copies_covers_all_groups_and_raw_tensors(
         _bucket_len=TPUModelRunner._bucket_len,
         _precompile_timed=mock_timed,
         device="cpu",
+        _staging_sources=[],
         bm_pool_layout=None,
     )
     fake._copy_mamba_state_blocks = TPUModelRunner._copy_mamba_state_blocks.__get__(
         fake
     )
+    fake._upload = TPUModelRunner._upload.__get__(fake)
     compiled_raws = []
     compiled_lens = []
 

@@ -23,6 +23,7 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
 )
+from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 
 
@@ -31,6 +32,7 @@ def test_speculative_decoding_manager_metadata_indices(device):
     # Mock TPUModelRunner
     mock_runner = MagicMock()
     mock_runner.device = device
+    _give_upload(mock_runner)
     mock_runner.arange_np = np.arange(100, dtype=np.int32)
     mock_runner.num_tokens_paddings = [8, 16, 32, 64]
 
@@ -59,6 +61,10 @@ def test_speculative_decoding_manager_metadata_indices(device):
 
     # Verify shapes and properties of the returned SpecDecodeMetadata
     assert isinstance(metadata, SpecDecodeMetadata)
+    # Every index tensor is uploaded through `_upload`, so its host copy is
+    # held: draft ids, draft lengths, three logits index sets, segment ids
+    # and group indices.
+    assert len(mock_runner._staging_sources) == 7
 
     # Expected draft lengths cpu array
     assert np.array_equal(metadata.draft_lengths_cpu, num_draft_tokens)
@@ -258,9 +264,17 @@ def test_propose_draft_token_ids_ngram_dispatches_correctly():
     mock_drafter.propose.assert_called_once_with(4, [[1], [2]], "NTS", "TIDS")
 
 
+def _give_upload(runner):
+    """The manager uploads through the runner's `_upload`, which holds the
+    host tensors until a staging fence covers them."""
+    runner._staging_sources = []
+    runner._upload = TPUModelRunner._upload.__get__(runner)
+
+
 def _fresh_metadata_manager(device, input_ids):
     mock_runner = MagicMock()
     mock_runner.device = device
+    _give_upload(mock_runner)
     mock_runner.arange_np = np.arange(100, dtype=np.int32)
     mock_runner.num_tokens_paddings = [8, 16, 32, 64]
     mock_runner.input_ids_cpu = input_ids
@@ -316,7 +330,7 @@ def test_spec_decode_metadata_deferred_draft_token_ids(device):
             nd, cu, 4
         )
         assert ref.deferred_draft_token_ids_cpu is None
-        uploaded = md.upload_deferred_draft_token_ids(device)
+        uploaded = md.upload_deferred_draft_token_ids(lambda host: host.to(device))
         assert uploaded.device.type == device.type
         assert torch.equal(uploaded.cpu(), ref.draft_token_ids.cpu())
 

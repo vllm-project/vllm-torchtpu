@@ -64,6 +64,7 @@ def request_state(req_id, block, output=()):
 def make_runner(device, monkeypatch, k):
     runner = object.__new__(TPUModelRunner)
     runner.device = device
+    runner._staging_sources = []
     runner.speculative_config = (
         SimpleNamespace(num_speculative_tokens=k, use_ngram_gpu=lambda: False)
         if k
@@ -336,6 +337,7 @@ def test_bootstrap_commits_once_after_upstream_update(device, monkeypatch, k):
 def test_proposed_drafts_reach_next_inputs(device, k, mode):
     runner = object.__new__(TPUModelRunner)
     runner.device = device
+    runner._staging_sources = []
     runner.speculative_config = SimpleNamespace(num_speculative_tokens=k)
     runner._last_sequence_layout_plan = None
     runner._fast_token_substitution = False

@@ -47,6 +47,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     _first_ge,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner import host_uploads
 
 logger = init_logger(__name__)
 
@@ -491,11 +492,11 @@ class PcpSequenceLayoutPlanner:
         if plan.logits_local_indices_cpu is None or plan.logits_owner_mask_cpu is None:
             return None
 
-        local_indices = plan.logits_local_indices_cpu.to(
-            hidden_states.device, non_blocking=True
+        local_indices = host_uploads.upload(
+            plan.logits_local_indices_cpu, hidden_states.device
         )
-        owner_mask = plan.logits_owner_mask_cpu.to(
-            hidden_states.device, non_blocking=True
+        owner_mask = host_uploads.upload(
+            plan.logits_owner_mask_cpu, hidden_states.device
         )
         selected = torch.index_select(hidden_states, 0, local_indices)
         selected = torch.where(

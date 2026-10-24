@@ -133,6 +133,8 @@ PATCHES = (
         refresh="vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings",
     ),
     Patch("vllm_torchtpu.layers.adapter.vision_attention", _ACTIVE),
+    # Host-to-device uploads.
+    Patch("vllm_torchtpu.runner.host_uploads:patch_host_uploads", _ACTIVE),
     # Platform runtime configuration.
     Patch(
         "vllm_torchtpu.platforms.tpu_platform:_configure_torchtpu_eager_mode", _ACTIVE
