@@ -157,10 +157,25 @@ class GatedResidual(common_hc.GatedResidual):
             and all(w.dtype == torch.bfloat16 for w in self._decode_weights())
         )
 
+    def _residual(self, hyper_input, norm):
+        """``mix``'s residual for ``combine``, with the injection gate computed
+        here as the fused decode mix computes it.
+
+        This keeps ``block_inject_weight``'s first use inside ``mix`` on every
+        path. Piecewise compilation orders a subgraph's inputs by first use, so
+        a fused decode bucket and an unfused bucket of the same model then take
+        the same inputs in the same order; the shape-variant hand-over refuses
+        a bucket whose inputs moved (h21 j-b1210ac2).
+        """
+        if not hasattr(self, "block_inject_weight"):
+            return hyper_input, norm
+        injection = F.linear(norm, self.block_inject_weight.weight)
+        return hyper_input, 2.0 * torch.sigmoid(injection.float() / self.hc_count)
+
     def mix(self, hyper_input):
-        """Returns ``mixed, (hyper_input, normed)``. On the fused decode path
-        the second residual is instead the combine's [T, hc] FP32 injection
-        gate (computed from the same normalized input); ``combine`` accepts
+        """Returns ``mixed, (hyper_input, injection)``: the combine's [T, hc] FP32
+        injection gate, computed from the normalized input (``normed`` in its
+        place for a hyper-connection without a combine); ``combine`` accepts
         either form."""
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if not hasattr(self, "input_mix_weight_down"):
@@ -186,7 +201,7 @@ class GatedResidual(common_hc.GatedResidual):
                 self.input_mix_weight_down.weight,
                 self.input_mix_weight_up.weight,
             )
-            return mixed, (hyper_input, norm)
+            return mixed, self._residual(hyper_input, norm)
         norm = self._normalize(hyper_input)
         gate = F.linear(norm, self.input_mix_weight_down.weight) / self.hc_count
         # TorchTPU can lower BF16 SiLU through BF16 logistic/tanh, rounding
@@ -202,7 +217,7 @@ class GatedResidual(common_hc.GatedResidual):
             and self.input_mix_weight_up.weight.dtype == torch.bfloat16
         ):
             mixed = self._prefill_up_op(gate, norm, self.input_mix_weight_up.weight)
-            return mixed, (hyper_input, norm)
+            return mixed, self._residual(hyper_input, norm)
         gate = F.linear(gate, self.input_mix_weight_up.weight)
         gate = torch.sigmoid(gate.float()).unflatten(
             -1, (self.hc_count, self.hidden_size)
@@ -216,7 +231,7 @@ class GatedResidual(common_hc.GatedResidual):
             start = branch * self.hidden_size
             mixed = mixed + weighted[..., start : start + self.hidden_size]
         mixed = mixed / self.hc_count
-        return mixed.to(hyper_input.dtype), (hyper_input, norm)
+        return mixed.to(hyper_input.dtype), self._residual(hyper_input, norm)
 
     def combine(self, block_output, residuals):
         if not hasattr(self, "block_inject_weight"):

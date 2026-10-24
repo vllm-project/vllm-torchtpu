@@ -6,8 +6,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 from jax.experimental.pallas import tpu as pltpu
 
+from tests.compilation.dynamo_input_order import parameters_by_first_use
 from vllm_torchtpu.kernels.qwen4_exp.hc_decode import decode_token_tile, hc_decode_mix
 from vllm_torchtpu.models.vllm.qwen4_exp.hyperconnection import (
     GatedResidual,
@@ -91,7 +93,8 @@ def test_decode_mix_matches_torch_path(tokens):
         expected_mixed, residual = module.mix(hyper)
         block = torch.randn(tokens, HIDDEN).to(torch.bfloat16)
         expected_out = module.combine(block, residual)
-        injection = F_injection(module, residual[1])
+        # mix returns the combine's injection gate as the second residual.
+        injection = residual[1]
 
     weight, down, up, inject = _weights(module)
     mixed, inj = hc_decode_mix(
@@ -113,11 +116,6 @@ def test_decode_mix_matches_torch_path(tokens):
     _check_bf16(_jax(out), expected_out, "combine")
 
 
-def F_injection(module, normed):
-    logits = torch.nn.functional.linear(normed, module.block_inject_weight.weight)
-    return 2.0 * torch.sigmoid(logits.float() / BRANCHES)
-
-
 @pytest.mark.parametrize("tokens", [4, 32, 128])
 def test_decode_combine_mix_matches_torch_path(tokens):
     attn, mlp = _module(tokens), _module(1000 + tokens)
@@ -126,7 +124,7 @@ def test_decode_combine_mix_matches_torch_path(tokens):
     block = torch.randn(tokens, HIDDEN).to(torch.bfloat16)
     with torch.no_grad():
         _, residual = attn.mix(hyper)
-        injection = F_injection(attn, residual[1])
+        injection = residual[1]
         expected_h = attn.combine(block, residual)
         expected_mixed, _ = mlp.mix(expected_h)
 
@@ -253,3 +251,64 @@ def test_layer_plumbing_matches_unfused_layer():
     _check_bf16(_jax(out), ref_out, "layer output")
     # Unfused modules never take the decode path.
     assert not attn._decode_fused(hyper)
+
+
+def _stub_ops(module):
+    """Traceable torch stand-ins for the registered ops, reading the same
+    weights in the same order."""
+
+    def mix_op(x, norm, down, up, inject):
+        normed = x * (1.0 + norm)
+        mixed = F.linear(F.silu(F.linear(normed, down)), up)[:, : module.hidden_size]
+        return mixed, F.linear(normed, inject).float()
+
+    def combine_mix_op(residual, block, gate, *weights):
+        combined = residual + block.repeat(1, BRANCHES) * gate.repeat_interleave(
+            module.hidden_size, dim=-1
+        ).to(block.dtype)
+        mixed, injection = mix_op(combined, *weights)
+        return mixed, injection, combined
+
+    module._decode_mix_op = mix_op
+    module._decode_combine_mix_op = combine_mix_op
+    return module
+
+
+class _Layer(torch.nn.Module):
+    """attn mix -> attention -> combine_mix -> mlp -> combine, as
+    Qwen4ExpDecoderLayer runs; the blocks own weights, as attention and MoE do."""
+
+    def __init__(self, attn, mlp):
+        super().__init__()
+        self.attn, self.mlp = attn, mlp
+        hidden = attn.hidden_size
+        self.attention = torch.nn.Linear(hidden, hidden, bias=False).to(torch.bfloat16)
+        self.moe = torch.nn.Linear(hidden, hidden, bias=False).to(torch.bfloat16)
+
+    def forward(self, hyper):
+        block, residual = self.attn.mix(hyper)
+        block, residual = self.attn.combine_mix(
+            self.attention(block), residual, self.mlp
+        )
+        return self.mlp.combine(self.moe(block), residual)
+
+
+def test_fused_and_unfused_traces_use_weights_in_one_order():
+    """A fused decode bucket and an unfused bucket of the same model must first
+    use the HC weights in one order (h20 j-dfd6839e, h21 j-b1210ac2: the
+    shape-variant hand-over refused the bucket because the unfused path first
+    used the attention HC's block_inject_weight in combine, after the attention
+    weights)."""
+    hidden, lowrank, tokens = 128, 32, 8
+    args = (torch.zeros(tokens, BRANCHES * hidden, dtype=torch.bfloat16),)
+
+    def layer(fused):
+        modules = [_module(seed, hidden=hidden, lowrank=lowrank) for seed in (1, 2)]
+        if fused:
+            modules = [_stub_ops(m) for m in modules]
+        return _Layer(*modules)
+
+    fused = parameters_by_first_use(layer(True), *args)
+    assert layer(True).attn._decode_fused(args[0])
+    assert len(fused) == 10
+    assert fused == parameters_by_first_use(layer(False), *args)
