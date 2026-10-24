@@ -9,6 +9,7 @@ from vllm_torchtpu.runner import compile_watch
 
 def test_post_warmup_compile_logs_one_warning(caplog, monkeypatch):
     monkeypatch.setattr(compile_watch, "_installed", False)
+    monkeypatch.setenv("VLLM_TPU_LOG_POST_WARMUP_COMPILES", "1")
     compile_watch.install_post_warmup_compile_log()
 
     @torch.compile(backend="eager", fullgraph=True, dynamic=False)

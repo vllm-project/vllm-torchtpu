@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import MagicMock
+import os
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -628,6 +629,7 @@ class TestAttentionMetadataBuilderPlumbing:
         builder.build(common_prefix_len=0, common_attn_metadata=self._make_cm(4))
         assert source.call_count == 1  # build() did not read it again
 
+    @patch.dict(os.environ, {"VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE": "1"})
     def test_unchanged_tables_skip_repacking(self):
         """With no BlockTable mutation since the last walk and the same walk
         geometry, staging reuses the previous upload without reading the CPU
@@ -672,6 +674,7 @@ class TestAttentionMetadataBuilderPlumbing:
         stage_block_table_uploads(runner, ctx(num_reqs=1), 4)  # new window
         assert source.call_count == calls + 2
 
+    @patch.dict(os.environ, {"VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE": "1"})
     def test_reused_upload_reuses_tables_and_rederives_mamba_indices(self):
         """A reused upload keeps the previous walk's table outputs but must
         re-derive the mamba indices from the new seq_lens."""

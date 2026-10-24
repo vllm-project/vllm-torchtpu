@@ -191,10 +191,13 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     VLLM_TPU_FUSED_ASYNC_DRAFT_SEED: bool = True
-    VLLM_TPU_DEFER_PREV_RESULTS_WAIT: bool = True
-    VLLM_TPU_LOG_POST_WARMUP_COMPILES: bool = True
+    VLLM_TPU_DEFER_PREV_RESULTS_WAIT: bool = False
+    VLLM_TPU_LOG_POST_WARMUP_COMPILES: bool = False
     VLLM_TPU_FUSED_READ_OFFSET_UPDATE: bool = True
-    VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE: bool = True
+    VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE: bool = False
+    VLLM_TPU_STAGE_TIMING_ONLY_WITH_SINK: bool = False
+    VLLM_TPU_STAGED_WALK_CLASS_GATHER: bool = False
+    VLLM_TPU_WARMED_SUBSTITUTE_SOURCE: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
@@ -1131,12 +1134,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP"),
     # Log one WARNING per torch.compile compile after warmup (runner/compile_watch.py).
     "VLLM_TPU_LOG_POST_WARMUP_COMPILES": env_bool(
-        "VLLM_TPU_LOG_POST_WARMUP_COMPILES", default=True
+        "VLLM_TPU_LOG_POST_WARMUP_COMPILES", default=False
     ),
     # Async scheduling: wait for the previous step's sampled-token copy after
     # launching this step's draft rather than before it (sample_tokens).
     "VLLM_TPU_DEFER_PREV_RESULTS_WAIT": env_bool(
-        "VLLM_TPU_DEFER_PREV_RESULTS_WAIT", default=True
+        "VLLM_TPU_DEFER_PREV_RESULTS_WAIT", default=False
     ),
     # Async spec decode: derive the draft seed (token, position, rejected
     # count) from the rejection-sampler output in one compiled program per
@@ -1155,7 +1158,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # its geometry and contents are unchanged (layers/core/attention_metadata.py
     # stage_block_table_uploads).
     "VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE": env_bool(
-        "VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE", default=True
+        "VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE", default=False
+    ),
+    # Host-path pieces (q38f-int: default off, toggled per arm).
+    # Record stage-timing device events only when a KV connector consumes them.
+    "VLLM_TPU_STAGE_TIMING_ONLY_WITH_SINK": env_bool(
+        "VLLM_TPU_STAGE_TIMING_ONLY_WITH_SINK", default=False
+    ),
+    # Staged walk: one gather per mamba geometry class instead of per group.
+    "VLLM_TPU_STAGED_WALK_CLASS_GATHER": env_bool(
+        "VLLM_TPU_STAGED_WALK_CLASS_GATHER", default=False
+    ),
+    # Async substitution: pad next_tokens to a precompiled source length.
+    "VLLM_TPU_WARMED_SUBSTITUTE_SOURCE": env_bool(
+        "VLLM_TPU_WARMED_SUBSTITUTE_SOURCE", default=False
     ),
     # Non-greedy sampling filters the vocab to this many 128-logit blocks,
     # ranked by block max, before running top-k (and any subsequent top-p).

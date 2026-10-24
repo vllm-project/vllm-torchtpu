@@ -24,6 +24,8 @@ from dataclasses import dataclass
 from torch_tpu._internal.stream.streams import TpuEvent
 from vllm.distributed.kv_transfer import has_kv_transfer_group
 
+from vllm_torchtpu import envs
+
 
 @dataclass
 class _PendingTiming:
@@ -51,6 +53,8 @@ class RunnerStageTiming:
         (`TPUModelRunner.get_finished_kv_transfers`); without one they are
         discarded every step, so skip recording them -- each device timing
         costs two TpuEvent records on the serving thread."""
+        if not envs.VLLM_TPU_STAGE_TIMING_ONLY_WITH_SINK:
+            return True
         if not self._sink:
             # Re-checked until true: warmup can run before the connector exists.
             self._sink = has_kv_transfer_group()

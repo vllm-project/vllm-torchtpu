@@ -194,6 +194,7 @@ def _staged_walk_products(
     mamba_geom: tuple,
     ckpt_window: int,
     include_tables: bool = True,
+    class_gather: bool = False,
 ) -> tuple:
     """Splits the staged flat block-table buffer into per-group tables and
     derives unified-pool mamba state and checkpoint indices. Without
@@ -203,6 +204,29 @@ def _staged_walk_products(
     if include_tables:
         for off, n, t in table_geom:
             outs.append(staged_dev[off : off + n * t].clone())
+    if mamba_geom and not class_gather:
+        # One gather per mamba group (VLLM_TPU_STAGED_WALK_CLASS_GATHER off).
+        states_g = []
+        ckpts_g = []
+        active = seq_lens > 0
+        for ti, t, bs in mamba_geom:
+            off, n, _ = table_geom[ti]
+            tbl = staged_dev[off : off + n * t].view(n, t)
+            state_offsets = torch.clamp((seq_lens - 1) // bs, min=0, max=t - 1).to(
+                torch.int64
+            )
+            gathered = torch.gather(tbl, 1, state_offsets.unsqueeze(1)).squeeze(1)
+            states_g.append(
+                torch.where(active, gathered, torch.zeros_like(gathered))
+            )
+            if ckpt_window > 1:
+                ckpt_offsets = state_offsets.unsqueeze(1) + torch.arange(
+                    ckpt_window, device=seq_lens.device, dtype=torch.int64
+                ).unsqueeze(0)
+                in_row = (ckpt_offsets < t) & active.unsqueeze(1)
+                safe = torch.where(in_row, ckpt_offsets, torch.zeros_like(ckpt_offsets))
+                ckpts_g.append(torch.gather(tbl, 1, safe) * in_row)
+        return tuple(outs) + tuple(states_g) + tuple(ckpts_g)
     states: list = [None] * len(mamba_geom)
     ckpts: list = [None] * len(mamba_geom)
     if mamba_geom:
@@ -259,6 +283,7 @@ def _staged_walk_products_compiled(
     mamba_geom: tuple,
     ckpt_window: int,
     include_tables: bool = True,
+    class_gather: bool = False,
 ) -> tuple:
     """One device program for everything the metadata walk consumes:
     per-group block-table splits (graph outputs are distinct buffers, so no
@@ -271,7 +296,13 @@ def _staged_walk_products_compiled(
     program sequence.
     """
     return _staged_walk_products(
-        staged_dev, seq_lens, table_geom, mamba_geom, ckpt_window, include_tables
+        staged_dev,
+        seq_lens,
+        table_geom,
+        mamba_geom,
+        ckpt_window,
+        include_tables,
+        class_gather,
     )
 
 
@@ -813,10 +844,10 @@ def _issue_walk_products(
         and cached[0] == reused_key
     ):
         ctx.staged_block_tables = cached[1]
-        products = walk(*args, False)
+        products = walk(*args, False, envs.VLLM_TPU_STAGED_WALK_CLASS_GATHER)
         n_tables = 0
     else:
-        products = walk(*args)
+        products = walk(*args, True, envs.VLLM_TPU_STAGED_WALK_CLASS_GATHER)
         n_tables = len(entries)
         ctx.staged_block_tables = {
             gid: products[i] for i, (gid, _, _) in enumerate(entries)
@@ -827,7 +858,7 @@ def _issue_walk_products(
                 runner._block_table_stage_tables = (prev[3], ctx.staged_block_tables)
             elif mamba_geom:
                 # Dummy runs warm the tables-free variant serving reuses.
-                walk(*args, False)
+                walk(*args, False, envs.VLLM_TPU_STAGED_WALK_CLASS_GATHER)
     n_mamba = len(mamba_geom)
     if n_mamba:
         states = products[n_tables : n_tables + n_mamba]

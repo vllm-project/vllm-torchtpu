@@ -2568,7 +2568,9 @@ class TPUModelRunner(GPUModelRunner):
             input_ids,
             cur_input_indices,
             pre_next_tokens_indices,
-            self._warmed_next_tokens(self._pre_async_results.next_tokens_tpu),
+            self._warmed_next_tokens(self._pre_async_results.next_tokens_tpu)
+            if envs.VLLM_TPU_WARMED_SUBSTITUTE_SOURCE
+            else self._pre_async_results.next_tokens_tpu,
         )
 
     def _substitute_next_lens(self) -> list[int]:
