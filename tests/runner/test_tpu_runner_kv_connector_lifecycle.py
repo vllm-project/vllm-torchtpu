@@ -19,6 +19,8 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
+from vllm.v1.executor.ray_utils import detach_zero_copy_from_model_runner_output
+from vllm.v1.outputs import LogprobsLists
 
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import (
@@ -174,6 +176,8 @@ def test_device_drafter_runs_before_kv_connector_save(
     if is_async:
         output = output.get_output()
     assert output.sampled_token_ids == [[7]]
+    detach_zero_copy_from_model_runner_output(output)
+    assert output.logprobs is None
 
     if not with_connector:
         assert events == ([] if method is None else ["draft"])
@@ -192,6 +196,56 @@ def test_device_drafter_runs_before_kv_connector_save(
     )
     assert output.kv_connector_output.finished_sending == {"sent"}
     assert output.kv_connector_output.finished_recving == {"loaded"}
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize("max_logprobs", [None, 0, 2])
+def test_sample_tokens_preserves_optional_logprobs_across_chunks(
+    is_async, max_logprobs
+):
+    runner = _fake_runner(None, is_async, False, propose=None)
+    runner.input_batch.max_num_logprobs = max_logprobs
+    runner.input_batch.num_reqs = 2
+    runner.input_batch.req_ids.append("r1")
+    runner.input_batch.req_id_to_index["r1"] = 1
+    runner.input_batch.num_tokens_no_spec.append(1)
+    runner.input_batch.token_ids_cpu = np.zeros((2, 8), dtype=np.int32)
+    runner.requests["r1"] = SimpleNamespace(
+        num_computed_tokens=0, num_tokens=1, output_token_ids=[]
+    )
+    state = runner.execute_model_state
+    state.scheduler_output.num_scheduled_tokens["r1"] = 1
+    state.logits_list = [torch.arange(16).reshape(2, 8).float()] * 2
+    state.num_reqs_list = [1, 1]
+    state.spec_decode_metadata_list = [None, None]
+    runner.model_config = SimpleNamespace(max_logprobs=max_logprobs)
+    runner._greedy_sample = lambda logits: logits.argmax(dim=-1, keepdim=True)
+    runner.gather_logprobs = TPUModelRunner.gather_logprobs.__get__(runner)
+
+    with (
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=False
+        ),
+        patch.object(AsyncTPUCopyState, "from_device_chunks", side_effect=_host_copy),
+        torch.compiler.set_stance("force_eager"),
+    ):
+        output = TPUModelRunner.sample_tokens(runner, None)
+        if is_async:
+            output = output.get_output()
+
+    assert output.sampled_token_ids == [[7], [7]]
+    detach_zero_copy_from_model_runner_output(output)
+    if max_logprobs is None:
+        assert output.logprobs is None
+    else:
+        assert isinstance(output.logprobs, LogprobsLists)
+        expected_ids = [[7] + [7, 6][:max_logprobs]] * 2
+        np.testing.assert_array_equal(output.logprobs.logprob_token_ids, expected_ids)
+        expected = torch.log_softmax(torch.arange(8).float(), dim=-1)
+        np.testing.assert_allclose(
+            output.logprobs.logprobs, expected[torch.tensor(expected_ids)]
+        )
+        np.testing.assert_array_equal(output.logprobs.sampled_token_ranks, [1, 1])
 
 
 @pytest.mark.parametrize("is_async", [False, True])

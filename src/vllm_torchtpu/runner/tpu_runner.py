@@ -4838,15 +4838,12 @@ class TPUModelRunner(GPUModelRunner):
         # Those copies are blocking. Once they become async., kv_save
         # should be called right after each single forward pass,
         # instead of the forwards of the entire input batch.
-        logprobs = []
+        logprobs_lists: LogprobsLists | None = None
         if needs_logprobs and len(combined_logprobs):
             # TODO: concatenate the LogprobsTensors (torch) first, then
             # call .tolists() once to match the GPU path and avoid the
             # per-chunk numpy round-trip.
-            combined_logprobs_lists = []
-            for i in range(len(combined_logprobs)):
-                logprobs = combined_logprobs[i].tolists()
-                combined_logprobs_lists.append(logprobs)
+            combined_logprobs_lists = [lp.tolists() for lp in combined_logprobs]
 
             logprobs_lists = LogprobsLists(
                 logprob_token_ids=np.concatenate(
@@ -4859,7 +4856,6 @@ class TPUModelRunner(GPUModelRunner):
                     [lp.sampled_token_ranks for lp in combined_logprobs_lists]
                 ),
             )
-            logprobs = logprobs_lists
 
         discard_sampled_tokens_req_indices = []
         num_reqs = self.input_batch.num_reqs
@@ -5143,7 +5139,7 @@ class TPUModelRunner(GPUModelRunner):
                 # Snapshot of the req_id_to_index for the VLLM scheduler.
                 req_id_to_index=dict(self.input_batch.req_id_to_index),
                 sampled_token_ids=[],  # Filled in AsyncTPUModelRunnerOutput get_output
-                logprobs=logprobs,
+                logprobs=logprobs_lists,
                 prompt_logprobs_dict={req_id: None for req_id in req_ids},
                 pooler_output=pooler_output,
                 kv_connector_output=kv_connector_output,

@@ -1387,11 +1387,6 @@
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `LogprobsLists | list[Unknown]` is not assignable to parameter `logprobs` with type `LogprobsLists | None` in function `vllm.v1.outputs.ModelRunnerOutput.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "bad-override-mutable-attribute",
       "concise_description": "Class member `TPUModelRunner.load_model` overrides parent class `GPUModelRunner` in an inconsistent manner"
     },
