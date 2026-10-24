@@ -51,6 +51,46 @@ class AllReduceRing:
         """Remote copy descriptors for round `rnd_i` on double-buffer `slot`."""
         cp, scr, me = self.cp, self.scr, self.me
         HIER, RSAG, R = cp.HIER, cp.RSAG, cp.R
+        if HIER == 4:
+            G, N_H = cp.HIER_GROUP, cp.N_HOSTS
+            g_me = lax.rem(me, G)
+            h_me = me // G
+            if rnd_i == 0:
+                return [
+                    pltpu.make_async_remote_copy(
+                        src_ref=scr["send"].at[slot, g_me ^ off],
+                        dst_ref=scr["recv"].at[slot, g_me],
+                        send_sem=scr["ar_ssem"].at[0, slot, off - 1],
+                        recv_sem=scr["ar_rsem"].at[0, slot, off - 1],
+                        device_id=(me ^ off,),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    )
+                    for off in range(1, G)
+                ]
+            if rnd_i == 1:
+                return [
+                    pltpu.make_async_remote_copy(
+                        src_ref=scr["ag_send"].at[slot],
+                        dst_ref=scr["ih_recv"].at[slot, h_me],
+                        send_sem=scr["ar_ssem"].at[1, slot, h_off - 1],
+                        recv_sem=scr["ar_rsem"].at[1, slot, h_off - 1],
+                        device_id=(me ^ (h_off * G),),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    )
+                    for h_off in range(1, N_H)
+                ]
+            src_buf = scr["s2_send"] if N_H > 1 else scr["ag_send"]
+            return [
+                pltpu.make_async_remote_copy(
+                    src_ref=src_buf.at[slot],
+                    dst_ref=scr["ag_recv"].at[slot, g_me],
+                    send_sem=scr["ar_ssem"].at[2, slot, off - 1],
+                    recv_sem=scr["ar_rsem"].at[2, slot, off - 1],
+                    device_id=(me ^ off,),
+                    device_id_type=pl.DeviceIdType.MESH,
+                )
+                for off in range(1, G)
+            ]
         if HIER == 3:
             off = 1 << rnd_i
             bit = lax.rem(me >> rnd_i, 2)
@@ -148,7 +188,12 @@ class AllReduceRing:
                             d.wait_send()
 
             c_idx = lax.rem(me, 2)
-            if HIER == 3:
+            if HIER == 4:
+                g_me = lax.rem(me, cp.HIER_GROUP)
+                for j in range(cp.HIER_GROUP):
+                    send[slot, j] = val[:, j * CW : (j + 1) * CW].astype(BF16)
+                recv[slot, g_me] = send[slot, g_me]
+            elif HIER == 3:
                 send[0, slot] = val.astype(BF16)
                 recv[0, slot, c_idx] = send[0, slot]
             elif HIER == 2:
@@ -169,6 +214,31 @@ class AllReduceRing:
             return rnd(val)
         with sc("ar_comm"):
             self.ar_round(slot, 0)
+        if HIER == 4:
+            G, N_H = cp.HIER_GROUP, cp.N_HOSTS
+            g_me = lax.rem(me, G)
+            ag_send, ag_recv = scr["ag_send"], scr["ag_recv"]
+            with sc("ar_sum"):
+                ag_send[slot] = jnp.sum(recv[slot].astype(F32), axis=0).astype(BF16)
+                if N_H > 1:
+                    scr["ih_recv"][slot, me // G] = ag_send[slot]
+                else:
+                    ag_recv[slot, g_me] = ag_send[slot]
+            if N_H > 1:
+                with sc("ar_comm"):
+                    self.ar_round(slot, 1)
+                with sc("ar_sum"):
+                    s2_send = scr["s2_send"]
+                    s2_send[slot] = jnp.sum(
+                        scr["ih_recv"][slot].astype(F32), axis=0
+                    ).astype(BF16)
+                    ag_recv[slot, g_me] = s2_send[slot]
+            with sc("ar_comm"):
+                self.ar_round(slot, 2)
+            with sc("ar_sum"):
+                return jnp.concatenate(
+                    [ag_recv[slot, j] for j in range(G)], axis=-1
+                ).astype(F32)
         if HIER == 3:
             for rnd_i in range(1, cp.N_HIER3):
                 with sc("ar_sum"):

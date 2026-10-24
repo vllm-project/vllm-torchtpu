@@ -66,7 +66,8 @@ class Tiles:
     lazy: bool = True  # Refill module dense slots after their streams
     inplace: bool = False  # Alias state inputs to outputs where supported
     rsag: bool = False  # Two-round reduce-scatter + all-gather
-    hier: int = 0  # Hierarchical all-reduce on v7x-8 (0, 1, 2, 3)
+    hier: int = 0  # Hierarchical all-reduce (0, 1, 2, 3, 4)
+    hier_group: int = 8  # Intra-host group size for hier=4
     war: int = -1  # Unfolded [MR, H] all-reduce payload (-1: auto, 0: off, 1: on)
     mb8: int = 0  # Internal activation row count MB (0: M, 1: max(16, MR), 2: MR)
     # Per-bucket schedule threshold (rows). Modules never compare `B` to a
@@ -134,6 +135,7 @@ TILE_NUMERICS: dict[str, NumericsClass] = {
     "inplace": "approx",  # state input/output aliasing (not proven exact)
     "rsag": "approx",  # rounds all-reduce partial sums to bf16
     "hier": "approx",  # all-reduce reduction order
+    "hier_group": "approx",  # intra-host group size for hier=4
     "war": "approx",  # all-reduce payload layout
     "mb8": "approx",  # activation row count
     "wide_rows": "approx",  # WIDE schedule threshold

@@ -140,6 +140,8 @@ class CommParams:
     AR_ROUNDS: tuple[int, ...]
     AR_PEERS: int
     N_HIER3: int = 3
+    HIER_GROUP: int = 8
+    N_HOSTS: int = 1
 
 
 @dataclass(frozen=True)
@@ -250,28 +252,55 @@ def build_scratch(
     typed = bool(ex.interpret)
 
     HIER = tiles.hier if R > 1 else 0
+    HIER_GROUP = tiles.hier_group if HIER == 4 else R
+    N_HOSTS = R // HIER_GROUP if HIER == 4 else 1
     RSAG = tiles.rsag and R > 1 and HIER == 0
     WAR = (
-        (ex.WIDE or MR * H <= PR * PC or (RSAG and (PC // R) % 128 != 0))
+        (
+            ex.WIDE
+            or MR * H <= PR * PC
+            or ((RSAG or HIER == 4) and (PC // HIER_GROUP) % 128 != 0)
+        )
         if tiles.war < 0
         else bool(tiles.war)
     )
     AR_R = MR if WAR else PR
     AR_C = H if WAR else PC
-    CW = AR_C // R
+    CW = AR_C // HIER_GROUP
     HC2 = AR_C // 2
     N_HIER3 = max(1, R.bit_length() - 1)
-    assert not RSAG or CW % 128 == 0
-    assert HIER in (0, 1, 2, 3) and (
-        HIER == 0 or R == 8 or (HIER == 3 and R >= 2 and (R & (R - 1)) == 0)
-    )
+    assert not (RSAG or HIER == 4) or CW % 128 == 0
+    # Power-of-two N_HOSTS keeps XOR peer me ^ (h_off * G) inside [0, R).
+    assert HIER in (0, 1, 2, 3, 4) and (
+        HIER == 0
+        or (HIER in (1, 2) and R == 8)
+        or (HIER == 3 and R >= 2 and (R & (R - 1)) == 0)
+        or (
+            HIER == 4
+            and HIER_GROUP >= 2
+            and (HIER_GROUP & (HIER_GROUP - 1)) == 0
+            and R >= HIER_GROUP
+            and R % HIER_GROUP == 0
+            and (N_HOSTS & (N_HOSTS - 1)) == 0
+        )
+    ), ("unsupported all-reduce mode", HIER, R, HIER_GROUP, N_HOSTS)
     assert HIER != 2 or HC2 % 128 == 0
     AR_ROUNDS = (
         tuple(range(N_HIER3))
         if HIER == 3
-        else ((0, 1, 2) if HIER == 2 else ((0, 1) if (RSAG or HIER == 1) else (0,)))
+        else (
+            (0, 1, 2) if HIER in (2, 4) else ((0, 1) if (RSAG or HIER == 1) else (0,))
+        )
     )
-    AR_PEERS = 1 if HIER == 3 else (3 if HIER in (1, 2) else max(R - 1, 1))
+    AR_PEERS = (
+        1
+        if HIER == 3
+        else (
+            max(HIER_GROUP - 1, N_HOSTS - 1)
+            if HIER == 4
+            else (3 if HIER in (1, 2) else max(R - 1, 1))
+        )
+    )
 
     vshape = {k: (tk[k], kinds[k][1]) for k in kinds}
     vdtype = {k: kinds[k][2] for k in kinds}
@@ -296,6 +325,8 @@ def build_scratch(
             if HIER == 3
             else (2, 2, AR_R, HC2)
             if HIER == 2
+            else (2, HIER_GROUP, AR_R, CW)
+            if HIER == 4
             else (2, R, AR_R, CW)
             if RSAG
             else (2, AR_R, AR_C),
@@ -308,6 +339,8 @@ def build_scratch(
             if HIER == 2
             else (2, 2, AR_R, AR_C)
             if HIER == 1
+            else (2, HIER_GROUP, AR_R, CW)
+            if HIER == 4
             else (2, R, AR_R, CW)
             if RSAG
             else (2, R, AR_R, AR_C),
@@ -321,9 +354,12 @@ def build_scratch(
     if p.dynamic_kinds:
         scratch["esem"] = pltpu.SemaphoreType.DMA((NBE,))
 
-    if RSAG:
+    if RSAG or HIER == 4:
         scratch["ag_send"] = pltpu.VMEM((2, AR_R, CW), BF16)
-        scratch["ag_recv"] = pltpu.VMEM((2, R, AR_R, CW), BF16)
+        scratch["ag_recv"] = pltpu.VMEM((2, HIER_GROUP, AR_R, CW), BF16)
+        if HIER == 4 and N_HOSTS > 1:
+            scratch["ih_recv"] = pltpu.VMEM((2, N_HOSTS, AR_R, CW), BF16)
+            scratch["s2_send"] = pltpu.VMEM((2, AR_R, CW), BF16)
     elif HIER == 1:
         scratch["ag_send"] = pltpu.VMEM((2, AR_R, AR_C), BF16)
         scratch["ag_recv"] = pltpu.VMEM((2, 4, AR_R, AR_C), BF16)
@@ -462,6 +498,8 @@ def build_scratch(
         AR_ROUNDS=AR_ROUNDS,
         AR_PEERS=AR_PEERS,
         N_HIER3=N_HIER3,
+        HIER_GROUP=HIER_GROUP,
+        N_HOSTS=N_HOSTS,
     )
     core_plan = CorePlan(
         plan=p,

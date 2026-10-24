@@ -16,6 +16,9 @@
 from __future__ import annotations
 
 import dataclasses
+import os
+import subprocess
+import sys
 
 import jax
 import jax.numpy as jnp
@@ -37,6 +40,9 @@ from vllm_torchtpu.megakernel.spec import (
     SwitchSlot,
     WeightDecl,
 )
+
+_DEVICE_COUNT_FLAG = "--xla_force_host_platform_device_count"
+_CHILD_TIMEOUT_S = 540
 
 
 class _TwoTileModule(Module):
@@ -275,27 +281,26 @@ def test_tworing_consumption_order_and_nesting_guards():
         pass
 
 
-@pytest.mark.parametrize(
-    "R,hier,rsag",
-    [
-        (2, 0, False),
-        (2, 0, True),
-        (8, 0, True),
-        (8, 1, False),
-        (8, 2, False),
-        (8, 3, False),
-    ],
-)
-def test_allreduce_ring_modes_in_pallas(R: int, hier: int, rsag: bool):
-    """Execute `AllReduceRing` across `R` ranks and 2 layers in Pallas."""
+def _execute_allreduce_ring(
+    R: int,
+    *,
+    hier: int,
+    rsag: bool,
+    hier_group: int = 8,
+    war: int = 1,
+    H: int = 1024,
+) -> tuple[jax.Array, jax.Array, ExecSpec, vmem.CorePlan, dict[str, object]]:
+    """Run a 2-layer, 2-slot `AllReduceRing` kernel across `R` CPU devices."""
     devs = jax.devices("cpu")
     assert len(devs) >= R, (
         f"Expected >= {R} CPU devices (check XLA_FLAGS), found {len(devs)}"
     )
 
-    tiles = dataclasses.replace(TINY_TILES, hier=hier, rsag=rsag, war=1, mb8=2)
+    tiles = dataclasses.replace(
+        TINY_TILES, hier=hier, hier_group=hier_group, rsag=rsag, war=war, mb8=2
+    )
     ex = ExecSpec(B=4, T=1, R=R, ctx=128, tiles=tiles, interpret=True)
-    g = FakeGeometry(L=2, H=1024)
+    g = FakeGeometry(L=2, H=H)
     ms = ModelSpec(
         "ar_test", config=g, layer_type=LayerType("lt", slots=(_TwoTileModule(),))
     )
@@ -357,13 +362,128 @@ def test_allreduce_ring_modes_in_pallas(R: int, hier: int, rsag: bool):
         jax.random.PRNGKey(42), (R, ex.MB, g.H), dtype=BF16
     ).astype(F32)
     out_all = step(x_all)
+    return x_all, out_all, ex, cp, scratch
 
-    expected_one = jnp.sum(x_all[:, : ex.B].astype(BF16).astype(F32), axis=0)
+
+def _expected_residual(x_all: jax.Array, B: int) -> jax.Array:
+    expected_one = jnp.sum(x_all[:, :B].astype(BF16).astype(F32), axis=0)
     expected = jnp.zeros_like(expected_one)
     for _ in range(4):
         expected = rnd(expected + rnd(expected_one))
+    return expected
+
+
+@pytest.mark.parametrize(
+    "R,hier,rsag",
+    [
+        (2, 0, False),
+        (2, 0, True),
+        (8, 0, True),
+        (8, 1, False),
+        (8, 2, False),
+        (8, 3, False),
+    ],
+)
+def test_allreduce_ring_modes_in_pallas(R: int, hier: int, rsag: bool):
+    """Execute `AllReduceRing` across `R` ranks and 2 layers in Pallas."""
+    x_all, out_all, ex, _, _ = _execute_allreduce_ring(R, hier=hier, rsag=rsag)
+    expected = _expected_residual(x_all, ex.B)
     for r in range(R):
         assert jnp.allclose(out_all[r, : ex.B], expected, atol=2e-1, rtol=2e-2)
+
+
+def test_allreduce_ring_hier4_single_group_matches_rsag_bitwise():
+    """Verify 1-group `hier=4` (`R=8, hier_group=8`) matches `rsag=True` bitwise."""
+    _, out_rsag, ex, _, _ = _execute_allreduce_ring(8, hier=0, rsag=True)
+    _, out_hier4, _, cp, scratch = _execute_allreduce_ring(
+        8, hier=4, rsag=False, hier_group=8
+    )
+    assert cp.comm.HIER == 4
+    assert cp.comm.HIER_GROUP == 8
+    assert cp.comm.N_HOSTS == 1
+    assert "ih_recv" not in scratch
+    assert "s2_send" not in scratch
+    assert jnp.array_equal(out_hier4[:, : ex.B], out_rsag[:, : ex.B])
+
+
+def _check_hier4_32_ranks_in_process() -> None:
+    x_all, out_all, ex, cp, scratch = _execute_allreduce_ring(
+        32, hier=4, rsag=False, hier_group=8
+    )
+    assert cp.comm.HIER == 4
+    assert cp.comm.HIER_GROUP == 8
+    assert cp.comm.N_HOSTS == 4
+    assert "ih_recv" in scratch and "s2_send" in scratch
+    expected = _expected_residual(x_all, ex.B)
+    host0_only = _expected_residual(x_all[:8], ex.B)
+    for r in range(1, 32):
+        assert jnp.array_equal(out_all[r, : ex.B], out_all[0, : ex.B])
+    assert jnp.allclose(out_all[0, : ex.B], expected, atol=2e-1, rtol=2e-2)
+    assert not jnp.allclose(out_all[0, : ex.B], host0_only, atol=2e-1, rtol=2e-2)
+
+
+def test_allreduce_ring_hier4_multi_group_and_32_ranks():
+    """Verify multi-group `hier=4` at `R=8, hier_group=4` and `R=32, hier_group=8`."""
+    x_all, out_all, ex, cp, scratch = _execute_allreduce_ring(
+        8, hier=4, rsag=False, hier_group=4
+    )
+    assert cp.comm.HIER == 4
+    assert cp.comm.HIER_GROUP == 4
+    assert cp.comm.N_HOSTS == 2
+    assert "ih_recv" in scratch and "s2_send" in scratch
+    expected = _expected_residual(x_all, ex.B)
+    group0_only = _expected_residual(x_all[:4], ex.B)
+    for r in range(1, 8):
+        assert jnp.array_equal(out_all[r, : ex.B], out_all[0, : ex.B])
+    assert jnp.allclose(out_all[0, : ex.B], expected, atol=2e-1, rtol=2e-2)
+    assert not jnp.allclose(out_all[0, : ex.B], group0_only, atol=2e-1, rtol=2e-2)
+
+    flags = [
+        f
+        for f in os.environ.get("XLA_FLAGS", "").split()
+        if not f.startswith(_DEVICE_COUNT_FLAG)
+    ]
+    env = dict(
+        os.environ,
+        JAX_PLATFORMS="cpu",
+        MALLOC_ARENA_MAX="2",
+        XLA_FLAGS=" ".join([*flags, f"{_DEVICE_COUNT_FLAG}=32"]),
+    )
+    out = subprocess.run(
+        [sys.executable or "python3", __file__, "hier4_r32"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=_CHILD_TIMEOUT_S,
+    )
+    assert out.returncode == 0, out.stdout[-2000:] + out.stderr[-4000:]
+
+
+def test_allreduce_ring_hier4_two_groups_with_folded_payload():
+    """`hier=4, hier_group=4` at `R=8` on the folded `[PR, PC]` payload."""
+    x_all, out_all, ex, cp, _ = _execute_allreduce_ring(
+        8, hier=4, rsag=False, hier_group=4, war=0, H=2048
+    )
+    assert not cp.comm.WAR and cp.comm.AR_C == 1024
+    for r in range(1, 8):
+        assert jnp.array_equal(out_all[r, : ex.B], out_all[0, : ex.B])
+    expected = _expected_residual(x_all, ex.B)
+    assert jnp.allclose(out_all[0, : ex.B], expected, atol=2e-1, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "R,bad_group,H", [(8, 3, 3072), (8, 16, 2048), (8, 1, 2048), (24, 8, 1024)]
+)
+def test_allreduce_ring_hier4_rejects_bad_hier_group(R: int, bad_group: int, H: int):
+    """Verify `build_scratch` rejects invalid `hier_group` values for `hier=4`."""
+    tiles = dataclasses.replace(TINY_TILES, hier=4, hier_group=bad_group, war=1, mb8=2)
+    ex = ExecSpec(B=4, T=1, R=R, ctx=128, tiles=tiles, interpret=True)
+    g = FakeGeometry(L=2, H=H)
+    ms = ModelSpec(
+        "ar_bad_group", config=g, layer_type=LayerType("lt", slots=(_TwoTileBlock(),))
+    )
+    with pytest.raises(AssertionError, match="unsupported all-reduce mode"):
+        vmem.build_scratch(ms, ex)
 
 
 def test_borrow_epool_rejected_inside_expert_stream():
@@ -381,3 +501,8 @@ def test_borrow_epool_rejected_inside_expert_stream():
         ):
             pass
     assert ring.borrow_epool() == "EPOOL"
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "hier4_r32":
+        _check_hier4_32_ranks_in_process()
