@@ -39,11 +39,35 @@ class ModelAdapter(Protocol):
 
     def begin_step(self) -> Any: ...
 
-    def prepare_inputs(self, snapshot: ModelInputSnapshot) -> dict[str, Any]: ...
+    def prepare_inputs(self, snapshot: ModelInputSnapshot) -> dict[str, Any]:
+        """Build model kwargs matching a signature exercised by ``dummy_run``.
+
+        For each configured compile bucket and execution mode, warmup and real
+        inputs must agree on kwarg keys, pytree structure, compiler-visible
+        tensor metadata (shape, dtype, device, strides) and guarded Python/static
+        values. Different warmed buckets/configurations may have different
+        signatures. Live request counts must be represented by padded tensors
+        and masks, not new keys or unbucketed tensor dimensions.
+
+        Share construction with ``dummy_run``, or test their equivalence. Tensor
+        contents may differ; converting live values to Python/static arguments
+        can still specialize the compiled forward. The runner forwards these
+        kwargs unchanged; it neither pads them nor enforces this contract.
+        """
+        ...
 
     def dummy_run(
         self, num_tokens, num_reqs, profile_prefix=None, *, dp_lockstep=False
-    ) -> float | None: ...
+    ) -> float | None:
+        """Exercise the model with the same kwargs contract as ``prepare_inputs``.
+
+        ``num_tokens``/``num_reqs`` select the requested bucket, not one global
+        shape. Cover every serving signature, including idle/DP-lockstep and
+        profile paths when applicable; profile data may differ from serving.
+        Delegation alone does not establish that arbitrary adapter code avoids
+        online compilation.
+        """
+        ...
 
     def get_kv_cache_spec(self) -> dict[str, Any]: ...
 
