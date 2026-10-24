@@ -136,3 +136,25 @@ def test_the_bias_moves_the_selection_and_not_the_weights():
         "the fixture's bias does not reorder the top-k, so this test cannot "
         "tell a kernel that applies it from one that ignores it"
     )
+
+
+@pytest.mark.parametrize("two_tables", [False, True])
+def test_labels_relabel_the_picks_and_nothing_else(two_tables):
+    """An expert placement's slot table: same picks, same weights, same slot
+    order, each index replaced by its label. The scores carry exact ties so
+    the tie rule (lowest column) is exercised before the relabel."""
+    rows = 256
+    scores = np.round(_scores(rows, seed=11) * 8) / 8  # many exact ties
+    weights = _scores(rows, seed=12) if two_tables else None
+    labels = np.random.default_rng(13).permutation(EXPERTS).astype(np.int32)
+    w0, i0 = _select(scores, weights)
+    w, i = router_ops.pallas_select(
+        jnp.asarray(scores),
+        topk=TOPK,
+        block_rows=rows,
+        weight_scores=None if weights is None else jnp.asarray(weights),
+        labels=jnp.asarray(labels),
+        interpret=True,
+    )
+    np.testing.assert_array_equal(np.asarray(w), w0)
+    np.testing.assert_array_equal(np.asarray(i), labels[i0])

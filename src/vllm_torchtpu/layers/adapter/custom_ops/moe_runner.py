@@ -17,6 +17,9 @@ from collections.abc import Callable
 
 from vllm.model_executor.layers.fused_moe.runner import moe_runner as _moe_runner
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+    SharedExpertsOrder,
+)
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
@@ -154,3 +157,45 @@ class VllmMoERunner(MoERunner):
                 return shared_output, hidden_states
             return hidden_states
         return super()._maybe_combine(shared_output, hidden_states)
+
+    def _apply_quant_method(
+        self,
+        hidden_states,
+        router_logits,
+        shared_experts_input,
+        input_ids=None,
+        shared_experts_overlapping=False,
+    ):
+        # Upstream runs the shared expert first and the fused op second, but
+        # the compiled program is free to reorder them, and XLA fuses the
+        # shared down projection with the shared+routed sum after the kernel.
+        # With MOE_FUSED_EP_SHARED_BEFORE_KERNEL the op is handed the shared
+        # output as a scheduling operand, so the down projection has to land
+        # before the kernel starts: inside the window where the kernel's token
+        # all-gather is in flight and the core otherwise waits.
+        if not (
+            envs.MOE_FUSED_EP_SHARED_BEFORE_KERNEL
+            and fused_moe_ep_supported(self._quant_method)
+        ):
+            return super()._apply_quant_method(
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+                shared_experts_overlapping,
+            )
+        assert not shared_experts_overlapping
+        self._maybe_apply_shared_experts(
+            shared_experts_input, SharedExpertsOrder.NO_OVERLAP
+        )
+        shared = (
+            self._shared_experts.output if self._shared_experts is not None else None
+        )
+        fused = self._quant_method.apply_monolithic(
+            layer=self.routed_experts,
+            x=hidden_states,
+            router_logits=router_logits,
+            input_ids=input_ids,
+            order_after=hidden_states if shared is None else shared,
+        )
+        return shared, fused

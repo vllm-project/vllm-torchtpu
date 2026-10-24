@@ -513,7 +513,10 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         x: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        order_after: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # `order_after`: the shared expert's output under
+        # MOE_FUSED_EP_SHARED_BEFORE_KERNEL; only the fused EP call reads it.
         layer = cast("TpuRoutedExperts", layer)
         activation_str = self._tpu_activation_str
         assert activation_str is not None, (
@@ -545,6 +548,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
                 layer._tpu_fused_w2_scale,
                 router_logits,
                 score_bias_operand(layer),
+                order_after=order_after,
             )
 
         # Quantization-independent routing decision (simulation override ->

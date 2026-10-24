@@ -61,7 +61,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import envs, expert_placement
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -81,6 +81,13 @@ def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
         return False
     if not name.endswith(_EXPERT_WEIGHT_SUFFIXES):
         return False
+    if expert_placement.has_applied_layers():
+        # The placement's rank list for this tensor's layer, at the EP rank the
+        # layer's expert map was built for -- so the fetch and the expert map
+        # agree by construction, whatever derived that rank.
+        placed = expert_placement.fetch_filter_ids(name)
+        if placed is not None:
+            return expert_id not in placed
     return expert_id not in local_expert_ids
 
 

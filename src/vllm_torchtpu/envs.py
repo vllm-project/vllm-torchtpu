@@ -100,6 +100,10 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
+    TPU_EXPERT_PLACEMENT: str = ""
+    MOE_EXPERT_COUNT_TAP_DIR: str = ""
+    MOE_EXPERT_COUNT_TAP_EVERY: int = 1000
+    MOE_FUSED_EP_SHARED_BEFORE_KERNEL: bool = False
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -772,6 +776,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ascending device-id order, so the SparseCore gather gets its
     # N-dimensional algorithm without moving the program's DeviceAssignment.
     "MOE_FUSED_EP_SORTED_GATHER": env_bool("MOE_FUSED_EP_SORTED_GATHER"),
+    # A static expert placement for the fused EP MoE kernel: a JSON table
+    # naming, per MoE layer, which global experts each EP rank holds and in
+    # what slot order -- a permutation, experts / ranks to a rank
+    # (expert_placement.py). A local path, a gs:// URI, or the name of a table
+    # shipped in vllm_torchtpu/expert_placements/. Empty: the checkpoint's
+    # contiguous blocks.
+    "TPU_EXPERT_PLACEMENT": env_str("TPU_EXPERT_PLACEMENT", ""),
+    # Directory the per-layer routed-expert counts are written to
+    # (layers/adapter/expert_count_tap.py), every MOE_EXPERT_COUNT_TAP_EVERY
+    # steps. Empty disables the tap and leaves the program unchanged.
+    "MOE_EXPERT_COUNT_TAP_DIR": env_str("MOE_EXPERT_COUNT_TAP_DIR", ""),
+    "MOE_EXPERT_COUNT_TAP_EVERY": env_int("MOE_EXPERT_COUNT_TAP_EVERY", 1000),
+    # Finish the shared expert before the fused EP kernel starts, so it runs
+    # while the kernel's token all-gather is in flight instead of after the
+    # kernel; see VllmMoERunner._apply_quant_method. The shared output is then
+    # materialized before the shared + routed sum rather than fused into it,
+    # so that sum may round differently in its last bits.
+    "MOE_FUSED_EP_SHARED_BEFORE_KERNEL": env_bool("MOE_FUSED_EP_SHARED_BEFORE_KERNEL"),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its
     # live rows, so one is the ladder off. Zero leaves the choice to the

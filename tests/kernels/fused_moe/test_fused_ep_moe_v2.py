@@ -754,6 +754,79 @@ def test_split_stages_with_a_reordered_gather_are_bit_exact(sharded_plan):
     assert not np.array_equal(np.asarray(wrong), np.asarray(fused))
 
 
+def _placement(rng, e_total):
+    """(expert of each slot, slot of each expert) for a random permutation."""
+    expert_of_slot = rng.permutation(e_total)
+    return expert_of_slot, np.argsort(expert_of_slot).astype(np.int32)
+
+
+def _fp4_layer(mesh, e_total=32, tokens=256):
+    weights, scales, _ = _make_fp4_weights(
+        mesh, 52, hidden=1024, inter=512, e_total=e_total, rhs_qb=512
+    )
+    x, gating = _make_inputs(mesh, 53, tokens=tokens, hidden=1024, e_total=e_total)
+    common = dict(
+        topk=4,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=512,
+        sharded_plan=True,
+        scoring_fn="sqrtsoftplus",
+        routed_scaling_factor=2.5,
+    )
+    return weights, scales, x, gating, common
+
+
+@pytest.mark.parametrize("routing", ["topk", "score_bias", "hash"])
+def test_expert_slot_placement_is_bit_exact(routing):
+    """A static placement permutes experts between shards and nothing else.
+
+    The weights go in slot order, `expert_slot` relabels each selected global
+    expert to its slot, and every token must come out with the same bits as
+    the unplaced layer -- on the served fp4 block-512 form, for the plain
+    top-k, the bias-corrected top-k and the hash-table selections. The
+    control checks the placement really moved experts across shards.
+    """
+    mesh = _mesh()
+    e_total = 32
+    weights, scales, x, gating, common = _fp4_layer(mesh, e_total)
+    rng = np.random.default_rng(54)
+    expert_of_slot, slot_of_expert = _placement(rng, e_total)
+    expert_sharding = NamedSharding(mesh, P(AXIS))
+
+    def to_slot_order(a):
+        return jax.device_put(np.asarray(a)[expert_of_slot], expert_sharding)
+
+    if routing == "score_bias":
+        common["score_bias"] = jnp.asarray(
+            rng.normal(size=(e_total,)).astype(np.float32)
+        )
+    elif routing == "hash":
+        common["hash_topk_ids"] = _make_hash_ids(
+            mesh, 55, tokens=256, topk=4, e_total=e_total
+        )
+    identity = fused_ep_moe_v2(x, *weights, *scales, gating, **common)
+    placed_weights = tuple(to_slot_order(a) for a in (*weights, *scales))
+    placed = fused_ep_moe_v2(
+        x, *placed_weights, gating, expert_slot=jnp.asarray(slot_of_expert), **common
+    )
+    np.testing.assert_array_equal(np.asarray(placed), np.asarray(identity))
+    unmapped = fused_ep_moe_v2(x, *placed_weights, gating, **common)
+    assert not np.array_equal(np.asarray(unmapped), np.asarray(identity))
+
+
+def test_order_after_orders_the_program_and_changes_no_value():
+    """`order_after` only holds the kernel back until it exists: the layer
+    must come out with the same bits with and without it."""
+    mesh = _mesh()
+    weights, scales, x, gating, common = _fp4_layer(mesh)
+    plain = fused_ep_moe_v2(x, *weights, *scales, gating, **common)
+    ordered = fused_ep_moe_v2(x, *weights, *scales, gating, order_after=x, **common)
+    np.testing.assert_array_equal(np.asarray(ordered), np.asarray(plain))
+
+
 @pytest.fixture(scope="module")
 def production_weights():
     """The Qwen3.5-397B MoE weights, fp8 e4m3 with per-channel scales.

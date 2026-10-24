@@ -28,6 +28,7 @@ import pytest
 import torch
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu import expert_placement
 from vllm_torchtpu.kernels.fused_moe.v2.host import token_gather_smem_bytes
 from vllm_torchtpu.layers.adapter import fused_moe_ep as bridge
 from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
@@ -134,6 +135,87 @@ def test_native_replica_groups_reach_prebuilt_op():
         == "op"
     )
     assert seen[0]["token_replica_groups"] == groups
+
+
+def _placed_layer():
+    """A layer an expert placement permuted: the same equal blocks, plus the
+    slot table `expert_placement.apply_to_layer` registers."""
+    layer = _layer()
+    slots = torch.arange(layer.global_num_experts, dtype=torch.int32).flip(0)
+    setattr(layer, expert_placement.EXPERT_SLOT_ATTR, slots)
+    return layer
+
+
+def test_a_placed_layer_arms_with_its_slot_table():
+    seen = []
+    build_op = lambda *args, **kw: seen.append(kw) or "op"  # noqa: E731
+    assert _prebuild(_placed_layer(), build_op=build_op) == "op"
+    assert seen[0]["has_expert_slot"] is True
+    assert _prebuild(_layer(), build_op=build_op) == "op"
+    assert seen[1]["has_expert_slot"] is False
+
+
+@pytest.mark.parametrize("placed,shared_before", [(True, False), (False, True)])
+def test_sorted_gather_gives_way_to_operands_it_does_not_carry(placed, shared_before):
+    """The split route/compute ops take at most one extra operand, so a slot
+    table or an ordering operand runs as the single fused program instead of
+    failing on arity at the first call."""
+    seen = []
+    with (
+        patch.object(envs, "MOE_FUSED_EP_SORTED_GATHER", True),
+        patch.object(envs, "MOE_FUSED_EP_SHARED_BEFORE_KERNEL", shared_before),
+        patch.object(bridge, "ep_sorted_gather_group", return_value=("g", (1, 0))),
+    ):
+        layer = _placed_layer() if placed else _layer()
+        build_op = lambda *args, **kw: seen.append(kw) or "op"  # noqa: E731
+        assert _prebuild(layer, build_op=build_op) == "op"
+        assert seen[0]["sorted_gather"] is None
+        assert seen[0]["has_order_after"] is shared_before
+        if placed:
+            # An unplaced layer of the same model keeps the sorted gather.
+            assert _prebuild(_layer(), build_op=build_op) == "op"
+            assert seen[1]["sorted_gather"] == ("g", (1, 0))
+
+
+@pytest.mark.parametrize(
+    "module,cls", [("fp8", "VllmFp8MoEMethodTPU"), ("nvfp4", "VllmNvfp4MoEMethod")]
+)
+def test_fused_ep_methods_hand_the_ordering_operand_to_the_op(module, cls):
+    """MOE_FUSED_EP_SHARED_BEFORE_KERNEL builds every fused EP op with an
+    `order_after` operand and the runner hands it to whichever method armed,
+    so each one has to take it and forward it."""
+    import importlib
+
+    quant = importlib.import_module(
+        f"vllm_torchtpu.layers.adapter.quantization.{module}"
+    )
+    method = object.__new__(getattr(quant, cls))
+    method._tpu_activation_str = "silu"
+    method._use_adaptive_fused_moe = False
+    setattr(method, bridge.FUSED_MOE_EP_OP_ATTR, "op")
+    w = torch.zeros(1)
+    layer = SimpleNamespace(
+        w13_weight=w,
+        w2_weight=w,
+        w13_weight_scale_inv=w,
+        w2_weight_scale_inv=w,
+        _tpu_fused_w13_scale=w,
+        _tpu_fused_w2_scale=w,
+    )
+    seen = {}
+
+    def op(owner, x, *args, **kwargs):
+        seen.update(kwargs)
+        return x
+
+    x, shared = torch.zeros(2, 8), torch.ones(2, 8)
+    with (
+        patch.object(bridge, "fused_moe_ep", side_effect=op),
+        patch.object(bridge, "score_bias_operand", return_value=None),
+    ):
+        out = method.apply_monolithic(layer, x, torch.zeros(2, 4), order_after=shared)
+    assert out is x
+    assert seen["order_after"] is shared
 
 
 @pytest.mark.parametrize("sharded_plan", [False, True])

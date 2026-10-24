@@ -45,7 +45,7 @@ from vllm.compilation.compiler_interface import CompilerInterface
 from vllm.config import VllmConfig
 from vllm.config.utils import Range
 
-from vllm_torchtpu import envs, utils
+from vllm_torchtpu import envs, expert_placement, utils
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.logger import init_logger
 
@@ -257,6 +257,11 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
     # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
+    # The expert count tap's snapshot cadence and directory are host-side;
+    # whether the tap is on at all does change the forward, and is hashed
+    # separately as "expert_count_tap".
+    "MOE_EXPERT_COUNT_TAP_DIR",
+    "MOE_EXPERT_COUNT_TAP_EVERY",
     # Pooling: the static pooler is a separate backend="tpu" helper outside the
     # backbone graph, and the KV cap reaches the hash through num_gpu_blocks.
     "VLLM_TPU_STATIC_POOLER",
@@ -283,6 +288,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # torch custom-op boundary Dynamo cannot see through, and the kernel they
     # export is chosen from their source, so an edit here has to invalidate
     # the compiled executables like any other kernel change.
+    "vllm_torchtpu/expert_placement.py",
     "vllm_torchtpu/layers/adapter/fused_moe_ep.py",
     # Same for the TP decode MoE op, whose body this module builds.
     "vllm_torchtpu/layers/adapter/moe_tp_decode.py",
@@ -413,6 +419,10 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         "libtpu": importlib_metadata.version("libtpu"),
         "env": _tpu_compile_env_factors(),
         "native_env": {name: os.getenv(name) for name in _NATIVE_TPU_COMPILE_ENV_VARS},
+        # The env var is only the table's path; its contents set the shapes.
+        "expert_placement": expert_placement.content_hash(),
+        # The tap adds its selection and counters to every MoE layer's forward.
+        "expert_count_tap": bool(envs.MOE_EXPERT_COUNT_TAP_DIR),
         "parallel": {
             "effective_data_parallel_size": utils.get_dp_size(
                 vllm_config.parallel_config

@@ -1111,8 +1111,14 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         x: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        order_after: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Forward pass using TPU-native GMM kernel with FP8 weights."""
+        """Forward pass using TPU-native GMM kernel with FP8 weights.
+
+        `order_after` is the shared expert's output under
+        MOE_FUSED_EP_SHARED_BEFORE_KERNEL, which prebuild gave every fused EP
+        op an operand for; only the fused EP call reads it.
+        """
         layer = cast("TpuRoutedExperts", layer)
         activation_str = self._tpu_activation_str
         assert activation_str is not None, (
@@ -1160,6 +1166,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 layer.w2_weight_scale_inv,
                 router_logits,
                 score_bias_operand(layer),
+                order_after=order_after,
             )
         from vllm_torchtpu.layers.adapter.moe_tp_decode import (
             moe_tp_decode_forward,
