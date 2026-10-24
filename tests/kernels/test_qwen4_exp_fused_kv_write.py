@@ -241,6 +241,8 @@ def test_rings_stay_on_separate_writer(interpret, monkeypatch):
 
     monkeypatch.setattr(pooled_qsa, "fused_layer_write", fused)
     monkeypatch.setattr(pooled_qsa, "write_ring_and_tags", ring)
+    # Earlier cases compiled this step; retrace so the recorders are called.
+    jax.clear_caches()
     rng = np.random.default_rng(11)
     args = make_step(rng, [4, 4], [5, 9], jnp.float8_e4m3fn)
     run(monkeypatch, True, args, main_slot=1, max_query_len=4)
