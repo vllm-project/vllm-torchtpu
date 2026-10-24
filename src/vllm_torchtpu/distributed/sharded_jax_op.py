@@ -94,6 +94,11 @@ def _placeholder(aval, spec, mesh):
     return torch.empty(shape, dtype=torch_dtype, device="tpu")
 
 
+def _native_output_specs() -> bool:
+    params = inspect.signature(pallas_impl.JaxCallable.__init__).parameters
+    return "output_partition_specs" in params
+
+
 def _build_sharded_callable_cls():
     """A ``JaxCallable`` whose ``__call__`` is the installed one, minus the
     assumption that a sharded output is replicated.
@@ -101,6 +106,8 @@ def _build_sharded_callable_cls():
     The method source is recompiled inside a throwaway class so its original
     indentation -- and therefore the needle below -- survives verbatim.
     """
+    if _native_output_specs():
+        return pallas_impl.JaxCallable
     src = inspect.getsource(pallas_impl.JaxCallable.__call__)
     if _STOCK_PLACEHOLDER_LINE not in src:
         logger.warning(
@@ -191,6 +198,11 @@ def sharded_jax_op(
             "output_partition_specs": str(output_partition_specs),
         },
     )
+    native_kwargs = (
+        {"output_partition_specs": output_partition_specs}
+        if _native_output_specs()
+        else {}
+    )
     wrapped_fn = _SHARDED_CALLABLE_CLS(
         name=name,
         jit_fn=jit_fn,
@@ -199,6 +211,7 @@ def sharded_jax_op(
         input_partition_specs=input_partition_specs,
         static_argnums=static_argnums,
         donate_argnums=donate_argnums,
+        **native_kwargs,
     )
 
     op = torch.library.custom_op(name, wrapped_fn, mutates_args=())

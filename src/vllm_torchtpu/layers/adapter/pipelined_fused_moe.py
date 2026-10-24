@@ -27,6 +27,7 @@ import torch
 from vllm.distributed.parallel_state import get_dp_group
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.distributed.hier_reduce_scatter import moe_combine_reduce_scatter
 from vllm_torchtpu.distributed.pcp import get_pcp_group
 from vllm_torchtpu.layers.adapter.fused_moe import fused_moe_gmm
 from vllm_torchtpu.layers.core.quantization import dequantize_tensor, quantize_tensor
@@ -298,7 +299,7 @@ def pipelined_fused_moe_gmm(
 
         if parallel_size > 1:
             assert collective_group is not None
-            return collective_group.reduce_scatter(out, dim=0)
+            return moe_combine_reduce_scatter(collective_group, out)
         return out
 
     _log_active_chunk_pipeline()
@@ -384,7 +385,7 @@ def pipelined_fused_moe_gmm(
         )
 
         # Reduce-scatter partial output for current chunk
-        rs_i = collective_group.reduce_scatter(out_i, dim=0)
+        rs_i = moe_combine_reduce_scatter(collective_group, out_i)
         rs_outputs.append(rs_i)
 
         if i + 1 < num_chunks:

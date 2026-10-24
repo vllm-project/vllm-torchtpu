@@ -1074,6 +1074,13 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
         )
+        if layer.moe_config.moe_parallel_config.use_ep:
+            # Like the EP mesh below, it needs a collective Dynamo cannot trace.
+            from vllm_torchtpu.distributed.hier_reduce_scatter import (
+                prebuild_hier_reduce_scatter,
+            )
+
+            prebuild_hier_reduce_scatter()
         # Resolve the EP mesh here, not on the first forward: it maps ranks to
         # TPU device ids with an all_gather_object, and Dynamo cannot trace a
         # collective inside the compiled graph. The result is recorded on this
