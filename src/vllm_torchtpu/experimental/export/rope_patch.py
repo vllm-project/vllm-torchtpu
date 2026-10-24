@@ -115,24 +115,33 @@ def _apply_rotary_emb(
     sin: torch.Tensor,
     is_neox_style: bool,
 ) -> torch.Tensor:
-    """Applies rotary embedding to `x[num_tokens, num_heads, rotary_dim]`."""
+    """Applies rotary embedding to `x[num_tokens, num_heads, rotary_dim]`.
+
+    Rotates in FP32 like vLLM's CUDA kernel (and the runtime TPU path in
+    `vllm_torchtpu.layers.adapter.rotary_embedding`); `cos`/`sin` arrive
+    already rounded to the cache dtype.
+    """
     try:
         from vllm.model_executor.layers.rotary_embedding.base import ApplyRotaryEmb
 
-        return ApplyRotaryEmb.forward_static(x, cos, sin, is_neox_style)
+        return ApplyRotaryEmb.forward_static(
+            x, cos, sin, is_neox_style, enable_fp32_compute=True
+        )
     except ImportError:
-        cos_u = cos.unsqueeze(-2).to(x.dtype)
-        sin_u = sin.unsqueeze(-2).to(x.dtype)
+        orig_dtype = x.dtype
+        x = x.float()
+        cos_u = cos.unsqueeze(-2).float()
+        sin_u = sin.unsqueeze(-2).float()
         if is_neox_style:
             x1, x2 = torch.chunk(x, 2, dim=-1)
             o1 = x1 * cos_u - x2 * sin_u
             o2 = x2 * cos_u + x1 * sin_u
-            return torch.cat((o1, o2), dim=-1)
+            return torch.cat((o1, o2), dim=-1).to(orig_dtype)
         x1 = x[..., ::2]
         x2 = x[..., 1::2]
         o1 = x1 * cos_u - x2 * sin_u
         o2 = x2 * cos_u + x1 * sin_u
-        return torch.stack((o1, o2), dim=-1).flatten(-2)
+        return torch.stack((o1, o2), dim=-1).flatten(-2).to(orig_dtype)
 
 
 def _build_device_vector_f32(

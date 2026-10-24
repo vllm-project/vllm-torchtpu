@@ -41,6 +41,7 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import (
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
+    from vllm.config.kernel import IrOpPriorityConfig
     from vllm.inputs import EngineInput
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
@@ -483,6 +484,35 @@ class TpuPlatform(Platform):
     @classmethod
     def import_kernels(cls) -> None:
         return
+
+    @classmethod
+    def import_ir_kernels(cls) -> None:
+        """Register the TPU providers for vLLM IR ops on top of the built-ins.
+
+        ``IrOpPriorityConfig.set_default`` calls this in every worker before
+        installing the priorities from ``get_default_ir_op_priority``.
+        """
+        super().import_ir_kernels()
+        import vllm_torchtpu.layers.adapter.ir_ops  # noqa: F401
+
+    @classmethod
+    def get_default_ir_op_priority(
+        cls, vllm_config: "VllmConfig"
+    ) -> "IrOpPriorityConfig":
+        """Prefer the CUDA-numerics ``tpu`` RMSNorm providers over ``native``.
+
+        See ``vllm_torchtpu/layers/adapter/ir_ops.py``. Users can still force
+        ``native`` through ``--kernel-config`` for A/B comparisons.
+        """
+        from vllm.config.kernel import IrOpPriorityConfig
+
+        from vllm_torchtpu.layers.adapter.ir_ops import TPU_IR_PROVIDER
+
+        return IrOpPriorityConfig.with_default(
+            ["native"],
+            rms_norm=[TPU_IR_PROVIDER, "native"],
+            fused_add_rms_norm=[TPU_IR_PROVIDER, "native"],
+        )
 
     @classmethod
     def device_id_to_physical_device_id(cls, device_id: int) -> int:
