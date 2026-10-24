@@ -554,11 +554,16 @@ def _patch_ltx2_split_rope() -> None:
     #   - TP: _slice_rope_for_tp slices 4-D tables by heads on dim 1 and so
     #     passes these (B, 1, T, H * D) tables through whole; the rotation
     #     takes the lanes of the local heads.
-    #   - Cache key: coords tensor (identity and version counter), device and
-    #     out_dtype. Inference tensors have no version counter, so in-place
-    #     edits of coords in inference mode are not seen (vLLM-Omni does not
-    #     edit coords after building them).
-    #   - Cross-attention ropes get a new coords slice each step and rebuild.
+    #   - Cache key: the storage of coords (its data pointer; Tensor.is_set_to
+    #     is not implemented for TPU), the layout of coords on it (storage
+    #     offset, shape, stride), its dtype, device and version counter, and
+    #     the device and out_dtype arguments. Fresh views with the same layout,
+    #     such as the cross-attention ropes' coords[:, 0:1, :] each step, hit
+    #     in and out of inference mode. The cache holds the coords view, which
+    #     keeps the storage alive, so its address is not reused while cached.
+    #     Inference tensors have no version counter, so in-place edits of
+    #     coords in inference mode are not seen (vLLM-Omni does not edit
+    #     coords after building them).
     #   - Interleaved RoPE and (B, H, T, D/2) tables use the original
     #     functions.
     #   - synchronize_tensors materializes the cached tables once.
@@ -585,10 +590,25 @@ def _patch_ltx2_split_rope() -> None:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.rope_type != "split":
             return orig_rope_forward(self, coords, device, out_dtype)
+        storage = coords.untyped_storage().data_ptr()
         version = None if coords.is_inference() else coords._version
-        key = (version, device, out_dtype)
+        key = (
+            version,
+            coords.storage_offset(),
+            tuple(coords.shape),
+            coords.stride(),
+            coords.dtype,
+            coords.device,
+            device,
+            out_dtype,
+        )
         cached = getattr(self, "_tpu_split_rope_cache", None)
-        if cached is not None and cached[0] is coords and cached[1] == key:
+        if (
+            cached is not None
+            and storage != 0
+            and cached[0].untyped_storage().data_ptr() == storage
+            and cached[1] == key
+        ):
             return cached[2]
         tables = orig_rope_forward(self, coords, device, out_dtype)
         if tables[0].ndim != 4:

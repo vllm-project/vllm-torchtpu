@@ -970,3 +970,51 @@ def test_ltx2_split_rope_tables_reused(ltx2, table_syncs):
     rope(coords)
     rope(coords)
     assert rope.calls == 2
+
+
+@pytest.mark.parametrize("inference", [False, True], ids=["grad", "inference"])
+def test_ltx2_split_rope_tables_reused_for_coords_views(ltx2, table_syncs, inference):
+    # Cross-attention ropes pass a fresh coords[:, 0:1, :] view every step,
+    # in vLLM-Omni under torch.inference_mode(), where views have no _base.
+    # Views of the same storage with the same layout and dtype hit; another
+    # storage offset, shape or dtype, or another tensor with equal values,
+    # rebuilds.
+    torch.manual_seed(0)
+    rope = ltx2.LTX2AudioVideoRotaryPosEmbed()
+    ref = ltx2.LTX2AudioVideoRotaryPosEmbed()  # counts the reference calls
+    ref.freqs = rope.freqs
+    f32 = torch.float32
+
+    def call(view):
+        tables = rope(view, out_dtype=f32)
+        want = split_rope_natural_tables(*_upstream_rope_forward(ref, view, None, f32))
+        assert torch.equal(tables[0], want[0]) and torch.equal(tables[1], want[1])
+        return tables
+
+    with torch.inference_mode(inference):
+        coords = _ltx2_coords()
+        assert (coords[:, 0:1, :]._base is None) == inference
+        tables = call(coords[:, 0:1, :])
+        assert call(coords[:, 0:1, :]) is tables
+        assert (rope.calls, len(table_syncs)) == (1, 1)
+
+        other = coords.clone()  # equal values and layout, another storage
+        for view in (
+            coords[:, 1:2, :],  # another storage offset
+            coords[:, 0:2, :],  # another shape at the same offset
+            coords[:, 0:1, :].view(torch.int32),  # another dtype, same bytes
+            other[:, 0:1, :],
+        ):
+            call(coords[:, 0:1, :])
+            calls = rope.calls
+            call(view)
+            assert (rope.calls, len(table_syncs)) == (calls + 1, calls + 1)
+
+    if not inference:
+        # An in-place edit bumps the version counter that views share.
+        stale = call(coords[:, 0:1, :])
+        calls = rope.calls
+        coords.add_(1.0)
+        fresh = call(coords[:, 0:1, :])
+        assert (rope.calls, len(table_syncs)) == (calls + 1, calls + 1)
+        assert not torch.equal(fresh[0], stale[0])
