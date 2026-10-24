@@ -146,6 +146,18 @@ def test_rope_patch_installed():
     )
 
 
+def test_rope_patch_accepts_token_major_tables():
+    # vLLM-Omni 0.32 (vllm-omni#8112): LingBot-World passes (tokens, D/2) tables.
+    rope = _MockRotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
+    x = torch.randn(1, 4, 2, 8, dtype=torch.bfloat16)
+    cos = torch.randn(4, 4, dtype=torch.bfloat16)
+    sin = torch.randn(4, 4, dtype=torch.bfloat16)
+    expected = rope.forward_native(x, cos[None, :, None], sin[None, :, None])
+    torch.testing.assert_close(
+        rotary_embedding_wan_forward(rope, x, cos, sin), expected, rtol=0, atol=0
+    )
+
+
 def test_tpu_flash_attention_backend(monkeypatch):
     from types import SimpleNamespace
     from unittest.mock import MagicMock

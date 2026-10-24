@@ -55,9 +55,12 @@ def test_generate_with_tp_equal_local_tpu_count(async_scheduling: bool):
             "running here would silently reduce TP coverage"
         )
 
+    # One ~6-token prompt and 4 output tokens: every step fits the 16-token
+    # bucket and the 8-request one, so those are the only shapes compiled.
     llm = LLM(
         model=MODEL_NAME,
-        max_num_batched_tokens=64,
+        max_num_batched_tokens=16,
+        max_num_seqs=8,
         max_model_len=64,
         tensor_parallel_size=tp_size,
         async_scheduling=async_scheduling,

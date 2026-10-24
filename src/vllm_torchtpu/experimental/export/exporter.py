@@ -15,10 +15,13 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
+import math
 import os
+import re
 import shutil
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from vllm_torchtpu.experimental.export import (
@@ -28,6 +31,7 @@ from vllm_torchtpu.experimental.export import (
     validator,
     weight_mapper,
 )
+from vllm_torchtpu.experimental.export.trace import trace
 
 # User inputs of forward_bucket{B}.mlir, in @main order; also the keyword names
 # of `ExportableTextOnlyLLM.forward`.
@@ -40,6 +44,182 @@ _USER_INPUT_NAMES = (
     "req_dist",
 )
 _NUM_USER_INPUTS = len(_USER_INPUT_NAMES)
+
+# Mesh axes of the artifact. Expert parallelism runs on the tensor-parallel
+# devices, so expert dimensions are split over `model` too.
+_AXIS_NAMES = ("data", "model")
+_MESH_AXIS_BY_ALIAS = {"dp": "data", "tp": "model", "ep": "model"}
+
+# Module types are shard-local: each module is the program one device runs,
+# with collectives written explicitly in the graph.
+_MLIR_SHAPES = "shard_local"
+
+Sharding = list[str | list[str] | None]
+
+
+def _axis_sizes(cfg: api.TextOnlyLLMExportConfig) -> dict[str, int]:
+    """Size of each mesh axis, keyed by `_AXIS_NAMES`."""
+    dp_size = int(getattr(cfg, "data_parallel_size", 1) or 1)
+    return {"data": dp_size, "model": cfg.tensor_parallel_size}
+
+
+def _replicated(rank: int) -> Sharding:
+    return [None] * rank
+
+
+def _mesh_sharding(raw: Any, rank: int) -> Sharding:
+    """Converts `weight_mapper.infer_weight_sharding` output to a mesh sharding.
+
+    The result has one entry per dimension: `None` or a mesh axis name.
+    """
+    if raw is None:
+        return _replicated(rank)
+    if isinstance(raw, str):
+        # Rank-0 shardings name the axis a per-device value varies along; such
+        # values are constants, which `_tensor_layouts` lays out from their values.
+        if rank == 0 or raw.strip() in ("", "None", "{replicated}", "replicated"):
+            return _replicated(rank)
+        raise ValueError(f"unsupported sharding {raw!r} for a rank-{rank} tensor")
+    entries = list(raw)
+    if len(entries) != rank:
+        raise ValueError(f"sharding {entries} has {len(entries)} entries, rank {rank}")
+    return [
+        None if e is None else _MESH_AXIS_BY_ALIAS.get(str(e), str(e)) for e in entries
+    ]
+
+
+def _axes_size(entry: str | list[str] | None, axis_sizes: Mapping[str, int]) -> int:
+    if entry is None:
+        return 1
+    axes = [entry] if isinstance(entry, str) else list(entry)
+    return math.prod(axis_sizes[a] for a in axes)
+
+
+def _global_shape(
+    local_shape: Sequence[int], sharding: Sharding, axis_sizes: Mapping[str, int]
+) -> list[int]:
+    """The global shape whose shards, cut along `sharding`, are `local_shape`."""
+    return [
+        int(d) * _axes_size(entry, axis_sizes)
+        for d, entry in zip(local_shape, sharding, strict=True)
+    ]
+
+
+def _state_sharding(shape: Sequence[int], tp_size: int) -> Sharding:
+    """KV cache shards hold this device's KV heads, the third dimension."""
+    sharding = _replicated(len(shape))
+    if tp_size > 1 and len(shape) >= 3:
+        sharding[2] = "model"
+    return sharding
+
+
+@dataclasses.dataclass(frozen=True)
+class _TensorLayout:
+    """How a weight or constant appears globally and in the lowered modules."""
+
+    shape: list[int]  # Global shape, as declared in metadata.json.
+    sharding: Sharding
+    lowered_shape: tuple[int, ...]  # Shard-local `@main` argument shape.
+    # Shape `model.forward` reads, when it differs from `lowered_shape`.
+    reshape: tuple[int, ...] | None = None
+
+
+def _tensor_layouts(
+    model: api.ExportableTextOnlyLLM,
+    params_map: Mapping[str, Any],
+    constants: frozenset[str],
+    axis_sizes: Mapping[str, int],
+) -> dict[str, _TensorLayout]:
+    """Lays out every weight and constant as a global, sharded tensor.
+
+    A constant whose value differs between devices becomes a global array with a
+    leading dimension split over `model`: each device holds a `[1, ...]` shard,
+    which `model.forward` reads back in its own shape. Gathering constant values
+    is collective, so every rank runs this with the same `params_map`.
+    """
+    tp_size = axis_sizes["model"]
+    layouts: dict[str, _TensorLayout] = {}
+    for name, spec in params_map.items():
+        local = tuple(int(d) for d in spec.shape)
+        if name in constants:
+            values = model.constant_axis_values(name)  # type: ignore[attr-defined]
+            if any(v != values[0] for v in values):
+                layouts[name] = _TensorLayout(
+                    shape=[len(values), *local],
+                    sharding=["model", *_replicated(len(local))],
+                    lowered_shape=(1, *local),
+                    reshape=local,
+                )
+            else:
+                layouts[name] = _TensorLayout(
+                    shape=list(local),
+                    sharding=_replicated(len(local)),
+                    lowered_shape=local,
+                )
+            continue
+        sharding = _mesh_sharding(
+            weight_mapper.infer_weight_sharding(
+                name,
+                local,
+                explicit_sharding=getattr(spec, "sharding", None),
+                tp_size_hint=tp_size,
+            ),
+            len(local),
+        )
+        layouts[name] = _TensorLayout(
+            shape=_global_shape(local, sharding, axis_sizes),
+            sharding=sharding,
+            lowered_shape=local,
+        )
+    return layouts
+
+
+def _lowered_params(
+    params_map: Mapping[str, Any], layouts: Mapping[str, _TensorLayout]
+) -> dict[str, api.ShapeDtypeStruct]:
+    """Param specs with the shard-local shapes the modules are lowered with."""
+    return {
+        n: api.ShapeDtypeStruct(
+            shape=layouts[n].lowered_shape,
+            dtype=tpu_lowering.dtype_name(s.dtype),
+        )
+        for n, s in params_map.items()
+    }
+
+
+def _weight_reshapes(
+    layouts: Mapping[str, _TensorLayout],
+) -> dict[str, tuple[int, ...]]:
+    return {n: lay.reshape for n, lay in layouts.items() if lay.reshape is not None}
+
+
+def _io_entry(
+    *,
+    arg_index: int,
+    index: int,
+    name: str,
+    shape: Sequence[int],
+    dtype: Any,
+    argument_type: str,
+    sharding: Sharding | None = None,
+    buffer_donor: bool = False,
+    is_input: bool = True,
+) -> dict[str, Any]:
+    """A `metadata.json` entry for a non-weight input or output."""
+    entry: dict[str, Any] = {
+        "arg_index": arg_index,
+        "index": index,
+        "name": name,
+        "shape": [int(d) for d in shape],
+        "dtype": tpu_lowering.dtype_name(dtype),
+        "sharding": _replicated(len(shape)) if sharding is None else sharding,
+        "argument_type": argument_type,
+    }
+    if is_input:
+        entry["is_weight"] = False
+        entry["weight_name"] = ""
+    entry["buffer_donor"] = buffer_donor
+    return entry
 
 
 def _user_inputs(
@@ -70,27 +250,22 @@ def _weight_slots(
 def _weight_input_entry(
     name: str,
     spec: Any,
+    layout: _TensorLayout,
     *,
     arg_index: int,
     slot: int,
-    tp_size: int,
     buffer_donor: bool,
+    constant: bool = False,
 ) -> dict[str, Any]:
-    """Returns the `metadata.json` input entry for a weight argument."""
-    shape = [int(d) for d in spec.shape]
+    """Returns the `metadata.json` input entry for a weight or constant argument."""
     return {
         "arg_index": arg_index,
         "index": slot,
         "name": name,
-        "shape": shape,
+        "shape": list(layout.shape),
         "dtype": tpu_lowering.dtype_name(spec.dtype),
-        "sharding": weight_mapper.infer_weight_sharding(
-            name,
-            shape,
-            explicit_sharding=getattr(spec, "sharding", None),
-            tp_size_hint=tp_size,
-        ),
-        "argument_type": "weight",
+        "sharding": list(layout.sharding),
+        "argument_type": "constant" if constant else "weight",
         "is_weight": True,
         "weight_name": name,
         "buffer_donor": buffer_donor,
@@ -99,24 +274,16 @@ def _weight_input_entry(
 
 def _export_abstract_params(
     params_map: Mapping[str, Any],
+    layouts: Mapping[str, _TensorLayout],
     output_dir: str,
-    tp_size: int,
     *,
+    constants: frozenset[str] = frozenset(),
     subdir: str = "subgraphs",
 ) -> tuple[dict[str, Any], dict[str, int]]:
-    """Lowers the `abstract_params.mlir` identity `f(x) -> x` with `donate_argnums`."""
-    param_items = [
-        (
-            name,
-            api.ShapeDtypeStruct(
-                shape=tuple(int(d) for d in spec.shape),
-                dtype=tpu_lowering.dtype_name(spec.dtype),
-                sharding=getattr(spec, "sharding", None),
-            ),
-        )
-        for name, spec in params_map.items()
-    ]
-    mlir_text = tpu_lowering.lower_abstract_params_mlir(param_items)
+    """Lowers the `abstract_params.mlir` identity, input `i` aliased to output `i`."""
+    mlir_text = tpu_lowering.lower_abstract_params_mlir(
+        list(_lowered_params(params_map, layouts).items())
+    )
 
     target_dir = os.path.join(output_dir, subdir) if subdir else output_dir
     os.makedirs(target_dir, exist_ok=True)
@@ -133,10 +300,11 @@ def _export_abstract_params(
         inp_entry = _weight_input_entry(
             name,
             spec,
+            layouts[name],
             arg_index=i,
             slot=weight_slots[name],
-            tp_size=tp_size,
             buffer_donor=True,
+            constant=name in constants,
         )
         inputs_meta.append(inp_entry)
         outputs_meta.append(
@@ -147,7 +315,7 @@ def _export_abstract_params(
                 "shape": inp_entry["shape"],
                 "dtype": inp_entry["dtype"],
                 "sharding": inp_entry["sharding"],
-                "argument_type": "weight",
+                "argument_type": inp_entry["argument_type"],
                 "buffer_donor": False,
             }
         )
@@ -160,75 +328,22 @@ def _export_abstract_params(
     return spec_dict, weight_slots
 
 
-def _export_text_only_llm_functions(
-    model: api.ExportableTextOnlyLLM,
-    params_map: Mapping[str, Any],
-    weight_slots: Mapping[str, int],
-    output_dir: str,
-    *,
-    subdir: str = "subgraphs",
-) -> dict[str, dict[str, Any]]:
-    """Lowers `forward`, `compute_logits`, and the samplers across all buckets."""
-    cfg: api.TextOnlyLLMExportConfig = model.export_config
-    act_dtype_str = tpu_lowering.dtype_name(cfg.dtype)
+def _lm_head_name(params_map: Mapping[str, Any]) -> str:
+    """The weight `compute_logits` projects with (tied embeddings fall back).
 
-    target_dir = os.path.join(output_dir, subdir) if subdir else output_dir
-    os.makedirs(target_dir, exist_ok=True)
+    Multimodal models nest the language model, e.g. `language_model.lm_head.weight`.
+    """
+    for cand in ("lm_head.weight", "model.embed_tokens.weight"):
+        if cand in params_map:
+            return cand
+        nested = [n for n in params_map if n.endswith(f".{cand}")]
+        if len(nested) == 1:
+            return nested[0]
+    return next(iter(params_map))
 
-    forward_names = [n for n in params_map if n != "lm_head.weight"]
-    if not forward_names:
-        forward_names = list(params_map.keys())
-    lm_head_name = (
-        "lm_head.weight"
-        if "lm_head.weight" in params_map
-        else (
-            "model.embed_tokens.weight"
-            if "model.embed_tokens.weight" in params_map
-            else next(iter(params_map.keys()))
-        )
-    )
-    lm_head_spec = params_map[lm_head_name]
-    lm_head_entry = _weight_input_entry(
-        lm_head_name,
-        lm_head_spec,
-        arg_index=1,
-        slot=weight_slots[lm_head_name],
-        tp_size=cfg.tensor_parallel_size,
-        buffer_donor=False,
-    )
 
-    default_kv_shape = (
-        cfg.num_blocks,
-        cfg.block_size,
-        cfg.num_kv_heads * 2,
-        cfg.head_dim,
-    )
-    abstract_states_fn = getattr(model, "abstract_states", None)
-    if callable(abstract_states_fn):
-        raw_states = list(abstract_states_fn())
-        if len(raw_states) != cfg.num_layers:
-            raise ValueError(
-                f"{type(model).__name__}.abstract_states() returned "
-                f"{len(raw_states)} state specs, expected cfg.num_layers == "
-                f"{cfg.num_layers}"
-            )
-        state_specs = [
-            api.ShapeDtypeStruct(
-                shape=tuple(int(d) for d in s.shape),
-                dtype=tpu_lowering.dtype_name(s.dtype),
-            )
-            for s in raw_states
-        ]
-    else:
-        state_specs = [
-            api.ShapeDtypeStruct(default_kv_shape, act_dtype_str)
-            for _ in range(cfg.num_layers)
-        ]
-
-    num_fwd_weights = len(forward_names)
-    state_start = _NUM_USER_INPUTS + num_fwd_weights
-
-    norm_params = {
+def _norm_params(params_map: Mapping[str, Any]) -> dict[str, api.ShapeDtypeStruct]:
+    return {
         n: api.ShapeDtypeStruct(
             shape=tuple(int(d) for d in s.shape),
             dtype=tpu_lowering.dtype_name(s.dtype),
@@ -237,6 +352,137 @@ def _export_text_only_llm_functions(
         for n, s in params_map.items()
     }
 
+
+def _state_specs(model: api.ExportableTextOnlyLLM) -> list[api.ShapeDtypeStruct]:
+    """Per-layer KV cache specs, from the model when it reports them."""
+    cfg = model.export_config
+    abstract_states_fn = getattr(model, "abstract_states", None)
+    if not callable(abstract_states_fn):
+        default_kv_shape = (
+            cfg.num_blocks,
+            cfg.block_size,
+            cfg.num_kv_heads * 2,
+            cfg.head_dim,
+        )
+        act_dtype_str = tpu_lowering.dtype_name(cfg.dtype)
+        return [
+            api.ShapeDtypeStruct(default_kv_shape, act_dtype_str)
+            for _ in range(cfg.num_layers)
+        ]
+    raw_states = list(abstract_states_fn())
+    if not raw_states:
+        raise ValueError(f"{type(model).__name__}.abstract_states() returned no state")
+    return [
+        api.ShapeDtypeStruct(
+            shape=tuple(int(d) for d in s.shape),
+            dtype=tpu_lowering.dtype_name(s.dtype),
+            sharding=s.sharding,
+        )
+        for s in raw_states
+    ]
+
+
+def _extra_user_inputs(
+    model: api.ExportableTextOnlyLLM,
+) -> list[tuple[str, tuple[int, ...]]]:
+    """`(name, shape)` of the int32 control inputs the model takes after its state.
+
+    Recurrent models take `mamba_state_indices`; they follow the state arguments
+    so that the weight and state arguments keep their indices.
+    """
+    extra_fn = getattr(model, "extra_user_inputs", None)
+    return list(extra_fn()) if callable(extra_fn) else []
+
+
+def _main_args_read(mlir_text: str) -> set[int]:
+    """Indices of the `@main` arguments that its body reads."""
+    header = re.search(r"func\.func public @main\((.*)\)[^\n]*\{\n", mlir_text)
+    if header is None:
+        raise ValueError("MLIR module has no public @main")
+    num_args = len(re.findall(r"%arg\d+:", header.group(1)))
+    depth, end = 1, header.end()
+    while depth and end < len(mlir_text):
+        depth += {"{": 1, "}": -1}.get(mlir_text[end], 0)
+        end += 1
+    body = mlir_text[header.end() : end]
+    return {k for k in range(num_args) if re.search(rf"%arg{k}\b", body)}
+
+
+@trace("export.params_read_by_forward")
+def _params_read_by_forward(
+    model: api.ExportableTextOnlyLLM, params_map: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Drops the forward weights that the forward graph never reads.
+
+    Candidates include buffers that only some configurations use (vocabulary
+    shard bounds are read only under tensor parallelism), so the smallest forward
+    bucket is lowered once with every candidate and unread ones are removed.
+    """
+    cfg = model.export_config
+    lm_head_name = _lm_head_name(params_map)
+    names = [n for n in params_map if n != lm_head_name]
+    bucket = min(cfg.token_buckets)
+    mlir_text = tpu_lowering.lower_torch_forward_to_mlir(
+        model,
+        user_inputs=_user_inputs(cfg, bucket),
+        forward_names=names,
+        params_map=_norm_params(params_map),
+        state_specs=_state_specs(model),
+        bucket_size=bucket,
+        trailing_user_inputs=_extra_user_inputs(model),
+    )
+    read = _main_args_read(mlir_text)
+    kept = {n for i, n in enumerate(names) if _NUM_USER_INPUTS + i in read}
+    return {n: s for n, s in params_map.items() if n == lm_head_name or n in kept}
+
+
+def _export_text_only_llm_functions(
+    model: api.ExportableTextOnlyLLM,
+    params_map: Mapping[str, Any],
+    layouts: Mapping[str, _TensorLayout],
+    weight_slots: Mapping[str, int],
+    output_dir: str,
+    *,
+    constants: frozenset[str] = frozenset(),
+    subdir: str = "subgraphs",
+) -> dict[str, dict[str, Any]]:
+    """Lowers `forward`, `compute_logits`, and the samplers across all buckets."""
+    cfg: api.TextOnlyLLMExportConfig = model.export_config
+    act_dtype_str = tpu_lowering.dtype_name(cfg.dtype)
+    tp_size = cfg.tensor_parallel_size
+    axis_sizes = _axis_sizes(cfg)
+
+    target_dir = os.path.join(output_dir, subdir) if subdir else output_dir
+    os.makedirs(target_dir, exist_ok=True)
+
+    lm_head_name = _lm_head_name(params_map)
+    forward_names = [n for n in params_map if n != lm_head_name] or list(params_map)
+    lm_head_spec = params_map[lm_head_name]
+    lm_head_entry = _weight_input_entry(
+        lm_head_name,
+        lm_head_spec,
+        layouts[lm_head_name],
+        arg_index=1,
+        slot=weight_slots[lm_head_name],
+        buffer_donor=False,
+    )
+    state_specs = _state_specs(model)
+    state_shardings = [
+        _state_sharding(s.shape, tp_size) if s.sharding is None else list(s.sharding)
+        for s in state_specs
+    ]
+    state_entries = [
+        (_global_shape(s.shape, sharding, axis_sizes), sharding, s.dtype)
+        for s, sharding in zip(state_specs, state_shardings, strict=True)
+    ]
+    extra_inputs = _extra_user_inputs(model)
+
+    num_fwd_weights = len(forward_names)
+    state_start = _NUM_USER_INPUTS + num_fwd_weights
+
+    lowered = _lowered_params(params_map, layouts)
+    reshapes = _weight_reshapes(layouts)
+
     forward_variants: dict[str, Any] = {}
     for b_idx, bucket_size in enumerate(cfg.token_buckets):
         user_inputs = _user_inputs(cfg, bucket_size)
@@ -244,78 +490,89 @@ def _export_text_only_llm_functions(
             model,
             user_inputs=user_inputs,
             forward_names=forward_names,
-            params_map=norm_params,
+            params_map=lowered,
             state_specs=state_specs,
             bucket_size=bucket_size,
+            weight_reshapes=reshapes,
+            trailing_user_inputs=extra_inputs,
         )
         fwd_file = f"forward_bucket{bucket_size}.mlir"
         fwd_rel = f"{subdir}/{fwd_file}" if subdir else fwd_file
         with open(os.path.join(target_dir, fwd_file), "w") as f:
             f.write(fwd_mlir)
 
-        fwd_inputs: list[dict[str, Any]] = []
-        for k, (u_name, u_shape) in enumerate(user_inputs):
-            fwd_inputs.append(
-                {
-                    "arg_index": k,
-                    "index": k,
-                    "name": u_name,
-                    "shape": list(u_shape),
-                    "dtype": "i32",
-                    "argument_type": "user_io",
-                    "is_weight": False,
-                    "weight_name": "",
-                    "buffer_donor": False,
-                }
+        fwd_inputs: list[dict[str, Any]] = [
+            _io_entry(
+                arg_index=k,
+                index=k,
+                name=u_name,
+                shape=u_shape,
+                dtype="i32",
+                argument_type="user_io",
             )
+            for k, (u_name, u_shape) in enumerate(user_inputs)
+        ]
         for w_i, w_name in enumerate(forward_names):
             fwd_inputs.append(
                 _weight_input_entry(
                     w_name,
                     params_map[w_name],
+                    layouts[w_name],
                     arg_index=_NUM_USER_INPUTS + w_i,
                     slot=weight_slots[w_name],
-                    tp_size=cfg.tensor_parallel_size,
                     buffer_donor=False,
+                    constant=w_name in constants,
                 )
             )
-        for s_i, s_spec in enumerate(state_specs):
+        for s_i, (s_shape, s_sharding, s_dtype) in enumerate(state_entries):
             fwd_inputs.append(
-                {
-                    "arg_index": state_start + s_i,
-                    "index": s_i,
-                    "name": f"kv_cache_layer_{s_i}",
-                    "shape": [int(d) for d in s_spec.shape],
-                    "dtype": tpu_lowering.dtype_name(s_spec.dtype),
-                    "argument_type": "state",
-                    "is_weight": False,
-                    "weight_name": "",
-                    "buffer_donor": True,
-                }
+                _io_entry(
+                    arg_index=state_start + s_i,
+                    index=s_i,
+                    name=f"kv_cache_layer_{s_i}",
+                    shape=s_shape,
+                    dtype=s_dtype,
+                    argument_type="state",
+                    sharding=s_sharding,
+                    buffer_donor=True,
+                )
+            )
+        extra_start = state_start + len(state_entries)
+        for e_i, (e_name, e_shape) in enumerate(extra_inputs):
+            fwd_inputs.append(
+                _io_entry(
+                    arg_index=extra_start + e_i,
+                    index=extra_start + e_i,
+                    name=e_name,
+                    shape=e_shape,
+                    dtype="i32",
+                    argument_type="user_io",
+                )
             )
 
         fwd_outputs: list[dict[str, Any]] = [
-            {
-                "arg_index": s_i,
-                "index": s_i,
-                "name": f"kv_cache_out_layer_{s_i}",
-                "shape": [int(d) for d in s_spec.shape],
-                "dtype": tpu_lowering.dtype_name(s_spec.dtype),
-                "argument_type": "state",
-                "buffer_donor": False,
-            }
-            for s_i, s_spec in enumerate(state_specs)
+            _io_entry(
+                arg_index=s_i,
+                index=s_i,
+                name=f"kv_cache_out_layer_{s_i}",
+                shape=s_shape,
+                dtype=s_dtype,
+                argument_type="state",
+                sharding=s_sharding,
+                is_input=False,
+            )
+            for s_i, (s_shape, s_sharding, s_dtype) in enumerate(state_entries)
         ]
         fwd_outputs.append(
-            {
-                "arg_index": cfg.num_layers,
-                "index": 0,
-                "name": "hidden_states",
-                "shape": [bucket_size, cfg.hidden_size],
-                "dtype": act_dtype_str,
-                "argument_type": "intermediate",
-                "buffer_donor": False,
-            }
+            _io_entry(
+                arg_index=len(state_entries),
+                index=0,
+                name="hidden_states",
+                shape=[bucket_size, cfg.hidden_size],
+                dtype=act_dtype_str,
+                argument_type="intermediate",
+                is_input=False,
+            )
         )
 
         forward_variants[str(bucket_size)] = {
@@ -331,10 +588,7 @@ def _export_text_only_llm_functions(
     stochastic_variants: dict[str, Any] = {}
     penalized_variants: dict[str, Any] = {}
 
-    lm_head_struct = api.ShapeDtypeStruct(
-        tuple(int(d) for d in lm_head_spec.shape),
-        tpu_lowering.dtype_name(lm_head_spec.dtype),
-    )
+    lm_head_struct = lowered[lm_head_name]
 
     for r_idx, req_size in enumerate(cfg.req_buckets):
         # 1. compute_logits_req{R}.mlir
@@ -360,34 +614,33 @@ def _export_text_only_llm_functions(
         with open(os.path.join(target_dir, logits_file), "w") as f:
             f.write(logits_mlir)
 
+        # `compute_logits` gathers the vocabulary shards, so logits are replicated.
         logits_variants[str(req_size)] = {
             "file_path": logits_rel,
             "subgraph_index": r_idx,
             "compile_size": req_size,
             "inputs": [
-                {
-                    "arg_index": 0,
-                    "index": 0,
-                    "name": "hidden_states",
-                    "shape": [req_size, cfg.hidden_size],
-                    "dtype": act_dtype_str,
-                    "argument_type": "intermediate",
-                    "is_weight": False,
-                    "weight_name": "",
-                    "buffer_donor": False,
-                },
+                _io_entry(
+                    arg_index=0,
+                    index=0,
+                    name="hidden_states",
+                    shape=[req_size, cfg.hidden_size],
+                    dtype=act_dtype_str,
+                    argument_type="intermediate",
+                ),
                 lm_head_entry,
             ],
             "outputs": [
-                {
-                    "arg_index": 0,
-                    "index": 0,
-                    "name": "logits",
-                    "shape": list(logits_shape),
-                    "dtype": logits_dtype_str,
-                    "argument_type": "user_io",
-                    "buffer_donor": False,
-                }
+                _io_entry(
+                    arg_index=0,
+                    index=0,
+                    name="logits",
+                    shape=logits_shape,
+                    dtype=logits_dtype_str,
+                    # Stays on device: the samplers take it as an intermediate input.
+                    argument_type="intermediate",
+                    is_input=False,
+                )
             ],
         }
 
@@ -414,109 +667,15 @@ def _export_text_only_llm_functions(
     }
 
 
-def _emit_declarative_weight_json(
-    model: api.ExportableTextOnlyLLM,
-    params_map: Mapping[str, Any],
-    weight_slots: Mapping[str, int],
-    output_dir: str,
-    dp_size: int,
-    tp_size: int,
-) -> None:
-    """Emits `serving_checkpoint/weight.json` from HF metadata; loads no tensors."""
-    cfg = model.export_config
-    ckpt_dir = os.path.join(output_dir, "serving_checkpoint")
-    os.makedirs(ckpt_dir, exist_ok=True)
-
-    hf_meta: Mapping[str, Any] = {}
-    default_st = "model.safetensors"
-    if cfg.hf_checkpoint_dir:
-        hf_meta, default_st = weight_mapper.read_hf_safetensors_metadata(
-            cfg.hf_checkpoint_dir
-        )
-    torch_model = getattr(model, "model", None)
-
-    weight_map: dict[str, Any] = {
-        "mesh": {
-            "mesh_shape": [dp_size, tp_size],
-            "axis_names": ["dp", "tp"],
-        }
-    }
-    # Source paths are relative to the checkpoint; record where it lives so a
-    # runtime can find the safetensors files without being told.
-    if cfg.hf_checkpoint_dir and os.path.isdir(cfg.hf_checkpoint_dir):
-        weight_map["hf_checkpoint_path"] = os.path.abspath(cfg.hf_checkpoint_dir)
-    for name, spec in params_map.items():
-        slot_idx = weight_slots[name]
-        shape_list = [int(d) for d in spec.shape]
-        dt_str = tpu_lowering.dtype_name(spec.dtype)
-        sharding_val = weight_mapper.infer_weight_sharding(
-            name,
-            shape_list,
-            model=torch_model,
-            explicit_sharding=getattr(spec, "sharding", None),
-            tp_size_hint=tp_size,
-        )
-        sources = weight_mapper.build_generic_weight_sources(
-            name,
-            shape_list,
-            model=torch_model,
-        )
-        resolved_sources = weight_mapper.expand_or_resolve_weight_sources(
-            name,
-            {"shape": shape_list, "sources": sources},
-            dict(hf_meta),
-            default_st,
-        )
-        weight_map[name] = {
-            "index": slot_idx,
-            "shape": shape_list,
-            "dtype": tpu_lowering.dtype_spec(dt_str).weight_json_name,
-            "sharding": sharding_val,
-            "sources": resolved_sources,
-        }
-
-    with open(os.path.join(ckpt_dir, "weight.json"), "w") as f:
-        json.dump(weight_map, f, indent=2)
-
-
 def _emit_model_companion_files(
     cfg: api.TextOnlyLLMExportConfig, output_dir: str
 ) -> dict[str, Any]:
-    """Copies companion files into the artifact and returns the `serving_config` block.
+    """Copies companion files into the artifact; returns their `serving_config` entries.
 
-    `config.json` is always written. `tokenizer.json` and `generation_config.json` are
-    copied when the checkpoint has them and declared in `serving_config` by path.
+    `tokenizer.json` and `generation_config.json` are copied when the checkpoint has
+    them and declared in `serving_config` by path; the runtime reads no other file.
     """
-    src_config_copied = False
-    if cfg.hf_checkpoint_dir and os.path.isdir(cfg.hf_checkpoint_dir):
-        src_cfg = os.path.join(cfg.hf_checkpoint_dir, "config.json")
-        if os.path.isfile(src_cfg):
-            shutil.copyfile(src_cfg, os.path.join(output_dir, "config.json"))
-            src_config_copied = True
-
-    if not src_config_copied:
-        config_doc = {
-            "architectures": list(cfg.architectures),
-            "vocab_size": cfg.vocab_size,
-            "hidden_size": cfg.hidden_size,
-            "num_hidden_layers": cfg.num_layers,
-            "num_attention_heads": cfg.num_q_heads,
-            "num_key_value_heads": cfg.num_kv_heads,
-            "head_dim": cfg.head_dim,
-            "eos_token_id": cfg.eos_token_id,
-            "max_position_embeddings": cfg.max_model_len,
-        }
-        with open(os.path.join(output_dir, "config.json"), "w") as f:
-            json.dump(config_doc, f, indent=2)
-
-    serving_config: dict[str, Any] = {
-        "bucket_sizes": [int(b) for b in cfg.token_buckets],
-        "paged_attention": {
-            "block_size": cfg.block_size,
-            "max_num_seqs": cfg.max_num_seqs,
-            "max_num_pages": cfg.max_num_pages,
-        },
-    }
+    serving_config: dict[str, Any] = {}
 
     tokenizer_written = False
     if cfg.hf_checkpoint_dir and os.path.isdir(cfg.hf_checkpoint_dir):
@@ -564,12 +723,12 @@ def _emit_model_companion_files(
     return serving_config
 
 
+@trace("export.export")
 def export(
     model: api.ExportableTextOnlyLLM,
     output_dir: str,
     *,
     subdir: str = "subgraphs",
-    emit_weight_json: bool = True,
 ) -> None:
     """Exports an `ExportableTextOnlyLLM` to a serving artifact directory.
 
@@ -577,8 +736,6 @@ def export(
         model: The model to export.
         output_dir: Artifact directory; created if missing.
         subdir: Subdirectory of `output_dir` for `.mlir` files (default `'subgraphs'`).
-        emit_weight_json: When True, emits declarative `serving_checkpoint/weight.json`
-            from HF metadata without loading tensor data.
     """
     if not isinstance(model, api.ExportableTextOnlyLLM):
         raise TypeError(
@@ -596,12 +753,17 @@ def export(
     tp_size = cfg.tensor_parallel_size
     dp_size = int(getattr(cfg, "data_parallel_size", 1) or 1)
     pp_size = int(getattr(cfg, "pipeline_parallel_size", 1) or 1)
-    params_map = model.abstract_params()
+    params_map = _params_read_by_forward(model, model.abstract_params())
+    constant_names_fn = getattr(model, "constant_names", None)
+    constants = frozenset(
+        constant_names_fn() if callable(constant_names_fn) else ()
+    ) & frozenset(params_map)
+    layouts = _tensor_layouts(model, params_map, constants, _axis_sizes(cfg))
 
     os.makedirs(output_dir, exist_ok=True)
 
     abs_spec, weight_slots = _export_abstract_params(
-        params_map, output_dir, tp_size=tp_size, subdir=subdir
+        params_map, layouts, output_dir, constants=constants, subdir=subdir
     )
 
     functions_dict: dict[str, dict[str, Any]] = {
@@ -611,11 +773,19 @@ def export(
     }
 
     llm_funcs = _export_text_only_llm_functions(
-        model, params_map, weight_slots, output_dir, subdir=subdir
+        model,
+        params_map,
+        layouts,
+        weight_slots,
+        output_dir,
+        constants=constants,
+        subdir=subdir,
     )
     functions_dict.update(llm_funcs)
-    serving_config = _emit_model_companion_files(cfg, output_dir)
-    config_block = {
+    # `serving_config` holds only what the runtime reads: the capacities the
+    # executables were exported with, then the companion files. Token buckets are
+    # the `functions.forward` variants and are not repeated here.
+    serving_config = {
         "vocab_size": cfg.vocab_size,
         "eos_token_id": cfg.eos_token_id,
         "max_num_seqs": cfg.max_num_seqs,
@@ -627,40 +797,28 @@ def export(
         "tensor_parallel_size": tp_size,
         "pipeline_parallel_size": pp_size,
         "data_parallel_size": dp_size,
+        **_emit_model_companion_files(cfg, output_dir),
     }
 
     metadata_doc: dict[str, Any] = {
         "format_version": 2,
         "model_name": cfg.model_name,
         "target_tpu": cfg.target_tpu,
+        "mlir_shapes": _MLIR_SHAPES,
         "mesh": {
-            "mesh_shape": [
-                config_block["data_parallel_size"],
-                config_block["tensor_parallel_size"],
-            ],
-            "axis_names": ["dp", "tp"],
+            "mesh_shape": [dp_size, tp_size],
+            "axis_names": list(_AXIS_NAMES),
         },
-        "config": config_block,
+        "serving_config": serving_config,
         "compile_options": {
             "num_replicas": cfg.num_replicas,
             "num_partitions": cfg.num_partitions,
             "use_spmd_partitioning": cfg.use_spmd_partitioning,
         },
         "functions": functions_dict,
-        "serving_config": serving_config,
     }
 
     with open(os.path.join(output_dir, "metadata.json"), "w") as f:
         json.dump(metadata_doc, f, indent=2)
 
     validator.validate_exported_model_dir(output_dir)
-
-    if emit_weight_json:
-        _emit_declarative_weight_json(
-            model,
-            params_map,
-            weight_slots,
-            output_dir,
-            dp_size,
-            tp_size,
-        )

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import math
 import os
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -31,6 +32,7 @@ from vllm_torchtpu.experimental.export import (
     tpu_lowering,
     weight_mapper,
 )
+from vllm_torchtpu.experimental.export.trace import trace
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 
@@ -95,6 +97,21 @@ def _min_smem_page_size(
     return 1 << (min_page - 1).bit_length()
 
 
+def check_supported_parallelism(parallel_cfg: Any) -> tuple[int, int]:
+    """Returns `(dp, pp)` after rejecting data or pipeline parallel sizes above 1.
+
+    Takes a `ParallelConfig` or the parsed CLI arguments.
+    """
+    dp_size = int(getattr(parallel_cfg, "data_parallel_size", 1) or 1)
+    pp_size = int(getattr(parallel_cfg, "pipeline_parallel_size", 1) or 1)
+    if (dp_size, pp_size) != (1, 1):
+        raise NotImplementedError(
+            f"export supports only data/pipeline parallel size 1, got "
+            f"dp={dp_size} pp={pp_size}"
+        )
+    return dp_size, pp_size
+
+
 def resolve_hf_checkpoint_dir(model: str | None) -> str | None:
     """Returns the local checkpoint directory for a path or a cached Hub repo id.
 
@@ -119,6 +136,7 @@ def resolve_hf_checkpoint_dir(model: str | None) -> str | None:
     return os.path.dirname(config_path)
 
 
+@trace("export.build_export_config")
 def build_export_config_from_vllm(
     vllm_config: Any,
     *,
@@ -146,8 +164,7 @@ def build_export_config_from_vllm(
     )
 
     tp_size = int(getattr(parallel_cfg, "tensor_parallel_size", 1) or 1)
-    dp_size = int(getattr(parallel_cfg, "data_parallel_size", 1) or 1)
-    pp_size = int(getattr(parallel_cfg, "pipeline_parallel_size", 1) or 1)
+    dp_size, pp_size = check_supported_parallelism(parallel_cfg)
 
     if target_tpu is None:
         with contextlib.suppress(Exception):
@@ -245,14 +262,6 @@ def build_export_config_from_vllm(
     else:
         req_buckets = tuple(int(r) for r in req_buckets)
 
-    raw_archs = getattr(model_cfg, "architectures", None) or _extract_hf_field(
-        hf_cfg, "architectures", default=("LlamaForCausalLM",)
-    )
-    if isinstance(raw_archs, str):
-        architectures = (raw_archs,)
-    else:
-        architectures = tuple(str(a) for a in raw_archs) or ("LlamaForCausalLM",)
-
     rope_scaling = _extract_hf_field(
         hf_cfg, "rope_scaling", "rope_parameters", default=None
     )
@@ -265,7 +274,7 @@ def build_export_config_from_vllm(
         target_tpu=str(target_tpu),
         num_replicas=1,
         num_partitions=tp_size,
-        use_spmd_partitioning=tp_size > 1,
+        use_spmd_partitioning=True,
         data_parallel_size=dp_size,
         pipeline_parallel_size=pp_size,
         vocab_size=vocab_size,
@@ -282,7 +291,6 @@ def build_export_config_from_vllm(
         dtype=dtype_str,
         token_buckets=token_buckets,
         req_buckets=req_buckets,
-        architectures=architectures,
         emit_byte_tokenizer=False,
         hf_checkpoint_dir=str(resolved_hf_dir) if resolved_hf_dir else None,
         uses_mrope=uses_mrope,
@@ -305,39 +313,75 @@ def _create_single_device_tpu_mesh() -> Any:
     return None
 
 
+def init_export_distributed_environment(vllm_config: Any) -> None:
+    """Joins the process group the export launcher set up for this rank.
+
+    The launcher (`cli.main`) starts one worker per tensor-parallel rank and sets
+    `RANK`, `LOCAL_RANK`, `MASTER_ADDR` and `MASTER_PORT`; a single-device export
+    is the one-worker case.
+    """
+    from vllm.distributed import init_distributed_environment
+
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    world_size = vllm_config.parallel_config.tensor_parallel_size
+    init_distributed_environment(
+        world_size=world_size,
+        rank=int(os.environ["RANK"]),
+        local_rank=int(os.environ["LOCAL_RANK"]),
+        distributed_init_method="env://",
+        backend=TpuPlatform.get_worker_distributed_backend(world_size),
+    )
+
+
 def load_dummy_vllm_model(vllm_config: Any) -> nn.Module:
     """Loads a vLLM model with `load_format='dummy'` on TPU (zero disk weight IO)."""
-    import socket
+    return load_vllm_model(vllm_config, load_format="dummy")
 
+
+@trace("export.load_model")
+def create_export_vllm_config(args: Any) -> Any:
+    """Creates the `VllmConfig` an export runs with from parsed `EngineArgs`.
+
+    Prefix caching is off for hybrid recurrent models: the artifact keeps their
+    recurrent state per layer, which vLLM only prefix-caches in its unified KV
+    pool, and the serving runtime does its own prefix caching.
+    """
+    from vllm.engine.arg_utils import EngineArgs
+
+    engine_args = EngineArgs.from_cli_args(args)
+    if engine_args.create_model_config().is_hybrid:
+        engine_args.enable_prefix_caching = False
+    return engine_args.create_engine_config()
+
+
+def load_vllm_model(vllm_config: Any, *, load_format: str) -> nn.Module:
+    """Loads a vLLM model with `load_format`, running vLLM's weight processing.
+
+    The model is placed on TPU when one is available; on a host without one
+    (`PJRT_DEVICE=CPU`) it stays on CPU.
+    """
     import torch.distributed as dist
     from vllm.config import set_current_vllm_config
     from vllm.distributed import (
         ensure_model_parallel_initialized,
-        init_distributed_environment,
         model_parallel_is_initialized,
     )
     from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
     from vllm.model_executor.model_loader import get_model_loader
 
-    vllm_config.load_config.load_format = "dummy"
+    vllm_config.load_config.load_format = load_format
     if getattr(vllm_config, "device_config", None) is not None:
         with contextlib.suppress(Exception):
             vllm_config.device_config.device = torch.device("tpu")
 
     with set_current_vllm_config(vllm_config):
         if not dist.is_initialized():
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.bind(("127.0.0.1", 0))
-                port = sock.getsockname()[1]
-            init_distributed_environment(
-                world_size=1,
-                rank=0,
-                local_rank=0,
-                distributed_init_method=f"tcp://127.0.0.1:{port}",
-                backend="gloo",
-            )
+            init_export_distributed_environment(vllm_config)
         if not model_parallel_is_initialized():
-            ensure_model_parallel_initialized(1, 1)
+            ensure_model_parallel_initialized(
+                vllm_config.parallel_config.tensor_parallel_size, 1
+            )
 
         mesh = _create_single_device_tpu_mesh()
         with contextlib.ExitStack() as stack:
@@ -361,6 +405,12 @@ def load_dummy_vllm_model(vllm_config: Any) -> nn.Module:
                 vllm_config=vllm_config,
                 model_config=vllm_config.model_config,
             )
+            # Same step vLLM's executors run right after `load_model`: it picks
+            # the KV block size from the model's attention backend, which serving
+            # uses and which keeps the block table within SMEM.
+            from vllm.platforms import current_platform
+
+            current_platform.update_block_size_for_backend(vllm_config)
 
             with contextlib.suppress(Exception):
                 from vllm_torchtpu.layers.adapter.attention import (
@@ -376,6 +426,52 @@ def load_dummy_vllm_model(vllm_config: Any) -> nn.Module:
 
             model._export_tpu_mesh = mesh  # type: ignore[attr-defined]
             return model
+
+
+# Constant values are gathered from every rank to lay them out, so only small
+# buffers qualify.
+_MAX_CONSTANT_ELEMENTS = 4096
+
+
+def _is_recurrent_layer(layer: Any) -> bool:
+    """Whether `layer` keeps fixed-size recurrent state (e.g. GDN linear attention)."""
+    try:
+        from vllm.model_executor.layers.mamba.abstract import MambaBase
+    except ImportError:
+        return False
+    return isinstance(layer, MambaBase)
+
+
+def _recurrent_state_specs(
+    layer: Any, num_blocks: int, tp_size: int
+) -> list[api.ShapeDtypeStruct]:
+    """Device-local `[num_blocks, ...]` specs of a recurrent layer's two states.
+
+    `get_state_shape` gives one block's device-local shapes. The conv state is
+    split over the model axis along its channel dimension and the recurrent
+    state along its value heads, its first dimension.
+    """
+    from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+
+    conv_shape, recurrent_shape = layer.get_state_shape()
+    conv_dtype, recurrent_dtype = layer.get_state_dtype()
+    conv_channel_dim = 0 if is_conv_state_dim_first() else len(conv_shape) - 1
+    specs = []
+    for shape, dtype, split_dim in (
+        (conv_shape, conv_dtype, conv_channel_dim),
+        (recurrent_shape, recurrent_dtype, 0),
+    ):
+        sharding: list[str | None] = [None] * (len(shape) + 1)
+        if tp_size > 1:
+            sharding[split_dim + 1] = "model"
+        specs.append(
+            api.ShapeDtypeStruct(
+                shape=[num_blocks, *(int(d) for d in shape)],
+                dtype=tpu_lowering.dtype_name(dtype),
+                sharding=sharding,
+            )
+        )
+    return specs
 
 
 class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
@@ -405,6 +501,9 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                 "UniversalVllmExportableLLM requires either `model` or `vllm_config`"
             )
         self._vllm_config = vllm_config
+        # Load first: loading finalizes `cache_config.block_size`.
+        if model is None:
+            model = load_dummy_vllm_model(vllm_config)
         if export_config is None:
             if vllm_config is None:
                 raise ValueError(
@@ -412,8 +511,6 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                 )
             export_config = build_export_config_from_vllm(vllm_config)
         self._export_config = export_config
-        if model is None:
-            model = load_dummy_vllm_model(vllm_config)
         self._model = model
         self._patched_rope_modules = rope_patch.patch_in_graph_rotary_embedding(
             self._model
@@ -445,8 +542,71 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
     def export_config(self) -> api.TextOnlyLLMExportConfig:
         return self._export_config
 
+    @trace("export.fit_num_blocks")
+    def fit_num_blocks_to_hbm(
+        self,
+        gpu_memory_utilization: float,
+        kv_cache_memory_bytes: int | None = None,
+        devices: Sequence[Any] | None = None,
+    ) -> int:
+        """Sets `num_blocks` to the KV blocks that fit this rank's KV budget.
+
+        Same budget as `TPUWorker.determine_available_memory`: `kv_cache_memory_bytes`
+        when given, otherwise the HBM limit of `devices` (default: this rank's TPU)
+        times `gpu_memory_utilization`, minus the HBM already in use (the loaded
+        model). Export runs no profile pass, so activation scratch has to fit in the
+        headroom `gpu_memory_utilization` leaves. Collective: rank 0's artifact
+        serves every rank, so all ranks take the minimum.
+        """
+        from vllm_torchtpu import utils
+
+        if kv_cache_memory_bytes:
+            available = kv_cache_memory_bytes
+            limit_msg = f"--kv-cache-memory-bytes {kv_cache_memory_bytes}"
+        else:
+            if devices is None:
+                devices = [torch.device("tpu")]
+            budget = utils.compute_hbm_budget(devices, gpu_memory_utilization)
+            available = budget.available
+            limit_msg = (
+                f"{budget.total_used} bytes in use of {budget.cap} allowed by "
+                f"--gpu-memory-utilization {gpu_memory_utilization} "
+                f"({budget.total_limit} bytes total)"
+            )
+        num_blocks = self._export_config.num_blocks
+        kv_bytes = sum(
+            math.prod(s.shape) * tpu_lowering.torch_dtype(s.dtype).itemsize
+            for s in self.abstract_states()
+        )
+        fitted = max(available, 0) * num_blocks // kv_bytes
+        if (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+        ):
+            from vllm.distributed import get_world_group
+
+            t = torch.tensor([fitted], dtype=torch.int64)
+            torch.distributed.all_reduce(
+                t, op=torch.distributed.ReduceOp.MIN, group=get_world_group().cpu_group
+            )
+            fitted = int(t.item())
+        if fitted < 1:
+            raise ValueError(
+                f"no KV cache block ({kv_bytes // num_blocks} bytes) fits in the KV "
+                f"budget: {limit_msg}; raise the budget or pass --num-blocks"
+            )
+        self._export_config = dataclasses.replace(
+            self._export_config, num_blocks=fitted
+        )
+        return fitted
+
     def abstract_params(self) -> Mapping[str, api.ShapeDtypeStruct]:
-        """Builds abstract parameter specs from `self.model.named_parameters()`."""
+        """Builds abstract specs for the model's parameters and buffers.
+
+        Buffers are constants: not in the checkpoint, their per-rank values come
+        from `constant_axis_values`. The exporter keeps only the tensors that a
+        subgraph actually reads.
+        """
         params: dict[str, api.ShapeDtypeStruct] = {}
         tp_size = self._export_config.tensor_parallel_size
         named_params = list(self._model.named_parameters())
@@ -468,6 +628,15 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                 sharding=sharding,
             )
 
+        for name, buf in self._model.named_buffers():
+            params.setdefault(
+                name,
+                api.ShapeDtypeStruct(
+                    shape=tuple(int(d) for d in buf.shape),
+                    dtype=tpu_lowering.dtype_name(buf.dtype),
+                ),
+            )
+
         # Ensure lm_head.weight is present even when tied to embed_tokens.weight
         if "lm_head.weight" not in params:
             for cand in (
@@ -485,8 +654,33 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                     break
         return params
 
-    def _attention_layers(self) -> list[Any]:
-        """Returns the ordered attention layers of the wrapped model."""
+    def constant_names(self) -> set[str]:
+        """Names in `abstract_params()` that are buffers rather than parameters."""
+        params = {name for name, _ in self._model.named_parameters()}
+        return {name for name, _ in self._model.named_buffers() if name not in params}
+
+    def constant_axis_values(self, name: str) -> list[Any]:
+        """Values of buffer `name` on every tensor-parallel rank, in rank order.
+
+        Collective: every rank must call it for the same names in the same order.
+        """
+        from vllm.distributed import get_tp_group
+
+        buf = dict(self._model.named_buffers())[name]
+        if buf.numel() > _MAX_CONSTANT_ELEMENTS:
+            raise ValueError(
+                f"buffer {name} has {buf.numel()} elements; constants are limited "
+                f"to {_MAX_CONSTANT_ELEMENTS}"
+            )
+        local = buf.detach().cpu().flatten().tolist()
+        value = local[0] if buf.dim() == 0 else local
+        group = get_tp_group()
+        values: list[Any] = [None] * group.world_size
+        torch.distributed.all_gather_object(values, value, group=group.cpu_group)
+        return values
+
+    def _named_attention_layers(self) -> list[tuple[str, Any]]:
+        """Returns the ordered `(layer name, layer)` attention layers of the model."""
         if self._vllm_config is not None:
             with contextlib.suppress(Exception):
                 from vllm.model_executor.layers.attention_layer_base import (
@@ -494,46 +688,93 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                 )
 
                 ctx = self._vllm_config.compilation_config.static_forward_context
-                layers = [m for m in ctx.values() if isinstance(m, AttentionLayerBase)]
+                layers = [
+                    (n, m) for n, m in ctx.items() if isinstance(m, AttentionLayerBase)
+                ]
                 if layers:
                     return layers
         return [
-            m
-            for _, m in self._model.named_modules()
+            (n, m)
+            for n, m in self._model.named_modules()
             if hasattr(m, "kv_cache") and isinstance(m.kv_cache, list)
         ]
 
-    def abstract_states(self) -> Sequence[api.ShapeDtypeStruct]:
-        """Returns per-layer KV cache specs matching the active attention backend."""
+    def _attention_layers(self) -> list[Any]:
+        """Returns the ordered attention layers of the wrapped model."""
+        return [m for _, m in self._named_attention_layers()]
+
+    def _has_recurrent_layers(self) -> bool:
+        return any(_is_recurrent_layer(m) for m in self._attention_layers())
+
+    def _layer_state_specs(self) -> list[list[api.ShapeDtypeStruct]] | None:
+        """The state tensors of each attention layer, or None if any is unknown.
+
+        A paged attention layer holds one KV cache; a recurrent (GDN) layer holds
+        its conv and recurrent states, `[num_blocks, ...]` each and indexed by the
+        `mamba_state_indices` block of each request.
+        """
         cfg = self._export_config
         act_dtype_str = tpu_lowering.dtype_name(cfg.dtype)
         attn_layers = self._attention_layers()
-        if attn_layers:
-            with contextlib.suppress(Exception):
-                from vllm_torchtpu.layers.adapter.attention import (
-                    PallasAttentionBackend,
-                    PallasAttentionBackendImpl,
+        if not attn_layers:
+            return None
+        try:
+            from vllm_torchtpu.layers.adapter.attention import (
+                PallasAttentionBackend,
+                PallasAttentionBackendImpl,
+            )
+        except Exception:
+            return None
+        per_layer: list[list[api.ShapeDtypeStruct]] = []
+        for layer in attn_layers:
+            impl = getattr(layer, "impl", None)
+            if isinstance(impl, PallasAttentionBackendImpl):
+                # An fp8 KV cache (`--kv-cache-dtype fp8`) stores quantized KV.
+                kv_dtype = getattr(
+                    impl, "kv_cache_quantized_dtype", None
+                ) or tpu_lowering.torch_dtype(act_dtype_str)
+                kv_shape = PallasAttentionBackend.get_kv_cache_shape(
+                    cfg.num_blocks,
+                    cfg.block_size,
+                    impl.num_kv_heads,
+                    impl.head_size,
+                    kv_dtype,
                 )
+                per_layer.append(
+                    [
+                        api.ShapeDtypeStruct(
+                            shape=tuple(int(d) for d in kv_shape),
+                            dtype=tpu_lowering.dtype_name(kv_dtype),
+                        )
+                    ]
+                )
+            elif _is_recurrent_layer(layer):
+                per_layer.append(
+                    _recurrent_state_specs(
+                        layer, cfg.num_blocks, cfg.tensor_parallel_size
+                    )
+                )
+            else:
+                return None
+        return per_layer
 
-                specs: list[api.ShapeDtypeStruct] = []
-                for layer in attn_layers:
-                    impl = getattr(layer, "impl", None)
-                    if isinstance(impl, PallasAttentionBackendImpl):
-                        kv_shape = PallasAttentionBackend.get_kv_cache_shape(
-                            cfg.num_blocks,
-                            cfg.block_size,
-                            impl.num_kv_heads,
-                            impl.head_size,
-                            tpu_lowering.torch_dtype(act_dtype_str),
-                        )
-                        specs.append(
-                            api.ShapeDtypeStruct(
-                                shape=tuple(int(d) for d in kv_shape),
-                                dtype=act_dtype_str,
-                            )
-                        )
-                if len(specs) == cfg.num_layers:
-                    return specs
+    def extra_user_inputs(self) -> list[tuple[str, tuple[int, ...]]]:
+        """Control inputs beyond the standard six that `forward` takes.
+
+        Recurrent layers read each request's state block from
+        `mamba_state_indices`.
+        """
+        if self._has_recurrent_layers():
+            return [("mamba_state_indices", (self._export_config.max_num_seqs,))]
+        return []
+
+    def abstract_states(self) -> Sequence[api.ShapeDtypeStruct]:
+        """Returns the state tensors of every attention layer, in layer order."""
+        cfg = self._export_config
+        act_dtype_str = tpu_lowering.dtype_name(cfg.dtype)
+        per_layer = self._layer_state_specs()
+        if per_layer is not None:
+            return [spec for specs in per_layer for spec in specs]
 
         default_kv_shape = (
             cfg.num_blocks,
@@ -580,16 +821,32 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             for k, v in weights.items():
                 if k.startswith(prefix):
                     call_weights[k[len(prefix) :]] = v
-                elif k != "lm_head.weight":
+                elif not k.startswith("lm_head."):
                     call_weights[k] = v
         else:
-            call_weights = {k: v for k, v in weights.items() if k != "lm_head.weight"}
+            call_weights = {
+                k: v for k, v in weights.items() if not k.startswith("lm_head.")
+            }
 
-        attn_layers = self._attention_layers()
+        named_layers = self._named_attention_layers()
+        attn_layers = [m for _, m in named_layers]
         working_kvs = list(kv_caches)
-        if len(attn_layers) == len(working_kvs):
+        per_layer = self._layer_state_specs()
+        # Each recurrent layer binds its `[conv_state, recurrent_state]` list.
+        layer_kvs: list[list[Any]] | None = None
+        if per_layer is not None and sum(map(len, per_layer)) == len(working_kvs):
+            it = iter(working_kvs)
+            layer_kvs = [[next(it) for _ in specs] for specs in per_layer]
+            for layer, bufs in zip(attn_layers, layer_kvs, strict=True):
+                layer.kv_cache = bufs if _is_recurrent_layer(layer) else bufs[0]
+        elif len(attn_layers) == len(working_kvs):
             for layer, kv_buf in zip(attn_layers, working_kvs, strict=True):
                 layer.kv_cache = kv_buf
+        forward_metadata: Any = attn_metadata
+        if any(_is_recurrent_layer(m) for m in attn_layers):
+            # Recurrent layers look their metadata up by layer name, as the
+            # runner's per-layer metadata provides it.
+            forward_metadata = {name: attn_metadata for name, _ in named_layers}
 
         def _invoke_backbone() -> tuple[Sequence[Any], Any]:
             use_func = bool(call_weights) and all(
@@ -614,7 +871,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                             "input_ids": input_ids,
                             "positions": positions,
                             "kv_caches": working_kvs,
-                            "attn_metadata": attn_metadata,
+                            "attn_metadata": forward_metadata,
                         }
                     )
                 except TypeError:
@@ -623,16 +880,29 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                 if prev_do_not_compile is not None:
                     backbone.do_not_compile = prev_do_not_compile
 
-            updated_kvs = (
-                [
+            if layer_kvs is not None:
+                updated_kvs = [
+                    buf
+                    for layer in attn_layers
+                    for buf in (
+                        layer.kv_cache
+                        if _is_recurrent_layer(layer)
+                        else [
+                            layer.kv_cache[0]
+                            if isinstance(layer.kv_cache, list)
+                            else layer.kv_cache
+                        ]
+                    )
+                ]
+            elif len(attn_layers) == len(working_kvs):
+                updated_kvs = [
                     layer.kv_cache[0]
                     if isinstance(layer.kv_cache, list)
                     else layer.kv_cache
                     for layer in attn_layers
                 ]
-                if len(attn_layers) == len(working_kvs)
-                else working_kvs
-            )
+            else:
+                updated_kvs = working_kvs
             if (
                 isinstance(out, tuple)
                 and len(out) == 2
@@ -661,7 +931,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                         )
                 stack.enter_context(
                     set_forward_context(
-                        attn_metadata, self._vllm_config, num_tokens=num_tokens
+                        forward_metadata, self._vllm_config, num_tokens=num_tokens
                     )
                 )
                 return _invoke_backbone()
@@ -672,7 +942,21 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         hidden_states: torch.Tensor,
         lm_head_weight: torch.Tensor,
     ) -> torch.Tensor:
-        """Projects `hidden_states[R, hidden_size]` to `logits[R, vocab_size]`."""
+        """Projects `hidden_states[R, hidden_size]` to `logits[R, vocab_size]`.
+
+        Each rank holds one vocabulary shard of `lm_head_weight`; the shards are
+        gathered and the vocabulary padding dropped, so every rank returns the full
+        vocabulary (at tensor parallel size 1 the gather returns its input).
+        """
+        from vllm.distributed import tensor_model_parallel_all_gather
+
+        local = self._local_logits(hidden_states, lm_head_weight)
+        gathered = tensor_model_parallel_all_gather(local, dim=-1)
+        return gathered[..., : self._export_config.vocab_size]
+
+    def _local_logits(
+        self, hidden_states: torch.Tensor, lm_head_weight: torch.Tensor
+    ) -> torch.Tensor:
         lm_head_mod = getattr(self._model, "lm_head", None)
         if isinstance(lm_head_mod, nn.Module) and hasattr(lm_head_mod, "weight"):
             with contextlib.suppress(Exception):
