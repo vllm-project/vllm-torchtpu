@@ -78,6 +78,11 @@ def rotary_embedding_wan_forward(
     """Drop-in ``RotaryEmbeddingWan.forward`` for bf16 interleaved half-dim tables."""
     if not (self.interleaved and self.half_head_dim) or x.dtype != torch.bfloat16:
         return self._forward_method(x, cos, sin)
+    # vLLM-Omni 0.32 (vllm-omni#8112) lets callers such as LingBot-World pass
+    # (tokens, D/2) tables; expand them to (1, S, 1, D/2) as forward_native does.
+    if cos.dim() == 2:
+        cos = cos.unsqueeze(0).unsqueeze(2)
+        sin = sin.unsqueeze(0).unsqueeze(2)
     return apply_rotary_pair_swap(x, cos, sin)
 
 

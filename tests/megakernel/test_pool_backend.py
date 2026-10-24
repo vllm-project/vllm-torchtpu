@@ -131,6 +131,13 @@ def test_ckpt_bounds_rejects_out_of_range_and_shared_slots():
         pool.check_ckpt_bounds(
             ckpt.at[1, 0, 0].set(ckpt[0, 0, 0]), cache_exec(ex).num_pages, lay
         )
+    # Null slot 0 on an inactive/padded sequence is allowed under act_mode="all".
+    pool.check_ckpt_bounds(
+        ckpt.at[:, 1, :].set(0),
+        cache_exec(ex).num_pages,
+        lay,
+        act_mode="all",
+    )
 
 
 def test_resolve_active_seqs_modes():

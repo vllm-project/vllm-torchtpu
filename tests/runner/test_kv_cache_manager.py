@@ -271,6 +271,34 @@ class TestKVCacheManager:
         assert self.runner._mamba_num_blocks == 17
         assert self.runner.cache_config.num_gpu_blocks_override == 2358467
 
+    @patch(
+        "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",
+        return_value=67584,
+    )
+    @patch(
+        "vllm_torchtpu.utils.torch.accelerator.get_memory_info",
+        return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024),
+    )
+    def test_update_mamba_page_size_padded_uses_updated_cache_config_block_size(
+        self, mock_mem_info, mock_get_page_size
+    ):
+        # Simulate update_block_size_for_backend raising cache_config.block_size
+        # after TPUModelRunner.__init__ captured self.runner.block_size = 16.
+        self.runner.block_size = 16
+        self.runner.vllm_config.cache_config.block_size = 264
+
+        layers = {}
+        mock_attn = _attention_layer_mock()
+        mock_attn.num_kv_heads = 2
+        mock_attn.head_size = 128
+        layers["attn_0"] = mock_attn
+        for i in range(3):
+            layers[f"mamba_{i}"] = DummyMamba()
+
+        self.runner.kv_cache_manager._update_mamba_page_size_padded(layers)
+
+        mock_get_page_size.assert_called_once_with(264, 2, 128, torch.bfloat16)
+
     def test_available_kv_cache_hbm_is_min_across_ep_dp(self, monkeypatch):
         """Pinned block counts must be sized from the DP-wide minimum budget."""
         local, peer = 7 * utils.GBYTES, 6 * utils.GBYTES
