@@ -2347,7 +2347,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             # o_proj (W_O_dcp_qrep), the others o_proj itself, as with the flag
             # off. Each side also lifts the other's weights, as the bucket
             # warmup requires (_retain_buffers: no data is read).
-            s_o = self.mla_attn.W_O_dcp_qrep_scale
+            s_o = cast(torch.Tensor, self.mla_attn.W_O_dcp_qrep_scale)
             assert s_o is not None
             if isinstance(attn_out, torch.Tensor):  # merged
                 attn_out = _retain_buffers(attn_out, w_o, s_o)
@@ -2366,8 +2366,8 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 out = outs[0] if len(outs) == 1 else torch.cat(outs)
                 return _retain_buffers(
                     out,
-                    self.o_proj.weight,
-                    self.o_proj.weight_scale,
+                    cast(torch.Tensor, self.o_proj.weight),
+                    cast(torch.Tensor, self.o_proj.weight_scale),
                     getattr(self.o_proj, FP8_PALLAS_WEIGHT, None),
                     getattr(self.o_proj, FP8_PALLAS_SCALE, None),
                 )
