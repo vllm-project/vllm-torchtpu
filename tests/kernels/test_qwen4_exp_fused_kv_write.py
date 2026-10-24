@@ -248,3 +248,50 @@ def test_rings_stay_on_separate_writer(interpret, monkeypatch):
     run(monkeypatch, True, args, main_slot=1, max_query_len=4)
     assert len(fused_ids) == 1
     assert len(ring_calls) == 1
+
+
+@pytest.mark.parametrize("layout", ["fp8_paired_slot1_packed_k", "bf16_whole_rows"])
+@pytest.mark.parametrize("case", sorted(CASES))
+def test_shard_select_with_fused_write_matches_separate_writers(
+    interpret, monkeypatch, case, layout
+):
+    """VLLM_TPU_QSA_INDEXER_SHARD with the fused writer: each rank's shard
+    select step writes the pool exactly as the separate writers do."""
+
+    def no_selection(query, *args, block_topk, shard=None, **kwargs):
+        blocks = jnp.zeros((len(query), block_topk), jnp.int32)
+        if shard is None:
+            return blocks
+        return jnp.stack([blocks, blocks], -1)
+
+    calls = []
+    original = fused_kv_write.fused_layer_write
+
+    def recording(*args, **kwargs):
+        calls.append(len(kwargs["main_rows"]))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(pooled_qsa, "select_blocks", no_selection)
+    monkeypatch.setattr(pooled_qsa, "fused_layer_write", recording)
+    jax.clear_caches()
+    dtype, options = LAYOUTS[layout]
+    query_lens, contexts = CASES[case]
+    args = make_step(np.random.default_rng(7), query_lens, contexts, dtype)
+    options = {**options, "max_query_len": max(query_lens)}
+    base_pool, _, _ = run(monkeypatch, False, args, **options)
+    monkeypatch.setattr(envs, "VLLM_TPU_QSA_FUSED_KV_WRITE", True)
+    for rank in range(2):
+        pool = jax.jit(
+            lambda *a, rank=rank: pooled_qsa.pooled_qsa_shard_select_step(
+                *a,
+                compress_ratio=RATIO,
+                token_topk=TOPK,
+                norm_eps=1e-6,
+                rotary_dim=ROTARY,
+                shard_rank=rank,
+                shard_size=2,
+                **options,
+            )
+        )(*args)[0]
+        np.testing.assert_array_equal(raw(pool), raw(base_pool))
+    assert len(calls) == 2  # one fused write per rank's trace
