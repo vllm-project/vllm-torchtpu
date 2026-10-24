@@ -63,7 +63,11 @@ def _parse_memo_mode(value: str | None) -> str:
     return "check" if v == "check" else "1"
 
 
-_MEMO_MODE = _parse_memo_mode(os.environ.get("VLLM_TPU_T3_GUARD_MEMO"))
+# VLLM_TPU_T3_HOST=1 is the master switch for the IX track-3 host trims; an
+# explicit VLLM_TPU_T3_GUARD_MEMO wins over it.
+_MEMO_MODE = _parse_memo_mode(
+    os.environ.get("VLLM_TPU_T3_GUARD_MEMO", os.environ.get("VLLM_TPU_T3_HOST"))
+)
 _MEMO_STATS = {"hit": 0, "store": 0, "check_ok": 0, "check_mismatch": 0, "nokey": 0}
 _MEMO_MAX_ENTRIES = 64
 _MEMO_MAX_SEQ = 16
