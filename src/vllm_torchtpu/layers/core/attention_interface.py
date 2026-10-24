@@ -864,6 +864,20 @@ def mla_attention(
     return kv_cache, output_TNA
 
 
+def sparse_mla_chunk_loop_options() -> dict:
+    """The sparse MLA chunk loop's fori options (TPU_MLA_SPARSE_CHUNK_FORI*).
+
+    Empty when the loop is off, so the kernel and router keep their defaults
+    and the program is unchanged.
+    """
+    if not envs.TPU_MLA_SPARSE_CHUNK_FORI:
+        return {}
+    return dict(
+        fori_min_chunks=envs.TPU_MLA_SPARSE_CHUNK_FORI_MIN_CHUNKS,
+        fori_unroll=envs.TPU_MLA_SPARSE_CHUNK_FORI_UNROLL,
+    )
+
+
 def sparse_mla_attention(
     ql_nope: jax.Array,
     q_pe: jax.Array,
@@ -967,6 +981,7 @@ def sparse_mla_attention(
         )
     cache_layout = nope_spec.layout.value
     chunk_kwargs = sparse_mla_chunk_kwargs()
+    fori_options = sparse_mla_chunk_loop_options()
 
     def _sparse_mla_ragged_paged_attention(
         ql_nope,
@@ -1009,6 +1024,7 @@ def sparse_mla_attention(
                 request_distribution_,
                 sm_scale=sm_scale or 1.0,
                 k_scale=dequant_scale,
+                **fori_options,
             )
             return output, kv_cache_nope, kv_cache_rope
 
@@ -1025,6 +1041,7 @@ def sparse_mla_attention(
             k_scale=dequant_scale,
             cache_layout=cache_layout,
             **chunk_kwargs,
+            **fori_options,
         )
 
         lkv_dim = ql_nope.shape[-1]

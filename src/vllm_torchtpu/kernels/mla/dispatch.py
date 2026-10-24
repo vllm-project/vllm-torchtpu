@@ -257,26 +257,46 @@ def select_tier(
     return jnp.argmin(costs).astype(jnp.int32)
 
 
-def _sparse_prefix(q, split_token, run_chunk):
+def _sparse_prefix(q, split_token, run_chunk, caches, **loop_options):
     """Sparse attention for query rows `[0, split_token)`, in place.
 
-    `run_chunk` must preserve rows at or after `token_end`: they still hold
-    queries for the masked-dense suffix.
+    `run_chunk(q, start_pos, chunk_size, token_end, caches)` must preserve rows
+    at or after `token_end`: they still hold queries for the masked-dense
+    suffix.
 
     A split always leaves at least `MASKED_DENSE_MIN_SUFFIX_TOKENS` suffix
     rows, so chunks starting in that tail are not emitted. Earlier chunks are
-    skipped on device once they start past the split.
+    skipped on device once they start past the split. `loop_options` are
+    `sparse_kernel.run_chunk_loop`'s fori options.
     """
-    num_rows = q.shape[0]
     chunk_size = sparse_kernel.DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE
-    for start_pos in range(0, num_rows - MASKED_DENSE_MIN_SUFFIX_TOKENS, chunk_size):
-        q = jax.lax.cond(
+    num_starts = -(-max(q.shape[0] - MASKED_DENSE_MIN_SUFFIX_TOKENS, 0) // chunk_size)
+
+    def step(start_pos, size, q, caches):
+        return jax.lax.cond(
             start_pos < split_token,
-            functools.partial(run_chunk, start_pos=start_pos, token_end=split_token),
+            functools.partial(
+                run_chunk,
+                start_pos=start_pos,
+                chunk_size=size,
+                token_end=split_token,
+                caches=caches,
+            ),
             lambda x: x,
             q,
         )
-    return q
+
+    # Crop the last chunk to the query rows, as the unrolled loop did. With a
+    # suffix minimum under one chunk the rounded-up starts run past the rows,
+    # and the chunk kernel cannot reshape a gather of fewer rows than its size.
+    return sparse_kernel.run_chunk_loop(
+        min(num_starts * chunk_size, q.shape[0]),
+        chunk_size,
+        step,
+        q,
+        caches,
+        **loop_options,
+    )
 
 
 def attention_from_parts(
@@ -292,13 +312,17 @@ def attention_from_parts(
     *,
     sm_scale: float,
     k_scale: float,
+    fori_min_chunks: int | None = None,
+    fori_unroll: int = 1,
 ) -> jax.Array:
     """MLA attention for a call `applies` accepted.
 
     Returns `[tokens, heads, ql_nope.shape[-1]]`. Each route concatenates the
     query parts and crops its own output: under the torch-tpu lowering an array
     crossing a `lax.switch`/`lax.cond` boundary is copied, so the full-width
-    query and output stay inside the routes.
+    query and output stay inside the routes. `fori_min_chunks` / `fori_unroll`
+    are the sparse kernel's chunk-loop options (`run_chunk_loop`), applied to
+    the sparse route and the sparse prefix alike.
     """
     num_rows, num_heads, latent_width = ql_nope.shape
     chunk_size = sparse_kernel.DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE
@@ -319,16 +343,22 @@ def attention_from_parts(
         total_num_pages=kv_cache_nope.shape[0],
     )
 
-    def sparse_chunk(q, start_pos, token_end, *, preserve_suffix=False):
+    loop_options = dict(fori_min_chunks=fori_min_chunks, fori_unroll=fori_unroll)
+
+    def sparse_chunk(
+        q, start_pos, chunk_size, token_end, caches, *, preserve_suffix=False
+    ):
+        nope, rope = caches
         return sparse_kernel.sparse_attention_chunk(
             q,
-            kv_cache_nope,
-            kv_cache_rope,
+            nope,
+            rope,
             kv_lens,
             physical_indices,
             None,
             start_pos=start_pos,
-            end_pos=min(start_pos + chunk_size, num_rows),
+            end_pos=start_pos + chunk_size,
+            chunk_size=chunk_size,
             token_end=token_end,
             sm_scale=sm_scale,
             k_scale=k_scale,
@@ -356,8 +386,16 @@ def attention_from_parts(
     def sparse_route():
         q = query()
         token_end = query_start_loc[request_distribution[2]]
-        for start_pos in range(0, num_rows, chunk_size):
-            q = sparse_chunk(q, start_pos, token_end)
+        q = sparse_kernel.run_chunk_loop(
+            num_rows,
+            chunk_size,
+            lambda start, size, q, caches: sparse_chunk(
+                q, start, size, token_end, caches
+            ),
+            q,
+            (kv_cache_nope, kv_cache_rope),
+            **loop_options,
+        )
         return crop(q)
 
     def masked_dense_route(limit, max_kv_len):
@@ -371,6 +409,8 @@ def attention_from_parts(
                 query(),
                 query_start_loc[split_seq],
                 functools.partial(sparse_chunk, preserve_suffix=True),
+                (kv_cache_nope, kv_cache_rope),
+                **loop_options,
             )
             return crop(masked_dense(q, max_kv_len, split_seq))
 
