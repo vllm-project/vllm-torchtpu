@@ -32,6 +32,8 @@ test's choosing; ``test_the_mesh_axis_name_is_the_one_the_kernel_reads`` pins
 that constraint, which the layer's own signature does not state.
 """
 
+import re
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -1003,3 +1005,105 @@ def test_fp4_agrees_across_every_weight_schedule(at_prefetch_depth):
             deepest,
             err_msg=f"depth {depth} disagrees with the deepest schedule",
         )
+
+
+# --------------------------------------------------------------------------- #
+# Progressive push. A build with the HBM contribution slab used to send an
+# expert's results only after its last tile; the progressive build sends each
+# (expert, dest) run as soon as the tiles holding it are committed. Only WHEN a
+# run leaves changes -- the same rows land in the same place, counted on the
+# same semaphores -- so the two builds have to agree bit for bit.
+# --------------------------------------------------------------------------- #
+
+# Two experts a shard and 2048 tokens at top 4 put about 512 rows on an
+# expert: four tiles of CAPACITY, so the tile loop pushes the runs that end two
+# tiles back and the last two tiles' runs go out after it. The slab (8192 rows
+# a shard) is past the VMEM-push bound of EP * 2 * CAPACITY = 2048, so this
+# shape builds the slab path the progressive push applies to.
+PUSH = dict(hidden=1024, inter=512, e_total=16, topk=4, tokens=2048)
+
+# kernel.py ends every fused kernel's name with _g{g_local}_c{capacity}_nb{nbuf}
+# and adds _pp to a progressive build's.
+KERNEL_NAME = re.compile(r"fused_ep_moe_v2[A-Za-z0-9_]*?_g\d+_c\d+_nb\d+")
+
+
+@pytest.fixture
+def with_progressive_push(monkeypatch):
+    """Build with `kernel.PROGRESSIVE_PUSH` set, from scratch each time.
+
+    The switch is read while the kernel is traced, so all three caches between
+    it and the program have to go: the kernel build memo, the layer's
+    shard_map memo (whose key does not carry the switch; see
+    `at_prefetch_depth`), and jax's own trace cache.
+    """
+
+    def clear():
+        kernel._BUILD_CACHE.clear()
+        layer._LAYER_SM_CACHE.clear()
+        jax.clear_caches()
+
+    def at(on):
+        monkeypatch.setattr(kernel, "PROGRESSIVE_PUSH", on)
+        clear()
+
+    yield at
+    clear()
+
+
+def test_progressive_push_is_bit_exact_with_the_end_of_expert_push(
+    with_progressive_push,
+):
+    """The progressive push changes when runs are sent, never what arrives.
+
+    The kernel names are checked so the agreement is not vacuous: had both
+    builds come out as the same program, they would agree trivially. The band
+    against the dense reference stops two identically broken builds from
+    passing.
+    """
+    mesh = _mesh()
+    w1, w2, w1_scale, w2_scale = _make_weights(
+        mesh,
+        46,
+        hidden=PUSH["hidden"],
+        inter=PUSH["inter"],
+        e_total=PUSH["e_total"],
+        weight_format=WeightFormat.FP8,
+    )
+    x, gating = _make_inputs(
+        mesh, 47, tokens=PUSH["tokens"], hidden=PUSH["hidden"], e_total=PUSH["e_total"]
+    )
+
+    def run(*args):
+        return fused_ep_moe_v2(
+            *args,
+            topk=PUSH["topk"],
+            renormalize=True,
+            mesh=mesh,
+            capacity=CAPACITY,
+            weight_format=WeightFormat.FP8,
+        )
+
+    args = (x, w1, w2, w1_scale, w2_scale, gating)
+    outs, names = {}, {}
+    for on in (False, True):
+        with_progressive_push(on)
+        names[on] = set(KERNEL_NAME.findall(jax.jit(run).lower(*args).as_text()))
+        outs[on] = np.asarray(run(*args))
+
+    assert len(names[False]) == 1 and len(names[True]) == 1, names
+    (end_of_expert,), (progressive,) = names[False], names[True]
+    assert "_pp" not in end_of_expert, end_of_expert
+    assert "_pp" in progressive, progressive
+
+    np.testing.assert_array_equal(
+        outs[True],
+        outs[False],
+        err_msg="the progressive push changed the layer's output",
+    )
+    want = _dense_reference(
+        mesh, x, w1, w2, w1_scale, w2_scale, gating, topk=PUSH["topk"]
+    )
+    error = _relative_l2(outs[True], want)
+    worst = _worst_token_relative_l2(outs[True], want)
+    assert error < FP8_RELATIVE_BOUND, f"relative L2 {error}"
+    assert worst < FP8_TOKEN_BOUND, f"worst token {worst}"
