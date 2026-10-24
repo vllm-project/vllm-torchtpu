@@ -66,16 +66,19 @@ MAX_ROWS = 8  # batch rows of an unchunked call; a larger batch runs in chunks (
 HOST_LANES = 8  # DCP ranks per host (rank = host * 8 + lane)
 
 
-def chunk_layout(batch: int, heads: int = HEADS_PER_RANK, *, chunk_rows: int | None = None) -> tuple[int, int]:
+def chunk_layout(batch: int, heads: int = HEADS_PER_RANK, *, chunk_rows: int | None = None,
+                 ring: int | None = None) -> tuple[int, int]:
     """``(chunk rows, ring slots)`` of a chunked call (``batch > MAX_ROWS``):
     8-row chunks at B16/B32/B48/B64 (amortizing exchanges), else 4 (also
     attention DP2's B128: 64 group rows of six heads, for VMEM); ring slots
     4 at B32 with three heads per rank, 3 for 8-row chunks, else 2
     (``persistent_scratch`` uses 4 for FP8 query packets). ``chunk_rows``
-    overrides the width and keeps at least three slots for a staged combine."""
+    overrides the width and keeps at least three slots for a staged combine;
+    ``ring`` overrides the slot count."""
     wide = batch <= 16 or batch in (32, 48, 64) and not (batch == 64 and heads == 6)
     rows = chunk_rows if chunk_rows is not None else 8 if wide else 4
-    ring = 4 if batch == 32 and heads == HEADS_PER_RANK else 3 if wide or chunk_rows is not None else 2
+    if ring is None:
+        ring = 4 if batch == 32 and heads == HEADS_PER_RANK else 3 if wide or chunk_rows is not None else 2
     if rows not in (4, 8) or batch % rows or rows > MAX_ROWS or ring not in (2, 3, 4):
         raise ValueError(f"DCP chunks: {rows} rows must divide the batch {batch} (<= {MAX_ROWS}), ring 2, 3 or 4")
     return rows, ring
@@ -246,7 +249,7 @@ def _grouped_spec(batch, group, heads, sequence_rows):
 
 def persistent_scratch(batch, group=GROUP, heads=HEADS_PER_RANK, *,
                        cache_dtype=jnp.bfloat16, sequence_rows=1, fp8_wire=False, force_chunks=False,
-                       chunk_rows=None):
+                       chunk_rows=None, ring=None):
     # Send the receiver's identical FP8 operand and lossless FP32 scale
     # (``fp8_wire``: for any shape, e.g. the MLA DSpark draft's two heads).
     # Plain attention DP2 holds six heads for B/2 rows. Speculative attention
@@ -258,7 +261,7 @@ def persistent_scratch(batch, group=GROUP, heads=HEADS_PER_RANK, *,
                    and (plain or fp8_wire or _grouped_spec(batch, group, heads, sequence_rows))
                    else jnp.bfloat16)
     if chunked(batch, force_chunks):
-        chunk, ring = chunk_layout(batch, heads, chunk_rows=chunk_rows)
+        chunk, ring = chunk_layout(batch, heads, chunk_rows=chunk_rows, ring=ring)
         rows = packet_layout(batch, heads)[0] * chunk
         if query_dtype == jnp.uint8 and not (group == 16 and sequence_rows > 1):
             # The smaller query buffers make two-chunk lookahead fit at B64.
