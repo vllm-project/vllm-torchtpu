@@ -89,6 +89,7 @@ def _rpa_attention_batch(
     lean_fetch=False,
     slot_read=False,
     compact=False,
+    fast_fetch=False,
 ):
     from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
 
@@ -142,7 +143,8 @@ def _rpa_attention_batch(
         prefill_block_sizes=prefill,
         # virtual_page_metadata makes every row a decode row.
         decode_only=decode_only,
-        lean_kv_fetch=lean_fetch,
+        lean_kv_fetch=lean_fetch or fast_fetch,
+        fast_kv_fetch=fast_fetch,
         kv_slot=kv_slot,
         compact_kv_schedule=compact,
     )
@@ -193,6 +195,7 @@ def rpa_attention(
     lean_fetch=False,
     slot_read=False,
     compact=False,
+    fast_fetch=False,
 ):
     batch_size = rpa_query_batch_size(blocks.shape[1] + 1)
     attend = functools.partial(
@@ -204,6 +207,7 @@ def rpa_attention(
         **({"decode_only": True} if decode_only else {}),
         **({"lean_fetch": True} if lean_fetch else {}),
         **({"slot_read": True} if slot_read else {}),
+        **({"fast_fetch": True} if fast_fetch else {}),
         **(
             dict(
                 compact=True,
@@ -398,6 +402,8 @@ def _decode_attention(
         options["lean_fetch"] = True
     if envs.VLLM_TPU_QSA_DECODE_SLOT_READ:
         options["slot_read"] = True
+    if envs.VLLM_TPU_QSA_DECODE_FAST_FETCH:
+        options["fast_fetch"] = True
     if envs.VLLM_TPU_QSA_DECODE_COMPACT_SCHEDULE:
         options["compact"] = True
 

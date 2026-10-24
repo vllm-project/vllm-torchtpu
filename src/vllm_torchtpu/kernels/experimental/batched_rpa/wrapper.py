@@ -512,6 +512,7 @@ def calculate_block_sizes(
         "mask_invalid_v",
         "decode_only",
         "lean_kv_fetch",
+        "fast_kv_fetch",
         "kv_slot",
         "compact_kv_schedule",
     ),
@@ -559,6 +560,7 @@ def ragged_paged_attention(
     mask_invalid_v: bool | None = None,
     decode_only: bool = False,
     lean_kv_fetch: bool = False,
+    fast_kv_fetch: bool = False,
     kv_slot: int | None = None,
     compact_kv_schedule: bool = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
@@ -625,6 +627,9 @@ def ragged_paged_attention(
         decode_only: The caller guarantees every sequence is a decode
             (distribution[0] == distribution[2]); skip the mixed kernel and its
             schedule, which would have no work. Defaults to False.
+        fast_kv_fetch: With lean_kv_fetch, fetch full KV tiles with static page
+            sizes and page ids read at static offsets (fewer scalar ops per
+            DMA). Defaults to False.
         lean_kv_fetch: Fetch HEAD_ALONG_SUBLANE cache pages with two scalar
             loads per page (the decode KV fetch is scalar-issue bound). Same
             DMAs and results. Defaults to False.
@@ -722,6 +727,7 @@ def ragged_paged_attention(
         skip_kv_update=skip_kv_update,
         mask_invalid_v=mask_invalid_v,
         lean_kv_fetch=lean_kv_fetch,
+        fast_kv_fetch=fast_kv_fetch,
         kv_slot=kv_slot,
         compact_kv_schedule=compact_kv_schedule,
     )
@@ -729,6 +735,8 @@ def ragged_paged_attention(
         kv_layout == configs.KVLayout.HEAD_ALONG_SUBLANE and skip_kv_update
     ):
         raise ValueError("compact_kv_schedule needs read-only HEAD_ALONG_SUBLANE")
+    if fast_kv_fetch and not lean_kv_fetch:
+        raise ValueError("fast_kv_fetch needs lean_kv_fetch")
     if lean_kv_fetch and kv_layout != configs.KVLayout.HEAD_ALONG_SUBLANE:
         raise ValueError("lean_kv_fetch needs HEAD_ALONG_SUBLANE")
     if kv_slot is not None and not (

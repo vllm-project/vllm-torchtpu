@@ -178,6 +178,9 @@ class ServingConfigs:
     # three: a tile's pages land at i * page_size, so only each entry's
     # physical page id and size are read.
     lean_kv_fetch: bool = False
+    # With lean_kv_fetch: full tiles fetch with static page sizes and page ids
+    # read at static offsets of the tile's page-table slice.
+    fast_kv_fetch: bool = False
     # HEAD_ALONG_SUBLANE with one KV head: attend the K/V pair at this head
     # slot of each packed cache row (either layer of a paired page) and unpack
     # only that pair. None unpacks every pair and attends the leading heads.

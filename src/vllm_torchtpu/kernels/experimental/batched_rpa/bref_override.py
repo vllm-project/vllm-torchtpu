@@ -371,16 +371,42 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
                 # Lean per-page fetch: a tile's cache pages land at
                 # i * page_size, so only each entry's physical page id and size
                 # are loaded, not its VMEM offset.
-                for i in range(self.cfgs.bkv_p_cache):
-                    p_idx = schedule_ref.dma_kv_cache[block_idx, b, i, 0]
-                    sz = schedule_ref.dma_kv_cache[block_idx, b, i, 2]
-                    sz = jnp.where(is_no_op, 0, sz)
-                    src_off = p_idx * page_size
-                    pltpu.make_async_copy(
-                        kv_cache_hbm_flat.at[pl.ds(src_off, sz)],
-                        vmem_dst.at[b, pl.ds(i * page_size, sz)],
-                        sem,
-                    ).start()
+
+                def lean_fetch(b=b):
+                    for i in range(self.cfgs.bkv_p_cache):
+                        p_idx = schedule_ref.dma_kv_cache[block_idx, b, i, 0]
+                        sz = schedule_ref.dma_kv_cache[block_idx, b, i, 2]
+                        sz = jnp.where(is_no_op, 0, sz)
+                        pltpu.make_async_copy(
+                            kv_cache_hbm_flat.at[pl.ds(p_idx * page_size, sz)],
+                            vmem_dst.at[b, pl.ds(i * page_size, sz)],
+                            sem,
+                        ).start()
+
+                if not self.cfgs.serve.fast_kv_fetch:
+                    lean_fetch()
+                else:
+                    # The fetch is bound by scalar work per DMA. A full tile
+                    # (its last page is full, so every page is) moves
+                    # page_size tokens per page: no size loads or selects.
+                    # Other tiles take the lean path.
+                    pages = self.cfgs.bkv_p_cache
+                    last = schedule_ref.dma_kv_cache[block_idx, b, pages - 1, 2]
+                    full = (last == page_size) & jnp.logical_not(is_no_op)
+
+                    @pl.when(full)
+                    def _full_tile(b=b):
+                        for i in range(pages):
+                            p_idx = schedule_ref.dma_kv_cache[block_idx, b, i, 0]
+                            pltpu.make_async_copy(
+                                kv_cache_hbm_flat.at[
+                                    pl.ds(p_idx * page_size, page_size)
+                                ],
+                                vmem_dst.at[b, pl.ds(i * page_size, page_size)],
+                                sem,
+                            ).start()
+
+                    pl.when(jnp.logical_not(full))(lean_fetch)
 
             # Contiguous fetch for new KV
             dma_entry_0 = schedule_ref.dma_kv_new[block_idx, b, 0]

@@ -297,10 +297,6 @@ def test_bench():
     main()
 
 
-if __name__ == "__main__":
-    main()
-
-
 def check_exact(cache):
     """Lean vs schedule per-page fetch: identical DMAs, so outputs must match."""
     rng = np.random.default_rng(7)
@@ -515,4 +511,121 @@ def test_lean_fetch_xprof(monkeypatch):
 def test_bench_xprof(monkeypatch):
     monkeypatch.setenv("BENCH_XPROF", "1")
     monkeypatch.setenv("BENCH_CASES", "2x64,6x24")
+    main()
+
+
+def _no_convert_strided_load_bkv(kv_in_vref, b_idx, start, *, cfgs):
+    """Diagnostic only (wrong values): K and V are the packed u32 words
+    reinterpreted as f32, so the kernel does no FP8 unpack/convert at all."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    from vllm_torchtpu.kernels.experimental.batched_rpa import utils
+
+    start //= cfgs.serve.packing_kv
+    kv_ref = kv_in_vref.at[b_idx].bitcast(jnp.uint32).reshape(
+        -1, cfgs.aligned_kv_head_dim
+    )
+    kv_ref = pltpu.annotate(kv_ref, no_hazard_no_deps=True)
+    kv = utils.strided_load(
+        kv_ref, start, cfgs.bkv_sz * cfgs.bkv_stride, cfgs.bkv_stride
+    )
+    word = pltpu.bitcast(kv, jnp.float32)
+    pairs = 1 if cfgs.serve.kv_slot is not None else cfgs.serve.packing_kv // 2
+    return [(word, word)] * pairs
+
+
+def test_diag_no_convert(monkeypatch):
+    """Step time with and without the in-kernel FP8 unpack (upper bound on (b))."""
+    from vllm_torchtpu.kernels.experimental.batched_rpa import kernel
+
+    monkeypatch.setenv("BENCH_CASES", "6x24,8x32,2x64")
+    monkeypatch.setenv("BENCH_PATTERNS", "random")
+    monkeypatch.setenv("BENCH_ARMS", "0111")
+    cache = make_cache()
+    results = []
+    cache = main_step(cache, results)
+    monkeypatch.setattr(kernel, "strided_load_bkv", _no_convert_strided_load_bkv)
+    print("DIAG no FP8 unpack:", flush=True)
+    main_step(cache, results)
+
+
+def check_fast_exact(cache):
+    """Fast full-tile fetch vs lean fetch: identical DMAs' bytes, so outputs
+    must match bit for bit (separately jitted: fast_kv_fetch is static)."""
+    rng = np.random.default_rng(19)
+    results = []
+    for pattern, (reqs, rows), offset in itertools.product(
+        ("random", "clustered"), ((2, 8), (6, 24), (8, 32), (2, 64)), (0, 1)
+    ):
+        q, gate, blocks, lengths, table = make_inputs(
+            rng, requests=reqs, rows=rows, overlap=0.0, pattern=pattern
+        )
+        outs = []
+        for fast in (False, True):
+            attend = jax.jit(
+                functools.partial(
+                    qsa_rpa.rpa_attention, kv_heads=1, ratio=RATIO, k_scale=0.375,
+                    v_scale=2.5, lean_fetch=True, decode_only=True, slot_read=True,
+                    fast_fetch=fast, **({"kv_head_offset": 1} if offset else {}),
+                ),
+                donate_argnums=(5,),
+            )
+            out, cache = attend(q, gate, blocks, lengths, table, cache)
+            outs.append(np.asarray(out.astype(jnp.float32)))
+        row = dict(mode="fast_exact", pattern=pattern, rows=rows, offset=offset,
+                   max_abs=float(np.max(np.abs(outs[0] - outs[1]))),
+                   nonzero=float(np.abs(outs[0]).max()))
+        print("EXACT", json.dumps(row), flush=True)
+        results.append(row)
+        assert row["max_abs"] == 0 and row["nonzero"] > 0
+    return cache, results
+
+
+def test_fast_fetch(monkeypatch):
+    """Same pod: lean vs fast fetch (static flag, retraced), 8/24/32/64 rows."""
+    monkeypatch.setenv("BENCH_CASES", "2x8,6x24,8x32,2x64")
+    monkeypatch.setenv("BENCH_PATTERNS", "random")
+    cache = make_cache()
+    cache, results = check_fast_exact(cache)
+    for fast in ("0", "1", "0", "1"):
+        monkeypatch.setenv("VLLM_TPU_QSA_DECODE_FAST_FETCH", fast)
+        monkeypatch.setenv("BENCH_ARMS", "0111")
+        print("FAST", fast, flush=True)
+        cache = main_step(cache, results)
+    out_dir = os.environ.get("CDK_OUTPUT_DIR", "/tmp")
+    Path(out_dir, "bench_qsa_fast_fetch.json").write_text(json.dumps(results, indent=1))
+
+
+def test_diag_combined(monkeypatch):
+    """Same pod: baseline, no-unpack, one-DMA-per-tile, and both together.
+    If only 'both' is faster, the scalar DMA-issue chain and the vector unpack
+    are each on the critical path; if none is, the step waits on memory."""
+    from vllm_torchtpu.kernels.experimental.batched_rpa import bref_override, kernel
+
+    monkeypatch.setenv("BENCH_CASES", "6x24,8x32")
+    monkeypatch.setenv("BENCH_PATTERNS", "random")
+    monkeypatch.setenv("BENCH_ARMS", "0111")
+    cache = make_cache()
+    results = []
+    copy_in = bref_override.KVBufferedRefHeadAlongSublane.copy_in
+    load = kernel.strided_load_bkv
+    for name, unpack, dma in (
+        ("base", load, copy_in),
+        ("no_unpack", _no_convert_strided_load_bkv, copy_in),
+        ("one_dma", load, _one_dma_copy_in),
+        ("both", _no_convert_strided_load_bkv, _one_dma_copy_in),
+    ):
+        monkeypatch.setattr(kernel, "strided_load_bkv", unpack)
+        monkeypatch.setattr(
+            bref_override.KVBufferedRefHeadAlongSublane, "copy_in", dma
+        )
+        # ragged_paged_attention is a module-level jax.jit with the same static
+        # arguments in every arm: without this its cached executable (traced
+        # with the unpatched kernel) would be reused.
+        jax.clear_caches()
+        print("DIAG", name, flush=True)
+        cache = main_step(cache, results)
+
+
+if __name__ == "__main__":
     main()

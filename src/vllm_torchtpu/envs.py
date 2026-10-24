@@ -110,6 +110,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE: bool = False
     VLLM_TPU_QSA_DECODE_LEAN_FETCH: bool = False
     VLLM_TPU_QSA_DECODE_SLOT_READ: bool = False
+    VLLM_TPU_QSA_DECODE_FAST_FETCH: bool = False
     VLLM_TPU_QSA_DECODE_COMPACT_SCHEDULE: bool = False
     VLLM_TPU_QSA_DECODE_RPA_BKV: int = 256
     VLLM_TPU_QSA_DECODE_RPA_LANES: int = 8
@@ -585,6 +586,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # paired page's second layer, presenting both heads with zero queries.
     "VLLM_TPU_QSA_DECODE_SLOT_READ": env_bool(
         "VLLM_TPU_QSA_DECODE_SLOT_READ", default=False
+    ),
+    # Qwen4-exp QSA decode/verify attention on RPA (implies the lean fetch):
+    # full KV tiles fetch with static page sizes and page ids read at static
+    # offsets, cutting the scalar work per DMA that bounds the decode kernel.
+    "VLLM_TPU_QSA_DECODE_FAST_FETCH": env_bool(
+        "VLLM_TPU_QSA_DECODE_FAST_FETCH", default=False
     ),
     # Qwen4-exp QSA decode/verify attention on RPA: compact KV schedule (one
     # entry per lane-tile instead of one per 4-token page), which lets the

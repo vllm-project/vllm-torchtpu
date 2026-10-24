@@ -144,3 +144,35 @@ def test_lean_fetch_lowers_for_tpu7x(monkeypatch, offset):
     )
     assert 'kernel_name = "RPAd' in text
     assert 'kernel_name = "RPAm' not in text
+
+
+@pytest.mark.parametrize("offset", [0, 1])
+def test_fast_fetch_lowers_for_tpu7x(monkeypatch, offset):
+    """VLLM_TPU_QSA_DECODE_FAST_FETCH: the full-tile fetch lowers to Mosaic."""
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: TPU7X)
+    for name, value in (
+        (FLAG, "0"),
+        (LEAN, "1"),
+        ("VLLM_TPU_QSA_DECODE_FAST_FETCH", "1"),
+        ("VLLM_TPU_QSA_DECODE_SLOT_READ", "1"),
+        ("VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE", "1"),
+    ):
+        monkeypatch.setenv(name, value)
+    rows, columns = 32, 64
+    shape = jax.ShapeDtypeStruct
+    specs = (
+        shape((rows, Q_HEADS, WIDTH), jnp.bfloat16),
+        shape((rows, Q_HEADS, WIDTH), jnp.bfloat16),
+        shape((rows, 512), jnp.int32),
+        shape((rows,), jnp.int32),
+        shape((rows, columns), jnp.int32),
+        shape((4096, 512, 1, 4, WIDTH), jnp.float8_e4m3fn),
+        shape((rows // 4 + 1,), jnp.int32),
+    )
+    options = dict(kv_heads=1, ratio=RATIO, k_scale=0.375, v_scale=2.5)
+    if offset:
+        options["kv_head_offset"] = offset
+    text = _lower(
+        functools.partial(qsa_rpa.qsa_attention, max_query_len=4, **options), *specs
+    )
+    assert 'kernel_name = "RPAd' in text
