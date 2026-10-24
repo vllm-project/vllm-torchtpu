@@ -137,6 +137,16 @@ class GatedResidual(common_hc.GatedResidual):
         output = torch.cat(normalized, dim=-1)
         return (output * (1.0 + self.hc_norm.weight.float())).to(hyper_input.dtype)
 
+    def disable_decode_fused(self):
+        """Keep the unfused mix at every token count.
+
+        For a module traced once for every token bucket (the MTP draft): the
+        fused path is chosen by the token count while tracing, so that one
+        graph could not serve buckets on the other side of the choice.
+        """
+        self._decode_mix_op = None
+        self._decode_combine_mix_op = None
+
     def _decode_weights(self):
         weights = (
             self.hc_norm.weight,

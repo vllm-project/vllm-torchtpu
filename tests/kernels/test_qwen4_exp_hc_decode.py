@@ -312,3 +312,16 @@ def test_fused_and_unfused_traces_use_weights_in_one_order():
     assert layer(True).attn._decode_fused(args[0])
     assert len(fused) == 10
     assert fused == parameters_by_first_use(layer(False), *args)
+
+
+def test_disable_decode_fused_keeps_the_unfused_mix():
+    """The MTP draft (traced once for every token bucket) disables the fused
+    decode mix, whose choice depends on the token count while tracing."""
+    module = _stub_ops(_module(3, hidden=128, lowrank=32))
+    hyper = torch.zeros(8, BRANCHES * 128, dtype=torch.bfloat16)
+    assert module._decode_fused(hyper)
+    module.disable_decode_fused()
+    assert not module._decode_fused(hyper)
+    with torch.no_grad():
+        mixed, (residual, injection) = module.mix(hyper)
+    assert mixed.shape == (8, 128) and injection.shape == (8, BRANCHES)

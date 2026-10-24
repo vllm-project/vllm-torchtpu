@@ -161,9 +161,14 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         )
         # The draft is traced once for every token bucket (see
         # draft_additional_config): its attention must not choose its
-        # structure by the token count either.
+        # structure by the token count either, and its HCs keep the unfused
+        # decode mix (TPU_QWEN4_HC_DECODE_FUSED picks the fused path by the
+        # token count while tracing).
         for layer in self.layers:
             layer.self_attn.single_graph = True
+        for module in self.modules():
+            if isinstance(module, GatedResidual):
+                module.disable_decode_fused()
         # Set by the Qwen3.8 megakernel driver before the first trace: the
         # layer's o_proj, both HCs and the MoE as one tail-kernel call.
         self.mk_tail: nn.Module | None = None
