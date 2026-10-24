@@ -66,19 +66,27 @@ class QSAFullIndexedBlock(QSAFullBlock):
         carrier: str = "",
         ck_width: int = 256,
         chunk_pages: int = 32,
+        manager_pages: int = 0,
+        ck_lanes: int = 0,
         **kw: Any,
     ) -> None:
         """`carrier`: "" = prototype contiguous keys `[requests, max_groups, 128]`; "fp8" = the
         served FP8 carrier `[kernel_pages, 16, 4, ck_width]` (32 groups per kernel page, two BF16
         keys per carrier row), paged by `qsa_cktab [requests, max_groups // 32]` and streamed
         `chunk_pages` pages per chunk; "bf16" = its BF16 view `[kernel_pages, 16, 2, ck_width]`
-        (CPU interpret: same layout, no in-kernel bitcast)."""
+        (CPU interpret: same layout, no in-kernel bitcast). `manager_pages` > 0: `qsa_cktab` holds
+        manager pages of that many contiguous kernel pages (served 1664-token pages: 13) and each
+        is one DMA (P4: per-kernel-page DMAs are issue-bound); `ck_lanes` = 128 reads only the
+        real lanes of each carrier row."""
         super().__init__(**kw)
         assert max_groups % 1024 == 0, max_groups  # whole (8, 128) score tiles per row
         self.max_groups, self.pps, self.debug = max_groups, pages_per_seq, debug
         self.carrier, self.ck_width = carrier, ck_width
+        self.mp, self.ck_lanes = manager_pages, ck_lanes or ck_width
         self.chunk_pages = chunk_pages if carrier else max_groups // GPK
-        assert (max_groups // GPK) % self.chunk_pages == 0 and (self.chunk_pages * GPK) % 1024 == 0
+        assert (max_groups // GPK) % self.chunk_pages == 0, (max_groups, self.chunk_pages)
+        assert (self.chunk_pages * GPK) % 128 == 0 and (max_groups // 128) % 8 == 0
+        assert not self.mp or self.chunk_pages % self.mp == 0
 
     @property
     def n_chunks(self) -> int:
@@ -112,7 +120,8 @@ class QSAFullIndexedBlock(QSAFullBlock):
         return [
             ExtraInput(POOL, "hbm"),
             *(
-                [ExtraInput(CK, "hbm"), ExtraInput(CKTAB, "smem", (nreq, self.max_groups // GPK), I32)]
+                [ExtraInput(CK, "hbm"), ExtraInput(
+                    CKTAB, "smem", (nreq, self.max_groups // GPK // (self.mp or 1)), I32)]
                 if self.carrier
                 else [ExtraInput(CK, "hbm", (nreq, self.max_groups, ix.IDX_DIM), BF16)]
             ),
@@ -130,7 +139,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
             *(
                 [
                     ScratchReq("qi_ring", pltpu.VMEM(
-                        (2, self.chunk_pages, 16, 4 if self.carrier == "fp8" else 2, self.ck_width),
+                        (2, self.chunk_pages, 16, 4 if self.carrier == "fp8" else 2, self.ck_lanes),
                         jnp.float8_e4m3fn if self.carrier == "fp8" else BF16,
                     )),
                     ScratchReq("qi_ring_sem", pltpu.SemaphoreType.DMA((2,))),
@@ -163,14 +172,25 @@ class QSAFullIndexedBlock(QSAFullBlock):
             st = ix.score_rows(qr, scr["qi_ck"][...])  # [T, G]
             scr["qi_s"][rows, 0] = st.reshape(T, self.max_groups // 128, 128)
             return
-        CH, NC, W = self.chunk_pages, self.n_chunks, self.ck_width
+        CH, NC, W, MP = self.chunk_pages, self.n_chunks, self.ck_lanes, self.mp
         CG = CH * GPK
         ring, sems = scr["qi_ring"], scr["qi_ring_sem"]
+        lanes = pl.ds(0, W)
 
         def copies(c: Any, s: Any) -> list[Any]:
+            tab = ctx.extra[CKTAB]
+            if MP:  # one DMA per manager page of MP contiguous kernel pages
+                return [
+                    pltpu.make_async_copy(
+                        ctx.extra[CK].at[pl.ds(tab[q, c * (CH // MP) + m] * MP, MP), :, :, lanes],
+                        ring.at[s, pl.ds(m * MP, MP)],
+                        sems.at[s],
+                    )
+                    for m in range(CH // MP)
+                ]
             return [
                 pltpu.make_async_copy(
-                    ctx.extra[CK].at[ctx.extra[CKTAB][q, c * CH + p]], ring.at[s, p], sems.at[s]
+                    ctx.extra[CK].at[tab[q, c * CH + p], :, :, lanes], ring.at[s, p], sems.at[s]
                 )
                 for p in range(CH)
             ]

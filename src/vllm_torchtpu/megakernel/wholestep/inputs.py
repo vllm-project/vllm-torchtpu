@@ -303,7 +303,7 @@ def indexer_selection(
     return jnp.asarray(pages), jnp.asarray(kvl)
 
 
-def add_carrier(key: int, d: dict[str, Any], width: int = 256) -> dict[str, Any]:
+def add_carrier(key: int, d: dict[str, Any], width: int = 256, mp: int = 0) -> dict[str, Any]:
     """The served compressed-key layout for `d["ck"]`: kernel pages of 32 groups, BF16 view
     `[pages, 16, 2, width]` (row 2i+j of a page = carrier row i, half j; lanes >= 128 zero),
     pages shuffled per request, `cktab [requests, max_groups // 32]`."""
@@ -311,12 +311,19 @@ def add_carrier(key: int, d: dict[str, Any], width: int = 256) -> dict[str, Any]
     nreq, G, D = ck.shape
     ppr = G // 32
     rng = np.random.default_rng(key + 23)
-    tab = (rng.permutation(nreq * ppr) + 1).reshape(nreq, ppr).astype(np.int32)
-    car = np.zeros((nreq * ppr + 1, 32, width), np.float32)
+    if mp:  # manager pages of mp contiguous kernel pages (manager page 0 unused)
+        nm = ppr // mp
+        mtab = (rng.permutation(nreq * nm) + 1).reshape(nreq, nm).astype(np.int32)
+        tab = (mtab[:, :, None] * mp + np.arange(mp)).reshape(nreq, ppr)
+        n_pages = (nreq * nm + 1) * mp
+    else:
+        mtab = tab = (rng.permutation(nreq * ppr) + 1).reshape(nreq, ppr).astype(np.int32)
+        n_pages = nreq * ppr + 1
+    car = np.zeros((n_pages, 32, width), np.float32)
     for q in range(nreq):
         car[tab[q], :, :D] = ck[q].reshape(ppr, 32, D)
     carrier = jnp.asarray(car, BF16).reshape(-1, 16, 2, width)
-    return {**d, "carrier": carrier, "cktab": jnp.asarray(tab)}
+    return {**d, "carrier": carrier, "cktab": jnp.asarray(mtab)}
 
 
 def extras_b(d: dict[str, Any], mesh: Mesh, R: int) -> tuple:

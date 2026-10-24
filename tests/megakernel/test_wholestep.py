@@ -294,9 +294,13 @@ def test_step_with_served_key_layout_matches_contiguous():
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
     pps = d["mtab"].shape[1]
     outs = []
-    for carrier in ("", "bf16"):
-        dd = wi.add_carrier(17, d) if carrier else d
-        idx = dict(max_groups=maxg, pages_per_seq=pps, carrier=carrier, chunk_pages=32)
+    # contiguous keys; served layout per kernel page; per manager page (4 kernel pages here,
+    # 13 served) reading only the 128 real lanes.
+    arms = (("", 0, 0), ("bf16", 0, 0), ("bf16", 4, 128))
+    for carrier, mp, lanes in arms:
+        dd = wi.add_carrier(17, d, mp=mp) if carrier else d
+        idx = dict(max_groups=maxg, pages_per_seq=pps, carrier=carrier, chunk_pages=32,
+                   manager_pages=mp, ck_lanes=lanes)
         spec = wholestep_spec(G, R, L=L, qsa=dict(budget=BUDGET), step=True, indexed=idx)
         w_mk, states = wi.pack_wholestep(spec, G, ex, dd, L)
         pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(
@@ -305,5 +309,6 @@ def test_step_with_served_key_layout_matches_contiguous():
         step, _ = kernel.make_step(mesh, spec, ex)
         _, o = step(pos_mk, hid_mk, w_mk, st_mk, *wi.extras_c(dd, mesh, R))
         outs.append((np.asarray(o[RESIDUAL_OUT], np.float32), np.asarray(o[CK_NEW], np.float32)))
-    np.testing.assert_array_equal(outs[0][0], outs[1][0])
-    np.testing.assert_array_equal(outs[0][1], outs[1][1])
+    for o in outs[1:]:
+        np.testing.assert_array_equal(outs[0][0], o[0])
+        np.testing.assert_array_equal(outs[0][1], o[1])
