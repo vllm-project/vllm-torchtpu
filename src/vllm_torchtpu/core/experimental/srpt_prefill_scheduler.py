@@ -39,6 +39,17 @@ prefills, is stalled: it moves ahead of the other prefill chunks and is not
 held until it gets a block. Decodes still go first, so a stalled chunk can
 still wait while decodes fill the budget.
 
+With ``VLLM_TPU_SRPT_ATTN_WORK_CAP=W`` (default 0, off) a step's attention work,
+``sum(n * (c + n / 2))`` over the chunks it schedules (``n`` new tokens after
+``c`` computed ones, decodes included), is kept near ``W`` by shrinking prefill
+chunks. Data-parallel ranks step in lockstep, so one rank's deep-context chunk
+otherwise stretches every rank's step and the decodes in it. A shrunk chunk is
+rounded to a multiple of ``VLLM_TPU_SRPT_ATTN_TILE_TOKENS`` (default 32, the
+query tile of the TPU attention kernels) so it does not pay for a partly used
+tile; the step's first prefill chunk always gets at least one tile, so a chunk
+whose context alone exceeds ``W`` still advances. A chunk the cap shrank counts
+as progress for the anti-starvation rule above.
+
 Under KV pressure upstream preempts ``running[-1]``, which is the longest
 non-stalled prefill chunk, so a long prompt can be preempted repeatedly.
 
@@ -46,6 +57,7 @@ Select with ``--scheduler-cls``
 ``vllm_torchtpu.core.experimental.srpt_prefill_scheduler.SrptPrefillScheduler``.
 """
 
+import math
 from itertools import chain
 
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -60,6 +72,7 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 _MAX_BACKOFF_SHIFT = 6
+_ATTN_CAP_LOG_EVERY = 10000
 
 
 class SrptPrefillScheduler(AsyncScheduler):
@@ -74,9 +87,22 @@ class SrptPrefillScheduler(AsyncScheduler):
         self._stalled_steps: dict[str, int] = {}
         # Target request id -> (failed holds, first step a hold may retry).
         self._hold_backoff: dict[str, tuple[int, int]] = {}
+        self.attn_work_cap = envs.VLLM_TPU_SRPT_ATTN_WORK_CAP
+        self.attn_tile_tokens = max(envs.VLLM_TPU_SRPT_ATTN_TILE_TOKENS, 1)
+        # Attention work and whether a prefill chunk was scheduled so far in
+        # this step's Scheduler.schedule(), and the requests the cap shrank.
+        self._in_schedule = False
+        self._attn_work = 0.0
+        self._attn_prefill_scheduled = False
+        self._attn_capped: set[str] = set()
+        self._attn_steps = 0
+        self._attn_capped_chunks = 0
         logger.info(
-            "SrptPrefillScheduler active (max_consecutive_holds=%d)",
+            "SrptPrefillScheduler active (max_consecutive_holds=%d, "
+            "attn_work_cap=%d, attn_tile_tokens=%d)",
             self.max_consecutive_holds,
+            self.attn_work_cap,
+            self.attn_tile_tokens,
         )
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
@@ -93,9 +119,14 @@ class SrptPrefillScheduler(AsyncScheduler):
         self.running[:] = [r for r in self.running if r.request_id not in held_ids]
         self.max_num_running_reqs -= len(held)
         self.max_num_active_reqs -= len(held)
+        self._attn_work = 0.0
+        self._attn_prefill_scheduled = False
+        self._attn_capped.clear()
+        self._in_schedule = True
         try:
             output = super().schedule(throttle_prefills)
         finally:
+            self._in_schedule = False
             self.max_num_running_reqs += len(held)
             self.max_num_active_reqs += len(held)
             self.running.extend(held)
@@ -105,8 +136,11 @@ class SrptPrefillScheduler(AsyncScheduler):
         # exceed a whole chunk.
         progress_tokens = self.cache_config.block_size
         for r in prefilling:
+            n = output.num_scheduled_tokens.get(r.request_id, 0)
             if (
-                output.num_scheduled_tokens.get(r.request_id, 0) >= progress_tokens
+                n >= progress_tokens
+                # Got all the attention work cap allowed this step.
+                or (n > 0 and r.request_id in self._attn_capped)
                 or not r.is_prefill_chunk
             ):
                 self._stalled_steps.pop(r.request_id, None)
@@ -116,7 +150,69 @@ class SrptPrefillScheduler(AsyncScheduler):
                 )
         if target is not None:
             self._record_hold_outcome(target)
+        if self.attn_work_cap:
+            self._attn_steps += 1
+            self._attn_capped_chunks += len(self._attn_capped)
+            if self._attn_steps % _ATTN_CAP_LOG_EVERY == 0:
+                logger.info(
+                    "SrptPrefillScheduler attention work cap: steps=%d "
+                    "capped_chunks=%d",
+                    self._attn_steps,
+                    self._attn_capped_chunks,
+                )
         return output
+
+    def _attn_cap_tokens(
+        self, context: int, num_new_tokens: int, work: float, prefill_scheduled: bool
+    ) -> int:
+        """Tokens of a prefill chunk of ``num_new_tokens`` after ``context``
+        computed ones that fit the attention work left after ``work``,
+        rounded to the attention tile."""
+        room = self.attn_work_cap - work
+        fit = int(math.sqrt(context * context + 2 * room) - context) if room > 0 else 0
+        if fit >= num_new_tokens:
+            return num_new_tokens
+        tile = self.attn_tile_tokens
+        # Round to the nearest tile, ties and the upper quarter up.
+        rounded = (fit + tile * 3 // 4) // tile * tile
+        if rounded >= num_new_tokens:
+            return num_new_tokens
+        if rounded >= tile:
+            return rounded
+        if not prefill_scheduled:
+            return min(num_new_tokens, tile)
+        return 0
+
+    def _reserve_prefill_lookahead(
+        self, request: Request, num_computed_tokens: int, num_new_tokens: int
+    ) -> int:
+        # Scheduler.schedule() calls this on every request it is about to
+        # schedule, in both queues, after its token budget limits, so it is
+        # where the step's attention work is tracked and capped.
+        if not (self._in_schedule and self.attn_work_cap):
+            return super()._reserve_prefill_lookahead(
+                request, num_computed_tokens, num_new_tokens
+            )
+        prefill = num_computed_tokens < request.num_prompt_tokens
+        if prefill and num_new_tokens > 0:
+            capped = self._attn_cap_tokens(
+                num_computed_tokens,
+                num_new_tokens,
+                self._attn_work,
+                self._attn_prefill_scheduled,
+            )
+            if capped < num_new_tokens:
+                self._attn_capped.add(request.request_id)
+                num_new_tokens = capped
+        num_new_tokens = super()._reserve_prefill_lookahead(
+            request, num_computed_tokens, num_new_tokens
+        )
+        if num_new_tokens > 0:
+            self._attn_work += num_new_tokens * (
+                num_computed_tokens + num_new_tokens / 2
+            )
+            self._attn_prefill_scheduled |= prefill
+        return num_new_tokens
 
     @staticmethod
     def _remaining(request: Request) -> int:
@@ -179,9 +275,10 @@ class SrptPrefillScheduler(AsyncScheduler):
 
     def _plan_running(
         self, reqs: list[Request], lptt: int
-    ) -> tuple[dict[str, int], int]:
-        """Tokens the RUNNING pass of Scheduler.schedule() would give ``reqs``
-        and the budget it leaves for WAITING.
+    ) -> tuple[dict[str, int], int, float, bool]:
+        """Tokens the RUNNING pass of Scheduler.schedule() would give ``reqs``,
+        the budget it leaves for WAITING, and (with the attention work cap)
+        the attention work it uses and whether it schedules a prefill chunk.
 
         Mirrors the per-request ``num_new_tokens`` math inline in that pass
         (vLLM v0.32.0, scheduler.py ~L657-751); re-sync on vLLM upgrades.
@@ -194,6 +291,8 @@ class SrptPrefillScheduler(AsyncScheduler):
         token_budget = self.max_num_scheduled_tokens
         input_budget = self.scheduler_config.max_num_batched_tokens
         alloc: dict[str, int] = {}
+        work = 0.0
+        prefill_scheduled = False
         for r in reqs:
             if token_budget <= 0 or input_budget <= draft_slots:
                 break
@@ -218,13 +317,25 @@ class SrptPrefillScheduler(AsyncScheduler):
                 - r.num_computed_tokens
                 - self.num_sampled_tokens_per_step,
             )
+            prefill = r.num_computed_tokens < r.num_prompt_tokens
+            if self.attn_work_cap and prefill and n > 0:
+                n = self._attn_cap_tokens(
+                    r.num_computed_tokens, n, work, prefill_scheduled
+                )
             n = self._reserve_prefill_lookahead(r, r.num_computed_tokens, n)
             if n <= 0:
                 continue
             alloc[r.request_id] = n
             token_budget -= n
             input_budget -= n + draft_slots
-        return alloc, min(token_budget, input_budget - draft_slots)
+            work += n * (r.num_computed_tokens + n / 2)
+            prefill_scheduled |= prefill
+        return (
+            alloc,
+            min(token_budget, input_budget - draft_slots),
+            work,
+            prefill_scheduled,
+        )
 
     def _next_waiting(self) -> Request | None:
         """The request upstream's WAITING pass admits next."""
@@ -269,9 +380,15 @@ class SrptPrefillScheduler(AsyncScheduler):
         held: list[Request] = []
         while True:
             lptt = self._long_prefill_threshold(len(kept) + num_waiting)
-            alloc, left = self._plan_running(kept, lptt)
+            alloc, left, work, prefill_scheduled = self._plan_running(kept, lptt)
             need = min(target_remaining, lptt) if lptt > 0 else target_remaining
-            if left >= need:
+            admit = min(need, left)
+            if self.attn_work_cap and admit > 0:
+                admit = self._attn_cap_tokens(
+                    hit_tokens, admit, work, prefill_scheduled
+                )
+            # Enough budget, and the cap lets the target advance a tile.
+            if left >= need and admit >= min(need, self.attn_tile_tokens):
                 break
             # Non-stalled prefill chunks sit last in `kept`, ordered by
             # remaining tokens, so this is the longest one.
@@ -290,11 +407,9 @@ class SrptPrefillScheduler(AsyncScheduler):
                 break
             kept.remove(candidate)
             held.append(candidate)
-        if not held or left <= 0:
+        if not held or admit <= 0:
             return [], None
-        if not self._kv_fits_hold(
-            kept, alloc, target, hit_blocks, hit_tokens, min(need, left)
-        ):
+        if not self._kv_fits_hold(kept, alloc, target, hit_blocks, hit_tokens, admit):
             return [], None
         return held, target
 

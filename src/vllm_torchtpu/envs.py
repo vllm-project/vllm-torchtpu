@@ -194,6 +194,8 @@ if TYPE_CHECKING:
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
+    VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
+    VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
 
 
 def env_with_choices(
@@ -1149,6 +1151,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # copies it automatically to DP/Ray engine-core actors.
     "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS": env_nonnegative_int(
         "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS", 8
+    ),
+    # SrptPrefillScheduler: cap on a step's attention work, sum of
+    # n * (context + n / 2) over its scheduled chunks; prefill chunks are shrunk
+    # to stay near it (0 disables).
+    "VLLM_TPU_SRPT_ATTN_WORK_CAP": env_nonnegative_int(
+        "VLLM_TPU_SRPT_ATTN_WORK_CAP", 0
+    ),
+    # SrptPrefillScheduler: chunks shrunk by the attention work cap are rounded
+    # to a multiple of this many tokens (the attention kernel's query tile).
+    "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
+        "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
     ),
 }
 

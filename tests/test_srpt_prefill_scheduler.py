@@ -504,16 +504,76 @@ def test_prefill_crowded_out_by_shorter_running_prefill_is_promoted(
     assert scheduler.schedule().num_scheduled_tokens == {"mid": 8, "long": 8}
 
 
-def test_max_consecutive_holds_env_var_and_compile_cache(
-    shared_model_config, monkeypatch
-):
+def test_env_vars_are_read_and_skip_the_compile_cache(shared_model_config, monkeypatch):
     monkeypatch.setenv("VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS", "16")
+    monkeypatch.setenv("VLLM_TPU_SRPT_ATTN_WORK_CAP", "25000000")
+    monkeypatch.setenv("VLLM_TPU_SRPT_ATTN_TILE_TOKENS", "16")
     scheduler, _ = _build_real_scheduler(shared_model_config)
     assert scheduler.max_consecutive_holds == 16
-    assert (
-        "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
+    assert scheduler.attn_work_cap == 25_000_000
+    assert scheduler.attn_tile_tokens == 16
+    for name in (
+        "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS",
+        "VLLM_TPU_SRPT_ATTN_WORK_CAP",
+        "VLLM_TPU_SRPT_ATTN_TILE_TOKENS",
+    ):
+        assert name in tpu_compiler._TPU_COMPILE_ENV_IGNORED
+        assert name not in tpu_compiler._tpu_compile_env_factors()
+
+
+def _capped_long_prefill(shared_model_config, **kwargs):
+    """A scheduler with `long` (512 tokens) running its prefill after one
+    uncapped 128-token chunk."""
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config, num_blocks=64, max_num_batched_tokens=128, **kwargs
     )
-    assert (
-        "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS"
-        not in tpu_compiler._tpu_compile_env_factors()
+    req_long = _running_long_prefill(scheduler, hasher, num_tokens=512)
+    assert req_long.num_computed_tokens == 128
+    return scheduler, hasher, req_long
+
+
+@pytest.mark.parametrize(("tile", "expected"), [(32, 32), (1, 33)])
+def test_attn_work_cap_rounds_chunk_to_tile(shared_model_config, tile, expected):
+    scheduler, _, _ = _capped_long_prefill(shared_model_config)
+    # After 128 computed tokens, 33 new ones cost 33 * (128 + 16.5) = 4768.5.
+    scheduler.attn_work_cap = 4800
+    scheduler.attn_tile_tokens = tile
+    assert scheduler.schedule().num_scheduled_tokens == {"long": expected}
+
+
+def test_attn_work_cap_first_prefill_chunk_gets_a_tile(shared_model_config):
+    scheduler, _, _ = _capped_long_prefill(shared_model_config)
+    # The context alone exceeds the cap; the chunk still advances one tile.
+    scheduler.attn_work_cap = 1
+    assert scheduler.schedule().num_scheduled_tokens == {"long": 32}
+
+
+def test_attn_work_cap_skips_later_chunk_without_room_for_a_tile(
+    shared_model_config,
+):
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        num_blocks=64,
+        max_num_batched_tokens=256,
+        long_prefill_token_threshold=64,
     )
+    for name, seed in (("a", 1), ("b", 2)):
+        scheduler.add_request(_make_real_request(name, 512, hasher, seed=seed))
+    assert scheduler.schedule().num_scheduled_tokens == {"a": 64, "b": 64}
+    # 32 tokens of `a` after 64 cost 32 * (64 + 16) = 2560; the 40 left fit
+    # no tile of `b`.
+    scheduler.attn_work_cap = 2600
+    assert scheduler.schedule().num_scheduled_tokens == {"a": 32}
+
+
+def test_attn_capped_chunk_counts_as_progress(shared_model_config):
+    scheduler, hasher, _ = _capped_long_prefill(shared_model_config)
+    scheduler.max_consecutive_holds = 2
+    # Progress is one KV cache block; make it larger than a capped chunk.
+    scheduler.cache_config.block_size = 64
+    scheduler.attn_work_cap = 1
+    for _ in range(3):
+        assert scheduler.schedule().num_scheduled_tokens == {"long": 32}
+    # `long` is not stalled, so it can still be held for a shorter request.
+    scheduler.add_request(_make_real_request("short", 16, hasher, seed=2))
+    assert scheduler.schedule().num_scheduled_tokens == {"short": 16}
