@@ -25,6 +25,8 @@ import jax.numpy as jnp
 import torch
 from torch_tpu._internal.pallas import pallas
 
+from vllm_torchtpu import envs
+
 # Both layouts store a token as 32-bit words: the native SparseCore cache holds
 # them as uint32, the TensorCore-tiled cache as WORD_BYTES uint8 rows that
 # `ref.bitcast(jnp.int32)` folds into one word row inside the kernel.
@@ -400,11 +402,27 @@ def _scatter_caches(
     writer; rope/TENSORCORE falls back to the XLA scatter. Shared by the
     unsharded and DCP writers, which differ only in how they derive
     (`page`, `slot`).
+
+    With `TPU_MLA_TC_KV_WRITER`, a decode-sized step into two SPARSECORE
+    caches is written by one TensorCore kernel instead (`tc_scatter`): same
+    bytes, no SparseCore offload.
     """
-    # Imported here, not at module scope: `scatter` imports this module back.
-    from vllm_torchtpu.kernels.mla import scatter
+    # Imported here, not at module scope: both import this module back.
+    from vllm_torchtpu.kernels.mla import scatter, tc_scatter
 
     dst_rows = _dst_rows(page, slot, nope_spec.page_size)
+    if envs.TPU_MLA_TC_KV_WRITER and tc_scatter.supports(
+        nope_spec, rope_spec, kv_c_normed.shape[0]
+    ):
+        return tc_scatter.scatter_caches(
+            kv_cache_nope,
+            kv_cache_rope,
+            kv_c_normed,
+            k_pe,
+            dst_rows,
+            nope_spec,
+            rope_spec,
+        )
     kv_cache_nope = scatter.scatter(
         kv_cache_nope, kv_c_normed, nope_spec, dst_rows=dst_rows
     )
