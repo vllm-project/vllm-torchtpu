@@ -15,6 +15,7 @@
 import contextlib
 import copy
 import inspect
+import math
 import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -3176,7 +3177,8 @@ def test_sample_from_logits_float32_noise_preserves_gumbel_tail():
 
 def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
     """All TPUModelRunner call sites into sample_from_logits_func must draw
-    uniform random noise `u` in float32 even when logits are bfloat16."""
+    uniform random noise `u` in float32 even when logits are bfloat16. The
+    precompiled graphs also take the served float32 temperatures."""
     monkeypatch.setattr(
         torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
     )
@@ -3186,6 +3188,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
     )
 
     seen_u_dtypes: list[torch.dtype] = []
+    seen_temperature_dtypes: list[torch.dtype] = []
 
     def fake_sample_from_logits(
         logits,
@@ -3198,11 +3201,12 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         apply_topk_topp=True,
     ):
         seen_u_dtypes.append(u.dtype)
+        seen_temperature_dtypes.append(temperatures.dtype)
         return torch.zeros((logits.shape[0], 1), dtype=torch.int32)
 
     bf16_logits = torch.zeros((2, 16), dtype=torch.bfloat16)
     sampling_params = (
-        torch.ones((2, 1), dtype=torch.bfloat16),
+        torch.ones((2, 1), dtype=torch.float32),
         torch.zeros((2, 1), dtype=torch.int32),
         torch.ones((2, 1), dtype=torch.float32),
     )
@@ -3222,7 +3226,9 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         )
         TPUModelRunner._precompile_sample_from_logits(precompile_runner)
         assert seen_u_dtypes == [torch.float32] * num_graphs
+        assert seen_temperature_dtypes == [torch.float32] * num_graphs
         seen_u_dtypes.clear()
+        seen_temperature_dtypes.clear()
 
     # 2. _sample_spec_verify_chunk (bonus_u and recover_u)
     seen_recover_dtypes: list[torch.dtype] = []
@@ -3333,3 +3339,64 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         TPUModelRunner.sample_tokens(runner, None)
 
     assert seen_u_dtypes == [torch.float32, torch.float32]
+
+
+def test_build_padded_sampling_params_keeps_float32_temperature():
+    """Temperatures reach the sampler in float32 whatever the logits dtype:
+    bfloat16 would turn T=0.8 into 0.80078125."""
+    runner = SimpleNamespace(
+        vocab_size=16,
+        input_batch=SimpleNamespace(
+            temperature_cpu_tensor=torch.tensor([0.8, 0.7, 0.0], dtype=torch.float32),
+            top_k_cpu_tensor=torch.tensor([0, 5, 16], dtype=torch.int32),
+            top_p_cpu_tensor=torch.tensor([1.0, 0.9, 1.0], dtype=torch.float32),
+        ),
+    )
+    logits = torch.zeros((4, 16), dtype=torch.bfloat16)
+
+    temperatures, top_k, top_p = TPUModelRunner._build_padded_sampling_params(
+        runner, 0, 3, logits
+    )
+
+    assert temperatures.dtype == torch.float32
+    assert torch.equal(
+        temperatures, torch.tensor([[0.8], [0.7], [0.0], [1.0]], dtype=torch.float32)
+    )
+    assert top_k.tolist() == [[0], [5], [0], [0]]
+    assert torch.equal(
+        top_p, torch.tensor([[1.0], [0.9], [1.0], [1.0]], dtype=torch.float32)
+    )
+
+
+def test_sampler_samples_at_float32_request_temperature():
+    """A request at T=0.8 over bfloat16 logits samples at float32 0.8.
+
+    The noise puts the Gumbel gap at 1.2592, between the scaled logit gaps at
+    float32 0.8 (1.25977) and at its bfloat16 rounding 0.80078125 (1.25854),
+    so only the float32 temperature keeps token 0.
+    """
+    runner = SimpleNamespace(
+        vocab_size=2,
+        input_batch=SimpleNamespace(
+            temperature_cpu_tensor=torch.tensor([0.8], dtype=torch.float32),
+            top_k_cpu_tensor=torch.tensor([0], dtype=torch.int32),
+            top_p_cpu_tensor=torch.tensor([1.0], dtype=torch.float32),
+        ),
+    )
+    runner._apply_temperature = TPUModelRunner._apply_temperature.__get__(runner)
+    logits = torch.tensor([[1.0078125, 0.0]], dtype=torch.bfloat16)
+    gumbel_gap = 1.2592
+    assert 1.0078125 / 0.80078125 < gumbel_gap < 1.0078125 / 0.8
+    u = torch.tensor(
+        [[math.exp(-math.exp(0.0)), math.exp(-math.exp(-gumbel_gap))]],
+        dtype=torch.float32,
+    )
+
+    temperatures, top_k, top_p = TPUModelRunner._build_padded_sampling_params(
+        runner, 0, 1, logits
+    )
+    sampled = TPUModelRunner.sample_from_logits.__wrapped__(
+        runner, logits, temperatures, u, top_k, top_p
+    )
+
+    assert sampled.tolist() == [[0]]

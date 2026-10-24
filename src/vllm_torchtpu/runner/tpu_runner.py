@@ -6095,9 +6095,11 @@ class TPUModelRunner(GPUModelRunner):
         with self._precompile_timed("sample_from_logits"):
             for num_reqs in self.num_reqs_paddings:
                 dummy_logits = self._dummy_logits(num_reqs)
-                dummy_temperatures = torch.ones(
-                    (num_reqs, 1), dtype=self._hidden_states_dtype
-                ).to(self.device)
+                # dtypes mirror _build_padded_sampling_params so the graph is
+                # byte-identical.
+                dummy_temperatures = torch.ones((num_reqs, 1), dtype=torch.float32).to(
+                    self.device
+                )
                 dummy_u = torch.rand_like(dummy_logits, dtype=torch.float32)
                 dummy_top_k = torch.zeros((num_reqs, 1), dtype=torch.int32).to(
                     self.device
@@ -6318,10 +6320,9 @@ class TPUModelRunner(GPUModelRunner):
                     _, target_logits_ng = self.spec_gather_bonus_and_target_logits(
                         dummy_logits, bonus_logits_indices, target_logits_indices
                     )
-                    warm_temps = torch.zeros(
-                        (num_tokens, 1),
-                        dtype=self._hidden_states_dtype,
-                    ).to(self.device)
+                    warm_temps = torch.zeros((num_tokens, 1), dtype=torch.float32).to(
+                        self.device
+                    )
                     warm_top_k = torch.zeros((num_tokens, 1), dtype=torch.int32).to(
                         self.device
                     )
@@ -7792,7 +7793,8 @@ class TPUModelRunner(GPUModelRunner):
         # fixed-shape H2D copy per tensor to keep decode shape-stable.
         padded_num_reqs = logits.shape[0]
         num_active_reqs = cur_end_idx - cur_start_idx
-        temps_cpu = torch.ones(padded_num_reqs, dtype=logits.dtype)
+        # float32, as vLLM keeps it: bf16 would round T=0.8 to 0.80078125.
+        temps_cpu = torch.ones(padded_num_reqs, dtype=torch.float32)
         top_k_cpu = torch.zeros(padded_num_reqs, dtype=torch.int32)
         top_p_cpu = torch.ones(padded_num_reqs, dtype=torch.float32)
 
