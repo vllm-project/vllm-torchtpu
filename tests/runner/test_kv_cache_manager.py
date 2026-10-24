@@ -737,6 +737,42 @@ class TestKVCacheManager:
         assert set(kv_cache_specs) == {"layer.0"}
         assert self.runner.shared_kv_cache_layers == {"layer.1": "layer.0"}
 
+    @patch("vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config")
+    @patch(
+        "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",
+        return_value=4096,
+    )
+    def test_get_kv_cache_spec_propagates_is_draft_layer(
+        self, mock_get_page_size, mock_get_layers
+    ):
+        target = _attention_layer_mock()
+        target.attn_type = AttentionType.DECODER
+        target.num_kv_heads = 2
+        target.head_size = 128
+        target.kv_sharing_target_layer_name = None
+        target.sliding_window = None
+        target.is_draft_layer = False
+        target.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
+
+        draft = _attention_layer_mock()
+        draft.attn_type = AttentionType.DECODER
+        draft.num_kv_heads = 2
+        draft.head_size = 128
+        draft.kv_sharing_target_layer_name = None
+        draft.sliding_window = None
+        draft.is_draft_layer = True
+        draft.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
+
+        mock_get_layers.return_value = {
+            "target.0": target,
+            "draft.0": draft,
+        }
+
+        kv_cache_specs = self.runner.get_kv_cache_spec()
+
+        assert kv_cache_specs["target.0"].is_draft is False
+        assert kv_cache_specs["draft.0"].is_draft is True
+
     def _make_shared_pair(self, attn_window, target_window):
         attn = _attention_layer_mock()
         attn.attn_type = AttentionType.DECODER
@@ -1157,7 +1193,7 @@ class TestKVCacheManager:
     @pytest.mark.parametrize("alias_head_size", [128, 256])
     def test_default_attention_hma_preserves_native_pool_budget(self, alias_head_size):
         """Full/SWA overlays share storage while retaining the last block ID."""
-        from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+        from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
         from vllm.v1.kv_cache_interface import SlidingWindowSpec
 
         def spec(cls, head_size=128, **kwargs):
@@ -1229,7 +1265,7 @@ class TestKVCacheManager:
         self, sliding_heads, sliding_page_bytes, shared
     ):
         """Compatible shapes share regions; other shapes retain native arrays."""
-        from vllm.v1.core.kv_cache_utils import (
+        from vllm.v1.core.kv_cache_planning import (
             get_kv_cache_config_from_groups,
             get_kv_cache_groups,
         )
@@ -1772,7 +1808,7 @@ def test_dsv4_groups_are_uniform_type_with_mixed_block_sizes():
     spec must be unwrapped before any `isinstance` type test, and block size is
     not uniform across groups, so it cannot be asserted equal.
     """
-    from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+    from vllm.v1.core.kv_cache_planning import get_kv_cache_groups
     from vllm.v1.kv_cache_interface import (
         AttentionSpec,
         MambaSpec,
@@ -2301,3 +2337,67 @@ class TestUpdateAttentionPageSizePadded:
                 256, 2, 256, torch.bfloat16
             )
         )
+
+
+def test_get_kv_cache_spec_propagates_is_draft_layer_cpu(monkeypatch):
+    monkeypatch.setattr(
+        TpuPlatform, "_find_non_ssm_backend", lambda *_: PallasAttentionBackend
+    )
+    monkeypatch.setattr(
+        PallasAttentionBackend,
+        "get_kv_cache_page_size_bytes",
+        lambda *_: 4096,
+    )
+
+    target = _attention_layer_mock()
+    target.attn_type = AttentionType.DECODER
+    target.num_kv_heads = 2
+    target.head_size = 128
+    target.kv_sharing_target_layer_name = None
+    target.sliding_window = None
+    target.is_draft_layer = False
+    target.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
+
+    draft = _attention_layer_mock()
+    draft.attn_type = AttentionType.DECODER
+    draft.num_kv_heads = 2
+    draft.head_size = 128
+    draft.kv_sharing_target_layer_name = None
+    draft.sliding_window = None
+    draft.is_draft_layer = True
+    draft.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
+
+    layers = {"target.0": target, "draft.0": draft}
+    monkeypatch.setattr(
+        "vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config",
+        lambda *_: layers,
+    )
+
+    cache_config = SimpleNamespace(
+        block_size=16,
+        cache_dtype="auto",
+        enable_prefix_caching=False,
+        mamba_page_size_padded=None,
+    )
+    stub = SimpleNamespace(
+        block_size=16,
+        kv_cache_dtype=torch.bfloat16,
+        cache_config=cache_config,
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=True),
+        model_config=SimpleNamespace(
+            use_mla=False,
+            is_hybrid=False,
+        ),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+        vllm_config=SimpleNamespace(cache_config=cache_config),
+        shared_kv_cache_layers={},
+        runner_only_attn_layers=set(),
+        _hybrid_uniform_page_size_bytes=None,
+        _unified_kv_layout=False,
+        _is_async_drafter=False,
+        drafter=None,
+    )
+
+    kv_cache_specs = KVCacheManager(stub).get_kv_cache_spec()
+    assert kv_cache_specs["target.0"].is_draft is False
+    assert kv_cache_specs["draft.0"].is_draft is True

@@ -4488,6 +4488,7 @@ class TPUModelRunner(GPUModelRunner):
             )
         req_temperatures = req_top_k = req_top_p = None
         topk_candidates = 0
+        draft_token_ids = md.draft_token_ids
         if all_greedy and grammar_output is None:
             bonus_token_ids, target_logits = self.spec_bonus_and_target_logits(
                 logits, md.bonus_logits_indices, md.target_logits_indices
@@ -4509,6 +4510,17 @@ class TPUModelRunner(GPUModelRunner):
                     )
                 )
                 assert target_logits is not None
+                draft_token_ids = (
+                    self.structured_decoding_manager.mask_invalid_draft_tokens(
+                        draft_token_ids,
+                        md.segment_ids,
+                        md.group_indices,
+                        grammar_output,
+                        cur_start_idx,
+                        cur_end_idx,
+                        draft_lengths_cpu=md.draft_lengths_cpu,
+                    )
+                )
             if all_greedy:
                 bonus_token_ids = self._greedy_sample(bonus_logits).view(-1)
             else:
@@ -4538,14 +4550,14 @@ class TPUModelRunner(GPUModelRunner):
         assert self.speculative_config is not None
         if self.rejection_sampler.synthetic_mode or not all_greedy:
             accept_u = torch.rand(
-                md.draft_token_ids.shape,
+                draft_token_ids.shape,
                 dtype=torch.float32,
                 device=target_logits.device,
                 generator=sampling_generator,
             )
         if all_greedy:
             return self.rejection_sampler(
-                draft_token_ids=md.draft_token_ids,
+                draft_token_ids=draft_token_ids,
                 num_draft_tokens=md.draft_lengths,
                 target_logits=target_logits,
                 bonus_token_ids=bonus_token_ids,
@@ -4562,7 +4574,7 @@ class TPUModelRunner(GPUModelRunner):
             target_logits, dtype=torch.float32, generator=sampling_generator
         )
         return self.rejection_sampler(
-            draft_token_ids=md.draft_token_ids,
+            draft_token_ids=draft_token_ids,
             num_draft_tokens=md.draft_lengths,
             target_logits=target_logits,
             bonus_token_ids=bonus_token_ids,

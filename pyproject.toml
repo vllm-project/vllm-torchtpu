@@ -135,8 +135,8 @@ torchtpu_layers = "vllm_torchtpu.layers:register_layers"
 # on top would overwrite it. Opt in with `pip install -e . --group vllm`.
 vllm = [
     # Note: we **intentionally** build vllm from source, see README.
-    # Keep vllm_test_utils on the same upstream tag below.
-    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.32.0",
+    # Keep vllm_test_utils on the same upstream commit below.
+    "vllm @ git+https://github.com/vllm-project/vllm.git@2de0531d81525b3fd652ca2f89810b2ff038395e",
 ]
 
 # Source for the `omni` extra's vllm-omni==0.32.0rc1 while that release is not
@@ -156,7 +156,7 @@ test = [
     "pytest-cov",
     "parameterized",
     # Not published on PyPI; lives in vLLM's tests/ directory.
-    "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@v0.32.0#subdirectory=tests/vllm_test_utils",
+    "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@2de0531d81525b3fd652ca2f89810b2ff038395e#subdirectory=tests/vllm_test_utils",
 ]
 
 [tool.pytest.ini_options]

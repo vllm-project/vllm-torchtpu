@@ -1059,33 +1059,17 @@ class TpuPlatform(Platform):
 
                 parallel_config.distributed_executor_backend = TpuMultiprocExecutor
         elif multihost_backend == "ray":
-            if parallel_config.data_parallel_size > 1:
-                if pcp_size > 1:
-                    raise NotImplementedError(
-                        "Prefill context parallelism is not supported "
-                        "together with multihost data parallelism."
-                    )
-                if not vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:
-                    raise NotImplementedError(
-                        "Multihost data parallelism requires the Ray V2 "
-                        "executor. Set VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1."
-                    )
-            if vllm_envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:
-                from vllm_torchtpu.executors.ray_distributed_executor_v2 import (
-                    RayDistributedExecutorV2,
+            if parallel_config.data_parallel_size > 1 and pcp_size > 1:
+                raise NotImplementedError(
+                    "Prefill context parallelism is not supported "
+                    "together with multihost data parallelism."
                 )
+            from vllm_torchtpu.executors.ray_distributed_executor_v2 import (
+                RayDistributedExecutorV2,
+            )
 
-                parallel_config.distributed_executor_backend = RayDistributedExecutorV2
-                logger.info(
-                    "Force using RayDistributedExecutorV2 for TPU on multihost."
-                )
-            else:
-                from vllm_torchtpu.executors.ray_distributed_executor import (
-                    RayDistributedExecutor,
-                )
-
-                parallel_config.distributed_executor_backend = RayDistributedExecutor
-                logger.info("Force using RayDistributedExecutor for TPU on multihost.")
+            parallel_config.distributed_executor_backend = RayDistributedExecutorV2
+            logger.info("Force using RayDistributedExecutorV2 for TPU on multihost.")
         else:
             logger.warning(
                 "Unknown TPU multihost backend: %s. Using uniproc_executor.",

@@ -546,3 +546,26 @@ def test_wan_self_attention_patch_falls_back_on_f32():
 
     apply_omni_model_specific_patches()
     assert WanSelfAttention()(torch.ones(1, 3, 8)) == "native"
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    [
+        "vllm_omni.diffusion.diffusion_engine",
+        "vllm_omni.entrypoints.openai.api_server",
+        "vllm_omni.entrypoints.cli.main",
+    ],
+)
+def test_vllm_omni_cold_import_subprocesses(module_name: str):
+    import importlib.machinery
+    import subprocess
+
+    if importlib.machinery.PathFinder.find_spec("vllm_omni") is None:
+        pytest.skip("vllm_omni is not installed in this environment")
+    result = subprocess.run(
+        [sys.executable, "-c", f"import {module_name}"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr

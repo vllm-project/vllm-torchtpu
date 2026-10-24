@@ -47,6 +47,7 @@ def _config(device="tpu", method=None, pcp=1):
             method=method,
             enable_adaptive_verification=False,
             parallel_drafting=method in ("dflash", "dspark"),
+            draft_lm_head_quantization=None,
             draft_model_config=SimpleNamespace(
                 architectures=["DFlashDraftModel"],
                 hf_config=SimpleNamespace(
@@ -100,7 +101,7 @@ def test_tpu_preserves_native_v1_rejections(feature, reason):
             "DFlash2DraftModel"
         ]
     elif feature == "diffusion":
-        config.model_config = SimpleNamespace(is_diffusion=True)
+        config.model_config = SimpleNamespace(is_diffusion=True, architecture="")
     else:
         config.parallel_config.enable_batch_sharded_sampling = True
     with pytest.raises(ValueError, match=reason):

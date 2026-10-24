@@ -240,18 +240,8 @@ def test_offloading_accepts_context_parallel_stages(stage_meshes):
     validate_pipeline_parallel_config(_config(pp=4, pcp=2, kv_transfer=OFFLOAD))
 
 
-def test_rejects_the_legacy_ray_executor(monkeypatch):
-    monkeypatch.setenv("TPU_MULTIHOST_BACKEND", "ray")
-    monkeypatch.setenv("VLLM_USE_RAY_V2_EXECUTOR_BACKEND", "0")
-    with pytest.raises(
-        NotImplementedError, match="legacy Ray.*VLLM_USE_RAY_V2_EXECUTOR_BACKEND=1"
-    ):
-        validate_pipeline_parallel_config(_config(pp=2))
-
-
 def test_accepts_the_ray_v2_executor(monkeypatch):
     monkeypatch.setenv("TPU_MULTIHOST_BACKEND", "ray")
-    monkeypatch.setenv("VLLM_USE_RAY_V2_EXECUTOR_BACKEND", "1")
     validate_pipeline_parallel_config(_config(pp=2))
 
 

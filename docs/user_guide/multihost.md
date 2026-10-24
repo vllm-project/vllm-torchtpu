@@ -5,7 +5,7 @@ When a model or parallelism configuration spans multiple TPU VM hosts in a pod s
 `vllm-torchtpu` supports two multi-host execution backends controlled by `TPU_MULTIHOST_BACKEND`:
 
 1. **Multiprocessing (`mp`) Backend (Default)**: Each TPU host runs its own `vllm serve` process and exchanges slice addresses over a `torch.distributed` `TCPStore` rendezvous (`src/vllm_torchtpu/distributed/tpu_mp_multihost.py`). No Ray cluster is required.
-2. **Ray (`ray`) Backend (`TPU_MULTIHOST_BACKEND=ray`)**: A Ray cluster spans all TPU hosts in the slice, and a single `vllm serve` driver on the head node schedules `RayDistributedExecutor` workers across the cluster.
+2. **Ray (`ray`) Backend (`TPU_MULTIHOST_BACKEND=ray`)**: A Ray cluster spans all TPU hosts in the slice, and a single `vllm serve` driver on the head node schedules `RayDistributedExecutorV2` workers across the cluster.
 
 ---
 

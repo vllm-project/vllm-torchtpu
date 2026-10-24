@@ -211,6 +211,8 @@ class DFlashProposer:
         self._draft_attn_layer_names = (
             set(all_attn_layers.keys()) - target_attn_layer_names
         )
+        for name in self._draft_attn_layer_names:
+            all_attn_layers[name].is_draft_layer = True
 
         # Share Embeddings and LM Head. DFlash drafts always predict target
         # vocab, so sharing is forced; DSpark overrides the flag because a

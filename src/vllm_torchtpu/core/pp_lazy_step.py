@@ -233,6 +233,7 @@ class LazyPushStepper:
             step.scheduler_output, model_output
         )
         core._attach_iteration_details(engine_core_outputs, iteration_details)
+        core._attach_weight_version(engine_core_outputs)
         return engine_core_outputs
 
     def _dispatch(self) -> bool:

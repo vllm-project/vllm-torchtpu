@@ -836,7 +836,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
     from dataclasses import replace
 
     from vllm.utils.math_utils import cdiv
-    from vllm.v1.core import kv_cache_coordinator, kv_cache_utils
+    from vllm.v1.core import kv_cache_coordinator, kv_cache_planning, kv_cache_utils
     from vllm.v1.kv_cache_interface import (
         AttentionSpec,
         FullAttentionSpec,
@@ -1098,26 +1098,25 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
     # uniform KV cache spec across groups, raising ValueError when encountering
     # heterogeneous layer configurations (e.g. hybrid attention/Mamba models,
     # pure linear state layers, or disaggregated PCP configurations with
-    # per-group block sizing). We patch it to catch ValueError and return an
-    # empty dict so initialization falls back cleanly to the TPU hybrid/PCP
-    # cache coordinator without crashing.
-    original_promote = getattr(kv_cache_utils, "_promote_local_kv_cache_specs", None)
-    if original_promote is not None and not getattr(
-        original_promote, "_tpu_hybrid_promote_patch", False
-    ):
+    # per-group block sizing). We patch it to catch ValueError and return the
+    # unmodified kv_cache_spec dict so initialization falls back cleanly to the
+    # TPU hybrid/PCP cache coordinator without crashing or logging a false
+    # promotion warning.
+    from vllm.v1.kv_cache_interface import KVCacheSpec
 
-        def patched_promote(specs):
+    original_promote = kv_cache_planning._promote_local_kv_cache_specs
+    if not getattr(original_promote, "_tpu_hybrid_promote_patch", False):
+
+        def patched_promote(
+            kv_cache_spec: dict[str, KVCacheSpec],
+        ) -> dict[str, KVCacheSpec]:
             try:
-                return original_promote(specs)
+                return original_promote(kv_cache_spec)
             except ValueError:
-                return {}
+                return kv_cache_spec
 
         patched_promote._tpu_hybrid_promote_patch = True
-        kv_cache_utils._promote_local_kv_cache_specs = patched_promote
-        for module_name in ("vllm.v1.engine.core", "vllm.v1.core.kv_cache_utils"):
-            mod = sys.modules.get(module_name)
-            if mod is not None and hasattr(mod, "_promote_local_kv_cache_specs"):
-                mod._promote_local_kv_cache_specs = patched_promote
+        kv_cache_planning._promote_local_kv_cache_specs = patched_promote
 
     if not getattr(EngineCoreProc, "_tpu_engine_core_patch_wrapper", False):
         EngineCoreProc._tpu_original_run_engine_core = EngineCoreProc.run_engine_core

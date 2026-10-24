@@ -296,6 +296,7 @@ class DeepseekV4Model(nn.Module):
         self.hc_mult = config.hc_mult
         self.hc_dim = self.hc_mult * config.hidden_size
         self.rms_norm_eps = config.rms_norm_eps
+        self.num_hash_layers: int = config.mlp_layer_types.count("hash_moe")
 
         self.topk_indices_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
@@ -392,9 +393,7 @@ class DeepseekV4Model(nn.Module):
         # handle -- and it would be a silent shape mismatch deep in a layer.
         hash_layers = typing.cast(
             Iterable[DeepseekV4DecoderLayer],
-            self.layers[
-                self.start_layer : min(self.end_layer, self.config.num_hash_layers)
-            ],
+            self.layers[self.start_layer : min(self.end_layer, self.num_hash_layers)],
         )
         wants = {layer.ffn.routes_dp_gathered_tokens for layer in hash_layers}
         assert len(wants) == 1, (
@@ -443,7 +442,7 @@ class DeepseekV4Model(nn.Module):
         # Hash routing is confined to the first `num_hash_layers`; only those
         # layers need ids gathered across DP.
         moe_input_ids = input_ids
-        if input_ids is not None and self.start_layer < self.config.num_hash_layers:
+        if input_ids is not None and self.start_layer < self.num_hash_layers:
             moe_input_ids = self._dp_gather_hash_moe_input_ids(input_ids)
 
         residual, post_mix, res_mix = None, None, None

@@ -223,11 +223,13 @@ def _sharded_runai_weights_iterator(
     local_expert_ids: set[int],
     use_tqdm_on_load: bool,
     model: torch.nn.Module | None = None,
+    is_unused_weight: Callable[[str], bool] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Stream only this rank's tensors from the safetensors files.
 
     Reads each file's safetensors header (via the Run:AI streamer, so
     ``gs://`` and local paths both work), drops non-local expert tensors
+    (and any checkpoint weights rejected by ``is_unused_weight``)
     from the request plan, and streams the surviving byte ranges as
     contiguous runs. The skipped bytes are never requested from storage.
     With ``model``, each decoder layer's online-FP8 linears are quantized
@@ -276,7 +278,9 @@ def _sharded_runai_weights_iterator(
         for path, meta in zip(hf_weights_files, metas):
             pos = meta.offset
             for tensor_meta, size in zip(meta.tensors_metadata, meta.read_sizes):
-                if _should_skip(tensor_meta.name, local_expert_ids):
+                if _should_skip(tensor_meta.name, local_expert_ids) or (
+                    is_unused_weight is not None and is_unused_weight(tensor_meta.name)
+                ):
                     skipped += 1
                     skipped_bytes += size
                     # A zero-byte skip leaves the byte stream contiguous, so
@@ -429,7 +433,12 @@ def patch_runai_sharded_expert_streaming() -> None:
         finally:
             self._loading_model = None
 
-    def _get_weights_iterator(self, model_or_path: str, revision: str | None):
+    def _get_weights_iterator(
+        self,
+        model_or_path: str,
+        revision: str | None,
+        is_unused_weight: Callable[[str], bool] | None = None,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
         try:
             local_expert_ids = _compute_local_expert_ids()
         except AttributeError:
@@ -447,7 +456,9 @@ def patch_runai_sharded_expert_streaming() -> None:
             )
             local_expert_ids = None
         if local_expert_ids is None:
-            return original_get_iterator(self, model_or_path, revision)
+            return original_get_iterator(
+                self, model_or_path, revision, is_unused_weight
+            )
         if getattr(self, "_is_distributed", False):
             # Per-rank fetch plans differ, so the streamer's cross-rank
             # broadcast mode would corrupt the chunk-id maps. Sharded
@@ -458,11 +469,21 @@ def patch_runai_sharded_expert_streaming() -> None:
                 "plans; streaming per rank instead."
             )
         hf_weights_files = self._prepare_weights(model_or_path, revision)
+        if is_unused_weight is not None:
+            if rsl.is_runai_obj_uri(model_or_path):
+                hf_weights_files = rsl._filter_remote_weights(
+                    hf_weights_files, model_or_path, is_unused_weight
+                )
+            else:
+                hf_weights_files = rsl.filter_safetensors_files_by_weight_name(
+                    hf_weights_files, is_unused_weight
+                )
         return _sharded_runai_weights_iterator(
             hf_weights_files,
             local_expert_ids,
             self.load_config.use_tqdm_on_load,
             self._loading_model,
+            is_unused_weight=is_unused_weight,
         )
 
     rsl.RunaiModelStreamerLoader._loading_model = None

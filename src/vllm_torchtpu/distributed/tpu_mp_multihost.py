@@ -34,7 +34,7 @@ multi-host ICI mesh before local workers are forked:
   * TORCH_TPU_SLICEBUILDER_ADDRESSES - "ip:port" for every worker on every
     host, ordered by increasing global rank, so all torch_tpu processes in
     the mesh can find each other. Mirrors the address list
-    ray_distributed_executor.py builds for the Ray backend.
+    ray_distributed_executor_v2.py builds for the Ray backend.
   * TORCH_TPU_TOPOLOGY - ICI mesh shape for the full chip count, looked up
     the same way the Ray backend does (get_tpu_multihost_topology).
 
@@ -168,7 +168,7 @@ def prepare_mp_multihost_env(parallel_config) -> None:
         key_prefix="tpu_mp_nnodes",
     )
 
-    # Same construction as ray_distributed_executor.py: one address per chip,
+    # Same construction as ray_distributed_executor_v2.py: one address per chip,
     # ordered by (host, local_rank), spanning every host in the slice.
     base_port = envs.TORCH_TPU_BASE_PORT
     sb_addresses = [
@@ -180,7 +180,7 @@ def prepare_mp_multihost_env(parallel_config) -> None:
 
     # Lazy import: tpu_platform.py imports this module from inside
     # check_and_update_config to avoid a top-level circular import. Mirrors
-    # the lookup ray_distributed_executor.py uses for the Ray backend.
+    # the lookup ray_distributed_executor_v2.py uses for the Ray backend.
     from vllm_torchtpu.platforms.tpu_platform import get_tpu_multihost_topology
 
     topology = get_tpu_multihost_topology(total_chips)

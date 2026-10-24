@@ -333,8 +333,8 @@ def _add_request(scheduler: Scheduler, request_id: str, num_prompt_tokens: int):
 @pytest.mark.parametrize(
     ("method", "parallel_drafting", "upstream_slots", "tpu_slots"),
     [
-        ("dflash", True, NUM_SPEC_TOKENS, 0),
-        ("dspark", True, NUM_SPEC_TOKENS - 1, 0),
+        ("dflash", True, 0, 0),
+        ("dspark", True, 0, 0),
         # Methods without a TPU block drafter keep upstream's charge.
         ("eagle3", True, NUM_SPEC_TOKENS - 1, NUM_SPEC_TOKENS - 1),
         ("draft_model", True, NUM_SPEC_TOKENS, NUM_SPEC_TOKENS),

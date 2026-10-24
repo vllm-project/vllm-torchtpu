@@ -35,6 +35,8 @@ def _config(
             block_size=512,
             enable_prefix_caching=enable_prefix_caching,
             prefix_match_unit=None,
+            num_gpu_blocks_override=None,
+            prefix_cache_retention_interval=0,
             # PallasAttentionBackend's default layout.
             get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBNHC,
         ),
@@ -328,7 +330,7 @@ def test_full_attention_capacity_counts_rank_local_pages(
 
 def test_pcp_1m_hybrid_capacity_admission_and_autofit():
     _patch_vllm_hybrid_pcp_block_sizes()
-    from vllm.v1.core import kv_cache_utils
+    from vllm.v1.core import kv_cache_planning
 
     config = _config(pcp=16)
     config.model_config = SimpleNamespace(max_model_len=1048576)
@@ -349,19 +351,24 @@ def test_pcp_1m_hybrid_capacity_admission_and_autofit():
         KVCacheGroupSpec([f"gdn.{j}.{i}" for i in range(23)], gdn) for j in range(3)
     ]
     # FA uses 128 local pages; each of three GDN groups retains two states.
-    needed = kv_cache_utils._max_memory_usage_bytes_from_groups(config, groups)
+    builder = kv_cache_planning.DefaultKVCacheConfigBuilder()
+    needed = kv_cache_planning._max_memory_usage_bytes_from_groups(
+        builder, config, groups
+    )
     assert needed == (128 + 3 * 2) * 23 * page_bytes
     usable = (1024 - 1) * 23 * page_bytes
-    kv_cache_utils._check_enough_kv_cache_memory(
+    kv_cache_planning._check_enough_kv_cache_memory(
         usable,
         lambda: needed,
         config.model_config.max_model_len,
-        lambda available: kv_cache_utils._estimate_max_model_len_from_groups(
-            config, groups, available
+        lambda available: kv_cache_planning._estimate_max_model_len_from_groups(
+            builder, config, groups, available
         ),
     )
     assert (
-        kv_cache_utils._estimate_max_model_len_from_groups(config, groups, usable)
+        kv_cache_planning._estimate_max_model_len_from_groups(
+            builder, config, groups, usable
+        )
         == 1048576
     )
     assert config.model_config.max_model_len == 1048576
