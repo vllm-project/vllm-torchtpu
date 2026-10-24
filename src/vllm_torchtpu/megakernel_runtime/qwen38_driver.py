@@ -85,6 +85,37 @@ def _parse_int(raw: str, key: str) -> int | None:
     return None
 
 
+_UNSET = object()
+
+
+def _vllm_env_override(**values: Any) -> Any:
+    """Override `vllm.envs` attributes inside the context.
+
+    Workers cache `vllm.envs` lookups after init (`enable_envs_cache`), so the
+    process environment cannot be changed then; a module attribute takes
+    precedence over the module's (cached) `__getattr__`.
+    """
+    import contextlib
+
+    import vllm.envs as venvs
+
+    @contextlib.contextmanager
+    def ctx():
+        saved = {k: venvs.__dict__.get(k, _UNSET) for k in values}
+        for k, v in values.items():
+            setattr(venvs, k, v)
+        try:
+            yield
+        finally:
+            for k, old in saved.items():
+                if old is _UNSET:
+                    delattr(venvs, k)
+                else:
+                    setattr(venvs, k, old)
+
+    return ctx()
+
+
 def _pallas_tp_mesh(runner: Any) -> Any:
     """The 8-device `tp` mesh every Pallas kernel in the served program uses.
 
@@ -355,6 +386,7 @@ class Qwen38SegmentDriver:
         self.mk_calls = 0
         self.sync = False  # `sync=1`: wait for the first calls' outputs and log it (bisecting)
         self.warm = False  # `warm=1`: host barriers around the first (compiling) call
+        self.noaot = False  # `noaot=1`: no AOT serialization / compile cache for the segment program
 
     @classmethod
     def maybe_create(cls, runner: Any) -> Qwen38SegmentDriver | None:
@@ -392,6 +424,7 @@ class Qwen38SegmentDriver:
         drv.mtp = _parse_flag(raw, "mtp", False)
         drv.sync = _parse_flag(raw, "sync", False)
         drv.warm = _parse_flag(raw, "warm", False)
+        drv.noaot = _parse_flag(raw, "noaot", False)
         logger.info(
             "Qwen3.8 segment megakernel enabled, verify buckets %s, shadow checks %d, hier %s, rings %s, head %s",
             drv.buckets,
@@ -437,6 +470,13 @@ class Qwen38SegmentDriver:
         cfg = getattr(self, "cfg", None) or runner.vllm_config
         stack.enter_context(set_vllm_model_wrapper_context(mesh=runner.mesh, vllm_config=cfg))
         stack.enter_context(set_current_vllm_config(cfg))
+        if getattr(self, "noaot", False):
+            # `noaot=1`: the segment program is compiled without vLLM's AOT
+            # serialization and compile cache (as the Qwen3.5 megakernel step,
+            # torch.compile(..., serializable=False)); the main model keeps both.
+            stack.enter_context(
+                _vllm_env_override(VLLM_USE_AOT_COMPILE=False, VLLM_DISABLE_COMPILE_CACHE=True)
+            )
         return stack
 
     def bind_and_warmup(self, runner: Any) -> None:
