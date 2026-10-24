@@ -14,7 +14,7 @@
 """TPU DeepSeek-V4 KV/score compressor, on the compress-and-store kernels."""
 
 import functools
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Self, cast
 
 import jax
 import torch
@@ -250,6 +250,44 @@ def _compressor_jax_indexer(
     return new_cache
 
 
+class RunLocalStateSpec(SlidingWindowMLASpec):
+    """Compressor state whose window is exactly one compressed run.
+
+    The HCA (ratio 128) compressor pools each 128-token run into one
+    compressed entry; its state window is just that run (the ratio-4
+    compressor's 8-token window also covers the previous run). With the block
+    size a multiple of 128, a prefix hit resumes at a run start and never
+    reads state from before the hit, so the state needs no caching.
+
+    As a plain 128-token sliding window, vLLM would cache and offload these
+    blocks at every block boundary. Not prefix-cacheable, the group is skipped
+    by the hit lookup, caches nothing, and is left out of KV offload; blocks
+    for tokens being computed are allocated as usual.
+    """
+
+    @property
+    def prefix_cacheable(self) -> bool:
+        return False
+
+    # The inherited grouping checks neither the spec type nor prefix
+    # caching, so it would fold a cacheable window of the same size into
+    # this group (or this state into a cacheable group).
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        assert all(isinstance(spec, RunLocalStateSpec) for spec in specs), (
+            "RunLocalStateSpec cannot share a KV cache group with a "
+            "prefix-cacheable SlidingWindowMLASpec."
+        )
+        return super().merge(specs)
+
+    def is_uniform_with_collection(
+        self, kv_cache_specs: dict[str, KVCacheSpec]
+    ) -> bool:
+        return all(
+            isinstance(spec, RunLocalStateSpec) for spec in kv_cache_specs.values()
+        ) and super().is_uniform_with_collection(kv_cache_specs)
+
+
 class VllmCompressorStateCache(CompressorStateCache):
     """Compressor state cache, paged to fit the array that hosts it."""
 
@@ -323,15 +361,26 @@ class VllmCompressorStateCache(CompressorStateCache):
         return block_size
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        kv_cache_block_size = vllm_config.cache_config.block_size
+        run_local = self.sliding_window == self.compress_ratio
+        # Run-local state is only safe if every prefix hit lands on a run start.
+        if run_local and kv_cache_block_size % self.compress_ratio:
+            raise ValueError(
+                f"DeepSeek-V4 compressor state cache {self.prefix!r}: block size "
+                f"{kv_cache_block_size} is not a multiple of the compress ratio "
+                f"{self.compress_ratio}: a prefix hit could land mid-run, whose "
+                "earlier state RunLocalStateSpec does not cache"
+            )
         # `_build_compressor_op` bakes `block_size` in as the kernel's
         # `state_block_size`, so spec and kernel must not disagree.
-        self.block_size = self._derive_block_size(vllm_config.cache_config.block_size)
+        self.block_size = self._derive_block_size(kv_cache_block_size)
         # uint8 is deliberate: the kernel writes raw f32 state bytes, and
         # declaring the real dtype would make the byte budget disagree with
         # the packed layout the host array actually uses. The physical overlay
         # onto that host is done by the runner.
         bytes_per_row = self.state_dim * 4
-        return SlidingWindowMLASpec(
+        spec_cls = RunLocalStateSpec if run_local else SlidingWindowMLASpec
+        return spec_cls(
             block_size=self.block_size,
             num_kv_heads=1,
             head_size=align_to(bytes_per_row, 128),

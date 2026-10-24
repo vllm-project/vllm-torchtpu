@@ -471,6 +471,8 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         # Retain pool tensor references to dispatch their writes during save fences.
         self._pool_sync_tensors = [pool_tensor.tensor for pool_tensor in pool_tensors]
 
+        # One ref list per offloaded group, as vLLM's own registration builds:
+        # groups that are not prefix-cacheable are not offloaded.
         group_data_refs = [
             [
                 CanonicalKVCacheRef(
@@ -478,7 +480,9 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                 )
                 for idx, pool_tensor in enumerate(pool_tensors)
             ]
-            for _ in self.connector_worker.kv_cache_config.kv_cache_groups
+            for _ in offloading_config_module.get_offloading_group_ids(
+                self.connector_worker.kv_cache_config
+            )
         ]
 
         self.connector_worker._init_worker(
