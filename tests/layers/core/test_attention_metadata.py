@@ -14,6 +14,7 @@
 
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
@@ -43,7 +44,7 @@ class TestAttentionMetadataBuilderPlumbing:
         runner.max_num_reqs = max_num_reqs
         runner.most_model_len = most_model_len
         runner.position_ids = torch.full((8,), 42, dtype=torch.int32)
-        runner._block_table_stage_cpu = None
+        runner._unfenced_h2d_sources = []
         runner.attn_groups = []
         runner._unified_kv_layout = False
 
@@ -426,7 +427,6 @@ class TestAttentionMetadataBuilderPlumbing:
         def make(staged):
             runner = self._make_runner_mock(num_groups=3, max_num_blocks_per_req=6)
             runner._unified_kv_layout = True
-            runner._block_table_stage_cpu = None
             attn = self._make_builder(runner, kv_cache_group_id=0)
             mambas = [
                 self._make_mamba_builder(runner, kv_cache_group_id=gid)
@@ -500,10 +500,78 @@ class TestAttentionMetadataBuilderPlumbing:
         assert ctx.staged_mamba_products is None
         assert ctx.staged_block_tables[0].numel() == 4 * 4
 
+    @pytest.mark.parametrize("num_groups", [1, 3])
+    def test_each_staged_walk_owns_its_host_buffer(self, num_groups):
+        """TorchTPU reads a non-blocking H2D source until the copy drains, so a
+        later chunk, draft or dummy walk must neither refill nor drop an earlier
+        walk's buffer before the staging fence releases it."""
+        runner = self._make_runner_mock(num_groups=num_groups)
+        self._make_attn_groups(
+            runner, [self._make_builder(runner, gid) for gid in range(num_groups)]
+        )
+        snapshots = []
+        for start, count, padded, dummy in [
+            (0, 2, 4, False),
+            (1, 1, 2, False),
+            (0, 3, 4, True),
+        ]:
+            ctx = AttentionMetadataBuilderContext(
+                num_reqs=count,
+                start_index=start,
+                use_max_model_len=True,
+                seq_lens=torch.ones(padded, dtype=torch.int32),
+                query_start_loc=torch.arange(padded + 1, dtype=torch.int32),
+                request_distribution=torch.tensor(
+                    [count, count, count], dtype=torch.int32
+                ),
+                position_ids_override=torch.zeros(1) if dummy else None,
+            )
+            stage_block_table_uploads(runner, ctx, padded)
+            snapshots.append(runner._unfenced_h2d_sources[-1].clone())
+
+        sources = runner._unfenced_h2d_sources
+        assert len(sources) == 3
+        assert len({src.data_ptr() for src in sources}) == 3
+        for src, snapshot in zip(sources, snapshots, strict=True):
+            torch.testing.assert_close(src, snapshot, rtol=0, atol=0)
+        # The first walk's rows survived the smaller batch and the dummy walk.
+        expected = torch.zeros((4, 4), dtype=torch.int32)
+        expected[:2] = runner.input_batch.block_table[0].get_cpu_tensor()[:2]
+        torch.testing.assert_close(
+            sources[0][: 4 * 4].view(4, 4), expected, rtol=0, atol=0
+        )
+
+    def test_each_unstaged_build_owns_its_host_buffer(self):
+        """The unstaged build() fallback must not reuse a shared block table
+        buffer across walks either."""
+        runner = self._make_runner_mock(num_groups=1)
+        builder = self._make_builder(runner, kv_cache_group_id=0)
+        snapshots = []
+        for start, count, padded in [(0, 2, 4), (1, 1, 2)]:
+            runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+                num_reqs=count,
+                start_index=start,
+                use_max_model_len=True,
+                seq_lens=torch.ones(padded, dtype=torch.int32),
+                query_start_loc=torch.arange(padded + 1, dtype=torch.int32),
+                request_distribution=torch.tensor(
+                    [count, count, count], dtype=torch.int32
+                ),
+            )
+            builder.build(
+                common_prefix_len=0, common_attn_metadata=self._make_cm(padded)
+            )
+            snapshots.append(runner._unfenced_h2d_sources[-1].clone())
+
+        sources = runner._unfenced_h2d_sources
+        assert len(sources) == 2
+        assert sources[0].data_ptr() != sources[1].data_ptr()
+        for src, snapshot in zip(sources, snapshots, strict=True):
+            torch.testing.assert_close(src, snapshot, rtol=0, atol=0)
+
     def test_staged_build_skips_per_group_upload(self):
         """With views staged, build() must not touch the CPU block table."""
         runner = self._make_runner_mock(num_groups=1)
-        runner._block_table_stage_cpu = None
         builder = self._make_builder(runner, kv_cache_group_id=0)
         self._make_attn_groups(runner, [builder])
         ctx = AttentionMetadataBuilderContext(
@@ -524,7 +592,6 @@ class TestAttentionMetadataBuilderPlumbing:
 
     def test_staging_respects_gid_subset_and_dummy_override(self):
         runner = self._make_runner_mock(num_groups=2)
-        runner._block_table_stage_cpu = None
         builders = [
             self._make_builder(runner, kv_cache_group_id=gid) for gid in range(2)
         ]
