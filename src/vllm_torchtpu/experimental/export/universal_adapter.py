@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import inspect
+import itertools
 import math
 import os
 from collections.abc import Mapping, Sequence
@@ -463,6 +464,67 @@ def _backbone_kwargs(
     if "attn_metadata" in params:
         kwargs["attn_metadata"] = attn_metadata
     return kwargs
+
+
+@contextlib.contextmanager
+def _weights_bound_in_place(module: nn.Module, weights: Mapping[str, Any]) -> Any:
+    """Rebinds `weights` on plain objects and restores shared submodules on exit.
+
+    `functional_call` rebinds module attributes only, while some layers hand a
+    parameter to a plain attribute object (vLLM MoE routers keep the gate's
+    `e_score_correction_bias`). In addition, when a submodule is reachable at
+    two paths in `named_modules()` (vLLM's `MoERunner` sets `self.gate = gate`
+    alongside `mlp.gate`), `functional_call` swaps the submodule's parameter
+    twice and leaves the bound `torch.Tensor` in `sub.__dict__` instead of
+    restoring `sub._parameters`, breaking the second forward pass. Snapshot
+    each submodule's parameter/buffer/attribute tables and restore them on exit.
+    """
+    bound: dict[int, Any] = {}
+    tensors = itertools.chain(
+        module.named_parameters(remove_duplicate=False),
+        module.named_buffers(remove_duplicate=False),
+    )
+    for name, tensor in tensors:
+        value = weights.get(name)
+        if isinstance(value, torch.Tensor):
+            bound[id(tensor)] = value
+    sub_snapshots: list[
+        tuple[nn.Module, dict[str, Any], dict[str, Any], dict[str, Any]]
+    ] = []
+    restore: list[tuple[Any, str, Any]] = []
+    try:
+        for sub in module.modules():
+            sub_snapshots.append(
+                (
+                    sub,
+                    dict(sub._parameters),
+                    dict(sub._buffers),
+                    dict(vars(sub)),
+                )
+            )
+            for holder in vars(sub).values():
+                if isinstance(holder, (nn.Module, torch.Tensor)) or not hasattr(
+                    holder, "__dict__"
+                ):
+                    continue
+                for attr, held in list(vars(holder).items()):
+                    if isinstance(held, torch.Tensor) and id(held) in bound:
+                        restore.append((holder, attr, held))
+                        setattr(holder, attr, bound[id(held)])
+        yield
+    finally:
+        for holder, attr, held in reversed(restore):
+            setattr(holder, attr, held)
+        for sub, orig_params, orig_buffers, orig_vars in reversed(sub_snapshots):
+            sub._parameters.clear()
+            sub._parameters.update(orig_params)
+            sub._buffers.clear()
+            sub._buffers.update(orig_buffers)
+            sub_vars = vars(sub)
+            for k in list(sub_vars):
+                if k not in orig_vars:
+                    del sub_vars[k]
+            sub_vars.update(orig_vars)
 
 
 def _is_recurrent_layer(layer: Any) -> bool:
@@ -942,9 +1004,10 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
 
                 def _call(kw: dict[str, Any]) -> Any:
                     if use_func:
-                        return torch.func.functional_call(
-                            backbone, call_weights, args=(), kwargs=kw
-                        )
+                        with _weights_bound_in_place(backbone, call_weights):
+                            return torch.func.functional_call(
+                                backbone, call_weights, args=(), kwargs=kw
+                            )
                     return backbone(**kw)
 
                 out = _call(
