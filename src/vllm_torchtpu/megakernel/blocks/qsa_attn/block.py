@@ -92,6 +92,10 @@ def attend_row(
     interpret: bool,
     fold: bool = False,
     ablate: str = "",
+    table: Any = None,
+    rows_per_req: int = 1,
+    table_row_base: Any = 0,
+    recent: tuple[jax.Array, jax.Array, jax.Array, jax.Array] | None = None,
 ) -> tuple[jax.Array, Any, Any]:
     """Gated sparse attention of row `r`: `([nh, 256]` F32, next `g0`, next `pre`).
 
@@ -107,6 +111,19 @@ def attend_row(
 
     `q`, `gate`: `[nh, 256]`. `ring`: `[2, TILE, 1, 4, 256]` FP8 VMEM; `sems`: DMA
     semaphores `[2]`. `pages` / `kv_len`: SMEM refs.
+
+    `table` (SMEM `[tables, pages_per_seq]`): `pages` then holds request-local
+    group ids `v`, mapped to the micro-page
+    `table[table_row_base + row // rows_per_req, v >> shift] * per_page + (v & (per_page - 1))`
+    (one extra SMEM load per copy). Without it `pages` holds micro-page ids.
+
+    `recent = (k [n, 256], v [n, 256], ok_row [1, n], ok_col [n, 1])`: extra tokens
+    held in VMEM (e.g. the step's own, not yet in the pool), merged into the
+    online softmax after the pool tiles. `k` / `v` are F32 in pool units (the FP8
+    values, not multiplied by the FP8 scales), so they take exactly the pool's
+    scaling path in both `fold` modes. `ok_row` / `ok_col` mark this row's valid
+    tokens (both layouts: Mosaic has no i1 transpose). A row with no pool tokens
+    but valid recent ones is attended, not zeroed.
     """
     per_page = pool.shape[1] // MICRO
     nrows = pages.shape[0] if nrows is None else nrows
@@ -138,6 +155,11 @@ def attend_row(
         out = []
         for j in range(TILE // MICRO):
             v = pages[row, jnp.minimum(t * (TILE // MICRO) + j, ncols - 1)]
+            if table is not None:
+                v = (
+                    table[table_row_base + row // rows_per_req, v >> shift] * per_page
+                    + (v & (per_page - 1))
+                )
             out.append(
                 pltpu.make_async_copy(
                     pool.at[v >> shift, pl.ds((v & (per_page - 1)) * MICRO, MICRO)],
@@ -229,13 +251,29 @@ def attend_row(
         jnp.zeros((nh, 1), F32),
         jnp.zeros((nh, dim), F32),
     )
-    _, l, acc = jax.lax.fori_loop(0, ntiles, tile, init)
+    m, l, acc = jax.lax.fori_loop(0, ntiles, tile, init)
+    has = length > 0
+    if recent is not None:
+        rk, rv, ok_row, ok_col = recent
+        key = rk if static(k_mul) and k_mul == 1.0 else rk * k_mul
+        sc = jax.lax.dot_general(qf, key, (((1,), (1,)), ((), ())), preferred_element_type=F32)
+        if not (static(s_mul) and s_mul == 1.0):
+            sc = sc * s_mul
+        sc = jnp.where(ok_row, sc, -jnp.inf)
+        m_new = jnp.maximum(m, jnp.max(sc, axis=-1, keepdims=True))
+        safe = jnp.where(m_new == -jnp.inf, 0.0, m_new)
+        p = jnp.where(ok_row, jnp.exp(sc - safe), 0.0)
+        alpha = jnp.where(m == -jnp.inf, 0.0, jnp.exp(m - safe))
+        val = rv if static(v_mul) and v_mul == 1.0 else rv * v_mul
+        l = l * alpha + jnp.sum(p, axis=-1, keepdims=True)
+        acc = acc * alpha + jnp.dot(p, jnp.where(ok_col, val, 0.0), preferred_element_type=F32)
+        has = has | (jnp.max(jnp.where(ok_row, 1, 0)) > 0)
     attn = acc / jnp.where(l > 0, l, 1.0) * (scale_v if fold else 1.0)
     gated = (
         attn.astype(BF16).astype(F32) * jax.nn.sigmoid(gate.astype(F32)).astype(BF16).astype(F32)
     ).astype(BF16).astype(F32)
     pre_next = jnp.where(cross, jnp.minimum(nslots - 1, ntiles_next), 0)
-    return jnp.where(length > 0, gated, 0.0), g0 + ntiles, pre_next
+    return jnp.where(has, gated, 0.0), g0 + ntiles, pre_next
 
 
 def lax_rem(a: Any, b: int) -> Any:
