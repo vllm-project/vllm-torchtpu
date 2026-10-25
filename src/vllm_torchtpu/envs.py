@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_SEND_GROUP_ROWS: int = 8
     TPU_DCP_MLA_SEND_SMALL_A2A: bool = True
     TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS: int = 8
+    TPU_DCP_MLA_SEND_SMALL_A2A_MERGE: bool = False
     TPU_MLA_FUSED_SMALL_A2A: bool = True
     TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB: int = 16
     TPU_MLA_FUSED_SMALL_A2A_PIN_MIN_TOKENS: int = 8
@@ -634,6 +635,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MLA_SEND_SMALL_A2A": env_bool("TPU_DCP_MLA_SEND_SMALL_A2A", default=True),
     "TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS": env_int(
         "TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS", 8
+    ),
+    # With TPU_DCP_MLA_SEND_SMALL_A2A, on the buckets it takes whose T * L
+    # partial rows are whole 16-row chunks and at most 128 (T <= 32 at L = 4):
+    # peers push into a VMEM receive scratch and the small all-to-all also
+    # runs the unpack and `_merge_received` in its tail, on the live rows
+    # only, writing the rest as zeros, so the op returns the merged bf16
+    # [T, L, V] and no merge op runs between it and W_UV. Not bit-identical
+    # to torch's merge (exp / summation order).
+    "TPU_DCP_MLA_SEND_SMALL_A2A_MERGE": env_bool(
+        "TPU_DCP_MLA_SEND_SMALL_A2A_MERGE", default=False
     ),
     # On the buckets TPU_DCP_MLA_SEND_SMALL_A2A takes (T <= its cap, a power of
     # 2) whose attention grid is one step (decode body step lever "step8",
