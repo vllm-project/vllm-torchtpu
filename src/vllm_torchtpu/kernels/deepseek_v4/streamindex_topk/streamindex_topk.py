@@ -76,6 +76,29 @@ def align_to(x, a):
     return cdiv(x, a) * a
 
 
+def _query_score_sublanes(query_tokens, compression_ratio, k, page_size, blocks, full):
+    # A score DMA writes complete KV tiles, including the last partial tile.
+    bound = max(k, cdiv(query_tokens, compression_ratio))
+    width = max(align_to(bound, page_size * block) for block in blocks)
+    return min(full, width // 128)
+
+
+def _query_prefix_fits(seq_lens, cu_q_lens, distribution, compression_ratio, bound):
+    query_lens = cu_q_lens[1:] - cu_q_lens[:-1]
+    active = (jnp.arange(seq_lens.shape[0]) < distribution[2]) & (query_lens > 0)
+    lengths = jnp.maximum(jnp.where(active, seq_lens, 0), 0)
+    # Conservatively fit the complete context, including an incomplete group.
+    # Divide first so the addition cannot overflow a nonnegative int32 length.
+    compressed = lengths // compression_ratio + (lengths % compression_ratio != 0)
+    return (
+        (distribution[2] >= 0)
+        & (distribution[2] <= seq_lens.shape[0])
+        & jnp.all(query_lens >= 0)
+        & jnp.all(jnp.where(active, seq_lens >= query_lens, True))
+        & (jnp.max(compressed) <= bound)
+    )
+
+
 def get_dtype_bitwidth(dtype):
     return jax.dtypes.itemsize_bits(dtype)
 
@@ -1338,6 +1361,7 @@ def streamindex_topk(
         chunk_tokens=None,
         scheduling_group_id=None,
         chunk_idx=0,
+        score_sublanes=None,
     ):
         max_num_tokens, num_q_heads, head_dim = q.shape
         # Only support batching for decode sequences.
@@ -1414,7 +1438,13 @@ def streamindex_topk(
                     disable_bounds_checks=True,
                 ),
                 out_shape=jax.ShapeDtypeStruct(
-                    shape=(chunk_tokens, num_sublanes_total, 128),
+                    shape=(
+                        chunk_tokens,
+                        num_sublanes_total
+                        if score_sublanes is None
+                        else score_sublanes,
+                        128,
+                    ),
                     dtype=out_dtype,
                 ),
                 input_output_aliases=input_output_aliases,
@@ -1527,6 +1557,7 @@ def streamindex_topk(
         chunk_tokens,
         out_dtype,
         scheduling_group_id,
+        score_sublanes,
     ):
         """Scores for one window of the flat token axis, in a private buffer."""
         # `scores=None`: no -inf pre-fill. It would write all of HBM scores, and
@@ -1552,6 +1583,7 @@ def streamindex_topk(
                 chunk_tokens=chunk_tokens,
                 out_dtype=out_dtype,
                 scheduling_group_id=scheduling_group_id,
+                score_sublanes=score_sublanes,
                 **spec,
             )
         assert scores is not None
@@ -1592,24 +1624,41 @@ def streamindex_topk(
         else:
             num_chunks, chunk_len = max_num_tokens // chunk_tokens, chunk_tokens
 
-        # Ids count from 1, so the 0 is never a real group: a single chunk has no
-        # pair to annotate and takes the `None` branch below both times.
+        fast_sublanes = _query_score_sublanes(
+            max_num_tokens,
+            compression_ratio,
+            k,
+            page_size,
+            num_kv_pages_per_blocks,
+            num_sublanes_total,
+        )
+        bounded = (
+            num_chunks > 1
+            and type(topk_backend) is SparseCoreTopK
+            and cp_size == 1
+            and fast_sublanes < num_sublanes_total
+            and (
+                components is None
+                or getattr(components.schedule, "preserves_kv_extent", False)
+            )
+        )
         group_base = 0
         if (
             num_chunks > 1
             and topk_backend.overlaps_scoring
             and scheduling_group_namespace is None
         ):
-            group_base = config.reserve_scheduling_group_ids(num_chunks - 1)
+            group_base = config.reserve_scheduling_group_ids(
+                (num_chunks - 1) * (2 if bounded else 1)
+            )
 
-        def group_id(chunk_pair):
+        def group_id(chunk_pair, branch):
+            pair = 2 * chunk_pair + branch if bounded else chunk_pair
             if scheduling_group_namespace is None:
-                return 2 * (group_base + chunk_pair) - 1
+                return 2 * (group_base + pair) - 1
             if scheduling_group_namespace == 0:
                 return None
-            return config.scoped_scheduling_group_id(
-                scheduling_group_namespace, chunk_pair
-            )
+            return config.scoped_scheduling_group_id(scheduling_group_namespace, pair)
 
         chunk_starts = (
             (None,)
@@ -1620,74 +1669,96 @@ def streamindex_topk(
             (spec, _pass_metadata(spec, chunk_starts, chunk_len))
             for spec in _pass_specs(decode_batch_end)
         )
-        topk_idxs = []
-        topk_scores_list = []
-        for m in range(num_chunks):
-            # Group g holds chunk g's SparseCore top-k and chunk g+1's TensorCore
-            # scoring, so the scheduler emits `sc(g).start, tc(g+1), sc(g).done`.
-            # Chunk 0's scoring and the last top-k have no partner.
-            tc_group = (
-                group_id(m - 1) if m > 0 and topk_backend.overlaps_scoring else None
-            )
-            sc_group = (
-                group_id(m)
-                if m < num_chunks - 1 and topk_backend.overlaps_scoring
-                else None
-            )
 
-            start = m * chunk_len
-            scores = _scores_for_chunk(
-                passes,
-                m,
-                chunk_starts[m],
-                chunk_len,
-                out_dtype,
-                tc_group,
-            )
-            scores = scores.reshape(chunk_len, -1)
-            if scores.shape[1] < k:
-                scores = jnp.pad(
-                    scores,
-                    ((0, 0), (0, k - scores.shape[1])),
-                    constant_values=BITS_NEG_INF,
+        def select_chunks(score_sublanes, branch):
+            topk_idxs = []
+            topk_scores_list = []
+            for m in range(num_chunks):
+                # Pair chunk g's SparseCore top-k with chunk g+1's TensorCore
+                # scoring, so the scheduler emits `sc(g).start, tc(g+1), sc(g).done`.
+                # Chunk 0's scoring and the last top-k have no partner.
+                tc_group = (
+                    group_id(m - 1, branch)
+                    if m > 0 and topk_backend.overlaps_scoring
+                    else None
+                )
+                sc_group = (
+                    group_id(m, branch)
+                    if m < num_chunks - 1 and topk_backend.overlaps_scoring
+                    else None
                 )
 
-            selected = topk_backend.select(
-                scores,
-                k,
-                row_lengths=eff_row_lengths[start : start + chunk_len],
-                scheduling_group_id=sc_group,
-                return_scores=return_scores,
+                start = m * chunk_len
+                scores = _scores_for_chunk(
+                    passes,
+                    m,
+                    chunk_starts[m],
+                    chunk_len,
+                    out_dtype,
+                    tc_group,
+                    score_sublanes,
+                )
+                scores = scores.reshape(chunk_len, -1)
+                if scores.shape[1] < k:
+                    scores = jnp.pad(
+                        scores,
+                        ((0, 0), (0, k - scores.shape[1])),
+                        constant_values=BITS_NEG_INF,
+                    )
+
+                selected = topk_backend.select(
+                    scores,
+                    k,
+                    row_lengths=eff_row_lengths[start : start + chunk_len],
+                    scheduling_group_id=sc_group,
+                    return_scores=return_scores,
+                )
+                if return_scores:
+                    assert isinstance(selected, tuple)
+                    chunk_topk_idxs, chunk_topk_scores = selected
+                    topk_scores_list.append(chunk_topk_scores)
+                else:
+                    assert isinstance(selected, jax.Array)
+                    chunk_topk_idxs = selected
+                topk_idxs.append(chunk_topk_idxs)
+
+            out = topk_idxs[0] if len(topk_idxs) == 1 else jnp.concatenate(topk_idxs)
+            out = out[:max_num_tokens, :k]
+
+            if cp_size == 1 and not return_scores:
+                return out
+
+            # Columns in `out` are rank-local compressed positions. Even when
+            # `cp_size > 1`, `streamindex_topk` only returns rank-local indices (callers
+            # like `streamindex_topk_dcp` resolve winners directly against their local
+            # candidate list without converting to global coordinates).
+            if not return_scores:
+                return out
+
+            scores_out = (
+                topk_scores_list[0]
+                if len(topk_scores_list) == 1
+                else jnp.concatenate(topk_scores_list)
             )
-            if return_scores:
-                assert isinstance(selected, tuple)
-                chunk_topk_idxs, chunk_topk_scores = selected
-                topk_scores_list.append(chunk_topk_scores)
-            else:
-                assert isinstance(selected, jax.Array)
-                chunk_topk_idxs = selected
-            topk_idxs.append(chunk_topk_idxs)
+            scores_out = scores_out[:max_num_tokens, :k]
+            return out, scores_out
 
-        out = topk_idxs[0] if len(topk_idxs) == 1 else jnp.concatenate(topk_idxs)
-        out = out[:max_num_tokens, :k]
-
-        if cp_size == 1 and not return_scores:
-            return out
-
-        # Columns in `out` are rank-local compressed positions. Even when
-        # `cp_size > 1`, `streamindex_topk` only returns rank-local indices (callers
-        # like `streamindex_topk_dcp` resolve winners directly against their local
-        # candidate list without converting to global coordinates).
-        if not return_scores:
-            return out
-
-        scores_out = (
-            topk_scores_list[0]
-            if len(topk_scores_list) == 1
-            else jnp.concatenate(topk_scores_list)
+        if not bounded:
+            return select_chunks(num_sublanes_total, 0)
+        # Keep the entire TC/SC pipeline inside each branch: a per-chunk cond
+        # would serialize the paired engines and materialize cropped scores.
+        return lax.cond(
+            _query_prefix_fits(
+                seq_lens,
+                cu_q_lens,
+                distribution,
+                compression_ratio,
+                fast_sublanes * 128,
+            ),
+            lambda _: select_chunks(fast_sublanes, 0),
+            lambda _: select_chunks(num_sublanes_total, 1),
+            operand=None,
         )
-        scores_out = scores_out[:max_num_tokens, :k]
-        return out, scores_out
 
     def _fast_path(_):
         # Every visible position wins, so a row is just its first row-length
