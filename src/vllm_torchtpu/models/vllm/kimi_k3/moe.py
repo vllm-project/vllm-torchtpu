@@ -4,12 +4,13 @@
 
 from __future__ import annotations
 
+import os
 import zlib
 
 import torch
 from torch import nn
 from vllm.config import get_current_vllm_config_or_none
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -127,11 +128,29 @@ class KimiMoE(nn.Module):
 
         self.prefill_group = None
         self.shared_group = None
+        self.pipe_chunks = int(os.environ.get("TPU_K3_MOE_PIPE_CHUNKS", "2"))
         if envs.TPU_K3_SP_PREFILL:
             self.prefill_group = FusedPrefillCollectives(prefix)
             self.shared_group = get_intra_chip_group()
             if self.shared_group is None or self.shared_group.world_size != 2:
                 raise ValueError("K3 SP prefill needs a physical two-core chip group")
+        elif (
+            self.use_ep
+            and self.tp_size == 32
+            and os.environ.get("TPU_K3_MOE_LATENT_AR_OVERLAP", "1") != "0"
+        ):
+            try:
+                intra_group = get_intra_chip_group()
+                tp_group = get_tp_group()
+                if (
+                    intra_group is not None
+                    and getattr(intra_group, "world_size", None) == 2
+                    and tp_group is not None
+                ):
+                    self.shared_group = intra_group
+                    self.prefill_group = tp_group
+            except Exception:
+                pass
 
         self.shared_experts = (
             KimiMLP(
@@ -192,9 +211,13 @@ class KimiMoE(nn.Module):
                 routed_output_transform=routed_output_transform,
             )
         if self.shared_group is not None and not hasattr(
-            self.experts.routed_experts.quant_method, "apply_with_routing"
+            getattr(self.experts.routed_experts, "quant_method", None),
+            "apply_with_routing" if envs.TPU_K3_SP_PREFILL else "apply_monolithic",
         ):
-            raise ValueError("K3 SP prefill requires the native MXFP4 MoE backend")
+            if envs.TPU_K3_SP_PREFILL:
+                raise ValueError("K3 SP prefill requires the native MXFP4 MoE backend")
+            self.shared_group = None
+            self.prefill_group = None
         if padded_intermediate_size != config.moe_intermediate_size:
             routed_experts = self.experts.routed_experts
             w13_weight = getattr(routed_experts, "w13_weight", None)
@@ -256,11 +279,47 @@ class KimiMoE(nn.Module):
     ) -> torch.Tensor:
         """Run EP experts with sharded or replicated tokens, then add shared experts."""
         group = self.prefill_group
+        routed = self.experts.routed_experts
+        pipe_chunks = getattr(self, "pipe_chunks", None)
+        if pipe_chunks is None:
+            pipe_chunks = int(os.environ.get("TPU_K3_MOE_PIPE_CHUNKS", "2"))
+        if (
+            not sequence_parallel
+            and pipe_chunks > 1
+            and hidden_states.shape[0] >= 4096
+            and hidden_states.shape[0] % pipe_chunks == 0
+        ):
+            reduced_chunks = []
+            for chunk in hidden_states.chunk(pipe_chunks, dim=0):
+                chunk_logits, _ = self.gate(chunk)
+                chunk_latent = chunk
+                if self.routed_expert_down_proj is not None:
+                    chunk_latent, _ = self.routed_expert_down_proj(chunk_latent)
+                chunk_out = routed.quant_method.apply_monolithic(
+                    routed, chunk_latent, chunk_logits
+                )
+                reduced_chunks.append(group.all_reduce(chunk_out))
+            shared_output = (
+                self.shared_experts(hidden_states, sequence_parallel=False)
+                if self.shared_experts is not None
+                else None
+            )
+            up_chunks = []
+            for chunk_out in reduced_chunks:
+                if self.routed_expert_norm is not None:
+                    chunk_out = self.routed_expert_norm(chunk_out)
+                if self.routed_expert_up_proj is not None:
+                    chunk_out, _ = self.routed_expert_up_proj(chunk_out)
+                up_chunks.append(chunk_out)
+            output = torch.cat(up_chunks, dim=0)
+            if shared_output is not None:
+                output = output + shared_output
+            return output
+
         router_logits, _ = self.gate(hidden_states)
         latent = hidden_states
         if self.routed_expert_down_proj is not None:
             latent, _ = self.routed_expert_down_proj(latent)
-        routed = self.experts.routed_experts
         if sequence_parallel:
             weights, ids = moe_routing.route(routed, latent, router_logits)
             latent, weights, ids = group.gather_moe_inputs(
@@ -276,12 +335,15 @@ class KimiMoE(nn.Module):
             if sequence_parallel
             else group.all_reduce(output)
         )
+        shared_output = (
+            self.shared_experts(hidden_states, sequence_parallel=sequence_parallel)
+            if self.shared_experts is not None
+            else None
+        )
         if self.routed_expert_norm is not None:
             output = self.routed_expert_norm(output)
         if self.routed_expert_up_proj is not None:
             output, _ = self.routed_expert_up_proj(output)
-        if self.shared_experts is not None:
-            output = output + self.shared_experts(
-                hidden_states, sequence_parallel=sequence_parallel
-            )
+        if shared_output is not None:
+            output = output + shared_output
         return output

@@ -110,14 +110,44 @@ def test_ring_tables_preserve_physical_links_and_torch_token_order():
                 assert tokens[peers[(pos - direction * 32) % 32]] == owners[rank]
 
 
-@pytest.mark.parametrize("rows", [128, 256])
+@pytest.mark.parametrize("rows", [32, 64, 128, 256])
 @pytest.mark.parametrize("width", [2176, 3584, 7168])
 def test_ring_regions_cover_payload_once(rows, width):
+    regions = _regions(rows, width)
+    assert len(regions) == (6 if rows == 32 else 12)
     count = np.zeros((rows, width), np.int8)
-    for start, size, col, ncols in _regions(rows, width):
+    for start, size, col, ncols in regions:
         assert start % 16 == size % 16 == col % 128 == ncols % 128 == 0
         count[start : start + size, col : col + ncols] += 1
     np.testing.assert_array_equal(count, np.ones_like(count))
+
+
+def test_ring_tables_accept_non_ascending_device_ids():
+    rng = np.random.default_rng(109)
+    physical = rng.permutation(32)
+    owners = rng.permutation(32)
+    device_ids = rng.permutation(32) + 100
+    devices = [
+        SimpleNamespace(
+            id=int(device_ids[i]),
+            coords=(p // 16, p // 8 % 2, p // 2 % 4),
+            core_on_chip=int(p % 2),
+        )
+        for i, p in enumerate(physical)
+    ]
+    tables = ring_tables(devices, owners)
+    for positions, peers, tokens in tables:
+        np.testing.assert_array_equal(peers[positions], np.arange(32))
+        np.testing.assert_array_equal(tokens, owners)
+
+    duplicate_devices = list(devices)
+    duplicate_devices[1] = SimpleNamespace(
+        id=int(device_ids[0]),
+        coords=devices[1].coords,
+        core_on_chip=devices[1].core_on_chip,
+    )
+    with pytest.raises(ValueError, match="distinct device IDs"):
+        ring_tables(duplicate_devices, owners)
 
 
 def test_mla_chip_layout_preserves_gate_heads_and_token_owners():
