@@ -524,6 +524,14 @@ TUNED_BLOCK_SIZES: dict[TunedKey, TunedValue] = {
     TunedKey(*key): TunedValue(*value) for key, value in TUNED_BLOCK_SIZES_RAW.items()
 }
 
+# (TPU generation, tokens, input channels, output channels) ->
+# (weight columns per tile, output rows per DMA, compiler VMEM budget).
+# The budget includes spill headroom; it is not the device's VMEM capacity.
+PROJECTION_ROPE_TUNING = {
+    (7, 288, 1280, 32768): (8192, 48, 56 * 1024 * 1024),
+}
+
+
 DEVICE_VMEM_LIMIT = {6: 96 * 1024 * 1024, 7: 48 * 1024 * 1024}
 
 

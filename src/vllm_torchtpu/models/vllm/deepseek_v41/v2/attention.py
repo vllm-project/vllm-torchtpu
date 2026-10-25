@@ -40,6 +40,7 @@ from .cache import (
 from .candidate_cache import prepare_candidate_cache, select_candidate_cache
 from .ced import prefix_replay_enabled
 from .ops import device_hooks, rms_norm, rotary, round_fp8_activation
+from .projection_rope import initialize_projection_rope
 
 logger = init_logger(__name__)
 
@@ -500,6 +501,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
     _sp_sharded_input = False
     # True once `_init_local_q_weights` built the gathered weights.
     _local_q_attn = False
+    _q_projection_rope_op: Any = None
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads):
@@ -1205,12 +1207,24 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         )
         q = None
         if not fused_qo:
-            q = _value(self.wq_b(qr)).reshape(-1, self.n_local_heads, self.head_dim)
-            # V4.1 normalizes the low-rank qr before wq_b, but does not
-            # normalize the projected query heads. Upstream's fused insert
-            # passes apply_q_norm=False; V4's qnorm_rope kernel changes
-            # attention scores.
-            q = self._rotate(q, positions)
+            # V4.1 normalizes qr before projection; neither route renormalizes q.
+            if (
+                self._q_projection_rope_op is not None
+                and qr.dtype == torch.bfloat16
+                and positions.dtype == torch.int32
+                and self._tpu_rope_cache.dtype == torch.float32
+            ):
+                q = self._q_projection_rope_op(
+                    qr,
+                    self.wq_b.weight,
+                    self.wq_b.weight_scale,
+                    positions,
+                    self._tpu_rope_cache,
+                )
+            else:
+                # Other weight/rotary layouts retain the original model path.
+                q = _value(self.wq_b(qr)).reshape(-1, self.n_local_heads, self.head_dim)
+                q = self._rotate(q, positions)
         # Match upstream's plain BF16 cache selected by this backend. Packed
         # FP8/NVFP4 cache numerics must not be imposed on BF16 cache rows.
         kv = self._rotate(kv, positions)
@@ -1885,6 +1899,19 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         else:
             self._full_attn_sink.copy_(self.attn_sink.detach().float())
         self._init_local_q_weights()
+        self._q_projection_rope_op = None
+        if (
+            tp_size == 1
+            and self.wo_a.weight.device.type == "tpu"
+            and self.wq_b.weight.shape == (1280, 32768)
+            and self.wq_b.weight.dtype == torch.float8_e4m3fn
+            and self.wq_b.weight_scale.shape == (32768,)
+            and self.wq_b.weight_scale.dtype == torch.float32
+            and self.n_local_heads == 64
+            and self.head_dim == 512
+            and self._config["qk_rope_head_dim"] == 64
+        ):
+            self._q_projection_rope_op = initialize_projection_rope()
         # Register before TorchDynamo captures the first model forward.
         if self.wo_a.weight.device.type == "tpu":
             _ = self.o_proj_op
