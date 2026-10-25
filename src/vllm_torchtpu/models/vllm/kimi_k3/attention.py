@@ -223,6 +223,8 @@ class MultiHeadLatentAttention(nn.Module):
         self.v_head_dim = int(config.v_head_dim)
         self.qk_head_dim = qk_head_dim
 
+        self.use_output_gate = bool(getattr(config, "mla_use_output_gate", False))
+        self.gate_is_fused = False
         self.mla_gate_is_fused = False
         if self.q_lora_rank is None:
             self.q_proj = ColumnParallelLinear(
@@ -240,7 +242,7 @@ class MultiHeadLatentAttention(nn.Module):
                 self.q_lora_rank,
                 self.kv_lora_rank + self.qk_rope_head_dim,
             ]
-            if config.mla_use_output_gate:
+            if self.use_output_gate:
                 qkv_a_output_sizes.append(config.num_attention_heads * self.v_head_dim)
                 self.fused_qkv_a_proj = MixedParallelMergedLinear(
                     config.hidden_size,
@@ -250,6 +252,7 @@ class MultiHeadLatentAttention(nn.Module):
                     quant_config=quant_config,
                     prefix=f"{prefix}.fused_qkv_a_proj",
                 )
+                self.gate_is_fused = True
                 self.mla_gate_is_fused = True
             else:
                 self.fused_qkv_a_proj = MergedColumnParallelLinear(
@@ -294,7 +297,7 @@ class MultiHeadLatentAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.g_proj",
             )
-            if (config.mla_use_output_gate and not self.mla_gate_is_fused)
+            if (self.use_output_gate and not self.gate_is_fused)
             else None
         )
         self.o_proj = RowParallelLinear(
@@ -328,8 +331,9 @@ class MultiHeadLatentAttention(nn.Module):
                 dtype=torch.float32,
             )
 
+        self._sp_prefill = bool(envs.TPU_K3_SP_PREFILL)
         self.prefill_group = (
-            FusedPrefillCollectives(prefix) if envs.TPU_K3_SP_PREFILL else None
+            FusedPrefillCollectives(prefix) if self._sp_prefill else None
         )
         mla_modules = MLAModules(
             g_proj=self.g_proj,
@@ -359,7 +363,7 @@ class MultiHeadLatentAttention(nn.Module):
             vllm_config.cache_config,
             quant_config,
             prefix,
-            gate_is_fused=self.mla_gate_is_fused,
+            gate_is_fused=self.gate_is_fused,
             non_causal_multi_token_decode=non_causal_multi_token_decode,
         )
 
@@ -371,9 +375,12 @@ class MultiHeadLatentAttention(nn.Module):
         wrapper = self.mla_attn
         wrapper.kimi_preprocess = None
         wrapper.kimi_gate_weight = None
+        gate_fused = getattr(
+            self, "gate_is_fused", getattr(self, "mla_gate_is_fused", False)
+        )
         if not (
             isinstance(group, FusedPrefillCollectives)
-            and self.mla_gate_is_fused
+            and gate_fused
             and weight is not None
             and weight.dtype == torch.bfloat16
             and weight.shape == (7168, 2496)
@@ -399,7 +406,10 @@ class MultiHeadLatentAttention(nn.Module):
             and getattr(self.mla_attn, "kimi_preprocess", None) is None
         ):
             hidden_states = group.all_gather(hidden_states, dim=0)
-        if sequence_parallel and isinstance(group, FusedPrefillCollectives):
+        if sequence_parallel and (
+            isinstance(group, FusedPrefillCollectives)
+            or hasattr(group, "project_reduce_scatter")
+        ):
             return self.mla_attn(positions, hidden_states, prefill_group=group)
         output = self.mla_attn(positions, hidden_states)
         return (
@@ -682,8 +692,15 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         if self.packed_prefill_weight is not None:
             # Every token bucket must capture the same parameter list: the
             # serving compiler hands executables between traces by input ABI.
-            if sequence_parallel and isinstance(group, FusedPrefillCollectives):
+            if sequence_parallel and (
+                isinstance(group, FusedPrefillCollectives)
+                or hasattr(group, "gather_project")
+            ):
                 packed = group.gather_project(hidden_states, self.packed_prefill_weight)
+            elif sequence_parallel and hasattr(group, "all_gather_matmul"):
+                packed = group.all_gather_matmul(
+                    hidden_states, self.packed_prefill_weight
+                )
             else:
                 if sequence_parallel:
                     hidden_states = group.all_gather(hidden_states, dim=0)

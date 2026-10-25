@@ -8,6 +8,7 @@
 """Torch custom-op bridge for Kimi KDA on the fused conv1d + GDN v3 kernel."""
 
 import math
+import os
 from collections.abc import Callable
 from typing import TypeVar
 
@@ -22,11 +23,30 @@ from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import config as gdn_config
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_wrapper
+from vllm_torchtpu.kernels.kimi_k3.mega_kda import (
+    _layout_supported as _mega_kda_layout_supported,
+    kda_forward_inference,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
 _VerifyWindowResult = TypeVar("_VerifyWindowResult")
+
+
+def _get_kda_prefill_kernel() -> str:
+    """Read and validate the compile-time K3 prefill kernel selection."""
+    kernel = (
+        os.environ.get("VLLM_TORCHTPU_K3_KDA_PREFILL_KERNEL", "hybrid")
+        .strip()
+        .lower()
+    )
+    if kernel not in ("gdn_v3", "chunked", "mega", "hybrid"):
+        raise ValueError(
+            "VLLM_TORCHTPU_K3_KDA_PREFILL_KERNEL must be 'gdn_v3', 'chunked', "
+            f"'mega', or 'hybrid', got {kernel!r}."
+        )
+    return kernel
 
 
 def _guard_kda_verify_window(
@@ -307,8 +327,14 @@ def _check_kda_abi(
     return num_tokens, num_sequences, num_heads, head_dim
 
 
-def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: int = 0):
-    """The same op, on the fused conv1d + GDN v3 kernel.
+def _build_fused_core(
+    lower_bound: float | None,
+    eps: float,
+    num_spec_tokens: int = 0,
+    *,
+    prefill_kernel: str | None = None,
+):
+    """The same op, on the fused conv1d + GDN v3 kernel (with optional MegaKDA prefill).
 
     The fused kernel replaces the four-stage manual pipeline and
     owns the convolution, silu, q/k L2-norm, the gate activation, beta's
@@ -319,6 +345,9 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
     Only `_gated_output_norm` stays outside, since the fused kernel has no
     notion of the output gate.
     """
+    selected_prefill = (
+        _get_kda_prefill_kernel() if prefill_kernel is None else prefill_kernel
+    )
 
     def fused_core(
         mixed_qkv: jax.Array,  # [T, 3 * H * D], pre-convolution
@@ -338,7 +367,7 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
         window_distribution: jax.Array | None = None,
         slot_read_offsets: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        num_tokens, _, num_heads, head_dim = _check_kda_abi(
+        num_tokens, num_seqs, num_heads, head_dim = _check_kda_abi(
             mixed_qkv,
             raw_gate,
             beta,
@@ -402,6 +431,71 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
                 prefill_only=prefill_only,
             )
 
+        def run_mega_prefill(conv_in, rec_in):
+            conv_out, new_conv = kimi_short_conv_scan(
+                mixed_qkv,
+                conv_in,
+                conv_weight.reshape(kernel_size, -1),
+                query_start_loc,
+                state_indices,
+                seq_lens,
+                start_seq=0,
+            )
+            conv_out = jax.nn.silu(conv_out)
+            total_tokens = jnp.minimum(query_start_loc[-1], num_tokens)
+            token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
+            sequence_ids = _token_sequence_ids(query_start_loc, num_tokens, num_seqs)
+            segment_ids = jnp.where(token_ids < total_tokens, sequence_ids + 1, 0)
+            query_lens = query_start_loc[1:] - query_start_loc[:-1]
+            has_initial_state = seq_lens > query_lens
+            initial_state = jnp.where(
+                has_initial_state[:, None, None, None],
+                rec_in[state_indices],
+                0.0,
+            )
+            qkv = conv_out.reshape(num_tokens, 3, num_heads, head_dim)
+            gate = raw_gate.reshape(num_tokens, num_heads, head_dim)
+            activated_beta = jax.nn.sigmoid(beta.astype(jnp.float32)).astype(beta.dtype)
+            mega_out, final_state = kda_forward_inference(
+                qkv[None, :, 0],
+                qkv[None, :, 1],
+                qkv[None, :, 2],
+                gate[None],
+                activated_beta[None],
+                A_log=a_log,
+                dt_bias=dt_bias,
+                lower_bound=lower_bound,
+                use_gate_in_kernel=True,
+                use_qk_l2norm_in_kernel=True,
+                segment_ids=segment_ids[None],
+                N_max=num_seqs,
+                initial_state=initial_state[None],
+                output_final_state=True,
+                safe_gate=True,
+            )
+            keep = (query_lens > 0) & (query_start_loc[:-1] < total_tokens)
+            write_indices = jnp.where(keep, state_indices, 0)
+            keep_rec = keep.reshape((num_seqs, 1, 1, 1))
+            written_rec = jnp.where(
+                keep_rec,
+                final_state[0].astype(rec_in.dtype),
+                rec_in[0],
+            )
+            new_rec = rec_in.at[write_indices].set(written_rec)
+            return (new_conv, new_rec), mega_out[0].reshape(
+                num_tokens, num_heads * head_dim
+            )
+
+        can_use_mega = (
+            num_spec_tokens == 0
+            and selected_prefill in ("mega", "hybrid")
+            and lower_bound is not None
+            and (-5 <= lower_bound < 0)
+            and mixed_qkv.dtype == jnp.bfloat16
+            and num_tokens % 64 == 0
+            and (selected_prefill == "mega" or num_tokens >= 256)
+        )
+
         if num_spec_tokens > 0:
             window_end = window_distribution[0]
             empty_out = jnp.zeros((num_tokens, num_heads * head_dim), mixed_qkv.dtype)
@@ -422,8 +516,25 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
                 verify_out,
                 prefill_out,
             )
+        elif can_use_mega:
+            mega_ok = (
+                (window_distribution[0] == 0)
+                & (window_distribution[-1] > 0)
+                & _mega_kda_layout_supported(query_start_loc, num_tokens)
+            )
+            (new_conv_state, new_pool), out = jax.lax.cond(
+                mega_ok,
+                lambda c, r: run_mega_prefill(c, r),
+                lambda c, r: run_kernel(c, r),
+                conv_state,
+                recurrent_state,
+            )
         else:
-            (new_conv_state, new_pool), out = run_kernel(conv_state, recurrent_state)
+            (new_conv_state, new_pool), out = run_kernel(
+                conv_state,
+                recurrent_state,
+                batched_only=(num_tokens == 1),
+            )
 
         output = out.reshape(num_tokens, num_heads, head_dim)
         output = _gated_output_norm(
@@ -432,6 +543,55 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
         return output, new_conv_state, new_pool
 
     return fused_core
+
+
+def _dispatched_kda_core(
+    mixed_qkv: jax.Array,
+    raw_gate: jax.Array,
+    beta: jax.Array,
+    output_gate: jax.Array,
+    conv_state: jax.Array,
+    recurrent_state: jax.Array,
+    conv_weight: jax.Array,
+    a_log: jax.Array,
+    dt_bias: jax.Array,
+    norm_weight: jax.Array,
+    query_start_loc: jax.Array,
+    state_indices: jax.Array,
+    seq_lens: jax.Array,
+    distribution: jax.Array,
+    window_distribution: jax.Array | None = None,
+    slot_read_offsets: jax.Array | None = None,
+    *,
+    lower_bound: float | None = None,
+    eps: float = 1e-5,
+    num_spec_tokens: int = 0,
+    prefill_kernel: str | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    core = _build_fused_core(
+        lower_bound,
+        eps,
+        num_spec_tokens=num_spec_tokens,
+        prefill_kernel=prefill_kernel,
+    )
+    return core(
+        mixed_qkv,
+        raw_gate,
+        beta,
+        output_gate,
+        conv_state,
+        recurrent_state,
+        conv_weight,
+        a_log,
+        dt_bias,
+        norm_weight,
+        query_start_loc,
+        state_indices,
+        seq_lens,
+        distribution,
+        window_distribution,
+        slot_read_offsets,
+    )
 
 
 def build_kimi_dispatched_kda_op(
@@ -443,8 +603,14 @@ def build_kimi_dispatched_kda_op(
     num_spec_tokens: int = 0,
 ):
     """Build fused KDA with separately guarded speculative and prefill segments."""
-    core = _build_fused_core(lower_bound, eps, num_spec_tokens)
-    variant = "fused_window" if num_spec_tokens else "fused"
+    prefill_kernel = _get_kda_prefill_kernel()
+    core = _build_fused_core(
+        lower_bound,
+        eps,
+        num_spec_tokens,
+        prefill_kernel=prefill_kernel,
+    )
+    variant = "fused_window" if num_spec_tokens else f"fused_{prefill_kernel}"
     logger.info("KDA op %s: using the %s GDN v3 path.", prefix, variant)
     op_name = f"pallas::kimi_dispatched_kda_{variant}_{prefix.replace('.', '_')}"
     dispatched_op = pallas.jax_op(op_name, core, donate_argnums=(4, 5))
@@ -748,6 +914,7 @@ def _pooled_kda_core(
             kernel_size=kernel_size,
             attention_mode=gdn_config.AttentionMode.KDA,
             gate_lower_bound=lower_bound,
+            batched_only=(num_tokens == 1),
             state_source=pool,
             state_plan=plan,
         )
@@ -801,7 +968,7 @@ def _pooled_kda_core(
     # and zero-length sequences are safe under identity indices because the
     # kernel gates their state DMAs to zero size rather than redirecting them
     # to the null slot.
-    fused_core = _build_fused_core(lower_bound, eps)
+    fused_core = _build_fused_core(lower_bound, eps, prefill_kernel="gdn_v3")
     output, new_conv_buf, new_ssm_buf = fused_core(
         mixed_qkv,
         raw_gate,

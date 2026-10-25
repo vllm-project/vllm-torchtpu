@@ -2411,3 +2411,235 @@ def test_sp_prefill_divisible_shapes_preserve_token_ownership(
         torch.testing.assert_close(auxiliary[0], hidden + 1)
     torch.testing.assert_close(actual, hidden + 1)
     assert calls == ([0] * (2 if capture_aux else 1) if expected_sp else [])
+
+
+def test_mla_output_gate_flags_and_sp_prefill_project_reduce_scatter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLinear(nn.Module):
+        def __init__(self, input_size, output_size, *args, **kwargs) -> None:
+            super().__init__()
+            del args, kwargs
+            self.output_size = (
+                sum(output_size) if isinstance(output_size, list) else output_size
+            )
+            self.weight = nn.Parameter(torch.empty(self.output_size, input_size))
+
+    class FakeMLAWrapper(nn.Module):
+        def __init__(
+            self, *args, gate_is_fused, non_causal_multi_token_decode=False
+        ) -> None:
+            super().__init__()
+            self.gate_is_fused = gate_is_fused
+            self.non_causal_multi_token_decode = non_causal_multi_token_decode
+            self.kimi_preprocess = lambda *a: a
+            self.received_prefill_group = None
+
+        def forward(self, positions, hidden_states, prefill_group=None):
+            del positions
+            self.received_prefill_group = prefill_group
+            return hidden_states
+
+    for name in (
+        "ColumnParallelLinear",
+        "MergedColumnParallelLinear",
+        "MixedParallelMergedLinear",
+        "ReplicatedLinear",
+        "RowParallelLinear",
+    ):
+        monkeypatch.setattr(kimi_attention, name, FakeLinear)
+    monkeypatch.setattr(
+        kimi_attention, "MultiHeadLatentAttentionWrapper", FakeMLAWrapper
+    )
+    monkeypatch.setattr(
+        kimi_attention, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(current_platform, "check_and_update_config", lambda _: None)
+    vllm_config = VllmConfig()
+    for use_gate in (False, True):
+        config = KimiLinearConfig(
+            hidden_size=16,
+            num_attention_heads=4,
+            q_lora_rank=8,
+            kv_lora_rank=8,
+            qk_nope_head_dim=4,
+            qk_rope_head_dim=2,
+            v_head_dim=4,
+            mla_use_nope=True,
+            mla_use_output_gate=use_gate,
+        )
+        with set_current_vllm_config(vllm_config):
+            layer = MultiHeadLatentAttention(
+                config, vllm_config, prefix=f"model.layers.{int(use_gate)}.self_attn"
+            )
+        assert layer.use_output_gate is use_gate
+        assert layer.gate_is_fused is use_gate
+        assert layer.mla_gate_is_fused is use_gate
+        assert layer.mla_attn.gate_is_fused is use_gate
+
+    group = SimpleNamespace(project_reduce_scatter=lambda x, proj: x)
+    layer.prefill_group = group
+    hidden = torch.ones(4, 16)
+    out = layer(torch.arange(4), hidden, sequence_parallel=True)
+    torch.testing.assert_close(out, hidden)
+    assert layer.mla_attn.received_prefill_group is group
+
+
+def test_dspark_precompute_and_store_context_kv_uses_kv_cache_update_op() -> None:
+    import jax.numpy as jnp
+    import numpy as np
+
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        update_mla_kv_cache_jax,
+    )
+    from vllm_torchtpu.models.vllm.kimi_k3.dspark import K3DSparkModel
+
+    cache_4d = jnp.zeros((4, 2, 2, 640), dtype=jnp.bfloat16)
+    kv_c = jnp.ones((3, 512), dtype=jnp.bfloat16) * 2.0
+    k_pe = jnp.ones((3, 64), dtype=jnp.bfloat16) * 3.0
+    seq_lens = jnp.array([2, 1], dtype=jnp.int32)
+    block_tables = jnp.array([1, 0, 2, 0], dtype=jnp.int32)
+    query_start_loc = jnp.array([0, 2, 3], dtype=jnp.int32)
+    updated = np.asarray(
+        update_mla_kv_cache_jax(
+            cache_4d, kv_c, k_pe, seq_lens, block_tables, query_start_loc
+        ),
+        dtype=np.float32,
+    )
+    assert np.all(updated[1, 0, 0, :512] == 2.0)
+    assert np.all(updated[1, 0, 0, 512:576] == 3.0)
+    assert np.all(updated[1, 0, 1, :512] == 2.0)
+    assert np.all(updated[2, 0, 0, :512] == 2.0)
+    assert np.all(updated[0] == 0.0)
+
+    model = K3DSparkModel.__new__(K3DSparkModel)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(kv_lora_rank=4, qk_rope_head_dim=2)
+    model.combine_hidden_states = lambda x: x
+    model.context_kv_proj = lambda x: (torch.ones(x.shape[0], 5 * 6), None)
+    update_calls = []
+
+    def make_layer(idx: int):
+        core = SimpleNamespace(
+            kv_cache_quantized_dtype=None,
+            kv_cache=torch.zeros(2, 2, 2, 8),
+            kv_cache_update_op=lambda cache, kvc, kpe, sl, bt, qsl: update_calls.append(
+                (idx, kvc.shape, kpe.shape)
+            ),
+            mla_op=_failing_op("mla_op"),
+        )
+        wrapper = SimpleNamespace(
+            mla_attn=core,
+            kv_a_layernorm=lambda x: x,
+            rotary_emb=lambda pos, q_pe, k_pe: (q_pe, k_pe),
+            num_heads=2,
+        )
+        return SimpleNamespace(self_attn=SimpleNamespace(mla_attn=wrapper))
+
+    model.layers = [make_layer(i) for i in range(5)]
+    meta = tuple(
+        SimpleNamespace(
+            seq_lens=torch.tensor([3], dtype=torch.int32),
+            block_tables=torch.tensor([0], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 3], dtype=torch.int32),
+            request_distribution=torch.tensor([0, 1, 1], dtype=torch.int32),
+        )
+        for _ in range(5)
+    )
+    target_hidden = torch.ones(3, 8)
+    out = model.precompute_and_store_context_kv(
+        target_hidden, torch.arange(3), meta
+    )
+    torch.testing.assert_close(out, target_hidden)
+    assert update_calls == [(i, (3, 4), (3, 2)) for i in range(5)]
+
+
+def test_kda_hybrid_mega_prefill_and_decode_fast_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import jax.numpy as jnp
+
+    monkeypatch.setenv("VLLM_TORCHTPU_K3_KDA_PREFILL_KERNEL", "hybrid")
+    assert kimi_custom_ops._get_kda_prefill_kernel() == "hybrid"
+    monkeypatch.setenv("VLLM_TORCHTPU_K3_KDA_PREFILL_KERNEL", "invalid")
+    with pytest.raises(ValueError, match="VLLM_TORCHTPU_K3_KDA_PREFILL_KERNEL"):
+        kimi_custom_ops._get_kda_prefill_kernel()
+    monkeypatch.setenv("VLLM_TORCHTPU_K3_KDA_PREFILL_KERNEL", "hybrid")
+
+    calls = []
+
+    def fake_mega(*args, **kwargs):
+        calls.append("mega")
+        q = args[0]
+        b, t, h, d = q.shape
+        n_max = kwargs["N_max"]
+        return jnp.ones((b, t, h, d), dtype=q.dtype), jnp.ones(
+            (b, n_max, h, d, d), dtype=jnp.float32
+        )
+
+    def fake_gdn(**kwargs):
+        calls.append(("gdn", kwargs.get("batched_only", False)))
+        qkv = kwargs["qkv"]
+        n_v, d_v = kwargs["n_v"], kwargs["d_v"]
+        return (kwargs["conv_state"], kwargs["recurrent_state"]), jnp.zeros(
+            (qkv.shape[0], n_v * d_v), dtype=qkv.dtype
+        )
+
+    monkeypatch.setattr(kimi_custom_ops, "kda_forward_inference", fake_mega)
+    monkeypatch.setattr(kimi_custom_ops.gdn_wrapper, "fused_conv1d_gdn", fake_gdn)
+
+    core = kimi_custom_ops._build_fused_core(-5.0, 1e-5, prefill_kernel="hybrid")
+    t, h, d, k = 256, 2, 4, 3
+    mqkv = jnp.zeros((t, 3 * h * d), dtype=jnp.bfloat16)
+    rg = jnp.zeros((t, h * d), dtype=jnp.bfloat16)
+    beta = jnp.zeros((t, h), dtype=jnp.bfloat16)
+    og = jnp.zeros((t, h * d), dtype=jnp.bfloat16)
+    conv_state = jnp.zeros((4, k - 1, 3 * h * d), dtype=jnp.bfloat16)
+    rec_state = jnp.zeros((4, h, d, d), dtype=jnp.float32)
+    conv_w = jnp.zeros((k, 3, h, d), dtype=jnp.bfloat16)
+    a_log = jnp.zeros((h,), dtype=jnp.float32)
+    dt_bias = jnp.zeros((h * d,), dtype=jnp.float32)
+    norm_w = jnp.ones((d,), dtype=jnp.float32)
+    qsl = jnp.array([0, 256], dtype=jnp.int32)
+    si = jnp.array([1], dtype=jnp.int32)
+    sl = jnp.array([256], dtype=jnp.int32)
+
+    out_prefill, _, new_rec = core(
+        mqkv,
+        rg,
+        beta,
+        og,
+        conv_state,
+        rec_state,
+        conv_w,
+        a_log,
+        dt_bias,
+        norm_w,
+        qsl,
+        si,
+        sl,
+        jnp.array([0, 1, 1], dtype=jnp.int32),
+    )
+    assert out_prefill.shape == (t, h, d)
+    assert float(jnp.sum(new_rec[1])) > 0.0
+    assert float(jnp.sum(new_rec[0])) == 0.0
+
+    calls.clear()
+    core(
+        mqkv[:1],
+        rg[:1],
+        beta[:1],
+        og[:1],
+        conv_state,
+        rec_state,
+        conv_w,
+        a_log,
+        dt_bias,
+        norm_w,
+        jnp.array([0, 1], dtype=jnp.int32),
+        si,
+        jnp.array([1], dtype=jnp.int32),
+        jnp.array([1, 1, 1], dtype=jnp.int32),
+    )
+    assert calls == [("gdn", True)]
+

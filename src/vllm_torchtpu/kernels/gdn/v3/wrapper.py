@@ -735,9 +735,19 @@ def fused_conv1d_gdn(
                 state_source, None, None, config.GDNMode.BATCHED
             )
         if not batched_only:
-            out_act, out_source, _ = call_kernel(
-                out_source, None, out_act, config.GDNMode.PER_SEQ
-            )
+            if out_act is None:
+                out_act, out_source, _ = call_kernel(
+                    out_source, None, None, config.GDNMode.PER_SEQ
+                )
+            else:
+                has_prefill = distribution[-1] > distribution[0]
+                out_act, out_source = jax.lax.cond(
+                    has_prefill,
+                    lambda s, a: call_kernel(s, None, a, config.GDNMode.PER_SEQ)[:2],
+                    lambda s, a: (a, s),
+                    out_source,
+                    out_act,
+                )
         out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
         return out_source, out_act
 
@@ -749,9 +759,20 @@ def fused_conv1d_gdn(
             conv_state, recurrent_state, None, config.GDNMode.BATCHED
         )
     if not batched_only:
-        out_act, out_conv_state, out_recurrent_state = call_kernel(
-            out_conv_state, out_recurrent_state, out_act, config.GDNMode.PER_SEQ
-        )
+        if out_act is None:
+            out_act, out_conv_state, out_recurrent_state = call_kernel(
+                out_conv_state, out_recurrent_state, None, config.GDNMode.PER_SEQ
+            )
+        else:
+            has_prefill = distribution[-1] > distribution[0]
+            out_act, out_conv_state, out_recurrent_state = jax.lax.cond(
+                has_prefill,
+                lambda c, r, a: call_kernel(c, r, a, config.GDNMode.PER_SEQ),
+                lambda c, r, a: (a, c, r),
+                out_conv_state,
+                out_recurrent_state,
+                out_act,
+            )
 
     out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
     out_conv_state = out_conv_state.astype(conv_out_dtype)

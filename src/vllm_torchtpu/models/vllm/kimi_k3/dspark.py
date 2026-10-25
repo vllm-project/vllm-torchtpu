@@ -174,6 +174,7 @@ class K3DSparkModel(nn.Module):
         kv_width = self.config.kv_lora_rank + self.config.qk_rope_head_dim
         all_kv = all_kv.view(num_tokens, num_layers, kv_width)
 
+        dummy_q_pe = None
         for layer_idx, layer in enumerate(self.layers):
             wrapper = layer.self_attn.mla_attn
             core = wrapper.mla_attn
@@ -185,11 +186,12 @@ class K3DSparkModel(nn.Module):
             kv_c = wrapper.kv_a_layernorm(kv_c)
             k_pe = k_pe.unsqueeze(1)
             assert wrapper.rotary_emb is not None
-            dummy_q_pe = torch.zeros(
-                (num_tokens, wrapper.num_heads, self.config.qk_rope_head_dim),
-                dtype=context.dtype,
-                device=context.device,
-            )
+            if dummy_q_pe is None or dummy_q_pe.shape[1] != wrapper.num_heads:
+                dummy_q_pe = torch.zeros(
+                    (num_tokens, wrapper.num_heads, self.config.qk_rope_head_dim),
+                    dtype=context.dtype,
+                    device=context.device,
+                )
             _, k_pe = wrapper.rotary_emb(positions, dummy_q_pe, k_pe)
             # This context path bypasses the regular MLA forward, so mirror
             # its cache quantization here.  RoPE may also promote k_pe to
@@ -203,22 +205,34 @@ class K3DSparkModel(nn.Module):
             else:
                 kv_c = kv_c.to(dtype=core.kv_cache.dtype)
                 k_pe = k_pe.to(dtype=core.kv_cache.dtype)
-            ql_nope = torch.zeros(
-                (num_tokens, wrapper.num_heads, self.config.kv_lora_rank),
-                dtype=context.dtype,
-                device=context.device,
-            )
-            core.mla_op(
-                core.kv_cache,
-                ql_nope,
-                dummy_q_pe,
-                kv_c,
-                k_pe.squeeze(1),
-                metadata[layer_idx].seq_lens,
-                metadata[layer_idx].block_tables,
-                metadata[layer_idx].query_start_loc,
-                metadata[layer_idx].request_distribution,
-            )
+            k_pe_flat = k_pe.squeeze(1)
+            kv_update_op = getattr(core, "kv_cache_update_op", None)
+            if kv_update_op is not None:
+                kv_update_op(
+                    core.kv_cache,
+                    kv_c,
+                    k_pe_flat,
+                    metadata[layer_idx].seq_lens,
+                    metadata[layer_idx].block_tables,
+                    metadata[layer_idx].query_start_loc,
+                )
+            else:
+                ql_nope = torch.zeros(
+                    (num_tokens, wrapper.num_heads, self.config.kv_lora_rank),
+                    dtype=context.dtype,
+                    device=context.device,
+                )
+                core.mla_op(
+                    core.kv_cache,
+                    ql_nope,
+                    dummy_q_pe,
+                    kv_c,
+                    k_pe_flat,
+                    metadata[layer_idx].seq_lens,
+                    metadata[layer_idx].block_tables,
+                    metadata[layer_idx].query_start_loc,
+                    metadata[layer_idx].request_distribution,
+                )
         return context
 
     def forward(

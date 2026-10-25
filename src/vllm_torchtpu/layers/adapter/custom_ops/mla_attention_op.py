@@ -555,6 +555,65 @@ def _fresh(t: torch.Tensor) -> torch.Tensor:
     return torch.empty(t.shape, dtype=t.dtype, device=t.device).copy_(t)
 
 
+def update_mla_kv_cache_jax(
+    cache_kv: jax.Array,
+    kv_c_normed: jax.Array,
+    k_pe: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+) -> jax.Array:
+    """Scatter dense MLA `(kv_c_normed, k_pe)` rows directly into `cache_kv`."""
+    if k_pe.ndim == 3:
+        k_pe = jnp.squeeze(k_pe, axis=1)
+    lkv_dim = ((kv_c_normed.shape[-1] + 127) // 128) * 128
+    r_dim = ((k_pe.shape[-1] + 127) // 128) * 128
+    kv_c_padded = jnp.pad(
+        kv_c_normed, ((0, 0), (0, lkv_dim - kv_c_normed.shape[-1]))
+    )
+    k_pe_padded = jnp.pad(
+        k_pe, ((0, 0), (0, r_dim - k_pe.shape[-1]))
+    )
+    kv_packed = jnp.concatenate([kv_c_padded, k_pe_padded], axis=-1)
+    num_tokens = kv_packed.shape[0]
+    if cache_kv.ndim == 4:
+        _, page_size_per_kv_packing, kv_packing, aligned_dim = cache_kv.shape
+        page_size = page_size_per_kv_packing * kv_packing
+        if kv_packed.shape[-1] < aligned_dim:
+            kv_packed = jnp.pad(
+                kv_packed, ((0, 0), (0, aligned_dim - kv_packed.shape[-1]))
+            )
+        _, seq_id, pos, valid = _row_positions(
+            num_tokens, seq_lens, query_start_loc
+        )
+        block_tables_2d = block_tables.reshape(seq_lens.shape[0], -1)
+        max_pages_per_seq = block_tables_2d.shape[1]
+        safe_page_idx = jnp.clip(pos // page_size, 0, max_pages_per_seq - 1)
+        page = jnp.where(
+            valid, block_tables_2d[seq_id, safe_page_idx], jnp.int32(OOB_PAGE)
+        )
+        slot = jnp.where(valid, pos % page_size, 0)
+        return cache_kv.at[
+            page, slot // kv_packing, slot % kv_packing
+        ].set(kv_packed)
+    _, aligned_dim, page_size = cache_kv.shape
+    if kv_packed.shape[-1] < aligned_dim:
+        kv_packed = jnp.pad(
+            kv_packed, ((0, 0), (0, aligned_dim - kv_packed.shape[-1]))
+        )
+    _, seq_id, pos, valid = _row_positions(
+        num_tokens, seq_lens, query_start_loc
+    )
+    block_tables_2d = block_tables.reshape(seq_lens.shape[0], -1)
+    max_pages_per_seq = block_tables_2d.shape[1]
+    safe_page_idx = jnp.clip(pos // page_size, 0, max_pages_per_seq - 1)
+    page = jnp.where(
+        valid, block_tables_2d[seq_id, safe_page_idx], jnp.int32(OOB_PAGE)
+    )
+    slot = jnp.where(valid, pos % page_size, 0)
+    return cache_kv.at[page, :, slot].set(kv_packed)
+
+
 class TPUDummyMLAPrefillBackend:
     def __init__(self, *args, **kwargs):
         pass
@@ -739,6 +798,7 @@ class VllmTPUMLAAttention(MLAAttention):
         self.mla_op = self.impl._build_mla_op(
             self, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
         )
+        self.kv_cache_update_op = self._build_kv_cache_update_op()
         self.sparse_mla_op = self.impl._build_sparse_mla_op(self)
 
         dcp_size = getattr(self.impl, "dcp_size", 1)
@@ -747,6 +807,36 @@ class VllmTPUMLAAttention(MLAAttention):
             self.sparse_mla_dcp_op = self.impl._build_sparse_mla_dcp_op(
                 self, dcp_size, self.impl.dcp_interleave_size
             )
+
+    def _build_kv_cache_update_op(self):
+        layer_id = (
+            getattr(self, "layer_name", "") or getattr(self, "prefix", "")
+        ).replace(".", "_").replace("/", "_")
+        op_name = f"pallas::mla_kv_cache_update_{layer_id}"
+        jax_op = pallas.jax_op(
+            op_name, update_mla_kv_cache_jax, donate_argnums=(0,)
+        )
+
+        def _fake(cache_kv, *args, **kwargs):
+            return torch.empty_like(cache_kv)
+
+        jax_op.register_fake(_fake)
+
+        def op(
+            cache_kv: torch.Tensor,
+            kv_c: torch.Tensor,
+            k_pe: torch.Tensor,
+            seq_lens: torch.Tensor,
+            block_tables: torch.Tensor,
+            query_start_loc: torch.Tensor,
+        ) -> torch.Tensor:
+            updated = jax_op(
+                cache_kv, kv_c, k_pe, seq_lens, block_tables, query_start_loc
+            )
+            cache_kv.copy_(updated)
+            return cache_kv
+
+        return op
 
     def forward(
         self,
