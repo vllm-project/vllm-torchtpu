@@ -2407,7 +2407,7 @@ class TestUnifiedReadOffsetMigration:
         runner._mamba_ckpt_window = ckpt_window
         runner._bucket_len = TPUModelRunner._bucket_len
         runner._pad_to_bucket = TPUModelRunner._pad_to_bucket
-        for name in ("_pad_dev_to_bucket", "_expand_pool_split", "_spec_seed_sources"):
+        for name in ("_spec_seed_copies",):
             setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
         # The collector strides the mamba block tables by the mamba groups'
         # spec block size (times the cp world), not by the attention block

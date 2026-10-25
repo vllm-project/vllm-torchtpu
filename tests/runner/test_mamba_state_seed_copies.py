@@ -124,9 +124,7 @@ def _make_self(
     ns._bucket_len = TPUModelRunner._bucket_len
     ns._pad_to_bucket = TPUModelRunner._pad_to_bucket
     for name in (
-        "_pad_dev_to_bucket",
-        "_expand_pool_split",
-        "_spec_seed_sources",
+        "_spec_seed_copies",
         "_copy_mamba_state_blocks",
     ):
         setattr(ns, name, getattr(TPUModelRunner, name).__get__(ns))
@@ -948,3 +946,112 @@ def test_async_state_seed_keeps_actual_crossing_when_all_drafts_accepted():
     _collect(fake, _sched({"a": 4}))
     assert fake._mamba_state_pos["a"] == 1
     assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(8, 6)]
+
+
+@pytest.mark.parametrize("split", [1, 2, 3])
+@pytest.mark.parametrize("num_crossings", [1, 5, 9])
+def test_spec_seed_copies_split_lands_on_bucket_ladder(split, num_crossings):
+    offsets = torch.zeros(128, dtype=torch.int32)
+    offsets[10] = 2
+    fake, _ = _spec_self(0, window=3, split=split)
+    fake.mamba_slot_read_offsets = offsets
+    rows = []
+    expected_pairs = []
+    for i in range(num_crossings):
+        base = 10 + 4 * i
+        new_owner = int(i % 2 == 1)
+        dst = base + 3
+        ckpts = [base, base + 1, base + 2]
+        rows.append([base, new_owner, 1, dst, *ckpts])
+        picked = ckpts[0] if new_owner else ckpts[int(offsets[base])]
+        for j in range(split):
+            expected_pairs.append((picked * split + j, dst * split + j))
+
+    src_t, dst_t = fake._spec_seed_copies(rows, window=3)
+    expected_len = TPUModelRunner._bucket_len(num_crossings * split)
+    assert src_t.shape == (expected_len,)
+    assert dst_t.shape == (expected_len,)
+    actual_pairs = [(s, d) for s, d in zip(src_t.tolist(), dst_t.tolist()) if s or d]
+    assert actual_pairs == expected_pairs
+
+
+@pytest.mark.parametrize("split", [1, 2, 3])
+def test_spec_seed_rows_impl_fullgraph_compile(split):
+    from vllm_torchtpu.runner import tpu_runner
+
+    offsets = torch.zeros(32, dtype=torch.int32)
+    offsets[5] = 2
+    offsets[10] = 1
+    rows = [
+        [5, 0, 1, 8, 5, 6, 7],  # live owner -> offset 2 -> block 7
+        [10, 1, 1, 13, 10, 11, 12],  # new owner -> offset 0 -> block 10
+    ]
+    out_len = TPUModelRunner._bucket_len(len(rows) * split)
+    in_len = (out_len + split - 1) // split
+    pad = [0, 1, 0, 0, 0, 0, 0]
+    packed = torch.tensor(rows + [pad] * (in_len - len(rows)), dtype=torch.long)
+
+    ref_src, ref_dst = tpu_runner._spec_seed_rows_impl(offsets, packed, split, out_len)
+    compiled = torch.compile(
+        tpu_runner._spec_seed_rows_impl,
+        backend="eager",
+        fullgraph=True,
+        dynamic=False,
+    )
+    got_src, got_dst = compiled(offsets, packed, split, out_len)
+    assert torch.equal(got_src, ref_src)
+    assert torch.equal(got_dst, ref_dst)
+
+
+@pytest.mark.parametrize("split", [1, 2, 3])
+def test_precompile_mamba_rollback_helpers_warms_spec_seed_ladder(monkeypatch, split):
+    from contextlib import nullcontext
+
+    from vllm_torchtpu.runner import tpu_runner
+
+    warmed_spec_shapes: set[tuple[tuple[int, int], int, int]] = set()
+    monkeypatch.setattr(
+        tpu_runner,
+        "_rollback_offsets_seed_compiled",
+        lambda offsets, dst: None,
+    )
+    monkeypatch.setattr(
+        tpu_runner,
+        "_rollback_offsets_migrate_compiled",
+        lambda offsets, src, dst: None,
+    )
+    monkeypatch.setattr(
+        tpu_runner,
+        "_spec_seed_rows_compiled",
+        lambda offsets, packed, sp, out_len: warmed_spec_shapes.add(
+            (tuple(packed.shape), sp, out_len)
+        ),
+    )
+
+    window = 3
+    max_num_reqs = 6
+    fake, _ = _spec_self(0, window=window, split=split)
+    fake.mamba_slot_read_offsets = torch.zeros(128, dtype=torch.int32)
+    fake.max_num_reqs = max_num_reqs
+    fake.kv_cache_config = None
+    fake._precompile_timed = lambda _label: nullcontext()
+    TPUModelRunner._precompile_mamba_rollback_helpers(fake)
+
+    num_groups = len(fake._mamba_copy_plan)
+    observed_shapes: set[tuple[tuple[int, int], int, int]] = set()
+    monkeypatch.setattr(
+        tpu_runner,
+        "_spec_seed_rows_impl",
+        lambda offsets, packed, sp, out_len: (
+            observed_shapes.add((tuple(packed.shape), sp, out_len))
+            or (
+                torch.zeros(out_len, dtype=torch.int32),
+                torch.zeros(out_len, dtype=torch.int32),
+            )
+        ),
+    )
+    for count in range(1, num_groups * max_num_reqs + 1):
+        rows = [[10, 0, 1, 13, 10, 11, 12] for _ in range(count)]
+        fake._spec_seed_copies(rows, window=window)
+
+    assert observed_shapes <= warmed_spec_shapes
