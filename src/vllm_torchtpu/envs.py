@@ -129,6 +129,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_FUSED_KV_WRITE: bool = False
     VLLM_TPU_QSA_INDEXER_SHARD: bool = False
     VLLM_TPU_QSA_INDEXER_SHARD_A2A_MIN_TOKENS: int = 0
+    VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -696,6 +697,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # blocks, instead of all-gathering every rank's candidates. 0: never.
     "VLLM_TPU_QSA_INDEXER_SHARD_A2A_MIN_TOKENS": env_nonnegative_int(
         "VLLM_TPU_QSA_INDEXER_SHARD_A2A_MIN_TOKENS", 0
+    ),
+    # With VLLM_TPU_QSA_INDEXER_SHARD: the prefill sequence-parallel backbone
+    # (QWEN4_EXP_PREFILL_SP, steps of at least its minimum token count) keeps
+    # the replicated indexer; only the smaller steps shard it. The prefill
+    # candidate exchange costs more than the sharded scoring saves. The two
+    # backbones are separate graphs with disjoint buckets, so the choice is
+    # static per graph.
+    "VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP": env_bool(
+        "VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP", default=False
     ),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4

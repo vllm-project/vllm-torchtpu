@@ -411,7 +411,14 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         self.main_slot = max(main_slot, 0)
         self._shard_op = None
         self._shard_select_op = None
-        if envs.VLLM_TPU_QSA_INDEXER_SHARD and self.tp_size > 1:
+        # With VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP a single-graph module (the
+        # MTP draft, traced once for every bucket including prefill chunks)
+        # keeps the replicated indexer: it cannot pick per bucket.
+        if (
+            envs.VLLM_TPU_QSA_INDEXER_SHARD
+            and self.tp_size > 1
+            and not (self.single_graph and envs.VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP)
+        ):
             from vllm.distributed import get_tp_group
 
             from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
@@ -569,7 +576,13 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             raise ValueError(f"Missing QSA checkpoint tensors: {sorted(missing)}")
 
     def forward_with_indices(
-        self, hidden, positions, metadata: QSAMetadata, rows=None, reduce=True
+        self,
+        hidden,
+        positions,
+        metadata: QSAMetadata,
+        rows=None,
+        reduce=True,
+        replicated_indexer=False,
     ):
         """Attention output and selected tokens.
 
@@ -579,8 +592,13 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         ``rows`` (int, -1 for none) limits both to those token rows; the
         caches are still written for every token. Pooled QSA attends only
         the rows; the dedicated-cache path attends all tokens and picks.
+
+        ``replicated_indexer`` (static per graph): keep the replicated indexer
+        even when the TP-sharded one is built.
         """
-        output, selected = self.attend_with_indices(hidden, positions, metadata, rows)
+        output, selected = self.attend_with_indices(
+            hidden, positions, metadata, rows, replicated_indexer
+        )
         output = self.o_proj(output)
         if reduce and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output)
@@ -590,7 +608,9 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         """Gated attention output before ``o_proj`` (this rank's heads)."""
         return self.attend_with_indices(hidden, positions, metadata)[0]
 
-    def attend_with_indices(self, hidden, positions, metadata: QSAMetadata, rows=None):
+    def attend_with_indices(
+        self, hidden, positions, metadata: QSAMetadata, rows=None, replicated_indexer=False
+    ):
         """``forward_with_indices`` without the output projection and all-reduce."""
         assert len(self.cache_owners) == (1 if self.pooled else 4), (
             "Task4 must bind real or profiling scratch QSA owners"
@@ -613,7 +633,11 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             )
         pick_rows = rows is not None and not self.pooled
         op = self._op if rows is None or pick_rows else self._rows_op
-        if self.pooled and getattr(self, "_shard_op", None) is not None:
+        if (
+            self.pooled
+            and getattr(self, "_shard_op", None) is not None
+            and not replicated_indexer
+        ):
             # The TP-sharded indexer; it also takes an optional rows operand.
             op = self._shard_op
         output, selected = op(
