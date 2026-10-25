@@ -36,6 +36,21 @@ it.
 
 Peer addresses: inside a ``(lane, axis)`` mesh a peer is ``(my lane, j)``;
 under the torch bridge both indices arrive as data.
+
+Merge mode (``merge_live``, TPU_DCP_MLA_SEND_SMALL_A2A_MERGE): the blocks are
+the DCP merge's send blocks -- row ``merge_row - 1`` the lse word row (the
+hi halves of the block's ``tl`` lse bit patterns at lanes ``[0, tl)``, the
+lo halves at ``[tl, 2 * tl)``), rows ``[merge_row, block)`` the bf16
+partials as 16-bit words. Peers push into a VMEM receive scratch instead of
+the output, and after the arrival wait the kernel runs the unpack and
+``_merge_received`` on the live rows only, ``MERGE_CHUNK_ROWS`` at a time:
+the weights of every sender and row at once (senders in sublanes, rows in
+lanes, transposed once), then each live chunk's partials streamed into two
+f32 accumulators, senders in order. Chunks past the live count are written
+as zeros while the blocks are in flight. It returns the bf16 ``[tl, V]``
+merge, each chunk DMA'd out as soon as it is done. The VMEM destination is
+safe for the same reason the output is: a peer writes it only after the
+barrier, which this core passes only inside the kernel that owns it.
 """
 
 import jax
@@ -45,6 +60,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.small_collectives.common import (
+    LANES,
     MESH,
     wait_bytes_of,
 )
@@ -52,6 +68,8 @@ from vllm_torchtpu.kernels.experimental.small_collectives.common import (
 # Barrier semaphore group, distinct from the fused MoE kernels (0), the
 # all-reduces (5), the reduce-scatter (7) and the all-gather (9).
 COLLECTIVE_ID = 11
+# Merge mode: rows per merged chunk (one bf16 sublane tile).
+MERGE_CHUNK_ROWS = 16
 
 
 def reference(blocks, row0=0):
@@ -61,6 +79,64 @@ def reference(blocks, row0=0):
     out[:, :, :row0] = 0
     n = out.shape[0]
     return out.reshape(n, -1, out.shape[-1])
+
+
+def merge_sender_rows(num_cores):
+    """Merge mode's senders, padded to whole 8-row sublane tiles."""
+    return -(-num_cores // 8) * 8
+
+
+def merge_weights(recv_ref, w_ref, *, num_cores, word_row, tl):
+    """``_merge_received``'s weights of every sender and row: the lse words of
+    sender ``w`` from row ``word_row`` of slot ``w`` of ``recv_ref``, as f32
+    rows (senders in sublanes, rows in lanes), then transposed once into
+    ``w_ref`` [LANES, LANES]: row r holds ``w_hi`` of sender w at lane w and
+    ``w_lo`` at lane ``senders + w``."""
+    n = num_cores
+    vdim = recv_ref.shape[-1]
+    senders = merge_sender_rows(n)
+    head0 = word_row // MERGE_CHUNK_ROWS * MERGE_CHUNK_ROWS
+    sub = lax.broadcasted_iota(jnp.int32, (senders, LANES), 0)
+    lse = jnp.full((senders, LANES), -jnp.inf, jnp.float32)
+    for w in range(n):
+        head = recv_ref[w, pl.ds(head0, MERGE_CHUNK_ROWS), :].astype(jnp.int32)
+        words = head[word_row - head0 : word_row - head0 + 1]
+        lo = pltpu.roll(words, vdim - tl, 1)
+        bits = lax.shift_left(words, jnp.int32(16)) | (lo & 0xFFFF)
+        row = lax.bitcast_convert_type(bits, jnp.float32)[:, :LANES]
+        lse = jnp.where(sub == w, jnp.broadcast_to(row, lse.shape), lse)
+    finite = jnp.isfinite(lse)
+    shift = jnp.max(jnp.where(finite, lse, -jnp.inf), axis=0, keepdims=True)
+    shift = jnp.where(jnp.isfinite(shift), shift, 0.0)
+    weights = jnp.where(finite, jnp.exp(lse - shift), 0.0)
+    denom = jnp.sum(weights, axis=0, keepdims=True)
+    weights = weights / jnp.where(denom > 0, denom, 1.0)
+    w_hi = weights.astype(jnp.bfloat16).astype(jnp.float32)
+    w_lo = weights - w_hi
+    pad = jnp.zeros((LANES - 2 * senders, LANES), jnp.float32)
+    w_ref[...] = jnp.concatenate([w_hi, w_lo, pad], axis=0).T
+
+
+def merge_chunk(recv_ref, w_ref, chunk, live, *, num_cores, part_row):
+    """Rows ``[chunk * MERGE_CHUNK_ROWS, ...)`` of the merge, bf16: each
+    sender's partials (NaN zeroed, then f32) times its ``w_hi`` and ``w_lo``
+    columns, summed in order, rows at or past ``live`` zero."""
+    n = num_cores
+    senders = merge_sender_rows(n)
+    start = chunk * MERGE_CHUNK_ROWS
+    vdim = recv_ref.shape[-1]
+    cols = w_ref[pl.ds(start, MERGE_CHUNK_ROWS), :]
+    acc_hi = jnp.zeros((MERGE_CHUNK_ROWS, vdim), jnp.float32)
+    acc_lo = jnp.zeros((MERGE_CHUNK_ROWS, vdim), jnp.float32)
+    for k in range(n):
+        words = recv_ref[k, pl.ds(part_row + start, MERGE_CHUNK_ROWS), :]
+        part = pltpu.bitcast(words, jnp.bfloat16)
+        part = jnp.where(jnp.isnan(part), jnp.bfloat16(0), part).astype(jnp.float32)
+        acc_hi = acc_hi + part * cols[:, k : k + 1]
+        acc_lo = acc_lo + part * cols[:, senders + k : senders + k + 1]
+    row = lax.broadcasted_iota(jnp.int32, acc_hi.shape, 0) + start
+    merged = jnp.where(row < live, acc_hi + acc_lo, 0.0)
+    return merged.astype(jnp.bfloat16)
 
 
 def small_all_to_all(
@@ -74,6 +150,8 @@ def small_all_to_all(
     lane=None,
     collective_id=COLLECTIVE_ID,
     hbm_operand=False,
+    merge_live=None,
+    merge_row=None,
 ):
     """``lax.all_to_all(x, axis, 0, 0, tiled=True)`` of ``[n * block, V]``
     for rows ``[row0, block)`` of every block, inside a shard_map over a mesh
@@ -94,11 +172,17 @@ def small_all_to_all(
         exposed because the producer runs just before; the kernel only DMAs
         them, so HBM costs nothing. The in_spec's memory space alone does not
         stop the staging (it only types the kernel ref).
+      merge_live: int32 [1], the number of live partial rows, or None. With
+        it the call runs merge mode (see the module docstring) on 16-bit
+        DCP send blocks and returns the bf16 merge ``[tl, V]``,
+        ``tl = block - merge_row``.
+      merge_row: merge mode's first partial row of a block (static); the row
+        before it is the lse word row.
     """
     if x.ndim != 2:
         raise ValueError(f"small_all_to_all takes [n * block, V], got {x.shape}")
     n = num_cores
-    total, _ = x.shape
+    total, vdim = x.shape
     if total % n:
         raise ValueError(f"{total} rows do not split into {n} blocks")
     block = total // n
@@ -109,6 +193,23 @@ def small_all_to_all(
     rows = block - row0
     data_rank = rank is not None
     data_lane = lane_axis is not None and lane is not None
+    merge = merge_live is not None
+    if merge:
+        tl = block - (merge_row or 0)
+        if not (
+            x.dtype.itemsize == 2
+            and row0 < merge_row < block
+            and (merge_row - row0) % 8 == 0
+            and tl % MERGE_CHUNK_ROWS == 0
+            and tl <= LANES
+            and 2 * tl <= vdim
+            and 2 * merge_sender_rows(n) <= LANES
+        ):
+            raise ValueError(
+                f"merge mode: {x.dtype} block {block} / row0 {row0} / merge_row "
+                f"{merge_row} / {n} cores / V {vdim} has no in-kernel merge layout"
+            )
+        chunks = tl // MERGE_CHUNK_ROWS
 
     def kernel(*refs):
         refs = list(refs)
@@ -119,7 +220,12 @@ def small_all_to_all(
             my_lane = refs.pop(0)[0]
         else:
             my_lane = lax.axis_index(lane_axis)
-        x_ref, o_ref, send_sem, recv_sem, local_sem = refs
+        if merge:
+            live = jnp.clip(refs.pop(0)[0], 0, tl)
+            x_ref, o_ref, recv_ref, w_ref, out_ref, *sems = refs
+            send_sem, recv_sem, local_sem, out_sem = sems
+        else:
+            x_ref, o_ref, send_sem, recv_sem, local_sem = refs
 
         def peer(j):
             ids = {axis: jnp.int32(j)}
@@ -127,12 +233,19 @@ def small_all_to_all(
                 ids[lane_axis] = my_lane
             return ids
 
+        def chunk_out(c):
+            part = pl.ds(c * MERGE_CHUNK_ROWS, MERGE_CHUNK_ROWS)
+            return pltpu.make_async_copy(out_ref.at[part], o_ref.at[part], out_sem)
+
         sem = pltpu.get_barrier_semaphore()
         for j in range(n):
             pl.semaphore_signal(sem, 1, device_id=peer(j), device_id_type=MESH)
         pl.semaphore_wait(sem, n)
 
-        mine = o_ref.at[pl.ds(pl.multiple_of(me * block + row0, 8), rows)]
+        if merge:
+            mine = recv_ref.at[me]
+        else:
+            mine = o_ref.at[pl.ds(pl.multiple_of(me * block + row0, 8), rows)]
         for j in range(n):  # block j into slot `me` of core j
 
             @pl.when(jnp.int32(j) != me)
@@ -149,10 +262,45 @@ def small_all_to_all(
         own = x_ref.at[pl.ds(pl.multiple_of(me * block + row0, 8), rows)]
         local = pltpu.make_async_copy(own, mine, local_sem)
         local.start()
-        others = o_ref.at[pl.ds(0, (n - 1) * rows)]
+        if merge:
+            for c in range(chunks):
+
+                @pl.when(c * MERGE_CHUNK_ROWS >= live)
+                def _(c=c):
+                    out_ref[pl.ds(c * MERGE_CHUNK_ROWS, MERGE_CHUNK_ROWS), :] = (
+                        jnp.zeros((MERGE_CHUNK_ROWS, vdim), jnp.bfloat16)
+                    )
+                    chunk_out(c).start()
+
+            others = recv_ref.at[pl.ds(0, n - 1)]
+        else:
+            others = o_ref.at[pl.ds(0, (n - 1) * rows)]
         wait_bytes_of(others, recv_sem)
         local.wait()
+        if merge:
+            merge_weights(
+                recv_ref, w_ref, num_cores=n, word_row=merge_row - 1 - row0, tl=tl
+            )
+            for c in range(chunks):
+
+                @pl.when(c * MERGE_CHUNK_ROWS < live)
+                def _(c=c):
+                    out_ref[pl.ds(c * MERGE_CHUNK_ROWS, MERGE_CHUNK_ROWS), :] = (
+                        merge_chunk(
+                            recv_ref,
+                            w_ref,
+                            c,
+                            live,
+                            num_cores=n,
+                            part_row=merge_row - row0,
+                        )
+                    )
+                    chunk_out(c).start()
+
         wait_bytes_of(others, send_sem)
+        if merge:
+            for c in range(chunks):
+                chunk_out(c).wait()
 
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
     any_ = pl.BlockSpec(memory_space=pl.ANY)
@@ -162,14 +310,28 @@ def small_all_to_all(
         scalars.append(jnp.reshape(rank, (-1,))[:1].astype(jnp.int32))
     if data_lane:
         scalars.append(jnp.reshape(lane, (-1,))[:1].astype(jnp.int32))
+    if merge:
+        scalars.append(jnp.reshape(merge_live, (-1,))[:1].astype(jnp.int32))
     if hbm_operand:
         x = pltpu.with_memory_space_constraint(x, pltpu.HBM)
+    out_shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
+    scratch = [pltpu.SemaphoreType.DMA] * 3
+    name = f"small_all_to_all_n{n}_b{block}_r{row0}"
+    if merge:
+        out_shape = jax.ShapeDtypeStruct((tl, vdim), jnp.bfloat16)
+        scratch = [
+            pltpu.VMEM((n, rows, vdim), x.dtype),
+            pltpu.VMEM((LANES, LANES), jnp.float32),
+            pltpu.VMEM((tl, vdim), jnp.bfloat16),
+            *[pltpu.SemaphoreType.DMA] * 4,
+        ]
+        name += "_merge"
     return pl.pallas_call(
         kernel,
-        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+        out_shape=out_shape,
         in_specs=[smem] * len(scalars) + [hbm if hbm_operand else any_],
         out_specs=hbm,
-        scratch_shapes=[pltpu.SemaphoreType.DMA] * 3,
+        scratch_shapes=scratch,
         compiler_params=pltpu.CompilerParams(collective_id=collective_id),
-        name=f"small_all_to_all_n{n}_b{block}_r{row0}",
+        name=name,
     )(*scalars, x)
