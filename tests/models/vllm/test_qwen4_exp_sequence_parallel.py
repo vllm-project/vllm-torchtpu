@@ -353,3 +353,14 @@ def test_padded_shards_admit_every_row_aligned_bucket(monkeypatch, tokens, expec
     monkeypatch.setattr(sp.envs, "QWEN4_EXP_PREFILL_SP", True, raising=False)
     monkeypatch.setattr(sp.envs, "QWEN4_EXP_PREFILL_SP_MIN_TOKENS", 1024, raising=False)
     assert sp.sequence_parallel_eligible(tokens, 8) is expected
+
+
+@pytest.mark.parametrize(
+    "pad,moe,expected", [(True, True, True), (True, False, False), (False, True, False)]
+)
+def test_padded_shards_only_with_the_sequence_parallel_moe(
+    monkeypatch, pad, moe, expected
+):
+    monkeypatch.setattr(sp.envs, "QWEN4_EXP_PREFILL_SP_PAD_HC", pad, raising=False)
+    monkeypatch.setattr(sp.envs, "QWEN4_EXP_PREFILL_SP_MOE", moe, raising=False)
+    assert sp.pad_hc_enabled() is expected

@@ -37,6 +37,9 @@ from vllm.distributed import (
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 # Each rank's shard stays a multiple of a sublane tile.
 ROW_ALIGNMENT = 8
@@ -59,6 +62,22 @@ def shard_rows(hc_tiles: Iterable[int]) -> int:
     structure across its buckets, so it traces once.
     """
     return math.lcm(ROW_ALIGNMENT, *(tile for tile in hc_tiles if tile))
+
+
+def pad_hc_enabled() -> bool:
+    """QWEN4_EXP_PREFILL_SP_PAD_HC, honoured only with QWEN4_EXP_PREFILL_SP_MOE.
+
+    Padded shards feeding the replicated MoE lowered real-AL to 3.09-3.11
+    against 3.24 with GSM8K held, so the pair stays apart until understood.
+    """
+    if not envs.QWEN4_EXP_PREFILL_SP_PAD_HC:
+        return False
+    if not envs.QWEN4_EXP_PREFILL_SP_MOE:
+        logger.warning(
+            "QWEN4_EXP_PREFILL_SP_PAD_HC needs QWEN4_EXP_PREFILL_SP_MOE=1; ignoring it."
+        )
+        return False
+    return True
 
 
 def padded_rows(rows, multiple: int):

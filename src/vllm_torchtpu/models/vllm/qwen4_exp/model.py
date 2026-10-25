@@ -856,7 +856,7 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
                     hc.prefill_norm_tile,
                 )
             )
-            if envs.QWEN4_EXP_PREFILL_SP_PAD_HC:
+            if sp.pad_hc_enabled():
                 # The shard is padded to the HC tile instead of required to
                 # divide it, so every row-aligned bucket takes this graph.
                 if rows > sp.ROW_ALIGNMENT:
