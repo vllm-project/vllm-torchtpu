@@ -41,7 +41,8 @@ IDX_HEADS, IDX_DIM = 4, 128
 def _next_toward(x: jax.Array, up: jax.Array, bitcast: Any) -> jax.Array:
     """`nextafter(x, +inf if up else -inf)` for finite nonzero f32 `x`, by bit arithmetic."""
     b = bitcast(x, I32)
-    inc = jnp.where(x > 0, up, ~up)  # magnitude grows toward +inf for x > 0
+    pos = x > 0  # magnitude grows toward +inf for x > 0 (logic ops: Mosaic rejects bool selects)
+    inc = (pos & up) | (~pos & ~up)
     return bitcast(jnp.where(inc, b + 1, b - 1), F32)
 
 

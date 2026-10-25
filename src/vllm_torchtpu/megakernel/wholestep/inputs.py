@@ -566,3 +566,36 @@ def fp8_carrier(carrier_bf16: jax.Array) -> jax.Array:
         out_specs=pl.BlockSpec((1, 16, 4, W), lambda p: (p, 0, 0, 0)),
         out_shape=jax.ShapeDtypeStruct((P_, 16, 4, W), jnp.float8_e4m3fn),
     )(carrier_bf16)
+
+
+def repeat_layers(d: dict[str, Any], Lg: int, L: int) -> dict[str, Any]:
+    """Timing inputs for `L` layers from `Lg`-layer random ones (`L % Lg == 0`): every per-layer
+    stack (weights, HC params, states, norms) repeated `L // Lg` times. Numerics are meaningless
+    across the copies; the work and the bytes per layer are the real ones."""
+    assert L % Lg == 0, (L, Lg)
+    n = L // Lg
+
+    def rep(x, axis):
+        return jnp.concatenate([x] * n, axis=axis)
+
+    inp = d["inp"]
+    w_l = {}
+    layer_first = {"in_norm", "post_norm", "router"}  # [L, ...], no rank axis
+    for k, v in inp.w_l.items():
+        # Every other per-layer stack is [R, L (or GDN layers), ...]; final_norm has no layer.
+        if k == "final_norm":
+            w_l[k] = v
+        elif k in layer_first:
+            w_l[k] = rep(v, 0)
+        else:
+            w_l[k] = rep(v, 1)
+    st_l = {k: rep(v, 1) for k, v in inp.st_l.items()}
+    hc = {name: {k: rep(v, 0) for k, v in p.items()} for name, p in d["hc"].items()}
+    import dataclasses as _dc
+
+    out = {**d, "inp": _dc.replace(inp, w_l=w_l, st_l=st_l), "hc": hc}
+    for k in ("qkvg", "o_proj"):
+        out[k] = rep(d[k], 1)
+    for k in ("qn", "kn"):
+        out[k] = rep(d[k], 0)
+    return out

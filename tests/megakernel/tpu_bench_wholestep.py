@@ -69,7 +69,7 @@ def run(g, B, T, L, mesh, chains, budget, identical, nbd, nbe, tiny=False, slots
         small=False) -> dict:
     R = mesh.size
     tiles = (
-        Tiles(bank=1 << 20, nbd=10, nbe=8, ebank=512 << 10, vmem_mib=64)
+        Tiles(bank=1 << 20, nbd=10, nbe=8, ebank=512 << 10, vmem_mib=63)
         if (tiny or small) else tiles_for(B, nbd, nbe)
     )
     ex = ExecSpec(R=R, B=B, T=T, ctx=128, tiles=tiles, interpret=tiny)
@@ -153,19 +153,23 @@ def run(g, B, T, L, mesh, chains, budget, identical, nbd, nbe, tiny=False, slots
 
 
 def run_step(g, B, T, L, mesh, chains, budget, max_groups, ctx, small, with_ref, gain=1.0,
-             identical=True, manager_pages=0) -> dict:
+             identical=True, manager_pages=0, repeat_from=0) -> dict:
     """Stage C on TPU: in-kernel indexer over the FP8 carrier + the step's own tokens."""
     R = mesh.size
-    tiles = (Tiles(bank=1 << 20, nbd=10, nbe=8, ebank=512 << 10, vmem_mib=64) if small
+    tiles = (Tiles(bank=1 << 20, nbd=10, nbe=8, ebank=512 << 10, vmem_mib=63) if small
              else tiles_for(B, None, None))
     ex = ExecSpec(R=R, B=B, T=T, ctx=128, tiles=tiles)
     n_pages = 8
 
+    Lg = repeat_from or L  # timing at large L: generate one block of layers, repeat it
+
     def gen(key):
-        d = wi.random_wholestep_inputs(7, g, ex, L, budget=budget, n_pages=n_pages,
+        d = wi.random_wholestep_inputs(7, g, ex, Lg, budget=budget, n_pages=n_pages,
                                        identical_experts=identical, gain=gain)
         for k in ("off", "budget", "first"):
             d.pop(k)
+        if Lg != L:
+            d = wi.repeat_layers(d, Lg, L)
         return d
 
     shapes = jax.eval_shape(gen, 0)
@@ -301,6 +305,8 @@ def main() -> None:
     ap.add_argument("--ctx", type=int, nargs="+", default=[3001, 100])
     ap.add_argument("--no-ref", action="store_true")
     ap.add_argument("--manager-pages", type=int, default=0)
+    ap.add_argument("--repeat-from", type=int, default=0,
+                    help="generate this many layers and repeat them to --layers (timing only)")
     a = ap.parse_args()
     devs = jax.devices()[:2] if (a.tiny or a.small) else jax.devices()
     g = qwen38.TINY if (a.tiny or a.small) else qwen38.FULL
@@ -313,7 +319,7 @@ def main() -> None:
                 try:
                     r = run_step(g, B, a.T, L, mesh, a.chains, a.budget, a.max_groups, a.ctx,
                                  a.small, not a.no_ref, a.gain, bool(a.identical[0]),
-                                 a.manager_pages)
+                                 a.manager_pages, a.repeat_from)
                 except Exception as e:  # noqa: BLE001
                     r = {"rows": B, "L": L, "stage": "C", "error": f"{type(e).__name__}: {e}"[:3000]}
                 print("RESULT", json.dumps(r), flush=True)
