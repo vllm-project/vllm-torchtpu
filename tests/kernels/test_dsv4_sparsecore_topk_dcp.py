@@ -16,8 +16,9 @@
 The contract is exact and deterministic, so the reference is too: the union of
 the ranks' outputs is the top-k of the whole row, with ties at the k-th score
 taken in (rank, column) order. Rows are drawn so that each path of the kernel
-runs: several rows per subcore, one, padding rows no rank sees, and parts
-longer than tile memory, which are streamed.
+runs: several rows per subcore, one, padding rows no rank sees, rows that
+finish by a candidate exchange or by the histogram levels, and parts longer
+than tile memory, which are streamed.
 """
 
 import jax
@@ -26,7 +27,7 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk_dcp import (
-    ROW_WORDS,
+    TILE_WORDS,
     sparsecore_topk_dcp,
 )
 
@@ -128,7 +129,10 @@ def _case(dcp_size, b, n, lo, hi, seed, levels=0, live=None):
     [
         (64, 4096, 0, 4096, 0, None),  # many rows per subcore, some empty
         (64, 4096, 1000, 4096, 16, None),  # ties at the k-th score
+        # Ties past a candidate slot: the histogram levels to the end.
+        (64, 4096, 2000, 4096, 4, None),
         (96, 2048, 0, 300, 0, 40),  # under k entries; padding rows
+        (64, 512, 0, 60, 0, None),  # every row under k: no refinement level
         (16, 16384, 8000, 16384, 0, None),  # fewer rows than subcores
     ],
 )
@@ -150,11 +154,33 @@ def test_mesh_with_a_lane_axis(b):
 
 
 @pytest.mark.multichip
+def test_candidate_and_histogram_rows_in_one_pass():
+    """Rows whose window fits a candidate slot skip the last level; rows with
+    more ties than that take the histogram levels, in the same pass."""
+    dcp_size = 4
+    _need_devices(dcp_size)
+    k = 512
+    scores, lengths = _case(dcp_size, 64, 4096, 2000, 4096, 11)
+    ties, _ = _case(dcp_size, 64, 4096, 2000, 4096, 12, levels=4)
+    scores[:, ::2] = ties[:, ::2]
+    _check(_run(scores, lengths, k), scores, lengths, k)
+
+
+@pytest.mark.multichip
+def test_full_passes_of_long_parts_stay_resident():
+    """Eight parts per subcore of over 8K words each fit tile memory."""
+    dcp_size = 2
+    _need_devices(dcp_size)
+    scores, lengths = _case(dcp_size, 256, 12288, 9000, 12288, 13)
+    _check(_run(scores, lengths, 2048), scores, lengths, 2048)
+
+
+@pytest.mark.multichip
 def test_parts_longer_than_tile_memory_are_streamed():
     dcp_size = 2
     _need_devices(dcp_size)
-    n = 2 * ROW_WORDS + 4096
-    scores, lengths = _case(dcp_size, 4, n, ROW_WORDS + 1, n, 3)
+    n = 2 * TILE_WORDS + 4096
+    scores, lengths = _case(dcp_size, 4, n, TILE_WORDS + 1, n, 3)
     _check(_run(scores, lengths, 2048), scores, lengths, 2048)
 
 
