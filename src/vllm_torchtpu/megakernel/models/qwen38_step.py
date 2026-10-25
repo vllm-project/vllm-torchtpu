@@ -46,10 +46,12 @@ def flat_weight_layout(spec: ModelSpec, ex: ExecSpec) -> list[tuple[str, int]]:
     ]
 
 
-def make_flat_segment_step(mesh: Any, spec: ModelSpec, ex: ExecSpec):
+def make_flat_segment_step(mesh: Any, spec: ModelSpec, ex: ExecSpec, extra_outs: tuple = ()):
     """Return `(fn, in_specs, out_specs, n_weights)` for one segment bucket.
 
-    `fn.extra_names` lists the extra inputs `fn` takes after `hidden`.
+    `fn.extra_names` lists the extra inputs `fn` takes after `hidden`; `extra_outs` names
+    block outputs returned after the residual and the GDN checkpoints (the whole-step
+    kernel's per-QSA-layer cache rows).
     """
     step, info = kernel.make_step(mesh, spec, ex)
     p, wsh = info["plan"], info["wshape"]
@@ -62,7 +64,7 @@ def make_flat_segment_step(mesh: Any, spec: ModelSpec, ex: ExecSpec):
     extras = kernel.extra_inputs(spec, info["exec"])
     n_x = len(extras)
     states = GDN_STATES if has_states else ()
-    outs = (RESIDUAL_OUT, *GDN_CKPTS) if has_ckpts else (RESIDUAL_OUT,)
+    outs = ((RESIDUAL_OUT, *GDN_CKPTS) if has_ckpts else (RESIDUAL_OUT,)) + tuple(extra_outs)
 
     def fn(pos, hidden, *rest):
         xs, rest = rest[:n_x], rest[n_x:]

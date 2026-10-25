@@ -1,0 +1,165 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""One Qwen3.8 whole-step call (model layers 3..46) as a single SPMD JAX function.
+
+`build_wholestep_call` returns `(fn, in_specs, out_specs, donate_argnums)` at one row
+count `B`. `fn(hidden, *weights, pool, *gdn_meta, *qsa_tables, positions, starts, context,
+trig)`: pads rows to the kernel's `M`, derives the GDN read / write blocks (as the segment
+call) and the QSA layers' extras with the stock addressing (`qwen38_wholestep_inputs`), runs
+the kernel, then — in the same function, on the donated pool — scatters the GDN checkpoints
+and writes every QSA layer's step tokens through the stock writer sequence
+(`qwen38_wholestep_cache`). Returns `(residual, pool)`.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import jax
+import jax.numpy as jnp
+from jax.sharding import PartitionSpec as P
+
+from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
+from vllm_torchtpu.megakernel.models.qwen38_step import make_flat_segment_step
+from vllm_torchtpu.megakernel.wholestep.qsa_full_c import IR_NEW, KR_NEW
+from vllm_torchtpu.megakernel.wholestep.qsa_full import KV_NEW
+from vllm_torchtpu.megakernel.wholestep.spec import wholestep_spec
+
+from .qwen38_scatter import scatter_gdn_ckpts_fast
+from .qwen38_segment_call import GDN_META, T_VERIFY, gdn_blocks, segment_tiles
+from .qwen38_wholestep_cache import QSALayerCache, wholestep_qsa_writes
+from .qwen38_wholestep_inputs import qsa_step_inputs
+
+QSA_TABLES = 3  # per QSA layer: ring ids, main table, compressed table
+
+
+def build_wholestep_call(
+    mesh: Any,
+    g: Any,
+    B: int,
+    layout: Any,
+    qsa_layers: list[QSALayerCache],
+    *,
+    L: int = 44,
+    budget: int,
+    max_groups: int,
+    norm_eps: float,
+    rotary_dim: int,
+    write: bool = True,
+    interpret: bool = False,
+    tiles: Tiles | None = None,
+) -> tuple[Any, tuple, tuple, tuple]:
+    R = mesh.size
+    T = T_VERIFY
+    ex = ExecSpec(
+        R=R, B=B, T=T, ctx=128, tiles=segment_tiles(B) if tiles is None else tiles,
+        interpret=interpret,
+    )
+    n_att = L // g.att_every
+    n_gdn = L - n_att
+    assert len(qsa_layers) == n_att, (len(qsa_layers), n_att)
+    pps = max_groups * 4 // 128
+    spec = wholestep_spec(
+        g, R, L=L, first="qsa", pool_gdn=True, qsa=dict(budget=budget), step=True,
+        indexed=dict(max_groups=max_groups, pages_per_seq=pps, carrier="fp8", n_layers=n_att),
+    )
+    fn, k_specs, _, n_w = make_flat_segment_step(mesh, spec, ex, extra_outs=(KV_NEW, KR_NEW, IR_NEW))
+    M, NS = ex.M, B // T
+    tp, rep = P("tp"), P()
+    x_specs = k_specs[2 : 2 + len(fn.extra_names)]
+    hbm = {x for x, s in zip(fn.extra_names, x_specs) if s == tp}
+
+    pad = jax.shard_map(
+        lambda h: jnp.pad(h, ((0, M - B), (0, 0))), mesh=mesh, in_specs=tp, out_specs=tp,
+        check_vma=False,
+    )
+    unpad = jax.shard_map(lambda r: r[:B], mesh=mesh, in_specs=tp, out_specs=tp, check_vma=False)
+    pos0 = jnp.zeros((B,), jnp.int32)
+    n_meta = GDN_META * n_gdn
+    n_tab = QSA_TABLES * n_att
+    slots = [(lay.main_slot, lay.compressed_slot) for lay in qsa_layers]
+    scales = (qsa_layers[0].k_scale, qsa_layers[0].v_scale)
+    assert all((lay.k_scale, lay.v_scale) == scales for lay in qsa_layers), "one KV scale pair"
+
+    names = (
+        "qsa_pool", "qsa_ck", "qsa_cktab", "qsa_nvis", "qsa_tail", "qsa_mtab", "qsa_off",
+        "qsa_scales", "qsa_rope", "qsa_ctx", "qsa_ring", "qsa_rope_ck",
+    )
+    out_specs_in = tuple(tp if n in hbm else rep for n in names)
+
+    def per_rank_inputs(pool, tables_flat, positions, starts, context, trig):
+        tables = [tuple(tables_flat[i : i + QSA_TABLES]) for i in range(0, n_tab, QSA_TABLES)]
+        d = qsa_step_inputs(
+            pool, tables, slots, trig, positions, starts, context, M=M, T=T,
+            pages_per_seq=pps, max_groups=max_groups, k_scale=scales[0], v_scale=scales[1],
+        )
+        return tuple(d[n] for n in names)
+
+    inputs = jax.shard_map(
+        per_rank_inputs,
+        mesh=mesh,
+        in_specs=(tp, rep, rep, rep, rep, rep),
+        out_specs=out_specs_in,
+        check_vma=False,
+    )
+
+    def per_rank_writes(pool, conv_ck, rec_ck, wb, kv, kr, ir, tables_flat, positions, starts,
+                        context, trig, norms_flat):
+        pool = scatter_gdn_ckpts_fast(pool, conv_ck, rec_ck, wb, layout=layout, interpret=interpret)
+        if not write:
+            return pool
+        Bq = len(positions)
+        rows = [(kr[o, :Bq], kv[o, :Bq, kv.shape[-1] // 2 :], ir[o, :Bq]) for o in range(n_att)]
+        norms = [tuple(norms_flat[2 * o : 2 * o + 2]) for o in range(n_att)]
+        tables = [tuple(tables_flat[i : i + QSA_TABLES]) for i in range(0, n_tab, QSA_TABLES)]
+        return wholestep_qsa_writes(
+            pool, rows, norms, tables, qsa_layers, positions, trig, starts, context,
+            compress_ratio=4, norm_eps=norm_eps, rotary_dim=rotary_dim, max_query_len=T,
+        )
+
+    writes = jax.shard_map(
+        per_rank_writes,
+        mesh=mesh,
+        in_specs=(tp, tp, tp, rep, tp, tp, tp, rep, rep, rep, rep, rep, rep),
+        out_specs=tp,
+        check_vma=False,
+    )
+
+    def call(*args):
+        hidden = args[0]
+        w = args[1 : 1 + n_w]
+        i = 1 + n_w
+        pool = args[i]
+        meta = args[i + 1 : i + 1 + n_meta]
+        i += 1 + n_meta
+        tables = args[i : i + n_tab]
+        i += n_tab
+        positions, starts, context, trig = args[i : i + 4]
+        norms = args[i + 4 :]  # per QSA layer: k_norm, index k_norm (cache writer)
+        x = pad(hidden)
+        rb, wb, hi = gdn_blocks(meta, NS, write)
+        xs = dict(zip(names, inputs(pool, tables, positions, starts, context, trig)))
+        xs.update(gdn_pool=pool, gdn_rb=rb, gdn_hi=hi.astype(jnp.int32))
+        outs = fn(pos0, x, *(xs[k] for k in fn.extra_names), *w)
+        res, conv_ck, rec_ck, kv, kr, ir = outs
+        pool = writes(pool, conv_ck, rec_ck, wb, kv, kr, ir, tables, positions, starts, context,
+                      trig, norms)
+        return unpad(res), pool
+
+    in_specs = (
+        (tp,) + (tp,) * n_w + (tp,) + (rep,) * n_meta + (rep,) * n_tab + (rep,) * 4
+        + (rep,) * (2 * n_att)
+    )
+    return call, in_specs, (tp, tp), (1 + n_w,)
+
