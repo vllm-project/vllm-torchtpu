@@ -424,6 +424,13 @@ class Qwen38SegmentDriver:
                 qwen38_segment_call.DEFAULT_RINGS = (int(e), int(d))
         drv = cls(runner, _parse_buckets(raw), head=_parse_flag(raw, "head", True))
         drv.check_left = _parse_check(raw)
+        for part in raw.split(","):
+            # `segset=1:5` / `headset=0`: only these segments / head groups run
+            # their kernels, the rest stock (bisection).
+            if part.startswith("segset="):
+                drv.segments.mk_segment_set = {int(x) for x in part[7:].split(":")}
+            if part.startswith("headset="):
+                drv.segments.mk_head_set = {int(x) for x in part[8:].split(":") if x != ""}
         segs = _parse_int(raw, "segs")
         if segs is not None:
             drv.segments.mk_segments = segs

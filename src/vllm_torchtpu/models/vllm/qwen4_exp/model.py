@@ -659,7 +659,23 @@ class Qwen4ExpBackbone(nn.Module):
         if head_groups:
             # Layers before the first QSA layer: one kernel call per group, the
             # per-layer embedding added before the group that starts at its layer.
+            head_set = getattr(segment_call, "mk_head_set", None)
             for h, group in enumerate(head_groups):
+                if head_set is not None and h not in head_set:
+                    for stock in layers[group[0] : group[-1] + 1]:
+                        hidden = stock(
+                            hidden,
+                            positions64,
+                            ids64,
+                            query_start_loc,
+                            ngram_context,
+                            state_slots,
+                            context_lens,
+                            valid_tokens,
+                            main_block_table,
+                            compressed_block_table,
+                        )
+                    continue
                 hidden = layers[group[0]].apply_ple(
                     hidden, ids64, query_start_loc, ngram_context, state_slots, context_lens
                 )
@@ -695,10 +711,12 @@ class Qwen4ExpBackbone(nn.Module):
         # (a config int, not a shape; for bisecting the served program).
         n_mk = getattr(segment_call, "mk_segments", None)
         n_mk = len(qsa_layers) if n_mk is None else int(n_mk)
+        # `mk_segment_set`: only these segments run their kernel (bisection).
+        mk_set = getattr(segment_call, "mk_segment_set", None)
         ends = qsa_layers[1:] + [len(layers)]
         for s, i in enumerate(qsa_layers):
             layer = layers[i]
-            if s >= n_mk:
+            if s >= n_mk or (mk_set is not None and s not in mk_set):
                 for stock in layers[i : ends[s]]:
                     hidden = stock(
                         hidden,
