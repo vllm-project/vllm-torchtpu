@@ -169,8 +169,8 @@ def pack_wholestep_operands(
             out.append(torch.zeros((1, g.NHC * g.H), dtype=torch.float32, device=dev))
         elif name in ("e13", "e2"):
             out.extend(w[name])
-        elif name == "es":
-            out.append(w[name])
+        elif name == "es":  # [L, EW, 1, X] -> 3-D [L*EW, 1, X]; the call reshapes it back
+            out.append(w[name].reshape(-1, *w[name].shape[2:]))
         else:
             nt, tk = p.nt[name], p.tk[name]
             t = w[name]
