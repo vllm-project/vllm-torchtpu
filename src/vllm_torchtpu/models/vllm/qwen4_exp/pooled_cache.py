@@ -19,6 +19,8 @@ import torch
 from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_config_from_groups,
     get_kv_cache_groups,
+    resolve_cache_hit_alignment_tokens,
+    resolve_kv_cache_block_sizes,
 )
 from vllm.v1.kv_cache_interface import CircularBufferSpec, MambaSpec
 from vllm.v1.worker.block_table import get_block_table_width
@@ -60,9 +62,16 @@ class Qwen4ExpPooledCache:
             * self.layout.page_bytes
             * max(len(g.layer_names) for g in self.groups),
         )
-        # EngineCore attaches the resolved layout after invoking the planner.
-        # Profiling allocates earlier, so preserve that same final contract.
+        # Profiling precedes EngineCore's scheduler finalization. Resolve the
+        # same metadata so full plan equality still guards physical ownership.
         config.kv_cache_layout = runner.cache_config.kv_cache_layout
+        scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
+            config, runner.vllm_config
+        )
+        config.hash_block_size = hash_block_size
+        config.cache_hit_alignment_tokens = resolve_cache_hit_alignment_tokens(
+            config, runner.vllm_config, scheduler_block_size, hash_block_size
+        )
         self.attn_groups = [
             [
                 AttentionGroup(
