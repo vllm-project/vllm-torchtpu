@@ -251,10 +251,23 @@ def stage_h2d_upload(runner: Any, host: torch.Tensor) -> torch.Tensor:
     to it, so a per-call buffer would otherwise be freed (and its memory
     reused) while the transfer is still in flight. The runner moves `host`
     from `_unfenced_h2d_sources` to `_fenced_h2d_sources` when it records the
-    fence and drops it once that fence has been waited on.
+    fence and recycles it into `_free_h2d_sources` once that fence has been
+    waited on.
     """
+    assert host.is_contiguous()
     runner._unfenced_h2d_sources.append(host)
     return host.to(runner.device, non_blocking=True)
+
+
+def zeros_h2d_source(
+    runner: Any, numel: int, dtype: torch.dtype = torch.int32
+) -> torch.Tensor:
+    """Return a zeroed 1D CPU buffer of `(numel, dtype)`, recycling one
+    released by `_wait_input_staging_fence` when available."""
+    free = runner._free_h2d_sources.get((numel, dtype))
+    if free:
+        return free.pop().view(-1).zero_()
+    return torch.zeros((numel,), dtype=dtype, device="cpu", pin_memory=PIN_MEMORY)
 
 
 class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
@@ -396,16 +409,15 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         else:
             # Per-call buffer: a later chunk or draft walk must not overwrite a
             # table whose upload is still in flight (see `stage_h2d_upload`).
-            block_tables = torch.zeros(
-                (target_num_reqs, target_num_blocks), dtype=torch.int32
-            )
+            flat = zeros_h2d_source(runner, target_num_reqs * target_num_blocks)
+            block_tables = flat.view(target_num_reqs, target_num_blocks)
             source_block_tables = block_table_obj.get_cpu_tensor()
             block_tables[: ctx.num_reqs, :target_num_blocks] = source_block_tables[
                 ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
             ]
             # Flatten on CPU before H2D to avoid device-side
             # as_strided/reshape materialization on every decode step.
-            block_tables_dev = stage_h2d_upload(runner, block_tables.reshape(-1))
+            block_tables_dev = stage_h2d_upload(runner, flat)
             input_positions = runner.position_ids
 
         mamba_ckpt_indices = None
@@ -528,7 +540,7 @@ def stage_block_table_uploads(
     # Per-walk buffer: TorchTPU reads the CPU source until the async H2D
     # drains, so a later chunk or draft walk must not refill a shared scratch
     # (see `stage_h2d_upload`).
-    flat = torch.zeros((total,), dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY)
+    flat = zeros_h2d_source(runner, total)
 
     if ctx.position_ids_override is None:
         offset = 0

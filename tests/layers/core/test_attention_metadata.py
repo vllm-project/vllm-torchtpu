@@ -22,6 +22,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadataBuilder,
     AttentionMetadataBuilderContext,
     stage_block_table_uploads,
+    stage_h2d_upload,
 )
 from vllm_torchtpu.layers.core.sequence_layout import (
     PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL,
@@ -45,6 +46,7 @@ class TestAttentionMetadataBuilderPlumbing:
         runner.most_model_len = most_model_len
         runner.position_ids = torch.full((8,), 42, dtype=torch.int32)
         runner._unfenced_h2d_sources = []
+        runner._free_h2d_sources = {}
         runner.attn_groups = []
         runner._unified_kv_layout = False
 
@@ -568,6 +570,38 @@ class TestAttentionMetadataBuilderPlumbing:
         assert sources[0].data_ptr() != sources[1].data_ptr()
         for src, snapshot in zip(sources, snapshots, strict=True):
             torch.testing.assert_close(src, snapshot, rtol=0, atol=0)
+
+    def test_stage_h2d_upload_rejects_non_contiguous_source(self):
+        runner = self._make_runner_mock(num_groups=1)
+        non_contig = torch.zeros((4, 4), dtype=torch.int32)[:, :2]
+        assert not non_contig.is_contiguous()
+        with pytest.raises(AssertionError):
+            stage_h2d_upload(runner, non_contig)
+        assert runner._unfenced_h2d_sources == []
+
+    def test_recycled_free_list_buffer_is_reused_and_zeroed(self):
+        runner = self._make_runner_mock(num_groups=1)
+        builder = self._make_builder(runner, kv_cache_group_id=0)
+        self._make_attn_groups(runner, [builder])
+        recycled = torch.full((4 * 4,), 99, dtype=torch.int32)
+        ptr = recycled.data_ptr()
+        runner._free_h2d_sources[(4 * 4, torch.int32)] = [recycled]
+
+        ctx = AttentionMetadataBuilderContext(
+            num_reqs=2,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.ones(4, dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+        )
+        stage_block_table_uploads(runner, ctx, 4)
+
+        assert runner._free_h2d_sources[(4 * 4, torch.int32)] == []
+        used = runner._unfenced_h2d_sources[-1]
+        assert used.data_ptr() == ptr
+        # Padded tail rows (2..3) were zeroed before refilling rows 0..1.
+        assert used.view(4, 4)[2:].tolist() == [[0, 0, 0, 0], [0, 0, 0, 0]]
 
     def test_staged_build_skips_per_group_upload(self):
         """With views staged, build() must not touch the CPU block table."""

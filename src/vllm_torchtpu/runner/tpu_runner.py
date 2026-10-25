@@ -133,6 +133,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     attention_block_table_width,
     stage_block_table_uploads,
     stage_h2d_upload,
+    zeros_h2d_source,
 )
 from vllm_torchtpu.layers.core.sequence_layout import (
     SequenceLayoutKind,
@@ -1001,6 +1002,7 @@ class TPUModelRunner(GPUModelRunner):
         # waited on; see `stage_h2d_upload` and `_record_input_staging_fence`.
         self._unfenced_h2d_sources: list[torch.Tensor] = []
         self._fenced_h2d_sources: list[torch.Tensor] = []
+        self._free_h2d_sources: dict[tuple[int, torch.dtype], list[torch.Tensor]] = {}
         self._cached_query_start_loc: torch.Tensor | None = None
         self._cached_logits_indices: torch.Tensor | None = None
         self._cached_request_distribution: torch.Tensor | None = None
@@ -1774,7 +1776,7 @@ class TPUModelRunner(GPUModelRunner):
 
         # Per-call buffer: draft steps rebuild this between fences, so a
         # shared scratch could be refilled while an upload is in flight.
-        indices = torch.zeros(target_num_reqs, dtype=torch.int32)
+        indices = zeros_h2d_source(self, target_num_reqs)
         req_ids = self.input_batch.req_ids
         num_live = max(0, min(num_reqs, len(req_ids) - start_index))
         for i in range(num_live):
@@ -2016,9 +2018,7 @@ class TPUModelRunner(GPUModelRunner):
                 dsts_g = [d for _, d in pairs]
                 spec_dsts.extend(dsts_g)
                 src_t = self._spec_seed_sources(state_srcs, ckpt_rows, new_owners)
-                dst_t = torch.tensor(dsts_g, dtype=torch.int32).to(
-                    self.device, non_blocking=True
-                )
+                dst_t = stage_h2d_upload(self, torch.tensor(dsts_g, dtype=torch.int32))
                 src_t, dst_t = self._expand_pool_split(src_t, dst_t)
                 key = tuple(id(raw) for raw in raws)
                 entry = per_raw_dev.setdefault(key, (raws, [], []))
@@ -2041,8 +2041,8 @@ class TPUModelRunner(GPUModelRunner):
 
         if spec_seed and spec_dsts:
             # The seeded checkpoint is checkpoint 0 of the new group.
-            dst_t = torch.tensor(self._pad_to_bucket(spec_dsts), dtype=torch.long).to(
-                self.device, non_blocking=True
+            dst_t = stage_h2d_upload(
+                self, torch.tensor(self._pad_to_bucket(spec_dsts), dtype=torch.long)
             )
             assert self.mamba_slot_read_offsets is not None
             _rollback_offsets_seed(self.mamba_slot_read_offsets, dst_t)
@@ -2052,11 +2052,11 @@ class TPUModelRunner(GPUModelRunner):
             # forward that reads the buffer). Padding with (0, 0) null-block
             # self-copies keeps the shapes on the seed-copy bucket ladder.
             offset_pairs = self._pad_to_bucket(offset_pairs, pad=(0, 0))
-            src_t = torch.tensor([s for s, _ in offset_pairs], dtype=torch.long).to(
-                self.device, non_blocking=True
+            src_t = stage_h2d_upload(
+                self, torch.tensor([s for s, _ in offset_pairs], dtype=torch.long)
             )
-            dst_t = torch.tensor([d for _, d in offset_pairs], dtype=torch.long).to(
-                self.device, non_blocking=True
+            dst_t = stage_h2d_upload(
+                self, torch.tensor([d for _, d in offset_pairs], dtype=torch.long)
             )
             _rollback_offsets_migrate(self.mamba_slot_read_offsets, src_t, dst_t)
 
@@ -2066,11 +2066,11 @@ class TPUModelRunner(GPUModelRunner):
             self._pending_mamba_state_copies.append((raws, src_t, dst_t))
 
         for raws, srcs, dsts in per_raw.values():
-            src_t = torch.tensor(self._pad_to_bucket(srcs), dtype=torch.int32).to(
-                self.device, non_blocking=True
+            src_t = stage_h2d_upload(
+                self, torch.tensor(self._pad_to_bucket(srcs), dtype=torch.int32)
             )
-            dst_t = torch.tensor(self._pad_to_bucket(dsts), dtype=torch.int32).to(
-                self.device, non_blocking=True
+            dst_t = stage_h2d_upload(
+                self, torch.tensor(self._pad_to_bucket(dsts), dtype=torch.int32)
             )
             self._pending_mamba_state_copies.append((raws, src_t, dst_t))
 
@@ -2136,21 +2136,15 @@ class TPUModelRunner(GPUModelRunner):
         """
         offsets = self.mamba_slot_read_offsets
         assert offsets is not None
-        state_t = torch.tensor(state_srcs, dtype=torch.long).to(
-            self.device, non_blocking=True
-        )
-        ckpt_t = torch.tensor(ckpt_rows, dtype=torch.int32).to(
-            self.device, non_blocking=True
-        )
+        state_t = stage_h2d_upload(self, torch.tensor(state_srcs, dtype=torch.long))
+        ckpt_t = stage_h2d_upload(self, torch.tensor(ckpt_rows, dtype=torch.int32))
         off = offsets[state_t].long().clamp_(0, ckpt_t.shape[1] - 1)
         # PD and prefix-cache restores provide committed state in checkpoint 0.
         # A recycled source block can retain another request's MTP offset.
         # The first-forward reset clears the destination, after this source
         # selection, so ignore that stale offset here without mutating the
         # source block (which may be shared). Live requests retain their offset.
-        new_owner_t = torch.tensor(new_owners, dtype=torch.bool).to(
-            self.device, non_blocking=True
-        )
+        new_owner_t = stage_h2d_upload(self, torch.tensor(new_owners, dtype=torch.bool))
         off = torch.where(new_owner_t, 0, off)
         return ckpt_t.gather(1, off.unsqueeze(1)).squeeze(1)
 
@@ -3460,6 +3454,10 @@ class TPUModelRunner(GPUModelRunner):
         if fence is not None:
             fence.synchronize()
             self._input_staging_fence = None
+            for src in self._fenced_h2d_sources:
+                self._free_h2d_sources.setdefault((src.numel(), src.dtype), []).append(
+                    src
+                )
             self._fenced_h2d_sources.clear()
 
     def _upload_unless_unchanged(self, slot: str, host: torch.Tensor) -> torch.Tensor:
@@ -5629,6 +5627,7 @@ class TPUModelRunner(GPUModelRunner):
             # Every row of a warmup step is padding; every row of a profile
             # step is a real token.
             padding_state.update(num_tokens if profiling else 0, num_tokens)
+        self._record_input_staging_fence()
         intermediate_tensors = None
         if through_handoff:
             assert self._pp_wave is not None and not profiling
@@ -5639,7 +5638,6 @@ class TPUModelRunner(GPUModelRunner):
                 num_tokens, zeros=not profiling, random=profiling
             )
             self._pp_take_topk_indices(intermediate_tensors, num_tokens)
-        self._record_input_staging_fence()
         with (
             self.maybe_select_dummy_loras(
                 self.lora_config, np.array([num_tokens], dtype=np.int32)

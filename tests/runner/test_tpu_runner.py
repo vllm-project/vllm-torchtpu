@@ -53,6 +53,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadataBuilder,
     AttentionMetadataBuilderContext,
     stage_h2d_upload,
+    zeros_h2d_source,
 )
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import tpu_runner
@@ -1397,6 +1398,8 @@ class TestAttentionMetadataBuilder:
         runner.most_model_len = most_model_len
         runner._unified_kv_layout = False
         runner.position_ids = torch.full((8,), 42, dtype=torch.int32)
+        runner._unfenced_h2d_sources = []
+        runner._free_h2d_sources = {}
 
         block_tables = []
         for gid in range(num_groups):
@@ -1629,6 +1632,7 @@ class TestCompactMambaSlotPool:
         runner._mamba_slot_stride = slot_stride
         runner._mamba_offset_seeded = set()
         runner._unfenced_h2d_sources = []
+        runner._free_h2d_sources = {}
         runner.input_batch = MagicMock()
         # Bind the real methods.
         runner._init_mamba_slot_pool = TPUModelRunner._init_mamba_slot_pool.__get__(
@@ -2331,6 +2335,7 @@ class TestUnifiedReadOffsetMigration:
         runner._pre_async_results = None
         runner._pool_block_split = 1
         runner._pending_mamba_state_copies = []
+        runner._unfenced_h2d_sources = []
         raw = torch.zeros(16, 2)
         runner._mamba_copy_plan = [(0, [raw])]
         runner.input_batch = MagicMock()
@@ -2367,6 +2372,10 @@ class TestUnifiedReadOffsetMigration:
         assert len(runner._pending_mamba_state_copies) == 1
         _, src_t, dst_t = runner._pending_mamba_state_copies[0]
         assert int(src_t[0]) == 5 and int(dst_t[0]) == 9
+        # Both offset migration and seed copy tensors were staged via stage_h2d_upload.
+        assert len(runner._unfenced_h2d_sources) == 4
+        assert runner._unfenced_h2d_sources[-2] is src_t
+        assert runner._unfenced_h2d_sources[-1] is dst_t
 
     def test_no_crossing_leaves_offsets_alone(self):
         runner, scheduler_output = self._make_runner(
@@ -2641,6 +2650,7 @@ class TestInputStagingFence:
             _input_staging_fence=None,
             _unfenced_h2d_sources=[],
             _fenced_h2d_sources=[],
+            _free_h2d_sources={},
         )
         TPUModelRunner._record_input_staging_fence(runner)
         fence = runner._input_staging_fence
@@ -2662,8 +2672,8 @@ class TestInputStagingFence:
 
     def test_staged_h2d_sources_live_until_their_fence_is_waited(self, monkeypatch):
         """A host source uploaded before a record is released by the wait on
-        that fence; one uploaded after it (a draft walk) must survive that wait
-        and only go with the next fence cycle."""
+        that fence into the free list; one uploaded after it (a draft walk)
+        must survive that wait and only go with the next fence cycle."""
         monkeypatch.setattr(
             torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
         )
@@ -2672,8 +2682,10 @@ class TestInputStagingFence:
             _input_staging_fence=None,
             _unfenced_h2d_sources=[],
             _fenced_h2d_sources=[],
+            _free_h2d_sources={},
         )
-        target = stage_h2d_upload(runner, torch.zeros(4, dtype=torch.int32))
+        target = stage_h2d_upload(runner, torch.ones(4, dtype=torch.int32))
+        target_ptr = target.data_ptr()
         TPUModelRunner._record_input_staging_fence(runner)
         draft = stage_h2d_upload(runner, torch.ones(4, dtype=torch.int32))
         assert runner._fenced_h2d_sources[0] is target
@@ -2681,12 +2693,19 @@ class TestInputStagingFence:
 
         TPUModelRunner._wait_input_staging_fence(runner)
         assert runner._fenced_h2d_sources == []
+        assert runner._free_h2d_sources[(4, torch.int32)] == [target]
         assert runner._unfenced_h2d_sources[0] is draft
+
+        reused = zeros_h2d_source(runner, 4, torch.int32)
+        assert reused.data_ptr() == target_ptr
+        assert reused.tolist() == [0, 0, 0, 0]
+        assert runner._free_h2d_sources[(4, torch.int32)] == []
 
         TPUModelRunner._record_input_staging_fence(runner)
         TPUModelRunner._wait_input_staging_fence(runner)
         assert runner._fenced_h2d_sources == []
         assert runner._unfenced_h2d_sources == []
+        assert runner._free_h2d_sources[(4, torch.int32)] == [draft]
 
     def test_dummy_run_fences_its_uploads_before_the_forward(self, monkeypatch):
         """Warmup and idle-DP dummy runs stage block tables too: each run must
@@ -2739,6 +2758,7 @@ class TestInputStagingFence:
             _input_staging_fence=None,
             _unfenced_h2d_sources=[],
             _fenced_h2d_sources=[],
+            _free_h2d_sources={},
             _token_padding_state=None,
             sequence_layout_planner=SimpleNamespace(
                 prepare_dummy=lambda **kw: SimpleNamespace(
@@ -2754,6 +2774,7 @@ class TestInputStagingFence:
             "_build_attention_metadata",
             "_record_input_staging_fence",
             "_wait_input_staging_fence",
+            "_pp_take_topk_indices",
         ):
             setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
         bt = MagicMock()
@@ -2789,6 +2810,26 @@ class TestInputStagingFence:
             assert runner._input_staging_fence is _FakeTpuEvent.instances[-1]
         assert len(_FakeTpuEvent.instances) == 3
         assert all(fence.synchronized == 1 for fence in _FakeTpuEvent.instances[:-1])
+
+        # With through_handoff=True, the fence must be recorded before
+        # _pp_wave.start_forward so the next wait never blocks on the receive.
+        handoff_checked = []
+
+        def start_forward(n):
+            assert runner._input_staging_fence is _FakeTpuEvent.instances[-1]
+            assert runner._unfenced_h2d_sources == []
+            handoff_checked.append(n)
+            return None
+
+        runner._pp_wave = SimpleNamespace(
+            step=contextlib.nullcontext,
+            start_forward=start_forward,
+            end_forward=lambda *a: None,
+        )
+        TPUModelRunner._dummy_run(
+            runner, num_tokens=16, num_reqs=4, num_blocks=4, through_handoff=True
+        )
+        assert handoff_checked == [16]
 
 
 class TestAsyncSpecDecodeTokenAccounting:

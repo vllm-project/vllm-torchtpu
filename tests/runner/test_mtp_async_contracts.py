@@ -174,6 +174,7 @@ def test_mamba_read_offset_follows_storage_owner(
     runner._pending_mamba_state_copies = []
     runner._mamba_slot_stride = 4
     runner._unfenced_h2d_sources = []
+    runner._free_h2d_sources = {}
     runner._init_mamba_slot_pool(9)
     if layout == "compact":
         runner._mamba_copy_plan = []
