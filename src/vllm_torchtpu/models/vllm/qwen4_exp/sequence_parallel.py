@@ -69,6 +69,10 @@ def pad_hc_enabled() -> bool:
 
     Padded shards feeding the replicated MoE lowered real-AL to 3.09-3.11
     against 3.24 with GSM8K held, so the pair stays apart until understood.
+    Localized so far: it takes a padded bucket (3072 at TP8) together with
+    the replicated MoE on the gathered rows; tracing the graph at 2048
+    instead of 1024 keeps it (s04, AL 3.109). Suspect a token-count choice
+    the replicated MoE makes at trace time without a guard.
     """
     if not envs.QWEN4_EXP_PREFILL_SP_PAD_HC:
         return False
