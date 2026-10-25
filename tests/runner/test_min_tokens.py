@@ -282,7 +282,6 @@ def _input_batch():
         device=torch.device("cpu"),
         vocab_size=16,
         block_sizes=[16],
-        kernel_block_sizes=[16],
         max_num_blocks_per_req=[4],
         logitsprocs=LogitsProcessors(),
         logitsprocs_need_output_token_ids=True,
@@ -603,6 +602,7 @@ def _plain_step_runner(num_output, logits, req_id="r0"):
             )
         },
         _pre_async_results=None,
+        _pp_wave=None,
         _min_tokens=min_tokens.MinTokensTracker(),
         speculative_config=None,
         scheduler_config=SimpleNamespace(async_scheduling=False),
@@ -677,6 +677,9 @@ def test_plain_step_masks_random_sampling_below_min_tokens(num_output, expected)
         torch.ones((1, 1)),
     )
     runner._sampler_topk_candidates = lambda *_args: 0
+    runner._sampler_applies_topk_topp = (
+        TPUModelRunner._sampler_applies_topk_topp.__get__(runner)
+    )
     runner._get_sampling_generator = lambda: torch.Generator().manual_seed(0)
     runner._apply_temperature = TPUModelRunner._apply_temperature.__get__(runner)
     runner.sample_from_logits_func = TPUModelRunner.sample_from_logits.__get__(runner)
@@ -940,7 +943,7 @@ def _verify(min_toks, grammar=False, start=0, grammar_only_stop=None, greedy=Tru
         rejection_sample_method="strict",
         synthetic_acceptance_rates=None,
     )
-    runner = _runner(SimpleNamespace())
+    runner = _runner(SimpleNamespace(no_top_k=True, no_top_p=True))
     runner.speculative_config = spec_config
     runner.rejection_sampler = RejectionSampler(spec_config, torch.device("cpu"))
     runner.sample_from_logits_func = runner.sample_from_logits
