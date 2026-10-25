@@ -91,9 +91,28 @@ def test_gate_needs_step8():
 def test_gate_cap():
     assert not _applies(8, TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS="4")
     assert _applies(4, TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS="4")
-    # A cap above the step8 step would leave a two-step grid: off everywhere.
-    assert not _applies(4, TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS="16")
+    # A cap above the step: buckets up to the step stay fused, the larger
+    # ones keep the small all-to-all after the kernel.
+    assert _applies(4, TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS="32")
+    assert _applies(8, TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS="32")
+    assert not _applies(16, TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS="32")
     assert not _applies(4, TPU_DCP_MLA_SMALL_CHUNK_TOKENS="4")
+
+
+def test_gate_step32():
+    # "step32": buckets of up to 32 tokens are one grid step.
+    levers = "tr,zu,pv512,noinf,quad,fxskip,lrows,step32"
+    env = dict(TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS="32", TPU_MLA_DECODE_BODY_LEVERS=levers)
+    assert [t for t in (4, 8, 16, 32, 64) if _applies(t, **env)] == [4, 8, 16, 32]
+    assert [t for t in (4, 8, 16, 32) if _applies(t, TPU_MLA_DECODE_BODY_LEVERS=levers)] == [4, 8]
+
+
+def test_step_lever_tokens():
+    assert sparse_mla.decode_step_tokens(sparse_mla.DECODE_BODY_DEFAULT) == 8
+    assert sparse_mla.decode_step_tokens(("tr", "step32")) == 32
+    assert sparse_mla.decode_step_tokens(("tr", "quad")) == 0
+    with pytest.raises(ValueError):
+        sparse_mla.decode_step_tokens(("step8", "step16"))
 
 
 def test_gate_compares_tokens_once():

@@ -632,7 +632,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS", 8
     ),
     # On the buckets TPU_DCP_MLA_SEND_SMALL_A2A takes (T <= its cap, a power of
-    # 2) whose attention grid is one step (decode body lever "step8"): the
+    # 2) whose attention grid is one step (decode body step lever "step8",
+    # "step16" or "step32"; buckets above the step keep the small all-to-all): the
     # decode MLA kernel runs that exchange itself -- barrier signalled at
     # kernel entry, each destination's block built in a VMEM slab and pushed
     # once to the peer -- and returns the receive buffer, so the send buffer

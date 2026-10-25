@@ -1059,18 +1059,27 @@ def send_small_a2a_applies(num_tokens: int) -> bool:
 
 def fused_small_a2a_applies(num_tokens: int) -> bool:
     """Whether the decode MLA kernel runs this bucket's small all-to-all
-    itself (`TPU_MLA_FUSED_SMALL_A2A`): a bucket `send_small_a2a_applies`
-    takes whose attention grid is one step -- the decode body lever "step8"
-    on the capped fused-prep row-widths body. The only token-count gate is
-    `send_small_a2a_applies`' `T <= cap` (a power of 2): the rest is static --
-    the cap itself at most DECODE_STEP8_TOKENS (a power-of-2 bucket at or
-    below it is its own step) and within the small-chunk path. Fixed at trace
-    time on the static bucket size. The cap is the one that applies at this
-    DCP size (`dcp_mla_topk_cap`: the auto default caps only at DCP >= 8)."""
+    itself (`TPU_MLA_FUSED_SMALL_A2A`): a bucket the Pallas small all-to-all
+    takes (`send_small_a2a_applies`' static conditions) whose attention grid
+    is one step -- the decode body's step lever ("step8" / "step16" /
+    "step32") on the capped fused-prep row-widths body. The only token-count
+    gate is one `T <= cap` on the static bucket size, the cap being the
+    smaller of the small all-to-all's cap and the step's tokens (a
+    power-of-2 bucket at or below the step is its own step), within the
+    small-chunk path; buckets above the step and within the small
+    all-to-all's cap keep the small all-to-all after the kernel. The cap is
+    the one that applies at this DCP size (`dcp_mla_topk_cap`: the auto
+    default caps only at DCP >= 8)."""
     from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_kernel
     from vllm_torchtpu.layers.core.attention_interface import dcp_mla_topk_cap
 
-    if not (envs.TPU_MLA_FUSED_SMALL_A2A and send_small_a2a_applies(num_tokens)):
+    if not (
+        envs.TPU_MLA_FUSED_SMALL_A2A
+        and envs.TPU_DCP_MLA_SEND_SMALL_A2A
+        and envs.TPU_DCP_INDEXER_SMALL_AG
+        and envs.TPU_SC_TOPK_DCP_MERGE_FLAT
+        and envs.TPU_DCP_RANK_OPERAND
+    ):
         return False
     group = get_dcp_group()
     dcp_size = 1 if group is None else int(group.world_size)
@@ -1082,15 +1091,17 @@ def fused_small_a2a_applies(num_tokens: int) -> bool:
             v.strip() for v in (value or "").split(",") if v.strip() and v != "0"
         )
     )
+    cap = min(
+        envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS,
+        sparse_kernel.decode_step_tokens(levers),
+    )
     return bool(
-        "step8" in levers
+        cap
         and dcp_mla_topk_cap(dcp_size)
         and envs.TPU_DCP_MLA_FUSED_PREP
         and envs.TPU_MLA_DECODE_ROW_WIDTHS
-        and envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS
-        <= sparse_kernel.DECODE_STEP8_TOKENS
-        and envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS
-        <= envs.TPU_DCP_MLA_SMALL_CHUNK_TOKENS
+        and cap <= envs.TPU_DCP_MLA_SMALL_CHUNK_TOKENS
+        and num_tokens <= cap
     )
 
 
