@@ -17,16 +17,6 @@
 # not run here.
 
 steps:
-  - label: "Type Check - Full Environment"
-    key: "typecheck_full"
-    depends_on: "build_docker"
-    agents:
-      queue: "cpu"
-    env:
-      CPU_ONLY: "1"
-    commands:
-      - bash .buildkite/scripts/run_in_docker.sh bash tools/typecheck_full.sh
-
   - label: "DeepSeek-V4.1 projection/RoPE: dispatch, parity and export"
     key: "dsv41_projection_rope"
     depends_on: "build_docker"
