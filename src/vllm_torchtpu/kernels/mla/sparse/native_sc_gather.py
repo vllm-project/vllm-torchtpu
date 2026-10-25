@@ -51,6 +51,10 @@ ROPE_WORDS = 32  # one rope token on the SparseCore view of the rope cache
 PACKED_ROPE_WORDS = 16
 # `write_rows` (the write phase's one operand), u32[3 * T, 128]: row blocks.
 WRITE_NOPE_PART, WRITE_ROPE_PART, WRITE_DST_PART, WRITE_PARTS = 0, 1, 2, 3
+# The write phase takes up to four rounds of `NUM_SUBCORES` tokens; rounds past
+# the second share one semaphore set (`write_semaphore_sets`).
+MAX_WRITE_TOKENS = 4 * NUM_SUBCORES
+MAX_SEPARATE_WRITE_ROUNDS = 2
 
 
 def _delta_swap(x, y, shift, mask):
@@ -377,6 +381,22 @@ def write_slots(num_tokens: int, fault: str | None) -> int:
     return num_tokens if fault == "no_fence" else num_tokens // NUM_SUBCORES
 
 
+def write_semaphore_sets(num_tokens: int, fault: str | None) -> int:
+    """Write-phase semaphore sets (dst, nope, rope) for a padded token count.
+
+    Up to `MAX_SEPARATE_WRITE_ROUNDS` rounds each round has a set of its own.
+    More rounds, and the single-writer control, share one set: every copy
+    sharing a semaphore has the same size and each wait names its own copy,
+    so the drain still waits for every copy. A SparseCore subcore has few
+    semaphore words (~59), and the write phase then holds the three of a
+    one-round write however many rounds it runs.
+    """
+    rounds = write_slots(num_tokens, fault)
+    if fault == "no_fence" or rounds > MAX_SEPARATE_WRITE_ROUNDS:
+        return 1
+    return rounds
+
+
 def _write_phase(
     write_refs: tuple[Any, ...],
     write_scratch: tuple[Any, ...],
@@ -414,6 +434,11 @@ def _write_phase(
     already the SparseCore's linear layout (a [T, 384] operand cost a 0.6 us
     relayout, j-241c6f15). A SparseCore scalar comes from lane 0 of a VMEM
     vector.
+
+    Up to `MAX_SEPARATE_WRITE_ROUNDS` rounds, each round fetches its dst
+    vector and waits for it before the next. Rounds that share a semaphore
+    set (`write_semaphore_sets`) fetch every dst vector at once and wait for
+    all of them first, so four rounds pay one fetch round trip, not four.
     """
     (rows_src,) = write_refs
     dst_vmem, dst_sem, write_sem = write_scratch
@@ -423,20 +448,30 @@ def _write_phase(
     rope_words = rope_cache_ref.shape[-1]
     single_writer = fault == "no_fence"
     rounds = num_tokens if single_writer else pl.cdiv(num_tokens, NUM_SUBCORES)
-    copies = []
-    for k in range(rounds):
+    sets = write_semaphore_sets(num_tokens, fault)
+
+    def dst_fetch(k):
         token = jnp.int32(k) if single_writer else subcore + k * NUM_SUBCORES
-        cp = pltpu.make_async_copy(
+        return token, pltpu.make_async_copy(
             rows_src.bitcast(jnp.int32).at[
                 pl.ds(WRITE_DST_PART * num_tokens + token, 1), pl.ds(0, NUM_LANES)
             ],
             dst_vmem.at[pl.ds(k, 1), :],
-            # The single-writer control shares one semaphore set (SparseCore
-            # has ~59 words of semaphores); each wait names its own copy.
-            dst_sem.at[0 if single_writer else k],
+            dst_sem.at[k % sets],
         )
+
+    fetch_together = sets < rounds and not single_writer
+    fetches = [dst_fetch(k) for k in range(rounds)] if fetch_together else []
+    for _, cp in fetches:
         cp.start()
+    for _, cp in fetches:
         cp.wait()
+    copies = []
+    for k in range(rounds):
+        token, cp = fetches[k] if fetch_together else dst_fetch(k)
+        if not fetch_together:
+            cp.start()
+            cp.wait()
         dst = dst_vmem[k, :][0] - 1  # stored as dst + 1 (< 2**31), 0 = skip
         if fault == "wrong_row":
             dst = dst + 1
@@ -450,14 +485,14 @@ def _write_phase(
         nope_cp = pltpu.make_async_copy(
             rows_src.at[pl.ds(WRITE_NOPE_PART * num_tokens + token, 1)],
             nope_cache_ref.at[pl.ds(row, 1)],
-            write_sem.at[0 if single_writer else 2 * k],
+            write_sem.at[2 * (k % sets)],
         )
         rope_cp = pltpu.make_async_copy(
             rows_src.at[
                 pl.ds(WRITE_ROPE_PART * num_tokens + token, 1), pl.ds(0, rope_words)
             ],
             rope_cache_ref.at[pl.ds(row, 1)],
-            write_sem.at[1 if single_writer else 2 * k + 1],
+            write_sem.at[2 * (k % sets) + 1],
         )
         if fault == "skip_write":
             continue
@@ -498,8 +533,8 @@ def pack_write_rows(
     to `Tp`, a whole number of subcore rounds (16); padding rows are skipped.
     """
     t = dst_rows.shape[0]
-    if not 0 < t <= 2 * NUM_SUBCORES:
-        raise ValueError(f"kv_write takes 1..{2 * NUM_SUBCORES} tokens")
+    if not 0 < t <= MAX_WRITE_TOKENS:
+        raise ValueError(f"kv_write takes 1..{MAX_WRITE_TOKENS} tokens")
     if nope_rows.shape != (t, 128) or nope_rows.dtype != jnp.uint32:
         raise ValueError(f"nope_rows must be uint32[{t}, 128]")
     rope_widths = ((t, PACKED_ROPE_WORDS), (t, ROPE_WORDS), (t, 128))
@@ -619,8 +654,9 @@ def dsa_gather_native_sc(
     `prepare_capped_window_fused` writes, so its single output carries both.
 
     ``kv_write`` (TPU_MLA_KV_WRITE_IN_GATHER) = ``(dst_rows, nope_rows,
-    rope_rows)``: i32[T] flattened cache rows (`page * page_size + slot`,
-    negative = skip), u32[T, 128] and u32[T, 32 or 128] (16 or 128 under
+    rope_rows)``, T <= `MAX_WRITE_TOKENS`: i32[T] flattened cache rows
+    (`page * page_size + slot`, negative = skip), u32[T, 128] and
+    u32[T, 32 or 128] (16 or 128 under
     ``packed_rope``) tokens already packed for the SparseCore cache
     (`kv_cache_utils.pack_tokens`; a 128-wide rope operand carries the token
     in words [0, 32), or [0, 16), and avoids a relayout), or
@@ -789,11 +825,12 @@ def dsa_gather_native_sc(
         if (
             write_rows.shape != (WRITE_PARTS * padded, 128)
             or write_rows.dtype != jnp.uint32
-            or not 0 < padded <= 2 * NUM_SUBCORES
+            or not 0 < padded <= MAX_WRITE_TOKENS
             or padded % NUM_SUBCORES
         ):
             raise ValueError(
-                f"write_rows must be uint32[3 * Tp, 128], Tp in (16, 32); got "
+                f"write_rows must be uint32[3 * Tp, 128], Tp a multiple of "
+                f"{NUM_SUBCORES} up to {MAX_WRITE_TOKENS}; got "
                 f"{write_rows.shape} {write_rows.dtype}"
             )
         if row_kwargs and padded > NUM_SUBCORES:
@@ -807,7 +844,7 @@ def dsa_gather_native_sc(
         operands.append(write_rows)
         rounds = write_slots(padded, write_fault)
         scratch_types["write_dst_vmem"] = pltpu.VMEM((rounds, NUM_LANES), jnp.int32)
-        sems = 1 if write_fault == "no_fence" else rounds
+        sems = write_semaphore_sets(padded, write_fault)
         scratch_types["write_dst_sem"] = pltpu.SemaphoreType.DMA((sems,))
         scratch_types["write_sem"] = pltpu.SemaphoreType.DMA((2 * sems,))
         write_tokens = padded

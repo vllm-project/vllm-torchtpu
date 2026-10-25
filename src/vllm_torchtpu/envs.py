@@ -209,6 +209,7 @@ if TYPE_CHECKING:
     TPU_MLA_TC_KV_WRITER: bool = False
     TPU_MLA_DECODE_PROLOGUE: bool = False
     TPU_MLA_KV_WRITE_IN_GATHER: bool = False
+    TPU_MLA_KV_WRITE_IN_GATHER_MAX_TOKENS: int = 32
     TPU_INDEXER_QB_OVERLAP: bool = False
     TPU_SPARSE_MLA_PACKED_ROPE: bool = False
     TPU_KV_TRANSFER_PORT: str = "9100"
@@ -952,6 +953,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # into both caches itself (then fences), instead of a separate cache
     # writer kernel (tc_scatter / scatter_rows). Same bytes, same owner mask.
     "TPU_MLA_KV_WRITE_IN_GATHER": env_bool("TPU_MLA_KV_WRITE_IN_GATHER", default=False),
+    # With TPU_MLA_KV_WRITE_IN_GATHER: the largest bucket whose KV write rides
+    # the gather. Up to 32 tokens that is the fused-prep decode gather; a
+    # larger bucket takes it when one live-group gather serves the whole call
+    # (TPU_DCP_MLA_MIXED_LIVE, one TPU_DCP_MLA_TOPK_CAP_CHUNK chunk). At most
+    # 64 (four SparseCore write rounds); 64 takes the 64-token bucket off the
+    # two SparseCore cache scatters it runs before its gather.
+    "TPU_MLA_KV_WRITE_IN_GATHER_MAX_TOKENS": env_int(
+        "TPU_MLA_KV_WRITE_IN_GATHER_MAX_TOKENS", 32
+    ),
     # Run the MLA q_b projection inside the DCP indexer op, in the local
     # SparseCore top-k's XLA scheduling group, so decode issues it while the TC
     # would otherwise idle on the top-k's call-done. Same kernel, same inputs:
