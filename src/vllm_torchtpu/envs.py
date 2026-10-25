@@ -211,6 +211,7 @@ if TYPE_CHECKING:
     TPU_MLA_KV_WRITE_IN_GATHER: bool = False
     TPU_MLA_KV_WRITE_IN_GATHER_MAX_TOKENS: int = 32
     TPU_INDEXER_QB_OVERLAP: bool = False
+    TPU_QB_OVERLAP_HONORS_SKIP_TOPK: bool = False
     TPU_SPARSE_MLA_PACKED_ROPE: bool = False
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
@@ -967,6 +968,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # would otherwise idle on the top-k's call-done. Same kernel, same inputs:
     # bit-identical q. Needs the fp8 Pallas q_b site (TPU_FP8_LINEAR_PALLAS).
     "TPU_INDEXER_QB_OVERLAP": env_bool("TPU_INDEXER_QB_OVERLAP", default=False),
+    # Take the q_b overlap path only in passes that run their own indexer, so an
+    # IndexShare draft step traced with skip_topk reads the shared top-k table.
+    "TPU_QB_OVERLAP_HONORS_SKIP_TOPK": env_bool("TPU_QB_OVERLAP_HONORS_SKIP_TOPK", default=False),
     # Store each token's 64-byte fp8 RoPE key in 64 bytes instead of a padded
     # 128-byte row (eight tokens per 128-word row), cutting the sparse MLA
     # latent cache from 640 to 576 B/token. SparseCore layouts only; the

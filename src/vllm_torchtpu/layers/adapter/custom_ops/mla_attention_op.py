@@ -2224,7 +2224,11 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                         dim=-1,
                     )
                 q_c = self.q_a_layernorm(q_c)
-                if getattr(self, "qb_overlap", False) and self.kimi_preprocess is None:
+                if (
+                    getattr(self, "qb_overlap", False)
+                    and self.kimi_preprocess is None
+                    and not (envs.TPU_QB_OVERLAP_HONORS_SKIP_TOPK and self.skip_topk)
+                ):
                     # The indexer runs on q_c anyway; it returns q too.
                     assert self.indexer is not None
                     early_topk, q = self.indexer(
