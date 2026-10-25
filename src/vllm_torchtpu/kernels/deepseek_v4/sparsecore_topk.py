@@ -36,6 +36,12 @@ Single-stage multi-subcore selection with VMEM_SHARED global histogram:
    each DCP merge row over P subcores by rank segment instead of one subcore
    per row. All bitwise identical to the default paths.
 
+6. ``TPU_SC_TOPK_ONE_SUBCORE_CAPACITY``: a call whose row width N splits every
+   row over P > 1 subcores also holds the P = 1 body, whose slice buffer is
+   sized by the capacity instead of N, and runs it when no row of the call is
+   longer than the capacity. Bitwise identical: both bodies take the boundary
+   ties at the lowest columns, and P > 1 joins its parts in column order.
+
 Output rows are the top-k column indices in unspecified order, ``-1``
 suffix-padded, matching an exact top-k over the given scores as a set (equal
 boundary scores may be broken differently). ``-inf`` scores and positions at
@@ -118,6 +124,8 @@ def _topk_body(
     rank_major_dcp: int = 0,
     coop_v2: bool = False,
     merge_coop_dcp: int = 0,
+    row_stride: int | None = None,
+    lengths_vmem: Any = None,
 ):
     dcp_merge = local_idxs_hbm is not None
     if rank_major_dcp:
@@ -1076,13 +1084,16 @@ def _topk_body(
     # and in column order, so ties still go to the lowest columns. Each subcore
     # fetches just its part; at p == 1 that is the row's first row_length
     # words. Every subcore copies all the row lengths in once.
-    pltpu.sync_copy(lengths_hbm, meta_vmem)
+    if lengths_vmem is None:
+        pltpu.sync_copy(lengths_hbm, meta_vmem)
+        lengths_vmem = meta_vmem
+    stride = p * slice_len if row_stride is None else row_stride
     _, half = _slice_buffer(num_waves, slice_len)
 
     def wave_info(wave):
         """Row length, busy flag and this subcore's column range."""
         core_first = wave * groups_per_chip + core * groups_per_core
-        row_len = jnp.minimum(vec_at(meta_vmem, core_first + group_id), n)
+        row_len = jnp.minimum(vec_at(lengths_vmem, core_first + group_id), n)
         if p == 1:
             # A lone subcore has no barriers to keep in step with, so it skips
             # its own empty rows.
@@ -1092,7 +1103,7 @@ def _topk_body(
             # wave only together: when none of the core's rows in it has
             # anything to select. Padded token rows are empty, and a large
             # bucket holds thousands of them.
-            core_lens = meta_vmem[pl.ds(core_first, LANES)]
+            core_lens = lengths_vmem[pl.ds(core_first, LANES)]
             live = (lane_iota < groups_per_core) & (core_lens > 0)
             busy = plsc.all_reduce_population_count(live)[0] > 0
         part = _cdiv_dyn(jnp.right_shift(row_len + (p - 1), p.bit_length() - 1))
@@ -1104,7 +1115,7 @@ def _topk_body(
 
     def slice_copy(wave, off, lo, words):
         row = wave * groups_per_chip + core * groups_per_core + group_id
-        src = pl.multiple_of(row * (p * slice_len) + lo, LANES)
+        src = pl.multiple_of(row * stride + lo, LANES)
         return pltpu.make_async_copy(
             scores_hbm.at[pl.ds(src, words)],
             slices_vmem.at[pl.ds(pl.multiple_of(off, LANES), words)],
@@ -1175,6 +1186,40 @@ def _topk_body(
     lax.fori_loop(0, num_waves, wave_body, jnp.int32(0))
 
 
+def _one_subcore_when_rows_fit(
+    scores_hbm,
+    lengths_hbm,
+    *refs,
+    num_rows: int,
+    capacity: int,
+    one_subcore,
+    split,
+):
+    """Runs the P = 1 body `one_subcore` when no row of the call is longer
+    than `capacity` words, and the P > 1 body `split` otherwise.
+
+    The row lengths land in the last scratch buffer, which both bodies read
+    instead of copying them again. Every subcore counts the same lengths, so
+    all of them take the same body and the split body's barriers still pair.
+    """
+    *refs, lengths_vmem = refs
+    pltpu.sync_copy(lengths_hbm, lengths_vmem)
+
+    def count_long_rows(i, count):
+        lengths = lengths_vmem[pl.ds(i * LANES, LANES)]
+        return count + plsc.all_reduce_population_count(lengths > capacity)[0]
+
+    long_rows = plsc.parallel_loop(
+        0, num_rows // LANES, unroll=2, carry=jnp.int32(0)
+    )(count_long_rows)  # pytype: disable=bad-argument-type
+
+    def run(body):
+        body(scores_hbm, lengths_hbm, *refs, lengths_vmem=lengths_vmem)
+
+    pl.when(long_rows == 0)(functools.partial(run, one_subcore))
+    pl.when(long_rows > 0)(functools.partial(run, split))
+
+
 # (b, n, p) shapes on which TPU_SC_TOPK_COOP_V2 is proven bitwise on hardware:
 # the DCP8 decode buckets T = 4 / 8 / 16 of the local top-k (n = 1M / 8), and
 # the a2a merge's stage 2 at T = 64 / 128 (b = T / 8 rows of n = 8 * 2048).
@@ -1214,6 +1259,7 @@ def _sc_topk_direct(
     scheduling_group_id: int | None = None,
     rank_major_dcp: int = 0,
     coop_v2: bool = False,
+    one_subcore_capacity: int = 0,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Single-stage SparseCore top-k on 32 subcores.
 
@@ -1230,6 +1276,12 @@ def _sc_topk_direct(
     subcore fetches its own row's ``dcp`` pieces, so the scores and
     ``local_idxs`` are neither padded to 32 rows nor relaid out from 2-D tiles,
     and only ``b * k`` slots are written. Same row contents, same output.
+
+    ``one_subcore_capacity`` (``p > 1``, no ``local_idxs``; see
+    `_one_subcore_capacity`): the SparseCore call also holds the ``p == 1``
+    body, with a slice buffer of that many words per subcore and rows still
+    ``p * slice_len`` words apart, and runs it when no row is longer than the
+    capacity. Same output.
     """
     if rank_major_dcp:
         if local_idxs is None or p != 1 or scores.ndim != 1:
@@ -1263,7 +1315,9 @@ def _sc_topk_direct(
     if not rank_major_dcp and (pad_b > 0 or pad_n > 0):
         words = jnp.pad(words, ((0, pad_b), (0, pad_n)))
 
-    lengths = jnp.pad(row_lengths.astype(jnp.int32), (0, padded_b - b))
+    one_subcore_waves = _cdiv(b, 32)
+    length_rows = one_subcore_waves * 32 if one_subcore_capacity else padded_b
+    lengths = jnp.pad(row_lengths.astype(jnp.int32), (0, length_rows - b))
     wave_loop = local_idxs is None
     if wave_loop:
         # One flat copy, padded for the 16-lane reads at its end.
@@ -1308,6 +1362,11 @@ def _sc_topk_direct(
     shared_gather = coop_v2 and p >= 4
     async_gather = coop_v2 and p < 4
     peer_n = p if async_gather else 1
+    slice_words = _slice_buffer(num_waves, slice_len)[0]
+    if one_subcore_capacity:
+        slice_words = max(
+            slice_words, _slice_buffer(one_subcore_waves, one_subcore_capacity)[0]
+        )
     scratch_types = (
         pltpu.VMEM((NUM_BUCKETS + LANES,), jnp.int32),  # glob_vmem
         pltpu.VMEM((k + LANES,), jnp.int32),  # rowbuf_vmem
@@ -1333,10 +1392,10 @@ def _sc_topk_direct(
         pltpu.VMEM_SHARED((2 * sc.num_subcores * k,), jnp.int32)
         if (p > 1 and return_scores)
         else None,  # shared_key_vmem
-        pltpu.VMEM((padded_b + LANES,), jnp.int32) if wave_loop else None,  # meta_vmem
-        pltpu.VMEM((_slice_buffer(num_waves, slice_len)[0],), jnp.int32)
-        if wave_loop
-        else None,  # slices_vmem
+        pltpu.VMEM((padded_b + LANES,), jnp.int32)
+        if wave_loop and not one_subcore_capacity
+        else None,  # meta_vmem
+        pltpu.VMEM((slice_words,), jnp.int32) if wave_loop else None,  # slices_vmem
         pltpu.SemaphoreType.DMA((2,)) if wave_loop else None,  # slice_sems
         pltpu.SemaphoreType.DMA((2 * p,)) if coop_v2 else None,  # gather_sems
         pltpu.VMEM((k + LANES,), jnp.int32) if shared_gather else None,  # oidx_vmem
@@ -1371,6 +1430,32 @@ def _sc_topk_direct(
         def body_fn(scores, lengths, idx, *rest):
             return orig_body(scores, lengths, *rest, local_idxs_hbm=idx)
 
+    name = f"sc_topk_direct_b{b}_n{n}_k{k}_p{p}{'_v2' if coop_v2 else ''}"
+    if one_subcore_capacity:
+        scratch_types = (
+            *scratch_types,
+            pltpu.VMEM((length_rows + LANES,), jnp.int32),  # the row lengths
+        )
+        body_fn = functools.partial(
+            _one_subcore_when_rows_fit,
+            num_rows=length_rows,
+            capacity=one_subcore_capacity,
+            one_subcore=functools.partial(
+                _topk_body,
+                b=b,
+                n=n,
+                k=k,
+                p=1,
+                slice_len=one_subcore_capacity,
+                num_waves=one_subcore_waves,
+                write_empty=write_empty,
+                return_scores=return_scores,
+                row_stride=p * slice_len,
+            ),
+            split=body_fn,
+        )
+        name += f"_p1upto{one_subcore_capacity}"
+
     # TPU_SC_TOPK_COST_BYTES: a cost hint for XLA's latency-hiding scheduler on
     # decode-sized calls (b <= 32), which otherwise sizes the SparseCore call's
     # window far below its ~10 us and leaves independent TensorCore work (q_b)
@@ -1390,7 +1475,7 @@ def _sc_topk_direct(
         scratch_types=scratch_types,
         mesh=mesh,
         cost_estimate=cost,
-        name=f"sc_topk_direct_b{b}_n{n}_k{k}_p{p}{'_v2' if coop_v2 else ''}",
+        name=name,
     )(words.reshape(-1), lengths_in, *extra_inputs)
     if scheduling_group_id is not None:
         out = xla_metadata.set_xla_metadata(
@@ -1439,6 +1524,25 @@ def _pick_partition(b: int, n: int, k: int) -> int:
     return p
 
 
+def _one_subcore_capacity(b: int, n: int, k: int, capacity: int) -> int:
+    """``capacity`` when `_pick_partition` splits rows of width ``n`` over
+    P > 1 subcores but would run rows of ``capacity`` words at P = 1, else 0.
+
+    The width follows max-model-len, and real rows are usually far shorter,
+    so such a call can take the P = 1 body whenever its rows fit. A lone
+    subcore holds up to 2 * MAX_SLICE_WORDS words; calls of 16 rows or fewer
+    split even short rows, to keep all 32 subcores busy.
+    """
+    if capacity % LANES or not 0 <= capacity <= 2 * MAX_SLICE_WORDS:
+        raise ValueError(
+            f"one-subcore capacity {capacity} must be a multiple of {LANES}"
+            f" from 0 to {2 * MAX_SLICE_WORDS}"
+        )
+    if capacity == 0 or _pick_partition(b, n, k) == 1:
+        return 0
+    return capacity if _pick_partition(b, capacity, k) == 1 else 0
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -1447,6 +1551,7 @@ def _pick_partition(b: int, n: int, k: int) -> int:
         "scheduling_group_id",
         "return_scores",
         "coop_v2",
+        "one_subcore_capacity",
     ),
 )
 def sparsecore_topk(
@@ -1458,11 +1563,17 @@ def sparsecore_topk(
     scheduling_group_id: int | None = None,
     return_scores: bool = False,
     coop_v2: bool | None = None,
+    one_subcore_capacity: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:  # i32[b, k] or (i32[b, k], i32[b, k])
     """Exact top-k indices per row, unsorted, -1 suffix-padded.
 
     ``coop_v2`` (None reads ``TPU_SC_TOPK_COOP_V2``): at ``p > 1``, the level
     loop and the gather described in the module docstring. Bitwise identical.
+
+    ``one_subcore_capacity`` (None reads ``TPU_SC_TOPK_ONE_SUBCORE_CAPACITY``,
+    0 is off): a call whose width splits every row over ``p > 1`` subcores
+    runs one subcore per row whenever no row is longer than this many words
+    (`_one_subcore_capacity`). Bitwise identical.
 
     When ``p > 1`` (for ``b < 32`` or ``n > 64K``), subcores on the same
     SparseCore cooperatively compute a global histogram in ``VMEM_SHARED`` to
@@ -1489,6 +1600,8 @@ def sparsecore_topk(
 
     if coop_v2 is None:
         coop_v2 = envs.TPU_SC_TOPK_COOP_V2
+    if one_subcore_capacity is None:
+        one_subcore_capacity = envs.TPU_SC_TOPK_ONE_SUBCORE_CAPACITY
     p = _pick_partition(b, n, k)
     return _sc_topk_direct(
         scores,
@@ -1499,6 +1612,7 @@ def sparsecore_topk(
         return_scores=return_scores,
         scheduling_group_id=scheduling_group_id,
         coop_v2=coop_v2,
+        one_subcore_capacity=_one_subcore_capacity(b, n, k, one_subcore_capacity),
     )
 
 
