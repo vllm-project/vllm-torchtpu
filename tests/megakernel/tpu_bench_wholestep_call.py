@@ -50,7 +50,11 @@ def main():
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--wstd", type=float, default=0.02)
     ap.add_argument("--L", type=int, default=44)
+    ap.add_argument("--remove", default="",
+                    help="timing-only removal arms (wrong results): comma list of "
+                         "attn_dma, attn_matmul, keys, select")
     a = ap.parse_args()
+    _apply_removals(a.remove)
     # The served Pallas mesh order (get_pallas_mesh in the server: [0, 1, 4, 5, 6, 7, 2, 3]).
     by_id = {d.id: d for d in jax.devices()}
     mesh = jax.sharding.Mesh(np.array([by_id[i] for i in (0, 1, 4, 5, 6, 7, 2, 3)]), ("tp",))
@@ -160,6 +164,33 @@ def main():
               f"finite {float(jnp.isfinite(r32).mean()):.4f} absmean "
               f"{float(jnp.nanmean(jnp.abs(r32))):.4g} (input {float(jnp.abs(hidden.astype(jnp.float32)).mean()):.4g})",
               flush=True)
+
+
+def _apply_removals(spec: str) -> None:
+    """Timing-only removal arms: patch pieces of the QSA step out of the kernel (wrong results)."""
+    import functools
+
+    from vllm_torchtpu.megakernel.wholestep import indexer as ix
+    from vllm_torchtpu.megakernel.wholestep import qsa_full_b, qsa_full_c
+
+    arms = [x for x in spec.split(",") if x]
+    for arm in arms:
+        if arm in ("attn_dma", "attn_matmul"):  # attend_row's own ablation switch
+            qsa_full_c.attend_row = functools.partial(
+                qsa_full_c.attend_row, ablate=arm.split("_")[1]
+            )
+        elif arm == "keys":  # no compressed-key stream or scoring
+            qsa_full_b.QSAFullIndexedBlock._score_request = lambda self, *a, **k: None
+        elif arm == "select":  # no thresholds / compaction arithmetic
+            ix.thresholds = lambda bits, ids, nv, K, G: (
+                jnp.zeros(bits.shape[:1] + (1, 1), jnp.int32),
+                jnp.zeros(bits.shape[:1] + (1, 1), jnp.int32),
+            )
+            ix.compact_row = lambda b, th, tm, nv, K, consts: jnp.zeros((1, K), jnp.int32)
+        else:
+            raise ValueError(arm)
+    if arms:
+        print("removal arms:", arms, flush=True)
 
 
 if __name__ == "__main__":
