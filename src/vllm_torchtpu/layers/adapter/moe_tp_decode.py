@@ -137,6 +137,9 @@ class _OpStatics:
     # TPU_MOE_TP_DECODE_HBM_OPERANDS: the kernel's 8 weight operands constrained
     # to HBM (it DMAs them itself; no XLA VMEM staging copy). Same bits.
     hbm_operands: bool = False
+    # TPU_MOE_TP_DECODE_AG_PAIRS: the all-reduce paths that exchange at least
+    # this many rows all-gather by chip pairs (0: none). Same bits.
+    ag_pairs: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -353,6 +356,7 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
             else None
         ),
         fast=bool(envs.TPU_MOE_TP_DECODE_FAST),
+        ag_pairs=int(envs.TPU_MOE_TP_DECODE_AG_PAIRS),
     )
     return _Admitted(
         shared=shared,
@@ -530,6 +534,7 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                     n_ranks=n_ranks,
                     fast=statics.fast,
                     hbm_operands=statics.hbm_operands,
+                    ag_pairs=statics.ag_pairs,
                 )[:n]
         if kernel.can_use_moe_tp_decode(
             x, scores, bias, *weights, topk=statics.topk, n_ranks=n_ranks
@@ -547,6 +552,7 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                 n_ranks=n_ranks,
                 fast=statics.fast,
                 hbm_operands=statics.hbm_operands,
+                ag_pairs=statics.ag_pairs,
             )
         if statics.prefill_above is not None and n > statics.prefill_above:
             return _prefill_chain(
@@ -715,17 +721,20 @@ def _e0_tensor(device: torch.device, experts_start: int) -> torch.Tensor:
     return t
 
 
-def _selftest(topo: _Topology, buckets, device) -> list[tuple[int, int, int]]:
+def _selftest(
+    topo: _Topology, buckets, device, ag_pairs: int = 0
+) -> list[tuple[int, int, int]]:
     """Run the kernel's all-reduce alone for every armed (rows, hidden) and row
-    path through the op's mesh and rank operand; returns this rank's failing
-    (rows, hidden, n_valid). Collective: every rank makes the same calls."""
+    path through the op's mesh and rank operand, with the kernel's chip-pair
+    setting; returns this rank's failing (rows, hidden, n_valid). Collective:
+    every rank makes the same calls."""
     n_ranks = int(topo.mesh.size)
     rank = _rank_tensor(device, topo.mesh_index)
     failures = []
     faulthandler.dump_traceback_later(SELFTEST_TIMEOUT_S, exit=True)
     try:
         for m, h in buckets:
-            spec = all_reduce.make_spec(n_ranks, m, h)
+            spec = all_reduce.make_spec(n_ranks, m, h, ag_pairs)
             op = _selftest_op(topo.mesh, spec)
             x = all_reduce.selftest_inputs(spec)
             mine = torch.from_numpy(x[topo.mesh_index]).to(torch.bfloat16).to(device)
@@ -737,6 +746,29 @@ def _selftest(topo: _Topology, buckets, device) -> list[tuple[int, int, int]]:
     finally:
         faulthandler.cancel_dump_traceback_later()
     return failures
+
+
+def _chip_places(topo: _Topology) -> list[tuple[tuple[int, ...], int | None]]:
+    """(chip coords, core on chip) at each index of the op's mesh. Its devices
+    carry ids only (get_pallas_mesh builds them from the process group), so
+    every rank reports its own JAX device, the one TPU device its process
+    addresses, and it must be the mesh's device at the rank's index.
+    Collective."""
+    device = jax.local_devices()[0]
+    mine = dict(
+        mesh_index=topo.mesh_index,
+        id=int(device.id),
+        coords=tuple(getattr(device, "coords", None) or ()),
+        core=getattr(device, "core_on_chip", None),
+    )
+    seen = sorted(_gather(mine), key=lambda s: s["mesh_index"])
+    ids = [int(d.id) for d in topo.mesh.devices.flat]
+    if [(s["mesh_index"], s["id"]) for s in seen] != list(enumerate(ids)):
+        raise RuntimeError(
+            f"moe_tp_decode: the ranks' JAX devices {seen} are not the op "
+            f"mesh's devices {ids} in mesh order"
+        )
+    return [(s["coords"], s["core"]) for s in seen]
 
 
 def _gather(obj) -> list:
@@ -821,10 +853,24 @@ def arm(model: torch.nn.Module, draft_model: torch.nn.Module | None = None) -> i
     ).hexdigest()[:16]
     mesh_index = -1 if isinstance(topo, str) else topo.mesh_index
     _check_ranks_agree(dict(sig=sig, mesh_index=mesh_index, armed=len(plan)))
+    ag_pairs = int(envs.TPU_MOE_TP_DECODE_AG_PAIRS)
+    if plan and ag_pairs > 0:
+        assert not isinstance(topo, str)
+        places = _chip_places(topo)
+        all_reduce.check_chip_pairs(places)
+        ids = [int(d.id) for d in topo.mesh.devices.flat]
+        logger.info(
+            "moe_tp_decode: chip-pair all-gather pairs (mesh indices: device "
+            "ids @ chip coords): %s",
+            "; ".join(
+                f"{i},{i + 1}: {ids[i]},{ids[i + 1]} @ {places[i][0]}"
+                for i in range(0, len(ids), 2)
+            ),
+        )
     if plan and not _SELFTEST_DONE:
         assert not isinstance(topo, str)
         device = plan[0][0].routed_experts.w13_weight.device
-        failures = _selftest(topo, buckets, device)
+        failures = _selftest(topo, buckets, device, ag_pairs)
         seen = _gather(dict(mesh_index=topo.mesh_index, failures=failures))
         if any(s["failures"] for s in seen):
             raise RuntimeError(
@@ -864,13 +910,15 @@ def arm(model: torch.nn.Module, draft_model: torch.nn.Module | None = None) -> i
     )
     log(
         "moe_tp_decode: armed %d/%d target and %d/%d drafter MoE layers (mesh "
-        "index %d, kernel token counts %s, sig %s); refused: %s",
+        "index %d, kernel token counts %s, chip-pair all-gather %s, sig %s); "
+        "refused: %s",
         len(plan) - armed_drafter,
         len(target),
         armed_drafter,
         len(drafter),
         mesh_index,
         sorted({m for m, _ in buckets}),
+        f"from {ag_pairs} rows" if ag_pairs else "off",
         sig,
         refused or "none",
     )

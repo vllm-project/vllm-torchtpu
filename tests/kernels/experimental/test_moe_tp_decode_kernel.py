@@ -200,6 +200,34 @@ def test_row_paths_at_glm52_shapes(monkeypatch):
     ]
 
 
+def test_chip_pair_spec_and_pairing_check(monkeypatch):
+    monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
+    h = GLM52_TP16["h"]
+    # The pair rows round up to the paths that exist: the 16-row trim (or
+    # 16-row full) path, the full path, or none.
+    rounded = [all_reduce.make_spec(16, 64, h, p).pair_rows for p in (0, 1, 16, 17)]
+    assert rounded == [0, 16, 16, 64]
+    assert all_reduce.make_spec(16, 64, h, 65).pair_rows == 0
+    assert all_reduce.make_spec(16, 16, h, 32).pair_rows == 0
+    spec = all_reduce.make_spec(16, 64, h, 32)
+    assert all_reduce.kernel_name(spec).endswith("-pairs_64")
+    assert not spec.pairs(16) and spec.pairs(64)
+    assert kernel.kernel_name(256, 64, h, 128, 128, 16, pair_rows=64).endswith(
+        "-pairs_64"
+    )
+
+    paired = [((i // 2 % 2, i // 4, 0), i % 2) for i in range(8)]
+    all_reduce.check_chip_pairs(paired)
+    for wrong in (
+        paired[1:] + paired[:1],
+        [paired[i] for i in (0, 2, 1, 3, 4, 5, 6, 7)],
+    ):
+        with pytest.raises(ValueError, match="2i and 2i \\+ 1"):
+            all_reduce.check_chip_pairs(wrong)
+    with pytest.raises(ValueError, match="2i and 2i \\+ 1"):
+        all_reduce.check_chip_pairs([((), None)] * 8)
+
+
 def test_selftest_inputs_have_exact_sums_that_expose_a_wrong_chunk(monkeypatch):
     monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
     spec = all_reduce.make_spec(N_RANKS, 16, GLM52_TP16["h"])
@@ -389,6 +417,17 @@ def test_all_reduce_selftest_on_16_devices(on_16_devices_b):
     assert on_16_devices_b["selftest_ok"]
 
 
+def test_chip_pair_all_gather_is_bitwise_on_16_devices(on_16_devices_b):
+    # 32 rows with pair_rows 16: the trim and full paths gather by chip pairs,
+    # fold stays flat; every path's output bits equal the flat all-reduce's,
+    # on the self-test inputs and on random partials.
+    assert on_16_devices_b["selftest_pairs"] == {
+        "exact": True,
+        "bitwise": True,
+        "races_found": False,
+    }
+
+
 @pytest.fixture(scope="module")
 def ep_on_16_devices():
     flags = os.environ.get("XLA_FLAGS", "")
@@ -575,6 +614,63 @@ def _interpret(fn, *args):
     with contextlib.redirect_stdout(io.StringIO()):
         out = np.asarray(jax.block_until_ready(fn(*args)))
     return out, bool(interpret_pallas_call.races.races_found)
+
+
+def _selftest_results(mesh, rank_ids, h, key):
+    """The all-reduce self-test at 32 rows on the 16 devices: (whether every
+    row path gives the exact sums, and the chip-pair all-gather against the
+    flat one: exact sums, output bits on the self-test inputs and on random
+    partials, races)."""
+    from jax.sharding import PartitionSpec as P
+
+    def run_selftest(spec):
+        call = all_reduce.standalone(spec)
+
+        def selftest(x, rank, n_valid):
+            return call(jnp.stack([n_valid.reshape(()), rank.reshape(())]), x)
+
+        return jax.jit(
+            jax.shard_map(
+                selftest,
+                mesh=mesh,
+                in_specs=(P("d"), P("d"), P()),
+                out_specs=P("d"),
+                check_vma=False,
+            )
+        )
+
+    spec = all_reduce.make_spec(N_RANKS, 32, h)
+    pairs = all_reduce.make_spec(N_RANKS, 32, h, 16)
+    flat_run, pairs_run = run_selftest(spec), run_selftest(pairs)
+    partials = all_reduce.selftest_inputs(spec)
+    noise = jax.random.normal(key, partials.shape).astype(jnp.bfloat16)
+    ok = True
+    paired = dict(exact=True, bitwise=True, races_found=False)
+    for n_valid in all_reduce.selftest_row_counts(spec):
+        for x in (jnp.asarray(partials, jnp.bfloat16), noise):
+            operands = (
+                x.reshape(N_RANKS * 32, -1),
+                rank_ids,
+                jnp.asarray([n_valid], jnp.int32),
+            )
+            out, races = _interpret(flat_run, *operands)
+            got, pair_races = _interpret(pairs_run, *operands)
+            out, got = out.reshape(N_RANKS, 32, -1), got.reshape(N_RANKS, 32, -1)
+            paired["bitwise"] &= bool(
+                np.array_equal(out.view(np.uint16), got.view(np.uint16))
+            )
+            paired["races_found"] |= pair_races
+            if x is noise:
+                continue
+            ok &= not races and all(
+                all_reduce.selftest_ok(spec, partials, out[r], n_valid)
+                for r in range(N_RANKS)
+            )
+            paired["exact"] &= all(
+                all_reduce.selftest_ok(pairs, partials, got[r], n_valid)
+                for r in range(N_RANKS)
+            )
+    return bool(ok), paired
 
 
 def _race_control():
@@ -827,36 +923,9 @@ def _worker(part):
     result["body_chain_exact"] = bool(
         np.array_equal(out, np.broadcast_to(want, out.shape))
     )
-    spec = all_reduce.make_spec(N_RANKS, 32, c["h"])
-    call = all_reduce.standalone(spec)
-    partials = all_reduce.selftest_inputs(spec)
-
-    def selftest(x, rank, n_valid):
-        return call(jnp.stack([n_valid.reshape(()), rank.reshape(())]), x)
-
-    run_selftest = jax.jit(
-        jax.shard_map(
-            selftest,
-            mesh=mesh,
-            in_specs=(P("d"), P("d"), P()),
-            out_specs=P("d"),
-            check_vma=False,
-        )
+    result["selftest_ok"], result["selftest_pairs"] = _selftest_results(
+        mesh, rank_ids, c["h"], keys[-3]
     )
-    ok = True
-    for n_valid in all_reduce.selftest_row_counts(spec):
-        out, races = _interpret(
-            run_selftest,
-            jnp.asarray(partials.reshape(N_RANKS * 32, -1), jnp.bfloat16),
-            rank_ids,
-            jnp.asarray([n_valid], jnp.int32),
-        )
-        out = out.reshape(N_RANKS, 32, -1)
-        ok &= not races and all(
-            all_reduce.selftest_ok(spec, partials, out[r], n_valid)
-            for r in range(N_RANKS)
-        )
-    result["selftest_ok"] = bool(ok)
     print("RESULT " + json.dumps(result))
 
 
