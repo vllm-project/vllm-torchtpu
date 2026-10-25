@@ -17,6 +17,22 @@
 # not run here.
 
 steps:
+  # Temporary PR diagnosis: both revisions use the exact image from build 6215.
+  # The normal full-environment gate below still runs independently.
+  - label: "DeepSeek-V4.1 typecheck: frozen base/head comparison"
+    key: "dsv41_typecheck_comparison"
+    timeout_in_minutes: 20
+    agents:
+      queue: "cpu"
+    commands:
+      - >-
+        python3 .buildkite/scripts/compare_typecheck.py
+        --image us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu:466e8f74db7a550d3b2ed561afe5a7950ce9e404-v0.31.1rc0
+        --base c16536c268534317e22f38db4e556094d9a0cc0d
+        --head 466e8f74db7a550d3b2ed561afe5a7950ce9e404
+    artifact_paths:
+      - "perf_eval_results/typecheck-comparison/**/*"
+
   - label: "Type Check - Full Environment"
     key: "typecheck_full"
     depends_on: "build_docker"
