@@ -1225,6 +1225,29 @@ def live_group_supported(
     )
 
 
+def live_group_one_gather(
+    num_tokens: int,
+    topk_cap: int | None,
+    chunk_size: int,
+    small_chunk_tokens: int,
+    small_chunk_batch_size: int | None,
+    attention_kernel_batch_size: int = DEFAULT_ATTENTION_KERNEL_BATCH_SIZE,
+) -> bool:
+    """Whether a `mixed_live_gather` call of `num_tokens` tokens with
+    `gather_and_attention_chunk_size=chunk_size` takes the live-group capped
+    path in a single chunk: one SparseCore gather then serves the whole call,
+    and it can carry the call's `kv_write`."""
+    if topk_cap is None or not FUSED_PREP_MAX_TOKENS < num_tokens <= chunk_size:
+        return False
+    _, batch = _chunk_kernel_batch_size(
+        num_tokens,
+        attention_kernel_batch_size,
+        small_chunk_tokens,
+        small_chunk_batch_size,
+    )
+    return live_group_supported(num_tokens, batch, topk_cap)
+
+
 def live_group_table(
     kv_lens: jax.Array,  # i32[num_tokens]
     token_end: jax.Array,  # i32[]
@@ -3623,7 +3646,10 @@ def sparse_ragged_paged_attention(
         XLA-initialised aliased input). Same values on every row.
       prologue_fault: test-only fault injection (`PROLOGUE_FAULTS`, and
         `SEND_FAULTS` with `send_world`).
-      kv_write: TPU_MLA_KV_WRITE_IN_GATHER, fused-prep decode buckets only:
+      kv_write: TPU_MLA_KV_WRITE_IN_GATHER, calls one capped gather serves:
+        fused-prep decode buckets, and live-group buckets of one chunk
+        (`live_group_one_gather`) of at most
+        `native_sc_gather.MAX_WRITE_TOKENS` tokens.
         `(dst_rows i32[T], nope_rows u32[T, 128], rope_rows u32[T, 32])`, this
         step's tokens packed for the SparseCore caches, or the same in
         `native_sc_gather.pack_write_rows`' one-operand u32[3 * Tp, 128] form
@@ -3864,10 +3890,29 @@ def sparse_ragged_paged_attention(
         and num_chunks == 1
         and q.shape[0] <= FUSED_PREP_MAX_TOKENS
     )
+    live_group = (
+        window_prep
+        and mixed_live_gather
+        and q.shape[0] > FUSED_PREP_MAX_TOKENS
+        and topk_cap is not None
+        and live_group_supported(
+            uniform_chunk,
+            _chunk_kernel_batch_size(
+                uniform_chunk,
+                attention_kernel_batch_size,
+                small_chunk_tokens,
+                small_chunk_batch_size,
+            )[1],
+            topk_cap,
+        )
+    )
     if fused_prep and not lse_mask_empty:
         raise ValueError("fused_window_prep requires lse_mask_empty")
-    if kv_write is not None and not fused_prep:
-        raise ValueError("kv_write needs the fused-prep decode path (one gather)")
+    if kv_write is not None and not (fused_prep or (live_group and num_chunks == 1)):
+        raise ValueError(
+            "kv_write needs one capped gather for the whole call: the fused-prep "
+            "decode path or a one-chunk live-group call"
+        )
     if fused_prep:
         assert topk_cap is not None and page_indices is not None
         # Only the attention kernel reads kv_lens here: the fused prep counts
@@ -3903,22 +3948,7 @@ def sparse_ragged_paged_attention(
                 else sparsecore_atoms_per_batch
             ),
         )
-    elif (
-        window_prep
-        and mixed_live_gather
-        and q.shape[0] > FUSED_PREP_MAX_TOKENS
-        and topk_cap is not None
-        and live_group_supported(
-            uniform_chunk,
-            _chunk_kernel_batch_size(
-                uniform_chunk,
-                attention_kernel_batch_size,
-                small_chunk_tokens,
-                small_chunk_batch_size,
-            )[1],
-            topk_cap,
-        )
-    ):
+    elif live_group:
         # Mixed / prefill buckets: window 0 in live-group order, so each
         # chunk gathers and each grid step fetches only its live atom blocks.
         assert topk_cap is not None and page_indices is not None
@@ -4379,8 +4409,9 @@ def sparse_attention_chunk(
     bounded to `group_num_live` indices and each grid step fetches only its
     live atom blocks. `group_widths` (with `group_tab`): static row widths the
     kernel specializes its body to per grid step (see `_attention_kernel`).
-    `kv_write` (with `gather_live_in_indices`): the gather first writes this
-    step's packed tokens into both caches; returns `(result, (nope, rope))`.
+    `kv_write` (with `gather_live_in_indices` or `group_tab`, on the call's
+    only chunk): the gather first writes this step's packed tokens into both
+    caches; returns `(result, (nope, rope))`.
     `send_world` (with `lse_fill`; TPU_DCP_MLA_SEND_LAYOUT): the second result
     is the DCP merge's int16 send buffer (`send_layout_shape`) instead of the
     lse, and `q`'s aliased output is left unwritten.
@@ -4396,8 +4427,8 @@ def sparse_attention_chunk(
     token (and `kv_write` writes 16-word rope tokens); the gather returns the
     same padded rows either way.
     """
-    if kv_write is not None and not gather_live_in_indices:
-        raise ValueError("kv_write rides the fused-prep capped gather only")
+    if kv_write is not None and not (gather_live_in_indices or group_tab is not None):
+        raise ValueError("kv_write rides the fused-prep or live-group capped gather")
     return_lse = lse is not None or lse_fill
     assert not (lse_fill and lse is not None), "lse_fill owns the lse buffer"
     q_rope = q_rope_table is not None
