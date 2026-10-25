@@ -125,9 +125,7 @@ def _make_self(
     ns._bucket_len = TPUModelRunner._bucket_len
     ns._pad_to_bucket = TPUModelRunner._pad_to_bucket
     for name in (
-        "_pad_dev_to_bucket",
-        "_expand_pool_split",
-        "_spec_seed_sources",
+        "_spec_seed_copies",
         "_copy_mamba_state_blocks",
     ):
         setattr(ns, name, getattr(TPUModelRunner, name).__get__(ns))
