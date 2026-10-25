@@ -47,6 +47,7 @@ class TestAttentionMetadataBuilderPlumbing:
         runner.position_ids = torch.full((8,), 42, dtype=torch.int32)
         runner._unfenced_h2d_sources = []
         runner._free_h2d_sources = {}
+        runner._registered_h2d_sources = set()
         runner.attn_groups = []
         runner._unified_kv_layout = False
 
@@ -529,9 +530,9 @@ class TestAttentionMetadataBuilderPlumbing:
                 position_ids_override=torch.zeros(1) if dummy else None,
             )
             stage_block_table_uploads(runner, ctx, padded)
-            snapshots.append(runner._unfenced_h2d_sources[-1].clone())
+            snapshots.append(runner._unfenced_h2d_sources[-1][0].clone())
 
-        sources = runner._unfenced_h2d_sources
+        sources = [src for src, _ in runner._unfenced_h2d_sources]
         assert len(sources) == 3
         assert len({src.data_ptr() for src in sources}) == 3
         for src, snapshot in zip(sources, snapshots, strict=True):
@@ -563,9 +564,9 @@ class TestAttentionMetadataBuilderPlumbing:
             builder.build(
                 common_prefix_len=0, common_attn_metadata=self._make_cm(padded)
             )
-            snapshots.append(runner._unfenced_h2d_sources[-1].clone())
+            snapshots.append(runner._unfenced_h2d_sources[-1][0].clone())
 
-        sources = runner._unfenced_h2d_sources
+        sources = [src for src, _ in runner._unfenced_h2d_sources]
         assert len(sources) == 2
         assert sources[0].data_ptr() != sources[1].data_ptr()
         for src, snapshot in zip(sources, snapshots, strict=True):
@@ -598,10 +599,13 @@ class TestAttentionMetadataBuilderPlumbing:
         stage_block_table_uploads(runner, ctx, 4)
 
         assert runner._free_h2d_sources[(4 * 4, torch.int32)] == []
-        used = runner._unfenced_h2d_sources[-1]
+        used, release_cb = runner._unfenced_h2d_sources[-1]
+        assert id(used) in runner._registered_h2d_sources
         assert used.data_ptr() == ptr
         # Padded tail rows (2..3) were zeroed before refilling rows 0..1.
         assert used.view(4, 4)[2:].tolist() == [[0, 0, 0, 0], [0, 0, 0, 0]]
+        release_cb()
+        assert runner._free_h2d_sources[(4 * 4, torch.int32)] == [used]
 
     def test_staged_build_skips_per_group_upload(self):
         """With views staged, build() must not touch the CPU block table."""

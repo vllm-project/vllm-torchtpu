@@ -52,6 +52,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilder,
     AttentionMetadataBuilderContext,
+    _noop_release,
     stage_h2d_upload,
     zeros_h2d_source,
 )
@@ -1400,6 +1401,7 @@ class TestAttentionMetadataBuilder:
         runner.position_ids = torch.full((8,), 42, dtype=torch.int32)
         runner._unfenced_h2d_sources = []
         runner._free_h2d_sources = {}
+        runner._registered_h2d_sources = set()
 
         block_tables = []
         for gid in range(num_groups):
@@ -1633,6 +1635,7 @@ class TestCompactMambaSlotPool:
         runner._mamba_offset_seeded = set()
         runner._unfenced_h2d_sources = []
         runner._free_h2d_sources = {}
+        runner._registered_h2d_sources = set()
         runner.input_batch = MagicMock()
         # Bind the real methods.
         runner._init_mamba_slot_pool = TPUModelRunner._init_mamba_slot_pool.__get__(
@@ -1760,8 +1763,8 @@ class TestCompactMambaSlotPool:
         # No shared staging buffer: the second chunk must not overwrite the
         # first chunk's in-flight upload, and both stay alive until the fence.
         assert idx_chunk0.data_ptr() != idx_chunk1.data_ptr()
-        assert runner._unfenced_h2d_sources[0] is idx_chunk0
-        assert runner._unfenced_h2d_sources[1] is idx_chunk1
+        assert runner._unfenced_h2d_sources[0][0] is idx_chunk0
+        assert runner._unfenced_h2d_sources[1][0] is idx_chunk1
 
     def test_spec_decode_stride_allocates_group_bases(self):
         """With speculative decoding each request owns a group of `stride`
@@ -2336,6 +2339,7 @@ class TestUnifiedReadOffsetMigration:
         runner._pool_block_split = 1
         runner._pending_mamba_state_copies = []
         runner._unfenced_h2d_sources = []
+        runner._registered_h2d_sources = set()
         raw = torch.zeros(16, 2)
         runner._mamba_copy_plan = [(0, [raw])]
         runner.input_batch = MagicMock()
@@ -2374,8 +2378,10 @@ class TestUnifiedReadOffsetMigration:
         assert int(src_t[0]) == 5 and int(dst_t[0]) == 9
         # Both offset migration and seed copy tensors were staged via stage_h2d_upload.
         assert len(runner._unfenced_h2d_sources) == 4
-        assert runner._unfenced_h2d_sources[-2] is src_t
-        assert runner._unfenced_h2d_sources[-1] is dst_t
+        assert runner._unfenced_h2d_sources[-2][0] is src_t
+        assert runner._unfenced_h2d_sources[-1][0] is dst_t
+        assert runner._unfenced_h2d_sources[-2][1] is _noop_release
+        assert runner._unfenced_h2d_sources[-1][1] is _noop_release
 
     def test_no_crossing_leaves_offsets_alone(self):
         runner, scheduler_output = self._make_runner(
@@ -2651,6 +2657,7 @@ class TestInputStagingFence:
             _unfenced_h2d_sources=[],
             _fenced_h2d_sources=[],
             _free_h2d_sources={},
+            _registered_h2d_sources=set(),
         )
         TPUModelRunner._record_input_staging_fence(runner)
         fence = runner._input_staging_fence
@@ -2672,8 +2679,10 @@ class TestInputStagingFence:
 
     def test_staged_h2d_sources_live_until_their_fence_is_waited(self, monkeypatch):
         """A host source uploaded before a record is released by the wait on
-        that fence into the free list; one uploaded after it (a draft walk)
-        must survive that wait and only go with the next fence cycle."""
+        that fence via its tuple callback (recycling registered `zeros_h2d_source`
+        buffers into `_free_h2d_sources` and using a no-op callback for one-off
+        tensors); one uploaded after it (a draft walk) must survive that wait
+        and only go with the next fence cycle."""
         monkeypatch.setattr(
             torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
         )
@@ -2683,18 +2692,33 @@ class TestInputStagingFence:
             _unfenced_h2d_sources=[],
             _fenced_h2d_sources=[],
             _free_h2d_sources={},
+            _registered_h2d_sources=set(),
         )
-        target = stage_h2d_upload(runner, torch.ones(4, dtype=torch.int32))
+        target_buf = zeros_h2d_source(runner, 4).fill_(1)
+        assert id(target_buf) in runner._registered_h2d_sources
+        target = stage_h2d_upload(runner, target_buf)
         target_ptr = target.data_ptr()
+
+        one_off_buf = torch.tensor([1, 2, 3], dtype=torch.long)
+        assert id(one_off_buf) not in runner._registered_h2d_sources
+        one_off = stage_h2d_upload(runner, one_off_buf)
+
         TPUModelRunner._record_input_staging_fence(runner)
-        draft = stage_h2d_upload(runner, torch.ones(4, dtype=torch.int32))
-        assert runner._fenced_h2d_sources[0] is target
-        assert runner._unfenced_h2d_sources[0] is draft
+        draft_buf = zeros_h2d_source(runner, 4).fill_(2)
+        draft = stage_h2d_upload(runner, draft_buf)
+
+        assert len(runner._fenced_h2d_sources) == 2
+        assert runner._fenced_h2d_sources[0][0] is target
+        assert runner._fenced_h2d_sources[0][1] is not _noop_release
+        assert runner._fenced_h2d_sources[1] == (one_off, _noop_release)
+        assert runner._unfenced_h2d_sources[0][0] is draft
 
         TPUModelRunner._wait_input_staging_fence(runner)
         assert runner._fenced_h2d_sources == []
-        assert runner._free_h2d_sources[(4, torch.int32)] == [target]
-        assert runner._unfenced_h2d_sources[0] is draft
+        # Only the registered `zeros_h2d_source` buffer is recycled into
+        # `_free_h2d_sources`; the one-off tensor's dummy callback is a no-op.
+        assert runner._free_h2d_sources == {(4, torch.int32): [target]}
+        assert runner._unfenced_h2d_sources[0][0] is draft
 
         reused = zeros_h2d_source(runner, 4, torch.int32)
         assert reused.data_ptr() == target_ptr
@@ -2706,6 +2730,89 @@ class TestInputStagingFence:
         assert runner._fenced_h2d_sources == []
         assert runner._unfenced_h2d_sources == []
         assert runner._free_h2d_sources[(4, torch.int32)] == [draft]
+
+    def test_wait_input_staging_fence_executes_tuple_callbacks_directly(
+        self, monkeypatch
+    ):
+        """`_wait_input_staging_fence` only invokes each fenced entry's callback
+        and clears `_fenced_h2d_sources`, without inspecting the buffer."""
+        monkeypatch.setattr(
+            torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+        )
+        called: list[str] = []
+        buf_a = torch.zeros(2, dtype=torch.int32)
+        buf_b = torch.zeros(3, dtype=torch.int64)
+        runner = SimpleNamespace(
+            _input_staging_fence=None,
+            _unfenced_h2d_sources=[
+                (buf_a, lambda: called.append("a")),
+                (buf_b, lambda: called.append("b")),
+            ],
+            _fenced_h2d_sources=[],
+        )
+        TPUModelRunner._record_input_staging_fence(runner)
+        assert runner._unfenced_h2d_sources == []
+        assert len(runner._fenced_h2d_sources) == 2
+
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert called == ["a", "b"]
+        assert runner._fenced_h2d_sources == []
+
+    def test_zeros_h2d_source_max_buffers_evicts_lru_and_unregisters(self, monkeypatch):
+        """When `max_buffers` is reached, `zeros_h2d_source` pops the
+        least-recently-used buffer from `_free_h2d_sources`, removes its
+        registration from `_registered_h2d_sources`, and registers the new
+        buffer."""
+        monkeypatch.setattr(
+            torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+        )
+        runner = SimpleNamespace(
+            device=torch.device("cpu"),
+            _input_staging_fence=None,
+            _unfenced_h2d_sources=[],
+            _fenced_h2d_sources=[],
+            _free_h2d_sources={},
+            _registered_h2d_sources=set(),
+        )
+        # Step 1: allocate and recycle 2 buffers (reaching max_buffers=2).
+        b1 = zeros_h2d_source(runner, 4, max_buffers=2)
+        b2 = zeros_h2d_source(runner, 8, max_buffers=2)
+        stage_h2d_upload(runner, b1)
+        stage_h2d_upload(runner, b2)
+        TPUModelRunner._record_input_staging_fence(runner)
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert runner._registered_h2d_sources == {id(b1), id(b2)}
+        assert list(runner._free_h2d_sources.keys()) == [
+            (4, torch.int32),
+            (8, torch.int32),
+        ]
+
+        # Step 2: reuse b1 (shape 4) so b2 (shape 8) becomes the oldest free
+        # buffer after the fence wait.
+        reused_b1 = zeros_h2d_source(runner, 4, max_buffers=2)
+        assert reused_b1 is b1
+        stage_h2d_upload(runner, reused_b1)
+        TPUModelRunner._record_input_staging_fence(runner)
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert list(runner._free_h2d_sources.keys()) == [
+            (8, torch.int32),
+            (4, torch.int32),
+        ]
+
+        # Step 3: allocate a new shape (16) with max_buffers=2 -> evicts and
+        # unregisters b2 (the LRU buffer in _free_h2d_sources), and registers b3.
+        b3 = zeros_h2d_source(runner, 16, max_buffers=2)
+        assert id(b2) not in runner._registered_h2d_sources
+        assert (8, torch.int32) not in runner._free_h2d_sources
+        assert runner._registered_h2d_sources == {id(b1), id(b3)}
+
+        stage_h2d_upload(runner, b3)
+        TPUModelRunner._record_input_staging_fence(runner)
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert runner._free_h2d_sources == {
+            (4, torch.int32): [b1],
+            (16, torch.int32): [b3],
+        }
 
     def test_dummy_run_fences_its_uploads_before_the_forward(self, monkeypatch):
         """Warmup and idle-DP dummy runs stage block tables too: each run must
@@ -2759,6 +2866,7 @@ class TestInputStagingFence:
             _unfenced_h2d_sources=[],
             _fenced_h2d_sources=[],
             _free_h2d_sources={},
+            _registered_h2d_sources=set(),
             _token_padding_state=None,
             sequence_layout_planner=SimpleNamespace(
                 prepare_dummy=lambda **kw: SimpleNamespace(

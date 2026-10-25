@@ -998,11 +998,15 @@ class TPUModelRunner(GPUModelRunner):
         # waits on it before rewriting them.
         self._input_staging_fence: Any = None
         # Per-call host sources of non-blocking uploads (block tables, mamba
-        # slot ids), kept alive until a fence recorded after them has been
-        # waited on; see `stage_h2d_upload` and `_record_input_staging_fence`.
-        self._unfenced_h2d_sources: list[torch.Tensor] = []
-        self._fenced_h2d_sources: list[torch.Tensor] = []
+        # slot ids), kept alive alongside their post-fence release callback
+        # until a fence recorded after them has been waited on; see
+        # `stage_h2d_upload` and `_record_input_staging_fence`.
+        # TODO: Extract this non-blocking H2D buffer staging and recycling
+        # lifecycle into a standalone helper class in a future refactor.
+        self._unfenced_h2d_sources: list[tuple[torch.Tensor, Callable[[], None]]] = []
+        self._fenced_h2d_sources: list[tuple[torch.Tensor, Callable[[], None]]] = []
         self._free_h2d_sources: dict[tuple[int, torch.dtype], list[torch.Tensor]] = {}
+        self._registered_h2d_sources: set[int] = set()
         self._cached_query_start_loc: torch.Tensor | None = None
         self._cached_logits_indices: torch.Tensor | None = None
         self._cached_request_distribution: torch.Tensor | None = None
@@ -3454,10 +3458,8 @@ class TPUModelRunner(GPUModelRunner):
         if fence is not None:
             fence.synchronize()
             self._input_staging_fence = None
-            for src in self._fenced_h2d_sources:
-                self._free_h2d_sources.setdefault((src.numel(), src.dtype), []).append(
-                    src
-                )
+            for _, release_cb in self._fenced_h2d_sources:
+                release_cb()
             self._fenced_h2d_sources.clear()
 
     def _upload_unless_unchanged(self, slot: str, host: torch.Tensor) -> torch.Tensor:
