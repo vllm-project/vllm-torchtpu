@@ -2618,7 +2618,9 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                         q_b_ts, q_c_lane, getattr(q_b_ts, "bias", None)
                     )
                 elif (
-                    getattr(self, "qb_overlap", False) and self.kimi_preprocess is None
+                    getattr(self, "qb_overlap", False)
+                    and self.kimi_preprocess is None
+                    and not (envs.TPU_QB_OVERLAP_HONORS_SKIP_TOPK and self.skip_topk)
                 ):
                     # The indexer runs on q_c anyway; it returns q too.
                     assert self.indexer is not None
