@@ -33,12 +33,16 @@ COLUMNS = 64  # page-table columns per request (32k tokens)
 ITERS = 10
 
 
-def make_step(rng):
-    query_lens = [DECODE_LEN] * DECODE
-    rest = TOKENS - DECODE * DECODE_LEN
-    share = rest // PREFILL
-    query_lens += [share] * (PREFILL - 1) + [rest - share * (PREFILL - 1)]
-    contexts = list(rng.integers(1000, 16000, DECODE)) + [0, 3000, 8000, 12000]
+def make_step(rng, case):
+    if case == "prefill_8192":
+        query_lens = [DECODE_LEN] * DECODE
+        rest = TOKENS - DECODE * DECODE_LEN
+        share = rest // PREFILL
+        query_lens += [share] * (PREFILL - 1) + [rest - share * (PREFILL - 1)]
+        contexts = list(rng.integers(1000, 16000, DECODE)) + [0, 3000, 8000, 12000]
+    else:  # c8 MTP verify step: 8 requests x 4 tokens
+        query_lens = [DECODE_LEN] * 8
+        contexts = list(rng.integers(1000, 16000, 8))
     requests = len(query_lens)
     starts = np.concatenate([[0], np.cumsum(query_lens)]).astype(np.int32)
     free = iter(rng.permutation(np.arange(1, PAGES)))
@@ -52,7 +56,8 @@ def make_step(rng):
         for c in range(last // RATIO + 1):
             comp[r, c] = next(free)
         ring[r] = next(free)
-    positions = np.zeros(TOKENS, np.int32)
+    tokens = int(starts[-1])
+    positions = np.zeros(tokens, np.int32)
     for r in range(requests):
         positions[starts[r] : starts[r + 1]] = contexts[r] + np.arange(query_lens[r])
 
@@ -64,10 +69,10 @@ def make_step(rng):
     )
     rope = jnp.pad(normal(65536, ROTARY), ((0, 0), (0, 128 - ROTARY)))
     args = (
-        normal(TOKENS, 2 * HEADS * HEAD_DIM),
-        normal(TOKENS, HEAD_DIM),
-        normal(TOKENS, HEAD_DIM),
-        normal(TOKENS, (INDEX_HEADS + 1) * INDEX_DIM),
+        normal(tokens, 2 * HEADS * HEAD_DIM),
+        normal(tokens, HEAD_DIM),
+        normal(tokens, HEAD_DIM),
+        normal(tokens, (INDEX_HEADS + 1) * INDEX_DIM),
         normal(HEAD_DIM),
         normal(HEAD_DIM),
         normal(INDEX_DIM),
@@ -105,6 +110,7 @@ def zero_ring(pool, ids, ring_elements, tag_elements):
 
 ARMS = {
     "all_writes": {},
+    "run_write": {},
     "no_main": {"write_main_cache": keep_pool},
     "no_compressed": {"write_compressed": keep_pool},
     "no_ring": {"read_ring_and_tags": zero_ring, "write_ring_and_tags": keep_pool},
@@ -117,7 +123,8 @@ ARMS = {
 }
 
 
-def bench(args, max_query_len, patches, main_slot):
+def bench(args, max_query_len, patches, main_slot, run_write=False):
+    os.environ["VLLM_TPU_QSA_COMPRESSED_RUN_WRITE"] = "1" if run_write else "0"
     jax.clear_caches()
     with mock.patch.multiple(
         pooled_qsa, select_blocks=no_selection, qsa_attention=no_attention, **patches
@@ -163,17 +170,19 @@ def test_prefill_write():
     os.environ.setdefault("VLLM_TPU_QSA_RING_SELECT", "1")
     os.environ.setdefault("VLLM_TPU_QSA_RING_DMA_BATCH", "32")
     rng = np.random.default_rng(0)
-    args, max_query_len = make_step(rng)
     out = os.environ.get("CDK_OUTPUT_DIR", "/tmp")
     results = []
-    for main_slot in (0, 1):
+    for case in ("prefill_8192", "decode_32"):
+        args, max_query_len = make_step(rng, case)
         for name, patches in ARMS.items():
-            ms, loop, pool = bench(args, max_query_len, patches, main_slot)
-            row = dict(main_slot=main_slot, arm=name, ms_per_layer=ms)
+            ms, loop, pool = bench(
+                args, max_query_len, patches, 1, run_write=name == "run_write"
+            )
+            row = dict(case=case, arm=name, ms_per_layer=ms)
             print("PFW", json.dumps(row), flush=True)
             results.append(row)
-            if name == "all_writes":
-                with jax.profiler.trace(os.path.join(out, "xprof", f"slot{main_slot}")):
+            if name in ("all_writes", "run_write"):
+                with jax.profiler.trace(os.path.join(out, "xprof", f"{case}_{name}")):
                     for _ in range(3):
                         pool = loop(pool)
                     jax.block_until_ready(pool)

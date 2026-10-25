@@ -109,6 +109,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK: int = 256
     VLLM_TPU_QSA_RING_SELECT: bool = False
     VLLM_TPU_QSA_RING_DMA_BATCH: int = 0
+    VLLM_TPU_QSA_COMPRESSED_RUN_WRITE: bool = False
     VLLM_TPU_GDN_HOIST_READ_OFFSETS: bool = False
     VLLM_TPU_QSA_BF16_REDUCE_PRECISION: bool = False
     VLLM_TPU_QSA_INDEXER_HOIST_META: bool = False
@@ -586,6 +587,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # power of two <= N that divides the request rows.
     "VLLM_TPU_QSA_RING_DMA_BATCH": env_nonnegative_int(
         "VLLM_TPU_QSA_RING_DMA_BATCH", 0
+    ),
+    # Qwen4-exp pooled QSA: write compressed keys with the run-based writer
+    # (kernels/qwen4_exp/compressed_write.py): one DMA per run of consecutive
+    # pair rows, all in flight, instead of per-tile / per-row serial writes.
+    "VLLM_TPU_QSA_COMPRESSED_RUN_WRITE": env_bool(
+        "VLLM_TPU_QSA_COMPRESSED_RUN_WRITE", default=False
     ),
     # Qwen4-exp QSA: round to BF16 with lax.reduce_precision instead of the
     # integer bit trick. Same RNE; the boundary stays observable to XLA and
