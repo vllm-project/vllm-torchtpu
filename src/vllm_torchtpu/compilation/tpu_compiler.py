@@ -102,7 +102,9 @@ _peer_wait = threading.local()
 # traced graph does not (e.g. a JAX callable over the TP mesh whose program is
 # specialised to the rank's mesh position). A graph calling one is
 # fingerprinted with the rank, so no other rank replays its artifact.
-_RANK_DEPENDENT_OPS: set[str] = set()
+# vLLM's sequence_parallel_chunk slices this rank's rows (tp_rank * chunk)
+# inside the custom op, so prefill sequence parallelism is one from the start.
+_RANK_DEPENDENT_OPS: set[str] = {"sequence_parallel_chunk"}
 
 
 def mark_rank_dependent(op_fragment: str) -> None:
