@@ -45,6 +45,11 @@ _ops: dict[tuple[float, bool], Callable[..., Any]] = {}
 _ops_lock = Lock()
 
 
+def _slice_rows() -> int:
+    """TPU_FUSED_ADD_RMSNORM_SLICES: the kernels' ``slice_rows``."""
+    return kernel.SLICE_ROWS if envs.TPU_FUSED_ADD_RMSNORM_SLICES else 0
+
+
 def _get_op(eps: float, has_residual: bool) -> Callable[..., Any]:
     """Build (once, at model construction -- outside Dynamo) the torch op."""
     key = (float(eps), has_residual)
@@ -56,12 +61,15 @@ def _get_op(eps: float, has_residual: bool) -> Callable[..., Any]:
         if op is not None:
             return op
         tag = f"{float(eps):.3e}".replace(".", "p").replace("-", "m").replace("+", "")
+        slice_rows = _slice_rows()
         if has_residual:
 
             def fn(
                 x: jax.Array, residual: jax.Array, weight: jax.Array
             ) -> tuple[jax.Array, jax.Array]:
-                return kernel.fused_add_rms_norm(x, residual, weight, eps=float(eps))
+                return kernel.fused_add_rms_norm(
+                    x, residual, weight, eps=float(eps), slice_rows=slice_rows
+                )
 
             def fake(x, residual, weight):
                 return torch.empty_like(x), torch.empty_like(residual)
@@ -69,7 +77,9 @@ def _get_op(eps: float, has_residual: bool) -> Callable[..., Any]:
         else:
 
             def fn(x: jax.Array, weight: jax.Array) -> jax.Array:
-                return kernel.fused_add_rms_norm(x, None, weight, eps=float(eps))
+                return kernel.fused_add_rms_norm(
+                    x, None, weight, eps=float(eps), slice_rows=slice_rows
+                )
 
             def fake(x, weight):
                 return torch.empty_like(x)
@@ -94,12 +104,18 @@ def _get_quant_op(eps: float, emit_y: bool):
         if op is not None:
             return op
         tag = f"{float(eps):.3e}".replace(".", "p").replace("-", "m").replace("+", "")
+        slice_rows = _slice_rows()
 
         def fn(
             x: jax.Array, residual: jax.Array, weight: jax.Array
         ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
             y, y_q, scale, new_res = kernel.fused_add_rms_norm_quant(
-                x, residual, weight, eps=float(eps), emit_y=emit_y
+                x,
+                residual,
+                weight,
+                eps=float(eps),
+                emit_y=emit_y,
+                slice_rows=slice_rows,
             )
             if y is None:
                 # No second consumer: y is dead and XLA drops this. Kept so a
@@ -224,12 +240,13 @@ def _get_quant_moe_op(eps: float):
         if op is not None:
             return op
         tag = f"{float(eps):.3e}".replace(".", "p").replace("-", "m").replace("+", "")
+        slice_rows = _slice_rows()
 
         def fn(
             x: jax.Array, residual: jax.Array, weight: jax.Array
         ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
             return kernel.fused_add_rms_norm_quant_moe(
-                x, residual, weight, eps=float(eps)
+                x, residual, weight, eps=float(eps), slice_rows=slice_rows
             )
 
         def fake(x, residual, weight):
