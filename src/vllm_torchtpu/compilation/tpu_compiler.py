@@ -98,6 +98,26 @@ _FINGERPRINT_MAX_NUMEL = 1 << 16
 
 _peer_wait = threading.local()
 
+# Op-name fragments whose lowering depends on the calling rank although the
+# traced graph does not (e.g. a JAX callable over the TP mesh whose program is
+# specialised to the rank's mesh position). A graph calling one is
+# fingerprinted with the rank, so no other rank replays its artifact.
+_RANK_DEPENDENT_OPS: set[str] = set()
+
+
+def mark_rank_dependent(op_fragment: str) -> None:
+    """Never replay a graph whose code mentions `op_fragment` across ranks."""
+    _RANK_DEPENDENT_OPS.add(op_fragment)
+
+
+def _rank_salt(code: str) -> str:
+    if not any(fragment in code for fragment in _RANK_DEPENDENT_OPS):
+        return ""
+    import torch.distributed as dist
+
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    return f"\nrank-dependent:{rank}"
+
 
 @contextlib.contextmanager
 def wait_for_peer_artifact(timeout_s: float):
@@ -128,7 +148,7 @@ def _graph_fingerprint(graph: fx.GraphModule) -> str | None:
         for name, module in graph.named_modules():
             if not isinstance(module, fx.GraphModule):
                 continue
-            h.update(f"{name}\n{module.code}".encode())
+            h.update(f"{name}\n{module.code}{_rank_salt(module.code)}".encode())
             for node in module.graph.nodes:
                 if node.op != "get_attr":
                     continue
