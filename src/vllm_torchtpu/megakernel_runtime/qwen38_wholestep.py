@@ -29,7 +29,9 @@ from typing import Any
 import torch
 from torch import nn
 
-from .qwen38_segment_call import T_VERIFY, segment_tiles
+from .qwen38_segment_call import T_VERIFY
+from .qwen38_wholestep_call import wholestep_tiles
+
 from .qwen38_wholestep_cache import QSALayerCache
 
 FIRST_LAYER, LAST_LAYER = 3, 47  # kernel covers model layers [FIRST_LAYER, LAST_LAYER)
@@ -77,7 +79,7 @@ class _WholeKind:
 
             full, in_specs, outs, donate = build_wholestep_call(
                 self.mesh, self.g, B, self.layout, self.qsa, L=L_WHOLE,
-                tiles=segment_tiles(B), **self.kw,
+                tiles=wholestep_tiles(B), **self.kw,
             )
             typed = make_typed_step_wrapper(f"qwen38_mk_whole_b{B}", full, len(in_specs), len(outs))
             self._calls[B] = sharded_jax_callable(
@@ -112,7 +114,7 @@ class Qwen38WholeStep(nn.Module):
             g, R, L=L_WHOLE, first="qsa", pool_gdn=True, qsa=dict(budget=budget), step=True,
             indexed=dict(max_groups=max_groups, pages_per_seq=pps, carrier="fp8", n_layers=n_att),
         )
-        ex = ExecSpec(R=R, B=buckets[0], T=T_VERIFY, ctx=128, tiles=segment_tiles(buckets[0]))
+        ex = ExecSpec(R=R, B=buckets[0], T=T_VERIFY, ctx=128, tiles=wholestep_tiles(buckets[0]))
         ops = pack_wholestep_operands(model, g, spec, ex, ids)
         self.n_w = len(ops)
         # How the operands are held decides what the compiled program sees: registered

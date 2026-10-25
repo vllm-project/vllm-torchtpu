@@ -44,6 +44,13 @@ from .qwen38_wholestep_inputs import qsa_step_inputs
 QSA_TABLES = 3  # per QSA layer: ring ids, main table, compressed table
 
 
+def wholestep_tiles(B: int) -> Tiles:
+    """Segment tiles, with the 64-row ring depths from 48 rows up: at 48 rows the segment's
+    (6, 10) rings leave the whole-step kernel 0.65 MiB over the 62 MiB VMEM limit (w01
+    j-508c1d10: CompileTimeScopedVmemOom 62.63M at qwen38_mk_whole_b48)."""
+    return segment_tiles(B, rings=(6, 4) if B >= 48 else None)
+
+
 def build_wholestep_call(
     mesh: Any,
     g: Any,
@@ -63,7 +70,7 @@ def build_wholestep_call(
     R = mesh.size
     T = T_VERIFY
     ex = ExecSpec(
-        R=R, B=B, T=T, ctx=128, tiles=segment_tiles(B) if tiles is None else tiles,
+        R=R, B=B, T=T, ctx=128, tiles=wholestep_tiles(B) if tiles is None else tiles,
         interpret=interpret,
     )
     n_att = L // g.att_every
