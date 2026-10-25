@@ -641,6 +641,17 @@ class MKBuildContext:
         self.PR, self.PC, self.HPC, self.CH = PR, PC, HPC, CH
         self.NACC, self.NY, self.KX2, self.NMIX = NACC, NY, KX2, NMIX
         self.typed = typed
+        from . import config as _cfg_late
+        self.SH_AT = int(_cfg_late.SH_AT)
+        # Serving knob (hostov stack e4244f756 / 6aa2cabb8): VLLM_TPU_QWEN35_MK_SH_AT=<0|1|2> for
+        # buckets of at most VLLM_TPU_QWEN35_MK_SH_AT_MAX_ROWS rows (default 8). Unset = config.SH_AT.
+        import os as _os_sh
+        _sh_env = _os_sh.environ.get("VLLM_TPU_QWEN35_MK_SH_AT", "").strip()
+        if _sh_env and int(self.B) <= int(_os_sh.environ.get("VLLM_TPU_QWEN35_MK_SH_AT_MAX_ROWS", "8")):
+            self.SH_AT = int(_sh_env)
+        if _sh_env:
+            print(f"[mk] SH_AT={self.SH_AT} for bucket rows={int(self.B)} (env {_sh_env}, max rows "
+                  f"{_os_sh.environ.get('VLLM_TPU_QWEN35_MK_SH_AT_MAX_ROWS', '8')})", flush=True)
         self.N_MOE, self.LAZY_ATT, self.LAZY_MOE = N_MOE, LAZY_ATT, LAZY_MOE
         self.SPLIT, self.TS, self.QR, self.DCP = SPLIT, TS, QR, DCP
         self.T, self.NS, self.VER, self.TQ = T, NS, VER, TQ

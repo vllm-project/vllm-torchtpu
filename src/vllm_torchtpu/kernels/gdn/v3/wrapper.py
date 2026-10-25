@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import json
 import os
 from typing import cast
 
@@ -37,6 +38,22 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _decode_tile_from_fused_ep_config() -> int:
+    """The decode tile size carried by TPU_MOE_FUSED_EP_V3_CONFIG's
+    "gdn_decode_tile_size" field (0: none). The serving recipe passes that
+    JSON env to the decode server alone and drops unknown env names such as
+    TPU_GDN_DECODE_TILE_SIZE, so the JSON is the route that reaches decode
+    and never reaches prefill."""
+    raw = os.environ.get("TPU_MOE_FUSED_EP_V3_CONFIG", "").strip()
+    if not raw:
+        return 0
+    try:
+        value = json.loads(raw).get("gdn_decode_tile_size", 0)
+        return int(value or 0)
+    except (ValueError, AttributeError, TypeError):
+        return 0
+
+
 def _decode_tile_override() -> int:
     if os.environ.get("TPU_GDN_SPEC_WINDOW_TILE1", "0").strip().lower() in (
         "1",
@@ -49,9 +66,18 @@ def _decode_tile_override() -> int:
         "TPU_GDN_DECODE_TILE_OVERRIDE", "0"
     )
     try:
-        return int(raw)
+        tile = int(raw)
     except ValueError:
-        return 0
+        tile = 0
+    if tile <= 0:
+        tile = _decode_tile_from_fused_ep_config()
+        if tile > 0:
+            logger.info_once(
+                "GDN decode tile size override %d (from TPU_MOE_FUSED_EP_V3_CONFIG "
+                "gdn_decode_tile_size)",
+                tile,
+            )
+    return tile
 
 
 def _pooled_region_bytes(

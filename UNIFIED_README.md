@@ -5,6 +5,40 @@ This branch serves both decode layouts of the Qwen3.5-397B P/D curve from one tr
 - **TP8 + DCP4** (bands C to H with the megakernel; bands A and B with the E6 or o6 configs): this is `shriharim/ix-curve-oct21-merged` @ `52925e2eb`. See `CURVE_README.md` in this tree for the per-band trees, environment and full commands.
 - **DP4 × TP2** (bands A and B): this is `shriharim/ix-dp4tp2-oct22` @ `7bad8dfde` plus the env-gated DP4×TP2 candidate commits, the fused-EP v4 flags (`compact_message`, `reorder_chain`) and the proxy's DP-rank routing (`PROXY_DECODE_ROUTING=dp_affinity`). All of them are off by default.
 
+## ix-unified-final: the single superset branch (2026-10-24)
+
+`ix-unified-final` is `31750c0fd` (this README's previous tip, the gated fold) plus the two local series below and one opt-in proxy alias. Every cherry-pick applied without a conflict and is patch-id identical to its source. No file is touched by both series. Every new switch is off by default, or defaults to the behaviour of `31750c0fd`; with nothing set, a config renders and runs the code paths of `31750c0fd`.
+
+| Commit here | Source | Change | Default |
+|---|---|---|---|
+| `5b8013baf` | `164abfad2` (ix-unified-port) | Host-overhead stack: `runner/fast_forward_context.py`, `runner/decode_carry.py` | off; `VLLM_TPU_FAST_FORWARD_CONTEXT=1`, `VLLM_TPU_DECODE_CARRY=1` |
+| `0c1ced0f9` | `1d6e27ef2` | Megakernel SH_AT | `VLLM_TPU_QWEN35_MK_SH_AT=0` (kernel unchanged) |
+| `724758d71` | `6b1683701` | Final-lineage decode admission throttle | off; `TPU_SCHED_DECODE_INFLIGHT_THROTTLE=1` |
+| `6a5ffde62` | `5150929c5` | Switches `TPU_PP_QUAD_COST`, `TPU_PP_INFLIGHT_COST`, `TPU_SCHED_PAW_PROMOTE_WARMEST` | 1 (unchanged); 0 restores the old trees |
+| `9032feea6` | `6b1ad14d7` | Test: the throttle acts through vLLM's hook | n/a |
+| `179430263` | `9d830e80b` | Fix: a quantized draft lm-head proxy keeps its buffers on the head's device (`TPU_DRAFT_LM_HEAD_QUANT=fp4` crashed on the CPU buffers) | reached only with the draft quant env |
+| `b2916cac6` | `3ebd37b21` | Fix: with fast forward context off, the call sites use their own `set_forward_context` | n/a |
+| `223a873b3` | `5134714a0` | Opt-in final-lineage PP8 chunk scheduler flavour | unified's class; `TPU_PP_SCHEDULER=final` |
+| `79400d892` | `fdd669a2c` (ix-unified-dpmk) | Fused EP v3 dense-slots layer for DP4×TP2 decode | off |
+| `87a9ab879` | `ac256c909` | Adapter routing to dense slots: `Config.dense_slots`, `dense_slots_max_tokens` (64), `dense_slots_fused`, `dense_slots_pallas_tables`, `dense_slots_merged`, or the `TPU_MOE_FEP_DENSE_SLOTS*` env | off |
+| `fa629aae8` | `7261dd71f` | GDN decode tile size through `TPU_MOE_FUSED_EP_V3_CONFIG` `"gdn_decode_tile_size"` (read only when `TPU_GDN_DECODE_TILE_SIZE` is unset) | 0 = the kernel's choice |
+| `f2af3fca8` | `ed615acf3` | Test: dense slots in Pallas interpret mode on 8 fake CPU devices | n/a |
+| `03cabe740` | new | Toy proxy `PROXY_PREFILL_ROUTING=prefix_hash_sticky`: prefix_hash with `PROXY_PREFIX_HASH_SATURATED_INFLIGHT` defaulting to 1 (an explicit value wins). The DP4×TP2 recipe lineage drops `PROXY_PREFIX_HASH_SATURATED_INFLIGHT` but always passes `PROXY_PREFILL_ROUTING`; the std/uport lineage passes every `PROXY_*` name, so either form works there | off; `prefix_hash` keeps 0 |
+
+### Runtime env adopted for DP4×TP2 (no code change; render-check every name)
+
+- Decode fused-EP JSON (v3 dense slots, gated in `j-dcfed5d3` 97.73% and with gate 64 in `j-49c0a4df` 97.73%): `DECODE_TPU_MOE_FUSED_EP_V3_CONFIG={"combine_real_tokens":true,"sort_index_compare":true,"compact_message":true,"reorder_chain":true,"dense_slots":true,"dense_slots_fused":true,"dense_slots_merged":true,"gdn_decode_tile_size":1}`.
+- Gate 64: `DECODE_TPU_SP_MIN_ROWS=64`, `DECODE_TPU_MOE_FUSED_EP_STEP_MIN_TOKENS=32` (replaces 88 / 44 in the DP4×TP2 column below).
+- Prefill buckets2: `COMPILE_SIZES_PREFILL=8,16,32,64,128,256,512,1024,1536,1664,2048,2176,3840,4352,6016,6528,8192` (padding only).
+- **Rejected: fp8 prefill attention** (`TPU_RPA_NATIVE_FP8_PREFILL=qkspvs`). Do not set it.
+- Sticky prefill routing is under test (`j-068c5ccc`, on a tree copy). It is not adopted; to try it on this branch, set `PROXY_PREFILL_ROUTING=prefix_hash_sticky`.
+
+### Recipes
+
+- DP4×TP2 points: the `cloud-devkit-dp4tp2` / `cloud-devkit-pfload` lineage (passthroughs below). Its proxy env is an allowlist.
+- TP8 points that use the ports (fast forward context, decode carry, SH_AT, the scheduler switches, `TPU_PP_SCHEDULER`, `TPU_DRAFT_LM_HEAD_QUANT`): the private clone `~/claude/cloud-devkit-uport` (llmdport + opt-in passthroughs `4a5b6443`, `5d012133`, `599e00ed`). Std drops every one of those names silently.
+- Every 72/80 entry must be removed from `VLLM_TPU_QWEN35_MTP_MK_VERIFY_BUCKETS` (buckets above 64 silently disable the MTP megakernel on this tree).
+
 ## What the branch is
 
 The branch is `52925e2eb` plus these cherry-picks, in order. Every cherry-pick applied without a textual conflict. Only `tpu_runner.py` needed a 3-way auto-merge, for `cf54717bc` on top of R5, and `toy_proxy_server.py` for `0aeb6fcb5` next to the llmd router. Each cherry-pick is patch-id identical to its source.

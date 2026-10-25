@@ -1540,7 +1540,9 @@ def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
     disabled."""
     from vllm_torchtpu.core.pp_chunk_scheduler import (
         SCHEDULER_CLS,
+        SCHEDULER_CLS_FINAL,
         patch_engine_core_for_pp_chunks,
+        pp_scheduler_cls,
     )
 
     scheduler_config = vllm_config.scheduler_config
@@ -1550,7 +1552,7 @@ def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
         logger.warning("Pipeline chunk sizing is off: the DP scheduler is enabled.")
         return
     paw_cls = "vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler"
-    if scheduler_config.scheduler_cls not in (None, SCHEDULER_CLS, paw_cls):
+    if scheduler_config.scheduler_cls not in (None, SCHEDULER_CLS, SCHEDULER_CLS_FINAL, paw_cls):
         logger.warning(
             "Pipeline chunk sizing is off: scheduler %s is configured.",
             scheduler_config.scheduler_cls,
@@ -1563,7 +1565,7 @@ def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
         raise ValueError(
             f"TPU_PP_CHUNK_SLACK must not be negative: {envs.TPU_PP_CHUNK_SLACK}"
         )
-    scheduler_config.scheduler_cls = SCHEDULER_CLS
+    scheduler_config.scheduler_cls = pp_scheduler_cls()
     patch_engine_core_for_pp_chunks(vllm_config)
 
 

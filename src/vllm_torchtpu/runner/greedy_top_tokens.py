@@ -1334,6 +1334,30 @@ class _QuantizedLMHeadProxy(torch.nn.Module):
                 .to(torch.bfloat16)
             )
         quantize_lm_head(self, mode=mode, group_size=group_size, weight=w)
+        # A head already quantized to fp8 has no weight; w was dequantized on the host,
+        # so quantize_lm_head registered this proxy's buffers on the CPU. The compiled
+        # draft programs need them where the head lives (ix-unified-port: band H,
+        # TPU_DRAFT_LM_HEAD_QUANT=fp4, crashed in capture_model with a CPU
+        # _w4a8_weight_3d argument). Same values, only the device changes.
+        _move_buffers_to(self, _head_device(base_head))
+
+
+def _head_device(head: torch.nn.Module) -> torch.device | None:
+    """Device of a head's weight, or of its fp8 buffer once the weight was freed."""
+    for name in ("weight", "_w8a8_weight_kn"):
+        t = getattr(head, name, None)
+        if isinstance(t, torch.Tensor):
+            return t.device
+    return None
+
+
+def _move_buffers_to(module: torch.nn.Module, device: torch.device | None) -> None:
+    """Re-register ``module``'s own buffers on ``device`` (no-op when None or already there)."""
+    if device is None:
+        return
+    for name, buf in list(module.named_buffers(recurse=False)):
+        if buf is not None and buf.device != device:
+            module.register_buffer(name, buf.to(device), persistent=False)
 
 
 class _DraftHeadOwnerProxy(torch.nn.Module):

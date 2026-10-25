@@ -54,6 +54,7 @@ PyTorch/XLA custom-op adapter bridging vLLM FusedMoE layers to the Pallas Fused 
 
 import dataclasses
 import json
+import os
 from typing import Any
 
 import jax
@@ -72,6 +73,7 @@ from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.kernels.fused_moe.v3 import MESH_AXIS, Config, fused_ep_moe
 from vllm_torchtpu.kernels.fused_moe.v3 import layer as _latest_layer
 from vllm_torchtpu.kernels.fused_moe.v3 import layout as _latest_layout
+from vllm_torchtpu.kernels.fused_moe.v3 import dense_slots as _dense_slots
 from vllm_torchtpu.layers.adapter.fused_moe_ep import (
     _squeeze_channel_scale,
     _squeeze_channel_scale_checked,
@@ -202,6 +204,42 @@ def served_config(
     return config
 
 
+def dense_slots_settings(config: Config | None = None) -> tuple[bool, int, bool, bool, bool]:
+    """(on, max tokens per shard, fused, pallas tables, merged) of the experimental dense-slots
+    layer (kernels/fused_moe/v3/dense_slots.py): TPU_MOE_FEP_DENSE_SLOTS=1
+    turns it on (default off) for calls of at most
+    TPU_MOE_FEP_DENSE_SLOTS_MAX_TOKENS rows per shard (default 64, the
+    DP4xTP2 decode buckets up to host B 128); larger calls keep the v3
+    layer. TPU_MOE_FEP_DENSE_SLOTS_FUSED=1 takes the variant whose exchange
+    and combine run inside the program; TPU_MOE_FEP_DENSE_SLOTS_PALLAS_TABLES=1
+    builds the index exchange and the tables as one Pallas program instead of
+    XLA ops; TPU_MOE_FEP_DENSE_SLOTS_MERGED=1 (with fused) runs them inside
+    the dense-slots program on the unpadded rows. The same settings are Config
+    fields (dense_slots, dense_slots_max_tokens, dense_slots_fused,
+    dense_slots_pallas_tables, dense_slots_merged),
+    so TPU_MOE_FUSED_EP_V3_CONFIG can carry them where a recipe passes only
+    known env names; a setting is on if either source turns it on, and the
+    env's threshold wins when it is set."""
+    c = config if config is not None else Config()
+    on = os.environ.get("TPU_MOE_FEP_DENSE_SLOTS", "0") == "1" or c.dense_slots
+    max_tokens = int(
+        os.environ.get("TPU_MOE_FEP_DENSE_SLOTS_MAX_TOKENS", "") or c.dense_slots_max_tokens
+    )
+    fused = os.environ.get("TPU_MOE_FEP_DENSE_SLOTS_FUSED", "0") == "1" or c.dense_slots_fused
+    pallas_tables = (
+        os.environ.get("TPU_MOE_FEP_DENSE_SLOTS_PALLAS_TABLES", "0") == "1"
+        or c.dense_slots_pallas_tables
+    )
+    merged = (
+        os.environ.get("TPU_MOE_FEP_DENSE_SLOTS_MERGED", "0") == "1" or c.dense_slots_merged
+    )
+    if max_tokens <= 0 or max_tokens % 8:
+        raise ValueError(
+            f"TPU_MOE_FEP_DENSE_SLOTS_MAX_TOKENS={max_tokens}: a positive multiple of 8"
+        )
+    return on, max_tokens, fused, pallas_tables, merged
+
+
 def run_moe_v3(
     mesh,
     topk: int,
@@ -228,15 +266,61 @@ def run_moe_v3(
             f"the latest kernel splits the experts over the mesh axis named "
             f"{MESH_AXIS!r}; the adapter's mesh has {mesh.axis_names}"
         )
-    ep = mesh.shape[MESH_AXIS]  # noqa: F841
+    ep = mesh.shape[MESH_AXIS]
     config = served_config(
         hidden=hidden, inter=inter, experts_per_shard=experts_per_shard, top_k=topk
     )
+
+    dense_on, dense_max, dense_fused, dense_pt, dense_merged = dense_slots_settings(config)
+    if dense_on:
+        logger.info_once(
+            "Fused EP MoE: dense-slots layer ON for calls of <= %d rows per shard "
+            "(fused=%s, pallas_tables=%s, merged=%s, skip_unrouted=%s, weight_slots=%s); "
+            "larger calls keep the v3 layer",
+            dense_max,
+            dense_fused,
+            dense_pt,
+            dense_merged,
+            config.dense_slots_skip_unrouted,
+            config.dense_slots_weight_slots or 3,
+        )
 
     def run_moe(x, w1, w2, w1_scale, w2_scale, gating, rank, valid_tokens):
         # rank: int32 [ep, 1], each shard's mesh index, the adapter's device
         # tensor; it becomes the kernel's shard-index operand.
         drop_nan_rows = valid_tokens is not None
+        if (
+            dense_on
+            and x.shape[0] // ep <= dense_max
+            and activation == "silu"
+            and WEIGHT_FORMAT == "fp8"
+        ):
+            logger.info_once(
+                "Fused EP MoE: dense-slots layer traced for %d rows (%d per shard)",
+                x.shape[0],
+                x.shape[0] // ep,
+            )
+            return _dense_slots.dense_slots_moe(
+                x,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                gating,
+                top_k=topk,
+                renormalize=renormalize,
+                mesh=mesh,
+                tile_rows=tile_rows(),
+                config=config,
+                experts_per_shard=experts_per_shard,
+                shard_index=rank,
+                valid_tokens=valid_tokens,
+                drop_nan_rows=drop_nan_rows,
+                fused=dense_fused,
+                pallas_tables=dense_pt,
+                merged=dense_merged,
+                unpadded=dense_merged,
+            )
         return fused_ep_moe(
             x,
             w1,

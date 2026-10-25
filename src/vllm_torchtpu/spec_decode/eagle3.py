@@ -21,6 +21,9 @@ import torch
 from vllm.compilation.backends import set_model_tag
 from vllm.config import VllmConfig, get_layers_from_vllm_config, set_current_vllm_config
 from vllm.forward_context import set_forward_context
+from vllm_torchtpu.runner import fast_forward_context as _ffc
+from vllm_torchtpu.runner import t3_host as _t3
+from vllm_torchtpu.runner.fast_forward_context import fast_set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.v1.kv_cache_interface import FullAttentionSpec
@@ -1142,7 +1145,7 @@ class Eagle3Proposer:
                     not rows_sliced and max_loop_bucket <= small_all_reduce_op.MAX_ROWS
                 )
             ),
-            set_forward_context(
+            (fast_set_forward_context if _ffc.enabled() else set_forward_context)(
                 attn_metadata,
                 self.draft_vllm_config,
                 num_tokens=num_tokens,
@@ -1162,7 +1165,12 @@ class Eagle3Proposer:
                 program(None, positions, hidden_states, seq_lens)
                 seq_lens.copy_(seq_lens_step1)
                 setattr(self, warm_attr, True)
-            return program(None, positions, hidden_states, seq_lens)
+            out = program(None, positions, hidden_states, seq_lens)
+        if _t3.AOT_SKIP_GUARDS:
+            _t3.maybe_skip_aot_guards(program)
+            if _t3.AB_PERIOD_MS > 0:
+                _t3.ab_toggle_aot_guards(program)
+        return out
 
     def _draft_model_for_step(self, step_idx: int) -> torch.nn.Module:
         """The compiled program draft step `step_idx` runs.
@@ -3298,7 +3306,7 @@ class Eagle3Proposer:
             padding_ctx,
             step0_gather_ctx,
             small_all_reduce_op.force_small_all_reduce(enabled=force_small_ar),
-            set_forward_context(
+            (fast_set_forward_context if _ffc.enabled() else set_forward_context)(
                 attn_metadata,
                 self.draft_vllm_config,
                 num_tokens=num_tokens,
@@ -3325,6 +3333,10 @@ class Eagle3Proposer:
                 model(**kwargs)
                 self._mtp_mk_step0_warm = True
             out = model(**kwargs)
+        if _t3.AOT_SKIP_GUARDS:
+            _t3.maybe_skip_aot_guards(model)
+            if _t3.AB_PERIOD_MS > 0:
+                _t3.ab_toggle_aot_guards(model)
 
         return self._unwrap_model_out(out)
 
@@ -3338,6 +3350,10 @@ class Eagle3Proposer:
             return False
         num_reqs = int(getattr(chunk, "num_reqs", 0) or 0)
         qsl = getattr(chunk, "query_start_loc_np", None)
+        if _t3.MTP_DECISION_MEMO:
+            hit = _t3.mtp_step0_memo_get(self, mk, chunk, attn_metadata, num_tokens, num_reqs, qsl)
+            if hit is not None:
+                return hit
         K = self.speculative_config.num_speculative_tokens
         if (
             num_reqs == 0
@@ -3348,7 +3364,10 @@ class Eagle3Proposer:
             or not np.all(np.diff(qsl[: num_reqs + 1]) == K + 1)
         ):
             return mk.note_step("s0_mixed", False)
-        return mk.use_for_step(attn_metadata, num_tokens, step0=True)
+        ok = mk.use_for_step(attn_metadata, num_tokens, step0=True)
+        if _t3.MTP_DECISION_MEMO:
+            _t3.mtp_step0_memo_put(self, mk, chunk, attn_metadata, num_tokens, num_reqs, qsl, ok)
+        return ok
 
     def precompile(self) -> None:
         """Precompile the draft-side @torch.compile wrapper subgraphs.

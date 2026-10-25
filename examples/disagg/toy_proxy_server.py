@@ -713,6 +713,24 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+# PROXY_PREFILL_ROUTING=prefix_hash_sticky is prefix_hash with the saturation
+# override on by default: PROXY_PREFIX_HASH_SATURATED_INFLIGHT defaults to 1
+# instead of 0, and an explicit value still wins. The alias exists because the
+# DP4xTP2 recipe lineage always passes PROXY_PREFILL_ROUTING but drops proxy
+# variables that are not on its allowlist, PROXY_PREFIX_HASH_SATURATED_INFLIGHT
+# among them. Opt-in: prefix_hash and every other value keep the default 0.
+_PREFIX_HASH_MODES = ("prefix_hash", "prefix_hash_sticky")
+
+
+def _prefill_routing_mode() -> str:
+    return os.getenv("PROXY_PREFILL_ROUTING", "prefix_hash").strip().lower()
+
+
+def _prefix_hash_saturated_inflight() -> int:
+    default = 1 if _prefill_routing_mode() == "prefix_hash_sticky" else 0
+    return _env_int("PROXY_PREFIX_HASH_SATURATED_INFLIGHT", default)
+
+
 # Retries here are deliberately limited to failures that provably occur before
 # any request byte is written to the socket, so the backend holds no state for
 # the request and a replay is indistinguishable from a first attempt:
@@ -920,19 +938,20 @@ async def lifespan(app: FastAPI):
     # Initialize round-robin iterators
     app.state.prefill_iterator = itertools.cycle(range(len(app.state.prefill_clients)))
     app.state.decode_iterator = itertools.cycle(range(len(app.state.decode_clients)))
-    routing_mode = os.getenv("PROXY_PREFILL_ROUTING", "prefix_hash").strip().lower()
+    routing_mode = _prefill_routing_mode()
     # Residency-aware prefill routing: PROXY_PREFILL_MAX_SESSIONS conversations
     # per prefill leg (0 = off; ~54 for a 397B leg without a host tier, ~240
     # with one) and PROXY_PREFIX_HASH_SATURATED_INFLIGHT, the per-leg in-flight
-    # count above which the sticky slack no longer applies (0 = off).
-    if len(app.state.prefill_clients) > 1 and routing_mode == "prefix_hash":
+    # count above which the sticky slack no longer applies (0 = off; 1 by
+    # default under PROXY_PREFILL_ROUTING=prefix_hash_sticky).
+    if len(app.state.prefill_clients) > 1 and routing_mode in _PREFIX_HASH_MODES:
         app.state.prefill_router = _PrefixAffinityRouter(
             n=len(app.state.prefill_clients),
             chunk=_env_int("PROXY_PREFIX_HASH_CHUNK", 1024),
             min_frac=_env_float("PROXY_PREFIX_HASH_MIN_FRAC", 0.5),
             slack=_env_int("PROXY_PREFIX_HASH_SLACK", 8),
             max_sessions=_env_int("PROXY_PREFILL_MAX_SESSIONS", 0),
-            saturated_inflight=_env_int("PROXY_PREFIX_HASH_SATURATED_INFLIGHT", 0),
+            saturated_inflight=_prefix_hash_saturated_inflight(),
             quad_attn_coeff=_env_float("PROXY_PREFILL_QUAD_ATTN_COEFF", 1.23e-5),
             token_slack=_env_float("PROXY_PREFIX_HASH_TOKEN_SLACK", 32768.0),
         )
@@ -1015,10 +1034,10 @@ async def lifespan(app: FastAPI):
     app.state.bytes_per_token = _env_float("PROXY_TOKEN_BYTES_EST", 3.4)
     app.state.output_tokens_est = _env_int("PROXY_DECODE_OUTPUT_TOKENS_EST", 1024)
 
-    saturated_inflight = _env_int("PROXY_PREFIX_HASH_SATURATED_INFLIGHT", 0)
+    saturated_inflight = _prefix_hash_saturated_inflight()
     print(
         f"Initialized {len(app.state.prefill_clients)} prefill clients "
-        f"(routing={'prefix_hash' if app.state.prefill_router else 'round_robin'}"
+        f"(routing={routing_mode if app.state.prefill_router else 'round_robin'}"
         f" max_sessions={_env_int('PROXY_PREFILL_MAX_SESSIONS', 0) or 'unlimited'}"
         f" saturated_inflight={saturated_inflight or 'off'}"
         f" pending_max={pending_cap or 'unlimited'}"

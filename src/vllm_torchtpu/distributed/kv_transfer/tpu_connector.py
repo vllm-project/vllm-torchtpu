@@ -21,6 +21,7 @@ import concurrent.futures
 import dataclasses
 import importlib
 import json
+import os
 import queue
 import threading
 import time
@@ -614,7 +615,24 @@ def stage3_fa_raiden_id_fields(
     }
 
 
+# VLLM_TPU_T3_ENV_CACHE=1 (default off): the per-step connector hot path asks
+# these process-constant env predicates several times per decode step; cache
+# each one's first answer for the life of the process.
+_T3_ENV_CACHE = (
+    os.environ.get("VLLM_TPU_T3_ENV_CACHE", os.environ.get("VLLM_TPU_T3_HOST", "0"))
+    == "1"
+)
+_t3_env_cache: dict[str, bool] = {}
+
+
 def _use_raiden_stage3_transport() -> bool:
+    if _T3_ENV_CACHE:
+        v = _t3_env_cache.get("stage3")
+        if v is None:
+            v = _t3_env_cache["stage3"] = (
+                str(tpu_envs.TPU_KV_RESHARD_TRANSPORT).strip().lower() == "raiden"
+            )
+        return v
     return str(tpu_envs.TPU_KV_RESHARD_TRANSPORT).strip().lower() == "raiden"
 
 
@@ -738,6 +756,11 @@ def _resolved_reshard_controller_address(dp_rank: int) -> str:
 
 
 def _use_raiden_glm_admission() -> bool:
+    if _T3_ENV_CACHE:
+        v = _t3_env_cache.get("glm")
+        if v is None:
+            v = _t3_env_cache["glm"] = bool(tpu_envs.use_raiden_glm_admission())
+        return v
     return tpu_envs.use_raiden_glm_admission()
 
 

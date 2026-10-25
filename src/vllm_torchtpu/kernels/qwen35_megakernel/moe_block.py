@@ -102,7 +102,29 @@ class MoEBlock:
             scr["sg"][...] = jnp.broadcast_to(jax.nn.sigmoid(glog), (MB, 128))
             mx = jnp.max(logits, axis=-1, keepdims=True)
             pexp = jnp.exp(logits - mx)
-        if SH_PRE:
+        SH_AT = ctx.SH_AT if SH_PRE else 0
+
+        def shared_all():
+            # SH_AT 1 / 2: the whole shared expert (sh13 then sh2), same ops in the same order
+            with sc("moe_shared"):
+                t13 = tk["sh13"]
+                g13 = None
+                for t, w in enumerate(w13s):
+                    p_ = mm(scr["xb"][:, t * t13 : (t + 1) * t13], w[...])
+                    g13 = p_ if g13 is None else g13 + p_
+                g13 = g13 * sm(slot, "sh13_s")
+                mid = rnd(
+                    rnd(jax.nn.silu(rnd(g13[:, : c.ISR]))) * rnd(g13[:, c.ISR :])
+                )
+                scr["xb2"][:, : c.ISR] = mid.astype(BF16)
+                t2 = tk["sh2"]
+                ysh = None
+                for t, w in enumerate(w2s):
+                    p_ = mm(scr["xb2"][:, t * t2 : (t + 1) * t2], w[...])
+                    ysh = p_ if ysh is None else ysh + p_
+                scr["part"][...] = ysh * sm(slot, "sh2_s") * scr["sg"][:, 0:1]
+
+        if SH_PRE and SH_AT == 0:
             with sc("moe_shared"):
                 t13 = tk["sh13"]
                 g13 = None
@@ -122,8 +144,10 @@ class MoEBlock:
                         ysh = p_ if ysh is None else ysh + p_
                     scr["part"][...] = ysh * sm(slot, "sh2_s") * scr["sg"][:, 0:1]
         with sc("moe_route"):
-            n_hit = self.route(l, pexp)
-        if SH_PRE and not ctx.SH2_PRE_ROUTE:
+            n_hit = self.route(l, pexp, during_dma=shared_all if SH_AT == 1 else None)
+        if SH_AT == 2:
+            shared_all()
+        if SH_PRE and SH_AT == 0 and not ctx.SH2_PRE_ROUTE:
             with sc("moe_shared"):
                 t2 = tk["sh2"]
                 ysh = None
@@ -175,7 +199,7 @@ class MoEBlock:
 
     __call__ = moe
 
-    def route(self, l, p8):
+    def route(self, l, p8, during_dma=None):
         """Top-k of rows 0..MR-1 (live rows 0..B-1; p8 = their unnormalized probabilities) ->
         renormalized weights scr["wn"]; the deduplicated hit experts (EP: this rank's) ->
         scr["elist"][:n_hit] in pick order, and their first tiles start. Returns n_hit."""
@@ -304,6 +328,8 @@ class MoEBlock:
             scr["wn"][...] = jnp.where(
                 row8 < B, wsel / jnp.sum(wsel, axis=-1, keepdims=True), 0.0
             )
+            if during_dma is not None:  # SH_AT == 1: shared expert under the copy's round trip
+                during_dma()
             cp.wait()
         stamp = l + 1
         n_fill0 = jnp.int32(0)

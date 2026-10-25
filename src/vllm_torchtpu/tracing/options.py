@@ -83,10 +83,14 @@ def parse_profile_options(
 
 
 def get_default_standard_opts() -> dict[str, Any]:
+    # VLLM_TPU_T3_PROF_PYTRACE (IX track 3, default unset): python tracer level
+    # for /start_profile captures, read from os.environ so it does not enter
+    # the compile-cache key the way an envs.py variable would.
+    t3_py = os.environ.get("VLLM_TPU_T3_PROF_PYTRACE", "").strip()
     return {
         "host_tracer_level": envs.HOST_TRACER_LEVEL,
         "device_tracer_level": envs.DEVICE_TRACER_LEVEL,
-        "python_tracer_level": envs.PYTHON_TRACER_LEVEL,
+        "python_tracer_level": int(t3_py) if t3_py else envs.PYTHON_TRACER_LEVEL,
     }
 
 

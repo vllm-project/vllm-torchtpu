@@ -229,6 +229,33 @@ class Config:
         before the FFN kernel; and the exchange's finish is ordered after
         the shard tables instead of after the scatter, so its waits overlap
         the scatter. Only the schedule changes: the same values.
+      dense_slots: (adapter binding) calls of at most dense_slots_max_tokens
+        rows per shard run the dense-slots layer (dense_slots.py) instead:
+        every result row lands at a row fixed by the routing alone, so no
+        packed tables, sparse-core scatter or sort. bf16 result rows; the
+        same per-row math as this layer with result_rows "bf16".
+      dense_slots_max_tokens: the largest rows per shard dense_slots takes,
+        a positive multiple of 8.
+      dense_slots_fused: the dense-slots variant whose exchange, arrivals and
+        combine stay in the program (VMEM).
+      dense_slots_pallas_tables: the dense-slots index exchange and tables as
+        one Pallas program instead of XLA ops.
+      dense_slots_merged: (with dense_slots_fused) the index exchange and the
+        tables inside the dense-slots program itself, under its first weight
+        refills, on the shard's unpadded rows (padding and valid-row masks in
+        the program); supersedes dense_slots_pallas_tables.
+      dense_slots_skip_unrouted: the dense-slots program streams the weights
+        of only its live local experts (those with at least one routed row)
+        instead of all of them; bit-identical output, fewer weight bytes when
+        the routing leaves experts cold.
+      dense_slots_weight_slots: the dense-slots program's VMEM weight slots
+        (whole experts); it keeps slots - 1 expert refills in flight. 0 (the
+        default) means 3 slots, 2 in flight. Same values, another schedule.
+      gdn_decode_tile_size: not a fused-EP setting: the GDN decode kernel's
+        tile size (kernels/gdn/v3/wrapper.py reads it from this JSON when
+        TPU_GDN_DECODE_TILE_SIZE is unset; 0 leaves the kernel's choice). It
+        rides here because the serving recipe passes this JSON to the decode
+        server alone and drops unknown env names.
     """
     result_slots: int = RESULT_SLOTS_DEFAULT
     row_fetch_ahead: int = ROW_FETCH_AHEAD_DEFAULT
@@ -261,6 +288,14 @@ class Config:
     sort_index_compare: bool = False
     compact_message: bool = False
     reorder_chain: bool = False
+    dense_slots: bool = False
+    dense_slots_max_tokens: int = 64
+    dense_slots_fused: bool = False
+    dense_slots_pallas_tables: bool = False
+    dense_slots_merged: bool = False
+    dense_slots_skip_unrouted: bool = False
+    dense_slots_weight_slots: int = 0
+    gdn_decode_tile_size: int = 0
 
     @property
     def token_dtype(self):
@@ -387,6 +422,15 @@ class Config:
                 or self.tables_zero_words % (SUBLANES * LANES)):
             raise ValueError(f"tables_zero_words {self.tables_zero_words}: a "
                              f"whole number of {SUBLANES * LANES}-word tiles")
+        if self.dense_slots_max_tokens <= 0 or self.dense_slots_max_tokens % 8:
+            raise ValueError(f"dense_slots_max_tokens {self.dense_slots_max_tokens}: a "
+                             "positive multiple of 8")
+        if self.dense_slots_weight_slots not in (0, 2, 3, 4, 5):
+            raise ValueError(f"dense_slots_weight_slots {self.dense_slots_weight_slots}: 0 "
+                             "(the default, 3) or 2..5")
+        if self.gdn_decode_tile_size < 0:
+            raise ValueError(f"gdn_decode_tile_size {self.gdn_decode_tile_size}: 0 (the "
+                             "kernel's choice) or a positive tile size")
         if self.weight_dma_priority not in WEIGHT_DMA_PRIORITIES:
             raise ValueError(f"weight_dma_priority {self.weight_dma_priority} "
                              f"is not one of {WEIGHT_DMA_PRIORITIES}")
