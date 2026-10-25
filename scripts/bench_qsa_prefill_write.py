@@ -123,32 +123,36 @@ def bench(args, max_query_len, patches, main_slot):
         pooled_qsa, select_blocks=no_selection, qsa_attention=no_attention, **patches
     ):
 
-        @jax.jit
+        # One jitted step per call: inside a fori_loop the SparseCore offload
+        # of the step fails to lower (RET_CHECK buffer_found).
+        step = jax.jit(
+            lambda pool, *rest: pooled_qsa.pooled_qsa_step(
+                *rest[:10],
+                pool,
+                *rest[10:],
+                compress_ratio=RATIO,
+                token_topk=TOPK,
+                norm_eps=1e-6,
+                rotary_dim=ROTARY,
+                main_slot=main_slot,
+                compressed_slot=2,
+                max_query_len=max_query_len,
+            )[0],
+            donate_argnums=0,
+        )
+        rest = args[:10] + args[11:]
+
         def loop(pool):
-            def body(i, pool):
-                pool, _, _ = pooled_qsa.pooled_qsa_step(
-                    *args[:10],
-                    pool,
-                    *args[11:],
-                    compress_ratio=RATIO,
-                    token_topk=TOPK,
-                    norm_eps=1e-6,
-                    rotary_dim=ROTARY,
-                    main_slot=main_slot,
-                    compressed_slot=2,
-                    max_query_len=max_query_len,
-                )
-                return pool
+            return step(pool, *rest)
 
-            return jax.lax.fori_loop(0, ITERS, body, pool)
-
-        pool = args[10]
+        pool = jnp.copy(args[10])
         pool = loop(pool)
         jax.block_until_ready(pool)
         samples = []
         for _ in range(5):
             t0 = time.perf_counter()
-            pool = loop(pool)
+            for _ in range(ITERS):
+                pool = loop(pool)
             jax.block_until_ready(pool)
             samples.append((time.perf_counter() - t0) / ITERS * 1e3)
         return float(np.median(samples)), loop, pool
@@ -170,7 +174,9 @@ def test_prefill_write():
             results.append(row)
             if name == "all_writes":
                 with jax.profiler.trace(os.path.join(out, "xprof", f"slot{main_slot}")):
-                    jax.block_until_ready(loop(pool))
+                    for _ in range(3):
+                        pool = loop(pool)
+                    jax.block_until_ready(pool)
     Path(out, "bench_qsa_prefill_write.json").write_text(json.dumps(results, indent=1))
 
 
