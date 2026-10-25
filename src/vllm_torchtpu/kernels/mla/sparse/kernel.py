@@ -3458,6 +3458,7 @@ def prepare_outputs(
         "sparsecore_atoms_per_batch",
         "sparsecore_gather_wait_mode",
         "sparsecore_gather_pipelined",
+        "sparsecore_gather_early_dma",
         "small_chunk_tokens",
         "small_chunk_batch_size",
         "small_chunk_live_gather",
@@ -3511,6 +3512,7 @@ def sparse_ragged_paged_attention(
     sparsecore_atoms_per_batch: int = 16,
     sparsecore_gather_wait_mode: str = "overlap_rope",
     sparsecore_gather_pipelined: bool = True,
+    sparsecore_gather_early_dma: bool = False,
     small_chunk_tokens: int = 16,
     small_chunk_batch_size: int | None = 1,
     small_chunk_live_gather: bool = True,
@@ -3579,6 +3581,9 @@ def sparse_ragged_paged_attention(
         overlaps ROPE work.
       sparsecore_gather_pipelined: Whether to pipeline native SparseCore gather
         serving.
+      sparsecore_gather_early_dma: Native SparseCore gather: start the
+        live-vector, first index block and KV write destination DMAs before
+        the `kv_write` phase (`dsa_gather_native_sc(early_dma=...)`).
       small_chunk_tokens: Chunks of at most this many tokens (the decode
         bucket) take the small-chunk path below; 0 disables it. Full
         `gather_and_attention_chunk_size` prefill chunks are unaffected.
@@ -4162,6 +4167,7 @@ def sparse_ragged_paged_attention(
             sparsecore_atoms_per_batch=sparsecore_atoms_per_batch,
             sparsecore_gather_wait_mode=sparsecore_gather_wait_mode,
             sparsecore_gather_pipelined=sparsecore_gather_pipelined,
+            sparsecore_gather_early_dma=sparsecore_gather_early_dma,
             is_dcp_mode=is_dcp_mode,
             small_chunk_tokens=small_chunk_tokens,
             small_chunk_batch_size=small_chunk_batch_size,
@@ -4375,6 +4381,7 @@ def sparse_attention_chunk(
     sparsecore_atoms_per_batch: int = 16,
     sparsecore_gather_wait_mode: str = "overlap_rope",
     sparsecore_gather_pipelined: bool = True,
+    sparsecore_gather_early_dma: bool = False,
     small_chunk_tokens: int = 0,
     small_chunk_batch_size: int | None = None,
     small_chunk_live_gather: bool = False,
@@ -5035,6 +5042,7 @@ def sparse_attention_chunk(
                 atoms_per_batch=gather_atoms,
                 wait_mode=sparsecore_gather_wait_mode,
                 serve_pipelined=sparsecore_gather_pipelined,
+                early_dma=sparsecore_gather_early_dma,
                 live_multiple=kernel_batch_size
                 * (GATHER_ATOM_ROWS if group_tab is not None else topk_cap),
                 kv_write=kv_write,
@@ -5092,6 +5100,7 @@ def sparse_attention_chunk(
                     atoms_per_batch=(dcp_gather_atoms if is_dcp_mode else gather_atoms),
                     wait_mode=sparsecore_gather_wait_mode,
                     serve_pipelined=sparsecore_gather_pipelined,
+                    early_dma=sparsecore_gather_early_dma,
                     **({"is_dcp_mode": True} if is_dcp_mode else {}),
                     packed_rope=packed_rope,
                     **live_kwargs,
