@@ -450,26 +450,26 @@ def _moe_quant_kernel(
 
 
 def _sliced_moe_quant_kernel(
-    x_ref,
-    r_ref,
-    w_ref,
-    y_ref,
-    q_ref,
-    s_ref,
-    ro_ref,
-    sum_ref,
-    *,
-    eps: float,
-    q_max: float,
-    slice_rows: int,
+    *refs, eps: float, q_max: float, slice_rows: int, router: bool
 ):
     """``_moe_quant_kernel`` computed one ``slice_rows`` slice of the tile at
     a time. The quant pass after the row amax reads ``y`` back from its output
     block, one byte-transpose group of columns at a time, and stores the same
-    u32 words to the same rows of the per-row layout as the whole-tile body."""
+    u32 words to the same rows of the per-row layout as the whole-tile body.
+
+    With ``router``, ``y`` goes to a bf16 scratch of the whole tile instead of
+    an output, and the tile ends with the router logits ``y @ gate.T`` from
+    it: bf16 operands, f32 accumulation, rounded to bf16 as the gate's XLA
+    matmul rounds them."""
     from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kernel import (  # noqa: E501
         _byte_transpose4,
     )
+
+    if router:
+        (x_ref, r_ref, w_ref, gate_ref, q_ref, s_ref, ro_ref, logits_ref) = refs[:8]
+        sum_ref, y_ref = refs[8:]
+    else:
+        x_ref, r_ref, w_ref, y_ref, q_ref, s_ref, ro_ref, sum_ref = refs
 
     lanes = 128
     tile_rows, hidden = x_ref.shape
@@ -506,6 +506,13 @@ def _sliced_moe_quant_kernel(
                 ] = b[t]
 
     _for_each_slice(tile_rows, slice_rows, body)
+    if router:
+        logits_ref[...] = jax.lax.dot_general(
+            y_ref[...],
+            gate_ref[...],
+            (((1,), (1,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        ).astype(logits_ref.dtype)
 
 
 @functools.partial(
@@ -515,6 +522,7 @@ def fused_add_rms_norm_quant_moe(
     x: jax.Array,
     residual: jax.Array,
     weight: jax.Array,
+    gate: jax.Array | None = None,
     *,
     eps: float,
     block_rows: int = DEFAULT_BLOCK_ROWS,
@@ -530,11 +538,28 @@ def fused_add_rms_norm_quant_moe(
     x_scale f32 [rows], new_residual)``; ``(x_q, x_scale)`` are bit for bit
     ``fused_moe_prefill_kernel_v2._quantize_rows(y)``. ``y`` is still written:
     the router reads it. ``slice_rows`` as in ``fused_add_rms_norm``.
+
+    With ``gate`` (the router weight, ``[experts, hidden]`` of x's dtype; needs
+    ``slice_rows``), the kernel computes the router logits from ``y`` itself
+    and does not write ``y``: returns ``(None, x_q, x_scale, new_residual,
+    logits [rows, experts])``, the logits in x's dtype, the gate matmul's
+    ``bf16(y @ gate.T)``. The weight stays resident in VMEM.
     """
     rows, hidden = x.shape
     if rows % block_rows or hidden % 512:
         raise ValueError(f"{rows=} {hidden=} {block_rows=}")
     _check_slices(block_rows, slice_rows)
+    if gate is not None:
+        return _quant_moe_router_call(
+            x,
+            residual,
+            weight,
+            gate,
+            eps=eps,
+            block_rows=block_rows,
+            slice_rows=slice_rows,
+            interpret=interpret,
+        )
     q_dtype = jnp.float8_e4m3fn
     q_max = float(jnp.finfo(q_dtype).max)
     lane_blocks = hidden // 128
@@ -545,7 +570,11 @@ def fused_add_rms_norm_quant_moe(
     tile = block_rows * hidden * 4
     if slice_rows:
         body = functools.partial(
-            _sliced_moe_quant_kernel, eps=eps, q_max=q_max, slice_rows=slice_rows
+            _sliced_moe_quant_kernel,
+            eps=eps,
+            q_max=q_max,
+            slice_rows=slice_rows,
+            router=False,
         )
     else:
         body = functools.partial(_moe_quant_kernel, eps=eps, q_max=q_max)
@@ -570,6 +599,57 @@ def fused_add_rms_norm_quant_moe(
         interpret=interpret,
     )(x, residual, weight.reshape(1, hidden))
     return y, x_q, scale.reshape(-1), new_res
+
+
+def _quant_moe_router_call(
+    x, residual, weight, gate, *, eps, block_rows, slice_rows, interpret
+):
+    rows, hidden = x.shape
+    experts = gate.shape[0]
+    if not slice_rows or gate.shape != (experts, hidden) or experts % 128:
+        raise ValueError(f"{slice_rows=} {gate.shape=} {hidden=}")
+    q_dtype = jnp.float8_e4m3fn
+    q_max = float(jnp.finfo(q_dtype).max)
+    lane_blocks = hidden // 128
+    row_spec = pl.BlockSpec((block_rows, hidden), lambda i: (i, 0))
+    q_spec = pl.BlockSpec((block_rows, lane_blocks, 128), lambda i: (i, 0, 0))
+    s_spec = pl.BlockSpec((block_rows, 1), lambda i: (i, 0))
+    w_spec = pl.BlockSpec((1, hidden), lambda i: (0, 0))
+    gate_spec = pl.BlockSpec(
+        (experts, hidden), lambda i: (0, 0), pipeline_mode=pl.Buffered(1)
+    )
+    logits_spec = pl.BlockSpec((block_rows, experts), lambda i: (i, 0))
+    tile = block_rows * hidden * 4
+    x_q, scale, new_res, logits = pl.pallas_call(
+        functools.partial(
+            _sliced_moe_quant_kernel,
+            eps=eps,
+            q_max=q_max,
+            slice_rows=slice_rows,
+            router=True,
+        ),
+        grid=(rows // block_rows,),
+        in_specs=[row_spec, row_spec, w_spec, gate_spec],
+        out_specs=[q_spec, s_spec, row_spec, logits_spec],
+        out_shape=[
+            jax.ShapeDtypeStruct((rows, lane_blocks, 128), q_dtype),
+            jax.ShapeDtypeStruct((rows, 1), jnp.float32),
+            jax.ShapeDtypeStruct((rows, hidden), x.dtype),
+            jax.ShapeDtypeStruct((rows, experts), x.dtype),
+        ],
+        scratch_shapes=[
+            *_slice_scratch(slice_rows, hidden),
+            pltpu.VMEM((block_rows, hidden), x.dtype),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",),
+            vmem_limit_bytes=min(100 * 1024 * 1024, max(32 * 1024 * 1024, 14 * tile)),
+        ),
+        name=f"fused_add_rmsnorm_quant_moe_router_b{block_rows}_h{hidden}_e{experts}"
+        f"{_slice_suffix(slice_rows)}",
+        interpret=interpret,
+    )(x, residual, weight.reshape(1, hidden), gate)
+    return None, x_q, scale.reshape(-1), new_res, logits
 
 
 def reference(x, residual, weight, eps):

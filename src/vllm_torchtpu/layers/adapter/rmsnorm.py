@@ -40,6 +40,9 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     PREQUANT_ATTR,
     PrequantSlot,
 )
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 _ops: dict[tuple[float, bool], Callable[..., Any]] = {}
 _ops_lock = Lock()
@@ -250,22 +253,117 @@ def _get_quant_moe_op(eps: float):
             )
 
         def fake(x, residual, weight):
-            rows, hidden = x.shape
-            return (
-                torch.empty_like(x),
-                torch.empty(
-                    (rows, hidden // 128, 128),
-                    dtype=torch.float8_e4m3fn,
-                    device=x.device,
-                ),
-                torch.empty((rows,), dtype=torch.float32, device=x.device),
-                torch.empty_like(residual),
-            )
+            return (torch.empty_like(x), *_quant_moe_fake(x, residual))
 
         op = pallas.jax_op(f"pallas::fused_add_rmsnorm_quant_moe_{tag}", fn)
         op.register_fake(fake)
         _quant_moe_ops[key] = op
         return op
+
+
+def _quant_moe_fake(x, residual):
+    rows, hidden = x.shape
+    return (
+        torch.empty(
+            (rows, hidden // 128, 128), dtype=torch.float8_e4m3fn, device=x.device
+        ),
+        torch.empty((rows,), dtype=torch.float32, device=x.device),
+        torch.empty_like(residual),
+    )
+
+
+_quant_moe_router_ops: dict[float, object] = {}
+
+
+def _get_quant_moe_router_op(eps: float):
+    """``_get_quant_moe_op``'s op that also computes the router logits from
+    its own y (TPU_FUSED_ADD_RMSNORM_SLICES=2; built at arming). Returns
+    ``(y, x_q, x_scale, new_residual, logits)``; the kernel does not write y,
+    and the y returned here is dead unless something besides the gate reads
+    it, so XLA drops it."""
+    key = float(eps)
+    op = _quant_moe_router_ops.get(key)
+    if op is not None:
+        return op
+    with _ops_lock:
+        op = _quant_moe_router_ops.get(key)
+        if op is not None:
+            return op
+        tag = f"{float(eps):.3e}".replace(".", "p").replace("-", "m").replace("+", "")
+        slice_rows = _slice_rows()
+
+        def fn(
+            x: jax.Array, residual: jax.Array, weight: jax.Array, gate: jax.Array
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+            _, x_q, x_scale, new_res, logits = kernel.fused_add_rms_norm_quant_moe(
+                x, residual, weight, gate, eps=float(eps), slice_rows=slice_rows
+            )
+            y = kernel.reference(x, residual, weight, float(eps))[0]
+            return y, x_q, x_scale, new_res, logits
+
+        def fake(x, residual, weight, gate):
+            return (
+                torch.empty_like(x),
+                *_quant_moe_fake(x, residual),
+                torch.empty((x.shape[0], gate.shape[0]), dtype=x.dtype, device=x.device),
+            )
+
+        op = pallas.jax_op(f"pallas::fused_add_rmsnorm_quant_moe_router_{tag}", fn)
+        op.register_fake(fake)
+        _quant_moe_router_ops[key] = op
+        return op
+
+
+def _router_gate(runner, hidden: int):
+    """The runner's gate when it is the plain bf16 ``F.linear`` the router
+    variant reproduces: no bias, no fused shared-expert gate, the stock
+    unquantized method on the ``[experts, hidden]`` weight, and none of the
+    GPU-only GEMM tiers. None otherwise."""
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    gate = runner.gate
+    if gate is None or getattr(runner, "_fse_fuse_gate", False):
+        return None
+    weight = getattr(gate, "weight", None)
+    if (
+        type(getattr(gate, "quant_method", None)) is not UnquantizedLinearMethod
+        or getattr(gate, "bias", None) is not None
+        or weight is None
+        or weight.dtype != torch.bfloat16
+        or weight.dim() != 2
+        or weight.shape[1] != hidden
+        or weight.shape[0] % 128
+    ):
+        return None
+    gpu_tiers = (
+        "allow_ll_bf16_gemm",
+        "allow_fp32_router_gemm",
+        "allow_bf16x3_router_gemm",
+        "allow_cublas_router_gemm",
+    )
+    if any(getattr(gate, name, False) for name in gpu_tiers):
+        return None
+    return gate
+
+
+def _read_router_logits(gate, slot: PrequantSlot) -> None:
+    """Makes ``gate`` return the logits its norm left in ``slot``, converted
+    to the gate's output dtype as its own matmul output is, and empty the
+    slot. The norm fills it on every path, so no trace reads the gate's own
+    weight; with an empty slot the gate runs as before."""
+    upstream = gate.forward
+    out_dtype = getattr(gate, "out_dtype", None)
+
+    def forward(x: torch.Tensor):
+        logits = slot.value
+        if logits is None:
+            return upstream(x)
+        slot.value = None
+        if out_dtype is not None and logits.dtype != out_dtype:
+            logits = logits.to(out_dtype)
+        return logits, None
+
+    gate.forward = forward
 
 
 def arm_prequant_moe(model: torch.nn.Module) -> int:
@@ -278,7 +376,15 @@ def arm_prequant_moe(model: torch.nn.Module) -> int:
     Call after moe_tp_decode.arm, on the target model only (the drafter's
     norms stay upstream). Pairs only where every bucket the norm's Pallas
     branch takes (`rows > bucket_gate_edge(_min_rows)`) is above the op's
-    prefill cut-over, so a filled slot always meets the prefill kernel."""
+    prefill cut-over, so a filled slot always meets the prefill kernel.
+
+    TPU_FUSED_ADD_RMSNORM_SLICES=2: where the runner's gate is the plain bf16
+    matmul, the norm also takes an alias of the gate weight as its own buffer
+    (it never holds the gate module) and leaves the router logits in a slot
+    the gate returns instead of computing them: from its kernel on the Pallas
+    branch, from the gate's own ``F.linear`` on y otherwise. Every trace then
+    lifts the weight under the norm's name, on both sides of the token-count
+    branch."""
     from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
     from vllm_torchtpu.layers.adapter.moe_tp_decode import (
@@ -286,7 +392,7 @@ def arm_prequant_moe(model: torch.nn.Module) -> int:
         arm_prequant_op,
     )
 
-    n = 0
+    n = routed = 0
     for layer in model.modules():
         ln_post = getattr(layer, "post_attention_layernorm", None)
         mlp = getattr(layer, "mlp", None)
@@ -305,7 +411,26 @@ def arm_prequant_moe(model: torch.nn.Module) -> int:
         slot = PrequantSlot()
         ln_post._prequant_moe_slot = slot
         setattr(experts, PREQUANT_MOE_ATTR, slot)
+        if envs.TPU_FUSED_ADD_RMSNORM_SLICES >= 2:
+            gate = _router_gate(runners[0], ln_post.hidden_size)
+            if gate is not None:
+                ln_post.register_buffer(
+                    "_router_weight", gate.weight.detach(), persistent=False
+                )
+                ln_post._op_quant_moe = _get_quant_moe_router_op(
+                    ln_post.variance_epsilon
+                )
+                ln_post._router_slot = PrequantSlot()
+                _read_router_logits(gate, ln_post._router_slot)
+                routed += 1
         n += 1
+    if envs.TPU_FUSED_ADD_RMSNORM_SLICES >= 2:
+        logger.info(
+            "TPU_FUSED_ADD_RMSNORM_SLICES=2: %d of %d MoE norms compute their "
+            "router logits",
+            routed,
+            n,
+        )
     return n
 
 
@@ -346,6 +471,7 @@ class TpuRMSNorm(RMSNorm):
         # TPU_FUSED_ADD_RMSNORM_QUANT_MOE: set by arm_prequant_moe.
         self._prequant_moe_slot = None
         self._op_quant_moe = None
+        self._router_slot = None
         if self._pallas_ok:
             self._op_res = _get_op(self.variance_epsilon, True)
             self._op_nores = _get_op(self.variance_epsilon, False)
@@ -370,6 +496,13 @@ class TpuRMSNorm(RMSNorm):
         )
 
     def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None):
+        out = self._forward(x, residual)
+        if self._router_slot is not None and self._router_slot.value is None:
+            y = out if residual is None else out[0]
+            self._router_slot.value = torch.nn.functional.linear(y, self._router_weight)
+        return out
+
+    def _forward(self, x: torch.Tensor, residual: torch.Tensor | None):
         if not self._use_pallas(x, residual):
             return super().forward(x, residual)
         if self._prequant_slot is not None and residual is not None and x.dim() == 2:
@@ -385,9 +518,18 @@ class TpuRMSNorm(RMSNorm):
             and x.dim() == 2
         ):
             # Same rows predicate again. The paired MoE op takes (x_q, x_scale)
-            # on its stage-A prefill kernel; y still feeds the router.
+            # on its stage-A prefill kernel; y still feeds the router, unless
+            # the norm computed the router logits for the gate.
             assert self._op_quant_moe is not None
-            y, x_q, x_scale, new_res = self._op_quant_moe(x, residual, self.weight.data)
+            if self._router_slot is not None:
+                y, x_q, x_scale, new_res, logits = self._op_quant_moe(
+                    x, residual, self.weight.data, self._router_weight
+                )
+                self._router_slot.value = logits
+            else:
+                y, x_q, x_scale, new_res = self._op_quant_moe(
+                    x, residual, self.weight.data
+                )
             self._prequant_moe_slot.value = (x_q, x_scale)
             return y, new_res
         if x.dim() == 2:

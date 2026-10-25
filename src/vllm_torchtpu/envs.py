@@ -2117,7 +2117,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # VMEM: 3,071 spill slots in the MoE norm's LLO). 1 = 32-row slices, each in
     # 512-column groups, with the unrounded sum in a 32-row f32 scratch; the
     # kernels are named ..._s32. Bit-identical: the same ops, and the sum of
-    # squares in the order Mosaic gives the whole-row reduction.
+    # squares in the order Mosaic gives the whole-row reduction. 2 = 1, and with
+    # TPU_FUSED_ADD_RMSNORM_QUANT_MOE the MoE norm also computes the router
+    # logits bf16(y @ gate.T) from its own y (the bf16 gate weight resident in
+    # VMEM), so the gate's XLA matmul and the bf16 y it reads are gone; the
+    # sigmoid and top-k stay in XLA. Only the f32 sum order over the hidden dim
+    # of the logits can differ from XLA's dot.
     "TPU_FUSED_ADD_RMSNORM_SLICES": env_nonnegative_int(
         "TPU_FUSED_ADD_RMSNORM_SLICES", 0
     ),
