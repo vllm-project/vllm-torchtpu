@@ -161,20 +161,29 @@ class KimiDecoderLayer(nn.Module):
 
         assert block_residuals is not None
         prefix_sum = hidden_states
-        if block_residuals.shape[-2] > 0:
-            hidden_states = self.self_attention_res(prefix_sum, block_residuals)
-        if self.layer_idx % self.attn_res_block_size == 0:
-            block_residuals = torch.cat(
-                (block_residuals, prefix_sum.unsqueeze(-2)), dim=-2
+        hidden_dim = hidden_states.shape[-1]
+        block_idx = self.layer_idx // self.attn_res_block_size
+        is_block_start = self.layer_idx % self.attn_res_block_size == 0
+        num_saved = block_idx if is_block_start else block_idx + 1
+        if num_saved > 0:
+            hidden_states = self.self_attention_res(
+                prefix_sum, block_residuals[:num_saved].reshape(-1, hidden_dim)
+            )
+        if is_block_start:
+            block_residuals = torch.select_scatter(
+                block_residuals, prefix_sum, 0, block_idx
             )
             prefix_sum = None
+            num_saved = block_idx + 1
 
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
             positions, hidden_states, sequence_parallel=sequence_parallel
         )
         prefix_sum = hidden_states if prefix_sum is None else prefix_sum + hidden_states
-        hidden_states = self.mlp_res(prefix_sum, block_residuals)
+        hidden_states = self.mlp_res(
+            prefix_sum, block_residuals[:num_saved].reshape(-1, hidden_dim)
+        )
         hidden_states = self.post_attention_layernorm(hidden_states)
         if self.is_moe:
             hidden_states = self.block_sparse_moe(
@@ -268,13 +277,20 @@ class KimiModel(nn.Module):
             hidden_states = hidden_states.reshape(
                 self.sp_group.world_size, -1, hidden_states.shape[-1]
             )[self.sp_group.rank_in_group].contiguous()
-        # A view avoids passing a symbolic local token count to TorchTPU's
-        # concrete-size allocation kernel during the dynamic trace.
-        block_residuals = (
-            hidden_states.unsqueeze(1)[:, :0, :]
-            if self.attn_res_block_size is not None
-            else None
-        )
+        # Pre-allocate major-first [num_blocks, tokens, hidden] buffer so each
+        # block boundary updates its slot via select_scatter and slices [:k]
+        # as a contiguous 2D [k * tokens, hidden] view without torch.cat copies.
+        if self.attn_res_block_size is not None:
+            num_res_blocks = (
+                len(self.layers) + self.attn_res_block_size - 1
+            ) // self.attn_res_block_size
+            block_residuals = (
+                hidden_states.unsqueeze(0).expand(num_res_blocks, -1, -1).clone()
+                if num_res_blocks > 0
+                else hidden_states[:0, :]
+            )
+        else:
+            block_residuals = None
         assert hidden_states is not None
 
         aux_hidden_states: list[torch.Tensor] = []
@@ -292,7 +308,9 @@ class KimiModel(nn.Module):
                 aux_hidden_states.append(hidden_states)
 
         if block_residuals is not None:
-            hidden_states = self.output_attn_res(hidden_states, block_residuals)
+            hidden_states = self.output_attn_res(
+                hidden_states, block_residuals.reshape(-1, hidden_states.shape[-1])
+            )
         hidden_states = self.norm(hidden_states)
         if sequence_parallel:
             hidden_states = self.sp_group.all_gather(hidden_states, dim=0)

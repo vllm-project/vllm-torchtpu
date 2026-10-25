@@ -185,24 +185,41 @@ class AttentionResidual(nn.Module):
         prefix_sum: torch.Tensor,
         block_residuals: torch.Tensor,
     ) -> torch.Tensor:
-        if block_residuals.shape[1] == 0:
+        num_blocks = (
+            block_residuals.shape[0]
+            if block_residuals.ndim == 2
+            else block_residuals.shape[1]
+        )
+        if num_blocks == 0:
             return prefix_sum
-        if self._prefill_op is not None and prefix_sum.shape[0] % 16 == 0:
+        if self._prefill_op is not None and prefix_sum.shape[0] % 8 == 0:
             return self._prefill_op(prefix_sum, block_residuals, self.folded_weight)
         w = self.folded_weight
         if prefix_sum.shape[0] == 1:
-            # With one token the per-slot statistics below are scalars that
-            # XLA leaves unfused; reducing over the concatenated slots keeps
-            # them one vector. A shape branch, so bucket 1 gets its own trace
-            # (see compilation.shape_variants).
-            values = torch.cat(
-                (block_residuals, prefix_sum.unsqueeze(-2)), dim=-2
-            ).float()  # [1, K, hidden]
-            inv = torch.rsqrt(values.pow(2).mean(-1) + self.eps)
-            probabilities = ((values * w).sum(-1) * inv).softmax(dim=-1)
-            out = (probabilities.unsqueeze(-1) * values).sum(dim=-2)
+            # With one token the per-slot statistics are scalars; keep a
+            # dedicated bucket-1 trace without concatenating [1, K, hidden].
+            v_blocks = block_residuals.reshape(-1, prefix_sum.shape[-1]).float()
+            v_prefix = prefix_sum.float()
+            inv_blocks = torch.rsqrt(v_blocks.pow(2).mean(-1) + self.eps)
+            inv_prefix = torch.rsqrt(v_prefix.pow(2).mean(-1) + self.eps)
+            scores = torch.cat(
+                (
+                    (v_blocks * w).sum(-1) * inv_blocks,
+                    (v_prefix * w).sum(-1) * inv_prefix,
+                ),
+                dim=0,
+            )
+            probabilities = scores.softmax(dim=0)
+            out = (probabilities[:-1].unsqueeze(-1) * v_blocks).sum(dim=0, keepdim=True)
+            out = out + probabilities[-1] * v_prefix
             return out.to(block_residuals.dtype)
-        v_blocks = block_residuals.float()
+        if block_residuals.ndim == 2:
+            tokens, hidden = prefix_sum.shape
+            v_blocks = (
+                block_residuals.view(-1, tokens, hidden).transpose(0, 1).float()
+            )
+        else:
+            v_blocks = block_residuals.float()
         v_prefix = prefix_sum.float()
         inv_blocks = torch.rsqrt(v_blocks.pow(2).mean(-1) + self.eps)
         inv_prefix = torch.rsqrt(v_prefix.pow(2).mean(-1) + self.eps)
