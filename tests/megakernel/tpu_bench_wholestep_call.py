@@ -64,9 +64,10 @@ def main():
     pps = a.max_groups * 4 // 128
     for B in [int(b) for b in a.buckets.split(",")]:
         nreq = B // 4
-        n_cols = pps
+        n_cols = pps  # table width (static); only the pages the contexts reach are allocated
+        n_used = -(-(a.ctx + 4 + nreq) // 128)
         # Blocks: GDN 33 layers x 4 ckpts per request, QSA main + compressed per request & layer.
-        NB = 1 + nreq * (n_gdn * 4 + n_att * (1 + 2 * n_cols)) + 8
+        NB = 1 + nreq * (n_gdn * 4 + n_att * (1 + 2 * n_used)) + 8
         layout = Qwen38GdnPoolLayout(pool_shape=(NB * 4, 128, 1, 4, 256), pool_dtype="float8_e4m3fn")
         call, in_specs, out_specs, donate = build_wholestep_call(
             mesh, g, B, layout, layers, L=L, budget=a.budget, max_groups=a.max_groups,
@@ -119,8 +120,8 @@ def main():
             comp = np.zeros((16, n_cols), np.int32)
             for q in range(nreq):
                 ring[q, 0] = next(free)
-                main[q] = [next(free) for _ in range(n_cols)]
-                comp[q] = [next(free) for _ in range(n_cols)]
+                main[q, :n_used] = [next(free) for _ in range(n_used)]
+                comp[q, :n_used] = [next(free) for _ in range(n_used)]
             tabs += [ring.reshape(-1), main.reshape(-1), comp.reshape(-1)]
         positions = np.concatenate([ctx[q] + np.arange(4) for q in range(nreq)]).astype(np.int32)
         inv = 1.0 / (1e7 ** (np.arange(0, 64, 2) / 64))
@@ -128,7 +129,9 @@ def main():
         trig = jnp.asarray(np.concatenate([np.cos(ang), np.sin(ang), np.zeros((len(ang), 64))], 1), jnp.bfloat16)
         norms = [jnp.zeros((256,), jnp.bfloat16), jnp.zeros((128,), jnp.bfloat16)] * n_att
         hidden = rnd((R * B, g.NHC * g.H), jnp.bfloat16)
-        pool = jax.device_put(jnp.zeros((R * NB * 4, 128, 1, 4, 256), jnp.float8_e4m3fn), tp)
+        pool = jax.jit(  # allocated sharded: a host-side zeros of the global pool does not fit
+            lambda: jnp.zeros((R * NB * 4, 128, 1, 4, 256), jnp.float8_e4m3fn), out_shardings=tp
+        )()
         put = lambda x: jax.device_put(jnp.asarray(x), rep)  # noqa: E731
         args = [hidden, *ws, pool, *map(put, meta), *map(put, tabs), put(positions), put(qsl),
                 put(ctx), put(trig), *map(put, norms)]

@@ -177,5 +177,7 @@ def pack_wholestep_operands(
             k_in = t.shape[-2]
             if k_in < nt * tk:
                 t = F.pad(t, (0, 0, 0, nt * tk - k_in))
-            out.append(t.reshape(*t.shape[:-2], nt, tk, t.shape[-1]))
+            # 3-D [L*nt, tk, N] (the call reshapes to [L, nt, tk, N]): torch_tpu re-lays out
+            # 4-D operands through execute_as_strided on every call.
+            out.append(t.reshape(-1, tk, t.shape[-1]))
     return [own_operand(t) for t in out]

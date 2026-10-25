@@ -84,6 +84,20 @@ def build_wholestep_call(
     fn, k_specs, _, n_w = make_flat_segment_step(mesh, spec, ex, extra_outs=(KV_NEW, KR_NEW, IR_NEW))
     M, NS = ex.M, B // T
     tp, rep = P("tp"), P()
+    # Planned global weight shapes: the packer hands tiled operands over 3-D ([L*nt, tk, N],
+    # the same bytes) and they are reshaped to [L, nt, tk, N] here, under jit, for free.
+    # Every 4-D operand is re-laid out by an execute_as_strided program per call at the
+    # torch_tpu boundary (q32/q40: all copied operands are 4-D, no 3-D one is).
+    from vllm_torchtpu.megakernel import kernel
+
+    _, info = kernel.make_step(mesh, spec, ex)
+    targets: list[tuple[int, ...] | None] = []
+    for name in info["plan"].w_names:
+        sh = info["wshape"][name]
+        if kernel.is_tupled_weight(sh):
+            targets += [None] * len(sh)
+        else:
+            targets.append((R * sh[0][0],) + tuple(sh[0][1:]))
     x_specs = k_specs[2 : 2 + len(fn.extra_names)]
     hbm = {x for x, s in zip(fn.extra_names, x_specs) if s == tp}
 
@@ -145,7 +159,10 @@ def build_wholestep_call(
 
     def call(*args):
         hidden = args[0]
-        w = args[1 : 1 + n_w]
+        w = [
+            x if t is None or tuple(x.shape) == t else x.reshape(t)
+            for x, t in zip(args[1 : 1 + n_w], targets, strict=True)
+        ]
         i = 1 + n_w
         pool = args[i]
         meta = args[i + 1 : i + 1 + n_meta]
