@@ -755,3 +755,37 @@ def test_deserialize_entry_does_not_copy_the_entry():
             raise AssertionError("replay must not deepcopy the entry")
 
     assert _deserialize_entry(Entry())(2, 3, 7) == 12
+
+
+def _fingerprint_at_rank(monkeypatch, fn, rank):
+    import torch.distributed as dist
+    from torch import fx
+
+    from vllm_torchtpu.compilation import tpu_compiler
+
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_rank", lambda *a, **k: rank)
+    return tpu_compiler._graph_fingerprint(fx.symbolic_trace(fn))
+
+
+def test_a_graph_slicing_this_ranks_rows_is_never_replayed_by_another_rank(
+    monkeypatch,
+):
+    # sequence_parallel_chunk reads the TP rank inside the op: the graph code
+    # is the same on every rank, the lowered program is not. Peer replay of
+    # it served every rank another rank's shard (GSM8K 2% with prefill SP).
+    import torch
+    import vllm.model_executor.models.utils  # noqa: F401  registers the op
+
+    def sharded(x):
+        return torch.ops.vllm.sequence_parallel_chunk_impl(x) * 2
+
+    def replicated(x):
+        return x * 2
+
+    assert _fingerprint_at_rank(monkeypatch, sharded, 0) != _fingerprint_at_rank(
+        monkeypatch, sharded, 1
+    )
+    assert _fingerprint_at_rank(monkeypatch, replicated, 0) == _fingerprint_at_rank(
+        monkeypatch, replicated, 1
+    )
