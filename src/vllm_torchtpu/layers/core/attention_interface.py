@@ -1104,12 +1104,15 @@ def kv_write_in_gather_supported(
     num_tokens: int,
     topk: int,
 ) -> bool:
-    """Whether TPU_MLA_KV_WRITE_IN_GATHER can take this decode step.
+    """Whether TPU_MLA_KV_WRITE_IN_GATHER can take this step's caches and size.
 
-    The fused-prep capped gather must run (SparseCore caches, a top-k wider
-    than TPU_DCP_MLA_TOPK_CAP), a nope token must be one 128-word row and a
-    rope token one 32-word SparseCore row (16 words under packed rope), and
-    the step at most 32 tokens (two subcore rounds; `FUSED_PREP_MAX_TOKENS`).
+    A capped gather must run (SparseCore caches, a top-k wider than
+    TPU_DCP_MLA_TOPK_CAP), a nope token must be one 128-word row and a rope
+    token one 32-word SparseCore row (16 words under packed rope), and the
+    step at most TPU_MLA_KV_WRITE_IN_GATHER_MAX_TOKENS tokens (32 by default:
+    the fused-prep decode buckets, two subcore rounds) and never more than
+    `native_sc_gather.MAX_WRITE_TOKENS` (four rounds). Whether one gather
+    serves the call is `one_capped_gather`.
     """
     topk_cap = envs.TPU_DCP_MLA_TOPK_CAP
     rope_words = (
@@ -1117,8 +1120,11 @@ def kv_write_in_gather_supported(
         if rope_spec.packed_rope
         else native_sc_gather.ROPE_WORDS
     )
+    max_tokens = min(
+        envs.TPU_MLA_KV_WRITE_IN_GATHER_MAX_TOKENS, native_sc_gather.MAX_WRITE_TOKENS
+    )
     return (
-        0 < num_tokens <= sparse_mla_kernel.FUSED_PREP_MAX_TOKENS
+        0 < num_tokens <= max_tokens
         and bool(topk_cap)
         and topk > topk_cap
         and nope_spec.layout is kv_cache_utils.KVCacheLayout.SPARSECORE
@@ -1127,6 +1133,27 @@ def kv_write_in_gather_supported(
         and nope_spec.shape[-1] == 128
         and rope_spec.token_bytes // kv_cache_utils.WORD_BYTES == rope_words
         and rope_spec.shape[-1] % rope_words == 0
+    )
+
+
+def one_capped_gather(num_tokens: int, topk_cap: int | None) -> bool:
+    """Whether one capped SparseCore gather serves a DCP attention call of
+    `num_tokens` tokens, so it can write the call's KV rows itself: the
+    fused-prep decode path (TPU_DCP_MLA_MASK_IN_KERNEL and
+    TPU_DCP_MLA_FUSED_PREP), or a live-group call (TPU_DCP_MLA_MIXED_LIVE) of
+    one TPU_DCP_MLA_TOPK_CAP_CHUNK chunk. `topk_cap` is the cap the call
+    takes, None when it takes none."""
+    if num_tokens <= sparse_mla_kernel.FUSED_PREP_MAX_TOKENS:
+        return bool(envs.TPU_DCP_MLA_MASK_IN_KERNEL and envs.TPU_DCP_MLA_FUSED_PREP)
+    return bool(
+        envs.TPU_DCP_MLA_MIXED_LIVE
+        and sparse_mla_kernel.live_group_one_gather(
+            num_tokens,
+            topk_cap,
+            envs.TPU_DCP_MLA_TOPK_CAP_CHUNK,
+            envs.TPU_DCP_MLA_SMALL_CHUNK_TOKENS,
+            envs.TPU_DCP_MLA_SMALL_CHUNK_BATCH,
+        )
     )
 
 
@@ -1246,8 +1273,10 @@ def sparse_mla_attention_dcp(
         merge's chunks. False for a caller that reads it whole: joining the
         pieces is a copy.
 
-    TPU_MLA_KV_WRITE_IN_GATHER: on fused-prep decode buckets the step's KV
-    write is not a kernel of its own; the SparseCore gather that feeds the
+    TPU_MLA_KV_WRITE_IN_GATHER: on buckets one capped gather serves
+    (`one_capped_gather`: fused-prep decode buckets, and one-chunk live-group
+    buckets up to TPU_MLA_KV_WRITE_IN_GATHER_MAX_TOKENS) the step's KV write
+    is not a kernel of its own; the SparseCore gather that feeds the
     attention kernel writes the packed rows (same owner mask, same bytes)
     and fences before it gathers.
 
@@ -1397,14 +1426,21 @@ def sparse_mla_attention_dcp(
         else:
             dcp_rank = streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size)
         decode_bucket = topk_idx.shape[0] <= sparse_mla_kernel.FUSED_PREP_MAX_TOKENS
+        # The capped path (and its chunk) applies only where the kernel takes
+        # it: SparseCore caches and a top-k wider than the cap.
+        topk_cap = dcp_mla_topk_cap(dcp_size)
+        if not (
+            topk_cap
+            and cache_layout == sparse_mla_kernel.SPARSECORE_CACHE_LAYOUT
+            and topk_idx.shape[-1] > topk_cap
+        ):
+            topk_cap = None
         kv_in_gather = (
             envs.TPU_MLA_KV_WRITE_IN_GATHER
-            and envs.TPU_DCP_MLA_MASK_IN_KERNEL
-            and envs.TPU_DCP_MLA_FUSED_PREP
-            and decode_bucket
             and kv_write_in_gather_supported(
                 nope_spec, rope_spec, kv_c_normed.shape[0], topk_idx.shape[-1]
             )
+            and one_capped_gather(topk_idx.shape[0], topk_cap)
         )
         kv_write = None
         if kv_in_gather:
@@ -1500,15 +1536,6 @@ def sparse_mla_attention_dcp(
                     split_kwargs["send_peer"] = jnp.stack(peer)
         else:
             q, split_kwargs = jnp.concatenate([ql_nope, q_pe], axis=-1), {}
-        # The capped path (and its chunk) applies only where the kernel takes
-        # it: SparseCore caches and a top-k wider than the cap.
-        topk_cap = dcp_mla_topk_cap(dcp_size)
-        if not (
-            topk_cap
-            and cache_layout == sparse_mla_kernel.SPARSECORE_CACHE_LAYOUT
-            and topk_idx.shape[-1] > topk_cap
-        ):
-            topk_cap = None
         chunk_kwargs = (
             {
                 "gather_and_attention_chunk_size": envs.TPU_DCP_MLA_TOPK_CAP_CHUNK,
