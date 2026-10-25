@@ -48,10 +48,11 @@ def main():
     ap.add_argument("--budget", type=int, default=128)
     ap.add_argument("--max-groups", type=int, default=2048)
     ap.add_argument("--iters", type=int, default=20)
+    ap.add_argument("--wstd", type=float, default=0.02)
     a = ap.parse_args()
-    from torch_tpu._internal.pallas import get_pallas_mesh  # the served device order
-
-    mesh = get_pallas_mesh(axis_names=("tp",))
+    # The served Pallas mesh order (get_pallas_mesh in the server: [0, 1, 4, 5, 6, 7, 2, 3]).
+    by_id = {d.id: d for d in jax.devices()}
+    mesh = jax.sharding.Mesh(np.array([by_id[i] for i in (0, 1, 4, 5, 6, 7, 2, 3)]), ("tp",))
     R = mesh.size
     g = qwen38.FULL
     tp, rep = NamedSharding(mesh, P("tp")), NamedSharding(mesh, P())
@@ -62,7 +63,7 @@ def main():
         nreq = B // 4
         n_cols = pps
         # Blocks: GDN 33 layers x 4 ckpts per request, QSA main + compressed per request & layer.
-        NB = 1 + nreq * (33 * 4 + n_cols * 2 + n_att) + 8
+        NB = 1 + nreq * (33 * 4 + n_att * (1 + n_cols)) + 8
         layout = Qwen38GdnPoolLayout(pool_shape=(NB * 4, 128, 1, 4, 256), pool_dtype="float8_e4m3fn")
         call, in_specs, out_specs, donate = build_wholestep_call(
             mesh, g, B, layout, layers, budget=a.budget, max_groups=a.max_groups,
@@ -81,7 +82,7 @@ def main():
             nonlocal key
             key, k = jax.random.split(key)
             if jnp.issubdtype(dtype, jnp.floating):
-                return jax.device_put((jax.random.normal(k, shape, jnp.float32) * 0.02).astype(dtype), tp)
+                return jax.device_put((jax.random.normal(k, shape, jnp.float32) * a.wstd).astype(dtype), tp)
             return jax.device_put(jnp.zeros(shape, dtype), tp)
 
         ws = []
@@ -115,7 +116,9 @@ def main():
                 comp[q] = main[q]  # timing only: keys overlap the main pages
             tabs += [ring.reshape(-1), main.reshape(-1), comp.reshape(-1)]
         positions = np.concatenate([ctx[q] + np.arange(4) for q in range(nreq)]).astype(np.int32)
-        trig = jnp.zeros((a.ctx + 4096, 128), jnp.bfloat16)
+        inv = 1.0 / (1e7 ** (np.arange(0, 64, 2) / 64))
+        ang = np.arange(a.ctx + 4096)[:, None] * inv[None]
+        trig = jnp.asarray(np.concatenate([np.cos(ang), np.sin(ang), np.zeros((len(ang), 64))], 1), jnp.bfloat16)
         norms = [jnp.zeros((256,), jnp.bfloat16), jnp.zeros((128,), jnp.bfloat16)] * n_att
         hidden = rnd((R * B, g.NHC * g.H), jnp.bfloat16)
         pool = jax.device_put(jnp.zeros((R * NB * 4, 128, 1, 4, 256), jnp.float8_e4m3fn), tp)
@@ -134,8 +137,11 @@ def main():
             res, pool = f(*args)
             jax.block_until_ready((res, pool))
             ts.append(time.perf_counter() - t0)
+        r32 = res.astype(jnp.float32)
         print(f"B={B} call median {1e3 * np.median(ts):.3f} ms p10 {1e3 * np.percentile(ts, 10):.3f} "
-              f"finite {bool(jnp.isfinite(res.astype(jnp.float32)).all())}", flush=True)
+              f"finite {float(jnp.isfinite(r32).mean()):.4f} absmean "
+              f"{float(jnp.nanmean(jnp.abs(r32))):.4g} (input {float(jnp.abs(hidden.astype(jnp.float32)).mean()):.4g})",
+              flush=True)
 
 
 if __name__ == "__main__":

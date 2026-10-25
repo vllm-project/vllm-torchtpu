@@ -742,6 +742,56 @@ class Qwen4ExpBackbone(nn.Module):
             return mixed, hidden
         return mixed
 
+    def forward_wholestep(
+        self,
+        input_ids,
+        positions,
+        segment_call,
+        whole,
+        *,
+        query_start_loc,
+        ngram_context,
+        state_slots,
+        context_lens,
+        valid_tokens,
+        main_block_table,
+        compressed_block_table,
+    ):
+        """``forward_segments`` with layers ``whole``'s first .. last-1 in ONE whole-step
+        megakernel call (attention, indexer and cache writes in-kernel / in-call).
+
+        Head groups as in ``forward_segments``; then ``whole`` (layers 3..46); the last QSA
+        layer keeps its stock attention core and the segment kernel for the rest.
+        """
+        assert self.host_ple_index is None, "segments need the PLE table on HBM"
+        ids64 = input_ids.to(torch.int64)
+        positions64 = positions.to(torch.int64)
+        hidden = self.embed_tokens(input_ids).repeat(1, self.hc_count)
+        layers = cast(Sequence[Qwen4ExpDecoderLayer], self.layers)
+        for h, group in enumerate(segment_call.head_groups):
+            hidden = layers[group[0]].apply_ple(
+                hidden, ids64, query_start_loc, ngram_context, state_slots, context_lens
+            )
+            hidden = segment_call.head(h, hidden)
+        hidden = whole(hidden, positions, query_start_loc, context_lens)
+        qsa_layers = [i for i, layer in enumerate(layers) if layer.layer_type == "full_attention"]
+        last = layers[qsa_layers[-1]]
+        metadata = QSAMetadata(
+            query_start_loc, context_lens, state_slots, main_block_table, compressed_block_table
+        )
+        cap = getattr(segment_call, "attention_rows", 0)  # as forward_segments
+        in_kernel = bool(cap) and int(hidden.shape[0]) <= cap
+        block, _ = last.attn_hyper_connection.mix(hidden)
+        if in_kernel:
+            attention = last.self_attn.select_for_kernel(block, positions64, metadata)
+        else:
+            attention = last.self_attn.attend(block, positions64, metadata)
+        hidden = segment_call(len(qsa_layers) - 1, hidden, attention)
+        mixed = self.hyper_connection_mixer.mix(hidden)[0]
+        if self.emit_mtp_hidden:
+            return mixed, hidden
+        return mixed
+
 
 @support_torch_compile(
     dynamic_arg_dims={
@@ -835,6 +885,58 @@ class Qwen4ExpBackboneSP(nn.Module):
             positions,
             inputs_embeds,
             sequence_parallel=True,
+            query_start_loc=query_start_loc,
+            ngram_context=ngram_context,
+            state_slots=state_slots,
+            context_lens=context_lens,
+            valid_tokens=valid_tokens,
+            main_block_table=main_block_table,
+            compressed_block_table=compressed_block_table,
+        )
+
+
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "inputs_embeds": 0,
+        "valid_tokens": 0,
+    }
+)
+class Qwen4ExpWholeStepModel(nn.Module):
+    """A third compiled program: the backbone with the whole-step megakernel.
+
+    Its own class (not a ``Qwen4ExpSegmentModel`` instance): two instances of one
+    ``support_torch_compile`` class over the same backbone share one compiled graph.
+    """
+
+    def __init__(self, *, vllm_config, prefix: str = "", backbone, segments, whole) -> None:
+        super().__init__()
+        self.prefix = prefix
+        self.backbone = backbone
+        self.segments = segments
+        self.whole = whole
+
+    def forward(
+        self,
+        input_ids,
+        positions,
+        inputs_embeds=None,
+        *,
+        query_start_loc,
+        ngram_context,
+        state_slots,
+        context_lens,
+        valid_tokens,
+        main_block_table,
+        compressed_block_table,
+    ):
+        return type(self.backbone).forward_wholestep(
+            self.backbone,
+            input_ids,
+            positions,
+            self.segments,
+            self.whole,
             query_start_loc=query_start_loc,
             ngram_context=ngram_context,
             state_slots=state_slots,

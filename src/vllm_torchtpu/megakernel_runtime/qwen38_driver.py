@@ -563,6 +563,12 @@ class Qwen38SegmentDriver:
         self.sync = False  # `sync=1`: wait for the first calls' outputs and log it (bisecting)
         self.warm = False  # `warm=1`: host barriers around the first (compiling) call
         self.noaot = False  # `noaot=1`: no AOT serialization / compile cache for the segment program
+        # `whole=1`: layers 3..46 in one whole-step call (`Qwen4ExpWholeStepModel`) on steps
+        # whose every request's context is <= `wholecap=N` tokens (others: segment program).
+        self.whole = False
+        self.whole_cap = 32768
+        self.whole_program = None
+        self.whole_calls = 0
 
     @classmethod
     def maybe_create(cls, runner: Any) -> Qwen38SegmentDriver | None:
@@ -625,6 +631,10 @@ class Qwen38SegmentDriver:
         drv.sync = _parse_flag(raw, "sync", False)
         drv.warm = _parse_flag(raw, "warm", False)
         drv.noaot = _parse_flag(raw, "noaot", False)
+        drv.whole = _parse_flag(raw, "whole", False)
+        cap = _parse_int(raw, "wholecap")
+        if cap is not None:
+            drv.whole_cap = cap
         global NO_DONATE
         NO_DONATE = _parse_flag(raw, "nodonate", False)
         if not _parse_flag(raw, "replay", False):
@@ -724,6 +734,8 @@ class Qwen38SegmentDriver:
                 backbone=runner.model.model,
                 segments=self.segments,
             )
+        if self.whole:
+            self._attach_whole(runner)
         if self.mtp:
             self._attach_mtp_tail(runner)
         if self.check_left > 0:
@@ -1088,6 +1100,46 @@ class Qwen38SegmentDriver:
             mixed = bb.hyper_connection_mixer.mix(h)[0]
         return (mixed, h) if bb.emit_mtp_hidden else mixed
 
+
+    def _attach_whole(self, runner: Any) -> None:
+        """The whole-step program (its own compiled class); on failure it stays off."""
+        from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpWholeStepModel
+
+        from .qwen38_wholestep import Qwen38WholeStep
+
+        try:
+            attn = next(l.self_attn for l in self.segments.layers if l.layer_type == "full_attention")
+            budget = int(attn.token_topk) // int(attn.compress_ratio)
+            max_groups = -(-self.whole_cap // 4 // 1024) * 1024
+            whole = Qwen38WholeStep(
+                runner.model, self.g, self.mesh, self.buckets, budget=budget, max_groups=max_groups,
+            )
+            whole.bind_pool(self.segments.pool, self.segments.layout)
+            with self._contexts(runner, "model_mk_whole"):
+                self.whole_program = Qwen4ExpWholeStepModel(
+                    vllm_config=self.cfg,
+                    prefix="model_mk_whole",
+                    backbone=runner.model.model,
+                    segments=self.segments,
+                    whole=whole,
+                )
+            logger.info(
+                "Qwen3.8 whole-step megakernel attached: layers 3..46, context cap %d, budget %d, "
+                "max_groups %d, %d operands", self.whole_cap, budget, max_groups, whole.n_w,
+            )
+        except Exception:
+            logger.exception("Qwen3.8 whole-step: setup failed; segment program only")
+            self.whole_program = None
+
+    def _whole_eligible(self, runner: Any, n_req: int) -> bool:
+        if self.whole_program is None:
+            return False
+        try:
+            ctx = runner.input_batch.num_computed_tokens_cpu[:n_req]
+            return int(ctx.max()) + T_VERIFY <= self.whole_cap
+        except Exception:
+            return False
+
     def _attach_mtp_tail(self, runner: Any) -> None:
         """Route the MTP draft layer's post-attention half to the tail kernel.
 
@@ -1284,6 +1336,11 @@ class Qwen38SegmentDriver:
         try:
             if self.check_left > 0 and self.shadow is not None:
                 out = self._shadow_step(runner, input_ids, positions, kw)
+            elif self._whole_eligible(runner, n_req):
+                self.whole_calls += 1
+                self._note(f"whole_b{rows}")
+                with self._contexts(runner, "model_mk_whole"):
+                    out = self.whole_program(input_ids=input_ids, positions=positions, **kw)
             else:
                 with self._serve_contexts(runner):
                     out = self.program(input_ids=input_ids, positions=positions, **kw)
@@ -1291,7 +1348,7 @@ class Qwen38SegmentDriver:
             # Fail closed: one failure disables the megakernel for this server;
             # this step and all later ones run the stock model.
             logger.exception("Qwen3.8 megakernel failed; disabling it, stock path from now on")
-            self.program = self.shadow = None
+            self.program = self.shadow = self.whole_program = None
             return False, None
         if isinstance(out, (list, tuple)):
             out = tuple(out)

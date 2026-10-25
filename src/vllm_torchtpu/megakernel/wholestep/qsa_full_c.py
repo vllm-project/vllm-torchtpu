@@ -45,7 +45,7 @@ from ..ops import BF16, F32, I32, rnd, rmsnorm
 from ..spec import ExtraInput, ScratchReq, SmallField, StateDecl
 from . import indexer as ix
 from .qsa_full import OFFSET, POOL, ROPE, SCALES
-from .qsa_full_b import CK, IDX_N, IDX_W, MTAB, NVIS, TAIL, QSAFullIndexedBlock
+from .qsa_full_b import CK, IDX_N, IDX_W, NVIS, TAIL, QSAFullIndexedBlock
 
 CTXQ = "qsa_ctx"  # [requests] tokens before this step
 RING = "qsa_ring"  # [requests, 8, 128] raw index-key ring (lane = position % 8)
@@ -173,8 +173,8 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         ga = c0 // 4
         per_page = ctx.extra[POOL].shape[1] // MICRO
         shift = per_page.bit_length() - 1
-        qb = self.row_base(ctx, l) + q
-        micro = ctx.extra[MTAB][qb, ga >> shift] * per_page + (ga & (per_page - 1))
+        qb = self.tab_base(ctx, l) + q
+        micro = self.tables(ctx)[1][qb, ga >> shift] * per_page + (ga & (per_page - 1))
         cp = pltpu.make_async_copy(
             ctx.extra[POOL].at[micro >> shift, pl.ds((micro & (per_page - 1)) * MICRO, MICRO)],
             scr["qc_old"],
@@ -229,69 +229,79 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             + jax.lax.broadcasted_iota(I32, (T, NC, S // NC, 128), 2) * 128
             + jax.lax.broadcasted_iota(I32, (T, NC, S // NC, 128), 3)
         )
+
+        def select_rows(lo: Any, n: int, s0: Any) -> None:
+            """Thresholds and compaction of rows `[lo, lo + n)`; scores at `qi_s[s0 …]`."""
+            rid = jax.lax.broadcasted_iota(I32, (n, 1, 1), 0) + lo
+            nv = jnp.zeros((n, 1, 1), I32)
+            for r in range(lo, lo + n):
+                nv = jnp.where(rid == r, ctx.extra[NVIS][r], nv)
+            ids = (
+                jax.lax.broadcasted_iota(I32, (n, S, 128), 1) * 128
+                + jax.lax.broadcasted_iota(I32, (n, S, 128), 2)
+            )
+            sc = pltpu.bitcast(scr["qi_s"][pl.ds(s0, n)].reshape(n, S, 128), I32)
+            bits = jnp.where(ids < nv, sc, -1)
+            thr, tmax = ix.thresholds(bits, ids, nv, K, G)
+            scr["qi_th"][pl.ds(lo, n)] = jnp.broadcast_to(thr, (n, 1, 128))
+            scr["qi_tm"][pl.ds(lo, n)] = jnp.broadcast_to(tmax, (n, 1, 128))
+            scr["qi_nv"][pl.ds(lo, n)] = jnp.broadcast_to(nv, (n, 1, 128))
+            consts = ix.compact_consts(S, K)
+            lid = consts[-1]
+            scr["qi_z"][...] = jnp.zeros((1, 128), I32)
+
+            def row(r: Any, carry: Any) -> Any:
+                nvr = scr["qi_nv"][r][:, :1]
+                ga = ctx.extra[CTXQ][r // T] // 4
+                b = jnp.where(lid < nvr, pltpu.bitcast(scr["qi_s"][r - lo + s0].reshape(S, 128), I32), -1)
+                th, tm = scr["qi_th"][r][:, :1], scr["qi_tm"][r][:, :1]
+                ov = nvr > K
+                sel = (ov & ((b > th) | ((b == th) & (lid <= tm)))) | (~ov & (b >= 0))
+                # Recent groups (>= g_a) leave the pool path; remember whether g_a was selected.
+                scr["qc_sga"][r] = jnp.sum((sel & (lid == ga)).astype(I32))
+                bp = jnp.where(lid < ga, b, -1)
+                # Selection of the pool path: the same set restricted to ids < g_a. With `n_vis`
+                # clamped to g_a the compaction sees exactly those ids (select-all of the kept).
+                kept = jnp.sum((sel & (lid < ga)).astype(I32))
+                b2 = jnp.where(sel & (lid < ga), bp, -1)
+                scr["qi_id"][r] = ix.compact_row(
+                    b2, jnp.zeros((1, 1), I32), jnp.zeros((1, 1), I32) + G,
+                    jnp.zeros((1, 1), I32) + kept, K, consts,
+                )
+                cs = [
+                    pltpu.make_async_copy(
+                        scr["qi_id"].at[r], scr["qi_ids"].at[pl.ds(r, 1), pl.ds(0, K)],
+                        scr["qi_sem"].at[1],
+                    ),
+                    pltpu.make_async_copy(
+                        scr["qi_z"], scr["qi_ids"].at[pl.ds(r, 1), pl.ds(K, 128)], scr["qi_sem"].at[2]
+                    ),
+                ]
+                for c in cs:
+                    c.start()
+                for c in cs:
+                    c.wait()
+                scr["qi_kvl"][r] = 4 * kept
+                return carry
+
+            jax.lax.fori_loop(lo, lo + n, row, 0)
+        self.load_tables(ctx, l)
         for q in range(nreq):
             qr = scr["qi_q"][q].astype(BF16)
-            self._score_request(ctx, q, qr, self.row_base(ctx, l), last=q == nreq - 1)
+            s0 = 0 if self.per_request_scores else q * T
+            self._score_request(ctx, q, qr, self.tab_base(ctx, l), last=q == nreq - 1, row0=s0)
             ck, gc = self._new_group(ctx, l, q, raw[q * T : (q + 1) * T])
             s_new = ix.score_rows(qr, jnp.broadcast_to(ck.astype(BF16), (8, ix.IDX_DIM)))[:, :1]
-            rows = slice(q * T, (q + 1) * T)
+            rows = slice(s0, s0 + T)
             # The completed group's fresh key replaces its stale cached column.
             scr["qi_s"][rows] = jnp.where(
                 gid == gc, s_new.reshape(T, 1, 1, 1), scr["qi_s"][rows]
             )
             self._recent_tile(ctx, l, q)
-        rid = jax.lax.broadcasted_iota(I32, (MB, 1, 1), 0)
-        nv = jnp.zeros((MB, 1, 1), I32)
-        for r in range(MB):
-            nv = jnp.where(rid == r, ctx.extra[NVIS][r], nv)
-        ids = (
-            jax.lax.broadcasted_iota(I32, (MB, S, 128), 1) * 128
-            + jax.lax.broadcasted_iota(I32, (MB, S, 128), 2)
-        )
-        bits = jnp.where(ids < nv, pltpu.bitcast(scr["qi_s"][...].reshape(MB, S, 128), I32), -1)
-        thr, tmax = ix.thresholds(bits, ids, nv, K, G)
-        scr["qi_th"][...] = jnp.broadcast_to(thr, (MB, 1, 128))
-        scr["qi_tm"][...] = jnp.broadcast_to(tmax, (MB, 1, 128))
-        scr["qi_nv"][...] = jnp.broadcast_to(nv, (MB, 1, 128))
-        consts = ix.compact_consts(S, K)
-        lid = consts[-1]
-        scr["qi_z"][...] = jnp.zeros((1, 128), I32)
-
-        def row(r: Any, carry: Any) -> Any:
-            nvr = scr["qi_nv"][r][:, :1]
-            ga = ctx.extra[CTXQ][r // T] // 4
-            b = jnp.where(lid < nvr, pltpu.bitcast(scr["qi_s"][r].reshape(S, 128), I32), -1)
-            th, tm = scr["qi_th"][r][:, :1], scr["qi_tm"][r][:, :1]
-            ov = nvr > K
-            sel = (ov & ((b > th) | ((b == th) & (lid <= tm)))) | (~ov & (b >= 0))
-            # Recent groups (>= g_a) leave the pool path; remember whether g_a was selected.
-            scr["qc_sga"][r] = jnp.sum((sel & (lid == ga)).astype(I32))
-            bp = jnp.where(lid < ga, b, -1)
-            # Selection of the pool path: the same set restricted to ids < g_a. With `n_vis`
-            # clamped to g_a the compaction sees exactly those ids (select-all of the kept).
-            kept = jnp.sum((sel & (lid < ga)).astype(I32))
-            b2 = jnp.where(sel & (lid < ga), bp, -1)
-            scr["qi_id"][r] = ix.compact_row(
-                b2, jnp.zeros((1, 1), I32), jnp.zeros((1, 1), I32) + G,
-                jnp.zeros((1, 1), I32) + kept, K, consts,
-            )
-            cs = [
-                pltpu.make_async_copy(
-                    scr["qi_id"].at[r], scr["qi_ids"].at[pl.ds(r, 1), pl.ds(0, K)],
-                    scr["qi_sem"].at[1],
-                ),
-                pltpu.make_async_copy(
-                    scr["qi_z"], scr["qi_ids"].at[pl.ds(r, 1), pl.ds(K, 128)], scr["qi_sem"].at[2]
-                ),
-            ]
-            for c in cs:
-                c.start()
-            for c in cs:
-                c.wait()
-            scr["qi_kvl"][r] = 4 * kept
-            return carry
-
-        jax.lax.fori_loop(0, MB, row, 0)
+            if self.per_request_scores:  # select this request's rows before the next scores
+                select_rows(q * T, T, 0)
+        if not self.per_request_scores:
+            select_rows(0, MB, 0)
         for c in outs:
             c.wait()
         if self.debug:  # the kernel's queries and pool-path ids; g_a's flag in id slot K-1
@@ -333,7 +343,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             out, g0, pre = attend_row(
                 r, g0, pre, nrows=ex.MB, pool=ctx.extra[POOL], ring=scr["qf_ring"],
                 sems=scr["qf_ring_sem"], pages=scr["qi_ids"], kv_len=scr["qi_kvl"],
-                table=ctx.extra[MTAB], rows_per_req=T, table_row_base=self.row_base(ctx, l),
+                table=self.tables(ctx)[1], rows_per_req=T, table_row_base=self.tab_base(ctx, l),
                 q=scr["qf_q"][r], gate=scr["qf_g"][r],
                 off=self.offset(ctx, l), scale_k=ctx.extra[SCALES][0],
                 scale_v=ctx.extra[SCALES][1], sm_scale=g.HD**-0.5, interpret=ex.interpret,

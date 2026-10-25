@@ -202,7 +202,7 @@ def test_selection_check_catches_an_off_by_one_id(monkeypatch):
 CTX_C = [3001, 100]  # request 0: g_a holds one old token; request 1: g_a starts at the step
 
 
-def _run_c(key: int = 17, T: int = 4):
+def _run_c(key: int = 17, T: int = 4, long: bool = False):
     from vllm_torchtpu.megakernel.wholestep.qsa_full_b import DBG_IDS, DBG_IQ
     from vllm_torchtpu.megakernel.wholestep.qsa_full_c import CK_NEW, IR_NEW, KR_NEW, RING_NEW
 
@@ -211,17 +211,24 @@ def _run_c(key: int = 17, T: int = 4):
     d = wi.random_wholestep_inputs(key, G, ex, L, budget=BUDGET, n_pages=PAGES, identical_experts=True)
     d = wi.add_indexer_inputs(key, G, ex, d, L, max_groups=MAX_GROUPS, ctx=CTX_C)
     d = wi.add_step_inputs(key, G, ex, d, L, ctx=CTX_C)
+    if long:  # served long-context mode: HBM page tables, one request's scores at a time
+        d = wi.add_carrier(key, d)
+        d["hbm_tables"] = True
     ref, _ = wi.wholestep_reference(G, ex, d, L)
     steps = d.pop("_step_out")
     pps = d["mtab"].shape[1]
+    long_kw = dict(carrier="bf16", chunk_pages=32, hbm_tables=True, per_request_scores=True)
     spec = wholestep_spec(
         G, R, L=L, qsa=dict(budget=BUDGET), step=True,
-        indexed=dict(max_groups=MAX_GROUPS, pages_per_seq=pps, debug=True),
+        indexed=dict(max_groups=MAX_GROUPS, pages_per_seq=pps, debug=True, **(long_kw if long else {})),
     )
     w_mk, states = wi.pack_wholestep(spec, G, ex, d, L)
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
     pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(mesh, ex, d["inp"].pos, d["inp"].x, w_mk, states)
-    assert [x.name for x in kernel.extra_inputs(spec, ex)] == wi.EXTRA_NAMES_C
+    names = list(wi.EXTRA_NAMES_C)
+    if long:
+        names.insert(names.index("qsa_ck") + 1, "qsa_cktab")
+    assert [x.name for x in kernel.extra_inputs(spec, ex)] == names
     step, _ = kernel.make_step(mesh, spec, ex)
     _, outs = step(pos_mk, hid_mk, w_mk, st_mk, *wi.extras_c(d, mesh, R))
     B, n_att, nreq = ex.B, L // G.att_every, ex.M // T
@@ -236,12 +243,14 @@ def _run_c(key: int = 17, T: int = 4):
     return res, np.asarray(ref, np.float32), x0, ck, ring, steps, iq, ids, d
 
 
-def test_step_selection_exact_on_its_own_queries():
+@pytest.mark.parametrize("long", [False, True])
+def test_step_selection_exact_on_its_own_queries(long):
     """Strict: the pool-path ids are the stock selection (from the kernel's own queries and
-    its own completed-group key) restricted to groups older than the step, every row/layer."""
+    its own completed-group key) restricted to groups older than the step, every row/layer.
+    `long`: HBM page tables with per-layer SMEM windows and per-request score buffers."""
     from vllm_torchtpu.megakernel.wholestep.indexer import score_rows, topk_reference
 
-    _, _, _, ck, _, _, iq, ids, d = _run_c()
+    _, _, _, ck, _, _, iq, ids, d = _run_c(long=long)
     T = 4
     for o in range(iq.shape[0]):
         for r in range(iq.shape[1]):

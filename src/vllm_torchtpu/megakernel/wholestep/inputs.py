@@ -375,12 +375,18 @@ def extras_b(d: dict[str, Any], mesh: Mesh, R: int) -> tuple:
         else (jax.device_put(kernel.fold(_rep(d["ck"], R)), tp),)
     )
     assert not pl_ or "carrier" in d, "per-layer metadata needs the served key layout"
+    mtab = _flat(d["mtab"]) if pl_ else d["mtab"]
+    if d.get("hbm_tables"):  # page tables as per-rank HBM extras (`hbm_tables=True` blocks)
+        ck = (ck[0], jax.device_put(kernel.fold(_rep(jnp.asarray(ck[1]), R)), tp))
+        mtab_x = jax.device_put(kernel.fold(_rep(jnp.asarray(mtab), R)), tp)
+    else:
+        mtab_x = jax.device_put(mtab, rep)
     return (
         jax.device_put(kernel.fold(d["pool"]), tp),
         *ck,
         jax.device_put(d["nvis"], rep),
         jax.device_put(d["tail"], rep),
-        jax.device_put(_flat(d["mtab"]) if pl_ else d["mtab"], rep),
+        mtab_x,
         jax.device_put(d["off"] if pl_ else jnp.asarray([d["off"]], jnp.int32), rep),
         jax.device_put(jnp.asarray([1.0, 1.0], F32), rep),
         jax.device_put(kernel.fold(_rep(d["rope"], R)), tp),
