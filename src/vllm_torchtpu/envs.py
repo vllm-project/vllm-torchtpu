@@ -1195,12 +1195,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # stage-A expert kernel sums each token's weighted expert rows in an f32
     # VMEM array and writes the MoE output itself, instead of writing every
     # expert row to an expert-major slab in HBM for a separate combine kernel
-    # to read back (453 MB per layer at 4096 tokens). 0 = off. Up to 1024 on
-    # GLM-5.2's TP16 slice: 24 MiB of sums beside the kernel's 23 MiB of
-    # buffers; 2048 tokens would need 71 MiB. Token counts must be a multiple
-    # of the kernel's tile rows (128 below 4096 tokens). Not bit-identical:
-    # each expert row is rounded to bf16 after its routing weight is applied,
-    # not before.
+    # to read back (453 MB per layer at 4096 tokens). 0 = off. Up to 4096 on
+    # GLM-5.2's TP16 slice: 1024 tokens in one pass (24 MiB of sums), 2048 to
+    # 4096 in two phases that hold the intermediate rows in VMEM and sum one
+    # 2048-column slice of the output at a time (58.5 MiB of VMEM at 4096).
+    # Larger token counts keep the slab. Token counts must be a multiple of the
+    # kernel's tile rows (128 below 4096 tokens, 256 from it). Not
+    # bit-identical: the sums are f32 in a different order, and in one pass
+    # each expert row is rounded to bf16 after its routing weight is applied.
     "TPU_MOE_PREFILL_SUM_IN_KERNEL_MAX_TOKENS": env_nonnegative_int(
         "TPU_MOE_PREFILL_SUM_IN_KERNEL_MAX_TOKENS", 0
     ),
