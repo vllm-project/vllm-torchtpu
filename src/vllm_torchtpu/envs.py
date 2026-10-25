@@ -191,6 +191,7 @@ if TYPE_CHECKING:
     TPU_SC_TOPK_DCP_MERGE_FLAT: bool = True
     TPU_SC_TOPK_COOP_V2: bool = True
     TPU_SC_TOPK_COOP_MERGE: bool = True
+    TPU_SC_TOPK_ONE_SUBCORE_CAPACITY: int = 0
     TPU_DCP_INDEXER_SMALL_AG: bool = True
     TPU_INDEXER_TOPK_SHARED_READ: bool = True
     TPU_SPARSE_MLA_CHUNK_TOKENS: int | None = None
@@ -1610,6 +1611,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # subcore walking all dcp * k scores; only the subcore holding this rank's
     # segment emits. T > 16 keeps the one-subcore merge. Bitwise identical.
     "TPU_SC_TOPK_COOP_MERGE": env_bool("TPU_SC_TOPK_COOP_MERGE", default=True),
+    # `sparsecore_topk` calls of 17 or more rows whose width splits every row
+    # over P > 1 subcores (n = 131,072 words per DCP8 rank at max-model-len
+    # 1M: P = 2) also carry the P = 1 kernel, whose subcores hold rows of up
+    # to this many words, and run it when no row of the call is longer. A
+    # multiple of 16, at most 65,536; 0 = off. GLM-5.2 DCP8, 4,096-token
+    # prefill: the TensorCore waits 1.13 ms per full-indexer layer for the
+    # P = 2 top-k, 98 us per 256-row call (47 us at P = 1). Bitwise identical.
+    "TPU_SC_TOPK_ONE_SUBCORE_CAPACITY": env_nonnegative_int(
+        "TPU_SC_TOPK_ONE_SUBCORE_CAPACITY", 0
+    ),
     # With TPU_SC_TOPK_DCP_MERGE_FLAT's flat path, buckets T <= 8
     # (streamindex_topk.SMALL_AG_MAX_TOKENS): the DCP
     # indexer's candidate all-gather (dcp x T * k int32 words) as one Pallas
