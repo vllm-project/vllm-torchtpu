@@ -825,8 +825,15 @@ class Qwen38SegmentDriver:
                     s = starts[i]
                     ids = segment_layers(self.g, s)
                     q = layers[i]
+
+                    def ok(tag, t):
+                        # Materialize `t` so an async failure names its stage.
+                        logger.info("qwen38 segxcheck seg%d stage %s ok: sum %.6g", s, tag, float(t.float().sum()))
+
+                    ok("in", h)
                     block, residual = q.attn_hyper_connection.mix(h)
                     att = q.self_attn.attend(block, pos64, meta)
+                    ok("attend", att)
                     w = [getattr(segs, f"w{s}_{j}") for j in range(segs.n_w[s])]
                     if s not in self.segx_audited:
                         self.segx_audited.add(s)
@@ -834,14 +841,19 @@ class Qwen38SegmentDriver:
                         ex = ExecSpec(R=R, B=segs.buckets[0], T=T_VERIFY, ctx=128, tiles=segment_tiles(segs.buckets[0]))
                         spec = qwen38.segment_spec(self.g, R, L=len(ids))
                         self._audit_operands(runner, w, _operand_names(spec, ex, len(ids)), spec, ex, ids, f"seg{s}", False)
-                    mk = self._mk_run(len(ids), False, w, h, att, self._snap(ids[1:], NS))
+                    snap = self._snap(ids[1:], NS)
+                    ok("snap", snap[0])
+                    mk = self._mk_run(len(ids), False, w, h, att, snap)
+                    ok("mk", mk)
                     snaps = [self._snap([j], NS) for j in ids[1:]]
+                    ok("snaps", snaps[0][0])
                     # Stock QSA layer on the same `att` (attention and its cache
                     # writes run once), staged like Qwen4ExpDecoderLayer.forward.
                     o = sp.reduce(q.self_attn.o_proj(att), False)
                     mixed2, residual2 = q.attn_hyper_connection.combine_mix(o, residual, q.mlp_hyper_connection)
                     mixed2 = torch.where(kw["valid_tokens"].to(torch.bool)[:, None], mixed2, 0)
                     st, ins = q.mlp_hyper_connection.combine(q.mlp(mixed2), residual2), [h]
+                    ok("stock-qsa", st)
                     for j in ids[1:]:
                         ins.append(st)
                         st = layers[j](st, *args)
