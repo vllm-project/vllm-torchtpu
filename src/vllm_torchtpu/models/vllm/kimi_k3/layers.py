@@ -192,26 +192,27 @@ class AttentionResidual(nn.Module):
         )
         if num_blocks == 0:
             return prefix_sum
-        if self._prefill_op is not None and prefix_sum.shape[0] % 8 == 0:
+        if (
+            self._prefill_op is not None
+            and prefix_sum.shape[0] >= 128
+            and prefix_sum.shape[0] % 8 == 0
+        ):
             return self._prefill_op(prefix_sum, block_residuals, self.folded_weight)
         w = self.folded_weight
         if prefix_sum.shape[0] == 1:
-            # With one token the per-slot statistics are scalars; keep a
-            # dedicated bucket-1 trace without concatenating [1, K, hidden].
-            v_blocks = block_residuals.reshape(-1, prefix_sum.shape[-1]).float()
-            v_prefix = prefix_sum.float()
-            inv_blocks = torch.rsqrt(v_blocks.pow(2).mean(-1) + self.eps)
-            inv_prefix = torch.rsqrt(v_prefix.pow(2).mean(-1) + self.eps)
-            scores = torch.cat(
+            # With one token the per-slot statistics below are scalars that
+            # XLA leaves unfused; reducing over the concatenated slots keeps
+            # them one vector. A shape branch, so bucket 1 gets its own trace.
+            values = torch.cat(
                 (
-                    (v_blocks * w).sum(-1) * inv_blocks,
-                    (v_prefix * w).sum(-1) * inv_prefix,
+                    block_residuals.reshape(-1, prefix_sum.shape[-1]),
+                    prefix_sum,
                 ),
                 dim=0,
-            )
-            probabilities = scores.softmax(dim=0)
-            out = (probabilities[:-1].unsqueeze(-1) * v_blocks).sum(dim=0, keepdim=True)
-            out = out + probabilities[-1] * v_prefix
+            ).float()  # [K, hidden]
+            inv = torch.rsqrt(values.pow(2).mean(-1) + self.eps)
+            probabilities = ((values * w).sum(-1) * inv).softmax(dim=0)
+            out = (probabilities.unsqueeze(-1) * values).sum(dim=0, keepdim=True)
             return out.to(block_residuals.dtype)
         if block_residuals.ndim == 2:
             tokens, hidden = prefix_sum.shape

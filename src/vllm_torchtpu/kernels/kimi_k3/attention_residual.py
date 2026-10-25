@@ -26,34 +26,41 @@ def _mix_kernel_2d(
     step_h: int,
 ):
     k = pl.program_id(1)
-    sq_k = jnp.zeros((tile_t, 128), jnp.float32)
-    dot_k = jnp.zeros((tile_t, 128), jnp.float32)
-    for c in range(0, hidden, step_h):
-        wc = w_ref[:, c : c + step_h]
-        hk = h_ref[:, c : c + step_h].astype(jnp.float32)
-        sq_k = sq_k + jnp.broadcast_to(
-            jnp.sum(hk * hk, axis=-1, keepdims=True), (tile_t, 128)
-        )
-        dot_k = dot_k + jnp.broadcast_to(
-            jnp.sum(hk * wc, axis=-1, keepdims=True), (tile_t, 128)
-        )
+    n_steps = hidden // step_h
+    zero_vec = jnp.zeros((tile_t, step_h), jnp.float32)
+
+    def body_k(i, carry):
+        sq_v, dot_v = carry
+        c = i * step_h
+        wc = w_ref[:, pl.ds(c, step_h)]
+        hk = h_ref[:, pl.ds(c, step_h)].astype(jnp.float32)
+        return sq_v + hk * hk, dot_v + hk * wc
+
+    sq_vec, dot_vec = jax.lax.fori_loop(0, n_steps, body_k, (zero_vec, zero_vec))
+    sq_k = jnp.broadcast_to(jnp.sum(sq_vec, axis=-1, keepdims=True), (tile_t, 128))
+    dot_k = jnp.broadcast_to(jnp.sum(dot_vec, axis=-1, keepdims=True), (tile_t, 128))
     inv_k = jax.lax.rsqrt(sq_k * (1.0 / hidden) + eps)
     sk = dot_k * inv_k
 
     @pl.when(k == 0)
     def init():
-        sq_p = jnp.zeros((tile_t, 128), jnp.float32)
-        dot_p = jnp.zeros((tile_t, 128), jnp.float32)
-        for c in range(0, hidden, step_h):
-            wc = w_ref[:, c : c + step_h]
-            pc = p_ref[:, c : c + step_h].astype(jnp.float32)
-            acc_scratch[:, c : c + step_h] = pc
-            sq_p = sq_p + jnp.broadcast_to(
-                jnp.sum(pc * pc, axis=-1, keepdims=True), (tile_t, 128)
-            )
-            dot_p = dot_p + jnp.broadcast_to(
-                jnp.sum(pc * wc, axis=-1, keepdims=True), (tile_t, 128)
-            )
+        def body_p(i, carry):
+            sq_v, dot_v = carry
+            c = i * step_h
+            wc = w_ref[:, pl.ds(c, step_h)]
+            pc = p_ref[:, pl.ds(c, step_h)].astype(jnp.float32)
+            acc_scratch[:, pl.ds(c, step_h)] = pc
+            return sq_v + pc * pc, dot_v + pc * wc
+
+        sq_p_vec, dot_p_vec = jax.lax.fori_loop(
+            0, n_steps, body_p, (zero_vec, zero_vec)
+        )
+        sq_p = jnp.broadcast_to(
+            jnp.sum(sq_p_vec, axis=-1, keepdims=True), (tile_t, 128)
+        )
+        dot_p = jnp.broadcast_to(
+            jnp.sum(dot_p_vec, axis=-1, keepdims=True), (tile_t, 128)
+        )
         inv_p = jax.lax.rsqrt(sq_p * (1.0 / hidden) + eps)
         m_scratch[...] = dot_p * inv_p
         d_scratch[...] = jnp.ones((tile_t, 128), jnp.float32)
@@ -68,19 +75,27 @@ def _mix_kernel_2d(
     d_scratch[...] = d_new
     so = scale_old[:, :1]
     sk1 = scale_k[:, :1]
-    for c in range(0, hidden, step_h):
-        hk = h_ref[:, c : c + step_h].astype(jnp.float32)
-        acc_scratch[:, c : c + step_h] = (
-            acc_scratch[:, c : c + step_h] * so + hk * sk1
-        )
+
+    def body_acc(i, _):
+        c = i * step_h
+        hk = h_ref[:, pl.ds(c, step_h)].astype(jnp.float32)
+        ac = acc_scratch[:, pl.ds(c, step_h)]
+        acc_scratch[:, pl.ds(c, step_h)] = ac * so + hk * sk1
+        return None
+
+    jax.lax.fori_loop(0, n_steps, body_acc, None)
 
     @pl.when(k == blocks - 1)
     def finalize():
         inv_d = 1.0 / d_scratch[:, :1]
-        for c in range(0, hidden, step_h):
-            out_ref[:, c : c + step_h] = (
-                acc_scratch[:, c : c + step_h] * inv_d
-            ).astype(out_ref.dtype)
+
+        def body_fin(i, _):
+            c = i * step_h
+            ac = acc_scratch[:, pl.ds(c, step_h)]
+            out_ref[:, pl.ds(c, step_h)] = (ac * inv_d).astype(out_ref.dtype)
+            return None
+
+        jax.lax.fori_loop(0, n_steps, body_fin, None)
 
 
 def _mix_kernel_3d(
@@ -95,18 +110,30 @@ def _mix_kernel_3d(
     hidden: int,
     step_h: int,
 ):
-    sq_p = jnp.zeros((tile_t, 1), jnp.float32)
-    dot_p = jnp.zeros((tile_t, 1), jnp.float32)
-    sq_h = jnp.zeros((tile_t, blocks), jnp.float32)
-    dot_h = jnp.zeros((tile_t, blocks), jnp.float32)
-    for c in range(0, hidden, step_h):
-        wc = w_ref[c : c + step_h].astype(jnp.float32)
-        pc = p_ref[:, c : c + step_h].astype(jnp.float32)
-        hc = h_ref[:, :, c : c + step_h].astype(jnp.float32)
-        sq_p = sq_p + jnp.sum(pc * pc, axis=-1, keepdims=True)
-        dot_p = dot_p + jnp.sum(pc * wc, axis=-1, keepdims=True)
-        sq_h = sq_h + jnp.sum(hc * hc, axis=-1)
-        dot_h = dot_h + jnp.sum(hc * wc, axis=-1)
+    n_steps = hidden // step_h
+    zero_p = jnp.zeros((tile_t, step_h), jnp.float32)
+    zero_h = jnp.zeros((tile_t, blocks, step_h), jnp.float32)
+
+    def body_stat(i, carry):
+        sq_p, dot_p, sq_h, dot_h = carry
+        c = i * step_h
+        wc = w_ref[pl.ds(c, step_h)].astype(jnp.float32)
+        pc = p_ref[:, pl.ds(c, step_h)].astype(jnp.float32)
+        hc = h_ref[:, :, pl.ds(c, step_h)].astype(jnp.float32)
+        return (
+            sq_p + pc * pc,
+            dot_p + pc * wc,
+            sq_h + hc * hc,
+            dot_h + hc * wc,
+        )
+
+    sq_p_v, dot_p_v, sq_h_v, dot_h_v = jax.lax.fori_loop(
+        0, n_steps, body_stat, (zero_p, zero_p, zero_h, zero_h)
+    )
+    sq_p = jnp.sum(sq_p_v, axis=-1, keepdims=True)
+    dot_p = jnp.sum(dot_p_v, axis=-1, keepdims=True)
+    sq_h = jnp.sum(sq_h_v, axis=-1)
+    dot_h = jnp.sum(dot_h_v, axis=-1)
     inv_p = jax.lax.rsqrt(sq_p * (1.0 / hidden) + eps)
     inv_h = jax.lax.rsqrt(sq_h * (1.0 / hidden) + eps)
     sp = dot_p * inv_p
@@ -117,11 +144,16 @@ def _mix_kernel_3d(
     inv_d = 1.0 / (jnp.sum(eh, axis=-1, keepdims=True) + ep)
     prob_h = (eh * inv_d)[:, :, None]
     prob_p = ep * inv_d
-    for c in range(0, hidden, step_h):
-        pc = p_ref[:, c : c + step_h].astype(jnp.float32)
-        hc = h_ref[:, :, c : c + step_h].astype(jnp.float32)
+
+    def body_mix(i, _):
+        c = i * step_h
+        pc = p_ref[:, pl.ds(c, step_h)].astype(jnp.float32)
+        hc = h_ref[:, :, pl.ds(c, step_h)].astype(jnp.float32)
         acc = jnp.sum(hc * prob_h, axis=1) + pc * prob_p
-        out_ref[:, c : c + step_h] = acc.astype(out_ref.dtype)
+        out_ref[:, pl.ds(c, step_h)] = acc.astype(out_ref.dtype)
+        return None
+
+    jax.lax.fori_loop(0, n_steps, body_mix, None)
 
 
 def attention_residual(prefix, history, folded_weight, *, eps=1e-5, interpret=False):
@@ -145,9 +177,18 @@ def attention_residual(prefix, history, folded_weight, *, eps=1e-5, interpret=Fa
             return prefix
         if tokens % 8:
             raise ValueError("Fused Attention Residual requires 8-token tiles")
-        tile_t = 8 if tokens % 16 else 16
+        if tokens % 64 == 0:
+            tile_t, target_step_h = 64, 128
+        elif tokens % 32 == 0:
+            tile_t, target_step_h = 32, 256
+        elif tokens % 16 == 0:
+            tile_t, target_step_h = 16, 512
+        else:
+            tile_t, target_step_h = 8, 512
         tiles_t = tokens // tile_t
-        step_h = next(s for s in (512, 256, 128) if hidden % s == 0)
+        step_h = next(
+            s for s in (target_step_h, 512, 256, 128) if hidden % s == 0 and s <= hidden
+        )
         w_2d = jax.lax.broadcast_in_dim(
             folded_weight.astype(jnp.float32), (tile_t, hidden), (1,)
         )

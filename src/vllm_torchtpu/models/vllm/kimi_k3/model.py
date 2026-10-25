@@ -285,7 +285,9 @@ class KimiModel(nn.Module):
                 len(self.layers) + self.attn_res_block_size - 1
             ) // self.attn_res_block_size
             block_residuals = (
-                hidden_states.unsqueeze(0).expand(num_res_blocks, -1, -1).clone()
+                torch.empty_like(
+                    hidden_states.unsqueeze(0).expand(num_res_blocks, -1, -1)
+                )
                 if num_res_blocks > 0
                 else hidden_states[:0, :]
             )
