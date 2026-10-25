@@ -99,6 +99,9 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+_STATS_EVERY = 1000
+
+
 def _enqueue_pool_writes(pool_tensors: list[torch.Tensor]) -> None:
     """Asynchronously dispatches graph execution for KV pool buffers without blocking.
 
@@ -278,6 +281,13 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             new_fence_ids.add(job_id)
             self._cold_stats["promoted"] += 1
 
+    def _bump(self, key: str, n: int) -> None:
+        """Block counts since start, logged every _STATS_EVERY steps: stores
+        parked for the fence, submitted, cancelled before launch because their
+        source blocks were reused, drained on reuse; loads submitted, failed."""
+        stats = self.__dict__.setdefault("_stats", {})
+        stats[key] = stats.get(key, 0) + n
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
@@ -311,6 +321,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 continue
             self._fence_pending[job_id] = parked
             new_fence_ids.add(job_id)
+            self._bump("parked", len(device_block_ids))
 
         # Submit load jobs immediately: destination HBM blocks are freshly
         # allocated and safe to write into.
@@ -330,6 +341,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 job.req_id,
                 pinned=src_spec.pinned,
             )
+            self._bump("loaded", len(device_block_ids))
 
         # Handle jobs_to_flush (source blocks are about to be recycled):
         # - Cancel fence-pending stores before they start.
@@ -349,6 +361,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             if parked is not None:
                 manager.on_store_job_cancelled(parked.keys)
                 finished_store_ids.append(job_id)
+                self._bump("cancelled", len(parked.keys))
                 # Avoid useless TPU sync if created and cancelled in the same step.
                 new_fence_ids.discard(job_id)
                 logger.debug(
@@ -359,14 +372,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             elif manager.is_job_launched(job_id):
                 launched_flush_ids.add(job_id)
         drained = manager.drain_jobs(launched_flush_ids) if launched_flush_ids else []
+        self._bump("drained", len(launched_flush_ids))
         if self._cold_pending and self._cold_enabled():
             self._promote_cold(new_fence_ids, finished_store_ids)
-        if self._cold_stats["parked"] and self._cold_stats["parked"] % 1000 == 0:
-            logger.info(
-                "Raiden store-on-evict: %s, %d jobs parked now",
-                " ".join(f"{k}={v}" for k, v in self._cold_stats.items()),
-                len(self._cold_pending),
-            )
 
         # Collect completed/drained jobs for the worker echo channel.
         for finished_job in list(drained) + manager.poll_finished_jobs():
@@ -376,6 +384,18 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 assert finished_job.req_id is not None
                 finished_loads[finished_job.job_id] = finished_job.req_id
                 failed_load_block_ids.extend(finished_job.failed_device_block_ids)
+                self._bump("load_failed", len(finished_job.failed_device_block_ids))
+
+        self._bump("steps", 1)
+        stats = self.__dict__["_stats"]
+        if stats["steps"] % _STATS_EVERY == 0:
+            logger.info(
+                "TPURaidenOffloadingConnector stats (blocks): %s | store-on-evict "
+                "jobs: %s parked_now=%d",
+                " ".join(f"{k}={v}" for k, v in stats.items()),
+                " ".join(f"{k}={v}" for k, v in self._cold_stats.items()),
+                len(self._cold_pending),
+            )
 
         # Return empty load_jobs/store_jobs: workers act as passive DMA endpoints.
         return RaidenOffloadingConnectorMetadata(
@@ -404,6 +424,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                     self._raiden_manager.submit_store_job(
                         job_id, parked.keys, parked.device_block_ids
                     )
+                    self._bump("submitted", len(parked.keys))
         super().update_connector_output(connector_output)
 
 
