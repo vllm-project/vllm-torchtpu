@@ -67,7 +67,11 @@ def scatter_gdn_ckpts_fast(
     """Same contract as `scatter_gdn_ckpts` (per-rank arrays); returns the pool.
 
     `ring` staging slots: checkpoint `i + 1` is loaded while `i` is converted,
-    and up to `ring` pool writes are in flight.
+    and up to `ring` pool writes are in flight. Checkpoints addressed to the
+    null block 0 (rows with no request, every row of a shadow call) are not
+    written, as the stock pooled GDN kernel moves no bytes for padded rows:
+    the null block's pages are also read (masked) as KV, and f32 state bytes
+    there would carry FP8 NaN encodings.
     """
     RING_ = ring
     NL, NS, T = write_blocks.shape
@@ -115,9 +119,11 @@ def scatter_gdn_ckpts_fast(
 
             # Slot `nslot` is reused by checkpoint i + 1: its write from
             # i + 1 - RING must have landed before the prefetch overwrites it.
-            @pl.when(i + 1 >= RING_)
+            prev = ids_ref[jnp.maximum(i + 1 - RING_, 0)]
+
+            @pl.when((i + 1 >= RING_) & (prev != 0))
             def _():
-                for c in out_copies(nslot, ids_ref[jnp.maximum(i + 1 - RING_, 0)]):
+                for c in out_copies(nslot, prev):
                     c.wait()
 
             @pl.when(i + 1 < n)
@@ -139,16 +145,23 @@ def scatter_gdn_ckpts_fast(
                 axis=0,
             )
             _store_typed(cout.at[slot], crow, interpret)
-            for c in out_copies(slot, ids_ref[i]):
-                c.start()
+
+            @pl.when(ids_ref[i] != 0)
+            def _():
+                for c in out_copies(slot, ids_ref[i]):
+                    c.start()
+
             return carry
 
         lax.fori_loop(0, n, body, 0)
         # Writes not yet waited on: the last RING - 1 checkpoints (the loop waits
         # for i + 1 - RING when it reuses a slot).
         for k in range(max(0, n - RING_ + 1), n):
-            for c in out_copies(k % RING_, ids_ref[k]):
-                c.wait()
+
+            @pl.when(ids_ref[k] != 0)
+            def _():
+                for c in out_copies(k % RING_, ids_ref[k]):
+                    c.wait()
 
     any_ = pltpu.HBM
     return pl.pallas_call(
