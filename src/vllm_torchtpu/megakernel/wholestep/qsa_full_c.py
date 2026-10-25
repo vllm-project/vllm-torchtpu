@@ -39,12 +39,11 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ..blocks.qsa_attn.block import MICRO, _unpack_kv
+from ..blocks.qsa_attn.block import MICRO, _unpack_kv, attend_row
 from ..exec_spec import ExecSpec
 from ..ops import BF16, F32, I32, rnd, rmsnorm
 from ..spec import ExtraInput, ScratchReq, SmallField, StateDecl
 from . import indexer as ix
-from .attend import attend_row_mapped
 from .qsa_full import OFFSET, POOL, ROPE, SCALES
 from .qsa_full_b import CK, IDX_N, IDX_W, MTAB, NVIS, TAIL, QSAFullIndexedBlock
 
@@ -58,8 +57,13 @@ FP8_MAX = 448.0
 
 def quant_fp8(x: jax.Array, scale: Any) -> jax.Array:
     """Stock cache write: `clip(x / scale, +-448) -> e4m3`, read back as f32 `* scale`."""
-    q = jnp.clip(x / scale, -FP8_MAX, FP8_MAX).astype(jnp.float8_e4m3fn)
-    return q.astype(F32) * scale
+    return pool_units(x, scale) * scale
+
+
+def pool_units(x: jax.Array, scale: Any) -> jax.Array:
+    """The FP8 value the stock write would store (`clip(x / scale) -> e4m3`), as f32: the units
+    `attend_row` reads pool tiles in (it applies the scales itself)."""
+    return jnp.clip(x / scale, -FP8_MAX, FP8_MAX).astype(jnp.float8_e4m3fn).astype(F32)
 
 
 def pick_row(rows: jax.Array, idx: Any) -> jax.Array:
@@ -152,8 +156,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         return ck, p3 // 4
 
     def _recent_tile(self, ctx: Any, l: Any, q: int) -> None:
-        """K / V of the 8 positions from `4 (ctx // 4)`: old members from the pool, the step's
-        tokens FP8-quantised from `qf_kv` (stock write-then-read)."""
+        """K / V of the 8 positions from `4 (ctx // 4)` in pool units (FP8 values, unscaled, as
+        `attend_row`'s `recent` expects): old members from the pool, the step's tokens
+        FP8-quantised from `qf_kv` (stock write-then-read)."""
         ex, scr, T = ctx.ex, ctx.scr, ctx.ex.T
         c0 = ctx.extra[CTXQ][q]
         ga = c0 // 4
@@ -171,10 +176,10 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         sk, sv = ctx.extra[SCALES][0], ctx.extra[SCALES][1]
         k8, v8 = _unpack_kv(scr["qc_old"], self.offset(ctx, l), ex.interpret)
         pad = jnp.zeros((4, 256), F32)
-        k_old = jnp.concatenate([k8.astype(F32) * sk, pad], axis=0)
-        v_old = jnp.concatenate([v8.astype(F32) * sv, pad], axis=0)
+        k_old = jnp.concatenate([k8.astype(F32), pad], axis=0)
+        v_old = jnp.concatenate([v8.astype(F32), pad], axis=0)
         kv = scr["qf_kv"][q * T : (q + 1) * T].astype(F32)
-        k_cur, v_cur = quant_fp8(kv[:, :256], sk), quant_fp8(kv[:, 256:], sv)
+        k_cur, v_cur = pool_units(kv[:, :256], sk), pool_units(kv[:, 256:], sv)
         pos = 4 * ga + jax.lax.broadcasted_iota(I32, (8, 1), 0)
         k_t = jnp.where(pos < c0, k_old, 0.0)
         v_t = jnp.where(pos < c0, v_old, 0.0)
@@ -306,7 +311,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 full = (grp == ga) & (ga < n_r) & (scr["qc_sga"][r] > 0)
                 return live & (pos <= p_r) & (part | full)
 
-            out, g0, pre = attend_row_mapped(
+            out, g0, pre = attend_row(
                 r, g0, pre, nrows=ex.MB, pool=ctx.extra[POOL], ring=scr["qf_ring"],
                 sems=scr["qf_ring_sem"], pages=scr["qi_ids"], kv_len=scr["qi_kvl"],
                 table=ctx.extra[MTAB], rows_per_req=T, table_row_base=self.row_base(ctx, l),

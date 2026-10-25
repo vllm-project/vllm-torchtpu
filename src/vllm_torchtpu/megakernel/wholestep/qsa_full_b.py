@@ -19,7 +19,7 @@ Per QSA layer, after the stage-A projection:
   scores  = per request: its compressed keys DMA'd into VMEM, `score_rows` on the MXU
   ids     = exact top-K per row (`indexer.thresholds` + `compact_row`), lane-major -> SMEM
   pages   = ids + the row's partial group (if `len % 4`), kv_len = 4 min(n_vis, K) + len % 4
-  attn    = `attend_row_mapped` (group ids -> pool micro-pages via the main table at DMA issue)
+  attn    = `attend_row(table=...)` (group ids -> pool micro-pages via the main table at DMA issue)
 
 Rows are grouped by request, `ex.T` verify rows each (MTP verify). Prototype key layout:
 `qsa_ck [requests, max_groups, 128]` BF16, contiguous per request (the served cache is paged;
@@ -35,11 +35,11 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from ..blocks.qsa_attn.block import attend_row
 from ..exec_spec import ExecSpec
 from ..ops import BF16, F32, I32, rnd
 from ..spec import ExtraInput, ScratchReq, SmallField, StateDecl, WeightDecl
 from . import indexer as ix
-from .attend import attend_row_mapped
 from .qsa_full import OFFSET, POOL, ROPE, SCALES, QSAFullBlock
 
 CK = "qsa_ck"
@@ -322,7 +322,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
 
         def row(r: Any, carry: Any) -> Any:
             *outs, g0, pre = carry
-            out, g0, pre = attend_row_mapped(
+            out, g0, pre = attend_row(
                 r,
                 g0,
                 pre,
