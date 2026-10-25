@@ -647,8 +647,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         """Cache BF16 KDA input weights after the normal checkpoint loaders."""
         self.packed_prefill_weight = None
         if not (
-            isinstance(getattr(self, "prefill_group", None), FusedPrefillCollectives)
-            and self.use_full_rank_gate
+            getattr(self, "use_full_rank_gate", False)
             and self.num_heads == 3
             and self.head_dim == 128
         ):
@@ -698,10 +697,10 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             if sequence_parallel:
                 hidden_states = group.all_gather(hidden_states, dim=0)
             projected, _ = self.fused_qkvb_proj(hidden_states)
-            query, key, value, beta = projected.split(
-                [self.local_projection_size] * 3 + [self.num_heads], dim=-1
+            mixed_qkv, beta = projected.split(
+                [3 * self.local_projection_size, self.num_heads], dim=-1
             )
-            mixed_qkv = torch.cat((query, key, value), dim=-1)
+            query = mixed_qkv[:, : self.local_projection_size]
             if self.use_full_rank_gate:
                 assert self.f_a_proj is not None
                 f_a, _ = self.f_a_proj(hidden_states)

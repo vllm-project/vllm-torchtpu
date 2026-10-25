@@ -512,6 +512,85 @@ def build_kimi_dispatched_kda_op(
     return dispatched_impl
 
 
+def _kda_v3_state_source(
+    pool: jax.Array,
+    *,
+    split: int,
+    ssm_ntok: int,
+    conv_tok0: int,
+    conv_ntok: int,
+    conv_dim: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    kernel_size: int,
+) -> gdn_config.StateSourcePlan:
+    """Build a GDN v3 `StateSourcePlan` for KDA on an MLA or GQA unified pool.
+
+    Unlike GQA pools where `conv_dim % lanes == 0` (`lane_split == 1`),
+    Kimi-K3's MLA pool has `lanes = 640` (`5 * 128`) and at `TP=32`
+    `conv_dim = 1152` (`9 * 128`). Splitting the conv region's lanes by
+    `gcd(lanes, conv_dim) = 128` (`lane_split = 5`) lets `typed_ldst` view the
+    VMEM tile as `(-1, 128)` so the leading `(K - 1) * conv_dim // 128` rows
+    map byte-for-byte to the flat conv state in HBM, with zero external
+    gather/scatter Pallas launches.
+    """
+    block_size = pool.shape[1]
+    payload = tuple(pool.shape[2:-1])
+    lanes = pool.shape[-1]
+    elem_bytes = jnp.dtype(pool.dtype).itemsize
+    tok_bytes = math.prod(payload) * lanes * elem_bytes
+
+    ssm_rows = n_v * d_k
+    ssm_elements = ssm_rows * d_v
+    assert ssm_ntok * tok_bytes >= ssm_elements * 4
+    if ssm_ntok % block_size == 0:
+        ssm_nblocks, ssm_nrows = ssm_ntok // block_size, block_size
+    else:
+        assert ssm_ntok < block_size
+        ssm_nblocks, ssm_nrows = 1, ssm_ntok
+    assert lanes % d_v == 0, (lanes, d_v)
+    ssm_lane_split = lanes // d_v
+    ssm_rows_used = ssm_elements // d_v
+
+    ssm = gdn_config.StateRegion(
+        kb0=0,
+        nblocks=ssm_nblocks,
+        row0=0,
+        nrows=ssm_nrows,
+        view_dtype=jnp.dtype(jnp.float32),
+        lane_split=ssm_lane_split,
+        rows_used=ssm_rows_used,
+    )
+
+    kb0, row0 = divmod(conv_tok0, block_size)
+    assert row0 + conv_ntok <= block_size
+    assert conv_tok0 + conv_ntok <= split * block_size
+    conv_out_lanes = math.gcd(lanes, conv_dim)
+    assert conv_out_lanes > 0 and lanes % conv_out_lanes == 0
+    conv_lane_split = lanes // conv_out_lanes
+    assert (kernel_size - 1) * conv_dim % conv_out_lanes == 0
+    conv_rows = (kernel_size - 1) * conv_dim // conv_out_lanes
+    assert conv_rows * elem_bytes * conv_out_lanes <= conv_ntok * tok_bytes
+
+    conv = gdn_config.StateRegion(
+        kb0=kb0,
+        nblocks=1,
+        row0=row0,
+        nrows=conv_ntok,
+        view_dtype=jnp.dtype(pool.dtype),
+        lane_split=conv_lane_split,
+        rows_used=conv_rows,
+        rows_perm=None,
+    )
+    return gdn_config.StateSourcePlan(
+        stride=split,
+        conv=conv,
+        recurrent=ssm,
+        whole_block_dma=pool_adapters.is_seq_along_lane_pool(),
+    )
+
+
 def _pooled_kda_core(
     mixed_qkv: jax.Array,
     raw_gate: jax.Array,
@@ -571,8 +650,115 @@ def _pooled_kda_core(
             f"{layout.required_tokens} > {manager_rows}"
         )
 
-    # SSM region [0, ssm_tokens): f32 view with one head_dim-wide lane group
-    # per typed row, so the leading H * D rows are exactly the state.
+    # Stage-3 stores whole, padded prefill-head shards in rank order. Each
+    # shard keeps the source's BF16 lane packing, so Raiden can concatenate
+    # aligned byte ranges without half-word scatter/gather. Restore logical
+    # (taps, qkv, heads, dim) order in the existing pooled adapter, just as
+    # Qwen's pair-blocked layout does. Ordinary serving has one shard and
+    # streams both states directly between the pool and the fused GDN v3
+    # double-buffered pipeline via `v3_state_source` (zero external
+    # gather/scatter Pallas launches or HBM copies).
+    shard_heads = num_heads if conv_shard_heads is None else conv_shard_heads
+    if shard_heads <= 0 or num_heads % shard_heads:
+        raise ValueError("KDA conv layout requires whole source head shards")
+    conv_shards = num_heads // shard_heads
+    if layout.conv_tokens % conv_shards:
+        raise ValueError("KDA conv shards must occupy whole packed pool rows")
+    shard_elems = (kernel_size - 1) * 3 * shard_heads * head_dim
+    padded_shard_elems = layout.conv_tokens // conv_shards * tok_bytes // elem_bytes
+    if shard_elems > padded_shard_elems:
+        raise ValueError("KDA conv shard exceeds its padded pool region")
+
+    conv_dim = 3 * num_heads * head_dim
+    lanes = pool.shape[-1]
+    ssm_elem_ratio = 4 // elem_bytes if elem_bytes in (1, 2, 4) else 0
+    ssm_bitcast_dim = pool.shape[-2] if pool.ndim > 3 else layout.ssm_tokens
+    if (
+        conv_shards == 1
+        and ssm_elem_ratio > 0
+        and ssm_bitcast_dim % ssm_elem_ratio == 0
+        and lanes % head_dim == 0
+        and (layout.ssm_tokens % pool.shape[1] == 0 or layout.ssm_tokens < pool.shape[1])
+        and (layout.ssm_tokens % pool.shape[1]) + layout.conv_tokens <= pool.shape[1]
+    ):
+        num_tokens = mixed_qkv.shape[0]
+        if mixed_qkv.shape != (num_tokens, conv_dim):
+            raise ValueError("Incompatible KDA activation and state shapes")
+        if raw_gate.shape != (num_tokens, num_heads * head_dim):
+            raise ValueError("Incompatible KDA gate shape")
+        if beta.shape != (num_tokens, num_heads):
+            raise ValueError("Incompatible KDA beta shape")
+        if output_gate.shape != (num_tokens, num_heads * head_dim):
+            raise ValueError("Incompatible KDA output-gate shape")
+        if dt_bias.shape != (num_heads * head_dim,):
+            raise ValueError("KDA dt_bias shape does not match the projection")
+        if query_start_loc.shape != (num_reqs + 1,):
+            raise ValueError("KDA query starts and state indices disagree")
+        if seq_lens.shape != (num_reqs,):
+            raise ValueError("KDA sequence lengths and state indices disagree")
+        if (
+            raw_gate.dtype != mixed_qkv.dtype
+            or beta.dtype != mixed_qkv.dtype
+            or output_gate.dtype != mixed_qkv.dtype
+        ):
+            raise TypeError("KDA activations must have one common dtype")
+        if a_log.dtype != jnp.float32 or dt_bias.dtype != jnp.float32:
+            raise TypeError("KDA A_log and dt_bias must be float32")
+        if (
+            query_start_loc.dtype != jnp.int32
+            or state_indices.dtype != jnp.int32
+            or seq_lens.dtype != jnp.int32
+        ):
+            raise TypeError("KDA metadata tensors must be int32")
+
+        plan = _kda_v3_state_source(
+            pool,
+            split=split,
+            ssm_ntok=layout.ssm_tokens,
+            conv_tok0=layout.ssm_tokens,
+            conv_ntok=layout.conv_tokens,
+            conv_dim=conv_dim,
+            n_v=num_heads,
+            d_k=head_dim,
+            d_v=head_dim,
+            kernel_size=kernel_size,
+        )
+        conv_weight_flat = jnp.transpose(
+            conv_weight.reshape(kernel_size, -1), (1, 0)
+        )[:, None]
+        pool, out = gdn_wrapper.fused_conv1d_gdn(
+            qkv=mixed_qkv,
+            b=beta,
+            a=raw_gate,
+            conv_state=None,
+            recurrent_state=None,
+            conv_weight=conv_weight_flat,
+            conv_bias=None,
+            a_log=a_log,
+            dt_bias=dt_bias.reshape(num_heads, head_dim),
+            query_start_loc=query_start_loc,
+            state_indices=state_indices,
+            distribution=distribution,
+            seq_lens=seq_lens,
+            read_offsets=None,
+            n_kq=num_heads,
+            n_v=num_heads,
+            d_k=head_dim,
+            d_v=head_dim,
+            kernel_size=kernel_size,
+            attention_mode=gdn_config.AttentionMode.KDA,
+            gate_lower_bound=lower_bound,
+            state_source=pool,
+            state_plan=plan,
+        )
+        output = out.reshape(num_tokens, num_heads, head_dim)
+        output = _gated_output_norm(
+            output, output_gate, norm_weight, eps, mixed_qkv.dtype
+        )
+        return output, pool
+
+    # Fallback path (e.g. Raiden PD conv_shards > 1 or split kernel blocks
+    # smaller than ssm_tokens): gather, run fused core, scatter.
     ssm_gathered = pool_adapters.gather_region(
         pool,
         state_indices,
@@ -586,22 +772,6 @@ def _pooled_kda_core(
     ssm_local = ssm_gathered[:, :ssm_rows, :].reshape(
         num_reqs, num_heads, head_dim, head_dim
     )
-
-    # Stage-3 stores whole, padded prefill-head shards in rank order. Each
-    # shard keeps the source's BF16 lane packing, so Raiden can concatenate
-    # aligned byte ranges without half-word scatter/gather. Restore logical
-    # (taps, qkv, heads, dim) order in the existing pooled adapter, just as
-    # Qwen's pair-blocked layout does. Ordinary serving has one shard.
-    shard_heads = num_heads if conv_shard_heads is None else conv_shard_heads
-    if shard_heads <= 0 or num_heads % shard_heads:
-        raise ValueError("KDA conv layout requires whole source head shards")
-    conv_shards = num_heads // shard_heads
-    if layout.conv_tokens % conv_shards:
-        raise ValueError("KDA conv shards must occupy whole packed pool rows")
-    shard_elems = (kernel_size - 1) * 3 * shard_heads * head_dim
-    padded_shard_elems = layout.conv_tokens // conv_shards * tok_bytes // elem_bytes
-    if shard_elems > padded_shard_elems:
-        raise ValueError("KDA conv shard exceeds its padded pool region")
     conv_gathered = pool_adapters.gather_region(
         pool,
         state_indices,

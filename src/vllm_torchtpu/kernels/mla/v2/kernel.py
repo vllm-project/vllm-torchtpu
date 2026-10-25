@@ -2163,6 +2163,8 @@ def prepare_q_nope_inputs(
     # Align T to sublane_multiple (i.e. dtype_packing * 8).
     # This is needed for xpose_pipeline to work efficiently.
     sublane_multiple = get_dtype_packing(q.dtype) * 8
+    if num_q_heads < sublane_multiple:
+        return prepare_q_inputs(jnp.transpose(q, (1, 0, 2)))
     max_num_tokens = align_to(actual_max_num_tokens, sublane_multiple)
     q = jnp.pad(
         q,
@@ -2234,6 +2236,12 @@ def prepare_outputs(
     actual_head_dim: int,
     vmem_limit_bytes: int | None = None,
 ):
+    sublane_multiple = get_dtype_packing(out.dtype) * 8
+    if out.shape[1] < sublane_multiple:
+        return jnp.transpose(
+            out[:actual_max_num_tokens, :actual_num_q_heads, :actual_head_dim],
+            (1, 0, 2),
+        )
     # Physical transpose: (T, N, D) -> (N, T, D), pipelined over T.
     try:
         # Tile to maximum of 160 (multi host bsz)

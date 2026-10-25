@@ -122,11 +122,15 @@ def load_state_region(
     """
     parts = [
         typed_ldst.load_typed(
-            slot_ref.at[j], view_dtype=region.view_dtype, lane_split=region.lane_split
+            slot_ref.at[j],
+            view_dtype=region.view_dtype,
+            lane_split=1 if region.nrows % 8 != 0 else region.lane_split,
         )
         for j in range(region.nblocks)
     ]
     arr = parts[0] if region.nblocks == 1 else jnp.concat(parts, axis=0)
+    if region.nrows % 8 != 0 and region.lane_split > 1:
+        arr = arr.reshape(-1, arr.shape[-1] // region.lane_split)
     arr = arr[: region.rows_used]
     # When a bfloat16 state uses a uint32 VMEM view (2 bf16 elements per
     # uint32 word), unpack back to bfloat16 before reshaping to `shape`.
@@ -166,11 +170,16 @@ def store_state_region(
     if region.rows_used < capacity:
         arr = jnp.pad(arr, ((0, capacity - region.rows_used), (0, 0)))
     for j in range(region.nblocks):
-        typed_ldst.store_typed(
-            slot_ref.at[j],
-            arr[j * rows_pb : (j + 1) * rows_pb],
-            lane_split=region.lane_split,
-        )
+        block_arr = arr[j * rows_pb : (j + 1) * rows_pb]
+        if region.nrows % 8 != 0 and region.lane_split > 1:
+            block_arr = block_arr.reshape(-1, out_lanes * region.lane_split)
+            typed_ldst.store_typed(slot_ref.at[j], block_arr, lane_split=1)
+        else:
+            typed_ldst.store_typed(
+                slot_ref.at[j],
+                block_arr,
+                lane_split=region.lane_split,
+            )
 
 
 def _load_conv_state(slot_ref: jax.Ref, cfg: config.GDNConfig, idx: int) -> jax.Array:
