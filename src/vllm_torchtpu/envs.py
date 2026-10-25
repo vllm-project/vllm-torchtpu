@@ -119,6 +119,7 @@ if TYPE_CHECKING:
     TPU_MOE_TP_DECODE_FAST: bool = True
     TPU_MOE_TP_DECODE_SPLIT_META: bool = True
     TPU_MOE_TP_DECODE_SHARED_META: bool = True
+    TPU_MOE_TP_DECODE_AG_PAIRS: int = 0
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -1233,6 +1234,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     )
     .strip()
     .lower(),
+    # moe_tp_decode: the in-kernel all-reduce's trim and full paths that
+    # exchange at least this many rows all-gather by chip pairs (0 = off; the
+    # fold path stays flat). Each rank sends its summed chunk to the ranks of
+    # its parity on the other chips and to its chip-mate, and forwards every
+    # chunk from its parity to its chip-mate, so a chunk crosses ICI once per
+    # chip instead of once per core: half the all-gather's ICI bytes for one
+    # on-chip copy latency. The reduce-scatter and its f32 sum are unchanged
+    # and the same bytes land in the same places, so the output bits are the
+    # same. Needs mesh indices 2i and 2i + 1 on one chip (checked at arming).
+    # Kernel names gain -pairs_<rows>.
+    "TPU_MOE_TP_DECODE_AG_PAIRS": env_nonnegative_int("TPU_MOE_TP_DECODE_AG_PAIRS", 0),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.

@@ -24,6 +24,16 @@ tile_rows < m):
   trim  above the fold range, n_valid <= tile_rows: rows [0, tile_rows) only.
   full  otherwise: all m rows.
 
+Chip pairs (spec.pair_rows): a trim or full path that exchanges at least
+pair_rows rows all-gathers by chip pairs (_exchange_pairs). Mesh indices 2i
+and 2i + 1 must be the two cores of one chip (check_chip_pairs). Rank r sends
+its sum to the n / 2 - 1 ranks of its parity, one per other chip, and to its
+chip-mate r ^ 1, and forwards each chunk from its parity to its chip-mate once
+it lands, so a chunk crosses ICI once per chip instead of once per rank. The
+reduce-scatter and the sum are unchanged and the all-gather copies the same
+bytes to the same places, so the output bits are the same. The fold path
+stays flat.
+
 n_valid must be the same on every rank (one replicated value). The barrier
 semaphore gets one signal from every rank at entry and is waited for n
 signals before each path's first remote copy, so every peer's buffers are
@@ -82,6 +92,7 @@ class AllReduceSpec:
     h: int
     tile_rows: int  # bf16 sublane tiling
     lanes: int
+    pair_rows: int = 0  # 0, tile_rows or m: fewest rows gathered by chip pairs
 
     @property
     def chunk(self) -> int:
@@ -99,8 +110,15 @@ class AllReduceSpec:
     def fold(self) -> bool:
         return self.lane_groups >= 2 and self.fold_rows >= 1
 
+    def pairs(self, rows: int) -> bool:
+        """Whether a trim or full path exchanging `rows` rows gathers by chip
+        pairs."""
+        return 0 < self.pair_rows <= rows
 
-def make_spec(n: int, m: int, h: int) -> AllReduceSpec:
+
+def make_spec(n: int, m: int, h: int, pair_rows: int = 0) -> AllReduceSpec:
+    """pair_rows: the trim and full paths that exchange at least this many
+    rows all-gather by chip pairs (0: none)."""
     info = pltpu.get_tpu_info()
     if not supported(n, m, h, info):
         raise ValueError(
@@ -108,11 +126,43 @@ def make_spec(n: int, m: int, h: int) -> AllReduceSpec:
             f"multiple of {info.num_lanes} lanes and m a multiple of "
             f"{info.get_sublane_tiling(BF16)} rows"
         )
-    return AllReduceSpec(n, m, h, info.get_sublane_tiling(BF16), info.num_lanes)
+    tile_rows = info.get_sublane_tiling(BF16)
+    if not 0 < pair_rows <= m:
+        pair_rows = 0
+    elif n % 2:
+        raise ValueError(f"the chip-pair all-gather needs an even n, not {n}")
+    else:
+        pair_rows = tile_rows if pair_rows <= tile_rows else m
+    return AllReduceSpec(n, m, h, tile_rows, info.num_lanes, pair_rows)
 
 
 def kernel_name(spec: AllReduceSpec) -> str:
-    return f"moe_tp_decode_all_reduce-m_{spec.m}-h_{spec.h}-n_{spec.n}"
+    name = f"moe_tp_decode_all_reduce-m_{spec.m}-h_{spec.h}-n_{spec.n}"
+    if spec.pair_rows:
+        name += f"-pairs_{spec.pair_rows}"
+    return name
+
+
+def check_chip_pairs(places) -> None:
+    """Raise unless places, (chip coords, core on chip) per mesh index, put
+    indices 2i and 2i + 1 on the two cores of one chip and every chip holds
+    one such pair, so the pairs cover every core once: the pairing
+    _exchange_pairs assumes."""
+    n = len(places)
+    chips = [tuple(coords or ()) for coords, _ in places]
+    cores = [core for _, core in places]
+    if (
+        n % 2
+        or not all(chips)
+        or None in cores
+        or any(chips[i] != chips[i ^ 1] or cores[i] == cores[i ^ 1] for i in range(n))
+        or len(set(chips)) != n // 2
+    ):
+        raise ValueError(
+            "chip-pair all-gather: mesh indices 2i and 2i + 1 must be the two "
+            f"cores of one chip, one pair per chip; mesh coords {chips}, "
+            f"cores {cores}"
+        )
 
 
 def _scratch_names(spec: AllReduceSpec) -> tuple[str, ...]:
@@ -272,6 +322,60 @@ def _exchange(spec, me, buf, rows, cols, s):
         copy.wait_send()
 
 
+def _exchange_pairs(spec, me, buf, rows, cols, s):
+    """_exchange with the all-gather by chip pairs: my sum to the ranks of my
+    parity (k-th to (me + 2k) % n) and to my mate, then each chunk of my
+    parity forwarded to my mate as it lands, in the order its owners send.
+    ag_send: 1..n/2-1 parity, n/2 mate, n/2+1.. forwards; ag_recv is indexed
+    by the chunk's owner, so every slot still takes one copy."""
+    n, cw = spec.n, cols // spec.n
+    half, mate = n // 2, lax.bitwise_xor(me, 1)
+
+    def slot(q):
+        return s["recv"].at[q, pl.ds(0, rows), pl.ds(0, cw)]
+
+    def chunk(t):
+        return _cols(buf, t, cw)
+
+    def put(src, t, owner, k):
+        copy = pltpu.make_async_remote_copy(
+            src,
+            chunk(owner),
+            s["ag_send"].at[k],
+            s["ag_recv"].at[owner],
+            device_id=(t,),
+            device_id_type=_MESH,
+        )
+        copy.start()
+        return copy
+
+    def land(q):
+        pltpu.make_async_copy(chunk(q), chunk(q), s["ag_recv"].at[q]).wait_recv()
+
+    red = s["red"].at[pl.ds(0, rows), pl.ds(0, cw)]
+    own = pltpu.make_async_copy(chunk(me), slot(me), s["loc"].at[0])
+    own.start()
+    rs = _send_all(spec, me, chunk, slot, s["rs_send"], s["rs_recv"])
+    own.wait()
+    _recv_all(spec, me, slot, s["rs_recv"])
+    red[...] = _sum_slots(
+        lambda q: s["recv"][q, pl.ds(0, rows), pl.ds(0, cw)], n
+    ).astype(red.dtype)
+    own_ag = pltpu.make_async_copy(red, chunk(me), s["loc"].at[1])
+    own_ag.start()
+    ag = [put(red, lax.rem(me + 2 * k, n), me, k) for k in range(1, half)]
+    ag.append(put(red, mate, me, half))
+    own_ag.wait()
+    for k in range(1, half):
+        q = lax.rem(me + (n - 2 * k), n)
+        land(q)
+        ag.append(put(chunk(q), mate, q, half + k))
+    for k in range(half):
+        land(lax.rem(mate + (n - 2 * k), n))
+    for copy in (*rs, *ag):
+        copy.wait_send()
+
+
 def _run_path(spec, kind, me, nv, partial, out_ref, s, barrier):
     """One row path (fold / trim / full): stage, barrier wait, exchange."""
     m, h, tr = spec.m, spec.h, spec.tile_rows
@@ -284,7 +388,10 @@ def _run_path(spec, kind, me, nv, partial, out_ref, s, barrier):
         _stage_rows(out_ref, partial, nv)
         buf = out_ref if rows == m else out_ref.at[pl.ds(0, rows)]
     pl.semaphore_wait(barrier, spec.n)
-    _exchange(spec, me, buf, rows, cols, s)
+    if kind != "fold" and spec.pairs(rows):
+        _exchange_pairs(spec, me, buf, rows, cols, s)
+    else:
+        _exchange(spec, me, buf, rows, cols, s)
     if kind == "fold":
         _unfold(spec, s["q"][...].astype(F32), nv, out_ref)
 
