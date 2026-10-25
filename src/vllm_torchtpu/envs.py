@@ -297,6 +297,7 @@ if TYPE_CHECKING:
     TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN: int = 4096
     TPU_FUSED_ADD_RMSNORM_QUANT: bool = True
     TPU_FUSED_ADD_RMSNORM_QUANT_MOE: bool = False
+    TPU_FUSED_ADD_RMSNORM_SLICES: int = 0
     TPU_MTP_EH_PROJ_TP: bool = False
     TPU_MTP_ONEHOT_AR: bool = True
     TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS: int = 0
@@ -2111,6 +2112,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # threshold is at or above the layer's prefill cut-over; buckets where the
     # stage-A build does not serve (blocked mode) quantize as before.
     "TPU_FUSED_ADD_RMSNORM_QUANT_MOE": env_bool("TPU_FUSED_ADD_RMSNORM_QUANT_MOE"),
+    # With TPU_FUSED_ADD_RMSNORM: how the Pallas norm bodies walk a 256-row tile.
+    # 0 = each step over the whole tile at once (two f32 tile arrays spill to
+    # VMEM: 3,071 spill slots in the MoE norm's LLO). 1 = 32-row slices, each in
+    # 512-column groups, with the unrounded sum in a 32-row f32 scratch; the
+    # kernels are named ..._s32. Bit-identical: the same ops, and the sum of
+    # squares in the order Mosaic gives the whole-row reduction.
+    "TPU_FUSED_ADD_RMSNORM_SLICES": env_nonnegative_int(
+        "TPU_FUSED_ADD_RMSNORM_SLICES", 0
+    ),
     # Comma-separated layer-prefix suffixes that take that path, matched on a "."
     # boundary. The defaults are the sites XLA does not prefetch on GLM-5.2-FP8
     # decode; a VMEM-prefetched weight (indexer wq_b, shared experts, dense
