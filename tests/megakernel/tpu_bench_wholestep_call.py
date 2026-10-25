@@ -49,6 +49,7 @@ def main():
     ap.add_argument("--max-groups", type=int, default=2048)
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--wstd", type=float, default=0.02)
+    ap.add_argument("--L", type=int, default=44)
     a = ap.parse_args()
     # The served Pallas mesh order (get_pallas_mesh in the server: [0, 1, 4, 5, 6, 7, 2, 3]).
     by_id = {d.id: d for d in jax.devices()}
@@ -56,17 +57,19 @@ def main():
     R = mesh.size
     g = qwen38.FULL
     tp, rep = NamedSharding(mesh, P("tp")), NamedSharding(mesh, P())
-    L, n_att = 44, 11
+    L = a.L
+    n_att = max(1, L // 4)
+    n_gdn = L - n_att
     layers = [QSALayerCache(compressed_slot=o % 2, main_slot=(o + 1) % 2) for o in range(n_att)]
     pps = a.max_groups * 4 // 128
     for B in [int(b) for b in a.buckets.split(",")]:
         nreq = B // 4
         n_cols = pps
         # Blocks: GDN 33 layers x 4 ckpts per request, QSA main + compressed per request & layer.
-        NB = 1 + nreq * (33 * 4 + n_att * (1 + n_cols)) + 8
+        NB = 1 + nreq * (n_gdn * 4 + n_att * (1 + 2 * n_cols)) + 8
         layout = Qwen38GdnPoolLayout(pool_shape=(NB * 4, 128, 1, 4, 256), pool_dtype="float8_e4m3fn")
         call, in_specs, out_specs, donate = build_wholestep_call(
-            mesh, g, B, layout, layers, budget=a.budget, max_groups=a.max_groups,
+            mesh, g, B, layout, layers, L=L, budget=a.budget, max_groups=a.max_groups,
             norm_eps=1e-6, rotary_dim=64,
         )
         spec = wholestep_spec(
@@ -93,18 +96,22 @@ def main():
             else:
                 ws.append(rnd((R * s[0][0],) + tuple(s[0][1:]), s[1]))
         rng = np.random.default_rng(0)
-        free = iter(rng.permutation(np.arange(1, NB)))
+        # GDN ids are manager blocks (4 kernel blocks each), QSA ids are kernel blocks
+        # (128 tokens): draw them from disjoint ranges of the kernel-granularity pool.
+        NG = 1 + nreq * n_gdn * 4
+        free_gdn = iter(rng.permutation(np.arange(1, NG)))
+        free = iter(rng.permutation(np.arange(4 * NG, 4 * NB)))
         ctx = np.array([a.ctx + q for q in range(nreq)] + [0] * (16 - nreq), np.int32)
         qsl = np.array([min(q, nreq) * 4 for q in range(17)], np.int32)
         seq = ctx + np.where(np.arange(16) < nreq, 4, 0)
         meta = []
-        for _ in range(33):
+        for _ in range(n_gdn):
             st = np.zeros(16, np.int32)
             ck = np.zeros((16, 4), np.int32)
             for q in range(nreq):
-                ck[q] = [next(free) for _ in range(4)]
+                ck[q] = [next(free_gdn) for _ in range(4)]
                 st[q] = ck[q, 0]
-            meta += [st, np.zeros(NB, np.int32), ck, qsl, seq]
+            meta += [st, np.zeros(NB * 4, np.int32), ck, qsl, seq]
         tabs = []
         for _ in range(n_att):
             ring = np.zeros((16, 8), np.int32)
@@ -113,7 +120,7 @@ def main():
             for q in range(nreq):
                 ring[q, 0] = next(free)
                 main[q] = [next(free) for _ in range(n_cols)]
-                comp[q] = main[q]  # timing only: keys overlap the main pages
+                comp[q] = [next(free) for _ in range(n_cols)]
             tabs += [ring.reshape(-1), main.reshape(-1), comp.reshape(-1)]
         positions = np.concatenate([ctx[q] + np.arange(4) for q in range(nreq)]).astype(np.int32)
         inv = 1.0 / (1e7 ** (np.arange(0, 64, 2) / 64))
@@ -129,7 +136,8 @@ def main():
         t0 = time.time()
         res, pool = f(*args)
         jax.block_until_ready(res)
-        print(f"B={B} first call (compile+run) {time.time() - t0:.1f} s", flush=True)
+        print(f"B={B} first call (compile+run) {time.time() - t0:.1f} s, finite "
+              f"{float(jnp.isfinite(res.astype(jnp.float32)).mean()):.4f}", flush=True)
         ts = []
         for _ in range(a.iters):
             args[1 + len(ws)] = pool
@@ -138,6 +146,9 @@ def main():
             jax.block_until_ready((res, pool))
             ts.append(time.perf_counter() - t0)
         r32 = res.astype(jnp.float32)
+        fin_rows = np.asarray(jnp.isfinite(r32).all(axis=1)).reshape(R, B)
+        print(f"B={B} L={L} finite rows per rank:", fin_rows.astype(int).tolist(), flush=True)
+        print(f"B={B} pool finite {float(jnp.isfinite(pool.astype(jnp.float32)).mean()):.4f}", flush=True)
         print(f"B={B} call median {1e3 * np.median(ts):.3f} ms p10 {1e3 * np.percentile(ts, 10):.3f} "
               f"finite {float(jnp.isfinite(r32).mean()):.4f} absmean "
               f"{float(jnp.nanmean(jnp.abs(r32))):.4g} (input {float(jnp.abs(hidden.astype(jnp.float32)).mean()):.4g})",

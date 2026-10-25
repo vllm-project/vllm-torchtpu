@@ -21,8 +21,9 @@ then the rank's K and V head, the stock `q_proj` / `k_proj` / `v_proj` views), `
 (`indexer.index_qk_proj`), `o_proj` and its norms.
 
 Every operand is returned as its own freshly allocated base tensor unless it already is a
-model parameter's storage (the expert views): a view (e.g. `reshape` of a stack) reaches the
-torch_tpu bridge through `execute_as_strided`, a full copy on every call (q32: 1.8 ms/step).
+whole contiguous parameter (the routed experts): a view (a `reshape` of a stack, a transposed
+weight) reaches the torch_tpu bridge through `execute_as_strided`, a full copy on every call
+(q32: 1.8 ms/step).
 """
 
 from __future__ import annotations
@@ -42,15 +43,16 @@ from .qwen38_weights import _hc_mix_operands, _lin_in, _shared, kn
 from .weight_collector import pack_expert_views_layer
 
 
-def param_storages(model: Any) -> set[int]:
-    return {p.untyped_storage().data_ptr() for p in model.parameters()}
+def own_operand(t: torch.Tensor) -> torch.Tensor:
+    """`t` itself if the bridge can pass it as is, else a fresh contiguous base tensor.
 
-
-def own_operand(t: torch.Tensor, params: set[int]) -> torch.Tensor:
-    """`t` itself if it is a parameter's storage, else a fresh contiguous base tensor."""
-    if t.untyped_storage().data_ptr() in params:
-        return t
-    if t._base is None and t.storage_offset() == 0 and t.is_contiguous():
+    Passed as is: a contiguous, offset-0 tensor that is a base (e.g. a fresh stack) or a whole
+    parameter (the routed-expert `w13` / `w2`). Any view — including a transposed parameter
+    (`kn` of an `[n, k]` weight) — reaches torch_tpu through `execute_as_strided`, a copy on
+    every call (agent-1a, q39: parameter views are part of the leftover copies).
+    """
+    plain = t.is_contiguous() and t.storage_offset() == 0
+    if plain and (t._base is None or isinstance(t, torch.nn.Parameter)):
         return t
     return torch.empty_like(t, memory_format=torch.contiguous_format).copy_(t)
 
@@ -85,7 +87,6 @@ def pack_wholestep_operands(
     gi = g.inner(ex.R, L)
     lay = GDNBlock.lin_in_layout(gi, ex) if gdn_j else None
     dev = layers[0].mlp.gate.weight.device
-    params = param_storages(model)
 
     w: dict[str, Any] = {}
     sm: dict[str, torch.Tensor] = {}
@@ -177,4 +178,4 @@ def pack_wholestep_operands(
             if k_in < nt * tk:
                 t = F.pad(t, (0, 0, 0, nt * tk - k_in))
             out.append(t.reshape(*t.shape[:-2], nt, tk, t.shape[-1]))
-    return [own_operand(t, params) for t in out]
+    return [own_operand(t) for t in out]
