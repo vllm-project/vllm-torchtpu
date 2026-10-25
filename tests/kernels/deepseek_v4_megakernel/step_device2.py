@@ -65,8 +65,9 @@ def main():
     p.add_argument("--iters", type=int, default=10)
     # extra variants on the same weights, comma separated: moe=stub,T=32/owners=4
     p.add_argument("--variants", default="")
-    # the embedding and the per-layer small weights identical on every rank, as
-    # serving replicates them (default: drawn per rank)
+    # every synthetic weight identical on every rank (each rank's slices and
+    # experts hold the same values), so all ranks carry the same hidden states
+    # (default: drawn per rank)
     p.add_argument("--replicated", action="store_true")
     a = p.parse_args()
     result(phase="start", args=vars(a))
@@ -82,19 +83,25 @@ def main():
     keys = iter(jax.random.split(jax.random.key(0), 1000))
 
     def gen(shape, dtype, kind):
-        """A random EP-sharded array built on device (leading axis split)."""
+        """A random EP-sharded array built on device (leading axis split);
+        --replicated: one rank's draw, the same on every rank."""
+        one = (shape[0] // R,) + tuple(shape[1:]) if a.replicated else shape
 
-        def f(k):
+        def draw(k):
             if kind == "fp8":
-                z = jax.random.normal(k, shape, jnp.bfloat16) * 64
+                z = jax.random.normal(k, one, jnp.bfloat16) * 64
                 return jnp.clip(z, -448, 448).astype(dtype)
             if kind == "bits":
-                return jax.random.bits(k, shape, jnp.uint32)
+                return jax.random.bits(k, one, jnp.uint32)
             if kind == "int":
-                return jax.random.randint(k, shape, 0, cfg.n_experts, jnp.int32)
+                return jax.random.randint(k, one, 0, cfg.n_experts, jnp.int32)
             if kind == "scale":
-                return jax.random.uniform(k, shape, jnp.float32, 0.5, 1.5) * 1e-2
-            return (jax.random.normal(k, shape, jnp.float32) * 0.02).astype(dtype)
+                return jax.random.uniform(k, one, jnp.float32, 0.5, 1.5) * 1e-2
+            return (jax.random.normal(k, one, jnp.float32) * 0.02).astype(dtype)
+
+        def f(k):
+            x = draw(k)
+            return jnp.tile(x, (R,) + (1,) * (x.ndim - 1)) if a.replicated else x
 
         return jax.jit(f, out_shardings=EP)(next(keys))
 
@@ -105,22 +112,8 @@ def main():
         kind = "fp8" if s.dtype == dc.FP8 else "bf16"
         shape = (R * nl, s.n_tiles, s.tile_rows, s.tile_cols)
         tiles[n] = gen(shape, jnp.dtype(s.dtype), kind)
-    if a.replicated:
-        def gen_rep(shape, dtype, kind):  # one rank's draw, tiled over the ranks
-            one = (shape[0] // R,) + shape[1:]
-
-            def f(k):
-                if kind == "scale":
-                    x = jax.random.uniform(k, one, jnp.float32, 0.5, 1.5) * 1e-2
-                else:
-                    x = (jax.random.normal(k, one, jnp.float32) * 0.02).astype(dtype)
-                return jnp.tile(x, (R,) + (1,) * (len(one) - 1))
-
-            return jax.jit(f, out_shardings=EP)(next(keys))
-    else:
-        gen_rep = gen
-    smalls = gen_rep((R * L, cfg.smalls_rows, 128), jnp.float32, "scale")
-    embed = gen_rep((R, 129280, H), jnp.bfloat16, "bf16")
+    smalls = gen((R * L, cfg.smalls_rows, 128), jnp.float32, "scale")
+    embed = gen((R, 129280, H), jnp.bfloat16, "bf16")
     pos_max = 1 << 17
     ang = jnp.arange(pos_max)[:, None] * 160000.0 ** (-jnp.arange(32) / 32.0)[None]
     cs = jnp.concatenate([jnp.cos(ang), jnp.sin(ang)], 1).astype(jnp.float32)
@@ -317,6 +310,14 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
         mism = [int(diff(x, y)) for x, y in zip(ca, cb)]
         written = sum(int(diff(x, y)) for x, y in zip(ca, orig))
         res_m, aux_m = int(diff(oa[0], ob[0])), int(diff(oa[1], ob[1]))
+        ust = {}
+        if scfg.union_stats:  # [R, L, B] CSA union sizes: ref vs new, group ranks vs their first
+            gdiv = jax.jit(lambda x: jnp.sum(x.reshape(R // GS, GS, -1)
+                                             != x.reshape(R // GS, GS, -1)[:, :1]))
+            ust = dict(union_sizes_mismatch=int(diff(oa[-1], ob[-1])),
+                       ref_group_rank_union_diff=int(gdiv(oa[-1])),
+                       new_group_rank_union_diff=int(gdiv(ob[-1])),
+                       union_entries=int(jax.jit(lambda x: jnp.sum(x >= 0))(oa[-1])))
         rel = jax.jit(lambda x, y: jnp.max(jnp.abs(x.astype(jnp.float32) - y))
                       / jnp.maximum(jnp.max(jnp.abs(y.astype(jnp.float32))), 1e-30))
         # ranks of one attention group whose residual differs from the group's first rank
@@ -329,6 +330,7 @@ def run_variant(a, var, cfg, tiles, smalls, embed, cs, moe_args, mesh, EP, R):
             cache_arrays_differing=sum(m > 0 for m in mism), words_written=written,
             res_max_rel=float(rel(ob[0], oa[0])), aux_max_rel=float(rel(ob[1], oa[1])),
             ref_group_rank_res_diff=int(div(oa[0])), new_group_rank_res_diff=int(div(ob[0])),
+            **ust,
             finite=bool(np.isfinite(np.asarray(oa[0].addressable_shards[0].data,
                                                np.float32)).all()),
             bitexact=sum(mism) == 0 and res_m == 0 and aux_m == 0 and written > 0,
