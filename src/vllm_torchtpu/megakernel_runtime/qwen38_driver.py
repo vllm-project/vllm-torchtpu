@@ -87,6 +87,31 @@ def _parse_int(raw: str, key: str) -> int | None:
     return None
 
 
+def _real_traffic(kw: dict) -> bool:
+    """A served step rather than a warmup dummy: some request has more than 64 tokens of context."""
+    ctx = kw.get("context_lens")
+    if not isinstance(ctx, torch.Tensor) or ctx.numel() == 0:
+        return True
+    return int(ctx.max()) > 64
+
+
+def _diff_stats(a: torch.Tensor, b: torch.Tensor, n: int, hc: int) -> dict:
+    """`a` vs reference `b` over the first `n` rows: rel, per-stream rel/cos/norm ratio, per-row rel."""
+    a, b = a.float()[:n], b.float()[:n]
+
+    def rel(x, y):
+        return float((x - y).abs().mean() / y.abs().mean().clamp_min(1e-12))
+
+    out = {"rel": round(rel(a, b), 5), "nan_a": int(torch.isnan(a).any(-1).sum()), "nan_b": int(torch.isnan(b).any(-1).sum())}
+    if a.shape[-1] % hc == 0 and hc > 1:
+        a3, b3 = a.unflatten(-1, (hc, -1)), b.unflatten(-1, (hc, -1))
+        out["stream_rel"] = [round(rel(a3[:, k], b3[:, k]), 4) for k in range(hc)]
+        out["stream_cos"] = [round(float(torch.nn.functional.cosine_similarity(a3[:, k], b3[:, k], dim=-1).mean()), 4) for k in range(hc)]
+        out["stream_ratio"] = [round(float((a3[:, k].norm(dim=-1) / b3[:, k].norm(dim=-1).clamp_min(1e-12)).mean()), 4) for k in range(hc)]
+    out["row_rel"] = [round(float((a[r] - b[r]).abs().mean() / b[r].abs().mean().clamp_min(1e-12)), 3) for r in range(min(n, 8))]
+    return out
+
+
 # `VLLM_TPU_MEGAKERNEL=...,nodonate=1`: the GDN pool is not donated to the segment op; it
 # writes a fresh pool that `_run` copies back into the live cache (bisecting a served hang).
 NO_DONATE = False
@@ -385,6 +410,8 @@ class Qwen38SegmentDriver:
         self.program = None
         self.check_left = 0
         self.shadow = None
+        self.h0check_left = 0
+        self.h0kind = None
         self.stats: dict[str, int] = {}
         self.mtp = False
         self.cfg = None
@@ -425,6 +452,10 @@ class Qwen38SegmentDriver:
                 qwen38_segment_call.DEFAULT_RINGS = (int(e), int(d))
         drv = cls(runner, _parse_buckets(raw), head=_parse_flag(raw, "head", True))
         drv.check_left = _parse_check(raw)
+        # `h0check=N`: every eligible step runs stock; the first N real ones also
+        # compare the head-0 (layer 0) kernel against stock layer 0 on the same
+        # input, the kernel reading a private copy of layer 0's state blocks.
+        drv.h0check_left = _parse_int(raw, "h0check") or 0
         for part in raw.split(","):
             # `segset=1:5` / `headset=0`: only these segments / head groups run
             # their kernels, the rest stock (bisection).
@@ -534,6 +565,60 @@ class Qwen38SegmentDriver:
                     backbone=runner.model.model,
                     segments=shadow_seg,
                 )
+
+    def _h0check(self, runner: Any, input_ids: Any, kw: dict, rows: int, n_req: int) -> None:
+        from vllm.forward_context import get_forward_context
+
+        from .qwen38_gdn_state import Qwen38GdnPoolLayout
+
+        segs, bb = self.segments, runner.model.model
+        layer = bb.layers[0]
+        hc = bb.hc_count
+        NS, T = rows // T_VERIFY, T_VERIFY
+        md = get_forward_context().attn_metadata[layer.linear_attn.prefix]
+        st = md.mamba_state_indices.to(torch.int64)[:NS]
+        off_tab = md.mamba_slot_read_offsets.to(torch.int64)
+        ck = md.mamba_ckpt_indices.to(torch.int64)[:NS, :T]
+        qsl = md.query_start_loc.to(torch.int32)[: NS + 1]
+        seq = md.seq_lens.to(torch.int32)[:NS]
+        pool = segs.pool
+        flat = ck.reshape(-1)
+        saved = pool[flat].clone()
+        # Private pool: block 0 null, request s column t at 1 + s*T + t.
+        small = torch.cat([torch.zeros_like(pool[:1]), saved], dim=0)
+        new_ck = (1 + torch.arange(NS * T, device=ck.device).reshape(NS, T)).to(torch.int32)
+        new_ck = torch.where(ck > 0, new_ck, torch.zeros_like(new_ck))
+        new_st = new_ck[:, 0]
+        new_off = torch.zeros(small.shape[0], dtype=torch.int32, device=ck.device)
+        new_off[new_st.long()] = off_tab[st].to(torch.int32)
+        if self.h0kind is None:
+            lay = Qwen38GdnPoolLayout(pool_shape=tuple(int(d) for d in small.shape), pool_dtype=segs.layout.pool_dtype)
+            self.h0kind = _SegmentKind(self.mesh, self.g, len(segs.head_groups[0]), lay, write=False, head=True)
+        w = [getattr(segs, f"h0_{i}") for i in range(segs.n_hw[0])]
+        meta = [new_st, new_off, new_ck, qsl, seq]
+        with torch.no_grad():
+            h_in = bb.embed_tokens(input_ids).repeat(1, hc)
+            mk_out = self.h0kind.op(h_in, h_in, w, [small, *meta])[0]
+            # Stock layer 0, staged like Qwen4ExpDecoderLayer.forward.
+            block, residual = layer.attn_hyper_connection.mix(h_in)
+            g = layer.linear_attn(block)
+            mixed2, residual2 = layer.attn_hyper_connection.combine_mix(g, residual, layer.mlp_hyper_connection)
+            valid = kw["valid_tokens"].to(torch.bool)
+            mixed2 = torch.where(valid[:, None], mixed2, 0)
+            moe = layer.mlp(mixed2)
+            st_out = layer.mlp_hyper_connection.combine(moe, residual2)
+        n = NS * T
+        pool[flat] = saved  # undo stock layer 0's checkpoint writes; the stock model serves this step
+        logger.info(
+            "qwen38 h0check inputs: rows=%d n_req=%d h_in_norm=%.4f st=%s off=%s ck0=%s seq=%s",
+            rows, n_req, float(h_in.float()[:n].norm()), st.tolist()[:8], off_tab[st].tolist()[:8],
+            ck[:2].tolist(), seq.tolist()[:8],
+        )
+        logger.info(
+            "qwen38 h0check layer0_out MK vs stock: %s | stock residual-after-GDN(norm)=%.4f moe(norm)=%.4f (%d left)",
+            _diff_stats(mk_out, st_out, n, hc), float((residual2[0] if isinstance(residual2, tuple) else residual2).float()[:n].norm()),
+            float(moe.float()[:n].norm()), self.h0check_left - 1,
+        )
 
     def _attach_mtp_tail(self, runner: Any) -> None:
         """Route the MTP draft layer's post-attention half to the tail kernel.
@@ -687,6 +772,15 @@ class Qwen38SegmentDriver:
             if self.mk_calls <= 2:
                 self._log_gdn_meta()
         kw = dict(model_kwargs or {})
+        if self.h0check_left > 0 or getattr(self, "h0check_done", False):
+            if self.h0check_left > 0 and getattr(runner, "warmup_done", False) and _real_traffic(kw):
+                try:
+                    self._h0check(runner, input_ids, kw, rows, n_req)
+                except Exception:
+                    logger.exception("qwen38 megakernel h0check failed")
+                self.h0check_left -= 1
+                self.h0check_done = True
+            return False, None
         first_warm = self.warm and self.mk_calls == 1
         if first_warm:
             self._tp_barrier("before the first (compiling) call")
