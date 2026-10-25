@@ -214,7 +214,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         )
         for q in range(nreq):
             qr = scr["qi_q"][q].astype(BF16)
-            self._score_request(ctx, q, qr, self.row_base(ctx, l))
+            self._score_request(ctx, q, qr, self.row_base(ctx, l), last=q == nreq - 1)
             ck, gc = self._new_group(ctx, l, q, raw[q * T : (q + 1) * T])
             s_new = ix.score_rows(qr, jnp.broadcast_to(ck.astype(BF16), (8, ix.IDX_DIM)))[:, :1]
             rows = slice(q * T, (q + 1) * T)

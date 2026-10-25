@@ -546,3 +546,23 @@ def add_per_layer(key: int, g: Qwen38Geometry, ex: ExecSpec, d: dict[str, Any], 
     if ring is not None:
         out["ring"] = ring
     return out
+
+
+def fp8_carrier(carrier_bf16: jax.Array) -> jax.Array:
+    """The served FP8 carrier `[pages, 16, 4, W]` whose BF16 ref-bitcast view is `carrier_bf16
+    [pages, 16, 2, W]` — written through the same ref bitcast the readers use (TPU only)."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    P_, _, _, W = carrier_bf16.shape
+
+    def k(i_ref, o_ref):
+        o_ref.bitcast(BF16)[...] = i_ref[...]
+
+    return pl.pallas_call(
+        k,
+        grid=(P_,),
+        in_specs=[pl.BlockSpec((1, 16, 2, W), lambda p: (p, 0, 0, 0))],
+        out_specs=pl.BlockSpec((1, 16, 4, W), lambda p: (p, 0, 0, 0)),
+        out_shape=jax.ShapeDtypeStruct((P_, 16, 4, W), jnp.float8_e4m3fn),
+    )(carrier_bf16)

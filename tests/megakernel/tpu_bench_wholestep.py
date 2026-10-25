@@ -152,6 +152,93 @@ def run(g, B, T, L, mesh, chains, budget, identical, nbd, nbe, tiny=False, slots
     }
 
 
+def run_step(g, B, T, L, mesh, chains, budget, max_groups, ctx, small, with_ref, gain=1.0,
+             identical=True, manager_pages=0) -> dict:
+    """Stage C on TPU: in-kernel indexer over the FP8 carrier + the step's own tokens."""
+    R = mesh.size
+    tiles = (Tiles(bank=1 << 20, nbd=10, nbe=8, ebank=512 << 10, vmem_mib=64) if small
+             else tiles_for(B, None, None))
+    ex = ExecSpec(R=R, B=B, T=T, ctx=128, tiles=tiles)
+    n_pages = 8
+
+    def gen(key):
+        d = wi.random_wholestep_inputs(7, g, ex, L, budget=budget, n_pages=n_pages,
+                                       identical_experts=identical, gain=gain)
+        for k in ("off", "budget", "first"):
+            d.pop(k)
+        return d
+
+    shapes = jax.eval_shape(gen, 0)
+    d = jax.jit(gen, out_shardings=_shard(shapes, R, mesh), static_argnums=0)(0)
+    d.update(off=1, budget=budget, first="gdn")
+    d = wi.add_indexer_inputs(7, g, ex, d, L, max_groups=max_groups, ctx=ctx)
+    d = wi.add_step_inputs(7, g, ex, d, L, ctx=ctx)
+    d = wi.add_carrier(7, d, mp=manager_pages)
+    d["carrier"] = wi.fp8_carrier(d["carrier"])
+    ref = None
+    if with_ref:
+        with jax.default_matmul_precision("highest"):
+            ref, _ = wi.wholestep_reference(g, ex, d, L)
+    d.pop("_step_out", None)
+    pps = d["mtab"].shape[-1]
+    idx = dict(max_groups=max_groups, pages_per_seq=pps, carrier="fp8", chunk_pages=52 if manager_pages else 32,
+               manager_pages=manager_pages)
+    spec = wholestep_spec(g, R, L=L, qsa=dict(budget=budget), step=True, indexed=idx)
+    meta = ("off", "budget", "first", "max_groups")
+
+    def pack(dd):
+        return wi.pack_wholestep(spec, g, ex, {**dd, **{k: d[k] for k in meta}}, L)
+
+    dd = {k: v for k, v in d.items() if k not in meta and k != "carrier"}
+    w_mk, states = jax.jit(pack, out_shardings=_shard(jax.eval_shape(pack, dd), R, mesh))(dd)
+    hid = jnp.broadcast_to(
+        jnp.pad(d["inp"].x, ((0, ex.M - B), (0, 0)))[None], (R, ex.M, d["inp"].x.shape[-1])
+    )
+    w_mk, states, hid = (_fold_put(t, mesh) for t in (w_mk, states, hid))
+    pos = jax.device_put(d["inp"].pos, NamedSharding(mesh, P()))
+    xs = wi.extras_c(d, mesh, R)
+    step, info = kernel.make_step(mesh, spec, ex)
+    t0 = time.perf_counter()
+    _, outs = step(pos, hid, w_mk, states, *xs)
+    res = outs[RESIDUAL_OUT].block_until_ready()
+    compile_s = time.perf_counter() - t0
+    out = {"rows": B, "L": L, "stage": "C", "max_groups": max_groups, "geom": "tiny" if small else "full",
+           "manager_pages": manager_pages, "compile_s": round(compile_s, 1)}
+    if ref is not None:
+        res0 = np.asarray(res.reshape(R, ex.M, -1)[0, :B], np.float32)
+        refn = np.asarray(ref, np.float32)
+        dl = np.abs(res0 - refn)
+        sc = float(np.abs(refn).mean())
+        sel_all = slice(T, 2 * T)  # request 1: select-all rows (selection-insensitive)
+        out["parity"] = {
+            "mean_rel": float(dl.mean() / sc),
+            "selectall_mean_rel": float(dl[sel_all].mean() / sc),
+            "selectall_max_rel": float(dl[sel_all].max() / sc),
+            "row_max_rel": [round(float(v), 3) for v in dl.max(axis=1) / sc],
+        }
+
+    def dev_chain(n):
+        def body(h, p, w, st, *e):
+            return jax.lax.fori_loop(0, n, lambda _, x: step(p, x, w, st, *e)[1][RESIDUAL_OUT], h)
+
+        return jax.jit(body)
+
+    fns = {n: dev_chain(n) for n in chains}
+    for f in fns.values():
+        f(hid, pos, w_mk, states, *xs).block_until_ready()
+
+    def tm(n):
+        t1 = time.perf_counter()
+        fns[n](hid, pos, w_mk, states, *xs).block_until_ready()
+        return time.perf_counter() - t1
+
+    best = {n: min(tm(n) for _ in range(5)) for n in chains}
+    slope, icpt = np.polyfit(np.array(list(best), float), np.array(list(best.values()), float), 1)
+    out.update(dev_us_per_call=round(slope * 1e6, 1), dev_intercept_us=round(icpt * 1e6, 1),
+               tiles=str(info["exec"].resolved_tiles))
+    return out
+
+
 def compile_only(g, B, T, L, mesh, budget, nbd, nbe, slots=8) -> dict:
     """Lower + compile the L-layer kernel from shapes only (no weights allocated): compile
     time and whether the program fits, e.g. at L = 48 (the whole model)."""
@@ -209,6 +296,11 @@ def main() -> None:
     ap.add_argument("--gain", type=float, default=1.0, help="sublayer output gain (smaller at H=2560)")
     ap.add_argument("--small", action="store_true",
                     help="TINY geometry compiled on 2 real TPU cores (the CPU test's config)")
+    ap.add_argument("--stage-c", action="store_true", help="in-kernel indexer + step tokens")
+    ap.add_argument("--max-groups", type=int, default=1024)
+    ap.add_argument("--ctx", type=int, nargs="+", default=[3001, 100])
+    ap.add_argument("--no-ref", action="store_true")
+    ap.add_argument("--manager-pages", type=int, default=0)
     a = ap.parse_args()
     devs = jax.devices()[:2] if (a.tiny or a.small) else jax.devices()
     g = qwen38.TINY if (a.tiny or a.small) else qwen38.FULL
@@ -217,6 +309,16 @@ def main() -> None:
     out = []
     for L in a.layers:
         for B in a.rows:
+            if a.stage_c:
+                try:
+                    r = run_step(g, B, a.T, L, mesh, a.chains, a.budget, a.max_groups, a.ctx,
+                                 a.small, not a.no_ref, a.gain, bool(a.identical[0]),
+                                 a.manager_pages)
+                except Exception as e:  # noqa: BLE001
+                    r = {"rows": B, "L": L, "stage": "C", "error": f"{type(e).__name__}: {e}"[:3000]}
+                print("RESULT", json.dumps(r), flush=True)
+                out.append(r)
+                continue
             if a.compile_only:
                 try:
                     r = compile_only(g, B, a.T, L, mesh, a.budget, a.nbd, a.nbe, a.slots)

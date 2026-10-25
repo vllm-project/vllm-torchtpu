@@ -180,8 +180,15 @@ class QSAFullIndexedBlock(QSAFullBlock):
         ]
 
     # ------------------------------------------------------------ in kernel
-    def _score_request(self, ctx: Any, q: int, qr: jax.Array, base: Any = 0) -> None:
-        """Scores of request `q`'s `T` rows into `qi_s[q*T : (q+1)*T]` (chunk-major)."""
+    def _score_request(
+        self, ctx: Any, q: int, qr: jax.Array, base: Any = 0, last: bool = True
+    ) -> None:
+        """Scores of request `q`'s `T` rows into `qi_s[q*T : (q+1)*T]` (chunk-major).
+
+        Carrier mode streams chunks through a 2-slot ring whose slot follows a chunk counter
+        across requests (`q * n_chunks + c`): request q's last chunk prefetches request q+1's
+        first chunk (unless `last`), so no request starts its key stream cold; request 0's
+        first chunk is issued here."""
         scr, T = ctx.scr, ctx.ex.T
         rows = slice(q * T, (q + 1) * T)
         if not self.carrier:
@@ -196,8 +203,8 @@ class QSAFullIndexedBlock(QSAFullBlock):
         ring, sems = scr["qi_ring"], scr["qi_ring_sem"]
         lanes = pl.ds(0, W)
 
-        def copies(c: Any, s: Any) -> list[Any]:
-            tab, qb = ctx.extra[CKTAB], base + q
+        def copies(c: Any, s: Any, qq: int = q) -> list[Any]:
+            tab, qb = ctx.extra[CKTAB], base + qq
             if MP:  # one DMA per manager page of MP contiguous kernel pages
                 return [
                     pltpu.make_async_copy(
@@ -214,16 +221,24 @@ class QSAFullIndexedBlock(QSAFullBlock):
                 for p in range(CH)
             ]
 
-        for cp in copies(0, 0):
-            cp.start()
+        if q == 0:
+            for cp in copies(0, 0):
+                cp.start()
 
         def chunk(c: Any, carry: Any) -> Any:
-            s = jax.lax.rem(c, 2)
+            s = jax.lax.rem(q * NC + c, 2)
 
             @pl.when(c + 1 < NC)
             def _():
                 for cp in copies(c + 1, 1 - s):
                     cp.start()
+
+            if not last:  # the next request's first chunk into the slot this chunk frees next
+
+                @pl.when(c + 1 == NC)
+                def _():
+                    for cp in copies(0, 1 - s, q + 1):
+                        cp.start()
 
             # One wait for the whole slot (the page copies add up to its bytes).
             pltpu.make_async_copy(ring.at[s], ring.at[s], sems.at[s]).wait()
@@ -255,7 +270,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
                     scr["qi_q"][q, i : i + 1, :] = iq[h][q * T + t : q * T + t + 1]
         base = self.row_base(ctx, l)
         for q in range(nreq):
-            self._score_request(ctx, q, scr["qi_q"][q].astype(BF16), base)
+            self._score_request(ctx, q, scr["qi_q"][q].astype(BF16), base, last=q == nreq - 1)
         rid = jax.lax.broadcasted_iota(I32, (MB, 1, 1), 0)
         nv = jnp.zeros((MB, 1, 1), I32)
         for r in range(MB):
