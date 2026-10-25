@@ -47,6 +47,7 @@ from vllm.config.utils import Range
 
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.compilation import graph_fingerprint
 from vllm_torchtpu.compilation.graph_fingerprint import _graph_fingerprint
 from vllm_torchtpu.gdn_pool_layout import prefill_checkpoint_enabled
 from vllm_torchtpu.logger import init_logger
@@ -103,6 +104,29 @@ _FAILED_SUFFIX = ".failed"
 _PROCESS_START = time.time()
 
 _peer_wait = threading.local()
+
+# Op-name fragments whose lowering depends on the calling rank although the
+# traced graph does not (e.g. a JAX callable over the TP mesh whose program is
+# specialised to the rank's mesh position). A graph calling one is
+# fingerprinted with the rank, so no other rank replays its artifact.
+_RANK_DEPENDENT_OPS: set[str] = set()
+
+
+def mark_rank_dependent(op_fragment: str) -> None:
+    """Never replay a graph whose code mentions `op_fragment` across ranks."""
+    _RANK_DEPENDENT_OPS.add(op_fragment)
+
+
+def _rank_salt(code: str) -> str:
+    if not any(fragment in code for fragment in _RANK_DEPENDENT_OPS):
+        return ""
+    import torch.distributed as dist
+
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    return f"\nrank-dependent:{rank}"
+
+
+graph_fingerprint.rank_salt = _rank_salt
 
 
 @contextlib.contextmanager

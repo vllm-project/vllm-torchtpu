@@ -28,6 +28,15 @@ logger = init_logger(__name__)
 # weights rather than constants, by dtype and shape.
 _FINGERPRINT_MAX_NUMEL = 1 << 16
 
+
+def _no_rank_salt(code: str) -> str:
+    return ""
+
+
+# Extra text hashed with a submodule's code; `tpu_compiler` installs one that
+# salts graphs calling rank-dependent ops with the rank (`mark_rank_dependent`).
+rank_salt = _no_rank_salt
+
 _GROUP_ARG_NAMES = frozenset({"group_name", "group"})
 
 _SYMMETRIC_COLLECTIVE_SCHEMAS = frozenset(
@@ -158,6 +167,7 @@ def _graph_fingerprint(graph: fx.GraphModule) -> str | None:
             h.update(
                 f"{name}\n{_normalized_module_code(module, canonical_by_raw)}".encode()
             )
+            h.update(rank_salt(module.code).encode())
             for node in module.graph.nodes:
                 if node.op != "get_attr":
                     continue

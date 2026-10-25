@@ -433,6 +433,14 @@ class Qwen38SegmentDriver:
         drv.noaot = _parse_flag(raw, "noaot", False)
         global NO_DONATE
         NO_DONATE = _parse_flag(raw, "nodonate", False)
+        if not _parse_flag(raw, "replay", False):
+            # The segment ops lower per rank (the kernel's mesh position), but the
+            # traced graph is the same on every rank, so a peer would replay rank
+            # 0's program on all ranks (q39 j-698bb3ee: "Replayed ... rank_0_0/
+            # model_mk_segments"). `replay=1` restores the old behaviour.
+            from vllm_torchtpu.compilation.tpu_compiler import mark_rank_dependent
+
+            mark_rank_dependent("qwen38_mk")
         logger.info(
             "Qwen3.8 segment megakernel enabled, verify buckets %s, shadow checks %d, hier %s, rings %s, head %s",
             drv.buckets,
