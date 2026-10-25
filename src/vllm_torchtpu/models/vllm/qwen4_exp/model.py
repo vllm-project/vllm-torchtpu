@@ -322,6 +322,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 replicated_indexer=(
                     sequence_parallel and envs.VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP
                 ),
+                token_shard=(
+                    sequence_parallel and envs.VLLM_TPU_QSA_INDEXER_TOKEN_SHARD
+                ),
             )[0]
             block = sp.reduce(block, sequence_parallel)
         block, residual = self.attn_hyper_connection.combine_mix(

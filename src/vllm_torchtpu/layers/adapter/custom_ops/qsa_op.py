@@ -16,6 +16,7 @@ from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import (
     pooled_qsa_shard_select_rows_step,
     pooled_qsa_shard_select_step,
     pooled_qsa_step,
+    pooled_qsa_token_select_step,
 )
 from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import qsa_step
 
@@ -588,6 +589,120 @@ def build_pooled_qsa_shard_op(tp_group, a2a_min_tokens: int = 0):
             compress_ratio=ratio,
             token_topk=topk,
             merged=merged,
+            **attend_kwargs,
+        )
+        pool.copy_(updated)
+        return output, selected
+
+    return run
+
+
+@functools.cache
+def _token_select_op():
+    select = pallas.jax_op(
+        "qwen4_exp::pooled_qsa_token_select",
+        pooled_qsa_token_select_step,
+        donate_argnums=(10,),
+    )
+
+    @select.register_fake
+    def select_fake(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        shard_index,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        shard_size,
+        k_scale=1.0,
+        v_scale=1.0,
+        compressed_slot=0,
+        main_slot=-1,
+        max_query_len=1,
+    ):
+        tokens, head_dim = qgate.shape[0], nq.shape[0]
+        heads = qgate.shape[1] // (2 * head_dim)
+        return (
+            torch.empty_like(pool),
+            qgate.new_empty((tokens, heads, head_dim)),
+            qgate.new_empty((tokens, heads, head_dim)),
+            positions.new_empty((tokens,), dtype=torch.int32),
+            positions.new_empty((tokens,), dtype=torch.int32),
+            positions.new_empty((starts.shape[0],), dtype=torch.int32),
+            positions.new_empty(
+                (tokens // shard_size, token_topk // compress_ratio), dtype=torch.int32
+            ),
+        )
+
+    return select
+
+
+def build_pooled_qsa_token_shard_op(tp_group, replicated):
+    """``build_pooled_qsa_op`` with the indexer split over the step's tokens.
+
+    For the prefill sequence-parallel backbone, whose QSA input is the whole
+    gathered step on every rank: rank ``r`` indexes token rows
+    ``[r * T / TP, (r + 1) * T / TP)``, the ``[T / TP, k]`` blocks are
+    all-gathered (16 MB per layer at T = 8192, TP 8) and every rank attends its
+    heads over all tokens. The selection is the replicated indexer's.
+
+    The returned callable takes the pooled op's operands plus a trailing
+    ``shard_index`` operand (int32 ``[1]``, the rank) and a ``kv_heads``
+    keyword. Buckets whose shard would not take the ragged prefill indexer
+    (``T / TP`` rows at most one per request slot and verify token, or ``T``
+    not a multiple of TP) call ``replicated`` instead; each bucket traces its
+    own graph, so the choice is static.
+    """
+    world = int(tp_group.world_size)
+    select = _token_select_op()
+    _, attend = _shard_ops(False)
+
+    def run(*args, shard_index, kv_heads, **kwargs):
+        tokens, slots = args[0].shape[0], args[12].shape[0]
+        if tokens % world or tokens // world <= slots * kwargs.get("max_query_len", 1):
+            return replicated(*args, **kwargs)
+        args = list(args)
+        for index in (8, 11, 12, 13, 14, 15):
+            args[index] = args[index].to(torch.int32)
+        pool = args[10]
+        updated, q, gate, lengths, req, starts, blocks = select(
+            *args, shard_index, shard_size=world, **kwargs
+        )
+        pool.copy_(updated)
+        attend_kwargs = {
+            name: kwargs[name]
+            for name in ("k_scale", "v_scale", "main_slot", "max_query_len")
+            if name in kwargs
+        }
+        updated, output, selected = attend(
+            q,
+            gate,
+            lengths,
+            req,
+            starts,
+            args[14],
+            args[12],
+            pool,
+            _all_gather_ranks(blocks, tp_group).reshape(tokens, -1),
+            kv_heads=kv_heads,
+            compress_ratio=kwargs["compress_ratio"],
+            token_topk=kwargs["token_topk"],
+            merged=True,
             **attend_kwargs,
         )
         pool.copy_(updated)

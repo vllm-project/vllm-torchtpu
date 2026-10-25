@@ -340,6 +340,14 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             ).to(device=device),
             persistent=False,
         )
+        if envs.VLLM_TPU_QSA_INDEXER_TOKEN_SHARD and tp_size > 1:
+            # The rank as an operand of the token-sharded indexer, so every
+            # rank traces the same program.
+            self.register_buffer(
+                "token_shard_index",
+                torch.full((1,), tp_rank, dtype=torch.int32, device=device),
+                persistent=False,
+            )
         with torch.device(device or "cpu"):
             set_default_quant_scales(self, register_buffer=True)
         self.cache_owners: tuple[torch.Tensor, ...] = ()
@@ -411,6 +419,22 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         self.main_slot = max(main_slot, 0)
         self._shard_op = None
         self._shard_select_op = None
+        self._token_shard_op = None
+        if envs.VLLM_TPU_QSA_INDEXER_TOKEN_SHARD and self.tp_size > 1:
+            from vllm.distributed import get_tp_group
+
+            from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
+                build_pooled_qsa_token_shard_op,
+            )
+
+            group = get_tp_group()
+            assert int(group.world_size) == self.tp_size
+            assert int(group.rank_in_group) == self.tp_rank
+            self._token_shard_op = partial(
+                build_pooled_qsa_token_shard_op(group, build_pooled_qsa_op()),
+                kv_heads=self.num_kv_heads,
+                **keywords,
+            )
         # With VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP a single-graph module (the
         # MTP draft, traced once for every bucket including prefill chunks)
         # keeps the replicated indexer: it cannot pick per bucket.
@@ -583,6 +607,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         rows=None,
         reduce=True,
         replicated_indexer=False,
+        token_shard=False,
     ):
         """Attention output and selected tokens.
 
@@ -594,10 +619,12 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         the rows; the dedicated-cache path attends all tokens and picks.
 
         ``replicated_indexer`` (static per graph): keep the replicated indexer
-        even when the TP-sharded one is built.
+        even when the TP-sharded one is built. ``token_shard`` (static per
+        graph, the prefill sequence-parallel backbone): index this rank's
+        token shard of the step and all-gather the selections, when built.
         """
         output, selected = self.attend_with_indices(
-            hidden, positions, metadata, rows, replicated_indexer
+            hidden, positions, metadata, rows, replicated_indexer, token_shard
         )
         output = self.o_proj(output)
         if reduce and self.tp_size > 1:
@@ -609,7 +636,13 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         return self.attend_with_indices(hidden, positions, metadata)[0]
 
     def attend_with_indices(
-        self, hidden, positions, metadata: QSAMetadata, rows=None, replicated_indexer=False
+        self,
+        hidden,
+        positions,
+        metadata: QSAMetadata,
+        rows=None,
+        replicated_indexer=False,
+        token_shard=False,
     ):
         """``forward_with_indices`` without the output projection and all-reduce."""
         assert len(self.cache_owners) == (1 if self.pooled else 4), (
@@ -640,6 +673,10 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         ):
             # The TP-sharded indexer; it also takes an optional rows operand.
             op = self._shard_op
+        token_shard_op = getattr(self, "_token_shard_op", None)
+        if token_shard and rows is None and token_shard_op is not None:
+            # Takes precedence over the key-sharded indexer in this graph.
+            op = partial(token_shard_op, shard_index=self.token_shard_index)
         output, selected = op(
             self.q_proj(hidden),
             self.k_proj(hidden),

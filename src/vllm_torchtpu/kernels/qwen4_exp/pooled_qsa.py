@@ -862,6 +862,22 @@ def merge_candidates(candidates, k, *, topk=None):
     return jax.lax.cond(jnp.any(ambiguous), reselect, lambda b: b, blocks)
 
 
+def token_shard_step(starts, context, shard_index, rows):
+    """Request layout of token rows ``[s * rows, (s + 1) * rows)`` of a step.
+
+    ``shard_index``: int32 ``[1]`` (an operand, so every rank traces the same
+    program). Returns ``(base, sub_starts, sub_context)``: the shard's first
+    row, the request starts re-based to the shard and each request's context
+    advanced by its rows before the shard. A request's rows in the shard see
+    the same keys as in the whole step, so the indexer selects the same
+    blocks for them; rows past ``starts[-1]`` stay outside every request.
+    """
+    base = shard_index.reshape(()).astype(jnp.int32) * rows
+    sub_starts = jnp.clip(starts - base, 0, rows).astype(starts.dtype)
+    before = jnp.clip(base - starts[:-1], 0, starts[1:] - starts[:-1])
+    return base, sub_starts, (context + before).astype(context.dtype)
+
+
 def select_blocks(
     query,
     pool,
@@ -1100,6 +1116,7 @@ def _pooled_qsa(
     rows: jax.Array | None = None,
     select_only: bool = False,
     shard: tuple[int, int] | None = None,
+    token_shard: tuple[jax.Array, int] | None = None,
 ) -> tuple[jax.Array, ...]:
     """One QSA layer over the unified pool.
 
@@ -1116,6 +1133,12 @@ def _pooled_qsa(
     returns ``(pool, q, gate, lengths, req, starts, candidates)`` for
     ``pooled_qsa_shard_attend``; ``req`` then indexes the per-request main
     table rows and ``starts`` is the attended token layout.
+
+    ``token_shard=(index, size)`` (``index`` int32 ``[1]``) runs the indexer
+    on token rows ``[index * T / size, (index + 1) * T / size)`` only and
+    returns the same tuple with that shard's ``[T / size, k]`` blocks in place
+    of ``candidates``; all-gather them for ``pooled_qsa_shard_attend`` with
+    ``merged``.
     """
     # Keep the Runner's flat group tables at the Torch boundary. Static JAX
     # shapes reconstruct their per-request rows inside the operator.
@@ -1253,6 +1276,29 @@ def _pooled_qsa(
         starts = jnp.arange(len(rows) + 1, dtype=jnp.int32)
         context = jnp.maximum(lengths - 1, 0)
         keep = picked = None
+    if token_shard is not None:
+        assert rows is None, "the token shard covers the all-token prefill path"
+        index, size = token_shard
+        width = len(iq) // size
+        base, sub_starts, sub_context = token_shard_step(starts, context, index, width)
+
+        def own(x):
+            return jax.lax.dynamic_slice_in_dim(x, base, width)
+
+        blocks = select_blocks(
+            own(iq),
+            pool,
+            own(lengths),
+            compressed_table,
+            own(req),
+            sub_starts,
+            sub_context,
+            ratio=compress_ratio,
+            block_topk=token_topk // compress_ratio,
+            slot=compressed_slot,
+            max_query_len=max_query_len,
+        )
+        return pool, q, gate, lengths, req, starts, blocks
     if shard is not None:
         block_topk = token_topk // compress_ratio
 
@@ -1449,6 +1495,71 @@ def pooled_qsa_shard_select_step(
         max_query_len=max_query_len,
         rows=None,
         shard=(shard_rank, shard_size),
+    )
+
+
+def pooled_qsa_token_select_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    shard_index: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    shard_size: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Cache writes and the indexer on this TP rank's token shard.
+
+    ``shard_index``: int32 ``[1]``, the rank. Returns ``(pool, q, gate,
+    lengths, req, starts, blocks)``; all-gather ``blocks`` over the TP group
+    and finish with ``pooled_qsa_shard_attend_step(merged=True)``.
+    """
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        token_shard=(shard_index, shard_size),
     )
 
 
