@@ -30,6 +30,7 @@ CASES = {
 
 def written(monkeypatch, run_write, args, options):
     monkeypatch.setattr(envs, "VLLM_TPU_QSA_COMPRESSED_RUN_WRITE", run_write)
+    monkeypatch.setattr(envs, "VLLM_TPU_QSA_COMPRESSED_RUN_WRITE_MIN_TOKENS", 0)
     jax.clear_caches()
     pool, _, _ = run(monkeypatch, False, args, **options)
     return raw(pool)

@@ -490,7 +490,10 @@ def write_compressed(
     pair, write, mask, values = compressed_pairs(
         pool, keys, complete, req, logical, starts, context, table, ratio, slot
     )
-    if envs.VLLM_TPU_QSA_COMPRESSED_RUN_WRITE:
+    if (
+        envs.VLLM_TPU_QSA_COMPRESSED_RUN_WRITE
+        and len(keys) >= envs.VLLM_TPU_QSA_COMPRESSED_RUN_WRITE_MIN_TOKENS
+    ):
         from vllm_torchtpu.kernels.qwen4_exp.compressed_write import write_runs
 
         return write_runs(
