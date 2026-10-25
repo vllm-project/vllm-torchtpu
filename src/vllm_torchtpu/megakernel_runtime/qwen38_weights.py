@@ -208,5 +208,8 @@ def pack_segment_operands(
             k_in = t.shape[-2]
             if k_in < nt * tk:
                 t = F.pad(t, (0, 0, 0, nt * tk - k_in))
-            out.append(t.reshape(*t.shape[:-2], nt, tk, t.shape[-1]).contiguous())
+            # Merged tile dims ([..., nt * tk, N]); the kernel's unpack_local_weight
+            # splits them under jit. A rank-4 operand is re-laid out by torch_tpu
+            # on every call (q40 j-c2430942: ~1.8 ms/step of execute_as_strided).
+            out.append(t.contiguous())
     return out

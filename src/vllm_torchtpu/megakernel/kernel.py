@@ -450,7 +450,13 @@ def unpack_local_weight(
     name: str = "",
     allow_expert_reshape: bool = False,
 ) -> jax.Array:
-    """Unpack a shard_map-local weight shard to `target_sh`, validating its shape."""
+    """Unpack a shard_map-local weight shard to `target_sh`, validating its shape.
+
+    With `allow_expert_reshape`, a rank-4+ weight may also arrive with its two
+    tile dims merged (`[..., nt * tk, N]`) and is reshaped here, a free XLA
+    bitcast: torch_tpu passes rank-3 operands as they are but re-lays out
+    rank-4 bf16 operands in an `execute_as_strided` program on every call.
+    """
     if x.shape == (1, *target_sh):
         return x[0]
     if x.shape == target_sh:
@@ -493,7 +499,7 @@ def make_step(
                     x,
                     target_weight_shape(wsh[k]),
                     name=k,
-                    allow_expert_reshape=k in p.dynamic_kinds,
+                    allow_expert_reshape=True,
                 )
                 for x in weights[k]
             )
@@ -502,7 +508,7 @@ def make_step(
                 weights[k],
                 target_weight_shape(wsh[k]),
                 name=k,
-                allow_expert_reshape=k in p.dynamic_kinds,
+                allow_expert_reshape=True,
             )
             for k in w_names
         ]
