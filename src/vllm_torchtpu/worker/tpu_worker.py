@@ -788,6 +788,9 @@ class TPUWorker(WorkerBase):
         # torch records every compile artifact for save_cache_artifacts(), which
         # vLLM never calls; drop the record so its memory can be freed.
         CacheArtifactManager.clear()
+        from vllm_torchtpu.runner.hostmem_release import report_and_maybe_drop
+
+        report_and_maybe_drop()
         # The warmed worker holds a large static heap (model, compiled
         # executables, KV bookkeeping); freezing it keeps a gen-2 collection
         # from scanning those objects mid-step.
