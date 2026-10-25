@@ -609,3 +609,13 @@ def get_tuned_block_sizes(
         return TunedValue(128, 128, 128)
     else:
         return tuned_value
+
+
+# (TPU generation, tokens, K, N) -> (weight columns, quant rows, VMEM budget).
+# v7 P7 complete-call XPlane A/B: T240 23.419 -> 20.005 us; T288
+# 25.288 -> 20.420 us. N=1024 balances weight refill and MXU work with two
+# generations; input chunking and earlier refill did not improve the call.
+BUFFERED_MATMUL_TUNING = {
+    (7, 240, 8192, 5120): (1024, 32, 56 * 1024**2),
+    (7, 288, 8192, 5120): (1024, 32, 56 * 1024**2),
+}

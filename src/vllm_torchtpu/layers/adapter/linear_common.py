@@ -10,6 +10,12 @@ from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
+from vllm_torchtpu.kernels.quantized_matmul.buffered import (
+    buffered_matmul,
+)
+from vllm_torchtpu.kernels.quantized_matmul.buffered import (
+    is_supported as is_buffered_matmul_supported,
+)
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
 # Some layers have their `.weight` read raw -- bypassing the linear method's
@@ -91,6 +97,8 @@ def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.A
             maybe_quantize_lhs=True,
             zero_initialize=True,
         )
+    if is_buffered_matmul_supported(x, w_q, w_s):
+        return buffered_matmul(x, w_q, w_s)
     return xla_quantized_matmul(x, w_q, w_s)
 
 

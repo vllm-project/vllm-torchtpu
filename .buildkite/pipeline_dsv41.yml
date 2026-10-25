@@ -17,6 +17,26 @@
 # not run here.
 
 steps:
+  - label: "DeepSeek-V4.1 output projection: dispatch, parity and export"
+    key: "dsv41_output_projection"
+    depends_on: "build_docker"
+    timeout_in_minutes: 30
+    agents:
+      queue: "tpu_v7x_2_queue"
+    commands:
+      - >-
+        bash .buildkite/scripts/run_in_docker.sh
+        bash -euc '
+        python -m pytest tests/models/vllm/test_dsv41_output_projection.py
+        -q --junitxml=/perf_eval_results/dsv41-output-projection.xml;
+        export LIBTPU_INIT_ARGS="--xla_tpu_dvfs_p_state=7 --xla_enable_custom_call_region_trace=false";
+        python scripts/dsv41_bench/bench_output_projection.py --tokens 240
+        --output /perf_eval_results/output-projection-240;
+        python scripts/dsv41_bench/bench_output_projection.py --tokens 288
+        --output /perf_eval_results/output-projection-288'
+    artifact_paths:
+      - "perf_eval_results/**/*"
+
   - label: "DeepSeek-V4.1 projection/RoPE: dispatch, parity and export"
     key: "dsv41_projection_rope"
     depends_on: "build_docker"

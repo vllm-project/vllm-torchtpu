@@ -25,6 +25,8 @@ from vllm_torchtpu.kernels.deepseek_v4.rope import (
     _cos_sin_lanes,
     _rotate_gptj,
 )
+from vllm_torchtpu.kernels.deepseek_v4.tuned_block_sizes import OUTPUT_PROJECTION_TUNING
+from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import get_tpu_version
 from vllm_torchtpu.layers.core.quantization import FP8_E4M3_MAX
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
@@ -219,6 +221,128 @@ def _kernel(
         out_ref[rows] = (partial * scale).astype(out_dtype)
 
 
+def _buffered_kernel(
+    x, w, s, out, xb, wb, sb, ob, xsem, wsem, ssem, osem, *, depth: int
+):
+    groups = x.shape[1] // SUBLANE
+    width = w.shape[1] // groups
+
+    def inputs(i):
+        return (
+            pltpu.make_async_copy(
+                x.at[:, pl.ds(i * SUBLANE, SUBLANE), :],
+                xb.at[i % depth],
+                xsem.at[i % depth],
+            ),
+            pltpu.make_async_copy(
+                w.at[:, pl.ds(i * width, width)], wb.at[i % depth], wsem.at[i % depth]
+            ),
+        )
+
+    def output(i):
+        return pltpu.make_async_copy(
+            ob.at[i % depth], out.at[:, pl.ds(i * width, width)], osem.at[i % depth]
+        )
+
+    with jax.named_scope("oa_dma_startup"):
+        pltpu.make_async_copy(s, sb, ssem).start()
+        for i in range(depth):
+            a, b = inputs(i)
+            a.start()
+            b.start()
+        pltpu.make_async_copy(s, sb, ssem).wait()
+
+    @pl.loop(0, groups, unroll=False)
+    def body(i):
+        with jax.named_scope("oa_input_wait"):
+            a, b = inputs(i)
+            a.wait()
+            b.wait()
+        with jax.named_scope("oa_output_recycle"):
+
+            @pl.when(i >= depth)
+            def recycle():
+                output(i - depth).wait()
+
+        with jax.named_scope("oa_compute"):
+            _kernel(
+                xb.at[i % depth],
+                wb.at[i % depth],
+                sb.at[:, pl.ds(i * width, width)],
+                None,
+                ob.at[i % depth],
+                tile_t=x.shape[0],
+                num_sub_t=1,
+                quantize_activations=True,
+                head_dim=x.shape[2],
+            )
+        with jax.named_scope("oa_prefetch_next"):
+
+            @pl.when(i + depth < groups)
+            def refill():
+                a, b = inputs(i + depth)
+                a.start()
+                b.start()
+
+        with jax.named_scope("oa_output_issue"):
+            output(i).start()
+
+    # All stores must finish before scratch can be released. Earlier stores
+    # were drained before their output slot was reused.
+    with jax.named_scope("oa_output_drain"):
+        for i in range(groups - depth, groups):
+            output(i).wait()
+
+
+def is_buffered_projection_supported(
+    x: jax.Array, w: jax.Array, scale: jax.Array
+) -> bool:
+    """Whether inputs match the measured v7 grouped-projection envelope."""
+    return (
+        x.ndim == 3
+        and x.shape[1:] == (64, 512)
+        and x.shape[0] in (240, 288)
+        and w.shape == (4096, 8192)
+        and scale.shape == (8192,)
+        and x.dtype == jnp.bfloat16
+        and w.dtype == jnp.float8_e4m3fn
+        and scale.dtype == jnp.float32
+        and get_tpu_version() == 7
+    )
+
+
+def _buffered_projection(
+    x: jax.Array, w: jax.Array, scale: jax.Array, *, name: str
+) -> jax.Array:
+    tokens, heads, head_dim = x.shape
+    reduction, out_features = w.shape
+    depth, vmem_budget = OUTPUT_PROJECTION_TUNING[
+        (get_tpu_version(), tokens, heads, head_dim, reduction, out_features)
+    ]
+    width = out_features // (heads // SUBLANE)
+    x = pltpu.with_memory_space_constraint(x, pltpu.HBM)
+    w = pltpu.with_memory_space_constraint(w, pltpu.HBM)
+    scale = pltpu.with_memory_space_constraint(scale, pltpu.HBM)
+    return pl.pallas_call(
+        functools.partial(_buffered_kernel, depth=depth),
+        out_shape=jax.ShapeDtypeStruct((tokens, out_features), x.dtype),
+        in_specs=(pl.BlockSpec(memory_space=pltpu.HBM),) * 3,
+        out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+        scratch_shapes=(
+            pltpu.VMEM((depth, tokens, SUBLANE, head_dim), x.dtype),
+            pltpu.VMEM((depth, reduction, width), w.dtype),
+            pltpu.VMEM((1, out_features), scale.dtype),
+            pltpu.VMEM((depth, tokens, width), x.dtype),
+            pltpu.SemaphoreType.DMA((depth,)),
+            pltpu.SemaphoreType.DMA((depth,)),
+            pltpu.SemaphoreType.DMA,
+            pltpu.SemaphoreType.DMA((depth,)),
+        ),
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=vmem_budget),
+        name=f"{name}_buffered",
+    )(x, w, scale.reshape(1, out_features))
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -258,6 +382,18 @@ def wo_a_projection(
     the kernel so both MXU operands are fp8. ``cos_sin=None`` consumes an
     already inverse-rotated input without loading a cache or rotating again.
     """
+    # Select after Torch export, when the JAX token shape is concrete. Explicit
+    # tiling and inverse-RoPE calls retain the original pipeline.
+    if (
+        cos_sin is None
+        and quantize_activations
+        and tile_t is None
+        and tile_r is None
+        and sub_t is None
+        and is_buffered_projection_supported(x, wo_a, wo_a_scale)
+    ):
+        return _buffered_projection(x, wo_a, wo_a_scale, name=name)
+
     assert x.ndim == 3
     assert x.dtype == jnp.bfloat16
     assert wo_a.ndim == 2 and wo_a_scale.ndim == 1
