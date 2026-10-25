@@ -20,10 +20,17 @@ import torch
 from torch_tpu._internal import pallas
 
 
-# Without this op, vLLM loads an adapter with hundreds of small eager writes,
-# and each write runs as a separate TPU program. This op writes the adapter's
-# slot of every stacked tensor in one program. It is a JAX op so the stacked
-# tensors can be donated and updated in place.
+# Without this op, vLLM's activate_adapter writes an adapter one stacked tensor
+# at a time: for every LoRA module, slice and A/B tensor, reset_lora zeroes the
+# slot and set_lora copies the adapter's weights into it from the host. On TPU
+# each of these writes runs as its own small program and each copy is its own
+# host-to-device transfer, so one load costs hundreds of program launches and
+# transfers (about 800 writes for Qwen3-0.6B). Each program also has the slot
+# index built in as a constant, so every slot compiles its own set.
+# This op takes the adapter's slot of every stacked tensor packed into one
+# tensor, so a load is one transfer and one program, and it takes the slot
+# index as an input, so one compile serves every slot. It is a JAX op so the
+# stacked tensors can be donated and updated in place.
 def _compute_slot_update(
     stacked_weights: list[jax.Array], slot_weights: jax.Array, slot_index: jax.Array
 ) -> list[jax.Array]:
