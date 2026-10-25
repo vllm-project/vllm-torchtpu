@@ -153,6 +153,28 @@ def test_decode_gather_and_reuse_preserve_valid_counts():
     np.testing.assert_array_equal(reused, output)
 
 
+@pytest.mark.parametrize("invalid", [np.nan, np.inf])
+def test_decode_ignores_nonfinite_swa_outside_visible_window(invalid):
+    if jax.default_backend() != "tpu":
+        pytest.skip("Compiled decode accumulator operations require TPU")
+    args, kwargs = _decode_inputs(2, 64, 64)
+    expected = csa2_attention(*args, **kwargs)
+    cache = np.asarray(args[3]).copy()
+    visible = np.zeros(cache.shape[:2], dtype=bool)
+    for seq, first in enumerate(np.asarray(args[5])[::6]):
+        base, minimum, *pages = np.asarray(kwargs["swa_metadata"])[seq]
+        for column, page in enumerate(pages):
+            positions = base + column * 64 + np.arange(64)
+            visible[page] |= (positions >= max(first - 127, minimum)) & (
+                positions < first + 6
+            )
+    cache[~visible] = invalid
+    poisoned = (*args[:3], jnp.asarray(cache), *args[4:])
+    actual = csa2_attention(*poisoned, **kwargs)
+    assert np.isfinite(np.asarray(actual, np.float32)).all()
+    np.testing.assert_allclose(actual, expected, atol=3e-3, rtol=2e-2)
+
+
 @pytest.mark.parametrize("heads", [8, 16, 32, 64, 96, 104, 128])
 def test_csa2_accumulator_pipeline_matches_reference(heads: int) -> None:
     """Cover both accumulator layouts and every one-to-six-query tail."""

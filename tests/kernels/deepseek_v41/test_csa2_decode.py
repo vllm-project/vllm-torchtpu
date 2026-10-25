@@ -9,8 +9,44 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental import pallas as pl
 
 from vllm_torchtpu.kernels.deepseek_v41.csa2.decode import csa2_decode
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("batch,tokens", [(3, 6), (4, 6), (2, 16)])
+def test_decode_buffered_index_maps_allow_epilogue_lookahead(
+    monkeypatch, benchmark, batch, tokens
+):
+    inputs = jax.tree.map(jnp.asarray, benchmark.make_inputs(batch, tokens, 8))
+
+    def inspect_call(kernel, *, out_shape, grid_spec, **unused):
+        def call(*operands):
+            # NumPy exposes out-of-range SMEM reads that JAX would clamp.
+            scalars = tuple(map(np.asarray, operands[:3]))
+            last = [n - 1 for n in grid_spec.grid]
+            specs = [
+                *jax.tree.leaves((grid_spec.in_specs, grid_spec.out_specs)),
+            ]
+            for axis, capacity in enumerate(grid_spec.grid):
+                for extra in (0, 1):
+                    lookahead = last.copy()
+                    lookahead[axis] = capacity + extra
+                    for spec in specs:
+                        if spec.index_map is None:
+                            continue
+                        np.testing.assert_array_equal(
+                            spec.index_map(*lookahead, *scalars),
+                            spec.index_map(*last, *scalars),
+                        )
+            return jnp.zeros(out_shape.shape, out_shape.dtype)
+
+        return call
+
+    monkeypatch.setattr(pl, "pallas_call", inspect_call)
+    with jax.disable_jit():
+        csa2_decode(**inputs, num_tokens=tokens)
 
 
 @pytest.fixture(scope="module")
