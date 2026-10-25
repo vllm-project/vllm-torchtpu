@@ -292,6 +292,11 @@ if [ "$CFG_PROXY" = router ]; then
     if [ -z "${K3_PD_PREFILL_POLICY:-}" ] && [ "${#PREFILL_HOSTS[@]}" -gt 1 ]; then
         K3_PD_PREFILL_POLICY=cache_aware
     fi
+    # With several decodes, power_of_two balances them by load; consistent_hash
+    # left one decode 18-39% above the mean.
+    if [ -z "${K3_PD_DECODE_POLICY:-}" ] && [ "${#DECODE_HOSTS[@]}" -gt 1 ]; then
+        K3_PD_DECODE_POLICY=power_of_two
+    fi
     if [ -n "${K3_PD_PREFILL_POLICY:-}${K3_PD_DECODE_POLICY:-}" ]; then
         vllm-router --help 2>&1 | grep -E -- '--(prefill|decode)-policy' \
             || { log "FATAL: vllm-router has no --prefill-policy/--decode-policy"; exit 2; }
