@@ -571,6 +571,7 @@ class Qwen38SegmentDriver:
         # `wholerows=N`: whole-step only up to N rows (its in-kernel indexer / attention run row
         # by row, ~0.25 ms per row: it loses to the segment / stock path at high concurrency).
         self.whole_max_rows = 16
+        self.whole_above = "stock"  # `wholeabove=stock|seg`: steps above `wholerows`
         self.whole_program = None
         self.whole_calls = 0
 
@@ -642,6 +643,9 @@ class Qwen38SegmentDriver:
         rows_max = _parse_int(raw, "wholerows")
         if rows_max is not None:
             drv.whole_max_rows = rows_max
+        for part in raw.split(","):
+            if part.startswith("wholeabove="):
+                drv.whole_above = part[len("wholeabove=") :]
         for part in raw.split(","):
             if part.startswith("wholehold="):
                 drv.whole_hold = part[len("wholehold=") :]
@@ -1299,6 +1303,9 @@ class Qwen38SegmentDriver:
             return False, None
         if rows not in self.buckets or n_req * T_VERIFY > rows:
             self._note(f"stock_rows{rows}_n{n_req}")
+            return False, None
+        if self.whole_program is not None and rows > self.whole_max_rows and self.whole_above == "stock":
+            self._note(f"stock_above_whole_b{rows}")
             return False, None
         self._note(f"mk_b{rows}")
         self.mk_calls += 1
