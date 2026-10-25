@@ -204,7 +204,7 @@ CTX_C = [3001, 100]  # request 0: g_a holds one old token; request 1: g_a starts
 
 def _run_c(key: int = 17, T: int = 4):
     from vllm_torchtpu.megakernel.wholestep.qsa_full_b import DBG_IDS, DBG_IQ
-    from vllm_torchtpu.megakernel.wholestep.qsa_full_c import CK_NEW, RING_NEW
+    from vllm_torchtpu.megakernel.wholestep.qsa_full_c import CK_NEW, IR_NEW, KR_NEW, RING_NEW
 
     R = 2
     ex = ExecSpec(R=R, B=2 * T, T=T, ctx=128, interpret=True, tiles=_TILES)
@@ -231,6 +231,8 @@ def _run_c(key: int = 17, T: int = 4):
     iq = np.asarray(outs[DBG_IQ], np.float32).reshape(R, n_att, ex.M, -1)[0, :, :B]
     ids = np.asarray(outs[DBG_IDS]).reshape(R, n_att, ex.M, -1)[0, :, :B]
     x0 = np.asarray(d["inp"].x[:B], np.float32)
+    d["_kr_new"] = np.asarray(outs[KR_NEW], np.float32).reshape(R, n_att, ex.M, -1)[:, :, :B]
+    d["_ir_new"] = np.asarray(outs[IR_NEW], np.float32).reshape(R, n_att, ex.M, -1)[:, :, :B]
     return res, np.asarray(ref, np.float32), x0, ck, ring, steps, iq, ids, d
 
 
@@ -265,9 +267,13 @@ def test_step_tokens_match_stock_semantics():
     the per-row budget: a 1-ulp drift of the index query flips boundary groups there (the
     selection itself is exact on the kernel's own queries, the strict test above); only their
     mean error is bounded, at 3x the depth-scaled mean budget."""
-    res, ref, x, ck, ring, steps, _, _, _ = _run_c()
+    res, ref, x, ck, ring, steps, _, _, d = _run_c()
     assert float(np.std(ref - x)) > 0.05
     for o, s in enumerate(steps):
+        # Cache-writer inputs: raw index key (replicated) and each rank's un-normed key.
+        for r in range(d["_kr_new"].shape[0]):
+            np.testing.assert_allclose(d["_ir_new"][r, o], np.asarray(s["raw"], np.float32), atol=0.1, rtol=0.05)
+            np.testing.assert_allclose(d["_kr_new"][r, o], np.asarray(s["kr"][r], np.float32), atol=0.1, rtol=0.05)
         for q in range(len(CTX_C)):
             np.testing.assert_allclose(ck[o, q], np.asarray(s["ck"][q], np.float32)[0], atol=0.1, rtol=0.05)
             np.testing.assert_allclose(ring[o, q], np.asarray(s["ring"][q], np.float32), atol=0.1, rtol=0.05)

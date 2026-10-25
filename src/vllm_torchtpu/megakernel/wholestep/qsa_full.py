@@ -158,6 +158,8 @@ class QSAFullBlock(Block):
         k = rmsnorm(y[:, k0 : k0 + hd], kn, g.eps, zero_centered=True)
         scr["qf_kv"][:, :hd] = main_rope(k, cos, sin, rot).astype(BF16)
         scr["qf_kv"][:, hd:] = y[:, k0 + hd : k0 + 2 * hd].astype(BF16)
+        if "qf_kr" in scr:  # the un-normed key projection, for the stock cache writer
+            scr["qf_kr"][...] = y[:, k0 : k0 + hd].astype(BF16)
         o = ctx.stream.sp.block_ord(l, self.name)
         kv = pltpu.make_async_copy(
             scr["qf_kv"], ctx.O[KV_NEW].at[o, pl.ds(0, ex.MB)], scr["qf_sem"].at[1]

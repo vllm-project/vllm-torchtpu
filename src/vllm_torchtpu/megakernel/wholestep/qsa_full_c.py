@@ -52,6 +52,10 @@ RING = "qsa_ring"  # [requests, 8, 128] raw index-key ring (lane = position % 8)
 ROPE_CK = "qsa_rope_ck"  # [requests, 128] RoPE row at the completed group's first position
 CK_NEW = "qsa_ck_new"
 RING_NEW = "qsa_ring_new"
+# Projections the post-kernel scatter feeds to the stock cache writers
+# (`pooled_qsa.qsa_cache_writes`): the un-normed key and the raw index key per row.
+KR_NEW = "qsa_kr_new"
+IR_NEW = "qsa_ir_new"
 FP8_MAX = 448.0
 
 
@@ -83,11 +87,13 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         return super().outputs(g, ex) + [
             StateDecl(CK_NEW, (nreq, 1, ix.IDX_DIM), BF16, "w"),
             StateDecl(RING_NEW, (nreq, 8, ix.IDX_DIM), BF16, "w"),
+            StateDecl(KR_NEW, (ex.M, g.HD), BF16, "w"),
+            StateDecl(IR_NEW, (ex.M, ix.IDX_DIM), BF16, "w"),
         ]
 
     def host_update_states(self, g, ex, pos, states, raw_outputs):  # noqa: ANN001
         out = super().host_update_states(g, ex, pos, states, raw_outputs)
-        out.update({k: raw_outputs[k] for k in (CK_NEW, RING_NEW)})
+        out.update({k: raw_outputs[k] for k in (CK_NEW, RING_NEW, KR_NEW, IR_NEW)})
         return out
 
     def extra_inputs(self, g: Any, ex: ExecSpec) -> list[ExtraInput]:
@@ -110,6 +116,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             ScratchReq("qc_rv", pltpu.VMEM((nreq, 8, 256), F32)),
             ScratchReq("qc_sga", pltpu.SMEM((ex.MB,), I32)),
             ScratchReq("qc_sem", pltpu.SemaphoreType.DMA((3,))),
+            ScratchReq("qf_kr", pltpu.VMEM((ex.MB, g.HD), BF16)),
+            ScratchReq("qc_ir", pltpu.VMEM((ex.MB, ix.IDX_DIM), BF16)),
+            ScratchReq("qc_osem", pltpu.SemaphoreType.DMA((2,))),
         ]
 
     # ------------------------------------------------------------ in kernel
@@ -200,6 +209,14 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         sin = scr["qf_rope"][:, rot // 2 : rot]
         iq = ix.index_query(yi, ctx.sm(slot, "qsa_iqn"), cos, sin, rot, g.eps, pltpu.bitcast)
         raw = yi[:, 4 * ix.IDX_DIM : 5 * ix.IDX_DIM]
+        scr["qc_ir"][...] = raw.astype(BF16)
+        o = ctx.stream.sp.block_ord(l, self.name)
+        outs = [
+            pltpu.make_async_copy(scr[src], ctx.O[dst].at[o, pl.ds(0, MB)], scr["qc_osem"].at[i])
+            for i, (src, dst) in enumerate((("qf_kr", KR_NEW), ("qc_ir", IR_NEW)))
+        ]
+        for c in outs:
+            c.start()
         nreq = MB // T
         for q in range(nreq):
             for t in range(T):
@@ -275,6 +292,8 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             return carry
 
         jax.lax.fori_loop(0, MB, row, 0)
+        for c in outs:
+            c.wait()
         if self.debug:  # the kernel's queries and pool-path ids; g_a's flag in id slot K-1
             from .qsa_full_b import DBG_IDS, DBG_IQ
 

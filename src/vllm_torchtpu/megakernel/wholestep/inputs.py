@@ -149,7 +149,11 @@ def wholestep_reference(
                     dl = layer_view(d, o_att)
                     if r == 0:
                         ssel = step_selection(g, ex, dl, mixed, o_att, d["budget"])
+                        ssel["kr"] = {}
                         step_out.append(ssel)
+                    # The un-normed key projection of this rank's KV head (cache-writer input).
+                    y_r = rnd(jnp.dot(mixed.astype(BF16), d["qkvg"][r, o_att], preferred_element_type=F32))
+                    ssel["kr"][r] = y_r[:, 2 * nh * hd : (2 * nh + 1) * hd].astype(BF16)
                     attn = step_attention(g, ex, dl, ssel["sel"], q, gate, kk, vv, r).reshape(B, -1)
                     delta = delta + jnp.dot(
                         attn.astype(BF16), d["o_proj"][r, o_att], preferred_element_type=F32
@@ -420,7 +424,7 @@ def step_selection(g: Qwen38Geometry, ex: ExecSpec, d: dict[str, Any], mixed: ja
     cos, sin = rope[:, : g.ROT // 2], rope[:, g.ROT // 2 : g.ROT]
     iq = index_query(y, d["iqn"][o_att], cos, sin, g.ROT, g.eps, bc)
     raw = y[:, 4 * IDX_DIM : 5 * IDX_DIM]
-    out = {"ck": {}, "ring": {}, "sel": {}}
+    out = {"ck": {}, "ring": {}, "sel": {}, "raw": raw.astype(BF16)}
     for q in range(-(-B // T)):
         c0 = int(d["ctxq"][q])
         p3 = c0 + (3 - c0 % 4) % 4
