@@ -15,6 +15,7 @@
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -93,6 +94,7 @@ def test_complete_layer_dense_context_against_plain_torch(fp8, tmp_path):
         init_distributed_environment,
         initialize_model_parallel,
     )
+    from vllm.forward_context import set_forward_context
     from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
     from vllm_torchtpu.models.vllm.qwen4_exp.qsa import QSAMetadata, Qwen4ExpQSA
@@ -173,9 +175,20 @@ def test_complete_layer_dense_context_against_plain_torch(fp8, tmp_path):
                         for x in (starts, lengths, slots, pages, pages.clone())
                     )
                 )
-                output, selected = compiled(
-                    hidden.to("tpu"), positions.to("tpu"), metadata
-                )
+                # The compact layer reads scheduler-owned tables from the
+                # production forward context, not the legacy metadata fields.
+                per_layer = {
+                    model.prefix: SimpleNamespace(
+                        block_tables=metadata.main_block_table
+                    ),
+                    model.prefix + ".raw_ring": SimpleNamespace(
+                        block_tables=metadata.state_slots
+                    ),
+                }
+                with set_forward_context(per_layer, config, num_tokens=bucket):
+                    output, selected = compiled(
+                        hidden.to("tpu"), positions.to("tpu"), metadata
+                    )
                 synchronize_tensors([output, selected, *owners])
                 actual = output.cpu().float().numpy()
                 expected_np = expected.float().numpy()
