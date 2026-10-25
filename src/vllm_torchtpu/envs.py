@@ -114,6 +114,7 @@ if TYPE_CHECKING:
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     FUSED_MOE_PREFILL_KERNEL: bool = True
     FUSED_MOE_PREFILL_KERNEL_V2: bool = False
+    TPU_MOE_PREFILL_SUM_IN_KERNEL_MAX_TOKENS: int = 0
     TPU_MOE_SINGLE_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_MOE_TP_DECODE_FAST: bool = True
@@ -1190,6 +1191,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to it. Whole experts only: layers the default build serves in blocked
     # mode keep it.
     "FUSED_MOE_PREFILL_KERNEL_V2": env_bool("FUSED_MOE_PREFILL_KERNEL_V2"),
+    # With FUSED_MOE_PREFILL_KERNEL_V2: the largest token count at which the
+    # stage-A expert kernel sums each token's weighted expert rows in an f32
+    # VMEM array and writes the MoE output itself, instead of writing every
+    # expert row to an expert-major slab in HBM for a separate combine kernel
+    # to read back (453 MB per layer at 4096 tokens). 0 = off. Up to 1024 on
+    # GLM-5.2's TP16 slice: 24 MiB of sums beside the kernel's 23 MiB of
+    # buffers; 2048 tokens would need 71 MiB. Token counts must be a multiple
+    # of the kernel's tile rows (128 below 4096 tokens). Not bit-identical:
+    # each expert row is rounded to bf16 after its routing weight is applied,
+    # not before.
+    "TPU_MOE_PREFILL_SUM_IN_KERNEL_MAX_TOKENS": env_nonnegative_int(
+        "TPU_MOE_PREFILL_SUM_IN_KERNEL_MAX_TOKENS", 0
+    ),
     # Build the MoE permutation, its inverse, and the sorted token ids from
     # one packed sort instead of three. The ragged (counting sort) path ignores it.
     "TPU_MOE_SINGLE_SORT": env_bool("TPU_MOE_SINGLE_SORT", True),
