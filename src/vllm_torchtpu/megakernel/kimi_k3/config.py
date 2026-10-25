@@ -11,6 +11,7 @@ the standalone tools install overrides before building the program.
 import dataclasses
 import hashlib
 import json
+import os
 from typing import Any
 
 from vllm_torchtpu.megakernel.config import set_active_kernel_config
@@ -79,11 +80,21 @@ class KernelConfig:
     dcp_skip: tuple[str, ...] = ()
     debug_skip: tuple[str, ...] = ()
     phase_scopes: bool = False
+    # FP8 wires for attention DP's hidden-row gathers (off when empty): "t0"
+    # the attention input, "t10" the MoE input. Rows travel as e4m3 with one
+    # FP32 scale each; every rank uses the dequantized rows.
+    fp8_wires: tuple[str, ...] = dataclasses.field(
+        default_factory=lambda: tuple(
+            filter(None, os.environ.get("K3_FP8_WIRES", "").split(","))
+        )
+    )
     pool_report: bool = False
     vmem_report: bool = False
     vmem_pad_kb: int = 0
 
     def __post_init__(self) -> None:
+        if not set(self.fp8_wires) <= {"t0", "t10"}:
+            raise ValueError("fp8_wires holds t0 and/or t10")
         if self.prefill_expert_parallel not in (8, 16, 32):
             raise ValueError("prefill_expert_parallel is 8, 16 or 32")
         if self.moe_reduce_dtype not in ("float32", "bfloat16"):
