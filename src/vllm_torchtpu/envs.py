@@ -31,6 +31,8 @@ if TYPE_CHECKING:
     TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS: int = 0
     TPU_DCP_MERGE_RS_BF16: int = 0
     TPU_DCP_MLA_SMALL_CHUNK_TOKENS: int = 16
+    TPU_DCP_MLA_SMALL_CHUNK_GATHER_ATOMS: str = ""
+    TPU_MLA_GATHER_EARLY_DMA: bool = False
     TPU_DCP_MLA_MASK_IN_KERNEL: bool = False
     TPU_DCP_MLA_FUSED_PREP: bool = False
     TPU_DCP_MLA_MIXED_LIVE: bool = False
@@ -860,6 +862,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernel default (unchanged); 32 also puts the 32-token MTP decode bucket
     # (5-8 running requests x 4 tokens) on that path. 0 disables it.
     "TPU_DCP_MLA_SMALL_CHUNK_TOKENS": env_int("TPU_DCP_MLA_SMALL_CHUNK_TOKENS", 16),
+    # DCP sparse MLA, small-chunk buckets: atoms per batch of the live-bounded
+    # SparseCore gather per bucket, "T=<atoms>,..." (T = the bucket's tokens;
+    # <atoms> must divide it), e.g. "16=4,32=8". Every one-atom batch runs its
+    # own inner pipeline (~1.9 us per atom against ~1.1 us inside a larger
+    # batch); T/4 atoms give each of the 32 subcores one batch of a full
+    # bucket's first top-k window. Same rows gathered. Buckets it does not list
+    # keep one atom per batch (`small_chunk_gather_atoms`' default). "" = off.
+    "TPU_DCP_MLA_SMALL_CHUNK_GATHER_ATOMS": lambda: os.getenv(
+        "TPU_DCP_MLA_SMALL_CHUNK_GATHER_ATOMS", ""
+    ),
+    # DCP sparse MLA, decode buckets (<= 32 tokens): the native SparseCore
+    # gather starts its live-vector DMA, its first index block and every KV
+    # write round's destination row DMA at kernel entry, so they run under the
+    # TPU_MLA_KV_WRITE_IN_GATHER write phase and its fence instead of after
+    # it, one round trip each. Same rows, same writes, same fence.
+    "TPU_MLA_GATHER_EARLY_DMA": env_bool("TPU_MLA_GATHER_EARLY_DMA", default=False),
     # DCP sparse MLA, decode buckets (<= 32 tokens): drop the per-layer
     # owns mask / dummy key / lse select glue. The kernel takes each token's
     # true kv_len (0 = this rank owns none of its top-k), attends nothing for

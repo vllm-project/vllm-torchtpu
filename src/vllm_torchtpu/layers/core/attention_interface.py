@@ -1048,6 +1048,24 @@ def dcp_mla_topk_cap(dcp_size: int) -> int:
     return topk_cap
 
 
+def dcp_small_chunk_gather_atoms(num_tokens: int) -> int:
+    """TPU_DCP_MLA_SMALL_CHUNK_GATHER_ATOMS: the small-chunk SparseCore gather's
+    atoms per batch at a bucket of `num_tokens` (static: the JAX op's shape),
+    from its `T=<atoms>` entries; a bucket it does not list takes 1."""
+    spec = envs.TPU_DCP_MLA_SMALL_CHUNK_GATHER_ATOMS.strip()
+    for entry in filter(None, (e.strip() for e in spec.split(","))):
+        tokens, _, atoms = entry.partition("=")
+        if int(tokens) != num_tokens:
+            continue
+        if int(atoms) < 1 or num_tokens % int(atoms):
+            raise ValueError(
+                f"TPU_DCP_MLA_SMALL_CHUNK_GATHER_ATOMS: {entry!r} needs atoms "
+                f"dividing the {num_tokens}-token bucket"
+            )
+        return int(atoms)
+    return 1
+
+
 def _mixed_body_levers(value: str, kernel_v2: bool = False) -> tuple[str, ...]:
     """TPU_DCP_MLA_MIXED_BODY -> the live body's lever tuple ("1" = default set),
     plus the stage-A levers with TPU_DCP_MLA_MIXED_KERNEL_V2."""
@@ -1609,6 +1627,8 @@ def sparse_mla_attention_dcp(
             # Largest chunk (tokens) that takes the small-chunk path (16 =
             # kernel default).
             small_chunk_tokens=small_chunk_tokens,
+            small_chunk_gather_atoms=dcp_small_chunk_gather_atoms(topk_idx.shape[0]),
+            sparsecore_gather_early_dma=envs.TPU_MLA_GATHER_EARLY_DMA and decode_bucket,
             lse_mask_empty=mask_in_kernel,
             fused_window_prep=fused_prep,
             mixed_live_gather=envs.TPU_DCP_MLA_MIXED_LIVE,

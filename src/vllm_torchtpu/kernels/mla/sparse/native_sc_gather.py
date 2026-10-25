@@ -122,6 +122,8 @@ def _kernel(
     sem_ref: Any,
     live_vmem_ref: Any = None,
     live_sem_ref: Any = None,
+    index_vmem_ref: Any = None,
+    index_sem_ref: Any = None,
     *,
     core_axis_name: str,
     subcore_axis_name: str,
@@ -142,8 +144,34 @@ def _kernel(
     write_tokens: int = 0,
     write_fault: str | None = None,
     rope_words: int = ROPE_WORDS,
+    early_dma: bool = False,
 ):
     owner = lax.axis_index((core_axis_name, subcore_axis_name))
+
+    def index_copy(owner_batch, slot):
+        block = index_vmem_ref.shape[1]
+        return pltpu.make_async_copy(
+            indices_hbm_ref.at[
+                pl.ds((owner + owner_batch * num_owners) * block, block)
+            ],
+            index_vmem_ref.at[slot],
+            index_sem_ref.at[slot],
+        )
+
+    if index_vmem_ref is not None:
+        index_copy(0, 0).start()
+    live_copy = None
+    if live_hbm_ref is not None:
+        # The live logical-batch count arrives as a broadcast i32[NUM_LANES]
+        # vector. On SparseCore a scalar load is legal only from SMEM and SMEM
+        # only at rank 0 (jax/_src/pallas/mosaic/sc_lowering.py), so the count is
+        # DMA'd into a VMEM vector and lane 0 extracted -- the same shape as the
+        # in-repo dsa_gather.py:90 (`valid_ref[pl.ds(0, 16)][0]`).
+        live_copy = pltpu.make_async_copy(
+            live_hbm_ref, live_vmem_ref, live_sem_ref.at[0]
+        )
+        if early_dma:
+            live_copy.start()
     late_drain = None
     if write_refs is not None and write_fault != "late_write":
         assert write_scratch is not None
@@ -155,23 +183,20 @@ def _kernel(
             subcore=lax.axis_index(subcore_axis_name),
             num_tokens=write_tokens,
             fault=write_fault,
+            early_dma=early_dma,
         )
     live_batches = None
-    if live_hbm_ref is not None:
-        # The live logical-batch count arrives as a broadcast i32[NUM_LANES]
-        # vector. On SparseCore a scalar load is legal only from SMEM and SMEM
-        # only at rank 0 (jax/_src/pallas/mosaic/sc_lowering.py), so the count is
-        # DMA'd into a VMEM vector and lane 0 extracted -- the same shape as the
-        # in-repo dsa_gather.py:90 (`valid_ref[pl.ds(0, 16)][0]`).
-        cp = pltpu.make_async_copy(live_hbm_ref, live_vmem_ref, live_sem_ref.at[0])
-        cp.start()
-        cp.wait()
+    if live_copy is not None:
+        if not early_dma:
+            live_copy.start()
+        live_copy.wait()
         # Lanes [0,16) broadcast the live logical-batch count, lanes [16,32)
         # the per-owner trip count; only lane 0 of a vector is ever extracted.
         live_batches = live_vmem_ref[pl.ds(0, NUM_LANES)][0]
+    if index_vmem_ref is not None:
+        index_copy(0, 0).wait()
 
-    def serve_batch(indices_ref, row_atoms_ref=None):
-        owner_batch = pl.program_id(0)
+    def serve(owner_batch, indices_ref, row_atoms_ref=None):
         logical_batch = owner + owner_batch * num_owners
         occurrence_base = logical_batch * atoms_per_batch * OCCURRENCES_PER_ATOM
 
@@ -301,6 +326,9 @@ def _kernel(
         else:
             pl.when(pred)(run_inner)
 
+    def serve_batch(*refs):
+        serve(pl.program_id(0), *refs)
+
     if linear_indices:
         indices_spec = pl.BlockSpec(
             (atoms_per_batch * OCCURRENCES_PER_ATOM,),
@@ -321,12 +349,29 @@ def _kernel(
             ),
         )
         in_refs += (row_atoms_hbm_ref,)
+
+    def serve_owner_batches(num_batches):
+        if index_vmem_ref is None:
+            pltpu.emit_pipeline(
+                serve_batch,
+                grid=(num_batches,),
+                in_specs=in_specs,
+            )(*in_refs)
+            return
+
+        def serve_prefetched(owner_batch, slot):
+            next_slot = 1 - slot
+            pl.when(owner_batch + 1 < num_batches)(
+                lambda: index_copy(owner_batch + 1, next_slot).start()
+            )
+            pl.when(owner_batch > 0)(lambda: index_copy(owner_batch, slot).wait())
+            serve(owner_batch, index_vmem_ref.at[slot])
+            return next_slot
+
+        lax.fori_loop(0, num_batches, serve_prefetched, jnp.int32(0))
+
     if live_batches is None:
-        pltpu.emit_pipeline(
-            serve_batch,
-            grid=(batches_per_owner,),
-            in_specs=in_specs,
-        )(*in_refs)
+        serve_owner_batches(batches_per_owner)
     else:
         # Traced grid length for emit_pipeline on a VectorSubcoreMesh, and
         # pl.when around it for the zero-trip case -- both lower on v7x SC.
@@ -340,11 +385,7 @@ def _kernel(
 
         @pl.when(owner_batches > 0)
         def _serve_live():
-            pltpu.emit_pipeline(
-                serve_batch,
-                grid=(owner_batches,),
-                in_specs=in_specs,
-            )(*in_refs)
+            serve_owner_batches(owner_batches)
 
     if late_drain is not None:
         late_drain()
@@ -406,6 +447,59 @@ def _write_phase(
     subcore: jax.Array,
     num_tokens: int,
     fault: str | None,
+    early_dma: bool = False,
+) -> Any:
+    """Write this step's packed tokens into both caches, then fence.
+
+    Every SparseCore core writes every token: its `NUM_SUBCORES` subcores
+    split the tokens (subcore s takes tokens s, s + 16, ...), wait their own
+    DMAs, and meet at `subcore_barrier`. So every row a core's gather reads
+    was written -- and completed -- by that core before its first gather DMA
+    (the write-then-barrier-then-read pattern of upstream
+    tests/pallas/tpu_sparsecore_pallas_test.py:2227-2240 @ce57049). The other
+    core writes the same rows with identical bytes, so the race between the
+    two cores' writes and either core's reads cannot change a byte, and no
+    cross-core fence is needed.
+
+    On a SparseCore view a rope token is its own 32-word row (the gather's
+    `rope_cache.reshape(-1, 32)`; 16 words under packed rope), so unlike the
+    TensorCore writer there is no read-modify-write of the shared 512 B row.
+
+    Everything arrives in one operand, `write_rows` u32[3 * tokens, 128] (see
+    `pack_write_rows`): row `t` the packed nope token, row `tokens + t` the
+    packed rope token in words [0, 32) ([0, 16) under packed rope: the width
+    of `rope_cache_ref`'s rows), row `2 * tokens + t` `dst + 1`
+    broadcast (0 = skip: padding, or a row another DCP rank owns). One operand
+    because every TensorCore-produced SparseCore operand costs the producer
+    ~0.6 us at decode sizes (twin j-488b9087 / j-44074daf: one such op per
+    operand per layer); 128-lane rows so the TensorCore (8, 128) tiling is
+    already the SparseCore's linear layout (a [T, 384] operand cost a 0.6 us
+    relayout, j-241c6f15). A SparseCore scalar comes from lane 0 of a VMEM
+    vector.
+
+    Up to `MAX_SEPARATE_WRITE_ROUNDS` rounds each round has a set of its own.
+    More rounds, and the single-writer control, share one set: every copy
+    sharing a semaphore has the same size and each wait names its own copy,
+    so the drain still waits for every copy. A SparseCore subcore has few
+    semaphore words (~59), and the write phase then holds the three of a
+    one-round write however many rounds it runs.
+    """
+    rounds = write_slots(num_tokens, fault)
+    if fault == "no_fence" or rounds > MAX_SEPARATE_WRITE_ROUNDS:
+        return 1
+    return rounds
+
+
+def _write_phase(
+    write_refs: tuple[Any, ...],
+    write_scratch: tuple[Any, ...],
+    nope_cache_ref: Any,
+    rope_cache_ref: Any,
+    *,
+    subcore: jax.Array,
+    num_tokens: int,
+    fault: str | None,
+    early_dma: bool = False,
 ) -> Any:
     """Write this step's packed tokens into both caches, then fence.
 
@@ -439,6 +533,11 @@ def _write_phase(
     vector and waits for it before the next. Rounds that share a semaphore
     set (`write_semaphore_sets`) fetch every dst vector at once and wait for
     all of them first, so four rounds pay one fetch round trip, not four.
+
+    `early_dma` starts every round's dst vector fetch before the first one is
+    waited, so the rounds pay one fetch round trip instead of one each. Rounds
+    with a semaphore set each then wait their own fetch in turn; rounds that
+    share a set already fetch together and wait for all first.
     """
     (rows_src,) = write_refs
     dst_vmem, dst_sem, write_sem = write_scratch
@@ -460,17 +559,22 @@ def _write_phase(
             dst_sem.at[k % sets],
         )
 
+    # Rounds that share a semaphore set must all land before any dst is read
+    # (a wait on a shared semaphore may be satisfied by another round's copy).
     fetch_together = sets < rounds and not single_writer
-    fetches = [dst_fetch(k) for k in range(rounds)] if fetch_together else []
+    fetch_ahead = (fetch_together or early_dma) and not single_writer
+    fetches = [dst_fetch(k) for k in range(rounds)] if fetch_ahead else []
     for _, cp in fetches:
         cp.start()
-    for _, cp in fetches:
-        cp.wait()
+    if fetch_together:
+        for _, cp in fetches:
+            cp.wait()
     copies = []
     for k in range(rounds):
-        token, cp = fetches[k] if fetch_together else dst_fetch(k)
-        if not fetch_together:
+        token, cp = fetches[k] if fetch_ahead else dst_fetch(k)
+        if not fetch_ahead:
             cp.start()
+        if not fetch_together:
             cp.wait()
         dst = dst_vmem[k, :][0] - 1  # stored as dst + 1 (< 2**31), 0 = skip
         if fault == "wrong_row":
@@ -596,6 +700,7 @@ def live_vec_geometry(out_size: int, atoms_per_batch: int) -> tuple[int, ...]:
         "live_vec_offset",
         "write_fault",
         "packed_rope",
+        "early_dma",
     ),
 )
 def dsa_gather_native_sc(
@@ -617,6 +722,7 @@ def dsa_gather_native_sc(
     kv_write: jax.Array | tuple[jax.Array, jax.Array, jax.Array] | None = None,
     write_fault: str | None = None,
     packed_rope: bool = False,
+    early_dma: bool = False,
 ) -> tuple[jax.Array, ...]:
     """Gather explicit native-SC ``uint32`` NOPE and ROPE cache rows.
 
@@ -681,6 +787,13 @@ def dsa_gather_native_sc(
     own 16-word eighths of a row (`SparseMLAKVCacheSpec.packed_rope`) instead
     of 32-word quarters. The gathered output is the same: the rope lanes past
     each token's 64 bytes are zeroed, exactly as the padded cache stores them.
+
+    ``early_dma`` (TPU_MLA_GATHER_EARLY_DMA) starts the live-vector DMA, each
+    owner's first index block (without ``row_live_atoms``) and every write
+    round's dst vector at kernel entry, so they overlap the ``kv_write`` phase
+    and its fence. The owner's batches then run in a double-buffered loop of
+    their own that starts from that block, instead of the batch pipeline.
+    Same rows gathered, same writes, same fence.
     """
     if wait_mode not in ("overlap_rope", "before_rope"):
         raise ValueError(f"unknown {wait_mode=}")
@@ -848,6 +961,14 @@ def dsa_gather_native_sc(
         scratch_types["write_dst_sem"] = pltpu.SemaphoreType.DMA((sems,))
         scratch_types["write_sem"] = pltpu.SemaphoreType.DMA((2 * sems,))
         write_tokens = padded
+    if early_dma and not row_kwargs:
+        scratch_types["index_vmem_ref"] = pltpu.VMEM(
+            (2, occurrences_per_batch)
+            if linear_indices
+            else (2, 1, atoms_per_batch, ROPE_PACKING, NUM_LANES),
+            jnp.int32,
+        )
+        scratch_types["index_sem_ref"] = pltpu.SemaphoreType.DMA((2,))
     inner = functools.partial(
         _kernel,
         core_axis_name=mesh.core_axis_name,
@@ -864,6 +985,7 @@ def dsa_gather_native_sc(
         write_fault=write_fault,
         **row_kwargs,
         rope_words=rope_words,
+        early_dma=early_dma,
     )
 
     def body(*refs, write_dst_vmem=None, write_dst_sem=None, write_sem=None, **scr):
@@ -902,6 +1024,7 @@ def dsa_gather_native_sc(
             f"{'_rowlive' if row_kwargs else ''}"
             f"{'_kvw' if kv_write is not None else ''}"
             f"{'_packedrope' if packed_rope else ''}"
+            f"{'_early' if early_dma else ''}"
         ),
     )(*operands)
     if kv_write is None:
