@@ -33,12 +33,19 @@ slots. Build arguments (the per-row default build's value first):
   flat      combine descriptors indexed from a carried flat pointer (False).
   sum_in_kernel_max_tokens
             largest token count at which the expert kernel sums each token's rows
-            itself (0). Each row is scaled by its routing weight in the down epilogue
-            and added into an f32 [T, h] VMEM array at its token; the shared expert's
-            tiles, which come last and cover the tokens in order, add their rows and
-            write the bf16 output. The expert-major slab in HBM and the combine kernel
-            are gone. The sums take 24 MiB at 1024 tokens on GLM-5.2's TP16 slice,
-            beside the kernel's 23 MiB of buffers; 2048 tokens would need 71 MiB.
+            itself (0); no slab in HBM and no combine kernel. Where the f32 sums of all
+            h columns fit in 24 MiB (1024 tokens on GLM-5.2's TP16 slice, 47 MiB of
+            VMEM in all) it is one pass: each row is scaled by its routing weight in
+            the down epilogue and added into an f32 [T, h] array at its token, and the
+            shared expert's tiles, which come last and cover the tokens in order, add
+            their rows and write the bf16 output. Up to 4096 tokens it is two phases.
+            Phase 1 runs the gate/up loop alone and keeps every tile's bf16
+            intermediate rows in VMEM (10.5 MiB at 4096 tokens). Phase 2 runs once per
+            2048-column slice of h: the slice of each visit's w2 streams through the
+            ring, each tile's down projection is added at its tokens, weighted from
+            SMEM, into an f32 [T, 2048] array (32 MiB), and the shared expert's tiles
+            write the finished tokens' slice. Each weight is still read once; 58.5 MiB
+            of VMEM at 4096 tokens.
 
 Explicit-MXU forms follow jax tests/pallas/tpu_pallas_test.py ExplicitMXUTest (jax
 0.11.2 ref form). The measurements behind each setting are in the t4-moe-prefill
@@ -74,7 +81,11 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     COMBINE_PARITIES,
     DN,
     HIDDEN_LANE_BLOCK,
+    QCHUNK,
+    _absmax_rows,
     _intermediate_rows,
+    _quant_apply,
+    _row_scale,
     _tile_row_scales,
     build_combine_kernel,
     combine_step_tokens,
@@ -186,6 +197,35 @@ _COMBINE_CHUNK_TOKENS = 2048
 STAGE_A = dict(nb=4, down="xmxu", tile_min=4096, flat=True, tall_rung_rows=32)
 
 _NT = 256  # explicit-MXU N-tile width (MXU column size on v7x)
+_MID_BLOCK = 16
+_FINAL_ROWS = 64
+_SUMS_ONE_PASS_BYTES = 24 << 20
+_SUMS_SLICED_BYTES = 32 << 20
+_SUM_SLICE_COLS = 2048
+
+
+def sum_columns(tokens, h, i, i_s):
+    """Columns of the f32 per-token sums the expert kernel holds at a time when it
+    sums each token's rows itself: all of h in one pass while they fit in 24 MiB
+    (1024 tokens at h 6144), else 2048-column slices of up to 32 MiB (4096 tokens)
+    over two phases; 0 where neither fits."""
+    if tokens * h * 4 <= _SUMS_ONE_PASS_BYTES:
+        return h
+    if (
+        h % _SUM_SLICE_COLS == 0
+        and h > _SUM_SLICE_COLS
+        and tokens * _SUM_SLICE_COLS * 4 <= _SUMS_SLICED_BYTES
+        and i == i_s <= QCHUNK
+    ):
+        return _SUM_SLICE_COLS
+    return 0
+
+
+def _quantize_mid(mid):
+    """fp8 rows and row scale of bf16 intermediate rows, as _intermediate_rows
+    quantizes them when they fit one QCHUNK."""
+    mid_scale, mid_sinv, usable = _row_scale(_absmax_rows(mid))
+    return _quant_apply(mid, mid_sinv.astype(jnp.bfloat16), usable), mid_scale
 
 
 def tile_rows_for(tokens, tile_min=8192):
@@ -215,12 +255,15 @@ def build_expert_kernel(
     issue="loop",
     lag=None,
     rung_rows=None,
-    sum_in_kernel=False,
+    sum_cols=0,
 ):
     assert down in ("dot", "xmxu") and issue in ("loop", "inline")
     assert not (issue == "inline" and down != "xmxu"), (
         "inline issue lives in the xmxu N-tile sequence"
     )
+    sum_in_kernel = sum_cols > 0
+    single_pass = sum_cols == h
+    two_phase = sum_in_kernel and not single_pass
     assert not sum_in_kernel or tokens % tile_rows == 0, (
         "the shared expert writes the output in whole tiles"
     )
@@ -246,6 +289,16 @@ def build_expert_kernel(
     if xmxu:
         assert out_by_pairs and h % _NT == 0 and _NT == 2 * _LANES
     nt = h // _NT
+    rung_step = tile_rows // n_rungs
+    slices = h // sum_cols if sum_in_kernel else 1
+    if two_phase:
+        assert h % sum_cols == 0 and (sum_cols // _NT) % 8 == 0
+        assert i == i_s and i <= QCHUNK and rung_step % _MID_BLOCK == 0
+        assert not inline, "inline issue lives in the down N-tiles phase 1 drops"
+    stage_cols = sum_cols if two_phase else h
+    mid_blocks = _cdiv(routes + tokens, _MID_BLOCK) + experts * (
+        rung_step // _MID_BLOCK
+    )
     # padded contraction of the down matmul (the explicit MXU takes K = 256); unpadded
     # under "dot"
     kp = _cdiv(i, _NT) * _NT if xmxu else i
@@ -253,7 +306,9 @@ def build_expert_kernel(
     shared = experts
     slab_rows = routes + tokens + tile_rows
     scale_rows = _cdiv(slab_rows, _LANES) + 1
-    token_rows = _cdiv(routes, _LANES) * _LANES + window
+    token_rows = (
+        _cdiv(routes + (tokens if two_phase else 0), _LANES) * _LANES + window
+    )
     n_blk_max = tile_rows // _GATHER_UNROLL
     # inline issue: block b of the next tile is issued after N-tile blocks_at.index(b)
     blocks_at = [
@@ -264,14 +319,17 @@ def build_expert_kernel(
         refs = list(refs)
         visit_expert, visit_start, visit_rows, num_visits = refs[:4]
         k0 = 4
-        row_token_sm = None
+        row_token_sm = coeff_sm = None
         if resident:
             row_token_sm = refs[4]
             k0 = 5
+        if two_phase:
+            coeff_sm = refs[5]
+            k0 = 6
         x_hbm, row_scale_hbm = refs[k0], refs[k0 + 1]
         k0 += 2
         row_coeff_hbm = None
-        if sum_in_kernel:
+        if single_pass:
             row_coeff_hbm = refs[k0]
             k0 += 1
         row_token_hbm = None
@@ -309,19 +367,33 @@ def build_expert_kernel(
         if not resident:
             window_sems = refs[k0]
             k0 += 1
-        (
-            out_sems,
-            ring_sems,
-            shared_w1_vmem,
-            shared_w2_vmem,
-            shared_w1_scale_vmem,
-            shared_w2_scale_vmem,
-            shared_sem,
-        ) = refs[k0 : k0 + 7]
-        k0 += 7
-        coeff_vmem = sums_vmem = final_vmem = None
-        if sum_in_kernel:
+        if two_phase:
+            (
+                out_sems,
+                ring_sems,
+                shared_w1_vmem,
+                shared_w1_scale_vmem,
+                shared_sem,
+            ) = refs[k0 : k0 + 5]
+            shared_w2_vmem = shared_w2_scale_vmem = None
+            k0 += 5
+        else:
+            (
+                out_sems,
+                ring_sems,
+                shared_w1_vmem,
+                shared_w2_vmem,
+                shared_w1_scale_vmem,
+                shared_w2_scale_vmem,
+                shared_sem,
+            ) = refs[k0 : k0 + 7]
+            k0 += 7
+        coeff_vmem = mid_vmem = sums_vmem = final_vmem = None
+        if single_pass:
             coeff_vmem, sums_vmem, final_vmem = refs[k0 : k0 + 3]
+            k0 += 3
+        if two_phase:
+            mid_vmem, sums_vmem, final_vmem = refs[k0 : k0 + 3]
             k0 += 3
         assert k0 == len(refs), (k0, len(refs))
 
@@ -350,24 +422,42 @@ def build_expert_kernel(
                 w1_scale_ring.at[slot],
                 w2_scale_ring.at[slot],
             )
+            if two_phase:
+                srcs, dsts = srcs[::2], dsts[::2]
             return [
                 pltpu.make_async_copy(s, d, ring_sems.at[slot])
                 for s, d in zip(srcs, dsts)
             ]
 
-        sw2_dst = shared_w2_vmem if kp_s == i_s else shared_w2_vmem.at[pl.ds(0, i_s)]
-        shared_copies = [
-            pltpu.make_async_copy(s, d, shared_sem)
-            for s, d in zip(
-                (
-                    shared_w1_hbm.at[0],
-                    shared_w2_hbm.at[0],
-                    shared_w1_scale_hbm.at[0],
-                    shared_w2_scale_hbm.at[0],
-                ),
-                (shared_w1_vmem, sw2_dst, shared_w1_scale_vmem, shared_w2_scale_vmem),
+        if two_phase:
+            shared_copies = [
+                pltpu.make_async_copy(s, d, shared_sem)
+                for s, d in zip(
+                    (shared_w1_hbm.at[0], shared_w1_scale_hbm.at[0]),
+                    (shared_w1_vmem, shared_w1_scale_vmem),
+                )
+            ]
+        else:
+            sw2_dst = (
+                shared_w2_vmem if kp_s == i_s else shared_w2_vmem.at[pl.ds(0, i_s)]
             )
-        ]
+            shared_copies = [
+                pltpu.make_async_copy(s, d, shared_sem)
+                for s, d in zip(
+                    (
+                        shared_w1_hbm.at[0],
+                        shared_w2_hbm.at[0],
+                        shared_w1_scale_hbm.at[0],
+                        shared_w2_scale_hbm.at[0],
+                    ),
+                    (
+                        shared_w1_vmem,
+                        sw2_dst,
+                        shared_w1_scale_vmem,
+                        shared_w2_scale_vmem,
+                    ),
+                )
+            ]
 
         def start_weights(v):
             @pl.when(jnp.logical_not(is_shared(v)))
@@ -484,7 +574,7 @@ def build_expert_kernel(
                     )
 
             scale_copy(start, slot).start()
-            if sum_in_kernel:
+            if single_pass:
                 coeff_copy(start, slot).start()
 
         def wait_tile(v, t, slot):
@@ -500,7 +590,7 @@ def build_expert_kernel(
                 act_sems.at[slot],
             ).wait()
             scale_copy(tile_start(v, t), slot).wait()
-            if sum_in_kernel:
+            if single_pass:
                 coeff_copy(tile_start(v, t), slot).wait()
 
         def out_copy(start, parity, n):
@@ -519,7 +609,7 @@ def build_expert_kernel(
             )
 
         def out_wait(parity, n):
-            if sum_in_kernel:
+            if single_pass:
                 final_copy(0, parity).wait()
                 return
             pltpu.make_async_copy(
@@ -529,12 +619,19 @@ def build_expert_kernel(
             ).wait()
 
         def add_rows(start, n, parity):
-            """Adds the tile's n weighted expert rows into their tokens' sums."""
+            """Adds the tile's n expert rows into their tokens' sums, weighted here when
+            the routing weights are in SMEM (two phases) and in the epilogue
+            otherwise."""
             assert row_token_sm is not None and sums_vmem is not None
 
             def add_row(r, carry):
                 token = row_token_sm[start + r]
-                sums_vmem[token] += out_vmem[parity, r].astype(jnp.float32)
+                if coeff_sm is None:
+                    sums_vmem[token] += out_vmem[parity, r].astype(jnp.float32)
+                else:
+                    sums_vmem[token] += (
+                        out_vmem[parity, r].astype(jnp.float32) * coeff_sm[start + r]
+                    )
                 return carry
 
             def add_block(b, carry):
@@ -565,11 +662,251 @@ def build_expert_kernel(
             lax.fori_loop(0, tile_rows // COMBINE_GROUP, group, 0)
             final_copy(t, parity).start()
 
+        def zero_sums(b, carry):
+            assert sums_vmem is not None
+            sums_vmem[pl.ds(b * _GATHER_UNROLL, _GATHER_UNROLL)] = jnp.zeros(
+                (_GATHER_UNROLL, *sums_vmem.shape[1:]), jnp.float32
+            )
+            return carry
+
+        def mid_blocks_of(live):
+            return _cdiv(live, rung_step) * (rung_step // _MID_BLOCK)
+
+        def scoped(f):
+            if xmxu:
+                pl.run_scoped(f)
+            else:
+                f()
+
+        def down_accumulators(rows, n_tiles):
+            """(lag, accumulators per MXU, the ACC accumulators) of one compute copy's
+            down matmul; allocated inside that copy's run_scoped."""
+            L = lag if lag is not None else _lag_for(rows, n_tiles)
+            L = min(
+                L, 2 * (acc_entries_rows // rows - 1) - 1
+            )  # one tile of ACC stays with gate/up
+            S = L // 2 + 1
+            return (
+                L,
+                S,
+                [
+                    [
+                        jax.empty_ref(
+                            jax.ShapeDtypeStruct((rows, _NT), jnp.float32),
+                            memory_space=pltpu.ACC(m),
+                        )
+                        for _ in range(S)
+                    ]
+                    for m in range(2)
+                ],
+            )
+
+        def down_xmxu(
+            rows, mid_q, mid_scale, w2, w2_scale, out32, half, accumulators, after_acc
+        ):
+            """out[:, n-tile] = pop(acc_n) * mid_scale * w2s[n-tile], one 256-column
+            N-tile at a time on alternating MXUs; the pop of N-tile n waits `lag`
+            N-tiles (>= 32 vmatmul slots)."""
+            k_in = mid_q.shape[1]
+            k_pad, n_tiles = w2.shape[0], w2.shape[1] // _NT
+            lhs = (
+                mid_q
+                if k_in == k_pad
+                else jnp.concatenate(
+                    [mid_q, jnp.zeros((rows, k_pad - k_in), mid_q.dtype)], axis=1
+                )
+            )
+            L, S, accs = accumulators
+
+            def acc_of(n):
+                return accs[n % 2][(n // 2) % S]
+
+            def push(n):
+                pltpu.matmul_push_rhs(
+                    w2[:, n * _NT : (n + 1) * _NT],
+                    staging_register=0,
+                    mxu_index=n % 2,
+                )
+
+            def epi(n):
+                r = pltpu.matmul_pop(acc_of(n))
+                o = r * mid_scale * w2_scale[:, n * _NT : (n + 1) * _NT]
+                out32[pl.ds(n, rows, stride=half)] = pltpu.pack_elementwise(
+                    [o[:, :_LANES], o[:, _LANES:]], packed_dtype=jnp.bfloat16
+                )
+
+            push(0)
+            for n in range(n_tiles):
+                if n + 1 < n_tiles:
+                    push(n + 1)
+                pltpu.matmul_acc_lhs(acc_of(n), lhs=lhs, load_staged_rhs=0)
+                if n >= L:
+                    epi(n - L)
+                after_acc(n)
+            for n in range(n_tiles - L, n_tiles):
+                epi(n)
+
+        # ---- phase 2 of the two-phase sum: the down projection per column slice ----
+        def slice_copies(w2_rows, w2_scale_row, s, slot):
+            cols = pl.ds(pl.multiple_of(s * sum_cols, sum_cols), sum_cols)
+            w2_dst = w2_ring.at[slot] if kp == i else w2_ring.at[slot, pl.ds(0, i)]
+            return [
+                pltpu.make_async_copy(w2_rows.at[:, cols], w2_dst, ring_sems.at[slot]),
+                pltpu.make_async_copy(
+                    w2_scale_row.at[:, cols], w2_scale_ring.at[slot], ring_sems.at[slot]
+                ),
+            ]
+
+        def start_slice_weights(u):
+            """Starts the w2 slice of visit u: slice u // visits, visit u % visits."""
+            s, v, slot = u // n_visit, lax.rem(u, n_visit), lax.rem(u, nb)
+
+            @pl.when(is_shared(v))
+            def _():
+                for c in slice_copies(
+                    shared_w2_hbm.at[0], shared_w2_scale_hbm.at[0], s, slot
+                ):
+                    c.start(priority=_WEIGHT_DMA_PRIORITY)
+
+            @pl.when(jnp.logical_not(is_shared(v)))
+            def _():
+                expert = visit_expert[v]
+                for c in slice_copies(
+                    w2_hbm.at[expert], w2_scale_hbm.at[expert], s, slot
+                ):
+                    c.start(priority=_WEIGHT_DMA_PRIORITY)
+
+        def wait_slice_weights(u):
+            for c in slice_copies(
+                w2_hbm.at[0], w2_scale_hbm.at[0], jnp.int32(0), lax.rem(u, nb)
+            ):
+                c.wait()
+
+        def slice_compute(rows, block, slot):
+            """One tile's down projection onto the current column slice, from the
+            intermediate rows phase 1 left at `block`, into out_vmem[0]."""
+            assert mid_vmem is not None
+            accumulators = down_accumulators(rows, sum_cols // _NT) if xmxu else None
+            mid = mid_vmem[pl.ds(block, rows // _MID_BLOCK)].reshape(rows, i)
+            mid_q, mid_scale = _quantize_mid(mid)
+            w2, w2_scale = w2_ring.at[slot], w2_scale_ring.at[slot]
+            if xmxu:
+                half = sum_cols // _NT
+                out32 = (
+                    out_vmem.at[0].bitcast(jnp.uint32).reshape(tile_rows * half, _LANES)
+                )
+                down_xmxu(
+                    rows,
+                    mid_q,
+                    mid_scale,
+                    w2,
+                    w2_scale,
+                    out32,
+                    half,
+                    accumulators,
+                    lambda n: None,
+                )
+                return
+            acc2 = lax.dot_general(mid_q, w2[...], DN, preferred_element_type=jnp.float32)
+            out = acc2 * mid_scale * w2_scale[...]
+            out = out.reshape(rows, sum_cols // _LANES, _LANES)
+            out_vmem[0, pl.ds(0, rows)] = out.astype(jnp.bfloat16)
+
+        def write_slice(t, s):
+            """Writes tokens t * tile_rows onward, whose sums the shared expert's tile
+            t has just completed, to column slice s of the output, _FINAL_ROWS rows per
+            DMA."""
+            assert sums_vmem is not None and final_vmem is not None
+            cols = pl.ds(pl.multiple_of(s * sum_cols, sum_cols), sum_cols)
+            chunks = tile_rows // _FINAL_ROWS
+
+            def copy(c):
+                first = pl.multiple_of(t * tile_rows + c * _FINAL_ROWS, _FINAL_ROWS)
+                return pltpu.make_async_copy(
+                    final_vmem.at[c % 2],
+                    out_hbm.at[pl.ds(first, _FINAL_ROWS), cols],
+                    out_sems.at[c % 2],
+                )
+
+            for c in range(chunks):
+                if c >= 2:
+                    copy(c - 2).wait()
+
+                def group(g, carry, c=c):
+                    first = pl.multiple_of(g * COMBINE_GROUP, COMBINE_GROUP)
+                    token = pl.multiple_of(
+                        t * tile_rows + c * _FINAL_ROWS + first, COMBINE_GROUP
+                    )
+                    y = sums_vmem[pl.ds(token, COMBINE_GROUP)].astype(jnp.bfloat16)
+                    final_vmem[c % 2, pl.ds(first, COMBINE_GROUP)] = y.reshape(
+                        COMBINE_GROUP, sum_cols
+                    )
+                    return carry
+
+                lax.fori_loop(0, _FINAL_ROWS // COMBINE_GROUP, group, 0)
+                copy(c).start()
+            for c in range(max(0, chunks - 2), chunks):
+                copy(c).wait()
+
+        def run_slices():
+            """Phase 2: per column slice, every visit's down projection from the stored
+            intermediate rows, summed per token; the shared expert's tiles, last in
+            each slice, write the finished tokens."""
+            for k in range(nb - 1):
+
+                @pl.when(k < slices * n_visit)
+                def _(k=k):
+                    start_slice_weights(jnp.int32(k))
+
+            def slice_body(carry):
+                s, v, t, block = carry
+                u = s * n_visit + v
+
+                @pl.when(t == 0)
+                def _():
+                    wait_slice_weights(u)
+
+                    @pl.when(u + nb - 1 < slices * n_visit)
+                    def _():
+                        start_slice_weights(u + nb - 1)
+
+                @pl.when(jnp.logical_and(v == 0, t == 0))
+                def _():
+                    lax.fori_loop(0, tokens // _GATHER_UNROLL, zero_sums, 0)
+
+                live = tile_live(v, t)
+                for r, rows in enumerate(rungs):
+                    below = rungs[r - 1] if r else 0
+
+                    @pl.when(jnp.logical_and(live > below, live <= rows))
+                    def _(rows=rows):
+                        scoped(lambda: slice_compute(rows, block, lax.rem(u, nb)))
+
+                add_rows(tile_start(v, t), live, 0)
+
+                @pl.when(is_shared(v))
+                def _():
+                    write_slice(t, s)
+
+                vn, tn = next_tile(v, t)
+                wrapped = vn == n_visit
+                return (
+                    jnp.where(wrapped, s + 1, s),
+                    jnp.where(wrapped, 0, vn),
+                    tn,
+                    jnp.where(wrapped, 0, block + mid_blocks_of(live)),
+                )
+
+            z = jnp.int32(0)
+            lax.while_loop(lambda carry: carry[0] < slices, slice_body, (z, z, z, z))
+
         # ---- prologue ----
         # zero the padded contraction rows of the down weights once (never DMA'd over)
         if kp != i:
-            w2_ring[:, pl.ds(i, kp - i), :] = jnp.zeros((nb, kp - i, h), w2_ring.dtype)
-        if kp_s != i_s:
+            w2_ring[:, pl.ds(i, kp - i), :] = jnp.zeros(
+                (nb, kp - i, stage_cols), w2_ring.dtype
+            )
+        if kp_s != i_s and not two_phase:
             shared_w2_vmem[pl.ds(i_s, kp_s - i_s), :] = jnp.zeros(
                 (kp_s - i_s, h), shared_w2_vmem.dtype
             )
@@ -595,19 +932,11 @@ def build_expert_kernel(
 
             vi, ti = next_tile(vi, ti)
 
-        if sum_in_kernel:
-            assert sums_vmem is not None
-
-            def zero_sums(b, carry):
-                sums_vmem[pl.ds(b * _GATHER_UNROLL, _GATHER_UNROLL)] = jnp.zeros(
-                    (_GATHER_UNROLL, lane_blocks, _LANES), jnp.float32
-                )
-                return carry
-
+        if single_pass:
             lax.fori_loop(0, tokens // _GATHER_UNROLL, zero_sums, 0)
 
         def tile_body(carry):
-            v, t, g, n_out0, n_out1, vi, ti = carry
+            v, t, g, n_out0, n_out1, vi, ti, *mid_block = carry
             p = lax.rem(g, 2)
             aslot = lax.rem(g, n_act)
 
@@ -661,11 +990,12 @@ def build_expert_kernel(
             slot = lax.rem(v, nb)
             start = tile_start(v, t)
             live = tile_live(v, t)
-            n_prev = jnp.where(p == 0, n_out0, n_out1)
+            if not two_phase:
+                n_prev = jnp.where(p == 0, n_out0, n_out1)
 
-            @pl.when(n_prev > 0)
-            def _():
-                out_wait(p, n_prev)
+                @pl.when(n_prev > 0)
+                def _():
+                    out_wait(p, n_prev)
 
             def build_lhs(rows, as_blocks=False):
                 """The gate/up LHS [rows, h] (or, as_blocks, its 128-column blocks in
@@ -734,28 +1064,10 @@ def build_expert_kernel(
             down_accs = {}
 
             def compute(rows, w1, w2, w1_scale, w2_scale, inter):
-                if xmxu:
+                if xmxu and not two_phase:
                     # allocated here (inside this copy's run_scoped), shared by both
                     # parity branches
-                    L = lag if lag is not None else _lag_for(rows, nt)
-                    L = min(
-                        L, 2 * (acc_entries_rows // rows - 1) - 1
-                    )  # one tile of ACC stays with gate/up
-                    S = L // 2 + 1
-                    down_accs[rows] = (
-                        L,
-                        S,
-                        [
-                            [
-                                jax.empty_ref(
-                                    jax.ShapeDtypeStruct((rows, _NT), jnp.float32),
-                                    memory_space=pltpu.ACC(m),
-                                )
-                                for _ in range(S)
-                            ]
-                            for m in range(2)
-                        ],
-                    )
+                    down_accs[rows] = down_accumulators(rows, nt)
                 act_scale = _tile_row_scales(act_scale_vmem[aslot], start, rows)
                 if xmxu:  # Mosaic refuses explicit MXU ops beside a dot in one program
                     acc1 = gateup_xmxu(rows, build_lhs(rows, as_blocks=True), w1)
@@ -767,11 +1079,26 @@ def build_expert_kernel(
                         DN,
                         preferred_element_type=jnp.float32,
                     )
+                if two_phase:
+                    assert mid_vmem is not None
+                    mid, _ = _intermediate_rows(
+                        acc1,
+                        act_scale,
+                        inter,
+                        w1s=w1_scale[...],
+                        act_fn="silu",
+                        w1b=None,
+                        requantize=False,
+                    )
+                    mid_vmem[pl.ds(mid_block[0], rows // _MID_BLOCK)] = mid.reshape(
+                        rows // _MID_BLOCK, _MID_BLOCK, inter
+                    )
+                    return
                 mid_q, mid_scale = _intermediate_rows(
                     acc1, act_scale, inter, w1s=w1_scale[...], act_fn="silu", w1b=None
                 )
                 assert mid_scale is not None
-                if sum_in_kernel:
+                if single_pass:
                     assert coeff_vmem is not None
                     mid_scale = mid_scale * _tile_row_scales(
                         coeff_vmem[aslot], start, rows
@@ -789,7 +1116,17 @@ def build_expert_kernel(
                             else None
                         )
                         if xmxu:
-                            down_xmxu(rows, mid_q, mid_scale, w2, w2_scale, out32, half)
+                            down_xmxu(
+                                rows,
+                                mid_q,
+                                mid_scale,
+                                w2,
+                                w2_scale,
+                                out32,
+                                half,
+                                down_accs[rows],
+                                issue_at,
+                            )
                             return
                         acc2 = lax.dot_general(
                             mid_q, w2[...], DN, preferred_element_type=jnp.float32
@@ -813,55 +1150,6 @@ def build_expert_kernel(
                         else:
                             out = out.reshape(rows, lane_blocks, _LANES)
                             out_vmem[par, pl.ds(0, rows)] = out.astype(jnp.bfloat16)
-
-            def down_xmxu(rows, mid_q, mid_scale, w2, w2_scale, out32, half):
-                """out[:, n-tile] = pop(acc_n) * mid_scale * w2s[n-tile], one 256-column
-                N-tile at a time on alternating MXUs; the pop of N-tile n waits `lag`
-                N-tiles (>= 32 vmatmul slots)."""
-                k_in = mid_q.shape[1]
-                k_pad = w2.shape[0]
-                lhs = (
-                    mid_q
-                    if k_in == k_pad
-                    else jnp.concatenate(
-                        [mid_q, jnp.zeros((rows, k_pad - k_in), mid_q.dtype)], axis=1
-                    )
-                )
-                L, S, accs = down_accs[rows]
-
-                def acc_of(n):
-                    return accs[n % 2][(n // 2) % S]
-
-                def push(n):
-                    pltpu.matmul_push_rhs(
-                        w2[:, n * _NT : (n + 1) * _NT],
-                        staging_register=0,
-                        mxu_index=n % 2,
-                    )
-
-                def epi(n):
-                    r = pltpu.matmul_pop(acc_of(n))
-                    o = r * mid_scale * w2_scale[:, n * _NT : (n + 1) * _NT]
-                    out32[pl.ds(n, rows, stride=half)] = pltpu.pack_elementwise(
-                        [o[:, :_LANES], o[:, _LANES:]], packed_dtype=jnp.bfloat16
-                    )
-
-                push(0)
-                for n in range(nt):
-                    if n + 1 < nt:
-                        push(n + 1)
-                    pltpu.matmul_acc_lhs(acc_of(n), lhs=lhs, load_staged_rhs=0)
-                    if n >= L:
-                        epi(n - L)
-                    issue_at(n)
-                for n in range(nt - L, nt):
-                    epi(n)
-
-            def scoped(f):
-                if xmxu:
-                    pl.run_scoped(f)
-                else:
-                    f()
 
             def compute_visit(rows):
                 @pl.when(is_shared(v))
@@ -897,7 +1185,10 @@ def build_expert_kernel(
                 def _(rows=rows):
                     compute_visit(rows)
 
-            if sum_in_kernel:
+            if two_phase:
+                next_block = mid_block[0] + mid_blocks_of(live)
+                return vn, tn, g + 1, n_out0, n_out1, vi_n, ti_n, next_block
+            if single_pass:
 
                 @pl.when(is_shared(v))
                 def _():
@@ -915,9 +1206,15 @@ def build_expert_kernel(
             n_out1 = jnp.where(p == 1, emitted, n_out1)
             return vn, tn, g + 1, n_out0, n_out1, vi_n, ti_n
 
-        _, _, _, n_out0, n_out1, _, _ = lax.while_loop(
-            lambda carry: carry[0] < n_visit, tile_body, (z, z, z, z, z, vi, ti)
+        _, _, _, n_out0, n_out1, *_ = lax.while_loop(
+            lambda carry: carry[0] < n_visit,
+            tile_body,
+            (z, z, z, z, z, vi, ti) + ((z,) if two_phase else ()),
         )
+
+        if two_phase:
+            run_slices()
+            return
 
         for par, n in ((0, n_out0), (1, n_out1)):
 
@@ -926,33 +1223,45 @@ def build_expert_kernel(
                 out_wait(par, n)
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
-    n_in = 11 - (1 if resident else 0) + (1 if sum_in_kernel else 0)
+    n_in = 11 - (1 if resident else 0) + (1 if single_pass else 0)
     scratch = [
         pltpu.VMEM((n_act, tile_rows, lane_blocks, _LANES), weight_dtype),
         pltpu.VMEM((n_act, scale_window, _LANES), jnp.float32),
-        pltpu.VMEM((2, tile_rows, lane_blocks, _LANES), jnp.bfloat16),
+        pltpu.VMEM(
+            (1 if two_phase else 2, tile_rows, stage_cols // _LANES, _LANES),
+            jnp.bfloat16,
+        ),
         pltpu.VMEM((nb, h, 2 * i), weight_dtype),
-        pltpu.VMEM((nb, kp, h), weight_dtype),
+        pltpu.VMEM((nb, kp, stage_cols), weight_dtype),
         pltpu.VMEM((nb, 1, 2 * i), jnp.float32),
-        pltpu.VMEM((nb, 1, h), jnp.float32),
+        pltpu.VMEM((nb, 1, stage_cols), jnp.float32),
     ]
     if not resident:
         scratch.append(pltpu.SMEM((2 * window,), jnp.int32))
     scratch.append(pltpu.SemaphoreType.DMA((n_act,)))
     if not resident:
         scratch.append(pltpu.SemaphoreType.DMA((2,)))
-    scratch += [
-        pltpu.SemaphoreType.DMA((2,)),
-        pltpu.SemaphoreType.DMA((nb,)),
-        pltpu.VMEM((h, 2 * i_s), weight_dtype),
-        pltpu.VMEM((kp_s, h), weight_dtype),
-        pltpu.VMEM((1, 2 * i_s), jnp.float32),
-        pltpu.VMEM((1, h), jnp.float32),
-        pltpu.SemaphoreType.DMA(()),
-    ]
+    if two_phase:
+        scratch += [
+            pltpu.SemaphoreType.DMA((2,)),
+            pltpu.SemaphoreType.DMA((nb,)),
+            pltpu.VMEM((h, 2 * i_s), weight_dtype),
+            pltpu.VMEM((1, 2 * i_s), jnp.float32),
+            pltpu.SemaphoreType.DMA(()),
+        ]
+    else:
+        scratch += [
+            pltpu.SemaphoreType.DMA((2,)),
+            pltpu.SemaphoreType.DMA((nb,)),
+            pltpu.VMEM((h, 2 * i_s), weight_dtype),
+            pltpu.VMEM((kp_s, h), weight_dtype),
+            pltpu.VMEM((1, 2 * i_s), jnp.float32),
+            pltpu.VMEM((1, h), jnp.float32),
+            pltpu.SemaphoreType.DMA(()),
+        ]
     tag = f"nb{nb}-{down}-{issue}" + ("" if rung_rows is None else f"-r{rung_rows}")
     out_shape = (slab_rows, lane_blocks, _LANES)
-    if sum_in_kernel:
+    if single_pass:
         scratch += [
             pltpu.VMEM((n_act, scale_window, _LANES), jnp.float32),
             pltpu.VMEM((tokens, lane_blocks, _LANES), jnp.float32),
@@ -960,10 +1269,18 @@ def build_expert_kernel(
         ]
         out_shape = (tokens, h)
         tag += "-sumk"
+    if two_phase:
+        scratch += [
+            pltpu.VMEM((mid_blocks, _MID_BLOCK, i), jnp.bfloat16),
+            pltpu.VMEM((tokens, sum_cols // _LANES, _LANES), jnp.float32),
+            pltpu.VMEM((2, _FINAL_ROWS, sum_cols), jnp.bfloat16),
+        ]
+        out_shape = (tokens, h)
+        tag += f"-sumk{slices}"
     call = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=5 if resident else 4,
+            num_scalar_prefetch=(5 if resident else 4) + (1 if two_phase else 0),
             in_specs=[hbm] * n_in,
             out_specs=hbm,
             scratch_shapes=tuple(scratch),
@@ -1215,7 +1532,9 @@ def fused_moe_prefill(
             None,
         )
     tile_rows = tile_rows_for(tokens, tile_min)
-    sum_in_kernel = tokens <= sum_in_kernel_max_tokens and tokens % tile_rows == 0
+    sum_cols = 0
+    if tokens <= sum_in_kernel_max_tokens and tokens % tile_rows == 0:
+        sum_cols = sum_columns(tokens, h, two_i // 2, i_s)
     call, scale_rows, token_rows = build_expert_kernel(
         experts=experts,
         h=h,
@@ -1230,7 +1549,7 @@ def fused_moe_prefill(
         issue=issue,
         lag=lag,
         rung_rows=tall_rung_rows if tile_rows > 128 else None,
-        sum_in_kernel=sum_in_kernel,
+        sum_cols=sum_cols,
     )
     if x_q is None:
         x_q, x_scale = _quantize_rows(x, weight_dtype)
@@ -1263,7 +1582,7 @@ def fused_moe_prefill(
         routed_visits,
         sorted_coeff,
     ) = _routing_plan(
-        topk_ids, route_valid, experts, x_scale, coeff if sum_in_kernel else None
+        topk_ids, route_valid, experts, x_scale, coeff if sum_cols else None
     )
     visit_expert = visit_expert.at[routed_visits].set(experts)
     visit_start = visit_start.at[routed_visits].set(routes)
@@ -1271,10 +1590,13 @@ def fused_moe_prefill(
     # pyrefly: ignore[bad-argument-type]
     row_scale = jnp.concatenate([sorted_scale, x_scale])
     row_scale = jnp.pad(row_scale, (0, scale_rows * _LANES - row_scale.shape[0]))
-    row_token = jnp.pad(row_token, (0, token_rows - routes))
+    if 0 < sum_cols < h:
+        row_token = jnp.concatenate([row_token, jnp.arange(tokens, dtype=jnp.int32)])
+    row_token = jnp.pad(row_token, (0, token_rows - row_token.shape[0]))
     args = [visit_expert, visit_start, visit_rows, (routed_visits + 1).reshape(1)]
-    if sum_in_kernel:
+    if sum_cols:
         row_coeff = jnp.concatenate([sorted_coeff, gate.reshape(-1)])
+    if sum_cols == h:
         row_coeff = jnp.pad(row_coeff, (0, scale_rows * _LANES - row_coeff.shape[0]))
         args += [
             row_token,
@@ -1282,6 +1604,9 @@ def fused_moe_prefill(
             row_scale.reshape(-1, _LANES),
             row_coeff.reshape(-1, _LANES),
         ]
+    elif sum_cols:
+        row_coeff = jnp.pad(row_coeff, (0, token_rows - row_coeff.shape[0]))
+        args += [row_token, row_coeff, x_q, row_scale.reshape(-1, _LANES)]
     elif issue == "inline":
         args += [row_token, x_q, row_scale.reshape(-1, _LANES)]
     else:
@@ -1297,7 +1622,7 @@ def fused_moe_prefill(
         shared_w1_scale.reshape(1, 1, 2 * i_s).astype(jnp.float32),
         shared_w2_scale.reshape(1, 1, h).astype(jnp.float32),
     )
-    if sum_in_kernel:
+    if sum_cols:
         return _psum_rows(out, axis_name)
     shared_row = routes + jnp.arange(tokens, dtype=jnp.int32)[:, None]
     slab_row = jnp.where(route_valid, slab_row, shared_row)
