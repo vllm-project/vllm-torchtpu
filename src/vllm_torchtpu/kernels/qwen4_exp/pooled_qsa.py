@@ -1296,7 +1296,9 @@ def _pooled_qsa(
             ratio=compress_ratio,
             block_topk=token_topk // compress_ratio,
             slot=compressed_slot,
-            max_query_len=max_query_len,
+            # The whole step takes the ragged prefill indexer; keep the
+            # shard on it too (it serves verify-sized requests as well).
+            max_query_len=1,
         )
         return pool, q, gate, lengths, req, starts, blocks
     if shard is not None:

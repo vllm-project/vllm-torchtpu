@@ -115,12 +115,12 @@ def sequence_parallel_eligible(
     is compiled by exactly one graph."""
     if not enabled(tp_size):
         return False
-    minimum = max(
-        int(envs.QWEN4_EXP_PREFILL_SP_MIN_TOKENS),
-        MIN_TOKENS_FLOOR,
-        tp_size * rows,
-    )
-    return num_tokens >= minimum and num_tokens % (tp_size * rows) == 0
+    return num_tokens >= min_tokens(tp_size, rows) and num_tokens % (tp_size * rows) == 0
+
+
+def min_tokens(tp_size: int, rows: int = ROW_ALIGNMENT) -> int:
+    """Smallest bucket of the sequence-parallel graph."""
+    return max(int(envs.QWEN4_EXP_PREFILL_SP_MIN_TOKENS), MIN_TOKENS_FLOOR, tp_size * rows)
 
 
 def tp_world_size() -> int:

@@ -240,6 +240,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 prefix=prefix + ".self_attn",
                 pooled=use_unified_pool(),
                 max_query_len=num_speculative_tokens(cfg) + 1,
+                max_num_seqs=cfg.scheduler_config.max_num_seqs,
             )
             cfg.compilation_config.static_forward_context[prefix + ".self_attn"] = (
                 self.self_attn

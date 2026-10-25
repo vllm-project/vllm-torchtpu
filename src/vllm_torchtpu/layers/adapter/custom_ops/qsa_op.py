@@ -652,7 +652,7 @@ def _token_select_op():
     return select
 
 
-def build_pooled_qsa_token_shard_op(tp_group, replicated):
+def build_pooled_qsa_token_shard_op(tp_group):
     """``build_pooled_qsa_op`` with the indexer split over the step's tokens.
 
     For the prefill sequence-parallel backbone, whose QSA input is the whole
@@ -663,10 +663,11 @@ def build_pooled_qsa_token_shard_op(tp_group, replicated):
 
     The returned callable takes the pooled op's operands plus a trailing
     ``shard_index`` operand (int32 ``[1]``, the rank) and a ``kv_heads``
-    keyword. Buckets whose shard would not take the ragged prefill indexer
-    (``T / TP`` rows at most one per request slot and verify token, or ``T``
-    not a multiple of TP) call ``replicated`` instead; each bucket traces its
-    own graph, so the choice is static.
+    keyword. Use it for every bucket of a graph or none (the buckets share
+    traced artifacts, and the all-gather moves the graph's split points):
+    each bucket's ``T`` must divide by TP and its shard must keep the ragged
+    prefill indexer (more rows than request slots), as the module checks
+    once for the graph's smallest bucket.
     """
     world = int(tp_group.world_size)
     select = _token_select_op()
@@ -674,8 +675,10 @@ def build_pooled_qsa_token_shard_op(tp_group, replicated):
 
     def run(*args, shard_index, kv_heads, **kwargs):
         tokens, slots = args[0].shape[0], args[12].shape[0]
-        if tokens % world or tokens // world <= slots * kwargs.get("max_query_len", 1):
-            return replicated(*args, **kwargs)
+        assert tokens % world == 0 and tokens // world > slots, (
+            f"token-sharded indexer: {tokens} tokens do not shard over TP "
+            f"{world} with more rows than {slots} request slots"
+        )
         args = list(args)
         for index in (8, 11, 12, 13, 14, 15):
             args[index] = args[index].to(torch.int32)

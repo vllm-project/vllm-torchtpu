@@ -32,6 +32,9 @@ from vllm_torchtpu import envs as vllm_torchtpu_envs
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import build_qsa_op
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -253,6 +256,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         prefix: str = "",
         pooled: bool = False,
         max_query_len: int = 1,
+        max_num_seqs: int = 0,
     ):
         super().__init__()
         if not 0 <= tp_rank < tp_size:
@@ -340,7 +344,8 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             ).to(device=device),
             persistent=False,
         )
-        if envs.VLLM_TPU_QSA_INDEXER_TOKEN_SHARD and tp_size > 1:
+        self.token_shard = self._token_shard_mode(tp_size, pooled, max_num_seqs)
+        if self.token_shard:
             # The rank as an operand of the token-sharded indexer, so every
             # rank traces the same program.
             self.register_buffer(
@@ -361,6 +366,30 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             norm_eps=float(self.q_norm.variance_epsilon),
             rotary_dim=int(self.head_dim * config.partial_rotary_factor),
         )
+
+    @staticmethod
+    def _token_shard_mode(tp_size, pooled, max_num_seqs):
+        """Whether the SP graph uses the token-sharded indexer, for all of
+        its buckets: one bucket without the all-gather would move the graph's
+        collective split points, and the buckets share traced artifacts. Its
+        smallest bucket's shard must keep the ragged prefill indexer (more
+        rows than request slots)."""
+        if not (envs.VLLM_TPU_QSA_INDEXER_TOKEN_SHARD and tp_size > 1):
+            return False
+        from vllm_torchtpu.models.vllm.qwen4_exp import sequence_parallel as sp
+
+        shard = sp.min_tokens(tp_size) // tp_size
+        active = pooled and sp.enabled(tp_size) and shard > max_num_seqs
+        logger.info_once(
+            "QSA token-sharded prefill indexer: %s (pooled=%s, prefill SP=%s, "
+            "smallest SP shard %d rows, max_num_seqs %d)",
+            "on" if active else "OFF",
+            pooled,
+            sp.enabled(tp_size),
+            shard,
+            max_num_seqs,
+        )
+        return active
 
     def get_attn_backend(self):
         return Qwen4ExpPooledQSABackend if self.pooled else Qwen4ExpQSABackend
@@ -420,7 +449,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         self._shard_op = None
         self._shard_select_op = None
         self._token_shard_op = None
-        if envs.VLLM_TPU_QSA_INDEXER_TOKEN_SHARD and self.tp_size > 1:
+        if getattr(self, "token_shard", False):
             from vllm.distributed import get_tp_group
 
             from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
@@ -431,7 +460,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             assert int(group.world_size) == self.tp_size
             assert int(group.rank_in_group) == self.tp_rank
             self._token_shard_op = partial(
-                build_pooled_qsa_token_shard_op(group, build_pooled_qsa_op()),
+                build_pooled_qsa_token_shard_op(group),
                 kv_heads=self.num_kv_heads,
                 **keywords,
             )

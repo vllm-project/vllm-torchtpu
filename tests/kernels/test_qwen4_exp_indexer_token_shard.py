@@ -108,3 +108,25 @@ def test_token_shard_steps_compose_to_the_pooled_step(rowwise_attention, size):
     )(q, gate, lengths, req, starts, tail[3], tail[1], new_pool, gathered)
     np.testing.assert_array_equal(np.asarray(out), np.asarray(want_out))
     np.testing.assert_array_equal(np.asarray(selected), np.asarray(want_selected))
+
+
+@pytest.mark.parametrize(
+    "min_tokens,max_num_seqs,active", [(1024, 32, True), (1024, 128, False), (4096, 256, True)]
+)
+def test_mode_is_decided_once_for_the_smallest_sp_bucket(
+    monkeypatch, min_tokens, max_num_seqs, active
+):
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.models.vllm.qwen4_exp.qsa import Qwen4ExpQSA
+
+    for name, value in (
+        ("VLLM_TPU_QSA_INDEXER_TOKEN_SHARD", True),
+        ("QWEN4_EXP_PREFILL_SP", True),
+        ("QWEN4_EXP_PREFILL_SP_MIN_TOKENS", min_tokens),
+    ):
+        monkeypatch.setattr(envs, name, value, raising=False)
+    assert Qwen4ExpQSA._token_shard_mode(8, True, max_num_seqs) is active
+    assert Qwen4ExpQSA._token_shard_mode(1, True, max_num_seqs) is False
+    assert Qwen4ExpQSA._token_shard_mode(8, False, max_num_seqs) is False
+    monkeypatch.setattr(envs, "QWEN4_EXP_PREFILL_SP", False, raising=False)
+    assert Qwen4ExpQSA._token_shard_mode(8, True, max_num_seqs) is False
