@@ -1442,9 +1442,25 @@ DECODE_BODY_LEVERS = (
     # gather still writes only the real tokens' batches. A step that runs past
     # the real tokens reads unwritten tiles for the padding tokens, whose
     # kv_len is 0 -- every key is zeroed and masked, so they attend nothing.
+    # "step16" / "step32": the same with 16 / 32 tokens per step, so buckets
+    # of up to that many tokens are one grid step (the fused exchange's
+    # condition) at the cost of one step's KV, q and stacked-softmax buffers
+    # sized for that many tokens.
     "step8",
+    "step16",
+    "step32",
 )
 DECODE_STEP8_TOKENS = 8
+DECODE_STEP_LEVERS = {"step8": 8, "step16": 16, "step32": 32}
+
+
+def decode_step_tokens(levers: tuple[str, ...]) -> int:
+    """Tokens per attention grid step of the decode lever among `levers`
+    ("step8" / "step16" / "step32"); 0 without one."""
+    steps = [DECODE_STEP_LEVERS[v] for v in levers if v in DECODE_STEP_LEVERS]
+    if len(steps) > 1:
+        raise ValueError(f"decode_body_levers: one step lever at most, got {levers}")
+    return steps[0] if steps else 0
 # The measured set (decode probes 02 / 04 / 05): "step8" runs 8 tokens per
 # attention grid step and "quad" stacks them in one softmax; "nofill" and
 # "q128" measured no gain.
@@ -1777,7 +1793,7 @@ def _attention_kernel(
         "nofill",
         "quad",
         "lrows",
-        "step8",
+        *DECODE_STEP_LEVERS,
     }, body_levers
     assert not ("quad" in body_levers and "pair" in body_levers)
     q128 = "q128" in body_levers
@@ -4865,11 +4881,12 @@ def sparse_attention_chunk(
     # `kernel_batch_size`.
     valid_rows = jnp.maximum(0, jnp.minimum(token_end, end_pos) - start_pos)
     batch_end = start_pos + cdiv(valid_rows, kernel_batch_size) * kernel_batch_size
-    # Decode lever "step8": the attention grid's own step (the prep and the
-    # gather above keep `kernel_batch_size`).
+    # Decode levers "step8" / "step16" / "step32": the attention grid's own
+    # step (the prep and the gather above keep `kernel_batch_size`).
     attn_batch_size, attn_batch_end = kernel_batch_size, batch_end
-    if "step8" in row_levers and small_chunk:
-        attn_batch_size = _largest_divisor(chunk_size, DECODE_STEP8_TOKENS)
+    step_tokens = decode_step_tokens(tuple(row_levers))
+    if step_tokens and small_chunk:
+        attn_batch_size = _largest_divisor(chunk_size, step_tokens)
         attn_batch_end = start_pos + cdiv(valid_rows, attn_batch_size) * attn_batch_size
     num_valid_indices = jnp.maximum(0, batch_end - start_pos) * topk
 
