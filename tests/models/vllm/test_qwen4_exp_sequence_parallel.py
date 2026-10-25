@@ -190,10 +190,11 @@ def make_layer(tp, layer_type, attn_hc, mlp_hc, attn_weight, moe_weight):
     return layer
 
 
+@pytest.mark.parametrize("sp_pad", [0, 24])
 @pytest.mark.parametrize("split_moe", [False, True])
 @pytest.mark.parametrize("layer_type", ["linear_attention", "full_attention"])
 def test_decoder_layer_sequence_parallel_matches_tp(
-    tp2, monkeypatch, layer_type, split_moe
+    tp2, monkeypatch, layer_type, split_moe, sp_pad
 ):
     from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
         vllm_adapter as adaptive_moe,
@@ -223,8 +224,9 @@ def test_decoder_layer_sequence_parallel_matches_tp(
         layer.mlp = SplitMoE(tp2, moe_w)
         layers[rank] = layer
         x = tp2.shard(hidden) if sequence_parallel else hidden
-        return layer(
-            x,
+        pad = sp_pad if sequence_parallel else 0
+        out = layer(
+            sp.pad_shard(x, pad),
             None,
             input_ids,
             None,
@@ -235,7 +237,15 @@ def test_decoder_layer_sequence_parallel_matches_tp(
             None,
             None,
             sequence_parallel=sequence_parallel,
+            sp_pad=pad,
         )
+        if pad:
+            # 16 real rows per rank, padded to 24: the tail stays zero.
+            assert out.shape[0] == pad
+            torch.testing.assert_close(
+                out[x.shape[0] :], torch.zeros_like(out[x.shape[0] :])
+            )
+        return sp.unpad(out, x.shape[0])
 
     replicated = tp2.run(lambda r: run(r, False))
     sharded = tp2.run(lambda r: run(r, True))
@@ -321,3 +331,25 @@ def test_eligibility_with_hc_shard_rows(monkeypatch, tokens, expected):
     monkeypatch.setattr(sp.envs, "QWEN4_EXP_PREFILL_SP", True, raising=False)
     monkeypatch.setattr(sp.envs, "QWEN4_EXP_PREFILL_SP_MIN_TOKENS", 1024, raising=False)
     assert sp.sequence_parallel_eligible(tokens, 8, rows=256) is expected
+
+
+def test_pad_shard_rounds_up_with_zero_rows_and_unpad_restores():
+    x = torch.randn(384, 4)
+    padded = sp.pad_shard(x, 256)
+    assert padded.shape == (512, 4)
+    assert torch.equal(padded[384:], torch.zeros(128, 4))
+    assert torch.equal(sp.unpad(padded, 384), x)
+    flags = sp.pad_shard(torch.ones(128, dtype=torch.bool), 256)
+    assert flags.dtype == torch.bool and not flags[128:].any()
+    assert sp.pad_shard(x, 0) is x
+    assert sp.padded_rows(256, 256) == 256
+
+
+@pytest.mark.parametrize(
+    "tokens,expected", [(960, False), (1024, True), (3072, True), (1088, True)]
+)
+def test_padded_shards_admit_every_row_aligned_bucket(monkeypatch, tokens, expected):
+    # QWEN4_EXP_PREFILL_SP_PAD_HC: the rule falls back to ROW_ALIGNMENT rows.
+    monkeypatch.setattr(sp.envs, "QWEN4_EXP_PREFILL_SP", True, raising=False)
+    monkeypatch.setattr(sp.envs, "QWEN4_EXP_PREFILL_SP_MIN_TOKENS", 1024, raising=False)
+    assert sp.sequence_parallel_eligible(tokens, 8) is expected

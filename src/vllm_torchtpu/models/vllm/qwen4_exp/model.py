@@ -281,10 +281,14 @@ class Qwen4ExpDecoderLayer(nn.Module):
         compressed_block_table,
         ple_raw_embeddings=None,
         sequence_parallel=False,
+        sp_pad=0,
     ):
         """``sequence_parallel``: ``hidden`` and the result are this TP rank's
-        token shard; the token-indexed inputs still cover the whole step."""
+        token shard; the token-indexed inputs still cover the whole step.
+        ``sp_pad``: the shard's HC streams are padded to a multiple of this many
+        rows; only the real rows enter collectives, attention and the MoE."""
         num_tokens = input_ids.shape[0] if sequence_parallel else None
+        rows = num_tokens // sp.tp_world_size() if sp_pad else None
         hidden = self.apply_ple(
             hidden,
             input_ids,
@@ -294,8 +298,11 @@ class Qwen4ExpDecoderLayer(nn.Module):
             context_lens,
             ple_raw_embeddings,
             sequence_parallel=sequence_parallel,
+            sp_pad=sp_pad,
         )
         block, residual = self.attn_hyper_connection.mix(hidden)
+        if sp_pad:
+            block = sp.unpad(block, rows)
         if sequence_parallel:
             block = sp.gather(block, num_tokens)
         if self.layer_type == "linear_attention":
@@ -315,17 +322,19 @@ class Qwen4ExpDecoderLayer(nn.Module):
             )[0]
             block = sp.reduce(block, sequence_parallel)
         block, residual = self.attn_hyper_connection.combine_mix(
-            block, residual, self.mlp_hyper_connection
+            sp.pad_shard(block, sp_pad), residual, self.mlp_hyper_connection
         )
         # GDN may leave padded rows unwritten; MoE dispatch requires finite inputs.
         if sequence_parallel:
             valid_tokens = sp.shard(valid_tokens[:, None])[:, 0]
+        if sp_pad:
+            block = sp.unpad(block, rows)
         block = torch.where(valid_tokens[:, None], block, 0)
         if sequence_parallel:
             moe = self._sequence_parallel_moe(block, num_tokens)
         else:
             moe = self.mlp(block)
-        return self.mlp_hyper_connection.combine(moe, residual)
+        return self.mlp_hyper_connection.combine(sp.pad_shard(moe, sp_pad), residual)
 
     def apply_ple(
         self,
@@ -337,10 +346,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
         context_lens,
         ple_raw_embeddings=None,
         sequence_parallel=False,
+        sp_pad=0,
     ):
         """``hidden`` plus this layer's per-layer embedding (unchanged without PLE).
 
-        ``sequence_parallel``: ``hidden`` is this TP rank's token shard.
+        ``sequence_parallel``: ``hidden`` is this TP rank's token shard, padded
+        to a multiple of ``sp_pad`` rows when that is set (see ``pad_shard``).
         """
         if self.ple is None:
             return hidden
@@ -354,8 +365,11 @@ class Qwen4ExpDecoderLayer(nn.Module):
             ple_slots = ple_metadata.mamba_state_indices
             assert ple_slots is not None
             speculative = ple_speculative_state(ple_metadata)
-        return hidden + self.ple.forward_with_history(
-            hidden,
+        source = hidden
+        if sp_pad:
+            source = sp.unpad(hidden, input_ids.shape[0] // sp.tp_world_size())
+        addend = self.ple.forward_with_history(
+            source,
             PLEInputs(input_ids, query_start_loc, ngram_context),
             ple_slots,
             context_lens > 0,
@@ -364,6 +378,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
             speculative,
             sequence_parallel=sequence_parallel,
         )
+        return hidden + sp.pad_shard(addend, sp_pad)
 
     def _sequence_parallel_moe(self, block, num_tokens):
         """The MoE block's output at this rank's rows of a sharded step.
@@ -464,6 +479,9 @@ class Qwen4ExpBackbone(nn.Module):
         # The MTP draft consumes the pre-final-mixer multi-stream hidden state
         # [T, hc_count * H]; it is returned as the second (aux) output.
         self.emit_mtp_hidden = num_speculative_tokens(cfg) > 0
+        # Row multiple the sequence-parallel graph pads its HC streams to;
+        # set by Qwen4ExpForCausalLM with QWEN4_EXP_PREFILL_SP_PAD_HC.
+        self.sp_pad_rows = 0
         self.embed_tokens = VocabParallelEmbedding(t.vocab_size, t.hidden_size)
         self.layers = nn.ModuleList(
             [
@@ -567,10 +585,12 @@ class Qwen4ExpBackbone(nn.Module):
             self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         )
         num_tokens = input_ids.shape[0]
+        sp_pad = self.sp_pad_rows if sequence_parallel else 0
         if sequence_parallel:
             sp.check_divisible(num_tokens)
             hidden = sp.shard(hidden)
-        hidden = hidden.repeat(1, self.hc_count)
+        rows = hidden.shape[0]
+        hidden = sp.pad_shard(hidden.repeat(1, self.hc_count), sp_pad)
         for layer in self.layers:
             hidden = layer(
                 hidden,
@@ -585,8 +605,11 @@ class Qwen4ExpBackbone(nn.Module):
                 compressed_block_table,
                 ple_raw_embeddings,
                 sequence_parallel=sequence_parallel,
+                sp_pad=sp_pad,
             )
         mixed = self.hyper_connection_mixer.mix(hidden)[0]
+        if sp_pad:
+            mixed, hidden = sp.unpad(mixed, rows), sp.unpad(hidden, rows)
         if sequence_parallel:
             mixed = sp.gather(mixed, num_tokens)
             if self.emit_mtp_hidden:
@@ -833,6 +856,12 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
                     hc.prefill_norm_tile,
                 )
             )
+            if envs.QWEN4_EXP_PREFILL_SP_PAD_HC:
+                # The shard is padded to the HC tile instead of required to
+                # divide it, so every row-aligned bucket takes this graph.
+                if rows > sp.ROW_ALIGNMENT:
+                    self.model.sp_pad_rows = rows
+                rows = sp.ROW_ALIGNMENT
             eligible = partial(
                 sp.sequence_parallel_eligible, tp_size=tp_size, rows=rows
             )

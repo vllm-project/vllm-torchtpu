@@ -61,6 +61,32 @@ def shard_rows(hc_tiles: Iterable[int]) -> int:
     return math.lcm(ROW_ALIGNMENT, *(tile for tile in hc_tiles if tile))
 
 
+def padded_rows(rows, multiple: int):
+    """``rows`` rounded up to ``multiple``. Shape arithmetic rather than a
+    branch, so one graph serves every bucket."""
+    return (rows + multiple - 1) // multiple * multiple
+
+
+def pad_shard(x: torch.Tensor, multiple: int) -> torch.Tensor:
+    """A shard with zero rows appended up to a multiple of ``multiple``.
+
+    With QWEN4_EXP_PREFILL_SP_PAD_HC the sequence-parallel graph keeps the HC
+    streams at this padded length, so every HC kernel takes its Pallas path
+    for any shard. The padding rows stay zero (or False) and are cut off with
+    :func:`unpad` before any collective or token-indexed op.
+    """
+    if multiple <= 1:
+        return x
+    rows = x.shape[0]
+    pad = padded_rows(rows, multiple) - rows
+    return torch.cat([x, x.new_zeros((pad, *x.shape[1:]))])
+
+
+def unpad(x: torch.Tensor, rows) -> torch.Tensor:
+    """The shard's real rows of a padded tensor."""
+    return x.narrow(0, 0, rows)
+
+
 def sequence_parallel_eligible(
     num_tokens: int, tp_size: int, rows: int = ROW_ALIGNMENT
 ) -> bool:

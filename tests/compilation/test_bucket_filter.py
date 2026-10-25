@@ -83,10 +83,10 @@ class Router(nn.Module):
             return self.replicated(x)
 
 
-def _prepare(cache_root, router=Router):
+def _prepare(cache_root, router=Router, buckets=BUCKETS):
     os.environ["QWEN4_EXP_PREFILL_SP"] = "1"
     os.environ["QWEN4_EXP_PREFILL_SP_MIN_TOKENS"] = "1024"
-    sv.BUCKETS[:] = BUCKETS
+    sv.BUCKETS[:] = buckets
     import vllm_torchtpu
 
     vllm_torchtpu._patch_vllm_bucket_filter()
@@ -94,10 +94,10 @@ def _prepare(cache_root, router=Router):
     return config, backend, router(config)
 
 
-def _serve_all(router, config):
+def _serve_all(router, config, buckets=BUCKETS):
     served = {}
     with set_current_vllm_config(config):
-        for bucket in BUCKETS:
+        for bucket in buckets:
             sv.CALLS.clear()
             with set_forward_context({}, config):
                 router(torch.zeros(bucket, sv.HIDDEN))
@@ -175,10 +175,10 @@ class TieredRouter(Router):
         return TieredReplicated(vllm_config=config), TieredSharded(vllm_config=config)
 
 
-def _ladder(router, config):
+def _ladder(router, config, buckets=BUCKETS):
     """TPUModelRunner._precompile_backbone over the router."""
     with set_current_vllm_config(config), shape_variants.warmup() as tracked:
-        for bucket in BUCKETS:
+        for bucket in buckets:
             if tracked.needs_retrace(bucket):
                 shape_variants.retrace(router, config, bucket)
             with set_forward_context({}, config):
@@ -200,6 +200,59 @@ def _a_retrace_keeps_the_other_graph(cache_root):
 
 def test_a_retrace_for_one_graph_keeps_the_other_graph_live(tmp_path):
     sv.in_child(partial(_a_retrace_keeps_the_other_graph, str(tmp_path)))
+
+
+PADDED_BUCKETS = [16, 960, 1024, 2048, 3072, 4096]
+HC_TILE = 256
+
+
+def hc_kernel(x: torch.Tensor) -> torch.Tensor:
+    """GatedResidual's gate: the Pallas kernel only on rows dividing its tile."""
+    if x.shape[0] >= HC_TILE and x.shape[0] % HC_TILE == 0:
+        return sv.WAVE(x)
+    return sv.WAVE(sv.WAVE(x))  # the XLA fallback: another structure
+
+
+@support_torch_compile(dynamic_arg_dims={"x": 0})
+class PaddedSharded(nn.Module):
+    """QWEN4_EXP_PREFILL_SP_PAD_HC: the shard is padded to the HC tile, so
+    1024 and 3072 (128 and 384 rows at TP8) take the kernel like 2048/4096."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from vllm_torchtpu.models.vllm.qwen4_exp import sequence_parallel as sp
+
+        tokens = x.shape[0]
+        torch._check(tokens % TP == 0)
+        rows = tokens // TP
+        shards = x.reshape(TP, rows, x.shape[1]).unbind(0)
+        return torch.cat(
+            [sp.unpad(hc_kernel(sp.pad_shard(s, HC_TILE)), rows) for s in shards]
+        )
+
+
+class PaddedRouter(Router):
+    def build(self, config: VllmConfig) -> tuple[nn.Module, nn.Module]:
+        return Replicated(vllm_config=config), PaddedSharded(vllm_config=config)
+
+
+def _padded_shards_trace_once(cache_root):
+    config, backend, router = _prepare(cache_root, PaddedRouter, PADDED_BUCKETS)
+    _ladder(router, config, PADDED_BUCKETS)
+    compiled = list(backend.compiled)
+    served = _serve_all(router, config, PADDED_BUCKETS)
+    assert backend.compiled == compiled, backend.compiled[len(compiled) :]
+    sp_buckets = [1024, 2048, 3072, 4096]
+    # One structure for every SP bucket: the kernel path on each shard.
+    expected = {b: (b, TP if b in sp_buckets else 1) for b in PADDED_BUCKETS}
+    assert served == expected, served
+    assert sorted(compiled) == sorted(expected.values()), compiled
+
+
+def test_padded_shards_put_1024_and_3072_on_one_sp_trace(tmp_path):
+    sv.in_child(partial(_padded_shards_trace_once, str(tmp_path)))
 
 
 def test_unfiltered_outside_a_routed_call():
