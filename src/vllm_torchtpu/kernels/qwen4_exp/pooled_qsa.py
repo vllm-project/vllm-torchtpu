@@ -514,6 +514,7 @@ def select_blocks(
     ratio,
     block_topk,
     topk_backend: TopKBackend | None = None,
+    scheduling_group_namespace: int | None = None,
 ):
     """Read BF16 key tiles directly from the carrier, without a cache conversion."""
     width = pool.shape[-1]
@@ -541,6 +542,7 @@ def select_blocks(
         ratio=ratio,
         block_topk=block_topk,
         topk_backend=topk_backend,
+        scheduling_group_namespace=scheduling_group_namespace,
     )
 
 

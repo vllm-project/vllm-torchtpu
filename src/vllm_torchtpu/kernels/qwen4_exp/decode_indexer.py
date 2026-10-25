@@ -42,7 +42,13 @@ def decode_query_chunk_size(pages_per_query: int) -> int:
 
 
 @functools.partial(
-    jax.jit, static_argnames=("compress_ratio", "block_topk", "topk_backend")
+    jax.jit,
+    static_argnames=(
+        "compress_ratio",
+        "block_topk",
+        "topk_backend",
+        "scheduling_group_namespace",
+    ),
 )
 def select_decode_blocks(
     indexq,
@@ -56,6 +62,7 @@ def select_decode_blocks(
     starts=None,
     context=None,
     topk_backend: TopKBackend | None = None,
+    scheduling_group_namespace: int | None = None,
 ):
     """Return int32[B, block_topk] completed-group IDs with a -1 suffix.
 
@@ -120,6 +127,7 @@ def select_decode_blocks(
         ratio=compress_ratio,
         block_topk=block_topk,
         topk_backend=topk_backend,
+        scheduling_group_namespace=scheduling_group_namespace,
     )
 
 
@@ -135,6 +143,7 @@ def select_index_blocks(
     ratio,
     block_topk,
     topk_backend: TopKBackend | None = None,
+    scheduling_group_namespace: int | None = None,
 ):
     """Share ragged query-block reuse and bounded per-query scoring schedules.
 
@@ -175,6 +184,7 @@ def select_index_blocks(
             chunk_tokens=512 if len(query) % 512 == 0 else None,
             components=qsa_indexing(ratio - 1),
             topk_backend=topk_backend,
+            scheduling_group_namespace=scheduling_group_namespace,
         )
 
     batch = len(query)
@@ -198,6 +208,7 @@ def select_index_blocks(
             enable_early_exit=True,
             components=qsa_indexing(),
             topk_backend=topk_backend,
+            scheduling_group_namespace=scheduling_group_namespace,
         )
 
     if batch <= chunk_size:

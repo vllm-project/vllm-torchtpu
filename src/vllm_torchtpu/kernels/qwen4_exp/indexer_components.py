@@ -65,6 +65,10 @@ class QSAIndexSchedule:
 
     causal_position_offset: int = 0
 
+    @property
+    def preserves_kv_extent(self) -> bool:
+        return True
+
     def validate(self, compression_ratio: int) -> None:
         if not 0 <= self.causal_position_offset < compression_ratio:
             raise ValueError("causal position offset must be in [0, compression_ratio)")

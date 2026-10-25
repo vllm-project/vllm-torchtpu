@@ -63,12 +63,13 @@ class ReferenceTopK:
         )
 
 
+@pytest.mark.parametrize("namespace", [None, 7])
 @pytest.mark.parametrize("pooled", [False, True])
 @pytest.mark.parametrize(
     "tokens,requests", [(4, 8), (8, 8), (128, 8), (512, 8), (9, 9)]
 )
 def test_shared_schedule_forwards_backend_and_causal_metadata(
-    monkeypatch, pooled, tokens, requests
+    monkeypatch, pooled, tokens, requests, namespace
 ):
     seen = []
     backend = ReferenceTopK()
@@ -83,6 +84,7 @@ def test_shared_schedule_forwards_backend_and_causal_metadata(
 
     def record(q, weights, cache, lengths, pages, cu, distribution, **kwargs):
         assert kwargs["topk_backend"] is backend
+        assert kwargs["scheduling_group_namespace"] == namespace
         seen.append((np.asarray(lengths), np.asarray(cu), kwargs))
         # Independently reconstruct each query's visible complete groups.
         rq = jnp.minimum(
@@ -115,6 +117,7 @@ def test_shared_schedule_forwards_backend_and_causal_metadata(
                 ratio=4,
                 block_topk=16,
                 topk_backend=backend,
+                scheduling_group_namespace=namespace,
             )
         else:
             got = decode_indexer.select_decode_blocks(
@@ -127,6 +130,7 @@ def test_shared_schedule_forwards_backend_and_causal_metadata(
                 context=context,
                 block_topk=16,
                 topk_backend=backend,
+                scheduling_group_namespace=namespace,
             )
     expected = np.full((tokens, 16), -1, np.int32)
     for request, count in enumerate(counts):
@@ -357,3 +361,35 @@ def test_pooled_step_forwards_backend_before_attention(monkeypatch):
         topk_backend=backend,
     )
     assert seen == [backend]
+
+
+def test_cached_decode_selector_separates_namespace_and_backend(monkeypatch):
+    traces = []
+
+    def record(q, weights, cache, lengths, pages, cu, distribution, **kwargs):
+        traces.append((kwargs["scheduling_group_namespace"], kwargs["topk_backend"]))
+        return jnp.full((len(q), kwargs["k"]), len(traces), jnp.int32)
+
+    monkeypatch.setattr(decode_indexer, "streamindex_topk", record)
+    monkeypatch.setattr(decode_indexer, "decode_query_chunk_size", lambda _: 4)
+    fn = decode_indexer.select_decode_blocks
+    fn.clear_cache()
+    args = (
+        jnp.zeros((1, 1, 128), jnp.bfloat16),
+        jnp.zeros((1, 32, 1, 128), jnp.bfloat16),
+        jnp.array([4], jnp.int32),
+        jnp.zeros((1, 1), jnp.int32),
+        jnp.zeros((1,), jnp.int32),
+    )
+    backend = ReferenceTopK()
+    for ns, selector, expected in [
+        (3, backend, 1),
+        (4, backend, 2),
+        (3, backend, 1),
+        (3, SparseCoreTopK(), 3),
+    ]:
+        np.testing.assert_array_equal(
+            fn(*args, topk_backend=selector, scheduling_group_namespace=ns), expected
+        )
+    assert traces == [(3, backend), (4, backend), (3, SparseCoreTopK())]
+    fn.clear_cache()
