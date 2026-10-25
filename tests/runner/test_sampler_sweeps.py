@@ -104,12 +104,16 @@ def _trace(fn, *args, **kwargs):
         return gm.forward
 
     torch._dynamo.reset()
-    torch.compile(
-        getattr(fn, "_torchdynamo_orig_callable", fn),
-        backend=record,
-        fullgraph=True,
-        dynamic=False,
-    )(*args, **kwargs)
+    try:
+        torch.compile(
+            getattr(fn, "_torchdynamo_orig_callable", fn),
+            backend=record,
+            fullgraph=True,
+            dynamic=False,
+        )(*args, **kwargs)
+    finally:
+        # Drop the recording backend's entries so later tests compile afresh.
+        torch._dynamo.reset()
     assert graphs
     return graphs
 
