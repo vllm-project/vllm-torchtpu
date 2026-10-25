@@ -18,8 +18,12 @@ counts are taken once those placeholders are settled.
 A row is masked while ``num_output_tokens + ahead < min_tokens``, where
 ``ahead`` is the row's position past the request's current output: 0 for a
 plain step, ``j`` for draft position ``j`` of a verify chunk, and the draft
-length for its bonus row. As in vLLM, a structured-output row whose logits are
-all -inf after masking gets its stop tokens back.
+length for its bonus row. Masking by position never lets a stop through
+before ``min_tokens``. vLLM's GPU sampler masks the bonus row whenever the
+request is below ``min_tokens``, whatever its position, so there it can hold
+back a stop the request is already allowed to emit, and return extra tokens.
+As in vLLM, a structured-output row whose logits are all -inf after masking
+gets its stop tokens back.
 
 Stop-token ids go to the device as ``[rows, STOP_IDS_WIDTH]`` tables, the only
 width compiled: a request with more stop ids is masked in several passes of

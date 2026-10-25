@@ -4611,6 +4611,9 @@ class TPUModelRunner(GPUModelRunner):
                 continue
             num_output = len(req_state.output_token_ids)
             if num_output - num_draft < req.min_tokens <= num_output + max_ahead:
+                # Deliberate stall: this waits for the previous step's D2H copy
+                # before any of this step's sampling is enqueued. Bounded to the
+                # few steps per request where min_tokens falls in this window.
                 self._modify_prev_results()
                 self._pre_async_results = None
                 return
