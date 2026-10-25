@@ -106,6 +106,17 @@ _scheduling_group_ids = itertools.count(1)
 _scheduling_group_ids_lock = threading.Lock()
 
 
+def scoped_scheduling_group_id(namespace: int, chunk_pair: int) -> int:
+    """Injectively pair a positive call-site namespace and local chunk pair."""
+    if namespace < 1 or chunk_pair < 0:
+        raise ValueError(
+            "Scheduling namespace must be positive and chunk pair nonnegative"
+        )
+    diagonal = namespace + chunk_pair
+    # Even IDs cannot alias the standalone JAX allocator's odd IDs.
+    return 2 * (diagonal * (diagonal + 1) // 2 + chunk_pair + 1)
+
+
 def reserve_scheduling_group_ids(count: int) -> int:
     """Reserves `count` scheduling group ids nobody else in this process gets.
 
