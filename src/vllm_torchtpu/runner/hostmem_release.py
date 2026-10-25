@@ -105,12 +105,67 @@ def _census() -> tuple[str, list[Any]]:
         except Exception as e:  # diagnostic only
             exe_size = f" one_executable_serialized=? ({type(e).__name__})"
     types = " ".join(f"{k}={v}" for k, v in sorted(by_type.items()))
+    if envs.VLLM_TPU_POST_WARMUP_HOSTMEM_DETAIL:
+        _log_detail(objs)
     summary = (
         f"objects={len(objs)} {types} serialize_attrs={len(runnables)} "
         f"bytes>=1M: n={big_n} total={big_bytes >> 20}M{exe_size}"
     )
     del objs, executables
     return summary, runnables
+
+
+def _log_detail(objs: list[Any]) -> None:
+    """Python's share of the heap by type, and who holds a bundled entry."""
+    import sys
+
+    sizes: dict[str, list[int]] = {}
+    for o in objs:
+        t = type(o)
+        try:
+            n = sys.getsizeof(o)
+        except Exception:
+            continue
+        rec = sizes.setdefault(t.__name__, [0, 0])
+        rec[0] += 1
+        rec[1] += n
+    total = sum(v[1] for v in sizes.values())
+    top = sorted(sizes.items(), key=lambda kv: -kv[1][1])[:20]
+    logger.info(
+        "[hostmem] python tracked objects shallow total=%.1fG top: %s",
+        total / (1 << 30),
+        " ".join(f"{k}={v[0]}/{v[1] >> 20}M" for k, v in top),
+    )
+    entry = next(
+        (o for o in objs if type(o).__name__ == "BundledAOTAutogradResult"), None
+    )
+    if entry is None:
+        return
+    chain = []
+    level = [entry]
+    for _ in range(4):
+        nxt = []
+        for x in level:
+            for r in gc.get_referrers(x):
+                if r is objs or r is level or r is nxt or type(r).__name__ == "frame":
+                    continue
+                nxt.append(r)
+        desc = {}
+        for r in nxt:
+            name = type(r).__name__
+            if name == "dict":
+                keys = [k for k in r if isinstance(k, str)][:4]
+                name = f"dict{keys}"
+            elif name == "function":
+                name = f"fn:{getattr(r, '__qualname__', '?')}"
+            elif name == "cell":
+                name = "cell"
+            desc[name] = desc.get(name, 0) + 1
+        chain.append(" ".join(f"{k}x{v}" for k, v in list(desc.items())[:8]))
+        level = nxt[:16]
+        if not level:
+            break
+    logger.info("[hostmem] referrers of one bundled entry: %s", " <- ".join(chain))
 
 
 def _release_heap() -> None:
