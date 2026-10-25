@@ -881,6 +881,9 @@ class TPUWorker(WorkerBase):
         )
 
         install_post_warmup_compile_log()
+        # Warmup (dummy runs, spec-decode warmup requests) is over: steps from here
+        # on serve real requests (read by the megakernel check mode).
+        self.model_runner.warmup_done = True
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:
