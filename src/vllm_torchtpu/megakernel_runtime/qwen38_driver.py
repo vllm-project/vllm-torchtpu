@@ -568,6 +568,9 @@ class Qwen38SegmentDriver:
         self.whole = False
         self.whole_cap = 32768
         self.whole_hold = "buffer"  # `wholehold=param|list|buffer`: how the operands are held
+        # `wholerows=N`: whole-step only up to N rows (its in-kernel indexer / attention run row
+        # by row, ~0.25 ms per row: it loses to the segment / stock path at high concurrency).
+        self.whole_max_rows = 16
         self.whole_program = None
         self.whole_calls = 0
 
@@ -636,6 +639,9 @@ class Qwen38SegmentDriver:
         cap = _parse_int(raw, "wholecap")
         if cap is not None:
             drv.whole_cap = cap
+        rows_max = _parse_int(raw, "wholerows")
+        if rows_max is not None:
+            drv.whole_max_rows = rows_max
         for part in raw.split(","):
             if part.startswith("wholehold="):
                 drv.whole_hold = part[len("wholehold=") :]
@@ -1129,15 +1135,16 @@ class Qwen38SegmentDriver:
                     whole=whole,
                 )
             logger.info(
-                "Qwen3.8 whole-step megakernel attached: layers 3..46, context cap %d, budget %d, "
-                "max_groups %d, %d operands", self.whole_cap, budget, max_groups, whole.n_w,
+                "Qwen3.8 whole-step megakernel attached: layers 3..46, context cap %d, rows <= %d, "
+                "budget %d, max_groups %d, %d operands, hold %s", self.whole_cap, self.whole_max_rows,
+                budget, max_groups, whole.n_w, self.whole_hold,
             )
         except Exception:
             logger.exception("Qwen3.8 whole-step: setup failed; segment program only")
             self.whole_program = None
 
-    def _whole_eligible(self, runner: Any, n_req: int) -> bool:
-        if self.whole_program is None:
+    def _whole_eligible(self, runner: Any, n_req: int, rows: int) -> bool:
+        if self.whole_program is None or rows > self.whole_max_rows:
             return False
         try:
             ctx = runner.input_batch.num_computed_tokens_cpu[:n_req]
@@ -1341,7 +1348,7 @@ class Qwen38SegmentDriver:
         try:
             if self.check_left > 0 and self.shadow is not None:
                 out = self._shadow_step(runner, input_ids, positions, kw)
-            elif self._whole_eligible(runner, n_req):
+            elif self._whole_eligible(runner, n_req, rows):
                 self.whole_calls += 1
                 self._note(f"whole_b{rows}")
                 with self._contexts(runner, "model_mk_whole"):
