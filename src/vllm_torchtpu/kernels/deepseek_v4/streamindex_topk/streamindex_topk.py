@@ -1080,6 +1080,7 @@ def _effective_row_lengths(
         "uniform_q_len",
         "components",
         "topk_backend",
+        "scheduling_group_namespace",
     ),
 )
 def streamindex_topk(
@@ -1111,6 +1112,7 @@ def streamindex_topk(
     uniform_q_len: int | None = None,
     components: indexing.StreamIndexComponents | None = None,
     topk_backend: TopKBackend = _DEFAULT_TOPK_BACKEND,
+    scheduling_group_namespace: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1184,6 +1186,9 @@ def streamindex_topk(
       topk_backend: Static selector for the score-bit buffers. The default keeps
         SparseCore selection and chunk overlap. A backend without overlap uses
         the same scoring chunks without cross-engine scheduling annotations.
+      scheduling_group_namespace: Positive static native call-site identity.
+        Zero omits unsafe unbound native annotations. None retains standalone
+        JAX allocation; a cached native body must use an explicit namespace.
 
     Returns:
       Top-K indices (rank-local when `cp_size > 1`, global compressed positions
@@ -1194,6 +1199,8 @@ def streamindex_topk(
     # `cache_kv`, keeping HBM transactions fused.
 
     kv_layout = KVLayout.parse(kv_layout)
+    if scheduling_group_namespace is not None and scheduling_group_namespace < 0:
+        raise ValueError("scheduling_group_namespace must be nonnegative")
 
     if cp_size < 1:
         raise ValueError(f"cp_size must be >= 1, got {cp_size}.")
@@ -1588,8 +1595,21 @@ def streamindex_topk(
         # Ids count from 1, so the 0 is never a real group: a single chunk has no
         # pair to annotate and takes the `None` branch below both times.
         group_base = 0
-        if num_chunks > 1 and topk_backend.overlaps_scoring:
+        if (
+            num_chunks > 1
+            and topk_backend.overlaps_scoring
+            and scheduling_group_namespace is None
+        ):
             group_base = config.reserve_scheduling_group_ids(num_chunks - 1)
+
+        def group_id(chunk_pair):
+            if scheduling_group_namespace is None:
+                return 2 * (group_base + chunk_pair) - 1
+            if scheduling_group_namespace == 0:
+                return None
+            return config.scoped_scheduling_group_id(
+                scheduling_group_namespace, chunk_pair
+            )
 
         chunk_starts = (
             (None,)
@@ -1607,10 +1627,10 @@ def streamindex_topk(
             # scoring, so the scheduler emits `sc(g).start, tc(g+1), sc(g).done`.
             # Chunk 0's scoring and the last top-k have no partner.
             tc_group = (
-                group_base + m - 1 if m > 0 and topk_backend.overlaps_scoring else None
+                group_id(m - 1) if m > 0 and topk_backend.overlaps_scoring else None
             )
             sc_group = (
-                group_base + m
+                group_id(m)
                 if m < num_chunks - 1 and topk_backend.overlaps_scoring
                 else None
             )

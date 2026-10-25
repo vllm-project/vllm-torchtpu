@@ -52,6 +52,66 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _bind_scheduling_group_namespaces(graph: fx.GraphModule) -> None:
+    """Bind static native-op namespaces to actual call sites in this program."""
+    argument = "scheduling_group_namespace"
+    namespace = 0
+
+    def parameter(node: fx.Node) -> int | None:
+        if node.op != "call_function" or not isinstance(
+            node.target, torch._ops.OpOverload
+        ):
+            return None
+        for index, item in enumerate(node.target._schema.arguments):
+            if item.name == argument:
+                return index
+        return None
+
+    def contains_groups(module: fx.GraphModule) -> bool:
+        return any(
+            parameter(node) is not None
+            for child in module.modules()
+            if isinstance(child, fx.GraphModule)
+            for node in child.graph.nodes
+        )
+
+    def bind(module: fx.GraphModule) -> None:
+        nonlocal namespace
+        changed = False
+        for node in module.graph.nodes:
+            if node.op == "call_module":
+                child = module.get_submodule(str(node.target))
+                if isinstance(child, fx.GraphModule) and contains_groups(child):
+                    # A module can be called twice; its cached body is not a call site.
+                    if not node.meta.get("scheduling_group_private_module"):
+                        name = f"_scheduling_{node.name}"
+                        while hasattr(module, name):
+                            name += "_"
+                        child = fx.GraphModule(child, copy.deepcopy(child.graph))
+                        module.add_submodule(name, child)
+                        node.target = name
+                        node.meta["scheduling_group_private_module"] = True
+                    bind(child)
+                    changed = True
+            index = parameter(node)
+            if index is None:
+                continue
+            namespace += 1
+            args, kwargs = list(node.args), dict(node.kwargs)
+            if index < len(args):
+                args[index] = namespace
+                kwargs.pop(argument, None)
+            else:
+                kwargs[argument] = namespace
+            node.args, node.kwargs = tuple(args), kwargs
+            changed = True
+        if changed:
+            module.graph.lint()
+            module.recompile()
+
+    bind(graph)
+
+
 @dataclasses.dataclass
 class TpuCompilationHandle:
     """Metadata handle saved to vLLM's compilation cache directory.
@@ -277,6 +337,8 @@ _NATIVE_TPU_COMPILE_ENV_VARS = (
 )
 
 _RUNTIME_CACHE_KEY_PATHS = (
+    # Static call-site binding changes the exported native kernel identity.
+    "vllm_torchtpu/compilation/tpu_compiler.py",
     # Pallas implementations execute behind torch custom-op boundaries, so
     # Dynamo's traced-file validation cannot see their source changes.
     "vllm_torchtpu/kernels",
@@ -817,6 +879,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         # moves, so the placeholder signature is unaffected.
         graph = copy.deepcopy(graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
+        _bind_scheduling_group_namespaces(graph)
 
         caching = (
             key is not None and self.cache_dir is not None and not self._disable_cache
@@ -937,6 +1000,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         # artifact is checked against is shaped the way it was when saved.
         graph = copy.deepcopy(graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
+        _bind_scheduling_group_namespaces(graph)
 
         compiled_fn = self._replay(path, graph, was_wrapped)
         if compiled_fn is None:
