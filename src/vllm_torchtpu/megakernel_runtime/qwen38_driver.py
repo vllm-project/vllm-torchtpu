@@ -194,13 +194,14 @@ class _SegmentKind:
     """
 
     def __init__(
-        self, mesh: Any, g: Any, L: int, layout: Any, write: bool, head: bool = False
+        self, mesh: Any, g: Any, L: int, layout: Any, write: bool, head: bool = False,
+        suffix: str = "",
     ) -> None:
         self.mesh, self.g, self.L, self.layout, self.write = mesh, g, L, layout, write
         self.head = head
         self.has_gdn = head or L > 1
         self._calls: dict[int, Any] = {}
-        self.tag = f"{'head' if head else 'seg'}_l{L}" + ("" if write else "_shadow")
+        self.tag = f"{'head' if head else 'seg'}_l{L}" + ("" if write else "_shadow") + suffix
         name = f"qwen38_mk::{self.tag}"
         has_gdn = self.has_gdn
 
@@ -412,6 +413,9 @@ class Qwen38SegmentDriver:
         self.shadow = None
         self.h0check_left = 0
         self.h0kind = None
+        self.segx_left = 0
+        self.segx_set: list[int] = []
+        self.private_kinds: dict = {}
         self.stats: dict[str, int] = {}
         self.mtp = False
         self.cfg = None
@@ -456,6 +460,12 @@ class Qwen38SegmentDriver:
         # compare the head-0 (layer 0) kernel against stock layer 0 on the same
         # input, the kernel reading a private copy of layer 0's state blocks.
         drv.h0check_left = _parse_int(raw, "h0check") or 0
+        # `segxcheck=N,segx=8:2`: like h0check for the named segments (each segment
+        # kernel vs its stock layers on the same input, private GDN state copies).
+        drv.segx_left = _parse_int(raw, "segxcheck") or 0
+        for part in raw.split(","):
+            if part.startswith("segx="):
+                drv.segx_set = [int(x) for x in part[5:].split(":")]
         for part in raw.split(","):
             # `segset=1:5` / `headset=0`: only these segments / head groups run
             # their kernels, the rest stock (bisection).
@@ -581,24 +591,11 @@ class Qwen38SegmentDriver:
         ck = md.mamba_ckpt_indices.to(torch.int64)[:NS, :T]
         qsl = md.query_start_loc.to(torch.int32)[: NS + 1]
         seq = md.seq_lens.to(torch.int32)[:NS]
-        pool = segs.pool
-        flat = ck.reshape(-1)
-        saved = pool[flat]
-        # Private pool: block 0 null, request s column t at 1 + s*T + t.
-        small = torch.cat([torch.zeros_like(pool[:1]), saved], dim=0)
-        new_ck = (1 + torch.arange(NS * T, device=ck.device).reshape(NS, T)).to(torch.int32)
-        new_ck = torch.where(ck > 0, new_ck, torch.zeros_like(new_ck))
-        new_st = new_ck[:, 0]
-        new_off = torch.zeros(small.shape[0], dtype=torch.int32, device=ck.device)
-        new_off[new_st.long()] = off_tab[st].to(torch.int32)
-        if self.h0kind is None:
-            lay = Qwen38GdnPoolLayout(pool_shape=tuple(int(d) for d in small.shape), pool_dtype=segs.layout.pool_dtype)
-            self.h0kind = _SegmentKind(self.mesh, self.g, len(segs.head_groups[0]), lay, write=False, head=True)
         w = [getattr(segs, f"h0_{i}") for i in range(segs.n_hw[0])]
-        meta = [new_st, new_off, new_ck, qsl, seq]
         with torch.no_grad():
             h_in = bb.embed_tokens(input_ids).repeat(1, hc)
-            mk_out = self.h0kind.op(h_in, h_in, w, [small, *meta])[0]
+            ids0 = list(segs.head_groups[0])
+            mk_out = self._mk_run(len(ids0), True, w, h_in, None, self._snap(ids0, NS))
             # Stock layer 0, staged like Qwen4ExpDecoderLayer.forward.
             from vllm_torchtpu.models.vllm.qwen4_exp import sequence_parallel as sp
 
@@ -631,6 +628,126 @@ class Qwen38SegmentDriver:
             _diff_stats(mk_out, st_out, n, hc), float((residual2[0] if isinstance(residual2, tuple) else residual2).float()[:n].norm()),
             float(moe.float()[:n].norm()), self.h0check_left,
         )
+        return (mixed, h) if bb.emit_mtp_hidden else mixed
+
+    def _snap(self, gdn_ids: list, NS: int) -> list:
+        """A private copy of `gdn_ids`' GDN state blocks plus remapped metadata.
+
+        Fixed capacity (null block + 16 requests x 4 checkpoint columns per GDN
+        layer) so one compiled kind serves every bucket. The real pool is only
+        read; take it before the stock layers write this step's checkpoints.
+        """
+        from vllm.forward_context import get_forward_context
+
+        if not gdn_ids:
+            return []
+        segs = self.segments
+        T, CAP = T_VERIFY, 16
+        md_all = get_forward_context().attn_metadata
+        pool = segs.pool
+        n_blk = 1 + len(gdn_ids) * CAP * T
+        dev = pool.device
+        small = torch.zeros((n_blk,) + tuple(pool.shape[1:]), dtype=pool.dtype, device=dev)
+        new_off = torch.zeros(n_blk, dtype=torch.int32, device=dev)
+        meta = []
+        for k, i in enumerate(gdn_ids):
+            md = md_all[segs.layers[i].linear_attn.prefix]
+            st = md.mamba_state_indices.to(torch.int64)[:NS]
+            ck = md.mamba_ckpt_indices.to(torch.int64)[:NS, :T]
+            base = 1 + k * CAP * T
+            small[base : base + NS * T] = pool[ck.reshape(-1)]
+            new_ck = (base + torch.arange(NS * T, device=dev).reshape(NS, T)).to(torch.int32)
+            new_ck = torch.where(ck > 0, new_ck, torch.zeros_like(new_ck))
+            new_off[new_ck[:, 0].long()] = md.mamba_slot_read_offsets.to(torch.int32)[st]
+            meta += [new_ck[:, 0], None, new_ck, md.query_start_loc.to(torch.int32)[: NS + 1], md.seq_lens.to(torch.int32)[:NS]]
+        return [small, *[new_off if m is None else m for m in meta]]
+
+    def _mk_run(self, L: int, head: bool, w: list, h: Any, att: Any, gdn_io: list) -> Any:
+        """The `L`-layer kernel on `gdn_io` from `_snap` (checkpoints not written)."""
+        from .qwen38_gdn_state import Qwen38GdnPoolLayout
+
+        key = (L, head, int(gdn_io[0].shape[0]) if gdn_io else 0)
+        if key not in self.private_kinds:
+            lay = self.segments.layout
+            if gdn_io:
+                lay = Qwen38GdnPoolLayout(
+                    pool_shape=tuple(int(d) for d in gdn_io[0].shape), pool_dtype=lay.pool_dtype
+                )
+            sfx = f"_check{key[2]}"
+            self.private_kinds[key] = _SegmentKind(self.mesh, self.g, L, lay, write=False, head=head, suffix=sfx)
+        return self.private_kinds[key].op(h, h if att is None else att, w, gdn_io)[0]
+
+    def _segxcheck(self, runner: Any, input_ids: Any, positions: Any, kw: dict, rows: int) -> Any:
+        """Serve the step with eager stock layers; on the named segments also run
+        the kernel on the same input (private GDN state) and log the diff."""
+        from vllm_torchtpu.models.vllm.qwen4_exp import sequence_parallel as sp
+        from vllm_torchtpu.models.vllm.qwen4_exp.qsa import QSAMetadata
+
+        segs, bb = self.segments, runner.model.model
+        layers, hc = bb.layers, bb.hc_count
+        NS = rows // T_VERIFY
+        pos64, ids64 = positions.to(torch.int64), input_ids.to(torch.int64)
+        args = (
+            pos64, ids64, kw["query_start_loc"], kw["ngram_context"], kw["state_slots"],
+            kw["context_lens"], kw["valid_tokens"], kw["main_block_table"], kw["compressed_block_table"],
+        )
+        meta = QSAMetadata(
+            kw["query_start_loc"], kw["context_lens"], kw["state_slots"],
+            kw["main_block_table"], kw["compressed_block_table"],
+        )
+        starts = {segment_layers(self.g, s)[0]: s for s in self.segx_set}
+        n = rows
+        with torch.no_grad():
+            h = bb.embed_tokens(input_ids).repeat(1, hc)
+            i = 0
+            while i < len(layers):
+                if i in starts:
+                    s = starts[i]
+                    ids = segment_layers(self.g, s)
+                    q = layers[i]
+                    block, residual = q.attn_hyper_connection.mix(h)
+                    att = q.self_attn.attend(block, pos64, meta)
+                    w = [getattr(segs, f"w{s}_{j}") for j in range(segs.n_w[s])]
+                    mk = self._mk_run(len(ids), False, w, h, att, self._snap(ids[1:], NS))
+                    snaps = [self._snap([j], NS) for j in ids[1:]]
+                    # Stock QSA layer on the same `att` (attention and its cache
+                    # writes run once), staged like Qwen4ExpDecoderLayer.forward.
+                    o = sp.reduce(q.self_attn.o_proj(att), False)
+                    mixed2, residual2 = q.attn_hyper_connection.combine_mix(o, residual, q.mlp_hyper_connection)
+                    mixed2 = torch.where(kw["valid_tokens"].to(torch.bool)[:, None], mixed2, 0)
+                    st, ins = q.mlp_hyper_connection.combine(q.mlp(mixed2), residual2), [h]
+                    for j in ids[1:]:
+                        ins.append(st)
+                        st = layers[j](st, *args)
+                    logger.info(
+                        "qwen38 segxcheck seg%d layers %d-%d rows=%d in_norm=%.4f MK vs stock: %s (%d left)",
+                        s, ids[0], ids[-1], rows, float(h.float().norm()), _diff_stats(mk, st, n, hc), self.segx_left,
+                    )
+                    # Each layer alone on its stock input: the QSA layer as an L=1
+                    # segment, each GDN layer as an L=1 head (weights packed here and
+                    # dropped after, to keep HBM free).
+                    R = self.mesh.size
+                    ex = ExecSpec(R=R, B=segs.buckets[0], T=T_VERIFY, ctx=128, tiles=segment_tiles(segs.buckets[0]))
+                    try:
+                        for k, j in enumerate(ids):
+                            head = k > 0
+                            spec = qwen38.segment_spec(self.g, R, L=1, head=head)
+                            wj = pack_segment_operands(runner.model, self.g, -1, spec, ex, layer_ids=[j], head=head)
+                            out_j = self._mk_run(1, head, wj, ins[k], att if k == 0 else None, snaps[k - 1] if head else [])
+                            ref_j = ins[k + 1] if k + 1 < len(ids) else st
+                            logger.info(
+                                "qwen38 segxcheck seg%d layer %d (%s) MK vs stock: %s",
+                                s, j, "gdn" if head else "qsa-out", _diff_stats(out_j, ref_j, n, hc),
+                            )
+                            del wj, out_j
+                    except Exception:
+                        logger.exception("qwen38 segxcheck seg%d per-layer check failed", s)
+                    h = st
+                    i = ids[-1] + 1
+                    continue
+                h = layers[i](h, *args)
+                i += 1
+            mixed = bb.hyper_connection_mixer.mix(h)[0]
         return (mixed, h) if bb.emit_mtp_hidden else mixed
 
     def _attach_mtp_tail(self, runner: Any) -> None:
@@ -785,6 +902,16 @@ class Qwen38SegmentDriver:
             if self.mk_calls <= 2:
                 self._log_gdn_meta()
         kw = dict(model_kwargs or {})
+        if self.segx_left > 0 or getattr(self, "segx_done", False):
+            if self.segx_left > 0 and getattr(runner, "warmup_done", False) and _real_traffic(kw):
+                self.segx_left -= 1
+                self.segx_done = True
+                try:
+                    return True, self._segxcheck(runner, input_ids, positions, kw, rows)
+                except Exception:
+                    logger.exception("qwen38 megakernel segxcheck failed; segxcheck off")
+                    self.segx_left = 0
+            return False, None
         if self.h0check_left > 0 or getattr(self, "h0check_done", False):
             if self.h0check_left > 0 and getattr(runner, "warmup_done", False) and _real_traffic(kw):
                 self.h0check_left -= 1
