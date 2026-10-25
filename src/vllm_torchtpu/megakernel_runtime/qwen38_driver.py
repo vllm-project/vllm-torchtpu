@@ -112,6 +112,42 @@ def _diff_stats(a: torch.Tensor, b: torch.Tensor, n: int, hc: int) -> dict:
     return out
 
 
+def _operand_names(spec: Any, ex: Any, L: int) -> list[str]:
+    """Names of the flattened operands `pack_segment_operands` returns."""
+    from vllm_torchtpu.megakernel import planner
+
+    names: list[str] = []
+    for n in planner.plan(spec, ex).w_names:
+        names += [f"{n}[{j}]" for j in range(L)] if n in ("e13", "e2") else [n]
+    return names
+
+
+def _cpu_proxy(m: Any, memo: dict | None = None) -> Any:
+    """A CPU copy of module `m` with the attributes `pack_segment_operands` reads."""
+    import types
+
+    from vllm_torchtpu.layers.adapter.quantization.unquantized import WEIGHT_FLIPPED_ATTR
+
+    memo = {} if memo is None else memo
+    if id(m) in memo:
+        return memo[id(m)]
+    ns = memo[id(m)] = types.SimpleNamespace()
+    for k, v in vars(m).items():
+        if k.startswith("_") and k != WEIGHT_FLIPPED_ATTR:
+            continue
+        if v is None or isinstance(v, (bool, int, float, str)):
+            setattr(ns, k, v)
+        elif isinstance(v, nn.Module) and k == "routed_experts":
+            setattr(ns, k, _cpu_proxy(v, memo))
+    for k, v in m._parameters.items():
+        setattr(ns, k, None if v is None else v.detach().cpu())
+    for k, v in m._buffers.items():
+        setattr(ns, k, None if v is None else v.detach().cpu())
+    for k, v in m._modules.items():
+        setattr(ns, k, None if v is None else _cpu_proxy(v, memo))
+    return ns
+
+
 # `VLLM_TPU_MEGAKERNEL=...,nodonate=1`: the GDN pool is not donated to the segment op; it
 # writes a fresh pool that `_run` copies back into the live cache (bisecting a served hang).
 NO_DONATE = False
@@ -415,6 +451,7 @@ class Qwen38SegmentDriver:
         self.h0kind = None
         self.segx_left = 0
         self.segx_set: list[int] = []
+        self.segx_audited: set[int] = set()
         self.private_kinds: dict = {}
         self.stats: dict[str, int] = {}
         self.mtp = False
@@ -595,7 +632,21 @@ class Qwen38SegmentDriver:
         with torch.no_grad():
             h_in = bb.embed_tokens(input_ids).repeat(1, hc)
             ids0 = list(segs.head_groups[0])
-            mk_out = self._mk_run(len(ids0), True, w, h_in, None, self._snap(ids0, NS))
+            R = self.mesh.size
+            ex = ExecSpec(R=R, B=segs.buckets[0], T=T_VERIFY, ctx=128, tiles=segment_tiles(segs.buckets[0]))
+            spec = qwen38.segment_spec(self.g, R, L=len(ids0), head=True)
+            names = _operand_names(spec, ex, len(ids0))
+            if not getattr(self, "h0_audited", False):
+                self.h0_audited = True
+                self._audit_operands(runner, w, names, spec, ex, ids0, "head0", True)
+            # Zero-weight splits: no MoE (routed + shared expert weights 0, so the
+            # MoE adds exactly 0) and no GDN (out_proj 0, so the GDN adds exactly 0).
+            no_moe = [torch.zeros_like(t) if n.split("[")[0] in ("e13", "e2", "sh13", "sh2") else t for n, t in zip(names, w)]
+            no_gdn = [torch.zeros_like(t) if n == "lin_out" else t for n, t in zip(names, w)]
+            snap0 = self._snap(ids0, NS)
+            mk_out = self._mk_run(len(ids0), True, w, h_in, None, snap0)
+            mk_nomoe = self._mk_run(len(ids0), True, no_moe, h_in, None, self._snap(ids0, NS))
+            mk_nogdn = self._mk_run(len(ids0), True, no_gdn, h_in, None, self._snap(ids0, NS))
             # Stock layer 0, staged like Qwen4ExpDecoderLayer.forward.
             from vllm_torchtpu.models.vllm.qwen4_exp import sequence_parallel as sp
 
@@ -606,6 +657,11 @@ class Qwen38SegmentDriver:
             mixed2 = torch.where(valid[:, None], mixed2, 0)
             moe = layer.mlp(mixed2)
             st_out = layer.mlp_hyper_connection.combine(moe, residual2)
+            # Stock counterparts of the splits (no GDN: block output 0).
+            st_nomoe = residual2[0] if isinstance(residual2, tuple) else residual2
+            m0, r0 = layer.attn_hyper_connection.combine_mix(torch.zeros_like(g), residual, layer.mlp_hyper_connection)
+            m0 = torch.where(valid[:, None], m0, 0)
+            st_nogdn = layer.mlp_hyper_connection.combine(layer.mlp(m0), r0)
             # Stock layer 0 above is this step's served layer 0 (its GDN writes are the
             # real ones); the rest of the model runs stock here and serves the step.
             args = (
@@ -628,7 +684,71 @@ class Qwen38SegmentDriver:
             _diff_stats(mk_out, st_out, n, hc), float((residual2[0] if isinstance(residual2, tuple) else residual2).float()[:n].norm()),
             float(moe.float()[:n].norm()), self.h0check_left,
         )
+        logger.info("qwen38 h0check split no-MoE (GDN + attn HC) MK vs stock: %s", _diff_stats(mk_nomoe, st_nomoe, n, hc))
+        logger.info("qwen38 h0check split no-GDN (MoE + HC) MK vs stock: %s", _diff_stats(mk_nogdn, st_nogdn, n, hc))
         return (mixed, h) if bb.emit_mtp_hidden else mixed
+
+    def _audit_operands(
+        self, runner: Any, w: list, names: list, spec: Any, ex: Any, ids: list, tag: str, head: bool
+    ) -> None:
+        """Each served operand vs the same packing done on CPU from CPU copies of
+        the modules (torch_tpu op check), one log line per operand; then what the
+        JAX side sees (position-weighted sums inside a shard_map) vs the torch side."""
+        try:
+            import types
+
+            layers = [None] * (max(ids) + 1)
+            for i in ids:
+                layers[i] = _cpu_proxy(runner.model.model.layers[i])
+            proxy = types.SimpleNamespace(model=types.SimpleNamespace(layers=layers))
+            ref = pack_segment_operands(proxy, self.g, -1, spec, ex, layer_ids=ids, head=head)
+            for n, a, b in zip(names, w, ref):
+                a = a.detach().cpu()
+                if tuple(a.shape) != tuple(b.shape):
+                    logger.info("qwen38 audit %s %s: SHAPE served %s cpu %s", tag, n, tuple(a.shape), tuple(b.shape))
+                    continue
+                af, bf = a.float(), b.float()
+                d = (af - bf).abs()
+                logger.info(
+                    "qwen38 audit %s %s %s %s: maxabs %.4g rel %.4g |cpu| %.4g nz served %d cpu %d",
+                    tag, n, tuple(a.shape), str(a.dtype).removeprefix("torch."), float(d.max()),
+                    float(d.mean() / bf.abs().mean().clamp_min(1e-30)), float(bf.abs().mean()),
+                    int((af != 0).sum()), int((bf != 0).sum()),
+                )
+            self._audit_jax_view(w, ref, names, tag)
+        except Exception:
+            logger.exception("qwen38 audit %s failed", tag)
+
+    def _audit_jax_view(self, w: list, ref: list, names: list, tag: str) -> None:
+        import jax
+        import jax.numpy as jnp
+        from jax.sharding import PartitionSpec as P
+
+        def stats(*xs):
+            out = []
+            for x in xs:
+                f = x.astype(jnp.float32).reshape(-1)
+                pos = (jnp.arange(f.shape[0], dtype=jnp.int32) % 7 + 1).astype(jnp.float32)
+                out.append(jnp.stack([jnp.sum(jnp.abs(f)), jnp.sum(f * pos)])[None])
+            return tuple(out)
+
+        n = len(w)
+        body = jax.shard_map(stats, mesh=self.mesh, in_specs=(P("tp"),) * n, out_specs=(P("tp"),) * n, check_vma=False)
+        typed = make_typed_step_wrapper(f"qwen38_audit_{tag}", body, n, n)
+        call = sharded_jax_callable(
+            f"qwen38_mk::audit_{tag}", typed, mesh=self.mesh,
+            input_partition_specs=(P("tp"),) * n, output_partition_specs=(P("tp"),) * n,
+        )
+        outs = call(*w)
+        for name, o, b in zip(names, outs, ref):
+            f = b.float().reshape(-1)
+            pos = (torch.arange(f.numel()) % 7 + 1).float()
+            cpu = (float(f.abs().sum()), float((f * pos).sum()))
+            o = o.detach().cpu().reshape(-1).tolist()
+            logger.info(
+                "qwen38 audit-jax %s %s: jax abs %.6g pos %.6g | cpu abs %.6g pos %.6g",
+                tag, name, o[0], o[1], cpu[0], cpu[1],
+            )
 
     def _snap(self, gdn_ids: list, NS: int) -> list:
         """A private copy of `gdn_ids`' GDN state blocks plus remapped metadata.
@@ -708,6 +828,12 @@ class Qwen38SegmentDriver:
                     block, residual = q.attn_hyper_connection.mix(h)
                     att = q.self_attn.attend(block, pos64, meta)
                     w = [getattr(segs, f"w{s}_{j}") for j in range(segs.n_w[s])]
+                    if s not in self.segx_audited:
+                        self.segx_audited.add(s)
+                        R = self.mesh.size
+                        ex = ExecSpec(R=R, B=segs.buckets[0], T=T_VERIFY, ctx=128, tiles=segment_tiles(segs.buckets[0]))
+                        spec = qwen38.segment_spec(self.g, R, L=len(ids))
+                        self._audit_operands(runner, w, _operand_names(spec, ex, len(ids)), spec, ex, ids, f"seg{s}", False)
                     mk = self._mk_run(len(ids), False, w, h, att, self._snap(ids[1:], NS))
                     snaps = [self._snap([j], NS) for j in ids[1:]]
                     # Stock QSA layer on the same `att` (attention and its cache
