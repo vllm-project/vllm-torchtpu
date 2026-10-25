@@ -418,6 +418,7 @@ class Qwen38SegmentDriver:
         if hier is not None:
             qwen38_segment_call.DEFAULT_HIER = hier
         qwen38_segment_call.CLAMP_BLOCKS = _parse_flag(raw, "gdnclamp", False)
+        qwen38_segment_call.PIPE_EP = _parse_flag(raw, "pipeep", True)
         for part in raw.split(","):
             if part.startswith("rings="):
                 e, d = part[len("rings=") :].split(":")

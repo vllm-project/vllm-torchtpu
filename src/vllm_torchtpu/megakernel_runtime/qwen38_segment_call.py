@@ -44,6 +44,8 @@ T_VERIFY = 4
 # (`VLLM_TPU_MEGAKERNEL=...,hier=N,rings=E:D` sets them; rings for every bucket).
 DEFAULT_HIER = 2
 DEFAULT_RINGS: tuple[int, int] | None = None
+# `pipeep=0`: the MoE experts on the non-pipelined EP path (A/B of a served factor).
+PIPE_EP = True
 # `VLLM_TPU_MEGAKERNEL=...,gdnclamp=1`: block ids outside the pool go to the null block 0.
 CLAMP_BLOCKS = False
 
@@ -75,7 +77,7 @@ def segment_tiles(
     nbe, nbd = rings or DEFAULT_RINGS or ring_depths(B)
     h = DEFAULT_HIER if hier is None else hier
     return Tiles(ebank=2 << 20, nbe=nbe, nbd=nbd, vmem_mib=62, hier=h).with_blocks(
-        {"moe": {"pipe_ep": True, "moe_unroll": True}}
+        {"moe": {"pipe_ep": PIPE_EP, "moe_unroll": True}}
     )
 
 
