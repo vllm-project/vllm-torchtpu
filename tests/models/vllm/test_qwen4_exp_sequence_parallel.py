@@ -125,7 +125,15 @@ class PartialAttention(nn.Module):
     def forward(self, block):  # GDN: un-reduced output projection
         return self._partial(block)
 
-    def forward_with_indices(self, block, positions, metadata, reduce=True):
+    def forward_with_indices(
+        self,
+        block,
+        positions,
+        metadata,
+        reduce=True,
+        replicated_indexer=False,
+        token_shard=False,
+    ):
         assert reduce is False
         return self._partial(block), None
 
