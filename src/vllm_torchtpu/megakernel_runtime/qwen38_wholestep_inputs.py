@@ -68,12 +68,14 @@ def qsa_step_inputs(
     max_groups: int,
     k_scale: float = 1.0,
     v_scale: float = 1.0,
+    layer_major_tables: bool = False,
 ) -> dict[str, Any]:
     """`{name: array}` of the stage-C QSA extras for `len(tables)` QSA layers.
 
     tables[o]: layer o's flat `(ring_ids, main_table, compressed_table)` as the runner hands
     them to the stock op; slots[o]: its `(main_slot, compressed_slot)` (-1 main slot = whole
-    rows: head-pair offset 0).
+    rows: head-pair offset 0). `layer_major_tables`: page tables `[layers, requests, cols]`
+    (the indexer's `hbm_tables` form) instead of `[layers * requests, cols]`.
     """
     n_req = len(context)
     nreq = M // T
@@ -105,10 +107,10 @@ def qsa_step_inputs(
     return {
         "qsa_pool": pool,
         "qsa_ck": pool.reshape(-1, 128 // GROUP // 2, pool.shape[-2], pool.shape[-1]),
-        "qsa_cktab": jnp.concatenate(cktab),
+        "qsa_cktab": jnp.stack(cktab) if layer_major_tables else jnp.concatenate(cktab),
         "qsa_nvis": lens // GROUP,
         "qsa_tail": lens % GROUP,
-        "qsa_mtab": jnp.concatenate(mtab),
+        "qsa_mtab": jnp.stack(mtab) if layer_major_tables else jnp.concatenate(mtab),
         "qsa_off": jnp.asarray([max(m, 0) for m, _ in slots], jnp.int32),
         "qsa_scales": jnp.asarray([k_scale, v_scale], jnp.float32),
         "qsa_rope": trig32[pos],

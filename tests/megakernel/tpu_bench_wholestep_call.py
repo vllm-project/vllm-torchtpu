@@ -38,7 +38,7 @@ from vllm_torchtpu.megakernel.wholestep.spec import wholestep_spec
 from vllm_torchtpu.megakernel_runtime.qwen38_gdn_state import Qwen38GdnPoolLayout
 from vllm_torchtpu.megakernel_runtime.qwen38_segment_call import segment_tiles
 from vllm_torchtpu.megakernel_runtime.qwen38_wholestep_cache import QSALayerCache
-from vllm_torchtpu.megakernel_runtime.qwen38_wholestep_call import build_wholestep_call
+from vllm_torchtpu.megakernel_runtime.qwen38_wholestep_call import LONG_CONTEXT, build_wholestep_call
 
 
 def main():
@@ -67,7 +67,9 @@ def main():
         n_cols = pps  # table width (static); only the pages the contexts reach are allocated
         n_used = -(-(a.ctx + 4 + nreq) // 128)
         # Blocks: GDN 33 layers x 4 ckpts per request, QSA main + compressed per request & layer.
-        NB = 1 + nreq * (n_gdn * 4 + n_att * (1 + 2 * n_used)) + 8
+        # Timing only: every QSA layer reads the same main / compressed pages of a request
+        # (a 90K-token context would otherwise need 11 x 1.4K blocks per request).
+        NB = 1 + nreq * (n_gdn * 4 + n_att + 2 * n_used) + 8
         layout = Qwen38GdnPoolLayout(pool_shape=(NB * 4, 128, 1, 4, 256), pool_dtype="float8_e4m3fn")
         call, in_specs, out_specs, donate = build_wholestep_call(
             mesh, g, B, layout, layers, L=L, budget=a.budget, max_groups=a.max_groups,
@@ -75,7 +77,8 @@ def main():
         )
         spec = wholestep_spec(
             g, R, L=L, first="qsa", pool_gdn=True, qsa=dict(budget=a.budget), step=True,
-            indexed=dict(max_groups=a.max_groups, pages_per_seq=pps, carrier="fp8", n_layers=n_att),
+            indexed=dict(max_groups=a.max_groups, pages_per_seq=pps, carrier="fp8", n_layers=n_att,
+                         **LONG_CONTEXT),
         )
         ex = ExecSpec(R=R, B=B, T=4, ctx=128, tiles=segment_tiles(B))
         _, info = kernel.make_step(mesh, spec, ex)
@@ -114,14 +117,15 @@ def main():
                 st[q] = ck[q, 0]
             meta += [st, np.zeros(NB * 4, np.int32), ck, qsl, seq]
         tabs = []
+        main = np.zeros((16, n_cols), np.int32)
+        comp = np.zeros((16, n_cols), np.int32)
+        for q in range(nreq):
+            main[q, :n_used] = [next(free) for _ in range(n_used)]
+            comp[q, :n_used] = [next(free) for _ in range(n_used)]
         for _ in range(n_att):
             ring = np.zeros((16, 8), np.int32)
-            main = np.zeros((16, n_cols), np.int32)
-            comp = np.zeros((16, n_cols), np.int32)
             for q in range(nreq):
                 ring[q, 0] = next(free)
-                main[q, :n_used] = [next(free) for _ in range(n_used)]
-                comp[q, :n_used] = [next(free) for _ in range(n_used)]
             tabs += [ring.reshape(-1), main.reshape(-1), comp.reshape(-1)]
         positions = np.concatenate([ctx[q] + np.arange(4) for q in range(nreq)]).astype(np.int32)
         inv = 1.0 / (1e7 ** (np.arange(0, 64, 2) / 64))

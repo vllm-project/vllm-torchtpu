@@ -42,6 +42,11 @@ from .qwen38_wholestep_cache import QSALayerCache, wholestep_qsa_writes
 from .qwen38_wholestep_inputs import qsa_step_inputs
 
 QSA_TABLES = 3  # per QSA layer: ring ids, main table, compressed table
+# Served indexer options: page tables in HBM with per-layer SMEM windows, one request's scores
+# at a time, and only the key chunks a request's rows can see (exact vs the stock selection,
+# tests/megakernel/test_wholestep.py long mode). Without the last, every request streams
+# max_groups keys per QSA layer: 22.4 ms at 64 rows for max_groups 8192 (j-dcafcac7).
+LONG_CONTEXT = dict(hbm_tables=True, per_request_scores=True, bounded_chunks=True)
 
 
 def wholestep_tiles(B: int) -> Tiles:
@@ -79,7 +84,7 @@ def build_wholestep_call(
     pps = max_groups * 4 // 128
     spec = wholestep_spec(
         g, R, L=L, first="qsa", pool_gdn=True, qsa=dict(budget=budget), step=True,
-        indexed=dict(max_groups=max_groups, pages_per_seq=pps, carrier="fp8", n_layers=n_att),
+        indexed=dict(max_groups=max_groups, pages_per_seq=pps, carrier="fp8", n_layers=n_att, **LONG_CONTEXT),
     )
     fn, k_specs, _, n_w = make_flat_segment_step(mesh, spec, ex, extra_outs=(KV_NEW, KR_NEW, IR_NEW))
     M, NS = ex.M, B // T
@@ -124,6 +129,7 @@ def build_wholestep_call(
         d = qsa_step_inputs(
             pool, tables, slots, trig, positions, starts, context, M=M, T=T,
             pages_per_seq=pps, max_groups=max_groups, k_scale=scales[0], v_scale=scales[1],
+            layer_major_tables=LONG_CONTEXT["hbm_tables"],
         )
         return tuple(d[n] for n in names)
 

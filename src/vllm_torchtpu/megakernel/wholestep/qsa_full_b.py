@@ -142,6 +142,12 @@ class QSAFullIndexedBlock(QSAFullBlock):
             return 0
         return ctx.stream.sp.block_ord(l, self.name) * (ctx.ex.M // ctx.ex.T)
 
+    def table_shape(self, ex: ExecSpec, cols: int) -> tuple[int, ...]:
+        """`[rows, cols]` SMEM tables, or `[layers, requests, cols]` with `hbm_tables`."""
+        if self.hbm_tables:
+            return (max(1, self.n_layers), ex.M // ex.T, cols)
+        return (self.meta_rows(ex), cols)
+
     def tab_base(self, ctx: Any, l: Any) -> Any:
         """First row of this layer's tables in the refs `tables` returns."""
         return 0 if self.hbm_tables else self.row_base(ctx, l)
@@ -156,9 +162,12 @@ class QSAFullIndexedBlock(QSAFullBlock):
         """Copy this layer's table rows into the SMEM windows (`hbm_tables` only)."""
         if not self.hbm_tables:
             return
-        nreq, base, scr = ctx.ex.M // ctx.ex.T, self.row_base(ctx, l), ctx.scr
+        # HBM tables are [layers, requests, cols]: a layer is one whole leading-dim block (a
+        # row offset `o * requests` into a 2-D table is not tile-aligned for 12 requests).
+        o = ctx.stream.sp.block_ord(l, self.name) if self.n_layers else 0
+        scr = ctx.scr
         cps = [
-            pltpu.make_async_copy(ctx.extra[src].at[pl.ds(base, nreq)], scr[dst], scr["qi_tsem"].at[i])
+            pltpu.make_async_copy(ctx.extra[src].at[o], scr[dst], scr["qi_tsem"].at[i])
             for i, (src, dst) in enumerate(((CKTAB, "qi_ckw"), (MTAB, "qi_mtw")))
         ]
         for c in cps:
@@ -172,19 +181,19 @@ class QSAFullIndexedBlock(QSAFullBlock):
         return ctx.extra[OFFSET][ctx.stream.sp.block_ord(l, self.name)]
 
     def extra_inputs(self, g: Any, ex: ExecSpec) -> list[ExtraInput]:
-        nreq, rows = ex.M // ex.T, self.meta_rows(ex)
+        nreq = ex.M // ex.T
         return [
             ExtraInput(POOL, "hbm"),
             *(
                 [ExtraInput(CK, "hbm"), ExtraInput(
                     CKTAB, "hbm" if self.hbm_tables else "smem",
-                    (rows, self.max_groups // GPK // (self.mp or 1)), I32)]
+                    self.table_shape(ex, self.max_groups // GPK // (self.mp or 1)), I32)]
                 if self.carrier
                 else [ExtraInput(CK, "hbm", (nreq, self.max_groups, ix.IDX_DIM), BF16)]
             ),
             ExtraInput(NVIS, "smem", (ex.M,), I32),
             ExtraInput(TAIL, "smem", (ex.M,), I32),
-            ExtraInput(MTAB, "hbm" if self.hbm_tables else "smem", (rows, self.pps), I32),
+            ExtraInput(MTAB, "hbm" if self.hbm_tables else "smem", self.table_shape(ex, self.pps), I32),
             ExtraInput(OFFSET, "smem", (max(1, self.n_layers),), I32),
             ExtraInput(SCALES, "smem", (2,), F32),
             ExtraInput(ROPE, "hbm", (ex.M, 128), F32),
