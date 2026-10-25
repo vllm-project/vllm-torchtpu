@@ -217,7 +217,8 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False):
     ref, _ = wi.wholestep_reference(G, ex, d, L)
     steps = d.pop("_step_out")
     pps = d["mtab"].shape[1]
-    long_kw = dict(carrier="bf16", chunk_pages=32, hbm_tables=True, per_request_scores=True)
+    long_kw = dict(carrier="bf16", chunk_pages=8, hbm_tables=True, per_request_scores=True,
+                   bounded_chunks=True)
     spec = wholestep_spec(
         G, R, L=L, qsa=dict(budget=BUDGET), step=True,
         indexed=dict(max_groups=MAX_GROUPS, pages_per_seq=pps, debug=True, **(long_kw if long else {})),

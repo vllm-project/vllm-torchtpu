@@ -567,6 +567,7 @@ class Qwen38SegmentDriver:
         # whose every request's context is <= `wholecap=N` tokens (others: segment program).
         self.whole = False
         self.whole_cap = 32768
+        self.whole_hold = "buffer"  # `wholehold=param|list|buffer`: how the operands are held
         self.whole_program = None
         self.whole_calls = 0
 
@@ -635,6 +636,9 @@ class Qwen38SegmentDriver:
         cap = _parse_int(raw, "wholecap")
         if cap is not None:
             drv.whole_cap = cap
+        for part in raw.split(","):
+            if part.startswith("wholehold="):
+                drv.whole_hold = part[len("wholehold=") :]
         global NO_DONATE
         NO_DONATE = _parse_flag(raw, "nodonate", False)
         if not _parse_flag(raw, "replay", False):
@@ -1113,6 +1117,7 @@ class Qwen38SegmentDriver:
             max_groups = -(-self.whole_cap // 4 // 1024) * 1024
             whole = Qwen38WholeStep(
                 runner.model, self.g, self.mesh, self.buckets, budget=budget, max_groups=max_groups,
+                hold=self.whole_hold,
             )
             whole.bind_pool(self.segments.pool, self.segments.layout)
             with self._contexts(runner, "model_mk_whole"):

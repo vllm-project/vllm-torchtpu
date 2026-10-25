@@ -92,7 +92,8 @@ class Qwen38WholeStep(nn.Module):
     """Layers 3..46 in one whole-step kernel call; owns the packed operands as buffers."""
 
     def __init__(self, model: Any, g: Any, mesh: Any, buckets: tuple[int, ...], *,
-                 budget: int, max_groups: int, write: bool = True, tag: str = "whole") -> None:
+                 budget: int, max_groups: int, write: bool = True, tag: str = "whole",
+                 hold: str = "buffer") -> None:
         super().__init__()
         from vllm_torchtpu.megakernel.exec_spec import ExecSpec
         from vllm_torchtpu.megakernel.wholestep.spec import wholestep_spec
@@ -114,8 +115,18 @@ class Qwen38WholeStep(nn.Module):
         ex = ExecSpec(R=R, B=buckets[0], T=T_VERIFY, ctx=128, tiles=segment_tiles(buckets[0]))
         ops = pack_wholestep_operands(model, g, spec, ex, ids)
         self.n_w = len(ops)
-        for i, t in enumerate(ops):
-            self.register_buffer(f"w_{i}", t, persistent=False)
+        # How the operands are held decides what the compiled program sees: registered
+        # buffers are re-materialised by `execute_as_strided` every step in the served segment
+        # MK (agent-1a, q32/q39), parameters passing the same op are not; the Qwen3.5 driver
+        # keeps a plain list. `hold`: "buffer" | "param" | "list".
+        self.hold = hold
+        if hold == "list":
+            object.__setattr__(self, "_ops", ops)
+        for i, t in enumerate(ops if hold != "list" else ()):
+            if hold == "param":
+                setattr(self, f"w_{i}", nn.Parameter(t, requires_grad=False))
+            else:
+                self.register_buffer(f"w_{i}", t, persistent=False)
         attn0 = self.layers[self.qsa_ids[0]].self_attn
         self.norm_eps = float(attn0.q_norm.variance_epsilon)
         self.rotary_dim = int(attn0._select_keywords.get("rotary_dim", 64))
@@ -159,7 +170,7 @@ class Qwen38WholeStep(nn.Module):
             ]
             norms += [a.k_norm.weight, a.indexer.k_layernorm.weight]
         rope = self.layers[self.qsa_ids[0]].self_attn.rope_cache
-        w = [getattr(self, f"w_{i}") for i in range(self.n_w)]
+        w = self._ops if self.hold == "list" else [getattr(self, f"w_{i}") for i in range(self.n_w)]
         args = [*w, self.pool, *meta, *tables, positions.to(torch.int32),
                 query_start_loc.to(torch.int32), context_lens.to(torch.int32), rope, *norms]
         res, pool = self.kind.op(hidden, args)

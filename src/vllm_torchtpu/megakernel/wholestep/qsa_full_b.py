@@ -71,6 +71,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         n_layers: int = 0,
         hbm_tables: bool = False,
         per_request_scores: bool = False,
+        bounded_chunks: bool = False,
         **kw: Any,
     ) -> None:
         """`carrier`: "" = prototype contiguous keys `[requests, max_groups, 128]`; "fp8" = the
@@ -87,7 +88,10 @@ class QSAFullIndexedBlock(QSAFullBlock):
         copied into SMEM windows `[requests, …]` at the layer's start (served contexts up to
         262K tokens: all layers' tables do not fit SMEM). `per_request_scores`: the score
         scratch holds one request's `T` rows (`[T, max_groups]` F32), selected before the next
-        request is scored (an all-rows buffer is 16 MiB at 64 rows and 64K groups)."""
+        request is scored (an all-rows buffer is 16 MiB at 64 rows and 64K groups).
+        `bounded_chunks`: each request streams only the key chunks its rows can see
+        (`ceil(n_vis / chunk groups)`, at least 1) instead of all `max_groups`; scores past a
+        row's `n_vis` are stale and masked by the selection."""
         super().__init__(**kw)
         assert max_groups % 1024 == 0, max_groups  # whole (8, 128) score tiles per row
         self.max_groups, self.pps, self.debug = max_groups, pages_per_seq, debug
@@ -95,6 +99,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         self.mp, self.ck_lanes = manager_pages, ck_lanes or ck_width
         self.n_layers = n_layers
         self.hbm_tables, self.per_request_scores = hbm_tables, per_request_scores
+        self.bounded_chunks = bounded_chunks
         self.chunk_pages = chunk_pages if carrier else max_groups // GPK
         assert (max_groups // GPK) % self.chunk_pages == 0, (max_groups, self.chunk_pages)
         assert (self.chunk_pages * GPK) % 128 == 0 and (max_groups // 128) % 8 == 0
@@ -200,6 +205,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
                 else [ScratchReq("qi_ck", pltpu.VMEM((G, ix.IDX_DIM), BF16))]
             ),
             ScratchReq("qi_q", pltpu.VMEM((MB // ex.T, ex.T * ix.IDX_HEADS, ix.IDX_DIM), F32)),
+            *([ScratchReq("qi_cc", pltpu.SMEM((1,), I32))] if self.bounded_chunks else []),
             ScratchReq("qi_s", pltpu.VMEM(
                 (ex.T if self.per_request_scores else MB, self.n_chunks, S // self.n_chunks, 128),
                 F32,
@@ -270,18 +276,28 @@ class QSAFullIndexedBlock(QSAFullBlock):
         if q == 0:
             for cp in copies(0, 0):
                 cp.start()
+            if self.bounded_chunks:
+                scr["qi_cc"][0] = 0
+        if self.bounded_chunks:
+            # Chunks this request's rows can see (the last row sees the most); slots follow a
+            # chunk counter carried across requests, as the fixed count's `q * NC + c` does.
+            nv = ctx.extra[NVIS][q * T + T - 1]
+            n_q = jnp.clip((nv + CG - 1) // CG, 1, NC)
+            c0 = scr["qi_cc"][0]
+        else:
+            n_q, c0 = NC, q * NC
 
         def chunk(c: Any, carry: Any) -> Any:
-            s = jax.lax.rem(q * NC + c, 2)
+            s = jax.lax.rem(c0 + c, 2)
 
-            @pl.when(c + 1 < NC)
+            @pl.when(c + 1 < n_q)
             def _():
                 for cp in copies(c + 1, 1 - s):
                     cp.start()
 
             if not last:  # the next request's first chunk into the slot this chunk frees next
 
-                @pl.when(c + 1 == NC)
+                @pl.when(c + 1 == n_q)
                 def _():
                     for cp in copies(0, 1 - s, q + 1):
                         cp.start()
@@ -297,7 +313,9 @@ class QSAFullIndexedBlock(QSAFullBlock):
             scr["qi_s"][rows, c] = st.reshape(T, CG // 128, 128)
             return carry
 
-        jax.lax.fori_loop(0, NC, chunk, 0)
+        jax.lax.fori_loop(0, n_q, chunk, 0)
+        if self.bounded_chunks:
+            scr["qi_cc"][0] = c0 + n_q
 
     def _select(self, ctx: Any, l: Any, slot: Any) -> None:
         ex, scr, g = ctx.ex, ctx.scr, ctx.g
