@@ -566,7 +566,7 @@ class Qwen38SegmentDriver:
                     segments=shadow_seg,
                 )
 
-    def _h0check(self, runner: Any, input_ids: Any, kw: dict, rows: int, n_req: int) -> None:
+    def _h0check(self, runner: Any, input_ids: Any, positions: Any, kw: dict, rows: int, n_req: int) -> Any:
         from vllm.forward_context import get_forward_context
 
         from .qwen38_gdn_state import Qwen38GdnPoolLayout
@@ -583,7 +583,7 @@ class Qwen38SegmentDriver:
         seq = md.seq_lens.to(torch.int32)[:NS]
         pool = segs.pool
         flat = ck.reshape(-1)
-        saved = pool[flat].clone()
+        saved = pool[flat]
         # Private pool: block 0 null, request s column t at 1 + s*T + t.
         small = torch.cat([torch.zeros_like(pool[:1]), saved], dim=0)
         new_ck = (1 + torch.arange(NS * T, device=ck.device).reshape(NS, T)).to(torch.int32)
@@ -600,15 +600,27 @@ class Qwen38SegmentDriver:
             h_in = bb.embed_tokens(input_ids).repeat(1, hc)
             mk_out = self.h0kind.op(h_in, h_in, w, [small, *meta])[0]
             # Stock layer 0, staged like Qwen4ExpDecoderLayer.forward.
+            from vllm_torchtpu.models.vllm.qwen4_exp import sequence_parallel as sp
+
             block, residual = layer.attn_hyper_connection.mix(h_in)
-            g = layer.linear_attn(block)
+            g = sp.reduce(layer.linear_attn(block), False)
             mixed2, residual2 = layer.attn_hyper_connection.combine_mix(g, residual, layer.mlp_hyper_connection)
             valid = kw["valid_tokens"].to(torch.bool)
             mixed2 = torch.where(valid[:, None], mixed2, 0)
             moe = layer.mlp(mixed2)
             st_out = layer.mlp_hyper_connection.combine(moe, residual2)
+            # Stock layer 0 above is this step's served layer 0 (its GDN writes are the
+            # real ones); the rest of the model runs stock here and serves the step.
+            args = (
+                positions.to(torch.int64), input_ids.to(torch.int64), kw["query_start_loc"],
+                kw["ngram_context"], kw["state_slots"], kw["context_lens"], kw["valid_tokens"],
+                kw["main_block_table"], kw["compressed_block_table"],
+            )
+            h = st_out
+            for later in bb.layers[1:]:
+                h = later(h, *args)
+            mixed = bb.hyper_connection_mixer.mix(h)[0]
         n = NS * T
-        pool[flat] = saved  # undo stock layer 0's checkpoint writes; the stock model serves this step
         logger.info(
             "qwen38 h0check inputs: rows=%d n_req=%d h_in_norm=%.4f st=%s off=%s ck0=%s seq=%s",
             rows, n_req, float(h_in.float()[:n].norm()), st.tolist()[:8], off_tab[st].tolist()[:8],
@@ -617,8 +629,9 @@ class Qwen38SegmentDriver:
         logger.info(
             "qwen38 h0check layer0_out MK vs stock: %s | stock residual-after-GDN(norm)=%.4f moe(norm)=%.4f (%d left)",
             _diff_stats(mk_out, st_out, n, hc), float((residual2[0] if isinstance(residual2, tuple) else residual2).float()[:n].norm()),
-            float(moe.float()[:n].norm()), self.h0check_left - 1,
+            float(moe.float()[:n].norm()), self.h0check_left,
         )
+        return (mixed, h) if bb.emit_mtp_hidden else mixed
 
     def _attach_mtp_tail(self, runner: Any) -> None:
         """Route the MTP draft layer's post-attention half to the tail kernel.
@@ -774,12 +787,13 @@ class Qwen38SegmentDriver:
         kw = dict(model_kwargs or {})
         if self.h0check_left > 0 or getattr(self, "h0check_done", False):
             if self.h0check_left > 0 and getattr(runner, "warmup_done", False) and _real_traffic(kw):
-                try:
-                    self._h0check(runner, input_ids, kw, rows, n_req)
-                except Exception:
-                    logger.exception("qwen38 megakernel h0check failed")
                 self.h0check_left -= 1
                 self.h0check_done = True
+                try:
+                    return True, self._h0check(runner, input_ids, positions, kw, rows, n_req)
+                except Exception:
+                    logger.exception("qwen38 megakernel h0check failed; h0check off")
+                    self.h0check_left = 0
             return False, None
         first_warm = self.warm and self.mk_calls == 1
         if first_warm:
