@@ -201,7 +201,10 @@ def pack_segment_operands(
         elif name in ("e13", "e2"):
             out.extend(w[name])
         elif name == "es":
-            out.append(w[name])
+            # [L, EW, 1, X] -> [L, EW, X]: no rank-4 operand at the torch boundary
+            # (see below); unpack_local_weight restores the singleton under jit.
+            t = w[name]
+            out.append(t.reshape(*t.shape[:-3], t.shape[-3] * t.shape[-2], t.shape[-1]))
         else:
             nt, tk = p.nt[name], p.tk[name]
             t = w[name]
