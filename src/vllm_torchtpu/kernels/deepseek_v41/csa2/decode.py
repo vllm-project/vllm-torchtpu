@@ -28,13 +28,15 @@ def _decode_kernel(
     q_ref: Any,  # VMEM: [T, H, 512], bfloat16
     main_cache_ref: Any,  # VMEM: [T, 512, 128], int32; packed FP8
     main_scale_ref: Any,  # VMEM: [T, 1, 512], float32
-    swa_kv_ref: Any,  # VMEM: tuple of [1, min(page_size, 64), 512] BF16 blocks
+    swa_kv_ref: Any,  # HBM: one shared [pages,page_size,512] BF16 owner
     sink_ref: Any,  # VMEM: [H, 1], float32
     rope_ref: Any,  # VMEM: [T, 2, 128], float32
     # output
     output_ref: Any,  # VMEM: [T, H, 512], bfloat16
     # scratch
     main_kv_ref: Any,  # VMEM: [T, 512, 512], bfloat16;
+    swa_ref: Any,  # VMEM: [block_seq, 256, 512], masked BF16 window
+    swa_sem: Any,
     swa_score_ref: Any,  # VMEM: [T, H, 256], float32; scaled, masked SWA logits
     main_p_ref: Any,  # VMEM: [T, H, 512], bfloat16
     swa_p_ref: Any,  # VMEM: [T, H, 256], bfloat16
@@ -50,8 +52,9 @@ def _decode_kernel(
     seq_start = pl.program_id(0) * block_seq
     query_offset = 0 if tokens_per_seq is None else pl.program_id(1) * num_tokens
     sequence_stride = num_tokens if tokens_per_seq is None else tokens_per_seq
-    page_size = swa_kv_ref[0].shape[1]
-    num_pages = len(swa_kv_ref) // block_seq
+    cache_page_size = swa_kv_ref.shape[1]
+    page_size = min(cache_page_size, 64)
+    num_pages = 256 // page_size
     num_heads = q_ref.shape[-2]
     mxu_heads = pl.cdiv(num_heads, 16) * 16
     mrb_stride = mxu_heads // 4
@@ -104,11 +107,62 @@ def _decode_kernel(
         for r, i in enumerate(indices)
     }
 
+    # One HBM owner avoids repeated buffered aliases in the enclosing graph.
+    copies = []
+    for seq in range(block_seq):
+        seq_idx = seq_start + seq
+        first = positions_ref[seq_idx] + query_offset
+        left = jnp.maximum(0, first - 127)
+        anchor = left // page_size * page_size
+        visible = jnp.maximum(left, swa_page_ref[seq_idx, 1])
+        for block in range(num_pages):
+            position = anchor + block * page_size
+            column = (position - swa_page_ref[seq_idx, 0]) // cache_page_size
+            safe = jnp.clip(column, 0, swa_page_ref.shape[1] - 3)
+            page = swa_page_ref[seq_idx, safe + 2]
+            valid = (
+                (position < first + num_tokens)
+                & (position + page_size > visible)
+                & (column >= 0)
+                & (column < swa_page_ref.shape[1] - 2)
+            )
+            page = jnp.where(valid, page, 0)
+            offset = jnp.where(valid, position % cache_page_size, 0)
+            copy = pltpu.make_async_copy(
+                swa_kv_ref.at[page, pl.ds(offset, page_size), :],
+                swa_ref.at[seq, pl.ds(block * page_size, page_size), :],
+                swa_sem.at[seq, block],
+            )
+            copy.start()
+            copies.append(copy)
+    for copy in copies:
+        copy.wait()
+
+    # Mask before both QK and PV: masked logits cannot remove NaNs, and
+    # zero probability multiplied by an invalid KV value is still NaN.
+    bf16_bits = jnp.dtype(jnp.bfloat16).itemsize * 8
+    low_mask = (1 << bf16_bits) - 1
+    for seq in range(block_seq):
+        position = positions_ref[seq_start + seq] + query_offset
+        left = jnp.maximum(0, position - 127)
+        anchor = left // page_size * page_size
+        left = jnp.maximum(left, swa_page_ref[seq_start + seq, 1])
+        right = position + num_tokens
+        for block in range(num_pages):
+            rows = anchor + block * page_size + 2 * jnp.arange(page_size // 2)
+            low = (rows >= left) & (rows < right)
+            high = (rows + 1 >= left) & (rows + 1 < right)
+            mask = jnp.where(low, low_mask, 0) | jnp.where(high, ~low_mask, 0)
+            values = swa_ref[seq, pl.ds(block * page_size, page_size)]
+            words = pltpu.bitcast(values, jnp.int32) & mask[:, None]
+            swa_ref[seq, pl.ds(block * page_size, page_size)] = pltpu.bitcast(
+                words, jnp.bfloat16
+            )
+
     def swa_qk_compute(seq, first, size, slot_base):
-        pages = swa_kv_ref[seq * num_pages : (seq + 1) * num_pages]
         for mxu in range(2):
             ks = pl.ds(mxu * 256, 256)
-            rhs = jnp.concatenate([page_ref[0, :, ks] for page_ref in pages], axis=0)
+            rhs = swa_ref[seq, :, ks]
             pltpu.matmul_push_rhs(rhs, 0, mxu, transpose=True)
 
             for r in range(size):
@@ -274,12 +328,9 @@ def _decode_kernel(
 
         # A group belongs to one sequence, so its Qs share the SWA RHS.
         seq = indices[0] // num_tokens
-        pages = swa_kv_ref[seq * num_pages : (seq + 1) * num_pages]
         for mxu in range(2):
             pltpu.matmul_push_rhs(
-                jnp.concatenate(
-                    [ref[0, :, pl.ds(mxu * 256, 256)] for ref in pages], axis=0
-                ),
+                swa_ref[seq, :, pl.ds(mxu * 256, 256)],
                 0,
                 mxu,
             )
@@ -367,7 +418,8 @@ def csa2_decode(
     Long sequences use fixed eight-query tiles and must be divisible by eight.
     Short sequences use a single tile. Main KV is packed FP8 INT32 [T,512,128]
     with FP32 scales [T,512] and authoritative valid counts [T].
-    SWA is finite BF16 [pages,page_size,512], including a reserved zero page.
+    SWA is BF16 [pages,page_size,512], including a reserved zero page.
+    Visible rows must be finite; values outside the visible window are masked.
     swa_page [B,2+C] stores page base, minimum visibility and physical page IDs.
     decoder_prefill reuses this pipeline for the model's decoder-layer prefill,
     retaining that path's FP32 KV scales. It does not change SWA visibility.
@@ -424,42 +476,24 @@ def csa2_decode(
         return jnp.zeros(q.shape, q.dtype)
     block_seq = 2 if batch_size % 2 == 0 else 1
     query_count = query_tile * block_seq
-    cache_page_size = page_size
-    page_size = min(page_size, 64)
-    swa_blocks = 256 // page_size
-
-    def swa_map(b, tile, positions_ref, swa_page_ref, main_lengths_ref, *, block, seq):
-        seq_idx = b * block_seq + seq
-        first_position = positions_ref[seq_idx]
-        if tiled:
-            first_position += tile * query_tile
-        window_start = jnp.maximum(0, first_position - 127)
-        window_end = first_position + query_tile
-        page_start = window_start // page_size * page_size
-        position = page_start + block * page_size
-        column = (position - swa_page_ref[seq_idx, 0]) // cache_page_size
-        safe_column = jnp.clip(column, 0, swa_page_ref.shape[1] - 3)
-        page = swa_page_ref[seq_idx, safe_column + 2]
-        visible_start = jnp.maximum(window_start, swa_page_ref[seq_idx, 1])
-        needed = (position < window_end) & (position + page_size > visible_start)
-        valid = needed & (column >= 0) & (column < swa_page_ref.shape[1] - 2)
-        return (
-            jnp.where(valid, page, 0),
-            jnp.where(valid, position % cache_page_size // page_size, 0),
-            0,
-        )
 
     def query_spec(trailing):
         if tiled:
             shape = (block_seq, query_tile, *trailing)
 
             def index_map(seq, tile, *_):
-                return seq, tile, *([0] * len(trailing))
+                return (
+                    jnp.minimum(seq, batch_size // block_seq - 1),
+                    jnp.minimum(tile, num_tokens // query_tile - 1),
+                    *([0] * len(trailing)),
+                )
         else:
             shape = (query_count, *trailing)
 
             def index_map(seq, *_):
-                return seq, *([0] * len(trailing))
+                return jnp.minimum(seq, batch_size // block_seq - 1), *(
+                    [0] * len(trailing)
+                )
 
         return pl.BlockSpec(
             shape,
@@ -477,27 +511,11 @@ def csa2_decode(
         tokens_per_seq=num_tokens if tiled else None,
         decoder_prefill=decoder_prefill,
     )
-    page_map = swa_map
-    # The untiled grid supplies only its sequence ID before prefetched metadata.
-    if not tiled:
-
-        def page_map(b, *refs, block, seq):
-            return swa_map(b, 0, *refs, block=block, seq=seq)
-
     in_specs = (
         query_spec((num_heads, 512)),
         query_spec((512, 128)),
         query_spec((1, 512)),
-        tuple(
-            pl.BlockSpec(
-                (1, page_size, 512),
-                functools.partial(page_map, block=block, seq=seq),
-                pipeline_mode=pl.Buffered(2),
-                memory_space=pltpu.VMEM,
-            )
-            for seq in range(block_seq)
-            for block in range(swa_blocks)
-        ),
+        pl.BlockSpec(memory_space=pltpu.HBM),
         pl.BlockSpec(
             (num_heads, 1),
             lambda *_: (0, 0),
@@ -524,6 +542,8 @@ def csa2_decode(
             out_specs=query_spec((num_heads, 512)),
             scratch_shapes=(
                 pltpu.VMEM((kv_count, 512, 512), jnp.bfloat16),
+                pltpu.VMEM((block_seq, 256, 512), jnp.bfloat16),
+                pltpu.SemaphoreType.DMA((block_seq, 256 // min(page_size, 64))),
                 pltpu.VMEM((query_count, num_heads, 256), jnp.float32),
                 pltpu.VMEM((p_count, num_heads, 512), jnp.bfloat16),
                 pltpu.VMEM((p_count, num_heads, 256), jnp.bfloat16),
@@ -540,7 +560,7 @@ def csa2_decode(
         q.reshape(*prefix, num_heads, 512),
         main_kv.reshape(*prefix, 512, 128),
         main_kv_scale.reshape(*prefix, 1, 512),
-        (swa_kv,) * (block_seq * swa_blocks),
+        swa_kv,
         sink[:, None],
         rope_cache.reshape(*prefix, 2, 128),
     )
