@@ -1087,25 +1087,21 @@ def select_blocks(
     return selected.reshape(-1, *selected.shape[2:])[: len(query)]
 
 
-def _pooled_qsa(
-    qgate: jax.Array,
-    key: jax.Array,
-    value: jax.Array,
-    index_qk: jax.Array,
-    nq: jax.Array,
-    nk: jax.Array,
-    niq: jax.Array,
-    nik: jax.Array,
-    positions: jax.Array,
-    trig: jax.Array,
+def qsa_cache_writes(
     pool: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    raw: jax.Array,
+    positions: jax.Array,
+    nik: jax.Array,
+    trig: jax.Array,
     starts: jax.Array,
     context: jax.Array,
     ring_ids: jax.Array,
     main_table: jax.Array,
     compressed_table: jax.Array,
+    *,
     compress_ratio: int,
-    token_topk: int,
     norm_eps: float,
     rotary_dim: int,
     k_scale: float = 1.0,
@@ -1113,50 +1109,22 @@ def _pooled_qsa(
     compressed_slot: int = 0,
     main_slot: int = -1,
     max_query_len: int = 1,
-    rows: jax.Array | None = None,
-    select_only: bool = False,
-    shard: tuple[int, int] | None = None,
-    token_shard: tuple[jax.Array, int] | None = None,
-    shared: jax.Array | None = None,
-) -> tuple[jax.Array, ...]:
-    """One QSA layer over the unified pool.
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """One QSA layer's cache writes for a step's tokens: main K/V, the completed groups'
+    compressed keys, ring rows and tags. Returns ``(pool, req, logical, valid)``.
 
-    ``select_only``: stop after the indexer and return ``(pool, q, gate, pages,
-    kv_lens)`` for an attention computed elsewhere (the Qwen3.8 segment
-    megakernel): ``q`` / ``gate`` ``[T, heads, D]`` BF16 and the virtual
-    micro-page ids / visible lengths of ``virtual_page_metadata``.
-
-    ``main_slot`` >= 0 selects this layer's KV head pair in main KV pages
-    shared by two layers (``pool_layout.pooled_cache_specs``); the default -1
-    keeps the layer's whole-row pages.
-
-    ``shard=(rank, size)`` stops after this rank's slice of the indexer and
-    returns ``(pool, q, gate, lengths, req, starts, candidates)`` for
-    ``pooled_qsa_shard_attend``; ``req`` then indexes the per-request main
-    table rows and ``starts`` is the attended token layout.
-
-    ``token_shard=(index, size)`` (``index`` int32 ``[1]``) runs the indexer
-    on token rows ``[index * T / size, (index + 1) * T / size)`` only and
-    returns the same tuple with that shard's ``[T / size, k]`` blocks in place
-    of ``candidates``; all-gather them for ``pooled_qsa_shard_attend`` with
-    ``merged``.
+    ``k`` / ``v`` are ``produce``'s normed+roped keys and values, ``raw`` its raw indexer
+    keys; tables are the per-request rows (``ring_ids`` already column 0). Every token
+    writes, verify drafts included (later steps overwrite rejected positions). Shared by
+    ``_pooled_qsa`` and the Qwen3.8 whole-step megakernel's post-kernel scatter, so both
+    leave the same cache bytes for the same inputs.
     """
-    # Keep the Runner's flat group tables at the Torch boundary. Static JAX
-    # shapes reconstruct their per-request rows inside the operator.
-    main_table = main_table.reshape(len(context), -1)
-    compressed_table = compressed_table.reshape(len(context), -1)
-    # Native BlockTable pads this one-block ring row to token alignment.
-    # Only column zero owns storage; the remaining entries are padding.
-    ring_ids = ring_ids.reshape(len(context), -1)[:, 0]
-    q, k, v, gate, iq, raw = produce(
-        qgate, key, value, index_qk, nq, nk, niq, positions, trig, norm_eps, rotary_dim
-    )
     # Native allocation supplies an owner for every nonempty query row;
     # padded/idle rows have empty query ranges. Keep lengths independent of
     # layer-specific page IDs so XLA can share RPA schedules across layers.
     active = starts[1:] > starts[:-1]
     slots = jnp.where(active, jnp.arange(len(ring_ids), dtype=jnp.int32), -1)
-    req, logical, valid = _token_metadata(len(q), starts, context, slots)
+    req, logical, valid = _token_metadata(len(k), starts, context, slots)
     page = jnp.where(valid, main_table[req, logical // pool.shape[1]], len(pool))
     fp8 = pool.dtype == jnp.float8_e4m3fn
     rows_packed = pack_rows(k, v, fp8=fp8, k_scale=k_scale, v_scale=v_scale)
@@ -1164,9 +1132,9 @@ def _pooled_qsa(
     # Decode/verify-sized steps only; prefill keeps the bulk tile writers.
     fused = (
         envs.VLLM_TPU_QSA_FUSED_KV_WRITE
-        and len(q) <= len(context) * max_query_len
+        and len(k) <= len(context) * max_query_len
         and fused_write_supported(
-            pool, len(q), len(ring_ids), main_slot if main_slot >= 0 else None
+            pool, len(k), len(ring_ids), main_slot if main_slot >= 0 else None
         )
     )
     if not fused:
@@ -1257,6 +1225,96 @@ def _pooled_qsa(
         pool = write_ring_and_tags(
             pool, ring.reshape(len(ids), -1), tags.reshape(len(ids), -1), ids
         )
+    return pool, req, logical, valid
+
+
+def _pooled_qsa(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+    rows: jax.Array | None = None,
+    select_only: bool = False,
+    shard: tuple[int, int] | None = None,
+    token_shard: tuple[jax.Array, int] | None = None,
+    shared: jax.Array | None = None,
+) -> tuple[jax.Array, ...]:
+    """One QSA layer over the unified pool.
+
+    ``select_only``: stop after the indexer and return ``(pool, q, gate, pages,
+    kv_lens)`` for an attention computed elsewhere (the Qwen3.8 segment
+    megakernel): ``q`` / ``gate`` ``[T, heads, D]`` BF16 and the virtual
+    micro-page ids / visible lengths of ``virtual_page_metadata``.
+
+    ``main_slot`` >= 0 selects this layer's KV head pair in main KV pages
+    shared by two layers (``pool_layout.pooled_cache_specs``); the default -1
+    keeps the layer's whole-row pages.
+
+    ``shard=(rank, size)`` stops after this rank's slice of the indexer and
+    returns ``(pool, q, gate, lengths, req, starts, candidates)`` for
+    ``pooled_qsa_shard_attend``; ``req`` then indexes the per-request main
+    table rows and ``starts`` is the attended token layout.
+
+    ``token_shard=(index, size)`` (``index`` int32 ``[1]``) runs the indexer
+    on token rows ``[index * T / size, (index + 1) * T / size)`` only and
+    returns the same tuple with that shard's ``[T / size, k]`` blocks in place
+    of ``candidates``; all-gather them for ``pooled_qsa_shard_attend`` with
+    ``merged``.
+    """
+    # Keep the Runner's flat group tables at the Torch boundary. Static JAX
+    # shapes reconstruct their per-request rows inside the operator.
+    main_table = main_table.reshape(len(context), -1)
+    compressed_table = compressed_table.reshape(len(context), -1)
+    # Native BlockTable pads this one-block ring row to token alignment.
+    # Only column zero owns storage; the remaining entries are padding.
+    ring_ids = ring_ids.reshape(len(context), -1)[:, 0]
+    q, k, v, gate, iq, raw = produce(
+        qgate, key, value, index_qk, nq, nk, niq, positions, trig, norm_eps, rotary_dim
+    )
+    pool, req, logical, valid = qsa_cache_writes(
+        pool,
+        k,
+        v,
+        raw,
+        positions,
+        nik,
+        trig,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio=compress_ratio,
+        norm_eps=norm_eps,
+        rotary_dim=rotary_dim,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        compressed_slot=compressed_slot,
+        main_slot=main_slot,
+        max_query_len=max_query_len,
+    )
+    fp8 = pool.dtype == jnp.float8_e4m3fn
     lengths = jnp.where(valid, logical + 1, 0).astype(jnp.int32)
     # Attend only the requested rows; every token above still wrote its KV,
     # compressed key and ring state. Up to one row per request slot, the

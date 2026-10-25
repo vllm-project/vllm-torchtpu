@@ -71,17 +71,24 @@ def index_rope(x, positions, cache, rotary_dim):
     )
 
 
+def produce_kv(key, value, nk, positions, trig, norm_eps, rotary_dim):
+    """Cached keys and values ``[T, kv_heads, D]`` from the k / v projections."""
+    head_dim = nk.shape[0]
+    key = key.reshape(len(key), key.shape[1] // head_dim, head_dim)
+    value = value.reshape(len(value), value.shape[1] // head_dim, head_dim)
+    key = main_rope(gemma_norm(key, nk, norm_eps), positions, trig, rotary_dim)
+    return key, value
+
+
 def produce(
     qgate, key, value, index_qk, nq, nk, niq, positions, trig, norm_eps, rotary_dim
 ):
     head_dim, index_dim = nq.shape[0], niq.shape[0]
     qgate = qgate.reshape(len(qgate), qgate.shape[1] // (2 * head_dim), 2 * head_dim)
-    key = key.reshape(len(key), key.shape[1] // head_dim, head_dim)
-    value = value.reshape(len(value), value.shape[1] // head_dim, head_dim)
     q = main_rope(
         gemma_norm(qgate[..., :head_dim], nq, norm_eps), positions, trig, rotary_dim
     )
-    key = main_rope(gemma_norm(key, nk, norm_eps), positions, trig, rotary_dim)
+    key, value = produce_kv(key, value, nk, positions, trig, norm_eps, rotary_dim)
     index_heads = index_qk.shape[1] // index_dim - 1
     iq = index_rope(
         gemma_norm(
