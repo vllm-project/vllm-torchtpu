@@ -13,7 +13,10 @@
 # limitations under the License.
 """PLE storage extensions using the common table and checkpoint shard loader."""
 
+import os
+import traceback
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, wait
 
 import numpy as np
 import torch
@@ -31,6 +34,9 @@ from vllm_torchtpu.layers.adapter.custom_ops.ple_op import (
 
 from .ple import Qwen4ExpPLETable
 from .ple_host import SharedPLEOptions, SharedPLETable
+
+_MAX_GATHER_WORKERS = 8
+_GATHER_ROWS_PER_WORKER = 1 << 14
 
 
 class _LoadedPLETable(PLEVocabParallelEmbedding):
@@ -211,14 +217,23 @@ class HostPLETable(_LoadedPLETable):
     ) -> None:
         self._shared_options = shared
         self._shared_table: SharedPLETable | None = None
-        super().__init__(
-            num_embeddings,
-            embedding_dim,
-            embedding_method=embedding_method,
-            padding_size=padding_size,
-            prefix=prefix,
-            parallel_group=parallel_group,
-        )
+        self._gather_pool: ThreadPoolExecutor | None = None
+        try:
+            super().__init__(
+                num_embeddings,
+                embedding_dim,
+                embedding_method=embedding_method,
+                padding_size=padding_size,
+                prefix=prefix,
+                parallel_group=parallel_group,
+            )
+        except BaseException:
+            if self._shared_table is not None:
+                self._shared_table.close()
+            raise
+        participants = 1 if shared is None else shared.participants
+        physical_share = max(1, (os.cpu_count() or 1) // participants // 2)
+        self._gather_workers = min(_MAX_GATHER_WORKERS, physical_share)
 
     def allocate_embedding_weight(
         self, num_embeddings: int, embedding_dim: int, dtype: torch.dtype
@@ -278,6 +293,39 @@ class HostPLETable(_LoadedPLETable):
             )
             self._shared_table.finish(metadata={"scale": scale})
 
+    def _take_rows(
+        self, table: np.ndarray, rows: np.ndarray, output: np.ndarray
+    ) -> None:
+        pending = []
+        try:
+            workers = min(
+                self._gather_workers, max(1, rows.size // _GATHER_ROWS_PER_WORKER)
+            )
+            if workers == 1:
+                np.take(table, rows, axis=0, out=output, mode="clip")
+                return
+            if self._gather_pool is None:
+                self._gather_pool = ThreadPoolExecutor(
+                    max_workers=self._gather_workers,
+                    thread_name_prefix="q4exp-ple-gather",
+                )
+            bounds = np.linspace(0, rows.size, workers + 1, dtype=np.int64)
+
+            def take_partition(index, source):
+                start, end = bounds[index : index + 2]
+                np.take(
+                    source, rows[start:end], axis=0, out=output[start:end], mode="clip"
+                )
+
+            for index in range(workers):
+                pending.append(self._gather_pool.submit(take_partition, index, table))
+            for future in pending:
+                future.result()
+        finally:
+            # Failed tasks must finish before releasing the borrowed mmap view.
+            wait(pending)
+            del table
+
     def lookup_host(self, ids: torch.Tensor) -> torch.Tensor:
         assert self._finalized
         indices = ids.numpy().reshape(-1)
@@ -292,14 +340,20 @@ class HostPLETable(_LoadedPLETable):
                 .view(torch.int16 if dtype == np.int16 else torch.uint8)
                 .numpy()
             )
-            np.take(table, indices - start, axis=0, out=output, mode="clip")
+            self._take_rows(table, indices - start, output)
         else:
             with self._shared_table.buffer() as buffer:
                 table = np.frombuffer(buffer, dtype=dtype).reshape(
                     -1, self.embedding_dim
                 )
-                np.take(table, indices - start, axis=0, out=output, mode="clip")
-                del table
+                try:
+                    self._take_rows(table, indices - start, output)
+                except BaseException as error:
+                    # A retained traceback must not pin a borrowed NumPy view.
+                    traceback.clear_frames(error.__traceback__)
+                    raise
+                finally:
+                    del table
         output[~owned] = 0
         raw = torch.from_numpy(output)
         if self.storage_dtype != torch.bfloat16:
@@ -310,6 +364,9 @@ class HostPLETable(_LoadedPLETable):
         raise NotImplementedError("Host PLE requires the explicit host lookup boundary")
 
     def close(self) -> None:
+        if self._gather_pool is not None:
+            self._gather_pool.shutdown(wait=True, cancel_futures=True)
+            self._gather_pool = None
         if self._shared_table is not None:
             self._shared_table.close()
         self.weight.data = torch.empty(
