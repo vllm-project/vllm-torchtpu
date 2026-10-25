@@ -49,6 +49,8 @@ def build_compact_pooled_qsa_op(
     Explicit keys must identify the implementation/version and all static
     configuration, consistently across processes. Different backends must not
     reuse a key. The default selector retains its legacy operator name.
+    The TPU compiler binds scheduling_group_namespace per FX call site; zero
+    keeps direct native calls safe without cross-call scheduling annotations.
     """
     return _build_compact_pooled_qsa_op(topk_backend, topk_backend_key)
 
@@ -88,6 +90,7 @@ def _build_compact_pooled_qsa_op(
         rotary_dim,
         k_scale=1.0,
         v_scale=1.0,
+        scheduling_group_namespace=0,
     ):
         return (
             torch.empty_like(pool),

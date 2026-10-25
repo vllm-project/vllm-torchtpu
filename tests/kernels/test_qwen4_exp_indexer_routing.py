@@ -259,7 +259,13 @@ def test_pooled_step_forwards_geometry_and_backend_before_attention(
 
     def select(query, pool, lengths, table, req, starts, context, **kwargs):
         seen.append(
-            (kwargs["topk_backend"], starts, context, kwargs["vmem_limit_bytes"])
+            (
+                kwargs["topk_backend"],
+                starts,
+                context,
+                kwargs["vmem_limit_bytes"],
+                kwargs["scheduling_group_namespace"],
+            )
         )
         return jnp.full((len(query), 16), -1, jnp.int32)
 
@@ -323,10 +329,12 @@ def test_pooled_step_forwards_geometry_and_backend_before_attention(
         norm_eps=1e-6,
         rotary_dim=2,
         topk_backend=backend,
+        scheduling_group_namespace=11,
     )
     assert len(seen) == 1
     assert seen[0][0] is backend and seen[0][1] is starts and seen[0][2] is context
     assert seen[0][3] == 16 * 1024**2
+    assert seen[0][4] == 11
 
 
 def test_cached_decode_selector_separates_namespace_and_backend(monkeypatch):
@@ -359,3 +367,41 @@ def test_cached_decode_selector_separates_namespace_and_backend(monkeypatch):
         )
     assert traces == [(3, backend), (4, backend), (3, SparseCoreTopK())]
     fn.clear_cache()
+
+
+def test_production_compact_factory_exposes_compiler_owned_namespace(monkeypatch):
+    import torch
+    from torch_tpu._internal import pallas
+
+    from vllm_torchtpu.compilation.tpu_compiler import _bind_scheduling_group_namespaces
+    from vllm_torchtpu.layers.adapter.custom_ops import qsa_op
+
+    registrations = []
+    original = pallas.jax_op
+
+    def register(name, function, **kwargs):
+        op = original(name, function, **kwargs)
+        registrations.append((op, kwargs))
+        return op
+
+    monkeypatch.setattr(pallas, "jax_op", register)
+    qsa_op.build_compact_pooled_qsa_op(
+        topk_backend=ReferenceTopK(), topk_backend_key="namespace-contract-test-v1"
+    )
+    op, options = registrations[0]
+    assert options["donate_argnums"] == (10, 11)
+    schema = op._opoverload._schema
+    assert schema.arguments[-1].name == "scheduling_group_namespace"
+    assert schema.arguments[-1].default_value == 0
+    graph = torch.fx.Graph()
+    args = tuple(graph.placeholder(arg.name) for arg in schema.arguments[:-1])
+    first = graph.call_function(op._opoverload, args)
+    second = graph.call_function(op._opoverload, args)
+    graph.output((first, second))
+    module = torch.fx.GraphModule({}, graph)
+    _bind_scheduling_group_namespaces(module)
+    assert [
+        n.kwargs["scheduling_group_namespace"]
+        for n in module.graph.nodes
+        if n.op == "call_function"
+    ] == [1, 2]

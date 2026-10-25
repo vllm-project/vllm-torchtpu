@@ -591,6 +591,7 @@ def compact_pooled_qsa_step(
     rotary_dim: int,
     k_scale: float = 1.0,
     v_scale: float = 1.0,
+    scheduling_group_namespace: int = 0,
     *,
     topk_backend: TopKBackend | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
@@ -681,6 +682,7 @@ def compact_pooled_qsa_step(
         ratio=compress_ratio,
         block_topk=token_topk // compress_ratio,
         topk_backend=topk_backend,
+        scheduling_group_namespace=scheduling_group_namespace,
         logical_block_size=main_pool.shape[1],
         vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
     )
