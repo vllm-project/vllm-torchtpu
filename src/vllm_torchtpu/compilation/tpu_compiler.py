@@ -302,6 +302,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/core",
     "vllm_torchtpu/layers/adapter/attention.py",
     "vllm_torchtpu/layers/adapter/cp_attention.py",
+    "vllm_torchtpu/layers/adapter/cp_mla_attention.py",
     "vllm_torchtpu/layers/adapter/custom_ops",
     "vllm_torchtpu/layers/adapter/fused_moe.py",
     # The fused EP MoE op and the helper that registers it. Both sit behind a
