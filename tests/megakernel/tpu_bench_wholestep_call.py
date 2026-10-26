@@ -53,7 +53,7 @@ def main():
     ap.add_argument("--L", type=int, default=44)
     ap.add_argument("--remove", default="",
                     help="timing-only removal arms (wrong results): comma list of "
-                         "attn_dma, attn_matmul, keys, select")
+                         "attn_dma, attn_matmul, keys, select, uattn")
     ap.add_argument("--shard", action="store_true",
                     help="request-sharded indexer (VLLM_TPU_MEGAKERNEL wholeshard=1)")
     ap.add_argument("--union", action="store_true",
@@ -189,6 +189,10 @@ def _apply_removals(spec: str) -> None:
             )
         elif arm == "keys":  # no compressed-key stream or scoring
             qsa_full_b.QSAFullIndexedBlock._score_request = lambda self, *a, **k: None
+        elif arm == "uattn":  # union attention (DMAs + compute) replaced by zeros
+            from vllm_torchtpu.megakernel.wholestep import union_attn as ua
+
+            ua.attend_request = lambda *, T, qs, **k: [jnp.zeros_like(q) for q in qs]
         elif arm == "select":  # no thresholds / compaction arithmetic
             ix.thresholds = lambda bits, ids, nv, K, G: (
                 jnp.zeros(bits.shape[:1] + (1, 1), jnp.int32),
