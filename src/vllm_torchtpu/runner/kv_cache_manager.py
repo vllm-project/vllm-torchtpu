@@ -32,7 +32,10 @@ from vllm.models.deepseek_v4.attention import (
 from vllm.models.deepseek_v4.compressor import CompressorStateCache
 from vllm.v1.attention.backend import AttentionBackend, AttentionLayer, AttentionType
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
-from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+from vllm.v1.core.kv_cache_utils import (
+    get_kv_cache_groups,
+    unify_kv_cache_spec_page_size,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
@@ -107,6 +110,7 @@ def check_kv_caches_cover_block_ids(
     kv_cache_tensors: Iterable[KVCacheTensor],
     num_blocks: int,
     spec_for_layer: Callable[[str], KVCacheSpec],
+    physical_block_counts: dict[str, int] | None = None,
 ) -> None:
     """Check block coverage for dense caches in scheduler-page layout."""
     for kv_cache_tensor in kv_cache_tensors:
@@ -119,11 +123,12 @@ def check_kv_caches_cover_block_ids(
             kv_cache = kv_caches.get(layer_name)
             if kv_cache is None:
                 raise ValueError(f"Missing KV cache for attention layer {layer_name}")
-            if kv_cache.shape[0] < num_blocks:
+            required_blocks = (physical_block_counts or {}).get(layer_name, num_blocks)
+            if kv_cache.shape[0] < required_blocks:
                 raise ValueError(
                     f"KV cache for {layer_name} holds {kv_cache.shape[0]} "
                     f"blocks, but the scheduler can issue block IDs through "
-                    f"{num_blocks - 1} ({num_blocks} blocks; "
+                    f"{required_blocks - 1} ({required_blocks} physical blocks; "
                     f"{len(kv_cache_tensor.layers)} layer(s) in this "
                     f"{kv_cache_tensor.size}-byte backing allocation). "
                     "TPU kernels do not bounds-check these "
@@ -175,6 +180,7 @@ class KVCacheManager:
     def __init__(self, runner: TPUModelRunner) -> None:
         self.runner = runner
         self.ds_v4 = DsV4KVCacheAllocator(runner)
+        self.native_swa_cache = None
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
@@ -399,10 +405,22 @@ class KVCacheManager:
         )
         if native_swa_layers:
             from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
+                NativeSWACache,
                 budget_native_swa,
             )
 
-            kv_cache_spec = budget_native_swa(kv_cache_spec, native_swa_layers)
+            if self.runner.cache_config.enable_prefix_caching and any(
+                kv_cache_spec[name].prefix_cacheable for name in native_swa_layers
+            ):
+                # Prefix-retained SWA pages outlive active requests. Keep their
+                # scheduler address space unless bounded replay is enabled.
+                self.native_swa_cache = None
+                kv_cache_spec = budget_native_swa(kv_cache_spec, native_swa_layers)
+            else:
+                kv_cache_spec = unify_kv_cache_spec_page_size(kv_cache_spec)
+                self.native_swa_cache = NativeSWACache(
+                    kv_cache_spec, native_swa_layers, self.runner.vllm_config
+                )
         if (
             hma_enabled
             and has_attention
@@ -1320,6 +1338,8 @@ class KVCacheManager:
         ]
 
         self.runner.may_reinitialize_input_batch(kv_cache_config, block_sizes)
+        if self.native_swa_cache is not None:
+            self.native_swa_cache.initialize(self.runner, kv_cache_config)
 
         # Populate self.attn_groups directly with a single shared TPU builder
         # per group; bypasses parent's initialize_attn_backend (per-backend
@@ -1334,6 +1354,11 @@ class KVCacheManager:
                 self.runner.device,
                 runner=self.runner,
                 kv_cache_group_id=gid,
+                block_table=(
+                    self.native_swa_cache.group_tables.get(gid)
+                    if self.native_swa_cache is not None
+                    else None
+                ),
             )
             self.runner.attn_groups.append(
                 [
@@ -1394,6 +1419,7 @@ class KVCacheManager:
                     self.runner.device,
                     self.runner.cache_config.get_resolved_kv_cache_layout(),
                     word_rows=True,
+                    compact_swa=self.native_swa_cache,
                     native_swa_layers=frozenset(
                         name
                         for name, module in (
@@ -1769,6 +1795,14 @@ class KVCacheManager:
                 kv_cache_config.kv_cache_tensors,
                 kv_cache_config.num_blocks,
                 _per_layer_spec,
+                physical_block_counts=(
+                    {
+                        name: window.capacity
+                        for name, window in self.native_swa_cache.layers.items()
+                    }
+                    if self.native_swa_cache is not None
+                    else None
+                ),
             )
 
         # Use tpu_bind_kv_cache to bind KV caches to attention layers using layer names
