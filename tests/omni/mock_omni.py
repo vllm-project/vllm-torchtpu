@@ -198,11 +198,12 @@ def _mock_apply_split_rotary_emb(x, freqs, *, head_dim):
     return out.reshape(b, h, t, head_dim).swapaxes(1, 2).reshape(b, t, h * head_dim)
 
 
-class _MockRotaryEmbeddingWan(torch.nn.Module):
-    """vLLM-Omni's CustomOp-style Wan RoPE (native interleaved formula)."""
+class _MockRotaryEmbedding(torch.nn.Module):
+    """vLLM-Omni's CustomOp-style base RoPE (native formula)."""
 
-    def __init__(self, is_neox_style=False, half_head_dim=False):
+    def __init__(self, is_neox_style=False, half_head_dim=True):
         super().__init__()
+        self.is_neox_style = is_neox_style
         self.interleaved = not is_neox_style
         self.half_head_dim = half_head_dim
         self._forward_method = self.forward_native
@@ -210,7 +211,42 @@ class _MockRotaryEmbeddingWan(torch.nn.Module):
     def forward(self, *args, **kwargs):
         return self._forward_method(*args, **kwargs)
 
+    def _prepare_half_head_dim_cos_sin(self, cos, sin):
+        if cos.dim() == 3:
+            cos = cos[0]
+            sin = sin[0]
+        if not self.half_head_dim:
+            cos = cos[..., ::2] if self.interleaved else cos[..., : cos.shape[-1] // 2]
+            sin = sin[..., ::2] if self.interleaved else sin[..., : sin.shape[-1] // 2]
+        return cos, sin
+
     def forward_native(self, x, cos, sin):
+        cos, sin = self._prepare_half_head_dim_cos_sin(cos, sin)
+        ro_dim = cos.shape[-1] * 2
+        x_rot = x[..., :ro_dim]
+        if self.interleaved:
+            cos = cos.unsqueeze(-2).repeat_interleave(2, dim=-1)
+            sin = sin.unsqueeze(-2).repeat_interleave(2, dim=-1)
+            x1, x2 = x_rot[..., ::2], x_rot[..., 1::2]
+            rot = torch.stack((-x2, x1), dim=-1).flatten(-2)
+        else:
+            cos = torch.cat([cos, cos], dim=-1).unsqueeze(-2)
+            sin = torch.cat([sin, sin], dim=-1).unsqueeze(-2)
+            x1, x2 = x_rot.chunk(2, dim=-1)
+            rot = torch.cat((-x2, x1), dim=-1)
+        return torch.cat([x_rot * cos + rot * sin, x[..., ro_dim:]], dim=-1)
+
+
+class _MockRotaryEmbeddingWan(_MockRotaryEmbedding):
+    """vLLM-Omni's CustomOp-style Wan RoPE (native interleaved formula)."""
+
+    def __init__(self, is_neox_style=False, half_head_dim=False):
+        super().__init__(is_neox_style=is_neox_style, half_head_dim=half_head_dim)
+
+    def forward_native(self, x, cos, sin):
+        if cos.dim() == 2:
+            cos = cos.unsqueeze(0).unsqueeze(2)
+            sin = sin.unsqueeze(0).unsqueeze(2)
         x1, x2 = x.unflatten(-1, (-1, 2)).unbind(-1)
         rotated = torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
         return rotated.flatten(-2, -1).to(x.dtype)
@@ -258,6 +294,7 @@ _ltx2_transformer.LTX2AudioVideoRotaryPosEmbed = _mock_ltx2_rope_cls()
 _ltx2_transformer.apply_split_rotary_emb = _mock_apply_split_rotary_emb
 _ltx2_transformer.get_tensor_model_parallel_world_size = lambda: 1
 _ltx2_transformer.get_tensor_model_parallel_rank = lambda: 0
+vllm_omni_mock.diffusion.layers.rope.RotaryEmbedding = _MockRotaryEmbedding
 vllm_omni_mock.diffusion.layers.rope.RotaryEmbeddingWan = _MockRotaryEmbeddingWan
 vllm_omni_mock.diffusion.layers.norm.RMSNorm = _MockRMSNorm
 _wan2_2 = vllm_omni_mock.diffusion.models.wan2_2

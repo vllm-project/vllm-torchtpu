@@ -27,6 +27,7 @@ from .mock_omni import (  # isort: split
     _mock_apply_split_rotary_emb,
     _mock_ltx2_rope_cls,
     _MockRMSNorm,
+    _MockRotaryEmbedding,
     _MockRotaryEmbeddingWan,
     vllm_omni_mock,
 )
@@ -62,6 +63,7 @@ from vllm_torchtpu.omni.rope import (
     _pair_swap_matrix,
     apply_rotary_pair_swap,
     can_fuse_qk_norm_rope,
+    rotary_embedding_forward,
     rotary_embedding_wan_forward,
     split_rope_natural_tables,
     wan_self_attention_fused,
@@ -107,12 +109,13 @@ def test_platform_attributes():
         mock_dev.assert_called_once_with("tpu")
 
 
-def test_rope_pair_swap_matches_native():
+@pytest.mark.parametrize("ro_dim", [16, 12], ids=["full", "partial"])
+def test_rope_pair_swap_matches_native(ro_dim):
     torch.manual_seed(0)
-    rope = _MockRotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
-    x = torch.randn(1, 24, 3, 16)
-    cos = torch.randn(1, 24, 1, 8)
-    sin = torch.randn(1, 24, 1, 8)
+    rope = _MockRotaryEmbedding(is_neox_style=False, half_head_dim=True)
+    x = torch.randn(2, 24, 3, 16)
+    cos = torch.randn(24, ro_dim // 2)
+    sin = torch.randn(24, ro_dim // 2)
     torch.testing.assert_close(
         apply_rotary_pair_swap(x, cos, sin), rope.forward_native(x, cos, sin)
     )
@@ -121,18 +124,30 @@ def test_rope_pair_swap_matches_native():
         cos.bfloat16(),
         sin.bfloat16(),
     )
+    out_bf16 = apply_rotary_pair_swap(x_bf16, cos_bf16, sin_bf16)
     torch.testing.assert_close(
-        apply_rotary_pair_swap(x_bf16, cos_bf16, sin_bf16),
+        out_bf16,
         rope.forward_native(x_bf16, cos_bf16, sin_bf16),
         rtol=0,
         atol=0,
     )
+    if ro_dim < x_bf16.shape[-1]:
+        torch.testing.assert_close(
+            out_bf16[..., ro_dim:], x_bf16[..., ro_dim:], rtol=0, atol=0
+        )
+
+
+def _assert_rope_fallback(rope, x, cos, sin):
+    spy = MagicMock(wraps=rope.forward_native)
+    rope._forward_method = spy
+    out = rope(x, cos, sin)
+    spy.assert_called_once_with(x, cos, sin)
+    torch.testing.assert_close(out, rope.forward_native(x, cos, sin), rtol=0, atol=0)
 
 
 def test_rope_patch_installed():
-    from unittest.mock import MagicMock
-
     apply_omni_model_specific_patches()
+    assert _MockRotaryEmbedding.forward is rotary_embedding_forward
     assert _MockRotaryEmbeddingWan.forward is rotary_embedding_wan_forward
     # Interleaved half-dim calls use apply_rotary_pair_swap (bit-exact in bf16).
     rope = _MockRotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
@@ -143,24 +158,47 @@ def test_rope_patch_installed():
         rope(x, cos, sin), rope.forward_native(x, cos, sin), rtol=0, atol=0
     )
 
-    # Non-half-dim or Neox calls delegate to _forward_method.
-    rope_fallback = _MockRotaryEmbeddingWan(is_neox_style=False, half_head_dim=False)
-    spy = MagicMock(wraps=rope_fallback.forward_native)
-    rope_fallback._forward_method = spy
-    out_fb = rope_fallback(x, cos, sin)
-    spy.assert_called_once_with(x, cos, sin)
-    torch.testing.assert_close(
-        out_fb, rope_fallback.forward_native(x, cos, sin), rtol=0, atol=0
+    # Non-half-dim, Neox, or f32 calls delegate to _forward_method.
+    _assert_rope_fallback(
+        _MockRotaryEmbeddingWan(is_neox_style=False, half_head_dim=False), x, cos, sin
     )
+    _assert_rope_fallback(rope, x.float(), cos.float(), sin.float())
 
-    # f32 calls delegate to _forward_method (precision fallback).
-    spy_f32 = MagicMock(wraps=rope.forward_native)
-    rope._forward_method = spy_f32
-    x_f32, cos_f32, sin_f32 = x.float(), cos.float(), sin.float()
-    out_f32 = rope(x_f32, cos_f32, sin_f32)
-    spy_f32.assert_called_once_with(x_f32, cos_f32, sin_f32)
-    torch.testing.assert_close(
-        out_f32, rope.forward_native(x_f32, cos_f32, sin_f32), rtol=0, atol=0
+
+@pytest.mark.parametrize("ro_dim", [8, 6], ids=["full", "partial"])
+@pytest.mark.parametrize("half_head_dim", [True, False], ids=["half", "full_table"])
+@pytest.mark.parametrize("batched_table", [False, True], ids=["2d_table", "3d_table"])
+def test_base_rotary_embedding_patch_bit_exact(ro_dim, half_head_dim, batched_table):
+    apply_omni_model_specific_patches()
+    torch.manual_seed(0)
+    rope = _MockRotaryEmbedding(is_neox_style=False, half_head_dim=half_head_dim)
+    x = torch.randn(2, 4, 3, 8, dtype=torch.bfloat16)
+    table_dim = ro_dim // 2 if half_head_dim else ro_dim
+    table_shape = (2, 4, table_dim) if batched_table else (4, table_dim)
+    cos = torch.randn(*table_shape, dtype=torch.bfloat16)
+    sin = torch.randn(*table_shape, dtype=torch.bfloat16)
+
+    out = rope(x, cos, sin)
+    want = rope.forward_native(x, cos, sin)
+    torch.testing.assert_close(out, want, rtol=0, atol=0)
+    if ro_dim < x.shape[-1]:
+        torch.testing.assert_close(out[..., ro_dim:], x[..., ro_dim:], rtol=0, atol=0)
+
+
+def test_base_rotary_embedding_patch_fallbacks():
+    apply_omni_model_specific_patches()
+    x = torch.randn(2, 4, 3, 8, dtype=torch.bfloat16)
+    cos = torch.randn(4, 4, dtype=torch.bfloat16)
+    sin = torch.randn(4, 4, dtype=torch.bfloat16)
+
+    _assert_rope_fallback(
+        _MockRotaryEmbedding(is_neox_style=True, half_head_dim=True), x, cos, sin
+    )
+    _assert_rope_fallback(
+        _MockRotaryEmbedding(is_neox_style=False, half_head_dim=True),
+        x.float(),
+        cos.float(),
+        sin.float(),
     )
 
 
@@ -170,9 +208,11 @@ def test_rope_patch_accepts_token_major_tables():
     x = torch.randn(1, 4, 2, 8, dtype=torch.bfloat16)
     cos = torch.randn(4, 4, dtype=torch.bfloat16)
     sin = torch.randn(4, 4, dtype=torch.bfloat16)
-    expected = rope.forward_native(x, cos[None, :, None], sin[None, :, None])
     torch.testing.assert_close(
-        rotary_embedding_wan_forward(rope, x, cos, sin), expected, rtol=0, atol=0
+        rotary_embedding_wan_forward(rope, x, cos, sin),
+        rope.forward_native(x, cos, sin),
+        rtol=0,
+        atol=0,
     )
 
 
