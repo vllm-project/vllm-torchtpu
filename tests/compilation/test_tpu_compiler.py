@@ -402,6 +402,8 @@ class TestTpuCompilerCache:
             "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
             "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
             "TPU_LIBRARY_PATH",
+            "TPU_STATIC_DECODE_INPUTS",
+            "TPU_STATIC_DECODE_INPUTS_VERIFY",
         }
 
         assert serving_only <= _TPU_COMPILE_ENV_IGNORED
