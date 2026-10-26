@@ -120,6 +120,7 @@ if TYPE_CHECKING:
     TPU_MOE_PREFILL_SUM_IN_KERNEL_MAX_TOKENS: int = 0
     TPU_MOE_PREFILL_SUM_IN_KERNEL_OVERLAP_ADDS: bool = False
     TPU_MOE_PREFILL_TILE_MIN: int = 0
+    TPU_MOE_PREFILL_ROW_TOKENS_RESIDENT_MAX_TOKENS: int = 0
     TPU_MOE_SINGLE_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_MOE_TP_DECODE_FAST: bool = True
@@ -1254,6 +1255,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # full on the 78-layer model, runs 131 us longer per call. Same output;
     # only the tiling changes.
     "TPU_MOE_PREFILL_TILE_MIN": env_nonnegative_int("TPU_MOE_PREFILL_TILE_MIN", 0),
+    # With FUSED_MOE_PREFILL_KERNEL_V2: the largest token count at which the
+    # stage-A expert kernel keeps the routes' token table resident in SMEM
+    # (scalar prefetch) and reads each route's token from it, instead of
+    # copying a window of the table from HBM before every tile and waiting for
+    # it. 0 = off. The table takes 4 bytes per route: 132.6 KB at 4096 tokens
+    # with top-8 routing. The same tokens feed the same row DMAs: bitwise
+    # identical. The in-kernel sum builds
+    # (TPU_MOE_PREFILL_SUM_IN_KERNEL_MAX_TOKENS) keep the table resident
+    # already, so this changes only the builds that write the slab.
+    "TPU_MOE_PREFILL_ROW_TOKENS_RESIDENT_MAX_TOKENS": env_nonnegative_int(
+        "TPU_MOE_PREFILL_ROW_TOKENS_RESIDENT_MAX_TOKENS", 0
+    ),
     # Build the MoE permutation, its inverse, and the sorted token ids from
     # one packed sort instead of three. The ragged (counting sort) path ignores it.
     "TPU_MOE_SINGLE_SORT": env_bool("TPU_MOE_SINGLE_SORT", True),
