@@ -58,6 +58,10 @@ AXIS = "d"
 QCHUNK = 512
 # Output columns the four-bit FFN contracts at a time.
 FP4_OUTPUT_CHUNK = 256
+# Output columns per weight-stream DMA of the gate/up and the down slab on
+# the single-slot fp4 path; each a whole number of FP4_OUTPUT_CHUNK.
+W1_STREAM_CHUNK = 2048
+W2_STREAM_CHUNK = 1792
 # How many tile heights the FFN body is emitted at, where it is emitted at
 # more than one. A tile runs the smallest rung that covers its live rows, so
 # an expert's short tail tile stops computing a full tile_m of rows nothing
@@ -697,6 +701,51 @@ def _build_fused_ep_moe_kernel(
     # last gate/up block of an expert's last tile, which is overlapped with
     # a whole down matmul plus an epilogue.
     starts_next_weights = streams_weights and not prefetches
+    # With one weight slot the next expert's slab can only be written where
+    # this expert has finished reading it. Whole-slab DMAs make that the end
+    # of the slab, so the next gate/up slab waits for this expert's whole
+    # gate/up matmul and the next visit's first block waits for all of it.
+    # Column chunks (W1_/W2_STREAM_CHUNK output columns, whole numbers of the
+    # reader's FP4_OUTPUT_CHUNK) let each chunk be refilled as soon as it
+    # is retired and landed as late as its first read, so the wire stays busy
+    # across visits. Smaller chunks lose: every wait is a scheduling fence in
+    # the unrolled matmul chain.
+    # Only where an expert is expected to fit one tile (the bound the height
+    # rungs use): a multi-tile visit re-reads the slab every tile, and the
+    # per-chunk predicates then cost more than the refill overlap buys.
+    chunk_of = {1: W1_STREAM_CHUNK, 2: W2_STREAM_CHUNK}
+    chunked_stream = (
+        starts_next_weights
+        and ragged_rows_alloc <= ep * g_local * capacity
+        and (2 * inter) % W1_STREAM_CHUNK == 0
+        and hidden % W2_STREAM_CHUNK == 0
+    )
+    n_w1_chunks = 2 * inter // W1_STREAM_CHUNK
+    n_w2_chunks = hidden // W2_STREAM_CHUNK
+    # A chunk-streamed visit's head waits only for its scale tables, which
+    # otherwise start after the previous visit's tile loop, behind that
+    # visit's down-slab chunks. A second scale slot lets them go out at the
+    # head of the previous visit instead -- where VMEM has room for it.
+    scale_slots = nbuf
+    if (
+        chunked_stream
+        and has_scales
+        and host.vmem_estimate_bytes(
+            g_local,
+            capacity,
+            hidden,
+            inter,
+            nbuf,
+            weight_format=weight_format,
+            rhs_qb=rhs_qb,
+            has_w1_bias=has_w1_bias,
+            has_w2_bias=has_w2_bias,
+            scale_slots=2,
+        )
+        <= slots.limit
+    ):
+        scale_slots = 2
+    scales_ahead = scale_slots > nbuf
     if rhs_packed4:
         # Asked here, beside the other device reads, because the packed
         # four-bit layout is the one place a written-down device fact and a
@@ -908,6 +957,7 @@ def _build_fused_ep_moe_kernel(
             # Never cp_sem: its start+wait users must not consume these.
             mehop_sem = next(it)
             mehop_scl_sem = next(it)
+        w1c_sems, w2c_sems = (next(it), next(it)) if chunked_stream else (None, None)
 
         me = rank_sm[0, 0]
 
@@ -928,6 +978,22 @@ def _build_fused_ep_moe_kernel(
         def scale_table(hbm, expert):
             return hbm.at[:, expert] if scales_block_major else hbm.at[expert]
 
+        def w1_chunk_copy(expert, slot, c):
+            """Gate/up column chunk `c` of `expert`, into weight slot `slot`."""
+            assert w1c_sems is not None
+            cols = pl.ds(c * W1_STREAM_CHUNK, W1_STREAM_CHUNK)
+            return pltpu.make_async_copy(
+                w1_hbm.at[expert, :, cols], w1_vm.at[slot, :, cols], w1c_sems.at[c]
+            )
+
+        def w2_chunk_copy(expert, slot, c):
+            """Down column chunk `c` of `expert`, into weight slot `slot`."""
+            assert w2c_sems is not None
+            cols = pl.ds(c * W2_STREAM_CHUNK, W2_STREAM_CHUNK)
+            return pltpu.make_async_copy(
+                w2_hbm.at[expert, :, cols], w2_vm.at[slot, :, cols], w2c_sems.at[c]
+            )
+
         def w1s_copy(expert, slot):
             assert w1s_hbm is not None
             return _slot_copy(scale_table(w1s_hbm, expert), w1s_vm, w1s_sems, slot)
@@ -936,7 +1002,7 @@ def _build_fused_ep_moe_kernel(
             assert w2s_hbm is not None
             return _slot_copy(scale_table(w2s_hbm, expert), w2s_vm, w2s_sems, slot)
 
-        def weight_starts(expert, slot):
+        def weight_starts(expert, slot, sslot=None):
             """Start every buffer slot `slot` holds for `expert`.
 
             In the order the body consumes them, which is also the order a
@@ -946,12 +1012,19 @@ def _build_fused_ep_moe_kernel(
             needs them, so they are all a streamed visit's head waits for.
             """
             if has_scales:
-                w1s_copy(expert, slot).start(priority=WEIGHT_DMA_PRIORITY)
-                w2s_copy(expert, slot).start(priority=WEIGHT_DMA_PRIORITY)
+                sslot = slot if sslot is None else sslot
+                w1s_copy(expert, sslot).start(priority=WEIGHT_DMA_PRIORITY)
+                w2s_copy(expert, sslot).start(priority=WEIGHT_DMA_PRIORITY)
+            if chunked_stream:
+                for c in range(n_w1_chunks):
+                    w1_chunk_copy(expert, slot, c).start(priority=WEIGHT_DMA_PRIORITY)
+                for c in range(n_w2_chunks):
+                    w2_chunk_copy(expert, slot, c).start(priority=WEIGHT_DMA_PRIORITY)
+                return
             w1_copy(expert, slot).start(priority=WEIGHT_DMA_PRIORITY)
             w2_copy(expert, slot).start(priority=WEIGHT_DMA_PRIORITY)
 
-        def weight_waits(expert, slot):
+        def weight_waits(expert, slot, sslot=None):
             """Wait for what the expert's first block needs.
 
             A streamed slab is not waited for here: its wait sits in the block
@@ -963,8 +1036,9 @@ def _build_fused_ep_moe_kernel(
                 w1_copy(expert, slot).wait()
                 w2_copy(expert, slot).wait()
             if has_scales:
-                w1s_copy(expert, slot).wait()
-                w2s_copy(expert, slot).wait()
+                sslot = slot if sslot is None else sslot
+                w1s_copy(expert, sslot).wait()
+                w2s_copy(expert, sslot).wait()
 
         def prologue():
             """Land the resident tables and start the first weight refills."""
@@ -1004,6 +1078,37 @@ def _build_fused_ep_moe_kernel(
 
             return start
 
+        def _chunk_hooks(expert, visit_i, slot, first_tile, last_tile):
+            """`(before, after)`, each `(which, block, n_start) -> ()`, for a
+            chunk-streamed visit: `before` lands chunk `n_start` at its first
+            block on the expert's first tile; `after` refills it with the next
+            visit's chunk after its last block on the expert's last tile."""
+            copies = {1: w1_chunk_copy, 2: w2_chunk_copy}
+            last_block = {1: hidden // rhs_qb - 1, 2: inter // rhs_qb - 1}
+
+            def before(which, block, n_start):
+                if block or n_start % chunk_of[which]:
+                    return
+                c = n_start // chunk_of[which]
+
+                @pl.when(first_tile)
+                def _():
+                    copies[which](expert, slot, c).wait()
+
+            def after(which, block, n_start):
+                ends_chunk = (n_start + FP4_OUTPUT_CHUNK) % chunk_of[which] == 0
+                if block != last_block[which] or not ends_chunk:
+                    return
+                c = n_start // chunk_of[which]
+
+                @pl.when(jnp.logical_and(last_tile, visit_i + 1 < n_visit))
+                def _():
+                    copies[which](visit_sm[visit_i + 1], slot, c).start(
+                        priority=WEIGHT_DMA_PRIORITY
+                    )
+
+            return before, after
+
         def _slab_waiter(expert, slot, first_tile):
             """`(copy, block) -> ()`: land the slab that block `block` opens,
             on the expert's first tile.
@@ -1027,7 +1132,9 @@ def _build_fused_ep_moe_kernel(
 
             return wait
 
-        def _fp4_block_readers(slot, wait_slab=None, slab_retired=None):
+        def _fp4_block_readers(
+            slot, wait_slab=None, slab_retired=None, chunk_hooks=None
+        ):
             """(w1_block, w2_block) fp4 block readers at weight slot `slot`.
 
             The one genuinely fp4 place in the kernel: everything around it
@@ -1046,6 +1153,8 @@ def _build_fused_ep_moe_kernel(
 
             def w1_block(b, n_start, n_end):
                 # N.B. b is the contraction-block index.
+                if chunk_hooks is not None:
+                    chunk_hooks[0](1, b, n_start)
                 if wait_slab is not None and n_start == 0:
                     wait_slab(w1_copy, b)
                 block = pltpu.bitcast(
@@ -1065,12 +1174,16 @@ def _build_fused_ep_moe_kernel(
                     and n_end == 2 * inter
                 ):
                     slab_retired()
+                if chunk_hooks is not None:
+                    chunk_hooks[1](1, b, n_start)
                 return block
 
             def w2_block(b, n_start, n_end):
+                if chunk_hooks is not None:
+                    chunk_hooks[0](2, b, n_start)
                 if wait_slab is not None and n_start == 0:
                     wait_slab(w2_copy, b)
-                return pltpu.bitcast(
+                block = pltpu.bitcast(
                     w2_vm[
                         slot,
                         pl.ds(b * packed_rows, packed_rows),
@@ -1078,6 +1191,9 @@ def _build_fused_ep_moe_kernel(
                     ],
                     FP4,
                 ).astype(FP8)
+                if chunk_hooks is not None:
+                    chunk_hooks[1](2, b, n_start)
+                return block
 
             return w1_block, w2_block
 
@@ -1319,6 +1435,7 @@ def _build_fused_ep_moe_kernel(
             # The weight slot indexes a contiguous counter so DISTANCE + 1 of
             # them occupy distinct slots; the DMA base stays the real expert.
             slot = lax.rem(visit_i, jnp.int32(nbuf))
+            sslot = lax.rem(visit_i, jnp.int32(scale_slots))
             if not prefetches and not starts_next_weights:
                 # No runway: nobody started this visit's weights, so it
                 # starts them itself and waits on the two lines below.
@@ -1335,9 +1452,16 @@ def _build_fused_ep_moe_kernel(
 
                 @pl.when(visit_i == 0)
                 def _():
-                    weight_starts(e, slot)
+                    weight_starts(e, slot, sslot)
 
-            weight_waits(e, slot)
+            weight_waits(e, slot, sslot)
+            if scales_ahead:
+                # The other scale slot was last read by the previous visit.
+                @pl.when(visit_i + 1 < n_visit)
+                def _():
+                    nxt, nslot = visit_sm[visit_i + 1], jnp.int32(1) - sslot
+                    w1s_copy(nxt, nslot).start(priority=WEIGHT_DMA_PRIORITY)
+                    w2s_copy(nxt, nslot).start(priority=WEIGHT_DMA_PRIORITY)
 
             # Refill the slot for the expert DISTANCE ahead: the previous
             # expert last read it, and DISTANCE < nbuf keeps it off both live
@@ -1625,19 +1749,24 @@ def _build_fused_ep_moe_kernel(
                         # expert_ffn_blockscale, so the epilogues below must
                         # not apply w2s again.
                         assert w1s_vm is not None and w2s_vm is not None
-                        w1s_blocks = w1s_vm[slot]  # [nb1, 2*inter] f32
-                        w2s_blocks = w2s_vm[slot]  # [nb2, hidden] f32
+                        w1s_blocks = w1s_vm[sslot]  # [nb1, 2*inter] f32
+                        w2s_blocks = w2s_vm[sslot]  # [nb2, hidden] f32
                         first_tile, last_tile = t == 0, t == n_tiles - 1
                         w1_block, w2_block = _fp4_block_readers(
                             slot,
                             wait_slab=(
                                 _slab_waiter(e, slot, first_tile)
-                                if streams_weights
+                                if streams_weights and not chunked_stream
                                 else None
                             ),
                             slab_retired=(
                                 _start_next_gate_up(visit_i, slot, last_tile)
-                                if starts_next_weights
+                                if starts_next_weights and not chunked_stream
+                                else None
+                            ),
+                            chunk_hooks=(
+                                _chunk_hooks(e, visit_i, slot, first_tile, last_tile)
+                                if chunked_stream
                                 else None
                             ),
                         )
@@ -1783,10 +1912,11 @@ def _build_fused_ep_moe_kernel(
                     # Scales first: they are all the next visit's head waits
                     # for, and the down slab behind them is a megabyte-scale
                     # queue they would otherwise sit out.
-                    if has_scales:
+                    if has_scales and not scales_ahead:
                         w1s_copy(nxt, slot).start(priority=WEIGHT_DMA_PRIORITY)
                         w2s_copy(nxt, slot).start(priority=WEIGHT_DMA_PRIORITY)
-                    w2_copy(nxt, slot).start(priority=WEIGHT_DMA_PRIORITY)
+                    if not chunked_stream:
+                        w2_copy(nxt, slot).start(priority=WEIGHT_DMA_PRIORITY)
 
             # Cross-expert lookahead: prime the next visited expert's first
             # activation tile before this expert's commit drain and push. Its
@@ -1972,6 +2102,7 @@ def _build_fused_ep_moe_kernel(
                 rhs_qb=rhs_qb,
                 has_w1_bias=has_w1_bias,
                 has_w2_bias=has_w2_bias,
+                scale_slots=scale_slots,
             )
         ]
         + [
@@ -1987,8 +2118,8 @@ def _build_fused_ep_moe_kernel(
             [
                 # The scale tables travel with the slabs they scale, so they are
                 # slot-deep and need their own sems: a wait is per-buffer.
-                pltpu.SemaphoreType.DMA((nbuf,)),  # w1s_sems
-                pltpu.SemaphoreType.DMA((nbuf,)),  # w2s_sems
+                pltpu.SemaphoreType.DMA((scale_slots,)),  # w1s_sems
+                pltpu.SemaphoreType.DMA((scale_slots,)),  # w2s_sems
             ]
             if has_scales
             else []
@@ -2014,6 +2145,14 @@ def _build_fused_ep_moe_kernel(
                 pltpu.SemaphoreType.DMA,  # mehop_sem
                 pltpu.SemaphoreType.DMA,  # mehop_scl_sem
             ]
+        )
+        + (
+            [
+                pltpu.SemaphoreType.DMA((n_w1_chunks,)),  # w1c_sems
+                pltpu.SemaphoreType.DMA((n_w2_chunks,)),  # w2c_sems
+            ]
+            if chunked_stream
+            else []
         )
     )
     # The staging buffer and the two weight slabs are always operands; the
