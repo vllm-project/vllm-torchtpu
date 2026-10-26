@@ -103,8 +103,8 @@ from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
 from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
 from vllm_torchtpu.layers.adapter.sample.fused_greedy_head import (
+    FusedGreedyHead,
     GreedyTokenIds,
-    PackedGreedyHead,
 )
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
@@ -4029,7 +4029,7 @@ class TPUModelRunner(GPUModelRunner):
                         hidden_states,
                         layout_plan,
                     )
-                    if self._can_use_packed_greedy_head(
+                    if self._can_use_fused_greedy_head(
                         scheduler_output, spec_decode_metadata, logits_indices.shape[0]
                     ):
                         logits = GreedyTokenIds(
@@ -4042,7 +4042,7 @@ class TPUModelRunner(GPUModelRunner):
                             hidden_states, logits_indices
                         )
                 else:
-                    if self._can_use_packed_greedy_head(
+                    if self._can_use_fused_greedy_head(
                         scheduler_output,
                         spec_decode_metadata,
                         sample_hidden_states.shape[0],
@@ -5035,7 +5035,7 @@ class TPUModelRunner(GPUModelRunner):
             )
         validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
-        self._packed_greedy_head: PackedGreedyHead | None = None
+        self._fused_greedy_head: FusedGreedyHead | None = None
         if envs.TPU_GREEDY_HEAD_BACKEND == "pallas":
             from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import (
                 DeepseekV41ForCausalLM,
@@ -5048,11 +5048,10 @@ class TPUModelRunner(GPUModelRunner):
             rows = self.max_num_reqs * (
                 self.speculative_config.num_speculative_tokens + 1
             )
-            self._packed_greedy_head = PackedGreedyHead(model.lm_head.weight, rows)
+            self._fused_greedy_head = FusedGreedyHead(model.lm_head.weight, rows)
             logger.info(
-                "Greedy head: packed weight shape=%s, bytes=%d",
-                tuple(self._packed_greedy_head.weight.shape),
-                self._packed_greedy_head.weight.numel() * 2,
+                "Greedy head: reusing original weight shape=%s",
+                tuple(self._fused_greedy_head.weight.shape),
             )
         else:
             assert envs.TPU_GREEDY_HEAD_BACKEND == "logits"
@@ -6001,8 +6000,8 @@ class TPUModelRunner(GPUModelRunner):
             min(self.max_num_reqs * (k + 1), self.num_tokens_paddings[-1]),
         )
         with self._precompile_timed("rejection_sampler"):
-            if self._packed_greedy_head is not None:
-                rows = self._packed_greedy_head.rows
+            if self._fused_greedy_head is not None:
+                rows = self._fused_greedy_head.rows
                 hidden = torch.zeros(
                     (rows, self.model_config.get_hidden_size()),
                     dtype=self._hidden_states_dtype,
@@ -6044,8 +6043,8 @@ class TPUModelRunner(GPUModelRunner):
                         self.device
                     )
                     if (
-                        self._packed_greedy_head is not None
-                        and num_tokens == self._packed_greedy_head.rows
+                        self._fused_greedy_head is not None
+                        and num_tokens == self._fused_greedy_head.rows
                     ):
                         synchronize_tensors(
                             self.gather_spec_token_ids(
@@ -7283,15 +7282,15 @@ class TPUModelRunner(GPUModelRunner):
             top_p_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
         )
 
-    def _can_use_packed_greedy_head(
+    def _can_use_fused_greedy_head(
         self,
         scheduler_output: "SchedulerOutput",
         metadata: SpecDecodeMetadata | None,
         rows: int,
     ) -> bool:
         return (
-            self._packed_greedy_head is not None
-            and rows == self._packed_greedy_head.rows
+            self._fused_greedy_head is not None
+            and rows == self._fused_greedy_head.rows
             and metadata is not None
             and self.input_batch.all_greedy
             and not scheduler_output.has_structured_output_requests
@@ -7302,13 +7301,13 @@ class TPUModelRunner(GPUModelRunner):
     def compute_selected_greedy_ids(
         self, hidden_states: torch.Tensor, indices: torch.Tensor
     ) -> torch.Tensor:
-        assert self._packed_greedy_head is not None
-        return self._packed_greedy_head(torch.index_select(hidden_states, 0, indices))
+        assert self._fused_greedy_head is not None
+        return self._fused_greedy_head(torch.index_select(hidden_states, 0, indices))
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_greedy_ids(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        assert self._packed_greedy_head is not None
-        return self._packed_greedy_head(hidden_states)
+        assert self._fused_greedy_head is not None
+        return self._fused_greedy_head(hidden_states)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def gather_spec_token_ids(
