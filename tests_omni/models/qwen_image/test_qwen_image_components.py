@@ -195,6 +195,27 @@ class TestQwenRotaryKernelApplication:
         with pytest.raises(AssertionError, match=NUMERIC_MISMATCH_PATTERN):
             assert_numerical_parity(bad_tpu_q_vid.cpu(), ref_q_vid, atol=5e-2, rtol=0.0)
 
+    @pytest.mark.parametrize("ro_dim", [128, 96], ids=["full", "partial"])
+    def test_rotary_embedding_pair_swap_bit_exact_on_tpu(self, ro_dim: int) -> None:
+        """Check patched RotaryEmbedding is bit-exact with forward_native on TPU."""
+        apply_omni_model_specific_patches()
+
+        torch.manual_seed(42)
+        rope = RotaryEmbedding(is_neox_style=False)
+        x_tpu = torch.randn(2, 128, 24, 128, dtype=torch.bfloat16, device="tpu")
+        cos_tpu = torch.randn(128, ro_dim // 2, dtype=torch.bfloat16, device="tpu")
+        sin_tpu = torch.randn(128, ro_dim // 2, dtype=torch.bfloat16, device="tpu")
+
+        out = rope(x_tpu, cos_tpu, sin_tpu)
+        native_out = rope.forward_native(x_tpu, cos_tpu, sin_tpu)
+
+        assert out.device.type == "tpu"
+        torch.testing.assert_close(out.cpu(), native_out.cpu(), rtol=0, atol=0)
+        if ro_dim < x_tpu.shape[-1]:
+            torch.testing.assert_close(
+                out[..., ro_dim:].cpu(), x_tpu[..., ro_dim:].cpu(), rtol=0, atol=0
+            )
+
 
 def _unmasked_sdpa_reference(q, k, v, scale):
     batch, seq, heads, d = q.shape

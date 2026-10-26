@@ -75,7 +75,7 @@ def apply_omni_model_specific_patches() -> None:
     """Apply model-specific runtime patches."""
     _patch_diffusion_ipc_cpu_pack()
     _patch_qwen_image_rope_txt_freqs_clone()
-    _patch_wan_pair_swap_rope()
+    _patch_pair_swap_rope()
     _patch_wan_ffn_gelu_fence()
     _patch_diffusion_worker_d2h_stream()
     _patch_diffusion_startup_warmup_sync()
@@ -146,17 +146,19 @@ def _clone_txt_freqs(forward: Any) -> Any:
     return _forward
 
 
-def _patch_wan_pair_swap_rope() -> None:
+def _patch_pair_swap_rope() -> None:
     # -------------------------------------------------------------------------
     # TODO: Remove this patch once torch_tpu lowers size-2 minor unflatten/stack
     # without relayouts, or vLLM-Omni's CustomOp gains an out-of-tree dispatch
-    # hook (then make this the TPU forward of RotaryEmbeddingWan).
+    # hook (then make this the TPU forward of RotaryEmbedding and
+    # RotaryEmbeddingWan).
     #
-    # RotaryEmbeddingWan.forward_native (the CustomOp path non-CUDA platforms
-    # take) rotates interleaved pairs via unflatten(-1, (-1, 2)) / stack(-1).
-    # torch_tpu lowers the size-2 minor dimension to sequence-minor layouts
-    # plus strided relayout copies around every q/k rotation, costing ~7 ms
-    # per Wan2.2-A14B layer at 480p on v7x (~9% of the layer).
+    # RotaryEmbedding.forward_native and RotaryEmbeddingWan.forward_native
+    # (the CustomOp path non-CUDA platforms take) rotate interleaved pairs via
+    # unflatten(-1, (-1, 2)) / stack(-1). torch_tpu lowers the size-2 minor
+    # dimension to sequence-minor layouts plus strided relayout copies around
+    # every q/k rotation, costing ~7 ms per Wan2.2-A14B layer at 480p on v7x
+    # (~9% of the layer).
     # The replacement computes the same rotation on the (..., head_dim)
     # layout with an exact signed pair-swap matmul (see omni/rope.py). It is
     # installed on the class because CustomOp binds _forward_method at init
@@ -166,12 +168,21 @@ def _patch_wan_pair_swap_rope() -> None:
     # Complex sliced views crash on TPU under inference mode, which rules
     # out the complex-number RoPE form.
     # -------------------------------------------------------------------------
-    from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
+    from vllm_omni.diffusion.layers.rope import (
+        RotaryEmbedding,
+        RotaryEmbeddingWan,
+    )
 
-    from vllm_torchtpu.omni.rope import rotary_embedding_wan_forward
+    from vllm_torchtpu.omni.rope import (
+        rotary_embedding_forward,
+        rotary_embedding_wan_forward,
+    )
 
+    RotaryEmbedding.forward = rotary_embedding_forward
     RotaryEmbeddingWan.forward = rotary_embedding_wan_forward
-    logger.info("Applied TPU patch: pair-swap matmul RotaryEmbeddingWan.")
+    logger.info(
+        "Applied TPU patch: pair-swap matmul RotaryEmbedding and RotaryEmbeddingWan."
+    )
 
 
 def _patch_wan_ffn_gelu_fence() -> None:
