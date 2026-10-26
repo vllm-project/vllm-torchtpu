@@ -6097,6 +6097,9 @@ def make_prefill_stack_sp_indexed(mesh, *, seq_len=8192, depth=93, segments, pre
 # The vocab-sharded embedding and each packed sequence's first-token logits.
 
 
+EMBED_BF16_REDUCE = True
+
+
 def make_embedding_sp(mesh, *, seq_len, vocab_per_rank=5120):
     """Embed rank-local token IDs using a vocab-sharded TP32 table."""
     if mesh.size != 32 or len(mesh.axis_names) != 1 or seq_len % 32:
@@ -6112,9 +6115,11 @@ def make_embedding_sp(mesh, *, seq_len, vocab_per_rank=5120):
         table = embedding[0]
         if table.shape != (vocab_per_rank, 7168):
             raise ValueError("embedding table has wrong per-rank shape")
+        # One rank holds each token's row and the rest add zeros, so a BF16
+        # reduce-scatter is exact (and half the bytes of FP32).
         partial = jnp.where(
             matched[:, None], table[jnp.clip(local_ids, 0, vocab_per_rank - 1)], 0
-        ).astype(jnp.float32)
+        ).astype(jnp.bfloat16 if EMBED_BF16_REDUCE else jnp.float32)
         hidden = jax.lax.psum_scatter(
             partial, axis_name, scatter_dimension=0, tiled=True
         ).astype(jnp.bfloat16)
