@@ -83,8 +83,13 @@ class QSAIndexSchedule:
 
 
 def qsa_indexing(
-    causal_position_offset: int = 0, per_token_scores: bool = False
+    causal_position_offset: int = 0,
+    per_token_scores: bool = False,
+    table_expansion: tuple[int, int, int] = (1, 1, 0),
 ) -> StreamIndexComponents:
     return StreamIndexComponents(
-        BF16KeyReader(), QSAIndexSchedule(causal_position_offset), per_token_scores
+        BF16KeyReader(),
+        QSAIndexSchedule(causal_position_offset),
+        per_token_scores,
+        table_expansion,
     )

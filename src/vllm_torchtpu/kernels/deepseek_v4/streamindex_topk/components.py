@@ -47,3 +47,10 @@ class StreamIndexComponents:
     # for small blocks (speculative verify); the blocked prefill layout is
     # bypassed.
     per_token_scores: bool = False
+    # (expansion, stride, offset): each `page_indices` entry stands for
+    # `expansion` consecutive kernel pages; kernel page k of a sequence reads
+    # physical page entry[k // expansion] * stride + offset + k % expansion.
+    # A caller whose pages are runs inside larger storage pages passes the
+    # storage table instead of an expanded one, so the scalar-prefetched table
+    # is `expansion` times smaller. (1, 1, 0) is the plain table.
+    table_expansion: tuple[int, int, int] = (1, 1, 0)

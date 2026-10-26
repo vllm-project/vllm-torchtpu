@@ -253,7 +253,10 @@ def kernel(
     max_num_seqs = seq_lens_ref.shape[0]
     num_page_indices = page_indices_ref.shape[0]
 
-    pages_per_seq = num_page_indices // max_num_seqs
+    table_expansion = (1, 1, 0) if components is None else components.table_expansion
+    if seq_along_lane and table_expansion != (1, 1, 0):
+        raise ValueError("an expanded page table needs the HEAD_ALONG_SUBLANE layout")
+    pages_per_seq = num_page_indices // max_num_seqs * table_expansion[0]
 
     bkv_sz_per_kv_packing = bkv_p * page_size_per_kv_packing
     bkv_sz = bkv_p * page_size
@@ -366,6 +369,7 @@ def kernel(
             pages_per_seq=pages_per_seq,
             seq_batch_size=seq_batch_size,
             chunk_idx=chunk_idx,
+            table_expansion=table_expansion,
         )
     o_alloc = bref_override.StreamIndexOBufferedRef.output(
         spec=out_spec,
@@ -1347,7 +1351,9 @@ def streamindex_topk(
         page_size = page_size_per_kv_packing * (
             kv_packing if components is None else components.keys.packing
         )
-    pages_per_seq = page_indices.shape[0] // max_num_seqs
+    pages_per_seq = page_indices.shape[0] // max_num_seqs * (
+        1 if components is None else components.table_expansion[0]
+    )
 
     for bkv_p in num_kv_pages_per_blocks:
         bkv_sz = page_size * bkv_p

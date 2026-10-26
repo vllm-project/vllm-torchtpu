@@ -1044,6 +1044,15 @@ def select_blocks(
             # Room for the local table padded to the widest KV block.
             pages_per_query += max(256, kv_block, decode_kv_block) // rows
             chunk_size = min(len(query), decode_query_chunk_size(pages_per_query))
+        # VLLM_TPU_QSA_DECODE_POOL_PAGE_TABLE: hand StreamIndex the pool-page
+        # table and let its KV reader expand each entry into the page's
+        # kernel pages, so the scalar-prefetched table (and with it the query
+        # window) is not bounded by logical_pages x the table width.
+        pool_table = envs.VLLM_TPU_QSA_DECODE_POOL_PAGE_TABLE and shard is None
+        expansion = (1, 1, 0)
+        if pool_table:
+            chunk_size = min(len(query), decode_query_chunk_size(table.shape[1]))
+            expansion = (logical_pages, physical_pages, slot * logical_pages)
         return _select_shared_stream(
             query,
             starts,
@@ -1057,7 +1066,7 @@ def select_blocks(
                 jnp.full(q.shape[:2], q.shape[-1] ** -0.5, jnp.float32),
                 cache,
                 seq_lens,
-                expand_pages(pages).reshape(len(pages), -1),
+                pages if pool_table else expand_pages(pages).reshape(len(pages), -1),
                 cu,
                 # VLLM_TPU_QSA_INDEXER_MIXED_ONLY: every sequence through the
                 # mixed pass. With per-token scores it scores a 1-token request
@@ -1071,7 +1080,9 @@ def select_blocks(
                 num_queries_per_block=(1, query_block, query_block),
                 decode_req_batch_size=8 if len(q) >= 8 else 4,
                 enable_early_exit=True,
-                components=qsa_indexing(ratio - 1, per_token_scores=True),
+                components=qsa_indexing(
+                    ratio - 1, per_token_scores=True, table_expansion=expansion
+                ),
                 decode_passes=not mixed_only,
                 hoist_step_metadata=envs.VLLM_TPU_QSA_INDEXER_HOIST_META,
             ),

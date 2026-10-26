@@ -65,6 +65,9 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
     pages_per_seq: int = dataclasses.field(default=1, metadata=dict(static=True))
     seq_batch_size: int = dataclasses.field(default=1, metadata=dict(static=True))
     chunk_idx: int = dataclasses.field(default=0, metadata=dict(static=True))
+    table_expansion: tuple[int, int, int] = dataclasses.field(
+        default=(1, 1, 0), metadata=dict(static=True)
+    )
 
     @classmethod
     def create(  # pytype: disable=signature-mismatch
@@ -81,6 +84,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
         seq_batch_size: int,
         grid_rank: int = 1,
         chunk_idx: int = 0,
+        table_expansion: tuple[int, int, int] = (1, 1, 0),
     ):
         assert buffer_type == pltpu.BufferType.INPUT
         standard_ref = pltpu.BufferedRef.create(
@@ -98,6 +102,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
             pages_per_seq=pages_per_seq,
             seq_batch_size=seq_batch_size,
             chunk_idx=chunk_idx,
+            table_expansion=table_expansion,
             **{
                 f.name: getattr(standard_ref, f.name)
                 for f in dataclasses.fields(pltpu.BufferedRef)
@@ -118,6 +123,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
         seq_batch_size: int,
         grid_rank: int = 1,
         chunk_idx: int = 0,
+        table_expansion: tuple[int, int, int] = (1, 1, 0),
         **kwargs: Any,
     ):
         return cls.create(
@@ -133,7 +139,26 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
             seq_batch_size=seq_batch_size,
             grid_rank=grid_rank,
             chunk_idx=chunk_idx,
+            table_expansion=table_expansion,
         )
+
+    def page_id(self, page_indices_ref: jax.Ref, seq: Any, k: Any) -> Any:
+        """Physical page of kernel page ``k`` of sequence ``seq``.
+
+        With ``table_expansion == (expansion, stride, offset)`` each table
+        entry stands for ``expansion`` consecutive kernel pages: kernel page k
+        is ``entry[k // expansion] * stride + offset + k % expansion``
+        (``pages_per_seq`` counts kernel pages, a whole number of entries per
+        sequence). Out-of-range entries clamp to the last one.
+        """
+        expansion, stride, offset = self.table_expansion
+        last = page_indices_ref.shape[0] - 1
+        if expansion == 1:
+            return page_indices_ref[jnp.minimum(seq * self.pages_per_seq + k, last)]
+        entry = jnp.minimum(
+            seq * (self.pages_per_seq // expansion) + k // expansion, last
+        )
+        return page_indices_ref[entry] * stride + offset + k % expansion
 
     def copy_in(  # pytype: disable=attribute-error
         self,
@@ -165,13 +190,12 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
 
         for batch_idx in range(self.seq_batch_size):
             kv_p_start = bkv_idx * self.bkv_p
-            page_indices_offset = (
-                effective_seq_idx + batch_idx
-            ) * self.pages_per_seq + kv_p_start
             for i in range(self.bkv_p):
-                page_idx = jnp.minimum(page_indices_offset + i, num_page_indices - 1)
+                page = self.page_id(
+                    page_indices_ref, effective_seq_idx + batch_idx, kv_p_start + i
+                )
                 safe_page_offset = jnp.minimum(
-                    page_indices_ref[page_idx] * self.page_size_per_kv_packing,
+                    page * self.page_size_per_kv_packing,
                     jnp.maximum(0, max_hbm_pages - self.page_size_per_kv_packing),
                 )
                 pltpu.make_async_copy(
