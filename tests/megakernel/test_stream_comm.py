@@ -28,6 +28,7 @@ from jax.sharding import PartitionSpec as P
 
 from tests.megakernel.megakernel_fakes import TINY_TILES, FakeGeometry
 from vllm_torchtpu.megakernel import comm, planner, stream, vmem
+from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.ops import BF16, F32, I32, rnd
 from vllm_torchtpu.megakernel.spec import (
@@ -364,6 +365,34 @@ def test_allreduce_ring_modes_in_pallas(R: int, hier: int, rsag: bool):
         expected = rnd(expected + rnd(expected_one))
     for r in range(R):
         assert jnp.allclose(out_all[r, : ex.B], expected, atol=2e-1, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "R,hier,rsag,war,H,match",
+    [
+        (8, 0, True, 1, 512, "multiple of 128"),
+        (8, 0, True, 0, 512, "multiple of 128"),
+        (8, -1, False, 1, 1024, "unsupported all-reduce mode"),
+        (8, 99, False, 1, 1024, "unsupported all-reduce mode"),
+        (4, 1, False, 1, 1024, "unsupported all-reduce mode"),
+        (4, 2, False, 1, 1024, "unsupported all-reduce mode"),
+        (6, 3, False, 1, 1024, "unsupported all-reduce mode"),
+        (8, 2, False, 1, 128, "hier=2 requires HC2=64 divisible by 128"),
+    ],
+)
+def test_comm_params_rejects_invalid_config(
+    R: int, hier: int, rsag: bool, war: int, H: int, match: str
+):
+    """Verify comm_params raises MegakernelConfigError on invalid configs."""
+    tiles = dataclasses.replace(TINY_TILES, hier=hier, rsag=rsag, war=war, mb8=2)
+    ex = ExecSpec(B=4, T=1, R=R, ctx=128, tiles=tiles, interpret=True)
+    ms = ModelSpec(
+        "bad_comm",
+        config=FakeGeometry(L=2, H=H),
+        layer_type=LayerType("lt", slots=(_TwoTileModule(),)),
+    )
+    with pytest.raises(MegakernelConfigError, match=match):
+        vmem.build_scratch(ms, ex)
 
 
 def test_borrow_epool_rejected_inside_expert_stream():

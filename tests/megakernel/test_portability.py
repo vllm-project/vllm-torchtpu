@@ -22,6 +22,10 @@ from pathlib import Path
 from vllm_torchtpu import megakernel
 
 
+def _ln(node: ast.AST) -> int:
+    return int(getattr(node, "lineno", 0))
+
+
 def _derive_required_modules(
     root: Path, py_files: list[Path], rel_paths: set[str]
 ) -> set[str]:
@@ -90,7 +94,7 @@ def test_megakernel_portability_ast_guard():
                     else (func.attr if isinstance(func, ast.Attribute) else None)
                 )
                 assert func_name not in {"__import__", "import_module"}, (
-                    f"{rel}:{node.lineno} calls dynamic import '{func_name}'; "
+                    f"{rel}:{_ln(node)} calls dynamic import '{func_name}'; "
                     "use static relative imports within megakernel/."
                 )
                 continue
@@ -112,30 +116,30 @@ def test_megakernel_portability_ast_guard():
             if rel not in facade_allowlist and not rel.startswith("models/"):
                 for mod in modules:
                     assert mod != "models" and not mod.startswith("models."), (
-                        f"{rel}:{node.lineno} imports '{mod}'; core megakernel "
+                        f"{rel}:{_ln(node)} imports '{mod}'; core megakernel "
                         "modules must be model-agnostic and never import models/."
                     )
                 if not modules:
                     assert "models" not in imported_names, (
-                        f"{rel}:{node.lineno} imports 'models'; core megakernel "
+                        f"{rel}:{_ln(node)} imports 'models'; core megakernel "
                         "modules must be model-agnostic and never import models/."
                     )
 
             for mod in modules:
                 root = mod.split(".")[0]
                 assert root not in forbidden_roots, (
-                    f"{rel}:{node.lineno} imports forbidden module '{mod}'; "
+                    f"{rel}:{_ln(node)} imports forbidden module '{mod}'; "
                     "use relative imports and keep 0 vllm/torch dependencies."
                 )
                 if level == 0:
                     assert root in allowed_external_roots, (
-                        f"{rel}:{node.lineno} uses non-relative or disallowed import "
+                        f"{rel}:{_ln(node)} uses non-relative or disallowed import "
                         f"'{mod}'; internal megakernel imports must be relative and "
                         "external imports must be Python stdlib, jax, or numpy."
                     )
                 if mod == "jax._src" or mod.startswith("jax._src."):
                     assert rel in jax_src_allowlist, (
-                        f"{rel}:{node.lineno} imports private JAX API '{mod}', "
+                        f"{rel}:{_ln(node)} imports private JAX API '{mod}', "
                         f"which is restricted to allowlist {sorted(jax_src_allowlist)}."
                     )
 
@@ -185,9 +189,49 @@ def test_modules_do_not_import_experimental_code():
                     names = [mod] + [a.name for a in node.names]
             for name in names:
                 assert "experimental" not in name and "fused_pool_io" not in name, (
-                    f"modules/{rel}:{node.lineno} imports '{name}'; modules "
+                    f"modules/{rel}:{_ln(node)} imports '{name}'; modules "
                     "must reach fused pool I/O through fused_io_hook"
                 )
+
+
+def _assert_package_is_framework_free(pkg: str) -> None:
+    """`megakernel/<pkg>/` imports only stdlib, jax, numpy and core spec modules."""
+    pkg_root = Path(megakernel.__file__).resolve().parent / pkg
+    py_files = sorted(pkg_root.rglob("*.py"))
+    rel_paths = {p.relative_to(pkg_root).as_posix() for p in py_files}
+    required_modules = _derive_required_modules(pkg_root, py_files, rel_paths)
+    assert len(required_modules) > 1
+    assert required_modules <= rel_paths, required_modules - rel_paths
+    allowed_external_roots = sys.stdlib_module_names | {"jax", "numpy"}
+    allowed_core = {"ops", "errors", "spec", "module", "decls", "exec_spec"}
+    for path in py_files:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    root = alias.name.split(".")[0]
+                    assert root in allowed_external_roots, (
+                        f"{pkg}/{path.name}:{_ln(node)} imports '{alias.name}'"
+                    )
+            elif isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                if node.level == 0:
+                    assert mod.split(".")[0] in allowed_external_roots, (
+                        f"{pkg}/{path.name}:{_ln(node)} imports '{mod}'"
+                    )
+                elif node.level == 2:
+                    names = [mod] if mod else [a.name for a in node.names]
+                    for name in names:
+                        assert name.split(".")[0] in allowed_core, (
+                            f"{pkg}/{path.name}:{_ln(node)} imports '..{name}'; "
+                            f"{pkg}/ may only use {sorted(allowed_core)} from core "
+                            "(never models/, modules/, kernel or cache)"
+                        )
+                else:
+                    assert node.level == 1, (
+                        f"{pkg}/{path.name}:{_ln(node)} relative import level "
+                        f"{node.level} leaves the megakernel package"
+                    )
 
 
 def test_pool_package_is_framework_free():
@@ -198,39 +242,14 @@ def test_pool_package_is_framework_free():
     dependencies are `ops`, `errors`, `spec`, `module`, `decls`, `exec_spec`
     and its own modules.
     """
-    pool_root = Path(megakernel.__file__).resolve().parent / "pool"
-    py_files = sorted(pool_root.rglob("*.py"))
-    rel_paths = {p.relative_to(pool_root).as_posix() for p in py_files}
-    required_pool_modules = _derive_required_modules(pool_root, py_files, rel_paths)
-    assert len(required_pool_modules) > 1
-    assert required_pool_modules <= rel_paths, required_pool_modules - rel_paths
-    allowed_external_roots = sys.stdlib_module_names | {"jax", "numpy"}
-    allowed_core = {"ops", "errors", "spec", "module", "decls", "exec_spec"}
-    for path in py_files:
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    root = alias.name.split(".")[0]
-                    assert root in allowed_external_roots, (
-                        f"pool/{path.name}:{node.lineno} imports '{alias.name}'"
-                    )
-            elif isinstance(node, ast.ImportFrom):
-                mod = node.module or ""
-                if node.level == 0:
-                    assert mod.split(".")[0] in allowed_external_roots, (
-                        f"pool/{path.name}:{node.lineno} imports '{mod}'"
-                    )
-                elif node.level == 2:
-                    names = [mod] if mod else [a.name for a in node.names]
-                    for name in names:
-                        assert name.split(".")[0] in allowed_core, (
-                            f"pool/{path.name}:{node.lineno} imports '..{name}'; "
-                            f"pool/ may only use {sorted(allowed_core)} from core "
-                            "(never models/, modules/, kernel or cache)"
-                        )
-                else:
-                    assert node.level == 1, (
-                        f"pool/{path.name}:{node.lineno} relative import level "
-                        f"{node.level} leaves the megakernel package"
-                    )
+    _assert_package_is_framework_free("pool")
+
+
+def test_comm_package_is_framework_free():
+    """`megakernel/comm/` imports only stdlib, jax, numpy and core spec modules.
+
+    Collectives stay model-free and below the kernel builder: no `models/`,
+    `modules/`, `vmem`, `kernel` or cache imports, so any model or runtime can
+    reuse them.
+    """
+    _assert_package_is_framework_free("comm")

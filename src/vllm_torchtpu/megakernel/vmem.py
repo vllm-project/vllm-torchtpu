@@ -24,6 +24,7 @@ import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 from . import exec_spec, pool_alias
+from .comm.params import CommParams, comm_params, ring_scratch, stage_scratch
 from .errors import MegakernelConfigError
 from .exec_spec import ExecSpec
 from .ops import BF16, F32, FP8, rup
@@ -118,31 +119,6 @@ class StreamParams:
 
 
 @dataclass(frozen=True)
-class CommParams:
-    """Core all-reduce and inter-rank collective parameters."""
-
-    R: int
-    B: int
-    M: int
-    MR: int
-    MB: int
-    H: int
-    PR: int
-    PC: int
-    HPC: int
-    HIER: int
-    RSAG: bool
-    WAR: bool
-    AR_R: int
-    AR_C: int
-    CW: int
-    HC2: int
-    AR_ROUNDS: tuple[int, ...]
-    AR_PEERS: int
-    N_HIER3: int = 3
-
-
-@dataclass(frozen=True)
 class CorePlan:
     """Complete build-time plan combining `Plan`, `StreamParams`, and `CommParams`."""
 
@@ -231,7 +207,7 @@ def build_scratch(
     g = model_spec.config
     tiles = ex.resolve_tiles(g)
 
-    R, B, M, MR, MB = ex.R, ex.B, ex.M, ex.MR, ex.MB
+    B, MB = ex.B, ex.MB
     H, L = g.H, g.L
     PC = min(1024, H)
     assert H % PC == 0, (H, PC)
@@ -249,29 +225,7 @@ def build_scratch(
     NMIX = p.shared_widths["mix"]
     typed = bool(ex.interpret)
 
-    HIER = tiles.hier if R > 1 else 0
-    RSAG = tiles.rsag and R > 1 and HIER == 0
-    WAR = (
-        (ex.WIDE or MR * H <= PR * PC or (RSAG and (PC // R) % 128 != 0))
-        if tiles.war < 0
-        else bool(tiles.war)
-    )
-    AR_R = MR if WAR else PR
-    AR_C = H if WAR else PC
-    CW = AR_C // R
-    HC2 = AR_C // 2
-    N_HIER3 = max(1, R.bit_length() - 1)
-    assert not RSAG or CW % 128 == 0
-    assert HIER in (0, 1, 2, 3) and (
-        HIER == 0 or R == 8 or (HIER == 3 and R >= 2 and (R & (R - 1)) == 0)
-    )
-    assert HIER != 2 or HC2 % 128 == 0
-    AR_ROUNDS = (
-        tuple(range(N_HIER3))
-        if HIER == 3
-        else ((0, 1, 2) if HIER == 2 else ((0, 1) if (RSAG or HIER == 1) else (0,)))
-    )
-    AR_PEERS = 1 if HIER == 3 else (3 if HIER in (1, 2) else max(R - 1, 1))
+    cp = comm_params(ex, tiles, H, PR, PC)
 
     vshape = {k: (tk[k], kinds[k][1]) for k in kinds}
     vdtype = {k: kinds[k][2] for k in kinds}
@@ -291,47 +245,14 @@ def build_scratch(
         "ybuf": pltpu.VMEM((MB, NY), F32),
         "part": pltpu.VMEM((MB, H), F32),
         "mix": pltpu.VMEM((MB, NMIX), F32),
-        "send": pltpu.VMEM(
-            (N_HIER3, 2, AR_R, AR_C)
-            if HIER == 3
-            else (2, 2, AR_R, HC2)
-            if HIER == 2
-            else (2, R, AR_R, CW)
-            if RSAG
-            else (2, AR_R, AR_C),
-            BF16,
-        ),
-        "recv": pltpu.VMEM(
-            (N_HIER3, 2, 2, AR_R, AR_C)
-            if HIER == 3
-            else (2, 2, AR_R, HC2)
-            if HIER == 2
-            else (2, 2, AR_R, AR_C)
-            if HIER == 1
-            else (2, R, AR_R, CW)
-            if RSAG
-            else (2, R, AR_R, AR_C),
-            BF16,
-        ),
-        "ar_ssem": pltpu.SemaphoreType.DMA((len(AR_ROUNDS), 2, AR_PEERS)),
-        "ar_rsem": pltpu.SemaphoreType.DMA((len(AR_ROUNDS), 2, AR_PEERS)),
+        **ring_scratch(cp),
         "fn": pltpu.VMEM((1, H), F32),
         "fn_sem": pltpu.SemaphoreType.DMA(()),
     }
     if p.dynamic_kinds:
         scratch["esem"] = pltpu.SemaphoreType.DMA((NBE,))
 
-    if RSAG:
-        scratch["ag_send"] = pltpu.VMEM((2, AR_R, CW), BF16)
-        scratch["ag_recv"] = pltpu.VMEM((2, R, AR_R, CW), BF16)
-    elif HIER == 1:
-        scratch["ag_send"] = pltpu.VMEM((2, AR_R, AR_C), BF16)
-        scratch["ag_recv"] = pltpu.VMEM((2, 4, AR_R, AR_C), BF16)
-    elif HIER == 2:
-        scratch["ag_send"] = pltpu.VMEM((2, AR_R, HC2), BF16)
-        scratch["ag_recv"] = pltpu.VMEM((2, 4, AR_R, HC2), BF16)
-        scratch["s2_send"] = pltpu.VMEM((2, AR_R, HC2), BF16)
-        scratch["s2_recv"] = pltpu.VMEM((2, 2, AR_R, HC2), BF16)
+    scratch.update(stage_scratch(cp))
 
     phase_map: dict[str, str] = {k: "persistent" for k in scratch}
 
@@ -441,27 +362,6 @@ def build_scratch(
         dmm_unroll=tiles.dmm_unroll,
         dense_acc_pair=tiles.dense_acc_pair,
         rel_fetch=tiles.rel_fetch,
-    )
-    cp = CommParams(
-        R=R,
-        B=B,
-        M=M,
-        MR=MR,
-        MB=MB,
-        H=H,
-        PR=PR,
-        PC=PC,
-        HPC=HPC,
-        HIER=HIER,
-        RSAG=RSAG,
-        WAR=WAR,
-        AR_R=AR_R,
-        AR_C=AR_C,
-        CW=CW,
-        HC2=HC2,
-        AR_ROUNDS=AR_ROUNDS,
-        AR_PEERS=AR_PEERS,
-        N_HIER3=N_HIER3,
     )
     core_plan = CorePlan(
         plan=p,
