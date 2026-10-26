@@ -851,6 +851,8 @@ def export(
         "data_parallel_size": dp_size,
         **_emit_model_companion_files(cfg, output_dir),
     }
+    if cfg.speculative_config is not None:
+        serving_config["speculative_config"] = cfg.speculative_config
 
     metadata_doc: dict[str, Any] = {
         "format_version": 2,

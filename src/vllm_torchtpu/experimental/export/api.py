@@ -82,6 +82,8 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
         hf_checkpoint_dir: Optional path to the HuggingFace checkpoint directory
             containing tokenizer.json, generation_config.json, and safetensors
             headers.
+        speculative_config: Speculative decoding the runtime runs, recorded as
+            `serving_config.speculative_config` (vLLM's field names); None for none.
     """
 
     vocab_size: int = 151936
@@ -101,6 +103,7 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
     emit_byte_tokenizer: bool = False
     hf_checkpoint_dir: str | None = None
     uses_mrope: bool = False
+    speculative_config: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.emit_byte_tokenizer and self.vocab_size > 256:
