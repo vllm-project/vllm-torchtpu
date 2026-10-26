@@ -16,6 +16,7 @@
 # this module must be imported before any model is constructed.
 from vllm_torchtpu.layers.adapter import attention as attention
 from vllm_torchtpu.layers.adapter import linear as linear
+from vllm_torchtpu.layers.adapter.attention_backend import register_attention_backend
 from vllm_torchtpu.models.vllm import register_models
 from vllm_torchtpu.tokenizers import register_tokenizers
 
@@ -23,3 +24,11 @@ from vllm_torchtpu.tokenizers import register_tokenizers
 def register_layers() -> None:
     register_models()
     register_tokenizers()
+    # Let --attention-backend flywheel select the FlyWheel kernels. Both
+    # classes are named by path, so registering loads none of flywheel_tpu.
+    flywheel = "vllm_torchtpu.layers.adapter.flywheel_attention"
+    register_attention_backend(
+        "flywheel",
+        vllm_backend=f"{flywheel}.FlywheelPallasAttentionBackend",
+        attention=f"{flywheel}.FlywheelAttentionBackend",
+    )
