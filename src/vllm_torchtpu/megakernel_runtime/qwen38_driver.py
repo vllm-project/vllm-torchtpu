@@ -538,6 +538,8 @@ class Qwen38SegmentDriver:
         # compare the head-0 (layer 0) kernel against stock layer 0 on the same
         # input, the kernel reading a private copy of layer 0's state blocks.
         drv.h0check_left = _parse_int(raw, "h0check") or 0
+        # `h0rows=96`: h0check only steps of that many rows (e.g. the chunked path).
+        drv.h0rows = _parse_int(raw, "h0rows") or 0
         # `h0dump=1`: the first h0check step also writes each rank's operands, input,
         # private state snapshot, metadata, kernel output and stock stages to
         # $CDK_OUTPUT_DIR/h0dump/rank<r>.pt (offline reference replay).
@@ -1160,7 +1162,12 @@ class Qwen38SegmentDriver:
                     self.segx_left = 0
             return False, None
         if self.h0check_left > 0 or getattr(self, "h0check_done", False):
-            if self.h0check_left > 0 and getattr(runner, "warmup_done", False) and _real_traffic(kw):
+            if (
+                self.h0check_left > 0
+                and getattr(runner, "warmup_done", False)
+                and _real_traffic(kw)
+                and (not getattr(self, "h0rows", 0) or rows == self.h0rows)
+            ):
                 self.h0check_left -= 1
                 self.h0check_done = True
                 try:
