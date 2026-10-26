@@ -60,24 +60,75 @@ def _patch_vllm_compact_mamba_streaming_input() -> None:
 
 
 def _patch_vllm_hybrid_kv_load_failure_recovery() -> None:
-    """Backport hybrid KV cache load failure recovery from vLLM #50388.
+    """Backport hybrid KV cache load failure recovery and record failure stats.
 
     In vLLM <= 0.29.0 (prior to vLLM #50388),
     ``Scheduler._update_requests_with_invalid_blocks`` unpacks
     ``(req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)``, which
     raises ``ValueError: too many values to unpack (expected 1)`` whenever a
     hybrid model (multiple KV cache groups) encounters a failed KV load.
+    In vLLM >= 0.32.0, ``Scheduler._handle_invalid_blocks`` also raises
+    ``RuntimeError`` when ``len(self.kv_cache_config.kv_cache_groups) > 1``,
+    even though TPU KV cache groups share a single ``BlockPool`` with globally
+    unique block IDs.
+
+    Also notifies the active TPU KV connector via ``record_kv_load_failure``
+    on sync/async load errors and suppresses duplicate external prefix-cache
+    queries/hits when a failed async load is retried under ``recompute``.
     """
     from functools import wraps
 
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
     from vllm.v1.core.sched.scheduler import Scheduler
-
-    if Scheduler.__dict__.get("_tpu_hybrid_kv_load_failure_patch", False):
-        return
+    from vllm.v1.metrics.stats import PrefixCacheStats
+    from vllm.v1.request import RequestStatus
 
     original_update = getattr(Scheduler, "_update_requests_with_invalid_blocks", None)
-    if original_update is None:
+    if original_update is None or getattr(
+        original_update, "_tpu_hybrid_kv_load_failure_patch", False
+    ):
         return
+
+    def _resolve_kv_load_connector_target(scheduler, req_id: str):
+        connector = getattr(scheduler, "connector", None)
+        if connector is not None:
+            reqs_to_conn = getattr(connector, "_requests_to_connector", None)
+            children = getattr(connector, "_connectors", None)
+            if isinstance(reqs_to_conn, dict) and isinstance(children, (list, tuple)):
+                idx = reqs_to_conn.get(req_id)
+                if isinstance(idx, int) and 0 <= idx < len(children):
+                    child = children[idx]
+                    return child, type(child).__name__
+                if len(children) == 1:
+                    child = children[0]
+                    return child, type(child).__name__
+            return connector, type(connector).__name__
+        vllm_cfg = getattr(scheduler, "vllm_config", None)
+        ktc = getattr(vllm_cfg, "kv_transfer_config", None)
+        return None, str(getattr(ktc, "kv_connector", None) or "unknown")
+
+    def _record_scheduler_kv_load_failures(
+        scheduler, req_ids: set[str], *, is_async: bool
+    ) -> None:
+        if not req_ids:
+            return
+        recompute = bool(getattr(scheduler, "recompute_kv_load_failures", True))
+        policy = "recompute" if recompute else "fail"
+        requests_map = getattr(scheduler, "requests", None) or {}
+        root_connector = getattr(scheduler, "connector", None)
+        for req_id in req_ids:
+            target_conn, connector_name = _resolve_kv_load_connector_target(
+                scheduler, req_id
+            )
+            record_fn = getattr(target_conn, "record_kv_load_failure", None)
+            if record_fn is None and root_connector is not None:
+                record_fn = getattr(root_connector, "record_kv_load_failure", None)
+            if record_fn is not None:
+                record_fn(connector_name, policy)
+            if is_async and recompute:
+                req = requests_map.get(req_id)
+                if req is not None and getattr(req, "num_computed_tokens", None) == 0:
+                    req._tpu_kv_load_recompute_pending = True
 
     @wraps(original_update)
     def _hybrid_update_requests_with_invalid_blocks(
@@ -88,13 +139,17 @@ def _patch_vllm_hybrid_kv_load_failure_recovery() -> None:
         evict_blocks: bool = True,
     ) -> tuple[set[str], int, set[int]]:
         if len(self.kv_cache_config.kv_cache_groups) <= 1:
-            return original_update(
+            affected_req_ids, total_affected_tokens, blocks_to_evict = original_update(
                 self,
                 requests,
                 invalid_block_ids,
                 num_scheduled_tokens,
                 evict_blocks=evict_blocks,
             )
+            _record_scheduler_kv_load_failures(
+                self, affected_req_ids, is_async=not evict_blocks
+            )
+            return affected_req_ids, total_affected_tokens, blocks_to_evict
 
         affected_req_ids: set[str] = set()
         total_affected_tokens = 0
@@ -103,10 +158,12 @@ def _patch_vllm_hybrid_kv_load_failure_recovery() -> None:
         null_block_id = self.kv_cache_manager.block_pool.null_block.block_id
         for request in requests:
             req_id = request.request_id
-            req_block_ids_per_group = self.kv_cache_manager.get_block_ids(req_id)
             req_num_computed_tokens = (
                 request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
             )
+            if req_num_computed_tokens <= 0:
+                continue
+            req_block_ids_per_group = self.kv_cache_manager.get_block_ids(req_id)
             request_invalid_block_ids = {
                 block_id
                 for req_block_ids in req_block_ids_per_group
@@ -125,11 +182,195 @@ def _patch_vllm_hybrid_kv_load_failure_recovery() -> None:
                             if block_id != null_block_id
                         )
                 affected_req_ids.add(req_id)
+        _record_scheduler_kv_load_failures(
+            self, affected_req_ids, is_async=not evict_blocks
+        )
         return affected_req_ids, total_affected_tokens, blocks_to_evict
 
+    _hybrid_update_requests_with_invalid_blocks.__dict__[
+        "_tpu_hybrid_kv_load_failure_patch"
+    ] = True
     Scheduler._update_requests_with_invalid_blocks = (
         _hybrid_update_requests_with_invalid_blocks
     )
+
+    original_handle_invalid = getattr(Scheduler, "_handle_invalid_blocks", None)
+    if original_handle_invalid is not None and not getattr(
+        original_handle_invalid, "_tpu_hybrid_kv_load_failure_patch", False
+    ):
+
+        @wraps(original_handle_invalid)
+        def _hybrid_handle_invalid_blocks(
+            self,
+            invalid_block_ids: set[int],
+            num_scheduled_tokens: dict[str, int],
+        ) -> set[str]:
+            if len(self.kv_cache_config.kv_cache_groups) <= 1:
+                return original_handle_invalid(
+                    self, invalid_block_ids, num_scheduled_tokens
+                )
+
+            should_fail = not self.recompute_kv_load_failures
+            waiting_queue = getattr(self, "kv_holding_waiting", self.waiting)
+            async_load_reqs = (
+                req
+                for req in waiting_queue
+                if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+            )
+            async_failed_req_ids, num_failed_tokens, _ = (
+                self._update_requests_with_invalid_blocks(
+                    async_load_reqs,
+                    invalid_block_ids,
+                    num_scheduled_tokens,
+                    evict_blocks=False,
+                )
+            )
+            total_failed_requests = len(async_failed_req_ids)
+            total_failed_tokens = num_failed_tokens
+
+            sync_failed_req_ids, num_failed_tokens, sync_blocks_to_evict = (
+                self._update_requests_with_invalid_blocks(
+                    self.running,
+                    invalid_block_ids,
+                    num_scheduled_tokens,
+                    evict_blocks=True,
+                )
+            )
+            total_failed_requests += len(sync_failed_req_ids)
+            total_failed_tokens += num_failed_tokens
+
+            if not total_failed_requests:
+                return set()
+
+            if sync_blocks_to_evict and not self.recompute_kv_load_failures:
+                self.kv_cache_manager.evict_blocks(sync_blocks_to_evict)
+
+            if should_fail:
+                all_failed_req_ids = async_failed_req_ids | sync_failed_req_ids
+                logger.error(
+                    "Failing %d request(s) due to KV load failure "
+                    "(failure_policy=fail, %d tokens affected). Request IDs: %s",
+                    total_failed_requests,
+                    total_failed_tokens,
+                    all_failed_req_ids,
+                )
+                return all_failed_req_ids
+
+            logger.warning(
+                "Recovered from KV load failure: "
+                "%d request(s) rescheduled (%d tokens affected).",
+                total_failed_requests,
+                total_failed_tokens,
+            )
+            self.failed_recving_kv_req_ids |= async_failed_req_ids
+            return sync_failed_req_ids
+
+        _hybrid_handle_invalid_blocks.__dict__["_tpu_hybrid_kv_load_failure_patch"] = (
+            True
+        )
+        Scheduler._handle_invalid_blocks = _hybrid_handle_invalid_blocks
+
+    original_failed_recving = getattr(Scheduler, "_handle_failed_recving", None)
+    if original_failed_recving is not None and not getattr(
+        original_failed_recving, "_tpu_hybrid_kv_load_failure_patch", False
+    ):
+
+        @wraps(original_failed_recving)
+        def _handle_failed_recving(self, failed_req_ids: set[str]) -> set[str]:
+            affected_req_ids = {
+                req_id
+                for req_id in failed_req_ids
+                if (req := self.requests.get(req_id)) is not None
+                and req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+            }
+            result = original_failed_recving(self, failed_req_ids)
+            _record_scheduler_kv_load_failures(self, affected_req_ids, is_async=True)
+            return result
+
+        _handle_failed_recving.__dict__["_tpu_hybrid_kv_load_failure_patch"] = True
+        Scheduler._handle_failed_recving = _handle_failed_recving
+
+    original_get_local_hit = getattr(Scheduler, "_get_local_prefix_cache_hit", None)
+    if original_get_local_hit is not None and not getattr(
+        original_get_local_hit, "_tpu_hybrid_kv_load_failure_patch", False
+    ):
+
+        @wraps(original_get_local_hit)
+        def _get_local_prefix_cache_hit(self, request):
+            stats = getattr(self, "connector_prefix_cache_stats", None)
+            if stats is not None:
+                stats._tpu_recompute_retry_req = (
+                    request
+                    if getattr(request, "_tpu_kv_load_recompute_pending", False)
+                    else None
+                )
+            return original_get_local_hit(self, request)
+
+        _get_local_prefix_cache_hit.__dict__["_tpu_hybrid_kv_load_failure_patch"] = True
+        Scheduler._get_local_prefix_cache_hit = _get_local_prefix_cache_hit
+
+    original_schedule = getattr(Scheduler, "schedule", None)
+    if original_schedule is not None and not getattr(
+        original_schedule, "_tpu_hybrid_kv_load_failure_patch", False
+    ):
+
+        @wraps(original_schedule)
+        def _schedule(self, *args, **kwargs):
+            try:
+                return original_schedule(self, *args, **kwargs)
+            finally:
+                stats = getattr(self, "connector_prefix_cache_stats", None)
+                if stats is not None:
+                    stats._tpu_recompute_retry_req = None
+
+        _schedule.__dict__["_tpu_hybrid_kv_load_failure_patch"] = True
+        Scheduler.schedule = _schedule
+
+    original_pcs_record = getattr(PrefixCacheStats, "record", None)
+    if original_pcs_record is not None and not getattr(
+        original_pcs_record, "_tpu_hybrid_kv_load_failure_patch", False
+    ):
+
+        @wraps(original_pcs_record)
+        def _pcs_record(
+            self,
+            num_tokens: int,
+            num_hits: int,
+            preempted: bool,
+            hits_by_source=None,
+        ) -> None:
+            retry_req = getattr(self, "_tpu_recompute_retry_req", None)
+            if retry_req is not None:
+                self._tpu_recompute_retry_req = None
+                retry_req._tpu_kv_load_recompute_pending = False
+                return
+            original_pcs_record(
+                self,
+                num_tokens=num_tokens,
+                num_hits=num_hits,
+                preempted=preempted,
+                hits_by_source=hits_by_source,
+            )
+
+        _pcs_record.__dict__["_tpu_hybrid_kv_load_failure_patch"] = True
+        PrefixCacheStats.record = _pcs_record
+
+    original_km_record = getattr(KVCacheManager, "record_prefix_cache_stats", None)
+    if original_km_record is not None and not getattr(
+        original_km_record, "_tpu_hybrid_kv_load_failure_patch", False
+    ):
+
+        @wraps(original_km_record)
+        def _km_record_prefix_cache_stats(self, request, *args, **kwargs):
+            if getattr(request, "_tpu_kv_load_recompute_pending", False):
+                request._tpu_kv_load_recompute_pending = False
+            return original_km_record(self, request, *args, **kwargs)
+
+        _km_record_prefix_cache_stats.__dict__["_tpu_hybrid_kv_load_failure_patch"] = (
+            True
+        )
+        KVCacheManager.record_prefix_cache_stats = _km_record_prefix_cache_stats
+
     Scheduler._tpu_hybrid_kv_load_failure_patch = True
     logger.info(
         "Applied TPU patch: hybrid KV cache load failure recovery (vLLM #50388)."

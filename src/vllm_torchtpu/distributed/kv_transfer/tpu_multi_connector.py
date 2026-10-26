@@ -69,6 +69,42 @@ class TPUMultiConnector(MultiConnector):
             if fn is not None:
                 fn(runner)
 
+    @classmethod
+    def _get_connector_classes_and_configs(cls, vllm_config):
+        pairs = super()._get_connector_classes_and_configs(vllm_config)
+        parent_ktc = getattr(vllm_config, "kv_transfer_config", None)
+        parent_policy = (
+            getattr(parent_ktc, "kv_load_failure_policy", None)
+            if parent_ktc is not None
+            else None
+        )
+        if not parent_policy:
+            return pairs
+        extra = getattr(parent_ktc, "kv_connector_extra_config", None)
+        ktcs = extra.get("connectors", ()) if isinstance(extra, dict) else ()
+        for idx, (_connector_cls, temp_config) in enumerate(pairs):
+            raw_ktc = ktcs[idx] if idx < len(ktcs) else None
+            if not isinstance(raw_ktc, dict) or "kv_load_failure_policy" not in raw_ktc:
+                temp_config.kv_transfer_config.kv_load_failure_policy = parent_policy
+        return pairs
+
+    def record_kv_load_failure(
+        self, connector_name: str, policy: str, count: int = 1
+    ) -> None:
+        """Route a KV load failure count to the matching child connector."""
+        fallback = None
+        for c in self._connectors:
+            fn = getattr(c, "record_kv_load_failure", None)
+            if fn is None:
+                continue
+            if fallback is None:
+                fallback = fn
+            if type(c).__name__ == connector_name:
+                fn(connector_name, policy, count=count)
+                return
+        if fallback is not None:
+            fallback(connector_name, policy, count=count)
+
     def get_block_ids_with_load_errors_group_index(self) -> int | None:
         """Return the KV cache group shared by all children's load errors.
 

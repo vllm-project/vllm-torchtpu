@@ -44,6 +44,77 @@ METRIC_TYPE_GAUGE = "gauge"
 
 # Default fallback value for missing label dimensions
 DEFAULT_LABEL_VALUE = ""
+KV_LOAD_FAILURES_METRIC_NAME = "vllm:kv_load_failures"
+KV_LOAD_FAILURES_DOC = (
+    "Cumulative number of KV cache load failures from external KV connectors."
+)
+
+
+def get_or_create_kv_load_failures_counter(
+    counter_cls: type[PromMetricT],
+    labelnames: list[str],
+) -> PromMetricT:
+    """Create or reuse the ``vllm:kv_load_failures`` Prometheus Counter.
+
+    When ``MultiConnector`` / ``TPUMultiConnector`` builds Prometheus metrics
+    for multiple child connectors in the same process, each child's
+    ``KVConnectorPromMetrics`` shares the single registered collector.
+    """
+    full_labelnames = [*labelnames, "connector", "policy"]
+    if counter_cls is Counter:
+        from prometheus_client import REGISTRY
+
+        existing = REGISTRY._names_to_collectors.get(KV_LOAD_FAILURES_METRIC_NAME)
+        if existing is not None:
+            return cast(PromMetricT, existing)
+    try:
+        return counter_cls(
+            name=KV_LOAD_FAILURES_METRIC_NAME,
+            documentation=KV_LOAD_FAILURES_DOC,
+            labelnames=full_labelnames,
+        )
+    except ValueError:
+        from prometheus_client import REGISTRY
+
+        existing = REGISTRY._names_to_collectors.get(KV_LOAD_FAILURES_METRIC_NAME)
+        if existing is not None:
+            return cast(PromMetricT, existing)
+        raise
+
+
+def init_kv_load_failures_counter(
+    counter_cls: type[PromMetricT],
+    vllm_config: VllmConfig,
+    labelnames: list[str],
+    per_engine_labelvalues: dict[int, list[object]],
+    default_connector_name: str | None = None,
+) -> PromMetricT:
+    """Register ``vllm:kv_load_failures`` and pre-initialize 0-valued series."""
+    counter = get_or_create_kv_load_failures_counter(counter_cls, labelnames)
+    ktc = getattr(vllm_config, "kv_transfer_config", None)
+    raw_connector = getattr(ktc, "kv_connector", None) if ktc is not None else None
+    connector_name = (
+        raw_connector
+        if isinstance(raw_connector, str) and raw_connector
+        else default_connector_name
+    )
+    raw_policy = (
+        getattr(ktc, "kv_load_failure_policy", None) if ktc is not None else None
+    )
+    policy = raw_policy if isinstance(raw_policy, str) and raw_policy else "fail"
+    if (
+        connector_name
+        and hasattr(counter, "labels")
+        and isinstance(per_engine_labelvalues, dict)
+    ):
+        for engine_labels in per_engine_labelvalues.values():
+            if isinstance(engine_labels, (list, tuple)) and len(engine_labels) == len(
+                labelnames
+            ):
+                cast(Any, counter).labels(*engine_labels, connector_name, policy)
+    return counter
+
+
 RUNNER_TIMING_BUCKETS_SECONDS = (
     0.00001,
     0.000025,
@@ -100,6 +171,12 @@ class TpuKVConnectorStats(KVConnectorStats):
         """Record cached HBM blocks evicted to make room for new blocks."""
         self.data["num_evicted_blocks"].append(num_evicted_blocks)
 
+    def record_kv_load_failures(
+        self, connector: str, policy: str, count: int = 1
+    ) -> None:
+        """Record scheduler-observed KV load failures with connector and policy."""
+        self.data["kv_load_failures"].append((connector, policy, int(count)))
+
     def record_prefill_queue_length(self, prefill_queue_length: int):
         """Record the prefill (send) queue length."""
         self.data["prefill_queue_length"].append(prefill_queue_length)
@@ -125,6 +202,7 @@ class TpuKVConnectorStats(KVConnectorStats):
             "mb_transferred": [],
             "num_failed_transfers": [],
             "num_evicted_blocks": [],
+            "kv_load_failures": [],
             "prefill_queue_length": [],
             "decode_queue_length": [],
             "runner_cpu_issue_seconds": [],
@@ -308,6 +386,13 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         self.counter_tpu_num_failed_transfers = create_metric_per_engine(
             counter_tpu_num_failed_transfers, self.per_engine_labelvalues
         )
+        self.counter_kv_load_failures = init_kv_load_failures_counter(
+            self._counter_cls,
+            vllm_config,
+            labelnames,
+            self.per_engine_labelvalues,
+            default_connector_name="TPUConnector",
+        )
 
         # Not TPU-specific: named as in the HBM KV cache observability design.
         counter_kv_cache_evictions = self._counter_cls(
@@ -417,6 +502,11 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
             self.runner_device_elapsed.labels(*engine_labels, rank, stage).observe(
                 seconds
             )
+        for connector, policy, count in transfer_stats_data.get("kv_load_failures", []):
+            if count > 0:
+                self.counter_kv_load_failures.labels(
+                    *engine_labels, connector, policy
+                ).inc(count)
 
         for prom_obj, list_item_key in zip(
             [

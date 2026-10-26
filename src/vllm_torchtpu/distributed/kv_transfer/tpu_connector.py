@@ -988,19 +988,41 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         gpu_block_pool.get_new_blocks = get_new_blocks  # type: ignore[method-assign]
         gpu_block_pool._maybe_evict_cached_block = _maybe_evict_cached_block  # type: ignore[method-assign]
 
-    def _take_scheduler_stats(self) -> TpuKVConnectorStats | None:
-        """Drain the HBM block evictions counted since the last step.
+    def record_kv_load_failure(
+        self, connector_name: str, policy: str, count: int = 1
+    ) -> None:
+        """Record scheduler-observed KV load failures for this connector."""
+        if count <= 0:
+            return
+        failures: dict[tuple[str, str], int] = self.__dict__.setdefault(
+            "_scheduler_kv_load_failures", {}
+        )
+        key = (connector_name, policy)
+        failures[key] = failures.get(key, 0) + int(count)
 
-        `bind_gpu_block_pool` does the counting; vLLM merges scheduler-side
-        connector stats into the step's stats.
+    def _take_scheduler_stats(self) -> TpuKVConnectorStats | None:
+        """Drain scheduler-side KV connector stats accumulated since the last step.
+
+        `bind_gpu_block_pool` counts HBM block evictions and
+        `record_kv_load_failure` records KV load failures; vLLM merges
+        scheduler-side connector stats into the step's stats.
         """
         num_evicted_blocks = getattr(self, "_num_evicted_blocks", 0)
-        if not num_evicted_blocks:
+        failures: dict[tuple[str, str], int] | None = self.__dict__.get(
+            "_scheduler_kv_load_failures"
+        )
+        if not num_evicted_blocks and not failures:
             return None
-        self._num_evicted_blocks = 0
         stats = TpuKVConnectorStats()
-        stats.record_evicted_blocks(num_evicted_blocks)
-        return stats
+        if num_evicted_blocks:
+            self._num_evicted_blocks = 0
+            stats.record_evicted_blocks(num_evicted_blocks)
+        if failures:
+            for (connector_name, policy), count in failures.items():
+                if count > 0:
+                    stats.record_kv_load_failures(connector_name, policy, count)
+            failures.clear()
+        return stats if not stats.is_empty() else None
 
     @classmethod
     def build_kv_connector_stats(

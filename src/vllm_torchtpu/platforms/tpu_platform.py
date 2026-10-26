@@ -413,6 +413,7 @@ def _register_tpu_kv_connectors() -> None:
     from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 
     for name, module_path in (
+        ("TPUConnector", "vllm_torchtpu.distributed.kv_transfer.tpu_connector"),
         ("TPURaidenConnector", "vllm_torchtpu.distributed.kv_transfer.tpu_connector"),
         (
             "TPUMultiConnector",
@@ -420,7 +421,8 @@ def _register_tpu_kv_connectors() -> None:
         ),
         ("TPURaidenOffloadingConnector", "vllm_torchtpu.offload.raiden_connector"),
     ):
-        KVConnectorFactory.register_connector(name, module_path, name)
+        if name not in KVConnectorFactory._registry:
+            KVConnectorFactory.register_connector(name, module_path, name)
 
 
 class TpuPlatform(Platform):

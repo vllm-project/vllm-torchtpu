@@ -57,12 +57,20 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorPromMetrics,
+    PromMetric,
+    PromMetricT,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
     config as offloading_config_module,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadPromMetrics,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
@@ -80,11 +88,17 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     CanonicalKVCacheTensor,
     GPULoadStoreSpec,
+    OffloadingCounterMetadata,
     OffloadKey,
 )
 from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
+    KV_LOAD_FAILURES_DOC,
+    KV_LOAD_FAILURES_METRIC_NAME,
+    init_kv_load_failures_counter,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.offload.raiden_store import (
     AdmissionOp,
@@ -313,6 +327,47 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                     )
         super().update_connector_output(connector_output)
 
+    def record_kv_load_failure(
+        self, connector_name: str, policy: str, count: int = 1
+    ) -> None:
+        """Record scheduler-observed KV load failures into offloading stats."""
+        if count <= 0:
+            return
+        self._connector_stats.increase_counter(
+            KV_LOAD_FAILURES_METRIC_NAME,
+            int(count),
+            labelvalues=(connector_name, policy),
+        )
+
+
+class TpuOffloadPromMetrics(OffloadPromMetrics):
+    """Prometheus metrics for ``TPURaidenOffloadingConnector``."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ):
+        super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
+        self._offloading_metric_metadata[KV_LOAD_FAILURES_METRIC_NAME] = (
+            OffloadingCounterMetadata(
+                documentation=KV_LOAD_FAILURES_DOC,
+                labelnames=("connector", "policy"),
+            )
+        )
+        self.counter_kv_load_failures = init_kv_load_failures_counter(
+            self._counter_cls,
+            vllm_config,
+            labelnames,
+            per_engine_labelvalues,
+            default_connector_name="TPURaidenOffloadingConnector",
+        )
+        self._offloading_metric_defs[KV_LOAD_FAILURES_METRIC_NAME] = (
+            self.counter_kv_load_failures
+        )
+
 
 class TPURaidenOffloadingConnector(OffloadingConnector):
     """Top-level facade connector for the store-backed (V2) raiden KV offload path."""
@@ -423,6 +478,26 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         if self.connector_scheduler is not None:
             return self.connector_scheduler.take_events()
         return []
+
+    def record_kv_load_failure(
+        self, connector_name: str, policy: str, count: int = 1
+    ) -> None:
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.record_kv_load_failure(
+                connector_name, policy, count
+            )
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> KVConnectorPromMetrics:
+        return TpuOffloadPromMetrics(
+            vllm_config, metric_types, labelnames, per_engine_labelvalues
+        )
 
     # -- worker-side hooks -------------------------------------------------
     def register_kv_caches(
