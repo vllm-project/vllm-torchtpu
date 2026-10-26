@@ -6781,7 +6781,15 @@ class TPUModelRunner(GPUModelRunner):
 
     def _precompile_compute_selected_logits(self) -> None:
         hsize = self.model_config.get_hidden_size()
-        with self._precompile_timed("compute_selected_logits"):
+        # Serving calls this under execute_model's no_grad, and dynamo guards on
+        # grad mode: warmed outside it, every entry missed and each bucket
+        # recompiled on its first served step (~1 s each, ~130 per hour at c32).
+        grad = (
+            torch.no_grad()
+            if envs.VLLM_TPU_WARM_SPEC_LOGITS_LENGTHS
+            else contextlib.nullcontext()
+        )
+        with self._precompile_timed("compute_selected_logits"), grad:
             for num_tokens in self.num_tokens_paddings:
                 dummy_hidden = torch.zeros(
                     (num_tokens, hsize),
@@ -6796,6 +6804,37 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
                         break
+            # A spec-decode verify step samples final_logits_indices, whose
+            # length is padded with num_tokens_paddings up to
+            # max_num_reqs * (K + 1), not with num_reqs_paddings; with
+            # max_num_reqs below that bound those lengths were never warmed
+            # and compiled on first use while serving (~1 s each).
+            if (
+                self.speculative_config is not None
+                and envs.VLLM_TPU_WARM_SPEC_LOGITS_LENGTHS
+            ):
+                k = self.speculative_config.num_speculative_tokens
+                max_logits_len = _get_padded_token_len(
+                    self.num_tokens_paddings,
+                    min(self.max_num_reqs * (k + 1), self.num_tokens_paddings[-1]),
+                )
+                warmed = set(self.num_reqs_paddings)
+                for length in self.num_tokens_paddings:
+                    if length > max_logits_len or length in warmed:
+                        continue
+                    indices = torch.zeros(length, dtype=torch.int32).to(self.device)
+                    for num_tokens in self.num_tokens_paddings:
+                        if num_tokens < length:
+                            continue
+                        dummy_hidden = torch.zeros(
+                            (num_tokens, hsize),
+                            dtype=self._hidden_states_dtype,
+                        ).to(self.device)
+                        out = self.compute_selected_logits(dummy_hidden, indices)
+                        synchronize_tensors(out)
+                        logger.info(
+                            "  -- num_tokens: %d, logits rows: %d", num_tokens, length
+                        )
 
     def _precompile_compute_logits_from_hidden_states(self) -> None:
         hsize = self.model_config.get_hidden_size()
@@ -7004,7 +7043,13 @@ class TPUModelRunner(GPUModelRunner):
         # async eagle3 parks (max_num_reqs*(1+K); see sample_tokens) so the spec
         # substitute doesn't recompile per real num_reqs.
         next_lens = self._substitute_next_lens()
-        with self._precompile_timed("substitute_placeholder_token"):
+        # Served from execute_model's no_grad; dynamo guards on grad mode.
+        grad = (
+            torch.no_grad()
+            if envs.VLLM_TPU_WARM_SPEC_LOGITS_LENGTHS
+            else contextlib.nullcontext()
+        )
+        with self._precompile_timed("substitute_placeholder_token"), grad:
             for num_tokens in self.num_tokens_paddings:
                 input_ids = torch.zeros(num_tokens, dtype=torch.int32).to(self.device)
                 cur_input_indices = torch.zeros(num_tokens, dtype=torch.int32).to(

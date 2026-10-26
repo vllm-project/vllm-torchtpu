@@ -243,6 +243,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS: int = 33554432
     VLLM_TPU_SEGMENT_TOKENIZE_VERIFY: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
+    VLLM_TPU_WARM_SPEC_LOGITS_LENGTHS: bool = True
     VLLM_TPU_FUSED_ASYNC_DRAFT_SEED: bool = True
     VLLM_TPU_DEFER_PREV_RESULTS_WAIT: bool = False
     VLLM_TPU_LOG_POST_WARMUP_COMPILES: bool = False
@@ -1515,6 +1516,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   - EP-DP lockstep: run_dp_dummy_draft only replays the per-step
     #     collective trace.
     "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP"),
+    # Precompile compute_selected_logits under no_grad (as served) and at the
+    # spec-verify logits lengths (num_tokens_paddings up to
+    # max_num_reqs * (K + 1)). 0 restores the old warm-up.
+    "VLLM_TPU_WARM_SPEC_LOGITS_LENGTHS": env_bool(
+        "VLLM_TPU_WARM_SPEC_LOGITS_LENGTHS", default=True
+    ),
     # Log one WARNING per torch.compile compile after warmup (runner/compile_watch.py).
     "VLLM_TPU_LOG_POST_WARMUP_COMPILES": env_bool(
         "VLLM_TPU_LOG_POST_WARMUP_COMPILES", default=False
