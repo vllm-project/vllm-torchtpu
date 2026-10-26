@@ -251,7 +251,9 @@ def _topk_body(
                 peer_hist_vmem.at[pl.ds(0, p * NUM_BUCKETS)],
             )
 
-    def reduce_scan(bound, thresh=None):
+    # `plsc.parallel_loop(..., carry=)` returns the final carry, though its
+    # stubs type the decorated loop as returning None; the helpers below cast.
+    def reduce_scan(bound, thresh=None) -> tuple[jax.Array, jax.Array]:
         """glob = running bucket counts of the sum of the group's p histograms,
         chunk by chunk (the sum stays in registers); with `thresh`, also the
         number of buckets whose running count is <= thresh (`find_bucket`).
@@ -268,28 +270,37 @@ def _topk_body(
                 below = below + plsc.all_reduce_population_count(c <= thresh)[0]
             return c[LANES - 1], below
 
-        return plsc.parallel_loop(
-            0, bound, unroll=2, carry=(jnp.int32(0), jnp.int32(0))
-        )(body)  # pytype: disable=bad-argument-type
+        return cast(
+            tuple[jax.Array, jax.Array],
+            plsc.parallel_loop(0, bound, unroll=2, carry=(jnp.int32(0), jnp.int32(0)))(
+                body
+            ),  # pytype: disable=bad-argument-type
+        )
 
-    def scan_glob(bound):
+    def scan_glob(bound) -> jax.Array:
         def body(i, carry):
             c = plsc.cumsum(glob_vmem[pl.ds(i * LANES, LANES)]) + carry
             glob_vmem[pl.ds(i * LANES, LANES)] = c
             return c[LANES - 1]
 
-        return plsc.parallel_loop(0, bound, unroll=2, carry=jnp.int32(0))(
-            body
-        )  # pytype: disable=bad-argument-type
+        return cast(
+            jax.Array,
+            plsc.parallel_loop(0, bound, unroll=2, carry=jnp.int32(0))(
+                body
+            ),  # pytype: disable=bad-argument-type
+        )
 
-    def find_bucket(bound, thresh):
+    def find_bucket(bound, thresh) -> jax.Array:
         def body(i, cnt):
             below = glob_vmem[pl.ds(i * LANES, LANES)] <= thresh
             return cnt + plsc.all_reduce_population_count(below)[0]
 
-        return plsc.parallel_loop(0, bound, unroll=2, carry=jnp.int32(0))(
-            body
-        )  # pytype: disable=bad-argument-type
+        return cast(
+            jax.Array,
+            plsc.parallel_loop(0, bound, unroll=2, carry=jnp.int32(0))(
+                body
+            ),  # pytype: disable=bad-argument-type
+        )
 
     def _run_step(
         scores_vmem,
