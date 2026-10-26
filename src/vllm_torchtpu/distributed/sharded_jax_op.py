@@ -164,8 +164,14 @@ def sharded_jax_op(
     output_partition_specs: Any,
     donate_argnums: Sequence[int] | None = None,
     fake: Callable[..., object] | None = None,
+    register: bool = True,
 ):
     """A torch custom op for ``fn`` run as an SPMD program over ``mesh``.
+
+    ``register=False`` returns the underlying callable instead of registering an op,
+    for a caller that wraps it in its own op: a registered schema is capped at 64
+    arguments, and a caller with more operands passes them as ``Tensor[]`` lists to
+    its own op.
 
     ``input_partition_specs`` describe the *global* arrays the op is called
     with; the torch tensors passed in are this rank's shards and
@@ -229,6 +235,8 @@ def sharded_jax_op(
         **callable_kwargs,
     )
 
+    if not register:
+        return wrapped_fn
     op = torch.library.custom_op(name, wrapped_fn, mutates_args=())
 
     def fake_fn(*args, **kwargs):

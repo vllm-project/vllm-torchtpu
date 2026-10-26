@@ -74,6 +74,39 @@ def copy_mamba_state_blocks(
 copy_pool_blocks = copy_mamba_state_blocks
 
 
+def _stacked_copy_fn(
+    pool: jax.Array, src: jax.Array, dst: jax.Array
+) -> tuple[jax.Array, jax.Array]:
+    # [n_layers, num_blocks, *page] -> one [n_layers * num_blocks, *page] pool
+    # (a bitcast); each pair is mirrored on every layer's row.
+    n, nb = pool.shape[:2]
+    view = pool.reshape(n * nb, *pool.shape[2:])
+    off = (jnp.arange(n, dtype=src.dtype) * nb)[:, None]
+    new_view = pool_adapters.copy_blocks(
+        view, (src[None, :] + off).reshape(-1), (dst[None, :] + off).reshape(-1)
+    )
+    return new_view.reshape(pool.shape), src[0]
+
+
+_stacked_copy_op = pallas.jax_op(
+    "pallas::kv_stack_block_copy", _stacked_copy_fn, donate_argnums=(0,)
+)
+_stacked_copy_op.register_fake(_fake_copy)
+
+
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def copy_stacked_pool_blocks(
+    pools: list[torch.Tensor], src: torch.Tensor, dst: torch.Tensor
+) -> torch.Tensor | None:
+    """GLM5_MKD_STACK_C: `pool[l, dst[i]] = pool[l, src[i]]` for every layer
+    row `l` of every stacked `[n_layers, num_blocks, ...]` KV cache."""
+    marker = None
+    for pool in pools:
+        new_pool, marker = _stacked_copy_op(pool, src, dst)
+        pool.copy_(new_pool)
+    return marker
+
+
 def _copy_step_budget_bytes() -> int:
     """Returns the per-step VMEM byte budget for `copy_blocks`.
 
