@@ -460,9 +460,12 @@ class Eagle3Proposer:
 
         The draft's tokens then come from the vocab-parallel argmax
         (`LogitsProcessor.get_top_tokens`, patched by greedy_top_tokens), as
-        the target's do. The draft's head runs at the precision it holds. A
-        draft with a draft->target id map, or one the argmax cannot serve,
-        keeps compute_logits + argmax.
+        the target's do. The draft's head runs at the precision it holds,
+        which is the checkpoint's BF16 by default (the draft gets a BF16 copy
+        when the target's head is quantized in place; see
+        greedy_top_tokens.keep_bf16_head_for_draft). A draft with a
+        draft->target id map, or one the argmax cannot serve, keeps
+        compute_logits + argmax.
         """
         self._draft_greedy_head_owner = None
         draft_model = self.draft_model
