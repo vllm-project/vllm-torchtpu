@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import functools
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -72,6 +73,7 @@ def attention_block_table_width(
         "mamba_prefill_ckpt_offsets",
         "mamba_prefill_ckpt_indices",
         "pcp_metadata",
+        "backend_metadata",
     ],
     meta_fields=[
         "sequence_layout_kind",
@@ -132,6 +134,9 @@ class AttentionMetadata:
     mamba_prefill_ckpt_indices: jax.Array | torch.Tensor | None = None
     # PCP manager only (see `runner/pcp/manager.py`); None elsewhere.
     pcp_metadata: PcpMetadata | None = None
+    # The selected TPU attention backend's own metadata of this step and KV
+    # cache group (TPUAttentionBackend.prepare_step); None for RPA.
+    backend_metadata: Any = None
     sequence_layout_kind: str = SequenceLayoutKind.ALL.value
     sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
     sequence_layout_version: int = 1
@@ -183,6 +188,9 @@ class AttentionMetadataBuilderContext:
     sequence_layout_descriptor: SequenceLayoutDescriptor = (
         DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
     )
+    # The TPU attention backend's own metadata of this chunk, per attention KV
+    # cache group id (TPUAttentionBackend.prepare_step); None for RPA.
+    backend_metadata: Mapping[int, Any] | None = None
     # Per-chunk cache of the shared mamba row-offset plan, keyed by
     # (target_block_size, target_num_blocks) -> (state_index, ckpt_index,
     # ckpt_in_row). Valid only because every context is constructed fresh
@@ -679,6 +687,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             pcp_metadata=pcp_metadata,
             mamba_prefill_ckpt_offsets=mamba_prefill_ckpt_offsets,
             mamba_prefill_ckpt_indices=mamba_prefill_ckpt_indices,
+            backend_metadata=(ctx.backend_metadata or {}).get(self.kv_cache_group_id),
             sequence_layout_kind=ctx.sequence_layout_descriptor.kind.value,
             sequence_layout_protocol=(ctx.sequence_layout_descriptor.protocol),
             sequence_layout_version=ctx.sequence_layout_descriptor.version,
