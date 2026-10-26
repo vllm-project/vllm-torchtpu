@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from typing import Any
 
+from vllm_torchtpu import envs
+
 
 @dataclass(frozen=True)
 class PcpStaticConfig:
@@ -82,8 +84,13 @@ class PcpStaticSupportValidator:
         if not config.enabled:
             return config
 
+        if envs.USE_TPU_PCP_MANAGER:
+            from vllm_torchtpu.runner.pcp import validate_pcp_manager_config
+
+            validate_pcp_manager_config(vllm_config)
+            return config
         if config.dcp_size > 1:
-            raise NotImplementedError("PCP runner path does not support DCP yet.")
+            raise NotImplementedError("PCP with DCP requires USE_TPU_PCP_MANAGER=1.")
         if config.is_moe and not config.expert_parallel:
             raise NotImplementedError(
                 "PCP on an MoE model requires --enable-expert-parallel: "

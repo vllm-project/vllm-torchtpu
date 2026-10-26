@@ -87,6 +87,10 @@ from vllm_torchtpu.layers.adapter.cp_mla_attention import (
     project_uv_heads,
     weight_lse_partials,
 )
+from vllm_torchtpu.layers.adapter.pcp_kv_gather import (
+    is_pcp_kv_gather_metadata,
+    pcp_chunk_pages,
+)
 from vllm_torchtpu.layers.core.attention_interface import (
     attention,
     attention_bundled,
@@ -2084,16 +2088,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 "not replicated and both share a dtype (dcp=%d).",
                 self.dcp_size,
             )
+        pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
+        self.pcp_kv_gather = envs.USE_TPU_PCP_MANAGER and self.dcp_size > 1
+        self.pcp_size = pcp_size if self.pcp_kv_gather else 1
         if self.dcp_size > 1:
-            # The indexer refuses pcp>1 and dcp>1 together (see
-            # `VllmTPUSparseAttnIndexer.__init__`)
-            pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
-            if isinstance(pcp_size, int) and pcp_size > 1:
-                raise NotImplementedError(
-                    f"pcp_size={pcp_size} and dcp_size={self.dcp_size} are "
-                    "both >1; sparse MLA has one KV-position interleave, "
-                    "not two."
-                )
             if self.dcp_interleave_size % kv_cache_utils.WORD_BYTES:
                 raise ValueError(
                     "DCP sparse MLA needs --cp-kv-cache-interleave-size to be "
@@ -2812,6 +2810,242 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         return sparse_mla_dcp_impl
 
+    def _build_pcp_write_split_op(self, layer: Any):
+        """Write the split prefill rows; see `sparse_mla_pcp_write_split`."""
+        from vllm_torchtpu.layers.core.attention_interface import (
+            sparse_mla_pcp_write_split,
+        )
+
+        mesh = self._dcp_mesh
+        assert mesh is not None
+        dcp_size = self.dcp_size
+        pcp_size = self.pcp_size
+        interleave_size = self.dcp_interleave_size
+
+        def pcp_write_split_core(
+            kv_cache_nope: jax.Array,
+            kv_cache_rope: jax.Array,
+            kv_c_normed: jax.Array,
+            k_pe: jax.Array,
+            restore_idx: jax.Array,
+            split_seq_lens: jax.Array,
+            split_block_tables: jax.Array,
+            split_query_start_loc: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            nope_spec, rope_spec = layer.mla_kv_spec
+            return sparse_mla_pcp_write_split(
+                kv_cache_nope,
+                kv_cache_rope,
+                kv_c_normed,
+                k_pe,
+                restore_idx,
+                split_seq_lens,
+                split_block_tables,
+                split_query_start_loc,
+                mesh,
+                nope_spec,
+                rope_spec,
+                dcp_size=dcp_size,
+                pcp_size=pcp_size,
+                interleave_size=interleave_size,
+            )
+
+        sharded = P(DCP_AXIS_NAME)
+        replicated = P()
+        op_name = f"pallas::pcp_write_split_{layer.layer_name.replace('.', '_')}"
+        jax_op = pcp_streaming_jax_op(
+            op_name,
+            pcp_write_split_core,
+            donate_argnums=(0, 1),
+            mesh=mesh,
+            input_partition_specs=(
+                sharded,  # kv_cache_nope
+                sharded,  # kv_cache_rope
+                sharded,  # kv_c_normed: local rows
+                sharded,  # k_pe
+                replicated,  # restore_idx
+                replicated,  # split_seq_lens
+                replicated,  # split_block_tables
+                replicated,  # split_query_start_loc
+            ),
+            output_partition_specs=(sharded, sharded),
+        )
+
+        def _fake(kv_cache_nope, kv_cache_rope, *rest, **kwargs):
+            del rest, kwargs
+            return torch.empty_like(kv_cache_nope), torch.empty_like(kv_cache_rope)
+
+        jax_op.register_fake(_fake)
+
+        def pcp_write_split_impl(
+            kv_cache: tuple[torch.Tensor, torch.Tensor], *args: torch.Tensor
+        ) -> None:
+            nope_cache, rope_cache = kv_cache
+            new_nope, new_rope = jax_op(nope_cache, rope_cache, *args)
+            nope_cache.copy_(new_nope)
+            rope_cache.copy_(new_rope)
+
+        return pcp_write_split_impl
+
+    def _build_pcp_prefill_op(self, layer: Any):
+        """Split-prefill attention; see `sparse_mla_attention_pcp_prefill`."""
+        from vllm_torchtpu.layers.core.attention_interface import (
+            sparse_mla_attention_pcp_prefill,
+        )
+
+        mesh = self._dcp_mesh
+        assert mesh is not None
+        dcp_size = self.dcp_size
+        interleave_size = self.dcp_interleave_size
+        k_scale = None
+        if layer.kv_cache_quantized_dtype is not None:
+            _, k_scale, _ = self._get_kv_scales(layer)
+
+        def pcp_prefill_core(
+            kv_cache_nope: jax.Array,
+            kv_cache_rope: jax.Array,
+            ql_nope: jax.Array,
+            q_pe: jax.Array,
+            topk_indices: jax.Array,
+            split_block_tables: jax.Array,
+            ws_req: jax.Array,
+            ws_vpage: jax.Array,
+            ws_page_offset: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+            num_split_reqs: jax.Array,
+            ws_used_pages: jax.Array,
+        ) -> jax.Array:
+            nope_spec, rope_spec = layer.mla_kv_spec
+            return sparse_mla_attention_pcp_prefill(
+                kv_cache_nope,
+                kv_cache_rope,
+                ql_nope,
+                q_pe,
+                topk_indices,
+                split_block_tables,
+                ws_req,
+                ws_vpage,
+                ws_page_offset,
+                query_start_loc,
+                request_distribution,
+                num_split_reqs,
+                ws_used_pages,
+                mesh,
+                nope_spec,
+                rope_spec,
+                sm_scale=layer.scale,
+                k_scale=k_scale,
+                dcp_size=dcp_size,
+                interleave_size=interleave_size,
+                chunk_pages=pcp_chunk_pages(nope_spec.page_size, dcp_size),
+            )
+
+        sharded = P(DCP_AXIS_NAME)
+        replicated = P()
+        op_name = f"pallas::pcp_prefill_mla_{layer.layer_name.replace('.', '_')}"
+        jax_op = pcp_streaming_jax_op(
+            op_name,
+            pcp_prefill_core,
+            donate_argnums=None,
+            mesh=mesh,
+            input_partition_specs=(
+                sharded,  # kv_cache_nope
+                sharded,  # kv_cache_rope
+                sharded,  # ql_nope: this rank's local rows, TP head slice
+                sharded,  # q_pe
+                sharded,  # topk_indices: local rows, global positions
+                replicated,  # split_block_tables: [num_split_seqs, pages]
+                replicated,  # ws_req
+                replicated,  # ws_vpage
+                sharded,  # ws_page_offset: per local segment
+                sharded,  # query_start_loc: local
+                sharded,  # request_distribution: local
+                replicated,  # num_split_reqs
+                replicated,  # ws_used_pages
+            ),
+            output_partition_specs=(sharded,),  # output
+        )
+
+        def _fake(kv_cache_nope, kv_cache_rope, ql_nope, *rest, **kwargs):
+            del kv_cache_nope, kv_cache_rope, rest, kwargs
+            return torch.empty_like(ql_nope)
+
+        jax_op.register_fake(_fake)
+
+        def pcp_prefill_impl(
+            kv_cache: tuple[torch.Tensor, torch.Tensor], *args: torch.Tensor
+        ) -> torch.Tensor:
+            nope_cache, rope_cache = kv_cache
+            return jax_op(nope_cache, rope_cache, *args)
+
+        return pcp_prefill_impl
+
+    def _forward_pcp_kv_gather(
+        self,
+        layer: Any,
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor],
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        topk_indices: torch.Tensor,
+        md: Any,
+    ) -> torch.Tensor:
+        """PCP manager sparse MLA; see `pcp_kv_gather.py`.
+
+        `topk_indices` holds rank-local DCP cache indices for the decode rows
+        and global positions for the split prefill rows.
+        """
+        from vllm_torchtpu.layers.adapter import pcp_kv_gather as kvg
+
+        assert getattr(layer, "pcp_prefill_op", None) is not None, (
+            "PCP ops were never built; `process_weights_after_loading` must run first."
+        )
+        pcp = md.pcp_metadata
+        assert pcp is not None
+        # All cache writes precede all cache reads, so XLA never copies the
+        # cache: split rows, then the decode op (writes, then reads), then the
+        # read-only split prefill op.
+        layer.pcp_write_split_op(
+            kv_cache,
+            kv_c_normed,
+            k_pe,
+            pcp.hidden_restore_idx,
+            pcp.split_seq_lens,
+            pcp.split_block_tables,
+            pcp.split_query_start_loc,
+        )
+        partial, lse = layer.sparse_mla_dcp_op(
+            kv_cache,
+            all_gather_heads(kvg.take_decode_rows(ql_nope, md)),
+            all_gather_heads(kvg.take_decode_rows(q_pe, md)),
+            kvg.take_decode_rows(kv_c_normed, md),
+            kvg.take_decode_rows(k_pe, md),
+            kvg.take_decode_rows(topk_indices, md),
+            pcp.rep_seq_lens,
+            pcp.rep_block_tables,
+            pcp.rep_query_start_loc,
+            pcp.rep_request_distribution,
+        )
+        decode_out = merge_lse_partials_scatter_heads(partial, lse)
+
+        prefill_out = layer.pcp_prefill_op(
+            kv_cache,
+            ql_nope,
+            q_pe,
+            topk_indices,
+            pcp.split_block_tables.view(pcp.split_seq_lens.shape[0], -1),
+            pcp.ws_req,
+            pcp.ws_vpage,
+            pcp.ws_page_offset,
+            md.query_start_loc,
+            md.request_distribution,
+            pcp.num_split_reqs,
+            pcp.ws_used_pages,
+        )
+        return kvg.merge_decode_rows(prefill_out, decode_out, md)
+
     def forward(
         self,
         layer: Any,
@@ -2923,7 +3157,23 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 "sparse MLA layers use a native (nope, rope) split "
                 f"cache; got {type(kv_cache)}"
             )
-            if self.dcp_size > 1:
+            if self.pcp_kv_gather and is_pcp_kv_gather_metadata(attn_metadata):
+                local_topk_indices = topk_indices[: ql_nope_flat.shape[0]]
+                if use_qrep:
+                    raise NotImplementedError(
+                        "The PCP manager needs --no-dcp-q-replicate."
+                    )
+                outputs = self._forward_pcp_kv_gather(
+                    layer,
+                    kv_cache,
+                    ql_nope_flat,
+                    q_pe_flat,
+                    kv_c_normed_flat,
+                    k_pe_flat,
+                    local_topk_indices,
+                    attn_metadata,
+                )
+            elif self.dcp_size > 1:
                 assert getattr(layer, "sparse_mla_dcp_op", None) is not None, (
                     "DCP sparse MLA op was never built; "
                     "`process_weights_after_loading` must run first."

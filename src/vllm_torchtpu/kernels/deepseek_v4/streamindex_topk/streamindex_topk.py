@@ -1110,10 +1110,12 @@ def indexer_kv_layout(
         from vllm_torchtpu import envs
 
         raiden_glm_admission = envs.use_raiden_glm_admission()
+        pcp_manager = envs.USE_TPU_PCP_MANAGER
         explicit_env = envs.is_indexer_kv_cache_mode_explicit()
         env_mode = envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
     except ImportError:
         raiden_glm_admission = False
+        pcp_manager = False
         explicit_env = False
         env_mode = DEFAULT_INDEXER_KV_CACHE_MODE
 
@@ -1149,6 +1151,26 @@ def indexer_kv_layout(
                     "HEAD_ALONG_SUBLANE layout for dsa.idx); falling back to "
                     "HEAD_ALONG_SUBLANE layout with 'has' writer. Set "
                     "VLLM_TPU_INDEXER_KV_CACHE_MODE=has to silence this warning.",
+                )
+            return KVLayout.HEAD_ALONG_SUBLANE
+        if pcp_manager:
+            # The PCP manager's split prefills write and gather the indexer K
+            # cache as packed rows (`pcp_workspace.position_ordered`).
+            if explicit_mode:
+                raise ValueError(
+                    "VLLM_TPU_INDEXER_KV_CACHE_MODE='sal' is not supported with "
+                    "USE_TPU_PCP_MANAGER=1, which requires the HEAD_ALONG_SUBLANE "
+                    "indexer K layout. Set VLLM_TPU_INDEXER_KV_CACHE_MODE=has (or "
+                    "unset it to allow automatic fallback)."
+                )
+            key = (resolved, "pcp_manager")
+            if key not in _INDEXER_KV_LAYOUT_FALLBACK_LOGGED:
+                _INDEXER_KV_LAYOUT_FALLBACK_LOGGED.add(key)
+                logger.warning(
+                    "Default VLLM_TPU_INDEXER_KV_CACHE_MODE='sal' is not supported "
+                    "with USE_TPU_PCP_MANAGER=1; falling back to HEAD_ALONG_SUBLANE "
+                    "layout with 'has' writer. Set VLLM_TPU_INDEXER_KV_CACHE_MODE=has "
+                    "to silence this warning.",
                 )
             return KVLayout.HEAD_ALONG_SUBLANE
         if block_size < 128 or block_size % 128 != 0:
