@@ -1200,12 +1200,18 @@ class Qwen38SegmentDriver:
                     self.segx_left = 0
             return False, None
         if self.h0check_left > 0 or getattr(self, "h0check_done", False):
-            if (
-                self.h0check_left > 0
-                and getattr(runner, "warmup_done", False)
-                and _real_traffic(kw)
-                and (not getattr(self, "h0rows", 0) or rows == self.h0rows)
-            ):
+            warm, real = bool(getattr(runner, "warmup_done", False)), _real_traffic(kw)
+            want = not getattr(self, "h0rows", 0) or rows == self.h0rows
+            seen = self.__dict__.setdefault("_h0_gate_seen", set())
+            if self.h0check_left > 0 and (rows, warm, real) not in seen:
+                # A check that silently never fires looks like a clean pass: log
+                # each (rows, warmup_done, real traffic) gate state once.
+                seen.add((rows, warm, real))
+                logger.info(
+                    "qwen38 h0check gate: rows=%d n_req=%d warmup_done=%s real_traffic=%s rows_wanted=%s left=%d",
+                    rows, n_req, warm, real, want, self.h0check_left,
+                )
+            if self.h0check_left > 0 and warm and real and want:
                 self.h0check_left -= 1
                 self.h0check_done = True
                 try:
