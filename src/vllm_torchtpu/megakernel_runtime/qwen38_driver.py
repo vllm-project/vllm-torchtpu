@@ -839,7 +839,10 @@ class Qwen38SegmentDriver:
             for i in ids:
                 layers[i] = _cpu_proxy(runner.model.model.layers[i])
             proxy = types.SimpleNamespace(model=types.SimpleNamespace(layers=layers))
-            ref = pack_segment_operands(proxy, self.g, -1, spec, ex, layer_ids=ids, head=head)
+            ref = pack_segment_operands(
+                proxy, self.g, -1, spec, ex, layer_ids=ids, head=head,
+                boundary=bool(envs.VLLM_TPU_MK_OWN_OPERANDS),
+            )
             for n, a, b in zip(names, w, ref):
                 a = a.detach().cpu()
                 if tuple(a.shape) != tuple(b.shape):
@@ -1012,7 +1015,10 @@ class Qwen38SegmentDriver:
                         for k, j in enumerate(ids):
                             head = k > 0
                             spec = qwen38.segment_spec(self.g, R, L=1, head=head)
-                            wj = pack_segment_operands(runner.model, self.g, -1, spec, ex, layer_ids=[j], head=head)
+                            wj = pack_segment_operands(
+                                runner.model, self.g, -1, spec, ex, layer_ids=[j], head=head,
+                                boundary=bool(envs.VLLM_TPU_MK_OWN_OPERANDS),
+                            )
                             out_j = self._mk_run(1, head, wj, ins[k], att if k == 0 else None, snaps[k - 1] if head else [])
                             ref_j = ins[k + 1] if k + 1 < len(ids) else st
                             logger.info(
