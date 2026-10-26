@@ -117,6 +117,46 @@ def test_v2_matches_its_default_build_bit_for_bit(setup, m, hot):
     assert rel < 7e-2, rel
 
 
+@pytest.mark.parametrize("m,hot", [(256, False), (1024, True)])
+def test_sum_overlap_adds_match_the_serial_sum_bit_for_bit(setup, m, hot):
+    """TPU_MOE_PREFILL_SUM_IN_KERNEL_OVERLAP_ADDS moves each tile's row adds into
+    the next tile's gate/up K-tiles; every token still gets the same rows added in
+    the same order."""
+    weights, mesh = setup
+    assert v2.sum_columns(m, H, INTER, INTER_S) == H
+    x = jax.random.normal(jax.random.key(m + 2), (m, H)).astype(jnp.bfloat16)
+    tw, ti = _routing(m, m + 2, hot)
+
+    def body(**kw):
+        def f(x, tw, ti, *w):
+            w1, w2, w1s, w2s, sw1, sw1s, sw2, sw2s = w
+            return v2.fused_moe_prefill(
+                x,
+                w1,
+                w2,
+                w1s,
+                w2s,
+                sw1,
+                sw1s,
+                sw2,
+                sw2s,
+                None,
+                tw,
+                ti,
+                axis_name="d",
+                routed_scale=ROUTED_SCALE,
+                sum_in_kernel_max_tokens=m,
+                **v2.STAGE_A,
+                **kw,
+            )
+
+        return f
+
+    serial = _run(mesh, body(), x, tw, ti, *weights)
+    overlapped = _run(mesh, body(sum_overlap_adds=True), x, tw, ti, *weights)
+    np.testing.assert_array_equal(np.asarray(overlapped), np.asarray(serial))
+
+
 @pytest.mark.parametrize("m", [512, 4096])
 def test_norm_quant_moe_feeds_stage_a_bit_for_bit(setup, m):
     """TPU_FUSED_ADD_RMSNORM_QUANT_MOE: the norm's (x_q, x_scale) are the
