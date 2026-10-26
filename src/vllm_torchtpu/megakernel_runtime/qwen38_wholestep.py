@@ -149,6 +149,13 @@ class Qwen38WholeStep(nn.Module):
 
     def bind_pool(self, pool: torch.Tensor, layout: Any) -> None:
         self.pool = pool
+        # Union stats land here inside the compiled call (in place, like the pool); the driver
+        # reads them outside it (`log_union_stats`). Room for the largest bucket's requests.
+        self.union_stats = (
+            torch.zeros((self.mesh.size * len(self.qsa_ids), max(self.buckets) // T_VERIFY, 1, 128),
+                        dtype=torch.int32, device=pool.device)
+            if union_stats_on() else None
+        )
         self.kind = _WholeKind(
             self.mesh, self.g, layout,
             [qsa_layer_cache(self.layers[i].self_attn) for i in self.qsa_ids],
@@ -189,19 +196,21 @@ class Qwen38WholeStep(nn.Module):
         outs = self.kind.op(hidden, args)
         res, pool = outs[0], outs[1]
         self.pool.copy_(pool)
-        if len(outs) > 2:
-            self._log_union_stats(outs[2])
+        if len(outs) > 2 and self.union_stats is not None:
+            # Python control flow or a host read here would be traced into the compiled
+            # program (w06g j-b1a76c09: ShapeSpecializationError at bucket 32); only copy.
+            self.union_stats.zero_()
+            self.union_stats[:, : outs[2].shape[1]].copy_(outs[2])
         return res
 
-    def _log_union_stats(self, stats: torch.Tensor) -> None:
-        """Every `wholestats=N` calls: how much a request's verify rows share (rank 0's rows;
-        the selection is replicated). Reading the small tensor syncs that one step only."""
-        from .qwen38_wholestep_call import UNION_STATS_EVERY
-
-        self._stat_calls = getattr(self, "_stat_calls", 0) + 1
-        if self._stat_calls % UNION_STATS_EVERY:
+    def log_union_stats(self, calls: int) -> None:
+        """How much a request's verify rows share (rank 0's rows; the selection is replicated),
+        from the last whole-step call. Called by the driver outside the compiled program; the
+        host read syncs that one step only."""
+        if self.union_stats is None:
             return
-        s = stats[: len(self.qsa_ids), :, 0, :4].to("cpu").to(torch.int64)
+        self._stat_calls = calls
+        s = self.union_stats[: len(self.qsa_ids), :, 0, :4].to("cpu").to(torch.int64)
         union, total, mx, rows = s[..., 0], s[..., 1], s[..., 2], s[..., 3]
         live = (union > 0) & (rows > 1)
         if not bool(live.any()):

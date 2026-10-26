@@ -1163,6 +1163,7 @@ class Qwen38SegmentDriver:
                 hold=self.whole_hold,
             )
             whole.bind_pool(self.segments.pool, self.segments.layout)
+            self.whole_module = whole
             with self._contexts(runner, "model_mk_whole"):
                 self.whole_program = Qwen4ExpWholeStepModel(
                     vllm_config=self.whole_cfg,
@@ -1393,6 +1394,10 @@ class Qwen38SegmentDriver:
                 self._note(f"whole_b{rows}")
                 with self._contexts(runner, "model_mk_whole"):
                     out = self.whole_program(input_ids=input_ids, positions=positions, **kw)
+                from . import qwen38_wholestep_call as wsc
+
+                if wsc.union_stats_on() and self.whole_calls % wsc.UNION_STATS_EVERY == 0:
+                    self.whole_module.log_union_stats(self.whole_calls)
             else:
                 with self._serve_contexts(runner):
                     out = self.program(input_ids=input_ids, positions=positions, **kw)
