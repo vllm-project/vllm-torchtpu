@@ -21,6 +21,18 @@ single TPU v7x chip using the canonical 2-step 512x768x25 request (24 fps,
    non-silent stereo 24 kHz audio (24,240 samples per channel).
 2. ``test_ltx2_seed_determinism_tpu``: verifies bitwise-identical video and
    audio across repeated runs with seed 42 and divergence against seed 43.
+3. ``test_ltx2_golden_answer_tpu``: compares video and audio with a CPU fp32
+   diffusers golden (``ltx2_t2v_full_default_cpu_golden.npz`` in
+   ``$LTX2_GOLDEN_DIR``, default ``$HF_HOME/golden/ltx2``) using the limits in
+   ``LTX2_GOLDEN_LIMITS``. The golden reproduces the TPU trajectory: the same
+   bf16 initial noise drawn by vllm-omni, vllm-omni's sigmas, the same 4-pass
+   guidance (STG at block 29) and negative prompt. Audio is checked by
+   log-spectrogram L1 and RMS ratio only: bf16 alone moves the 2-step waveform
+   by rel-L2 ~1.0 (CPU bf16 vs CPU fp32), as much as TPU does.
+   Regenerate the golden with the out-of-repo generate_ltx2_golden.py:
+   ``python generate_ltx2_golden.py --model-dir <Lightricks/LTX-2 dir>
+   --out-dir <dir> --runs ltx2_t2v_full_default`` (CPU, ~170 GB RAM, ~5 min on
+   64 cores).
 
 Measured on TPU v7x (``j-50558160-e001-496d-a3cf``, 158.69s total for module,
 well within the 1800s CI Nightly per-test timeout):
@@ -44,7 +56,9 @@ pytest.importorskip("vllm_omni", reason="vllm_omni is required for LTX-2 tests")
 
 from tests_omni.conftest import OmniRunner
 from tests_omni.models.ltx2.utils import (
+    LTX2_GOLDEN_EXTRA_ARGS,
     LTX2_PROMPT,
+    assert_ltx2_golden_parity,
     build_ltx2_request,
     extract_ltx2_outputs,
     get_ltx2_model,
@@ -131,3 +145,20 @@ def test_ltx2_seed_determinism_tpu(
     assert not np.array_equal(out_42_a.audio, out_43.audio), (
         "Different seeds (42 vs 43) must produce different audio outputs"
     )
+
+
+@pytest.mark.parametrize(
+    "omni_runner",
+    [get_ltx2_model()],
+    indirect=True,
+)
+def test_ltx2_golden_answer_tpu(omni_runner: OmniRunner) -> None:
+    """Compare TPU v7x video and audio with the CPU fp32 diffusers golden."""
+    out = extract_ltx2_outputs(
+        list(
+            omni_runner.generate(
+                LTX2_PROMPT, build_ltx2_request(extra_args=LTX2_GOLDEN_EXTRA_ARGS)
+            )
+        )
+    )
+    assert_ltx2_golden_parity(out)
