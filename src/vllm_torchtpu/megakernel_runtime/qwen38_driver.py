@@ -168,6 +168,35 @@ NO_DONATE = False
 _UNSET = object()
 
 
+class _StackedContexts:
+    """Enter the given context factories in order, exit in reverse (an ExitStack
+    with nothing to resolve per use)."""
+
+    __slots__ = ("_factories", "_entered")
+
+    def __init__(self, factories: tuple) -> None:
+        self._factories = factories
+        self._entered: list = []
+
+    def __enter__(self) -> None:
+        try:
+            for make in self._factories:
+                cm = make()
+                cm.__enter__()
+                self._entered.append(cm)
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    def __exit__(self, *exc: Any) -> bool:
+        suppressed = False
+        while self._entered:
+            cm = self._entered.pop()
+            if cm.__exit__(*(exc if not suppressed else (None, None, None))):
+                suppressed = True
+        return suppressed
+
+
 def _vllm_env_override(**values: Any) -> Any:
     """Override `vllm.envs` attributes inside the context.
 
@@ -660,11 +689,34 @@ class Qwen38SegmentDriver:
             )
         return stack
 
+    def _serve_contexts(self, runner: Any) -> Any:
+        """`_contexts(runner, "model_mk_segments")` for the per-step call, without
+        the per-step imports, attribute lookups and ExitStack: the three context
+        factories and their arguments are resolved once. Still entered and exited
+        around every call, so nothing leaks into the stock path."""
+        fast = getattr(self, "_serve_ctx", None)
+        if fast is None or getattr(self, "noaot", False):
+            return self._contexts(runner, "model_mk_segments")
+        return _StackedContexts(fast)
+
     def bind_and_warmup(self, runner: Any) -> None:
         from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpSegmentModel
 
         self.segments.bind_pool()
         self.cfg = self._segment_config(runner)
+        from vllm.compilation.backends import set_model_tag
+        from vllm.config import set_current_vllm_config
+
+        from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+            set_vllm_model_wrapper_context,
+        )
+
+        cfg, mesh = self.cfg, runner.mesh
+        self._serve_ctx = (
+            lambda: set_model_tag("model_mk_segments"),
+            lambda: set_vllm_model_wrapper_context(mesh=mesh, vllm_config=cfg),
+            lambda: set_current_vllm_config(cfg),
+        )
         with self._contexts(runner, "model_mk_segments"):
             self.program = Qwen4ExpSegmentModel(
                 vllm_config=self.cfg,
@@ -1188,7 +1240,8 @@ class Qwen38SegmentDriver:
             )
             if self.mk_calls <= 2:
                 self._log_gdn_meta()
-        kw = dict(model_kwargs or {})
+        # Read-only below: no per-step copy.
+        kw = model_kwargs if model_kwargs is not None else {}
         if self.segx_left > 0 or getattr(self, "segx_done", False):
             if self.segx_left > 0 and getattr(runner, "warmup_done", False) and _real_traffic(kw):
                 self.segx_left -= 1
@@ -1227,7 +1280,7 @@ class Qwen38SegmentDriver:
             if self.check_left > 0 and self.shadow is not None:
                 out = self._shadow_step(runner, input_ids, positions, kw)
             else:
-                with self._contexts(runner, "model_mk_segments"):
+                with self._serve_contexts(runner):
                     out = self.program(input_ids=input_ids, positions=positions, **kw)
         except Exception:
             # Fail closed: one failure disables the megakernel for this server;
