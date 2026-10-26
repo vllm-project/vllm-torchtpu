@@ -37,6 +37,8 @@ from typing import Any
 
 import torch
 
+MODEL_AXIS_NAME = "model"
+
 
 @dataclass(frozen=True)
 class CpGroupLayout:
