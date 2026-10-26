@@ -41,6 +41,8 @@ GROUP = 4  # compress ratio
 
 
 def _fit(x: Any, n: int) -> Any:
+    """Rows (requests / positions) padded or cropped to the kernel's static count. Cropping only
+    drops padding rows: the driver calls the kernel for steps whose requests fit its bucket."""
     x = x[:n]
     if x.shape[0] < n:
         x = jnp.pad(x, ((0, n - x.shape[0]),) + ((0, 0),) * (x.ndim - 1))
@@ -87,15 +89,25 @@ def qsa_step_inputs(
     lens = jnp.where(live[:, None], ctx[:, None] + t[None] + 1, 0).reshape(M)
     cpp = carrier_pages_per_block(pool)
     n_ck = max_groups // (128 // GROUP)
+    # Carrier (kernel) pages per block-table column: a pool block of `pool.shape[1]` tokens
+    # holds `pool.shape[1] // 128` pages of 32 groups for this layer, at `slot * that` within
+    # the block's `cpp` physical pages (`pooled_qsa.select_blocks`' expand_pages). Served pools
+    # have 512-token blocks: 4 pages per column.
+    lp = pool.shape[1] // 128
+    page = jnp.arange(n_ck, dtype=jnp.int32)
     mtab, cktab, rings = [], [], []
     for (ring_ids, main, comp), (_, cslot) in zip(tables, slots, strict=True):
         main = _fit(main.reshape(n_req, -1).astype(jnp.int32), nreq)
         comp = _fit(comp.reshape(n_req, -1).astype(jnp.int32), nreq)
         ids = _fit(ring_ids.reshape(n_req, -1)[:, 0].astype(jnp.int32), nreq)
         ids = jnp.where(live, ids, 0)
+        # Columns past `pages_per_seq` / the compressed width only address contexts past
+        # `wholecap`, which the driver routes to stock (`_whole_eligible`); padding covers
+        # tables narrower than the cap.
         mtab.append(jnp.pad(main, ((0, 0), (0, max(0, pages_per_seq - main.shape[1]))))[:, :pages_per_seq])
-        ck = comp * cpp + cslot
-        cktab.append(jnp.pad(ck, ((0, 0), (0, max(0, n_ck - ck.shape[1]))))[:, :n_ck])
+        cols = -(-n_ck // lp)
+        comp = jnp.pad(comp, ((0, 0), (0, max(0, cols - comp.shape[1]))))[:, :cols]
+        cktab.append(comp[:, page // lp] * cpp + cslot * lp + page % lp)
         ring, _ = read_ring_and_tags(pool, ids, RING_ROWS * IDX_DIM, RING_ROWS * 2)
         ring = ring.reshape(nreq, RING_ROWS, IDX_DIM)
         rings.append(jnp.where((ctx > 0)[:, None, None], ring, 0).astype(jnp.bfloat16))
