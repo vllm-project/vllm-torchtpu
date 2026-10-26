@@ -582,6 +582,30 @@ def _patch_vllm_compile_all_ranges() -> None:
             "When loading from cache/AOT artifacts, "
             "compile_all_ranges should not be called."
         )
+        from vllm_torchtpu.compilation.tpu_compiler import (
+            agree_all_ranks,
+            graph_is_rank_dependent,
+        )
+
+        if graph_is_rank_dependent(self.graph):
+            # No peer replays a rank-salted artifact: compile every range here without waiting
+            # for an owner (an owner that failed left its peers waiting PEER_WAIT_S), then fail
+            # together, before any rank runs the program its peers may not have. Not deferred
+            # under TPU_PRECOMPILE_TRACE_FIRST either: the deferred pass waits on owners.
+            failure: Exception | None = None
+            try:
+                compile_rotated(
+                    [(self, e) for e in self.range_entries.values()],
+                    int(os.environ["LOCAL_RANK"]),
+                )
+            except Exception as e:  # noqa: BLE001 - re-raised below on every rank
+                failure = e
+            if not agree_all_ranks(failure is None):
+                raise failure or RuntimeError(
+                    "rank-dependent compile failed on another rank; failing on all ranks"
+                )
+            return
+
         from vllm_torchtpu.compilation import shape_variants
 
         if shape_variants.deferring():
