@@ -5,6 +5,7 @@ import argparse
 import importlib.metadata
 import json
 import os
+import re
 import statistics
 import subprocess
 from pathlib import Path
@@ -28,6 +29,17 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     assert args.samples > 0
+    # CI images exclude .git; run_in_docker.sh forwards the image's build SHA.
+    git_sha = (
+        os.environ.get("BUILDKITE_COMMIT")
+        or subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[2],
+            text=True,
+        ).strip()
+    )
+    if re.fullmatch(r"[0-9a-f]{40}", git_sha) is None:
+        raise ValueError("Benchmark source requires a full Git commit SHA")
     assert get_tpu_version() == 7, "These candidates are qualified on TPU v7."
     args.output.mkdir(parents=True, exist_ok=True)
     device = jax.devices()[0]
@@ -125,11 +137,7 @@ def main() -> None:
         "scope": "complete XLA module device latency; not serving E2E",
         "tokens": tokens,
         "seed": args.seed,
-        "git_sha": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            cwd=Path(__file__).resolve().parents[2],
-            text=True,
-        ).strip(),
+        "git_sha": git_sha,
         "device": str(device),
         "libtpu_flags": os.environ.get("LIBTPU_INIT_ARGS", ""),
         "runtime": {
