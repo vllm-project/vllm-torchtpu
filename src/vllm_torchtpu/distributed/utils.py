@@ -284,6 +284,25 @@ def get_raiden_pool_staging_leases() -> int:
     return envs.TPU_RAIDEN_POOL_STAGING_LEASES
 
 
+def get_raiden_pool_staging_budget_mb() -> int:
+    """Consumer-side host staging budget for the pool-reshard arena, in MiB
+    per rank across every bounded KV storage.
+
+    With N > 0 the consumer sizes each storage's arena to its share of the
+    budget and asks the source controller to pull any request that does not
+    fit one lease as a chain of sub-transfers (page-aligned windows of the
+    request's full-attention pages, one engine plan each), so the arena no
+    longer scales with max_model_len. 0 keeps whole-request leases.
+    """
+    return envs.TPU_RAIDEN_POOL_STAGING_BUDGET_MB
+
+
+def get_raiden_pool_staging_window_blocks() -> int:
+    """Explicit consumer-side sub-transfer window in full-attention
+    destination pages; overrides the budget-derived window. 0 = none."""
+    return envs.TPU_RAIDEN_POOL_STAGING_WINDOW_BLOCKS
+
+
 def get_raiden_inline_load() -> bool:
     """Load remote KV before the first forward instead of a no-forward step."""
     return envs.TPU_RAIDEN_INLINE_LOAD

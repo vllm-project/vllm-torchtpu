@@ -155,6 +155,8 @@ if TYPE_CHECKING:
     TPU_USE_RAIDEN_CONNECTOR: bool = False
     TPU_RAIDEN_TRANSFER_NUM_SLOTS: int = 0
     TPU_RAIDEN_POOL_STAGING_LEASES: int = 8
+    TPU_RAIDEN_POOL_STAGING_BUDGET_MB: int = 0
+    TPU_RAIDEN_POOL_STAGING_WINDOW_BLOCKS: int = 0
     TPU_RAIDEN_INLINE_LOAD: bool = False
     QUANTIZE_ON_LOAD_PREFIXES: list[str] = []
     KDA_MANUAL_STATE_DMA: bool | None = None
@@ -1000,6 +1002,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Concurrent pool-reshard transfers to provision bounded host staging for.
     "TPU_RAIDEN_POOL_STAGING_LEASES": env_nonnegative_int(
         "TPU_RAIDEN_POOL_STAGING_LEASES", 8
+    ),
+    # Consumer-side host staging budget (MiB per rank) for the pool-reshard
+    # arena: a request larger than the budget allows is pulled as a chain of
+    # sub-transfers. 0 = size the arena for whole max-length requests.
+    "TPU_RAIDEN_POOL_STAGING_BUDGET_MB": env_nonnegative_int(
+        "TPU_RAIDEN_POOL_STAGING_BUDGET_MB", 0
+    ),
+    # Explicit consumer-side sub-transfer window (full-attention destination
+    # pages per sub-transfer); overrides the budget-derived window. 0 = none.
+    "TPU_RAIDEN_POOL_STAGING_WINDOW_BLOCKS": env_nonnegative_int(
+        "TPU_RAIDEN_POOL_STAGING_WINDOW_BLOCKS", 0
     ),
     # Load remote KV before the first forward, not in a no-forward step.
     "TPU_RAIDEN_INLINE_LOAD": env_bool("TPU_RAIDEN_INLINE_LOAD", default=False),

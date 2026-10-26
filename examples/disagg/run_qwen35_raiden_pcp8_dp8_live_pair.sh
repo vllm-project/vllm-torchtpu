@@ -14,7 +14,9 @@
 # limitations under the License.
 
 # Reproduce the Qwen3.5-397B-A17B-FP8 golden Stage-3 Raiden resharding E2E:
-# PCP8/TP1 prefill on one 8-chip host and DP8/TP1 decode on another. This file
+# PCP8/TP1 prefill on one 8-chip host and DP8/TP1 decode on another (default),
+# or the head-sharded DP4/TP2 decode of PR #1183 (--decode-dp 4 --decode-tp 2
+# --kv-layout HND). This file
 # deliberately contains its controllers, accuracy oracle, benchmark client,
 # analysis, remote launch, and cleanup logic. It does not import helper scripts
 # or add source checkouts to PYTHONPATH.
@@ -36,6 +38,16 @@ readonly DEFAULT_DECODE_CONTROLLER_PORT=28000
 readonly DEFAULT_KV_PORT=14579
 readonly DEFAULT_TRANSFER_PORT=9100
 readonly DEFAULT_SIDE_CHANNEL_PORT=9600
+# Decode topology / FA cache layout. The defaults keep the golden PCP8 -> DP8
+# token-major pair byte-identical.
+readonly DEFAULT_DECODE_DP=8
+readonly DEFAULT_DECODE_TP=1
+readonly DEFAULT_KV_LAYOUT=NHD
+readonly DEFAULT_INTERLEAVE=256
+readonly DEFAULT_NUM_GPU_BLOCKS_OVERRIDE=64
+readonly DEFAULT_BENCHMARK_LENGTHS="8192,32768,65534"
+readonly DEFAULT_MEASURED_REQUESTS=12
+readonly DEFAULT_MEASURED_QPS=0.05
 
 usage() {
   cat <<'EOF'
@@ -73,6 +85,37 @@ Options:
   --block-size TOKENS      Optional shared P/D page-size floor. When omitted,
                            each role derives its own page size from its pooled
                            GDN state and attention-backend constraints.
+  --decode-dp N            Decode data-parallel engines (default: 8).
+  --decode-tp N            Decode tensor-parallel size per engine (default: 1).
+                           2 = head-sharded dp{N}tp2_decode (PR #1183): every
+                           decode TP worker is its own destination unit and
+                           TPU_RAIDEN_DST_SHARDS=2 is exported on both roles.
+                           Requires --kv-layout HND; N x TP must be 8.
+  --kv-layout LAYOUT       NHD (default: token-major FA cache) or HND
+                           (seq-along-lane: VLLM_KV_CACHE_LAYOUT=HND on both
+                           roles). Under HND the fingerprinted kernel page is
+                           vLLM's kernel block size, which the non-PCP decode
+                           kernel caps at 256 while the PCP prefill kernel
+                           takes the largest supported divisor of the block
+                           size; pass a --block-size that is an odd multiple
+                           of 256 (4352 clears the 397B GDN floor of 4224) so
+                           both roles land on 256, and --interleave 256.
+  --interleave TOKENS      Prefill cp_kv_cache_interleave_size (default: 256).
+                           Under HND it must equal the kernel page.
+  --num-gpu-blocks-override N
+                           vLLM --num-gpu-blocks-override for both roles when
+                           --block-size is given (default: 64, the pinned
+                           golden geometry). 0 lets each role size its KV
+                           pool from HBM (needed for prompts beyond 64 x
+                           block-size tokens, e.g. 1M-token contexts).
+  --benchmark-lengths LIST Comma-separated measured prompt lengths in tokens
+                           (default: 8192,32768,65534). Each length runs one
+                           excluded primer plus the measured requests.
+  --measured-requests N    Measured requests per length (default: 12).
+  --measured-qps RATE      Deterministic request rate per length (default:
+                           0.05 = one request every 20 s).
+  --prefill-env KEY=VALUE  Like --role-env, exported into the prefill role only.
+  --decode-env KEY=VALUE   Like --role-env, exported into the decode role only.
   --ssh-option OPTION      Append one OpenSSH -o option; may be repeated.
   --preflight-only         Check both installed environments and free ports.
   --no-performance-gate    Report golden metrics without enforcing the r20
@@ -305,6 +348,7 @@ check_role_environment() {
   local transfer_port="$8"
   local side_channel_port="$9"
   local model="${10}"
+  local decode_dp="${11}"
 
   command -v setsid >/dev/null 2>&1 || die "setsid is required on the ${role} host"
   setsid --help 2>&1 | grep -q -- '--wait' \
@@ -325,7 +369,7 @@ check_role_environment() {
 
   "${python_bin}" - "${role}" "${role_dir}" "${expected_vllm_version}" \
     "${api_port}" "${controller_port}" "${kv_port}" "${transfer_port}" \
-    "${side_channel_port}" "${model}" <<'PY'
+    "${side_channel_port}" "${model}" "${decode_dp}" <<'PY'
 import contextlib
 import hashlib
 import importlib.metadata
@@ -336,7 +380,7 @@ import pathlib
 import socket
 import sys
 
-role, role_dir, expected, api_port, controller_port, kv_port, transfer_port, side_port, model = sys.argv[1:]
+role, role_dir, expected, api_port, controller_port, kv_port, transfer_port, side_port, model, decode_dp = sys.argv[1:]
 
 # TPU/plugin imports emit useful diagnostics. Keep the report on stdout valid
 # JSON by routing those diagnostics to the preflight stderr artifact.
@@ -370,6 +414,12 @@ ports = [int(api_port), int(controller_port), int(kv_port)]
 # ranks. Keep the legacy side-channel range clear as well.
 ports.extend(int(transfer_port) + 2 * rank for rank in range(8))
 ports.extend(int(side_port) + rank for rank in range(8))
+# Store mode binds one reshard service (controller_port + dp_rank) and one
+# dispatch controller (controller_port + 100 + dp_rank) per engine: one on
+# prefill, decode_dp on decode.
+store_units = int(decode_dp) if role == "decode" else 1
+ports.extend(int(controller_port) + rank for rank in range(1, store_units))
+ports.extend(int(controller_port) + 100 + rank for rank in range(store_units))
 if len(ports) != len(set(ports)):
     raise SystemExit(f"configured {role} ports overlap: {ports}")
 
@@ -540,6 +590,19 @@ configure_role_environment() {
   export TPU_KV_RESHARD_TRANSPORT=raiden
   export TPU_RAIDEN_TRANSFER_PARALLELISM=8
   export TPU_GDN_CONV_QK_PAIR_LAYOUT=1
+  # Destination head shards (dp{N}tp{T}_decode, PR #1183): the producer routes
+  # each KV head shard to one decode TP worker, and the handoff's dst_tp_size
+  # must equal the consumer's TP. 1 = the golden DP8/TP1 pair (same as unset).
+  export TPU_RAIDEN_DST_SHARDS="${DECODE_TP}"
+  if [[ "${KV_LAYOUT}" == HND ]]; then
+    # Seq-along-lane FA cache on both roles (raiden/seq_on_lane.py): one
+    # contiguous run per KV head per kernel page is what lets the raw
+    # byte-span transport route full-head producer pages to head-sharded
+    # consumers without a data transform.
+    export VLLM_KV_CACHE_LAYOUT=HND
+  else
+    unset VLLM_KV_CACHE_LAYOUT
+  fi
 
   export XLA_PYTHON_CLIENT_PREALLOCATE=false
   export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
@@ -828,7 +891,6 @@ PY
     --no-enable-log-requests
     --no-enable-prefix-caching
     --no-async-scheduling
-    --tensor-parallel-size 1
   )
   # TEST-ONLY: an empty --block-size means "let each role derive its own page
   # size" (tpu_block_size_utils), instead of pinning the r20 8192 geometry.
@@ -838,7 +900,20 @@ PY
   # only when the page size is pinned too; otherwise the runner's own
   # compact-mamba sizing picks the count.
   if [[ -n "${BLOCK_SIZE}" ]]; then
-    common_args+=(--block-size "${BLOCK_SIZE}" --num-gpu-blocks-override 64)
+    common_args+=(--block-size "${BLOCK_SIZE}")
+    if ((NUM_GPU_BLOCKS_OVERRIDE > 0)); then
+      common_args+=(--num-gpu-blocks-override "${NUM_GPU_BLOCKS_OVERRIDE}")
+    fi
+  fi
+  # vLLM >= 0.32 serves /v1/completions/render (which the oracle and the
+  # benchmark client use to tokenize prompts) only with --enable-scale-out.
+  if "${python_bin}" - <<'PY'
+import importlib.metadata, sys
+from packaging.version import Version
+sys.exit(0 if Version(importlib.metadata.version("vllm")) >= Version("0.32.0") else 1)
+PY
+  then
+    common_args+=(--enable-scale-out)
   fi
   if [[ "${model}" != /* && -n "${MODEL_REVISION}" ]]; then
     common_args+=(--revision "${MODEL_REVISION}")
@@ -852,8 +927,9 @@ PY
       --long-prefill-token-threshold 32768
       --max-num-seqs 8
       --compilation-config "${prefill_compilation_config}"
+      --tensor-parallel-size 1
       --prefill-context-parallel-size 8
-      --cp-kv-cache-interleave-size 256
+      --cp-kv-cache-interleave-size "${INTERLEAVE}"
       --kv-transfer-config '{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer","kv_port":'"${kv_port}"'}'
     )
   elif [[ "${role}" == decode ]]; then
@@ -864,8 +940,9 @@ PY
       --max-num-seqs 32
       --compilation-config "${decode_compilation_config}"
       --prefill-context-parallel-size 1
-      --data-parallel-size 8
-      --data-parallel-size-local 8
+      --tensor-parallel-size "${DECODE_TP}"
+      --data-parallel-size "${DECODE_DP}"
+      --data-parallel-size-local "${DECODE_DP}"
       --kv-transfer-config '{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_consumer","kv_port":'"${kv_port}"'}'
     )
   else
@@ -1475,8 +1552,12 @@ analyze_golden_benchmark() {
   local python_bin="$1"
   local run_dir="$2"
   local performance_gate="$3"
+  local lengths="$4"
+  local measured_requests="$5"
+  local block_size="$6"
 
-  "${python_bin}" - "${run_dir}" "${performance_gate}" <<'PY'
+  "${python_bin}" - "${run_dir}" "${performance_gate}" "${lengths}" \
+    "${measured_requests}" "${block_size}" <<'PY'
 from __future__ import annotations
 
 import json
@@ -1487,6 +1568,11 @@ import sys
 
 run = pathlib.Path(sys.argv[1])
 performance_gate = sys.argv[2] == "1"
+lengths = [int(value) for value in sys.argv[3].split(",")]
+measured_requests = int(sys.argv[4])
+# Destination page size in tokens (the --block-size the roles ran with, or the
+# derived default); only used to round the FA payload up to whole pages.
+block_size = int(sys.argv[5]) if sys.argv[5] else 8192
 
 
 def events(path):
@@ -1538,13 +1624,30 @@ completed = {
     if event.get("event") == "raiden_stage3_receiver_complete"
     and "uuid" in event
 }
-payload_bytes = {
+# Bytes one request moves (every destination unit combined). The r20 golden
+# lengths are recorded exactly; other lengths are derived from the
+# Qwen3.5-397B-A17B geometry those values encode: 15 FA layers x 1,024 B per
+# token (fp8, 2 KV heads x 256) over whole destination pages, plus the fixed
+# 183.1 MiB of GDN state per request.
+golden_payload_bytes = {
     8192: 317875200,
     32768: 695362560,
     65534: 1198663680,
 }
+FA_BYTES_PER_TOKEN = 15360
+STATE_BYTES_PER_REQUEST = 192026624
+
+
+def payload_bytes_for(length):
+    if length in golden_payload_bytes:
+        return golden_payload_bytes[length]
+    pages = -(-length // block_size)
+    return STATE_BYTES_PER_REQUEST + pages * block_size * FA_BYTES_PER_TOKEN
+
+
+payload_bytes = {length: payload_bytes_for(length) for length in lengths}
 rows = {}
-for length in (8192, 32768, 65534):
+for length in lengths:
     path = run / "client" / f"measured-{length}" / "requests.jsonl"
     records = [json.loads(line) for line in path.read_text().splitlines()
                if line.strip()]
@@ -1597,33 +1700,39 @@ for length in (8192, 32768, 65534):
     }
 
 client_checks = {
-    f"length_{length}_has_12_valid_requests":
-        rows[str(length)]["num_requests"] == 12
-        and rows[str(length)]["num_valid"] == 12
-    for length in (8192, 32768, 65534)
+    f"length_{length}_has_{measured_requests}_valid_requests":
+        rows[str(length)]["num_requests"] == measured_requests
+        and rows[str(length)]["num_valid"] == measured_requests
+    for length in lengths
 }
 timing_checks = {
-    f"length_{length}_has_12_transfer_timings":
-        rows[str(length)]["transfer_event_count"] == 12
-        and rows[str(length)]["controller_submit_event_count"] == 12
-    for length in (8192, 32768, 65534)
+    f"length_{length}_has_{measured_requests}_transfer_timings":
+        rows[str(length)]["transfer_event_count"] == measured_requests
+        and rows[str(length)]["controller_submit_event_count"] == measured_requests
+    for length in lengths
 }
-performance_checks = {
-    "8192_transfer_p50_within_10pct_r20":
-        in_band(rows["8192"]["transfer_e2e_p50_ms"], 43.0),
-    "32768_transfer_p50_within_10pct_r20":
-        in_band(rows["32768"]["transfer_e2e_p50_ms"], 59.1),
-    "65534_transfer_p50_within_10pct_r20":
-        in_band(rows["65534"]["transfer_e2e_p50_ms"], 90.2),
-    "65534_prefill_mean_within_10pct_r20":
-        in_band(rows["65534"]["prefill_mean_ms"], 1514.0),
-    "65534_server_ttft_p50_within_10pct_r20":
-        in_band(rows["65534"]["server_ttft_p50_ms"], 1700.0),
-    "65534_second_token_step_below_30ms":
-        rows["65534"]["second_token_step_mean_ms"] is not None
-        and rows["65534"]["second_token_step_mean_ms"] < 30.0,
-}
-for length in (8192, 32768, 65534):
+# The r20 acceptance bands exist only for the golden lengths; other lengths
+# are reported without bands.
+performance_checks = {}
+if "8192" in rows:
+    performance_checks["8192_transfer_p50_within_10pct_r20"] = in_band(
+        rows["8192"]["transfer_e2e_p50_ms"], 43.0)
+if "32768" in rows:
+    performance_checks["32768_transfer_p50_within_10pct_r20"] = in_band(
+        rows["32768"]["transfer_e2e_p50_ms"], 59.1)
+if "65534" in rows:
+    performance_checks.update({
+        "65534_transfer_p50_within_10pct_r20":
+            in_band(rows["65534"]["transfer_e2e_p50_ms"], 90.2),
+        "65534_prefill_mean_within_10pct_r20":
+            in_band(rows["65534"]["prefill_mean_ms"], 1514.0),
+        "65534_server_ttft_p50_within_10pct_r20":
+            in_band(rows["65534"]["server_ttft_p50_ms"], 1700.0),
+        "65534_second_token_step_below_30ms":
+            rows["65534"]["second_token_step_mean_ms"] is not None
+            and rows["65534"]["second_token_step_mean_ms"] < 30.0,
+    })
+for length in lengths:
     value = rows[str(length)]["controller_submit_p50_ms"]
     performance_checks[f"{length}_controller_submit_in_expected_range"] = (
         value is not None and 25.0 <= value <= 50.0)
@@ -1643,12 +1752,12 @@ result = {
     json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 lines = []
-for length in (8192, 32768, 65534):
+for length in lengths:
     row = rows[str(length)]
     def show(value, digits=1):
         return "n/a" if value is None or not math.isfinite(value) else f"{value:.{digits}f}"
     line = (
-        f"len={length}: n={row['num_valid']}/12 | "
+        f"len={length}: n={row['num_valid']}/{measured_requests} | "
         f"prefill mean={show(row['prefill_mean_ms'], 0)} ms | "
         f"decode TTFT p50={show(row['decode_ttft_p50_ms'], 0)} ms | "
         f"2nd-token mean={show(row['second_token_step_mean_ms'])} ms | "
@@ -1689,6 +1798,8 @@ SKIP_ACCURACY_ORACLE=0
 # Extra KEY=VALUE environment entries exported into both role processes
 # (forwarded verbatim to the internal-role invocations on each host).
 ROLE_ENVS=()
+PREFILL_ENVS=()
+DECODE_ENVS=()
 PREFILL_HOST=""
 DECODE_HOST=""
 MODEL="${DEFAULT_MODEL}"
@@ -1703,6 +1814,14 @@ STARTUP_TIMEOUT="${DEFAULT_STARTUP_TIMEOUT}"
 REQUEST_TIMEOUT="${DEFAULT_REQUEST_TIMEOUT}"
 MAX_MODEL_LEN="${DEFAULT_MAX_MODEL_LEN}"
 BLOCK_SIZE=""
+DECODE_DP="${DEFAULT_DECODE_DP}"
+DECODE_TP="${DEFAULT_DECODE_TP}"
+KV_LAYOUT="${DEFAULT_KV_LAYOUT}"
+INTERLEAVE="${DEFAULT_INTERLEAVE}"
+NUM_GPU_BLOCKS_OVERRIDE="${DEFAULT_NUM_GPU_BLOCKS_OVERRIDE}"
+BENCHMARK_LENGTHS="${DEFAULT_BENCHMARK_LENGTHS}"
+MEASURED_REQUESTS="${DEFAULT_MEASURED_REQUESTS}"
+MEASURED_QPS="${DEFAULT_MEASURED_QPS}"
 PREFILL_API_PORT="${DEFAULT_PREFILL_API_PORT}"
 DECODE_API_PORT="${DEFAULT_DECODE_API_PORT}"
 PREFILL_CONTROLLER_PORT="${DEFAULT_PREFILL_CONTROLLER_PORT}"
@@ -1733,6 +1852,14 @@ while (($#)); do
     --request-timeout) REQUEST_TIMEOUT="${2:?missing value for $1}"; shift 2 ;;
     --max-model-len) MAX_MODEL_LEN="${2:?missing value for $1}"; shift 2 ;;
     --block-size) BLOCK_SIZE="${2:?missing value for $1}"; shift 2 ;;
+    --decode-dp) DECODE_DP="${2:?missing value for $1}"; shift 2 ;;
+    --decode-tp) DECODE_TP="${2:?missing value for $1}"; shift 2 ;;
+    --kv-layout) KV_LAYOUT="${2:?missing value for $1}"; shift 2 ;;
+    --interleave) INTERLEAVE="${2:?missing value for $1}"; shift 2 ;;
+    --num-gpu-blocks-override) NUM_GPU_BLOCKS_OVERRIDE="${2:?missing value for $1}"; shift 2 ;;
+    --benchmark-lengths) BENCHMARK_LENGTHS="${2:?missing value for $1}"; shift 2 ;;
+    --measured-requests) MEASURED_REQUESTS="${2:?missing value for $1}"; shift 2 ;;
+    --measured-qps) MEASURED_QPS="${2:?missing value for $1}"; shift 2 ;;
     --prefill-api-port) PREFILL_API_PORT="${2:?missing value for $1}"; shift 2 ;;
     --decode-api-port) DECODE_API_PORT="${2:?missing value for $1}"; shift 2 ;;
     --prefill-controller-port) PREFILL_CONTROLLER_PORT="${2:?missing value for $1}"; shift 2 ;;
@@ -1750,6 +1877,14 @@ while (($#)); do
       [[ "${2:?missing value for $1}" == *=* ]] \
         || die "--role-env requires KEY=VALUE, got: $2"
       ROLE_ENVS+=("$2"); shift 2 ;;
+    --prefill-env)
+      [[ "${2:-}" =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]] \
+        || die "--prefill-env requires KEY=VALUE, got: $2"
+      PREFILL_ENVS+=("$2"); shift 2 ;;
+    --decode-env)
+      [[ "${2:-}" =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]] \
+        || die "--decode-env requires KEY=VALUE, got: $2"
+      DECODE_ENVS+=("$2"); shift 2 ;;
     --preflight-only) PREFLIGHT_ONLY=1; shift ;;
     --no-performance-gate) PERFORMANCE_GATE=0; shift ;;
     --keep-cache) KEEP_CACHE=1; shift ;;
@@ -1777,6 +1912,36 @@ if [[ -n "${BLOCK_SIZE}" ]]; then
 fi
 if ((MAX_MODEL_LEN < 65536)); then
   die "the golden benchmark requires --max-model-len at least 65536"
+fi
+is_positive_integer "${DECODE_DP}" || die "--decode-dp must be positive"
+is_positive_integer "${DECODE_TP}" || die "--decode-tp must be positive"
+is_positive_integer "${INTERLEAVE}" || die "--interleave must be positive"
+[[ "${NUM_GPU_BLOCKS_OVERRIDE}" =~ ^[0-9]+$ ]] \
+  || die "--num-gpu-blocks-override must be a non-negative integer"
+is_positive_integer "${MEASURED_REQUESTS}" || die "--measured-requests must be positive"
+[[ "${MEASURED_QPS}" =~ ^[0-9]*\.?[0-9]+$ ]] || die "--measured-qps must be a positive number"
+[[ "${BENCHMARK_LENGTHS}" =~ ^[0-9]+(,[0-9]+)*$ ]] \
+  || die "--benchmark-lengths must be a comma-separated list of token counts"
+IFS=, read -r -a BENCHMARK_LENGTH_LIST <<<"${BENCHMARK_LENGTHS}"
+for _length in "${BENCHMARK_LENGTH_LIST[@]}"; do
+  is_positive_integer "${_length}" || die "benchmark length must be positive: ${_length}"
+  ((_length + 2 <= MAX_MODEL_LEN)) \
+    || die "benchmark length ${_length} plus two decode tokens exceeds --max-model-len ${MAX_MODEL_LEN}"
+done
+((DECODE_DP * DECODE_TP == 8)) \
+  || die "--decode-dp x --decode-tp must cover the 8-chip decode host (got ${DECODE_DP} x ${DECODE_TP})"
+[[ "${KV_LAYOUT}" == NHD || "${KV_LAYOUT}" == HND ]] \
+  || die "--kv-layout must be NHD or HND, got: ${KV_LAYOUT}"
+if ((DECODE_TP > 1)) && [[ "${KV_LAYOUT}" != HND ]]; then
+  die "--decode-tp ${DECODE_TP} (head-sharded decode) requires --kv-layout HND"
+fi
+if [[ "${KV_LAYOUT}" == HND ]]; then
+  ((INTERLEAVE % 128 == 0)) \
+    || die "--interleave must be a multiple of 128 under HND, got ${INTERLEAVE}"
+  [[ -n "${BLOCK_SIZE}" ]] \
+    || die "--kv-layout HND requires an explicit --block-size (both roles must derive the same kernel page)"
+  ((BLOCK_SIZE % INTERLEAVE == 0)) \
+    || die "--block-size must be a multiple of --interleave under HND"
 fi
 [[ "${RUN_ID}" =~ ^[a-zA-Z0-9_.-]+$ ]] \
   || die "run ID may contain only letters, numbers, dot, underscore, and dash"
@@ -1806,7 +1971,7 @@ if [[ -n "${INTERNAL_ROLE}" ]]; then
         check_role_environment "${ROLE_PYTHON}" "${ROLE_KIND}" "${ROLE_DIR}" \
           "${EXPECTED_VLLM_VERSION}" "${role_api_port}" \
           "${role_controller_port}" "${KV_PORT}" "${TRANSFER_PORT}" \
-          "${SIDE_CHANNEL_PORT}" "${MODEL}"
+          "${SIDE_CHANNEL_PORT}" "${MODEL}" "${DECODE_DP}"
       else
         run_role_server "${ROLE_KIND}" "${ROLE_PYTHON}" "${ROLE_HOST}" \
           "${ROLE_DIR}" "${RUN_ID}" "${MODEL}" "${SERVED_MODEL}" \
@@ -1889,6 +2054,20 @@ local_args_common=(
 for _role_env in ${ROLE_ENVS[@]+"${ROLE_ENVS[@]}"}; do
   remote_args_common+=(--role-env "${_role_env}")
   local_args_common+=(--role-env "${_role_env}")
+done
+# Role-specific entries ride the same internal-role --role-env channel, each
+# forwarded to its own host only.
+for _role_env in ${PREFILL_ENVS[@]+"${PREFILL_ENVS[@]}"}; do
+  remote_args_common+=(--role-env "${_role_env}")
+done
+for _role_env in ${DECODE_ENVS[@]+"${DECODE_ENVS[@]}"}; do
+  local_args_common+=(--role-env "${_role_env}")
+done
+for _topo_arg in --decode-dp "${DECODE_DP}" --decode-tp "${DECODE_TP}" \
+    --kv-layout "${KV_LAYOUT}" --interleave "${INTERLEAVE}" \
+    --num-gpu-blocks-override "${NUM_GPU_BLOCKS_OVERRIDE}"; do
+  remote_args_common+=("${_topo_arg}")
+  local_args_common+=("${_topo_arg}")
 done
 
 # TEST-ONLY: the internal-role parser rejects an EMPTY --reshard-sidecar-bin
@@ -2083,7 +2262,7 @@ ssh "${SSH_OPTIONS[@]}" "${PREFILL_SSH}" "${remote_serve_command}" \
   <"${SCRIPT_PATH}" >"${RESULT_DIR}/prefill.launch.log" 2>&1 &
 remote_ssh_pid=$!
 
-log "starting local DP8 decode role"
+log "starting local DP${DECODE_DP}/TP${DECODE_TP} decode role (kv-layout ${KV_LAYOUT})"
 setsid "${SCRIPT_PATH}" --internal-role serve "${local_args_common[@]}" \
   >"${RESULT_DIR}/decode.launch.log" 2>&1 &
 decode_supervisor_pid=$!
@@ -2129,7 +2308,7 @@ else
   fi
 fi
 
-for benchmark_length in 8192 32768 65534; do
+for benchmark_length in "${BENCHMARK_LENGTH_LIST[@]}"; do
   primer_dir="${LOCAL_RUN_DIR}/client/primer-${benchmark_length}"
   measured_dir="${LOCAL_RUN_DIR}/client/measured-${benchmark_length}"
   mkdir -p "${primer_dir}" "${measured_dir}"
@@ -2139,9 +2318,10 @@ for benchmark_length in 8192 32768 65534; do
     "$((900000 + benchmark_length))" "primer-${benchmark_length}" \
     "${REQUEST_TIMEOUT}" "${MAX_MODEL_LEN}" \
     2>&1 | tee "${primer_dir}/client.log"
-  log "running 12 measured requests at ${benchmark_length} tokens (0.05 qps)"
+  log "running ${MEASURED_REQUESTS} measured requests at ${benchmark_length} tokens (${MEASURED_QPS} qps)"
   run_benchmark_phase "${DECODE_PYTHON}" "${prefill_url}" "${decode_url}" \
-    "${SERVED_MODEL}" "${measured_dir}" 12 0.05 "${benchmark_length}" \
+    "${SERVED_MODEL}" "${measured_dir}" "${MEASURED_REQUESTS}" "${MEASURED_QPS}" \
+    "${benchmark_length}" \
     "$((100000 + benchmark_length))" "measured-${benchmark_length}" \
     "${REQUEST_TIMEOUT}" "${MAX_MODEL_LEN}" \
     2>&1 | tee "${measured_dir}/client.log"
@@ -2160,5 +2340,6 @@ collect_remote_logs
 
 log "analyzing client validation and golden r20 acceptance metrics"
 analyze_golden_benchmark "${DECODE_PYTHON}" "${LOCAL_RUN_DIR}" \
-  "${PERFORMANCE_GATE}" | tee "${RESULT_DIR}/benchmark_analysis.log"
+  "${PERFORMANCE_GATE}" "${BENCHMARK_LENGTHS}" "${MEASURED_REQUESTS}" \
+  "${BLOCK_SIZE}" | tee "${RESULT_DIR}/benchmark_analysis.log"
 log "golden accuracy and performance validation passed; stopping both roles"
