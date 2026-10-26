@@ -115,6 +115,7 @@ if TYPE_CHECKING:
     FUSED_MOE_PREFILL_KERNEL: bool = True
     FUSED_MOE_PREFILL_KERNEL_V2: bool = False
     TPU_MOE_PREFILL_SUM_IN_KERNEL_MAX_TOKENS: int = 0
+    TPU_MOE_PREFILL_SUM_IN_KERNEL_OVERLAP_ADDS: bool = False
     TPU_MOE_SINGLE_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_MOE_TP_DECODE_FAST: bool = True
@@ -1205,6 +1206,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # each expert row is rounded to bf16 after its routing weight is applied.
     "TPU_MOE_PREFILL_SUM_IN_KERNEL_MAX_TOKENS": env_nonnegative_int(
         "TPU_MOE_PREFILL_SUM_IN_KERNEL_MAX_TOKENS", 0
+    ),
+    # With TPU_MOE_PREFILL_SUM_IN_KERNEL_MAX_TOKENS, for the one-pass build
+    # (1024 tokens): add each tile's expert rows into the token sums during
+    # the next tile's gate/up matmuls, straight-line in the issue slots they
+    # leave free, instead of in a loop of their own after the tile. Rows past
+    # the next tile's height are added in a loop before it. Same sums in the
+    # same order as without it; the call is named ...-sumk-pipe.
+    "TPU_MOE_PREFILL_SUM_IN_KERNEL_OVERLAP_ADDS": env_bool(
+        "TPU_MOE_PREFILL_SUM_IN_KERNEL_OVERLAP_ADDS"
     ),
     # Build the MoE permutation, its inverse, and the sorted token ids from
     # one packed sort instead of three. The ragged (counting sort) path ignores it.
