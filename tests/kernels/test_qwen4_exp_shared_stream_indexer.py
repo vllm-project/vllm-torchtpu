@@ -9,6 +9,7 @@ the SparseCore selector, so both paths are compared on identical score bits.
 
 import functools
 import importlib
+import types
 
 import jax
 import jax.numpy as jnp
@@ -435,6 +436,30 @@ def test_indexer_step_flags_keep_the_selection(monkeypatch, interpret, case, fla
     for flag in flags:
         monkeypatch.setenv(flag, "1")
     np.testing.assert_array_equal(select(args), expected)
+
+
+@pytest.mark.parametrize("slot", [0, 1])
+def test_pool_page_ids_match_the_expanded_table(slot):
+    """Every kernel page, including reads past the last sequence's last page
+    (clamped), resolves to the expanded table's page id."""
+    seqs, entries, expansion, stride = 3, 5, 13, 104
+    table = jnp.asarray(
+        np.random.default_rng(0).permutation(64)[: seqs * entries], jnp.int32
+    )
+    expanded = (
+        table[:, None] * stride + slot * expansion + jnp.arange(expansion)
+    ).reshape(-1)
+    pages_per_seq = entries * expansion
+
+    for seq in range(seqs + 1):
+        for k in range(pages_per_seq + 2 * expansion):
+            want = expanded[min(seq * pages_per_seq + k, len(expanded) - 1)]
+            ref = types.SimpleNamespace(
+                pages_per_seq=pages_per_seq,
+                table_expansion=(expansion, stride, slot * expansion),
+            )
+            got = bref_override.StreamIndexKVBufferedRef.page_id(ref, table, seq, k)
+            assert int(got) == int(want), (seq, k)
 
 
 @pytest.mark.parametrize("chunk", [1 << 20, 4])

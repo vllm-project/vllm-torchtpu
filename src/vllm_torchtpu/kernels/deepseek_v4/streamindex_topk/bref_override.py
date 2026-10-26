@@ -149,16 +149,16 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
         entry stands for ``expansion`` consecutive kernel pages: kernel page k
         is ``entry[k // expansion] * stride + offset + k % expansion``
         (``pages_per_seq`` counts kernel pages, a whole number of entries per
-        sequence). Out-of-range entries clamp to the last one.
+        sequence). Out-of-range kernel pages clamp to the last kernel page,
+        exactly as on the pre-expanded table.
         """
         expansion, stride, offset = self.table_expansion
-        last = page_indices_ref.shape[0] - 1
-        if expansion == 1:
-            return page_indices_ref[jnp.minimum(seq * self.pages_per_seq + k, last)]
-        entry = jnp.minimum(
-            seq * (self.pages_per_seq // expansion) + k // expansion, last
+        flat = jnp.minimum(
+            seq * self.pages_per_seq + k, page_indices_ref.shape[0] * expansion - 1
         )
-        return page_indices_ref[entry] * stride + offset + k % expansion
+        if expansion == 1:
+            return page_indices_ref[flat]
+        return page_indices_ref[flat // expansion] * stride + offset + flat % expansion
 
     def copy_in(  # pytype: disable=attribute-error
         self,

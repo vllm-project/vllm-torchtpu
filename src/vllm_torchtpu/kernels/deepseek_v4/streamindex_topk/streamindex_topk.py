@@ -256,6 +256,8 @@ def kernel(
     table_expansion = (1, 1, 0) if components is None else components.table_expansion
     if seq_along_lane and table_expansion != (1, 1, 0):
         raise ValueError("an expanded page table needs the HEAD_ALONG_SUBLANE layout")
+    if table_expansion != (1, 1, 0) and num_page_indices % max_num_seqs:
+        raise ValueError("an expanded page table needs whole entries per sequence")
     pages_per_seq = num_page_indices // max_num_seqs * table_expansion[0]
 
     bkv_sz_per_kv_packing = bkv_p * page_size_per_kv_packing

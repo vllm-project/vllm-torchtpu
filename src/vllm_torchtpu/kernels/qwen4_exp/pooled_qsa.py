@@ -1051,7 +1051,11 @@ def select_blocks(
         pool_table = envs.VLLM_TPU_QSA_DECODE_POOL_PAGE_TABLE and shard is None
         expansion = (1, 1, 0)
         if pool_table:
-            chunk_size = min(len(query), decode_query_chunk_size(table.shape[1]))
+            # Same headroom as the sharded table, in pool pages.
+            pool_pages = table.shape[1] + -(
+                -max(256, kv_block, decode_kv_block) // (rows * logical_pages)
+            )
+            chunk_size = min(len(query), decode_query_chunk_size(pool_pages))
             expansion = (logical_pages, physical_pages, slot * logical_pages)
         return _select_shared_stream(
             query,
