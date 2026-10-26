@@ -249,9 +249,9 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
     d["_kr_new"] = np.asarray(outs[KR_NEW], np.float32).reshape(R, n_att, ex.M, -1)[:, :, :B]
     d["_ir_new"] = np.asarray(outs[IR_NEW], np.float32).reshape(R, n_att, ex.M, -1)[:, :, :B]
     if stats:
-        from vllm_torchtpu.megakernel.wholestep.qsa_full_c import UNION_STATS
+        from vllm_torchtpu.megakernel.wholestep.qsa_full_c import UNION_STATS, UNION_STATS_REQS
 
-        d["_stats"] = np.asarray(outs[UNION_STATS]).reshape(R, n_att, nreq, -1)
+        d["_stats"] = np.asarray(outs[UNION_STATS]).reshape(R, n_att, UNION_STATS_REQS, -1)[:, :, :nreq]
     return res, np.asarray(ref, np.float32), x0, ck, ring, steps, iq, ids, d
 
 

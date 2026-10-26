@@ -56,7 +56,11 @@ RING_NEW = "qsa_ring_new"
 # Projections the post-kernel scatter feeds to the stock cache writers
 # (`pooled_qsa.qsa_cache_writes`): the un-normed key and the raw index key per row.
 KR_NEW = "qsa_kr_new"
-UNION_STATS = "qsa_union_stats"  # [requests, 1, 128] int32 per QSA layer (`union_stats`)
+UNION_STATS = "qsa_union_stats"  # [UNION_STATS_REQS, 1, 128] int32 per QSA layer (`union_stats`)
+# Fixed request capacity of the stats output (64-row buckets / T): its shape must not follow the
+# bucket, or the torch op's fake output makes vLLM's trace branch on the token count (w06g/w07g:
+# ShapeSpecializationError 's72 <= 4' at bucket 32).
+UNION_STATS_REQS = 16
 IR_NEW = "qsa_ir_new"
 FP8_MAX = 448.0
 
@@ -91,7 +95,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             StateDecl(RING_NEW, (nreq, 8, ix.IDX_DIM), BF16, "w"),
             StateDecl(KR_NEW, (ex.M, g.HD), BF16, "w"),
             StateDecl(IR_NEW, (ex.M, ix.IDX_DIM), BF16, "w"),
-        ] + ([StateDecl(UNION_STATS, (nreq, 1, 128), I32, "w")] if self.union_stats else [])
+        ] + (
+            [StateDecl(UNION_STATS, (UNION_STATS_REQS, 1, 128), I32, "w")] if self.union_stats else []
+        )
 
     def host_update_states(self, g, ex, pos, states, raw_outputs):  # noqa: ANN001
         out = super().host_update_states(g, ex, pos, states, raw_outputs)
@@ -584,6 +590,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 recent=(scr["qc_rk"][q], scr["qc_rv"][q], ok, ok_any),
             )
             if self.union_stats:
+                assert nreq <= UNION_STATS_REQS, (nreq, UNION_STATS_REQS)
                 kept = [scr["qi_kvl"][r] // 4 for r in rs]
                 lane = jax.lax.broadcasted_iota(I32, (1, 128), 1)
                 vals = [scr["qu_n"][q], sum(kept[1:], kept[0]), kept[0], (kept[0] > 0).astype(I32)]

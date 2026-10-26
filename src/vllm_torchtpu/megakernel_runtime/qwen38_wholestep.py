@@ -30,6 +30,7 @@ import torch
 from torch import nn
 
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.megakernel.wholestep.qsa_full_c import UNION_STATS_REQS
 
 from .qwen38_segment_call import T_VERIFY
 from .qwen38_wholestep_cache import QSALayerCache
@@ -71,12 +72,8 @@ class _WholeKind:
         @op.register_fake
         def _(hidden, args):
             out = [torch.empty_like(hidden), torch.empty_like(args[self.pool_index])]
-            if union_stats_on():  # per rank [QSA layers, requests, 1, 128], stacked over ranks
-                from vllm_torchtpu.megakernel.exec_spec import ExecSpec
-
-                B = int(hidden.shape[0])
-                ex = ExecSpec(R=mesh.size, B=B, T=T_VERIFY, ctx=128, tiles=wholestep_tiles(B))
-                shape = (mesh.size * len(qsa), ex.M // T_VERIFY, 1, 128)
+            if union_stats_on():  # per rank [QSA layers, UNION_STATS_REQS, 1, 128], stacked
+                shape = (mesh.size * len(qsa), UNION_STATS_REQS, 1, 128)  # bucket-independent
                 out.append(hidden.new_empty(shape, dtype=torch.int32))
             return out
 
@@ -152,7 +149,7 @@ class Qwen38WholeStep(nn.Module):
         # Union stats land here inside the compiled call (in place, like the pool); the driver
         # reads them outside it (`log_union_stats`). Room for the largest bucket's requests.
         self.union_stats = (
-            torch.zeros((self.mesh.size * len(self.qsa_ids), max(self.buckets) // T_VERIFY, 1, 128),
+            torch.zeros((self.mesh.size * len(self.qsa_ids), UNION_STATS_REQS, 1, 128),
                         dtype=torch.int32, device=pool.device)
             if union_stats_on() else None
         )
@@ -199,8 +196,7 @@ class Qwen38WholeStep(nn.Module):
         if len(outs) > 2 and self.union_stats is not None:
             # Python control flow or a host read here would be traced into the compiled
             # program (w06g j-b1a76c09: ShapeSpecializationError at bucket 32); only copy.
-            self.union_stats.zero_()
-            self.union_stats[:, : outs[2].shape[1]].copy_(outs[2])
+            self.union_stats.copy_(outs[2])
         return res
 
     def log_union_stats(self, calls: int) -> None:
