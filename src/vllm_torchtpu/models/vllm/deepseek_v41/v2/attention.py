@@ -41,6 +41,7 @@ from .candidate_cache import prepare_candidate_cache, select_candidate_cache
 from .ced import prefix_replay_enabled
 from .ops import device_hooks, rms_norm, rotary, round_fp8_activation
 from .projection_rope import initialize_projection_rope
+from .swa_cache import CompactSWASpec, NativeSWASpec
 
 logger = init_logger(__name__)
 
@@ -354,6 +355,8 @@ class AttentionBackend(compressor_upstream.CompressorBackend):
 
 
 class SWACache(NativeCacheView, DeepseekV4SWACache):
+    native_pages = False
+
     def __init__(self, *args, **kwargs):
         kwargs["block_size"] = kwargs["cache_config"].block_size
         # Upstream ties bounded replay to its V2 model runner; the TPU model
@@ -363,6 +366,24 @@ class SWACache(NativeCacheView, DeepseekV4SWACache):
         kwargs["dtype"] = torch.bfloat16
         kwargs["backend_cls"] = AttentionBackend
         super().__init__(*args, **kwargs)
+
+    def get_kv_cache_spec(self, vllm_config):
+        spec = super().get_kv_cache_spec(vllm_config)
+        if not self.native_pages:
+            return spec
+        values = {
+            field.name: getattr(spec, field.name) for field in dataclasses.fields(spec)
+        }
+        values["extra_retained_tokens"] = max(
+            0, vllm_config.num_prefill_lookahead_tokens - 1
+        )
+        if vllm_config.cache_config.enable_prefix_caching and spec.prefix_cacheable:
+            return NativeSWASpec(**values)
+        return CompactSWASpec(
+            **values,
+            max_num_seqs=vllm_config.scheduler_config.max_num_seqs,
+            max_in_flight_tokens=vllm_config.max_in_flight_tokens,
+        )
 
 
 class IndexerCache(NativeCacheView, upstream.DeepseekV4IndexerCache):
@@ -534,7 +555,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             and self.n_local_heads == 64
         )
         self._csa2 = bool(self.compress_ratio) and csa2_supported
-        self.swa_cache_layer._tpu_native_swa = self._csa2
+        self.swa_cache_layer.native_pages = self._csa2
         if self.compress_ratio:
             logger.info_once(
                 "DeepSeek-V4.1 attention backend: %s",

@@ -478,9 +478,11 @@ class TPUWorker(WorkerBase):
         from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
             reserve_rope_companion,
         )
+        from vllm_torchtpu.models.vllm.deepseek_v41.v2.swa_cache import (
+            native_swa_reservation,
+        )
 
-        compact = self.model_runner.kv_cache_manager.native_swa_cache
-        swa_bytes = 0 if compact is None else compact.reserve_bytes
+        swa_bytes = native_swa_reservation(self.model_runner.get_kv_cache_spec())
         available -= swa_bytes
         if available <= 0:
             raise ValueError("KV budget cannot hold the compact SWA windows")

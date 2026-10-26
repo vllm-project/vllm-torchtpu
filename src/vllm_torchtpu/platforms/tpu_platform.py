@@ -360,6 +360,14 @@ def _register_tpu_kv_connectors() -> None:
 
 
 class TpuPlatform(Platform):
+    @classmethod
+    def register_custom_kv_cache_specs(cls, vllm_config) -> None:
+        from vllm_torchtpu.models.vllm.deepseek_v41.v2.swa_cache import (
+            register_native_swa_specs,
+        )
+
+        register_native_swa_specs()
+
     # Registered via the `vllm.platform_plugins` entry point in pyproject.toml.
     _enum = PlatformEnum.OOT
     device_name: str = "tpu"
