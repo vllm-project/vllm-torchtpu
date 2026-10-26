@@ -35,6 +35,9 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.pp_validation import validate_pipeline_parallel_config
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
+    is_turboquant_kv_cache_dtype as _is_turboquant_cache_dtype,
+)
+from vllm_torchtpu.platforms.tpu_block_size_utils import (
     unified_kv_layout_enabled,
     update_tpu_block_size_and_slot_config,
 )
@@ -71,6 +74,7 @@ else:
     SamplingType = None
 
 logger = init_logger(__name__)
+
 
 # Every map below is keyed on the number of devices in the slice, which is
 # what world_size counts and what the slice builder sizes its worker address
@@ -695,11 +699,23 @@ class TpuPlatform(Platform):
                     "support MLA models; leave --attention-backend unset."
                 )
             selected_backend = AttentionBackendEnum.FLASH_ATTN_MLA
+        elif _is_turboquant_cache_dtype(attn_selector_config.kv_cache_dtype):
+            if registered:
+                assert selected_backend is not None
+                raise ValueError(
+                    f"--attention-backend {selected_backend.name.lower()} does not "
+                    "support TurboQuant KV cache; leave --attention-backend unset."
+                )
+            # Registers the TPU class under AttentionBackendEnum.TURBOQUANT.
+            import vllm_torchtpu.layers.adapter.turboquant_attention  # noqa: F401
+
+            selected_backend = AttentionBackendEnum.TURBOQUANT
 
         supported_backends = [
             AttentionBackendEnum.FLASH_ATTN,
             AttentionBackendEnum.CUSTOM,
             AttentionBackendEnum.FLASH_ATTN_MLA,
+            AttentionBackendEnum.TURBOQUANT,
         ]
         if not registered and selected_backend not in supported_backends:
             if selected_backend is not None:
@@ -797,6 +813,16 @@ class TpuPlatform(Platform):
         )
         _register_tpu_kv_connectors()
 
+        cache_dtype = getattr(
+            getattr(vllm_config, "cache_config", None), "cache_dtype", None
+        )
+        if _is_turboquant_cache_dtype(cache_dtype):
+            from vllm_torchtpu.layers.adapter.turboquant_attention import (
+                check_turboquant_config,
+            )
+
+            check_turboquant_config(vllm_config)
+
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             raise NotImplementedError(
                 "Pathways is not supported by vllm-torchtpu. "
@@ -835,6 +861,12 @@ class TpuPlatform(Platform):
                     f"--attention-backend {selected_backend.name.lower()} resolves "
                     f"to {backend.__qualname__}, not a PallasAttentionBackend."
                 )
+        elif _is_turboquant_cache_dtype(cache_dtype):
+            from vllm_torchtpu.layers.adapter.turboquant_attention import (
+                PallasTurboQuantAttentionBackend,
+            )
+
+            backend = PallasTurboQuantAttentionBackend
         elif selected_backend == AttentionBackendEnum.CUSTOM:
             backend = PallasBatchedRPAAttentionBackend
         else:
@@ -1294,7 +1326,12 @@ class TpuPlatform(Platform):
                 )
             else:
                 is_hybrid = vllm_config.model_config.is_hybrid
-                if not is_hybrid and not cache_config.user_specified_block_size:
+                is_tq = _is_turboquant_cache_dtype(
+                    getattr(cache_config, "cache_dtype", None)
+                )
+                if (
+                    not is_hybrid or is_tq
+                ) and not cache_config.user_specified_block_size:
                     default = backend_cls.get_page_size(vllm_config)
                     cache_config.block_size = (  # type: ignore[assignment]
                         backend_cls.get_preferred_block_size(default)
@@ -1358,7 +1395,7 @@ class TpuPlatform(Platform):
         cls, kv_cache_dtype: str, _model_config: ModelConfig
     ) -> bool:
         supported = {"auto", "bfloat16", "fp8", "fp8_e4m3", "fp8_e5m2"}
-        return kv_cache_dtype in supported
+        return kv_cache_dtype in supported or _is_turboquant_cache_dtype(kv_cache_dtype)
 
     @classmethod
     def use_sync_weight_loader(cls) -> bool:
