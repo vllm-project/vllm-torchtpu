@@ -207,7 +207,10 @@ class NativeSWAWindow:
             )
             // size
         )
-        return {column: pages[column] for column in range(first, last)}
+        # CPU positions include drafts whose rejection is applied on device.
+        # Keep rollback pages addressable until advance() releases them; slicing
+        # at the optimistic start would hide valid history across a page boundary.
+        return dict(pages)
 
 
 class NativeSWACache:

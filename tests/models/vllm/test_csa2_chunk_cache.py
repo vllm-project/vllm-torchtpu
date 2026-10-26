@@ -261,6 +261,25 @@ def test_compact_swa_preserves_windows_through_rejection_and_recycling():
 
 
 @pytest.mark.cpu_test
+def test_compact_swa_maps_history_before_optimistic_cpu_window():
+    window = cache_module.NativeSWAWindow(_compact_spec(), _compact_config())
+    storage = torch.full((window.capacity, 32), -1, dtype=torch.int32)
+    committed = 0
+    optimistic = 0
+    for step in range(200):
+        window.advance(set())
+        size = 128 if not step else 6
+        pages = window.map_request("a", optimistic, optimistic + size, 0)
+        # Device-side rejection corrects positions after CPU metadata is built.
+        for token in range(max(0, committed - 127), committed):
+            assert storage[pages[token // 32], token % 32] == token
+        for token in range(committed, committed + size):
+            storage[pages[token // 32], token % 32] = token
+        optimistic = committed + size
+        committed += size if not step else 1 + step % 6
+
+
+@pytest.mark.cpu_test
 def test_compact_swa_reservation_depends_on_working_set():
     config = _compact_config(sequences=48, tokens=2048)
     cache = cache_module.NativeSWACache(
