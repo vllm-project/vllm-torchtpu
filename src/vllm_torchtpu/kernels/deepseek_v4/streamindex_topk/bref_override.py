@@ -142,8 +142,8 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
             table_expansion=table_expansion,
         )
 
-    def page_id(self, page_indices_ref: jax.Ref, seq: Any, k: Any) -> Any:
-        """Physical page of kernel page ``k`` of sequence ``seq``.
+    def page_id(self, page_indices_ref: jax.Ref, seq: Any, start: Any, i: int) -> Any:
+        """Physical page of kernel page ``start + i`` of sequence ``seq``.
 
         With ``table_expansion == (expansion, stride, offset)`` each table
         entry stands for ``expansion`` consecutive kernel pages: kernel page k
@@ -151,14 +151,25 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
         (``pages_per_seq`` counts kernel pages, a whole number of entries per
         sequence). Out-of-range kernel pages clamp to the last kernel page,
         exactly as on the pre-expanded table.
+
+        ``i`` is static: the KV block's copy loop divides its first page once
+        and carries the static offset, keeping integer division off the
+        scalar unit's per-page path.
         """
         expansion, stride, offset = self.table_expansion
-        flat = jnp.minimum(
-            seq * self.pages_per_seq + k, page_indices_ref.shape[0] * expansion - 1
-        )
+        last = page_indices_ref.shape[0] * expansion - 1
+        base = seq * self.pages_per_seq + start
         if expansion == 1:
-            return page_indices_ref[flat]
-        return page_indices_ref[flat // expansion] * stride + offset + flat % expansion
+            return page_indices_ref[jnp.minimum(base + i, last)]
+        entry0 = base // expansion
+        run = base - entry0 * expansion + i % expansion
+        carry = run >= expansion
+        entry = entry0 + i // expansion + carry.astype(entry0.dtype)
+        run = run - jnp.where(carry, expansion, 0)
+        over = base + i > last
+        entry = jnp.where(over, page_indices_ref.shape[0] - 1, entry)
+        run = jnp.where(over, expansion - 1, run)
+        return page_indices_ref[entry] * stride + offset + run
 
     def copy_in(  # pytype: disable=attribute-error
         self,
@@ -192,7 +203,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
             kv_p_start = bkv_idx * self.bkv_p
             for i in range(self.bkv_p):
                 page = self.page_id(
-                    page_indices_ref, effective_seq_idx + batch_idx, kv_p_start + i
+                    page_indices_ref, effective_seq_idx + batch_idx, kv_p_start, i
                 )
                 safe_page_offset = jnp.minimum(
                     page * self.page_size_per_kv_packing,

@@ -72,7 +72,7 @@ def _copy_in_whole_pages(self, src_ref, grid_indices):
     vmem_dst = self.window_ref.at[slot]
     for batch_idx in range(self.seq_batch_size):
         for i in range(self.bkv_p):
-            page = self.page_id(page_indices_ref, seq + batch_idx, kv_p_start + i)
+            page = self.page_id(page_indices_ref, seq + batch_idx, kv_p_start, i)
             page = jnp.minimum(page, cache_kv_hbm.shape[0] - 1)
             pltpu.make_async_copy(
                 cache_kv_hbm.at[page],
@@ -451,15 +451,20 @@ def test_pool_page_ids_match_the_expanded_table(slot):
     ).reshape(-1)
     pages_per_seq = entries * expansion
 
+    ref = types.SimpleNamespace(
+        pages_per_seq=pages_per_seq,
+        table_expansion=(expansion, stride, slot * expansion),
+    )
+    block = 8  # not a multiple of the expansion: blocks start mid-entry
     for seq in range(seqs + 1):
-        for k in range(pages_per_seq + 2 * expansion):
-            want = expanded[min(seq * pages_per_seq + k, len(expanded) - 1)]
-            ref = types.SimpleNamespace(
-                pages_per_seq=pages_per_seq,
-                table_expansion=(expansion, stride, slot * expansion),
-            )
-            got = bref_override.StreamIndexKVBufferedRef.page_id(ref, table, seq, k)
-            assert int(got) == int(want), (seq, k)
+        for start in range(0, pages_per_seq + 2 * expansion, block):
+            for i in range(block):
+                k = start + i
+                want = expanded[min(seq * pages_per_seq + k, len(expanded) - 1)]
+                got = bref_override.StreamIndexKVBufferedRef.page_id(
+                    ref, table, jnp.int32(seq), jnp.int32(start), i
+                )
+                assert int(got) == int(want), (seq, k)
 
 
 @pytest.mark.parametrize("chunk", [1 << 20, 4])
