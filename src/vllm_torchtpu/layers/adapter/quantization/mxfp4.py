@@ -665,6 +665,28 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             w2_weight_padded,
             orig_intermediate,
         )
+        # TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS: a sequence-parallel layer also
+        # serves the small buckets on the replicated layout, whose op groups
+        # the TP replicas of each token (the op is keyed by its groups).
+        op_nosp = None
+        parallel = layer.moe_config.moe_parallel_config
+        if (
+            op is not None
+            and parallel.is_sequence_parallel
+            and envs.TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS > 0
+        ):
+            sp_size = parallel.sp_size
+            parallel.sp_size = 1
+            try:
+                op_nosp = self._prebuild_w4a8(
+                    layer,
+                    activation_str,
+                    w13_weight_padded,
+                    w2_weight_padded,
+                    orig_intermediate,
+                )
+            finally:
+                parallel.sp_size = sp_size
         (
             w13_weight_processed,
             w2_weight_processed,
@@ -715,6 +737,18 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         )
 
         setattr(self, FUSED_MOE_EP_OP_ATTR, op)
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+            FUSED_MOE_EP_DEFER_OP_ATTR,
+            FUSED_MOE_EP_NOSP_DEFER_OP_ATTR,
+            FUSED_MOE_EP_NOSP_OP_ATTR,
+            defer_op_for,
+        )
+
+        setattr(self, FUSED_MOE_EP_NOSP_OP_ATTR, op_nosp)
+        # TPU_DSV4_MHC_MOE_AR_SEAM: the partial-returning companions (None
+        # unless armed).
+        setattr(self, FUSED_MOE_EP_DEFER_OP_ATTR, defer_op_for(op))
+        setattr(self, FUSED_MOE_EP_NOSP_DEFER_OP_ATTR, defer_op_for(op_nosp))
         expert_placement.check_layer_served(layer, fused_armed=op is not None)
         if op is not None:
             reason = fused_moe_ep_unsupported_reason(

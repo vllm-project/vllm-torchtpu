@@ -121,6 +121,31 @@ class GatherTest(parameterized.TestCase):
         np.testing.assert_array_equal(nope_ref, nope_sc[:num_valid])
         np.testing.assert_array_equal(rope_ref, rope_sc[: num_valid // 4])
 
+    @parameterized.parameters(
+        # Decode buckets of 8, 16 and 48 tokens at top_k 1024.
+        (8 * 1024, 8 * 1024),
+        (16 * 1024, 8 * 1024),
+        (48 * 1024, 40 * 1024),
+        (16 * 1024, 16 * 1024),
+    )
+    def test_no_pad(self, n, num_valid):
+        nope_cache, perm_key = create_nope_cache()
+        rope_cache, _ = create_rope_cache()
+
+        max_index = nope_cache.shape[0] * nope_cache.shape[1]
+        indices = jax.random.randint(perm_key, (n,), 0, max_index, dtype=jnp.int32)
+
+        nope_ref, rope_ref = gather_ref_impl(
+            nope_cache, rope_cache, indices[:num_valid]
+        )
+        nope_sc, rope_sc = csa_gather(
+            nope_cache, rope_cache, indices, num_valid_indices=num_valid, no_pad=True
+        )
+        assert nope_sc.shape == (n, csa_cache_layout.ROW_WORDS)
+
+        np.testing.assert_array_equal(nope_ref, nope_sc[:num_valid])
+        np.testing.assert_array_equal(rope_ref, rope_sc[: num_valid // 4])
+
 
 if __name__ == "__main__":
     absltest.main()

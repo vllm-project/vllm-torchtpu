@@ -247,3 +247,41 @@ def test_weight_load_round_trip(tiny_fc):
         model.markov_head.markov_w2.weight[:VOCAB],
         ckpt["mtp.2.markov_head.markov_w2.weight"],
     )
+
+
+@pytest.mark.parametrize(
+    "winners",
+    [
+        [30, 70],  # equal maxima on two ranks: the lower rank's id
+        [26, 30],  # equal maxima inside one rank's shard: its first id
+        [95],
+        [],  # an all-equal row: id 0
+    ],
+)
+def test_vocab_parallel_argmax_matches_full_argmax(monkeypatch, winners):
+    """Per-rank (max, argmax) pairs reduce to the full-vocabulary argmax,
+    ties included, as greedy drafting needs for identical drafts."""
+    tp, vocab, rows = 4, 96, 3
+    shard = vocab // tp
+    logits = torch.randn(rows, vocab).to(torch.bfloat16)
+    if winners:
+        logits[:, winners] = logits.max() + 1
+    else:
+        logits[:] = 0.5
+    shards = logits.split(shard, dim=-1)
+
+    def run(rank, gather):
+        monkeypatch.setattr(dspark_mod, "tensor_model_parallel_all_gather", gather)
+        head = SimpleNamespace(
+            tp_size=tp, org_vocab_start_index=torch.tensor(rank * shard)
+        )
+        return dspark_mod.DSparkDeepseekV4ForCausalLM.vocab_parallel_argmax(
+            SimpleNamespace(lm_head=head), shards[rank]
+        )
+
+    pairs = []
+    for rank in range(tp):
+        run(rank, lambda pair, dim: pairs.append(pair) or pair.repeat(1, tp))
+    for rank in range(tp):
+        got = run(rank, lambda pair, dim: torch.cat(pairs, dim=dim))
+        torch.testing.assert_close(got, logits.argmax(dim=-1), rtol=0, atol=0)

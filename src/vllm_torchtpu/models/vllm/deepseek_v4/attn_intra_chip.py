@@ -339,9 +339,7 @@ class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
         q_half = self.wq_b(qr_pair).view(2, num_tokens, -1)
         peer = _swap_with_peer_chiplet(group, q_half[rank], q_half[1 - rank])
         pieces = [q_half[rank], peer] if rank == 0 else [peer, q_half[rank]]
-        return torch.cat(pieces, dim=-1).view(
-            num_tokens, self.mla_attn.n_local_heads, self.mla_attn.head_dim
-        )
+        return torch.cat(pieces, dim=-1)
 
     def _o_proj(self, o, positions):
         group = self._chip_pair

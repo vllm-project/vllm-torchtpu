@@ -42,6 +42,13 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         if self.use_all2all:
             self.all2all_manager = TpuNullAll2AllManager(self.cpu_group)
 
+    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        # Every TP all-reduce (row-parallel projections, MoE reduce_results,
+        # vocab embedding) comes through here.
+        from vllm_torchtpu.layers.adapter import small_all_reduce_op
+
+        return small_all_reduce_op.all_reduce_or(input_, self.ranks, super().all_reduce)
+
     def _moe_group(self, is_sequence_parallel: bool):
         group = get_ep_group() if is_sequence_parallel else get_dp_group()
         return group if group.world_size > 1 else None

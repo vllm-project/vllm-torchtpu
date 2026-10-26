@@ -25,7 +25,11 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
     adaptive_fused_moe_supported,
 )
-from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+    RUNNER_ROUTED_SCALE_ATTR,
+    SHARED_IN_OP_ATTR,
+    fused_moe_ep_supported,
+)
 from vllm_torchtpu.layers.adapter.moe_tp_decode import moe_tp_decode_supported
 
 # Taken once at import, outside any trace: the MoE forward is traced by
@@ -50,6 +54,25 @@ class VllmMoERunner(MoERunner):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._take_over_moe_quant_config_init()
+        if self.shared_experts is not None:
+            # Read by prebuild_fused_moe_ep under MOE_FUSED_EP_SHARED_IN_OP: an
+            # op that adds the shared expert itself must also apply the routed
+            # scale this runner would otherwise apply to the routed output.
+            object.__setattr__(
+                self.routed_experts,
+                RUNNER_ROUTED_SCALE_ATTR,
+                float(self.routed_scaling_factor),
+            )
+
+    @property
+    def _shared_in_op(self) -> bool:
+        """The armed fused-EP op returns shared + routed, reduced and scaled."""
+        return bool(getattr(self.routed_experts, SHARED_IN_OP_ATTR, False))
+
+    def _maybe_apply_routed_scale_to_output(self, shared_output, fused_output):
+        if self._shared_in_op:
+            return shared_output, fused_output
+        return super()._maybe_apply_routed_scale_to_output(shared_output, fused_output)
 
     def _take_over_moe_quant_config_init(self) -> None:
         routed_experts = self.routed_experts
@@ -149,6 +172,9 @@ class VllmMoERunner(MoERunner):
         return super()._maybe_dispatch(hidden_states, router_logits)
 
     def _maybe_combine(self, shared_output, hidden_states):
+        if self._shared_in_op:
+            # The op already holds the shared expert's (reduced) output.
+            return None, hidden_states
         if self._fused_ep_owns_pcp_collectives():
             # The fused program has already pushed and summed routed rows
             # back onto their token-owning PCP rank. Preserve upstream's
@@ -198,4 +224,7 @@ class VllmMoERunner(MoERunner):
             input_ids=input_ids,
             order_after=hidden_states if shared is None else shared,
         )
+        if self._shared_in_op:
+            assert shared is not None
+            return None, fused
         return shared, fused

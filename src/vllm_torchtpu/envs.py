@@ -78,8 +78,13 @@ if TYPE_CHECKING:
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     TPU_GREEDY_TOP_TOKENS: bool = False
+    TPU_SAMPLER_FUSED_CHAIN: bool = True
+    TPU_SAMPLER_GRAPH_RNG: bool = False
     DP_SCHED_ENABLED: bool = False
+    TPU_KV_HOLD_REPLAY_CHECKPOINT: bool = False
+    TPU_FINE_PREFIX_HIT_TOKENS: int = 0
     TPU_STEP_TIMING_LOG_STEPS: int = 0
+    TPU_ASYNC_DRAFT_BEFORE_RESULT_WAIT: bool = False
     TPU_KV_DROP_HCA_STATE_CHECKPOINT: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
@@ -101,10 +106,26 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
+    MOE_FUSED_EP_V2_DECODE_TILE_M: int = 0
+    MOE_FUSED_EP_V2_DECODE_TILE_MAX_LOCAL_TOKENS: int = 16
+    MOE_FUSED_EP_V2_MERGED_EXCHANGE: bool = True
+    MOE_FUSED_EP_V2_ONEHOT_SCATTER: bool = True
+    MOE_FUSED_EP_V2_PALLAS_PLAN: bool = True
+    MOE_FUSED_EP_V2_DECODE_COMBINE: bool = True
+    MOE_FUSED_EP_V2_PALLAS_RESTORE: bool = True
+    MOE_FUSED_EP_V2_FUSED_SELECT: bool = True
+    MOE_FUSED_EP_V2_LANE_QUANT: bool = True
+    MOE_FUSED_EP_V2_ONESHOT_GATHER: bool = True
+    MOE_FUSED_EP_V2_COMBINE_RESTORE: bool = False
+    MOE_FUSED_EP_V2_FOLD_RESTORE_INTO_SHARED_AR: bool = False
+    MOE_FUSED_EP_V2_TAIL_BARRIER: bool = False
+    MOE_FUSED_EP_V2_FILL_SCHEDULE: bool = True
     TPU_EXPERT_PLACEMENT: str = ""
     MOE_EXPERT_COUNT_TAP_DIR: str = ""
     MOE_EXPERT_COUNT_TAP_EVERY: int = 1000
     MOE_FUSED_EP_SHARED_BEFORE_KERNEL: bool = False
+    MOE_FUSED_EP_SHARED_IN_OP: bool = True
+    MOE_FUSED_EP_SHARED_RS_MIN_ROWS: int = -1
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
     TPU_DSV4_PAIR_SWAP: bool = False
@@ -113,7 +134,30 @@ if TYPE_CHECKING:
     TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK: tuple[int, int, int] = (64, 128, 64)
     TPU_DSV4_INDEXER_NUM_QUERIES_PER_BLOCK: tuple[int, int, int] = (1, 32, 32)
     TPU_DSV4_CSA_GATHER_AND_ATTENTION_CHUNK_SIZE: int = 64
+    TPU_DSV4_COMPRESSOR_PROJ_RUNS_MIN_TOKENS: int = 128
+    TPU_DSV4_COMPRESSOR_PROJ_RUNS_TILE_N: int = 512
+    TPU_DSV4_COMPRESSOR_PROJ_RUNS_INDEXER: bool = False
+    TPU_DSV4_COMPRESSOR_PREFILL_BLOCK: int = 128
+    TPU_DSV4_COMPRESSOR_PREFILL_BLOCK_MIN_TOKENS: int = 256
+    TPU_DSV4_COMPRESSOR_PROJ_STREAM_MAX_TOKENS: int = 0
+    TPU_DSV4_COMPRESSOR_PROJ_STREAM_CFG: tuple[int, int, int] = (3584, 2, 1)
+    TPU_DSV4_COMPRESSOR_FP8: bool = False
+    TPU_DSV4_COMPRESSOR_PAIR: bool = False
+    TPU_DSV4_COMPRESSOR_PROJ_STREAM_MIN_WIDTH: int = 0
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
+    TPU_SMALL_ALL_REDUCE: bool = True
+    TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 0
+    TPU_SMALL_ALL_REDUCE_PAIRS: int = 0
+    TPU_SMALL_COLLECTIVES_SKIP_DEVICE_BARRIER: bool = False
+    MOE_FUSED_EP_V2_FOLD_ANY_DECODE: bool = False
+    TPU_DSV4_EP_MIXED_PLAN_KERNEL: bool = False
+    TPU_DSV4_EP_MIXED_EXCHANGE_ONESHOT: bool = False
+    TPU_DSV4_EP_MIXED_COMBINE_KERNEL: bool = False
+    MOE_FUSED_EP_V2_ONESHOT_GATHER_MAX_LOCAL_TOKENS: int = 4
+    TPU_FP8_LINEAR_PALLAS: bool = True
+    TPU_FP8_LINEAR_PALLAS_SITES: str = ""
+    TPU_FP8_SKINNY_HBM_PIN_SITES: str = FP8_LINEAR_PALLAS_DEFAULT_SITES
+    TPU_FP8_SKINNY_SCALE_DMA: bool = True
     TPU_TOKEN_BUCKET_LINEAR: bool = False
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
@@ -125,12 +169,76 @@ if TYPE_CHECKING:
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
+    TPU_STREAMIDX_VERIFY_BD: bool = False
+    TPU_DSV4_SC_TOPK_FLAT_SCORES: bool = True
+    TPU_DSV4_SC_TOPK_COOP_MAX_ROWS: int = 16
+    TPU_DSV4_SWA_NUM_QUERIES_PER_BLOCK: tuple[int, int, int] = (1, 32, 32)
+    TPU_DSV4_SWA_Q_COMPUTE_BLOCK_SIZE: int = 16
+    TPU_DSV4_SWA_KV_BLOCK_TOKENS: int = 256
+    TPU_DSV4_HCA_PREFETCH_EARLY: bool = False
+    TPU_DSV4_FUSED_HCA_DECODE: bool = False
+    TPU_DSV4_FUSED_HCA_BLK_PAGES: int = 128
+    TPU_DSV4_FUSED_HCA_ROPE: bool = False
+    TPU_DSV4_FUSED_HCA_MIXED: bool = False
+    TPU_DSV4_FUSED_HCA_MIXED_KT: int = 2048
+    TPU_DSV4_FUSED_HCA_MIXED_KT_TAIL: int = 512
+    TPU_DSV4_FUSED_HCA_MIXED_Q_ROWS: int = 1024
+    TPU_DSV4_SWA_SINGLE_PASS: bool = False
+    TPU_DSV4_SWA_SINGLE_PASS_MAX_TOKENS: int = 32
+    TPU_DSV4_SWA_SINGLE_PASS_BQ: int = 8
+    TPU_DSV4_INDEXER_KV_SPLIT_MIN_TOKENS: int = 0
+    TPU_STREAMIDX_STRICT_CAUSAL: bool = True
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
     TPU_STREAMIDX_SMALL_BUCKET_BKVP: int | None = None
     TPU_STREAMIDX_SMALL_BUCKET_TOKENS: int = 64
+    TPU_DSV4_CSA_GATHER_NO_PAD: bool = True
+    TPU_DSV4_CSA_UNION_DENSE: bool = False
+    TPU_DSV4_SMLA_UNION_VERIFY: bool = False
+    TPU_DSV4_SMLA_UNION_VERIFY_MAX_TOKENS: int = 128
+    TPU_DSV4_SMLA_UNION_VERIFY_ABOVE: int = 0
+    TPU_DSV4_SMLA_UNION_VERIFY_EARLY: bool = True
+    TPU_DSV4_SMLA_UNION_VERIFY_FENCE: int = 0
+    TPU_DSV4_QNORM_ROPE_FLAT: bool = False
+    TPU_DSV4_ROPE_QUANT_FLAT: bool = False
+    TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS: int = 512
+    TPU_DSV4_CSA_WINDOW_MIXED: bool = False
+    TPU_DSV4_CSA_WINDOW_MIXED_ABOVE: int = 256
+    TPU_DSV4_CSA_WINDOW_MIXED_MIN_HEADS: int = 32
+    TPU_DSV4_CSA_WINDOW_MIXED_GROUPS: int = 1
+    TPU_DSV4_CSA_WINDOW_MIXED_MAX_TOKENS: int = 2048
+    TPU_DSV4_CSA_WINDOW_MIXED_WQ: int = 8
+    TPU_DSV4_CSA_UNION_DENSE_ROWS_PER_TOKEN: int = 160
+    TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS: int = 32
+    TPU_DSV4_CSA_UNION_DENSE_MAX_KV_TP4: int = 0
+    TPU_DSV4_CSA_TOPK_AFTER_Q_ABOVE: int = 0
+    TPU_DSV4_CSA_TOPK_FENCE_Q: bool = False
+    TPU_DSV4_CSA_TOPK_AFTER_KV: bool = False
+    TPU_DSV4_SEQ_PARALLEL: bool = False
+    TPU_NUM_GPU_BLOCKS_OVERRIDE: int = 0
+    TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS: int = 0
+    TPU_DSV4_SP_SHARED_TP: int = 0
+    TPU_DSV4_INDEXER_TOKEN_SPLIT_ABOVE: int = 0
+    TPU_DSV4_INDEXER_TOKEN_SPLIT_PIECES: int = 1
+    TPU_DSV4_INDEXER_GROUP_MAX: bool = False
+    TPU_DSV4_INDEXER_GROUP_MAX_MIN_KV: int = 65536
+    TPU_STREAMIDX_CHUNK_SCHED_GROUPS: bool = True
+    TPU_DSPARK_VOCAB_PARALLEL_MARKOV: bool = True
+    TPU_DSPARK_SHARDED_CONTEXT_KV: bool = True
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
+    VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL: bool = True
+    VLLM_TPU_DSV4_MHC_FUSE_NORM: bool = True
+    VLLM_TPU_DSV4_MHC_STACKED_FN: bool = True
+    VLLM_TPU_DSV4_MHC_TOKEN_BLOCK: int = 128
+    VLLM_TPU_DSV4_MHC_GATES_MAX_TOKENS: int = 0
+    VLLM_TPU_DSV4_MHC_SMALL_BLOCK: int = 16
+    VLLM_TPU_DSV4_MHC_FN_CHUNKS: int = 3
+    VLLM_TPU_DSV4_MHC_LOW_VMEM_MAX_TOKENS: int = 0
+    VLLM_TPU_DSV4_MHC_SEAM_FN_HBM: str = ""
+    TPU_DSV4_MHC_AR_SEAM: bool = False
+    TPU_DSV4_MHC_MOE_AR_SEAM: int = 0
+    VLLM_TPU_DSV4_MHC_POST_HEAD: bool = True
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_SPARSE_MLA_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
@@ -255,6 +363,12 @@ def env_with_choices(
 _TRUE_STRINGS = ("true", "1", "yes", "on")
 _FALSE_STRINGS = ("false", "0", "no", "off")
 DEFAULT_INDEXER_KV_CACHE_MODE = "sal"
+# DeepSeek-V4 per-core decode linears at TP8 (attention TP, shared expert TP).
+# DSv4 decode linears measured faster on the kernel (close-gaps fp8-linears);
+# the shared expert is left out (no gain at c16, already prefetched at c4).
+FP8_LINEAR_PALLAS_DEFAULT_SITES = (
+    "attn.fused_wqa_wkv,attn.wq_b,attn.wo_b,indexer.wq_b"
+)
 
 
 def env_bool(env_name: str, default: bool = False) -> Callable[[], bool]:
@@ -735,11 +849,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Greedy steps without logprobs or grammar take the vocabulary-parallel
     # argmax (runner/greedy_top_tokens.py) instead of gathering the logits.
     "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS"),
+    # Non-greedy, grammar-free spec-verify steps run the logits gathers, bonus
+    # sampling, per-token parameter gathers and the rejection sampler as one
+    # compiled program instead of about ten. Same uniforms, same tokens.
+    "TPU_SAMPLER_FUSED_CHAIN": env_bool("TPU_SAMPLER_FUSED_CHAIN", True),
+    # With TPU_SAMPLER_FUSED_CHAIN: draw the chain's uniforms inside that
+    # program instead of as eager programs before it. Dynamo cannot take a
+    # torch.Generator, so the sampling generator becomes the device's default
+    # generator, seeded once from model_config.seed like the dedicated one; a
+    # compiled torch.rand on it yields the eager draw's bits, so the stream is
+    # unchanged as long as nothing else draws from the default generator.
+    "TPU_SAMPLER_GRAPH_RNG": env_bool("TPU_SAMPLER_GRAPH_RNG"),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
+    # Engine core: sliding-window groups keep each request's replay-boundary
+    # prefix-cache checkpoint until the request is freed, and the freed request
+    # queues it with the prefix it serves (core/checkpoint_free_order.py).
+    "TPU_KV_HOLD_REPLAY_CHECKPOINT": env_bool("TPU_KV_HOLD_REPLAY_CHECKPOINT"),
+    # Engine core: prefix-cache hits on full-attention + sliding-window hybrids
+    # land on multiples of this many tokens instead of the scheduler block; the
+    # full-attention block holding the hit point is copied on write
+    # (core/fine_prefix_hits.py). 0 = off.
+    "TPU_FINE_PREFIX_HIT_TOKENS": env_nonnegative_int("TPU_FINE_PREFIX_HIT_TOKENS", 0),
     # Steps between per-rank "step timing" log lines: the step period grouped
     # by DP token bucket (runner/step_timing_log.py). 0 disables it.
     "TPU_STEP_TIMING_LOG_STEPS": env_nonnegative_int("TPU_STEP_TIMING_LOG_STEPS", 0),
+    # Async scheduling + DFlash/DSpark: dispatch the drafter before the host
+    # waits on the previous step's sampled-token copy (runner/tpu_runner.py).
+    "TPU_ASYNC_DRAFT_BEFORE_RESULT_WAIT": env_bool("TPU_ASYNC_DRAFT_BEFORE_RESULT_WAIT"),
     # Model workers: DeepSeek-V4's 128-ratio compressor state cache is declared
     # not prefix-cacheable (no checkpoint cached, held or host-offloaded); see
     # core/hca_state_checkpoint.py.
@@ -822,6 +959,60 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ascending device-id order, so the SparseCore gather gets its
     # N-dimensional algorithm without moving the program's DeviceAssignment.
     "MOE_FUSED_EP_SORTED_GATHER": env_bool("MOE_FUSED_EP_SORTED_GATHER"),
+    # Decode buckets of fused EP MoE v2 (kernels/fused_moe/v2/layer.py
+    # SMALL_BATCH_LOCAL_TOKENS, fused stage only), all bit-identical and ON
+    # by default (set =0 to fall back to the XLA glue):
+    # carry the routing exchange inside the activation all-gather (needs the
+    # sharded plan); build the slab tables by TensorCore one-hot rather than
+    # SparseCore scatter; build the whole routing plan in one Pallas call
+    # (needs the sharded plan); sum the arrivals in one Pallas call; restore
+    # the TP replicas' rows with a small Pallas all-gather; fold the score
+    # bias and row-finiteness test into the top-k selector.
+    "MOE_FUSED_EP_V2_MERGED_EXCHANGE": env_bool("MOE_FUSED_EP_V2_MERGED_EXCHANGE", True),
+    "MOE_FUSED_EP_V2_ONEHOT_SCATTER": env_bool("MOE_FUSED_EP_V2_ONEHOT_SCATTER", True),
+    "MOE_FUSED_EP_V2_PALLAS_PLAN": env_bool("MOE_FUSED_EP_V2_PALLAS_PLAN", True),
+    "MOE_FUSED_EP_V2_DECODE_COMBINE": env_bool("MOE_FUSED_EP_V2_DECODE_COMBINE", True),
+    "MOE_FUSED_EP_V2_PALLAS_RESTORE": env_bool("MOE_FUSED_EP_V2_PALLAS_RESTORE", True),
+    "MOE_FUSED_EP_V2_FUSED_SELECT": env_bool("MOE_FUSED_EP_V2_FUSED_SELECT", True),
+    # Decode buckets: quantize the wire rows straight into lane blocks.
+    "MOE_FUSED_EP_V2_LANE_QUANT": env_bool("MOE_FUSED_EP_V2_LANE_QUANT", True),
+    # Decode buckets with MERGED_EXCHANGE: move the merged payload with the
+    # one-shot Pallas all-gather (barrier + direct remote DMAs).
+    "MOE_FUSED_EP_V2_ONESHOT_GATHER": env_bool("MOE_FUSED_EP_V2_ONESHOT_GATHER", True),
+    # Decode buckets with DECODE_COMBINE and PALLAS_RESTORE in effect: one
+    # Pallas call sums the arrivals and pushes them to every TP member.
+    "MOE_FUSED_EP_V2_COMBINE_RESTORE": env_bool("MOE_FUSED_EP_V2_COMBINE_RESTORE"),
+    # Fused EP MoE v2, in-op shared expert at decode buckets (Pallas restore +
+    # small all-reduce in effect): add each core's routed rows into its slot of
+    # the shared partial and let the one small all-reduce sum both, instead of
+    # a restore all-gather followed by the shared all-reduce. Not bit-exact
+    # (one extra bf16 rounding moves before the reduce).
+    "MOE_FUSED_EP_V2_FOLD_RESTORE_INTO_SHARED_AR": env_bool(
+        "MOE_FUSED_EP_V2_FOLD_RESTORE_INTO_SHARED_AR"
+    ),
+    # With FOLD_RESTORE_INTO_SHARED_AR: fold at every decode-glue bucket the
+    # small all-reduce takes (e.g. T32 at TP4, t_local 8, with
+    # TPU_SMALL_ALL_REDUCE_MAX_ROWS=32), not only where the Pallas restore is
+    # in effect (t_local <= 4).
+    "MOE_FUSED_EP_V2_FOLD_ANY_DECODE": env_bool("MOE_FUSED_EP_V2_FOLD_ANY_DECODE"),
+    # Mixed buckets (t_local > 16, sharded plan, quantized rows): build the
+    # fused-EP routing plan in one Pallas call (mixed_plan_kernel) instead of
+    # ~100 XLA ops and two SparseCore scatters. Same bits.
+    "TPU_DSV4_EP_MIXED_PLAN_KERNEL": env_bool("TPU_DSV4_EP_MIXED_PLAN_KERNEL"),
+    # With the mixed plan kernel on: move the routing exchange with the
+    # one-shot Pallas all-gather on the TensorCore instead of XLA's all-gather
+    # (SparseCore-offloaded ahead of the activation gather at c4/c8, a
+    # synchronous TensorCore collective at c16). Same bits.
+    "TPU_DSV4_EP_MIXED_EXCHANGE_ONESHOT": env_bool("TPU_DSV4_EP_MIXED_EXCHANGE_ONESHOT"),
+    # Mixed buckets (t_local > 16, quantized rows): the combine (scale gather,
+    # coefficient, row gather, k-sum, row_routes select) as one Pallas call
+    # (mixed_combine_kernel) instead of a SparseCore gather + XLA/Pallas sum.
+    "TPU_DSV4_EP_MIXED_COMBINE_KERNEL": env_bool("TPU_DSV4_EP_MIXED_COMBINE_KERNEL"),
+    # Largest local token count the one-shot Pallas EP gather takes (smallest
+    # stays 2).
+    "MOE_FUSED_EP_V2_ONESHOT_GATHER_MAX_LOCAL_TOKENS": env_nonnegative_int(
+        "MOE_FUSED_EP_V2_ONESHOT_GATHER_MAX_LOCAL_TOKENS", 4
+    ),
     # A JSON file naming, per MoE layer, which global experts each EP rank
     # holds and in what slot order (expert_placement.py), or the name of one
     # shipped in vllm_torchtpu/expert_placements/. Empty: the checkpoint's
@@ -835,6 +1026,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Finish the shared expert before the fused EP kernel starts, so it runs
     # while the kernel's token all-gather is in flight instead of after the
     # kernel; see VllmMoERunner._apply_quant_method.
+    # With MOE_FUSED_EP_SHARED_BEFORE_KERNEL: the fused EP op takes the shared
+    # expert's TP-partial output and returns shared + routed, reduced. From
+    # MOE_FUSED_EP_SHARED_RS_MIN_ROWS rows per TP replica up, the shared partial
+    # is reduce-scattered onto each core's own rows before the routed rows'
+    # replica all-gather (one reduce-scatter instead of an all-reduce); below,
+    # it is all-reduced in the op (the runner's own arithmetic). -1 (default)
+    # picks by TP size: 1024 rows at TP >= 8, 256 below (DSv4 twin: the
+    # reduce-scatter wins at T2048 TP8 and T512 TP4); 0 never reduce-scatters.
+    "MOE_FUSED_EP_SHARED_IN_OP": env_bool("MOE_FUSED_EP_SHARED_IN_OP", True),
+    "MOE_FUSED_EP_SHARED_RS_MIN_ROWS": env_int("MOE_FUSED_EP_SHARED_RS_MIN_ROWS", -1),
     "MOE_FUSED_EP_SHARED_BEFORE_KERNEL": env_bool("MOE_FUSED_EP_SHARED_BEFORE_KERNEL"),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its
@@ -843,6 +1044,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE": lambda: int(
         os.getenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", "0") or 0
     ),
+    # Tile height (= capacity) of fused EP MoE v2's decode builds: a fused
+    # call with t_local <= MOE_FUSED_EP_V2_DECODE_TILE_MAX_LOCAL_TOKENS builds
+    # at this height instead of the adapter's 128, with a single rung. At
+    # decode every expert holds a few rows, so the 32-row tile computes what
+    # the ladder's short rung computes today, while the program text drops
+    # the 128-row FFN body copies; in a 61-layer program that text evicted
+    # the next op's code from the TensorCore's instruction overlay (the
+    # decode combine paid a ~4.6 us overlay load per layer). Per-row
+    # arithmetic is unchanged, so the output bits are. Zero is off.
+    "MOE_FUSED_EP_V2_DECODE_TILE_M": env_nonnegative_int("MOE_FUSED_EP_V2_DECODE_TILE_M", 0),
+    "MOE_FUSED_EP_V2_DECODE_TILE_MAX_LOCAL_TOKENS": env_nonnegative_int(
+        "MOE_FUSED_EP_V2_DECODE_TILE_MAX_LOCAL_TOKENS", 16
+    ),
+    # Restore fused EP MoE v2's all-pairs barrier after the transport drain.
+    # The kernel's double head barrier is sufficient on its own; the trailing
+    # one only waits for the slowest core (~4.7 us a call at EP16).
+    "MOE_FUSED_EP_V2_TAIL_BARRIER": env_bool("MOE_FUSED_EP_V2_TAIL_BARRIER"),
+    # Fused EP MoE v2's decode fill schedule: on chunk-streamed builds with at
+    # most kernel.FILL_MAX_ROWS_PER_EXPERT routed rows per expert, stream each
+    # weight slab in two chunks and wait the gate/up slab chunk by chunk, so
+    # the first visit computes before its whole slab lands. 0 turns it off.
+    "MOE_FUSED_EP_V2_FILL_SCHEDULE": env_bool("MOE_FUSED_EP_V2_FILL_SCHEDULE", True),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
     # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device
@@ -876,6 +1099,56 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DSV4_INDEXER_NUM_QUERIES_PER_BLOCK": env_positive_int_triple(
         "TPU_DSV4_INDEXER_NUM_QUERIES_PER_BLOCK", (1, 32, 32)
     ),
+    # DSv4 compressor state projection (proj_and_save_state): calls of at least
+    # this many tokens write one DMA per page-contiguous run of token states
+    # instead of one per token and half-state (same bytes). 0 disables.
+    "TPU_DSV4_COMPRESSOR_PROJ_RUNS_MIN_TOKENS": env_nonnegative_int(
+        "TPU_DSV4_COMPRESSOR_PROJ_RUNS_MIN_TOKENS", 128
+    ),
+    "TPU_DSV4_COMPRESSOR_PROJ_RUNS_TILE_N": env_positive_int(
+        "TPU_DSV4_COMPRESSOR_PROJ_RUNS_TILE_N", 512
+    ),
+    # Also the 128-dim indexer compressor (not bit-exact: last-bit differences
+    # in the score half of the state).
+    "TPU_DSV4_COMPRESSOR_PROJ_RUNS_INDEXER": env_bool(
+        "TPU_DSV4_COMPRESSOR_PROJ_RUNS_INDEXER"
+    ),
+    # DSv4 compress-norm-rope-store of a step's prefill boundaries in blocks of
+    # this many compressed tokens (prefill_block.py), CSA and the SAL indexer,
+    # for calls of at least ..._MIN_TOKENS tokens (256 keeps it off c16's
+    # 128-token decode bucket, which has no prefill boundaries). 0 disables.
+    "TPU_DSV4_COMPRESSOR_PREFILL_BLOCK": env_nonnegative_int(
+        "TPU_DSV4_COMPRESSOR_PREFILL_BLOCK", 128
+    ),
+    "TPU_DSV4_COMPRESSOR_PREFILL_BLOCK_MIN_TOKENS": env_nonnegative_int(
+        "TPU_DSV4_COMPRESSOR_PREFILL_BLOCK_MIN_TOKENS", 256
+    ),
+    # DSv4 compressor projection: calls of at most this many tokens stream the
+    # weight from HBM through a VMEM ring (proj_and_save_state.kernel_stream)
+    # instead of the 4-step emit_pipeline kernel. 0 disables.
+    "TPU_DSV4_COMPRESSOR_PROJ_STREAM_MAX_TOKENS": env_nonnegative_int(
+        "TPU_DSV4_COMPRESSOR_PROJ_STREAM_MAX_TOKENS", 0
+    ),
+    # ...its ring as "k_tile,slots,dmas_per_tile". k_tile 3584 keeps the bf16
+    # stored bytes identical to the emit_pipeline kernel.
+    "TPU_DSV4_COMPRESSOR_PROJ_STREAM_CFG": env_positive_int_triple(
+        "TPU_DSV4_COMPRESSOR_PROJ_STREAM_CFG", (3584, 2, 1)
+    ),
+    # Store the compressor projections (fused_wkv_wgate; bf16 in the
+    # checkpoint) as per-output-channel e4m3 with an f32 scale, and run every
+    # projection through the stream kernel (bf16 x fp8 dot, f32 accumulation).
+    # Numerics change: needs accuracy evidence.
+    "TPU_DSV4_COMPRESSOR_FP8": env_bool("TPU_DSV4_COMPRESSOR_FP8"),
+    # CSA layers: the KV compressor's and the indexer compressor's projections
+    # (same tokens) in one weight-stream call, for steps the stream serves
+    # (TPU_DSV4_COMPRESSOR_PROJ_STREAM_MAX_TOKENS).
+    "TPU_DSV4_COMPRESSOR_PAIR": env_bool("TPU_DSV4_COMPRESSOR_PAIR"),
+    # Stream only compressor projections whose state is at least this wide
+    # (CSA KV 2048, HCA 1024, indexer 512); narrower ones keep the pipeline
+    # kernel. 0 = all.
+    "TPU_DSV4_COMPRESSOR_PROJ_STREAM_MIN_WIDTH": env_nonnegative_int(
+        "TPU_DSV4_COMPRESSOR_PROJ_STREAM_MIN_WIDTH", 0
+    ),
     # CSA: query tokens per gather + attention chunk of the sparse attention
     # (sparse_ragged_paged_attention). Steps of at most 128 tokens keep 32.
     "TPU_DSV4_CSA_GATHER_AND_ATTENTION_CHUNK_SIZE": env_positive_int(
@@ -890,6 +1163,52 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_HASH_TABLE_ROW_MAJOR": env_bool(
         "TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False
     ),
+    # Sum small bf16 TP all-reduces with the Pallas two-shot kernel
+    # (kernels/experimental/small_collectives) over the TP group's cores of the
+    # expert-parallel mesh, instead of XLA's all-reduce. Needs an EP mesh.
+    "TPU_SMALL_ALL_REDUCE": env_bool("TPU_SMALL_ALL_REDUCE", True),
+    # Largest block, in rows, the kernel takes; XLA sums larger ones inside the
+    # same op. 0 picks by TP group size (small_all_reduce_op.max_rows: 32 rows
+    # at 8 cores, 16 below, where the kernel measured faster than XLA under the
+    # DSv4 served LIBTPU flags).
+    "TPU_SMALL_ALL_REDUCE_MAX_ROWS": env_nonnegative_int(
+        "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 0
+    ),
+    # Four-member TP groups laid out as two chips (group positions 0,1 and 2,3
+    # each the two cores of one chip, as DP4 x TP4 on 2x2x2 lists them): sum
+    # with the small all-reduce's chip-aware "pairs" form (on-chip
+    # reduce-scatter, cross-chip swap of pair sums, on-chip all-gather: half the
+    # two-shot's chip-to-chip bytes) pipelined over this many column chunks.
+    # Rounds twice, like XLA's psum. 0 = off (two-shot / one-shot as before).
+    "TPU_SMALL_ALL_REDUCE_PAIRS": env_nonnegative_int(
+        "TPU_SMALL_ALL_REDUCE_PAIRS", 0
+    ),
+    # Small Pallas collectives (all-reduce, one-shot gather): skip Mosaic's
+    # default entry device barrier; their own group barrier already orders
+    # every push after every member's entry.
+    "TPU_SMALL_COLLECTIVES_SKIP_DEVICE_BARRIER": env_bool(
+        "TPU_SMALL_COLLECTIVES_SKIP_DEVICE_BARRIER"
+    ),
+    # Per-channel FP8 dense linears at decode token counts (<= fp8_skinny.MAX_M rows)
+    # run as the weight-streaming Pallas kernel (kernels/quantized_matmul/
+    # fp8_skinny.py) instead of XLA's quantize + fp8 dot, on the layers named by
+    # TPU_FP8_LINEAR_PALLAS_SITES whose (K, N) has a measured tiling. Outputs differ
+    # from the XLA path (exact f32 accumulation): tolerance-tier numerics.
+    "TPU_FP8_LINEAR_PALLAS": env_bool("TPU_FP8_LINEAR_PALLAS", True),
+    # Comma-separated layer-prefix suffixes, "."-bounded, e.g. "attn.wo_b".
+    "TPU_FP8_LINEAR_PALLAS_SITES": env_str(
+        "TPU_FP8_LINEAR_PALLAS_SITES", FP8_LINEAR_PALLAS_DEFAULT_SITES
+    ),
+    # Of the TPU_FP8_LINEAR_PALLAS sites, those whose kernel weight operand is
+    # constrained to HBM, so XLA cannot stage it into VMEM ahead of the call.
+    # Same arithmetic, bit-identical outputs; placement only.
+    "TPU_FP8_SKINNY_HBM_PIN_SITES": env_str(
+        "TPU_FP8_SKINNY_HBM_PIN_SITES", FP8_LINEAR_PALLAS_DEFAULT_SITES
+    ),
+    # HBM-pinned fp8_skinny sites with N % 1024 == 0: the per-channel weight scale
+    # is an HBM operand DMA'd in-kernel with the weight ring, instead of a VMEM
+    # operand XLA stages with an exposed copy just before the call. Bit-identical.
+    "TPU_FP8_SKINNY_SCALE_DMA": env_bool("TPU_FP8_SKINNY_SCALE_DMA", True),
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",") if v.strip()
@@ -923,9 +1242,94 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Cutting the flat token axis into `chunk_tokens`-sized pieces lets each
     # chunk's SparseCore top-k overlap the next chunk's TensorCore scoring.
     # Unset means unchunked: one single pass, no pipelining.
+    # DSv4 sliding-window attention kernel blocks (decode, prefill, mixed)
+    # query tokens per block, q rows per compute block, KV tokens per block.
+    "TPU_DSV4_SWA_NUM_QUERIES_PER_BLOCK": env_positive_int_triple(
+        "TPU_DSV4_SWA_NUM_QUERIES_PER_BLOCK", (1, 32, 32)
+    ),
+    # 16 (was a hardcoded 4): bit-exact, mixed T2048 SWA pass 0.497 -> 0.359 ms
+    # per layer on one core; decode unchanged.
+    "TPU_DSV4_SWA_Q_COMPUTE_BLOCK_SIZE": env_positive_int(
+        "TPU_DSV4_SWA_Q_COMPUTE_BLOCK_SIZE", 16
+    ),
+    "TPU_DSV4_SWA_KV_BLOCK_TOKENS": env_positive_int(
+        "TPU_DSV4_SWA_KV_BLOCK_TOKENS", 256
+    ),
+    # DSv4 sliding-window attention: run every sequence in one mixed-case kernel
+    # launch instead of three (decode / verify / mixed), two of which are empty
+    # on a speculative-decoding decode step (~1-1.5 us per empty launch).
+    "TPU_DSV4_SWA_SINGLE_PASS": env_bool("TPU_DSV4_SWA_SINGLE_PASS"),
+    # ... only for buckets of T <= this many tokens (decode steps), with this
+    # mixed-case q block (a verify window, not a prefill chunk).
+    "TPU_DSV4_SWA_SINGLE_PASS_MAX_TOKENS": env_int(
+        "TPU_DSV4_SWA_SINGLE_PASS_MAX_TOKENS", 32
+    ),
+    "TPU_DSV4_SWA_SINGLE_PASS_BQ": env_positive_int("TPU_DSV4_SWA_SINGLE_PASS_BQ", 8),
+    # DSv4 HCA attention: issue the next KV block's page DMAs before the current
+    # block's compute instead of after it, so the copy overlaps the compute.
+    "TPU_DSV4_HCA_PREFETCH_EARLY": env_bool("TPU_DSV4_HCA_PREFETCH_EARLY"),
+    # DSv4 HCA layers, steps of T <= 32 tokens: one fused kernel for the SWA window
+    # + compressed rows (one online softmax + sink, new rows stored in-kernel)
+    # instead of the SWA kernel, the HCA MLA kernels and their hand-off glue.
+    "TPU_DSV4_FUSED_HCA_DECODE": env_bool("TPU_DSV4_FUSED_HCA_DECODE"),
+    # ... HCA pages (8 compressed rows each) per KV block of that kernel.
+    "TPU_DSV4_FUSED_HCA_BLK_PAGES": env_positive_int("TPU_DSV4_FUSED_HCA_BLK_PAGES", 128),
+    # ... and (with TPU_DSV4_FUSED_HCA_DECODE) the HCA layers' q RMSNorm + RoPE and kv RoPE move
+    # into the attention op: in the fused kernel's prologue at T <= 32, the stock rope kernels otherwise.
+    "TPU_DSV4_FUSED_HCA_ROPE": env_bool("TPU_DSV4_FUSED_HCA_ROPE"),
+    # DSv4 HCA layers, steps of T > 32 tokens (mixed / prefill-chunk steps): one fused kernel
+    # (fused_hca_mixed) per layer instead of the SWA kernel + MLA-p + MLA-m + hand-off glue; each
+    # request's compressed rows are read once into VMEM and reused by all its query blocks.
+    "TPU_DSV4_FUSED_HCA_MIXED": env_bool("TPU_DSV4_FUSED_HCA_MIXED"),
+    # ... compressed rows per wide compute tile (where every query row of the block sees them), per
+    # narrow tail / visibility-edge tile, and query rows (tokens x heads) per prefill block.
+    "TPU_DSV4_FUSED_HCA_MIXED_KT": env_positive_int("TPU_DSV4_FUSED_HCA_MIXED_KT", 2048),
+    "TPU_DSV4_FUSED_HCA_MIXED_KT_TAIL": env_positive_int("TPU_DSV4_FUSED_HCA_MIXED_KT_TAIL", 512),
+    "TPU_DSV4_FUSED_HCA_MIXED_Q_ROWS": env_positive_int("TPU_DSV4_FUSED_HCA_MIXED_Q_ROWS", 1024),
+    # DSv4 indexer: from this many tokens per bucket on, each TP rank scores
+    # only its contiguous 1/TP of every sequence's compressed positions; the
+    # ranks exchange their top-k candidates (all-to-all) and merge them (same
+    # indices, same order as the replicated indexer). 0 = replicated indexer.
+    # Ported from patemotter fdcc70a0d/cccc1c5b7/ec1c92c5f/9fb77a965.
+    "TPU_DSV4_INDEXER_KV_SPLIT_MIN_TOKENS": env_int(
+        "TPU_DSV4_INDEXER_KV_SPLIT_MIN_TOKENS", 0
+    ),
     "TPU_STREAMIDX_CHUNK_TOKENS": env_positive_int_or_none(
         "TPU_STREAMIDX_CHUNK_TOKENS"
     ),
+    # StreamIndex verify pass (speculative-decoding windows of <= 8 tokens):
+    # score two lane tiles per 256-deep MXU pass with a block-diagonal q
+    # (16 rows per head) and reduce the heads in packed bf16 (relu(q.k) and the
+    # weights rounded to bf16, products accumulated in f32), the numerics the
+    # mixed/prefill pass already uses. Halves the VPU work of the reduction.
+    "TPU_STREAMIDX_VERIFY_BD": env_bool("TPU_STREAMIDX_VERIFY_BD"),
+    # DSv4 q-RMSNorm + RoPE / indexer rope_quant: read the wq_b projection in its
+    # flat [T, heads * dim] (8, 128) tiles inside the kernel instead of letting
+    # XLA relay it out to [T, heads, dim] first (a TC copy per layer at decode,
+    # a SparseCore data-format call at prefill). Bit-exact. Ported from cuiq
+    # forge/cmp-c90c0ac7 af9afe1f1 / a2c62f3b6.
+    "TPU_DSV4_QNORM_ROPE_FLAT": env_bool("TPU_DSV4_QNORM_ROPE_FLAT"),
+    "TPU_DSV4_ROPE_QUANT_FLAT": env_bool("TPU_DSV4_ROPE_QUANT_FLAT"),
+    # DSv4 indexer: hand the SparseCore top-k the scoring kernel's [T, S, 128]
+    # buffer as is, without padding rows, instead of reshaping it to [T, S*128]
+    # and padding the rows to the top-k's wave size. The bytes are identical, so
+    # XLA passes it as a bitcast; the padded form costs a relayout, a pad and a
+    # SparseCore data-format conversion (~48 us per CSA layer at T8/T16, 1M
+    # max-model-len). Same selection. Set 0 to restore the padded form.
+    "TPU_DSV4_SC_TOPK_FLAT_SCORES": env_bool(
+        "TPU_DSV4_SC_TOPK_FLAT_SCORES", default=True
+    ),
+    # DSv4 indexer: token buckets up to which the SparseCore top-k splits every
+    # row over a group of subcores (the cooperative pass) instead of one
+    # subcore per row. A decode bucket holds a few long verify rows, which
+    # otherwise leave most of the 32 subcores idle. Same selection. 0 = off.
+    # (port of patemotter 591c2370b; 32-row buckets measured no better)
+    "TPU_DSV4_SC_TOPK_COOP_MAX_ROWS": env_int("TPU_DSV4_SC_TOPK_COOP_MAX_ROWS", 16),
+    # DSv4 indexer rows see only the compressed groups complete at their own
+    # position, (pos + 1) // ratio, in multi-token forwards (chunked prefill,
+    # speculative verify). 0 restores the old bound, under which a row can
+    # select a group that a later token of the same forward completes.
+    "TPU_STREAMIDX_STRICT_CAUSAL": env_bool("TPU_STREAMIDX_STRICT_CAUSAL", default=True),
     # Merge the DCP indexer candidates with an all-to-all over the token axis
     # instead of an all-gather over the candidate axis. Same result.
     "TPU_DCP_INDEXER_A2A_MERGE": env_bool("TPU_DCP_INDEXER_A2A_MERGE", default=False),
@@ -955,6 +1359,158 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_STREAMIDX_SMALL_BUCKET_TOKENS": env_int(
         "TPU_STREAMIDX_SMALL_BUCKET_TOKENS", 64
     ),
+    # DSv4 CSA: size the SparseCore KV gather's per-subcore chunk so its output
+    # needs no padding rows, and hence no slice copy after it.
+    "TPU_DSV4_CSA_GATHER_NO_PAD": env_bool("TPU_DSV4_CSA_GATHER_NO_PAD", True),
+    # CSA prefill (buckets of at least ..._MIN_TOKENS tokens): attend each query
+    # block's (64 tokens at <= 16 local heads, else 32) union of top-k rows once,
+    # gathered on SparseCore, with a per-token selection mask
+    # (`csa_union_dense`), instead of gathering every token's own 1024 rows.
+    # Same keys per token. A step whose union rows exceed ROWS_PER_TOKEN x
+    # tokens (where it would not pay) falls back to the sparse path.
+    "TPU_DSV4_CSA_UNION_DENSE": env_bool("TPU_DSV4_CSA_UNION_DENSE"),
+    # CSA decode buckets (T <= ..._MAX_TOKENS, a power of 2): cut every request
+    # into windows of <= 8 tokens (a speculative verify window is one) and
+    # attend each window's union of top-k rows once (`csa_window_union`: one
+    # SparseCore call dedups, ranks and gathers the union rows and writes each
+    # token's keep mask; one TensorCore call attends all windows), instead of
+    # gathering and pushing every token's own 1024 rows. Same keys per token;
+    # no context cap, no runtime fallback.
+    "TPU_DSV4_SMLA_UNION_VERIFY": env_bool("TPU_DSV4_SMLA_UNION_VERIFY"),
+    "TPU_DSV4_SMLA_UNION_VERIFY_MAX_TOKENS": env_int(
+        "TPU_DSV4_SMLA_UNION_VERIFY_MAX_TOKENS", 128
+    ),
+    # ... and only buckets of T > this many tokens (a power of 2; 0 = all).
+    "TPU_DSV4_SMLA_UNION_VERIFY_ABOVE": env_int("TPU_DSV4_SMLA_UNION_VERIFY_ABOVE", 0),
+    # Issue the union SparseCore call as soon as the top-k exists (it then runs
+    # behind the SWA pass on the TensorCore) instead of after the SWA pass.
+    "TPU_DSV4_SMLA_UNION_VERIFY_EARLY": env_bool(
+        "TPU_DSV4_SMLA_UNION_VERIFY_EARLY", True
+    ),
+    # ... and issue that SparseCore call only once the attention op's q (1) or
+    # q and roped kv (2) exist. Unfenced, XLA starts it -- and so waits on the
+    # indexer top-k -- before the q projection: served c16 T32 exposed
+    # ~16.5 us/CSA layer of top-k wait that the base arm hid behind SWA.
+    # Scheduling only. 0 = unfenced.
+    "TPU_DSV4_SMLA_UNION_VERIFY_FENCE": env_int("TPU_DSV4_SMLA_UNION_VERIFY_FENCE", 0),
+    # CSA buckets of T > ..._ABOVE tokens (a power of 2, above the decode
+    # buckets) with at least ..._MIN_HEADS local heads (32 = TP4): attend each
+    # request's 8-token windows' unions (`csa_window_union`, the decode route's
+    # kernels run in SparseCore waves) instead of union-dense blocks. Same keys
+    # per token; no context cap, no runtime fallback.
+    "TPU_DSV4_CSA_WINDOW_MIXED": env_bool("TPU_DSV4_CSA_WINDOW_MIXED"),
+    "TPU_DSV4_CSA_WINDOW_MIXED_ABOVE": env_int("TPU_DSV4_CSA_WINDOW_MIXED_ABOVE", 256),
+    "TPU_DSV4_CSA_WINDOW_MIXED_MIN_HEADS": env_int("TPU_DSV4_CSA_WINDOW_MIXED_MIN_HEADS", 32),
+    # Window groups per step: one SparseCore call per group, so group g + 1's
+    # dedup/gather runs under group g's TensorCore attention (1 = one call).
+    "TPU_DSV4_CSA_WINDOW_MIXED_GROUPS": env_int("TPU_DSV4_CSA_WINDOW_MIXED_GROUPS", 1),
+    # ... and buckets of T <= this many tokens (a power of 2; at TP8 the
+    # union-dense bq-64 kernel stays ahead at T2048 below ~100k-token prefixes).
+    "TPU_DSV4_CSA_WINDOW_MIXED_MAX_TOKENS": env_int("TPU_DSV4_CSA_WINDOW_MIXED_MAX_TOKENS", 2048),
+    # Tokens per window on the mixed route: 8, or 16 (M = 16 x 16 heads = 256
+    # rows per pushed tile at TP8; half the gathered rows of 8-token windows).
+    "TPU_DSV4_CSA_WINDOW_MIXED_WQ": env_int("TPU_DSV4_CSA_WINDOW_MIXED_WQ", 8),
+    "TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS": env_int(
+        "TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS", 512
+    ),
+    "TPU_DSV4_CSA_UNION_DENSE_ROWS_PER_TOKEN": env_int(
+        "TPU_DSV4_CSA_UNION_DENSE_ROWS_PER_TOKEN", 160
+    ),
+    # Only at most this many local query heads (16 = TP8, 32 = TP4). At TP4 (T512
+    # buckets) the plan runs as one pass on two subcores per block.
+    "TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS": env_int(
+        "TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS", 32
+    ),
+    # At more than 16 local heads (TP4): route a sequence to union-dense only
+    # when its compressed KV (seq_len // 4, + 1) is <= this many rows; longer
+    # sequences stay on the sparse path, and a step with none routed skips the
+    # SparseCore plan. At TP4 the dense pass costs ~heads x union, so it pays
+    # only at short contexts (-17% @22.5k, -7% @51k, 0% @100k tokens per call),
+    # and a step that falls back pays the plan for nothing. 0 = no limit.
+    "TPU_DSV4_CSA_UNION_DENSE_MAX_KV_TP4": env_int(
+        "TPU_DSV4_CSA_UNION_DENSE_MAX_KV_TP4", 0
+    ),
+    # CSA buckets above this many tokens fence the top-k with the projected
+    # q before the attention op uses it, so the indexer's top-k all-gather
+    # (token split) completes under the q projection instead of right behind
+    # its start. Scheduling only. 0 = off.
+    "TPU_DSV4_CSA_TOPK_AFTER_Q_ABOVE": env_int("TPU_DSV4_CSA_TOPK_AFTER_Q_ABOVE", 0),
+    # Indexer token-split path: fence this rank's SparseCore top-k with the
+    # projected + roped q before the top-k all-gather, so the q projection
+    # runs while the top-k is on the SparseCore instead of after its done.
+    # Scheduling only.
+    "TPU_DSV4_CSA_TOPK_FENCE_Q": env_bool("TPU_DSV4_CSA_TOPK_FENCE_Q"),
+    # With TPU_DSV4_CSA_TOPK_AFTER_Q_ABOVE: fence the top-k with the roped kv
+    # too (the union plan starts after kv_rope). Scheduling only.
+    "TPU_DSV4_CSA_TOPK_AFTER_KV": env_bool("TPU_DSV4_CSA_TOPK_AFTER_KV"),
+    # DeepSeek-V4 sequence parallelism over the TP group: the mHC residual
+    # stream, the mHC seams and the MoE (router, fused EP, a replicated shared
+    # expert) run on this rank's 1/tp of the tokens. Attention all-gathers its
+    # input and reduce-scatters its output (instead of one all-reduce), and the
+    # fused EP needs no restore all-gather or shared reduce-scatter.
+    "TPU_DSV4_SEQ_PARALLEL": env_bool("TPU_DSV4_SEQ_PARALLEL"),
+    # Pin the KV pool to exactly this many blocks per engine, as
+    # --num-gpu-blocks-override does, for launchers whose server command fixes
+    # --gpu-memory-utilization (a served-config invariant: resident-weight
+    # changes must not resize the pool). Ignored when the CLI flag is set.
+    # 0 = off (pool sized from --gpu-memory-utilization).
+    "TPU_NUM_GPU_BLOCKS_OVERRIDE": env_int("TPU_NUM_GPU_BLOCKS_OVERRIDE", 0),
+    # Per-bucket gate on TPU_DSV4_SEQ_PARALLEL: steps of T <= this many tokens
+    # (a power of 2) run the replicated layout -- one TP all-reduce after
+    # attention, the TP-sharded shared expert, the fused EP's TP-replica op --
+    # and only T > it run sequence parallel. 0: every bucket sequence parallel.
+    "TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS": env_int("TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS", 0),
+    # Under TPU_DSV4_SEQ_PARALLEL: keep only this rank's TP slice of the shared
+    # expert (the full replicated copy, +3.75 GB/rank at TP8, is dropped after
+    # load). The sequence-parallel side all-gathers its rows over the TP group,
+    # runs the TP-sliced gate/up/down and reduce-scatters back onto its rows
+    # (the replicated side of the gate already ran on the slice).
+    # 0 = off (full weight on the SP side); 1 = bf16 row all-gather;
+    # 2 = the rows quantized to fp8 before the all-gather (per-channel weight
+    # scales only; the same per-row quantization the matmul applies after it).
+    "TPU_DSV4_SP_SHARED_TP": env_int("TPU_DSV4_SP_SHARED_TP", 0),
+    # Under TPU_DSV4_SEQ_PARALLEL (sequence-parallel side of the gate): for
+    # T > this (a power of 2), each TP rank scores and selects the CSA indexer
+    # top-k of its own contiguous T / tp rows only (the whole batch's metadata
+    # and row lengths, so the same selection), and the indices are all-gathered.
+    # Needs max_num_seqs x (spec + 1) <= 2 x this / tp (no verify window cut).
+    # 0 = off.
+    "TPU_DSV4_INDEXER_TOKEN_SPLIT_ABOVE": env_int(
+        "TPU_DSV4_INDEXER_TOKEN_SPLIT_ABOVE", 0
+    ),
+    # Token-split indexer windows (above): cut each rank's window into this
+    # many row pieces (a power of 2), each scored into its own buffer with its
+    # own SparseCore top-k, so piece i's top-k can overlap piece i+1's scoring.
+    # Same selection. 1 = one unpipelined pass.
+    "TPU_DSV4_INDEXER_TOKEN_SPLIT_PIECES": env_int(
+        "TPU_DSV4_INDEXER_TOKEN_SPLIT_PIECES", 1
+    ),
+    # Token-split indexer windows: the mixed scoring pass also writes each
+    # row's 16-column group maxima, and the SparseCore top-k of long rows reads
+    # those and gathers only the candidate groups (sparsecore_topk_pf) instead
+    # of the whole score row. Same selection, same column order.
+    "TPU_DSV4_INDEXER_GROUP_MAX": env_bool("TPU_DSV4_INDEXER_GROUP_MAX"),
+    # ... only for sequences with at least this many compressed rows (both the
+    # scorer's group-max work and the SparseCore prefilter; shorter rows keep
+    # the full-row top-k, which is faster there). 0 = every eligible row.
+    "TPU_DSV4_INDEXER_GROUP_MAX_MIN_KV": env_int(
+        "TPU_DSV4_INDEXER_GROUP_MAX_MIN_KV", 65536
+    ),
+    # StreamIndex chunked pipeline: annotate consecutive chunks' SparseCore
+    # top-k and TensorCore scoring with XLA scheduling groups (1, default), or
+    # leave the overlap to the scheduler (0; the annotated form failed to
+    # compile in served graphs: "annotation groups with gaps").
+    "TPU_STREAMIDX_CHUNK_SCHED_GROUPS": env_bool(
+        "TPU_STREAMIDX_CHUNK_SCHED_GROUPS", default=True
+    ),
+    # DSpark greedy drafting: shard the Markov head over the vocabulary and
+    # exchange per-rank (max, argmax) pairs instead of reading the replicated
+    # full-vocabulary weight at every draft position.
+    "TPU_DSPARK_VOCAB_PARALLEL_MARKOV": env_bool("TPU_DSPARK_VOCAB_PARALLEL_MARKOV", True),
+    # DSpark context-KV step: each tensor-parallel rank computes its 1/tp of
+    # the replicated main_proj columns and all-gathers them, and one matmul
+    # computes only the KV columns of every draft layer's fused_wqa_wkv.
+    "TPU_DSPARK_SHARDED_CONTEXT_KV": env_bool("TPU_DSPARK_SHARDED_CONTEXT_KV", True),
     # Indexer K-cache writer and layout mode for GLM-5.2 / DSv4 StreamIndex:
     #   "sal" (default): Pallas coalesced_kv_append(_dcp) in SEQ_ALONG_LANE layout
     #     (falls back to "has" when block_size < 128 or when Raiden GLM admission
@@ -971,6 +1527,71 @@ environment_variables: dict[str, Callable[[], Any]] = {
         )()
         or DEFAULT_INDEXER_KV_CACHE_MODE
     ).lower(),
+    # DeepSeek-V4 mHC: compute the post/comb gates (sigmoid, softmax and
+    # Sinkhorn) inside the Pallas pre / fused seam kernels instead of as an
+    # XLA epilogue of ~130 tiny ops per seam.
+    "VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL": env_bool(
+        "VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL", True
+    ),
+    # DeepSeek-V4 mHC: the pre / fused seam kernels also apply the
+    # sublayer's attn_norm / ffn_norm RMSNorm to the layer input they emit.
+    "VLLM_TPU_DSV4_MHC_FUSE_NORM": env_bool("VLLM_TPU_DSV4_MHC_FUSE_NORM", True),
+    # DeepSeek-V4 mHC: keep fn as its three bf16 chunks stacked (3 * 24, K)
+    # and run the mix GEMM as one MXU pass (the MXU pads the 24-wide output
+    # anyway). Not bit-identical to the three-pass path: the partial sums
+    # round differently (measured closer to an f64 reference).
+    "VLLM_TPU_DSV4_MHC_STACKED_FN": env_bool("VLLM_TPU_DSV4_MHC_STACKED_FN", True),
+    # DeepSeek-V4 mHC: fused seam token block (0 = kernel default 32). 128
+    # amortizes the per-grid-step cost at prefill sizes.
+    "VLLM_TPU_DSV4_MHC_TOKEN_BLOCK": env_int("VLLM_TPU_DSV4_MHC_TOKEN_BLOCK", 128),
+    # DeepSeek-V4 mHC: in-kernel gates only up to this many tokens
+    # (-1 = kernel default 512, 0 = no cap; with a 128-token block the
+    # token-major Sinkhorn fills every lane, so no cap is needed).
+    "VLLM_TPU_DSV4_MHC_GATES_MAX_TOKENS": env_int(
+        "VLLM_TPU_DSV4_MHC_GATES_MAX_TOKENS", 0
+    ),
+    # DeepSeek-V4 mHC: fused seam batches of at most this many tokens (with
+    # in-kernel gates) run as one block of exactly their rows. 16 = off (the
+    # bf16 sublane tile); 8 halves the f32 VPU work of a T<=8 decode seam
+    # (6.42 -> 5.78 us at T=8; post/comb mixes move by f32 ulps).
+    "VLLM_TPU_DSV4_MHC_SMALL_BLOCK": env_int("VLLM_TPU_DSV4_MHC_SMALL_BLOCK", 16),
+    # DeepSeek-V4 mHC: bf16 chunks of the stacked fn the fused seam reads.
+    # 3 = exact f32 mix GEMM (default); 2 = hi + mid (16 mantissa bits): the
+    # lo third of the fn bytes and MXU pushes is skipped, seam -0.9 us at
+    # T=8..32; mix logits move ~3e-6 relative (f64 oracle; 3-chunk 1.2e-7).
+    "VLLM_TPU_DSV4_MHC_FN_CHUNKS": env_int("VLLM_TPU_DSV4_MHC_FN_CHUNKS", 3),
+    # DeepSeek-V4 mHC: a fused seam of at most this many tokens reserves
+    # 32 MiB of scoped VMEM instead of the 100 MiB default (clamped to 64 MiB),
+    # which made XLA evict the AR output and the neighbours' prefetched
+    # operands around every seam. 0 = off. A power of 2 (gate `T <= cap`).
+    "VLLM_TPU_DSV4_MHC_LOW_VMEM_MAX_TOKENS": env_int(
+        "VLLM_TPU_DSV4_MHC_LOW_VMEM_MAX_TOKENS", 0
+    ),
+    # DeepSeek-V4 mHC: which fused seams read their fn from HBM in the
+    # kernel's own pipeline instead of an XLA VMEM prefetch ahead of the call:
+    # "attn" (the seam after the MoE, gating the attention input), "ffn" (the
+    # seam after attention), "both", or "" (none). With a 32 MiB seam
+    # (VLLM_TPU_DSV4_MHC_LOW_VMEM_MAX_TOKENS) XLA prefetches fn, and behind
+    # the fused MoE the copy is exposed (~2.2 us). Applies only where the
+    # 32 MiB reservation does (T <= the cap above). Bit-identical.
+    "VLLM_TPU_DSV4_MHC_SEAM_FN_HBM": lambda: os.getenv(
+        "VLLM_TPU_DSV4_MHC_SEAM_FN_HBM", ""
+    ),
+    # DeepSeek-V4 mHC: attention side -- wo_b's TP all-reduce and the ffn seam
+    # as one Pallas call (mhc/ar_seam_kernel.py). Bit-identical; measured
+    # parity with the low-VMEM unfused pair, so off.
+    "TPU_DSV4_MHC_AR_SEAM": env_bool("TPU_DSV4_MHC_AR_SEAM"),
+    # DeepSeek-V4 mHC: MoE side -- the fused EP op returns its pre-all-reduce
+    # partial (fold path) and the next layer's attention seam sums it in the
+    # same Pallas call as the seam, with hc_attn_fn DMA'd from HBM under the
+    # all-reduce's ICI rounds (behind the fused MoE, XLA's fn prefetch is
+    # exposed). 1 = fn by entry DMA (HBM-pinned), 2 = fn as an XLA-placed VMEM
+    # block (removal arm for the fn overlap). 0 = off. Bit-identical.
+    "TPU_DSV4_MHC_MOE_AR_SEAM": env_int("TPU_DSV4_MHC_MOE_AR_SEAM", 0),
+    # DeepSeek-V4 mHC: fuse the posts that only feed the hc head collapse or
+    # DSpark's aux stream mean into one kernel each, so the (T, 4, H) streams
+    # are never written (one to three posts per forward).
+    "VLLM_TPU_DSV4_MHC_POST_HEAD": env_bool("VLLM_TPU_DSV4_MHC_POST_HEAD", True),
     "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER": env_bool(
         "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", True
     ),

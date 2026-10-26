@@ -23,3 +23,8 @@ from vllm_torchtpu.tokenizers import register_tokenizers
 def register_layers() -> None:
     register_models()
     register_tokenizers()
+    from vllm_torchtpu.core.fast_block_hasher import install as _fbh_install
+    from vllm_torchtpu.detok_prompt_suffix import install as _dps_install
+
+    _fbh_install()
+    _dps_install()

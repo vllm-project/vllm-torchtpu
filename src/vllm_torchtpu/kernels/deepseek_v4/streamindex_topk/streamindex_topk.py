@@ -50,6 +50,20 @@ MlaCase = config.MlaCase
 KVLayout = config.KVLayout
 DEFAULT_BUFFER_COUNT = config.DEFAULT_BUFFER_COUNT
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+# K-IDXM group maxima: 16 lane tiles (2048 columns) per packed 128-lane gm row.
+GM_TILES = 16
+GM_LEVELS = 4  # log2(GM_TILES)
+GM_F32 = __import__("os").environ.get("TPU_DSV4_GM_INT", "0") != "1"
+# Test-only: TPU_KIDXM_FAULT=gm_bad (positive control: odd tiles' pair max skipped)
+# or gm_flat (the v1 flat roll form, a timing arm).
+_GM_FAULT = __import__("os").environ.get("TPU_KIDXM_FAULT", "")
+
+
+def _monotone_key(bits):
+    """f32 bits -> int32 key ordered as the floats (the SparseCore top-k's)."""
+    return jnp.bitwise_xor(
+        bits, jnp.bitwise_and(jnp.right_shift(bits, 31), jnp.int32(0x7FFFFFFF))
+    )
 DCP_AXIS_NAME = "dcp"
 
 cp_local_to_global = metadata.cp_local_to_global
@@ -273,9 +287,18 @@ def score_pipeline(
     cp_size: int = 1,
     interleave_c: int = 1,
     chunk_idx: int = 0,
+    verify_bd: bool = False,
+    group_max: bool = False,
+    gm_min_kv: int = 0,
 ):
-    """Executes the n-buffered Pallas scoring pipeline for StreamIndex Top-K."""
-    scores_hbm_ref = score_refs[-1]
+    """Executes the n-buffered Pallas scoring pipeline for StreamIndex Top-K.
+
+    group_max (K-IDXM): the multi-token (blocked) path also writes, per token,
+    the maximum monotone key of every 16 consecutive score columns, packed 128
+    groups per 2048 columns (see `sparsecore_topk_pf`). The last two refs are
+    then (scores, group maxima)."""
+    scores_hbm_ref = score_refs[-2] if group_max else score_refs[-1]
+    gm_hbm_ref = score_refs[-1] if group_max else None
     buffer_cnt = buffer_count
     seq_along_lane = kv_layout == KVLayout.SEQ_ALONG_LANE
 
@@ -426,6 +449,25 @@ def score_pipeline(
         seq_batch_size=seq_batch_size,
         chunk_idx=chunk_idx,
     )
+    gm_rows_bkv = num_sublanes_bkv // GM_TILES
+    g_alloc = None
+    if group_max:
+        assert num_sublanes_bkv % GM_TILES == 0, (bkv_sz, GM_TILES)
+        g_spec = pl.BlockSpec(
+            (pl.BoundedSlice(seq_batch_size * bq_sz), gm_rows_bkv, 128),
+            lambda p_id: (seq_tile(p_id), bq_block(p_id), bkv_block(p_id), 0),
+            pipeline_mode=pl.Buffered(buffer_count=2, use_lookahead=False),
+        )
+        g_alloc = bref_override.StreamIndexOBufferedRef.output(
+            spec=g_spec,
+            dtype_or_type=gm_hbm_ref,
+            buffer_count=2,
+            use_lookahead=False,
+            bq_sz=bq_sz,
+            num_sublanes=gm_rows_bkv,
+            seq_batch_size=seq_batch_size,
+            chunk_idx=chunk_idx,
+        )
 
     # ------------------------------------------------------------------------
     # SEQ_ALONG_LANE block access.
@@ -492,6 +534,28 @@ def score_pipeline(
     # and realigning every slice costs more VPU work than the reduction itself.
     # The zero pad rows are scored and dropped.
     hm_tok = align_to(bq_sz, 8)
+
+    # Block-diagonal verify scoring (`verify_bd`, TPU_STREAMIDX_VERIFY_BD). The
+    # contraction is head_dim = 128 deep, but the MXU pads it to 256 anyway, so
+    # stacking two lane tiles' keys on the contraction ([keys_a; keys_b]) against
+    # a block-diagonal q -- row (h, half, t) holds q[t, h] in contraction half
+    # `half`, zeros in the other -- scores both tiles in the passes one took.
+    # Each head then owns 2 * hm_tok = 16 rows: one packed (16, 128) bf16 tile
+    # per lane tile, so the head reduction runs in packed bf16 (relu(q.k) and
+    # the weights rounded to bf16, products accumulated in f32; the numerics of
+    # `reduce_token_block`'s bf16 reduce), one multiply-accumulate per packed
+    # register instead of a max, a multiply and an add per f32 register.
+    use_verify_bd = (
+        verify_bd
+        and seq_along_lane
+        and not prefill_cfg.enabled
+        and seq_batch_size == 1
+        and bq_sz > 1
+        and get_dtype_bitwidth(q_hbm_ref.dtype) == 8
+        and 2 * hm_tok == 8 * get_dtype_packing(jnp.bfloat16)
+        and 2 * head_dim <= 256
+        and (num_lane_tiles_bkv // 2) % 2 == 0
+    )
 
     def pad_tokens(bq_rows, n_tok):
         """[n_tok, H, D] -> [hm_tok, H, D], zero rows appended."""
@@ -575,10 +639,51 @@ def score_pipeline(
             ret.append(s_summed.reshape(-1, num_sublanes, 128))
         return jnp.concatenate(ret, axis=0)
 
-    def step_body(q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref=None):
+    def build_verify_bd_caches(q_vmem, weights_vmem, q_bd_ref, wb_ref):
+        """Caches the block-diagonal q and lane-broadcast bf16 weights of a q block.
+
+        Args:
+          q_vmem: [bq, H, D] query block.
+          weights_vmem: [bq, H] indexer weights.
+          q_bd_ref: [H * 2 * hm_tok, 2 * D] block-diagonal q, rows (head, half,
+            token); the token axis is padded to hm_tok with zero rows.
+          wb_ref: [H, 2 * hm_tok, 128] bf16 weights of each (head, half, token)
+            row, broadcast along lanes; zero on the padding rows.
+        """
+        # Built in f32 (exact for FP8 values), cast back to the q dtype.
+        qf = pad_tokens(q_vmem[...], bq_sz).astype(jnp.float32)
+        qhm = qf.transpose(1, 0, 2)  # [H, hm_tok, D]
+        z = jnp.zeros_like(qhm)
+        q_bd = jnp.concatenate(
+            [
+                jnp.concatenate([qhm, z], axis=-1),
+                jnp.concatenate([z, qhm], axis=-1),
+            ],
+            axis=1,
+        )
+        q_bd_ref[...] = q_bd.reshape(q_bd_ref.shape).astype(q_bd_ref.dtype)
+        w = weights_vmem[...].astype(jnp.float32)
+        w = jnp.pad(w, ((0, hm_tok - w.shape[0]), (0, 0)))  # [hm_tok, H]
+        for h in range(num_q_heads):
+            col = w[:, h : h + 1]
+            wb_ref[h] = jnp.broadcast_to(
+                jnp.concatenate([col, col], axis=0), (2 * hm_tok, 128)
+            ).astype(wb_ref.dtype)
+
+    def step_body(
+        q_vmem, weights_vmem, bkv_vmem, scores_vmem, gm_vmem=None, q_hm_ref=None,
+        wb_ref=None,
+    ):
         bkv_idx = bkv_block(pl.program_id(0))
 
-        if q_hm_ref is not None:
+        if wb_ref is not None:
+            # Verify-bd: the caches depend only on the q block (see below).
+            @pl.when(bkv_idx == 0)
+            def _():
+                build_verify_bd_caches(q_vmem, weights_vmem, q_hm_ref, wb_ref)
+
+            bq_vec = None
+        elif q_hm_ref is not None:
             # The head-major reordering depends only on the q block, but the grid
             # iterates kv innermost (`bkv_idx = step % num_bkv`), so bq_idx is held
             # fixed for a whole run of steps. Reordering once per q block instead of
@@ -597,8 +702,70 @@ def score_pipeline(
         w_data = weights_vmem[...].reshape(seq_batch_size, -1, num_q_heads)
         bq_weights_vec = [w_data[batch_idx] for batch_idx in range(seq_batch_size)]
 
+        def score_verify_bd(num_tiles):
+            """Verify-bd scoring of the block's first `num_tiles` lane tiles."""
+            rows = seq_along_lane_block_rows(bkv_vmem)
+            half_n = num_tiles // 2
+            # Two lane tiles per contraction half per matmul (N = 256 lanes), the
+            # heads reduced inside each chunk and the weight tile reloaded from
+            # VMEM per chunk, as in `blocked_prefill_step`: in that shape the
+            # compiler fuses each packed bf16 term into one multiply-accumulate.
+            # One matmul over the whole block, with a single weight register
+            # reused across every lane tile, does not fuse: the relu is packed,
+            # unpacked and multiplied and added in f32, 2.5x the VALU work.
+            chunk = math.gcd(half_n, 2)
+            halves = ([], [])
+            for c in range(half_n // chunk):
+                tiles = (
+                    range(c * chunk, (c + 1) * chunk),
+                    range(half_n + c * chunk, half_n + (c + 1) * chunk),
+                )
+                # Contraction half 0 scores lane tiles [0, n/2), half 1 [n/2, n).
+                rhs = jnp.concatenate(
+                    [
+                        jnp.concatenate(
+                            [seq_along_lane_key_tile(rows, 0, j) for j in t], axis=1
+                        )
+                        for t in tiles
+                    ],
+                    axis=0,
+                )
+                st = jnp.einsum(
+                    "nd,dm->nm",
+                    q_hm_ref[...],
+                    rhs,
+                    preferred_element_type=jnp.float32,
+                ).reshape(num_q_heads, 2 * hm_tok, chunk * 128)
+                acc = None
+                for h in range(num_q_heads):
+                    w_h = wb_ref[h]
+                    if chunk > 1:
+                        w_h = jnp.concatenate([w_h] * chunk, axis=1)
+                    # As in `reduce_token_block`: rounding before the relu equals
+                    # rounding after it, and the chain starts from a product and
+                    # adds one unpacked bf16 x bf16 product per head.
+                    r = jnp.maximum(st[h].astype(jnp.bfloat16), 0)
+                    term = r.astype(jnp.float32) * w_h.astype(jnp.float32)
+                    acc = term if acc is None else acc + term
+                assert acc is not None
+                # Rows [0, bq) of the head slice score half 0's tiles, rows
+                # [hm_tok, hm_tok + bq) half 1's.
+                for half, t in enumerate(tiles):
+                    scale = jnp.concatenate(
+                        [seq_along_lane_scale_tile(rows, 0, j) for j in t], axis=1
+                    )
+                    r0 = half * hm_tok
+                    halves[half].append(acc[r0 : r0 + bq_sz] * scale)
+            s = jnp.concatenate(halves[0] + halves[1], axis=1)
+            scores_vmem[:, :num_tiles] = pltpu.bitcast(
+                s.reshape(bq_sz, num_tiles, 128), jnp.int32
+            )
+
         def score(num_tiles):
             """Scores the block's first `num_tiles` lane tiles."""
+            if wb_ref is not None:
+                score_verify_bd(num_tiles)
+                return
             bkvs = []
             bkv_scales = []
             for batch_idx in range(seq_batch_size):
@@ -663,7 +830,8 @@ def score_pipeline(
             score(num_lane_tiles_bkv)
 
     def blocked_prefill_step(
-        q_vmem, weights_vmem, bkv_vmem, scores_vmem, q_hm_ref, wb_ref, q_half_ref=None
+        q_vmem, weights_vmem, bkv_vmem, scores_vmem, gm_vmem=None, q_hm_ref=None,
+        wb_ref=None, q_half_ref=None,
     ):
         """Scores one (q block, kv block) step of the multi-token path.
 
@@ -815,9 +983,15 @@ def score_pipeline(
             else None
         )
 
-        def score_block(rows):
+        def score_block(rows, with_gm=True):
             """Scores every token block, reducing only its first `rows` rows."""
             chunk_scores = []
+            gm_packed = [None] * num_tok_blks
+            if gm_vmem is not None:
+                assert tiles_per_chunk * num_lane_chunks % GM_TILES == 0
+                gm_lane = jax.lax.broadcasted_iota(jnp.int32, (rows, 128), 1) & (
+                    GM_TILES - 1
+                )
             for c in range(num_lane_chunks):
                 keys, scales = load_chunk(c)
                 # Reload the cached rows for every chunk instead of keeping the whole
@@ -837,6 +1011,59 @@ def score_pipeline(
                 tb_scores = []
                 for tb in range(num_tok_blks):
                     acc = reduce_token_block(sts, tb, rows) * scales
+                    if gm_vmem is not None and with_gm:
+                        for jj in range(tiles_per_chunk):
+                            tile = c * tiles_per_chunk + jj
+                            if _GM_FAULT == "gm_zero":  # timing-only removal arm
+                                if tile % GM_TILES == GM_TILES - 1:
+                                    gm_vmem[pl.ds(tb * tok_blk, rows), tile // GM_TILES] = (
+                                        jnp.zeros((rows, 128), jnp.int32))
+                                continue
+                            if GM_F32:
+                                # Max in f32 (the order of the keys for every non-NaN
+                                # score; -0 is canonicalized to +0 at the end so the
+                                # group key is never below a +0 member's key).
+                                key = acc[:, jj * 128 : (jj + 1) * 128]
+                            else:
+                                key = _monotone_key(
+                                    pltpu.bitcast(acc[:, jj * 128 : (jj + 1) * 128], jnp.int32)
+                                )
+                            if _GM_FAULT == "gm_flat":
+                                # v1 form: 4 lane rolls per tile + a roll/select pack.
+                                i = tile % GM_TILES
+                                for sh in (1, 2, 4, 8):
+                                    key = jnp.maximum(key, pltpu.roll(key, 128 - sh, 1))
+                                moved = pltpu.roll(key, i, 1) if i else key
+                                gm_packed[tb] = (
+                                    moved if gm_packed[tb] is None
+                                    else jnp.where(gm_lane == i, moved, gm_packed[tb])
+                                )
+                                if i == GM_TILES - 1:
+                                    gm_vmem[pl.ds(tb * tok_blk, rows), tile // GM_TILES] = gm_packed[tb]
+                                    gm_packed[tb] = None
+                                continue
+                            # Tree: combine tile groups pairwise; a level-l value holds,
+                            # at lane 2^l m + s, tile s's max over lanes [2^l m, 2^l m + 2^l).
+                            stack = gm_packed[tb] or []
+                            stack.append((0, key))
+                            while len(stack) >= 2 and stack[-1][0] == stack[-2][0]:
+                                (lv, y), (_, x) = stack.pop(), stack.pop()
+                                w = 1 << lv
+                                x = jnp.maximum(x, pltpu.roll(x, 128 - w, 1))
+                                if not (_GM_FAULT == "gm_bad" and lv == 0):
+                                    y = jnp.maximum(y, pltpu.roll(y, 128 - w, 1))
+                                stack.append(
+                                    (lv + 1, jnp.where((gm_lane & (2 * w - 1)) < w, x,
+                                                       pltpu.roll(y, w, 1)))
+                                )
+                            if stack[-1][0] == GM_LEVELS:
+                                top = stack.pop()[1]
+                                if GM_F32:
+                                    top = _monotone_key(
+                                        pltpu.bitcast(jnp.where(top == 0, 0.0, top), jnp.int32)
+                                    )
+                                gm_vmem[pl.ds(tb * tok_blk, rows), tile // GM_TILES] = top
+                            gm_packed[tb] = stack
                     if scores_rows is None:
                         tb_scores.append(acc)
                         continue
@@ -873,8 +1100,15 @@ def score_pipeline(
                 seq_batch_size=seq_batch_size,
                 chunk_idx=chunk_idx,
             )
-            pl.when(valid_rows <= half)(functools.partial(score_block, half))
-            pl.when(valid_rows > half)(functools.partial(score_block, tok_blk))
+            if gm_vmem is not None and gm_min_kv > 0:
+                gm_on = (seq_lens_ref[seq_tile(pl.program_id(0))] >> shift_comp) >= gm_min_kv
+                for vr, vh in ((valid_rows <= half, half), (valid_rows > half, tok_blk)):
+                    pl.when(vr & gm_on)(functools.partial(score_block, vh, True))
+                    pl.when(vr & jnp.logical_not(gm_on))(
+                        functools.partial(score_block, vh, False))
+            else:
+                pl.when(valid_rows <= half)(functools.partial(score_block, half))
+                pl.when(valid_rows > half)(functools.partial(score_block, tok_blk))
         else:
             score_block(tok_blk)
 
@@ -887,18 +1121,39 @@ def score_pipeline(
                 q_half_ref=q_half_ref,
             )
         else:
-            body = functools.partial(step_body, q_hm_ref=q_hm_ref)
+            body = functools.partial(step_body, q_hm_ref=q_hm_ref, wb_ref=wb_ref)
 
-        @pl.with_scoped(final_allocs=(q_alloc, weights_alloc, kv_alloc, o_alloc))
+        allocs = (q_alloc, weights_alloc, kv_alloc, o_alloc) + (
+            (g_alloc,) if group_max else ()
+        )
+
+        @pl.with_scoped(final_allocs=allocs)
         def _run_pipeline(final_allocs):
-            q_buf, weights_buf, kv_buf, o_buf = final_allocs
+            q_buf, weights_buf, kv_buf, o_buf = final_allocs[:4]
+            window_refs = (cu_q_lens_ref, metadata_ref, start_end_seq_idx_ref)
+            if group_max:
+                g_buf = final_allocs[4]
+                pipeline_fn = pltpu.emit_pipeline(
+                    body,
+                    grid=(metadata_ref.num_steps[chunk_idx],),
+                    in_specs=(q_buf.spec, weights_buf.spec, kv_buf.spec),
+                    out_specs=(o_buf.spec, g_buf.spec),
+                )
+                pipeline_fn(
+                    (q_hbm_ref, *window_refs),
+                    (indexer_weights_hbm_ref, *window_refs),
+                    (cache_kv_hbm_ref, page_indices_ref, metadata_ref),
+                    (scores_hbm_ref, *window_refs),
+                    (gm_hbm_ref, *window_refs),
+                    allocations=(q_buf, weights_buf, kv_buf, o_buf, g_buf),
+                )
+                return
             pipeline_fn = pltpu.emit_pipeline(
                 body,
                 grid=(metadata_ref.num_steps[chunk_idx],),
                 in_specs=(q_buf.spec, weights_buf.spec, kv_buf.spec),
                 out_specs=o_buf.spec,
             )
-            window_refs = (cu_q_lens_ref, metadata_ref, start_end_seq_idx_ref)
             pipeline_fn(
                 (q_hbm_ref, *window_refs),
                 (indexer_weights_hbm_ref, *window_refs),
@@ -937,6 +1192,12 @@ def score_pipeline(
                 if half_block_cache
                 else ()
             ),
+        )
+    elif use_verify_bd:
+        pl.run_scoped(
+            lambda q_bd_ref, wb_ref: _run_all(q_hm_ref=q_bd_ref, wb_ref=wb_ref),
+            pltpu.VMEM((num_q_heads * 2 * hm_tok, 2 * head_dim), q_hbm_ref.dtype),
+            pltpu.VMEM((num_q_heads, 2 * hm_tok, 128), jnp.bfloat16),
         )
     elif seq_batch_size == 1 and bq_sz > 1:
         pl.run_scoped(
@@ -1164,6 +1425,142 @@ def convert_cache_to_seq_along_lane(
     )
 
 
+def _token_seq_ids(
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    distribution: jax.Array,  # i32[3]
+    num_tokens: int,
+    max_num_seqs: int,
+) -> jax.Array:  # i32[num_tokens]
+    """Sequence of each token row (rows past the batch get `distribution[2]`)."""
+    token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
+    seq_mask = token_ids[:, None] >= cu_q_lens[None, 1 : max_num_seqs + 1]
+    seq_mask = jnp.where(
+        jnp.arange(max_num_seqs)[None, :] < distribution[2], seq_mask, False
+    )
+    return jnp.sum(seq_mask, axis=1)
+
+
+# Rows per score-returning SparseCore top-k call of a kv-split share.
+_KV_SPLIT_SC_MAX_ROWS = 1024
+
+
+def kv_split_window(
+    seq_lens: jax.Array,  # i32[max_num_seqs]
+    rank: jax.Array | int,
+    *,
+    kv_split: int,
+    compression_ratio: int,
+    page_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    """(first row, row count) of rank `rank`'s share of each sequence's
+    compressed positions: contiguous whole pages, the same count per rank.
+    (Ported from patemotter fdcc70a0d.)"""
+    kv_len = seq_lens // compression_ratio
+    pages = cdiv(kv_len, page_size)
+    per_rank = cdiv(pages, kv_split)
+    start = jnp.minimum(rank * per_rank, pages) * page_size
+    return start, jnp.clip(kv_len - start, 0, per_rank * page_size)
+
+
+def merge_kv_split_topk(
+    shares: jax.Array,  # i32[kv_split, T, 2 * k]: (indices, score bits) per rank
+    k: int,
+) -> jax.Array:  # i32[T, k]
+    """The unsplit top-k from every rank's kv_split share top-k.
+
+    A global winner is beaten by fewer than k positions, so by fewer than k
+    on its own rank, and survives there. Ranks own increasing column ranges,
+    so the rank-major candidate list is in column order and the top-k over it
+    breaks ties toward the lowest column, as the unsplit top-k does.
+    (After patemotter fdcc70a0d / 7898b6033.)
+    """
+    num_ranks, num_tokens, _ = shares.shape
+    cand = shares.reshape(num_ranks, num_tokens, 2, k).transpose(2, 1, 0, 3)
+    cand = cand.reshape(2, num_tokens, num_ranks * k)
+    cand_idx, cand_bits = cand[0], cand[1]
+    valid = cand_idx >= 0
+    num_valid = jnp.sum(valid, axis=1, dtype=jnp.int32)
+    # Rows with at most k candidates keep them all (below), and are skipped by
+    # the SparseCore top-k (row length 0). Selecting k of a row padded with -inf ties is its slow path (1.3 ms
+    # for 256 rows at 2k context vs 0.14 ms at 100k, tpu7x one core).
+    long_row = num_valid > k
+    slots = sparsecore_topk(
+        cand_bits,
+        k,
+        row_lengths=jnp.where(long_row, num_ranks * k, 0).astype(jnp.int32),
+        write_empty_rows=True,
+    )
+    # Empty slots gather distinct columns: an all-equal index (every slot -1
+    # -> column 0) made this gather ~10x slower on tpu7x (1.3 vs 0.1 ms).
+    lane = jnp.arange(k, dtype=jnp.int32)[None, :]
+    picked = jnp.take_along_axis(cand_idx, jnp.where(slots >= 0, slots, lane), axis=1)
+    from_sc = jnp.where(slots >= 0, picked, -1)
+    # A row with at most k visible positions selects all of them: columns
+    # 0 .. num_valid-1 in order, as the unsplit top-k (and its early-exit fast
+    # path) returns. No gather needed.
+    j = jnp.arange(k, dtype=jnp.int32)[None, :]
+    compact = jnp.where(j < num_valid[:, None], j, -1)
+    return jnp.where(long_row[:, None], from_sc, compact)
+
+
+def token_window_metadata(
+    seq_lens: jax.Array,  # i32[S]
+    page_indices: jax.Array,  # i32[S * pages_per_seq]
+    cu_q_lens: jax.Array,  # i32[S + 1]
+    distribution: jax.Array,  # i32[3]
+    offset: jax.Array,  # i32 scalar: first row of the window
+    *,
+    window: int,
+    compression_ratio: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """(seq_lens, page_indices, cu_q_lens, distribution) of the token rows
+    `[offset, offset + window)` of a batch, as a batch of its own.
+
+    Sequences are renumbered from the first one with a row in the window (its
+    page-table row moves with it). A sequence cut by the window keeps its rows'
+    positions: its length drops by the rows past the window. The length the
+    scoring passes see is then rounded up to a whole compressed block (capped
+    at the real length) so the block a cut row may select -- the whole batch's
+    row lengths allow a row its own open block when the sequence continues --
+    is scored; the passes leave positions unmasked and the row lengths (from
+    the whole batch, `row_window`) cut every row exactly.
+
+    The caller guarantees no cut inside the verify/decode segments (window >=
+    their rows, windows aligned to multiples of `window`).
+    """
+    S = seq_lens.shape[0]
+    pps = page_indices.shape[0] // S
+    ids = jnp.arange(S, dtype=jnp.int32)
+    live = ids < distribution[2]
+    s0 = jnp.sum(live & (cu_q_lens[1:] <= offset)).astype(jnp.int32)
+    src = jnp.minimum(s0 + ids, S - 1)
+    # Sequences with a row in the window: from s0 up to the last one that
+    # starts before the window's end (no zero-row sequence is handed over).
+    s1 = jnp.sum(live & (cu_q_lens[:-1] < offset + window)).astype(jnp.int32)
+    n_live = jnp.maximum(s1 - s0, 0)
+    j_live = ids < n_live
+    cu_full = cu_q_lens[jnp.minimum(s0 + jnp.arange(S + 1, dtype=jnp.int32), S)]
+    cu_w = jnp.clip(cu_full - offset, 0, window)
+    cu_w = jnp.where(
+        jnp.arange(S + 1) <= n_live, cu_w, cu_w[jnp.minimum(n_live, S)]
+    ).astype(jnp.int32)
+    end = cu_q_lens[src + 1]
+    after = jnp.maximum(end - (offset + window), 0)
+    exact = seq_lens[src] - after
+    c = compression_ratio
+    padded = jnp.minimum(seq_lens[src], (exact + c - 1) // c * c)
+    seq_w = jnp.where(j_live, padded, 0).astype(seq_lens.dtype)
+    pages_w = page_indices.reshape(S, pps)[src].reshape(-1)
+    dist_w = jnp.stack(
+        [
+            jnp.clip(distribution[0] - s0, 0, n_live),
+            jnp.clip(distribution[1] - s0, 0, n_live),
+            n_live,
+        ]
+    ).astype(distribution.dtype)
+    return seq_w, pages_w, cu_w, dist_w
+
+
 def _effective_row_lengths(
     seq_lens: jax.Array,  # i32[max_num_seqs]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
@@ -1174,8 +1571,15 @@ def _effective_row_lengths(
     cp_rank: jax.Array | int = 0,
     cp_size: int = 1,
     interleave_c: int = 1,
+    kv_window: tuple[jax.Array, jax.Array] | None = None,
+    strict_causal: bool = False,
 ) -> jax.Array:  # i32[num_tokens]
     """Visible compressed KV positions per token row of the score matrix.
+
+    With `strict_causal`, a token sees the (token_pos + 1) // compression_ratio
+    complete groups at or before it. Without it, it also sees its own group
+    whenever that group completes later in the same forward, i.e. the
+    compressed entry of up to compression_ratio - 1 tokens after it.
 
     Under context parallelism the score matrix is rank-local, so the row length
     is the number of globally-visible positions that *this* rank owns.
@@ -1192,8 +1596,14 @@ def _effective_row_lengths(
     seq_len = seq_lens[seq_ids]
     token_pos = seq_len - q_len + (token_ids - q_start)
     kv_len = seq_len // compression_ratio
-    visible = jnp.minimum(kv_len, token_pos // compression_ratio + 1)
+    if strict_causal:
+        visible = jnp.minimum(kv_len, (token_pos + 1) // compression_ratio)
+    else:
+        visible = jnp.minimum(kv_len, token_pos // compression_ratio + 1)
     visible = cp_local_length(visible, cp_rank, cp_size, interleave_c)
+    if kv_window is not None:
+        win_start, win_len = kv_window
+        visible = jnp.clip(visible - win_start[seq_ids], 0, win_len[seq_ids])
     valid = token_ids < cu_q_lens[num_seqs]
     return jnp.where(valid, jnp.minimum(visible, num_positions), 0)
 
@@ -1215,6 +1625,15 @@ def _effective_row_lengths(
         "interleave_size",
         "return_scores",
         "uniform_q_len",
+        "sc_flat_scores",
+        "sc_topk_coop_max_rows",
+        "kv_split",
+        "row_window_tokens",
+        "verify_bd",
+        "strict_causal",
+        "chunk_sched_groups",
+        "group_max",
+        "group_max_min_kv",
     ),
 )
 def streamindex_topk(
@@ -1244,8 +1663,32 @@ def streamindex_topk(
     interleave_size: int = 1,
     return_scores: bool = False,
     uniform_q_len: int | None = None,
+    sc_flat_scores: bool = False,
+    sc_topk_coop_max_rows: int = 0,
+    kv_split: int = 1,
+    kv_split_rank: jax.Array | int = 0,
+    row_window: tuple[jax.Array, jax.Array, jax.Array, jax.Array] | None = None,
+    row_window_tokens: int = 0,
+    verify_bd: bool | None = None,
+    strict_causal: bool = False,
+    chunk_sched_groups: bool = True,
+    group_max: bool = False,
+    group_max_min_kv: int = 0,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
+
+    row_window (TPU_DSV4_INDEXER_TOKEN_SPLIT_ABOVE): `q` holds rows
+    `[offset, offset + T)` of a `row_window_tokens`-row batch and the metadata
+    is that window's (`token_window_metadata`); `row_window = (seq_lens,
+    cu_q_lens, distribution, offset)` of the whole batch sets each row's
+    visible length exactly as the whole batch's top-k does.
+
+    kv_split > 1 (ported from patemotter fdcc70a0d): score only rank
+    `kv_split_rank`'s contiguous, page-aligned 1/kv_split share of every
+    sequence's compressed positions of a cache every rank holds whole, and
+    return that share's top-k as GLOBAL columns with their score bits
+    (unfilled slots: index -1, score BITS_NEG_INF). A top-k over all ranks'
+    candidates (rank-major) is the unsplit top-k.
 
     Args:
       q: concatenated all sequences' queries.
@@ -1305,6 +1748,24 @@ def streamindex_topk(
         a static q length and the (decode, prefill, mixed) block sizes' prefill
         entry, instead of the decode passes, which assume one query token. None
         keeps the segment on the decode passes.
+      sc_flat_scores: hand the SparseCore top-k the scoring kernel's
+        [T, S, 128] buffer as is, with no padding rows. Its bytes already are
+        the flat row-major rows the top-k reads, so XLA passes it through as a
+        bitcast; the default reshapes it to [T, S * 128] and pads the rows to
+        the top-k's wave size, which XLA lowers as a relayout, a pad and a
+        SparseCore data-format conversion of the whole (padded) buffer. Same
+        selection either way.
+      sc_topk_coop_max_rows: `sparsecore_topk`'s `coop_max_rows`.
+      verify_bd: score the `uniform_q_len` pass (windows of <= 8 tokens) with a
+        block-diagonal q and a packed bf16 head reduction (see `score_pipeline`).
+        Not bit-exact: relu(q.k) and the weights are rounded to bf16, as in the
+        mixed pass. None reads TPU_STREAMIDX_VERIFY_BD.
+      strict_causal: a token selects only among the compressed groups that are
+        complete at its own position, (pos + 1) // compression_ratio of them.
+        False keeps the previous bound, pos // compression_ratio + 1, under
+        which a multi-token forward (chunked prefill, speculative verify) lets
+        a token see its own group's entry when that group completes later in
+        the same forward.
       return_scores: also return the score of each selected position, which is
         what makes a cross-rank merge possible. A local top-k over a sharded KV
         axis is not the global top-k, so the merge needs the scores the same way
@@ -1319,6 +1780,10 @@ def streamindex_topk(
     # `cache_kv`, keeping HBM transactions fused.
 
     kv_layout = KVLayout.parse(kv_layout)
+    if verify_bd is None:
+        from vllm_torchtpu import envs
+
+        verify_bd = envs.TPU_STREAMIDX_VERIFY_BD
 
     if cp_size < 1:
         raise ValueError(f"cp_size must be >= 1, got {cp_size}.")
@@ -1404,6 +1869,36 @@ def streamindex_topk(
         page_size = page_size_per_kv_packing * kv_packing
     pages_per_seq = page_indices.shape[0] // max_num_seqs
 
+    kv_window = None
+    global_seq_lens = seq_lens
+    if kv_split > 1:
+        if cp_size > 1 or enable_early_exit:
+            raise NotImplementedError("kv_split needs cp_size == 1, no early exit.")
+        return_scores = True
+        kv_window = kv_split_window(
+            seq_lens,
+            kv_split_rank,
+            kv_split=kv_split,
+            compression_ratio=compression_ratio,
+            page_size=page_size,
+        )
+        # The passes see each sequence as its window alone: the page table row
+        # starts at the window's first page, the length is the window's. The
+        # window length is held at >= the sequence's query length so the
+        # passes' query positions stay non-negative; the extra columns are cut
+        # by the row lengths (clipped to the window) before the top-k.
+        first_page = kv_window[0] // page_size
+        cols = jnp.arange(pages_per_seq, dtype=jnp.int32)[None, :] + first_page[:, None]
+        page_indices = jnp.take_along_axis(
+            page_indices.reshape(max_num_seqs, pages_per_seq),
+            jnp.minimum(cols, pages_per_seq - 1),
+            axis=1,
+        ).reshape(-1)
+        q_lens_per_seq = cu_q_lens[1 : max_num_seqs + 1] - cu_q_lens[:max_num_seqs]
+        seq_lens = jnp.maximum(
+            kv_window[1] * compression_ratio, jnp.maximum(q_lens_per_seq, 0)
+        ).astype(seq_lens.dtype)
+
     for bkv_p in num_kv_pages_per_blocks:
         bkv_sz = page_size * bkv_p
         if bkv_sz % 128 != 0:
@@ -1474,8 +1969,9 @@ def streamindex_topk(
             hbm_spec,  # cache_kv
         ]
         if aliased:
-            in_specs.append(hbm_spec)  # scores_init, aliased to out
-        out_specs = hbm_spec
+            # scores_init (+ gm_init), aliased to the outputs
+            in_specs += [hbm_spec] * (2 if group_max else 1)
+        out_specs = (hbm_spec, hbm_spec) if group_max else hbm_spec
 
         scratch_shapes = []
 
@@ -1492,6 +1988,8 @@ def streamindex_topk(
         num_flat_prefetches = len(jax.tree_util.tree_leaves(scalar_prefetches))
         # The aliased `scores_init` is the 5th operand after the flat prefetches.
         input_output_aliases = {num_flat_prefetches + 4: 0} if aliased else {}
+        if aliased and group_max:
+            input_output_aliases[num_flat_prefetches + 5] = 1
 
         layout_tag = "" if kv_layout == KVLayout.HEAD_ALONG_SUBLANE else "-sal"
         scope_name = f"StreamIdxTC-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}{layout_tag}"
@@ -1514,6 +2012,9 @@ def streamindex_topk(
                     cp_size=cp_size,
                     interleave_c=interleave_c,
                     chunk_idx=chunk_idx,
+                    verify_bd=verify_bd and case == MlaCase.PREFILL,
+                    group_max=group_max,
+                    gm_min_kv=group_max_min_kv if group_max else 0,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=num_scalar_prefetch,
@@ -1527,7 +2028,18 @@ def streamindex_topk(
                     vmem_limit_bytes=vmem_limit_bytes,
                     disable_bounds_checks=True,
                 ),
-                out_shape=jax.ShapeDtypeStruct(
+                out_shape=(
+                    jax.ShapeDtypeStruct(
+                        shape=(chunk_tokens, num_sublanes_total, 128),
+                        dtype=out_dtype,
+                    ),
+                    jax.ShapeDtypeStruct(
+                        shape=(chunk_tokens, num_sublanes_total // GM_TILES, 128),
+                        dtype=jnp.int32,
+                    ),
+                )
+                if group_max
+                else jax.ShapeDtypeStruct(
                     shape=(chunk_tokens, num_sublanes_total, 128),
                     dtype=out_dtype,
                 ),
@@ -1541,11 +2053,14 @@ def streamindex_topk(
             q,
             prepared_indexer_weights,
             cache_kv,
-            *((scores_init,) if aliased else ()),
+            *((tuple(scores_init) if group_max else (scores_init,)) if aliased else ()),
         )
         if scheduling_group_id is not None:
-            scores = xla_metadata.set_xla_metadata(
-                scores, _scheduling_group_id=scheduling_group_id
+            scores = jax.tree.map(
+                lambda x: xla_metadata.set_xla_metadata(
+                    x, _scheduling_group_id=scheduling_group_id
+                ),
+                scores,
             )
         return scores
 
@@ -1652,6 +2167,11 @@ def streamindex_topk(
         # XLA would common the identical per-chunk fills into one buffer then clone
         # it back out (~370us on 1GB of scores). `row_lengths` bounds the reads.
         scores = None
+        if chunk_token_start is not None:
+            # Pipelined pieces: the mixed pass goes first so that a piece holding
+            # no verify-window rows can skip the uniform pass (below) - every
+            # piece would otherwise launch it, empty, for its page-table copy.
+            passes = tuple(sorted(passes, key=lambda sp: sp[0]["case"] != MlaCase.MIXED))
         for spec, pass_meta in passes:
 
             def run(scores_init, spec=spec, pass_meta=pass_meta):
@@ -1672,7 +2192,18 @@ def streamindex_topk(
                     **spec,
                 )
 
-            if scores is not None and spec["case"] == MlaCase.DECODE:
+            if (
+                scores is not None
+                and chunk_token_start is not None
+                and spec["case"] == MlaCase.PREFILL
+            ):
+                scores = jax.lax.cond(
+                    pass_meta.num_steps[chunk_idx] > 0,
+                    run,
+                    lambda scores_init: scores_init,
+                    scores,
+                )
+            elif scores is not None and spec["case"] == MlaCase.DECODE:
                 # An empty pass still pays its launch and the page-table copy
                 # into SMEM; skipping it leaves the buffer as the pass would.
                 scores = jax.lax.cond(
@@ -1703,27 +2234,69 @@ def streamindex_topk(
         )
 
         num_positions = max(num_sublanes_total * 128, k)
-        eff_row_lengths = _effective_row_lengths(
-            seq_lens=seq_lens,
-            cu_q_lens=cu_q_lens,
-            distribution=distribution,
-            num_tokens=max_num_tokens,
-            num_positions=num_positions,
-            compression_ratio=compression_ratio,
-            cp_rank=cp_rank,
-            cp_size=cp_size,
-            interleave_c=interleave_c,
-        )
+        if row_window is None:
+            eff_row_lengths = _effective_row_lengths(
+                seq_lens=global_seq_lens,
+                cu_q_lens=cu_q_lens,
+                distribution=distribution,
+                num_tokens=max_num_tokens,
+                num_positions=num_positions,
+                compression_ratio=compression_ratio,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+                interleave_c=interleave_c,
+                kv_window=kv_window,
+                strict_causal=strict_causal,
+            )
+        else:
+            if cp_size > 1 or kv_window is not None:
+                raise NotImplementedError("row_window needs cp_size == 1, no kv_split.")
+            full_seq_lens, full_cu, full_dist, row_offset = row_window
+            eff_row_lengths = jax.lax.dynamic_slice(
+                _effective_row_lengths(
+                    seq_lens=full_seq_lens,
+                    cu_q_lens=full_cu,
+                    distribution=full_dist,
+                    num_tokens=row_window_tokens,
+                    num_positions=num_positions,
+                    compression_ratio=compression_ratio,
+                    strict_causal=strict_causal,
+                ),
+                (row_offset,),
+                (max_num_tokens,),
+            )
 
-        if chunk_tokens is None or max_num_tokens % chunk_tokens:
+        split_chunks = False
+        call_chunk_tokens = chunk_tokens
+        if (
+            kv_window is not None
+            and chunk_tokens is None
+            and max_num_tokens > _KV_SPLIT_SC_MAX_ROWS
+            and max_num_tokens % _KV_SPLIT_SC_MAX_ROWS == 0
+        ):
+            # A share returns score bits, and the score-returning SparseCore
+            # top-k over 2048 rows does not fit SparseCore memory (2109439 >
+            # 2097151 words, twin j-7aed76d2): score and select in row chunks.
+            # Without scheduling-group annotations: in the served graph they
+            # failed to compile ("annotation groups with gaps", twin j-6706060c).
+            call_chunk_tokens = _KV_SPLIT_SC_MAX_ROWS
+            split_chunks = True
+
+        if call_chunk_tokens is None or max_num_tokens % call_chunk_tokens:
             num_chunks, chunk_len = 1, max_num_tokens
         else:
-            num_chunks, chunk_len = max_num_tokens // chunk_tokens, chunk_tokens
+            num_chunks, chunk_len = (
+                max_num_tokens // call_chunk_tokens,
+                call_chunk_tokens,
+            )
 
         # Ids count from 1, so the 0 is never a real group: a single chunk has no
         # pair to annotate and takes the `None` branch below both times.
         group_base = 0
-        if num_chunks > 1:
+        if not chunk_sched_groups:
+            # TPU_STREAMIDX_CHUNK_SCHED_GROUPS=0: pieces without annotations.
+            split_chunks = True
+        if num_chunks > 1 and not split_chunks:
             group_base = config.reserve_scheduling_group_ids(num_chunks - 1)
 
         chunk_starts = (
@@ -1741,8 +2314,10 @@ def streamindex_topk(
             # Group g holds chunk g's SparseCore top-k and chunk g+1's TensorCore
             # scoring, so the scheduler emits `sc(g).start, tc(g+1), sc(g).done`.
             # Chunk 0's scoring and the last top-k have no partner.
-            tc_group = None if m == 0 else group_base + m - 1
-            sc_group = None if m == num_chunks - 1 else group_base + m
+            tc_group = None if (m == 0 or split_chunks) else group_base + m - 1
+            sc_group = (
+                None if (m == num_chunks - 1 or split_chunks) else group_base + m
+            )
 
             start = m * chunk_len
             scores = _scores_for_chunk(
@@ -1753,15 +2328,50 @@ def streamindex_topk(
                 out_dtype,
                 tc_group,
             )
-            scores = scores.reshape(chunk_len, -1)
-            if scores.shape[1] < k:
+            gm = None
+            if group_max:
+                scores, gm = scores
+            # A kv-split share takes the by-length pass, never the cooperative
+            # one (lowc cccc1c5b7: coop shares came back wrong next to the merge).
+            topk_kwargs = dict(
+                coop_max_rows=0 if kv_window is not None else sc_topk_coop_max_rows
+            )
+            if sc_flat_scores and scores.shape[1] * 128 >= k:
+                topk_kwargs["pad_rows"] = False
+            else:
+                scores = scores.reshape(chunk_len, -1)
+            if scores.ndim == 2 and scores.shape[1] < k:
                 scores = jnp.pad(
                     scores,
                     ((0, 0), (0, k - scores.shape[1])),
                     constant_values=BITS_NEG_INF,
                 )
 
-            if return_scores:
+            if gm is not None:
+                # K-IDXM: long rows of the blocked (mixed) pass are selected from
+                # their group maxima; every other row as before. Same selection.
+                assert not return_scores
+                if scores.ndim == 2:  # sc_flat_scores off: the same bytes, viewed 3D
+                    scores = scores.reshape(scores.shape[0], -1, 128)
+                from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk_pf import (
+                    sparsecore_topk_pf,
+                )
+
+                rows = start + jnp.arange(chunk_len, dtype=jnp.int32)
+                eligible = (rows >= cu_q_lens[distribution[1]]) & (
+                    rows < cu_q_lens[distribution[2]]
+                )
+                chunk_topk_idxs = sparsecore_topk_pf(
+                    scores,
+                    gm,
+                    k,
+                    eff_row_lengths[start : start + chunk_len],
+                    eligible=eligible,
+                    min_len=max(group_max_min_kv, 16 * k + 16),
+                    scheduling_group_id=sc_group,
+                    **topk_kwargs,
+                )
+            elif return_scores:
                 chunk_topk_idxs, chunk_topk_scores = sparsecore_topk(
                     scores,
                     k,
@@ -1769,6 +2379,7 @@ def streamindex_topk(
                     write_empty_rows=True,
                     scheduling_group_id=sc_group,
                     return_scores=True,
+                    **topk_kwargs,
                 )
                 topk_scores_list.append(chunk_topk_scores)
             else:
@@ -1779,11 +2390,18 @@ def streamindex_topk(
                     write_empty_rows=True,
                     scheduling_group_id=sc_group,
                     return_scores=False,
+                    **topk_kwargs,
                 )
             topk_idxs.append(chunk_topk_idxs)
 
         out = topk_idxs[0] if len(topk_idxs) == 1 else jnp.concatenate(topk_idxs)
         out = out[:max_num_tokens, :k]
+        if kv_window is not None:
+            seq_ids = _token_seq_ids(
+                cu_q_lens, distribution, max_num_tokens, max_num_seqs
+            )
+            first_row = jnp.pad(kv_window[0], (0, 1))[seq_ids]
+            out = jnp.where(out >= 0, out + first_row[:, None], -1)
 
         if cp_size == 1 and not return_scores:
             return out
@@ -1801,6 +2419,8 @@ def streamindex_topk(
             else jnp.concatenate(topk_scores_list)
         )
         scores_out = scores_out[:max_num_tokens, :k]
+        if kv_window is not None:
+            scores_out = jnp.where(out >= 0, scores_out, BITS_NEG_INF)
         return out, scores_out
 
     def _fast_path(_):
@@ -1815,7 +2435,9 @@ def streamindex_topk(
         q_abs_pos = (seq_len - q_len) + (token_idx - q_start)
         max_valid_idx = jnp.minimum(
             seq_len // compression_ratio - 1,
-            q_abs_pos // compression_ratio,
+            (q_abs_pos + 1) // compression_ratio - 1
+            if strict_causal
+            else q_abs_pos // compression_ratio,
         )
         max_valid_idx = jnp.where(token_idx < cu_q_lens[-1], max_valid_idx, -1)
         s_idx = jnp.arange(k, dtype=jnp.int32)[None, :]

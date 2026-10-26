@@ -198,7 +198,7 @@ def main_kernel(
     )(indices_hbm_ref, valid_indices_ref)
 
 
-@functools.partial(jax.jit, static_argnames=("top_k",))
+@functools.partial(jax.jit, static_argnames=("top_k", "no_pad"))
 def csa_gather(
     nope_cache: jax.Array,
     rope_cache: jax.Array,
@@ -206,6 +206,7 @@ def csa_gather(
     num_valid_indices: jax.Array | None = None,
     *,
     top_k: int = 1024,
+    no_pad: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Fused SparseCore gather of the nope and rope caches.
 
@@ -222,6 +223,9 @@ def csa_gather(
       top_k: the consumer's row block (the attention kernel's top-k), a
         multiple of 128. `rope_out` pairs entry i of a period with entry
         i + top_k // 2.
+      no_pad: give each subcore fewer than `top_k` rows per step when that
+        tiles N exactly. Otherwise the outputs are padded to a multiple of
+        `top_k` rows per subcore and sliced back to N, which copies them.
 
     Returns:
       Both outputs are int32 with 128 lanes, which XLA lays out byte-for-byte
@@ -268,6 +272,18 @@ def csa_gather(
     num_streams = 4
     assert out_size % top_k == 0
     num_row_subchunks = top_k // row_subchunk_size
+    if no_pad:
+        # Any multiple of `num_streams` subchunks keeps each pipeline step's
+        # subchunks consecutive, all the rope output mapping relies on.
+        total_subchunks, rem = divmod(out_size, row_subchunk_size * num_cores)
+        num_row_subchunks = next(
+            (
+                n
+                for n in range(num_row_subchunks, 0, -num_streams)
+                if rem == 0 and total_subchunks % n == 0
+            ),
+            num_row_subchunks,
+        )
     row_chunk_size = row_subchunk_size * num_row_subchunks
     block_size = row_chunk_size * num_cores
     out_pad_size = ((out_size + block_size - 1) // block_size) * block_size - out_size

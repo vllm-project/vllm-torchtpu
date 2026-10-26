@@ -49,11 +49,15 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import 
     cp_rank_as_data,
     get_kv_cache_shape,
     indexer_kv_layout,
+    kv_split_window,
+    merge_kv_split_topk,
     streamindex_topk,
     streamindex_topk_dcp,
+    token_window_metadata,
 )
 
 __all__ = [
+    "token_window_metadata",
     "bref_override",
     "config",
     "kv_cache_append",
@@ -79,6 +83,8 @@ __all__ = [
     "get_kv_cache_shape",
     "get_page_and_slot",
     "indexer_kv_layout",
+    "kv_split_window",
+    "merge_kv_split_topk",
     "scatter_rows",
     "scatter_rows_reference",
     "streamindex_topk",

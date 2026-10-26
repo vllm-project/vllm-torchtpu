@@ -376,6 +376,28 @@ def _register_tpu_kv_connectors() -> None:
         KVConnectorFactory.register_connector(name, module_path, name)
 
 
+
+def _apply_num_gpu_blocks_override_env(cache_config) -> None:
+    """TPU_NUM_GPU_BLOCKS_OVERRIDE -> cache_config.num_gpu_blocks_override, unless
+    --num-gpu-blocks-override already set it. The engine core sizes the pool
+    from this field (vLLM may_override_num_blocks) and the workers receive the
+    same config."""
+    pin = envs.TPU_NUM_GPU_BLOCKS_OVERRIDE
+    if pin <= 0:
+        return
+    current = cache_config.num_gpu_blocks_override
+    if current is not None and current != pin:
+        logger.warning(
+            "TPU_NUM_GPU_BLOCKS_OVERRIDE=%d ignored: --num-gpu-blocks-override=%d set",
+            pin,
+            current,
+        )
+        return
+    if current is None:
+        logger.info("TPU_NUM_GPU_BLOCKS_OVERRIDE: pinning num_gpu_blocks_override=%d", pin)
+    cache_config.num_gpu_blocks_override = pin
+
+
 class TpuPlatform(Platform):
     # Registered via the `vllm.platform_plugins` entry point in pyproject.toml.
     _enum = PlatformEnum.OOT
@@ -851,6 +873,7 @@ class TpuPlatform(Platform):
 
         scheduler_config = vllm_config.scheduler_config
         cache_config = vllm_config.cache_config
+        _apply_num_gpu_blocks_override_env(cache_config)
 
         is_hybrid = model_config.is_hybrid if model_config is not None else False
         if (

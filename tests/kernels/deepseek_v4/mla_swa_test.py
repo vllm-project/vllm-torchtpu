@@ -572,7 +572,7 @@ class CorrectnessTest(parameterized.TestCase):
         q = self.gen_random((total_tokens, self.num_heads, self.head_dim), self.q_dtype)
         new_kv = self.gen_random((total_tokens, self.head_dim), self.kv_dtype)
 
-        def run(distribution, cache):
+        def run(distribution, cache, **kw):
             return mla_swa.mla_sliding_window_ragged_paged_attention(
                 q,
                 new_kv,
@@ -590,6 +590,7 @@ class CorrectnessTest(parameterized.TestCase):
                 logical_page_size=self.page_size,
                 non_causal_block=non_causal_block,
                 chunk_prefill_size=verify_q_len,
+                **kw,
             )
 
         mixed = run(jnp.array([n, n, self.batch_size], jnp.int32), self.swc_cache + 0)
@@ -597,6 +598,15 @@ class CorrectnessTest(parameterized.TestCase):
             jnp.array([n, 2 * n, self.batch_size], jnp.int32), self.swc_cache + 0
         )
         for a, b in zip(mixed, static):
+            np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+        # One mixed-case launch for every sequence (decode, window, mixed).
+        single = run(
+            jnp.array([n, 2 * n, self.batch_size], jnp.int32),
+            self.swc_cache + 0,
+            single_pass=True,
+            single_pass_bq=8,
+        )
+        for a, b in zip(single, static):
             np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
         self.run_and_compare_outputs(
             q,

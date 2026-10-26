@@ -119,6 +119,31 @@ _RANK_BUFFER: Any = None
 # (`Fp8Config.get_quant_method`), so this is per-layer state without a registry
 # that has to be torn down between models in one process.
 FUSED_MOE_EP_OP_ATTR = "_fused_moe_ep_op"
+# A sequence-parallel layer's op for the buckets TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS
+# leaves on the replicated layout (TP-replica token groups), and the switch the
+# model flips while tracing such a bucket. A Python value read at trace time:
+# each bucket's trace sees the value its own shape branch set.
+FUSED_MOE_EP_NOSP_OP_ATTR = "_fused_moe_ep_op_nosp"
+SP_GATE = {"replicated": False}
+# TPU_DSV4_MHC_MOE_AR_SEAM: the companion op (same layer, same program) that
+# returns its pre-all-reduce partial at decode buckets for the next layer's
+# mHC seam to sum (``shared_defer_ar``), per op and per SP variant, and the
+# trace-time handshake: the model sets "want" around a layer's MoE call, and
+# fused_moe_ep sets "done" when the companion took the call.
+FUSED_MOE_EP_DEFER_OP_ATTR = "_fused_moe_ep_op_defer"
+FUSED_MOE_EP_NOSP_DEFER_OP_ATTR = "_fused_moe_ep_op_nosp_defer"
+MOE_DEFER_GATE = {"want": False, "done": False}
+_DEFER_OPS: dict[int, Any] = {}
+
+
+def defer_op_for(op) -> Any:
+    """The partial-returning companion of ``op`` (built by ``_build_op``
+    under TPU_DSV4_MHC_MOE_AR_SEAM), or None."""
+    return None if op is None else _DEFER_OPS.get(id(op))
+# Set on a layer whose op returns shared + routed (MOE_FUSED_EP_SHARED_IN_OP).
+SHARED_IN_OP_ATTR = "_tpu_fused_ep_shared_in_op"
+# The runner's routed_scaling_factor, stashed on the routed-experts layer.
+RUNNER_ROUTED_SCALE_ATTR = "_tpu_runner_routed_scale"
 
 
 def _squeeze_channel_scale(
@@ -185,6 +210,21 @@ def _build_op(
     has_expert_slot=False,
     has_order_after=False,
     scales_expert_second_minor=False,
+    merge_exchange=False,
+    onehot_scatter=False,
+    pallas_plan=False,
+    decode_combine=False,
+    pallas_restore=False,
+    fused_select=False,
+    lane_quant=False,
+    oneshot_gather=False,
+    combine_restore=False,
+    shared_in_op=False,
+    shared_out_scale=1.0,
+    shared_rs_min_rows=0,
+    shared_small_ar_max_rows=0,
+    shared_fold_restore=False,
+    shared_defer_ar=0,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
@@ -193,6 +233,7 @@ def _build_op(
     """
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
 
+    build_args = dict(locals())
     key = (
         topk,
         renormalize,
@@ -210,6 +251,21 @@ def _build_op(
         has_expert_slot,
         has_order_after,
         scales_expert_second_minor,
+        merge_exchange,
+        onehot_scatter,
+        pallas_plan,
+        decode_combine,
+        pallas_restore,
+        fused_select,
+        lane_quant,
+        oneshot_gather,
+        combine_restore,
+        shared_in_op,
+        shared_out_scale,
+        shared_rs_min_rows,
+        shared_small_ar_max_rows,
+        shared_fold_restore,
+        shared_defer_ar,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -221,7 +277,29 @@ def _build_op(
     name = FUSED_MOE_EP_OP_NAME if not _OPS else f"{FUSED_MOE_EP_OP_NAME}_{len(_OPS)}"
 
     routing_kw = dict(
-        scoring_fn=scoring_fn, routed_scaling_factor=routed_scaling_factor
+        scoring_fn=scoring_fn,
+        routed_scaling_factor=routed_scaling_factor,
+        merge_exchange=merge_exchange,
+        onehot_scatter=onehot_scatter,
+        pallas_plan=pallas_plan,
+        decode_combine=decode_combine,
+        pallas_restore=pallas_restore,
+        fused_select=fused_select,
+        lane_quant=lane_quant,
+        oneshot_gather=oneshot_gather,
+        combine_restore=combine_restore,
+    )
+    shared_kw = (
+        dict(
+            shared_in_op=True,
+            shared_out_scale=shared_out_scale,
+            shared_rs_min_rows=shared_rs_min_rows,
+            shared_small_ar_max_rows=shared_small_ar_max_rows,
+            shared_fold_restore=shared_fold_restore,
+            shared_defer_ar=shared_defer_ar,
+        )
+        if shared_in_op
+        else {}
     )
 
     # Any: the layer, route or compute result depending on bias_kw's stage;
@@ -252,6 +330,7 @@ def _build_op(
             sharded_plan=sharded_plan,
             token_replica_groups=token_replica_groups,
             scales_expert_second_minor=scales_expert_second_minor,
+            **shared_kw,
             **bias_kw,
             **routing_kw,
         )
@@ -381,6 +460,26 @@ def _build_op(
             sorted_gather,
         )
     _OPS[key] = op
+    if (
+        not shared_defer_ar
+        and envs.TPU_DSV4_MHC_MOE_AR_SEAM
+        and shared_in_op
+        and shared_fold_restore
+        and sorted_gather is None
+        and shared_small_ar_max_rows > 0
+        and _replica_width(token_replica_groups) > 1
+    ):
+        # Same rows cap as the in-op small all-reduce, which is also the cap
+        # the seam op (deepseek_v4_mhc_ar_seam_op) sums below.
+        build_args.pop("fused_ep_moe_v2", None)
+        build_args.pop("WeightFormat", None)
+        build_args["shared_defer_ar"] = shared_small_ar_max_rows
+        _DEFER_OPS[id(op)] = _build_op(**build_args)
+        logger.info_once(
+            "Fused EP MoE: decode partial handed to the next mHC seam "
+            "(TPU_DSV4_MHC_MOE_AR_SEAM) up to %d rows",
+            shared_small_ar_max_rows,
+        )
     return op
 
 
@@ -643,6 +742,15 @@ def fused_moe_ep(
     answer.
     """
     op = getattr(owner, FUSED_MOE_EP_OP_ATTR)
+    defer = getattr(owner, FUSED_MOE_EP_DEFER_OP_ATTR, None)
+    if SP_GATE["replicated"]:
+        nosp = getattr(owner, FUSED_MOE_EP_NOSP_OP_ATTR, None)
+        if nosp is not None:
+            op = nosp
+            defer = getattr(owner, FUSED_MOE_EP_NOSP_DEFER_OP_ATTR, None)
+    if MOE_DEFER_GATE["want"] and defer is not None:
+        op = defer
+        MOE_DEFER_GATE["done"] = True
     if w1.dtype == torch.float4_e2m1fn_x2:
         # FP4 scales are already [E, K/block, N]. Even a single block must
         # retain its axis; the per-channel helper would incorrectly drop it.
@@ -1001,10 +1109,20 @@ def prebuild_fused_moe_ep(
     token_replica_groups = ep_token_replica_groups(
         is_sequence_parallel=layer.moe_config.moe_parallel_config.is_sequence_parallel
     )
+    replica_width = _replica_width(token_replica_groups)
     scoring_fn, has_score_bias, routed_scale = _routing_config(layer)
     has_hash_ids = getattr(layer, "hash_indices_table", None) is not None
     has_expert_slot = placed is not None
     has_order_after = envs.MOE_FUSED_EP_SHARED_BEFORE_KERNEL
+    # The shared expert's partial rides the ordering operand into the op, which
+    # returns shared + routed reduced; the runner's routed scale moves in with
+    # it (VllmMoERunner stashes it on the layer and skips its own scaling).
+    shared_in_op = (
+        has_order_after
+        and envs.MOE_FUSED_EP_SHARED_IN_OP
+        and hasattr(layer, RUNNER_ROUTED_SCALE_ATTR)  # the runner has a shared expert
+    )
+    shared_out_scale = float(getattr(layer, RUNNER_ROUTED_SCALE_ATTR, 1.0))
     if (has_expert_slot or has_order_after) and sorted_gather is not None:
         raise ValueError(
             f"{layer.layer_name}: TPU_EXPERT_PLACEMENT and "
@@ -1029,12 +1147,47 @@ def prebuild_fused_moe_ep(
         has_expert_slot=has_expert_slot,
         has_order_after=has_order_after,
         scales_expert_second_minor=scales_expert_second_minor,
+        merge_exchange=envs.MOE_FUSED_EP_V2_MERGED_EXCHANGE,
+        onehot_scatter=envs.MOE_FUSED_EP_V2_ONEHOT_SCATTER,
+        pallas_plan=envs.MOE_FUSED_EP_V2_PALLAS_PLAN,
+        decode_combine=envs.MOE_FUSED_EP_V2_DECODE_COMBINE,
+        pallas_restore=envs.MOE_FUSED_EP_V2_PALLAS_RESTORE,
+        fused_select=envs.MOE_FUSED_EP_V2_FUSED_SELECT,
+        lane_quant=envs.MOE_FUSED_EP_V2_LANE_QUANT,
+        oneshot_gather=envs.MOE_FUSED_EP_V2_ONESHOT_GATHER,
+        combine_restore=envs.MOE_FUSED_EP_V2_COMBINE_RESTORE,
+        shared_in_op=shared_in_op,
+        shared_out_scale=shared_out_scale,
+        shared_rs_min_rows=_shared_rs_min_rows(replica_width),
+        # Below the reduce-scatter threshold the in-op shared all-reduce takes
+        # the small all-reduce kernel where the runner's would have.
+        shared_small_ar_max_rows=(
+            _small_ar_max_rows(replica_width)
+            if shared_in_op and envs.TPU_SMALL_ALL_REDUCE
+            else 0
+        ),
+        # 1: fold where the Pallas restore is in effect; 2: at every decode
+        # bucket the small all-reduce takes (MOE_FUSED_EP_V2_FOLD_ANY_DECODE).
+        shared_fold_restore=(
+            (2 if envs.MOE_FUSED_EP_V2_FOLD_ANY_DECODE else 1)
+            if shared_in_op and envs.MOE_FUSED_EP_V2_FOLD_RESTORE_INTO_SHARED_AR
+            else 0
+        ),
     )
+    if shared_in_op:
+        object.__setattr__(layer, SHARED_IN_OP_ATTR, True)
+        logger.info_once(
+            "Fused EP MoE reduces the shared expert in its op | out_scale=%s "
+            "rs_min_rows=%d",
+            shared_out_scale,
+            _shared_rs_min_rows(replica_width),
+        )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
         "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s "
         "act=%s scoring=%s score_bias=%s hash_routing=%s routed_scale=%s "
-        "token_replica_groups=%s",
+        "token_replica_groups=%s decode_glue(merged=%s onehot=%s plan=%s "
+        "combine=%s restore=%s select=%s lane_quant=%s oneshot=%s combine_restore=%s)",
         hidden,
         inter,
         local_experts,
@@ -1051,6 +1204,15 @@ def prebuild_fused_moe_ep(
         has_hash_ids,
         routed_scale,
         token_replica_groups,
+        envs.MOE_FUSED_EP_V2_MERGED_EXCHANGE,
+        envs.MOE_FUSED_EP_V2_ONEHOT_SCATTER,
+        envs.MOE_FUSED_EP_V2_PALLAS_PLAN,
+        envs.MOE_FUSED_EP_V2_DECODE_COMBINE,
+        envs.MOE_FUSED_EP_V2_PALLAS_RESTORE,
+        envs.MOE_FUSED_EP_V2_FUSED_SELECT,
+        envs.MOE_FUSED_EP_V2_LANE_QUANT,
+        envs.MOE_FUSED_EP_V2_ONESHOT_GATHER,
+        envs.MOE_FUSED_EP_V2_COMBINE_RESTORE,
     )
     # Chunked collection stops applying the moment this arms: the fused call
     # returns before `apply_monolithic` reaches the chunked path, and the
@@ -1131,6 +1293,26 @@ def fused_moe_ep_unsupported_reason(
     ):
         return "expert biases are not wired through the fused EP op"
     return _unsupported_routing_reason(layer, supplies_hash_ids=supplies_hash_ids)
+
+
+def _replica_width(groups) -> int:
+    """Cores per token replica group (the TP group), 1 without groups."""
+    return len(groups[0]) if groups else 1
+
+
+def _shared_rs_min_rows(width: int) -> int:
+    """MOE_FUSED_EP_SHARED_RS_MIN_ROWS, with -1 resolved by the token replica
+    (TP) group width: 1024 rows at 8 or more, 256 below (where the
+    reduce-scatter measured faster than the in-op all-reduce on the DSv4 twin)."""
+    if envs.MOE_FUSED_EP_SHARED_RS_MIN_ROWS >= 0:
+        return envs.MOE_FUSED_EP_SHARED_RS_MIN_ROWS
+    return 1024 if width >= 8 else 256
+
+
+def _small_ar_max_rows(width: int) -> int:
+    from vllm_torchtpu.layers.adapter import small_all_reduce_op
+
+    return small_all_reduce_op.max_rows(width)
 
 
 def _routing_config(layer) -> tuple[str, bool, float]:

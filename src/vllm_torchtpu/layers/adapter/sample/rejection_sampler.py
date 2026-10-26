@@ -428,8 +428,7 @@ def _greedy_rejection_sample(
     return selected_tokens[:batch_size]
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-def _random_rejection_sample_with_segment(
+def random_rejection_sample_with_segment_impl(
     draft_token_ids: torch.Tensor,
     target_logits: torch.Tensor,
     num_draft_tokens: torch.Tensor,
@@ -619,3 +618,10 @@ def _random_rejection_sample_with_segment(
     selected_tokens[batch_range, accepted_count] = bonus_token_at_accepted_count
 
     return selected_tokens[:batch_size]
+
+
+# The uncompiled body is also traced inline by the runner's fused verify chain
+# (TPU_SAMPLER_FUSED_CHAIN).
+_random_rejection_sample_with_segment = torch.compile(
+    backend="tpu", fullgraph=True, dynamic=False
+)(random_rejection_sample_with_segment_impl)

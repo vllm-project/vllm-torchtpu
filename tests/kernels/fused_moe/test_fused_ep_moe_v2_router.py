@@ -158,3 +158,46 @@ def test_labels_relabel_the_picks_and_nothing_else(two_tables):
     )
     np.testing.assert_array_equal(np.asarray(w), w0)
     np.testing.assert_array_equal(np.asarray(i), labels[i0])
+
+
+@pytest.mark.parametrize("with_bias", [False, True], ids=["plain", "bias"])
+@pytest.mark.parametrize("with_labels", [False, True], ids=["ids", "labels"])
+def test_select_routed_matches_unfused(with_bias, with_labels):
+    """pallas_select_routed == the bias add, pallas_select and the layer's
+    row-routes mask, bit for bit, including rows with NaN or -inf entries."""
+    rng = np.random.default_rng(7)
+    rows = 16
+    gate = rng.normal(size=(rows, EXPERTS)).astype(np.float32)
+    gate[3] = np.nan  # masked padding row
+    gate[5] = -np.inf  # replica padding row
+    gate[6, :7] = np.inf
+    scores = np.sqrt(np.log1p(np.exp(gate))).astype(np.float32)
+    bias = (
+        jnp.asarray(rng.normal(size=EXPERTS).astype(np.float32) * 3.0)
+        if with_bias
+        else None
+    )
+    labels = (
+        jnp.asarray(rng.permutation(EXPERTS).astype(np.int32)) if with_labels else None
+    )
+    s, g = jnp.asarray(scores), jnp.asarray(gate)
+    w, i, routes = router_ops.pallas_select_routed(
+        s, g, topk=TOPK, block_rows=8, score_bias=bias, labels=labels, interpret=True
+    )
+    ref_w, ref_i = router_ops.pallas_select(
+        s if bias is None else s + bias[None, :],
+        topk=TOPK,
+        block_rows=8,
+        weight_scores=None if bias is None else s,
+        labels=labels,
+        interpret=True,
+    )
+    ref_routes = jnp.any(jnp.isfinite(s), axis=-1, keepdims=True) & jnp.any(
+        jnp.isfinite(g), axis=-1, keepdims=True
+    )
+    np.testing.assert_array_equal(
+        np.asarray(w).view(np.int32), np.asarray(ref_w).view(np.int32)
+    )
+    np.testing.assert_array_equal(np.asarray(i), np.asarray(ref_i))
+    np.testing.assert_array_equal(np.asarray(routes), np.asarray(ref_routes))
+    assert not bool(routes[3, 0]) and not bool(routes[5, 0]) and bool(routes[6, 0])

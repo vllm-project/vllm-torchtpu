@@ -211,12 +211,44 @@ def _kernel(
     num_sub_t: int,
     quantize_activations: bool,
     head_dim: int,
+    groups_per_step: int = 1,
 ) -> None:
-    rhs = w_ref[...]
-    scale = scale_ref[...]
     cos_sin = cos_sin_ref[...]
     sub_t = tile_t // num_sub_t
     out_dtype = x_ref.dtype
+    heads = x_ref.shape[1] // groups_per_step
+    cols = w_ref.shape[1] // groups_per_step
+    for j in range(groups_per_step):
+        _group(
+            x_ref.at[:, pl.ds(j * heads, heads)],
+            w_ref.at[:, pl.ds(j * cols, cols)],
+            scale_ref.at[:, pl.ds(j * cols, cols)],
+            cos_sin,
+            out_ref.at[:, pl.ds(j * cols, cols)],
+            sub_t=sub_t,
+            num_sub_t=num_sub_t,
+            quantize_activations=quantize_activations,
+            head_dim=head_dim,
+            out_dtype=out_dtype,
+        )
+
+
+def _group(
+    x_ref,
+    w_ref,
+    scale_ref,
+    cos_sin,
+    out_ref,
+    *,
+    sub_t,
+    num_sub_t,
+    quantize_activations,
+    head_dim,
+    out_dtype,
+):
+    """One group's heads against its wo_a column block."""
+    rhs = w_ref[...]
+    scale = scale_ref[...]
     for s in range(num_sub_t):
         # Subchunk the tile to allow more Instruction level parallelism
         # opportunities to be exploited by the LLO compiler.
@@ -257,6 +289,7 @@ def _kernel(
         "sub_t",
         "quantize_activations",
         "name",
+        "groups_per_step",
     ),
 )
 def wo_a_projection(
@@ -270,6 +303,7 @@ def wo_a_projection(
     sub_t: int | None = None,
     quantize_activations: bool = True,
     name: str = "wo_a_projection",
+    groups_per_step: int | None = None,
 ) -> jax.Array:
     """Do DSv4 wo_a projection.
 
@@ -322,6 +356,16 @@ def wo_a_projection(
     assert tile_t % sub_t == 0
     num_t_tiles = num_tokens // tile_t
     num_r_tiles = lora_rank // tile_r
+    if groups_per_step is None:
+        # Two groups per grid step halve the steps (and their fixed cost) at
+        # decode-sized token tiles; a larger tile's doubled blocks overrun VMEM.
+        # rc7 tpu7x one core, quantized activations (j-1e69970b), per call:
+        # 4 groups (TP4) T=16/128/256: 14.7/19.5/25.6 -> 13.4/18.0/24.9 us;
+        # 2 groups (TP8) within 0.2 us; T=512 is slower (24.8 -> 26.0 us at
+        # TP8, 38.7 -> 39.9 at TP4), so the cap is 256.
+        groups_per_step = 2 if tile_t <= 256 and num_r_tiles == 1 else 1
+    gps = groups_per_step if num_groups % groups_per_step == 0 else 1
+    assert gps == 1 or num_r_tiles == 1
 
     return pl.pallas_call(
         functools.partial(
@@ -330,23 +374,26 @@ def wo_a_projection(
             num_sub_t=tile_t // sub_t,
             quantize_activations=quantize_activations,
             head_dim=head_dim,
+            groups_per_step=gps,
         ),
         out_shape=jax.ShapeDtypeStruct((num_tokens, out_features), x.dtype),
-        grid=(num_groups, num_t_tiles, num_r_tiles),
+        grid=(num_groups // gps, num_t_tiles, num_r_tiles),
         in_specs=[
-            # x: one group's heads, [t, g, 0] over [T, G * H, head_dim].
+            # x: `gps` groups' heads, [t, g, 0] over [T, G * H, head_dim].
             pl.BlockSpec(
-                (tile_t, heads_per_group, head_dim), lambda g, t, r: (t, g, 0)
+                (tile_t, gps * heads_per_group, head_dim), lambda g, t, r: (t, g, 0)
             ),
             # wo_a: the whole reduction, column block g * R + r * tile_r.
-            pl.BlockSpec((reduction, tile_r), lambda g, t, r: (0, g * num_r_tiles + r)),
+            pl.BlockSpec(
+                (reduction, gps * tile_r), lambda g, t, r: (0, g * num_r_tiles + r)
+            ),
             # wo_a_scale
-            pl.BlockSpec((1, tile_r), lambda g, t, r: (0, g * num_r_tiles + r)),
+            pl.BlockSpec((1, gps * tile_r), lambda g, t, r: (0, g * num_r_tiles + r)),
             # cos_sin: one token block
             pl.BlockSpec((tile_t, 2 * LANE), lambda g, t, r: (t, 0)),
         ],
         out_specs=pl.BlockSpec(
-            (tile_t, tile_r), lambda g, t, r: (t, g * num_r_tiles + r)
+            (tile_t, gps * tile_r), lambda g, t, r: (t, g * num_r_tiles + r)
         ),
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,

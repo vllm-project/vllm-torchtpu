@@ -36,6 +36,7 @@ from __future__ import annotations
 import torch
 from vllm.config import VllmConfig
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 
@@ -98,6 +99,9 @@ class DSparkProposer(DFlashProposer):
                 trained_block,
             )
         logger.info("DSpark: sample_from_anchor=%s, K=%d.", self.sample_from_anchor, K)
+        # Drafting is always greedy here (see the warning above), which the
+        # vocabulary-parallel Markov chain requires.
+        self._vocab_parallel_markov = envs.TPU_DSPARK_VOCAB_PARALLEL_MARKOV
 
     # A reduced-vocab DSpark checkpoint carries its own lm_head
     # ([draft_vocab, hidden] plus a d2t remap) and possibly its own
@@ -127,6 +131,25 @@ class DSparkProposer(DFlashProposer):
                     f"DSpark draft model lacks {attr}(); expected a "
                     "Qwen3DSpark/Gemma4DSpark-family model."
                 )
+        if self._vocab_parallel_markov:
+            if not hasattr(self.draft_model, "prepare_vocab_parallel_markov"):
+                raise RuntimeError(
+                    "TPU_DSPARK_VOCAB_PARALLEL_MARKOV: "
+                    f"{type(self.draft_model).__name__} has no vocabulary-parallel "
+                    "Markov head."
+                )
+            self.draft_model.prepare_vocab_parallel_markov()
+        if envs.TPU_DSPARK_SHARDED_CONTEXT_KV:
+            prepare = getattr(
+                self.draft_model.model, "prepare_sharded_context_kv", None
+            )
+            if prepare is None:
+                raise RuntimeError(
+                    "TPU_DSPARK_SHARDED_CONTEXT_KV: "
+                    f"{type(self.draft_model).__name__} has no sharded context-KV "
+                    "projection."
+                )
+            prepare()
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _dflash_forward_and_sample(
@@ -152,22 +175,44 @@ class DSparkProposer(DFlashProposer):
 
         padded_num_reqs = hidden.shape[0] // block_size
         valid_hidden = hidden[: padded_num_reqs * block_size]
+        sample_start = 0 if self.sample_from_anchor else 1
+        num_slots = block_size - sample_start
 
-        # Draft-vocab logits for every slot; the Markov bias is added in
-        # draft space and ids are remapped to target vocab after argmax.
-        logits = self.draft_model.compute_draft_logits(valid_hidden)
-        logits_3d = logits.view(padded_num_reqs, block_size, logits.shape[-1])
-
+        # Reorder the narrow hidden states before the vocabulary projection.
+        # Each Markov step then reads contiguous request rows without
+        # relayouting the much wider [requests, slots, vocab] logits.
+        slot_hidden = (
+            valid_hidden.view(padded_num_reqs, block_size, hidden.shape[-1])[
+                :, sample_start:
+            ]
+            .transpose(0, 1)
+            .reshape(num_slots * padded_num_reqs, hidden.shape[-1])
+        )
         ids_3d = input_ids[: padded_num_reqs * block_size].view(
             padded_num_reqs, block_size
         )
         prev = ids_3d[:, 0]
         draft_tokens = []
-        sample_start = 0 if self.sample_from_anchor else 1
-        for i in range(sample_start, block_size):
+        if getattr(self, "_vocab_parallel_markov", False):
+            # Greedy on this rank's vocabulary shard; one (max, argmax) pair
+            # per rank and row is exchanged per draft position.
+            logits = self.draft_model.compute_draft_logits_local(slot_hidden)
+            logits_3d = logits.view(num_slots, padded_num_reqs, logits.shape[-1])
+            for i in range(num_slots):
+                bias = self.draft_model.markov_bias_local(
+                    self.draft_model.markov_embed(prev)
+                )
+                step = self.draft_model.vocab_parallel_argmax(logits_3d[i] + bias)
+                draft_tokens.append(step)
+                prev = step
+            return torch.stack(draft_tokens, dim=1), hidden
+
+        logits = self.draft_model.compute_draft_logits(slot_hidden)
+        logits_3d = logits.view(num_slots, padded_num_reqs, logits.shape[-1])
+        for i in range(num_slots):
             bias = self.draft_model.markov_bias(self.draft_model.markov_embed(prev))
             step = self.draft_model.map_draft_to_target(
-                (logits_3d[:, i] + bias).argmax(dim=-1)
+                (logits_3d[i] + bias).argmax(dim=-1)
             )
             draft_tokens.append(step)
             prev = step

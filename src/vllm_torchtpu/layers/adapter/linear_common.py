@@ -22,7 +22,9 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
+from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
 # Some layers have their `.weight` read raw -- bypassing the linear method's
@@ -48,6 +50,10 @@ KEEP_VLLM_LAYOUT_ATTR = "_tpu_keep_vllm_weight_layout"
 # (`dummy_loader`, `reload/layerwise`), where a second flip would transpose
 # back and silently corrupt the values.
 WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"
+
+# Set at load on a layer routed through `quantized_matmul_pallas`
+# (TPU_FP8_LINEAR_PALLAS); the value is the layer's `hbm_pin` flag.
+FP8_PALLAS_ATTR = "_tpu_fp8_skinny_hbm_pin"
 
 
 def _get_x_q_dtype(w_q_dtype: jnp.dtype) -> jnp.dtype:
@@ -156,6 +162,72 @@ def quantized_matmul(
     x_2d = x.reshape(-1, x.shape[-1])
     out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s)
     return out_2d.reshape(orig_out_shape)
+
+
+def _fp8_linear_pallas(
+    x: jax.Array, w_q: jax.Array, w_s: jax.Array, *, hbm_pin: bool
+) -> jax.Array:
+    """Decode rows with a measured (K, N) tiling go to the weight-streaming
+    `fp8_skinny` kernel; every other call is `xla_quantized_matmul` unchanged."""
+    if fp8_skinny.supports(x.shape[0], w_q, w_s):
+        return fp8_skinny.fp8_skinny_matmul(
+            x, w_q, w_s, hbm_pin=hbm_pin, scale_dma=envs.TPU_FP8_SKINNY_SCALE_DMA
+        )
+    return xla_quantized_matmul(x, w_q, w_s)
+
+
+def _fp8_linear_pallas_jax(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.Array:
+    return _fp8_linear_pallas(x, w_q, w_s, hbm_pin=False)
+
+
+def _fp8_linear_pallas_hbm_jax(
+    x: jax.Array, w_q: jax.Array, w_s: jax.Array
+) -> jax.Array:
+    return _fp8_linear_pallas(x, w_q, w_s, hbm_pin=True)
+
+
+_fp8_linear_pallas_ops: dict[bool, Callable] = {}
+
+
+def get_fp8_linear_pallas_op(hbm_pin: bool) -> Callable:
+    """The cached torch op for `quantized_matmul_pallas`; build it at load (outside
+    Dynamo), it takes a lock."""
+    op = _fp8_linear_pallas_ops.get(hbm_pin)
+    if op is not None:
+        return op
+    with _quantized_matmul_kernel_op_lock:
+        op = _fp8_linear_pallas_ops.get(hbm_pin)
+        if op is not None:
+            return op
+        if hbm_pin:
+            op = pallas.jax_op(
+                "pallas::fp8_linear_pallas_hbm", _fp8_linear_pallas_hbm_jax
+            )
+        else:
+            op = pallas.jax_op("pallas::fp8_linear_pallas", _fp8_linear_pallas_jax)
+
+        def _fake(x: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor):
+            del w_s
+            return torch.empty(x.shape[0], w_q.shape[1], dtype=x.dtype, device=x.device)
+
+        op.register_fake(_fake)
+        _fp8_linear_pallas_ops[hbm_pin] = op
+        return op
+
+
+def quantized_matmul_pallas(
+    x: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor, hbm_pin: bool = False
+) -> torch.Tensor:
+    """`quantized_matmul` for a TPU_FP8_LINEAR_PALLAS layer: per-channel FP8, (k, n)
+    weight, 1-D scale. Skinny calls run `fp8_skinny`, the rest the XLA path."""
+    if x.shape[-1] != w_q.shape[0]:
+        raise ValueError(
+            f"Input hidden dim {x.shape[-1]} must match weight hidden dim "
+            f"{w_q.shape[0]}."
+        )
+    x_2d = x.reshape(-1, x.shape[-1])
+    out_2d = get_fp8_linear_pallas_op(hbm_pin)(x_2d, w_q, w_s)
+    return out_2d.reshape(*x.shape[:-1], w_q.shape[1])
 
 
 def _quantized_matmul_fp4_jax(

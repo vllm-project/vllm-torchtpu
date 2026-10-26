@@ -35,11 +35,23 @@ NEG = -3.0e38  # below any real softmax score (>=0); avoids inf
 
 def _select_kernel(x_ref, w_ref, i_ref, *, topk, n, v_ref=None, l_ref=None):
     """One block of rows: take the top `topk` by repeated max-and-mask."""
+    _select(
+        x_ref[...],
+        None if v_ref is None else v_ref[...],
+        None if l_ref is None else l_ref[...],
+        w_ref,
+        i_ref,
+        topk=topk,
+        n=n,
+    )
+
+
+def _select(x, v, labels, w_ref, i_ref, *, topk, n):
+    """_select_kernel on values: x [R, n] f32, v the weight scores or None,
+    labels [1, n] i32 or None."""
     # NaN is flushed to the sentinel so every row has a maximum some
     # column equals; an all-NaN row selects expert 0 with weight NEG.
-    x = jnp.where(jnp.isnan(x_ref[...]), NEG, x_ref[...])  # [R, n] f32
-    v = None if v_ref is None else v_ref[...]
-    labels = None if l_ref is None else l_ref[...]  # [1, n] i32
+    x = jnp.where(jnp.isnan(x), NEG, x)  # [R, n] f32
     iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
     for j in range(topk):
         m = jnp.max(x, axis=1, keepdims=True)  # [R,1] rowmax
@@ -79,6 +91,83 @@ def _select_kernel_labelled(*refs, topk, n, has_weights):
     v_ref = next(it) if has_weights else None
     l_ref, w_ref, i_ref = next(it), next(it), next(it)
     _select_kernel(x_ref, w_ref, i_ref, topk=topk, n=n, v_ref=v_ref, l_ref=l_ref)
+
+
+def _select_routed_kernel(*refs, topk, n, has_bias, has_labels):
+    """(scores, gate, [bias], [labels]) -> (w, i, routes): the selection on
+    scores + bias with weights from the scores, plus the row-routes mask."""
+    it = iter(refs)
+    s_ref, g_ref = next(it), next(it)
+    b_ref = next(it) if has_bias else None
+    l_ref = next(it) if has_labels else None
+    w_ref, i_ref, r_ref = next(it), next(it), next(it)
+    scores = s_ref[...]
+
+    def any_finite(a):
+        # isfinite as a compare: NaN and +-inf both fail it.
+        finite = (jnp.abs(a) < jnp.inf).astype(jnp.int32)
+        return jnp.max(finite, axis=1, keepdims=True)
+
+    r_ref[...] = any_finite(scores) * any_finite(g_ref[...])
+    _select(
+        scores if b_ref is None else scores + b_ref[...],
+        None if b_ref is None else scores,
+        None if l_ref is None else l_ref[...],
+        w_ref,
+        i_ref,
+        topk=topk,
+        n=n,
+    )
+
+
+def pallas_select_routed(
+    scores, gate, *, topk, block_rows, score_bias=None, labels=None, interpret=False
+):
+    """pallas_select on ``scores + score_bias`` with the weights read from
+    ``scores``, which also returns the layer's row-routes mask [R, 1] bool:
+    a row routes iff some score and some gate logit of it is finite.
+
+    The same selection, weights and mask the layer otherwise builds from three
+    more XLA ops (the bias add and two finiteness reductions); f32 addition and
+    the finiteness test are exact, so every output is bit-identical.
+    """
+    R, N = scores.shape
+    assert R % block_rows == 0, (R, block_rows)
+    if gate.shape != (R, N):
+        raise ValueError(f"gate {gate.shape} must match scores {scores.shape}")
+    row_spec = pl.BlockSpec((block_rows, N), lambda i: (i, 0))
+    vec_spec = pl.BlockSpec((1, N), lambda i: (0, 0))
+    operands, specs = [scores, gate.astype(jnp.float32)], [row_spec, row_spec]
+    if score_bias is not None:
+        operands.append(score_bias.astype(jnp.float32).reshape(1, N))
+        specs.append(vec_spec)
+    if labels is not None:
+        operands.append(labels.astype(jnp.int32).reshape(1, N))
+        specs.append(vec_spec)
+    kernel = functools.partial(
+        _select_routed_kernel,
+        topk=topk,
+        n=N,
+        has_bias=score_bias is not None,
+        has_labels=labels is not None,
+    )
+    w, i, routes = pl.pallas_call(
+        kernel,
+        grid=(R // block_rows,),
+        in_specs=specs,
+        out_specs=[
+            pl.BlockSpec((block_rows, topk), lambda i: (i, 0)),
+            pl.BlockSpec((block_rows, topk), lambda i: (i, 0)),
+            pl.BlockSpec((block_rows, 1), lambda i: (i, 0)),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((R, topk), jnp.float32),
+            jax.ShapeDtypeStruct((R, topk), jnp.int32),
+            jax.ShapeDtypeStruct((R, 1), jnp.int32),
+        ],
+        interpret=interpret,
+    )(*operands)
+    return w, i, routes != 0
 
 
 def pallas_select(

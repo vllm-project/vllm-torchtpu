@@ -40,3 +40,23 @@ def optimization_barrier_op() -> Any:
 def optimization_barrier(x: torch.Tensor) -> torch.Tensor:
     """Block XLA fusion passes from fusing across ``x``."""
     return optimization_barrier_op()(x)
+
+
+@run_once
+def optimization_barrier2_op() -> Any:
+    """``pallas::optimization_barrier2``: a fence over two tensors -- neither
+    output is available before both inputs are computed."""
+
+    def _optimization_barrier2(x: jax.Array, y: jax.Array) -> tuple[jax.Array, jax.Array]:
+        return jax.lax.optimization_barrier((x, y))
+
+    op = pallas.jax_op("pallas::optimization_barrier2", _optimization_barrier2)
+    op.register_fake(lambda x, y: (torch.empty_like(x), torch.empty_like(y)))
+    return op
+
+
+def optimization_barrier2(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Order: whatever consumes either output runs after both inputs."""
+    return optimization_barrier2_op()(x, y)

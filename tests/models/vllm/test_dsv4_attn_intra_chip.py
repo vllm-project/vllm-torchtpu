@@ -185,8 +185,10 @@ def test_matches_unsharded_reference(monkeypatch):
     def run(rank):
         try:
             layer = make(rank)
-            # The base attention_impl runs attention between these two hooks.
-            o = attn(layer._project_q(qr[rank]), pos[rank])
+            # The base attention_impl runs attention between these two hooks;
+            # its qnorm_rope turns the flat projection into heads.
+            q = layer._project_q(qr[rank]).view(-1, NUM_HEADS, HEAD_DIM)
+            o = attn(q, pos[rank])
             out[rank] = layer._o_proj(o, pos[rank])
         except BaseException as error:  # noqa: BLE001 - surfaced below
             errors.append(error)

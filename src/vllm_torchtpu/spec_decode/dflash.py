@@ -434,6 +434,11 @@ class DFlashProposer:
             draft_lengths = chunk.draft_lengths
             if draft_lengths is None:
                 draft_lengths = self._zero_draft_lengths(num_reqs)
+            self._record_builder_call(
+                "next_tokens",
+                (next_tokens_device, query_start_loc_device, position_ids_device,
+                 draft_lengths, num_reqs_device),
+            )
             input_ids, positions, seq_lens = self._tpu_build_dflash_inputs_next_tokens(
                 next_tokens_device,
                 query_start_loc_device,
@@ -446,6 +451,11 @@ class DFlashProposer:
                 INVALID_TOKEN_ID,
             )
         elif device_seed is not None:
+            self._record_builder_call(
+                "seed",
+                (device_seed, query_start_loc_device, position_ids_device,
+                 num_reqs_device),
+            )
             input_ids, positions, seq_lens = self._tpu_build_dflash_inputs_seed(
                 device_seed,
                 query_start_loc_device,
@@ -462,6 +472,95 @@ class DFlashProposer:
             )
 
         return input_ids, positions, seq_lens
+
+    def _record_builder_call(self, kind: str, operands: tuple) -> None:
+        """Keep the first real builder call of each kind (operand shapes,
+        dtypes and the caller's grad mode) so `warm_input_builders` can
+        replay it at every bucket. Cheap after the first call per kind."""
+        templates = self.__dict__.setdefault("_builder_templates", {})
+        if kind in templates:
+            return
+        # Dynamo guards on the storage offset too: the live request count is
+        # a view into request_distribution (offset 2), not a fresh scalar.
+        templates[kind] = (
+            tuple(
+                (tuple(t.shape), t.dtype, t.storage_offset())
+                if isinstance(t, torch.Tensor)
+                else t
+                for t in operands
+            ),
+            torch.is_grad_enabled(),
+        )
+
+    def warm_input_builders(self) -> None:
+        """Compile the drafter input builders at every (target token bucket,
+        draft bucket) pair.
+
+        Their programs are keyed on `position_ids` (the target step's token
+        bucket) and the static draft bucket `padded_len`, and the spec-decode
+        warmup drives only a few of those pairs, so mixed steps (decodes plus
+        a prefill chunk of any bucket) compiled them while serving: tens of
+        ~60 ms compiles per worker in an AgentX hour (rc7 j-b85c1061 logs).
+        Replays the first real call of each builder (recorded during the
+        warmup; shapes, dtypes and grad mode) on zero operands, varying only
+        the target bucket and the draft bucket.
+        """
+        templates = self.__dict__.get("_builder_templates", {})
+        if not templates:
+            logger.warning(
+                "DFlash: no input-builder call recorded during the warmup; "
+                "skipping the builder warmup."
+            )
+            return
+        device = self.runner.device
+        block_size = self.block_size
+        draft_buckets = [
+            p
+            for p in self._draft_token_paddings()
+            if block_size <= p <= self._get_padded_len(
+                self._max_chunk_reqs() * block_size
+            )
+        ]
+        n = 0
+        for kind, (specs, grad_enabled) in templates.items():
+            fn = (
+                self._tpu_build_dflash_inputs_next_tokens
+                if kind == "next_tokens"
+                else self._tpu_build_dflash_inputs_seed
+            )
+            for num_tokens in self.runner.num_tokens_paddings:
+                ops = []
+                for i, spec in enumerate(specs):
+                    if not isinstance(spec, tuple) or len(spec) != 3:
+                        ops.append(spec)
+                        continue
+                    shape, dtype, offset = spec
+                    if i == 2:  # position_ids: the target step's token bucket
+                        shape = (num_tokens,)
+                    numel = 1
+                    for d in shape:
+                        numel *= d
+                    # Same storage offset as the live operand (a guarded property).
+                    base = torch.zeros(offset + numel, dtype=dtype, device=device)
+                    ops.append(base[offset : offset + numel].view(shape))
+                for padded_len in draft_buckets:
+                    extra = (
+                        (block_size, padded_len, self.mask_token_id, INVALID_TOKEN_ID)
+                        if kind == "next_tokens"
+                        else (block_size, padded_len, self.mask_token_id)
+                    )
+                    with torch.set_grad_enabled(grad_enabled):
+                        out = fn(*ops, *extra)
+                    synchronize_tensors(out)
+                    n += 1
+        logger.info(
+            "DFlash: warmed %d input-builder programs (%s x %d target buckets x "
+            "draft buckets %s)",
+            n,
+            sorted(templates),
+            len(self.runner.num_tokens_paddings),
+            draft_buckets,
+        )
 
     def _zero_draft_lengths(self, num_reqs: int) -> torch.Tensor:
         """Cached all-zero `draft_lengths` for a chunk without spec

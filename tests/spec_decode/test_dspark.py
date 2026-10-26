@@ -71,6 +71,53 @@ def _make_proposer(hf_dict, num_speculative_tokens=4, **spec_fields):
 _LAYER_IDS = {"dspark_target_layer_ids": [1, 15, 30]}
 
 
+@pytest.mark.parametrize("sample_from_anchor", [False, True])
+@pytest.mark.parametrize("num_reqs", [1, 3, 8])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_sampling_slot_order_matches_request_major_reference(
+    sample_from_anchor, num_reqs, dtype
+):
+    generator = torch.Generator().manual_seed(17)
+    block_size, hidden_size, vocab_size, rank = 5, 16, 32, 8
+    hidden = torch.randn(num_reqs * block_size, hidden_size, generator=generator).to(
+        dtype
+    )
+    head = torch.randn(hidden_size, vocab_size, generator=generator).to(dtype)
+    embed = torch.randn(vocab_size, rank, generator=generator).to(dtype)
+    markov = torch.randn(rank, vocab_size, generator=generator).to(dtype)
+    mapping = torch.randperm(vocab_size, generator=generator)
+    ids = torch.randint(vocab_size, (num_reqs * block_size,), generator=generator)
+    projected_rows = []
+
+    def project(x):
+        projected_rows.append(x.shape[0])
+        return x @ head
+
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.sample_from_anchor = sample_from_anchor
+    proposer.draft_model = SimpleNamespace(
+        model=lambda **kwargs: hidden,
+        compute_draft_logits=project,
+        markov_embed=lambda tokens: embed[tokens],
+        markov_bias=lambda x: x @ markov,
+        map_draft_to_target=lambda tokens: mapping[tokens],
+    )
+    actual, returned_hidden = DSparkProposer._dflash_forward_and_sample.__wrapped__(
+        proposer, ids, torch.arange(ids.numel()), block_size
+    )
+
+    logits = (hidden @ head).view(num_reqs, block_size, vocab_size)
+    previous = ids.view(num_reqs, block_size)[:, 0]
+    expected = []
+    sample_start = 0 if sample_from_anchor else 1
+    for slot in range(sample_start, block_size):
+        previous = mapping[(logits[:, slot] + embed[previous] @ markov).argmax(-1)]
+        expected.append(previous)
+    assert torch.equal(actual, torch.stack(expected, dim=1))
+    assert returned_hidden is hidden
+    assert projected_rows == [num_reqs * (block_size - sample_start)]
+
+
 def test_noise_resolution_and_dense_block():
     p = _make_proposer(
         {

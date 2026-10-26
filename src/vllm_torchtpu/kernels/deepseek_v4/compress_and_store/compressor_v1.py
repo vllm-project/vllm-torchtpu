@@ -18,6 +18,7 @@ import jax.numpy as jnp
 
 import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.config as config
 import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.kernel as compress_kernel
+import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.prefill_block as prefill_block_kernel
 import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.proj_and_save_state as proj_kernel  # noqa: E501
 
 
@@ -227,6 +228,87 @@ def prepare_boundary_batch(
     )
 
 
+def _proj(
+    hidden_states, wkv_wgate, wkv_scale, ape, positions, slot_mapping, target,
+    compress_ratio, head_dim, runs_min_tokens, runs_indexer, runs_tile_n, tile_k,
+    stream_max_tokens, stream_cfg, stream_min_width=0,
+):
+    return proj_kernel.proj_and_save_state(
+        hidden_states=hidden_states,
+        wkv_wgate=wkv_wgate,
+        ape=ape,
+        positions=positions,
+        slot_mapping=slot_mapping,
+        cache=target,
+        compress_ratio=compress_ratio,
+        # The indexer's runs bytes differ from `kernel`'s in the last bits of
+        # the score half (same f64 distance); opt in only.
+        runs_min_tokens=(runs_min_tokens if head_dim != 128 or runs_indexer else 0),
+        runs_tile_n=runs_tile_n,
+        tile_k_cap=tile_k,
+        wkv_scale=wkv_scale,
+        stream_max_tokens=stream_max_tokens,
+        stream_cfg=tuple(stream_cfg),
+        stream_min_width=stream_min_width,
+    )
+
+
+def _state_slots(*, positions, block_table, query_start_loc, kv_block_table, cache,
+                 state_cache, distribution, cos_sin_cache, compress_ratio,
+                 state_block_size, head_dim, overlap, seq_along_lane):
+    """Each token's state row (-1: padding / no write), as `compressor_forward`."""
+    _, slots, _ = derive_metadata(
+        positions=positions,
+        block_table=block_table,
+        query_start_loc=query_start_loc,
+        kv_block_table=kv_block_table,
+        cache=cache,
+        compress_ratio=compress_ratio,
+        state_block_size=state_block_size,
+        head_dim=head_dim,
+        overlap=overlap,
+        cos_sin_cache=cos_sin_cache,
+        state_cache=state_cache,
+        seq_along_lane=seq_along_lane,
+    )
+    real = jnp.arange(positions.shape[0]) < query_start_loc[distribution[2]]
+    return jnp.where(real, slots, -1)
+
+
+def pair_proj(hidden_states, positions, groups, *, stream_cfg=(3584, 2, 1)):
+    """Projects and saves the state of several compressors of the same tokens
+    (the CSA KV compressor and its indexer's) in ONE weight-stream call.
+
+    groups: dicts with the `compressor_forward` operands of each compressor
+    (wkv_wgate, wkv_scale, ape, block_table, query_start_loc, kv_block_table,
+    cache, state_cache, distribution, cos_sin_cache) and its statics
+    (compress_ratio, state_block_size, head_dim, overlap, seq_along_lane).
+    Returns each group's updated state host (`cache`, or `state_cache` when
+    separate). Follow with `compressor_forward(..., skip_proj=True)`.
+    """
+    gs = []
+    for g in groups:
+        slots = _state_slots(
+            positions=positions,
+            **{k: g[k] for k in ("block_table", "query_start_loc", "kv_block_table",
+                                 "cache", "state_cache", "distribution", "cos_sin_cache",
+                                 "compress_ratio", "state_block_size", "head_dim",
+                                 "overlap", "seq_along_lane")},
+        )
+        gs.append(dict(
+            wkv_wgate=g["wkv_wgate"],
+            wkv_scale=g["wkv_scale"],
+            ape=g["ape"],
+            slot_mapping=slots,
+            cache=g["cache"] if g["state_cache"] is None else g["state_cache"],
+            compress_ratio=g["compress_ratio"],
+        ))
+    return proj_kernel._proj_and_save_state_stream_multi(
+        hidden_states, positions, gs, t=stream_cfg[0], nbuf=stream_cfg[1],
+        ndma=stream_cfg[2], interpret=False, name="proj_and_save_state_pair",
+    )
+
+
 def compressor_forward(
     hidden_states: jax.Array,  # [num_tokens, hidden_size] fp32
     wkv_wgate: jax.Array,  # [2*coff*head_dim, hidden_size] fp32
@@ -248,6 +330,17 @@ def compressor_forward(
     quant_block: int,
     state_cache: jax.Array | None = None,  # [num_pages, state_page_size, 4, 128] uint8
     seq_along_lane: bool = False,  # indexer only: `cache` is SEQ_ALONG_LANE
+    proj_runs_min_tokens: int = 0,  # see `proj_and_save_state`
+    proj_runs_tile_n: int = 512,
+    proj_runs_indexer: bool = False,  # runs path for the 128-dim indexer too
+    proj_tile_k: int = 3584,  # k tile cap of the projection (3584 = 2 k steps)
+    proj_stream_max_tokens: int = 0,  # weight-stream kernel for calls <= this
+    proj_stream_cfg: tuple[int, int, int] = (3584, 2, 1),
+    proj_stream_min_width: int = 0,
+    wkv_scale: jax.Array | None = None,  # per-column scale of fp8 wkv_wgate
+    skip_proj: bool = False,  # state already saved (`pair_proj`)
+    prefill_block: int = 0,  # see `prefill_block`; 0 disables
+    prefill_block_min_tokens: int = 0,
 ) -> tuple[jax.Array, jax.Array | None, jax.Array]:
     """Projects, saves state, then compresses and stores the boundary records."""
     num_tokens = positions.shape[0]
@@ -273,15 +366,15 @@ def compressor_forward(
     is_real_token = token_index < query_start_loc[distribution[2]]
     slot_mapping_slots = jnp.where(is_real_token, slot_mapping_slots, -1)
 
-    updated_state = proj_kernel.proj_and_save_state(
-        hidden_states=hidden_states,
-        wkv_wgate=wkv_wgate,
-        ape=ape,
-        positions=positions,
-        slot_mapping=slot_mapping_slots,
-        cache=cache if shares_buffer else state_cache,
-        compress_ratio=compress_ratio,
-    )
+    if skip_proj:
+        updated_state = cache if shares_buffer else state_cache
+    else:
+        updated_state = _proj(
+            hidden_states, wkv_wgate, wkv_scale, ape, positions, slot_mapping_slots,
+            cache if shares_buffer else state_cache, compress_ratio, head_dim,
+            proj_runs_min_tokens, proj_runs_indexer, proj_runs_tile_n, proj_tile_k,
+            proj_stream_max_tokens, proj_stream_cfg, proj_stream_min_width,
+        )
     if shares_buffer:
         cache = updated_state
     else:
@@ -289,6 +382,42 @@ def compressor_forward(
 
     is_decode_token = token_index < query_start_loc[distribution[0]]
     is_boundary = (kv_slot_mapping >= 0) & is_real_token
+
+    use_block = (
+        prefill_block > 0
+        and num_tokens >= max(prefill_block_min_tokens, 1)
+        and overlap
+        and compress_ratio == config.CSA_COMPRESS_RATIO
+        and (head_dim == 512 or seq_along_lane)
+        and cos_sin_cache is not None
+    )
+    plan = None
+    if use_block:
+        cfgs = config.Configs.make(
+            config.select_mode(head_dim, overlap),
+            size_n=num_tokens,
+            physical_page_size=cache.shape[1],
+            state_block_size=state_block_size,
+            head_dim=head_dim,
+            compress_ratio=compress_ratio,
+            seq_along_lane=seq_along_lane,
+            sal_page_size=cache.shape[-1] if seq_along_lane else None,
+        )
+        plan = prefill_block_kernel.plan_blocks(
+            positions,
+            query_start_loc,
+            distribution,
+            token_to_req_indices,
+            block_table,
+            kv_block_table,
+            cos_sin_cache,
+            block=prefill_block,
+            compress_ratio=compress_ratio,
+            state_block_size=state_block_size,
+            kv_block_size=cfgs.kv_block_size,
+            seq_along_lane=seq_along_lane,
+        )
+        is_boundary = is_boundary & ~plan.in_block
 
     boundary_positions, boundary_req, boundary_kv_slot = prepare_boundary_batch(
         positions=positions,
@@ -318,6 +447,20 @@ def compressor_forward(
         rms_eps=rms_eps,
         seq_along_lane=seq_along_lane,
     )
+
+    if plan is not None:
+        cache, rope_cache = prefill_block_kernel.prefill_block_compress(
+            cache,
+            rope_cache,
+            plan,
+            norm_weight,
+            state_block_size=state_block_size,
+            compress_ratio=compress_ratio,
+            quant_block=quant_block,
+            rms_eps=rms_eps,
+            seq_along_lane=seq_along_lane,
+            block=prefill_block,
+        )
 
     if shares_buffer:
         return cache, rope_cache, cache

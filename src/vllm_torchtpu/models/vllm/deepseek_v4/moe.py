@@ -26,7 +26,15 @@ from vllm.model_executor.layers.fused_moe import FusedMoEFactory
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.models.utils import extract_layer_index
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import DeepseekV4MLP
+
+
+def dsv4_sequence_parallel() -> bool:
+    """TPU_DSV4_SEQ_PARALLEL with a TP group to split the tokens over."""
+    return bool(envs.TPU_DSV4_SEQ_PARALLEL) and (
+        get_tensor_model_parallel_world_size() > 1
+    )
 
 
 class DeepseekV4MoE(nn.Module):
@@ -36,9 +44,16 @@ class DeepseekV4MoE(nn.Module):
         self,
         vllm_config: VllmConfig,
         prefix: str = "",
+        seq_parallel: bool | None = None,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
+        # Under sequence parallelism this layer sees only this rank's 1/tp of
+        # the tokens: the shared expert holds the whole weight (no TP partial
+        # to reduce) and the fused EP treats every rank's rows as distinct.
+        self.is_sequence_parallel = (
+            dsv4_sequence_parallel() if seq_parallel is None else seq_parallel
+        )
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.prefix = prefix
@@ -88,9 +103,18 @@ class DeepseekV4MoE(nn.Module):
                 hidden_act=config.hidden_act,
                 swiglu_limit=self.swiglu_limit,
                 quant_config=quant_config,
-                reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
+                is_sequence_parallel=self.is_sequence_parallel,
+                # The served recipe's source patch keys on the literal
+                # reduce_results=False followed by a comma (it would add a second
+                # is_sequence_parallel); keep this the call's last argument.
+                reduce_results=False
             )
+            if self.is_sequence_parallel:
+                # The same recipe patch scales a replicated shared expert by
+                # 1/tp so that a TP reduction of identical copies sums to one;
+                # under sequence parallelism nothing reduces it.
+                object.__setattr__(self.shared_experts, "_tp_scale", 1.0)
 
         self.tp_rank = get_tensor_model_parallel_rank()
         assert config.n_routed_experts % self.tp_size == 0
@@ -114,6 +138,7 @@ class DeepseekV4MoE(nn.Module):
             swiglu_limit=self.swiglu_limit,
             router_logits_dtype=torch.float32,
             apply_routed_scale_to_output=True,
+            is_sequence_parallel=self.is_sequence_parallel,
         )
 
         # The monolithic TPU MoE path never consults the router: MoERunner

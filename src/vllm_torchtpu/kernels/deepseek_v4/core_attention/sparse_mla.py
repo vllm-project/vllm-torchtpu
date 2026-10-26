@@ -92,8 +92,12 @@ def gather_page_ids(
     max_num_seqs: int,
     *,
     block_tokens: int = 8,
+    num_valid_tokens: jax.Array | None = None,
 ) -> jax.Array:
-    """Gathers physical page ids for the CSA top-k tokens."""
+    """Gathers physical page ids for the CSA top-k tokens.
+
+    With `num_valid_tokens`, rows at or past it are left unwritten.
+    """
     num_tokens, topk = seq_page_ids.shape
     pages_per_seq = page_indices.shape[0] // max_num_seqs
     num_chunks = cdiv(pages_per_seq, _GATHER_PAGE_CHUNK)
@@ -121,7 +125,11 @@ def gather_page_ids(
                 pl.BlockSpec((block_tokens, topk), lambda t: (t, 0)),
             ],
             out_specs=pl.BlockSpec((block_tokens, topk), lambda t: (t, 0)),
-            grid=(padded_tokens // block_tokens,),
+            grid=(
+                padded_tokens // block_tokens
+                if num_valid_tokens is None
+                else cdiv(num_valid_tokens, block_tokens),
+            ),
         ),
         out_shape=jax.ShapeDtypeStruct((padded_tokens, topk), jnp.int32),
         compiler_params=pltpu.CompilerParams(
@@ -168,6 +176,58 @@ def _dequant_dsv4_fp8(words: jax.Array):
     return (nope_fp8 * nope_scales).astype(jnp.bfloat16)
 
 
+def _e8m0_high_bytes_to_bf16(pairs: jax.Array) -> jax.Array:
+    """BF16 2^(e - 127) for the e8m0 byte e in the high byte of each int16.
+
+    Exact for e in [1, 254], every scale the compressor writes for finite data
+    (amax >= 1e-4); e = 0 gives 0 rather than 2^-127 and e = 255 gives +inf
+    rather than NaN. Costs a shift and a mask per word, against the compare and
+    select fix-ups of an e8m0 -> bf16 convert.
+    """
+    bits = lax.shift_right_logical(pairs, 1) & 0x7F807F80
+    return pltpu.bitcast(bits, jnp.bfloat16)
+
+
+def _dequant_dsv4_fp8_sub_rows(words: jax.Array) -> list[jax.Array]:
+    """int32 [rows, 128] NoPE words -> the record's 4 sub-rows as BF16 [rows, 128].
+
+    Byte b of word (t, l) is record byte 128 b + l of row t (`csa_cache_layout`),
+    so sub-row b is byte plane b. A truncating int32 -> int16 -> int8 cast keeps
+    the low half / low byte, so each sub-row costs a shift and a pack. Each
+    sub-row is scaled on its own and returned unjoined: the caller assembles the
+    KV tile by 128-lane-aligned concatenation instead of joining [rows, 448]
+    values with a scale tile concatenated 4x and sliced at lane 448.
+    Sub-row 3 lanes NOPE_DIM % 128: are the scale bytes, not values; the caller
+    replaces them with the rope dims.
+    """
+
+    def int16_pairs(halves):  # int16 [n, 128] -> int32 [n // 2, 128], same bits
+        return pltpu.bitcast(halves, jnp.int32)
+
+    def low_and_high_bytes(halves):
+        high = lax.shift_right_logical(int16_pairs(halves), 8)
+        return [
+            halves.astype(jnp.int8),
+            pltpu.bitcast(high, jnp.int16).astype(jnp.int8),
+        ]
+
+    low_halves = words.astype(jnp.int16)
+    high_halves = lax.shift_right_logical(words, 16).astype(jnp.int16)
+    sub_rows = low_and_high_bytes(low_halves) + low_and_high_bytes(high_halves)
+    # scales[d] = scales[d % 64]; the 64 scale bytes are lanes 64: of sub-row 3.
+    tail = _e8m0_high_bytes_to_bf16(int16_pairs(high_halves))
+    lane = lax.broadcasted_iota(jnp.int32, tail.shape, 1)
+    tile = jnp.where(
+        lane < NOPE_SCALE_PERIOD, pltpu.roll(tail, NOPE_SCALE_PERIOD, 1), tail
+    )
+    return [
+        (pltpu.bitcast(r, jnp.float8_e4m3fn).astype(jnp.bfloat16) * tile).astype(
+            jnp.bfloat16
+        )
+        for r in sub_rows
+    ]
+
+
 def _attention_kernel(
     # Prefetch
     kv_lens_ref,  # [max_num_seqs]
@@ -185,7 +245,7 @@ def _attention_kernel(
     # Output
     o_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
     # Scratch
-    bkv_nope_x2_ref,  # [2, batch_size, page_size * 4, 128]
+    bkv_nope_x2_ref,  # int32[2, batch_size, topk, 128]
     bkv_rope_x2_ref,  # [2, batch_size, page_size, rope_dim]
     bq_x2_ref,  # [2, batch_size, num_q_heads, head_dim]
     bo_x2_ref,  # [2, batch_size, num_q_heads, head_dim]
@@ -201,10 +261,8 @@ def _attention_kernel(
 
     num_tokens, num_q_heads, head_dim = q_hbm_ref.shape
     assert kv_lens_ref.shape[0] == num_tokens
-    # csa_gather emits int32 words; these are the uint8 nope slabs
-    # [.., topk * 4, 128] and bf16 rope rows [.., topk // 2, 128] they encode,
-    # a free bitcast of the same bytes.
-    cache_kv_nope_hbm_ref = cache_kv_nope_hbm_ref.bitcast(jnp.uint8)
+    # csa_gather emits int32 words; the rope ones are the bf16 rows
+    # [.., topk // 2, 128] they encode, a free bitcast of the same bytes.
     cache_kv_rope_hbm_ref = cache_kv_rope_hbm_ref.bitcast(jnp.bfloat16)
     # The gathered rope buffer carries two top-k entries per row (csa_gather).
     bkv_sz = cache_kv_rope_hbm_ref.shape[1] * 2
@@ -414,34 +472,66 @@ def _attention_kernel(
         q = bq_x2_ref.at[bq_sem_idx, batch_idx][...]
         return q
 
-    def load_bkv(bkv_sem_idx, batch_idx, masked):
+    def load_bkv(bkv_sem_idx, batch_idx):
         # The gathered NoPE rows as the int32 words csa_gather wrote.
-        words = bkv_nope_x2_ref.bitcast(jnp.int32).at[bkv_sem_idx, batch_idx][...]
-        bkv_nope = _dequant_dsv4_fp8(words)
+        words = bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx][...]
+        bkv_nope = _dequant_dsv4_fp8_sub_rows(words)
 
         # The gathered rope block is [bkv_sz // 2, 2 * rope_dim]: entry i in
         # lanes 0:rope_dim, entry i + bkv_sz // 2 in the upper half (see
-        # csa_gather). Mosaic has no [m, 2n] -> [2m, n] shape cast, but the
-        # lane slice + row concatenate below is one lane rotate per vreg.
+        # csa_gather). The rope dims belong in lanes NOPE_DIM % 128: of the
+        # last nope sub-row, where the upper half already is, so only the
+        # first half's rows take a lane rotate before the select.
         bkv_rope = bkv_rope_x2_ref.at[bkv_sem_idx, batch_idx][...]
-        bkv_rope = bkv_rope.reshape(bkv_sz // 2, -1)
         rope_dim = bkv_rope.shape[-1] // 2
+        assert rope_dim == NOPE_DIM % 128
         bkv_rope = jnp.concatenate(
-            [bkv_rope[:, :rope_dim], bkv_rope[:, rope_dim:]], axis=0
+            [pltpu.roll(bkv_rope, rope_dim, 1), bkv_rope], axis=0
         )
-        bkv = jnp.concatenate([bkv_nope, bkv_rope], axis=-1)
+        lane = lax.broadcasted_iota(jnp.int32, bkv_rope.shape, 1)
+        bkv_rope = jnp.where(lane < rope_dim, bkv_nope[-1], bkv_rope)
+        # Rows past kv_len were zeroed in VMEM (zero_rows_past_kv_len).
+        return jnp.concatenate([*bkv_nope[:-1], bkv_rope], axis=-1)
 
-        # In vLLM, multiple caches may overlay on the same KV Tensor. For example,
-        # compressor state cache write data in bfloat16 / float32 format, certain
-        # byte pattern are interpreted as NaN in FP8, e.g. float8_e8m0fnu byte 0xFF
-        # decodes to NaN.
-        # We need to mask out the data by the actual kv_len to avoid NaN propagting
-        # to the downstream computation.
-        if masked:
-            kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
-            k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
-            bkv = jnp.where(k_span < kv_len, bkv, 0)
-        return bkv
+    def zero_rows_past_kv_len(bkv_sem_idx):
+        """Zeroes the gathered rows at or past each short entry's kv_len, in VMEM.
+
+        In vLLM, multiple caches may overlay on the same KV Tensor. For example,
+        compressor state cache write data in bfloat16 / float32 format, certain
+        byte pattern are interpreted as NaN in FP8, e.g. float8_e8m0fnu byte 0xFF
+        decodes to NaN, which would reach the output through P @ V. Zero words
+        dequantize to zeros, so this replaces the [bkv_sz, head_dim] select
+        load_bkv would otherwise pay for every entry of a masked batch, and only
+        entries with fewer than bkv_sz valid rows pay it (a decode batch is
+        usually masked only because of its padding rows).
+        """
+
+        def zero_entry(b, carry):
+            kv_len = kv_lens_ref[batch_start_seq_idx + b]
+
+            @pl.when(kv_len < bkv_sz)
+            def _():
+                nope_ref = bkv_nope_x2_ref.at[bkv_sem_idx, b]
+                row = lax.broadcasted_iota(jnp.int32, nope_ref.shape, 0)
+                nope_ref[...] = jnp.where(row < kv_len, nope_ref[...], 0)
+                # Rope word (t, l) holds entries e and e + 1 in its low and
+                # high halves, e = 2 t + bkv_sz // 2 * (l >= rope lanes / 2).
+                rope_ref = bkv_rope_x2_ref.at[bkv_sem_idx, b]
+                words = pltpu.bitcast(rope_ref[...], jnp.int32)
+                lane = lax.broadcasted_iota(jnp.int32, words.shape, 1)
+                entry = 2 * lax.broadcasted_iota(jnp.int32, words.shape, 0) + jnp.where(
+                    lane < words.shape[1] // 2, 0, bkv_sz // 2
+                )
+                words = jnp.where(
+                    entry + 1 < kv_len,
+                    words,
+                    jnp.where(entry < kv_len, words & 0xFFFF, 0),
+                )
+                rope_ref[...] = pltpu.bitcast(words, rope_ref.dtype)
+
+            return carry
+
+        lax.fori_loop(0, batch_size, zero_entry, 0)
 
     def load_swa_output(bq_sem_idx, batch_idx):
         swa_acc = swa_acc_x2_ref[bq_sem_idx, batch_idx, ...]
@@ -477,27 +567,21 @@ def _attention_kernel(
         prev_exp_m_diff = None
         prev_l = None
         prev_swa_acc = None
-        prev_out = None
 
         # Wait for cur blocks if not ready yet
         wait_fetch_bq_batch(batch_start_seq_idx, bi_sem_idx)
         wait_fetch_swa_batch(batch_start_seq_idx, bi_sem_idx)
         wait_fetch_bkv_batch(batch_start_seq_idx, bi_sem_idx)
+        if masked:
+            zero_rows_past_kv_len(bi_sem_idx)
 
         @pl.when(pl.program_id(0) >= 2)
         def _wait_send():
             wait_send_bo_batch(bo_sem_idx)
 
         for batch_idx in range(batch_size):
-            bkv = load_bkv(bi_sem_idx, batch_idx, masked)
+            bkv = load_bkv(bi_sem_idx, batch_idx)
             bq = load_bq(bi_sem_idx, batch_idx)
-
-            if prev_out is not None:
-                # Artificial dependency to force MXU/VPU interleaving by limiting
-                # LLO's QK runahead
-                # We use jnp.where to prevent XLA from optimizing the dependency away.
-                # prev_out won't be inf in practice.
-                bq = jnp.where(prev_out == jnp.inf, prev_out, bq)
 
             swa_acc, swa_l, swa_m = load_swa_output(bi_sem_idx, batch_idx)
 
@@ -525,7 +609,6 @@ def _attention_kernel(
 
                 # Store output from acc to bo.
                 bo_x2_ref.at[bo_sem_idx, batch_idx - 1][...] = out
-                prev_out = out
 
             prev_p = p
             prev_bkv = bkv
@@ -548,9 +631,9 @@ def _attention_kernel(
         start_fetch_swa_batch(batch_start_seq_idx, 0)
         start_fetch_bkv_batch(batch_start_seq_idx, 0)
 
-    # Every row past a token's kv_len is masked out of both the keys and the
-    # scores. Long contexts fill all bkv_sz top-k slots, so a batch whose tokens
-    # all do skips both masks, which are identities there (~15% of the bundles).
+    # Every row past a token's kv_len is zeroed out of the keys and masked out
+    # of the scores. Long contexts fill all bkv_sz top-k slots, so a batch whose
+    # tokens all do skips both, which are identities there.
     all_full = kv_lens_ref[batch_start_seq_idx] >= bkv_sz
     for batch_idx in range(1, batch_size):
         all_full = jnp.logical_and(
@@ -652,6 +735,7 @@ def prepare_outputs(
         "attention_kernel_batch_size",
         "gather_and_attention_chunk_size",
         "vmem_limit_bytes",
+        "gather_no_pad",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -672,6 +756,9 @@ def sparse_ragged_paged_attention(
     gather_and_attention_chunk_size: int = 128,
     attention_kernel_batch_size: int = 16,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    # See `csa_gather.csa_gather`'s `no_pad`.
+    gather_no_pad: bool = False,
+    num_valid_tokens: jax.Array | None = None,
 ) -> jax.Array:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -690,6 +777,8 @@ def sparse_ragged_paged_attention(
         k is also the total number of sequences.
       sm_scale: the softmax scale which will be applied to the Q@K^T.
       vmem_limit_bytes: the vmem limit for the pallas kernel.
+      num_valid_tokens: attend only query rows `[0, num_valid_tokens)`; later
+        rows return `q` unchanged. Defaults to every scheduled token.
 
     Returns:
       The output of attention.
@@ -748,12 +837,12 @@ def sparse_ragged_paged_attention(
 
         out_specs = pl.BlockSpec(memory_space=pltpu.HBM)  # o
 
-        # One batch entry's worth of gathered top-k rows, per cache, in the
-        # uint8 / bf16 views the kernel bitcasts the int32 words to.
+        # One batch entry's worth of gathered top-k rows, per cache: nope as
+        # its int32 words, rope in the bf16 view the kernel bitcasts it to.
         _, topk_rows, lanes = cache_kv_nope.shape
         bkv_nope_double_buf = pltpu.VMEM(
-            (2, batch_size, topk_rows * 4, lanes),
-            jnp.uint8,
+            (2, batch_size, topk_rows, lanes),
+            jnp.int32,
         )
         _, rope_rows, lanes = cache_kv_rope.shape
         bkv_rope_double_buf = pltpu.VMEM(
@@ -843,6 +932,21 @@ def sparse_ragged_paged_attention(
             swa_m,
         )
 
+    # Rows past an explicit bound are never gathered, so skip their page ids --
+    # but the attention batches below round the bound up (to a multiple of the
+    # kernel batch, within its gather chunk) and gather those rows too, so the
+    # page ids must cover whole chunks. A bound at the batch/8-row granularity
+    # left page ids unwritten for gathered rows: wild gather addresses.
+    page_ids_bound = num_valid_tokens
+    if page_ids_bound is not None:
+        page_ids_bound = jnp.minimum(
+            q.shape[0],
+            (page_ids_bound + gather_and_attention_chunk_size - 1)
+            // gather_and_attention_chunk_size
+            * gather_and_attention_chunk_size,
+        )
+    if num_valid_tokens is None:
+        num_valid_tokens = cu_q_lens[distribution[2]]
     tokens_per_seq = cu_q_lens[1:] - cu_q_lens[:-1]
     seq_ids_segment = jnp.repeat(
         jnp.arange(max_num_seqs), tokens_per_seq, total_repeat_length=q.shape[0]
@@ -854,7 +958,11 @@ def sparse_ragged_paged_attention(
     token_offset = topk_indices % page_size
     topk = topk_indices.shape[-1]
     page_ids = gather_page_ids(
-        page_indices, seq_page_ids, seq_ids_segment, max_num_seqs
+        page_indices,
+        seq_page_ids,
+        seq_ids_segment,
+        max_num_seqs,
+        num_valid_tokens=page_ids_bound,
     )
 
     # For the "-1" padding elements in topk_indices, we scatter the corresponding
@@ -895,7 +1003,7 @@ def sparse_ragged_paged_attention(
                 jnp.maximum(
                     0,
                     jnp.minimum(
-                        cu_q_lens[distribution[2]],
+                        num_valid_tokens,
                         end_pos,
                     )
                     - start_pos,
@@ -921,6 +1029,7 @@ def sparse_ragged_paged_attention(
             indices,
             num_valid_indices=num_valid_indices,
             top_k=topk,
+            no_pad=gather_no_pad,
         )
         gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, topk, -1)
         gathered_rope_buffer = gathered_rope_buffer.reshape(chunk_size, topk // 4, -1)
@@ -936,7 +1045,7 @@ def sparse_ragged_paged_attention(
             swa_m,
             start_seq_idx=start_pos,
             end_seq_idx=batch_end,
-            num_valid_tokens=cu_q_lens[distribution[2]],
+            num_valid_tokens=num_valid_tokens,
             kernel_batch_size=kernel_batch_size,
         )
     return prepare_outputs(

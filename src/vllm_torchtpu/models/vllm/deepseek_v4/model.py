@@ -26,8 +26,10 @@ from vllm.config import VllmConfig
 from vllm.distributed import (
     get_dp_group,
     get_pp_group,
+    get_tp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -54,15 +56,23 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor 
     VllmDeepseekCompressor,  # noqa: E501
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_mhc_op import (  # noqa: E501
+    KernelOpts,
     MHCOps,
     get_mhc_ops,
+    get_mhc_post_head_op,
     get_mhc_post_op,
+    get_mhc_split_fn_op,
+    get_mhc_stack_fn_op,
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.deepseek_v4.attention import VllmDeepseekV4MLAAttention
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import mhc_collapse_head
-from vllm_torchtpu.models.vllm.deepseek_v4.moe import DeepseekV4MoE
-from vllm_torchtpu.utils import host_rss_gib, release_memory_to_os
+from vllm_torchtpu.layers.adapter.fused_moe_ep import MOE_DEFER_GATE, SP_GATE
+from vllm_torchtpu.models.vllm.deepseek_v4.moe import (
+    DeepseekV4MoE,
+    dsv4_sequence_parallel,
+)
+from vllm_torchtpu.utils import fresh_buffer, host_rss_gib, release_memory_to_os
 
 logger = init_logger(__name__)
 
@@ -76,6 +86,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list | None = None,
+        seq_parallel: bool | None = None,
     ):
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -97,10 +108,35 @@ class DeepseekV4DecoderLayer(nn.Module):
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=aux_stream_list,
         )
-        self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
+        # Sequence parallel: the layer's residual stream holds this rank's
+        # 1/tp of the tokens; attention gathers its input and scatters its
+        # (TP-partial) output, so wo_b must not all-reduce. The DSpark draft
+        # layers (blocks of K + 1 rows) pass False.
+        self.seq_parallel = (
+            dsv4_sequence_parallel() if seq_parallel is None else seq_parallel
+        )
+        self.ffn = DeepseekV4MoE(
+            vllm_config, prefix=f"{prefix}.ffn", seq_parallel=self.seq_parallel
+        )
+        if self.seq_parallel:
+            if envs.TPU_DSV4_ATTN_INTRA_CHIP_TP:
+                raise ValueError(
+                    "TPU_DSV4_SEQ_PARALLEL and TPU_DSV4_ATTN_INTRA_CHIP_TP are "
+                    "exclusive"
+                )
+            self.attn.wo_b.reduce_results = False
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
+        # The mHC kernels then emit attn_norm/ffn_norm-normalized inputs.
+        self.fuse_norm = envs.VLLM_TPU_DSV4_MHC_FUSE_NORM
+        self.mhc_opts = KernelOpts(
+            gates_in_kernel=envs.VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL,
+            fuse_norm=self.fuse_norm,
+            stacked_fn=envs.VLLM_TPU_DSV4_MHC_STACKED_FN,
+            token_block=envs.VLLM_TPU_DSV4_MHC_TOKEN_BLOCK,
+            gates_max_tokens=envs.VLLM_TPU_DSV4_MHC_GATES_MAX_TOKENS,
+        )
         self.hc_mult = config.hc_mult
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
@@ -147,14 +183,233 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_eps,
                 self.hc_post_alpha,
                 self.hc_sinkhorn_iters,
+                opts=self.mhc_opts,
             )
             object.__setattr__(self, "_mhc_ops_instance", ops)
+            # VLLM_TPU_DSV4_MHC_SEAM_FN_HBM: per seam site, a variant of the
+            # fused op that streams fn from HBM (see envs).
+            fh = envs.VLLM_TPU_DSV4_MHC_SEAM_FN_HBM
+            fh_ops = None
+            if fh in ("attn", "ffn", "both"):
+                fh_ops = get_mhc_ops(
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_eps,
+                    self.hc_post_alpha,
+                    self.hc_sinkhorn_iters,
+                    opts=self.mhc_opts._replace(fn_hbm=True),
+                )
+            seam_ops = {
+                name: fh_ops.fused if fh_ops is not None and fh in (site, "both") else ops.fused
+                for name, site in (("hc_attn_fn", "attn"), ("hc_ffn_fn", "ffn"))
+            }
+            object.__setattr__(self, "_seam_ops", seam_ops)
+            self._arm_ar_seam()
+            self._arm_moe_ar_seam()
+            if self.seq_parallel:
+                # Built outside the trace alongside the mHC ops.
+                from vllm_torchtpu.models.vllm.deepseek_v4.seq_parallel import (
+                    build_sp_ops,
+                )
+
+                object.__setattr__(self, "_sp_ops", build_sp_ops())
+                shared = getattr(self.ffn, "shared_experts", None)
+                if (
+                    (
+                        envs.TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS > 0
+                        or envs.TPU_DSV4_SP_SHARED_TP
+                    )
+                    and shared is not None
+                    and not shared.arm_tp_slice(
+                        get_tensor_model_parallel_rank(),
+                        get_tensor_model_parallel_world_size(),
+                    )
+                ):
+                    raise RuntimeError(
+                        "TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS / TPU_DSV4_SP_SHARED_TP: "
+                        "the shared expert's "
+                        "weight layout cannot be TP-sliced; unset it"
+                    )
         return ops
+
+    def _seam(self, fn_name: str):
+        """The fused seam op for the seam that gates ``fn_name``'s sublayer."""
+        ops = self.mhc_ops
+        return self.__dict__.get("_seam_ops", {}).get(fn_name, ops.fused)
+
+    def _arm_moe_ar_seam(self) -> None:
+        """TPU_DSV4_MHC_MOE_AR_SEAM: build the op that sums the previous
+        layer's fused-EP partial (its in-op shared all-reduce, deferred) and
+        runs this layer's attention seam on the sum, in one Pallas call with
+        hc_attn_fn DMA'd under the all-reduce. The model asks the previous
+        layer's MoE for its partial only when this op exists."""
+        object.__setattr__(self, "_moe_ar_seam_op", None)
+        mode = envs.TPU_DSV4_MHC_MOE_AR_SEAM
+        opts = self.mhc_opts
+        if not (
+            mode in (1, 2)
+            and opts.gates_in_kernel
+            and opts.fuse_norm
+            and opts.stacked_fn
+            and get_tp_group().world_size > 1
+        ):
+            return
+        from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4 import (
+            deepseek_v4_mhc_ar_seam_op as ar_seam,
+        )
+
+        op = ar_seam.get_ar_seam_op(
+            self._ar_seam_consts(),
+            self._ar_seam_kernel_kw(),
+            moe_fn_mode="pin" if mode == 1 else "vmem",
+        )
+        if op is None or tuple(ar_seam.tp_ranks()) != tuple(
+            get_tp_group().ranks
+        ):
+            return
+        object.__setattr__(self, "_moe_ar_seam_op", op)
+
+    def _ar_seam_consts(self) -> tuple:
+        return (
+            self.rms_norm_eps,
+            self.hc_eps,
+            self.hc_eps,
+            self.hc_post_alpha,
+            self.hc_sinkhorn_iters,
+        )
+
+    def _ar_seam_kernel_kw(self) -> dict:
+        opts = self.mhc_opts
+        kernel_kw = dict(
+            gates_in_kernel=True,
+            small_block=envs.VLLM_TPU_DSV4_MHC_SMALL_BLOCK,
+            fn_chunks=envs.VLLM_TPU_DSV4_MHC_FN_CHUNKS,
+        )
+        if opts.gates_max_tokens >= 0:
+            kernel_kw["gates_max_tokens"] = opts.gates_max_tokens
+        if opts.token_block:
+            kernel_kw["token_block_size"] = opts.token_block
+        return kernel_kw
+
+    def _arm_ar_seam(self) -> None:
+        """TPU_DSV4_MHC_AR_SEAM: build the fused attention-AR + ffn-seam op
+        (outside the trace, with the mHC ops) and hand wo_b's all-reduce to
+        it. Only the served mHC form (in-kernel gates, fused norm, stacked
+        fn) on a TP group the small all-reduce kernel serves."""
+        object.__setattr__(self, "_ar_seam_op", None)
+        opts = self.mhc_opts
+        wo_b = self.attn.wo_b
+        if not (
+            envs.TPU_DSV4_MHC_AR_SEAM
+            and opts.gates_in_kernel
+            and opts.fuse_norm
+            and opts.stacked_fn
+            and not envs.TPU_DSV4_ATTN_INTRA_CHIP_TP
+            and getattr(wo_b, "tp_size", 1) > 1
+        ):
+            return
+        from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4 import (
+            deepseek_v4_mhc_ar_seam_op as ar_seam,
+        )
+
+        kernel_kw = dict(
+            gates_in_kernel=True,
+            small_block=envs.VLLM_TPU_DSV4_MHC_SMALL_BLOCK,
+            fn_chunks=envs.VLLM_TPU_DSV4_MHC_FN_CHUNKS,
+        )
+        if opts.gates_max_tokens >= 0:
+            kernel_kw["gates_max_tokens"] = opts.gates_max_tokens
+        if opts.token_block:
+            kernel_kw["token_block_size"] = opts.token_block
+        consts = (
+            self.rms_norm_eps,
+            self.hc_eps,
+            self.hc_eps,
+            self.hc_post_alpha,
+            self.hc_sinkhorn_iters,
+        )
+        op = ar_seam.get_ar_seam_op(consts, kernel_kw)
+        if op is None or tuple(ar_seam.tp_ranks()) != tuple(
+            get_tp_group().ranks
+        ):
+            return
+        object.__setattr__(self, "_ar_seam_op", op)
+        # The fused op sums wo_b's partial; the replicated path below sums it
+        # itself whenever the op is not taken.
+        wo_b.reduce_results = False
+
+    def _attn_seam(self, positions, x, residual, post_mix, res_mix):
+        """Attention, its TP all-reduce and the ffn seam, as
+        ``mhc_ops.fused(all_reduce(attn(x)), ...)``; one op when armed."""
+        op = self.__dict__.get("_ar_seam_op")
+        fn = (*self._fn3("hc_ffn_fn"), self.hc_ffn_scale, self.hc_ffn_base)
+        norm = self._norm_arg(self.ffn_norm)
+        x_p = self.attn(positions, x)
+        if torch.compiler.is_compiling():
+            from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4 import (
+                deepseek_v4_mhc_ar_seam_op as ar_seam,
+            )
+
+            rank, peers = ar_seam.rank_peers()
+            return op(x_p, residual, post_mix, res_mix, *fn, *norm, rank, peers)
+        x = tensor_model_parallel_all_reduce(x_p)
+        return self.mhc_ops.fused(x, residual, post_mix, res_mix, *fn, *norm)
+
+    def split_hc_fns(self) -> None:
+        """Split hc_attn_fn / hc_ffn_fn into the bf16 chunks the mHC ops take.
+
+        The split depends only on the weight; doing it here, once after the
+        weights land, keeps it out of every forward. Each buffer goes through
+        `fresh_buffer`: a view or an aliased clone would otherwise be
+        re-materialized as a `tt_jit_as_strided` program before every forward
+        (~62 per decode step measured, j-decf9ff4 vs mHC off j-4eccc700).
+        """
+        if self.mhc_opts.stacked_fn:
+            stack = get_mhc_stack_fn_op()
+            for name in ("hc_attn_fn", "hc_ffn_fn"):
+                self.register_buffer(
+                    f"{name}_cat",
+                    fresh_buffer(stack(getattr(self, name))),
+                    persistent=False,
+                )
+        else:
+            split = get_mhc_split_fn_op()
+            for name in ("hc_attn_fn", "hc_ffn_fn"):
+                for suffix, chunk in zip(
+                    ("hi", "mid", "lo"), split(getattr(self, name))
+                ):
+                    self.register_buffer(
+                        f"{name}_{suffix}", fresh_buffer(chunk), persistent=False
+                    )
+        if self.fuse_norm:
+            # The kernels read the norm weight as (1, H); reshaping (H,) in
+            # the forward is a relayout copy per seam (~1.4 us at decode).
+            for norm_name in ("attn_norm", "ffn_norm"):
+                w = getattr(self, norm_name).weight
+                self.register_buffer(
+                    f"{norm_name}_w2d",
+                    fresh_buffer(w.detach().reshape(1, -1)),
+                    persistent=False,
+                )
+
+    def _fn3(self, name: str) -> tuple[torch.Tensor, ...]:
+        if self.mhc_opts.stacked_fn:
+            return (getattr(self, f"{name}_cat"),)
+        return tuple(getattr(self, f"{name}_{s}") for s in ("hi", "mid", "lo"))
+
+    def _norm_arg(self, norm: RMSNorm) -> tuple[torch.Tensor, ...]:
+        if not self.fuse_norm:
+            return ()
+        name = "attn_norm" if norm is self.attn_norm else "ffn_norm"
+        return (getattr(self, f"{name}_w2d"),)
+
+    def _norm(self, norm: RMSNorm, x: torch.Tensor) -> torch.Tensor:
+        return x if self.fuse_norm else norm(x)
 
     def hc_pre(
         self,
         x: torch.Tensor,
-        hc_fn: torch.Tensor,
+        hc_fn3: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -163,7 +418,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         The gate constants are baked into the op, so only the tensors are
         passed; this just puts `layer_input` first for the caller.
         """
-        post_mix, res_mix, layer_input = self.mhc_ops.pre(x, hc_fn, hc_scale, hc_base)
+        post_mix, res_mix, layer_input = self.mhc_ops.pre(
+            x, *hc_fn3, hc_scale, hc_base, *self._norm_arg(self.attn_norm)
+        )
         return layer_input, post_mix, res_mix
 
     def forward(
@@ -174,8 +431,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         post_mix: torch.Tensor | None = None,
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
+        x_partial: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Defer each post into the next pre so the pair is one kernel.
+
+        x_partial (TPU_DSV4_MHC_MOE_AR_SEAM): `x` is the previous MoE's
+        partial over the TP group (see the model loop); this layer's seam op
+        sums it.
 
         `x` arrives as the previous sublayer's raw output and the caller
         carries `(residual, post_mix, res_mix)` -- the recombine that output
@@ -186,32 +448,76 @@ class DeepseekV4DecoderLayer(nn.Module):
             # Chain start: a standalone pre, nothing to fuse it with.
             residual = x
             x, post_mix, res_mix = self.hc_pre(
-                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+                x, self._fn3("hc_attn_fn"), self.hc_attn_scale, self.hc_attn_base
             )
-        else:
-            residual, post_mix, res_mix, x = self.mhc_ops.fused(
+        elif x_partial:
+            from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4 import (
+                deepseek_v4_mhc_ar_seam_op as ar_seam,
+            )
+
+            rank, peers = ar_seam.rank_peers()
+            residual, post_mix, res_mix, x = self.__dict__["_moe_ar_seam_op"](
                 x,
                 residual,
                 post_mix,
                 res_mix,
-                self.hc_attn_fn,
+                *self._fn3("hc_attn_fn"),
                 self.hc_attn_scale,
                 self.hc_attn_base,
+                *self._norm_arg(self.attn_norm),
+                rank,
+                peers,
+            )
+        else:
+            residual, post_mix, res_mix, x = self._seam("hc_attn_fn")(
+                x,
+                residual,
+                post_mix,
+                res_mix,
+                *self._fn3("hc_attn_fn"),
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                *self._norm_arg(self.attn_norm),
             )
 
-        x = self.attn_norm(x)
-        x = self.attn(positions, x)
+        x = self._norm(self.attn_norm, x)
+        if self.__dict__.get("_ar_seam_op") is not None and (
+            not self.seq_parallel or SP_GATE["replicated"]
+        ):
+            residual, post_mix, res_mix, x = self._attn_seam(
+                positions, x, residual, post_mix, res_mix
+            )
+            x = self._norm(self.ffn_norm, x)
+            x = self.ffn(x, input_ids)
+            return x, residual, post_mix, res_mix
+        if self.seq_parallel and SP_GATE["replicated"]:
+            # A bucket TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS keeps replicated: the
+            # whole batch on every TP rank, wo_b's partial summed here.
+            x = tensor_model_parallel_all_reduce(self.attn(positions, x))
+        elif self.seq_parallel:
+            # The views pin the row counts to the trace's own symbols (the
+            # token count T of `positions`, and the local count of the
+            # residual): the collectives' fakes return (T // tp) * tp and
+            # T // tp, and TorchTPU refuses an allocation sized by an
+            # expression it cannot resolve to an input dimension.
+            sp_ops = self.__dict__["_sp_ops"]
+            n_local = x.shape[0]
+            x = self.attn(positions, sp_ops["ag"](x).view(positions.shape[0], -1))
+            x = sp_ops["rs"](x).view(n_local, -1)
+        else:
+            x = self.attn(positions, x)
 
-        residual, post_mix, res_mix, x = self.mhc_ops.fused(
+        residual, post_mix, res_mix, x = self._seam("hc_ffn_fn")(
             x,
             residual,
             post_mix,
             res_mix,
-            self.hc_ffn_fn,
+            *self._fn3("hc_ffn_fn"),
             self.hc_ffn_scale,
             self.hc_ffn_base,
+            *self._norm_arg(self.ffn_norm),
         )
-        x = self.ffn_norm(x)
+        x = self._norm(self.ffn_norm, x)
         x = self.ffn(x, input_ids)
         return x, residual, post_mix, res_mix
 
@@ -369,6 +675,23 @@ class DeepseekV4Model(nn.Module):
         # ``DeepseekV4ForCausalLM.set_aux_hidden_state_layers`` before warmup.
         self.aux_hidden_state_layers: tuple[int, ...] = ()
 
+        # TPU_DSV4_SEQ_PARALLEL: the layers run on this rank's 1/tp of the
+        # tokens (contiguous block `tp_rank`); the outputs are gathered back.
+        self.seq_parallel = dsv4_sequence_parallel()
+        if self.seq_parallel and get_pp_group().world_size > 1:
+            raise ValueError("TPU_DSV4_SEQ_PARALLEL does not support PP")
+
+    def _sp_local_rows(self, tensors, rank):
+        """This rank's contiguous 1/tp block of each tensor's rows. The rank is
+        device data, so every TP rank traces the same graph."""
+        tp = get_tp_group().world_size
+        return [
+            None
+            if t is None
+            else t.reshape(tp, -1, *t.shape[1:]).index_select(0, rank)[0]
+            for t in tensors
+        ]
+
     @property
     def mhc_post_op(self):
         """The op that settles the post the last decoder layer deferred.
@@ -381,6 +704,12 @@ class DeepseekV4Model(nn.Module):
         if op is None:
             op = get_mhc_post_op()
             object.__setattr__(self, "_mhc_post_op_instance", op)
+            if getattr(self, "seq_parallel", False):
+                from vllm_torchtpu.models.vllm.deepseek_v4.seq_parallel import (
+                    build_sp_ops,
+                )
+
+                object.__setattr__(self, "_sp_ops", build_sp_ops())
         return op
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -442,11 +771,27 @@ class DeepseekV4Model(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        # TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS: a shape branch (T <= cap stays
+        # replicated), so each side of it is its own trace (shape_variants);
+        # the layers and the fused EP read the switch while being traced.
+        seq_parallel = self.seq_parallel and not (
+            envs.TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS > 0
+            and positions.shape[0] <= envs.TPU_DSV4_SEQ_PARALLEL_MIN_TOKENS
+        )
+        if self.seq_parallel:
+            SP_GATE["replicated"] = not seq_parallel
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
+            if seq_parallel:
+                from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import (  # noqa: E501
+                    tp_rank_as_data,
+                )
+
+                sp_rank = tp_rank_as_data(get_tp_group(), hidden_states.device)
+                (hidden_states,) = self._sp_local_rows([hidden_states], sp_rank)
             hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
         else:
             assert intermediate_tensors is not None
@@ -459,14 +804,46 @@ class DeepseekV4Model(nn.Module):
         moe_input_ids = input_ids
         if input_ids is not None and self.start_layer < self.config.num_hash_layers:
             moe_input_ids = self._dp_gather_hash_moe_input_ids(input_ids)
+            if seq_parallel:
+                (moe_input_ids,) = self._sp_local_rows([moe_input_ids], sp_rank)
 
         residual, post_mix, res_mix = None, None, None
+        # The fused tail needs the head here and at least one layer to defer
+        # a post into it.
+        fuse_tail = (
+            envs.VLLM_TPU_DSV4_MHC_POST_HEAD
+            and get_pp_group().is_last_rank
+            and self.end_layer > self.start_layer
+        )
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None
+        # TPU_DSV4_MHC_MOE_AR_SEAM: a layer's MoE hands its pre-all-reduce
+        # partial to the next layer's attention seam, which sums it. Only on
+        # the replicated layout, never into a chain end (the last layer, an
+        # aux hidden state), and only where the next layer armed the op.
+        # A shape branch (T <= cap, the small all-reduce's power-of-2 row cap):
+        # above it every trace keeps the stock MoE all-reduce and seam ops.
+        moe_seam = bool(envs.TPU_DSV4_MHC_MOE_AR_SEAM) and not seq_parallel
+        if moe_seam:
+            from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4 import (
+                deepseek_v4_mhc_ar_seam_op as ar_seam,
+            )
+
+            moe_seam = positions.shape[0] <= ar_seam.moe_cap()
+        x_partial = False
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
+            nxt = idx + 1
+            defer = (
+                moe_seam
+                and nxt < self.end_layer
+                and nxt not in self.aux_hidden_state_layers
+                and self.layers[nxt].__dict__.get("_moe_ar_seam_op") is not None
+            )
+            MOE_DEFER_GATE["want"] = defer
+            MOE_DEFER_GATE["done"] = False
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
                 positions,
@@ -474,14 +851,44 @@ class DeepseekV4Model(nn.Module):
                 post_mix,
                 res_mix,
                 residual,
+                x_partial=x_partial,
             )
+            x_partial = defer and MOE_DEFER_GATE["done"]
+            MOE_DEFER_GATE["want"] = False
+            MOE_DEFER_GATE["done"] = False
             if idx + 1 in self.aux_hidden_state_layers:
+                if fuse_tail and idx + 1 == self.end_layer:
+                    continue  # the fused tail below emits this aux mean
+                if fuse_tail:
+                    (aux_mean,) = self._post_head_op(False, True)(
+                        hidden_states, residual, post_mix, res_mix,
+                        self.hc_head_fn, self.hc_head_scale, self.hc_head_base,
+                    )
+                    aux_hidden_states.append(aux_mean)
+                    continue
                 # Reconstruct the full hc-stream state and collapse it the
                 # way the drafts were trained on: settle the deferred post,
                 # then mean over the hc streams (upstream numerics).
                 aux_recon = self.mhc_post_op(hidden_states, residual, post_mix, res_mix)
                 aux_hidden_states.append(aux_recon.mean(dim=1))
                 final_aux_recon = aux_recon
+
+        if fuse_tail:
+            # One kernel: last post + hc head (+ the final aux mean).
+            want_mean = self.end_layer in self.aux_hidden_state_layers
+            outs = self._post_head_op(True, want_mean)(
+                hidden_states, residual, post_mix, res_mix,
+                self.hc_head_fn, self.hc_head_scale, self.hc_head_base,
+            )
+            if want_mean:
+                aux_hidden_states.append(outs[1])
+            hidden_states = self.norm(outs[0])
+            hidden_states, aux_hidden_states = self._sp_gather(
+                hidden_states, aux_hidden_states, positions.shape[0], seq_parallel
+            )
+            if aux_hidden_states:
+                return hidden_states, aux_hidden_states
+            return hidden_states
 
         if post_mix is not None:
             if (
@@ -507,9 +914,44 @@ class DeepseekV4Model(nn.Module):
             self.hc_eps,
         )
         hidden_states = self.norm(hidden_states)
+        hidden_states, aux_hidden_states = self._sp_gather(
+            hidden_states, aux_hidden_states, positions.shape[0], seq_parallel
+        )
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
+
+    def _sp_gather(self, hidden_states, aux_hidden_states, rows, seq_parallel):
+        """Undo the sequence-parallel split on the backbone's outputs. `rows`
+        is the step's token count (an input dimension of the trace)."""
+        if not seq_parallel:
+            return hidden_states, aux_hidden_states
+        ag = self.__dict__["_sp_ops"]["ag"]
+
+        def gather(t):
+            return ag(t).view(rows, *t.shape[1:])
+
+        return gather(hidden_states), [gather(a) for a in aux_hidden_states]
+
+    def _post_head_op(self, want_head: bool, want_mean: bool):
+        """The fused post + head / aux-mean op; built in the runner's op
+        prebuild (``post_head_ops``) before compile."""
+        ops = self.__dict__.setdefault("_post_head_ops", {})
+        key = (want_head, want_mean)
+        if key not in ops:
+            ops[key] = get_mhc_post_head_op(
+                self.rms_norm_eps, self.hc_eps, want_head=want_head,
+                want_mean=want_mean,
+            )
+        return ops[key]
+
+    @property
+    def post_head_ops(self):
+        """Prebuild every fused-tail variant outside the trace."""
+        if envs.VLLM_TPU_DSV4_MHC_POST_HEAD:
+            for key in ((True, False), (True, True), (False, True)):
+                self._post_head_op(*key)
+        return self.__dict__.get("_post_head_ops")
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load checkpoint tensors into stacked, expert, sink and plain params."""
@@ -623,6 +1065,9 @@ class DeepseekV4Model(nn.Module):
                         continue
         finally:
             staged.flush_all()
+        for layer in self.layers:
+            if isinstance(layer, DeepseekV4DecoderLayer):
+                layer.split_hc_fns()
 
         return loaded_params
 

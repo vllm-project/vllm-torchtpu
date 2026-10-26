@@ -328,7 +328,7 @@ class CorrectnessTest(parameterized.TestCase):
         swa_l = gen_random(rng, (total_tokens, num_heads), dtype=jnp.float32)
         swa_m = gen_random(rng, (total_tokens, num_heads), dtype=jnp.float32)
 
-        def run(distribution):
+        def run(distribution, **kw):
             return mla.mla_ragged_paged_attention(
                 q,
                 kernel_cache,
@@ -345,11 +345,15 @@ class CorrectnessTest(parameterized.TestCase):
                 num_kv_pages_per_block=2,
                 num_queries_per_block=(1, 16, 16),
                 chunk_prefill_size=verify_q_len,
+                **kw,
             )
 
         mixed = run([4, 4, batch_size])
         static = run([4, 8, batch_size])
         np.testing.assert_array_equal(np.asarray(mixed), np.asarray(static))
+        # Next KV block's DMAs issued before the current block's compute.
+        early = run([4, 8, batch_size], prefetch_early=True)
+        np.testing.assert_array_equal(np.asarray(early), np.asarray(static))
         ref = ref_implementation(
             q,
             cache_kv_base,

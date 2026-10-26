@@ -18,6 +18,11 @@ from typing import cast
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -25,6 +30,11 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
 from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
 
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    quantized_matmul,
+)
+from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import mhc_collapse_head
 from vllm_torchtpu.models.vllm.deepseek_v4.model import (
@@ -72,6 +82,56 @@ def _rewrite_dspark_name(name: str, mapper: WeightsMapper) -> str | None:
     if mapped is None:
         return None
     return mapped.removeprefix("model.")
+
+
+def _materialize(view: torch.Tensor) -> torch.Tensor:
+    """A fresh row-major buffer holding `view` (as the FP8 linear's own load
+    step allocates its runtime weight)."""
+    return torch.empty(view.shape, dtype=view.dtype, device=view.device).copy_(view)
+
+
+class _Fp8Columns(nn.Module):
+    """Output columns of TPU FP8 linears that share an input, as one FP8
+    matmul: the concatenation of each ``(linear, start, end)`` slice of the
+    runtime weight ([n_in, n_out]) and of its per-output-column scale."""
+
+    def __init__(self, slices: list[tuple[nn.Module, int, int]]) -> None:
+        super().__init__()
+        weights, scales = [], []
+        for linear, start, end in slices:
+            if not isinstance(
+                getattr(linear, "quant_method", None), VllmFp8LinearMethodTPU
+            ) or getattr(linear, KEEP_VLLM_LAYOUT_ATTR, False):
+                raise ValueError(
+                    "TPU_DSPARK_SHARDED_CONTEXT_KV needs TPU FP8 linears in the "
+                    f"canonical [n_in, n_out] layout; got {type(linear).__name__} "
+                    f"with {type(getattr(linear, 'quant_method', None)).__name__}."
+                )
+            # Per-output-column scale: 1-D [n_out] (per-channel path) or
+            # rank-4 [1, n_in_blocks, 1, n_out] (block-quant gmm_v2 path).
+            # Either way the output columns are the last axis.
+            scale = linear.weight_scale
+            if scale.ndim not in (1, 4) or scale.shape[-1] != linear.weight.shape[1]:
+                raise ValueError(
+                    f"FP8 scale {tuple(scale.shape)} is not per output column of "
+                    f"weight {tuple(linear.weight.shape)}."
+                )
+            if scales and scales[0].shape[:-1] != scale.shape[:-1]:
+                raise ValueError(
+                    f"FP8 scales {tuple(scales[0].shape)} and {tuple(scale.shape)} "
+                    "do not concatenate along the output columns."
+                )
+            weights.append(linear.weight[:, start:end])
+            scales.append(scale[..., start:end])
+        self.register_buffer(
+            "weight", _materialize(torch.cat(weights, dim=1)), persistent=False
+        )
+        self.register_buffer(
+            "weight_scale", _materialize(torch.cat(scales, dim=-1)), persistent=False
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return quantized_matmul(x, self.weight, self.weight_scale)
 
 
 def _insert_context_kv(
@@ -169,6 +229,8 @@ class DSparkDeepseekV4Model(nn.Module):
                     current_vllm_config,
                     prefix=maybe_prefix(prefix, f"layers.{self.num_hidden_layers + i}"),
                     topk_indices_buffer=self.topk_indices_buffer,
+                    # Draft blocks are K + 1 rows per request: never split.
+                    seq_parallel=False,
                 )
                 for i in range(self.num_dspark_layers)
             ]
@@ -214,6 +276,9 @@ class DSparkDeepseekV4Model(nn.Module):
             config.dspark_markov_rank,
             prefix=maybe_prefix(prefix, "markov_head"),
         )
+        # Set by prepare_sharded_context_kv.
+        self.main_proj_local: _Fp8Columns | None = None
+        self.context_kv_proj: _Fp8Columns | None = None
 
     # Borrowed from the target: the lazily built MHC post op, the expert
     # mapping, and the per-layer loader.
@@ -228,7 +293,38 @@ class DSparkDeepseekV4Model(nn.Module):
 
     def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
         """main_x = main_norm(main_proj(concat of target aux states))."""
-        return self.main_norm(self.main_proj(aux_hidden_states))
+        if self.main_proj_local is not None:
+            main_x = tensor_model_parallel_all_gather(
+                self.main_proj_local(aux_hidden_states), dim=-1
+            )
+        else:
+            main_x = self.main_proj(aux_hidden_states)
+        return self.main_norm(main_x)
+
+    def prepare_sharded_context_kv(self) -> None:
+        """TPU_DSPARK_SHARDED_CONTEXT_KV: this rank computes 1/tp of the
+        replicated ``main_proj`` columns (all-gathered after), and one matmul
+        computes the KV columns of every draft layer's ``fused_wqa_wkv``."""
+        tp_size = get_tensor_model_parallel_world_size()
+        width = self.config.hidden_size
+        if width % tp_size:
+            raise ValueError(
+                f"TPU_DSPARK_SHARDED_CONTEXT_KV: hidden size {width} does not "
+                f"split over {tp_size} tensor-parallel ranks."
+            )
+        cols = width // tp_size
+        start = get_tensor_model_parallel_rank() * cols
+        self.main_proj_local = _Fp8Columns([(self.main_proj, start, start + cols)])
+        self.context_kv_proj = _Fp8Columns(
+            [
+                (
+                    layer.attn.fused_wqa_wkv,
+                    layer.attn.mla_attn.q_lora_rank,
+                    layer.attn.fused_wqa_wkv.weight.shape[1],
+                )
+                for layer in cast(Iterable[DeepseekV4DecoderLayer], self.layers)
+            ]
+        )
 
     def get_draft_attn_causal(self) -> list[bool]:
         # In-block attention is non-causal; consumed by the DSV4 attention
@@ -253,10 +349,19 @@ class DSparkDeepseekV4Model(nn.Module):
         mirroring upstream; the paged insert goes through the TPU attention op.
         """
         main_x = self.combine_hidden_states(target_hidden_states)
+        # TPU_DSPARK_SHARDED_CONTEXT_KV: every layer's KV columns in one matmul.
+        kv_all = (
+            None
+            if self.context_kv_proj is None
+            else self.context_kv_proj(main_x).chunk(len(self.layers), dim=-1)
+        )
         for i, layer in enumerate(cast(Iterable[DeepseekV4DecoderLayer], self.layers)):
             attn = layer.attn
-            qr_kv, _ = attn.fused_wqa_wkv(main_x)
-            kv = qr_kv[..., attn.mla_attn.q_lora_rank :]
+            if kv_all is not None:
+                kv = kv_all[i]
+            else:
+                qr_kv, _ = attn.fused_wqa_wkv(main_x)
+                kv = qr_kv[..., attn.mla_attn.q_lora_rank :]
             kv = attn.kv_norm(kv)
             _insert_context_kv(attn, kv, positions, metadata[i])
         return main_x
@@ -364,6 +469,71 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
+
+    # --- Vocabulary-parallel greedy Markov chain ----------------------------
+    # Each rank scores only its lm_head vocabulary shard: base draft logits
+    # without the all-gather, Markov bias from its rows of `markov_w2`.
+
+    def prepare_vocab_parallel_markov(self) -> None:
+        """Slice this rank's `markov_w2` rows; call once the lm_head is shared."""
+        head = self.lm_head
+        assert head is not None
+        w2 = self.model.markov_head.markov_w2
+        if head.num_embeddings_padded != head.org_vocab_size or (
+            w2.org_vocab_size != head.org_vocab_size
+        ):
+            raise ValueError(
+                "TPU_DSPARK_VOCAB_PARALLEL_MARKOV needs a full-vocabulary draft "
+                "whose lm_head shards carry no padding or added tokens; got "
+                f"lm_head {head.org_vocab_size} (padded "
+                f"{head.num_embeddings_padded}), markov_w2 {w2.org_vocab_size}."
+            )
+        if self.logits_processor.soft_cap is not None:
+            raise ValueError("Vocabulary-parallel Markov drafting needs no soft cap.")
+        shard = head.shard_indices
+        self.register_buffer(
+            "markov_w2_local",
+            w2.weight[shard.org_vocab_start_index : shard.org_vocab_end_index]
+            .detach()
+            .clone(),
+            persistent=False,
+        )
+
+    def compute_draft_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """This rank's vocabulary shard of `compute_draft_logits`."""
+        assert self.lm_head is not None
+        return self.logits_processor(
+            self.lm_head, self.model.norm(hidden_states), skip_gather=True
+        )
+
+    def markov_bias_local(self, markov_embed: torch.Tensor) -> torch.Tensor:
+        """This rank's vocabulary shard of `markov_bias`."""
+        bias = torch.nn.functional.linear(markov_embed, self.markov_w2_local)
+        if self.logits_processor.scale != 1.0:
+            bias = bias * self.logits_processor.scale
+        return bias
+
+    def vocab_parallel_argmax(self, local_logits: torch.Tensor) -> torch.Tensor:
+        """`argmax` over the full vocabulary from per-rank shards ([P, V/tp]).
+
+        Ties resolve to the lowest token id as in a full-vocabulary argmax: the
+        local argmax keeps its shard's first index and the cross-rank argmax
+        the first rank, which owns the lower ids.
+        """
+        head = self.lm_head
+        assert head is not None
+        local_idx = local_logits.argmax(dim=-1, keepdim=True)
+        local_max = local_logits.gather(-1, local_idx)
+        # A buffer, not the int: rank-specific literals would give each rank
+        # its own compiled graph.
+        global_idx = local_idx + head.org_vocab_start_index
+        # f32 holds token ids below 2**24 exactly.
+        pair = torch.cat([local_max.float(), global_idx.float()], dim=-1)
+        gathered = tensor_model_parallel_all_gather(pair, dim=-1).view(
+            local_logits.shape[0], head.tp_size, 2
+        )
+        best_rank = gathered[..., 0].argmax(dim=-1, keepdim=True)
+        return gathered[..., 1].gather(-1, best_rank).squeeze(-1).to(torch.int64)
 
     # --- Weight loading -----------------------------------------------------
 

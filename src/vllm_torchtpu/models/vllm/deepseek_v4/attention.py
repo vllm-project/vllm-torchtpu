@@ -49,10 +49,12 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_o
     VllmDeepseekV4SWACache,
     _attention_csa,
     _attention_hca,
+    _attention_hca_rope,
     get_packed_mla_head_size,
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
     VllmDeepseekCompressor,
+    pair_proj_forward,
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import (
     VllmDeepseekV4Indexer,
@@ -82,8 +84,22 @@ def _qnorm_rope_jax(
     cos_sin_cache: jax.Array,
     *,
     eps: float,
+    head_dim: int,
 ) -> jax.Array:
-    """Per-head RMSNorm (no weight) fused with RoPE on the query heads."""
+    """Per-head RMSNorm (no weight) fused with RoPE on the flat q projection."""
+    return rope_kernel.qnorm_rope_flat(
+        x, positions, cos_sin_cache, num_heads=x.shape[1] // head_dim, eps=eps
+    )
+
+
+def _qnorm_rope_3d_jax(
+    x: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    *,
+    eps: float,
+) -> jax.Array:
+    """Per-head RMSNorm (no weight) fused with RoPE on [tokens, heads, dim] q."""
     return rope_kernel.qnorm_rope(x, positions, cos_sin_cache, eps=eps)
 
 
@@ -121,6 +137,15 @@ def _o_proj_jax(
 def _fake_rope(x, positions, cos_sin_cache, *args, **kwargs):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
     return torch.empty_like(x)
+
+
+def _make_fake_qnorm_rope(head_dim: int):
+    """Abstract implementation: ``[tokens, heads * head_dim]`` -> 3-D."""
+
+    def _fake(x, positions, cos_sin_cache):
+        return x.new_empty((x.shape[0], x.shape[1] // head_dim, head_dim))
+
+    return _fake
 
 
 def _fake_o_proj(x, positions, cos_sin_cache, wo_a, wo_a_scale, *args, **kwargs):
@@ -384,6 +409,33 @@ class VllmDeepseekV4MLAAttention(
                 "csa_gather_and_attention_chunk_size": (
                     envs.TPU_DSV4_CSA_GATHER_AND_ATTENTION_CHUNK_SIZE
                 ),
+                "csa_gather_no_pad": envs.TPU_DSV4_CSA_GATHER_NO_PAD,
+                "union_dense": envs.TPU_DSV4_CSA_UNION_DENSE,
+                "union_verify": envs.TPU_DSV4_SMLA_UNION_VERIFY,
+                "union_verify_max_tokens": envs.TPU_DSV4_SMLA_UNION_VERIFY_MAX_TOKENS,
+                "union_verify_above": envs.TPU_DSV4_SMLA_UNION_VERIFY_ABOVE,
+                "union_verify_early": envs.TPU_DSV4_SMLA_UNION_VERIFY_EARLY,
+                "union_verify_fence": envs.TPU_DSV4_SMLA_UNION_VERIFY_FENCE,
+                "window_mixed": envs.TPU_DSV4_CSA_WINDOW_MIXED,
+                "window_mixed_above": envs.TPU_DSV4_CSA_WINDOW_MIXED_ABOVE,
+                "window_mixed_min_heads": envs.TPU_DSV4_CSA_WINDOW_MIXED_MIN_HEADS,
+                "window_mixed_groups": envs.TPU_DSV4_CSA_WINDOW_MIXED_GROUPS,
+                "window_mixed_max_tokens": envs.TPU_DSV4_CSA_WINDOW_MIXED_MAX_TOKENS,
+                "window_mixed_wq": envs.TPU_DSV4_CSA_WINDOW_MIXED_WQ,
+                "union_dense_min_tokens": envs.TPU_DSV4_CSA_UNION_DENSE_MIN_TOKENS,
+                "union_dense_rows_per_token": (
+                    envs.TPU_DSV4_CSA_UNION_DENSE_ROWS_PER_TOKEN
+                ),
+                "union_dense_max_heads": envs.TPU_DSV4_CSA_UNION_DENSE_MAX_HEADS,
+                "union_dense_max_kv_tp4": envs.TPU_DSV4_CSA_UNION_DENSE_MAX_KV_TP4,
+                # The TP4 plan outside its lax.cond pays only with the indexer
+                # token split (short SparseCore top-k ahead of it).
+                "union_dense_plan_unconditional": (
+                    envs.TPU_DSV4_INDEXER_TOKEN_SPLIT_ABOVE > 0
+                    and bool(envs.TPU_DSV4_SEQ_PARALLEL)
+                ),
+                "topk_after_q_above": envs.TPU_DSV4_CSA_TOPK_AFTER_Q_ABOVE,
+                "topk_after_kv": envs.TPU_DSV4_CSA_TOPK_AFTER_KV,
             }
             if is_csa
             else {
@@ -392,8 +444,15 @@ class VllmDeepseekV4MLAAttention(
             }
         )
 
+        rope_fused = self._hca_rope_fused
+        if rope_fused:
+            kernel_tuning = dict(
+                kernel_tuning,
+                head_dim=int(self.mla_attn.head_dim),
+                q_eps=float(self.mla_attn.eps),
+            )
         wrapped_fn = functools.partial(
-            _attention_csa if is_csa else _attention_hca,
+            _attention_csa if is_csa else (_attention_hca_rope if rope_fused else _attention_hca),
             sm_scale=sm_scale,
             sliding_window=self.window_size,
             logical_page_size=logical_page_size,
@@ -413,6 +472,7 @@ class VllmDeepseekV4MLAAttention(
             f"{'_aliased' if two_caches_same_buffer else ''}"
             f"{'_ncb' if non_causal else ''}"
             f"{f'_vq{verify_q_len}' if verify_q_len else ''}"
+            f"{'_frope' if rope_fused else ''}"
             f"{'' if built_from_real_caches else '_prof'}"
         )
 
@@ -453,6 +513,10 @@ class VllmDeepseekV4MLAAttention(
         )
         if is_csa:
             input_partition_specs += (P(),)  # main_cache_rope
+        if rope_fused:
+            # q arrives as the flat projection [T, heads * head_dim]; + positions, cos_sin_cache
+            input_partition_specs = (P(attn_data_axis, attn_head_axis),) + input_partition_specs[1:]
+            input_partition_specs += (P(), P())
 
         # Donate sw_cache to permit in-place updates by the Pallas
         # sliding-window kernel.
@@ -492,26 +556,32 @@ class VllmDeepseekV4MLAAttention(
 
     @property
     def qnorm_rope_op(self):
-        """The fused q-RMSNorm + RoPE op, built lazily on first forward."""
+        """The fused q-RMSNorm + RoPE op, built before compile (tpu_runner's
+        prebuild list): the flat-input op under TPU_DSV4_QNORM_ROPE_FLAT, else
+        the [tokens, heads, dim] one."""
+        if not envs.TPU_DSV4_QNORM_ROPE_FLAT:
+            return self.qnorm_rope_3d_op
         op = self.__dict__.get("_qnorm_rope_op_instance")
         if op is not None:
             return op
 
         eps = float(self.mla_attn.eps)
-        op_name = f"pallas::deepseek_v4_qnorm_rope_e{_name_float(eps)}"
+        head_dim = int(self.mla_attn.head_dim)
+        op_name = f"pallas::deepseek_v4_qnorm_rope_flat_e{_name_float(eps)}_d{head_dim}"
         op = _pallas_op_cache.get(op_name)
         if op is None:
             op = pallas.jax_op(
                 op_name,
-                functools.partial(_qnorm_rope_jax, eps=eps),
+                functools.partial(_qnorm_rope_jax, eps=eps, head_dim=head_dim),
                 mesh=get_pallas_op_mesh(),
                 input_partition_specs=(
-                    P(None, "model", None),  # q
+                    P(None, "model"),  # q, flat: heads side by side
                     P(),  # positions
                     P(),  # cos_sin_cache
                 ),
+                output_partition_specs=(P(None, "model", None),),
             )
-            op.register_fake(_fake_rope)
+            op.register_fake(_make_fake_qnorm_rope(head_dim))
             _pallas_op_cache[op_name] = op
         object.__setattr__(self, "_qnorm_rope_op_instance", op)
         return op
@@ -541,12 +611,43 @@ class VllmDeepseekV4MLAAttention(
         object.__setattr__(self, "_kv_rope_op_instance", op)
         return op
 
+    @property
+    def qnorm_rope_3d_op(self):
+        """The [tokens, heads, dim] q-RMSNorm + RoPE op (TPU_DSV4_QNORM_ROPE_FLAT=0)."""
+        op = self.__dict__.get("_qnorm_rope_3d_op_instance")
+        if op is not None:
+            return op
+
+        eps = float(self.mla_attn.eps)
+        op_name = f"pallas::deepseek_v4_qnorm_rope_e{_name_float(eps)}"
+        op = _pallas_op_cache.get(op_name)
+        if op is None:
+            op = pallas.jax_op(
+                op_name,
+                functools.partial(_qnorm_rope_3d_jax, eps=eps),
+                mesh=get_pallas_op_mesh(),
+                input_partition_specs=(
+                    P(None, "model", None),  # q
+                    P(),  # positions
+                    P(),  # cos_sin_cache
+                ),
+            )
+            op.register_fake(_fake_rope)
+            _pallas_op_cache[op_name] = op
+        object.__setattr__(self, "_qnorm_rope_3d_op_instance", op)
+        return op
+
     def qnorm_rope(
         self,
         q: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        """Apply RMSNorm and scaling RoPE to query head states."""
+        """RMSNorm + scaling RoPE on the flat q projection -> [tokens, heads, dim].
+
+        TPU_DSV4_QNORM_ROPE_FLAT reads the projection's (8, 128) tiles in the
+        kernel; otherwise q is viewed 3-D and XLA relays it out first."""
+        if not envs.TPU_DSV4_QNORM_ROPE_FLAT:
+            q = q.view(q.shape[0], -1, self.mla_attn.head_dim)
         return self.qnorm_rope_op(q, positions, self.mla_attn.rotary_emb.cos_sin_cache)
 
     def kv_rope(
@@ -558,9 +659,18 @@ class VllmDeepseekV4MLAAttention(
         return self.kv_rope_op(kv, positions, self.mla_attn.rotary_emb.cos_sin_cache)
 
     def _project_q(self, qr: torch.Tensor) -> torch.Tensor:
-        """Project the q latent to query heads: [num_tokens, heads, head_dim]."""
-        return self.wq_b(qr).view(
-            qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim
+        """Project the q latent: [num_tokens, heads * head_dim], heads side by side."""
+        return self.wq_b(qr)
+
+    @property
+    def _hca_rope_fused(self) -> bool:
+        """HCA layer whose q RMSNorm + RoPE and kv RoPE run inside the attention op
+        (TPU_DSV4_FUSED_HCA_DECODE + TPU_DSV4_FUSED_HCA_ROPE)."""
+        return bool(
+            envs.TPU_DSV4_FUSED_HCA_DECODE
+            and envs.TPU_DSV4_FUSED_HCA_ROPE
+            and self.compress_ratio > 1
+            and self.compress_ratio != 4
         )
 
     def attention_impl(
@@ -573,23 +683,60 @@ class VllmDeepseekV4MLAAttention(
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         """Execute indexing, state compression, and kernel attention dispatch."""
-        q = self._project_q(qr)
-        q = self.qnorm_rope(q, positions)
-        kv = self.kv_rope(kv, positions)
+        rope_fused = self._hca_rope_fused
+        if rope_fused:
+            # Raw projection + pre-RoPE kv; the attention op applies both RoPEs.
+            q = self.wq_b(qr)
+            if isinstance(q, tuple):
+                q = q[0]
+        else:
+            q = self._project_q(qr)
+            q = self.qnorm_rope(q, positions)
+            kv = self.kv_rope(kv, positions)
 
         topk_indices = None
         compressor = getattr(self.mla_attn, "compressor", None)
+        paired = False
         if self.indexer is not None:
             indexer_emb = getattr(
                 self.mla_attn,
                 "indexer_rotary_emb",
                 getattr(self.mla_attn, "rotary_emb", None),
             )
-            topk_indices = self.indexer(
-                hidden_states, qr, indexer_weights, positions, indexer_emb
-            )
+            if envs.TPU_DSV4_COMPRESSOR_PAIR and compressor is not None:
+                # One weight stream for both projections of these tokens; the
+                # two compressor calls below then skip theirs.
+                paired = pair_proj_forward(
+                    compressor,
+                    self.indexer.compressor,
+                    hidden_states,
+                    positions,
+                    self.mla_attn.rotary_emb,
+                    indexer_emb,
+                )
+            if envs.TPU_DSV4_CSA_TOPK_FENCE_Q and self.indexer._token_split_active(
+                positions.shape[0]
+            ):
+                # TPU_DSV4_CSA_TOPK_FENCE_Q: fence the local top-k with the
+                # projected q before the top-k all-gather (scheduling only).
+                topk_indices, q = self.indexer(
+                    hidden_states, qr, indexer_weights, positions, indexer_emb,
+                    fence=q,
+                    compressor_skip_proj=paired,
+                )
+            else:
+                topk_indices = self.indexer(
+                    hidden_states,
+                    qr,
+                    indexer_weights,
+                    positions,
+                    indexer_emb,
+                    compressor_skip_proj=paired,
+                )
         if compressor is not None:
-            compressor(hidden_states, positions, self.mla_attn.rotary_emb)
+            compressor(
+                hidden_states, positions, self.mla_attn.rotary_emb, skip_proj=paired
+            )
 
         res = self.forward_mqa(
             q,
@@ -734,6 +881,11 @@ class VllmDeepseekV4MLAAttention(
             main_distribution,
             self.attn_sink,
         )
+        if self._hca_rope_fused:
+            operands += (
+                positions.to(torch.int32),
+                self.mla_attn.rotary_emb.cos_sin_cache,
+            )
         if is_csa:
             main_cache_rope = self._as_kernel_cache_view(_live_cache(rope_entry))
             if main_cache_rope is None:
