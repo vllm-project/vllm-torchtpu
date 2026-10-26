@@ -61,6 +61,8 @@ if TYPE_CHECKING:
     TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS: int = 1
     TPU_MLA_FUSED_SMALL_A2A_MERGE: bool = True
     TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS: int = 4
+    TPU_DCP_MLA_OUT_VMEM_MAX_TOKENS: int = 0
+    TPU_DCP_MLA_OUT_VMEM_MIB: int = 32
     TPU_SMALL_COLL_HBM_OPERAND: bool = True
     TPU_DCP_MERGE_CHUNKED_SMALL: int = 2
     TPU_DCP_MLA_MERGE_PIECES: int = 2
@@ -712,6 +714,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS": env_int(
         "TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS", 4
     ),
+    # DCP sparse MLA buckets of at most this many tokens that return the
+    # partial and its lse to the merge (no send layout, one chunk, no merge
+    # pieces; the 64-token decode bucket): the kernel writes both into VMEM
+    # outputs, where the merge's lse rescale reads them. In HBM, XLA copies
+    # them into VMEM only after the lse all-gather, and the lse relayout for
+    # the gather reads HBM: ~3.3 us exposed per layer at T = 64. The partial no
+    # longer aliases q, so padding rows past the real tokens hold no defined
+    # value; their lse stays -inf and the merge weights them 0. Same bits in
+    # every merged row. 0 = off.
+    "TPU_DCP_MLA_OUT_VMEM_MAX_TOKENS": env_int("TPU_DCP_MLA_OUT_VMEM_MAX_TOKENS", 0),
+    # With TPU_DCP_MLA_OUT_VMEM_MAX_TOKENS: those calls' scoped VMEM limit
+    # (MiB). The default limit reserves all of VMEM for the call, leaving none
+    # for its outputs; the rest is XLA's (the outputs, 2 MiB at T = 64, and
+    # prefetches it may run under the call). The kernel's scratch is ~13 MiB
+    # at T = 64; 32 is the pinned fused small all-to-all calls' limit.
+    "TPU_DCP_MLA_OUT_VMEM_MIB": env_int("TPU_DCP_MLA_OUT_VMEM_MIB", 32),
     # The DCP small all-gather (TPU_DCP_INDEXER_SMALL_AG) and small all-to-all
     # (TPU_DCP_MLA_SEND_SMALL_A2A) take their data operand constrained to HBM.
     # Unconstrained (pl.ANY), XLA stages it into VMEM with a copy-start/-done
