@@ -106,7 +106,7 @@ f = torch.compile(m, backend="tpu", fullgraph=True, dynamic=False)
 x = torch.ones((8, 128), dtype=torch.bfloat16, device=dev)
 for _ in range(3):
     y = f(x)
-torch.tpu.synchronize() if hasattr(torch, "tpu") else None
+_ = y.cpu()
 print("MARK_BEGIN", flush=True)
 sys.stderr.write("MARK_BEGIN\n"); sys.stderr.flush()
 for _ in range(20):
@@ -137,7 +137,8 @@ def test_operand_copies():
                    rc=r.returncode, top=progs.most_common(5))
         if r.returncode or not seg:
             tail = [l for l in err.splitlines() if not l[:1] in ("I", "W") and "worker hostname" not in l]
-            row["error"] = " | ".join(tail[-12:])[-1200:]
+            tb = [l for l in tail if "Error" in l or "error" in l or "File " in l]
+            row["error"] = " | ".join((tb or tail)[-10:])[-1200:]
         print("OPC " + json.dumps(row), flush=True)
 
 
