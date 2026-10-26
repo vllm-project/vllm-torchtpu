@@ -12,8 +12,10 @@ and the vllm_torchtpu frame that triggered it:
 Off by default; ``VLLM_TPU_LOG_POST_WARMUP_COMPILES=1`` turns it on.
 """
 
+import sys
 import time
-import traceback
+
+import torch
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
@@ -24,10 +26,22 @@ _installed = False
 
 
 def _trigger_frame() -> str:
-    for frame in reversed(traceback.extract_stack()[:-2]):
-        path = frame.filename
+    """The innermost vllm_torchtpu frame, with the shapes of its tensor locals
+    (which name the bucket that was not warmed)."""
+    frame = sys._getframe(2)
+    while frame is not None:
+        path = frame.f_code.co_filename
         if "/vllm_torchtpu/" in path and not path.endswith("compile_watch.py"):
-            return f"{path.rsplit('/', 1)[-1]}:{frame.lineno} {frame.name}"
+            shapes = [
+                f"{name}={tuple(value.shape)}"
+                for name, value in frame.f_locals.items()
+                if isinstance(value, torch.Tensor)
+            ][:8]
+            return (
+                f"{path.rsplit('/', 1)[-1]}:{frame.f_lineno} {frame.f_code.co_name}"
+                + (f" [{' '.join(shapes)}]" if shapes else "")
+            )
+        frame = frame.f_back
     return "?"
 
 
