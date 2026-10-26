@@ -660,6 +660,8 @@ class Qwen38SegmentDriver:
 
             snap0 = self._snap(ids0, NS)
             ok("snap", snap0[0])
+            # The kernel donates the pool operand: copy the snapshot first.
+            snap_cpu = [t.detach().cpu() for t in snap0] if getattr(self, "h0dump", False) else None
             mk_out = self._mk_run(len(ids0), True, w, h_in, None, snap0)
             ok("mk", mk_out)
             ok("zeros", no_moe[names.index("e13[0]")])
@@ -706,7 +708,7 @@ class Qwen38SegmentDriver:
                 d = {
                     "names": names, "rows": rows, "n_req": n_req,
                     "w": [cpu(t) for t in w], "h_in": cpu(h_in),
-                    "snap": [cpu(t) for t in snap0], "mk_out": cpu(mk_out), "st_out": cpu(st_out),
+                    "snap": snap_cpu, "mk_out": cpu(mk_out), "st_out": cpu(st_out),
                     "stock_block": cpu(block), "stock_g": cpu(g), "stock_res2": cpu(r2),
                     "stock_mixed2": cpu(mixed2), "stock_moe": cpu(moe),
                     "mk_nomoe": cpu(mk_nomoe), "mk_nogdn": cpu(mk_nogdn),
