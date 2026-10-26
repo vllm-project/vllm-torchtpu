@@ -136,5 +136,10 @@ def test_operand_copies():
         row = dict(arm=name, as_strided_per_call=n_as / 20, programs_per_call=n_prog / 20,
                    rc=r.returncode, top=progs.most_common(5))
         if r.returncode or not seg:
-            row["error"] = " | ".join(l for l in err.splitlines() if "Error" in l)[-600:]
+            tail = [l for l in err.splitlines() if not l[:1] in ("I", "W") and "worker hostname" not in l]
+            row["error"] = " | ".join(tail[-12:])[-1200:]
         print("OPC " + json.dumps(row), flush=True)
+
+
+if __name__ == "__main__":
+    test_operand_copies()
