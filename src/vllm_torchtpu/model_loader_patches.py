@@ -64,7 +64,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import envs, expert_placement
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -155,6 +155,12 @@ def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
         return False
     if not name.endswith(_EXPERT_WEIGHT_SUFFIXES):
         return False
+    if expert_placement.has_applied_layers():
+        # A placed layer's rank holds the experts its slots name, replicas
+        # included, rather than the linear block.
+        placed = expert_placement.fetch_filter_ids(name, _ep_rank())
+        if placed is not None:
+            return expert_id not in placed
     return expert_id not in local_expert_ids
 
 
@@ -171,6 +177,30 @@ def _should_skip_weight_tpu(
     if local_expert_ids is None:
         return False
     return _should_skip(weight_name, local_expert_ids)
+
+
+@functools.cache
+def _ep_rank() -> int:
+    """This process's EP rank, derived as vLLM's FusedMoE parallel config does.
+
+    Cached: the streaming loader filters from worker threads, which do not
+    carry the vLLM config context; the first call is on the loading thread.
+    """
+    from vllm.config import get_current_vllm_config
+    from vllm.distributed import (
+        get_dp_group,
+        get_pcp_group,
+        get_tensor_model_parallel_rank,
+    )
+
+    parallel_config = get_current_vllm_config().parallel_config
+    dp_size = parallel_config.data_parallel_size
+    tp_size = parallel_config.tensor_parallel_size
+    pcp_size = parallel_config.prefill_context_parallel_size
+    dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
+    tp_rank = get_tensor_model_parallel_rank() if tp_size > 1 else 0
+    pcp_rank = get_pcp_group().rank_in_group if pcp_size > 1 else 0
+    return dp_rank * pcp_size * tp_size + pcp_rank * tp_size + tp_rank
 
 
 def _compute_local_expert_ids() -> set[int] | None:

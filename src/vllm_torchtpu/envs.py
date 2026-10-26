@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     MOE_FUSED_EP_PUSH_SC_PREPUSH: int = 2
     MOE_FUSED_EP_PUSH_TC_EXCHANGE: bool = False
+    TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_PP_DYNAMIC_CHUNKS: bool = True
@@ -660,6 +661,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # weight-bandwidth bound and the per-device expert load is badly
     # imbalanced. See K3_HIERARCHICAL_EP_PLAN.md.
     "TPU_MOE_HIERARCHICAL_EP": env_bool("TPU_MOE_HIERARCHICAL_EP"),
+    # A static expert layout for the fused EP MoE kernel (expert_placement.py):
+    # a shipped layout's name, a path or a gs:// URI naming, per MoE layer,
+    # which global experts each EP rank holds and in what slot order, with
+    # spare slots holding replicas. Harness alias of
+    # additional_config.deepseek_v41.expert_layout. Empty: the checkpoint's
+    # contiguous blocks.
+    "TPU_EXPERT_PLACEMENT": env_str("TPU_EXPERT_PLACEMENT", ""),
     # MoE router top-k implementation: "rowmax" (default) is the sort-free
     # k-pass selection, "sort" is torch.topk, kept as an escape hatch.
     "TPU_MOE_ROUTER_TOPK": env_with_choices(

@@ -48,7 +48,11 @@ class VllmDeepseekV41Fp8Config(VllmDeepseekV4Fp8Config):
 class DeepseekV41MoE(DeepseekV4MoE):
     def __init__(self, vllm_config, *args, **kwargs):
         if vllm_config.parallel_config.enable_eplb:
-            raise NotImplementedError("V4.1 TPU MoE does not support EPLB")
+            raise NotImplementedError(
+                "V4.1 TPU MoE does not support vLLM's EPLB; a static expert "
+                "layout with replica slots is selected with "
+                "additional_config.deepseek_v41.expert_layout instead"
+            )
         if vllm_config.kernel_config.moe_backend in v4_upstream.MEGA_MOE_BACKENDS:
             raise NotImplementedError("V4.1 TPU requires the native V4 MoE backend")
         factory = v4_upstream.FusedMoEFactory
