@@ -3499,6 +3499,7 @@ def prepare_outputs(
         "out_pieces_gather_first",
         "packed_rope",
         "packed_gather",
+        "out_vmem",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -3559,6 +3560,7 @@ def sparse_ragged_paged_attention(
     send_recv_in: jax.Array | None = None,
     packed_rope: bool = False,
     packed_gather: bool = False,
+    out_vmem: int = 0,
 ) -> jax.Array | tuple[jax.Array, ...]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -3740,6 +3742,17 @@ def sparse_ragged_paged_attention(
         kernel restores the tail in VMEM (`native_sc_gather.expand_packed_rope`).
         Half the gathered rope bytes cross HBM; every score is unchanged.
         Other chunks keep the padded rows.
+      out_vmem: TPU_DCP_MLA_OUT_VMEM_MAX_TOKENS. The attention call's scoped
+        VMEM in bytes (0 = off). With `return_lse`, `lse_lane_dense` and
+        `lse_mask_empty` on a single chunk, and without `lse_in_kernel`
+        taking effect, `send_world` or `out_pieces`: the output and lse are
+        VMEM arrays, where the DCP merge's rescale reads them, instead of HBM
+        arrays XLA copies into VMEM after the lse all-gather. The rest of
+        VMEM is XLA's, to hold them beside the call; the call's other array
+        operands are pinned to HBM. The output no longer aliases q, so rows
+        the grid never reaches hold no defined value; their lse stays -inf,
+        so a DCP merge weights them 0. Every row the grid writes is
+        bit-identical.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -4159,6 +4172,16 @@ def sparse_ragged_paged_attention(
                 "out_pieces needs return_lse, lse_lane_dense and lse_mask_empty"
             )
         piece_rows = max(q.shape[0] // out_pieces, gather_and_attention_chunk_size)
+    out_vmem_applies = (
+        return_lse
+        and lse_lane_dense
+        and lse_mask_empty
+        and not lse_fill
+        and num_chunks == 1
+        and not send_world
+        and not piece_rows
+    )
+    out_vmem = out_vmem if out_vmem_applies else 0
     if out_pieces_fault not in (None, "swap"):
         raise ValueError(f"unknown out_pieces_fault {out_pieces_fault}")
     piece_outs: list[jax.Array] = []
@@ -4237,6 +4260,7 @@ def sparse_ragged_paged_attention(
             send_recv_in=send_recv_in,
             packed_rope=packed_rope,
             packed_gather=packed_gather and group_tab is not None,
+            out_vmem=out_vmem,
             **extra,
         )
 
@@ -4437,6 +4461,7 @@ def sparse_attention_chunk(
     send_recv_in: jax.Array | None = None,
     packed_rope: bool = False,
     packed_gather: bool = False,
+    out_vmem: int = 0,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -4487,7 +4512,12 @@ def sparse_attention_chunk(
     `packed_gather` (with `group_tab`): the gathered rope buffer holds eight
     keys per row without the zero tail (`dsa_gather_native_sc(packed_out=)`),
     and so does `pre_gathered`'s.
+    `out_vmem` (with `lse`; scoped VMEM bytes): the output and lse are VMEM
+    arrays and the output does not alias `q` (see
+    `sparse_ragged_paged_attention`).
     """
+    if out_vmem and (lse is None or send_world or out_piece is not None):
+        raise ValueError("out_vmem needs an lse input and no send layout or piece")
     if kv_write is not None and not (gather_live_in_indices or group_tab is not None):
         raise ValueError("kv_write rides the fused-prep or live-group capped gather")
     return_lse = lse is not None or lse_fill
@@ -4788,6 +4818,8 @@ def sparse_attention_chunk(
             scope_name += f"-capw_{capped_windows}"
         if send_exchange is not None:
             scope_name += "-xa2a"
+        if out_vmem:
+            scope_name += "-ov"
         num_prefetch = len(scalar_prefetches)
         # Merge pieces: q is read-only; the lse input (and the carried piece
         # output, the operand after it) alias the two outputs.
@@ -4801,6 +4833,13 @@ def sparse_attention_chunk(
         piece_aliases = {lse_operand: 1}
         if out_carried is not None:
             piece_aliases[lse_operand + 1] = 0
+        # out_vmem: the refs stay typed as above (the kernel only DMAs them);
+        # the output arrays themselves are placed in VMEM.
+        out_vmem_outputs = (
+            [pltpu.VMEM(q.shape, q.dtype), pltpu.VMEM(lse_shape, jnp.float32)]
+            if out_vmem
+            else []
+        )
         kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
                 kernel_body,
@@ -4814,7 +4853,9 @@ def sparse_attention_chunk(
                 compiler_params=pltpu.CompilerParams(
                     dimension_semantics=("arbitrary",),
                     vmem_limit_bytes=(
-                        min(
+                        min(vmem_limit_bytes, out_vmem)
+                        if out_vmem
+                        else min(
                             vmem_limit_bytes,
                             send_exchange[2]
                             if len(send_exchange) > 2
@@ -4832,7 +4873,9 @@ def sparse_attention_chunk(
                     ),
                 ),
                 out_shape=(
-                    [
+                    out_vmem_outputs
+                    if out_vmem
+                    else [
                         jax.ShapeDtypeStruct(
                             shape=(out_rows, *q.shape[1:]), dtype=q.dtype
                         ),
@@ -4874,7 +4917,7 @@ def sparse_attention_chunk(
                 ),
                 input_output_aliases=(
                     piece_aliases
-                    if out_piece is not None
+                    if out_piece is not None or out_vmem
                     else {num_prefetch: 0, lse_operand: 1}
                     if lse_fill and send_recv_in is not None
                     else {num_prefetch: 0}
@@ -4926,6 +4969,11 @@ def sparse_attention_chunk(
                 pltpu.with_memory_space_constraint(x, pltpu.HBM)
                 if pin is True or (pin and r in pin)
                 else x
+                for x, r in zip(operands, roles)
+            ]
+        if out_vmem:
+            operands = [
+                x if r == "lse" else pltpu.with_memory_space_constraint(x, pltpu.HBM)
                 for x, r in zip(operands, roles)
             ]
         return kernel(*scalar_prefetches, *operands)
