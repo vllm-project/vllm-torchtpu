@@ -123,7 +123,13 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             ScratchReq("qf_kr", pltpu.VMEM((ex.MB, g.HD), BF16)),
             ScratchReq("qc_ir", pltpu.VMEM((ex.MB, ix.IDX_DIM), BF16)),
             ScratchReq("qc_osem", pltpu.SemaphoreType.DMA((2,))),
-        ] + (self._shard_scratch(ex) if self.shard_index else []) + (
+        ] + ([
+            # Request-major copies for the traced request index of `loop_requests`: a dynamic
+            # `[q * T, (q + 1) * T)` sublane window of a row-major tile is not provably aligned
+            # (Mosaic E2003, j-bfd3a7f8); a leading-dim index is.
+            ScratchReq("qc_irq", pltpu.VMEM((nreq, ex.T, ix.IDX_DIM), F32)),
+            ScratchReq("qc_kvq", pltpu.VMEM((nreq, ex.T, 2 * g.HD), F32)),
+        ] if self.loop_requests else []) + (self._shard_scratch(ex) if self.shard_index else []) + (
             self._union_scratch(ex) if self.union_attn else []
         )
 
@@ -234,7 +240,10 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         pad = jnp.zeros((4, 256), F32)
         k_old = jnp.concatenate([k8.astype(F32), pad], axis=0)
         v_old = jnp.concatenate([v8.astype(F32), pad], axis=0)
-        kv = scr["qf_kv"][pl.ds(q * T, T)].astype(F32)
+        if self.loop_requests:
+            kv = scr["qc_kvq"][q]
+        else:
+            kv = scr["qf_kv"][q * T : (q + 1) * T].astype(F32)
         k_cur, v_cur = pool_units(kv[:, :256], sk), pool_units(kv[:, 256:], sv)
         pos = 4 * ga + jax.lax.broadcasted_iota(I32, (8, 1), 0)
         k_t = jnp.where(pos < c0, k_old, 0.0)
@@ -349,12 +358,12 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         self.load_tables(ctx, l)
         if self.loop_requests:
             npr = self._shard_rows(ex)[0] if self.shard_index else nreq
+            for q in range(nreq):  # static stores into the request-major copies
+                scr["qc_irq"][q] = raw[q * T : (q + 1) * T]
+                scr["qc_kvq"][q] = scr["qf_kv"][q * T : (q + 1) * T].astype(F32)
 
             def req(q: Any, carry: Any) -> Any:
-                # `qc_ir` holds `raw` (BF16-valued: exact); a traced slice of a value does not
-                # lower on TPU (Pallas: no dynamic_slice), a ref read does.
-                raw_q = scr["qc_ir"][pl.ds(q * T, T)].astype(F32)
-                ck, gc = self._new_group(ctx, l, q, raw_q)
+                ck, gc = self._new_group(ctx, l, q, scr["qc_irq"][q])
 
                 def own() -> None:
                     qr = scr["qi_q"][q].astype(BF16)

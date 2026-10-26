@@ -37,7 +37,7 @@ from ..ops import BF16, F32, I32
 GROUPS_PER_TILE = TILE // MICRO  # one group = one micro-page of 4 tokens
 
 
-UNION_CHUNK = 512  # output slots compacted per pass (bounds the [slots, S] temporaries)
+UNION_CHUNK = 256  # output slots compacted per pass (bounds the [slots, S] temporaries)
 
 
 def union_consts(S: int, KU: int) -> tuple:
@@ -62,8 +62,8 @@ def compact_union(code: jax.Array, KU: int, consts: tuple) -> tuple[jax.Array, j
 
     `code [S, 128]` int32 (lane = group id, value = row bits < 2^T). The compaction of
     `indexer.compact_row` with every coded lane selected, `UNION_CHUNK` output slots per pass
-    (the `[slots, S]` one-hot temporaries of all `KU` slots at once overflow VMEM: 62.8 of 62.1
-    MiB at 16 rows, j-c89e9978); each slot's code is gathered from its group's sublane row by the
+    (the `[slots, S]` one-hot temporaries overflow VMEM: all 2048 slots at once 62.8 of 62.1 MiB at
+    16 rows, j-c89e9978; 512 per pass still 62.4, j-bfd3a7f8); each slot's code is gathered from its group's sublane row by the
     same one-hot matmul (codes <= 15 are exact in BF16).
     """
     U, Us, jcol0, srow, lane = consts
