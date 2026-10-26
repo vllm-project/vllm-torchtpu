@@ -1,5 +1,15 @@
 # DP8 cached-extend and startup benchmark
 
+The greedy target head defaults to `TPU_GREEDY_HEAD_BACKEND=auto` for both
+benchmark and profile runs. On TPU v7, DSV4.1 TP1/PP1 DSpark decode with
+BF16 `[288,5120]` hidden states and `[129280,5120]` weights uses the fused
+GEMM/argmax head without copying weights. Other shapes/configurations,
+non-greedy requests, structured output and logprobs use the logits path.
+Set `TPU_GREEDY_HEAD_BACKEND=logits` to disable the fused head; `pallas`
+requires a supported model configuration and fails at startup otherwise.
+The startup log records head selection. Historical benchmark results from
+before this default change used logits unless explicitly overridden.
+
 This harness qualifies `encoder_extend` on one v7x host: four physical chips,
 eight logical devices, TP1/DP8/EP8/PP1. It observes normal serving completion;
 it adds no device synchronization and never calls `get_output()` early.

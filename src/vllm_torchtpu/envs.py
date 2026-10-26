@@ -58,7 +58,7 @@ if TYPE_CHECKING:
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
-    TPU_GREEDY_HEAD_BACKEND: str = "logits"
+    TPU_GREEDY_HEAD_BACKEND: str = "auto"
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     DP_SCHED_ENABLED: bool = False
@@ -586,7 +586,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # this only selects which profiler consumes them.
     "USE_PHASED_PROFILER": env_bool("USE_PHASED_PROFILER"),
     # Migration selector: remove after fused-head E2E/quality qualification.
-    "TPU_GREEDY_HEAD_BACKEND": lambda: os.getenv("TPU_GREEDY_HEAD_BACKEND", "logits"),
+    # Auto selects the qualified fused head; logits explicitly disables it.
+    "TPU_GREEDY_HEAD_BACKEND": env_with_choices(
+        "TPU_GREEDY_HEAD_BACKEND", "auto", ["auto", "pallas", "logits"]
+    ),
     # Kernel-iteration mode: split the compiled graph at the Pallas custom
     # ops, keep kernel sources out of the compile-cache key, and enable the
     # /reload_kernel endpoint so kernel edits apply to a running server

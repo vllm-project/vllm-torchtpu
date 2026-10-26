@@ -7,8 +7,18 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.utils import get_device_name
+
 # Qualified on v7 with full-K reuse and compact partials; other shapes fall back.
 TUNED_TILES = {(288, 5120, 129280): 1280}
+
+
+def is_supported_shape(rows: int, weight_shape: tuple[int, ...]) -> bool:
+    return (
+        len(weight_shape) == 2
+        and (rows, weight_shape[1], weight_shape[0]) in TUNED_TILES
+        and get_device_name() == "TPU v7"
+    )
 
 
 def fused_greedy_head(hidden: jax.Array, weight: jax.Array) -> jax.Array:

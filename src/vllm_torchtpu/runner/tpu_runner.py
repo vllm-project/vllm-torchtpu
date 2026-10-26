@@ -5035,26 +5035,7 @@ class TPUModelRunner(GPUModelRunner):
             )
         validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
-        self._fused_greedy_head: FusedGreedyHead | None = None
-        if envs.TPU_GREEDY_HEAD_BACKEND == "pallas":
-            from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import (
-                DeepseekV41ForCausalLM,
-            )
-
-            assert isinstance(model, DeepseekV41ForCausalLM)
-            assert self.parallel_config.tensor_parallel_size == 1
-            assert self.lora_config is None
-            assert self.speculative_config is not None
-            rows = self.max_num_reqs * (
-                self.speculative_config.num_speculative_tokens + 1
-            )
-            self._fused_greedy_head = FusedGreedyHead(model.lm_head.weight, rows)
-            logger.info(
-                "Greedy head: reusing original weight shape=%s",
-                tuple(self._fused_greedy_head.weight.shape),
-            )
-        else:
-            assert envs.TPU_GREEDY_HEAD_BACKEND == "logits"
+        self._init_fused_greedy_head()
         if self._is_deepseek_v41:
             depth = getattr(model, "token_lookback_depth", 0)
             self.lookback_token_ids = (
@@ -7280,6 +7261,53 @@ class TPUModelRunner(GPUModelRunner):
             temps_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
             top_k_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
             top_p_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
+        )
+
+    def _init_fused_greedy_head(self) -> None:
+        self._fused_greedy_head: FusedGreedyHead | None = None
+        backend = envs.TPU_GREEDY_HEAD_BACKEND
+        if backend == "logits":
+            return
+
+        from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import (
+            DeepseekV41ForCausalLM,
+        )
+
+        model = self.model
+        spec = self.speculative_config
+        if (
+            isinstance(model, DeepseekV41ForCausalLM)
+            and self.parallel_config.tensor_parallel_size == 1
+            and self.parallel_config.pipeline_parallel_size == 1
+            and self.lora_config is None
+            and spec is not None
+            and spec.method == "dspark"
+        ):
+            rows = self.max_num_reqs * (spec.num_speculative_tokens + 1)
+            if FusedGreedyHead.is_supported(model.lm_head.weight, rows):
+                self._fused_greedy_head = FusedGreedyHead(model.lm_head.weight, rows)
+                logger.info(
+                    "Greedy head: backend=%s, rows=%d, "
+                    "reusing original weight shape=%s",
+                    backend,
+                    rows,
+                    tuple(self._fused_greedy_head.weight.shape),
+                )
+                return
+        assert backend != "pallas", (
+            "Forced fused greedy head requires DSV4.1, TPU v7, TP1/PP1, no LoRA, "
+            "DSpark decoding and a tuned BF16 shape; "
+            "use TPU_GREEDY_HEAD_BACKEND=auto or logits for other configurations"
+        )
+        logger.warning_once(
+            "Greedy head: auto uses logits outside the qualified envelope "
+            "(model=%s, TP=%d, PP=%d, max_num_reqs=%d, LoRA=%s, speculative=%s)",
+            type(model).__name__,
+            self.parallel_config.tensor_parallel_size,
+            self.parallel_config.pipeline_parallel_size,
+            self.max_num_reqs,
+            self.lora_config is not None,
+            spec is not None,
         )
 
     def _can_use_fused_greedy_head(
