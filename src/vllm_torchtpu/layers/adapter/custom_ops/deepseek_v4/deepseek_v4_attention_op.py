@@ -241,6 +241,8 @@ def _attention_csa(
     if q.shape[0] <= 128:
         gather_and_attention_chunk_size = 32
         attention_kernel_batch_size = 8
+    elif q.shape[0] <= 256:
+        gather_and_attention_chunk_size = 64
 
     # First use of the top-k after the SWA pass: the indexer's SparseCore
     # top-k then completes behind the q projection and SWA, which do not need

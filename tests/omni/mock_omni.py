@@ -79,9 +79,23 @@ class _MockSDPAImpl:
         self.softmax_scale = kwargs.get("softmax_scale", scale)
         self.causal = kwargs.get("causal", False)
 
+    def forward(self, query, key, value, attn_metadata=None):
+        # AttentionImpl.forward has no branch for out-of-tree platforms.
+        raise NotImplementedError("No forward implementation for platform: oot")
+
     def _forward_impl(
         self, query, key, value, attn_metadata=None, mask_mode="broadcast_k"
     ):
+        # Mirrors _maybe_reshape_attn_mask: a 2D [B, Sk] keep mask is cast to
+        # bool and broadcast over heads and queries.
+        assert mask_mode == "broadcast_k"
+        attn_mask = getattr(attn_metadata, "attn_mask", None)
+        if (
+            attn_mask is not None
+            and attn_mask.ndim == 2
+            and attn_mask.shape == (query.shape[0], key.shape[1])
+        ):
+            attn_mask = attn_mask.to(torch.bool)[:, None, None, :]
         if self.num_kv_heads != self.num_heads:
             n_rep = self.num_heads // self.num_kv_heads
             key = torch.repeat_interleave(key, n_rep, dim=2)
@@ -90,7 +104,7 @@ class _MockSDPAImpl:
         k = key.transpose(1, 2)
         v = value.transpose(1, 2)
         out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, scale=self.scale
+            q, k, v, attn_mask=attn_mask, scale=self.softmax_scale
         )
         return out.transpose(1, 2)
 
@@ -139,6 +153,51 @@ class _MockColumnParallelGELU(torch.nn.Module):
         return torch.nn.functional.gelu(self.proj(x), approximate=self.approximate)
 
 
+def _mock_ltx2_rope_cls():
+    """A fresh class of vLLM-Omni's LTX-2 RoPE (patches install on the class)."""
+
+    class LTX2AudioVideoRotaryPosEmbed(torch.nn.Module):
+        """LTX-2 RoPE: (cos, sin) of coords with per-head frequencies."""
+
+        def __init__(self, rope_type="split", heads=3, head_dim=8):
+            super().__init__()
+            self.rope_type = rope_type
+            self.freqs = 4 * torch.rand(heads, head_dim // 2)
+            self.calls = 0
+
+        def forward(self, coords, device=None, out_dtype=None):
+            self.calls += 1
+            # (B, P, T, 2) patch bounds -> (B, H, T, D/2) angles.
+            pos = coords.float().mean(dim=(1, 3))
+            angles = pos[:, None, :, None] * self.freqs[:, None, :]
+            if self.rope_type == "interleaved":
+                # (B, T, H * D), each frequency repeated for its pair.
+                angles = angles.transpose(1, 2).flatten(2).repeat_interleave(2, -1)
+            cos, sin = angles.cos(), angles.sin()
+            if out_dtype is not None:
+                cos, sin = cos.to(out_dtype), sin.to(out_dtype)
+            return cos, sin
+
+    return LTX2AudioVideoRotaryPosEmbed
+
+
+def _mock_apply_split_rotary_emb(x, freqs, *, head_dim):
+    """vLLM-Omni's LTX-2 split RoPE of (B, T, H * D) with (B, H, T, D/2) tables.
+
+    Same operations as upstream: products in the promoted dtype of x and the
+    tables, addcmul_, and no cast back to x.dtype.
+    """
+    cos, sin = freqs
+    b, t = x.shape[:2]
+    h, r = cos.shape[1], cos.shape[-1]
+    split_x = x.reshape(b, t, h, head_dim).swapaxes(1, 2).reshape(b, h, t, 2, r)
+    cos_u, sin_u = cos.unsqueeze(-2), sin.unsqueeze(-2)
+    out = split_x * cos_u
+    out[..., :1, :].addcmul_(-sin_u, split_x[..., 1:, :])
+    out[..., 1:, :].addcmul_(sin_u, split_x[..., :1, :])
+    return out.reshape(b, h, t, head_dim).swapaxes(1, 2).reshape(b, t, h * head_dim)
+
+
 class _MockRotaryEmbeddingWan(torch.nn.Module):
     """vLLM-Omni's CustomOp-style Wan RoPE (native interleaved formula)."""
 
@@ -173,6 +232,13 @@ class _MockWanSelfAttention(torch.nn.Module):
         return "native"
 
 
+class _MockWorkerProc:
+    """vLLM-Omni's diffusion WorkerProc with its async output loop."""
+
+    def _async_output_loop(self):
+        pass
+
+
 vllm_omni_mock = MagicMock()
 vllm_omni_mock.platforms.interface.OmniPlatform = _MockOmniPlatform
 vllm_omni_mock.platforms.interface.OmniPlatformEnum = _MockOmniPlatformEnum
@@ -186,11 +252,18 @@ qwen_transformer_mock = (
 )
 qwen_transformer_mock.QwenEmbedRope = _MockQwenEmbedRope
 qwen_transformer_mock.QwenEmbedLayer3DRope = _MockQwenEmbedLayer3DRope
+
+_ltx2_transformer = vllm_omni_mock.diffusion.models.ltx2.ltx2_transformer
+_ltx2_transformer.LTX2AudioVideoRotaryPosEmbed = _mock_ltx2_rope_cls()
+_ltx2_transformer.apply_split_rotary_emb = _mock_apply_split_rotary_emb
+_ltx2_transformer.get_tensor_model_parallel_world_size = lambda: 1
+_ltx2_transformer.get_tensor_model_parallel_rank = lambda: 0
 vllm_omni_mock.diffusion.layers.rope.RotaryEmbeddingWan = _MockRotaryEmbeddingWan
 vllm_omni_mock.diffusion.layers.norm.RMSNorm = _MockRMSNorm
 _wan2_2 = vllm_omni_mock.diffusion.models.wan2_2
 _wan2_2.wan2_2_transformer.ColumnParallelGELU = _MockColumnParallelGELU
 _wan2_2.wan2_2_transformer.WanSelfAttention = _MockWanSelfAttention
+vllm_omni_mock.diffusion.worker.diffusion_worker.WorkerProc = _MockWorkerProc
 
 sys.modules["vllm_omni"] = vllm_omni_mock
 sys.modules["vllm_omni.platforms"] = vllm_omni_mock.platforms
@@ -211,6 +284,7 @@ sys.modules["vllm_omni.diffusion.attention.backends.sdpa"] = (
     vllm_omni_mock.diffusion.attention.backends.sdpa
 )
 sys.modules["vllm_omni.diffusion.models"] = vllm_omni_mock.diffusion.models
+sys.modules["vllm_omni.diffusion.models.ltx2"] = vllm_omni_mock.diffusion.models.ltx2
 sys.modules["vllm_omni.diffusion.models.qwen_image"] = (
     vllm_omni_mock.diffusion.models.qwen_image
 )
@@ -230,3 +304,7 @@ sys.modules["vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer"] = (
 sys.modules["vllm_omni.diffusion.layers"] = vllm_omni_mock.diffusion.layers
 sys.modules["vllm_omni.diffusion.layers.rope"] = vllm_omni_mock.diffusion.layers.rope
 sys.modules["vllm_omni.diffusion.layers.norm"] = vllm_omni_mock.diffusion.layers.norm
+sys.modules["vllm_omni.diffusion.worker"] = vllm_omni_mock.diffusion.worker
+sys.modules["vllm_omni.diffusion.worker.diffusion_worker"] = (
+    vllm_omni_mock.diffusion.worker.diffusion_worker
+)

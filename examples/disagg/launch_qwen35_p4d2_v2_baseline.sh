@@ -204,6 +204,11 @@ for compile_sizes_name in COMPILE_SIZES PREFILL_COMPILE_SIZES DECODE_COMPILE_SIZ
   fi
 done
 
+# MAX_NUM_BATCHED_TOKENS is the prefill token budget. Decode gets its own, by
+# default its largest compile size: the platform rejects a budget a step could
+# not pad to.
+DECODE_MAX_NUM_BATCHED_TOKENS="${DECODE_MAX_NUM_BATCHED_TOKENS:-$(tr ',' '\n' <<<"${DECODE_COMPILE_SIZES}" | sort -n | tail -n 1)}"
+
 managed_ports=("${PROXY_PORT}" "${PREFILL_PORT}" "${DECODE_PORT}" "${TPU_SIDE_CHANNEL_PORT}" "${KV_PORT}")
 for offset in 0 1 2 3; do
   managed_ports+=("$((PREFILL_TPU_KV_TRANSFER_PORT + offset))")
@@ -298,7 +303,6 @@ common_args=(
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
   --kv-cache-dtype fp8
   --language-model-only
-  --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}"
   --max-num-seqs "${MAX_NUM_SEQS}"
   --no-disable-hybrid-kv-cache-manager
   --attention-backend "${ATTENTION_BACKEND}"
@@ -351,6 +355,8 @@ DECODE_TP=${DECODE_TP}
 DECODE_DP=${DECODE_DP}
 PREFILL_COMPILE_SIZES=${PREFILL_COMPILE_SIZES}
 DECODE_COMPILE_SIZES=${DECODE_COMPILE_SIZES}
+MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS}
+DECODE_MAX_NUM_BATCHED_TOKENS=${DECODE_MAX_NUM_BATCHED_TOKENS}
 PREFILL_SPECULATIVE_CONFIG=${PREFILL_SPECULATIVE_CONFIG}
 DECODE_SPECULATIVE_CONFIG=${DECODE_SPECULATIVE_CONFIG}
 PREFILL_BLOCK_SIZE=${prefill_block_size_label}
@@ -426,14 +432,14 @@ export TPU_RAIDEN_TRANSFER_PARALLELISM=4;
 EOF
 )
 
-prefill_args=(--port "${PREFILL_PORT}" "${common_args[@]}" --compilation-config "${prefill_compilation_config}" --tensor-parallel-size "${PREFILL_TP}" --prefill-context-parallel-size "${PREFILL_PCP}" --kv-transfer-config "${p_kv}")
+prefill_args=(--port "${PREFILL_PORT}" "${common_args[@]}" --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" --compilation-config "${prefill_compilation_config}" --tensor-parallel-size "${PREFILL_TP}" --prefill-context-parallel-size "${PREFILL_PCP}" --kv-transfer-config "${p_kv}")
 if [[ "${PREFILL_PP}" -gt 1 ]]; then
   prefill_args+=(--pipeline-parallel-size "${PREFILL_PP}")
 fi
 if [[ "${PREFILL_PCP}" -gt 1 ]]; then
   prefill_args+=(--cp-kv-cache-interleave-size "${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE}")
 fi
-decode_args=(--port "${DECODE_PORT}" "${common_args[@]}" --compilation-config "${decode_compilation_config}" --tensor-parallel-size "${DECODE_TP}" --prefill-context-parallel-size 1 --kv-transfer-config "${d_kv}")
+decode_args=(--port "${DECODE_PORT}" "${common_args[@]}" --max-num-batched-tokens "${DECODE_MAX_NUM_BATCHED_TOKENS}" --compilation-config "${decode_compilation_config}" --tensor-parallel-size "${DECODE_TP}" --prefill-context-parallel-size 1 --kv-transfer-config "${d_kv}")
 if [[ "${DECODE_DP}" -gt 1 ]]; then
   decode_args+=(--data-parallel-size "${DECODE_DP}" --data-parallel-size-local "${DECODE_DP}")
 fi

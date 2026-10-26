@@ -111,9 +111,17 @@ def _make_runner(
     runner._decode_device_cache_key = None
     # The staging-tensor fence is recorded by execute_model; these tests
     # call _prepare_inputs directly, so the wait must find an empty fence.
+    # _dummy_run records one itself (see _fake_tpu_events).
     runner._input_staging_fence = None
+    runner._unfenced_h2d_sources = []
+    runner._fenced_h2d_sources = []
+    runner._free_h2d_sources = {}
+    runner._registered_h2d_sources = set()
     runner._wait_input_staging_fence = types.MethodType(
         TPUModelRunner._wait_input_staging_fence, runner
+    )
+    runner._record_input_staging_fence = types.MethodType(
+        TPUModelRunner._record_input_staging_fence, runner
     )
     runner._cached_query_start_loc = None
     runner._cached_logits_indices = None
@@ -242,6 +250,14 @@ def _make_runner(
 
     runner._build_attention_metadata = fake_build_attention_metadata
     return runner
+
+
+def _fake_tpu_events(monkeypatch):
+    """Stand in for `torch.tpu.Event` so a CPU test can record the staging fence."""
+    event = SimpleNamespace(record=lambda: None, synchronize=lambda: None)
+    monkeypatch.setattr(
+        torch, "tpu", SimpleNamespace(Event=lambda: event), raising=False
+    )
 
 
 def _scheduler_output(scheduled_tokens):

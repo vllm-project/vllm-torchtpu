@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for `decls` and `Block` binding/resolution primitives."""
+"""Unit tests for `decls` and `Module` binding/resolution primitives."""
 
 from __future__ import annotations
 
@@ -25,23 +25,23 @@ import pytest
 
 from vllm_torchtpu.megakernel.decls import (
     REQUIRED,
-    BlockBinding,
     FrozenDict,
     HFParamDecl,
     KVCacheDecl,
+    ModuleBinding,
     ParamTransform,
     RecurrentCacheDecl,
-    ResolvedBlockGeometry,
+    ResolvedModuleGeometry,
     VLLMAlias,
     apply_decl_overrides,
     combined_hf_param_shapes,
 )
 from vllm_torchtpu.megakernel.ops import BF16, F32, FP8
-from vllm_torchtpu.megakernel.spec import Block
+from vllm_torchtpu.megakernel.spec import Module
 
 
-class _ToyAttn(Block):
-    """Minimal self-contained block for testing `bind` and `resolve`."""
+class _ToyAttn(Module):
+    """Minimal self-contained module for testing `bind` and `resolve`."""
 
     name = "toy_attn"
     GEOMETRY_FIELDS = {
@@ -115,7 +115,7 @@ class _ToyAttn(Block):
                 hf_name=f"{pfx}.o_proj.weight",
                 shape=(geom.NH * geom.HD, geom.H),
                 dtype=BF16,
-                transform=ParamTransform(transpose=True, shard_axis=0),
+                transform=ParamTransform(transpose=(1, 0), shard_axis=0),
                 vllm_aliases=(VLLMAlias(source=f"{pfx}.o_proj", targets=(o_name,)),),
             ),
         ]
@@ -179,6 +179,9 @@ def test_cache_and_hf_param_declarations():
             transform=ParamTransform(transpose=(0, 0, 1)),
         )
 
+    with pytest.raises(TypeError, match="permutation tuple or None"):
+        ParamTransform(transpose=True)  # type: ignore[arg-type]
+
     # combined_hf_param_shapes fuses uniform groups in fuse_order along fuse_axis.
     w1 = HFParamDecl(
         name="w1",
@@ -197,11 +200,11 @@ def test_cache_and_hf_param_declarations():
     assert combined_hf_param_shapes([w3, w1]) == {"w13": ((8, 256, 192), FP8)}
 
 
-def test_block_bind_resolve_and_strict_key_lookup():
-    # Base Block defaults reject unimplemented bind/hf_params/reference/geometry.
-    base = Block()
-    with pytest.raises(NotImplementedError, match="Block.bind"):
-        Block.bind()
+def test_module_bind_resolve_and_strict_key_lookup():
+    # Base Module defaults reject unimplemented bind/hf_params/reference/geometry.
+    base = Module()
+    with pytest.raises(NotImplementedError, match="Module.bind"):
+        Module.bind()
     with pytest.raises(ValueError, match="requires a resolved geometry"):
         base._require_geometry()
     with pytest.raises(NotImplementedError, match="hf_params"):
@@ -220,9 +223,9 @@ def test_block_bind_resolve_and_strict_key_lookup():
         )
     )
     binding = _ToyAttn.bind("self_attn")
-    assert isinstance(binding, BlockBinding)
+    assert isinstance(binding, ModuleBinding)
     resolved = binding.resolve(cfg)
-    assert isinstance(resolved, ResolvedBlockGeometry)
+    assert isinstance(resolved, ResolvedModuleGeometry)
     assert resolved.geometry is resolved
     assert (resolved.H, resolved.hidden) == (512, 512)
     assert (resolved.NH, resolved.heads) == (8, 8)
@@ -238,7 +241,7 @@ def test_block_bind_resolve_and_strict_key_lookup():
         hd=64, kvh=2, page_size=128, page_dtype=BF16
     )
     assert len(binding.hf_params(cfg)) == 3
-    assert isinstance(binding.to_block(cfg), _ToyAttn)
+    assert isinstance(binding.to_module(cfg), _ToyAttn)
     assert pickle.loads(pickle.dumps(binding)) == binding
     assert hash(binding) == hash(copy.deepcopy(binding))
     assert pickle.loads(pickle.dumps(resolved)) == resolved
@@ -297,7 +300,7 @@ def test_rename_transforms_validation_and_reference_lookup():
         rename={"q_proj": "custom_q"},
         transforms={
             "custom_q": {"shard_axis": None},
-            "o_proj": ParamTransform(transpose=False, shard_axis=1),
+            "o_proj": ParamTransform(transpose=None, shard_axis=1),
         },
     ).resolve(cfg)
     by_name = {d.name: d for d in custom.hf_params()}
@@ -305,7 +308,7 @@ def test_rename_transforms_validation_and_reference_lookup():
     assert by_name["custom_q"].transform == ParamTransform(
         transpose=(0, 2, 1), shard_axis=None
     )
-    assert by_name["o_proj"].transform == ParamTransform(transpose=False, shard_axis=1)
+    assert by_name["o_proj"].transform == ParamTransform(transpose=None, shard_axis=1)
 
     with pytest.raises(TypeError, match="Invalid transforms"):
         apply_decl_overrides(
@@ -329,3 +332,16 @@ def test_rename_transforms_validation_and_reference_lookup():
     ).resolve(cfg)
     assert named.reference({"alt_q": 5}, 2) == (7, None)
     assert named.reference(5, 2, state=F32) == (7, F32)
+
+    # A Module subclass without a custom __init__ works with bind(...).resolve().
+    class _PlainModule(Module):
+        name = "plain_module"
+        GEOMETRY_FIELDS = {"H": ("hidden_size", REQUIRED)}
+        OPTIONS = {"flag": False}
+
+    plain = _PlainModule.bind("plain", flag=True).resolve(cfg).to_module()
+    assert plain.prefix == "plain"
+    assert plain.geometry.H == 256
+    assert plain.options == FrozenDict({"flag": True})
+    with pytest.raises(TypeError, match="unexpected option"):
+        _PlainModule(bad_opt=1)

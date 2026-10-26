@@ -13,10 +13,10 @@
 # limitations under the License.
 """Core execution config for the megakernel: tiles, tunables registry, ExecSpec.
 
-Only core execution knobs live here. A block with its own knobs registers a
+Only core execution knobs live here. A module with its own knobs registers a
 frozen `Tunables` dataclass (`register_tunables`, with a per-field `NUMERICS`
-class); `Tiles.blocks` holds one instance per block name (`Tiles.block` and
-`Tiles.with_blocks`). Optional cache-specific execution settings ride on
+class); `Tiles.modules` holds one instance per module name (`Tiles.module` and
+`Tiles.with_modules`). Optional cache-specific execution settings ride on
 `ExecSpec.cache`.
 """
 
@@ -27,9 +27,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
-from .block_options import (
-    BlockOptionsMap,
-    DebugBlocksMap,
+from .module_options import (
+    DebugModulesMap,
+    ModuleOptionsMap,
     NumericsClass,
     TunablesMap,
     debug_class,
@@ -52,8 +52,8 @@ class Tiles:
     """Core execution tiling, ring depths, budgets and collectives.
 
     Every core field declares its numerics class in `TILE_NUMERICS` (below);
-    block knobs live in `blocks` (`{block name: Tunables}`, see `block` and
-    `with_blocks`).
+    module knobs live in `modules` (`{module name: Tunables}`, see `module` and
+    `with_modules`).
     """
 
     bank: int = 2 << 20  # Bytes per dense ring slot
@@ -63,13 +63,13 @@ class Tiles:
     vmem_mib: int = 62  # VMEM limit in MiB
     smem_mib: int = 1  # SMEM limit in MiB
     bounds_checks: bool = False
-    lazy: bool = True  # Refill block dense slots after their streams
+    lazy: bool = True  # Refill module dense slots after their streams
     inplace: bool = False  # Alias state inputs to outputs where supported
     rsag: bool = False  # Two-round reduce-scatter + all-gather
     hier: int = 0  # Hierarchical all-reduce on v7x-8 (0, 1, 2, 3)
     war: int = -1  # Unfolded [MR, H] all-reduce payload (-1: auto, 0: off, 1: on)
     mb8: int = 0  # Internal activation row count MB (0: M, 1: max(16, MR), 2: MR)
-    # Per-bucket schedule threshold (rows). Blocks never compare `B` to a
+    # Per-bucket schedule threshold (rows). Modules never compare `B` to a
     # literal; they read this, and tile rules (`profiles/`) may tune it.
     wide_rows: int = 16  # `B > wide_rows`: WIDE schedule (`ExecSpec.WIDE`)
     # Opt-in performance flags below default to off; the default tile rule
@@ -77,47 +77,47 @@ class Tiles:
     dense_acc_pair: bool = False  # Unrolled / paired dense matmul accumulation
     dmm_unroll: int = 0  # Max tiles to fully unroll in dmatmul (0: never)
     rel_fetch: bool = False  # Trace-time-decoded dense refills (fetch_rel/flush_rel)
-    # Per-block tunables (registered `Tunables` instances keyed by block name).
-    blocks: Mapping[str, Any] = TunablesMap()
+    # Per-module tunables (registered `Tunables` instances keyed by module name).
+    modules: Mapping[str, Any] = TunablesMap()
 
     def __post_init__(self) -> None:
-        if not isinstance(self.blocks, TunablesMap):
-            object.__setattr__(self, "blocks", TunablesMap(self.blocks))
+        if not isinstance(self.modules, TunablesMap):
+            object.__setattr__(self, "modules", TunablesMap(self.modules))
 
-    def block(self, name: str, cls: type[_T] | None = None) -> _T:
-        """Tunables of block `name` (class defaults when unset).
+    def module(self, name: str, cls: type[_T] | None = None) -> _T:
+        """Tunables of module `name` (class defaults when unset).
 
-        Raises `KeyError` for an unregistered block and `TypeError` if the
+        Raises `KeyError` for an unregistered module and `TypeError` if the
         stored tunables are not a `cls`.
         """
         want: type = tunables_class(name) if cls is None else cls
-        val = self.blocks.get(name)
+        val = self.modules.get(name)
         if val is None:
             return want()
         if not isinstance(val, want):
             raise TypeError(
-                f"Tiles.blocks[{name!r}] is a {type(val).__name__}, not a "
+                f"Tiles.modules[{name!r}] is a {type(val).__name__}, not a "
                 f"{want.__name__}"
             )
         return val
 
-    def with_blocks(self, updates: Mapping[str, Any]) -> Tiles:
-        """Copy with block tunables replaced: `{block name: {field: value}}`.
+    def with_modules(self, updates: Mapping[str, Any]) -> Tiles:
+        """Copy with module tunables replaced: `{module name: {field: value}}`.
 
-        A value may also be a `Tunables` instance (replaces the block's whole
-        set). Unknown blocks or fields raise.
+        A value may also be a `Tunables` instance (replaces the module's whole
+        set). Unknown modules or fields raise.
         """
-        blocks = dict(self.blocks)
+        modules = dict(self.modules)
         for name, upd in updates.items():
             if isinstance(upd, Mapping):
-                blocks[name] = dataclasses.replace(self.block(name), **upd)
+                modules[name] = dataclasses.replace(self.module(name), **upd)
             else:
-                blocks[name] = upd
-        return dataclasses.replace(self, blocks=TunablesMap(blocks))
+                modules[name] = upd
+        return dataclasses.replace(self, modules=TunablesMap(modules))
 
 
 # Numerics class of every core `Tiles` field (combined with each registered
-# block's `Tunables.NUMERICS` by `tile_numerics`).
+# module's `Tunables.NUMERICS` by `tile_numerics`).
 # `exact`: moving the field off its baseline value keeps outputs and states
 # bit-identical, because it only changes DMA / ring scheduling, memory budgets
 # or debug checks. `approx`: changes the arithmetic (matmul K-tiling,
@@ -125,7 +125,7 @@ class Tiles:
 TILE_NUMERICS: dict[str, NumericsClass] = {
     "bank": "approx",  # dense K-tiling
     "nbd": "exact",  # dense ring depth (scheduling)
-    "nbe": "approx",  # expert ring depth also gates block pipelining paths
+    "nbe": "approx",  # expert ring depth also gates module pipelining paths
     "ebank": "approx",  # expert K-tiling
     "vmem_mib": "exact",  # budget only
     "smem_mib": "exact",  # budget only
@@ -144,7 +144,7 @@ TILE_NUMERICS: dict[str, NumericsClass] = {
 
 
 def tile_numerics() -> dict[str, NumericsClass]:
-    """Numerics class of every tile knob: core fields plus `<block>.<field>`."""
+    """Numerics class of every tile knob: core fields plus `<module>.<field>`."""
     out: dict[str, NumericsClass] = dict(TILE_NUMERICS)
     for name, cls in sorted(registered_tunables().items()):
         out.update({f"{name}.{k}": v for k, v in cls.NUMERICS.items()})  # type: ignore[attr-defined]
@@ -169,14 +169,14 @@ class DebugOptions:
 
     skip: frozenset[str] = frozenset()  # Named execution phases to skip during ablation
     scopes: int | bool = False  # Emit per-phase jax.named_scope annotations
-    # Per-block debug flags (registered `Debug` dataclasses keyed by block name).
+    # Per-module debug flags (registered `Debug` dataclasses keyed by module name).
     # Kept out of `Tiles`, so setting them leaves `ExecSpec.tiles=None` (and its
     # build-time VMEM refinement) intact.
-    blocks: Mapping[str, Any] = DebugBlocksMap()
+    modules: Mapping[str, Any] = DebugModulesMap()
 
     def __post_init__(self) -> None:
-        if not isinstance(self.blocks, DebugBlocksMap):
-            object.__setattr__(self, "blocks", DebugBlocksMap(self.blocks))
+        if not isinstance(self.modules, DebugModulesMap):
+            object.__setattr__(self, "modules", DebugModulesMap(self.modules))
 
 
 @dataclass(frozen=True)
@@ -187,9 +187,9 @@ class ExecSpec:
     T: int = 1  # Tokens per sequence (>1 for MTP verify)
     R: int = 8  # Tensor-parallel / expert-parallel ranks
     ctx: int = 2048  # Max KV sequence length
-    # True: 4D stacked expert weights; False: per-layer 3D. The one block
+    # True: 4D stacked expert weights; False: per-layer 3D. The one module
     # weight-layout choice kept in core: the kernel builder, weight packing and
-    # the expert ring all depend on it, not just the block that owns experts.
+    # the expert ring all depend on it, not just the module that owns experts.
     stack_e: bool = False
     interpret: Any = False  # Run Pallas in CPU interpret mode (bool or InterpretParams)
     # None -> default_tiles(B, R=R), which may be refined at build time to fit VMEM
@@ -254,10 +254,10 @@ class ExecSpec:
 
 
 __all__ = [
-    "BlockOptionsMap",
-    "DebugBlocksMap",
+    "DebugModulesMap",
     "DebugOptions",
     "ExecSpec",
+    "ModuleOptionsMap",
     "NumericsClass",
     "TILE_NUMERICS",
     "Tiles",
