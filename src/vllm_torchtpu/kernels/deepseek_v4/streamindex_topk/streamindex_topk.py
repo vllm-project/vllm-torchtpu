@@ -29,9 +29,11 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
     BITS_NEG_INF,
+    rank_major_merge_fits,
     sparsecore_topk,
     sparsecore_topk_dcp_merge,
 )
+from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk_dcp import sparsecore_topk_dcp
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     bref_override,
     config,
@@ -1048,6 +1050,7 @@ def _effective_row_lengths(
         "interleave_size",
         "return_scores",
         "uniform_q_len",
+        "dcp_axis_name",
     ),
 )
 def streamindex_topk(
@@ -1077,6 +1080,7 @@ def streamindex_topk(
     interleave_size: int = 1,
     return_scores: bool = False,
     uniform_q_len: int | None = None,
+    dcp_axis_name: str | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1142,6 +1146,12 @@ def streamindex_topk(
         what makes a cross-rank merge possible. A local top-k over a sharded KV
         axis is not the global top-k, so the merge needs the scores the same way
         the DCP attention kernels need an LSE output.
+      dcp_axis_name: with `cp_size > 1`, inside a `shard_map` over this axis:
+        each chunk's top-k is the exact top-k over every rank's shard
+        (`sparsecore_topk_dcp`, which sums the radix histograms over the
+        ranks), and the result is this rank's share of it, as rank-local
+        positions packed into a prefix and `-1` padded. No merge is needed
+        afterwards. Needs `return_scores=False`.
 
     Returns:
       Top-K indices (rank-local when `cp_size > 1`, global compressed positions
@@ -1166,6 +1176,8 @@ def streamindex_topk(
             raise NotImplementedError(
                 "enable_early_exit is not supported with cp_size > 1."
             )
+    if dcp_axis_name is not None and (cp_size == 1 or return_scores):
+        raise ValueError("dcp_axis_name needs cp_size > 1 and return_scores=False.")
     if enable_early_exit and return_scores:
         raise NotImplementedError(
             "return_scores is not supported with enable_early_exit."
@@ -1522,6 +1534,20 @@ def streamindex_topk(
             cp_size=cp_size,
             interleave_c=interleave_c,
         )
+        # Rank 0 owns the first interleave block of every row, so its row
+        # lengths bound every rank's, and every rank computes the same (only
+        # `dcp_axis_name` reads them).
+        row_bounds = _effective_row_lengths(
+            seq_lens=seq_lens,
+            cu_q_lens=cu_q_lens,
+            distribution=distribution,
+            num_tokens=max_num_tokens,
+            num_positions=num_positions,
+            compression_ratio=compression_ratio,
+            cp_rank=0,
+            cp_size=cp_size,
+            interleave_c=interleave_c,
+        )
 
         if chunk_tokens is None or max_num_tokens % chunk_tokens:
             num_chunks, chunk_len = 1, max_num_tokens
@@ -1569,7 +1595,19 @@ def streamindex_topk(
                     constant_values=BITS_NEG_INF,
                 )
 
-            if return_scores:
+            if dcp_axis_name is not None:
+                # Chained: every rank must run the chunks' calls in one order.
+                chunk_topk_idxs = sparsecore_topk_dcp(
+                    scores,
+                    k,
+                    eff_row_lengths[start : start + chunk_len],
+                    row_bounds[start : start + chunk_len],
+                    dcp_size=cp_size,
+                    axis_name=dcp_axis_name,
+                    scheduling_group_id=sc_group,
+                    after=topk_idxs[-1] if topk_idxs else None,
+                )
+            elif return_scores:
                 chunk_topk_idxs, chunk_topk_scores = sparsecore_topk(
                     scores,
                     k,
@@ -1652,6 +1690,8 @@ def streamindex_topk(
         "chunk_tokens",
         "dcp_axis_name",
         "a2a_merge",
+        "hist_merge",
+        "flat_merge",
     ),
 )
 def streamindex_topk_dcp(
@@ -1677,6 +1717,8 @@ def streamindex_topk_dcp(
     chunk_tokens: int | None = None,
     dcp_axis_name: str = DCP_AXIS_NAME,
     a2a_merge: bool = False,
+    hist_merge: bool = False,
+    flat_merge: bool | None = None,
 ) -> jax.Array:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -1716,6 +1758,13 @@ def streamindex_topk_dcp(
     `dcp_sc_compact.pack_owned_winners`, since a slot still names its source
     rank and that rank's own list, so the indices never travel on either path.
 
+    `hist_merge` collapses steps 1-3 into one pass: every chunk's SparseCore
+    top-k sums its radix histograms over the ranks before picking each bucket
+    (`sparsecore_topk_dcp`), so it finds the global threshold directly and
+    each rank emits its own winners. No candidates are exchanged and no merge
+    runs; the only traffic is 1 KB of histogram per token and radix level,
+    inside the chunk pipeline, where it overlaps the next chunk's scoring.
+
     Args:
       q: replicated query tokens, in natural request-major order
         `[padded_num_tokens, num_q_heads, head_dim]`.
@@ -1745,6 +1794,14 @@ def streamindex_topk_dcp(
       dcp_axis_name: name of the DCP mesh axis.
       a2a_merge: merge over the token axis with an `all_to_all` instead of over
         the candidate axis with an `all_gather`; see above. Same result.
+      hist_merge: find the global top-k in each chunk's SparseCore pass by
+        summing radix histograms over the ranks; see above. Same result up to
+        how ties at the k-th score are split.
+      flat_merge: all-gather merge only, `padded_num_tokens <= 32`: gather the
+        scores flat (`[T * k] -> [dcp_size * T * k]`, rank-major) and merge
+        them in place (`sparsecore_topk_dcp_merge(rank_major=True)`), with no
+        32-row pad or 2-D relayout around the merge. None reads
+        `TPU_SC_TOPK_DCP_MERGE_FLAT`. Same result.
 
     Returns:
       i32[padded_num_tokens, k] of this rank's own *local* cache indices for
@@ -1773,6 +1830,15 @@ def streamindex_topk_dcp(
         raise ValueError(
             f"padded_num_tokens={q.shape[0]} must be divisible by dcp_size={dcp_size}."
         )
+    if a2a_merge and hist_merge:
+        raise ValueError("a2a_merge and hist_merge are exclusive.")
+    if flat_merge is None:
+        from vllm_torchtpu import envs
+
+        flat_merge = envs.TPU_SC_TOPK_DCP_MERGE_FLAT
+    flat_merge = (
+        bool(flat_merge) and not a2a_merge and rank_major_merge_fits(q.shape[0])
+    )
 
     def _local(
         q,
@@ -1786,7 +1852,7 @@ def streamindex_topk_dcp(
         dcp_rank = cp_rank_as_data(dcp_axis_name, dcp_size)
         local_page_indices = jnp.mod(page_indices, jnp.int32(cache_kv.shape[0]))
 
-        idxs, scores = streamindex_topk(
+        local = streamindex_topk(
             q,
             indexer_weights,
             cache_kv,
@@ -1807,8 +1873,13 @@ def streamindex_topk_dcp(
             cp_size=dcp_size,
             cp_rank=dcp_rank,
             interleave_size=interleave_size,
-            return_scores=True,
+            return_scores=not hist_merge,
+            dcp_axis_name=dcp_axis_name if hist_merge else None,
         )
+        if hist_merge:
+            # The chunks' top-k already is this rank's share of the global one.
+            return local
+        idxs, scores = local
 
         if a2a_merge:
             # Stage 1. Rank `j` collects every rank's scores for token block
@@ -1833,11 +1904,13 @@ def streamindex_topk_dcp(
             slots = lax.all_gather(slots, dcp_axis_name, axis=0, tiled=True)
             return dcp_sc_compact.pack_owned_winners(slots, idxs, dcp_rank)
 
-        # Stage 1. All-gather the scores; the indices stay home.
+        # Stage 1. All-gather the scores; the indices stay home. Flat, the
+        # gather is rank-major over whole [T * k] lists, which the merge reads
+        # in place.
         scores = lax.all_gather(
-            scores,
+            scores.reshape(-1) if flat_merge else scores,
             dcp_axis_name,
-            axis=1,
+            axis=0 if flat_merge else 1,
             tiled=True,
         )
 
@@ -1849,6 +1922,7 @@ def streamindex_topk_dcp(
             k,
             dcp_rank=dcp_rank,
             dcp_size=dcp_size,
+            rank_major=flat_merge,
         )
 
     replicated = P()

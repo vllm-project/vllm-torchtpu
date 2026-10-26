@@ -116,7 +116,12 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_SPEC_STATIC_VERIFY: bool = True
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
+    TPU_DCP_INDEXER_HIST_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
+    TPU_SC_TOPK_DCP_MERGE_FLAT: bool = False
+    TPU_SC_TOPK_COOP_V2: bool = False
+    TPU_SC_TOPK_COOP_MERGE: bool = False
+    TPU_SC_TOPK_COST_BYTES: int = 0
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
     TPU_STREAMIDX_SMALL_BUCKET_BKVP: int | None = None
     TPU_STREAMIDX_SMALL_BUCKET_TOKENS: int = 64
@@ -837,12 +842,44 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Merge the DCP indexer candidates with an all-to-all over the token axis
     # instead of an all-gather over the candidate axis. Same result.
     "TPU_DCP_INDEXER_A2A_MERGE": env_bool("TPU_DCP_INDEXER_A2A_MERGE", default=False),
+    # Find the DCP indexer's global top-k in each chunk's SparseCore pass by
+    # summing its radix histograms over the ranks, instead of a local top-k,
+    # a candidate exchange and a merge, on the buckets that would take the
+    # all-to-all merge (TPU_DCP_INDEXER_A2A_MIN_TOKENS). Decode-sized buckets
+    # keep the all-gather merge: there the exchange rounds' latency outweighs
+    # the merge they save.
+    "TPU_DCP_INDEXER_HIST_MERGE": env_bool("TPU_DCP_INDEXER_HIST_MERGE", default=False),
     # Smallest padded token bucket that takes the all-to-all merge when
     # TPU_DCP_INDEXER_A2A_MERGE is on. The bucket is static, so each compiled
     # variant picks one merge with no runtime cost.
     "TPU_DCP_INDEXER_A2A_MIN_TOKENS": env_nonnegative_int(
         "TPU_DCP_INDEXER_A2A_MIN_TOKENS", 64
     ),
+    # DCP indexer top-k, all-gather merge, T <= 32 tokens: all-gather each
+    # rank's candidate scores flat ([T * k] -> [dcp * T * k], rank-major) and
+    # let the SparseCore merge read each row's dcp pieces in place, instead of
+    # gathering [T, dcp * k] and padding it to 32 rows (an XLA pad + relayout
+    # copy of 32 * dcp * k words, plus relayouts of the local slots and the
+    # output slice). T > 32 keeps the padded path. Bitwise identical output.
+    "TPU_SC_TOPK_DCP_MERGE_FLAT": env_bool("TPU_SC_TOPK_DCP_MERGE_FLAT", default=False),
+    # `sparsecore_topk` at P > 1: the refinement levels as one runtime loop
+    # (the SparseCore call's startup grows with its program size), each
+    # level's peer reduce + scan + bucket search as one
+    # loop, and no serial winner gather -- P >= 4 (T <= 8 at the DCP8
+    # decode shapes): each subcore scatters its winners into the group's
+    # staging slot at its prefix offset; P = 2: all peer copies in flight
+    # before the first wait. Single-wave calls only (T <= 16 at DCP8); larger
+    # buckets keep the default path. Bitwise identical output.
+    "TPU_SC_TOPK_COOP_V2": env_bool("TPU_SC_TOPK_COOP_V2", default=False),
+    # With TPU_SC_TOPK_DCP_MERGE_FLAT's flat merge and T <= 16 rows: split each
+    # merge row over p = min(dcp, 32 / T) subcores by rank segment
+    # (`sparsecore_topk.sparsecore_topk_dcp_merge_coop`) instead of one
+    # subcore walking all dcp * k scores; only the subcore holding this rank's
+    # segment emits. T > 16 keeps the one-subcore merge. Bitwise identical.
+    "TPU_SC_TOPK_COOP_MERGE": env_bool("TPU_SC_TOPK_COOP_MERGE", default=False),
+    # bytes_accessed cost hint on decode-sized (b <= 32) SparseCore top-k
+    # kernels, for XLA's latency-hiding scheduler; 0 = none. Same values.
+    "TPU_SC_TOPK_COST_BYTES": env_nonnegative_int("TPU_SC_TOPK_COST_BYTES", 0),
     # MIXED-pass query block for StreamIndex top-k token buckets of at most
     # TPU_STREAMIDX_SMALL_BUCKET_TOKENS. Under MTP every decode request has
     # q_len = gamma + 1 and runs in the MIXED pass, whose default 128-row block

@@ -560,6 +560,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # Chunking cuts the replicated query-token axis, which is orthogonal to
         # the KV axis DCP shards, so the same knob applies here unchanged.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
+        hist_merge = envs.TPU_DCP_INDEXER_HIST_MERGE
         a2a_merge = envs.TPU_DCP_INDEXER_A2A_MERGE
         a2a_min_tokens = envs.TPU_DCP_INDEXER_A2A_MIN_TOKENS
         small_bucket = (
@@ -606,6 +607,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
                 q.shape[0], *small_bucket
             )
+            # The histogram merge, if on, replaces the all-to-all one.
+            large = _dcp_indexer_a2a_for_bucket(q.shape[0], True, a2a_min_tokens)
             local_topk = streamindex_topk_dcp(
                 q,
                 weights,
@@ -623,9 +626,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 num_queries_per_block=queries_per_block,
                 kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
-                a2a_merge=_dcp_indexer_a2a_for_bucket(
-                    q.shape[0], a2a_merge, a2a_min_tokens
-                ),
+                a2a_merge=large and a2a_merge and not hist_merge,
+                hist_merge=large and hist_merge,
             )
             return cache_kv, local_topk
 

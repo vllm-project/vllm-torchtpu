@@ -266,17 +266,19 @@ def _need_devices(dcp_size):
         pytest.skip(f"needs {dcp_size} devices, have {n}")
 
 
-def _dcp_case(dcp_size, seed, compression_ratio=1, interleave_size=1, seq_len=None):
+def _dcp_case(
+    dcp_size, seed, compression_ratio=1, interleave_size=1, seq_len=None, q_len=Q_LEN
+):
     """Records plus the positional args and kwargs of one sharded DCP call.
 
     `seq_len` is in uncompressed tokens and defaults to filling the cache.
     """
     rec = _global_records(KV_LEN)
     kq, kw = jax.random.split(jax.random.key(seed))
-    q = (jax.random.normal(kq, (Q_LEN, H_IDX, D_IDX), jnp.float32) * 0.5).astype(
+    q = (jax.random.normal(kq, (q_len, H_IDX, D_IDX), jnp.float32) * 0.5).astype(
         jnp.float8_e4m3fn
     )
-    weights = jax.random.normal(kw, (Q_LEN, H_IDX), jnp.float32).astype(jnp.bfloat16)
+    weights = jax.random.normal(kw, (q_len, H_IDX), jnp.float32).astype(jnp.bfloat16)
     if seq_len is None:
         seq_len = KV_LEN * compression_ratio
 
@@ -302,7 +304,7 @@ def _dcp_case(dcp_size, seed, compression_ratio=1, interleave_size=1, seq_len=No
         shards,
         jnp.array([seq_len], jnp.int32),
         jnp.arange(vpages, dtype=jnp.int32),
-        jnp.array([0, Q_LEN], jnp.int32),
+        jnp.array([0, q_len], jnp.int32),
         jnp.array([0, 0, 1], jnp.int32),
     )
     kwargs = dict(
@@ -319,13 +321,14 @@ def _dcp_case(dcp_size, seed, compression_ratio=1, interleave_size=1, seq_len=No
 
 @pytest.mark.multichip
 @pytest.mark.parametrize("dcp_size", [2, 4, 8])
-@pytest.mark.parametrize("a2a_merge", [False, True])
-def test_dcp_reassembles_the_unsharded_global_topk(dcp_size, a2a_merge):
+@pytest.mark.parametrize("merge", ["all_gather", "a2a", "hist"])
+def test_dcp_reassembles_the_unsharded_global_topk(dcp_size, merge):
     """Union the per-rank lists back together; it must be the global top-k.
-    Both merge paths; the unsharded reference is all they must agree on."""
+    Every merge path; the unsharded reference is all they must agree on."""
     _need_devices(dcp_size)
     rec, args, kwargs = _dcp_case(dcp_size, 0)
-    kwargs["a2a_merge"] = a2a_merge
+    kwargs["a2a_merge"] = merge == "a2a"
+    kwargs["hist_merge"] = merge == "hist"
     q, weights = args[0], args[1]
 
     pages = KV_LEN // PAGE_SIZE
@@ -467,9 +470,11 @@ def test_all_to_all_round_trip_preserves_token_order(dcp_size):
 @pytest.mark.multichip
 @pytest.mark.parametrize("dcp_size", [2, 4, 8])
 @pytest.mark.parametrize("chunk_tokens", [32, 64, 128])
-def test_dcp_chunking_does_not_change_the_result(chunk_tokens, dcp_size):
+@pytest.mark.parametrize("hist_merge", [False, True])
+def test_dcp_chunking_does_not_change_the_result(chunk_tokens, dcp_size, hist_merge):
     _need_devices(dcp_size)
     _, args, kwargs = _dcp_case(dcp_size, 11)
+    kwargs["hist_merge"] = hist_merge
 
     hlo = streamindex_topk_dcp.lower(
         *args, **kwargs, chunk_tokens=chunk_tokens
@@ -635,3 +640,23 @@ def test_dcp_append_and_topk_match_across_xla_has_and_sal(dcp_size):
 
     np.testing.assert_array_equal(topk_has, topk_xla)
     np.testing.assert_array_equal(topk_sal, topk_xla)
+
+
+# ===================================================================== #
+# TPU_SC_TOPK_DCP_MERGE_FLAT: flat rank-major gather, unpadded merge.
+# ===================================================================== #
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("dcp_size", [2, 4, 8])
+@pytest.mark.parametrize("q_len", [8, 16, 32, 64])
+def test_flat_merge_matches_padded(dcp_size, q_len):
+    """Flag on vs off, byte for byte; q_len 64 (> 32) takes the padded path
+    either way."""
+    _need_devices(dcp_size)
+    _require_sparsecore()
+    _, args, kwargs = _dcp_case(dcp_size, 41, q_len=q_len)
+    want = np.asarray(streamindex_topk_dcp(*args, **kwargs, flat_merge=False))
+    got = np.asarray(streamindex_topk_dcp(*args, **kwargs, flat_merge=True))
+    np.testing.assert_array_equal(got, want)
+    assert (want >= 0).any()
