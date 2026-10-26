@@ -157,6 +157,86 @@ def test_sum_overlap_adds_match_the_serial_sum_bit_for_bit(setup, m, hot):
     np.testing.assert_array_equal(np.asarray(overlapped), np.asarray(serial))
 
 
+@pytest.mark.parametrize("m,hot", [(1024, False), (2048, True), (4096, True)])
+def test_resident_tokens_match_token_windows_bit_for_bit(setup, m, hot):
+    """TPU_MOE_PREFILL_ROW_TOKENS_RESIDENT_MAX_TOKENS: the stage-A build that reads each
+    route's token from the token table resident in SMEM returns exactly what the
+    build that copies a window of the table before every tile returns."""
+    weights, mesh = setup
+    x = jax.random.normal(jax.random.key(m + 3), (m, H)).astype(jnp.bfloat16)
+    tw, ti = _routing(m, m + 3, hot)
+
+    def body(**kw):
+        def f(x, tw, ti, *w):
+            w1, w2, w1s, w2s, sw1, sw1s, sw2, sw2s = w
+            return v2.fused_moe_prefill(
+                x,
+                w1,
+                w2,
+                w1s,
+                w2s,
+                sw1,
+                sw1s,
+                sw2,
+                sw2s,
+                None,
+                tw,
+                ti,
+                axis_name="d",
+                routed_scale=ROUTED_SCALE,
+                **v2.STAGE_A,
+                **kw,
+            )
+
+        return f
+
+    ref = _run(mesh, body(), x, tw, ti, *weights)
+    got = _run(mesh, body(row_tokens_resident_max_tokens=m), x, tw, ti, *weights)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
+
+
+@pytest.mark.parametrize("m,hot", [(1024, True), (2048, True), (4096, True)])
+def test_resident_tokens_beside_the_in_kernel_sum_bit_for_bit(setup, m, hot):
+    """The in-kernel sum up to 1024 tokens with overlapped adds and 128-row tiles up
+    to 4096 tokens, with and without the resident token table up to 4096 tokens: the
+    one-pass build already reads every token from its resident table and is the same
+    build, and the slab builds above it read the resident table; each output is the
+    one without the resident switch, bit for bit."""
+    weights, mesh = setup
+    x = jax.random.normal(jax.random.key(m + 4), (m, H)).astype(jnp.bfloat16)
+    tw, ti = _routing(m, m + 4, hot)
+
+    def body(**kw):
+        def f(x, tw, ti, *w):
+            w1, w2, w1s, w2s, sw1, sw1s, sw2, sw2s = w
+            return v2.fused_moe_prefill(
+                x,
+                w1,
+                w2,
+                w1s,
+                w2s,
+                sw1,
+                sw1s,
+                sw2,
+                sw2s,
+                None,
+                tw,
+                ti,
+                axis_name="d",
+                routed_scale=ROUTED_SCALE,
+                **dict(v2.STAGE_A, tile_min=8192),
+                sum_in_kernel_max_tokens=1024,
+                sum_overlap_adds=True,
+                **kw,
+            )
+
+        return f
+
+    ref = _run(mesh, body(), x, tw, ti, *weights)
+    got = _run(mesh, body(row_tokens_resident_max_tokens=4096), x, tw, ti, *weights)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
+
+
 @pytest.mark.parametrize("m", [512, 4096])
 def test_norm_quant_moe_feeds_stage_a_bit_for_bit(setup, m):
     """TPU_FUSED_ADD_RMSNORM_QUANT_MOE: the norm's (x_q, x_scale) are the

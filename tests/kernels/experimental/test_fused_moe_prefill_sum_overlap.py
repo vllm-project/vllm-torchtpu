@@ -12,7 +12,11 @@ while its staging slot still holds it, before the shared expert's tile writes it
 token; padding rows only ever go to the spare row past the tokens. The replay is
 shown to catch a missing loop, a read of the tile's own slot, a skipped row and a
 carry through the shared tiles. In Pallas interpret mode the overlapped build
-returns the serial build's output bit for bit."""
+returns the serial build's output bit for bit.
+
+TPU_MOE_PREFILL_ROW_TOKENS_RESIDENT_MAX_TOKENS, also in interpret mode: the slab
+build that reads each route's token from the resident table matches the window
+build bit for bit, and beside the overlapped sum it changes nothing."""
 
 import functools
 
@@ -185,13 +189,12 @@ def interpret(monkeypatch):
     v2.build_combine.cache_clear()
 
 
-def test_overlapped_adds_match_the_serial_sum_bit_for_bit(interpret):
-    """Pallas interpret mode with down="dot" (no CPU lowering for the explicit MXU's
-    pair pack, so h has an odd number of lane blocks). One expert in every token and
-    another in the first third: multi-tile visits, short tails before full tiles,
-    full tiles before short ones, dropped routes and three shared tiles."""
-    tokens, h, experts, inter, topk = 384, 640, 8, 128, 4
-    assert v2.sum_columns(tokens, h, inter, inter) == h
+def _stage_a_runner(tokens=384, h=640, experts=8, inter=128, topk=4):
+    """The op in Pallas interpret mode with down="dot" (no CPU lowering for the
+    explicit MXU's pair pack, so h has an odd number of lane blocks), loop issue and
+    128-row tiles. One expert in every token and another in the first third:
+    multi-tile visits, short tails before full tiles, full tiles before short ones,
+    dropped routes and three shared tiles."""
     f8 = jnp.float8_e4m3fn
     ks = jax.random.split(jax.random.key(0), 10)
     x = jax.random.normal(ks[0], (tokens, h)).astype(jnp.bfloat16)
@@ -235,9 +238,50 @@ def test_overlapped_adds_match_the_serial_sum_bit_for_bit(interpret):
         args = jax.device_put(args, cpu)
         return np.asarray(jax.jit(g)(*args).astype(jnp.float32))
 
+    return run
+
+
+def test_overlapped_adds_match_the_serial_sum_bit_for_bit(interpret):
+    tokens = 384
+    assert v2.sum_columns(tokens, 640, 128, 128) == 640
+    run = _stage_a_runner(tokens)
     serial = run(sum_in_kernel_max_tokens=tokens)
     overlapped = run(sum_in_kernel_max_tokens=tokens, sum_overlap_adds=True)
     np.testing.assert_array_equal(overlapped.view(np.uint32), serial.view(np.uint32))
     slab = run()
     rel = np.linalg.norm(overlapped - slab) / np.linalg.norm(slab)
     assert 0 < rel < 1e-2, rel
+
+
+def test_resident_tokens_match_token_windows_beside_the_sum(interpret, monkeypatch):
+    """TPU_MOE_PREFILL_ROW_TOKENS_RESIDENT_MAX_TOKENS: the slab build that reads each
+    route's token from the resident table returns the window build's output bit for
+    bit; beside the overlapped in-kernel sum, whose build keeps the table resident
+    already, the op builds the same kernel and returns the same output."""
+    tokens = 384
+    run = _stage_a_runner(tokens)
+    names = []
+    pallas_call = pl.pallas_call
+
+    def named(*args, **kwargs):
+        names.append(kwargs.get("name", ""))
+        return pallas_call(*args, **kwargs)
+
+    monkeypatch.setattr(pl, "pallas_call", named)
+
+    def built(**kw):
+        v2.build_expert_kernel.cache_clear()
+        names.clear()
+        out = run(**kw)
+        return out, [n for n in names if n.startswith("fused_moe_prefill-")]
+
+    windows, windows_names = built()
+    resident, resident_names = built(row_tokens_resident_max_tokens=tokens)
+    assert windows_names[0].endswith("-loop") and resident_names[0].endswith("-loop-rt")
+    np.testing.assert_array_equal(resident.view(np.uint32), windows.view(np.uint32))
+
+    summed = dict(sum_in_kernel_max_tokens=tokens, sum_overlap_adds=True)
+    alone, alone_names = built(**summed)
+    both, both_names = built(**summed, row_tokens_resident_max_tokens=tokens)
+    assert alone_names == both_names and both_names[0].endswith("-sumk-pipe")
+    np.testing.assert_array_equal(both.view(np.uint32), alone.view(np.uint32))

@@ -52,6 +52,14 @@ slots. Build arguments (the per-row default build's value first):
             free, instead of in a loop after the tile (False). A routed tile stages its
             rows in the slot of its parity and reads its predecessor's from the other,
             so the two never alias; the shared expert's tiles use slot 0.
+  row_tokens_resident_max_tokens
+            largest token count at which loop issue keeps the token table resident
+            in SMEM (scalar prefetch), as inline issue does, and reads each route's
+            token from it (0). Below it the per-tile token-window DMA, its wait and
+            the fence after the wait are gone; the same tokens feed the same row
+            DMAs. The table takes 4 bytes per route: 132.6 KB at 4096 tokens, top-8.
+            The in-kernel sum builds keep the table resident already; the op
+            passes it only to the builds that write the slab.
 
 Explicit-MXU forms follow jax tests/pallas/tpu_pallas_test.py ExplicitMXUTest (jax
 0.11.2 ref form). The measurements behind each setting are in the t4-moe-prefill
@@ -264,6 +272,7 @@ def build_expert_kernel(
     rung_rows=None,
     sum_cols=0,
     overlap_adds=False,
+    resident_tokens=False,
 ):
     assert down in ("dot", "xmxu") and issue in ("loop", "inline")
     assert not (issue == "inline" and down != "xmxu"), (
@@ -277,7 +286,7 @@ def build_expert_kernel(
         "the shared expert writes the output in whole tiles"
     )
     inline = issue == "inline"
-    resident = inline or sum_in_kernel
+    resident = inline or sum_in_kernel or resident_tokens
     n_act = _LOOKAHEAD + 1
     window = tile_rows + _LANES
     scale_window = tile_rows // _LANES + 1
@@ -493,7 +502,7 @@ def build_expert_kernel(
         def tile_live(v, t):
             return jnp.minimum(visit_rows[v] - t * tile_rows, tile_rows)
 
-        # ---- token-number windows (loop issue only) ----
+        # ---- token-number windows (loop issue without the resident table) ----
         def window_copy(start, slot):
             assert row_token_hbm is not None
             assert token_window is not None and window_sems is not None
@@ -1395,6 +1404,8 @@ def build_expert_kernel(
         ]
         out_shape = (tokens, h)
         tag += f"-sumk{slices}"
+    if resident_tokens and not inline and not sum_in_kernel:
+        tag += "-rt"
     call = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -1611,6 +1622,7 @@ def fused_moe_prefill(
     tall_rung_rows=None,
     sum_in_kernel_max_tokens=0,
     sum_overlap_adds=False,
+    row_tokens_resident_max_tokens=0,
 ):
     """fused_moe_prefill_kernel.fused_moe_prefill's op with per-row activation
     scales and the stage-A levers as arguments (the defaults are the per-row
@@ -1619,7 +1631,11 @@ def fused_moe_prefill(
     bit for bit. Up to sum_in_kernel_max_tokens tokens (in whole tiles) the
     expert kernel applies the routing weights and sums each token's rows itself,
     and no slab or combine kernel is built; with sum_overlap_adds the one-pass
-    build adds each tile's rows beside the next tile's gate/up matmuls."""
+    build adds each tile's rows beside the next tile's gate/up matmuls. Up to
+    row_tokens_resident_max_tokens tokens a build that writes the slab reads
+    each route's token from the token table resident in SMEM instead of from a
+    copied window of it: the same row DMAs, the same output (the in-kernel sum
+    builds read it from SMEM already)."""
     if x_q is None:
         tokens, h = x.shape
     else:
@@ -1655,6 +1671,10 @@ def fused_moe_prefill(
     sum_cols = 0
     if tokens <= sum_in_kernel_max_tokens and tokens % tile_rows == 0:
         sum_cols = sum_columns(tokens, h, two_i // 2, i_s)
+    # The in-kernel sum builds keep the token table resident on their own.
+    resident_tokens = (
+        issue == "loop" and not sum_cols and tokens <= row_tokens_resident_max_tokens
+    )
     call, scale_rows, token_rows = build_expert_kernel(
         experts=experts,
         h=h,
@@ -1671,6 +1691,7 @@ def fused_moe_prefill(
         rung_rows=tall_rung_rows if tile_rows > 128 else None,
         sum_cols=sum_cols,
         overlap_adds=sum_overlap_adds and sum_cols == h,
+        resident_tokens=resident_tokens,
     )
     if x_q is None:
         x_q, x_scale = _quantize_rows(x, weight_dtype)
@@ -1728,7 +1749,7 @@ def fused_moe_prefill(
     elif sum_cols:
         row_coeff = jnp.pad(row_coeff, (0, token_rows - row_coeff.shape[0]))
         args += [row_token, row_coeff, x_q, row_scale.reshape(-1, _LANES)]
-    elif issue == "inline":
+    elif issue == "inline" or resident_tokens:
         args += [row_token, x_q, row_scale.reshape(-1, _LANES)]
     else:
         args += [x_q, row_scale.reshape(-1, _LANES), row_token]
@@ -1760,11 +1781,14 @@ def fused_moe_prefill_stage_a(*args, **kwargs):
     """FUSED_MOE_PREFILL_KERNEL_V2: `fused_moe_prefill` at STAGE_A, with the
     same arguments as fused_moe_prefill_kernel.fused_moe_prefill, summing each
     token's expert rows in the kernel up to
-    TPU_MOE_PREFILL_SUM_IN_KERNEL_MAX_TOKENS tokens."""
+    TPU_MOE_PREFILL_SUM_IN_KERNEL_MAX_TOKENS tokens and keeping the token table
+    resident in SMEM up to TPU_MOE_PREFILL_ROW_TOKENS_RESIDENT_MAX_TOKENS
+    tokens."""
     return fused_moe_prefill(
         *args,
         **kwargs,
         **dict(STAGE_A, tile_min=envs.TPU_MOE_PREFILL_TILE_MIN or STAGE_A["tile_min"]),
         sum_in_kernel_max_tokens=envs.TPU_MOE_PREFILL_SUM_IN_KERNEL_MAX_TOKENS,
         sum_overlap_adds=envs.TPU_MOE_PREFILL_SUM_IN_KERNEL_OVERLAP_ADDS,
+        row_tokens_resident_max_tokens=envs.TPU_MOE_PREFILL_ROW_TOKENS_RESIDENT_MAX_TOKENS,
     )
