@@ -127,6 +127,7 @@ steps:
         tests/kernels/test_dsv41_decode_index_scores.py
         tests/models/vllm/test_dsv41_decode_indexer_route.py
         tests/models/vllm/test_csa2_chunk_cache.py
+        tests/models/vllm/test_native_swa_manager.py
         tests/compilation/test_moe_schedule.py
         tests/kernels/deepseek_v41/test_csa2_prefill.py
         -q --junitxml=/perf_eval_results/dsv41-kernel-config.xml

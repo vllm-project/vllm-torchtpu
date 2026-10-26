@@ -2,25 +2,18 @@
 
 import math
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import Any, Protocol, cast
 
 import jax
-import numpy as np
 import torch
 from vllm.v1.core.kv_cache_utils import unify_kv_cache_spec_page_size
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec, SlidingWindowSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
 from vllm.v1.worker.utils import allocate_kv_cache as allocate_upstream_kv_cache
 
 from vllm_torchtpu.kernels.deepseek_v4.csa_cache_layout import ROW_WORDS
 from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout
 
-if TYPE_CHECKING:
-    from vllm.config import VllmConfig
-    from vllm.v1.kv_cache_interface import KVCacheConfig
-
-    from vllm_torchtpu.layers.core.attention_metadata import (
-        AttentionMetadataBuilderContext,
-    )
+from .swa_cache import CompactSWASpec, NativeSWASpec, native_swa_reservation
 
 ROW_BYTES = ROW_WORDS * 4
 # DSV4 FP8 NoPE record: 448 e4m3 values, then one e8m0 scale per lane of a
@@ -133,194 +126,8 @@ def budget_native_swa(
     }
 
 
-class NativeSWAWindow:
-    """Compact physical pages shared by layers with the same window geometry."""
-
-    def __init__(self, spec: SlidingWindowSpec, config: "VllmConfig") -> None:
-        self.spec = replace(
-            spec, extra_retained_tokens=max(0, config.num_prefill_lookahead_tokens - 1)
-        )
-        spec = self.spec
-        self.rollback = (
-            config.num_speculative_tokens * config.max_concurrent_batches
-            + config.num_prefill_lookahead_tokens
-        )
-        retained = spec.sliding_window - 1 + spec.extra_retained_tokens + self.rollback
-        self.capacity = (
-            1
-            + config.scheduler_config.max_num_seqs
-            * (math.ceil(retained / spec.block_size) + 2)
-            + math.ceil(config.max_in_flight_tokens / spec.block_size)
-        )
-        self.reset()
-
-    def reset(self) -> None:
-        self.free = list(range(self.capacity - 1, 0, -1))
-        self.requests: dict[str, dict[int, int]] = {}
-        self.keep_from: dict[str, int] = {}
-        self.table: Any = None
-        self.row_pages: dict[int, dict[int, int]] = {}
-
-    def advance(self, invalidated: set[str]) -> None:
-        for req_id in list(self.requests):
-            pages = self.requests[req_id]
-            first = self.keep_from[req_id]
-            for column in list(pages):
-                if req_id in invalidated or column < first:
-                    self.free.append(pages.pop(column))
-            if req_id in invalidated:
-                del self.requests[req_id]
-                del self.keep_from[req_id]
-
-    def map_request(
-        self, req_id: str, start: int, end: int, replay: int
-    ) -> dict[int, int]:
-        size = self.spec.block_size
-        first = (
-            max(
-                0,
-                replay,
-                start - self.spec.sliding_window + 1 - self.spec.extra_retained_tokens,
-            )
-            // size
-        )
-        last = math.ceil(end / size)
-        pages = self.requests.get(req_id, {})
-        missing = [column for column in range(first, last) if column not in pages]
-        if len(missing) > len(self.free):
-            raise RuntimeError("Compact SWA page budget exhausted")
-        if req_id in self.requests and any(
-            column < start // size for column in missing
-        ):
-            raise RuntimeError("Compact SWA lost a retained window page")
-        self.requests[req_id] = pages
-        for column in missing:
-            pages[column] = self.free.pop()
-        self.keep_from[req_id] = (
-            max(
-                0,
-                end
-                - self.rollback
-                - self.spec.sliding_window
-                + 1
-                - self.spec.extra_retained_tokens,
-            )
-            // size
-        )
-        # CPU positions include drafts whose rejection is applied on device.
-        # Keep rollback pages addressable until advance() releases them; slicing
-        # at the optimistic start would hide valid history across a page boundary.
-        return dict(pages)
-
-
-class NativeSWACache:
-    """Reserve and address live SWA windows independently of global KV IDs."""
-
-    def __init__(
-        self,
-        specs: dict[str, KVCacheSpec],
-        layers: frozenset[str],
-        config: "VllmConfig",
-    ) -> None:
-        self.windows: dict[tuple, NativeSWAWindow] = {}
-        self.layers: dict[str, NativeSWAWindow] = {}
-        for name in layers.intersection(specs):
-            spec = specs[name]
-            if not isinstance(spec, SlidingWindowSpec):
-                raise ValueError("Compact native SWA requires a sliding-window spec")
-            if config.cache_config.enable_prefix_caching and spec.prefix_cacheable:
-                raise ValueError("Compact native SWA requires bounded prefix replay")
-            key = (spec.block_size, spec.sliding_window, spec.extra_retained_tokens)
-            if key not in self.windows:
-                self.windows[key] = NativeSWAWindow(spec, config)
-            self.layers[name] = self.windows[key]
-        self.group_tables: dict[int, Any] = {}
-        self.reserve_bytes = sum(
-            window.capacity * window.spec.unpadded_page_size_bytes
-            for window in self.layers.values()
-        )
-
-    def initialize(self, runner: Any, cache_config: "KVCacheConfig") -> None:
-        from vllm.v1.worker.block_table import BlockTable
-
-        from vllm_torchtpu.layers.core.block_table_delta import ensure_tracked
-
-        self.group_tables = {}
-        for window in self.windows.values():
-            window.reset()
-        for gid, group in enumerate(cache_config.kv_cache_groups):
-            names = set(group.layer_names).intersection(self.layers)
-            if not names:
-                continue
-            if names != set(group.layer_names):
-                raise ValueError(
-                    "Compact SWA and word-cache layers share a metadata group"
-                )
-            window = self.layers[next(iter(names))]
-            if any(self.layers[name] is not window for name in names):
-                raise ValueError(
-                    "Compact SWA metadata group has mixed window geometries"
-                )
-            source = runner.input_batch.block_table[gid]
-            if source.block_size != window.spec.block_size:
-                raise ValueError("Compact SWA requires unsplit scheduler pages")
-            if window.table is None:
-                window.table = BlockTable(
-                    block_size=source.block_size,
-                    max_num_reqs=source.max_num_reqs,
-                    max_num_blocks_per_req=source.max_num_blocks_per_req,
-                    max_num_batched_tokens=source.max_num_batched_tokens,
-                    pin_memory=False,
-                    device=torch.device("cpu"),
-                    kernel_block_size=source.block_size,
-                    cp_kv_cache_interleave_size=1,
-                )
-                ensure_tracked(window.table)
-            self.group_tables[gid] = window.table
-
-    def advance(self, invalidated: set[str]) -> None:
-        for window in self.windows.values():
-            window.advance(invalidated)
-
-    def prepare(self, runner: Any, ctx: "AttentionMetadataBuilderContext") -> None:
-        if ctx.position_ids_override is not None:
-            return
-        assert ctx.query_start_loc_cpu is not None and ctx.seq_lens_cpu is not None
-        for window in self.windows.values():
-            table = window.table
-            assert table is not None
-            array = table.get_numpy_array()
-            for offset in range(ctx.num_reqs):
-                row = ctx.start_index + offset
-                req_id = runner.input_batch.req_ids[row]
-                if req_id is None:
-                    continue
-                end = ctx.seq_lens_cpu[offset]
-                count = (
-                    ctx.query_start_loc_cpu[offset + 1]
-                    - ctx.query_start_loc_cpu[offset]
-                )
-                if not count:
-                    continue
-                replay = (
-                    0
-                    if ctx.replay_starts_cpu is None
-                    else ctx.replay_starts_cpu[offset]
-                )
-                pages = window.map_request(req_id, end - count, end, replay)
-                columns = np.fromiter(pages, dtype=np.int64)
-                values = np.fromiter(pages.values(), dtype=np.int32)
-                previous = window.row_pages.get(row, {})
-                if previous != pages:
-                    array[row, list(previous)] = 0
-                    array[row, columns] = values
-                    table.num_blocks_per_row[row] = math.ceil(end / table.block_size)
-                    table._rewrote(row)
-                    window.row_pages[row] = pages
-
-
 def _materialize_native_swa(
-    config, device, views, swa_layers, csa2_layers, compact_swa
+    config, device, views, swa_specs, csa2_layers
 ) -> MaterializedNativeKVCache:
     """Split each allocator region into typed owners without unbudgeted HBM."""
     from vllm_torchtpu.kv_cache_materializer import layer_to_pool_index
@@ -328,6 +135,7 @@ def _materialize_native_swa(
     fp8_layers = {name for name, view in views.items() if view.dtype == torch.uint8}
     if csa2_layers.intersection(views) != fp8_layers:
         raise ValueError("Native SWA allocation requires CSA2 for all FP8 consumers")
+    swa_layers = set(swa_specs)
     regions = layer_to_pool_index(config)
     groups: dict[tuple, list[str]] = {}
     for name, view in views.items():
@@ -335,7 +143,12 @@ def _materialize_native_swa(
             raise ValueError("Native cache requires [blocks,1,page_size,features]")
         geometry = tuple(view.shape[2:]) if name in swa_layers else None
         groups.setdefault(
-            (name if geometry is not None and compact_swa else regions[name], geometry),
+            (
+                name
+                if isinstance(swa_specs.get(name), CompactSWASpec)
+                else regions[name],
+                geometry,
+            ),
             [],
         ).append(name)
     result = MaterializedNativeKVCache({}, [])
@@ -350,9 +163,10 @@ def _materialize_native_swa(
                 raise ValueError("Native SWA requires BF16 [pages,page_size,512]")
         elif page_bytes % ROW_BYTES:
             raise ValueError("Native word pool pages must align to 512 bytes")
+        swa_spec = swa_specs.get(names[0])
         num_blocks = (
-            compact_swa.layers[names[0]].capacity
-            if geometry is not None and compact_swa is not None
+            swa_spec.pool_capacity
+            if isinstance(swa_spec, CompactSWASpec)
             else config.num_blocks
         )
         blocks_per_bank = SPARSECORE_MAX_POOL_BYTES // page_bytes
@@ -408,8 +222,7 @@ def _materialize_native_swa(
         for bank in (raw if isinstance(raw, tuple) else (raw,))
     }
     budget = max(tensor.size for tensor in config.kv_cache_tensors)
-    if compact_swa is not None:
-        budget += compact_swa.reserve_bytes
+    budget += native_swa_reservation(swa_specs)
     if sum(bank.nbytes for bank in owners.values()) > budget:
         raise ValueError(
             "Native SWA owners exceed budget; apply budget_native_swa first"
@@ -424,8 +237,6 @@ def materialize_upstream_kv_cache(
     *,
     word_rows=False,
     csa2_layers: frozenset[str] = frozenset(),
-    native_swa_layers: frozenset[str] = frozenset(),
-    compact_swa: NativeSWACache | None = None,
 ) -> MaterializedNativeKVCache:
     """Keep upstream placements, with one TPU input per shared physical region."""
     from vllm_torchtpu.kv_cache_materializer import layer_to_pool_index
@@ -433,9 +244,15 @@ def materialize_upstream_kv_cache(
     views = allocate_upstream_kv_cache(kv_cache_config, torch.device("meta"), layout)
     if not views:
         return MaterializedNativeKVCache({}, [])
-    if native_swa_layers.intersection(views):
+    swa_specs = {
+        name: group.kv_cache_spec
+        for group in kv_cache_config.kv_cache_groups
+        if isinstance(group.kv_cache_spec, NativeSWASpec)
+        for name in group.layer_names
+    }
+    if swa_specs:
         return _materialize_native_swa(
-            kv_cache_config, device, views, native_swa_layers, csa2_layers, compact_swa
+            kv_cache_config, device, views, swa_specs, csa2_layers
         )
     sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
     assert len(sizes) == 1

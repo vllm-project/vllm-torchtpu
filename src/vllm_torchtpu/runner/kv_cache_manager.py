@@ -73,6 +73,10 @@ from vllm_torchtpu.layers.adapter.attention import (
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilder
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.swa_cache import (
+    CompactSWASpec,
+    NativeSWASpec,
+)
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
@@ -180,7 +184,6 @@ class KVCacheManager:
     def __init__(self, runner: TPUModelRunner) -> None:
         self.runner = runner
         self.ds_v4 = DsV4KVCacheAllocator(runner)
-        self.native_swa_cache = None
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
@@ -398,29 +401,24 @@ class KVCacheManager:
         )
         native_swa_layers = frozenset(
             name
-            for name, module in (
-                self.runner.vllm_config.compilation_config.static_forward_context.items()
-            )
-            if getattr(module, "_tpu_native_swa", False) is True
+            for name, spec in kv_cache_spec.items()
+            if isinstance(spec, NativeSWASpec)
         )
         if native_swa_layers:
             from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
-                NativeSWACache,
                 budget_native_swa,
             )
 
-            if self.runner.cache_config.enable_prefix_caching and any(
-                kv_cache_spec[name].prefix_cacheable for name in native_swa_layers
-            ):
-                # Prefix-retained SWA pages outlive active requests. Keep their
-                # scheduler address space unless bounded replay is enabled.
-                self.native_swa_cache = None
-                kv_cache_spec = budget_native_swa(kv_cache_spec, native_swa_layers)
-            else:
-                kv_cache_spec = unify_kv_cache_spec_page_size(kv_cache_spec)
-                self.native_swa_cache = NativeSWACache(
-                    kv_cache_spec, native_swa_layers, self.runner.vllm_config
-                )
+            retained_swa = frozenset(
+                name
+                for name in native_swa_layers
+                if not isinstance(kv_cache_spec[name], CompactSWASpec)
+            )
+            kv_cache_spec = (
+                budget_native_swa(kv_cache_spec, retained_swa)
+                if retained_swa
+                else unify_kv_cache_spec_page_size(kv_cache_spec)
+            )
         if (
             hma_enabled
             and has_attention
@@ -1338,8 +1336,6 @@ class KVCacheManager:
         ]
 
         self.runner.may_reinitialize_input_batch(kv_cache_config, block_sizes)
-        if self.native_swa_cache is not None:
-            self.native_swa_cache.initialize(self.runner, kv_cache_config)
 
         # Populate self.attn_groups directly with a single shared TPU builder
         # per group; bypasses parent's initialize_attn_backend (per-backend
@@ -1354,11 +1350,6 @@ class KVCacheManager:
                 self.runner.device,
                 runner=self.runner,
                 kv_cache_group_id=gid,
-                block_table=(
-                    self.native_swa_cache.group_tables.get(gid)
-                    if self.native_swa_cache is not None
-                    else None
-                ),
             )
             self.runner.attn_groups.append(
                 [
@@ -1419,14 +1410,6 @@ class KVCacheManager:
                     self.runner.device,
                     self.runner.cache_config.get_resolved_kv_cache_layout(),
                     word_rows=True,
-                    compact_swa=self.native_swa_cache,
-                    native_swa_layers=frozenset(
-                        name
-                        for name, module in (
-                            self.runner.vllm_config.compilation_config.static_forward_context.items()  # noqa: E501
-                        )
-                        if getattr(module, "_tpu_native_swa", False) is True
-                    ),
                     csa2_layers=frozenset(
                         name
                         for name, module in (
@@ -1795,14 +1778,11 @@ class KVCacheManager:
                 kv_cache_config.kv_cache_tensors,
                 kv_cache_config.num_blocks,
                 _per_layer_spec,
-                physical_block_counts=(
-                    {
-                        name: window.capacity
-                        for name, window in self.native_swa_cache.layers.items()
-                    }
-                    if self.native_swa_cache is not None
-                    else None
-                ),
+                physical_block_counts={
+                    name: spec.pool_capacity
+                    for name, spec in layer_name_to_spec.items()
+                    if isinstance(spec, CompactSWASpec)
+                },
             )
 
         # Use tpu_bind_kv_cache to bind KV caches to attention layers using layer names

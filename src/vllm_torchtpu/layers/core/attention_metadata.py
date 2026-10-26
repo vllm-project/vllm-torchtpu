@@ -240,12 +240,10 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         device,
         runner,
         kv_cache_group_id,
-        block_table=None,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.runner = runner
         self.kv_cache_group_id = kv_cache_group_id
-        self.block_table = block_table
         self.is_mamba_group = isinstance(kv_cache_spec, MambaSpec)
         self.target_block_size = self.kv_cache_spec.block_size
         if self.is_mamba_group:
@@ -257,17 +255,12 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         # Only mamba/GDN layers consume physical state slot ids; attention
         # groups leave AttentionMetadata.mamba_state_indices None.
 
-        block_table_obj = self._source_block_table()
+        block_table_obj = runner.input_batch.block_table[self.kv_cache_group_id]
         self.block_tables_cpu = torch.zeros(
             (runner.max_num_reqs, block_table_obj.max_num_blocks_per_req),
             dtype=torch.int32,
             device="cpu",
         )
-
-    def _source_block_table(self):
-        if self.block_table is not None:
-            return self.block_table
-        return self.runner.input_batch.block_table[self.kv_cache_group_id]
 
     def _mamba_row_plan(
         self, ctx: AttentionMetadataBuilderContext, target_num_blocks: int
@@ -323,7 +316,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         rows with exactly the width the group's build() will slice back out.
         """
         runner = self.runner
-        block_table_obj = self._source_block_table()
+        block_table_obj = runner.input_batch.block_table[self.kv_cache_group_id]
         if ctx.use_max_model_len:
             target_num_blocks = block_table_obj.max_num_blocks_per_req
         else:

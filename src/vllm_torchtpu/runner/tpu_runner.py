@@ -1535,9 +1535,6 @@ class TPUModelRunner(GPUModelRunner):
         )
 
         if ctx.staged_block_tables is None:
-            compact = self.kv_cache_manager.native_swa_cache
-            if compact is not None:
-                compact.prepare(self, ctx)
             # One batched H2D for every group's block table (zero-filled for
             # dummy runs); see `stage_block_table_uploads`.
             stage_block_table_uploads(self, ctx, effective_num_reqs_padded)
@@ -2496,9 +2493,6 @@ class TPUModelRunner(GPUModelRunner):
             | (scheduler_output.preempted_req_ids or set())
             | scheduler_output.scheduled_cached_reqs.resumed_req_ids
         )
-        compact = self.kv_cache_manager.native_swa_cache
-        if compact is not None:
-            compact.advance(invalidated_req_ids)
         for req_id in invalidated_req_ids:
             self._mamba_state_pos.pop(req_id, None)
             self._replay_starts.pop(req_id, None)
