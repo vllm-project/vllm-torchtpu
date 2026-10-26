@@ -351,7 +351,10 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             npr = self._shard_rows(ex)[0] if self.shard_index else nreq
 
             def req(q: Any, carry: Any) -> Any:
-                ck, gc = self._new_group(ctx, l, q, jax.lax.dynamic_slice_in_dim(raw, q * T, T))
+                # `qc_ir` holds `raw` (BF16-valued: exact); a traced slice of a value does not
+                # lower on TPU (Pallas: no dynamic_slice), a ref read does.
+                raw_q = scr["qc_ir"][pl.ds(q * T, T)].astype(F32)
+                ck, gc = self._new_group(ctx, l, q, raw_q)
 
                 def own() -> None:
                     qr = scr["qi_q"][q].astype(BF16)

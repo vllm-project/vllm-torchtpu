@@ -37,8 +37,12 @@ from ..ops import BF16, F32, I32
 GROUPS_PER_TILE = TILE // MICRO  # one group = one micro-page of 4 tokens
 
 
+UNION_CHUNK = 512  # output slots compacted per pass (bounds the [slots, S] temporaries)
+
+
 def union_consts(S: int, KU: int) -> tuple:
-    """Constants of `compact_union` (the `compact_consts` set at union width `KU`)."""
+    """Constants of `compact_union` (`compact_consts` at the per-pass slot width)."""
+    W = min(KU, UNION_CHUNK)
     li = jax.lax.broadcasted_iota(I32, (128, 128), 0)
     lj = jax.lax.broadcasted_iota(I32, (128, 128), 1)
     si = jax.lax.broadcasted_iota(I32, (S, S), 0)
@@ -46,9 +50,9 @@ def union_consts(S: int, KU: int) -> tuple:
     return (
         (li <= lj).astype(BF16),
         (si < sj).astype(BF16),
-        jax.lax.broadcasted_iota(I32, (KU, 1), 0),
+        jax.lax.broadcasted_iota(I32, (W, 1), 0),
         jax.lax.broadcasted_iota(I32, (1, S), 1),
-        jax.lax.broadcasted_iota(I32, (KU, 128), 1),
+        jax.lax.broadcasted_iota(I32, (W, 128), 1),
     )
 
 
@@ -57,33 +61,39 @@ def compact_union(code: jax.Array, KU: int, consts: tuple) -> tuple[jax.Array, j
     codes (slots past the count: 0) and the count `[1, 1]`.
 
     `code [S, 128]` int32 (lane = group id, value = row bits < 2^T). The compaction of
-    `indexer.compact_row` with every coded lane selected; each slot's code is gathered from its
-    group's sublane row by the same one-hot matmul (codes <= 15 are exact in BF16).
+    `indexer.compact_row` with every coded lane selected, `UNION_CHUNK` output slots per pass
+    (the `[slots, S]` one-hot temporaries of all `KU` slots at once overflow VMEM: 62.8 of 62.1
+    MiB at 16 rows, j-c89e9978); each slot's code is gathered from its group's sublane row by the
+    same one-hot matmul (codes <= 15 are exact in BF16).
     """
-    U, Us, jcol, srow, lane = consts
-    S = code.shape[0]
+    U, Us, jcol0, srow, lane = consts
+    S, W = code.shape[0], jcol0.shape[0]
     sel = code > 0
     P = jnp.dot(sel.astype(F32).astype(BF16), U, preferred_element_type=F32)
     c_row = jnp.transpose(jnp.broadcast_to(P[:, 127:128], (S, 128)))[0:1, :]
     O_row = jnp.dot(c_row.astype(BF16), Us, preferred_element_type=F32)
     E_row = O_row + c_row
-    jf = jcol.astype(F32)
-    r_j = jnp.sum((E_row <= jf).astype(I32), axis=1, keepdims=True)
-    oh = (srow == r_j).astype(F32).astype(BF16)
-    Pg = jnp.dot(oh, P.astype(BF16), preferred_element_type=F32)
-    O_rj = jnp.sum(jnp.where(srow == r_j, O_row, 0.0), axis=1, keepdims=True)
-    lane_j = jnp.sum((Pg <= jf - O_rj).astype(I32), axis=1, keepdims=True)
-    Cg = jnp.dot(oh, code.astype(F32).astype(BF16), preferred_element_type=F32)
-    code_j = jnp.sum(jnp.where(lane == lane_j, Cg, 0.0), axis=1, keepdims=True)
+    Pb, codeb = P.astype(BF16), code.astype(F32).astype(BF16)
     n = jnp.sum(sel.astype(I32), axis=(0, 1), keepdims=True)
-    live = jcol < n
-    ids = jnp.where(live, r_j * 128 + lane_j, 0).astype(F32)
-    codes = jnp.where(live, code_j, 0.0)
-
-    def lanes(x: jax.Array) -> jax.Array:
-        return jnp.transpose(jnp.broadcast_to(x, (KU, 128)))[0:1, :].astype(I32)
-
-    return lanes(ids), lanes(codes), n
+    ids_out, codes_out = [], []
+    for j0 in range(0, KU, W):
+        jcol = jcol0 + j0
+        jf = jcol.astype(F32)
+        r_j = jnp.sum((E_row <= jf).astype(I32), axis=1, keepdims=True)
+        hit = srow == r_j
+        oh = hit.astype(F32).astype(BF16)
+        Pg = jnp.dot(oh, Pb, preferred_element_type=F32)
+        O_rj = jnp.sum(jnp.where(hit, O_row, 0.0), axis=1, keepdims=True)
+        lane_j = jnp.sum((Pg <= jf - O_rj).astype(I32), axis=1, keepdims=True)
+        Cg = jnp.dot(oh, codeb, preferred_element_type=F32)
+        code_j = jnp.sum(jnp.where(lane == lane_j, Cg, 0.0), axis=1, keepdims=True)
+        live = jcol < n
+        ids = jnp.where(live, r_j * 128 + lane_j, 0).astype(F32)
+        codes = jnp.where(live, code_j, 0.0)
+        ids_out.append(jnp.transpose(jnp.broadcast_to(ids, (W, 128)))[0:1, :].astype(I32))
+        codes_out.append(jnp.transpose(jnp.broadcast_to(codes, (W, 128)))[0:1, :].astype(I32))
+    cat = lambda xs: xs[0] if len(xs) == 1 else jnp.concatenate(xs, axis=1)  # noqa: E731
+    return cat(ids_out), cat(codes_out), n
 
 
 def attend_request(
