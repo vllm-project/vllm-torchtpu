@@ -132,7 +132,11 @@ def _materialize_native_swa(
     """Split each allocator region into typed owners without unbudgeted HBM."""
     from vllm_torchtpu.kv_cache_materializer import layer_to_pool_index
 
-    fp8_layers = {name for name, view in views.items() if view.dtype == torch.uint8}
+    fp8_layers = {
+        name
+        for name, view in views.items()
+        if view.dtype == torch.uint8 and view.shape[-1] == ROW_BYTES
+    }
     if csa2_layers.intersection(views) != fp8_layers:
         raise ValueError("Native SWA allocation requires CSA2 for all FP8 consumers")
     swa_layers = set(swa_specs)

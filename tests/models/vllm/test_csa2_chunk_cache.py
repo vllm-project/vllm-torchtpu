@@ -19,6 +19,10 @@ from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import cache as cache_module
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import PagedCacheRows
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_cache import (
+    PackedFP8IndexCacheRows,
+    PackedFP8IndexerSpec,
+)
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.swa_cache import (
     CompactSWASpec,
     NativeSWASpec,
@@ -114,6 +118,79 @@ def test_native_swa_allocation_budgets_overlaid_groups_and_binds_pages(
         cache.row_indices(indices * page_size), indices * page_size
     )
     torch.testing.assert_close(cache.pages(indices), indices)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("split", [False, True])
+def test_native_swa_allocation_with_packed_fp8_indexer(
+    monkeypatch, split, vllm_config_context
+):
+    blocks, page_bytes = 4, 32768
+    specs = {
+        "main": MLAAttentionSpec(
+            block_size=64, num_kv_heads=1, head_size=512, dtype=torch.uint8
+        ),
+        "indexer": PackedFP8IndexerSpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=132,
+            dtype=torch.uint8,
+            alignment=512,
+        ),
+        "swa": NativeSWASpec(
+            block_size=32,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.bfloat16,
+            sliding_window=128,
+        ),
+    }
+    assert {spec.page_size_bytes for spec in specs.values()} == {page_bytes}
+    if split:
+        monkeypatch.setattr(cache_module, "SPARSECORE_MAX_POOL_BYTES", 2 * page_bytes)
+    config = KVCacheConfig(
+        num_blocks=blocks,
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names=[name], kv_cache_spec=spec)
+            for name, spec in specs.items()
+        ],
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=blocks * page_bytes * 2,
+                block_stride=page_bytes,
+                offset=blocks * page_bytes if name == "swa" else 0,
+                layer_stride=blocks * page_bytes,
+                layers=[name],
+            )
+            for name in specs
+        ],
+    )
+    materialized = cache_module.materialize_upstream_kv_cache(
+        config,
+        "cpu",
+        KVCacheLayout.LBHNC,
+        word_rows=True,
+        csa2_layers=frozenset(("main",)),
+    )
+    main = materialized.native_raw_cache["main"]
+    assert materialized.native_raw_cache["indexer"] is main
+    assert set(materialized.scale_pools) == {"main"}
+    assert not materialized.rope_pools
+    banks = main if isinstance(main, tuple) else (main,)
+    scales = materialized.scale_pools["main"]
+    scale_banks = scales if isinstance(scales, tuple) else (scales,)
+    assert len(banks) == len(scale_banks) == (2 if split else 1)
+    for bank, scale in zip(banks, scale_banks):
+        assert bank.dtype == torch.int32
+        assert scale.dtype == torch.float32 and scale.shape == (bank.shape[0],)
+    indexer = PackedFP8IndexCacheRows(
+        main, materialized.native_cache_layouts["indexer"]
+    )
+    assert indexer.layout.page_size == specs["indexer"].num_states
+    with pytest.raises(ValueError, match="requires CSA2 for all FP8 consumers"):
+        cache_module.materialize_upstream_kv_cache(
+            config, "cpu", KVCacheLayout.LBHNC, word_rows=True
+        )
 
 
 @pytest.mark.cpu_test
