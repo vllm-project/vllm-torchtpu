@@ -401,7 +401,16 @@ def maybe_share_lm_head(
         )
         share_lm_head = True
 
-    if share_lm_head:
+    from vllm_torchtpu.runner import greedy_top_tokens
+
+    if not share_lm_head:
+        greedy_top_tokens.release_draft_bf16_head(target_lm_head)
+    else:
+        # The target's head may be quantized in place (W8A8 FP8,
+        # TPU_QUANTIZE_SHARED_LM_HEAD); the draft then takes the BF16 twin
+        # kept for it, so it computes at the checkpoint's precision.
+        bf16_head = greedy_top_tokens.draft_bf16_head_of(target_lm_head)
+        draft_lm_head = target_lm_head if bf16_head is None else bf16_head
         if tp_layout_matches:
             logger.info(
                 "Sharing the target's lm_head with the draft using the same TP layout."
@@ -414,7 +423,7 @@ def maybe_share_lm_head(
             shared_heads = list(iter_mtp_shared_heads(draft_model))
             for shared_head in shared_heads:
                 del shared_head.head
-                shared_head.head = target_lm_head
+                shared_head.head = draft_lm_head
             if shared_heads:
                 logger.info(
                     "Shared the target's lm_head with %d MTP "
@@ -423,19 +432,28 @@ def maybe_share_lm_head(
                 )
 
             if hasattr(draft_model, "lm_head"):
-                draft_model.lm_head = target_lm_head
+                draft_model.lm_head = draft_lm_head
             elif hasattr(draft_model, "model") and hasattr(
                 draft_model.model, "lm_head"
             ):
-                draft_model.model.lm_head = target_lm_head
+                draft_model.model.lm_head = draft_lm_head
             elif not shared_heads:
-                draft_model.lm_head = target_lm_head
+                draft_model.lm_head = draft_lm_head
         elif materialize_if_mismatched:
             logger.info(
                 "Populating draft's own lm_head with a host-gathered, "
                 "per-worker replicated copy of the target lm_head."
             )
-            populate_draft_lm_head_from_target(draft_model, target_lm_head)
+            populate_draft_lm_head_from_target(draft_model, draft_lm_head)
+        if tp_layout_matches or materialize_if_mismatched:
+            logger.info(
+                "Draft lm_head precision: %s (target lm_head: %s; %s).",
+                greedy_top_tokens.head_precision(draft_lm_head),
+                greedy_top_tokens.head_precision(target_lm_head),
+                "the draft's own BF16 copy of the checkpoint head"
+                if bf16_head is not None
+                else "the draft shares the target's head module",
+            )
 
     # We must override _gather_logits for replicated draft models even if we don't share
     # the lm_head, because the draft model's logits_processor will still try to gather
