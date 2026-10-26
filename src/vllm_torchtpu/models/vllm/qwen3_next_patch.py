@@ -1116,6 +1116,20 @@ def _patched_gemma_rmsnorm_forward_native(
     return x if residual is None else (x, residual)
 
 
+def _speculative_decoding_configured() -> bool:
+    """Whether the engine being loaded runs a draft model.
+
+    Unknown counts as yes: keeping an unused BF16 head costs memory, while
+    dropping one a draft needs would run the draft head in FP8.
+    """
+    try:
+        from vllm.config import get_current_vllm_config
+
+        return get_current_vllm_config().speculative_config is not None
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def setup_qwen3_next_v6_after_loading(model: Any) -> None:
     """Post-weight-load setup for fused router/shared-expert FP8 weights, Pallas
     sigmoid-gate o_proj and GDN weight layout."""
@@ -1188,6 +1202,13 @@ def setup_qwen3_next_v6_after_loading(model: Any) -> None:
         ):
             from vllm_torchtpu.runner import greedy_top_tokens
 
+            # A draft that borrows this head (Qwen3.5 MTP has none of its
+            # own) must keep the checkpoint's BF16 head: keep a BF16 twin
+            # before the in-place quantization drops the weight.
+            if greedy_top_tokens.draft_lm_head_bf16_enabled() and (
+                _speculative_decoding_configured()
+            ):
+                greedy_top_tokens.keep_bf16_head_for_draft(module)
             greedy_top_tokens.quantize_lm_head(module, mode="fp8", in_place=True)
     if hoisted_norm_tensors:
         synchronize_tensors(hoisted_norm_tensors)

@@ -512,11 +512,15 @@ class Eagle3Proposer:
 
         The draft's tokens then come from the vocab-parallel argmax
         (`LogitsProcessor.get_top_tokens`, patched by greedy_top_tokens), as
-        the target's do. TPU_DRAFT_LM_HEAD_QUANT picks a quantized lm-head
-        proxy for the draft only (read with os.environ; unset means fp8 for a
-        bf16 head, "none"/"bf16" keep the head as is; see
-        greedy_top_tokens.parse_draft_lm_head_quant). It changes draft tokens,
-        and so the acceptance rate, never the verified output. A draft with a
+        the target's do. The draft's head runs at the precision it holds,
+        which is the checkpoint's BF16 by default (the draft gets a BF16 copy
+        when the target's head is quantized in place; see
+        greedy_top_tokens.keep_bf16_head_for_draft). TPU_DRAFT_LM_HEAD_QUANT
+        is an explicit opt-in to a quantized lm-head proxy for the draft only
+        (read with os.environ; unset, "none" or "bf16" keep the head as is;
+        see greedy_top_tokens.parse_draft_lm_head_quant). That runs the draft
+        head below its shipped precision; it changes draft tokens, and so the
+        acceptance rate, never the verified output. A draft with a
         draft->target id map, or one the argmax cannot serve, keeps
         compute_logits + argmax.
         """
@@ -544,10 +548,13 @@ class Eagle3Proposer:
         quant_env = os.environ.get("TPU_DRAFT_LM_HEAD_QUANT")
         quant_mode, group_size = greedy_top_tokens.parse_draft_lm_head_quant(
             quant_env
-            if quant_env is not None
-            else ("fp8" if head_quant is None else None)
         )
         if quant_mode is not None and head_quant != quant_mode:
+            logger.warning(
+                "TPU_DRAFT_LM_HEAD_QUANT=%s quantizes the draft's lm_head below "
+                "the checkpoint's BF16 precision.",
+                quant_env,
+            )
             proxy_head = greedy_top_tokens._QuantizedLMHeadProxy(
                 draft_head, mode=quant_mode, group_size=group_size or 128
             )

@@ -879,10 +879,110 @@ def quantize_lm_head(
             delattr(head, "weight")
         logger.info_once(
             "Quantized shared ParallelLMHead in-place to W8A8 FP8: "
-            "_w8a8_weight_kn=%s, freed BF16 weight.",
+            "_w8a8_weight_kn=%s, %s.",
             tuple(w_fp8_kn.shape),
+            "BF16 weight kept for the draft's own head"
+            if draft_bf16_head_of(head) is not None
+            else "freed BF16 weight",
         )
     return head
+
+
+# The draft's BF16 head, kept on the target head when the target's is
+# quantized in place (see keep_bf16_head_for_draft). Stored outside
+# ``_modules`` so the target never lists it as a submodule.
+_DRAFT_BF16_HEAD_ATTR = "_tpu_draft_bf16_head"
+
+
+def draft_lm_head_bf16_enabled() -> bool:
+    """``TPU_DRAFT_LM_HEAD_BF16`` (default on): a draft that borrows the
+    target's LM head keeps the head at its shipped BF16 precision, even when
+    ``TPU_QUANTIZE_SHARED_LM_HEAD`` quantizes the target's head to FP8.
+
+    ``0`` lets the draft share the quantized target head, which runs the
+    draft's head below the checkpoint's precision.
+    """
+    import os
+
+    return os.environ.get("TPU_DRAFT_LM_HEAD_BF16", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def bf16_head_twin(head: torch.nn.Module) -> torch.nn.Module:
+    """A second ``ParallelLMHead`` holding ``head``'s current BF16 weight.
+
+    The twin is a shallow copy with its own parameter, buffer and submodule
+    tables, so freeing ``head``'s weight (``quantize_lm_head(...,
+    in_place=True)``) leaves the twin's weight, quant method and shard
+    layout as loaded. The weight tensor is the same one, not a copy: no
+    extra memory is used until the target's weight is dropped.
+    """
+    import copy
+
+    twin = copy.copy(head)
+    state = twin.__dict__
+    for table in ("_parameters", "_buffers", "_modules"):
+        if table in state:
+            state[table] = type(state[table])(state[table])
+    if "_non_persistent_buffers_set" in state:
+        state["_non_persistent_buffers_set"] = set(
+            state["_non_persistent_buffers_set"]
+        )
+    state.pop(_DRAFT_BF16_HEAD_ATTR, None)
+    for name in ("_w8a8_weight_kn", "_w8a8_scale"):
+        state.get("_buffers", {}).pop(name, None)
+    state["_quant_mode"] = None
+    state["_quant_group_size"] = None
+    state["_quant_desc"] = "bf16"
+    return twin
+
+
+def keep_bf16_head_for_draft(head: torch.nn.Module) -> torch.nn.Module | None:
+    """Keeps a BF16 twin of ``head`` for the draft before ``head`` is
+    quantized in place. Returns the twin, or None when ``head`` has no BF16
+    weight left to keep (already quantized)."""
+    weight = getattr(head, "weight", None)
+    if not isinstance(weight, torch.Tensor) or getattr(head, "_quant_mode", None):
+        return None
+    twin = bf16_head_twin(head)
+    object.__setattr__(head, _DRAFT_BF16_HEAD_ATTR, twin)
+    logger.info(
+        "Kept a BF16 copy of the target lm_head for the draft "
+        "(TPU_DRAFT_LM_HEAD_BF16=1): weight %s %s.",
+        tuple(weight.shape),
+        str(weight.dtype).replace("torch.", ""),
+    )
+    return twin
+
+
+def draft_bf16_head_of(target_head: object) -> torch.nn.Module | None:
+    """The BF16 head kept for the draft on ``target_head``, if any."""
+    return getattr(target_head, "__dict__", {}).get(_DRAFT_BF16_HEAD_ATTR)
+
+
+def release_draft_bf16_head(target_head: object) -> None:
+    """Drops the BF16 head kept for a draft that turned out to have its own."""
+    state = getattr(target_head, "__dict__", None)
+    if state is not None and state.pop(_DRAFT_BF16_HEAD_ATTR, None) is not None:
+        logger.info(
+            "The draft has its own lm_head; released the BF16 copy of the "
+            "target's head."
+        )
+
+
+def head_precision(head: object) -> str:
+    """``bf16`` / ``w8a8`` / ``w4a8_g<N>``: the precision a head computes in."""
+    desc = getattr(head, "_quant_desc", None)
+    if desc:
+        return str(desc)
+    weight = getattr(head, "weight", None)
+    if isinstance(weight, torch.Tensor):
+        return str(weight.dtype).replace("torch.", "").replace("bfloat16", "bf16")
+    return "unknown"
 
 
 def target_head_dp_mode(dp_lockstep: bool, tp_size: int) -> str:
