@@ -223,6 +223,7 @@ if TYPE_CHECKING:
     TPU_QB_OVERLAP_HONORS_SKIP_TOPK: bool = False
     TPU_SPARSE_MLA_PACKED_ROPE: bool = False
     TPU_SPARSE_MLA_GATHER_PACKED_ROPE: bool = False
+    TPU_SPARSE_MLA_GATHER_PACKED_ROPE_MIN_TOKENS: int = 128
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
     TPU_NODE_ID: int = 0
@@ -1032,6 +1033,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # with TPU_SPARSE_MLA_PACKED_ROPE no rope zero byte is read or written.
     "TPU_SPARSE_MLA_GATHER_PACKED_ROPE": env_bool(
         "TPU_SPARSE_MLA_GATHER_PACKED_ROPE", default=False
+    ),
+    # Smallest bucket (tokens) that takes it (`bucket_gate_edge`). The 64-token
+    # decode bucket gathers too few rows per chunk for the rope bytes to pay for
+    # the in-VMEM rebuild (4-13 us slower per 10-layer step on dummy weights),
+    # so by default only the prefill buckets of 128 tokens and up use it.
+    "TPU_SPARSE_MLA_GATHER_PACKED_ROPE_MIN_TOKENS": env_nonnegative_int(
+        "TPU_SPARSE_MLA_GATHER_PACKED_ROPE_MIN_TOKENS", 128
     ),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS": lambda: os.getenv("JAX_PLATFORMS", "").lower(),

@@ -1659,6 +1659,10 @@ def sparse_mla_attention_dcp(
                 {"packed_gather": True}
                 if envs.TPU_SPARSE_MLA_GATHER_PACKED_ROPE
                 and cache_layout == sparse_mla_kernel.SPARSECORE_CACHE_LAYOUT
+                and topk_idx.shape[0]
+                > envs.bucket_gate_edge(
+                    envs.TPU_SPARSE_MLA_GATHER_PACKED_ROPE_MIN_TOKENS
+                )
                 else {}
             ),
         )
