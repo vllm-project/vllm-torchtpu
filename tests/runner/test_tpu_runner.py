@@ -3153,12 +3153,9 @@ def test_gather_logprobs_preserves_normalization_precision(dtype, max_logprobs):
 def test_sample_from_logits_float32_noise_preserves_gumbel_tail():
     """Uniform noise `u` in float32 preserves the upper Gumbel tail above the
     bfloat16 ceiling (-log(-log(1 - 2^-7)) ~= 4.85) when logits are bfloat16."""
-    from vllm_torchtpu.layers.adapter.sample import random_sample
-
-    def sample_fn(_runner, *args):
-        return random_sample.sample_from_logits(*args)
-
-    runner = None
+    runner = SimpleNamespace()
+    runner._apply_temperature = TPUModelRunner._apply_temperature.__get__(runner)
+    sample_fn = TPUModelRunner.sample_from_logits.__wrapped__
 
     logits = torch.tensor([[6.0, 0.0]], dtype=torch.bfloat16)
     temperatures = torch.tensor([[1.0]], dtype=torch.bfloat16)

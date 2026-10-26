@@ -11,7 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Token sampling from logits, shared by the TPU runner and the AOT exporter.
+"""Token sampling from logits, as the TPU runner samples.
+
+The exporter lowers the TPU runner's sampler (`TPUModelRunner.sample_from_logits`
+and `_apply_temperature`) into every artifact, so that an artifact samples as
+vLLM does. This module is a copy of it, kept inside the experimental exporter;
+`tests/experimental/export/test_sampler_parity.py` checks that the two agree.
 
 A row with temperature <= `SAMPLING_EPS` takes the argmax. Other rows are
 sampled with the Gumbel-max trick: divide the logits by the temperature,

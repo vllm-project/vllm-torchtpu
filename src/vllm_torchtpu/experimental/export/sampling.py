@@ -20,8 +20,7 @@ from typing import Any
 
 import torch
 
-from vllm_torchtpu.experimental.export import api, tpu_lowering
-from vllm_torchtpu.layers.adapter.sample import random_sample
+from vllm_torchtpu.experimental.export import api, random_sample, tpu_lowering
 
 
 def greedy_tokens(logits: torch.Tensor) -> torch.Tensor:
@@ -100,7 +99,7 @@ def stochastic_tokens(
 ) -> torch.Tensor:
     """Samples one token id i64[R, 1] per row of logits[R, V] with top-k / top-p.
 
-    The vLLM TPU runner's sampler (`random_sample.sample_from_logits`): the logits
+    The vLLM TPU runner's sampler (see `random_sample`): the logits
     are divided by the temperature, masked to the top-k (`top_k <= 0` keeps all)
     and top-p (`top_p >= 1` keeps all) set by bisection, and sampled with the
     Gumbel-max trick, whose noise comes from `uniform` (`uniform_per_logit`). A

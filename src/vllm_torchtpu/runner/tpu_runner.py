@@ -121,9 +121,11 @@ from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
 )
 from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
-from vllm_torchtpu.layers.adapter.sample import random_sample
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
-from vllm_torchtpu.layers.adapter.sample.top_k_top_p import CANDIDATE_BLOCK
+from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
+    CANDIDATE_BLOCK,
+    apply_top_k_top_p,
+)
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilder,
@@ -465,7 +467,7 @@ def _build_kv_connector_output(
 
 # Smallest output size
 MIN_NUM_SEQS = 8
-SAMPLING_EPS = random_sample.SAMPLING_EPS
+SAMPLING_EPS = 1e-5
 
 
 def _get_sequence_layout_planner_for_runner(runner: Any):
@@ -7954,6 +7956,12 @@ class TPUModelRunner(GPUModelRunner):
         target_logits = torch.index_select(logits, 0, target_logits_indices)
         return bonus_logits, target_logits
 
+    def _apply_temperature(
+        self, logits: torch.Tensor, temperatures: torch.Tensor
+    ) -> torch.Tensor:
+        safe_temperatures = torch.where(temperatures == 0.0, 1.0, temperatures)
+        return logits / safe_temperatures
+
     # TODO: Under SPMD mode, sample_from_logits has correctness issue.
     #       Re-enable the torch.compile once the issue is fixed in torchxla.
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -7972,17 +7980,25 @@ class TPUModelRunner(GPUModelRunner):
         Sample with xla-friendly function. This function is to be traced
         separately from `forward` for lighter compilation overhead.
         """
-        # The AOT exporter samples with the same function.
-        return random_sample.sample_from_logits(
-            logits,
-            temperatures,
-            u,
-            top_k,
-            top_p,
-            all_greedy=all_greedy,
-            topk_candidates=topk_candidates,
-            apply_topk_topp=apply_topk_topp,
+        if all_greedy:
+            return torch.argmax(logits, dim=-1, keepdim=True)
+        is_greedy = temperatures <= SAMPLING_EPS
+        scaled_logits = self._apply_temperature(logits, temperatures)
+        if apply_topk_topp:
+            masked_logits = apply_top_k_top_p(
+                scaled_logits, top_k, top_p, topk_candidates
+            )
+        else:
+            # No request sets top-k/top-p: skip the two 31-step vocabulary
+            # bisections (separate graph, warmed in the precompile).
+            masked_logits = scaled_logits
+        u_clamped = torch.clamp(
+            u, min=torch.finfo(u.dtype).tiny, max=1.0 - torch.finfo(u.dtype).eps
         )
+        gumbel_noise = -torch.log(-torch.log(u_clamped))
+        noisy_logits = masked_logits + gumbel_noise
+        final_logits = torch.where(is_greedy, logits, noisy_logits)
+        return torch.argmax(final_logits, dim=-1, keepdim=True)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def spec_logprob_row_tokens(
