@@ -32,18 +32,10 @@
 # OpenAI-compatible server. Other subcommands (proxy, --version) run the rvllm
 # binary directly.
 #
-# The rvllm binary is not part of this repository. RVLLM_BINARY points to it:
-#   RVLLM_BINARY=/path/to/rvllm       a local binary, used as is
-#   RVLLM_BINARY=<location>           a location holding `rvllm` and a
-#                                     `metadata.json` whose "sha256" entry is
-#                                     the binary's SHA-256 (lowercase hex):
-#                                     gs://..., https://... or a local
-#                                     directory. The binary is checked against
-#                                     the sha256 and cached under
-#                                     RVLLM_CACHE_DIR.
+# The rvllm binary is not part of this repository:
+#   RVLLM_BINARY           path to the rvllm binary (required)
 # Optional:
-#   RVLLM_BINARY_SHA256    expected sha256 (overrides metadata.json)
-#   RVLLM_CACHE_DIR        cache root (default: ~/.cache/rvllm)
+#   RVLLM_CACHE_DIR        where exports are cached (default: ~/.cache/rvllm)
 #   RVLLM_ARTIFACT_DIR     use this exported artifact instead of exporting
 #   PYTHON                 interpreter for the exporter (default: python3)
 
@@ -57,68 +49,14 @@ die() {
     exit 1
 }
 
-sha256_of() {
-    sha256sum "$1" | cut -d' ' -f1
-}
-
-# Copies `<location>/<name>` to `<dest>`; location is gs://, https:// or a path.
-fetch() {
-    local location="$1" name="$2" dest="$3"
-    case "${location}" in
-        gs://*)
-            command -v gcloud >/dev/null || die "gcloud is needed to download from ${location}"
-            gcloud --no-user-output-enabled storage cp "${location%/}/${name}" "${dest}"
-            ;;
-        http://* | https://*)
-            curl -fsSL -o "${dest}" "${location%/}/${name}"
-            ;;
-        *)
-            cp "${location%/}/${name}" "${dest}"
-            ;;
-    esac
-}
-
-# Prints the path of the rvllm binary, downloading and verifying it if needed.
+# Prints the path of the rvllm binary.
 resolve_binary() {
-    local location="${RVLLM_BINARY:-}"
-    [ -n "${location}" ] ||
-        die "set RVLLM_BINARY to an rvllm binary, or to a location (gs://, https:// or a" \
-            "directory) holding rvllm and its metadata.json"
-    if [ -f "${location}" ]; then
-        [ -x "${location}" ] || die "RVLLM_BINARY=${location} is not executable"
-        echo "${location}"
-        return
+    local binary="${RVLLM_BINARY:-}"
+    [ -n "${binary}" ] || die "set RVLLM_BINARY to the path of the rvllm binary"
+    if [ ! -f "${binary}" ] || [ ! -x "${binary}" ]; then
+        die "RVLLM_BINARY=${binary} is not an executable file"
     fi
-    case "${location}" in
-        gs://* | http://* | https://*) ;;
-        *) [ -d "${location}" ] || die "RVLLM_BINARY=${location} is neither a file, a directory nor a URL" ;;
-    esac
-    local tmp
-    tmp="$(mktemp -d)"
-    # shellcheck disable=SC2064 # expand ${tmp} now: it is local to this function
-    trap "rm -rf '${tmp}'" RETURN
-    local expected="${RVLLM_BINARY_SHA256:-}"
-    if [ -z "${expected}" ]; then
-        fetch "${location}" metadata.json "${tmp}/metadata.json" ||
-            die "could not fetch metadata.json from ${location} (or set RVLLM_BINARY_SHA256)"
-        expected="$("${PYTHON}" -c 'import json, sys; print(json.load(open(sys.argv[1]))["sha256"])' \
-            "${tmp}/metadata.json")" || die "metadata.json from ${location} has no sha256"
-    fi
-    local cached="${CACHE_DIR}/bin/${expected}/rvllm"
-    if [ -x "${cached}" ] && [ "$(sha256_of "${cached}")" = "${expected}" ]; then
-        echo "${cached}"
-        return
-    fi
-    fetch "${location}" rvllm "${tmp}/rvllm" ||
-        die "could not fetch the rvllm binary from ${location}"
-    local actual
-    actual="$(sha256_of "${tmp}/rvllm")"
-    [ "${actual}" = "${expected}" ] ||
-        die "rvllm from ${location} has sha256 ${actual}, expected ${expected}"
-    mkdir -p "$(dirname "${cached}")"
-    chmod 755 "${tmp}/rvllm"
-    mv -f "${tmp}/rvllm" "${cached}"
-    echo "${cached}"
+    echo "${binary}"
 }
 
 # Prints the directory of the installed exporter package.

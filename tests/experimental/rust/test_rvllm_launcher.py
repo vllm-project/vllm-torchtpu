@@ -17,7 +17,6 @@ The split uses vLLM's real `vllm serve` parser. The script runs with a fake
 rvllm binary and a fake export step, and records what each one received.
 """
 
-import hashlib
 import json
 import os
 import subprocess
@@ -272,39 +271,8 @@ def test_a_binary_must_be_named(env):
     assert "RVLLM_BINARY" in result.stderr
 
 
-def test_a_binary_location_that_does_not_exist_is_rejected(env, tmp_path):
-    env["RVLLM_BINARY"] = str(tmp_path / "missing")
+def test_the_binary_must_be_an_executable_file(env, tmp_path):
+    env["RVLLM_BINARY"] = str(tmp_path)
     result = run(env, "proxy", check=False)
     assert result.returncode != 0
-    assert "neither a file, a directory nor a URL" in result.stderr
-
-
-def _publish(env, tmp_path, sha=None):
-    """Lays out a download location: the fake binary and its metadata.json."""
-    site = tmp_path / "site"
-    site.mkdir(exist_ok=True)
-    data = Path(env["RVLLM_BINARY"]).read_bytes()
-    (site / "rvllm").write_bytes(data)
-    digest = hashlib.sha256(data).hexdigest()
-    (site / "metadata.json").write_text(json.dumps({"sha256": sha or digest}))
-    env["RVLLM_BINARY"] = str(site)
-    return digest
-
-
-def test_downloaded_binary_is_verified_and_cached(env, tmp_path):
-    digest = _publish(env, tmp_path)
-    run(env, "proxy")
-    assert (Path(env["RVLLM_CACHE_DIR"]) / "bin" / digest / "rvllm").exists()
-    assert logged(env, "rvllm.args") == ["proxy"]
-    # Served from the cache once the download location is gone.
-    (tmp_path / "site" / "rvllm").unlink()
-    run(env, "proxy", "again")
-    assert logged(env, "rvllm.args") == ["proxy", "again"]
-
-
-def test_downloaded_binary_with_the_wrong_sha256_is_rejected(env, tmp_path):
-    _publish(env, tmp_path, sha="0" * 64)
-    result = run(env, "proxy", check=False)
-    assert result.returncode != 0
-    assert "expected " + "0" * 64 in result.stderr
-    assert not list((Path(env["RVLLM_CACHE_DIR"]) / "bin").glob("*/rvllm"))
+    assert "is not an executable file" in result.stderr
