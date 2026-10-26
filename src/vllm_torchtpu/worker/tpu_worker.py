@@ -479,6 +479,13 @@ class TPUWorker(WorkerBase):
             reserve_rope_companion,
         )
 
+        compact = self.model_runner.kv_cache_manager.native_swa_cache
+        swa_bytes = 0 if compact is None else compact.reserve_bytes
+        available -= swa_bytes
+        if available <= 0:
+            raise ValueError("KV budget cannot hold the compact SWA windows")
+        if swa_bytes:
+            logger.info("Compact native SWA reservation: %d bytes", swa_bytes)
         return reserve_rope_companion(
             self.vllm_config,
             available,

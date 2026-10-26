@@ -134,6 +134,29 @@ def test_check_kv_caches_cover_block_ids_rejects_short_cache(allocated_blocks):
     assert "2 layer(s) in this 131072-byte backing allocation" in str(exc.value)
 
 
+@pytest.mark.parametrize("allocated", [3, 4])
+def test_check_kv_caches_cover_compact_physical_ids(allocated):
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=2, head_size=128, dtype=torch.bfloat16
+    )
+    tensor = KVCacheTensor(
+        size=spec.page_size_bytes * 1000,
+        layers=["swa"],
+        layer_stride=spec.page_size_bytes * 1000,
+        block_stride=spec.page_size_bytes,
+    )
+    caches = {"swa": torch.empty((allocated, 1))}
+    if allocated < 4:
+        with pytest.raises(ValueError, match="4 physical blocks"):
+            check_kv_caches_cover_block_ids(
+                caches, [tensor], 1000, lambda _: spec, {"swa": 4}
+            )
+    else:
+        check_kv_caches_cover_block_ids(
+            caches, [tensor], 1000, lambda _: spec, {"swa": 4}
+        )
+
+
 def test_check_kv_caches_cover_block_ids_rejects_missing_attention_cache():
     spec = FullAttentionSpec(
         block_size=16, num_kv_heads=2, head_size=128, dtype=torch.bfloat16
