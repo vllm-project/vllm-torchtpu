@@ -90,7 +90,18 @@ def test_output_projection_rejects_other_contracts(monkeypatch, which, change):
     assert not supported(*inputs)
 
 
-def _reference_a(x, w, scale):
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("tokens", [240, 288])
+def test_buffered_projection_traces_memory_space_boundary(monkeypatch, tokens):
+    monkeypatch.setattr(oa, "get_tpu_version", lambda: 7)
+    x, w, scale, _, _ = _abstract_inputs(tokens)
+    # Tracing rejects reshape on a Pallas HBM-annotated array, before TPU
+    # compilation. Exercise the public dispatch, including its scale reshape.
+    graph = str(jax.make_jaxpr(oa.wo_a_projection)(x, w, scale, None))
+    assert "wo_a_projection_buffered" in graph
+
+
+def _reference_a(x: jax.Array, w: jax.Array, scale: jax.Array) -> jax.Array:
     # Reproduce the pre-specialization defaults, bypassing automatic dispatch.
     tile_t = next(n for n in range(min(x.shape[0], 1024), 0, -1) if x.shape[0] % n == 0)
     sub_t = next(n for n in range(min(tile_t, 128), 0, -1) if tile_t % n == 0)
@@ -119,9 +130,13 @@ def projection_ops():
         csa2_adapter.initialize_csa2_ops()
         _get_quantized_matmul_op()
     ref_a = pallas.jax_op("pallas::test_output_projection_a_reference", _reference_a)
-    ref_b = pallas.jax_op(
-        "pallas::test_output_projection_b_reference", xla_quantized_matmul
-    )
+
+    # xla_quantized_matmul has an unannotated optional quantization argument;
+    # expose only the three tensor arguments required by this custom op.
+    def reference_b(x: jax.Array, w: jax.Array, scale: jax.Array) -> jax.Array:
+        return xla_quantized_matmul(x, w, scale)
+
+    ref_b = pallas.jax_op("pallas::test_output_projection_b_reference", reference_b)
     for op in (ref_a, ref_b):
         op.register_fake(lambda x, w, scale: x.new_empty((x.shape[0], w.shape[1])))
 

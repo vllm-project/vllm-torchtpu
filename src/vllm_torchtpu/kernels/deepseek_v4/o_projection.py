@@ -322,7 +322,11 @@ def _buffered_projection(
     width = out_features // (heads // SUBLANE)
     x = pltpu.with_memory_space_constraint(x, pltpu.HBM)
     w = pltpu.with_memory_space_constraint(w, pltpu.HBM)
-    scale = pltpu.with_memory_space_constraint(scale, pltpu.HBM)
+    # Ordinary JAX primitives cannot consume Pallas memory-space annotations.
+    # Reshape before constraining the array at the custom-call boundary.
+    scale = pltpu.with_memory_space_constraint(
+        scale.reshape(1, out_features), pltpu.HBM
+    )
     return pl.pallas_call(
         functools.partial(_buffered_kernel, depth=depth),
         out_shape=jax.ShapeDtypeStruct((tokens, out_features), x.dtype),
@@ -340,7 +344,7 @@ def _buffered_projection(
         ),
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=vmem_budget),
         name=f"{name}_buffered",
-    )(x, w, scale.reshape(1, out_features))
+    )(x, w, scale)
 
 
 @functools.partial(
