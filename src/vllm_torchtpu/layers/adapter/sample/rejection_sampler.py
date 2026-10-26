@@ -170,6 +170,33 @@ class RejectionSampler:
             self.synthetic_mode,
         )
 
+    def greedy_from_token_ids(
+        self,
+        draft_token_ids: torch.Tensor,
+        num_draft_tokens: torch.Tensor,
+        target_token_ids: torch.Tensor,
+        bonus_token_ids: torch.Tensor,
+        segment_ids: torch.Tensor,
+        group_indices: torch.Tensor,
+        max_draft_tokens: int,
+        accept_u: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Validate drafts against already reduced target token IDs."""
+        if self.synthetic_mode and accept_u is None:
+            raise ValueError("Synthetic rejection sampling requires accept_u.")
+        return _greedy_rejection_sample_from_token_ids(
+            draft_token_ids,
+            target_token_ids,
+            num_draft_tokens,
+            bonus_token_ids,
+            segment_ids,
+            group_indices,
+            max_draft_tokens,
+            accept_u,
+            self.synthetic_conditional_rates,
+            self.synthetic_mode,
+        )
+
 
 def _get_segment_info(num_draft_tokens: torch.Tensor, total_tokens: int):
     """Helper to create segment IDs and per-segment indices."""
@@ -213,13 +240,38 @@ def _greedy_rejection_sample_with_segment(
     synthetic_conditional_rates: torch.Tensor | None,
     synthetic_mode: bool,
 ) -> torch.Tensor:
-    """Vectorized greedy speculative decoding validation in Torch."""
+    return _greedy_rejection_sample_from_token_ids(
+        draft_token_ids,
+        torch.argmax(target_logits, dim=-1).to(torch.int32),
+        num_draft_tokens,
+        bonus_token_ids,
+        segment_ids,
+        group_indices,
+        max_draft_tokens,
+        accept_u,
+        synthetic_conditional_rates,
+        synthetic_mode,
+    )
+
+
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _greedy_rejection_sample_from_token_ids(
+    draft_token_ids: torch.Tensor,
+    target_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+    accept_u: torch.Tensor | None,
+    synthetic_conditional_rates: torch.Tensor | None,
+    synthetic_mode: bool,
+) -> torch.Tensor:
+    """Validate greedy drafts after reducing the vocabulary dimension."""
     total_tokens = draft_token_ids.shape[0]
     batch_size = num_draft_tokens.shape[0]
     device = draft_token_ids.device
-
-    # Get target argmax
-    target_logits_argmax = torch.argmax(target_logits, dim=-1).to(torch.int32)
+    target_logits_argmax = target_token_ids.to(torch.int32)
     draft_token_ids = draft_token_ids.to(torch.int32)
 
     # Find the first mismatch index per segment using matrix masking.

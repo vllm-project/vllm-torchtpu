@@ -801,3 +801,58 @@ def test_rejection_sampler_ignores_padded_segment_sentinel(device):
 
     expected = torch.tensor([[1, 9], [8, -1]], dtype=torch.int32, device=device)
     assert torch.equal(output, expected)
+
+
+@pytest.mark.parametrize("synthetic", [False, True])
+@pytest.mark.parametrize("edge", ["ragged", "ties", "nonfinite", "zero_drafts"])
+def test_greedy_token_ids_match_logits_path(device, synthetic, edge):
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    sampler = RejectionSampler()
+    if synthetic:
+        sampler.synthetic_mode = True
+        sampler.synthetic_conditional_rates = torch.tensor(
+            [0.8, 0.5, 0.2], device=device
+        )
+    torch.manual_seed(17)
+    logits = torch.randn(12, 257, dtype=torch.bfloat16)
+    if edge == "ties":
+        logits[:, 7] = 20
+        logits[:, 130] = 20
+    elif edge == "nonfinite":
+        logits[0, 3] = float("nan")
+        logits[0, 132] = float("nan")
+        logits[1, 12] = float("inf")
+        logits[2] = -float("inf")
+    logits = logits.to(device)
+    target_indices = torch.tensor([0, 1, 2, 6, 7, 0], dtype=torch.int32, device=device)
+    bonus_indices = torch.tensor([3, 5, 8], dtype=torch.int32, device=device)
+    lengths = [0, 0, 0] if edge == "zero_drafts" else [3, 0, 2]
+    num_drafts = torch.tensor(lengths, dtype=torch.int32, device=device)
+    segments = torch.tensor([0, 0, 0, 2, 2, 3], dtype=torch.int64, device=device)
+    groups = torch.tensor([0, 1, 2, 0, 1, 0], dtype=torch.int32, device=device)
+    gathered = torch.index_select(logits, 0, target_indices)
+    drafts = torch.argmax(gathered, dim=-1).to(torch.int32)
+    drafts[1] = (drafts[1] + 1) % logits.shape[1]
+    accept_u = torch.tensor([0.1, 0.7, 0.3, 0.9, 0.2, 0.0], device=device)
+    common = dict(
+        draft_token_ids=drafts,
+        num_draft_tokens=num_drafts,
+        segment_ids=segments,
+        group_indices=groups,
+        max_draft_tokens=3,
+        accept_u=accept_u if synthetic else None,
+    )
+    bonus_reference = torch.argmax(torch.index_select(logits, 0, bonus_indices), dim=-1)
+    expected = sampler(
+        target_logits=gathered, bonus_token_ids=bonus_reference, **common
+    )
+    bonus_ids, target_ids = TPUModelRunner.spec_bonus_and_target_token_ids(
+        None, logits, bonus_indices, target_indices
+    )
+    actual = sampler.greedy_from_token_ids(
+        target_token_ids=target_ids, bonus_token_ids=bonus_ids, **common
+    )
+    assert torch.equal(bonus_ids.cpu(), bonus_reference.cpu())
+    assert torch.equal(target_ids.cpu(), torch.argmax(gathered, dim=-1).cpu())
+    assert torch.equal(actual.cpu(), expected.cpu())

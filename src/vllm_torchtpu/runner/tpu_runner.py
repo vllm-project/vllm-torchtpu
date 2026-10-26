@@ -4303,8 +4303,30 @@ class TPUModelRunner(GPUModelRunner):
         """
         req_temperatures = req_top_k = req_top_p = None
         if all_greedy and grammar_output is None:
-            bonus_token_ids, target_logits = self.spec_bonus_and_target_logits(
+            bonus_token_ids, target_token_ids = self.spec_bonus_and_target_token_ids(
                 logits, md.bonus_logits_indices, md.target_logits_indices
+            )
+            assert self.rejection_sampler is not None
+            assert self.speculative_config is not None
+            accept_u = (
+                torch.rand(
+                    md.draft_token_ids.shape,
+                    dtype=torch.float32,
+                    device=logits.device,
+                    generator=sampling_generator,
+                )
+                if self.rejection_sampler.synthetic_mode
+                else None
+            )
+            return self.rejection_sampler.greedy_from_token_ids(
+                draft_token_ids=md.draft_token_ids,
+                num_draft_tokens=md.draft_lengths,
+                target_token_ids=target_token_ids,
+                bonus_token_ids=bonus_token_ids,
+                segment_ids=md.segment_ids,
+                group_indices=md.group_indices,
+                max_draft_tokens=self.speculative_config.num_speculative_tokens,
+                accept_u=accept_u,
             )
         else:
             bonus_logits, target_logits = self.spec_gather_bonus_and_target_logits(
@@ -5898,13 +5920,13 @@ class TPUModelRunner(GPUModelRunner):
 
         Both verify sub-branches are distinct ``dynamic=False`` graphs, so warm
         each: greedy (``do_sampling=False`` ->
-        ``_greedy_rejection_sample_with_segment``, prelude
-        ``spec_bonus_and_target_logits``) and non-greedy (``do_sampling=True``
+        ``_greedy_rejection_sample_from_token_ids``, prelude
+        ``spec_bonus_and_target_token_ids``) and non-greedy (``do_sampling=True``
         -> ``_random_rejection_sample_with_segment``, prelude
         ``spec_gather_bonus_and_target_logits``). Which one runs is decided per
         step by ``input_batch.all_greedy`` and ``grammar_output``, so both are
         reachable and must be pre-compiled here; the greedy + structured-output
-        combination reuses graphs warmed by these two passes.
+        combination additionally warms the full-logits greedy sampler.
         """
         if not (self._is_async_drafter):
             return
@@ -5954,15 +5976,15 @@ class TPUModelRunner(GPUModelRunner):
                         self.device
                     )
                     # --- greedy verify path (do_sampling=False) ---
-                    bonus_token_ids, target_logits_warm = (
-                        self.spec_bonus_and_target_logits(
+                    bonus_token_ids, target_token_ids_warm = (
+                        self.spec_bonus_and_target_token_ids(
                             dummy_logits, bonus_logits_indices, target_logits_indices
                         )
                     )
-                    out = self.rejection_sampler(
+                    out = self.rejection_sampler.greedy_from_token_ids(
                         draft_token_ids=draft_token_ids,
                         num_draft_tokens=draft_lengths,
-                        target_logits=target_logits_warm,
+                        target_token_ids=target_token_ids_warm,
                         bonus_token_ids=bonus_token_ids,
                         segment_ids=segment_ids,
                         group_indices=group_indices,
@@ -5975,8 +5997,10 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     synchronize_tensors(out)
                     # --- non-greedy verify path (do_sampling=True) ---
-                    _, target_logits_ng = self.spec_gather_bonus_and_target_logits(
-                        dummy_logits, bonus_logits_indices, target_logits_indices
+                    bonus_logits_ng, target_logits_ng = (
+                        self.spec_gather_bonus_and_target_logits(
+                            dummy_logits, bonus_logits_indices, target_logits_indices
+                        )
                     )
                     warm_temps = torch.zeros(
                         (num_tokens, 1),
@@ -5992,6 +6016,22 @@ class TPUModelRunner(GPUModelRunner):
                         (num_tokens, self.vocab_size),
                         dtype=torch.float32,
                     ).to(self.device)
+                    # Grammar masks are applied before greedy reduction.
+                    grammar_out = self.rejection_sampler(
+                        draft_token_ids=draft_token_ids,
+                        num_draft_tokens=draft_lengths,
+                        target_logits=target_logits_ng,
+                        bonus_token_ids=self._greedy_sample(bonus_logits_ng).view(-1),
+                        segment_ids=segment_ids,
+                        group_indices=group_indices,
+                        max_draft_tokens=k,
+                        accept_u=(
+                            warm_accept_u
+                            if self.rejection_sampler.synthetic_mode
+                            else None
+                        ),
+                    )
+                    synchronize_tensors(grammar_out)
                     out = self.rejection_sampler(
                         draft_token_ids=draft_token_ids,
                         num_draft_tokens=draft_lengths,
@@ -7180,24 +7220,18 @@ class TPUModelRunner(GPUModelRunner):
         return self.model.compute_logits(hidden_states)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-    def spec_bonus_and_target_logits(
+    def spec_bonus_and_target_token_ids(
         self,
         logits: torch.Tensor,
         bonus_logits_indices: torch.Tensor,
         target_logits_indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Spec-decode verify prelude: gather the bonus-token logits + argmax, and
-        # gather the target_logits rows for the rejection sampler, in ONE compiled
-        # region keyed on [num_tokens, num_reqs] shapes. Run raw (the
-        # logits[indices] gathers + argmax at the verify site), these are eager
-        # ops torch-tpu's DEFER_AND_FUSE fuses with the live per-step dispatch
-        # into per-context programs (the cold target-side recompiles). index_select
-        # is value-identical to logits[indices]. Same pattern as the draft wraps.
-        bonus_token_ids = torch.argmax(
-            torch.index_select(logits, 0, bonus_logits_indices), dim=-1
+        # Reduce before gathering: greedy verification only consumes token IDs.
+        token_ids = torch.argmax(logits, dim=-1).to(torch.int32)
+        return (
+            torch.index_select(token_ids, 0, bonus_logits_indices),
+            torch.index_select(token_ids, 0, target_logits_indices),
         )
-        target_logits = torch.index_select(logits, 0, target_logits_indices)
-        return bonus_token_ids, target_logits
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def spec_gather_bonus_and_target_logits(
@@ -7208,7 +7242,7 @@ class TPUModelRunner(GPUModelRunner):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Non-greedy verify prelude: gather the bonus-token logits and the
         # target_logits rows in ONE compiled region keyed on [num_reqs,
-        # num_tokens] shapes. Unlike the greedy spec_bonus_and_target_logits,
+        # num_tokens] shapes. Unlike the greedy spec_bonus_and_target_token_ids,
         # the bonus row is kept as FULL logits (not argmax'd) because the
         # non-greedy path samples the bonus token from them. Run raw, the
         # logits[indices] gathers are eager ops torch-tpu's DEFER_AND_FUSE fuses
