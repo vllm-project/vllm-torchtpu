@@ -673,7 +673,27 @@ class Qwen38SegmentDriver:
             from vllm_torchtpu.models.vllm.qwen4_exp import sequence_parallel as sp
 
             block, residual = layer.attn_hyper_connection.mix(h_in)
-            g = sp.reduce(layer.linear_attn(block), False)
+            la = layer.linear_attn
+            cap: dict = {}
+            hooks = []
+            if getattr(self, "h0dump", False):
+                # Stock GDN internals for the offline replay: projections, the
+                # gated norm's inputs/output and out_proj's input/output.
+                cap["qkvz"] = la.in_proj_qkvz(block)[0]
+                cap["ba"] = la.in_proj_ba(block)[0]
+
+                def grab(tag):
+                    def hook(mod, args, out):
+                        cap[tag + "_in"] = [a for a in args if isinstance(a, torch.Tensor)]
+                        cap[tag + "_out"] = out[0] if isinstance(out, tuple) else out
+                    return hook
+
+                hooks = [la.norm.register_forward_hook(grab("norm")), la.out_proj.register_forward_hook(grab("out_proj"))]
+            try:
+                g = sp.reduce(la(block), False)
+            finally:
+                for hk in hooks:
+                    hk.remove()
             mixed2, residual2 = layer.attn_hyper_connection.combine_mix(g, residual, layer.mlp_hyper_connection)
             valid = kw["valid_tokens"].to(torch.bool)
             mixed2 = torch.where(valid[:, None], mixed2, 0)
@@ -713,6 +733,7 @@ class Qwen38SegmentDriver:
                     "stock_mixed2": cpu(mixed2), "stock_moe": cpu(moe),
                     "mk_nomoe": cpu(mk_nomoe), "mk_nogdn": cpu(mk_nogdn),
                     "st_nogdn": cpu(st_nogdn), "valid": cpu(kw["valid_tokens"]),
+                    "stock_gdn": {k: ([cpu(t) for t in v] if isinstance(v, list) else cpu(v)) for k, v in cap.items()},
                 }
                 out = os.path.join(os.environ.get("CDK_OUTPUT_DIR", "/tmp/cdk_output"), "h0dump")
                 os.makedirs(out, exist_ok=True)
