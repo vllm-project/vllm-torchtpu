@@ -30,7 +30,7 @@ import torch
 from torch import nn
 
 from .qwen38_segment_call import T_VERIFY
-from .qwen38_wholestep_call import LONG_CONTEXT, wholestep_tiles
+from .qwen38_wholestep_call import indexed_options, wholestep_tiles
 
 from .qwen38_wholestep_cache import QSALayerCache
 
@@ -112,7 +112,7 @@ class Qwen38WholeStep(nn.Module):
         pps = max_groups * 4 // 128
         spec = wholestep_spec(
             g, R, L=L_WHOLE, first="qsa", pool_gdn=True, qsa=dict(budget=budget), step=True,
-            indexed=dict(max_groups=max_groups, pages_per_seq=pps, carrier="fp8", n_layers=n_att, **LONG_CONTEXT),
+            indexed=dict(max_groups=max_groups, pages_per_seq=pps, carrier="fp8", n_layers=n_att, **indexed_options()),
         )
         ex = ExecSpec(R=R, B=buckets[0], T=T_VERIFY, ctx=128, tiles=wholestep_tiles(buckets[0]))
         ops = pack_wholestep_operands(model, g, spec, ex, ids)

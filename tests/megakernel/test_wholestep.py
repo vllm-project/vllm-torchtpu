@@ -206,7 +206,7 @@ def test_selection_check_catches_an_off_by_one_id(monkeypatch):
 CTX_C = [3001, 100]  # request 0: g_a holds one old token; request 1: g_a starts at the step
 
 
-def _run_c(key: int = 17, T: int = 4, long: bool = False):
+def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, rank_ids: bool = False):
     from vllm_torchtpu.megakernel.wholestep.qsa_full_b import DBG_IDS, DBG_IQ
     from vllm_torchtpu.megakernel.wholestep.qsa_full_c import CK_NEW, IR_NEW, KR_NEW, RING_NEW
 
@@ -222,7 +222,7 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False):
     steps = d.pop("_step_out")
     pps = d["mtab"].shape[1]
     long_kw = dict(carrier="bf16", chunk_pages=8, hbm_tables=True, per_request_scores=True,
-                   bounded_chunks=True)
+                   bounded_chunks=True, shard_index=shard)
     spec = wholestep_spec(
         G, R, L=L, qsa=dict(budget=BUDGET), step=True,
         indexed=dict(max_groups=MAX_GROUPS, pages_per_seq=pps, debug=True, **(long_kw if long else {})),
@@ -241,7 +241,8 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False):
     ck = np.asarray(outs[CK_NEW], np.float32).reshape(R, n_att, nreq, -1)[0]
     ring = np.asarray(outs[RING_NEW], np.float32).reshape(R, n_att, nreq, 8, -1)[0]
     iq = np.asarray(outs[DBG_IQ], np.float32).reshape(R, n_att, ex.M, -1)[0, :, :B]
-    ids = np.asarray(outs[DBG_IDS]).reshape(R, n_att, ex.M, -1)[0, :, :B]
+    ids = np.asarray(outs[DBG_IDS]).reshape(R, n_att, ex.M, -1)[:, :, :B]
+    ids = ids if rank_ids else ids[0]
     x0 = np.asarray(d["inp"].x[:B], np.float32)
     d["_kr_new"] = np.asarray(outs[KR_NEW], np.float32).reshape(R, n_att, ex.M, -1)[:, :, :B]
     d["_ir_new"] = np.asarray(outs[IR_NEW], np.float32).reshape(R, n_att, ex.M, -1)[:, :, :B]
@@ -271,6 +272,19 @@ def test_step_selection_exact_on_its_own_queries(long):
             want = {i for i in topk_reference(st, n, BUDGET) if i < c0 // 4}
             got = set(ids[o, r, : len(want)].tolist())
             assert got == want, (o, r, len(got ^ want))
+
+
+def test_sharded_indexer_matches_unsharded():
+    """`shard_index`: each rank scores and selects its own request (R = 2, two requests), then
+    the ranks exchange ids, lengths and `g_a` flags. Every rank ends with the unsharded kernel's
+    pool-path ids, and the step's outputs are bit-identical (same ids, same attention order)."""
+    base = _run_c(long=True, rank_ids=True)
+    shard = _run_c(long=True, shard=True, rank_ids=True)
+    ids_b, ids_s = base[7], shard[7]
+    for r in range(ids_s.shape[0]):  # every rank holds every row's ids after the exchange
+        np.testing.assert_array_equal(ids_s[r], ids_b[0])
+    for i, name in ((0, "residual"), (3, "ck_new"), (4, "ring_new")):
+        np.testing.assert_array_equal(shard[i], base[i], err_msg=name)
 
 
 def test_step_tokens_match_stock_semantics():

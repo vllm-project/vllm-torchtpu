@@ -640,6 +640,10 @@ class Qwen38SegmentDriver:
         cap = _parse_int(raw, "wholecap")
         if cap is not None:
             drv.whole_cap = cap
+        if _parse_flag(raw, "wholeshard", False):
+            from . import qwen38_wholestep_call
+
+            qwen38_wholestep_call.SHARD_INDEX = True
         rows_max = _parse_int(raw, "wholerows")
         if rows_max is not None:
             drv.whole_max_rows = rows_max

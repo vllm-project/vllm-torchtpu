@@ -72,6 +72,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         hbm_tables: bool = False,
         per_request_scores: bool = False,
         bounded_chunks: bool = False,
+        shard_index: bool = False,
         **kw: Any,
     ) -> None:
         """`carrier`: "" = prototype contiguous keys `[requests, max_groups, 128]`; "fp8" = the
@@ -91,7 +92,10 @@ class QSAFullIndexedBlock(QSAFullBlock):
         request is scored (an all-rows buffer is 16 MiB at 64 rows and 64K groups).
         `bounded_chunks`: each request streams only the key chunks its rows can see
         (`ceil(n_vis / chunk groups)`, at least 1) instead of all `max_groups`; scores past a
-        row's `n_vis` are stale and masked by the selection."""
+        row's `n_vis` are stale and masked by the selection. `shard_index` (needs
+        `per_request_scores`): each rank scores and selects only its own contiguous run of
+        `ceil(requests / R)` requests, then the ranks exchange the selected ids, lengths and
+        `g_a` flags so every rank attends every row (in-kernel remote DMA, int32: exact)."""
         super().__init__(**kw)
         assert max_groups % 1024 == 0, max_groups  # whole (8, 128) score tiles per row
         self.max_groups, self.pps, self.debug = max_groups, pages_per_seq, debug
@@ -100,6 +104,8 @@ class QSAFullIndexedBlock(QSAFullBlock):
         self.n_layers = n_layers
         self.hbm_tables, self.per_request_scores = hbm_tables, per_request_scores
         self.bounded_chunks = bounded_chunks
+        self.shard_index = shard_index
+        assert not shard_index or per_request_scores, "the sharded indexer selects per request"
         self.chunk_pages = chunk_pages if carrier else max_groups // GPK
         assert (max_groups // GPK) % self.chunk_pages == 0, (max_groups, self.chunk_pages)
         assert (self.chunk_pages * GPK) % 128 == 0 and (max_groups // 128) % 8 == 0
@@ -241,14 +247,16 @@ class QSAFullIndexedBlock(QSAFullBlock):
 
     # ------------------------------------------------------------ in kernel
     def _score_request(
-        self, ctx: Any, q: int, qr: jax.Array, base: Any = 0, last: bool = True, row0: Any = None
+        self, ctx: Any, q: int, qr: jax.Array, base: Any = 0, last: bool = True, row0: Any = None,
+        first: bool | None = None,
     ) -> None:
         """Scores of request `q`'s `T` rows into `qi_s[q*T : (q+1)*T]` (chunk-major).
 
         Carrier mode streams chunks through a 2-slot ring whose slot follows a chunk counter
         across requests (`q * n_chunks + c`): request q's last chunk prefetches request q+1's
         first chunk (unless `last`), so no request starts its key stream cold; request 0's
-        first chunk is issued here."""
+        first chunk is issued here. `first` (default `q == 0`) marks the first request of the
+        rank's run when the indexer is sharded by request (`shard_index`)."""
         scr, T = ctx.scr, ctx.ex.T
         r0 = q * T if row0 is None else row0
         rows = slice(r0, r0 + T)
@@ -282,7 +290,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
                 for p in range(CH)
             ]
 
-        if q == 0:
+        if (q == 0) if first is None else first:
             for cp in copies(0, 0):
                 cp.start()
             if self.bounded_chunks:

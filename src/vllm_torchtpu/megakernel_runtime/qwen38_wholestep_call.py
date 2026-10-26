@@ -47,6 +47,14 @@ QSA_TABLES = 3  # per QSA layer: ring ids, main table, compressed table
 # tests/megakernel/test_wholestep.py long mode). Without the last, every request streams
 # max_groups keys per QSA layer: 22.4 ms at 64 rows for max_groups 8192 (j-dcafcac7).
 LONG_CONTEXT = dict(hbm_tables=True, per_request_scores=True, bounded_chunks=True)
+# `VLLM_TPU_MEGAKERNEL=...,wholeshard=1`: each rank scores and selects its own run of requests and
+# the ranks exchange the selections in-kernel (`QSAFullIndexedBlock.shard_index`; exact).
+SHARD_INDEX = False
+
+
+def indexed_options() -> dict:
+    """The served indexer options (`LONG_CONTEXT`, plus the request-sharded selection)."""
+    return dict(LONG_CONTEXT, shard_index=SHARD_INDEX)
 
 
 def wholestep_tiles(B: int) -> Tiles:
@@ -84,7 +92,7 @@ def build_wholestep_call(
     pps = max_groups * 4 // 128
     spec = wholestep_spec(
         g, R, L=L, first="qsa", pool_gdn=True, qsa=dict(budget=budget), step=True,
-        indexed=dict(max_groups=max_groups, pages_per_seq=pps, carrier="fp8", n_layers=n_att, **LONG_CONTEXT),
+        indexed=dict(max_groups=max_groups, pages_per_seq=pps, carrier="fp8", n_layers=n_att, **indexed_options()),
     )
     fn, k_specs, _, n_w = make_flat_segment_step(mesh, spec, ex, extra_outs=(KV_NEW, KR_NEW, IR_NEW))
     M, NS = ex.M, B // T

@@ -119,6 +119,22 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             ScratchReq("qf_kr", pltpu.VMEM((ex.MB, g.HD), BF16)),
             ScratchReq("qc_ir", pltpu.VMEM((ex.MB, ix.IDX_DIM), BF16)),
             ScratchReq("qc_osem", pltpu.SemaphoreType.DMA((2,))),
+        ] + (self._shard_scratch(ex) if self.shard_index else [])
+
+    def _shard_rows(self, ex: ExecSpec) -> tuple[int, int, int]:
+        """(requests per rank, rows per rank, exchange row width) of the sharded indexer."""
+        nreq = ex.MB // ex.T
+        npr = -(-nreq // ex.R)
+        return npr, npr * ex.T, -(-(self.budget + 2) // 128) * 128
+
+    def _shard_scratch(self, ex: ExecSpec) -> list[ScratchReq]:
+        _, rows, W = self._shard_rows(ex)
+        n = max(ex.R - 1, 1)
+        return [
+            ScratchReq("qg_send", pltpu.VMEM((rows, 1, W), I32)),
+            ScratchReq("qg_recv", pltpu.VMEM((ex.R, rows, 1, W), I32)),
+            ScratchReq("qg_ssem", pltpu.SemaphoreType.DMA((n,))),
+            ScratchReq("qg_rsem", pltpu.SemaphoreType.DMA((n,))),
         ]
 
     # ------------------------------------------------------------ in kernel
@@ -286,7 +302,29 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
 
             jax.lax.fori_loop(lo, lo + n, row, 0)
         self.load_tables(ctx, l)
-        for q in range(nreq):
+        if self.shard_index:
+            # Each rank scores and selects its own run of `npr` requests; every rank still
+            # builds every request's completed group (outputs) and recent tile (its KV head).
+            npr = self._shard_rows(ex)[0]
+            for q in range(nreq):
+                ck, gc = self._new_group(ctx, l, q, raw[q * T : (q + 1) * T])
+
+                @pl.when(q // npr == ctx.me)
+                def _(q=q, ck=ck, gc=gc):
+                    qr = scr["qi_q"][q].astype(BF16)
+                    self._score_request(
+                        ctx, q, qr, self.tab_base(ctx, l), row0=0,
+                        first=q % npr == 0, last=q % npr == npr - 1 or q == nreq - 1,
+                    )
+                    s_new = ix.score_rows(qr, jnp.broadcast_to(ck.astype(BF16), (8, ix.IDX_DIM)))
+                    scr["qi_s"][0:T] = jnp.where(
+                        gid == gc, s_new[:, :1].reshape(T, 1, 1, 1), scr["qi_s"][0:T]
+                    )
+                    select_rows(q * T, T, 0)
+
+                self._recent_tile(ctx, l, q)
+            self._exchange_selection(ctx)
+        for q in range(0 if self.shard_index else nreq):
             qr = scr["qi_q"][q].astype(BF16)
             s0 = 0 if self.per_request_scores else q * T
             self._score_request(ctx, q, qr, self.tab_base(ctx, l), last=q == nreq - 1, row0=s0)
@@ -314,6 +352,60 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 c = pltpu.make_async_copy(src, ctx.O[dst].at[o, pl.ds(0, MB)], scr["qi_sem"].at[0])
                 c.start()
                 c.wait()
+
+    def _exchange_selection(self, ctx: Any) -> None:
+        """All-gather the sharded indexer's per-row results: pool-path ids (`qi_id` and its
+        SMEM copy `qi_ids`), `qi_kvl` and the `g_a` flag `qc_sga`. Each rank sends its run of
+        rows (lanes `[0, K)` ids, `K` length, `K + 1` flag) to every peer's slot `me`; int32
+        throughout, so the gathered selection is the owner's exactly."""
+        ex, scr, K, T, MB = ctx.ex, ctx.scr, self.budget, ctx.ex.T, ctx.ex.MB
+        npr, rows, W = self._shard_rows(ex)
+        me = ctx.me
+        lane = jax.lax.broadcasted_iota(I32, (1, W), 1)
+        lo = me * rows
+        scr["qi_z"][...] = jnp.zeros((1, 128), I32)  # set by select_rows only on owners
+
+        def pack(i: Any, carry: Any) -> Any:
+            r = jnp.minimum(lo + i, MB - 1)  # past the last request: never read
+            scr["qg_send"][i, :, pl.ds(0, K)] = scr["qi_id"][r]
+            head = jnp.where(lane == K, scr["qi_kvl"][r], 0)
+            scr["qg_send"][i] = jnp.where(
+                lane < K, scr["qg_send"][i], jnp.where(lane == K + 1, scr["qc_sga"][r], head)
+            )
+            return carry
+
+        jax.lax.fori_loop(0, rows, pack, 0)
+        scr["qg_recv"][me] = scr["qg_send"][...]
+        if ex.R > 1:
+            ctx.comm.exchange(
+                ctx.comm.group_copies(
+                    lambda off: scr["qg_send"], scr["qg_recv"].at[me],
+                    scr["qg_ssem"], scr["qg_rsem"], ex.R,
+                )
+            )
+
+        def unpack(r: Any, carry: Any) -> Any:
+            o = r // T // npr
+            row = scr["qg_recv"][o, r - o * rows]
+            scr["qi_id"][r] = row[:, :K]
+            scr["qi_kvl"][r] = jnp.sum(jnp.where(lane == K, row, 0))
+            scr["qc_sga"][r] = jnp.sum(jnp.where(lane == K + 1, row, 0))
+            cs = [
+                pltpu.make_async_copy(
+                    scr["qi_id"].at[r], scr["qi_ids"].at[pl.ds(r, 1), pl.ds(0, K)],
+                    scr["qi_sem"].at[1],
+                ),
+                pltpu.make_async_copy(
+                    scr["qi_z"], scr["qi_ids"].at[pl.ds(r, 1), pl.ds(K, 128)], scr["qi_sem"].at[2]
+                ),
+            ]
+            for c in cs:
+                c.start()
+            for c in cs:
+                c.wait()
+            return carry
+
+        jax.lax.fori_loop(0, MB, unpack, 0)
 
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
         ex, scr, g = ctx.ex, ctx.scr, ctx.g

@@ -38,7 +38,8 @@ from vllm_torchtpu.megakernel.wholestep.spec import wholestep_spec
 from vllm_torchtpu.megakernel_runtime.qwen38_gdn_state import Qwen38GdnPoolLayout
 from vllm_torchtpu.megakernel_runtime.qwen38_segment_call import segment_tiles
 from vllm_torchtpu.megakernel_runtime.qwen38_wholestep_cache import QSALayerCache
-from vllm_torchtpu.megakernel_runtime.qwen38_wholestep_call import LONG_CONTEXT, build_wholestep_call
+from vllm_torchtpu.megakernel_runtime import qwen38_wholestep_call as wsc
+from vllm_torchtpu.megakernel_runtime.qwen38_wholestep_call import build_wholestep_call, indexed_options
 
 
 def main():
@@ -53,8 +54,11 @@ def main():
     ap.add_argument("--remove", default="",
                     help="timing-only removal arms (wrong results): comma list of "
                          "attn_dma, attn_matmul, keys, select")
+    ap.add_argument("--shard", action="store_true",
+                    help="request-sharded indexer (VLLM_TPU_MEGAKERNEL wholeshard=1)")
     a = ap.parse_args()
     _apply_removals(a.remove)
+    wsc.SHARD_INDEX = a.shard
     # The served Pallas mesh order (get_pallas_mesh in the server: [0, 1, 4, 5, 6, 7, 2, 3]).
     by_id = {d.id: d for d in jax.devices()}
     mesh = jax.sharding.Mesh(np.array([by_id[i] for i in (0, 1, 4, 5, 6, 7, 2, 3)]), ("tp",))
@@ -82,7 +86,7 @@ def main():
         spec = wholestep_spec(
             g, R, L=L, first="qsa", pool_gdn=True, qsa=dict(budget=a.budget), step=True,
             indexed=dict(max_groups=a.max_groups, pages_per_seq=pps, carrier="fp8", n_layers=n_att,
-                         **LONG_CONTEXT),
+                         **indexed_options()),
         )
         ex = ExecSpec(R=R, B=B, T=4, ctx=128, tiles=segment_tiles(B))
         _, info = kernel.make_step(mesh, spec, ex)
