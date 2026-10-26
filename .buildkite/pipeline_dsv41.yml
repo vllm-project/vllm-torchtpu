@@ -17,6 +17,22 @@
 # not run here.
 
 steps:
+  - label: "DeepSeek-V4.1 greedy head: CPU reference and rejection parity"
+    key: "dsv41_greedy_head"
+    depends_on: "build_docker"
+    timeout_in_minutes: 30
+    agents:
+      queue: "tpu_v7x_2_queue"
+    commands:
+      - >-
+        bash .buildkite/scripts/run_in_docker.sh
+        python -m pytest
+        tests/kernels/test_fused_greedy_head.py
+        tests/spec_decode/test_rejection_sampler.py
+        --use-tpu -q --junitxml=/perf_eval_results/dsv41-greedy-head.xml
+    artifact_paths:
+      - "perf_eval_results/**/*"
+
   - label: "DeepSeek-V4.1 output projection: dispatch, parity and export"
     key: "dsv41_output_projection"
     depends_on: "build_docker"

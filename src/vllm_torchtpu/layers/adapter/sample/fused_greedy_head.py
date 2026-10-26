@@ -19,7 +19,12 @@ class GreedyTokenIds:
 
 
 class PackedGreedyHead:
-    """Immutable inference weight snapshot; rebuild after any weight update."""
+    """Immutable inference weight snapshot; rebuild after any weight update.
+
+    Keep the original head for shared draft logits and target logits consumers.
+    Packing duplicates its BF16 storage (1.233 GiB for the qualified shape) to
+    avoid per-tile layout conversion. This is not a view of the original weight.
+    """
 
     def __init__(self, weight: torch.Tensor, rows: int):
         vocab, width = weight.shape

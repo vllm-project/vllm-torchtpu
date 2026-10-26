@@ -585,12 +585,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The trace directory and iteration limits come from `profiler_config`;
     # this only selects which profiler consumes them.
     "USE_PHASED_PROFILER": env_bool("USE_PHASED_PROFILER"),
+    # Migration selector: remove after fused-head E2E/quality qualification.
+    "TPU_GREEDY_HEAD_BACKEND": lambda: os.getenv("TPU_GREEDY_HEAD_BACKEND", "logits"),
     # Kernel-iteration mode: split the compiled graph at the Pallas custom
     # ops, keep kernel sources out of the compile-cache key, and enable the
     # /reload_kernel endpoint so kernel edits apply to a running server
     # without restarting it. Development aid; off by default.
-    # Migration selector: remove after fused-head E2E/quality qualification.
-    "TPU_GREEDY_HEAD_BACKEND": lambda: os.getenv("TPU_GREEDY_HEAD_BACKEND", "logits"),
     "TPU_KERNEL_ITER_MODE": lambda: bool(int(os.getenv("TPU_KERNEL_ITER_MODE") or "0")),
     # Comma-separated module names re-imported by /reload_kernel (and, in
     # kernel-iteration mode, excluded from the compile-cache key). Defaults
