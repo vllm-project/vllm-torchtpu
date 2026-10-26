@@ -84,6 +84,7 @@ def apply_omni_model_specific_patches() -> None:
     _patch_wan_fresh_timestep()
     _patch_sdpa_fallback_dispatch()
     _patch_ltx2_vocoder_cpu_init()
+    _patch_wan_vae_conv_out_lane_padding()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -645,3 +646,54 @@ def _patch_ltx2_split_rope() -> None:
     rope_cls.forward = _cached_rope_forward
     ltx2_transformer.apply_split_rotary_emb = _apply_split_rotary_emb
     logger.info("Applied TPU patch: cached LTX-2 split RoPE on the q/k layout.")
+
+
+def _patch_wan_vae_conv_out_lane_padding() -> None:
+    # TODO: Remove once TPU conv3d lowers 3-channel outputs at full lane bandwidth.
+    from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
+
+    orig_forward = WanCausalConv3d.forward
+    padded_channels = 128
+
+    def _padded_forward(
+        self: Any, x: torch.Tensor, cache_x: Any = None
+    ) -> torch.Tensor:
+        if self.out_channels != 3:
+            return orig_forward(self, x, cache_x=cache_x)
+        weight = self.weight
+        if getattr(self, "_padded_weight_src", None) != (
+            weight.data_ptr(),
+            weight.dtype,
+        ):
+            pad_rows = padded_channels - weight.shape[0]
+            self._padded_weight = torch.cat(
+                [weight, weight.new_zeros((pad_rows, *weight.shape[1:]))], dim=0
+            )
+            self._padded_bias = (
+                None
+                if self.bias is None
+                else torch.cat([self.bias, self.bias.new_zeros(pad_rows)], dim=0)
+            )
+            self._padded_weight_src = (weight.data_ptr(), weight.dtype)
+        # Apply the same causal padding as WanCausalConv3d.forward.
+        padding = list(self._padding)
+        if cache_x is not None and self._padding[4] > 0:
+            cache_x = cache_x.to(x.device)
+            x = torch.cat([cache_x, x], dim=2)
+            padding[4] -= cache_x.shape[2]
+        x = torch.nn.functional.pad(x, padding)
+        out = torch.nn.functional.conv3d(
+            x,
+            self._padded_weight,
+            self._padded_bias,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=self.groups,
+        )
+        return out[:, :3]
+
+    WanCausalConv3d.forward = _padded_forward
+    logger.info(
+        "Applied TPU patch: lane-dense output padding for the Wan VAE conv_out."
+    )
