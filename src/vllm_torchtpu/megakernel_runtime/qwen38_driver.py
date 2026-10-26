@@ -504,6 +504,10 @@ class Qwen38SegmentDriver:
         # compare the head-0 (layer 0) kernel against stock layer 0 on the same
         # input, the kernel reading a private copy of layer 0's state blocks.
         drv.h0check_left = _parse_int(raw, "h0check") or 0
+        # `h0dump=1`: the first h0check step also writes each rank's operands, input,
+        # private state snapshot, metadata, kernel output and stock stages to
+        # $CDK_OUTPUT_DIR/h0dump/rank<r>.pt (offline reference replay).
+        drv.h0dump = bool(_parse_int(raw, "h0dump") or 0)
         # `segxcheck=N,segx=8:2`: like h0check for the named segments (each segment
         # kernel vs its stock layers on the same input, private GDN state copies).
         drv.segx_left = _parse_int(raw, "segxcheck") or 0
@@ -690,6 +694,31 @@ class Qwen38SegmentDriver:
                 h = later(h, *args)
             mixed = bb.hyper_connection_mixer.mix(h)[0]
         n = NS * T
+        if getattr(self, "h0dump", False):
+            self.h0dump = False
+            try:
+                import os
+
+                from vllm.distributed import get_tensor_model_parallel_rank
+
+                cpu = lambda t: t.detach().cpu()  # noqa: E731
+                r2 = residual2[0] if isinstance(residual2, tuple) else residual2
+                d = {
+                    "names": names, "rows": rows, "n_req": n_req,
+                    "w": [cpu(t) for t in w], "h_in": cpu(h_in),
+                    "snap": [cpu(t) for t in snap0], "mk_out": cpu(mk_out), "st_out": cpu(st_out),
+                    "stock_block": cpu(block), "stock_g": cpu(g), "stock_res2": cpu(r2),
+                    "stock_mixed2": cpu(mixed2), "stock_moe": cpu(moe),
+                    "mk_nomoe": cpu(mk_nomoe), "mk_nogdn": cpu(mk_nogdn),
+                    "st_nogdn": cpu(st_nogdn), "valid": cpu(kw["valid_tokens"]),
+                }
+                out = os.path.join(os.environ.get("CDK_OUTPUT_DIR", "/tmp/cdk_output"), "h0dump")
+                os.makedirs(out, exist_ok=True)
+                path = os.path.join(out, f"rank{get_tensor_model_parallel_rank()}.pt")
+                torch.save(d, path)
+                logger.info("qwen38 h0check dump written: %s", path)
+            except Exception:
+                logger.exception("qwen38 h0check dump failed")
         logger.info(
             "qwen38 h0check inputs: rows=%d n_req=%d h_in_norm=%.4f st=%s off=%s ck0=%s seq=%s",
             rows, n_req, float(h_in.float()[:n].norm()), st.tolist()[:8], off_tab[st].tolist()[:8],
