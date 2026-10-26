@@ -508,7 +508,9 @@ class TestTpuPlatform:
         # Only batched RPA lays out HND, so passing shows its layouts were used.
         monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
         monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "fork")
-        monkeypatch.setattr(attention_backend, "_REGISTERED_BACKENDS", {"tpu_test"})
+        monkeypatch.setattr(
+            attention_backend, "_REGISTERED_BACKENDS", {"tpu_test": None}
+        )
         backend = (
             PallasBatchedRPAAttentionBackend
             if batched_rpa

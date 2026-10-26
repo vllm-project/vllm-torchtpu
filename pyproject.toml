@@ -75,6 +75,9 @@ dependencies = [
     # scripts/vllm/benchmarking/configs/ were tuned against an earlier libtpu;
     # re-verify those runs when bumping.
     "libtpu==0.0.50",
+    # The FlyWheel attention kernels that --attention-backend flywheel runs
+    # (layers/adapter/flywheel_attention.py). Imported only when selected.
+    "flywheel-tpu==0.4.0",
     "ray[default]",
     "ray[data]",
 ]
@@ -271,6 +274,7 @@ ignore-missing-imports = [
     "compressed_tensors", "compressed_tensors.*",
     "einops", "einops.*",
     "fastapi", "fastapi.*",
+    "flywheel_tpu", "flywheel_tpu.*",
     "google.protobuf", "google.protobuf.*",
     "jax", "jax.*",
     "jaxlib", "jaxlib.*",

@@ -413,6 +413,8 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         "jax": importlib_metadata.version("jax"),
         "jaxlib": importlib_metadata.version("jaxlib"),
         "libtpu": importlib_metadata.version("libtpu"),
+        # --attention-backend flywheel's kernels, outside the hashed sources.
+        "flywheel_tpu": importlib_metadata.version("flywheel-tpu"),
         "env": _tpu_compile_env_factors(),
         "native_env": {name: os.getenv(name) for name in _NATIVE_TPU_COMPILE_ENV_VARS},
         "parallel": {
