@@ -650,6 +650,10 @@ class Qwen38SegmentDriver:
             from . import qwen38_wholestep_call
 
             qwen38_wholestep_call.UNION_ATTN = True
+        if _parse_flag(raw, "wholeloop", False):
+            from . import qwen38_wholestep_call
+
+            qwen38_wholestep_call.LOOP_REQUESTS = True
         every = _parse_int(raw, "wholestats")
         if every:
             from . import qwen38_wholestep_call
