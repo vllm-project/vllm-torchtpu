@@ -698,17 +698,19 @@ class PallasAttentionBackend(AttentionBackend):
         return 1024 * 1024 // 2 // pages_per_req // 4
 
     # TPU has limited SREGs (scalar registers), if page_size is too small, we
-    # can spill SREGs easily which leads to bad performance. The strategy we
-    # apply here is trying to split max-model-len to 16 pages which make the
-    # spill less likely. Meanwhile we make sure the page size is in [16, 256].
+    # can spill SREGs easily which leads to bad performance. Up to 8192 tokens
+    # we split max-model-len into 16 pages to make the spill less likely, and
+    # keep the page size in [16, 256].
     @staticmethod
     def get_page_size(vllm_config: VllmConfig) -> int:
-        # TODO: This is a temporary fix for vmem OOM.
-        # For long model length, we use 16 page-size to avoid too much
-        # VMEM spill. A more robust solution should be implemented to
-        # handle VREG spills.
+        # Longer contexts use 128-token pages. KV offload moves one page of one
+        # layer per transfer, so 16-token pages stalled the engine (#2158). The
+        # RPA v3 kernel sizes its VMEM blocks by bkv_sz, which only has to be a
+        # multiple of the page size. This is smaller than the 256 that 8192
+        # gets, because 128 is the size measured at long context.
+        # get_min_page_size can still raise it for very long contexts.
         if vllm_config.model_config.max_model_len > 8192:
-            return 16
+            return 128
         page_size = next_power_of_2(vllm_config.model_config.max_model_len) // 16
         if page_size <= 16:
             return 16
