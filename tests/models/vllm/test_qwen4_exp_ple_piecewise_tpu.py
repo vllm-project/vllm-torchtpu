@@ -94,6 +94,8 @@ def test_request_indexing_across_host_lookup_compiles_all_buckets(fp8):
     embedding.shard_indices = NS(org_vocab_start_index=0, org_vocab_end_index=512)
     embedding.embedding_dim = 8
     embedding._shared_table = None
+    embedding._gather_workers = 1
+    embedding._gather_pool = None
     embedding.weight = torch.nn.Parameter(
         bits.view(embedding.storage_dtype), requires_grad=False
     )
@@ -121,3 +123,4 @@ def test_request_indexing_across_host_lookup_compiles_all_buckets(fp8):
         assert len(compiled_pieces) == 2
     finally:
         torch._dynamo.reset()
+        embedding.close()
