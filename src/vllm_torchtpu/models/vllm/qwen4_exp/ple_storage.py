@@ -1,0 +1,375 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""PLE storage extensions using the common table and checkpoint shard loader."""
+
+import os
+import traceback
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, wait
+
+import numpy as np
+import torch
+from vllm.distributed import GroupCoordinator
+from vllm.models.qwen4_exp.common.ngram_embedding import Qwen4ExpPLEEmbeddingMethod
+from vllm.models.qwen4_exp.common.ple import (
+    PLEVocabParallelEmbedding,
+    compute_ple_shard_overlap,
+)
+
+from vllm_torchtpu.layers.adapter.custom_ops.ple_op import (
+    build_decode_op,
+    build_raw_lookup_op,
+)
+
+from .ple import Qwen4ExpPLETable
+from .ple_host import SharedPLEOptions, SharedPLETable
+
+_MAX_GATHER_WORKERS = 8
+_GATHER_ROWS_PER_WORKER = 1 << 14
+
+
+class _LoadedPLETable(PLEVocabParallelEmbedding):
+    """Common checkpoint coverage and decode for compact storage."""
+
+    weight: torch.nn.Parameter
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        *,
+        embedding_method: Qwen4ExpPLEEmbeddingMethod,
+        padding_size: int,
+        prefix: str,
+        parallel_group: GroupCoordinator | None = None,
+    ) -> None:
+        if num_embeddings >= 2**31:
+            raise ValueError("PLE row indices must fit int32")
+        self._loaded_ranges: set[tuple[int, int]] = set()
+        self._owned_ranges: list[tuple[int, int]] = []
+        self._finalized = False
+        self._decode: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None
+        super().__init__(
+            num_embeddings,
+            embedding_dim,
+            quant_method=embedding_method,
+            padding_size=padding_size,
+            prefix=prefix,
+            parallel_group=parallel_group,
+        )
+        self.output_dtype = torch.get_default_dtype()
+        if self.output_dtype != torch.bfloat16:
+            raise ValueError("Compact PLE storage requires BF16 model activations")
+
+    def allocate_embedding_weight(
+        self, num_embeddings: int, embedding_dim: int, dtype: torch.dtype
+    ) -> torch.Tensor:
+        if num_embeddings * embedding_dim // 128 >= 2**31:
+            raise ValueError("PLE compact segment indices must fit int32")
+        if dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+            raise ValueError(
+                "Compact PLE storage requires BF16 or FP8 checkpoint weights"
+            )
+        self.storage_dtype = dtype
+        return torch.empty(num_embeddings, embedding_dim, dtype=dtype, device="cpu")
+
+    def _apply(self, fn, recurse=True):
+        # The loader owns CPU storage until finalize_weights. A model-wide
+        # device move must not copy a second, padded embedding table to HBM.
+        weight = self._parameters.pop("weight")
+        try:
+            return super()._apply(fn, recurse)
+        finally:
+            self._parameters["weight"] = weight
+
+    def weight_loader(
+        self,
+        param: torch.Tensor,
+        loaded_weight: torch.Tensor,
+        checkpoint_start: int | None = None,
+    ) -> None:
+        if self._finalized:
+            raise ValueError("PLE table is already finalized")
+        if checkpoint_start is None:
+            raise NotImplementedError(
+                "PLE table loading requires checkpoint row offsets"
+            )
+        if loaded_weight.dtype != self.storage_dtype:
+            raise ValueError("PLE checkpoint dtype must match its embedding method")
+        key = (checkpoint_start, loaded_weight.shape[0])
+        if key in self._loaded_ranges:
+            raise ValueError("Duplicate PLE checkpoint row range")
+        self._copy_checkpoint(param, loaded_weight, checkpoint_start)
+        overlap = compute_ple_shard_overlap(
+            checkpoint_start=checkpoint_start,
+            checkpoint_rows=loaded_weight.shape[0],
+            tp_start=self.shard_indices.org_vocab_start_index,
+            tp_end=self.shard_indices.org_vocab_end_index,
+        )
+        if overlap is not None:
+            self._owned_ranges.append(
+                (
+                    overlap.destination_start,
+                    overlap.destination_start + overlap.row_count,
+                )
+            )
+        self._loaded_ranges.add(key)
+
+    def _copy_checkpoint(self, param, loaded_weight, checkpoint_start):
+        super().weight_loader(param, loaded_weight, checkpoint_start)
+
+    def finalize_weights(self) -> None:
+        if self._finalized:
+            return
+        end = 0
+        for start, stop in sorted(self._owned_ranges):
+            if start > end:
+                raise ValueError("Missing PLE checkpoint rows")
+            end = max(end, stop)
+        if end != self.shard_indices.num_org_elements:
+            raise ValueError("Missing PLE checkpoint rows")
+        self.quant_method.process_weights_after_loading(self)
+        self._finish_storage()
+        self._decode = build_decode_op()
+        self._finalized = True
+
+    def decode(self, raw: torch.Tensor) -> torch.Tensor:
+        assert self._finalized and self._decode is not None
+        if self.storage_dtype == torch.bfloat16:
+            scale = raw.new_ones((), dtype=self.output_dtype)
+        else:
+            scale = self.get_parameter("weight_scale")
+        return self._decode(raw, scale)
+
+    def _finish_storage(self) -> None:
+        raise NotImplementedError
+
+
+class ResidentPLETable(_LoadedPLETable):
+    """Transfer one encoded table to device and retain the dense reference API."""
+
+    forward = Qwen4ExpPLETable.forward
+
+    def allocate_embedding_weight(self, num_embeddings, embedding_dim, dtype):
+        weight = super().allocate_embedding_weight(num_embeddings, embedding_dim, dtype)
+        self.register_buffer("table", torch.empty(0, dtype=torch.uint8))
+        # Keep the shard offset as data rather than a rank-specialized constant
+        # in graphs containing collectives. It moves with this table.
+        self.register_buffer(
+            "_vocab_start",
+            torch.tensor(
+                self.shard_indices.org_vocab_start_index,
+                dtype=torch.int32,
+                device="cpu",
+            ),
+            persistent=False,
+        )
+        self._raw_lookup = None
+        return weight
+
+    def _finish_storage(self) -> None:
+        if self.weight.numel() % 128:
+            raise ValueError("Compact PLE table must fill 128-element storage segments")
+        carrier = torch.int16 if self.storage_dtype == torch.bfloat16 else torch.uint8
+        self.table = (
+            self.weight.detach().view(carrier).reshape(-1, 128).to(self.table.device)
+        )
+        self._vocab_start = self._vocab_start.to(self.table.device)
+        self.weight.data = torch.empty(0, dtype=self.storage_dtype, device="cpu")
+        self._raw_lookup = build_raw_lookup_op(
+            self.shard_indices.num_org_elements,
+            self.embedding_dim,
+        )
+
+    def lookup_raw(self, ids: torch.Tensor) -> torch.Tensor:
+        assert self._finalized and self._raw_lookup is not None
+        return self._raw_lookup(self.table, ids, self._vocab_start)
+
+    def local_rows(self, ids: torch.Tensor) -> torch.Tensor:
+        rows = self.decode(self.lookup_raw(ids))
+        return rows.reshape(*ids.shape, self.embedding_dim)
+
+
+class HostPLETable(_LoadedPLETable):
+    """Keep checkpoint bytes on CPU, optionally in one sealed shared mapping."""
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        *,
+        embedding_method: Qwen4ExpPLEEmbeddingMethod,
+        padding_size: int,
+        prefix: str,
+        parallel_group: GroupCoordinator | None = None,
+        shared: SharedPLEOptions | None = None,
+    ) -> None:
+        self._shared_options = shared
+        self._shared_table: SharedPLETable | None = None
+        self._gather_pool: ThreadPoolExecutor | None = None
+        try:
+            super().__init__(
+                num_embeddings,
+                embedding_dim,
+                embedding_method=embedding_method,
+                padding_size=padding_size,
+                prefix=prefix,
+                parallel_group=parallel_group,
+            )
+        except BaseException:
+            if self._shared_table is not None:
+                self._shared_table.close()
+            raise
+        participants = 1 if shared is None else shared.participants
+        physical_share = max(1, (os.cpu_count() or 1) // participants // 2)
+        self._gather_workers = min(_MAX_GATHER_WORKERS, physical_share)
+
+    def allocate_embedding_weight(
+        self, num_embeddings: int, embedding_dim: int, dtype: torch.dtype
+    ) -> torch.Tensor:
+        if dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+            raise ValueError(
+                "Compact PLE storage requires BF16 or FP8 checkpoint weights"
+            )
+        self.storage_dtype = dtype
+        options = self._shared_options
+        if options is None:
+            return super().allocate_embedding_weight(
+                num_embeddings, embedding_dim, dtype
+            )
+        prototype = torch.empty((), dtype=dtype, device="cpu")
+        self._shared_table = SharedPLETable(
+            directory=options.directory,
+            key=options.key,
+            identity=dict(
+                options.identity,
+                dtype=str(dtype),
+                rows=num_embeddings,
+                head_dim=embedding_dim,
+                start=self.shard_indices.org_vocab_start_index,
+            ),
+            nbytes=num_embeddings * embedding_dim * prototype.element_size(),
+            participants=options.participants,
+        )
+        # No per-process staging allocation and no persistent writable view:
+        # each loader call borrows the mapping, allowing finish() to seal it.
+        return torch.empty(num_embeddings, embedding_dim, dtype=dtype, device="meta")
+
+    def _copy_checkpoint(self, param, loaded_weight, checkpoint_start):
+        table = self._shared_table
+        if table is None:
+            return super()._copy_checkpoint(param, loaded_weight, checkpoint_start)
+        # Readers still consume upstream tensors for dtype/coverage checks.
+        # Only the destination copy is skipped; source I/O depends on the loader.
+        if table.is_writer:
+            with table.writable_buffer() as buffer:
+                destination = torch.frombuffer(
+                    buffer, dtype=self.storage_dtype
+                ).reshape(self.num_embeddings_per_partition, self.embedding_dim)
+                try:
+                    super()._copy_checkpoint(
+                        destination, loaded_weight, checkpoint_start
+                    )
+                finally:
+                    del destination
+
+    def _finish_storage(self) -> None:
+        if self._shared_table is not None:
+            scale = (
+                None
+                if self.storage_dtype == torch.bfloat16
+                else float(self.get_parameter("weight_scale").detach().cpu().item())
+            )
+            self._shared_table.finish(metadata={"scale": scale})
+
+    def _take_rows(
+        self, table: np.ndarray, rows: np.ndarray, output: np.ndarray
+    ) -> None:
+        pending = []
+        try:
+            workers = min(
+                self._gather_workers, max(1, rows.size // _GATHER_ROWS_PER_WORKER)
+            )
+            if workers == 1:
+                np.take(table, rows, axis=0, out=output, mode="clip")
+                return
+            if self._gather_pool is None:
+                self._gather_pool = ThreadPoolExecutor(
+                    max_workers=self._gather_workers,
+                    thread_name_prefix="q4exp-ple-gather",
+                )
+            bounds = np.linspace(0, rows.size, workers + 1, dtype=np.int64)
+
+            def take_partition(index, source):
+                start, end = bounds[index : index + 2]
+                np.take(
+                    source, rows[start:end], axis=0, out=output[start:end], mode="clip"
+                )
+
+            for index in range(workers):
+                pending.append(self._gather_pool.submit(take_partition, index, table))
+            for future in pending:
+                future.result()
+        finally:
+            # Failed tasks must finish before releasing the borrowed mmap view.
+            wait(pending)
+            del table
+
+    def lookup_host(self, ids: torch.Tensor) -> torch.Tensor:
+        assert self._finalized
+        indices = ids.numpy().reshape(-1)
+        start = self.shard_indices.org_vocab_start_index
+        end = self.shard_indices.org_vocab_end_index
+        owned = (indices >= start) & (indices < end)
+        dtype = np.int16 if self.storage_dtype == torch.bfloat16 else np.uint8
+        output = np.empty((indices.size, self.embedding_dim), dtype=dtype)
+        if self._shared_table is None:
+            table = (
+                self.weight.detach()
+                .view(torch.int16 if dtype == np.int16 else torch.uint8)
+                .numpy()
+            )
+            self._take_rows(table, indices - start, output)
+        else:
+            with self._shared_table.buffer() as buffer:
+                table = np.frombuffer(buffer, dtype=dtype).reshape(
+                    -1, self.embedding_dim
+                )
+                try:
+                    self._take_rows(table, indices - start, output)
+                except BaseException as error:
+                    # A retained traceback must not pin a borrowed NumPy view.
+                    traceback.clear_frames(error.__traceback__)
+                    raise
+                finally:
+                    del table
+        output[~owned] = 0
+        raw = torch.from_numpy(output)
+        if self.storage_dtype != torch.bfloat16:
+            raw = raw.view(torch.int8)
+        return raw.reshape(*ids.shape[:-1], ids.shape[-1] * self.embedding_dim)
+
+    def forward(self, input_: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError("Host PLE requires the explicit host lookup boundary")
+
+    def close(self) -> None:
+        if self._gather_pool is not None:
+            self._gather_pool.shutdown(wait=True, cancel_futures=True)
+            self._gather_pool = None
+        if self._shared_table is not None:
+            self._shared_table.close()
+        self.weight.data = torch.empty(
+            0, dtype=self.storage_dtype, device=self.weight.device
+        )
+        self._finalized = False
