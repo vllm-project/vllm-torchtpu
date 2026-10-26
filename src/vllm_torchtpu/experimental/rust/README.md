@@ -5,7 +5,7 @@ the artifacts written by the [AOT exporter](../export/) through PJRT, with
 no Python in the serving process. It takes the `vllm serve` command line:
 
 ```bash
-export RVLLM_BINARY=/path/to/rvllm
+export RVLLM_BINARY=/path/to/rvllm   # or a download location, see below
 src/vllm_torchtpu/experimental/rust/bin/rvllm.bin serve Qwen/Qwen3-0.6B \
   --max-model-len 2048 --port 8000
 ```
@@ -63,12 +63,40 @@ rvllm.bin proxy --port 8000 --prefiller-hosts p --prefiller-ports 8100 \
 
 ## The rvllm binary
 
-The binary is not part of this repository. Set `RVLLM_BINARY` to its path.
+The binary is not part of this repository. `RVLLM_BINARY` points the script to
+it, in one of two ways:
+
+- **A local `rvllm` binary**, used as is.
+- **A location holding `rvllm` and its `metadata.json`**, which has a `sha256`
+  entry. It can be `gs://...`, `https://...` or a local directory. The binary is
+  checked against the sha256 and cached.
+
+A download location holds two files: the binary, named `rvllm`, and a
+`metadata.json` that describes it. This `metadata.json` is not the one in an
+exported artifact. The script reads one field, `sha256`, which is required: the
+binary's SHA-256 in lowercase hex. It ignores every other field; the release
+build of rvllm writes them to say what the binary was built from:
+
+```json
+{
+  "sha256": "732fca1514422763ae796096b72fb60ef6ed243911b91cc44efaef6fcc97b8ee",
+  "size_bytes": 13560920,
+  "git_branch": "main",
+  "git_commit": "9e68e2178",
+  "built_at": "2026-10-26T13:20:10-07:00",
+  "builder_image": "<image the binary was compiled in>",
+  "date_tag": "20261026",
+  "elf_interpreter": "/lib64/ld-linux-x86-64.so.2"
+}
+```
 
 Other variables:
 
 | Variable | Meaning |
 |---|---|
-| `RVLLM_CACHE_DIR` | Where exports are cached. The default is `~/.cache/rvllm`. |
+| `RVLLM_BINARY_SHA256` | The expected sha256, overriding `metadata.json`. |
+| `RVLLM_CACHE_DIR` | The cache root for binaries and exports. The default is `~/.cache/rvllm`. |
 | `RVLLM_ARTIFACT_DIR` | Serve this exported artifact instead of exporting. |
 | `PYTHON` | The interpreter that runs the exporter. The default is `python3`. |
+
+Downloading from `gs://` uses `gcloud storage` with the caller's credentials.
