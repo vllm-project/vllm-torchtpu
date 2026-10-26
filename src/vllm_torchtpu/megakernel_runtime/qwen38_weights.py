@@ -216,3 +216,24 @@ def pack_segment_operands(
             # on every call (q40 j-c2430942: ~1.8 ms/step of execute_as_strided).
             out.append(t.contiguous())
     return out
+
+
+def own_operands(ops: list[torch.Tensor]) -> tuple[list[torch.Tensor], int]:
+    """Kernel operands as non-view tensors, and how many were views.
+
+    torch_tpu re-materializes a view operand with an eager as_strided program
+    on every call of the compiled program that takes it. A contiguous view at
+    storage offset 0 is detached (same storage, no copy); any other view is
+    cloned (only small operands, such as the expert-scale reshape, are views).
+    """
+    out, fixed = [], 0
+    for t in ops:
+        if t._base is None:
+            out.append(t)
+            continue
+        fixed += 1
+        if t.is_contiguous() and t.storage_offset() == 0:
+            out.append(t.detach())
+        else:
+            out.append(t.clone())
+    return out, fixed

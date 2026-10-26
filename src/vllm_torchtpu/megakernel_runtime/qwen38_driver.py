@@ -47,7 +47,7 @@ from .driver import (
 from .exported_bridge import make_typed_step_wrapper, sharded_jax_callable
 from .qwen38_mtp_tail import MtpTailKind
 from .qwen38_segment_call import GDN_META, T_VERIFY, build_segment_call, segment_tiles
-from .qwen38_weights import head_groups, pack_segment_operands, segment_layers
+from .qwen38_weights import head_groups, own_operands, pack_segment_operands, segment_layers
 
 logger = init_logger(__name__)
 
@@ -362,6 +362,7 @@ class Qwen38Segments(nn.Module):
             L = len(segment_layers(g, s))
             ex = ExecSpec(R=R, B=buckets[0], T=T_VERIFY, ctx=128, tiles=segment_tiles(buckets[0]))
             ops = pack_segment_operands(model, g, s, qwen38.segment_spec(g, R, L=L), ex)
+            ops = self._own(ops, f"segment {s}")
             self.n_w.append(len(ops))
             for i, t in enumerate(ops):
                 self.register_buffer(f"w{s}_{i}", t, persistent=False)
@@ -371,11 +372,22 @@ class Qwen38Segments(nn.Module):
             ex = ExecSpec(R=R, B=buckets[0], T=T_VERIFY, ctx=128, tiles=segment_tiles(buckets[0]))
             spec = qwen38.segment_spec(g, R, L=L, head=True)
             ops = pack_segment_operands(model, g, -1, spec, ex, layer_ids=group, head=True)
+            ops = self._own(ops, f"head group {h}")
             self.n_hw.append(len(ops))
             for i, t in enumerate(ops):
                 self.register_buffer(f"h{h}_{i}", t, persistent=False)
         self.pool = None
         self.layout = None
+
+    @staticmethod
+    def _own(ops: list[torch.Tensor], what: str) -> list[torch.Tensor]:
+        """With VLLM_TPU_MK_OWN_OPERANDS, register no view operands."""
+        if not envs.VLLM_TPU_MK_OWN_OPERANDS:
+            return ops
+        ops, fixed = own_operands(ops)
+        if fixed:
+            logger.info("qwen38 megakernel %s: %d view operands made owned", what, fixed)
+        return ops
 
     def bind_pool(self) -> None:
         from .qwen38_gdn_state import Qwen38GdnPoolLayout
@@ -465,6 +477,7 @@ class MtpTail(nn.Module):
         R = mesh.size
         ex = ExecSpec(R=R, B=buckets[0], T=T_VERIFY, ctx=128, tiles=segment_tiles(buckets[0]))
         ops = pack_segment_operands(draft, g, -1, qwen38.segment_spec(g, R, L=1), ex, layer_ids=[0])
+        ops = Qwen38Segments._own(ops, "MTP tail")
         self.n_w = len(ops)
         for i, t in enumerate(ops):
             self.register_buffer(f"w_{i}", t, persistent=False)
