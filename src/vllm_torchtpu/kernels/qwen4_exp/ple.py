@@ -42,12 +42,15 @@ def _bf16(x):
     return jax.lax.optimization_barrier(x.astype(jnp.bfloat16))
 
 
-def resident_lookup_raw(table, ids, vocab_start, *, local_rows: int, head_dim: int):
+def resident_lookup_raw(
+    table, ids, vocab_start, *, local_rows: int, head_dim: int, chunk_tokens: int = 8
+):
     """Owner-masked integer bits [T,heads*head_dim]: INT8/FP8 or INT16/BF16.
 
-    Use the validated eight-token chunks: unbounded full-table gathers failed
-    in the original FP8 lowering probes. Pad/crop only the queries, keeping
-    the persistent table unchanged.
+    Gather ``chunk_tokens`` tokens at a time (a multiple of 8; steps shorter
+    than a chunk use one chunk of their own size): unbounded full-table
+    gathers failed in the original FP8 lowering probes. Pad/crop only the
+    queries, keeping the persistent table unchanged.
 
     ``vocab_start`` (an int or an int32 array of one element) is this shard's
     first row. As an array it is an operand rather than a constant, so every
@@ -58,8 +61,10 @@ def resident_lookup_raw(table, ids, vocab_start, *, local_rows: int, head_dim: i
     carrier = jnp.int16 if table.dtype == jnp.int16 else jnp.int8
     if token_count == 0:
         return jnp.zeros((0, embedding_dim), carrier)
+    assert chunk_tokens % 8 == 0, chunk_tokens
+    chunk = min(chunk_tokens, -(-token_count // 8) * 8)
     padded = jnp.pad(
-        ids.astype(jnp.int32), ((0, (-token_count) % 8), (0, 0)), constant_values=-1
+        ids.astype(jnp.int32), ((0, (-token_count) % chunk), (0, 0)), constant_values=-1
     )
     start = jnp.asarray(vocab_start, jnp.int32).reshape(())
 
@@ -70,7 +75,7 @@ def resident_lookup_raw(table, ids, vocab_start, *, local_rows: int, head_dim: i
         bits = jnp.where(owned[..., None], bits, jnp.zeros((), table.dtype))
         return jax.lax.bitcast_convert_type(bits, carrier)
 
-    result = jax.lax.map(gather, padded.reshape(-1, 8, heads))
+    result = jax.lax.map(gather, padded.reshape(-1, chunk, heads))
     return result.reshape(-1, embedding_dim)[:token_count]
 
 

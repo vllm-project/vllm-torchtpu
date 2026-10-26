@@ -60,3 +60,27 @@ def test_one_program_serves_every_shard():
         got = lookup(table, jnp.asarray(ids), jnp.asarray([start], jnp.int32))
         np.testing.assert_array_equal(np.asarray(got), _expected(rows, ids, start))
     assert lookup._cache_size() == 1
+
+
+@pytest.mark.parametrize("chunk_tokens", [16, 64, 256])
+@pytest.mark.parametrize("token_count", [1, 13, 64, 300])
+def test_larger_chunks_match_eight_token_chunks(chunk_tokens, token_count):
+    """VLLM_TPU_PLE_LOOKUP_CHUNK_TOKENS changes only how many tokens one
+    gather takes, including steps shorter than a chunk and ragged tails."""
+    rng = np.random.default_rng(chunk_tokens + token_count)
+    rows, table = _shard(rng)
+    start = jnp.asarray([LOCAL_ROWS], jnp.int32)
+    ids = rng.integers(0, 3 * LOCAL_ROWS, (token_count, 2))
+    want = resident_lookup_raw(
+        table, jnp.asarray(ids), start, local_rows=LOCAL_ROWS, head_dim=HEAD_DIM
+    )
+    got = resident_lookup_raw(
+        table,
+        jnp.asarray(ids),
+        start,
+        local_rows=LOCAL_ROWS,
+        head_dim=HEAD_DIM,
+        chunk_tokens=chunk_tokens,
+    )
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    np.testing.assert_array_equal(np.asarray(got), _expected(rows, ids, LOCAL_ROWS))

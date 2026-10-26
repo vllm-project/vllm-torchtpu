@@ -783,7 +783,7 @@ def test_ple_native_adapter_reuses_common_math_and_checkpoint(
     group = Group()
     parallel = PLEParallel(group, group, embedding_across_dp=False)
 
-    def raw_lookup(rows, width):
+    def raw_lookup(rows, width, chunk_tokens=8):
         def run(table, ids, vocab_start):
             result = table.reshape(rows, width)[ids.clamp(0, rows - 1)].clone()
             result[(ids < 0) | (ids >= rows)] = 0

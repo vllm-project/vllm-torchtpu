@@ -131,6 +131,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_INDEXER_SHARD_A2A_MIN_TOKENS: int = 0
     VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP: bool = False
     VLLM_TPU_QSA_INDEXER_TOKEN_SHARD: bool = False
+    VLLM_TPU_PLE_LOOKUP_CHUNK_TOKENS: int = 8
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -715,6 +716,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # precedence over VLLM_TPU_QSA_INDEXER_SHARD in that graph.
     "VLLM_TPU_QSA_INDEXER_TOKEN_SHARD": env_bool(
         "VLLM_TPU_QSA_INDEXER_TOKEN_SHARD", default=False
+    ),
+    # Qwen4-exp resident PLE table: tokens per gather in the raw embedding
+    # lookup (a multiple of 8). 8 is the originally validated chunk; an
+    # 8192-token prefill step then runs 1024 sequential gathers.
+    "VLLM_TPU_PLE_LOOKUP_CHUNK_TOKENS": env_nonnegative_int(
+        "VLLM_TPU_PLE_LOOKUP_CHUNK_TOKENS", 8
     ),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4

@@ -11,6 +11,7 @@ from vllm.distributed import GroupCoordinator
 from vllm.models.qwen4_exp.common.ngram_embedding import Qwen4ExpPLEEmbeddingMethod
 from vllm.models.qwen4_exp.common.ple import compute_ple_shard_overlap
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.custom_ops.ple_op import (
     build_decode_op,
     build_raw_lookup_op,
@@ -153,7 +154,9 @@ class ResidentPLETable(Qwen4ExpPLETable):
             device=self.table.device,
         )
         self._raw_lookup = build_raw_lookup_op(
-            self.shard_indices.num_org_elements, self.embedding_dim
+            self.shard_indices.num_org_elements,
+            self.embedding_dim,
+            envs.VLLM_TPU_PLE_LOOKUP_CHUNK_TOKENS,
         )
 
     def lookup_raw(self, ids: torch.Tensor) -> torch.Tensor:
