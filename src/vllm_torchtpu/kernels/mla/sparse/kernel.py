@@ -1884,6 +1884,17 @@ def _attention_kernel(
         if sparsecore_layout
         else cache_kv_nope_hbm_ref.shape[1] // kv_cache_utils.WORD_BYTES
     )
+    # Gathered keys per rope row: four padded quads, or eight in the packed
+    # gather output (TPU_SPARSE_MLA_GATHER_PACKED_ROPE; live groups only).
+    rope_keys_per_row = (
+        bkv_sz // cache_kv_rope_hbm_ref.shape[1]
+        if sparsecore_layout
+        else native_sc_gather.ROPE_PACKING
+    )
+    packed_rope_rows = rope_keys_per_row == 2 * native_sc_gather.ROPE_PACKING
+    assert rope_keys_per_row == native_sc_gather.ROPE_PACKING or (
+        packed_rope_rows and group_tab_ref is not None
+    ), (rope_keys_per_row, group_tab_ref)
 
     q_dtype = q_hbm_ref.dtype
     q_packing = get_dtype_packing(q_dtype)
@@ -2057,11 +2068,7 @@ def _attention_kernel(
             nope_rows = (
                 slice_sz if sparsecore_layout else slice_sz * kv_cache_utils.WORD_BYTES
             )
-            rope_rows = (
-                slice_sz // native_sc_gather.ROPE_PACKING
-                if sparsecore_layout
-                else slice_sz
-            )
+            rope_rows = slice_sz // rope_keys_per_row if sparsecore_layout else slice_sz
             bkv_nope_vmem_ref = bkv_nope_x2_ref.at[
                 bkv_sem_idx, :, pl.ds(0, nope_rows), :
             ]
@@ -2758,8 +2765,7 @@ def _attention_kernel(
                 words = jnp.where(key < kv_len, words, jnp.uint32(0))
             bkv_nope = pltpu.bitcast(words, jnp.uint8).reshape(rows, nope_dim)
             bkv_nope = pltpu.bitcast(bkv_nope, jnp.float8_e4m3fn)
-        bkv_rope = pltpu.bitcast(rope_ref[...], jnp.uint8).reshape(rows, 128)
-        bkv_rope = pltpu.bitcast(bkv_rope, jnp.float8_e4m3fn)
+        bkv_rope = rope_keys(rope_ref[...], rows)
         bkv = jnp.concatenate([bkv_nope, bkv_rope], axis=-1)
         if bkv.shape[-1] < head_dim:
             bkv = jnp.pad(bkv, ((0, 0), (0, head_dim - bkv.shape[-1])))
@@ -2767,6 +2773,14 @@ def _attention_kernel(
             k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
             bkv = jnp.where(k_span < kv_len, bkv, 0)
         return bkv
+
+    def rope_keys(words, rows):
+        """Gathered SparseCore rope words -> [rows, 128] fp8 keys: the 64 rope
+        bytes of each key, then zeros."""
+        if packed_rope_rows:
+            words = native_sc_gather.expand_packed_rope(words)
+        keys = pltpu.bitcast(words, jnp.uint8).reshape(rows, 128)
+        return pltpu.bitcast(keys, jnp.float8_e4m3fn)
 
     def load_bkv(bkv_sem_idx, batch_idx, rows=None, levers=()):
         # `rows` None = the whole bkv_sz tile (kv rungs / row widths narrow it).
@@ -2803,18 +2817,16 @@ def _attention_kernel(
         if slice_sz == bkv_sz:
             bkv_rope = bkv_rope_ref[...]
         elif sparsecore_layout:
-            bkv_rope = bkv_rope_ref.at[
-                pl.ds(0, slice_sz // native_sc_gather.ROPE_PACKING), :
-            ][...]
+            bkv_rope = bkv_rope_ref.at[pl.ds(0, slice_sz // rope_keys_per_row), :][...]
         else:
             bkv_rope = bkv_rope_ref.at[pl.ds(0, slice_sz), :][...]
         if sparsecore_layout:
             # The native gather's delta-swap produces four-token grouped
             # uint32[128] rows. Expanding their byte lanes recovers one
             # contiguous 128-byte row per selected token.
-            bkv_rope = pltpu.bitcast(bkv_rope, jnp.uint8)
-            bkv_rope = bkv_rope.reshape(slice_sz, 128)
-        bkv_rope = pltpu.bitcast(bkv_rope, jnp.float8_e4m3fn)
+            bkv_rope = rope_keys(bkv_rope, slice_sz)
+        else:
+            bkv_rope = pltpu.bitcast(bkv_rope, jnp.float8_e4m3fn)
         bkv = jnp.concatenate([bkv_nope, bkv_rope], axis=-1)
 
         # Pad kv (576) to q's 128-aligned head_dim (640); the padded dims are
@@ -3486,6 +3498,7 @@ def prepare_outputs(
         "out_pieces_fault",
         "out_pieces_gather_first",
         "packed_rope",
+        "packed_gather",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -3545,6 +3558,7 @@ def sparse_ragged_paged_attention(
     send_peer: jax.Array | None = None,
     send_recv_in: jax.Array | None = None,
     packed_rope: bool = False,
+    packed_gather: bool = False,
 ) -> jax.Array | tuple[jax.Array, ...]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -3720,6 +3734,12 @@ def sparse_ragged_paged_attention(
         (`SparseMLAKVCacheSpec.packed_rope`); the gather expands it to the
         padded rows the attention body reads, so the scores are unchanged.
         `kv_write` then writes 16-word rope tokens.
+      packed_gather: TPU_SPARSE_MLA_GATHER_PACKED_ROPE. On live-group chunks
+        (`mixed_live_gather`) the gather writes each key's 64 rope bytes
+        without the 64-byte zero tail, eight keys per row, and the attention
+        kernel restores the tail in VMEM (`native_sc_gather.expand_packed_rope`).
+        Half the gathered rope bytes cross HBM; every score is unchanged.
+        Other chunks keep the padded rows.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -4216,6 +4236,7 @@ def sparse_ragged_paged_attention(
             send_peer=send_peer,
             send_recv_in=send_recv_in,
             packed_rope=packed_rope,
+            packed_gather=packed_gather and group_tab is not None,
             **extra,
         )
 
@@ -4415,6 +4436,7 @@ def sparse_attention_chunk(
     send_peer: jax.Array | None = None,
     send_recv_in: jax.Array | None = None,
     packed_rope: bool = False,
+    packed_gather: bool = False,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -4462,6 +4484,9 @@ def sparse_attention_chunk(
     `packed_rope` (SparseCore layout only): the rope cache holds 16 words per
     token (and `kv_write` writes 16-word rope tokens); the gather returns the
     same padded rows either way.
+    `packed_gather` (with `group_tab`): the gathered rope buffer holds eight
+    keys per row without the zero tail (`dsa_gather_native_sc(packed_out=)`),
+    and so does `pre_gathered`'s.
     """
     if kv_write is not None and not (gather_live_in_indices or group_tab is not None):
         raise ValueError("kv_write rides the fused-prep or live-group capped gather")
@@ -4481,6 +4506,11 @@ def sparse_attention_chunk(
         raise ValueError("topk_cap requires the sparsecore cache layout")
     if packed_rope and not sparsecore_layout:
         raise ValueError("packed_rope requires the sparsecore cache layout")
+    if packed_gather and (group_tab is None or topk_cap is None):
+        raise ValueError("packed_gather needs the live-group capped path")
+    gathered_rope_keys_per_row = native_sc_gather.ROPE_PACKING * (
+        2 if packed_gather else 1
+    )
     if topk_cap is not None and (topk_cap % GATHER_ATOM_ROWS or topk % topk_cap):
         raise ValueError(
             f"topk_cap ({topk_cap}) must be a multiple of {GATHER_ATOM_ROWS} "
@@ -5048,6 +5078,7 @@ def sparse_attention_chunk(
                 kv_write=kv_write,
                 write_fault=kv_write_fault,
                 packed_rope=packed_rope,
+                **({"packed_out": True} if packed_gather else {}),
                 **live_kwargs,
             )
             gathered_nope_buffer, gathered_rope_buffer = gathered[:2]
@@ -5058,7 +5089,7 @@ def sparse_attention_chunk(
             )
             gathered_rope_buffer = gathered_rope_buffer.reshape(
                 capped_windows * chunk_size,
-                topk_cap // native_sc_gather.ROPE_PACKING,
+                topk_cap // gathered_rope_keys_per_row,
                 128,
             )
             if group_tab is not None:
@@ -5073,7 +5104,7 @@ def sparse_attention_chunk(
                     gathered_rope_buffer.reshape(
                         chunk_size * topk // block,
                         kernel_batch_size,
-                        GATHER_ATOM_ROWS // native_sc_gather.ROPE_PACKING,
+                        GATHER_ATOM_ROWS // gathered_rope_keys_per_row,
                         128,
                     ),
                 )
