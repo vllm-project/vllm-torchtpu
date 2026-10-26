@@ -140,14 +140,8 @@ class KimiMoE(nn.Module):
             and os.environ.get("TPU_K3_MOE_LATENT_AR_OVERLAP", "0") == "1"
         ):
             try:
-                intra_group = get_intra_chip_group()
                 tp_group = get_tp_group()
-                if (
-                    intra_group is not None
-                    and getattr(intra_group, "world_size", None) == 2
-                    and tp_group is not None
-                ):
-                    self.shared_group = intra_group
+                if tp_group is not None:
                     self.prefill_group = tp_group
             except Exception:
                 pass
@@ -210,7 +204,9 @@ class KimiMoE(nn.Module):
                 routed_input_transform=self.routed_expert_down_proj,
                 routed_output_transform=routed_output_transform,
             )
-        if self.shared_group is not None and not hasattr(
+        if (
+            self.prefill_group is not None or self.shared_group is not None
+        ) and not hasattr(
             getattr(self.experts.routed_experts, "quant_method", None),
             "apply_with_routing" if envs.TPU_K3_SP_PREFILL else "apply_monolithic",
         ):
@@ -266,7 +262,11 @@ class KimiMoE(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, sequence_parallel: bool = False
     ) -> torch.Tensor:
-        if sequence_parallel or self.shared_group is not None:
+        if (
+            sequence_parallel
+            or self.prefill_group is not None
+            or self.shared_group is not None
+        ):
             return self._forward_expert_parallel(hidden_states, sequence_parallel)
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
@@ -304,6 +304,8 @@ class KimiMoE(nn.Module):
                 if self.shared_experts is not None
                 else None
             )
+            if shared_output is not None and self.shared_group is None:
+                shared_output = group.all_reduce(shared_output)
             up_chunks = []
             for chunk_out in reduced_chunks:
                 if self.routed_expert_norm is not None:
@@ -340,6 +342,12 @@ class KimiMoE(nn.Module):
             if self.shared_experts is not None
             else None
         )
+        if (
+            shared_output is not None
+            and not sequence_parallel
+            and self.shared_group is None
+        ):
+            shared_output = group.all_reduce(shared_output)
         if self.routed_expert_norm is not None:
             output = self.routed_expert_norm(output)
         if self.routed_expert_up_proj is not None:

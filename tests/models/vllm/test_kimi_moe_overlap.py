@@ -77,9 +77,9 @@ def test_kimi_moe_init_acquires_latent_allreduce_and_intra_chip_shared_groups(
         moe_intermediate_size=1024,
     )
     layer = kimi_moe.KimiMoE(config, quant_config=None, prefix="moe")
-    assert layer.shared_group is intra_group
+    assert layer.shared_group is None
     assert layer.prefill_group is tp_group
-    assert mlp_kwargs["tp_group"] is intra_group
+    assert mlp_kwargs["tp_group"] is None
 
 
 def test_kimi_moe_init_defaults_to_tp32_shared_experts_and_fused_moe_runner(
@@ -225,6 +225,77 @@ def test_kimi_moe_schedules_shared_experts_between_allreduce_and_routed_up_proj(
     expected_routed = ((x[:, :2] + x[:, :2]) * 2.0 * 1.5).repeat(1, 2)
     expected = expected_routed + x * 0.25
     torch.testing.assert_close(out, expected)
+
+
+def test_kimi_moe_tp32_shared_experts_ping_pong_allreduce_overlap() -> None:
+    """When shared_group is None (TP=32 shared_experts, reduce_results=False)
+    and prefill_group is set (TPU_K3_MOE_LATENT_AR_OVERLAP=1), _forward_expert_parallel
+    issues:
+      1) group.all_reduce(routed_latent) [T, 2]
+      2) shared_experts(hidden_states) [T, 4] (overlapped with [T, 2] AllReduce)
+      3) group.all_reduce(shared_output) [T, 4]
+      4) routed_expert_norm + routed_expert_up_proj (overlapped with [T, 4] AllReduce)."""
+    events: list[tuple[str, tuple[int, ...]]] = []
+
+    class Group:
+        def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+            tag = "all_reduce_latent" if x.shape[-1] == 2 else "all_reduce_shared"
+            events.append((tag, tuple(x.shape)))
+            return x * 2.0
+
+    model = kimi_moe.KimiMoE.__new__(kimi_moe.KimiMoE)
+    nn.Module.__init__(model)
+    model.shared_group = None
+    model.prefill_group = Group()
+    model.pipe_chunks = 1
+    model.gate = _Projection(
+        lambda x: (events.append(("gate", tuple(x.shape))) or x[:, :4])
+    )
+    model.routed_expert_down_proj = _Projection(
+        lambda x: (events.append(("down_proj", tuple(x.shape))) or x[:, :2])
+    )
+    model.routed_expert_norm = lambda x: (
+        events.append(("routed_norm", tuple(x.shape))) or (x * 1.5)
+    )
+    model.routed_expert_up_proj = _Projection(
+        lambda x: (events.append(("up_proj", tuple(x.shape))) or x.repeat(1, 2))
+    )
+
+    def shared_fn(x: torch.Tensor, *, sequence_parallel: bool = False) -> torch.Tensor:
+        assert not sequence_parallel
+        events.append(("shared_experts", tuple(x.shape)))
+        return x * 0.25
+
+    model.shared_experts = shared_fn
+    model.experts = SimpleNamespace(
+        routed_experts=SimpleNamespace(
+            quant_method=SimpleNamespace(
+                apply_monolithic=lambda layer, latent, logits: (
+                    events.append(("routed_gmm", tuple(latent.shape)))
+                    or (latent + logits[:, :2])
+                )
+            )
+        )
+    )
+
+    x = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+    out = model(x, sequence_parallel=False)
+
+    assert [e[0] for e in events] == [
+        "gate",
+        "down_proj",
+        "routed_gmm",
+        "all_reduce_latent",
+        "shared_experts",
+        "all_reduce_shared",
+        "routed_norm",
+        "up_proj",
+    ]
+    assert events[3] == ("all_reduce_latent", (8, 2))
+    assert events[5] == ("all_reduce_shared", (8, 4))
+    expected_routed = ((x[:, :2] + x[:, :2]) * 2.0 * 1.5).repeat(1, 2)
+    expected_shared = (x * 0.25) * 2.0
+    torch.testing.assert_close(out, expected_routed + expected_shared)
 
 
 @pytest.mark.parametrize("num_tokens", [4096, 8192])
