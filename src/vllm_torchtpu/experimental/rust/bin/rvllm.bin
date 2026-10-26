@@ -26,13 +26,15 @@
 # records it in the artifact. Other subcommands (bench, proxy, --version) run
 # the rvllm binary directly.
 #
-# The rvllm binary is not part of this repository. Point to it with one of:
+# The rvllm binary is not part of this repository. RVLLM_BINARY points to it:
 #   RVLLM_BINARY=/path/to/rvllm       a local binary, used as is
-#   RVLLM_BINARY_URL=<location>       a directory holding `rvllm` and its
-#                                     `metadata.json` (with a "sha256" entry):
-#                                     gs://..., https://... or a local path.
-#                                     The binary is checked against the sha256
-#                                     and cached under RVLLM_CACHE_DIR.
+#   RVLLM_BINARY=<location>           a location holding `rvllm` and a
+#                                     `metadata.json` whose "sha256" entry is
+#                                     the binary's SHA-256 (lowercase hex):
+#                                     gs://..., https://... or a local
+#                                     directory. The binary is checked against
+#                                     the sha256 and cached under
+#                                     RVLLM_CACHE_DIR.
 # Optional:
 #   RVLLM_BINARY_SHA256    expected sha256 (overrides metadata.json)
 #   RVLLM_CACHE_DIR        cache root (default: ~/.cache/rvllm)
@@ -102,35 +104,41 @@ fetch() {
 
 # Prints the path of the rvllm binary, downloading and verifying it if needed.
 resolve_binary() {
-    if [ -n "${RVLLM_BINARY:-}" ]; then
-        [ -x "${RVLLM_BINARY}" ] || die "RVLLM_BINARY=${RVLLM_BINARY} is not an executable file"
-        echo "${RVLLM_BINARY}"
+    local location="${RVLLM_BINARY:-}"
+    [ -n "${location}" ] ||
+        die "set RVLLM_BINARY to an rvllm binary, or to a location (gs://, https:// or a" \
+            "directory) holding rvllm and its metadata.json"
+    if [ -f "${location}" ]; then
+        [ -x "${location}" ] || die "RVLLM_BINARY=${location} is not executable"
+        echo "${location}"
         return
     fi
-    [ -n "${RVLLM_BINARY_URL:-}" ] ||
-        die "set RVLLM_BINARY to an rvllm binary, or RVLLM_BINARY_URL to where to download it from"
+    case "${location}" in
+        gs://* | http://* | https://*) ;;
+        *) [ -d "${location}" ] || die "RVLLM_BINARY=${location} is neither a file, a directory nor a URL" ;;
+    esac
     local tmp
     tmp="$(mktemp -d)"
     # shellcheck disable=SC2064 # expand ${tmp} now: it is local to this function
     trap "rm -rf '${tmp}'" RETURN
     local expected="${RVLLM_BINARY_SHA256:-}"
     if [ -z "${expected}" ]; then
-        fetch "${RVLLM_BINARY_URL}" metadata.json "${tmp}/metadata.json" ||
-            die "could not fetch metadata.json from ${RVLLM_BINARY_URL} (or set RVLLM_BINARY_SHA256)"
+        fetch "${location}" metadata.json "${tmp}/metadata.json" ||
+            die "could not fetch metadata.json from ${location} (or set RVLLM_BINARY_SHA256)"
         expected="$("${PYTHON}" -c 'import json, sys; print(json.load(open(sys.argv[1]))["sha256"])' \
-            "${tmp}/metadata.json")" || die "metadata.json from ${RVLLM_BINARY_URL} has no sha256"
+            "${tmp}/metadata.json")" || die "metadata.json from ${location} has no sha256"
     fi
     local cached="${CACHE_DIR}/bin/${expected}/rvllm"
     if [ -x "${cached}" ] && [ "$(sha256_of "${cached}")" = "${expected}" ]; then
         echo "${cached}"
         return
     fi
-    fetch "${RVLLM_BINARY_URL}" rvllm "${tmp}/rvllm" ||
-        die "could not fetch the rvllm binary from ${RVLLM_BINARY_URL}"
+    fetch "${location}" rvllm "${tmp}/rvllm" ||
+        die "could not fetch the rvllm binary from ${location}"
     local actual
     actual="$(sha256_of "${tmp}/rvllm")"
     [ "${actual}" = "${expected}" ] ||
-        die "rvllm from ${RVLLM_BINARY_URL} has sha256 ${actual}, expected ${expected}"
+        die "rvllm from ${location} has sha256 ${actual}, expected ${expected}"
     mkdir -p "$(dirname "${cached}")"
     chmod 755 "${tmp}/rvllm"
     mv -f "${tmp}/rvllm" "${cached}"

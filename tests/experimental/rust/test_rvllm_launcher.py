@@ -164,7 +164,7 @@ def test_a_binary_must_be_named(env):
     del env["RVLLM_BINARY"]
     result = run(env, "serve", "m", check=False)
     assert result.returncode != 0
-    assert "RVLLM_BINARY_URL" in result.stderr
+    assert "RVLLM_BINARY" in result.stderr
 
 
 def _publish(env, tmp_path, sha=None):
@@ -175,7 +175,7 @@ def _publish(env, tmp_path, sha=None):
     (site / "rvllm").write_bytes(data)
     digest = sha or hashlib.sha256(data).hexdigest()
     (site / "metadata.json").write_text(json.dumps({"sha256": digest}))
-    env["RVLLM_BINARY_URL"] = str(site)
+    env["RVLLM_BINARY"] = str(site)
     return hashlib.sha256(data).hexdigest()
 
 
@@ -197,3 +197,10 @@ def test_downloaded_binary_with_the_wrong_sha256_is_rejected(env, tmp_path):
     assert result.returncode != 0
     assert "expected " + "0" * 64 in result.stderr
     assert not list((Path(env["RVLLM_CACHE_DIR"]) / "bin").glob("*/rvllm"))
+
+
+def test_a_binary_location_that_does_not_exist_is_rejected(env, tmp_path):
+    env["RVLLM_BINARY"] = str(tmp_path / "missing")
+    result = run(env, "bench", check=False)
+    assert result.returncode != 0
+    assert "neither a file, a directory nor a URL" in result.stderr
