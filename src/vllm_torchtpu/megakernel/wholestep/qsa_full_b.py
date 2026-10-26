@@ -75,6 +75,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         shard_index: bool = False,
         union_attn: bool = False,
         union_stats: bool = False,
+        loop_requests: bool = False,
         **kw: Any,
     ) -> None:
         """`carrier`: "" = prototype contiguous keys `[requests, max_groups, 128]`; "fp8" = the
@@ -102,7 +103,11 @@ class QSAFullIndexedBlock(QSAFullBlock):
         their selections, streamed once (`union_attn.attend_request`). `union_stats` (needs
         `union_attn`): per QSA layer and request, output `qsa_union_stats` lanes `[union groups,
         sum of the rows' groups, max row groups, rows with groups]` (int32), read by the runner
-        outside the graph to measure how much a request's rows share."""
+        outside the graph to measure how much a request's rows share. `loop_requests` (needs
+        `per_request_scores`): the per-request work of a QSA layer (completed group, key
+        streaming and scores, selection, recent tile) runs in a `fori_loop` over requests instead
+        of a Python loop, so the kernel body, and its compile time, does not grow with the
+        bucket's request count."""
         super().__init__(**kw)
         assert max_groups % 1024 == 0, max_groups  # whole (8, 128) score tiles per row
         self.max_groups, self.pps, self.debug = max_groups, pages_per_seq, debug
@@ -117,6 +122,8 @@ class QSAFullIndexedBlock(QSAFullBlock):
         assert not union_attn or per_request_scores, "the union is built per request"
         self.union_stats = union_stats
         assert not union_stats or union_attn, "the stats count the union"
+        self.loop_requests = loop_requests
+        assert not loop_requests or per_request_scores, "the request loop selects per request"
         self.chunk_pages = chunk_pages if carrier else max_groups // GPK
         assert (max_groups // GPK) % self.chunk_pages == 0, (max_groups, self.chunk_pages)
         assert (self.chunk_pages * GPK) % 128 == 0 and (max_groups // 128) % 8 == 0
@@ -301,11 +308,19 @@ class QSAFullIndexedBlock(QSAFullBlock):
                 for p in range(CH)
             ]
 
-        if (q == 0) if first is None else first:
+        first = (q == 0) if first is None else first
+
+        def issue_first() -> None:
             for cp in copies(0, 0):
                 cp.start()
             if self.bounded_chunks:
                 scr["qi_cc"][0] = 0
+
+        if isinstance(first, bool):
+            if first:
+                issue_first()
+        else:  # traced (`loop_requests`)
+            pl.when(first)(issue_first)
         if self.bounded_chunks:
             # Chunks this request's rows can see (the last row sees the most); slots follow a
             # chunk counter carried across requests, as the fixed count's `q * NC + c` does.
@@ -323,9 +338,9 @@ class QSAFullIndexedBlock(QSAFullBlock):
                 for cp in copies(c + 1, 1 - s):
                     cp.start()
 
-            if not last:  # the next request's first chunk into the slot this chunk frees next
+            if last is not True:  # the next request's first chunk into the slot this chunk frees
 
-                @pl.when(c + 1 == n_q)
+                @pl.when((c + 1 == n_q) & jnp.logical_not(last))
                 def _():
                     for cp in copies(0, 1 - s, q + 1):
                         cp.start()

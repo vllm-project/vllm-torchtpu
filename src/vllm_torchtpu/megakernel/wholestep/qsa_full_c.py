@@ -234,7 +234,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         pad = jnp.zeros((4, 256), F32)
         k_old = jnp.concatenate([k8.astype(F32), pad], axis=0)
         v_old = jnp.concatenate([v8.astype(F32), pad], axis=0)
-        kv = scr["qf_kv"][q * T : (q + 1) * T].astype(F32)
+        kv = scr["qf_kv"][pl.ds(q * T, T)].astype(F32)
         k_cur, v_cur = pool_units(kv[:, :256], sk), pool_units(kv[:, 256:], sv)
         pos = 4 * ga + jax.lax.broadcasted_iota(I32, (8, 1), 0)
         k_t = jnp.where(pos < c0, k_old, 0.0)
@@ -281,8 +281,8 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             """Thresholds and compaction of rows `[lo, lo + n)`; scores at `qi_s[s0 …]`."""
             rid = jax.lax.broadcasted_iota(I32, (n, 1, 1), 0) + lo
             nv = jnp.zeros((n, 1, 1), I32)
-            for r in range(lo, lo + n):
-                nv = jnp.where(rid == r, ctx.extra[NVIS][r], nv)
+            for i in range(n):  # `lo` may be traced (`loop_requests`)
+                nv = jnp.where(rid == lo + i, ctx.extra[NVIS][lo + i], nv)
             ids = (
                 jax.lax.broadcasted_iota(I32, (n, S, 128), 1) * 128
                 + jax.lax.broadcasted_iota(I32, (n, S, 128), 2)
@@ -347,7 +347,36 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 scr["qu_cd"][lo // T] = codes
                 scr["qu_n"][lo // T] = jnp.sum(nu)
         self.load_tables(ctx, l)
-        if self.shard_index:
+        if self.loop_requests:
+            npr = self._shard_rows(ex)[0] if self.shard_index else nreq
+
+            def req(q: Any, carry: Any) -> Any:
+                ck, gc = self._new_group(ctx, l, q, jax.lax.dynamic_slice_in_dim(raw, q * T, T))
+
+                def own() -> None:
+                    qr = scr["qi_q"][q].astype(BF16)
+                    self._score_request(
+                        ctx, q, qr, self.tab_base(ctx, l), row0=0,
+                        first=jax.lax.rem(q, npr) == 0,
+                        last=(jax.lax.rem(q, npr) == npr - 1) | (q == nreq - 1),
+                    )
+                    s_new = ix.score_rows(qr, jnp.broadcast_to(ck.astype(BF16), (8, ix.IDX_DIM)))
+                    scr["qi_s"][0:T] = jnp.where(
+                        gid == gc, s_new[:, :1].reshape(T, 1, 1, 1), scr["qi_s"][0:T]
+                    )
+                    select_rows(q * T, T, 0)
+
+                if self.shard_index:
+                    pl.when(q // npr == ctx.me)(own)
+                else:
+                    own()
+                self._recent_tile(ctx, l, q)
+                return carry
+
+            jax.lax.fori_loop(0, nreq, req, 0)
+            if self.shard_index:
+                self._exchange_selection(ctx)
+        elif self.shard_index:
             # Each rank scores and selects its own run of `npr` requests; every rank still
             # builds every request's completed group (outputs) and recent tile (its KV head).
             npr = self._shard_rows(ex)[0]
@@ -369,7 +398,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
 
                 self._recent_tile(ctx, l, q)
             self._exchange_selection(ctx)
-        for q in range(0 if self.shard_index else nreq):
+        for q in range(0 if self.shard_index or self.loop_requests else nreq):
             qr = scr["qi_q"][q].astype(BF16)
             s0 = 0 if self.per_request_scores else q * T
             self._score_request(ctx, q, qr, self.tab_base(ctx, l), last=q == nreq - 1, row0=s0)
@@ -527,9 +556,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             for c in cs:
                 c.wait()
             rs = [q * T + t for t in range(T)]
-            ok = jnp.concatenate(
-                [jnp.broadcast_to(self._recent_ok(ctx, r, srow), (nh, 8)) for r in rs], axis=0
-            )
+            ok = [self._recent_ok(ctx, r, srow) for r in rs]
             ok_any = self._recent_ok(ctx, rs[0], scol)
             for r in rs[1:]:
                 ok_any = ok_any | self._recent_ok(ctx, r, scol)
@@ -537,7 +564,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 T=T, nh=nh, pool=ctx.extra[POOL], ring=scr["qf_ring"], sems=scr["qf_ring_sem"],
                 ids=scr["qu_row"], codes=scr["qu_cd"].at[q], n_union=scr["qu_n"][q],
                 table=self.tables(ctx)[1], table_row=self.tab_base(ctx, l) + q,
-                q=jnp.concatenate([scr["qf_q"][r] for r in rs], axis=0),
+                qs=[scr["qf_q"][r] for r in rs],
                 gates=[scr["qf_g"][r] for r in rs],
                 has=[scr["qi_kvl"][r] > 0 for r in rs],
                 off=self.offset(ctx, l), scale_k=ctx.extra[SCALES][0],

@@ -207,7 +207,7 @@ CTX_C = [3001, 100]  # request 0: g_a holds one old token; request 1: g_a starts
 
 
 def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, rank_ids: bool = False,
-           union: bool = False, stats: bool = False):
+           union: bool = False, stats: bool = False, loop: bool = False):
     from vllm_torchtpu.megakernel.wholestep.qsa_full_b import DBG_IDS, DBG_IQ
     from vllm_torchtpu.megakernel.wholestep.qsa_full_c import CK_NEW, IR_NEW, KR_NEW, RING_NEW
 
@@ -224,7 +224,7 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
     pps = d["mtab"].shape[1]
     long_kw = dict(carrier="bf16", chunk_pages=8, hbm_tables=True, per_request_scores=True,
                    bounded_chunks=True, shard_index=shard, union_attn=union,
-                   union_stats=stats)
+                   union_stats=stats, loop_requests=loop)
     spec = wholestep_spec(
         G, R, L=L, qsa=dict(budget=BUDGET), step=True,
         indexed=dict(max_groups=MAX_GROUPS, pages_per_seq=pps, debug=True, **(long_kw if long else {})),
@@ -341,6 +341,17 @@ def test_union_stats_count_the_rows_selections():
                     sum(1 for x in sets if x)]
             for r in range(st.shape[0]):
                 assert st[r, o, q, :4].tolist() == want, (r, o, q, st[r, o, q, :4], want)
+
+
+def test_request_loop_matches_unrolled():
+    """`loop_requests`: the per-request work in a `fori_loop` (traced request index, the
+    carrier prefetch chain on traced first/last flags) gives bit-identical outputs, alone and with
+    the sharded indexer and union attention."""
+    for kw in (dict(), dict(shard=True, union=True)):
+        base = _run_c(long=True, rank_ids=True, **kw)
+        loop = _run_c(long=True, rank_ids=True, loop=True, **kw)
+        for i, name in ((0, "residual"), (3, "ck_new"), (4, "ring_new"), (7, "ids")):
+            np.testing.assert_array_equal(loop[i], base[i], err_msg=f"{name} {kw}")
 
 
 def test_step_tokens_match_stock_semantics():
