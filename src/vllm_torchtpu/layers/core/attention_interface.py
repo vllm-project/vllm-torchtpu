@@ -1064,6 +1064,16 @@ def _mixed_body_levers(value: str, kernel_v2: bool = False) -> tuple[str, ...]:
     return levers
 
 
+def _mixed_body_small_levers(value: str) -> tuple[str, ...]:
+    """TPU_DCP_MLA_MIXED_BODY_SMALL -> the small live buckets' lever tuple
+    ("1" = `MIXED_BODY_SMALL_DEFAULT`, else a comma list; empty / "0" = off)."""
+    if not value or value == "0":
+        return ()
+    if value == "1":
+        return sparse_mla_kernel.MIXED_BODY_SMALL_DEFAULT
+    return tuple(v.strip() for v in value.split(",") if v.strip())
+
+
 def _decode_body_levers(value: str) -> tuple[str, ...]:
     """TPU_MLA_DECODE_BODY_LEVERS -> the decode body's lever tuple ("1" =
     `DECODE_BODY_DEFAULT`, else a comma list; empty / "0" = off)."""
@@ -1607,6 +1617,9 @@ def sparse_mla_attention_dcp(
             ),
             mixed_body_levers=_mixed_body_levers(
                 envs.TPU_DCP_MLA_MIXED_BODY, envs.TPU_DCP_MLA_MIXED_KERNEL_V2
+            ),
+            mixed_body_small_levers=_mixed_body_small_levers(
+                envs.TPU_DCP_MLA_MIXED_BODY_SMALL
             ),
             kv_write=kv_write,
             kv_write_fault=None if kv_write_fault == "wrong_owner" else kv_write_fault,

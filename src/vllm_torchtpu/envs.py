@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_MIXED_LIVE_WIDTHS: str = ""
     TPU_MLA_DECODE_ROW_WIDTHS: str = ""
     TPU_DCP_MLA_MIXED_BODY: str = ""
+    TPU_DCP_MLA_MIXED_BODY_SMALL: str = ""
     TPU_DCP_MLA_MIXED_MASK_IN_KERNEL: bool = False
     TPU_DCP_MLA_MIXED_FUSED_PREP: bool = False
     TPU_MTP_DCP_MERGE_SMALL_A2A: bool = True
@@ -904,6 +905,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MXU/VPU dependency), or a comma list of lever names
     # (kernels/mla/sparse/kernel.py MIXED_BODY_LEVERS). Empty = off.
     "TPU_DCP_MLA_MIXED_BODY": lambda: os.getenv("TPU_DCP_MLA_MIXED_BODY", ""),
+    # With TPU_DCP_MLA_MIXED_LIVE: attention-body levers for the live-group
+    # buckets TPU_DCP_MLA_MIXED_BODY leaves on the plain body (at most 64
+    # tokens: the decode bucket of batch 9-16 with 3 drafts) -- "1" = the
+    # bitwise set measured there (per-row zeroing on the packed NOPE words in
+    # place of the fp8 kv_len mask, byte-transpose NOPE unpack, NOPE-only PV,
+    # no forced MXU/VPU dependency, fix-up only on overflowing steps), or a
+    # comma list of lever names (kernels/mla/sparse/kernel.py
+    # MIXED_BODY_LEVERS, or "quad"). Empty = off.
+    "TPU_DCP_MLA_MIXED_BODY_SMALL": lambda: os.getenv(
+        "TPU_DCP_MLA_MIXED_BODY_SMALL", ""
+    ),
     # With TPU_DCP_MLA_MIXED_BODY set: add the stage-A body levers
     # (kernels/mla/sparse/kernel.py MIXED_KERNEL_V2_LEVERS) -- the capped
     # fix-up only on steps that overflow, and a two-token stacked softmax with
