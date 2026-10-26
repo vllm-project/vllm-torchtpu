@@ -110,6 +110,9 @@ def head_groups(model: Any, g: Qwen38Geometry) -> list[list[int]]:
     return groups
 
 
+SMALL_OPERAND_BYTES = 32 << 20
+
+
 def pack_segment_operands(
     model: Any,
     g: Qwen38Geometry,
@@ -221,7 +224,16 @@ def pack_segment_operands(
             # on every call (q40 j-c2430942: ~1.8 ms/step of execute_as_strided).
             out.append(t.contiguous())
     if boundary:
-        out = [t.clone() if t._base is not None else t for t in out]
+        # torch_tpu re-materializes (eager as_strided, every call) a device
+        # buffer whose history has an in-place slice write or a view; clone()
+        # keeps that history, a host round-trip does not (the small operands:
+        # 'smalls', the expert scales, the HC injection weight).
+        out = [
+            t.cpu().to(t.device)
+            if t.numel() * t.element_size() <= SMALL_OPERAND_BYTES
+            else (t.clone() if t._base is not None else t)
+            for t in out
+        ]
     return out
 
 
