@@ -189,6 +189,8 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
+    TPU_GC_POLICY: str = "default"
+    TPU_GC_COLLECT_EVERY: int = 1000
 
 
 def env_with_choices(
@@ -1170,6 +1172,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": env_nonnegative_int(
         "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE", 0
     ),
+    # How the Python cyclic collector is run while serving (gc_policy.py).
+    # 'freeze' takes the post-warmup heap out of its reach and replaces
+    # automatic collection with one explicit collection every
+    # TPU_GC_COLLECT_EVERY DP-coordinated steps, which every rank reaches
+    # together; 0 never collects. 'default' leaves CPython's own cadence.
+    "TPU_GC_POLICY": env_with_choices(
+        "TPU_GC_POLICY", "default", ["default", "freeze"]
+    ),
+    "TPU_GC_COLLECT_EVERY": env_nonnegative_int("TPU_GC_COLLECT_EVERY", 1000),
 }
 
 
