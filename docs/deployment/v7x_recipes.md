@@ -170,7 +170,9 @@ Defaults that apply to every recipe below:
 | `black-forest-labs/FLUX.1-dev` | Text-to-image | Any `v7x` slice (1 device) | Single device | `512×512` / 10 steps | [`test_flux_nightly.py`](https://github.com/vllm-project/vllm-torchtpu/blob/main/tests_omni/models/flux/test_flux_nightly.py) |
 | `black-forest-labs/FLUX.2-klein-4B` | Text-to-image | Any `v7x` slice (1 device) | Single device | `512×512` / 4 steps | [`test_flux_nightly.py`](https://github.com/vllm-project/vllm-torchtpu/blob/main/tests_omni/models/flux/test_flux_nightly.py) |
 | `Qwen/Qwen-Image` | Text-to-image | Any `v7x` slice (1 device) | Single device | `512×512` / 10 steps | [`test_qwen_image_nightly.py`](https://github.com/vllm-project/vllm-torchtpu/blob/main/tests_omni/models/qwen_image/test_qwen_image_nightly.py) |
+| `Qwen/Qwen-Image-Edit-2511` | Image editing | `v7x-8` (1 host, 8 devices) | `CFG=2, Ulysses=4` | `1024×1024` / 20 steps ([#1432](https://github.com/vllm-project/vllm-torchtpu/pull/1432), [#1748](https://github.com/vllm-project/vllm-torchtpu/pull/1748)); `512×512` / 10 steps (nightly, 1 device) | [`test_qwen_image_nightly.py`](https://github.com/vllm-project/vllm-torchtpu/blob/main/tests_omni/models/qwen_image/test_qwen_image_nightly.py) |
 | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Image-to-video | `v7x-8` (1 host, 8 devices) | `CFG=2, Ulysses=4` | `480×832`, 81 frames / 40 steps ([#1432](https://github.com/vllm-project/vllm-torchtpu/pull/1432) benchmark); `480×832`, 17 frames / 2 steps (nightly, 1 device) | [`test_wan_nightly.py`](https://github.com/vllm-project/vllm-torchtpu/blob/main/tests_omni/models/wan/test_wan_nightly.py) |
+| `Lightricks/LTX-2` | Text-to-video (with audio) | `v7x-8` (1 host, 8 devices) | `CFG=2, Ulysses=4` | `704×1280`, 121 frames / 40 steps | [#2297](https://github.com/vllm-project/vllm-torchtpu/pull/2297), [#2298](https://github.com/vllm-project/vllm-torchtpu/pull/2298) |
 
 ### `black-forest-labs/FLUX.1-dev` (`1 device`)
 
@@ -198,11 +200,33 @@ curl -s http://localhost:8000/v1/images/generations \
     "num_inference_steps": 10,
     "guidance_scale": 3.5,
     "seed": 42
-  }' | jq -r '.data[0].b64_json' | base64 -d > flux1_dev.png
+  }' | python3 -c "import sys, json, base64; sys.stdout.buffer.write(base64.b64decode(json.load(sys.stdin)['data'][0]['b64_json']))" > flux1_dev.png
+```
+
+For `CFG=2, TP=4` on `v7x-8` (`1024×1024`, 28 steps), pass `--cfg-parallel-size 2 --tensor-parallel-size 4` and include `"true_cfg_scale": 2.0` with a `"negative_prompt"` in the request body so both CFG branches execute in parallel:
+
+```bash
+vllm serve black-forest-labs/FLUX.1-dev --omni --port 8000 --cfg-parallel-size 2 --tensor-parallel-size 4
+```
+
+```bash
+curl -s http://localhost:8000/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "black-forest-labs/FLUX.1-dev",
+    "prompt": "a cup of coffee on a wooden table, morning light",
+    "negative_prompt": "blurry, low quality, distorted",
+    "size": "1024x1024",
+    "num_inference_steps": 28,
+    "guidance_scale": 3.5,
+    "true_cfg_scale": 2.0,
+    "seed": 42,
+    "response_format": "b64_json"
+  }' | python3 -c "import sys, json, base64; sys.stdout.buffer.write(base64.b64decode(json.load(sys.stdin)['data'][0]['b64_json']))" > flux1_dev_cfg2_tp4.png
 ```
 
 > [!TIP]
-> **Lower latency on `v7x-8`**: add `--tensor-parallel-size 8`, benchmarked at `1024×1024` / 28 steps in [#1432](https://github.com/vllm-project/vllm-torchtpu/pull/1432) with a modest latency gain over a single device. `--cfg-parallel-size 2 --tensor-parallel-size 4` performed alike in the same benchmark, but the CFG pair only has work to split when the request sets `true_cfg_scale` above 1 together with a `negative_prompt`; the request above uses distilled `guidance_scale` only. The FLUX.1 transformer defines no Ulysses sequence-parallel plan, so scale it with `--tensor-parallel-size` rather than `--usp`.
+> **Lower latency on `v7x-8`**: add `--tensor-parallel-size 8`, benchmarked at `1024×1024` / 28 steps in [#1432](https://github.com/vllm-project/vllm-torchtpu/pull/1432) with a modest latency gain over a single device. `--cfg-parallel-size 2 --tensor-parallel-size 4` performed alike in the same benchmark when the request sets `"true_cfg_scale": 2.0` (above 1) together with a `negative_prompt`. The FLUX.1 transformer defines no Ulysses sequence-parallel plan, so scale it with `--tensor-parallel-size` rather than `--usp`.
 >
 > **`FLUX.1-schnell`**: serve `black-forest-labs/FLUX.1-schnell` with the same flags; the nightly test uses 4 steps and `guidance_scale` 0.0 (the PR-lane [`test_flux_pr.py`](https://github.com/vllm-project/vllm-torchtpu/blob/main/tests_omni/models/flux/test_flux_pr.py) uses 2 steps).
 
@@ -229,7 +253,7 @@ curl -s http://localhost:8000/v1/images/generations \
     "num_inference_steps": 4,
     "guidance_scale": 1.0,
     "seed": 42
-  }' | jq -r '.data[0].b64_json' | base64 -d > flux2_klein.png
+  }' | python3 -c "import sys, json, base64; sys.stdout.buffer.write(base64.b64decode(json.load(sys.stdin)['data'][0]['b64_json']))" > flux2_klein.png
 ```
 
 ### `Qwen/Qwen-Image` (`1 device`)
@@ -256,7 +280,7 @@ curl -s http://localhost:8000/v1/images/generations \
     "num_inference_steps": 10,
     "true_cfg_scale": 4.0,
     "seed": 42
-  }' | jq -r '.data[0].b64_json' | base64 -d > qwen_image.png
+  }' | python3 -c "import sys, json, base64; sys.stdout.buffer.write(base64.b64decode(json.load(sys.stdin)['data'][0]['b64_json']))" > qwen_image.png
 ```
 
 > [!TIP]
@@ -265,6 +289,29 @@ curl -s http://localhost:8000/v1/images/generations \
 > **Image editing**: `Qwen/Qwen-Image-Edit` and `Qwen/Qwen-Image-Edit-2511` use the same `vllm serve` flags and the same nightly test; send multipart requests to `/v1/images/edits` (`image`, `prompt`, `negative_prompt`, `size` (`auto` by default; the nightly test pins `512x512`), `num_inference_steps`, `true_cfg_scale`, `seed`).
 >
 > **First start**: checkpoints are downloaded on first use (the Qwen-Image repositories are several tens of GB), so on a cold cache pre-download them (`hf download Qwen/Qwen-Image`) or raise `--init-timeout` and `--stage-init-timeout`.
+
+### `Qwen/Qwen-Image-Edit-2511` (`CFG=2, Ulysses=4`)
+
+Validated nightly in [`tests_omni/models/qwen_image/test_qwen_image_nightly.py`](https://github.com/vllm-project/vllm-torchtpu/blob/main/tests_omni/models/qwen_image/test_qwen_image_nightly.py) ([#1749](https://github.com/vllm-project/vllm-torchtpu/pull/1749)) and verified on `v7x-8` (8 logical devices) with `CFG 2 × Ulysses 4` at `1024×1024` / 20 steps ([#1432](https://github.com/vllm-project/vllm-torchtpu/pull/1432), [#1748](https://github.com/vllm-project/vllm-torchtpu/pull/1748)):
+
+```bash
+vllm serve Qwen/Qwen-Image-Edit-2511 --omni --port 8000 --ulysses-degree 4 --cfg-parallel-size 2
+```
+
+Send a multipart image-edit request to `/v1/images/edits` (`input.png` is the source image):
+
+```bash
+curl -s -X POST http://localhost:8000/v1/images/edits \
+  -F "model=Qwen/Qwen-Image-Edit-2511" \
+  -F "image=@input.png" \
+  -F "prompt=Turn the scene into a vintage watercolor painting" \
+  -F "size=1024x1024" \
+  -F "num_inference_steps=20" \
+  -F "true_cfg_scale=4.0" \
+  -F "seed=42" \
+  -F "response_format=b64_json" \
+  | python3 -c "import sys, json, base64; sys.stdout.buffer.write(base64.b64decode(json.load(sys.stdin)['data'][0]['b64_json']))" > qwen_image_edit.png
+```
 
 ### `Wan-AI/Wan2.2-I2V-A14B-Diffusers` (`CFG=2, Ulysses=4`)
 
@@ -300,3 +347,30 @@ curl -s http://localhost:8000/v1/videos/sync \
 > **Single device**: omit `--cfg-parallel-size` and `--usp` to run on one device (the nightly test configuration). `--usp 8` (`Ulysses 8`) was also run end to end in [#1427](https://github.com/vllm-project/vllm-torchtpu/pull/1427).
 >
 > **Other Wan checkpoints**: `Wan-AI/Wan2.2-TI2V-5B-Diffusers` (Text-Image-to-Video, 5B) and the Wan2.1 T2V, I2V, and VACE checkpoints are covered by the [`tests_omni/models/wan/`](https://github.com/vllm-project/vllm-torchtpu/tree/main/tests_omni/models/wan) tests on a single device.
+
+### `Lightricks/LTX-2` (`CFG=2, Ulysses=4`)
+
+Joint audio-video generation on `v7x-8` (8 logical devices) with `CFG 2 × Ulysses 4` at `704×1280`, 121 frames, 40 steps ([#2297](https://github.com/vllm-project/vllm-torchtpu/pull/2297), [#2298](https://github.com/vllm-project/vllm-torchtpu/pull/2298)):
+
+```bash
+vllm serve Lightricks/LTX-2 --omni --ulysses-degree 4 --cfg-parallel-size 2 --enforce-eager --port 8000
+```
+
+Submit an asynchronous video generation job to `/v1/videos`, poll `/v1/videos/<video_id>` until `"status": "completed"`, and download the rendered MP4 from `/v1/videos/<video_id>/content`:
+
+```bash
+curl -s http://localhost:8000/v1/videos \
+  -F "prompt=A cinematic drone shot over a misty pine forest at sunrise, golden rays breaking through the trees." \
+  -F "height=704" \
+  -F "width=1280" \
+  -F "num_frames=121" \
+  -F "num_inference_steps=40" \
+  -F "guidance_scale=4.0" \
+  -F "seed=42" \
+  -F "frame_rate=24"
+```
+
+```bash
+curl -s http://localhost:8000/v1/videos/<video_id>
+curl -s http://localhost:8000/v1/videos/<video_id>/content -o ltx2.mp4
+```
