@@ -35,6 +35,7 @@ def supports_decode(
     page_records: int | None,
 ) -> bool:
     """Static envelope; the caller must also prove request-major live rows."""
+    banks = pool if isinstance(pool, tuple) else (pool,)
     requests = records.shape[0]
     if not (
         requests > 0
@@ -47,22 +48,21 @@ def supports_decode(
         and page_records is not None
         and page_records >= SLOTS
         and page_records % SLOTS == 0
-        and isinstance(pool, tuple)
-        and len(pool) == 2
+        and 1 <= len(banks) <= 2
         and records.shape[1] % page_records == 0
         and all(
             bank.dtype == jnp.int32
             and bank.ndim == 2
             and bank.shape[1] == ROW_WORDS
             and bank.shape[0] % (page_records // SLOTS) == 0
-            for bank in pool
+            for bank in banks
         )
     ):
         return False
     assert page_records is not None
     width = 1 << (records.shape[1] - 1).bit_length()
     config = get_persistent_score_config(
-        (q.shape[0] // requests, *q.shape[1:], width, len(pool))
+        (q.shape[0] // requests, *q.shape[1:], width, len(banks))
     )
     return (
         page_records % (SLOTS * pltpu.get_tpu_info().num_sublanes) == 0
@@ -99,7 +99,7 @@ def _select(scores, lengths, k, block_size, threshold):
 def decode_indexer(
     q: jax.Array,
     weights: jax.Array,
-    pool: tuple[jax.Array, jax.Array],
+    pool: jax.Array | tuple[jax.Array, ...],
     pages: jax.Array,
     lengths: jax.Array,
     *,
@@ -133,8 +133,9 @@ def decode_indexer(
         raise ValueError("Candidate publication requires fewer candidates than blocks")
     if page_records < 1:
         raise ValueError("page_records must be positive")
-    if not isinstance(pool, tuple) or len(pool) != 2:
-        raise NotImplementedError("Persistent decode requires two packed cache banks")
+    pool = pool if isinstance(pool, tuple) else (pool,)
+    if not 1 <= len(pool) <= 2:
+        raise ValueError("Persistent decode requires one or two packed cache banks")
     fused_blocks = candidate_count > 0 and candidate_block_size == 8
     if request_tile is None:
         request_tile = get_decode_request_tile(

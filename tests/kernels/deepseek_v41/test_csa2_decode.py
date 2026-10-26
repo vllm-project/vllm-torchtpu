@@ -24,7 +24,7 @@ def test_decode_buffered_index_maps_allow_epilogue_lookahead(
     def inspect_call(kernel, *, out_shape, grid_spec, **unused):
         def call(*operands):
             # NumPy exposes out-of-range SMEM reads that JAX would clamp.
-            scalars = tuple(map(np.asarray, operands[:3]))
+            scalars = tuple(map(np.asarray, operands[: grid_spec.num_scalar_prefetch]))
             last = [n - 1 for n in grid_spec.grid]
             specs = [
                 *jax.tree.leaves((grid_spec.in_specs, grid_spec.out_specs)),

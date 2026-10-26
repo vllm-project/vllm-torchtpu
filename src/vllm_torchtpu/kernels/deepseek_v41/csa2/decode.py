@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Google LLC
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Regular decode with automatic DMA buffering and two-MXU RHS lookahead.
+"""Decode with SWA prefetch and two-MXU RHS lookahead.
 
 Main visibility uses framework gather counts. Matrix operations use kernel-local
 accumulator refs allocated with JAX 0.11.2.
@@ -24,6 +24,7 @@ def _decode_kernel(
     positions_ref: Any,  # SMEM: [total_seqs], int32
     swa_page_ref: Any,  # SMEM: [total_seqs, 2 + page_columns], int32
     main_lengths_ref: Any,  # SMEM: [total_tokens], int32; gathered valid counts
+    swa_dma_ref: Any,  # SMEM: flattened [B, tiles, blocks, 2], page and aligned block
     # input (T = block_seq * num_tokens)
     q_ref: Any,  # VMEM: [T, H, 512], bfloat16
     main_cache_ref: Any,  # VMEM: [T, 512, 128], int32; packed FP8
@@ -35,8 +36,8 @@ def _decode_kernel(
     output_ref: Any,  # VMEM: [T, H, 512], bfloat16
     # scratch
     main_kv_ref: Any,  # VMEM: [T, 512, 512], bfloat16;
-    swa_ref: Any,  # VMEM: [block_seq, 256, 512], masked BF16 window
-    swa_sem: Any,
+    swa_buffer_ref: Any,  # VMEM: [2, block_seq, 256, 512], BF16 windows
+    swa_sem: Any,  # DMA: [2, block_seq, num_pages]
     swa_score_ref: Any,  # VMEM: [T, H, 256], float32; scaled, masked SWA logits
     main_p_ref: Any,  # VMEM: [T, H, 512], bfloat16
     swa_p_ref: Any,  # VMEM: [T, H, 256], bfloat16
@@ -107,57 +108,47 @@ def _decode_kernel(
         for r, i in enumerate(indices)
     }
 
-    # One HBM owner avoids repeated buffered aliases in the enclosing graph.
-    copies = []
-    for seq in range(block_seq):
-        seq_idx = seq_start + seq
-        first = positions_ref[seq_idx] + query_offset
-        left = jnp.maximum(0, first - 127)
-        anchor = left // page_size * page_size
-        visible = jnp.maximum(left, swa_page_ref[seq_idx, 1])
-        for block in range(num_pages):
-            position = anchor + block * page_size
-            column = (position - swa_page_ref[seq_idx, 0]) // cache_page_size
-            safe = jnp.clip(column, 0, swa_page_ref.shape[1] - 3)
-            page = swa_page_ref[seq_idx, safe + 2]
-            valid = (
-                (position < first + num_tokens)
-                & (position + page_size > visible)
-                & (column >= 0)
-                & (column < swa_page_ref.shape[1] - 2)
-            )
-            page = jnp.where(valid, page, 0)
-            offset = jnp.where(valid, position % cache_page_size, 0)
-            copy = pltpu.make_async_copy(
-                swa_kv_ref.at[page, pl.ds(offset, page_size), :],
-                swa_ref.at[seq, pl.ds(block * page_size, page_size), :],
-                swa_sem.at[seq, block],
-            )
-            copy.start()
-            copies.append(copy)
-    for copy in copies:
-        copy.wait()
+    tiles_per_seq = 1 if tokens_per_seq is None else tokens_per_seq // num_tokens
+    tile = 0 if tokens_per_seq is None else pl.program_id(1)
+    step = pl.program_id(0) * tiles_per_seq + tile
+    slot = step % 2
+    swa_ref = swa_buffer_ref.at[slot]
 
-    # Mask before both QK and PV: masked logits cannot remove NaNs, and
-    # zero probability multiplied by an invalid KV value is still NaN.
-    bf16_bits = jnp.dtype(jnp.bfloat16).itemsize * 8
-    low_mask = (1 << bf16_bits) - 1
-    for seq in range(block_seq):
-        position = positions_ref[seq_start + seq] + query_offset
-        left = jnp.maximum(0, position - 127)
-        anchor = left // page_size * page_size
-        left = jnp.maximum(left, swa_page_ref[seq_start + seq, 1])
-        right = position + num_tokens
-        for block in range(num_pages):
-            rows = anchor + block * page_size + 2 * jnp.arange(page_size // 2)
-            low = (rows >= left) & (rows < right)
-            high = (rows + 1 >= left) & (rows + 1 < right)
-            mask = jnp.where(low, low_mask, 0) | jnp.where(high, ~low_mask, 0)
-            values = swa_ref[seq, pl.ds(block * page_size, page_size)]
-            words = pltpu.bitcast(values, jnp.int32) & mask[:, None]
-            swa_ref[seq, pl.ds(block * page_size, page_size)] = pltpu.bitcast(
-                words, jnp.bfloat16
-            )
+    def transfer_swa(seq_start, query_offset, slot, *, wait):
+        for seq in range(block_seq):
+            seq_idx = seq_start + seq
+            tile = query_offset // num_tokens
+            for block in range(num_pages):
+                descriptor = ((seq_idx * tiles_per_seq + tile) * num_pages + block) * 2
+                page = swa_dma_ref[descriptor]
+                offset = swa_dma_ref[descriptor + 1] * page_size
+                copy = pltpu.make_async_copy(
+                    swa_kv_ref.at[page, pl.ds(offset, page_size), :],
+                    swa_buffer_ref.at[
+                        slot, seq, pl.ds(block * page_size, page_size), :
+                    ],
+                    swa_sem.at[slot, seq, block],
+                )
+                if wait:
+                    copy.wait()
+                else:
+                    copy.start()
+
+    @pl.when(step == 0)
+    def prime_swa():
+        transfer_swa(seq_start, query_offset, slot, wait=False)
+
+    transfer_swa(seq_start, query_offset, slot, wait=True)
+
+    @pl.when(step + 1 < (positions_ref.shape[0] // block_seq) * tiles_per_seq)
+    def prefetch_swa():
+        following = step + 1
+        transfer_swa(
+            following // tiles_per_seq * block_seq,
+            following % tiles_per_seq * num_tokens,
+            1 - slot,
+            wait=False,
+        )
 
     def swa_qk_compute(seq, first, size, slot_base):
         for mxu in range(2):
@@ -418,8 +409,7 @@ def csa2_decode(
     Long sequences use fixed eight-query tiles and must be divisible by eight.
     Short sequences use a single tile. Main KV is packed FP8 INT32 [T,512,128]
     with FP32 scales [T,512] and authoritative valid counts [T].
-    SWA is BF16 [pages,page_size,512], including a reserved zero page.
-    Visible rows must be finite; values outside the visible window are masked.
+    SWA is finite BF16 [pages,page_size,512], including a reserved zero page.
     swa_page [B,2+C] stores page base, minimum visibility and physical page IDs.
     decoder_prefill reuses this pipeline for the model's decoder-layer prefill,
     retaining that path's FP32 KV scales. It does not change SWA visibility.
@@ -532,31 +522,62 @@ def csa2_decode(
         else (batch_size // block_seq,)
     )
     prefix = (batch_size, num_tokens) if tiled else (total_tokens,)
+    dma_block_size = min(page_size, 64)
+    first = positions[:, None, None] + (
+        jnp.arange(num_tokens // query_tile, dtype=jnp.int32)[None, :, None]
+        * query_tile
+    )
+    left = jnp.maximum(0, first - 127)
+    row = left // dma_block_size * dma_block_size + (
+        jnp.arange(256 // dma_block_size, dtype=jnp.int32)[None, None, :]
+        * dma_block_size
+    )
+    column = (row - swa_page[:, 0, None, None]) // page_size
+    physical = jnp.take_along_axis(
+        swa_page[:, None, 2:], jnp.clip(column, 0, swa_page.shape[1] - 3), axis=2
+    )
+    needed = (
+        (row < first + query_tile)
+        & (row + dma_block_size > jnp.maximum(left, swa_page[:, 1, None, None]))
+        & (column >= 0)
+        & (column < swa_page.shape[1] - 2)
+    )
+    swa_dma = jnp.stack(
+        (
+            jnp.where(needed, physical, 0),
+            jnp.where(needed, row % page_size // dma_block_size, 0),
+        ),
+        axis=-1,
+    )
+
     output = pl.pallas_call(
         kernel,
         out_shape=jax.ShapeDtypeStruct((*prefix, num_heads, 512), q.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=3,
+            num_scalar_prefetch=4,
             grid=grid,
             in_specs=in_specs,
             out_specs=query_spec((num_heads, 512)),
             scratch_shapes=(
                 pltpu.VMEM((kv_count, 512, 512), jnp.bfloat16),
-                pltpu.VMEM((block_seq, 256, 512), jnp.bfloat16),
-                pltpu.SemaphoreType.DMA((block_seq, 256 // min(page_size, 64))),
+                pltpu.VMEM((2, block_seq, 256, 512), jnp.bfloat16),
+                pltpu.SemaphoreType.DMA((2, block_seq, 256 // min(page_size, 64))),
                 pltpu.VMEM((query_count, num_heads, 256), jnp.float32),
                 pltpu.VMEM((p_count, num_heads, 512), jnp.bfloat16),
                 pltpu.VMEM((p_count, num_heads, 256), jnp.bfloat16),
             ),
         ),
+        # SWA prefetch carries buffers across consecutive grid iterations.
         compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel",) * len(grid)
+            dimension_semantics=("arbitrary",) * len(grid)
         ),
         name="csa2_decode",
     )(
         positions,
         swa_page,
         main_lengths,
+        # Flatten to avoid SMEM padding the small descriptor dimensions.
+        swa_dma.reshape(-1),
         q.reshape(*prefix, num_heads, 512),
         main_kv.reshape(*prefix, 512, 128),
         main_kv_scale.reshape(*prefix, 1, 512),

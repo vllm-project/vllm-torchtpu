@@ -105,7 +105,7 @@ def _prepare_pages(pages, lengths, limits_out, contiguous_out, banks, tile, page
 def grouped_decode_scores(
     q: jax.Array,
     weights: jax.Array,
-    pool: tuple[jax.Array, jax.Array],
+    pool: jax.Array | tuple[jax.Array, ...],
     pages: jax.Array,
     lengths: jax.Array,
     *,
@@ -119,7 +119,7 @@ def grouped_decode_scores(
     Args:
         q: BF16 [request, query, head, feature] in split order (even64 then odd64).
         weights: FP32 [request, query, head].
-        pool: Two int32 [packed_record,128] banks; low16 holds the even record
+        pool: One or two int32 [packed_record,128] banks; low16 holds the even record
             and high16 the odd, each in split order (even64 then odd64).
             Banks contain complete pages.
         pages: Int32 [request, page] page-aligned physical record starts;
@@ -145,8 +145,9 @@ def grouped_decode_scores(
         or lengths.shape != q.shape[:2]
     ):
         raise ValueError("Expected request-major Q [R,Q,32,128] and weights [R,Q,32]")
-    if not isinstance(pool, tuple) or len(pool) != 2:
-        raise NotImplementedError("Persistent decode requires two packed cache banks")
+    pool = pool if isinstance(pool, tuple) else (pool,)
+    if not 1 <= len(pool) <= 2:
+        raise ValueError("Persistent decode requires one or two packed cache banks")
     if block_size not in (0, 8):
         raise NotImplementedError("Persistent decode supports block_size 0 or 8")
     if jax.default_backend() != "tpu" or pltpu.get_tpu_info().generation != 7:
@@ -250,7 +251,7 @@ def _grouped_decode_scores(
         or b.shape[0] % page_rows
         for b in pool
     ):
-        raise ValueError("The halfplane cache requires two page-aligned int32 banks")
+        raise ValueError("The halfplane cache requires page-aligned int32 banks")
     total_rows = sum(b.shape[0] for b in pool)
 
     def kernel(
@@ -329,21 +330,28 @@ def _grouped_decode_scores(
             read_rows = count * page_rows
 
             def copy(address, size, dest):
-                low, high = pool_ref
-
-                @pl.when(address < low.shape[0])
-                def low_copy():
+                if len(pool_ref) == 1:
                     pltpu.make_async_copy(
-                        low.at[pl.ds(address, size), :], dest, input_sem.at[slot]
-                    ).start()
-
-                @pl.when(address >= low.shape[0])
-                def high_copy():
-                    pltpu.make_async_copy(
-                        high.at[pl.ds(address - low.shape[0], size), :],
+                        pool_ref[0].at[pl.ds(address, size), :],
                         dest,
                         input_sem.at[slot],
                     ).start()
+                else:
+                    low, high = pool_ref
+
+                    @pl.when(address < low.shape[0])
+                    def low_copy():
+                        pltpu.make_async_copy(
+                            low.at[pl.ds(address, size), :], dest, input_sem.at[slot]
+                        ).start()
+
+                    @pl.when(address >= low.shape[0])
+                    def high_copy():
+                        pltpu.make_async_copy(
+                            high.at[pl.ds(address - low.shape[0], size), :],
+                            dest,
+                            input_sem.at[slot],
+                        ).start()
 
             @pl.when((read_rows < key_tile // SLOTS) & (step < buffers))
             def clear_partial():
@@ -636,7 +644,7 @@ def _grouped_decode_scores(
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
             grid=(),
-            in_specs=(vmem, vmem, (hbm, hbm), (vmem, vmem)),
+            in_specs=(vmem, vmem, (hbm,) * len(pool), (vmem, vmem)),
             out_specs=(hbm, hbm if block_size else None),
             scratch_shapes=(
                 pltpu.VMEM((buffers, key_tile // SLOTS, dim), jnp.int32),
