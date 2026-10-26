@@ -406,6 +406,15 @@ class Qwen38Segments(nn.Module):
                     raise RuntimeError("Qwen3.8 megakernel needs one unified GDN pool tensor")
             if getattr(self.layers[0].linear_attn, "_bm_kernel", False):
                 raise RuntimeError("Qwen3.8 megakernel does not support block-major pools yet")
+            if envs.VLLM_TPU_MK_OWN_OPERANDS and base._base is not None:
+                # The unified pool is a view of the runner's raw KV buffer. A
+                # detached alias keeps the same storage (in-place writes still
+                # land in the cache) without view metadata.
+                logger.info(
+                    "qwen38 megakernel GDN pool: view %s (offset %d, contiguous %s) aliased",
+                    tuple(base.shape), base.storage_offset(), base.is_contiguous(),
+                )
+                base = base.detach()
             self.pool = base
             self.layout = pool_layout_of(base)
         for L in sorted({len(segment_layers(self.g, s)) for s in range(self.n_seg)}):
