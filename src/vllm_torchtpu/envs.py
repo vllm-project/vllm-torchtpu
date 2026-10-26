@@ -251,6 +251,8 @@ if TYPE_CHECKING:
     VLLM_TPU_SEGMENT_TOKENIZE_VERIFY: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     VLLM_TPU_WARM_SPEC_LOGITS_LENGTHS: bool = True
+    VLLM_TPU_PLE_HOST_FAST_LOOKUP: bool = False
+    VLLM_TPU_PLE_HOST_TIMING: bool = False
     VLLM_TPU_FUSED_ASYNC_DRAFT_SEED: bool = True
     VLLM_TPU_DEFER_PREV_RESULTS_WAIT: bool = False
     VLLM_TPU_LOG_POST_WARMUP_COMPILES: bool = False
@@ -1572,6 +1574,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_WARM_SPEC_LOGITS_LENGTHS": env_bool(
         "VLLM_TPU_WARM_SPEC_LOGITS_LENGTHS", default=True
     ),
+    # Host PLE (CPU offload): gather into two reused, pinned-if-possible
+    # buffers and copy them to the device without staging (ple_storage.py).
+    "VLLM_TPU_PLE_HOST_FAST_LOOKUP": env_bool("VLLM_TPU_PLE_HOST_FAST_LOOKUP"),
+    # Log the host PLE lookup's D2H / gather / H2D host time every 1000 calls.
+    "VLLM_TPU_PLE_HOST_TIMING": env_bool("VLLM_TPU_PLE_HOST_TIMING"),
     # Log one WARNING per torch.compile compile after warmup (runner/compile_watch.py).
     "VLLM_TPU_LOG_POST_WARMUP_COMPILES": env_bool(
         "VLLM_TPU_LOG_POST_WARMUP_COMPILES", default=False

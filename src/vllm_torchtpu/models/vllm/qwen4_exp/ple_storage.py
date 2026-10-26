@@ -262,28 +262,74 @@ class HostPLETable(ResidentPLETable):
         indices = ids.numpy().reshape(-1)
         start = self.shard_indices.org_vocab_start_index
         end = self.shard_indices.org_vocab_end_index
-        owned = (indices >= start) & (indices < end)
         dtype = np.int16 if self.storage_dtype == torch.bfloat16 else np.uint8
-        output = np.empty((indices.size, self.embedding_dim), dtype=dtype)
+        if envs.VLLM_TPU_PLE_HOST_FAST_LOOKUP:
+            raw = self._lookup_into_buffer(indices, start, end, dtype)
+        else:
+            owned = (indices >= start) & (indices < end)
+            output = np.empty((indices.size, self.embedding_dim), dtype=dtype)
+            if self._shared_table is None:
+                table = (
+                    self.weight.detach()
+                    .view(torch.int16 if dtype == np.int16 else torch.uint8)
+                    .numpy()
+                )
+                np.take(table, indices - start, axis=0, out=output, mode="clip")
+            else:
+                with self._shared_table.buffer() as buffer:
+                    table = np.frombuffer(buffer, dtype=dtype).reshape(
+                        -1, self.embedding_dim
+                    )
+                    np.take(table, indices - start, axis=0, out=output, mode="clip")
+                    del table
+            output[~owned] = 0
+            raw = torch.from_numpy(output)
+        if self.storage_dtype != torch.bfloat16:
+            raw = raw.view(torch.int8)
+        return raw.reshape(*ids.shape[:-1], ids.shape[-1] * self.embedding_dim)
+
+    def _lookup_into_buffer(
+        self, indices: np.ndarray, start: int, end: int, dtype
+    ) -> torch.Tensor:
+        """The same rows, gathered into one of two reused (pinned if possible)
+        host buffers, so the step allocates nothing and the device copy can
+        start without staging. Two buffers alternate: a step's lookup runs
+        only after the previous step's forward, and so its copy, has run."""
+        n = indices.size
+        bufs = self.__dict__.setdefault("_lookup_bufs", [None, None])
+        slot = self.__dict__.get("_lookup_slot", 0)
+        self._lookup_slot = slot ^ 1
+        buf = bufs[slot]
+        if buf is None or buf.shape[0] < n:
+            rows = max(n, 2 * (buf.shape[0] if buf is not None else 0))
+            carrier = torch.int16 if dtype == np.int16 else torch.uint8
+            try:
+                buf = torch.empty(
+                    (rows, self.embedding_dim), dtype=carrier, pin_memory=True
+                )
+            except RuntimeError:
+                buf = torch.empty((rows, self.embedding_dim), dtype=carrier)
+            bufs[slot] = buf
+        out_t = buf[:n]
+        output = out_t.numpy()
+        local = indices - start
         if self._shared_table is None:
-            table = (
-                self.weight.detach()
-                .view(torch.int16 if dtype == np.int16 else torch.uint8)
-                .numpy()
-            )
-            np.take(table, indices - start, axis=0, out=output, mode="clip")
+            table = self.__dict__.get("_np_table")
+            if table is None:
+                table = self.weight.detach().view(buf.dtype).numpy()
+                self._np_table = table
+            np.take(table, local, axis=0, out=output, mode="clip")
         else:
             with self._shared_table.buffer() as buffer:
                 table = np.frombuffer(buffer, dtype=dtype).reshape(
                     -1, self.embedding_dim
                 )
-                np.take(table, indices - start, axis=0, out=output, mode="clip")
+                np.take(table, local, axis=0, out=output, mode="clip")
                 del table
-        output[~owned] = 0
-        raw = torch.from_numpy(output)
-        if self.storage_dtype != torch.bfloat16:
-            raw = raw.view(torch.int8)
-        return raw.reshape(*ids.shape[:-1], ids.shape[-1] * self.embedding_dim)
+        stray = (local < 0) | (local >= end - start)
+        if stray.any():
+            output[stray] = 0
+        return out_t
 
     def lookup_raw(self, ids: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError("Host PLE requires the explicit host lookup boundary")
