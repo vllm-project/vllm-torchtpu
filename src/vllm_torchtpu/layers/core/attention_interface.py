@@ -1652,6 +1652,11 @@ def sparse_mla_attention_dcp(
             decode_body_levers=_decode_body_levers(envs.TPU_MLA_DECODE_BODY_LEVERS),
             out_pieces=out_pieces,
             out_pieces_gather_first=envs.TPU_DCP_MLA_MERGE_PIECES >= 3,
+            out_vmem=(
+                envs.TPU_DCP_MLA_OUT_VMEM_MIB * 1024 * 1024
+                if topk_idx.shape[0] <= envs.TPU_DCP_MLA_OUT_VMEM_MAX_TOKENS
+                else 0
+            ),
             **chunk_kwargs,
             **split_kwargs,
             **packed_rope_kwargs,
