@@ -1495,6 +1495,12 @@ MIXED_KERNEL_V2_LEVERS = ("fxskip", "pair")
 # Buckets up to this many tokens keep the plain live body: at 64 tokens the
 # levers measured within noise to +2.5 % (partly filled bucket).
 MIXED_BODY_MAX_SKIP_TOKENS = 64
+# `mixed_body_small_levers` (TPU_DCP_MLA_MIXED_BODY_SMALL): the live body's
+# levers on those buckets instead (the 64-token decode bucket). The bitwise
+# set measured on the full 64-token bucket: the fp8 kv_len mask replaced by
+# per-row zeroing on the NOPE words, the byte-transpose unpack, a NOPE-only
+# PV, no forced MXU/VPU dependency and the fix-up only on overflowing steps.
+MIXED_BODY_SMALL_DEFAULT = ("tr", "zu", "pv512", "noinf", "fxskip")
 
 # TPU_DCP_MLA_SEND_LAYOUT: the decode kernel writes the DCP merge's packed
 # real-rows all-to-all send buffer itself. Each of the `world` destination
@@ -3466,6 +3472,7 @@ def prepare_outputs(
         "mixed_live_gather",
         "mixed_live_widths",
         "mixed_body_levers",
+        "mixed_body_small_levers",
         "lse_in_kernel",
         "prologue_fault",
         "kv_write_fault",
@@ -3519,6 +3526,7 @@ def sparse_ragged_paged_attention(
     mixed_live_gather: bool = False,
     mixed_live_widths: tuple[int, ...] = (),
     mixed_body_levers: tuple[str, ...] = (),
+    mixed_body_small_levers: tuple[str, ...] = (),
     q_rope_table: jax.Array | None = None,
     lse_in_kernel: bool = False,
     prologue_fault: str | None = None,
@@ -3635,6 +3643,11 @@ def sparse_ragged_paged_attention(
       mixed_body_levers: With `mixed_live_gather` taken: attention-body
         rewrites of the live grid steps (`MIXED_BODY_LEVERS`, documented at
         `_attention_kernel`). `MIXED_BODY_DEFAULT` is bitwise-identical.
+        They apply to buckets of more than `MIXED_BODY_MAX_SKIP_TOKENS`
+        tokens.
+      mixed_body_small_levers: The same for the live-group buckets of at most
+        `MIXED_BODY_MAX_SKIP_TOKENS` tokens, which otherwise run the plain
+        body. `MIXED_BODY_SMALL_DEFAULT` is bitwise-identical.
       q_rope_table: In-kernel q rope (TPU_MLA_DECODE_PROLOGUE; split q only).
         `q_pe` is then the raw, un-roped q head view `[tokens, heads, 256]`
         (nope 192 | rope 64, NeoX half-split rope order) and this is f32
@@ -3854,6 +3867,17 @@ def sparse_ragged_paged_attention(
         )
     if "pair" in mixed_body_levers and "xqk" in mixed_body_levers:
         raise ValueError("mixed_body_levers: 'pair' and 'xqk' are alternatives")
+    if not set(mixed_body_small_levers) <= set(MIXED_BODY_LEVERS) | {"quad"}:
+        raise ValueError(
+            f"mixed_body_small_levers {mixed_body_small_levers} not in "
+            f"{MIXED_BODY_LEVERS + ('quad',)}"
+        )
+    if len({"pair", "quad", "xqk"} & set(mixed_body_small_levers)) > 1:
+        raise ValueError(
+            "mixed_body_small_levers: 'pair', 'quad' and 'xqk' are alternatives"
+        )
+    if "zu" in mixed_body_small_levers and "pv512" not in mixed_body_small_levers:
+        raise ValueError("mixed_body_small_levers: 'zu' needs 'pv512'")
     if not set(decode_body_levers) <= set(DECODE_BODY_LEVERS):
         raise ValueError(
             f"decode_body_levers {decode_body_levers} not in {DECODE_BODY_LEVERS}"
@@ -3868,6 +3892,9 @@ def sparse_ragged_paged_attention(
         # "q128" narrows the in-kernel q rope's raw-head DMA; without it
         # there is nothing to narrow.
         mixed_body_levers = tuple(v for v in mixed_body_levers if v != "q128")
+        mixed_body_small_levers = tuple(
+            v for v in mixed_body_small_levers if v != "q128"
+        )
         decode_body_levers = tuple(v for v in decode_body_levers if v != "q128")
     num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
     # With the cap, translate the top-k once per call straight into the capped
@@ -4162,9 +4189,11 @@ def sparse_ragged_paged_attention(
             group_widths=mixed_live_widths if group_tab is not None else (),
             row_widths=decode_row_widths if group_tab is None else (),
             group_levers=(
-                mixed_body_levers
-                if group_tab is not None and q.shape[0] > MIXED_BODY_MAX_SKIP_TOKENS
-                else ()
+                ()
+                if group_tab is None
+                else mixed_body_levers
+                if q.shape[0] > MIXED_BODY_MAX_SKIP_TOKENS
+                else mixed_body_small_levers
             ),
             row_levers=(
                 decode_body_levers
