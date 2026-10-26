@@ -113,6 +113,9 @@ PATCHES = (
         refresh="vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings",
     ),
     Patch("vllm_torchtpu.layers.adapter.vision_attention", _ACTIVE),
+    # The serving gc policy also owns the engine core's heap (gc_policy.py);
+    # the runner arms its own at the end of warmup.
+    Patch("vllm_torchtpu.gc_policy:install_engine_core", ("engine_core",)),
     # Platform runtime configuration.
     Patch(
         "vllm_torchtpu.platforms.tpu_platform:_configure_torchtpu_eager_mode", _ACTIVE
