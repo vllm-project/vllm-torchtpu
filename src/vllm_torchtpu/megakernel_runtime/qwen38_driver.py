@@ -28,6 +28,7 @@ the first N eligible steps against the stock model).
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -382,6 +383,13 @@ class Qwen38Segments(nn.Module):
     @staticmethod
     def _own(ops: list[torch.Tensor], what: str) -> list[torch.Tensor]:
         """With VLLM_TPU_MK_OWN_OPERANDS, register no view operands."""
+        if os.environ.get("VLLM_TPU_MK_OPERAND_DUMP"):
+            for i, t in enumerate(ops):
+                logger.info(
+                    "qwen38 megakernel operand %s[%d]: %s %s stride=%s offset=%d view=%s",
+                    what, i, tuple(t.shape), t.dtype, t.stride(), t.storage_offset(),
+                    t._base is not None,
+                )
         if not envs.VLLM_TPU_MK_OWN_OPERANDS:
             return ops
         ops, fixed = own_operands(ops)
