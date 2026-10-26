@@ -345,7 +345,9 @@ class Qwen4ExpMTP(nn.Module):
         drafts = [
             cast(Qwen4ExpDecoderLayer, layer).self_attn for layer in self.model.layers
         ]
-        if not layers or any(getattr(a, "_shared_ops", None) is None for a in drafts):
+        # The shared ops are built when the pool is bound, after this load-time
+        # call; the forward takes the shared path only once they exist.
+        if not layers:
             return False
         target = layers[-1].self_attn
         width = target.max_selected_tokens
