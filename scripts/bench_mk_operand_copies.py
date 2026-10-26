@@ -17,6 +17,14 @@ import sys
 
 ARMS = {
     "none": dict(),
+    "slice_clone": dict(dtype="float32", shape=(4, 1, 51456), build="slice", post="clone"),
+    "slice_cpu": dict(dtype="float32", shape=(4, 1, 51456), build="slice", post="cpu"),
+    "slice_contig_view": dict(dtype="float32", shape=(4, 1, 51456), build="slice", post="reshape"),
+    "i32_clone": dict(dtype="float32", shape=(1608, 128), build="i32", post="clone"),
+    "i32_cpu": dict(dtype="float32", shape=(1608, 128), build="i32", post="cpu"),
+    "cat_fresh": dict(dtype="float32", shape=(64, 3840), build="cat"),
+    "pad_fresh": dict(dtype="bfloat16", shape=(10240, 128), build="pad"),
+    "addmul_fresh": dict(dtype="float32", shape=(64, 3840), build="arith"),
     "f32_64x3840": dict(dtype="float32", shape=(64, 3840)),
     "bf16_64x3840": dict(dtype="bfloat16", shape=(64, 3840)),
     "f32_1608x128": dict(dtype="float32", shape=(1608, 128)),
@@ -84,8 +92,23 @@ class M(torch.nn.Module):
                 t[:, 0, :1000] = 1.0
             elif b == "i32":
                 t = torch.ones(shape, dtype=torch.float32, device=dev).view(torch.int32)
+            elif b == "cat":
+                h = torch.ones((shape[0], shape[1] // 2), dtype=dt, device=dev)
+                t = torch.cat([h, h], dim=-1)
+            elif b == "pad":
+                t = torch.nn.functional.pad(
+                    torch.ones((shape[0], shape[1] - 8), dtype=dt, device=dev), (0, 8))
+            elif b == "arith":
+                t = torch.ones(shape, dtype=dt, device=dev) * 2 + 1
             else:
                 t = torch.ones(shape, dtype=dt, device=dev)
+            post = cfg.get("post")
+            if post == "clone":
+                t = t.clone()
+            elif post == "cpu":
+                t = t.cpu().to(dev)
+            elif post == "reshape":
+                t = t.reshape(-1, 128).clone()
             if b == "param":
                 self.w = torch.nn.Parameter(t, requires_grad=False)
             else:
@@ -119,6 +142,8 @@ print("MARK_END", flush=True)
 
 def test_operand_copies():
     for name, cfg in ARMS.items():
+        if os.environ.get("OPC_ONLY") and name not in os.environ["OPC_ONLY"].split(","):
+            continue
         env = dict(os.environ)
         env["TPU_VMODULE"] = "tpu_pjrt_client=1"
         env["TPU_STDERR_LOG_LEVEL"] = "0"
