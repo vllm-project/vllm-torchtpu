@@ -29,6 +29,10 @@ Each DCP rank stores a shard of the KV cache, so it can only produce a
      output and its log-sum-exp.
   3. `merge_lse_partials_scatter_heads` folds the partials into the exact
      whole-context result and narrows the head axis back to this rank's own.
+
+When DCP spans TP x PCP (the PCP manager), only TP ranks hold distinct heads:
+heads are gathered and scattered over TP, partials also summed over PCP, and
+the log-sum-exp weights still span the whole DCP group.
 """
 
 from __future__ import annotations
@@ -49,6 +53,31 @@ from vllm_torchtpu.layers.core.quantization import quantize_tensor
 if envs.TPU_DCP_MERGE_VSPACE_FUSED:
     # Registers the fused V-space operand ops at import, never in a trace.
     from vllm_torchtpu.layers.adapter import dcp_vspace  # noqa: F401
+from vllm_torchtpu.distributed.pcp import get_pcp_group
+
+
+def _get_tp_group() -> Any | None:
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        return get_tp_group()
+    except (AssertionError, ImportError):
+        return None
+
+
+def dcp_spans_pcp() -> bool:
+    """True when the DCP group covers TP x PCP rather than borrowing from TP.
+
+    That is the PCP manager's layout (`validate_pcp_manager_config` enforces
+    it). Decided from the flag rather than the groups: looking a group up can
+    fail an assert, which `torch.compile` cannot trace.
+    """
+    return bool(envs.USE_TPU_PCP_MANAGER)
+
+
+def _head_group() -> Any | None:
+    """The group whose ranks hold distinct query head slices."""
+    return _get_tp_group() if dcp_spans_pcp() else get_dcp_group()
 
 
 def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
@@ -63,9 +92,10 @@ def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
 
     Returns:
       `[num_tokens, tp_local_num_heads * dcp_size, dim]`, identical
-      on every rank. Returned unchanged without a DCP group.
+      on every rank (over TP only when DCP spans TP x PCP). Returned
+      unchanged without a DCP group.
     """
-    group = get_dcp_group()
+    group = _head_group()
     if group is None or int(group.world_size) == 1:
         return q
     return group.all_gather(q.contiguous(), dim=1)
@@ -76,8 +106,9 @@ def all_gather_q_nope_pe_heads(
     q_pe: torch.Tensor,
     kv_lora_rank: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused all-gather of `(ql_nope, q_pe)` across DCP ranks in a single call."""
-    group = get_dcp_group()
+    """Fused all-gather of `(ql_nope, q_pe)` across DCP ranks in a single call
+    (over TP only when DCP spans TP x PCP)."""
+    group = _head_group()
     if group is None or int(group.world_size) == 1:
         return ql_nope, q_pe
     q_dcp = group.all_gather(torch.cat([ql_nope, q_pe], dim=-1), dim=1)
@@ -173,8 +204,10 @@ def merge_lse_partials_scatter_heads(
     # drafter never compares it.
     # A W_UV-projected f32 partial still crosses in the attention dtype.
     narrow = envs.TPU_DCP_RS_OUT_PRECISION and is_backbone
+    spans_pcp = dcp_spans_pcp()
     if (
         envs.TPU_DCP_LSE_MERGE_A2A
+        and not spans_pcp
         and is_backbone
         and output.shape[0] <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
     ):
@@ -185,6 +218,21 @@ def merge_lse_partials_scatter_heads(
             send_dtype=wire_dtype if narrow else None,
             query_start_loc=query_start_loc,
         )
+
+    if spans_pcp:
+        # TP reduce-scatter (this PCP position, narrowed to our heads), then
+        # PCP all-reduce (same heads on the other positions): every DCP rank
+        # once.
+        rs_dtype = (wire_dtype or output.dtype) if narrow else None
+        weighted = _weight_by_lse(output, lse, group)
+        if rs_dtype is not None:
+            weighted = weighted.to(rs_dtype)
+        tp_group = _get_tp_group()
+        if tp_group is not None and int(tp_group.world_size) > 1:
+            weighted = tp_group.reduce_scatter(weighted.contiguous(), dim=1)
+        pcp_group = get_pcp_group()
+        assert pcp_group is not None
+        return pcp_group.all_reduce(weighted.contiguous()).to(output.dtype)
 
     # The drafter cannot compare the token count in torch, but JAX exports
     # each of its buckets at a concrete shape: one op picks the exchange
@@ -215,6 +263,8 @@ def vspace_fused_applies(num_tokens: int, is_backbone: bool) -> bool:
     `merge_lse_partials_scatter_heads` already makes for the same bucket. The
     MTP drafter never takes it."""
     if not envs.TPU_DCP_MERGE_VSPACE_FUSED or not is_backbone:
+        return False
+    if dcp_spans_pcp():
         return False
     if envs.TPU_DCP_MERGE_RS_BF16 == 2:
         return False
@@ -576,6 +626,18 @@ def weight_lse_partials(
     return out
 
 
+def _weight_by_lse(output: torch.Tensor, lse: torch.Tensor, group: Any) -> torch.Tensor:
+    """This rank's `softmax_r(lse) * o_r` term in f32, weighted over `group`
+    (as in `cp_lse_ag_out_rs`)."""
+    lse = lse.to(torch.float32)
+    lses = group.all_gather(lse.unsqueeze(0).contiguous(), dim=0)
+    merged_lse = torch.logsumexp(lses, dim=0)
+    # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
+    weight = torch.exp(lse - merged_lse).unsqueeze(-1)
+    weighted = output.to(torch.float32) * weight
+    return torch.where(weight > 0, weighted, torch.zeros_like(weighted))
+
+
 def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:
     """Block `d` of `x`'s leading axis goes to rank `d`; block `r` of the
     result came from rank `r`."""
@@ -695,6 +757,8 @@ def send_layout_applies(
 
     group = get_dcp_group()
     if group is None or int(group.world_size) == 1:
+        return False
+    if dcp_spans_pcp():
         return False
     if not (
         envs.TPU_DCP_MLA_SEND_LAYOUT
@@ -1071,6 +1135,8 @@ def fused_small_a2a_applies(num_tokens: int) -> bool:
     from vllm_torchtpu.layers.core.attention_interface import dcp_mla_topk_cap
 
     if not (envs.TPU_MLA_FUSED_SMALL_A2A and send_small_a2a_applies(num_tokens)):
+        return False
+    if dcp_spans_pcp():
         return False
     group = get_dcp_group()
     dcp_size = 1 if group is None else int(group.world_size)

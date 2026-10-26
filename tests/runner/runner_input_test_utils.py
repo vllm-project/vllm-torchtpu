@@ -84,6 +84,8 @@ def _make_runner(
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
     runner.sequence_layout_planner = create_sequence_layout_planner(runner.vllm_config)
+    runner.pcp_manager = None
+    runner.get_pcp_planner = types.MethodType(TPUModelRunner.get_pcp_planner, runner)
     runner.cache_config = SimpleNamespace(
         num_gpu_blocks=8, num_gpu_blocks_override=None
     )

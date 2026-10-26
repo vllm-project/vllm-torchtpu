@@ -19,6 +19,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_torchtpu.layers.core.pcp_metadata import PcpMetadata
 from vllm_torchtpu.layers.core.sequence_layout import (
     DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
     DEFAULT_SEQUENCE_LAYOUT_PROTOCOL,
@@ -55,6 +56,7 @@ def attention_block_table_width(
         "mamba_slot_read_offsets",
         "mamba_ckpt_indices",
         "mamba_request_distribution",
+        "pcp_metadata",
     ],
     meta_fields=[
         "sequence_layout_kind",
@@ -106,6 +108,8 @@ class AttentionMetadata:
     # the first two groups. None unless the model has mamba layers and spec
     # decoding is enabled.
     mamba_request_distribution: jax.Array | torch.Tensor | None = None
+    # PCP manager only (see `runner/pcp/manager.py`); None elsewhere.
+    pcp_metadata: PcpMetadata | None = None
     sequence_layout_kind: str = SequenceLayoutKind.ALL.value
     sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
     sequence_layout_version: int = 1
@@ -171,6 +175,10 @@ class AttentionMetadataBuilderContext:
     # (state_indices, ckpt_indices | None) from the single
     # `_staged_walk_products_compiled` program; None -> per-group fallback.
     staged_mamba_products: dict | None = None
+    # Persistent-batch row of each request (None: rows [start_index,
+    # start_index + num_reqs)). Set by the PCP manager.
+    block_table_rows: Any = None
+    use_pcp_manager: bool = False
 
 
 def _staged_walk_products(
@@ -374,12 +382,22 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             ).to(runner.device)
             input_positions = ctx.position_ids_override
         else:
+            if self.block_tables_cpu.shape[0] < target_num_reqs:
+                # A sequence layout's request bucket can outgrow
+                # `max_num_reqs` (see `TPUModelRunner.max_num_local_reqs`).
+                self.block_tables_cpu = torch.zeros(
+                    (target_num_reqs, self.block_tables_cpu.shape[1]),
+                    dtype=self.block_tables_cpu.dtype,
+                )
             block_tables = self.block_tables_cpu[:target_num_reqs, :target_num_blocks]
             block_tables.zero_()
             source_block_tables = block_table_obj.get_cpu_tensor()
-            block_tables[: ctx.num_reqs, :target_num_blocks] = source_block_tables[
-                ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
-            ]
+            _copy_block_table_rows(
+                block_tables[:, :target_num_blocks],
+                source_block_tables,
+                ctx,
+                target_num_blocks,
+            )
             # Flatten on CPU before H2D to avoid device-side
             # as_strided/reshape materialization on every decode step.
             block_tables_dev = block_tables.reshape(-1).to(
@@ -450,6 +468,17 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             mamba_slot_read_offsets = None
             mamba_request_distribution = None
 
+        pcp_metadata = (
+            None
+            if not ctx.use_pcp_manager
+            else runner.pcp_manager.build_metadata(
+                runner=runner,
+                block_table_obj=block_table_obj,
+                target_num_reqs=target_num_reqs,
+                target_num_blocks=target_num_blocks,
+            )
+        )
+
         return AttentionMetadata(
             input_positions=input_positions,
             block_tables=block_tables_dev,
@@ -460,10 +489,27 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             mamba_slot_read_offsets=mamba_slot_read_offsets,
             mamba_ckpt_indices=mamba_ckpt_indices,
             mamba_request_distribution=mamba_request_distribution,
+            pcp_metadata=pcp_metadata,
             sequence_layout_kind=ctx.sequence_layout_descriptor.kind.value,
             sequence_layout_protocol=(ctx.sequence_layout_descriptor.protocol),
             sequence_layout_version=ctx.sequence_layout_descriptor.version,
         )
+
+
+def _copy_block_table_rows(
+    dst: torch.Tensor,
+    source: torch.Tensor,
+    ctx: AttentionMetadataBuilderContext,
+    target_num_blocks: int,
+) -> None:
+    """Fill `dst[:ctx.num_reqs]` with this metadata's requests' block tables."""
+    if ctx.block_table_rows is None:
+        dst[: ctx.num_reqs] = source[
+            ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
+        ]
+    else:
+        rows = torch.as_tensor(ctx.block_table_rows, dtype=torch.long)
+        dst[: ctx.num_reqs] = source[:, :target_num_blocks].index_select(0, rows)
 
 
 def stage_block_table_uploads(
@@ -520,9 +566,7 @@ def stage_block_table_uploads(
                 num_reqs_padded, target_num_blocks
             )
             source = block_table_obj.get_cpu_tensor()
-            rows[: ctx.num_reqs] = source[
-                ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
-            ]
+            _copy_block_table_rows(rows, source, ctx, target_num_blocks)
             offset += num_reqs_padded * target_num_blocks
     # Dummy runs keep the zeroed scratch: same staged layout, null blocks.
 

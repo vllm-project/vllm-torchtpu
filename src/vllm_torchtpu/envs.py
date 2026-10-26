@@ -65,6 +65,10 @@ if TYPE_CHECKING:
     TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS: int = 2048
     TPU_MLA_DECODE_BODY_LEVERS: str = "1"
     TPU_DCP_MLA_MIXED_KERNEL_V2: bool = True
+    USE_TPU_PCP_MANAGER: bool = False
+    TPU_PCP_SHARDING_PLAN: str = "headtail"
+    TPU_PCP_KV_WORKSPACE_TOKENS: int = 1048576
+    TPU_PCP_KV_CHUNK_TOKENS: int = 65536
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -907,6 +911,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MLA_MIXED_FUSED_PREP": env_bool(
         "TPU_DCP_MLA_MIXED_FUSED_PREP", default=False
     ),
+    # Run PCP through `runner/pcp/manager.py` (PCP x DCP KV gather).
+    "USE_TPU_PCP_MANAGER": env_bool("USE_TPU_PCP_MANAGER", default=False),
+    "TPU_PCP_SHARDING_PLAN": env_with_choices(
+        "TPU_PCP_SHARDING_PLAN",
+        "headtail",
+        ["headtail", "interleaved"],
+        case_sensitive=False,
+    ),
+    # PCP manager: max context tokens one step's split prefills may gather.
+    "TPU_PCP_KV_WORKSPACE_TOKENS": env_int("TPU_PCP_KV_WORKSPACE_TOKENS", 1048576),
+    # PCP manager: context tokens gathered per all-gather chunk.
+    "TPU_PCP_KV_CHUNK_TOKENS": env_int("TPU_PCP_KV_CHUNK_TOKENS", 65536),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per
