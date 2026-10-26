@@ -142,6 +142,8 @@ def test_host_boundary_preserves_bits_dp_axis_and_current_ids(monkeypatch, dp, f
     )
     embedding.embedding_dim = width
     embedding._shared_table = None
+    embedding._gather_workers = 1
+    embedding._gather_pool = None
     embedding.weight = torch.nn.Parameter(
         bits.view(embedding.storage_dtype), requires_grad=False
     )
@@ -187,6 +189,7 @@ def test_host_boundary_preserves_bits_dp_axis_and_current_ids(monkeypatch, dp, f
         assert boundaries and all(count == 1 for count in boundaries)
     finally:
         torch._dynamo.reset()
+        embedding.close()
 
 
 @pytest.mark.parametrize("offload", [False, True])
