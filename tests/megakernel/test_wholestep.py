@@ -83,7 +83,9 @@ def _assert_within_budget(res: np.ndarray, ref: np.ndarray, layers: int = L) -> 
     for r in range(res.shape[0]):
         d = np.abs(res[r] - ref)
         assert d.mean() < 1e-2 * k * scale, (r, d.mean(), scale)
-        assert np.quantile(d, 0.999) < 5e-2 * k * scale, (r, np.quantile(d, 0.999), scale)
+        # q999 6e-2 (was 5e-2): the sigmoid(z) GDN gate passes more BF16 rounding (first QSA
+        # layer's K/V rows: 0.0313 vs 0.0281); the segment parity tests moved 5e-2 -> 6e-2.
+        assert np.quantile(d, 0.999) < 6e-2 * k * scale, (r, np.quantile(d, 0.999), scale)
         assert d.max() < 1e-1 * k * scale, (r, d.max(), scale)
 
 
@@ -94,7 +96,9 @@ def test_two_groups_identical_experts_match_reference():
     _assert_within_budget(res, ref)
     # The step's K/V rows (cache-write payload): the first QSA layer's input has seen three
     # layers of drift, the second's seven; both inside the residual's depth-scaled budget.
-    np.testing.assert_allclose(kv[:, 0], kv_ref[:, 0], rtol=2e-2, atol=2e-2)
+    # atol 4e-2: Qwen3.8's sigmoid(z) GDN gate passes more of the BF16-rounded GDN output
+    # than silu did (5 of 8192 elements at 0.035; the segment tests widened likewise).
+    np.testing.assert_allclose(kv[:, 0], kv_ref[:, 0], rtol=2e-2, atol=4e-2)
     for o in range(kv.shape[1]):
         for r in range(kv.shape[0]):  # per-rank projections: per-rank references
             _assert_within_budget(kv[r : r + 1, o], kv_ref[r, o], layers=4 * (o + 1))
