@@ -121,6 +121,42 @@ def _rank_salt(code: str) -> str:
     return f"\nrank-dependent:{rank}"
 
 
+def graph_is_rank_dependent(graph: fx.GraphModule) -> bool:
+    """Whether `graph` (or a submodule) calls a rank-dependent op: its artifacts are salted
+    with the rank, so no peer ever replays them and waiting for a peer's is pointless."""
+    try:
+        return any(
+            _rank_salt(module.code)
+            for _, module in graph.named_modules()
+            if isinstance(module, fx.GraphModule)
+        )
+    except Exception:
+        return False
+
+
+def agree_all_ranks(ok: bool) -> bool:
+    """True only if every rank passes `ok` (a MIN all-reduce on the world CPU group).
+
+    Lets the ranks fail a rank-dependent compile together: a rank that failed alone would leave
+    its peers running an SPMD program it never joins, or waiting on an artifact it never saves
+    (w04 j-05391f11: one rank's VMEM OOM left the other seven idle ~62 min).
+    """
+    import torch.distributed as dist
+
+    if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() == 1:
+        return ok
+    group = None
+    try:
+        from vllm.distributed.parallel_state import get_world_group
+
+        group = get_world_group().cpu_group
+    except Exception:
+        pass
+    flag = torch.tensor([1 if ok else 0], dtype=torch.int32)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group)
+    return bool(flag.item())
+
+
 @contextlib.contextmanager
 def wait_for_peer_artifact(timeout_s: float):
     """Within this block, `compile` waits up to `timeout_s` for another rank

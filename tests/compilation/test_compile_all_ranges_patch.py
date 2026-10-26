@@ -76,13 +76,17 @@ def _compile(
     local_rank,
     ranks_per_host=8,
     disable_cache=False,
+    fail_at=None,
 ):
-    """(range end, peer wait in seconds) per compile, in order."""
+    """(range end, peer wait in seconds) per compile, in order. `fail_at`: the range whose
+    compile raises MemoryError."""
     _host(monkeypatch, ranks_per_host)
     monkeypatch.setenv("LOCAL_RANK", str(local_rank))
     calls = []
 
     def compile(graph, args, *rest, compile_range, **kwargs):
+        if compile_range.end == fail_at:
+            raise MemoryError("vmem")
         calls.append(
             (compile_range.end, getattr(tpu_compiler._peer_wait, "timeout_s", 0.0))
         )
@@ -272,3 +276,98 @@ def test_peer_replay_is_ignored_with_the_compile_cache_disabled(
         assert all(wait == 0.0 for _, wait in calls)
         assert sorted(end for end, _ in calls) == SIZES
     assert warnings and "VLLM_DISABLE_COMPILE_CACHE" in warnings[0]
+
+
+# --- rank-dependent graphs (rank-salted artifacts: no peer ever replays them) ----------
+
+
+def test_rank_dependent_graph_compiles_every_range_without_waiting(
+    compile_all_ranges, monkeypatch
+):
+    """A graph calling a rank-dependent op (e.g. the Qwen3.8 megakernel) has no owner to wait
+    for: every rank compiles every range at once, then the ranks agree on success."""
+    monkeypatch.setattr(tpu_compiler, "graph_is_rank_dependent", lambda graph: True)
+    agreed = []
+    monkeypatch.setattr(
+        tpu_compiler, "agree_all_ranks", lambda ok: agreed.append(ok) or ok
+    )
+    for rank in range(8):
+        calls = _compile(compile_all_ranges, monkeypatch, rank)
+        assert all(wait == 0.0 for _, wait in calls)
+        assert sorted(end for end, _ in calls) == SIZES
+    assert agreed == [True] * 8
+
+
+def test_rank_dependent_failure_on_another_rank_fails_here(
+    compile_all_ranges, monkeypatch
+):
+    monkeypatch.setattr(tpu_compiler, "graph_is_rank_dependent", lambda graph: True)
+    monkeypatch.setattr(tpu_compiler, "agree_all_ranks", lambda ok: False)
+    with pytest.raises(RuntimeError, match="another rank"):
+        _compile(compile_all_ranges, monkeypatch, 3)
+
+
+def test_rank_dependent_failure_here_still_joins_the_agreement(
+    compile_all_ranges, monkeypatch
+):
+    """The failing rank reaches the agreement (its peers would otherwise block in it) and then
+    raises its own error."""
+    monkeypatch.setattr(tpu_compiler, "graph_is_rank_dependent", lambda graph: True)
+    agreed = []
+    monkeypatch.setattr(
+        tpu_compiler, "agree_all_ranks", lambda ok: agreed.append(ok) or ok
+    )
+    with pytest.raises(MemoryError, match="vmem"):
+        _compile(compile_all_ranges, monkeypatch, 0, fail_at=512)
+    assert agreed == [False]
+
+
+def test_graph_is_rank_dependent_reads_submodule_code(monkeypatch):
+    import torch
+    from torch import fx
+
+    monkeypatch.setattr(tpu_compiler, "_RANK_DEPENDENT_OPS", {"qwen38_mk_test"})
+
+    class Inner(torch.nn.Module):
+        def forward(self, x):
+            return torch.relu(x)
+
+    class Outer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.inner = fx.symbolic_trace(Inner())
+
+        def forward(self, x):
+            return self.inner(x) + 1
+
+    graph = fx.symbolic_trace(Outer())
+    assert not tpu_compiler.graph_is_rank_dependent(graph)
+    tpu_compiler._RANK_DEPENDENT_OPS.add("relu")
+    assert tpu_compiler.graph_is_rank_dependent(graph)
+    assert not tpu_compiler.graph_is_rank_dependent(object())
+
+
+def _agree_worker(rank, port, oks, out):
+    import torch.distributed as dist
+
+    dist.init_process_group(
+        "gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=len(oks)
+    )
+    try:
+        out[rank] = tpu_compiler.agree_all_ranks(oks[rank])
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("oks", [[True, True], [True, False], [False, False]])
+def test_agree_all_ranks_is_a_min_over_ranks(oks):
+    import socket
+
+    import torch.multiprocessing as mp
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    out = mp.Manager().dict()
+    mp.spawn(_agree_worker, args=(port, oks, out), nprocs=len(oks), join=True)
+    assert [out[r] for r in range(len(oks))] == [all(oks)] * len(oks)

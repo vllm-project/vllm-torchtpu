@@ -524,6 +524,25 @@ def _patch_vllm_compile_all_ranges() -> None:
             "compile_all_ranges should not be called."
         )
         local_rank = int(os.environ["LOCAL_RANK"])
+        from vllm_torchtpu.compilation.tpu_compiler import (
+            agree_all_ranks,
+            graph_is_rank_dependent,
+        )
+
+        if graph_is_rank_dependent(self.graph):
+            # No peer replays a rank-salted artifact: compile every range here without waiting
+            # for an owner (an owner that failed left its peers waiting PEER_WAIT_S), then fail
+            # together, before any rank runs the program its peers may not have.
+            failure: Exception | None = None
+            try:
+                compile_rotated(self, local_rank)
+            except Exception as e:  # noqa: BLE001 - re-raised below on every rank
+                failure = e
+            if not agree_all_ranks(failure is None):
+                raise failure or RuntimeError(
+                    "rank-dependent compile failed on another rank; failing on all ranks"
+                )
+            return
         if not envs.TPU_PRECOMPILE_PEER_REPLAY:
             compile_rotated(self, local_rank)
             return
