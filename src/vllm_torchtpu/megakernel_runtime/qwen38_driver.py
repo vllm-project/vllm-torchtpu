@@ -166,6 +166,9 @@ def _cpu_proxy(m: Any, memo: dict | None = None) -> Any:
 NO_DONATE = False
 # Largest whole-step bucket: its VMEM plan fits up to 64 rows (`wholestep_tiles`).
 WHOLE_MAX_ROWS = 64
+# Model steps after warmup (verify steps; any step once disabled) by which a `whole=1`
+# server must have made a whole-step call.
+WHOLE_SELF_CHECK_STEPS = 200
 
 _UNSET = object()
 
@@ -1181,6 +1184,33 @@ class Qwen38SegmentDriver:
             logger.exception("Qwen3.8 whole-step: setup failed; segment program only")
             self.whole_program = None
 
+    def _whole_self_check(self, runner: Any) -> None:
+        """Loud error if `whole=1` but no whole-step call ran in the first model steps after
+        warmup: a silent fall-back to stock (w06g / w07g served GSM8K on stock after the MK
+        failed at its first call) then shows within minutes instead of at the end of a run."""
+        if getattr(self, "_whole_checked", False) or not getattr(runner, "warmup_done", False):
+            return
+        if not hasattr(self, "_whole_check_base"):
+            self._whole_check_base, self._whole_check_steps = self.whole_calls, 0
+        self._whole_check_steps += 1
+        if self._whole_check_steps < WHOLE_SELF_CHECK_STEPS:
+            return
+        self._whole_checked = True
+        served = self.whole_calls - self._whole_check_base
+        if served == 0:
+            logger.error(
+                "Qwen3.8 whole-step SELF-CHECK FAILED: whole=1 but no whole-step call in the "
+                "first %d steps after warmup (megakernel %s); step mix %s",
+                WHOLE_SELF_CHECK_STEPS,
+                "disabled" if self.whole_program is None else "on, nothing eligible",
+                dict(sorted(self.stats.items())),
+            )
+        else:
+            logger.info(
+                "Qwen3.8 whole-step self-check: %d whole-step calls in the first %d verify steps",
+                served, WHOLE_SELF_CHECK_STEPS,
+            )
+
     def _whole_eligible(self, runner: Any, n_req: int, rows: int) -> bool:
         if self.whole_program is None or rows > min(WHOLE_MAX_ROWS, self.whole_max_rows):
             return False
@@ -1322,12 +1352,14 @@ class Qwen38SegmentDriver:
         intermediate_tensors: Any,
         model_kwargs: Any = None,
     ) -> tuple[bool, Any]:
-        if self.program is None or inputs_embeds is not None or intermediate_tensors is not None:
+        if inputs_embeds is not None or intermediate_tensors is not None:
             # Counted like every other stock route, so a bypass shows in the mix.
-            self._note(
-                "stock_noprogram" if self.program is None
-                else ("stock_embeds" if inputs_embeds is not None else "stock_intermediate")
-            )
+            self._note("stock_embeds" if inputs_embeds is not None else "stock_intermediate")
+            return False, None
+        if self.program is None:  # disabled (it failed): the self-check still counts steps
+            self._note("stock_noprogram")
+            if self.whole:
+                self._whole_self_check(runner)
             return False, None
         self.seq += 1
         ok, n_req, t_seq, reason = MegakernelDriver._inspect_step_detail(None, None, runner)
@@ -1335,6 +1367,8 @@ class Qwen38SegmentDriver:
         if not ok or t_seq != T_VERIFY:
             self._note(reason if not ok else f"stock_t{t_seq}")
             return False, None
+        if self.whole:
+            self._whole_self_check(runner)
         if rows not in self.buckets or n_req * T_VERIFY > rows:
             self._note(f"stock_rows{rows}_n{n_req}")
             return False, None
