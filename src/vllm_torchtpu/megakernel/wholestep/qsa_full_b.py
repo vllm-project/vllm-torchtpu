@@ -73,6 +73,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         per_request_scores: bool = False,
         bounded_chunks: bool = False,
         shard_index: bool = False,
+        union_attn: bool = False,
         **kw: Any,
     ) -> None:
         """`carrier`: "" = prototype contiguous keys `[requests, max_groups, 128]`; "fp8" = the
@@ -95,7 +96,9 @@ class QSAFullIndexedBlock(QSAFullBlock):
         row's `n_vis` are stale and masked by the selection. `shard_index` (needs
         `per_request_scores`): each rank scores and selects only its own contiguous run of
         `ceil(requests / R)` requests, then the ranks exchange the selected ids, lengths and
-        `g_a` flags so every rank attends every row (in-kernel remote DMA, int32: exact)."""
+        `g_a` flags so every rank attends every row (in-kernel remote DMA, int32: exact).
+        `union_attn` (needs `per_request_scores`): each request's verify rows attend one union of
+        their selections, streamed once (`union_attn.attend_request`)."""
         super().__init__(**kw)
         assert max_groups % 1024 == 0, max_groups  # whole (8, 128) score tiles per row
         self.max_groups, self.pps, self.debug = max_groups, pages_per_seq, debug
@@ -106,6 +109,8 @@ class QSAFullIndexedBlock(QSAFullBlock):
         self.bounded_chunks = bounded_chunks
         self.shard_index = shard_index
         assert not shard_index or per_request_scores, "the sharded indexer selects per request"
+        self.union_attn = union_attn
+        assert not union_attn or per_request_scores, "the union is built per request"
         self.chunk_pages = chunk_pages if carrier else max_groups // GPK
         assert (max_groups // GPK) % self.chunk_pages == 0, (max_groups, self.chunk_pages)
         assert (self.chunk_pages * GPK) % 128 == 0 and (max_groups // 128) % 8 == 0

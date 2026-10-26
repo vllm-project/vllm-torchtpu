@@ -44,6 +44,7 @@ from ..exec_spec import ExecSpec
 from ..ops import BF16, F32, I32, rnd, rmsnorm
 from ..spec import ExtraInput, ScratchReq, SmallField, StateDecl
 from . import indexer as ix
+from . import union_attn as ua
 from .qsa_full import OFFSET, POOL, ROPE, SCALES
 from .qsa_full_b import CK, IDX_N, IDX_W, NVIS, TAIL, QSAFullIndexedBlock
 
@@ -119,7 +120,33 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             ScratchReq("qf_kr", pltpu.VMEM((ex.MB, g.HD), BF16)),
             ScratchReq("qc_ir", pltpu.VMEM((ex.MB, ix.IDX_DIM), BF16)),
             ScratchReq("qc_osem", pltpu.SemaphoreType.DMA((2,))),
-        ] + (self._shard_scratch(ex) if self.shard_index else [])
+        ] + (self._shard_scratch(ex) if self.shard_index else []) + (
+            self._union_scratch(ex) if self.union_attn else []
+        )
+
+    def _union_width(self, ex: ExecSpec) -> int:
+        """Union slots per request: every row's whole selection, 128-lane aligned."""
+        return -(-(ex.T * self.budget) // 128) * 128
+
+    def _union_scratch(self, ex: ExecSpec) -> list[ScratchReq]:
+        nreq, KU, S = ex.MB // ex.T, self._union_width(ex), self.max_groups // 128
+        out = [
+            ScratchReq("qu_code", pltpu.VMEM((S, 128), I32)),
+            ScratchReq("qu_id", pltpu.VMEM((nreq, 1, KU), I32)),
+            ScratchReq("qu_cd", pltpu.VMEM((nreq, 1, KU), I32)),
+            ScratchReq("qu_n", pltpu.SMEM((nreq,), I32)),
+            ScratchReq("qu_row", pltpu.SMEM((1, KU + 128), I32)),
+            ScratchReq("qu_sem", pltpu.SemaphoreType.DMA((2,))),
+        ]
+        if self.shard_index:
+            npr, n = self._shard_rows(ex)[0], max(ex.R - 1, 1)
+            out += [
+                ScratchReq("qgu_send", pltpu.VMEM((npr, 1, 2 * KU + 128), I32)),
+                ScratchReq("qgu_recv", pltpu.VMEM((ex.R, npr, 1, 2 * KU + 128), I32)),
+                ScratchReq("qgu_ssem", pltpu.SemaphoreType.DMA((n,))),
+                ScratchReq("qgu_rsem", pltpu.SemaphoreType.DMA((n,))),
+            ]
+        return out
 
     def _shard_rows(self, ex: ExecSpec) -> tuple[int, int, int]:
         """(requests per rank, rows per rank, exchange row width) of the sharded indexer."""
@@ -265,6 +292,8 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             consts = ix.compact_consts(S, K)
             lid = consts[-1]
             scr["qi_z"][...] = jnp.zeros((1, 128), I32)
+            if self.union_attn:
+                scr["qu_code"][...] = jnp.zeros((S, 128), I32)
 
             def row(r: Any, carry: Any) -> Any:
                 nvr = scr["qi_nv"][r][:, :1]
@@ -280,6 +309,10 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 # clamped to g_a the compaction sees exactly those ids (select-all of the kept).
                 kept = jnp.sum((sel & (lid < ga)).astype(I32))
                 b2 = jnp.where(sel & (lid < ga), bp, -1)
+                if self.union_attn:  # row bit r - lo of every pool-path group it selects
+                    scr["qu_code"][...] = scr["qu_code"][...] | jnp.where(
+                        sel & (lid < ga), jnp.left_shift(1, r - lo), 0
+                    )
                 scr["qi_id"][r] = ix.compact_row(
                     b2, jnp.zeros((1, 1), I32), jnp.zeros((1, 1), I32) + G,
                     jnp.zeros((1, 1), I32) + kept, K, consts,
@@ -301,6 +334,14 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 return carry
 
             jax.lax.fori_loop(lo, lo + n, row, 0)
+            if self.union_attn:  # per-request call: rows [lo, lo + T) are request lo // T
+                KU = self._union_width(ex)
+                ids, codes, nu = ua.compact_union(
+                    scr["qu_code"][...], KU, ua.union_consts(S, KU)
+                )
+                scr["qu_id"][lo // T] = ids
+                scr["qu_cd"][lo // T] = codes
+                scr["qu_n"][lo // T] = jnp.sum(nu)
         self.load_tables(ctx, l)
         if self.shard_index:
             # Each rank scores and selects its own run of `npr` requests; every rank still
@@ -406,6 +447,106 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             return carry
 
         jax.lax.fori_loop(0, MB, unpack, 0)
+        if self.union_attn:
+            self._exchange_unions(ctx)
+
+    def _exchange_unions(self, ctx: Any) -> None:
+        """All-gather the owners' per-request unions (ids, row codes, count; int32)."""
+        ex, scr = ctx.ex, ctx.scr
+        nreq, KU = ex.MB // ex.T, self._union_width(ex)
+        npr = self._shard_rows(ex)[0]
+        me = ctx.me
+        lane = jax.lax.broadcasted_iota(I32, (1, 2 * KU + 128), 1)
+
+        def pack(i: Any, carry: Any) -> Any:
+            q = jnp.minimum(me * npr + i, nreq - 1)  # past the last request: never read
+            scr["qgu_send"][i, :, pl.ds(0, KU)] = scr["qu_id"][q]
+            scr["qgu_send"][i, :, pl.ds(KU, KU)] = scr["qu_cd"][q]
+            scr["qgu_send"][i, :, pl.ds(2 * KU, 128)] = jnp.zeros((1, 128), I32) + scr["qu_n"][q]
+            return carry
+
+        jax.lax.fori_loop(0, npr, pack, 0)
+        scr["qgu_recv"][me] = scr["qgu_send"][...]
+        if ex.R > 1:
+            ctx.comm.exchange(
+                ctx.comm.group_copies(
+                    lambda off: scr["qgu_send"], scr["qgu_recv"].at[me],
+                    scr["qgu_ssem"], scr["qgu_rsem"], ex.R,
+                )
+            )
+
+        def unpack(q: Any, carry: Any) -> Any:
+            o = q // npr
+            row = scr["qgu_recv"][o, q - o * npr]
+            scr["qu_id"][q] = row[:, :KU]
+            scr["qu_cd"][q] = row[:, KU : 2 * KU]
+            scr["qu_n"][q] = jnp.sum(jnp.where(lane == 2 * KU, row, 0))
+            return carry
+
+        jax.lax.fori_loop(0, nreq, unpack, 0)
+
+    def _recent_ok(self, ctx: Any, r: Any, s: Any) -> Any:
+        """Row `r`'s valid recent-tile slots `s`: causal, its partial group, and `g_a` when
+        complete for the row and selected (the per-row attention's `ok`)."""
+        ex, scr, T = ctx.ex, ctx.scr, ctx.ex.T
+        q = r // T
+        c0 = ctx.extra[CTXQ][q]
+        ga = c0 // 4
+        p_r = c0 + r - q * T
+        n_r, tail = ctx.extra[NVIS][r], ctx.extra[TAIL][r]
+        pos = 4 * ga + s
+        grp = pos // 4
+        part = (grp == n_r) & (tail > 0)
+        full = (grp == ga) & (ga < n_r) & (scr["qc_sga"][r] > 0)
+        return (r < ex.B) & (pos <= p_r) & (part | full)
+
+    def _attend_unions(self, ctx: Any, l: Any, zeros: tuple) -> list[jax.Array]:
+        """Every request's rows over the union of their selections (`union_attn`)."""
+        ex, scr, g, T = ctx.ex, ctx.scr, ctx.g, ctx.ex.T
+        nh, KU, nreq = self.nh(g, ex), self._union_width(ex), ex.MB // ex.T
+        rows = jax.lax.broadcasted_iota(I32, (ex.MB, 1), 0)
+        srow = jax.lax.broadcasted_iota(I32, (1, 8), 1)
+        scol = jax.lax.broadcasted_iota(I32, (8, 1), 0)
+
+        def req(q: Any, outs: Any) -> Any:
+            cs = [
+                pltpu.make_async_copy(
+                    scr["qu_id"].at[q], scr["qu_row"].at[pl.ds(0, 1), pl.ds(0, KU)],
+                    scr["qu_sem"].at[0],
+                ),
+                pltpu.make_async_copy(
+                    scr["qi_z"], scr["qu_row"].at[pl.ds(0, 1), pl.ds(KU, 128)], scr["qu_sem"].at[1]
+                ),
+            ]
+            for c in cs:
+                c.start()
+            for c in cs:
+                c.wait()
+            rs = [q * T + t for t in range(T)]
+            ok = jnp.concatenate(
+                [jnp.broadcast_to(self._recent_ok(ctx, r, srow), (nh, 8)) for r in rs], axis=0
+            )
+            ok_any = self._recent_ok(ctx, rs[0], scol)
+            for r in rs[1:]:
+                ok_any = ok_any | self._recent_ok(ctx, r, scol)
+            res = ua.attend_request(
+                T=T, nh=nh, pool=ctx.extra[POOL], ring=scr["qf_ring"], sems=scr["qf_ring_sem"],
+                ids=scr["qu_row"], codes=scr["qu_cd"].at[q], n_union=scr["qu_n"][q],
+                table=self.tables(ctx)[1], table_row=self.tab_base(ctx, l) + q,
+                q=jnp.concatenate([scr["qf_q"][r] for r in rs], axis=0),
+                gates=[scr["qf_g"][r] for r in rs],
+                has=[scr["qi_kvl"][r] > 0 for r in rs],
+                off=self.offset(ctx, l), scale_k=ctx.extra[SCALES][0],
+                scale_v=ctx.extra[SCALES][1], sm_scale=g.HD**-0.5, interpret=ex.interpret,
+                recent=(scr["qc_rk"][q], scr["qc_rv"][q], ok, ok_any),
+            )
+            outs = list(outs)
+            for t, r in enumerate(rs):
+                for h in range(nh):
+                    outs[h] = jnp.where(rows == r, res[t][h : h + 1], outs[h])
+            return tuple(outs)
+
+        return list(jax.lax.fori_loop(0, nreq, req, zeros))
 
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
         ex, scr, g = ctx.ex, ctx.scr, ctx.g
@@ -448,7 +589,10 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             )
 
         zeros = tuple(jnp.zeros((ex.MB, g.HD), F32) for _ in range(nh))
-        *outs, _, _ = jax.lax.fori_loop(0, ex.MB, row, (*zeros, jnp.int32(0), jnp.int32(0)))
+        if self.union_attn:
+            outs = self._attend_unions(ctx, l, zeros)
+        else:
+            *outs, _, _ = jax.lax.fori_loop(0, ex.MB, row, (*zeros, jnp.int32(0), jnp.int32(0)))
         for h, o in enumerate(outs):
             scr["xb2"][:, pl.ds(h * g.HD, g.HD)] = o.astype(BF16)
         kv.wait()

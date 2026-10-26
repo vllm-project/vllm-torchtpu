@@ -50,11 +50,14 @@ LONG_CONTEXT = dict(hbm_tables=True, per_request_scores=True, bounded_chunks=Tru
 # `VLLM_TPU_MEGAKERNEL=...,wholeshard=1`: each rank scores and selects its own run of requests and
 # the ranks exchange the selections in-kernel (`QSAFullIndexedBlock.shard_index`; exact).
 SHARD_INDEX = False
+# `...,wholeunion=1`: each request's verify rows attend one union of their selections, streamed
+# once (`QSAFullIndexedBlock.union_attn`; same tokens per row, f32 order of the softmax tiles).
+UNION_ATTN = False
 
 
 def indexed_options() -> dict:
-    """The served indexer options (`LONG_CONTEXT`, plus the request-sharded selection)."""
-    return dict(LONG_CONTEXT, shard_index=SHARD_INDEX)
+    """The served indexer options (`LONG_CONTEXT`, the request-sharded selection, union attention)."""
+    return dict(LONG_CONTEXT, shard_index=SHARD_INDEX, union_attn=UNION_ATTN)
 
 
 def wholestep_tiles(B: int) -> Tiles:

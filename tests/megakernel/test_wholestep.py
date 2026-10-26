@@ -206,7 +206,8 @@ def test_selection_check_catches_an_off_by_one_id(monkeypatch):
 CTX_C = [3001, 100]  # request 0: g_a holds one old token; request 1: g_a starts at the step
 
 
-def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, rank_ids: bool = False):
+def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, rank_ids: bool = False,
+           union: bool = False):
     from vllm_torchtpu.megakernel.wholestep.qsa_full_b import DBG_IDS, DBG_IQ
     from vllm_torchtpu.megakernel.wholestep.qsa_full_c import CK_NEW, IR_NEW, KR_NEW, RING_NEW
 
@@ -222,7 +223,7 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
     steps = d.pop("_step_out")
     pps = d["mtab"].shape[1]
     long_kw = dict(carrier="bf16", chunk_pages=8, hbm_tables=True, per_request_scores=True,
-                   bounded_chunks=True, shard_index=shard)
+                   bounded_chunks=True, shard_index=shard, union_attn=union)
     spec = wholestep_spec(
         G, R, L=L, qsa=dict(budget=BUDGET), step=True,
         indexed=dict(max_groups=MAX_GROUPS, pages_per_seq=pps, debug=True, **(long_kw if long else {})),
@@ -285,6 +286,36 @@ def test_sharded_indexer_matches_unsharded():
         np.testing.assert_array_equal(ids_s[r], ids_b[0])
     for i, name in ((0, "residual"), (3, "ck_new"), (4, "ring_new")):
         np.testing.assert_array_equal(shard[i], base[i], err_msg=name)
+
+
+def test_union_attention_matches_per_row(monkeypatch):
+    """`union_attn`: each request's rows attend one union of their selections (here 229 of a
+    possible 256 groups for request 0: four ring tiles instead of one per row). Every row attends
+    the same tokens in the same order, so only the online softmax's tile partition differs: the
+    outputs agree to BF16 rounding (on these inputs, exactly), alone and with `shard_index`. A
+    corrupted row code (row 0 attending the whole union) is caught."""
+    from vllm_torchtpu.megakernel.wholestep import union_attn as ua
+
+    base = _run_c(long=True, rank_ids=True)
+    scale = float(np.abs(base[1]).mean())
+
+    def close(run: tuple) -> float:
+        d = np.abs(run[0] - base[0])
+        assert d.max() < 1e-2 * scale and (d == 0).mean() > 0.99, (d.max() / scale, (d == 0).mean())
+        np.testing.assert_array_equal(run[7], base[7])  # the selection itself is untouched
+        return float(d.max())
+
+    close(_run_c(long=True, rank_ids=True, union=True))
+    close(_run_c(long=True, rank_ids=True, union=True, shard=True))
+    orig = ua.compact_union
+
+    def broken(code, KU, consts):  # noqa: ANN001
+        ids, codes, n = orig(code, KU, consts)
+        return ids, codes | 1, n
+
+    monkeypatch.setattr(ua, "compact_union", broken)
+    with pytest.raises(AssertionError):
+        close(_run_c(long=True, rank_ids=True, union=True))
 
 
 def test_step_tokens_match_stock_semantics():

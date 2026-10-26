@@ -1,0 +1,225 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Per-request union attention: a request's `T` verify rows read one union of their selections.
+
+`attend_row` streams every row's own selected groups, so the `T` rows of a request read their
+shared groups `T` times. Here the request's pool-path selections are merged into one ascending
+union of groups, each tagged with a `T`-bit code (bit `t`: row `t` selected it); the union is
+streamed once through the ring and scored for all `T * nh` query rows in one matmul per tile,
+each row masked to its own groups. Every row attends exactly the tokens it attends in
+`attend_row`, in the same ascending order; only the tile partition of the online softmax differs
+(a row's groups sit in fewer, fuller tiles), so results agree to f32 rounding, not bit for bit.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import jax
+import jax.numpy as jnp
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+
+from ..blocks.qsa_attn.block import MICRO, TILE, _unpack_kv
+from ..ops import BF16, F32, I32
+
+GROUPS_PER_TILE = TILE // MICRO  # one group = one micro-page of 4 tokens
+
+
+def union_consts(S: int, KU: int) -> tuple:
+    """Constants of `compact_union` (the `compact_consts` set at union width `KU`)."""
+    li = jax.lax.broadcasted_iota(I32, (128, 128), 0)
+    lj = jax.lax.broadcasted_iota(I32, (128, 128), 1)
+    si = jax.lax.broadcasted_iota(I32, (S, S), 0)
+    sj = jax.lax.broadcasted_iota(I32, (S, S), 1)
+    return (
+        (li <= lj).astype(BF16),
+        (si < sj).astype(BF16),
+        jax.lax.broadcasted_iota(I32, (KU, 1), 0),
+        jax.lax.broadcasted_iota(I32, (1, S), 1),
+        jax.lax.broadcasted_iota(I32, (KU, 128), 1),
+    )
+
+
+def compact_union(code: jax.Array, KU: int, consts: tuple) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Ascending union of the groups with a nonzero row code, as lane-major `[1, KU]` ids and
+    codes (slots past the count: 0) and the count `[1, 1]`.
+
+    `code [S, 128]` int32 (lane = group id, value = row bits < 2^T). The compaction of
+    `indexer.compact_row` with every coded lane selected; each slot's code is gathered from its
+    group's sublane row by the same one-hot matmul (codes <= 15 are exact in BF16).
+    """
+    U, Us, jcol, srow, lane = consts
+    S = code.shape[0]
+    sel = code > 0
+    P = jnp.dot(sel.astype(F32).astype(BF16), U, preferred_element_type=F32)
+    c_row = jnp.transpose(jnp.broadcast_to(P[:, 127:128], (S, 128)))[0:1, :]
+    O_row = jnp.dot(c_row.astype(BF16), Us, preferred_element_type=F32)
+    E_row = O_row + c_row
+    jf = jcol.astype(F32)
+    r_j = jnp.sum((E_row <= jf).astype(I32), axis=1, keepdims=True)
+    oh = (srow == r_j).astype(F32).astype(BF16)
+    Pg = jnp.dot(oh, P.astype(BF16), preferred_element_type=F32)
+    O_rj = jnp.sum(jnp.where(srow == r_j, O_row, 0.0), axis=1, keepdims=True)
+    lane_j = jnp.sum((Pg <= jf - O_rj).astype(I32), axis=1, keepdims=True)
+    Cg = jnp.dot(oh, code.astype(F32).astype(BF16), preferred_element_type=F32)
+    code_j = jnp.sum(jnp.where(lane == lane_j, Cg, 0.0), axis=1, keepdims=True)
+    n = jnp.sum(sel.astype(I32), axis=(0, 1), keepdims=True)
+    live = jcol < n
+    ids = jnp.where(live, r_j * 128 + lane_j, 0).astype(F32)
+    codes = jnp.where(live, code_j, 0.0)
+
+    def lanes(x: jax.Array) -> jax.Array:
+        return jnp.transpose(jnp.broadcast_to(x, (KU, 128)))[0:1, :].astype(I32)
+
+    return lanes(ids), lanes(codes), n
+
+
+def attend_request(
+    *,
+    T: int,
+    nh: int,
+    pool: Any,
+    ring: Any,
+    sems: Any,
+    ids: Any,
+    codes: Any,
+    n_union: Any,
+    table: Any,
+    table_row: Any,
+    q: jax.Array,
+    gates: list[jax.Array],
+    has: list[Any],
+    off: Any,
+    scale_k: Any,
+    scale_v: Any,
+    sm_scale: float,
+    interpret: bool,
+    recent: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+) -> list[jax.Array]:
+    """Gated sparse attention of one request's `T` rows over their union: `T` `[nh, 256]` F32.
+
+    `ids` SMEM `[1, KU + 128]` request-local group ids of the union (ascending), `codes` a
+    `(KU,)`-lane VMEM ref of their row bits, `n_union` the count; `table[table_row, v >> shift]`
+    maps a group to its micro-page as `attend_row`'s `table` does. `q` `[T * nh, 256]` (row-major
+    by verify row), `gates` / `has` per row (`has`: the row has pool tokens; recent tokens add to
+    it). `recent = (k [8, 256], v [8, 256], ok [T * nh, 8], ok_any [8, 1])` in pool units.
+    Scaling follows `attend_row` without `fold`: K by `scale_k`, scores by `sm_scale`, V by
+    `scale_v`, per tile.
+    """
+    per_page = pool.shape[1] // MICRO
+    nslots = ring.shape[0]
+    ncols = ids.shape[1]
+    assert per_page & (per_page - 1) == 0, per_page
+    shift = per_page.bit_length() - 1
+    rows = T * nh
+    length = n_union * MICRO
+    ntiles = (length + TILE - 1) // TILE
+
+    def copies(t: Any, s: Any) -> list[Any]:
+        out = []
+        for j in range(GROUPS_PER_TILE):
+            v = ids[0, jnp.minimum(t * GROUPS_PER_TILE + j, ncols - 1)]
+            v = table[table_row, v >> shift] * per_page + (v & (per_page - 1))
+            out.append(
+                pltpu.make_async_copy(
+                    pool.at[v >> shift, pl.ds((v & (per_page - 1)) * MICRO, MICRO)],
+                    ring.at[s, pl.ds(j * MICRO, MICRO)],
+                    sems.at[s],
+                )
+            )
+        return out
+
+    def start(t: Any, s: Any) -> None:
+        for cp in copies(t, s):
+            cp.start()
+
+    def wait(t: Any, s: Any) -> None:
+        if interpret:
+            for cp in copies(t, s):
+                cp.wait()
+        else:
+            pltpu.make_async_copy(ring.at[s], ring.at[s], sems.at[s]).wait()
+
+    for k in range(nslots - 1):
+
+        @pl.when(k < ntiles)
+        def _(k=k):
+            start(k, k)
+
+    # Row bit of each stacked query row, and the one-hot expansion of a tile's 64 group codes
+    # to its 256 token lanes (token i belongs to group slot i // 4).
+    rbit = jnp.left_shift(1, jax.lax.broadcasted_iota(I32, (rows, 1), 0) // nh)
+    gi = jax.lax.broadcasted_iota(I32, (GROUPS_PER_TILE, TILE), 0)
+    ti = jax.lax.broadcasted_iota(I32, (GROUPS_PER_TILE, TILE), 1)
+    expand = (ti // MICRO == gi).astype(F32).astype(BF16)
+    qf = q.astype(F32)
+
+    def tile(t: Any, carry: Any) -> Any:
+        m, l, acc = carry
+        s = jax.lax.rem(t, nslots)
+        wait(t, s)
+        ahead = t + nslots - 1
+
+        @pl.when(ahead < ntiles)
+        def _():
+            start(ahead, jax.lax.rem(ahead, nslots))
+
+        # This tile's 64 codes: the aligned 128-lane window holding them, then its half.
+        win = codes[:, pl.ds(pl.multiple_of((t // 2) * 128, 128), 128)]
+        half = jnp.where(jax.lax.rem(t, 2) == 0, win[:, :GROUPS_PER_TILE], win[:, GROUPS_PER_TILE:])
+        tok_code = jnp.dot(half.astype(F32).astype(BF16), expand, preferred_element_type=F32)
+        tok = t * TILE + jax.lax.broadcasted_iota(I32, (1, TILE), 1)
+        valid = (tok < length) & ((tok_code.astype(I32) & rbit) != 0)  # [rows, TILE]
+        k8, v8 = _unpack_kv(ring.at[s], off, interpret)
+        key = k8.astype(F32) * scale_k
+        tok_col = t * TILE + jax.lax.broadcasted_iota(I32, (TILE, 1), 0)
+        value = jnp.where(tok_col < length, v8.astype(F32) * scale_v, 0.0)
+        score = jax.lax.dot_general(qf, key, (((1,), (1,)), ((), ())), preferred_element_type=F32)
+        score = jnp.where(valid, score * sm_scale, -jnp.inf)
+        m_new = jnp.maximum(m, jnp.max(score, axis=-1, keepdims=True))
+        safe = jnp.where(m_new == -jnp.inf, 0.0, m_new)  # a row with no token in this tile
+        p = jnp.where(valid, jnp.exp(score - safe), 0.0)
+        alpha = jnp.where(m == -jnp.inf, jnp.where(m_new == -jnp.inf, 1.0, 0.0), jnp.exp(m - safe))
+        l_new = l * alpha + jnp.sum(p, axis=-1, keepdims=True)
+        acc_new = acc * alpha + jnp.dot(p, value, preferred_element_type=F32)
+        return m_new, l_new, acc_new
+
+    dim = q.shape[-1]
+    init = (
+        jnp.full((rows, 1), -jnp.inf, F32),
+        jnp.zeros((rows, 1), F32),
+        jnp.zeros((rows, dim), F32),
+    )
+    m, l, acc = jax.lax.fori_loop(0, ntiles, tile, init)
+    rk, rv, ok, ok_any = recent
+    sc = jax.lax.dot_general(qf, rk * scale_k, (((1,), (1,)), ((), ())), preferred_element_type=F32)
+    sc = jnp.where(ok, sc * sm_scale, -jnp.inf)
+    m_new = jnp.maximum(m, jnp.max(sc, axis=-1, keepdims=True))
+    safe = jnp.where(m_new == -jnp.inf, 0.0, m_new)
+    p = jnp.where(ok, jnp.exp(sc - safe), 0.0)
+    alpha = jnp.where(m == -jnp.inf, 0.0, jnp.exp(m - safe))
+    l = l * alpha + jnp.sum(p, axis=-1, keepdims=True)
+    acc = acc * alpha + jnp.dot(p, jnp.where(ok_any, rv * scale_v, 0.0), preferred_element_type=F32)
+    attn = acc / jnp.where(l > 0, l, 1.0)
+    out = []
+    for t in range(T):
+        a = attn[t * nh : (t + 1) * nh]
+        g = gates[t]
+        gated = (
+            a.astype(BF16).astype(F32) * jax.nn.sigmoid(g.astype(F32)).astype(BF16).astype(F32)
+        ).astype(BF16).astype(F32)
+        row_has = has[t] | (jnp.max(jnp.where(ok[t * nh : t * nh + 1], 1, 0)) > 0)
+        out.append(jnp.where(row_has, gated, 0.0))
+    return out
