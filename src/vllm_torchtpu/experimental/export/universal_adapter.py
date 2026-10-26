@@ -37,8 +37,6 @@ from vllm_torchtpu.experimental.export import (
 from vllm_torchtpu.experimental.export.trace import trace
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
-
-
 # The vLLM TPU runner's smallest request padding (`tpu_runner.MIN_NUM_SEQS`).
 _MIN_REQ_BUCKET = 8
 
@@ -46,9 +44,10 @@ _MIN_REQ_BUCKET = 8
 def default_req_buckets(max_num_seqs: int) -> tuple[int, ...]:
     """Request buckets as the vLLM TPU runner pads `num_reqs` (`_get_req_paddings`).
 
-    Powers of two from 8 up to, and always ending with, `max_num_seqs`, so a batch is padded
-    to at most twice its size. A fixed list with a jump to `max_num_seqs` (8, 16, 32, 64, 512)
-    would run the LM head and the sampler on 512 rows for any batch above 64.
+    Powers of two from 8 up to, and always ending with, `max_num_seqs`, so a batch is
+    padded to at most twice its size. A fixed list with a jump to `max_num_seqs`
+    (8, 16, 32, 64, 512) would run the LM head and the sampler on 512 rows for any
+    batch above 64.
     """
     buckets = []
     size = _MIN_REQ_BUCKET
@@ -57,6 +56,7 @@ def default_req_buckets(max_num_seqs: int) -> tuple[int, ...]:
         size *= 2
     buckets.append(max_num_seqs)
     return tuple(buckets)
+
 
 def make_attention_metadata(
     *,
