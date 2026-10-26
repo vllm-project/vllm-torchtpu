@@ -878,6 +878,25 @@ def token_shard_step(starts, context, shard_index, rows):
     return base, sub_starts, (context + before).astype(context.dtype)
 
 
+def compressed_kernel_pages(pages: jax.Array, pool: jax.Array, slot: int = 0, ratio: int = 4) -> jax.Array:
+    """Flat kernel-page ids of compressed block-table columns `pages`.
+
+    Each column (a pool block of `pool.shape[1]` tokens) holds `pool.shape[1] // 128` kernel
+    pages of `128 // ratio` compressed keys for this layer, at `slot` times that within the
+    block's physical pages: column `c` -> `c * physical_pages + slot * logical_pages + j`. The
+    one addressing of compressed keys, shared by the stock selection and the whole-step
+    megakernel's page tables.
+    """
+    rows = 128 // ratio
+    physical_pages = math.prod(pool.shape[1:]) * pool.dtype.itemsize // (rows * pool.shape[-1] * 2)
+    logical_pages = pool.shape[1] // 128
+    scaled = pages[..., None] * physical_pages
+    first = jnp.arange(logical_pages)
+    if slot:
+        first = first + slot * logical_pages
+    return (scaled + first).reshape(-1)
+
+
 def select_blocks(
     query,
     pool,
@@ -918,11 +937,7 @@ def select_blocks(
     )
 
     def expand_pages(pages):
-        scaled = pages[..., None] * physical_pages
-        first = jnp.arange(logical_pages)
-        if slot:
-            first = first + slot * logical_pages
-        return (scaled + first).reshape(-1)
+        return compressed_kernel_pages(pages, pool, slot, ratio)
 
     def topk(q, weights, cache, seq_lens, pages, cu, distribution, **kw):
         """``pages``: [seqs, kernel pages per seq]."""

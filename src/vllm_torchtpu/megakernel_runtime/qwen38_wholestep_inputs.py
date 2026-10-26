@@ -33,6 +33,7 @@ from typing import Any
 
 import jax.numpy as jnp
 
+from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import compressed_kernel_pages
 from vllm_torchtpu.kernels.qwen4_exp.qsa_state import read_ring_and_tags
 
 RING_ROWS = 8  # newest positions kept per request (lane = position % 8), >= ratio
@@ -87,14 +88,11 @@ def qsa_step_inputs(
     # Rows: lengths seen by verify row t of request q = context + t + 1 (0 for idle requests).
     t = jnp.arange(T, dtype=jnp.int32)
     lens = jnp.where(live[:, None], ctx[:, None] + t[None] + 1, 0).reshape(M)
-    cpp = carrier_pages_per_block(pool)
     n_ck = max_groups // (128 // GROUP)
     # Carrier (kernel) pages per block-table column: a pool block of `pool.shape[1]` tokens
-    # holds `pool.shape[1] // 128` pages of 32 groups for this layer, at `slot * that` within
-    # the block's `cpp` physical pages (`pooled_qsa.select_blocks`' expand_pages). Served pools
-    # have 512-token blocks: 4 pages per column.
+    # holds `pool.shape[1] // 128` pages of 32 groups for this layer (served 512-token blocks:
+    # 4). Addressed by `pooled_qsa.compressed_kernel_pages`, the stock selection's own mapping.
     lp = pool.shape[1] // 128
-    page = jnp.arange(n_ck, dtype=jnp.int32)
     mtab, cktab, rings = [], [], []
     for (ring_ids, main, comp), (_, cslot) in zip(tables, slots, strict=True):
         main = _fit(main.reshape(n_req, -1).astype(jnp.int32), nreq)
@@ -107,7 +105,8 @@ def qsa_step_inputs(
         mtab.append(jnp.pad(main, ((0, 0), (0, max(0, pages_per_seq - main.shape[1]))))[:, :pages_per_seq])
         cols = -(-n_ck // lp)
         comp = jnp.pad(comp, ((0, 0), (0, max(0, cols - comp.shape[1]))))[:, :cols]
-        cktab.append(comp[:, page // lp] * cpp + cslot * lp + page % lp)
+        pages = compressed_kernel_pages(comp, pool, cslot, GROUP).reshape(nreq, cols * lp)
+        cktab.append(pages[:, :n_ck].astype(jnp.int32))
         ring, _ = read_ring_and_tags(pool, ids, RING_ROWS * IDX_DIM, RING_ROWS * 2)
         ring = ring.reshape(nreq, RING_ROWS, IDX_DIM)
         rings.append(jnp.where((ctx > 0)[:, None, None], ring, 0).astype(jnp.bfloat16))

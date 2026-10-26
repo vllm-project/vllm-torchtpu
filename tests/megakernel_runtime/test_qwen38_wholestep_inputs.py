@@ -67,3 +67,52 @@ def test_compressed_pages_match_stock_expand(block_tokens, slot, monkeypatch):
     if block_tokens == 512:  # positive control: one page per column (the old mapping) differs
         old = comp[:, :n_ck] * carrier_pages_per_block(pool) + slot
         assert not np.array_equal(old, want[:, : old.shape[1]])
+
+
+def test_long_request_tables_match_stock_selection_addressing(monkeypatch):
+    """End to end for a served-shaped long request: a 100K-token context (25,000 groups over
+    196 compressed blocks of 512 tokens, cap 131072 = 1024 kernel pages), packed slot 1, and a
+    second short request. Every visible group's kernel page in the whole-step table is the one
+    the stock selection reads (its expand_pages of the same block table)."""
+    from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import compressed_kernel_pages
+
+    monkeypatch.setattr(
+        wsi, "read_ring_and_tags",
+        lambda pool, ids, n, m: (jnp.zeros((len(ids), n), jnp.bfloat16), None),
+    )
+    pool = jnp.zeros((4096, 512, 1, 4, 256), jnp.float8_e4m3fn)
+    nreq, T, max_groups, slot = 2, 4, 32768, 1
+    ctx = np.array([100_000, 3_000], np.int32)
+    blocks = -(-ctx // 512)
+    rng = np.random.default_rng(1)
+    width = 260  # the runner's table is wider than the cap needs (256 columns)
+    comp = np.zeros((nreq, width), np.int32)
+    for q in range(nreq):
+        comp[q, : blocks[q]] = rng.choice(np.arange(1, 4096), size=blocks[q], replace=False)
+    tables = [(jnp.ones((nreq, 1), jnp.int32), jnp.ones((nreq, 1024), jnp.int32), jnp.asarray(comp))]
+    out = qsa_step_inputs(
+        pool, tables, [(0, slot)], jnp.zeros((200_000, 128), jnp.float32),
+        jnp.arange(nreq * T, dtype=jnp.int32), jnp.arange(0, nreq * T + 1, T, dtype=jnp.int32),
+        jnp.asarray(ctx), M=nreq * T, T=T, pages_per_seq=1024, max_groups=max_groups,
+        layer_major_tables=True,
+    )
+    cktab = np.asarray(out["qsa_cktab"])[0]  # layer 0: [requests, kernel pages]
+    for q in range(nreq):
+        stock = np.asarray(compressed_kernel_pages(jnp.asarray(comp[q]), pool, slot))
+        n_pages = -(-(ctx[q] // 4) // 32)
+        np.testing.assert_array_equal(cktab[q, :n_pages], stock[:n_pages])
+
+
+def test_shared_addressing_is_the_former_inline_stock_formula():
+    """compressed_kernel_pages is byte-for-byte select_blocks' former inline expand_pages."""
+    from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import compressed_kernel_pages
+
+    for shape in ((16, 512, 1, 4, 256), (16, 128, 1, 4, 256)):
+        pool = jnp.zeros(shape, jnp.float8_e4m3fn)
+        physical = carrier_pages_per_block(pool)
+        logical = shape[1] // 128
+        pages = jnp.asarray([[3, 7, 0], [1, 2, 5]], jnp.int32)
+        for slot in (0, 1):
+            first = jnp.arange(logical) + (slot * logical if slot else 0)
+            want = (pages[..., None] * physical + first).reshape(-1)
+            np.testing.assert_array_equal(compressed_kernel_pages(pages, pool, slot), want)
