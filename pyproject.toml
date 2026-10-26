@@ -271,6 +271,7 @@ python-version = "3.12"
 # them makes an unresolved import degrade to `Any` instead of erroring.
 ignore-missing-imports = [
     "compressed_tensors", "compressed_tensors.*",
+    "diffusers", "diffusers.*",
     "einops", "einops.*",
     "fastapi", "fastapi.*",
     "google.protobuf", "google.protobuf.*",
