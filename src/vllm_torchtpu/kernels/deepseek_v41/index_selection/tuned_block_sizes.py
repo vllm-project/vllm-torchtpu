@@ -45,6 +45,8 @@ class PersistentScoreConfig:
 
 
 PERSISTENT_SCORE_CONFIGS: dict[tuple[int, ...], PersistentScoreConfig] = {
+    (6, 32, 128, 65536, 1): PersistentScoreConfig(99328, 1024, 32),
+    (6, 32, 128, 131072, 1): PersistentScoreConfig(99328, 1024, 32),
     (6, 32, 128, 65536, 2): PersistentScoreConfig(99328, 1024, 32),
     (6, 32, 128, 131072, 2): PersistentScoreConfig(99328, 1024, 32),
 }
@@ -70,6 +72,8 @@ class DecodeTuningKey:
 # Calibrated at R48 on TPU7x, JAX 0.10.2 / libtpu 0.0.47; DSpark K5.
 # Seeds 517/519, effective lengths 49408/98816; all other options default.
 DECODE_REQUEST_TILES: dict[DecodeTuningKey, int] = {
+    DecodeTuningKey("TPU7x", 6, 32, 65536, 128, 512, 1): 12,
+    DecodeTuningKey("TPU7x", 6, 32, 131072, 128, 512, 1): 16,
     DecodeTuningKey("TPU7x", 6, 32, 65536, 128, 512, 2): 12,
     DecodeTuningKey("TPU7x", 6, 32, 131072, 128, 512, 2): 16,
 }

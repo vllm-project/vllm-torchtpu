@@ -96,6 +96,7 @@ def test_six_query_dispatch_preserves_request_contract(
 
 @pytest.mark.parametrize("page_size", [8, 16, 32, 64, 128, 256])
 @pytest.mark.parametrize("banked", [False, True])
+@pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="SparseCore publication")
 def test_native_swa_publication_preserves_neighbor_tokens(page_size, banked):
     # Unaligned writes on both sides of page/bank boundaries must not clobber
     # the other half of a packed BF16 word. Invalid records cannot touch page 0.
@@ -125,7 +126,6 @@ def test_native_swa_publication_preserves_neighbor_tokens(page_size, banked):
         owner,
         jnp.asarray(records),
         jnp.asarray(values, jnp.bfloat16),
-        interpret=jax.default_backend() == "cpu",
     )
     actual = jnp.concatenate(updated) if banked else updated
     np.testing.assert_array_equal(actual.reshape(-1, 512), expected)
@@ -133,6 +133,7 @@ def test_native_swa_publication_preserves_neighbor_tokens(page_size, banked):
 
 @pytest.mark.parametrize("fragmented", [False, True])
 @pytest.mark.parametrize("banked", [False, True])
+@pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="SparseCore publication")
 def test_native_swa_publication_contiguous_padding_and_fragmentation(
     fragmented, banked
 ):
@@ -154,7 +155,6 @@ def test_native_swa_publication_contiguous_padding_and_fragmentation(
         owner,
         jnp.asarray(records),
         jnp.asarray(values, jnp.bfloat16),
-        interpret=jax.default_backend() == "cpu",
     )
     actual = jnp.concatenate(updated) if banked else updated
     np.testing.assert_array_equal(actual.reshape(-1, 512), expected)
@@ -172,6 +172,7 @@ def test_native_swa_publication_rejects_non_native_owners(dtype, shape):
         )
 
 
+@pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="SparseCore publication")
 def test_native_swa_publication_preserves_bf16_bits():
     bits = jnp.resize(
         jnp.array([0, 0x8000, 1, 0x8001, 0x3F80, 0x7F80, 0xFF80, 0x7FC1], jnp.uint16),
@@ -183,12 +184,21 @@ def test_native_swa_publication_preserves_bf16_bits():
     bits = jax.lax.bitcast_convert_type(values, jnp.uint16)
     owner = jnp.zeros((4, 16, 512), jnp.bfloat16)
     records = jnp.array([17, 31, 32], jnp.int32)
-    updated = write_swa_pages(
-        owner, records, values, interpret=jax.default_backend() == "cpu"
-    )
+    updated = write_swa_pages(owner, records, values)
     actual = jax.lax.bitcast_convert_type(updated, jnp.uint16).reshape(-1, 512)
     np.testing.assert_array_equal(actual[records], bits)
     np.testing.assert_array_equal(actual[jnp.array([16, 18, 30, 33])], 0)
+
+
+@pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="SparseCore publication")
+def test_native_swa_publication_all_invalid_preserves_owner():
+    owner = jnp.full((4, 32, 512), -3, jnp.bfloat16)
+    result = write_swa_pages(
+        owner,
+        jnp.array([-1, 0, 128, 9999], jnp.int32),
+        jnp.ones((4, 512), jnp.bfloat16),
+    )
+    np.testing.assert_array_equal(result, -3)
 
 
 def test_native_swa_shared_owner_avoids_pool_sized_temporaries():

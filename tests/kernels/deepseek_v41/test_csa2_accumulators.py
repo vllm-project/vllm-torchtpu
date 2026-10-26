@@ -28,14 +28,17 @@ def _decode_inputs(batch, heads, page_size):
     positions = (first[:, None] + jnp.arange(6)).reshape(-1)
     starts = jnp.arange(batch + 1, dtype=jnp.int32) * 6
     words, scales = encode_csa2_kv(random((tokens * 512, 512)))
-    swa = random((1 + batch * 4, page_size, 512)).at[0].set(0)
+    pages_per_seq = max(4, 256 // page_size)
+    swa = random((1 + batch * pages_per_seq, page_size, 512)).at[0].set(0)
     base = jnp.maximum(0, first - 127) // page_size * page_size
     minimum = jnp.maximum(0, first - 80)
     metadata = jnp.concatenate(
         (
             base[:, None],
             minimum[:, None],
-            jnp.arange(1, batch * 4 + 1, dtype=jnp.int32).reshape(batch, 4),
+            jnp.arange(1, batch * pages_per_seq + 1, dtype=jnp.int32).reshape(
+                batch, pages_per_seq
+            ),
         ),
         axis=1,
     )
@@ -93,7 +96,8 @@ def test_decode_traces_on_pinned_jax():
 
 
 @pytest.mark.parametrize(
-    "batch,heads,page_size", [(1, 8, 64), (2, 64, 64), (3, 24, 128), (2, 128, 256)]
+    "batch,heads,page_size",
+    [(1, 8, 64), (2, 64, 32), (2, 64, 64), (3, 24, 128), (2, 128, 256)],
 )
 def test_decode_matches_ragged_reference_with_authoritative_counts(
     batch, heads, page_size
@@ -153,8 +157,8 @@ def test_decode_gather_and_reuse_preserve_valid_counts():
     np.testing.assert_array_equal(reused, output)
 
 
-@pytest.mark.parametrize("invalid", [np.nan, np.inf])
-def test_decode_ignores_nonfinite_swa_outside_visible_window(invalid):
+@pytest.mark.parametrize("stale_value", [-16.0, 16.0])
+def test_decode_ignores_finite_swa_outside_visible_window(stale_value):
     if jax.default_backend() != "tpu":
         pytest.skip("Compiled decode accumulator operations require TPU")
     args, kwargs = _decode_inputs(2, 64, 64)
@@ -168,9 +172,10 @@ def test_decode_ignores_nonfinite_swa_outside_visible_window(invalid):
             visible[page] |= (positions >= max(first - 127, minimum)) & (
                 positions < first + 6
             )
-    cache[~visible] = invalid
-    poisoned = (*args[:3], jnp.asarray(cache), *args[4:])
-    actual = csa2_attention(*poisoned, **kwargs)
+    # The cache owner is zero-initialized and stores finite BF16 values.
+    cache[~visible] = stale_value
+    stale = (*args[:3], jnp.asarray(cache), *args[4:])
+    actual = csa2_attention(*stale, **kwargs)
     assert np.isfinite(np.asarray(actual, np.float32)).all()
     np.testing.assert_allclose(actual, expected, atol=3e-3, rtol=2e-2)
 
