@@ -169,6 +169,7 @@ WHOLE_MAX_ROWS = 64
 # Model steps after warmup (verify steps; any step once disabled) by which a `whole=1`
 # server must have made a whole-step call.
 WHOLE_SELF_CHECK_STEPS = 200
+STEP_MIX_EVERY = 5000  # steps between periodic step-mix log lines
 
 _UNSET = object()
 
@@ -1340,7 +1341,9 @@ class Qwen38SegmentDriver:
     def _note(self, key: str) -> None:
         self.stats[key] = self.stats.get(key, 0) + 1
         n = sum(self.stats.values())
-        if n & (n - 1) == 0 and n >= 64:
+        # Powers of two early, then every STEP_MIX_EVERY steps, so the mix can be joined in
+        # time to the serving metrics (AL windows) over a whole run.
+        if (n & (n - 1) == 0 and n >= 64) or n % STEP_MIX_EVERY == 0:
             logger.info("qwen38 megakernel step mix: %s", dict(sorted(self.stats.items())))
 
     def try_forward(
