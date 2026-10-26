@@ -432,17 +432,20 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
         # Unit lower-triangular, as the chunked solve produces.
         strict = jnp.tril(jax.random.normal(rng, (3, 128, 128)) * 0.1, k=-1)
         t = strict + jnp.eye(128)[None]
-        reference = jnp.linalg.inv(t)
-        for block_size in (16, 8, 4, 2):
-            with self.subTest(block_size=block_size):
-                inv = compute_gdn.invert_triangular_matrix(t, block_size=block_size)
-                np.testing.assert_allclose(inv, reference, rtol=1e-4, atol=1e-4)
-                np.testing.assert_allclose(
-                    jnp.einsum("bij,bjk->bik", t, inv),
-                    jnp.broadcast_to(jnp.eye(128), t.shape),
-                    rtol=1e-4,
-                    atol=1e-4,
-                )
+        # The off-diagonal blocks are f32 dots; TPU's default matmul precision
+        # rounds their inputs to bf16, which is below this test's resolution.
+        with jax.default_matmul_precision("highest"):
+            reference = jnp.linalg.inv(t)
+            for block_size in (16, 8, 4, 2):
+                with self.subTest(block_size=block_size):
+                    inv = compute_gdn.invert_triangular_matrix(t, block_size=block_size)
+                    np.testing.assert_allclose(inv, reference, rtol=1e-4, atol=1e-4)
+                    np.testing.assert_allclose(
+                        jnp.einsum("bij,bjk->bik", t, inv),
+                        jnp.broadcast_to(jnp.eye(128), t.shape),
+                        rtol=1e-4,
+                        atol=1e-4,
+                    )
 
     def test_tile_sizes_with_split_state_slots_at_w1(self):
         """W=1 decode tiles count 1 input and 1 output state slot per sequence."""
