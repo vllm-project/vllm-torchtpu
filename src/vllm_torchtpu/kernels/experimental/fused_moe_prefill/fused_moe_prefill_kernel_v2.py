@@ -1764,7 +1764,7 @@ def fused_moe_prefill_stage_a(*args, **kwargs):
     return fused_moe_prefill(
         *args,
         **kwargs,
-        **STAGE_A,
+        **dict(STAGE_A, tile_min=envs.TPU_MOE_PREFILL_TILE_MIN or STAGE_A["tile_min"]),
         sum_in_kernel_max_tokens=envs.TPU_MOE_PREFILL_SUM_IN_KERNEL_MAX_TOKENS,
         sum_overlap_adds=envs.TPU_MOE_PREFILL_SUM_IN_KERNEL_OVERLAP_ADDS,
     )

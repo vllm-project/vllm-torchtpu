@@ -116,6 +116,7 @@ if TYPE_CHECKING:
     FUSED_MOE_PREFILL_KERNEL_V2: bool = False
     TPU_MOE_PREFILL_SUM_IN_KERNEL_MAX_TOKENS: int = 0
     TPU_MOE_PREFILL_SUM_IN_KERNEL_OVERLAP_ADDS: bool = False
+    TPU_MOE_PREFILL_TILE_MIN: int = 0
     TPU_MOE_SINGLE_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_MOE_TP_DECODE_FAST: bool = True
@@ -1216,6 +1217,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_PREFILL_SUM_IN_KERNEL_OVERLAP_ADDS": env_bool(
         "TPU_MOE_PREFILL_SUM_IN_KERNEL_OVERLAP_ADDS"
     ),
+    # With FUSED_MOE_PREFILL_KERNEL_V2: the token count from which the stage-A
+    # build runs 256-row tiles; 0 keeps its own 4096. With 8192 the 4,096-token
+    # bucket runs the 128-row build of the smaller buckets, whose code fits one
+    # instruction overlay; the 256-row build spans three and, with HBM nearly
+    # full on the 78-layer model, runs 131 us longer per call. Same output;
+    # only the tiling changes.
+    "TPU_MOE_PREFILL_TILE_MIN": env_nonnegative_int("TPU_MOE_PREFILL_TILE_MIN", 0),
     # Build the MoE permutation, its inverse, and the sorted token ids from
     # one packed sort instead of three. The ragged (counting sort) path ignores it.
     "TPU_MOE_SINGLE_SORT": env_bool("TPU_MOE_SINGLE_SORT", True),
