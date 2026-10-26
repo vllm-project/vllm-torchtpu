@@ -312,6 +312,9 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
                 ("tp8_padded_n512_b64", 2, 8, 64, 512, 1, bf16, (8, 64)),
                 # PCP8 + TP1 disagg prefill (n_kq=2, n_v=8, W=1)
                 ("pcp8_prefill_b4096", 2, 8, 4096, 16, 1, f32, (4, 128)),
+                # Qwen3.5/3.6-27B + TP2 (n_kq=8, n_v=24): 3 head groups
+                ("qwen27b_tp2_c32_b32", 8, 24, 32, 32, 1, f32, None),
+                ("qwen27b_tp2_c32_b2048", 8, 24, 2048, 32, 1, f32, None),
                 # DP4 + TP2 + EP8 (n_kq=8, n_v=32, W=1 and W=4)
                 ("dp4tp2_c64_b8", 8, 32, 8, 32, 1, f32, (2, 8)),
                 ("dp4tp2_c64_b32", 8, 32, 32, 32, 1, f32, (4, 32)),
@@ -348,7 +351,98 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
                         mixed_vmem_limit_bytes=mixed_limit,
                         window_size=w,
                     )
-                    self.assertEqual(got, expected, msg=label)
+                    if expected is None:
+                        # Only the shape contract: tiles exist and the chunk
+                        # is a multiple of the triangular block.
+                        decode_tile, mixed_tile = got
+                        self.assertGreaterEqual(decode_tile, 1, msg=label)
+                        self.assertIn(mixed_tile, tiling.MIXED_TILE_SIZES, label)
+                        cfg = self._gdn_config(n_v, mixed_tile)
+                        b = min(cfg.triangular_block_size, mixed_tile)
+                        self.assertEqual(mixed_tile % b, 0, msg=label)
+                    else:
+                        self.assertEqual(got, expected, msg=label)
+
+    def _gdn_config(self, n_v, chunk_size, attention_mode=config.AttentionMode.GDN):
+        n_kq = max(1, n_v // 4)
+        return config.GDNConfig(
+            mode=config.GDNMode.PER_SEQ,
+            dtypes=config.Dtypes(
+                act_in=jnp.dtype(jnp.bfloat16),
+                act_out=jnp.dtype(jnp.bfloat16),
+                compute=jnp.dtype(jnp.float32),
+                recurrent_state=jnp.dtype(jnp.float32),
+                conv_state=jnp.dtype(jnp.bfloat16),
+            ),
+            batch_size=chunk_size,
+            dim_size=2 * n_kq * 128 + n_v * 128,
+            kernel_size=4,
+            tile_size=chunk_size,
+            num_kq_heads=n_kq,
+            num_v_heads=n_v,
+            kq_head_dim=128,
+            v_head_dim=128,
+            attention_mode=attention_mode,
+        )
+
+    def test_triangular_block_size_divides_every_chunk(self):
+        """B is a power of two dividing every mixed tile size, for any head count.
+
+        Regression for Qwen3.5/3.6-27B at TP=2 (24 local value heads): the
+        exact quotient 16 // 3 = 5 does not divide 128, truncating the
+        intra-chunk inverse to 125 rows and failing startup with
+        "array split does not result in an equal division: rest is 1".
+        """
+        expected_gdn = {8: 16, 16: 8, 24: 4, 32: 4, 40: 2, 48: 2, 64: 2}
+        for n_v in (1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64, 96, 128):
+            for attention_mode in config.AttentionMode:
+                for chunk_size in tiling.MIXED_TILE_SIZES:
+                    with self.subTest(
+                        n_v=n_v, mode=attention_mode, chunk_size=chunk_size
+                    ):
+                        cfg = self._gdn_config(n_v, chunk_size, attention_mode)
+                        b = cfg.triangular_block_size
+                        self.assertGreaterEqual(b, 2)
+                        self.assertEqual(b & (b - 1), 0, f"B={b} not a power of 2")
+                        effective = min(b, cfg.chunk_size)
+                        self.assertEqual(cfg.chunk_size % effective, 0)
+            if n_v in expected_gdn:
+                cfg = self._gdn_config(n_v, 128)
+                self.assertEqual(cfg.triangular_block_size, expected_gdn[n_v], n_v)
+
+    def test_invert_triangular_matrix_rejects_non_dividing_block(self):
+        """Negative control: a block size that does not divide the chunk
+        fails at the solve instead of returning a truncated inverse."""
+        from vllm_torchtpu.kernels.gdn.v3 import compute_gdn
+
+        t = jnp.tril(jnp.ones((2, 128, 128), dtype=jnp.float32))
+        with self.assertRaisesRegex(AssertionError, "divisible"):
+            compute_gdn.invert_triangular_matrix(t, block_size=5)
+        # Divisors still work and the inverse keeps the full chunk.
+        for block_size in (16, 8, 4, 2):
+            inv = compute_gdn.invert_triangular_matrix(t, block_size=block_size)
+            self.assertEqual(inv.shape, t.shape)
+
+    def test_invert_triangular_matrix_block_sizes_agree(self):
+        """Every power-of-two block size inverts the same matrix identically,
+        so moving 24 heads from B=5 to B=4 only changes the schedule."""
+        from vllm_torchtpu.kernels.gdn.v3 import compute_gdn
+
+        rng = jax.random.key(7)
+        # Unit lower-triangular, as the chunked solve produces.
+        strict = jnp.tril(jax.random.normal(rng, (3, 128, 128)) * 0.1, k=-1)
+        t = strict + jnp.eye(128)[None]
+        reference = jnp.linalg.inv(t)
+        for block_size in (16, 8, 4, 2):
+            with self.subTest(block_size=block_size):
+                inv = compute_gdn.invert_triangular_matrix(t, block_size=block_size)
+                np.testing.assert_allclose(inv, reference, rtol=1e-4, atol=1e-4)
+                np.testing.assert_allclose(
+                    jnp.einsum("bij,bjk->bik", t, inv),
+                    jnp.broadcast_to(jnp.eye(128), t.shape),
+                    rtol=1e-4,
+                    atol=1e-4,
+                )
 
     def test_tile_sizes_with_split_state_slots_at_w1(self):
         """W=1 decode tiles count 1 input and 1 output state slot per sequence."""
@@ -1311,7 +1405,8 @@ class GDNAttentionTest(parameterized.TestCase):
         distribution = jnp.array([32, num_reqs, num_reqs], dtype=jnp.int32)
         seq_lens = jnp.array([64] * 32 + [128, 224], dtype=jnp.int32)
 
-        for n_kq, n_v in [(2, 8), (8, 32), (16, 64)]:
+        # (8, 24) is Qwen3.5/3.6-27B at TP=2: 3 head groups, B must divide C.
+        for n_kq, n_v in [(2, 8), (8, 24), (8, 32), (16, 64)]:
             rngs = iter(jax.random.split(jax.random.key(99), 16))
             conv_dim = 2 * n_kq * d_k + n_v * d_v
             qkv = jax.random.normal(
@@ -1779,6 +1874,7 @@ class GDNAttentionTest(parameterized.TestCase):
 
         for n_kq, n_v, num_seqs, num_spec_tokens, prefill_len, num_decodes in [
             (2, 8, 16, 3, 16, 0),  # TP8 DCP=4 c=16 MTP=3: 16-tok prefill in B=16
+            (8, 24, 16, 0, 12, 4),  # 27B TP2: 24 heads -> B=4 (was 5, truncated C)
             (8, 32, 16, 0, 12, 4),  # DP4TP2: 4 decodes + 12-tok prefill in B=16
             (16, 64, 16, 0, 12, 4),  # DP8: 4 decodes + 12-tok prefill in B=16
         ]:
