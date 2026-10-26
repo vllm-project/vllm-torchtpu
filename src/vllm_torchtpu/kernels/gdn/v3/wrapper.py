@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -728,6 +729,10 @@ def fused_conv1d_gdn(
     if batched_only and prefill_only:
         raise ValueError("batched_only and prefill_only are mutually exclusive")
 
+    skip_empty_per_seq = (
+        os.environ.get("TPU_K3_GDN_SKIP_EMPTY_PER_SEQ", "0").strip() == "1"
+    )
+
     if pooled:
         out_act, out_source = None, state_source
         if not prefill_only:
@@ -735,11 +740,7 @@ def fused_conv1d_gdn(
                 state_source, None, None, config.GDNMode.BATCHED
             )
         if not batched_only:
-            if out_act is None:
-                out_act, out_source, _ = call_kernel(
-                    out_source, None, None, config.GDNMode.PER_SEQ
-                )
-            else:
+            if out_act is not None and skip_empty_per_seq:
                 has_prefill = distribution[-1] > distribution[0]
                 out_act, out_source = jax.lax.cond(
                     has_prefill,
@@ -747,6 +748,10 @@ def fused_conv1d_gdn(
                     lambda s, a: (a, s),
                     out_source,
                     out_act,
+                )
+            else:
+                out_act, out_source, _ = call_kernel(
+                    out_source, None, out_act, config.GDNMode.PER_SEQ
                 )
         out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
         return out_source, out_act
@@ -759,11 +764,7 @@ def fused_conv1d_gdn(
             conv_state, recurrent_state, None, config.GDNMode.BATCHED
         )
     if not batched_only:
-        if out_act is None:
-            out_act, out_conv_state, out_recurrent_state = call_kernel(
-                out_conv_state, out_recurrent_state, None, config.GDNMode.PER_SEQ
-            )
-        else:
+        if out_act is not None and skip_empty_per_seq:
             has_prefill = distribution[-1] > distribution[0]
             out_act, out_conv_state, out_recurrent_state = jax.lax.cond(
                 has_prefill,
@@ -772,6 +773,10 @@ def fused_conv1d_gdn(
                 out_conv_state,
                 out_recurrent_state,
                 out_act,
+            )
+        else:
+            out_act, out_conv_state, out_recurrent_state = call_kernel(
+                out_conv_state, out_recurrent_state, out_act, config.GDNMode.PER_SEQ
             )
 
     out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]

@@ -37,7 +37,7 @@ _VerifyWindowResult = TypeVar("_VerifyWindowResult")
 def _get_kda_prefill_kernel() -> str:
     """Read and validate the compile-time K3 prefill kernel selection."""
     kernel = (
-        os.environ.get("VLLM_TORCHTPU_K3_KDA_PREFILL_KERNEL", "hybrid")
+        os.environ.get("VLLM_TORCHTPU_K3_KDA_PREFILL_KERNEL", "gdn_v3")
         .strip()
         .lower()
     )

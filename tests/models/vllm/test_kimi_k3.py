@@ -2559,6 +2559,8 @@ def test_kda_hybrid_mega_prefill_and_decode_fast_path(
 ) -> None:
     import jax.numpy as jnp
 
+    monkeypatch.delenv("VLLM_TORCHTPU_K3_KDA_PREFILL_KERNEL", raising=False)
+    assert kimi_custom_ops._get_kda_prefill_kernel() == "gdn_v3"
     monkeypatch.setenv("VLLM_TORCHTPU_K3_KDA_PREFILL_KERNEL", "hybrid")
     assert kimi_custom_ops._get_kda_prefill_kernel() == "hybrid"
     monkeypatch.setenv("VLLM_TORCHTPU_K3_KDA_PREFILL_KERNEL", "invalid")
