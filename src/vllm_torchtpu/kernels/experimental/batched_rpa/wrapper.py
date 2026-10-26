@@ -508,6 +508,7 @@ def calculate_block_sizes(
         "cp_group_size",
         "attention_scope",
         "return_lse",
+        "mask_invalid_v",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -550,6 +551,7 @@ def ragged_paged_attention(
     cp_rank: jax.Array | None = None,
     attention_scope: configs.AttentionScope = configs.AttentionScope.FULL,
     return_lse: bool = False,
+    mask_invalid_v: bool | None = None,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -607,6 +609,10 @@ def ragged_paged_attention(
             tokens. Defaults to FULL.
         return_lse: If True, return log-sum-exp (lse) values along with the
             output. Defaults to False.
+        mask_invalid_v: If True, zero out invalid V token slices before the pv
+            matmul so NaNs in unused VMEM or shared new-KV pages cannot propagate via
+            0.0 * NaN. Defaults to None (True for SEQ_ALONG_LANE, False for
+            HEAD_ALONG_SUBLANE).
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -692,6 +698,7 @@ def ragged_paged_attention(
         attention_scope=attention_scope,
         return_lse=return_lse,
         skip_kv_update=skip_kv_update,
+        mask_invalid_v=mask_invalid_v,
     )
 
     q_hbm, new_kv_hbm = prepare_inputs(
