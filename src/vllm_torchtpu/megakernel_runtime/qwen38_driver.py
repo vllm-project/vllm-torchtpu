@@ -164,6 +164,8 @@ def _cpu_proxy(m: Any, memo: dict | None = None) -> Any:
 # `VLLM_TPU_MEGAKERNEL=...,nodonate=1`: the GDN pool is not donated to the segment op; it
 # writes a fresh pool that `_run` copies back into the live cache (bisecting a served hang).
 NO_DONATE = False
+# Largest whole-step bucket: its VMEM plan fits up to 64 rows (`wholestep_tiles`).
+WHOLE_MAX_ROWS = 64
 
 _UNSET = object()
 
@@ -714,7 +716,9 @@ class Qwen38SegmentDriver:
 
         stack = contextlib.ExitStack()
         stack.enter_context(set_model_tag(tag))
-        cfg = getattr(self, "cfg", None) or runner.vllm_config
+        cfg = (getattr(self, "whole_cfg", None) if tag == "model_mk_whole" else None) or (
+            getattr(self, "cfg", None) or runner.vllm_config
+        )
         stack.enter_context(set_vllm_model_wrapper_context(mesh=runner.mesh, vllm_config=cfg))
         stack.enter_context(set_current_vllm_config(cfg))
         if getattr(self, "noaot", False):
@@ -1138,14 +1142,26 @@ class Qwen38SegmentDriver:
             attn = next(l.self_attn for l in self.segments.layers if l.layer_type == "full_attention")
             budget = int(attn.token_topk) // int(attn.compress_ratio)
             max_groups = -(-self.whole_cap // 4 // 1024) * 1024
+            # vLLM compiles a module for every compile size on its first call: the whole-step
+            # program compiles only the buckets it can serve (w04 j-05391f11: the 96-row bucket
+            # of the segment driver ran out of VMEM, 67.9 of 63 MiB, and disabled the MK).
+            buckets = tuple(b for b in self.buckets if b <= min(WHOLE_MAX_ROWS, self.whole_max_rows))
+            if not buckets:
+                raise ValueError(f"no whole-step bucket <= {self.whole_max_rows} rows in {self.buckets}")
+            import copy
+
+            self.whole_cfg = copy.copy(self.cfg)
+            cc = copy.copy(self.cfg.compilation_config)
+            cc.compile_sizes = list(buckets)
+            object.__setattr__(self.whole_cfg, "compilation_config", cc)
             whole = Qwen38WholeStep(
-                runner.model, self.g, self.mesh, self.buckets, budget=budget, max_groups=max_groups,
+                runner.model, self.g, self.mesh, buckets, budget=budget, max_groups=max_groups,
                 hold=self.whole_hold,
             )
             whole.bind_pool(self.segments.pool, self.segments.layout)
             with self._contexts(runner, "model_mk_whole"):
                 self.whole_program = Qwen4ExpWholeStepModel(
-                    vllm_config=self.cfg,
+                    vllm_config=self.whole_cfg,
                     prefix="model_mk_whole",
                     backbone=runner.model.model,
                     segments=self.segments,
@@ -1161,7 +1177,7 @@ class Qwen38SegmentDriver:
             self.whole_program = None
 
     def _whole_eligible(self, runner: Any, n_req: int, rows: int) -> bool:
-        if self.whole_program is None or rows > self.whole_max_rows:
+        if self.whole_program is None or rows > min(WHOLE_MAX_ROWS, self.whole_max_rows):
             return False
         try:
             ctx = runner.input_batch.num_computed_tokens_cpu[:n_req]
