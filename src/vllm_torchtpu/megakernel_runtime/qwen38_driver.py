@@ -112,6 +112,13 @@ def _diff_stats(a: torch.Tensor, b: torch.Tensor, n: int, hc: int) -> dict:
     return out
 
 
+def _zeros_like(t: torch.Tensor) -> torch.Tensor:
+    """`zeros_like` that also works for FP8 on torch_tpu (fills a same-size int view)."""
+    if t.dtype.itemsize == 1 and t.dtype not in (torch.uint8, torch.int8, torch.bool):
+        return torch.zeros(t.shape, dtype=torch.uint8, device=t.device).view(t.dtype)
+    return torch.zeros_like(t)
+
+
 def _operand_names(spec: Any, ex: Any, L: int) -> list[str]:
     """Names of the flattened operands `pack_segment_operands` returns."""
     from vllm_torchtpu.megakernel import planner
@@ -641,12 +648,21 @@ class Qwen38SegmentDriver:
                 self._audit_operands(runner, w, names, spec, ex, ids0, "head0", True)
             # Zero-weight splits: no MoE (routed + shared expert weights 0, so the
             # MoE adds exactly 0) and no GDN (out_proj 0, so the GDN adds exactly 0).
-            no_moe = [torch.zeros_like(t) if n.split("[")[0] in ("e13", "e2", "sh13", "sh2") else t for n, t in zip(names, w)]
-            no_gdn = [torch.zeros_like(t) if n == "lin_out" else t for n, t in zip(names, w)]
+            no_moe = [_zeros_like(t) if n.split("[")[0] in ("e13", "e2", "sh13", "sh2") else t for n, t in zip(names, w)]
+            no_gdn = [_zeros_like(t) if n == "lin_out" else t for n, t in zip(names, w)]
+            def ok(tag, t):
+                # Materialize `t` so an async failure names its stage.
+                logger.info("qwen38 h0check stage %s ok: sum %.6g", tag, float(t.float().sum()))
+
             snap0 = self._snap(ids0, NS)
+            ok("snap", snap0[0])
             mk_out = self._mk_run(len(ids0), True, w, h_in, None, snap0)
+            ok("mk", mk_out)
+            ok("zeros", no_moe[names.index("e13[0]")])
             mk_nomoe = self._mk_run(len(ids0), True, no_moe, h_in, None, self._snap(ids0, NS))
+            ok("mk_nomoe", mk_nomoe)
             mk_nogdn = self._mk_run(len(ids0), True, no_gdn, h_in, None, self._snap(ids0, NS))
+            ok("mk_nogdn", mk_nogdn)
             # Stock layer 0, staged like Qwen4ExpDecoderLayer.forward.
             from vllm_torchtpu.models.vllm.qwen4_exp import sequence_parallel as sp
 
@@ -767,19 +783,23 @@ class Qwen38SegmentDriver:
         pool = segs.pool
         n_blk = 1 + len(gdn_ids) * CAP * T
         dev = pool.device
-        small = torch.zeros((n_blk,) + tuple(pool.shape[1:]), dtype=pool.dtype, device=dev)
         new_off = torch.zeros(n_blk, dtype=torch.int32, device=dev)
+        # One gather builds the private pool (block 0 = the real null block, unused
+        # slots also block 0): no FP8 fill/index_put, which fails on torch_tpu
+        # ("a required argument is in a failed state" downstream).
+        src = [torch.zeros(1, dtype=torch.int64, device=dev)]
         meta = []
         for k, i in enumerate(gdn_ids):
             md = md_all[segs.layers[i].linear_attn.prefix]
             st = md.mamba_state_indices.to(torch.int64)[:NS]
             ck = md.mamba_ckpt_indices.to(torch.int64)[:NS, :T]
             base = 1 + k * CAP * T
-            small[base : base + NS * T] = pool[ck.reshape(-1)]
+            src += [ck.reshape(-1), torch.zeros(CAP * T - NS * T, dtype=torch.int64, device=dev)]
             new_ck = (base + torch.arange(NS * T, device=dev).reshape(NS, T)).to(torch.int32)
             new_ck = torch.where(ck > 0, new_ck, torch.zeros_like(new_ck))
             new_off[new_ck[:, 0].long()] = md.mamba_slot_read_offsets.to(torch.int32)[st]
             meta += [new_ck[:, 0], None, new_ck, md.query_start_loc.to(torch.int32)[: NS + 1], md.seq_lens.to(torch.int32)[:NS]]
+        small = pool[torch.cat(src)]
         return [small, *[new_off if m is None else m for m in meta]]
 
     def _mk_run(self, L: int, head: bool, w: list, h: Any, att: Any, gdn_io: list) -> Any:
