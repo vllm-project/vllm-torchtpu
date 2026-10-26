@@ -60,6 +60,9 @@ class KernelConfig:
     # Prefill MLA flash tiles (queries x keys per step).
     mla_flash_qtile: int = 1024
     mla_flash_ktile: int = 2048
+    # Prefix keys in mla_flash_ktile tiles and a whole-window query tile under
+    # mla_flash_qtile rows (False: the window's key tile, as before).
+    mla_flash_prefix_tiles: bool = True
     # Prefill MoE expert parallelism: 8 (EP8/TP4, the pre-shard layout), 16
     # (EP16/TP2: 56 experts, TP2 within the chip) or 32 (28 whole experts);
     # 16 and 32 regroup the EP8 group's shards at load.
