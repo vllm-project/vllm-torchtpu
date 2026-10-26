@@ -30,11 +30,22 @@ from .spec import ExtraInput, ModelSpec, Module, Spec, StateDecl, SwitchSlot, We
 
 def k_tile(K: int, N: int, dtype: Any, bank: int) -> int:
     """Largest 128-multiple divisor of K whose `[tk, N]` tile fits `bank` bytes."""
+    dt = jnp.dtype(dtype)
+    if K <= 0 or K % 128 != 0:
+        raise MegakernelConfigError(
+            f"Weight K dimension must be a positive multiple of 128, got K={K} "
+            f"(N={N}, dtype={dt})"
+        )
     best = None
     for tk in range(128, K + 1, 128):
-        if K % tk == 0 and pool_alias.storage_size((tk, N), jnp.dtype(dtype)) <= bank:
+        if K % tk == 0 and pool_alias.storage_size((tk, N), dt) <= bank:
             best = tk
-    assert best is not None, ("no 128-row tile fits a bank", K, N, dtype, bank)
+    if best is None:
+        min_bytes = pool_alias.storage_size((128, N), dt)
+        raise MegakernelConfigError(
+            f"No 128-row tile of shape (K={K}, N={N}, dtype={dt}) fits bank={bank} "
+            f"bytes (minimum 128x{N} tile requires {min_bytes} bytes)"
+        )
     return best
 
 
@@ -73,12 +84,6 @@ class Plan:
     o_names: tuple[str, ...]
     module_params: dict[str, Any]
 
-    def __getitem__(self, key: str) -> Any:
-        return getattr(self, key)
-
-    def keys(self):
-        return self.__dataclass_fields__.keys()
-
 
 def _discover_schedule(
     model_spec: ModelSpec,
@@ -103,21 +108,28 @@ def _discover_schedule(
 
     for s in model_spec.layer_type.slots:
         if isinstance(s, SwitchSlot):
-            assert len(s.active_branches) <= 2, (
-                f"SwitchSlot {s.name!r} supports at most 2 active branches, "
-                f"got {len(s.active_branches)}"
-            )
+            if len(s.active_branches) > 2:
+                raise MegakernelConfigError(
+                    f"SwitchSlot {s.name!r} supports at most 2 active branches, "
+                    f"got {len(s.active_branches)}"
+                )
             if len(s.active_branches) > 1:
                 if period == 1:
                     period = s.period
                     branch_counts = s.active_counts
-                else:
-                    assert s.period == period and s.active_counts == branch_counts, (
+                elif s.period != period or s.active_counts != branch_counts:
+                    raise MegakernelConfigError(
                         "Multiple SwitchSlots in a LayerType must share "
-                        "period and branch_counts"
+                        f"period and branch_counts: expected ({period}, "
+                        f"{branch_counts}), got ({s.period}, {s.active_counts}) "
+                        f"on {s.name!r}"
                     )
 
-    assert L % period == 0, (L, period)
+    if L <= 0 or L % period != 0:
+        raise MegakernelConfigError(
+            f"Layer count L={L} must be a positive multiple of SwitchSlot "
+            f"period={period}"
+        )
     n_cycles = L // period
 
     module_layer_counts: dict[str, int] = {}
@@ -130,13 +142,16 @@ def _discover_schedule(
             active = s.active_branches
             counts = s.active_counts
             reds = {m.reduction for m in active}
-            assert len(reds) == 1, (
-                f"SwitchSlot {s.name} branches must share reduction policy: {reds}"
-            )
+            if len(reds) != 1:
+                raise MegakernelConfigError(
+                    f"SwitchSlot {s.name!r} branches must share reduction policy: "
+                    f"{reds}"
+                )
             norms = {m.input_norm for m in active}
-            assert len(norms) == 1, (
-                f"SwitchSlot {s.name} branches must share input_norm: {norms}"
-            )
+            if len(norms) != 1:
+                raise MegakernelConfigError(
+                    f"SwitchSlot {s.name!r} branches must share input_norm: {norms}"
+                )
             red = active[0].reduction
             if len(active) == 1:
                 m = active[0]
@@ -152,10 +167,11 @@ def _discover_schedule(
             module_branch_idx[s.name] = None
 
         if red == "allreduce":
-            assert next_ar_slot < 2, (
-                "At most 2 'allreduce' slots per layer are supported by "
-                "double-buffered AllReduceRing"
-            )
+            if next_ar_slot >= 2:
+                raise MegakernelConfigError(
+                    "At most 2 'allreduce' slots per layer are supported by "
+                    "double-buffered AllReduceRing"
+                )
             slot_ar_index.append(next_ar_slot)
             next_ar_slot += 1
         else:
@@ -229,7 +245,8 @@ def plan(
     for m in model_spec.all_modules():
         slot_i = module_slot_idx[m.name]
         for w in m.weights(g, ex):
-            assert w.name not in weight_decls, f"Duplicate weight declaration: {w.name}"
+            if w.name in weight_decls:
+                raise MegakernelConfigError(f"Duplicate weight declaration: {w.name!r}")
             weight_decls[w.name] = w
             weight_owners[w.name] = m.name
             if w.stream_ring == "static":
@@ -253,14 +270,16 @@ def plan(
                 small_widths[sf.name] = sf.width
                 small_slot_owners[sf.name] = slot_i
             else:
-                assert small_slot_owners[sf.name] == slot_i, (
-                    f"Smalls field {sf.name!r} declared by modules in different slots "
-                    f"(slot {small_slot_owners[sf.name]} vs slot {slot_i}); only "
-                    f"branches of the same SwitchSlot may share a smalls field name."
-                )
+                if small_slot_owners[sf.name] != slot_i:
+                    raise MegakernelConfigError(
+                        f"Smalls field {sf.name!r} declared by modules in different "
+                        f"slots (slot {small_slot_owners[sf.name]} vs slot {slot_i}); "
+                        "only branches of the same SwitchSlot may share a smalls "
+                        "field name."
+                    )
                 small_widths[sf.name] = max(small_widths[sf.name], sf.width)
-        if m.input_norm is not None:
-            assert m.input_norm in m_small_names, (
+        if m.input_norm is not None and m.input_norm not in m_small_names:
+            raise MegakernelConfigError(
                 f"Module {m.name!r} declares input_norm={m.input_norm!r} "
                 f"which is not in its smalls(): {sorted(m_small_names)}"
             )
@@ -268,17 +287,19 @@ def plan(
         for st in m.states(g, ex):
             if st.name in state_decls:
                 prev = state_decls[st.name]
-                assert st == prev and not st.per_layer and st.access == "r", (
-                    f"Duplicate state declaration {st.name!r}: {st} vs {prev}"
-                )
+                if not (st == prev and not st.per_layer and st.access == "r"):
+                    raise MegakernelConfigError(
+                        f"Duplicate state declaration {st.name!r}: {st} vs {prev}"
+                    )
                 continue
             state_decls[st.name] = st
             state_owners[st.name] = m.name
 
         for out in m.outputs(g, ex):
-            assert out.name not in output_decls, (
-                f"Duplicate output declaration: {out.name}"
-            )
+            if out.name in output_decls:
+                raise MegakernelConfigError(
+                    f"Duplicate output declaration: {out.name!r}"
+                )
             output_decls[out.name] = out
             output_owners[out.name] = m.name
 

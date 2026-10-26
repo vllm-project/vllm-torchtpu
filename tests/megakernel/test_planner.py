@@ -18,18 +18,20 @@ from __future__ import annotations
 import dataclasses
 
 import pytest
-from conftest import (
+
+from tests.megakernel.megakernel_fakes import (
     FakeAltMixerModule,
     FakeGeometry,
     FakeMixerModule,
     make_fake_model_spec,
 )
-
+from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel import module_options, planner
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
-from vllm_torchtpu.megakernel.ops import FP8
+from vllm_torchtpu.megakernel.ops import BF16, FP8, I32
 from vllm_torchtpu.megakernel.spec import (
+    ExtraInput,
     LayerType,
     ModelSpec,
     Module,
@@ -84,7 +86,7 @@ def test_planner_hybrid_switch_slot(fake_ex: ExecSpec):
     _, in_s_w = p.smalls_layout["in_s"]
     assert in_s_w == 640
 
-    # >2 branches in a SwitchSlot raises AssertionError at plan time
+    # >2 branches in a SwitchSlot raises MegakernelConfigError at plan time
     class ThirdBranchModule(Module):
         name = "third"
 
@@ -98,8 +100,124 @@ def test_planner_hybrid_switch_slot(fake_ex: ExecSpec):
         config=FakeGeometry(L=4, H=256),
         layer_type=LayerType("l", slots=(bad_sw,)),
     )
-    with pytest.raises(AssertionError, match="supports at most 2 active branches"):
+    with pytest.raises(
+        MegakernelConfigError, match="supports at most 2 active branches"
+    ):
         planner.plan(bad_ms, fake_ex)
+
+    # Layer count not divisible by SwitchSlot period raises MegakernelConfigError
+    bad_period_ms = make_fake_model_spec(L=6, att_every=4, H=256)
+    with pytest.raises(
+        MegakernelConfigError, match="positive multiple of SwitchSlot period=4"
+    ):
+        planner.plan(bad_period_ms, fake_ex)
+
+    # >2 allreduce slots per layer raises MegakernelConfigError
+    class ExtraARModule(Module):
+        name = "extra_ar"
+        reduction = "allreduce"
+
+    bad_ar_ms = ModelSpec(
+        name="bad_3ar",
+        config=FakeGeometry(L=2, H=256),
+        layer_type=LayerType(
+            "l",
+            slots=(FakeMixerModule(), FakeAltMixerModule(), ExtraARModule()),
+        ),
+    )
+    with pytest.raises(
+        MegakernelConfigError, match="At most 2 'allreduce' slots per layer"
+    ):
+        planner.plan(bad_ar_ms, fake_ex)
+
+
+def test_k_tile_divisors_and_config_errors():
+    """Verify `k_tile` selects the largest fitting 128-multiple divisor and raises
+    distinct `MegakernelConfigError`s for unaligned `K` vs insufficient `bank`."""
+    assert planner.k_tile(512, 256, BF16, 512 * 256 * 2) == 512
+    assert planner.k_tile(512, 256, BF16, 256 * 256 * 2) == 256
+    assert planner.k_tile(384, 256, BF16, 256 * 256 * 2) == 128
+
+    with pytest.raises(
+        MegakernelConfigError, match="positive multiple of 128, got K=200"
+    ):
+        planner.k_tile(200, 256, BF16, 4 << 20)
+
+    with pytest.raises(
+        MegakernelConfigError, match="positive multiple of 128, got K=0"
+    ):
+        planner.k_tile(0, 256, BF16, 4 << 20)
+
+    with pytest.raises(
+        MegakernelConfigError,
+        match=r"No 128-row tile .* fits bank=1048576 bytes",
+    ):
+        planner.k_tile(128, 8192, BF16, 1 << 20)
+
+
+def test_encode_ecopy():
+    """Verify `encode_ecopy` packs cross-rank secondary replicas and warns on
+    same-rank or duplicate secondary placements."""
+    assert mk.encode_ecopy is planner.encode_ecopy
+
+    # moe_tp=True or EW <= ER disables redundant copy descriptors
+    cores_no_extra = [[0, 1], [2, 3]]
+    assert planner.encode_ecopy(4, 2, 2, False, cores_no_extra) == [0.0] * 4
+    assert planner.encode_ecopy(4, 2, 3, True, [[0, 1, 2], [2, 3, 0]]) == [0.0] * 4
+
+    # E=4, ER=2, EW=4 (extra=2):
+    # rank 0 primary=[0, 1], extra=[2, -1] -> expert 2 (vid=2) gets 1 + 0*2 + 0 = 1.0
+    # rank 1 primary=[2, 3], extra=[99, 0] -> expert 99 ignored; expert 0 (vid=0)
+    # gets 1 + 1*2 + 1 = 4.0
+    cores = [[0, 1, 2, -1], [2, 3, 99, 0]]
+    assert planner.encode_ecopy(4, 2, 4, False, cores) == [4.0, 0.0, 1.0, 0.0]
+
+    # Same-rank redundant replica warns and is ignored
+    with pytest.warns(UserWarning, match="ignoring same-rank replica"):
+        same_rank = planner.encode_ecopy(4, 2, 3, False, [[0, 1, 0], [2, 3, -1]])
+    assert same_rank == [0.0] * 4
+
+    # Multiple secondary replicas for the same expert warns and overwrites
+    with pytest.warns(UserWarning, match="multiple secondary replicas"):
+        dup = planner.encode_ecopy(6, 2, 3, False, [[0, 1, 4], [2, 3, 4], [4, 5, -1]])
+    # expert 4 has vid=4; rank 0 sets 1.0, rank 1 overwrites with 1 + 1*1 + 0 = 2.0
+    assert dup == [0.0, 0.0, 0.0, 0.0, 2.0, 0.0]
+
+
+def test_extra_inputs(fake_ex: ExecSpec):
+    """Verify `extra_inputs` preserves declaration order and rejects duplicates."""
+
+    class ModA(Module):
+        name = "mod_a"
+
+        def extra_inputs(self, g: FakeGeometry, ex: ExecSpec) -> list[ExtraInput]:
+            return [ExtraInput("in_a", "hbm", (ex.B, 8), I32)]
+
+    class ModB(Module):
+        name = "mod_b"
+
+        def extra_inputs(self, g: FakeGeometry, ex: ExecSpec) -> list[ExtraInput]:
+            return [ExtraInput("in_b", "smem", (ex.B, 16), I32)]
+
+    class ModDup(Module):
+        name = "mod_dup"
+
+        def extra_inputs(self, g: FakeGeometry, ex: ExecSpec) -> list[ExtraInput]:
+            return [ExtraInput("in_a", "hbm", (ex.B, 4), I32)]
+
+    g = FakeGeometry(L=2, H=256)
+    ms = ModelSpec("extras_ok", config=g, layer_type=LayerType("l", (ModA(), ModB())))
+    got = planner.extra_inputs(ms, fake_ex)
+    assert [(x.name, x.memory_space, x.shape, x.dtype) for x in got] == [
+        ("in_a", "hbm", (fake_ex.B, 8), I32),
+        ("in_b", "smem", (fake_ex.B, 16), I32),
+    ]
+
+    ms_dup = ModelSpec(
+        "extras_dup", config=g, layer_type=LayerType("l", (ModA(), ModDup()))
+    )
+    with pytest.raises(MegakernelConfigError, match="duplicate module extra inputs"):
+        planner.extra_inputs(ms_dup, fake_ex)
 
 
 def test_planner_custom_module_extension(fake_ex: ExecSpec):
