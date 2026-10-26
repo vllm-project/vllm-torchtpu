@@ -170,6 +170,7 @@ WHOLE_MAX_ROWS = 64
 # server must have made a whole-step call.
 WHOLE_SELF_CHECK_STEPS = 200
 STEP_MIX_EVERY = 5000  # steps between periodic step-mix log lines
+STEP_MIX_INTERVAL_S = float(os.environ.get("VLLM_TPU_MK_STEP_MIX_INTERVAL_S", "10") or 0)
 
 _UNSET = object()
 
@@ -1338,6 +1339,12 @@ class Qwen38SegmentDriver:
         except Exception as exc:
             logger.info("qwen38 megakernel gdn meta: unavailable (%s)", exc)
 
+    def _count(self, key: str, n: int) -> None:
+        """Add `n` to a counter logged with the step mix without counting a step (drafted
+        tokens per path, for attributing accepted tokens to whole-step vs stock steps)."""
+        self.counters = getattr(self, "counters", {})
+        self.counters[key] = self.counters.get(key, 0) + n
+
     def _note(self, key: str) -> None:
         self.stats[key] = self.stats.get(key, 0) + 1
         n = sum(self.stats.values())
@@ -1345,6 +1352,19 @@ class Qwen38SegmentDriver:
         # time to the serving metrics (AL windows) over a whole run.
         if (n & (n - 1) == 0 and n >= 64) or n % STEP_MIX_EVERY == 0:
             logger.info("qwen38 megakernel step mix: %s", dict(sorted(self.stats.items())))
+        if STEP_MIX_INTERVAL_S:
+            import time
+
+            now = time.monotonic()
+            if now - getattr(self, "_mix_t", 0.0) >= STEP_MIX_INTERVAL_S:
+                # Cumulative counts on a wall-clock cadence matching vLLM's spec-decode metrics
+                # interval: differencing both per window attributes accepted / drafted tokens to
+                # whole-step vs stock steps (tools: whole_path_al.py).
+                self._mix_t = now
+                logger.info(
+                    "qwen38 megakernel step mix (timed): %s counters %s",
+                    dict(sorted(self.stats.items())), dict(getattr(self, "counters", {})),
+                )
 
     def try_forward(
         self,
@@ -1385,6 +1405,7 @@ class Qwen38SegmentDriver:
             # AgentX request past the 32K cap started that compile and the sampler RPC timed out).
             above = rows > min(WHOLE_MAX_ROWS, self.whole_max_rows)
             self._note(f"stock_above_whole_b{rows}" if above else "stock_whole_ctx")
+            self._count("drafts_stock", n_req * (T_VERIFY - 1))
             return False, None
         self._note(f"mk_b{rows}")
         self.mk_calls += 1
@@ -1436,6 +1457,7 @@ class Qwen38SegmentDriver:
                 out = self._shadow_step(runner, input_ids, positions, kw)
             elif self._whole_eligible(runner, n_req, rows):
                 self.whole_calls += 1
+                self._count("drafts_whole", n_req * (T_VERIFY - 1))
                 self._note(f"whole_b{rows}")
                 with self._contexts(runner, "model_mk_whole"):
                     out = self.whole_program(input_ids=input_ids, positions=positions, **kw)
