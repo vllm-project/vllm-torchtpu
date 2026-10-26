@@ -48,7 +48,7 @@ from .driver import (
 from .exported_bridge import make_typed_step_wrapper, sharded_jax_callable
 from .qwen38_mtp_tail import MtpTailKind
 from .qwen38_segment_call import GDN_META, T_VERIFY, build_segment_call, segment_tiles
-from .qwen38_weights import head_groups, own_operands, pack_segment_operands, segment_layers
+from .qwen38_weights import head_groups, pack_segment_operands, segment_layers
 
 logger = init_logger(__name__)
 
@@ -307,7 +307,8 @@ class _SegmentKind:
     def callable_for(self, B: int) -> Any:
         if B not in self._calls:
             full, in_specs, outs, donate = build_segment_call(
-                self.mesh, self.g, self.L, B, self.layout, self.write, head=self.head
+                self.mesh, self.g, self.L, B, self.layout, self.write, head=self.head,
+                flat_smalls=bool(envs.VLLM_TPU_MK_OWN_OPERANDS),
             )
             # JaxCallable needs explicit, jax.Array-annotated positional parameters.
             typed = make_typed_step_wrapper(
@@ -362,7 +363,10 @@ class Qwen38Segments(nn.Module):
         for s in range(self.n_seg):
             L = len(segment_layers(g, s))
             ex = ExecSpec(R=R, B=buckets[0], T=T_VERIFY, ctx=128, tiles=segment_tiles(buckets[0]))
-            ops = pack_segment_operands(model, g, s, qwen38.segment_spec(g, R, L=L), ex)
+            ops = pack_segment_operands(
+                model, g, s, qwen38.segment_spec(g, R, L=L), ex,
+                boundary=bool(envs.VLLM_TPU_MK_OWN_OPERANDS),
+            )
             ops = self._own(ops, f"segment {s}")
             self.n_w.append(len(ops))
             for i, t in enumerate(ops):
@@ -372,7 +376,10 @@ class Qwen38Segments(nn.Module):
             L = len(group)
             ex = ExecSpec(R=R, B=buckets[0], T=T_VERIFY, ctx=128, tiles=segment_tiles(buckets[0]))
             spec = qwen38.segment_spec(g, R, L=L, head=True)
-            ops = pack_segment_operands(model, g, -1, spec, ex, layer_ids=group, head=True)
+            ops = pack_segment_operands(
+                model, g, -1, spec, ex, layer_ids=group, head=True,
+                boundary=bool(envs.VLLM_TPU_MK_OWN_OPERANDS),
+            )
             ops = self._own(ops, f"head group {h}")
             self.n_hw.append(len(ops))
             for i, t in enumerate(ops):
@@ -382,7 +389,7 @@ class Qwen38Segments(nn.Module):
 
     @staticmethod
     def _own(ops: list[torch.Tensor], what: str) -> list[torch.Tensor]:
-        """With VLLM_TPU_MK_OWN_OPERANDS, register no view operands."""
+        """Debug: with VLLM_TPU_MK_OPERAND_DUMP, log every operand's layout."""
         if os.environ.get("VLLM_TPU_MK_OPERAND_DUMP"):
             for i, t in enumerate(ops):
                 logger.info(
@@ -390,11 +397,6 @@ class Qwen38Segments(nn.Module):
                     what, i, tuple(t.shape), t.dtype, t.stride(), t.storage_offset(),
                     t._base is not None,
                 )
-        if not envs.VLLM_TPU_MK_OWN_OPERANDS:
-            return ops
-        ops, fixed = own_operands(ops)
-        if fixed:
-            logger.info("qwen38 megakernel %s: %d view operands made owned", what, fixed)
         return ops
 
     def bind_pool(self) -> None:
@@ -494,7 +496,7 @@ class MtpTail(nn.Module):
         R = mesh.size
         ex = ExecSpec(R=R, B=buckets[0], T=T_VERIFY, ctx=128, tiles=segment_tiles(buckets[0]))
         ops = pack_segment_operands(draft, g, -1, qwen38.segment_spec(g, R, L=1), ex, layer_ids=[0])
-        ops = Qwen38Segments._own(ops, "MTP tail")
+        ops = Qwen38Segments._own(ops, "MTP tail")  # MTP tail keeps the plain layout
         self.n_w = len(ops)
         for i, t in enumerate(ops):
             self.register_buffer(f"w_{i}", t, persistent=False)

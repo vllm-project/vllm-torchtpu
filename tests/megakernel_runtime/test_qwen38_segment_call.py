@@ -84,10 +84,18 @@ def _blocks(NL):
 
 
 @pytest.mark.parametrize(
-    "L,head,pool_gdn,kb",
-    [(4, False, False, 128), (4, False, True, 128), (2, True, True, 128), (4, False, True, 512), (2, True, True, 512)],
+    "L,head,pool_gdn,kb,flat_smalls",
+    [
+        (4, False, False, 128, False),
+        (4, False, True, 128, False),
+        (2, True, True, 128, False),
+        (4, False, True, 512, False),
+        (2, True, True, 512, False),
+        (4, False, True, 128, True),
+        (2, True, True, 128, True),
+    ],
 )
-def test_segment_call_matches_reference_and_writes_checkpoints(L, head, pool_gdn, kb):
+def test_segment_call_matches_reference_and_writes_checkpoints(L, head, pool_gdn, kb, flat_smalls):
     POOL_SHAPE = (NMB * (512 // kb), kb, 1, 4, 256)  # served: 128- or 512-row blocks
     NL = L if head else L - 1
     rng = np.random.default_rng(0)
@@ -128,7 +136,16 @@ def test_segment_call_matches_reference_and_writes_checkpoints(L, head, pool_gdn
     for name in kernel.build(spec, ex)[1]["plan"].w_names:
         v = w_mk[name]
         flat.extend(v if isinstance(v, tuple) else (v,))
-    flat = [jax.device_put(kernel.fold(x), tp) for x in flat]
+    flat = [kernel.fold(x) for x in flat]
+    if flat_smalls:
+        # The packer's `boundary` layout: "smalls" as [L * S / 128, 128] per rank.
+        names = [
+            n for n in kernel.build(spec, ex)[1]["plan"].w_names
+            for _ in range(len(w_mk[n]) if isinstance(w_mk[n], tuple) else 1)
+        ]
+        k = names.index("smalls")
+        flat[k] = flat[k].reshape(-1, 128)
+    flat = [jax.device_put(x, tp) for x in flat]
     hidden = jax.device_put(jnp.tile(inp.x, (R, 1)), tp)
     attn = jax.device_put(inp.attn.reshape(R * B, -1), tp)
     pool = jax.device_put(
@@ -147,7 +164,8 @@ def test_segment_call_matches_reference_and_writes_checkpoints(L, head, pool_gdn
 
     layout = gs.Qwen38GdnPoolLayout(pool_shape=POOL_SHAPE, pool_dtype="float8_e4m3fn")
     fn, in_specs, out_specs, donate = build_segment_call(
-        mesh, G, L, B, layout, interpret=True, tiles=TILES, head=head, pool_gdn=pool_gdn
+        mesh, G, L, B, layout, interpret=True, tiles=TILES, head=head, pool_gdn=pool_gdn,
+        flat_smalls=flat_smalls,
     )
     lead = (hidden,) if head else (hidden, attn)
     assert len(in_specs) == len(lead) + len(flat) + 1 + len(meta)

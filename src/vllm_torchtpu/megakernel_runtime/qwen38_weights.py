@@ -118,10 +118,15 @@ def pack_segment_operands(
     ex: ExecSpec,
     layer_ids: list[int] | None = None,
     head: bool = False,
+    boundary: bool = False,
 ) -> list[torch.Tensor]:
     """This rank's segment-`s` (or head group `layer_ids`) weight operands.
 
-    Flattened in `plan.w_names` order.
+    Flattened in `plan.w_names` order. `boundary`: operands torch_tpu would
+    re-lay out on every call of the compiled program are passed in a layout it
+    keeps: "smalls" as `[L * S / 128, 128]` (the segment call restores
+    `[L, 1, S]` under jit, see `build_segment_call(flat_smalls=True)`), and
+    views as fresh tensors (a view keeps its base's device layout).
     """
     p = planner.plan(spec, ex)
     L = spec.config.L
@@ -195,7 +200,7 @@ def pack_segment_operands(
     out: list[torch.Tensor] = []
     for name in p.w_names:
         if name == "smalls":
-            out.append(smalls)
+            out.append(smalls.reshape(-1, 128).clone() if boundary else smalls)
         elif name == "final_norm":
             out.append(torch.zeros((1, W), dtype=torch.float32, device=dev))
         elif name in ("e13", "e2"):
@@ -215,6 +220,8 @@ def pack_segment_operands(
             # splits them under jit. A rank-4 operand is re-laid out by torch_tpu
             # on every call (q40 j-c2430942: ~1.8 ms/step of execute_as_strided).
             out.append(t.contiguous())
+    if boundary:
+        out = [t.clone() if t._base is not None else t for t in out]
     return out
 
 

@@ -79,6 +79,8 @@ def make_flat_segment_step(mesh: Any, spec: ModelSpec, ex: ExecSpec):
         return tuple(new[k] for k in outs)
 
     fn.extra_names = tuple(x.name for x in extras)
+    fn.weight_layout = tuple(layout)
+    fn.smalls_width = p.smalls_width
     x_specs = tuple(P("tp") if x.memory_space == "hbm" else P() for x in extras)
     in_specs = (P(), P("tp")) + x_specs + (P("tp"),) * (n_w + len(states))
     out_specs = (P("tp"),) * len(outs)

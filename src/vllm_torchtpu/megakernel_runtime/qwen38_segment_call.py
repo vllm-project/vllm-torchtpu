@@ -135,6 +135,7 @@ def build_segment_call(
     head: bool = False,
     pool_gdn: bool = True,
     fast_scatter: bool = True,
+    flat_smalls: bool = False,
 ) -> tuple[Any, tuple, tuple, tuple]:
     """`(fn, in_specs, out_specs, donate_argnums)` of segment kind `L` at `B` rows.
 
@@ -162,6 +163,12 @@ def build_segment_call(
     pool_gdn = pool_gdn and has_gdn
     spec = qwen38.segment_spec(g, R, L=L, head=head, pool_gdn=pool_gdn)
     fn, _, _, n_w = make_flat_segment_step(mesh, spec, ex)
+    # `flat_smalls`: the packer passed "smalls" as `[L * S / 128, 128]` (no
+    # size-1 tiling dim, so torch_tpu does not re-lay it out on every call).
+    smalls_at = None
+    if flat_smalls:
+        flat_names = [n for n, c in fn.weight_layout for _ in range(max(c, 1))]
+        smalls_at = flat_names.index("smalls") if "smalls" in flat_names else None
     M, NS = ex.M, B // T_VERIFY
     tp, rep = P("tp"), P()
     pad = jax.shard_map(
@@ -198,6 +205,10 @@ def build_segment_call(
         hidden = args[0]
         attn = None if head else args[1]
         w = args[n_lead : n_lead + n_w]
+        if smalls_at is not None:
+            w = list(w)
+            w[smalls_at] = w[smalls_at].reshape(-1, 1, fn.smalls_width)
+            w = tuple(w)
         x = pad(hidden)
         named = {} if head else {"qsa_attn": pad(attn)}
         states: tuple = ()
