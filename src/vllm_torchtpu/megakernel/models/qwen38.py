@@ -60,6 +60,10 @@ class Qwen38InnerGeometry(Qwen35Geometry):
     padded so each rank's slice is a 128 multiple.
     """
 
+    # Gate on the GDN output norm: Qwen3.8's `RMSNormGated` multiplies by
+    # sigmoid(z) (Qwen3.5: silu(z)).
+    gdn_gate: str = "sigmoid"
+
     def check(self, ex: ExecSpec) -> None:
         R, B, T, M = ex.R, ex.B, ex.T, ex.M
         assert self.att_every > self.L or self.L % self.att_every == 0

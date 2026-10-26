@@ -79,6 +79,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from ..blocks.gdn.recurrence import gate_act
 from ..exec_spec import ExecSpec
 from ..fused_io_hook import FusedPoolIO, register_fused_io
 from ..ops import BF16, F32, FP8, I32, U32, bswitch, rnd, rup
@@ -852,7 +853,7 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
                         )
                         val = (gnw[None, :] * val.astype(BF16)).astype(F32)
                         zz = ybuf[b, QKV : QKV + Z].reshape(vh, VD)
-                        scr["mix"][b, :Z] = rnd(val * jax.nn.silu(zz)).reshape(Z)
+                        scr["mix"][b, :Z] = rnd(val * gate_act(gp.gate)(zz)).reshape(Z)
 
                         if interpret:
                             u32_out = pltpu.bitcast(s_bf16.reshape(vh * KD, VD), U32)

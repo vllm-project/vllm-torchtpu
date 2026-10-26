@@ -68,6 +68,7 @@ class GDNParams:
     eps: float
     zero_centered_norm: bool
     l2_eps: float = 1e-6
+    gate: str = "silu"  # z-gate activation on the gated output norm: "silu" | "sigmoid"
     NGI: int = 0
     NGO: int = 0
     G_PER_ATT: int = 0
@@ -243,6 +244,7 @@ def derive_params(
         eps=g.eps,
         zero_centered_norm=bool(g.zero_centered_norm),
         l2_eps=float(g.gdn_l2_eps),
+        gate=str(getattr(g, "gdn_gate", "silu")),
         NGI=NGI,
         NGO=NGO,
         G_PER_ATT=g_per_att,

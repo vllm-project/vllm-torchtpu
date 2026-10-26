@@ -64,6 +64,7 @@ def gdn_reference(
     expand = vh // kh
     eps = float(getattr(g, "eps", 1e-6))
     l2_eps = float(getattr(g, "gdn_l2_eps", 1e-6))
+    gate = {"silu": jax.nn.silu, "sigmoid": jax.nn.sigmoid}[str(getattr(g, "gdn_gate", "silu"))]
     xb = x[:B].astype(BF16).astype(F32)
 
     def _slice_sm(arr: Any) -> Any:
@@ -194,7 +195,7 @@ def gdn_reference(
             )
             val = (gnw[None, :] * val.astype(BF16)).astype(F32)
             zz = ybuf[b, QKV : QKV + Z].reshape(vh, VD)
-            mix_r.append(rnd(val * jax.nn.silu(zz)).reshape(Z))
+            mix_r.append(rnd(val * gate(zz)).reshape(Z))
 
         rec_cat = jnp.concatenate(rec_r_list, axis=0)
         if has_multi_out:

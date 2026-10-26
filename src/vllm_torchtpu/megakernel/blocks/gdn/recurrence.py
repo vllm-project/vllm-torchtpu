@@ -27,6 +27,11 @@ from .params import GDNParams
 from .states import rec_chunk
 
 
+def gate_act(gate: str) -> Any:
+    """Activation applied to `z` on the gated output norm."""
+    return {"silu": jax.nn.silu, "sigmoid": jax.nn.sigmoid}[gate]
+
+
 def gdn_rec(ctx: Any, gp: GDNParams, u: Any, ybuf: Any, slot: Any) -> None:
     """Gated delta rule on key-major `recb [B * vh, KD, VD]` (`GCH=False`)."""
     ex = ctx.ex
@@ -76,7 +81,7 @@ def gdn_rec(ctx: Any, gp: GDNParams, u: Any, ybuf: Any, slot: Any) -> None:
         val = out * lax.rsqrt(jnp.mean(out * out, axis=-1, keepdims=True) + gp.eps)
         val = (gnw[None, :] * val.astype(BF16)).astype(F32)
         zz = ybuf[b, QKV : QKV + Z].reshape(vh, VD)
-        scr["mix"][b, :Z] = rnd(val * jax.nn.silu(zz)).reshape(Z)
+        scr["mix"][b, :Z] = rnd(val * gate_act(gp.gate)(zz)).reshape(Z)
 
 
 def gdn_rec_chunked(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> None:
@@ -167,7 +172,7 @@ def gdn_rec_chunked(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> None:
             val = out * lax.rsqrt(jnp.mean(out * out, axis=-1, keepdims=True) + gp.eps)
             val = (gnw[None, :] * val.astype(BF16)).astype(F32)
             zz = zc[bb].reshape(vh, VD)
-            row = rnd(val * jax.nn.silu(zz)).reshape(1, Z)
+            row = rnd(val * gate_act(gp.gate)(zz)).reshape(1, Z)
             blk = jnp.where(row_i == bb, row, blk)
         scr["mix"][pl.ds(r0, n_pad), 0:Z] = blk
 

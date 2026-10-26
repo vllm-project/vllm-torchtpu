@@ -65,7 +65,10 @@ def _assert_within_budget(res: np.ndarray, ref: np.ndarray) -> None:
     for r in range(res.shape[0]):
         d = np.abs(res[r] - ref)
         assert d.mean() < 1e-2 * scale, (r, d.mean(), scale)
-        assert np.quantile(d, 0.999) < 5e-2 * scale, (r, np.quantile(d, 0.999), scale)
+        # 6e-2: the sigmoid(z) GDN output gate passes ~2x more of the BF16-rounded
+        # GDN output than silu(z) did, so its rounding tail is wider (5.1% at the
+        # 99.9th percentile on the head segment).
+        assert np.quantile(d, 0.999) < 6e-2 * scale, (r, np.quantile(d, 0.999), scale)
         assert d.max() < 1e-1 * scale, (r, d.max(), scale)
 
 
