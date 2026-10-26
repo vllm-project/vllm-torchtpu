@@ -15,6 +15,8 @@ from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import (
     pooled_qsa_shard_pages_step,
     pooled_qsa_shard_select_rows_step,
     pooled_qsa_shard_select_step,
+    pooled_qsa_shared_rows_step,
+    pooled_qsa_shared_step,
     pooled_qsa_step,
     pooled_qsa_token_select_step,
 )
@@ -286,6 +288,108 @@ def build_pooled_qsa_rows_op() -> Callable[..., tuple[torch.Tensor, torch.Tensor
     def run(*args, **kwargs):
         args = list(args)
         for index in (8, 11, 12, 13, 14, 15, 16):
+            args[index] = args[index].to(torch.int32)
+        updated, output, blocks = op(*args, **kwargs)
+        args[10].copy_(updated)
+        return output, blocks
+
+    return run
+
+
+@functools.cache
+def build_pooled_qsa_shared_op(with_rows: bool):
+    """``build_pooled_qsa_op`` (``with_rows``: ``build_pooled_qsa_rows_op``)
+    taking a trailing ``shared`` operand: another layer's ``selected`` for
+    the attended rows, used in place of this layer's indexer selection."""
+    suffix = "_rows" if with_rows else ""
+    op = pallas.jax_op(
+        f"qwen4_exp::pooled_qsa_shared{suffix}",
+        pooled_qsa_shared_rows_step if with_rows else pooled_qsa_shared_step,
+        donate_argnums=(10,),
+    )
+
+    def shapes(qgate, positions, pool, shared, compress_ratio, token_topk):
+        rows = shared.shape[0]
+        return (
+            torch.empty_like(pool),
+            qgate.new_empty((rows, qgate.shape[-1] // 2)),
+            positions.new_empty(
+                (rows, token_topk + compress_ratio - 1), dtype=torch.int32
+            ),
+        )
+
+    if with_rows:
+
+        @op.register_fake
+        def fake_rows(
+            qgate,
+            key,
+            value,
+            index_qk,
+            nq,
+            nk,
+            niq,
+            nik,
+            positions,
+            trig,
+            pool,
+            starts,
+            context,
+            ring_ids,
+            main_table,
+            compressed_table,
+            rows,
+            shared,
+            compress_ratio,
+            token_topk,
+            norm_eps,
+            rotary_dim,
+            k_scale=1.0,
+            v_scale=1.0,
+            compressed_slot=0,
+            main_slot=-1,
+            max_query_len=1,
+        ):
+            return shapes(qgate, positions, pool, shared, compress_ratio, token_topk)
+
+    else:
+
+        @op.register_fake
+        def fake(
+            qgate,
+            key,
+            value,
+            index_qk,
+            nq,
+            nk,
+            niq,
+            nik,
+            positions,
+            trig,
+            pool,
+            starts,
+            context,
+            ring_ids,
+            main_table,
+            compressed_table,
+            shared,
+            compress_ratio,
+            token_topk,
+            norm_eps,
+            rotary_dim,
+            k_scale=1.0,
+            v_scale=1.0,
+            compressed_slot=0,
+            main_slot=-1,
+            max_query_len=1,
+        ):
+            return shapes(qgate, positions, pool, shared, compress_ratio, token_topk)
+
+    ints = (8, 11, 12, 13, 14, 15, 16, 17) if with_rows else (8, 11, 12, 13, 14, 15, 16)
+
+    def run(*args, **kwargs):
+        args = list(args)
+        for index in ints:
             args[index] = args[index].to(torch.int32)
         updated, output, blocks = op(*args, **kwargs)
         args[10].copy_(updated)

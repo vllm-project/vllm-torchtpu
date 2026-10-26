@@ -414,6 +414,11 @@ class Eagle3Proposer:
 
         self._validate_mtp_layer_count()
         self._init_mtp_index_sharing()
+        bind = getattr(self.draft_model, "bind_shared_selection", None)
+        if bind is not None and bind(
+            target_model, self.vllm_config.scheduler_config.max_num_batched_tokens
+        ):
+            logger.info("MTP draft attends the target's last QSA selection.")
         if self._share_mtp_indices:
             self._build_mtp_loop_model()
         self._build_mtp_fused_loop()

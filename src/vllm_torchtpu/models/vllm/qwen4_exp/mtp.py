@@ -39,6 +39,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
+from vllm_torchtpu import envs as vllm_torchtpu_envs
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 from .config import mtp_layer_prefixes
@@ -324,6 +325,41 @@ class Qwen4ExpMTP(nn.Module):
             spec_step_idx,
             draft_rows,
         )
+
+    def bind_shared_selection(self, target_model: nn.Module, max_tokens: int) -> bool:
+        """VLLM_TPU_QSA_DRAFT_SHARED_SELECTION: the draft's QSA layers attend
+        the target's last QSA layer selection instead of their own indexer.
+
+        The target layer writes its ``selected`` rows into a shared buffer;
+        draft step 0 reads each request's last verified row from it and
+        carries those rows to the later steps. Returns whether it bound.
+        """
+        if not vllm_torchtpu_envs.VLLM_TPU_QSA_DRAFT_SHARED_SELECTION:
+            return False
+        backbone = getattr(target_model, "model", None)
+        layers = [
+            layer
+            for layer in getattr(backbone, "layers", ())
+            if getattr(layer, "layer_type", None) == "full_attention"
+        ]
+        drafts = [
+            cast(Qwen4ExpDecoderLayer, layer).self_attn for layer in self.model.layers
+        ]
+        if not layers or any(getattr(a, "_shared_ops", None) is None for a in drafts):
+            return False
+        target = layers[-1].self_attn
+        width = target.max_selected_tokens
+        sink = torch.full(
+            (max_tokens, width), -1, dtype=torch.int32, device=target.rope_cache.device
+        )
+        target.register_buffer("_selection_sink", sink, persistent=False)
+        for attention in drafts:
+            assert attention.max_selected_tokens == width
+            attention.register_buffer("_selection_source", sink, persistent=False)
+            attention.register_buffer(
+                "_selection_rows", torch.full_like(sink, -1), persistent=False
+            )
+        return True
 
     def compute_logits(self, hidden_states, spec_step_idx: int = 0):
         return self.logits_processor(self.lm_head, hidden_states)

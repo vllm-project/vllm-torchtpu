@@ -1117,6 +1117,7 @@ def _pooled_qsa(
     select_only: bool = False,
     shard: tuple[int, int] | None = None,
     token_shard: tuple[jax.Array, int] | None = None,
+    shared: jax.Array | None = None,
 ) -> tuple[jax.Array, ...]:
     """One QSA layer over the unified pool.
 
@@ -1334,19 +1335,22 @@ def _pooled_qsa(
             # The rows' own decode batch: row i owns main table row req[i].
             req = req_rows
         return pool, q, gate, lengths, req, starts, candidates
-    blocks = select_blocks(
-        iq,
-        pool,
-        lengths,
-        compressed_table,
-        req,
-        starts,
-        context,
-        ratio=compress_ratio,
-        block_topk=token_topk // compress_ratio,
-        slot=compressed_slot,
-        max_query_len=max_query_len,
-    )
+    if shared is not None:
+        blocks = shared_blocks(shared, lengths, compress_ratio, token_topk)
+    else:
+        blocks = select_blocks(
+            iq,
+            pool,
+            lengths,
+            compressed_table,
+            req,
+            starts,
+            context,
+            ratio=compress_ratio,
+            block_topk=token_topk // compress_ratio,
+            slot=compressed_slot,
+            max_query_len=max_query_len,
+        )
     if envs.VLLM_TPU_QSA_TOPK_STATS:
         from vllm_torchtpu.kernels.qwen4_exp import topk_stats
 
@@ -1425,6 +1429,23 @@ def _attend(
         output = jnp.where(keep[:, None], output[picked], 0)
         selected = jnp.where(keep[:, None], selected[picked], -1)
     return pool, output, selected
+
+
+def shared_blocks(shared, lengths, compress_ratio, token_topk):
+    """Blocks taken from another layer's selection instead of this indexer.
+
+    ``shared`` is that layer's ``selected`` (``selected_tokens`` layout,
+    ``[rows, token_topk + ratio - 1]``) for the rows attended here: block j
+    sits at columns ``[j * ratio, (j + 1) * ratio)``. Rows whose completed
+    groups all fit keep every visible block, as the indexer would; a group
+    the other layer did not cover falls back to group 0.
+    """
+    block_topk = token_topk // compress_ratio
+    groups = shared[:, :token_topk:compress_ratio]
+    groups = jnp.where(groups >= 0, groups // compress_ratio, 0).astype(jnp.int32)
+    visible = visible_blocks(lengths, compress_ratio, block_topk)
+    fits = (lengths // compress_ratio <= block_topk)[:, None]
+    return jnp.where(fits, visible, groups)
 
 
 def visible_blocks(lengths, compress_ratio, block_topk):
@@ -1890,6 +1911,129 @@ def pooled_qsa_step(
         compressed_slot,
         main_slot,
         max_query_len=max_query_len,
+    )
+
+
+def pooled_qsa_shared_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    shared: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_step`` attending ``shared``'s selection (``shared_blocks``)
+    instead of scoring its own: caches are written as usual, the indexer's
+    scoring and top-k are skipped."""
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        shared=shared,
+    )
+
+
+def pooled_qsa_shared_rows_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    rows: jax.Array,
+    shared: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_rows_step`` with ``pooled_qsa_shared_step``'s selection;
+    ``shared`` holds one row per entry of ``rows``."""
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        rows=rows,
+        shared=shared,
     )
 
 

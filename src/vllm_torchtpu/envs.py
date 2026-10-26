@@ -116,6 +116,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_BF16_REDUCE_PRECISION: bool = False
     VLLM_TPU_QSA_INDEXER_HOIST_META: bool = False
     VLLM_TPU_QSA_INDEXER_MIXED_ONLY: bool = False
+    VLLM_TPU_QSA_DRAFT_SHARED_SELECTION: bool = False
     VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
@@ -619,6 +620,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Qwen4-exp QSA indexer on decode / verify steps: score every request in the
     # mixed pass and drop the two one-token decode passes (empty on verify
     # steps). Bypasses VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK on one-token steps.
+    # Qwen4-exp MTP: the draft's QSA layer attends the target's last QSA layer
+    # selection (the request's last verified row) instead of scoring its own
+    # indexer: a selection-sharing approximation, gated on real AL.
+    "VLLM_TPU_QSA_DRAFT_SHARED_SELECTION": env_bool(
+        "VLLM_TPU_QSA_DRAFT_SHARED_SELECTION"
+    ),
     "VLLM_TPU_QSA_INDEXER_MIXED_ONLY": env_bool(
         "VLLM_TPU_QSA_INDEXER_MIXED_ONLY", default=False
     ),

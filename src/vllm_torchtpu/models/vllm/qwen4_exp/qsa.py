@@ -432,6 +432,17 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             keywords["main_slot"] = main_slot
         self._op = partial(build_pooled_qsa_op(), **keywords)
         self._rows_op = partial(build_pooled_qsa_rows_op(), **keywords)
+        self._shared_ops = None
+        if vllm_torchtpu_envs.VLLM_TPU_QSA_DRAFT_SHARED_SELECTION:
+            from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
+                build_pooled_qsa_shared_op,
+            )
+
+            # (all-token, rows) ops attending another layer's selection.
+            self._shared_ops = (
+                partial(build_pooled_qsa_shared_op(False), **keywords),
+                partial(build_pooled_qsa_shared_op(True), **keywords),
+            )
         # The select op (`select_for_kernel`) is built here, outside the traced
         # forward (jax_op inspects the step signature, which Dynamo cannot trace),
         # and only when the megakernel is enabled: default serving never
@@ -637,6 +648,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         reduce=True,
         replicated_indexer=False,
         token_shard=False,
+        shared=None,
     ):
         """Attention output and selected tokens.
 
@@ -653,7 +665,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         token shard of the step and all-gather the selections, when built.
         """
         output, selected = self.attend_with_indices(
-            hidden, positions, metadata, rows, replicated_indexer, token_shard
+            hidden, positions, metadata, rows, replicated_indexer, token_shard, shared
         )
         output = self.o_proj(output)
         if reduce and self.tp_size > 1:
@@ -672,8 +684,14 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         rows=None,
         replicated_indexer=False,
         token_shard=False,
+        shared=None,
     ):
-        """``forward_with_indices`` without the output projection and all-reduce."""
+        """``forward_with_indices`` without the output projection and all-reduce.
+
+        ``shared`` (pooled, VLLM_TPU_QSA_DRAFT_SHARED_SELECTION): another QSA
+        layer's ``selected`` for the attended rows (one per ``rows`` entry);
+        it replaces this layer's indexer selection.
+        """
         assert len(self.cache_owners) == (1 if self.pooled else 4), (
             "Task4 must bind real or profiling scratch QSA owners"
         )
@@ -706,6 +724,22 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         if token_shard and rows is None and token_shard_op is not None:
             # Takes precedence over the key-sharded indexer in this graph.
             op = partial(token_shard_op, shard_index=self.token_shard_index)
+        shared_ops = getattr(self, "_shared_ops", None)
+        source = getattr(self, "_selection_source", None)
+        if shared is None and source is not None and shared_ops is not None:
+            # An MTP draft bound to the target (bind_shared_selection): step 0
+            # attends each request's last verified row, which is that row of
+            # the target's step; later steps (one row per request, in the same
+            # order) reuse what step 0 took.
+            carried = cast(torch.Tensor, getattr(self, "_selection_rows"))
+            if rows is not None:
+                shared = source[rows.clamp_min(0)]
+                carried[: shared.shape[0]].copy_(shared)
+            else:
+                shared = carried[: hidden.shape[0]]
+        use_shared = shared is not None and shared_ops is not None and not pick_rows
+        if use_shared:
+            op = shared_ops[rows is not None]
         output, selected = op(
             self.q_proj(hidden),
             self.k_proj(hidden),
@@ -724,6 +758,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             metadata.main_block_table,
             metadata.compressed_block_table,
             *(() if rows is None or pick_rows else (rows,)),
+            *((shared,) if use_shared else ()),
             **(
                 {"k_scale": self._k_scale_float, "v_scale": self._v_scale_float}
                 if self.fp8_kv
@@ -735,6 +770,10 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             picked = rows.clamp_min(0)
             output = torch.where(keep, output[picked], 0)
             selected = torch.where(keep, selected[picked], -1)
+        sink = getattr(self, "_selection_sink", None)
+        if sink is not None and rows is None:
+            # The target's selection for the MTP draft (bind_shared_selection).
+            sink[: selected.shape[0]].copy_(selected)
         return output, selected
 
     def select_for_kernel(self, hidden, positions, metadata: QSAMetadata):
