@@ -1338,8 +1338,16 @@ class Qwen38SegmentDriver:
         if rows not in self.buckets or n_req * T_VERIFY > rows:
             self._note(f"stock_rows{rows}_n{n_req}")
             return False, None
-        if self.whole_program is not None and rows > self.whole_max_rows and self.whole_above == "stock":
-            self._note(f"stock_above_whole_b{rows}")
+        if (
+            self.whole_program is not None
+            and self.whole_above == "stock"
+            and not self._whole_eligible(runner, n_req, rows)
+        ):
+            # Above `wholerows` or past `wholecap`: stock, not the segment program, which only
+            # compiles (all its buckets, mid-serving) on its first call (w05 j-84f89805: a c1
+            # AgentX request past the 32K cap started that compile and the sampler RPC timed out).
+            above = rows > min(WHOLE_MAX_ROWS, self.whole_max_rows)
+            self._note(f"stock_above_whole_b{rows}" if above else "stock_whole_ctx")
             return False, None
         self._note(f"mk_b{rows}")
         self.mk_calls += 1
