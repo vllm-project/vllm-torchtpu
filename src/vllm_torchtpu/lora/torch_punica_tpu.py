@@ -78,7 +78,14 @@ class PunicaWrapperTPU(PunicaWrapperBase):
         )
         _write_head(self._token_lora_indices, token_slots)
         _write_head(self._sampler_indices, sampler_slots)
-        _write_head(self._embeddings_indices, np.maximum(token_slots, 0) * vocab_size)
+        _write_head(
+            self._embeddings_indices, np.maximum(token_slots, 0) * np.int32(vocab_size)
+        )
+        # This step's lengths, as PunicaWrapperBase._update_base_metadata
+        # records them; index 2 belongs to a buffer this wrapper never writes.
+        self.indices_len[0] = len(token_slots)
+        self.indices_len[1] = len(sampler_slots)
+        self.indices_len[3] = len(token_slots)
 
     def add_shrink(
         self,
@@ -119,7 +126,7 @@ class PunicaWrapperTPU(PunicaWrapperBase):
         lora_b_stacked: tuple[torch.Tensor, ...],
         output_slices: tuple[int, ...],
         offset_start: int = 0,
-        add_inputs=True,
+        add_inputs: bool | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Performs GEMM for multiple slices of lora_b.
@@ -142,18 +149,21 @@ class PunicaWrapperTPU(PunicaWrapperBase):
             output_slices: Every slice's size.
             offset_start: The column of y where the first slice starts.
             add_inputs: If False, the result holds the LoRA output alone.
+                Defaults to True. vLLM's layers pass it as add_input.
 
         Returns:
             The updated y as a new tensor.
         """
-        assert tuple(b.shape[2] for b in lora_b_stacked) == tuple(output_slices), (
-            f"output_slices {output_slices} do not match the LoRA B widths"
+        torch._assert(
+            tuple(b.shape[2] for b in lora_b_stacked) == tuple(output_slices),
+            f"output_slices {output_slices} do not match the LoRA B widths",
         )
         idx = self._token_lora_indices[: y.size(0)]
         onehot = one_hot_slots(idx, lora_b_stacked[0].shape[0])
         delta = torch.cat(
             [bgmv_expand(x[i], b, onehot) for i, b in enumerate(lora_b_stacked)], dim=-1
         )
+        add_inputs = _resolve_add_inputs(add_inputs, kwargs)
         return _add_delta(y, delta, offset_start, add_inputs)
 
     def add_lora_embedding(
@@ -161,7 +171,7 @@ class PunicaWrapperTPU(PunicaWrapperBase):
         y: torch.Tensor,
         x: torch.Tensor,
         lora_b_stacked: torch.Tensor,
-        add_inputs: bool = True,
+        add_inputs: bool | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Applies LoRA for VocabParallelEmbeddingWithLoRA.
@@ -177,6 +187,7 @@ class PunicaWrapperTPU(PunicaWrapperBase):
             x: The tokens' rows of LoRA A. (num_tokens, max_lora_rank)
             lora_b_stacked: (max_loras, 1, embedding_dim, max_lora_rank)
             add_inputs: If False, the result holds the LoRA output alone.
+                Defaults to True. vLLM's layers pass it as add_input.
 
         Returns:
             The updated y as a new tensor.
@@ -184,6 +195,7 @@ class PunicaWrapperTPU(PunicaWrapperBase):
         idx = self._token_lora_indices[: x.size(0)]
         onehot = one_hot_slots(idx, lora_b_stacked.shape[0])
         delta = bgmv_expand(x, lora_b_stacked, onehot)
+        add_inputs = _resolve_add_inputs(add_inputs, kwargs)
         return _add_delta(y, delta, 0, add_inputs)
 
     def add_lora_linear(
@@ -294,10 +306,30 @@ def _write_head(buf: torch.Tensor, values: np.ndarray) -> None:
     buf[:n].copy_(torch.from_numpy(values))
 
 
+def _resolve_add_inputs(add_inputs: bool | None, kwargs: dict) -> bool:
+    """vLLM's PunicaWrapperBase names the flag add_inputs, but its LoRA layers
+    pass add_input. Without this, add_input=False would fall into kwargs and
+    the wrapper would still add the inputs."""
+    add_input = kwargs.pop("add_input", None)
+    torch._assert(
+        add_inputs is None or add_input is None,
+        f"got both add_inputs={add_inputs} and add_input={add_input}",
+    )
+    if add_inputs is not None:
+        return add_inputs
+    return True if add_input is None else add_input
+
+
 def _add_delta(
     y: torch.Tensor, delta: torch.Tensor, offset: int, add_inputs: bool
 ) -> torch.Tensor:
     """Lays delta over y's columns from offset on. Columns it does not reach,
     such as the vocab padding of logits, get no delta."""
+    # F.pad crops delta on a negative width instead of failing.
+    torch._assert(
+        offset >= 0 and offset + delta.shape[-1] <= y.shape[-1],
+        f"LoRA delta of width {delta.shape[-1]} at column {offset} does not fit "
+        f"y of width {y.shape[-1]}",
+    )
     delta = F.pad(delta, (offset, y.shape[-1] - offset - delta.shape[-1]))
     return y + delta if add_inputs else delta

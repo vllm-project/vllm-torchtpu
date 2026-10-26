@@ -68,6 +68,10 @@ def test_update_metadata_translates_ids_to_slots():
     # Row offsets into the stacked embedding LoRA A; tokens without an
     # adapter read slot 0.
     assert wrapper._embeddings_indices[:8].tolist() == [VOCAB, VOCAB] + [0] * 6
+    # PunicaWrapperBase's properties return only this step's entries.
+    assert wrapper.token_lora_indices.tolist() == TOKEN_SLOTS
+    assert wrapper.sampler_indices.tolist() == REQUEST_SLOTS
+    assert wrapper.indices_len[3] == len(TOKEN_IDS)
 
 
 @pytest.mark.parametrize("token_ids,request_ids", [((5,), (0,)), ((0,), (5,))])
@@ -132,6 +136,58 @@ def test_add_expand_places_the_delta_at_offset_start(add_inputs):
     delta = torch.zeros(8, 20)
     delta[:, 5:17] = _per_token(shrunk[0], lora_b, TOKEN_SLOTS)
     torch.testing.assert_close(out, y + delta if add_inputs else delta)
+
+
+@pytest.mark.parametrize("offset_start", [-1, 9])
+def test_add_expand_rejects_a_delta_outside_y(offset_start):
+    """The 12 delta columns must fit in y's 20 columns; a padding of the wrong
+    sign would crop them silently."""
+    shrunk = torch.randn(1, 8, RANK)
+    lora_b = _stacked(12, RANK)
+    y = torch.randn(8, 20)
+
+    with pytest.raises(AssertionError, match="does not fit"):
+        _wrapper().add_expand(y, shrunk, (lora_b,), (12,), offset_start=offset_start)
+
+
+@pytest.mark.parametrize(
+    "flag,adds_y",
+    [
+        ({}, True),
+        ({"add_inputs": False}, False),
+        ({"add_input": False}, False),
+        ({"add_input": True}, True),
+    ],
+)
+@pytest.mark.parametrize("method", ["add_expand", "add_lora_embedding"])
+def test_add_input_and_add_inputs_set_the_same_flag(method, flag, adds_y):
+    """vLLM's layers pass add_input while the base class names it add_inputs;
+    either one decides whether y is added."""
+    y = torch.randn(8, 12)
+    lora_b = _stacked(12, RANK)
+    if method == "add_expand":
+        args = (y, torch.randn(1, 8, RANK), (lora_b,), (12,))
+    else:
+        args = (y, torch.randn(8, RANK), lora_b)
+    run = getattr(_wrapper(), method)
+
+    out = run(*args, **flag)
+
+    delta = run(*args, add_inputs=False)
+    torch.testing.assert_close(out, y + delta if adds_y else delta)
+
+
+@pytest.mark.parametrize("method", ["add_expand", "add_lora_embedding"])
+def test_add_input_and_add_inputs_together_are_rejected(method):
+    y = torch.randn(8, 12)
+    lora_b = _stacked(12, RANK)
+    if method == "add_expand":
+        args = (y, torch.randn(1, 8, RANK), (lora_b,), (12,))
+    else:
+        args = (y, torch.randn(8, RANK), lora_b)
+
+    with pytest.raises(AssertionError, match="got both"):
+        getattr(_wrapper(), method)(*args, add_inputs=True, add_input=True)
 
 
 def test_add_lora_embedding_expands_the_layers_lookup():
