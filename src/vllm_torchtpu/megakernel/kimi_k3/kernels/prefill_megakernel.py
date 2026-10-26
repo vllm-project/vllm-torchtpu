@@ -3946,11 +3946,17 @@ def _flash_kernel_packed(length_ref, segment_ref, *refs, tile, q_tile, count, pr
         jnp.full((1, q_tile), -jnp.inf, jnp.float32),
         jnp.zeros((128 + _ONES, q_tile), jnp.float32),
     )
+    fp8 = prefixed and pk_buf.dtype == jnp.float8_e4m3fn
+    # FP8 prefix: every probability is 2**PROB_SHIFT larger (exact for BF16 and
+    # FP32; the ratio to the ones-row denominator is unchanged).
+    pshift = PROB_SHIFT if fp8 else 0.0
     if prefixed:
+        pq = q.astype(jnp.float8_e4m3fn) if fp8 else q
         carry = _prefix_phase(
-            carry, q, segment_ref, layer_ref[0], head, first_row, rows, first_row < length,
+            carry, pq, segment_ref, layer_ref[0], head, first_row, rows, first_row < length,
             prefix_k_hbm, prefix_v_hbm, pk_buf, pv_buf, psems, tile=prefix_tile, q_tile=q_tile,
-            count=count)
+            count=count, pshift=pshift,
+            fragment=FP8_FRAGMENT if fp8 else None, exp_bf16=fp8 and FP8_EXP_BF16)
 
     # Blocks [a, b) see every row and need no mask: past the sequence start,
     # wholly before the tile's first row.
@@ -3958,7 +3964,7 @@ def _flash_kernel_packed(length_ref, segment_ref, *refs, tile, q_tile, count, pr
     a = jnp.maximum(first_block, interior)
     a, b = jnp.where(a < b, a, count_blocks), jnp.where(a < b, b, count_blocks)
     loop = functools.partial(_key_loop, q=q, layer=0, head=head, k_hbm=k_hbm, v_hbm=v_hbm, k_buf=k_buf,
-                             v_buf=v_buf, sems=sems, tile=tile)
+                             v_buf=v_buf, sems=sems, tile=tile, pshift=pshift)
     carry = loop(carry, first_block, a, mask=window_mask, value_mask=real)
     carry = loop(carry, a, b, streamed=True)
     carry = loop(carry, b, count_blocks, mask=window_mask, value_mask=real)
@@ -3969,7 +3975,8 @@ def _flash_kernel_packed(length_ref, segment_ref, *refs, tile, q_tile, count, pr
 
 
 def _prefix_phase(carry, q, segment_ref, layer, head, first_row, rows, live, k_hbm, v_hbm, k_buf, v_buf, sems,
-                  *, tile, q_tile, count):
+                  *, tile, q_tile, count, pshift=0.0,
+                  fragment=None, exp_bf16=False):
     """The cached-prefix part of ``_flash_kernel_packed``: fold each
     sequence's arena rows into the online softmax ``carry`` of the query
     tile ``q`` (window ``rows``, from ``first_row``), once per distinct
@@ -4001,7 +4008,8 @@ def _prefix_phase(carry, q, segment_ref, layer, head, first_row, rows, live, k_h
             return (value_rows >= lo_row) & (value_rows < hi_row)
 
         loop = functools.partial(_key_loop, q=q, layer=layer, head=head, k_hbm=k_hbm, v_hbm=v_hbm,
-                                 k_buf=k_buf, v_buf=v_buf, sems=sems, tile=tile)
+                                 k_buf=k_buf, v_buf=v_buf, sems=sems, tile=tile, pshift=pshift,
+                                 fragment=fragment, exp_bf16=exp_bf16)
         # Whole blocks [a, b); without one, [lo, hi) is all edge.
         a, b = (lo_row + tile - 1) // tile, hi_row // tile
         a, b = jnp.where(a < b, a, hi), jnp.where(a < b, b, hi)
@@ -4035,7 +4043,20 @@ def _prefix_phase(carry, q, segment_ref, layer, head, first_row, rows, live, k_h
 # delayed PV follow the scheduling idea in heavyball-research/flywheel-tpu
 # (Apache-2.0), f646686, pallas/fwd_pipeline.py).
 FRAGMENT = 512
+# The FP8 prefix phase's query fragment and exponentials
+# (fragment 256 with BF16 exp2 measured fastest at 4K and 8K windows).
+FP8_FRAGMENT = 256
+FP8_EXP_BF16 = True
+# Rerun an FP8 streamed block exactly when its maximum jumps (else the whole loop).
+FP8_BLOCK_RERUN = True
 _ONES = 8
+_ONES_FP8 = 32  # an E4M3FN sublane tile
+# FP8 prefix probabilities are scaled by 2**PROB_SHIFT so small ones keep E4M3FN
+# precision; a streamed FP8 block may then exceed the carried maximum by at most
+# FP8_STALE_LIMIT before E4M3FN's 448 limit (2**(4 + 4.75) < 448), else the
+# loop reruns exactly.
+PROB_SHIFT = 4.0
+FP8_STALE_LIMIT = 4.75
 # Streamed blocks exponentiate against the maximum of the earlier key
 # blocks; probabilities reach at most 2**STALE_LIMIT before the
 # end-of-block rescale, far inside FP32/BF16 range even summed over a block.
@@ -4043,7 +4064,8 @@ STALE_LIMIT = 64.0
 
 
 def _key_loop(carry, lo, hi, *, q, layer, head, k_hbm, v_hbm, k_buf, v_buf, sems, tile, mask=None,
-              value_mask=None, streamed=False):
+              value_mask=None, streamed=False, pshift=0.0, fragment=None,
+              exp_bf16=False):
     """Fold key blocks ``[lo, hi)`` of arena layer ``layer`` (keys
     ``[L, 3, C, 256]``, values ``[L, 3, 128, C]``) into the transposed online
     softmax ``carry``: ``[1, Q]`` running maxima and ``[128 + _ONES, Q]``
@@ -4082,6 +4104,13 @@ def _key_loop(carry, lo, hi, *, q, layer, head, k_hbm, v_hbm, k_buf, v_buf, sems
                 copy.start()
 
         k, v = k_buf[slot], v_buf[slot]
+        if v.dtype == jnp.float8_e4m3fn:
+            if value_mask is not None:
+                value_keys = key_block * tile + jax.lax.broadcasted_iota(jnp.int32, (1, tile), 1)
+                v = jnp.where(value_mask(value_keys), v.astype(jnp.bfloat16),
+                              jnp.zeros((), jnp.bfloat16)).astype(jnp.float8_e4m3fn)
+            # A full FP8 sublane tile of ones rows; the fold keeps 128 + _ONES rows.
+            return k, jnp.concatenate((v, jnp.ones((_ONES_FP8, tile), v.dtype)), axis=0)
         if value_mask is not None:
             # One row of key indices: the mask varies along the keys only.
             value_keys = key_block * tile + jax.lax.broadcasted_iota(jnp.int32, (1, tile), 1)
@@ -4091,7 +4120,8 @@ def _key_loop(carry, lo, hi, *, q, layer, head, k_hbm, v_hbm, k_buf, v_buf, sems
     def step(key_block, carry):
         k, v = block(key_block)
         key_rows = key_block * tile + jax.lax.broadcasted_iota(jnp.int32, (tile, 1), 0)
-        return _exact_step(q, k, v, carry, None if mask is None else functools.partial(mask, key_rows))
+        return _exact_step(q, k, v, carry, None if mask is None else functools.partial(mask, key_rows),
+                           pshift=pshift, fragment=fragment, exp_bf16=exp_bf16)
 
     def exact(c):
         pl.when(lo < hi)(prime)
@@ -4100,33 +4130,50 @@ def _key_loop(carry, lo, hi, *, q, layer, head, k_hbm, v_hbm, k_buf, v_buf, sems
     if not streamed:
         return exact(carry)
 
+    fp8 = v_buf.dtype == jnp.float8_e4m3fn
+
     def stream(c):
         def body(key_block, state):
             c, worst = state
-            c, gap = _stale_step(q, *block(key_block), c)
-            return c, jnp.maximum(worst, gap)
+            k, v = block(key_block)
+            stale, gap = _stale_step(q, k, v, c, pshift=pshift,
+                                     fragment=fragment, exp_bf16=exp_bf16)
+            if fp8 and FP8_BLOCK_RERUN:
+                # E4M3FN overflows past FP8_STALE_LIMIT: redo only this block
+                # exactly (the running maximum rarely jumps), not the loop.
+                stale = jax.lax.cond(
+                    jnp.max(gap) > FP8_STALE_LIMIT,
+                    lambda: _exact_step(q, k, v, c, None, pshift=pshift,
+                                        fragment=fragment, exp_bf16=exp_bf16),
+                    lambda: stale)
+                return stale, worst
+            return stale, jnp.maximum(worst, gap)
 
         prime()
         first = step(lo, c)
         worst = jnp.full(c[0].shape, -jnp.inf, jnp.float32)
         result, worst = jax.lax.fori_loop(lo + 1, hi, body, (first, worst))
-        return jax.lax.cond(jnp.max(worst) > STALE_LIMIT, exact, lambda _: result, c)
+        limit = FP8_STALE_LIMIT if v_buf.dtype == jnp.float8_e4m3fn else STALE_LIMIT
+        return jax.lax.cond(jnp.max(worst) > limit, exact, lambda _: result, c)
 
     return jax.lax.cond(lo < hi, stream, lambda c: c, carry)
 
 
-def _exact_step(q, k, v, carry, mask):
+def _exact_step(q, k, v, carry, mask, *, pshift=0.0, fragment=None, exp_bf16=False):
     """One key block of the transposed online softmax (``_key_loop``), each
     query's maximum updated before exponentiating (a query may start with
     no key: a -inf maximum). ``v`` is ``[V^T; ones]``."""
     maximum, accumulator = carry
-    fragment = min(FRAGMENT, q.shape[0])
+    fragment = min(fragment or FRAGMENT, q.shape[0])
     maxima, accumulators = [], []
     previous = None
 
+    pdtype = v.dtype
+    rows = accumulator.shape[0]
+
     def fold(sl, probabilities, correction):
         weighted = jax.lax.dot_general(v, probabilities, (((1,), (0,)), ((), ())),
-                                       preferred_element_type=jnp.float32)
+                                       preferred_element_type=jnp.float32)[:rows]
         accumulators.append(accumulator[:, sl] * correction + weighted)
 
     for qi in range(q.shape[0] // fragment):
@@ -4138,7 +4185,11 @@ def _exact_step(q, k, v, carry, mask):
         new_maximum = jnp.maximum(maximum[:, sl], jnp.max(scores, axis=0, keepdims=True))
         # A query with no key yet keeps a -inf maximum; exponentiate against 0.
         safe_maximum = jnp.where(new_maximum == -jnp.inf, 0.0, new_maximum)
-        probabilities = jnp.exp2(scores - safe_maximum).astype(jnp.bfloat16)
+        exponent = scores - safe_maximum if not pshift else scores - (safe_maximum - pshift)
+        if exp_bf16:
+            probabilities = jnp.exp2(exponent.astype(jnp.bfloat16)).astype(pdtype)
+        else:
+            probabilities = jnp.exp2(exponent).astype(pdtype)
         maxima.append(new_maximum)
         if previous is not None:
             fold(*previous)
@@ -4148,7 +4199,7 @@ def _exact_step(q, k, v, carry, mask):
     return jnp.concatenate(maxima, axis=1), jnp.concatenate(accumulators, axis=1)
 
 
-def _stale_step(q, k, v, carry):
+def _stale_step(q, k, v, carry, *, pshift=0.0, fragment=None, exp_bf16=False):
     """One unmasked key block with every query's running maximum finite:
     exponentiate the block's scores against the carried maximum (not the
     block's own), so each score feeds the max and the exponent straight
@@ -4157,13 +4208,21 @@ def _stale_step(q, k, v, carry):
     step. Returns (carry, each query's block maximum less the carried
     one, ``[1, Q]``)."""
     maximum, accumulator = carry
-    fragment = min(FRAGMENT, q.shape[0])
+    fragment = min(fragment or FRAGMENT, q.shape[0])
     maxima, accumulators, gaps = [], [], []
     previous = None
 
+    pdtype = v.dtype
+    rows = accumulator.shape[0]
+
+    def probs(exponent):
+        if exp_bf16:
+            return jnp.exp2(exponent.astype(jnp.bfloat16)).astype(pdtype)
+        return jnp.exp2(exponent).astype(pdtype)
+
     def fold(sl, probabilities, reference, new_maximum):
         weighted = jax.lax.dot_general(v, probabilities, (((1,), (0,)), ((), ())),
-                                       preferred_element_type=jnp.float32)
+                                       preferred_element_type=jnp.float32)[:rows]
         accumulators.append((accumulator[:, sl] + weighted) * jnp.exp2(reference - new_maximum))
 
     for qi in range(q.shape[0] // fragment):
@@ -4172,7 +4231,8 @@ def _stale_step(q, k, v, carry):
                                      preferred_element_type=jnp.float32)  # [keys, queries]
         reference = maximum[:, sl]
         block_maximum = jnp.max(scores, axis=0, keepdims=True)
-        probabilities = jnp.exp2(scores - reference).astype(jnp.bfloat16)
+        exponent = scores - reference if not pshift else scores - (reference - pshift)
+        probabilities = probs(exponent)
         new_maximum = jnp.maximum(reference, block_maximum)
         maxima.append(new_maximum)
         gaps.append(block_maximum - reference)
@@ -4407,8 +4467,9 @@ def _expand_pages_kernel(order_ref, pages_hbm, up_ref, keys_hbm, values_hbm, buf
                 expanded = jnp.dot(x[:, :512], up_ref[:, h * 256:(h + 1) * 256],
                                    preferred_element_type=jnp.float32).astype(jnp.bfloat16)
                 kbuf[slot, h, rows, :] = jnp.concatenate(
-                    (expanded[:, :128], rope, jnp.zeros((page_tokens, 64), jnp.bfloat16)), axis=-1)
-                vbuf[slot, h, :, rows] = expanded[:, 128:].T
+                    (expanded[:, :128], rope, jnp.zeros((page_tokens, 64), jnp.bfloat16)),
+                    axis=-1).astype(kbuf.dtype)
+                vbuf[slot, h, :, rows] = expanded[:, 128:].T.astype(vbuf.dtype)
         for copy in writes(c, slot):
             copy.start()
         return carry
@@ -4444,18 +4505,19 @@ def expand_prefix_pages(pages, order, key_value_up):
     if capacity % span:
         raise ValueError(f"the prefix capacity must be a multiple of {span} tokens")
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    out_dtype = jnp.float8_e4m3fn if _config().prefill_prefix_fp8 else jnp.bfloat16
     keys, values = pl.pallas_call(
         functools.partial(_expand_pages_kernel, heads=heads),
-        out_shape=(jax.ShapeDtypeStruct((heads, capacity, 256), jnp.bfloat16),
-                   jax.ShapeDtypeStruct((heads, 128, capacity), jnp.bfloat16)),
+        out_shape=(jax.ShapeDtypeStruct((heads, capacity, 256), out_dtype),
+                   jax.ShapeDtypeStruct((heads, 128, capacity), out_dtype)),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
             in_specs=[hbm, pl.BlockSpec(memory_space=pltpu.VMEM)],
             out_specs=(hbm, hbm),
             scratch_shapes=(
                 pltpu.VMEM((2, EXPAND_PAGES, page_rows, packing, lanes), pages.dtype),
-                pltpu.VMEM((2, heads, span, 256), jnp.bfloat16),
-                pltpu.VMEM((2, heads, 128, span), jnp.bfloat16),
+                pltpu.VMEM((2, heads, span, 256), out_dtype),
+                pltpu.VMEM((2, heads, 128, span), out_dtype),
                 pltpu.SemaphoreType.DMA((3, 2)),
             ),
         ),
@@ -4531,8 +4593,8 @@ def mla_flash_prefill_packed(query, key, value, length, segments, *, count, tile
                 pltpu.VMEM((2, 128, k_tile), jnp.bfloat16),
                 pltpu.SemaphoreType.DMA((2, 2)),
             ) + ((
-                pltpu.VMEM((2, p_tile, 256), jnp.bfloat16),
-                pltpu.VMEM((2, 128, p_tile), jnp.bfloat16),
+                pltpu.VMEM((2, p_tile, 256), arena[0].dtype),
+                pltpu.VMEM((2, 128, p_tile), arena[1].dtype),
                 pltpu.SemaphoreType.DMA((2, 2)),
             ) if arena is not None else ()),
         ),
