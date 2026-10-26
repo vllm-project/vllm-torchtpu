@@ -715,7 +715,9 @@ class Qwen38SegmentDriver:
             for later in bb.layers[1:]:
                 h = later(h, *args)
             mixed = bb.hyper_connection_mixer.mix(h)[0]
-        n = NS * T
+        # Stats over the live requests' rows only: padded rows are masked to 0
+        # before the stock MoE but not in the kernel.
+        n = n_req * T
         if getattr(self, "h0dump", False):
             self.h0dump = False
             try:
