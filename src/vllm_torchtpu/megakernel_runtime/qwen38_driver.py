@@ -46,7 +46,7 @@ from .driver import (
 )
 from .exported_bridge import make_typed_step_wrapper, sharded_jax_callable
 from .qwen38_mtp_tail import MtpTailKind
-from .qwen38_segment_call import T_VERIFY, build_segment_call, segment_tiles
+from .qwen38_segment_call import GDN_META, T_VERIFY, build_segment_call, segment_tiles
 from .qwen38_weights import head_groups, pack_segment_operands, segment_layers
 
 logger = init_logger(__name__)
@@ -55,7 +55,12 @@ logger = init_logger(__name__)
 # mk-row-slope/report.md vs mk/stock-segment-vs-rows.md); 64 is the margin case.
 # 24 and 48 are serving token buckets too (TPU_TOKEN_BUCKET_EXTRA); without them
 # 24-/48-row verify steps (6 or 12 requests) run stock.
-DEFAULT_BUCKETS = (4, 8, 16, 24, 32, 48, 64)
+# 96 rows (24 requests, the default seat cap; a serving token bucket) runs as row
+# chunks of at most KERNEL_ROWS. 128+ is left out: the segment program shares the
+# stock hyper-connection code, which branches at its 128-row prefill tile.
+DEFAULT_BUCKETS = (4, 8, 16, 24, 32, 48, 64, 96)
+# The segment kernel's row limit (Qwen38InnerGeometry.check: B <= M <= 64).
+KERNEL_ROWS = 64
 
 
 def _parse_buckets(raw: str) -> tuple[int, ...]:
@@ -255,7 +260,10 @@ class _SegmentKind:
             weights: list[torch.Tensor],
             gdn_io: list[torch.Tensor],
         ) -> list[torch.Tensor]:
-            call = self.callable_for(int(hidden.shape[0]))
+            B = int(hidden.shape[0])
+            if B > KERNEL_ROWS:
+                return self._chunked(hidden, attn, weights, gdn_io, B)
+            call = self.callable_for(B)
             if head:
                 return list(call(hidden, *weights, *gdn_io))
             return list(call(hidden, attn, *weights, *gdn_io))
@@ -268,6 +276,32 @@ class _SegmentKind:
             return out
 
         self.op = op
+
+    def _chunked(self, hidden: Any, attn: Any, weights: list, gdn_io: list, B: int) -> list:
+        """`B > KERNEL_ROWS` rows as consecutive kernel calls over request-aligned
+        row chunks. Rows are independent and a request's T_VERIFY rows never
+        straddle a chunk, so this is exact; the GDN pool is threaded through the
+        calls (each donates it to the next) and the per-request metadata sliced.
+        """
+        outs: list = []
+        pool = gdn_io[0] if self.has_gdn else None
+        meta = list(gdn_io[1:])
+        for r0 in range(0, B, KERNEL_ROWS):
+            b = min(KERNEL_ROWS, B - r0)
+            s0, ns = r0 // T_VERIFY, b // T_VERIFY
+            io: list = []
+            if self.has_gdn:
+                io = [pool]
+                for i in range(0, len(meta), GDN_META):
+                    st, off, ck, qsl, seq = meta[i : i + GDN_META]
+                    io += [st[s0 : s0 + ns], off, ck[s0 : s0 + ns], qsl[s0 : s0 + ns + 1], seq[s0 : s0 + ns]]
+            call = self.callable_for(b)
+            h = hidden[r0 : r0 + b]
+            res = call(h, *weights, *io) if self.head else call(h, attn[r0 : r0 + b], *weights, *io)
+            outs.append(res[0])
+            if self.has_gdn:
+                pool = res[1]
+        return [torch.cat(outs, dim=0)] + ([pool] if self.has_gdn else [])
 
     def callable_for(self, B: int) -> Any:
         if B not in self._calls:
@@ -823,7 +857,7 @@ class Qwen38SegmentDriver:
     def _snap(self, gdn_ids: list, NS: int) -> list:
         """A private copy of `gdn_ids`' GDN state blocks plus remapped metadata.
 
-        Fixed capacity (null block + 16 requests x 4 checkpoint columns per GDN
+        Fixed capacity (null block + 32 requests x 4 checkpoint columns per GDN
         layer) so one compiled kind serves every bucket. The real pool is only
         read; take it before the stock layers write this step's checkpoints.
         """
@@ -832,7 +866,7 @@ class Qwen38SegmentDriver:
         if not gdn_ids:
             return []
         segs = self.segments
-        T, CAP = T_VERIFY, 16
+        T, CAP = T_VERIFY, 32
         md_all = get_forward_context().attn_metadata
         pool = segs.pool
         n_blk = 1 + len(gdn_ids) * CAP * T
@@ -985,7 +1019,8 @@ class Qwen38SegmentDriver:
             return
         try:
             kind = MtpTailKind(
-                self.mesh, self.g, self.segments.layout, self.segments.write_ckpts, max(self.buckets)
+                self.mesh, self.g, self.segments.layout, self.segments.write_ckpts,
+                min(max(self.buckets), KERNEL_ROWS),
             )
             tail = MtpTail(draft, self.g, self.mesh, kind, self.buckets)
         except Exception:
