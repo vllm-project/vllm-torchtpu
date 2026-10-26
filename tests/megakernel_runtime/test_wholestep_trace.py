@@ -77,6 +77,8 @@ def test_op_traces_without_guards_on_the_token_count(options):
     assert len(outs) == (3 if options == "union_stats" else 2)
     for v in outs[2:]:  # the stats: static, whatever the token count (the pool follows its input)
         assert all(isinstance(d, int) for d in v.shape), v.shape
+        # Torch sees this rank's shard: one row block per QSA layer, not R of them (w08).
+        assert v.shape[0] == N_ATT, v.shape
 
 
 def test_a_token_count_dependent_fake_shape_is_caught(options):

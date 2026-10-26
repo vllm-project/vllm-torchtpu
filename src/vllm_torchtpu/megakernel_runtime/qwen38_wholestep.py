@@ -72,8 +72,10 @@ class _WholeKind:
         @op.register_fake
         def _(hidden, args):
             out = [torch.empty_like(hidden), torch.empty_like(args[self.pool_index])]
-            if union_stats_on():  # per rank [QSA layers, UNION_STATS_REQS, 1, 128], stacked
-                shape = (mesh.size * len(qsa), UNION_STATS_REQS, 1, 128)  # bucket-independent
+            if union_stats_on():  # this rank's [QSA layers, UNION_STATS_REQS, 1, 128]
+                # Torch sees each rank's shard (w08: a buffer sized for all ranks failed the
+                # copy, [11, 16, 1, 128] -> [88, 16, 1, 128]); bucket-independent.
+                shape = (len(qsa), UNION_STATS_REQS, 1, 128)
                 out.append(hidden.new_empty(shape, dtype=torch.int32))
             return out
 
@@ -149,7 +151,7 @@ class Qwen38WholeStep(nn.Module):
         # Union stats land here inside the compiled call (in place, like the pool); the driver
         # reads them outside it (`log_union_stats`). Room for the largest bucket's requests.
         self.union_stats = (
-            torch.zeros((self.mesh.size * len(self.qsa_ids), UNION_STATS_REQS, 1, 128),
+            torch.zeros((len(self.qsa_ids), UNION_STATS_REQS, 1, 128),
                         dtype=torch.int32, device=pool.device)
             if union_stats_on() else None
         )
