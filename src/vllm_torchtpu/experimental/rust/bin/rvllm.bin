@@ -20,11 +20,17 @@
 #
 # exports the model with `python -m vllm_torchtpu.experimental.export` (once;
 # the artifact is cached by model, export arguments and exporter source) and
-# then runs `rvllm serve <artifact>` with the deployment flags. Arguments that
-# configure the server (--host, --port, --served-model-name, the disaggregation
-# flags, ...) go to rvllm; every other argument goes to the exporter, which
-# records it in the artifact. Other subcommands (bench, proxy, --version) run
-# the rvllm binary directly.
+# then runs `rvllm serve <artifact>`. vLLM's own argument parser splits the
+# command line (see vllm_torchtpu/experimental/rust/launcher_args.py): engine
+# arguments go to the exporter; --host, --port, --served-model-name,
+# --[no-]async-scheduling and --load-format, and rvllm's own flags (--role,
+# --kv-*, ...), go to rvllm. A frontend option rvllm does not implement fails,
+# except those that only affect vLLM's own logs or docs, which print a warning.
+# Both commands are printed before they run.
+#
+# `rvllm.bin bench ...` runs `vllm bench ...`, which works against any
+# OpenAI-compatible server. Other subcommands (proxy, --version) run the rvllm
+# binary directly.
 #
 # The rvllm binary is not part of this repository. RVLLM_BINARY points to it:
 #   RVLLM_BINARY=/path/to/rvllm       a local binary, used as is
@@ -49,36 +55,6 @@ PYTHON="${PYTHON:-python3}"
 die() {
     echo "rvllm.bin: error: $*" >&2
     exit 1
-}
-
-# Flags of `rvllm serve` (its deployment options). They configure the server,
-# not the model, so they are not passed to the exporter.
-SERVE_VALUE_FLAGS=(
-    --host --port --served-model-name
-    --max-queued-requests --max_queued_requests --shutdown-timeout --shutdown_timeout
-    --structured-decoding-mode --structured_decoding_mode
-    --role --kv-role --kv_role --kv-port --kv_port --kv-transfer-port
-    --kv-listen --kv_listen --kv-teleport-listen --kv-advertise --kv_advertise
-    --kv-producers --kv_producers
-    --debug-max-blocks --debug_max_blocks --pjrt-cpu-device-count --pjrt_cpu_device_count
-    --prompt --max-tokens --max_tokens
-)
-SERVE_BOOL_FLAGS=(
-    --async-scheduling --async_scheduling --no-async-scheduling --no_async_scheduling
-    --debug-dummy-weight --debug_dummy_weight --debug-dummy-compute --debug_dummy_compute
-)
-# Flags both sides read: the exporter writes dummy weights for
-# `--load-format dummy`, and rvllm then loads none.
-SHARED_VALUE_FLAGS=(--load-format --load_format)
-
-# Whether $1 is one of the remaining arguments.
-is_one_of() {
-    local needle="$1" x
-    shift
-    for x in "$@"; do
-        [ "${x}" = "${needle}" ] && return 0
-    done
-    return 1
 }
 
 sha256_of() {
@@ -153,57 +129,20 @@ exporter_dir() {
 serve() {
     local binary="$1"
     shift
-    local model="" export_args=() serve_args=()
-    # Whether the last argument was a model option still waiting for its value:
-    # the exporter's options are not known here, so a bare word after one of
-    # them is its value. The model comes first, as in `vllm serve <model>`.
-    local export_value_pending=0
-    while [ $# -gt 0 ]; do
-        local arg="$1" name="${1%%=*}"
-        if [[ "${arg}" != -* ]]; then
-            if [ "${export_value_pending}" -eq 1 ]; then
-                export_args+=("${arg}")
-            elif [ -z "${model}" ]; then
-                model="${arg}"
-            else
-                die "unexpected argument '${arg}' (the model is '${model}')"
-            fi
-            export_value_pending=0
-            shift
-            continue
-        fi
-        export_value_pending=0
-        if [ "${name}" = "--model" ]; then
-            if [[ "${arg}" == *=* ]]; then
-                model="${arg#*=}"
-            else
-                [ $# -ge 2 ] || die "--model needs a value"
-                model="$2"
-                shift
-            fi
-        elif is_one_of "${name}" "${SERVE_BOOL_FLAGS[@]}"; then
-            serve_args+=("${arg}")
-        elif is_one_of "${name}" "${SERVE_VALUE_FLAGS[@]}" "${SHARED_VALUE_FLAGS[@]}"; then
-            local pair=("${arg}")
-            if [[ "${arg}" != *=* ]]; then
-                [ $# -ge 2 ] || die "${arg} needs a value"
-                pair+=("$2")
-                shift
-            fi
-            serve_args+=("${pair[@]}")
-            if is_one_of "${name}" "${SHARED_VALUE_FLAGS[@]}"; then
-                export_args+=("${pair[@]}")
-            fi
-        elif [ "${name}" = "--output-dir" ] || [ "${name}" = "--export-mode" ]; then
-            die "${name} is chosen by rvllm.bin; set RVLLM_ARTIFACT_DIR to serve an existing artifact"
-        else
-            # A model argument: the exporter takes the `vllm serve` command line
-            # and records in the artifact what the runtime needs.
-            export_args+=("${arg}")
-            [[ "${arg}" == *=* ]] || export_value_pending=1
-        fi
-        shift
-    done
+    # vLLM's parser splits the command line; see launcher_args.py.
+    local split model="" export_args=() serve_args=() kind value
+    split="$(mktemp)"
+    # shellcheck disable=SC2064 # expand ${split} now
+    trap "rm -f '${split}'" RETURN
+    "${PYTHON}" -m vllm_torchtpu.experimental.rust.launcher_args "$@" >"${split}" || exit 1
+    while IFS= read -r -d '' kind && IFS= read -r -d '' value; do
+        case "${kind}" in
+            M) model="${value}" ;;
+            E) export_args+=("${value}") ;;
+            S) serve_args+=("${value}") ;;
+            W) echo "rvllm.bin: warning: ${value}" >&2 ;;
+        esac
+    done <"${split}"
 
     local artifact="${RVLLM_ARTIFACT_DIR:-}"
     if [ -z "${artifact}" ]; then
@@ -214,11 +153,13 @@ serve() {
         key="$(printf '%s\0' "${model}" "${export_args[@]}" "${source_hash}" | sha256sum | cut -c1-24)"
         artifact="${CACHE_DIR}/artifacts/${key}"
         if [ ! -f "${artifact}/.complete" ]; then
+            local export_cmd=("${PYTHON}" -m vllm_torchtpu.experimental.export "${model}"
+                --output-dir "${artifact}.partial" --export-mode all "${export_args[@]}")
             echo "rvllm.bin: exporting ${model} to ${artifact}" >&2
+            echo "rvllm.bin: export command: $(printf '%q ' "${export_cmd[@]}")" >&2
             rm -rf "${artifact}.partial"
             mkdir -p "$(dirname "${artifact}")"
-            "${PYTHON}" -m vllm_torchtpu.experimental.export "${model}" \
-                --output-dir "${artifact}.partial" --export-mode all "${export_args[@]}"
+            "${export_cmd[@]}"
             rm -rf "${artifact}"
             mv "${artifact}.partial" "${artifact}"
             touch "${artifact}/.complete"
@@ -226,7 +167,9 @@ serve() {
             echo "rvllm.bin: serving the cached export ${artifact}" >&2
         fi
     fi
-    exec "${binary}" serve "${artifact}" "${serve_args[@]}"
+    local serve_cmd=("${binary}" serve "${artifact}" "${serve_args[@]}")
+    echo "rvllm.bin: serve command: $(printf '%q ' "${serve_cmd[@]}")" >&2
+    exec "${serve_cmd[@]}"
 }
 
 main() {
@@ -234,6 +177,9 @@ main() {
         "" | -h | --help)
             sed -n '/^# Serves a model/,/^# *PYTHON /p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
             return
+            ;;
+        bench)
+            exec "${PYTHON}" -m vllm.entrypoints.cli.main "$@"
             ;;
     esac
     # A failed command substitution stops the script only in an assignment.

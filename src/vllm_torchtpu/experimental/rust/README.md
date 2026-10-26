@@ -23,26 +23,40 @@ next start skips the export. The server speaks the OpenAI-compatible API on
 
 ## Arguments
 
-The script splits the `vllm serve` command line in two:
+vLLM's own `vllm serve` parser splits the command line
+([`launcher_args.py`](launcher_args.py)), so option names, short forms and
+values are exactly vLLM's:
 
-- **Deployment flags go to rvllm.** These are `--host`, `--port`,
-  `--served-model-name`, `--max-queued-requests`, `--shutdown-timeout` and
-  `--structured-decoding-mode`. The disaggregation flags `--role`,
-  `--kv-port`, `--kv-listen`, `--kv-advertise` and `--kv-producers` go to
-  rvllm too, as do `--async-scheduling` and `--no-async-scheduling`.
-  `--load-format` goes to both rvllm and the exporter.
-- **Everything else goes to the exporter**, which records in the artifact what
-  the runtime needs. Examples are `--max-model-len`, `--tensor-parallel-size`,
+- **Engine arguments go to the exporter.** These are the fields of vLLM's
+  `AsyncEngineArgs`, such as `--max-model-len`, `--tensor-parallel-size`,
   `--max-num-seqs`, `--quantization` and `--speculative-config`. The exporter
-  ignores options that only configure vLLM's own API server.
+  records in the artifact what the runtime needs.
+- **Some options go to rvllm.** `--host`, `--port`, `--served-model-name` and
+  `--[no-]async-scheduling` set the server and its runtime behavior.
+  `--load-format` goes to both rvllm and the exporter.
+- **rvllm's own deployment flags go to rvllm.** `vllm serve` has no such flags:
+  `--role`, `--kv-port`, `--kv-listen`, `--kv-advertise`, `--kv-producers`,
+  `--max-queued-requests`, `--shutdown-timeout` and
+  `--structured-decoding-mode`.
+- **No option is silently ignored.**
+  - A frontend option that only affects vLLM's own logs, docs or HTTP limits
+    is dropped with a warning: `--uvicorn-log-level`, `--max-log-len`,
+    `--disable-fastapi-docs`, `--api-server-count`, and a few more.
+  - Every other option rvllm does not implement fails before anything runs,
+    for example `--api-key`, `--chat-template`, `--enable-auto-tool-choice`
+    and `--ssl-*`. So does an option `vllm serve` does not know.
+  - Disaggregated serving uses rvllm's flags: `--kv-transfer-config` fails
+    and says which flags to use.
 
-Put the model first, as in `vllm serve <model>`. The exporter's options are
-not known to the script, so it takes a bare word after an option as that
-option's value.
+The script prints the export command and the `rvllm serve` command before it
+runs them.
 
-`bench` and `proxy` run the rvllm binary directly:
+`rvllm.bin bench ...` runs `vllm bench ...`, which benchmarks any
+OpenAI-compatible server and needs no rvllm binary. `proxy` and `--version`
+run the rvllm binary directly:
 
 ```bash
+rvllm.bin bench serve --model Qwen/Qwen3-0.6B --max-concurrency 8 ...
 rvllm.bin proxy --port 8000 --prefiller-hosts p --prefiller-ports 8100 \
   --decoder-hosts d --decoder-ports 8200
 ```
