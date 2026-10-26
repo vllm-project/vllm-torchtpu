@@ -82,6 +82,86 @@ def test_kimi_moe_init_acquires_latent_allreduce_and_intra_chip_shared_groups(
     assert mlp_kwargs["tp_group"] is intra_group
 
 
+def test_kimi_moe_init_defaults_to_tp32_shared_experts_and_fused_moe_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """By default when TPU_K3_SP_PREFILL=False, KimiMoE keeps shared_experts at
+    TP=32 (shared_group=None) and pipe_chunks=1, delegating forward() to
+    self.experts (FusedMoEFactory / MoERunner)."""
+    monkeypatch.delenv("TPU_K3_MOE_LATENT_AR_OVERLAP", raising=False)
+    monkeypatch.delenv("TPU_K3_MOE_PIPE_CHUNKS", raising=False)
+    monkeypatch.setattr(kimi_moe.envs, "TPU_K3_SP_PREFILL", False)
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(enable_expert_parallel=True)
+    )
+    monkeypatch.setattr(
+        kimi_moe, "get_current_vllm_config_or_none", lambda: vllm_config
+    )
+    monkeypatch.setattr(kimi_moe, "get_tensor_model_parallel_world_size", lambda: 32)
+    intra_group = SimpleNamespace(world_size=2, rank_in_group=0)
+    tp_group = SimpleNamespace(world_size=32, rank_in_group=0)
+    monkeypatch.setattr(kimi_moe, "get_intra_chip_group", lambda: intra_group)
+    monkeypatch.setattr(kimi_moe, "get_tp_group", lambda: tp_group)
+
+    mlp_kwargs: dict = {}
+    runner_calls: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+
+    class FakeMLP(nn.Module):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__()
+            mlp_kwargs.update(kwargs)
+
+    class FakeGate(nn.Module):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__()
+
+        def forward(self, x: torch.Tensor):
+            return x[:, :8], None
+
+    class FakeRunner(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.routed_experts = SimpleNamespace(
+                quant_method=SimpleNamespace(apply_monolithic=lambda *a: a[1])
+            )
+            self.moe_config = SimpleNamespace()
+
+        def forward(
+            self, *, hidden_states: torch.Tensor, router_logits: torch.Tensor
+        ) -> torch.Tensor:
+            runner_calls.append(
+                (tuple(hidden_states.shape), tuple(router_logits.shape))
+            )
+            return hidden_states * 2.0
+
+    monkeypatch.setattr(kimi_moe, "KimiMLP", FakeMLP)
+    monkeypatch.setattr(kimi_moe, "GateLinear", FakeGate)
+    monkeypatch.setattr(kimi_moe, "make_latent_projection", FakeGate)
+    monkeypatch.setattr(kimi_moe, "RMSNorm", FakeGate)
+    monkeypatch.setattr(kimi_moe, "FusedMoEFactory", lambda **kwargs: FakeRunner())
+
+    config = KimiLinearConfig(
+        hidden_size=32,
+        routed_expert_hidden_size=16,
+        hidden_act="silu",
+        num_experts=8,
+        num_experts_per_token=2,
+        num_shared_experts=1,
+        moe_intermediate_size=1024,
+    )
+    layer = kimi_moe.KimiMoE(config, quant_config=None, prefix="moe")
+    assert layer.shared_group is None
+    assert layer.prefill_group is None
+    assert layer.pipe_chunks == 1
+    assert mlp_kwargs["tp_group"] is None
+    assert mlp_kwargs["reduce_results"] is False
+
+    x = torch.ones((4, 32), dtype=torch.float32)
+    out = layer(x, sequence_parallel=False)
+    assert runner_calls == [((4, 32), (4, 8))]
+    torch.testing.assert_close(out, x * 2.0)
+
+
 def test_kimi_moe_schedules_shared_experts_between_allreduce_and_routed_up_proj() -> None:
     """shared_experts must launch immediately after group.all_reduce(output) and
     before routed_expert_norm / routed_expert_up_proj so XLA overlaps shared_experts

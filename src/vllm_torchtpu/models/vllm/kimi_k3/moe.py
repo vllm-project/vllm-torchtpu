@@ -128,7 +128,7 @@ class KimiMoE(nn.Module):
 
         self.prefill_group = None
         self.shared_group = None
-        self.pipe_chunks = int(os.environ.get("TPU_K3_MOE_PIPE_CHUNKS", "2"))
+        self.pipe_chunks = int(os.environ.get("TPU_K3_MOE_PIPE_CHUNKS", "1"))
         if envs.TPU_K3_SP_PREFILL:
             self.prefill_group = FusedPrefillCollectives(prefix)
             self.shared_group = get_intra_chip_group()
@@ -137,7 +137,7 @@ class KimiMoE(nn.Module):
         elif (
             self.use_ep
             and self.tp_size == 32
-            and os.environ.get("TPU_K3_MOE_LATENT_AR_OVERLAP", "1") != "0"
+            and os.environ.get("TPU_K3_MOE_LATENT_AR_OVERLAP", "0") == "1"
         ):
             try:
                 intra_group = get_intra_chip_group()
@@ -282,7 +282,7 @@ class KimiMoE(nn.Module):
         routed = self.experts.routed_experts
         pipe_chunks = getattr(self, "pipe_chunks", None)
         if pipe_chunks is None:
-            pipe_chunks = int(os.environ.get("TPU_K3_MOE_PIPE_CHUNKS", "2"))
+            pipe_chunks = int(os.environ.get("TPU_K3_MOE_PIPE_CHUNKS", "1"))
         if (
             not sequence_parallel
             and pipe_chunks > 1
