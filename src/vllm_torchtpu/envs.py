@@ -222,6 +222,7 @@ if TYPE_CHECKING:
     TPU_INDEXER_QB_OVERLAP: bool = False
     TPU_QB_OVERLAP_HONORS_SKIP_TOPK: bool = False
     TPU_SPARSE_MLA_PACKED_ROPE: bool = False
+    TPU_SPARSE_MLA_GATHER_PACKED_ROPE: bool = False
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
     TPU_NODE_ID: int = 0
@@ -1024,6 +1025,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gather expands the rows back to the padded format the attention kernel
     # reads. Changes the cache layout: a disagg pair must agree on it.
     "TPU_SPARSE_MLA_PACKED_ROPE": env_bool("TPU_SPARSE_MLA_PACKED_ROPE", default=False),
+    # Live-group (mixed / prefill) DCP sparse MLA chunks: the SparseCore gather
+    # writes each key's 64 rope bytes without the 64-byte zero tail (eight keys
+    # per 128-word row) and the attention kernel restores the tail in VMEM, so
+    # the tail never crosses HBM. Same scores bit for bit. Either cache layout;
+    # with TPU_SPARSE_MLA_PACKED_ROPE no rope zero byte is read or written.
+    "TPU_SPARSE_MLA_GATHER_PACKED_ROPE": env_bool(
+        "TPU_SPARSE_MLA_GATHER_PACKED_ROPE", default=False
+    ),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS": lambda: os.getenv("JAX_PLATFORMS", "").lower(),
     # TPU accelerator type (e.g., "v5litepod-16", "v4-8")

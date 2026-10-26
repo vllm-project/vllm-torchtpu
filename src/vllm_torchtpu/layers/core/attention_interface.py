@@ -1655,6 +1655,12 @@ def sparse_mla_attention_dcp(
             **chunk_kwargs,
             **split_kwargs,
             **packed_rope_kwargs,
+            **(
+                {"packed_gather": True}
+                if envs.TPU_SPARSE_MLA_GATHER_PACKED_ROPE
+                and cache_layout == sparse_mla_kernel.SPARSECORE_CACHE_LAYOUT
+                else {}
+            ),
         )
         output, lse = attn[:2]
         if kv_write is not None:
