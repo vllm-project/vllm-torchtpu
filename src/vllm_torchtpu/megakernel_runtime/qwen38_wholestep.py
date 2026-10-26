@@ -29,10 +29,13 @@ from typing import Any
 import torch
 from torch import nn
 
-from .qwen38_segment_call import T_VERIFY
-from .qwen38_wholestep_call import indexed_options, wholestep_tiles
+from vllm_torchtpu.logger import init_logger
 
+from .qwen38_segment_call import T_VERIFY
 from .qwen38_wholestep_cache import QSALayerCache
+from .qwen38_wholestep_call import indexed_options, union_stats_on, wholestep_tiles
+
+logger = init_logger(__name__)
 
 FIRST_LAYER, LAST_LAYER = 3, 47  # kernel covers model layers [FIRST_LAYER, LAST_LAYER)
 L_WHOLE = LAST_LAYER - FIRST_LAYER
@@ -67,7 +70,15 @@ class _WholeKind:
 
         @op.register_fake
         def _(hidden, args):
-            return [torch.empty_like(hidden), torch.empty_like(args[self.pool_index])]
+            out = [torch.empty_like(hidden), torch.empty_like(args[self.pool_index])]
+            if union_stats_on():  # per rank [QSA layers, requests, 1, 128], stacked over ranks
+                from vllm_torchtpu.megakernel.exec_spec import ExecSpec
+
+                B = int(hidden.shape[0])
+                ex = ExecSpec(R=mesh.size, B=B, T=T_VERIFY, ctx=128, tiles=wholestep_tiles(B))
+                shape = (mesh.size * len(qsa), ex.M // T_VERIFY, 1, 128)
+                out.append(hidden.new_empty(shape, dtype=torch.int32))
+            return out
 
         self.op = op
         self.pool_index = -1
@@ -175,6 +186,32 @@ class Qwen38WholeStep(nn.Module):
         w = self._ops if self.hold == "list" else [getattr(self, f"w_{i}") for i in range(self.n_w)]
         args = [*w, self.pool, *meta, *tables, positions.to(torch.int32),
                 query_start_loc.to(torch.int32), context_lens.to(torch.int32), rope, *norms]
-        res, pool = self.kind.op(hidden, args)
+        outs = self.kind.op(hidden, args)
+        res, pool = outs[0], outs[1]
         self.pool.copy_(pool)
+        if len(outs) > 2:
+            self._log_union_stats(outs[2])
         return res
+
+    def _log_union_stats(self, stats: torch.Tensor) -> None:
+        """Every `wholestats=N` calls: how much a request's verify rows share (rank 0's rows;
+        the selection is replicated). Reading the small tensor syncs that one step only."""
+        from .qwen38_wholestep_call import UNION_STATS_EVERY
+
+        self._stat_calls = getattr(self, "_stat_calls", 0) + 1
+        if self._stat_calls % UNION_STATS_EVERY:
+            return
+        s = stats[: len(self.qsa_ids), :, 0, :4].to("cpu").to(torch.int64)
+        union, total, mx, rows = s[..., 0], s[..., 1], s[..., 2], s[..., 3]
+        live = (union > 0) & (rows > 1)
+        if not bool(live.any()):
+            return
+        u, t, m = union[live].double(), total[live].double(), mx[live].double()
+        share = t / u  # 1 = disjoint rows, rows-per-request = identical selections
+        q = torch.quantile(share, torch.tensor([0.1, 0.5, 0.9], dtype=torch.float64))
+        logger.info(
+            "Qwen3.8 whole-step union stats (call %d, %d layer-requests): rows' groups / union "
+            "p10 %.2f p50 %.2f p90 %.2f; union / max row p50 %.2f; mean union %.0f groups",
+            self._stat_calls, int(live.sum()), q[0], q[1], q[2],
+            float(torch.quantile(u / m, 0.5)), float(u.mean()),
+        )

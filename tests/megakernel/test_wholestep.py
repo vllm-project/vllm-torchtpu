@@ -207,7 +207,7 @@ CTX_C = [3001, 100]  # request 0: g_a holds one old token; request 1: g_a starts
 
 
 def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, rank_ids: bool = False,
-           union: bool = False):
+           union: bool = False, stats: bool = False):
     from vllm_torchtpu.megakernel.wholestep.qsa_full_b import DBG_IDS, DBG_IQ
     from vllm_torchtpu.megakernel.wholestep.qsa_full_c import CK_NEW, IR_NEW, KR_NEW, RING_NEW
 
@@ -223,7 +223,8 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
     steps = d.pop("_step_out")
     pps = d["mtab"].shape[1]
     long_kw = dict(carrier="bf16", chunk_pages=8, hbm_tables=True, per_request_scores=True,
-                   bounded_chunks=True, shard_index=shard, union_attn=union)
+                   bounded_chunks=True, shard_index=shard, union_attn=union,
+                   union_stats=stats)
     spec = wholestep_spec(
         G, R, L=L, qsa=dict(budget=BUDGET), step=True,
         indexed=dict(max_groups=MAX_GROUPS, pages_per_seq=pps, debug=True, **(long_kw if long else {})),
@@ -247,6 +248,10 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
     x0 = np.asarray(d["inp"].x[:B], np.float32)
     d["_kr_new"] = np.asarray(outs[KR_NEW], np.float32).reshape(R, n_att, ex.M, -1)[:, :, :B]
     d["_ir_new"] = np.asarray(outs[IR_NEW], np.float32).reshape(R, n_att, ex.M, -1)[:, :, :B]
+    if stats:
+        from vllm_torchtpu.megakernel.wholestep.qsa_full_c import UNION_STATS
+
+        d["_stats"] = np.asarray(outs[UNION_STATS]).reshape(R, n_att, nreq, -1)
     return res, np.asarray(ref, np.float32), x0, ck, ring, steps, iq, ids, d
 
 
@@ -316,6 +321,26 @@ def test_union_attention_matches_per_row(monkeypatch):
     monkeypatch.setattr(ua, "compact_union", broken)
     with pytest.raises(AssertionError):
         close(_run_c(long=True, rank_ids=True, union=True))
+
+
+def test_union_stats_count_the_rows_selections():
+    """`union_stats`: per QSA layer and request, `[union size, sum of the rows' pool-path
+    groups, max row, rows with groups]`, equal on every rank to the counts from the ids."""
+    run = _run_c(long=True, rank_ids=True, union=True, shard=True, stats=True)
+    ids, d = run[7][0], run[8]
+    st = d["_stats"]
+    for o in range(ids.shape[0]):
+        for q in range(len(CTX_C)):
+            ga = int(d["ctxq"][q]) // 4
+            sets = []
+            for t in range(4):
+                r = q * 4 + t
+                n = min(int(d["nvis"][r]), BUDGET)
+                sets.append({int(x) for x in ids[o, r, :n] if x < ga})
+            want = [len(set().union(*sets)), sum(map(len, sets)), max(map(len, sets)),
+                    sum(1 for x in sets if x)]
+            for r in range(st.shape[0]):
+                assert st[r, o, q, :4].tolist() == want, (r, o, q, st[r, o, q, :4], want)
 
 
 def test_step_tokens_match_stock_semantics():

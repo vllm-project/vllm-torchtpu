@@ -648,6 +648,11 @@ class Qwen38SegmentDriver:
             from . import qwen38_wholestep_call
 
             qwen38_wholestep_call.UNION_ATTN = True
+        every = _parse_int(raw, "wholestats")
+        if every:
+            from . import qwen38_wholestep_call
+
+            qwen38_wholestep_call.UNION_STATS_EVERY = every
         rows_max = _parse_int(raw, "wholerows")
         if rows_max is not None:
             drv.whole_max_rows = rows_max

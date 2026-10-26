@@ -56,6 +56,7 @@ RING_NEW = "qsa_ring_new"
 # Projections the post-kernel scatter feeds to the stock cache writers
 # (`pooled_qsa.qsa_cache_writes`): the un-normed key and the raw index key per row.
 KR_NEW = "qsa_kr_new"
+UNION_STATS = "qsa_union_stats"  # [requests, 1, 128] int32 per QSA layer (`union_stats`)
 IR_NEW = "qsa_ir_new"
 FP8_MAX = 448.0
 
@@ -90,11 +91,13 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             StateDecl(RING_NEW, (nreq, 8, ix.IDX_DIM), BF16, "w"),
             StateDecl(KR_NEW, (ex.M, g.HD), BF16, "w"),
             StateDecl(IR_NEW, (ex.M, ix.IDX_DIM), BF16, "w"),
-        ]
+        ] + ([StateDecl(UNION_STATS, (nreq, 1, 128), I32, "w")] if self.union_stats else [])
 
     def host_update_states(self, g, ex, pos, states, raw_outputs):  # noqa: ANN001
         out = super().host_update_states(g, ex, pos, states, raw_outputs)
         out.update({k: raw_outputs[k] for k in (CK_NEW, RING_NEW, KR_NEW, IR_NEW)})
+        if self.union_stats:
+            out[UNION_STATS] = raw_outputs[UNION_STATS]
         return out
 
     def extra_inputs(self, g: Any, ex: ExecSpec) -> list[ExtraInput]:
@@ -136,7 +139,8 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             ScratchReq("qu_cd", pltpu.VMEM((nreq, 1, KU), I32)),
             ScratchReq("qu_n", pltpu.SMEM((nreq,), I32)),
             ScratchReq("qu_row", pltpu.SMEM((1, KU + 128), I32)),
-            ScratchReq("qu_sem", pltpu.SemaphoreType.DMA((2,))),
+            ScratchReq("qu_sem", pltpu.SemaphoreType.DMA((3,))),
+            ScratchReq("qu_st", pltpu.VMEM((1, 128), I32)),
         ]
         if self.shard_index:
             npr, n = self._shard_rows(ex)[0], max(ex.R - 1, 1)
@@ -540,6 +544,23 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 scale_v=ctx.extra[SCALES][1], sm_scale=g.HD**-0.5, interpret=ex.interpret,
                 recent=(scr["qc_rk"][q], scr["qc_rv"][q], ok, ok_any),
             )
+            if self.union_stats:
+                kept = [scr["qi_kvl"][r] // 4 for r in rs]
+                lane = jax.lax.broadcasted_iota(I32, (1, 128), 1)
+                vals = [scr["qu_n"][q], sum(kept[1:], kept[0]), kept[0], (kept[0] > 0).astype(I32)]
+                for k in kept[1:]:
+                    vals[2] = jnp.maximum(vals[2], k)
+                    vals[3] = vals[3] + (k > 0).astype(I32)
+                st = jnp.zeros((1, 128), I32)
+                for i, v in enumerate(vals):
+                    st = jnp.where(lane == i, v, st)
+                scr["qu_st"][...] = st
+                cp = pltpu.make_async_copy(
+                    scr["qu_st"], ctx.O[UNION_STATS].at[ctx.stream.sp.block_ord(l, self.name), q],
+                    scr["qu_sem"].at[2],
+                )
+                cp.start()
+                cp.wait()
             outs = list(outs)
             for t, r in enumerate(rs):
                 for h in range(nh):

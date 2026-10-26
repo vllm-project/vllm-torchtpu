@@ -32,7 +32,7 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
 from vllm_torchtpu.megakernel.models.qwen38_step import make_flat_segment_step
-from vllm_torchtpu.megakernel.wholestep.qsa_full_c import IR_NEW, KR_NEW
+from vllm_torchtpu.megakernel.wholestep.qsa_full_c import IR_NEW, KR_NEW, UNION_STATS
 from vllm_torchtpu.megakernel.wholestep.qsa_full import KV_NEW
 from vllm_torchtpu.megakernel.wholestep.spec import wholestep_spec
 
@@ -53,11 +53,20 @@ SHARD_INDEX = False
 # `...,wholeunion=1`: each request's verify rows attend one union of their selections, streamed
 # once (`QSAFullIndexedBlock.union_attn`; same tokens per row, f32 order of the softmax tiles).
 UNION_ATTN = False
+# `...,wholestats=N` (with `wholeunion=1`): the call also returns per QSA layer and request the
+# union size vs the rows' selections (`qsa_union_stats`); the runner logs them every N calls.
+UNION_STATS_EVERY = 0
+
+
+def union_stats_on() -> bool:
+    return UNION_ATTN and UNION_STATS_EVERY > 0
 
 
 def indexed_options() -> dict:
     """The served indexer options (`LONG_CONTEXT`, the request-sharded selection, union attention)."""
-    return dict(LONG_CONTEXT, shard_index=SHARD_INDEX, union_attn=UNION_ATTN)
+    return dict(
+        LONG_CONTEXT, shard_index=SHARD_INDEX, union_attn=UNION_ATTN, union_stats=union_stats_on()
+    )
 
 
 def wholestep_tiles(B: int) -> Tiles:
@@ -97,7 +106,10 @@ def build_wholestep_call(
         g, R, L=L, first="qsa", pool_gdn=True, qsa=dict(budget=budget), step=True,
         indexed=dict(max_groups=max_groups, pages_per_seq=pps, carrier="fp8", n_layers=n_att, **indexed_options()),
     )
-    fn, k_specs, _, n_w = make_flat_segment_step(mesh, spec, ex, extra_outs=(KV_NEW, KR_NEW, IR_NEW))
+    stats = union_stats_on()
+    fn, k_specs, _, n_w = make_flat_segment_step(
+        mesh, spec, ex, extra_outs=(KV_NEW, KR_NEW, IR_NEW) + ((UNION_STATS,) if stats else ())
+    )
     M, NS = ex.M, B // T
     tp, rep = P("tp"), P()
     # Planned global weight shapes: the packer hands tiled operands over 3-D ([L*nt, tk, N],
@@ -193,14 +205,14 @@ def build_wholestep_call(
         xs = dict(zip(names, inputs(pool, tables, positions, starts, context, trig)))
         xs.update(gdn_pool=pool, gdn_rb=rb, gdn_hi=hi.astype(jnp.int32))
         outs = fn(pos0, x, *(xs[k] for k in fn.extra_names), *w)
-        res, conv_ck, rec_ck, kv, kr, ir = outs
+        res, conv_ck, rec_ck, kv, kr, ir = outs[:6]
         pool = writes(pool, conv_ck, rec_ck, wb, kv, kr, ir, tables, positions, starts, context,
                       trig, norms)
-        return unpad(res), pool
+        return (unpad(res), pool, outs[6]) if stats else (unpad(res), pool)
 
     in_specs = (
         (tp,) + (tp,) * n_w + (tp,) + (rep,) * n_meta + (rep,) * n_tab + (rep,) * 4
         + (rep,) * (2 * n_att)
     )
-    return call, in_specs, (tp, tp), (1 + n_w,)
+    return call, in_specs, (tp, tp, tp) if stats else (tp, tp), (1 + n_w,)
 
