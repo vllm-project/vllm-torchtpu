@@ -224,6 +224,7 @@ def _kernel(
     kv_head_offset: int = 0,
     bf16_mxu: bool = False,
     query_tile: int = 256,
+    lean: bool = False,
 ):
     block = pl.program_id(0)
     # The model produces BF16 queries.  A BF16 call boundary can avoid a large
@@ -349,7 +350,11 @@ def _kernel(
             if kv_ref.dtype == jnp.float8_e4m3fn:
                 key = key.astype(jnp.float32)
                 value = value.astype(jnp.float32)
-                key = jnp.where(jnp.isfinite(key) & written, key, 0)
+                # A key only reaches visible (written, finite) scores through
+                # the mask select below, so lean skips its guard. Values keep
+                # theirs: a masked probability is 0, and 0 x NaN is NaN.
+                if not lean:
+                    key = jnp.where(jnp.isfinite(key) & written, key, 0)
                 value = jnp.where(jnp.isfinite(value) & written, value, 0)
             else:
                 key = jnp.where(written, key, 0)
@@ -671,6 +676,7 @@ def block_sparse_gqa_prefill(
             **({"kv_head_offset": kv_head_offset} if kv_head_offset else {}),
             **({"bf16_mxu": True} if bf16_mxu else {}),
             query_tile=query_tile,
+            **({"lean": True} if envs.VLLM_TPU_QSA_PREFILL_LEAN else {}),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
