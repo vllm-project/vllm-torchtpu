@@ -51,6 +51,7 @@ MTAB = "qsa_mtab"  # [requests, pages_per_seq] main-pool page table
 IDX_W = "idx_w"
 DBG_IQ = "qsa_dbg_iq"  # debug outputs: the kernel's index queries and selected ids per layer
 DBG_IDS = "qsa_dbg_ids"
+UNION_SLOTS = 4  # attention ring slots with `union_attn`
 IDX_N = 4 * ix.IDX_DIM + ix.IDX_DIM  # 512 query + 128 raw-key columns
 
 
@@ -120,6 +121,11 @@ class QSAFullIndexedBlock(QSAFullBlock):
         assert not shard_index or per_request_scores, "the sharded indexer selects per request"
         self.union_attn = union_attn
         assert not union_attn or per_request_scores, "the union is built per request"
+        if union_attn:
+            # The union path's scratch (codes, union ids, compaction) pushed the 16-row kernel
+            # 0.5 MiB past scoped VMEM (j-3d8ad822: 62.6 of 62.1 MiB); a 4-slot ring (3 tiles in
+            # flight, 1 MiB less) keeps a request's union stream ahead of its reads.
+            self.slots = min(self.slots, UNION_SLOTS)
         self.union_stats = union_stats
         assert not union_stats or union_attn, "the stats count the union"
         self.loop_requests = loop_requests
