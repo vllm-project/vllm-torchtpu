@@ -1,19 +1,17 @@
 """V4.1 paged cache allocation, row addressing and mutation."""
 
 import math
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
 import jax
 import torch
-from vllm.v1.core.kv_cache_utils import unify_kv_cache_spec_page_size
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
 from vllm.v1.worker.utils import allocate_kv_cache as allocate_upstream_kv_cache
 
 from vllm_torchtpu.kernels.deepseek_v4.csa_cache_layout import ROW_WORDS
 from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout
 
-from .swa_cache import CompactSWASpec, NativeSWASpec, native_swa_reservation
+from .swa_cache import DeepseekV41SWASpec, swa_pool_bytes
 
 ROW_BYTES = ROW_WORDS * 4
 # DSV4 FP8 NoPE record: 448 e4m3 values, then one e8m0 scale per lane of a
@@ -86,50 +84,14 @@ def native_cache_view(raw, shape, dtype, block_stride_bytes, offset_bytes):
     return pages[:, page_offset : page_offset + page_bytes].view(dtype).reshape(shape)
 
 
-def budget_native_swa(
-    specs: dict[str, KVCacheSpec], swa_layers: frozenset[str]
-) -> dict[str, KVCacheSpec]:
-    """Budget separate typed owners before the scheduler chooses block count."""
-    swa_layers = swa_layers.intersection(specs)
-    if not swa_layers:
-        return specs
-    assert all(isinstance(spec, AttentionSpec) for spec in specs.values())
-    # Grow logical blocks before adding typed-owner padding. Otherwise the
-    # uniform padded size prevents upstream from packing small compressed pages.
-    specs = unify_kv_cache_spec_page_size(specs)
-    attention_specs = cast(dict[str, AttentionSpec], specs)
-    # Cache groups may overlay the same block IDs. Different native layouts
-    # need separate storage, even though the scheduler still shares those IDs.
-    swa_bytes = {
-        (
-            attention_specs[name].num_states,
-            attention_specs[name].state_content_size_bytes,
-            attention_specs[name].dtype,
-        ): attention_specs[name].unpadded_page_size_bytes
-        for name in swa_layers
-    }
-    word_bytes = max(
-        (
-            spec.unpadded_page_size_bytes
-            for name, spec in attention_specs.items()
-            if name not in swa_layers
-        ),
-        default=0,
-    )
-    page_bytes = max(
-        word_bytes + sum(swa_bytes.values()),
-        max(spec.page_size_bytes for spec in specs.values()),
-    )
-    return {
-        name: replace(spec, page_size_padded=page_bytes)
-        for name, spec in attention_specs.items()
-    }
-
-
 def _materialize_native_swa(
     config, device, views, swa_specs, csa2_layers
 ) -> MaterializedNativeKVCache:
-    """Split each allocator region into typed owners without unbudgeted HBM."""
+    """Give each SWA layer its private-pool owner; other regions keep word rows.
+
+    SWA block IDs index the layer's `pool_capacity` BF16 pages directly. All
+    other layers share one int32 word-row owner per allocator region.
+    """
     from vllm_torchtpu.kv_cache_materializer import layer_to_pool_index
 
     fp8_layers = {
@@ -147,13 +109,7 @@ def _materialize_native_swa(
             raise ValueError("Native cache requires [blocks,1,page_size,features]")
         geometry = tuple(view.shape[2:]) if name in swa_layers else None
         groups.setdefault(
-            (
-                name
-                if isinstance(swa_specs.get(name), CompactSWASpec)
-                else regions[name],
-                geometry,
-            ),
-            [],
+            (name if name in swa_layers else regions[name], geometry), []
         ).append(name)
     result = MaterializedNativeKVCache({}, [])
     for (_, geometry), names in groups.items():
@@ -167,10 +123,9 @@ def _materialize_native_swa(
                 raise ValueError("Native SWA requires BF16 [pages,page_size,512]")
         elif page_bytes % ROW_BYTES:
             raise ValueError("Native word pool pages must align to 512 bytes")
-        swa_spec = swa_specs.get(names[0])
         num_blocks = (
-            swa_spec.pool_capacity
-            if isinstance(swa_spec, CompactSWASpec)
+            swa_specs[names[0]].pool_capacity
+            if geometry is not None
             else config.num_blocks
         )
         blocks_per_bank = SPARSECORE_MAX_POOL_BYTES // page_bytes
@@ -218,19 +173,17 @@ def _materialize_native_swa(
             if name in fp8_layers:
                 assert scale is not None
                 result.scale_pools[name] = scale
-    # Scales use the existing companion reservation; typed page owners must
-    # fit the scheduler's allocation independently of that reservation.
+    # Scales use the existing companion reservation. Word owners fit the
+    # scheduler's allocation; SWA owners fit the worker's pool reservation.
     owners = {
         id(bank): bank
         for raw in result.native_raw_cache.values()
         for bank in (raw if isinstance(raw, tuple) else (raw,))
     }
     budget = max(tensor.size for tensor in config.kv_cache_tensors)
-    budget += native_swa_reservation(swa_specs)
+    budget += swa_pool_bytes(swa_specs)
     if sum(bank.nbytes for bank in owners.values()) > budget:
-        raise ValueError(
-            "Native SWA owners exceed budget; apply budget_native_swa first"
-        )
+        raise ValueError("Native cache owners exceed the KV and SWA pool budget")
     return result
 
 
@@ -251,7 +204,7 @@ def materialize_upstream_kv_cache(
     swa_specs = {
         name: group.kv_cache_spec
         for group in kv_cache_config.kv_cache_groups
-        if isinstance(group.kv_cache_spec, NativeSWASpec)
+        if isinstance(group.kv_cache_spec, DeepseekV41SWASpec)
         for name in group.layer_names
     }
     if swa_specs:

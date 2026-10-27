@@ -41,7 +41,7 @@ from .candidate_cache import prepare_candidate_cache, select_candidate_cache
 from .ced import prefix_replay_enabled
 from .ops import device_hooks, rms_norm, rotary, round_fp8_activation
 from .projection_rope import initialize_projection_rope
-from .swa_cache import CompactSWASpec, NativeSWASpec
+from .swa_cache import DeepseekV41SWASpec
 
 logger = init_logger(__name__)
 
@@ -377,12 +377,19 @@ class SWACache(NativeCacheView, DeepseekV4SWACache):
         values["extra_retained_tokens"] = max(
             0, vllm_config.num_prefill_lookahead_tokens - 1
         )
-        if vllm_config.cache_config.enable_prefix_caching and spec.prefix_cacheable:
-            return NativeSWASpec(**values)
-        return CompactSWASpec(
+        # One spec with or without prefix caching: bounded replay rebuilds the
+        # window after a hit, so pages live only while their request holds them.
+        if vllm_config.cache_config.enable_prefix_caching and not spec.bounded_replay:
+            # A main-KV hit without replay would read a window never rebuilt.
+            raise ValueError(
+                "DeepSeek-V4.1 CSA2 SWA with prefix caching requires "
+                "--swa-bounded-replay and prefill-context-parallel-size=1"
+            )
+        return DeepseekV41SWASpec(
             **values,
             max_num_seqs=vllm_config.scheduler_config.max_num_seqs,
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
+            num_lookahead_tokens=vllm_config.num_lookahead_tokens,
         )
 
 

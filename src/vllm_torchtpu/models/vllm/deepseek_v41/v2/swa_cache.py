@@ -1,5 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Native SWA storage with vLLM-owned page lifetimes."""
+"""CSA2 SWA pages: one spec, one manager, one window-sized physical pool.
+
+DeepSeek-V4.1 rebuilds sliding-window KV after a prefix hit by bounded
+replay, so SWA pages never outlive the request window that owns them, with
+or without prefix caching. The manager therefore issues block IDs from a
+private pool sized for live windows, and those IDs are the physical page
+indices of the BF16 owner `cache._materialize_native_swa` allocates.
+"""
 
 from collections.abc import Sequence
 from dataclasses import dataclass, fields, replace
@@ -14,22 +21,39 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
 
 @dataclass(frozen=True, kw_only=True)
-class NativeSWASpec(SlidingWindowMLASpec):
-    """BF16 page owners; ordinary prefix retention keeps scheduler addresses."""
-
-
-@dataclass(frozen=True, kw_only=True)
-class CompactSWASpec(NativeSWASpec):
-    """An independent pool whose IDs are issued by SlidingWindowManager."""
+class DeepseekV41SWASpec(SlidingWindowMLASpec):
+    """Native BF16 SWA pages owned by `DeepseekV41SWAManager`'s pool."""
 
     max_num_seqs: int
     max_in_flight_tokens: int
+    num_lookahead_tokens: int = 0
+
+    @property
+    def prefix_cacheable(self) -> bool:
+        # Bounded replay rebuilds the window after a hit; with prefix caching
+        # off there are no hits. Either way no page is shared or retained.
+        return False
 
     @property
     def pool_capacity(self) -> int:
-        retained = self.sliding_window - 1 + self.extra_retained_tokens
-        # One page for the null block. Two partial pages per request cover
-        # window alignment and splitting the shared in-flight token budget.
+        """Pages for the worst case; the pool never limits admission.
+
+        `allocate_slots` frees below the processed basis and allocates through
+        the lookahead slots, so a request holds at most
+        cdiv(W - 1 + extra + lookahead + x, bs) + 1 pages, where x is its
+        in-flight plus newly scheduled tokens. x sums to at most
+        `max_in_flight_tokens` over all requests; cdiv(a + x) <= cdiv(a) +
+        cdiv(x) gives one more page per request. Block lists never shrink, so
+        after a rejection a request still holds pages allocated for its
+        rejected drafts and their lookahead; the second lookahead term covers
+        that stale tail. Page 0 is the null block.
+        """
+        retained = (
+            self.sliding_window
+            - 1
+            + self.extra_retained_tokens
+            + 2 * self.num_lookahead_tokens
+        )
         return (
             1
             + self.max_num_seqs * (cdiv(retained, self.block_size) + 2)
@@ -40,7 +64,7 @@ class CompactSWASpec(NativeSWASpec):
         self, kv_cache_specs: dict[str, KVCacheSpec]
     ) -> bool:
         return all(
-            isinstance(spec, CompactSWASpec) and spec == self
+            isinstance(spec, DeepseekV41SWASpec) and spec == self
             for spec in kv_cache_specs.values()
         )
 
@@ -49,8 +73,12 @@ class CompactSWASpec(NativeSWASpec):
         merged = SlidingWindowMLASpec.merge(specs)
         first = specs[0]
         assert all(
-            spec.max_num_seqs == first.max_num_seqs
-            and spec.max_in_flight_tokens == first.max_in_flight_tokens
+            (spec.max_num_seqs, spec.max_in_flight_tokens, spec.num_lookahead_tokens)
+            == (
+                first.max_num_seqs,
+                first.max_in_flight_tokens,
+                first.num_lookahead_tokens,
+            )
             for spec in specs
         )
         return replace(
@@ -59,26 +87,24 @@ class CompactSWASpec(NativeSWASpec):
         )
 
 
-class CompactSWAManager(SlidingWindowManager):
-    """Reuse vLLM allocation/reclamation; check a private SWA pool's capacity.
+class DeepseekV41SWAManager(SlidingWindowManager):
+    """Upstream sliding-window allocation and reclamation over a private pool.
 
-    Like HiSparseSourceManager, private-pool demand contributes zero to the
-    shared pool, or an admission failure when the private pool is exhausted.
-    Each cache group owns its pool, so checks cannot overcommit another group.
+    Demand is charged to the private pool only. `pool_capacity` bounds the
+    peak, so a shortfall is a capacity bug: fail loudly rather than returning
+    an admission failure that the scheduler would turn into preemption.
     """
 
-    def __init__(self, kv_cache_spec: CompactSWASpec, **kwargs: Any) -> None:
-        if kwargs["enable_caching"] and kv_cache_spec.prefix_cacheable:
-            raise ValueError("Compact SWA requires bounded prefix replay")
-        self.shared_pool = kwargs["block_pool"]
+    def __init__(self, kv_cache_spec: DeepseekV41SWASpec, **kwargs: Any) -> None:
+        shared_pool = kwargs["block_pool"]
         kwargs["block_pool"] = BlockPool(
             num_gpu_blocks=kv_cache_spec.pool_capacity,
             enable_caching=False,
-            hash_block_size=self.shared_pool.hash_block_size,
+            hash_block_size=shared_pool.hash_block_size,
         )
         super().__init__(kv_cache_spec, **kwargs)
-        # SWA writes each visible token before reading it. Its local IDs must
-        # never enter the shared pool's unqualified block-zeroing messages.
+        # SWA writes each visible token before reading it. Private IDs must
+        # never enter the shared pool's block-zeroing or copy messages.
         self._record_new_block_ids = False
 
     def get_num_blocks_to_allocate(
@@ -92,6 +118,9 @@ class CompactSWAManager(SlidingWindowManager):
         apply_admission_cap: bool = False,
         prefill_end: int = 0,
     ) -> int:
+        if apply_admission_cap:
+            # Whole-sequence admission estimates; the pool is sized for peak.
+            return 0
         required = super().get_num_blocks_to_allocate(
             request_id,
             num_tokens,
@@ -99,28 +128,37 @@ class CompactSWAManager(SlidingWindowManager):
             total_computed_tokens,
             num_local_computed_tokens,
             num_tokens_main_model,
-            apply_admission_cap=apply_admission_cap,
             prefill_end=prefill_end,
         )
         if required > self.block_pool.get_num_free_blocks():
-            return self.shared_pool.num_gpu_blocks + 1
+            raise RuntimeError(
+                f"DeepSeek-V4.1 SWA pool exhausted: {request_id} needs "
+                f"{required} pages, {self.block_pool.get_num_free_blocks()} free "
+                f"of {self.block_pool.num_gpu_blocks}"
+            )
         return 0
 
 
-def register_native_swa_specs() -> None:
+def register_swa_specs() -> None:
     """Called by the platform's upstream KV-cache registration hook."""
     KVCacheSpecRegistry.register(
-        NativeSWASpec, SlidingWindowManager, uniform_type_base_spec=NativeSWASpec
-    )
-    KVCacheSpecRegistry.register(
-        CompactSWASpec, CompactSWAManager, uniform_type_base_spec=CompactSWASpec
+        DeepseekV41SWASpec,
+        DeepseekV41SWAManager,
+        uniform_type_base_spec=DeepseekV41SWASpec,
     )
 
 
-def native_swa_reservation(specs: dict[str, KVCacheSpec]) -> int:
+def num_physical_blocks(spec: KVCacheSpec, num_blocks: int) -> int:
+    """Pages a group's owner holds: the private pool, or the shared block count."""
+    if isinstance(spec, DeepseekV41SWASpec):
+        return spec.pool_capacity
+    return num_blocks
+
+
+def swa_pool_bytes(specs: dict[str, KVCacheSpec]) -> int:
     """Physical BF16 bytes deducted before sizing the shared word pool."""
     return sum(
         spec.pool_capacity * spec.unpadded_page_size_bytes
         for spec in specs.values()
-        if isinstance(spec, CompactSWASpec)
+        if isinstance(spec, DeepseekV41SWASpec)
     )

@@ -5,7 +5,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
+from vllm.v1.core.kv_cache_utils import (
+    get_kv_cache_configs,
+    unify_kv_cache_spec_page_size,
+)
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     KVCacheConfig,
@@ -16,6 +19,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
+from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import cache as cache_module
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import PagedCacheRows
@@ -24,50 +28,28 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_cache import (
     PackedFP8IndexerSpec,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.swa_cache import (
-    CompactSWASpec,
-    NativeSWASpec,
-    native_swa_reservation,
-    register_native_swa_specs,
+    DeepseekV41SWASpec,
+    register_swa_specs,
+    swa_pool_bytes,
 )
 
 
-@pytest.mark.cpu_test
-@pytest.mark.parametrize("split", [False, True])
-def test_native_swa_allocation_budgets_overlaid_groups_and_binds_pages(
-    monkeypatch, split
-):
-    blocks, page_size = 4, 32
-    specs = {
-        name: (
-            NativeSWASpec(
-                block_size=page_size,
-                num_kv_heads=1,
-                head_size=512,
-                dtype=dtype,
-                sliding_window=128,
-            )
-            if name.startswith("swa")
-            else MLAAttentionSpec(
-                block_size=page_size, num_kv_heads=1, head_size=512, dtype=dtype
-            )
-        )
-        for name, dtype in (
-            ("swa", torch.bfloat16),
-            ("swa_alias", torch.bfloat16),
-            ("main", torch.uint8),
-        )
-    }
-    swa_layers = frozenset(("swa", "swa_alias"))
-    specs = cache_module.budget_native_swa(specs, swa_layers)
-    assert cache_module.budget_native_swa(specs, swa_layers) == specs
-    page_bytes = 2 * 1024 * page_size
-    assert {spec.page_size_bytes for spec in specs.values()} == {page_bytes}
-    assert specs["main"].block_size == 2 * page_size
-    if split:
-        monkeypatch.setattr(
-            cache_module, "SPARSECORE_MAX_POOL_BYTES", 2 * page_size * 1024
-        )
-    config = KVCacheConfig(
+def _swa_spec(block_size=32, sequences=1, in_flight=32, lookahead=0):
+    return DeepseekV41SWASpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.bfloat16,
+        sliding_window=128,
+        bounded_replay=True,
+        max_num_seqs=sequences,
+        max_in_flight_tokens=in_flight,
+        num_lookahead_tokens=lookahead,
+    )
+
+
+def _config(specs, blocks, page_bytes, swa_offset=0):
+    return KVCacheConfig(
         num_blocks=blocks,
         kv_cache_groups=[
             KVCacheGroupSpec(layer_names=[name], kv_cache_spec=spec)
@@ -75,42 +57,66 @@ def test_native_swa_allocation_budgets_overlaid_groups_and_binds_pages(
         ],
         kv_cache_tensors=[
             KVCacheTensor(
-                size=blocks * page_bytes,
+                size=blocks * page_bytes * (2 if swa_offset else 1),
                 block_stride=page_bytes,
-                offset=0,
+                offset=swa_offset if name.startswith("swa") else 0,
                 layer_stride=blocks * page_bytes,
                 layers=[name],
             )
             for name in specs
         ],
     )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("split", [False, True])
+def test_swa_owners_hold_pool_pages_and_bind_block_ids(monkeypatch, split):
+    """Each SWA layer owns pool_capacity BF16 pages; block IDs index them."""
+    blocks, page_size = 16, 32
+    swa = _swa_spec(page_size)
+    capacity = swa.pool_capacity
+    assert capacity == 8 < blocks
+    specs = {
+        "swa": swa,
+        "swa_alias": swa,
+        "main": MLAAttentionSpec(
+            block_size=page_size, num_kv_heads=1, head_size=512, dtype=torch.uint8
+        ),
+    }
+    page_bytes = 1024 * page_size
+    if split:
+        monkeypatch.setattr(cache_module, "SPARSECORE_MAX_POOL_BYTES", 4 * page_bytes)
     materialized = cache_module.materialize_upstream_kv_cache(
-        config,
+        _config(specs, blocks, page_bytes),
         "cpu",
         KVCacheLayout.LBHNC,
         word_rows=True,
         csa2_layers=frozenset(("main",)),
     )
     raw = materialized.native_raw_cache["swa"]
-    assert raw is materialized.native_raw_cache["swa_alias"]
+    # Layers never alias SWA pages: each request window is per layer.
+    assert raw is not materialized.native_raw_cache["swa_alias"]
     banks = raw if isinstance(raw, tuple) else (raw,)
     assert len(banks) == (2 if split else 1)
+    assert sum(bank.shape[0] for bank in banks) == capacity
     assert all(
         bank.dtype == torch.bfloat16 and bank.shape[1:] == (page_size, 512)
         for bank in banks
     )
-    assert sum(bank.nbytes for bank in materialized.raw_tensors) == (
-        blocks * page_bytes + blocks * specs["main"].num_states * 4
-    )
+    layout = materialized.native_cache_layouts["swa"]
+    assert layout[0] == (capacity, page_size, 512)
+    assert materialized.kv_caches["swa"].shape[0] == capacity
     main = materialized.native_raw_cache["main"]
     main_banks = main if isinstance(main, tuple) else (main,)
     assert all(bank.dtype == torch.int32 for bank in main_banks)
-    assert sum(bank.nbytes for bank in main_banks) == blocks * page_size * 1024
-    cache = PagedCacheRows(raw, materialized.native_cache_layouts["swa"])
+    assert sum(bank.nbytes for bank in main_banks) == blocks * page_size * 512
+    cache = PagedCacheRows(raw, layout)
     for i, bank in enumerate(banks):
         bank.fill_(i + 1)
-    indices = torch.tensor([1, 2, 3])
-    expected = torch.tensor([1, 2, 2] if split else [1, 1, 1], dtype=torch.bfloat16)
+    indices = torch.tensor([1, 3, 4, 7])
+    expected = torch.tensor(
+        [1, 1, 2, 2] if split else [1, 1, 1, 1], dtype=torch.bfloat16
+    )
     torch.testing.assert_close(
         cache[indices, torch.zeros_like(indices)][:, 0], expected
     )
@@ -121,37 +127,9 @@ def test_native_swa_allocation_budgets_overlaid_groups_and_binds_pages(
 
 
 @pytest.mark.cpu_test
-def test_native_swa_budget_keeps_packed_fp8_indexer_padding():
-    """replace() reruns the indexer's __post_init__; keep the typed-owner budget."""
-    specs = {
-        "main": MLAAttentionSpec(
-            block_size=64, num_kv_heads=1, head_size=512, dtype=torch.uint8
-        ),
-        "indexer": PackedFP8IndexerSpec(
-            block_size=128,
-            num_kv_heads=1,
-            head_size=132,
-            dtype=torch.uint8,
-            alignment=512,
-        ),
-        "swa": NativeSWASpec(
-            block_size=32,
-            num_kv_heads=1,
-            head_size=512,
-            dtype=torch.bfloat16,
-            sliding_window=128,
-        ),
-    }
-    budgeted = cache_module.budget_native_swa(specs, frozenset(("swa",)))
-    sizes = {spec.page_size_bytes for spec in budgeted.values()}
-    assert len(sizes) == 1
-    assert sizes.pop() >= specs["main"].page_size_bytes + specs["swa"].page_size_bytes
-
-
-@pytest.mark.cpu_test
 @pytest.mark.parametrize("split", [False, True])
-def test_native_swa_allocation_with_packed_fp8_indexer(monkeypatch, split):
-    blocks, page_bytes = 4, 32768
+def test_swa_allocation_with_packed_fp8_indexer(monkeypatch, split):
+    blocks, page_bytes = 8, 32768
     specs = {
         "main": MLAAttentionSpec(
             block_size=64, num_kv_heads=1, head_size=512, dtype=torch.uint8
@@ -163,34 +141,14 @@ def test_native_swa_allocation_with_packed_fp8_indexer(monkeypatch, split):
             dtype=torch.uint8,
             alignment=512,
         ),
-        "swa": NativeSWASpec(
-            block_size=32,
-            num_kv_heads=1,
-            head_size=512,
-            dtype=torch.bfloat16,
-            sliding_window=128,
-        ),
+        "swa": _swa_spec(),
     }
     assert {spec.page_size_bytes for spec in specs.values()} == {page_bytes}
     if split:
-        monkeypatch.setattr(cache_module, "SPARSECORE_MAX_POOL_BYTES", 2 * page_bytes)
-    config = KVCacheConfig(
-        num_blocks=blocks,
-        kv_cache_groups=[
-            KVCacheGroupSpec(layer_names=[name], kv_cache_spec=spec)
-            for name, spec in specs.items()
-        ],
-        kv_cache_tensors=[
-            KVCacheTensor(
-                size=blocks * page_bytes * 2,
-                block_stride=page_bytes,
-                offset=blocks * page_bytes if name == "swa" else 0,
-                layer_stride=blocks * page_bytes,
-                layers=[name],
-            )
-            for name in specs
-        ],
-    )
+        # Both the word pool (8 blocks) and the SWA owner (8 pages) split.
+        monkeypatch.setattr(cache_module, "SPARSECORE_MAX_POOL_BYTES", 4 * page_bytes)
+    config = _config(specs, blocks, page_bytes, swa_offset=blocks * page_bytes)
+    assert specs["swa"].pool_capacity == blocks
     materialized = cache_module.materialize_upstream_kv_cache(
         config,
         "cpu",
@@ -220,8 +178,10 @@ def test_native_swa_allocation_with_packed_fp8_indexer(monkeypatch, split):
 
 
 @pytest.mark.cpu_test
-def test_native_swa_budget_admits_million_token_context(record_property):
-    """Typed SWA owners must not erase compressed-page packing at admission."""
+def test_swa_pool_admits_million_token_context(record_property):
+    """SWA pages leave the shared pool, so its blocks only pay for main KV."""
+    KVCacheSpecRegistry.check_kv_cache_spec_registry({})
+    register_swa_specs()
     specs: dict[str, KVCacheSpec] = {
         f"swa.{layer}": SlidingWindowMLASpec(
             block_size=16,
@@ -232,19 +192,9 @@ def test_native_swa_budget_admits_million_token_context(record_property):
         )
         for layer in range(43)
     }
-    native_swa = frozenset(f"swa.{layer}" for layer in range(2, 40))
-    for name in native_swa:
-        specs[name] = NativeSWASpec(
-            block_size=16,
-            num_kv_heads=1,
-            head_size=512,
-            dtype=torch.bfloat16,
-            sliding_window=128,
-        )
-    from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
-
-    KVCacheSpecRegistry.check_kv_cache_spec_registry({})
-    register_native_swa_specs()
+    swa_layers = [f"swa.{layer}" for layer in range(2, 40)]
+    for name in swa_layers:
+        specs[name] = _swa_spec(16, sequences=48, in_flight=4096, lookahead=5)
     for layer, ratio in ((2, 2), (8, 2), (14, 2), (20, 1)):
         for kind, width, dtype in (
             ("main", 512, torch.uint8),
@@ -283,20 +233,16 @@ def test_native_swa_budget_admits_million_token_context(record_property):
         max_in_flight_tokens=4096,
         num_prefill_lookahead_tokens=0,
     )
-    budgeted = cache_module.budget_native_swa(specs, native_swa)
-    assert cache_module.budget_native_swa(budgeted, native_swa) == budgeted
-    # Use the real startup admission check from the failing serving run.
-    caches = get_kv_cache_configs(config, [budgeted], [24 << 30])
-    assert caches[0].num_blocks > 0
-    assert config.model_config.max_model_len == 1048576
-    assert budgeted["main.2"].block_size == 128
-    assert budgeted["index.2"].block_size == 256
-    assert budgeted["swa.2"].block_size == 32
-    assert budgeted["ring.2"].block_size == 8
-    assert cache_module.budget_native_swa(specs, frozenset()) is specs
+    unified = unify_kv_cache_spec_page_size(specs)
+    reservation = swa_pool_bytes(unified)
+    caches = get_kv_cache_configs(config, [unified], [(24 << 30) - reservation])[0]
+    record_property("blocks", caches.num_blocks)
+    record_property("swa_reserved_bytes", reservation)
+    assert caches.num_blocks > 0
+    assert unified["swa.2"].block_size == 32
     # Check full-model owner sizing without allocating multi-GiB CPU buffers.
     materialized = cache_module.materialize_upstream_kv_cache(
-        caches[0],
+        caches,
         "meta",
         KVCacheLayout.LBHNC,
         word_rows=True,
@@ -304,45 +250,12 @@ def test_native_swa_budget_admits_million_token_context(record_property):
     )
     assert len(materialized.kv_caches) == len(specs)
     assert sum(raw.nbytes for raw in materialized.raw_tensors) <= 30 << 30
-
-    config.cache_config.enable_prefix_caching = False
-    config.scheduler_config.max_num_seqs = 48
-    config.num_speculative_tokens = 5
-    config.max_concurrent_batches = 2
-    for name in native_swa:
-        specs[name] = CompactSWASpec(
-            block_size=16,
-            num_kv_heads=1,
-            head_size=512,
-            dtype=torch.bfloat16,
-            sliding_window=128,
-            max_num_seqs=48,
-            max_in_flight_tokens=config.max_in_flight_tokens,
-        )
-    unified = cache_module.unify_kv_cache_spec_page_size(specs)
-    reservation = native_swa_reservation(unified)
-    compact_config = get_kv_cache_configs(
-        config, [unified], [(24 << 30) - reservation]
-    )[0]
-    record_property("old_blocks", caches[0].num_blocks)
-    record_property("compact_blocks", compact_config.num_blocks)
-    record_property("swa_reserved_bytes", reservation)
-    assert compact_config.num_blocks > 1.8 * caches[0].num_blocks
-    compact_materialized = cache_module.materialize_upstream_kv_cache(
-        compact_config,
-        "meta",
-        KVCacheLayout.LBHNC,
-        word_rows=True,
-        csa2_layers=frozenset(f"main.{layer}" for layer in (2, 8, 14, 20)),
-    )
-    assert sum(raw.nbytes for raw in compact_materialized.raw_tensors) <= 30 << 30
-    for name in native_swa:
+    for name in swa_layers:
         spec = unified[name]
-        assert isinstance(spec, CompactSWASpec)
-        raw = compact_materialized.native_raw_cache[name]
+        assert isinstance(spec, DeepseekV41SWASpec)
+        raw = materialized.native_raw_cache[name]
         assert isinstance(raw, torch.Tensor)
-        assert raw.shape[0] == spec.pool_capacity
-        assert raw.shape[0] < compact_config.num_blocks // 10
+        assert raw.shape[0] == spec.pool_capacity < caches.num_blocks // 10
 
 
 @pytest.mark.cpu_test
