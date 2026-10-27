@@ -481,6 +481,68 @@ def _sequence_parallel_output(own: np.ndarray, peer_dir: RankDir, name: str, ran
     return np.ascontiguousarray(np.concatenate([h[:, rows] for h in halves], axis=-1))
 
 
+def prefill_expert_plan(layers: int):
+    """The prefill EP16 expert placement (``KernelConfig.prefill_expert_plan``):
+    ``order [layers - 1, 896]``, the logical expert at each physical slot
+    (chip c holds slots 56c..56c+55), or None. A bare name loads from
+    kimi_k3/data."""
+    path = _config().prefill_expert_plan
+    if not path:
+        return None
+    order = np.load(_plan_path(path))["order"].astype(np.int64)
+    if order.shape != (layers - 1, 896) or any(sorted(row) != list(range(896)) for row in order.tolist()):
+        raise ValueError(f"prefill expert plan {path}: order must be [{layers - 1}, 896] permutations")
+    return order
+
+
+def _planned_expert_parts(presharded, rank_dir, name, rank, order, layers):
+    """``RankDir.regrouped_expert_parts`` for EP16/TP2 with a placement plan:
+    chip ``rank // 2`` holds, per layer, the experts ``order[l, 56 c:56 c + 56]``
+    (from any EP8 group's pre-shard), half the intermediate (quarters
+    2 (rank % 2) and 2 (rank % 2) + 1)."""
+    spec = rank_dir.spec(name)
+    shape = tuple(spec["shape"])  # [layers, 112, ...] per quarter
+    dtype = _dtype(spec["dtype"])
+    chip, quarters = rank // 2, (2 * (rank % 2), 2 * (rank % 2) + 1)
+    dirs = {}
+
+    def source(group, q):
+        key = 4 * group + q
+        if key not in dirs:
+            dirs[key] = RankDir(presharded, key, layers)
+        return dirs[key]
+
+    count = len(spec["files"])
+    nbytes = int(np.prod((56,) + shape[2:])) * dtype.itemsize * len(quarters)
+    for index, (filename, (lo, hi)) in enumerate(zip(spec["files"], spec["layer_ranges"])):
+        def reader(filename=filename, lo=lo, hi=hi):
+            # One contiguous read per (layer, expert, quarter), many in flight:
+            # memmap page faults over network storage are far slower.
+            expert_bytes = int(np.prod(shape[2:])) * dtype.itemsize
+            raw = {q: np.empty((hi - lo, 56, *shape[2:]), dtype) for q in quarters}
+            jobs = []
+            for layer in range(lo, hi):
+                experts = order[layer, 56 * chip:56 * chip + 56]
+                for slot, expert in enumerate(experts):
+                    group, index = int(expert) // 112, int(expert) % 112
+                    for q in quarters:
+                        offset = ((layer - lo) * shape[1] + index) * expert_bytes
+                        jobs.append((source(group, q).path / filename, offset, raw[q][layer - lo, slot]))
+            with ThreadPoolExecutor(32) as pool:
+                list(pool.map(lambda job: read_into(job[0], job[1], job[2], streams=1), jobs))
+            layers_out = []
+            for layer in range(lo, hi):
+                parts = [raw[q][layer - lo] for q in quarters]
+                if name in ("expert_gu", "expert_gus"):
+                    half = shape[-1] // 2
+                    layers_out.append(np.concatenate([q[..., :half] for q in parts]
+                                                     + [q[..., half:] for q in parts], axis=-1))
+                else:
+                    layers_out.append(np.concatenate(parts, axis=1))
+            return np.stack(layers_out)
+        yield f"{name}@{index}/{count}", (hi - lo) * nbytes, reader
+
+
 def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 93,
                       split_experts: bool = False) -> Iterator[tuple[str, str, np.ndarray]]:
     """The prefill stack's weights for ``rank``.
@@ -516,8 +578,13 @@ def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 
         else:  # 56 experts, half the intermediate (TP2 within the chip)
             quarters, part, parts = (2 * (rank % 2), 2 * (rank % 2) + 1), (rank // 2) % 2, 2
         quarter_dirs = [RankDir(presharded, group + q, layers) for q in quarters]
-        jobs += [job for name in sorted(EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n)))
-                 for job in rank_dir.regrouped_expert_parts(name, quarter_dirs, part, parts)]
+        plan = prefill_expert_plan(layers) if ep == 16 else None
+        if plan is not None:
+            jobs += [job for name in sorted(EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n)))
+                     for job in _planned_expert_parts(presharded, rank_dir, name, rank, plan, layers)]
+        else:
+            jobs += [job for name in sorted(EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n)))
+                     for job in rank_dir.regrouped_expert_parts(name, quarter_dirs, part, parts)]
     else:
         jobs += list(_expert_jobs(rank_dir, split_experts))
     jobs.append(("dense", _dense_bytes(rank_dir), rank_dir.read_dense_all))
@@ -545,8 +612,14 @@ def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 
             if name == "m_o":
                 family = _sequence_parallel_output(family, peer_dir, "m_o", rank)
             yield "mla", name, family
+        plan = prefill_expert_plan(layers) if ep == 16 else None
         for name in PREFILL_MOE_DENSE:
-            yield "moe", name, families[name]
+            family = families[name]
+            if plan is not None and name in ("router", "router_bias"):
+                # Physical expert p's router column is logical expert order[l, p].
+                family = np.ascontiguousarray(np.take_along_axis(
+                    family, plan[:, None, :].astype(np.int64), axis=-1))
+            yield "moe", name, family
         del families
 
 

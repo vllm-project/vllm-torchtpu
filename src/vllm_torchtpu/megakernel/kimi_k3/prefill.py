@@ -25,6 +25,7 @@ every scheduled prompt chunk into vLLM's unified pools for the KV connector:
 from __future__ import annotations
 
 import dataclasses
+import os
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -47,6 +48,7 @@ from vllm_torchtpu.megakernel.bridge import (
     stream_to_device,
 )
 from vllm_torchtpu.megakernel.config import MegakernelEngineConfig
+from vllm_torchtpu.megakernel.kimi_k3.config import active
 from vllm_torchtpu.megakernel.kimi_k3.layout import NUM_LAYERS
 from vllm_torchtpu.megakernel.kimi_k3.pools import (
     CONV_ROWS,
@@ -422,6 +424,8 @@ class PrefillProgram:
         )
         weight_groups = ("common", "kda", "mla", "moe")
         state_sharding = jax.sharding.NamedSharding(mesh, sharded)
+        counting = bool(active().prefill_route_counts)
+        nroute = 1 if counting else 0
 
         def zeros(shape, dtype):
             # Rank-leading states: shard them, or XLA may replicate them.
@@ -447,7 +451,8 @@ class PrefillProgram:
             latents = zeros((MLA_LAYERS, window, 576), jnp.bfloat16)
             rec_at = zeros((KDA_LAYERS, count, 3, 128, 128), jnp.float32)
             hist_at = zeros((KDA_LAYERS, count, 3, 3, 3, 128), jnp.bfloat16)
-            prefix, blocks, kda_state, mla_state, tap = first(
+            route = zeros((NUM_LAYERS - 1, 56), jnp.int32) if counting else None
+            prefix, blocks, kda_state, mla_state, tap, *routes = first(
                 hidden,
                 w["common"],
                 w["kda"],
@@ -458,11 +463,12 @@ class PrefillProgram:
                 length,
                 segment_desc=segments,
                 arena=arena,
+                route=route,
             )
-            return (prefix, blocks, *kda_state, *mla_state, tap)
+            return (prefix, blocks, *kda_state, *mla_state, *routes, tap)
 
-        # prefix, blocks, rec, hist, rec_at, hist_at, latents
-        state_specs = (sharded,) * 7
+        # prefix, blocks, rec, hist, rec_at, hist_at, latents[, route counts]
+        state_specs = (sharded,) * (7 + nroute)
         name = f"k3_prefill_packed{count}c"
         ops["first"] = register_global_op(
             self._op_name(f"{name}_first", window),
@@ -486,14 +492,12 @@ class PrefillProgram:
             rec_at,
             hist_at,
             latents,
-            length,
-            pair,
-            segments,
-            *args,
+            *rest,
         ):
+            routes, (length, pair, segments, *args) = rest[:nroute], rest[nroute:]
             arena, args = split(args, 2)
             w, _ = self._unflat(args, *weight_groups)
-            prefix, blocks, kda_state, mla_state, middle, tap = regular(
+            prefix, blocks, kda_state, mla_state, middle, tap, *routes = regular(
                 prefix,
                 blocks,
                 w["common"],
@@ -506,8 +510,9 @@ class PrefillProgram:
                 pair,
                 segment_desc=segments,
                 arena=arena,
+                route=routes[0] if routes else None,
             )
-            return (prefix, blocks, *kda_state, *mla_state, middle, tap)
+            return (prefix, blocks, *kda_state, *mla_state, *routes, middle, tap)
 
         ops["group"] = register_global_op(
             self._op_name(f"{name}_group8", window),
@@ -520,14 +525,15 @@ class PrefillProgram:
             # then the streams between its two groups and entering its last
             # group's third layer
             state_specs + (sharded,) * 2,
-            donate_argnums=tuple(range(7)),
+            donate_argnums=tuple(range(7 + nroute)),
             export_key=self._export_key(f"{name}_group", window),
         )
 
-        def run_final(prefix, blocks, latents, length, segments, *args):
+        def run_final(prefix, blocks, latents, *rest):
+            routes, (length, segments, *args) = rest[:nroute], rest[nroute:]
             arena, args = split(args, 1)
             w, _ = self._unflat(args, "io", "common", "mla", "moe")
-            prefix, blocks, (latents,) = final(
+            prefix, blocks, (latents,), *routes = final(
                 prefix,
                 blocks,
                 w["common"],
@@ -537,6 +543,7 @@ class PrefillProgram:
                 length,
                 segment_desc=segments,
                 arena=arena,
+                route=routes[0] if routes else None,
             )
             logits = logits_op(
                 prefix,
@@ -554,18 +561,18 @@ class PrefillProgram:
                 out_specs=replicated,
                 check_vma=False,
             )(logits)
-            return logits, latents
+            return (logits, latents, *routes)
 
         ops["final"] = register_global_op(
             self._op_name(f"{name}_final", window),
             mesh,
             run_final,
-            (sharded,) * 3
+            (sharded,) * (3 + nroute)
             + (replicated,) * 2
             + prefix_specs(1)
             + (sharded,) * self._count("io", "common", "mla", "moe"),
-            (replicated, sharded),
-            donate_argnums=(0, 1, 2),
+            (replicated, sharded) + (sharded,) * nroute,
+            donate_argnums=tuple(range(3 + nroute)),
             export_key=self._export_key(f"{name}_final", window),
         )
         if not self._pairs:
@@ -641,20 +648,22 @@ class PrefillProgram:
                 *tail,
                 *self._flat("common", "kda", "mla", "moe", expert_bank=p + 1),
             )
-        prefix, blocks, rec, hist, rec_at, hist_at, latents = state
+        prefix, blocks, rec, hist, rec_at, hist_at, latents, *routes = state
         if ring is not None:
             # The last pair's middle: entering layer 88; its tap: entering 90.
             ring(blocks, prefix, middle, tap3, tap90)
-        logits, latents = ops["final"](
+        logits, latents, *routes = ops["final"](
             prefix,
             blocks,
             latents,
+            *routes,
             extent,
             segments,
             pools[MLA_LAYERS - 1],
             *tail,
             *self._flat("io", "common", "mla", "moe", expert_bank=12),
         )
+        self.last_routes = routes[0] if routes else None
         return logits, latents, rec, hist, rec_at, hist_at
 
     def zero_state(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1604,6 +1613,7 @@ class KimiPrefiller:
                 ring_hook,
             )
         )
+        self._count_routes()
         self._writer.write_packed(
             latents,
             recurrent,
@@ -1638,6 +1648,29 @@ class KimiPrefiller:
                 ),
             )
         return logits
+
+    def _count_routes(self) -> None:
+        """K3_PREFILL_ROUTE_COUNTS: accumulate the window's MoE route counts
+        ([1, 92, 56] per rank: its chip's local experts per MoE layer) and
+        have each chip's even rank save a cumulative snapshot every
+        ``prefill_route_counts_every`` windows under
+        ``$K3_PREFILL_ROUTE_COUNTS_DIR`` (default ``$CDK_OUTPUT_DIR/
+        prefill_route_counts``)."""
+        routes = getattr(self.program, "last_routes", None)
+        if routes is None:
+            return
+        total = getattr(self, "_route_total", None)
+        self._route_total = routes if total is None else total + routes
+        self._route_windows = getattr(self, "_route_windows", 0) + 1
+        if self._route_windows % active().prefill_route_counts_every or self.rank % 2:
+            return
+        directory = os.environ.get("K3_PREFILL_ROUTE_COUNTS_DIR") or os.path.join(
+            os.environ.get("CDK_OUTPUT_DIR", "/tmp"), "prefill_route_counts"
+        )
+        os.makedirs(directory, exist_ok=True)
+        counts = np.asarray(self._route_total.cpu()).reshape(NUM_LAYERS - 1, 56)
+        name = f"prefill-r{self.rank:02d}-w{self._route_windows:07d}.npy"
+        np.save(os.path.join(directory, name), counts)
 
     def _cp_operands(
         self, rows: Sequence[RequestInput], by_row, window: int, members
@@ -1715,7 +1748,12 @@ class KimiPrefiller:
                 (1, KDA_LAYERS, count, 3, 3, 3, 128), dtype=torch.bfloat16
             )
             latents = torch.empty((1, MLA_LAYERS, window, 576), dtype=torch.bfloat16)
-            state = (stream, blocks, recurrent, conv, recurrent, conv, latents)
+            routes = (
+                (torch.empty((1, NUM_LAYERS - 1, 56), dtype=torch.int32),)
+                if active().prefill_route_counts
+                else ()
+            )
+            state = (stream, blocks, recurrent, conv, recurrent, conv, latents, *routes)
             extent, segments = i32(1), i32(5 * count)
             tail = (i32(1, 1 + self.cp_capacity // self.page_tokens), i32(1, 2 * count))
             add(
@@ -1752,6 +1790,7 @@ class KimiPrefiller:
                     stream,
                     blocks,
                     latents,
+                    *routes,
                     extent,
                     segments,
                     mla[MLA_LAYERS - 1],

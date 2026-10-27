@@ -63,6 +63,28 @@ class KernelConfig:
     # Prefill MLA flash tiles (queries x keys per step).
     mla_flash_qtile: int = 1024
     mla_flash_ktile: int = 2048
+    # Prefix keys in mla_flash_ktile tiles and a whole-window query tile under
+    # mla_flash_qtile rows (False: the window's key tile, as before).
+    mla_flash_prefix_tiles: bool = True
+    # Cached-prefix attention in FP8 (E4M3FN keys/values from the expansion, FP8
+    # queries, probabilities x16 in E4M3FN, FP32 statistics); the window's own
+    # keys stay BF16. K3_PREFILL_PREFIX_FP8=1 turns it on.
+    prefill_prefix_fp8: bool = dataclasses.field(
+        default_factory=lambda: os.environ.get("K3_PREFILL_PREFIX_FP8", "") == "1"
+    )
+    # Prefill MoE route counts (diagnostic): each fused MoE call also returns its
+    # chip's 56 local expert counts; the prefiller saves cumulative snapshots.
+    prefill_route_counts: bool = dataclasses.field(
+        default_factory=lambda: os.environ.get("K3_PREFILL_ROUTE_COUNTS", "") == "1"
+    )
+    prefill_route_counts_every: int = 200
+    # Prefill EP16 expert placement (empty: the pre-shard's): an npz whose
+    # ``order`` [92, 896] is the logical expert at each physical slot (chip c:
+    # slots 56c..56c+55); the router columns and expert weights are loaded in
+    # that order. A bare name loads from kimi_k3/data.
+    prefill_expert_plan: str = dataclasses.field(
+        default_factory=lambda: os.environ.get("K3_PREFILL_EXPERT_PLAN", "")
+    )
     # Prefill MoE expert parallelism: 8 (EP8/TP4, the pre-shard layout), 16
     # (EP16/TP2: 56 experts, TP2 within the chip) or 32 (28 whole experts);
     # 16 and 32 regroup the EP8 group's shards at load.
