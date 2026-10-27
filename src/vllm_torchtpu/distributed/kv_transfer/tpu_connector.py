@@ -87,6 +87,9 @@ from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
     SendMeta,
     TPUConnectorMetadata,
 )
+from vllm_torchtpu.distributed.kv_transfer.kv_cache_memory_stats import (
+    KVCacheMemoryCollector,
+)
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorPromMetrics,
     TpuKVConnectorStats,
@@ -840,6 +843,7 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         elif role == KVConnectorRole.WORKER:
             self.connector_scheduler = None
             self.connector_worker = worker_cls(vllm_config)
+        self._kv_cache_memory: KVCacheMemoryCollector | None = None
 
     # ---- Scheduler-side methods -----------------------------------------
     def on_new_request(self, request: "Request") -> None:
@@ -941,13 +945,42 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.get_finished_count()
 
+    def bind_scheduler(self, scheduler: Any) -> None:
+        if getattr(scheduler, "_tpu_kv_block_state_collector_bound", None) is True:
+            return
+        scheduler._tpu_kv_block_state_collector_bound = True
+        self._kv_cache_memory = KVCacheMemoryCollector(scheduler)
+
+    def _take_scheduler_stats(self) -> dict[str, Any]:
+        if self._kv_cache_memory is None:
+            return {}
+        return self._kv_cache_memory.collect()
+
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         """
         Get the KV transfer stats for the connector.
         """
-        if self.connector_worker is None:
+        sched_stats = self._take_scheduler_stats()
+        if self.connector_worker is not None:
+            worker_stats = self.connector_worker.get_kv_connector_stats()
+            if worker_stats is not None:
+                if sched_stats:
+                    worker_stats.data.update(sched_stats)
+                return worker_stats
+        xfer_stats = getattr(self, "_xfer_stats", None)
+        if xfer_stats is not None:
+            if xfer_stats.is_empty() and not sched_stats:
+                return None
+            prev = xfer_stats
+            if sched_stats:
+                prev.data.update(sched_stats)
+            self._xfer_stats = TpuKVConnectorStats()
+            return prev
+        if not sched_stats:
             return None
-        return self.connector_worker.get_kv_connector_stats()
+        stats = TpuKVConnectorStats()
+        stats.data.update(sched_stats)
+        return stats
 
     @classmethod
     def build_kv_connector_stats(

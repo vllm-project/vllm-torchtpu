@@ -29,6 +29,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 from vllm.v1.metrics.utils import create_metric_per_engine
 
 import vllm_torchtpu.distributed.utils as dist_utils
+from vllm_torchtpu.distributed.kv_transfer.kv_cache_memory_stats import (
+    STATS_BLOCKS_BY_STATE,
+    KVCacheMemoryProm,
+)
 from vllm_torchtpu.distributed.kv_transfer.raiden.telemetry_utils import (
     normalize_raiden_metric_name,
     parse_raiden_metric_key,
@@ -125,6 +129,7 @@ class TpuKVConnectorStats(KVConnectorStats):
             "runner_cpu_issue_seconds": [],
             "runner_device_elapsed_seconds": [],
         }
+        self.data[STATS_BLOCKS_BY_STATE] = cast(Any, None)
 
     def clone_and_reset(self) -> "TpuKVConnectorStats":
         old = copy.copy(self)
@@ -134,7 +139,13 @@ class TpuKVConnectorStats(KVConnectorStats):
     def aggregate(self, other: "KVConnectorStats") -> "KVConnectorStats":
         if not other.is_empty():
             for k, v in other.data.items():
-                if k not in self.data:
+                if k == STATS_BLOCKS_BY_STATE:
+                    if v is not None:
+                        self.data[k] = v
+                    continue
+                if v is None:
+                    continue
+                if k not in self.data or self.data[k] is None:
                     self.data[k] = []
                 accumulator = self.data[k]
                 assert isinstance(accumulator, list)
@@ -325,6 +336,9 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         self.dynamic_metrics: dict[str, tuple[str, Any, list[str]]] = (
             self._get_raiden_metric_definitions(labelnames)
         )
+        self._kv_cache_memory_prom = KVCacheMemoryProm(
+            self._gauge_cls, labelnames, self.per_engine_labelvalues
+        )
 
     def _get_raiden_metric_definitions(self, labelnames: list[str] | None = None):
         if labelnames is None:
@@ -391,6 +405,7 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
         return metric_defs
 
     def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
+        self._kv_cache_memory_prom.observe(transfer_stats_data, engine_idx)
         engine_labels = self.per_engine_labelvalues[engine_idx]
         for rank, stage, seconds in transfer_stats_data.get(
             "runner_cpu_issue_seconds", []

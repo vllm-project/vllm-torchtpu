@@ -224,6 +224,7 @@ class TestTpuCompilerCache:
 
         serving_only = {
             "TPU_IPC_SOCKET_DIR",
+            "TPU_KV_BLOCK_STATE_INTERVAL_S",
             "TPU_KV_CHANNEL_EXECUTOR_MAX_WORKERS",
             "TPU_KV_COORD_EXECUTOR_MAX_WORKERS",
             "TPU_KV_LATENCY_LOG_INTERVAL",

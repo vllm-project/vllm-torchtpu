@@ -94,3 +94,9 @@ class TPUMultiConnector(MultiConnector):
                 )
             index = child_index
         return index
+
+    def bind_scheduler(self, scheduler) -> None:
+        for c in self._connectors:
+            bind = getattr(c, "bind_scheduler", None)
+            if callable(bind):
+                bind(scheduler)

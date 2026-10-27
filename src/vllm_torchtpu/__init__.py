@@ -2074,3 +2074,37 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
         "Applied TPU patch: register shard index bounds as buffers in "
         "VocabParallelEmbedding"
     )
+
+
+def _patch_vllm_scheduler_binds_kv_connector() -> None:
+    """Bind the Scheduler to its KVConnector for block-state observability.
+
+    vLLM constructs ``Scheduler.connector`` inside ``Scheduler.__init__``
+    without passing ``self``, so the connector has no reference back to
+    ``kv_cache_manager.block_pool`` or the request tables. Calling an
+    optional ``connector.bind_scheduler(self)`` hook at the end of
+    ``Scheduler.__init__`` enables scheduler-side block-state scanning.
+    """
+    import functools
+
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    orig_init = Scheduler.__init__
+    if getattr(orig_init, "_tpu_binds_kv_connector", None) is True:
+        return
+
+    @functools.wraps(orig_init)
+    def _init_with_kv_connector_binding(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        connector = getattr(self, "connector", None)
+        bind = getattr(connector, "bind_scheduler", None)
+        if callable(bind):
+            bind(self)
+        else:
+            for child in getattr(connector, "_connectors", ()):
+                child_bind = getattr(child, "bind_scheduler", None)
+                if callable(child_bind):
+                    child_bind(self)
+
+    _init_with_kv_connector_binding.__dict__["_tpu_binds_kv_connector"] = True
+    Scheduler.__init__ = _init_with_kv_connector_binding

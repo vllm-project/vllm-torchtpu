@@ -106,6 +106,7 @@ PATCHES = (
         _ENGINE,
     ),
     Patch("vllm_torchtpu:_patch_dflash_drafting_slot_budget", _ENGINE),
+    Patch("vllm_torchtpu:_patch_vllm_scheduler_binds_kv_connector", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),

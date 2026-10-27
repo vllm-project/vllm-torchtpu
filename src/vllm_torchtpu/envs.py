@@ -194,6 +194,7 @@ if TYPE_CHECKING:
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
+    TPU_KV_BLOCK_STATE_INTERVAL_S: float = 10.0
 
 
 def env_with_choices(
@@ -1150,6 +1151,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS": env_nonnegative_int(
         "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS", 8
     ),
+    # Cadence in seconds for the KV cache block-state scanner that emits
+    # vllm:kv_cache_blocks_by_state. Set <= 0 to scan on every stats poll.
+    "TPU_KV_BLOCK_STATE_INTERVAL_S": env_float("TPU_KV_BLOCK_STATE_INTERVAL_S", 10.0),
 }
 
 

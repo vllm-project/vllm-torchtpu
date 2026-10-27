@@ -57,12 +57,21 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorPromMetrics,
+    KVConnectorStats,
+    PromMetric,
+    PromMetricT,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
     config as offloading_config_module,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadPromMetrics,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
@@ -80,11 +89,21 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     CanonicalKVCacheTensor,
     GPULoadStoreSpec,
+    OffloadingGaugeMetadata,
     OffloadKey,
 )
 from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu.distributed.kv_transfer.kv_cache_memory_stats import (
+    ALL_KV_GROUPS,
+    KV_CACHE_BLOCKS_BY_STATE_DOC,
+    KV_CACHE_BLOCKS_BY_STATE_METRIC_NAME,
+    STATS_BLOCKS_BY_STATE,
+    KVCacheMemoryCollector,
+    get_or_create_kv_cache_blocks_by_state_gauge,
+    init_kv_cache_blocks_by_state_gauge,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.offload.raiden_store import (
     AdmissionOp,
@@ -206,6 +225,26 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         assert isinstance(self.manager, RaidenOffloadingManager)
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
+        self._kv_cache_memory: KVCacheMemoryCollector | None = None
+
+    def bind_scheduler(self, scheduler) -> None:
+        if getattr(scheduler, "_tpu_kv_block_state_collector_bound", None) is True:
+            return
+        scheduler._tpu_kv_block_state_collector_bound = True
+        self._kv_cache_memory = KVCacheMemoryCollector(scheduler)
+
+    def get_stats(self) -> KVConnectorStats | None:
+        if self._kv_cache_memory is not None:
+            sched_stats = self._kv_cache_memory.collect()
+            blocks_by_state = sched_stats.get(STATS_BLOCKS_BY_STATE)
+            if blocks_by_state:
+                for state, cnt in blocks_by_state.items():
+                    self._connector_stats.set_gauge(
+                        KV_CACHE_BLOCKS_BY_STATE_METRIC_NAME,
+                        float(cnt),
+                        labelvalues=(ALL_KV_GROUPS, state),
+                    )
+        return super().get_stats()
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -314,6 +353,34 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         super().update_connector_output(connector_output)
 
 
+class TpuOffloadPromMetrics(OffloadPromMetrics):
+    """Prometheus metrics for ``TPURaidenOffloadingConnector``."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ):
+        super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
+        self._offloading_metric_metadata[KV_CACHE_BLOCKS_BY_STATE_METRIC_NAME] = (
+            OffloadingGaugeMetadata(
+                documentation=KV_CACHE_BLOCKS_BY_STATE_DOC,
+                labelnames=("kv_group", "state"),
+            )
+        )
+        self.blocks_by_state = get_or_create_kv_cache_blocks_by_state_gauge(
+            self._gauge_cls, labelnames
+        )
+        init_kv_cache_blocks_by_state_gauge(
+            self.blocks_by_state, per_engine_labelvalues
+        )
+        self._offloading_metric_defs[KV_CACHE_BLOCKS_BY_STATE_METRIC_NAME] = (
+            self.blocks_by_state
+        )
+
+
 class TPURaidenOffloadingConnector(OffloadingConnector):
     """Top-level facade connector for the store-backed (V2) raiden KV offload path."""
 
@@ -409,6 +476,10 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             self._pending_fences: list[tuple[set[int], torch.Event]] = []
 
     # -- scheduler-side hooks ----------------------------------------------
+    def bind_scheduler(self, scheduler) -> None:
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.bind_scheduler(scheduler)
+
     def reset_cache(self) -> bool | None:
         # External cache reset is unsupported by the Raiden store. Report
         # failure through the endpoint's documented channel instead of raising an
@@ -423,6 +494,18 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         if self.connector_scheduler is not None:
             return self.connector_scheduler.take_events()
         return []
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> KVConnectorPromMetrics:
+        return TpuOffloadPromMetrics(
+            vllm_config, metric_types, labelnames, per_engine_labelvalues
+        )
 
     # -- worker-side hooks -------------------------------------------------
     def register_kv_caches(

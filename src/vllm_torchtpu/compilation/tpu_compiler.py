@@ -197,6 +197,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     # entry not named here joins the cache key, so omitting these would
     # recompile the world whenever an operator retuned a port.
     "TPU_IPC_SOCKET_DIR",
+    "TPU_KV_BLOCK_STATE_INTERVAL_S",
     "TPU_KV_CHANNEL_EXECUTOR_MAX_WORKERS",
     "TPU_KV_COORD_EXECUTOR_MAX_WORKERS",
     "TPU_KV_LATENCY_LOG_INTERVAL",
