@@ -1963,6 +1963,7 @@ def _layer_kernel(
     fallback_counts=None,
     fallback_shared=None,
     maximum=None,
+    route_counts=None,
 ):
     """One launch owns all compute, metadata and communication on the fast path.
 
@@ -2026,6 +2027,9 @@ def _layer_kernel(
                 metadata_ready=metadata_ready,
             )
             count_copy().wait()
+            if route_counts is not None:
+                for e in range(56):
+                    route_counts[e] = s["counts"][e]
             if tokens == 8192:
                 maximum_copy().wait()
             if tokens != 8192:
@@ -2155,8 +2159,16 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
             ((1,), jnp.int32),
         ]
         output_specs += [hbm] * 4 + [pl.BlockSpec()]
+    counting = k._config().prefill_route_counts
+    body = _layer_kernel
+    if counting:
+        workspace_shapes += [((56,), jnp.int32)]
+        output_specs += [pl.BlockSpec(memory_space=pltpu.SMEM)]
+
+        def body(*refs):
+            return _layer_kernel(*refs[:-1], route_counts=refs[-1])
     kernel = pl.pallas_call(
-        _layer_kernel,
+        body,
         out_shape=tuple(jax.ShapeDtypeStruct(s, d) for s, d in workspace_shapes),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
@@ -2176,7 +2188,7 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
         jax.shard_map,
         mesh=mesh,
         in_specs=(P("k3_sp"), P("k3_sp"), P("k3_sp"), P(), P()),
-        out_specs=P("k3_sp"),
+        out_specs=(P("k3_sp"), P("k3_sp")) if counting else P("k3_sp"),
         check_vma=False,
     )
     def local(hidden, prefix, families, length, slot):
@@ -2199,8 +2211,11 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
             w["latent_up"],
             prefix[0],
         )
+        if counting:
+            *outputs, routes = outputs
+            routes = routes[None]
         if seq_len < 8192:
-            return outputs[0][None]
+            return (outputs[0][None], routes) if counting else outputs[0][None]
         final, latent, _, ids, probs, counts, shared, maximum = outputs
 
         def overflow():
@@ -2229,6 +2244,7 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
                 shared_reduced=True,
             )
 
-        return jax.lax.cond(maximum[0] <= 32768, lambda: final, overflow)[None]
+        result = jax.lax.cond(maximum[0] <= 32768, lambda: final, overflow)[None]
+        return (result, routes) if counting else result
 
     return jax.jit(local)

@@ -3139,7 +3139,8 @@ def kda_chunk(q, k, v, gate, beta, state, *, sub_block=_KDA_SUB_BLOCK, invert=No
 # ---------------------------------------------------------------------------
 
 
-def mla_projections(hidden, weights, *, epsilon=1e-5, return_latent=False, query_scale=1.0):
+def mla_projections(hidden, weights, *, epsilon=1e-5, return_latent=False, query_scale=1.0,
+                    sp_axis=None):
     """MLA Q/K/V projections for a token window (per-rank layout).
 
     ``hidden``: [T, hidden] BF16. Returns (query [T,3,256] times
@@ -3151,7 +3152,16 @@ def mla_projections(hidden, weights, *, epsilon=1e-5, return_latent=False, query
     every rank.
     """
     tokens = hidden.shape[0]
-    query_latent = _dot(hidden, weights.query_down_projection)
+    if sp_axis is None:
+        rows, local = tokens, hidden
+    else:
+        # The low-rank projections are not head-split: each rank projects one
+        # contiguous 1/32 of the window and the results are all-gathered.
+        rows = tokens // jax.lax.psum(1, sp_axis)
+        local = jax.lax.dynamic_slice_in_dim(
+            hidden, jax.lax.axis_index(sp_axis) * rows, rows
+        )
+    query_latent = _dot(local, weights.query_down_projection)
     query_latent = (
         query_latent
         * jax.lax.rsqrt(
@@ -3159,12 +3169,18 @@ def mla_projections(hidden, weights, *, epsilon=1e-5, return_latent=False, query
         )
         * weights.query_normalization
     ).astype(jnp.bfloat16)
+    compressed = _dot(local, weights.key_value_down_projection).astype(
+        jnp.bfloat16
+    )
+    if sp_axis is not None:
+        width = query_latent.shape[1]
+        both = jax.lax.all_gather(
+            jnp.concatenate((query_latent, compressed), axis=1), sp_axis, tiled=True
+        )
+        query_latent, compressed = both[:, :width], both[:, width:]
     query = (_dot(query_latent, weights.query_up_projection) * query_scale).astype(jnp.bfloat16)
     query = query.reshape(tokens, _HEADS, 256)
 
-    compressed = _dot(hidden, weights.key_value_down_projection).astype(
-        jnp.bfloat16
-    )
     kv_latent = compressed[:, :512].astype(jnp.float32)
     kv_latent = (
         kv_latent
@@ -3887,7 +3903,7 @@ SCALE = 192.0**-0.5
 SCALE_LOG2 = SCALE * 1.4426950408889634
 
 
-def _flash_kernel_packed(length_ref, segment_ref, *refs, tile, q_tile, count, prefixed=False):
+def _flash_kernel_packed(length_ref, segment_ref, *refs, tile, q_tile, count, prefixed=False, prefix_tile=None):
     """Causal MLA flash attention over a packed window of ``count``
     sequences, per (head, ``q_tile``-row query tile), with ``tile``-row
     key/value blocks double-buffered from HBM.
@@ -3901,7 +3917,8 @@ def _flash_kernel_packed(length_ref, segment_ref, *refs, tile, q_tile, count, pr
     one-layer arena (keys ``[1, 3, T, 256]``, values transposed
     ``[1, 3, 128, T]``). Offsets are multiples of 256."""
     if prefixed:
-        layer_ref, q_ref, k_hbm, v_hbm, prefix_k_hbm, prefix_v_hbm, out_ref, k_buf, v_buf, sems = refs
+        (layer_ref, q_ref, k_hbm, v_hbm, prefix_k_hbm, prefix_v_hbm, out_ref, k_buf, v_buf, sems,
+         pk_buf, pv_buf, psems) = refs
     else:
         q_ref, k_hbm, v_hbm, out_ref, k_buf, v_buf, sems = refs
     head, query_block = pl.program_id(0), pl.program_id(1)
@@ -3944,11 +3961,17 @@ def _flash_kernel_packed(length_ref, segment_ref, *refs, tile, q_tile, count, pr
         jnp.full((1, q_tile), -jnp.inf, jnp.float32),
         jnp.zeros((128 + _ONES, q_tile), jnp.float32),
     )
+    fp8 = prefixed and pk_buf.dtype == jnp.float8_e4m3fn
+    # FP8 prefix: every probability is 2**PROB_SHIFT larger (exact for BF16 and
+    # FP32; the ratio to the ones-row denominator is unchanged).
+    pshift = PROB_SHIFT if fp8 else 0.0
     if prefixed:
+        pq = q.astype(jnp.float8_e4m3fn) if fp8 else q
         carry = _prefix_phase(
-            carry, q, segment_ref, layer_ref[0], head, first_row, rows, first_row < length,
-            prefix_k_hbm, prefix_v_hbm, k_buf, v_buf, sems, tile=tile, q_tile=q_tile,
-            count=count)
+            carry, pq, segment_ref, layer_ref[0], head, first_row, rows, first_row < length,
+            prefix_k_hbm, prefix_v_hbm, pk_buf, pv_buf, psems, tile=prefix_tile, q_tile=q_tile,
+            count=count, pshift=pshift,
+            fragment=FP8_FRAGMENT if fp8 else None, exp_bf16=fp8 and FP8_EXP_BF16)
 
     # Blocks [a, b) see every row and need no mask: past the sequence start,
     # wholly before the tile's first row.
@@ -3956,7 +3979,7 @@ def _flash_kernel_packed(length_ref, segment_ref, *refs, tile, q_tile, count, pr
     a = jnp.maximum(first_block, interior)
     a, b = jnp.where(a < b, a, count_blocks), jnp.where(a < b, b, count_blocks)
     loop = functools.partial(_key_loop, q=q, layer=0, head=head, k_hbm=k_hbm, v_hbm=v_hbm, k_buf=k_buf,
-                             v_buf=v_buf, sems=sems, tile=tile)
+                             v_buf=v_buf, sems=sems, tile=tile, pshift=pshift)
     carry = loop(carry, first_block, a, mask=window_mask, value_mask=real)
     carry = loop(carry, a, b, streamed=True)
     carry = loop(carry, b, count_blocks, mask=window_mask, value_mask=real)
@@ -3967,7 +3990,8 @@ def _flash_kernel_packed(length_ref, segment_ref, *refs, tile, q_tile, count, pr
 
 
 def _prefix_phase(carry, q, segment_ref, layer, head, first_row, rows, live, k_hbm, v_hbm, k_buf, v_buf, sems,
-                  *, tile, q_tile, count):
+                  *, tile, q_tile, count, pshift=0.0,
+                  fragment=None, exp_bf16=False):
     """The cached-prefix part of ``_flash_kernel_packed``: fold each
     sequence's arena rows into the online softmax ``carry`` of the query
     tile ``q`` (window ``rows``, from ``first_row``), once per distinct
@@ -3999,7 +4023,8 @@ def _prefix_phase(carry, q, segment_ref, layer, head, first_row, rows, live, k_h
             return (value_rows >= lo_row) & (value_rows < hi_row)
 
         loop = functools.partial(_key_loop, q=q, layer=layer, head=head, k_hbm=k_hbm, v_hbm=v_hbm,
-                                 k_buf=k_buf, v_buf=v_buf, sems=sems, tile=tile)
+                                 k_buf=k_buf, v_buf=v_buf, sems=sems, tile=tile, pshift=pshift,
+                                 fragment=fragment, exp_bf16=exp_bf16)
         # Whole blocks [a, b); without one, [lo, hi) is all edge.
         a, b = (lo_row + tile - 1) // tile, hi_row // tile
         a, b = jnp.where(a < b, a, hi), jnp.where(a < b, b, hi)
@@ -4033,7 +4058,19 @@ def _prefix_phase(carry, q, segment_ref, layer, head, first_row, rows, live, k_h
 # delayed PV follow the scheduling idea in heavyball-research/flywheel-tpu
 # (Apache-2.0), f646686, pallas/fwd_pipeline.py).
 FRAGMENT = 512
+# The FP8 prefix phase's query fragment, and its exponentials in BF16.
+FP8_FRAGMENT = 256
+FP8_EXP_BF16 = True
+# Rerun an FP8 streamed block exactly when its maximum jumps (else the whole loop).
+FP8_BLOCK_RERUN = True
 _ONES = 8
+_ONES_FP8 = 32  # an E4M3FN sublane tile
+# FP8 prefix probabilities are scaled by 2**PROB_SHIFT so small ones keep E4M3FN
+# precision; a streamed FP8 block may then exceed the carried maximum by at most
+# FP8_STALE_LIMIT before E4M3FN's 448 limit (2**(4 + 4.75) < 448), else the
+# loop reruns exactly.
+PROB_SHIFT = 4.0
+FP8_STALE_LIMIT = 4.75
 # Streamed blocks exponentiate against the maximum of the earlier key
 # blocks; probabilities reach at most 2**STALE_LIMIT before the
 # end-of-block rescale, far inside FP32/BF16 range even summed over a block.
@@ -4041,7 +4078,8 @@ STALE_LIMIT = 64.0
 
 
 def _key_loop(carry, lo, hi, *, q, layer, head, k_hbm, v_hbm, k_buf, v_buf, sems, tile, mask=None,
-              value_mask=None, streamed=False):
+              value_mask=None, streamed=False, pshift=0.0, fragment=None,
+              exp_bf16=False):
     """Fold key blocks ``[lo, hi)`` of arena layer ``layer`` (keys
     ``[L, 3, C, 256]``, values ``[L, 3, 128, C]``) into the transposed online
     softmax ``carry``: ``[1, Q]`` running maxima and ``[128 + _ONES, Q]``
@@ -4080,6 +4118,13 @@ def _key_loop(carry, lo, hi, *, q, layer, head, k_hbm, v_hbm, k_buf, v_buf, sems
                 copy.start()
 
         k, v = k_buf[slot], v_buf[slot]
+        if v.dtype == jnp.float8_e4m3fn:
+            if value_mask is not None:
+                value_keys = key_block * tile + jax.lax.broadcasted_iota(jnp.int32, (1, tile), 1)
+                v = jnp.where(value_mask(value_keys), v.astype(jnp.bfloat16),
+                              jnp.zeros((), jnp.bfloat16)).astype(jnp.float8_e4m3fn)
+            # A full FP8 sublane tile of ones rows; the fold keeps 128 + _ONES rows.
+            return k, jnp.concatenate((v, jnp.ones((_ONES_FP8, tile), v.dtype)), axis=0)
         if value_mask is not None:
             # One row of key indices: the mask varies along the keys only.
             value_keys = key_block * tile + jax.lax.broadcasted_iota(jnp.int32, (1, tile), 1)
@@ -4089,7 +4134,8 @@ def _key_loop(carry, lo, hi, *, q, layer, head, k_hbm, v_hbm, k_buf, v_buf, sems
     def step(key_block, carry):
         k, v = block(key_block)
         key_rows = key_block * tile + jax.lax.broadcasted_iota(jnp.int32, (tile, 1), 0)
-        return _exact_step(q, k, v, carry, None if mask is None else functools.partial(mask, key_rows))
+        return _exact_step(q, k, v, carry, None if mask is None else functools.partial(mask, key_rows),
+                           pshift=pshift, fragment=fragment, exp_bf16=exp_bf16)
 
     def exact(c):
         pl.when(lo < hi)(prime)
@@ -4098,33 +4144,50 @@ def _key_loop(carry, lo, hi, *, q, layer, head, k_hbm, v_hbm, k_buf, v_buf, sems
     if not streamed:
         return exact(carry)
 
+    fp8 = v_buf.dtype == jnp.float8_e4m3fn
+
     def stream(c):
         def body(key_block, state):
             c, worst = state
-            c, gap = _stale_step(q, *block(key_block), c)
-            return c, jnp.maximum(worst, gap)
+            k, v = block(key_block)
+            stale, gap = _stale_step(q, k, v, c, pshift=pshift,
+                                     fragment=fragment, exp_bf16=exp_bf16)
+            if fp8 and FP8_BLOCK_RERUN:
+                # E4M3FN overflows past FP8_STALE_LIMIT: redo only this block
+                # exactly (the running maximum rarely jumps), not the loop.
+                stale = jax.lax.cond(
+                    jnp.max(gap) > FP8_STALE_LIMIT,
+                    lambda: _exact_step(q, k, v, c, None, pshift=pshift,
+                                        fragment=fragment, exp_bf16=exp_bf16),
+                    lambda: stale)
+                return stale, worst
+            return stale, jnp.maximum(worst, gap)
 
         prime()
         first = step(lo, c)
         worst = jnp.full(c[0].shape, -jnp.inf, jnp.float32)
         result, worst = jax.lax.fori_loop(lo + 1, hi, body, (first, worst))
-        return jax.lax.cond(jnp.max(worst) > STALE_LIMIT, exact, lambda _: result, c)
+        limit = FP8_STALE_LIMIT if v_buf.dtype == jnp.float8_e4m3fn else STALE_LIMIT
+        return jax.lax.cond(jnp.max(worst) > limit, exact, lambda _: result, c)
 
     return jax.lax.cond(lo < hi, stream, lambda c: c, carry)
 
 
-def _exact_step(q, k, v, carry, mask):
+def _exact_step(q, k, v, carry, mask, *, pshift=0.0, fragment=None, exp_bf16=False):
     """One key block of the transposed online softmax (``_key_loop``), each
     query's maximum updated before exponentiating (a query may start with
     no key: a -inf maximum). ``v`` is ``[V^T; ones]``."""
     maximum, accumulator = carry
-    fragment = min(FRAGMENT, q.shape[0])
+    fragment = min(fragment or FRAGMENT, q.shape[0])
     maxima, accumulators = [], []
     previous = None
 
+    pdtype = v.dtype
+    rows = accumulator.shape[0]
+
     def fold(sl, probabilities, correction):
         weighted = jax.lax.dot_general(v, probabilities, (((1,), (0,)), ((), ())),
-                                       preferred_element_type=jnp.float32)
+                                       preferred_element_type=jnp.float32)[:rows]
         accumulators.append(accumulator[:, sl] * correction + weighted)
 
     for qi in range(q.shape[0] // fragment):
@@ -4136,7 +4199,11 @@ def _exact_step(q, k, v, carry, mask):
         new_maximum = jnp.maximum(maximum[:, sl], jnp.max(scores, axis=0, keepdims=True))
         # A query with no key yet keeps a -inf maximum; exponentiate against 0.
         safe_maximum = jnp.where(new_maximum == -jnp.inf, 0.0, new_maximum)
-        probabilities = jnp.exp2(scores - safe_maximum).astype(jnp.bfloat16)
+        exponent = scores - safe_maximum if not pshift else scores - (safe_maximum - pshift)
+        if exp_bf16:
+            probabilities = jnp.exp2(exponent.astype(jnp.bfloat16)).astype(pdtype)
+        else:
+            probabilities = jnp.exp2(exponent).astype(pdtype)
         maxima.append(new_maximum)
         if previous is not None:
             fold(*previous)
@@ -4146,7 +4213,7 @@ def _exact_step(q, k, v, carry, mask):
     return jnp.concatenate(maxima, axis=1), jnp.concatenate(accumulators, axis=1)
 
 
-def _stale_step(q, k, v, carry):
+def _stale_step(q, k, v, carry, *, pshift=0.0, fragment=None, exp_bf16=False):
     """One unmasked key block with every query's running maximum finite:
     exponentiate the block's scores against the carried maximum (not the
     block's own), so each score feeds the max and the exponent straight
@@ -4155,13 +4222,21 @@ def _stale_step(q, k, v, carry):
     step. Returns (carry, each query's block maximum less the carried
     one, ``[1, Q]``)."""
     maximum, accumulator = carry
-    fragment = min(FRAGMENT, q.shape[0])
+    fragment = min(fragment or FRAGMENT, q.shape[0])
     maxima, accumulators, gaps = [], [], []
     previous = None
 
+    pdtype = v.dtype
+    rows = accumulator.shape[0]
+
+    def probs(exponent):
+        if exp_bf16:
+            return jnp.exp2(exponent.astype(jnp.bfloat16)).astype(pdtype)
+        return jnp.exp2(exponent).astype(pdtype)
+
     def fold(sl, probabilities, reference, new_maximum):
         weighted = jax.lax.dot_general(v, probabilities, (((1,), (0,)), ((), ())),
-                                       preferred_element_type=jnp.float32)
+                                       preferred_element_type=jnp.float32)[:rows]
         accumulators.append((accumulator[:, sl] + weighted) * jnp.exp2(reference - new_maximum))
 
     for qi in range(q.shape[0] // fragment):
@@ -4170,7 +4245,8 @@ def _stale_step(q, k, v, carry):
                                      preferred_element_type=jnp.float32)  # [keys, queries]
         reference = maximum[:, sl]
         block_maximum = jnp.max(scores, axis=0, keepdims=True)
-        probabilities = jnp.exp2(scores - reference).astype(jnp.bfloat16)
+        exponent = scores - reference if not pshift else scores - (reference - pshift)
+        probabilities = probs(exponent)
         new_maximum = jnp.maximum(reference, block_maximum)
         maxima.append(new_maximum)
         gaps.append(block_maximum - reference)
@@ -4405,8 +4481,9 @@ def _expand_pages_kernel(order_ref, pages_hbm, up_ref, keys_hbm, values_hbm, buf
                 expanded = jnp.dot(x[:, :512], up_ref[:, h * 256:(h + 1) * 256],
                                    preferred_element_type=jnp.float32).astype(jnp.bfloat16)
                 kbuf[slot, h, rows, :] = jnp.concatenate(
-                    (expanded[:, :128], rope, jnp.zeros((page_tokens, 64), jnp.bfloat16)), axis=-1)
-                vbuf[slot, h, :, rows] = expanded[:, 128:].T
+                    (expanded[:, :128], rope, jnp.zeros((page_tokens, 64), jnp.bfloat16)),
+                    axis=-1).astype(kbuf.dtype)
+                vbuf[slot, h, :, rows] = expanded[:, 128:].T.astype(vbuf.dtype)
         for copy in writes(c, slot):
             copy.start()
         return carry
@@ -4442,18 +4519,19 @@ def expand_prefix_pages(pages, order, key_value_up):
     if capacity % span:
         raise ValueError(f"the prefix capacity must be a multiple of {span} tokens")
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    out_dtype = jnp.float8_e4m3fn if _config().prefill_prefix_fp8 else jnp.bfloat16
     keys, values = pl.pallas_call(
         functools.partial(_expand_pages_kernel, heads=heads),
-        out_shape=(jax.ShapeDtypeStruct((heads, capacity, 256), jnp.bfloat16),
-                   jax.ShapeDtypeStruct((heads, 128, capacity), jnp.bfloat16)),
+        out_shape=(jax.ShapeDtypeStruct((heads, capacity, 256), out_dtype),
+                   jax.ShapeDtypeStruct((heads, 128, capacity), out_dtype)),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
             in_specs=[hbm, pl.BlockSpec(memory_space=pltpu.VMEM)],
             out_specs=(hbm, hbm),
             scratch_shapes=(
                 pltpu.VMEM((2, EXPAND_PAGES, page_rows, packing, lanes), pages.dtype),
-                pltpu.VMEM((2, heads, span, 256), jnp.bfloat16),
-                pltpu.VMEM((2, heads, 128, span), jnp.bfloat16),
+                pltpu.VMEM((2, heads, span, 256), out_dtype),
+                pltpu.VMEM((2, heads, 128, span), out_dtype),
                 pltpu.SemaphoreType.DMA((3, 2)),
             ),
         ),
@@ -4492,6 +4570,15 @@ def mla_flash_prefill_packed(query, key, value, length, segments, *, count, tile
         raise ValueError(f"segments must be [{fields} * count]")
     length = jnp.asarray(length, jnp.int32).reshape((1,))
     q_tile, k_tile = _tiles(tokens, tokens, tile)
+    # Prefix keys stream in their own tiles (the arena capacity, not the
+    # window, bounds them); a window under 1024 rows is one query tile.
+    if _config().mla_flash_prefix_tiles and tokens < _config().mla_flash_qtile and tokens % 256 == 0:
+        q_tile = tokens
+    p_tile = k_tile
+    if arena is not None and _config().mla_flash_prefix_tiles:
+        p_tile = _config().mla_flash_ktile
+        if arena[0].shape[2] % p_tile:
+            p_tile = k_tile
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     scalars = (length, segments.astype(jnp.int32))
     operands = (query, key[None], jnp.swapaxes(value, 1, 2)[None])  # the window as a one-layer arena
@@ -4500,15 +4587,15 @@ def mla_flash_prefill_packed(query, key, value, length, segments, *, count, tile
         arena_keys, arena_values = arena
         if (arena_keys.ndim != 4 or arena_keys.shape[1:] != (heads, arena_keys.shape[2], 256)
                 or arena_values.shape != (*arena_keys.shape[:2], 128, arena_keys.shape[2])
-                or arena_keys.shape[2] % k_tile):
-            raise ValueError(f"arena must be [L,{heads},C,256] / [L,{heads},128,C] with C a multiple of {k_tile}")
+                or arena_keys.shape[2] % p_tile):
+            raise ValueError(f"arena must be [L,{heads},C,256] / [L,{heads},128,C] with C a multiple of {p_tile}")
         scalars += (jnp.asarray(layer, jnp.int32).reshape((1,)),)
         operands += (arena_keys, arena_values)
         in_specs += (hbm, hbm)
     name = "kimi_mla_flash_prefill_packed" + ("_prefixed" if arena is not None else "")
     return pl.pallas_call(
         functools.partial(_flash_kernel_packed, tile=k_tile, q_tile=q_tile, count=count,
-                          prefixed=arena is not None),
+                          prefixed=arena is not None, prefix_tile=p_tile),
         out_shape=jax.ShapeDtypeStruct((heads, tokens, 128), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=len(scalars),
@@ -4519,7 +4606,11 @@ def mla_flash_prefill_packed(query, key, value, length, segments, *, count, tile
                 pltpu.VMEM((2, k_tile, 256), jnp.bfloat16),
                 pltpu.VMEM((2, 128, k_tile), jnp.bfloat16),
                 pltpu.SemaphoreType.DMA((2, 2)),
-            ),
+            ) + ((
+                pltpu.VMEM((2, p_tile, 256), arena[0].dtype),
+                pltpu.VMEM((2, 128, p_tile), arena[1].dtype),
+                pltpu.SemaphoreType.DMA((2, 2)),
+            ) if arena is not None else ()),
         ),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel"), vmem_limit_bytes=64 * 1024**2,
@@ -4817,7 +4908,8 @@ def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity
             *(local_weights[name] for name in _PROJECTION_NAMES)
         )
         query, new_key, new_value, output_gate, latent = mla_projections(
-            full_hidden, projections, return_latent=True, query_scale=SCALE_LOG2)
+            full_hidden, projections, return_latent=True, query_scale=SCALE_LOG2,
+            sp_axis="k3_sp")
         tokens = query.shape[0]
         real = (jnp.arange(tokens) < length.reshape(()))[None, :, None]
         new_key = jnp.where(real, new_key.transpose(1, 0, 2), 0)
@@ -5751,6 +5843,18 @@ def make_dense_ffn_sp(mesh, *, seq_len):
 # SparseCore row movement does not lower inside a dynamic JAX loop.
 
 
+def _route_update(result, route, layer):
+    """A MoE call's output, and ``route`` [32, 92, 56] with the call's local
+    expert counts at MoE layer ``layer`` (when the MoE returns counts)."""
+    if not isinstance(result, tuple):
+        return result, route
+    out, counts = result
+    if route is None:
+        return out, route
+    return out, jax.lax.dynamic_update_slice(
+        route, counts[:, None, :].astype(route.dtype), (0, jnp.asarray(layer, jnp.int32).reshape(()), 0))
+
+
 def make_regular_group4_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capacity, mla_flash_tile=256):
     """One runtime-indexed group at layers 4g..4g+3 (g = 1..22) over a
     packed window: three KDA layers and one MLA layer, each followed by its
@@ -5788,7 +5892,7 @@ def make_regular_group4_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capac
         return jnp.asarray([value], jnp.int32)
 
     def run(prefix, blocks, common, kda_families, mla_families,
-            moe_families, kda_state, mla_state, length, group, segment_desc, arena):
+            moe_families, kda_state, mla_state, length, group, segment_desc, arena, route=None):
         base = group[0] * 4
         kda_states = tuple(kda_state)
         if len(kda_states) != len(kda_outputs):
@@ -5836,14 +5940,16 @@ def make_regular_group4_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capac
                 choose(common["ffn_norm"], index),
                 scalar(index // 12 + 1),
             )
-            prefix = moe(
+            prefix, route = _route_update(moe(
                 ffn_input, after_attention, moe_families,
                 length, scalar(index - 1),
-            )
+            ), route, index - 1)
+        if route is not None:
+            return prefix, blocks, kda_states, mla_cache, tap, route
         return prefix, blocks, kda_states, mla_cache, tap
 
     return jax.jit(run, out_shardings=(
-        sharding, sharding, (sharding,) * len(kda_outputs), (sharding,), sharding,
+        sharding, sharding, (sharding,) * len(kda_outputs), (sharding,), sharding, *((sharding,) if _config().prefill_route_counts else ()),
     ))
 
 
@@ -5860,24 +5966,26 @@ def make_regular_group8_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capac
     sharding = NamedSharding(mesh, P("k3_sp"))
 
     def run(prefix, blocks, common, kda_families, mla_families,
-            moe_families, kda_state, mla_state, length, pair, segment_desc, arena):
+            moe_families, kda_state, mla_state, length, pair, segment_desc, arena, route=None):
         first = jnp.asarray([2 * pair[0] + 1], jnp.int32)
         second = first + 1
         arenas = arena.split()
-        middle, blocks, kda_state, mla_state, _ = group4(
+        middle, blocks, kda_state, mla_state, _, *r1 = group4(
             prefix, blocks, common, kda_families, mla_families,
             moe_families, kda_state, mla_state, length, first,
-            segment_desc, arenas[0],
+            segment_desc, arenas[0], route,
         )
-        prefix, blocks, kda_state, mla_state, tap = group4(
+        prefix, blocks, kda_state, mla_state, tap, *r2 = group4(
             middle, blocks, common, kda_families, mla_families,
             moe_families, kda_state, mla_state, length, second,
-            segment_desc, arenas[1],
+            segment_desc, arenas[1], r1[0] if r1 else None,
         )
+        if r2:
+            return prefix, blocks, kda_state, mla_state, middle, tap, r2[0]
         return prefix, blocks, kda_state, mla_state, middle, tap
 
     return jax.jit(run, out_shardings=(
-        sharding, sharding, (sharding,) * 4, (sharding,), sharding, sharding,
+        sharding, sharding, (sharding,) * 4, (sharding,), sharding, sharding, *((sharding,) if _config().prefill_route_counts else ()),
     ))
 
 
@@ -5898,7 +6006,7 @@ def make_final_mla_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capacity, 
     moe = make_indexed_moe_sp_ring(mesh, seq_len=seq_len)
 
     def run(prefix, blocks, common, mla_families, moe_families,
-            mla_state, length, segment_desc, arena):
+            mla_state, length, segment_desc, arena, route=None):
         if len(mla_state) != 1:
             raise ValueError("mla_state is (latents,)")
         attn_res = common["attn_res"][:, 92]
@@ -5919,14 +6027,16 @@ def make_final_mla_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capacity, 
             after_attention, blocks, common["mlp_res"][:, 92],
             common["ffn_norm"][:, 92], active,
         )
-        prefix = moe(
+        prefix, route = _route_update(moe(
             ffn_input, after_attention, moe_families,
             length, jnp.asarray([91], jnp.int32),
-        )
+        ), route, 91)
+        if route is not None:
+            return prefix, blocks, mla_cache, route
         return prefix, blocks, mla_cache
 
     return jax.jit(run, out_shardings=(
-        sharding, sharding, (sharding,),
+        sharding, sharding, (sharding,), *((sharding,) if _config().prefill_route_counts else ()),
     ))
 
 
@@ -5991,7 +6101,7 @@ def make_prefill_stack_sp_indexed(mesh, *, seq_len=8192, depth=93, segments, pre
     kda_outputs = (3, 4, 6, 7)  # rec, hist, rec_at, hist_at in the KDA op's result
 
     def run(hidden, common, kda_families, mla_families, moe_families,
-            kda_state, mla_state, length, segment_desc, arena):
+            kda_state, mla_state, length, segment_desc, arena, route=None):
         kda_state = tuple(kda_state)
         if len(kda_state) != len(kda_outputs):
             raise ValueError("kda_state is (rec, hist, rec_at, hist_at)")
@@ -6024,7 +6134,7 @@ def make_prefill_stack_sp_indexed(mesh, *, seq_len=8192, depth=93, segments, pre
         )
 
         def body(index, carry):
-            prefix, blocks, kda_states, mla_cache, tap = carry
+            prefix, blocks, kda_states, mla_cache, tap, route = carry
             if tap_layer is not None:
                 tap = jnp.where(index == tap_layer, prefix, tap)
             blocks = jax.lax.cond(
@@ -6068,24 +6178,25 @@ def make_prefill_stack_sp_indexed(mesh, *, seq_len=8192, depth=93, segments, pre
                 choose(common["ffn_norm"], index),
                 active(index // 12 + 1),
             )
-            prefix = moe(
+            prefix, route = _route_update(moe(
                 ffn_input, after_attention, moe_families,
                 length, active(index - 1),
-            )
-            return prefix, blocks, kda_states, mla_cache, tap
+            ), route, index - 1)
+            return prefix, blocks, kda_states, mla_cache, tap, route
 
         result = jax.lax.fori_loop(
             1, depth, body,
-            (prefix, blocks, kda_states, tuple(mla_state), prefix if tap_layer is not None else None),
+            (prefix, blocks, kda_states, tuple(mla_state), prefix if tap_layer is not None else None, route),
             unroll=unroll,
         )
+        extra = (result[5],) if route is not None else ()
         if tap_layer is not None:
-            return (result[0], result[1], result[2], result[3], result[4])
-        return (result[0], result[1], result[2], result[3])
+            return (result[0], result[1], result[2], result[3], result[4], *extra)
+        return (result[0], result[1], result[2], result[3], *extra)
 
     return jax.jit(run, out_shardings=(
         sharding, sharding, (sharding,) * len(kda_outputs), (sharding,),
-        *((sharding,) if tap_layer is not None else ()),
+        *((sharding,) if tap_layer is not None else ()), *((sharding,) if _config().prefill_route_counts else ()),
     ))
 
 
@@ -6094,6 +6205,9 @@ def make_prefill_stack_sp_indexed(mesh, *, seq_len=8192, depth=93, segments, pre
 # ============================================================================
 #
 # The vocab-sharded embedding and each packed sequence's first-token logits.
+
+
+EMBED_BF16_REDUCE = True
 
 
 def make_embedding_sp(mesh, *, seq_len, vocab_per_rank=5120):
@@ -6111,9 +6225,11 @@ def make_embedding_sp(mesh, *, seq_len, vocab_per_rank=5120):
         table = embedding[0]
         if table.shape != (vocab_per_rank, 7168):
             raise ValueError("embedding table has wrong per-rank shape")
+        # One rank holds each token's row and the rest add zeros, so a BF16
+        # reduce-scatter is exact (and half the bytes of FP32).
         partial = jnp.where(
             matched[:, None], table[jnp.clip(local_ids, 0, vocab_per_rank - 1)], 0
-        ).astype(jnp.float32)
+        ).astype(jnp.bfloat16 if EMBED_BF16_REDUCE else jnp.float32)
         hidden = jax.lax.psum_scatter(
             partial, axis_name, scatter_dimension=0, tiled=True
         ).astype(jnp.bfloat16)
