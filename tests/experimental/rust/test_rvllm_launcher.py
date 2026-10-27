@@ -35,7 +35,10 @@ try:
     from vllm_torchtpu.experimental.rust import launcher
 
     PARSER = export_cli.build_arg_parser()
-    if "--max-model-len" not in PARSER._option_string_actions:
+    # Without a usable platform device (the CPU CI runner), build_arg_parser()
+    # falls back to a minimal parser that also defines --max-model-len, so test
+    # for the `model_tag` positional that only the real `vllm serve` parser has.
+    if "model_tag" not in {a.dest for a in PARSER._actions}:
         raise RuntimeError("the vllm serve parser is not available")
 except Exception as e:  # noqa: BLE001
     pytest.skip(f"vLLM's serve parser is unavailable: {e}", allow_module_level=True)
