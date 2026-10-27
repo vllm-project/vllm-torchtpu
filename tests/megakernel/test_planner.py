@@ -157,7 +157,7 @@ def test_k_tile_divisors_and_config_errors():
 
 def test_encode_ecopy():
     """Verify `encode_ecopy` packs cross-rank secondary replicas and warns on
-    same-rank or duplicate secondary placements."""
+    out-of-range, same-rank, or duplicate secondary placements."""
     assert mk.encode_ecopy is planner.encode_ecopy
 
     # moe_tp=True or EW <= ER disables redundant copy descriptors
@@ -167,10 +167,14 @@ def test_encode_ecopy():
 
     # E=4, ER=2, EW=4 (extra=2):
     # rank 0 primary=[0, 1], extra=[2, -1] -> expert 2 (vid=2) gets 1 + 0*2 + 0 = 1.0
-    # rank 1 primary=[2, 3], extra=[99, 0] -> expert 99 ignored; expert 0 (vid=0)
-    # gets 1 + 1*2 + 1 = 4.0
-    cores = [[0, 1, 2, -1], [2, 3, 99, 0]]
+    # rank 1 primary=[2, 3], extra=[-1, 0] -> expert 0 (vid=0) gets 1 + 1*2 + 1 = 4.0
+    cores = [[0, 1, 2, -1], [2, 3, -1, 0]]
     assert planner.encode_ecopy(4, 2, 4, False, cores) == [4.0, 0.0, 1.0, 0.0]
+
+    # Out-of-range or unmapped expert id (>= E) warns and is ignored
+    with pytest.warns(UserWarning, match="out of range"):
+        oor = planner.encode_ecopy(4, 2, 4, False, [[0, 1, 2, -1], [2, 3, 99, 0]])
+    assert oor == [4.0, 0.0, 1.0, 0.0]
 
     # Same-rank redundant replica warns and is ignored
     with pytest.warns(UserWarning, match="ignoring same-rank replica"):

@@ -488,7 +488,13 @@ def encode_ecopy(E: int, ER: int, EW: int, moe_tp: bool, cores: Any) -> list[flo
             if g_int < 0:
                 continue
             v = vid.get(g_int)
-            if v is None:
+            if not (0 <= g_int < E) or v is None or not (0 <= v < E):
+                warnings.warn(
+                    f"encode_ecopy: expert {g_int} at redundant slot "
+                    f"(rank={r1}, slot={k}) is out of range [0, {E}) or missing "
+                    "from primary slots; ignoring.",
+                    stacklevel=2,
+                )
                 continue
             if v // ER == r1:
                 warnings.warn(
