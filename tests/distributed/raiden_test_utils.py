@@ -269,7 +269,7 @@ def dsv4_materialization(*, num_blocks=16, tokens_per_page=256):
     # allocates them; everything overlaid on NoPE inherits that.
     csa_nope = [words(tokens) for _ in range(2)]
     csa_rope = [words(tokens // 4) for _ in range(2)]
-    indexer = [cache(tokens // 4, 256) for _ in range(2)]
+    indexer = [cache(33, 256) for _ in range(2)]
     hca = cache(tokens * 2, 128)
 
     csa_names = [f"model.layers.{i}.self_attn.attn" for i in range(2)]

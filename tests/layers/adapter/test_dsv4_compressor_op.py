@@ -48,14 +48,13 @@ def _state_cache(compress_ratio: int, head_dim: int = 512):
     [
         # CSA: its state overlays its own compressed-KV page.
         (4, 512, 1024, 16),
-        (4, 512, 512, 8),
         # HCA state rows are hosted on a *CSA* page, not on HCA's own (which
         # holds two token states), so the page is far larger than HCA's
         # compression ratio alone would suggest.
         (128, 512, 1024, 32),
         (128, 512, 512, 16),
-        # The lightning indexer: 256-lane records. Its own page holds 32
-        # token states, but it is floored to CSA's 16 so the two share a
+        # The lightning indexer: 33 SEQ_ALONG_LANE rows of 1024 bytes hold 16
+        # token states (2 rows each), matching CSA's 16 so the two share a
         # `(block_size, sliding_window)` cache group.
         (4, 128, 1024, 16),
     ],
@@ -80,6 +79,22 @@ def test_state_block_size_refuses_a_page_holding_no_row():
     cache = _state_cache(128)
     with pytest.raises(ValueError, match="cannot be paged"):
         cache._derive_block_size(64)
+
+
+@pytest.mark.parametrize("compress_ratio, head_dim", [(4, 512), (4, 128)])
+def test_state_block_size_with_seq_along_lane_indexer(compress_ratio, head_dim):
+    """The SEQ_ALONG_LANE indexer requires a 1024-token block (256 compressed tokens).
+
+    The SEQ_ALONG_LANE indexer page holds 16 compressor states, the same as a
+    CSA page, so CSA and the indexer can stay in the same KV cache group. The
+    layout only works with 256 compressed tokens per page (a 1024-token
+    block). Any other block size raises an error when the block size is
+    computed, instead of failing later inside the kernel.
+    """
+    cache = _state_cache(compress_ratio, head_dim)
+    assert cache._derive_block_size(1024) == 16
+    with pytest.raises(ValueError, match="cannot be paged"):
+        cache._derive_block_size(512)
 
 
 def test_state_cache_spec_is_raw_uint8_at_the_host_page_size():

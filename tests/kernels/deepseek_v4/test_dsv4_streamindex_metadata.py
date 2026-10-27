@@ -13,6 +13,9 @@
 # limitations under the License.
 """Tests for batch_tile_idx, bq_idx, and bkv_idx metadata (GDN v3 style)."""
 
+import re
+
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -103,6 +106,34 @@ class MetadataTest(parameterized.TestCase):
         )
 
         self.assertEqual(int(meta.num_steps[0]), 1)
+
+    def test_compute_metadata_static_verify_windows(self):
+        """Speculative verify windows on the static-q pass (PREFILL case with
+        `static_q_len` = 1 + K): one query block per sequence since the kernel
+        sets `bq_sz = static_q_len`, and the usual kv blocks."""
+        seq_lens = jnp.array([128, 256, 200], dtype=jnp.int32)
+        cu_q_lens = jnp.array([0, 7, 14, 21], dtype=jnp.int32)
+
+        meta = metadata.compute_metadata(
+            seq_lens=seq_lens,
+            cu_q_lens=cu_q_lens,
+            start_seq_idx=0,
+            end_seq_idx=3,
+            bq_sz=7,
+            bkv_sz=128,
+            pages_per_seq=2,
+            page_size=128,
+            max_num_tokens=21,
+            compression_ratio=1,
+            static_q_len=7,
+            seq_batch_size=1,
+        )
+
+        # kv blocks per sequence: 1, 2, 2 -> 5 tiles, each the single q block.
+        self.assertEqual(int(meta.num_steps[0]), 5)
+        np.testing.assert_array_equal(np.array(meta.start_seq_idx)[:5], [0, 1, 1, 2, 2])
+        np.testing.assert_array_equal(np.array(meta.bq_idx)[:5], [0, 0, 0, 0, 0])
+        np.testing.assert_array_equal(np.array(meta.bkv_idx)[:5], [0, 0, 1, 0, 1])
 
     def test_compute_batched_seq_metadata_decode(self):
         seq_lens = jnp.array([128, 256, 512, 64], dtype=jnp.int32)
@@ -311,6 +342,72 @@ class MetadataTest(parameterized.TestCase):
             print(f"Tile {tile_id:02d}: {phase:<38s} | bq_idx={bq} | bkv_idx={bkv}")
 
         print("=" * 60 + "\n")
+
+
+class SharedScheduleTest(absltest.TestCase):
+    """The schedule has no conditional, so the indexer layers of a step share it.
+
+    Every indexer layer builds the same schedule from the same step metadata.
+    XLA never CSEs a conditional, so an empty-pass `lax.cond` here would give
+    each layer its own copy.
+    """
+
+    SEQ_LENS = (700, 900, 300, 50)
+    CU_Q_LENS = (0, 4, 8, 12, 16)
+
+    def _meta(self, seq_lens, cu_q_lens, start, end):
+        return metadata.compute_metadata(
+            seq_lens=seq_lens,
+            cu_q_lens=cu_q_lens,
+            start_seq_idx=start,
+            end_seq_idx=end,
+            bq_sz=4,
+            bkv_sz=2 * 256,
+            pages_per_seq=8,
+            page_size=256,
+            max_num_tokens=16,
+        )
+
+    def _args(self, start, end):
+        return (
+            jnp.array(self.SEQ_LENS, jnp.int32),
+            jnp.array(self.CU_Q_LENS, jnp.int32),
+            jnp.int32(start),
+            jnp.int32(end),
+        )
+
+    def test_empty_pass_is_all_zeros(self):
+        meta = jax.jit(self._meta)(*self._args(2, 2))
+        for name in ("num_steps", "batch_tile_idx", "bq_idx", "bkv_idx"):
+            arr = np.asarray(getattr(meta, name))
+            self.assertTrue((arr == 0).all(), f"{name} not zeroed for an empty pass")
+        live = jax.jit(self._meta)(*self._args(0, 4))
+        self.assertGreater(int(np.asarray(live.num_steps).sum()), 0, "vacuous")
+
+    def test_schedule_lowers_without_a_conditional(self):
+        txt = jax.jit(self._meta).lower(*self._args(0, 4)).as_text()
+        self.assertIsNone(re.search(r"stablehlo\.(case|if)\b", txt))
+
+    def test_identical_schedules_compile_to_one_copy(self):
+        def layers(n, seq_lens, cu_q_lens, start, end):
+            total = jnp.int32(0)
+            for i in range(n):
+                meta = self._meta(seq_lens, cu_q_lens, start, end)
+                total = total + (i + 1) * (jnp.sum(meta.bq_idx) + meta.num_steps[0])
+            return total
+
+        def n_instructions(n):
+            txt = (
+                jax.jit(layers, static_argnums=0)
+                .lower(n, *self._args(0, 4))
+                .compile()
+                .as_text()
+            )
+            return sum(1 for line in txt.splitlines() if " = " in line)
+
+        one, two = n_instructions(1), n_instructions(2)
+        # The second layer adds only its own consumer ops, not a schedule.
+        self.assertLess(4 * (two - one), one, f"1 layer {one}, 2 layers {two}")
 
 
 class ChunkedMetadataTest(parameterized.TestCase):

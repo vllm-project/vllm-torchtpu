@@ -120,7 +120,9 @@ def _build_indexer(dtype=torch.float32, n_head=N_HEAD, buffer_tokens=32):
         qk_rope_head_dim=ROPE_DIM,
     )
     vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(max_model_len=MAX_MODEL_LEN)
+        model_config=SimpleNamespace(max_model_len=MAX_MODEL_LEN),
+        # VllmConfig resolves this to 5 for a max_model_len up to 256K.
+        attention_config=SimpleNamespace(sparse_mla_prefill_workspace_factor=5),
     )
     topk_indices_buffer = torch.full((buffer_tokens, TOPK), -1, dtype=torch.int32)
 

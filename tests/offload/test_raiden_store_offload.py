@@ -50,6 +50,10 @@ physical TPU hardware or native C++ wheels:
    - Settings: extra-config and env sources, and the fail-fast checks.
    - Plumbing: BackendConfigs reach the store and every worker, and nothing
      new is passed while the tier is off.
+
+5. Diverged Hybrid Hits:
+   - A full-attention local hit deeper than the Mamba one: the store's hit
+     ends where it holds the recurrent state, and is 0 without it.
 """
 
 import enum
@@ -3438,6 +3442,158 @@ class TestStoragePlumbing(unittest.TestCase):
         plain, tiered = self.manager_kwargs
         self.assertNotIn("backend_configs", plain)
         self.assertEqual(tiered["backend_configs"], [cfg])
+
+
+class TestDivergedHybridHitLookup(unittest.TestCase):
+    """The offload child's lookup on a diverged hybrid hit.
+
+    With TPU_RAIDEN_PREFIX_AWARE_LOAD=1 the connector reports
+    supports_divergent_local_hybrid_hits, so the scheduler may start from a
+    full-attention local hit deeper than the Mamba one. That is safe because
+    the lookup treats a Mamba group as a one-chunk window: a host hit ends
+    where the store holds the recurrent state, and without it the answer is
+    0, which makes the scheduler fall back to the common boundary. These run
+    the real lookup (upstream OffloadingConnectorScheduler, not patched) and
+    the real RaidenOffloadingManager over the fake store.
+    """
+
+    BLOCK = 16
+    # Five full blocks; the last prompt token is always recomputed.
+    PROMPT = 5 * BLOCK + 1
+    # Full-attention local hit: chunk 0. The Mamba state for it is absent.
+    LOCAL = BLOCK
+    ATTN, MAMBA = 0, 1
+
+    def setUp(self):
+        import torch
+        from vllm import SamplingParams
+        from vllm.utils.hashing import sha256
+        from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+        from vllm.v1.kv_cache_interface import (
+            FullAttentionSpec,
+            KVCacheConfig,
+            KVCacheGroupSpec,
+            MambaSpec,
+        )
+        from vllm.v1.kv_offload.base import OffloadingKVEventsConfig
+        from vllm.v1.request import Request
+
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
+
+        self.store = FakeKVCacheStore()
+        self.manager = make_manager(self.store)
+        attn = FullAttentionSpec(
+            block_size=self.BLOCK, num_kv_heads=1, head_size=8, dtype=torch.bfloat16
+        )
+        mamba = MambaSpec(
+            block_size=self.BLOCK,
+            shapes=((2, 8),),
+            dtypes=(torch.bfloat16,),
+            mamba_cache_mode="align",
+        )
+        kv_cache_config = KVCacheConfig(
+            num_blocks=64,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(["attn"], attn),
+                KVCacheGroupSpec(["gdn"], mamba),
+            ],
+        )
+        # Only the fields the scheduler reads; the store spec's sizing and
+        # control plane play no part in a lookup.
+        spec = SimpleNamespace(
+            config=SimpleNamespace(
+                groups=[
+                    SimpleNamespace(group_id=group, tokens_per_block=self.BLOCK)
+                    for group in (self.ATTN, self.MAMBA)
+                ]
+            ),
+            blocks_per_chunk=1,
+            tokens_per_block=[self.BLOCK, self.BLOCK],
+            tokens_per_hash=self.BLOCK,
+            offload_prompt_only=False,
+            kv_events_config=OffloadingKVEventsConfig(
+                enable_kv_cache_events=False, self_describing_kv_events=False
+            ),
+            get_manager=lambda: self.manager,
+        )
+        vllm_config = SimpleNamespace(
+            cache_config=SimpleNamespace(
+                prefix_cache_retention_interval=None, enable_prefix_caching=True
+            ),
+            speculative_config=None,
+            parallel_config=SimpleNamespace(
+                world_size=2, decode_context_parallel_size=1
+            ),
+        )
+        self.scheduler = TPURaidenOffloadingScheduler(
+            spec, vllm_config, kv_cache_config
+        )
+        init_none_hash(sha256)
+        params = SamplingParams(max_tokens=1)
+        params.update_from_generation_config({}, 2)
+        self.request = Request(
+            "req",
+            list(range(self.PROMPT)),
+            params,
+            None,
+            block_hasher=get_request_block_hasher(self.BLOCK, sha256),
+        )
+        self.scheduler.on_new_request(self.request)
+
+    def _key(self, group: int, chunk: int):
+        from vllm.v1.kv_offload.base import make_offload_key
+
+        return make_offload_key(self.request.block_hashes[chunk], group)
+
+    def _seed(self, group: int, *chunks: int) -> None:
+        for chunk in chunks:
+            seed_host_entries(self.store, self._key(group, chunk))
+
+    def _hit(self) -> int | None:
+        hit, _ = self.scheduler.get_num_new_matched_tokens(self.request, self.LOCAL)
+        return hit
+
+    def test_no_hit_without_the_recurrent_state(self):
+        # Attention chunks 1-3 are on the host but no Mamba state is: loading
+        # them would leave the request without the state at their end.
+        self._seed(self.ATTN, 1, 2, 3)
+        self.assertEqual(self._hit(), 0)
+
+    def test_hit_ends_at_the_recurrent_state_and_loads_its_block(self):
+        from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+        from vllm.v1.core.kv_cache_utils import KVCacheBlock
+
+        self._seed(self.ATTN, 1, 2, 3)
+        self._seed(self.MAMBA, 3)
+        self.assertEqual(self._hit(), 3 * self.BLOCK)
+
+        # Block 0 of each group is the local hit. A Mamba group holds null
+        # blocks below the boundary and a fresh block at its end.
+        attn_blocks = [KVCacheBlock(block_id) for block_id in (10, 11, 12, 13)]
+        mamba_blocks = [KVCacheBlock(0) for _ in range(3)] + [KVCacheBlock(23)]
+        for block in mamba_blocks[:3]:
+            block.is_null = True
+        self.scheduler.update_state_after_alloc(
+            self.request,
+            KVCacheBlocks(blocks=(attn_blocks, mamba_blocks)),
+            3 * self.BLOCK,
+        )
+        (job,) = self.scheduler._current_batch_load_jobs.values()
+        self.assertEqual(list(job.dst_spec.block_ids), [11, 12, 13, 23])
+        (status,) = self.scheduler._jobs.values()
+        loaded = {self._key(self.ATTN, chunk) for chunk in (1, 2, 3)}
+        self.assertEqual(status.keys, loaded | {self._key(self.MAMBA, 3)})
+        # prepare_load pinned the Mamba state's host blocks for the transfer.
+        for sub_hash in sub_hashes(self._key(self.MAMBA, 3)):
+            self.assertEqual(self.store.entries[sub_hash].pin_count, 1)
+
+    def test_hit_stops_at_an_earlier_recurrent_state(self):
+        # The state is on the host at chunk 2 but not at chunk 3, so the hit
+        # ends at chunk 2 although attention reaches chunk 3.
+        self._seed(self.ATTN, 1, 2, 3)
+        self._seed(self.MAMBA, 2)
+        self.assertEqual(self._hit(), 2 * self.BLOCK)
 
 
 if __name__ == "__main__":

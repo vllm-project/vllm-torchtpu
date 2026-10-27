@@ -328,8 +328,11 @@ def _greedy_rejection_sample(
 
     if total_tokens > 0:
         if synthetic_mode:
-            assert accept_u is not None
-            assert synthetic_conditional_rates is not None
+            if accept_u is None or synthetic_conditional_rates is None:
+                raise ValueError(
+                    "synthetic rejection sampling requires accept_u and "
+                    "synthetic_conditional_rates"
+                )
             conditional_rates = synthetic_conditional_rates[
                 group_indices.to(torch.int64)
             ]
@@ -479,7 +482,10 @@ def _random_rejection_sample_with_segment(
         -1, safe_draft_token_ids.unsqueeze(-1)
     ).squeeze(-1)
     if synthetic_mode:
-        assert synthetic_conditional_rates is not None
+        if synthetic_conditional_rates is None:
+            raise ValueError(
+                "synthetic rejection sampling requires synthetic_conditional_rates"
+            )
         conditional_rates = synthetic_conditional_rates[group_indices.to(torch.int64)]
         accepted = accept_u < conditional_rates
     else:

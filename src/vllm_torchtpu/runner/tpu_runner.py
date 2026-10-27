@@ -97,6 +97,11 @@ from vllm_torchtpu import envs, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
+from vllm_torchtpu.distributed.kv_transfer.kv_save_nan_check import (
+    KVSaveNanCheck,
+    begin_kv_save_nan_check,
+    wait_for_save_with_nan_check,
+)
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorStats,
 )
@@ -110,6 +115,9 @@ from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
     PallasAttentionBackend,
     PallasAttentionBackendImpl,
+)
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import (
+    static_verify_q_len,
 )
 from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
     copy_mamba_state_blocks,
@@ -129,6 +137,8 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadataBuilderContext,
     attention_block_table_width,
     stage_block_table_uploads,
+    stage_h2d_upload,
+    zeros_h2d_source,
 )
 from vllm_torchtpu.layers.core.sequence_layout import (
     SequenceLayoutKind,
@@ -142,6 +152,7 @@ from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
 from vllm_torchtpu.runner import greedy_top_tokens
 from vllm_torchtpu.runner import utils as runner_utils
+from vllm_torchtpu.runner.kernel_block_table import install_kernel_block_tables
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import (
     MMEncoderManager,
@@ -216,6 +227,7 @@ class ExecuteModelState:
     # logits_list holds the greedy tokens ([rows, 1]), not logits
     # (TPU_GREEDY_TOP_TOKENS).
     top_tokens: bool = False
+    kv_save_nan_check: KVSaveNanCheck | None = None
 
 
 # Per-step mamba read-offset operations, consolidated into single cached
@@ -363,10 +375,18 @@ def _substitute_placeholder_token(
     Return:
         input_ids with real placeholders replaced; padding slots untouched.
     """
-    assert (
+    # torch._assert, not assert or raise: it survives python -O, and under
+    # torch.compile(fullgraph=True) the caller still sees this message.
+    torch._assert(
         input_ids.shape[0]
         == token_in_tpu_cur_input_indices.shape[0]
-        == token_in_tpu_pre_next_tokens_indices.shape[0]
+        == token_in_tpu_pre_next_tokens_indices.shape[0],
+        "placeholder substitution inputs must share one length: "
+        f"input_ids.shape[0]={input_ids.shape[0]}, "
+        "token_in_tpu_cur_input_indices.shape[0]="
+        f"{token_in_tpu_cur_input_indices.shape[0]}, "
+        "token_in_tpu_pre_next_tokens_indices.shape[0]="
+        f"{token_in_tpu_pre_next_tokens_indices.shape[0]}",
     )
     mask = token_in_tpu_pre_next_tokens_indices > -1
     # clamp_min(0) gives a safe in-range gather index for the -1 sentinel
@@ -908,11 +928,6 @@ class TPUModelRunner(GPUModelRunner):
             dtype=torch.int32,
             device="cpu",
         )
-        # CPU staging for compact-mamba per-request recurrent-slot ids; H2D
-        # copied each step into `AttentionMetadata.mamba_state_indices`.
-        self.mamba_state_indices_cpu = torch.zeros(
-            self.max_num_reqs, dtype=torch.int32, device="cpu"
-        )
         # Block-table-derived mamba state: the state-block position each
         # request's state currently lives at, the mamba-group -> raw-pool
         # mapping (built in initialize_kv_cache), and the block-seed copies
@@ -945,7 +960,6 @@ class TPUModelRunner(GPUModelRunner):
             self.max_num_tokens, dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
         )
         self.seq_lens_np = self.seq_lens_cpu.numpy()
-        self._block_table_stage_cpu: torch.Tensor | None = None
         if self.supports_mm_inputs:
             self.is_mm_embed_cpu = torch.zeros(
                 self.max_num_tokens,
@@ -997,6 +1011,16 @@ class TPUModelRunner(GPUModelRunner):
         # (input_ids_cpu, positions_cpu, seq_lens_cpu, ...); the next chunk
         # waits on it before rewriting them.
         self._input_staging_fence: Any = None
+        # Per-call host sources of non-blocking uploads (block tables, mamba
+        # slot ids), kept alive alongside their post-fence release callback
+        # until a fence recorded after them has been waited on; see
+        # `stage_h2d_upload` and `_record_input_staging_fence`.
+        # TODO: Extract this non-blocking H2D buffer staging and recycling
+        # lifecycle into a standalone helper class in a future refactor.
+        self._unfenced_h2d_sources: list[tuple[torch.Tensor, Callable[[], None]]] = []
+        self._fenced_h2d_sources: list[tuple[torch.Tensor, Callable[[], None]]] = []
+        self._free_h2d_sources: dict[tuple[int, torch.dtype], list[torch.Tensor]] = {}
+        self._registered_h2d_sources: set[int] = set()
         self._cached_query_start_loc: torch.Tensor | None = None
         self._cached_logits_indices: torch.Tensor | None = None
         self._cached_request_distribution: torch.Tensor | None = None
@@ -1065,6 +1089,7 @@ class TPUModelRunner(GPUModelRunner):
         # The step whose KV-connector progress an intermediate stage still
         # owes in sample_tokens.
         self._pp_pending_scheduler_output: SchedulerOutput | None = None
+        self._pp_pending_kv_save_nan_check: KVSaveNanCheck | None = None
 
         # Tracks token padding in each step.
         self._token_padding_state: token_padding.TokenPaddingState | None = None
@@ -1186,9 +1211,13 @@ class TPUModelRunner(GPUModelRunner):
         else:
             kv_connector.start_load_kv(None)
 
-    def maybe_wait_for_kv_save(self) -> None:
+    def maybe_wait_for_kv_save(self, nan_check: KVSaveNanCheck | None = None) -> None:
         if has_kv_transfer_group():
-            get_kv_transfer_group().wait_for_save()
+            connector = get_kv_transfer_group()
+            if nan_check is None:
+                connector.wait_for_save()
+            else:
+                wait_for_save_with_nan_check(connector, nan_check)
 
     def get_finished_kv_transfers(self, scheduler_output):
         if not has_kv_transfer_group():
@@ -1270,6 +1299,14 @@ class TPUModelRunner(GPUModelRunner):
     def _init_speculative_decoding(self) -> None:
         self.drafter = None
         self.rejection_sampler = None
+        # Full speculative verify windows (1 + K tokens) lead the verify
+        # segment and their count goes into request_distribution[1]
+        # (_reorder_batch_for_rpa, _build_attention_metadata). The length
+        # comes from the one helper the DSv4 attention and indexer ops use
+        # too, since only ops that implement the static query-length pass may
+        # see rows in that segment; see static_verify_q_len for why.
+        self._static_verify_q_len: int | None = static_verify_q_len(self.vllm_config)
+        self._num_static_verify_reqs = 0
         # Drafting and verification happen where sampling happens, on the
         # last pipeline stage; the other stages keep the config for the KV
         # cache spec and the scheduler, and nothing else.
@@ -1527,7 +1564,9 @@ class TPUModelRunner(GPUModelRunner):
         [1-token decodes][spec verify windows][prefill/mixed]. Ragged paged
         attention keeps its 1-token decode front segment, while the GDN
         kernel's windowed mode covers the first two segments contiguously
-        (see `AttentionMetadata.mamba_request_distribution`).
+        (see `AttentionMetadata.mamba_request_distribution`). With a static
+        verify length, the windows of exactly that length lead the verify
+        segment and `_num_static_verify_reqs` counts them.
 
         Returns:
             (num_decode, num_windowed): the number of 1-token decode requests
@@ -1549,34 +1588,46 @@ class TPUModelRunner(GPUModelRunner):
                 return 1
             return 2
 
-        def partition(start: int, end: int, bound: int) -> int:
-            """Two-pointer partition of [start, end]: requests with
-            segment <= bound before the rest. Returns the first index of the
-            second part."""
+        def partition(start: int, end: int, first) -> int:
+            """Two-pointer partition of [start, end]: requests for which
+            `first(req_id)` holds before the rest. Returns the first index of
+            the second part."""
             i, j = start, end
             while i < j:
                 i_req_id = self.input_batch.req_ids[i]
                 j_req_id = self.input_batch.req_ids[j]
                 assert i_req_id is not None
                 assert j_req_id is not None
-                if segment(i_req_id) <= bound:
+                if first(i_req_id):
                     i += 1
-                elif segment(j_req_id) > bound:
+                elif not first(j_req_id):
                     j -= 1
                 else:
                     self.input_batch.swap_states(i, j)
                     i += 1
                     j -= 1
-            if i == j and segment(self.input_batch.req_ids[i]) <= bound:
+            if i == j and first(self.input_batch.req_ids[i]):
                 i += 1
             return i
 
         # Pass 1: 1-token decode requests to the front.
-        num_decode = partition(0, num_reqs - 1, 0)
+        num_decode = partition(0, num_reqs - 1, lambda r: segment(r) == 0)
         # Pass 2: speculative verify windows before prefill/mixed requests.
         num_windowed = num_decode
         if spec_decode_tokens and num_decode < num_reqs:
-            num_windowed = partition(num_decode, num_reqs - 1, 1)
+            num_windowed = partition(
+                num_decode, num_reqs - 1, lambda r: segment(r) <= 1
+            )
+        # Pass 3: full-length verify windows first within the verify segment.
+        self._num_static_verify_reqs = 0
+        q_len = getattr(self, "_static_verify_q_len", None)
+        if q_len is not None and num_decode < num_windowed:
+            num_full = partition(
+                num_decode,
+                num_windowed - 1,
+                lambda r: scheduler_output.num_scheduled_tokens[r] == q_len,
+            )
+            self._num_static_verify_reqs = num_full - num_decode
         mla_dispatch.maybe_order_prefills_by_kv_len(
             self, num_decode, num_reqs, scheduler_output, spec_decode_tokens
         )
@@ -1672,6 +1723,7 @@ class TPUModelRunner(GPUModelRunner):
     # KV-cache spec derivation, sizing and allocation live on
     # `self.kv_cache_manager` now; these forward the runner's existing callers.
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+        self._refresh_smem_request_caps()
         with set_current_vllm_config(self.vllm_config):
             return self.kv_cache_manager.get_kv_cache_spec()
 
@@ -1745,8 +1797,9 @@ class TPUModelRunner(GPUModelRunner):
                 self._free_mamba_slots.append(self._mamba_slot_by_req_id.pop(req_id))
                 self._mamba_offset_seeded.discard(req_id)
 
-        indices = self.mamba_state_indices_cpu[:target_num_reqs]
-        indices.fill_(0)
+        # Per-call buffer: draft steps rebuild this between fences, so a
+        # shared scratch could be refilled while an upload is in flight.
+        indices = zeros_h2d_source(self, target_num_reqs)
         req_ids = self.input_batch.req_ids
         num_live = max(0, min(num_reqs, len(req_ids) - start_index))
         for i in range(num_live):
@@ -1759,7 +1812,7 @@ class TPUModelRunner(GPUModelRunner):
                 slot = self._free_mamba_slots.pop()
                 self._mamba_slot_by_req_id[req_id] = slot
             indices[i] = slot
-        return indices.to(self.device, non_blocking=True)
+        return stage_h2d_upload(self, indices)
 
     def _build_mamba_copy_plan(
         self,
@@ -1988,9 +2041,7 @@ class TPUModelRunner(GPUModelRunner):
                 dsts_g = [d for _, d in pairs]
                 spec_dsts.extend(dsts_g)
                 src_t = self._spec_seed_sources(state_srcs, ckpt_rows, new_owners)
-                dst_t = torch.tensor(dsts_g, dtype=torch.int32).to(
-                    self.device, non_blocking=True
-                )
+                dst_t = stage_h2d_upload(self, torch.tensor(dsts_g, dtype=torch.int32))
                 src_t, dst_t = self._expand_pool_split(src_t, dst_t)
                 key = tuple(id(raw) for raw in raws)
                 entry = per_raw_dev.setdefault(key, (raws, [], []))
@@ -2013,8 +2064,8 @@ class TPUModelRunner(GPUModelRunner):
 
         if spec_seed and spec_dsts:
             # The seeded checkpoint is checkpoint 0 of the new group.
-            dst_t = torch.tensor(self._pad_to_bucket(spec_dsts), dtype=torch.long).to(
-                self.device, non_blocking=True
+            dst_t = stage_h2d_upload(
+                self, torch.tensor(self._pad_to_bucket(spec_dsts), dtype=torch.long)
             )
             assert self.mamba_slot_read_offsets is not None
             _rollback_offsets_seed(self.mamba_slot_read_offsets, dst_t)
@@ -2024,11 +2075,11 @@ class TPUModelRunner(GPUModelRunner):
             # forward that reads the buffer). Padding with (0, 0) null-block
             # self-copies keeps the shapes on the seed-copy bucket ladder.
             offset_pairs = self._pad_to_bucket(offset_pairs, pad=(0, 0))
-            src_t = torch.tensor([s for s, _ in offset_pairs], dtype=torch.long).to(
-                self.device, non_blocking=True
+            src_t = stage_h2d_upload(
+                self, torch.tensor([s for s, _ in offset_pairs], dtype=torch.long)
             )
-            dst_t = torch.tensor([d for _, d in offset_pairs], dtype=torch.long).to(
-                self.device, non_blocking=True
+            dst_t = stage_h2d_upload(
+                self, torch.tensor([d for _, d in offset_pairs], dtype=torch.long)
             )
             _rollback_offsets_migrate(self.mamba_slot_read_offsets, src_t, dst_t)
 
@@ -2038,11 +2089,11 @@ class TPUModelRunner(GPUModelRunner):
             self._pending_mamba_state_copies.append((raws, src_t, dst_t))
 
         for raws, srcs, dsts in per_raw.values():
-            src_t = torch.tensor(self._pad_to_bucket(srcs), dtype=torch.int32).to(
-                self.device, non_blocking=True
+            src_t = stage_h2d_upload(
+                self, torch.tensor(self._pad_to_bucket(srcs), dtype=torch.int32)
             )
-            dst_t = torch.tensor(self._pad_to_bucket(dsts), dtype=torch.int32).to(
-                self.device, non_blocking=True
+            dst_t = stage_h2d_upload(
+                self, torch.tensor(self._pad_to_bucket(dsts), dtype=torch.int32)
             )
             self._pending_mamba_state_copies.append((raws, src_t, dst_t))
 
@@ -2108,21 +2159,15 @@ class TPUModelRunner(GPUModelRunner):
         """
         offsets = self.mamba_slot_read_offsets
         assert offsets is not None
-        state_t = torch.tensor(state_srcs, dtype=torch.long).to(
-            self.device, non_blocking=True
-        )
-        ckpt_t = torch.tensor(ckpt_rows, dtype=torch.int32).to(
-            self.device, non_blocking=True
-        )
+        state_t = stage_h2d_upload(self, torch.tensor(state_srcs, dtype=torch.long))
+        ckpt_t = stage_h2d_upload(self, torch.tensor(ckpt_rows, dtype=torch.int32))
         off = offsets[state_t].long().clamp_(0, ckpt_t.shape[1] - 1)
         # PD and prefix-cache restores provide committed state in checkpoint 0.
         # A recycled source block can retain another request's MTP offset.
         # The first-forward reset clears the destination, after this source
         # selection, so ignore that stale offset here without mutating the
         # source block (which may be shared). Live requests retain their offset.
-        new_owner_t = torch.tensor(new_owners, dtype=torch.bool).to(
-            self.device, non_blocking=True
-        )
+        new_owner_t = stage_h2d_upload(self, torch.tensor(new_owners, dtype=torch.bool))
         off = torch.where(new_owner_t, 0, off)
         return ckpt_t.gather(1, off.unsqueeze(1)).squeeze(1)
 
@@ -3267,9 +3312,21 @@ class TPUModelRunner(GPUModelRunner):
             # no dedicated prefill-only bucket, and all remaining requests in
             # mixed mode.
             chunk_num_decode = max(0, min(rpa_num_decode_reqs - start_index, num_reqs))
+            # [decode_end, static-q verify end, mixed_end]; the middle
+            # segment is empty unless static-q verify windows are present
+            # (see _init_speculative_decoding).
+            chunk_static_verify_end = max(
+                chunk_num_decode,
+                min(
+                    num_decode_reqs
+                    + getattr(self, "_num_static_verify_reqs", 0)
+                    - start_index,
+                    num_reqs,
+                ),
+            )
             if self.mamba_slot_read_offsets is None:
                 self._request_distribution_cpu[0] = chunk_num_decode
-                self._request_distribution_cpu[1] = chunk_num_decode
+                self._request_distribution_cpu[1] = chunk_static_verify_end
                 self._request_distribution_cpu[2] = num_reqs
                 request_distribution = self._request_distribution_cpu.to(
                     self.device, non_blocking=True
@@ -3404,16 +3461,25 @@ class TPUModelRunner(GPUModelRunner):
         tensors are rewritten by the next chunk's input preparation. The
         event is recorded before the forward is dispatched, so waiting on it
         never waits for the forward itself.
+
+        Per-call host sources staged since the previous fence (see
+        `stage_h2d_upload`) become covered by this one; `_wait_input_staging_fence`
+        releases them once it has synchronized.
         """
         fence = torch.tpu.Event()
         fence.record()
         self._input_staging_fence = fence
+        self._fenced_h2d_sources.extend(self._unfenced_h2d_sources)
+        self._unfenced_h2d_sources.clear()
 
     def _wait_input_staging_fence(self) -> None:
         fence = self._input_staging_fence
         if fence is not None:
             fence.synchronize()
             self._input_staging_fence = None
+            for _, release_cb in self._fenced_h2d_sources:
+                release_cb()
+            self._fenced_h2d_sources.clear()
 
     def _upload_unless_unchanged(self, slot: str, host: torch.Tensor) -> torch.Tensor:
         """`host.to(self.device)`, reusing `slot`'s previous upload when the
@@ -3822,6 +3888,11 @@ class TPUModelRunner(GPUModelRunner):
                 report_completion=not raiden_inline,
             )
 
+        nan_check = (
+            begin_kv_save_nan_check(get_kv_transfer_group())
+            if has_kv_transfer_group()
+            else None
+        )
         while chunk_index < target_num_chunks:
             if start_index >= self.input_batch.num_reqs:
                 assert self._dp_target_bucket is not None
@@ -3991,6 +4062,22 @@ class TPUModelRunner(GPUModelRunner):
                     intermediate_tensors=intermediate_tensors,
                 )
 
+            if nan_check is not None:
+                assert isinstance(hidden_states, (torch.Tensor, IntermediateTensors)), (
+                    "KV store NaN checking requires forward hidden states or "
+                    "intermediate tensors"
+                )
+                plan = self._last_sequence_layout_plan
+                assert plan is not None, (
+                    "A real forward chunk must have a sequence layout plan"
+                )
+                nan_check.record(
+                    hidden_states,
+                    tuple(self.input_batch.req_ids[start_index:end_index]),
+                    self.query_start_loc_np[: num_reqs + 1],
+                    plan,
+                )
+
             if not self._pp_is_last:
                 # The next stage continues this chunk; logits and sampling
                 # happen on the last stage.
@@ -4100,6 +4187,7 @@ class TPUModelRunner(GPUModelRunner):
 
         if not self._pp_is_last:
             self._pp_pending_scheduler_output = scheduler_output
+            self._pp_pending_kv_save_nan_check = nan_check
             return None
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
@@ -4110,6 +4198,7 @@ class TPUModelRunner(GPUModelRunner):
             draft_chunks=draft_chunks,
             mamba_state_indices_list=mamba_state_indices_list,
             top_tokens=top_tokens,
+            kv_save_nan_check=nan_check,
         )
 
         if self.is_pooling_model:
@@ -4957,8 +5046,10 @@ class TPUModelRunner(GPUModelRunner):
         # clear past its drafter.) ngram drafts below from host tokens and
         # writes no KV. The wait above also proves the previous forward
         # finished, so a store deferred behind it can be handed to raiden in
-        # this step rather than the next.
-        self.maybe_wait_for_kv_save()
+        # this step rather than the next. Note that state.kv_save_nan_check
+        # snapshots only the target forward chunks from execute_model(), not
+        # the drafter's KV writes above.
+        self.maybe_wait_for_kv_save(state.kv_save_nan_check)
         (
             finished_sending,
             finished_recving,
@@ -5245,8 +5336,16 @@ class TPUModelRunner(GPUModelRunner):
             for module in self.model.modules()
         )
         if envs.TPU_MOE_SKIP_PADDED_TOKENS or uses_mxfp4_moe:
+            max_padded_tokens = self.max_num_tokens
+            if isinstance(self.drafter, DFlashProposer):
+                # A DFlash draft forward can outgrow the largest target
+                # bucket (DFlashProposer._draft_token_paddings); it never
+                # exceeds a block per request.
+                max_padded_tokens = max(
+                    max_padded_tokens, self.max_num_reqs * self.drafter.block_size
+                )
             self._token_padding_state = token_padding.TokenPaddingState.create(
-                self.max_num_tokens, self.device
+                max_padded_tokens, self.device
             )
             token_padding.set_padding_state(self._token_padding_state)
 
@@ -5434,6 +5533,9 @@ class TPUModelRunner(GPUModelRunner):
         stage must then run the same sequence of forwards, and the caller
         settles the hand-off afterwards.
         """
+        # Same fence discipline as a serving chunk: release the previous
+        # chunk's host sources, then fence this one's before its forward.
+        self._wait_input_staging_fence()
         kv_cache_initialized = self.kv_cache_config is not None
         profiling = profile_prefix is not None
 
@@ -5571,6 +5673,7 @@ class TPUModelRunner(GPUModelRunner):
             # Every row of a warmup step is padding; every row of a profile
             # step is a real token.
             padding_state.update(num_tokens if profiling else 0, num_tokens)
+        self._record_input_staging_fence()
         intermediate_tensors = None
         if through_handoff:
             assert self._pp_wave is not None and not profiling
@@ -6951,6 +7054,10 @@ class TPUModelRunner(GPUModelRunner):
         K = self.speculative_config.num_speculative_tokens
         drafter = self.drafter
         block = int(getattr(drafter, "block_size", K + 1))
+        # A step holds at most max_num_seqs requests, and the input batch may
+        # hold no more. self.max_num_reqs is raised to MIN_NUM_SEQS for request
+        # padding, so it caps the pad, as in serving, but not the count.
+        max_seqs = int(self.scheduler_config.max_num_seqs)
         max_reqs = int(self.max_num_reqs)
         budget = int(self.max_num_tokens)
         pads = list(self.num_tokens_paddings)
@@ -6960,7 +7067,7 @@ class TPUModelRunner(GPUModelRunner):
 
         seen: set[tuple] = set()
         grid: list[int] = []
-        for R in range(1, max_reqs + 1):
+        for R in range(1, max_seqs + 1):
             keys = []
             if budget >= R * (1 + K):
                 keys.append(
@@ -6971,7 +7078,7 @@ class TPUModelRunner(GPUModelRunner):
                         tok_bucket(R * block),
                     )
                 )
-            if mixed and max_reqs >= R + 1 and budget >= R * (1 + K) + 1:
+            if mixed and max_seqs >= R + 1 and budget >= R * (1 + K) + 1:
                 keys.append(
                     (
                         "mixed",
@@ -7010,6 +7117,8 @@ class TPUModelRunner(GPUModelRunner):
         assert self.speculative_config is not None
         assert self.kv_cache_config is not None
         K = self.speculative_config.num_speculative_tokens
+        # The most requests one step may hold (see _spec_warmup_bucket_grid).
+        max_seqs = int(self.scheduler_config.max_num_seqs)
         room = self.max_model_len - P
         n_decode = min(3 if short else max(5, K + 2), max(0, room // (1 + K) - 1))
         max_pos = min(self.max_model_len, P + n_decode * (1 + K))
@@ -7091,7 +7200,7 @@ class TPUModelRunner(GPUModelRunner):
                 nct = [x + 1 for x in nct]
             if (
                 mixed
-                and self.max_num_reqs >= R + 1
+                and max_seqs >= R + 1
                 and int(self.max_num_tokens) - R * (1 + K) >= P
             ):
                 # Mixed verify+prefill steps at the full step budget: R verify
@@ -7110,7 +7219,7 @@ class TPUModelRunner(GPUModelRunner):
                 ]
                 mix_nblk = max(mix_nblks)
                 variants = [[P_mix]]
-                if self.max_num_reqs >= R + 2 and P_mix >= 2 * P:
+                if max_seqs >= R + 2 and P_mix >= 2 * P:
                     variants.append([P_mix // 2, P_mix - P_mix // 2])
                 prev_ids: list[str] = []
                 base_lo = 1 + R * nblk
@@ -7406,6 +7515,9 @@ class TPUModelRunner(GPUModelRunner):
         cc = self.vllm_config.compilation_config
         saved_cache = (cc.cache_dir, cc.local_cache_dir)
         saved_sizes = cc.compile_sizes
+        # The request caps already reflect the finalized block size: vLLM
+        # calls get_kv_cache_spec() (which refreshes them) before
+        # determine_available_memory() reaches this profile run.
         with set_current_vllm_config(self.vllm_config):
             self._initialize_attention_kernels()
             # Pre-warm FP8 quantized-matmul lock; Dynamo can't trace Lock.
@@ -7462,6 +7574,15 @@ class TPUModelRunner(GPUModelRunner):
         Startup initially has a placeholder table. Refresh after vLLM installs
         the final cache groups so DCP and kernel block splitting are reflected.
         """
+        # `TpuPlatform.update_block_size_for_backend` may raise
+        # `cache_config.block_size` after `__init__` captured it (e.g. hybrid
+        # attention+SSM models); re-sync so the caps below use the finalized
+        # value. It is unset until the platform finalizes it.
+        cache_config = getattr(self, "cache_config", None)
+        block_size = getattr(cache_config, "block_size", None)
+        block_size_changed = block_size is not None and block_size != self.block_size
+        if block_size_changed:
+            self.block_size = block_size
         groups = (
             kv_cache_config
             if kv_cache_config is not None
@@ -7481,6 +7602,12 @@ class TPUModelRunner(GPUModelRunner):
             if groups is not None
             else []
         )
+        # Before the final cache groups exist, `max_num_blocks_per_req` is the
+        # placeholder block table's width (synced in `__init__`). Re-derive it
+        # only when the block size moved, so an unchanged size keeps the width
+        # the table and `block_table_cpu` were actually allocated with.
+        if not attention_groups and block_size_changed:
+            self.max_num_blocks_per_req = cdiv(self.max_model_len, self.block_size)
 
         def widest_table(model_len: int | None) -> int:
             if attention_groups:
@@ -7516,7 +7643,9 @@ class TPUModelRunner(GPUModelRunner):
         self._decode_device_cache_key = None
 
     def may_reinitialize_input_batch(
-        self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
+        self,
+        kv_cache_config: KVCacheConfig,
+        kernel_block_sizes: list[int] | None = None,
     ) -> None:
         """Override to keep TPUModelRunner block accounting in sync with upstream.
 
@@ -7529,8 +7658,16 @@ class TPUModelRunner(GPUModelRunner):
         We must immediately sync `TPUModelRunner.max_num_blocks_per_req` and
         resize `block_table_cpu` so TPU staging and spec-decode warmup block
         allocations perfectly match the new underlying `BlockTable` capacity.
+
+        Groups whose kernel block is smaller than their manager block get a
+        `KernelBlockTable`, so the block tables hold the kernel block ids TPU
+        attention reads. `kernel_block_sizes` is required; its `None` default
+        only matches the vLLM 0.32 base signature.
         """
-        super().may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
+        if kernel_block_sizes is None:
+            raise ValueError("kernel_block_sizes is required on TPU")
+        super().may_reinitialize_input_batch(kv_cache_config)
+        install_kernel_block_tables(self.input_batch.block_table, kernel_block_sizes)
         if self.input_batch.block_table:
             self.max_num_blocks_per_req = self.input_batch.block_table[
                 0
@@ -7670,10 +7807,12 @@ class TPUModelRunner(GPUModelRunner):
         their KV-connector progress so the aggregated step output is
         complete."""
         scheduler_output = self._pp_pending_scheduler_output
+        nan_check = self._pp_pending_kv_save_nan_check
         self._pp_pending_scheduler_output = None
+        self._pp_pending_kv_save_nan_check = None
         if scheduler_output is None:
             return EMPTY_MODEL_RUNNER_OUTPUT
-        self.maybe_wait_for_kv_save()
+        self.maybe_wait_for_kv_save(nan_check)
         (
             finished_sending,
             finished_recving,
@@ -7812,7 +7951,10 @@ class TPUModelRunner(GPUModelRunner):
     def compute_selected_top_tokens(
         self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor
     ) -> torch.Tensor:
-        assert self._greedy_head_owner is not None
+        # Callers gate on _greedy_top_tokens_this_step, so this only narrows the
+        # type; a missing head owner is object state, hence RuntimeError.
+        if self._greedy_head_owner is None:
+            raise RuntimeError("greedy top-token path requires a greedy head owner")
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
         return greedy_top_tokens.top_tokens(self._greedy_head_owner, selected)
 
@@ -7820,7 +7962,10 @@ class TPUModelRunner(GPUModelRunner):
     def compute_top_tokens_from_hidden_states(
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        assert self._greedy_head_owner is not None
+        # Callers gate on _greedy_top_tokens_this_step, so this only narrows the
+        # type; a missing head owner is object state, hence RuntimeError.
+        if self._greedy_head_owner is None:
+            raise RuntimeError("greedy top-token path requires a greedy head owner")
         return greedy_top_tokens.top_tokens(self._greedy_head_owner, hidden_states)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)

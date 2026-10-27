@@ -83,6 +83,10 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         return False
 
     @classmethod
+    def get_profiler_cls(cls) -> str:
+        return "vllm_torchtpu.omni.profiler.TpuOmniTorchProfilerWrapper"
+
+    @classmethod
     def supports_float64(cls) -> bool:
         return False
 

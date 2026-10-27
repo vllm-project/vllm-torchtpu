@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     ENABLE_QUANTIZED_MATMUL_KERNEL: bool = False
     REQUANTIZE_BLOCK_SIZE: int | None = None
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
+    TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
@@ -100,6 +101,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
+    TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_TOKEN_BUCKET_LINEAR: bool = False
     TPU_PP_DYNAMIC_CHUNKS: bool = True
@@ -112,6 +114,7 @@ if TYPE_CHECKING:
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
+    TPU_SPEC_STATIC_VERIFY: bool = True
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
@@ -506,6 +509,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "REQUANTIZE_WEIGHT_DTYPE": lambda: os.getenv(
         "REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"
     ),
+    # Opt-in W8A16 for small FP8 dense-linear steps. A step whose padded token
+    # bucket (from compile_sizes, not the number of live requests) has at most
+    # this many rows keeps bf16 activations against the FP8 weights instead of
+    # quantizing them per call: small decode steps are weight-bandwidth bound,
+    # so the per-call quantization (an abs-max reduction and a cast) costs
+    # more than FP8 activations save. Measured on v7x only. Applies only to
+    # the per-channel path with FP8 weights; the blockwise kernel path
+    # (ENABLE_QUANTIZED_MATMUL_KERNEL=1) and int8 weights always quantize.
+    # With compile_sizes [256] and a threshold below 256, no bucket qualifies.
+    # 0 (default) keeps W8A8 everywhere.
+    "TPU_FP8_LINEAR_W8A16_MAX_ROWS": env_nonnegative_int(
+        "TPU_FP8_LINEAR_W8A16_MAX_ROWS", 0
+    ),
     # Specify dtype for quantized MoE weights
     "MOE_REQUANTIZE_WEIGHT_DTYPE": lambda: os.getenv(
         "MOE_REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"
@@ -765,6 +781,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # time at TP=32; halving the bytes each core reads costs two on-package
     # all-gathers per layer. Independent of TPU_MOE_HIERARCHICAL_EP.
     "TPU_LATENT_PROJ_INTRA_CHIP_TP": env_bool("TPU_LATENT_PROJ_INTRA_CHIP_TP"),
+    # Experimental: shard DSv4 attention wq_b/wo_a/wo_b across a chip's two
+    # cores while KV and attention stay DP (deepseek_v4/attn_intra_chip.py).
+    "TPU_DSV4_ATTN_INTRA_CHIP_TP": env_bool("TPU_DSV4_ATTN_INTRA_CHIP_TP"),
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
     "TPU_ROPE_CACHE_TRUNCATE": env_bool("TPU_ROPE_CACHE_TRUNCATE"),
@@ -810,6 +829,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_STREAMIDX_CHUNK_TOKENS": env_positive_int_or_none(
         "TPU_STREAMIDX_CHUNK_TOKENS"
     ),
+    # Score full speculative verify windows (1 + K tokens) in the attention
+    # kernels' static query-length pass instead of the mixed pass. Only takes
+    # effect for models whose ops implement that pass (DeepSeek-V4); 0 keeps
+    # every verify window on the mixed pass.
+    "TPU_SPEC_STATIC_VERIFY": env_bool("TPU_SPEC_STATIC_VERIFY", default=True),
     # Merge the DCP indexer candidates with an all-to-all over the token axis
     # instead of an all-gather over the candidate axis. Same result.
     "TPU_DCP_INDEXER_A2A_MERGE": env_bool("TPU_DCP_INDEXER_A2A_MERGE", default=False),

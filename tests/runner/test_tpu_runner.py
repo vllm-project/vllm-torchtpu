@@ -52,6 +52,9 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilder,
     AttentionMetadataBuilderContext,
+    _noop_release,
+    stage_h2d_upload,
+    zeros_h2d_source,
 )
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import tpu_runner
@@ -125,6 +128,14 @@ def test_spec_warmup_request_counts_blocks_in_block_table_units(
     assert len(block_ids) <= spec.max_num_blocks_per_req(config, 40960)
 
 
+class _BlockTables(list):
+    """A list of block tables with `MultiGroupBlockTable.block_tables`."""
+
+    @property
+    def block_tables(self):
+        return self
+
+
 def _smem_runner(dcp_size=8, kernel_page_size=384, most_model_len=65536):
     spec = FullAttentionSpec(
         block_size=384, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
@@ -135,6 +146,7 @@ def _smem_runner(dcp_size=8, kernel_page_size=384, most_model_len=65536):
     split = 384 // kernel_page_size
     pages = spec.max_num_blocks_per_req(config, 1048576) * split
     table = SimpleNamespace(
+        block_size=384,
         max_num_blocks_per_req=pages,
         blocks_per_kv_block=split,
         get_cpu_tensor=lambda: torch.zeros((64, pages), dtype=torch.int32),
@@ -146,7 +158,7 @@ def _smem_runner(dcp_size=8, kernel_page_size=384, most_model_len=65536):
         block_size=384,
         max_num_blocks_per_req=pages,
         most_model_len=most_model_len,
-        input_batch=SimpleNamespace(block_table=[table]),
+        input_batch=SimpleNamespace(block_table=_BlockTables([table])),
         kv_cache_config=SimpleNamespace(
             kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
         ),
@@ -231,13 +243,15 @@ def test_smem_caps_follow_widest_attention_group():
 def test_smem_caps_refresh_after_placeholder_table_rebuild(monkeypatch):
     runner = _smem_runner(most_model_len=None)
     final_table = runner.input_batch.block_table[0]
-    runner.input_batch.block_table[0] = SimpleNamespace(max_num_blocks_per_req=2731)
+    runner.input_batch.block_table[0] = SimpleNamespace(
+        block_size=384, max_num_blocks_per_req=2731
+    )
     runner.max_num_blocks_per_req = 2731
     runner.block_table_cpu = torch.zeros((64, 2731), dtype=torch.int32)
     runner._refresh_smem_request_caps()
     assert runner.num_reqs_max_model_len == 47
 
-    def rebuild(_self, _config, _sizes):
+    def rebuild(_self, _config):
         runner.input_batch.block_table[0] = final_table
 
     monkeypatch.setattr(GPUModelRunner, "may_reinitialize_input_batch", rebuild)
@@ -254,6 +268,93 @@ def test_smem_caps_refresh_after_placeholder_table_rebuild(monkeypatch):
     assert real_runner.max_num_blocks_per_req == 342
     assert real_runner.block_table_cpu.shape == (64, 342)
     assert real_runner.num_reqs_most_model_len is None
+
+
+def test_smem_caps_refresh_after_backend_block_size_update():
+    runner = SimpleNamespace(
+        max_model_len=32768,
+        max_num_reqs=256,
+        max_num_tokens=8192,
+        block_size=16,
+        max_num_blocks_per_req=2048,
+        most_model_len=16384,
+        num_blocks_per_most_len_req=1024,
+        num_reqs_max_model_len=64,
+        num_reqs_most_model_len=128,
+        cache_config=SimpleNamespace(block_size=264),
+        kv_cache_config=None,
+        _attention_capacity={"stale": object()},
+        _decode_device_cache_key=("stale",),
+    )
+    runner._refresh_smem_request_caps = (
+        TPUModelRunner._refresh_smem_request_caps.__get__(runner)
+    )
+    runner._refresh_smem_request_caps()
+    assert runner.block_size == 264
+    assert runner.max_num_blocks_per_req == 125
+    assert runner.num_reqs_max_model_len == 256
+    assert runner.num_blocks_per_most_len_req == 63
+    assert runner.num_reqs_most_model_len == 256
+    assert runner._attention_capacity == {}
+    assert runner._decode_device_cache_key is None
+
+
+def test_smem_caps_refresh_keeps_block_table_width_when_block_size_unchanged():
+    """With no final cache groups yet and an unchanged block size, the refresh
+    must keep `max_num_blocks_per_req` as synced from the placeholder block
+    table in `__init__` (which may be wider than `cdiv(max_model_len,
+    block_size)`), not re-derive it."""
+    runner = SimpleNamespace(
+        max_model_len=1000,
+        max_num_reqs=256,
+        max_num_tokens=8192,
+        block_size=16,
+        max_num_blocks_per_req=64,  # placeholder table width, > cdiv(1000, 16)
+        most_model_len=None,
+        num_blocks_per_most_len_req=None,
+        num_reqs_max_model_len=0,
+        num_reqs_most_model_len=None,
+        cache_config=SimpleNamespace(block_size=16),
+        kv_cache_config=None,
+        _attention_capacity={},
+        _decode_device_cache_key=None,
+    )
+    TPUModelRunner._refresh_smem_request_caps(runner)
+    assert runner.block_size == 16
+    assert runner.max_num_blocks_per_req == 64
+    assert runner.num_reqs_max_model_len == min(
+        PallasAttentionBackend.get_max_num_seqs_for_pages(64), 256, 8192
+    )
+
+
+def test_smem_caps_refresh_keeps_block_size_until_platform_finalizes_it():
+    """`cache_config.block_size` is unset until the platform picks one (and
+    lightweight harnesses omit it); the runner must keep its own value."""
+    runner = SimpleNamespace(
+        max_model_len=32768,
+        max_num_reqs=256,
+        max_num_tokens=8192,
+        block_size=384,
+        max_num_blocks_per_req=86,
+        most_model_len=None,
+        num_blocks_per_most_len_req=None,
+        num_reqs_max_model_len=0,
+        num_reqs_most_model_len=None,
+        cache_config=SimpleNamespace(block_size=None),
+        kv_cache_config=None,
+        _attention_capacity={},
+        _decode_device_cache_key=None,
+    )
+    TPUModelRunner._refresh_smem_request_caps(runner)
+    assert runner.block_size == 384
+    assert runner.max_num_blocks_per_req == 86
+
+
+def test_may_reinitialize_input_batch_requires_kernel_block_sizes():
+    # Without them, split groups would hand manager block ids to the kernels.
+    runner = object.__new__(TPUModelRunner)
+    with pytest.raises(ValueError, match="kernel_block_sizes is required"):
+        TPUModelRunner.may_reinitialize_input_batch(runner, SimpleNamespace())
 
 
 def test_suspend_kv_transfer_group_restores_agent_after_failure():
@@ -438,11 +539,13 @@ def test_spec_decode_warmup_sweeps_batches_at_the_shortest_and_longest_prompt(
     ]
 
 
-def _runner(K: int, block: int, max_reqs: int, budget: int, paddings: list[int]):
+def _runner(K: int, block: int, max_seqs: int, budget: int, paddings: list[int]):
     return SimpleNamespace(
         speculative_config=SimpleNamespace(num_speculative_tokens=K),
         drafter=SimpleNamespace(block_size=block),
-        max_num_reqs=max_reqs,
+        scheduler_config=SimpleNamespace(max_num_seqs=max_seqs),
+        # As in TPUModelRunner.__init__: raised to MIN_NUM_SEQS for padding.
+        max_num_reqs=max(max_seqs, tpu_runner.MIN_NUM_SEQS),
         max_num_tokens=budget,
         num_tokens_paddings=paddings,
     )
@@ -454,6 +557,7 @@ def _step_keys(runner, R: int, mixed: bool) -> set[tuple]:
     K = runner.speculative_config.num_speculative_tokens
     block = runner.drafter.block_size
     pads = runner.num_tokens_paddings
+    max_seqs = runner.scheduler_config.max_num_seqs
     max_reqs = runner.max_num_reqs
 
     def tok_bucket(n: int) -> int:
@@ -469,7 +573,7 @@ def _step_keys(runner, R: int, mixed: bool) -> set[tuple]:
                 tok_bucket(R * block),
             )
         )
-    if mixed and max_reqs >= R + 1 and runner.max_num_tokens >= R * (1 + K) + 1:
+    if mixed and max_seqs >= R + 1 and runner.max_num_tokens >= R * (1 + K) + 1:
         keys.add(
             (
                 "mixed",
@@ -482,15 +586,20 @@ def _step_keys(runner, R: int, mixed: bool) -> set[tuple]:
 
 
 FLASH = dict(
-    K=5, block=5, max_reqs=64, budget=1024, paddings=[16, 32, 64, 128, 256, 512, 1024]
+    K=5, block=5, max_seqs=64, budget=1024, paddings=[16, 32, 64, 128, 256, 512, 1024]
 )
-AGENTX = dict(K=5, block=5, max_reqs=8, budget=256, paddings=[16, 32, 64, 128, 256])
+AGENTX = dict(K=5, block=5, max_seqs=8, budget=256, paddings=[16, 32, 64, 128, 256])
 # 8 decoders x 6 rows = 48 > a 32-token budget: counts above 5 have no step.
-TIGHT = dict(K=5, block=5, max_reqs=8, budget=32, paddings=[16, 32])
+TIGHT = dict(K=5, block=5, max_seqs=8, budget=32, paddings=[16, 32])
+# The nightly DSpark bs4 engine: max_num_seqs sits below MIN_NUM_SEQS, so the
+# runner's padded request bound (8) is above any count a step can hold.
+DSPARK_BS4 = dict(K=7, block=7, max_seqs=4, budget=256, paddings=[16, 32, 64, 128, 256])
 
 
 @pytest.mark.parametrize(
-    "cfg", [FLASH, AGENTX, TIGHT], ids=["flash", "agentx", "tight"]
+    "cfg",
+    [FLASH, AGENTX, TIGHT, DSPARK_BS4],
+    ids=["flash", "agentx", "tight", "dspark-bs4"],
 )
 @pytest.mark.parametrize("mixed", [False, True])
 def test_grid_covers_every_bucket_combination_once(cfg, mixed):
@@ -498,11 +607,11 @@ def test_grid_covers_every_bucket_combination_once(cfg, mixed):
     grid = TPUModelRunner._spec_warmup_bucket_grid(runner, mixed=mixed)
 
     assert grid == sorted(set(grid))
-    assert all(1 <= R <= cfg["max_reqs"] for R in grid)
+    assert all(1 <= R <= cfg["max_seqs"] for R in grid)
     # Every bucket combination a serving step can take is warmed ...
     covered = set().union(*(_step_keys(runner, R, mixed) for R in grid))
     needed = set().union(
-        *(_step_keys(runner, R, mixed) for R in range(1, cfg["max_reqs"] + 1))
+        *(_step_keys(runner, R, mixed) for R in range(1, cfg["max_seqs"] + 1))
     )
     assert covered == needed
     # ... by one count each: every grid entry brings a bucket no earlier one had.
@@ -511,6 +620,47 @@ def test_grid_covers_every_bucket_combination_once(cfg, mixed):
         keys = _step_keys(runner, R, mixed)
         assert keys - seen, f"count {R} adds no new bucket"
         seen |= keys
+
+
+@pytest.mark.parametrize("R", [1, 2, 3])
+def test_spec_batch_warmup_holds_at_most_max_num_seqs_requests(R):
+    # The input batch holds max_num_seqs requests, below the runner's padded
+    # max_num_reqs here. The mixed steps add one, then two, prefill requests
+    # beside the R decoders; a step past max_num_seqs fails add_request.
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    live: set[str] = set()
+    sizes: list[int] = []
+
+    def execute_model(so):
+        live.difference_update(so.finished_req_ids)
+        live.update(r.req_id for r in so.scheduled_new_reqs)
+        sizes.append(len(live))
+
+    runner = SimpleNamespace(
+        max_model_len=256,
+        max_num_tokens=256,
+        max_num_reqs=tpu_runner.MIN_NUM_SEQS,
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+        speculative_config=SimpleNamespace(num_speculative_tokens=7),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=4096, kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+        ),
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(decode_context_parallel_size=1)
+        ),
+        execute_model=execute_model,
+        sample_tokens=lambda _: None,
+        take_draft_token_ids=lambda: None,
+        _warmup_spec_decode_cleanup=lambda rids: True,
+    )
+
+    TPUModelRunner._warmup_spec_batch(runner, R, 16, short=True, mixed=True)
+
+    # Each mixed variant that fits ran: the peak is R decoders plus two
+    # prefills, capped at max_num_seqs, so a swallowed failure shows here too.
+    assert max(sizes) == min(R + 2, 4)
 
 
 def test_mtp_prefill_warmup_retries_each_bucket_without_a_pipeline():
@@ -562,13 +712,19 @@ def test_prefill_only_mtp_follows_context_or_pipeline_parallelism(
 
 
 def test_only_the_last_pipeline_stage_hosts_a_drafter():
-    last = SimpleNamespace(speculative_config=_spec(), _pp_is_last=True)
-    middle = SimpleNamespace(speculative_config=_spec(), _pp_is_last=False)
+    spec = _spec()
+    # A non-DSv4 model: the static verify length stays None either way.
+    vllm_config = SimpleNamespace(speculative_config=spec, model_config=None)
+    last = SimpleNamespace(speculative_config=spec, _pp_is_last=True)
+    middle = SimpleNamespace(
+        speculative_config=spec, _pp_is_last=False, vllm_config=vllm_config
+    )
     assert TPUModelRunner._is_async_drafter.fget(last) is True
     assert TPUModelRunner._is_async_drafter.fget(middle) is False
 
     TPUModelRunner._init_speculative_decoding(middle)
     assert middle.drafter is None and middle.rejection_sampler is None
+    assert middle._static_verify_q_len is None
 
 
 def test_dp_idle_pairing_replays_the_draft_only_where_a_drafter_lives():
@@ -1243,6 +1399,9 @@ class TestAttentionMetadataBuilder:
         runner.most_model_len = most_model_len
         runner._unified_kv_layout = False
         runner.position_ids = torch.full((8,), 42, dtype=torch.int32)
+        runner._unfenced_h2d_sources = []
+        runner._free_h2d_sources = {}
+        runner._registered_h2d_sources = set()
 
         block_tables = []
         for gid in range(num_groups):
@@ -1474,7 +1633,9 @@ class TestCompactMambaSlotPool:
         # Slots per request: 1 without spec decode, num_spec + 1 with it.
         runner._mamba_slot_stride = slot_stride
         runner._mamba_offset_seeded = set()
-        runner.mamba_state_indices_cpu = torch.zeros(max_num_reqs, dtype=torch.int32)
+        runner._unfenced_h2d_sources = []
+        runner._free_h2d_sources = {}
+        runner._registered_h2d_sources = set()
         runner.input_batch = MagicMock()
         # Bind the real methods.
         runner._init_mamba_slot_pool = TPUModelRunner._init_mamba_slot_pool.__get__(
@@ -1585,14 +1746,13 @@ class TestCompactMambaSlotPool:
 
     def test_chunked_build_allocates_all(self):
         """Two chunks in one step: each chunk allocates its own requests; all
-        get distinct slots."""
+        get distinct slots, uploaded from distinct host buffers."""
         runner = self._make_runner(max_num_reqs=4, mamba_num_blocks=5)
         runner._init_mamba_slot_pool(5)
         self._set_batch(runner, ["a", "b", "c", "d"])
 
-        # clone: the result aliases a reused staging buffer (no copy on CPU).
-        idx_chunk0 = runner._build_mamba_state_indices(0, 2, 4).clone()
-        idx_chunk1 = runner._build_mamba_state_indices(2, 2, 4).clone()
+        idx_chunk0 = runner._build_mamba_state_indices(0, 2, 4)
+        idx_chunk1 = runner._build_mamba_state_indices(2, 2, 4)
         slots = {
             int(idx_chunk0[0]),
             int(idx_chunk0[1]),
@@ -1600,6 +1760,11 @@ class TestCompactMambaSlotPool:
             int(idx_chunk1[1]),
         }
         assert slots == {1, 2, 3, 4}
+        # No shared staging buffer: the second chunk must not overwrite the
+        # first chunk's in-flight upload, and both stay alive until the fence.
+        assert idx_chunk0.data_ptr() != idx_chunk1.data_ptr()
+        assert runner._unfenced_h2d_sources[0][0] is idx_chunk0
+        assert runner._unfenced_h2d_sources[1][0] is idx_chunk1
 
     def test_spec_decode_stride_allocates_group_bases(self):
         """With speculative decoding each request owns a group of `stride`
@@ -1703,6 +1868,33 @@ class TestReorderBatchForRpa:
         assert num_windowed == 2
         assert set(runner.input_batch.req_ids[:2]) == {"vr", "vr2"}
         assert runner.input_batch.req_ids[2] == "pf"
+
+    def test_static_verify_windows_lead_verify_segment(self):
+        """With a static verify length (DeepSeek-V4, 1 + K), full-length
+        windows lead the verify segment and are counted; a short window
+        (fewer drafts scheduled) stays behind them."""
+        runner = self._make_runner()
+        runner._static_verify_q_len = 4
+        self._batch(runner, ["pf", "short", "dc", "full", "full2"])
+        sched = self._sched(
+            {"pf": 16, "short": 2, "dc": 1, "full": 4, "full2": 4},
+            spec_reqs=("short", "full", "full2"),
+        )
+        num_decode, num_windowed = runner._reorder_batch_for_rpa(sched)
+        assert (num_decode, num_windowed) == (1, 4)
+        assert runner._num_static_verify_reqs == 2
+        ids = runner.input_batch.req_ids
+        assert ids[0] == "dc"
+        assert set(ids[1:3]) == {"full", "full2"}
+        assert ids[3] == "short"
+        assert ids[4] == "pf"
+
+    def test_no_static_verify_without_static_length(self):
+        runner = self._make_runner()
+        self._batch(runner, ["vr", "dc"])
+        sched = self._sched({"vr": 4, "dc": 1}, spec_reqs=("vr",))
+        assert runner._reorder_batch_for_rpa(sched) == (1, 2)
+        assert runner._num_static_verify_reqs == 0
 
     def test_masked_dense_orders_by_kv_length(self):
         runner = self._make_runner(groups_requests=True)
@@ -2146,6 +2338,8 @@ class TestUnifiedReadOffsetMigration:
         runner._pre_async_results = None
         runner._pool_block_split = 1
         runner._pending_mamba_state_copies = []
+        runner._unfenced_h2d_sources = []
+        runner._registered_h2d_sources = set()
         raw = torch.zeros(16, 2)
         runner._mamba_copy_plan = [(0, [raw])]
         runner.input_batch = MagicMock()
@@ -2182,6 +2376,12 @@ class TestUnifiedReadOffsetMigration:
         assert len(runner._pending_mamba_state_copies) == 1
         _, src_t, dst_t = runner._pending_mamba_state_copies[0]
         assert int(src_t[0]) == 5 and int(dst_t[0]) == 9
+        # Both offset migration and seed copy tensors were staged via stage_h2d_upload.
+        assert len(runner._unfenced_h2d_sources) == 4
+        assert runner._unfenced_h2d_sources[-2][0] is src_t
+        assert runner._unfenced_h2d_sources[-1][0] is dst_t
+        assert runner._unfenced_h2d_sources[-2][1] is _noop_release
+        assert runner._unfenced_h2d_sources[-1][1] is _noop_release
 
     def test_no_crossing_leaves_offsets_alone(self):
         runner, scheduler_output = self._make_runner(
@@ -2452,7 +2652,13 @@ class TestInputStagingFence:
         monkeypatch.setattr(
             torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
         )
-        runner = SimpleNamespace(_input_staging_fence=None)
+        runner = SimpleNamespace(
+            _input_staging_fence=None,
+            _unfenced_h2d_sources=[],
+            _fenced_h2d_sources=[],
+            _free_h2d_sources={},
+            _registered_h2d_sources=set(),
+        )
         TPUModelRunner._record_input_staging_fence(runner)
         fence = runner._input_staging_fence
         assert fence is _FakeTpuEvent.instances[-1]
@@ -2470,6 +2676,268 @@ class TestInputStagingFence:
         runner = SimpleNamespace(_input_staging_fence=None)
         TPUModelRunner._wait_input_staging_fence(runner)
         assert runner._input_staging_fence is None
+
+    def test_staged_h2d_sources_live_until_their_fence_is_waited(self, monkeypatch):
+        """A host source uploaded before a record is released by the wait on
+        that fence via its tuple callback (recycling registered `zeros_h2d_source`
+        buffers into `_free_h2d_sources` and using a no-op callback for one-off
+        tensors); one uploaded after it (a draft walk) must survive that wait
+        and only go with the next fence cycle."""
+        monkeypatch.setattr(
+            torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+        )
+        runner = SimpleNamespace(
+            device=torch.device("cpu"),
+            _input_staging_fence=None,
+            _unfenced_h2d_sources=[],
+            _fenced_h2d_sources=[],
+            _free_h2d_sources={},
+            _registered_h2d_sources=set(),
+        )
+        target_buf = zeros_h2d_source(runner, 4).fill_(1)
+        assert id(target_buf) in runner._registered_h2d_sources
+        target = stage_h2d_upload(runner, target_buf)
+        target_ptr = target.data_ptr()
+
+        one_off_buf = torch.tensor([1, 2, 3], dtype=torch.long)
+        assert id(one_off_buf) not in runner._registered_h2d_sources
+        one_off = stage_h2d_upload(runner, one_off_buf)
+
+        TPUModelRunner._record_input_staging_fence(runner)
+        draft_buf = zeros_h2d_source(runner, 4).fill_(2)
+        draft = stage_h2d_upload(runner, draft_buf)
+
+        assert len(runner._fenced_h2d_sources) == 2
+        assert runner._fenced_h2d_sources[0][0] is target
+        assert runner._fenced_h2d_sources[0][1] is not _noop_release
+        assert runner._fenced_h2d_sources[1] == (one_off, _noop_release)
+        assert runner._unfenced_h2d_sources[0][0] is draft
+
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert runner._fenced_h2d_sources == []
+        # Only the registered `zeros_h2d_source` buffer is recycled into
+        # `_free_h2d_sources`; the one-off tensor's dummy callback is a no-op.
+        assert runner._free_h2d_sources == {(4, torch.int32): [target]}
+        assert runner._unfenced_h2d_sources[0][0] is draft
+
+        reused = zeros_h2d_source(runner, 4, torch.int32)
+        assert reused.data_ptr() == target_ptr
+        assert reused.tolist() == [0, 0, 0, 0]
+        assert runner._free_h2d_sources[(4, torch.int32)] == []
+
+        TPUModelRunner._record_input_staging_fence(runner)
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert runner._fenced_h2d_sources == []
+        assert runner._unfenced_h2d_sources == []
+        assert runner._free_h2d_sources[(4, torch.int32)] == [draft]
+
+    def test_wait_input_staging_fence_executes_tuple_callbacks_directly(
+        self, monkeypatch
+    ):
+        """`_wait_input_staging_fence` only invokes each fenced entry's callback
+        and clears `_fenced_h2d_sources`, without inspecting the buffer."""
+        monkeypatch.setattr(
+            torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+        )
+        called: list[str] = []
+        buf_a = torch.zeros(2, dtype=torch.int32)
+        buf_b = torch.zeros(3, dtype=torch.int64)
+        runner = SimpleNamespace(
+            _input_staging_fence=None,
+            _unfenced_h2d_sources=[
+                (buf_a, lambda: called.append("a")),
+                (buf_b, lambda: called.append("b")),
+            ],
+            _fenced_h2d_sources=[],
+        )
+        TPUModelRunner._record_input_staging_fence(runner)
+        assert runner._unfenced_h2d_sources == []
+        assert len(runner._fenced_h2d_sources) == 2
+
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert called == ["a", "b"]
+        assert runner._fenced_h2d_sources == []
+
+    def test_zeros_h2d_source_max_buffers_evicts_lru_and_unregisters(self, monkeypatch):
+        """When `max_buffers` is reached, `zeros_h2d_source` pops the
+        least-recently-used buffer from `_free_h2d_sources`, removes its
+        registration from `_registered_h2d_sources`, and registers the new
+        buffer."""
+        monkeypatch.setattr(
+            torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+        )
+        runner = SimpleNamespace(
+            device=torch.device("cpu"),
+            _input_staging_fence=None,
+            _unfenced_h2d_sources=[],
+            _fenced_h2d_sources=[],
+            _free_h2d_sources={},
+            _registered_h2d_sources=set(),
+        )
+        # Step 1: allocate and recycle 2 buffers (reaching max_buffers=2).
+        b1 = zeros_h2d_source(runner, 4, max_buffers=2)
+        b2 = zeros_h2d_source(runner, 8, max_buffers=2)
+        stage_h2d_upload(runner, b1)
+        stage_h2d_upload(runner, b2)
+        TPUModelRunner._record_input_staging_fence(runner)
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert runner._registered_h2d_sources == {id(b1), id(b2)}
+        assert list(runner._free_h2d_sources.keys()) == [
+            (4, torch.int32),
+            (8, torch.int32),
+        ]
+
+        # Step 2: reuse b1 (shape 4) so b2 (shape 8) becomes the oldest free
+        # buffer after the fence wait.
+        reused_b1 = zeros_h2d_source(runner, 4, max_buffers=2)
+        assert reused_b1 is b1
+        stage_h2d_upload(runner, reused_b1)
+        TPUModelRunner._record_input_staging_fence(runner)
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert list(runner._free_h2d_sources.keys()) == [
+            (8, torch.int32),
+            (4, torch.int32),
+        ]
+
+        # Step 3: allocate a new shape (16) with max_buffers=2 -> evicts and
+        # unregisters b2 (the LRU buffer in _free_h2d_sources), and registers b3.
+        b3 = zeros_h2d_source(runner, 16, max_buffers=2)
+        assert id(b2) not in runner._registered_h2d_sources
+        assert (8, torch.int32) not in runner._free_h2d_sources
+        assert runner._registered_h2d_sources == {id(b1), id(b3)}
+
+        stage_h2d_upload(runner, b3)
+        TPUModelRunner._record_input_staging_fence(runner)
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert runner._free_h2d_sources == {
+            (4, torch.int32): [b1],
+            (16, torch.int32): [b3],
+        }
+
+    def test_dummy_run_fences_its_uploads_before_the_forward(self, monkeypatch):
+        """Warmup and idle-DP dummy runs stage block tables too: each run must
+        release the previous run's host sources and fence its own before the
+        forward, so repeated runs neither accumulate buffers nor make the next
+        wait block on a dummy forward."""
+        _FakeTpuEvent.instances.clear()
+        monkeypatch.setattr(
+            torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+        )
+        monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **kw: None)
+        for name in ("set_forward_context", "set_vllm_model_wrapper_context"):
+            monkeypatch.setattr(
+                tpu_runner, name, lambda *a, **kw: contextlib.nullcontext()
+            )
+        from vllm_torchtpu.layers.core.sequence_layout import (
+            DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
+        )
+
+        def forward_model(**kw):
+            # The fence must already cover this run's uploads.
+            assert runner._input_staging_fence is _FakeTpuEvent.instances[-1]
+            assert runner._unfenced_h2d_sources == []
+            return torch.zeros((4, 8), dtype=torch.float32), None
+
+        runner = SimpleNamespace(
+            device=torch.device("cpu"),
+            max_model_len=64,
+            max_num_tokens=64,
+            max_num_reqs=4,
+            max_num_blocks_per_req=4,
+            most_model_len=None,
+            block_size=16,
+            uses_mrope=False,
+            supports_mm_inputs=False,
+            _pp_is_first=True,
+            _pp_wave=None,
+            _pp_topk_buffer=None,
+            _kv_cache_bundle=None,
+            lora_config=None,
+            vllm_config=MagicMock(),
+            mesh=MagicMock(),
+            kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
+            _has_mamba_state=False,
+            mamba_slot_read_offsets=None,
+            _mamba_ckpt_window=1,
+            _unified_kv_layout=False,
+            empty_slot_mappings={},
+            position_ids=torch.zeros(64, dtype=torch.int32),
+            _input_staging_fence=None,
+            _unfenced_h2d_sources=[],
+            _fenced_h2d_sources=[],
+            _free_h2d_sources={},
+            _registered_h2d_sources=set(),
+            _token_padding_state=None,
+            sequence_layout_planner=SimpleNamespace(
+                prepare_dummy=lambda **kw: SimpleNamespace(
+                    descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
+                )
+            ),
+            maybe_select_dummy_loras=lambda *a, **kw: contextlib.nullcontext(),
+            _dp_num_tokens_across_dp=lambda n: None,
+            forward_model=forward_model,
+            compute_selected_logits=lambda out, idx: out,
+        )
+        for name in (
+            "_build_attention_metadata",
+            "_record_input_staging_fence",
+            "_wait_input_staging_fence",
+            "_pp_take_topk_indices",
+        ):
+            setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
+        bt = MagicMock()
+        bt.max_num_blocks_per_req = 4
+        bt.get_cpu_tensor.return_value = torch.zeros((4, 4), dtype=torch.int32)
+        runner.input_batch = SimpleNamespace(block_table=[bt])
+        builder = AttentionMetadataBuilder(
+            kv_cache_spec=FullAttentionSpec(
+                block_size=16,
+                num_kv_heads=2,
+                head_size=128,
+                dtype=torch.bfloat16,
+                page_size_padded=16384,
+            ),
+            layer_names=["attn.0"],
+            vllm_config=MagicMock(),
+            device=runner.device,
+            runner=runner,
+            kv_cache_group_id=0,
+        )
+        group = MagicMock()
+        group.metadata_builders = [builder]
+        group.layer_names = ["attn.0"]
+        runner.attn_groups = [[group]]
+
+        for dp_lockstep in (False, True, False):
+            TPUModelRunner._dummy_run(
+                runner, num_tokens=16, num_reqs=4, num_blocks=4, dp_lockstep=dp_lockstep
+            )
+            # Only this run's staged table is still held, by its own fence.
+            assert runner._unfenced_h2d_sources == []
+            assert len(runner._fenced_h2d_sources) == 1
+            assert runner._input_staging_fence is _FakeTpuEvent.instances[-1]
+        assert len(_FakeTpuEvent.instances) == 3
+        assert all(fence.synchronized == 1 for fence in _FakeTpuEvent.instances[:-1])
+
+        # With through_handoff=True, the fence must be recorded before
+        # _pp_wave.start_forward so the next wait never blocks on the receive.
+        handoff_checked = []
+
+        def start_forward(n):
+            assert runner._input_staging_fence is _FakeTpuEvent.instances[-1]
+            assert runner._unfenced_h2d_sources == []
+            handoff_checked.append(n)
+            return None
+
+        runner._pp_wave = SimpleNamespace(
+            step=contextlib.nullcontext,
+            start_forward=start_forward,
+            end_forward=lambda *a: None,
+        )
+        TPUModelRunner._dummy_run(
+            runner, num_tokens=16, num_reqs=4, num_blocks=4, through_handoff=True
+        )
+        assert handoff_checked == [16]
 
 
 class TestAsyncSpecDecodeTokenAccounting:
@@ -3105,6 +3573,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
                 mamba_state_indices_list=None,
                 pooler_output_list=[],
                 top_tokens=False,
+                kv_save_nan_check=None,
             ),
             input_batch=SimpleNamespace(
                 max_num_logprobs=None,

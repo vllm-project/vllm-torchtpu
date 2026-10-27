@@ -108,9 +108,9 @@ def test_bonus_anchor_keeps_dflash_layout():
         ("dspark_draft_topk", 8),
     ],
 )
-def test_rejects_unsupported_drafting_options(field, value):
-    with pytest.raises(ValueError, match="does not support"):
-        _make_proposer(
+def test_warns_on_unsupported_drafting_options(field, value):
+    with mock.patch("vllm_torchtpu.spec_decode.dspark.logger") as log:
+        p = _make_proposer(
             {
                 "dspark_noise_token_id": 7,
                 "dspark_block_size": 4,
@@ -118,18 +118,59 @@ def test_rejects_unsupported_drafting_options(field, value):
             },
             **{field: value},
         )
+    # Drafting falls back to greedy over the fixed K-token block.
+    assert p.block_size == 4
+    log.warning.assert_called_once()
+    assert "does not support" in log.warning.call_args.args[0]
 
 
-def test_block_size_guard():
-    with pytest.raises(ValueError, match="block size"):
-        _make_proposer(
-            {
-                "dspark_noise_token_id": 7,
-                "dspark_block_size": 7,
-                **_LAYER_IDS,
-            },
-            num_speculative_tokens=4,
-        )
+@pytest.mark.parametrize(
+    "sample_from_anchor,trained_block,K,query_block",
+    [
+        (True, 5, 6, 6),  # DeepSeek-V4-Pro-0813 served at K=6
+        (True, 7, 4, 4),
+        (False, 7, 4, 5),  # bonus-anchor layout keeps 1 + K
+    ],
+)
+def test_k_need_not_match_checkpoint_block(
+    sample_from_anchor, trained_block, K, query_block
+):
+    # The query block follows K whatever block the checkpoint was trained
+    # at; the mismatch is allowed but warned about.
+    hf = {
+        "dspark_noise_token_id": 7,
+        "dspark_block_size": trained_block,
+        "sample_from_anchor": sample_from_anchor,
+        **_LAYER_IDS,
+    }
+    with mock.patch("vllm_torchtpu.spec_decode.dspark.logger") as log:
+        p = _make_proposer(hf, num_speculative_tokens=K)
+    assert p.block_size == query_block
+    log.warning.assert_called_once()
+    assert "trained with block size" in log.warning.call_args.args[0]
+
+
+@pytest.mark.parametrize(
+    "block_key,sample_from_anchor,trained_block,K",
+    [
+        ("dspark_block_size", True, 4, 4),
+        # Speculators-format checkpoints count the bonus anchor in block_size
+        # and draft block_size - 1 tokens (e.g. dspark_qwen3_8b_block7, K=6).
+        ("block_size", False, 7, 6),
+    ],
+)
+def test_matching_checkpoint_block_does_not_warn(
+    block_key, sample_from_anchor, trained_block, K
+):
+    hf = {
+        "dspark_noise_token_id": 7,
+        block_key: trained_block,
+        "sample_from_anchor": sample_from_anchor,
+        **_LAYER_IDS,
+    }
+    with mock.patch("vllm_torchtpu.spec_decode.dspark.logger") as log:
+        _make_proposer(hf, num_speculative_tokens=K)
+    log.warning.assert_not_called()
 
 
 def test_missing_noise_token():

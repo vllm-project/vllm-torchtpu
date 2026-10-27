@@ -106,7 +106,7 @@ class PageBufferRef(_BufferedRef):
         sem = self.sem_recvs.at[slot]
         pid = grid_indices[0]
 
-        state_cache_ref, token_pages_ref = src_ref
+        state_cache_ref, token_pages_ref, kv_slot_mapping_ref = src_ref
 
         tile_n = self.cfgs.tile_sizes.tile_n
         pages_to_buffer_per_token = self.cfgs.pages_to_buffer_per_token
@@ -114,27 +114,35 @@ class PageBufferRef(_BufferedRef):
         page_buffer_ref = cast(jax.Ref, self.window_ref.at[slot])
         global_idx = pid * tile_n
 
-        @pl.loop(0, tile_n * pages_to_buffer_per_token, unroll=True)
-        def loop_body(idx):
-            n = idx // pages_to_buffer_per_token
-            p = idx % pages_to_buffer_per_token
+        # A token without an output record (kv slot < 0) needs no window: its
+        # pages are not fetched, and `wait_in` waits on exactly the same set.
+        for n in range(tile_n):
             idx_n = global_idx + n
 
-            # compress_norm_rope_store looks up each token's window pages,
-            # oldest first.
-            page = token_pages_ref[idx_n * pages_to_buffer_per_token + p]
-
-            src = state_cache_ref.at[page, :, :, :]
-            dest = page_buffer_ref.at[n, p, :, :, :]
-            pltpu.make_async_copy(src, dest, sem).start()
+            @pl.when(kv_slot_mapping_ref[idx_n] >= 0)
+            def _(n=n, idx_n=idx_n):
+                for p in range(pages_to_buffer_per_token):
+                    # compress_norm_rope_store looks up each token's window
+                    # pages, oldest first.
+                    page = token_pages_ref[idx_n * pages_to_buffer_per_token + p]
+                    src = state_cache_ref.at[page, :, :, :]
+                    dest = page_buffer_ref.at[n, p, :, :, :]
+                    pltpu.make_async_copy(src, dest, sem).start()
 
     def wait_in(self, src_ref, grid_indices):
         assert self.sem_recvs is not None
         assert self.window_ref is not None
+        _, _, kv_slot_mapping_ref = src_ref
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
-        pltpu.make_async_copy(vmem_ref, vmem_ref, sem).wait()
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
+        tile_n = self.cfgs.tile_sizes.tile_n
+        global_idx = grid_indices[0] * tile_n
+        for n in range(tile_n):
+
+            @pl.when(kv_slot_mapping_ref[global_idx + n] >= 0)
+            def _(n=n):
+                pltpu.make_async_copy(vmem_ref.at[n], vmem_ref.at[n], sem).wait()
 
 
 @jax.tree_util.register_dataclass
@@ -210,6 +218,10 @@ class OutputRef(_BufferedRef):
         tile_n = self.cfgs.tile_sizes.tile_n
         global_idx = pid * tile_n
 
+        if self.cfgs.dims.seq_along_lane:
+            # The body staged the records in VMEM (`stage_sal_columns`); the
+            # cache is written once, after the pipeline.
+            return
         if self.cfgs.dims.mode == config.Mode.CSA_INDEXER:
             cache_ref, kv_slot_mapping_ref, is_first_mask_ref = dest_ref
 
@@ -262,6 +274,8 @@ class OutputRef(_BufferedRef):
 
         is_indexer = self.cfgs.dims.mode == config.Mode.CSA_INDEXER
 
+        if self.cfgs.dims.seq_along_lane:
+            return
         if is_indexer:
             _, kv_slot_mapping_ref, is_first_mask_ref = dest_ref
 
@@ -477,9 +491,10 @@ def create_allocs_and_specs(
         index_map=lambda i: (i, 0, 0, 0),
     )
     is_indexer = cfgs.dims.mode == config.Mode.CSA_INDEXER
-    buffer_type = (
-        pltpu.BufferType.INPUT_OUTPUT if is_indexer else pltpu.BufferType.OUTPUT
-    )
+    # The HEAD_ALONG_SUBLANE indexer read-modify-writes the cache's 4-token
+    # rows; SEQ_ALONG_LANE stages its records in VMEM instead (see kernel_fn).
+    rmw = is_indexer and not cfgs.dims.seq_along_lane
+    buffer_type = pltpu.BufferType.INPUT_OUTPUT if rmw else pltpu.BufferType.OUTPUT
     output_alloc = OutputRef.create(
         spec=output_spec,
         dtype_or_type=jnp.uint8,
@@ -488,7 +503,7 @@ def create_allocs_and_specs(
         use_lookahead=False,
         cfgs=cfgs,
     )
-    if is_indexer:
+    if is_indexer and not cfgs.dims.seq_along_lane:
         output_args = (cache_ref, kv_slot_mapping_ref, is_first_mask_ref)
     else:
         output_args = (cache_ref, kv_slot_mapping_ref)
@@ -510,6 +525,7 @@ def create_allocs_and_specs(
     page_buffer_args = (
         cache_ref if state_cache_ref is None else state_cache_ref,
         token_pages_ref,
+        kv_slot_mapping_ref,
     )
 
     # rope

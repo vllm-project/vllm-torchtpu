@@ -165,31 +165,6 @@ def _tiny_hf_config():
     )
 
 
-@pytest.fixture(scope="module")
-def dist_ctx():
-    import torch.distributed as dist
-    from vllm.distributed import (
-        ensure_model_parallel_initialized,
-        init_distributed_environment,
-    )
-
-    if not dist.is_initialized():
-        import portpicker
-
-        port = portpicker.pick_unused_port()
-        init_distributed_environment(
-            world_size=1,
-            rank=0,
-            local_rank=0,
-            distributed_init_method=f"tcp://127.0.0.1:{port}",
-            backend="gloo",
-        )
-    # GroupCoordinator construction consults the current vLLM config.
-    with set_current_vllm_config(VllmConfig()):
-        ensure_model_parallel_initialized(1, 1)
-    yield
-
-
 @pytest.mark.parametrize("compress_ratio", [1, 4, 128])
 def test_attention_constructs_tpu_swa_cache(monkeypatch, request, compress_ratio):
     """Exercise upstream construction, including its SWA backend argument."""
@@ -225,6 +200,10 @@ def test_attention_constructs_tpu_swa_cache(monkeypatch, request, compress_ratio
     config.model_config = SimpleNamespace(
         hf_config=hf_config, dtype=torch.bfloat16, max_model_len=256
     )
+    # VllmConfig resolves this only when built with a model config; 5 is its
+    # value for this max_model_len. The compress_ratio=4 indexer sizes its
+    # prefill buffer from it.
+    config.attention_config.sparse_mla_prefill_workspace_factor = 5
     config.cache_config = CacheConfig(block_size=1024, cache_dtype="fp8_e4m3")
     config.scheduler_config = SchedulerConfig(
         max_model_len=256,

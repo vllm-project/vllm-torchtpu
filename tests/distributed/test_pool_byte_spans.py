@@ -695,7 +695,7 @@ def test_glm_row_spans_union_partitions_request_bytes():
 # and spends two rows on every one of its 256 page tokens.
 _DSV4_CSA_NOPE = dict(page_tokens=1024, live_bytes_per_block=256 * 512, row_bytes=512)
 _DSV4_CSA_ROPE = dict(page_tokens=1024, live_bytes_per_block=64 * 512, row_bytes=512)
-_DSV4_IDX = dict(page_tokens=1024, live_bytes_per_block=64 * 1024, row_bytes=1024)
+_DSV4_IDX = dict(page_tokens=1024, live_bytes_per_block=33 * 1024, row_bytes=1024)
 _DSV4_HCA = dict(page_tokens=256, live_bytes_per_block=512 * 512, row_bytes=512)
 
 
@@ -759,6 +759,13 @@ def test_dsv4_row_spans_trim_the_tail_to_whole_rows():
     )
     assert hca.spans[-1].size_bytes == 88 * 512
     assert hca.declared_bytes == _DSV4_HCA["live_bytes_per_block"] + 88 * 512
+
+    # SAL indexer puts tokens on the lane axis and head-dim + scale across all
+    # 33 rows, so a partial tail page still needs every row.
+    idx = _dsv4_row_spans(
+        _DSV4_IDX, tag="dsv4.idx.g1", num_tokens=1500, block_ids=[1, 2]
+    )
+    assert idx.spans[-1].size_bytes == 33 * 1024
 
 
 def test_dsv4_row_spans_validation_failures():

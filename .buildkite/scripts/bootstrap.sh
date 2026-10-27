@@ -74,6 +74,16 @@ if [[ "$JOB_PRIORITY" == "$PRIORITY_ONCALL_FIX" ]]; then
   buildkite-agent annotate --style warning --context oncall-fix \
     "Runs at on-call priority (\`oncall-fix\` label): ahead of every other build, including main."
 fi
+# One concurrency group per author for the TPU steps of their PR builds; see
+# PR_TPU_JOBS_PER_AUTHOR. Keyed on the commit author's email, which every
+# webhook build carries: the Buildkite creator is missing whenever the GitHub
+# account is not linked to a Buildkite user.
+if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]]; then
+  pr_author="${BUILDKITE_BUILD_AUTHOR_EMAIL:-${BUILDKITE_BUILD_CREATOR_EMAIL:-}}"
+  if [[ -n "$pr_author" ]]; then
+    export PR_TPU_CONCURRENCY_GROUP="tpu-pr/${pr_author,,}"
+  fi
+fi
 
 # --- Check for explicit skip-ci or non-code/documentation-only changes ---
 echo "--- :git: Checking if CI build should be skipped"
@@ -156,27 +166,23 @@ if [[ "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
   upload_with_priority .buildkite/pipeline_promote.yml "$JOB_PRIORITY"
 fi
 
-# Release branch builds (releases/v<version>, e.g. releases/v0.29.0; see
-# RELEASE_BRANCH_REGEX in configs/pipeline_config.sh) also build and publish
-# vllm-torchtpu-core and the combined vllm-torchtpu wheel. PR builds never
-# release. Uploaded before the CI lanes so Buildkite places it after them; its
-# block step waits until the whole CI run has passed.
-if [[ "${BUILDKITE_BRANCH:-}" =~ ${RELEASE_BRANCH_REGEX} \
-      && "${BUILDKITE_PULL_REQUEST:-false}" == "false" ]]; then
-  echo "Release branch ${BUILDKITE_BRANCH}: uploading release fragment"
-  upload_with_priority .buildkite/pipeline_release_pypi.yml "$JOB_PRIORITY"
-fi
-
 # The suite's lanes, in upload order. Lane <lane> is
 # .buildkite/pipeline_<lane>.yml; no other file is uploaded as a lane. CI_LANES
 # picks a subset - a scheduled pipeline names its own lane. Without it a build runs every lane but
 # perf, which has scheduled builds of its own; nightly builds still run perf,
 # and so does the integration pipeline, whose LKG promotion waits on two perf
 # steps. A PR whose change needs perf/eval coverage asks for it with the
-# run-perf-eval label; adding the label to a ready PR starts a build.
+# run-perf-eval label, or the full nightly suite across every lane with
+# run-full-ci; adding either label to a ready PR starts a build.
 ALL_LANES="verify perf integration tests"
 default_lanes="verify integration tests"
 pr_labels="${BUILDKITE_PULL_REQUEST_LABELS:-}"
+if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]] \
+    && grep -qx "run-full-ci" <<< "${pr_labels//,/$'\n'}"; then
+  export NIGHTLY=1
+  buildkite-agent annotate --style info --context full-ci \
+    "Runs the full (nightly) suite (\`run-full-ci\` label)."
+fi
 if [[ "${NIGHTLY:-0}" == "1" || "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
   default_lanes="${ALL_LANES}"
 elif [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]] \

@@ -38,13 +38,19 @@ def _model(attn=1.5e-7, slack=0.1, granularity=4096) -> StepCostModel:
 
 
 def _scheduler(
-    mamba_split=False, cost=None, running=(), waiting=(), step_limit=None
+    mamba_split=False,
+    cost=None,
+    running=(),
+    waiting=(),
+    step_limit=None,
+    kv_holding_waiting=(),
 ) -> TpuPipelineChunkScheduler:
     scheduler = TpuPipelineChunkScheduler.__new__(TpuPipelineChunkScheduler)
     scheduler._cost = cost
     scheduler._step_limit = step_limit
     scheduler._pp_size = 8
     scheduler.waiting = list(waiting)
+    scheduler.kv_holding_waiting = list(kv_holding_waiting)
     scheduler.vllm_config = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=16384),
         parallel_config=SimpleNamespace(pipeline_parallel_size=8),
@@ -243,6 +249,30 @@ def test_the_step_limit_spreads_the_pending_prefill_over_the_stages():
     with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
         scheduler.schedule()
     assert scheduler._step_limit is None
+
+
+def test_kv_holding_queue_does_not_shrink_the_pending_work_budget():
+    pending = [_request(0, 65536, f"w{i}") for i in range(4)]
+    scheduler = _scheduler(cost=_model(granularity=2048), waiting=pending)
+    assert scheduler._pending_step_limit() == 16384
+
+    # Queue placement alone does not consume prompt tokens. Requests holding
+    # KV blocks must contribute the same pending work as other waiting requests.
+    scheduler.waiting = []
+    scheduler.kv_holding_waiting = pending
+    assert scheduler._pending_step_limit() == 16384
+
+    # Splitting requests across both queues must preserve the same budget.
+    scheduler.waiting = pending[:2]
+    scheduler.kv_holding_waiting = pending[2:]
+    assert scheduler._pending_step_limit() == 16384
+    scheduler.waiting = []
+
+    # Count only the remaining prompt work, even in the KV-holding queue.
+    scheduler.kv_holding_waiting = [_request(24576, 32768)]
+    assert scheduler._pending_step_limit() == 4096
+    scheduler.kv_holding_waiting = [_decode("done")]
+    assert scheduler._pending_step_limit() is None
 
 
 def test_the_step_limit_keeps_a_prompt_whole_when_halves_are_no_faster():

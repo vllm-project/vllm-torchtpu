@@ -234,6 +234,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "_patch_vllm_hybrid_kv_load_failure_recovery",
         "_patch_vllm_same_step_prefix_hits",
         "patch_disable_eagle_block_drop",
+        "_patch_dflash_drafting_slot_budget",
         "_patch_vllm_merge_multimodal_embeddings",
     ]
     assert stages["platform_activation"] == (
@@ -242,6 +243,7 @@ def test_manifest_preserves_lifecycle_dependencies():
     assert stages["model_load"] == [
         "maybe_patch_qwen3_vl",
         "maybe_patch_qwen3_next",
+        "maybe_patch_qwen2",
     ]
     assert "patch_moe_expert_write_staging" in stages["worker_init"]
     for names in (stages["platform_activation"], stages["worker_init"]):
