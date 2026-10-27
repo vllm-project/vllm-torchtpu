@@ -107,15 +107,22 @@ only_docs_changed() {
 }
 
 FILES_CHANGED=""
+PR_DIFF_RESOLVED=0
 if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]]; then
   BASE_BRANCH=${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-"main"}
   echo "PR detected. Target branch: ${BASE_BRANCH}"
 
-  git fetch origin "${BASE_BRANCH}" --depth=20 --quiet || echo "Base fetch failed"
-  git fetch origin "${BUILDKITE_COMMIT:-HEAD}" --depth=20 --quiet || true
+  git fetch origin "${BASE_BRANCH}" --depth=200 --quiet || echo "Base fetch failed"
+  git fetch origin "${BUILDKITE_COMMIT:-HEAD}" --depth=200 --quiet || true
+  if ! git merge-base origin/"${BASE_BRANCH}" "${BUILDKITE_COMMIT:-HEAD}" >/dev/null 2>&1; then
+    git fetch origin "${BASE_BRANCH}" --depth=1000 --quiet || true
+    git fetch origin "${BUILDKITE_COMMIT:-HEAD}" --depth=1000 --quiet || true
+  fi
 
-  FILES_CHANGED=$(git diff --name-only origin/"${BASE_BRANCH}"..."${BUILDKITE_COMMIT:-HEAD}" 2>/dev/null || true)
-  if [[ -z "${FILES_CHANGED}" ]]; then
+  if FILES_CHANGED=$(git diff --name-only origin/"${BASE_BRANCH}"..."${BUILDKITE_COMMIT:-HEAD}" 2>/dev/null) \
+      && [[ -n "${FILES_CHANGED}" ]]; then
+    PR_DIFF_RESOLVED=1
+  else
     FILES_CHANGED=$(git diff-tree --no-commit-id --name-only -r -m "${BUILDKITE_COMMIT:-HEAD}")
   fi
 elif [[ "${BUILDKITE_SOURCE:-}" != "schedule" ]]; then
@@ -126,6 +133,7 @@ elif [[ "${BUILDKITE_SOURCE:-}" != "schedule" ]]; then
   FILES_CHANGED=$(git diff --name-only "${BUILDKITE_COMMIT:-HEAD}^" "${BUILDKITE_COMMIT:-HEAD}" 2>/dev/null || true)
 fi
 
+pr_labels="${BUILDKITE_PULL_REQUEST_LABELS:-}"
 if [[ -n "${FILES_CHANGED}" ]]; then
   echo "Files changed:"
   echo "${FILES_CHANGED}"
@@ -133,9 +141,23 @@ if [[ -n "${FILES_CHANGED}" ]]; then
   if only_docs_changed "${FILES_CHANGED}"; then
     echo "Only documentation/non-code files changed. Skipping CI build."
     exit 0
-  else
-    echo "Code files changed. Proceeding with pipeline upload."
   fi
+
+  if [[ "${PR_DIFF_RESOLVED}" == "1" && -z "${CI_LANES:-}" ]] \
+      && ! grep -qx "run-full-ci" <<< "${pr_labels//,/$'\n'}"; then
+    eval "$(printf '%s\n' "${FILES_CHANGED}" | python3 "${SCRIPT_DIR}/select_pr_tests.py" --shell)"
+    if [[ "${PR_SKIP_ALL_CI:-0}" == "1" ]]; then
+      if grep -qx "run-perf-eval" <<< "${pr_labels//,/$'\n'}"; then
+        PR_SELECTED_LANES="verify perf"
+        PR_TEST_SELECTION_ANNOTATION="Diff-aware PR test selection: running verify + perf lanes (\`run-perf-eval\` label)."
+      else
+        echo "${PR_SKIP_ALL_REASON:-Only non-PR files changed.} Skipping CI build."
+        exit 0
+      fi
+    fi
+  fi
+
+  echo "Code files changed. Proceeding with pipeline upload."
 fi
 
 echo "--- Starting Buildkite Bootstrap"
@@ -175,8 +197,7 @@ fi
 # run-perf-eval label, or the full nightly suite across every lane with
 # run-full-ci; adding either label to a ready PR starts a build.
 ALL_LANES="verify perf integration tests"
-default_lanes="verify integration tests"
-pr_labels="${BUILDKITE_PULL_REQUEST_LABELS:-}"
+default_lanes="${PR_SELECTED_LANES:-verify integration tests}"
 if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]] \
     && grep -qx "run-full-ci" <<< "${pr_labels//,/$'\n'}"; then
   export NIGHTLY=1
@@ -187,11 +208,17 @@ if [[ "${NIGHTLY:-0}" == "1" || "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION
   default_lanes="${ALL_LANES}"
 elif [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]] \
     && grep -qx "run-perf-eval" <<< "${pr_labels//,/$'\n'}"; then
-  default_lanes="${ALL_LANES}"
+  if [[ " ${default_lanes} " != *" perf "* ]]; then
+    default_lanes="${default_lanes} perf"
+  fi
   if [[ -z "${CI_LANES:-}" ]]; then
     buildkite-agent annotate --style info --context perf-eval \
       "Runs the perf/eval lane (\`run-perf-eval\` label)."
   fi
+fi
+if [[ -n "${PR_TEST_SELECTION_ANNOTATION:-}" && -z "${CI_LANES:-}" ]]; then
+  buildkite-agent annotate --style info --context pr-test-selection \
+    "${PR_TEST_SELECTION_ANNOTATION}"
 fi
 lanes="${CI_LANES:-${default_lanes}}"
 for lane in ${lanes}; do
@@ -226,7 +253,7 @@ fi
 
 # pipeline_build.yml skips the -omni image build when this is non-empty.
 # Buildkite rejects the upload if a skip reason is over 70 characters.
-OMNI_IMAGE_SKIP=""
+OMNI_IMAGE_SKIP="${OMNI_IMAGE_SKIP:-}"
 if [[ " ${lanes} " != *" tests "* ]]; then
   OMNI_IMAGE_SKIP="Only the tests lane uses the -omni image; this build has none."
 fi
