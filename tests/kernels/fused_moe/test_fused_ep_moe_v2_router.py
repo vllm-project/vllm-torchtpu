@@ -254,3 +254,209 @@ def test_rejects_nondivisible_requested_row_tile():
             block_rows=256,
             interpret=True,
         )
+
+
+@pytest.mark.parametrize("case", ["biased", "ties", "nonfinite", "tiny"])
+@pytest.mark.cpu_test
+def test_packed_top6_normalizes_unbiased_weights(case):
+    """Packing must preserve expert order and normalize the unbiased table."""
+    rng = np.random.default_rng(41)
+    raw = rng.random((288, 384), dtype=np.float32)
+    bias = rng.uniform(-3, 0, 384).astype(np.float32)
+    if case == "ties":
+        raw[:] = 1
+        bias[:] = -100
+        bias[[0, 127, 128, 255, 256, 383]] = 0
+    elif case == "nonfinite":
+        raw[0] = np.nan
+        raw[1] = np.inf
+        raw[2] = 0
+        raw[3, ::3] = np.nan
+        raw[4, ::3] = np.inf
+        bias[::7] = np.nan
+    elif case == "tiny":
+        raw *= np.float32(1e-22)
+    scores = raw + bias
+    original_w, original_i = _select(scores, raw, topk=6, block_rows=32, interpret=True)
+    with np.errstate(invalid="ignore"):
+        expected = original_w / np.maximum(
+            original_w.sum(axis=-1, keepdims=True), np.float32(1e-20)
+        )
+    weights, indices = router_ops.pallas_select(
+        jnp.asarray(scores),
+        topk=6,
+        block_rows=288,
+        weight_scores=jnp.asarray(raw),
+        normalize=True,
+        interpret=True,
+    )
+    np.testing.assert_array_equal(indices, original_i)
+    np.testing.assert_allclose(weights, expected, rtol=2e-6, atol=1e-6)
+    if case == "biased":
+        _, unbiased_ids = _reference(raw, raw, topk=6)
+        assert not np.array_equal(indices, unbiased_ids)
+    elif case == "ties":
+        np.testing.assert_array_equal(indices[0], [0, 127, 128, 255, 256, 383])
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {},
+        {"rows": 256},
+        {"experts": 128},
+        {"topk": 3},
+        {"scoring_fn": "softmax"},
+        {"scoring_fn": "sigmoid"},
+        {"renormalize": False},
+        {"has_bias": False},
+        {"has_hash": True},
+        {"dtype": jnp.float32},
+        {"backend": "cpu"},
+        {"chip": router_ops.pltpu.ChipVersion.TPU_V6E},
+    ],
+)
+@pytest.mark.cpu_test
+def test_normalized_router_only_uses_measured_envelope(monkeypatch, change):
+    """Never normalize hash/no-bias routes or widen unmeasured tiles/devices."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    config = dict(
+        rows=288,
+        experts=384,
+        topk=6,
+        scoring_fn="sqrtsoftplus",
+        renormalize=True,
+        has_bias=True,
+        has_hash=False,
+        dtype=jnp.bfloat16,
+        backend="tpu",
+        chip=router_ops.pltpu.ChipVersion.TPU_7X,
+    )
+    config.update(change)
+    monkeypatch.setattr(router_ops.jax, "default_backend", lambda: config["backend"])
+    monkeypatch.setattr(
+        router_ops.pltpu,
+        "get_tpu_info",
+        lambda: SimpleNamespace(chip_version=config["chip"]),
+    )
+    monkeypatch.setattr(router_ops, "logger", Mock())
+    gate = jax.ShapeDtypeStruct((config["rows"], config["experts"]), config["dtype"])
+    tile = router_ops.normalized_router_block_rows(
+        gate,
+        topk=config["topk"],
+        scoring_fn=config["scoring_fn"],
+        renormalize=config["renormalize"],
+        has_bias=config["has_bias"],
+        has_hash=config["has_hash"],
+    )
+    assert tile == (None if change else 288)
+
+
+@pytest.mark.parametrize("topk,block_rows", [(3, 288), (6, 32)])
+@pytest.mark.cpu_test
+def test_normalized_selector_rejects_unsupported_tiles(topk, block_rows):
+    scores = jnp.ones((288, 384), jnp.float32)
+    with pytest.raises(ValueError, match="Normalized selection requires"):
+        router_ops.pallas_select(
+            scores,
+            topk=topk,
+            block_rows=block_rows,
+            weight_scores=scores,
+            normalize=True,
+            interpret=True,
+        )
+
+
+@pytest.mark.cpu_test
+def test_normalized_route_stage_keeps_scaling_and_invalid_sentinels(monkeypatch):
+    """Exercise production wiring without running experts or TPU collectives."""
+    import functools
+    from unittest.mock import Mock
+
+    from vllm_torchtpu.kernels.fused_moe.v2 import host, kernel, layer
+
+    info = router_ops.pltpu.get_tpu_info_for_chip(
+        router_ops.pltpu.ChipVersion.TPU_7X, 1
+    )
+    monkeypatch.setattr(router_ops.pltpu, "get_tpu_info", lambda: info)
+    monkeypatch.setattr(kernel, "logger", Mock())
+    monkeypatch.setattr(
+        layer,
+        "pallas_select",
+        functools.partial(router_ops.pallas_select, interpret=True),
+    )
+    # Isolate the layer's function cache from other tests and from this A/B.
+    monkeypatch.setattr(layer, "_LAYER_SM_CACHE", {})
+    with jax.default_device(jax.devices("cpu")[0]):
+        rng = np.random.default_rng(43)
+        gate = jnp.asarray(rng.normal(size=(288, 384)), dtype=jnp.bfloat16)
+        gate = gate.at[:3].set(
+            jnp.array([jnp.nan, -jnp.inf, jnp.inf], jnp.bfloat16)[:, None]
+        )
+        bias = jnp.asarray(rng.normal(size=(384,)), dtype=jnp.float32)
+        mesh = jax.sharding.Mesh(np.array(jax.devices("cpu")[:1]), ("d",))
+        args = (
+            jnp.zeros((288, 128), jnp.bfloat16),
+            jnp.zeros((384, 128, 256), jnp.bfloat16),
+            jnp.zeros((384, 128, 128), jnp.bfloat16),
+            None,
+            None,
+            gate,
+        )
+        outputs = []
+        for tile in (None, 288):
+            layer._LAYER_SM_CACHE.clear()
+            # Bind the selected path explicitly; hardware admission is tested above.
+            monkeypatch.setattr(
+                layer, "normalized_router_block_rows", lambda *a, tile=tile, **kw: tile
+            )
+            outputs.append(
+                tuple(
+                    np.asarray(value)
+                    for value in layer.fused_ep_moe_v2(
+                        *args,
+                        topk=6,
+                        renormalize=True,
+                        mesh=mesh,
+                        capacity=128,
+                        weight_format=host.WeightFormat.BF16,
+                        scoring_fn="sqrtsoftplus",
+                        score_bias=bias,
+                        routed_scaling_factor=2.5,
+                        stage="route",
+                    )
+                )
+            )
+        (old_wire, old_weights, old_payload), (wire, weights, payload) = outputs
+        np.testing.assert_array_equal(wire, old_wire)
+        np.testing.assert_array_equal(payload, old_payload)
+        np.testing.assert_allclose(weights, old_weights, rtol=2e-6, atol=1e-6)
+        np.testing.assert_array_equal(weights[:3], 0)
+        np.testing.assert_array_equal(payload[0, : 3 * 6], 384)
+        np.testing.assert_allclose(weights[3:].sum(axis=-1), 2.5, rtol=2e-6)
+
+
+def test_packed_top6_tpu_lowering_matches_numpy():
+    """Run the normalized selector through Mosaic on one supported device."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("requires a TPU7x device")
+    if (
+        router_ops.pltpu.get_tpu_info().chip_version
+        != router_ops.pltpu.ChipVersion.TPU_7X
+    ):
+        pytest.skip("normalized selector is calibrated on TPU7x")
+    rng = np.random.default_rng(42)
+    raw = rng.random((288, 384), dtype=np.float32)
+    biased = raw + rng.uniform(-3, 0, 384).astype(np.float32)
+    biased[0] = 1
+    expected_weights, expected_ids = _reference(biased, raw, topk=6)
+    expected_weights /= expected_weights.sum(axis=-1, keepdims=True)
+    weights, indices = jax.jit(
+        lambda scores, values: router_ops.pallas_select(
+            scores, topk=6, block_rows=288, weight_scores=values, normalize=True
+        )
+    )(jnp.asarray(biased), jnp.asarray(raw))
+    np.testing.assert_array_equal(indices, expected_ids)
+    np.testing.assert_allclose(weights, expected_weights, rtol=2e-6, atol=1e-6)
