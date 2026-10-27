@@ -22,20 +22,193 @@ DCP ranks own *different* Q heads but share one GQA-replicated KV head.
 from __future__ import annotations
 
 import functools
+from typing import Any
 
 import jax
 import torch
+from torch.nn import Parameter
 from torch_tpu._internal import pallas
+from vllm.config import get_current_vllm_config_or_none
+from vllm.distributed import (
+    divide,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
+from vllm.model_executor.layers.linear import (
+    WEIGHT_LOADER_V2_SUPPORTED,
+    LinearBase,
+    set_weight_attrs,
+)
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group
-from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
+from vllm_torchtpu.distributed.dcp_comm import (
+    cp_lse_ag_out_rs,
+    cp_lse_ag_out_scale,
+)
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs as _batched_rpa_configs,
 )
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     wrapper as _batched_rpa_wrapper,
 )
+from vllm_torchtpu.layers.adapter.linear import TpuRowParallelLinear
 from vllm_torchtpu.utils import synchronize_tensors
+
+
+def is_dcp_duplicate_o_proj_enabled(vllm_config: Any | None = None) -> bool:
+    """Return True when DCP duplicate o_proj is enabled."""
+    vllm_config = vllm_config or get_current_vllm_config_or_none()
+    parallel_config = (
+        None if vllm_config is None else getattr(vllm_config, "parallel_config", None)
+    )
+    if (
+        parallel_config is not None
+        and getattr(parallel_config, "prefill_context_parallel_size", 1) > 1
+    ):
+        return False
+    dcp_size = (
+        1
+        if parallel_config is None
+        else getattr(parallel_config, "decode_context_parallel_size", 1)
+    )
+    if dcp_size <= 1:
+        dcp_group = get_dcp_group()
+        if dcp_group is not None:
+            dcp_size = int(dcp_group.world_size)
+    flag = bool(envs.TPU_DCP_DUPLICATE_O_PROJ) or (
+        parallel_config is not None
+        and bool(getattr(parallel_config, "dcp_duplicate_o_proj", False))
+    )
+    return dcp_size > 1 and flag
+
+
+class DCPGroupRowParallelLinear(TpuRowParallelLinear):
+    """RowParallelLinear sharded across DCP groups (tp_size // dcp_size)."""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        bias: bool = True,
+        input_is_parallel: bool = True,
+        skip_bias_add: bool = False,
+        params_dtype: torch.dtype | None = None,
+        reduce_results: bool = True,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+        *,
+        return_bias: bool = True,
+        disable_tp: bool = False,
+    ):
+        vllm_config = get_current_vllm_config_or_none()
+        parallel_config = (
+            None
+            if vllm_config is None
+            else getattr(vllm_config, "parallel_config", None)
+        )
+        dcp_world_size = (
+            None
+            if parallel_config is None
+            else getattr(parallel_config, "decode_context_parallel_size", None)
+        )
+        if dcp_world_size is None:
+            dcp_group = get_dcp_group()
+            dcp_world_size = int(dcp_group.world_size) if dcp_group is not None else 1
+
+        rank = get_tensor_model_parallel_rank() if not disable_tp else 0
+        world_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
+
+        self.group_size = max(int(dcp_world_size), 1) if not disable_tp else 1
+        self.orep_active = self.group_size > 1
+        self.tp_world_size = world_size
+
+        self.tp_rank = rank // self.group_size
+        self.tp_size = divide(world_size, self.group_size)
+
+        self.input_size_per_partition = divide(input_size, self.tp_size)
+        self.output_size_per_partition = output_size
+        self.output_partition_sizes = [output_size]
+
+        LinearBase.__init__(
+            self,
+            input_size,
+            output_size,
+            bias,
+            skip_bias_add,
+            params_dtype,
+            quant_config,
+            prefix,
+            return_bias=return_bias,
+            disable_tp=disable_tp,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+        )
+
+        if not input_is_parallel:
+            raise ValueError(
+                "DCPGroupRowParallelLinear requires input_is_parallel=True."
+            )
+        self.input_is_parallel = input_is_parallel
+        self.reduce_results = reduce_results
+
+        loader = (
+            self.weight_loader_v2
+            if any(
+                cls.__name__ in WEIGHT_LOADER_V2_SUPPORTED
+                for cls in self.quant_method.__class__.__mro__
+            )
+            else self.weight_loader
+        )
+        self.quant_method.create_weights(
+            layer=self,
+            input_size_per_partition=self.input_size_per_partition,
+            output_partition_sizes=self.output_partition_sizes,
+            input_size=self.input_size,
+            output_size=self.output_size,
+            params_dtype=self.params_dtype,
+            weight_loader=loader,
+        )
+        if not reduce_results and (bias and not skip_bias_add):
+            raise ValueError(
+                "When not reduce the results, adding bias to the "
+                "results can lead to incorrect results"
+            )
+
+        if bias:
+            self.bias = Parameter(torch.empty(self.output_size, dtype=params_dtype))
+            set_weight_attrs(
+                self.bias,
+                {
+                    "output_dim": 0,
+                    "weight_loader": self.weight_loader,
+                },
+            )
+        else:
+            self.register_parameter("bias", None)
+        self.update_param_tp_status()
+
+    def forward(
+        self,
+        input_: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        output_parallel = self.quant_method.apply(self, input_, None)
+
+        if self.reduce_results and self.tp_world_size > 1:
+            output = tensor_model_parallel_all_reduce(output_parallel)
+        else:
+            output = output_parallel
+
+        if not self.skip_bias_add and self.bias is not None:
+            output = output + self.bias
+
+        if not self.return_bias:
+            return output
+        output_bias = self.bias if self.skip_bias_add else None
+        return output, output_bias
+
 
 # ---------------------------------------------------------------------------
 # LSE-weighted combination
@@ -271,6 +444,43 @@ def build_dcp_kernels(
 # ---------------------------------------------------------------------------
 
 
+def merge_dcp_new_into_ctx(
+    ctx_output: torch.Tensor,
+    ctx_lse: torch.Tensor,
+    new_output: torch.Tensor,
+    new_lse: torch.Tensor,
+    *,
+    dcp_rank: int,
+    dcp_world_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Merge new-token attention into this DCP rank's slice of context attention."""
+    if ctx_output.shape[1] != new_output.shape[1] * dcp_world_size:
+        raise ValueError(
+            f"ctx_output heads {ctx_output.shape[1]} must equal new_output heads "
+            f"{new_output.shape[1]} * dcp_world_size {dcp_world_size}"
+        )
+
+    heads_local = new_output.shape[1]
+    start_head = dcp_rank * heads_local
+    end_head = (dcp_rank + 1) * heads_local
+
+    own_ctx_out = ctx_output[:, start_head:end_head, :]
+    own_ctx_lse = ctx_lse[:, start_head:end_head].to(torch.float32)
+
+    merged_own_out, merged_own_lse = merge_attn_results(
+        own_ctx_out,
+        own_ctx_lse,
+        new_output,
+        new_lse.to(torch.float32),
+    )
+
+    merged_ctx_out = ctx_output.clone()
+    merged_ctx_out[:, start_head:end_head, :] = merged_own_out.to(ctx_output.dtype)
+    merged_ctx_lse = ctx_lse.to(torch.float32).clone()
+    merged_ctx_lse[:, start_head:end_head] = merged_own_lse
+    return merged_ctx_out, merged_ctx_lse
+
+
 def forward_with_dcp(
     *,
     layer,
@@ -289,6 +499,8 @@ def forward_with_dcp(
         _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
     ),
     decode_query_size: int = 1,
+    q_dcp_replicated: bool = False,
+    dcp_duplicate_o_proj: bool = False,
 ) -> torch.Tensor:
     """Two-pass DCP attention forward.
     1. CACHE_ONLY: query is all-gathered by heads to attend every rank's KV
@@ -319,7 +531,18 @@ def forward_with_dcp(
         decode_query_size=decode_query_size,
     )
 
-    query_across_dcp = dcp_group.all_gather(query.contiguous(), dim=1)
+    if q_dcp_replicated:
+        if query.shape[1] % dcp_world_size != 0:
+            raise ValueError(
+                f"Query heads {query.shape[1]} must be divisible by "
+                f"dcp_world_size {dcp_world_size}"
+            )
+        own_q_heads = query.shape[1] // dcp_world_size
+        query_across_dcp = query.contiguous()
+        query_local = query.narrow(1, dcp_rank * own_q_heads, own_q_heads).contiguous()
+    else:
+        query_across_dcp = dcp_group.all_gather(query.contiguous(), dim=1)
+        query_local = query
 
     shared_args = (
         key,
@@ -334,16 +557,28 @@ def forward_with_dcp(
     )
 
     ctx_output, ctx_lse = cache_kernel(kv_cache, query_across_dcp, *shared_args)
+    new_output, new_lse = new_kernel(kv_cache, query_local, *shared_args)
 
-    ctx_output, ctx_lse = cp_lse_ag_out_rs(
-        ctx_output, ctx_lse, dcp_group, return_lse=True
-    )
-
-    new_output, new_lse = new_kernel(kv_cache, query, *shared_args)
-
-    output, _ = merge_attn_results(ctx_output, ctx_lse, new_output, new_lse)
-    output = output.to(new_output.dtype)  # f32 ctx_lse promotes the merge
+    if dcp_duplicate_o_proj:
+        merged_ctx_out, merged_ctx_lse = merge_dcp_new_into_ctx(
+            ctx_output,
+            ctx_lse,
+            new_output,
+            new_lse,
+            dcp_rank=dcp_rank,
+            dcp_world_size=dcp_world_size,
+        )
+        scaled_out = cp_lse_ag_out_scale(
+            merged_ctx_out, merged_ctx_lse, dcp_group, return_lse=False
+        )
+        output = scaled_out.to(new_output.dtype)
+    else:
+        ctx_output, ctx_lse = cp_lse_ag_out_rs(
+            ctx_output, ctx_lse, dcp_group, return_lse=True
+        )
+        output, _ = merge_attn_results(ctx_output, ctx_lse, new_output, new_lse)
+        output = output.to(new_output.dtype)  # f32 ctx_lse promotes the merge
 
     if not torch.compiler.is_compiling():
-        synchronize_tensors(kv_cache, wait=False)
+        synchronize_tensors((kv_cache, output), wait=False)
     return output

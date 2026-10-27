@@ -329,3 +329,171 @@ def test_dcp_fp8_pass_matches_reference(
     # Exact because writes only copy already-quantized values. Comparing the
     # entire pool also catches changes to old tokens, other owners and padding.
     np.testing.assert_array_equal(cache, expected_cache)
+
+
+@pytest.mark.parametrize("pre_gathered_q", [False, True])
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+def test_dcp_fp8_duplicate_o_proj_adapter_forward(
+    layout, pre_gathered_q, monkeypatch, vllm_config_context
+):
+    dcp_size = 2
+    global_q_heads = 16
+    own_q_heads = global_q_heads // _TP_SIZE
+    get_current_vllm_config().cache_config.kv_cache_layout = (
+        "LBHNC" if layout == "HND" else "LBNHC"
+    )
+
+    cache_cases = [
+        _make_case(
+            layout,
+            rank_idx,
+            configs.AttentionScope.CACHE_ONLY,
+            dcp_size=dcp_size,
+            own_q_heads=own_q_heads,
+        )
+        for rank_idx in range(dcp_size)
+    ]
+    new_cases = [
+        _make_case(
+            layout,
+            rank_idx,
+            configs.AttentionScope.NEW_TOKENS_ONLY,
+            dcp_size=dcp_size,
+            own_q_heads=own_q_heads,
+        )
+        for rank_idx in range(dcp_size)
+    ]
+
+    ref_merged_outs = []
+    ref_merged_lses = []
+    for rank_idx in range(dcp_size):
+        merged_out_r, merged_lse_r = cp_attention.merge_dcp_new_into_ctx(
+            torch.from_numpy(cache_cases[rank_idx][1]),
+            torch.from_numpy(cache_cases[rank_idx][2]),
+            torch.from_numpy(new_cases[rank_idx][1]),
+            torch.from_numpy(new_cases[rank_idx][2]),
+            dcp_rank=rank_idx,
+            dcp_world_size=dcp_size,
+        )
+        ref_merged_outs.append(merged_out_r)
+        ref_merged_lses.append(merged_lse_r)
+
+    ref_global_lse = torch.logsumexp(torch.stack(ref_merged_lses, dim=0), dim=0)
+    expected_full_out = sum(
+        ref_merged_outs[r]
+        * torch.exp(ref_merged_lses[r] - ref_global_lse).unsqueeze(-1)
+        for r in range(dcp_size)
+    ).numpy()
+
+    captured_merged_lses: list[torch.Tensor | None] = [None] * dcp_size
+
+    class DuplicateTrackerGroup:
+        def __init__(self, rank_idx):
+            self.rank_in_group = rank_idx
+            self.world_size = dcp_size
+
+        def all_gather(self, tensor, dim=0):
+            if dim == 1:
+                if pre_gathered_q:
+                    raise AssertionError(
+                        "Q all_gather must not run when query is pre-gathered"
+                    )
+                full_q = cache_cases[0][0][1].to(tensor.device)
+                return full_q
+            lse_2d = tensor.squeeze(0).detach().cpu()
+            captured_merged_lses[self.rank_in_group] = lse_2d
+            if all(item is not None for item in captured_merged_lses):
+                return torch.stack(
+                    [item.to(tensor.device) for item in captured_merged_lses], dim=0
+                )
+            return torch.stack(
+                [ref_merged_lses[r].to(tensor.device) for r in range(dcp_size)], dim=0
+            )
+
+        def reduce_scatter(self, tensor, dim=1):
+            raise AssertionError(
+                "reduce_scatter must not be called under dcp_duplicate_o_proj"
+            )
+
+    def run_pass_for_rank(rank_idx):
+        monkeypatch.setattr(
+            attention,
+            "_get_dcp_group",
+            lambda r=rank_idx: DuplicateTrackerGroup(r),
+        )
+        monkeypatch.setattr(
+            cp_attention,
+            "get_dcp_group",
+            lambda r=rank_idx: DuplicateTrackerGroup(r),
+        )
+        monkeypatch.setattr(cp_attention, "_DCP_KERNEL_REGISTRY", {})
+
+        impl = attention.PallasBatchedRPAAttentionBackendImpl(
+            num_heads=own_q_heads,
+            head_size=_HEAD_DIM,
+            scale=_HEAD_DIM**-0.5,
+            num_kv_heads=1,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype="fp8",
+        )
+        config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=_TP_SIZE,
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=dcp_size,
+                dcp_duplicate_o_proj=True,
+            )
+        )
+        layer = SimpleNamespace(
+            _k_scale_float=_K_SCALE,
+            _v_scale_float=_V_SCALE,
+            dcp_duplicate_o_proj=True,
+        )
+        with set_vllm_model_wrapper_context(mesh=None, vllm_config=config):
+            impl.initialize_kernel(layer)
+            (
+                cache,
+                queries_full,
+                keys,
+                values,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+            ) = cache_cases[rank_idx][0]
+            if pre_gathered_q:
+                query_arg = queries_full.view(-1, own_q_heads, _HEAD_DIM).contiguous()
+            else:
+                query_arg = queries_full[
+                    :, rank_idx * own_q_heads : (rank_idx + 1) * own_q_heads
+                ].contiguous()
+            metadata = SimpleNamespace(
+                seq_lens=seq_lens.to("tpu"),
+                block_tables=block_tables.to("tpu"),
+                query_start_loc=query_start_loc.to("tpu"),
+                request_distribution=request_distribution.to("tpu"),
+            )
+            cache_tpu = cache.to("tpu")
+            out = impl.forward(
+                layer=layer,
+                query=query_arg.to("tpu"),
+                key=(keys.float() * _K_SCALE).to(torch.bfloat16).to("tpu"),
+                value=(values.float() * _V_SCALE).to(torch.bfloat16).to("tpu"),
+                kv_cache=cache_tpu,
+                attn_metadata=metadata,
+            )
+            return out.cpu().float().numpy(), cache_tpu.cpu().float().numpy()
+
+    for rank_idx in range(dcp_size):
+        run_pass_for_rank(rank_idx)
+
+    rank_outputs = []
+    for rank_idx in range(dcp_size):
+        out_np, updated_cache_np = run_pass_for_rank(rank_idx)
+        rank_outputs.append(out_np)
+        np.testing.assert_array_equal(updated_cache_np, new_cases[rank_idx][3])
+
+    combined_output = sum(rank_outputs)
+    assert combined_output.shape == expected_full_out.shape
+    np.testing.assert_allclose(combined_output, expected_full_out, atol=5e-3, rtol=1e-2)

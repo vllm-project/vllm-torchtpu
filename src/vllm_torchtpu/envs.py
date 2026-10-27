@@ -19,6 +19,9 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    TPU_DCP_DUPLICATE_O_PROJ: bool = False
+    DCP_DUPLICATE_O_PROJ: bool = False
+    VLLM_DCP_DUPLICATE_O_PROJ: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
@@ -483,6 +486,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # under TPU_DCP_MLA_OPROJ_ALL_REDUCE; 0 runs in a single chunk.
     "TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS": env_nonnegative_multiple_of(
         "TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS", 512, 128
+    ),
+    # Duplicate o_proj (W_O) across DCP ranks to eliminate reduce-scatter
+    "TPU_DCP_DUPLICATE_O_PROJ": lambda: (
+        env_bool("TPU_DCP_DUPLICATE_O_PROJ")()
+        or env_bool("DCP_DUPLICATE_O_PROJ")()
+        or env_bool("VLLM_DCP_DUPLICATE_O_PROJ")()
+    ),
+    "DCP_DUPLICATE_O_PROJ": lambda: (
+        env_bool("TPU_DCP_DUPLICATE_O_PROJ")()
+        or env_bool("DCP_DUPLICATE_O_PROJ")()
+        or env_bool("VLLM_DCP_DUPLICATE_O_PROJ")()
+    ),
+    "VLLM_DCP_DUPLICATE_O_PROJ": lambda: (
+        env_bool("TPU_DCP_DUPLICATE_O_PROJ")()
+        or env_bool("DCP_DUPLICATE_O_PROJ")()
+        or env_bool("VLLM_DCP_DUPLICATE_O_PROJ")()
     ),
     # QK pair-blocked GDN conv layout for Raiden transfers.  Not supported
     # with the unified GDN state pool: its kernel reads segment-major
