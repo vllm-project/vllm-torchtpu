@@ -646,9 +646,10 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         # `fused` is the lazy result of a stack of views, and torch_tpu
         # re-materializes that lineage as a per-step `tt_jit_as_strided`
         # program at the dispatched op's boundary (same failure mode and fix as
-        # the w_scale case in quantization/fp8.py). A fresh buffer filled by
-        # copy_ breaks the lazy chain so PJRT ships a plain row-major buffer.
-        out = torch.empty_like(fused)
+        # the w_scale case in quantization/fp8.py). A fresh float32 buffer
+        # filled by copy_ breaks the lazy chain and avoids a per-layer
+        # bf16->f32 convert_element_type kernel before the Pallas call.
+        out = torch.empty(fused.shape, dtype=torch.float32, device=fused.device)
         out.copy_(fused)
         self.conv_weight_fused = out
         self._pack_prefill_projection()
@@ -709,7 +710,6 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 [1152, 128, 384, 128], dim=-1
             )
             beta = beta_pad[:, : self.num_heads]
-            query = mixed_qkv[:, : self.local_projection_size]
         else:
             if sequence_parallel:
                 hidden_states = group.all_gather(hidden_states, dim=0)
@@ -717,7 +717,6 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             mixed_qkv, beta = projected.split(
                 [3 * self.local_projection_size, self.num_heads], dim=-1
             )
-            query = mixed_qkv[:, : self.local_projection_size]
             if self.use_full_rank_gate:
                 assert self.f_a_proj is not None
                 f_a, _ = self.f_a_proj(hidden_states)
@@ -736,7 +735,9 @@ class KimiDeltaAttention(nn.Module, MambaBase):
 
         metadata = self._metadata()
         if metadata is None or self.kv_cache is None or self.kv_cache[0].numel() == 0:
-            output = torch.zeros_like(query)
+            output = mixed_qkv.new_zeros(
+                (mixed_qkv.shape[0], self.local_projection_size)
+            )
         elif len(self.kv_cache) == 1:
             # Unified pool: the single attention-shaped buffer carries both
             # KDA state regions.

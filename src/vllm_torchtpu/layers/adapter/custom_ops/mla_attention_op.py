@@ -1090,9 +1090,9 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         )
 
         if output_gate is not None:
-            attn_out *= output_gate.sigmoid()
+            attn_out = attn_out * output_gate.sigmoid()
         elif self.g_proj is not None:
-            attn_out *= self.g_proj(hidden_states)[0].sigmoid()
+            attn_out = attn_out * self.g_proj(hidden_states)[0].sigmoid()
         if prefill_group is not None:
             return prefill_group.project_reduce_scatter(attn_out, self.o_proj)
         return self.o_proj(attn_out)[0]

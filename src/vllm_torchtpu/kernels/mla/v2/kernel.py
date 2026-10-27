@@ -2662,7 +2662,10 @@ def mla_ragged_paged_attention(
             cache_kv,
         )
 
-    batch_distribution = (distribution[0] // decode_batch_size) * decode_batch_size
+    eff_decode_batch_size = min(decode_batch_size, max(1, actual_max_num_tokens))
+    batch_distribution = (
+        distribution[0] // eff_decode_batch_size
+    ) * eff_decode_batch_size
     # Batched decode
     ql_nope, updated_kv = run_mla_kernel(
         ql_nope,
@@ -2678,31 +2681,32 @@ def mla_ragged_paged_attention(
         start_seq_idx=jnp.array(0),
         end_seq_idx=batch_distribution,
         static_q_len=1,
-        batch_size=decode_batch_size,
+        batch_size=eff_decode_batch_size,
         s_dtype=s_dtype,
         p_same_dtype_as_v=p_same_dtype_as_v,
         case=MlaCase.BATCHED_DECODE,
     )
-    # Decode-only
-    ql_nope, updated_kv = run_mla_kernel(
-        ql_nope,
-        q_pe,
-        new_kv_c,
-        new_k_pe,
-        updated_kv,
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        num_kv_pages_per_block=num_kv_pages_per_blocks[0],
-        num_queries_per_block=num_queries_per_blocks[0],
-        start_seq_idx=batch_distribution,
-        end_seq_idx=distribution[0],
-        static_q_len=1,
-        batch_size=1,
-        s_dtype=s_dtype,
-        p_same_dtype_as_v=p_same_dtype_as_v,
-        case=MlaCase.DECODE,
-    )
+    if eff_decode_batch_size > 1:
+        # Decode-only remainder when batched decode steps by > 1 sequences.
+        ql_nope, updated_kv = run_mla_kernel(
+            ql_nope,
+            q_pe,
+            new_kv_c,
+            new_k_pe,
+            updated_kv,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+            num_queries_per_block=num_queries_per_blocks[0],
+            start_seq_idx=batch_distribution,
+            end_seq_idx=distribution[0],
+            static_q_len=1,
+            batch_size=1,
+            s_dtype=s_dtype,
+            p_same_dtype_as_v=p_same_dtype_as_v,
+            case=MlaCase.DECODE,
+        )
 
     if chunk_prefill_size is not None:
         # Handle prefill where the query length is fixed per sequence.

@@ -263,7 +263,9 @@ def _gated_output_norm(
     activation_dtype,
 ) -> jax.Array:
     """Per-head ``o_norm`` followed by the sigmoid output gate."""
-    output = output.astype(activation_dtype).astype(jnp.float32)
+    if output.dtype != activation_dtype:
+        output = output.astype(activation_dtype)
+    output = output.astype(jnp.float32)
     output *= jax.lax.rsqrt(jnp.mean(output * output, axis=-1, keepdims=True) + eps)
     output = (output * norm_weight.astype(jnp.float32)).astype(activation_dtype)
     return output * jax.nn.sigmoid(output_gate.reshape(output.shape))
@@ -389,9 +391,7 @@ def _build_fused_core(
         # kernel indexes -- the reshapes are free. The dense `conv_state`
         # cache is declared in the kernel's (K - 1, 1, dim) slot layout so it
         # is read in place; the pooled path hands in its gathered slots flat.
-        # The kernel wants the weight transposed to [dim, 1, kernel_size].
-        conv_weight_flat = conv_weight.reshape(kernel_size, -1)
-        conv_weight_flat = jnp.transpose(conv_weight_flat, (1, 0))[:, None]
+        conv_weight_flat = conv_weight.reshape(kernel_size, 1, -1)
         if num_spec_tokens > 0 and slot_read_offsets is None:
             raise ValueError("slot_read_offsets are required for KDA verify")
         read_offsets = slot_read_offsets[state_indices] if num_spec_tokens > 0 else None
@@ -889,9 +889,7 @@ def _pooled_kda_core(
             d_v=head_dim,
             kernel_size=kernel_size,
         )
-        conv_weight_flat = jnp.transpose(
-            conv_weight.reshape(kernel_size, -1), (1, 0)
-        )[:, None]
+        conv_weight_flat = conv_weight.reshape(kernel_size, 1, -1)
         pool, out = gdn_wrapper.fused_conv1d_gdn(
             qkv=mixed_qkv,
             b=beta,

@@ -92,3 +92,37 @@ def test_k3_mixed_tuned_params_require_matching_geometry(
     assert tuned.num_kv_pages_per_block == 1
     assert tuned.num_queries_per_block == 16
     assert tuned.q_split == 1
+
+
+def test_k3_tp32_page256_arbitrary_seqs_mixed_and_decode_tuned_params(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mock_logger = MagicMock()
+    monkeypatch.setattr(tuned_params, "logger", mock_logger)
+
+    mixed_32seq = replace(
+        _k3_tp32_fp8_8k_page256_mixed_key(),
+        max_num_seqs=32,
+        pages_per_seq=128,
+    )
+    tuned_mixed = get_tuned_params(mixed_32seq)
+    assert tuned_mixed.num_kv_pages_per_block == 16
+    assert tuned_mixed.num_queries_per_block == 512
+    assert tuned_mixed.q_split == 8
+    assert tuned_mixed.vmem_limit_bytes == 52 * 1024 * 1024
+
+    decode_b1 = replace(mixed_32seq, case="batched_decode", max_num_tokens=1)
+    tuned_b1 = get_tuned_params(decode_b1)
+    assert tuned_b1.decode_batch_size == 1
+    assert tuned_b1.num_kv_pages_per_block == 4
+
+    decode_b8 = replace(mixed_32seq, case="batched_decode", max_num_tokens=8)
+    tuned_b8 = get_tuned_params(decode_b8)
+    assert tuned_b8.decode_batch_size == 8
+    assert tuned_b8.num_kv_pages_per_block == 4
+
+    decode_8k = replace(mixed_32seq, case="batched_decode", max_num_tokens=8192)
+    tuned_8k = get_tuned_params(decode_8k)
+    assert tuned_8k.decode_batch_size == 1
+    assert tuned_8k.num_kv_pages_per_block == 4
+    mock_logger.warning.assert_not_called()

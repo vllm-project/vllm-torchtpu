@@ -503,7 +503,7 @@ def fused_conv1d_gdn(
 
     num_seqs = state_indices.size
     batch_size, dim = qkv.shape
-    assert conv_weight.shape == (dim, 1, kernel_size)
+    assert conv_weight.shape in ((dim, 1, kernel_size), (kernel_size, 1, dim))
     if conv_bias is not None:
         assert conv_bias.shape == (dim,)
     assert query_start_loc.shape == (num_seqs + 1,)
@@ -595,7 +595,10 @@ def fused_conv1d_gdn(
     if not pooled:
         conv_state_shape = conv_state.shape
         conv_state = conv_state.reshape(-1, kernel_size - 1, 1, dim)
-    conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
+    if conv_weight.shape != (kernel_size, 1, dim):
+        conv_weight = conv_weight.swapaxes(0, 2)
+    if conv_weight.dtype != jnp.float32:
+        conv_weight = conv_weight.astype(jnp.float32)
     conv_bias = conv_bias.astype(jnp.float32) if conv_bias is not None else None
 
     # Step 4: Wrap inputs for the kernel.
