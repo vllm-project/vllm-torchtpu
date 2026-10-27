@@ -71,6 +71,14 @@ WEIGHT_DMA_PRIORITY = 1
 # The collective this kernel's barrier and remote copies belong to. Shared
 # with any other collective kernel built with the same id.
 COLLECTIVE_ID = 0
+# Builds that ship results from the HBM contribution slab push each
+# (expert, dest) run as soon as the tiles holding it are committed, while
+# the expert's remaining tiles still compute. Off, an expert's results go
+# out only after its last tile, so the push of a many-tile expert -- and
+# of the last expert visited -- sits on the wire with nothing to hide
+# behind, and every shard's drain waits for it. Read at build time; the
+# VMEM-push builds (small buckets) already ship every tile as it finishes.
+PROGRESSIVE_PUSH = True
 # The jax whose private ref-level bitcast the four-bit weight stream binds
 # to. Recorded so the failure names the version this was built against
 # rather than only the version that broke it.
@@ -750,6 +758,7 @@ def _build_fused_ep_moe_kernel(
     # This subsumes the deferred commit drain the same bound used to select:
     # deferring a wait one visit is worth nothing once the wait is gone.
     push_from_vmem = ragged_rows_alloc <= ep * g_local * tile_m
+    progressive_push = PROGRESSIVE_PUSH and not push_from_vmem
     ls_window_rows = host.act_scale_window_rows(tile_m)
     gather_tiles = host.TOKEN_GATHER_TILES_PER_WINDOW
     gather_payload_rows = gather_tiles * tile_m
@@ -1487,6 +1496,16 @@ def _build_fused_ep_moe_kernel(
                     def _():
                         wait_commits(parity, pending)
 
+                    if progressive_push:
+                        # This guard just took tile t - 2's commit and the
+                        # previous tile's guard took t - 3's, so every tile up
+                        # to t - 2 is in the slab: push the runs that end in
+                        # t - 2. Runs ending in the last two tiles go out after
+                        # the loop, behind drain_commits.
+                        @pl.when(t >= 2)
+                        def _():
+                            push_runs_ending_in(e, t - 2)
+
                 # Wait this tile's stream, then issue tile t+1's into the other
                 # slot before compute, so the fetch runs under the MXU window.
                 lhs_ready_tile(live_rows, parity)
@@ -1769,68 +1788,92 @@ def _build_fused_ep_moe_kernel(
         def _():
             prime_expert(visit_sm[0], jnp.int32(0), jnp.int32(0), jnp.bool_(False))
 
-        def push_expert(e):
-            """Push expert e's remote regions and hop its own-dest region."""
-            # Remote pushes go per (expert, dest) at true length; run starts
-            # stay aligned, so recv positions are unchanged. Each is predicated
-            # on its own length: a zero-length REMOTE DMA must never issue.
-            for d in range(ep):
-                region_blocks = commit_len_sm[e, d]
-                src_block = contrib_off_sm[e, d]
-                dst_block = push_dst_sm[e, d]
-                is_me = jnp.int32(d) == me
+        def run_last_tile(e, d):
+            """The expert-local tile holding run (e, d)'s last block."""
+            return jnp.right_shift(
+                commit_start_sm[e, d] + commit_len_sm[e, d] - 1, tile_block_shift
+            )
 
-                @pl.when(_and_nonempty(jnp.logical_not(is_me), region_blocks))
-                def _():
-                    # One expert per push, so the region IS expert e's run.
-                    true_rows = true_rows_sm[e, d]
+        def push_run(e, d):
+            """Push run (e, d): its remote rows and scale mirror, or the
+            own-dest hop. Remote pushes go per (expert, dest) at true length;
+            run starts stay aligned, so recv positions are unchanged. Each is
+            predicated on its own length: a zero-length REMOTE DMA must never
+            issue.
+            """
+            region_blocks = commit_len_sm[e, d]
+            src_block = contrib_off_sm[e, d]
+            dst_block = push_dst_sm[e, d]
+            is_me = jnp.int32(d) == me
 
-                    def push_run():
-                        """The rows themselves, at their true length."""
-                        pltpu.make_async_remote_copy(
-                            src_ref=contrib_hbm.at[
-                                pl.ds(contrib_off_sm[e, d] * ROWBLK, true_rows)
-                            ],
-                            dst_ref=recv_hbm.at[
-                                pl.ds(push_dst_sm[e, d] * ROWBLK, true_rows)
-                            ],
-                            send_sem=send_sem,
-                            recv_sem=recv_sem,
-                            device_id=(jnp.int32(d),),
-                            device_id_type=pl.DeviceIdType.MESH,
-                        ).start()
+            @pl.when(_and_nonempty(jnp.logical_not(is_me), region_blocks))
+            def _():
+                # One expert per push, so the region IS expert e's run.
+                true_rows = true_rows_sm[e, d]
 
-                    # A nonempty region can hold an empty (e, d) run.
-                    pl.when(true_rows > 0)(push_run)
-                    # Scale mirror: the source tiles this run's rows
-                    # fall in, landing at the base the destination's own
-                    # plan gave the run.
-                    src_sub, dst_sub, n_sub = _run_tiles(e, d, region_blocks)
+                def push_rows():
+                    """The rows themselves, at their true length."""
                     pltpu.make_async_remote_copy(
-                        src_ref=cscl_hbm.at[pl.ds(src_sub, n_sub)],
-                        dst_ref=rscl_hbm.at[pl.ds(dst_sub, n_sub)],
-                        send_sem=send_scl_sem,
-                        recv_sem=recv_scl_sem,
+                        src_ref=contrib_hbm.at[
+                            pl.ds(contrib_off_sm[e, d] * ROWBLK, true_rows)
+                        ],
+                        dst_ref=recv_hbm.at[
+                            pl.ds(push_dst_sm[e, d] * ROWBLK, true_rows)
+                        ],
+                        send_sem=send_sem,
+                        recv_sem=recv_sem,
                         device_id=(jnp.int32(d),),
                         device_id_type=pl.DeviceIdType.MESH,
                     ).start()
 
-                # Safe to defer: recv is read only after the drain.
-                @pl.when(_and_nonempty(is_me, region_blocks))
-                def _():
-                    pltpu.make_async_copy(
-                        contrib_hbm.at[
-                            pl.ds(src_block * ROWBLK, region_blocks * ROWBLK)
-                        ],
-                        recv_hbm.at[pl.ds(dst_block * ROWBLK, region_blocks * ROWBLK)],
-                        mehop_sem,
-                    ).start()
-                    src_sub, dst_sub, n_sub = _run_tiles(e, d, region_blocks)
-                    pltpu.make_async_copy(
-                        cscl_hbm.at[pl.ds(src_sub, n_sub)],
-                        rscl_hbm.at[pl.ds(dst_sub, n_sub)],
-                        mehop_scl_sem,
-                    ).start()
+                # A nonempty region can hold an empty (e, d) run.
+                pl.when(true_rows > 0)(push_rows)
+                # Scale mirror: the source tiles this run's rows
+                # fall in, landing at the base the destination's own
+                # plan gave the run.
+                src_sub, dst_sub, n_sub = _run_tiles(e, d, region_blocks)
+                pltpu.make_async_remote_copy(
+                    src_ref=cscl_hbm.at[pl.ds(src_sub, n_sub)],
+                    dst_ref=rscl_hbm.at[pl.ds(dst_sub, n_sub)],
+                    send_sem=send_scl_sem,
+                    recv_sem=recv_scl_sem,
+                    device_id=(jnp.int32(d),),
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
+
+            # Safe to defer: recv is read only after the drain.
+            @pl.when(_and_nonempty(is_me, region_blocks))
+            def _():
+                pltpu.make_async_copy(
+                    contrib_hbm.at[pl.ds(src_block * ROWBLK, region_blocks * ROWBLK)],
+                    recv_hbm.at[pl.ds(dst_block * ROWBLK, region_blocks * ROWBLK)],
+                    mehop_sem,
+                ).start()
+                src_sub, dst_sub, n_sub = _run_tiles(e, d, region_blocks)
+                pltpu.make_async_copy(
+                    cscl_hbm.at[pl.ds(src_sub, n_sub)],
+                    rscl_hbm.at[pl.ds(dst_sub, n_sub)],
+                    mehop_scl_sem,
+                ).start()
+
+        def push_runs_ending_in(e, tile):
+            """Progressive push: expert e's runs whose last tile is `tile`."""
+            for d in range(ep):
+                pl.when(run_last_tile(e, d) == tile)(functools.partial(push_run, e, d))
+
+        def push_expert(e, first_tile=None):
+            """Push expert e's remote regions and hop its own-dest region.
+
+            With ``first_tile``, only the runs whose last tile is at or past
+            it: the progressive push already sent the others.
+            """
+            for d in range(ep):
+                if first_tile is None:
+                    push_run(e, d)
+                else:
+                    pl.when(run_last_tile(e, d) >= first_tile)(
+                        functools.partial(push_run, e, d)
+                    )
 
         def visit_step(visit_i, carry):
             """One step of the visit list: compute, then drain and push."""
@@ -1840,7 +1883,13 @@ def _build_fused_ep_moe_kernel(
                 # Each tile shipped itself; there is nothing left to flush.
                 return carry
             carry = drain_commits(carry)
-            push_expert(e)
+            if progressive_push:
+                # The tile loop pushed every run ending before the last
+                # two tiles; these are the rest.
+                n_tiles = -(-expert_rows_sm[e] // tile_m)
+                push_expert(e, first_tile=n_tiles - 2)
+            else:
+                push_expert(e)
             return carry
 
         carry0 = tuple(jnp.int32(0) for _ in range(6 if push_from_vmem else 4))
@@ -1999,6 +2048,7 @@ def _build_fused_ep_moe_kernel(
         )
         name = (
             f"fused_ep_moe_v2"
+            f"{'_pp' if progressive_push else ''}"
             f"{format_tag}"
             f"{'' if act_fn == 'silu' else '_' + act_fn}"
             f"{bias_tag}"
