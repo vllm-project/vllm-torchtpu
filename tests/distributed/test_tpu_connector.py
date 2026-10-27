@@ -3099,6 +3099,145 @@ class TestTPURaidenConnectorWorker:
         # A request that fits one window stays byte-identical on the wire.
         assert "dst_window_blocks" not in by_uuid[1998]
 
+    def test_raiden_staging_window_disabled_with_multiple_fa_tags(self):
+        worker = _make_raiden_worker(
+            tp_rank=0, tp_size=1, is_producer=False, block_size=16
+        )
+        groups = (SimpleNamespace(layer_names=("fa.0", "fa.1")),)
+        manifest = SimpleNamespace(
+            pools=[
+                SimpleNamespace(
+                    tag="fa.fa_0",
+                    layer_name="fa.0",
+                    storage_index=0,
+                    block_stride_bytes=1 << 20,
+                ),
+                SimpleNamespace(
+                    tag="fa.fa_1",
+                    layer_name="fa.1",
+                    storage_index=1,
+                    block_stride_bytes=1 << 20,
+                ),
+            ]
+        )
+        with (
+            patch(f"{_MOD}._windowed_load_supported", return_value=True),
+            patch(
+                f"{_MOD}.dist_utils.get_raiden_pool_staging_window_blocks",
+                return_value=2,
+            ),
+            patch(f"{_MOD}.logger.warning") as warning,
+        ):
+            hints = worker._raiden_staging_blocks_per_pool(manifest, groups)
+        assert worker._stage3_fa_window_blocks == 0
+        assert hints == [4, 4]
+        warning.assert_called_once()
+
+    def test_stage3_consumer_window_kwarg_on_synchronous_sharded_leader_path(self):
+        worker = _make_raiden_worker(
+            is_producer=False, block_size=1024, tp_rank=0, tp_size=2
+        )
+        worker._stage3_state_group_count = 1
+        worker._stage3_fa_window_blocks = 2
+        worker._raiden_work_unit = MagicMock()
+        facade = MagicMock()
+        facade.start_transfer.return_value = True
+        worker._stage3_source_facades["prefill-controller.test:27000"] = facade
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_load["dst-long"] = _Stage3LoadMeta(
+            uuid=2001,
+            source_req_id="src-long",
+            local_block_ids=[50, 51, 52, 53],
+            num_tokens=4095,
+            src_controller_address="prefill-controller.test:27000",
+            src_job_name="prefill",
+            src_engine_id="producer-engine",
+            src_data_replica_idx=0,
+            src_parallelism=8,
+            mamba_state_block_ids=[11],
+        )
+        group = MagicMock()
+        with (
+            patch(f"{_MOD}.get_tp_group", return_value=group),
+            patch.object(
+                worker,
+                "_require_stage3_controller",
+                return_value=(MagicMock(), "10.0.0.2:28000"),
+            ),
+            patch.object(
+                worker, "_stage3_source_work_units", return_value=[MagicMock()]
+            ),
+            patch.object(
+                worker,
+                "_raiden_destination_work_units",
+                return_value=[MagicMock(), MagicMock()],
+            ),
+            patch.object(worker, "_raiden_hbm_memory_type", MagicMock(return_value=3)),
+        ):
+            worker._submit_stage3_loads(meta, MagicMock(), synchronous=True)
+
+        assert facade.start_transfer.call_count == 1
+        call_kwargs = facade.start_transfer.call_args.kwargs
+        assert call_kwargs["dst_window_blocks"] == [2, 0, 0]
+        assert call_kwargs["dst_device_block_ids"] == [50, 51, 52, 53, 11, 11]
+
+    def test_raiden_staging_budget_with_standalone_gdn_state_storages(self):
+        worker = _make_raiden_worker(
+            tp_rank=0, tp_size=1, is_producer=False, block_size=16
+        )
+        groups = (
+            SimpleNamespace(layer_names=("fa.0",)),
+            SimpleNamespace(layer_names=("gdn.0", "gdn.1")),
+        )
+        manifest = SimpleNamespace(
+            pools=[
+                SimpleNamespace(
+                    tag="fa",
+                    layer_name="fa.0",
+                    storage_index=0,
+                    block_stride_bytes=2 << 20,
+                ),
+                SimpleNamespace(
+                    tag="gdn.conv.g0",
+                    layer_name="gdn.0",
+                    storage_index=1,
+                    block_stride_bytes=512 << 10,
+                ),
+                SimpleNamespace(
+                    tag="gdn.ssm.g0",
+                    layer_name="gdn.0",
+                    storage_index=2,
+                    block_stride_bytes=512 << 10,
+                ),
+                SimpleNamespace(
+                    tag="gdn.conv.g1",
+                    layer_name="gdn.1",
+                    storage_index=3,
+                    block_stride_bytes=512 << 10,
+                ),
+                SimpleNamespace(
+                    tag="gdn.ssm.g1",
+                    layer_name="gdn.1",
+                    storage_index=4,
+                    block_stride_bytes=512 << 10,
+                ),
+            ]
+        )
+        # 12 MiB budget with 2 leases: 4 standalone GDN storages take
+        # 4 * (2 leases * 512 KiB) = 4 MiB total, leaving 8 MiB for the
+        # single FA storage (2 leases * 2 FA pages * 2 MiB = 8 MiB).
+        with (
+            patch(f"{_MOD}._windowed_load_supported", return_value=True),
+            patch(f"{_MOD}.dist_utils.get_raiden_pool_staging_leases", return_value=2),
+            patch(
+                f"{_MOD}.dist_utils.get_raiden_pool_staging_budget_mb",
+                return_value=12,
+            ),
+        ):
+            hints = worker._raiden_staging_blocks_per_pool(manifest, groups)
+        assert worker._stage3_fa_window_blocks == 2
+        assert hints == [2, 1, 1, 1, 1]
+
     def test_v2_stage3_startup_registration_payload_golden(self):
         cases = (
             # role, dp rank, transfer rank, unit replica, data/listener hosts

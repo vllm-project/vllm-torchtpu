@@ -6392,6 +6392,17 @@ class TPURaidenConnectorWorker:
                 clip_kwargs["dst_skip_bytes"] = [fa_skip_bytes] * fa_tag_count + [0] * (
                     len(transfer_tags) - fa_tag_count
                 )
+            window_blocks = int(self._stage3_fa_window_blocks)
+            # NOTE: Please double-check if this path is still reachable when
+            # synchronous=True / TPU_RAIDEN_INLINE_LOAD=1 with TP > 1.
+            # _submit_stage3_load_async and _trigger_stage3_reshard_pull both
+            # forward dst_window_blocks, so forwarding it here as well keeps
+            # the synchronous leader path consistent with the shrunk staging
+            # arena registered in _register_raiden_pools.
+            if 0 < window_blocks < max(dst_counts[:fa_tag_count], default=0):
+                clip_kwargs["dst_window_blocks"] = [window_blocks] * fa_tag_count + [
+                    0
+                ] * (len(transfer_tags) - fa_tag_count)
             start_submit = time.perf_counter()
             controller_contacted = True
             accepted = self._start_stage3_transfer_with_d5_retry(
@@ -7111,14 +7122,37 @@ class TPURaidenConnectorWorker:
             )
             self._stage3_fa_window_blocks = 0
             return 0
+        from vllm_torchtpu.distributed.kv_transfer.raiden import (
+            pool_manifest as rpm,
+        )
+
+        # NOTE: Please verify whether this guard is needed for per-layer FA tags
+        # (TPU_RAIDEN_POOL_TAGS_PER_LAYER=1). When multiple fa.<layer> tags are
+        # registered on a consumer, each FA tag receives the same local_blocks
+        # list in dst_device_block_ids. In tpu-sync's PlanSubTransfers,
+        # windowed_shares_blocks appears to reject splitting when any windowed
+        # tag shares destination block IDs with another tag, falling back to a
+        # single unsplit transfer. Keeping whole-request leases here avoids
+        # shrinking the consumer arena when sub-transfer splitting is skipped.
+        fa_tags = {
+            str(pool.tag)
+            for pool in getattr(manifest, "pools", ())
+            if str(pool.tag).startswith(rpm.TAG_FA)
+        }
+        if len(fa_tags) > 1:
+            logger.warning(
+                "Raiden pool staging budget/window requested with %d FA pool "
+                "tags, which tpu_sync PlanSubTransfers does not split when "
+                "tags share destination block ids; keeping whole-request "
+                "staging leases",
+                len(fa_tags),
+            )
+            self._stage3_fa_window_blocks = 0
+            return 0
         fa_pages = int(self._max_request_blocks())
         if explicit > 0:
             window = explicit
         else:
-            from vllm_torchtpu.distributed.kv_transfer.raiden import (
-                pool_manifest as rpm,
-            )
-
             leases = max(1, int(dist_utils.get_raiden_pool_staging_leases()))
             group_of_layer: dict[str, int] = {}
             for index, group in enumerate(kv_cache_groups or ()):
@@ -7150,7 +7184,21 @@ class TPURaidenConnectorWorker:
             if not fa_bounded:
                 self._stage3_fa_window_blocks = 0
                 return 0
-            share = budget_bytes // len(bounded)
+            # NOTE: When TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0, GDN conv/ssm
+            # pools live on separate storages from FA pools (so bounded has
+            # both fa_bounded and standalone state storages). Each standalone
+            # state storage only stages fixed `leases * state_blocks` slots in
+            # _raiden_staging_blocks_per_pool, so subtracting their fixed byte
+            # footprint before dividing by len(fa_bounded) avoids dividing the
+            # FA budget by the total number of standalone GDN state tensors.
+            # (When unified block pool is enabled, non_fa_state_bytes is 0 and
+            # len(fa_bounded) == len(bounded), so this is a no-op.)
+            non_fa_state_bytes = sum(
+                strides[s] * leases * len(state_tables.get(s, ()))
+                for s in bounded
+                if s not in fa_storages
+            )
+            share = max(0, budget_bytes - non_fa_state_bytes) // len(fa_bounded)
             window = fa_pages
             for storage in fa_bounded:
                 slots = share // max(1, strides[storage])
