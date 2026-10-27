@@ -385,18 +385,94 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
                     self.assertEqual(got, expected, msg=label)
 
 
+class GDNMulticoreDispatchTest(parameterized.TestCase):
+    """Trace real kernels on CPU to check the hardware/mode dispatch boundary."""
+
+    @parameterized.named_parameters(
+        ("v4_decode", "TPU v4", 2, config.AttentionMode.GDN, 0, 2),
+        ("v4_verify", "TPU v4", 2, config.AttentionMode.GDN, 3, 2),
+        ("v4_kda", "TPU v4", 2, config.AttentionMode.KDA, 3, 1),
+        ("v5p", "TPU v5p", 2, config.AttentionMode.GDN, 3, 1),
+        ("v6e", "TPU v6e", 1, config.AttentionMode.GDN, 3, 1),
+        ("v7", "TPU7x", 1, config.AttentionMode.GDN, 3, 1),
+    )
+    def test_multicore_grid(self, device_kind, cores, attention_mode, spec, expected):
+        # Clear cached traces so the spy observes both real pallas_call invocations.
+        jax.clear_caches()
+        mesh = AbstractMesh(
+            (), (), (), abstract_device=AbstractDevice(device_kind, cores, "tpu")
+        )
+        shape = jax.ShapeDtypeStruct
+        f32 = jnp.float32
+        n_kq, n_v, d_k, d_v, kernel_size = 1, 2, 128, 128, 4
+        dim = 2 * n_kq * d_k + n_v * d_v
+        seqs, tokens = 8, 32
+        gate_dim = n_v * d_k if attention_mode == config.AttentionMode.KDA else n_v
+        bias_shape = (
+            (n_v, d_k) if attention_mode == config.AttentionMode.KDA else (n_v,)
+        )
+        with (
+            use_abstract_mesh(mesh),
+            mock.patch.object(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", False),
+            mock.patch.object(
+                wrapper.pl, "pallas_call", wraps=wrapper.pl.pallas_call
+            ) as call,
+        ):
+            jax.make_jaxpr(
+                lambda *args: wrapper.fused_conv1d_gdn(
+                    *args,
+                    n_kq=n_kq,
+                    n_v=n_v,
+                    d_k=d_k,
+                    d_v=d_v,
+                    kernel_size=kernel_size,
+                    num_spec_tokens=spec,
+                    attention_mode=attention_mode,
+                    mixed_tile_size=1,
+                )
+            )(
+                shape((tokens, dim), f32),
+                shape((tokens, n_v), f32),
+                shape((tokens, gate_dim), f32),
+                shape((seqs * (spec + 1), kernel_size - 1, dim), f32),
+                shape((seqs * (spec + 1), n_v, d_k, d_v), f32),
+                shape((dim, 1, kernel_size), f32),
+                None,
+                shape((n_v,), f32),
+                shape(bias_shape, f32),
+                shape((seqs + 1,), jnp.int32),
+                shape((seqs,), jnp.int32),
+                shape((3,), jnp.int32),
+                shape((seqs,), jnp.int32),
+                shape((seqs,), jnp.int32),
+            )
+        self.assertLen(call.call_args_list, 2)
+        batched, per_seq = call.call_args_list
+        self.assertEqual(
+            batched.kwargs.get("grid", ()), (expected,) if expected > 1 else ()
+        )
+        self.assertEqual(per_seq.kwargs.get("grid", ()), ())
+        semantics = batched.kwargs["compiler_params"].dimension_semantics
+        self.assertEqual(semantics, ("parallel",) if expected > 1 else None)
+
+
 class GDNStatePipelineRaceTest(parameterized.TestCase):
     """CPU interpret-mode checks of the state DMA pipeline."""
 
-    def test_state_pipeline_has_no_dma_race(self):
+    @parameterized.named_parameters(
+        ("single_core", "TPU7x", 1, 6),
+        ("v4_multicore", "TPU v4", 2, 12),
+        ("v4_empty_decode", "TPU v4", 2, 0),
+        ("v4_single_decode", "TPU v4", 2, 1),
+        ("v4_uneven_tiles", "TPU v4", 2, 10),
+    )
+    def test_state_pipeline_has_no_dma_race(self, device_kind, num_cores, num_decode):
         """Pallas interpret-mode vector-clock detector finds zero DMA races."""
         n_kq, n_v, d_k, d_v, kernel_size = 1, 2, 128, 128, 4
         dim = 2 * n_kq * d_k + n_v * d_v
-        # 6 decode sequences, then 3 one-token prefill sequences (one PER_SEQ tile
-        # each), so both kernels reuse a slot two steps later.
-        num_decode = 6
-        num_seqs = 9
-        decode_tile = 2  # 3 pipeline steps: step 2 reuses step 0's slot.
+        # The largest case has three pipeline steps per core and reuses slots.
+        num_seqs = num_decode + 3
+        decode_tile = min(2, max(1, num_decode))
 
         rngs = iter(jax.random.split(jax.random.key(0), 9))
         qkv = jax.random.normal(next(rngs), (num_seqs, dim), dtype=jnp.bfloat16)
@@ -419,6 +495,26 @@ class GDNStatePipelineRaceTest(parameterized.TestCase):
         state_indices = jnp.arange(num_seqs, dtype=jnp.int32)
         distribution = jnp.array([num_decode, num_seqs, num_seqs], dtype=jnp.int32)
         seq_lens = jnp.full((num_seqs,), 11, dtype=jnp.int32)
+        (conv_ref, rec_ref), out_ref = gdn_attention_ref(
+            qkv=qkv,
+            b=b,
+            a=a,
+            conv_state=init_conv,
+            recurrent_state=init_rec,
+            conv_weight=conv_w,
+            conv_bias=conv_b,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            query_start_loc=q_loc,
+            state_indices=state_indices,
+            distribution=distribution,
+            seq_lens=seq_lens,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+        )
 
         # OSS jax 0.11.x has no InterpretParams.on_race, so read the detector's
         # verdict before each pallas_call clears the shared state.
@@ -433,7 +529,7 @@ class GDNStatePipelineRaceTest(parameterized.TestCase):
             orig_clear()
 
         mesh = AbstractMesh(
-            (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
+            (), (), (), abstract_device=AbstractDevice(device_kind, num_cores, "tpu")
         )
         pltpu.reset_tpu_interpret_mode_state()
         mosaic_interpret._clear_shared_memory = _record_and_clear
@@ -475,6 +571,9 @@ class GDNStatePipelineRaceTest(parameterized.TestCase):
                     mixed_tile_size=1,
                 )
                 jax.block_until_ready((conv_out, rec_out, out))
+            np.testing.assert_allclose(out, out_ref, rtol=1e-2, atol=1e-2)
+            np.testing.assert_allclose(conv_out, conv_ref, rtol=1e-2, atol=1e-2)
+            np.testing.assert_allclose(rec_out, rec_ref, rtol=1e-2, atol=1e-2)
             self.assertTrue(races_per_call)
             self.assertFalse(
                 any(races_per_call),
