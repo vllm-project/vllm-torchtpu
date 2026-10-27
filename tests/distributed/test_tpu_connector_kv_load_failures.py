@@ -74,7 +74,8 @@ def _vllm_config(connector="TPUConnector", policy="recompute", **kwargs):
 def _connector(policy="recompute", max_concurrent_batches=1):
     cfg = _vllm_config(policy=policy)
     cfg.max_concurrent_batches = max_concurrent_batches
-    with patch(f"{_MOD}.TPUConnectorScheduler"):
+    with patch(f"{_MOD}.TPUConnectorScheduler") as scheduler_cls:
+        scheduler_cls.return_value.request_finished.return_value = (False, None)
         return TPUConnector(cfg, KVConnectorRole.SCHEDULER, MagicMock())
 
 

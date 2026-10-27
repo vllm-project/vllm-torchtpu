@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.kv_cache_manager import KVCacheManager as VllmKVCacheManager
     from vllm.v1.request import Request
 
 import vllm_torchtpu.distributed.utils as dist_utils
@@ -88,6 +89,10 @@ from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
     ReqId,
     SendMeta,
     TPUConnectorMetadata,
+)
+from vllm_torchtpu.distributed.kv_transfer.kv_cache_memory_stats import (
+    KVBlockStateTracker,
+    TracksKVBlockStates,
 )
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorPromMetrics,
@@ -762,7 +767,7 @@ def _use_raiden_connector(vllm_config: VllmConfig) -> bool:
     return dist_utils.get_use_raiden_connector()
 
 
-class TPUConnector(KVConnectorBase_V1, SupportsHMA):
+class TPUConnector(KVConnectorBase_V1, SupportsHMA, TracksKVBlockStates):
     force_raiden_connector = False
 
     @property
@@ -850,6 +855,7 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         elif role == KVConnectorRole.WORKER:
             self.connector_scheduler = None
             self.connector_worker = worker_cls(vllm_config)
+        self.kv_block_states = KVBlockStateTracker()
 
     # ---- Scheduler-side methods -----------------------------------------
     def on_new_request(self, request: "Request") -> None:
@@ -868,6 +874,7 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
         assert self.connector_scheduler is not None
+        self.kv_block_states.on_alloc(request.request_id, num_external_tokens)
         if num_external_tokens > 0:
             # A re-admitted (e.g. preempted) request starts a new claim.
             self._retiring_load_claims.pop(request.request_id, None)
@@ -886,6 +893,7 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         scheduler_output: SchedulerOutput,
     ) -> TPUConnectorMetadata:
         assert self.connector_scheduler is not None
+        self.kv_block_states.on_scheduled(scheduler_output.num_scheduled_tokens)
         # A scheduled request is not waiting for its load, so the load runs
         # inline in this step and any failure shows up in this step's output.
         for req_id in scheduler_output.num_scheduled_tokens:
@@ -899,9 +907,22 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
         self._retire_load_claim(request.request_id)
-        return self.connector_scheduler.request_finished(request, block_ids)
+        delay_free, params = self.connector_scheduler.request_finished(
+            request, block_ids
+        )
+        self.kv_block_states.on_finished(request.request_id, delay_free)
+        return delay_free, params
 
     def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        delay_free, params = self._request_finished_all_groups(request, block_ids)
+        self.kv_block_states.on_finished(request.request_id, delay_free)
+        return delay_free, params
+
+    def _request_finished_all_groups(
         self,
         request: "Request",
         block_ids: tuple[list[int], ...],
@@ -971,8 +992,19 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         Get the KV transfer stats for the connector.
         """
         if self.connector_worker is None:
-            return self._take_scheduler_stats()
+            stats = self._take_scheduler_stats()
+            counts = self.kv_block_states.maybe_count()
+            if counts is not None:
+                if stats is None:
+                    stats = TpuKVConnectorStats()
+                stats.record_blocks_by_state(counts)
+            return stats
         return self.connector_worker.get_kv_connector_stats()
+
+    def bind_kv_cache_manager(self, kv_cache_manager: "VllmKVCacheManager") -> None:
+        # The base class binds the block pool through bind_gpu_block_pool.
+        super().bind_kv_cache_manager(kv_cache_manager)
+        self.kv_block_states.bind(kv_cache_manager)
 
     def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
         """Count the cached blocks this pool evicts for new blocks.
@@ -1169,6 +1201,7 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         """Counts failed KV loads, and retires scheduler-side Stage-3 dedup
         state on real completion."""
         self._count_load_failures(connector_output)
+        self.kv_block_states.on_connector_output(connector_output)
         scheduler = self.connector_scheduler
         if scheduler is not None and hasattr(scheduler, "update_connector_output"):
             scheduler.update_connector_output(connector_output)

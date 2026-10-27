@@ -48,7 +48,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.config import VllmConfig
@@ -59,6 +59,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorPromMetrics,
+    KVConnectorStats,
     PromMetric,
     PromMetricT,
 )
@@ -70,6 +71,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingWorkerMetadata,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadingConnectorStats,
     OffloadPromMetrics,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
@@ -89,11 +91,20 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCacheTensor,
     GPULoadStoreSpec,
     OffloadingCounterMetadata,
+    OffloadingGaugeMetadata,
     OffloadKey,
 )
 from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu.distributed.kv_transfer.kv_cache_memory_stats import (
+    BLOCK_STATES,
+    KV_CACHE_BLOCKS_BY_STATE_DOC,
+    KV_CACHE_BLOCKS_BY_STATE_METRIC_NAME,
+    KVBlockStateTracker,
+    TracksKVBlockStates,
+    get_or_create_kv_cache_blocks_by_state_gauge,
+)
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     KV_LOAD_FAILURES_DOC,
     KV_LOAD_FAILURES_METRIC_NAME,
@@ -109,6 +120,8 @@ from vllm_torchtpu.offload.raiden_store import (
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVCacheEvent
+    from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+    from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
@@ -363,9 +376,17 @@ class TpuOffloadPromMetrics(OffloadPromMetrics):
                 self._counter_cls, vllm_config, labelnames, per_engine_labelvalues
             )
         )
+        self._offloading_metric_metadata[KV_CACHE_BLOCKS_BY_STATE_METRIC_NAME] = (
+            OffloadingGaugeMetadata(
+                documentation=KV_CACHE_BLOCKS_BY_STATE_DOC, labelnames=("state",)
+            )
+        )
+        self._offloading_metric_defs[KV_CACHE_BLOCKS_BY_STATE_METRIC_NAME] = (
+            get_or_create_kv_cache_blocks_by_state_gauge(self._gauge_cls, labelnames)
+        )
 
 
-class TPURaidenOffloadingConnector(OffloadingConnector):
+class TPURaidenOffloadingConnector(OffloadingConnector, TracksKVBlockStates):
     """Top-level facade connector for the store-backed (V2) raiden KV offload path."""
 
     @classmethod
@@ -458,8 +479,55 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             # In-flight fence events awaiting device retirement before acknowledging
             # store jobs, recorded as pairs of (fence_job_ids, event).
             self._pending_fences: list[tuple[set[int], torch.Event]] = []
+        self.kv_block_states = KVBlockStateTracker()
 
     # -- scheduler-side hooks ----------------------------------------------
+    def bind_kv_cache_manager(self, kv_cache_manager: KVCacheManager) -> None:
+        super().bind_kv_cache_manager(kv_cache_manager)
+        self.kv_block_states.bind(kv_cache_manager)
+
+    def update_state_after_alloc(
+        self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
+    ):
+        self.kv_block_states.on_alloc(request.request_id, num_external_tokens)
+        return super().update_state_after_alloc(request, blocks, num_external_tokens)
+
+    def build_connector_meta(
+        self, scheduler_output: SchedulerOutput
+    ) -> KVConnectorMetadata:
+        self.kv_block_states.on_scheduled(scheduler_output.num_scheduled_tokens)
+        return super().build_connector_meta(scheduler_output)
+
+    def update_connector_output(self, connector_output: KVConnectorOutput):
+        self.kv_block_states.on_connector_output(connector_output)
+        super().update_connector_output(connector_output)
+
+    def request_finished(
+        self, request: Request, block_ids: list[int]
+    ) -> tuple[bool, dict[str, Any] | None]:
+        delay_free, params = super().request_finished(request, block_ids)
+        self.kv_block_states.on_finished(request.request_id, delay_free)
+        return delay_free, params
+
+    def request_finished_all_groups(
+        self, request: Request, block_ids: tuple[list[int], ...]
+    ) -> tuple[bool, dict[str, Any] | None]:
+        delay_free, params = super().request_finished_all_groups(request, block_ids)
+        self.kv_block_states.on_finished(request.request_id, delay_free)
+        return delay_free, params
+
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        stats = cast(OffloadingConnectorStats | None, super().get_kv_connector_stats())
+        counts = self.kv_block_states.maybe_count()
+        if counts is not None:
+            if stats is None:
+                stats = OffloadingConnectorStats()
+            for state, count in zip(BLOCK_STATES, counts):
+                stats.set_gauge(
+                    KV_CACHE_BLOCKS_BY_STATE_METRIC_NAME, count, labelvalues=(state,)
+                )
+        return stats
+
     def reset_cache(self) -> bool | None:
         # External cache reset is unsupported by the Raiden store. Report
         # failure through the endpoint's documented channel instead of raising an

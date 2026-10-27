@@ -29,6 +29,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 from vllm.v1.metrics.utils import create_metric_per_engine
 
 import vllm_torchtpu.distributed.utils as dist_utils
+from vllm_torchtpu.distributed.kv_transfer.kv_cache_memory_stats import (
+    BLOCK_STATES,
+    STATS_KEY_BLOCKS_BY_STATE,
+    get_or_create_kv_cache_blocks_by_state_gauge,
+)
 from vllm_torchtpu.distributed.kv_transfer.raiden.telemetry_utils import (
     normalize_raiden_metric_name,
     parse_raiden_metric_key,
@@ -162,6 +167,10 @@ class TpuKVConnectorStats(KVConnectorStats):
         self.data["runner_cpu_issue_seconds"].extend(cpu_samples)
         self.data["runner_device_elapsed_seconds"].extend(device_samples)
 
+    def record_blocks_by_state(self, counts: list[int]) -> None:
+        """Record a block count snapshot, one count per BLOCK_STATES entry."""
+        self.data[STATS_KEY_BLOCKS_BY_STATE].extend(counts)
+
     def reset(self):
         # Must be serializable
         self.data: dict[str, list[float | int | tuple[str, str, float]]] = {
@@ -176,6 +185,7 @@ class TpuKVConnectorStats(KVConnectorStats):
             "decode_queue_length": [],
             "runner_cpu_issue_seconds": [],
             "runner_device_elapsed_seconds": [],
+            STATS_KEY_BLOCKS_BY_STATE: [],
         }
 
     def clone_and_reset(self) -> "TpuKVConnectorStats":
@@ -387,6 +397,10 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
             gauge_tpu_decode_queue_length, self.per_engine_labelvalues
         )
 
+        self.gauge_kv_cache_blocks_by_state = (
+            get_or_create_kv_cache_blocks_by_state_gauge(self._gauge_cls, labelnames)
+        )
+
         self.dynamic_metrics: dict[str, tuple[str, Any, list[str]]] = (
             self._get_raiden_metric_definitions(labelnames)
         )
@@ -471,6 +485,10 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
             self.counter_kv_load_failures.labels(*engine_labels, connector, policy).inc(
                 count
             )
+        # Snapshots arrive in order; the last one wins.
+        blocks_by_state = transfer_stats_data.get(STATS_KEY_BLOCKS_BY_STATE, [])
+        for state, count in zip(BLOCK_STATES, blocks_by_state[-len(BLOCK_STATES) :]):
+            self.gauge_kv_cache_blocks_by_state.labels(*engine_labels, state).set(count)
 
         for prom_obj, list_item_key in zip(
             [

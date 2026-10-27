@@ -525,6 +525,7 @@ class TestTPUConnector:
             cfg, KVConnectorRole.SCHEDULER, _make_test_kv_cache_config()
         )
         sched = mock_sched_cls.return_value
+        sched.request_finished.return_value = (False, None)
         req, blocks, sched_out = MagicMock(), MagicMock(), MagicMock()
 
         connector.get_num_new_matched_tokens(req, 16)
@@ -783,6 +784,7 @@ class TestTPUConnector:
             cfg, KVConnectorRole.SCHEDULER, _make_test_kv_cache_config()
         )
         sched = mock_sched_cls.return_value
+        sched.request_finished.return_value = (False, None)
         req = MagicMock()
 
         connector.request_finished_all_groups(req, ([1, 2, 3],))

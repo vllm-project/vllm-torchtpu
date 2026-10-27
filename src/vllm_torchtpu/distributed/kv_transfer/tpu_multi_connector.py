@@ -13,10 +13,19 @@
 # limitations under the License.
 """TPU Multi Connector wrapper for combining disagg and offloading."""
 
+from typing import TYPE_CHECKING
+
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
 
+from vllm_torchtpu.distributed.kv_transfer.kv_cache_memory_stats import (
+    KVBlockStateTracker,
+    TracksKVBlockStates,
+)
 from vllm_torchtpu.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
 
 logger = init_logger(__name__)
 
@@ -68,6 +77,15 @@ class TPUMultiConnector(MultiConnector):
             fn = getattr(c, "register_runner", None)
             if fn is not None:
                 fn(runner)
+
+    def bind_kv_cache_manager(self, kv_cache_manager: "KVCacheManager") -> None:
+        # Children share one tracker, so vllm:kv_cache_blocks_by_state counts
+        # every child's loading and held requests and is sampled once.
+        kv_block_states = KVBlockStateTracker()
+        for c in self._connectors:
+            if isinstance(c, TracksKVBlockStates):
+                c.kv_block_states = kv_block_states
+        super().bind_kv_cache_manager(kv_cache_manager)
 
     @classmethod
     def _get_connector_classes_and_configs(cls, vllm_config):
