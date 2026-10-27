@@ -431,7 +431,18 @@ def _attention_kernel(
     capped_windows: int | None = None,
     split_q: bool = False,
     lse_lane_dense: bool = False,
+    tq_centroids: tuple[float, ...] | None = None,
 ):
+    # TurboQuant mode (`tq_centroids` set, SparseCore layout only): the
+    # gathered NoPE holds 4-bit latent codes, two tokens per 128-word row
+    # (`native_sc_gather` `nope_words=64`), and each RoPE row carries the
+    # token's bf16 latent norm in bytes [64, 66). `unpack_bkv` dequantizes both
+    # to bf16 -- the NoPE in the caller's rotated basis, the RoPE times
+    # `k_scale` -- so no scale is applied to the scores or the PV product.
+    rope_scale = k_scale
+    if tq_centroids is not None:
+        assert sparsecore_layout
+        k_scale = 1.0
     # Split-q mode (`split_q`): `q_hbm_ref` holds q_nope only and the rope
     # part arrives as a separate input `q_pe_hbm_ref` (first of `refs`), with
     # its own VMEM double buffer (last scratch ref). The two are joined and
@@ -498,7 +509,7 @@ def _attention_kernel(
     nope_dim = kv_cache_utils.WORD_BYTES * kv_cache_utils.TILE_LANE_BYTES
     assert kv_lens_ref.shape[0] == num_tokens
     bkv_sz = (
-        cache_kv_nope_hbm_ref.shape[1]
+        cache_kv_nope_hbm_ref.shape[1] * (1 if tq_centroids is None else 2)
         if sparsecore_layout
         else cache_kv_nope_hbm_ref.shape[1] // kv_cache_utils.WORD_BYTES
     )
@@ -735,7 +746,43 @@ def _attention_kernel(
             lambda: kv_lens_ref[batch_start_seq_idx + batch_idx],
         )
 
+    def unpack_bkv_tq(bkv_nope_ref, bkv_rope_ref):
+        from vllm_torchtpu.layers.core import turboquant as tq
+
+        # Two tokens per uint32[128] row, delta-swapped by the native gather
+        # so the byte expansion is one contiguous 256 B code row per token.
+        codes = pltpu.bitcast(bkv_nope_ref[...], jnp.uint8)
+        codes = codes.reshape(bkv_sz, tq.MLA_TQ_NOPE_BYTES)
+        rope_u8 = pltpu.bitcast(bkv_rope_ref[...], jnp.uint8).reshape(bkv_sz, 128)
+        off = tq.MLA_TQ_NORM_BYTE_OFFSET
+        # Pull the two norm byte columns out with lane-masked reductions
+        # rather than single-lane slices of a packed uint8 tile.
+        lane = lax.broadcasted_iota(jnp.int32, rope_u8.shape, 1)
+        rope_i32 = rope_u8.astype(jnp.int32)
+
+        def byte_col(col):
+            return jnp.sum(jnp.where(lane == col, rope_i32, 0), axis=1, keepdims=True)
+
+        nope = tq.dequant_mla_latent_vreg(
+            codes,
+            byte_col(off),
+            byte_col(off + 1),
+            np.asarray(tq_centroids, np.float32),
+            jnp.bfloat16,
+        )
+        # The norm bytes may decode to fp8 NaN; only the k_pe lanes are kept.
+        rope_u8 = jnp.where(lane < off, rope_u8, jnp.uint8(0))
+        rope = pltpu.bitcast(rope_u8, jnp.float8_e4m3fn).astype(jnp.float32)
+        if rope_scale != 1.0:
+            rope = rope * rope_scale
+        return jnp.concatenate([nope, rope.astype(jnp.bfloat16)], axis=-1)
+
     def unpack_bkv(bkv_nope_ref, bkv_rope_ref, get_kv_len):
+        if tq_centroids is not None:
+            bkv = unpack_bkv_tq(bkv_nope_ref, bkv_rope_ref)
+            kv_len = get_kv_len()
+            k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
+            return jnp.where(k_span < kv_len, bkv, 0)
         bkv_nope = bkv_nope_ref[...]
         if sparsecore_layout:
             # Native SC returns one uint32[128] row per token. Bitcasting
@@ -1061,6 +1108,7 @@ def prepare_outputs(
         "live_gather_all_chunks",
         "topk_cap",
         "lse_lane_dense",
+        "tq_centroids",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -1095,6 +1143,7 @@ def sparse_ragged_paged_attention(
     topk_cap: int | None = None,
     q_pe: jax.Array | None = None,
     lse_lane_dense: bool = False,
+    tq_centroids: tuple[float, ...] | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -1159,6 +1208,12 @@ def sparse_ragged_paged_attention(
       lse_lane_dense: With `return_lse`, carry the log-sum-exp as f32[tokens,
         heads] through the kernel instead of f32[tokens, heads, 1] (lane-padded
         tiles). Same values.
+      tq_centroids: TurboQuant mode (SparseCore layout only). The NoPE cache
+        holds 4-bit latent codes, `u32[pages, page_size / 2, 128]` (see
+        `turboquant.quantize_mla_latent`), and each RoPE row carries the
+        token's bf16 norm after its 64 fp8 bytes. `q`'s nope part must be
+        pre-rotated and the output's nope part post-rotated by the same
+        Hadamard; `k_scale` then applies to the RoPE keys only.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -1170,6 +1225,13 @@ def sparse_ragged_paged_attention(
             f"{SPARSECORE_CACHE_LAYOUT!r}, got {cache_layout!r}"
         )
     sparsecore_layout = cache_layout == SPARSECORE_CACHE_LAYOUT
+    nope_ratio = 4  # NoPE / RoPE cache size: 512 B vs 128 B per token.
+    if tq_centroids is not None:
+        if not sparsecore_layout:
+            raise NotImplementedError(
+                "TurboQuant sparse MLA needs the sparsecore layout"
+            )
+        nope_ratio = 2  # 256 B of 4-bit codes vs 128 B per token.
     if sparsecore_layout:
         if (
             cache_kv_nope.dtype != jnp.uint32
@@ -1204,14 +1266,14 @@ def sparse_ragged_paged_attention(
             raise ValueError(
                 "tensorcore ROPE cache must be uint8[pages,page_size/4,4,128]"
             )
-    if cache_kv_nope.size != 4 * cache_kv_rope.size:
+    if cache_kv_nope.size != nope_ratio * cache_kv_rope.size:
         raise ValueError(
             f"NOPE cache size ({cache_kv_nope.size}) must be exactly "
-            f"4 * ROPE cache size ({cache_kv_rope.size})"
+            f"{nope_ratio} * ROPE cache size ({cache_kv_rope.size})"
         )
     if (
         cache_kv_nope.shape[0] != cache_kv_rope.shape[0]
-        or cache_kv_nope.shape[1] != 4 * cache_kv_rope.shape[1]
+        or cache_kv_nope.shape[1] != nope_ratio * cache_kv_rope.shape[1]
     ):
         raise ValueError(
             "NOPE and ROPE caches must have matching page counts and page geometry"
@@ -1232,7 +1294,7 @@ def sparse_ragged_paged_attention(
     else:
         q = prepare_q_inputs(q)  # [max_num_tokens, num_q_heads, head_dim]
 
-    page_size = cache_kv_nope.shape[1]
+    page_size = cache_kv_rope.shape[1] * kv_cache_utils.WORD_BYTES
 
     _, num_q_heads, _ = q.shape
 
@@ -1360,6 +1422,7 @@ def sparse_ragged_paged_attention(
             ),
             q_pe=q_pe,
             lse_lane_dense=lse_lane_dense,
+            tq_centroids=tq_centroids,
         )
         if return_lse:
             q, lse = result
@@ -1461,6 +1524,7 @@ def sparse_attention_chunk(
     window_indices: jax.Array | None = None,
     q_pe: jax.Array | None = None,
     lse_lane_dense: bool = False,
+    tq_centroids: tuple[float, ...] | None = None,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -1481,6 +1545,7 @@ def sparse_attention_chunk(
     (unpadded, nope a multiple of 128) and `q_pe` its rope part; the kernel
     joins them in VMEM and the output (aliasing `q`) is `nope` wide.
     `lse_lane_dense`: `lse` is f32[max_num_tokens, num_q_heads].
+    `tq_centroids`: TurboQuant NoPE codes (see `sparse_ragged_paged_attention`).
     """
     return_lse = lse is not None
     if topk_override is not None:
@@ -1506,6 +1571,11 @@ def sparse_attention_chunk(
         head_dim = align_to(head_dim + q_pe.shape[-1], 128)
     chunk_size = end_pos - start_pos
     capped_windows = None if topk_cap is None else topk // topk_cap
+    if tq_centroids is not None and not sparsecore_layout:
+        raise NotImplementedError("TurboQuant sparse MLA needs the sparsecore layout")
+    # NoPE words per token, and tokens per gathered 128-word NoPE row.
+    nope_words = 128 if tq_centroids is None else 64
+    nope_tokens_per_row = 128 // nope_words
 
     def run_mla_kernel(
         q: jax.Array,  # [max_num_tokens, num_q_heads, head_dim]
@@ -1611,6 +1681,7 @@ def sparse_attention_chunk(
             capped_windows=capped_windows,
             split_q=split_q,
             lse_lane_dense=lse_lane_dense,
+            tq_centroids=tq_centroids,
         )
 
         scope_name = (
@@ -1732,10 +1803,11 @@ def sparse_attention_chunk(
                 serve_pipelined=sparsecore_gather_pipelined,
                 num_live_indices=num_live_capped,
                 live_multiple=kernel_batch_size * topk_cap,
+                nope_words=nope_words,
             )
         )
         gathered_nope_buffer = gathered_nope_buffer.reshape(
-            capped_windows * chunk_size, topk_cap, 128
+            capped_windows * chunk_size, topk_cap // nope_tokens_per_row, 128
         )
         gathered_rope_buffer = gathered_rope_buffer.reshape(
             capped_windows * chunk_size, topk_cap // native_sc_gather.ROPE_PACKING, 128
@@ -1763,10 +1835,13 @@ def sparse_attention_chunk(
                 atoms_per_batch=gather_atoms,
                 wait_mode=sparsecore_gather_wait_mode,
                 serve_pipelined=sparsecore_gather_pipelined,
+                nope_words=nope_words,
                 **live_kwargs,
             )
         )
-        gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, topk, 128)
+        gathered_nope_buffer = gathered_nope_buffer.reshape(
+            chunk_size, topk // nope_tokens_per_row, 128
+        )
         gathered_rope_buffer = gathered_rope_buffer.reshape(
             chunk_size, topk // native_sc_gather.ROPE_PACKING, 128
         )

@@ -91,6 +91,7 @@ from vllm_torchtpu.layers.adapter.cp_mla_attention import (
     all_gather_q_nope_pe_heads,
     merge_lse_partials_scatter_heads,
 )
+from vllm_torchtpu.layers.core import turboquant
 from vllm_torchtpu.layers.core.attention_interface import (
     attention,
     attention_bundled,
@@ -1670,6 +1671,8 @@ class PallasMLAttentionBackend(AttentionBackend):
         "fp8_e4m3",
         "fp8_e5m2",
         "fp8_ds_mla",
+        # Sparse (DSA) MLA only: 4-bit latent codes, see `turboquant_attention`.
+        "turboquant_4bit_nc",
     ]
 
     # DeepSeek-V4 MLA packed-cache constants (64-dim RoPE tail, 64-wide UE8M0 blocks).
@@ -1759,6 +1762,16 @@ class PallasMLAttentionBackend(AttentionBackend):
         )
 
     @staticmethod
+    def _sparse_mla_turboquant_preset(
+        cache_dtype_str: str | torch.dtype,
+    ) -> str | None:
+        from vllm_torchtpu.layers.adapter.turboquant_attention import (
+            active_mla_turboquant_preset,
+        )
+
+        return active_mla_turboquant_preset(cache_dtype_str)
+
+    @staticmethod
     def get_sparse_kv_cache_specs(
         num_blocks: int,
         block_size: int,
@@ -1768,13 +1781,17 @@ class PallasMLAttentionBackend(AttentionBackend):
         """The (nope, rope) specs for one sparse-MLA layer."""
         rope_dim = PallasMLAttentionBackend._DS_MLA_ROPE_HEAD_DIM
         kv_packing = get_dtype_packing(_resolve_kv_cache_dtype(cache_dtype_str))
+        nope_bytes = head_size - rope_dim
+        if PallasMLAttentionBackend._sparse_mla_turboquant_preset(cache_dtype_str):
+            # 4-bit codes; the norm rides in the RoPE row's zero padding.
+            nope_bytes = turboquant.MLA_TQ_NOPE_BYTES
         return (
             SparseMLAKVCacheSpec.create(
                 KVCacheType.NOPE,
                 KVCacheLayout(envs.TPU_SPARSE_MLA_NOPE_LAYOUT),
                 num_blocks,
                 block_size,
-                head_size - rope_dim,
+                nope_bytes,
                 kv_packing,
             ),
             SparseMLAKVCacheSpec.create(
@@ -1794,6 +1811,15 @@ class PallasMLAttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str | torch.dtype = "auto",
     ) -> int:
+        if PallasMLAttentionBackend._sparse_mla_turboquant_preset(cache_dtype_str):
+            # Exactly the split (nope, rope) allocation of
+            # `get_sparse_kv_cache_specs`: 256 B codes + 128 B RoPE row/token.
+            specs = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+                1, block_size, head_size, cache_dtype_str
+            )
+            return sum(
+                math.prod(spec.shape) * spec.torch_dtype.itemsize for spec in specs
+            )
         dtype = _resolve_kv_cache_dtype(cache_dtype_str)
         shape = PallasMLAttentionBackend.get_kv_cache_shape(
             1,
@@ -2008,6 +2034,12 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 )
             self._dcp_mesh = get_or_create_dcp_mesh()
 
+    @staticmethod
+    def _is_turboquant(layer: Any) -> bool:
+        return turboquant.is_turboquant_kv_cache_dtype(
+            getattr(layer, "kv_cache_dtype", None)
+        )
+
     def _get_kv_scales(
         self, layer: Any
     ) -> tuple[float | None, float | None, float | None]:
@@ -2141,6 +2173,13 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         k_scale = None
         if layer.kv_cache_quantized_dtype is not None:
             _, k_scale, _ = self._get_kv_scales(layer)
+        tq_tables = None
+        if self._is_turboquant(layer):
+            from vllm_torchtpu.layers.adapter.turboquant_attention import (
+                get_mla_latent_tables,
+            )
+
+            tq_tables = get_mla_latent_tables()
 
         def sparse_mla_attention_core_tpu(
             kv_cache_nope: jax.Array,
@@ -2176,6 +2215,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 sm_scale=layer.scale,
                 k_scale=k_scale,
                 allow_masked_dense=allow_masked_dense,
+                tq_tables=tq_tables,
             )
 
         op_name = f"pallas::sparse_mla_attention_{layer.layer_name.replace('.', '_')}"
@@ -2428,7 +2468,14 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         q_scale, k_scale, v_scale = self._get_kv_scales(layer)
 
-        if layer.kv_cache_quantized_dtype is not None:
+        if self._is_turboquant(layer):
+            # The latent is quantized to 4-bit codes inside the sparse op;
+            # only the RoPE key keeps the fp8 cache format.
+            assert k_scale is not None
+            k_pe, _ = quantize_kv(
+                torch.float8_e4m3fn, k_pe, value=None, k_scale=k_scale
+            )
+        elif layer.kv_cache_quantized_dtype is not None:
             assert k_scale is not None
             kv_c_normed, _ = quantize_kv(
                 layer.kv_cache_quantized_dtype, kv_c_normed, value=None, k_scale=k_scale

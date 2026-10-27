@@ -169,7 +169,17 @@ class SparseMLAKVCacheSpec:
                     self.head_dim // TILE_LANE_BYTES,
                     TILE_LANE_BYTES,
                 )
-            return (self.num_pages, self.page_size, self.head_dim // WORD_BYTES)
+            words = self.head_dim // WORD_BYTES
+            if words < TILE_LANE_BYTES:
+                # Narrow tokens (TurboQuant's 256 B NoPE codes) share a 128-word
+                # row so HBM is not lane-padded; readers view it as `(-1, words)`.
+                assert TILE_LANE_BYTES % words == 0, words
+                return (
+                    self.num_pages,
+                    self.page_size * words // TILE_LANE_BYTES,
+                    TILE_LANE_BYTES,
+                )
+            return (self.num_pages, self.page_size, words)
         if self.cache_type is KVCacheType.ROPE:
             if self.layout is KVCacheLayout.TENSORCORE:
                 return (
@@ -308,8 +318,13 @@ def _check_inputs(
     rope_spec: SparseMLAKVCacheSpec,
 ) -> None:
     """Assert the caches were allocated from the specs they are written with."""
-    assert kv_c_normed.dtype == jnp.float8_e4m3fn, (
-        f"sparse MLA kernel requires --kv-cache-dtype fp8 (got {kv_c_normed.dtype})"
+    # fp8 latents, or TurboQuant's pre-packed uint8 codes (narrow NoPE token).
+    assert kv_c_normed.dtype == jnp.float8_e4m3fn or (
+        kv_c_normed.dtype == jnp.uint8
+        and kv_c_normed.shape[-1] == nope_spec.token_bytes < 512
+    ), (
+        "sparse MLA kernel requires --kv-cache-dtype fp8 or turboquant "
+        f"(got {kv_c_normed.dtype}{list(kv_c_normed.shape)})"
     )
     assert kv_cache_nope.dtype == nope_spec.jax_dtype, (
         f"nope cache {kv_cache_nope.dtype} does not match its spec "

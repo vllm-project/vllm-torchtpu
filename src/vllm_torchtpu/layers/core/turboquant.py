@@ -814,3 +814,92 @@ def tq_ragged_paged_attention(
         skip_kv_update=skip_kv_update,
     )
     return kv_cache, outputs
+
+
+# ======================================================================================
+# Sparse (DSA) absorbed-MLA latent cache
+# ======================================================================================
+#
+# In absorbed MLA the 512-dim compressed latent `kv_c_normed` is BOTH the key
+# (`q_nope . c`) and the value (`P @ c`), so a single 4-bit MSE code covers K and
+# V. Rotating the latent by an orthonormal symmetric `H` keeps the scores
+# (`(q H) . (c H) == q . c`) and rotates the value aggregate (`P (c H) ==
+# (P c) H`), so callers pre-rotate `q_nope` and post-rotate the attention output
+# once by `H` (`H^T == H`). One norm-corrected `bf16` L2 norm per token rides in
+# the otherwise zero-padded tail of the RoPE row (`MLA_TQ_NORM_BYTE_OFFSET`).
+
+MLA_TQ_LATENT_DIM = 512
+MLA_TQ_BITS = 4
+MLA_TQ_NOPE_BYTES = MLA_TQ_LATENT_DIM * MLA_TQ_BITS // 8  # 256 B/token.
+MLA_TQ_NORM_BYTE_OFFSET = 64  # After the 64 fp8 `k_pe` bytes in the RoPE row.
+
+
+def make_mla_latent_tables(centroids: np.ndarray) -> TQTables:
+    """Tables for the 512-dim MLA latent (`centroids` are D=512 Lloyd-Max)."""
+    sorted_c = np.sort(np.asarray(centroids, dtype=np.float32))
+    assert sorted_c.shape == (1 << MLA_TQ_BITS,), sorted_c.shape
+    return TQTables(
+        hadamard=hadamard_matrix(MLA_TQ_LATENT_DIM),
+        centroids=sorted_c,
+        midpoints=((sorted_c[:-1] + sorted_c[1:]) / 2).astype(np.float32),
+    )
+
+
+def quantize_mla_latent(
+    latent: jax.Array,  # [T, 512]
+    tables: TQTables,
+) -> tuple[jax.Array, jax.Array]:
+    """`latent` -> (`u8[T, 256]` packed 4-bit codes, `u8[T, 2]` bf16 norm bytes).
+
+    Byte `i` holds code `i` in its low nibble and code `256 + i` in its high
+    nibble (sign-magnitude: bit 3 is the sign, bits 0-2 the magnitude index).
+    """
+    x = latent.astype(jnp.float32)
+    norm = jnp.sqrt(jnp.sum(x * x, axis=-1, keepdims=True))
+    rot = rotate(x / (norm + _KEY_NORM_EPS), jnp.asarray(tables.hadamard))
+    half_levels = 1 << (MLA_TQ_BITS - 1)
+    pos_mids = jnp.asarray(tables.midpoints[half_levels:], dtype=jnp.float32)
+    mag_idx = jnp.sum(jnp.abs(rot)[..., None] >= pos_mids, axis=-1).astype(jnp.uint8)
+    pos_c_sq = jnp.asarray(tables.centroids[half_levels:] ** 2, dtype=jnp.float32)
+    c_sq = jnp.sum(pos_c_sq[mag_idx], axis=-1, keepdims=True)
+    norm = norm * jax.lax.rsqrt(c_sq + _CENTROID_NORM_EPS)
+    codes = mag_idx | jnp.where(rot < 0.0, jnp.uint8(half_levels), jnp.uint8(0))
+    half = MLA_TQ_LATENT_DIM // 2
+    packed = codes[:, :half] | (codes[:, half:] << jnp.uint8(4))
+    kn_lo, kn_hi = _f32_to_bf16_bytes(norm)
+    return packed, jnp.concatenate([kn_lo, kn_hi], axis=-1)
+
+
+def dequant_mla_latent_vreg(
+    packed: jax.Array,  # u8[N, 256]
+    norm_lo: jax.Array,  # u8[N, 1]
+    norm_hi: jax.Array,  # u8[N, 1]
+    centroids: np.ndarray,
+    out_dtype: jnp.dtype,
+) -> jax.Array:
+    """In-kernel inverse of `quantize_mla_latent`, in the rotated basis: `[N, 512]`."""
+    lo = (packed & jnp.uint8(0xF)).astype(jnp.uint32)
+    hi = (packed >> jnp.uint8(4)).astype(jnp.uint32)
+    vals = jnp.concatenate(
+        [
+            _lookup_centroids_vreg(lo, MLA_TQ_BITS, centroids),
+            _lookup_centroids_vreg(hi, MLA_TQ_BITS, centroids),
+        ],
+        axis=-1,
+    )
+    norm = _bf16_u16_to_f32_vreg(norm_lo.astype(jnp.uint32), norm_hi.astype(jnp.uint32))
+    return (vals * norm).astype(out_dtype)
+
+
+def dequant_mla_latent_ref(
+    packed: jax.Array, norm_bytes: jax.Array, tables: TQTables
+) -> jax.Array:
+    """Pure-jnp reference: original-basis `f32[T, 512]` reconstruction."""
+    vals = dequant_mla_latent_vreg(
+        packed,
+        norm_bytes[:, :1],
+        norm_bytes[:, 1:2],
+        tables.centroids,
+        jnp.float32,
+    )
+    return rotate(vals, jnp.asarray(tables.hadamard))

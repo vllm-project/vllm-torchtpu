@@ -289,6 +289,64 @@ class PallasTurboQuantAttentionBackendImpl(PallasAttentionBackendImpl):
         self._kernel_op_prefix = f"pallas::tq_rpa_kernel_{preset}"  # type: ignore[misc]
 
 
+# ======================================================================================
+# Sparse (DSA) MLA: the 512-dim latent is stored as 4-bit codes by the regular
+# `PallasMLAttentionBackend`; see `turboquant.quantize_mla_latent`.
+# ======================================================================================
+
+MLA_TURBOQUANT_PRESETS = ("turboquant_4bit_nc",)
+
+
+def active_mla_turboquant_preset(
+    cache_dtype: str | torch.dtype | None = None,
+) -> str | None:
+    """The TurboQuant preset an MLA cache of `cache_dtype` uses, else None.
+
+    MLA backends see the storage dtype (uint8, shared with `fp8_ds_mla`), so a
+    non-string dtype is resolved from the current config like `_resolve_preset`.
+    """
+    if isinstance(cache_dtype, str) and not is_turboquant_kv_cache_dtype(cache_dtype):
+        return None
+    if isinstance(cache_dtype, torch.dtype) and cache_dtype != torch.uint8:
+        return None
+    return _resolve_preset(cache_dtype if isinstance(cache_dtype, str) else None)
+
+
+@functools.cache
+def get_mla_latent_tables() -> tq.TQTables:
+    from vllm.model_executor.layers.quantization.turboquant.centroids import (
+        get_centroids,
+    )
+
+    with torch.device("cpu"):
+        centroids = get_centroids(tq.MLA_TQ_LATENT_DIM, tq.MLA_TQ_BITS)
+    return tq.make_mla_latent_tables(centroids.cpu().numpy().astype(np.float32))
+
+
+def _check_turboquant_sparse_mla(preset: str, model_config) -> None:
+    from vllm_torchtpu import envs
+
+    if preset not in MLA_TURBOQUANT_PRESETS:
+        raise NotImplementedError(
+            f"TurboQuant on MLA models supports {MLA_TURBOQUANT_PRESETS}; got {preset}."
+        )
+    hf_config = model_config.hf_text_config
+    if getattr(hf_config, "index_topk", None) is None:
+        raise NotImplementedError(
+            "TurboQuant on MLA models needs sparse (DSA) attention."
+        )
+    if getattr(hf_config, "kv_lora_rank", None) != tq.MLA_TQ_LATENT_DIM:
+        raise NotImplementedError(
+            f"TurboQuant sparse MLA needs kv_lora_rank={tq.MLA_TQ_LATENT_DIM}."
+        )
+    layouts = (envs.TPU_SPARSE_MLA_NOPE_LAYOUT, envs.TPU_SPARSE_MLA_ROPE_LAYOUT)
+    if layouts != ("sparsecore", "sparsecore"):
+        raise NotImplementedError(
+            "TurboQuant sparse MLA needs TPU_SPARSE_MLA_{NOPE,ROPE}_LAYOUT="
+            f"sparsecore; got {layouts}."
+        )
+
+
 def check_turboquant_config(vllm_config: VllmConfig) -> None:
     """Platform-level validation, called from `TpuPlatform.check_and_update_config`."""
     cache_config = vllm_config.cache_config
@@ -296,11 +354,9 @@ def check_turboquant_config(vllm_config: VllmConfig) -> None:
     set_active_turboquant_preset(preset)
 
     model_config = vllm_config.model_config
-    if model_config is not None:
-        if model_config.use_mla:
-            raise NotImplementedError(
-                "TurboQuant KV cache does not support MLA models."
-            )
+    if model_config is not None and model_config.use_mla:
+        _check_turboquant_sparse_mla(preset, model_config)
+    elif model_config is not None:
         validate_turboquant_head_dim(model_config.get_head_size())
         if not cache_config.user_specified_block_size:
             cache_config.block_size = (  # type: ignore[assignment]

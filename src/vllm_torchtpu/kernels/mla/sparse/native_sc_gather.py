@@ -68,7 +68,12 @@ def _kernel(
     serve_pipelined: bool,
     live_hbm_ref: Any = None,
     guard_tail: bool = False,
+    nope_words: int = 128,
 ):
+    # `nope_words == 64` (TurboQuant's 256 B NoPE codes): pairs of tokens are
+    # delta-swapped into one 128-word output row so the TensorCore `bitcast`
+    # to uint8 yields one contiguous 256 B row per token (see `body`).
+    narrow_nope = nope_words != 128
     owner = lax.axis_index((core_axis_name, subcore_axis_name))
     live_batches = None
     if live_hbm_ref is not None:
@@ -102,10 +107,22 @@ def _kernel(
             atom = pl.program_id(0)
             nope_inputs = refs[:ROPE_PACKING]
             rope_inputs = refs[ROPE_PACKING : 2 * ROPE_PACKING]
-            rope_output = refs[-1]
+            rope_output = refs[2 * ROPE_PACKING]
 
             nope_copies = []
-            for stream in range(ROPE_PACKING):
+            if narrow_nope:
+                nope_output = refs[2 * ROPE_PACKING + 1]
+                low_16 = jnp.uint32(0x0000FFFF)
+                half = nope_words
+                for stream in range(ROPE_PACKING):
+                    for pair in range(NUM_LANES // 2):
+                        x = nope_inputs[stream][pl.ds(2 * pair, 1), pl.ds(0, half)]
+                        y = nope_inputs[stream][pl.ds(2 * pair + 1, 1), pl.ds(0, half)]
+                        x, y = _delta_swap(x, y, 16, low_16)
+                        row = stream * (NUM_LANES // 2) + pair
+                        nope_output[pl.ds(row, 1), pl.ds(0, half)] = x
+                        nope_output[pl.ds(row, 1), pl.ds(half, half)] = y
+            for stream in range(ROPE_PACKING if not narrow_nope else 0):
                 copy = pltpu.make_async_copy(
                     nope_inputs[stream],
                     nope_out_hbm_ref.at[destinations(atom, stream), :],
@@ -142,7 +159,7 @@ def _kernel(
 
         nope_specs = tuple(
             pl.BlockSpec(
-                (pl.Indirect(NUM_LANES), 128),
+                (pl.Indirect(NUM_LANES), nope_words),
                 lambda atom, stream=stream: (values(atom, stream), 0),
             )
             for stream in range(ROPE_PACKING)
@@ -158,18 +175,29 @@ def _kernel(
             (QUADS_PER_ATOM, 128),
             lambda atom: (logical_batch * atoms_per_batch + atom, 0),
         )
+        out_specs = (rope_out_spec,)
+        outs = (rope_out_hbm_ref,)
+        if narrow_nope:
+            # One 128-word row per token pair: OCCURRENCES_PER_ATOM // 2 rows.
+            out_specs += (
+                pl.BlockSpec(
+                    (OCCURRENCES_PER_ATOM // 2, 128),
+                    lambda atom: (logical_batch * atoms_per_batch + atom, 0),
+                ),
+            )
+            outs += (nope_out_hbm_ref,)
 
         def run_inner():
             pltpu.emit_pipeline(
                 body,
                 grid=(atoms_per_batch,),
                 in_specs=nope_specs + rope_specs,
-                out_specs=(rope_out_spec,),
+                out_specs=out_specs,
                 no_pipelining=not serve_pipelined,
             )(
                 *([nope_hbm_ref] * ROPE_PACKING),
                 *([rope_hbm_ref] * ROPE_PACKING),
-                rope_out_hbm_ref,
+                *outs,
             )
 
         if live_batches is not None and guard_tail:
@@ -217,6 +245,7 @@ def _kernel(
         "wait_mode",
         "serve_pipelined",
         "live_multiple",
+        "nope_words",
     ),
 )
 def dsa_gather_native_sc(
@@ -230,6 +259,7 @@ def dsa_gather_native_sc(
     serve_pipelined: bool = True,
     num_live_indices: jax.Array | None = None,
     live_multiple: int = 1,
+    nope_words: int = 128,
 ) -> tuple[jax.Array, jax.Array]:
     """Gather explicit native-SC ``uint32`` NOPE and ROPE cache rows.
 
@@ -243,7 +273,14 @@ def dsa_gather_native_sc(
     unwritten. ``live_multiple`` is a static promise that ``num_live_indices``
     is a multiple of it; when that multiple covers whole owner rounds the
     per-owner tail guard is dropped.
+
+    ``nope_words`` is the NoPE token width in words: 128 (fp8 latent), or 64
+    (TurboQuant codes, two tokens per cache row). At 64 the NoPE output is
+    ``uint32[out_size // 2, 128]``: row ``r`` holds tokens ``2r`` and ``2r+1``
+    delta-swapped so that its uint8 bitcast is their two 256 B rows in order.
     """
+    if nope_words not in (64, 128):
+        raise ValueError(f"nope_words must be 64 or 128, got {nope_words}")
     if wait_mode not in ("overlap_rope", "before_rope"):
         raise ValueError(f"unknown {wait_mode=}")
     if nope_cache.dtype != jnp.uint32 or nope_cache.shape[-1] != 128:
@@ -282,7 +319,7 @@ def dsa_gather_native_sc(
     live = num_live_indices is not None
     scratch_types = {"sem_ref": pltpu.SemaphoreType.DMA((ROPE_PACKING,))}
     operands = [
-        nope_cache.reshape(-1, 128),
+        nope_cache.reshape(-1, nope_words),
         rope_cache.reshape(-1, 32),
         indices.reshape(num_batches, atoms_per_batch, ROPE_PACKING, NUM_LANES),
     ]
@@ -328,6 +365,7 @@ def dsa_gather_native_sc(
         wait_mode=wait_mode,
         serve_pipelined=serve_pipelined,
         guard_tail=guard_tail,
+        nope_words=nope_words,
     )
     if live:
         inner = body
@@ -338,7 +376,7 @@ def dsa_gather_native_sc(
     return core_map_helper.kernel(
         body,
         out_type=(
-            jax.ShapeDtypeStruct((out_size, 128), jnp.uint32),
+            jax.ShapeDtypeStruct((out_size * nope_words // 128, 128), jnp.uint32),
             jax.ShapeDtypeStruct((out_size // ROPE_PACKING, 128), jnp.uint32),
         ),
         compiler_params=pltpu.CompilerParams(
@@ -350,6 +388,7 @@ def dsa_gather_native_sc(
         mesh=mesh,
         name=(
             f"sc_native_sc_gather_a{atoms_per_batch}_{wait_mode}_"
+            f"{'' if nope_words == 128 else f'nw{nope_words}_'}"
             f"{'pipe' if serve_pipelined else 'nopipe'}{'_live' if live else ''}"
         ),
     )(*operands)
