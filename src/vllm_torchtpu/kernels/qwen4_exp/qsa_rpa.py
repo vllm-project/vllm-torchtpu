@@ -198,6 +198,12 @@ def rpa_attention(
     fast_fetch=False,
 ):
     batch_size = rpa_query_batch_size(blocks.shape[1] + 1)
+    if compact and envs.VLLM_TPU_QSA_DECODE_RPA_MAX_QUERIES:
+        # The compact schedule holds one entry per lane-tile instead of one
+        # per 4-token page, leaving SMEM for a larger scalar-prefetched page
+        # table: a full MTP verify step (24 requests x 4 rows) runs as one
+        # RPA call per layer instead of two 64-row chunks.
+        batch_size = envs.VLLM_TPU_QSA_DECODE_RPA_MAX_QUERIES
     attend = functools.partial(
         _rpa_attention_batch,
         kv_heads=kv_heads,
