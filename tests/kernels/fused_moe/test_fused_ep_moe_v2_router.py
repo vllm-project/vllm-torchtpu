@@ -256,7 +256,9 @@ def test_rejects_nondivisible_requested_row_tile():
         )
 
 
-@pytest.mark.parametrize("case", ["biased", "ties", "nonfinite", "tiny"])
+@pytest.mark.parametrize(
+    "case", ["biased", "ties", "nonfinite", "tiny", "every_expert"]
+)
 @pytest.mark.cpu_test
 def test_packed_top6_normalizes_unbiased_weights(case):
     """Packing must preserve expert order and normalize the unbiased table."""
@@ -277,6 +279,11 @@ def test_packed_top6_normalizes_unbiased_weights(case):
     elif case == "tiny":
         raw *= np.float32(1e-22)
     scores = raw + bias
+    if case == "every_expert":
+        # Exercise every expert ID, including adjacent IDs above 256.
+        expected_ids = (np.arange(288)[:, None] * 6 + np.arange(6)) % 384
+        scores[:] = -1
+        np.put_along_axis(scores, expected_ids, np.arange(6, 0, -1)[None, :], axis=1)
     original_w, original_i = _select(scores, raw, topk=6, block_rows=32, interpret=True)
     with np.errstate(invalid="ignore"):
         expected = original_w / np.maximum(
@@ -297,6 +304,8 @@ def test_packed_top6_normalizes_unbiased_weights(case):
         assert not np.array_equal(indices, unbiased_ids)
     elif case == "ties":
         np.testing.assert_array_equal(indices[0], [0, 127, 128, 255, 256, 383])
+    elif case == "every_expert":
+        np.testing.assert_array_equal(indices, expected_ids)
 
 
 @pytest.mark.parametrize(
