@@ -23,6 +23,59 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2 import engram as v2_engram
 pytestmark = pytest.mark.usefixtures("cpu_engram_transfer")
 
 
+@pytest.mark.parametrize("tokens", [1, 17, 288, 2048])
+@pytest.mark.parametrize("heads", [3, 24])
+def test_ready_rows_packed_scales_match_tpu_and_cpu(tokens, heads):
+    """Exercise aligned/unaligned scale tails through the production adapter."""
+    import jax
+
+    if jax.default_backend() != "tpu":
+        pytest.skip("Packed scale layout boundary requires TPU hardware")
+    generator = torch.Generator().manual_seed(2703)
+    raw = torch.randint(
+        0, 256, (tokens, heads, 256), generator=generator, dtype=torch.uint8
+    )
+    raw[(raw & 127) == 127] = 0
+    scale = torch.randint(
+        120, 132, (tokens, heads, 8), generator=generator, dtype=torch.uint8
+    )
+    scale[10::11] = 255
+    packed = torch.cat((raw.flatten(), scale.flatten())).view(torch.int32)
+    packed = packed.reshape(tokens, -1).to("tpu")
+    holder = SimpleNamespace(
+        _staged_raw=packed,
+        _active_raw=packed,
+        _host_raw=raw,
+        _host_scale=scale,
+        embed_tokens=SimpleNamespace(block_size=32),
+    )
+
+    def candidate(data):
+        holder._active_raw = data
+        return common_engram.Engram._ready_rows(holder, tokens)
+
+    def baseline(data):
+        words = data.view(heads * (256 + 8) // 4, tokens)
+        raw_bytes = common_engram._unpack_bytes(
+            words[: heads * 256 // 4].flatten(), raw.numel()
+        )
+        scale_bytes = common_engram._unpack_bytes(
+            words[heads * 256 // 4 :].flatten(), scale.numel()
+        )
+        return common_engram.dequant_fp8_rows(
+            raw_bytes.reshape(raw.shape), scale_bytes.reshape(scale.shape), 32
+        )
+
+    original = torch.compile(baseline, backend="tpu", fullgraph=True, dynamic=False)
+    optimized = torch.compile(candidate, backend="tpu", fullgraph=True, dynamic=False)
+    got, want = optimized(packed).cpu(), original(packed).cpu()
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
+    torch.testing.assert_close(torch.signbit(got), torch.signbit(want))
+    reference = common_engram.dequant_fp8_rows(raw, scale, 32)
+    torch.testing.assert_close(got, reference, rtol=0, atol=0)
+    torch._dynamo.reset()
+
+
 @pytest.fixture(autouse=True)
 def setup_torch_accelerator(monkeypatch: pytest.MonkeyPatch):
     """Enable CPU execution for upstream Engram constructor checks."""

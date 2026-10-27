@@ -17,6 +17,23 @@
 # not run here.
 
 steps:
+  - label: "DeepSeek-V4.1 layout: aux mean and packed scale parity"
+    key: "dsv41_layout_parity"
+    depends_on: "build_docker"
+    timeout_in_minutes: 30
+    agents:
+      queue: "tpu_v7x_2_queue"
+    commands:
+      - >-
+        bash .buildkite/scripts/run_in_docker.sh
+        python -m pytest
+        tests/models/vllm/test_dsv41_common_mhc.py
+        tests/models/vllm/test_dsv41_common_v1_v2_engram.py
+        -k 'test_aux_mean_preserves_tpu_reduction_order or test_ready_rows_packed_scales_match_tpu_and_cpu'
+        -q --junitxml=/perf_eval_results/dsv41-layout-parity.xml
+    artifact_paths:
+      - "perf_eval_results/**/*"
+
   - label: "DeepSeek-V4.1 greedy head: CPU reference and rejection parity"
     key: "dsv41_greedy_head"
     depends_on: "build_docker"

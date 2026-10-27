@@ -17,6 +17,7 @@ from vllm.config import get_current_vllm_config_or_none
 from vllm.models.deepseek_v41.common import engram as upstream
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.adapter.custom_ops.packed_suffix_op import packed_suffix
 from vllm_torchtpu.layers.adapter.upstream_bindings import (
     bind_device_ops,
     device_hooks,
@@ -803,11 +804,10 @@ class Engram(upstream.Engram):
         scale_words_per_tok = -(-(cols * blocks) // 4)
         raw_bytes = num_tokens * cols * head_dim
         scale_bytes = num_tokens * cols * blocks
-        by_word = self._active_raw.view(
-            raw_words_per_tok + scale_words_per_tok, num_tokens
-        )
-        raw = _unpack_bytes(by_word[:raw_words_per_tok].view(-1), raw_bytes)
-        scale = _unpack_bytes(by_word[raw_words_per_tok:].view(-1), scale_bytes)
+        words = self._active_raw.flatten()
+        raw = _unpack_bytes(words[: num_tokens * raw_words_per_tok], raw_bytes)
+        scale_words = packed_suffix(words, num_tokens * scale_words_per_tok)
+        scale = _unpack_bytes(scale_words.flatten(), scale_bytes)
         return dequant_fp8_rows(
             raw.reshape(num_tokens, cols, head_dim),
             scale.reshape(num_tokens, cols, blocks),

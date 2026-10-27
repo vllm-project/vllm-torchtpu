@@ -322,6 +322,8 @@ def staging(transport, monkeypatch):
         get_current_vllm_config_or_none=lambda: None,
         logger=logging.getLogger(__name__),
     )
+    adapter = ROOT / "src/vllm_torchtpu/layers/adapter/custom_ops/packed_suffix_op.py"
+    load_nodes(adapter, {"packed_suffix"}, namespace)
     code = ast.fix_missing_locations(ast.Module(body=helpers + [cls], type_ignores=[]))
     exec(compile(code, str(path), "exec"), namespace)
     weight = torch.arange(64 * 32).remainder(120).to(torch.uint8).view(64, 32)
