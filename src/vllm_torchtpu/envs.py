@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     TPU_ATTN_MOE_OVERLAP: bool = False
     TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER: bool = False
+    TPU_ATTN_MOE_OVERLAP_MIN_TOKENS: int = 0
     TPU_K3_SP_PREFILL: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
@@ -413,6 +414,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER": env_bool(
         "TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER", default=False
     ),
+    "TPU_ATTN_MOE_OVERLAP_MIN_TOKENS": env_int("TPU_ATTN_MOE_OVERLAP_MIN_TOKENS", 0),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # DCP sparse MLA (SparseCore cache layout): gather and attend this many

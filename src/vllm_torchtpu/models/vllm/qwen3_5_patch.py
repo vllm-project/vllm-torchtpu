@@ -54,6 +54,9 @@ _FP8_SUBCHANNEL_SIZE = 512
 
 
 def _overlap_min_tokens(hidden_size: int, tp_size: int, element_size: int) -> int:
+    configured = envs.TPU_ATTN_MOE_OVERLAP_MIN_TOKENS
+    if configured > 0:
+        return configured
     return (_MIN_PER_CHIP_SIZE_MB * 1024 * 1024 * tp_size) // (
         hidden_size * element_size
     )

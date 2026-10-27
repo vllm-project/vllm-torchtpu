@@ -775,3 +775,76 @@ def test_non_overlap_branch_ignores_fp8_flag(
     assert [op for op, _, _ in wire_fp8] == ["all_reduce", "all_reduce"]
     assert wire_fp8 == wire_bf16
     assert torch.equal(out_fp8, out_bf16)
+
+
+def test_overlap_min_tokens_env_and_two_trace_handover(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TPU_ATTN_MOE_OVERLAP_MIN_TOKENS overrides 8 MiB floor across 2 traces."""
+    import sympy
+    from torch import fx
+    from torch._dynamo.source import ConstantSource
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+    from torch.utils._sympy.value_ranges import ValueRanges
+
+    monkeypatch.setattr(envs, "TPU_ATTN_MOE_OVERLAP_MIN_TOKENS", 1024)
+    assert qwen3_5_patch._overlap_min_tokens(4096, 8, 2) == 1024
+    monkeypatch.setattr(envs, "TPU_ATTN_MOE_OVERLAP_MIN_TOKENS", 0)
+    assert qwen3_5_patch._overlap_min_tokens(4096, 8, 2) == 8192
+
+    monkeypatch.setattr(envs, "TPU_ATTN_MOE_OVERLAP_MIN_TOKENS", 1024)
+    compile_sizes = [4, 16, 64, 1024, 8192]
+
+    def _build_trace_graph(is_overlap_trace: bool) -> fx.GraphModule:
+        shape_env = ShapeEnv()
+        s0 = shape_env.create_symbol(
+            16 if not is_overlap_trace else 1024, source=ConstantSource("s0")
+        )
+        threshold = qwen3_5_patch._overlap_min_tokens(4096, 8, 2)
+        cond = (
+            sympy.Lt(s0, threshold) if not is_overlap_trace else sympy.Ge(s0, threshold)
+        )
+        shape_env.guards.append(SimpleNamespace(expr=cond, stack=None, user_stack=None))
+        shape_env.var_to_range[s0] = ValueRanges(2, 16384)
+        g = fx.Graph()
+        p_x = g.placeholder("x")
+        p_pos = g.placeholder("positions")
+        hint = 16 if not is_overlap_trace else 1024
+        sym_int = shape_env.create_symintnode(s0, hint=hint)
+        fake_mode = SimpleNamespace(shape_env=shape_env)
+        p_x.meta["val"] = SimpleNamespace(shape=(sym_int, 4096), fake_mode=fake_mode)
+        p_pos.meta["val"] = SimpleNamespace(shape=(sym_int,), fake_mode=fake_mode)
+        out = g.call_function(torch.ops.aten.add.Tensor, (p_x, p_x))
+        g.output(out)
+        gm = fx.GraphModule(torch.nn.Module(), g)
+        return gm
+
+    g_small = _build_trace_graph(is_overlap_trace=False)
+    g_large = _build_trace_graph(is_overlap_trace=True)
+    assert shape_variants.graph_signature(g_small) == shape_variants.graph_signature(
+        g_large
+    )
+    env0 = shape_variants.trace_shape_env(g_small)
+    env1 = shape_variants.trace_shape_env(g_large)
+
+    with shape_variants.warmup() as buckets:
+        for s in compile_sizes:
+            reason = shape_variants.unsupported_reason(env0, s)
+            if reason is None:
+                buckets.put(None, f"key_{s}", g_small, f"exec_ar_{s}")
+            else:
+                buckets.refused.add(s)
+        assert buckets.needs_retrace(1024)
+        assert buckets.needs_retrace(8192)
+
+        buckets.traces = 1
+        for s in compile_sizes:
+            handed = buckets.get(None, f"key_{s}", g_large)
+            if handed is not None:
+                assert handed == f"exec_ar_{s}"
+                continue
+            reason = shape_variants.unsupported_reason(env1, s)
+            assert reason is None
+            buckets.put(None, f"key_{s}", g_large, f"exec_sp_{s}")
+            buckets.refused.discard(s)
+        assert len(buckets.refused) == 0
