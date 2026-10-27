@@ -14,6 +14,7 @@ SKIP_DB_UPLOAD_FLAG=0
 SKIP_PERF_CHECK=0
 SKIP_BENCHMARK=0
 BASELINE_CONFIG=""
+LM_EVAL_LIMIT="100"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -29,6 +30,11 @@ while [[ $# -gt 0 ]]; do
         --run-lm-eval)
             RUN_LM_EVAL=1
             shift
+            ;;
+        --lm-eval-limit)
+            # "none" evaluates the complete split; a number limits smoke runs.
+            LM_EVAL_LIMIT="$2"
+            shift 2
             ;;
         --run-code-eval)
             RUN_CODE_EVAL=1
@@ -73,7 +79,7 @@ while [[ $# -gt 0 ]]; do
 
         *)
             echo "Unknown argument: $1"
-            echo "Usage: $0 --config CONFIG_NAME [--results-dir DIR] [--run-lm-eval] [--run-code-eval] [--run-mm-eval] [--host HOST] [--port PORT] [--skip-db-upload] [--skip-perf-check] [--skip-benchmark] [--baseline-config CONFIG_NAME]"
+            echo "Usage: $0 --config CONFIG_NAME [--results-dir DIR] [--run-lm-eval] [--lm-eval-limit N|none] [--run-code-eval] [--run-mm-eval] [--host HOST] [--port PORT] [--skip-db-upload] [--skip-perf-check] [--skip-benchmark] [--baseline-config CONFIG_NAME]"
             # shellcheck disable=SC2016
             echo '  --results-dir defaults to $ARTIFACTS_DIR/$CONFIG_NAME when ARTIFACTS_DIR is set, else /tmp/perf_eval_$CONFIG_NAME'
             exit 1
@@ -171,8 +177,10 @@ run_lm_eval() {
             )
             ;;
         *)
+            if [ "$LM_EVAL_LIMIT" != "none" ]; then
+                lm_eval_args+=(--limit "$LM_EVAL_LIMIT")
+            fi
             lm_eval_args+=(
-                --limit 100
                 --model local-chat-completions
                 --model_args "$model_args"
                 --apply_chat_template
