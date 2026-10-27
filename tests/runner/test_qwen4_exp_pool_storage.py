@@ -16,16 +16,31 @@
 import math
 from types import SimpleNamespace as NS
 
+import jax
+import jax.numpy as jnp
 import pytest
 import torch
+from jax.experimental import pallas as pl
 
 from tests.models.vllm.qwen4_exp_test_utils import q4exp_text_config
 from tests.runner.test_qwen4_exp_pool import pool_config
+from vllm_torchtpu.kernels.typed_ldst import load_typed
 from vllm_torchtpu.models.vllm.qwen4_exp.pooled_cache import Qwen4ExpPooledCache
 
 
-def test_actual_pool_backing_does_not_allocate_main_sized_compressed_pages(monkeypatch):
-    cfg = pool_config(kv="bfloat16")
+@pytest.mark.parametrize(
+    "kv,dtype,packing",
+    [
+        ("auto", torch.bfloat16, 2),
+        ("bfloat16", torch.bfloat16, 2),
+        ("fp8", torch.float8_e4m3fn, 4),
+        ("fp8_e4m3", torch.float8_e4m3fn, 4),
+    ],
+)
+def test_actual_pool_backing_does_not_allocate_main_sized_compressed_pages(
+    monkeypatch, kv, dtype, packing
+):
+    cfg = pool_config(kv=kv, ssm="float32")
     cfg.model_config.hf_text_config = q4exp_text_config(
         hidden_size=128,
         num_attention_heads=4,
@@ -47,7 +62,7 @@ def test_actual_pool_backing_does_not_allocate_main_sized_compressed_pages(monke
     runner = NS(
         vllm_config=cfg,
         cache_config=cfg.cache_config,
-        kv_cache_dtype="bfloat16",
+        kv_cache_dtype=kv,
         device=torch.device("cpu"),
     )
     bound = []
@@ -70,12 +85,14 @@ def test_actual_pool_backing_does_not_allocate_main_sized_compressed_pages(monke
     cfg.cache_config.num_gpu_blocks_override = cache.pages
     cache.allocate()
     assert bound
-    # Two requests: four full-attention blocks, four recurrent checkpoints,
-    # one non-cacheable ring each, plus the native null block. The compressed
-    # index belongs to those same attention blocks, not four more blocks.
-    expected_blocks = 1 + 2 * (math.ceil(512 / 128) * 2 + 1)
-    main_per_block = 128 * 2 * 2 * 256 * 2
-    index_per_block = max(8192, (128 // 4) * 128 * 2)
+    # Each request owns attention blocks, recurrent checkpoints and one ring,
+    # plus the shared null block. Compressed keys share the attention blocks.
+    block_size = cache.layout.block_size
+    expected_blocks = 1 + 2 * (math.ceil(512 / block_size) * 2 + 1)
+    main_per_block = (
+        block_size * math.ceil(2 * 2 / packing) * packing * 256 * dtype.itemsize
+    )
+    index_per_block = max(8192, (block_size // 4) * 128 * 2)
     expected_bytes = expected_blocks * (main_per_block + index_per_block)
     unique = {
         t.untyped_storage()._cdata: t.untyped_storage().nbytes()
@@ -84,6 +101,33 @@ def test_actual_pool_backing_does_not_allocate_main_sized_compressed_pages(monke
     assert sum(unique.values()) == expected_bytes
     assert cache.native_config.num_blocks == expected_blocks
     assert len(bound[0]) == 2
+    main, index = bound[0]
+    assert main.dtype == dtype
+    assert main.untyped_storage().nbytes() == expected_blocks * main_per_block
+    assert index.dtype == torch.bfloat16
+    assert index.untyped_storage().nbytes() == expected_blocks * index_per_block
+
+    # Equal byte counts can hide an unpacked "auto" probe shape. Trace the
+    # actual GDN typed view: its FP32 bitcast rescales the second-minor axis.
+    def load_state(block_ref, output_ref):
+        output_ref[...] = load_typed(block_ref, view_dtype=jnp.float32, lane_split=2)
+
+    carrier = jnp.bfloat16 if dtype == torch.bfloat16 else jnp.float8_e4m3fn
+    state_view = jax.ShapeDtypeStruct((main_per_block // 4 // 128, 128), jnp.float32)
+    assert (
+        jax.eval_shape(
+            pl.pallas_call(load_state, out_shape=state_view),
+            jax.ShapeDtypeStruct(main.shape[1:], carrier),
+        )
+        == state_view
+    )
+    assert main.shape == (
+        expected_blocks,
+        block_size,
+        math.ceil(2 * 2 / packing),
+        packing,
+        256,
+    )
 
 
 def _startup_cache(

@@ -73,7 +73,7 @@ def materialize_pool(
         layout.block_size,
         main_spec.num_kv_heads,
         main_spec.head_size,
-        cache_dtype_str=cfg.cache_config.cache_dtype,
+        cache_dtype_str=main_spec.dtype,
     )
     assert math.prod(shape[1:]) * main_spec.dtype.itemsize == layout.main_page_bytes
     allocate = torch.empty if main_spec.dtype == torch.float8_e4m3fn else torch.zeros
