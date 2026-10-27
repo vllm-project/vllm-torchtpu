@@ -745,6 +745,46 @@ class Qwen38SegmentDriver:
             )
         return stack
 
+    def _start_watchdog(self, runner: Any, period_s: float = 300.0) -> None:
+        """Self-check: a segment MK that silently stops serving reads like a clean
+        stock run. Every `period_s` after warmup, log an ERROR if the driver saw
+        decode steps but made 0 MK calls (unless auto-disabled), and a WARNING
+        once if the driver was not called at all in the period."""
+        import threading
+        import time
+
+        def loop() -> None:
+            while not getattr(runner, "warmup_done", False):
+                time.sleep(10.0)
+            last_calls, last_mk = getattr(self, "calls_total", 0), self.mk_calls
+            quiet_logged = False
+            while True:
+                time.sleep(period_s)
+                calls, mk = getattr(self, "calls_total", 0), self.mk_calls
+                if calls == last_calls:
+                    if not quiet_logged:
+                        logger.warning(
+                            "qwen38 megakernel self-check: driver not called in the last %.0f s "
+                            "(idle server, or forward steps bypass the megakernel hook)", period_s,
+                        )
+                        quiet_logged = True
+                else:
+                    quiet_logged = False
+                    # `wholedry=1` routes every MK-eligible step to stock on purpose.
+                    if (
+                        mk == last_mk
+                        and getattr(self, "disabled_reason", None) is None
+                        and not getattr(self, "whole_dry", False)
+                    ):
+                        logger.error(
+                            "qwen38 megakernel self-check: 0 MK calls in %d driver steps over %.0f s; "
+                            "step mix %s", calls - last_calls, period_s, dict(sorted(self.stats.items())),
+                        )
+                last_calls, last_mk = calls, mk
+
+        self._watchdog = threading.Thread(target=loop, name="qwen38-mk-selfcheck", daemon=True)
+        self._watchdog.start()
+
     def _serve_contexts(self, runner: Any) -> Any:
         """`_contexts(runner, "model_mk_segments")` for the per-step call, without
         the per-step imports, attribute lookups and ExitStack: the three context
@@ -758,6 +798,18 @@ class Qwen38SegmentDriver:
     def bind_and_warmup(self, runner: Any) -> None:
         from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpSegmentModel
 
+        if getattr(runner.model.model, "host_ple_index", None) is not None:
+            # forward_segments needs the PLE table on HBM; with PLE CPU offload
+            # (PLE_CPU_OFFLOAD, auto-on at max concurrency >= 32) the first MK
+            # call would fail to trace and fail closed. Say so once, up front.
+            logger.warning(
+                "Qwen3.8 megakernel disabled: PLE CPU offload is on (host_ple_index=%s); "
+                "the segment program needs the PLE table on HBM. Every step runs stock.",
+                runner.model.model.host_ple_index,
+            )
+            self.disabled_reason = "stock_host_ple"
+            return
+        self._start_watchdog(runner)
         self.segments.bind_pool()
         self.cfg = self._segment_config(runner)
         from vllm.compilation.backends import set_model_tag
@@ -1388,12 +1440,13 @@ class Qwen38SegmentDriver:
         intermediate_tensors: Any,
         model_kwargs: Any = None,
     ) -> tuple[bool, Any]:
+        self.calls_total = getattr(self, "calls_total", 0) + 1
         if inputs_embeds is not None or intermediate_tensors is not None:
             # Counted like every other stock route, so a bypass shows in the mix.
             self._note("stock_embeds" if inputs_embeds is not None else "stock_intermediate")
             return False, None
         if self.program is None:  # disabled (it failed): the self-check still counts steps
-            self._note("stock_noprogram")
+            self._note(getattr(self, "disabled_reason", "stock_noprogram"))
             if self.whole:
                 self._whole_self_check(runner)
             return False, None
