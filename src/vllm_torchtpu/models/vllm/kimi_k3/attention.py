@@ -735,9 +735,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
 
         metadata = self._metadata()
         if metadata is None or self.kv_cache is None or self.kv_cache[0].numel() == 0:
-            output = mixed_qkv.new_zeros(
-                (mixed_qkv.shape[0], self.local_projection_size)
-            )
+            output = torch.zeros_like(mixed_qkv[:, : self.local_projection_size])
         elif len(self.kv_cache) == 1:
             # Unified pool: the single attention-shaped buffer carries both
             # KDA state regions.
