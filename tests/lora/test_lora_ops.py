@@ -119,3 +119,20 @@ def test_dtype_mismatch_points_at_lora_dtype():
         bgmv_shrink(x, lora_a, onehot, 1.0)
     with pytest.raises(AssertionError, match="lora_dtype must match the model dtype"):
         bgmv_expand(buf, lora_b, onehot)
+
+
+def test_dtype_mismatch_message_survives_fullgraph_compile():
+    """The ops run inside the compiled backbone, where a failed plain assert
+    surfaces as Dynamo Unsupported without this message."""
+    lora_a = _stacked(RANK, HIDDEN, torch.bfloat16)
+    lora_b = _stacked(OUT, RANK, torch.bfloat16)
+    x = torch.randn(len(IDX), HIDDEN)
+    buf = torch.randn(len(IDX), RANK)
+    onehot = one_hot_slots(IDX, NUM_SLOTS)
+
+    shrink = torch.compile(bgmv_shrink, backend="eager", fullgraph=True)
+    expand = torch.compile(bgmv_expand, backend="eager", fullgraph=True)
+    with pytest.raises(AssertionError, match="lora_dtype must match the model dtype"):
+        shrink(x, lora_a, onehot, 1.0)
+    with pytest.raises(AssertionError, match="lora_dtype must match the model dtype"):
+        expand(buf, lora_b, onehot)
