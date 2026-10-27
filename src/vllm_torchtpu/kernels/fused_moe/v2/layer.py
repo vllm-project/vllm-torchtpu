@@ -61,7 +61,10 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     rowquant_fp8,
 )
 from vllm_torchtpu.kernels.fused_moe.v2.preprocessing import PreprocessTopology
-from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
+from vllm_torchtpu.kernels.fused_moe.v2.router_ops import (
+    normalized_router_block_rows,
+    pallas_select,
+)
 from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import (
     TokenReplicaLayout,
     replica_wire_rows,
@@ -590,6 +593,16 @@ def fused_ep_moe_v2(
         select_rows = MAX_ROUTING_BLOCK
         while t_local % select_rows:
             select_rows //= 2
+        normalized_rows = normalized_router_block_rows(
+            gate_l,
+            topk=topk,
+            scoring_fn=scoring_fn,
+            renormalize=renormalize,
+            has_bias=score_bias_l is not None,
+            has_hash=hash_l is not None,
+        )
+        if normalized_rows is not None:
+            select_rows = normalized_rows
         if hash_l is not None:
             # The selection was made by the caller's table, so the selector
             # does not run at all; the weights are still the scores at the
@@ -609,6 +622,7 @@ def fused_ep_moe_v2(
                 topk=topk,
                 block_rows=select_rows,
                 weight_scores=scores,
+                normalize=normalized_rows is not None,
             )
         topk_idx = _relabel_expert_ids_to_mesh_order(
             topk_idx, g_local=g_local, mesh_ep_ranks=mesh_ep_ranks
@@ -624,8 +638,12 @@ def fused_ep_moe_v2(
         # routed at full weight to expert zero. Mask it explicitly instead.
         # gate_l is checked too: under sigmoid/sqrtsoftplus a -inf logit scores
         # a finite 0, so replica padding would otherwise pass the score check.
-        row_routes = _row_routes(scores, gate_l)
-        if renormalize:
+        if normalized_rows is not None:
+            # Every finite BF16 logit has a finite sqrtsoftplus score.
+            row_routes = jnp.any(jnp.isfinite(gate_l), axis=-1, keepdims=True)
+        else:
+            row_routes = _row_routes(scores, gate_l)
+        if renormalize and normalized_rows is None:
             denom = jnp.maximum(topk_weights.sum(axis=-1, keepdims=True), 1e-20)
             topk_weights = topk_weights / jnp.where(row_routes, denom, 1.0)
         if routed_scaling_factor != 1.0:
