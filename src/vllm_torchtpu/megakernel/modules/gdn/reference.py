@@ -24,7 +24,7 @@ from jax import lax
 
 from ...exec_spec import ExecSpec
 from ...ops import BF16, F32, rnd, rup
-from .params import gdn_lin_in_layout
+from .params import gdn_lin_in_layout, resolve_gdn_options
 
 
 def gdn_reference(
@@ -39,6 +39,7 @@ def gdn_reference(
     multi_layer: bool = True,
     packed_conv: bool = False,
     flat_rec: bool = False,
+    options: Mapping[str, Any] | None = None,
 ) -> tuple[jax.Array, dict[str, Any]]:
     """Pure-JAX multi-rank GDN forward for one linear-attention layer (`gdn_idx`).
 
@@ -57,7 +58,10 @@ def gdn_reference(
     o_gdn = int(gdn_idx)
     lyr = o_gdn if layer_idx is None else int(layer_idx)
     L = int(getattr(g, "L", 1))
-    lay_gdn = gdn_lin_in_layout(g, ex)
+    opts = resolve_gdn_options(options or {}, g)
+    decay_type, decay_law = opts["decay_type"], opts["decay_law"]
+    gate_type, decay_bound = opts["gate_type"], opts["decay_bound"]
+    lay_gdn = gdn_lin_in_layout(g, ex, decay_type=decay_type)
     kh, vh, KD, VD = lay_gdn.kh, lay_gdn.vh, lay_gdn.KD, lay_gdn.VD
     QKV, Z, BA, A_OFF = lay_gdn.QKV, lay_gdn.Z, lay_gdn.BA, lay_gdn.A_OFF
     CR, HR = rup(3 * B, 8), rup(3 + T, 8)
@@ -157,8 +161,11 @@ def gdn_reference(
                 us.append(u_s)
             u = jnp.concatenate(us, axis=0)
 
+        is_key_decay = decay_type == "key"
+        a_dim = vh * KD if is_key_decay else vh
         alog = alog_l[r, :vh]
-        dtb = dtb_l[r, :vh]
+        exp_alog = jnp.exp(alog)[:, None] if is_key_decay else jnp.exp(alog)
+        dtb = dtb_l[r, :a_dim]
         gnw = gnorm_l[r, :VD].astype(BF16)
         mix_r = []
         rec_r_list = []
@@ -180,9 +187,18 @@ def gdn_reference(
             qc = jnp.repeat(q, expand, axis=0)[:, :, None]
             kc_ = jnp.repeat(k, expand, axis=0)[:, :, None]
             beta = rnd(jax.nn.sigmoid(ybuf[b, BA : BA + vh]))
-            a_val = ybuf[b, A_OFF : A_OFF + vh]
-            decay = -jnp.exp(alog) * jax.nn.softplus(a_val + dtb)
-            st_cur = st_cur * jnp.exp(decay)[:, None, None]
+            a_val = ybuf[b, A_OFF : A_OFF + a_dim]
+            a_shifted = (a_val + dtb).reshape(vh, KD) if is_key_decay else (a_val + dtb)
+            if decay_law == "bounded_sigmoid":
+                decay = -F32(decay_bound) * jax.nn.sigmoid(exp_alog * a_shifted)
+            else:
+                decay = -exp_alog * jax.nn.softplus(a_shifted)
+            eg = (
+                jnp.exp(decay)[:, :, None]
+                if is_key_decay
+                else jnp.exp(decay)[:, None, None]
+            )
+            st_cur = st_cur * eg
             pred = jnp.sum(st_cur * kc_, axis=1)
             delta = (v - pred) * beta[:, None]
             st_cur = st_cur + kc_ * delta[:, None, :]
@@ -194,7 +210,8 @@ def gdn_reference(
             )
             val = (gnw[None, :] * val.astype(BF16)).astype(F32)
             zz = ybuf[b, QKV : QKV + Z].reshape(vh, VD)
-            mix_r.append(rnd(val * jax.nn.silu(zz)).reshape(Z))
+            gate_val = jax.nn.sigmoid(zz) if gate_type == "sigmoid" else jax.nn.silu(zz)
+            mix_r.append(rnd(val * gate_val).reshape(Z))
 
         rec_cat = jnp.concatenate(rec_r_list, axis=0)
         if has_multi_out:

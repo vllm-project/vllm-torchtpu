@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from ...decls import (
@@ -29,7 +30,7 @@ from ...decls import (
 )
 from ...errors import MegakernelConfigError
 from ...ops import BF16, F32, FP8
-from .params import gdn_lin_in_layout
+from .params import gdn_lin_in_layout, resolve_gdn_options
 
 GDN_PARAM_NAMES: frozenset[str] = frozenset(
     {
@@ -80,6 +81,12 @@ GDN_FIELD_ALIASES: dict[str, str] = {
     "rms_norm_eps": "eps",
 }
 
+# None falls back to the geometry attribute, or GDN_OPTION_DEFAULTS if unset.
+GDN_OPTIONS: dict[str, Any] = dict.fromkeys(
+    ("decay_type", "decay_law", "gate_type", "decay_bound")
+)
+
+
 GDN_GEOMETRY_METHODS: dict[str, Any] = {
     "kh": lambda g, R: gdn_lin_in_layout(g, R).kh,
     "vh": lambda g, R: gdn_lin_in_layout(g, R).vh,
@@ -103,6 +110,7 @@ def resolve_gdn_binding(
     cls: Any, binding: ModuleBinding, resolved: ResolvedModuleGeometry
 ) -> ResolvedModuleGeometry:
     vals = dict(resolved.values)
+    opts = resolve_gdn_options(binding.options, None)
     conv_k = _check_conv_kernel(int(vals.get("conv_kernel", 4)))
     vals.update(
         {
@@ -115,6 +123,7 @@ def resolve_gdn_binding(
             "conv_taps": conv_k - 1,
             "eps": float(vals["eps"]),
             "gdn_l2_eps": float(vals["gdn_l2_eps"]),
+            **opts,
         }
     )
     return ResolvedModuleGeometry(
@@ -127,17 +136,28 @@ def resolve_gdn_binding(
     )
 
 
-def gdn_hf_params(prefix: str, geom: Any) -> list[HFParamDecl]:
-    """Return canonical (unfused) HF parameter declarations for `GDNModule`."""
+def gdn_hf_params(
+    prefix: str, geom: Any, options: Mapping[str, Any] | None = None
+) -> list[HFParamDecl]:
+    """Return canonical (unfused) HF parameter declarations for `GDNModule`.
+
+    `options` are the module's requested options; they take precedence over
+    geometry attributes, matching `GDNModule.resolved_options`.
+    """
     conv_kernel = _check_conv_kernel(int(getattr(geom, "conv_kernel", 4)))
     p = f"{prefix}." if prefix else ""
     H, KH, VH = int(geom.H), int(geom.KH), int(geom.VH)
     KD, VD = int(geom.KD), int(geom.VD)
     kq_dim, v_dim = KH * KD, VH * VD
     qkv_full = 2 * kq_dim + v_dim
-    lay = gdn_lin_in_layout(geom, 1)
+    decay_type = resolve_gdn_options(options or {}, geom)["decay_type"]
+    lay = gdn_lin_in_layout(geom, 1, decay_type=decay_type)
     b_slot_width = lay.A_OFF - lay.BA
-    a_slot_width = lay.NLI - lay.A_OFF
+    # With per-key decay, lin_a and dt_bias have width VH * KD (KD is a multiple
+    # of 128, so per-rank vh * KD needs no column padding), while A_log stays (VH,).
+    key_decay = decay_type == "key"
+    a_dim = VH * KD if key_decay else VH
+    a_slot_width = None if key_decay else lay.NLI - lay.A_OFF
     rename = geom.rename if isinstance(geom, ResolvedModuleGeometry) else {}
 
     def _n(canon: str) -> str:
@@ -196,23 +216,24 @@ def gdn_hf_params(prefix: str, geom: Any) -> list[HFParamDecl]:
         canon: str,
         hf_stem: str,
         order: int,
-        slot_w: int,
+        slot_w: int | None,
         aliases: tuple[VLLMAlias, ...] = (),
+        width: int = VH,
     ) -> list[HFParamDecl]:
         w_n, s_n = _n(canon), _n(f"{canon}_s")
         return [
             HFParamDecl(
                 name=w_n,
                 hf_name=f"{p}{hf_stem}.weight",
-                shape=(H, VH),
-                hf_shape=(VH, H),
+                shape=(H, width),
+                hf_shape=(width, H),
                 dtype=FP8,
                 transform=ParamTransform(
                     fuse_into="lin_in",
                     fuse_order=order,
                     fuse_axis=-1,
                     transpose=(1, 0),
-                    pad=((0, 0), (0, slot_w)),
+                    pad=None if slot_w is None else ((0, 0), (0, slot_w)),
                     quantize="per_channel_fp8",
                     shard_axis=-1,
                 ),
@@ -221,14 +242,14 @@ def gdn_hf_params(prefix: str, geom: Any) -> list[HFParamDecl]:
             HFParamDecl(
                 name=s_n,
                 hf_name=f"{p}{hf_stem}.weight_scale_inv",
-                shape=(VH,),
-                hf_shape=(VH,),
+                shape=(width,),
+                hf_shape=(width,),
                 dtype=F32,
                 transform=ParamTransform(
                     fuse_into="lin_in_s",
                     fuse_order=order,
                     fuse_axis=-1,
-                    pad=((0, slot_w),),
+                    pad=None if slot_w is None else ((0, slot_w),),
                     scale_for=w_n,
                     shard_axis=-1,
                     small_field="in_s",
@@ -323,7 +344,7 @@ def gdn_hf_params(prefix: str, geom: Any) -> list[HFParamDecl]:
             ),
         ),
         *_ba_pair("lin_b", "in_proj_b", 4, b_slot_width, ba_alias),
-        *_ba_pair("lin_a", "in_proj_a", 5, a_slot_width),
+        *_ba_pair("lin_a", "in_proj_a", 5, a_slot_width, width=a_dim),
         HFParamDecl(
             name=_n("lin_out"),
             hf_name=f"{p}out_proj.weight",
@@ -381,7 +402,7 @@ def gdn_hf_params(prefix: str, geom: Any) -> list[HFParamDecl]:
             ),
         ),
         _vec1d("alog", "A_log", VH, 0),
-        _vec1d("dtb", "dt_bias", VH, 0),
+        _vec1d("dtb", "dt_bias", a_dim, 0),
         _vec1d("gnorm", "norm.weight", VD, None),
     ]
     return apply_decl_overrides(decls, geom)

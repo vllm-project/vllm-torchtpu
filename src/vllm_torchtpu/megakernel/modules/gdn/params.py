@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -38,6 +40,7 @@ class GDNLinInLayout:
     A_OFF: int
     BA_PAD: int
     NLI: int
+    A_DIM: int = 0
 
 
 @dataclass(frozen=True)
@@ -89,6 +92,11 @@ class GDNParams:
     # Pool layout of the model's pool backend (set only for pool I/O: GPR or
     # fused); the slot geometry above and `page_base` come from it.
     pool_layout: Any = None
+    A_DIM: int = 0
+    decay_type: str = "head"
+    decay_law: str = "softplus"
+    gate_type: str = "silu"
+    decay_bound: float = 5.0
 
 
 @dataclass(frozen=True)
@@ -112,7 +120,64 @@ class GDNTunables:
     }
 
 
-def gdn_lin_in_layout(g: Any, ex_or_r: ExecSpec | int) -> GDNLinInLayout:
+GDN_OPTION_DEFAULTS: dict[str, Any] = {
+    "decay_type": "head",
+    "decay_law": "softplus",
+    "gate_type": "silu",
+    "decay_bound": 5.0,
+}
+
+
+def validate_gdn_options(options: Mapping[str, Any]) -> None:
+    """Reject unsupported option values; `None` means inherit."""
+    allowed = {
+        "decay_type": ("head", "key"),
+        "decay_law": ("softplus", "bounded_sigmoid"),
+        "gate_type": ("silu", "sigmoid"),
+    }
+    for k, ok in allowed.items():
+        if (v := options.get(k)) is not None and v not in ok:
+            raise MegakernelConfigError(f"GDNModule requires {k} in {ok}, got {v!r}")
+    db = options.get("decay_bound")
+    if db is not None and (
+        isinstance(db, bool)
+        or not isinstance(db, (int, float))
+        or not math.isfinite(float(db))
+        or float(db) <= 0.0
+    ):
+        raise MegakernelConfigError(f"GDNModule requires decay_bound > 0, got {db!r}")
+
+
+def check_fused_gdn_options(options: Mapping[str, Any]) -> None:
+    """Reject KDA options when `fused_pool_io` is enabled."""
+    if (
+        options["decay_type"] != "head"
+        or options["decay_law"] != "softplus"
+        or options["gate_type"] != "silu"
+    ):
+        raise MegakernelConfigError(
+            "GDNModule fused_pool_io supports only decay_type='head', "
+            "decay_law='softplus', and gate_type='silu'; got "
+            f"decay_type={options['decay_type']!r}, "
+            f"decay_law={options['decay_law']!r}, "
+            f"gate_type={options['gate_type']!r}"
+        )
+
+
+def resolve_gdn_options(requested: Mapping[str, Any], g: Any) -> dict[str, Any]:
+    """Options in effect: requested value, else geometry attribute, else default."""
+    opts = {
+        k: v if (v := requested.get(k)) is not None else getattr(g, k, d)
+        for k, d in GDN_OPTION_DEFAULTS.items()
+    }
+    validate_gdn_options(opts)
+    opts["decay_bound"] = float(opts["decay_bound"])
+    return opts
+
+
+def gdn_lin_in_layout(
+    g: Any, ex_or_r: ExecSpec | int, *, decay_type: str | None = None
+) -> GDNLinInLayout:
     """Return shared column offsets for `lin_in` (`[qkv | z | b | a]`)."""
     R = ex_or_r.R if isinstance(ex_or_r, ExecSpec) else int(ex_or_r)
     kh = g.KH // R
@@ -121,7 +186,15 @@ def gdn_lin_in_layout(g: Any, ex_or_r: ExecSpec | int) -> GDNLinInLayout:
     qkv = 2 * kh * KD + vh * VD
     z = vh * VD
     ba = qkv + z
-    ba_pad = 128
+    dt = resolve_gdn_options({"decay_type": decay_type}, g)["decay_type"]
+    if dt == "key":
+        a_off = ba + 128
+        a_dim = vh * KD
+        ba_pad = 128 + rup(a_dim, 128)
+    else:
+        a_off = ba + 64
+        a_dim = vh
+        ba_pad = 128
     return GDNLinInLayout(
         kh=kh,
         vh=vh,
@@ -130,14 +203,21 @@ def gdn_lin_in_layout(g: Any, ex_or_r: ExecSpec | int) -> GDNLinInLayout:
         QKV=qkv,
         Z=z,
         BA=ba,
-        A_OFF=ba + 64,
+        A_OFF=a_off,
         BA_PAD=ba_pad,
         NLI=ba + ba_pad,
+        A_DIM=a_dim,
     )
 
 
 def derive_params(
-    g: Any, ex: ExecSpec, plan: Any, tt: GDNTunables, name: str
+    g: Any,
+    ex: ExecSpec,
+    plan: Any,
+    tt: GDNTunables,
+    name: str,
+    *,
+    options: Mapping[str, Any],
 ) -> GDNParams:
     """`GDNParams` for geometry `g` under `ex` and the module's tunables `tt`."""
     tiles = ex.resolve_tiles(g)
@@ -147,7 +227,10 @@ def derive_params(
     )
     assert g.KH % R == 0 and g.VH % R == 0, (g.KH, g.VH, R)
     assert g.VH % g.KH == 0, (g.VH, g.KH)
-    lay = gdn_lin_in_layout(g, ex)
+    if cache_exec(ex).FUSED:
+        check_fused_gdn_options(options)
+    eff_dt = options["decay_type"]
+    lay = gdn_lin_in_layout(g, ex, decay_type=eff_dt)
     assert lay.vh <= 64, ("b|a gate lanes require vh <= 64", lay.vh)
     for dim_name, dim_val in (
         ("H", g.H),
@@ -262,6 +345,11 @@ def derive_params(
         conv_stage=bool(tt.conv_stage),
         head_major=bool(tt.gdn_head_major),
         pool_layout=pool_layout,
+        A_DIM=lay.A_DIM,
+        decay_type=eff_dt,
+        decay_law=options["decay_law"],
+        gate_type=options["gate_type"],
+        decay_bound=options["decay_bound"],
     )
 
 
