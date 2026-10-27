@@ -76,22 +76,28 @@ def align_to(x, a):
     return cdiv(x, a) * a
 
 
-def _query_score_sublanes(query_tokens, compression_ratio, k, page_size, blocks, full):
+def _score_sublanes(capacity, k, page_size, blocks, full):
     # A score DMA writes complete KV tiles, including the last partial tile.
-    bound = max(k, cdiv(query_tokens, compression_ratio))
+    bound = max(k, capacity)
     width = max(align_to(bound, page_size * block) for block in blocks)
     return min(full, width // 128)
 
 
 def _query_prefix_fits(seq_lens, cu_q_lens, distribution, compression_ratio, bound):
     query_lens = cu_q_lens[1:] - cu_q_lens[:-1]
-    active = (jnp.arange(seq_lens.shape[0]) < distribution[2]) & (query_lens > 0)
+    seq_ids = jnp.arange(seq_lens.shape[0])
+    # An idle decode slot can widen a queried neighbor's grouped DMA schedule.
+    active = (seq_ids < distribution[2]) & (
+        (query_lens > 0) | (seq_ids < distribution[0])
+    )
     lengths = jnp.maximum(jnp.where(active, seq_lens, 0), 0)
     # Conservatively fit the complete context, including an incomplete group.
     # Divide first so the addition cannot overflow a nonnegative int32 length.
     compressed = lengths // compression_ratio + (lengths % compression_ratio != 0)
     return (
-        (distribution[2] >= 0)
+        (distribution[0] >= 0)
+        & (distribution[0] <= distribution[1])
+        & (distribution[1] <= distribution[2])
         & (distribution[2] <= seq_lens.shape[0])
         & jnp.all(query_lens >= 0)
         & jnp.all(jnp.where(active, seq_lens >= query_lens, True))
@@ -1104,6 +1110,7 @@ def _effective_row_lengths(
         "components",
         "topk_backend",
         "scheduling_group_namespace",
+        "prefix_capacity",
     ),
 )
 def streamindex_topk(
@@ -1136,6 +1143,7 @@ def streamindex_topk(
     components: indexing.StreamIndexComponents | None = None,
     topk_backend: TopKBackend = _DEFAULT_TOPK_BACKEND,
     scheduling_group_namespace: int | None = None,
+    prefix_capacity: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1209,6 +1217,13 @@ def streamindex_topk(
       topk_backend: Static selector for the score-bit buffers. The default keeps
         SparseCore selection and chunk overlap. A backend without overlap uses
         the same scoring chunks without cross-engine scheduling annotations.
+      prefix_capacity: Optional static score capacity in compressed KV columns.
+        None builds only the full-capacity pipeline. An explicit positive bound
+        is rounded for DMA tiles and enables a guarded prefix/full branch when
+        chunking. The caller guarantees its schedule does not widen metadata
+        writes and its backend supports reduced score pitch with unchanged
+        row-length and winner semantics. Contexts exceeding the safe tile extent
+        retain the full pipeline; this never truncates the candidate set.
       scheduling_group_namespace: Positive static native call-site identity.
         Zero omits unsafe unbound native annotations. None retains standalone
         JAX allocation; a cached native body must use an explicit namespace.
@@ -1222,6 +1237,8 @@ def streamindex_topk(
     # `cache_kv`, keeping HBM transactions fused.
 
     kv_layout = KVLayout.parse(kv_layout)
+    if prefix_capacity is not None and prefix_capacity < 1:
+        raise ValueError("prefix_capacity must be positive compressed KV columns")
     if scheduling_group_namespace is not None and scheduling_group_namespace < 0:
         raise ValueError("scheduling_group_namespace must be nonnegative")
 
@@ -1624,23 +1641,22 @@ def streamindex_topk(
         else:
             num_chunks, chunk_len = max_num_tokens // chunk_tokens, chunk_tokens
 
-        fast_sublanes = _query_score_sublanes(
-            max_num_tokens,
-            compression_ratio,
-            k,
-            page_size,
-            num_kv_pages_per_blocks,
-            num_sublanes_total,
+        fast_sublanes = (
+            num_sublanes_total
+            if prefix_capacity is None
+            else _score_sublanes(
+                prefix_capacity,
+                k,
+                page_size,
+                num_kv_pages_per_blocks,
+                num_sublanes_total,
+            )
         )
         bounded = (
-            num_chunks > 1
-            and type(topk_backend) is SparseCoreTopK
+            prefix_capacity is not None
+            and num_chunks > 1
             and cp_size == 1
             and fast_sublanes < num_sublanes_total
-            and (
-                components is None
-                or getattr(components.schedule, "preserves_kv_extent", False)
-            )
         )
         group_base = 0
         if (
@@ -1745,6 +1761,11 @@ def streamindex_topk(
 
         if not bounded:
             return select_chunks(num_sublanes_total, 0)
+        # Each pass writes a complete final tile, even at a partial context.
+        safe_extent = min(
+            fast_sublanes * 128 // (page_size * block) * (page_size * block)
+            for block in num_kv_pages_per_blocks
+        )
         # Keep the entire TC/SC pipeline inside each branch: a per-chunk cond
         # would serialize the paired engines and materialize cropped scores.
         return lax.cond(
@@ -1753,7 +1774,7 @@ def streamindex_topk(
                 cu_q_lens,
                 distribution,
                 compression_ratio,
-                fast_sublanes * 128,
+                safe_extent,
             ),
             lambda _: select_chunks(fast_sublanes, 0),
             lambda _: select_chunks(num_sublanes_total, 1),

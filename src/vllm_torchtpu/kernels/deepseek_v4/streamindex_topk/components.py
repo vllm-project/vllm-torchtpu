@@ -48,9 +48,6 @@ class IndexSchedule(Protocol):
     shape. ``chunk_metadata`` returns one chunk's steps indexed from zero; it
     must cover every admitted score column. These hooks do not promise that
     score-free enumeration is equivalent to scoring and selection.
-    An optional ``preserves_kv_extent=True`` attribute promises chunk metadata
-    only selects/rebases existing KV steps, without widening score writes.
-    Omitted attributes retain full score capacity and remain protocol-compatible.
     """
 
     def validate(self, compression_ratio: int) -> None: ...
