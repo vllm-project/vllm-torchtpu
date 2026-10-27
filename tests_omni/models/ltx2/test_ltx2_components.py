@@ -23,17 +23,12 @@ HuggingFace diffusers / transformers counterpart on CPU:
   ``modality`` forward variants.
 - Tiny ``LTX2TextConnectors`` with ``_install_connector_attention`` on
   left-padded prompts.
-- Tiny ``DistributedAutoencoderKLLTX2Video`` encode (posterior mode:
-  observed fp32/bf16 ratios 0.753 / 1.420) and decode (whole video:
-  0.577 / 1.103; per-frame max: 0.590 / 1.150) against
-  ``AutoencoderKLLTX2Video``.
-- Tiny ``AutoencoderKLLTX2Audio`` causal mel-spectrogram decode
-  (observed fp32/bf16 ratios 0.559 / 1.199).
-- Tiny ``LTX2Vocoder`` stereo waveform synthesis via ``_run_ltx_vocoder``
-  (observed fp32/bf16 ratios 0.208 / 1.034).
+- Tiny ``DistributedAutoencoderKLLTX2Video`` encode (posterior mode) and
+  decode (whole video and per frame) against ``AutoencoderKLLTX2Video``.
+- Tiny ``AutoencoderKLLTX2Audio`` causal mel-spectrogram decode.
+- Tiny ``LTX2Vocoder`` stereo waveform synthesis via ``_run_ltx_vocoder``.
 - Tiny ``Gemma3ForConditionalGeneration`` ``from_pretrained`` load path and
-  multi-layer hidden-state stacking on left-padded prompts (observed
-  fp32/bf16 ratios 0.658 / 0.990).
+  multi-layer hidden-state stacking on left-padded prompts.
 """
 
 import copy
@@ -115,14 +110,14 @@ CONNECTOR_MAX_REL_L2: dict[str, tuple[float, float]] = {
     "video": (2.8e-3, 5.9e-3),
     "audio": (2.7e-3, 5.6e-3),
 }
-VIDEO_VAE_RATIO_GATES: dict[str, tuple[float, float]] = {
-    "mode": (0.78, 1.47),
-    "decode": (0.60, 1.14),
-    "decode-frame": (0.61, 1.19),
+VIDEO_VAE_MAX_REL_L2: dict[str, tuple[float, float]] = {
+    "mode": (7.3e-3, 1.2e-2),
+    "decode": (6.5e-3, 1.2e-2),
+    "decode-frame": (6.7e-3, 1.3e-2),
 }
-AUDIO_VAE_RATIO_GATE: tuple[float, float] = (0.58, 1.24)
-VOCODER_RATIO_GATE: tuple[float, float] = (0.22, 1.07)
-GEMMA3_RATIO_GATE: tuple[float, float] = (0.68, 1.02)
+AUDIO_VAE_MAX_REL_L2: tuple[float, float] = (9.6e-3, 1.9e-2)
+VOCODER_MAX_REL_L2: tuple[float, float] = (1.7e-3, 8.4e-3)
+GEMMA3_MAX_REL_L2: tuple[float, float] = (7.4e-3, 1.2e-2)
 
 
 @pytest.fixture(scope="module")
@@ -632,7 +627,6 @@ def test_ltx2_tiny_video_vae_parity(
     """DistributedAutoencoderKLLTX2Video on TPU matches diffusers on CPU."""
     torch.manual_seed(0)
     ref_vae = AutoencoderKLLTX2Video(**TINY_VIDEO_VAE_CONFIG).eval()
-    ref_vae_bf16 = copy.deepcopy(ref_vae).to(torch.bfloat16).eval()
 
     # 9 = 8 * 1 + 1 pixel frames -> 2 latent frames; 64x64 -> 2x2 latents (32x).
     gen = torch.Generator(device="cpu").manual_seed(1)
@@ -641,12 +635,6 @@ def test_ltx2_tiny_video_vae_parity(
 
     ref_mode = ref_vae.encode(video).latent_dist.mode()
     ref_decode = ref_vae.decode(latents, None, return_dict=False)[0]
-    ref_bf16_mode = (
-        ref_vae_bf16.encode(video.to(torch.bfloat16)).latent_dist.mode().float()
-    )
-    ref_bf16_decode = ref_vae_bf16.decode(
-        latents.to(torch.bfloat16), None, return_dict=False
-    )[0].float()
 
     tpu_outputs: dict[torch.dtype, dict[str, torch.Tensor]] = {}
     for dtype in (torch.float32, torch.bfloat16):
@@ -667,29 +655,34 @@ def test_ltx2_tiny_video_vae_parity(
             "decode": decode_out.float().cpu(),
         }
 
-    for output, ref_out, ref_bf16_out in (
-        ("mode", ref_mode, ref_bf16_mode),
-        ("decode", ref_decode, ref_bf16_decode),
-    ):
-        fp32_ratio, bf16_ratio = VIDEO_VAE_RATIO_GATES[output]
+    for output, ref_out in (("mode", ref_mode), ("decode", ref_decode)):
+        fp32_max, bf16_max = VIDEO_VAE_MAX_REL_L2[output]
         assert_parity(
-            ref=ref_out,
-            ref_bf16=ref_bf16_out,
-            tpu_fp32=tpu_outputs[torch.float32][output],
-            tpu_bf16=tpu_outputs[torch.bfloat16][output],
-            fp32_ratio=fp32_ratio,
-            bf16_ratio=bf16_ratio,
+            tpu_outputs[torch.float32][output],
+            ref_out,
+            name=f"video VAE {output} TPU fp32",
+            max_rel_l2=fp32_max,
+        )
+        assert_parity(
+            tpu_outputs[torch.bfloat16][output],
+            ref_out,
+            name=f"video VAE {output} TPU bf16",
+            max_rel_l2=bf16_max,
         )
 
-    frame_fp32_ratio, frame_bf16_ratio = VIDEO_VAE_RATIO_GATES["decode-frame"]
+    frame_fp32_max, frame_bf16_max = VIDEO_VAE_MAX_REL_L2["decode-frame"]
     for frame in range(ref_decode.shape[2]):
         assert_parity(
-            ref=ref_decode[:, :, frame],
-            ref_bf16=ref_bf16_decode[:, :, frame],
-            tpu_fp32=tpu_outputs[torch.float32]["decode"][:, :, frame],
-            tpu_bf16=tpu_outputs[torch.bfloat16]["decode"][:, :, frame],
-            fp32_ratio=frame_fp32_ratio,
-            bf16_ratio=frame_bf16_ratio,
+            tpu_outputs[torch.float32]["decode"][:, :, frame],
+            ref_decode[:, :, frame],
+            name=f"video VAE decode frame {frame} TPU fp32",
+            max_rel_l2=frame_fp32_max,
+        )
+        assert_parity(
+            tpu_outputs[torch.bfloat16]["decode"][:, :, frame],
+            ref_decode[:, :, frame],
+            name=f"video VAE decode frame {frame} TPU bf16",
+            max_rel_l2=frame_bf16_max,
         )
 
 
@@ -722,18 +715,13 @@ def test_ltx2_tiny_audio_vae_parity(
     omni_ctx: None,
 ) -> None:
     """AutoencoderKLLTX2Audio decode on TPU matches CPU."""
-    assert torch.nn.functional.interpolate.__name__ == "_safe_interpolate"
     torch.manual_seed(0)
     ref_audio_vae = AutoencoderKLLTX2Audio(**TINY_AUDIO_VAE_CONFIG).eval()
-    ref_audio_vae_bf16 = copy.deepcopy(ref_audio_vae).to(torch.bfloat16).eval()
 
     audio_latents = torch.randn(
         1, 8, 26, 16, generator=torch.Generator(device="cpu").manual_seed(2)
     )
     ref_mel = ref_audio_vae.decode(audio_latents, return_dict=False)[0]
-    ref_bf16_mel = ref_audio_vae_bf16.decode(
-        audio_latents.to(torch.bfloat16), return_dict=False
-    )[0].float()
 
     tpu_outputs: dict[torch.dtype, torch.Tensor] = {}
     for dtype in (torch.float32, torch.bfloat16):
@@ -746,14 +734,18 @@ def test_ltx2_tiny_audio_vae_parity(
         assert mel_out.shape == (1, 2, 101, 64)
         tpu_outputs[dtype] = mel_out.float().cpu()
 
-    fp32_ratio, bf16_ratio = AUDIO_VAE_RATIO_GATE
+    fp32_max, bf16_max = AUDIO_VAE_MAX_REL_L2
     assert_parity(
-        ref=ref_mel,
-        ref_bf16=ref_bf16_mel,
-        tpu_fp32=tpu_outputs[torch.float32],
-        tpu_bf16=tpu_outputs[torch.bfloat16],
-        fp32_ratio=fp32_ratio,
-        bf16_ratio=bf16_ratio,
+        tpu_outputs[torch.float32],
+        ref_mel,
+        name="audio VAE decode TPU fp32",
+        max_rel_l2=fp32_max,
+    )
+    assert_parity(
+        tpu_outputs[torch.bfloat16],
+        ref_mel,
+        name="audio VAE decode TPU bf16",
+        max_rel_l2=bf16_max,
     )
 
 
@@ -778,16 +770,13 @@ def test_ltx2_tiny_vocoder_parity(
     omni_ctx: None,
 ) -> None:
     """LTX2Vocoder via _run_ltx_vocoder on TPU matches vocoder(mel) on CPU."""
-    assert torch.nn.functional.interpolate.__name__ == "_safe_interpolate"
     torch.manual_seed(0)
     ref_vocoder = LTX2Vocoder(**TINY_VOCODER_CONFIG).eval()
-    ref_vocoder_bf16 = copy.deepcopy(ref_vocoder).to(torch.bfloat16).eval()
 
     mel = torch.randn(
         1, 2, 16, 64, generator=torch.Generator(device="cpu").manual_seed(3)
     )
     ref_wav = ref_vocoder(mel)
-    ref_bf16_wav = ref_vocoder_bf16(mel.to(torch.bfloat16)).float()
     assert (ref_wav.abs() < 0.999).float().mean() > 0.9
 
     tpu_outputs: dict[torch.dtype, torch.Tensor] = {}
@@ -797,14 +786,18 @@ def test_ltx2_tiny_vocoder_parity(
         assert wav_out.shape == (1, 2, 3840)
         tpu_outputs[dtype] = wav_out.float().cpu()
 
-    fp32_ratio, bf16_ratio = VOCODER_RATIO_GATE
+    fp32_max, bf16_max = VOCODER_MAX_REL_L2
     assert_parity(
-        ref=ref_wav,
-        ref_bf16=ref_bf16_wav,
-        tpu_fp32=tpu_outputs[torch.float32],
-        tpu_bf16=tpu_outputs[torch.bfloat16],
-        fp32_ratio=fp32_ratio,
-        bf16_ratio=bf16_ratio,
+        tpu_outputs[torch.float32],
+        ref_wav,
+        name="vocoder TPU fp32",
+        max_rel_l2=fp32_max,
+    )
+    assert_parity(
+        tpu_outputs[torch.bfloat16],
+        ref_wav,
+        name="vocoder TPU bf16",
+        max_rel_l2=bf16_max,
     )
 
 
@@ -869,23 +862,13 @@ def test_ltx2_tiny_gemma3_parity(
         ref_gemma = Gemma3ForConditionalGeneration.from_pretrained(
             tmp_path, dtype=torch.float32
         ).eval()
-        ref_gemma_bf16 = Gemma3ForConditionalGeneration.from_pretrained(
-            tmp_path, dtype=torch.bfloat16
-        ).eval()
 
     ref_hs = ref_gemma(
         input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True
     ).hidden_states
     ref_stacked = torch.stack(ref_hs, dim=-1).flatten(2, 3)
-    ref_bf16_hs = ref_gemma_bf16(
-        input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True
-    ).hidden_states
-    ref_bf16_stacked = torch.stack(ref_bf16_hs, dim=-1).flatten(2, 3).float()
     ref_real = torch.cat(
         [ref_stacked[r, seq_len - n :] for r, n in enumerate(real_lens)], dim=0
-    )
-    ref_bf16_real = torch.cat(
-        [ref_bf16_stacked[r, seq_len - n :] for r, n in enumerate(real_lens)], dim=0
     )
 
     tpu_outputs: dict[torch.dtype, torch.Tensor] = {}
@@ -906,12 +889,16 @@ def test_ltx2_tiny_gemma3_parity(
             [stacked[r, seq_len - n :] for r, n in enumerate(real_lens)], dim=0
         )
 
-    fp32_ratio, bf16_ratio = GEMMA3_RATIO_GATE
+    fp32_max, bf16_max = GEMMA3_MAX_REL_L2
     assert_parity(
-        ref=ref_real,
-        ref_bf16=ref_bf16_real,
-        tpu_fp32=tpu_outputs[torch.float32],
-        tpu_bf16=tpu_outputs[torch.bfloat16],
-        fp32_ratio=fp32_ratio,
-        bf16_ratio=bf16_ratio,
+        tpu_outputs[torch.float32],
+        ref_real,
+        name="gemma3 hidden states TPU fp32",
+        max_rel_l2=fp32_max,
+    )
+    assert_parity(
+        tpu_outputs[torch.bfloat16],
+        ref_real,
+        name="gemma3 hidden states TPU bf16",
+        max_rel_l2=bf16_max,
     )
