@@ -88,7 +88,7 @@ def test_long_decode_matches_reference(benchmark):
 
 
 @pytest.mark.parametrize("heads", [8, 64])
-def test_decoder_prefill_reuses_decode_with_fp32_scales(benchmark, heads):
+def test_tiled_decode_matches_prefill(benchmark, heads):
     if jax.default_backend() != "tpu":
         pytest.skip("Async MXU operations require TPU")
     from vllm_torchtpu.kernels.deepseek_v41.csa2.prefill import csa2_prefill
@@ -108,5 +108,5 @@ def test_decoder_prefill_reuses_decode_with_fp32_scales(benchmark, heads):
         swa_metadata=inputs["swa_page"],
         main_lengths=inputs["main_lengths"],
     )
-    actual = csa2_decode(**inputs, num_tokens=128, decoder_prefill=True)
+    actual = csa2_decode(**inputs, num_tokens=128)
     np.testing.assert_allclose(actual, expected, atol=3e-3, rtol=3e-2)

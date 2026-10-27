@@ -95,8 +95,6 @@ def csa2_attention(
         num_tokens=num_tokens,
         scale=scale,
     )
-    if decoder and num_tokens != 6:
-        decode_kwargs["decoder_prefill"] = True
     return jax.lax.cond(
         regular,
         lambda: csa2_decode(

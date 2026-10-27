@@ -217,9 +217,7 @@ def main():
             ("prefill", lambda data: prefill_call(prefill, data, args.num_tokens)),
             (
                 "tile8",
-                lambda data: decode(
-                    **data, num_tokens=args.num_tokens, decoder_prefill=True
-                ),
+                lambda data: decode(**data, num_tokens=args.num_tokens),
             ),
         )
         compiled_variants = []

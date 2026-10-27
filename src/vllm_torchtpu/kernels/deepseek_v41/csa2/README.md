@@ -21,8 +21,7 @@ model configuration and passes `_ced_decoder` as `decoder`; it never infers the
 stage from causal or noncausal visibility.
 
 Decoder-layer prefill reuses the decode pipeline for consecutive, equal-length
-requests whose query count is divisible by eight. `decoder_prefill=True` retains
-the prefill path's FP32 KV scales; ordinary decode keeps BF16-effective scales.
+requests whose query count is divisible by eight. Both use FP32 KV scales.
 Six-Q dispatch is unchanged. Ragged requests, padding, split SWA banks, and
 explicit noncausal bounds retain the general prefill path. Both gather and KV
 reuse propagate the same model-stage flag and authoritative main counts.

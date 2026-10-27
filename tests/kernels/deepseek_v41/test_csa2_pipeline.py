@@ -365,7 +365,6 @@ def test_decoder_layer_prefill_dispatch(
 ):
     def decoded(q, words, scales, swa, positions, sink, rope, **kwargs):
         assert kwargs["num_tokens"] == 16
-        assert kwargs["decoder_prefill"] is True
         return jnp.broadcast_to(
             (jnp.repeat(positions, 16) + kwargs["main_lengths"])[:, None, None],
             q.shape,
