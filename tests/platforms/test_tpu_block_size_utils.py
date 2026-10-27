@@ -111,7 +111,8 @@ class FakeConfiguredGdnModel:
 class FakeCompactMambaModel:
     @staticmethod
     def get_mamba_state_shape_from_config(_):
-        # 1 physical conv row followed by 256 physical SSM rows.
+        # 2 physical conv rows (fp32 in the pool) followed by 256 physical SSM
+        # rows.
         return ((1, 512), (2, 128, 256))
 
     @staticmethod
@@ -284,12 +285,13 @@ def test_kimi_linear_padded_ssm_fit(vllm_config):
 
     _update(vllm_config, backend_cls=FakeKimiMLABackend, model_cls=FakeKimiLinearModel)
 
-    # State regions: ceil(262144 / 2560) = 103 pool rows + pow2(ceil(9216 /
-    # 2560)) = 4 -> 107 packed rows = 214 tokens at packing 2. The fit floor
-    # 214 beats the backend minimum of 64 and the input block size of 16.
-    assert vllm_config.cache_config.block_size == 214
-    assert vllm_config.cache_config.mamba_block_size == 214
-    assert vllm_config.cache_config.mamba_page_size_padded == 107 * 2560
+    # State regions: ceil(262144 / 2560) = 103 pool rows (1536 B of padding
+    # in the last row) + fp32 conv pow2(ceil(18432 / 2560)) = 8 -> 111 packed
+    # rows = 222 tokens at packing 2. The fit floor 222 beats the backend
+    # minimum of 64 and the input block size of 16.
+    assert vllm_config.cache_config.block_size == 222
+    assert vllm_config.cache_config.mamba_block_size == 222
+    assert vllm_config.cache_config.mamba_page_size_padded == 111 * 2560
 
 
 def test_tp_sharding_changes_the_physical_gdn_fit(vllm_config):
@@ -313,8 +315,8 @@ def test_fit_has_no_fixed_16_token_alignment(vllm_config):
         model_cls=FakeCompactMambaModel,
     )
 
-    assert vllm_config.cache_config.block_size == 257
-    assert vllm_config.cache_config.mamba_page_size_padded == 257 * 1024
+    assert vllm_config.cache_config.block_size == 258
+    assert vllm_config.cache_config.mamba_page_size_padded == 258 * 1024
 
 
 def test_user_block_size_below_fit_is_promoted(vllm_config):
@@ -388,7 +390,7 @@ def test_pcp_kimi_pool_keeps_model_state_geometry(vllm_config, architecture):
     ):
         layout = _hybrid_mamba_state_layout(vllm_config, 1024)
     assert layout.ssm_bytes == 4 * 128 * 128 * 4
-    assert layout.conv_bytes == 3 * 3 * 4 * 128 * 2
+    assert layout.conv_bytes == 3 * 3 * 4 * 128 * 4
     assert vllm_config.parallel_config.tensor_parallel_size == 2
 
 
@@ -410,10 +412,10 @@ def test_pcp_gdn_pool_sizes_replicated_kq_state(vllm_config):
     )
 
     # Local SSM: 4*128*128*4 = 256 KiB (256 rows). Local Conv:
-    # 3*(1Q+1K+4V)*128*2 = 4608 B, rounded to 8 physical rows.
-    assert vllm_config.cache_config.block_size == 264
-    assert vllm_config.cache_config.mamba_block_size == 264
-    assert vllm_config.cache_config.mamba_page_size_padded == 264 * 1024
+    # 3*(1Q+1K+4V)*128*4 = 9216 B, rounded to 16 physical rows.
+    assert vllm_config.cache_config.block_size == 272
+    assert vllm_config.cache_config.mamba_block_size == 272
+    assert vllm_config.cache_config.mamba_page_size_padded == 272 * 1024
 
 
 def test_backend_minimum_is_part_of_the_block_floor(vllm_config):

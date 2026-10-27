@@ -37,6 +37,7 @@ from .pool_manifest import (
     TAG_MLA_NOPE,
     TAG_MLA_ROPE,
     PoolManifest,
+    gdn_state_unit_bytes,
 )
 from .tags import class_tag
 
@@ -179,7 +180,7 @@ def measured_fa_layout_fingerprint(
         )
 
     version = package_version or importlib.metadata.version
-    payload = {
+    payload: dict[str, Any] = {
         "schema": FA_LAYOUT_FINGERPRINT_SCHEMA,
         "torch_tpu": version("torch_tpu"),
         "libtpu": version("libtpu"),
@@ -188,15 +189,20 @@ def measured_fa_layout_fingerprint(
         "element_size_in_bits": element_bits,
         "kv_layout": kv_layout,
         # GDN conv state layout version.  Both sides of a disagg pair must
-        # agree: the byte-span convention (pair-blocked whole-token QK
-        # spans vs the legacy split Q/K) is baked into the transfer plan,
-        # and the geometries are size-identical, so a mixed pair would not
-        # otherwise fail closed.  The controller compares fingerprints
-        # before emitting a plan.
+        # agree: the byte-span convention (segment-major Q/K, or the QK
+        # pair-blocked spans an older build may still emit) is baked into
+        # the transfer plan, and the geometries are size-identical, so a
+        # mixed pair would not otherwise fail closed.  The controller
+        # compares fingerprints before emitting a plan.
         "gdn_conv_layout": (
             "qk-pair-v1" if tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT else "legacy-split-qk"
         ),
     }
+    # The conv and SSM state dtypes are not visible in the layout version or
+    # the FA geometry, so a peer on another state dtype would otherwise pair.
+    unit_bytes = gdn_state_unit_bytes(manifest)
+    if unit_bytes:
+        payload["gdn_state_unit_bytes"] = unit_bytes
     return canonical_layout_fingerprint(payload), payload
 
 
@@ -270,7 +276,7 @@ def measured_kimi_k3_layout_fingerprint(
     if set(state_layouts) != {TAG_GDN_CONV, TAG_GDN_SSM}:
         raise ValueError("Kimi layout requires gdn.conv and gdn.ssm pools")
     payload["gdn_state_layouts"] = state_layouts
-    payload["gdn_conv_layout"] = "kda-rank-blocked-tap-qkv-head-dim-bf16-v1"
+    payload["gdn_conv_layout"] = "kda-rank-blocked-tap-qkv-head-dim-fp32-v1"
     payload["state_fragment_heads"] = int(state_fragment_heads)
     return canonical_layout_fingerprint(payload), payload
 

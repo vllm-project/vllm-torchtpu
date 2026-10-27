@@ -107,6 +107,10 @@ steps:
           test-cmd: "pytest -sv --timeout=600 -m 'not tpu_test and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
   - group: "Unit Tests on TPU"
+    # Set by bootstrap.sh for skip-tpu-ci and filled in when this file is
+    # uploaded; build.env() would not see it, since it reads only the
+    # environment the build was created with.
+    if: '"${SKIP_TPU_CI:-0}" != "1"'
     steps:
       # test_speculative_decoding.py gets steps of its own so it runs on its
       # own chips rather than serializing behind everything else; the general

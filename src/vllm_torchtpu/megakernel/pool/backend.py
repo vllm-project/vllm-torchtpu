@@ -200,7 +200,7 @@ def kernel_debug_check(cond: Any, msg: str, *, interpret: bool) -> None:
         jax.debug.callback(_cb, cond)
 
 
-# `ex -> (chunk rows, state ring depth)` of the recurrent block's chunked path.
+# `ex -> (chunk rows, state ring depth)` of the recurrent module's chunked path.
 RecChunk = Callable[[ExecSpec], tuple[int, int]]
 
 
@@ -257,11 +257,12 @@ def make_pool_backend(
     elif supports_pool_gather and rec_chunk is None:
         raise MegakernelConfigError(
             "make_pool_backend(supports_pool_gather=True) needs rec_chunk (the "
-            "recurrent block's chunking, e.g. GDNBlock.chunk_rows): without it "
+            "recurrent module's chunking, e.g. GDNModule.chunk_rows): without it "
             "in-kernel gather is never eligible"
         )
     # Local imports: the kernels import the shared checks from this module.
     from .gather import gather_gdn_states
+    from .scatter import scatter_pool_states
 
     has_rec = layout.has_recurrent
 
@@ -288,9 +289,33 @@ def make_pool_backend(
         )
         return {"conv": conv, "rec": rec}
 
-    def _scatter(*_args: Any, **_kwargs: Any) -> Any:
-        raise NotImplementedError(
-            "TODO: state scatter is not yet wired in make_pool_backend"
+    def _scatter(
+        ex_paged: ExecSpec,
+        raw_pools: tuple[jax.Array, ...],
+        pos: jax.Array,
+        page_table: jax.Array,
+        out_map: dict[str, Any],
+        ckpt_indices: jax.Array | None,
+        active_seqs: Any,
+    ) -> tuple[jax.Array, ...]:
+        if check is not None:
+            check(ex_paged)
+        conv_out = out_map.get("conv_ckpt" if ex_paged.VER else "conv")
+        rec_out = out_map.get("rec_ckpt" if ex_paged.VER else "rec")
+        return scatter_pool_states(
+            layout,
+            ex_paged,
+            raw_pools,
+            pos,
+            page_table,
+            out_map["knew"],
+            out_map["vnew"],
+            conv_out if has_rec else None,
+            rec_out if has_rec else None,
+            ckpt_indices if has_rec else None,
+            active_seqs,
+            interpret=ex_paged.interpret,
+            conv_partial=cache_exec(ex_paged).GPR,
         )
 
     def _can_pool_gather(ex_paged: ExecSpec) -> bool:

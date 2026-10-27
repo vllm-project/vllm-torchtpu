@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 
@@ -223,3 +223,35 @@ def infer_weight_sharding(
         return [None, None, None, None]
 
     return [None] * rank
+
+
+# Embedding names a tied LM head shares, most specific first.
+_EMBEDDING_NAMES = (
+    "model.embed_tokens.weight",
+    "embed_tokens.weight",
+    "transformer.wte.weight",
+)
+
+
+def tied_lm_head_alias(names: Iterable[str]) -> tuple[str, str] | None:
+    """`(lm_head name, embedding name)` when the LM head is tied to the embedding.
+
+    None for an untied head. A tied head has no parameter of its own, so no
+    `lm_head.weight` is among `names`; it then projects with the language model's
+    embedding. A multimodal model nests the language model, so
+    `language_model.model.embed_tokens.weight` gives `language_model.lm_head.weight`.
+    """
+    names = list(names)
+    if any(n == "lm_head.weight" or n.endswith(".lm_head.weight") for n in names):
+        return None
+    found = []
+    for n in names:
+        for rank, emb in enumerate(_EMBEDDING_NAMES):
+            if n == emb or n.endswith("." + emb):
+                found.append(
+                    (rank, len(n), f"{n[: len(n) - len(emb)]}lm_head.weight", n)
+                )
+                break
+    # The language model's embedding: the most specific name (`model.embed_tokens`,
+    # not an MTP head's `mtp.embed_tokens`), then the outermost.
+    return min(found)[2:] if found else None

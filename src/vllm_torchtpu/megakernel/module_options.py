@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Per-block tunables and debug-options registries and immutable option maps."""
+"""Per-module tunables and debug-options registries and immutable option maps."""
 
 from __future__ import annotations
 
@@ -21,14 +21,14 @@ from typing import Any, Literal
 
 NumericsClass = Literal["exact", "approx"]
 
-# Block name -> its `Tunables` class (registered via `register_tunables`).
+# Module name -> its `Tunables` class (registered via `register_tunables`).
 _TUNABLES: dict[str, type] = {}
-# Block name -> its `Debug` class (registered via `register_debug`).
+# Module name -> its `Debug` class (registered via `register_debug`).
 _DEBUG: dict[str, type] = {}
 
 
 def register_tunables(name: str, cls: type) -> None:
-    """Register `cls` as the `Tunables` of blocks named `name`.
+    """Register `cls` as the `Tunables` of modules named `name`.
 
     `cls` must be a frozen dataclass whose `NUMERICS` class attribute maps
     every field to `"exact"` or `"approx"`. Re-registering the same class is a
@@ -50,29 +50,29 @@ def register_tunables(name: str, cls: type) -> None:
     prev = _TUNABLES.get(name)
     if prev is not None and prev is not cls:
         raise ValueError(
-            f"block {name!r} already registered tunables {prev.__name__}, "
+            f"module {name!r} already registered tunables {prev.__name__}, "
             f"not {cls.__name__}"
         )
     _TUNABLES[name] = cls
 
 
 def tunables_class(name: str) -> type:
-    """The registered `Tunables` class of blocks named `name`."""
+    """The registered `Tunables` class of modules named `name`."""
     try:
         return _TUNABLES[name]
     except KeyError:
         raise KeyError(
-            f"no tunables registered for block {name!r}; known: {sorted(_TUNABLES)}"
+            f"no tunables registered for module {name!r}; known: {sorted(_TUNABLES)}"
         ) from None
 
 
 def registered_tunables() -> dict[str, type]:
-    """All registered `{block name: Tunables class}` (a copy)."""
+    """All registered `{module name: Tunables class}` (a copy)."""
     return dict(_TUNABLES)
 
 
 def register_debug(name: str, cls: type) -> None:
-    """Register `cls` as the `Debug` options class of blocks named `name`.
+    """Register `cls` as the `Debug` options class of modules named `name`.
 
     `cls` must be a frozen dataclass. Re-registering the same class is a no-op;
     a different class for a registered name is an error.
@@ -82,37 +82,37 @@ def register_debug(name: str, cls: type) -> None:
     prev = _DEBUG.get(name)
     if prev is not None and prev is not cls:
         raise ValueError(
-            f"block {name!r} already registered Debug class {prev.__name__}, "
+            f"module {name!r} already registered Debug class {prev.__name__}, "
             f"not {cls.__name__}"
         )
     _DEBUG[name] = cls
 
 
 def debug_class(name: str) -> type:
-    """The registered `Debug` class of blocks named `name`."""
+    """The registered `Debug` class of modules named `name`."""
     try:
         return _DEBUG[name]
     except KeyError:
         raise KeyError(
-            f"no Debug class registered for block {name!r}; known: {sorted(_DEBUG)}"
+            f"no Debug class registered for module {name!r}; known: {sorted(_DEBUG)}"
         ) from None
 
 
 def registered_debug() -> dict[str, type]:
-    """All registered `{block name: Debug class}` (a copy)."""
+    """All registered `{module name: Debug class}` (a copy)."""
     return dict(_DEBUG)
 
 
-class BlockOptionsMap(Mapping[str, Any]):
-    """Immutable, hashable `{block name: frozen dataclass}` mapping.
+class ModuleOptionsMap(Mapping[str, Any]):
+    """Immutable, hashable `{module name: frozen dataclass}` mapping.
 
     Entries equal to their class defaults are dropped, so maps that leave a
-    block at its defaults compare equal however they were built.
+    module at its defaults compare equal however they were built.
     """
 
     __slots__ = ("_map",)
     # Owner and fix hint shown in error messages.
-    _WHAT = "DebugOptions.blocks"
+    _WHAT = "DebugOptions.modules"
     _HINT = ""
 
     def __init__(self, items: Mapping[str, Any] | None = None) -> None:
@@ -153,7 +153,7 @@ class BlockOptionsMap(Mapping[str, Any]):
         return hash(tuple(self._map.items()))
 
     def __eq__(self, other: object) -> bool:
-        if isinstance(other, BlockOptionsMap):
+        if isinstance(other, ModuleOptionsMap):
             return self._map == other._map
         return isinstance(other, Mapping) and self._map == dict(other)
 
@@ -161,44 +161,44 @@ class BlockOptionsMap(Mapping[str, Any]):
         return f"{type(self).__name__}({self._map!r})"
 
 
-class TunablesMap(BlockOptionsMap):
-    """`{block name: Tunables}` (`Tiles.blocks`): a `BlockOptionsMap` whose
-    entries must be instances of the block's registered `Tunables` class."""
+class TunablesMap(ModuleOptionsMap):
+    """`{module name: Tunables}` (`Tiles.modules`): a `ModuleOptionsMap` whose
+    entries must be instances of the module's registered `Tunables` class."""
 
     __slots__ = ()
-    _WHAT = "Tiles.blocks"
-    _HINT = " (use Tiles.with_blocks for field dicts)"
+    _WHAT = "Tiles.modules"
+    _HINT = " (use Tiles.with_modules for field dicts)"
 
     def _check(self, name: str, val: Any) -> None:
-        # An unregistered (e.g. misspelled) block name raises `KeyError`.
+        # An unregistered (e.g. misspelled) module name raises `KeyError`.
         cls = tunables_class(name)
         if not isinstance(val, cls):
             raise TypeError(
-                f"Tiles.blocks[{name!r}] must be a {cls.__name__}, got "
+                f"Tiles.modules[{name!r}] must be a {cls.__name__}, got "
                 f"{type(val).__name__}{self._HINT}"
             )
 
 
-class DebugBlocksMap(BlockOptionsMap):
-    """`{block name: Debug}` (`DebugOptions.blocks`): a `BlockOptionsMap` whose
-    entries must name a block with a registered `Debug` class and be an
+class DebugModulesMap(ModuleOptionsMap):
+    """`{module name: Debug}` (`DebugOptions.modules`): a `ModuleOptionsMap` whose
+    entries must name a module with a registered `Debug` class and be an
     instance of that class."""
 
     __slots__ = ()
-    _WHAT = "DebugOptions.blocks"
+    _WHAT = "DebugOptions.modules"
 
     def _check(self, name: str, val: Any) -> None:
         cls = debug_class(name)
         if not isinstance(val, cls):
             raise TypeError(
-                f"DebugOptions.blocks[{name!r}] must be a {cls.__name__}, got "
+                f"DebugOptions.modules[{name!r}] must be a {cls.__name__}, got "
                 f"{type(val).__name__}"
             )
 
 
 __all__ = [
-    "BlockOptionsMap",
-    "DebugBlocksMap",
+    "DebugModulesMap",
+    "ModuleOptionsMap",
     "NumericsClass",
     "TunablesMap",
     "debug_class",

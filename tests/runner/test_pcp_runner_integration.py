@@ -19,7 +19,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import torch
-from runner_input_test_utils import _make_runner, _scheduler_output
+from runner_input_test_utils import _fake_tpu_events, _make_runner, _scheduler_output
 
 from vllm_torchtpu.layers.core.sequence_layout import (
     SequenceLayoutKind,
@@ -160,6 +160,8 @@ def test_prepare_inputs_routes_reordered_verify_per_chunk(bucket, chunk_size, hy
 
 
 def _run_dummy_run(monkeypatch, runner, *, num_tokens=256):
+    _fake_tpu_events(monkeypatch)
+
     def capture_forward_context(attn_metadata, *_args, **_kwargs):
         runner._captured_dummy_attn_metadata = attn_metadata
         return contextlib.nullcontext()
