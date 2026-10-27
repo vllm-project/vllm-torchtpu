@@ -15,7 +15,7 @@
 
 from jax.experimental.pallas import tpu as pltpu
 
-# (chip version, local rows, experts, topk). Two-table sqrtsoftplus, BF16 logits;
+# (chip version, local rows, experts, topk). Two-table sqrtsoftplus, FP32 scoring;
 # JAX 0.11.2 / libtpu 0.0.50. Packed normalization: 1.440576 us selector,
 # 7.978391 us isolated router (synthetic input; no model-level latency claim).
 NORMALIZED_ROUTER_BLOCK_ROWS: dict[tuple[pltpu.ChipVersion, int, int, int], int] = {
