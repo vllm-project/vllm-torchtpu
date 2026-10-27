@@ -35,8 +35,18 @@ def build_query_tiles(
     return jnp.stack((requests, offsets, lengths), axis=1), ends[-1]
 
 
+def _tile_field(tiles, tile, column):
+    if len(tiles.shape) == 1:
+        return tiles[tile * 3 + column]
+    return tiles[tile, column]
+
+
 def swa_window(tile, tiles, positions, pages, bounds, *, page_size, non_causal):
-    request, start, count = tiles[tile, 0], tiles[tile, 1], tiles[tile, 2]
+    request, start, count = (
+        _tile_field(tiles, tile, 0),
+        _tile_field(tiles, tile, 1),
+        _tile_field(tiles, tile, 2),
+    )
     active = request < pages.shape[0]
     request = jnp.minimum(request, pages.shape[0] - 1)
     position = positions[start]
@@ -66,8 +76,10 @@ def _prepare_swa(
     num_pages = 256 // page_size
     request, active, left, right, anchor = 0, True, 0, 256, 0
     if not dummy_metadata:
-        request = jnp.minimum(tiles_ref[tile, 0], swa_page_ref.shape[0] - 1)
-        active = tiles_ref[tile, 0] < swa_page_ref.shape[0]
+        request = jnp.minimum(
+            _tile_field(tiles_ref, tile, 0), swa_page_ref.shape[0] - 1
+        )
+        active = _tile_field(tiles_ref, tile, 0) < swa_page_ref.shape[0]
         _, left, right, anchor = swa_window(
             tile,
             tiles_ref,
@@ -166,7 +178,7 @@ def _prefill_kernel(
         position_start, left, right, anchor = 0, 0, 256, 0
         active, request = True, 0
     else:
-        request, t0 = tiles_ref[tile, 0], tiles_ref[tile, 1]
+        request, t0 = _tile_field(tiles_ref, tile, 0), _tile_field(tiles_ref, tile, 1)
         position_start, left, right, anchor = swa_window(
             tile,
             tiles_ref,
@@ -178,7 +190,7 @@ def _prefill_kernel(
         )
         read_start = jnp.minimum(t0, positions_ref.shape[0] - bq)
         row_offset = t0 - read_start
-        valid_count = tiles_ref[tile, 2]
+        valid_count = _tile_field(tiles_ref, tile, 2)
         position_start -= row_offset
         t0 = read_start
         active = request < swa_page_ref.shape[0]
@@ -443,14 +455,14 @@ def _prefill_kernel(
                 continue
             if previous:
                 last_tile = previous_tile
-                last_start = tiles_ref[last_tile, 1]
+                last_start = _tile_field(tiles_ref, last_tile, 1)
                 last_offset = last_start - jnp.minimum(
                     last_start, positions_ref.shape[0] - bq
                 )
                 valid = (
-                    (tiles_ref[last_tile, 0] < swa_page_ref.shape[0])
+                    (_tile_field(tiles_ref, last_tile, 0) < swa_page_ref.shape[0])
                     & (i >= last_offset)
-                    & (i < last_offset + tiles_ref[last_tile, 2])
+                    & (i < last_offset + _tile_field(tiles_ref, last_tile, 2))
                 )
             else:
                 valid = active & (i >= row_offset) & (i < row_offset + valid_count)
@@ -636,10 +648,22 @@ def csa2_prefill(
         if bq == 1:
             num_tiles = tokens
     bounds = swa_bounds if non_causal else jnp.zeros((batch, 2), jnp.int32)
+    info = pltpu.get_tpu_info()
+    # SMEM pads each short matrix row to a full lane row. Leave three
+    # quarters for positions, counts, page tables and compiler temporaries.
+    tile_bytes = (
+        pl.cdiv(tiles.shape[0], info.num_sublanes)
+        * info.num_sublanes
+        * info.num_lanes
+        * jnp.dtype(jnp.int32).itemsize
+    )
+    tile_metadata = (
+        tiles.reshape(-1) if tile_bytes > info.smem_capacity_bytes // 4 else tiles
+    )
     scalars = (
         (None,) * 5
         if dummy_metadata
-        else (tiles, positions, main_lengths, swa_metadata, bounds)
+        else (tile_metadata, positions, main_lengths, swa_metadata, bounds)
     )
     # Reserve three quarters of VMEM for four Q/KV buffers, decoded KV,
     # probabilities and compiler temporaries. Large batches stream metadata.
@@ -715,7 +739,7 @@ def csa2_prefill(
             start = (
                 tile * bq
                 if dummy_metadata
-                else jnp.minimum(tiles_ref[tile, 1], tokens - bq)
+                else jnp.minimum(_tile_field(tiles_ref, tile, 1), tokens - bq)
             )
             return pl.ds(start, bq)
 
@@ -742,7 +766,7 @@ def csa2_prefill(
                 )
             request, left, right, anchor = 0, 0, 256, 0
             if not dummy_metadata:
-                request = jnp.minimum(tiles_ref[tile, 0], batch - 1)
+                request = jnp.minimum(_tile_field(tiles_ref, tile, 0), batch - 1)
                 _, left, right, anchor = swa_window(
                     tile,
                     tiles_ref,
@@ -806,7 +830,7 @@ def csa2_prefill(
             if len(banks) == 1:
                 values = swa_buf[bank].reshape(256, 512)
                 if not dummy_metadata:
-                    active = tiles_ref[tile, 0] < batch
+                    active = _tile_field(tiles_ref, tile, 0) < batch
                     _, left, right, anchor = swa_window(
                         tile,
                         tiles_ref,

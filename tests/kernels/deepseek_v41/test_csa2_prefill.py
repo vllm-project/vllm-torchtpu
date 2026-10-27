@@ -282,7 +282,8 @@ def test_prefill_carry_pipeline_short_batches(tokens):
     np.testing.assert_allclose(actual, expected, atol=3e-3, rtol=3e-2)
 
 
-def test_prefill_streams_metadata_larger_than_vmem():
+@pytest.mark.parametrize("ragged", [False, True])
+def test_prefill_streams_metadata_larger_than_vmem(ragged):
     if jax.default_backend() != "tpu":
         pytest.skip("VMEM residency and async DMA require TPU")
     # Scales + RoPE alone exceed the entire core VMEM. Keeping them resident
@@ -297,12 +298,14 @@ def test_prefill_streams_metadata_larger_than_vmem():
         (jnp.zeros((1, 2), jnp.int32), jnp.ones((1, (tokens + 256) // 64), jnp.int32)),
         1,
     )
+    starts = jnp.array([0, 9, tokens - 5] if ragged else [0, tokens], jnp.int32)
+    metadata = jnp.repeat(metadata, starts.shape[0] - 1, axis=0)
     output = csa2_prefill(
         q,
         jnp.zeros((tokens, 512, 128), jnp.int32),
         jnp.ones((tokens, 512), jnp.float32),
         swa,
-        jnp.array([0, tokens], jnp.int32),
+        starts,
         jnp.arange(127, 127 + tokens, dtype=jnp.int32),
         jnp.zeros(8, jnp.float32),
         jnp.broadcast_to(jnp.array([1.0, 0.0])[None, :, None], (tokens, 2, 128)),
@@ -310,4 +313,7 @@ def test_prefill_streams_metadata_larger_than_vmem():
         main_lengths=jnp.zeros(tokens, jnp.int32),
         bq=8,
     )
+    if ragged:
+        np.testing.assert_array_equal(output[-5:], 0)
+        output = output[:-5]
     np.testing.assert_allclose(output, 128 / 129, atol=3e-3, rtol=3e-2)
