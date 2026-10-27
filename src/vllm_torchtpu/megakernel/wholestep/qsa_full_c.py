@@ -46,7 +46,7 @@ from ..spec import ExtraInput, ScratchReq, SmallField, StateDecl
 from . import indexer as ix
 from . import union_attn as ua
 from .qsa_full import OFFSET, POOL, ROPE, SCALES
-from .qsa_full_b import CK, IDX_N, IDX_W, NVIS, TAIL, QSAFullIndexedBlock
+from .qsa_full_b import CK, IDX_N, IDX_W, MTAB, NVIS, TAIL, QSAFullIndexedBlock
 
 CTXQ = "qsa_ctx"  # [requests] tokens before this step
 RING = "qsa_ring"  # [requests, 8, 128] raw index-key ring (lane = position % 8)
@@ -154,6 +154,11 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             ScratchReq("qu_sem", pltpu.SemaphoreType.DMA((3,))),
             ScratchReq("qu_st", pltpu.VMEM((1, 128), I32)),
         ]
+        if self.union_phys:
+            out += [
+                ScratchReq("qu_tab", pltpu.VMEM((1, self.pps), I32)),
+                ScratchReq("qu_pv", pltpu.VMEM((1, KU), I32)),
+            ]
         if self.shard_index:
             npr, n = self._shard_rows(ex)[0], max(ex.R - 1, 1)
             out += [
@@ -560,9 +565,31 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         scol = jax.lax.broadcasted_iota(I32, (8, 1), 0)
 
         def req(q: Any, outs: Any) -> Any:
+            src = scr["qu_id"].at[q]
+            if self.union_phys:
+                # The request's main-table row, then its union ids -> physical micro-page ids for
+                # every slot a tile reads (< ceil(n / 64) * 64 <= ceil(n / 128) * 128).
+                o = ctx.stream.sp.block_ord(l, self.name) if self.n_layers else 0
+                cp = pltpu.make_async_copy(
+                    ctx.extra[MTAB].at[o, pl.ds(q, 1)], scr["qu_tab"], scr["qu_sem"].at[2]
+                )
+                cp.start()
+                cp.wait()
+                per_page = ctx.extra[POOL].shape[1] // ua.MICRO
+                tab = scr["qu_tab"][...]
+
+                def chunk(c: Any, carry: Any) -> Any:
+                    lo = pl.multiple_of(c * 128, 128)
+                    scr["qu_pv"][:, pl.ds(lo, 128)] = ua.physical_ids(
+                        src[:, pl.ds(lo, 128)], tab, per_page
+                    )
+                    return carry
+
+                jax.lax.fori_loop(0, (scr["qu_n"][q] + 127) // 128, chunk, 0)
+                src = scr["qu_pv"]
             cs = [
                 pltpu.make_async_copy(
-                    scr["qu_id"].at[q], scr["qu_row"].at[pl.ds(0, 1), pl.ds(0, KU)],
+                    src, scr["qu_row"].at[pl.ds(0, 1), pl.ds(0, KU)],
                     scr["qu_sem"].at[0],
                 ),
                 pltpu.make_async_copy(
@@ -587,7 +614,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 has=[scr["qi_kvl"][r] > 0 for r in rs],
                 off=self.offset(ctx, l), scale_k=ctx.extra[SCALES][0],
                 scale_v=ctx.extra[SCALES][1], sm_scale=g.HD**-0.5, interpret=ex.interpret,
-                recent=(scr["qc_rk"][q], scr["qc_rv"][q], ok, ok_any),
+                recent=(scr["qc_rk"][q], scr["qc_rv"][q], ok, ok_any), phys=self.union_phys,
             )
             if self.union_stats:
                 assert nreq <= UNION_STATS_REQS, (nreq, UNION_STATS_REQS)

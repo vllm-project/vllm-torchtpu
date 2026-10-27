@@ -58,6 +58,9 @@ UNION_ATTN = False
 UNION_STATS_EVERY = 0
 # `...,wholeloop=1`: a QSA layer's per-request work in a fori_loop (compile size flat in B).
 LOOP_REQUESTS = False
+# `...,wholephys=1` (with `wholeunion=1`): union ids -> physical micro-page ids in one vector pass
+# per request, so each attention copy issues from one SMEM load (same addresses; RPAd's recipe).
+UNION_PHYS = False
 
 
 def union_stats_on() -> bool:
@@ -68,7 +71,7 @@ def indexed_options() -> dict:
     """The served indexer options (`LONG_CONTEXT`, the request-sharded selection, union attention)."""
     return dict(
         LONG_CONTEXT, shard_index=SHARD_INDEX, union_attn=UNION_ATTN, union_stats=union_stats_on(),
-        loop_requests=LOOP_REQUESTS,
+        loop_requests=LOOP_REQUESTS, union_phys=UNION_ATTN and UNION_PHYS,
     )
 
 

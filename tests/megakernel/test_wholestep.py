@@ -208,7 +208,7 @@ CTX_C = [3001, 100]  # request 0: g_a holds one old token; request 1: g_a starts
 
 def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, rank_ids: bool = False,
            union: bool = False, stats: bool = False, loop: bool = False, ctx: list | None = None,
-           max_groups: int | None = None):
+           max_groups: int | None = None, phys: bool = False):
     from vllm_torchtpu.megakernel.wholestep.qsa_full_b import DBG_IDS, DBG_IQ
     from vllm_torchtpu.megakernel.wholestep.qsa_full_c import CK_NEW, IR_NEW, KR_NEW, RING_NEW
 
@@ -227,7 +227,7 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
     pps = d["mtab"].shape[1]
     long_kw = dict(carrier="bf16", chunk_pages=8, hbm_tables=True, per_request_scores=True,
                    bounded_chunks=True, shard_index=shard, union_attn=union,
-                   union_stats=stats, loop_requests=loop)
+                   union_stats=stats, union_phys=phys, loop_requests=loop)
     spec = wholestep_spec(
         G, R, L=L, qsa=dict(budget=BUDGET), step=True,
         indexed=dict(max_groups=MG, pages_per_seq=pps, debug=True, **(long_kw if long else {})),
@@ -324,6 +324,37 @@ def test_union_attention_matches_per_row(monkeypatch):
     monkeypatch.setattr(ua, "compact_union", broken)
     with pytest.raises(AssertionError):
         close(_run_c(long=True, rank_ids=True, union=True))
+
+
+def test_physical_ids_match_the_copy_address_math():
+    """`union_attn.physical_ids` (vector lookup) equals the per-copy scalar address
+    `tab[v >> shift] * per_page + (v & (per_page - 1))` for every id of every table column,
+    including id 0 (the zero-padded slots); a wrong shift is caught."""
+    from vllm_torchtpu.megakernel.wholestep import union_attn as ua
+
+    rng = np.random.default_rng(0)
+    for per_page, pps in ((128, 256), (128, 512), (4, 9)):
+        tab = rng.integers(0, 200_000, (1, pps)).astype(np.int32)
+        ids = np.arange(per_page * pps, dtype=np.int32)
+        ids = np.concatenate([ids, np.zeros((-len(ids)) % 128, np.int32)])
+        want = tab[0, ids >> (per_page.bit_length() - 1)] * per_page + (ids & (per_page - 1))
+        got = np.concatenate([
+            np.asarray(ua.physical_ids(jnp.asarray(ids[None, i : i + 128]), jnp.asarray(tab), per_page))[0]
+            for i in range(0, len(ids), 128)
+        ])
+        np.testing.assert_array_equal(got, want)
+        bad = np.asarray(ua.physical_ids(jnp.asarray(ids[None, :128] + 128 * per_page), jnp.asarray(tab), 2 * per_page))[0]
+        assert not np.array_equal(bad, want[:128])
+
+
+def test_union_physical_ids_bit_identical():
+    """`union_phys`: the copies read the same addresses, so the step is bit-identical to the
+    union kernel (alone and with `shard_index` + `loop_requests`)."""
+    for kw in (dict(), dict(shard=True, loop=True)):
+        base = _run_c(long=True, rank_ids=True, union=True, **kw)
+        run = _run_c(long=True, rank_ids=True, union=True, phys=True, **kw)
+        for i, name in ((0, "residual"), (3, "ck_new"), (4, "ring_new"), (7, "ids")):
+            np.testing.assert_array_equal(run[i], base[i], err_msg=f"{name} {kw}")
 
 
 def test_union_stats_count_the_rows_selections():

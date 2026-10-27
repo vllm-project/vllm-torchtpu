@@ -60,9 +60,17 @@ def main():
                     help="per-request union attention (VLLM_TPU_MEGAKERNEL wholeunion=1)")
     ap.add_argument("--loop", action="store_true",
                     help="per-request work in a fori_loop (VLLM_TPU_MEGAKERNEL wholeloop=1)")
+    ap.add_argument("--phys", action="store_true",
+                    help="union ids -> physical page ids per request (VLLM_TPU_MEGAKERNEL wholephys=1)")
+    ap.add_argument("--slots", type=int, default=0, help="union attention ring slots (0: default)")
     a = ap.parse_args()
     _apply_removals(a.remove)
     wsc.SHARD_INDEX, wsc.UNION_ATTN, wsc.LOOP_REQUESTS = a.shard, a.union, a.loop
+    wsc.UNION_PHYS = a.phys
+    if a.slots:
+        from vllm_torchtpu.megakernel.wholestep import qsa_full_b
+
+        qsa_full_b.UNION_SLOTS = a.slots
     # The served Pallas mesh order (get_pallas_mesh in the server: [0, 1, 4, 5, 6, 7, 2, 3]).
     by_id = {d.id: d for d in jax.devices()}
     mesh = jax.sharding.Mesh(np.array([by_id[i] for i in (0, 1, 4, 5, 6, 7, 2, 3)]), ("tp",))

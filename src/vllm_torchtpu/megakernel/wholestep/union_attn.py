@@ -96,6 +96,20 @@ def compact_union(code: jax.Array, KU: int, consts: tuple) -> tuple[jax.Array, j
     return cat(ids_out), cat(codes_out), n
 
 
+def physical_ids(ids: jax.Array, tab: jax.Array, per_page: int) -> jax.Array:
+    """Physical micro-page ids `[1, 128]` of 128 request-local group ids `ids [1, 128]`: what
+    `attend_request` computes per copy (`tab[v >> shift] * per_page + (v & (per_page - 1))`), as
+    one vector pass against the request's page-table row `tab [1, pps]` (lane select + lane sum:
+    exact int32), so each copy issues from a single SMEM load (RPAd's precomputed page ids).
+    """
+    shift = per_page.bit_length() - 1
+    col = jnp.transpose(jnp.broadcast_to(ids, (128, 128)))[:, 0:1]
+    lane = jax.lax.broadcasted_iota(I32, (1, tab.shape[1]), 1)
+    page = jnp.sum(jnp.where((col >> shift) == lane, tab, 0), axis=1, keepdims=True)
+    phys = page * per_page + (col & (per_page - 1))
+    return jnp.transpose(jnp.broadcast_to(phys, (128, 128)))[0:1, :]
+
+
 def attend_request(
     *,
     T: int,
@@ -117,12 +131,15 @@ def attend_request(
     sm_scale: float,
     interpret: bool,
     recent: tuple[jax.Array, jax.Array, list[jax.Array], jax.Array],
+    phys: bool = False,
 ) -> list[jax.Array]:
     """Gated sparse attention of one request's `T` rows over their union: `T` `[nh, 256]` F32.
 
     `ids` SMEM `[1, KU + 128]` request-local group ids of the union (ascending), `codes` a
     `[1, KU]` VMEM ref of their row bits, `n_union` the count; `table[table_row, v >> shift]`
     maps a group to its micro-page as `attend_row`'s `table` does. `qs` / `gates` `[nh, 256]` and
+    `phys`: `ids` already holds physical micro-page ids (`physical_ids`) for every slot a tile
+    reads (`< ceil(n_union / 64) * 64`); each copy is then one SMEM load, no table, no clamp.
     `has` (the row has pool tokens) per row. `recent = (k [8, 256], v [8, 256], ok_rows, ok_any
     [8, 1])` in pool units, `ok_rows` `T` `[1, 8]` masks. Each tile is copied and unpacked once and
     scored per row (`[nh, 256]` queries, as `attend_row`); scaling follows `attend_row` without
@@ -138,9 +155,13 @@ def attend_request(
 
     def copies(t: Any, s: Any) -> list[Any]:
         out = []
+        base = t * GROUPS_PER_TILE
         for j in range(GROUPS_PER_TILE):
-            v = ids[0, jnp.minimum(t * GROUPS_PER_TILE + j, ncols - 1)]
-            v = table[table_row, v >> shift] * per_page + (v & (per_page - 1))
+            if phys:
+                v = ids[0, base + j]
+            else:
+                v = ids[0, jnp.minimum(base + j, ncols - 1)]
+                v = table[table_row, v >> shift] * per_page + (v & (per_page - 1))
             out.append(
                 pltpu.make_async_copy(
                     pool.at[v >> shift, pl.ds((v & (per_page - 1)) * MICRO, MICRO)],

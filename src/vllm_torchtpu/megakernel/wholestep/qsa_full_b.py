@@ -76,6 +76,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         shard_index: bool = False,
         union_attn: bool = False,
         union_stats: bool = False,
+        union_phys: bool = False,
         loop_requests: bool = False,
         **kw: Any,
     ) -> None:
@@ -104,7 +105,10 @@ class QSAFullIndexedBlock(QSAFullBlock):
         their selections, streamed once (`union_attn.attend_request`). `union_stats` (needs
         `union_attn`): per QSA layer and request, output `qsa_union_stats` lanes `[union groups,
         sum of the rows' groups, max row groups, rows with groups]` (int32), read by the runner
-        outside the graph to measure how much a request's rows share. `loop_requests` (needs
+        outside the graph to measure how much a request's rows share. `union_phys` (needs
+        `union_attn`, `hbm_tables`): each request's union ids are turned into physical micro-page
+        ids by one vector pass before its tile loop (`union_attn.physical_ids`), so every copy
+        issues from one SMEM load instead of the ids -> table chain (same addresses). `loop_requests` (needs
         `per_request_scores`): the per-request work of a QSA layer (completed group, key
         streaming and scores, selection, recent tile) runs in a `fori_loop` over requests instead
         of a Python loop, so the kernel body, and its compile time, does not grow with the
@@ -129,6 +133,8 @@ class QSAFullIndexedBlock(QSAFullBlock):
             self.slots = min(self.slots, UNION_SLOTS)
         self.union_stats = union_stats
         assert not union_stats or union_attn, "the stats count the union"
+        self.union_phys = union_phys
+        assert not union_phys or (union_attn and hbm_tables), "phys ids: union over HBM tables"
         self.loop_requests = loop_requests
         assert not loop_requests or per_request_scores, "the request loop selects per request"
         self.chunk_pages = chunk_pages if carrier else max_groups // GPK
