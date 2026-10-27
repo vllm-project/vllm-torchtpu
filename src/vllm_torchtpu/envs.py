@@ -253,6 +253,8 @@ if TYPE_CHECKING:
     VLLM_TPU_WARM_SPEC_LOGITS_LENGTHS: bool = True
     VLLM_TPU_PLE_HOST_FAST_LOOKUP: bool = False
     VLLM_TPU_PLE_HOST_TIMING: bool = False
+    VLLM_TPU_PLE_HOST_OVERLAP: bool = False
+    VLLM_TPU_PLE_HOST_OVERLAP_CHECK: int = 0
     VLLM_TPU_FUSED_ASYNC_DRAFT_SEED: bool = True
     VLLM_TPU_DEFER_PREV_RESULTS_WAIT: bool = False
     VLLM_TPU_LOG_POST_WARMUP_COMPILES: bool = False
@@ -1579,6 +1581,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_PLE_HOST_FAST_LOOKUP": env_bool("VLLM_TPU_PLE_HOST_FAST_LOOKUP"),
     # Log the host PLE lookup's D2H / gather / H2D host time every 1000 calls.
     "VLLM_TPU_PLE_HOST_TIMING": env_bool("VLLM_TPU_PLE_HOST_TIMING"),
+    # Host PLE: start the ids' copy before the decoder layers that precede the
+    # PLE layer and finish the lookup just before it (ple_offload.py).
+    "VLLM_TPU_PLE_HOST_OVERLAP": env_bool("VLLM_TPU_PLE_HOST_OVERLAP"),
+    # Verify the first N overlapped ids copies against a blocking copy.
+    "VLLM_TPU_PLE_HOST_OVERLAP_CHECK": env_nonnegative_int(
+        "VLLM_TPU_PLE_HOST_OVERLAP_CHECK", 0
+    ),
     # Log one WARNING per torch.compile compile after warmup (runner/compile_watch.py).
     "VLLM_TPU_LOG_POST_WARMUP_COMPILES": env_bool(
         "VLLM_TPU_LOG_POST_WARMUP_COMPILES", default=False

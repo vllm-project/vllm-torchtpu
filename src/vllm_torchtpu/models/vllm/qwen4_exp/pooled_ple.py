@@ -18,7 +18,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.ple_op import (
 
 from .parallel import PLEParallel
 from .ple import PLEInputs, Qwen4ExpPLELayer, token_requests
-from .ple_offload import host_lookup
+from .ple_offload import host_lookup, host_lookup_finish, host_lookup_start
 from .ple_storage import HostPLETable, ResidentPLETable, SharedPLEOptions
 
 
@@ -136,6 +136,26 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
             ids,
             inputs.input_ids.shape[0],
             self.ple_embedding.ngram_embedding.embedding_dim * ids.shape[-1],
+            self.parallel.dp_group.world_size if self.parallel.across_dp else 1,
+            self.storage.storage_dtype == torch.float8_e4m3fn,
+            self.prefix,
+        )
+
+    def lookup_start(self, inputs: PLEInputs, valid_tokens: torch.Tensor) -> torch.Tensor:
+        """Device ids, then start their copy to the host (see ple_offload)."""
+        assert self.cpu_offload
+        return host_lookup_start(self._lookup_ids(inputs, valid_tokens), self.prefix)
+
+    def lookup_finish(
+        self, token: torch.Tensor, inputs: PLEInputs, after: torch.Tensor
+    ) -> torch.Tensor:
+        e = self.ple_embedding
+        parts = (e.ngram_size - 1) * e.heads_per_ngram
+        return host_lookup_finish(
+            token,
+            after,
+            inputs.input_ids.shape[0],
+            e.ngram_embedding.embedding_dim * parts,
             self.parallel.dp_group.world_size if self.parallel.across_dp else 1,
             self.storage.storage_dtype == torch.float8_e4m3fn,
             self.prefix,

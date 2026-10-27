@@ -311,8 +311,13 @@ class TPUQwen4ExpConfig(VerifyAndUpdateConfig):
             compilation = vllm_config.compilation_config
             if compilation.splitting_ops is None:
                 compilation.splitting_ops = []
-            if "qwen4_exp::host_lookup" not in compilation.splitting_ops:
-                compilation.splitting_ops.append("qwen4_exp::host_lookup")
+            for op in (
+                "qwen4_exp::host_lookup",
+                "qwen4_exp::host_lookup_start",
+                "qwen4_exp::host_lookup_finish",
+            ):
+                if op not in compilation.splitting_ops:
+                    compilation.splitting_ops.append(op)
         if qwen.get("engram_config", {}).get("dp_shared_memory", False):
             # This hook runs before engine copies / TPU worker DP collapse.
             # Runtime-only ModelConfig attributes survive deepcopy/pickling

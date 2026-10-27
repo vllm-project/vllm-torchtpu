@@ -581,13 +581,19 @@ class Qwen4ExpBackbone(nn.Module):
         # Resolve host lookup before any decoder work so shape arithmetic
         # stays in the main graph and model preparation precedes the D2H wait.
         ple_raw_embeddings = None
+        ple_token = None
         if self.host_ple_index is not None:
             ple = cast(Qwen4ExpDecoderLayer, self.layers[self.host_ple_index]).ple
             assert ple is not None
-            ple_raw_embeddings = ple.lookup_for_model(
-                PLEInputs(input_ids, query_start_loc, ngram_context),
-                query_start_loc[-1:],
-            )
+            ple_inputs = PLEInputs(input_ids, query_start_loc, ngram_context)
+            if envs.VLLM_TPU_PLE_HOST_OVERLAP and self.host_ple_index > 0:
+                # Start the ids' copy now; finish it just before the PLE layer
+                # so the earlier layers run on the device meanwhile.
+                ple_token = ple.lookup_start(ple_inputs, query_start_loc[-1:])
+            else:
+                ple_raw_embeddings = ple.lookup_for_model(
+                    ple_inputs, query_start_loc[-1:]
+                )
         hidden = (
             self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         )
@@ -598,7 +604,9 @@ class Qwen4ExpBackbone(nn.Module):
             hidden = sp.shard(hidden)
         rows = hidden.shape[0]
         hidden = sp.pad_shard(hidden.repeat(1, self.hc_count), sp_pad)
-        for layer in self.layers:
+        for index, layer in enumerate(self.layers):
+            if ple_token is not None and index == self.host_ple_index:
+                ple_raw_embeddings = ple.lookup_finish(ple_token, ple_inputs, hidden)
             hidden = layer(
                 hidden,
                 positions.to(torch.int64),
