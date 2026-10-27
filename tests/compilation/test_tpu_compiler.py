@@ -180,6 +180,8 @@ class TestTpuCompilerCache:
             "vllm_torchtpu/kernels/pool_adapters.py",
             "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
             "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
+            # Registers the MTP KV-only pass's cache-write op.
+            "vllm_torchtpu/spec_decode/mtp_kv_only.py",
         } <= hashed
 
     def test_runtime_hash_excluded_kernels_stay_omni_only(self):
