@@ -3573,6 +3573,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
                 mamba_state_indices_list=None,
                 pooler_output_list=[],
                 top_tokens=False,
+                kv_save_nan_check=None,
             ),
             input_batch=SimpleNamespace(
                 max_num_logprobs=None,

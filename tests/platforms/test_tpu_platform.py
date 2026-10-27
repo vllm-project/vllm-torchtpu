@@ -744,6 +744,8 @@ class TestTpuPlatform:
             # vLLM resolves lora_dtype "auto" to the model dtype.
             (torch.float16, torch.float16),
             (torch.float32, torch.float32),
+            # Set by hand to a dtype other than the model dtype.
+            (torch.float32, torch.float16),
             # Set by hand to the dtype the model runs in on TPU.
             (torch.float16, torch.bfloat16),
         ],

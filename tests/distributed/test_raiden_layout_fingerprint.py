@@ -141,6 +141,71 @@ def test_fingerprint_diverges_across_gdn_conv_layouts(monkeypatch):
     assert pair_fingerprint != legacy_fingerprint
 
 
+def _gdn_manifest(*, key_heads=2, value_heads=8, conv_itemsize=4, ssm_itemsize=4):
+    """`_manifest` plus one GDN conv and one GDN SSM pool."""
+    manifest = _manifest()
+    head_dim = 128
+    key_bytes = value_bytes = head_dim * conv_itemsize
+    row = (2 * key_heads + value_heads) * head_dim * conv_itemsize
+    conv = (
+        rpm.RegionSpec("gdn_conv_q", 0, row, key_bytes, 3, key_heads),
+        rpm.RegionSpec(
+            "gdn_conv_k", key_heads * key_bytes, row, key_bytes, 3, key_heads
+        ),
+        rpm.RegionSpec(
+            "gdn_conv_v", 2 * key_heads * key_bytes, row, value_bytes, 3, value_heads
+        ),
+    )
+    head_bytes = head_dim * head_dim * ssm_itemsize
+    ssm = (rpm.RegionSpec("gdn_ssm", 0, head_bytes, head_bytes, value_heads),)
+    for tag, regions in (("gdn.conv.g0", conv), ("gdn.ssm.g0", ssm)):
+        manifest.pools.append(
+            rpm.PoolEntry(
+                tag=tag,
+                layer_name="model.layers.0.linear_attn",
+                storage_index=0,
+                base_offset_bytes=0,
+                block_stride_bytes=4096 * 1024,
+                num_blocks=16,
+                regions=regions,
+                dtype_tag="float8_e4m3fn",
+            )
+        )
+    return manifest
+
+
+def _measure_gdn(**kwargs):
+    return rlf.measured_fa_layout_fingerprint(
+        _gdn_manifest(**kwargs),
+        layout_getter=lambda tensor: ([4, 3, 2, 1, 0], [[4, 128], [4, 1]], 0),
+        package_version=lambda package: "unused",
+    )
+
+
+def test_fingerprint_pins_gdn_state_dtypes(monkeypatch):
+    """Peers on different conv or SSM state dtypes must not pair: neither the
+    layout version nor the FA geometry shows the state dtypes."""
+    monkeypatch.delenv("TPU_GDN_CONV_QK_PAIR_LAYOUT", raising=False)
+    fp32, payload = _measure_gdn()
+    assert payload["gdn_state_unit_bytes"] == {
+        "gdn_conv_k": 512,
+        "gdn_conv_q": 512,
+        "gdn_conv_v": 512,
+        "gdn_ssm": 65536,
+    }
+    bf16_conv, _ = _measure_gdn(conv_itemsize=2)
+    bf16_ssm, _ = _measure_gdn(ssm_itemsize=2)
+    assert len({fp32, bf16_conv, bf16_ssm}) == 3
+
+
+def test_gdn_state_fingerprint_ignores_head_sharding(monkeypatch):
+    """A producer and a consumer sharding the GDN heads differently pair."""
+    monkeypatch.delenv("TPU_GDN_CONV_QK_PAIR_LAYOUT", raising=False)
+    full, _ = _measure_gdn(key_heads=2, value_heads=8)
+    shard, _ = _measure_gdn(key_heads=1, value_heads=4)
+    assert full == shard
+
+
 @pytest.mark.parametrize(
     ("layout", "message"),
     [

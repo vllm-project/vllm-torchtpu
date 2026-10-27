@@ -36,6 +36,7 @@ from vllm_torchtpu.experimental.export import (
     tpu_lowering,
     universal_adapter,
     validator,
+    weight_mapper,
 )
 
 
@@ -334,6 +335,9 @@ def test_end_to_end_export_writes_no_weights(tmp_path) -> None:
     )
     assert os.path.isfile(os.path.join(out_dir, "subgraphs", "sample_tokens_req4.mlir"))
     assert os.path.isfile(
+        os.path.join(out_dir, "subgraphs", "sample_tokens_temperature_req4.mlir")
+    )
+    assert os.path.isfile(
         os.path.join(out_dir, "subgraphs", "sample_tokens_stochastic_req4.mlir")
     )
     assert os.path.isfile(
@@ -354,10 +358,14 @@ class _TinyRecurrentExportableLLM(_TinyTorchExportableLLM):
                 cfg.dtype,
             ),
             api.ShapeDtypeStruct(
-                (cfg.num_blocks, 3, 1, 8), "f32", sharding=[None, None, None, "model"]
+                (cfg.num_state_slots, 3, 1, 8),
+                "f32",
+                sharding=[None, None, None, "model"],
             ),
             api.ShapeDtypeStruct(
-                (cfg.num_blocks, 2, 4, 4), "f32", sharding=[None, "model", None, None]
+                (cfg.num_state_slots, 2, 4, 4),
+                "f32",
+                sharding=[None, "model", None, None],
             ),
         ]
 
@@ -409,9 +417,11 @@ def test_end_to_end_export_of_a_recurrent_model(tmp_path: Path) -> None:
     states = [t for t in forward["inputs"] if t["argument_type"] == "state"]
     assert [(t["shape"], t["dtype"], t["sharding"]) for t in states] == [
         ([16, 8, 4, 8], "bf16", [None, None, None, None]),
-        ([16, 3, 1, 8], "f32", [None, None, None, "model"]),
-        ([16, 2, 4, 4], "f32", [None, "model", None, None]),
+        ([9, 3, 1, 8], "f32", [None, None, None, "model"]),
+        ([9, 2, 4, 4], "f32", [None, "model", None, None]),
     ]
+    # Recurrent state pools hold one slot per sequence plus null slot 0.
+    assert meta["serving_config"]["num_state_slots"] == 9
     # The recurrent control input follows the state, which keeps its indices.
     last = forward["inputs"][-1]
     assert last["name"] == "mamba_state_indices"
@@ -435,6 +445,54 @@ def test_lm_head_name_finds_a_nested_language_model_head() -> None:
     assert exporter._lm_head_name(params) == "language_model.model.embed_tokens.weight"
 
 
+@pytest.mark.parametrize(
+    ("names", "alias"),
+    [
+        # A tied head is named after the embedding, nested or not.
+        (
+            ["model.embed_tokens.weight"],
+            ("lm_head.weight", "model.embed_tokens.weight"),
+        ),
+        (
+            [
+                "language_model.model.embed_tokens.weight",
+                "visual.patch_embed.proj.weight",
+                "mtp.embed_tokens.weight",
+            ],
+            (
+                "language_model.lm_head.weight",
+                "language_model.model.embed_tokens.weight",
+            ),
+        ),
+        # An untied head has its own weight.
+        (["model.embed_tokens.weight", "lm_head.weight"], None),
+        (
+            [
+                "language_model.model.embed_tokens.weight",
+                "language_model.lm_head.weight",
+            ],
+            None,
+        ),
+    ],
+)
+def test_tied_lm_head_alias(names: list[str], alias: tuple[str, str] | None) -> None:
+    assert weight_mapper.tied_lm_head_alias(names) == alias
+
+
+def test_a_nested_tied_lm_head_keeps_the_embedding_a_forward_weight() -> None:
+    # Qwen3.5-0.8B: a multimodal model whose language model ties lm_head to the
+    # embedding.
+    model = nn.Module()
+    model.language_model = nn.Module()
+    model.language_model.model = nn.Module()
+    embed = nn.Embedding(32, 8)
+    model.language_model.model.embed_tokens = embed
+    tensors = checkpoint.local_tensors(model)
+    assert tensors["language_model.lm_head.weight"] is embed.weight
+    # compute_logits projects with the alias, so forward keeps the embedding.
+    assert exporter._lm_head_name(tensors) == "language_model.lm_head.weight"
+
+
 class _FakeRecurrentLayer:
     def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
         return (3, 1, 64), (4, 16, 16)
@@ -452,7 +510,7 @@ def test_recurrent_state_specs_split_conv_channels_and_value_heads(
         return_value=False,
     ):
         conv, recurrent = universal_adapter._recurrent_state_specs(
-            _FakeRecurrentLayer(), num_blocks=32, tp_size=tp_size
+            _FakeRecurrentLayer(), num_slots=32, tp_size=tp_size
         )
     split = "model" if tp_size > 1 else None
     assert (conv.shape, conv.dtype, conv.sharding) == (
@@ -511,6 +569,124 @@ def test_metadata_has_one_serving_config_with_what_the_runtime_reads(tmp_path) -
     assert (serving["vocab_size"], serving["num_blocks"]) == (32, 16)
 
 
+def test_metadata_declares_the_speculative_config_it_was_exported_with(
+    tmp_path,
+) -> None:
+    speculative = {
+        "method": "ngram",
+        "num_speculative_tokens": 4,
+        "prompt_lookup_max": 3,
+        "prompt_lookup_min": 3,
+    }
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny-torch",
+        vocab_size=32,
+        hidden_size=16,
+        num_layers=1,
+        num_q_heads=2,
+        num_kv_heads=2,
+        head_dim=8,
+        block_size=8,
+        num_blocks=16,
+        max_num_seqs=8,
+        max_model_len=64,
+        token_buckets=(8,),
+        req_buckets=(4, 8),
+        emit_byte_tokenizer=True,
+        speculative_config=speculative,
+    )
+    out_dir = str(tmp_path / "exported")
+    with mock.patch.object(
+        tpu_lowering,
+        "lower_torch_callable_to_mlir",
+        side_effect=_mock_lower_torch_callable_to_mlir,
+    ):
+        exporter.export(_TinyTorchExportableLLM(cfg), out_dir)
+    meta = json.loads(Path(out_dir, "metadata.json").read_text())
+    assert meta["serving_config"]["speculative_config"] == speculative
+
+
+def test_parse_args_takes_the_vllm_serve_command_line(capsys) -> None:
+    # What a `vllm serve` benchmark config passes, model tag included: engine
+    # arguments shape the artifact, frontend options are reported and ignored.
+    parser = cli.build_arg_parser()
+    if "model_tag" not in {a.dest for a in parser._actions}:
+        pytest.skip(
+            "vLLM cannot build its serve parser here (its platform's device is "
+            "unavailable); run with VLLM_TARGET_DEVICE=cpu VLLM_PLUGINS="
+        )
+    args = cli.parse_args(
+        [
+            "Qwen/Qwen3-0.6B",
+            "--output-dir",
+            "/tmp/out",
+            "--max-model-len",
+            "1024",
+            "--block-size",
+            "32",
+            "--port",
+            "8001",
+            "--default-chat-template-kwargs",
+            '{"enable_thinking": false}',
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            "hermes",
+        ]
+    )
+    assert args.model == "Qwen/Qwen3-0.6B"
+    assert (args.max_model_len, args.block_size) == (1024, 32)
+    ignored = capsys.readouterr().err
+    for flag in [
+        "--port",
+        "--default-chat-template-kwargs",
+        "--enable-auto-tool-choice",
+        "--tool-call-parser",
+    ]:
+        assert flag in ignored, ignored
+    for flag in ["--max-model-len", "--block-size", "--output-dir"]:
+        assert flag not in ignored, ignored
+
+
+def test_export_speculative_config_keeps_vllm_field_names() -> None:
+    assert cli.export_speculative_config(None) is None
+    assert cli.export_speculative_config(
+        '{"method": "ngram", "num_speculative_tokens": 4, "prompt_lookup_max": 3}'
+    ) == {
+        "method": "ngram",
+        "num_speculative_tokens": 4,
+        "prompt_lookup_max": 3,
+        "prompt_lookup_min": 3,
+    }
+
+
+@pytest.mark.parametrize(
+    "raw, error",
+    [
+        ({"method": "mtp", "num_speculative_tokens": 1}, "not supported"),
+        ({"method": "ngram", "prompt_lookup_max": 3}, "num_speculative_tokens"),
+        ({"method": "ngram", "num_speculative_tokens": 2}, "prompt_lookup_max"),
+        (
+            {"method": "ngram", "num_speculative_tokens": 0, "prompt_lookup_max": 3},
+            "num_speculative_tokens",
+        ),
+        (
+            {
+                "method": "ngram",
+                "num_speculative_tokens": 2,
+                "prompt_lookup_max": 3,
+                "model": "x",
+            },
+            "fields",
+        ),
+    ],
+)
+def test_export_speculative_config_rejects_what_the_runtime_cannot_run(
+    raw: dict[str, Any], error: str
+) -> None:
+    with pytest.raises(ValueError, match=error):
+        cli.export_speculative_config(raw)
+
+
 def test_compute_logits_output_is_the_samplers_intermediate_input(tmp_path) -> None:
     cfg = api.TextOnlyLLMExportConfig(
         model_name="tiny-torch",
@@ -538,6 +714,7 @@ def test_compute_logits_output_is_the_samplers_intermediate_input(tmp_path) -> N
     functions = json.loads(Path(out_dir, "metadata.json").read_text())["functions"]
     samplers = [
         "sample_tokens",
+        "sample_tokens_temperature",
         "sample_tokens_stochastic",
         "sample_tokens_penalized",
     ]
@@ -568,6 +745,7 @@ def single_rank_tp_group() -> Any:
 def test_universal_adapter_1d_and_2d_mrope_export_and_cli(tmp_path) -> None:
     hf_dir = tmp_path / "hf_ckpt"
     hf_dir.mkdir()
+    (hf_dir / "tokenizer.json").write_text(json.dumps({"version": "1.0"}))
     with open(hf_dir / "config.json", "w") as f:
         json.dump(
             {
@@ -726,6 +904,28 @@ def test_fit_num_blocks_to_hbm_uses_kv_cache_memory_bytes_without_the_device() -
     assert adapter.export_config.num_blocks == 33
 
 
+def test_fit_num_blocks_to_hbm_takes_recurrent_state_off_the_budget_first() -> None:
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny", num_layers=1, num_kv_heads=4, head_dim=128, block_size=128
+    )
+    adapter = _adapter_without_model(cfg)
+    state_bytes = 1000
+    kv_block_bytes = 128 * 4 * 2 * 128 * 2
+
+    def abstract_states() -> list[api.ShapeDtypeStruct]:
+        c = adapter.export_config
+        return [
+            api.ShapeDtypeStruct((c.num_blocks, 128, 8, 128), "bf16"),
+            # A recurrent state pool: one f32 slot of `state_bytes` per sequence.
+            api.ShapeDtypeStruct((c.num_state_slots, state_bytes // 4), "f32"),
+        ]
+
+    adapter.abstract_states = abstract_states
+    fixed = cfg.num_state_slots * state_bytes
+    assert adapter.fit_num_blocks_to_hbm(0.9, fixed + 33 * kv_block_bytes + 1) == 33
+    assert adapter.abstract_states()[1].shape[0] == cfg.num_state_slots
+
+
 def test_fit_num_blocks_to_hbm_rejects_a_budget_without_room_for_a_block() -> None:
     from vllm_torchtpu import utils
 
@@ -771,6 +971,7 @@ def test_generation_config_is_not_declared_when_the_checkpoint_has_none(
     hf_dir = tmp_path / "hf_ckpt"
     hf_dir.mkdir()
     (hf_dir / "config.json").write_text(json.dumps({"eos_token_id": 2}))
+    (hf_dir / "tokenizer.json").write_text(json.dumps({"version": "1.0"}))
     out_dir = tmp_path / "artifact"
     out_dir.mkdir()
     cfg = api.TextOnlyLLMExportConfig(
@@ -781,6 +982,58 @@ def test_generation_config_is_not_declared_when_the_checkpoint_has_none(
 
     assert "generation_config" not in serving_config
     assert not (out_dir / "generation_config.json").exists()
+
+
+@pytest.mark.parametrize(
+    "files,expected",
+    [
+        (
+            {
+                "chat_template.jinja": "jinja file",
+                "tokenizer_config.json": json.dumps({"chat_template": "config"}),
+            },
+            "jinja file",
+        ),
+        ({"tokenizer_config.json": json.dumps({"chat_template": "config"})}, "config"),
+        (
+            {
+                "tokenizer_config.json": json.dumps(
+                    {
+                        "chat_template": [
+                            {"name": "tool_use", "template": "tools"},
+                            {"name": "default", "template": "named default"},
+                        ]
+                    }
+                )
+            },
+            "named default",
+        ),
+        ({"tokenizer_config.json": json.dumps({"bos_token": "<s>"})}, None),
+        ({}, None),
+    ],
+)
+def test_chat_template_is_written_and_declared_like_huggingface_finds_it(
+    tmp_path, files: dict[str, str], expected: str | None
+) -> None:
+    hf_dir = tmp_path / "hf_ckpt"
+    hf_dir.mkdir()
+    (hf_dir / "tokenizer.json").write_text(json.dumps({"version": "1.0"}))
+    for name, text in files.items():
+        (hf_dir / name).write_text(text)
+    out_dir = tmp_path / "artifact"
+    out_dir.mkdir()
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny", vocab_size=64, hf_checkpoint_dir=str(hf_dir)
+    )
+
+    serving_config = exporter._emit_model_companion_files(cfg, str(out_dir))
+
+    if expected is None:
+        assert "chat_template" not in serving_config
+        assert not (out_dir / "chat_template.jinja").exists()
+    else:
+        assert serving_config["chat_template"] == {"path": "chat_template.jinja"}
+        assert (out_dir / "chat_template.jinja").read_text() == expected
 
 
 def _parallel_vllm_cfg(tmp_path: Path, tp: int, dp: int, pp: int) -> Any:
@@ -880,11 +1133,15 @@ def test_params_read_by_forward_drops_unread_forward_weights() -> None:
 def test_resolve_hf_checkpoint_dir_uses_cached_hub_snapshot(tmp_path: Path) -> None:
     snapshot = tmp_path / "snapshots" / "main"
     snapshot.mkdir(parents=True)
+    fetched = []
 
-    def fake_cached_file(repo: str, filename: str, **kwargs: Any) -> str:
-        assert kwargs["local_files_only"] is True
+    def fake_cached_file(repo: str, filename: str, **kwargs: Any) -> str | None:
         if repo != "org/tiny":
-            raise OSError(f"{repo} is not cached")
+            raise OSError(f"{repo} is not on the Hub")
+        fetched.append((filename, kwargs.get("local_files_only", False)))
+        if filename == "generation_config.json":
+            assert kwargs["_raise_exceptions_for_missing_entries"] is False
+            return None
         return str(snapshot / filename)
 
     resolve = universal_adapter.resolve_hf_checkpoint_dir
@@ -894,6 +1151,26 @@ def test_resolve_hf_checkpoint_dir_uses_cached_hub_snapshot(tmp_path: Path) -> N
         assert resolve("org/tiny") == str(snapshot)
         with pytest.raises(FileNotFoundError, match="org/missing"):
             resolve("org/missing")
+    # The companion files are fetched, not only looked up in the cache: a dummy
+    # weight load caches config.json alone.
+    assert fetched == [
+        ("config.json", False),
+        ("tokenizer.json", False),
+        ("generation_config.json", False),
+    ]
+
+
+def test_companion_files_require_a_tokenizer(tmp_path: Path) -> None:
+    hf_dir = tmp_path / "hf_ckpt"
+    hf_dir.mkdir()
+    (hf_dir / "config.json").write_text(json.dumps({"eos_token_id": 2}))
+    out_dir = tmp_path / "artifact"
+    out_dir.mkdir()
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny", vocab_size=64, hf_checkpoint_dir=str(hf_dir)
+    )
+    with pytest.raises(FileNotFoundError, match="tokenizer.json"):
+        exporter._emit_model_companion_files(cfg, str(out_dir))
 
 
 def _tp2_model(constant_values: Mapping[str, list[Any]]) -> Any:
@@ -1019,6 +1296,67 @@ def test_compute_logits_returns_the_vocabulary_without_padding() -> None:
     assert torch.equal(logits, torch.matmul(hidden, lm_head.T)[:, :10])
 
 
+class _LlamaLikeBackbone(nn.Module):
+    """Backbone whose `forward` takes `intermediate_tensors` with no default."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.embed_tokens = nn.Embedding(8, 4)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: Any,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert intermediate_tensors is None
+        return self.embed_tokens(input_ids)
+
+
+class _KvCacheArgBackbone(_LlamaLikeBackbone):
+    """Backbone that takes the KV caches and fails inside its forward."""
+
+    def forward(  # type: ignore[override]
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        kv_caches: Sequence[torch.Tensor] | None = None,
+        attn_metadata: Any = None,
+    ) -> torch.Tensor:
+        if kv_caches is not None:
+            raise TypeError("bug inside the model")
+        return self.embed_tokens(input_ids)
+
+
+def _run_backbone_forward(backbone: nn.Module) -> tuple[Sequence[Any], Any]:
+    cfg = api.TextOnlyLLMExportConfig(model_name="tiny", num_layers=0)
+    adapter = _adapter_without_model(cfg)
+    adapter._model = nn.Module()
+    adapter._model.model = backbone
+    weight = torch.arange(32.0).reshape(8, 4)
+    return adapter.forward(
+        {"model.embed_tokens.weight": weight},
+        [],
+        input_ids=torch.tensor([1, 2, 3]),
+        positions=torch.tensor([0, 1, 2]),
+        kv_lens=torch.tensor([3]),
+        block_tables=torch.zeros(1, 1, dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 3]),
+        req_dist=torch.tensor([0, 0, 1]),
+    )
+
+
+def test_forward_passes_intermediate_tensors_to_the_backbone() -> None:
+    _, hidden = _run_backbone_forward(_LlamaLikeBackbone())
+    assert torch.equal(hidden, torch.arange(32.0).reshape(8, 4)[[1, 2, 3]])
+
+
+def test_forward_propagates_type_errors_raised_inside_the_backbone() -> None:
+    with pytest.raises(TypeError, match="bug inside the model"):
+        _run_backbone_forward(_KvCacheArgBackbone())
+
+
 def _pallas_impl(kv_dtype: torch.dtype | None) -> Any:
     from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
 
@@ -1026,6 +1364,37 @@ def _pallas_impl(kv_dtype: torch.dtype | None) -> Any:
     impl.num_kv_heads, impl.head_size = 2, 128
     impl.kv_cache_quantized_dtype = kv_dtype
     return impl
+
+
+def _bare_layer(cls_path: str) -> Any:
+    module_name, cls_name = cls_path.rsplit(".", 1)
+    module = __import__(module_name, fromlist=[cls_name])
+    return object.__new__(getattr(module, cls_name))
+
+
+@pytest.mark.parametrize(
+    "cls_path",
+    [
+        "vllm.model_executor.layers.mamba.mamba_mixer2.MambaMixer2",
+        "vllm.model_executor.layers.mamba.short_conv.ShortConv",
+        "vllm.model_executor.layers.mamba.mamba_mixer.MambaMixer",
+    ],
+)
+def test_layer_state_specs_reject_unsupported_recurrent_layers(cls_path: str) -> None:
+    layer = _bare_layer(cls_path)
+    exportable = SimpleNamespace(
+        _export_config=SimpleNamespace(
+            dtype="bf16", num_blocks=16, block_size=32, tensor_parallel_size=1
+        ),
+        _attention_layers=lambda: [layer],
+    )
+    cls_name = cls_path.rsplit(".", 1)[1]
+    with pytest.raises(
+        NotImplementedError,
+        match=rf"recurrent layer {cls_name} is not supported by export; "
+        r"supported: GatedDeltaNetAttention",
+    ):
+        universal_adapter.UniversalVllmExportableLLM._layer_state_specs(exportable)
 
 
 @pytest.mark.parametrize("kv_dtype", [None, torch.float8_e4m3fn])
@@ -1038,7 +1407,11 @@ def test_layer_state_specs_declare_kv_and_recurrent_state(
     recurrent = _FakeRecurrentLayer()
     exportable = SimpleNamespace(
         _export_config=SimpleNamespace(
-            dtype="bf16", num_blocks=16, block_size=32, tensor_parallel_size=1
+            dtype="bf16",
+            num_blocks=16,
+            num_state_slots=9,
+            block_size=32,
+            tensor_parallel_size=1,
         ),
         _attention_layers=lambda: [recurrent, attention],
     )
@@ -1048,6 +1421,7 @@ def test_layer_state_specs_declare_kv_and_recurrent_state(
             "_is_recurrent_layer",
             side_effect=lambda m: m is recurrent,
         ),
+        mock.patch.object(universal_adapter, "_check_recurrent_layer_supported"),
         mock.patch(
             "vllm.model_executor.layers.mamba.mamba_utils.is_conv_state_dim_first",
             return_value=False,
@@ -1056,12 +1430,75 @@ def test_layer_state_specs_declare_kv_and_recurrent_state(
         recurrent_states, kv_states = (
             universal_adapter.UniversalVllmExportableLLM._layer_state_specs(exportable)
         )
-    assert [s.shape for s in recurrent_states] == [(16, 3, 1, 64), (16, 4, 16, 16)]
+    # Recurrent state is per sequence slot; the KV cache is per block.
+    assert [s.shape for s in recurrent_states] == [(9, 3, 1, 64), (9, 4, 16, 16)]
     # An fp8 KV cache is declared in fp8, with fp8's packing.
     stored = kv_dtype or torch.bfloat16
     (kv,) = kv_states
     assert kv.dtype == tpu_lowering.dtype_name(stored)
     assert kv.shape == PallasAttentionBackend.get_kv_cache_shape(16, 32, 2, 128, stored)
+
+
+@pytest.mark.parametrize("kv_dtype", [None, torch.float8_e4m3fn])
+def test_layer_state_specs_declare_the_mla_latent_cache(
+    kv_dtype: torch.dtype | None,
+) -> None:
+    from vllm_torchtpu.layers.adapter.attention import (
+        PallasMLAttentionBackend,
+        PallasMLAttentionBackendImpl,
+    )
+
+    # One latent KV head of kv_lora_rank + qk_rope_head_dim = 576, which the
+    # MLA kernel stores packed: [blocks, block_size / packing, packing, 640].
+    mla = SimpleNamespace(
+        impl=object.__new__(PallasMLAttentionBackendImpl),
+        head_size=576,
+        num_kv_heads=1,
+        kv_cache_quantized_dtype=kv_dtype,
+        use_sparse=False,
+    )
+    exportable = SimpleNamespace(
+        _export_config=SimpleNamespace(
+            dtype="bf16", num_blocks=16, block_size=1024, tensor_parallel_size=1
+        ),
+        _attention_layers=lambda: [mla],
+    )
+    per_layer = universal_adapter.UniversalVllmExportableLLM._layer_state_specs(
+        exportable
+    )
+    assert per_layer is not None
+    ((kv,),) = per_layer
+    stored = kv_dtype or torch.bfloat16
+    assert kv.dtype == tpu_lowering.dtype_name(stored)
+    assert kv.shape == PallasMLAttentionBackend.get_kv_cache_shape(
+        16, 1024, 1, 576, stored
+    )
+    packing = 4 if kv_dtype else 2
+    assert kv.shape == (16, 1024 // packing, packing, 640)
+
+
+def test_layer_state_specs_reject_sparse_mla() -> None:
+    from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackendImpl
+
+    indexer_cache = SimpleNamespace(impl=None)
+    sparse_mla = SimpleNamespace(
+        impl=object.__new__(PallasMLAttentionBackendImpl),
+        head_size=576,
+        num_kv_heads=1,
+        kv_cache_quantized_dtype=None,
+        use_sparse=True,
+    )
+    exportable = SimpleNamespace(
+        _export_config=SimpleNamespace(
+            dtype="bf16", num_blocks=16, block_size=1024, tensor_parallel_size=1
+        ),
+        _attention_layers=lambda: [indexer_cache, sparse_mla],
+    )
+    with pytest.raises(
+        NotImplementedError,
+        match="sparse MLA is not supported by export",
+    ):
+        universal_adapter.UniversalVllmExportableLLM._layer_state_specs(exportable)
 
 
 @pytest.fixture
@@ -1141,6 +1578,17 @@ def test_launch_workers_keeps_rank0_output(tmp_path: Path) -> None:
         cli._launch_workers(["--model", "m"], 4, str(out_dir))
     assert json.loads((out_dir / "metadata.json").read_text()) == {"rank": 0}
     assert not list(tmp_path.glob(".export_ranks_*"))
+
+
+def test_launch_workers_creates_the_output_parent_dir(tmp_path: Path) -> None:
+    out_dir = tmp_path / "new" / "out"
+    with (
+        mock.patch.object(cli, "_worker_env", lambda tp: {}),
+        mock.patch.object(cli.subprocess, "Popen", _FakeWorker),
+    ):
+        cli._launch_workers(["--model", "m"], 1, str(out_dir))
+    assert json.loads((out_dir / "metadata.json").read_text()) == {"rank": 0}
+    assert not list((tmp_path / "new").glob(".export_ranks_*"))
 
 
 def test_launch_workers_fails_when_a_worker_fails(tmp_path: Path) -> None:
@@ -1224,3 +1672,171 @@ def test_launch_workers_all_mode_saves_into_the_output_dir(tmp_path: Path) -> No
     # Every rank joins the same JAX coordinator.
     assert len({flag(c, checkpoint.JAX_COORDINATOR_FLAG) for c in cmds}) == 1
     assert not stale.exists()
+
+
+class _Router:
+    """A plain object holding a module's parameter, as vLLM MoE routers do."""
+
+    def __init__(self, bias: torch.Tensor) -> None:
+        self.bias = bias
+
+
+class _BackboneWithRouter(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = nn.Module()
+        self.gate.bias = nn.Parameter(torch.zeros(4), requires_grad=False)
+        self.experts = nn.Module()
+        # Mirrors vLLM's MoERunner/RoutedExperts layout: the same `gate`
+        # submodule is reachable at two module paths (`gate` and
+        # `experts.gate`), `routed_experts` holds the shared Parameter directly,
+        # and `router` is a plain object holding the Parameter outside the
+        # module tree.
+        self.experts.gate = self.gate
+        self.experts.routed_experts = nn.Module()
+        self.experts.routed_experts.bias = self.gate.bias
+        self.experts.router = _Router(self.gate.bias)
+
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> Any:
+        del positions
+        assert self.gate.bias is self.experts.routed_experts.bias
+        assert self.gate.bias is self.experts.router.bias
+        return input_ids.float()[:, None] + self.experts.router.bias[None, :]
+
+
+def test_forward_binds_weights_held_outside_the_module_tree() -> None:
+    wrapper = nn.Module()
+    wrapper.model = _BackboneWithRouter()
+    original = wrapper.model.gate.bias
+    exportable = object.__new__(universal_adapter.UniversalVllmExportableLLM)
+    exportable._model = wrapper
+    exportable._vllm_config = None
+    exportable._export_config = SimpleNamespace(dtype="bf16", max_num_seqs=1)
+    controls = {
+        name: torch.zeros(1, dtype=torch.int32)
+        for name in ("kv_lens", "block_tables", "query_start_loc", "req_dist")
+    }
+    for step in (1.0, 2.0):
+        bias = torch.arange(4, dtype=torch.float32) + step
+        _, hidden = exportable.forward(
+            {"model.gate.bias": bias},
+            [],
+            input_ids=torch.tensor([10, 20]),
+            positions=torch.tensor([0, 1]),
+            **controls,
+        )
+        # Every holder reads the bound weight, and repeated forward calls
+        # (probe pass + bucket lowering) leave the shared parameter intact.
+        assert torch.equal(hidden, torch.tensor([[10.0], [20.0]]) + bias)
+        assert wrapper.model.gate.bias is original
+        assert wrapper.model.experts.routed_experts.bias is original
+        assert wrapper.model.experts.router.bias is original
+        assert "bias" in wrapper.model.gate._parameters
+    assert torch.equal(original, torch.zeros(4))
+
+
+@pytest.mark.parametrize(
+    "max_num_seqs,expected",
+    [
+        (512, (8, 16, 32, 64, 128, 256, 512)),
+        (300, (8, 16, 32, 64, 128, 256, 300)),
+        (8, (8,)),
+        (4, (4,)),
+    ],
+)
+def test_default_req_buckets_pad_like_the_vllm_runner(
+    max_num_seqs: int, expected: tuple[int, ...]
+) -> None:
+    assert universal_adapter.default_req_buckets(max_num_seqs) == expected
+
+
+def test_uniform_per_logit_is_in_range_and_depends_only_on_the_row() -> None:
+    uniform = torch.tensor([0.1, 0.5, 0.9, 0.5])
+    u = sampling.uniform_per_logit(uniform, 1000)
+    assert u.shape == (4, 1000) and u.dtype == torch.float32
+    assert bool((u > 0).all()) and bool((u < 1).all())
+    assert torch.equal(u[1], u[3])  # same seed, same values
+    assert not torch.equal(u[0], u[1])
+    alone = sampling.uniform_per_logit(uniform[2:3], 1000)
+    assert torch.equal(alone[0], u[2])  # batch-invariant
+    assert abs(float(u.mean()) - 0.5) < 0.02
+
+
+def _sample_frequencies(sample, logits_row, rows=20000, **params):
+    torch.manual_seed(0)
+    logits = logits_row.expand(rows, -1).contiguous()
+    uniform = torch.rand(rows)
+    tokens = sample(logits, uniform=uniform, **params).squeeze(-1)
+    return torch.bincount(tokens, minlength=logits.shape[-1]).float() / rows
+
+
+def test_temperature_and_stochastic_samplers_follow_the_softmax() -> None:
+    logits_row = torch.tensor([[2.0, 1.0, 0.5, 0.0, -1.0, -3.0]])
+    rows = 20000
+    temp = torch.full((rows,), 0.7)
+    expected = torch.softmax(logits_row[0] / 0.7, dim=-1)
+    freq = _sample_frequencies(
+        lambda logits, uniform, **p: sampling.temperature_tokens(logits, temp, uniform),
+        logits_row,
+        rows,
+    )
+    assert torch.allclose(freq, expected, atol=0.015), (freq, expected)
+    no_k = torch.zeros(rows, dtype=torch.int32)
+    no_p = torch.ones(rows)
+    freq = _sample_frequencies(
+        lambda logits, uniform, **p: sampling.stochastic_tokens(
+            logits, temp, no_k, no_p, torch.zeros(rows), uniform
+        ),
+        logits_row,
+        rows,
+    )
+    assert torch.allclose(freq, expected, atol=0.015), (freq, expected)
+
+
+def test_stochastic_sampler_keeps_only_the_top_k_and_top_p_tokens() -> None:
+    logits_row = torch.tensor([[3.0, 2.5, 2.0, 0.0, -1.0, -2.0]])
+    rows = 4000
+    temp = torch.ones(rows)
+    top_k = torch.full((rows,), 2, dtype=torch.int32)
+    freq = _sample_frequencies(
+        lambda logits, uniform, **p: sampling.stochastic_tokens(
+            logits, temp, top_k, torch.ones(rows), torch.zeros(rows), uniform
+        ),
+        logits_row,
+        rows,
+    )
+    assert float(freq[2:].sum()) == 0.0 and float(freq[:2].min()) > 0.2
+    top_p = torch.full((rows,), 0.5)
+    freq = _sample_frequencies(
+        lambda logits, uniform, **p: sampling.stochastic_tokens(
+            logits,
+            temp,
+            torch.zeros(rows, dtype=torch.int32),
+            top_p,
+            torch.zeros(rows),
+            uniform,
+        ),
+        logits_row,
+        rows,
+    )
+    # softmax([3, 2.5, 2, ...]) = [0.47, 0.29, ...]: the top-p set is tokens 0 and 1.
+    assert float(freq[2:].sum()) == 0.0 and float(freq[1]) > 0.2
+
+
+def test_zero_temperature_rows_take_the_argmax() -> None:
+    logits = torch.tensor([[0.0, 5.0, 1.0], [4.0, 0.0, 1.0]])
+    temp = torch.tensor([0.0, 0.0])
+    uniform = torch.tensor([0.3, 0.8])
+    assert sampling.temperature_tokens(logits, temp, uniform).squeeze(-1).tolist() == [
+        1,
+        0,
+    ]
+    tokens = sampling.stochastic_tokens(
+        logits,
+        temp,
+        torch.tensor([1, 1], dtype=torch.int32),
+        torch.ones(2),
+        torch.zeros(2),
+        uniform,
+    )
+    assert tokens.squeeze(-1).tolist() == [1, 0]

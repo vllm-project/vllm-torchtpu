@@ -97,6 +97,11 @@ from vllm_torchtpu import envs, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
+from vllm_torchtpu.distributed.kv_transfer.kv_save_nan_check import (
+    KVSaveNanCheck,
+    begin_kv_save_nan_check,
+    wait_for_save_with_nan_check,
+)
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorStats,
 )
@@ -222,6 +227,7 @@ class ExecuteModelState:
     # logits_list holds the greedy tokens ([rows, 1]), not logits
     # (TPU_GREEDY_TOP_TOKENS).
     top_tokens: bool = False
+    kv_save_nan_check: KVSaveNanCheck | None = None
 
 
 # Per-step mamba read-offset operations, consolidated into single cached
@@ -369,10 +375,18 @@ def _substitute_placeholder_token(
     Return:
         input_ids with real placeholders replaced; padding slots untouched.
     """
-    assert (
+    # torch._assert, not assert or raise: it survives python -O, and under
+    # torch.compile(fullgraph=True) the caller still sees this message.
+    torch._assert(
         input_ids.shape[0]
         == token_in_tpu_cur_input_indices.shape[0]
-        == token_in_tpu_pre_next_tokens_indices.shape[0]
+        == token_in_tpu_pre_next_tokens_indices.shape[0],
+        "placeholder substitution inputs must share one length: "
+        f"input_ids.shape[0]={input_ids.shape[0]}, "
+        "token_in_tpu_cur_input_indices.shape[0]="
+        f"{token_in_tpu_cur_input_indices.shape[0]}, "
+        "token_in_tpu_pre_next_tokens_indices.shape[0]="
+        f"{token_in_tpu_pre_next_tokens_indices.shape[0]}",
     )
     mask = token_in_tpu_pre_next_tokens_indices > -1
     # clamp_min(0) gives a safe in-range gather index for the -1 sentinel
@@ -1075,6 +1089,7 @@ class TPUModelRunner(GPUModelRunner):
         # The step whose KV-connector progress an intermediate stage still
         # owes in sample_tokens.
         self._pp_pending_scheduler_output: SchedulerOutput | None = None
+        self._pp_pending_kv_save_nan_check: KVSaveNanCheck | None = None
 
         # Tracks token padding in each step.
         self._token_padding_state: token_padding.TokenPaddingState | None = None
@@ -1196,9 +1211,13 @@ class TPUModelRunner(GPUModelRunner):
         else:
             kv_connector.start_load_kv(None)
 
-    def maybe_wait_for_kv_save(self) -> None:
+    def maybe_wait_for_kv_save(self, nan_check: KVSaveNanCheck | None = None) -> None:
         if has_kv_transfer_group():
-            get_kv_transfer_group().wait_for_save()
+            connector = get_kv_transfer_group()
+            if nan_check is None:
+                connector.wait_for_save()
+            else:
+                wait_for_save_with_nan_check(connector, nan_check)
 
     def get_finished_kv_transfers(self, scheduler_output):
         if not has_kv_transfer_group():
@@ -1340,10 +1359,15 @@ class TPUModelRunner(GPUModelRunner):
         num_eligible = 0
         num_truncated = 0
         for name, module in self.model.named_modules():
-            if type(module) not in (
-                RotaryEmbedding,
-                MRotaryEmbedding,
-                MRotaryEmbeddingInterleaved,
+            # isinstance, not an exact type match: on TPU these are the
+            # out-of-tree subclasses from layers/adapter/rotary_embedding.py.
+            if not isinstance(
+                module,
+                (
+                    RotaryEmbedding,
+                    MRotaryEmbedding,
+                    MRotaryEmbeddingInterleaved,
+                ),
             ):
                 continue
             for buf_name in ("cos_sin_cache", "cos_sin_cache_bf16"):
@@ -3869,6 +3893,11 @@ class TPUModelRunner(GPUModelRunner):
                 report_completion=not raiden_inline,
             )
 
+        nan_check = (
+            begin_kv_save_nan_check(get_kv_transfer_group())
+            if has_kv_transfer_group()
+            else None
+        )
         while chunk_index < target_num_chunks:
             if start_index >= self.input_batch.num_reqs:
                 assert self._dp_target_bucket is not None
@@ -4038,6 +4067,22 @@ class TPUModelRunner(GPUModelRunner):
                     intermediate_tensors=intermediate_tensors,
                 )
 
+            if nan_check is not None:
+                assert isinstance(hidden_states, (torch.Tensor, IntermediateTensors)), (
+                    "KV store NaN checking requires forward hidden states or "
+                    "intermediate tensors"
+                )
+                plan = self._last_sequence_layout_plan
+                assert plan is not None, (
+                    "A real forward chunk must have a sequence layout plan"
+                )
+                nan_check.record(
+                    hidden_states,
+                    tuple(self.input_batch.req_ids[start_index:end_index]),
+                    self.query_start_loc_np[: num_reqs + 1],
+                    plan,
+                )
+
             if not self._pp_is_last:
                 # The next stage continues this chunk; logits and sampling
                 # happen on the last stage.
@@ -4147,6 +4192,7 @@ class TPUModelRunner(GPUModelRunner):
 
         if not self._pp_is_last:
             self._pp_pending_scheduler_output = scheduler_output
+            self._pp_pending_kv_save_nan_check = nan_check
             return None
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
@@ -4157,6 +4203,7 @@ class TPUModelRunner(GPUModelRunner):
             draft_chunks=draft_chunks,
             mamba_state_indices_list=mamba_state_indices_list,
             top_tokens=top_tokens,
+            kv_save_nan_check=nan_check,
         )
 
         if self.is_pooling_model:
@@ -5004,8 +5051,10 @@ class TPUModelRunner(GPUModelRunner):
         # clear past its drafter.) ngram drafts below from host tokens and
         # writes no KV. The wait above also proves the previous forward
         # finished, so a store deferred behind it can be handed to raiden in
-        # this step rather than the next.
-        self.maybe_wait_for_kv_save()
+        # this step rather than the next. Note that state.kv_save_nan_check
+        # snapshots only the target forward chunks from execute_model(), not
+        # the drafter's KV writes above.
+        self.maybe_wait_for_kv_save(state.kv_save_nan_check)
         (
             finished_sending,
             finished_recving,
@@ -7763,10 +7812,12 @@ class TPUModelRunner(GPUModelRunner):
         their KV-connector progress so the aggregated step output is
         complete."""
         scheduler_output = self._pp_pending_scheduler_output
+        nan_check = self._pp_pending_kv_save_nan_check
         self._pp_pending_scheduler_output = None
+        self._pp_pending_kv_save_nan_check = None
         if scheduler_output is None:
             return EMPTY_MODEL_RUNNER_OUTPUT
-        self.maybe_wait_for_kv_save()
+        self.maybe_wait_for_kv_save(nan_check)
         (
             finished_sending,
             finished_recving,
@@ -7905,7 +7956,10 @@ class TPUModelRunner(GPUModelRunner):
     def compute_selected_top_tokens(
         self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor
     ) -> torch.Tensor:
-        assert self._greedy_head_owner is not None
+        # Callers gate on _greedy_top_tokens_this_step, so this only narrows the
+        # type; a missing head owner is object state, hence RuntimeError.
+        if self._greedy_head_owner is None:
+            raise RuntimeError("greedy top-token path requires a greedy head owner")
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
         return greedy_top_tokens.top_tokens(self._greedy_head_owner, selected)
 
@@ -7913,7 +7967,10 @@ class TPUModelRunner(GPUModelRunner):
     def compute_top_tokens_from_hidden_states(
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        assert self._greedy_head_owner is not None
+        # Callers gate on _greedy_top_tokens_this_step, so this only narrows the
+        # type; a missing head owner is object state, hence RuntimeError.
+        if self._greedy_head_owner is None:
+            raise RuntimeError("greedy top-token path requires a greedy head owner")
         return greedy_top_tokens.top_tokens(self._greedy_head_owner, hidden_states)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)

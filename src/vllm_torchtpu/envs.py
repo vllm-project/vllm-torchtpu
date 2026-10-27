@@ -432,15 +432,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # lane-padded tiles cost a broadcast init, a relayout copy and padded
     # copies through the LSE merge. Bit-identical outputs.
     "TPU_MLA_SPARSE_SPLIT_Q": env_bool("TPU_MLA_SPARSE_SPLIT_Q", default=False),
-    # QK pair-blocked pooled GDN conv layout: full-width states interleave
-    # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
-    # to one whole destination pool token (2 contiguous transfer spans per
-    # rank per state group).  Identity for head-shard states.  Must match
-    # across a disagg pair; the value rides the raiden layout fingerprint.
-    # Resolution is layered (see env_override.py): an explicitly set
-    # value always wins; otherwise raiden runs derive it from
-    # TPU_RAIDEN_TRANSFER_PARALLELISM (enabled iff >= 8, and 8 is that
-    # variable's default — so it is on by default under raiden).
+    # QK pair-blocked GDN conv layout for Raiden transfers.  Not supported
+    # with the unified GDN state pool: its kernel reads segment-major
+    # [Q | K | V] conv rows, so the pool manifest rejects this flag.  Must
+    # match across a disagg pair; the value rides the raiden layout
+    # fingerprint.
     "TPU_GDN_CONV_QK_PAIR_LAYOUT": env_bool(
         "TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False
     ),
