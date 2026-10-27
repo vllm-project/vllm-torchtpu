@@ -564,3 +564,41 @@ def test_step_with_per_layer_metadata_matches_reference():
     for r in range(R):
         dd = np.abs(res[r, :T] - refn[:T])
         assert dd.mean() < 3e-2 * k * scale, (r, dd.mean() / scale)
+
+
+@pytest.mark.parametrize("S", [8, 256, 512])
+def test_compaction_exclusive_prefix_matches_reference(S):
+    """`indexer.exclusive_prefix` (128-lane chunks + running total for S % 128 == 0, else one
+    `[S, S]` matmul): `compact_row` returns the stock top-K ids ascending and `compact_union` the
+    ascending union with its codes, at the 131K / 262K score widths (S = 256 / 512); a prefix
+    shifted by one chunk is caught."""
+    from vllm_torchtpu.megakernel.wholestep import indexer as ix
+    from vllm_torchtpu.megakernel.wholestep import union_attn as ua
+
+    G, K = S * 128, 64
+    rng = np.random.default_rng(S)
+    sc = rng.standard_normal(G).astype(np.float32)
+    sc[rng.integers(0, G, 40)] = sc[5]  # ties across chunks
+    nv = G - 37
+    bits = np.where(np.arange(G) < nv, np.asarray(sc).view(np.int32), -1).reshape(1, S, 128)
+    ids = np.arange(G, dtype=np.int32).reshape(1, S, 128)
+    thr, tmax = ix.thresholds(jnp.asarray(bits), jnp.asarray(ids), jnp.full((1, 1, 1), nv), K, G)
+    consts = ix.compact_consts(S, K)
+    got = np.asarray(ix.compact_row(jnp.asarray(bits[0]), thr[0], tmax[0], jnp.full((1, 1), nv), K, consts))[0]
+    assert got.tolist() == sorted(ix.topk_reference(sc, nv, K))
+    code = np.zeros((S, 128), np.int32)
+    pick = rng.choice(G, 300, replace=False)
+    code.reshape(-1)[pick] = rng.integers(1, 16, 300)
+    KU = 512
+    u_ids, u_codes, n = ua.compact_union(jnp.asarray(code), KU, ua.union_consts(S, KU))
+    want = np.sort(pick)
+    assert int(np.asarray(n)[0, 0]) == 300
+    np.testing.assert_array_equal(np.asarray(u_ids)[0, :300], want)
+    np.testing.assert_array_equal(np.asarray(u_codes)[0, :300], code.reshape(-1)[want])
+    c = jnp.asarray(rng.integers(0, 129, (1, S)).astype(np.float32))
+    want_p = np.concatenate([[0], np.cumsum(np.asarray(c)[0])[:-1]])
+    np.testing.assert_array_equal(np.asarray(ix.exclusive_prefix(c, consts[1]))[0], want_p)
+    if S % 128 == 0 and S > 128:  # positive control: drop the running total
+        bad = jnp.concatenate([jnp.dot(c[:, i:i + 128].astype(jnp.bfloat16), consts[1],
+                                       preferred_element_type=jnp.float32) for i in range(0, S, 128)], axis=1)
+        assert not np.array_equal(np.asarray(bad)[0], want_p)

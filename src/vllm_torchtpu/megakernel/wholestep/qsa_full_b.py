@@ -272,7 +272,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
             ScratchReq("qi_ids", pltpu.SMEM((MB, K + 128), I32)),
             ScratchReq("qi_kvl", pltpu.SMEM((MB,), I32)),
             ScratchReq("qi_z", pltpu.VMEM((1, 128), I32)),
-            ScratchReq("qi_dbg", pltpu.VMEM((MB, 4 * ix.IDX_DIM), F32)),
+            *([ScratchReq("qi_dbg", pltpu.VMEM((MB, 4 * ix.IDX_DIM), F32))] if self.debug else []),
             ScratchReq("qi_sem", pltpu.SemaphoreType.DMA((3,))),
         ]
 

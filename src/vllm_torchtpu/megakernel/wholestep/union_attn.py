@@ -33,6 +33,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from ..blocks.qsa_attn.block import MICRO, TILE, _unpack_kv
 from ..ops import BF16, F32, I32
+from .indexer import exclusive_prefix
 
 GROUPS_PER_TILE = TILE // MICRO  # one group = one micro-page of 4 tokens
 
@@ -45,11 +46,9 @@ def union_consts(S: int, KU: int) -> tuple:
     W = min(KU, UNION_CHUNK)
     li = jax.lax.broadcasted_iota(I32, (128, 128), 0)
     lj = jax.lax.broadcasted_iota(I32, (128, 128), 1)
-    si = jax.lax.broadcasted_iota(I32, (S, S), 0)
-    sj = jax.lax.broadcasted_iota(I32, (S, S), 1)
     return (
         (li <= lj).astype(BF16),
-        (si < sj).astype(BF16),
+        (li < lj).astype(BF16),  # `indexer.exclusive_prefix`'s 128-lane strict triangle
         jax.lax.broadcasted_iota(I32, (W, 1), 0),
         jax.lax.broadcasted_iota(I32, (1, S), 1),
         jax.lax.broadcasted_iota(I32, (W, 128), 1),
@@ -71,7 +70,7 @@ def compact_union(code: jax.Array, KU: int, consts: tuple) -> tuple[jax.Array, j
     sel = code > 0
     P = jnp.dot(sel.astype(F32).astype(BF16), U, preferred_element_type=F32)
     c_row = jnp.transpose(jnp.broadcast_to(P[:, 127:128], (S, 128)))[0:1, :]
-    O_row = jnp.dot(c_row.astype(BF16), Us, preferred_element_type=F32)
+    O_row = exclusive_prefix(c_row, Us)
     E_row = O_row + c_row
     Pb, codeb = P.astype(BF16), code.astype(F32).astype(BF16)
     n = jnp.sum(sel.astype(I32), axis=(0, 1), keepdims=True)

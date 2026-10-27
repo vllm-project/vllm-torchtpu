@@ -112,7 +112,7 @@ def compact_row(b, th, tm, nv, K: int, consts: tuple) -> jax.Array:
     sel = (ov & ((b > th) | ((b == th) & (lid <= tm)))) | (~ov & (b >= 0))
     P = jnp.dot(sel.astype(F32).astype(BF16), U, preferred_element_type=F32)
     c_row = jnp.transpose(jnp.broadcast_to(P[:, 127:128], (S, 128)))[0:1, :]
-    O_row = jnp.dot(c_row.astype(BF16), Us, preferred_element_type=F32)
+    O_row = exclusive_prefix(c_row, Us)
     E_row = O_row + c_row
     jf = jcol.astype(F32)
     r_j = jnp.sum((E_row <= jf).astype(I32), axis=1, keepdims=True)
@@ -125,14 +125,31 @@ def compact_row(b, th, tm, nv, K: int, consts: tuple) -> jax.Array:
     return jnp.transpose(jnp.broadcast_to(idc, (K, 128)))[0:1, :].astype(I32)
 
 
+def exclusive_prefix(c_row: jax.Array, us: jax.Array) -> jax.Array:
+    """Exclusive prefix sum `[1, S]` of the per-sublane-row counts `c_row [1, S]` (each <= 128,
+    exact in BF16): one `[1, 128] x [128, 128]` strict-triangular matmul per 128-lane chunk plus
+    the running total of the chunks before it (f32 integers: exact). Replaces the `[S, S]` strict
+    triangle, whose VMEM grows with S^2 (0.5 MiB at S = 512, 262K contexts). An S that is not a
+    multiple of 128 (small test / 32K-cap shapes) keeps the one `[S, S]` matmul."""
+    S = c_row.shape[1]
+    if S % 128:
+        si = jax.lax.broadcasted_iota(I32, (S, S), 0)
+        sj = jax.lax.broadcasted_iota(I32, (S, S), 1)
+        return jnp.dot(c_row.astype(BF16), (si < sj).astype(BF16), preferred_element_type=F32)
+    out, carry = [], jnp.zeros((1, 1), F32)
+    for c in range(c_row.shape[1] // 128):
+        x = c_row[:, c * 128 : (c + 1) * 128]
+        out.append(jnp.dot(x.astype(BF16), us, preferred_element_type=F32) + carry)
+        carry = carry + jnp.sum(x, axis=1, keepdims=True)
+    return out[0] if len(out) == 1 else jnp.concatenate(out, axis=1)
+
+
 def compact_consts(S: int, K: int) -> tuple:
     li = jax.lax.broadcasted_iota(I32, (128, 128), 0)
     lj = jax.lax.broadcasted_iota(I32, (128, 128), 1)
-    si = jax.lax.broadcasted_iota(I32, (S, S), 0)
-    sj = jax.lax.broadcasted_iota(I32, (S, S), 1)
     return (
         (li <= lj).astype(BF16),
-        (si < sj).astype(BF16),
+        (li < lj).astype(BF16),  # 128-lane strict triangle of `exclusive_prefix`
         jax.lax.broadcasted_iota(I32, (K, 1), 0),
         jax.lax.broadcasted_iota(I32, (1, S), 1),
         jax.lax.broadcasted_iota(I32, (S, 128), 0) * 128
