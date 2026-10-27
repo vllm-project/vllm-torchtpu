@@ -32,10 +32,22 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 from vllm_omni.diffusion.models.flux.flux_transformer import FluxPosEmbed
 from vllm_omni.diffusion.models.flux2.flux2_transformer import Flux2PosEmbed
 
-from tests_omni.omni_test_utils import assert_numerical_parity
+from tests_omni.omni_test_utils import assert_parity
 from vllm_torchtpu.omni.attention import TpuFlashAttentionImpl, TpuSDPAImpl
 
 pytestmark = [pytest.mark.omni]
+
+# (max_rel_l2, max_abs) vs the CPU reference, ~3% above the worst observed
+# value across the parametrized attention impls. RoPE application is exact.
+PARITY_BOUNDS: dict[str, tuple[float, float]] = {
+    "standard_attention": (4.4e-3, 8.6e-3),
+    "joint_attention": (4.5e-3, 1.4e-2),
+    "gqa_attention": (4.1e-3, 1.3e-2),
+    "long_sequence_attention": (5.4e-3, 2.2e-3),
+    "masked_fallback_fp32": (2.2e-3, 3.8e-3),
+    "rope_q": (0.0, 0.0),
+    "rope_k": (0.0, 0.0),
+}
 
 
 def _sdpa_reference(
@@ -71,8 +83,8 @@ class TestFluxTpuSDPAAttention:
     `TpuSDPAImpl` is the hardware implementation that vllm-torchtpu registers into
     vllm_omni, so we test its forward pass directly. The reference is an independent
     float64 softmax(Q K^T * scale) V on CPU from the same bf16 inputs, so a
-    [B, S, H, D] layout or GQA head-mapping mistake cannot cancel out (measured max
-    abs error 0.0043 against atol 1e-2).
+    [B, S, H, D] layout or GQA head-mapping mistake cannot cancel out (bounds in
+    PARITY_BOUNDS).
     """
 
     @pytest.mark.parametrize("impl_cls", [TpuSDPAImpl, TpuFlashAttentionImpl])
@@ -124,8 +136,15 @@ class TestFluxTpuSDPAAttention:
             msg="TPU execution must be bitwise identical for identical inputs",
         )
 
-        # Numerical parity against CPU baseline (CosSim >= 0.999, bfloat16 tolerance)
-        assert_numerical_parity(tpu_out.cpu(), ref_out, atol=1e-2, rtol=1e-2)
+        # Numerical parity against CPU baseline
+        max_rel_l2, max_abs = PARITY_BOUNDS["standard_attention"]
+        assert_parity(
+            tpu_out.cpu(),
+            ref_out,
+            name=f"{impl_cls.__name__} standard attention",
+            max_rel_l2=max_rel_l2,
+            max_abs=max_abs,
+        )
 
     @pytest.mark.parametrize("impl_cls", [TpuSDPAImpl, TpuFlashAttentionImpl])
     def test_flux_joint_attention_asymmetry_numeric_parity_on_tpu(self, impl_cls):
@@ -165,7 +184,14 @@ class TestFluxTpuSDPAAttention:
         assert tpu_out.shape == (batch_size, q_len, num_heads, head_size)
         assert torch.all(torch.isfinite(tpu_out.cpu()))
 
-        assert_numerical_parity(tpu_out.cpu(), ref_out, atol=1e-2, rtol=1e-2)
+        max_rel_l2, max_abs = PARITY_BOUNDS["joint_attention"]
+        assert_parity(
+            tpu_out.cpu(),
+            ref_out,
+            name=f"{impl_cls.__name__} joint attention",
+            max_rel_l2=max_rel_l2,
+            max_abs=max_abs,
+        )
 
     @pytest.mark.parametrize("impl_cls", [TpuSDPAImpl, TpuFlashAttentionImpl])
     def test_flux_gqa_repeat_interleave_numeric_parity_on_tpu(self, impl_cls):
@@ -206,7 +232,14 @@ class TestFluxTpuSDPAAttention:
         assert tpu_out.shape == (batch_size, seq_len, num_heads, head_size)
         assert torch.all(torch.isfinite(tpu_out.cpu()))
 
-        assert_numerical_parity(tpu_out.cpu(), ref_out, atol=1e-2, rtol=1e-2)
+        max_rel_l2, max_abs = PARITY_BOUNDS["gqa_attention"]
+        assert_parity(
+            tpu_out.cpu(),
+            ref_out,
+            name=f"{impl_cls.__name__} GQA attention",
+            max_rel_l2=max_rel_l2,
+            max_abs=max_abs,
+        )
 
     @pytest.mark.parametrize("impl_cls", [TpuSDPAImpl, TpuFlashAttentionImpl])
     def test_flux_long_sequence_fixed_m_numeric_parity_on_tpu(self, impl_cls):
@@ -241,8 +274,13 @@ class TestFluxTpuSDPAAttention:
         v_tpu = value_cpu.to(device="tpu")
 
         tpu_out = impl.forward(q_tpu, k_tpu, v_tpu)
-        assert_numerical_parity(
-            tpu_out.cpu(), ref_out, atol=2e-2, rtol=2e-2, min_cos_sim=0.999
+        max_rel_l2, max_abs = PARITY_BOUNDS["long_sequence_attention"]
+        assert_parity(
+            tpu_out.cpu(),
+            ref_out,
+            name=f"{impl_cls.__name__} long-sequence attention",
+            max_rel_l2=max_rel_l2,
+            max_abs=max_abs,
         )
 
     def test_flux_masked_attention_fallback_matches_sdpa_on_tpu(self, monkeypatch):
@@ -327,7 +365,14 @@ class TestFluxTpuSDPAAttention:
         sdpa_f32 = sdpa_impl.forward(q_f32, k_f32, v_f32).cpu()
         torch.testing.assert_close(flash_f32, sdpa_f32, atol=0.0, rtol=0.0)
         ref_out = _sdpa_reference(query_cpu, key_cpu, value_cpu, scale)
-        assert_numerical_parity(flash_f32, ref_out, atol=1e-2, rtol=1e-2)
+        max_rel_l2, max_abs = PARITY_BOUNDS["masked_fallback_fp32"]
+        assert_parity(
+            flash_f32,
+            ref_out,
+            name="masked fallback fp32",
+            max_rel_l2=max_rel_l2,
+            max_abs=max_abs,
+        )
 
 
 class TestFluxRoPEPositionEmbeddingOnTpu:
@@ -422,5 +467,12 @@ class TestFluxRoPEKernelApplication:
         torch.testing.assert_close(tpu_k.cpu(), tpu_k_replay.cpu(), atol=0.0, rtol=0.0)
 
         # Numerical parity against CPU ground truth
-        assert_numerical_parity(tpu_q.cpu(), ref_q, atol=1e-4, rtol=1e-4)
-        assert_numerical_parity(tpu_k.cpu(), ref_k, atol=1e-4, rtol=1e-4)
+        for which, tpu_out, ref_out in (("q", tpu_q, ref_q), ("k", tpu_k, ref_k)):
+            max_rel_l2, max_abs = PARITY_BOUNDS[f"rope_{which}"]
+            assert_parity(
+                tpu_out.cpu(),
+                ref_out,
+                name=f"RoPE {which}",
+                max_rel_l2=max_rel_l2,
+                max_abs=max_abs,
+            )
