@@ -1354,16 +1354,6 @@ def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
         # buckets). Avoid falling back to the un-tuned (1, 16) tile which
         # fragments MXU work across 32x too many query blocks.
         page_tokens = tuning_key.page_size_per_kv_packing * tuning_key.kv_packing
-        if page_tokens == 256 and tuning_key.max_num_tokens >= 4096:
-            return TunableParams(
-                num_kv_pages_per_block=min(
-                    16, max(1, tuning_key.pages_per_seq)
-                ),
-                num_queries_per_block=512,
-                vmem_limit_bytes=54525952,
-                decode_batch_size=1,
-                q_split=8,
-            )
         if page_tokens >= 256:
             # 256- or 324-token unified-pool / large pages.
             num_kv_pages = (

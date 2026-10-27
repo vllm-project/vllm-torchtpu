@@ -106,10 +106,10 @@ def test_k3_tp32_page256_arbitrary_seqs_mixed_and_decode_tuned_params(
         pages_per_seq=128,
     )
     tuned_mixed = get_tuned_params(mixed_32seq)
-    assert tuned_mixed.num_kv_pages_per_block == 16
+    assert tuned_mixed.num_kv_pages_per_block == 8
     assert tuned_mixed.num_queries_per_block == 512
-    assert tuned_mixed.q_split == 8
-    assert tuned_mixed.vmem_limit_bytes == 52 * 1024 * 1024
+    assert tuned_mixed.q_split == 2
+    assert tuned_mixed.vmem_limit_bytes == 60 * 1024 * 1024
 
     decode_b1 = replace(mixed_32seq, case="batched_decode", max_num_tokens=1)
     tuned_b1 = get_tuned_params(decode_b1)
