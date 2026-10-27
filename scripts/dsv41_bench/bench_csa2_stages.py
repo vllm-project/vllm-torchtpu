@@ -5,7 +5,8 @@
 Encoder/decoder identify DSV41 layer stages, independently of the mask. These
 isolated causal cases exclude SparseCore gather, KV publication and projection.
 Use the serving harness separately to establish actual framework routing and
-end-to-end effects. Baseline is the generic CSA2 file exported from the PR base.
+end-to-end effects. Baseline can be a generic CSA2 file or a directory
+containing decode.py and prefill.py.
 """
 
 import argparse
@@ -53,19 +54,37 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--baseline", required=True, type=Path)
+    parser.add_argument("--rounds", type=int, default=1)
+    parser.add_argument(
+        "--stage",
+        choices=("prefill_encoder", "prefill_decoder", "decode"),
+        action="append",
+    )
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
     prefill, decode = load_kernels(root)
-    spec = importlib.util.spec_from_file_location("csa2_baseline", args.baseline)
-    assert spec is not None and spec.loader is not None
-    baseline = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(baseline)
+
+    def load_baseline(name):
+        path = args.baseline / f"{name}.py" if args.baseline.is_dir() else args.baseline
+        spec = importlib.util.spec_from_file_location(f"csa2_baseline_{name}", path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return (
+            getattr(module, f"csa2_{name}") if args.baseline.is_dir() else module.csa2
+        )
+
+    baseline_prefill = load_baseline("prefill")
+    baseline_decode = load_baseline("decode")
     versions = {p: importlib.metadata.version(p) for p in ("jax", "jaxlib", "libtpu")}
     assert versions == dict(jax="0.11.2", jaxlib="0.11.2", libtpu="0.0.50")
     args.out.mkdir(parents=True, exist_ok=True)
     device = jax.devices("tpu")[0]
     sources = list((root / "src/vllm_torchtpu/kernels/deepseek_v41/csa2").glob("*.py"))
-    sources += [args.baseline, Path(__file__)]
+    sources += (
+        list(args.baseline.glob("*.py")) if args.baseline.is_dir() else [args.baseline]
+    )
+    sources.append(Path(__file__))
     (args.out / "runtime.json").write_text(
         json.dumps(
             dict(
@@ -73,7 +92,7 @@ def main() -> None:
                 device=str(device),
                 device_kind=device.device_kind,
                 source_sha256={
-                    p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sources
+                    str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in sources
                 },
                 timing_basis="Single device; kernel and complete XLA module events",
                 layer_stage_basis="Model encoder/decoder layers, not mask semantics",
@@ -87,6 +106,8 @@ def main() -> None:
         ("decode", 48, 6),
     ]
     for stage, batch, num_tokens in cases:
+        if args.stage and stage not in args.stage:
+            continue
         host = make_inputs(batch, num_tokens, 64)
         selected = sorted(
             {
@@ -109,8 +130,10 @@ def main() -> None:
             inputs = jax.device_put(host, device)
             jax.block_until_ready(inputs)
 
-            def baseline_call(data, num_tokens=num_tokens):
-                return prefill_call(baseline.csa2, data, num_tokens)
+            def baseline_call(data, num_tokens=num_tokens, stage=stage):
+                if args.baseline.is_dir() and stage != "prefill_encoder":
+                    return baseline_decode(**data, num_tokens=num_tokens)
+                return prefill_call(baseline_prefill, data, num_tokens)
 
             def candidate_call(data, num_tokens=num_tokens, stage=stage):
                 if stage == "prefill_encoder":
@@ -151,7 +174,7 @@ def main() -> None:
                 )
                 variants.append((variant, compiled, compile_seconds, correctness))
                 del output
-            for repeat in range(2):
+            for repeat in range(args.rounds):
                 for variant, compiled, compile_seconds, correctness in (
                     variants if repeat == 0 else reversed(variants)
                 ):
