@@ -478,6 +478,8 @@ def csa2_prefill(
         page = pages_ref[request, jnp.clip(column, 0, pages_ref.shape[1] - 3) + 2]
         valid = (position < right) & (position + page_size > left)
         valid &= (column >= 0) & (column < pages_ref.shape[1] - 2)
+        # A page outside the owner would DMA past it and halt the core.
+        valid &= (page >= 0) & (page < sum(b.shape[0] for b in banks))
         if len(banks) == 2:
             valid &= (
                 (page < banks[0].shape[0]) if bank == 0 else (page >= banks[0].shape[0])
