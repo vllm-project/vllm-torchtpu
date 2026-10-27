@@ -47,7 +47,6 @@ def _decode_kernel(
     block_q: int,
     scale: float,
     tokens_per_seq: int | None = None,
-    decoder_prefill: bool = False,
 ) -> None:
     log2_e = math.log2(math.e)
     seq_start = pl.program_id(0) * block_seq
@@ -250,8 +249,6 @@ def _decode_kernel(
         for r, i in enumerate(indices):
             main_logits = qk_values[r]
             kv_scales = token_ref(main_scale_ref, i)[...]
-            if not decoder_prefill:
-                kv_scales = kv_scales.astype(jnp.bfloat16).astype(jnp.float32)
             main_logits = main_logits * (kv_scales * (scale * log2_e))
 
             sink = sink_ref[...] * log2_e
@@ -277,9 +274,6 @@ def _decode_kernel(
             exponentials = exponentials / denominator
             # The denominator uses unscaled weights; fold KV scales into
             # main PV weights and round once to BF16.
-            kv_scales = token_ref(main_scale_ref, i)[...]
-            if not decoder_prefill:
-                kv_scales = kv_scales.astype(jnp.bfloat16)
             main_p_ref[probability_slots[i]] = (
                 exponentials[:, :512] * kv_scales
             ).astype(jnp.bfloat16)
@@ -385,7 +379,6 @@ def _decode_kernel(
     static_argnames=(
         "num_tokens",
         "scale",
-        "decoder_prefill",
     ),
 )
 def csa2_decode(
@@ -401,7 +394,6 @@ def csa2_decode(
     num_tokens: int = 6,
     scale: float = 512**-0.5,
     main_lengths: jax.Array,
-    decoder_prefill: bool = False,
 ) -> jax.Array:
     """Causal CSA2 for consecutive, equal-length sequences.
 
@@ -411,8 +403,6 @@ def csa2_decode(
     with FP32 scales [T,512] and authoritative valid counts [T].
     SWA is finite BF16 [pages,page_size,512], including a reserved zero page.
     swa_page [B,2+C] stores page base, minimum visibility and physical page IDs.
-    decoder_prefill reuses this pipeline for the model's decoder-layer prefill,
-    retaining that path's FP32 KV scales. It does not change SWA visibility.
     """
     if q.ndim != 3 or q.shape[2] != 512:
         raise ValueError("CSA2 q must have shape [T,H,512]")
@@ -499,7 +489,6 @@ def csa2_decode(
         block_q=block_q,
         scale=scale,
         tokens_per_seq=num_tokens if tiled else None,
-        decoder_prefill=decoder_prefill,
     )
     in_specs = (
         query_spec((num_heads, 512)),

@@ -115,11 +115,7 @@ def main() -> None:
             def candidate_call(data, num_tokens=num_tokens, stage=stage):
                 if stage == "prefill_encoder":
                     return prefill_call(prefill, data, num_tokens)
-                return decode(
-                    **data,
-                    num_tokens=num_tokens,
-                    decoder_prefill=stage == "prefill_decoder",
-                )
+                return decode(**data, num_tokens=num_tokens)
 
             variants = []
             for variant, call in (
