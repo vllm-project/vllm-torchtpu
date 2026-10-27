@@ -207,15 +207,18 @@ CTX_C = [3001, 100]  # request 0: g_a holds one old token; request 1: g_a starts
 
 
 def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, rank_ids: bool = False,
-           union: bool = False, stats: bool = False, loop: bool = False):
+           union: bool = False, stats: bool = False, loop: bool = False, ctx: list | None = None,
+           max_groups: int | None = None):
     from vllm_torchtpu.megakernel.wholestep.qsa_full_b import DBG_IDS, DBG_IQ
     from vllm_torchtpu.megakernel.wholestep.qsa_full_c import CK_NEW, IR_NEW, KR_NEW, RING_NEW
 
+    CTX = CTX_C if ctx is None else ctx
+    MG = MAX_GROUPS if max_groups is None else max_groups
     R = 2
     ex = ExecSpec(R=R, B=2 * T, T=T, ctx=128, interpret=True, tiles=_TILES)
     d = wi.random_wholestep_inputs(key, G, ex, L, budget=BUDGET, n_pages=PAGES, identical_experts=True)
-    d = wi.add_indexer_inputs(key, G, ex, d, L, max_groups=MAX_GROUPS, ctx=CTX_C)
-    d = wi.add_step_inputs(key, G, ex, d, L, ctx=CTX_C)
+    d = wi.add_indexer_inputs(key, G, ex, d, L, max_groups=MG, ctx=CTX)
+    d = wi.add_step_inputs(key, G, ex, d, L, ctx=CTX)
     if long:  # served long-context mode: HBM page tables, one request's scores at a time
         d = wi.add_carrier(key, d)
         d["hbm_tables"] = True
@@ -227,7 +230,7 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
                    union_stats=stats, loop_requests=loop)
     spec = wholestep_spec(
         G, R, L=L, qsa=dict(budget=BUDGET), step=True,
-        indexed=dict(max_groups=MAX_GROUPS, pages_per_seq=pps, debug=True, **(long_kw if long else {})),
+        indexed=dict(max_groups=MG, pages_per_seq=pps, debug=True, **(long_kw if long else {})),
     )
     w_mk, states = wi.pack_wholestep(spec, G, ex, d, L)
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
