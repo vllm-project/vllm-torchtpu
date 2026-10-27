@@ -37,7 +37,7 @@ from vllm_torchtpu.megakernel.wholestep.qsa_full import KV_NEW
 from vllm_torchtpu.megakernel.wholestep.spec import wholestep_spec
 
 from .qwen38_scatter import scatter_gdn_ckpts_fast
-from .qwen38_segment_call import GDN_META, T_VERIFY, gdn_blocks, segment_tiles
+from .qwen38_segment_call import GDN_META, T_VERIFY, gdn_blocks, ring_depths, segment_tiles
 from .qwen38_wholestep_cache import QSALayerCache, wholestep_qsa_writes
 from .qwen38_wholestep_inputs import qsa_step_inputs
 
@@ -75,11 +75,18 @@ def indexed_options() -> dict:
     )
 
 
-def wholestep_tiles(B: int) -> Tiles:
+def wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
     """Segment tiles, with the 64-row ring depths from 48 rows up: at 48 rows the segment's
     (6, 10) rings leave the whole-step kernel 0.65 MiB over the 62 MiB VMEM limit (w01
-    j-508c1d10: CompileTimeScopedVmemOom 62.63M at qwen38_mk_whole_b48)."""
-    return segment_tiles(B, rings=(6, 4) if B >= 48 else None)
+    j-508c1d10: CompileTimeScopedVmemOom 62.63M at qwen38_mk_whole_b48). Past 32768 groups
+    (262K contexts) the 16-row kernel's selection temporaries double and miss by 0.13 MiB
+    (j-38d236d7: 62.23M at 65536 groups), so up to 16 rows the expert ring drops one 2 MiB slot."""
+    if B >= 48:
+        return segment_tiles(B, rings=(6, 4))
+    if B <= 16 and max_groups > 32768:
+        nbe, nbd = ring_depths(B)
+        return segment_tiles(B, rings=(nbe - 1, nbd))
+    return segment_tiles(B)
 
 
 def build_wholestep_call(
@@ -101,7 +108,7 @@ def build_wholestep_call(
     R = mesh.size
     T = T_VERIFY
     ex = ExecSpec(
-        R=R, B=B, T=T, ctx=128, tiles=wholestep_tiles(B) if tiles is None else tiles,
+        R=R, B=B, T=T, ctx=128, tiles=wholestep_tiles(B, max_groups) if tiles is None else tiles,
         interpret=interpret,
     )
     n_att = L // g.att_every

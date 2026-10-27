@@ -89,7 +89,7 @@ class _WholeKind:
 
             full, in_specs, outs, donate = build_wholestep_call(
                 self.mesh, self.g, B, self.layout, self.qsa, L=L_WHOLE,
-                tiles=wholestep_tiles(B), **self.kw,
+                tiles=wholestep_tiles(B, self.kw["max_groups"]), **self.kw,
             )
             typed = make_typed_step_wrapper(f"qwen38_mk_whole_b{B}", full, len(in_specs), len(outs))
             self._calls[B] = sharded_jax_callable(
@@ -124,7 +124,7 @@ class Qwen38WholeStep(nn.Module):
             g, R, L=L_WHOLE, first="qsa", pool_gdn=True, qsa=dict(budget=budget), step=True,
             indexed=dict(max_groups=max_groups, pages_per_seq=pps, carrier="fp8", n_layers=n_att, **indexed_options()),
         )
-        ex = ExecSpec(R=R, B=buckets[0], T=T_VERIFY, ctx=128, tiles=wholestep_tiles(buckets[0]))
+        ex = ExecSpec(R=R, B=buckets[0], T=T_VERIFY, ctx=128, tiles=wholestep_tiles(buckets[0], max_groups))
         ops = pack_wholestep_operands(model, g, spec, ex, ids)
         # Host round-trip of the small packed operands (operand_hold): w08r c1's whole-step
         # steps ran 18 per-call execute_as_strided programs more than stock (+0.85 ms/step).
