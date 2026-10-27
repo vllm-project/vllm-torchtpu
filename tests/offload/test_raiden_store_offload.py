@@ -3823,6 +3823,7 @@ class TestDivergedHybridHitLookup(unittest.TestCase):
             parallel_config=SimpleNamespace(
                 world_size=2, decode_context_parallel_size=1
             ),
+            kv_transfer_config=SimpleNamespace(kv_load_failure_policy="fail"),
         )
         self.scheduler = TPURaidenOffloadingScheduler(
             spec, vllm_config, kv_cache_config

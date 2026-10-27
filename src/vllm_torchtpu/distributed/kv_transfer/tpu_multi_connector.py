@@ -69,6 +69,17 @@ class TPUMultiConnector(MultiConnector):
             if fn is not None:
                 fn(runner)
 
+    @classmethod
+    def _get_connector_classes_and_configs(cls, vllm_config):
+        # The scheduler applies the parent's KV load failure policy, so the
+        # children use it too, e.g. as the `policy` label of
+        # `vllm:kv_load_failures`.
+        pairs = super()._get_connector_classes_and_configs(vllm_config)
+        policy = vllm_config.kv_transfer_config.kv_load_failure_policy
+        for _, child_config in pairs:
+            child_config.kv_transfer_config.kv_load_failure_policy = policy
+        return pairs
+
     def get_block_ids_with_load_errors_group_index(self) -> int | None:
         """Return the KV cache group shared by all children's load errors.
 

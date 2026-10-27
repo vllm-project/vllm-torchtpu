@@ -57,12 +57,20 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorPromMetrics,
+    PromMetric,
+    PromMetricT,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
     config as offloading_config_module,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadPromMetrics,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
@@ -80,11 +88,17 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     CanonicalKVCacheTensor,
     GPULoadStoreSpec,
+    OffloadingCounterMetadata,
     OffloadKey,
 )
 from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
+    KV_LOAD_FAILURES_DOC,
+    KV_LOAD_FAILURES_METRIC_NAME,
+    create_kv_load_failures_counter,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.offload.raiden_store import (
     AdmissionOp,
@@ -206,6 +220,10 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         assert isinstance(self.manager, RaidenOffloadingManager)
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
+        self._kv_load_failure_labels = (
+            "TPURaidenOffloadingConnector",
+            vllm_config.kv_transfer_config.kv_load_failure_policy,
+        )
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -276,6 +294,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         drained = manager.drain_jobs(launched_flush_ids) if launched_flush_ids else []
 
         # Collect completed/drained jobs for the worker echo channel.
+        failed_load_req_ids: set[str] = set()
         for finished_job in list(drained) + manager.poll_finished_jobs():
             if finished_job.op == AdmissionOp.STORE:
                 finished_store_ids.append(finished_job.job_id)
@@ -283,6 +302,14 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 assert finished_job.req_id is not None
                 finished_loads[finished_job.job_id] = finished_job.req_id
                 failed_load_block_ids.extend(finished_job.failed_device_block_ids)
+                if finished_job.failed_device_block_ids:
+                    failed_load_req_ids.add(finished_job.req_id)
+        if failed_load_req_ids:
+            self._connector_stats.increase_counter(
+                KV_LOAD_FAILURES_METRIC_NAME,
+                len(failed_load_req_ids),
+                labelvalues=self._kv_load_failure_labels,
+            )
 
         # Return empty load_jobs/store_jobs: workers act as passive DMA endpoints.
         return RaidenOffloadingConnectorMetadata(
@@ -312,6 +339,30 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                         job_id, parked.keys, parked.device_block_ids
                     )
         super().update_connector_output(connector_output)
+
+
+class TpuOffloadPromMetrics(OffloadPromMetrics):
+    """Upstream offloading metrics plus `vllm:kv_load_failures`."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ):
+        super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
+        self._offloading_metric_metadata[KV_LOAD_FAILURES_METRIC_NAME] = (
+            OffloadingCounterMetadata(
+                documentation=KV_LOAD_FAILURES_DOC,
+                labelnames=("connector", "policy"),
+            )
+        )
+        self._offloading_metric_defs[KV_LOAD_FAILURES_METRIC_NAME] = (
+            create_kv_load_failures_counter(
+                self._counter_cls, vllm_config, labelnames, per_engine_labelvalues
+            )
+        )
 
 
 class TPURaidenOffloadingConnector(OffloadingConnector):
@@ -423,6 +474,18 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         if self.connector_scheduler is not None:
             return self.connector_scheduler.take_events()
         return []
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> KVConnectorPromMetrics:
+        return TpuOffloadPromMetrics(
+            vllm_config, metric_types, labelnames, per_engine_labelvalues
+        )
 
     # -- worker-side hooks -------------------------------------------------
     def register_kv_caches(

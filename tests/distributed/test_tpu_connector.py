@@ -6150,6 +6150,20 @@ class TestTPUConnectorStats(unittest.TestCase):
         counter = self.metrics.counter_kv_cache_evictions[0]
         assert counter._value.get() == 7.0
 
+    def test_prometheus_counter_kv_load_failures(self):
+        stats = TpuKVConnectorStats()
+        assert stats.is_empty() is True
+        stats.record_kv_load_failures("TPURaidenConnector", "recompute", count=2)
+        assert stats.is_empty() is False
+        self.metrics.observe(stats.data, engine_idx=0)
+        child = self.metrics.counter_kv_load_failures.labels(
+            model_name="my_model",
+            engine="0",
+            connector="TPURaidenConnector",
+            policy="recompute",
+        )
+        assert child._value.get() == 2.0
+
     def test_tpu_stats_aggregation_queue_lengths(self):
         stats = TpuKVConnectorStats()
         reduced = stats.reduce()

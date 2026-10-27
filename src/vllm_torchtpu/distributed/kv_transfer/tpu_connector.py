@@ -69,6 +69,7 @@ from vllm.distributed.parallel_state import (
 from vllm.utils.math_utils import round_down
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
@@ -783,6 +784,14 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         super().__init__(vllm_config, role, kv_cache_config)
         assert vllm_config.kv_transfer_config is not None
         self._connector_metadata: TPUConnectorMetadata | None = None
+        # Scheduler side, for `vllm:kv_load_failures`: see `_count_load_failures`.
+        self._load_claims: dict[str, set[int]] = {}
+        self._retiring_load_claims: dict[str, int] = {}
+        self._num_kv_load_failures = 0
+        self._kv_load_failure_policy = (
+            vllm_config.kv_transfer_config.kv_load_failure_policy
+        )
+        self._max_concurrent_batches = vllm_config.max_concurrent_batches
         use_raiden = self.force_raiden_connector or _use_raiden_connector(vllm_config)
         self.use_raiden = use_raiden
         self._stage3_fa_group_index = 0
@@ -859,6 +868,15 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
         assert self.connector_scheduler is not None
+        if num_external_tokens > 0:
+            # A re-admitted (e.g. preempted) request starts a new claim.
+            self._retiring_load_claims.pop(request.request_id, None)
+            self._load_claims[request.request_id] = {
+                block_id
+                for group in blocks.get_block_ids()
+                for block_id in group
+                if block_id != 0
+            }
         return self.connector_scheduler.update_state_after_alloc(
             request, blocks, num_external_tokens
         )
@@ -868,6 +886,10 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         scheduler_output: SchedulerOutput,
     ) -> TPUConnectorMetadata:
         assert self.connector_scheduler is not None
+        # A scheduled request is not waiting for its load, so the load runs
+        # inline in this step and any failure shows up in this step's output.
+        for req_id in scheduler_output.num_scheduled_tokens:
+            self._retire_load_claim(req_id)
         return self.connector_scheduler.build_connector_meta(scheduler_output)
 
     def request_finished(
@@ -876,6 +898,7 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
+        self._retire_load_claim(request.request_id)
         return self.connector_scheduler.request_finished(request, block_ids)
 
     def request_finished_all_groups(
@@ -884,6 +907,7 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
+        self._retire_load_claim(request.request_id)
 
         if self.use_raiden and _use_raiden_stage3_transport():
             for transfer_group in self._stage3_transfer_groups:
@@ -991,17 +1015,26 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         gpu_block_pool._tpu_eviction_counter_bound = True
 
     def _take_scheduler_stats(self) -> TpuKVConnectorStats | None:
-        """Drain the HBM block evictions counted since the last step.
+        """Drain the HBM block evictions and KV load failures counted since
+        the last step.
 
-        `bind_gpu_block_pool` does the counting; vLLM merges scheduler-side
-        connector stats into the step's stats.
+        `bind_gpu_block_pool` counts evictions and `_count_load_failures`
+        counts load failures; vLLM merges scheduler-side connector stats into
+        the step's stats.
         """
         num_evicted_blocks = getattr(self, "_num_evicted_blocks", 0)
-        if not num_evicted_blocks:
+        num_kv_load_failures = getattr(self, "_num_kv_load_failures", 0)
+        if not num_evicted_blocks and not num_kv_load_failures:
             return None
-        self._num_evicted_blocks = 0
         stats = TpuKVConnectorStats()
-        stats.record_evicted_blocks(num_evicted_blocks)
+        if num_evicted_blocks:
+            self._num_evicted_blocks = 0
+            stats.record_evicted_blocks(num_evicted_blocks)
+        if num_kv_load_failures:
+            self._num_kv_load_failures = 0
+            stats.record_kv_load_failures(
+                type(self).__name__, self._kv_load_failure_policy, num_kv_load_failures
+            )
         return stats
 
     @classmethod
@@ -1092,8 +1125,50 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
             return self._stage3_fa_group_index
         return None
 
-    def update_connector_output(self, connector_output: Any) -> None:
-        """Retires scheduler-side Stage-3 dedup state on real completion."""
+    def _retire_load_claim(self, request_id: str) -> None:
+        """Drop the request's load claim once its load can no longer fail.
+
+        That is after the output of the current step is counted: under the
+        `fail` policy the scheduler finishes a request whose load failed
+        before it passes the output to `update_connector_output`. With
+        `max_concurrent_batches` > 1 (async scheduling or pipeline
+        parallelism), the outputs of earlier steps arrive first.
+        """
+        if request_id in self._load_claims:
+            self._retiring_load_claims.setdefault(
+                request_id, self._max_concurrent_batches
+            )
+
+    def _count_load_failures(self, connector_output: KVConnectorOutput) -> None:
+        """Count requests that hold a block whose external load failed.
+
+        A request is counted once, even if it is reported again. Each claim
+        holds all of the request's blocks when its load was admitted, so a
+        request that shares a failed block with another request's load is
+        counted too.
+        """
+        invalid_block_ids = connector_output.invalid_block_ids
+        if invalid_block_ids:
+            for req_id, block_ids in list(self._load_claims.items()):
+                if not invalid_block_ids.isdisjoint(block_ids):
+                    self._num_kv_load_failures += 1
+                    del self._load_claims[req_id]
+                    self._retiring_load_claims.pop(req_id, None)
+        for req_id in connector_output.finished_recving or ():
+            self._load_claims.pop(req_id, None)
+        # Counts connector outputs: vLLM skips this hook for a step without
+        # one, but TPU workers send one every step.
+        for req_id, outputs_left in list(self._retiring_load_claims.items()):
+            if outputs_left > 1:
+                self._retiring_load_claims[req_id] = outputs_left - 1
+            else:
+                del self._retiring_load_claims[req_id]
+                self._load_claims.pop(req_id, None)
+
+    def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
+        """Counts failed KV loads, and retires scheduler-side Stage-3 dedup
+        state on real completion."""
+        self._count_load_failures(connector_output)
         scheduler = self.connector_scheduler
         if scheduler is not None and hasattr(scheduler, "update_connector_output"):
             scheduler.update_connector_output(connector_output)
