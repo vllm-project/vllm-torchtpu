@@ -561,6 +561,17 @@ class Eagle3Proposer:
             owner = greedy_top_tokens._DraftHeadOwnerProxy(
                 owner.logits_processor, proxy_head
             )
+        elif (
+            head_quant is None
+            and self.runner._dp_lockstep_enabled()
+            and greedy_top_tokens.draft_vocab_parallel_enabled()
+            and self._dp_lockstep_sharded()
+            and not self._draft_replicated
+        ):
+            # EP-DP lockstep, TP-sharded draft: every rank runs every draft
+            # pass at the same loop bucket, so the BF16 head can be split
+            # over the whole DP x TP group (TPU_DRAFT_VOCAB_PARALLEL=0 opts out).
+            owner = greedy_top_tokens.vocab_parallel_draft_owner(owner)
         self._draft_greedy_head_owner = owner
         logger.info(
             "TPU_GREEDY_TOP_TOKENS enabled for draft proposer (%s, quant=%s).",

@@ -413,6 +413,10 @@ def tpu_get_top_tokens(
         raise ValueError(
             f"scale must be > 0.0 for greedy argmax reduction, got {self.scale}"
         )
+    if getattr(lm_head, "_vp_draft", False):
+        return _vocab_parallel_draft_top_tokens(
+            self, lm_head, hidden_states, embedding_bias
+        )
     tp_size = lm_head.tp_size
     quant_mode = getattr(lm_head, "_quant_mode", None)
     if quant_mode == "fp8" and embedding_bias is None and self.soft_cap is None:
@@ -886,6 +890,230 @@ def quantize_lm_head(
             else "freed BF16 weight",
         )
     return head
+
+
+class _DraftHeadOwnerProxy(torch.nn.Module):
+    """Owner proxy pairing ``logits_processor`` with a draft ``lm_head`` (the
+    vocab-parallel draft head)."""
+
+    def __init__(
+        self, logits_processor: LogitsProcessor, lm_head: torch.nn.Module
+    ) -> None:
+        super().__init__()
+        self.logits_processor = logits_processor
+        self.lm_head = lm_head
+
+
+def draft_vocab_parallel_enabled() -> bool:
+    """``TPU_DRAFT_VOCAB_PARALLEL`` (default on): under expert-parallel data
+    parallelism with a tensor-parallel draft, the draft's BF16 greedy head is
+    split over the whole DP x TP group instead of within each TP group (see
+    ``_VocabParallelDraftHead``). ``0`` keeps the per-TP-group head."""
+    import os
+
+    return os.environ.get("TPU_DRAFT_VOCAB_PARALLEL", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+class _VocabParallelDraftHead(torch.nn.Module):
+    """The draft's BF16 greedy head split over all DP x TP ranks.
+
+    Under EP-DP lockstep every DP engine's TP group holds the same TP shard
+    of the head, so each draft pass streams ``vocab / tp`` rows per rank (at
+    DP4 x TP2: 124,160 x 4,096 BF16, ~1 GB) for that engine's own few rows.
+    Here DP rank ``d`` of TP rank ``t`` keeps only the ``d``-th of ``dp``
+    equal slices of its TP shard, i.e. global vocabulary slice
+    ``t * dp + d``. A pass all-gathers every engine's hidden rows over DP,
+    computes its slice's logits for all of them with the head's own quant
+    method (the same BF16 matmul, mask and local max as the per-TP-group
+    path), all-gathers the ``(value, index)`` pairs over the EP group
+    (= DP x TP), puts them in vocabulary order and keeps this engine's rows.
+    The argmax over slices in vocabulary order takes the first maximum, so
+    ties resolve to the lowest token id, as ``torch.argmax`` does over the
+    full logits. Each rank streams ``1 / dp`` of the bytes.
+
+    Every rank must run each pass, with the same row count: true under
+    EP-DP lockstep for a TP-sharded draft, where busy and idle engines run
+    the same ``_draft_propose_token`` / fused-loop programs at the loop
+    bucket of ``max_num_reqs`` (``Eagle3Proposer._loop_bucket``).
+    Rank-specific values (vocab start, padding, DP rank) are tensor buffers
+    so every rank compiles the same program.
+    """
+
+    def __init__(
+        self,
+        base_head: torch.nn.Module,
+        dp_rank: int,
+        dp_size: int,
+        tp_rank: int,
+        tp_size: int,
+    ) -> None:
+        super().__init__()
+        weight = base_head.weight
+        shard_vocab = int(weight.shape[0])
+        if shard_vocab % dp_size:
+            raise ValueError(
+                f"TP shard of {shard_vocab} rows does not split into {dp_size} "
+                "equal DP slices"
+            )
+        n = shard_vocab // dp_size
+        si = base_head.shard_indices
+        shard_pad = int(si.num_org_vocab_padding)
+        valid = max(0, min(n, shard_vocab - shard_pad - dp_rank * n))
+        start = int(si.org_vocab_start_index) + dp_rank * n
+        self.weight = torch.nn.Parameter(
+            weight.detach()[dp_rank * n : (dp_rank + 1) * n].clone(),
+            requires_grad=False,
+        )
+        self.quant_method = base_head.quant_method
+        self.tp_size = tp_size
+        self.dp_size = dp_size
+        self.num_slices = dp_size * tp_size
+        from types import SimpleNamespace
+
+        self.shard_indices = SimpleNamespace(
+            org_vocab_start_index=start, num_org_vocab_padding=n - valid
+        )
+        device = weight.device
+        self.register_buffer(
+            "org_vocab_start_index",
+            torch.tensor(start, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "num_org_vocab_padding",
+            torch.tensor(n - valid, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "vp_dp_rank",
+            torch.tensor([dp_rank], dtype=torch.int64, device=device),
+            persistent=False,
+        )
+        # Pairs arrive in EP-group order (rank dp * tp_size + tp, checked in
+        # vocab_parallel_draft_owner); slice k belongs to tp = k // dp_size,
+        # dp = k % dp_size. perm[k] is that rank's position in the gather.
+        perm = [
+            (k % dp_size) * tp_size + k // dp_size for k in range(self.num_slices)
+        ]
+        self.register_buffer(
+            "vp_slice_order",
+            torch.tensor(perm, dtype=torch.int64, device=device),
+            persistent=False,
+        )
+        self._vp_draft = True
+        self._quant_mode = None
+        self._quant_group_size = None
+        self._quant_desc = "bf16"
+
+
+def _vocab_parallel_draft_top_tokens(
+    processor: LogitsProcessor,
+    lm_head: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    embedding_bias: torch.Tensor | None,
+) -> torch.Tensor:
+    """``tpu_get_top_tokens`` for a ``_VocabParallelDraftHead``: the same
+    logits, mask and local max as its BF16 fallback path, over all DP
+    engines' rows and this rank's vocabulary slice."""
+    from vllm.distributed.parallel_state import get_dp_group, get_ep_group
+
+    dp_size = int(lm_head.dp_size)
+    num_slices = int(lm_head.num_slices)
+    rows = hidden_states.shape[0]
+    all_rows = get_dp_group().all_gather(hidden_states, dim=0)
+    logits = processor._apply_head(lm_head, all_rows, embedding_bias)
+    if processor.soft_cap is not None:
+        logits = torch.tanh(logits / processor.soft_cap) * processor.soft_cap
+    if processor.scale != 1.0:
+        logits = logits * processor.scale
+    slice_vocab = logits.shape[-1]
+    col_idx = torch.arange(slice_vocab, device=logits.device, dtype=torch.int32)
+    valid_cols = slice_vocab - lm_head.num_org_vocab_padding.to(
+        device=logits.device, dtype=torch.int32
+    )
+    logits = logits.masked_fill((col_idx >= valid_cols).unsqueeze(0), -float("inf"))
+    local_max_vals, local_max_indices = logits.max(dim=-1)
+    global_indices = local_max_indices.to(torch.int32) + (
+        lm_head.org_vocab_start_index.to(device=logits.device, dtype=torch.int32)
+    )
+    local_pair = torch.stack(
+        [local_max_vals.float(), global_indices.float()], dim=-1
+    )  # [dp * rows, 2]
+    gathered = get_ep_group().all_gather(local_pair, dim=0)
+    gathered = gathered.view(num_slices, dp_size, rows, 2)
+    gathered = gathered.index_select(0, lm_head.vp_slice_order)
+    mine = gathered.index_select(1, lm_head.vp_dp_rank).squeeze(1)  # [slices, rows, 2]
+    max_slice = mine[:, :, 0].argmax(dim=0, keepdim=True)
+    top_tokens = mine[:, :, 1].gather(dim=0, index=max_slice)
+    return top_tokens.squeeze(0).to(torch.int64)
+
+
+def vocab_parallel_draft_owner(owner: torch.nn.Module) -> torch.nn.Module:
+    """``owner`` with its BF16 head replaced by a ``_VocabParallelDraftHead``
+    when the DP / EP / TP groups allow it (EP group = DP x TP with rank
+    ``dp * tp_size + tp``, TP shard divisible by DP); ``owner`` unchanged
+    otherwise. The caller decides that the draft runs under EP-DP lockstep
+    with a TP-sharded head."""
+    from vllm.distributed.parallel_state import (
+        get_dp_group,
+        get_ep_group,
+        get_tp_group,
+    )
+
+    head = owner.lm_head
+    weight = getattr(head, "weight", None)
+    if (
+        getattr(head, "_quant_mode", None) is not None
+        or not isinstance(weight, torch.Tensor)
+        or weight.dtype != torch.bfloat16
+    ):
+        return owner
+    dp, ep, tp = get_dp_group(), get_ep_group(), get_tp_group()
+    dp_size, tp_size = int(dp.world_size), int(tp.world_size)
+    reason = None
+    if dp_size <= 1:
+        reason = "a single DP engine"
+    elif int(head.tp_size) != tp_size:
+        reason = f"head tp_size {head.tp_size} != TP group {tp_size}"
+    elif int(ep.world_size) != dp_size * tp_size:
+        reason = f"EP group {ep.world_size} != DP {dp_size} x TP {tp_size}"
+    elif int(ep.rank_in_group) != int(dp.rank_in_group) * tp_size + int(
+        tp.rank_in_group
+    ):
+        reason = (
+            f"EP rank {ep.rank_in_group} != DP rank {dp.rank_in_group} x "
+            f"{tp_size} + TP rank {tp.rank_in_group}"
+        )
+    elif weight.shape[0] % dp_size:
+        reason = f"TP shard of {weight.shape[0]} rows not divisible by DP {dp_size}"
+    if reason is not None:
+        logger.warning(
+            "TPU_DRAFT_VOCAB_PARALLEL: keeping the per-TP-group draft head (%s).",
+            reason,
+        )
+        return owner
+    vp_head = _VocabParallelDraftHead(
+        head, int(dp.rank_in_group), dp_size, int(tp.rank_in_group), tp_size
+    )
+    logger.info(
+        "TPU_DRAFT_VOCAB_PARALLEL: draft lm_head vocab-parallel over DP%d x TP%d "
+        "= %d slices; this rank: vocab [%d, %d), weight %s %s (was %s per TP "
+        "group). Same BF16 logits; ties to the lowest token id.",
+        dp_size,
+        tp_size,
+        dp_size * tp_size,
+        vp_head.shard_indices.org_vocab_start_index,
+        vp_head.shard_indices.org_vocab_start_index + vp_head.weight.shape[0],
+        tuple(vp_head.weight.shape),
+        str(vp_head.weight.dtype).replace("torch.", ""),
+        tuple(weight.shape),
+    )
+    return _DraftHeadOwnerProxy(owner.logits_processor, vp_head)
 
 
 # The draft's BF16 head, kept on the target head when the target's is
