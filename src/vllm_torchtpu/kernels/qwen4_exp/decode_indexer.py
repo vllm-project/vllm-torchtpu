@@ -145,6 +145,7 @@ def select_index_blocks(
     topk_backend: TopKBackend | None = None,
     scheduling_group_namespace: int | None = None,
     vmem_limit_bytes: int | None = None,
+    prefix_capacity: int | None = None,
 ):
     """Share ragged query-block reuse and bounded per-query scoring schedules.
 
@@ -154,11 +155,15 @@ def select_index_blocks(
     T>padded request capacity is a static scheduling heuristic, not a semantic
     mode classifier, safety requirement or proven profitability boundary.
     Per-request starts/context and per-query causal lengths are authoritative.
+    The default SC/QSA prefill composition opts into query-sized score capacity.
+    Injected backends stay full unless prefix_capacity explicitly certifies their
+    reduced-pitch contract together with this extent-preserving QSA schedule.
     """
     resource_options = (
         {} if vmem_limit_bytes is None else {"vmem_limit_bytes": vmem_limit_bytes}
     )
-    if topk_backend is None:
+    default_backend = topk_backend is None
+    if default_backend:
         topk_backend = SparseCoreTopK()
     page_size = cache.shape[1] * 2
     query_width = query.shape[-1]
@@ -167,6 +172,8 @@ def select_index_blocks(
     if (starts is None) != (context is None):
         raise ValueError("starts and context must be supplied together")
     if starts is not None and context is not None and len(query) > len(context):
+        if prefix_capacity is None and default_backend:
+            prefix_capacity = max(block_topk, (len(query) + ratio - 1) // ratio)
         query_lens = starts[1:] - starts[:-1]
         num_seqs = jnp.max(
             jnp.where(query_lens > 0, jnp.arange(len(context), dtype=jnp.int32) + 1, 0)
@@ -187,6 +194,7 @@ def select_index_blocks(
             enable_early_exit=True,
             chunk_tokens=512 if len(query) % 512 == 0 else None,
             components=qsa_indexing(ratio - 1),
+            prefix_capacity=prefix_capacity,
             topk_backend=topk_backend,
             scheduling_group_namespace=scheduling_group_namespace,
             **resource_options,

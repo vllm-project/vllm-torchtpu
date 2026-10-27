@@ -405,3 +405,74 @@ def test_production_compact_factory_exposes_compiler_owned_namespace(monkeypatch
         for n in module.graph.nodes
         if n.op == "call_function"
     ] == [1, 2]
+
+
+@pytest.mark.parametrize("mode", ["default", "injected", "explicit"])
+def test_prefill_prefix_capacity_preserves_functional_visibility(monkeypatch, mode):
+    import importlib
+
+    stream = importlib.import_module(
+        "vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk"
+    )
+    widths = []
+
+    def pallas_call(kernel, **kwargs):
+        shape = kwargs["out_shape"].shape
+
+        def score(*args):
+            values = jnp.broadcast_to(
+                jnp.arange(shape[1] * 128, dtype=jnp.float32),
+                (shape[0], shape[1] * 128),
+            )
+            return jax.lax.bitcast_convert_type(values, jnp.int32).reshape(shape)
+
+        return score
+
+    original = ReferenceTopK.select
+
+    def select(self, bits, k, row_lengths, *, scheduling_group_id, return_scores):
+        jax.debug.callback(lambda: widths.append(bits.shape[1]), ordered=True)
+        return original(
+            ReferenceTopK(),
+            bits,
+            k,
+            row_lengths,
+            scheduling_group_id=None,
+            return_scores=return_scores,
+        )
+
+    # Real adapter, metadata, JIT, ranking and visibility; hardware score/SC
+    # bodies alone are replaced by monotonic float32 scores and CPU selection.
+    monkeypatch.setattr(stream.pl, "pallas_call", pallas_call)
+    monkeypatch.setattr(ReferenceTopK, "select", select)
+    monkeypatch.setattr(SparseCoreTopK, "select", select)
+    stream.streamindex_topk.clear_cache()
+    options = {} if mode == "default" else {"topk_backend": ReferenceTopK()}
+    if mode == "explicit":
+        options["prefix_capacity"] = 256
+    for history in (0, 4096):
+        widths.clear()
+        ids = decode_indexer.select_index_blocks(
+            jnp.ones((1024, 2, 128), jnp.bfloat16),
+            jnp.zeros((129, 16, 2, 128), jnp.bfloat16),
+            jnp.full((1024,), 1024 + history, jnp.int32),
+            jnp.tile(jnp.arange(128, dtype=jnp.int32), (2, 1)),
+            jnp.zeros((1024,), jnp.int32),
+            starts=jnp.array([0, 1024, 1024], jnp.int32),
+            context=jnp.array([history, 0], jnp.int32),
+            ratio=4,
+            block_topk=128,
+            scheduling_group_namespace=5,
+            **options,
+        )
+        ids.block_until_ready()
+        visible = (history + np.arange(1, 1025)) // 4
+        slots = np.arange(128)[None, :]
+        expected = np.where(
+            slots < np.minimum(visible, 128)[:, None],
+            np.maximum(visible - 128, 0)[:, None] + slots,
+            -1,
+        )
+        np.testing.assert_array_equal(np.sort(ids, axis=1), np.sort(expected, axis=1))
+        np.testing.assert_array_equal(np.asarray(ids) >= 0, expected >= 0)
+        assert widths == [256 if history == 0 and mode != "injected" else 4096] * 2
