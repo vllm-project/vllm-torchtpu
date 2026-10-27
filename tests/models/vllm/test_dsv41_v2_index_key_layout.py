@@ -10,66 +10,6 @@ import torch
 pytestmark = pytest.mark.cpu_test
 
 
-@pytest.mark.parametrize("page_size", [8, 128])
-def test_candidate_addresses_deduplicate_and_drop_invalid_pages(monkeypatch, page_size):
-    import jax
-    import jax.numpy as jnp
-    import numpy as np
-
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
-        fp8_candidate_cache,
-    )
-
-    monkeypatch.setattr(jax, "default_backend", lambda: "cpu")
-    with jax.default_device(jax.devices("cpu")[0]):
-        candidates = jnp.array([[2, 0, 2, 3, -1, 999]], jnp.int32)
-        table = [[2, 3, -1, 4, 5, 6, -1, -1]] if page_size == 8 else [[2]]
-        canonical, physical = fp8_candidate_cache.canonical_candidate_blocks(
-            candidates,
-            jnp.array(table, jnp.int32),
-            jnp.array([0, 1], jnp.int32),
-            block=16,
-            width=64,
-            cache_pages=7,
-            page_size=page_size,
-        )
-        ids = [0, 2] if page_size == 8 else [0, 2, 3]
-        addresses = [2, 3, 5, 6] if page_size == 8 else [16, 18, 19]
-        np.testing.assert_array_equal(canonical[0], ids + [-1] * (6 - len(ids)))
-        np.testing.assert_array_equal(
-            physical[0], addresses + [-1] * (physical.shape[1] - len(addresses))
-        )
-
-
-@pytest.mark.parametrize("page_size", [8, 128])
-def test_candidate_long_context_partial_block(page_size):
-    import jax.numpy as jnp
-    import numpy as np
-
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8_candidate_cache import (
-        canonical_candidate_blocks,
-    )
-
-    width, block = 2**20 + 5, 16
-    last = width // block
-    table = np.zeros((1, (width + page_size - 1) // page_size), np.int32)
-    table[0, 0] = -1
-    ids = jnp.array([[last, 0, last, last + 1, -1]], jnp.int32)
-    canonical, physical = canonical_candidate_blocks(
-        ids,
-        jnp.asarray(table),
-        jnp.array([0, 1]),
-        block=block,
-        width=width,
-        cache_pages=1,
-        page_size=page_size,
-    )
-    np.testing.assert_array_equal(canonical, [[last, -1, -1, -1, -1]])
-    expected = np.full(physical.shape, -1, np.int32)
-    expected[0, 0] = 0
-    np.testing.assert_array_equal(physical, expected)
-
-
 def _cache(raw=None, *, layout=None):
     from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import IndexCacheRows
 
@@ -146,7 +86,7 @@ def test_same_process_full_page_copy_preserves_halfplane_bits():
 
 
 def test_indexer_cache_eager_halfplane_round_trip():
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_cache import IndexerCache
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention import IndexerCache
 
     view = object.__new__(IndexerCache)
     torch.nn.Module.__init__(view)
@@ -166,15 +106,15 @@ def test_indexer_cache_eager_halfplane_round_trip():
 def test_halfplane_refuses_unsupported_transfer_and_offload(
     monkeypatch, transfer, offloading, message
 ):
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import indexer_cache
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention
 
     config = SimpleNamespace(
         kv_transfer_config=transfer,
         cache_config=SimpleNamespace(kv_offloading_size=offloading),
     )
-    monkeypatch.setattr(indexer_cache, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(attention, "get_current_vllm_config", lambda: config)
     with pytest.raises(ValueError, match=message):
-        indexer_cache.IndexerCache()
+        attention.IndexerCache()
 
 
 def test_halfplane_cpu_writer_matches_legacy_nan_canonicalization():

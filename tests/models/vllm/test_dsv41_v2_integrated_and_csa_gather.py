@@ -406,8 +406,6 @@ class TestIntegratedEvenQuerySplit:
         mock_attn.ranks = ranks
         mock_attn.topk = 4
         mock_attn._config = {"index_topk": 4}
-        mock_attn._max_model_len = 512
-        mock_attn.compress_ratio = 2
         mock_attn.candidate_block_size = 16
         mock_attn._fp8_kv = False
         mock_attn.indexer.head_dim = 128
@@ -419,31 +417,32 @@ class TestIntegratedEvenQuerySplit:
 
         captured_args = {}
 
-        def mock_indexer(
+        def mock_paged_indexer(
             q_part,
-            weights_part,
             index_cache,
             records,
+            weights_part,
             lengths_part,
+            candidates_part,
+            write_records,
+            write_keys,
             requests_part,
-            *,
-            candidates,
+            *args,
             **kwargs,
         ):
             captured_args["q_part_shape"] = q_part.shape
             captured_args["weights_part_shape"] = weights_part.shape
             captured_args["lengths_part_shape"] = lengths_part.shape
-            captured_args["candidates_part_shape"] = candidates.shape
+            captured_args["candidates_part_shape"] = candidates_part.shape
             expected_part, _ = v2_attn._query_split(count, ranks)
             assert q_part.shape[0] == expected_part == 4  # strictly 4, NOT 3!
             return (
+                index_cache.raw,
                 torch.zeros(expected_part, 4, dtype=torch.int32),
-                candidates,
+                candidates_part,
             )
 
-        mock_attn.indexer.indexer_op = MagicMock(side_effect=mock_indexer)
-        mock_attn.indexer.indexer_op.candidate_blocks = None
-        mock_attn.indexer.indexer_op.candidate_write = False
+        monkeypatch.setattr(v2_attn, "paged_indexer", mock_paged_indexer)
         monkeypatch.setattr(
             v2_attn, "get_tensor_model_parallel_world_size", lambda: ranks
         )
@@ -460,7 +459,7 @@ class TestIntegratedEvenQuerySplit:
         requests = torch.arange(count, dtype=torch.int32)
         weights = torch.zeros(count, 2)
         lengths = torch.full((count, 1), 50, dtype=torch.int32)
-        swa_slots = torch.ones(count, dtype=torch.bool)
+        swa_slots = torch.zeros(count, 1, dtype=torch.int32)
 
         with v2_attn.stage_attention_cache_scope():
             selected = v2_attn.DeepseekV41Attention._select_paged_indices(
@@ -473,6 +472,7 @@ class TestIntegratedEvenQuerySplit:
                 weights,
                 lengths,
                 swa_slots,
+                None,
             )
 
         assert selected.shape == (count, 4)
@@ -604,13 +604,15 @@ class TestIntegratedAttentionKernelsDecode:
         assert sel_fb.shape == (tokens, topk)
         assert cand_fb.shape == (tokens, 8)
 
-    def test_select_indexer_jax_and_wrappers_with_page_records(self):
-        """Verifies page_records forwarding in select_indexer_jax."""
+    def test_update_and_select_jax_and_wrappers_with_page_records(self):
+        """Verifies page_records forwarding in update_and_select_jax."""
         tokens = 2
         width = 256
         topk = 32
         q = jnp.zeros((tokens, 1, 128), dtype=jnp.bfloat16)
         pool = jnp.zeros((1000, 128), dtype=jnp.int32)
+        write_records = jnp.zeros((0,), dtype=jnp.int32)
+        keys = jnp.zeros((0, 128), dtype=jnp.bfloat16)
         records = jnp.zeros((tokens, width), dtype=jnp.int32)
         weights = jnp.zeros((tokens, 1), dtype=jnp.float32)
         lengths = jnp.full((tokens,), 20, dtype=jnp.int32)
@@ -619,13 +621,15 @@ class TestIntegratedAttentionKernelsDecode:
         batch_max = lengths.max()
 
         # Case 1: page_records > 0
-        sel1, pub1 = v2_ak.select_indexer_jax(
+        up1, sel1, pub1 = v2_ak.update_and_select_jax(
             q,
             pool,
             records,
             weights,
             lengths,
             candidates,
+            write_records,
+            keys,
             requests,
             batch_max,
             topk,
@@ -638,13 +642,15 @@ class TestIntegratedAttentionKernelsDecode:
         assert sel1.shape == (tokens, topk)
 
         # Case 2: page_records == 0 (disables page gathers)
-        sel2, pub2 = v2_ak.select_indexer_jax(
+        up2, sel2, pub2 = v2_ak.update_and_select_jax(
             q,
             pool,
             records,
             weights,
             lengths,
             candidates,
+            write_records,
+            keys,
             requests,
             batch_max,
             topk,

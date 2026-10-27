@@ -186,13 +186,7 @@ def materialize_upstream_kv_cache(
             )
     # FP8 NoPE layers (uint8 records) keep RoPE in a companion with one
     # 32-word slot per pool row, budgeted by `reserve_rope_companion`.
-    # Main KV uses 512-byte records. The indexer has its own 132-byte FP8
-    # record (including scale), so it must not receive a RoPE companion.
-    fp8_layers = [
-        name
-        for name, view in views.items()
-        if view.dtype == torch.uint8 and view.shape[-1] == ROW_BYTES
-    ]
+    fp8_layers = [name for name, view in views.items() if view.dtype == torch.uint8]
     rope_pools: dict[str, RawCachePool] = {}
     scale_pools: dict[str, RawCachePool] = {}
     # Follow the attention modules' resolved mode, not the global preference:

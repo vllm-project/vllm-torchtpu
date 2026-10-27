@@ -22,8 +22,6 @@ from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
-from . import tuned_block_sizes
-
 # Byte-wise radix passes over IEEE FP32 keys. These describe the representation,
 # independently of TensorCore/SparseCore lane counts.
 RADIX_BITS = jnp.iinfo(jnp.uint8).bits
@@ -793,43 +791,4 @@ def streaming_topk(
     return result
 
 
-def select_candidate_tokens(
-    scores: jax.Array,
-    candidates: jax.Array,
-    *,
-    k: int,
-    block_size: int,
-    unordered: bool,
-    scheduling_group_id: int | None = None,
-) -> jax.Array:
-    """Select compact scores and map winners to logical token IDs."""
-    if k == 0:
-        return jnp.empty((scores.shape[0], 0), jnp.int32)
-    if (
-        unordered
-        and jax.default_backend() == "tpu"
-        and k % plsc.get_sparse_core_info().num_lanes == 0
-    ):
-        return streaming_topk(
-            scores,
-            valid_lengths=jnp.full((scores.shape[0], 1), scores.shape[1], jnp.int32),
-            logical_blocks=candidates,
-            k=k,
-            exclude_neg_inf=True,
-            reconstruct_threshold=tuned_block_sizes.PACKED_FP8_CANDIDATE_TOPK_CONFIG.get(
-                (*scores.shape, k), 8192
-            ),
-            scheduling_group_id=scheduling_group_id,
-        )
-    values, slots = jax.lax.top_k(scores, k)
-    logical = (
-        jnp.take_along_axis(candidates, slots // block_size, axis=1) * block_size
-        + slots % block_size
-    )
-    valid = jnp.isfinite(values) if unordered else values > -jnp.inf
-    sentinel = jnp.iinfo(jnp.int32).max
-    logical = jnp.sort(jnp.where(valid, logical, sentinel))
-    return jnp.where(logical < sentinel, logical, -1)
-
-
-__all__ = ["select_candidate_tokens", "streaming_topk"]
+__all__ = ["streaming_topk"]

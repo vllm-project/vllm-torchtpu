@@ -3374,13 +3374,15 @@ def write_index_keys(
     return scatter_index_keys(pool, write_records, keys)
 
 
-def select_indexer_jax(
+def update_and_select_jax(
     q: jax.Array,
     pool: jax.Array,
     records: jax.Array,
     weights: jax.Array,
     lengths: jax.Array,
     candidates: jax.Array,
+    write_records: jax.Array,
+    keys: jax.Array,
     requests: jax.Array,
     batch_max: jax.Array,
     topk: int,
@@ -3390,11 +3392,12 @@ def select_indexer_jax(
     unordered: bool,
     page_records: int = 0,
     prefill_mode: str = "streaming",
-) -> tuple[jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """``page_records`` 0 disables page gathers (see `paged_indexer_jax`)."""
-    return paged_indexer_jax(
+    updated = write_index_keys(pool, write_records, keys)
+    selected, published = paged_indexer_jax(
         q,
-        pool,
+        updated,
         records,
         weights,
         lengths,
@@ -3409,9 +3412,10 @@ def select_indexer_jax(
         page_records or None,
         prefill_mode,
     )
+    return updated, selected, published
 
 
-def select_indexer_2bank_jax(
+def update_and_select_2bank_jax(
     q: jax.Array,
     pool_lo: jax.Array,
     pool_hi: jax.Array,
@@ -3419,6 +3423,8 @@ def select_indexer_2bank_jax(
     weights: jax.Array,
     lengths: jax.Array,
     candidates: jax.Array,
+    write_records: jax.Array,
+    keys: jax.Array,
     requests: jax.Array,
     batch_max: jax.Array,
     topk: int,
@@ -3428,24 +3434,30 @@ def select_indexer_2bank_jax(
     unordered: bool,
     page_records: int = 0,
     prefill_mode: str = "streaming",
-) -> tuple[jax.Array, jax.Array]:
-    return paged_indexer_jax(
-        q,
-        cast(Any, (pool_lo, pool_hi)),
-        records,
-        weights,
-        lengths,
-        candidates,
-        requests,
-        topk,
-        block_size,
-        candidate_write,
-        candidate_filter,
-        unordered,
-        batch_max,
-        page_records or None,
-        prefill_mode,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    (updated_lo, updated_hi), selected, published = cast(
+        Any,
+        update_and_select_jax(
+            q,
+            cast(Any, (pool_lo, pool_hi)),
+            records,
+            weights,
+            lengths,
+            candidates,
+            write_records,
+            keys,
+            requests,
+            batch_max,
+            topk,
+            block_size,
+            candidate_write,
+            candidate_filter,
+            unordered,
+            page_records,
+            prefill_mode,
+        ),
     )
+    return updated_lo, updated_hi, selected, published
 
 
 def initialize_indexer():
@@ -3464,10 +3476,11 @@ def initialize_indexer():
 
     _indexer_op = pallas.jax_op(
         "pallas::dsv41v2_exact_indexer",
-        select_indexer_jax,
+        update_and_select_jax,
+        donate_argnums=(1,),
         mesh=get_pallas_op_mesh(),
         input_partition_specs=cast(
-            tuple[tuple[str, ...], ...], (P(),) * 8 + (None,) * 7
+            tuple[tuple[str, ...], ...], (P(),) * 10 + (None,) * 7
         ),
     )
 
@@ -3478,6 +3491,8 @@ def initialize_indexer():
         weights,
         lengths,
         candidates,
+        write_records,
+        keys,
         requests,
         batch_max,
         topk,
@@ -3489,6 +3504,7 @@ def initialize_indexer():
         prefill_mode="streaming",
     ):
         return (
+            torch.empty_like(pool),
             records.new_empty(
                 (q.shape[0], min(topk, records.shape[1])), dtype=torch.int32
             ),
@@ -3498,10 +3514,11 @@ def initialize_indexer():
     _indexer_op.register_fake(fake)
     _indexer_2bank_op = pallas.jax_op(
         "pallas::dsv41v2_exact_indexer_2bank",
-        select_indexer_2bank_jax,
+        update_and_select_2bank_jax,
+        donate_argnums=(1, 2),
         mesh=get_pallas_op_mesh(),
         input_partition_specs=cast(
-            tuple[tuple[str, ...], ...], (P(),) * 9 + (None,) * 7
+            tuple[tuple[str, ...], ...], (P(),) * 11 + (None,) * 7
         ),
     )
 
@@ -3513,6 +3530,8 @@ def initialize_indexer():
         weights,
         lengths,
         candidates,
+        write_records,
+        keys,
         requests,
         batch_max,
         topk,
@@ -3524,6 +3543,8 @@ def initialize_indexer():
         prefill_mode="streaming",
     ):
         return (
+            torch.empty_like(pool_lo),
+            torch.empty_like(pool_hi),
             records.new_empty(
                 (q.shape[0], min(topk, records.shape[1])), dtype=torch.int32
             ),
@@ -3540,6 +3561,8 @@ def paged_indexer(
     weights,
     lengths,
     candidates,
+    write_records,
+    keys,
     requests,
     *,
     topk,
@@ -3553,7 +3576,6 @@ def paged_indexer(
 ):
     """``records`` is ``[requests, width]``; ``requests`` maps tokens to rows.
 
-    The model must publish Index-K before selection; this op only reads it.
     ``batch_max`` (default ``lengths.max()``) is the longest length of the
     whole batch when the queries are only part of it. ``page_records``: see
     `paged_index_scores_jax`.
@@ -3570,6 +3592,8 @@ def paged_indexer(
         weights,
         lengths.flatten().int(),
         candidates.int(),
+        write_records.int(),
+        keys,
         requests.int(),
         batch_max.reshape(1).int(),
         topk,
@@ -3582,12 +3606,13 @@ def paged_indexer(
     )
     if _has_hi_bank(cache):
         assert _indexer_2bank_op is not None
-        return _indexer_2bank_op(
+        updated_lo, updated_hi, selected, published = _indexer_2bank_op(
             q,
             cache.raw,
             cache.raw_hi,
             *tail_args,
         )
+        return (updated_lo, updated_hi), selected, published
     return _indexer_op(
         q,
         cache.raw,

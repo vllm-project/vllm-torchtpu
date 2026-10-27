@@ -47,7 +47,6 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
     paged_indexer_jax,
     remap_union_kv_to_chunk,
     repack_chunk_rope_words,
-    select_indexer_jax,
     select_indices_jax,
     slice_token_parallel_attention_inputs,
     sparse_fp8_attention,
@@ -55,6 +54,7 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
     sparse_fp8_attention_qo,
     sparse_ragged_paged_attention_union_gather,
     unpack_union_rope_words,
+    update_and_select_jax,
     write_index_keys,
 )
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
@@ -1679,7 +1679,7 @@ class TestIndexerKernelsAndSelection:
                 np.asarray(attention_kernels._compact_selected(want_sel)),
             )
 
-    def test_write_index_keys_then_select(self):
+    def test_write_index_keys_and_update_and_select(self):
         pool = jnp.zeros((64, 128), dtype=jnp.int32)
         write_records = jnp.array([0, 1], dtype=jnp.int32)
         keys_bf16 = jnp.zeros((2, 128), dtype=jnp.bfloat16)
@@ -1698,7 +1698,7 @@ class TestIndexerKernelsAndSelection:
         updated = write_index_keys(pool, write_records, keys_bf16)
         assert updated.shape == pool.shape
 
-        # 4. select_indexer_jax
+        # 4. update_and_select_jax
         q = jnp.zeros((4, 2, 128), dtype=jnp.bfloat16)
         records = jnp.zeros((2, 64), dtype=jnp.int32)
         weights = jnp.ones((4, 2), dtype=jnp.float32)
@@ -1707,13 +1707,15 @@ class TestIndexerKernelsAndSelection:
         requests = jnp.array([0, 0, 1, 1], dtype=jnp.int32)
         batch_max = jnp.array([64], dtype=jnp.int32)
 
-        sel, pub = select_indexer_jax(
+        up_pool, sel, pub = update_and_select_jax(
             q,
-            updated,
+            pool,
             records,
             weights,
             lengths,
             candidates,
+            write_records,
+            keys_bf16,
             requests,
             batch_max,
             topk=8,
@@ -1722,18 +1724,21 @@ class TestIndexerKernelsAndSelection:
             candidate_filter=False,
             unordered=False,
         )
+        assert up_pool.shape == pool.shape
         assert sel.shape == (4, 8)
         assert pub.shape == (4, 2)
 
-        # 5. select_indexer_2bank_jax
-        sel_2b, pub_2b = attention_kernels.select_indexer_2bank_jax(
+        # 5. update_and_select_2bank_jax
+        up_lo, up_hi, sel_2b, pub_2b = attention_kernels.update_and_select_2bank_jax(
             q,
-            updated[:32],
-            updated[32:],
+            pool[:32],
+            pool[32:],
             records,
             weights,
             lengths,
             candidates,
+            write_records,
+            keys_bf16,
             requests,
             batch_max,
             topk=8,
@@ -1742,6 +1747,7 @@ class TestIndexerKernelsAndSelection:
             candidate_filter=False,
             unordered=False,
         )
+        assert jnp.array_equal(jnp.concatenate((up_lo, up_hi), axis=0), up_pool)
         assert jnp.array_equal(sel_2b, sel)
         assert jnp.array_equal(pub_2b, pub)
 
@@ -1750,8 +1756,6 @@ class TestIndexerKernelsAndSelection:
         captured_fake = {}
 
         def mock_jax_op(name, fn, **kwargs):
-            if name.startswith("pallas::dsv41v2_exact_indexer"):
-                assert not kwargs.get("donate_argnums")
             mock_op = mock.MagicMock()
             mock_op.register_fake = lambda fake_fn: captured_fake.setdefault(
                 name, fake_fn
@@ -1771,13 +1775,15 @@ class TestIndexerKernelsAndSelection:
             pool = torch.zeros(64, 128)
             records = torch.zeros(2, 64, dtype=torch.int32)
             cands = torch.zeros(4, 2, dtype=torch.int32)
-            f_sel, f_cands = fake_fn(
+            f_pool, f_sel, f_cands = fake_fn(
                 q,
                 pool,
                 records,
                 torch.ones(4, 2),
                 torch.full((4,), 64),
                 cands,
+                torch.zeros(2),
+                torch.zeros(2, 128),
                 torch.zeros(4),
                 torch.tensor(64),
                 topk=8,
@@ -1786,12 +1792,13 @@ class TestIndexerKernelsAndSelection:
                 candidate_filter=False,
                 unordered=False,
             )
+            assert f_pool.shape == pool.shape
             assert f_sel.shape == (4, 8)
             assert f_cands.shape == cands.shape
 
             assert "pallas::dsv41v2_exact_indexer_2bank" in captured_fake
             fake_2b_fn = captured_fake["pallas::dsv41v2_exact_indexer_2bank"]
-            f_sel_2b, f_cands_2b = fake_2b_fn(
+            f_lo, f_hi, f_sel_2b, f_cands_2b = fake_2b_fn(
                 q,
                 pool[:32],
                 pool[32:],
@@ -1799,6 +1806,8 @@ class TestIndexerKernelsAndSelection:
                 torch.ones(4, 2),
                 torch.full((4,), 64),
                 cands,
+                torch.zeros(2),
+                torch.zeros(2, 128),
                 torch.zeros(4),
                 torch.tensor(64),
                 topk=8,
@@ -1807,6 +1816,8 @@ class TestIndexerKernelsAndSelection:
                 candidate_filter=False,
                 unordered=False,
             )
+            assert f_lo.shape == (32, 128)
+            assert f_hi.shape == (32, 128)
             assert f_sel_2b.shape == (4, 8)
             assert f_cands_2b.shape == cands.shape
 
@@ -1817,10 +1828,12 @@ class TestIndexerKernelsAndSelection:
 
         # Test paged_indexer wrapper with batch_max=None and batch_max provided
         mock_idx_op = mock.MagicMock(
-            return_value=(torch.zeros(4, 8), torch.zeros(4, 2))
+            return_value=(torch.zeros(1), torch.zeros(4, 8), torch.zeros(4, 2))
         )
         mock_idx_2b_op = mock.MagicMock(
             return_value=(
+                torch.zeros(1),
+                torch.zeros(1),
                 torch.zeros(4, 8),
                 torch.zeros(4, 2),
             )
@@ -1836,6 +1849,8 @@ class TestIndexerKernelsAndSelection:
             torch.ones(4, 2),
             torch.full((4,), 64),
             torch.zeros(4, 2),
+            torch.zeros(2),
+            torch.zeros(2, 64),
             torch.zeros(4),
             topk=8,
             block_size=16,
@@ -1852,6 +1867,8 @@ class TestIndexerKernelsAndSelection:
             torch.ones(4, 2),
             torch.full((4,), 64),
             torch.zeros(4, 2),
+            torch.zeros(2),
+            torch.zeros(2, 64),
             torch.zeros(4),
             topk=8,
             block_size=16,
@@ -1862,13 +1879,15 @@ class TestIndexerKernelsAndSelection:
         assert mock_idx_op.call_count == 2
 
         cache_2b = SimpleNamespace(raw=torch.zeros(32, 64), raw_hi=torch.zeros(32, 64))
-        selected_2b, published_2b = paged_indexer(
+        up_2b, _, _ = paged_indexer(
             torch.zeros(4, 2, 64),
             cache_2b,
             torch.zeros(2, 64),
             torch.ones(4, 2),
             torch.full((4,), 64),
             torch.zeros(4, 2),
+            torch.zeros(2),
+            torch.zeros(2, 64),
             torch.zeros(4),
             topk=8,
             block_size=16,
@@ -1876,8 +1895,7 @@ class TestIndexerKernelsAndSelection:
             candidate_filter=False,
             batch_max=torch.tensor([64]),
         )
-        assert selected_2b.shape == (4, 8)
-        assert published_2b.shape == (4, 2)
+        assert isinstance(up_2b, tuple) and len(up_2b) == 2
         assert mock_idx_2b_op.call_count == 1
 
 
