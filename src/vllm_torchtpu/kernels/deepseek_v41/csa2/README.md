@@ -8,7 +8,7 @@
 | `pipeline.py` | `csa2_attention`, `csa2_pipeline` | Attention dispatch and overlapping KV gathers |
 | `reference.py` | `prefill_reference` | Independent JAX math for numerical validation |
 
-Decode and prefill each own one Pallas kernel. The QK stages are named `swa_qk_compute`,
+Decode and prefill retain separate compute implementations and public APIs. The QK stages are named `swa_qk_compute`,
 `swa_qk_pop`, `main_qk_compute`, and `main_qk_pop`; the remaining stages are
 `main_unpack`, `softmax`, `fused_pv`, and `inverse_rope`. Accumulator refs are
 allocated directly with `jax.empty_ref` and indexed as `accumulators[mxu][slot]`.
@@ -25,6 +25,18 @@ requests whose query count is divisible by eight. Both use FP32 KV scales.
 Six-Q dispatch is unchanged. Ragged requests, padding, split SWA banks, and
 explicit noncausal bounds retain the general prefill path. Both gather and KV
 reuse propagate the same model-stage flag and authoritative main counts.
+
+Six-query H64 decode with 64-token SWA pages and at least eight requests uses
+four input buffers, carries PV across requests, and preloads the next SWA RHS.
+Other decode shapes retain the buffered grid. Both schedules use the same decode
+math and FP32 scales, including the native SWA physical-owner bounds checks.
+
+Prefill uses four Q/KV/SWA buffers, two output buffers, and cross-tile PV.
+Each 64-row packed-KV read is converted in four 16-row slices shared by QK/PV.
+Scale and inverse-RoPE tables stay resident only when they fit within one quarter
+of core VMEM; larger batches stream them through fixed-size buffers.
+`dummy_metadata=True` is exclusively an all-keys-valid mathematical benchmark;
+its timing does not represent real paged prefill.
 
 Prefill keeps tile planning, validation, and launch setup in the same module.
 Causal and noncausal visibility specialize its implementation at tracing; these
