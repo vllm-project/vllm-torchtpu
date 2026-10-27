@@ -48,6 +48,29 @@ def static_pv(cfgs: configs.RpaConfigs) -> bool:
     """
 
 
+def decode_exp2(cfgs: configs.RpaConfigs) -> bool:
+    """Whether this kernel's softmax runs in base 2 (`ServingConfigs.decode_exp2`).
+
+    """
+    return (
+        cfgs.serve.decode_exp2
+        and cfgs.mode == configs.RpaCase.DECODE
+        and cfgs.model.soft_cap is None
+        and not cfgs.serve.return_lse
+    )
+
+
+def p_prescaled(cfgs: configs.RpaConfigs) -> bool:
+    """Whether the softmax weights leave the exponential already times P_SCALE.
+
+    With the base-2 decode softmax and the static fp8 PV, log2(P_SCALE) is
+    subtracted from the row max before the exponential, so the weights, l
+    and the accumulator all carry the factor and the separate multiply of
+    the weights (and of l in `calculate_and_store_out`) is not needed.
+    """
+    return decode_exp2(cfgs) and static_pv(cfgs)
+
+
 # Weight of the low fp8 half in a split (hi + lo / _SPLIT_LO) quantization.
 _SPLIT_LO = 16.0
 
@@ -154,9 +177,11 @@ def flash_attention_qk_softmax(
     qk_operand = _native_fp8(cfgs).qk
     native_qk = qk_operand is not configs.Fp8Operand.OFF
     split_qk = qk_operand is configs.Fp8Operand.SPLIT
+    use_exp2 = decode_exp2(cfgs)
+    base_scale = math.log2(math.e) if use_exp2 else 1.0
     folded_scale = q_folded_scale(cfgs) if (diet and not native_qk) else None
-    if folded_scale is not None and folded_scale != 1.0:
-        q = q * jnp.asarray(folded_scale, dtype=q.dtype)
+    if folded_scale is not None and folded_scale * base_scale != 1.0:
+        q = q * jnp.asarray(folded_scale * base_scale, dtype=q.dtype)
 
     if static_qk:
         fp8_max = float(jnp.finfo(k.dtype).max)
@@ -197,7 +222,7 @@ def flash_attention_qk_softmax(
         # Native QK: the static factors (and the q row scales) scale the
         # [TQ, S] f32 tile in one multiply; a per-token k_scale is only
         # [B, KV, 1, S].
-        scale = float(cfgs.model.sm_scale)
+        scale = float(cfgs.model.sm_scale) * base_scale
         if isinstance(k_scale, (int, float)):
             scale *= float(k_scale)
         elif k_scale is not None and row_scale is None:
@@ -210,7 +235,7 @@ def flash_attention_qk_softmax(
         if k_scale is not None and not isinstance(k_scale, (int, float)):
             qk *= k_scale
     elif folded_scale is None:
-        qk *= cfgs.model.sm_scale
+        qk *= cfgs.model.sm_scale * base_scale
         if cfgs.serve.scale_q is not None:
             qk *= cfgs.serve.scale_q
         if k_scale is not None:
@@ -230,6 +255,7 @@ def flash_attention_qk_softmax(
             qk_masked.append(jnp.where(mask_b, qk[b_idx], cfgs.model.mask_value))
         qk = jnp.stack(qk_masked, axis=0)
 
+    _exp = jnp.exp2 if use_exp2 else jnp.exp
     m_curr = jnp.max(qk, axis=-1, keepdims=True)
 
     alpha_list = []
@@ -238,7 +264,7 @@ def flash_attention_qk_softmax(
     for b_idx in range(cfgs.block.batch_size):
         m_curr_b = m_curr[b_idx]
         m_next_b = jnp.maximum(m_prev, m_curr_b)
-        alpha_b = jnp.exp(m_prev - m_next_b)
+        alpha_b = _exp(m_prev - m_next_b)
         alpha_list.append(alpha_b)
         m_next_list.append(m_next_b)
         reset_m = is_last_k[step, b_idx] != 0
@@ -247,7 +273,10 @@ def flash_attention_qk_softmax(
         m_prev = jnp.where(reset_m, -jnp.inf, m_next_b)
 
     m_next = jnp.stack(m_next_list, axis=0)
-    p = jnp.exp(qk - utils.broadcast_minor(m_next, qk.shape))
+    m_shift = m_next
+    if p_prescaled(cfgs):
+        m_shift = m_next - jnp.asarray(math.log2(P_SCALE), m_next.dtype)
+    p = _exp(qk - utils.broadcast_minor(m_shift, qk.shape))
     p_rowsum = jnp.sum(p, axis=-1, keepdims=True, dtype=cfgs.serve.dtype_out)
 
     l_next_list = []
@@ -299,6 +328,9 @@ def flash_attention_pv(
     pv_operand = _native_fp8(cfgs).pv
     native_pv = pv_operand is not configs.Fp8Operand.OFF
     split_pv = pv_operand is configs.Fp8Operand.SPLIT
+    if p_prescaled(cfgs):
+        p = p.astype(v.dtype)
+    elif static_pv(cfgs):
         p = (p * jnp.asarray(P_SCALE, p.dtype)).astype(v.dtype)
     elif native_pv:
         p, p_row_scale = _quantize_rows(p, v.dtype, split=split_pv)

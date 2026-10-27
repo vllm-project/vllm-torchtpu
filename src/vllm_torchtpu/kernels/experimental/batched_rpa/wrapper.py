@@ -627,6 +627,7 @@ def calculate_block_sizes(
         "return_raw_output",
         "native_fp8",
         "native_fp8_prefill",
+        "decode_exp2",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -676,6 +677,7 @@ def ragged_paged_attention(
     prepared_inputs: tuple[jax.Array, jax.Array] | None = None,
     return_raw_output: bool = False,
     native_fp8: configs.NativeFp8 = configs.NATIVE_FP8_OFF,
+    decode_exp2: bool = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -757,6 +759,7 @@ def ragged_paged_attention(
         native_fp8: Which DECODE matmuls run natively in the fp8 KV dtype, and
             how each operand is scaled (`configs.NativeFp8`). Needs an fp8 KV
             cache. Defaults to every operand off.
+        decode_exp2: Run the DECODE softmax in base 2; see
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -836,6 +839,7 @@ def ragged_paged_attention(
 
     serve_cfgs = configs.ServingConfigs(
         native_fp8=native_fp8,
+        decode_exp2=decode_exp2,
         num_seqs=max_num_seqs,
         num_page_indices=num_page_indices,
         total_q_tokens=queries.shape[0],
