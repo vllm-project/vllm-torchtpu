@@ -1753,17 +1753,43 @@ def test_dummy_router_is_fixed_random_and_layer_specific(monkeypatch, transposed
 def test_attention_residual_bridge_fake_shape():
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    from vllm_torchtpu.models.vllm.kimi_k3.layers import _build_attention_residual_op
+    from vllm_torchtpu.models.vllm.kimi_k3.layers import (
+        _build_attention_residual_op,
+        _build_attention_residual_with_inv_rms_op,
+    )
 
     op = _build_attention_residual_op(1e-5)
     assert op is _build_attention_residual_op(1e-5)
+    op_inv = _build_attention_residual_with_inv_rms_op(1e-5)
+    assert op_inv is _build_attention_residual_with_inv_rms_op(1e-5)
     with FakeTensorMode():
         prefix = torch.empty(256, 7168, dtype=torch.bfloat16)
         history = torch.empty(256, 8, 7168, dtype=torch.bfloat16)
         weight = torch.empty(7168, dtype=torch.float32)
+        inv_rms = torch.empty(8, 256, dtype=torch.float32)
         output = op(prefix, history, weight)
         assert output.shape == prefix.shape
         assert output.dtype == prefix.dtype
+        output_inv = op_inv(prefix, history.reshape(-1, 7168), weight, inv_rms)
+        assert output_inv.shape == prefix.shape
+        assert output_inv.dtype == prefix.dtype
+
+
+@pytest.mark.parametrize("num_tokens", [1, 8])
+def test_attention_residual_with_precomputed_inv_rms_matches_reference(
+    num_tokens: int,
+) -> None:
+    torch.manual_seed(42)
+    num_blocks, hidden, eps = 6, 64, 1e-5
+    module = _attention_residual_stub(hidden=hidden, eps=eps)
+    prefix_sum = torch.randn(num_tokens, hidden, dtype=torch.bfloat16)
+    blocks_major = torch.randn(num_blocks, num_tokens, hidden, dtype=torch.bfloat16)
+    block_residuals_2d = blocks_major.reshape(-1, hidden)
+    block_inv_rms = torch.rsqrt(blocks_major.float().pow(2).mean(-1) + eps)
+
+    expected = module(prefix_sum, block_residuals_2d)
+    actual = module(prefix_sum, block_residuals_2d, block_inv_rms)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("sequence_parallel", [False, True])

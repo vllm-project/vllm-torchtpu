@@ -138,8 +138,12 @@ class KimiDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         block_residuals: torch.Tensor | None,
+        block_inv_rms: torch.Tensor | None = None,
         sequence_parallel: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor | None]
+        | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]
+    ):
         if self.attn_res_block_size is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -157,6 +161,8 @@ class KimiDecoderLayer(nn.Module):
                 hidden_states = self.mlp(
                     hidden_states, sequence_parallel=sequence_parallel
                 )
+            if block_inv_rms is not None:
+                return residual + hidden_states, None, None
             return residual + hidden_states, None
 
         assert block_residuals is not None
@@ -167,12 +173,21 @@ class KimiDecoderLayer(nn.Module):
         num_saved = block_idx if is_block_start else block_idx + 1
         if num_saved > 0:
             hidden_states = self.self_attention_res(
-                prefix_sum, block_residuals[:num_saved].reshape(-1, hidden_dim)
+                prefix_sum,
+                block_residuals[:num_saved].reshape(-1, hidden_dim),
+                block_inv_rms[:num_saved] if block_inv_rms is not None else None,
             )
         if is_block_start:
             block_residuals = torch.select_scatter(
                 block_residuals, prefix_sum, 0, block_idx
             )
+            if block_inv_rms is not None:
+                curr_inv_rms = torch.rsqrt(
+                    prefix_sum.float().pow(2).mean(-1) + self.self_attention_res.eps
+                )
+                block_inv_rms = torch.select_scatter(
+                    block_inv_rms, curr_inv_rms, 0, block_idx
+                )
             prefix_sum = None
             num_saved = block_idx + 1
 
@@ -182,7 +197,9 @@ class KimiDecoderLayer(nn.Module):
         )
         prefix_sum = hidden_states if prefix_sum is None else prefix_sum + hidden_states
         hidden_states = self.mlp_res(
-            prefix_sum, block_residuals[:num_saved].reshape(-1, hidden_dim)
+            prefix_sum,
+            block_residuals[:num_saved].reshape(-1, hidden_dim),
+            block_inv_rms[:num_saved] if block_inv_rms is not None else None,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
         if self.is_moe:
@@ -191,6 +208,8 @@ class KimiDecoderLayer(nn.Module):
             )
         else:
             hidden_states = self.mlp(hidden_states, sequence_parallel=sequence_parallel)
+        if block_inv_rms is not None:
+            return prefix_sum + hidden_states, block_residuals, block_inv_rms
         return prefix_sum + hidden_states, block_residuals
 
 
@@ -291,8 +310,20 @@ class KimiModel(nn.Module):
                 if num_res_blocks > 0
                 else hidden_states[:0, :]
             )
+            block_inv_rms = (
+                torch.empty(
+                    (num_res_blocks, hidden_states.shape[0]),
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                )
+                if num_res_blocks > 0
+                else hidden_states.new_empty(
+                    (0, hidden_states.shape[0]), dtype=torch.float32
+                )
+            )
         else:
             block_residuals = None
+            block_inv_rms = None
         assert hidden_states is not None
 
         aux_hidden_states: list[torch.Tensor] = []
@@ -300,18 +331,29 @@ class KimiModel(nn.Module):
             aux_hidden_states.append(hidden_states)
 
         for layer_idx, layer in enumerate(self.layers):
-            hidden_states, block_residuals = layer(
-                positions,
-                hidden_states,
-                block_residuals,
-                sequence_parallel=sequence_parallel,
-            )
+            if block_inv_rms is not None:
+                hidden_states, block_residuals, block_inv_rms = layer(
+                    positions,
+                    hidden_states,
+                    block_residuals,
+                    block_inv_rms,
+                    sequence_parallel=sequence_parallel,
+                )
+            else:
+                hidden_states, block_residuals = layer(
+                    positions,
+                    hidden_states,
+                    block_residuals,
+                    sequence_parallel=sequence_parallel,
+                )
             if layer_idx + 1 in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states)
 
         if block_residuals is not None:
             hidden_states = self.output_attn_res(
-                hidden_states, block_residuals.reshape(-1, hidden_states.shape[-1])
+                hidden_states,
+                block_residuals.reshape(-1, hidden_states.shape[-1]),
+                block_inv_rms,
             )
         hidden_states = self.norm(hidden_states)
         if sequence_parallel:
