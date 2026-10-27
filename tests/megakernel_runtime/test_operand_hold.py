@@ -29,3 +29,21 @@ def test_small_operands_are_fresh_copies_with_equal_values():
     # (on CPU .cpu().to(cpu) is the identity; on TPU it is a host round-trip copy)
     assert torch.equal(ops[0], base) and torch.equal(ops[1], view)
     assert ops[2] is big  # over the limit: untouched
+
+
+def test_fresh_copy_is_an_op_result_with_equal_values():
+    """`own_operand` of a reshaped stack: equal values, a contiguous base tensor (no view), and
+    not built by `copy_` (a `copy_` into the result would be caught: its grad_fn-free result
+    still has `_base is None`, so the check is that `cat` produced it: version counter 0)."""
+    from vllm_torchtpu.megakernel_runtime.qwen38_wholestep_weights import fresh_copy, own_operand
+
+    stack = torch.stack([torch.randn(6, 8, 16) for _ in range(3)])
+    view = stack.reshape(-1, 8, 16)
+    for t in (view, view[:1], stack.transpose(0, 1)):
+        out = own_operand(t)
+        assert torch.equal(out, t) and out.shape == t.shape
+        assert out._base is None and out.is_contiguous() and out.storage_offset() == 0
+        assert out._version == 0  # no in-place write after creation (empty_like().copy_() is 1)
+    assert torch.empty_like(view).copy_(view)._version == 1  # positive control of the check
+    assert own_operand(stack) is stack  # fresh stack: passed as is
+    assert fresh_copy(torch.tensor(3.0)).shape == ()

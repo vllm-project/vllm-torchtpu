@@ -54,7 +54,19 @@ def own_operand(t: torch.Tensor) -> torch.Tensor:
     plain = t.is_contiguous() and t.storage_offset() == 0
     if plain and (t._base is None or isinstance(t, torch.nn.Parameter)):
         return t
-    return torch.empty_like(t, memory_format=torch.contiguous_format).copy_(t)
+    return fresh_copy(t)
+
+
+def fresh_copy(t: torch.Tensor) -> torch.Tensor:
+    """A copy of `t` that is the fresh result of an op (`cat` of two halves along dim 0), in
+    `t`'s shape. `empty_like().copy_()` writes the new base in place, the history class torch_tpu
+    re-materialises per call (w10 c1: the 32 MiB host round-trip covered 7 of 114 operands; the
+    ~18 big reshaped stacks still went through `copy_`). 0-d tensors are host round-tripped."""
+    if t.dim() == 0:
+        return t.cpu().to(t.device)
+    if t.shape[0] < 2:
+        return torch.cat([t, t[:0]], dim=0)
+    return torch.cat(t.split((t.shape[0] + 1) // 2, dim=0), dim=0)
 
 
 def qkvg_operand(attn: Any, g: Any, R: int) -> torch.Tensor:
