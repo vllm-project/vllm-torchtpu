@@ -815,3 +815,91 @@ def _run_spawn_probes():
 
 if __name__ == "__main__":
     _run_spawn_probes()
+
+
+class TestLatePollModelRunnerOutput:
+    """The late-poll wrapper adds landed loads to the step's output."""
+
+    def _output(self, kv_connector_output=None):
+        from vllm.v1.outputs import AsyncModelRunnerOutput
+
+        inner_output = SimpleNamespace(kv_connector_output=kv_connector_output)
+
+        class _Inner(AsyncModelRunnerOutput):
+            def get_output(self):
+                return inner_output
+
+        return _Inner()
+
+    def test_creates_connector_output_when_the_step_had_none(self):
+        from vllm_torchtpu.worker.tpu_worker import _LatePollModelRunnerOutput
+
+        wrapped = _LatePollModelRunnerOutput(self._output(), [lambda: {"r1"}])
+        out = wrapped.get_output()
+        assert out.kv_connector_output.finished_recving == {"r1"}
+
+    def test_merges_into_the_step_output(self):
+        from vllm.v1.outputs import KVConnectorOutput
+
+        from vllm_torchtpu.worker.tpu_worker import _LatePollModelRunnerOutput
+
+        kv = KVConnectorOutput(finished_recving={"r0"}, finished_sending={"s0"})
+        wrapped = _LatePollModelRunnerOutput(
+            self._output(kv), [lambda: {"r1"}, lambda: set()]
+        )
+        out = wrapped.get_output()
+        assert out.kv_connector_output.finished_recving == {"r0", "r1"}
+        assert out.kv_connector_output.finished_sending == {"s0"}
+
+    def test_nothing_landed_leaves_the_output_alone(self):
+        from vllm_torchtpu.worker.tpu_worker import _LatePollModelRunnerOutput
+
+        wrapped = _LatePollModelRunnerOutput(self._output(), [lambda: set()])
+        assert wrapped.get_output().kv_connector_output is None
+
+
+class TestDeferredNoForwardOutput:
+    """The zero-token step output waits for the dummy batch, then polls."""
+
+    def _worker(self):
+        worker = object.__new__(TPUWorker)
+        worker._dummy_batch_cv = __import__("threading").Condition()
+        worker._dummy_batch_count = 0
+        return worker
+
+    def test_polls_after_the_dummy_batch(self):
+        import threading
+
+        from vllm_torchtpu.worker.tpu_worker import _DeferredNoForwardOutput
+
+        worker = self._worker()
+        seen_count: list[int] = []
+
+        def poll():
+            seen_count.append(worker._dummy_batch_count)
+            return {"r1"}
+
+        out = _DeferredNoForwardOutput(
+            SimpleNamespace(kv_connector_output=None), worker, [poll], 0
+        )
+        out.timeout_s = 5.0
+        timer = threading.Timer(0.05, worker._note_dummy_batch_done)
+        timer.start()
+        result = out.get_output()
+        assert seen_count == [1]
+        assert result.kv_connector_output.finished_recving == {"r1"}
+
+    def test_timeout_bounds_the_wait(self):
+        import time
+
+        from vllm_torchtpu.worker.tpu_worker import _DeferredNoForwardOutput
+
+        worker = self._worker()
+        out = _DeferredNoForwardOutput(
+            SimpleNamespace(kv_connector_output=None), worker, [lambda: set()], 0
+        )
+        out.timeout_s = 0.02
+        t = time.monotonic()
+        result = out.get_output()
+        assert 0.015 <= time.monotonic() - t < 1.0
+        assert result.kv_connector_output is None
