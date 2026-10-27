@@ -6027,6 +6027,11 @@ class TPUModelRunner(GPUModelRunner):
                         self._fused_greedy_head is not None
                         and num_tokens == self._fused_greedy_head.rows
                     ):
+                        logger.info(
+                            "Rejection warmup: stage=gather_ids rows=%d reqs=%d",
+                            num_tokens,
+                            num_reqs,
+                        )
                         synchronize_tensors(
                             self.gather_spec_token_ids(
                                 draft_token_ids,
@@ -6035,6 +6040,11 @@ class TPUModelRunner(GPUModelRunner):
                             )
                         )
                     # --- greedy verify path (do_sampling=False) ---
+                    logger.info(
+                        "Rejection warmup: stage=greedy_ids rows=%d reqs=%d",
+                        num_tokens,
+                        num_reqs,
+                    )
                     bonus_token_ids, target_token_ids_warm = (
                         self.spec_bonus_and_target_token_ids(
                             dummy_logits, bonus_logits_indices, target_logits_indices
@@ -6056,6 +6066,11 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     synchronize_tensors(out)
                     # --- non-greedy verify path (do_sampling=True) ---
+                    logger.info(
+                        "Rejection warmup: stage=gather_logits rows=%d reqs=%d",
+                        num_tokens,
+                        num_reqs,
+                    )
                     bonus_logits_ng, target_logits_ng = (
                         self.spec_gather_bonus_and_target_logits(
                             dummy_logits, bonus_logits_indices, target_logits_indices
@@ -6076,6 +6091,11 @@ class TPUModelRunner(GPUModelRunner):
                         dtype=torch.float32,
                     ).to(self.device)
                     # Grammar masks are applied before greedy reduction.
+                    logger.info(
+                        "Rejection warmup: stage=grammar_greedy rows=%d reqs=%d",
+                        num_tokens,
+                        num_reqs,
+                    )
                     grammar_out = self.rejection_sampler(
                         draft_token_ids=draft_token_ids,
                         num_draft_tokens=draft_lengths,
@@ -6091,6 +6111,11 @@ class TPUModelRunner(GPUModelRunner):
                         ),
                     )
                     synchronize_tensors(grammar_out)
+                    logger.info(
+                        "Rejection warmup: stage=random rows=%d reqs=%d",
+                        num_tokens,
+                        num_reqs,
+                    )
                     out = self.rejection_sampler(
                         draft_token_ids=draft_token_ids,
                         num_draft_tokens=draft_lengths,
