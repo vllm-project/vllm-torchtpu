@@ -110,6 +110,7 @@ class PackedFP8IndexerSpec(MLAAttentionSpec):
     """Keep 132-byte records compatible with hybrid power-of-two pages."""
 
     def __post_init__(self):
+        requested_page_size = self.page_size_padded
         record_bytes = 1 << (self.state_content_size_bytes - 1).bit_length()
         min_states = max(1, (self.alignment or 1) // record_bytes)
         object.__setattr__(
@@ -117,7 +118,11 @@ class PackedFP8IndexerSpec(MLAAttentionSpec):
         )
         super().__post_init__()
         size = max(self.alignment or 1, self.real_page_size_bytes)
-        object.__setattr__(self, "page_size_padded", 1 << (size - 1).bit_length())
+        natural_page_size = 1 << (size - 1).bit_length()
+        # Keep a larger explicit page budget when vLLM reconstructs the spec.
+        if requested_page_size is None or requested_page_size < natural_page_size:
+            requested_page_size = natural_page_size
+        object.__setattr__(self, "page_size_padded", requested_page_size)
 
     @classmethod
     def merge(cls, specs):

@@ -6,12 +6,115 @@ import functools
 import jax
 import jax.numpy as jnp
 
-from vllm_torchtpu.kernels.deepseek_v41.csa2 import csa2
-from vllm_torchtpu.kernels.deepseek_v41.csa2_cache import gather_csa2_kv_sc
+from .cache import gather_csa2_kv_sc
+from .decode import csa2_decode
+from .prefill import csa2_prefill
+
+
+def csa2_gather_chunk_size(num_tokens: int) -> int:
+    # On v7x TP1 with 64 heads, 128-row chunks overlap SC gather with TC
+    # attention while retaining full gathered KV for subsequent layers.
+    # Up to 512 queries, launch and concatenation costs erase the stage-level
+    # benefit; use one gather and one attention without extra staging HBM.
+    return num_tokens if num_tokens <= 512 else 128
+
+
+def csa2_attention(
+    q: jax.Array,
+    words: jax.Array,
+    scales: jax.Array,
+    swa: jax.Array | tuple[jax.Array, jax.Array],
+    starts: jax.Array,
+    positions: jax.Array,
+    sink: jax.Array,
+    rope: jax.Array,
+    *,
+    swa_metadata: jax.Array,
+    swa_bounds: jax.Array | None,
+    main_lengths: jax.Array,
+    scale: float,
+    compress_ratio: int,
+    bq: int,
+    decoder: bool = False,
+) -> jax.Array:
+    """Dispatch decode and decoder-layer prefill to the common decode pipeline.
+
+    Request boundaries are device data. Check them before using the regular
+    grid; tensor shapes alone cannot distinguish decode from a mixed batch.
+    Empty trailing request slots are allowed, but token padding and partial
+    requests retain the ragged path. Both gather and cache reuse call here.
+    """
+
+    def ragged():
+        return csa2_prefill(
+            q,
+            words,
+            scales,
+            swa,
+            starts,
+            positions,
+            sink,
+            rope,
+            swa_metadata=swa_metadata,
+            swa_bounds=swa_bounds,
+            main_lengths=main_lengths,
+            scale=scale,
+            compress_ratio=compress_ratio,
+            bq=bq,
+        )
+
+    num_tokens = 6
+    if decoder:
+        request_slots = starts.shape[0] - 1
+        if request_slots:
+            width, remainder = divmod(q.shape[0], request_slots)
+            if not remainder and width > 8 and width % 8 == 0:
+                num_tokens = width
+    batch_size, tail = divmod(q.shape[0], num_tokens)
+    if (
+        not batch_size
+        or tail
+        or starts.shape[0] < batch_size + 1
+        or isinstance(swa, tuple)
+        or swa_bounds is not None
+    ):
+        return ragged()
+
+    # Extra request slots must be empty at the end, not interleaved with Qs.
+    expected_starts = jnp.minimum(
+        jnp.arange(starts.shape[0], dtype=jnp.int32) * num_tokens, q.shape[0]
+    )
+    first_positions = positions[::num_tokens]
+    consecutive = first_positions[:, None] + jnp.arange(num_tokens)
+    regular = jnp.all(starts == expected_starts) & jnp.all(
+        positions.reshape(batch_size, num_tokens) == consecutive
+    )
+    decode_kwargs = dict(
+        swa_page=swa_metadata[:batch_size],
+        main_lengths=main_lengths,
+        num_tokens=num_tokens,
+        scale=scale,
+    )
+    if decoder and num_tokens != 6:
+        decode_kwargs["decoder_prefill"] = True
+    return jax.lax.cond(
+        regular,
+        lambda: csa2_decode(
+            q,
+            words,
+            scales,
+            swa,
+            first_positions,
+            sink,
+            rope,
+            **decode_kwargs,
+        ),
+        ragged,
+    )
 
 
 @functools.partial(
-    jax.jit, static_argnames=("chunk_size", "bq", "scale", "compress_ratio")
+    jax.jit, static_argnames=("chunk_size", "bq", "scale", "compress_ratio", "decoder")
 )
 def csa2_pipeline(
     q: jax.Array,
@@ -31,6 +134,7 @@ def csa2_pipeline(
     bq: int,
     scale: float,
     compress_ratio: int,
+    decoder: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Return attention and contiguous gathered KV for subsequent layer reuse.
 
@@ -74,7 +178,7 @@ def csa2_pipeline(
         chunk_words, chunk_scales = current
         word_chunks.append(chunk_words)
         scale_chunks.append(chunk_scales)
-        previous = csa2(
+        previous = csa2_attention(
             q[offset:end],
             chunk_words,
             chunk_scales,
@@ -89,6 +193,7 @@ def csa2_pipeline(
             scale=scale,
             compress_ratio=compress_ratio,
             bq=bq,
+            decoder=decoder,
         )
         if following is not None:
             current = following
