@@ -225,7 +225,8 @@ def build_scratch(
     NMIX = p.shared_widths["mix"]
     typed = bool(ex.interpret)
 
-    cp = comm_params(ex, tiles, H, PR, PC)
+    n_ar_slots = sum(s is not None for s in p.slot_ar_index)
+    cp = comm_params(ex, tiles, H, PR, PC, n_ar_slots)
 
     vshape = {k: (tk[k], kinds[k][1]) for k in kinds}
     vdtype = {k: kinds[k][2] for k in kinds}
