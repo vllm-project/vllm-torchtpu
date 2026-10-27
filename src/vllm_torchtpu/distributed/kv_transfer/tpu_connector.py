@@ -507,6 +507,8 @@ class _Stage3SubmitOutcome:
     submit_ms: float
     # Unix timestamp when the RPC was issued; paces re-attempts.
     attempted_at: float
+    # Unix timestamp when the RPC returned; 0 when it was never issued.
+    finished_at: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -1534,6 +1536,9 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         super().__init__(vllm_config)
         self._send_completion_enabled = send_completion_enabled(vllm_config)
         stage3_consumer = not self.is_producer and _use_raiden_stage3_transport()
+        # Unix time each consumer request reached the scheduler, reported
+        # with its load declaration.
+        self._stage3_arrival_ts: dict[str, float] = {}
         self._stage3_prefix_aware_load_enabled = (
             stage3_consumer and _prefix_aware_load_enabled()
         )
@@ -1638,6 +1643,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             and self._stage3_truncates_prompt()
         ):
             self._maybe_truncate_prompt_for_handoff(request)
+        if not self.is_producer and _use_raiden_stage3_transport():
+            self._stage3_arrival_ts[request.request_id] = time.time()
         self._admit_kv_transfer_params(request)
 
     def _validate_load_params(
@@ -2043,6 +2050,22 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             len(local_block_ids),
             src_controller_address,
         )
+        logger.info(
+            "%s",
+            json.dumps(
+                {
+                    "event": "raiden_stage3_load_declared",
+                    "req_id": source_req_id,
+                    "destination_req_id": request.request_id,
+                    "uuid": uuid,
+                    "num_tokens": num_tokens,
+                    "skip_tokens": skip_tokens,
+                    "ts_arrival": self._stage3_arrival_ts.pop(request.request_id, None),
+                    "ts_declared": time.time(),
+                },
+                sort_keys=True,
+            ),
+        )
 
     def _raiden_engine_id(self) -> str:
         env_id = str(tpu_envs.TPU_RAIDEN_ENGINE_ID).strip()
@@ -2255,6 +2278,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         if not _use_raiden_stage3_transport():
             return super().request_finished(request, block_ids)
         req_id = request.request_id
+        self._stage3_arrival_ts.pop(req_id, None)
         early_uuid = self._stage3_early_sends.get(req_id)
         self._stage3_early_requests.pop(req_id, None)
         self._stage3_block_tables.pop(req_id, None)
@@ -2770,6 +2794,27 @@ class TPURaidenConnectorWorker:
         # WAITING_FOR_REMOTE_KVS (or finished); a duplicate/late report (after
         # the req was admitted -> RUNNING) trips that assert.
         self._reported_recving: set[str] = set()
+        # Guards the receive bookkeeping that late_poll_finished_recving (the
+        # async output thread) shares with the model-runner thread's poll.
+        self._stage3_poll_lock = threading.RLock()
+        # Native terminal records a late poll consumed but did not report;
+        # the next model-runner poll replays them ahead of its own.
+        self._stage3_late_native: list[tuple[list, list, list]] = []
+        # Unix time each load was staged, for the per-request event log.
+        self._stage3_load_staged_ts: dict[str, float] = {}
+        # Producer registrations handed to the side thread
+        # (TPU_RAIDEN_STAGE3_ASYNC_REGISTER): one future per step, the
+        # request ids it carries, and the thread's own controller client.
+        self._stage3_register_executor: concurrent.futures.ThreadPoolExecutor | None = (
+            None
+        )
+        self._stage3_register_futures: list[
+            tuple[concurrent.futures.Future, frozenset[str]]
+        ] = []
+        self._stage3_register_local = threading.local()
+        # Set by get_finished once the step's forward is dispatched; the
+        # side thread starts on it or after the configured delay.
+        self._stage3_register_gate = threading.Event()
         # req_id -> local (device) block ids, retained while a load is in flight
         # so a failed recv can surface the affected blocks for recompute. A
         # scheduler-finished load is pruned only after its native terminal.
@@ -4168,6 +4213,8 @@ class TPURaidenConnectorWorker:
                     self.vllm_config
                 ):
                     self._register_stage3_request_row_spans(metadata)
+                elif tpu_envs.TPU_RAIDEN_STAGE3_ASYNC_REGISTER:
+                    self._submit_stage3_registration(metadata)
                 else:
                     self._register_stage3_request_blocks(metadata)
                 return
@@ -4287,9 +4334,60 @@ class TPURaidenConnectorWorker:
             )
             time.sleep(delay_s)
 
-    def _register_stage3_request_blocks(self, metadata: TPUConnectorMetadata) -> None:
+    def _submit_stage3_registration(self, metadata: TPUConnectorMetadata) -> None:
+        """Hands one step's producer registrations to the side thread.
+
+        The span lowering and the controller RPCs then overlap the forward
+        this step dispatches instead of delaying it. The work holds the GIL,
+        so the thread starts only once the model-runner thread has dispatched
+        the forward (get_finished sets the gate) or after
+        TPU_RAIDEN_STAGE3_ASYNC_REGISTER_DELAY_MS, whichever comes first.
+        Steps keep their order on the one worker thread. The thread uses its
+        own controller client; the bookkeeping it writes is taken under
+        _stage3_poll_lock, and get_finished waits for the registration of a
+        request before it acts on that request's finish.
+        """
+        if self._stage3_register_executor is None:
+            self._stage3_register_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="raiden-register"
+            )
+        _, address = self._require_stage3_controller()
+        req_ids = frozenset(metadata.reqs_to_send) | frozenset(metadata.reqs_to_release)
+        gate = threading.Event()
+        self._stage3_register_gate = gate
+        delay_s = float(tpu_envs.TPU_RAIDEN_STAGE3_ASYNC_REGISTER_DELAY_MS) / 1e3
+
+        def _run() -> None:
+            gate.wait(delay_s)
+            facade = getattr(self._stage3_register_local, "facade", None)
+            if facade is None:
+                facade = self._new_raiden_controller_facade(address)
+                self._stage3_register_local.facade = facade
+            self._register_stage3_request_blocks(metadata, facade=facade)
+
+        future = self._stage3_register_executor.submit(_run)
+        self._stage3_register_futures.append((future, req_ids))
+
+    def _reap_stage3_registrations(self, finished_req_ids: set[str] | None) -> None:
+        """Waits for the registrations of the finished requests and raises
+        any registration error on the model-runner thread."""
+        if not self._stage3_register_futures:
+            return
+        wait_for = set(finished_req_ids or ())
+        kept: list[tuple[concurrent.futures.Future, frozenset[str]]] = []
+        for future, req_ids in self._stage3_register_futures:
+            if not future.done() and not (req_ids & wait_for):
+                kept.append((future, req_ids))
+                continue
+            future.result()
+        self._stage3_register_futures = kept
+
+    def _register_stage3_request_blocks(
+        self, metadata: TPUConnectorMetadata, facade: Any | None = None
+    ) -> None:
         """Registers only this PCP rank's interleaved physical source blocks."""
-        facade, _ = self._require_stage3_controller()
+        if facade is None:
+            facade, _ = self._require_stage3_controller()
         if self._raiden_work_unit is None:
             raise RuntimeError("Stage-3 producer work unit is not registered")
         parallelism = self._raiden_transfer_parallelism()
@@ -4313,25 +4411,27 @@ class TPURaidenConnectorWorker:
             lowering_rank = transfer_rank // self.tp_size
 
         now = time.time()
-        expired_terminal_req_ids = [
-            req_id
-            for req_id, registration in self._stage3_terminal_sends.items()
-            if registration.expiration_time <= now
-        ]
-        for req_id in expired_terminal_req_ids:
-            self._stage3_terminal_sends.pop(req_id, None)
-            self._stage3_reported_sends.discard(req_id)
-            self._stage3_prune_state_send_tracking(req_id)
+        with self._stage3_poll_lock:
+            expired_terminal_req_ids = [
+                req_id
+                for req_id, registration in self._stage3_terminal_sends.items()
+                if registration.expiration_time <= now
+            ]
+            for req_id in expired_terminal_req_ids:
+                self._stage3_terminal_sends.pop(req_id, None)
+                self._stage3_reported_sends.discard(req_id)
+                self._stage3_prune_state_send_tracking(req_id)
 
         # Retires this stage's registration of a uuid the scheduler published
         # ahead of the finish and did not hand to a consumer; no
         # finished_sending is reported for it.
         for req_id, uuid in metadata.reqs_to_release.items():
-            registration = self._stage3_registered_sends.get(req_id)
-            if registration is None or registration.uuid != int(uuid):
-                continue
-            del self._stage3_registered_sends[req_id]
-            self._stage3_status_probe_next.pop(req_id, None)
+            with self._stage3_poll_lock:
+                registration = self._stage3_registered_sends.get(req_id)
+                if registration is None or registration.uuid != int(uuid):
+                    continue
+                del self._stage3_registered_sends[req_id]
+                self._stage3_status_probe_next.pop(req_id, None)
             facade.release_request_blocks(req_id=req_id, uuid=int(uuid))
             logger.info(
                 "%s",
@@ -4509,13 +4609,14 @@ class TPURaidenConnectorWorker:
                 tombstone_deadline = time.time() + float(
                     dist_utils.get_p2p_wait_pull_timeout()
                 )
-                self._stage3_terminal_sends[req_id] = _Stage3RegisteredSend(
-                    uuid=uuid,
-                    local_block_ids=local_ids,
-                    num_tokens=num_tokens,
-                    expiration_time=tombstone_deadline,
-                )
-                self._done_sending.add(req_id)
+                with self._stage3_poll_lock:
+                    self._stage3_terminal_sends[req_id] = _Stage3RegisteredSend(
+                        uuid=uuid,
+                        local_block_ids=local_ids,
+                        num_tokens=num_tokens,
+                        expiration_time=tombstone_deadline,
+                    )
+                    self._done_sending.add(req_id)
                 logger.warning(
                     "TPURaidenConnectorWorker rank%d --> Stage-3 request "
                     "registration was already cancelled req_id=%s uuid=%d",
@@ -4531,19 +4632,23 @@ class TPURaidenConnectorWorker:
             registered_ahead = (
                 pipeline or getattr(req_meta, "registered_ahead", False) is True
             )
-            self._stage3_registered_sends[req_id] = _Stage3RegisteredSend(
-                uuid=uuid,
-                local_block_ids=local_ids,
-                num_tokens=num_tokens,
-                expiration_time=(float("inf") if registered_ahead else expiration_time),
-                finish_pending=registered_ahead,
-            )
-            if not any(reg.spans for reg in pool_spans):
-                # This PCP rank owns no physical page for the request. It has
-                # nevertheless published an empty D5 entry so controller
-                # lookup sees the complete source unit set, and is terminal
-                # immediately: there is no native transfer to wait for.
-                self._stage3_send_outcomes.setdefault(req_id, "done")
+            with self._stage3_poll_lock:
+                self._stage3_registered_sends[req_id] = _Stage3RegisteredSend(
+                    uuid=uuid,
+                    local_block_ids=local_ids,
+                    num_tokens=num_tokens,
+                    expiration_time=(
+                        float("inf") if registered_ahead else expiration_time
+                    ),
+                    finish_pending=registered_ahead,
+                )
+                if not any(reg.spans for reg in pool_spans):
+                    # This PCP rank owns no physical page for the request. It
+                    # has nevertheless published an empty D5 entry so
+                    # controller lookup sees the complete source unit set, and
+                    # is terminal immediately: there is no native transfer to
+                    # wait for.
+                    self._stage3_send_outcomes.setdefault(req_id, "done")
             logger.info(
                 "%s",
                 json.dumps(
@@ -5659,6 +5764,7 @@ class TPURaidenConnectorWorker:
             self._stage3_submitted_load_tokens[destination_req_id] = num_tokens
             self._stage3_submitted_load_metas[destination_req_id] = req_meta
             self._stage3_load_start_times[destination_req_id] = time.perf_counter()
+            self._stage3_load_staged_ts[destination_req_id] = time.time()
             local_blocks = list(req_meta.local_block_ids)
             self._load_block_ids[destination_req_id] = local_blocks
             if (
@@ -5741,6 +5847,10 @@ class TPURaidenConnectorWorker:
                             "destination_pages": len(local_blocks),
                             "destination_units": int(self.tp_size),
                             "controller_submit_ms": submit_ms,
+                            "ts_staged": self._stage3_load_staged_ts.get(
+                                destination_req_id
+                            ),
+                            "ts_rpc_end": time.time(),
                         },
                         sort_keys=True,
                     ),
@@ -6104,6 +6214,7 @@ class TPURaidenConnectorWorker:
             error=error,
             submit_ms=(time.perf_counter() - start_submit) * 1000,
             attempted_at=attempted_at,
+            finished_at=time.time(),
         )
 
     def _apply_stage3_submit_outcome(self, outcome: _Stage3SubmitOutcome) -> None:
@@ -6112,6 +6223,12 @@ class TPURaidenConnectorWorker:
         Model-runner thread only: every table it touches pairs with the
         get_finished/get_block_ids_with_load_errors drain of the same pass.
         """
+        with self._stage3_poll_lock:
+            self._apply_stage3_submit_outcome_locked(outcome)
+
+    def _apply_stage3_submit_outcome_locked(
+        self, outcome: _Stage3SubmitOutcome
+    ) -> None:
         task = outcome.task
         pending = task.pending
         destination_req_id = pending.destination_req_id
@@ -6247,6 +6364,9 @@ class TPURaidenConnectorWorker:
                     "state_group_count": self._stage3_state_group_count,
                     "destination_pages": len(pending.local_blocks),
                     "controller_submit_ms": outcome.submit_ms,
+                    "ts_staged": self._stage3_load_staged_ts.get(destination_req_id),
+                    "ts_rpc_start": outcome.attempted_at,
+                    "ts_rpc_end": outcome.finished_at,
                 },
                 sort_keys=True,
             ),
@@ -6546,6 +6666,8 @@ class TPURaidenConnectorWorker:
             # and must never contain a collective.
             self._drain_stage3_submit_outcomes()
         if self.is_producer and self._raiden_stage3_enabled():
+            self._stage3_register_gate.set()
+            self._reap_stage3_registrations(finished_req_ids)
             # The scheduler finished these requests: their registrations
             # made ahead of the finish start the TTL clock and the status
             # probe.
@@ -6559,6 +6681,15 @@ class TPURaidenConnectorWorker:
                         expiration_time=now
                         + float(dist_utils.get_p2p_wait_pull_timeout()),
                     )
+        with self._stage3_poll_lock:
+            return self._get_finished_locked(engine, finished_req_ids, cleanup_req_ids)
+
+    def _get_finished_locked(
+        self,
+        engine: "KVCacheManager",
+        finished_req_ids: set[str] | None,
+        cleanup_req_ids: set[str],
+    ) -> tuple[set[str], set[str]]:
         self._poll_finished(engine)
         done_sending = self._done_sending
         if self.is_producer and self._raiden_stage3_enabled():
@@ -6623,6 +6754,7 @@ class TPURaidenConnectorWorker:
             self._stage3_submitted_loads.pop(req_id, None)
             self._stage3_submitted_load_tokens.pop(req_id, None)
             self._stage3_load_start_times.pop(req_id, None)
+            self._stage3_load_staged_ts.pop(req_id, None)
             self._stage3_controller_accepted.discard(req_id)
             self._stage3_pending_controller_failures.pop(req_id, None)
             self._stage3_pending_submits.pop(req_id, None)
@@ -6663,6 +6795,20 @@ class TPURaidenConnectorWorker:
         ):
             self._drain_stage3_submit_outcomes()
         done_sending, done_recving, failed_recving = engine.poll_stats()
+        if self._stage3_late_native:
+            # Records a late poll took off the manager and left for this
+            # poll, oldest first, ahead of the fresh ones.
+            late_sending: list = []
+            late_recving: list = []
+            late_failed: list = []
+            for sending, recving, failed in self._stage3_late_native:
+                late_sending.extend(sending)
+                late_recving.extend(recving)
+                late_failed.extend(failed)
+            self._stage3_late_native = []
+            done_sending = late_sending + list(done_sending)
+            done_recving = late_recving + list(done_recving)
+            failed_recving = late_failed + list(failed_recving)
         sender_failures: set[str] = set()
         cancelled_sends: set[str] = set()
         if self.is_producer and not self._raiden_stage3_enabled():
@@ -6834,6 +6980,7 @@ class TPURaidenConnectorWorker:
                                 "uuid": registration.uuid,
                                 "num_tokens": registration.num_tokens,
                                 "transfer_rank": transfer_rank,
+                                "ts": time.time(),
                             },
                             sort_keys=True,
                         ),
@@ -6881,6 +7028,8 @@ class TPURaidenConnectorWorker:
                                     "uuid": uuid,
                                     "num_tokens": num_tokens,
                                     "reshard_e2e_latency_ms": latency_ms,
+                                    "ts_seen": time.time(),
+                                    "late": False,
                                 },
                                 sort_keys=True,
                             ),
@@ -6957,6 +7106,75 @@ class TPURaidenConnectorWorker:
                 )
                 del self._stage3_registered_sends[req_id]
                 del self._stage3_terminal_cleanup[req_id]
+
+    def late_poll_finished_recving(self) -> set[str]:
+        """Reports Stage-3 loads that completed since the step's poll.
+
+        Called from the async output thread when a step's output is
+        materialized, so a load that landed during the step rides that
+        step's output instead of the next one's. Only loads the model-runner
+        thread has already accepted are reported; every other record the
+        manager hands out is kept for its next poll. No collectives run
+        here, so the TP ranks may report a request on different steps and
+        the executor's aggregator waits for the last one.
+        """
+        if self.is_producer or not self._raiden_stage3_enabled():
+            return set()
+        engine = self._raiden_transfer_engine
+        if engine is None:
+            return set()
+        with self._stage3_poll_lock:
+            done_sending, done_recving, failed_recving = engine.poll_stats()
+            ready: set[str] = set()
+            deferred: list = []
+            for native_req_id in done_recving:
+                req_id = self._stage3_destination_req_ids.get(native_req_id)
+                if (
+                    req_id is not None
+                    and req_id in self._stage3_controller_accepted
+                    and req_id not in self._stage3_inflight_submits
+                    and req_id not in self._stage3_terminal_loads
+                    and req_id not in self._reported_recving
+                    and req_id not in self._suppress_done_recving
+                    and req_id not in self._stage3_finished_loads_pending_cleanup
+                    and req_id in self._stage3_submitted_loads
+                ):
+                    ready.add(req_id)
+                else:
+                    deferred.append(native_req_id)
+            if done_sending or deferred or failed_recving:
+                self._stage3_late_native.append(
+                    (list(done_sending), deferred, list(failed_recving))
+                )
+            now = time.time()
+            for req_id in ready:
+                self._stage3_terminal_loads.add(req_id)
+                self._reported_recving.add(req_id)
+                start_time = self._stage3_load_start_times.get(req_id)
+                latency_ms = (
+                    (time.perf_counter() - start_time) * 1000
+                    if start_time is not None
+                    else None
+                )
+                logger.info(
+                    "%s",
+                    json.dumps(
+                        {
+                            "event": "raiden_stage3_receiver_complete",
+                            "req_id": self._stage3_source_request_id(req_id),
+                            "destination_req_id": req_id,
+                            "uuid": self._stage3_submitted_loads.get(req_id),
+                            "num_tokens": self._stage3_submitted_load_tokens.get(
+                                req_id
+                            ),
+                            "reshard_e2e_latency_ms": latency_ms,
+                            "ts_seen": now,
+                            "late": True,
+                        },
+                        sort_keys=True,
+                    ),
+                )
+            return ready
 
     def _submit_stage3_async_complete(
         self, req_id: str, uuid: int, attempts: int = 0
