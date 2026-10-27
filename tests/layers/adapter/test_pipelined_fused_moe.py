@@ -399,11 +399,12 @@ def test_fp8_all_gather_puts_eight_bit_rows_on_the_wire():
     out, calls = _run_with_fp8_all_gather(hidden_states, group=group)
 
     # The rows cross as int8 -- the same eight bits as fp8, in a dtype every
-    # collective backend carries -- next to one f32 scale per row. The routing
+    # collective backend carries, next to one scale per row.
+    # Scales cross in bf16 to avoid 32-bit collective conversions. The routing
     # tensors gathered after them keep their own dtypes and are not the point.
     gathers = [(c[1], c[2]) for c in group.call_log if c[0] == "all_gather"]
     assert gathers[0] == (hidden_states.shape, torch.int8)
-    assert gathers[1] == ((64, 1), torch.float32)
+    assert gathers[1] == ((64, 1), torch.bfloat16)
     assert not [
         dtype
         for shape, dtype in gathers
@@ -434,7 +435,7 @@ def test_fp8_all_gather_takes_a_hidden_size_no_block_would_divide():
 
     gathers = [(c[1], c[2]) for c in group.call_log if c[0] == "all_gather"]
     assert gathers[0] == ((8, 576), torch.int8)
-    assert gathers[1] == ((8, 1), torch.float32)
+    assert gathers[1] == ((8, 1), torch.bfloat16)
     assert calls[0]["hidden_states"].shape == (16, 576)
     torch.testing.assert_close(
         out, hidden_states, rtol=1.0 / 32, atol=float(hidden_states.abs().max()) / 32

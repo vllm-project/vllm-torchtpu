@@ -46,8 +46,9 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `TPU_MOE_HIERARCHICAL_EP` | `False` | Enables two-level intra-chip / inter-chip hierarchical Expert Parallelism on dual-core TPU v7x hosts. |
 | `TPU_MOE_SEQUENCE_PARALLEL` | `False` | Enables sequence parallelism around MoE blocks. |
 | `TPU_ATTN_MOE_OVERLAP` | `False` | Overlaps Qwen3.5 MoE post-attention norm and router gate with TP collectives on token buckets >= 8 MiB per rank. |
+| `TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER` | `False` | Requires `TPU_ATTN_MOE_OVERLAP=True` (`PP=1`). Keeps the Qwen3.5 overlap residual sharded across layers via post-MoE `reduce-scatter` and quantizes pre-attention and pre-MoE TP all-gathers to per-row `fp8` (including `bfloat16` checkpoints). |
 | `TPU_MOE_ROUTER_TOPK` | `"rowmax"` | MoE router top-k kernel implementation (`"rowmax"` or standard top-k). |
-| `TPU_MOE_FP8_ALL_GATHER` | `False` | Performs MoE activation all-gather in `fp8` before expert computation. |
+| `TPU_MOE_FP8_ALL_GATHER` | `False` | Performs DP/PCP-group MoE activation all-gather in `fp8` before expert computation (no effect under TP-only execution). |
 | `ENABLE_QUANTIZED_MATMUL_KERNEL` | `False` | Dispatches quantized linear layers to the custom Pallas quantized matmul kernel. |
 | `REQUANTIZE_WEIGHT_DTYPE` | `"float8_e4m3fn"` | Target weight dtype for load-time linear weight requantization. |
 | `REQUANTIZE_BLOCK_SIZE` | `None` | Target subchannel block size for load-time linear weight requantization. |
