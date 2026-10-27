@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU chip specifications, collectives, geometry, and per-pass module costs."""
+"""Standalone analytical TPU serving roofline and step floor package."""
 
 from __future__ import annotations
 
@@ -34,6 +34,8 @@ from .modules import (
     experts_touched,
     pass_costs,
 )
+from .serving import ConcurrencyRow, plan
+from .step import StepFloor, spec_cycle_floor, step_floor
 
 __all__ = [
     "CHIPS",
@@ -42,11 +44,13 @@ __all__ = [
     "ChipSpec",
     "Collective",
     "CollectiveTable",
+    "ConcurrencyRow",
     "Dtypes",
     "ModelGeometry",
     "ModuleCost",
     "Parallel",
     "SliceTopology",
+    "StepFloor",
     "StepShape",
     "dtypes_from_hf_config",
     "ep_busiest_experts",
@@ -54,6 +58,9 @@ __all__ = [
     "from_hf_config",
     "load_hf_config",
     "pass_costs",
+    "plan",
+    "spec_cycle_floor",
+    "step_floor",
     "collective_ici_hops",
     "submesh_for_group",
     "torus_collective_s",
