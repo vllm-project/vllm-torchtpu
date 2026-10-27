@@ -1221,6 +1221,11 @@ class Qwen38SegmentDriver:
         model_kwargs: Any = None,
     ) -> tuple[bool, Any]:
         if self.program is None or inputs_embeds is not None or intermediate_tensors is not None:
+            # Counted like every other stock route, so a bypass shows in the mix.
+            self._note(
+                "stock_noprogram" if self.program is None
+                else ("stock_embeds" if inputs_embeds is not None else "stock_intermediate")
+            )
             return False, None
         self.seq += 1
         ok, n_req, t_seq, reason = MegakernelDriver._inspect_step_detail(None, None, runner)
