@@ -36,6 +36,7 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
 )
 from vllm_torchtpu.kernels.mla.sparse import native_sc_gather
 from vllm_torchtpu.kernels.mla.v2.tuned_params import TuningKey, get_tuned_params
+from vllm_torchtpu.layers.core import turboquant as tq
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import get_megacore
@@ -838,6 +839,40 @@ def mla_attention(
     return kv_cache, output_TNA
 
 
+def _tq_rotate(x: jax.Array, tables: tq.TQTables) -> jax.Array:
+    """`x @ H` over the last (latent) dim, in `x`'s dtype (`H` is symmetric)."""
+    return tq.rotate(x, jnp.asarray(tables.hadamard)).astype(x.dtype)
+
+
+def _tq_pack_sparse_mla_latent(
+    kv_c_normed: jax.Array, k_pe: jax.Array, tables: tq.TQTables
+) -> tuple[jax.Array, jax.Array]:
+    """(`kv_c_normed`, fp8 `k_pe`) -> (`u8[T, 256]` codes, `u8[T, 66]` RoPE row).
+
+    The codes' 64-byte blocks 1 and 2 are swapped: `pack_tokens` bands a
+    256 B token into words as `[b, b+64, b+128, b+192]`, and the native gather's
+    16-bit delta swap plus the TensorCore uint8 bitcast read them back as
+    blocks `[0, 2, 1, 3]` -- so storing them pre-swapped yields natural order.
+    """
+    codes, norm_bytes = tq.quantize_mla_latent(kv_c_normed, tables)
+    block = tq.MLA_TQ_NOPE_BYTES // 4
+    codes = jnp.concatenate(
+        [
+            codes[:, :block],
+            codes[:, 2 * block : 3 * block],
+            codes[:, block : 2 * block],
+            codes[:, 3 * block :],
+        ],
+        axis=-1,
+    )
+    assert k_pe.dtype == jnp.float8_e4m3fn, k_pe.dtype
+    assert k_pe.shape[-1] == tq.MLA_TQ_NORM_BYTE_OFFSET, k_pe.shape
+    rope_row = jnp.concatenate(
+        [jax.lax.bitcast_convert_type(k_pe, jnp.uint8), norm_bytes], axis=-1
+    )
+    return codes, rope_row
+
+
 def sparse_mla_attention(
     ql_nope: jax.Array,
     q_pe: jax.Array,
@@ -857,6 +892,8 @@ def sparse_mla_attention(
     k_scale: float | None = None,
     *,
     allow_masked_dense: bool = False,
+    tq_tables: tq.TQTables | None = None,
+    tq_prerotated: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Sharded wrapper for the GLM-5.2 sparse (DSA) MLA Pallas kernel.
 
@@ -883,6 +920,10 @@ def sparse_mla_attention(
       allow_masked_dense: Whether masked-dense routing admitted this layer
         (`kernels.mla.dispatch.admit_layer`). A static Python bool; when false
         the layer compiles only the original sparse call.
+      tq_tables: TurboQuant latent tables (`tq.make_mla_latent_tables`). When
+        set, `kv_c_normed` arrives unquantized and is stored as 4-bit codes
+        (`nope_spec` 256 B/token, norm in the RoPE row's padding); `k_pe` is
+        still fp8. Masked-dense routing is not used.
 
     Returns:
       A tuple containing:
@@ -913,6 +954,10 @@ def sparse_mla_attention(
         f"rope head dimension to be {lane_bytes // 2}, got {lkv_dim}+"
         f"{rope_dim}"
     )
+    tq_kwargs: dict[str, Any] = {}
+    if tq_tables is not None:
+        allow_masked_dense = False
+        tq_kwargs["tq_centroids"] = tuple(float(c) for c in tq_tables.centroids)
 
     in_specs = (
         P(None, None, None),  # ql_nope
@@ -956,6 +1001,10 @@ def sparse_mla_attention(
         query_start_loc_,
         request_distribution_,
     ):
+        if tq_tables is not None:
+            kv_c_normed, k_pe = _tq_pack_sparse_mla_latent(kv_c_normed, k_pe, tq_tables)
+            if not tq_prerotated:
+                ql_nope = _tq_rotate(ql_nope, tq_tables)
         kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache(
             kv_cache_nope,
             kv_cache_rope,
@@ -1001,13 +1050,18 @@ def sparse_mla_attention(
             cache_layout=cache_layout,
             **chunk_kwargs,
             **packed_rope_kwargs,
+            **tq_kwargs,
         )
 
         lkv_dim = ql_nope.shape[-1]
         # The kernel's output is lkv_dim + rope_dim wide because it attends
         # over concatenated (nope + rope) keys. Only the nope part is the MLA
         # value (P @ latent); drop the rope tail before the W_UV projection.
-        return output[..., :lkv_dim], kv_cache_nope, kv_cache_rope
+        output = output[..., :lkv_dim]
+        if tq_tables is not None and not tq_prerotated:
+            # Values were aggregated in the rotated basis: (P c H) H = P c.
+            output = _tq_rotate(output, tq_tables)
+        return output, kv_cache_nope, kv_cache_rope
 
     output, new_kv_cache_nope, new_kv_cache_rope = jax.jit(
         shard_map.shard_map(
@@ -1347,6 +1401,11 @@ def sparse_mla_attention_dcp(
                 P(dcp_axis_name, None),  # received lse
             )
     dequant_scale = float(k_scale) if k_scale is not None else 1.0
+    if (
+        nope_spec.token_bytes
+        != kv_cache_utils.WORD_BYTES * kv_cache_utils.TILE_LANE_BYTES
+    ):
+        raise NotImplementedError("TurboQuant sparse MLA does not support DCP yet.")
     # One cache_layout below governs both caches, so they must agree.
     if nope_spec.layout is not rope_spec.layout:
         raise ValueError(

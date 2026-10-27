@@ -33,6 +33,10 @@ DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE = 64
 DEFAULT_ATTENTION_KERNEL_BATCH_SIZE = 16
 # The native SparseCore gather's unit, which `topk_cap` must be a multiple of.
 GATHER_ATOM_ROWS = native_sc_gather.OCCURRENCES_PER_ATOM
+# TurboQuant tuning knobs (read at trace time).
+TQ_SPLIT_MATMUL = True  # per-plane partial matmuls instead of K/V concats
+TQ_UNROLL = 2  # unroll of the rolled per-token batch loop
+TQ_DEQUANT_MODE = "fast_post"  # "fast_post", "fast_pre", "fp8_post", or "raw"
 
 
 def cdiv(a, b):
@@ -1594,7 +1598,16 @@ def _attention_kernel(
     out_in: bool = False,
     send_exchange: tuple | None = None,
     recv_in: bool = False,
+    tq_centroids: tuple[float, ...] | None = None,
 ):
+    rope_scale = k_scale
+    _is_cubic = False
+    if tq_centroids is not None:
+        from vllm_torchtpu.layers.core import turboquant as _tq
+
+        assert sparsecore_layout
+        k_scale = 1.0
+        _is_cubic = _tq.is_mla_cubic_codebook(tq_centroids)
     # Fused exchange (`send_exchange` = (axis, lane_axis or None), with the
     # send layout on a one-step grid; TPU_MLA_FUSED_SMALL_A2A, see
     # SEND_SLAB_ROW0): the bo tile is per-destination slabs [W, SEND_SLAB_ROW0
@@ -1835,7 +1848,7 @@ def _attention_kernel(
     nope_dim = kv_cache_utils.WORD_BYTES * kv_cache_utils.TILE_LANE_BYTES
     assert kv_lens_ref.shape[0] == num_tokens
     bkv_sz = (
-        cache_kv_nope_hbm_ref.shape[1]
+        cache_kv_nope_hbm_ref.shape[1] * (1 if tq_centroids is None else 2)
         if sparsecore_layout
         else cache_kv_nope_hbm_ref.shape[1] // kv_cache_utils.WORD_BYTES
     )
@@ -2737,7 +2750,166 @@ def _attention_kernel(
             slice_sz=slice_sz,
         )
 
+    def tq_split_entry(bkv_nope_ref, bkv_rope_ref, bq, kv_len):
+        """TurboQuant attention for one query token without K/V concats.
+
+        The 512-dim latent arrives as two `[bkv_sz, 256]` nibble planes (codes
+        `0..255` and `256..511`); scores are the sum of three partial matmuls
+        (lo, hi, rope) and the value product skips the rope tail entirely.
+        """
+        from vllm_torchtpu.layers.core import turboquant as tq
+
+        half = tq.MLA_TQ_NOPE_BYTES
+        codes = pltpu.bitcast(bkv_nope_ref[...], jnp.uint8).reshape(bkv_sz, half)
+        rope_i32 = pltpu.bitcast(bkv_rope_ref[...], jnp.int32)  # i32[bkv_sz // 4, 128]
+        off = tq.MLA_TQ_NORM_BYTE_OFFSET
+        lane_i32 = lax.broadcasted_iota(jnp.int32, rope_i32.shape, 1)
+        lo_i32 = jnp.sum(
+            jnp.where(lane_i32 == off, rope_i32, 0),
+            axis=1,
+            keepdims=True,
+        )
+        hi_i32 = jnp.sum(
+            jnp.where(lane_i32 == off + 1, rope_i32, 0),
+            axis=1,
+            keepdims=True,
+        )
+        lo_u8 = pltpu.bitcast(
+            jnp.broadcast_to(lo_i32, rope_i32.shape), jnp.uint8
+        ).reshape(bkv_sz, 128)
+        hi_u8 = pltpu.bitcast(
+            jnp.broadcast_to(hi_i32, rope_i32.shape), jnp.uint8
+        ).reshape(bkv_sz, 128)
+        rope_pe_i32 = jnp.where(lane_i32 < off, rope_i32, 0)
+        rope = pltpu.bitcast(rope_pe_i32, jnp.float8_e4m3fn).reshape(bkv_sz, 128)
+
+        def mm(a, b):
+            return jnp.einsum("nd,md->nm", a, b, preferred_element_type=jnp.float32)
+
+        s_rope = mm(bq[:, 2 * half : 2 * half + 128], rope)
+        if rope_scale != 1.0:
+            s_rope = s_rope * rope_scale
+
+        post_norm = TQ_DEQUANT_MODE in ("fast_post", "fp8_post")
+        if TQ_DEQUANT_MODE == "raw":
+            k_lo = (codes & jnp.uint8(0xF)).astype(jnp.bfloat16)
+            k_hi = (codes >> jnp.uint8(4)).astype(jnp.bfloat16)
+        elif TQ_DEQUANT_MODE == "fp8_post":
+            codes_u32 = bkv_nope_ref[...]
+            sign_lo = (codes_u32 & jnp.uint32(0x08080808)) << jnp.uint32(4)
+            mag_lo = codes_u32 & jnp.uint32(0x07070707)
+            fp8_lo = sign_lo | (mag_lo * jnp.uint32(3) + jnp.uint32(0x02020202))
+            sign_hi = codes_u32 & jnp.uint32(0x80808080)
+            mag_hi = (codes_u32 >> jnp.uint32(4)) & jnp.uint32(0x07070707)
+            fp8_hi = sign_hi | (mag_hi * jnp.uint32(3) + jnp.uint32(0x02020202))
+            k_lo = pltpu.bitcast(fp8_lo, jnp.float8_e4m3fn).reshape(bkv_sz, half)
+            k_hi = pltpu.bitcast(fp8_hi, jnp.float8_e4m3fn).reshape(bkv_sz, half)
+        elif post_norm:
+            dt = tq.MLA_TQ_DEQUANT_DTYPE
+            k_lo = tq._cubic_levels_vreg(codes & jnp.uint8(0xF), dt).astype(
+                jnp.bfloat16
+            )
+            k_hi = tq._cubic_levels_vreg(codes >> jnp.uint8(4), dt).astype(jnp.bfloat16)
+        elif TQ_DEQUANT_MODE == "u16_pre":
+            dt = tq.MLA_TQ_DEQUANT_DTYPE
+            norm_u16 = lo_u8.astype(jnp.uint16) | (
+                hi_u8.astype(jnp.uint16) << jnp.uint16(8)
+            )
+            norm_u16 = jnp.where(
+                (norm_u16 & jnp.uint16(0x7F80)) == jnp.uint16(0x7F80),
+                jnp.uint16(0),
+                norm_u16,
+            )
+            norm_128 = jax.lax.bitcast_convert_type(norm_u16, jnp.bfloat16)
+            norm_256 = jnp.concatenate([norm_128, norm_128], axis=-1).astype(dt)
+            k_lo = (
+                tq._cubic_levels_vreg(codes & jnp.uint8(0xF), dt) * norm_256
+            ).astype(jnp.bfloat16)
+            k_hi = (tq._cubic_levels_vreg(codes >> jnp.uint8(4), dt) * norm_256).astype(
+                jnp.bfloat16
+            )
+        else:
+            dt = tq.MLA_TQ_DEQUANT_DTYPE
+            norm_f32 = tq._bf16_u16_to_f32_vreg(
+                lo_u8.astype(jnp.uint32), hi_u8.astype(jnp.uint32)
+            )
+            norm_128 = jnp.where(jnp.isfinite(norm_f32), norm_f32, 0.0).astype(dt)
+            norm_256 = jnp.concatenate([norm_128, norm_128], axis=-1)
+            k_lo = (
+                tq._cubic_levels_vreg(codes & jnp.uint8(0xF), dt) * norm_256
+            ).astype(jnp.bfloat16)
+            k_hi = (tq._cubic_levels_vreg(codes >> jnp.uint8(4), dt) * norm_256).astype(
+                jnp.bfloat16
+            )
+
+        s_nope = mm(bq[:, :half], k_lo) + mm(bq[:, half : 2 * half], k_hi)
+        kv_span = lax.broadcasted_iota(jnp.int32, s_nope.shape, 1)
+        norm_row = None
+        if post_norm:
+            norm_f32 = tq._bf16_u16_to_f32_vreg(
+                lo_u8.astype(jnp.uint32), hi_u8.astype(jnp.uint32)
+            )
+            norm_row = jnp.swapaxes(norm_f32[:, :1], 0, 1)
+            norm_row = jnp.where(kv_span[:1, :] < kv_len, norm_row, 0.0)
+            s = s_nope * norm_row + s_rope
+        else:
+            s = s_nope + s_rope
+        s *= sm_scale
+        s = jnp.where(kv_span < kv_len, s, jnp.finfo(jnp.float32).min)
+        m = jnp.max(s, axis=1, keepdims=True)
+        p = jnp.exp(s - m)
+        l_sum = jnp.sum(p, axis=1, keepdims=True)
+        pb = (p * norm_row if norm_row is not None else p).astype(jnp.bfloat16)
+
+        def pv(b):
+            return jnp.einsum("nm,md->nd", pb, b, preferred_element_type=jnp.float32)
+
+        acc = jnp.concatenate([pv(k_lo), pv(k_hi)], axis=-1)
+        out = (acc * pl.reciprocal(l_sum, approx=True)).astype(q_dtype)
+        if o_dim > out.shape[-1]:
+            out = jnp.concatenate(
+                [out, jnp.zeros((out.shape[0], o_dim - out.shape[-1]), q_dtype)],
+                axis=-1,
+            )
+        return out[:, :o_dim], l_sum, m
+
+    def unpack_bkv_tq(bkv_nope_ref, bkv_rope_ref):
+        from vllm_torchtpu.layers.core import turboquant as tq
+
+        # Two tokens per uint32[128] row, delta-swapped by the native gather
+        # so the byte expansion is one contiguous 256 B code row per token.
+        codes = pltpu.bitcast(bkv_nope_ref[...], jnp.uint8)
+        codes = codes.reshape(bkv_sz, tq.MLA_TQ_NOPE_BYTES)
+        rope_u8 = pltpu.bitcast(bkv_rope_ref[...], jnp.uint8).reshape(bkv_sz, 128)
+        off = tq.MLA_TQ_NORM_BYTE_OFFSET
+        # Pull the two norm byte columns out with lane-masked reductions
+        # rather than single-lane slices of a packed uint8 tile.
+        lane = lax.broadcasted_iota(jnp.int32, rope_u8.shape, 1)
+        rope_i32 = rope_u8.astype(jnp.int32)
+
+        def byte_col(col):
+            return jnp.sum(jnp.where(lane == col, rope_i32, 0), axis=1, keepdims=True)
+
+        nope = tq.dequant_mla_latent_vreg(
+            codes,
+            byte_col(off),
+            byte_col(off + 1),
+            np.asarray(tq_centroids, np.float32),
+            jnp.bfloat16,
+        )
+        # The norm bytes may decode to fp8 NaN; only the k_pe lanes are kept.
+        rope_u8 = jnp.where(lane < off, rope_u8, jnp.uint8(0))
+        rope = pltpu.bitcast(rope_u8, jnp.float8_e4m3fn).astype(jnp.float32)
+        if rope_scale != 1.0:
+            rope = rope * rope_scale
+        return jnp.concatenate([nope, rope.astype(jnp.bfloat16)], axis=-1)
+
     def unpack_bkv(bkv_nope_ref, bkv_rope_ref, get_kv_len, slice_sz=bkv_sz):
+        if tq_centroids is not None:
+            bkv = unpack_bkv_tq(bkv_nope_ref, bkv_rope_ref)
+            kv_len = get_kv_len()
+            k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
+            return jnp.where(k_span < kv_len, bkv, 0)
         # slice_sz < bkv_sz reads only the rung the batch's longest row needs.
         if slice_sz == bkv_sz:
             bkv_nope = bkv_nope_ref[...]
@@ -3112,6 +3284,33 @@ def _attention_kernel(
             xqk_write_blse(batch_size - 1, prev[3], prev[2])
 
         def run_steps(rows=None, levers=()):
+            if tq_centroids is not None:
+
+                def tq_entry(batch_idx, carry):
+                    kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
+                    if TQ_SPLIT_MATMUL and _is_cubic:
+                        out, l_sum, m = tq_split_entry(
+                            bkv_nope_x2_ref.at[bi_sem_idx, batch_idx],
+                            bkv_rope_x2_ref.at[bi_sem_idx, batch_idx],
+                            load_bq(bi_sem_idx, batch_idx),
+                            kv_len,
+                        )
+                        store_out(bo_sem_idx, batch_idx, out)
+                        write_blse(batch_idx, m, l_sum)
+                        return carry
+                    bkv = load_bkv(bi_sem_idx, batch_idx, rows, levers)
+                    p, l_sum, m = attention_step1_qk_softmax(
+                        load_bq(bi_sem_idx, batch_idx), bkv, kv_len
+                    )
+                    out = attention_step2_pv(p, bkv, l_sum, levers)
+                    store_out(bo_sem_idx, batch_idx, out)
+                    write_blse(batch_idx, m, l_sum)
+                    return carry
+
+                lax.fori_loop(
+                    0, batch_size, tq_entry, 0, unroll=min(TQ_UNROLL, batch_size)
+                )
+                return
             if "pair" in levers:
                 return run_pairs(rows, levers)
             if "quad" in levers:
@@ -3439,6 +3638,7 @@ def prepare_outputs(
         "out_pieces_fault",
         "out_pieces_gather_first",
         "packed_rope",
+        "tq_centroids",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -3496,6 +3696,7 @@ def sparse_ragged_paged_attention(
     send_peer: jax.Array | None = None,
     send_recv_in: jax.Array | None = None,
     packed_rope: bool = False,
+    tq_centroids: tuple[float, ...] | None = None,
 ) -> jax.Array | tuple[jax.Array, ...]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -3674,6 +3875,15 @@ def sparse_ragged_paged_attention(
     sparsecore_layout = cache_layout == SPARSECORE_CACHE_LAYOUT
     # Tokens per ROPE cache row: four padded 128-byte rows, or eight packed.
     rope_tokens_per_row = 8 if packed_rope else 4
+    nope_ratio = rope_tokens_per_row
+    if tq_centroids is not None:
+        if not sparsecore_layout:
+            raise NotImplementedError(
+                "TurboQuant sparse MLA needs the sparsecore layout"
+            )
+        if packed_rope:
+            raise NotImplementedError("TurboQuant sparse MLA does not use packed_rope")
+        nope_ratio = 2  # 256 B of 4-bit codes vs 128 B per token.
     if sparsecore_layout:
         if (
             cache_kv_nope.dtype != jnp.uint32
@@ -3711,14 +3921,14 @@ def sparse_ragged_paged_attention(
             raise ValueError(
                 "tensorcore ROPE cache must be uint8[pages,page_size/4,4,128]"
             )
-    if cache_kv_nope.size != rope_tokens_per_row * cache_kv_rope.size:
+    if cache_kv_nope.size != nope_ratio * cache_kv_rope.size:
         raise ValueError(
             f"NOPE cache size ({cache_kv_nope.size}) must be exactly "
-            f"{rope_tokens_per_row} * ROPE cache size ({cache_kv_rope.size})"
+            f"{nope_ratio} * ROPE cache size ({cache_kv_rope.size})"
         )
     if (
         cache_kv_nope.shape[0] != cache_kv_rope.shape[0]
-        or cache_kv_nope.shape[1] != rope_tokens_per_row * cache_kv_rope.shape[1]
+        or cache_kv_nope.shape[1] != nope_ratio * cache_kv_rope.shape[1]
     ):
         raise ValueError(
             "NOPE and ROPE caches must have matching page counts and page geometry"
@@ -3763,7 +3973,7 @@ def sparse_ragged_paged_attention(
     else:
         q = prepare_q_inputs(q)  # [max_num_tokens, num_q_heads, head_dim]
 
-    page_size = cache_kv_nope.shape[1]
+    page_size = cache_kv_rope.shape[1] * rope_tokens_per_row
 
     _, num_q_heads, _ = q.shape
 
@@ -4135,6 +4345,7 @@ def sparse_ragged_paged_attention(
             send_peer=send_peer,
             send_recv_in=send_recv_in,
             packed_rope=packed_rope,
+            tq_centroids=tq_centroids,
             **extra,
         )
 
@@ -4333,6 +4544,7 @@ def sparse_attention_chunk(
     send_peer: jax.Array | None = None,
     send_recv_in: jax.Array | None = None,
     packed_rope: bool = False,
+    tq_centroids: tuple[float, ...] | None = None,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -4413,6 +4625,10 @@ def sparse_attention_chunk(
         head_dim = align_to(head_dim + (Q_ROPE_DIM if q_rope else q_pe.shape[-1]), 128)
     chunk_size = end_pos - start_pos
     capped_windows = None if topk_cap is None else topk // topk_cap
+    if tq_centroids is not None and not sparsecore_layout:
+        raise NotImplementedError("TurboQuant sparse MLA needs the sparsecore layout")
+    nope_words = 128 if tq_centroids is None else 64
+    nope_tokens_per_row = 128 // nope_words
 
     def run_mla_kernel(
         q: jax.Array,  # [max_num_tokens, num_q_heads, head_dim]
@@ -4651,6 +4867,7 @@ def sparse_attention_chunk(
             out_in=out_carried is not None,
             send_exchange=send_exchange,
             recv_in=send_recv_in is not None,
+            tq_centroids=tq_centroids,
         )
         if live_views is None and row_levers and row_widths and capped_windows:
             # Decode body levers on the row-widths body.
@@ -4963,13 +5180,14 @@ def sparse_attention_chunk(
                 kv_write=kv_write,
                 write_fault=kv_write_fault,
                 packed_rope=packed_rope,
+                nope_words=nope_words,
                 **live_kwargs,
             )
             gathered_nope_buffer, gathered_rope_buffer = gathered[:2]
             if kv_write is not None:
                 cache_kv_nope, cache_kv_rope = gathered[2:]
             gathered_nope_buffer = gathered_nope_buffer.reshape(
-                capped_windows * chunk_size, topk_cap, 128
+                capped_windows * chunk_size, topk_cap // nope_tokens_per_row, 128
             )
             gathered_rope_buffer = gathered_rope_buffer.reshape(
                 capped_windows * chunk_size,
@@ -4982,7 +5200,7 @@ def sparse_attention_chunk(
                     gathered_nope_buffer.reshape(
                         chunk_size * topk // block,
                         kernel_batch_size,
-                        GATHER_ATOM_ROWS,
+                        GATHER_ATOM_ROWS // nope_tokens_per_row,
                         128,
                     ),
                     gathered_rope_buffer.reshape(
@@ -5017,10 +5235,13 @@ def sparse_attention_chunk(
                     serve_pipelined=sparsecore_gather_pipelined,
                     **({"is_dcp_mode": True} if is_dcp_mode else {}),
                     packed_rope=packed_rope,
+                    nope_words=nope_words,
                     **live_kwargs,
                 )
             )
-            gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, topk, 128)
+            gathered_nope_buffer = gathered_nope_buffer.reshape(
+                chunk_size, topk // nope_tokens_per_row, 128
+            )
             gathered_rope_buffer = gathered_rope_buffer.reshape(
                 chunk_size, topk // native_sc_gather.ROPE_PACKING, 128
             )
