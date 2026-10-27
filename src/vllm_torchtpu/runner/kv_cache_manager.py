@@ -81,6 +81,7 @@ from vllm_torchtpu.layers.adapter.attention import (
     PallasMLAttentionBackend,
     VllmTPUDeepseekV32IndexerBackend,
 )
+from vllm_torchtpu.layers.core import turboquant
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilder
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
@@ -367,6 +368,7 @@ class KVCacheManager:
             elif isinstance(attn_module, MLAAttention):
                 if layer_name in kv_cache_spec:
                     continue
+                is_tq_mla = turboquant.is_turboquant_kv_cache_dtype(cache_dtype_str)
                 page_size_padded = (
                     self.runner._hybrid_uniform_page_size_bytes
                     if self.runner._hybrid_uniform_page_size_bytes is not None
@@ -374,13 +376,21 @@ class KVCacheManager:
                         block_size,
                         1,
                         attn_module.head_size,
-                        self.runner.kv_cache_dtype,
+                        cache_dtype_str if is_tq_mla else self.runner.kv_cache_dtype,
                     )
                 )
                 kv_cache_spec[layer_name] = MLAAttentionSpec(
                     block_size=block_size,
                     num_kv_heads=1,
-                    head_size=attn_module.head_size,
+                    # TurboQuant packs a token into fewer bytes than the
+                    # 576-wide latent; vLLM asserts the padded page covers
+                    # `block_size * head_size` bytes, so publish the packed
+                    # width (the sparse cache specs do not read it).
+                    head_size=(
+                        page_size_padded // block_size
+                        if is_tq_mla
+                        else attn_module.head_size
+                    ),
                     dtype=self.runner.kv_cache_dtype,
                     cache_dtype_str=cache_dtype_str,
                     page_size_padded=page_size_padded,

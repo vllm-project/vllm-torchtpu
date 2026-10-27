@@ -1995,6 +1995,16 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         self.non_causal_multi_token_decode = bool(
             kwargs.get("non_causal_multi_token_decode", False)
         )
+        if turboquant.is_turboquant_kv_cache_dtype(kv_cache_dtype):
+            # MLA backends only see the uint8 storage dtype when sizing KV
+            # pages; record the preset in this (worker) process so
+            # `get_kv_cache_page_size_bytes` sizes TurboQuant pages, not
+            # fp8_ds_mla ones.
+            from vllm_torchtpu.layers.adapter.turboquant_attention import (
+                set_active_turboquant_preset,
+            )
+
+            set_active_turboquant_preset(kv_cache_dtype)
 
         parallel_config = getattr(
             get_current_vllm_config_or_none(), "parallel_config", None
