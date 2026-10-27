@@ -47,9 +47,19 @@ def _decode_kernel(
     block_q: int,
     scale: float,
     tokens_per_seq: int | None = None,
+    external_accumulators: Any = None,
+    sequence_index: Any = None,
+    current_swa: Any = None,
+    previous_output: Any = None,
+    previous_rope: Any = None,
+    drain_only: bool = False,
+    swa_rhs_preloaded: bool = False,
+    preload_swa: Any = None,
 ) -> None:
     log2_e = math.log2(math.e)
-    seq_start = pl.program_id(0) * block_seq
+    seq_start = (
+        pl.program_id(0) * block_seq if sequence_index is None else sequence_index
+    )
     query_offset = 0 if tokens_per_seq is None else pl.program_id(1) * num_tokens
     sequence_stride = num_tokens if tokens_per_seq is None else tokens_per_seq
     cache_page_size = swa_kv_ref.shape[1]
@@ -64,15 +74,19 @@ def _decode_kernel(
     swa_capacity = 256 // (block_seq * mrb_stride)
     accumulator_slots = max(2 * block_q, block_seq * min(num_tokens, swa_capacity))
 
-    accumulators = tuple(
-        tuple(
-            jax.empty_ref(
-                jax.ShapeDtypeStruct((mxu_heads, 256), jnp.float32),
-                memory_space=pltpu.ACC(mxu),
+    accumulators = (
+        external_accumulators
+        if external_accumulators is not None
+        else tuple(
+            tuple(
+                jax.empty_ref(
+                    jax.ShapeDtypeStruct((mxu_heads, 256), jnp.float32),
+                    memory_space=pltpu.ACC(mxu),
+                )
+                for _ in range(accumulator_slots)
             )
-            for _ in range(accumulator_slots)
+            for mxu in range(2)
         )
-        for mxu in range(2)
     )
 
     def token_ref(ref, i):
@@ -107,53 +121,59 @@ def _decode_kernel(
         for r, i in enumerate(indices)
     }
 
-    tiles_per_seq = 1 if tokens_per_seq is None else tokens_per_seq // num_tokens
-    tile = 0 if tokens_per_seq is None else pl.program_id(1)
-    step = pl.program_id(0) * tiles_per_seq + tile
-    slot = step % 2
-    swa_ref = swa_buffer_ref.at[slot]
+    if current_swa is not None:
+        swa_ref = current_swa
+    else:
+        tiles_per_seq = 1 if tokens_per_seq is None else tokens_per_seq // num_tokens
+        tile = 0 if tokens_per_seq is None else pl.program_id(1)
+        step = pl.program_id(0) * tiles_per_seq + tile
+        slot = step % 2
+        swa_ref = swa_buffer_ref.at[slot]
 
-    def transfer_swa(seq_start, query_offset, slot, *, wait):
-        for seq in range(block_seq):
-            seq_idx = seq_start + seq
-            tile = query_offset // num_tokens
-            for block in range(num_pages):
-                descriptor = ((seq_idx * tiles_per_seq + tile) * num_pages + block) * 2
-                page = swa_dma_ref[descriptor]
-                offset = swa_dma_ref[descriptor + 1] * page_size
-                copy = pltpu.make_async_copy(
-                    swa_kv_ref.at[page, pl.ds(offset, page_size), :],
-                    swa_buffer_ref.at[
-                        slot, seq, pl.ds(block * page_size, page_size), :
-                    ],
-                    swa_sem.at[slot, seq, block],
-                )
-                if wait:
-                    copy.wait()
-                else:
-                    copy.start()
+        def transfer_swa(seq_start, query_offset, slot, *, wait):
+            for seq in range(block_seq):
+                seq_idx = seq_start + seq
+                tile = query_offset // num_tokens
+                for block in range(num_pages):
+                    descriptor = (
+                        (seq_idx * tiles_per_seq + tile) * num_pages + block
+                    ) * 2
+                    page = swa_dma_ref[descriptor]
+                    offset = swa_dma_ref[descriptor + 1] * page_size
+                    copy = pltpu.make_async_copy(
+                        swa_kv_ref.at[page, pl.ds(offset, page_size), :],
+                        swa_buffer_ref.at[
+                            slot, seq, pl.ds(block * page_size, page_size), :
+                        ],
+                        swa_sem.at[slot, seq, block],
+                    )
+                    if wait:
+                        copy.wait()
+                    else:
+                        copy.start()
 
-    @pl.when(step == 0)
-    def prime_swa():
-        transfer_swa(seq_start, query_offset, slot, wait=False)
+        @pl.when(step == 0)
+        def prime_swa():
+            transfer_swa(seq_start, query_offset, slot, wait=False)
 
-    transfer_swa(seq_start, query_offset, slot, wait=True)
+        transfer_swa(seq_start, query_offset, slot, wait=True)
 
-    @pl.when(step + 1 < (positions_ref.shape[0] // block_seq) * tiles_per_seq)
-    def prefetch_swa():
-        following = step + 1
-        transfer_swa(
-            following // tiles_per_seq * block_seq,
-            following % tiles_per_seq * num_tokens,
-            1 - slot,
-            wait=False,
-        )
+        @pl.when(step + 1 < (positions_ref.shape[0] // block_seq) * tiles_per_seq)
+        def prefetch_swa():
+            following = step + 1
+            transfer_swa(
+                following // tiles_per_seq * block_seq,
+                following % tiles_per_seq * num_tokens,
+                1 - slot,
+                wait=False,
+            )
 
     def swa_qk_compute(seq, first, size, slot_base):
         for mxu in range(2):
             ks = pl.ds(mxu * 256, 256)
             rhs = swa_ref[seq, :, ks]
-            pltpu.matmul_push_rhs(rhs, 0, mxu, transpose=True)
+            if not swa_rhs_preloaded:
+                pltpu.matmul_push_rhs(rhs, 0, mxu, transpose=True)
 
             for r in range(size):
                 lhs = jnp.pad(
@@ -163,7 +183,7 @@ def _decode_kernel(
                 pltpu.matmul_acc_lhs(
                     accumulators[mxu][slot_base + r],
                     lhs,
-                    load_staged_rhs=0 if r == 0 else None,
+                    load_staged_rhs=(1 if swa_rhs_preloaded else 0) if r == 0 else None,
                 )
 
     def swa_qk_pop(seq, first, size, slot_base):
@@ -188,18 +208,23 @@ def _decode_kernel(
             ) + jnp.where(valid[None, :], 0.0, -jnp.inf)
 
     def main_unpack(indices):
-        # Larger tiles let the compiler rematerialize FP8 conversion at both
-        # consumers. Sixteen rows retain one decode in the measured native LLO.
+        # Carry-PV loads 64 rows and converts each 16-row slice once for QK/PV.
+        unpack_rows = 64 if external_accumulators is not None else 16
         for i in indices:
-            for row in range(0, 512, 16):
-                rows = pl.ds(row, 16)
-                words = token_ref(main_cache_ref, i)[rows, :]
-                for group in range(4):
-                    shifted = lax.shift_right_logical(words, 8 * group)
-                    bits = shifted.astype(jnp.uint8)
-                    fp8 = lax.bitcast_convert_type(bits, jnp.float8_e4m3fn)
-                    values = fp8.astype(jnp.bfloat16)
-                    main_kv_ref[kv_slots[i], rows, pl.ds(group * 128, 128)] = values
+            for row in range(0, 512, unpack_rows):
+                words = token_ref(main_cache_ref, i)[pl.ds(row, unpack_rows), :]
+                for subrow in range(0, unpack_rows, 16):
+                    subwords = words[pl.ds(subrow, 16)]
+                    for group in range(4):
+                        shifted = lax.shift_right_logical(subwords, 8 * group)
+                        bits = shifted.astype(jnp.uint8)
+                        fp8 = lax.bitcast_convert_type(bits, jnp.float8_e4m3fn)
+                        values = fp8.astype(jnp.bfloat16)
+                        main_kv_ref[
+                            kv_slots[i],
+                            pl.ds(row + subrow, 16),
+                            pl.ds(group * 128, 128),
+                        ] = values
 
     def main_qk_compute(indices):
         tiles = [(r, i, block) for r, i in enumerate(indices) for block in range(2)]
@@ -330,7 +355,10 @@ def _decode_kernel(
                     load_staged_rhs=0 if r == 0 else None,
                 )
 
-    def inverse_rope(indices):
+                if r == len(indices) - 1 and preload_swa is not None:
+                    preload_swa(mxu)
+
+    def inverse_rope(indices, target=output_ref, rotations=rope_ref):
         for r, i in enumerate(indices):
             output = jnp.concatenate(
                 [
@@ -347,11 +375,34 @@ def _decode_kernel(
                 mode="promise_in_bounds",
             )
             rotated = (
-                tail * token_ref(rope_ref, i)[0][None, :]
-                + partner * token_ref(rope_ref, i)[1][None, :]
+                tail * token_ref(rotations, i)[0][None, :]
+                + partner * token_ref(rotations, i)[1][None, :]
             )
-            token_ref(output_ref, i)[:, :384] = output[:, :384].astype(jnp.bfloat16)
-            token_ref(output_ref, i)[:, 384:] = rotated.astype(jnp.bfloat16)
+            token_ref(target, i)[:, :384] = output[:, :384].astype(jnp.bfloat16)
+            token_ref(target, i)[:, 384:] = rotated.astype(jnp.bfloat16)
+
+    if external_accumulators is not None:
+        indices = tuple(range(num_tokens))
+        if drain_only:
+            inverse_rope(indices)
+            return
+        swa_qk_compute(0, 0, num_tokens, 0)
+        main_unpack(indices)
+        if previous_output is not None:
+            inverse_rope(indices, previous_output, previous_rope)
+        swa_qk_pop(0, 0, num_tokens, 0)
+        main_qk_compute(indices)
+        for i in indices:
+            logits = jnp.concatenate(
+                [
+                    pltpu.matmul_pop(accumulators[mxu][i])[:num_heads]
+                    for mxu in range(2)
+                ],
+                axis=1,
+            )
+            softmax((i,), (logits,))
+        fused_pv(indices)
+        return
 
     for first in range(0, num_tokens, swa_capacity):
         size = min(swa_capacity, num_tokens - first)
@@ -372,6 +423,268 @@ def _decode_kernel(
             inverse_rope(groups[step - 1])
         fused_pv(indices)
     inverse_rope(groups[-1])
+
+
+def _carry_decode(
+    q, main_kv, scales, swa, sink, rope, positions, pages, lengths, *, scale
+):
+    bq = 6
+    tokens, heads, _ = q.shape
+    tiles = tokens // 6
+
+    def kernel(
+        positions_ref,
+        pages_ref,
+        lengths_ref,
+        q_hbm,
+        kv_hbm,
+        scales_ref,
+        swa_hbm,
+        sink_ref,
+        rope_ref,
+        out_hbm,
+        q_buf,
+        kv_buf,
+        swa_buf,
+        outputs,
+        decoded,
+        swa_work,
+        swa_scores,
+        main_p,
+        swa_p,
+        input_sems,
+        output_sems,
+        swa_sems,
+    ):
+        accumulators = tuple(
+            tuple(
+                jax.empty_ref(
+                    jax.ShapeDtypeStruct((heads, 256), jnp.float32),
+                    memory_space=pltpu.ACC(mxu),
+                )
+                for _ in range(2 * bq)
+            )
+            for mxu in range(2)
+        )
+
+        def input_copies(tile, bank):
+            rows = pl.ds(tile * 6, 6)
+            return (
+                pltpu.make_async_copy(
+                    q_hbm.at[rows], q_buf.at[bank, pl.ds(0, 6)], input_sems.at[bank, 0]
+                ),
+                pltpu.make_async_copy(
+                    kv_hbm.at[rows],
+                    kv_buf.at[bank, pl.ds(0, 6)],
+                    input_sems.at[bank, 1],
+                ),
+            )
+
+        def start_input(tile, bank):
+            for copy in input_copies(tile, bank):
+                copy.start()
+
+        def swa_copies(tile, bank):
+            position = positions_ref[tile]
+            window_start = jnp.maximum(0, position - 127)
+            anchor = window_start // 64 * 64
+            visible_start = jnp.maximum(window_start, pages_ref[tile, 1])
+            copies = []
+            for block in range(4):
+                key = anchor + block * 64
+                column = (key - pages_ref[tile, 0]) // 64
+                safe = jnp.clip(column, 0, pages_ref.shape[1] - 3)
+                physical = pages_ref[tile, safe + 2]
+                valid = (
+                    (key < position + 6)
+                    & (key + 64 > visible_start)
+                    & (column >= 0)
+                    & (column < pages_ref.shape[1] - 2)
+                    & (physical >= 0)
+                    & (physical < swa_hbm.shape[0])
+                )
+                page = jnp.where(valid, physical, 0)
+                copies.append(
+                    pltpu.make_async_copy(
+                        swa_hbm.at[page],
+                        swa_buf.at[bank, block],
+                        swa_sems.at[bank, block],
+                    )
+                )
+            return copies
+
+        def start_swa(tile, bank):
+            for copy in swa_copies(tile, bank):
+                copy.start()
+
+        def wait_swa(tile, bank):
+            for copy in swa_copies(tile, bank):
+                copy.wait()
+
+        def output_copy(tile, bank):
+            return pltpu.make_async_copy(
+                outputs.at[bank, pl.ds(0, 6)],
+                out_hbm.at[pl.ds(tile * 6, 6)],
+                output_sems.at[bank],
+            )
+
+        def compute(
+            tile,
+            bank,
+            sb,
+            *,
+            previous=False,
+            drain=False,
+            prefetch=True,
+            prefetch_swa=True,
+            preload_next=True,
+        ):
+            def preload_next_swa(mxu):
+                values = swa_buf[(sb + 1) % 4].reshape(256, 512)
+                pltpu.matmul_push_rhs(
+                    values[:, pl.ds(mxu * 256, 256)], 1, mxu, transpose=True
+                )
+
+            swa_work[...] = swa_buf[sb].reshape(1, 256, 512)
+            _decode_kernel(
+                positions_ref,
+                pages_ref,
+                lengths_ref,
+                None,
+                q_buf.at[sb],
+                kv_buf.at[sb],
+                scales_ref.at[pl.ds(tile * bq, bq)],
+                swa_hbm,
+                sink_ref,
+                rope_ref.at[pl.ds(tile * bq, bq)],
+                outputs.at[bank],
+                decoded,
+                None,
+                None,
+                swa_scores,
+                main_p,
+                swa_p,
+                num_tokens=bq,
+                block_seq=1,
+                block_q=bq,
+                scale=scale,
+                external_accumulators=accumulators,
+                sequence_index=tile,
+                current_swa=swa_work,
+                previous_output=outputs.at[1 - bank] if previous else None,
+                previous_rope=rope_ref.at[pl.ds((tile - 1) * bq, bq)]
+                if previous
+                else None,
+                drain_only=drain,
+                swa_rhs_preloaded=previous,
+                preload_swa=preload_next_swa if preload_next and not drain else None,
+            )
+            if previous:
+                output_copy(tile - 1, 1 - bank).start()
+            if prefetch and not drain:
+                start_input(tile + 4, sb)
+            if prefetch_swa and not drain:
+                start_swa(tile + 4, sb)
+
+        def step(
+            tile,
+            bank,
+            sb,
+            *,
+            previous=True,
+            wait_output=True,
+            prefetch=True,
+            prefetch_swa=True,
+            preload_next=True,
+        ):
+            for copy in input_copies(tile, sb):
+                copy.wait()
+            if not previous:
+                wait_swa(tile, sb)
+            if preload_next:
+                wait_swa(tile + 1, (sb + 1) % 4)
+            if wait_output:
+                output_copy(tile - 3, 1 - bank).wait()
+            compute(
+                tile,
+                bank,
+                sb,
+                previous=previous,
+                prefetch=prefetch,
+                prefetch_swa=prefetch_swa,
+                preload_next=preload_next,
+            )
+
+        for i in range(4):
+            start_input(i, i)
+        for i in range(4):
+            start_swa(i, i)
+        step(0, 0, 0, previous=False, wait_output=False)
+        step(1, 1, 1, wait_output=False)
+        step(2, 0, 2, wait_output=False)
+        step(3, 1, 3)
+        groups = (tiles - 8) // 4
+
+        def body(group, unused):
+            for j in range(4):
+                step(4 + group * 4 + j, j % 2, (4 + j) % 4)
+            return None
+
+        lax.fori_loop(0, groups, body, None)
+        for tile in range(4 + groups * 4, tiles):
+            step(
+                tile,
+                tile % 2,
+                tile % 4,
+                prefetch=tile < tiles - 4,
+                prefetch_swa=tile < tiles - 4,
+                preload_next=tile < tiles - 1,
+            )
+        output_copy(tiles - 3, (tiles - 3) % 2).wait()
+        compute(
+            tiles - 1,
+            (tiles - 1) % 2,
+            (tiles - 1) % 4,
+            drain=True,
+            prefetch=False,
+            prefetch_swa=False,
+            preload_next=False,
+        )
+        output_copy(tiles - 1, (tiles - 1) % 2).start()
+        output_copy(tiles - 2, (tiles - 2) % 2).wait()
+        output_copy(tiles - 1, (tiles - 1) % 2).wait()
+
+    spaces = (pltpu.HBM, pltpu.HBM, pltpu.VMEM, pltpu.HBM, pltpu.VMEM, pltpu.VMEM)
+    args = (q, main_kv, scales[:, None, :], swa, sink[:, None], rope)
+    args = tuple(pltpu.with_memory_space_constraint(x, s) for x, s in zip(args, spaces))
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct(q.shape, jnp.bfloat16),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=3,
+            grid=(),
+            in_specs=tuple(pl.BlockSpec(memory_space=s) for s in spaces),
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            scratch_shapes=(
+                pltpu.VMEM((4, bq, heads, 512), jnp.bfloat16),
+                pltpu.VMEM((4, bq, 512, 128), jnp.int32),
+                pltpu.VMEM((4, 4, 64, 512), jnp.bfloat16),
+                pltpu.VMEM((2, bq, heads, 512), jnp.bfloat16),
+                pltpu.VMEM((bq, 512, 512), jnp.bfloat16),
+                pltpu.VMEM((1, 256, 512), jnp.bfloat16),
+                pltpu.VMEM((bq, heads, 256), jnp.float32),
+                pltpu.VMEM((bq, heads, 512), jnp.bfloat16),
+                pltpu.VMEM((bq, heads, 256), jnp.bfloat16),
+                pltpu.SemaphoreType.DMA((4, 2)),
+                pltpu.SemaphoreType.DMA((2,)),
+                pltpu.SemaphoreType.DMA((4, 4)),
+            ),
+        ),
+        compiler_params=pltpu.CompilerParams(
+            disable_bounds_checks=True, disable_semaphore_checks=True
+        ),
+        name="csa2_decode",
+    )(positions, pages, lengths, *args)
 
 
 @functools.partial(
@@ -454,6 +767,28 @@ def csa2_decode(
             raise ValueError(f"CSA2 {name} must have shape {shape} and dtype {dtype}")
     if total_tokens == 0:
         return jnp.zeros(q.shape, q.dtype)
+    # The four-input carry schedule has four prologue and four drain tiles.
+    # Larger metadata tables retain the bounded buffered-grid implementation.
+    if (
+        num_tokens == 6
+        and num_heads == 64
+        and page_size == 64
+        and batch_size >= 8
+        and main_kv_scale.nbytes + rope_cache.nbytes
+        <= pltpu.get_tpu_info().vmem_capacity_bytes // 4
+    ):
+        return _carry_decode(
+            q,
+            main_kv,
+            main_kv_scale,
+            swa_kv,
+            sink,
+            rope_cache,
+            positions,
+            swa_page,
+            main_lengths,
+            scale=scale,
+        )
     block_seq = 2 if batch_size % 2 == 0 else 1
     query_count = query_tile * block_seq
 

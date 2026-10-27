@@ -110,3 +110,14 @@ def test_tiled_decode_matches_prefill(benchmark, heads):
     )
     actual = csa2_decode(**inputs, num_tokens=128)
     np.testing.assert_allclose(actual, expected, atol=3e-3, rtol=3e-2)
+
+
+@pytest.mark.parametrize("batch", [8, 9, 11, 12, 13, 48])
+def test_carry_decode_preserves_page_mapping_and_fp32_scales(benchmark, batch):
+    if jax.default_backend() != "tpu":
+        pytest.skip("Async MXU operations require TPU")
+    host = benchmark.make_inputs(batch, 6, 64, varied_counts=True)
+    expected = benchmark.reference(host, 6, range(batch * 6))
+    actual = csa2_decode(**jax.device_put(host))
+    np.testing.assert_allclose(actual, expected, atol=3e-3, rtol=3e-2)
+    assert np.isfinite(actual).all()

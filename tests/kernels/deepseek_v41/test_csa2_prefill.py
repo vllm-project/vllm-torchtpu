@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Ragged tile coverage, visibility, tail writes and automatic DMA lowering."""
+"""Ragged tile coverage, visibility, carry-PV tails and bounded metadata."""
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v41.csa2.prefill import (
     build_query_tiles,
@@ -179,35 +179,6 @@ def test_prefill_traces_dynamic_tile_grid(bq, banked, non_causal):
 
 
 @pytest.mark.cpu_test
-@pytest.mark.parametrize("direct_output", [False, True])
-def test_buffered_index_maps_allow_epilogue_lookahead(monkeypatch, direct_output):
-    args, kwargs = prefill_inputs()
-    if direct_output:
-        args = (*args[:4], jnp.array([0, 25], jnp.int32), *args[5:])
-        kwargs["swa_metadata"] = kwargs["swa_metadata"][:1]
-
-    def inspect_call(kernel, *, out_shape, grid_spec, **unused):
-        def call(*operands):
-            # NumPy rejects SMEM reads beyond the logical tile table instead
-            # of silently clamping them as JAX array indexing would.
-            scalars = tuple(map(np.asarray, operands[: grid_spec.num_scalar_prefetch]))
-            capacity = scalars[0].shape[0]
-            for spec in jax.tree.leaves(grid_spec.in_specs):
-                expected = spec.index_map(capacity - 1, *scalars)
-                for tile in (capacity, capacity + 1):
-                    np.testing.assert_array_equal(
-                        spec.index_map(tile, *scalars), expected
-                    )
-            return jnp.zeros(out_shape.shape, out_shape.dtype)
-
-        return call
-
-    monkeypatch.setattr(pl, "pallas_call", inspect_call)
-    with jax.disable_jit():
-        csa2_prefill(*args, **kwargs, bq=9 if direct_output else 6)
-
-
-@pytest.mark.cpu_test
 @pytest.mark.parametrize("tokens", [128, 288])
 @pytest.mark.parametrize("requests", [1, 8])
 def test_prefill_warmup_with_mostly_padding(tokens, requests):
@@ -284,3 +255,59 @@ def test_single_request_direct_output_preserves_padding(non_causal, valid_tokens
         rtol=3e-2,
     )
     np.testing.assert_array_equal(actual[valid_tokens:], 0)
+
+
+@pytest.mark.parametrize("tokens", [8, 16, 24, 32, 40, 48, 56, 64, 72])
+def test_prefill_carry_pipeline_short_batches(tokens):
+    if jax.default_backend() != "tpu":
+        pytest.skip("Async MXU operations require TPU")
+    args, kwargs = prefill_inputs()
+    q, words, scales, swa, _, _, sink, rope = args
+    args = (
+        jnp.resize(q, (tokens, 8, 512)),
+        jnp.resize(words, (tokens, 512, 128)),
+        jnp.resize(scales, (tokens, 512)),
+        jnp.nan_to_num(swa),
+        jnp.array([0, tokens], jnp.int32),
+        jnp.arange(120, 120 + tokens, dtype=jnp.int32),
+        sink,
+        jnp.resize(rope, (tokens, 2, 128)),
+    )
+    kwargs = dict(
+        swa_metadata=kwargs["swa_metadata"][1:2],
+        main_lengths=jnp.resize(kwargs["main_lengths"], (tokens,)),
+    )
+    actual = csa2_prefill(*args, **kwargs, bq=8)
+    expected = prefill_reference(*args, **kwargs)
+    np.testing.assert_allclose(actual, expected, atol=3e-3, rtol=3e-2)
+
+
+def test_prefill_streams_metadata_larger_than_vmem():
+    if jax.default_backend() != "tpu":
+        pytest.skip("VMEM residency and async DMA require TPU")
+    # Scales + RoPE alone exceed the entire core VMEM. Keeping them resident
+    # would fail compilation; a fixed-size streaming pipeline must still work.
+    metadata_per_token = (512 + 2 * 128) * jnp.dtype(jnp.float32).itemsize
+    tokens = (
+        pltpu.get_tpu_info().vmem_capacity_bytes // metadata_per_token // 8 + 1
+    ) * 8
+    q = jnp.zeros((tokens, 8, 512), jnp.bfloat16)
+    swa = jnp.ones((2, 64, 512), jnp.bfloat16).at[0].set(0)
+    metadata = jnp.concatenate(
+        (jnp.zeros((1, 2), jnp.int32), jnp.ones((1, (tokens + 256) // 64), jnp.int32)),
+        1,
+    )
+    output = csa2_prefill(
+        q,
+        jnp.zeros((tokens, 512, 128), jnp.int32),
+        jnp.ones((tokens, 512), jnp.float32),
+        swa,
+        jnp.array([0, tokens], jnp.int32),
+        jnp.arange(127, 127 + tokens, dtype=jnp.int32),
+        jnp.zeros(8, jnp.float32),
+        jnp.broadcast_to(jnp.array([1.0, 0.0])[None, :, None], (tokens, 2, 128)),
+        swa_metadata=metadata,
+        main_lengths=jnp.zeros(tokens, jnp.int32),
+        bq=8,
+    )
+    np.testing.assert_allclose(output, 128 / 129, atol=3e-3, rtol=3e-2)
