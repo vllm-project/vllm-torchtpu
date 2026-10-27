@@ -314,13 +314,9 @@ def active_mla_turboquant_preset(
 
 @functools.cache
 def get_mla_latent_tables() -> tq.TQTables:
-    from vllm.model_executor.layers.quantization.turboquant.centroids import (
-        get_centroids,
-    )
-
-    with torch.device("cpu"):
-        centroids = get_centroids(tq.MLA_TQ_LATENT_DIM, tq.MLA_TQ_BITS)
-    return tq.make_mla_latent_tables(centroids.cpu().numpy().astype(np.float32))
+    # Cubic codebook (see `turboquant.MLA_TQ_CUBIC_GAMMA`): within ~2% MSE of
+    # D=512 Lloyd-Max and cheap to dequantize in-kernel.
+    return tq.make_mla_latent_tables()
 
 
 def _check_turboquant_sparse_mla(preset: str, model_config) -> None:

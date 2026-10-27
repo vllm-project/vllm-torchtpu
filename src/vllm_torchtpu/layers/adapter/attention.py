@@ -2207,6 +2207,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             nope_spec, rope_spec = layer.mla_kv_spec
             # Recorded when the KV cache is allocated, which precedes tracing.
             allow_masked_dense = getattr(layer, "allow_masked_dense", False) is True
+            tq_prerotated = getattr(layer, "_tq_weights_rotated", False) is True
             return sparse_mla_attention(
                 ql_nope,
                 q_pe,
@@ -2226,6 +2227,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 k_scale=k_scale,
                 allow_masked_dense=allow_masked_dense,
                 tq_tables=tq_tables,
+                tq_prerotated=tq_prerotated,
             )
 
         op_name = f"pallas::sparse_mla_attention_{layer.layer_name.replace('.', '_')}"

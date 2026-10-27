@@ -51,9 +51,20 @@ def _cos(a, b):
     return np.sum(a * b, -1) / (np.linalg.norm(a, axis=-1) * np.linalg.norm(b, axis=-1))
 
 
-def _build(rng, *, query_tokens, topk, num_heads=8, cache_tokens=8192, k_scale=1.0):
+def _build(
+    rng,
+    *,
+    query_tokens,
+    topk,
+    num_heads=8,
+    cache_tokens=8192,
+    k_scale=1.0,
+    codebook="cubic",
+):
     pages = cache_tokens // PAGE_SIZE
-    tables = tq.make_mla_latent_tables(_lloyd_max(rng, NOPE_DIM))
+    tables = tq.make_mla_latent_tables(
+        None if codebook == "cubic" else _lloyd_max(rng, NOPE_DIM)
+    )
     outliers = 1 + 3 * (rng.random(NOPE_DIM) < 0.02)
     latent = jnp.asarray(
         rng.standard_normal((cache_tokens, NOPE_DIM)) * outliers, jnp.bfloat16
@@ -164,6 +175,14 @@ class SparseMlaTurboQuantTest(parameterized.TestCase):
 
     @parameterized.named_parameters(
         dict(testcase_name="prefill", query_tokens=128, topk=256, k_scale=1.0, kw={}),
+        dict(
+            testcase_name="prefill_lloyd",
+            query_tokens=128,
+            topk=256,
+            k_scale=1.0,
+            kw={},
+            codebook="lloyd",
+        ),
         dict(testcase_name="kscale", query_tokens=128, topk=256, k_scale=0.75, kw={}),
         dict(testcase_name="decode", query_tokens=16, topk=2048, k_scale=1.0, kw={}),
         dict(
@@ -174,12 +193,15 @@ class SparseMlaTurboQuantTest(parameterized.TestCase):
             kw=dict(topk_cap=512),
         ),
     )
-    def test_matches_dequantized_reference(self, query_tokens, topk, k_scale, kw):
+    def test_matches_dequantized_reference(
+        self, query_tokens, topk, k_scale, kw, codebook="cubic"
+    ):
         p = _build(
             np.random.default_rng(2),
             query_tokens=query_tokens,
             topk=topk,
             k_scale=k_scale,
+            codebook=codebook,
         )
         sm_scale = (NOPE_DIM + ROPE_DIM) ** -0.5
         out = jax.block_until_ready(

@@ -834,8 +834,38 @@ MLA_TQ_NOPE_BYTES = MLA_TQ_LATENT_DIM * MLA_TQ_BITS // 8  # 256 B/token.
 MLA_TQ_NORM_BYTE_OFFSET = 64  # After the 64 fp8 `k_pe` bytes in the RoPE row.
 
 
-def make_mla_latent_tables(centroids: np.ndarray) -> TQTables:
-    """Tables for the 512-dim MLA latent (`centroids` are D=512 Lloyd-Max)."""
+# Default codebook: odd cubic in the offset-binary code `n` (0..15),
+# `c(n) = t + gamma * t**3` with `t = n - 7.5`. Only its shape matters (the
+# norm correction absorbs scale), and it fits the D=512 Lloyd-Max levels to
+# within 2% MSE while dequantizing in ~6 VPU ops instead of a select tree.
+MLA_TQ_CUBIC_GAMMA = 0.0086873
+# Level spacing for coordinates of a rotated unit 512-vector (~N(0, 1/512)):
+# the MSE-optimal `alpha = 0.2413` for N(0, 1), divided by sqrt(512). Used only
+# for the quantizer's decision thresholds; dequant and the norm correction use
+# the unscaled levels.
+MLA_TQ_CUBIC_SCALE = 0.24130783 / math.sqrt(MLA_TQ_LATENT_DIM)
+
+
+def _mla_cubic_levels() -> np.ndarray:
+    t = np.arange(1 << MLA_TQ_BITS, dtype=np.float64) - ((1 << MLA_TQ_BITS) - 1) / 2
+    return (t + MLA_TQ_CUBIC_GAMMA * t**3).astype(np.float32)
+
+
+def is_mla_cubic_codebook(centroids: Any) -> bool:
+    c = np.asarray(centroids, dtype=np.float32)
+    return c.shape == (1 << MLA_TQ_BITS,) and np.allclose(
+        c, _mla_cubic_levels() * np.float32(MLA_TQ_CUBIC_SCALE)
+    )
+
+
+def make_mla_latent_tables(centroids: np.ndarray | None = None) -> TQTables:
+    """Tables for the 512-dim MLA latent.
+
+    `centroids=None` selects the cubic codebook (offset-binary codes);
+    otherwise `centroids` are D=512 Lloyd-Max levels (sign-magnitude codes).
+    """
+    if centroids is None:
+        centroids = _mla_cubic_levels() * np.float32(MLA_TQ_CUBIC_SCALE)
     sorted_c = np.sort(np.asarray(centroids, dtype=np.float32))
     assert sorted_c.shape == (1 << MLA_TQ_BITS,), sorted_c.shape
     return TQTables(
@@ -852,43 +882,73 @@ def quantize_mla_latent(
     """`latent` -> (`u8[T, 256]` packed 4-bit codes, `u8[T, 2]` bf16 norm bytes).
 
     Byte `i` holds code `i` in its low nibble and code `256 + i` in its high
-    nibble (sign-magnitude: bit 3 is the sign, bits 0-2 the magnitude index).
+    nibble: offset-binary level indices for the cubic codebook, sign-magnitude
+    (bit 3 sign, bits 0-2 magnitude index) for Lloyd-Max.
     """
     x = latent.astype(jnp.float32)
     norm = jnp.sqrt(jnp.sum(x * x, axis=-1, keepdims=True))
     rot = rotate(x / (norm + _KEY_NORM_EPS), jnp.asarray(tables.hadamard))
-    half_levels = 1 << (MLA_TQ_BITS - 1)
-    pos_mids = jnp.asarray(tables.midpoints[half_levels:], dtype=jnp.float32)
-    mag_idx = jnp.sum(jnp.abs(rot)[..., None] >= pos_mids, axis=-1).astype(jnp.uint8)
-    pos_c_sq = jnp.asarray(tables.centroids[half_levels:] ** 2, dtype=jnp.float32)
-    c_sq = jnp.sum(pos_c_sq[mag_idx], axis=-1, keepdims=True)
+    if is_mla_cubic_codebook(tables.centroids):
+        mids = jnp.asarray(tables.midpoints, dtype=jnp.float32)
+        codes = jnp.sum(rot[..., None] >= mids, axis=-1).astype(jnp.uint8)
+        c = jnp.asarray(_mla_cubic_levels())[codes]
+        c_sq = jnp.sum(c * c, axis=-1, keepdims=True)
+    else:
+        half_levels = 1 << (MLA_TQ_BITS - 1)
+        pos_mids = jnp.asarray(tables.midpoints[half_levels:], dtype=jnp.float32)
+        mag_idx = jnp.sum(jnp.abs(rot)[..., None] >= pos_mids, axis=-1).astype(
+            jnp.uint8
+        )
+        pos_c_sq = jnp.asarray(tables.centroids[half_levels:] ** 2, dtype=jnp.float32)
+        c_sq = jnp.sum(pos_c_sq[mag_idx], axis=-1, keepdims=True)
+        codes = mag_idx | jnp.where(rot < 0.0, jnp.uint8(half_levels), jnp.uint8(0))
     norm = norm * jax.lax.rsqrt(c_sq + _CENTROID_NORM_EPS)
-    codes = mag_idx | jnp.where(rot < 0.0, jnp.uint8(half_levels), jnp.uint8(0))
     half = MLA_TQ_LATENT_DIM // 2
     packed = codes[:, :half] | (codes[:, half:] << jnp.uint8(4))
     kn_lo, kn_hi = _f32_to_bf16_bytes(norm)
     return packed, jnp.concatenate([kn_lo, kn_hi], axis=-1)
 
 
+# Arithmetic dtype of the in-kernel cubic dequant (read at trace time).
+MLA_TQ_DEQUANT_DTYPE = jnp.bfloat16
+
+
+def _cubic_levels_vreg(code: jax.Array, dtype: Any = jnp.float32) -> jax.Array:
+    t = code.astype(dtype) - jnp.asarray(((1 << MLA_TQ_BITS) - 1) / 2, dtype)
+    gamma = jnp.asarray(MLA_TQ_CUBIC_GAMMA, dtype)
+    return t * (jnp.asarray(1.0, dtype) + gamma * (t * t))
+
+
 def dequant_mla_latent_vreg(
     packed: jax.Array,  # u8[N, 256]
-    norm_lo: jax.Array,  # u8[N, 1]
-    norm_hi: jax.Array,  # u8[N, 1]
+    norm_lo: jax.Array,  # u8/int[N, 1]
+    norm_hi: jax.Array,  # u8/int[N, 1]
     centroids: np.ndarray,
     out_dtype: jnp.dtype,
 ) -> jax.Array:
     """In-kernel inverse of `quantize_mla_latent`, in the rotated basis: `[N, 512]`."""
-    lo = (packed & jnp.uint8(0xF)).astype(jnp.uint32)
-    hi = (packed >> jnp.uint8(4)).astype(jnp.uint32)
-    vals = jnp.concatenate(
-        [
-            _lookup_centroids_vreg(lo, MLA_TQ_BITS, centroids),
-            _lookup_centroids_vreg(hi, MLA_TQ_BITS, centroids),
-        ],
-        axis=-1,
-    )
+    if is_mla_cubic_codebook(centroids):
+        lo = packed & jnp.uint8(0xF)
+        hi = packed >> jnp.uint8(4)
+        vals = jnp.concatenate(
+            [
+                _cubic_levels_vreg(lo, MLA_TQ_DEQUANT_DTYPE),
+                _cubic_levels_vreg(hi, MLA_TQ_DEQUANT_DTYPE),
+            ],
+            axis=-1,
+        )
+    else:
+        lo = (packed & jnp.uint8(0xF)).astype(jnp.uint32)
+        hi = (packed >> jnp.uint8(4)).astype(jnp.uint32)
+        vals = jnp.concatenate(
+            [
+                _lookup_centroids_vreg(lo, MLA_TQ_BITS, centroids),
+                _lookup_centroids_vreg(hi, MLA_TQ_BITS, centroids),
+            ],
+            axis=-1,
+        )
     norm = _bf16_u16_to_f32_vreg(norm_lo.astype(jnp.uint32), norm_hi.astype(jnp.uint32))
-    return (vals * norm).astype(out_dtype)
+    return (vals * norm.astype(vals.dtype)).astype(out_dtype)
 
 
 def dequant_mla_latent_ref(

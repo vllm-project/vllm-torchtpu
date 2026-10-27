@@ -986,6 +986,33 @@ class VllmTPUMLAAttention(MLAAttention):
                 assert kv_b_weight is not None
                 self.kv_b_proj.weight = Parameter(kv_b_weight, requires_grad=False)
 
+        self._tq_weights_rotated = False
+        if (
+            self.use_sparse
+            or self.indexer is not None
+            or self.topk_indices_buffer is not None
+        ) and PallasMLAttentionBackendImpl._is_turboquant(self):
+            # Fold the symmetric orthonormal Hadamard H into W_UK_T and W_UV once
+            # on load: (q_nope @ W_UK_T) @ H == q_nope @ (W_UK_T @ H) and
+            # (out @ H) @ W_UV == out @ (H @ W_UV). Eliminates both per-step
+            # [T, H, 512] @ [512, 512] query/output rotations at runtime.
+            from vllm_torchtpu.layers.adapter.turboquant_attention import (
+                get_mla_latent_tables,
+            )
+
+            h = torch.from_numpy(get_mla_latent_tables().hadamard).to(
+                device=self.W_UK_T.device, dtype=torch.float32
+            )
+            self.W_UK_T = Parameter(
+                torch.matmul(self.W_UK_T.to(torch.float32), h).to(self.W_UK_T.dtype),
+                requires_grad=False,
+            )
+            self.W_UV = Parameter(
+                torch.matmul(h, self.W_UV.to(torch.float32)).to(self.W_UV.dtype),
+                requires_grad=False,
+            )
+            self._tq_weights_rotated = True
+
         device = torch.device("tpu")
 
         if should_quantize_on_load(self.prefix):

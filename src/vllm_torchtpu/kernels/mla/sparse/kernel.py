@@ -33,6 +33,10 @@ DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE = 64
 DEFAULT_ATTENTION_KERNEL_BATCH_SIZE = 16
 # The native SparseCore gather's unit, which `topk_cap` must be a multiple of.
 GATHER_ATOM_ROWS = native_sc_gather.OCCURRENCES_PER_ATOM
+# TurboQuant tuning knobs (read at trace time).
+TQ_SPLIT_MATMUL = True  # per-plane partial matmuls instead of K/V concats
+TQ_UNROLL = 2  # unroll of the rolled per-token batch loop
+TQ_DEQUANT_MODE = "fast_post"  # "fast_post", "fast_pre", "fp8_post", or "raw"
 
 
 def cdiv(a, b):
@@ -440,9 +444,13 @@ def _attention_kernel(
     # to bf16 -- the NoPE in the caller's rotated basis, the RoPE times
     # `k_scale` -- so no scale is applied to the scores or the PV product.
     rope_scale = k_scale
+    _is_cubic = False
     if tq_centroids is not None:
+        from vllm_torchtpu.layers.core import turboquant as _tq
+
         assert sparsecore_layout
         k_scale = 1.0
+        _is_cubic = _tq.is_mla_cubic_codebook(tq_centroids)
     # Split-q mode (`split_q`): `q_hbm_ref` holds q_nope only and the rope
     # part arrives as a separate input `q_pe_hbm_ref` (first of `refs`), with
     # its own VMEM double buffer (last scratch ref). The two are joined and
@@ -746,6 +754,129 @@ def _attention_kernel(
             lambda: kv_lens_ref[batch_start_seq_idx + batch_idx],
         )
 
+    def tq_split_entry(bkv_nope_ref, bkv_rope_ref, bq, kv_len):
+        """TurboQuant attention for one query token without K/V concats.
+
+        The 512-dim latent arrives as two `[bkv_sz, 256]` nibble planes (codes
+        `0..255` and `256..511`); scores are the sum of three partial matmuls
+        (lo, hi, rope) and the value product skips the rope tail entirely.
+        """
+        from vllm_torchtpu.layers.core import turboquant as tq
+
+        half = tq.MLA_TQ_NOPE_BYTES
+        codes = pltpu.bitcast(bkv_nope_ref[...], jnp.uint8).reshape(bkv_sz, half)
+        rope_i32 = pltpu.bitcast(bkv_rope_ref[...], jnp.int32)  # i32[bkv_sz // 4, 128]
+        off = tq.MLA_TQ_NORM_BYTE_OFFSET
+        lane_i32 = lax.broadcasted_iota(jnp.int32, rope_i32.shape, 1)
+        lo_i32 = jnp.sum(
+            jnp.where(lane_i32 == off, rope_i32, 0),
+            axis=1,
+            keepdims=True,
+        )
+        hi_i32 = jnp.sum(
+            jnp.where(lane_i32 == off + 1, rope_i32, 0),
+            axis=1,
+            keepdims=True,
+        )
+        lo_u8 = pltpu.bitcast(
+            jnp.broadcast_to(lo_i32, rope_i32.shape), jnp.uint8
+        ).reshape(bkv_sz, 128)
+        hi_u8 = pltpu.bitcast(
+            jnp.broadcast_to(hi_i32, rope_i32.shape), jnp.uint8
+        ).reshape(bkv_sz, 128)
+        rope_pe_i32 = jnp.where(lane_i32 < off, rope_i32, 0)
+        rope = pltpu.bitcast(rope_pe_i32, jnp.float8_e4m3fn).reshape(bkv_sz, 128)
+
+        def mm(a, b):
+            return jnp.einsum("nd,md->nm", a, b, preferred_element_type=jnp.float32)
+
+        s_rope = mm(bq[:, 2 * half : 2 * half + 128], rope)
+        if rope_scale != 1.0:
+            s_rope = s_rope * rope_scale
+
+        post_norm = TQ_DEQUANT_MODE in ("fast_post", "fp8_post")
+        if TQ_DEQUANT_MODE == "raw":
+            k_lo = (codes & jnp.uint8(0xF)).astype(jnp.bfloat16)
+            k_hi = (codes >> jnp.uint8(4)).astype(jnp.bfloat16)
+        elif TQ_DEQUANT_MODE == "fp8_post":
+            codes_u32 = bkv_nope_ref[...]
+            sign_lo = (codes_u32 & jnp.uint32(0x08080808)) << jnp.uint32(4)
+            mag_lo = codes_u32 & jnp.uint32(0x07070707)
+            fp8_lo = sign_lo | (mag_lo * jnp.uint32(3) + jnp.uint32(0x02020202))
+            sign_hi = codes_u32 & jnp.uint32(0x80808080)
+            mag_hi = (codes_u32 >> jnp.uint32(4)) & jnp.uint32(0x07070707)
+            fp8_hi = sign_hi | (mag_hi * jnp.uint32(3) + jnp.uint32(0x02020202))
+            k_lo = pltpu.bitcast(fp8_lo, jnp.float8_e4m3fn).reshape(bkv_sz, half)
+            k_hi = pltpu.bitcast(fp8_hi, jnp.float8_e4m3fn).reshape(bkv_sz, half)
+        elif post_norm:
+            dt = tq.MLA_TQ_DEQUANT_DTYPE
+            k_lo = tq._cubic_levels_vreg(codes & jnp.uint8(0xF), dt).astype(
+                jnp.bfloat16
+            )
+            k_hi = tq._cubic_levels_vreg(codes >> jnp.uint8(4), dt).astype(jnp.bfloat16)
+        elif TQ_DEQUANT_MODE == "u16_pre":
+            dt = tq.MLA_TQ_DEQUANT_DTYPE
+            norm_u16 = lo_u8.astype(jnp.uint16) | (
+                hi_u8.astype(jnp.uint16) << jnp.uint16(8)
+            )
+            norm_u16 = jnp.where(
+                (norm_u16 & jnp.uint16(0x7F80)) == jnp.uint16(0x7F80),
+                jnp.uint16(0),
+                norm_u16,
+            )
+            norm_128 = jax.lax.bitcast_convert_type(norm_u16, jnp.bfloat16)
+            norm_256 = jnp.concatenate([norm_128, norm_128], axis=-1).astype(dt)
+            k_lo = (
+                tq._cubic_levels_vreg(codes & jnp.uint8(0xF), dt) * norm_256
+            ).astype(jnp.bfloat16)
+            k_hi = (tq._cubic_levels_vreg(codes >> jnp.uint8(4), dt) * norm_256).astype(
+                jnp.bfloat16
+            )
+        else:
+            dt = tq.MLA_TQ_DEQUANT_DTYPE
+            norm_f32 = tq._bf16_u16_to_f32_vreg(
+                lo_u8.astype(jnp.uint32), hi_u8.astype(jnp.uint32)
+            )
+            norm_128 = jnp.where(jnp.isfinite(norm_f32), norm_f32, 0.0).astype(dt)
+            norm_256 = jnp.concatenate([norm_128, norm_128], axis=-1)
+            k_lo = (
+                tq._cubic_levels_vreg(codes & jnp.uint8(0xF), dt) * norm_256
+            ).astype(jnp.bfloat16)
+            k_hi = (tq._cubic_levels_vreg(codes >> jnp.uint8(4), dt) * norm_256).astype(
+                jnp.bfloat16
+            )
+
+        s_nope = mm(bq[:, :half], k_lo) + mm(bq[:, half : 2 * half], k_hi)
+        kv_span = lax.broadcasted_iota(jnp.int32, s_nope.shape, 1)
+        norm_row = None
+        if post_norm:
+            norm_f32 = tq._bf16_u16_to_f32_vreg(
+                lo_u8.astype(jnp.uint32), hi_u8.astype(jnp.uint32)
+            )
+            norm_row = jnp.swapaxes(norm_f32[:, :1], 0, 1)
+            norm_row = jnp.where(kv_span[:1, :] < kv_len, norm_row, 0.0)
+            s = s_nope * norm_row + s_rope
+        else:
+            s = s_nope + s_rope
+        s *= sm_scale
+        s = jnp.where(kv_span < kv_len, s, jnp.finfo(jnp.float32).min)
+        m = jnp.max(s, axis=1, keepdims=True)
+        p = jnp.exp(s - m)
+        l_sum = jnp.sum(p, axis=1, keepdims=True)
+        pb = (p * norm_row if norm_row is not None else p).astype(jnp.bfloat16)
+
+        def pv(b):
+            return jnp.einsum("nm,md->nd", pb, b, preferred_element_type=jnp.float32)
+
+        acc = jnp.concatenate([pv(k_lo), pv(k_hi)], axis=-1)
+        out = (acc * pl.reciprocal(l_sum, approx=True)).astype(q_dtype)
+        if o_dim > out.shape[-1]:
+            out = jnp.concatenate(
+                [out, jnp.zeros((out.shape[0], o_dim - out.shape[-1]), q_dtype)],
+                axis=-1,
+            )
+        return out[:, :o_dim], l_sum, m
+
     def unpack_bkv_tq(bkv_nope_ref, bkv_rope_ref):
         from vllm_torchtpu.layers.core import turboquant as tq
 
@@ -983,6 +1114,16 @@ def _attention_kernel(
             # instead, so the dequant body is emitted once.
             def tq_entry(batch_idx, carry):
                 kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
+                if TQ_SPLIT_MATMUL and _is_cubic:
+                    out, l_sum, m = tq_split_entry(
+                        bkv_nope_x2_ref.at[bi_sem_idx, batch_idx],
+                        bkv_rope_x2_ref.at[bi_sem_idx, batch_idx],
+                        load_bq(bi_sem_idx, batch_idx),
+                        kv_len,
+                    )
+                    bo_x2_ref.at[bo_sem_idx, batch_idx][...] = out
+                    write_blse(batch_idx, m, l_sum)
+                    return carry
                 bkv = load_bkv(bi_sem_idx, batch_idx)
                 p, l_sum, m = attention_step1_qk_softmax(
                     load_bq(bi_sem_idx, batch_idx), bkv, kv_len
@@ -992,7 +1133,7 @@ def _attention_kernel(
                 write_blse(batch_idx, m, l_sum)
                 return carry
 
-            lax.fori_loop(0, batch_size, tq_entry, 0)
+            lax.fori_loop(0, batch_size, tq_entry, 0, unroll=min(TQ_UNROLL, batch_size))
             if capped_windows is not None:
                 fixup_capped_overflow(bi_sem_idx, bo_sem_idx)
             start_send_bo_batch(batch_start_seq_idx, bo_sem_idx)

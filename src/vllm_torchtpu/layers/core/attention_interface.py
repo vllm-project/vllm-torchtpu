@@ -919,6 +919,7 @@ def sparse_mla_attention(
     *,
     allow_masked_dense: bool = False,
     tq_tables: tq.TQTables | None = None,
+    tq_prerotated: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Sharded wrapper for the GLM-5.2 sparse (DSA) MLA Pallas kernel.
 
@@ -1027,7 +1028,8 @@ def sparse_mla_attention(
     ):
         if tq_tables is not None:
             kv_c_normed, k_pe = _tq_pack_sparse_mla_latent(kv_c_normed, k_pe, tq_tables)
-            ql_nope = _tq_rotate(ql_nope, tq_tables)
+            if not tq_prerotated:
+                ql_nope = _tq_rotate(ql_nope, tq_tables)
         kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache(
             kv_cache_nope,
             kv_cache_rope,
@@ -1080,7 +1082,7 @@ def sparse_mla_attention(
         # over concatenated (nope + rope) keys. Only the nope part is the MLA
         # value (P @ latent); drop the rope tail before the W_UV projection.
         output = output[..., :lkv_dim]
-        if tq_tables is not None:
+        if tq_tables is not None and not tq_prerotated:
             # Values were aggregated in the rotated basis: (P c H) H = P c.
             output = _tq_rotate(output, tq_tables)
         return output, kv_cache_nope, kv_cache_rope
