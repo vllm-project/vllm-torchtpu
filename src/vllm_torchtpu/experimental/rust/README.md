@@ -1,16 +1,23 @@
 # Serving exports with the Rust runtime
 
-`bin/rvllm.bin` serves a model with rvllm, a native Rust runtime that runs
-the artifacts written by the [AOT exporter](../export/) through PJRT, with
-no Python in the serving process. It takes the `vllm serve` command line:
+`python -m vllm_torchtpu.experimental.rust` serves a model with rvllm, a native
+Rust runtime that runs the artifacts written by the [AOT exporter](../export/)
+through PJRT, with no Python in the serving process. It takes the `vllm serve` command line:
 
 ```bash
-export RVLLM_BINARY=/path/to/rvllm   # or a download location, see below
-src/vllm_torchtpu/experimental/rust/bin/rvllm.bin serve Qwen/Qwen3-0.6B \
-  --max-model-len 2048 --port 8000
+python -m vllm_torchtpu.experimental.rust serve Qwen/Qwen3-0.6B \
+  --max-model-len 2048 --port 8000 --rvllm-binary /path/to/rvllm
 ```
 
-On first use, the script exports the model and then serves it:
+`--rvllm-binary` is the launcher's only option of its own (see
+[The rvllm binary](#the-rvllm-binary)); everything else is the `vllm serve`
+command line.
+
+The launcher ([`launcher.py`](launcher.py)) runs the export as a child process
+and then replaces itself with the rvllm binary (`exec`), so the server is the
+only process left, and it gets signals and the exit status directly.
+
+On first use, the launcher exports the model and then serves it:
 
 1. It exports with `python -m vllm_torchtpu.experimental.export <model>
    --export-mode all` and the model arguments.
@@ -24,7 +31,7 @@ next start skips the export. The server speaks the OpenAI-compatible API on
 ## Arguments
 
 vLLM's own `vllm serve` parser splits the command line
-([`launcher_args.py`](launcher_args.py)), so option names, short forms and
+([`launcher.py`](launcher.py)), so option names, short forms and
 values are exactly vLLM's:
 
 - **Engine arguments go to the exporter.** These are the fields of vLLM's
@@ -48,23 +55,23 @@ values are exactly vLLM's:
   - Disaggregated serving uses rvllm's flags: `--kv-transfer-config` fails
     and says which flags to use.
 
-The script prints the export command and the `rvllm serve` command before it
+The launcher prints the export command and the `rvllm serve` command before it
 runs them.
 
-`rvllm.bin bench ...` runs `vllm bench ...`, which benchmarks any
-OpenAI-compatible server and needs no rvllm binary. `proxy` and `--version`
-run the rvllm binary directly:
+`bench ...` runs `vllm bench ...`, which benchmarks any OpenAI-compatible
+server and needs no rvllm binary. `proxy` and `--version` run the rvllm binary
+directly:
 
 ```bash
-rvllm.bin bench serve --model Qwen/Qwen3-0.6B --max-concurrency 8 ...
-rvllm.bin proxy --port 8000 --prefiller-hosts p --prefiller-ports 8100 \
+python -m vllm_torchtpu.experimental.rust bench serve --model Qwen/Qwen3-0.6B --max-concurrency 8 ...
+python -m vllm_torchtpu.experimental.rust proxy --port 8000 --prefiller-hosts p --prefiller-ports 8100 \
   --decoder-hosts d --decoder-ports 8200
 ```
 
 ## The rvllm binary
 
-The binary is not part of this repository. `RVLLM_BINARY` points the script to
-it, in one of two ways:
+The binary is not part of this repository. `--rvllm-binary` points the launcher
+to it, in one of two ways:
 
 - **A local `rvllm` binary**, used as is.
 - **A location holding `rvllm` and its `metadata.json`**, which has a `sha256`
@@ -73,7 +80,7 @@ it, in one of two ways:
 
 A download location holds two files: the binary, named `rvllm`, and a
 `metadata.json` that describes it. This `metadata.json` is not the one in an
-exported artifact. The script reads one field, `sha256`, which is required: the
+exported artifact. The launcher reads one field, `sha256`, which is required: the
 binary's SHA-256 in lowercase hex. It ignores every other field; the release
 build of rvllm writes them to say what the binary was built from:
 
@@ -90,13 +97,9 @@ build of rvllm writes them to say what the binary was built from:
 }
 ```
 
-Other variables:
-
-| Variable | Meaning |
-|---|---|
-| `RVLLM_BINARY_SHA256` | The expected sha256, overriding `metadata.json`. |
-| `RVLLM_CACHE_DIR` | The cache root for binaries and exports. The default is `~/.cache/rvllm`. |
-| `RVLLM_ARTIFACT_DIR` | Serve this exported artifact instead of exporting. |
-| `PYTHON` | The interpreter that runs the exporter. The default is `python3`. |
-
 Downloading from `gs://` uses `gcloud storage` with the caller's credentials.
+Downloaded binaries and exports are cached under `~/.cache/rvllm`.
+
+`--rvllm-binary` can appear anywhere on the command line, as
+`--rvllm-binary VALUE` or `--rvllm-binary=VALUE`. `vllm serve` has no `--rvllm-*`
+options, and any other one fails.
