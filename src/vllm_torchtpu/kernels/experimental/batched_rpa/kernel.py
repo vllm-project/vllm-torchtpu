@@ -102,7 +102,7 @@ def calculate_and_store_out(
     cfgs: configs.RpaConfigs,
 ):
     def _accum(b_idx: int | jax.Array, batch_acc: jax.Array, batch_l: jax.Array):
-        if flash_attention.static_pv(cfgs):
+        if flash_attention.static_pv(cfgs) and not flash_attention.p_prescaled(cfgs):
             # The accumulator carries P_SCALE; l sums the unscaled weights.
             batch_l = batch_l * jnp.asarray(flash_attention.P_SCALE, batch_l.dtype)
         batch_l = utils.broadcast_minor(batch_l, batch_acc.shape)
@@ -436,6 +436,20 @@ def generate_mask(
 ) -> jax.Array:
     """Generates causal, sliding window, and attention scope mask for QK computation."""
     b, k_heads, tq, s = shape
+    # The FULL-scope DECODE kernel masks its scores on the causal test alone.
+    # Every decode query sits at the end of its sequence, so a key the causal
+    # test admits is below the sequence's KV length, and the KV-length test
+    # (`kv_iota < n_valid`) adds nothing. Rows past a lane's query length admit
+    # keys past its KV length, but rows are independent and those rows are
+    # never stored; V rows past the KV length are zeroed before PV either way
+    # (`mask_invalid_v` or `_mask_unattended_v`).
+    causal_only = (
+        cfgs.mode == configs.RpaCase.DECODE
+        and cfgs.serve.attention_scope == configs.AttentionScope.FULL
+        and cfgs.model.sliding_window is None
+        and step_meta.local_k_start is None
+        and step_meta.local_k_end is None
+    )
 
     kv_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 2)
     q_iota = lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 1)
@@ -455,6 +469,9 @@ def generate_mask(
         # Step 2
         #   offset = causal_offset - bq_start
         offset = step_meta.causal_offset[b_idx] - bq_start
+        if causal_only:
+            masks.append(q_kv_diff >= offset)
+            continue
         n_valid = (
             stitch_meta.bkv_sz_frm_cache[b_idx] + stitch_meta.bkv_sz_frm_new[b_idx]
         )
