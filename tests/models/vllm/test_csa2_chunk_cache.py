@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
@@ -120,10 +122,47 @@ def test_native_swa_allocation_budgets_overlaid_groups_and_binds_pages(
     torch.testing.assert_close(cache.pages(indices), indices)
 
 
+@pytest.fixture
+def cpu_vllm_config_context():
+    # CPU CI does not register torch's TPU device type.
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
+    with set_current_vllm_config(config):
+        yield
+
+
+@pytest.mark.cpu_test
+def test_native_swa_budget_keeps_packed_fp8_indexer_padding():
+    """replace() reruns the indexer's __post_init__; keep the typed-owner budget."""
+    specs = {
+        "main": MLAAttentionSpec(
+            block_size=64, num_kv_heads=1, head_size=512, dtype=torch.uint8
+        ),
+        "indexer": PackedFP8IndexerSpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=132,
+            dtype=torch.uint8,
+            alignment=512,
+        ),
+        "swa": NativeSWASpec(
+            block_size=32,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.bfloat16,
+            sliding_window=128,
+        ),
+    }
+    budgeted = cache_module.budget_native_swa(specs, frozenset(("swa",)))
+    sizes = {spec.page_size_bytes for spec in budgeted.values()}
+    assert len(sizes) == 1
+    assert sizes.pop() >= specs["main"].page_size_bytes + specs["swa"].page_size_bytes
+
+
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("split", [False, True])
 def test_native_swa_allocation_with_packed_fp8_indexer(
-    monkeypatch, split, vllm_config_context
+    monkeypatch, split, cpu_vllm_config_context
 ):
     blocks, page_bytes = 4, 32768
     specs = {
