@@ -616,6 +616,31 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         # Positive control: a different scatter modulus moves the padding rows.
         self.assertFalse(np.array_equal(got(windows, total_pages + 1), want))
 
+    def _dcp_problem(self, rng, query_tokens, seq_q):
+        """A DCP-shaped problem: 64 heads, per-row live counts incl. empty rows.
+
+        Returns the problem, the top-k as `sparse_mla_attention_dcp` passes it,
+        `owns`, the page table, cu_q_lens and the distribution.
+        """
+        topk = 2048
+        problem = _build_problem(
+            rng, k_scale=0.75, query_tokens=query_tokens, topk=topk, num_heads=64
+        )
+        counts = rng.integers(0, topk + 1, size=query_tokens)
+        counts[0], counts[1] = 0, 1025  # an empty row and an overflow row
+        live = np.arange(topk)[None, :] < counts[:, None]
+        topk_idx = jnp.where(jnp.asarray(live), problem["topk"], -1)
+        # As `sparse_mla_attention_dcp`: a row owning none of its top-k gets
+        # key 0, and `owns` masks its lse afterwards.
+        owns = jnp.any(topk_idx >= 0, axis=-1)
+        topk_idx = topk_idx.at[:, 0].set(jnp.where(owns, topk_idx[:, 0], 0))
+        num_seqs = len(seq_q)
+        page_table = jnp.tile(problem["page_table"], num_seqs)
+        cu_q_lens = jnp.asarray(np.concatenate([[0], np.cumsum(seq_q)]), jnp.int32)
+        num_decode = sum(1 for n in seq_q if n == 4)
+        distribution = jnp.array([num_decode, num_decode, num_seqs], jnp.int32)
+        return problem, topk_idx, owns, page_table, cu_q_lens, distribution
+
     @parameterized.product(
         (
             # Decode buckets (MTP 3: q=4 per request) and a mixed step.
@@ -636,23 +661,9 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         if jax.devices()[0].platform != "tpu":
             self.skipTest("Sparse MLA attention requires a TPU")
         rng = np.random.default_rng(20261006)
-        topk = 2048
-        problem = _build_problem(
-            rng, k_scale=0.75, query_tokens=query_tokens, topk=topk, num_heads=64
+        problem, topk_idx, owns, page_table, cu_q_lens, distribution = (
+            self._dcp_problem(rng, query_tokens, seq_q)
         )
-        counts = rng.integers(0, topk + 1, size=query_tokens)
-        counts[0], counts[1] = 0, 1025  # an empty row and an overflow row
-        live = np.arange(topk)[None, :] < counts[:, None]
-        topk_idx = jnp.where(jnp.asarray(live), problem["topk"], -1)
-        # As `sparse_mla_attention_dcp`: a row owning none of its top-k gets
-        # key 0, and `owns` masks its lse afterwards.
-        owns = jnp.any(topk_idx >= 0, axis=-1)
-        topk_idx = topk_idx.at[:, 0].set(jnp.where(owns, topk_idx[:, 0], 0))
-        num_seqs = len(seq_q)
-        page_table = jnp.tile(problem["page_table"], num_seqs)
-        cu_q_lens = jnp.asarray(np.concatenate([[0], np.cumsum(seq_q)]), jnp.int32)
-        num_decode = sum(1 for n in seq_q if n == 4)
-        distribution = jnp.array([num_decode, num_decode, num_seqs], jnp.int32)
         sparsecore = cache_layout == sparse_mla.SPARSECORE_CACHE_LAYOUT
         q_nope = problem["q"][..., :NOPE_DIM]
         q_pe = problem["q"][..., NOPE_DIM:]
@@ -682,6 +693,83 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         )
         np.testing.assert_array_equal(
             np.asarray(lse).view(np.uint32), np.asarray(ref_lse).view(np.uint32)
+        )
+
+    @parameterized.product(
+        seq_q=((4,) * 5, (4,) * 8, (4, 4, 4, 4, 13)),
+        topk_cap=(512, None),
+    )
+    def test_decode_bucket_32_small_chunk_matches_large_chunk(self, seq_q, topk_cap):
+        """`small_chunk_tokens=32` runs the 32-token MTP decode bucket.
+
+        The bucket moves from the bz-16 path to the bz-4 small-chunk path with
+        the arguments the DCP call passes. Real rows match
+        `small_chunk_tokens=16`, and rows owning none of their top-k stay finite.
+        """
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        query_tokens = 32
+        rng = np.random.default_rng(20261010)
+        problem, topk_idx, owns, page_table, cu_q_lens, distribution = (
+            self._dcp_problem(rng, query_tokens, seq_q)
+        )
+        q_nope = problem["q"][..., :NOPE_DIM]
+        q_pe = problem["q"][..., NOPE_DIM:]
+        real_tokens = int(sum(seq_q))
+
+        def run(topk_in, small_chunk_tokens):
+            out, lse = sparse_mla.sparse_ragged_paged_attention(
+                q_nope,
+                problem["sparsecore_nope"],
+                problem["sparsecore_rope"],
+                topk_in,
+                page_table,
+                cu_q_lens,
+                distribution,
+                sm_scale=0.125,
+                k_scale=0.75,
+                return_lse=True,
+                cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+                gather_and_attention_chunk_size=256,
+                topk_cap=topk_cap,
+                q_pe=q_pe,
+                lse_lane_dense=True,
+                small_chunk_tokens=small_chunk_tokens,
+                small_chunk_batch_size=4,
+            )
+            lse = jnp.where(owns[:, None], lse, -jnp.inf)
+            return out[..., :NOPE_DIM], lse
+
+        # The bucket takes the bz-4 kernel at 32 and the bz-16 one at 16.
+        small_jaxpr = str(jax.make_jaxpr(lambda: run(topk_idx, 32))())
+        large_jaxpr = str(jax.make_jaxpr(lambda: run(topk_idx, 16))())
+        self.assertIn("-bz_4-", small_jaxpr)
+        self.assertNotIn("-bz_16-", small_jaxpr)
+        self.assertIn("-bz_16-", large_jaxpr)
+
+        (ref, ref_lse), (out, lse) = jax.block_until_ready(
+            (run(topk_idx, 16), run(topk_idx, 32))
+        )
+        real_out = np.asarray(out, np.float32)[:real_tokens]
+        np.testing.assert_allclose(
+            real_out,
+            np.asarray(ref, np.float32)[:real_tokens],
+            rtol=2e-2,
+            atol=2e-2,
+        )
+        np.testing.assert_allclose(
+            np.asarray(lse)[:real_tokens],
+            np.asarray(ref_lse)[:real_tokens],
+            rtol=1e-4,
+            atol=1e-4,
+        )
+        empty = ~np.asarray(owns)[:real_tokens]
+        self.assertTrue(empty.any())
+        self.assertTrue(np.isfinite(real_out[empty]).all())
+        # Positive control: the comparison must be able to fail.
+        self.assertGreater(
+            np.abs(real_out - np.asarray(q_nope, np.float32)[:real_tokens]).max(),
+            2e-2,
         )
 
     def test_topk_cap_validation(self):

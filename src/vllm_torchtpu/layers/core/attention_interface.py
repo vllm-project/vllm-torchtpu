@@ -1227,6 +1227,11 @@ def sparse_mla_attention_dcp(
         # Virtual page ordinal -> physical block in this rank's own shard, the
         # same resolution the scatter above and `streamindex_topk_dcp` use.
         local_block_tables = jnp.mod(block_tables_, jnp.int32(nope_spec.num_pages))
+        small_chunk_batch = envs.TPU_DCP_MLA_SMALL_CHUNK_BATCH
+        if small_chunk_batch < 1:
+            raise ValueError(
+                f"TPU_DCP_MLA_SMALL_CHUNK_BATCH={small_chunk_batch} must be >= 1."
+            )
         output, lse = sparse_mla_kernel.sparse_ragged_paged_attention(
             q,
             kv_cache_nope,
@@ -1243,6 +1248,8 @@ def sparse_mla_attention_dcp(
             # Ranks own ~topk/dcp of each row: a static top-k width with an
             # exact in-kernel overflow pass for the rows that need more.
             topk_cap=topk_cap,
+            small_chunk_batch_size=small_chunk_batch,
+            small_chunk_tokens=envs.TPU_DCP_MLA_SMALL_CHUNK_TOKENS,
             **chunk_kwargs,
             **split_kwargs,
         )
