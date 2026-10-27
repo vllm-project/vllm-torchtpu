@@ -124,6 +124,28 @@ def xla_quantized_matmul(
     return out.astype(x.dtype)
 
 
+def xla_prequantized_matmul(
+    x_q: jax.Array,
+    x_scale: jax.Array,
+    w_q: jax.Array,
+    w_scale: jax.Array,
+    out_dtype: jnp.dtype = jnp.bfloat16,
+) -> jax.Array:
+    """Quantized matmul on pre-quantized `(x_q, x_scale)` activations."""
+    acc_dtype = jnp.float32
+    if jnp.issubdtype(w_q.dtype, jnp.integer):
+        acc_dtype = jnp.int32
+    out = jax.lax.dot_general(
+        x_q,
+        w_q,
+        dimension_numbers=(((1,), (0,)), ((), ())),
+        preferred_element_type=acc_dtype,
+    ).astype(jnp.float32)
+    out *= x_scale
+    out *= jnp.expand_dims(w_scale, 0)
+    return out.astype(out_dtype)
+
+
 def xla_quantized_batched_matmul(
     x: jax.Array,
     w_q: jax.Array,

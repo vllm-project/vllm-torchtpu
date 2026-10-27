@@ -249,6 +249,11 @@ def warmup() -> Iterator[BucketExecutables]:
         _session = None
 
 
+def in_warmup() -> bool:
+    """Whether a shape-specialization warmup is currently running."""
+    return _session is not None
+
+
 def runnable_for(
     cache_dir: str | None, key: str, graph: fx.GraphModule, size: int | None = None
 ) -> Callable[..., Any] | None:

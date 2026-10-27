@@ -36,10 +36,13 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+from torch_tpu._internal import pallas
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group
 from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
+from vllm_torchtpu.kernels.lse_rescale import lse_rescale_quantize
+from vllm_torchtpu.layers.core.quantization import quantize_tensor
 
 
 def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
@@ -78,8 +81,32 @@ def all_gather_q_nope_pe_heads(
     )
 
 
+def project_uv_heads(
+    partial: torch.Tensor,
+    w_uv: torch.Tensor,
+    w_uv_scale: torch.Tensor | None,
+    out_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """`[T, N, kv_lora_rank]` partial -> `[T, N, v_head_dim]` in `out_dtype`,
+    head n by W_UV[n].
+
+    W_UV is linear and the merge weights are per (token, head), so projecting
+    each partial before the merge gives the same result as projecting after.
+    """
+    if out_dtype != torch.float32 and w_uv_scale is None:
+        out = torch.bmm(partial.transpose(0, 1), w_uv.to(partial.dtype))
+        return out.transpose(0, 1).to(out_dtype)
+    out = torch.bmm(partial.transpose(0, 1).to(torch.float32), w_uv.to(torch.float32))
+    if w_uv_scale is not None:
+        out = out * w_uv_scale.to(torch.float32)
+    return out.transpose(0, 1).to(out_dtype)
+
+
 def merge_lse_partials_scatter_heads(
-    output: torch.Tensor, lse: torch.Tensor, is_backbone: bool = True
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    is_backbone: bool = True,
+    wire_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Combine this rank's partial attention output with its peers'.
 
@@ -110,6 +137,7 @@ def merge_lse_partials_scatter_heads(
         comparison is fixed at trace time. Pass False from the MTP drafter,
         which is traced once for every bucket: it always takes the
         reduce-scatter, exactly as with TPU_DCP_LSE_MERGE_A2A unset.
+      wire_dtype: dtype a projected partial crosses the wire in when narrowed.
 
     Returns:
       `[num_tokens, tp_local_num_heads, kv_lora_rank]` in `output.dtype` --
@@ -126,15 +154,63 @@ def merge_lse_partials_scatter_heads(
     # bucket; comparing its token count would pin that graph to the first
     # size traced. `is_backbone` is checked before the token count, so the
     # drafter never compares it.
+    narrow = envs.TPU_DCP_RS_OUT_PRECISION and is_backbone
     if (
         envs.TPU_DCP_LSE_MERGE_A2A
         and is_backbone
         and output.shape[0] <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
     ):
-        return merge_lse_partials_all_to_all(output, lse, group)
+        return merge_lse_partials_all_to_all(
+            output, lse, group, send_dtype=wire_dtype if narrow else None
+        )
 
-    rs_dtype = output.dtype if envs.TPU_DCP_RS_OUT_PRECISION and is_backbone else None
+    rs_dtype = (wire_dtype or output.dtype) if narrow else None
     return cp_lse_ag_out_rs(output, lse, group, rs_dtype=rs_dtype)
+
+
+def _fake_lse_rescale_quantize(
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    merged_lse: torch.Tensor,
+    start: int,
+    out_dtype: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    heads, _, dim = output.shape
+    rows = lse.shape[0]
+    return (
+        output.new_empty((rows, heads * dim), dtype=getattr(torch, out_dtype)),
+        output.new_empty((rows, 1), dtype=torch.float32),
+    )
+
+
+_lse_rescale_quantize = pallas.jax_op(
+    "pallas::lse_rescale_quantize", lse_rescale_quantize
+)
+_lse_rescale_quantize.register_fake(_fake_lse_rescale_quantize)
+
+
+def weight_lse_partials(
+    output: torch.Tensor, lse: torch.Tensor, quant_dtype: torch.dtype, chunk: int
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Weight `[T, H, V]` partial by its LSE share and quantize per token."""
+    group = get_dcp_group()
+    assert group is not None
+    lse = lse.to(torch.float32)
+    lses = group.all_gather(lse.unsqueeze(0).contiguous(), dim=0)
+    pieces = zip(lse.split(chunk), torch.logsumexp(lses, dim=0).split(chunk))
+    if output.device.type == "tpu":
+        head_major = output.transpose(0, 1)
+        dtype = str(quant_dtype).removeprefix("torch.")
+        return [
+            _lse_rescale_quantize(head_major, own, merged, c * chunk, dtype)
+            for c, (own, merged) in enumerate(pieces)
+        ]
+    out = []
+    for x, (own, merged) in zip(output.split(chunk), pieces):
+        weight = torch.exp(own - merged).unsqueeze(-1)
+        weighted = torch.where(weight > 0, x.to(torch.float32) * weight, 0.0)
+        out.append(quantize_tensor(weighted.flatten(1), quant_dtype))
+    return out
 
 
 def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:
@@ -149,18 +225,24 @@ def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:
 
 
 def merge_lse_partials_all_to_all(
-    output: torch.Tensor, lse: torch.Tensor, group: Any
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    group: Any,
+    send_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Same result as the reduce-scatter merge, via all-to-all.
 
     Each rank sends head block `d` of its partial and lse to rank `d`, then
     merges its own heads locally in f32. Faster for small token counts.
+    `send_dtype` is the dtype the partial crosses in; None keeps its own.
     """
     world = int(group.world_size)
     num_tokens, num_heads, vdim = output.shape
     local = num_heads // world
     # Destination-major: [world, T, local, V] and [world, T, local].
     o_send = output.reshape(num_tokens, world, local, vdim).transpose(0, 1)
+    if send_dtype is not None:
+        o_send = o_send.to(send_dtype)
     l_send = lse.to(torch.float32).reshape(num_tokens, world, local).transpose(0, 1)
     o_recv = _all_to_all(o_send, group)
     l_recv = _all_to_all(l_send, group)
