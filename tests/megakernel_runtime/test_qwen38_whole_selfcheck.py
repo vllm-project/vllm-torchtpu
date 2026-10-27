@@ -22,7 +22,7 @@ def _run(monkeypatch, *, steps, calls_per_step, program=object(), warm_at=0):
     errors, infos = [], []
     monkeypatch.setattr(drv.logger, "error", lambda *a: errors.append(a[0] % a[1:]))
     monkeypatch.setattr(drv.logger, "info", lambda *a: infos.append(a[0] % a[1:]))
-    d = SimpleNamespace(whole_calls=0, whole_program=program, stats={"whole_b4": 0})
+    d = SimpleNamespace(whole_calls=0, whole_program=program, whole_dry=False, stats={"whole_b4": 0})
     runner = SimpleNamespace(warmup_done=False)
     for i in range(steps):
         runner.warmup_done = i >= warm_at
@@ -46,7 +46,7 @@ def test_warmup_calls_do_not_count(monkeypatch):
     """Whole-step calls during warmup only, none after: still an error."""
     msgs = []
     monkeypatch.setattr(drv.logger, "error", lambda *a: msgs.append(a[0] % a[1:]))
-    d = SimpleNamespace(whole_calls=0, whole_program=object(), stats={})
+    d = SimpleNamespace(whole_calls=0, whole_program=object(), whole_dry=False, stats={})
     runner = SimpleNamespace(warmup_done=False)
     for _ in range(10):  # warmup: calls happen, not counted
         d.whole_calls += 1
@@ -55,3 +55,15 @@ def test_warmup_calls_do_not_count(monkeypatch):
     for _ in range(drv.WHOLE_SELF_CHECK_STEPS):
         drv.Qwen38SegmentDriver._whole_self_check(d, runner)
     assert len(msgs) == 1 and "nothing eligible" in msgs[0], msgs
+
+
+def test_dry_mode_reports_without_error(monkeypatch):
+    msgs, errs = [], []
+    monkeypatch.setattr(drv.logger, "error", lambda *a: errs.append(a[0] % a[1:]))
+    monkeypatch.setattr(drv.logger, "info", lambda *a: msgs.append(a[0] % a[1:]))
+    d = SimpleNamespace(whole_calls=0, whole_program=object(), whole_dry=True,
+                        stats={"dry_whole_b4": 150, "stock_whole_ctx": 50})
+    runner = SimpleNamespace(warmup_done=True)
+    for _ in range(drv.WHOLE_SELF_CHECK_STEPS):
+        drv.Qwen38SegmentDriver._whole_self_check(d, runner)
+    assert not errs and len(msgs) == 1 and "wholedry" in msgs[0] and "150 dry" in msgs[0]

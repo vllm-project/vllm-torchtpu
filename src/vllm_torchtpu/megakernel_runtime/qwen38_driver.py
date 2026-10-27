@@ -1201,7 +1201,14 @@ class Qwen38SegmentDriver:
             return
         self._whole_checked = True
         served = self.whole_calls - self._whole_check_base
-        if served == 0:
+        if self.whole_dry:  # no whole-step call by design; report the would-be count instead
+            logger.info(
+                "Qwen3.8 whole-step self-check (wholedry): %d whole-step calls (expected 0), %d "
+                "dry whole-eligible steps so far; step mix %s",
+                served, sum(v for k, v in self.stats.items() if k.startswith("dry_whole_b")),
+                dict(sorted(self.stats.items())),
+            )
+        elif served == 0:
             logger.error(
                 "Qwen3.8 whole-step SELF-CHECK FAILED: whole=1 but no whole-step call in the "
                 "first %d steps after warmup (megakernel %s); step mix %s",
@@ -1383,7 +1390,7 @@ class Qwen38SegmentDriver:
             return False, None
         if self.program is None:  # disabled (it failed): the self-check still counts steps
             self._note("stock_noprogram")
-            if self.whole and not self.whole_dry:
+            if self.whole:
                 self._whole_self_check(runner)
             return False, None
         self.seq += 1
@@ -1392,7 +1399,7 @@ class Qwen38SegmentDriver:
         if not ok or t_seq != T_VERIFY:
             self._note(reason if not ok else f"stock_t{t_seq}")
             return False, None
-        if self.whole and not self.whole_dry:
+        if self.whole:
             self._whole_self_check(runner)
         if rows not in self.buckets or n_req * T_VERIFY > rows:
             self._note(f"stock_rows{rows}_n{n_req}")
