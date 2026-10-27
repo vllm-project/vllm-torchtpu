@@ -192,7 +192,9 @@ class ServingConfigs:
     # quantizes the softmax weights per row, "qkpv" does both. A "2" after
     # either ("qk2", "pv2", "qk2pv2") splits that operand into fp8 high and
     # residual halves stacked along the matmul rows (~bf16 accuracy for 2x
-    # LHS rows). Empty: off.
+    # LHS rows). An "s" after either ("qks", "pvs") takes the static scale
+    # the prefill path uses instead of a per-row one: "qks" casts q as is,
+    # "pvs" casts the softmax weights times P_SCALE. Empty: off.
     native_fp8: str = ""
     # The same for the PREFILL and MIXED kernels: "qk", "pv", "qkpv", each
     # optionally with "s" for a static operand scale instead of a per-row
@@ -200,6 +202,11 @@ class ServingConfigs:
     # inside the e4m3 range); "pvs" casts the softmax weights times a fixed
     # power of two (flash_attention.P_SCALE) and divides it out with l.
     native_fp8_prefill: str = ""
+    # Run the DECODE softmax in base 2: log2(e) is folded into the score
+    # scale and the exponentials are exp2. Equal in exact arithmetic; q (or
+    # the scores) takes one extra rounding of the folded scale, so results
+    # differ from the base-e path in the last bits.
+    decode_exp2: bool = False
 
     def __post_init__(self):
         if self.mask_invalid_v is None:
@@ -212,6 +219,10 @@ class ServingConfigs:
     def native_fp8_split(self, which: str) -> bool:
         """Whether the native fp8 `which` operand is split into hi/lo halves."""
         return f"{which}2" in self.native_fp8
+
+    def native_fp8_static(self, which: str) -> bool:
+        """Whether the decode `which` operand takes the static fp8 scale."""
+        return f"{which}s" in self.native_fp8
 
     def native_fp8_prefill_static(self, which: str) -> bool:
         """Whether the prefill `which` operand takes the static fp8 scale."""
