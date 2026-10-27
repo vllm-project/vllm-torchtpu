@@ -47,12 +47,8 @@ def validate_pcp_manager_config(vllm_config: Any) -> None:
     sparse_mla = bool(getattr(model_config, "use_mla", False)) and hasattr(
         hf_config, "index_topk"
     )
-    plan = envs.TPU_PCP_SHARDING_PLAN.lower()
-    if not sparse_mla or plan != "headtail":
-        raise NotImplementedError(
-            "The PCP manager only supports sparse MLA + headtail, got "
-            f"sparse_mla={sparse_mla} + {plan}."
-        )
+    if not sparse_mla:
+        raise NotImplementedError("The PCP manager only supports sparse MLA.")
     if pcp_size <= 1 or dcp_size <= 1:
         raise NotImplementedError(
             "USE_TPU_PCP_MANAGER needs prefill and decode context parallel "

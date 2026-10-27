@@ -116,3 +116,19 @@ vllm serve Qwen/Qwen3.5-397B-A17B-FP8 \
   --kv-cache-dtype fp8 \
   --max-model-len 65536
 ```
+
+### PCP x DCP (PCP manager)
+
+Set `USE_TPU_PCP_MANAGER=1` to combine `PCP` and `DCP` on sparse MLA models. Each split prefill is sharded over the `PCP` ranks (`TPU_PCP_SHARDING_PLAN=headtail`). For attention, every rank gathers the split prefills' KV from the `DCP`-sharded cache into a workspace. Decode requests are replicated on every `PCP` rank and run the regular `DCP` decode path.
+
+Requirements:
+
+- A sparse MLA model.
+- `--decode-context-parallel-size` equal to `--prefill-context-parallel-size` x `--tensor-parallel-size`.
+- No speculative decoding, LoRA, pipeline parallelism, data parallelism, or multimodal inputs.
+- MoE models also need `--enable-expert-parallel`.
+
+Sizing: 
+
+- `TPU_PCP_KV_WORKSPACE_TOKENS` (default `1048576`) must hold the sum of the contexts of all split prefills in one step. 
+- `TPU_PCP_KV_CHUNK_TOKENS` sets the how many tokens we all-gather in each step.

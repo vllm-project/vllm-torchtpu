@@ -441,7 +441,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_PCP_SHARDING_PLAN": env_with_choices(
         "TPU_PCP_SHARDING_PLAN",
         "headtail",
-        ["headtail", "interleaved"],
+        ["headtail"],
         case_sensitive=False,
     ),
     # PCP manager: max context tokens one step's split prefills may gather.
