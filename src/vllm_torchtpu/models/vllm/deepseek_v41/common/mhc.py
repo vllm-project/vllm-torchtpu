@@ -724,6 +724,18 @@ def pre(
     return post, comb, value, next_pre
 
 
+def _residual_mean(residual: torch.Tensor) -> torch.Tensor:
+    """Reduce four BF16 streams without materializing the full FP32 view."""
+    if residual.shape[1] != 4 or residual.dtype != torch.bfloat16:
+        return residual.mean(1)
+    width = residual.shape[-1]
+    flat = residual.flatten(1)
+    streams = [flat[:, i * width : (i + 1) * width].float() for i in range(4)]
+    # Match the TPU reduction tree, including cancellation before BF16 rounding.
+    summed = (streams[0] + streams[2]) + (streams[1] + streams[3])
+    return (summed * 0.25).to(residual.dtype)
+
+
 def shifted_post_pre(
     x,
     residual,
@@ -791,7 +803,7 @@ def shifted_post_pre(
             )
             if norm_weight is not None:
                 value = rms_norm(value, norm_weight, norm_eps)
-        aux = residual.mean(1) if capture_aux else x.new_empty(0, x.shape[-1])
+        aux = _residual_mean(residual) if capture_aux else x.new_empty(0, x.shape[-1])
         return residual, post_mix, comb_mix, value, next_pre, aux
     residual = post(x, residual, post_layer_mix, comb_res_mix)
     aux = residual.mean(1) if capture_aux else x.new_empty(0, x.shape[-1])

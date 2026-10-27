@@ -190,3 +190,34 @@ def test_collapse_flat_matches_view_sum(mult):
         np.testing.assert_array_equal(_np(got), _np(want))
     else:
         np.testing.assert_allclose(_np(got), _np(want), rtol=1e-6, atol=1e-5)
+
+
+@pytest.mark.parametrize("tokens", [17, 240, 288, 2048])
+def test_aux_mean_preserves_tpu_reduction_order(tokens):
+    if jax.default_backend() != "tpu":
+        pytest.skip("The reference reduction tree is specific to TPU")
+    generator = torch.Generator().manual_seed(2702)
+    shape = (tokens, MULT, 5120)
+    residual = (
+        torch.randn(shape, generator=generator)
+        * torch.pow(2.0, torch.randint(-30, 30, shape, generator=generator))
+    ).bfloat16()
+    # Sequential or adjacent-pair accumulation loses these cancellation cases.
+    patterns = torch.tensor(
+        [[1e10, 1, -1e10, 1], [1e10, -1e10, 1, 1], [1, 1, 1e10, -1e10]]
+    ).bfloat16()
+    residual[0, :, : len(patterns)] = patterns.T
+    flat = residual.flatten(1).to("tpu")
+
+    def baseline(value):
+        return value.view(tokens, MULT, 5120).mean(1)
+
+    def candidate(value):
+        return mhc._residual_mean(value.view(tokens, MULT, 5120))
+
+    original = torch.compile(baseline, backend="tpu", fullgraph=True, dynamic=False)
+    optimized = torch.compile(candidate, backend="tpu", fullgraph=True, dynamic=False)
+    torch.testing.assert_close(
+        optimized(flat).cpu(), original(flat).cpu(), rtol=0, atol=0
+    )
+    torch._dynamo.reset()
