@@ -110,10 +110,13 @@ class DsV4KVCacheAllocator:
             # vLLM's grouping compares neither the spec type nor prefix
             # caching, so a cacheable window of the same size and block size
             # can share a group with the run-local state; one side would then
-            # be prefix-cached wrongly.
+            # be prefix-cached wrongly. Layers keep their own spec only in the
+            # packed layout DSv4 uses; a merged group spec maps every layer
+            # to one spec, so this check cannot see a mix there.
             run_local = {
                 isinstance(per_layer_spec(layer_name), RunLocalStateSpec)
                 for layer_name in group.layer_names
+                if layer_name not in self.runner.shared_kv_cache_layers
             }
             if len(run_local) > 1:
                 raise ValueError(

@@ -1678,6 +1678,15 @@ def test_dsv4_classification_refuses_a_group_mixing_run_local_state():
     assert swa_groups == [["m.layers.0.attn.swa_cache"]]
     assert state_names == ["m.layers.1.attn.compressor.state_cache"]
 
+    # A shared layer has no spec of its own, so the check must skip it too.
+    shared = "m.layers.2.attn.compressor.state_cache"
+    runner.shared_kv_cache_layers = {shared: "m.layers.1.attn.compressor.state_cache"}
+    separate[-1].layer_names.append(shared)
+    _, _, state_names = DsV4KVCacheAllocator(runner)._classify_ds_v4_layers(
+        SimpleNamespace(kv_cache_groups=separate), specs.__getitem__
+    )
+    assert state_names == ["m.layers.1.attn.compressor.state_cache"]
+
 
 def test_dsv4_swa_overlay_shares_hosts_across_groups():
     """SWA caches take a host by position *within* their own cache group.

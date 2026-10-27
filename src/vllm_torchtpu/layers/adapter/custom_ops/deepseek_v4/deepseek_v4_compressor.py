@@ -272,12 +272,15 @@ class RunLocalStateSpec(SlidingWindowMLASpec):
     # The inherited grouping checks neither the spec type nor prefix
     # caching. These overrides only run when vLLM calls them on a
     # RunLocalStateSpec, so they miss a mixed list led by a cacheable
-    # SlidingWindowMLASpec; DsV4KVCacheAllocator._classify_ds_v4_layers is
-    # the guard that covers both orders.
+    # SlidingWindowMLASpec. In the packed layout DSv4 uses,
+    # DsV4KVCacheAllocator._classify_ds_v4_layers rejects such a group; with a
+    # merged group spec the state is just cached as before.
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
+        # AssertionError, not ValueError: vLLM's `is_kv_cache_spec_uniform`
+        # catches only AssertionError. Raised explicitly so `python -O` keeps it.
         if not all(isinstance(spec, RunLocalStateSpec) for spec in specs):
-            raise ValueError(
+            raise AssertionError(
                 "RunLocalStateSpec cannot share a KV cache group with a "
                 "prefix-cacheable SlidingWindowMLASpec."
             )
@@ -377,7 +380,8 @@ class VllmCompressorStateCache(CompressorStateCache):
                 f"DeepSeek-V4 compressor state cache {self.prefix!r}: block size "
                 f"{kv_cache_block_size} is not a multiple of the compress ratio "
                 f"{self.compress_ratio}: a prefix hit could land mid-run, whose "
-                "earlier state RunLocalStateSpec does not cache"
+                "earlier state RunLocalStateSpec does not cache; set "
+                f"--block-size to a multiple of {self.compress_ratio}"
             )
         # `_build_compressor_op` bakes `block_size` in as the kernel's
         # `state_block_size`, so spec and kernel must not disagree.
@@ -472,6 +476,8 @@ class VllmDeepseekCompressor(DeepseekCompressor):
     def _build_compressor_op(self):
         # RunLocalStateSpec leaves the state before a prefix hit uncached, so
         # the kernel must not read the previous run's state: no overlap.
+        # Upstream sizes the window as (1 + overlap) * compress_ratio, so this
+        # cannot fire today; it guards a future overlapping kernel mode.
         run_local = (
             isinstance(self.state_cache, VllmCompressorStateCache)
             and self.state_cache.run_local

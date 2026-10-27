@@ -29,6 +29,7 @@ from vllm.v1.core.kv_cache_utils import (
     get_group_id,
     get_request_block_hasher,
     init_none_hash,
+    is_kv_cache_spec_uniform,
 )
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -205,8 +206,10 @@ def _swa(block_size, window, head_size, cls=SlidingWindowMLASpec):
 def test_run_local_state_does_not_group_with_a_cacheable_window():
     run_local = _swa(SWA_BLOCK, 128, 1024, cls=RunLocalStateSpec)
     cacheable = _swa(SWA_BLOCK, 128, 1024)
-    with pytest.raises(ValueError, match="cannot share a KV cache group"):
+    with pytest.raises(AssertionError, match="cannot share a KV cache group"):
         RunLocalStateSpec.merge([run_local, cacheable])
+    # vLLM's uniformity probe catches only AssertionError from `merge`.
+    assert not is_kv_cache_spec_uniform({"a": run_local, "b": cacheable})
     assert not run_local.is_uniform_with_collection({"a": run_local, "b": cacheable})
     merged = RunLocalStateSpec.merge([run_local, run_local])
     assert type(merged) is RunLocalStateSpec and not merged.prefix_cacheable
