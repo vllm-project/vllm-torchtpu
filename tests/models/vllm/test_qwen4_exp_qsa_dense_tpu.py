@@ -15,12 +15,13 @@
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
-from qwen4_exp_test_utils import q4exp_text_config
+from qwen4_exp_test_utils import q4exp_text_config, qsa_test_pools
 
 
 def _dense_step(hidden, weights, positions, prior, fp8):
@@ -93,6 +94,7 @@ def test_complete_layer_dense_context_against_plain_torch(fp8, tmp_path):
         init_distributed_environment,
         initialize_model_parallel,
     )
+    from vllm.forward_context import set_forward_context
     from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
     from vllm_torchtpu.models.vllm.qwen4_exp.qsa import QSAMetadata, Qwen4ExpQSA
@@ -141,12 +143,10 @@ def test_complete_layer_dense_context_against_plain_torch(fp8, tmp_path):
                 model.load_weights(
                     [("_k_scale", torch.tensor(0.375)), ("_v_scale", torch.tensor(2.5))]
                 )
-            owners = [
-                torch.full(shape, fill, dtype=dt).to("tpu")
-                for _, shape, dt, fill in model.get_cache_owner_layouts(20, 8)
-            ]
+            cpu_owners, _ = qsa_test_pools(model, 20)
+            owners = [owner.to("tpu") for owner in cpu_owners]
             model.to("tpu")
-            model.bind_cache_owners(owners)
+            model.bind_pool(*owners)
             identities = [id(x) for x in owners]
             compiled = torch.compile(
                 model.forward_with_indices,
@@ -175,9 +175,20 @@ def test_complete_layer_dense_context_against_plain_torch(fp8, tmp_path):
                         for x in (starts, lengths, slots, pages, pages.clone())
                     )
                 )
-                output, selected = compiled(
-                    hidden.to("tpu"), positions.to("tpu"), metadata
-                )
+                # The compact layer reads scheduler-owned tables from the
+                # production forward context, not the legacy metadata fields.
+                per_layer = {
+                    model.prefix: SimpleNamespace(
+                        block_tables=metadata.main_block_table
+                    ),
+                    model.prefix + ".raw_ring": SimpleNamespace(
+                        block_tables=metadata.state_slots
+                    ),
+                }
+                with set_forward_context(per_layer, config, num_tokens=bucket):
+                    output, selected = compiled(
+                        hidden.to("tpu"), positions.to("tpu"), metadata
+                    )
                 synchronize_tensors([output, selected, *owners])
                 actual = output.cpu().float().numpy()
                 expected_np = expected.float().numpy()
@@ -209,9 +220,9 @@ def test_complete_layer_dense_context_against_plain_torch(fp8, tmp_path):
                 assert (
                     torch.count_nonzero(owners[0][[0, 17, 18, 19]].cpu().float()) == 0
                 )
-                assert torch.count_nonzero(owners[1][[0, 17, 18, 19]].cpu()) == 0
-                assert torch.count_nonzero(owners[2][1:].cpu()) == 0
-                assert torch.all(owners[3][1:].cpu() == -1)
+                # Index owner page0 holds the active ring at independent ID0;
+                # unreferenced pages remain untouched in both physical owners.
+                assert torch.count_nonzero(owners[1][[17, 18, 19]].cpu()) == 0
                 print(
                     f"DENSE_LAYER fp8={fp8} context={context} "
                     f"count={count} relative_l2={error}"

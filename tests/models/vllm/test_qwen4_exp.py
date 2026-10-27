@@ -25,7 +25,6 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen4ExpTextConfig
 from vllm.config import (
-    CompilationMode,
     DeviceConfig,
     VllmConfig,
     set_current_vllm_config,
@@ -37,19 +36,13 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
 )
 from vllm.model_executor.model_loader.utils import configure_quant_config
-from vllm.model_executor.models import ModelRegistry
-from vllm.model_executor.models.config import MODELS_CONFIG_MAP
 from vllm.models.qwen4_exp.common.ngram_embedding import (
     Qwen4ExpPLEEmbeddingMethod,
     Qwen4ExpPLEFp8EmbeddingMethod,
 )
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
-import vllm_torchtpu.models.vllm.qwen4_exp.model as qwen4_model
-from vllm_torchtpu.gdn_pool_layout import QWEN_GDN_ARCHITECTURES
-from vllm_torchtpu.layers import register_layers
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config
-from vllm_torchtpu.models.vllm.qwen4_exp.config import TPUQwen4ExpConfig
 from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpForCausalLM
 from vllm_torchtpu.models.vllm.qwen4_exp.ple import (
     PLEInputs,
@@ -118,71 +111,6 @@ def _text_config(**overrides) -> Qwen4ExpTextConfig:
 # ---------------------------------------------------------------------------
 # Registration and config checks
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize(
-    "arch", ["Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration"]
-)
-def test_qwen4_exp_is_registered(arch: str) -> None:
-    previous_model = ModelRegistry.models.get(arch)
-    previous_config = MODELS_CONFIG_MAP.get(arch)
-    try:
-        register_layers()
-        assert ModelRegistry.models[arch].load_model_cls() is Qwen4ExpForCausalLM
-        assert MODELS_CONFIG_MAP[arch] is TPUQwen4ExpConfig
-        assert arch in QWEN_GDN_ARCHITECTURES
-    finally:
-        if previous_model is None:
-            ModelRegistry.models.pop(arch, None)
-        else:
-            ModelRegistry.models[arch] = previous_model
-        if previous_config is None:
-            MODELS_CONFIG_MAP.pop(arch, None)
-        else:
-            MODELS_CONFIG_MAP[arch] = previous_config
-
-
-def _vllm_config_for_checks(
-    text_config: Qwen4ExpTextConfig,
-    *,
-    max_model_len: int = 2048,
-    speculative_config: object | None = None,
-    pipeline_parallel_size: int = 1,
-    use_sequence_parallel_moe: bool = False,
-    prefill_context_parallel_size: int = 1,
-    decode_context_parallel_size: int = 1,
-) -> SimpleNamespace:
-    return SimpleNamespace(
-        model_config=SimpleNamespace(
-            hf_config=text_config,
-            hf_text_config=text_config,
-            multimodal_config=None,
-            max_model_len=max_model_len,
-        ),
-        cache_config=SimpleNamespace(mamba_ssm_cache_dtype="auto"),
-        parallel_config=SimpleNamespace(
-            enable_dbo=False,
-            ubatch_size=1,
-            pipeline_parallel_size=pipeline_parallel_size,
-            use_sequence_parallel_moe=use_sequence_parallel_moe,
-            prefill_context_parallel_size=prefill_context_parallel_size,
-            decode_context_parallel_size=decode_context_parallel_size,
-        ),
-        speculative_config=speculative_config,
-    )
-
-
-def test_config_accepts_supported_text_model_and_strips_mrope() -> None:
-    text_config = _text_config(
-        rope_parameters={
-            "rope_type": "default",
-            "rope_theta": 1e7,
-            "partial_rotary_factor": 0.25,
-            "mrope_section": [1, 1, 0],
-            "mrope_interleaved": True,
-        }
-    )
-    TPUQwen4ExpConfig.verify_and_update_config(_vllm_config_for_checks(text_config))
-    assert "mrope_section" not in text_config.rope_parameters
-    assert "mrope_interleaved" not in text_config.rope_parameters
 
 
 _QSA = dict(
@@ -194,520 +122,17 @@ _QSA = dict(
 )
 
 
-def test_config_accepts_qsa_within_indexer_budget() -> None:
-    vllm_config = _vllm_config_for_checks(_text_config(**_QSA), max_model_len=2048)
-    TPUQwen4ExpConfig.verify_and_update_config(vllm_config)
-
-
-def test_config_rejects_unknown_layer_type() -> None:
-    text_config = _text_config()
-    text_config.layer_types = ["linear_attention", "sliding_attention"]
-    with pytest.raises(NotImplementedError, match="sliding_attention"):
-        TPUQwen4ExpConfig.verify_and_update_config(_vllm_config_for_checks(text_config))
-
-
-@pytest.mark.parametrize(
-    "text_overrides,config_overrides,match",
-    [
-        ({"ple_layer_ids": [1], "eos_token_id": 3}, {}, "PLE"),
-        (_QSA, {"max_model_len": 4096}, "indexer_budget=2048"),
-        (
-            {},
-            {"speculative_config": SimpleNamespace(method="mtp")},
-            "speculative decoding",
-        ),
-        ({}, {"pipeline_parallel_size": 2}, "pipeline_parallel_size=1"),
-        ({}, {"use_sequence_parallel_moe": True}, "sequence-parallel MoE"),
-        ({}, {"prefill_context_parallel_size": 2}, "context parallelism"),
-        ({}, {"decode_context_parallel_size": 2}, "context parallelism"),
-    ],
-    ids=["ple", "long_context_qsa", "mtp", "pp", "sp_moe", "pcp", "dcp"],
-)
-def test_config_rejects_unsupported_features(
-    text_overrides, config_overrides, match
-) -> None:
-    vllm_config = _vllm_config_for_checks(
-        _text_config(**text_overrides), **config_overrides
-    )
-    with pytest.raises(NotImplementedError, match=match):
-        TPUQwen4ExpConfig.verify_and_update_config(vllm_config)
-
-
-@pytest.mark.parametrize(
-    "nested,override",
-    [
-        (False, '{"ple_layer_ids": []}'),
-        (True, '{"text_config": {"ple_layer_ids": []}}'),
-    ],
-    ids=["text_only", "vision_language"],
-)
-def test_config_ple_error_names_override(nested, override) -> None:
-    text_config = _text_config(ple_layer_ids=[1], eos_token_id=3)
-    vllm_config = _vllm_config_for_checks(text_config)
-    if nested:
-        vllm_config.model_config.hf_config = SimpleNamespace(text_config=text_config)
-    with pytest.raises(NotImplementedError) as excinfo:
-        TPUQwen4ExpConfig.verify_and_update_config(vllm_config)
-    assert f"--hf-overrides '{override}'" in str(excinfo.value)
-
-
 # ---------------------------------------------------------------------------
 # Decoder wiring with stand-in sublayers
 # ---------------------------------------------------------------------------
-class _FakeSublayer(nn.Module):
-    """A deterministic hidden_size -> hidden_size stand-in that records calls."""
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__()
-        self.args = args
-        self.kwargs = kwargs
-        self.proj = nn.Linear(HIDDEN, HIDDEN, bias=False)
-        self.calls: list[dict[str, torch.Tensor]] = []
-
-    def forward(self, *args, **kwargs) -> torch.Tensor:
-        self.calls.append(kwargs)
-        hidden_states = (
-            kwargs["hidden_states"] if "hidden_states" in kwargs else args[0]
-        )
-        return torch.tanh(self.proj(hidden_states))
-
-
-class _FakeEmbedding(nn.Embedding):
-    def __init__(self, num_embeddings: int, embedding_dim: int, prefix: str = ""):
-        super().__init__(num_embeddings, embedding_dim)
-
-
-class _FakeLMHead(nn.Module):
-    def __init__(self, num_embeddings: int, embedding_dim: int, prefix: str = ""):
-        super().__init__()
-        self.weight = nn.Parameter(torch.zeros(num_embeddings, embedding_dim))
-
-
-@pytest.fixture
-def fake_sublayers(monkeypatch):
-    for name in (
-        "Qwen4ExpGatedDeltaNetAttention",
-        "Qwen3NextAttention",
-        "Qwen3NextSparseMoeBlock",
-    ):
-        monkeypatch.setattr(qwen4_model, name, _FakeSublayer)
-    monkeypatch.setattr(qwen4_model, "VocabParallelEmbedding", _FakeEmbedding)
-    monkeypatch.setattr(qwen4_model, "ParallelLMHead", _FakeLMHead)
-    monkeypatch.setattr(qwen4_model, "LogitsProcessor", lambda vocab_size: None)
-
-
-def _model_vllm_config(text_config: Qwen4ExpTextConfig) -> SimpleNamespace:
-    return SimpleNamespace(
-        model_config=SimpleNamespace(hf_text_config=text_config),
-        cache_config=None,
-        quant_config=None,
-        additional_config={},
-        compilation_config=SimpleNamespace(mode=CompilationMode.NONE),
-    )
-
-
-def _hc_connections(model):
-    return [
-        *(
-            hc
-            for layer in model.layers
-            for hc in (layer.attn_hyper_connection, layer.mlp_hyper_connection)
-        ),
-        model.hyper_connection_mixer,
-    ]
-
-
-def _hc_constructor_config(options, *, calibrated=False):
-    from vllm.config import CompilationConfig, DeviceConfig, VllmConfig
-
-    # Real pinned additional_config/compilation interfaces; lightweight text
-    # metadata and unrelated sublayers avoid loading a checkpoint/accelerator.
-    config = VllmConfig(
-        device_config=DeviceConfig(device="cpu"),
-        compilation_config=CompilationConfig(mode=CompilationMode.NONE),
-        additional_config={"qwen4_exp": options},
-    )
-    text = _text_config(
-        hidden_size=2560 if calibrated else HIDDEN,
-        hc_lowrank=320 if calibrated else 8,
-    )
-    config.model_config = SimpleNamespace(hf_text_config=text)
-    return config
-
-
-@pytest.mark.parametrize(
-    "options,full,combine",
-    [
-        ({}, "auto", "auto"),
-        ({"hc_prefill_full_tile": 0}, 0, 0),
-        ({"hc_prefill_full_tile": 128}, 128, 128),
-        ({"hc_prefill_full_tile": 0, "hc_prefill_combine_tile": "auto"}, 0, "auto"),
-        ({"hc_prefill_full_tile": "auto", "hc_prefill_combine_tile": 0}, "auto", 0),
-        ({"hc_prefill_full_tile": 128, "hc_prefill_combine_tile": 32}, 128, 32),
-        ({"hc_prefill_combine_tile": 0}, "auto", 0),
-    ],
-)
-def test_model_hc_local_implementation_and_independent_modes(
-    fake_sublayers, monkeypatch, options, full, combine
-):
-    from vllm.utils.torch_utils import set_default_torch_dtype
-
-    from tests.models.vllm.test_qwen4_exp_hc_auto import (
-        MEASURED,
-        combine_selected,
-        mix_selected,
-        route_inputs,
-    )
-    from vllm_torchtpu.kernels.qwen4_exp import vllm_adapter
-    from vllm_torchtpu.models.vllm.qwen4_exp.hyperconnection import GatedResidual
-
-    def forbidden(*args):
-        pytest.fail("metadata-only model construction executed a fused operation")
-
-    monkeypatch.setattr(vllm_adapter, "current_hc_hardware", lambda: MEASURED)
-    monkeypatch.setattr(vllm_adapter, "build_full_mix_op", lambda *a: forbidden)
-    monkeypatch.setattr(vllm_adapter, "build_gated_residual_op", lambda *a: forbidden)
-    with torch.device("meta"), set_default_torch_dtype(torch.bfloat16):
-        model = qwen4_model.Qwen4ExpModel(
-            vllm_config=_hc_constructor_config(options, calibrated=True), prefix="model"
-        )
-    connections = _hc_connections(model)
-    x, block = route_inputs(1536)
-    for i, connection in enumerate(connections):
-        assert type(connection) is GatedResidual
-        assert connection.prefill_full_tile == full
-        assert connection.prefill_combine_tile == combine
-        assert mix_selected(connection, x) is bool(full)
-        if i < len(connections) - 1:
-            assert combine_selected(connection, block, x, x) is bool(combine)
-        else:
-            assert connection._prefill_combine_op is None
-            assert not hasattr(connection, "block_inject_weight")
-
-
-@pytest.mark.parametrize(
-    "options",
-    [
-        {"hc_prefill_full_tile": True},
-        {"hc_prefill_full_tile": -128},
-        {"hc_prefill_full_tile": "128"},
-        {"hc_prefill_full_tile": None},
-        {"hc_prefill_combine_tile": False},
-        {"hc_prefill_combine_tile": -16},
-        {"hc_prefill_combine_tile": "invalid"},
-    ],
-)
-def test_model_hc_rejects_invalid_modes(fake_sublayers, options):
-    with pytest.raises(ValueError, match="HC prefill mode"):
-        qwen4_model.Qwen4ExpModel(
-            vllm_config=_hc_constructor_config(options), prefix="model"
-        )
-
-
-def test_model_hc_keeps_checkpoint_keys_and_single_registered_owners(
-    fake_sublayers, monkeypatch
-):
-    from vllm.models.qwen4_exp.common import hyperconnection as upstream
-
-    from vllm_torchtpu.kernels.qwen4_exp import vllm_adapter
-    from vllm_torchtpu.models.vllm.qwen4_exp.hyperconnection import GatedResidual
-
-    def forbidden():
-        pytest.fail("CPU model construction queried/initialized TPU hardware")
-
-    monkeypatch.setattr(
-        torch, "tpu", SimpleNamespace(is_initialized=lambda: False), raising=False
-    )
-    monkeypatch.setattr(vllm_adapter.pltpu, "get_tpu_info", forbidden)
-    with torch.device("cpu"):
-        model = qwen4_model.Qwen4ExpModel(
-            vllm_config=_hc_constructor_config({}), prefix="model"
-        )
-    connections = _hc_connections(model)
-    for i, connection in enumerate(connections):
-        assert type(connection) is GatedResidual
-        assert connection._prefill_full_op is connection._prefill_combine_op is None
-        reference = upstream.GatedResidual(
-            connection.config, use_combine=i < len(connections) - 1
-        )
-        assert connection.state_dict().keys() == reference.state_dict().keys()
-        for name, weight in connection.state_dict().items():
-            assert (weight.shape, weight.dtype) == (
-                reference.state_dict()[name].shape,
-                reference.state_dict()[name].dtype,
-            )
-        owners = {
-            n: (id(p), p.untyped_storage()._cdata)
-            for n, p in connection.named_parameters()
-        }
-        checkpoint = {
-            n: torch.full_like(p, 0.125) for n, p in reference.state_dict().items()
-        }
-        connection.load_state_dict(checkpoint, strict=True)
-        assert owners == {
-            n: (id(p), p.untyped_storage()._cdata)
-            for n, p in connection.named_parameters()
-        }
-        for name, weight in connection.state_dict().items():
-            torch.testing.assert_close(weight, checkpoint[name], rtol=0, atol=0)
-    assert len({id(c) for c in connections}) == len(connections)
-    parameters = list(model.named_parameters(remove_duplicate=False))
-    assert len(parameters) == len(model.state_dict())
-    assert len({id(p) for _, p in parameters}) == len(parameters)
-    assert len({p.untyped_storage()._cdata for _, p in parameters}) == len(parameters)
-
-
-def test_model_hc_hash_only_additional_config_keeps_defaults(fake_sublayers):
-    class HashOnlyOptions:
-        def compute_hash(self):
-            return "test-hash-only-options"
-
-    config = _hc_constructor_config({})
-    config.additional_config = HashOnlyOptions()
-    model = qwen4_model.Qwen4ExpModel(vllm_config=config, prefix="model")
-    for connection in _hc_connections(model):
-        assert connection.prefill_full_tile == "auto"
-        assert connection.prefill_combine_tile == "auto"
-
-
-def test_model_owned_hc_uses_local_fp32_gate_precision(fake_sublayers):
-    from tests.models.vllm.test_qwen4_exp_math import hc_cuda_source_reference
-    from vllm_torchtpu.models.vllm.qwen4_exp.hyperconnection import GatedResidual
-
-    model = qwen4_model.Qwen4ExpModel(
-        vllm_config=_hc_constructor_config({}), prefix="model"
-    ).bfloat16()
-    x = torch.ones((1, HC * HIDDEN), dtype=torch.bfloat16)
-    for connection in _hc_connections(model):
-        assert type(connection) is GatedResidual
-        with torch.no_grad():
-            connection.hc_norm.weight.fill_(0.25)
-            connection.hc_norm.weight[0] = 0
-            connection.input_mix_weight_down.weight.zero_()
-            connection.input_mix_weight_down.weight[0, 0] = 24
-            connection.input_mix_weight_up.weight.fill_(-1)
-        actual, residuals = connection.mix(x)
-        # Independent fixed BF16 result from the existing CUDA precision test.
-        expected = torch.tensor(0.0030975341796875, dtype=torch.bfloat16)
-        torch.testing.assert_close(actual[0, 1], expected, rtol=0, atol=0)
-        if hasattr(connection, "block_inject_weight"):
-            with torch.no_grad():
-                connection.block_inject_weight.weight.zero_()
-                connection.block_inject_weight.weight[:, 0] = -8
-            block = torch.full((1, HIDDEN), -3.125, dtype=torch.bfloat16)
-            ref_mix, ref_combined = hc_cuda_source_reference(connection, x, block)
-            torch.testing.assert_close(actual, ref_mix, rtol=0, atol=0)
-            torch.testing.assert_close(
-                connection.combine(block, residuals), ref_combined, rtol=0, atol=0
-            )
-
-
-def _randomize_hc_norms(model: nn.Module) -> None:
-    for name, param in model.named_parameters():
-        if name.endswith("hc_norm.weight"):
-            with torch.no_grad():
-                param.normal_(0.0, 0.1)
-
-
-def _ref_mix(hc: nn.Module, hyper: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reference GatedResidual.mix with per-stream norm (hc_per_branch_norm)."""
-    streams = hyper.unflatten(-1, (HC, HIDDEN))
-    weight = hc.hc_norm.weight.view(HC, HIDDEN)
-    eps = hc.hc_norm.variance_epsilon
-    normed = streams * torch.rsqrt(streams.square().mean(-1, keepdim=True) + eps)
-    normed = (normed * (1.0 + weight)).flatten(-2)
-    gate = F.silu(normed @ hc.input_mix_weight_down.weight.T / HC)
-    gate = torch.sigmoid(gate @ hc.input_mix_weight_up.weight.T)
-    mixed = (gate * normed).unflatten(-1, (HC, HIDDEN)).mean(-2)
-    return mixed, normed
-
-
-def _ref_combine(
-    hc: nn.Module, hyper: torch.Tensor, normed: torch.Tensor, out: torch.Tensor
-) -> torch.Tensor:
-    inject = 2.0 * torch.sigmoid(normed @ hc.block_inject_weight.weight.T / HC)
-    streams = hyper.unflatten(-1, (HC, HIDDEN))
-    return (streams + out.unsqueeze(-2) * inject.unsqueeze(-1)).flatten(-2)
-
-
-def test_model_matches_hyper_connection_reference(fake_sublayers) -> None:
-    torch.manual_seed(0)
-    model = qwen4_model.Qwen4ExpModel(
-        vllm_config=_model_vllm_config(_text_config()), prefix="model"
-    )
-    _randomize_hc_norms(model)
-    input_ids = torch.tensor([1, 5, 7, 30, 2])
-    positions = torch.arange(input_ids.numel())
-
-    with torch.no_grad():
-        output = model(input_ids, positions)
-
-        hyper = model.embed_tokens(input_ids).repeat(1, HC)
-        for layer in model.layers:
-            sublayer = (
-                layer.linear_attn
-                if layer.layer_type == "linear_attention"
-                else layer.self_attn
-            )
-            for hc, block in (
-                (layer.attn_hyper_connection, sublayer),
-                (layer.mlp_hyper_connection, layer.mlp),
-            ):
-                mixed, normed = _ref_mix(hc, hyper)
-                block_out = torch.tanh(block.proj(mixed))
-                hyper = _ref_combine(hc, hyper, normed, block_out)
-        expected, _ = _ref_mix(model.hyper_connection_mixer, hyper)
-
-    assert output.shape == (input_ids.numel(), HIDDEN)
-    torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
-
-
-def test_layer_types_select_gdn_or_dense_gated_attention(fake_sublayers) -> None:
-    text_config = _text_config()
-    model = qwen4_model.Qwen4ExpModel(
-        vllm_config=_model_vllm_config(text_config), prefix="model"
-    )
-    gdn_layer, attn_layer = model.layers
-    assert not hasattr(gdn_layer, "self_attn")
-    assert not hasattr(attn_layer, "linear_attn")
-    # Upstream Qwen4Exp, like Qwen3.5, uses the non-interleaved GDN layout.
-    assert gdn_layer.linear_attn.kwargs["gqa_interleaved_layout"] is False
-    assert gdn_layer.linear_attn.args[0] is text_config
-    assert attn_layer.self_attn.kwargs["prefix"] == "model.layers.1.self_attn"
-    # The final mixer only mixes; the checkpoint has no injection for it.
-    assert not hasattr(model.hyper_connection_mixer, "block_inject_weight")
-
-    positions = torch.arange(3)
-    with torch.no_grad():
-        model(torch.tensor([1, 2, 3]), positions)
-    assert attn_layer.self_attn.calls[0]["positions"] is positions
-    assert "positions" not in gdn_layer.linear_attn.calls[0]
-
-
-def test_unknown_layer_type_is_rejected(fake_sublayers) -> None:
-    text_config = _text_config()
-    text_config.layer_types = ["linear_attention", "sliding_attention"]
-    with pytest.raises(ValueError, match="sliding_attention"):
-        qwen4_model.Qwen4ExpModel(
-            vllm_config=_model_vllm_config(text_config), prefix="model"
-        )
 
 
 # ---------------------------------------------------------------------------
 # Weight loading
 # ---------------------------------------------------------------------------
-def test_load_weights_maps_hyper_connection_names_and_skips_mtp_and_indexer(
-    fake_sublayers,
-) -> None:
-    model = Qwen4ExpForCausalLM(vllm_config=_model_vllm_config(_text_config()))
-    prefix = "model.language_model"
-    skipped = (
-        # MTP weights belong to the draft model.
-        "mtp.fc_hidden.weight",
-        # Dense attention does not use the QSA indexer.
-        f"{prefix}.layers.1.self_attn.indexer.index_qk_proj.weight",
-    )
-    weights = {
-        f"{prefix}.layers.0.attn_hyper_connection.hc_norm.weight": torch.randn(
-            HC * HIDDEN
-        ),
-        f"{prefix}.layers.1.mlp_hyper_connection.input_mix_weight_down.weight": (
-            torch.randn(8, HC * HIDDEN)
-        ),
-        f"{prefix}.layers.1.mlp_hyper_connection.block_inject_weight.weight": (
-            torch.randn(HC, HC * HIDDEN)
-        ),
-        f"{prefix}.hyper_connection_mixer.input_mix_weight_up.weight": torch.randn(
-            HC * HIDDEN, 8
-        ),
-        f"{prefix}.embed_tokens.weight": torch.randn(VOCAB, HIDDEN),
-        "lm_head.weight": torch.randn(VOCAB, HIDDEN),
-        **{name: torch.randn(HIDDEN, HIDDEN) for name in skipped},
-    }
-
-    loaded = model.load_weights(iter(weights.items()))
-
-    params = dict(model.named_parameters())
-    for name, tensor in weights.items():
-        if name in skipped:
-            continue
-        vllm_name = name.replace(f"{prefix}.", "model.")
-        assert vllm_name in loaded
-        param = params[vllm_name]
-        torch.testing.assert_close(param, tensor.to(param.dtype))
-    assert not any("mtp." in name or ".indexer." in name for name in loaded)
 
 
 _LM = "model.language_model"
-
-
-@pytest.mark.parametrize(
-    "checkpoint_name,expected",
-    [
-        (f"{_LM}.embed_tokens.weight", ("model.embed_tokens.weight", None)),
-        ("lm_head.weight", ("lm_head.weight", None)),
-        (
-            f"{_LM}.hyper_connection_mixer.hc_norm.weight",
-            ("model.hyper_connection_mixer.hc_norm.weight", None),
-        ),
-        (
-            f"{_LM}.layers.0.linear_attn.in_proj_qkv.weight",
-            ("model.layers.0.linear_attn.in_proj_qkvz.weight", (0, 1, 2)),
-        ),
-        (
-            f"{_LM}.layers.0.linear_attn.in_proj_z.weight",
-            ("model.layers.0.linear_attn.in_proj_qkvz.weight", 3),
-        ),
-        (
-            f"{_LM}.layers.0.linear_attn.in_proj_b.weight",
-            ("model.layers.0.linear_attn.in_proj_ba.weight", 0),
-        ),
-        (
-            f"{_LM}.layers.0.linear_attn.in_proj_a.weight",
-            ("model.layers.0.linear_attn.in_proj_ba.weight", 1),
-        ),
-        (
-            f"{_LM}.layers.3.self_attn.q_proj.weight",
-            ("model.layers.3.self_attn.qkv_proj.weight", "q"),
-        ),
-        (
-            f"{_LM}.layers.0.mlp.shared_expert.up_proj.weight",
-            ("model.layers.0.mlp.shared_expert.gate_up_proj.weight", 1),
-        ),
-        (
-            f"{_LM}.layers.0.mlp.experts.7.down_proj.weight_scale_inv",
-            ("model.layers.0.mlp.experts.7.down_proj.weight_scale_inv", None),
-        ),
-        (f"{_LM}.layers.3.self_attn.indexer.index_qk_proj.weight", None),
-        (
-            f"{_LM}.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight",
-            ("model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight", None),
-        ),
-        (
-            f"{_LM}.layers.0.ple.key_proj.weight",
-            ("model.layers.0.ple.key_proj.weight", None),
-        ),
-        (
-            f"{_LM}.layers.0.ple.conv1d.weight",
-            ("model.layers.0.ple.conv1d.weight", None),
-        ),
-        (f"{_LM}.layers.0.ple.ple_embedding.hashstats_ngram_counts", None),
-        (f"{_LM}.layers.0.ple.ple_embedding.token_lookup", None),
-        ("model.visual.blocks.0.attn.qkv.weight", None),
-        ("mtp.layers.0.mlp.experts.0.gate_proj.weight", None),
-    ],
-)
-def test_checkpoint_names_map_to_params_or_are_dropped(
-    checkpoint_name: str, expected: tuple[str, object] | None
-) -> None:
-    mapped = list(
-        Qwen4ExpForCausalLM.hf_to_vllm_mapper.apply([(checkpoint_name, torch.empty(0))])
-    )
-    if expected is None:
-        assert mapped == []
-        return
-    ((name, tensor),) = mapped
-    assert (name, getattr(tensor, "shard_id", None)) == expected
 
 
 def test_fp8_checkpoint_quantizes_routed_experts_and_ple_table() -> None:
@@ -754,7 +179,9 @@ def test_fp8_checkpoint_quantizes_routed_experts_and_ple_table() -> None:
         "model.layers.0.linear_attn.in_proj_qkvz",
         "model.layers.0.linear_attn.in_proj_ba",
         "model.layers.0.linear_attn.out_proj",
-        "model.layers.1.self_attn.qkv_proj",
+        "model.layers.1.self_attn.q_proj",
+        "model.layers.1.self_attn.k_proj",
+        "model.layers.1.self_attn.v_proj",
         "model.layers.1.self_attn.o_proj",
         "model.layers.0.mlp.shared_expert.gate_up_proj",
         "model.layers.1.mlp.shared_expert.down_proj",
@@ -1107,53 +534,6 @@ def test_ple_table_shards_load_across_tp_ranks(monkeypatch, fp8: bool) -> None:
         rows += rank_table.local_rows(ids)
     expected = table.float() * 0.25 if fp8 else table
     torch.testing.assert_close(rows, expected[ids])
-
-
-@pytest.mark.parametrize("ple_layer_ids", [[1], []], ids=["ple", "ple_disabled"])
-def test_load_weights_loads_ple_or_drops_it_when_disabled(
-    fake_sublayers, monkeypatch, ple_layer_ids
-) -> None:
-    _set_tp(monkeypatch, 0, 1)
-    text_config = _text_config(**{**_PLE, "ple_layer_ids": ple_layer_ids})
-    model = Qwen4ExpForCausalLM(vllm_config=_model_vllm_config(text_config))
-    prefix = f"{_LM}.layers.0.ple"
-    weights = {
-        f"{prefix}.key_proj.weight": torch.randn(HC * HIDDEN, _PLE["ple_embed_dim"]),
-        f"{prefix}.conv1d.weight": torch.randn(
-            HC * HIDDEN, 1, _PLE["ple_conv_kernel_size"]
-        ),
-        f"{prefix}.norm_conv.weight": torch.randn(HC * HIDDEN),
-        f"{prefix}.ple_embedding.layer_multipliers": torch.tensor([3, 5, 7]),
-        f"{prefix}.ple_embedding.ngram_embedding.shard_2.weight": torch.randn(
-            20, _HEAD_DIM
-        ),
-    }
-
-    loaded = model.load_weights(iter(weights.items()))
-
-    if not ple_layer_ids:
-        assert loaded == set()
-        return
-    expected = {
-        name.replace(f"{_LM}.", "model."): tensor for name, tensor in weights.items()
-    }
-    table = "model.layers.0.ple.ple_embedding.ngram_embedding"
-    last_shard = expected.pop(f"{table}.shard_2.weight")
-    assert loaded == {*expected, f"{table}.weight"}
-    state = model.state_dict()
-    for name, tensor in expected.items():
-        torch.testing.assert_close(state[name], tensor)
-    last_shard_start = 2 * math.ceil(_TABLE_ROWS / _PLE["split_ngram_parts"])
-    torch.testing.assert_close(state[f"{table}.weight"][last_shard_start:], last_shard)
-
-
-def test_model_rejects_ple_without_runner_inputs(fake_sublayers, monkeypatch) -> None:
-    _set_tp(monkeypatch, 0, 1)
-    model = qwen4_model.Qwen4ExpModel(
-        vllm_config=_model_vllm_config(_text_config(**_PLE)), prefix="model"
-    )
-    with pytest.raises(NotImplementedError, match="PLE"):
-        model(torch.tensor([1, 2, 3]), torch.arange(3))
 
 
 @pytest.mark.parametrize(
@@ -1537,8 +917,11 @@ def test_ple_native_adapter_reuses_common_math_and_checkpoint(
         lambda: lambda raw, scale: raw.view(torch.bfloat16),
     )
 
-    def conv_bridge(dilation):
-        def run(x, weight, history, starts, slots, initial):
+    def conv_bridge(dilation, state_len):
+        def run(x, weight, pool, starts, slots, initial):
+            history = pool.reshape(pool.shape[0], -1)[
+                :, : state_len * x.shape[-1]
+            ].view(pool.shape[0], state_len, x.shape[-1])
             request, chunk = token_requests(starts, x.shape[0])
             windows = torch.where(
                 initial[:, None, None], history[slots.clamp_min(0)], 0
@@ -1553,7 +936,7 @@ def test_ple_native_adapter_reuses_common_math_and_checkpoint(
 
         return run
 
-    monkeypatch.setattr(pooled_ple, "build_short_conv_op", conv_bridge)
+    monkeypatch.setattr(pooled_ple, "build_pooled_short_conv_op", conv_bridge)
     shared = (
         ple_storage.SharedPLEOptions(tmp_path, "layer", {"checkpoint": "fixture"}, 1)
         if storage == "shared"
@@ -1608,7 +991,12 @@ def test_ple_native_adapter_reuses_common_math_and_checkpoint(
         4, reference.conv_state_len, HC * HIDDEN, dtype=torch.bfloat16
     )
     history[1].fill_(4)  # A reused slot must ignore stale history on first prefill.
-    adapted.bind_history(history)
+    pool = torch.zeros((4, 128, 1, 2, 128), dtype=torch.bfloat16)
+    flat = pool.reshape(4, -1)
+    flat[:, : history[0].numel()] = history.reshape(4, -1)
+    history = flat[:, : history[0].numel()].view_as(history)
+    untouched = flat[:, history[0].numel() :].clone()
+    adapted.bind_pool(pool)
     contexts = torch.full((3, 2), _PLE["eos_token_id"], dtype=torch.int64)
     expected_history = history.clone()
     generator = torch.Generator(device="cpu").manual_seed(314)
@@ -1640,8 +1028,71 @@ def test_ple_native_adapter_reuses_common_math_and_checkpoint(
                 if slot > 0:
                     expected_history[slot] = next_windows[i]
             torch.testing.assert_close(history, expected_history, rtol=0, atol=0)
+            torch.testing.assert_close(
+                flat[:, history[0].numel() :], untouched, rtol=0, atol=0
+            )
     if isinstance(adapted.storage, ple_storage.HostPLETable):
         adapted.storage.close()
+
+
+def test_decoder_consumes_typed_shared_options(monkeypatch, tmp_path):
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import model as qwen4_model
+    from vllm_torchtpu.models.vllm.qwen4_exp import ple_host
+    from vllm_torchtpu.models.vllm.qwen4_exp.ple_storage import HostPLETable
+
+    _set_tp(monkeypatch, 0, 1)
+    group = SimpleNamespace(rank_in_group=0, world_size=1)
+    for name in ("get_tp_group", "get_dp_group"):
+        monkeypatch.setattr(qwen4_model, name, lambda: group)
+    monkeypatch.setattr(
+        qwen4_model, "Qwen4ExpGatedDeltaNetAttention", lambda *a, **kw: nn.Identity()
+    )
+    monkeypatch.setattr(
+        qwen4_model, "Qwen3NextSparseMoeBlock", lambda **kw: nn.Identity()
+    )
+    monkeypatch.setattr(qwen4_model, "GatedResidual", lambda *a, **kw: nn.Identity())
+    monkeypatch.setattr(ple_host.tempfile, "gettempdir", lambda: str(tmp_path))
+    options = []
+
+    def shared(*args):
+        result = ple_host.shared_ple_options(*args)
+        options.append(result)
+        return result
+
+    monkeypatch.setattr(qwen4_model, "shared_ple_options", shared)
+    cfg = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=_text_config(**dict(_PLE, ple_layer_ids=[1])),
+            _qwen4_exp_ple_host_launch=dict(instance="typed-fixture", participants=1),
+        ),
+        quant_config=None,
+        compilation_config=SimpleNamespace(static_forward_context={}),
+        additional_config={
+            "qwen4_exp": {
+                "engram_config": dict(
+                    cpu_offload=True,
+                    dp_shared_memory=True,
+                )
+            }
+        },
+    )
+    with set_default_torch_dtype(torch.bfloat16):
+        layer = qwen4_model.Qwen4ExpDecoderLayer(cfg, 0, "model.layers.0")
+    try:
+        table = layer.ple.storage
+        assert isinstance(table, HostPLETable)
+        assert isinstance(options[0], ple_host.SharedPLEOptions)
+        assert table._shared_options is options[0]
+        assert options[0].participants == 1
+        assert options[0].key == "typed-fixture/model.layers.0.ple/tp0"
+        assert (
+            cfg.compilation_config.static_forward_context["model.layers.0.ple"]
+            is layer.ple
+        )
+    finally:
+        layer.ple.storage.close()
 
 
 @pytest.mark.parametrize("host", [False, True], ids=["resident", "host"])

@@ -144,6 +144,7 @@ def select_index_blocks(
     block_topk,
     topk_backend: TopKBackend | None = None,
     scheduling_group_namespace: int | None = None,
+    vmem_limit_bytes: int | None = None,
     prefix_capacity: int | None = None,
 ):
     """Share ragged query-block reuse and bounded per-query scoring schedules.
@@ -158,6 +159,9 @@ def select_index_blocks(
     Injected backends stay full unless prefix_capacity explicitly certifies their
     reduced-pitch contract together with this extent-preserving QSA schedule.
     """
+    resource_options = (
+        {} if vmem_limit_bytes is None else {"vmem_limit_bytes": vmem_limit_bytes}
+    )
     default_backend = topk_backend is None
     if default_backend:
         topk_backend = SparseCoreTopK()
@@ -193,6 +197,7 @@ def select_index_blocks(
             prefix_capacity=prefix_capacity,
             topk_backend=topk_backend,
             scheduling_group_namespace=scheduling_group_namespace,
+            **resource_options,
         )
 
     batch = len(query)
@@ -217,6 +222,7 @@ def select_index_blocks(
             components=qsa_indexing(),
             topk_backend=topk_backend,
             scheduling_group_namespace=scheduling_group_namespace,
+            **resource_options,
         )
 
     if batch <= chunk_size:

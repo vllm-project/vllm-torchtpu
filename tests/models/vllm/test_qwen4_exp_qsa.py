@@ -18,10 +18,20 @@ import ml_dtypes
 import numpy as np
 import pytest
 import torch
-from qwen4_exp_test_utils import q4exp_text_config as attention_config
+from qwen4_exp_test_utils import (
+    q4exp_text_config as attention_config,
+)
+from qwen4_exp_test_utils import (
+    qsa_forward_context,
+    qsa_test_pools,
+)
 
 from vllm_torchtpu.kernels.qwen4_exp.qsa import index_rope, main_rope
-from vllm_torchtpu.models.vllm.qwen4_exp.qsa import Qwen4ExpQSA, make_rope_cache
+from vllm_torchtpu.models.vllm.qwen4_exp.qsa import (
+    Qwen4ExpQSA,
+    get_qsa_cache_specs,
+    make_rope_cache,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -149,18 +159,11 @@ def test_alternative_config_drives_checkpoint_cache_and_custom_op(
             ]
         )
     with torch.device("cpu"), FakeTensorMode(allow_non_fake_inputs=True):
-        owners = [
-            torch.full(shape, fill, dtype=dtype)
-            for _, shape, dtype, fill in model.get_cache_owner_layouts(4, 3)
-        ]
-        auxiliary_shapes = [(4, 16, 1, 128), (3, 8, 32), (3, 8, 2)]
-        expected_shapes = (
-            [(4, 128, 4, 2, 128)] + auxiliary_shapes
-            if cache_dtype == "auto"
-            else [(4, 128, 2, 4, 128)] + auxiliary_shapes
-        )
-        assert [tuple(owner.shape) for owner in owners] == expected_shapes
-        model.bind_cache_owners(owners)
+        owners, layout = qsa_test_pools(model, 4)
+        assert owners[0].shape[0] == owners[1].shape[0] == 4
+        assert owners[1].dtype == torch.bfloat16
+        assert owners[0].shape[1] == layout.block_size
+        model.bind_pool(*owners)
         metadata = QSAMetadata(
             torch.empty(3, dtype=torch.int32),
             torch.empty(2, dtype=torch.int32),
@@ -168,6 +171,7 @@ def test_alternative_config_drives_checkpoint_cache_and_custom_op(
             torch.empty(2, 2, dtype=torch.int32),
             torch.empty(2, 2, dtype=torch.int32),
         )
+        qsa_forward_context(monkeypatch, model, metadata)
         output, selected = model.forward_with_indices(
             torch.empty(7, 128, dtype=torch.bfloat16),
             torch.empty(7, dtype=torch.int64),
@@ -176,7 +180,7 @@ def test_alternative_config_drives_checkpoint_cache_and_custom_op(
         assert output.shape == (7, 128)
         assert selected.shape == (7, 135)
         assert model.rope_cache.shape == (256, 128)
-        specs = model.get_auxiliary_cache_specs()
+        specs = get_qsa_cache_specs(model.config, model.tp_size, model.cache_dtype)[1]
         assert specs["compressed_k"].tokens_per_state == 8
         assert specs["compressed_k"].head_size == 32
         assert specs["raw_ring"].block_size == 8
@@ -283,22 +287,8 @@ def test_model_cache_binding_reaches_real_custom_op_schema(dtype, monkeypatch):
             max_model_len=8192,
             cache_dtype=dtype,
         )
-        auxiliary = [
-            torch.empty(4, 32, 1, 128, dtype=torch.bfloat16),
-            torch.empty(3, 8, 128, dtype=torch.bfloat16),
-            torch.empty(3, 8, 2, dtype=torch.int32),
-        ]
-        if dtype == "auto":
-            owners = [
-                torch.empty(4, 128, 2, 2, 256, dtype=torch.bfloat16),
-                *auxiliary,
-            ]
-        else:
-            owners = [
-                torch.empty(4, 128, 1, 4, 256, dtype=torch.float8_e4m3fn),
-                *auxiliary,
-            ]
-        model.bind_cache_owners(owners)
+        owners, layout = qsa_test_pools(model, 4)
+        model.bind_pool(*owners)
         metadata = QSAMetadata(
             torch.empty(3, dtype=torch.int32),
             torch.empty(2, dtype=torch.int32),
@@ -306,6 +296,7 @@ def test_model_cache_binding_reaches_real_custom_op_schema(dtype, monkeypatch):
             torch.empty(2, 2, dtype=torch.int32),
             torch.empty(2, 2, dtype=torch.int32),
         )
+        qsa_forward_context(monkeypatch, model, metadata)
         output, selected = model.forward_with_indices(
             torch.empty(7, 2560, dtype=torch.bfloat16),
             torch.empty(7, dtype=torch.int64),
@@ -378,195 +369,197 @@ def test_checkpoint_head_packing_and_kv_replication(tp, rank, monkeypatch):
             rtol=0,
             atol=0,
         )
-        assert module.get_attn_backend().get_min_page_size(None) == 128
-        assert module.get_attn_backend().is_sparse()
-        assert module.get_auxiliary_cache_specs()["compressed_k"].tokens_per_state == 4
+        assert (
+            module.get_attn_backend().get_supported_kernel_block_sizes()[0].base == 128
+        )
+        assert module.get_attn_backend().__name__ == "Qwen4ExpPooledQSABackend"
+        assert (
+            get_qsa_cache_specs(module.config, module.tp_size, module.cache_dtype)[1][
+                "compressed_k"
+            ].tokens_per_state
+            == 4
+        )
         with pytest.raises(ValueError, match="Missing"):
             module.finalize_weights()
 
 
+@pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize(
-    "updates,tp,match",
+    "factory_name,donated",
     [
-        ({}, 0, "positive tp_size"),
-        ({}, -1, "positive tp_size"),
-        ({"num_attention_heads": 0}, 1, "num_attention_heads"),
-        ({"num_attention_heads": 7}, 2, "num_attention_heads"),
-        ({"num_key_value_heads": 0}, 1, "num_key_value_heads"),
-        ({"num_key_value_heads": 3}, 2, "num_key_value_heads"),
-        ({"indexer_kv_heads": 2}, 1, "indexer_kv_heads"),
-        ({"head_dim": 0}, 1, "head_dim"),
-        ({"indexer_head_dim": 0}, 1, "indexer_head_dim"),
-        ({"indexer_n_heads": 0}, 1, "indexer_n_heads"),
+        ("build_compact_pooled_qsa_op", (10, 11)),
     ],
 )
-def test_invalid_geometry_fails_before_projection_allocation(
-    updates, tp, match, monkeypatch
+def test_static_indexer_backend_cache_and_owner_contract(
+    monkeypatch, factory_name, donated, fp8
 ):
-    import vllm_torchtpu.models.vllm.qwen4_exp.qsa as module
-
-    def forbidden(*args, **kwargs):
-        pytest.fail("invalid geometry reached weight allocation")
-
-    monkeypatch.setattr(module, "ColumnParallelLinear", forbidden)
-    monkeypatch.setattr(module, "ReplicatedLinear", forbidden)
-    with pytest.raises(ValueError, match=match):
-        Qwen4ExpQSA(
-            config=attention_config(hidden_size=16, **updates),
-            tp_rank=0,
-            tp_size=tp,
-            max_model_len=128,
-            device="cpu",
-        )
-
-
-@pytest.mark.parametrize("position_dtype", [torch.int32, torch.int64])
-def test_actual_native_factory_fake_dtype_and_fullgraph(position_dtype):
-    from torch._subclasses.fake_tensor import FakeTensorMode
-
-    from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import build_qsa_op
-
-    build_qsa_op()
-    # Call the registered native op directly, retaining the original position
-    # dtype rather than relying on the wrapper's normalization to int32.
-    op = torch.ops.qwen4_exp.qsa
-    graphs = []
-
-    def record(gm, inputs):
-        graphs.append(gm.code)
-        return gm.forward
-
-    with FakeTensorMode():
-
-        def bf(*shape):
-            return torch.empty(shape, dtype=torch.bfloat16)
-
-        def ii(*shape):
-            return torch.empty(shape, dtype=torch.int32)
-
-        args = (
-            bf(4, 512),
-            bf(4, 128),
-            bf(4, 128),
-            bf(4, 384),
-            bf(128),
-            bf(128),
-            bf(128),
-            bf(128),
-            torch.empty(4, dtype=position_dtype),
-            bf(128, 128),
-            bf(4, 128, 1, 2, 128),
-            bf(4, 32, 1, 128),
-            bf(3, 8, 128),
-            ii(3, 8, 2),
-            ii(3),
-            ii(2),
-            ii(2),
-            ii(2, 2),
-            ii(2, 2),
-            4,
-            64,
-            1e-6,
-            32,
-        )
-        for fn in (
-            op,
-            torch.compile(op, backend=record, fullgraph=True, dynamic=False),
-        ):
-            result = fn(*args)
-            assert result[-1].shape == (4, 67)
-            assert result[-1].dtype == torch.int32
-            assert result[-2].shape == (4, 256)
-            assert result[3].shape == (3, 8, 2) and result[3].dtype == torch.int32
-    assert len(graphs) == 1
-
-
-def test_native_tag_planes_are_donated_and_written_to_the_same_owner(monkeypatch):
+    from tests.kernels.test_qwen4_exp_indexer_routing import ReferenceTopK
     from vllm_torchtpu.layers.adapter.custom_ops import qsa_op
 
-    calls = []
+    captured = []
 
-    class RecordingOp:
-        def register_fake(self, fn):
-            return fn
+    class RecordedOp:
+        def register_fake(self, function):
+            return function
 
-        def __call__(self, *args):
-            calls.append(args)
-            planes = args[13].clone()
-            # Include signed/unsigned low-plane boundaries and independent
-            # high bits. This tests transport, not a claim of int64 positions.
-            planes[0, 0] = torch.tensor([-2147483648, 2147483647])
-            planes[0, 1] = torch.tensor([2147483647, -2147483648])
+        def __call__(self, *args, **kwargs):
+            main, index = args[10:12]
             return (
-                *args[10:13],
-                planes,
-                args[0].new_zeros((4, 256)),
-                args[8].new_full((4, 67), -1),
+                torch.full(main.shape, 2, dtype=torch.bfloat16).to(main.dtype),
+                torch.full_like(index, 3),
+                torch.zeros((1, 128), dtype=torch.bfloat16),
+                torch.full((1, 67), -1, dtype=torch.int32),
             )
 
-    def factory(name, fn, *, donate_argnums):
-        assert donate_argnums == (10, 11, 12, 13)
-        return RecordingOp()
+    def register(name, function, **kwargs):
+        captured.append((name, function, kwargs))
+        return RecordedOp()
 
-    monkeypatch.setattr(qsa_op.pallas, "jax_op", factory)
-    qsa_op.build_qsa_op.cache_clear()
+    cached = getattr(qsa_op, "_" + factory_name)
+    cached.cache_clear()
     try:
-        op = qsa_op.build_qsa_op()
-        tags = torch.full((3, 8, 2), -1, dtype=torch.int32)
-        owners = (
-            torch.zeros(4, 128, 1, 2, 128, dtype=torch.bfloat16),
-            torch.zeros(4, 32, 1, 128, dtype=torch.bfloat16),
-            torch.zeros(3, 8, 128, dtype=torch.bfloat16),
-            tags,
-        )
-        identities = [(id(x), x.data_ptr()) for x in owners]
-
-        def bf(*shape):
-            return torch.zeros(shape, dtype=torch.bfloat16)
-
-        def ii(*shape):
-            return torch.zeros(shape, dtype=torch.int32)
-
-        args = (
-            bf(4, 512),
-            bf(4, 128),
-            bf(4, 128),
-            bf(4, 384),
-            bf(128),
-            bf(128),
-            bf(128),
-            bf(128),
-            ii(4),
-            bf(128, 128),
-            *owners,
-            ii(3),
-            ii(2),
-            ii(2),
-            ii(2, 2),
-            ii(2, 2),
-            4,
-            64,
-            1e-6,
-            32,
-        )
-        for _ in range(2):
-            op(*args)
-            assert calls[-1][13] is tags
-            assert identities == [(id(x), x.data_ptr()) for x in owners]
-            torch.testing.assert_close(
-                tags[0, :2],
-                torch.tensor(
-                    [[-2147483648, 2147483647], [2147483647, -2147483648]],
-                    dtype=torch.int32,
-                ),
-                rtol=0,
-                atol=0,
+        monkeypatch.setattr(qsa_op.pallas, "jax_op", register)
+        factory = getattr(qsa_op, factory_name)
+        assert factory() is factory(topk_backend=None)
+        backend = ReferenceTopK()
+        first = factory(topk_backend=backend, topk_backend_key="reference-v1/forward")
+        assert (
+            factory(
+                topk_backend=ReferenceTopK(), topk_backend_key="reference-v1/forward"
             )
-            assert torch.all(tags[1:] == -1)
-            tags.fill_(-1)  # external slot reset/reuse preserves both planes
-            assert torch.all(tags == -1)
+            is first
+        )
+        assert (
+            factory(
+                topk_backend=ReferenceTopK(reverse=True),
+                topk_backend_key="reference-v1/reverse",
+            )
+            is not first
+        )
+        main = torch.zeros(
+            (3, 128, 1, 4 if fp8 else 2, 256),
+            dtype=torch.float8_e4m3fn if fp8 else torch.bfloat16,
+        )
+        index = torch.zeros((3, 16, 1, 2, 128), dtype=torch.bfloat16)
+        aliases = (main, index)
+        storages = [owner.untyped_storage()._cdata for owner in aliases]
+        producer = [torch.zeros((1, 256), dtype=torch.bfloat16) for _ in range(10)]
+        metadata = [torch.zeros((1,), dtype=torch.int64) for _ in range(5)]
+        factory()(
+            *producer,
+            main,
+            index,
+            *metadata,
+            compress_ratio=4,
+            token_topk=64,
+            norm_eps=1e-6,
+            rotary_dim=64,
+        )
+        assert main is aliases[0] and index is aliases[1]
+        assert [owner.untyped_storage()._cdata for owner in aliases] == storages
+        assert torch.all(main.float() == 2) and torch.all(index == 3)
+        assert index.dtype == torch.bfloat16
+        assert len(captured) == 3
+        assert len({item[0] for item in captured}) == 3
+        assert captured[1][1].keywords["topk_backend"] is backend
+        assert all(item[2]["donate_argnums"] == donated for item in captured)
+        with pytest.raises(TypeError, match="unhashable"):
+            factory(topk_backend={})
+        with pytest.raises(ValueError, match="requires a stable"):
+            factory(topk_backend=backend)
+        with pytest.raises(ValueError, match="different backend"):
+            factory(
+                topk_backend=ReferenceTopK(reverse=True),
+                topk_backend_key="reference-v1/forward",
+            )
+        with pytest.raises(ValueError, match="requires an explicit"):
+            factory(topk_backend_key="orphan-key")
+        assert captured[0][0] == "qwen4_exp::" + factory_name[6:-3]
+        assert len(captured) == 3
     finally:
-        qsa_op.build_qsa_op.cache_clear()
+        cached.cache_clear()
+
+
+def test_actual_model_keeps_static_backend_when_binding_compact_owners(monkeypatch):
+    import gc
+    import weakref
+
+    from tests.kernels.test_qwen4_exp_indexer_routing import ReferenceTopK
+    from vllm_torchtpu.models.vllm.qwen4_exp import qsa
+
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_rank", lambda: 0
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.parameter.get_tensor_model_parallel_world_size", lambda: 1
+    )
+    seen = []
+    backend = ReferenceTopK()
+
+    def factory(**kwargs):
+        seen.append((kwargs["topk_backend"], kwargs["topk_backend_key"]))
+        return lambda *args, **kw: None
+
+    monkeypatch.setattr(qsa, "build_compact_pooled_qsa_op", factory)
+    layer = Qwen4ExpQSA(
+        config=attention_config(hidden_size=16),
+        tp_size=1,
+        tp_rank=0,
+        max_model_len=128,
+        topk_backend=backend,
+        topk_backend_key="reference-v1/forward",
+    )
+    main = torch.zeros((2, 128, 1, 2, 256), dtype=torch.bfloat16)
+    index = torch.zeros((2, 16, 1, 2, 128), dtype=torch.bfloat16)
+    with pytest.raises(TypeError):
+        layer.bind_pool(main)
+    layer.bind_pool(main, index)
+    assert seen == [(backend, "reference-v1/forward")]
+    assert layer.cache_owners == (main, index)
+    assert "topk_backend" not in layer._op.keywords
+    assert "topk_backend_key" not in layer._op.keywords
+    ref = weakref.ref(layer)
+    operation = layer._op
+    del layer
+    gc.collect()
+    assert ref() is None
+    assert operation is not None
+
+
+def test_compact_selector_forwards_logical_ids_and_existing_resource_budget(
+    monkeypatch,
+):
+    import jax
+
+    from tests.kernels.test_qwen4_exp_indexer_routing import ReferenceTopK
+    from vllm_torchtpu.kernels.qwen4_exp import pooled_qsa
+
+    seen = []
+    backend = ReferenceTopK()
+
+    def select(query, cache, lengths, table, req, **kwargs):
+        seen.append((table, kwargs))
+        return jnp.full((len(query), 16), -1, jnp.int32)
+
+    monkeypatch.setattr(pooled_qsa, "select_index_blocks", select)
+    with jax.disable_jit():
+        pooled_qsa.select_blocks(
+            jnp.ones((4, 1, 128), jnp.bfloat16),
+            jnp.zeros((12, 32, 1, 2, 128), jnp.bfloat16),
+            jnp.array([4, 5, 0, 0], jnp.int32),
+            jnp.array([[3, 4], [0, 0]], jnp.int32),
+            jnp.array([0, 0, 1, 1], jnp.int32),
+            jnp.array([0, 2, 2], jnp.int32),
+            jnp.array([3, 0], jnp.int32),
+            ratio=4,
+            block_topk=16,
+            logical_block_size=256,
+            vmem_limit_bytes=123456,
+            topk_backend=backend,
+        )
+    np.testing.assert_array_equal(seen[0][0], [[6, 7, 8, 9], [0, 1, 0, 1]])
+    assert seen[0][1]["topk_backend"] is backend
+    assert seen[0][1]["vmem_limit_bytes"] == 123456
 
 
 @torch.inference_mode()

@@ -369,6 +369,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # K3 custom-op registration, sharding, and Attention Residual bridges.
     "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
+    # Model-owned pooled cache geometry changes graph argument extents.
+    "vllm_torchtpu/models/vllm/qwen4_exp/pool_layout.py",
 )
 
 # vLLM-Omni diffusion code, dropped from the hashed set above. Diffusion
