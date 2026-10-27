@@ -7439,6 +7439,11 @@ class TPUModelRunner(GPUModelRunner):
                     if not self._warmup_one_spec_request(
                         int(P), idx=i, quiet=True, greedy=greedy
                     ):
+                        if (
+                            isinstance(self.drafter, Eagle3Proposer)
+                            and self.drafter._mtp_full_draft_loop is not None
+                        ):
+                            self.drafter._mtp_full_draft_loop_warm = False
                         # First attempt cold-compiles the draft forward; a
                         # SymInt from that cold compile can leak into the
                         # dynamic=False gather wrapper on the first bucket. Retry
