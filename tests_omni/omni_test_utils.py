@@ -50,6 +50,20 @@ def high_freq_energy(img: np.ndarray) -> float:
     return float(np.abs(laplacian).mean())
 
 
+def metrics(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
+    """Compute cosine similarity, relative L2 error, and max absolute error in fp64."""
+    actual_flat = actual.detach().cpu().double().flatten()
+    expected_flat = expected.detach().cpu().double().flatten()
+    diff = actual_flat - expected_flat
+    norm_product = actual_flat.norm() * expected_flat.norm()
+    cos = torch.dot(actual_flat, expected_flat) / norm_product.clamp_min(1e-30)
+    return {
+        "cos": float(cos),
+        "rel_l2": float(diff.norm() / expected_flat.norm().clamp_min(1e-30)),
+        "max_abs": float(diff.abs().max()),
+    }
+
+
 def assert_parity(
     actual: torch.Tensor,
     reference: torch.Tensor,
