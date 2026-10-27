@@ -31,7 +31,9 @@ The checkpoint stores FP8 weights with either block scales or tensor/channel
 scales. At load time we dequantize those weights to float32, then requantize
 them into the runtime FP8 layout consumed by the Pallas matmul bridge in
 `vllm_torchtpu/layers/adapter/linear_common.py`. Activations are quantized
-dynamically inside the bridge. By default the bridge dispatches to a pure-JAX
+dynamically inside the bridge, except that TPU_FP8_LINEAR_W8A16_MAX_ROWS (off
+by default) keeps bf16 activations (W8A16) for small token buckets on the
+per-channel path with FP8 weights. By default the bridge dispatches to a pure-JAX
 `dot_general`-based per-channel FP8 matmul (`xla_quantized_matmul`); setting
 ENABLE_QUANTIZED_MATMUL_KERNEL=1 together with REQUANTIZE_BLOCK_SIZE selects
 the blockwise Pallas kernel path instead.
@@ -1341,12 +1343,13 @@ def _wrap_block_scale_weight_loader(weight_loader: Callable) -> Callable:
 class VllmFp8LinearMethodTPU(Fp8LinearMethod):
     """
     TPU FP8 linear method that keeps weights in FP8 at runtime and quantizes
-    activations dynamically inside a Pallas matmul bridge.
+    activations dynamically inside a Pallas matmul bridge, unless
+    TPU_FP8_LINEAR_W8A16_MAX_ROWS is opted in for small token buckets.
 
     Reuses vLLM's Fp8LinearMethod.create_weights() for correct FP8 weight and
     scale parameter allocation (needed by the weight loader). After loading,
     checkpoint FP8 weights are converted to the runtime FP8 layout and applied
-    with dynamically quantized activations through `quantized_matmul`.
+    through `quantized_matmul`.
 
     Inherits from Fp8LinearMethod but skips GPU-specific __init__. Only
     sets attributes needed by create_weights().
@@ -1383,6 +1386,11 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         self.out_dtype = torch.get_default_dtype()
         vllm_fp8.init_fp8_linear_kernel = lambda *args, **kwargs: None
         self.linear_config = linear_config
+        self.w8a16_max_rows = (
+            linear_config.w8a16_max_rows
+            if linear_config is not None
+            else envs.TPU_FP8_LINEAR_W8A16_MAX_ROWS
+        )
 
         if quant_config.is_checkpoint_fp8_serialized:
             self._linear_quant_config = _get_linear_quant_config(self.linear_config)
@@ -1671,7 +1679,12 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             # Prevent the quantization of activations to FP8 (W8A16).
             out = torch.matmul(x, weight.to(x.dtype)) * layer.weight_scale.to(x.dtype)
         else:
-            out = quantized_matmul(x, weight, layer.weight_scale)
+            out = quantized_matmul(
+                x,
+                weight,
+                layer.weight_scale,
+                w8a16_max_rows=self.w8a16_max_rows,
+            )
         if bias is not None:
             out = out + bias
         return out

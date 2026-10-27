@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 
@@ -125,6 +125,19 @@ def infer_weight_sharding(
     if tp_size <= 1:
         return [None] * rank
 
+    # FP8 requantization replaces a layer's parameters, dropping their shard
+    # attributes. A row-parallel layer's scales are computed over the rank's own
+    # input slice, so they differ per rank and must not be declared replicated.
+    if weight_name.endswith(
+        (
+            "o_proj.weight_scale",
+            "down_proj.weight_scale",
+            "out_proj.weight_scale",
+            "wo_b.weight_scale",
+        )
+    ):
+        return ["tp"] + [None] * (rank - 1)
+
     if rank == 1:
         if any(
             k in weight_name
@@ -142,20 +155,13 @@ def infer_weight_sharding(
                 "in_proj_qkvz",
                 "in_proj_ba",
                 "a_log",
+                "A_log",
                 "dt_bias",
                 "fused_qkvb_proj",
                 "fused_fa_ga_proj",
                 "f_b_proj",
                 "g_b_proj",
                 "attn_sink",
-            )
-        ) and not any(
-            weight_name.endswith(s)
-            for s in (
-                "o_proj.weight_scale",
-                "down_proj.weight_scale",
-                "out_proj.weight_scale",
-                "wo_b.weight_scale",
             )
         ):
             return ["tp"]
@@ -217,3 +223,35 @@ def infer_weight_sharding(
         return [None, None, None, None]
 
     return [None] * rank
+
+
+# Embedding names a tied LM head shares, most specific first.
+_EMBEDDING_NAMES = (
+    "model.embed_tokens.weight",
+    "embed_tokens.weight",
+    "transformer.wte.weight",
+)
+
+
+def tied_lm_head_alias(names: Iterable[str]) -> tuple[str, str] | None:
+    """`(lm_head name, embedding name)` when the LM head is tied to the embedding.
+
+    None for an untied head. A tied head has no parameter of its own, so no
+    `lm_head.weight` is among `names`; it then projects with the language model's
+    embedding. A multimodal model nests the language model, so
+    `language_model.model.embed_tokens.weight` gives `language_model.lm_head.weight`.
+    """
+    names = list(names)
+    if any(n == "lm_head.weight" or n.endswith(".lm_head.weight") for n in names):
+        return None
+    found = []
+    for n in names:
+        for rank, emb in enumerate(_EMBEDDING_NAMES):
+            if n == emb or n.endswith("." + emb):
+                found.append(
+                    (rank, len(n), f"{n[: len(n) - len(emb)]}lm_head.weight", n)
+                )
+                break
+    # The language model's embedding: the most specific name (`model.embed_tokens`,
+    # not an MTP head's `mtp.embed_tokens`), then the outermost.
+    return min(found)[2:] if found else None

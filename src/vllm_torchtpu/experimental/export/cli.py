@@ -16,6 +16,8 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import json
 import os
 import shutil
 import subprocess
@@ -51,18 +53,25 @@ def _parse_int_list(raw: str | Sequence[int] | None) -> tuple[int, ...] | None:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    """Builds CLI argument parser aligned with `EngineArgs` plus `--output-dir`."""
+    """Builds the `vllm serve` argument parser plus the export options.
+
+    The exporter takes `vllm serve`'s command line 1:1, model tag included: its
+    engine arguments shape the artifact, and its frontend arguments, which do not,
+    are reported and ignored (see `ignored_frontend_args`).
+    """
     try:
-        from vllm.engine.arg_utils import EngineArgs
+        from vllm.entrypoints.launchers.cli_args import make_arg_parser
         from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-        flexible_parser = FlexibleArgumentParser(
-            prog="python -m vllm_torchtpu.experimental.export",
-            description=(
-                "Export a vLLM model to a standardized StableHLO serving directory."
-            ),
+        parser: argparse.ArgumentParser = make_arg_parser(
+            FlexibleArgumentParser(
+                prog="python -m vllm_torchtpu.experimental.export",
+                description=(
+                    "Export a vLLM model to a standardized StableHLO serving "
+                    "directory. Takes the `vllm serve` command line."
+                ),
+            )
         )
-        parser: argparse.ArgumentParser = EngineArgs.add_cli_args(flexible_parser)
     except Exception:
         parser = argparse.ArgumentParser(
             prog="python -m vllm_torchtpu.experimental.export",
@@ -193,13 +202,122 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# Destinations of the export options and internal flags, which are not
+# `vllm serve` arguments.
+_EXPORT_DESTS = frozenset(
+    {
+        "output_dir",
+        "target_tpu",
+        "token_buckets",
+        "req_buckets",
+        "num_blocks",
+        "export_mode",
+        "export_worker",
+        "jax_coordinator",
+        "checkpoint_data_dir",
+    }
+)
+
+
+def ignored_frontend_args(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> list[str]:
+    """The `vllm serve` frontend options set in `args`, which the export ignores.
+
+    Engine arguments (the fields of vLLM's `AsyncEngineArgs`) shape the artifact;
+    everything else `vllm serve` takes configures its HTTP frontend.
+    """
+    try:
+        from vllm.engine.arg_utils import AsyncEngineArgs
+    except Exception:
+        return []
+    engine_dests = {f.name for f in dataclasses.fields(AsyncEngineArgs)}
+    ignored = []
+    for action in parser._actions:
+        dest = action.dest
+        if (
+            dest in engine_dests
+            or dest in _EXPORT_DESTS
+            or dest in ("help", "model_tag")
+            or not action.option_strings
+        ):
+            continue
+        if getattr(args, dest, action.default) != action.default:
+            # The positive long form, not `--no-...` of a boolean option.
+            names = [
+                o
+                for o in action.option_strings
+                if o.startswith("--") and not o.startswith("--no-")
+            ]
+            ignored.append((names or action.option_strings)[0])
+    return ignored
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parses CLI arguments."""
     parser = build_arg_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
+    # `vllm serve MODEL`: the positional model tag names the model, as in vLLM.
+    if getattr(args, "model_tag", None):
+        args.model = args.model_tag
+    if not getattr(args, "export_worker", False):
+        ignored = ignored_frontend_args(parser, args)
+        if ignored:
+            sys.stderr.write(
+                "[export] Ignoring vllm serve frontend options, which do not shape "
+                f"the artifact: {', '.join(ignored)}\n"
+            )
     # Force dummy weight loading so AOT export never reads multi-GB safetensors data.
     args.load_format = "dummy"
     return args
+
+
+# Speculative methods the artifact can declare: ngram drafts on the host from the
+# sequence itself, so it needs no exported draft graphs.
+SPECULATIVE_METHODS = ("ngram",)
+_SPECULATIVE_FIELDS = frozenset(
+    {"method", "num_speculative_tokens", "prompt_lookup_max", "prompt_lookup_min"}
+)
+
+
+def export_speculative_config(raw: Any) -> dict[str, Any] | None:
+    """The `serving_config.speculative_config` for `--speculative-config`.
+
+    Keeps vLLM's field names. Rejects methods that would need exported draft
+    graphs (MTP, EAGLE, a draft model) and fields the runtime would not honor.
+    """
+    if raw is None:
+        return None
+    cfg = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    method = cfg.get("method")
+    if method not in SPECULATIVE_METHODS:
+        raise ValueError(
+            f"--speculative-config method {method!r} is not supported by the "
+            f"exporter; supported: {', '.join(SPECULATIVE_METHODS)}"
+        )
+    unknown = sorted(set(cfg) - _SPECULATIVE_FIELDS)
+    if unknown:
+        raise ValueError(
+            f"--speculative-config fields {unknown} are not supported for method "
+            f"{method!r}; supported: {sorted(_SPECULATIVE_FIELDS)}"
+        )
+
+    def positive(name: str) -> int:
+        value = cfg.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(
+                f"--speculative-config {name} must be a positive integer, got {value!r}"
+            )
+        return value
+
+    lookup_max = positive("prompt_lookup_max")
+    cfg.setdefault("prompt_lookup_min", lookup_max)
+    return {
+        "method": method,
+        "num_speculative_tokens": positive("num_speculative_tokens"),
+        "prompt_lookup_max": lookup_max,
+        "prompt_lookup_min": positive("prompt_lookup_min"),
+    }
 
 
 def create_vllm_config_from_args(args: argparse.Namespace) -> Any:
@@ -216,6 +334,11 @@ def run_export_from_args(
     model: Any = None,
 ) -> api.TextOnlyLLMExportConfig:
     """Executes the AOT model export given parsed CLI arguments."""
+    speculative_config = export_speculative_config(
+        getattr(args, "speculative_config", None)
+    )
+    # The serving runtime drafts; vLLM must not build a drafter for the export.
+    args.speculative_config = None
     if vllm_config is None and model is None:
         vllm_config = create_vllm_config_from_args(args)
     if vllm_config is not None:
@@ -249,10 +372,12 @@ def run_export_from_args(
     )
     num_blocks_override = getattr(args, "num_blocks", None)
     if num_blocks_override is not None:
-        import dataclasses
-
         export_cfg = dataclasses.replace(
             export_cfg, num_blocks=int(num_blocks_override)
+        )
+    if speculative_config is not None:
+        export_cfg = dataclasses.replace(
+            export_cfg, speculative_config=speculative_config
         )
 
     if isinstance(model, api.ExportableTextOnlyLLM):
@@ -338,9 +463,9 @@ def _launch_workers(
         )
         shutil.rmtree(data_dir, ignore_errors=True)
         worker_flags += [checkpoint.DATA_DIR_FLAG, data_dir]
-    rank_root = tempfile.mkdtemp(
-        prefix=".export_ranks_", dir=os.path.dirname(os.path.abspath(output_dir))
-    )
+    parent_dir = os.path.dirname(os.path.abspath(output_dir))
+    os.makedirs(parent_dir, exist_ok=True)
+    rank_root = tempfile.mkdtemp(prefix=".export_ranks_", dir=parent_dir)
     procs = []
     try:
         for rank in range(tp_size):

@@ -39,12 +39,13 @@ ENABLE_PREFIX_CACHING=true
 # One prefill chunk is one KV block, so a request resumed from a prefix hit
 # runs the cold run's chunk shapes and the stages can compare tokens. The block
 # is the one the engine settles on, four times the TP32 pair's for a TP8 rank's
-# KDA state: 648 for bf16 (observed), 1296 for fp8 (derived from TP32's 324);
-# the stages verify it against /metrics.
+# KDA state: 340 packed rows (308 f32 SSM + 32 f32 conv), so 680 tokens for
+# bf16 and 1360 for fp8 (derived from the pool layout; 648 was observed for
+# bf16 when the conv state was bf16); the stages verify it against /metrics.
 if [ "$KV_CACHE_DTYPE" = "fp8" ]; then
-    MAX_NUM_BATCHED_TOKENS=1296
+    MAX_NUM_BATCHED_TOKENS=1360
 else
-    MAX_NUM_BATCHED_TOKENS=648
+    MAX_NUM_BATCHED_TOKENS=680
 fi
 _before="$EXTRA_SERVE_ARGS"
 EXTRA_SERVE_ARGS=$(printf '%s' "$EXTRA_SERVE_ARGS" | sed "s/\"compile_sizes\":\[1,8,8192\]/\"compile_sizes\":[1,8,${MAX_NUM_BATCHED_TOKENS}]/")
@@ -111,7 +112,7 @@ _kv_transfer_config="{\"kv_connector\":\"TPURaidenConnector\",\"kv_connector_mod
 # recurrent state lags, or prefix-aware loads turn off for the whole engine,
 # so the counters stage (decode local_cache_hit > 0) guards that too.
 if [ "$_kv_role" = kv_consumer ]; then
-    _offload_config="{\"kv_connector\":\"TPURaidenOffloadingConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.offload.raiden_connector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":${K3_1P1D_DECODE_CPU_BYTES_TO_USE:-68719476736},\"raiden_controller_port\":48800}}"
+    _offload_config="{\"kv_connector\":\"TPURaidenOffloadingConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.offload.raiden_connector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":${K3_1P1D_DECODE_CPU_BYTES_TO_USE:-68719476736},\"raiden_controller_port\":28800}}"
     _kv_transfer_config="{\"kv_connector\":\"TPUMultiConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector\",\"kv_role\":\"kv_consumer\",\"kv_connector_extra_config\":{\"connectors\":[${_kv_transfer_config},${_offload_config}]}}"
 fi
 EXTRA_SERVE_ARGS="$EXTRA_SERVE_ARGS --kv-transfer-config ${_kv_transfer_config}"

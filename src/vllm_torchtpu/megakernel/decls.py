@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Stdlib-only block parameter, cache, and geometry declaration primitives."""
+"""Stdlib-only module parameter, cache, and geometry declaration primitives."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .spec import Block
+    from .module import Module
 
 
 class _RequiredType:
@@ -67,10 +67,11 @@ class FrozenDict(Mapping[str, Any]):
     def __hash__(self) -> int:
         return hash(frozenset(self._dict.items()))
 
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, FrozenDict):
-            return self._dict == other._dict
-        return self._dict == dict(other) if isinstance(other, Mapping) else False
+    def __eq__(self, other: object) -> Any:
+        if isinstance(other, Mapping):
+            other_d = other if isinstance(other, FrozenDict) else FrozenDict(other)
+            return self._dict == other_d._dict
+        return NotImplemented
 
     def __repr__(self) -> str:
         return f"FrozenDict({self._dict!r})"
@@ -81,7 +82,7 @@ class FrozenDict(Mapping[str, Any]):
 
 @dataclass(frozen=True)
 class KVCacheDecl:
-    """KV-page cache requirement declared by an attention block."""
+    """KV-page cache requirement declared by an attention module."""
 
     hd: int
     kvh: int = 1
@@ -95,7 +96,7 @@ class KVCacheDecl:
 
 @dataclass(frozen=True)
 class RecurrentCacheDecl:
-    """Recurrent + causal-conv slot requirement declared by a recurrent block."""
+    """Recurrent + causal-conv slot requirement declared by a recurrent module."""
 
     kh: int
     vh: int
@@ -110,14 +111,14 @@ class RecurrentCacheDecl:
 
 @dataclass(frozen=True)
 class ParamTransform:
-    """Declarative transform rules for a canonical block parameter."""
+    """Declarative transform rules for a canonical module parameter."""
 
     fuse_into: str | None = None
     fuse_order: int = 0
     fuse_axis: int = -1
     split_from: str | None = None
     split_slice: tuple[int, int] | None = None
-    transpose: tuple[int, ...] | bool = False
+    transpose: tuple[int, ...] | None = None
     pad: tuple[tuple[int, int], ...] | None = None
     quantize: str | None = None
     scale_for: str | None = None
@@ -128,6 +129,18 @@ class ParamTransform:
     channel_splits: tuple[int, ...] | None = None
     flatten_tail: bool = False
     expert_axis: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.transpose is not None and (
+            not isinstance(self.transpose, tuple)
+            or not all(
+                isinstance(i, int) and not isinstance(i, bool) for i in self.transpose
+            )
+        ):
+            raise TypeError(
+                f"ParamTransform.transpose must be an int permutation tuple or None, "
+                f"got {self.transpose!r}"
+            )
 
 
 _TRANSFORM_FIELD_NAMES = frozenset(f.name for f in dataclasses.fields(ParamTransform))
@@ -167,7 +180,7 @@ class HFParamDecl:
 
     def __post_init__(self) -> None:
         perm = self.transform.transpose
-        if isinstance(perm, tuple) and sorted(perm) != list(range(len(self.shape))):
+        if perm is not None and sorted(perm) != list(range(len(self.shape))):
             raise ValueError(
                 f"HFParamDecl {self.name!r}: transpose={perm} is not a valid "
                 f"rank-{len(self.shape)} permutation for shape={self.shape}"
@@ -175,14 +188,14 @@ class HFParamDecl:
         if self.hf_shape is None:
             hf_sh = (
                 tuple(self.shape[perm.index(i)] for i in range(len(perm)))
-                if isinstance(perm, tuple)
+                if perm is not None
                 else self.shape
             )
             object.__setattr__(self, "hf_shape", hf_sh)
 
 
 def apply_decl_overrides(decls: Sequence[HFParamDecl], geom: Any) -> list[HFParamDecl]:
-    """Apply `geom.transforms` overrides to a block's `HFParamDecl` list."""
+    """Apply `geom.transforms` overrides to a module's `HFParamDecl` list."""
     transforms = getattr(geom, "transforms", None)
     if not transforms:
         return list(decls)
@@ -275,53 +288,55 @@ def _resolve_field_spec(
             return found
     if default is not REQUIRED:
         return default
-    raise ValueError(f"Cannot resolve field {canon!r} ({hf_key!r}) from {hf_config!r}")
+    raise ValueError(f"Cannot resolve field {canon!r} (missing HF key {hf_key!r})")
 
 
 def validate_rename_and_transforms(
-    block_cls: type[Block],
+    module_cls: type[Module],
     rename: Mapping[str, str],
     transforms: Mapping[str, Any],
     *,
     param_name_override: str | None = None,
 ) -> None:
-    """Validate `rename` and `transforms` keys against `block_cls.PARAM_NAMES`."""
-    allowed = set(getattr(block_cls, "PARAM_NAMES", ())) | (
+    """Validate `rename` and `transforms` keys against `module_cls.PARAM_NAMES`."""
+    allowed = set(getattr(module_cls, "PARAM_NAMES", ())) | (
         {param_name_override} if param_name_override else set()
     )
     seen: set[str] = set()
     for k, v in rename.items():
         if allowed and k not in allowed:
-            raise ValueError(f"{block_cls.__name__}.bind got unknown rename key {k!r}")
+            raise ValueError(f"{module_cls.__name__}.bind got unknown rename key {k!r}")
         if not isinstance(v, str) or not v:
-            raise ValueError(f"{block_cls.__name__}.bind invalid rename[{k!r}]={v!r}")
+            raise ValueError(f"{module_cls.__name__}.bind invalid rename[{k!r}]={v!r}")
         if (v in allowed and v != k) or v in seen:
-            raise ValueError(f"{block_cls.__name__}.bind rename target collision {v!r}")
+            raise ValueError(
+                f"{module_cls.__name__}.bind rename target collision {v!r}"
+            )
         seen.add(v)
     allowed_tf = allowed | seen
     for k, v in transforms.items():
         if allowed_tf and k not in allowed_tf:
             raise ValueError(
-                f"{block_cls.__name__}.bind got unknown transforms key {k!r}"
+                f"{module_cls.__name__}.bind got unknown transforms key {k!r}"
             )
         if isinstance(v, Mapping):
             if bad := (set(v) - _TRANSFORM_FIELD_NAMES):
                 raise ValueError(
-                    f"{block_cls.__name__}.bind transforms[{k!r}] got unknown "
+                    f"{module_cls.__name__}.bind transforms[{k!r}] got unknown "
                     f"fields {sorted(bad)}"
                 )
         elif not isinstance(v, ParamTransform):
             raise TypeError(
-                f"{block_cls.__name__}.bind transforms[{k!r}] invalid type "
+                f"{module_cls.__name__}.bind transforms[{k!r}] invalid type "
                 f"{type(v).__name__}"
             )
 
 
 @dataclass(frozen=True)
-class ResolvedBlockGeometry:
-    """Resolved block geometry and options from `BlockBinding.resolve(hf_config)`."""
+class ResolvedModuleGeometry:
+    """Resolved module geometry and options from `ModuleBinding.resolve(hf_config)`."""
 
-    block_cls: type[Block]
+    module_cls: type[Module]
     prefix: str
     values: Mapping[str, Any] = field(default_factory=FrozenDict)
     options: Mapping[str, Any] = field(default_factory=FrozenDict)
@@ -335,43 +350,43 @@ class ResolvedBlockGeometry:
     def __getattr__(self, name: str) -> Any:
         values = object.__getattribute__(self, "values")
         options = object.__getattribute__(self, "options")
-        block_cls = object.__getattribute__(self, "block_cls")
+        module_cls = object.__getattribute__(self, "module_cls")
         cands = (
             name,
-            block_cls.FIELD_ALIASES.get(name),
-            *(a for a, t in block_cls.FIELD_ALIASES.items() if t == name),
+            module_cls.FIELD_ALIASES.get(name),
+            *(a for a, t in module_cls.FIELD_ALIASES.items() if t == name),
         )
         for key in cands:
             if key is not None and (key in values or key in options):
                 return values[key] if key in values else options[key]
-        if (fn := block_cls.GEOMETRY_METHODS.get(name)) is not None:
+        if (fn := module_cls.GEOMETRY_METHODS.get(name)) is not None:
             return lambda *a, _fn=fn, **kw: _fn(self, *a, **kw)
         raise AttributeError(f"{type(self).__name__} has no attribute {name!r}")
 
     @property
-    def geometry(self) -> ResolvedBlockGeometry:
+    def geometry(self) -> ResolvedModuleGeometry:
         return self
 
-    def to_block(self) -> Block:
-        return self.block_cls._from_resolved(self)
+    def to_module(self) -> Module:
+        return self.module_cls._from_resolved(self)
 
     def hf_params(self, prefix: str | None = None) -> list[HFParamDecl]:
-        return self.to_block().hf_params(
+        return self.to_module().hf_params(
             self.prefix if prefix is None else prefix, self
         )
 
     def cache_decl(self) -> KVCacheDecl | RecurrentCacheDecl | None:
-        return self.to_block().cache_decl(self)
+        return self.to_module().cache_decl(self)
 
     def reference(self, params: Any, x: Any, state: Any = None, **kwargs: Any) -> Any:
-        return self.to_block().reference(params, x, state, **kwargs)
+        return self.to_module().reference(params, x, state, **kwargs)
 
 
 @dataclass(frozen=True)
-class BlockBinding:
-    """Frozen declarative block binding returned by `Block.bind(...)`."""
+class ModuleBinding:
+    """Frozen declarative module binding returned by `Module.bind(...)`."""
 
-    block_cls: type[Block]
+    module_cls: type[Module]
     prefix: str
     fields: Mapping[str, Any] = field(default_factory=FrozenDict)
     options: Mapping[str, Any] = field(default_factory=FrozenDict)
@@ -384,11 +399,11 @@ class BlockBinding:
             object.__setattr__(self, attr, FrozenDict(getattr(self, attr)))
         object.__setattr__(self, "explicit_fields", frozenset(self.explicit_fields))
 
-    def resolve(self, hf_config: Any) -> ResolvedBlockGeometry:
-        return self.block_cls._resolve_binding(self, hf_config)
+    def resolve(self, hf_config: Any) -> ResolvedModuleGeometry:
+        return self.module_cls._resolve_binding(self, hf_config)
 
-    def to_block(self, hf_config: Any) -> Block:
-        return self.resolve(hf_config).to_block()
+    def to_module(self, hf_config: Any) -> Module:
+        return self.resolve(hf_config).to_module()
 
     def hf_params(self, hf_config: Any, prefix: str | None = None) -> list[HFParamDecl]:
         return self.resolve(hf_config).hf_params(

@@ -20,12 +20,73 @@ from typing import Any
 
 import torch
 
-from vllm_torchtpu.experimental.export import api, tpu_lowering
+from vllm_torchtpu.experimental.export import api, random_sample, tpu_lowering
 
 
 def greedy_tokens(logits: torch.Tensor) -> torch.Tensor:
     """Returns the argmax token id i64[R, 1] of each row of logits[R, V]."""
     return torch.argmax(logits, dim=-1, keepdim=True).to(torch.int64)
+
+
+# Multipliers of a 32-bit integer hash (MurmurHash3's finalizer), as signed i32.
+_HASH_SEED_STEP = -1640531527  # 0x9E3779B9
+_HASH_MUL_1 = -2048144789  # 0x85EBCA6B
+_HASH_MUL_2 = -1028477387  # 0xC2B2AE35
+
+
+def uniform_per_logit(uniform: torch.Tensor, vocab: int) -> torch.Tensor:
+    """Expands one uniform per row, uniform[R], into one per logit, f32[R, V] in (0, 1).
+
+    The row's uniform seeds a hash of the token id, so a row's values depend only
+    on its own uniform: sampling stays batch-invariant and reproducible from the
+    request's seed. The hash runs in i32, whose multiplications wrap.
+    """
+    seed = uniform.to(torch.float32).contiguous().view(torch.int32).unsqueeze(-1)
+    ids = torch.arange(vocab, device=uniform.device, dtype=torch.int32).unsqueeze(0)
+    x = seed ^ (ids * _HASH_SEED_STEP)
+    # Right shifts are arithmetic on i32; the masks make them logical.
+    x = x ^ ((x >> 16) & 0xFFFF)
+    x = x * _HASH_MUL_1
+    x = x ^ ((x >> 13) & 0x7FFFF)
+    x = x * _HASH_MUL_2
+    x = x ^ ((x >> 16) & 0xFFFF)
+    mantissa = (x >> 8) & 0xFFFFFF
+    return (mantissa.to(torch.float32) + 0.5) * (1.0 / (1 << 24))
+
+
+def _sample(
+    logits: torch.Tensor,
+    temperature: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    uniform: torch.Tensor,
+    apply_topk_topp: bool,
+) -> torch.Tensor:
+    logits = logits.to(torch.float32)
+    tokens = random_sample.sample_from_logits(
+        logits,
+        temperature.to(torch.float32).unsqueeze(-1),
+        uniform_per_logit(uniform, int(logits.shape[-1])),
+        top_k.to(torch.int32).unsqueeze(-1),
+        top_p.to(torch.float32).unsqueeze(-1),
+        apply_topk_topp=apply_topk_topp,
+    )
+    return tokens.to(torch.int64)
+
+
+def temperature_tokens(
+    logits: torch.Tensor, temperature: torch.Tensor, uniform: torch.Tensor
+) -> torch.Tensor:
+    """Samples one token id i64[R, 1] per row of logits[R, V] at its temperature.
+
+    For batches where no row sets top-k or top-p: the vLLM TPU runner's sampler
+    without the top-k / top-p bisections. A row with `temperature <= 1e-5` takes
+    the argmax.
+    """
+    no_filter = torch.zeros_like(temperature)
+    return _sample(
+        logits, temperature, no_filter.to(torch.int32), no_filter + 1.0, uniform, False
+    )
 
 
 def stochastic_tokens(
@@ -36,48 +97,18 @@ def stochastic_tokens(
     min_p: torch.Tensor,
     uniform: torch.Tensor,
 ) -> torch.Tensor:
-    """Samples one token id i64[R, 1] per row of logits[R, V].
+    """Samples one token id i64[R, 1] per row of logits[R, V] with top-k / top-p.
 
-    Each row is sampled with its own parameters. A row with `temperature <= 1e-5`
-    takes the argmax. Otherwise the logits are divided by the temperature, sorted
-    by descending probability (ties by ascending token id), and filtered:
-
-    - Top-K keeps the `top_k` most likely tokens (`top_k <= 0` keeps all).
-    - Top-P keeps the smallest prefix whose probability reaches `top_p`
-      (`top_p >= 1` keeps all).
-    - Min-P keeps tokens at least `min_p` times as likely as the most likely
-      token (`min_p <= 0` keeps all).
-
-    The most likely token always survives. The token is the first one whose
-    cumulative probability over the kept tokens exceeds `uniform`.
+    The vLLM TPU runner's sampler (see `random_sample`): the logits
+    are divided by the temperature, masked to the top-k (`top_k <= 0` keeps all)
+    and top-p (`top_p >= 1` keeps all) set by bisection, and sampled with the
+    Gumbel-max trick, whose noise comes from `uniform` (`uniform_per_logit`). A
+    row with `temperature <= 1e-5` takes the argmax. `min_p` is not applied, as
+    in vLLM on TPU (the runtime rejects requests that set it); the input keeps
+    the samplers' signature.
     """
-    logits = logits.to(torch.float32)
-    vocab = int(logits.shape[-1])
-    temp_f32 = temperature.to(torch.float32)
-    scaled = logits / torch.clamp(temp_f32, min=1e-5).unsqueeze(-1)
-    sorted_logits, order = torch.sort(scaled, dim=-1, descending=True, stable=True)
-    ranks = torch.arange(vocab, device=logits.device, dtype=torch.int32).unsqueeze(0)
-    top_k_i32 = top_k.to(torch.int32)
-    vocab_t = torch.full_like(top_k_i32, vocab)
-    k = torch.where(top_k_i32 > 0, torch.minimum(top_k_i32, vocab_t), vocab_t)
-    keep = ranks < k.unsqueeze(-1)
-    neg_inf = torch.full_like(sorted_logits, -float("inf"))
-    probs = torch.softmax(torch.where(keep, sorted_logits, neg_inf), dim=-1)
-    keep = keep & (
-        (torch.cumsum(probs, dim=-1) - probs) < top_p.to(torch.float32).unsqueeze(-1)
-    )
-    keep = keep & (probs >= min_p.to(torch.float32).unsqueeze(-1) * probs[:, :1])
-    keep = keep | (ranks == 0)
-    probs = torch.softmax(torch.where(keep, sorted_logits, neg_inf), dim=-1)
-    cdf = torch.cumsum(probs, dim=-1)
-    threshold = uniform.to(torch.float32).unsqueeze(-1) * cdf[:, -1:]
-    index = torch.sum((cdf <= threshold).to(torch.int64), dim=-1)
-    max_idx = torch.sum(keep.to(torch.int64), dim=-1) - 1
-    index = torch.minimum(index, max_idx)
-    sampled = torch.gather(order.to(torch.int64), -1, index.unsqueeze(-1)).squeeze(-1)
-    greedy = torch.argmax(logits, dim=-1).to(torch.int64)
-    tokens = torch.where(temp_f32 <= 1e-5, greedy, sampled)
-    return tokens.unsqueeze(-1)
+    del min_p
+    return _sample(logits, temperature, top_k, top_p, uniform, True)
 
 
 def penalized_tokens(
@@ -219,6 +250,11 @@ def export_samplers(
         [logits_spec],
         module_name=f"sample_tokens_req{req_size}",
     )
+    temperature_mlir = tpu_lowering.lower_torch_callable_to_mlir(
+        temperature_tokens,
+        [logits_spec, param_specs[0], param_specs[4]],
+        module_name=f"sample_tokens_temperature_req{req_size}",
+    )
     stochastic_mlir = tpu_lowering.lower_torch_callable_to_mlir(
         stochastic_tokens,
         [logits_spec, *param_specs],
@@ -259,6 +295,11 @@ def export_samplers(
         _tensor_entry(i, name, (req_size,), dtype_name, "user_io")
         for i, (name, dtype_name) in enumerate(param_inputs, start=1)
     ]
+    temperature_inputs = [
+        logits_input,
+        _tensor_entry(1, "temperature", (req_size,), "f32", "user_io"),
+        _tensor_entry(2, "uniform", (req_size,), "f32", "user_io"),
+    ]
     penalized_inputs = stochastic_inputs + [
         _tensor_entry(i, name, shape, dtype_name, "user_io")
         for i, (name, shape, dtype_name) in enumerate(
@@ -272,6 +313,7 @@ def export_samplers(
     variants: dict[str, dict[str, Any]] = {}
     for function, mlir, inputs in [
         ("sample_tokens", greedy_mlir, [logits_input]),
+        ("sample_tokens_temperature", temperature_mlir, temperature_inputs),
         ("sample_tokens_stochastic", stochastic_mlir, stochastic_inputs),
         ("sample_tokens_penalized", penalized_mlir, penalized_inputs),
     ]:
