@@ -357,6 +357,7 @@ class MoEInputs(NamedTuple):
     partial: Ref
     hash_ids: Ref  # SMEM int32 [num_hash_layers, T * 8]: tid2eid rows (6 used)
     row_valid: Ref  # SMEM int32 [T]: 1 for live global rows
+    amax: Any = None  # optional f32 [T, 1]: precomputed row max |x| from ffn_norm
 
 
 class MoEWeights(NamedTuple):
@@ -387,6 +388,7 @@ def moe_phase(
     before_ar: Any = None,  # called once the lease is free, before the AR
     expert_held: Any = None,  # SMEM int32 [L, slots]: placement (moe_phase.py)
     expert_copy: Any = None,  # SMEM int32 [L, slots] or None: replica split
+    shared_expert: Any = None,  # optional callback computing inputs.partial
 ) -> None:
     """Router (moe_router semantics, noaux_tc / hash), this rank's routed
     experts on all T rows (W4A8 as stock), sum x routed_scaling_factor added
@@ -399,7 +401,7 @@ def moe_phase(
 
     impl.moe_phase(
         geom, layer, is_hash, me, inputs, weights, out, lease, scratch, ar, ar_slot,
-        expert_block, before_ar, expert_held, expert_copy,
+        expert_block, before_ar, expert_held, expert_copy, shared_expert,
     )  # fmt: skip
 
 

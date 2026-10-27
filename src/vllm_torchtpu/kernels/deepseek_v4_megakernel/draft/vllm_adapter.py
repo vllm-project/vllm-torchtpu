@@ -85,13 +85,29 @@ class DraftMegakernel:
         meta[KI.META_Q] = spec.q
         meta[KI.META_EBLK] = expert_block
         self.meta = meta.to(self.device)
+        self._metas: dict[int, torch.Tensor] = {spec.q: self.meta}
         self.cfg: KI.StepConfig | None = None
         self.caches: VA.BoundCaches | None = None
         self._steps: dict[KI.Bucket, Callable] = {}
         self._preps: dict[KI.Bucket, Callable] = {}
         self._idle: dict[KI.Bucket, list[torch.Tensor]] = {}
+        self._draft_buckets: dict[KI.Bucket, KI.Bucket] = {}
         # the target's VA.RunTrace (maybe_create)
         self.trace: Any = VA.RunTrace(rank, 0, False)
+
+    def _draft_q_for(self, target: KI.Bucket) -> int:
+        if target.q != self.ctx_q and target.q > 1:
+            return target.q - 1
+        return self.spec.q
+
+    def _meta_for(self, target: KI.Bucket) -> torch.Tensor:
+        dq = self._draft_q_for(target)
+        meta = self._metas.get(dq)
+        if meta is None:
+            m = self.meta.detach().clone()
+            m[KI.META_Q] = dq
+            meta = self._metas[dq] = m.to(self.device)
+        return meta
 
     @classmethod
     def maybe_create(cls, runner: Any, target: Any) -> DraftMegakernel | None:
@@ -208,10 +224,11 @@ class DraftMegakernel:
             group_widths=tuple(group_widths),
         )
         for tb in target_buckets:
-            b = draft_bucket(tb, self.spec.q)
-            self._steps[tb] = self._build_step(b)
+            b = draft_bucket(tb, self._draft_q_for(tb))
+            self._draft_buckets[tb] = b
+            self._steps[tb] = self._build_step(b, ctx_q=tb.q)
             self._preps[tb] = self._build_prep(b, tb)
-            self._idle[tb] = self._idle_operands(b)
+            self._idle[tb] = self._idle_operands(b, ctx_q=tb.q)
         logger.info(
             "DeepSeek-V4 draft megakernel bound: %d cache arrays, KV groups %s",
             len(caches.arrays),
@@ -222,11 +239,12 @@ class DraftMegakernel:
     def bound(self) -> bool:
         return self.cfg is not None
 
-    def _build_step(self, bucket: KI.Bucket) -> Callable:
+    def _build_step(self, bucket: KI.Bucket, ctx_q: int | None = None) -> Callable:
         cfg, caches = self.cfg, self.caches
         assert cfg is not None and caches is not None
         VA._need(self.kernel.cache_inplace, "draft megakernel: in-place caches only")
-        fn = self.kernel.build_draft_step(cfg, bucket, self.ctx_q)
+        eff_ctx_q = self.ctx_q if ctx_q is None else ctx_q
+        fn = self.kernel.build_draft_step(cfg, bucket, eff_ctx_q)
         n_bt = len(cfg.group_widths)
         n_in = _HEAD_OPERANDS + n_bt + len(self.weights) + len(caches.arrays)
         tag = f"q{bucket.q}_t{bucket.rows}"
@@ -244,7 +262,8 @@ class DraftMegakernel:
         -> the draft bucket's fixed shapes; requests past `num_reqs` (the
         step's request count) are inactive, their rows zero."""
         K, B, M = bucket.q, bucket.reqs, bucket.own_rows
-        Mc = B * self.ctx_q
+        ctx_q = target.q
+        Mc = B * ctx_q
         widths = self.cfg.group_widths
         fit = VA._fit_rows
 
@@ -253,7 +272,7 @@ class DraftMegakernel:
             dev = seq_lens.device
             active = torch.arange(B, dtype=torch.int32, device=dev) < num_reqs
             rows = fit(active.repeat_interleave(K), M)
-            crows = fit(active.repeat_interleave(self.ctx_q), Mc)
+            crows = fit(active.repeat_interleave(ctx_q), Mc)
             zi = torch.zeros((), dtype=torch.int32, device=dev)
             ids = torch.where(rows, fit(input_ids, M).int(), zi)
             pos = torch.where(rows, fit(positions, M).int(), zi)
@@ -273,9 +292,12 @@ class DraftMegakernel:
         )
         return self._compile(prep)
 
-    def _idle_operands(self, bucket: KI.Bucket) -> list[torch.Tensor]:
+    def _idle_operands(
+        self, bucket: KI.Bucket, ctx_q: int | None = None
+    ) -> list[torch.Tensor]:
         z = torch.zeros
-        B, Mc, i32 = bucket.reqs, bucket.reqs * self.ctx_q, torch.int32
+        eff_ctx_q = self.ctx_q if ctx_q is None else ctx_q
+        B, Mc, i32 = bucket.reqs, bucket.reqs * eff_ctx_q, torch.int32
         n_aux_h = self.n_aux * self.spec.hidden_size
         ops = [z(bucket.own_rows, dtype=i32), z(bucket.own_rows, dtype=i32),
                z(B, dtype=i32), z((Mc, n_aux_h), dtype=torch.bfloat16),
@@ -315,7 +337,7 @@ class DraftMegakernel:
 
     def _run(self, target: KI.Bucket, ops: Sequence[torch.Tensor]) -> torch.Tensor:
         assert self.caches is not None
-        head = (self.meta, *ops[:6])
+        head = (self._meta_for(target), *ops[:6])
         return self._steps[target](
             head, list(ops[6:]), self.weights, self.caches.arrays
         )

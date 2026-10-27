@@ -1258,3 +1258,28 @@ def test_placement_operands_are_this_ep_ranks_table_rows():
     assert ops["moe_held"][1].tolist() == [2, 3, 0]
     with pytest.raises(VA.Unsupported, match="expert placement for 8 experts over 2"):
         VA.placement_operands(spec, 0, "cpu", XP.Placement(8, 2, {}))
+
+
+def test_multi_q_buckets_and_step_q():
+    b = VA.parse_row_buckets("16,32,64@4:131072", q=7, reqs=4, max_ctx=1 << 20)
+    assert [(x.q, x.rows, x.max_ctx) for x in b] == [
+        (7, 16, 1 << 20),
+        (7, 32, 1 << 20),
+        (4, 64, 131072),
+    ]
+    extra = VA.parse_row_buckets("16,32", q=7, reqs=4, extra_qs=(4,))
+    assert [(x.q, x.rows) for x in extra] == [(7, 16), (4, 16), (7, 32), (4, 32)]
+    assert VA.select_bucket(24, b, q=7) == b[1]
+    assert VA.select_bucket(40, b, q=7) is None
+    assert VA.select_bucket(40, b, q=4) == b[2]
+    # step_q=4 classifies against q=4 buckets
+    local_q4 = _classify(
+        num_reqs=4,
+        num_windowed=4,
+        num_static_verify=0,
+        num_tokens=16,
+        buckets=b,
+        step_q=4,
+    )
+    assert local_q4 == VA.LocalStep(VA.ELIGIBLE, VA.ELIGIBLE, 32, 0, q=4)
+    assert VA.decide_step(local_q4, None, b) == ("mk_q4_t64", b[2])

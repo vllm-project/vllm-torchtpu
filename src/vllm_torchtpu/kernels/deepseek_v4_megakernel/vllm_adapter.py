@@ -77,24 +77,38 @@ def _need(cond: bool, why: str) -> None:
 
 
 def parse_row_buckets(
-    raw: str, q: int, reqs: int, max_ctx: int | None = None
+    raw: str,
+    q: int,
+    reqs: int,
+    max_ctx: int | None = None,
+    extra_qs: Sequence[int] = (),
 ) -> tuple[KI.Bucket, ...]:
     """`VLLM_TPU_DSV4_MK_BUCKETS`: comma-separated global row counts T (the
-    sum of every DP rank's active rows), each optionally `T:ctx` with its own
-    longest served context (default `max_ctx`); `reqs` slots per rank."""
-    ctx_of: dict[int, int | None] = {}
+    sum of every DP rank's active rows), each optionally `T[@q][:ctx]` with its
+    own verify query length `q` and longest served context (default `max_ctx`);
+    `reqs` slots per rank."""
+    ctx_of: dict[tuple[int, int], int | None] = {}
+    default_qs = tuple(dict.fromkeys((q, *(int(x) for x in extra_qs if int(x) > 0))))
     for item in (x.strip() for x in raw.split(",")):
         if item:
-            r, _, c = item.partition(":")
-            ctx_of[int(r)] = int(c) if c else max_ctx
-    rows = sorted(ctx_of)
-    _need(bool(rows), f"no buckets in VLLM_TPU_DSV4_MK_BUCKETS={raw!r}")
-    _need(
-        rows[0] >= q,
-        f"bucket {rows[0]} rows holds no {q}-row request "
-        f"(VLLM_TPU_DSV4_MK_BUCKETS={raw!r})",
+            rc, _, c = item.partition(":")
+            r_str, has_q, q_str = rc.partition("@")
+            r = int(r_str)
+            ctx = int(c) if c else max_ctx
+            qs = (int(q_str),) if has_q else default_qs
+            for bq in qs:
+                ctx_of[(r, bq)] = ctx
+    entries = sorted(ctx_of, key=lambda rq: (rq[0], -rq[1]))
+    _need(bool(entries), f"no buckets in VLLM_TPU_DSV4_MK_BUCKETS={raw!r}")
+    for r, bq in entries:
+        _need(
+            r >= bq,
+            f"bucket {r} rows holds no {bq}-row request "
+            f"(VLLM_TPU_DSV4_MK_BUCKETS={raw!r})",
+        )
+    return tuple(
+        KI.Bucket(q=bq, rows=r, reqs=reqs, max_ctx=ctx_of[(r, bq)]) for r, bq in entries
     )
-    return tuple(KI.Bucket(q=q, rows=r, reqs=reqs, max_ctx=ctx_of[r]) for r in rows)
 
 
 def _serves_ctx(b: KI.Bucket, ctx: int) -> bool:
@@ -102,12 +116,15 @@ def _serves_ctx(b: KI.Bucket, ctx: int) -> bool:
 
 
 def select_bucket(
-    rows: int, buckets: Sequence[KI.Bucket], ctx: int = 0
+    rows: int,
+    buckets: Sequence[KI.Bucket],
+    ctx: int = 0,
+    q: int | None = None,
 ) -> KI.Bucket | None:
     """The smallest bucket with at least `rows` global rows that serves a
-    `ctx`-token context, or None."""
+    `ctx`-token context (and query length `q`, when specified), or None."""
     for b in buckets:
-        if b.rows >= rows and _serves_ctx(b, ctx):
+        if (q is None or b.q == q) and b.rows >= rows and _serves_ctx(b, ctx):
             return b
     return None
 
@@ -244,6 +261,7 @@ class LocalStep:
     reason: str
     rows: int = 0  # global rows this rank's requests occupy in the step
     ctx: int = 0  # longest request context incl. this step's window
+    q: int = 0  # non-zero when the step uses a non-default verify width
 
     @property
     def vote(self) -> int:
@@ -273,6 +291,7 @@ class DPReduced:
     any_veto: bool
     total_rows: int  # sum of every rank's active rows
     max_ctx: int = 0  # the group's longest request context
+    q: int = 0  # non-zero when the step uses a non-default verify width
 
 
 @dataclasses.dataclass(frozen=True)
@@ -297,12 +316,15 @@ def classify_local_step(
     buckets: Sequence[KI.Bucket],
     max_reqs: int,
     max_seq_len: int = 0,
+    step_q: int | None = None,
 ) -> LocalStep:
     """Classify this rank's step from the runner's host-side counts.
 
     The counts are `_reorder_batch_for_rpa`'s: `num_decode` 1-token requests
     lead, then `num_static_verify` verify windows of exactly q tokens, up to
-    `num_windowed`; anything after is prefill.
+    `num_windowed`; anything after is prefill. When `step_q` is given (for
+    width-aware DSpark steps with a uniform alternate verify width), the step
+    is matched against buckets of width `step_q`.
     """
     if num_reqs == 0 or num_tokens == 0:
         return LocalStep(IDLE, IDLE)
@@ -312,22 +334,32 @@ def classify_local_step(
         return LocalStep(STOCK, "stock_prefill")
     if num_chunks != 1:
         return LocalStep(STOCK, "stock_chunks")
-    uniform = num_decode == num_reqs if q == 1 else num_static_verify == num_reqs
+    eff_q = q if step_q is None else step_q
+    if step_q is not None and step_q != q:
+        uniform = num_decode == 0 and any(b.q == step_q for b in buckets)
+    else:
+        uniform = num_decode == num_reqs if q == 1 else num_static_verify == num_reqs
     if not uniform:
         return LocalStep(STOCK, "stock_mixed_qlen")
-    if num_tokens != num_reqs * q:
+    if num_tokens != num_reqs * eff_q:
         raise AssertionError(
-            f"{num_reqs} requests of {q} rows scheduled {num_tokens} tokens"
+            f"{num_reqs} requests of {eff_q} rows scheduled {num_tokens} tokens"
         )
     if num_reqs > max_reqs:
         return LocalStep(STOCK, "stock_own_reqs")
     # max_seq_len: the longest request's tokens incl. this step's window
-    if not any(_serves_ctx(b, max_seq_len) for b in buckets):
+    multi_q = any(b.q != q for b in buckets)
+    want_q = eff_q if (multi_q or (step_q is not None and step_q != q)) else None
+    if not any(
+        (want_q is None or b.q == want_q) and _serves_ctx(b, max_seq_len)
+        for b in buckets
+    ):
         return LocalStep(STOCK, "stock_ctx")
-    rows = num_reqs * KI.request_block_rows(q)
-    if select_bucket(rows, buckets, max_seq_len) is None:
+    rows = num_reqs * KI.request_block_rows(eff_q)
+    if select_bucket(rows, buckets, max_seq_len, q=want_q) is None:
         return LocalStep(STOCK, f"stock_rows{rows}")
-    return LocalStep(ELIGIBLE, ELIGIBLE, rows, max_seq_len)
+    out_q = eff_q if (step_q is not None and step_q != q) else 0
+    return LocalStep(ELIGIBLE, ELIGIBLE, rows, max_seq_len, q=out_q)
 
 
 def decide_step(
@@ -344,7 +376,7 @@ def decide_step(
     if reduced is None:
         if local.kind != ELIGIBLE:
             return local.reason, None
-        rows, ctx = local.rows, local.ctx
+        rows, ctx, step_q = local.rows, local.ctx, local.q
     else:
         if reduced.any_veto:
             if local.kind == STOCK:
@@ -354,12 +386,13 @@ def decide_step(
             ), None
         if reduced.max_tokens == 0 or reduced.max_chunks != 1:
             return "stock_dp_idle", None
-        rows, ctx = reduced.total_rows, reduced.max_ctx
-    bucket = select_bucket(rows, buckets, ctx)
+        rows, ctx, step_q = reduced.total_rows, reduced.max_ctx, reduced.q or local.q
+    want_q = step_q if step_q > 0 else None
+    bucket = select_bucket(rows, buckets, ctx, q=want_q)
     if bucket is None:
         if reduced is None:
             raise AssertionError(f"no bucket for {rows} rows after an eligible vote")
-        if select_bucket(rows, buckets) is not None:
+        if select_bucket(rows, buckets, q=want_q) is not None:
             return f"stock_ctx_rows{rows}", None
         return f"stock_total_rows{rows}", None
     return bucket.key, bucket
@@ -1255,6 +1288,11 @@ class DSv4Megakernel:
             len(weights),
             copied_bytes(runner.model, weights) / 2**30,
         )
+        per_bs = getattr(spec_cfg, "num_speculative_tokens_per_batch_size", None)
+        extra_qs: tuple[int, ...] = ()
+        if per_bs:
+            vals = per_bs.values() if hasattr(per_bs, "values") else per_bs
+            extra_qs = tuple(int(v) + 1 for v in vals if int(v) + 1 != q)
         mk = cls(
             spec=spec,
             buckets=parse_row_buckets(
@@ -1262,6 +1300,7 @@ class DSv4Megakernel:
                 q,
                 envs.VLLM_TPU_DSV4_MK_OWN_REQS,
                 envs.VLLM_TPU_DSV4_MK_MAX_CTX,
+                extra_qs=extra_qs,
             ),
             kernel=kernel,
             mesh=mesh,
@@ -1323,6 +1362,7 @@ class DSv4Megakernel:
         meta[KI.META_EBLK] = expert_block
         meta[KI.META_VSTART] = vocab_start
         self.meta = meta.to(self.device)
+        self._metas: dict[int, torch.Tensor] = {spec.q: self.meta}
         self.cfg: KI.StepConfig | None = None
         self.caches: BoundCaches | None = None
         self._steps: dict[KI.Bucket, Callable] = {}
@@ -1637,11 +1677,30 @@ class DSv4Megakernel:
             )
         return local
 
+    def _meta_for(self, bucket: KI.Bucket) -> torch.Tensor:
+        meta = self._metas.get(bucket.q)
+        if meta is None:
+            m = self.meta.detach().clone()
+            m[KI.META_Q] = bucket.q
+            meta = self._metas[bucket.q] = m.to(self.device)
+        return meta
+
     def _classify(self, runner, scheduler_output, num_reqs, num_decode,
                   num_windowed, num_chunks, scheduled) -> LocalStep:  # fmt: skip
         if num_reqs != scheduled:
             # the persistent batch holds requests this step does not schedule
             return LocalStep(STOCK, "stock_unscheduled_reqs")
+        step_q = None
+        if (
+            num_reqs > 0
+            and num_decode == 0
+            and num_windowed == num_reqs
+            and runner._num_static_verify_reqs < num_reqs
+            and any(b.q != self.spec.q for b in self.buckets)
+        ):
+            counts = set(scheduler_output.num_scheduled_tokens.values())
+            if len(counts) == 1:
+                step_q = int(next(iter(counts)))
         return classify_local_step(
             num_reqs=num_reqs,
             num_decode=num_decode,
@@ -1654,6 +1713,7 @@ class DSv4Megakernel:
             buckets=self.buckets,
             max_reqs=self.buckets[0].reqs,
             max_seq_len=self._max_seq_len(runner, scheduler_output),
+            step_q=step_q,
         )
 
     @staticmethod
@@ -1848,7 +1908,7 @@ class DSv4Megakernel:
             )
         with self.trace(f"target {bucket.key} {'idle' if decision.idle else 'busy'}"):
             hidden, aux = self._steps[bucket](
-                self.meta,
+                self._meta_for(bucket),
                 ops[0],
                 ops[1],
                 ops[2],
@@ -1892,7 +1952,7 @@ class DSv4Megakernel:
                 # since torch_tpu compiles on the first sync, not at the call.
                 for ops in (prepped[-1], self._idle_operands[b]):
                     hidden, aux = self._steps[b](
-                        self.meta,
+                        self._meta_for(b),
                         ops[0],
                         ops[1],
                         ops[2],

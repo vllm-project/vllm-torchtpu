@@ -534,8 +534,12 @@ class MoEBlock:
                 d.start()
 
     def item_dma_args(self, i):
-        _, e_loc, s_loc = self.item(i)
-        return e_loc, s_loc, self.piece_starts(s_loc), self._expert_buf(i)
+        if self.cfg.mode == "tp":
+            e_loc, s_loc, buf = self.s["elist"][i], 0, lax.rem(self._entry(i)[0], 2)
+        else:
+            m, s_loc, _ = self._entry(i)
+            e_loc, buf = self.s["jlist"][m], lax.rem(m, 2)
+        return e_loc, s_loc, self.piece_starts(s_loc), buf
 
     def start_item(self, i, slot):
         self.issue_item(i, slot)
@@ -691,7 +695,20 @@ class MoEBlock:
     def back(self, slot, mid_q, coef):
         self.down(slot, mid_q, coef)
 
-    def run(self, n_items, acc_init=None):
+    def prefetch(self, n_items):
+        """Start the initial ring window of expert weight DMAs (up to nbuf - 1
+        items) ahead of accumulator seeding; returns the number of items issued."""
+        NB = self.cfg.nbuf
+        target = jnp.minimum(n_items, NB - 1)
+
+        def issue(k, c):
+            self.start_item(k, lax.rem(k, NB))
+            return c
+
+        lax.fori_loop(0, target, issue, 0)
+        return target
+
+    def run(self, n_items, acc_init=None, prefetched=None):
         """Software-pipelined over items with ONE copy of each code site (the
         weight-DMA issue is replicated per layer where weights are
         layer-indexed, and code size is time inside the step kernel): step i
@@ -707,6 +724,7 @@ class MoEBlock:
         # else: the caller has written s["acc"] already
         s["mid"][...] = jnp.zeros(s["mid"].shape, s["mid"].dtype)
         s["coef"][...] = jnp.zeros(s["coef"].shape, F32)
+        init_issued = jnp.int32(0) if prefetched is None else prefetched
 
         def step(i, issued):
             # slots of items i-1 (down) and i (gate-up) are busy: issue up to i+NB-2
@@ -731,7 +749,7 @@ class MoEBlock:
 
         @pl.when(n_items > 0)
         def _():
-            lax.fori_loop(0, n_items + 1, step, jnp.int32(0))
+            lax.fori_loop(0, n_items + 1, step, init_issued)
 
 
 def intermediate(cfg, acc, xs):

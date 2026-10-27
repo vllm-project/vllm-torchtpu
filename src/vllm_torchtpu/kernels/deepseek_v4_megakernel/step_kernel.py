@@ -919,31 +919,42 @@ def _kernel(scfg: StepKernelConfig, typed: bool, ax: str, names_scr, n_moe_scr,
                 )
                 s["logits"][...] = acc[:, : cfg.n_experts]
             inter = cfg.inter
-            with sc("mk_w13"):
-                ops.fp8_linear("w13", g("w13"), xa, slot, emit(qkv), amax=amax_f)
-            for c, w in DR._chunks(inter, DR.EW):
-                gt = jnp.minimum(qkv[:, c : c + w].astype(F32), cfg.swiglu_limit)
-                up = jnp.clip(
-                    qkv[:, inter + c : inter + c + w].astype(F32),
-                    -cfg.swiglu_limit,
-                    cfg.swiglu_limit,
-                )
-                s["act"][:, c : c + w] = (gt * jax.nn.sigmoid(gt) * up).astype(BF16)
-            ops.fp8_linear("w2", g("w2"), s["act"], slot, emit(s["part"]))
+
+            def shared_expert_fn():
+                with sc("mk_w13"):
+                    ops.fp8_linear("w13", g("w13"), xa, slot, emit(qkv), amax=amax_f)
+                for c, w in DR._chunks(inter, DR.EW):
+                    gt = jnp.minimum(qkv[:, c : c + w].astype(F32), cfg.swiglu_limit)
+                    up = jnp.clip(
+                        qkv[:, inter + c : inter + c + w].astype(F32),
+                        -cfg.swiglu_limit,
+                        cfg.swiglu_limit,
+                    )
+                    s["act"][:, c : c + w] = (gt * jax.nn.sigmoid(gt) * up).astype(BF16)
+                ops.fp8_linear("w2", g("w2"), s["act"], slot, emit(s["part"]))
+
+            if not moe:
+                shared_expert_fn()
         if moe:
             leased = scfg.moe_leased and not typed
             lease = SP.PoolLease(
                 pool if leased else None, 0, lease_rows if leased else 0
             )
+            is_hash = (
+                False if geom.num_hash_layers == 0 else (li < geom.num_hash_layers)
+            )
+            mw_refs = (
+                tuple(moe_w)
+                if len(moe_w) == 4
+                else tuple(SP.LayerRefs(moe_w[j::4]) for j in range(4))
+            )
             SP.moe_phase(
-                geom, li, li < geom.num_hash_layers, me,
-                SP.MoEInputs(xa, s["logits"], s["part"], hash_ids, row_valid),
-                SP.MoEWeights(
-                    SP.LayerRefs(moe_w[0::4]), SP.LayerRefs(moe_w[1::4]),
-                    SP.LayerRefs(moe_w[2::4]), SP.LayerRefs(moe_w[3::4]), moe_bias,
-                ),
+                geom, li, is_hash, me,
+                SP.MoEInputs(xa, s["logits"], s["part"], hash_ids, row_valid, amax=amax_f),
+                SP.MoEWeights(*mw_refs, moe_bias),
                 xin, lease, moe_scr, ar=ar, ar_slot=1, expert_block=eblk[0],
                 before_ar=prefetch_next, expert_held=held, expert_copy=copy,
+                shared_expert=shared_expert_fn,
             )  # fmt: skip
         else:
             prefetch_next()
