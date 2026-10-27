@@ -34,7 +34,9 @@ math and FP32 scales, including the native SWA physical-owner bounds checks.
 Prefill uses four Q/KV/SWA buffers, two output buffers, and cross-tile PV.
 Each 64-row packed-KV read is converted in four 16-row slices shared by QK/PV.
 Scale and inverse-RoPE tables stay resident only when they fit within one quarter
-of core VMEM; larger batches stream them through fixed-size buffers.
+of core VMEM; larger batches stream them through fixed-size buffers. Large tile
+metadata tables use a flat SMEM layout to avoid padding three fields to a full
+lane row.
 `dummy_metadata=True` is exclusively an all-keys-valid mathematical benchmark;
 its timing does not represent real paged prefill.
 
