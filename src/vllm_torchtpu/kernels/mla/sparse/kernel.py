@@ -975,6 +975,31 @@ def _attention_kernel(
             if return_lse:
                 _send_blse_batch(batch_start_seq_idx, bo_sem_idx, wait=True)
 
+        if tq_centroids is not None:
+            # TurboQuant: the in-register dequant of a [bkv_sz, 512] window is
+            # large straight-line code, and the unrolled pipelining loop below
+            # would emit it `batch_size` times per kernel (multi-GiB
+            # executables at prefill sizes). Walk the batch with a rolled loop
+            # instead, so the dequant body is emitted once.
+            def tq_entry(batch_idx, carry):
+                kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
+                bkv = load_bkv(bi_sem_idx, batch_idx)
+                p, l_sum, m = attention_step1_qk_softmax(
+                    load_bq(bi_sem_idx, batch_idx), bkv, kv_len
+                )
+                out = attention_step2_pv(p, bkv, l_sum)
+                bo_x2_ref.at[bo_sem_idx, batch_idx][...] = out[:, :o_dim]
+                write_blse(batch_idx, m, l_sum)
+                return carry
+
+            lax.fori_loop(0, batch_size, tq_entry, 0)
+            if capped_windows is not None:
+                fixup_capped_overflow(bi_sem_idx, bo_sem_idx)
+            start_send_bo_batch(batch_start_seq_idx, bo_sem_idx)
+            if return_lse:
+                _send_blse_batch(batch_start_seq_idx, bo_sem_idx)
+            return
+
         for batch_idx in range(batch_size):
             kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
             bkv = load_bkv(bi_sem_idx, batch_idx)
