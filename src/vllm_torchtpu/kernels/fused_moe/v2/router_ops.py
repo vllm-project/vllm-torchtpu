@@ -125,10 +125,12 @@ def _normalized_select_kernel(x_ref, w_ref, i_ref, *, topk, n, v_ref=None, norma
             idx = jnp.min(
                 jnp.where(ismax, iota.astype(jnp.float32), jnp.float32(n - 1)),
                 axis=1,
-            ).astype(jnp.int32)
+            )
+            # Keep the picked-mask dependency independent of the INT32 output cast.
+            picked = iota.astype(jnp.float32) == idx[:, None]
         else:
             idx = jnp.min(jnp.where(ismax, iota, n - 1), axis=1)
-        picked = iota == idx[:, None]
+            picked = iota == idx[:, None]
         # noaux selects with biased scores but emits unbiased weights.
         # A masked sum reads the resident tile without a dynamic lane gather.
         selected_weight = (
