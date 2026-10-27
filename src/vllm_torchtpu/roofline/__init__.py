@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU chip specifications, analytical torus collectives, and model geometry."""
+"""TPU chip specifications, collectives, geometry, and per-pass module costs."""
 
 from __future__ import annotations
 
@@ -24,6 +24,16 @@ from .collectives import (
     torus_collective_s,
 )
 from .geometry import LAYER_FAMILIES, ModelGeometry, from_hf_config
+from .hf_loader import dtypes_from_hf_config, load_hf_config
+from .modules import (
+    Dtypes,
+    ModuleCost,
+    Parallel,
+    StepShape,
+    ep_busiest_experts,
+    experts_touched,
+    pass_costs,
+)
 
 __all__ = [
     "CHIPS",
@@ -32,10 +42,19 @@ __all__ = [
     "ChipSpec",
     "Collective",
     "CollectiveTable",
+    "Dtypes",
     "ModelGeometry",
-    "collective_ici_hops",
+    "ModuleCost",
+    "Parallel",
     "SliceTopology",
+    "StepShape",
+    "dtypes_from_hf_config",
+    "ep_busiest_experts",
+    "experts_touched",
     "from_hf_config",
+    "load_hf_config",
+    "pass_costs",
+    "collective_ici_hops",
     "submesh_for_group",
     "torus_collective_s",
 ]
