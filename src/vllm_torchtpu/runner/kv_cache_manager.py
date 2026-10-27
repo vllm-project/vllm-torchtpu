@@ -74,8 +74,8 @@ from vllm_torchtpu.layers.adapter.attention import (
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilder
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.swa_cache import (
-    CompactSWASpec,
-    NativeSWASpec,
+    DeepseekV41SWASpec,
+    num_physical_blocks,
 )
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
@@ -114,7 +114,6 @@ def check_kv_caches_cover_block_ids(
     kv_cache_tensors: Iterable[KVCacheTensor],
     num_blocks: int,
     spec_for_layer: Callable[[str], KVCacheSpec],
-    physical_block_counts: dict[str, int] | None = None,
 ) -> None:
     """Check block coverage for dense caches in scheduler-page layout."""
     for kv_cache_tensor in kv_cache_tensors:
@@ -127,7 +126,7 @@ def check_kv_caches_cover_block_ids(
             kv_cache = kv_caches.get(layer_name)
             if kv_cache is None:
                 raise ValueError(f"Missing KV cache for attention layer {layer_name}")
-            required_blocks = (physical_block_counts or {}).get(layer_name, num_blocks)
+            required_blocks = num_physical_blocks(spec, num_blocks)
             if kv_cache.shape[0] < required_blocks:
                 raise ValueError(
                     f"KV cache for {layer_name} holds {kv_cache.shape[0]} "
@@ -399,26 +398,10 @@ class KVCacheManager:
             exempt_layers=ds_v4_layers,
             attention_backend=backend_cls,
         )
-        native_swa_layers = frozenset(
-            name
-            for name, spec in kv_cache_spec.items()
-            if isinstance(spec, NativeSWASpec)
-        )
-        if native_swa_layers:
-            from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
-                budget_native_swa,
-            )
-
-            retained_swa = frozenset(
-                name
-                for name in native_swa_layers
-                if not isinstance(kv_cache_spec[name], CompactSWASpec)
-            )
-            kv_cache_spec = (
-                budget_native_swa(kv_cache_spec, retained_swa)
-                if retained_swa
-                else unify_kv_cache_spec_page_size(kv_cache_spec)
-            )
+        if any(isinstance(spec, DeepseekV41SWASpec) for spec in kv_cache_spec.values()):
+            # SWA pages live in their own pools; only the scheduler's block
+            # geometry must agree across groups.
+            kv_cache_spec = unify_kv_cache_spec_page_size(kv_cache_spec)
         if (
             hma_enabled
             and has_attention
@@ -1778,11 +1761,6 @@ class KVCacheManager:
                 kv_cache_config.kv_cache_tensors,
                 kv_cache_config.num_blocks,
                 _per_layer_spec,
-                physical_block_counts={
-                    name: spec.pool_capacity
-                    for name, spec in layer_name_to_spec.items()
-                    if isinstance(spec, CompactSWASpec)
-                },
             )
 
         # Use tpu_bind_kv_cache to bind KV caches to attention layers using layer names

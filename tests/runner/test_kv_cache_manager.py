@@ -134,10 +134,20 @@ def test_check_kv_caches_cover_block_ids_rejects_short_cache(allocated_blocks):
     assert "2 layer(s) in this 131072-byte backing allocation" in str(exc.value)
 
 
-@pytest.mark.parametrize("allocated", [3, 4])
-def test_check_kv_caches_cover_compact_physical_ids(allocated):
-    spec = FullAttentionSpec(
-        block_size=16, num_kv_heads=2, head_size=128, dtype=torch.bfloat16
+@pytest.mark.parametrize("extra", [-1, 0])
+def test_check_kv_caches_cover_swa_pool_pages(extra):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.swa_cache import (
+        DeepseekV41SWASpec,
+    )
+
+    spec = DeepseekV41SWASpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.bfloat16,
+        sliding_window=128,
+        max_num_seqs=1,
+        max_in_flight_tokens=16,
     )
     tensor = KVCacheTensor(
         size=spec.page_size_bytes * 1000,
@@ -145,16 +155,13 @@ def test_check_kv_caches_cover_compact_physical_ids(allocated):
         layer_stride=spec.page_size_bytes * 1000,
         block_stride=spec.page_size_bytes,
     )
-    caches = {"swa": torch.empty((allocated, 1))}
-    if allocated < 4:
-        with pytest.raises(ValueError, match="4 physical blocks"):
-            check_kv_caches_cover_block_ids(
-                caches, [tensor], 1000, lambda _: spec, {"swa": 4}
-            )
+    # The SWA owner holds its pool's pages, not the shared block count.
+    caches = {"swa": torch.empty((spec.pool_capacity + extra, 1))}
+    if extra < 0:
+        with pytest.raises(ValueError, match=f"{spec.pool_capacity} physical"):
+            check_kv_caches_cover_block_ids(caches, [tensor], 1000, lambda _: spec)
     else:
-        check_kv_caches_cover_block_ids(
-            caches, [tensor], 1000, lambda _: spec, {"swa": 4}
-        )
+        check_kv_caches_cover_block_ids(caches, [tensor], 1000, lambda _: spec)
 
 
 def test_check_kv_caches_cover_block_ids_rejects_missing_attention_cache():

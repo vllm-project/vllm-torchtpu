@@ -479,15 +479,15 @@ class TPUWorker(WorkerBase):
             reserve_rope_companion,
         )
         from vllm_torchtpu.models.vllm.deepseek_v41.v2.swa_cache import (
-            native_swa_reservation,
+            swa_pool_bytes,
         )
 
-        swa_bytes = native_swa_reservation(self.model_runner.get_kv_cache_spec())
+        swa_bytes = swa_pool_bytes(self.model_runner.get_kv_cache_spec())
         available -= swa_bytes
         if available <= 0:
-            raise ValueError("KV budget cannot hold the compact SWA windows")
+            raise ValueError("KV budget cannot hold the DeepSeek-V4.1 SWA pools")
         if swa_bytes:
-            logger.info("Compact native SWA reservation: %d bytes", swa_bytes)
+            logger.info("DeepSeek-V4.1 SWA pool reservation: %d bytes", swa_bytes)
         return reserve_rope_companion(
             self.vllm_config,
             available,
