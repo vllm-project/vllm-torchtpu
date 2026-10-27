@@ -359,3 +359,54 @@ def test_planner_transitive_imports_exclude_vmem_kernel_and_cache():
         or Path(r).name.startswith("cache")
     }
     assert not forbidden, f"planner transitively imports forbidden modules: {forbidden}"
+
+
+def test_conftest_8_cpu_devices() -> None:
+    """Megakernel tests always run with >= 8 virtual CPU devices."""
+    import jax
+
+    assert len(jax.devices("cpu")) >= 8
+
+
+def test_mixed_pytest_session_keeps_non_megakernel_single_cpu_device(
+    tmp_path,
+    pytestconfig: pytest.Config,
+) -> None:
+    """Mixed pytest collection must keep 1 CPU device outside `tests/megakernel*`."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    outside = tmp_path / "test_outside_single_cpu.py"
+    outside.write_text(
+        "import jax\ndef test_single_cpu():\n    assert len(jax.devices('cpu')) == 1\n",
+        encoding="utf-8",
+    )
+    repo_root = Path(__file__).resolve().parents[2]
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k != "XLA_FLAGS" and not k.startswith("_VLLM_MK_SUBPROC_")
+    }
+    env["JAX_PLATFORMS"] = "cpu"
+    cmd = [sys.executable, "-m", "pytest", "-q"]
+    confcutdir = getattr(pytestconfig.option, "confcutdir", None)
+    if confcutdir:
+        cmd.append(f"--confcutdir={confcutdir}")
+    cmd.extend(
+        [
+            str(outside),
+            f"{Path(__file__).resolve()}::test_conftest_8_cpu_devices",
+        ]
+    )
+    proc = subprocess.run(
+        cmd,
+        cwd=str(repo_root),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
