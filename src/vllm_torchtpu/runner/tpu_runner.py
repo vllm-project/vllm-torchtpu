@@ -6123,6 +6123,7 @@ class TPUModelRunner(GPUModelRunner):
         initialized_count = 0
         decode_query_sizes = []
         layer_widths = []
+        target_modes = None
         with set_vllm_model_wrapper_context(
             mesh=self.mesh, vllm_config=self.vllm_config
         ):
@@ -6163,6 +6164,11 @@ class TPUModelRunner(GPUModelRunner):
                             name,
                             _DRAFT_KV_BLOCK_CAP,
                         )
+                    # Reduced-precision attention is target-only: mark the
+                    # layer before its kernels are built (native_fp8_scope).
+                    impl.native_fp8_draft = is_draft
+                    if not is_draft and target_modes is None:
+                        target_modes = impl.attention_modes
                     impl.initialize_kernel(cast(AttentionLayer, attn_layer))
                     layer_widths.append(
                         (
@@ -6228,6 +6234,16 @@ class TPUModelRunner(GPUModelRunner):
             "width_after_init, head_size) -> count: %s | draft names known=%d",
             dict(Counter(layer_widths)),
             len(draft_attn_names),
+        )
+        from vllm_torchtpu.layers.adapter import native_fp8_scope
+
+        n_draft = sum(1 for w in layer_widths if w[0] == "draft")
+        logger.info(
+            native_fp8_scope.scope_line(
+                target_modes or native_fp8_scope.OFF,
+                len(layer_widths) - n_draft,
+                n_draft,
+            )
         )
         logger.info(
             "Pre-built attention/indexing kernels for %d layers/modules. "

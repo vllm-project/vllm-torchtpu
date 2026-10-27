@@ -78,7 +78,7 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     SparseMLAKVCacheSpec,
 )
 from vllm_torchtpu.kernels.mla.v2 import kernel as mla_v2_kernel
-from vllm_torchtpu.layers.adapter import batched_rpa_decode
+from vllm_torchtpu.layers.adapter import batched_rpa_decode, native_fp8_scope
 from vllm_torchtpu.layers.adapter import cp_mla_attention as _cp_mla_attention
 from vllm_torchtpu.layers.adapter.cp_attention import (
     build_dcp_kernels as _build_dcp_kernels,
@@ -557,11 +557,13 @@ def _pallas_rpa_kernel_batched(
     kv_layout: batched_rpa_configs.KVLayout,
     decode_query_size: int = 1,
     decode_lanes: int | None = None,
+    attention_modes: native_fp8_scope.AttentionModes = native_fp8_scope.OFF,
     block_major: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by
     `PallasBatchedRPAAttentionBackendImpl`."""
     kernel_kwargs = batched_rpa_decode.kernel_kwargs(decode_lanes)
+    kernel_kwargs.update(native_fp8_scope.kernel_kwargs(attention_modes))
     if decode_query_size > 1:
         kernel_kwargs["decode_query_size"] = decode_query_size
     return _pallas_rpa_kernel_impl(
@@ -861,6 +863,12 @@ class PallasAttentionBackendImpl(AttentionImpl):
     _kernel_op_prefix: ClassVar[str] = "pallas::rpa_kernel"
     decode_query_size: int = 1
     decode_lanes: int | None = None
+    # Reduced-precision modes of this layer's batched RPA kernels; off unless
+    # the model turns them on (native_fp8_scope).
+    attention_modes: native_fp8_scope.AttentionModes = native_fp8_scope.OFF
+    # Set by the runner on a speculative draft's attention layers before
+    # their kernels are built: those layers keep full precision.
+    native_fp8_draft: bool = False
 
     # Bundled (block-major) RPA kernel entry: accepts the full KV cache bundle
     # and a dynamic scalar layer_idx. Registered under a dedicated prefix to avoid
@@ -994,6 +1002,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             if use_pcp_streaming
             else batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
         )
+        modes = native_fp8_scope.effective(self.attention_modes, self.native_fp8_draft)
         config_key = (
             self._kernel_op_prefix,
             self.sliding_window,
@@ -1006,6 +1015,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pcp_kv_layout,
             self.decode_query_size,
             self.decode_lanes,
+            modes,
             block_major,
         )
         existing = self._kernel_config_cache.get(config_key)
@@ -1049,6 +1059,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pcp_kv_layout,
             self.decode_query_size,
             self.decode_lanes,
+            modes,
             block_major,
         )
         existing = self._kernel_registry.get(registry_key)
@@ -1092,6 +1103,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 entry_kwargs["decode_query_size"] = self.decode_query_size
             if "decode_lanes" in entry_params:
                 entry_kwargs["decode_lanes"] = self.decode_lanes
+            # Entries without the argument run kernels that have no
+            # reduced-precision modes.
+            if modes.any() and "attention_modes" in entry_params:
+                entry_kwargs["attention_modes"] = modes
             if block_major:
                 if "block_major" not in entry_params:
                     raise NotImplementedError(
@@ -1446,6 +1461,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     cp_rank=self.dcp_rank,
                     kv_layout=self.kv_layout,
                     decode_query_size=self.decode_query_size,
+                    attention_modes=native_fp8_scope.effective(
+                        self.attention_modes, self.native_fp8_draft
+                    ),
                 )
             return
 
