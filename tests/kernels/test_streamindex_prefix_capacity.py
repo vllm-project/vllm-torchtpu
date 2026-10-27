@@ -83,7 +83,9 @@ module = importlib.import_module(
 def test_complete_dma_tiles_fit_physical_score_pitch(
     tokens, ratio, k, page, blocks, expected
 ):
-    sublanes = module._query_score_sublanes(tokens, ratio, k, page, blocks, 1024)
+    sublanes = module._score_sublanes(
+        (tokens + ratio - 1) // ratio, k, page, blocks, 1024
+    )
     assert sublanes * 128 == expected
     # Independent last-tile endpoint, including partial compressed groups.
     for pages in blocks:
@@ -104,6 +106,10 @@ def test_complete_dma_tiles_fit_physical_score_pitch(
         ([1, 0], [0, 8192, 8192], [0, 0, 1], False),
         ([8192, 0], [0, 8192, 8192], [0, 0, 3], False),
         ([2147483647, 0], [0, 8192, 8192], [0, 0, 1], False),
+        ([1, 0], [0, 1, 1], [-1, 0, 1], False),
+        ([1, 0], [0, 1, 1], [1, 0, 1], False),
+        ([1, 0], [0, 1, 1], [0, 2, 1], False),
+        ([1, 0], [0, 1, 1], [3, 3, 3], False),
     ],
 )
 def test_active_context_extent_guards_not_visible_floor(
@@ -128,7 +134,7 @@ class Alternate(SparseCoreTopK):
     "backend,bounded,opt_in",
     [
         (SparseCoreTopK(), True, True),
-        (Alternate(), False, True),
+        (Alternate(), True, True),
         (SparseCoreTopK(), False, False),
         (SparseCoreTopK(), False, None),
     ],
@@ -182,6 +188,7 @@ def test_real_pipeline_selects_same_ids_and_keeps_branch_groups_disjoint(
         components=preserving_components(3, opt_in),
         topk_backend=backend,
         scheduling_group_namespace=5,
+        prefix_capacity=256 if opt_in is True else None,
     )
     visible = np.arange(1, T + 1) // 4
     expected = np.where(
@@ -239,6 +246,7 @@ def capacity_probe(preserves):
             num_queries_per_block=(1, 128, 128),
             chunk_tokens=512,
             components=components,
+            prefix_capacity=1024 if preserves else None,
             scheduling_group_namespace=scheduling_group_namespace,
         )
 
@@ -322,3 +330,105 @@ def test_native_prefix_capacity_and_full_fallback_share_one_bucket():
             args[1].cpu().view(torch.uint16), cpu[1].view(torch.uint16), rtol=0, atol=0
         )
     assert len(graphs) == 1
+
+
+def dma_endpoints(lengths, starts, tile, *, batch=1, ratio=1, tokens=1, end=None):
+    meta = module.metadata.compute_metadata(
+        seq_lens=jnp.array(lengths, jnp.int32),
+        cu_q_lens=jnp.array(starts, jnp.int32),
+        start_seq_idx=0,
+        end_seq_idx=len(lengths) if end is None else end,
+        bq_sz=1,
+        bkv_sz=tile,
+        pages_per_seq=128,
+        page_size=32,
+        max_num_tokens=tokens,
+        compression_ratio=ratio,
+        static_q_len=1 if batch > 1 else None,
+        seq_batch_size=batch,
+        chunk_token_start=0,
+        chunk_tokens=tokens,
+    )
+    return (np.asarray(meta.bkv_idx[: int(np.sum(meta.num_steps))]) + 1) * tile
+
+
+def record_score_widths(monkeypatch):
+    executed = []
+
+    def pallas_call(kernel, **kwargs):
+        output = kwargs["out_shape"]
+        return lambda *args: jnp.zeros(output.shape, output.dtype)
+
+    def select(self, scores, k, **kwargs):
+        jax.debug.callback(lambda: executed.append(scores.shape[1]), ordered=True)
+        return jnp.zeros((scores.shape[0], k), jnp.int32)
+
+    # Only hardware bodies are replaced; JIT, metadata and runtime guards are real.
+    monkeypatch.setattr(module.pl, "pallas_call", pallas_call)
+    monkeypatch.setattr(SparseCoreTopK, "select", select)
+    module.streamindex_topk.clear_cache()
+    return executed
+
+
+def run_prefix_case(lengths, starts, distribution, *, ratio, capacity, blocks):
+    tokens = starts[-1]
+    result = module.streamindex_topk(
+        jnp.ones((tokens, 2, 128), jnp.bfloat16),
+        jnp.ones((tokens, 2), jnp.float32),
+        jnp.zeros((129, 8, 4, 256), jnp.uint8),
+        jnp.array(lengths, jnp.int32),
+        jnp.tile(jnp.arange(128, dtype=jnp.int32), len(lengths)),
+        jnp.array(starts, jnp.int32),
+        jnp.array(distribution, jnp.int32),
+        k=128,
+        compression_ratio=ratio,
+        num_kv_pages_per_block=blocks,
+        num_queries_per_block=(1, 128, 128),
+        decode_req_batch_size=4,
+        chunk_tokens=512,
+        prefix_capacity=capacity,
+        scheduling_group_namespace=5,
+    )
+    result.block_until_ready()
+
+
+def test_complete_mixed_dma_requires_full_pipeline(monkeypatch):
+    executed = record_score_widths(monkeypatch)
+    for context, expected_width in ((2048, 2304), (2200, 4224)):
+        for tile in (384, 256, 512):
+            np.testing.assert_array_equal(
+                dma_endpoints([context], [0, 1], tile),
+                [start + tile for start in range(0, context, tile)],
+            )
+        executed.clear()
+        run_prefix_case(
+            [context, 0],
+            [0, 2048, 2048],
+            [0, 0, 1],
+            ratio=1,
+            capacity=2048,
+            blocks=(12, 8, 16),
+        )
+        assert executed == [expected_width] * 4
+    assert dma_endpoints([2200], [0, 1], 512)[-1] == 2560
+
+
+def test_idle_decode_neighbor_widens_real_grouped_metadata(monkeypatch):
+    starts = [0, 1, 1, 1, 1, 1024]
+    lengths = [1, 4096, 0, 0, 1023]
+    np.testing.assert_array_equal(
+        dma_endpoints(lengths, starts, 256, batch=4, ratio=4, tokens=512, end=4),
+        [256, 512, 768, 1024],
+    )
+    executed = record_score_widths(monkeypatch)
+    for idle_context, expected_width in ((1024, 256), (4096, 4096)):
+        executed.clear()
+        run_prefix_case(
+            [1, idle_context, 0, 0, 1023],
+            starts,
+            [4, 4, 5],
+            ratio=4,
+            capacity=256,
+            blocks=(8, 8, 8),
+        )
+        assert executed == [expected_width] * 2
