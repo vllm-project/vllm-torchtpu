@@ -503,7 +503,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         conv_state_dtype, temporal_state_dtype = super().get_state_dtype()
-        if unified_kv_layout_enabled_for_architecture(self.model_config.architecture):
+        cache_dtype = getattr(self.cache_config, "cache_dtype", None)
+        if unified_kv_layout_enabled_for_architecture(
+            self.model_config.architecture, cache_dtype=cache_dtype
+        ):
             # Declare exactly what the pool physically stores. vLLM sizes the
             # mamba page from the dtype declared HERE and asserts the padded
             # page covers it, while the block-slot derivation budgets the page

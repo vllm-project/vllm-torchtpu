@@ -20,6 +20,7 @@ import torch
 
 from vllm_torchtpu.gdn_pool_layout import (
     QWEN_GDN_ARCHITECTURES,
+    TURBOQUANT_KV_CACHE_DTYPES,
     PooledGDNStateLayout,
     derive_pooled_gdn_state_layout,
     pooled_gdn_state_dtypes,
@@ -60,8 +61,12 @@ def unified_kv_layout_enabled(vllm_config: "VllmConfig") -> bool:
     caches, which is the only layout an attention-only model has and the only
     one the other hybrid families implement.
     """
+    cache_dtype = getattr(
+        getattr(vllm_config, "cache_config", None), "cache_dtype", None
+    )
     return unified_kv_layout_enabled_for_architecture(
-        vllm_config.model_config.architecture
+        vllm_config.model_config.architecture,
+        cache_dtype=cache_dtype,
     )
 
 
@@ -75,6 +80,7 @@ _TPU_CACHE_DTYPE_TO_TORCH_DTYPE = {
     "fp8_ds_mla": torch.uint8,
     "int8": torch.int8,
     "uint8": torch.uint8,
+    **dict.fromkeys(TURBOQUANT_KV_CACHE_DTYPES, torch.uint8),
 }
 
 _SLOT_ALIGNMENT_BYTES = 16

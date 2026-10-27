@@ -54,6 +54,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
+    get_kv_quant_mode,
 )
 from vllm.v1.worker.utils import (
     AttentionGroup,
@@ -187,7 +188,7 @@ def _warn_if_kv_cache_is_padded(
     )
     actual = math.prod(page_shape) * dtype.itemsize
     unpadded = block_size * 2 * num_kv_heads * head_size * dtype.itemsize
-    if actual == unpadded:
+    if actual <= unpadded:
         return
     logger.warning_once(
         "KV cache pages are %.2fx larger than num_kv_heads=%d at "
@@ -225,6 +226,7 @@ class KVCacheManager:
         )
         backend_cls = TpuPlatform._find_non_ssm_backend(self.runner.vllm_config)
         block_size = self.runner.vllm_config.cache_config.block_size
+        self.runner.block_size = block_size
         cache_dtype_str = self.runner.vllm_config.cache_config.cache_dtype
 
         has_attention = any(
@@ -323,6 +325,15 @@ class KVCacheManager:
                             self.runner.kv_cache_dtype,
                         )
                     )
+                    spec_kwargs = (
+                        dict(
+                            kv_quant_mode=get_kv_quant_mode(cache_dtype_str),
+                            state_content_bytes=page_size_padded
+                            // (block_size * attn_module.num_kv_heads),
+                        )
+                        if getattr(backend_cls, "is_turboquant", False)
+                        else {}
+                    )
                     if attn_module.sliding_window is not None:
                         kv_cache_spec[layer_name] = SlidingWindowSpec(
                             block_size=block_size,
@@ -331,6 +342,7 @@ class KVCacheManager:
                             dtype=self.runner.kv_cache_dtype,
                             page_size_padded=page_size_padded,
                             sliding_window=attn_module.sliding_window,
+                            **spec_kwargs,
                         )
                     else:
                         kv_cache_spec[layer_name] = FullAttentionSpec(
@@ -339,6 +351,7 @@ class KVCacheManager:
                             head_size=attn_module.head_size,
                             dtype=self.runner.kv_cache_dtype,
                             page_size_padded=page_size_padded,
+                            **spec_kwargs,
                         )
                 elif attn_module.attn_type in (
                     AttentionType.ENCODER,

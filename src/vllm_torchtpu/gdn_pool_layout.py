@@ -78,7 +78,25 @@ def pooled_gdn_state_itemsize(dtype: object) -> int:
         raise ValueError(f"unsupported pooled GDN state dtype: {dtype}") from exc
 
 
-def unified_kv_layout_enabled_for_architecture(architecture: str | None) -> bool:
+TURBOQUANT_KV_CACHE_DTYPES = (
+    "turboquant_k8v4",
+    "turboquant_4bit_nc",
+    "turboquant_k3v4_nc",
+    "turboquant_3bit_nc",
+)
+
+
+def is_turboquant_kv_cache_dtype(cache_dtype: object) -> bool:
+    return (
+        isinstance(cache_dtype, str)
+        and cache_dtype.lower().strip() in TURBOQUANT_KV_CACHE_DTYPES
+    )
+
+
+def unified_kv_layout_enabled_for_architecture(
+    architecture: str | None,
+    cache_dtype: object = None,
+) -> bool:
     """Whether `architecture` runs on the attention-shaped unified KV pool.
 
     Split out of `platforms.tpu_block_size_utils.unified_kv_layout_enabled`
@@ -88,6 +106,8 @@ def unified_kv_layout_enabled_for_architecture(architecture: str | None) -> bool
     """
     from vllm_torchtpu import envs as tpu_envs
 
+    if is_turboquant_kv_cache_dtype(cache_dtype):
+        return False
     override = tpu_envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
     if override is not None:
         return override
