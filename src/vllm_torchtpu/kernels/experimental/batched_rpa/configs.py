@@ -212,6 +212,8 @@ class ServingConfigs:
     skip_kv_update: bool = False
     mask_invalid_v: bool | None = None
     native_fp8: NativeFp8 = NATIVE_FP8_OFF
+    # Run the DECODE softmax in base 2: log2(e) is folded into the score
+    decode_exp2: bool = False
 
     def __post_init__(self):
         if Fp8Operand.SPLIT in (self.native_fp8.qk, self.native_fp8.pv) and (
