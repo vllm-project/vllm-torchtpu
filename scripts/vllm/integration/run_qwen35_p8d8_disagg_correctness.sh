@@ -40,10 +40,14 @@ PREFILL_TP="${PREFILL_TP:-1}"
 DECODE_TP="${DECODE_TP:-2}"
 DECODE_DCP="${DECODE_DCP:-1}"
 TPU_RAIDEN_DST_SHARDS="${TPU_RAIDEN_DST_SHARDS:-${DECODE_TP}}"
-# HND needs cp_kv_cache_interleave_size == the PCP kernel page; block 384
-# gives a 128-token page, matching the interleave below.
+# HND needs cp_kv_cache_interleave_size == the PCP kernel page on both peers
+# (the page is in the Raiden layout fingerprint). Prefill block 384 gives a
+# 128-token page, matching the interleave below. The decode block is grown to
+# fit the TP2 GDN state (2304 tokens for Qwen3.5-35B), and the kernel page
+# is the largest supported size dividing it, so pin an odd multiple of 128
+# above that fit to keep its page at 128 too.
 PREFILL_BLOCK_SIZE="${PREFILL_BLOCK_SIZE:-384}"
-DECODE_BLOCK_SIZE="${DECODE_BLOCK_SIZE:-384}"
+DECODE_BLOCK_SIZE="${DECODE_BLOCK_SIZE:-2432}"
 
 PREFILL_CTRL_PORT="${PREFILL_CTRL_PORT:-27000}"
 DECODE_CTRL_PORT="${DECODE_CTRL_PORT:-28000}"
