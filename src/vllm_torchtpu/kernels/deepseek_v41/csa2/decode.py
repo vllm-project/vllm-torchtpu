@@ -530,6 +530,9 @@ def csa2_decode(
         & (row + dma_block_size > jnp.maximum(left, swa_page[:, 1, None, None]))
         & (column >= 0)
         & (column < swa_page.shape[1] - 2)
+        # A page outside the owner would DMA past it and halt the core.
+        & (physical >= 0)
+        & (physical < swa_kv.shape[0])
     )
     swa_dma = jnp.stack(
         (
