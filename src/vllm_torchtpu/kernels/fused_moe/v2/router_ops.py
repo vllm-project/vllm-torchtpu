@@ -53,13 +53,17 @@ def normalized_router_block_rows(
     has_bias: bool,
     has_hash: bool,
 ) -> int | None:
-    """Return a measured normalized-selector tile, or retain generic routing."""
+    """Return a measured normalized-selector tile, or retain generic routing.
+
+    The serving adapter widens gate logits to FP32 before calling the layer.
+    Scoring and finite-row checks support both that form and direct BF16 inputs.
+    """
     if (
         scoring_fn != "sqrtsoftplus"
         or not renormalize
         or not has_bias
         or has_hash
-        or gate.dtype != jnp.bfloat16
+        or gate.dtype not in (jnp.bfloat16, jnp.float32)
         or jax.default_backend() != "tpu"
     ):
         return None

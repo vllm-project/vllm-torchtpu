@@ -639,7 +639,7 @@ def fused_ep_moe_v2(
         # gate_l is checked too: under sigmoid/sqrtsoftplus a -inf logit scores
         # a finite 0, so replica padding would otherwise pass the score check.
         if normalized_rows is not None:
-            # Every finite BF16 logit has a finite sqrtsoftplus score.
+            # Every finite FP32/BF16 logit has a finite sqrtsoftplus score.
             row_routes = jnp.any(jnp.isfinite(gate_l), axis=-1, keepdims=True)
         else:
             row_routes = _row_routes(scores, gate_l)

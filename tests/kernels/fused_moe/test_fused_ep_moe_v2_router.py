@@ -311,7 +311,7 @@ def test_packed_top6_normalizes_unbiased_weights(case):
         {"renormalize": False},
         {"has_bias": False},
         {"has_hash": True},
-        {"dtype": jnp.float32},
+        {"dtype": jnp.float16},
         {"backend": "cpu"},
         {"chip": router_ops.pltpu.ChipVersion.TPU_V6E},
     ],
@@ -370,10 +370,13 @@ def test_normalized_selector_rejects_unsupported_tiles(topk, block_rows):
 
 
 @pytest.mark.cpu_test
-def test_normalized_route_stage_keeps_scaling_and_invalid_sentinels(monkeypatch):
+@pytest.mark.parametrize("adapter_widen", [False, True])
+def test_normalized_route_stage_keeps_scaling_and_invalid_sentinels(
+    monkeypatch, adapter_widen
+):
     """Exercise production wiring without running experts or TPU collectives."""
     import functools
-    from unittest.mock import Mock
+    from unittest.mock import Mock, patch
 
     from vllm_torchtpu.kernels.fused_moe.v2 import host, kernel, layer
 
@@ -395,6 +398,9 @@ def test_normalized_route_stage_keeps_scaling_and_invalid_sentinels(monkeypatch)
         gate = gate.at[:3].set(
             jnp.array([jnp.nan, -jnp.inf, jnp.inf], jnp.bfloat16)[:, None]
         )
+        if adapter_widen:
+            # fused_moe_ep._build_op.call passes this widened form to the layer.
+            gate = gate.astype(jnp.float32)
         bias = jnp.asarray(rng.normal(size=(384,)), dtype=jnp.float32)
         mesh = jax.sharding.Mesh(np.array(jax.devices("cpu")[:1]), ("d",))
         args = (
@@ -405,13 +411,18 @@ def test_normalized_route_stage_keeps_scaling_and_invalid_sentinels(monkeypatch)
             None,
             gate,
         )
+        selected_tiles = []
+
+        def production_tile(gate, **kwargs):
+            with patch.object(router_ops.jax, "default_backend", return_value="tpu"):
+                tile = router_ops.normalized_router_block_rows(gate, **kwargs)
+            selected_tiles.append(tile)
+            return tile
+
         outputs = []
-        for tile in (None, 288):
+        for choose_tile in (lambda *a, **kw: None, production_tile):
             layer._LAYER_SM_CACHE.clear()
-            # Bind the selected path explicitly; hardware admission is tested above.
-            monkeypatch.setattr(
-                layer, "normalized_router_block_rows", lambda *a, tile=tile, **kw: tile
-            )
+            monkeypatch.setattr(layer, "normalized_router_block_rows", choose_tile)
             outputs.append(
                 tuple(
                     np.asarray(value)
@@ -429,6 +440,7 @@ def test_normalized_route_stage_keeps_scaling_and_invalid_sentinels(monkeypatch)
                     )
                 )
             )
+        assert selected_tiles and all(tile == 288 for tile in selected_tiles)
         (old_wire, old_weights, old_payload), (wire, weights, payload) = outputs
         np.testing.assert_array_equal(wire, old_wire)
         np.testing.assert_array_equal(payload, old_payload)
@@ -460,3 +472,36 @@ def test_packed_top6_tpu_lowering_matches_numpy():
     )(jnp.asarray(biased), jnp.asarray(raw))
     np.testing.assert_array_equal(indices, expected_ids)
     np.testing.assert_allclose(weights, expected_weights, rtol=2e-6, atol=1e-6)
+
+
+@pytest.mark.cpu_test
+def test_fp32_sqrtsoftplus_validity_matches_generic_row_check():
+    """FP32 admission must preserve invalid rows without rounding logits to BF16."""
+    from vllm_torchtpu.kernels.fused_moe.v2.layer import _apply_scoring_fn, _row_routes
+
+    rng = np.random.default_rng(47)
+    bits = rng.integers(0, 2**32, (288, 384), dtype=np.uint32)
+    values = bits.view(np.float32)
+    extremes = np.array(
+        [
+            np.finfo(np.float32).max,
+            -np.finfo(np.float32).max,
+            0,
+            -100,
+            np.nan,
+            np.inf,
+            -np.inf,
+            np.finfo(np.float32).tiny,
+        ],
+        dtype=np.float32,
+    )
+    values[:8] = extremes[:, None]
+    values[8:16] = np.nan
+    values[8:16, 383] = extremes
+    with jax.default_device(jax.devices("cpu")[0]):
+        gate = jnp.asarray(values)
+        scores = _apply_scoring_fn(gate, "sqrtsoftplus")
+        original = _row_routes(scores, gate)
+        simplified = jnp.any(jnp.isfinite(gate), axis=-1, keepdims=True)
+        np.testing.assert_array_equal(simplified, original)
+        assert np.isfinite(np.asarray(scores)[0]).all()
