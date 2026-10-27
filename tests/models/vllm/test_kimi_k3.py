@@ -1792,6 +1792,43 @@ def test_attention_residual_with_precomputed_inv_rms_matches_reference(
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_block_inv_rms_dynamic_trace_uses_empty_like() -> None:
+    torch.manual_seed(43)
+    num_res_blocks, hidden, eps = 4, 64, 1e-5
+    module = _attention_residual_stub(hidden=hidden, eps=eps)
+    graphs = []
+
+    def capture(graph, _inputs):
+        graphs.append(graph)
+        return graph.forward
+
+    def step(hidden_states: torch.Tensor) -> torch.Tensor:
+        block_residuals = torch.empty_like(
+            hidden_states.unsqueeze(0).expand(num_res_blocks, -1, -1)
+        )
+        block_inv_rms = torch.empty_like(
+            hidden_states[:, 0].unsqueeze(0).expand(num_res_blocks, -1),
+            dtype=torch.float32,
+        )
+        block_residuals = torch.select_scatter(block_residuals, hidden_states, 0, 0)
+        curr_inv_rms = torch.rsqrt(hidden_states.float().pow(2).mean(-1) + eps)
+        block_inv_rms = torch.select_scatter(block_inv_rms, curr_inv_rms, 0, 0)
+        return module(
+            hidden_states,
+            block_residuals[:1].reshape(-1, hidden),
+            block_inv_rms[:1],
+        )
+
+    x = torch.randn(8, hidden, dtype=torch.bfloat16)
+    mark_dynamic(x, 0)
+    torch._dynamo.reset()
+    compiled = torch.compile(step, backend=capture, fullgraph=True, dynamic=False)
+    out = compiled(x)
+    assert out.shape == (8, hidden)
+    targets = [n.target for n in graphs[0].graph.nodes if n.op == "call_function"]
+    assert torch.ops.aten.empty.memory_format not in targets
+
+
 @pytest.mark.parametrize("sequence_parallel", [False, True])
 def test_chip_shared_expert_matches_full_projection(sequence_parallel):
     """Pair TP reproduces a full FFN and returns the owner's token slice."""

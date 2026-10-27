@@ -311,15 +311,12 @@ class KimiModel(nn.Module):
                 else hidden_states[:0, :]
             )
             block_inv_rms = (
-                torch.empty(
-                    (num_res_blocks, hidden_states.shape[0]),
+                torch.empty_like(
+                    hidden_states[:, 0].unsqueeze(0).expand(num_res_blocks, -1),
                     dtype=torch.float32,
-                    device=hidden_states.device,
                 )
                 if num_res_blocks > 0
-                else hidden_states.new_empty(
-                    (0, hidden_states.shape[0]), dtype=torch.float32
-                )
+                else hidden_states[:0, 0].unsqueeze(0).to(torch.float32)
             )
         else:
             block_residuals = None

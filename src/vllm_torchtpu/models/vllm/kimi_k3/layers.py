@@ -266,10 +266,7 @@ class AttentionResidual(nn.Module):
             v_blocks = block_residuals.float()
         v_prefix = prefix_sum.float()
         if block_inv_rms is not None:
-            inv_b = block_inv_rms.float()
-            if inv_b.ndim == 2 and inv_b.shape != v_blocks.shape[:2]:
-                inv_b = inv_b.transpose(0, 1)
-            inv_blocks = inv_b.reshape(v_blocks.shape[:2])
+            inv_blocks = block_inv_rms.transpose(0, 1).float()
         else:
             inv_blocks = torch.rsqrt(v_blocks.pow(2).mean(-1) + self.eps)
         inv_prefix = torch.rsqrt(v_prefix.pow(2).mean(-1) + self.eps)
