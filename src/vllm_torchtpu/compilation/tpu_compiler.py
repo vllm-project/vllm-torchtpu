@@ -35,7 +35,7 @@ from vllm.config import VllmConfig
 from vllm.config.utils import Range
 
 from vllm_torchtpu import envs, utils
-from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.compilation import shape_variants, transforms
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -343,6 +343,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
     # The MTP KV-only pass registers its cache-write op here.
     "vllm_torchtpu/spec_decode/mtp_kv_only.py",
+    "vllm_torchtpu/compilation/transforms.py",
 )
 
 
@@ -820,6 +821,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         # and vLLM keeps its own reference to `graph`. Only the output node
         # moves, so the placeholder signature is unaffected.
         graph = copy.deepcopy(graph)
+        transforms.apply_microbatch_pass(graph, example_inputs, size)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
         caching = (
@@ -939,6 +941,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         # Same deepcopy + output-tuple rewrite as `compile`, so the graph the
         # artifact is checked against is shaped the way it was when saved.
         graph = copy.deepcopy(graph)
+        transforms.apply_microbatch_pass(graph, example_inputs, size)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
         compiled_fn = self._replay(path, graph, was_wrapped)

@@ -299,6 +299,8 @@ if TYPE_CHECKING:
     TPU_SAMPLER_GRAPH_RNG: bool = True
     TPU_FP8_LINEAR_PALLAS_SITES: str = "q_b_proj,self_attn.o_proj,mlp.gate_up_proj"
     TPU_SAMPLER_VERIFY_TRIM: bool = False
+    TPU_QWEN35_MICROBATCH_GROUPS: int = 0
+    TPU_QWEN35_MICROBATCH_MIN_TOKENS: int = 1024
 
 
 def env_with_choices(
@@ -1728,6 +1730,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Load remote KV before the first forward, not in a no-forward step.
     "TPU_RAIDEN_INLINE_LOAD": env_bool("TPU_RAIDEN_INLINE_LOAD", default=False),
+    # Compilation transforms.microbatch knobs for GLM-5.2 and general models.
+    "TPU_TOKEN_MICROBATCHES": env_nonnegative_int("TPU_TOKEN_MICROBATCHES", 0),
+    "TPU_MICROBATCH_MIN_TOKENS": env_int("TPU_MICROBATCH_MIN_TOKENS", 1024),
     # Comma-separated dot-bounded module prefix names to quantize to FP8 on load.
     # Examples: QUANTIZE_ON_LOAD_PREFIXES="self_attn,shared_experts,layers.0.mlp"
     "QUANTIZE_ON_LOAD_PREFIXES": lambda: [
@@ -2065,6 +2070,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_FP8_LINEAR_PALLAS_SITES": env_str(
         "TPU_FP8_LINEAR_PALLAS_SITES",
         "q_b_proj,self_attn.o_proj,mlp.gate_up_proj",
+    ),
+    # Number of token microbatch groups for Qwen3.5 / Qwen3Next via
+    # `transforms.microbatch` (0 or 1 = off; 2 = 2-way microbatching).
+    "TPU_QWEN35_MICROBATCH_GROUPS": env_int("TPU_QWEN35_MICROBATCH_GROUPS", 0),
+    "TPU_QWEN35_MICROBATCH_MIN_TOKENS": env_int(
+        "TPU_QWEN35_MICROBATCH_MIN_TOKENS", 1024
     ),
 }
 

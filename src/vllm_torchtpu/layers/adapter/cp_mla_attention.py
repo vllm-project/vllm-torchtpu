@@ -40,7 +40,7 @@ import jax.numpy as jnp
 import torch
 from torch_tpu._internal import pallas
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import envs, transforms
 from vllm_torchtpu.distributed.dcp import get_dcp_group
 from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
 from vllm_torchtpu.kernels.lse_rescale import lse_rescale_quantize
@@ -297,38 +297,35 @@ def _merge_chunked(
     multiply are TensorCore work, so chunk `k`'s reduce-scatter can run under
     chunk `k + 1`'s gather and multiply instead of after all of them.
     """
-    step = output.shape[0] // chunks
     if _lse_gathered_once(output.shape[0]):
         return _merge_chunked_lse_gathered(
             output, lse, group, chunks, rs_dtype, vspace=vspace
         )
+    use_barrier = not bool(envs.TPU_DCP_MLA_MERGE_PIECES)
     if envs.TPU_DCP_MERGE_RS_BF16 or envs.TPU_DCP_MERGE_WEIGHTED_HM or vspace:
         # `cp_lse_ag_out_rs` op for op, except the scatter-sum's wire dtype
         # (RS_BF16) and/or the heads-major operand (WEIGHTED_HM).
         lse_f32 = lse.to(torch.float32)
-        pieces: list[torch.Tensor] = []
-        for c in range(chunks):
-            pieces.append(
-                _weighted_reduce_scatter(
-                    output[c * step : (c + 1) * step],
-                    lse_f32[c * step : (c + 1) * step],
-                    _gather_lse(lse_f32[c * step : (c + 1) * step], group),
-                    group,
-                    rs_dtype,
-                    vspace=vspace,
-                )
+        with transforms.microbatch(
+            min_len=envs.TPU_DCP_MERGE_CHUNKED_MIN_TOKENS,
+            groups=chunks,
+            barrier=use_barrier,
+        ):
+            lses = _gather_lse(lse_f32, group)
+            return _weighted_reduce_scatter(
+                output,
+                lse_f32,
+                lses,
+                group,
+                rs_dtype,
+                vspace=vspace,
             )
-        return torch.cat(pieces, dim=0)
-    pieces = [
-        cp_lse_ag_out_rs(
-            output[c * step : (c + 1) * step],
-            lse[c * step : (c + 1) * step],
-            group,
-            rs_dtype=rs_dtype,
-        )
-        for c in range(chunks)
-    ]
-    return torch.cat(pieces, dim=0)
+    with transforms.microbatch(
+        min_len=envs.TPU_DCP_MERGE_CHUNKED_MIN_TOKENS,
+        groups=chunks,
+        barrier=use_barrier,
+    ):
+        return cp_lse_ag_out_rs(output, lse, group, rs_dtype=rs_dtype)
 
 
 def _lse_gathered_once(num_tokens: int) -> bool:
@@ -492,35 +489,37 @@ def _merge_chunked_lse_gathered(
     bit what the chunk's own gather returned, and the per-row merge arithmetic
     is unchanged.
     """
-    step = output.shape[0] // chunks
     lse_f32 = lse.to(torch.float32)
-    # No token-count test here: torch traces a compile range per graph, and a
-    # comparison it cannot decide over the range specializes the graph
-    # (ShapeSpecializationError on the mirror). MIN_TOKENS gates the kernel
-    # pieces (JAX, static shapes) only.
+    use_barrier = not bool(envs.TPU_DCP_MLA_MERGE_PIECES)
     if envs.TPU_DCP_MLA_MERGE_PIECES >= 2:
-        # Chunk 0's rows alone, then the rest: chunk 0's reduce-scatter need
-        # not wait for every chunk's lse (TPU_DCP_MLA_MERGE_PIECES=2). The
-        # same rows, so the same gathered values.
-        head = _gather_lse(lse_f32[:step], group)
-        rest = _gather_lse(lse_f32[step:], group)
-        rows = [head] + [rest[:, (c - 1) * step : c * step] for c in range(1, chunks)]
-    else:
-        gathered = _gather_lse(lse_f32, group)
-        rows = [gathered[:, c * step : (c + 1) * step] for c in range(chunks)]
-    pieces: list[torch.Tensor] = []
-    for c in range(chunks):
-        pieces.append(
-            _weighted_reduce_scatter(
-                output[c * step : (c + 1) * step],
-                lse_f32[c * step : (c + 1) * step],
-                rows[c],
+        with transforms.microbatch(
+            min_len=envs.TPU_DCP_MERGE_CHUNKED_MIN_TOKENS,
+            groups=chunks,
+            barrier=use_barrier,
+        ):
+            lses = _gather_lse(lse_f32, group)
+            return _weighted_reduce_scatter(
+                output,
+                lse_f32,
+                lses,
                 group,
                 rs_dtype,
                 vspace=vspace,
             )
+    gathered_t = _gather_lse(lse_f32, group).transpose(0, 1)
+    with transforms.microbatch(
+        min_len=envs.TPU_DCP_MERGE_CHUNKED_MIN_TOKENS,
+        groups=chunks,
+        barrier=use_barrier,
+    ):
+        return _weighted_reduce_scatter(
+            output,
+            lse_f32,
+            gathered_t.transpose(0, 1),
+            group,
+            rs_dtype,
+            vspace=vspace,
         )
-    return torch.cat(pieces, dim=0)
 
 
 def _fake_lse_rescale_quantize(
