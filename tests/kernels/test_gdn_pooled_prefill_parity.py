@@ -191,6 +191,7 @@ def _benchmark_pooled_five(pool, qkv, b, a, conv_weight, conv_bias, a_log, dt_bi
             d_v=BENCH_D_V,
             kernel_size=BENCH_KERNEL_SIZE,
             pool_block_tokens=BENCH_MANAGER_TOKENS,
+            conv_state_dtype=jnp.bfloat16,
         )
         return state_pool, output
 

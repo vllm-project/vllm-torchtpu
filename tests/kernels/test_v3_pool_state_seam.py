@@ -13,11 +13,12 @@
 # limitations under the License.
 """GDN V3 pooled state seam: plan math, byte compatibility, equivalence.
 
-`TestV3StateSourcePlan` and the source-hygiene test are pure Python/CPU.
-The remaining classes execute Pallas kernels and run on TPU (same gating
+`TestV3StateSourcePlan`, `TestPooledStateOracles` and the source-hygiene test
+run on CPU. The remaining classes execute Pallas kernels and run on TPU (same gating
 as test_pool_adapters.py).
 """
 
+import inspect
 import pathlib
 
 import jax
@@ -59,9 +60,39 @@ def _plan(pool=None, **overrides):
         d_k=D_K,
         d_v=D_V,
         kernel_size=KERNEL_SIZE,
+        conv_state_dtype=jnp.bfloat16,
     )
     kwargs.update(overrides)
     return pool_adapters.v3_state_source(pool, **kwargs)
+
+
+def _pack_bf16_ssm(state):
+    # The v3 VMEM view pairs adjacent logical rows at d_v lanes, not adjacent
+    # elements at the carrier's wider lane count.
+    words = state.reshape(state.shape[0], -1, 2, D_V).view(jnp.uint16)
+    words = words.astype(jnp.uint32)
+    return words[:, :, 0, :] | (words[:, :, 1, :] << 16)
+
+
+def _unpack_bf16_ssm(words, shape):
+    halves = jnp.stack(
+        [(words & 0xFFFF).astype(jnp.uint16), (words >> 16).astype(jnp.uint16)],
+        axis=-2,
+    )
+    return halves.view(jnp.bfloat16).reshape(shape)
+
+
+def _assert_state_signal(actual, expected):
+    actual, expected = np.asarray(actual, np.float32), np.asarray(expected, np.float32)
+    # Unit-scale inputs keep the output/SSM signal well above the absolute
+    # floor. A norm bound also rejects zero tensors regardless of near-zero
+    # individual elements. 2% covers BF16 state-store rounding, not missing state.
+    assert np.sqrt(np.mean(expected.astype(np.float64) ** 2)) > 2e-3
+    np.testing.assert_allclose(actual, expected, rtol=2e-2, atol=2e-4)
+    relative_l2 = np.linalg.norm((actual - expected).ravel()) / np.linalg.norm(
+        expected.ravel()
+    )
+    assert relative_l2 < 2e-2, relative_l2
 
 
 class TestV3StateSourcePlan:
@@ -109,6 +140,60 @@ class TestV3StateSourcePlan:
     def test_conv_region_straddling_kernel_blocks_rejected(self):
         with pytest.raises(NotImplementedError):
             _plan(conv_tok0=KBS - 8)
+
+    @pytest.mark.parametrize("conv_dtype", [jnp.bfloat16, jnp.float32])
+    def test_conv_storage_is_explicit(self, conv_dtype):
+        plan = _plan(conv_state_dtype=conv_dtype, conv_ntok=32)
+        assert plan.conv.view_dtype == jnp.dtype(conv_dtype)
+        signature = inspect.signature(pool_adapters.v3_state_source)
+        assert (
+            signature.parameters["conv_state_dtype"].default is inspect.Parameter.empty
+        )
+
+    def test_unsupported_conv_dtype_is_actionable(self):
+        with pytest.raises(NotImplementedError, match="bfloat16 or float32"):
+            _plan(conv_state_dtype=jnp.float16)
+
+
+class TestPooledStateOracles:
+    def test_bf16_pairs_have_independent_word_order(self):
+        # Each logical row has a different bit pattern. Compute each expected
+        # word from its two source coordinates, independently of the reshape.
+        bits = (np.arange(4 * D_V, dtype=np.uint16) + 0x3C00).reshape(1, 4, D_V)
+        state = jnp.asarray(bits).view(jnp.bfloat16)
+        packed = np.asarray(_pack_bf16_ssm(state))
+        expected = np.empty((1, 2, D_V), np.uint32)
+        for row in range(2):
+            for lane in range(D_V):
+                expected[0, row, lane] = int(bits[0, 2 * row, lane]) | (
+                    int(bits[0, 2 * row + 1, lane]) << 16
+                )
+        np.testing.assert_array_equal(packed, expected)
+        restored = np.asarray(_unpack_bf16_ssm(jnp.asarray(packed), state.shape))
+        np.testing.assert_array_equal(restored.view(np.uint16), bits)
+        # The former flat BF16 scatter has a different byte stream.
+        with pytest.raises(AssertionError):
+            np.testing.assert_array_equal(packed.view(np.uint16).ravel(), bits.ravel())
+
+    @pytest.mark.parametrize(
+        "fault", ["zero_output", "zero_ssm", "permuted", "perturbed"]
+    )
+    def test_comparison_rejects_bad_signal(self, fault):
+        expected = np.linspace(-0.7, 0.9, 1024, dtype=np.float32).reshape(8, 128)
+        if fault.startswith("zero"):
+            actual = np.zeros_like(expected)
+        elif fault == "permuted":
+            actual = expected[::-1]
+        else:
+            actual = expected + 0.05
+        with pytest.raises(AssertionError):
+            _assert_state_signal(actual, expected)
+
+    def test_fp32_surviving_rows_reject_bf16_narrowing(self):
+        seed = (np.arange(2 * DIM, dtype=np.float32) / 129 + 0.00031).reshape(2, DIM)
+        narrowed = np.asarray(jnp.asarray(seed, jnp.bfloat16), np.float32)
+        with pytest.raises(AssertionError):
+            np.testing.assert_allclose(narrowed, seed, rtol=1e-6, atol=1e-7)
 
 
 def test_v3_kernel_package_stays_pool_agnostic():
@@ -612,10 +697,7 @@ class TestPooledCallerV3:
         # load/store_state_region pack bf16 pairs into uint32 in VMEM, which
         # differs from gather/scatter_region, so we manually pack/unpack bf16
         # into uint32 outside rather than passing the bf16 array directly.
-        rec_u16 = (
-            recurrent_bf16.reshape(n, -1, 2, D_V).view(jnp.uint16).astype(jnp.uint32)
-        )
-        recurrent_u32 = rec_u16[:, :, 0, :] | (rec_u16[:, :, 1, :] << 16)
+        recurrent_u32 = _pack_bf16_ssm(recurrent_bf16)
         pool = pool_adapters.scatter_region(
             pool,
             recurrent_u32,
@@ -624,6 +706,43 @@ class TestPooledCallerV3:
             ntok=ssm_ntok,
             split=SPLIT,
         )
+        # Read the seeded bytes through the kernel's actual typed VMEM load,
+        # before recurrence can overwrite them. Gather/unpack alone is not a
+        # validation of the v3 consumer layout.
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+
+        from vllm_torchtpu.kernels.gdn.v3.vmem_ldst import load_state_region
+
+        plan = gdn_attention._build_v3_pool_state_plan(
+            pool,
+            conv_dim=DIM,
+            n_v=N_V,
+            d_k=D_K,
+            d_v=D_V,
+            kernel_size=KERNEL_SIZE,
+            pool_block_tokens=SPLIT * KBS,
+            qk_pair_layout=False,
+            recurrent_state_dtype=jnp.bfloat16,
+            conv_state_dtype=jnp.bfloat16,
+        )
+        region = plan.recurrent
+
+        def load(slot_ref, out_ref):
+            out_ref[...] = load_state_region(slot_ref, region, (N_V, D_K, D_V))
+
+        read = pl.pallas_call(
+            load,
+            out_shape=jax.ShapeDtypeStruct((N_V, D_K, D_V), jnp.bfloat16),
+            compiler_params=pltpu.CompilerParams(),
+        )
+        for slot in range(n):
+            start = (slot + 1) * SPLIT
+            loaded = read(pool[start : start + region.nblocks, : region.nrows])
+            np.testing.assert_array_equal(
+                np.asarray(loaded), np.asarray(recurrent_bf16[slot])
+            )
+
         kwargs = _rand_inputs(42, n) | dict(
             query_start_loc=jnp.arange(n + 1),
             distribution=jnp.array([n, n, n], dtype=jnp.int32),
@@ -656,6 +775,7 @@ class TestPooledCallerV3:
             kernel_size=KERNEL_SIZE,
             pool_block_tokens=SPLIT * KBS,
             recurrent_state_dtype=jnp.bfloat16,
+            conv_state_dtype=jnp.bfloat16,
         )
         pooled_ssm_u32 = pool_adapters.gather_region(
             new_pool,
@@ -666,14 +786,7 @@ class TestPooledCallerV3:
             out_dtype=jnp.uint32,
             out_lanes=D_V,
         )
-        pooled_u16 = jnp.stack(
-            [
-                (pooled_ssm_u32 & 0xFFFF).astype(jnp.uint16),
-                (pooled_ssm_u32 >> 16).astype(jnp.uint16),
-            ],
-            axis=-2,
-        )
-        pooled_ssm = pooled_u16.view(jnp.bfloat16).reshape(n, N_V, D_K, D_V)
+        pooled_ssm = _unpack_bf16_ssm(pooled_ssm_u32, recurrent_bf16.shape)
 
         np.testing.assert_allclose(
             np.asarray(pooled_out), np.asarray(dense_out), rtol=5e-2, atol=5e-2
@@ -684,6 +797,176 @@ class TestPooledCallerV3:
             rtol=5e-2,
             atol=5e-2,
         )
+
+    @pytest.mark.parametrize("conv_dtype", [jnp.bfloat16, jnp.float32])
+    @pytest.mark.parametrize("ssm_dtype", [jnp.bfloat16, jnp.float32])
+    def test_state_dtypes_decode_then_long_prefill(
+        self, monkeypatch, conv_dtype, ssm_dtype
+    ):
+        from vllm_torchtpu import envs
+        from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
+        from vllm_torchtpu.layers.core import gdn_attention
+
+        # These are lazy module attributes; restore absence as well as values.
+        monkeypatch.setitem(vars(envs), "TPU_GDN_CONV_QK_PAIR_LAYOUT", False)
+        rng = np.random.default_rng(20261008)
+        idx = jnp.array([1], jnp.int32)
+        conv = jnp.asarray(
+            (np.arange(3 * DIM, dtype=np.float32) / 129 + 0.00031).reshape(1, 3, DIM),
+            conv_dtype,
+        )
+        # Bound the conv signal without discarding its FP32-only low bits.
+        conv = conv / jnp.asarray(32, conv_dtype)
+        rec = jnp.asarray(rng.normal(0, 0.25, (1, N_V, D_K, D_V)), ssm_dtype)
+        layout = derive_pooled_gdn_state_layout(
+            ssm_bytes=rec.size * jnp.dtype(ssm_dtype).itemsize,
+            conv_bytes=conv.size * jnp.dtype(conv_dtype).itemsize,
+            token_bytes=4 * LANES,
+        )
+        # A manager-grained FP8 carrier with 256 physical lanes, d_v=128.
+        page = ((layout.required_tokens + KBS - 1) // KBS) * KBS
+        raw = np.full((3, page, 1, 4, LANES), 0x35, np.uint8)
+        pool = jax.lax.bitcast_convert_type(jnp.asarray(raw), jnp.float8_e4m3fn)
+        ssm_rows = (
+            _pack_bf16_ssm(rec)
+            if ssm_dtype == jnp.bfloat16
+            else rec.reshape(1, -1, D_V)
+        )
+        pool = pool_adapters.scatter_region(
+            pool, ssm_rows, idx, tok0=0, ntok=layout.ssm_tokens
+        )
+        conv_rows = conv.reshape(1, -1, LANES)
+        capacity = layout.conv_tokens * 4 // jnp.dtype(conv_dtype).itemsize
+        conv_rows = jnp.pad(
+            conv_rows, ((0, 0), (0, capacity - conv_rows.shape[1]), (0, 0))
+        )
+        pool = pool_adapters.scatter_region(
+            pool, conv_rows, idx, tok0=layout.ssm_tokens, ntok=layout.conv_tokens
+        )
+
+        def read_states(p):
+            words = pool_adapters.gather_region(
+                p,
+                idx,
+                tok0=0,
+                ntok=layout.ssm_tokens,
+                out_dtype=jnp.uint32 if ssm_dtype == jnp.bfloat16 else jnp.float32,
+                out_lanes=D_V,
+            )
+            r = (
+                _unpack_bf16_ssm(words, rec.shape)
+                if ssm_dtype == jnp.bfloat16
+                else words.reshape(rec.shape)
+            )
+            c = pool_adapters.gather_region(
+                p,
+                idx,
+                tok0=layout.ssm_tokens,
+                ntok=layout.conv_tokens,
+                out_dtype=conv_dtype,
+            )[:, : 3 * DIM // LANES].reshape(conv.shape)
+            return c, r
+
+        initial_conv, initial_rec = read_states(pool)
+        np.testing.assert_array_equal(np.asarray(initial_conv), np.asarray(conv))
+        np.testing.assert_array_equal(np.asarray(initial_rec), np.asarray(rec))
+        untouched = np.asarray(pool)[[0, 2]].view(np.uint8).copy()
+        weight = jnp.asarray(rng.normal(0, 0.25, (DIM, 1, 4)), jnp.bfloat16)
+        bias = jnp.asarray(rng.normal(0, 0.25, (DIM,)), jnp.bfloat16)
+        a_log = jnp.zeros((N_V,), jnp.float32)
+        dt_bias = jnp.full((N_V,), -6, jnp.float32)
+
+        def args(qkv, b, a, context):
+            count = len(qkv)
+            return dict(
+                b=b,
+                a=a,
+                conv_weight=weight,
+                conv_bias=bias,
+                a_log=a_log,
+                dt_bias=dt_bias,
+                query_start_loc=jnp.array([0, count], jnp.int32),
+                distribution=jnp.array(
+                    [1, 1, 1] if count == 1 else [0, 1, 1], jnp.int32
+                ),
+                seq_lens=jnp.array([context + count], jnp.int32),
+                n_kq=N_KQ,
+                n_v=N_V,
+                d_k=D_K,
+                d_v=D_V,
+                kernel_size=KERNEL_SIZE,
+            )
+
+        @jax.jit
+        def dense(c, r, qkv, b, a, context):
+            return wrapper.fused_conv1d_gdn(
+                qkv=qkv,
+                conv_state=c,
+                recurrent_state=r,
+                state_indices=jnp.array([0], jnp.int32),
+                **args(qkv, b, a, context),
+            )
+
+        @jax.jit
+        def pooled(p, qkv, b, a, context):
+            kw = args(qkv, b, a, context)
+            kw["A_log"] = kw.pop("a_log")
+            return gdn_attention.run_jax_gdn_attention_pooled_local(
+                mixed_qkv=qkv,
+                recurrent_state=p,
+                state_indices=idx,
+                pool_block_tokens=page,
+                recurrent_state_dtype=ssm_dtype,
+                conv_state_dtype=conv_dtype,
+                **kw,
+            )
+
+        # Dense recurrence is FP32; the pooled seam rounds only at state store.
+        dense_conv, dense_rec = conv.astype(jnp.float32), rec.astype(jnp.float32)
+        context = 256
+        for step, count in enumerate((1, 4096, 1)):
+            qkv = jnp.asarray(rng.normal(size=(count, DIM)), jnp.bfloat16)
+            b = jnp.asarray(rng.normal(size=(count, N_V)), jnp.bfloat16)
+            a = jnp.asarray(rng.normal(size=(count, N_V)), jnp.bfloat16)
+            before_conv = np.asarray(dense_conv).copy()
+            (dense_conv, dense_rec), expected = dense(
+                dense_conv, dense_rec, qkv, b, a, context
+            )
+            pool, actual = pooled(pool, qkv, b, a, context)
+            actual_conv, actual_rec = read_states(pool)
+            _assert_state_signal(actual, expected)
+            _assert_state_signal(actual_rec, dense_rec)
+            for reference in (expected, dense_rec):
+                reference = np.asarray(reference, np.float32)
+                for bad in (
+                    np.zeros_like(reference),
+                    np.roll(reference, 1, axis=-1),
+                    reference + 0.05,
+                ):
+                    with pytest.raises(AssertionError):
+                        _assert_state_signal(bad, reference)
+            np.testing.assert_allclose(
+                np.asarray(actual_conv, np.float32),
+                np.asarray(dense_conv),
+                rtol=1e-6,
+                atol=1e-7,
+            )
+            if step == 0:
+                # Before any prefill can overwrite history, two original rows
+                # survive exactly; narrowing FP32 to BF16 must fail this check.
+                np.testing.assert_allclose(
+                    np.asarray(actual_conv[0, :2], np.float32),
+                    before_conv[0, 1:],
+                    rtol=1e-6,
+                    atol=1e-7,
+                )
+            np.testing.assert_array_equal(
+                np.asarray(pool)[[0, 2]].view(np.uint8), untouched
+            )
+            context += count
+            # Compare the next invocation from the same stored state, avoiding
+            # conflating BF16 state-store rounding with accumulation semantics.
+            dense_rec = dense_rec.astype(ssm_dtype).astype(jnp.float32)
 
     def test_caller_matches_roundtrip(self):
         gdn_attention = pytest.importorskip("vllm_torchtpu.layers.core.gdn_attention")
@@ -724,6 +1007,7 @@ class TestPooledCallerV3:
             d_v=D_V,
             kernel_size=KERNEL_SIZE,
             pool_block_tokens=SPLIT * KBS,
+            conv_state_dtype=jnp.bfloat16,
         )
 
         np.testing.assert_allclose(
@@ -783,6 +1067,7 @@ class TestPooledCallerV3:
             kernel_size=KERNEL_SIZE,
             pool_block_tokens=split * page_size,
             recurrent_state_dtype=jnp.float32,
+            conv_state_dtype=jnp.bfloat16,
         )
         assert new_pool.shape == pool.shape
         np.testing.assert_allclose(
@@ -823,6 +1108,7 @@ class TestPooledCallerV3:
             kernel_size=KERNEL_SIZE,
             pool_block_tokens=split * page_size,
             recurrent_state_dtype=jnp.float32,
+            conv_state_dtype=jnp.bfloat16,
         )
         assert new_pool2.shape == pool.shape
         np.testing.assert_allclose(

@@ -600,6 +600,7 @@ class TestKimiLinearMlaPoolGeometry:
             d_k=self.D_K,
             d_v=self.D_V,
             kernel_size=2,
+            conv_state_dtype=jnp.bfloat16,
         )
 
         ssm = plan.recurrent
@@ -633,4 +634,5 @@ class TestKimiLinearMlaPoolGeometry:
                 d_k=self.D_K,
                 d_v=self.D_V,
                 kernel_size=self.KERNEL_SIZE,
+                conv_state_dtype=jnp.bfloat16,
             )

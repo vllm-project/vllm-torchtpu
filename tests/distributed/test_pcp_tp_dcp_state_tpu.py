@@ -67,6 +67,7 @@ def _run_state_seam():
                 pool_block_tokens=384,
                 qk_pair_layout=True,
                 recurrent_state_dtype=jnp.bfloat16,
+                conv_state_dtype=jnp.bfloat16,
             )
             plans[heads] = plan
 
@@ -244,6 +245,7 @@ def _run_fanout_state_seam():
             pool_block_tokens=384,
             qk_pair_layout=True,
             recurrent_state_dtype=jnp.bfloat16,
+            conv_state_dtype=jnp.bfloat16,
         )
         gdn = rpm.GdnHeadGeometry(
             local_key_heads=lk, local_value_heads=lv, key_head_dim=d, value_head_dim=d

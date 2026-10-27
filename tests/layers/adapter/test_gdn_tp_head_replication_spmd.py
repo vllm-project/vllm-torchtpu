@@ -299,6 +299,7 @@ def _build_spmd(devices, weights, conv, recurrent):
             d_v=HEAD_DIM,
             kernel_size=KERNEL_SIZE,
             pool_block_tokens=MANAGER_TOKENS,
+            conv_state_dtype=jnp.bfloat16,
         )
         conv_out, recurrent_out = _unpack_states(new_pool, n_v, conv_dim)
         outputs = dict(
