@@ -5999,6 +5999,7 @@ class TestTPUConnectorStats(unittest.TestCase):
             "kv_pull_time": [1200.0, 5400.0, 12000.0],
             "mb_transferred": [128.0, 256.0, 2048.0],
             "num_failed_transfers": [0, 1, 2],
+            "num_evicted_blocks": [2, 5],
         }
 
         self.metrics.observe(mock_data, engine_idx=0)
@@ -6144,6 +6145,10 @@ class TestTPUConnectorStats(unittest.TestCase):
     def test_prometheus_counter_num_failed_transfers(self):
         counter = self.metrics.counter_tpu_num_failed_transfers[0]
         assert counter._value.get() == 3.0
+
+    def test_prometheus_counter_kv_cache_evictions(self):
+        counter = self.metrics.counter_kv_cache_evictions[0]
+        assert counter._value.get() == 7.0
 
     def test_tpu_stats_aggregation_queue_lengths(self):
         stats = TpuKVConnectorStats()
@@ -8198,3 +8203,129 @@ class TestSpecSourceFenceRegisterAhead:
         assert fences == [(2, True)]
         worker.process_send_load(self._meta(c=False))
         assert fences == [(2, True), (2, True)]
+
+
+# ---------------------------------------------------------------------------
+# vllm:kv_cache_evictions: only cached blocks reused as new blocks count.
+# See `TPUConnector.bind_gpu_block_pool`.
+# ---------------------------------------------------------------------------
+
+
+class TestEvictionCounter:
+    BLOCK_SIZE = 16
+
+    @classmethod
+    def _manager(cls, enable_caching: bool = True):
+        """Returns a 3-usable-block cache manager and a connector bound to it."""
+        from vllm.utils.hashing import sha256
+        from vllm.v1.core.kv_cache_manager import KVCacheManager
+        from vllm.v1.core.kv_cache_utils import init_none_hash
+
+        init_none_hash(sha256)
+        config = _make_test_kv_cache_config()
+        config.num_blocks = 4  # 3 usable blocks; block 0 is the null block.
+        manager = KVCacheManager(
+            config,
+            max_model_len=256,
+            scheduler_block_size=cls.BLOCK_SIZE,
+            hash_block_size=cls.BLOCK_SIZE,
+            enable_caching=enable_caching,
+        )
+        connector = SimpleNamespace()
+        TPUConnector.bind_gpu_block_pool(connector, manager.block_pool)  # type: ignore[arg-type]
+        return manager, connector
+
+    @classmethod
+    def _allocate(cls, manager, request_id: str, start: int, num_blocks: int):
+        from vllm import SamplingParams
+        from vllm.utils.hashing import sha256
+        from vllm.v1.core.kv_cache_utils import get_request_block_hasher
+        from vllm.v1.request import Request
+
+        prompt = list(range(start, start + num_blocks * cls.BLOCK_SIZE))
+        request = Request(
+            request_id,
+            prompt,
+            SamplingParams(max_tokens=1),
+            None,
+            block_hasher=get_request_block_hasher(cls.BLOCK_SIZE, sha256),
+        )
+        blocks, num_hit_tokens = manager.get_computed_blocks(request)[:2]
+        assert num_hit_tokens == 0
+        assert manager.allocate_slots(request, len(prompt), 0, blocks) is not None
+        return request
+
+    @staticmethod
+    def _drain(connector) -> list[int] | None:
+        stats = TPUConnector._take_scheduler_stats(connector)  # type: ignore[arg-type]
+        return None if stats is None else stats.data["num_evicted_blocks"]
+
+    def test_counts_cached_blocks_reused_for_new_blocks(self):
+        manager, connector = self._manager()
+        manager.free(self._allocate(manager, "cached", start=0, num_blocks=2))
+        assert self._drain(connector) is None
+
+        # 1 empty block + 2 cached blocks are free; taking all 3 evicts both.
+        self._allocate(manager, "new", start=1000, num_blocks=3)
+        assert self._drain(connector) == [2]
+        # Draining resets the count.
+        assert self._drain(connector) is None
+
+    def test_invalidation_is_not_an_eviction(self):
+        manager, connector = self._manager()
+        request = self._allocate(manager, "cached", start=0, num_blocks=2)
+        block_ids = manager.get_block_ids(request.request_id)[0]
+        manager.free(request)
+
+        # As after a failed KV load: the hash is dropped, the block is not reused.
+        manager.evict_blocks({block_ids[0]})
+        assert self._drain(connector) is None
+
+        # Only the block that still holds a hash is evicted when reused.
+        self._allocate(manager, "new", start=1000, num_blocks=3)
+        assert self._drain(connector) == [1]
+
+    def test_no_evictions_without_prefix_caching(self):
+        manager, connector = self._manager(enable_caching=False)
+        manager.free(self._allocate(manager, "first", start=0, num_blocks=2))
+        self._allocate(manager, "second", start=0, num_blocks=3)
+        assert self._drain(connector) is None
+
+    def test_binding_twice_wraps_once(self):
+        manager, connector = self._manager()
+        pool = manager.block_pool
+        wrapped = (pool.get_new_blocks, pool._maybe_evict_cached_block)
+
+        TPUConnector.bind_gpu_block_pool(SimpleNamespace(), pool)  # type: ignore[arg-type]
+
+        assert (pool.get_new_blocks, pool._maybe_evict_cached_block) == wrapped
+        manager.free(self._allocate(manager, "cached", start=0, num_blocks=2))
+        self._allocate(manager, "new", start=1000, num_blocks=3)
+        assert self._drain(connector) == [2]
+
+    def test_pool_wrapped_by_someone_else_is_still_counted(self):
+        from vllm.utils.hashing import sha256
+        from vllm.v1.core.kv_cache_manager import KVCacheManager
+        from vllm.v1.core.kv_cache_utils import init_none_hash
+
+        init_none_hash(sha256)
+        config = _make_test_kv_cache_config()
+        config.num_blocks = 4
+        manager = KVCacheManager(
+            config,
+            max_model_len=256,
+            scheduler_block_size=self.BLOCK_SIZE,
+            hash_block_size=self.BLOCK_SIZE,
+        )
+        pool = manager.block_pool
+        # E.g. a test spy wrapping the instance method before the bind.
+        pool.get_new_blocks = MagicMock(wraps=pool.get_new_blocks)  # type: ignore[method-assign]
+        connector = SimpleNamespace()
+        TPUConnector.bind_gpu_block_pool(connector, pool)  # type: ignore[arg-type]
+
+        manager.free(self._allocate(manager, "cached", start=0, num_blocks=2))
+        self._allocate(manager, "new", start=1000, num_blocks=3)
+        assert self._drain(connector) == [2]
+
+    def test_without_block_pool(self):
+        assert self._drain(SimpleNamespace()) is None
