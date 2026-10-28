@@ -145,15 +145,11 @@ def derive_metadata(
     return token_to_req_indices, slot_mapping_slots, kv_slot_mapping
 
 
-def _get_packing_indices(keep, size):
-    order = jnp.nonzero(keep, size=size, fill_value=-1)[0]
-    valid = order >= 0
-    safe = jnp.where(valid, order, 0)
-    return safe, valid
-
-
-def _pack_array(x, safe, valid, default_value):
-    return jnp.where(valid, x[safe], default_value)
+def _shift_back(x: jax.Array, shift: int, fill: int) -> jax.Array:
+    """`x[i - shift]`, or `fill` where `i < shift`."""
+    n = x.shape[0]
+    shift = min(shift, n)
+    return jnp.concatenate([jnp.full((shift,), fill, x.dtype), x[: n - shift]])
 
 
 def prepare_boundary_batch(
@@ -170,48 +166,43 @@ def prepare_boundary_batch(
 
     Layout: [ decode_packed (0..K-1) | pad (K..K_aligned-1) |
     prefill_row_tiled (K_aligned..) | pad ]
+
+    Boundary tokens are packed in token order, so each one's destination is
+    computed where it stands. A prefill request's positions are consecutive, so
+    the boundary before one in its own request is `compress_ratio` tokens back;
+    requests own their compressed-KV pages, so a request's first boundary always
+    starts a new row.
     """
     num_tokens = positions.shape[0]
     max_prefill_boundary = num_tokens // compress_ratio + 1 + num_reqs
-    packed_size = num_tokens + max_prefill_boundary
 
-    # 1. Get packing indices for all boundary tokens
-    safe, valid = _get_packing_indices(is_boundary, packed_size)
+    is_prefill = is_boundary & ~is_decode_token
+    packed_index = jnp.cumsum(is_boundary.astype(jnp.int32)) - 1
 
-    # 2. Pack inputs and the decode mask
-    pos = _pack_array(positions, safe, valid, 0)
-    req = _pack_array(token_to_req_indices, safe, valid, 0)
-    kv = _pack_array(kv_slot_mapping, safe, valid, -1)
-    is_decode = _pack_array(is_decode_token, safe, valid, False)
-
-    valid_token = kv >= 0
-    is_prefill = valid_token & ~is_decode
-
-    # 3. Calculate row-tiling ONLY for prefill tokens
-    row = jnp.where(is_prefill, kv // rope_pack, -1)
-    row_shifted = jnp.roll(row, 1)
-    starts_row = (row != row_shifted) & is_prefill
-    starts_row = starts_row.at[0].set(is_prefill[0])
+    # Row-tiling ONLY for prefill tokens: a row continues when the boundary just
+    # before it in packed order is `compress_ratio` tokens back, in the same row.
+    row = jnp.where(is_prefill, kv_slot_mapping // rope_pack, -1)
+    continues_row = (_shift_back(row, compress_ratio, -1) == row) & (
+        _shift_back(packed_index, compress_ratio, -2) == packed_index - 1
+    )
+    starts_row = is_prefill & ~continues_row
 
     tile_index = jnp.cumsum(starts_row.astype(jnp.int32)) - 1
+    run_start = jax.lax.cummax(jnp.where(starts_row, packed_index, 0))
+    pos_within_tile = packed_index - run_start
 
-    index = jnp.arange(packed_size)
-    run_start = jax.lax.cummax(jnp.where(starts_row, index, 0))
-    pos_within_tile = index - run_start
-
-    # 4. Calculate alignment offset for prefill block
-    K = jnp.sum(is_decode)
+    # Alignment offset for the prefill block
+    K = jnp.sum(is_boundary & is_decode_token)
     K_aligned = ((K + 3) // 4) * 4
 
-    # 5. Combine destination indices
     prefill_size = rope_pack * max_prefill_boundary
     # Whole kernel tiles, so compress_norm_rope_store needs no padding.
     tile = compress_kernel.TILE_N
     output_size = (num_tokens + prefill_size + tile - 1) // tile * tile
 
     dest_prefill = K_aligned + tile_index * rope_pack + pos_within_tile
-    dest = jnp.where(is_decode, index, dest_prefill)
-    dest = jnp.where(valid_token, dest, output_size)
+    dest = jnp.where(is_decode_token, packed_index, dest_prefill)
+    dest = jnp.where(is_boundary, dest, output_size)
 
     # 6. Scatter to output once
     def scatter(default_val, src):
@@ -222,9 +213,9 @@ def prepare_boundary_batch(
         )
 
     return (
-        scatter(0, pos),
-        scatter(0, req),
-        scatter(-1, kv),
+        scatter(0, positions),
+        scatter(0, token_to_req_indices),
+        scatter(-1, kv_slot_mapping),
     )
 
 
