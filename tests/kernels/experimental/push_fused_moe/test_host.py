@@ -205,21 +205,12 @@ def test_segments_land_on_the_plans_slab_rows(ep, t_local, g_local, topk, skew):
         assert meta[2 * g_local + 2] == sent == counts.sum()
 
 
-def test_eplb_remap_passes_the_sentinel_through():
-    from vllm_torchtpu.kernels.experimental.push_fused_moe.layer import (
-        _remap_topk_ids,
-    )
+def test_to_slots_splits_rows_over_replicas():
+    from vllm_torchtpu.kernels.experimental.push_fused_moe.layer import _to_slots
 
-    e_logical, ep = 6, 2
-    table = np.arange(e_logical * ep, dtype=np.int32).reshape(e_logical, ep) + 100
-    ids = np.array([[0, 5, e_logical], [3, 1, -1]], np.int32)
-    for src in range(ep):
-        got = np.asarray(
-            _remap_topk_ids(jnp.asarray(ids), jnp.asarray(table), jnp.int32(src))
-        )
-        want = np.where(
-            (ids >= 0) & (ids < e_logical),
-            table[np.clip(ids, 0, None) % e_logical, src],
-            ids,
-        )
-        np.testing.assert_array_equal(got, want)
+    # Expert 0 has two copies (slots 3, 7); experts 1 and 2 one each.
+    table = np.array([[3, 7], [5, -1], [0, -1]], np.int32)
+    ids = np.array([[0, 1], [0, 2], [2, 0]], np.int32)
+    got = np.asarray(_to_slots(jnp.asarray(ids), jnp.asarray(table), jnp.int32(4)))
+    # Row r takes replica (4 + r) mod (copies of its expert).
+    np.testing.assert_array_equal(got, [[3, 5], [7, 0], [0, 3]])
