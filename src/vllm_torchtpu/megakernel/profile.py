@@ -42,6 +42,8 @@ re-labels (`<name>+overrides`, class derived) instead of silently staying
 from __future__ import annotations
 
 import dataclasses
+import functools
+import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -55,10 +57,89 @@ from .profiles.default import default_tiles
 
 # Name of the model-agnostic library default profile.
 DEFAULT_PROFILE_NAME = "default"
-# Tile rule: `(B, *, moe_tp, R) -> Tiles` for a bucket of `B` rows.
+
+
+@dataclass(frozen=True)
+class TileContext:
+    """Bucket execution context passed to a `TileRule` callable."""
+
+    B: int
+    T: int = 1
+    R: int = 8
+    moe_tp: bool = False
+    ctx: int = 2048
+    g: Any = None
+
+    @property
+    def NS(self) -> int:
+        assert self.B % self.T == 0, (self.B, self.T)
+        return self.B // self.T
+
+    def __int__(self) -> int:
+        return int(self.B)
+
+
+# Tile rule: `(tc: TileContext) -> Tiles` or `(B, *, moe_tp, R) -> Tiles`.
 TileRule = Callable[..., Tiles]
 # Fields automatically derived by `Profile.with_overrides`.
 _DERIVED_PROFILE_FIELDS = frozenset({"name", "numerics", "model_default"})
+
+
+def _compute_rule_dispatch(rule: TileRule) -> tuple[bool, tuple[str, ...]]:
+    try:
+        sig = inspect.signature(rule)
+    except (TypeError, ValueError):
+        return (True, ())
+    params = sig.parameters
+    pos_params = [
+        p
+        for p in params.values()
+        if p.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    ]
+    has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    first_is_tc = bool(
+        pos_params
+        and (
+            pos_params[0].name in ("tc", "tile_ctx", "tile_context", "context")
+            or pos_params[0].annotation
+            in (TileContext, "TileContext", "mk.TileContext")
+        )
+    )
+    takes_tc = first_is_tc or (
+        "moe_tp" not in params and "R" not in params and not has_varkw
+    )
+    extra_kws = tuple(k for k in ("T", "NS", "ctx", "g") if k in params)
+    return (takes_tc, extra_kws)
+
+
+@functools.lru_cache(maxsize=256)
+def _rule_dispatch_cached(rule: TileRule) -> tuple[bool, tuple[str, ...]]:
+    return _compute_rule_dispatch(rule)
+
+
+def _rule_dispatch(rule: TileRule) -> tuple[bool, tuple[str, ...]]:
+    """Return cached `(takes_tile_context, extra_kw_names)` for `rule`."""
+    try:
+        return _rule_dispatch_cached(rule)
+    except TypeError:
+        return _compute_rule_dispatch(rule)
+
+
+def _call_tile_rule(rule: TileRule, tc: TileContext) -> Tiles:
+    """Invoke `rule` with `TileContext` `tc` or `(B, *, moe_tp, R)`."""
+    takes_tc, extra_kws = _rule_dispatch(rule)
+    if takes_tc:
+        return rule(tc)
+    if not extra_kws:
+        return rule(tc.B, moe_tp=tc.moe_tp, R=tc.R)
+    kw: dict[str, Any] = {"moe_tp": tc.moe_tp, "R": tc.R}
+    for k in extra_kws:
+        kw[k] = getattr(tc, k)
+    return rule(tc.B, **kw)
 
 
 @dataclass(frozen=True)
@@ -168,14 +249,30 @@ class Profile:
         ref = model_default_profile(self.model)
         return None if ref is self else ref.tiles
 
-    def tiles_for(self, B: int, *, R: int, moe_tp: bool = False) -> Tiles:
-        """Return this profile's tiles for a bucket of `B` rows on `R` ranks.
+    def tiles_for(
+        self,
+        B: int | TileContext,
+        *,
+        R: int = 8,
+        moe_tp: bool = False,
+        T: int = 1,
+        ctx: int = 2048,
+        g: Any = None,
+    ) -> Tiles:
+        """Return this profile's tiles for a bucket of `B` rows (or `TileContext`).
 
         For the library default rule (`tile_rule() is None`) these are the
         tiles before build-time VMEM refinement.
         """
+        tc = (
+            B
+            if isinstance(B, TileContext)
+            else TileContext(B=int(B), T=T, R=R, moe_tp=moe_tp, ctx=ctx, g=g)
+        )
         rule = self.tile_rule()
-        return (default_tiles if rule is None else rule)(B, moe_tp=moe_tp, R=R)
+        if rule is None:
+            return default_tiles(tc.B, moe_tp=tc.moe_tp, R=tc.R)
+        return _call_tile_rule(rule, tc)
 
     def exec_for(self, base: ExecSpec, *, B: int, T: int, g: Any = None) -> ExecSpec:
         """Specialize `base` for bucket `(T, B)` under this profile.
@@ -196,7 +293,9 @@ class Profile:
         moe_tp = bool(getattr(g, "moe_tp", False)) if g is not None else False
         tiles = base.tiles
         if tiles is None and self.tile_rule() is not None:
-            tiles = self.tiles_for(B, R=base.R, moe_tp=moe_tp)
+            tiles = self.tiles_for(
+                TileContext(B=B, T=T, R=base.R, moe_tp=moe_tp, ctx=base.ctx, g=g)
+            )
         base_gather = cache_exec(base).pool_gather
         if base_gather is not False:
             pool_gather = base_gather
@@ -216,7 +315,9 @@ _MODEL_DEFAULTS: dict[str, str] = {}
 
 # Bucket grid on which a profile's tile rule is compared to its reference.
 _NUMERICS_GRID_B = range(1, MAX_BATCH_ROWS + 1)
+_NUMERICS_GRID_T = (1, 2, 4, 8)
 _NUMERICS_GRID_R = (1, 2, 4, 8, 16)
+_NUMERICS_GRID_CTX = (2048, 8192, 32768)
 
 
 def _knob(t: Tiles, key: str) -> Any:
@@ -256,7 +357,6 @@ def approx_features(profile: Profile) -> tuple[str, ...]:
         return ()
     # While the `default` profile itself is being built, its rule is the
     # library default with split pool I/O.
-    ref_tiles = default_tiles if ref is None else ref.tiles_for
     ref_rule = default_tiles if ref is None else ref.tile_rule()
     ref_fused = False if ref is None else ref.fused_pool_io
     ref_gather = False if ref is None else ref.pool_gather
@@ -265,14 +365,25 @@ def approx_features(profile: Profile) -> tuple[str, ...]:
         approx_knobs = [k for k, v in tile_numerics().items() if v == "approx"]
         for R in _NUMERICS_GRID_R:
             for moe_tp in (False, True):
-                for B in _NUMERICS_GRID_B:
-                    t = profile.tiles_for(B, moe_tp=moe_tp, R=R)
-                    d = ref_tiles(B, moe_tp=moe_tp, R=R)
-                    if t == d:
-                        continue
-                    feats.update(
-                        f"tiles.{k}" for k in approx_knobs if _knob(t, k) != _knob(d, k)
-                    )
+                for ctx in _NUMERICS_GRID_CTX:
+                    for T in _NUMERICS_GRID_T:
+                        for B in _NUMERICS_GRID_B:
+                            if B % T != 0:
+                                continue
+                            tc = TileContext(B=B, T=T, R=R, moe_tp=moe_tp, ctx=ctx)
+                            t = profile.tiles_for(tc)
+                            d = (
+                                default_tiles(B, moe_tp=moe_tp, R=R)
+                                if ref is None
+                                else ref.tiles_for(tc)
+                            )
+                            if t == d:
+                                continue
+                            feats.update(
+                                f"tiles.{k}"
+                                for k in approx_knobs
+                                if _knob(t, k) != _knob(d, k)
+                            )
     if (
         profile.fused_pool_io != ref_fused
         and POOL_IO_NUMERICS["fused_pool_io"] == "approx"
@@ -390,6 +501,7 @@ __all__ = [
     "DEFAULT_PROFILE",
     "Baseline",
     "Profile",
+    "TileContext",
     "TileRule",
     "approx_features",
     "get_profile",
