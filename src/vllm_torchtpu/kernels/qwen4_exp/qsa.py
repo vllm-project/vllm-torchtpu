@@ -4,6 +4,8 @@
 import jax
 import jax.numpy as jnp
 
+from vllm_torchtpu import envs
+
 from .rounding import bf16
 
 
@@ -117,6 +119,38 @@ def quantize_kv(value, scale):
     return jnp.clip(encoded, -448, 448).astype(jnp.float8_e4m3fn)
 
 
+def _shift_clip(x, d: int):
+    """``x[clip(t + d, 0, len(x) - 1)]`` for a static ``d``: slices and an edge repeat."""
+    if d == 0 or len(x) == 0:
+        return x
+    d = max(-len(x), min(d, len(x)))
+    if d > 0:
+        return jnp.concatenate([x[d:], jnp.repeat(x[-1:], d, axis=0)])
+    return jnp.concatenate([jnp.repeat(x[:1], -d, axis=0), x[:d]])
+
+
+def _select_shift(x, phase, j: int, ratio: int):
+    """``x[clip(t - phase[t] + j)]``: member ``j`` of token ``t``'s compression group."""
+    out = _shift_clip(x, j)
+    for p in range(1, ratio):
+        mask = (phase == p).reshape((-1,) + (1,) * (x.ndim - 1))
+        out = jnp.where(mask, _shift_clip(x, j - p), out)
+    return out
+
+
+def _onehot_rows(index, table):
+    """``table[index]`` ([T, k] indices into [n, d]) as an exact one-hot product: one
+    nonzero term per output, accumulated in f32 at full precision."""
+    onehot = (index[..., None] == jnp.arange(table.shape[0])).astype(jnp.float32)
+    out = jnp.einsum(
+        "tkn,nd->tkd",
+        onehot,
+        table.astype(jnp.float32),
+        precision=jax.lax.Precision.HIGHEST,
+    )
+    return out.astype(table.dtype)
+
+
 def _indexer_updates(
     raw,
     positions,
@@ -154,20 +188,33 @@ def _indexer_updates(
     group_start = logical // ratio * ratio
     members = group_start[:, None] + jnp.arange(ratio)[None]
     chunk_indices = starts[req, None] + members - context[req, None]
-    current = raw[jnp.clip(chunk_indices, 0, count - 1)]
-    previous = ring[safe_slots[req, None], members % rows]
+    first_index = starts[req] + group_start - context[req]
+    if envs.VLLM_TPU_QSA_INDEXER_UPDATE_SHIFT:
+        # Same values without per-token row gathers: a token's group members sit at static
+        # offsets -3..3 from it (selected by logical % ratio), and the ring / tag rows come
+        # from a one-hot product over the few (slot, lane) pairs.
+        phase = logical % ratio
+        current = jnp.stack(
+            [_select_shift(raw, phase, j, ratio) for j in range(ratio)], axis=1
+        )
+        lane = safe_slots[req, None] * rows + members % rows
+        previous = _onehot_rows(lane, ring.reshape(-1, ring.shape[-1]))
+        old_position = _onehot_rows(
+            (safe_slots[req] * rows + group_start % rows)[:, None],
+            tags[..., 0].reshape(-1, 1),
+        )[:, 0, 0]
+        first_current = _select_shift(positions, phase, 0, ratio)
+    else:
+        current = raw[jnp.clip(chunk_indices, 0, count - 1)]
+        previous = ring[safe_slots[req, None], members % rows]
+        old_position = tags[safe_slots[req], group_start % rows, 0]
+        first_current = positions[jnp.clip(first_index, 0, count - 1)]
     previous = jnp.where((context[req] > 0)[:, None, None], previous, 0)
     joined = jnp.where(
         (chunk_indices >= starts[req, None])[..., None], current, previous
     )
     pooled = bf16(jnp.mean(joined.astype(jnp.float32), axis=1))
-    first_index = starts[req] + group_start - context[req]
-    old_position = tags[safe_slots[req], group_start % rows, 0]
-    first_position = jnp.where(
-        first_index >= starts[req],
-        positions[jnp.clip(first_index, 0, count - 1)],
-        old_position,
-    )
+    first_position = jnp.where(first_index >= starts[req], first_current, old_position)
     completed = index_rope(
         gemma_norm(pooled, norm_k, norm_eps),
         jnp.maximum(first_position, 0),
