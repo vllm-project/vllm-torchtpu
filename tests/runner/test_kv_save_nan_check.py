@@ -297,6 +297,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         speculative_config=None,
         _fence_spec_kv_under_token_copy=False,
         _is_dspark_pd_producer=False,
+        _adaptive_verification=None,
         _get_sampling_generator=lambda: None,
         _greedy_sample=lambda _logits: torch.tensor([7]),
         _update_mamba_slot_read_offsets=lambda *_args: None,

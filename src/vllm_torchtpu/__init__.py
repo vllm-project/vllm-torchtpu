@@ -1743,10 +1743,12 @@ def _patch_vllm_force_v1_runner_tpu() -> None:
 
     vLLM 0.29 defaults to GPU Model Runner V2 when Triton is available and
     rejects GPU V2-only features when V1 is selected. TPUModelRunner owns
-    PCP, DSpark, and mixed-attention DFlash implementations, but consumes
-    V1-shaped scheduler output. Keep that default regardless of Triton and
-    remove only those implemented features from the native V1 rejection
-    list. The other native checks and TPU's combination checks still apply.
+    PCP, DSpark (with adaptive verification), and mixed-attention DFlash
+    implementations, but consumes V1-shaped scheduler output. Keep that
+    default regardless of Triton and remove only those implemented features
+    from the native V1 rejection list. The other native checks and TPU's
+    combination checks still apply. Adaptive verification's native check
+    requires full CUDA graphs, so TPU validates it against its own runner.
     An explicit VLLM_USE_V2_MODEL_RUNNER retains upstream precedence.
     """
     from collections.abc import Callable
@@ -1786,16 +1788,32 @@ def _patch_vllm_force_v1_runner_tpu() -> None:
         if device_config is None or device_config.device_type != "tpu":
             return unsupported
         # These are limitations of the upstream GPU V1 runner. Do not bypass
-        # the validator: adaptive verification, DFlash2, and future features
-        # must remain rejected until TPU implements them.
+        # the validator: DFlash2 and future features must remain rejected
+        # until TPU implements them. Adaptive verification is DSpark-only.
         implemented = {
             "prefill context parallel",
             "dspark speculative decoding",
             "mixed sliding/full dflash drafts",
         }
+        spec = self.speculative_config
+        if spec is not None and spec.method == "dspark":
+            implemented.add("adaptive draft verification")
         return [feature for feature in unsupported if feature not in implemented]
 
+    original_validate_adaptive = VllmConfig._validate_adaptive_verification
+
+    def patched_validate_adaptive(self):
+        device_config = getattr(self, "device_config", None)
+        if device_config is None or device_config.device_type != "tpu":
+            return original_validate_adaptive(self)
+        from vllm_torchtpu.spec_decode.adaptive_verification import (
+            validate_adaptive_verification_config,
+        )
+
+        validate_adaptive_verification_config(self)
+
     VllmConfig._get_v1_model_runner_unsupported_features = patched_unsupported
+    VllmConfig._validate_adaptive_verification = patched_validate_adaptive
     VllmConfig.use_v2_model_runner = property(patched_use_v2)
     VllmConfig._tpu_force_v1_runner_patch = True
     logger.info("Applied TPU patch: force V1 model runner semantics on TPU.")
