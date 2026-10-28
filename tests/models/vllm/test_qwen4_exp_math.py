@@ -294,20 +294,18 @@ def test_hc_rejects_invalid_full_tile(tile):
 
 
 @pytest.mark.parametrize(
-    "tokens,hidden,dtype,full_tile,expected",
+    "tokens,hidden,dtype,full_tile",
     [
-        (256, 128, torch.bfloat16, 128, True),
-        (128, 128, torch.bfloat16, 128, True),
-        (384, 128, torch.bfloat16, 128, True),
-        (257, 128, torch.bfloat16, 128, False),
-        (256, 129, torch.bfloat16, 128, False),
-        (256, 128, torch.float32, 128, False),
-        (256, 128, torch.bfloat16, 0, False),
+        (256, 128, torch.bfloat16, 128),
+        (128, 128, torch.bfloat16, 128),
+        (384, 128, torch.bfloat16, 128),
+        (257, 128, torch.bfloat16, 128),
+        (256, 129, torch.bfloat16, 128),
+        (256, 128, torch.float32, 128),
+        (256, 128, torch.bfloat16, 0),
     ],
 )
-def test_hc_full_dispatch_and_fallback(
-    tokens, hidden, dtype, full_tile, expected, monkeypatch
-):
+def test_hc_forced_cpu_device_falls_back(tokens, hidden, dtype, full_tile, monkeypatch):
     from vllm_torchtpu.kernels.qwen4_exp import vllm_adapter
     from vllm_torchtpu.kernels.qwen4_exp.hc_resources import HcHardware
 
@@ -331,13 +329,13 @@ def test_hc_full_dispatch_and_fallback(
         calls.append("combine")
         return hyper_input
 
-    if module._prefill_full_op is not None:
-        module._prefill_full_op = full
+    if module._prefill_full_ops:
+        module._prefill_full_ops = {tile: full for tile in module._prefill_full_ops}
     if module._prefill_combine_op is not None:
         module._prefill_combine_op = combine
     mixed, residuals = module.mix(x)
     result = module.combine(block, residuals)
-    assert calls == (["mix", "combine"] if expected else [])
+    assert calls == []
     assert mixed.shape == (tokens, hidden)
     assert result.shape == x.shape
     assert mixed.dtype == result.dtype == dtype
@@ -361,7 +359,8 @@ def hc_rank_fixture(monkeypatch):
         vllm_adapter, "build_gated_residual_op", lambda *args: forbidden
     )
     module, _, _ = hc_fixture(True, hidden=128, full_tile=128)
-    assert module._prefill_full_op is module._prefill_combine_op is forbidden
+    assert module._prefill_full_ops == {128: forbidden}
+    assert module._prefill_combine_op is forbidden
     return module
 
 
@@ -456,7 +455,7 @@ def test_hc_tpu_full_mix_and_combine(compiled, tokens):
     with torch.device("cpu"):
         module, x, block = hc_fixture(True, tokens=tokens, full_tile=128)
         expected = hc_cuda_source_reference(module, x, block)
-    assert module._prefill_full_op is not None
+    assert module._prefill_full_ops
     assert module._prefill_combine_op is not None
     module = module.to("tpu")
 
@@ -499,7 +498,7 @@ def test_hc_resource_fallback_keeps_independent_combine(
     module = GatedResidual(
         config, prefill_full_tile=full_tile, prefill_combine_tile=combine_tile
     )
-    assert module._prefill_full_op is None
+    assert not module._prefill_full_ops
     assert module._prefill_combine_op is not None
     x = torch.ones(combine_tile, 10240, dtype=torch.bfloat16)
     block = torch.ones(combine_tile, 2560, dtype=torch.bfloat16)
@@ -510,10 +509,14 @@ def test_hc_resource_fallback_keeps_independent_combine(
         return residual
 
     module._prefill_combine_op = merge
+    expected = hc_cuda_source_reference(module, x, block)
     mixed, residual = module.mix(x)
     assert torch.isfinite(mixed).all()
-    assert module.combine(block, residual) is x
-    assert calls == [torch.float32]
+    torch.testing.assert_close(mixed, expected[0], rtol=0, atol=0)
+    torch.testing.assert_close(
+        module.combine(block, residual), expected[1], rtol=0, atol=0
+    )
+    assert calls == []
 
 
 def test_hc_unknown_hardware_and_default_optout_do_not_claim_device(monkeypatch):
@@ -524,10 +527,12 @@ def test_hc_unknown_hardware_and_default_optout_do_not_claim_device(monkeypatch)
 
     monkeypatch.setattr(vllm_adapter, "current_hc_hardware", forbidden)
     module, _, _ = hc_fixture(True)
-    assert module._prefill_full_op is module._prefill_combine_op is None
+    assert not module._prefill_full_ops
+    assert module._prefill_combine_op is None
     monkeypatch.setattr(vllm_adapter, "current_hc_hardware", lambda: None)
     module, x, block = hc_fixture(True, tokens=128, full_tile=128)
-    assert module._prefill_full_op is module._prefill_combine_op is None
+    assert not module._prefill_full_ops
+    assert module._prefill_combine_op is None
     expected = hc_cuda_source_reference(module, x, block)
     mixed, residual = module.mix(x)
     torch.testing.assert_close(mixed, expected[0], rtol=0, atol=0)
@@ -543,11 +548,11 @@ def test_hc_tpu_residual_only_small_tile(compiled):
         config = HyperConnectionConfig(
             hidden_size=2560, hc_count=3, hc_lowrank=320, hc_per_branch_norm=True
         )
-        module = GatedResidual(config, prefill_combine_tile=32)
+        module = GatedResidual(config, prefill_full_tile=0, prefill_combine_tile=32)
         x = torch.ones(96, 7680, dtype=torch.bfloat16)
         block = torch.full((96, 2560), 0.25, dtype=torch.bfloat16)
         expected = hc_cuda_source_reference(module, x, block)
-    assert module._prefill_full_op is None and module._prefill_combine_op is not None
+    assert not module._prefill_full_ops and module._prefill_combine_op is not None
     module = module.to("tpu")
 
     def chain(x, block):
