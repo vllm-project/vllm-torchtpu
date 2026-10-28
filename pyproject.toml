@@ -282,6 +282,7 @@ ignore-missing-imports = [
     "google.protobuf", "google.protobuf.*",
     "jax", "jax.*",
     "jaxlib", "jaxlib.*",
+    "jinja2", "jinja2.*",
     "numpy", "numpy.*",
     "packaging", "packaging.*",
     "pathwaysutils", "pathwaysutils.*",
