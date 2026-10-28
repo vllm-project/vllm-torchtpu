@@ -91,7 +91,7 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 
-from vllm_torchtpu import envs, utils
+from vllm_torchtpu import envs, expert_placement, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
@@ -5720,6 +5720,10 @@ class TPUModelRunner(GPUModelRunner):
             # shared op rejects them with RuntimeProgramInputMismatch while
             # precompiling the draft buckets.
             self._relayout_tables(getattr(self.drafter, "draft_model", None))
+
+        # After the drafter: every placed MoE layer, the drafter's too, must
+        # have had its router renumbered with its experts.
+        expert_placement.check_routers_permuted()
 
         # After the drafter, so its MTP layer is armed too.
         if envs.FUSED_MOE_DECODE_KERNEL:

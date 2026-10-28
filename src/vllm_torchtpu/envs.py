@@ -108,6 +108,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
+    TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -859,6 +860,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ascending device-id order, so the SparseCore gather gets its
     # N-dimensional algorithm without moving the program's DeviceAssignment.
     "MOE_FUSED_EP_SORTED_GATHER": env_bool("MOE_FUSED_EP_SORTED_GATHER"),
+    # A static expert placement for expert parallelism: a JSON table naming,
+    # per MoE layer, which global experts each EP rank holds and in what slot
+    # order -- a permutation, experts / ranks to a rank (expert_placement.py).
+    # Applied at weight load, to the experts and the router alike, so every MoE
+    # kernel serves it unchanged. A local path or a gs:// URI. Empty: the
+    # checkpoint's contiguous blocks.
+    "TPU_EXPERT_PLACEMENT": env_str("TPU_EXPERT_PLACEMENT", ""),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its
     # live rows, so one is the ladder off. Zero leaves the choice to the

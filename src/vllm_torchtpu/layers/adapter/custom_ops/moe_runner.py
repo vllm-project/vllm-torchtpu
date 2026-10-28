@@ -21,7 +21,7 @@ from vllm.model_executor.layers.fused_moe.router.routing_simulator_router import
 from vllm.model_executor.layers.fused_moe.runner import moe_runner as _moe_runner
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import envs, expert_placement
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
     adaptive_fused_moe_supported,
 )
@@ -56,6 +56,9 @@ class VllmMoERunner(MoERunner):
             # strategies without monolithic support). The TPU MoE methods
             # simulate routing themselves from the real logits (moe_routing).
             self.router.prepare_monolithic_logits = lambda router_logits: router_logits
+        # Before the weights load, and whatever the quant method and kernel:
+        # a placed layer loads its experts in slot order.
+        expert_placement.apply(self)
 
     def _take_over_moe_quant_config_init(self) -> None:
         routed_experts = self.routed_experts
