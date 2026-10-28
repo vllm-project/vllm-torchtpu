@@ -31,7 +31,7 @@ def test_toolchain_mismatch_returns_invalid_toolchain() -> None:
         "jax": "0.9.1",
         "jaxlib": "0.9.1",
         "libtpu": "0.0.50",
-        "libtpu_so": "size=123456",
+        "libtpu_so": "sha256:0123456789abcdef",
         "topology_name": "tpu7x:2x2x1",
         "libtpu_init_args": "",
         "xla_flags": "",
@@ -40,11 +40,11 @@ def test_toolchain_mismatch_returns_invalid_toolchain() -> None:
     assert ok is True
     assert msg == "OK"
 
-    tc_diff = {**tc_base, "libtpu": "0.0.51"}
+    tc_diff = {**tc_base, "libtpu_so": "sha256:fedcba9876543210"}
     ok2, msg2 = compiler_stats.check_toolchain_match(tc_base, tc_diff)
     assert ok2 is False
     assert msg2.startswith("INVALID_TOOLCHAIN")
-    assert "libtpu" in msg2
+    assert "libtpu_so" in msg2
 
     d = compiler_stats.diff_compiled_buckets(
         {"toolchain": tc_base, "llo": {}},
@@ -52,6 +52,15 @@ def test_toolchain_mismatch_returns_invalid_toolchain() -> None:
     )
     assert d["status"] == "INVALID_TOOLCHAIN"
     assert d["exact_match"] is False
+
+
+def test_ensure_libtpu_on_path_rejects_missing_site(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify MK_TPU_AOT_SITE raises a clear error if set to a non-existent path."""
+    monkeypatch.setenv("MK_TPU_AOT_SITE", "/nonexistent/tpu_aot_site_path")
+    with pytest.raises(RuntimeError, match="MK_TPU_AOT_SITE"):
+        compiler_stats.ensure_libtpu_on_path(require=True)
 
 
 def test_roofline_stats_matches_analytic_model() -> None:
@@ -287,6 +296,9 @@ def test_no_frozen_references_in_owned_files() -> None:
         "_".join(("MK", "FROZEN", "QWEN35", "DIR")),
         "-".join(("hand", "written")),
         "_".join(("CANDIDATE30", "BASELINE")),
+        "".join(("nan", "wei")),
+        "".join(("venv", "312")),
+        "_".join(("tpu", "aot", "pkgs")),
     )
     for p in owned_paths:
         txt = p.read_text(encoding="utf-8")

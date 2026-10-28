@@ -19,8 +19,10 @@
 #   tests/megakernel/perf/t1_gate.sh [gate] <base_ref> <head_ref> [buckets] [options]
 #
 # Examples:
-#   tests/megakernel/perf/t1_gate.sh origin/nanwei/mk-dev HEAD
-#   tests/megakernel/perf/t1_gate.sh gate origin/nanwei/mk-dev origin/nanwei/mk-b7-verify "1:8,1:32,4:4,4:16,4:32,4:64"
+#   MK_PYTHON_BIN=/path/to/python MK_TPU_AOT_SITE=/path/to/libtpu_site \
+#     tests/megakernel/perf/t1_gate.sh origin/main HEAD
+#   MK_PYTHON_BIN=/path/to/python MK_TPU_AOT_SITE=/path/to/libtpu_site \
+#     tests/megakernel/perf/t1_gate.sh gate <base_ref> <head_ref> "1:8,1:32,4:4,4:16,4:32,4:64"
 
 set -euo pipefail
 
@@ -80,9 +82,31 @@ done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-PYTHON_BIN="${MK_PYTHON_BIN:-/usr/local/google/home/nanwei/mk/venv312/bin/python}"
-if [[ ! -x "${PYTHON_BIN}" ]]; then
-  PYTHON_BIN="$(command -v python3)"
+if [[ -z "${MK_PYTHON_BIN:-}" ]]; then
+  echo "Error: MK_PYTHON_BIN is not set. Set MK_PYTHON_BIN to a Python interpreter with jax and libtpu installed." >&2
+  exit 2
+fi
+if [[ ! -x "${MK_PYTHON_BIN}" ]] && ! command -v "${MK_PYTHON_BIN}" >/dev/null 2>&1; then
+  echo "Error: MK_PYTHON_BIN='${MK_PYTHON_BIN}' is not an executable Python interpreter." >&2
+  exit 2
+fi
+PYTHON_BIN="${MK_PYTHON_BIN}"
+
+STAGE1_PYTHONPATH="${REPO_ROOT}/src:${REPO_ROOT}"
+if [[ -n "${MK_TPU_AOT_SITE:-}" ]]; then
+  if [[ ! -d "${MK_TPU_AOT_SITE}" ]]; then
+    echo "Error: MK_TPU_AOT_SITE='${MK_TPU_AOT_SITE}' does not exist or is not a directory." >&2
+    exit 2
+  fi
+  STAGE1_PYTHONPATH="${MK_TPU_AOT_SITE}:${STAGE1_PYTHONPATH}"
+fi
+if [[ -n "${PYTHONPATH:-}" ]]; then
+  STAGE1_PYTHONPATH="${STAGE1_PYTHONPATH}:${PYTHONPATH}"
+fi
+if ! PYTHONPATH="${STAGE1_PYTHONPATH}" "${PYTHON_BIN}" -c "import jax, libtpu" >/dev/null 2>&1; then
+  echo "Error: Failed to import jax and libtpu using MK_PYTHON_BIN='${PYTHON_BIN}'." >&2
+  echo "       Set MK_TPU_AOT_SITE to the directory containing libtpu (or install jax and libtpu into MK_PYTHON_BIN)." >&2
+  exit 2
 fi
 
 cd "${REPO_ROOT}"
@@ -131,7 +155,7 @@ git -C "${REPO_ROOT}" worktree add --detach "${WT_HEAD}" "${HEAD_SHA}" >/dev/nul
 # Stage 1: Cloudtop AOT TPU7x full normalized LLO + Mosaic diff per subkernel
 echo "[T1-GATE] Stage 1: Running Cloudtop TPU7x AOT compilation and full LLO + Mosaic diff..."
 set +e
-PYTHONPATH="/usr/local/google/home/nanwei/mk/tpu_aot_pkgs:${REPO_ROOT}/src:${REPO_ROOT}" \
+PYTHONPATH="${STAGE1_PYTHONPATH}" \
   "${PYTHON_BIN}" -m tests.megakernel.perf.t1_gate \
   --base-wt "${WT_BASE}" \
   --head-wt "${WT_HEAD}" \

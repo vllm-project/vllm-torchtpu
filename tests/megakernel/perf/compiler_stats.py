@@ -31,10 +31,8 @@ import tempfile
 import time
 from typing import Any
 
-# Default path where cloudtop isolated libtpu package is installed if not in active
-# venv.
-DEFAULT_CLOUDTOP_LIBTPU_SITE = pathlib.Path.home() / "mk" / "tpu_aot_pkgs"
 DEFAULT_AOT_TOPOLOGY = "tpu7x:2x2x1"
+_LIBTPU_SO_SHA256_CACHE: dict[tuple[str, int, int], str] = {}
 
 # Analytic roofline constants from megakernel_roofline.md / roofline.py for
 # Qwen3.5-397B-A17B-FP8 on v7x-8.
@@ -75,18 +73,29 @@ class ToolchainMismatchError(RuntimeError):
     """
 
 
-def ensure_libtpu_on_path() -> None:
-    """Add `~/mk/tpu_aot_pkgs` to `sys.path` if `libtpu` is not already importable."""
+def ensure_libtpu_on_path(*, require: bool = False) -> None:
+    """Add `MK_TPU_AOT_SITE` to `sys.path` if set and verify `libtpu` when required."""
     if not pathlib.Path("/dev/vfio").is_dir():
         os.environ.setdefault("JAX_PLATFORMS", "cpu")
         os.environ.setdefault("TPU_WORKER_HOSTNAMES", "localhost")
+    aot_site = os.environ.get("MK_TPU_AOT_SITE", "").strip()
+    if aot_site:
+        site_path = pathlib.Path(aot_site).expanduser().resolve()
+        if not site_path.is_dir():
+            raise RuntimeError(
+                f"MK_TPU_AOT_SITE={aot_site!r} does not exist or is not a directory."
+            )
+        site_str = str(site_path)
+        if site_str not in sys.path:
+            sys.path.insert(0, site_str)
     try:
         import libtpu  # noqa: F401
-    except ImportError:
-        if DEFAULT_CLOUDTOP_LIBTPU_SITE.is_dir():
-            site_str = str(DEFAULT_CLOUDTOP_LIBTPU_SITE)
-            if site_str not in sys.path:
-                sys.path.insert(0, site_str)
+    except ImportError as exc:
+        if require:
+            raise RuntimeError(
+                "libtpu is not installed in the active Python environment; "
+                "set MK_TPU_AOT_SITE=/path/to/libtpu_site_packages or install libtpu."
+            ) from exc
 
 
 def _strip_dump_flags(flag_str: str) -> str:
@@ -101,6 +110,19 @@ def _strip_dump_flags(flag_str: str) -> str:
             continue
         tokens.append(tok)
     return " ".join(sorted(tokens))
+
+
+def _hash_file_sha256(path: pathlib.Path) -> str:
+    """Compute and cache the SHA-256 digest of a binary file such as `libtpu.so`."""
+    st = path.stat()
+    key = (str(path), st.st_mtime_ns, st.st_size)
+    cached = _LIBTPU_SO_SHA256_CACHE.get(key)
+    if cached is not None:
+        return cached
+    with path.open("rb") as f:
+        digest = hashlib.file_digest(f, "sha256").hexdigest()
+    _LIBTPU_SO_SHA256_CACHE[key] = digest
+    return digest
 
 
 def get_toolchain_info(topology_name: str = DEFAULT_AOT_TOPOLOGY) -> dict[str, str]:
@@ -119,8 +141,8 @@ def get_toolchain_info(topology_name: str = DEFAULT_AOT_TOPOLOGY) -> dict[str, s
 
         so_path = pathlib.Path(libtpu.get_library_path())
         if so_path.is_file():
-            st = so_path.stat()
-            libtpu_so_sha = f"size={st.st_size}"
+            digest = _hash_file_sha256(so_path)
+            libtpu_so_sha = f"sha256:{digest[:16]}"
     except Exception:
         libtpu_so_sha = "unknown"
 
@@ -650,7 +672,7 @@ def compile_bucket_in_process(
     """Compile a single `(profile, T, B)` bucket via AOT `tpu7x` topology in the current
     process.
     """
-    ensure_libtpu_on_path()
+    ensure_libtpu_on_path(require=True)
     own_tmp = False
     if dump_dir is None and "jax" not in sys.modules:
         dump_dir = tempfile.mkdtemp(prefix=f"mk_llo_inproc_t{T}_b{B}_")
@@ -851,12 +873,14 @@ def compile_bucket_subprocess(
     eff_dump_dir.mkdir(parents=True, exist_ok=True)
     out_json = eff_dump_dir / "bucket_compile_stats.json"
 
+    ensure_libtpu_on_path(require=True)
     env = os.environ.copy()
     env["JAX_PLATFORMS"] = "cpu"
     env["TPU_WORKER_HOSTNAMES"] = "localhost"
     py_paths = [str(wt_path / "src"), str(wt_path), str(perf_repo_root)]
-    if DEFAULT_CLOUDTOP_LIBTPU_SITE.is_dir():
-        py_paths.insert(0, str(DEFAULT_CLOUDTOP_LIBTPU_SITE))
+    aot_site = os.environ.get("MK_TPU_AOT_SITE", "").strip()
+    if aot_site:
+        py_paths.insert(0, str(pathlib.Path(aot_site).expanduser().resolve()))
     if env.get("PYTHONPATH"):
         py_paths.append(env["PYTHONPATH"])
     env["PYTHONPATH"] = ":".join(py_paths)
