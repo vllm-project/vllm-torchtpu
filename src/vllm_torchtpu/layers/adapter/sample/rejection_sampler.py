@@ -72,6 +72,7 @@ class RejectionSampler:
         need_top_p: bool = True,
         radix_bits: int = 1,
         fast_top_p: bool = False,
+        verify_rows: int = 0,
     ) -> torch.Tensor:
         return self.forward(
             draft_token_ids=draft_token_ids,
@@ -93,6 +94,7 @@ class RejectionSampler:
             need_top_p=need_top_p,
             radix_bits=radix_bits,
             fast_top_p=fast_top_p,
+            verify_rows=verify_rows,
         )
 
     def forward(
@@ -116,6 +118,7 @@ class RejectionSampler:
         need_top_p: bool = True,
         radix_bits: int = 1,
         fast_top_p: bool = False,
+        verify_rows: int = 0,
     ) -> torch.Tensor:
         """Performs rejection sampling for speculative decoding.
 
@@ -147,6 +150,10 @@ class RejectionSampler:
           radix_bits: bits per pass of the top-k/top-p threshold bisection.
           fast_top_p: static; skip the top-p bisection's provably idle steps
             (same threshold, see top_k_top_p.topp_mask).
+          verify_rows: static (do_sampling only, TPU_SAMPLER_VERIFY_TRIM_ROWS);
+            keep only the first that many draft slots, which hold every real
+            one. target_logits may already have that many rows; the other
+            per-slot inputs are sliced in the graph.
 
         Returns:
           A tensor of shape [batch_size, max_draft_tokens + 1] containing the
@@ -189,6 +196,7 @@ class RejectionSampler:
                 need_top_p,
                 radix_bits,
                 fast_top_p,
+                verify_rows,
             )
         if self.synthetic_mode and accept_u is None:
             raise ValueError("Synthetic rejection sampling requires accept_u.")
@@ -462,8 +470,23 @@ def _random_rejection_sample_with_segment_impl(
     need_top_p: bool = True,
     radix_bits: int = 1,
     fast_top_p: bool = False,
+    verify_rows: int = 0,
 ) -> torch.Tensor:
-    """Vectorized non-greedy speculative decoding validation in Torch."""
+    """Vectorized non-greedy speculative decoding validation in Torch.
+
+    ``verify_rows`` (static): keep only the first that many draft slots. The
+    caller guarantees every real slot is among them; the rest are padding
+    slots, which reach no output."""
+    if verify_rows:
+        draft_token_ids = draft_token_ids[:verify_rows]
+        target_logits = target_logits[:verify_rows]
+        segment_ids = segment_ids[:verify_rows]
+        group_indices = group_indices[:verify_rows]
+        temperatures = temperatures[:verify_rows]
+        top_k = top_k[:verify_rows]
+        top_p = top_p[:verify_rows]
+        accept_u = accept_u[:verify_rows]
+        recover_u = recover_u[:verify_rows]
     total_tokens = draft_token_ids.shape[0]
     batch_size = num_draft_tokens.shape[0]
     device = draft_token_ids.device
