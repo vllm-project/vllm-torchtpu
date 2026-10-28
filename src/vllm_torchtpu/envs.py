@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     RAY_USAGE_STATS_ENABLED: str = "0"
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: str = "shm"
     ENABLE_QUANTIZED_MATMUL_KERNEL: bool = False
+    TPU_PLE_FUSED_GATE: bool = False
     REQUANTIZE_BLOCK_SIZE: int | None = None
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
@@ -508,6 +509,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Enable the blockwise Pallas quantized matmul kernel for dense linears.
     "ENABLE_QUANTIZED_MATMUL_KERNEL": env_bool("ENABLE_QUANTIZED_MATMUL_KERNEL"),
+    # Fuse PLE normalization and gate dot products on TPU.
+    "TPU_PLE_FUSED_GATE": env_bool("TPU_PLE_FUSED_GATE", default=False),
     # Runtime block size for dense linear weight requantization.
     "REQUANTIZE_BLOCK_SIZE": lambda: int(block_size)
     if (block_size := os.getenv("REQUANTIZE_BLOCK_SIZE")) is not None

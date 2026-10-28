@@ -44,6 +44,10 @@ from vllm.models.qwen4_exp.common.ngram_embedding import (
 )
 from vllm.models.qwen4_exp.common.ple import PLEVocabParallelEmbedding
 
+from vllm_torchtpu.layers.adapter.custom_ops.ple_op import (
+    build_normalized_gate_dot_dispatch,
+)
+
 _MASK64 = (1 << 64) - 1
 _MAX_INT64 = (1 << 63) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -550,6 +554,9 @@ class Qwen4ExpPLELayer(nn.Module):
             )
             for _ in range(3)
         )
+        self.gate_dot = build_normalized_gate_dot_dispatch(
+            self.hc_count, self.hidden_size
+        )
         # Holds the checkpoint's [channels, 1, kernel] weight; forward runs the
         # conv with dilated_short_conv to carry state across steps.
         self.conv1d = nn.Conv1d(
@@ -598,12 +605,7 @@ class Qwen4ExpPLELayer(nn.Module):
         """PLE values before convolution; storage and history remain caller-owned."""
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
-        streams = (self.hc_count, self.hidden_size)
-        key = self.norm_key(key).unflatten(-1, streams)
-        query = self.norm_query(hidden_states).unflatten(-1, streams)
-        # As in upstream's gate kernel, the products are rounded to the
-        # activation dtype and then summed in fp32.
-        dot = (key * query).float().sum(dim=-1, keepdim=True).to(key.dtype)
+        dot = self.gate_dot(key, hidden_states, self.norm_key, self.norm_query)
         gate = dot / math.sqrt(self.hidden_size)
         gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
         gated_value = (torch.sigmoid(gate) * value.unsqueeze(-2)).flatten(-2)
