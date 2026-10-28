@@ -36,7 +36,10 @@ serves every layer, and ``segment_ids`` are built with tensor ops only --
 the flash padding) gets a distinct, equality-masked segment.
 """
 
+from contextlib import nullcontext
+
 import jax
+import jax.numpy as jnp
 import torch
 import torch.nn.functional as F
 from torch_tpu._internal import pallas
@@ -58,15 +61,22 @@ def _vision_flash_core(
 ) -> jax.Array:
     # q,k,v: [batch, num_heads, seq, head_dim]; seg: [batch, seq]. sm_scale is
     # folded into q by the caller, so use 1.0 here.
-    return flash_attention(
-        q,
-        k,
-        v,
-        segment_ids=SegmentIds(q=q_seg, kv=kv_seg),
-        causal=False,
-        sm_scale=1.0,
-        vmem_limit_bytes=_VMEM_LIMIT_BYTES,
+    # Pallas dot precision is independent of PyTorch's matmul precision setting.
+    precision = (
+        jax.default_matmul_precision("highest")
+        if q.dtype == jnp.float32
+        else nullcontext()
     )
+    with precision:
+        return flash_attention(
+            q,
+            k,
+            v,
+            segment_ids=SegmentIds(q=q_seg, kv=kv_seg),
+            causal=False,
+            sm_scale=1.0,
+            vmem_limit_bytes=_VMEM_LIMIT_BYTES,
+        )
 
 
 @CustomOp.register_oot(name="MMEncoderAttention")
