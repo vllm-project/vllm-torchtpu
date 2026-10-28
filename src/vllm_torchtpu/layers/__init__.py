@@ -23,3 +23,7 @@ from vllm_torchtpu.tokenizers import register_tokenizers
 def register_layers() -> None:
     register_models()
     register_tokenizers()
+    # Loaded in every vLLM process: lets the stall watchdog dump their stacks.
+    from vllm_torchtpu.stall_watchdog import install_signal_dump
+
+    install_signal_dump()

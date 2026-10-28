@@ -81,7 +81,7 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 
-from vllm_torchtpu import envs, utils
+from vllm_torchtpu import envs, stall_watchdog, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
@@ -1124,6 +1124,7 @@ class TPUModelRunner(GPUModelRunner):
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank)
         host_phases.set_rank(profiler_rank)
+        stall_watchdog.start(profiler_rank)
 
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
@@ -3722,6 +3723,7 @@ class TPUModelRunner(GPUModelRunner):
         # Update cached state
         self._update_states(scheduler_output)
         host_phases.mark("update_states")
+        stall_watchdog.note_step(self.input_batch.num_reqs)
         if self.scheduler_config.async_scheduling:
             self._flush_disjoint_async_results()
         if scheduler_output.total_num_scheduled_tokens == 0:
