@@ -188,6 +188,7 @@ def _layer(
     max_tokens,
     shared_gated=True,
     routed_scale=1.0,
+    fold="off",
 ):
     """Per-rank body of the op: the kernel up to `max_tokens`, GMM MoE above.
     An ungated layer still passes its placeholder shared_gate_weight operand
@@ -229,6 +230,28 @@ def _layer(
         "whole experts" if ib is None else f"blocked ib={ib}",
         nb,
     )
+    if fold != "off":
+        # Operands as stored: per-call reshapes are XLA ops of their own.
+        return _kernel_body(
+            rank,
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            shared_w1,
+            shared_w1_scale,
+            shared_w2,
+            shared_w2_scale,
+            shared_gate_weight if shared_gated else None,
+            tw,
+            ti,
+            n_ranks=n_ranks,
+            expert_start="rank" if expert_parallel else None,
+            routed_scale=routed_scale,
+            fold=True,
+            gate_in_kernel=fold == "kernel",
+        )
     return _kernel_body(
         rank[0, :1],
         x,
@@ -258,6 +281,7 @@ def _build_op(
     shared_gated: bool = True,
     routed_scale: float = 1.0,
 ):
+    fold = envs.FUSED_MOE_DECODE_KERNEL_FOLD
     key = (
         id(mesh),
         n_ranks,
@@ -266,6 +290,7 @@ def _build_op(
         max_tokens,
         shared_gated,
         routed_scale,
+        fold,
     )
     op = _OPS.get(key)
     if op is not None:
@@ -279,6 +304,7 @@ def _build_op(
         max_tokens=max_tokens,
         shared_gated=shared_gated,
         routed_scale=routed_scale,
+        fold=fold,
     )
 
     # torch_tpu infers static arguments from annotations: every operand is a
