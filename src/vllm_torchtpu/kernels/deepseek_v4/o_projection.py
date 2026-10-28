@@ -244,11 +244,13 @@ def _pipelined_kernel(
     # inputs
     x_hbm_ref: jax.Ref,  # HBM (T, G * H, head_dim) bf16
     w_hbm_ref: jax.Ref,  # HBM (D, G * R) fp8
-    scale_ref: jax.Ref,  # VMEM (1, G * R) f32
-    cos_sin_ref: jax.Ref,  # VMEM (T, 2 * LANE) f32
+    scale_hbm_ref: jax.Ref,  # HBM (1, G * R) f32
+    cos_sin_hbm_ref: jax.Ref,  # HBM (T, 2 * LANE) f32
     # output
     out_hbm_ref: jax.Ref,  # HBM (T, G * R) bf16
     # scratch
+    scale_ref: jax.Ref,  # (1, G * R) f32
+    cos_sin_ref: jax.Ref,  # (T, 2 * LANE) f32
     x_buf: jax.Ref,  # (2, rows, H, head_dim) bf16
     x_q_ref: jax.Ref,  # (2, rows, D) fp8
     x_rinv_ref: jax.Ref,  # (2, rows, 1) f32
@@ -258,6 +260,7 @@ def _pipelined_kernel(
     w_sems: jax.Ref,  # (2,) DMA
     out_sems: jax.Ref,  # (2,) DMA
     x0_sems: jax.Ref,  # (rows // WO_A_PREP_ROWS,) DMA, block 0's sub-chunks
+    const_sems: jax.Ref,  # (2,) DMA, scale and cos_sin
     *,
     num_groups: int,
     groups_per_step: int,
@@ -362,6 +365,14 @@ def _pipelined_kernel(
 
     @pl.when(step == 0)
     def _():
+        # scale and cos_sin are fetched here, beside block 0, rather than
+        # staged in VMEM by XLA copies ahead of the call.
+        scale_copy = pltpu.make_async_copy(scale_hbm_ref, scale_ref, const_sems.at[0])
+        cos_sin_copy = pltpu.make_async_copy(
+            cos_sin_hbm_ref, cos_sin_ref, const_sems.at[1]
+        )
+        cos_sin_copy.start()
+        scale_copy.start()
         # Block 0 by sub-chunks, so its prep starts after the first one lands.
         sub_copies = [
             pltpu.make_async_copy(
@@ -375,7 +386,9 @@ def _pipelined_kernel(
             copy.start()
         w_copy(0).start()
         x_copy(*locate(1)).start()
+        cos_sin_copy.wait()
         prep(0, 0, sub_copies)
+        scale_copy.wait()
 
     for l in range(per_step):
         g, r, slot = locate(l)
@@ -442,6 +455,8 @@ def _wo_a_pipelined(
     groups_per_step = 1 if (num_tokens // rows) % 2 == 0 else 2
     assert num_groups % groups_per_step == 0
     scratch = [
+        pltpu.VMEM((1, out_features), jnp.float32),
+        pltpu.VMEM(cos_sin.shape, cos_sin.dtype),
         pltpu.VMEM((2, rows, SUBLANE, head_dim), x.dtype),
         pltpu.VMEM((2, rows, reduction), wo_a.dtype),
         pltpu.VMEM((2, rows, 1), jnp.float32),
@@ -454,7 +469,6 @@ def _wo_a_pipelined(
         for b in scratch
     )
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
-    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     return pl.pallas_call(
         functools.partial(
             _pipelined_kernel,
@@ -463,7 +477,7 @@ def _wo_a_pipelined(
             head_dim=head_dim,
         ),
         grid=(num_groups // groups_per_step,),
-        in_specs=[hbm, hbm, vmem, vmem],
+        in_specs=[hbm] * 4,
         out_specs=hbm,
         # Pinned: with the small VMEM limit XLA would otherwise place the 16 MB
         # output in VMEM and pay a copy back to HBM for the consumer.
@@ -472,6 +486,7 @@ def _wo_a_pipelined(
             *scratch,
             *[pltpu.SemaphoreType.DMA((2,))] * 3,
             pltpu.SemaphoreType.DMA((rows // WO_A_PREP_ROWS,)),
+            pltpu.SemaphoreType.DMA((2,)),
         ],
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
@@ -480,11 +495,14 @@ def _wo_a_pipelined(
         ),
         name=name,
     )(
-        # Where its producer wrote it; otherwise XLA may stage x in VMEM.
+        # Where their producers wrote them; otherwise XLA may stage them in
+        # VMEM with copies ahead of the call.
         pltpu.with_memory_space_constraint(x, pltpu.HBM),
         wo_a,
-        wo_a_scale.reshape(1, out_features),
-        cos_sin,
+        pltpu.with_memory_space_constraint(
+            wo_a_scale.reshape(1, out_features), pltpu.HBM
+        ),
+        pltpu.with_memory_space_constraint(cos_sin, pltpu.HBM),
     )
 
 
