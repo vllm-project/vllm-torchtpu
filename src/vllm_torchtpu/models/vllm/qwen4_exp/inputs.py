@@ -101,6 +101,69 @@ def merge_recent_ngram_context(
     return torch.where(usable, gathered, history)
 
 
+def fused_step_inputs(
+    starts,
+    seq_lens,
+    state_indices,
+    store,
+    scalars,
+    previous,
+    current,
+    ids,
+    *,
+    window: bool,
+    pooled: bool,
+    spec_window: int,
+    eos_token_id: int,
+    ngram_size: int,
+):
+    """``Qwen4ExpAdapter.prepare_inputs``'s device work as one function, so it
+    compiles to one program (VLLM_TPU_QWEN4_FUSED_PREP) instead of ~20 eager
+    launches per step.
+
+    ``scalars`` = [row_start, num_requests, previous_rows...] (one upload);
+    ``store`` is the device token store, or with ``window`` the uploaded
+    ``ngram_window_from_host`` array. ``current``'s three record tensors are
+    updated in place exactly like ``_speculative_ngram_context``. Returns
+    (context, history, slots, valid_tokens).
+    """
+    rows = starts.shape[0] - 1
+    row_start = scalars[0]
+    num_requests = scalars[1]
+    lengths_now = starts[1:] - starts[:-1]
+    context = (seq_lens - lengths_now).to(torch.int64)
+    row_range = torch.arange(rows, device=starts.device)
+    valid_rows = row_range < num_requests
+    if pooled:
+        state_indices = row_range.to(torch.int32)
+    slots = torch.where(valid_rows, state_indices, -1).to(torch.int32)
+    if window:
+        history = ngram_context_from_window(store, context, eos_token_id, ngram_size)
+    else:
+        row_ids = (row_range.to(torch.int64) + row_start).clamp(max=store.shape[0] - 1)
+        history = ngram_context_from_store(
+            store, row_ids, context, eos_token_id, ngram_size
+        )
+    if spec_window:
+        history = merge_recent_ngram_context(
+            history, *previous, scalars[2 : 2 + rows], context
+        )
+        tokens, recent_context, recent_lengths = current
+        ids64 = ids.to(torch.int64)
+        offsets = torch.arange(spec_window, device=ids.device)
+        chunk = ids64[
+            (starts[:-1, None].to(torch.int64) + offsets).clamp(0, ids.shape[0] - 1)
+        ]
+        target = torch.where(valid_rows, row_range + row_start, tokens.shape[0] - 1)
+        tokens.index_copy_(0, target, torch.cat([history, chunk], dim=1))
+        recent_context.index_copy_(0, target, context)
+        recent_lengths.index_copy_(
+            0, target, lengths_now.to(torch.int64).clamp(max=spec_window)
+        )
+    valid_tokens = torch.arange(ids.shape[0], device=ids.device) < starts[-1]
+    return context, history, slots, valid_tokens
+
+
 def dummy_query_lengths(num_tokens, num_reqs, max_active):
     active = min(num_tokens, num_reqs, max_active)
     lengths = [1] * active + [0] * (num_reqs - active)
@@ -271,6 +334,8 @@ class Qwen4ExpAdapter:
         return history
 
     def prepare_inputs(self, snapshot):
+        if envs.VLLM_TPU_QWEN4_FUSED_PREP and envs.VLLM_TPU_QWEN4_NGRAM_WINDOW != "check":
+            return self._prepare_inputs_fused(snapshot)
         runner = self.runner
         ctx = runner._attn_metadata_builder_ctx
         starts = ctx.query_start_loc
@@ -338,6 +403,148 @@ class Qwen4ExpAdapter:
             compressed_block_table=tables[1],
         )
         return kwargs
+
+    def _block_tables(self, snapshot, rows):
+        attention = f"{self.attention_prefix}.self_attn"
+        return [
+            # Metadata uses the genuine native group table, never state slots.
+            snapshot.attention_metadata[name].block_tables.reshape(rows, -1)
+            for name in (self._main_owner(attention), self._compressed_owner(attention))
+        ]
+
+    def _host_upload(self, array):
+        """Upload a small host array; keep the source alive for a few steps
+        because a non-blocking copy may still be reading it."""
+        host = torch.from_numpy(array)
+        self._host_keep = (getattr(self, "_host_keep", ()) + (host,))[-8:]
+        return host.to(self.runner.device, non_blocking=True)
+
+    def _prepare_inputs_fused(self, snapshot):
+        """VLLM_TPU_QWEN4_FUSED_PREP: ``prepare_inputs`` with its device work in
+        one compiled program (``fused_step_inputs``) fed by at most two uploads."""
+        import numpy as np
+
+        runner = self.runner
+        ctx = runner._attn_metadata_builder_ctx
+        starts = ctx.query_start_loc
+        rows = starts.shape[0] - 1
+        scalars = np.full(2 + (rows if self.spec_window else 0), -1, dtype=np.int64)
+        scalars[0] = snapshot.row_start
+        scalars[1] = snapshot.num_requests
+        if self.spec_window:
+            req_ids = runner.input_batch.req_ids
+            for i in range(snapshot.num_requests):
+                req_id = req_ids[snapshot.row_start + i]
+                scalars[2 + i] = self._previous_rows.get(req_id, -1)
+                self._current_rows[req_id] = snapshot.row_start + i
+            previous, current = self._recent_buffers(runner.device)
+        else:
+            previous = current = None
+        window = envs.VLLM_TPU_QWEN4_NGRAM_WINDOW == "1"
+        if window:
+            width = max(self.spec_window - 1, 0) + self.config.ngram_size - 1
+            store = self._host_upload(
+                ngram_window_from_host(
+                    runner.input_batch.token_ids_cpu_tensor.numpy(),
+                    runner.input_batch.num_computed_tokens_cpu,
+                    snapshot.row_start,
+                    snapshot.num_requests,
+                    rows,
+                    width,
+                    self.config.eos_token_id,
+                )
+            )
+        else:
+            store = snapshot.token_store
+        state_indices = starts if self.pooled else ctx.mamba_state_indices
+        context, history, slots, valid_tokens = self._fused_fn()(
+            starts,
+            ctx.seq_lens,
+            state_indices,
+            store,
+            self._host_upload(scalars),
+            previous,
+            current,
+            snapshot.input_ids,
+            window=window,
+            pooled=self.pooled,
+            spec_window=self.spec_window,
+            eos_token_id=self.config.eos_token_id,
+            ngram_size=self.config.ngram_size,
+        )
+        tables = self._block_tables(snapshot, rows)
+        return dict(
+            query_start_loc=starts,
+            ngram_context=history,
+            state_slots=slots,
+            context_lens=context,
+            valid_tokens=valid_tokens,
+            main_block_table=tables[0],
+            compressed_block_table=tables[1],
+        )
+
+    def _fused_fn(self):
+        fn = getattr(self, "_fused", None)
+        if fn is None:
+            fn = self._fused = torch.compile(
+                fused_step_inputs, backend="tpu", fullgraph=True, dynamic=False
+            )
+        return fn
+
+    def precompile_fused_inputs(self, num_tokens_paddings, rows_options):
+        """Compile ``fused_step_inputs`` for every (rows, num_tokens) bucket a
+        step can reach, under no_grad like execute_model, before serving."""
+        if not envs.VLLM_TPU_QWEN4_FUSED_PREP:
+            return
+        runner = self.runner
+        device = runner.device
+        window = envs.VLLM_TPU_QWEN4_NGRAM_WINDOW == "1"
+        store_rows = runner.input_batch.token_ids_cpu_tensor.shape[0]
+        with torch.no_grad():
+            for rows in sorted({r for r in rows_options if r}):
+                starts = torch.zeros(rows + 1, dtype=torch.int32, device=device)
+                seq_lens = torch.zeros(rows, dtype=torch.int32, device=device)
+                state = torch.zeros(rows, dtype=torch.int32, device=device)
+                if window:
+                    width = max(self.spec_window - 1, 0) + self.config.ngram_size - 1
+                    store = torch.zeros((rows, width + 1), dtype=torch.int64, device=device)
+                else:
+                    store = torch.zeros(
+                        (store_rows, runner.input_batch.token_ids_cpu_tensor.shape[1]),
+                        dtype=runner.input_batch.token_ids_cpu_tensor.dtype,
+                        device=device,
+                    )
+                scalars = torch.full(
+                    (2 + (rows if self.spec_window else 0),), -1, dtype=torch.int64
+                ).to(device)
+                scalars[:2] = 0
+                if self.spec_window:
+                    previous, current = self._recent_buffers(device)
+                else:
+                    previous = current = None
+                for num_tokens in num_tokens_paddings:
+                    ids = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+                    out = self._fused_fn()(
+                        starts,
+                        seq_lens,
+                        starts if self.pooled else state,
+                        store,
+                        scalars,
+                        previous,
+                        current,
+                        ids,
+                        window=window,
+                        pooled=self.pooled,
+                        spec_window=self.spec_window,
+                        eos_token_id=self.config.eos_token_id,
+                        ngram_size=self.config.ngram_size,
+                    )
+                    synchronize_tensors(out)
+        logger.info(
+            "Compiled fused qwen4 step inputs for rows %s x %d token buckets",
+            sorted({r for r in rows_options if r}),
+            len(num_tokens_paddings),
+        )
 
     def _check_ngram_window(self, snapshot, row_ids, context, history):
         """``VLLM_TPU_QWEN4_NGRAM_WINDOW=check``: compare the windowed context with the full-store

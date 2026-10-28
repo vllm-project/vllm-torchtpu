@@ -98,6 +98,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_INDEXER_MIXED_ONLY: bool = False
     VLLM_TPU_QSA_DRAFT_SHARED_SELECTION: bool = False
     VLLM_TPU_QWEN4_NGRAM_WINDOW: str = ""
+    VLLM_TPU_QWEN4_FUSED_PREP: bool = False
     VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
@@ -579,6 +580,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "check" = both paths and log mismatches for the first 200 steps, then as "1"
     # (models/vllm/qwen4_exp/inputs.py).
     "VLLM_TPU_QWEN4_NGRAM_WINDOW": lambda: os.getenv("VLLM_TPU_QWEN4_NGRAM_WINDOW", ""),
+    # Qwen4Exp: run the adapter's per-step input preparation (n-gram context,
+    # speculative record, slots) as one compiled program instead of ~20 eager
+    # launches; models/vllm/qwen4_exp/inputs.py fused_step_inputs.
+    "VLLM_TPU_QWEN4_FUSED_PREP": env_bool("VLLM_TPU_QWEN4_FUSED_PREP"),
     "VLLM_TPU_QSA_DRAFT_SHARED_SELECTION": env_bool(
         "VLLM_TPU_QSA_DRAFT_SHARED_SELECTION"
     ),

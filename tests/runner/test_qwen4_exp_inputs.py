@@ -325,3 +325,80 @@ def test_ngram_window_matches_full_store(spec):
         dev_ctx[:n] = torch.from_numpy(np.maximum(host_ctx[start : start + n] - spec, 0))
         ref = ngram_context_from_store(torch.from_numpy(store), row_ids, dev_ctx, eos, ngram)
         assert not torch.equal(ngram_context_from_window(narrow, dev_ctx, eos, ngram)[:n], ref[:n])
+
+
+@pytest.mark.parametrize("window", ["", "1"])
+@pytest.mark.parametrize("pooled", [False, True])
+@pytest.mark.parametrize("spec", [0, 3])
+def test_fused_prepare_inputs_matches_eager(monkeypatch, spec, pooled, window):
+    """VLLM_TPU_QWEN4_FUSED_PREP: the one-program input preparation returns the
+    eager path's kwargs and leaves the same speculative records, step after step,
+    as requests move rows and drop out."""
+    import numpy as np
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.models.vllm.qwen4_exp import inputs as inputs_mod
+
+    rows, max_reqs, max_len, num_tokens = 4, 6, 64, 16
+    rng = np.random.default_rng(spec * 10 + pooled)
+
+    def make():
+        runner = NS(device="cpu", max_num_reqs=max_reqs)
+        runner.model_config = NS(hf_text_config=q4exp_text_config())
+        runner.cache_config = NS(block_size=128)
+        runner.input_batch = NS(
+            token_ids_cpu_tensor=torch.from_numpy(
+                rng.integers(100, 999, (max_reqs, max_len)).astype(np.int32)
+            ),
+            num_computed_tokens_cpu=np.zeros(max_reqs, dtype=np.int64),
+            req_ids=[],
+        )
+        adapter = Qwen4ExpAdapter(runner)
+        adapter.pooled = pooled
+        adapter.spec_window = spec + 1 if spec else 0
+        return runner, adapter
+
+    r_eager, a_eager = make()
+    r_fused, a_fused = make()
+    r_fused.input_batch.token_ids_cpu_tensor.copy_(r_eager.input_batch.token_ids_cpu_tensor)
+    monkeypatch.setattr(envs, "VLLM_TPU_QWEN4_NGRAM_WINDOW", window, raising=False)
+    monkeypatch.setattr(a_fused, "_fused_fn", lambda: inputs_mod.fused_step_inputs)
+    attention = f"{a_eager.attention_prefix}.self_attn"
+    main = torch.arange(rows * 3).reshape(rows, 3)
+    compressed = torch.arange(rows * 2).reshape(rows, 2)
+    tables = {
+        a_eager._main_owner(attention): NS(block_tables=main),
+        a_eager._compressed_owner(attention): NS(block_tables=compressed),
+    }
+    for step, (req_ids, lengths) in enumerate(
+        [(["a", "b", "c"], [4, 1, 4]), (["c", "a"], [4, 4]), (["c", "d", "a"], [1, 4, 4])]
+    ):
+        n = len(req_ids)
+        ctx_lens = rng.integers(5, max_len - 8, n)
+        starts = torch.zeros(rows + 1, dtype=torch.int32)
+        starts[1 : n + 1] = torch.tensor(np.cumsum(lengths), dtype=torch.int32)
+        starts[n + 1 :] = starts[n]
+        seq_lens = torch.zeros(rows, dtype=torch.int32)
+        seq_lens[:n] = torch.tensor(ctx_lens + np.array(lengths), dtype=torch.int32)
+        ids = torch.from_numpy(rng.integers(100, 999, num_tokens).astype(np.int32))
+        outs = []
+        for runner, adapter, fused in ((r_eager, a_eager, False), (r_fused, a_fused, True)):
+            monkeypatch.setattr(envs, "VLLM_TPU_QWEN4_FUSED_PREP", fused, raising=False)
+            runner.input_batch.req_ids = req_ids
+            runner.input_batch.num_computed_tokens_cpu[:n] = ctx_lens
+            runner._attn_metadata_builder_ctx = NS(
+                query_start_loc=starts,
+                seq_lens=seq_lens,
+                mamba_state_indices=torch.tensor([5, 3, 1, 0], dtype=torch.int32),
+            )
+            store = adapter.begin_step()
+            outs.append(
+                adapter.prepare_inputs(ModelInputSnapshot(store, 0, n, num_tokens, tables, ids))
+            )
+        eager, fused = outs
+        assert eager.keys() == fused.keys()
+        for key in eager:
+            assert torch.equal(eager[key], fused[key]), (step, key)
+        if spec:
+            for got, ref in zip(a_fused._recent[1], a_eager._recent[1]):
+                assert torch.equal(got, ref), step

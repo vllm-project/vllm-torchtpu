@@ -6604,6 +6604,15 @@ class TPUModelRunner(GPUModelRunner):
             self._precompile_sampling_subgraphs()
             self._precompile_pooler_subgraphs()
             self._precompile_mamba_rollback_helpers()
+            precompile_inputs = getattr(
+                self.model_adapter, "precompile_fused_inputs", None
+            )
+            if precompile_inputs is not None:
+                with self._precompile_timed("fused model-adapter inputs"):
+                    precompile_inputs(
+                        self.num_tokens_paddings,
+                        (self.num_reqs_max_model_len, self.num_reqs_most_model_len),
+                    )
 
             # Precompile multimodal vision encoder graphs
             self.encoder_cudagraph_manager = maybe_create_mm_encoder_manager(
