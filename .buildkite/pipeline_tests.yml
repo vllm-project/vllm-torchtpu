@@ -205,7 +205,7 @@ steps:
               <<: *tests_plugin_defaults
               test-file-pattern: "tests_omni/**/{test_*,*_test}.py"
               fail-on-no-tests: true
-              test-cmd: "pytest -sv --timeout=1200 -m 'not nightly and omni' --junit-xml={{resultPath}} {{testExamples}}"
+              test-cmd: "pytest -sv --timeout=1200 -m 'not nightly' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: "Unit Tests - Speculative Decoding (Nightly)"
         key: "unit_tests_spec_decode_nightly"
@@ -290,4 +290,22 @@ steps:
               <<: *tests_plugin_defaults
               test-file-pattern: "tests_omni/**/{test_*,*_test}.py"
               fail-on-no-tests: true
-              test-cmd: "pytest -sv --timeout=1800 -m 'nightly and omni' --junit-xml={{resultPath}} {{testExamples}}"
+              test-cmd: "pytest -sv --timeout=1800 -m 'not multichip' --junit-xml={{resultPath}} {{testExamples}}"
+
+      - label: "Unit Tests - Omni Multichip (Nightly)"
+        key: "unit_tests_omni_multichip_nightly"
+        <<: *tpu_step
+        depends_on: "build_docker_omni"
+        if: 'build.env("NIGHTLY") == "1"'
+        env:
+          SHAPE: *shape_multi
+          DOCKER_IMAGE_SUFFIX: "-omni"
+        commands:
+          - *omni_test
+        plugins:
+          - *kube_plugin
+          - tests#v1.0.0:
+              <<: *tests_plugin_defaults
+              test-file-pattern: "tests_omni/**/{test_*,*_test}.py"
+              fail-on-no-tests: true
+              test-cmd: "pytest -sv --timeout=1800 -m 'multichip' --junit-xml={{resultPath}} {{testExamples}}"

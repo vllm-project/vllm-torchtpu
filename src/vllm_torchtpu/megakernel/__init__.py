@@ -20,6 +20,7 @@ from . import (
     module,
     module_options,
     ops,
+    planner,
     pool_alias,
     profiles,
     spec,
@@ -27,6 +28,7 @@ from . import (
 from .errors import MegakernelConfigError, MegakernelLayoutError
 from .exec_spec import DebugOptions, ExecSpec, Tiles, default_tiles
 from .ops import rup
+from .planner import encode_ecopy
 from .spec import (
     REQUIRED,
     ExtraInput,
@@ -76,11 +78,13 @@ __all__ = [
     "WeightDecl",
     "decls",
     "default_tiles",
+    "encode_ecopy",
     "errors",
     "exec_spec",
     "module",
     "module_options",
     "ops",
+    "planner",
     "pool_alias",
     "profiles",
     "rup",

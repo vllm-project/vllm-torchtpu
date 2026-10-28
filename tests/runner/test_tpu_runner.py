@@ -30,6 +30,9 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.distributed.kv_transfer import kv_transfer_state
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorTransferResults,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiKVConnectorStats,
 )
@@ -910,7 +913,11 @@ def test_get_finished_kv_transfers_drains_invalid_block_ids(
     cpu_samples = [("0", "main_forward", 0.1)] if has_samples else []
     device_samples = [("0", "main_forward", 0.2)] if has_samples else []
     connector = MagicMock()
-    connector.get_finished.return_value = ({"sent"}, {"loaded"})
+    connector.get_transfer_results.return_value = KVConnectorTransferResults(
+        finished_sending={"sent"},
+        finished_recving={"loaded", "failed"},
+        failed_recving={"failed"},
+    )
     connector.get_block_ids_with_load_errors.return_value = {41, 43}
     connector.get_block_ids_with_load_errors_group_index.return_value = 2
     connector.build_connector_worker_meta.return_value = {"jobs": []}
@@ -930,7 +937,15 @@ def test_get_finished_kv_transfers_drains_invalid_block_ids(
     ):
         result = TPUModelRunner.get_finished_kv_transfers(runner, scheduler_output)
 
-    assert result == ({"sent"}, {"loaded"}, {"jobs": []}, {41, 43}, 2, stats)
+    assert result == (
+        {"sent"},
+        {"loaded", "failed"},
+        {"failed"},
+        {"jobs": []},
+        {41, 43},
+        2,
+        stats,
+    )
     assert result[-1] is stats
     if isinstance(leaf_stats, TpuKVConnectorStats):
         assert leaf_stats.data["runner_cpu_issue_seconds"] == cpu_samples
@@ -939,7 +954,8 @@ def test_get_finished_kv_transfers_drains_invalid_block_ids(
         assert stats == original_stats
     assert unrelated_stats.data == original_unrelated_data
     runner._stage_timing.take_samples.assert_called_once_with()
-    connector.get_finished.assert_called_once_with({"finished"})
+    connector.get_transfer_results.assert_called_once_with({"finished"})
+    connector.get_finished.assert_not_called()
     connector.get_block_ids_with_load_errors.assert_called_once_with()
     connector.get_block_ids_with_load_errors_group_index.assert_called_once_with()
     connector.clear_connector_metadata.assert_called_once_with()
@@ -949,7 +965,15 @@ def test_no_forward_output_preserves_invalid_block_ids():
     runner = SimpleNamespace(
         maybe_setup_kv_connector=MagicMock(),
         get_finished_kv_transfers=MagicMock(
-            return_value=(set(), {"failed-load"}, None, {41, 43}, 2, None)
+            return_value=(
+                set(),
+                {"failed-load"},
+                {"failed-load"},
+                None,
+                {41, 43},
+                2,
+                None,
+            )
         ),
     )
     scheduler_output = SimpleNamespace()
@@ -964,12 +988,13 @@ def test_no_forward_output_preserves_invalid_block_ids():
         )
 
     assert output.kv_connector_output.finished_recving == {"failed-load"}
+    assert output.kv_connector_output.failed_recving == {"failed-load"}
     assert output.kv_connector_output.invalid_block_ids == {41, 43}
     if tpu_runner._KV_CONNECTOR_OUTPUT_SUPPORTS_INVALID_BLOCK_GROUP:
         assert output.kv_connector_output.invalid_block_group_index == 2
 
 
-def test_build_kv_connector_output_supports_vllm_023():
+def test_build_kv_connector_output_omits_unsupported_group_index():
     with (
         patch.object(
             tpu_runner,
@@ -981,6 +1006,7 @@ def test_build_kv_connector_output_supports_vllm_023():
         tpu_runner._build_kv_connector_output(
             finished_sending={"sent"},
             finished_recving=None,
+            failed_recving=set(),
             kv_connector_worker_meta=None,
             invalid_block_ids=set(),
             invalid_block_group_index=None,
@@ -989,6 +1015,7 @@ def test_build_kv_connector_output_supports_vllm_023():
     output_cls.assert_called_once_with(
         finished_sending={"sent"},
         finished_recving=None,
+        failed_recving=set(),
         kv_connector_worker_meta=None,
         invalid_block_ids=set(),
         kv_connector_stats=None,
@@ -1004,6 +1031,7 @@ def test_build_kv_connector_output_forwards_invalid_block_ids_for_hybrid_recover
         out = tpu_runner._build_kv_connector_output(
             finished_sending=None,
             finished_recving={"failed-load"},
+            failed_recving=set(),
             kv_connector_worker_meta=None,
             invalid_block_ids={41, 43},
             invalid_block_group_index=2,

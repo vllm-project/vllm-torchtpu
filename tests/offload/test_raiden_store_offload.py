@@ -1233,7 +1233,26 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         store.complete_load(sub_hashes(_key(0)))
         meta2 = self._build_meta(sched, self._stock_meta())
         self.assertEqual(meta2.finished_load_jobs, {3: "r1"})
-        self.assertEqual(meta2.failed_load_device_block_ids, [])
+        self.assertEqual(meta2.failed_load_req_ids, set())
+
+    def test_failed_load_is_reported_by_request(self):
+        # Block ids are only unique within a KV cache group, so a failed load
+        # must reach the scheduler as its request id; the request still
+        # finishes so it leaves WAITING_FOR_REMOTE_KVS, then recomputes or
+        # fails per kv_load_failure_policy.
+        store = FakeKVCacheStore()
+        manager = make_manager(store)
+        seed_host_entries(store, _key(0))
+        manager.prepare_load([_key(0)], _ctx("r1"))
+        sched = self._make_scheduler(manager)
+        self._build_meta(
+            sched, self._stock_meta(load_jobs={3: self._load_job([_key(0)], [10])})
+        )
+
+        store.complete_load(sub_hashes(_key(0)), success=False)
+        meta = self._build_meta(sched, self._stock_meta())
+        self.assertEqual(meta.finished_load_jobs, {3: "r1"})
+        self.assertEqual(meta.failed_load_req_ids, {"r1"})
 
     def test_flush_cancels_fence_pending_store(self):
         store = FakeKVCacheStore()
@@ -1474,7 +1493,6 @@ class TestWorkerSideConnector(unittest.TestCase):
         conn.connector_worker = MagicMock()
         conn._fenced_jobs = {}
         conn._completed_jobs = {}
-        conn._load_error_block_ids = set()
         conn._pool_sync_tensors = []
         conn._pending_fences = []
         return conn
@@ -1583,24 +1601,39 @@ class TestWorkerSideConnector(unittest.TestCase):
         conn._connector_metadata = self._meta(
             finished_store_job_ids=[1, 2],
             finished_load_jobs={3: "req-a"},
-            failed_load_device_block_ids=[10, 11],
         )
         sending, recving = conn.get_finished(set())
         self.assertEqual(sending, set())
         self.assertEqual(recving, {"req-a"})
         self.assertEqual(conn._completed_jobs, {1: 1, 2: 1, 3: 1})
-        self.assertEqual(conn.get_block_ids_with_load_errors(), {10, 11})
-        self.assertEqual(conn.get_block_ids_with_load_errors(), set())
 
-    def test_load_errors_group_index_is_unscoped(self):
-        # The runner calls this whenever failed block ids are reported.
+    def test_failed_load_reported_as_failed_recving(self):
+        # vLLM rejects block-level load failures on multi-group KV layouts
+        # (DeepSeek-V4, hybrid Mamba), so failures travel by request id.
         conn = self._make_worker_connector()
         conn._connector_metadata = self._meta(
-            failed_load_device_block_ids=[10, 11],
+            finished_load_jobs={3: "req-a", 4: "req-b"},
+            failed_load_req_ids={"req-b"},
         )
-        conn.get_finished(set())
-        self.assertEqual(conn.get_block_ids_with_load_errors(), {10, 11})
-        self.assertIsNone(conn.get_block_ids_with_load_errors_group_index())
+        results = conn.get_transfer_results(set())
+        self.assertEqual(results.finished_sending, set())
+        # The failed request still finishes, which releases it from
+        # WAITING_FOR_REMOTE_KVS.
+        self.assertEqual(results.finished_recving, {"req-a", "req-b"})
+        self.assertEqual(results.failed_recving, {"req-b"})
+        self.assertEqual(conn._completed_jobs, {3: 1, 4: 1})
+        self.assertEqual(conn.get_block_ids_with_load_errors(), set())
+
+    def test_get_finished_refuses_to_report_a_failed_load(self):
+        # get_finished() has no failure channel: returning req-b as finished
+        # would pass its failed load as a good one.
+        conn = self._make_worker_connector()
+        conn._connector_metadata = self._meta(
+            finished_load_jobs={3: "req-a", 4: "req-b"},
+            failed_load_req_ids={"req-b"},
+        )
+        with self.assertRaisesRegex(RuntimeError, "get_transfer_results"):
+            conn.get_finished(set())
 
     def test_build_connector_worker_meta_drains_state(self):
         conn = self._make_worker_connector()
@@ -2569,6 +2602,39 @@ class TestNamespace(unittest.TestCase):
             pcp_ns, derive_offload_namespace(cfg(), **kwargs, cp_geometry=(8, 1, 16))
         )
 
+    def test_namespace_is_salted_only_when_a_group_is_not_offloaded(self):
+        from vllm_torchtpu.offload.raiden_store import derive_offload_namespace
+
+        c = MagicMock()
+        c.model_config.model = "m"
+        c.model_config.revision = "r"
+        c.model_config.quantization = None
+        c.cache_config.prefix_caching_hash_algo = "sha256"
+        kwargs = dict(
+            kernel_block_size=256,
+            per_block_shape=(256, 8, 2, 128),
+            kv_dtype="bfloat16",
+            device_block_size=1280,
+            world_size=4,
+            num_kv_cache_groups=5,
+            num_kv_cache_tensors=64,
+        )
+        ns = derive_offload_namespace(c, **kwargs)
+        # Offloading every group keeps existing namespaces unchanged.
+        every = derive_offload_namespace(
+            c, **kwargs, offloaded_group_ids=(0, 1, 2, 3, 4)
+        )
+        self.assertEqual(ns, every)
+        # Skipping a group (the DSv4 HCA state) moves to a new namespace.
+        skipped = derive_offload_namespace(
+            c, **kwargs, offloaded_group_ids=(0, 1, 2, 4)
+        )
+        self.assertNotEqual(ns, skipped)
+        self.assertNotEqual(
+            skipped,
+            derive_offload_namespace(c, **kwargs, offloaded_group_ids=(0, 1, 2, 3)),
+        )
+
 
 class TestHybridGeometry(unittest.TestCase):
     """resolve_kernel_geometry on hybrid unified-pool group structures."""
@@ -2914,7 +2980,16 @@ def _worker_config(bytes_per_block, *, num_blocks=1):
     )
 
 
-def _build_spec(extra_config, *, tp_size=4, pp_size=1, pcp_size=1, dp_rank_local=0):
+def _build_spec(
+    extra_config,
+    *,
+    tp_size=4,
+    pp_size=1,
+    pcp_size=1,
+    dp_rank_local=0,
+    groups=None,
+    kv_cache_groups=None,
+):
     """A real TPURaidenStoreOffloadingSpec over stub configs, with kernel
     geometry, the block-major contract, and the namespace patched out. Under
     pipeline parallelism the spec needs the recorded all-ranks bytes, so
@@ -2930,7 +3005,7 @@ def _build_spec(extra_config, *, tp_size=4, pp_size=1, pcp_size=1, dp_rank_local
     config = SimpleNamespace(
         extra_config={"cpu_bytes_to_use": 1 << 20, **extra_config},
         enable_kv_cache_events=False,
-        groups=[SimpleNamespace(tokens_per_block=64)],
+        groups=groups or [SimpleNamespace(group_id=0, tokens_per_block=64)],
         cache=SimpleNamespace(tokens_per_hash=64, blocks_per_chunk=1),
         parallel=SimpleNamespace(
             tp_size=tp_size,
@@ -2949,7 +3024,7 @@ def _build_spec(extra_config, *, tp_size=4, pp_size=1, pcp_size=1, dp_rank_local
     vllm_config.parallel_config.data_parallel_rank = dp_rank_local
     vllm_config.parallel_config.data_parallel_rank_local = dp_rank_local
     kv_cache_config = SimpleNamespace(
-        kv_cache_groups=[SimpleNamespace(kv_cache_spec=object())],
+        kv_cache_groups=kv_cache_groups or [SimpleNamespace(kv_cache_spec=object())],
         kv_cache_tensors=[object()],
     )
     with (
@@ -2962,6 +3037,31 @@ def _build_spec(extra_config, *, tp_size=4, pp_size=1, pcp_size=1, dp_rank_local
         patch.object(rs, "derive_offload_namespace", return_value=b"\0" * 16),
     ):
         return rs.TPURaidenStoreOffloadingSpec(config, vllm_config, kv_cache_config)
+
+
+class TestOffloadedGroupSubset(unittest.TestCase):
+    """vLLM offloads only the prefix-cacheable groups, so the spec's group
+    configs can skip a KV cache group; each is checked against its own."""
+
+    def test_groups_are_matched_by_group_id(self):
+        import torch
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        def group(block_size):
+            spec = FullAttentionSpec(
+                block_size=block_size, num_kv_heads=1, head_size=8, dtype=torch.uint8
+            )
+            return SimpleNamespace(kv_cache_spec=spec)
+
+        spec = _build_spec(
+            {"cpu_bytes_to_use": 1 << 20},
+            groups=[
+                SimpleNamespace(group_id=0, tokens_per_block=64),
+                SimpleNamespace(group_id=2, tokens_per_block=16),
+            ],
+            kv_cache_groups=[group(64), group(32), group(16)],
+        )
+        self.assertIsNotNone(spec)
 
 
 class TestAllRanksKvBytesPerBlock(unittest.TestCase):
