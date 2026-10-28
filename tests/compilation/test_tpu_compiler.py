@@ -132,6 +132,62 @@ class TestTpuCompilerCache:
                     changed = compute_tpu_compilation_hash(self._config())
                 assert base != changed
 
+    def test_tpu_hash_without_libtpu_package_uses_library_fingerprint(self, tmp_path):
+        from importlib import metadata as importlib_metadata
+
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+
+        def version(name):
+            if name == "libtpu":
+                raise importlib_metadata.PackageNotFoundError(name)
+            return "1"
+
+        hashes = []
+        for payload in (b"build-a" * 4096, b"build-b" * 4096):
+            library = tmp_path / f"{len(hashes)}" / "libtpu.so"
+            library.parent.mkdir()
+            library.write_bytes(payload)
+            with (
+                patch(
+                    "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+                    return_value=[],
+                ),
+                patch(
+                    "vllm_torchtpu.compilation.tpu_compiler.importlib_metadata.version",
+                    side_effect=version,
+                ),
+                patch.dict(os.environ, {"TPU_LIBRARY_PATH": str(library)}),
+            ):
+                hashes.append(compute_tpu_compilation_hash(self._config()))
+        assert hashes[0] != hashes[1]
+
+    def test_tpu_hash_prefers_tpu_library_path_over_libtpu_package(self, tmp_path):
+        # JAX loads TPU_LIBRARY_PATH in preference to the pip package, so the
+        # hash must follow the library even when libtpu==0.0.50 is installed.
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+
+        def version(name):
+            return "0.0.50" if name == "libtpu" else "1"
+
+        hashes = []
+        for payload in (b"build-a" * 4096, b"build-b" * 4096):
+            library = tmp_path / f"{len(hashes)}" / "libtpu.so"
+            library.parent.mkdir()
+            library.write_bytes(payload)
+            with (
+                patch(
+                    "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+                    return_value=[],
+                ),
+                patch(
+                    "vllm_torchtpu.compilation.tpu_compiler.importlib_metadata.version",
+                    side_effect=version,
+                ),
+                patch.dict(os.environ, {"TPU_LIBRARY_PATH": str(library)}),
+            ):
+                hashes.append(compute_tpu_compilation_hash(self._config()))
+        assert hashes[0] != hashes[1]
+
     def test_tpu_hash_covers_effective_data_parallel_size(self):
         from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
 

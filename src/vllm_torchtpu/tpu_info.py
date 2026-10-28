@@ -13,7 +13,10 @@
 # limitations under the License.
 import functools
 import glob
+import hashlib
+import importlib.util
 import os
+from importlib import metadata as importlib_metadata
 
 import requests
 from jax.experimental.pallas import tpu as pltpu
@@ -82,6 +85,88 @@ def get_chip_version(accelerator_type: str | None = None) -> pltpu.ChipVersion:
             accelerator_type,
         )
         return pltpu.ChipVersion.TPU_7X
+
+
+def get_libtpu_version() -> str | None:
+    """Version of the pip ``libtpu`` package, or None if it is not installed.
+
+    Some environments load ``libtpu.so`` directly through ``TPU_LIBRARY_PATH``
+    (for example container images that ship a prebuilt library) and have no
+    ``libtpu`` package metadata.
+    """
+    try:
+        return importlib_metadata.version("libtpu")
+    except importlib_metadata.PackageNotFoundError:
+        return None
+
+
+def _pip_libtpu_library_path() -> str | None:
+    """``libtpu.so`` shipped by the pip ``libtpu`` package, if installed.
+
+    Located with ``find_spec`` rather than an import: importing ``libtpu`` sets
+    ``TPU_LIBRARY_PATH`` to this path when it is unset.
+    """
+    spec = importlib.util.find_spec("libtpu")
+    if spec is None or not spec.origin:
+        return None
+    return os.path.join(os.path.dirname(spec.origin), "libtpu.so")
+
+
+def get_tpu_library_path() -> str | None:
+    """Custom ``libtpu.so`` from ``TPU_LIBRARY_PATH``, if one is in use.
+
+    JAX loads ``TPU_LIBRARY_PATH`` in preference to the pip ``libtpu`` package
+    (``jax/_src/cloud_tpu_init.py``). Like JAX, a path that is just the pip
+    package's own library (which ``import libtpu`` exports) is not custom.
+    Returns None when the variable is unset, names a missing file, or names the
+    pip package's library.
+    """
+    path = envs.TPU_LIBRARY_PATH or ""
+    if not path or not os.path.isfile(path):
+        return None
+    package_library = _pip_libtpu_library_path()
+    if (
+        package_library is not None
+        and os.path.isfile(package_library)
+        and os.path.samefile(path, package_library)
+    ):
+        return None
+    return path
+
+
+@functools.cache
+def _libtpu_file_fingerprint(path: str, size: int, mtime_ns: int) -> str:
+    # Hash the size and the first/last MiB: cheap for a ~700 MB library, and
+    # it distinguishes builds even when images reset mtimes. This assumes the
+    # ELF header and the .note.gnu.build-id note, which differ between builds,
+    # lie within the first MiB of libtpu.so; a build that differed only in the
+    # middle of the file would not change the fingerprint.
+    digest = hashlib.sha256(str(size).encode())
+    with open(path, "rb") as f:
+        digest.update(f.read(1 << 20))
+        if size > (1 << 20):
+            f.seek(max(size - (1 << 20), 1 << 20))
+            digest.update(f.read(1 << 20))
+    return digest.hexdigest()[:16]
+
+
+def get_libtpu_cache_key() -> str:
+    """Identify the libtpu build in use, for compilation and layout cache keys.
+
+    Uses a fingerprint of a custom library at ``TPU_LIBRARY_PATH`` (JAX loads
+    it instead of the pip package; see ``get_tpu_library_path``), otherwise
+    the ``libtpu`` package version, otherwise ``"unpackaged-unknown"``.
+    """
+    path = get_tpu_library_path()
+    if path is not None:
+        st = os.stat(path)
+        return "unpackaged-" + _libtpu_file_fingerprint(
+            path, st.st_size, st.st_mtime_ns
+        )
+    libtpu_version = get_libtpu_version()
+    if libtpu_version is not None:
+        return libtpu_version
+    return "unpackaged-unknown"
 
 
 def get_node_name() -> str:
