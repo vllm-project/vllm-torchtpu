@@ -760,8 +760,11 @@ def test_megakernel_paths_keep_the_sink_layer_on_attend():
 
     with pytest.raises(NotImplementedError, match="shared-selection"):
         Qwen4ExpQSA.select_for_kernel(NS(_selection_sink=torch.zeros(1, 1)), None, None, None)
+    import inspect
+
     try:
-        from vllm_torchtpu.megakernel_runtime.qwen38_driver import Qwen38Segments
-    except Exception:  # noqa: BLE001 - optional runtime deps
+        from vllm_torchtpu.megakernel_runtime import qwen38_driver, qwen38_wholestep
+    except (ImportError, ModuleNotFoundError):
         pytest.skip("megakernel runtime unavailable")
-    assert not hasattr(Qwen38Segments, "attention_rows")
+    for module in (qwen38_driver, qwen38_wholestep):  # no setter, on the class or in __init__
+        assert "attention_rows" not in inspect.getsource(module), module.__name__
