@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import apply_act_fn, interleave_lane
@@ -198,7 +199,10 @@ def test_moe_gmm_uses_selected_ragged_gather_reduce(
         if sc_lanes == "no-tpu-info":
             raise ValueError("unsupported device kind")
         return types.SimpleNamespace(
-            sparse_core=sc_info, num_lanes=128, vmem_capacity_bytes=64 << 20
+            chip_version=pltpu.ChipVersion.TPU_7X,
+            sparse_core=sc_info,
+            num_lanes=128,
+            vmem_capacity_bytes=64 << 20,
         )
 
     monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info", get_tpu_info)
@@ -948,7 +952,11 @@ def test_fused_moe_func_int4_packed_matches_reference():
 
 
 def _fake_tpu_info(sparse_core):
-    return types.SimpleNamespace(sparse_core=sparse_core)
+    # A chip the SparseCore kernels are validated on; only the SparseCore
+    # geometry varies across these tests.
+    return types.SimpleNamespace(
+        chip_version=pltpu.ChipVersion.TPU_7X, sparse_core=sparse_core
+    )
 
 
 def _fake_sc_info(num_lanes, num_cores, num_subcores):
@@ -1011,6 +1019,16 @@ def test_onehot_threshold_auto_zero_without_sparse_core(monkeypatch):
     monkeypatch.setattr(
         fused_moe_gmm.pltpu, "get_tpu_info", lambda: _fake_tpu_info(None)
     )
+    assert fused_moe_gmm.resolve_onehot_permute_threshold() == 0
+
+
+def test_onehot_threshold_auto_zero_for_unvalidated_sparse_core_chip(monkeypatch):
+    monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", None, raising=False)
+    # TPU8i reports a SparseCore, but the SparseCore gather/reduce kernels are
+    # not validated on it, so the one-hot path is off.
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_8I, 1)
+    assert info.sparse_core is not None
+    monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info", lambda: info)
     assert fused_moe_gmm.resolve_onehot_permute_threshold() == 0
 
 
