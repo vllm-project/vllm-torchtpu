@@ -47,6 +47,9 @@ from vllm.config.utils import Range
 
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.compilation.scheduling_groups import (
+    _bind_scheduling_group_namespaces,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -271,6 +274,8 @@ _NATIVE_TPU_COMPILE_ENV_VARS = (
 )
 
 _RUNTIME_CACHE_KEY_PATHS = (
+    # Static call-site binding changes the exported native kernel identity.
+    "vllm_torchtpu/compilation/scheduling_groups.py",
     # Pallas implementations execute behind torch custom-op boundaries, so
     # Dynamo's traced-file validation cannot see their source changes.
     "vllm_torchtpu/kernels",
@@ -807,6 +812,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         # moves, so the placeholder signature is unaffected.
         graph = copy.deepcopy(graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
+        _bind_scheduling_group_namespaces(graph)
 
         caching = (
             key is not None and self.cache_dir is not None and not self._disable_cache
@@ -927,6 +933,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         # artifact is checked against is shaped the way it was when saved.
         graph = copy.deepcopy(graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
+        _bind_scheduling_group_namespaces(graph)
 
         compiled_fn = self._replay(path, graph, was_wrapped)
         if compiled_fn is None:
