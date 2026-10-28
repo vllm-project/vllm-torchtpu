@@ -1721,6 +1721,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SCHED_KV_PREFETCH_RESERVE_BLOCKS": env_nonnegative_int(
         "TPU_SCHED_KV_PREFETCH_RESERVE_BLOCKS", 64
     ),
+    # PrefixAwareScheduler: also count the whole chunks the offload tier holds
+    # right past a request's HBM hit as warm (core/prefix_aware_scheduler.py),
+    # so a session HBM evicted but the tier kept is not ranked fully cold.
+    "TPU_PREFIX_AWARE_TIER_WARMTH": env_bool(
+        "TPU_PREFIX_AWARE_TIER_WARMTH", default=False
+    ),
     # Load remote KV before the first forward, not in a no-forward step.
     "TPU_RAIDEN_INLINE_LOAD": env_bool("TPU_RAIDEN_INLINE_LOAD", default=False),
     # Comma-separated dot-bounded module prefix names to quantize to FP8 on load.
