@@ -53,8 +53,8 @@ RANDOM_RANGE_RATIO="0.0"
 # the GLM-5.2 NVFP4 recipe.
 export MOE_REQUANTIZE_BLOCK_SIZE="${MOE_REQUANTIZE_BLOCK_SIZE:-512}"
 
-# Optimized GLM-5.3-NVFP4 v7x-8 serving stack (+65.07% output tok/s/device:
-# 139.72 -> 230.63 tok/s/device at ISL=8192, OSL=1024, c=512):
+# Optimized GLM-5.3-NVFP4 v7x-8 serving stack (+97.35% output tok/s/device:
+# 139.72 -> 275.74 tok/s/device at ISL=8192, OSL=1024, c=512; mmlu_pro=0.7643):
 # 1. Fused EP MoE v2 with W4A8 MXU matmuls + sharded schedule plan + padded-row skip
 export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-1}"
 export MOE_FUSED_EP_ENABLE_W4A8="${MOE_FUSED_EP_ENABLE_W4A8:-1}"
@@ -74,6 +74,9 @@ export VLLM_TPU_FAST_TOKEN_SUBSTITUTION="${VLLM_TPU_FAST_TOKEN_SUBSTITUTION:-1}"
 # 5. SparseCore async All-Gather offload (512 KiB threshold: keeps q_g >= 768 KiB on SparseCore while keeping 296 KiB MoE routing exchange on TensorCore ICI)
 export SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES="${SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES:-524288}"
 export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:+$LIBTPU_INIT_ARGS }--xla_enable_async_all_gather=true --xla_tpu_enable_sparse_core_collective_offload_all_gather=true --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=${SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES}"
+# 6. Load-time per-channel FP8 quantization of excluded BF16 dense MLP, shared-expert, and MLA linear projections (frees 9.23 GiB/chip for 2-wave C=32 KV cache + W8A8 prefill / W8A16 decode)
+export QUANTIZE_ON_LOAD_PREFIXES="${QUANTIZE_ON_LOAD_PREFIXES:-shared_experts,layers.0.mlp,layers.1.mlp,layers.2.mlp,fused_qkv_a_proj,q_b_proj,o_proj}"
+export TPU_FP8_LINEAR_W8A16_MAX_ROWS="${TPU_FP8_LINEAR_W8A16_MAX_ROWS:-32}"
 
 # Server configuration:
 # - max-model-len=9216: exact nominal length for 8192 input + 1024 output.
@@ -96,7 +99,9 @@ KV_CACHE_DTYPE="fp8"
 # --enable-ep-weight-filter: each rank reads only its own experts plus dense
 # weights (model_loader_patches.py). --safetensors-load-strategy=prefetch
 # streams the 47 shards from local disk.
-EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--enable-ep-weight-filter --safetensors-load-strategy=prefetch --tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm45"
+# 292 KV blocks/rank = 32 concurrent 9216-token sequences/rank (2 balanced waves of 32+32 in the T=32 decode bucket).
+NUM_GPU_BLOCKS_OVERRIDE="${GLM53_NUM_GPU_BLOCKS_OVERRIDE:-292}"
+EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--enable-ep-weight-filter --safetensors-load-strategy=prefetch --tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm45${NUM_GPU_BLOCKS_OVERRIDE:+ --num-gpu-blocks-override ${NUM_GPU_BLOCKS_OVERRIDE}}"
 
 # Greedy decoding for bench requests.
 BENCHMARK_TEMPERATURE="0"

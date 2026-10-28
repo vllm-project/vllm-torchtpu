@@ -1,9 +1,9 @@
 {
     "isl8192_osl1024_c512": {
         "completed": 512,
-        "median_tpot_ms": 96.87,
+        "median_tpot_ms": 107.47,
         "num_prompts": 512,
-        "output_token_throughput": 1845.01,
-        "total_token_throughput": 16605.13
+        "output_token_throughput": 2205.95,
+        "total_token_throughput": 19853.52
     }
 }

@@ -103,3 +103,36 @@ class TestUnquantizedConfigQuantizeOnLoadDispatch:
             linear_layer, prefix="model.layers.0.mlp.down_proj"
         )
         assert isinstance(method, VllmUnquantizedLinearMethod)
+
+    def test_nvfp4_excluded_linear_layer_respects_quantize_on_load(
+        self, monkeypatch, linear_layer
+    ):
+        from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4Config
+
+        monkeypatch.setenv("QUANTIZE_ON_LOAD_PREFIXES", "shared_experts")
+        cfg = VllmNvfp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            kv_cache_quant_algo=None,
+            exclude_modules=["model.layers.*.mlp.shared_experts*"],
+        )
+        method_match = cfg.get_quant_method(
+            linear_layer, prefix="model.layers.3.mlp.shared_experts.down_proj"
+        )
+        assert isinstance(method_match, VllmFp8LinearMethodTPU)
+        linear_layer.register_parameter(
+            "weight",
+            torch.nn.Parameter(
+                torch.randn(32, 64, dtype=torch.bfloat16) * 0.02,
+                requires_grad=False,
+            ),
+        )
+        method_match.process_weights_after_loading(linear_layer)
+        assert linear_layer.weight.dtype == torch.float8_e4m3fn
+        assert linear_layer.weight.shape == (64, 32)
+        assert linear_layer.weight_scale.shape == (32,)
+
+        monkeypatch.setenv("QUANTIZE_ON_LOAD_PREFIXES", "")
+        method_no_match = cfg.get_quant_method(
+            linear_layer, prefix="model.layers.3.mlp.shared_experts.down_proj"
+        )
+        assert isinstance(method_no_match, VllmUnquantizedLinearMethod)
