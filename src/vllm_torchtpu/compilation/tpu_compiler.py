@@ -257,6 +257,15 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
     # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
+    # The expert count tap's snapshot cadence and directory are host-side;
+    # whether the tap is on at all does change the forward, and is hashed
+    # separately as "expert_count_tap".
+    "MOE_EXPERT_COUNT_TAP_DIR",
+    "MOE_EXPERT_COUNT_TAP_EVERY",
+    # A static expert placement permutes expert weights and router tables at
+    # load (expert_placement.py); every program is the unplaced model's, so a
+    # placed server reuses its compile cache.
+    "TPU_EXPERT_PLACEMENT",
     # Pooling: the static pooler is a separate backend="tpu" helper outside the
     # backbone graph, and the KV cap reaches the hash through num_gpu_blocks.
     "VLLM_TPU_STATIC_POOLER",
@@ -413,6 +422,8 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         "libtpu": importlib_metadata.version("libtpu"),
         "env": _tpu_compile_env_factors(),
         "native_env": {name: os.getenv(name) for name in _NATIVE_TPU_COMPILE_ENV_VARS},
+        # The tap adds its selection and counters to every MoE layer's forward.
+        "expert_count_tap": bool(envs.MOE_EXPERT_COUNT_TAP_DIR),
         "parallel": {
             "effective_data_parallel_size": utils.get_dp_size(
                 vllm_config.parallel_config

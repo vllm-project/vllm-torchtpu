@@ -43,6 +43,9 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `USE_MOE_FUSED_EP_KERNEL` | `False` | Enables the fused Expert-Parallel (`EP`) Pallas MoE kernel. |
 | `MOE_FUSED_EP_KERNEL_IMPL` | `None` | Selects a specific fused EP MoE kernel implementation (`"v1"` or `"v2"`). |
 | `MOE_FUSED_EP_ENABLE_W4A8` | `False` | Enables 4-bit weight / 8-bit activation (`W4A8`) execution in the fused EP MoE kernel. |
+| `TPU_EXPERT_PLACEMENT` | `""` | Static expert placement for `EP`: a JSON table (a shipped table's name, a local path or a `gs://` URI) that sets, per MoE layer, which experts each EP rank holds. Applied at weight load to the experts and the router, so every MoE kernel serves it unchanged. |
+| `MOE_EXPERT_COUNT_TAP_DIR` | `""` | Directory the per-layer routed-expert count snapshots are written to, the input of `scripts/moe_expert_placement.py`. A diagnostic: the forward does extra work. Empty disables the tap. |
+| `MOE_EXPERT_COUNT_TAP_EVERY` | `1000` | Runner steps between routed-expert count snapshots. |
 | `TPU_MOE_HIERARCHICAL_EP` | `False` | Enables two-level intra-chip / inter-chip hierarchical Expert Parallelism on dual-core TPU v7x hosts. |
 | `TPU_MOE_SEQUENCE_PARALLEL` | `False` | Enables sequence parallelism around MoE blocks. |
 | `TPU_MOE_ROUTER_TOPK` | `"rowmax"` | MoE router top-k kernel implementation (`"rowmax"` or standard top-k). |

@@ -470,6 +470,11 @@ class TpuPlatform(Platform):
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
+        "MOE_EXPERT_COUNT_TAP_DIR",
+        "MOE_EXPERT_COUNT_TAP_EVERY",
+        # Every EP rank must hold the same placement: a rank that served
+        # without it would route to experts its peers no longer hold.
+        "TPU_EXPERT_PLACEMENT",
         "VLLM_TPU_INDEXER_KV_CACHE_MODE",
         "TPU_DCP_INDEXER_A2A_MERGE",
         "TPU_DCP_INDEXER_A2A_MIN_TOKENS",

@@ -61,7 +61,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import envs, expert_placement
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -81,6 +81,13 @@ def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
         return False
     if not name.endswith(_EXPERT_WEIGHT_SUFFIXES):
         return False
+    if expert_placement.has_applied_layers():
+        # The placement's rank list for this tensor's layer, at the EP rank the
+        # layer's expert map was built for -- so the fetch and the expert map
+        # agree by construction, whatever derived that rank.
+        placed = expert_placement.fetch_filter_ids(name)
+        if placed is not None:
+            return expert_id not in placed
     return expert_id not in local_expert_ids
 
 
@@ -968,3 +975,30 @@ def patch_moe_expert_write_staging() -> None:
         "Applied TPU patch: expert parameters are staged on the host "
         "and written to the device once each."
     )
+
+
+def patch_expert_placement_routers() -> None:
+    """Renumber placed MoE layers' routers after every model's weights load.
+
+    TPU_EXPERT_PLACEMENT loads a placed layer's experts in slot order
+    (``expert_placement.apply``, from the TPU MoE runner). Its router has to
+    be renumbered the same way once the checkpoint is written and before
+    process_weights_after_loading stages anything derived from it. Every model
+    a loader builds, a drafter included, passes through here between the two,
+    so no model needs code of its own.
+    """
+    from vllm.model_executor.model_loader import base_loader
+
+    orig_process = base_loader.process_weights_after_loading
+    if getattr(orig_process, "_tpu_renumbers_expert_routers", False):
+        return
+
+    @functools.wraps(orig_process)
+    def process_weights_after_loading(model, model_config, target_device):
+        expert_placement.permute_routers(model)
+        return orig_process(model, model_config, target_device)
+
+    typing.cast(
+        typing.Any, process_weights_after_loading
+    )._tpu_renumbers_expert_routers = True
+    base_loader.process_weights_after_loading = process_weights_after_loading
