@@ -523,17 +523,24 @@ class RaidenOffloadingManager(OffloadingManager):
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         return RequestOffloadingContext()
 
-    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+    def lookup(
+        self,
+        key: OffloadKey,
+        req_context: ReqContext | None = None,
+        *,
+        local_only: bool = False,
+    ) -> LookupResult:
         if key in self._inflight_store_keys:
             return LookupResult.HIT_PENDING
         sub_hashes = self._sub_hashes(key)
         # A probe across all sub-hashes, not a claim: the store pins every
         # local hit it reports, and those pins go straight back below.
         # `prepare_load` takes them again when the scheduler commits to a load.
-        # With the global registry enabled, local misses query remote peer slices.
-        # If the registry is unreachable or times out, the error is swallowed and
-        # lookup safely falls back to local-only caching without failing requests.
-        allow_remote = self._enable_global
+        # With the global registry enabled, local misses query remote peer slices
+        # unless the caller asked for a local-only probe (e.g. scheduler warmth
+        # ranking, which never calls `prepare_load` and must not stall on RPCs
+        # or populate `_remote_slices`).
+        allow_remote = self._enable_global and not local_only
         matches = self._probe(sub_hashes, enable_global=allow_remote)
         if len(matches) < len(sub_hashes):
             return LookupResult.MISS
@@ -566,9 +573,10 @@ class RaidenOffloadingManager(OffloadingManager):
             # (SHARED_STORAGE) are both read with read_remote straight into
             # HBM. The storage tier answers whether or not the global registry
             # is enabled, so only a peer hit is gated on it.
-            if (
-                status == self._block_status.REMOTE and allow_remote
-            ) or status == self._block_status.SHARED_STORAGE:
+            if not local_only and (
+                (status == self._block_status.REMOTE and allow_remote)
+                or status == self._block_status.SHARED_STORAGE
+            ):
                 if sub_hash in self._hash_to_admission:
                     # A read_remote for this sub-hash is already in flight;
                     # a second launch on the same hash must not race it.
