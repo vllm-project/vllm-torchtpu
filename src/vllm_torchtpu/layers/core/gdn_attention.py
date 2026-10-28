@@ -38,9 +38,11 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
 )
 from vllm_torchtpu.kernels.gdn.v3 import pcp_wrapper as gdn_v3_pcp_wrapper
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
+from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput
 from vllm_torchtpu.utils import get_mesh_shape_product
 
 _GDN_TP_AXIS_NAME = "tp"
+_GDN_MODEL_AXIS_NAME = "model"
 
 
 def _gdn_tp_axis_name(mesh: jax.sharding.Mesh) -> str | None:
@@ -850,7 +852,7 @@ def _build_v3_pool_state_plan(
 
 
 def run_jax_gdn_attention_pooled_local(
-    mixed_qkv: jnp.ndarray,
+    mixed_qkv: jnp.ndarray | Conv1DInput,
     b: jnp.ndarray,
     a: jnp.ndarray,
     recurrent_state: jnp.ndarray,
@@ -932,7 +934,7 @@ def run_jax_gdn_attention_pooled_local(
 
 
 def run_jax_gdn_attention_pooled(
-    j_mixed_qkv: jnp.ndarray,
+    j_mixed_qkv: jnp.ndarray | Conv1DInput,
     j_b: jnp.ndarray,
     j_a: jnp.ndarray,
     recurrent_state: jnp.ndarray,
@@ -997,14 +999,18 @@ def run_jax_gdn_attention_pooled(
     """
     pool_spec = P(*([None] * recurrent_state.ndim))  # attention-shaped pool
     in_specs = (
-        P(None, "model"),  # j_mixed_qkv
-        P(None, "model"),  # j_b
-        P(None, "model"),  # j_a
+        (
+            jax.tree.map(lambda _: P(None, None, _GDN_MODEL_AXIS_NAME), j_mixed_qkv)
+            if isinstance(j_mixed_qkv, Conv1DInput)
+            else P(None, _GDN_MODEL_AXIS_NAME)
+        ),  # j_mixed_qkv
+        P(None, _GDN_MODEL_AXIS_NAME),  # j_b
+        P(None, _GDN_MODEL_AXIS_NAME),  # j_a
         pool_spec,  # recurrent_state (attention-shaped pool)
-        P("model", None, None),  # j_conv_weight
-        P("model") if j_conv_bias is not None else None,  # j_conv_bias
-        P("model"),  # j_A_log
-        P("model"),  # j_dt_bias
+        P(_GDN_MODEL_AXIS_NAME, None, None),  # j_conv_weight
+        P(_GDN_MODEL_AXIS_NAME) if j_conv_bias is not None else None,  # j_conv_bias
+        P(_GDN_MODEL_AXIS_NAME),  # j_A_log
+        P(_GDN_MODEL_AXIS_NAME),  # j_dt_bias
         P(None),  # query_start_loc
         P(None),  # state_indices
         P(None),  # distribution
@@ -1025,10 +1031,10 @@ def run_jax_gdn_attention_pooled(
 
     out_specs = (
         pool_spec,  # new_recurrent_state (attention-shaped pool)
-        P(None, "model"),  # output
+        P(None, _GDN_MODEL_AXIS_NAME),  # output
     )
 
-    tp_size = get_mesh_shape_product(mesh, "model")
+    tp_size = get_mesh_shape_product(mesh, _GDN_MODEL_AXIS_NAME)
 
     p_run_jax_gdn_attention_pooled_local = functools.partial(
         run_jax_gdn_attention_pooled_local,
