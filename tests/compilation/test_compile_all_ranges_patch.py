@@ -37,6 +37,9 @@ def compile_all_ranges(monkeypatch):
     monkeypatch.setenv("TPU_PARALLEL_PRECOMPILE", "1")
     monkeypatch.setenv("TPU_PRECOMPILE_BIGGEST_FIRST", "1")
     monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", "1")
+    # host_slot() takes TPU_LOCAL_RANK_OFFSET off LOCAL_RANK; keep a value from
+    # the environment from changing which rank owns which range.
+    monkeypatch.delenv("TPU_LOCAL_RANK_OFFSET", raising=False)
     monkeypatch.setattr(
         piecewise_backend, "create_concrete_args", lambda graph, size: [size]
     )
@@ -67,7 +70,13 @@ def _host(monkeypatch, ranks_per_host):
     monkeypatch.setattr(parallel_state, "get_node_count", lambda: 2)
 
 
-def _compile(compile_all_ranges, monkeypatch, local_rank, ranks_per_host=8):
+def _compile(
+    compile_all_ranges,
+    monkeypatch,
+    local_rank,
+    ranks_per_host=8,
+    disable_cache=False,
+):
     """(range end, peer wait in seconds) per compile, in order."""
     _host(monkeypatch, ranks_per_host)
     monkeypatch.setenv("LOCAL_RANK", str(local_rank))
@@ -87,7 +96,9 @@ def _compile(compile_all_ranges, monkeypatch, local_rank, ranks_per_host=8):
             for s in SIZES
         },
         vllm_backend=SimpleNamespace(
-            compiler_manager=SimpleNamespace(compile=compile),
+            compiler_manager=SimpleNamespace(
+                compile=compile, disable_cache=disable_cache
+            ),
             inductor_config={},
             is_encoder=False,
         ),
@@ -182,3 +193,82 @@ def test_peer_replay_off_compiles_every_range_without_waiting(
     for calls in runs:
         assert all(wait == 0.0 for _, wait in calls)
         assert sorted(end for end, _ in calls) == SIZES
+
+
+def _host_owners(compile_all_ranges, monkeypatch, local_ranks, **kwargs):
+    """Every range a rank compiled without waiting, for each rank present."""
+    return {
+        r: _owned(_compile(compile_all_ranges, monkeypatch, r, **kwargs))
+        for r in local_ranks
+    }
+
+
+def _assert_one_owner_each(owners):
+    """The ranks present own every range exactly once between them, so no
+    rank waits on a slot no process holds."""
+    owned = [end for ends in owners.values() for end in ends]
+    assert sorted(owned) == SIZES
+
+
+def _assert_opted_out(compile_all_ranges, monkeypatch, local_ranks, **kwargs):
+    for r in local_ranks:
+        calls = _compile(compile_all_ranges, monkeypatch, r, **kwargs)
+        assert all(wait == 0.0 for _, wait in calls)
+        assert sorted(end for end, _ in calls) == SIZES
+
+
+def test_dense_dp_engines_compile_alone(compile_all_ranges, monkeypatch):
+    """Dense DP replicas keep a world group per engine (one rank at TP=1) and
+    all bind LOCAL_RANK=0: with one rank per host they must not wait on slots
+    1..7 that no process of theirs holds."""
+    _assert_opted_out(compile_all_ranges, monkeypatch, [0] * 8, ranks_per_host=1)
+
+
+def test_local_rank_offset_is_taken_off(compile_all_ranges, monkeypatch):
+    """TPU_LOCAL_RANK_OFFSET=4 with 4 ranks on the host: the binding sets
+    LOCAL_RANK 4..7, which are slots 0..3. Without taking the offset off they
+    owned no range and replayed nothing."""
+    monkeypatch.setenv("TPU_LOCAL_RANK_OFFSET", "4")
+    owners = _host_owners(
+        compile_all_ranges, monkeypatch, range(4, 8), ranks_per_host=4
+    )
+    # The same split as ranks 0..3 of a 4-rank host without an offset.
+    assert list(owners.values()) == [
+        [4096, 32, 16],
+        [2048, 64],
+        [1024, 128],
+        [512, 256],
+    ]
+
+
+def test_a_slot_outside_the_host_opts_out(compile_all_ranges, monkeypatch):
+    """A rank whose slot falls outside the host count waits on no one."""
+    _assert_opted_out(compile_all_ranges, monkeypatch, [9], ranks_per_host=8)
+
+
+def test_peer_replay_is_ignored_with_the_compile_cache_disabled(
+    compile_all_ranges, monkeypatch
+):
+    """Peers hand ranges over through vLLM's compile cache, so with the cache
+    disabled TPU_PRECOMPILE_PEER_REPLAY=1 is an invalid combination: it warns
+    and falls back to every rank compiling every range, without waiting."""
+    import vllm_torchtpu
+
+    warnings = []
+
+    class _Logger:
+        def warning_once(self, msg, *args, **kwargs):
+            warnings.append(msg)
+
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: None
+
+    monkeypatch.setattr(vllm_torchtpu, "logger", _Logger())
+    runs = [
+        _compile(compile_all_ranges, monkeypatch, r, disable_cache=True)
+        for r in range(8)
+    ]
+    for calls in runs:
+        assert all(wait == 0.0 for _, wait in calls)
+        assert sorted(end for end, _ in calls) == SIZES
+    assert warnings and "VLLM_DISABLE_COMPILE_CACHE" in warnings[0]
