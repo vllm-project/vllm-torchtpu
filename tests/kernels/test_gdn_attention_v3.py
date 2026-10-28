@@ -313,8 +313,8 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
                 # PCP8 + TP1 disagg prefill (n_kq=2, n_v=8, W=1)
                 ("pcp8_prefill_b4096", 2, 8, 4096, 16, 1, f32, (4, 128)),
                 # Qwen3.5/3.6-27B + TP2 (n_kq=8, n_v=24): 3 head groups
-                ("qwen27b_tp2_c32_b32", 8, 24, 32, 32, 1, f32, None),
-                ("qwen27b_tp2_c32_b2048", 8, 24, 2048, 32, 1, f32, None),
+                ("qwen27b_tp2_c32_b32", 8, 24, 32, 32, 1, f32, (4, 32)),
+                ("qwen27b_tp2_c32_b2048", 8, 24, 2048, 32, 1, f32, (4, 128)),
                 # DP4 + TP2 + EP8 (n_kq=8, n_v=32, W=1 and W=4)
                 ("dp4tp2_c64_b8", 8, 32, 8, 32, 1, f32, (2, 8)),
                 ("dp4tp2_c64_b32", 8, 32, 32, 32, 1, f32, (4, 32)),
@@ -351,17 +351,11 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
                         mixed_vmem_limit_bytes=mixed_limit,
                         window_size=w,
                     )
-                    if expected is None:
-                        # Only the shape contract: tiles exist and the chunk
-                        # is a multiple of the triangular block.
-                        decode_tile, mixed_tile = got
-                        self.assertGreaterEqual(decode_tile, 1, msg=label)
-                        self.assertIn(mixed_tile, tiling.MIXED_TILE_SIZES, label)
-                        cfg = self._gdn_config(n_v, mixed_tile)
-                        b = min(cfg.triangular_block_size, mixed_tile)
-                        self.assertEqual(mixed_tile % b, 0, msg=label)
-                    else:
-                        self.assertEqual(got, expected, msg=label)
+                    self.assertEqual(got, expected, msg=label)
+                    _, mixed_tile = got
+                    cfg = self._gdn_config(n_v, mixed_tile)
+                    tri_b = min(cfg.triangular_block_size, mixed_tile)
+                    self.assertEqual(mixed_tile % tri_b, 0, msg=label)
 
     def _gdn_config(self, n_v, chunk_size, attention_mode=None, cfg_mod=config):
         if attention_mode is None:
