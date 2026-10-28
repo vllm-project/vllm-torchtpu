@@ -23,6 +23,11 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2 import config, me
 
 # Sub-chunks whose index and weight fetches may be in flight at once.
 INDEX_FETCH_DEPTH = 8
+# Rows per reduce pass and the pass loop's unroll. On tpu7x, four rows unrolled
+# by two schedule in ~33 bundles per 16 rows x 16 columns, against ~39 for one
+# 16-row pass, whose per-row weights, shifts and predicates overflow registers.
+REDUCE_ROWS_PER_PASS = 4
+REDUCE_UNROLL = 2
 
 
 def call_kernel_pipeline(
@@ -297,46 +302,66 @@ def _reduce_rows(
     prev_dst: jax.Array,
     cfg: config.Config,
 ):
-    """Weights one sub-chunk's gathered rows and runs the segmented sum."""
+    """Weights one sub-chunk's gathered rows and runs the segmented sum.
+
+    The rows run in passes of REDUCE_ROWS_PER_PASS, each seeded from the previous
+    pass's last output row, so a pass keeps only its own rows' weights, shifts
+    and group tests in registers.
+    """
     num_simd_lanes = cfg.sc_info.num_lanes
+    rows_per_pass = min(REDUCE_ROWS_PER_PASS, num_simd_lanes)
+    assert num_simd_lanes % rows_per_pass == 0
 
-    @plsc.parallel_loop(0, cfg.col_chunk_size, step=num_simd_lanes)
-    def col_loop(col_compute_offset: jax.Array):
-        col_slice = pl.ds(col_compute_offset, num_simd_lanes)
-        # Running sum, seeded by the carry from the previous sub-chunk.
-        previous_accumulated_data = refs.scratch.prev_iter_last_row_vmem[c, col_slice]
-        for row_src in range(num_simd_lanes):
-            val_u32 = gather_ref[row_src, col_slice]
-            if cfg.in_dtype == jnp.bfloat16:
-                # The two bfloat16 rows packed in one uint32 word sit in the low
-                # (even row) or high (odd row) 16 bits. Shift the wanted half
-                # into the float32 sign/exponent position and clear the rest.
-                is_even_row = jnp.bitwise_and(src_idx_slice[row_src], 1) == 0
-                shift = jnp.where(is_even_row, 16, 0)
-                lower_mask = jnp.uint32(jnp.iinfo(jnp.uint16).max)
-                upper_mask = jnp.left_shift(lower_mask, 16)
-                shifted = jnp.bitwise_and(jnp.left_shift(val_u32, shift), upper_mask)
-                data_f32 = plsc.bitcast(shifted, jnp.float32)
+    for pass_start in range(0, num_simd_lanes, rows_per_pass):
+
+        @plsc.parallel_loop(
+            0, cfg.col_chunk_size, step=num_simd_lanes, unroll=REDUCE_UNROLL
+        )
+        def col_loop(col_compute_offset: jax.Array):
+            col_slice = pl.ds(col_compute_offset, num_simd_lanes)
+            # Running sum, seeded by the row before the pass.
+            if pass_start == 0:
+                previous_accumulated_data = refs.scratch.prev_iter_last_row_vmem[
+                    c, col_slice
+                ]
             else:
-                data_f32 = plsc.bitcast(val_u32, jnp.float32)
-            data_f32 *= tw_slice[row_src]
+                previous_accumulated_data = out_vmem[pass_start - 1, col_slice]
+            for row_src in range(pass_start, pass_start + rows_per_pass):
+                val_u32 = gather_ref[row_src, col_slice]
+                if cfg.in_dtype == jnp.bfloat16:
+                    # The two bfloat16 rows packed in one uint32 word sit in the low
+                    # (even row) or high (odd row) 16 bits. Shift the wanted half
+                    # into the float32 sign/exponent position and clear the rest.
+                    is_even_row = jnp.bitwise_and(src_idx_slice[row_src], 1) == 0
+                    shift = jnp.where(is_even_row, 16, 0)
+                    lower_mask = jnp.uint32(jnp.iinfo(jnp.uint16).max)
+                    upper_mask = jnp.left_shift(lower_mask, 16)
+                    shifted = jnp.bitwise_and(
+                        jnp.left_shift(val_u32, shift), upper_mask
+                    )
+                    data_f32 = plsc.bitcast(shifted, jnp.float32)
+                else:
+                    data_f32 = plsc.bitcast(val_u32, jnp.float32)
+                data_f32 *= tw_slice[row_src]
 
-            # Reduction: accumulate while the destination group is unchanged,
-            # restart otherwise. Sorting guarantees rows of one group are
-            # contiguous.
-            dst_row_hbm = dst_slice[row_src]
-            prev = prev_dst if row_src == 0 else dst_slice[row_src - 1]
-            accumulated_data = jnp.where(
-                dst_row_hbm == prev,
-                previous_accumulated_data + data_f32,
-                data_f32,
-            )
-            previous_accumulated_data = accumulated_data
+                # Reduction: accumulate while the destination group is unchanged,
+                # restart otherwise. Sorting guarantees rows of one group are
+                # contiguous.
+                dst_row_hbm = dst_slice[row_src]
+                prev = prev_dst if row_src == 0 else dst_slice[row_src - 1]
+                accumulated_data = jnp.where(
+                    dst_row_hbm == prev,
+                    previous_accumulated_data + data_f32,
+                    data_f32,
+                )
+                previous_accumulated_data = accumulated_data
 
-            # The output buffer stays float32: a bfloat16 output would be
-            # (16, 128)-tiled and the row scatter below writes single rows at
-            # arbitrary, non-tile-aligned destinations, which is only legal for
-            # 32-bit elements. The cast happens in the wrapper.
-            out_vmem[row_src, col_slice] = accumulated_data
-            if row_src == num_simd_lanes - 1:
-                refs.scratch.prev_iter_last_row_vmem[c, col_slice] = accumulated_data
+                # The output buffer stays float32: a bfloat16 output would be
+                # (16, 128)-tiled and the row scatter below writes single rows at
+                # arbitrary, non-tile-aligned destinations, which is only legal for
+                # 32-bit elements. The cast happens in the wrapper.
+                out_vmem[row_src, col_slice] = accumulated_data
+                if row_src == num_simd_lanes - 1:
+                    refs.scratch.prev_iter_last_row_vmem[c, col_slice] = (
+                        accumulated_data
+                    )
