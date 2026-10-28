@@ -285,6 +285,13 @@ if [ "$CFG_PROXY" = router ]; then
     for _h in "${PREFILL_HOSTS[@]}"; do _router_args+=(--prefill "http://${_h}:${PORT}"); done
     for _h in "${DECODE_HOSTS[@]}"; do _router_args+=(--decode "http://${_h}:${PORT}"); done
     _router_args+=(--policy consistent_hash)
+    # With several prefills, cache_aware places new conversations on the
+    # least-loaded prefill and keeps a conversation's turns together; the
+    # decode stays consistent_hash (cache_aware pins nearly every request to
+    # one decode, as the AgentX traces share a long prefix).
+    if [ -z "${K3_PD_PREFILL_POLICY:-}" ] && [ "${#PREFILL_HOSTS[@]}" -gt 1 ]; then
+        K3_PD_PREFILL_POLICY=cache_aware
+    fi
     if [ -n "${K3_PD_PREFILL_POLICY:-}${K3_PD_DECODE_POLICY:-}" ]; then
         vllm-router --help 2>&1 | grep -E -- '--(prefill|decode)-policy' \
             || { log "FATAL: vllm-router has no --prefill-policy/--decode-policy"; exit 2; }
