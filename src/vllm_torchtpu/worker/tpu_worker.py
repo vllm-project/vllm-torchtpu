@@ -37,7 +37,6 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs, profiler_trace, utils
-from vllm_torchtpu.compilation.cold_start import compact_cold_start
 from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
@@ -736,29 +735,8 @@ class TPUWorker(WorkerBase):
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
-        with compact_cold_start() as compaction:
-            with _startup_compilation_artifacts():
-                self.model_runner.capture_model()
-            if compaction is not None and compaction.any_rank_compacted():
-                # This dedicated worker has not started serving. The native
-                # process cache also owns the cold executables; replacing the
-                # Python bundles alone cannot release their compiler state.
-                backend_calls = compaction.backend_calls
-                torch.tpu.synchronize()
-                compaction.drop_runnables()
-                torch.tpu._clear_cache()
-                _release_free_host_heap()
-                with set_current_vllm_config(self.vllm_config):
-                    compaction.restore_runnables()
-                with _startup_compilation_artifacts():
-                    self.model_runner.capture_model()
-                assert compaction.backend_calls == backend_calls, (
-                    "Cold-start rewarm unexpectedly compiled another FX graph"
-                )
-                logger.info(
-                    "Cold-start compaction complete: local_programs=%d, rewarm=True",
-                    compaction.programs,
-                )
+        with _startup_compilation_artifacts():
+            self.model_runner.capture_model()
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
         set_torch_threads_for_runtime()
