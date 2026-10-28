@@ -358,6 +358,29 @@ def init_export_distributed_environment(vllm_config: Any) -> None:
     )
 
 
+def run_model_loader(vllm_config: Any) -> nn.Module:
+    """Builds the model and loads its weights with vLLM's loader for `load_config`.
+
+    Logged as an `export.load_safetensors` span (`export.load_dummy_weights` for
+    dummy weights): reading a large checkpoint is often the longest stage.
+    """
+    from vllm.model_executor.model_loader import get_model_loader
+
+    load_format = vllm_config.load_config.load_format
+    span = (
+        "export.load_dummy_weights"
+        if load_format == "dummy"
+        else "export.load_safetensors"
+    )
+    with trace(span):
+        loader = get_model_loader(vllm_config.load_config)
+        # `@instrument` on `load_model` hides its signature from type checkers.
+        load_model: Any = loader.load_model
+        return load_model(
+            vllm_config=vllm_config, model_config=vllm_config.model_config
+        )
+
+
 def load_dummy_vllm_model(vllm_config: Any) -> nn.Module:
     """Loads a vLLM model with `load_format='dummy'` on TPU (zero disk weight IO)."""
     return load_vllm_model(vllm_config, load_format="dummy")
@@ -392,7 +415,6 @@ def load_vllm_model(vllm_config: Any, *, load_format: str) -> nn.Module:
         model_parallel_is_initialized,
     )
     from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-    from vllm.model_executor.model_loader import get_model_loader
 
     vllm_config.load_config.load_format = load_format
     if getattr(vllm_config, "device_config", None) is not None:
@@ -422,13 +444,7 @@ def load_vllm_model(vllm_config: Any, *, load_format: str) -> nn.Module:
                     set_vllm_model_wrapper_context(mesh=mesh, vllm_config=vllm_config)
                 )
 
-            loader = get_model_loader(vllm_config.load_config)
-            # `@instrument` on `load_model` hides its signature from type checkers.
-            load_model: Any = loader.load_model
-            model: nn.Module = load_model(
-                vllm_config=vllm_config,
-                model_config=vllm_config.model_config,
-            )
+            model = run_model_loader(vllm_config)
             # Same step vLLM's executors run right after `load_model`: it picks
             # the KV block size from the model's attention backend, which serving
             # uses and which keeps the block table within SMEM.
