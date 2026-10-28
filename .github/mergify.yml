@@ -41,7 +41,7 @@ pull_request_rules:
       - -closed
       - or:
           - 'title~=(?i)\[(?:model[ -]+support|new[ -]+model)\]'
-          - 'body~=(?im)^[ \t]*[-*][ \t]+\[x\][ \t]+`?\[model[ -]+support\]`?'
+          - 'body~=(?im)^[ \t]*[-*][ \t]+\[x\][ \t]+(?:`?\[model\]`?|model[ \t]+support\b)'
     actions:
       label:
         add: [model-support]
