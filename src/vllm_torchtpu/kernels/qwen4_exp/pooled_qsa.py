@@ -10,6 +10,9 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import BITS_NEG_INF
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
+    SparseCoreTopK,
+)
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     cp_local_to_global,
     streamindex_topk,
@@ -1089,6 +1092,14 @@ def select_blocks(
                 ),
                 decode_passes=not mixed_only,
                 hoist_step_metadata=envs.VLLM_TPU_QSA_INDEXER_HOIST_META,
+                # VLLM_TPU_QSA_INDEXER_SC_BOUNDED_COPY: the score rows are
+                # sized for max_model_len; select from each row's live prefix
+                # only instead of copying the whole row to the SparseCore.
+                **(
+                    {"topk_backend": SparseCoreTopK(bounded_copy=True)}
+                    if envs.VLLM_TPU_QSA_INDEXER_SC_BOUNDED_COPY and shard is None
+                    else {}
+                ),
             ),
         )
     if shard is not None:

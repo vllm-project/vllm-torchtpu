@@ -129,6 +129,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_COMPACT_SCHEDULE: bool = False
     VLLM_TPU_QSA_DECODE_RPA_BKV: int = 256
     VLLM_TPU_QSA_DECODE_POOL_PAGE_TABLE: bool = False
+    VLLM_TPU_QSA_INDEXER_SC_BOUNDED_COPY: bool = False
     VLLM_TPU_QSA_DECODE_RPA_LANES: int = 8
     VLLM_TPU_QSA_FUSED_KV_WRITE: bool = False
     VLLM_TPU_QSA_INDEXER_SHARD: bool = False
@@ -692,6 +693,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # query window instead of several serial ones. Same pages, same order.
     "VLLM_TPU_QSA_DECODE_POOL_PAGE_TABLE": env_bool(
         "VLLM_TPU_QSA_DECODE_POOL_PAGE_TABLE", default=False
+    ),
+    # Qwen4-exp shared-stream decode indexer: SparseCore top-k copies only
+    # each score row's live prefix (one subcore per row) instead of every
+    # subcore copying its whole slice of a row sized for max_model_len.
+    # Same winners; selection time follows the context, not the table width.
+    "VLLM_TPU_QSA_INDEXER_SC_BOUNDED_COPY": env_bool(
+        "VLLM_TPU_QSA_INDEXER_SC_BOUNDED_COPY", default=False
     ),
     "VLLM_TPU_QSA_DECODE_RPA_LANES": env_nonnegative_int(
         "VLLM_TPU_QSA_DECODE_RPA_LANES", 8

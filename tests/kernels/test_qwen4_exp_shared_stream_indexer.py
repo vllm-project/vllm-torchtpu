@@ -529,3 +529,36 @@ def test_mixed_only_lowers_without_decode_passes(monkeypatch):
         text = select_fn.trace(*args).lower(lowering_platforms=("tpu",)).as_text()
     assert "StreamIdxTC-m-bq_4-bkvp_32" in text
     assert "StreamIdxTC-d" not in text
+
+
+@pytest.mark.parametrize("bounded", [False, True])
+def test_sc_bounded_copy_flag_selects_the_backend(monkeypatch, bounded):
+    """VLLM_TPU_QSA_INDEXER_SC_BOUNDED_COPY hands the decode/verify indexer a
+    bounded-copy SparseCore selector; off keeps streamindex's default."""
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
+        SparseCoreTopK,
+    )
+
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    seen = []
+
+    class Stop(Exception):
+        pass
+
+    def capture(*args, **kwargs):
+        seen.append(kwargs.get("topk_backend"))
+        raise Stop
+
+    monkeypatch.setattr(pooled_qsa, "streamindex_topk", capture)
+    monkeypatch.setenv("VLLM_TPU_QSA_DECODE_QUERY_BLOCK", "4")
+    monkeypatch.setenv("VLLM_TPU_QSA_INDEXER_SC_BOUNDED_COPY", "1" if bounded else "0")
+    q_lens, context, tokens = CASES["verify_k3"]
+    with pytest.raises(Stop):
+        pooled_qsa.select_blocks(
+            **inputs(0, q_lens, context, tokens, "integer"),
+            ratio=RATIO,
+            block_topk=BLOCK_TOPK,
+            max_query_len=4,
+        )
+    assert seen == [SparseCoreTopK(bounded_copy=True) if bounded else None]

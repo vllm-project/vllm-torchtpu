@@ -128,3 +128,26 @@ def test_backend_replacement_keeps_real_streamindex_scores(chunk_tokens, return_
             scores = np.asarray(result[1]).view(np.float32)
             np.testing.assert_array_equal(scores[ids >= 0], 0)
             np.testing.assert_array_equal(scores[ids < 0], -np.inf)
+
+
+@pytest.mark.parametrize("bounded", [False, True])
+def test_sparsecore_backend_forwards_bounded_copy(monkeypatch, bounded):
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import topk_backend
+
+    seen = {}
+
+    def capture(score_bits, k, **kwargs):
+        seen.update(kwargs)
+        return jnp.zeros((score_bits.shape[0], k), jnp.int32)
+
+    monkeypatch.setattr(topk_backend, "sparsecore_topk", capture)
+    SparseCoreTopK(bounded_copy=bounded).select(
+        jnp.zeros((4, 128), jnp.int32),
+        16,
+        jnp.full((4,), 128, jnp.int32),
+        scheduling_group_id=None,
+        return_scores=False,
+    )
+    assert seen["bounded_copy"] is bounded
+    assert SparseCoreTopK() == SparseCoreTopK(bounded_copy=False)
+    assert hash(SparseCoreTopK(bounded_copy=True)) != hash(SparseCoreTopK())

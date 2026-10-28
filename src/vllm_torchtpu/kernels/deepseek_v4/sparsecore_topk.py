@@ -30,6 +30,7 @@ or beyond ``row_lengths`` are never selected. NaNs are unsupported.
 """
 
 import functools
+import math
 from typing import Any, cast
 
 import jax
@@ -49,6 +50,11 @@ NUM_BUCKETS = 256
 MAX_SLICE_WORDS = 32 * 1024
 # Unroll factor for the loops that walk the whole resident slice.
 SCAN_UNROLL = 8
+# Bounded copy (one subcore per row, single-buffered row): the largest row it
+# holds, in 32-bit words (384KB of the 512KB tile memory), and the words per
+# score DMA.
+BOUNDED_MAX_WORDS = 96 * 1024
+BOUNDED_CHUNK_WORDS = 2048
 
 L0_SHIFT = 24
 REFINEMENT_LEVELS = ((16, 0xFF), (8, 0xFF), (0, 0xFF))
@@ -84,6 +90,8 @@ def _topk_body(
     shared_counts_vmem,
     shared_idx_vmem,
     shared_key_vmem,
+    bounded_vmem=None,
+    bounded_sem=None,
     *,
     b: int,
     n: int,
@@ -94,6 +102,7 @@ def _topk_body(
     write_empty: bool,
     return_scores: bool,
     local_idxs_hbm: Any = None,
+    bounded_copy: bool = False,
 ):
     dcp_merge = local_idxs_hbm is not None
     num_subcores = 16
@@ -558,7 +567,75 @@ def _topk_body(
     cores_per_chip = num_sc_cores * num_subcores
     # A slice past MAX_SLICE_WORDS only fits in tile memory single-buffered.
     buf_count = 1 if (num_waves == 1 or slice_len > MAX_SLICE_WORDS) else 2
-    if p == 1:
+    if bounded_copy:
+        # The row stays in HBM; each wave copies only the chunks below the
+        # row's length into one resident buffer. Every scores_vmem read in
+        # _run_step is below walk_chunks * LANES <= the copied extent.
+        chunk = math.gcd(slice_len, BOUNDED_CHUNK_WORDS)
+
+        def copy_live(len_slice_vmem):
+            row = pl.program_id(0) * cores_per_chip + flat
+            length = jnp.minimum(vec_at(len_slice_vmem, 0), n)
+            live = jnp.where(
+                (row < b) & (length > 0), jnp.minimum(slice_len, length), 0
+            )
+
+            def descriptor(c):
+                src = pl.multiple_of(row * slice_len + c * chunk, chunk)
+                dst = pl.multiple_of(c * chunk, chunk)
+                return pltpu.make_async_copy(
+                    scores_hbm.at[pl.ds(src, chunk)],
+                    bounded_vmem.at[pl.ds(dst, chunk)],
+                    bounded_sem,
+                )
+
+            def start(c, carry):
+                descriptor(c).start()
+                return carry
+
+            def wait(c, carry):
+                descriptor(c).wait()
+                return carry
+
+            count = (live + (chunk - 1)) // chunk
+            lax.fori_loop(0, count, start, 0)
+            lax.fori_loop(0, count, wait, 0)
+
+        len_spec = pl.BlockSpec(
+            (LANES,),
+            lambda w: (w * cores_per_chip + flat,),
+            pipeline_mode=pl.Buffered(1 if num_waves == 1 else 2),
+        )
+        out_spec = pl.BlockSpec(
+            (k,),
+            lambda w: (w * cores_per_chip + flat,),
+            pipeline_mode=pl.Buffered(1 if num_waves == 1 else 2),
+        )
+        if return_scores:
+
+            def pipeline_step_bounded_scores(len_slice_vmem, out_vmem, keys_vmem):
+                copy_live(len_slice_vmem)
+                _run_step(bounded_vmem, len_slice_vmem, out_vmem, keys_vmem)
+
+            pltpu.emit_pipeline(
+                pipeline_step_bounded_scores,
+                grid=(num_waves,),
+                in_specs=(len_spec,),
+                out_specs=(out_spec, out_spec),
+            )(lengths_hbm, out_hbm, keys_hbm)
+        else:
+
+            def pipeline_step_bounded(len_slice_vmem, out_vmem):
+                copy_live(len_slice_vmem)
+                _run_step(bounded_vmem, len_slice_vmem, out_vmem)
+
+            pltpu.emit_pipeline(
+                pipeline_step_bounded,
+                grid=(num_waves,),
+                in_specs=(len_spec,),
+                out_specs=(out_spec,),
+            )(lengths_hbm, out_hbm)
+    elif p == 1:
         in_specs = (
             pl.BlockSpec(
                 (slice_len,),
@@ -656,6 +733,7 @@ def _sc_topk_direct(
     write_empty: bool = True,
     return_scores: bool = True,
     scheduling_group_id: int | None = None,
+    bounded_copy: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Single-stage SparseCore top-k on 32 subcores.
 
@@ -667,6 +745,8 @@ def _sc_topk_direct(
     compares raw bits either way.
     """
     b, n = scores.shape
+    if bounded_copy and (p != 1 or local_idxs is not None):
+        raise ValueError("bounded_copy reads one whole row per subcore (p == 1)")
     info = pltpu.get_tpu_info()
     sc = info.sparse_core
     if sc is None:
@@ -730,6 +810,8 @@ def _sc_topk_direct(
         pltpu.VMEM_SHARED((2 * sc.num_subcores * k,), jnp.int32)
         if (p > 1 and return_scores)
         else None,  # shared_key_vmem
+        pltpu.VMEM((slice_len,), jnp.int32) if bounded_copy else None,  # bounded_vmem
+        pltpu.SemaphoreType.DMA(()) if bounded_copy else None,  # bounded_sem
     )
 
     body_fn = functools.partial(
@@ -742,6 +824,7 @@ def _sc_topk_direct(
         num_waves=num_waves,
         write_empty=write_empty,
         return_scores=return_scores,
+        bounded_copy=bounded_copy,
     )
     if local_idxs is not None:
         orig_body = body_fn
@@ -803,6 +886,7 @@ def _pick_partition(b: int, n: int, k: int) -> int:
         "write_empty_rows",
         "scheduling_group_id",
         "return_scores",
+        "bounded_copy",
     ),
 )
 def sparsecore_topk(
@@ -813,6 +897,7 @@ def sparsecore_topk(
     write_empty_rows: bool = True,
     scheduling_group_id: int | None = None,
     return_scores: bool = False,
+    bounded_copy: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:  # i32[b, k] or (i32[b, k], i32[b, k])
     """Exact top-k indices per row, unsorted, -1 suffix-padded.
 
@@ -839,7 +924,13 @@ def sparsecore_topk(
     else:
         row_lengths = row_lengths.astype(jnp.int32)
 
-    p = _pick_partition(b, n, k)
+    # bounded_copy: one subcore per row copies only the chunks below the row's
+    # length, instead of every subcore copying its whole slice. With wide
+    # buffers and short rows (a decode indexer sized for max_model_len) most
+    # of each row is never read. It needs a full wave of rows (b >= 32) and a
+    # row that fits single-buffered; otherwise the partitioned path runs.
+    bounded = bounded_copy and b >= 32 and _align_to(n, LANES) <= BOUNDED_MAX_WORDS
+    p = 1 if bounded else _pick_partition(b, n, k)
     return _sc_topk_direct(
         scores,
         k,
@@ -848,6 +939,7 @@ def sparsecore_topk(
         write_empty=write_empty_rows,
         return_scores=return_scores,
         scheduling_group_id=scheduling_group_id,
+        bounded_copy=bounded,
     )
 
 

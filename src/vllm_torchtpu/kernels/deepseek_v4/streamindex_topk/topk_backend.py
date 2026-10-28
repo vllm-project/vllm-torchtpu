@@ -35,9 +35,14 @@ class TopKBackend(Protocol):
 
 @dataclass(frozen=True)
 class SparseCoreTopK:
-    """The original selector, including its score/next-chunk overlap schedule."""
+    """The original selector, including its score/next-chunk overlap schedule.
+
+    ``bounded_copy`` copies only each row's live prefix of the score buffer
+    (see ``sparsecore_topk``); same winners.
+    """
 
     overlaps_scoring: ClassVar[bool] = True
+    bounded_copy: bool = False
 
     def select(
         self,
@@ -55,4 +60,5 @@ class SparseCoreTopK:
             write_empty_rows=True,
             scheduling_group_id=scheduling_group_id,
             return_scores=return_scores,
+            bounded_copy=self.bounded_copy,
         )

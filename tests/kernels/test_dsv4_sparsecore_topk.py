@@ -498,3 +498,92 @@ def test_scheduling_group_ids_do_not_change_the_selection(kind):
         np.sort(np.take_along_axis(scores, np.maximum(plain, 0), axis=1), axis=1),
         np.sort(np.take_along_axis(scores, np.maximum(grouped, 0), axis=1), axis=1),
     )
+
+
+# --- bounded_copy: one subcore per row copies only the row's live prefix. ---
+
+N_QSA_DECODE = 69632  # QSA decode indexer row: 2054 kernel pages x 32, aligned to 4096
+BOUNDED_SHAPES = [
+    pytest.param(32, N_SHORT, 512, id="b32-n10240"),
+    pytest.param(96, N_QSA_DECODE, 512, id="b96-n69632"),
+    pytest.param(128, N_QSA_DECODE, 2048, id="b128-n69632-k2048"),
+]
+
+
+def _bounded_lengths(b, n, k):
+    """Edge lengths, with a long row ahead of a short one on each subcore."""
+    chunk = sc_module.BOUNDED_CHUNK_WORDS
+    edges = [0, 1, LANES - 1, LANES, LANES + 1, k, chunk - 1, chunk, chunk + 1,
+             25000, n - 1, n]
+    lengths = np.array([edges[i % len(edges)] for i in range(b)], np.int32)
+    # Rows w * 32 + s share subcore s across waves: wave 0 full, later short,
+    # so a later wave's buffer still holds the earlier row past its length.
+    lengths[: min(b, 32)] = n
+    return np.minimum(lengths, n)
+
+
+def _run_bounded(scores, k, row_lengths, return_scores=False):
+    out = sparsecore_topk(
+        jnp.asarray(scores),
+        k,
+        jnp.asarray(row_lengths),
+        bounded_copy=True,
+        return_scores=return_scores,
+    )
+    return jax.tree.map(np.asarray, jax.block_until_ready(out))
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("b,n,k", BOUNDED_SHAPES)
+@pytest.mark.parametrize("kind", ["strict_desc", "random", "heavy_ties"])
+def test_bounded_copy_never_reads_past_the_row(b, n, k, kind):
+    """Past each row's length the buffer holds scores that would win (+1e30):
+    the bounded copy must select exactly as the reference over the live
+    prefix, with no index past the length."""
+    rng = np.random.default_rng(SEED)
+    scores = _scores(kind, b, n, rng)
+    lengths = _bounded_lengths(b, n, k)
+    poisoned = scores.copy()
+    poisoned[np.arange(n)[None, :] >= lengths[:, None]] = 1e30
+    idx = _run_bounded(poisoned, k, lengths)
+    assert _mismatch(poisoned, idx, k, lengths) is None
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("b,n,k", BOUNDED_SHAPES)
+def test_bounded_copy_returns_the_partitioned_scores(b, n, k):
+    """Same winning scores (as a multiset) and score bits as the default path."""
+    rng = np.random.default_rng(SEED)
+    scores = _scores("heavy_ties", b, n, rng)
+    lengths = _bounded_lengths(b, n, k)
+    idx, keys = _run_bounded(scores, k, lengths, return_scores=True)
+    ref_idx, ref_keys = jax.tree.map(
+        np.asarray,
+        sparsecore_topk(
+            jnp.asarray(scores), k, jnp.asarray(lengths), return_scores=True
+        ),
+    )
+    assert _mismatch(scores, idx, k, lengths) is None
+    np.testing.assert_array_equal(np.sort(keys, axis=1), np.sort(ref_keys, axis=1))
+
+
+def test_bounded_copy_runs_one_subcore_per_row_only_when_it_fits(monkeypatch):
+    """A full wave of rows that fit single-buffered take p=1 with the bounded
+    copy; anything else keeps the partitioned path (and its p)."""
+    calls = []
+
+    def capture(scores, k, row_lengths, *, p, bounded_copy, **kwargs):
+        calls.append((scores.shape, p, bounded_copy))
+        return jnp.zeros((scores.shape[0], k), jnp.int32)
+
+    monkeypatch.setattr(sc_module, "_sc_topk_direct", capture)
+    for b, n in ((96, N_QSA_DECODE), (16, N_QSA_DECODE), (64, N_128K)):
+        sc_module.sparsecore_topk(
+            jnp.zeros((b, n), jnp.float32), 512, jnp.full((b,), n, jnp.int32),
+            bounded_copy=True,
+        )
+    assert calls == [
+        ((96, N_QSA_DECODE), 1, True),
+        ((16, N_QSA_DECODE), _pick_partition(16, N_QSA_DECODE, 512), False),
+        ((64, N_128K), _pick_partition(64, N_128K, 512), False),
+    ]
