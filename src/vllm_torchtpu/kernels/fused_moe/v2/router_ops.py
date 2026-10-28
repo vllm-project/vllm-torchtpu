@@ -111,7 +111,15 @@ def _normalized_select_kernel(x_ref, w_ref, i_ref, *, topk, n, v_ref=None, norma
     v = None if v_ref is None else v_ref[...]
     iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
     output_columns = packed_weights = pair_first = total = None
+    encoded_ids = encoded_last = None
     if normalize:
+        # Positive normal FP32 codes preserve expert order without numeric casts.
+        encoded_ids = jax.lax.bitcast_convert_type(
+            iota | jnp.int32(0x3F800000), jnp.float32
+        )
+        encoded_last = jax.lax.bitcast_convert_type(
+            jnp.int32(0x3F800000 | (n - 1)), jnp.float32
+        )
         packed_shape = (x.shape[0], topk)
         output_columns = jax.lax.broadcasted_iota(jnp.int32, packed_shape, 1)
         packed_weights = jnp.zeros(packed_shape, jnp.float32)
@@ -121,13 +129,9 @@ def _normalized_select_kernel(x_ref, w_ref, i_ref, *, topk, n, v_ref=None, norma
         # Lowest matching column; non-matching columns fill with the last
         # expert so every index returned is a real expert.
         if normalize:
-            # IDs 0..383 are exact in FP32; avoid decomposing an INT32 reduction.
-            idx = jnp.min(
-                jnp.where(ismax, iota.astype(jnp.float32), jnp.float32(n - 1)),
-                axis=1,
-            )
-            # Keep the picked-mask dependency independent of the INT32 output cast.
-            picked = iota.astype(jnp.float32) == idx[:, None]
+            assert encoded_ids is not None and encoded_last is not None
+            idx = jnp.min(jnp.where(ismax, encoded_ids, encoded_last), axis=1)
+            picked = encoded_ids == idx[:, None]
         else:
             idx = jnp.min(jnp.where(ismax, iota, n - 1), axis=1)
             picked = iota == idx[:, None]
@@ -153,7 +157,12 @@ def _normalized_select_kernel(x_ref, w_ref, i_ref, *, topk, n, v_ref=None, norma
                     total = total + pair_sum
         else:
             w_ref[:, j] = selected_weight
-        i_ref[:, j] = idx.astype(jnp.int32)
+        if normalize:
+            i_ref[:, j] = jax.lax.bitcast_convert_type(idx, jnp.int32) & jnp.int32(
+                0x007FFFFF
+            )
+        else:
+            i_ref[:, j] = idx.astype(jnp.int32)
         x = jnp.where(picked, NEG, x)
     if normalize:
         assert packed_weights is not None and total is not None

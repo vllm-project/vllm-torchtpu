@@ -75,7 +75,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import (
 SCORING_FNS = ("softmax", "sigmoid", "sqrtsoftplus")
 
 
-def _apply_scoring_fn(logits, scoring_fn):
+def _apply_scoring_fn(logits, scoring_fn, *, specialize_softplus=False):
     """Gate logits -> f32 routing scores."""
     scores = logits.astype(jnp.float32)
     if scoring_fn == "softmax":
@@ -83,6 +83,11 @@ def _apply_scoring_fn(logits, scoring_fn):
     if scoring_fn == "sigmoid":
         return jax.nn.sigmoid(scores)
     if scoring_fn == "sqrtsoftplus":
+        if specialize_softplus:
+            return jnp.sqrt(
+                jnp.maximum(scores, jnp.float32(0))
+                + jnp.log1p(jnp.exp(-jnp.abs(scores)))
+            )
         return jnp.sqrt(jax.nn.softplus(scores))
     raise NotImplementedError(
         f"the fused EP MoE router scores with {SCORING_FNS}; got {scoring_fn!r}"
@@ -589,7 +594,6 @@ def fused_ep_moe_v2(
         _pack_routing_exchange builds, and the local pair blocks and their
         histogram the routing plan reads alongside the gathered payload.
         """
-        scores = _apply_scoring_fn(gate_l, scoring_fn)
         select_rows = MAX_ROUTING_BLOCK
         while t_local % select_rows:
             select_rows //= 2
@@ -600,6 +604,9 @@ def fused_ep_moe_v2(
             renormalize=renormalize,
             has_bias=score_bias_l is not None,
             has_hash=hash_l is not None,
+        )
+        scores = _apply_scoring_fn(
+            gate_l, scoring_fn, specialize_softplus=normalized_rows is not None
         )
         if normalized_rows is not None:
             select_rows = normalized_rows
