@@ -257,6 +257,7 @@ def _pipelined_kernel(
     x_sems: jax.Ref,  # (2,) DMA
     w_sems: jax.Ref,  # (2,) DMA
     out_sems: jax.Ref,  # (2,) DMA
+    x0_sems: jax.Ref,  # (rows // WO_A_PREP_ROWS,) DMA, block 0's sub-chunks
     *,
     num_groups: int,
     groups_per_step: int,
@@ -318,11 +319,14 @@ def _pipelined_kernel(
             out_sems.at[slot],
         )
 
-    def prep(r, slot):
-        """RoPE + per-row quantize of the x block in ``slot`` (row block r)."""
+    def prep(r, slot, sub_copies=()):
+        """RoPE + per-row quantize of the x block in ``slot`` (row block r),
+        each sub-chunk after its copy in ``sub_copies``, if given."""
         lo = head_dim - LANE
         for s in range(rows // prep_rows):
             sub = pl.ds(s * prep_rows, prep_rows)
+            if sub_copies:
+                sub_copies[s].wait()
             cos_sin = cos_sin_ref[pl.ds(r * rows + s * prep_rows, prep_rows)]
             # _rotate_gptj's sign is +-1, so folding it into sin is exact.
             cos, sin = cos_sin[:, :LANE], cos_sin[:, LANE:] * _gptj_sign()
@@ -358,11 +362,20 @@ def _pipelined_kernel(
 
     @pl.when(step == 0)
     def _():
-        x_copy(*locate(0)).start()
+        # Block 0 by sub-chunks, so its prep starts after the first one lands.
+        sub_copies = [
+            pltpu.make_async_copy(
+                x_hbm_ref.at[pl.ds(s * prep_rows, prep_rows), pl.ds(0, heads)],
+                x_buf.at[0, pl.ds(s * prep_rows, prep_rows)],
+                x0_sems.at[s],
+            )
+            for s in range(rows // prep_rows)
+        ]
+        for copy in sub_copies:
+            copy.start()
         w_copy(0).start()
         x_copy(*locate(1)).start()
-        x_copy(*locate(0)).wait()
-        prep(0, 0)
+        prep(0, 0, sub_copies)
 
     for l in range(per_step):
         g, r, slot = locate(l)
@@ -453,7 +466,11 @@ def _wo_a_pipelined(
         in_specs=[hbm, hbm, vmem, vmem],
         out_specs=hbm,
         out_shape=jax.ShapeDtypeStruct((num_tokens, out_features), x.dtype),
-        scratch_shapes=[*scratch, *[pltpu.SemaphoreType.DMA((2,))] * 3],
+        scratch_shapes=[
+            *scratch,
+            *[pltpu.SemaphoreType.DMA((2,))] * 3,
+            pltpu.SemaphoreType.DMA((rows // WO_A_PREP_ROWS,)),
+        ],
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
             vmem_limit_bytes=scratch_bytes + WO_A_VMEM_HEADROOM_BYTES,
