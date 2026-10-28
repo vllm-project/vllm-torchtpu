@@ -27,8 +27,8 @@ def pcp_gather_rows(
 ) -> jax.Array:
     """All-gather local rows over PCP and restore request-major split order.
 
-    This function currently assume DCP = PCP x TP, and only do all gather from 
-    PCP group. 
+    This function currently assume DCP = PCP x TP, and only do all gather from
+    PCP group.
     """
     num_local = x.shape[0]
     as_bytes = x.dtype.itemsize == 1

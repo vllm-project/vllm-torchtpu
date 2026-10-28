@@ -1483,6 +1483,8 @@ def sparse_mla_attention_pcp_prefill(
                 return buf_nope, buf_rope
 
             num_chunks = (ws_used_pages_[0] + chunk_pages - 1) // chunk_pages
+            # TODO(weiyulin): This line zero entire workspace, we should benchmark
+            # if this time-consuming.
             init = (
                 jnp.zeros((ws_rows, *nope.shape[1:]), nope.dtype),
                 jnp.zeros((ws_rows, *rope.shape[1:]), rope.dtype),
