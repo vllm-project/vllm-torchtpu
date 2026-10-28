@@ -302,6 +302,7 @@ if TYPE_CHECKING:
     TPU_FP8_LINEAR_PALLAS: bool = True
     TPU_SAMPLER_VOCAB_PARALLEL: bool = True
     TPU_SMALL_ALL_REDUCE_VALID_ROWS: bool = False
+    TPU_SMALL_ALL_REDUCE_CHIP_PAIRS: int = 0
     TPU_FUSED_OPROJ_AR: bool = True
     TPU_FUSED_OPROJ_AR_WAVES: bool = True
     TPU_FP8_SKINNY_SCALE_DMA: bool = False
@@ -2129,6 +2130,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rows to 16. Valid rows are bitwise TPU_SMALL_ALL_REDUCE's (same f32 sum
     # in core order).
     "TPU_SMALL_ALL_REDUCE_VALID_ROWS": env_bool("TPU_SMALL_ALL_REDUCE_VALID_ROWS"),
+    # With TPU_SMALL_ALL_REDUCE: kernel all-reduces of at least this many rows
+    # (up to TPU_SMALL_ALL_REDUCE_MAX_ROWS) run the two-shot by chip pairs
+    # (small_collectives/all_reduce.py, form "pairs"): each core sends its
+    # chip-mate the mate's half of the columns, the pair's sum crosses ICI once
+    # per chip to its owner, and each owner's sum crosses ICI once per chip
+    # back, forwarded to the chip-mate. Such a block skips the valid-rows
+    # all-reduce; the backbone takes that branch by the cap rule
+    # (`rows > bucket_gate_edge(this value)`), so give a power of 2. Same
+    # math, different rounding order: each chip's two values are added and
+    # rounded to bf16 before the f32 sum over chips. Needs mesh
+    # indices 2i and 2i + 1 on one chip; prebuild checks that and runs the
+    # kernel once at the row cap on known blocks. Kernel name
+    # small_all_reduce_pairs_r<rows>. 0 = off.
+    "TPU_SMALL_ALL_REDUCE_CHIP_PAIRS": env_nonnegative_int(
+        "TPU_SMALL_ALL_REDUCE_CHIP_PAIRS", 0
+    ),
     # With TPU_SMALL_ALL_REDUCE and TPU_FP8_LINEAR_PALLAS: attention's o_proj at
     # decode (<= 16 rows, a measured fp8_skinny shape, TP group = the mesh) runs its
     # matmul and its TP all-reduce as one Pallas kernel
