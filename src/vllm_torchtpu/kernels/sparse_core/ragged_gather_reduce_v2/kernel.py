@@ -248,8 +248,9 @@ def _step_kernel(
     )
 
     # Each output row is written once, by its group's last row, after the
-    # group's full sum is in that row. Other rows and padding rows go to a
-    # throwaway row.
+    # group's full sum is in that row. Other rows and padding rows go to
+    # throwaway rows, one per lane: repeated destinations within one indirect
+    # scatter stall it.
     lane = jax.lax.broadcasted_iota(jnp.int32, (num_simd_lanes,), 0)
     row = window_row_start + row_start + lane
     next_dst = (
@@ -260,7 +261,7 @@ def _step_kernel(
         row + 1 < num_rows_current_row_partition, next_dst == dst_slice
     )
     is_final_write = jnp.logical_and(is_valid, jnp.logical_not(next_continues))
-    garbage_dst = refs.data.out.shape[0] - 1
+    garbage_dst = refs.data.out.shape[0] - num_simd_lanes + lane
     dst_rows = jnp.where(is_final_write, dst_slice, garbage_dst)
 
     # The slot's previous scatter (two steps back) must land before the slot is
