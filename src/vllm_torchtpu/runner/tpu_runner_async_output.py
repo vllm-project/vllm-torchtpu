@@ -65,6 +65,30 @@ def spec_logprobs_lists(
     )
 
 
+# VLLM_TPU_PINNED_TOKEN_COPY: per (shape, dtype) a ring of preallocated pinned
+# host buffers the sampled tokens are copied into, instead of a fresh pageable
+# tensor whose pages the driver would have to pin and map on every step. A
+# buffer is reused after _PINNED_RING steps; `sampled_token_ids_cpu` copies out
+# of it at wait time, well within that window.
+_PINNED_RING = 8
+_pinned: dict[tuple, list] = {}
+
+
+def _pinned_buffer(like: torch.Tensor) -> torch.Tensor:
+    key = (tuple(like.shape), like.dtype)
+    entry = _pinned.get(key)
+    if entry is None:
+        entry = _pinned[key] = [[], 0]
+    buffers, turn = entry
+    if len(buffers) < _PINNED_RING:
+        buffers.append(torch.empty(like.shape, dtype=like.dtype, pin_memory=True))
+        out = buffers[-1]
+    else:
+        out = buffers[turn % _PINNED_RING]
+    entry[1] = turn + 1
+    return out
+
+
 @dataclass
 class AsyncTPUCopyState:
     """Async D2H copy state for sampled tokens.
@@ -86,6 +110,8 @@ class AsyncTPUCopyState:
     spec_logprobs: list[SpecLogprobsChunk] | None = None
     # Device sources of `spec_logprobs`, kept alive until the copy lands.
     _spec_logprobs_tpu: list[LogprobsTensors] | None = None
+    # The chunks live in reused pinned buffers (VLLM_TPU_PINNED_TOKEN_COPY).
+    pinned: bool = False
     # VLLM_TPU_SERIALIZE_COPY_WAIT: the worker's async-output thread
     # (get_output) and its main thread (the deferred previous-results wait)
     # can wait on the same state at once; the lock lets only one synchronize.
@@ -101,7 +127,11 @@ class AsyncTPUCopyState:
         spec_logprobs: list[SpecLogprobsChunk] | None = None,
     ) -> "AsyncTPUCopyState":
         assert len(chunks_tpu) == len(chunk_real_lens) and len(chunks_tpu) > 0
-        chunks_cpu = [t.to("cpu", non_blocking=True) for t in chunks_tpu]
+        pinned = envs.VLLM_TPU_PINNED_TOKEN_COPY
+        if pinned:
+            chunks_cpu = [_pinned_buffer(t).copy_(t, non_blocking=True) for t in chunks_tpu]
+        else:
+            chunks_cpu = [t.to("cpu", non_blocking=True) for t in chunks_tpu]
         spec_logprobs_tpu = None
         if spec_logprobs:
             spec_logprobs_tpu = [c.tensors for c in spec_logprobs]
@@ -116,6 +146,7 @@ class AsyncTPUCopyState:
             chunk_real_lens=chunk_real_lens,
             copy_ready_event=copy_ready_event,
             chunks_tpu=chunks_tpu,
+            pinned=pinned,
             spec_logprobs=spec_logprobs or None,
             _spec_logprobs_tpu=spec_logprobs_tpu,
         )
@@ -155,7 +186,10 @@ class AsyncTPUCopyState:
         if self._sampled_token_ids_cpu is None:
             trimmed = [t[:n] for t, n in zip(self.chunks_cpu, self.chunk_real_lens)]
             if len(trimmed) == 1:
-                self._sampled_token_ids_cpu = trimmed[0]
+                # Pinned buffers are reused: copy the tokens out of the ring.
+                self._sampled_token_ids_cpu = (
+                    trimmed[0].clone() if self.pinned else trimmed[0]
+                )
             else:
                 self._sampled_token_ids_cpu = torch.cat(trimmed, dim=0)
         return self._sampled_token_ids_cpu
