@@ -248,6 +248,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         self.mlp = Qwen3NextSparseMoeBlock(vllm_config=cfg, prefix=prefix + ".mlp")
         if (
             envs.QWEN4_EXP_PREFILL_SP_SHARED_LOCAL
+            and index < t.num_hidden_layers  # backbone only: the MTP draft never takes SP
             and envs.QWEN4_EXP_PREFILL_SP_MOE
             and sp.enabled(tp.world_size)
             and getattr(self.mlp, "shared_expert", None) is not None
