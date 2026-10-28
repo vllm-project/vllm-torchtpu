@@ -11,6 +11,7 @@ the standalone tools install overrides before building the program.
 import dataclasses
 import hashlib
 import json
+import os
 from typing import Any
 
 from vllm_torchtpu.megakernel.config import set_active_kernel_config
@@ -60,6 +61,16 @@ class KernelConfig:
     # Prefill MLA flash tiles (queries x keys per step).
     mla_flash_qtile: int = 1024
     mla_flash_ktile: int = 2048
+    # Attention DP verifies (sequence_rows > 1) also take these plain B64/B128
+    # overlaps: "shared128" (shared-expert reduction at 128 rows), "router"
+    # (router latent, 128 rows), "dense" (dense scatter rows), "sp8" (SP8
+    # residual rows, 128 rows). The shared-expert overlap at 64 verify rows is
+    # always on ("shared64" is accepted and changes nothing).
+    verify_overlaps: tuple[str, ...] = dataclasses.field(
+        default_factory=lambda: tuple(
+            filter(None, os.environ.get("K3_VERIFY_OVERLAPS", "").split(","))
+        )
+    )
     # Prefill MoE expert parallelism: 8 (EP8/TP4, the pre-shard layout), 16
     # (EP16/TP2: 56 experts, TP2 within the chip) or 32 (28 whole experts);
     # 16 and 32 regroup the EP8 group's shards at load.
