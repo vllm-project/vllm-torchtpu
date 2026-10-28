@@ -44,6 +44,7 @@ def install_signal_dump() -> None:
         faulthandler.register(signal.SIGUSR2, file=sys.stderr, all_threads=True)
     except (AttributeError, ValueError, RuntimeError):
         return
+    logger.info("Stall watchdog: SIGUSR2 dumps the stacks of pid %d", os.getpid())
 
 
 def note_step(live_reqs: int) -> None:
