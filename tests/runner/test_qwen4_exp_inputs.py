@@ -325,3 +325,27 @@ def test_ngram_window_matches_full_store(spec):
         dev_ctx[:n] = torch.from_numpy(np.maximum(host_ctx[start : start + n] - spec, 0))
         ref = ngram_context_from_store(torch.from_numpy(store), row_ids, dev_ctx, eos, ngram)
         assert not torch.equal(ngram_context_from_window(narrow, dev_ctx, eos, ngram)[:n], ref[:n])
+
+
+def test_ngram_window_check_fault_shift_is_caught():
+    """`VLLM_TPU_QWEN4_NGRAM_WINDOW=check-fault` builds the window from host context - 1; against the
+    full store at the real device context that must differ on rows with context (the check's
+    positive control would otherwise prove nothing)."""
+    import numpy as np
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.inputs import (
+        ngram_context_from_window,
+        ngram_window_from_host,
+    )
+
+    ngram, eos, rows, n, start, spec = 4, 7, 6, 4, 1, 3
+    store = np.random.default_rng(1).integers(100, 999, (8, 64)).astype(np.int32)
+    host_ctx = np.array([0, 5, 9, 30, 63, 12, 2, 2], dtype=np.int64)
+    width = spec + ngram - 1
+    shifted = ngram_window_from_host(store, np.maximum(host_ctx - 1, 0), start, n, rows, width, eos)
+    row_ids = torch.arange(rows, dtype=torch.int64) + start
+    dev_ctx = torch.zeros(rows, dtype=torch.int64)
+    dev_ctx[:n] = torch.from_numpy(host_ctx[start : start + n])
+    ref = ngram_context_from_store(torch.from_numpy(store), row_ids, dev_ctx, eos, ngram)
+    got = ngram_context_from_window(torch.from_numpy(shifted), dev_ctx, eos, ngram)
+    assert bool((got[:n] != ref[:n]).any(dim=1).all())

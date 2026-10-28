@@ -5,6 +5,7 @@ import math
 import time
 from typing import TYPE_CHECKING, cast
 
+import numpy as np
 import torch
 from vllm.forward_context import set_forward_context
 
@@ -24,6 +25,8 @@ if TYPE_CHECKING:
     from .pooled_cache import Qwen4ExpPooledCache
 
 logger = init_logger(__name__)
+# VLLM_TPU_QWEN4_NGRAM_WINDOW=check: checked steps between two logged (host-read) summaries.
+NGRAM_CHECK_LOG_EVERY = 500
 
 
 def ngram_context_from_store(
@@ -204,9 +207,9 @@ class Qwen4ExpAdapter:
         # Row numbers in this store are unrelated to state slots/page IDs.
         batch = self.runner.input_batch
         mode = envs.VLLM_TPU_QWEN4_NGRAM_WINDOW
-        if mode == "1" or (mode == "check" and getattr(self, "_ngram_check_left", 200) <= 0):
-            # Windowed n-gram context: prepare_inputs copies only the rows' windows (`check`:
-            # once its comparisons are done, it runs exactly like `1`).
+        if mode == "1":
+            # Windowed n-gram context: prepare_inputs copies only the rows' windows. The check
+            # modes keep the full-store H2D every step as their reference.
             self.token_store = batch.token_ids_cpu_tensor
         else:
             self.token_store = batch.token_ids_cpu_tensor.to(
@@ -289,12 +292,16 @@ class Qwen4ExpAdapter:
         )
         row_ids = row_ids.clamp(max=snapshot.token_store.shape[0] - 1)
         mode = envs.VLLM_TPU_QWEN4_NGRAM_WINDOW
-        if mode in ("1", "check"):
+        if mode in ("1", "check", "check-fault"):
             # Device context >= host context - spec tokens: a window of spec + ngram - 1 tokens.
             width = max(self.spec_window - 1, 0) + self.config.ngram_size - 1
+            computed = runner.input_batch.num_computed_tokens_cpu
+            if mode == "check-fault":
+                # Positive control for the check: a window one token early must be reported.
+                computed = np.maximum(computed - 1, 0)
             window = ngram_window_from_host(
                 runner.input_batch.token_ids_cpu_tensor.numpy(),
-                runner.input_batch.num_computed_tokens_cpu,
+                computed,
                 snapshot.row_start,
                 snapshot.num_requests,
                 rows,
@@ -307,7 +314,7 @@ class Qwen4ExpAdapter:
                 self.config.eos_token_id,
                 self.config.ngram_size,
             )
-            if mode == "check" and snapshot.token_store.device.type != "cpu":
+            if mode != "1" and snapshot.token_store.device.type != "cpu":
                 self._check_ngram_window(snapshot, row_ids, context, history)
         else:
             history = ngram_context_from_store(
@@ -340,22 +347,32 @@ class Qwen4ExpAdapter:
         return kwargs
 
     def _check_ngram_window(self, snapshot, row_ids, context, history):
-        """``VLLM_TPU_QWEN4_NGRAM_WINDOW=check``: compare the windowed context with the full-store
-        one on the live rows for the first 200 steps (one sync each), log the mismatches."""
-        left = getattr(self, "_ngram_check_left", 200)
-        if left <= 0 or snapshot.num_requests == 0:
+        """``VLLM_TPU_QWEN4_NGRAM_WINDOW=check`` (``check-fault``: its positive control): on every
+        step with live requests, for the whole run, compare the windowed context the step uses with
+        the full-store one. Counts accumulate on device; every ``NGRAM_CHECK_LOG_EVERY`` checks one
+        host read logs them (after startup too, so served traffic is covered, not only warmup)."""
+        n = snapshot.num_requests
+        if n == 0:
             return
-        self._ngram_check_left = left - 1
         ref = ngram_context_from_store(
             snapshot.token_store, row_ids, context, self.config.eos_token_id, self.config.ngram_size
         )
-        n = snapshot.num_requests
-        bad = int((ref[:n] != history[:n]).any(dim=1).sum().item())
-        self._ngram_check_bad = getattr(self, "_ngram_check_bad", 0) + bad
-        if bad or left in (200, 1):
+        bad = (ref[:n] != history[:n]).any(dim=1).sum()
+        if getattr(self, "_ngram_check_bad", None) is None:
+            self._ngram_check_bad = torch.zeros((), dtype=torch.int64, device=bad.device)
+            self._ngram_check_steps = self._ngram_check_rows = self._ngram_check_multi = 0
+            self._ngram_check_max_rows = 0
+        self._ngram_check_bad += bad
+        self._ngram_check_steps += 1
+        self._ngram_check_rows += n
+        self._ngram_check_multi += n > 1
+        self._ngram_check_max_rows = max(self._ngram_check_max_rows, n)
+        if self._ngram_check_steps % NGRAM_CHECK_LOG_EVERY == 1:
             logger.info(
-                "qwen4 ngram window check: %d of %d rows differ this step, %d total, %d checks left",
-                bad, n, self._ngram_check_bad, left - 1,
+                "qwen4 ngram window check: %d differing rows in %d checked steps (%d rows, %d steps "
+                "with >1 row, max %d rows)",
+                int(self._ngram_check_bad.item()), self._ngram_check_steps, self._ngram_check_rows,
+                self._ngram_check_multi, self._ngram_check_max_rows,
             )
 
     def dummy_run(
