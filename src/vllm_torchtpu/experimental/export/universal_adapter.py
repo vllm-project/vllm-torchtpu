@@ -376,9 +376,10 @@ def run_model_loader(vllm_config: Any) -> nn.Module:
         loader = get_model_loader(vllm_config.load_config)
         # `@instrument` on `load_model` hides its signature from type checkers.
         load_model: Any = loader.load_model
-        return load_model(
+        model: nn.Module = load_model(
             vllm_config=vllm_config, model_config=vllm_config.model_config
         )
+    return model
 
 
 def load_dummy_vllm_model(vllm_config: Any) -> nn.Module:
