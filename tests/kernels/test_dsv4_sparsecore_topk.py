@@ -451,23 +451,30 @@ def test_return_scores(b: int, n: int, k: int):
 # `b=64, n=N_SHORT` is P=1; `b=16, n=N_128K` is one cooperative call at P=8.
 SINGLE_STAGE = (64, N_SHORT, 2048)
 COOPERATIVE = (16, N_128K, 2048)
+# TPU_SC_TOPK_BY_LENGTH: >= 32 rows at P > 1, and a width that fits its buffer.
+BY_LENGTH = (64, N_128K, 2048)
+N_96K = 98304
 
 
-def _stage_group_ids(monkeypatch, b, n, k, **kwargs) -> list[int | None]:
-    """The `scheduling_group_id` each `_sc_topk_direct` call receives, in order.
+def _stage_group_ids(monkeypatch, b, n, k, **kwargs) -> list[tuple[str, int | None]]:
+    """The `scheduling_group_id` each SparseCore call receives, in order.
 
     Calls `sparsecore_topk.__wrapped__` rather than the jitted wrapper so the
-    stub is guaranteed to be the function that runs: a cached trace from an
-    earlier test would otherwise re-run the real kernel and record nothing.
+    stubs are guaranteed to be the functions that run: a cached trace from an
+    earlier test would otherwise re-run the real kernels and record nothing.
     """
-    seen: list[int | None] = []
+    seen: list[tuple[str, int | None]] = []
 
-    def _stub(scores, k_, row_lengths, *, scheduling_group_id=None, **_):
-        seen.append(scheduling_group_id)
-        out = jnp.zeros((scores.shape[0], k_), jnp.int32)
-        return out, out
+    def _stub(name):
+        def stub(scores, k_, row_lengths, *, scheduling_group_id=None, **kw):
+            seen.append((name, scheduling_group_id))
+            out = jnp.zeros((scores.shape[0], k_), jnp.int32)
+            return (out, out) if kw.get("return_scores") else out
 
-    monkeypatch.setattr(sc_module, "_sc_topk_direct", _stub)
+        return stub
+
+    monkeypatch.setattr(sc_module, "_sc_topk_direct", _stub("cooperative"))
+    monkeypatch.setattr(sc_module, "_sc_topk_by_length", _stub("by_length"))
     sc_module.sparsecore_topk.__wrapped__(jnp.zeros((b, n), jnp.float32), k, **kwargs)
     return seen
 
@@ -475,12 +482,46 @@ def _stage_group_ids(monkeypatch, b, n, k, **kwargs) -> list[int | None]:
 @pytest.mark.parametrize(
     "shape,expected_p,kwargs,expected",
     [
-        (SINGLE_STAGE, 1, dict(scheduling_group_id=3), [3]),
-        (SINGLE_STAGE, 1, {}, [None]),
-        (COOPERATIVE, 4, dict(scheduling_group_id=3), [3]),
-        (COOPERATIVE, 4, {}, [None]),
+        (SINGLE_STAGE, 1, dict(scheduling_group_id=3), [("cooperative", 3)]),
+        (SINGLE_STAGE, 1, {}, [("cooperative", None)]),
+        (COOPERATIVE, 4, dict(scheduling_group_id=3), [("cooperative", 3)]),
+        (COOPERATIVE, 4, {}, [("cooperative", None)]),
+        # TPU_SC_TOPK_BY_LENGTH at p == 1: nothing to split, one call.
+        (
+            SINGLE_STAGE,
+            1,
+            dict(scheduling_group_id=3, by_length=True),
+            [("cooperative", 3)],
+        ),
+        # Fewer rows than subcores: the cooperative split, one call.
+        (COOPERATIVE, 4, dict(by_length=True), [("cooperative", None)]),
+        # n past the by-length buffer: rows that fit one subcore, then the rest.
+        (
+            BY_LENGTH,
+            4,
+            dict(scheduling_group_id=3, by_length=True),
+            [("by_length", 3), ("cooperative", 3)],
+        ),
+        (
+            BY_LENGTH,
+            4,
+            dict(by_length=True, return_scores=True),
+            [("by_length", None), ("cooperative", None)],
+        ),
+        # n within the buffer: every row fits, no cooperative call.
+        ((64, N_96K, 2048), 2, dict(by_length=True), [("by_length", None)]),
     ],
-    ids=["p1", "p1_none", "p4", "p4_none"],
+    ids=[
+        "p1",
+        "p1_none",
+        "p4",
+        "p4_none",
+        "p1_bylen",
+        "p4_b16_bylen",
+        "p4_bylen",
+        "p4_bylen_scores",
+        "p2_bylen_fits",
+    ],
 )
 def test_each_stage_gets_the_group_id_it_was_given(
     monkeypatch, shape, expected_p, kwargs, expected
@@ -488,6 +529,105 @@ def test_each_stage_gets_the_group_id_it_was_given(
     b, n, k = shape
     assert _pick_partition(b, n, k) == expected_p
     assert _stage_group_ids(monkeypatch, b, n, k, **kwargs) == expected
+
+
+# --------------------------------------------------------------------------- #
+# TPU_SC_TOPK_BY_LENGTH.
+# --------------------------------------------------------------------------- #
+# GLM-5.2 per-rank widths: 1M over DCP 8 / 16, and a short context.
+N_DCP8 = N_1M // 8
+N_DCP16 = N_1M // 16
+N_16K = 16384
+
+
+def _by_length_lengths(b, n, k, rng, slot):
+    """Ragged lengths with the edges pinned: empty, below k, the slot, one past
+    it (if n allows), the full row; the rest uniform."""
+    lengths = rng.integers(0, n + 1, b).astype(np.int32)
+    edges = [0, k - 3, min(slot, n), min(slot + 1, n), n, 1, k, k + 1]
+    m = min(b, len(edges))
+    lengths[:m] = edges[:m]
+    return lengths
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("kind", ["random", "heavy_ties"])
+@pytest.mark.parametrize("return_scores", [False, True])
+@pytest.mark.parametrize(
+    "b,n",
+    [
+        (32, N_DCP8),
+        (64, N_DCP8),
+        (200, N_DCP8),
+        (64, N_96K),
+        # Gated off (b < 32, or P == 1): the default call, unchanged.
+        (16, N_DCP8),
+        (64, N_DCP16),
+    ],
+)
+def test_by_length_returns_the_cooperative_arrays(b, n, kind, return_scores):
+    """Flag on vs off: the same index (and key) arrays, order included,
+    whichever path a row takes. The DCP merges index the local lists by slot,
+    so order is part of the contract."""
+    k = 2048
+    p = _pick_partition(b, n, k)
+    slot = sc_module._by_length_slot_words(k, return_scores)
+    rng = np.random.default_rng(SEED + b + n)
+    scores_np = _scores(kind, b, n, rng)
+    if b > 8:
+        scores_np[8] = -np.inf  # a live row with nothing to select
+    lengths_np = _by_length_lengths(b, n, k, rng, slot)
+    scores, lengths = jnp.asarray(scores_np), jnp.asarray(lengths_np)
+
+    def run(by_length):
+        return jax.block_until_ready(
+            sparsecore_topk(
+                scores,
+                k,
+                lengths,
+                return_scores=return_scores,
+                by_length=by_length,
+            )
+        )
+
+    want, got = run(False), run(True)
+    if return_scores:
+        np.testing.assert_array_equal(np.asarray(got[1]), np.asarray(want[1]))
+        want, got = want[0], got[0]
+    got = np.asarray(got)
+    np.testing.assert_array_equal(got, np.asarray(want))
+    assert _mismatch(scores_np, got, k, lengths_np) is None
+    if p > 1 and b >= 32 and n > slot:
+        assert (lengths_np > slot).any(), "no row took the cooperative call"
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("kind", ["random", "heavy_ties"])
+@pytest.mark.parametrize("return_scores", [False, True])
+@pytest.mark.parametrize(
+    "b,n", [(4, N_16K), (16, N_16K), (16, N_DCP16), (64, N_DCP16), (33, N_DCP8)]
+)
+def test_by_length_kernel_matches_the_direct_kernel(b, n, kind, return_scores):
+    """The by-length kernel alone, on shapes the dispatcher keeps off it: the
+    same arrays as the direct call at the dispatcher's P, rows up to the slot."""
+    k = 2048
+    slot = min(sc_module._by_length_slot_words(k, return_scores), n)
+    rng = np.random.default_rng(SEED + 7 * b + n)
+    scores = jnp.asarray(_scores(kind, b, n, rng))
+    lengths = jnp.asarray(np.minimum(_by_length_lengths(b, n, k, rng, slot), slot))
+    words = jax.lax.bitcast_convert_type(scores, jnp.int32)
+    want = sc_module._sc_topk_direct(
+        words,
+        k,
+        lengths,
+        p=_pick_partition(b, n, k),
+        return_scores=return_scores,
+    )
+    got = sc_module._sc_topk_by_length(
+        words, k, lengths, slot_words=slot, return_scores=return_scores
+    )
+    for g, w in zip(jax.tree.leaves(got), jax.tree.leaves(want)):
+        np.testing.assert_array_equal(np.asarray(g), np.asarray(w))
 
 
 @pytest.mark.tpu_test
