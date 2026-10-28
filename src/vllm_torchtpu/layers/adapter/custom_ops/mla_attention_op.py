@@ -132,6 +132,14 @@ STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP = 8
 # 16 pages wins at 16 tokens and short contexts (32 regresses b3 at 9.4k keys).
 STREAMIDX_PACK_BKVP_CAP_TOKENS = 8
 STREAMIDX_PACK_BKVP = (32, 16)  # (T <= cap, T > cap)
+# KV ring depth of TPU_STREAMIDX_DECODE_RING, the depth of the emit_pipeline
+# ring it replaces.
+STREAMIDX_DECODE_RING_SLOTS = 6
+
+
+def _streamidx_decode_ring() -> int:
+    """KV ring depth of the packed decode manual pipeline; 0 keeps emit_pipeline."""
+    return STREAMIDX_DECODE_RING_SLOTS if envs.TPU_STREAMIDX_DECODE_RING else 0
 
 
 def _streamidx_block_sizes(
@@ -591,6 +599,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         skip_empty_decode_chunked = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED
         mixed_bkvp = envs.TPU_STREAMIDX_MIXED_KV_PAGES
         decode_pack = envs.TPU_STREAMIDX_DECODE_PACK
+        decode_ring = _streamidx_decode_ring()
         shared_meta = self._shared_meta
 
         def _streamidx_topk_jax(
@@ -667,6 +676,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
                 decode_pack=decode_pack,
+                decode_ring=decode_ring,
                 shared_meta=shared_meta,
             )
             return cache_kv, topk_indices
@@ -695,6 +705,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 skip_empty_decode_chunked,
                 mixed_bkvp,
                 decode_pack,
+                decode_ring,
                 shared_meta,
                 kv_cache_mode,
             ),
@@ -750,6 +761,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         skip_empty_decode_chunked = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED
         mixed_bkvp = envs.TPU_STREAMIDX_MIXED_KV_PAGES
         decode_pack = envs.TPU_STREAMIDX_DECODE_PACK
+        decode_ring = _streamidx_decode_ring()
         shared_meta = self._shared_meta
         global_group = None
         if envs.TPU_IDX_TOPK_SCHED_GROUPS:
@@ -856,6 +868,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 dcp_lane_ids=lane_ids_arg,
                 small_all_gather=small_ag,
                 decode_pack=decode_pack,
+                decode_ring=decode_ring,
                 shared_meta=shared_meta,
                 **overlap,
             )

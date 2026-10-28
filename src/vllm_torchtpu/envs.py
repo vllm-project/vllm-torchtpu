@@ -198,6 +198,7 @@ if TYPE_CHECKING:
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_STREAMIDX_SKIP_EMPTY_DECODE: bool = True
     TPU_STREAMIDX_DECODE_PACK: bool = True
+    TPU_STREAMIDX_DECODE_RING: bool = False
     TPU_STREAMIDX_SHARED_META: bool = True
     TPU_SC_TOPK_DCP_MERGE_FLAT: bool = True
     TPU_SC_TOPK_COOP_V2: bool = True
@@ -1720,6 +1721,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # passes are unchanged. Pairs with TPU_STREAMIDX_SMALL_BUCKET_BKVP=32
     # (GLM-5.2 DCP8, 9k-67k keys per rank: -10...-48 % per call).
     "TPU_STREAMIDX_DECODE_PACK": env_bool("TPU_STREAMIDX_DECODE_PACK", default=True),
+    # Run the packed page-major blocks of TPU_STREAMIDX_DECODE_PACK as a manual
+    # pipeline instead of emit_pipeline: q and weights are copied in once per
+    # call, and each step issues its look-ahead page copies and the previous
+    # step's score copy, without a branch, in the block of its MXU and head-sum
+    # work instead of in loop regions of their own before the waits. Kernel
+    # names gain "-rg6". Bit-identical indices and scores.
+    "TPU_STREAMIDX_DECODE_RING": env_bool("TPU_STREAMIDX_DECODE_RING", default=False),
     # StreamIdx per-step inputs built once per step instead of once per
     # indexer layer: the MIXED pass schedule without its empty-pass cond (so
     # XLA CSEs the layers' identical copies), its scalar [start, end, chunk]
