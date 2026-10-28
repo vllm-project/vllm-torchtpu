@@ -60,6 +60,10 @@ slots. Build arguments (the per-row default build's value first):
             DMAs. The table takes 4 bytes per route: 132.6 KB at 4096 tokens, top-8.
             The in-kernel sum builds keep the table resident already; the op
             passes it only to the builds that write the slab.
+  scatter   return only this core's rows of the summed output, the reduce-scatter
+            without the all-gather after it (False). The rows a core keeps are its
+            block of every combine chunk (`own_rows`); TPU_PREFILL_SEQ_PARALLEL keeps
+            the residual stream split that way between the layers.
 
 Explicit-MXU forms follow jax tests/pallas/tpu_pallas_test.py ExplicitMXUTest (jax
 0.11.2 ref form). The measurements behind each setting are in the t4-moe-prefill
@@ -1547,14 +1551,66 @@ def build_combine(*, t_local, topk, hidden, lane_blocks, wire_dtype, out_dtype, 
     return fn
 
 
-def combine(slab, slab_row, coeff, axis_name, flat=False):
-    tokens, slots = slab_row.shape
-    h = slab.shape[1] * _LANES
-    chunks = next(
+def token_chunks(tokens):
+    """How many equal chunks of at most _COMBINE_CHUNK_TOKENS rows the combine
+    sums a step of `tokens` tokens in, each with its own reduction."""
+    return next(
         n
         for n in range(1, tokens + 1)
         if not tokens % n and tokens // n <= _COMBINE_CHUNK_TOKENS
     )
+
+
+def _rank_blocks(x, ranks):
+    """x [tokens, ...] as [chunks, ranks, rows, ...]: block (c, r) is what the
+    reduce-scatter of combine chunk c leaves on core r."""
+    tokens = x.shape[0]
+    chunks = token_chunks(tokens)
+    if tokens % (chunks * ranks):
+        raise ValueError(
+            f"{tokens} tokens in {chunks} chunks do not split over {ranks} cores"
+        )
+    return x.reshape(chunks, ranks, tokens // (chunks * ranks), *x.shape[1:])
+
+
+def own_rows(x, index, ranks):
+    """Core `index`'s rows of the step's rows x [tokens, ...]: its block of
+    every combine chunk, in token order."""
+    mine = lax.dynamic_index_in_dim(_rank_blocks(x, ranks), index, 1, keepdims=False)
+    return mine.reshape(-1, *x.shape[1:])
+
+
+def scatter_rows(x, axis_name):
+    """The sum over `axis_name` of x [tokens, ...], this core's rows only
+    (`own_rows`): one reduce-scatter per combine chunk."""
+    blocks = _rank_blocks(x, lax.axis_size(axis_name))
+    chunk = blocks.shape[1] * blocks.shape[2]
+    outs = [
+        lax.psum_scatter(
+            x[c * chunk : (c + 1) * chunk], axis_name, scatter_dimension=0, tiled=True
+        )
+        for c in range(blocks.shape[0])
+    ]
+    return outs[0] if len(outs) == 1 else jnp.concatenate(outs, 0)
+
+
+def gather_rows(x, axis_name):
+    """Every core's rows (`own_rows`) put back in token order: one all-gather
+    per combine chunk."""
+    ranks = lax.axis_size(axis_name)
+    chunks = token_chunks(x.shape[0] * ranks)
+    rows = x.shape[0] // chunks
+    outs = [
+        lax.all_gather(x[c * rows : (c + 1) * rows], axis_name, axis=0, tiled=True)
+        for c in range(chunks)
+    ]
+    return outs[0] if chunks == 1 else jnp.concatenate(outs, 0)
+
+
+def combine(slab, slab_row, coeff, axis_name, flat=False, scatter=False):
+    tokens, slots = slab_row.shape
+    h = slab.shape[1] * _LANES
+    chunks = token_chunks(tokens)
     chunk = tokens // chunks
     outs = []
     for c in range(chunks):
@@ -1574,8 +1630,13 @@ def combine(slab, slab_row, coeff, axis_name, flat=False):
             y = jnp.sum(gathered * coeff[rows][..., None], axis=1).astype(jnp.bfloat16)
         if outs:
             y, _ = lax.optimization_barrier((y, outs[-1]))
-        # Reduce-scatter + all-gather, not one all-reduce of the chunk (#2196).
-        outs.append(_psum_rows(y, axis_name))
+        if scatter:
+            outs.append(
+                lax.psum_scatter(y, axis_name, scatter_dimension=0, tiled=True)
+            )
+        else:
+            # Reduce-scatter + all-gather, not one all-reduce of the chunk (#2196).
+            outs.append(_psum_rows(y, axis_name))
     return outs[0] if chunks == 1 else jnp.concatenate(outs, 0)
 
 
@@ -1623,6 +1684,7 @@ def fused_moe_prefill(
     sum_in_kernel_max_tokens=0,
     sum_overlap_adds=False,
     row_tokens_resident_max_tokens=0,
+    scatter=False,
 ):
     """fused_moe_prefill_kernel.fused_moe_prefill's op with per-row activation
     scales and the stage-A levers as arguments (the defaults are the per-row
@@ -1635,7 +1697,9 @@ def fused_moe_prefill(
     row_tokens_resident_max_tokens tokens a build that writes the slab reads
     each route's token from the token table resident in SMEM instead of from a
     copied window of it: the same row DMAs, the same output (the in-kernel sum
-    builds read it from SMEM already)."""
+    builds read it from SMEM already). With `scatter` it returns this core's
+    rows of the sum only (`scatter_rows`); x may then be None when x_q is given
+    and there is no shared expert gate."""
     if x_q is None:
         tokens, h = x.shape
     else:
@@ -1765,7 +1829,7 @@ def fused_moe_prefill(
         shared_w2_scale.reshape(1, 1, h).astype(jnp.float32),
     )
     if sum_cols:
-        return _psum_rows(out, axis_name)
+        return scatter_rows(out, axis_name) if scatter else _psum_rows(out, axis_name)
     shared_row = routes + jnp.arange(tokens, dtype=jnp.int32)[:, None]
     slab_row = jnp.where(route_valid, slab_row, shared_row)
     return combine(
@@ -1774,6 +1838,7 @@ def fused_moe_prefill(
         jnp.concatenate([coeff, gate], 1),
         axis_name,
         flat=flat,
+        scatter=scatter,
     )
 
 
