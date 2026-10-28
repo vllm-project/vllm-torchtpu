@@ -24,7 +24,9 @@ from vllm_torchtpu.kernels.deepseek_v4.rope import (
     LANE,
     CosSinRef,
     _cos_sin_lanes,
+    _gptj_sign,
     _rotate_gptj,
+    _swap_pairs,
 )
 from vllm_torchtpu.layers.core.quantization import FP8_E4M3_MAX
 
@@ -322,14 +324,15 @@ def _pipelined_kernel(
         for s in range(rows // prep_rows):
             sub = pl.ds(s * prep_rows, prep_rows)
             cos_sin = cos_sin_ref[pl.ds(r * rows + s * prep_rows, prep_rows)]
-            cos, sin = cos_sin[:, :LANE], cos_sin[:, LANE:]
+            # _rotate_gptj's sign is +-1, so folding it into sin is exact.
+            cos, sin = cos_sin[:, :LANE], cos_sin[:, LANE:] * _gptj_sign()
             # Heads major first: the [rows, H * head_dim] relayout the dot needs
             # is then one transpose, and cos/sin apply per row unbroadcast.
             x_heads = jnp.swapaxes(x_buf[slot, sub], 0, 1)
             parts = []
             for xh in x_heads:
                 tail = xh[:, lo:].astype(jnp.float32)
-                roped = tail * cos + _rotate_gptj(tail) * sin
+                roped = tail * cos + _swap_pairs(tail) * sin
                 parts += [xh[:, :lo], roped.astype(xh.dtype)]
             x = jnp.concatenate(parts, axis=-1)
             amax = jnp.max(jnp.abs(x), axis=1, keepdims=True)
