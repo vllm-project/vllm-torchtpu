@@ -59,6 +59,10 @@ def mark_padding(num_valid_tokens: int, num_padded_tokens: int) -> None:
         _padding_state.update(num_valid_tokens, num_padded_tokens)
 
 
+def get_padding_state() -> "TokenPaddingState | None":
+    return _padding_state
+
+
 def zero_routing_weights_for_padding(
     topk_ids: torch.Tensor, topk_weights: torch.Tensor, is_local_tensor: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:

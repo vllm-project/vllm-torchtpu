@@ -5375,6 +5375,11 @@ class TPUModelRunner(GPUModelRunner):
             draft = self._async_drafter.draft_model if self._is_async_drafter else None
             arm(self.model, draft)
 
+        if envs.TPU_MICROBATCH_FACTOR > 1:
+            from vllm_torchtpu.models.microbatch import maybe_install_microbatch
+
+            maybe_install_microbatch(self.model, self.vllm_config)
+
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()
         self._initialize_quantization_kernels()

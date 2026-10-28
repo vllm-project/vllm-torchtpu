@@ -146,6 +146,10 @@ PATCHES = (
         "vllm_torchtpu.platforms.tpu_platform:_patch_api_server_kernel_reload_endpoint",
         _ACTIVE,
     ),
+    Patch(
+        "vllm_torchtpu.models.microbatch.qwen:patch_qwen_microbatch",
+        _ACTIVE,
+    ),
     # Model-specific patches.
     # Append patches for new models here with
     # stages=("platform_activation", "model_load") and model_config=True.
