@@ -23,6 +23,9 @@ import pytest
 
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import sparsecore_topk
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.components import (
+    StreamIndexComponents,
+)
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
     SparseCoreTopK,
 )
@@ -196,6 +199,84 @@ class PrefixSchedule:
                 for a in (meta.batch_tile_idx, meta.bq_idx, meta.bkv_idx)
             ),
         )
+
+
+@pytest.mark.parametrize("cp_size", [1, 2])
+@pytest.mark.parametrize(
+    "shift,offset,visible,local,sharded",
+    [
+        (-3, 0, [0, 0, 0, 1], [0, 0, 0, 1], [0, 0, 0, 0]),
+        (20, 0, [4, 4, 4, 4], [3, 3, 3, 3], [2, 2, 2, 2]),
+        (0, -10, [1, 2, 3, 4], [0, 0, 0, 0], [0, 0, 0, 0]),
+        (0, 10, [1, 2, 3, 4], [3, 3, 3, 3], [3, 3, 3, 3]),
+    ],
+    ids=[
+        "negative-positions",
+        "past-end-positions",
+        "negative-lengths",
+        "long-lengths",
+    ],
+)
+def test_component_row_lengths_are_bounded(
+    cp_size, shift, offset, visible, local, sharded
+):
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
+        _effective_row_lengths,
+    )
+
+    calls = []
+
+    class ObservingSchedule(PrefixSchedule):
+        def positions(self, positions):
+            calls.append("positions")
+            return positions + shift
+
+        def visible_lengths(self, lengths):
+            calls.append("visible_lengths")
+            np.testing.assert_array_equal(lengths, visible)
+            return lengths + offset
+
+    actual = _effective_row_lengths(
+        jnp.array([4]),
+        jnp.array([0, 4]),
+        jnp.array([0, 0, 1]),
+        num_tokens=4,
+        num_positions=3,
+        compression_ratio=1,
+        cp_rank=cp_size - 1,
+        cp_size=cp_size,
+        components=StreamIndexComponents(DenseKeyReader(), ObservingSchedule()),
+    )
+    assert calls == ["positions", "visible_lengths"]
+    np.testing.assert_array_equal(actual, local if cp_size == 1 else sharded)
+
+
+@pytest.mark.parametrize(
+    "cp_size,cp_rank,expected",
+    [
+        (1, 0, [2, 2, 2, 1, 0, 0]),
+        (2, 0, [1, 1, 1, 1, 0, 0]),
+        (2, 1, [1, 1, 1, 0, 0, 0]),
+    ],
+)
+def test_default_row_lengths_keep_causal_and_padding_behavior(
+    cp_size, cp_rank, expected
+):
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
+        _effective_row_lengths,
+    )
+
+    actual = _effective_row_lengths(
+        jnp.array([5, 2, 0]),
+        jnp.array([0, 3, 4, 4]),
+        jnp.array([0, 0, 2]),
+        num_tokens=6,
+        num_positions=16,
+        compression_ratio=2,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+    )
+    np.testing.assert_array_equal(actual, expected)
 
 
 def test_key_reader_decodes_window_and_scales():
@@ -374,4 +455,48 @@ def test_components_reject_unsupported_inputs(unsupported):
             num_queries_per_block=8,
             kv_layout=layout,
             components=StreamIndexComponents(reader, PrefixSchedule()),
+        )
+
+
+@pytest.mark.parametrize("packing", [0, -1, 3, 512])
+def test_component_packing_rejected_before_scoring(packing):
+    class PermissiveReader(DenseKeyReader):
+        def validate(self, cache, width, layout):
+            pass
+
+    args, _ = _component_inputs((64,), (4,), 8)
+    with pytest.raises(ValueError, match="packing"):
+        streamindex_topk(
+            *args,
+            k=128,
+            compression_ratio=1,
+            num_kv_pages_per_block=(1, 2, 1),
+            num_queries_per_block=8,
+            components=StreamIndexComponents(
+                PermissiveReader(packing), PrefixSchedule()
+            ),
+        )
+
+
+def test_unsupported_layout_skips_both_component_validators():
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.config import KVLayout
+
+    class ForbiddenReader(DenseKeyReader):
+        def validate(self, cache, width, layout):
+            pytest.fail("key validator must not receive an unsupported layout")
+
+    class ForbiddenSchedule(PrefixSchedule):
+        def validate(self, compression_ratio):
+            pytest.fail("schedule validator must not receive an unsupported layout")
+
+    args, _ = _component_inputs((64,), (4,), 8)
+    with pytest.raises(NotImplementedError, match="HEAD_ALONG_SUBLANE"):
+        streamindex_topk(
+            *args,
+            k=128,
+            compression_ratio=1,
+            num_kv_pages_per_block=1,
+            num_queries_per_block=8,
+            kv_layout=KVLayout.SEQ_ALONG_LANE,
+            components=StreamIndexComponents(ForbiddenReader(), ForbiddenSchedule()),
         )
