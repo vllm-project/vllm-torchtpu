@@ -23,16 +23,24 @@ INDEX_BLOCK_TOKENS = 4096
 
 
 def pcp_gather_rows(
-    x: jax.Array, restore_idx: jax.Array, *, axis_name: str, pcp_size: int
+    x: jax.Array, restore_idx: jax.Array, *, dcp_axis_name: str, pcp_size: int
 ) -> jax.Array:
-    """All-gather local rows over PCP and restore request-major split order."""
+    """All-gather local rows over PCP and restore request-major split order.
+
+    This function currently assume DCP = PCP x TP, and only do all gather from 
+    PCP group. 
+    """
     num_local = x.shape[0]
     as_bytes = x.dtype.itemsize == 1
     rows = lax.bitcast_convert_type(x, jnp.uint8) if as_bytes else x
-    gathered = lax.all_gather(rows, axis_name, tiled=False)
-    tp_size = gathered.shape[0] // pcp_size
-    gathered = gathered.reshape(pcp_size, tp_size, *rows.shape)[:, 0]
-    gathered = gathered.reshape(pcp_size * num_local, *rows.shape[1:])
+    tp_size = lax.axis_size(dcp_axis_name) // pcp_size
+    groups = [[p * tp_size + t for p in range(pcp_size)] for t in range(tp_size)]
+    gathered = lax.all_gather(
+        rows,
+        dcp_axis_name,
+        tiled=True,
+        axis_index_groups=groups if tp_size > 1 else None,
+    )
     out = gathered[restore_idx[: pcp_size * num_local]]
     return lax.bitcast_convert_type(out, x.dtype) if as_bytes else out
 

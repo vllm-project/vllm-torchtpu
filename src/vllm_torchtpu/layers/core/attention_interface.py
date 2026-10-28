@@ -1323,7 +1323,7 @@ def sparse_mla_pcp_write_split(
         split_qsl_,
     ):
         gather = functools.partial(
-            ws.pcp_gather_rows, axis_name=dcp_axis_name, pcp_size=pcp_size
+            ws.pcp_gather_rows, dcp_axis_name=dcp_axis_name, pcp_size=pcp_size
         )
         return update_sparse_mla_kv_cache_dcp(
             kv_cache_nope,

@@ -540,7 +540,7 @@ def pcp_prefill_topk(
             k_split = ws.pcp_gather_rows(
                 k_packed,
                 restore_idx,
-                axis_name=DCP_AXIS_NAME,
+                dcp_axis_name=DCP_AXIS_NAME,
                 pcp_size=pcp_size,
             )
             cache_kv = _scatter_indexer_k_rows(
