@@ -11,6 +11,8 @@ decomposed layer in f32 (routed experts + gated shared expert, psum).
 Needs 8 host devices: JAX_PLATFORMS=cpu
 XLA_FLAGS=--xla_force_host_platform_device_count=8 (skipped otherwise)."""
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -149,3 +151,80 @@ def test_qwen38_flash_shapes_match_decomposed_layer(mesh, monkeypatch):
     assert _max_rel(got[0], _reference(*_inputs(0), skip=int(ids[0, 0]))) > 0.08
     ungated = _reference(x, w1, w1_s, w2, w2_s, sw1, sw2, gate, tw, ids, gated=False)
     assert _max_rel(got[0], ungated) > 0.08
+
+
+@pytest.mark.parametrize("tokens", [M, M - 4])
+def test_folded_prologue_is_bitwise_the_unfolded_call(mesh, monkeypatch, tokens):
+    """fold=True (routing prologue inside the kernel, operands as stored) returns
+    exactly the unfolded call's output, with and without row padding."""
+    monkeypatch.setattr(kmod, "_vmem_capacity", lambda: 64 << 20)
+    x, w1, w1_s, w2, w2_s, sw1, sw2, gate, tw, ids = _inputs(1)
+    x, tw, ids = x[:tokens], tw[:tokens], ids[:tokens]
+    padded = [
+        pad_shared_intermediate(_torch(sw1[r]), _torch(sw2[r]), INTER_S_PAD)
+        for r in range(N)
+    ]
+    psw1 = jnp.stack([_jax(p[0]) for p in padded])
+    psw2 = jnp.stack([_jax(p[1]) for p in padded])
+    sh, rep = NamedSharding(mesh, P("d")), NamedSharding(mesh, P())
+    gate_row = gate.reshape(1, H)  # as the linear stores it
+
+    def body(fold, rank, w1, w2, w1_s, w2_s, sw1, sw2, x, gate_row, tw, ids):
+        common = (
+            x,
+            w1[0],
+            w2[0],
+            w1_s[0][:, :, None, :],
+            w2_s[0][:, :, None, :],
+            sw1[0],
+        )
+        if fold:
+            return kmod.fused_moe_decode(
+                rank,
+                *common,
+                jnp.ones((2 * INTER_S_PAD,), jnp.float32),
+                sw2[0],
+                jnp.ones((H,), jnp.float32),
+                gate_row,
+                tw,
+                ids,
+                n_ranks=N,
+                expert_start="rank",
+                fold=True,
+                interpret=True,
+            )[None]
+        return kmod.fused_moe_decode(
+            rank[0, :1],
+            *common,
+            jnp.ones((1, 2 * INTER_S_PAD), jnp.float32),
+            sw2[0],
+            jnp.ones((1, H), jnp.float32),
+            gate_row.reshape(-1, 1),
+            tw,
+            ids,
+            n_ranks=N,
+            expert_start=rank[0, 1],
+            interpret=True,
+        )[None]
+
+    rank = np.stack([np.arange(N), np.arange(N) * E], 1).astype(np.int32)
+    args = [
+        jax.device_put(rank, sh),
+        *(jax.device_put(a, sh) for a in (w1, w2, w1_s, w2_s, psw1, psw2)),
+        *(jax.device_put(a, rep) for a in (x, gate_row, tw, ids)),
+    ]
+    outs = [
+        np.asarray(
+            jax.jit(
+                jax.shard_map(
+                    functools.partial(body, fold),
+                    mesh=mesh,
+                    in_specs=(P("d"),) * 7 + (P(),) * 4,
+                    out_specs=P("d"),
+                    check_vma=False,
+                )
+            )(*args).view(jnp.uint16)
+        )
+        for fold in (False, True)
+    ]
+    np.testing.assert_array_equal(outs[1], outs[0])
