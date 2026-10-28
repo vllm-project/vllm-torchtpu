@@ -142,6 +142,7 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpeculativeDecodingManager,
 )
 from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
+from vllm_torchtpu.runner import host_phases
 from vllm_torchtpu.runner.tpu_pooling import (
     StaticPoolerChunkOutput,
     StaticPoolerSpec,
@@ -1122,6 +1123,7 @@ class TPUModelRunner(GPUModelRunner):
 
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank)
+        host_phases.set_rank(profiler_rank)
 
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
@@ -3714,8 +3716,10 @@ class TPUModelRunner(GPUModelRunner):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        host_phases.begin_step()
         # Update cached state
         self._update_states(scheduler_output)
+        host_phases.mark("update_states")
         if self.scheduler_config.async_scheduling:
             self._flush_disjoint_async_results()
         if scheduler_output.total_num_scheduled_tokens == 0:
@@ -3758,6 +3762,7 @@ class TPUModelRunner(GPUModelRunner):
             has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
         )
         self._dp_step_num_chunks = target_num_chunks
+        host_phases.mark("reorder_count")
 
         # Run the multimodal (vision) encoder. vLLM's base
         # GPUModelRunner.execute_model does this; our override must do it
@@ -3777,6 +3782,7 @@ class TPUModelRunner(GPUModelRunner):
         step_token_store = (
             self.model_adapter.begin_step() if self.model_adapter is not None else None
         )
+        host_phases.mark("adapter_begin_step")
 
         # Profile the current batch composition (prefill vs decode) if phased profiling
         # is enabled.
@@ -3874,6 +3880,7 @@ class TPUModelRunner(GPUModelRunner):
             ) = self._prepare_inputs(
                 scheduler_output, start_index, num_decode_reqs, num_windowed_reqs
             )
+            host_phases.mark("prepare_inputs")
 
             # Seed newly-advanced mamba state blocks before the forward reads
             # them (chunk boundaries, decode crossings, prefix-cache resumes).
@@ -3886,6 +3893,7 @@ class TPUModelRunner(GPUModelRunner):
             input_ids = self._apply_async_token_substitution(
                 self.input_ids, cur_input_indices, pre_next_tokens_indices
             )
+            host_phases.mark("seed_reset_subst")
             # Async spec: the drafts the target verifies live in the substituted
             # input_ids (host input_ids_cpu holds placeholders), so re-source the
             # rejection sampler's draft_token_ids from the device.
@@ -4003,6 +4011,7 @@ class TPUModelRunner(GPUModelRunner):
                     )
                 )
 
+            host_phases.mark("adapter_prepare_inputs")
             trace_name = f"ModelForward: {num_reqs} reqs, {num_tokens_padded} toks"
             if "min_kv_len" in trace_kwargs:
                 trace_name += (
@@ -4039,6 +4048,7 @@ class TPUModelRunner(GPUModelRunner):
                     intermediate_tensors=intermediate_tensors,
                     model_kwargs=model_kwargs,
                 )
+            host_phases.mark("forward_dispatch")
 
             if not self._pp_is_last:
                 # The next stage continues this chunk; logits and sampling
@@ -4150,6 +4160,7 @@ class TPUModelRunner(GPUModelRunner):
         if not self._pp_is_last:
             self._pp_pending_scheduler_output = scheduler_output
             return None
+        host_phases.mark("post_forward")
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
             logits_list=logits_list,
@@ -4612,6 +4623,7 @@ class TPUModelRunner(GPUModelRunner):
         state = self.execute_model_state
         scheduler_output = state.scheduler_output
         self.execute_model_state = None
+        host_phases.mark("between_execute_and_sample")
 
         # Used to keep rand draws consistent across TP ranks.
         sampling_generator = self._get_sampling_generator()
@@ -4904,6 +4916,7 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 request_seq_lens.append((i, req_state, seq_len, req_id))
 
+        host_phases.mark("sample_verify")
         next_tokens_tpu = None
         copy_state = None
         if combined_selected_tokens:
@@ -4926,6 +4939,7 @@ class TPUModelRunner(GPUModelRunner):
             and envs.VLLM_TPU_DEFER_PREV_RESULTS_WAIT
             and not has_kv_transfer_group()
         )
+        host_phases.mark("token_d2h_bookkeeping")
         if self.scheduler_config.async_scheduling and not defer_prev_wait:
             self._modify_prev_results()
 
@@ -4995,9 +5009,11 @@ class TPUModelRunner(GPUModelRunner):
                         device_seed=device_seed,
                     )
 
+        host_phases.mark("draft_propose")
         if defer_prev_wait:
             self._modify_prev_results()
 
+        host_phases.mark("modify_prev_results")
         if self._is_dspark_pd_producer:
             assert isinstance(self.drafter, DFlashProposer)
             self.drafter.prepare_prefill_handoff()
@@ -5220,8 +5236,10 @@ class TPUModelRunner(GPUModelRunner):
                     scheduler_output=scheduler_output,
                 )
 
+            host_phases.mark("sample_tail_sync")
             return final_output
 
+        host_phases.mark("sample_tail")
         return async_output
 
     def load_model(self) -> None:
