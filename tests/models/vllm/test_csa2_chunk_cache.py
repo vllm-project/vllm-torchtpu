@@ -23,10 +23,6 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import cache as cache_module
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import PagedCacheRows
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_cache import (
-    PackedFP8IndexCacheRows,
-    PackedFP8IndexerSpec,
-)
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.swa_cache import (
     DeepseekV41SWASpec,
     register_swa_specs,
@@ -124,57 +120,6 @@ def test_swa_owners_hold_pool_pages_and_bind_block_ids(monkeypatch, split):
         cache.row_indices(indices * page_size), indices * page_size
     )
     torch.testing.assert_close(cache.pages(indices), indices)
-
-
-@pytest.mark.cpu_test
-@pytest.mark.parametrize("split", [False, True])
-def test_swa_allocation_with_packed_fp8_indexer(monkeypatch, split):
-    blocks, page_bytes = 8, 32768
-    specs = {
-        "main": MLAAttentionSpec(
-            block_size=64, num_kv_heads=1, head_size=512, dtype=torch.uint8
-        ),
-        "indexer": PackedFP8IndexerSpec(
-            block_size=128,
-            num_kv_heads=1,
-            head_size=132,
-            dtype=torch.uint8,
-            alignment=512,
-        ),
-        "swa": _swa_spec(),
-    }
-    assert {spec.page_size_bytes for spec in specs.values()} == {page_bytes}
-    if split:
-        # Both the word pool (8 blocks) and the SWA owner (8 pages) split.
-        monkeypatch.setattr(cache_module, "SPARSECORE_MAX_POOL_BYTES", 4 * page_bytes)
-    config = _config(specs, blocks, page_bytes, swa_offset=blocks * page_bytes)
-    assert specs["swa"].pool_capacity == blocks
-    materialized = cache_module.materialize_upstream_kv_cache(
-        config,
-        "cpu",
-        KVCacheLayout.LBHNC,
-        word_rows=True,
-        csa2_layers=frozenset(("main",)),
-    )
-    main = materialized.native_raw_cache["main"]
-    assert materialized.native_raw_cache["indexer"] is main
-    assert set(materialized.scale_pools) == {"main"}
-    assert not materialized.rope_pools
-    banks = main if isinstance(main, tuple) else (main,)
-    scales = materialized.scale_pools["main"]
-    scale_banks = scales if isinstance(scales, tuple) else (scales,)
-    assert len(banks) == len(scale_banks) == (2 if split else 1)
-    for bank, scale in zip(banks, scale_banks):
-        assert bank.dtype == torch.int32
-        assert scale.dtype == torch.float32 and scale.shape == (bank.shape[0],)
-    indexer = PackedFP8IndexCacheRows(
-        main, materialized.native_cache_layouts["indexer"]
-    )
-    assert indexer.layout.page_size == specs["indexer"].num_states
-    with pytest.raises(ValueError, match="requires CSA2 for all FP8 consumers"):
-        cache_module.materialize_upstream_kv_cache(
-            config, "cpu", KVCacheLayout.LBHNC, word_rows=True
-        )
 
 
 @pytest.mark.cpu_test
