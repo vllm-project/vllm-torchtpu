@@ -22,7 +22,7 @@ from jax import lax
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
-from torch_tpu import pallas
+from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
 from vllm_torchtpu.layers.adapter import moe_tp_decode
