@@ -26,6 +26,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
 from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowMLASpec
 
 from vllm_torchtpu.kernels.deepseek_v4.core_attention.mla import (
+    HCA_KV_PAGES_PER_BLOCK,
     mla_ragged_paged_attention,
 )
 from vllm_torchtpu.kernels.deepseek_v4.core_attention.mla_swa import (
@@ -173,7 +174,7 @@ def _attention_hca(
         swa_m=swa_m,
         sm_scale=sm_scale,
         # The following parameters are tuned based on microbenchmark results.
-        num_kv_pages_per_block=(128, 64, 64),
+        num_kv_pages_per_block=HCA_KV_PAGES_PER_BLOCK,
         num_queries_per_block=(1, 32, 32),
         chunk_prefill_size=verify_q_len,
     )
