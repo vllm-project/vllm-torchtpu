@@ -291,3 +291,37 @@ def test_ngram_history_uses_configured_width_and_eos():
         store, torch.tensor([0, 0]), torch.tensor([1, 4]), eos_token_id=7, ngram_size=4
     )
     assert history.tolist() == [[7, 7, 11], [12, 13, 14]]
+
+
+@pytest.mark.parametrize("spec", [0, 3])
+def test_ngram_window_matches_full_store(spec):
+    """VLLM_TPU_QWEN4_NGRAM_WINDOW: the per-row host window (width spec + ngram - 1 before the host
+    context) gives the full-store n-gram context for every device context the async rejection
+    correction can produce (host context minus 0..spec), incl. contexts shorter than the n-gram;
+    a window one token too narrow is caught."""
+    import numpy as np
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.inputs import (
+        ngram_context_from_window,
+        ngram_window_from_host,
+    )
+
+    ngram, eos, rows, n, start = 4, 7, 6, 4, 1
+    rng = np.random.default_rng(spec)
+    store = rng.integers(100, 999, (8, 64)).astype(np.int32)
+    host_ctx = np.array([0, 0, 1, 2, 30, 63, 5, 9], dtype=np.int64)
+    width = spec + ngram - 1
+    window = torch.from_numpy(ngram_window_from_host(store, host_ctx, start, n, rows, width, eos))
+    row_ids = torch.arange(rows, dtype=torch.int64) + start
+    for r in range(spec + 1):
+        dev_ctx = torch.zeros(rows, dtype=torch.int64)
+        dev_ctx[:n] = torch.from_numpy(np.maximum(host_ctx[start : start + n] - r, 0))
+        ref = ngram_context_from_store(torch.from_numpy(store), row_ids, dev_ctx, eos, ngram)
+        got = ngram_context_from_window(window, dev_ctx, eos, ngram)
+        assert torch.equal(got[:n], ref[:n]), (r, got[:n], ref[:n])
+    if spec:
+        narrow = torch.from_numpy(ngram_window_from_host(store, host_ctx, start, n, rows, width - 1, eos))
+        dev_ctx = torch.zeros(rows, dtype=torch.int64)
+        dev_ctx[:n] = torch.from_numpy(np.maximum(host_ctx[start : start + n] - spec, 0))
+        ref = ngram_context_from_store(torch.from_numpy(store), row_ids, dev_ctx, eos, ngram)
+        assert not torch.equal(ngram_context_from_window(narrow, dev_ctx, eos, ngram)[:n], ref[:n])

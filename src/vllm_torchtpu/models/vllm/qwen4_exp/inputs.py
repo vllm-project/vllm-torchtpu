@@ -8,8 +8,10 @@ from typing import TYPE_CHECKING, cast
 import torch
 from vllm.forward_context import set_forward_context
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kv_cache_materializer import LayerKVCache
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
@@ -21,6 +23,8 @@ from .config import mtp_layer_prefixes, num_speculative_tokens, use_unified_pool
 if TYPE_CHECKING:
     from .pooled_cache import Qwen4ExpPooledCache
 
+logger = init_logger(__name__)
+
 
 def ngram_context_from_store(
     token_store, row_indices, context_lens, eos_token_id, ngram_size
@@ -30,6 +34,37 @@ def ngram_context_from_store(
     )
     gathered = token_store[row_indices[:, None], columns.clamp(min=0)]
     return torch.where(columns >= 0, gathered.to(torch.int64), eos_token_id)
+
+
+def ngram_window_from_host(
+    token_ids, num_computed, row_start, num_requests, rows, width, eos_token_id
+):
+    """Host side of the windowed n-gram context: per live row the last ``width`` host-store tokens
+    before its host context ``num_computed[row_start + i]`` (async spec decoding advances the host
+    context optimistically; the device context is at most ``width - ngram_size + 1`` tokens shorter),
+    as one ``[rows, width + 1]`` int64 array whose last column is the window's first position."""
+    import numpy as np
+
+    out = np.zeros((rows, width + 1), dtype=np.int64)
+    if num_requests:
+        ctx = np.asarray(num_computed[row_start : row_start + num_requests], dtype=np.int64)
+        lo = ctx - width
+        cols = lo[:, None] + np.arange(width)
+        vals = token_ids[np.arange(row_start, row_start + num_requests)[:, None], np.clip(cols, 0, None)]
+        out[:num_requests, :width] = np.where(cols >= 0, vals, eos_token_id)
+        out[:num_requests, width] = lo
+    return out
+
+
+def ngram_context_from_window(window, context_lens, eos_token_id, ngram_size):
+    """``ngram_context_from_store`` over ``ngram_window_from_host``'s device copy."""
+    width = window.shape[1] - 1
+    columns = context_lens[:, None] + torch.arange(
+        1 - ngram_size, 0, dtype=torch.int64, device=window.device
+    )
+    index = (columns - window[:, width:]).clamp(0, width - 1)
+    gathered = torch.gather(window[:, :width], 1, index)
+    return torch.where(columns >= 0, gathered, eos_token_id)
 
 
 def merge_recent_ngram_context(
@@ -168,9 +203,15 @@ class Qwen4ExpAdapter:
         # Exactly one immutable H2D snapshot after runner request reordering.
         # Row numbers in this store are unrelated to state slots/page IDs.
         batch = self.runner.input_batch
-        self.token_store = batch.token_ids_cpu_tensor.to(
-            self.runner.device, non_blocking=True
-        )
+        mode = envs.VLLM_TPU_QWEN4_NGRAM_WINDOW
+        if mode == "1" or (mode == "check" and getattr(self, "_ngram_check_left", 200) <= 0):
+            # Windowed n-gram context: prepare_inputs copies only the rows' windows (`check`:
+            # once its comparisons are done, it runs exactly like `1`).
+            self.token_store = batch.token_ids_cpu_tensor
+        else:
+            self.token_store = batch.token_ids_cpu_tensor.to(
+                self.runner.device, non_blocking=True
+            )
         if self.spec_window:
             self._previous_rows, self._current_rows = self._current_rows, {}
             self._recent.reverse()
@@ -247,13 +288,35 @@ class Qwen4ExpAdapter:
             + snapshot.row_start
         )
         row_ids = row_ids.clamp(max=snapshot.token_store.shape[0] - 1)
-        history = ngram_context_from_store(
-            snapshot.token_store,
-            row_ids,
-            context,
-            self.config.eos_token_id,
-            self.config.ngram_size,
-        )
+        mode = envs.VLLM_TPU_QWEN4_NGRAM_WINDOW
+        if mode in ("1", "check"):
+            # Device context >= host context - spec tokens: a window of spec + ngram - 1 tokens.
+            width = max(self.spec_window - 1, 0) + self.config.ngram_size - 1
+            window = ngram_window_from_host(
+                runner.input_batch.token_ids_cpu_tensor.numpy(),
+                runner.input_batch.num_computed_tokens_cpu,
+                snapshot.row_start,
+                snapshot.num_requests,
+                rows,
+                width,
+                self.config.eos_token_id,
+            )
+            history = ngram_context_from_window(
+                torch.from_numpy(window).to(runner.device, non_blocking=True),
+                context,
+                self.config.eos_token_id,
+                self.config.ngram_size,
+            )
+            if mode == "check" and snapshot.token_store.device.type != "cpu":
+                self._check_ngram_window(snapshot, row_ids, context, history)
+        else:
+            history = ngram_context_from_store(
+                snapshot.token_store,
+                row_ids,
+                context,
+                self.config.eos_token_id,
+                self.config.ngram_size,
+            )
         if self.spec_window:
             history = self._speculative_ngram_context(
                 snapshot, history, context, starts
@@ -275,6 +338,25 @@ class Qwen4ExpAdapter:
             compressed_block_table=tables[1],
         )
         return kwargs
+
+    def _check_ngram_window(self, snapshot, row_ids, context, history):
+        """``VLLM_TPU_QWEN4_NGRAM_WINDOW=check``: compare the windowed context with the full-store
+        one on the live rows for the first 200 steps (one sync each), log the mismatches."""
+        left = getattr(self, "_ngram_check_left", 200)
+        if left <= 0 or snapshot.num_requests == 0:
+            return
+        self._ngram_check_left = left - 1
+        ref = ngram_context_from_store(
+            snapshot.token_store, row_ids, context, self.config.eos_token_id, self.config.ngram_size
+        )
+        n = snapshot.num_requests
+        bad = int((ref[:n] != history[:n]).any(dim=1).sum().item())
+        self._ngram_check_bad = getattr(self, "_ngram_check_bad", 0) + bad
+        if bad or left in (200, 1):
+            logger.info(
+                "qwen4 ngram window check: %d of %d rows differ this step, %d total, %d checks left",
+                bad, n, self._ngram_check_bad, left - 1,
+            )
 
     def dummy_run(
         self, num_tokens, num_reqs, profile_prefix=None, *, dp_lockstep=False

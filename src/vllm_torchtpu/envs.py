@@ -117,6 +117,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_INDEXER_HOIST_META: bool = False
     VLLM_TPU_QSA_INDEXER_MIXED_ONLY: bool = False
     VLLM_TPU_QSA_DRAFT_SHARED_SELECTION: bool = False
+    VLLM_TPU_QWEN4_NGRAM_WINDOW: str = ""
     VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
@@ -627,6 +628,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Qwen4-exp MTP: the draft's QSA layer attends the target's last QSA layer
     # selection (the request's last verified row) instead of scoring its own
     # indexer: a selection-sharing approximation, gated on real AL.
+    # Qwen4Exp n-gram context: "1" = H2D only each row's window of the host token store that the
+    # device context can address ([host_ctx - K - ngram + 1, host_ctx), K = spec tokens) instead of
+    # the whole [max_num_seqs, max_model_len] table every step (16 MiB at c1, ~2 ms of transfer);
+    # "check" = both paths and log mismatches for the first 200 steps, then as "1"
+    # (models/vllm/qwen4_exp/inputs.py).
+    "VLLM_TPU_QWEN4_NGRAM_WINDOW": lambda: os.getenv("VLLM_TPU_QWEN4_NGRAM_WINDOW", ""),
     "VLLM_TPU_QSA_DRAFT_SHARED_SELECTION": env_bool(
         "VLLM_TPU_QSA_DRAFT_SHARED_SELECTION"
     ),
