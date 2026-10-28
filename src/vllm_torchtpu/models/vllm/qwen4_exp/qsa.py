@@ -31,6 +31,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu import envs as vllm_torchtpu_envs
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import build_qsa_op
+from vllm_torchtpu.layers.adapter.custom_ops.rows_update_op import update_rows_
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.logger import init_logger
 
@@ -734,7 +735,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             carried = cast(torch.Tensor, getattr(self, "_selection_rows"))
             if rows is not None:
                 shared = source[rows.clamp_min(0)]
-                carried[: shared.shape[0]].copy_(shared)
+                update_rows_(carried, shared)
             else:
                 shared = carried[: hidden.shape[0]]
         use_shared = shared is not None and shared_ops is not None and not pick_rows
@@ -773,7 +774,9 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         sink = getattr(self, "_selection_sink", None)
         if sink is not None and rows is None:
             # The target's selection for the MTP draft (bind_shared_selection).
-            sink[: selected.shape[0]].copy_(selected)
+            # Both writes go through the donating row update: a slice copy_
+            # into the buffer copied all of it every step (~42 us at 8192 rows).
+            update_rows_(sink, selected)
         return output, selected
 
     def select_for_kernel(self, hidden, positions, metadata: QSAMetadata):

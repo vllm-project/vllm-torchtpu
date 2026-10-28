@@ -24,8 +24,8 @@ import torch
 from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
     VllmTPUSparseAttnIndexer,
     _topk_rows,
-    _topk_rows_update_jax,
 )
+from vllm_torchtpu.layers.adapter.custom_ops.rows_update_op import rows_update_jax
 
 
 def _reference(buf, topk_tokens, num_tokens, topk_indices):
@@ -59,7 +59,7 @@ def test_topk_rows_update_matches_fill_then_write(rows, width, topk, num_tokens)
     want = _reference(stale.clone(), topk, num_tokens, topk_indices)
 
     got_rows = _topk_rows(stale, topk, num_tokens, topk_indices)
-    got = _topk_rows_update_jax(
+    got = rows_update_jax(
         jnp.asarray(stale.numpy()), jnp.asarray(got_rows.numpy())
     )
 

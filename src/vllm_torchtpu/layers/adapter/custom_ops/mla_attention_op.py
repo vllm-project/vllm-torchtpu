@@ -65,6 +65,7 @@ from vllm_torchtpu.layers.adapter.attention import (
     PallasMLAttentionBackendImpl,
     VllmTPUDeepseekV32IndexerBackend,
 )
+from vllm_torchtpu.layers.adapter.custom_ops.rows_update_op import update_rows_
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on_load
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
@@ -249,39 +250,6 @@ def _dcp_indexer_a2a_for_bucket(
     prefill-sized ones (>= `min_tokens`) take the all-to-all.
     """
     return enabled and num_tokens >= min_tokens
-
-
-def _topk_rows_update_jax(buf: jax.Array, rows: jax.Array) -> jax.Array:
-    """`buf[:rows.shape[0]] = rows` as one row update of a donated buffer."""
-    return jax.lax.dynamic_update_slice(buf, rows.astype(buf.dtype), (0, 0))
-
-
-# The shared top-k table's row update, donating the table.
-#
-# `buf[:n] = rows` on the module buffer reaches XLA as a graph input that is
-# mutated but not donated -- aot_autograd returns the new value and writes it
-# back after the graph -- plus a view write lowered as two row updates of the
-# same base. Both force a full `[max_num_batched_tokens, width]` copy of the
-# table in every indexed layer. Routing the write through a donating op with a
-# `copy_` writeback (the KV-cache pattern) marks the table a buffer donor, so
-# XLA updates it in place. Built at import, not lazily: dynamo cannot trace the
-# op's construction from inside a compiled forward.
-_TOPK_ROWS_UPDATE_OP = pallas.jax_op(
-    "pallas::indexer_topk_rows_update", _topk_rows_update_jax, donate_argnums=(0,)
-)
-
-
-# torch.compile traces the forward with fake tensors (shape and dtype, no data),
-# so it can't run the JAX function to learn what this op returns. This fake
-# tells it: a tensor shaped like `buf`, i.e. the whole updated table, which the
-# caller copies back into `buf`. The real `_topk_rows_update_jax` runs only
-# when the compiled graph executes.
-def _fake_topk_rows_update(buf: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
-    del rows
-    return torch.empty_like(buf)
-
-
-_TOPK_ROWS_UPDATE_OP.register_fake(_fake_topk_rows_update)
 
 
 def _topk_rows(
@@ -771,7 +739,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         """The rows the -1 fill plus partial write would leave, in one update.
 
         Writes the `_topk_rows` with a single row update through a donating op
-        (see `_TOPK_ROWS_UPDATE_OP`), so XLA updates the table in place: same
+        (see `rows_update_op`), so XLA updates the table in place: same
         contents, no full-table copy per indexed layer. Returns those rows
         rather than the buffer, so attention reads them instead of a whole
         `[max_num_batched_tokens, width]` buffer version. The buffer still gets
@@ -779,7 +747,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         """
         buf = self.topk_indices_buffer
         rows = _topk_rows(buf, self.topk_tokens, num_tokens, topk_indices)
-        buf.copy_(_TOPK_ROWS_UPDATE_OP(buf, rows))
+        update_rows_(buf, rows)
         return rows
 
 
