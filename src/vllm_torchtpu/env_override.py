@@ -176,6 +176,15 @@ def set_libtpu_flag_default(flag_name: str, value: str) -> None:
     logger.info("Appended default flag to LIBTPU_INIT_ARGS: %s", new_args)
 
 
+def libtpu_init_args() -> list[str]:
+    """The flags libtpu will read from ``LIBTPU_INIT_ARGS``, one per token.
+
+    Includes the user's flags, the defaults added below at import, and any
+    added since with :func:`set_libtpu_flag_default`.
+    """
+    return os.environ.get("LIBTPU_INIT_ARGS", "").split()
+
+
 _libtpu_extra_args: list[str] = []
 
 # --xla_tpu_use_dynamic_smem_negotiation: let libtpu size SMEM to fit the
