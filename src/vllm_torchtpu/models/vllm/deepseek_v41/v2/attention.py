@@ -21,7 +21,10 @@ from vllm.models.deepseek_v41 import compressor as compressor_upstream
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import cache_capacity
-from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    WEIGHT_FLIPPED_ATTR,
+)
 
 from . import csa2_adapter
 from .attention_kernels import (
@@ -41,6 +44,7 @@ from .candidate_cache import prepare_candidate_cache, select_candidate_cache
 from .ced import prefix_replay_enabled
 from .ops import device_hooks, rms_norm, rotary, round_fp8_activation
 from .projection_rope import initialize_projection_rope
+from .qa_rope_op import get_qa_rope_op, get_rope_rows_op
 from .swa_cache import DeepseekV41SWASpec
 
 logger = init_logger(__name__)
@@ -428,6 +432,15 @@ class IndexerCache(NativeCacheView, upstream.DeepseekV4IndexerCache):
         return AttentionBackend
 
 
+def _uses_qa_rope(attn, hidden_states):
+    """Whether ``attn`` runs the fused Q-A/KV op (``_qa_kv_norm_rope``)."""
+    return (
+        getattr(attn, "_qa_rope_enabled", False)
+        and hidden_states.dtype == torch.bfloat16
+        and hidden_states.dim() == 2
+    )
+
+
 def _value(output):
     return output[0] if isinstance(output, tuple) else output
 
@@ -530,6 +543,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
     # True once `_init_local_q_weights` built the gathered weights.
     _local_q_attn = False
     _q_projection_rope_op: Any = None
+    # True once `process_weights_after_loading` qualified the fused Q-A/KV op.
+    _qa_rope_enabled = False
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads):
@@ -637,7 +652,13 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         qr_kv, kv_score, indexer_weights = self._run_parallel_input_projections(
             hidden_states
         )
-        qr, qr_scale, kv = self._split_qkv_and_norm(qr_kv)
+        kv_rotated = False
+        if _uses_qa_rope(self, hidden_states):
+            qr, kv, kv_rotated = self._qa_kv_norm_rope(hidden_states, positions)
+            assert qr is not None  # emit_qr defaults to True
+            qr_scale = None
+        else:
+            qr, qr_scale, kv = self._split_qkv_and_norm(qr_kv)
         # This rank's SP token shard of qr, before the gather.
         swa_kv = getattr(getattr(self, "swa_cache_layer", None), "kv_cache", None)
         qr_local = (
@@ -689,18 +710,24 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             positions,
             o_padded,
         )
+        kwargs = {"kv_rotated": True} if kv_rotated else {}
         if qr_local is not None:
-            projected = self._prepare_and_attn_fn(*args, qr_local=qr_local)
+            projected = self._prepare_and_attn_fn(*args, qr_local=qr_local, **kwargs)
             if projected is not None:
                 # The fused q/attention/wo_a op already produced wo_b's input.
                 return _value(self.wo_b(projected))
         else:
-            self._prepare_and_attn_fn(*args)
+            self._prepare_and_attn_fn(*args, **kwargs)
         o = o_padded[:, : self.n_local_heads, :]
         return self._o_proj(o, positions)
 
     def _run_parallel_input_projections(self, hidden_states):
-        qr_kv = self._fused_wqa_wkv_gemm(hidden_states)
+        # None when `_qa_kv_norm_rope` produces qr and kv instead.
+        qr_kv = (
+            None
+            if _uses_qa_rope(self, hidden_states)
+            else self._fused_wqa_wkv_gemm(hidden_states)
+        )
         kv_score = (
             self.compressor.project(hidden_states)
             if self.compressor is not None and not self._ced_global_from_encoder
@@ -737,6 +764,46 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             None,
             self.kv_norm(qr_kv[:, self.q_lora_rank :]),
         )
+
+    def _qa_kv_norm_rope(self, hidden_states, positions, *, emit_qr=True):
+        """Fused ``_fused_wqa_wkv_gemm`` -> ``_split_qkv_and_norm`` -> SWA ``_rotate``.
+
+        Returns ``(qr | None, kv, kv_rotated)``. SP-sharded input leaves kv
+        unrotated: its rows are a token shard of the gathered ``positions``.
+        """
+        rotate = not self._sp_sharded_input and positions.dtype == torch.int32
+        op = get_qa_rope_op(
+            self.kv_norm.variance_epsilon, emit_qr=emit_qr, rotate_kv=rotate
+        )
+        layer = self.fused_wqa_wkv
+        args = [
+            hidden_states,
+            layer.weight,
+            layer.weight_scale,
+            self.q_norm.weight,
+            self.kv_norm.weight,
+        ]
+        if rotate:
+            args.append(self._rope_rows(positions))
+        out = op(*args)
+        qr, kv = out if emit_qr else (None, out)
+        return qr, kv, rotate
+
+    def _rope_rows(self, positions):
+        """This step's ``_tpu_rope_cache`` rows, gathered once per stage."""
+        stage_cache = _active_stage_attn_cache
+        key = ("rope_rows", id(self._tpu_rope_cache))
+        cached = stage_cache.get(key) if stage_cache is not None else None
+        if (
+            cached is not None
+            and cached[0] is positions
+            and cached[1] is self._tpu_rope_cache
+        ):
+            return cached[2]
+        rows = get_rope_rows_op()(self._tpu_rope_cache, positions)
+        if stage_cache is not None:
+            stage_cache[key] = (positions, self._tpu_rope_cache, rows)
+        return rows
 
     @property
     def kv_rope_op(self):
@@ -921,9 +988,12 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         positions,
         output,
         qr_local=None,
+        kv_rotated=False,
     ):
         """Attend into ``output``, or return the ``wo_b`` input when the fused
-        q/attention/``wo_a`` op (``qr_local``) ran; else ``None``."""
+        q/attention/``wo_a`` op (``qr_local``) ran; else ``None``.
+
+        ``kv_rotated``: ``_qa_kv_norm_rope`` already applied the SWA RoPE."""
         metadata = get_forward_context().attn_metadata
         if not isinstance(metadata, dict) or not self.swa_cache_layer.kv_cache.numel():
             output.zero_()
@@ -1242,20 +1312,27 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 and positions.dtype == torch.int32
                 and self._tpu_rope_cache.dtype == torch.float32
             ):
-                q = self._q_projection_rope_op(
+                q_args = [
                     qr,
                     self.wq_b.weight,
                     self.wq_b.weight_scale,
                     positions,
                     self._tpu_rope_cache,
-                )
+                ]
+                if self._qa_rope_enabled:
+                    # Share the step's gathered rows with the Q-A/KV kernel.
+                    q_args.append(self._rope_rows(positions))
+                    q = initialize_projection_rope(shared_rows=True)(*q_args)
+                else:
+                    q = self._q_projection_rope_op(*q_args)
             else:
                 # Other weight/rotary layouts retain the original model path.
                 q = _value(self.wq_b(qr)).reshape(-1, self.n_local_heads, self.head_dim)
                 q = self._rotate(q, positions)
         # Match upstream's plain BF16 cache selected by this backend. Packed
         # FP8/NVFP4 cache numerics must not be imposed on BF16 cache rows.
-        kv = self._rotate(kv, positions)
+        if not kv_rotated:
+            kv = self._rotate(kv, positions)
         if self._csa2:
             assert csa2_write_records is not None
             csa2_adapter.publish_swa(swa_cache, csa2_write_records, kv.reshape(-1, 512))
@@ -1940,9 +2017,46 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             and self._config["qk_rope_head_dim"] == 64
         ):
             self._q_projection_rope_op = initialize_projection_rope()
+        self._qa_rope_enabled = tp_size == 1 and self._qa_rope_supported()
         # Register before TorchDynamo captures the first model forward.
+        if self._qa_rope_enabled:
+            eps = self.kv_norm.variance_epsilon
+            get_rope_rows_op()
+            if self._q_projection_rope_op is not None:
+                initialize_projection_rope(shared_rows=True)
+            for emit_qr in (True, False):
+                for rotate_kv in (True, False):
+                    get_qa_rope_op(eps, emit_qr=emit_qr, rotate_kv=rotate_kv)
         if self.wo_a.weight.device.type == "tpu":
             _ = self.o_proj_op
+
+    def _qa_rope_supported(self):
+        """Per-channel FP8 ``fused_wqa_wkv`` in the canonical (k, n) layout."""
+        layer = getattr(self, "fused_wqa_wkv", None)
+        if layer is None:
+            return False
+        weight = layer.weight
+        scale = getattr(layer, "weight_scale", None)
+        width = self.q_lora_rank + self.head_dim
+        rotary_dim = self._config["qk_rope_head_dim"]
+        return (
+            weight.device.type == "tpu"
+            and getattr(layer, WEIGHT_FLIPPED_ATTR, False)
+            and weight.dtype == torch.float8_e4m3fn
+            and weight.shape == (self.hidden_size, width)
+            and scale is not None
+            and scale.dtype == torch.float32
+            and scale.shape == (width,)
+            and self.q_lora_rank % 128 == 0
+            and self.head_dim % 128 == 0
+            and self.q_norm.weight.dtype == self.kv_norm.weight.dtype
+            and self.q_norm.weight.dtype in (torch.bfloat16, torch.float32)
+            and self.q_norm.variance_epsilon == self.kv_norm.variance_epsilon
+            and self._tpu_rope_cache.dtype == torch.float32
+            and self._tpu_rope_cache.shape[1] == rotary_dim
+            and 0 < rotary_dim <= 128
+            and rotary_dim % 2 == 0
+        )
 
     def _o_proj(self, output, positions):
         assert output.dtype == torch.bfloat16

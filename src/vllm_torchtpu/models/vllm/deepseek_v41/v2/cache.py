@@ -1539,9 +1539,84 @@ def scatter_cache_values(
     from jax.experimental.pallas import tpu as pltpu
 
     chunks = width // ROW_WORDS
-    # Records per grid step whose row DMAs are in flight together. A serial
-    # start/wait per 512 B row is DMA-latency bound.
+    # Records whose row DMAs are in flight together. A serial start/wait per
+    # 512 B row is DMA-latency bound.
     block = 64
+    if records.shape[0] < _COMPACT_MIN_RECORDS:
+        return _scatter_rows_dense(cache, records, words, chunks, block)
+    # Visit only valid records: a scalar loop iteration costs ~90 ns even when
+    # it issues nothing, and a prefill ring write keeps ~8 of 2048 records.
+    # Sized nonzero compacts valid records to the front in token order (it
+    # lowers to cumsum + scatter, no sort); DMA order within a batch is kept.
+    valid = (records >= 0) & (records < cache.shape[0] // chunks)
+    (order,) = jnp.nonzero(valid, size=records.shape[0], fill_value=0)
+    order = order.astype(jnp.int32)
+    targets = records[order]
+    count = jnp.sum(valid, dtype=jnp.int32).reshape(1)
+
+    def kernel(
+        count_ref, order_ref, target_ref, values_ref, _input_ref, output_ref, sem
+    ):
+        def copies(index):
+            token, record = order_ref[index], target_ref[index]
+            return [
+                pltpu.make_async_copy(
+                    values_ref.at[
+                        pl.ds((token * chunks + chunk) * ROW_WORDS, ROW_WORDS)
+                    ],
+                    output_ref.at[record * chunks + chunk, :],
+                    sem,
+                )
+                for chunk in range(chunks)
+            ]
+
+        def batch(b, carry):
+            first = b * block
+            size = jnp.minimum(block, count_ref[0] - first)
+
+            def run(method):
+                def body(index, inner):
+                    for copy in copies(first + index):
+                        getattr(copy, method)()
+                    return inner
+
+                jax.lax.fori_loop(0, size, body, 0)
+
+            run("start")
+            run("wait")
+            return carry
+
+        jax.lax.fori_loop(0, (count_ref[0] + block - 1) // block, batch, 0)
+
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=3,
+            grid=(1,),
+            in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 2,
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            scratch_shapes=[pltpu.SemaphoreType.DMA],
+        ),
+        out_shape=jax.ShapeDtypeStruct(cache.shape, cache.dtype),
+        input_output_aliases={4: 0},
+        # Flatten only the small update batch. A partial DMA from a tiled 2D
+        # source can straddle its padded minor dimension; the cache stays 2D.
+    )(count, order, targets, words.reshape(-1), cache)
+
+
+# Compaction costs ~25-40 us of XLA ops per call regardless of how many records
+# are valid, against ~90 ns per record for the dense walk (TPU7x: 2048 records
+# 191.6 -> 41.6 us; 288 records 31.8 -> 46.8 us). Static, so decode-sized
+# batches keep the dense walk.
+_COMPACT_MIN_RECORDS = 1024
+
+
+def _scatter_rows_dense(cache, records, words, chunks, block):
+    """Walk every record in blocks; skip invalid ones inside the kernel."""
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
     count = records.shape[0]
     records = jnp.pad(records, (0, -count % block), constant_values=-1)
 
