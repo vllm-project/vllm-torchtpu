@@ -267,6 +267,10 @@ _TPU_COMPILE_ENV_IGNORED = {
     # backbone graph, and the KV cap reaches the hash through num_gpu_blocks.
     "VLLM_TPU_STATIC_POOLER",
     "VLLM_TPU_POOLING_KV_CACHE_TOKENS",
+    # Host thread CPU affinity and placement probe; never affect lowered HLO.
+    "VLLM_TPU_CPU_PIN",
+    "VLLM_TPU_CPU_PIN_RESERVE",
+    "VLLM_TPU_CPU_PROBE_S",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (

@@ -105,6 +105,11 @@ class TPUWorker(WorkerBase):
         from vllm_torchtpu import patch_registry
 
         patch_registry.apply("worker_init")
+        _ = (
+            envs.VLLM_TPU_CPU_PIN,
+            envs.VLLM_TPU_CPU_PIN_RESERVE,
+            envs.VLLM_TPU_CPU_PROBE_S,
+        )
         # This process creates the worker's reply ring to the engine.
         from vllm_torchtpu.distributed.pp_push import widen_message_rings
 
@@ -801,6 +806,10 @@ class TPUWorker(WorkerBase):
         )
 
         install_post_warmup_compile_log()
+        if envs.VLLM_TPU_CPU_PIN != "off" or envs.VLLM_TPU_CPU_PROBE_S > 0:
+            from vllm_torchtpu.worker import cpu_pinning
+
+            cpu_pinning.apply(self.rank, self.local_rank)
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:
