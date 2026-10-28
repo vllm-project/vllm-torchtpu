@@ -13,8 +13,8 @@
 # limitations under the License.
 """`qwen35-baseline`: the default execution profile of the Qwen3.5 model.
 
-Per-bucket tiles bit-exact with the hand-written Qwen3.5 megakernel: its ring
-depths, reduce-scatter / hierarchical all-reduce modes and VMEM budget per
+Per-bucket reference tiles for Qwen3.5: conservative ring depths,
+reduce-scatter / hierarchical all-reduce modes and VMEM budget per
 batch bucket, with every opt-in performance flag off, split pool I/O and no
 in-kernel gather. The Qwen3.5 model declares it as its default profile
 (`model_default=True`), so adapters that name no profile run Qwen3.5 with it,
@@ -111,9 +111,8 @@ PROFILE = register_profile(
         model_default=True,
         tiles=baseline_tiles,
         description=(
-            "Qwen3.5 default: per-bucket tiles bit-exact with the hand-written "
-            "Qwen3.5 kernel, split pool I/O, no in-kernel gather, all opt-in "
-            "performance flags off."
+            "Qwen3.5 default reference profile: conservative per-bucket tiles, "
+            "split pool I/O, no in-kernel gather, all opt-in performance flags off."
         ),
     )
 )

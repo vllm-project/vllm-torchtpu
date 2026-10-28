@@ -182,18 +182,13 @@ def test_overrides_relabel_and_never_silently_stay_exact():
     assert c.with_overrides(fused_pool_io=True).name == "qwen35-candidate30+overrides"
 
 
-def test_candidate30_profiles_carry_baseline():
-    for name in ("qwen35-candidate30", "qwen35-candidate30-fused"):
-        b = mk.get_profile(name).baseline
-        assert b is not None and b.ref == "candidate30"
-        assert b.commit == "8743659cdfcfbb0d77d7fc454f519520d223e785"
-        for job in (
-            "j-07676b1a-25aa-48f3-a600",
-            "j-ffda2788-53ab-4d8a-a419",
-            "j-de863aa4-7371-49ac-b57f",
-        ):
-            assert job in b.job
-        assert b.config and b.bench
+def test_candidate30_profiles_omit_internal_baseline_provenance():
+    assert not hasattr(qwen35.qwen35_candidate30, "CANDIDATE30_BASELINE")
+    for name in ("qwen35-baseline", "qwen35-candidate30", "qwen35-candidate30-fused"):
+        p = mk.get_profile(name)
+        assert p.baseline is None
+        assert "hand-written" not in p.description.lower()
+        assert "frozen" not in p.description.lower()
 
 
 # ---------------------------------------------------------------------------
