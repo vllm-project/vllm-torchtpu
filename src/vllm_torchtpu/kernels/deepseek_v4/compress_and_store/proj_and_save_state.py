@@ -56,7 +56,6 @@ class Configs:
 
     tile_sizes: TileSizes
     dims: Dimensions
-    token_page_size: int
     chunk_n: int  # tokens per weight pass; a multiple of tile_n dividing size_n
 
     @property
@@ -143,6 +142,9 @@ def kernel(
     acc_ref_u8 = acc_ref.bitcast(jnp.uint8)
     # A CSA int32 NoPE array hosts the state too; write it as uint8 slabs.
     cache = csa_cache_layout.as_u8_slabs(cache)
+    # A slot is page * page_size + row, so the flat row index is the slot itself.
+    num_pages, page_size, sub_rows, lanes = cache.shape
+    cache_rows = cache.reshape(num_pages * page_size, sub_rows, lanes)
     write_count_ref[0] = 0
 
     def _wait_for_writes():
@@ -170,12 +172,9 @@ def kernel(
 
             # Guard index calculations to avoid out-of-bounds even for size 0
             safe_slot_idx = lax.select(valid, global_slot_idx, 0)
-            page_size_tokens = cfgs.token_page_size
-            p = safe_slot_idx // page_size_tokens
-            start_slot_token = safe_slot_idx % page_size_tokens
 
             size = lax.select(valid, slots_per_token, 0)
-            dest = cache.at[p, pl.ds(start_slot_token, size), :, :]
+            dest = cache_rows.at[pl.ds(safe_slot_idx, size), :, :]
             src = acc_ref_u8.at[n_idx_val, i, pl.ds(0, size), :, :]
             pltpu.make_async_copy(src, dest, sem_ref.at[0]).start()
 
@@ -372,8 +371,6 @@ def proj_and_save_state(
     num_tokens, hidden_size = hidden_states.shape
     _, state_dim = wkv_wgate.shape
 
-    token_page_size = cache.shape[1]
-
     state_width = state_dim // 2
     tile_m = state_width
     tile_k = _select_tile_k(hidden_size)
@@ -401,7 +398,6 @@ def proj_and_save_state(
     cfgs = Configs(
         tile_sizes=tile_sizes,
         dims=dims,
-        token_page_size=token_page_size,
         chunk_n=_select_chunk_n(num_tokens, tile_n),
     )
 
