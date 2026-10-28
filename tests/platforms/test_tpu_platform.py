@@ -476,6 +476,67 @@ class TestTpuPlatform:
             with pytest.raises(NotImplementedError, match=message):
                 TpuPlatform.check_and_update_config(vllm_config)
 
+    @pytest.mark.parametrize("multiport", [True, False])
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch("vllm_torchtpu.distributed.tpu_mp_multihost.prepare_mp_multihost_dp_env")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_multiport_dp_child_bootstraps_the_whole_host_slice(
+        self,
+        mock_prepare_env,
+        mock_multihost_dp,
+        mock_apply_patches,
+        vllm_config,
+        monkeypatch,
+        multiport,
+    ):
+        """A --data-parallel-multi-port-external-lb child (DP4 x TP2, rank 3)
+        looks like one host of a four-host DP deployment. With
+        TPU_MULTIPORT_DP_LOCAL_SIZE it skips the cross-host rendezvous, sizes
+        the single-host bootstrap for the whole 8-device slice, and uses the
+        deterministic DP master port every sibling derives."""
+        for key in (
+            "TPU_MULTIPORT_DP_LOCAL_SIZE",
+            "TORCH_TPU_DP_SIZE",
+            "TORCH_TPU_DP_MASTER_ADDR",
+            "TORCH_TPU_DP_MASTER_PORT",
+            "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+        ):
+            monkeypatch.setenv(key, os.environ.get(key, ""))
+            monkeypatch.delenv(key)
+        if multiport:
+            monkeypatch.setenv("TPU_MULTIPORT_DP_LOCAL_SIZE", "4")
+        mock_multihost_dp.return_value = True
+        pc = vllm_config.parallel_config
+        pc.data_parallel_size = 4
+        pc.data_parallel_size_local = 1
+        pc.data_parallel_rank = 3
+        pc.data_parallel_external_lb = True
+        pc.data_parallel_rpc_port = 29550
+        pc.data_parallel_master_ip = ""
+        pc.tensor_parallel_size = 2
+        pc.world_size = 2
+        pc.world_size_across_dp = 8
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        if multiport:
+            mock_multihost_dp.assert_not_called()
+            mock_prepare_env.assert_called_once_with(8)
+            assert os.environ["TORCH_TPU_DP_MASTER_PORT"] == "29551"
+            assert os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == ",".join(
+                f"localhost:{8070 + i}" for i in range(8)
+            )
+            assert pc._data_parallel_master_port_list == [
+                29650, 29651, 29652, 29653, 29654
+            ]
+        else:
+            # Unchanged path: the multi-host DP bootstrap decides.
+            mock_multihost_dp.assert_called_once_with(pc, 8)
+            mock_prepare_env.assert_not_called()
+            assert "TORCH_TPU_SLICEBUILDER_ADDRESSES" not in os.environ
+
     @pytest.mark.parametrize("head_size,refused", [(64, True), (128, False)])
     @patch("vllm_torchtpu.patch_registry.apply")
     @patch(

@@ -54,9 +54,15 @@ def _log_tpu_info() -> None:
 
 def register_tpu_platform() -> str:
     """vLLM out-of-tree platform plugin entry point."""
+    from vllm_torchtpu.distributed.tpu_multiport_dp import device_control_env_var
     from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
     _log_tpu_info()
+    # Before vLLM resolves --device-ids (EngineArgs), which a multi-port DP
+    # child receives as TPU core indices; see tpu_multiport_dp.
+    TpuPlatform.device_control_env_var = device_control_env_var(
+        TpuPlatform.device_control_env_var
+    )
     return f"{TpuPlatform.__module__}.{TpuPlatform.__qualname__}"
 
 
