@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Google LLC
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CSA2 prefill with ragged query tiles and a four-buffer carry-PV pipeline."""
+"""CSA2 attention with ragged query tiles and a four-buffer carry-PV pipeline."""
 
 import functools
 import math
@@ -14,25 +14,38 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 
+def _fill_query_tiles(starts, tiles, total_tokens, bq):
+    batch = starts.shape[0] - 1
+
+    def request_body(request, first):
+        begin = starts[request]
+        end = jnp.where(
+            request == batch, total_tokens, starts[jnp.minimum(request + 1, batch)]
+        )
+        count = pl.cdiv(end - begin, bq)
+
+        def tile_body(local, unused):
+            offset = begin + local * bq
+            tile = (first + local) * 3
+            tiles[tile] = request
+            tiles[tile + 1] = offset
+            tiles[tile + 2] = jnp.minimum(bq, end - offset)
+            return None
+
+        lax.fori_loop(0, count, tile_body, None)
+        return first + count
+
+    # A final synthetic request covers output padding without an HBM clear pass.
+    return lax.fori_loop(0, batch + 1, request_body, jnp.int32(0))
+
+
 def build_query_tiles(
     starts: jax.Array, total_tokens: int, bq: int
 ) -> tuple[jax.Array, jax.Array]:
-    # A final synthetic request covers output padding without an HBM clear pass.
-    boundaries = jnp.concatenate((starts, jnp.array([total_tokens], jnp.int32)))
-    sizes = boundaries[1:] - boundaries[:-1]
-    counts = pl.cdiv(sizes, bq)
-    ends = jnp.cumsum(counts)
-    begins = jnp.concatenate((jnp.zeros(1, jnp.int32), ends[:-1]))
     capacity = min(total_tokens, pl.cdiv(total_tokens, bq) + starts.shape[0] - 1)
-    ids = jnp.arange(capacity, dtype=jnp.int32)
-    requests = jnp.minimum(
-        jnp.searchsorted(ends, ids, side="right"), sizes.shape[0] - 1
-    )
-    offsets = boundaries[requests] + (ids - begins[requests]) * bq
-    valid = ids < ends[-1]
-    lengths = jnp.where(valid, jnp.minimum(bq, boundaries[requests + 1] - offsets), 0)
-    offsets = jnp.where(valid, offsets, 0)
-    return jnp.stack((requests, offsets, lengths), axis=1), ends[-1]
+    tiles = jax.new_ref(jnp.zeros(capacity * 3, jnp.int32))
+    count = _fill_query_tiles(starts, tiles, total_tokens, bq)
+    return tiles[...].reshape(capacity, 3), count
 
 
 def _tile_field(tiles, tile, column):
@@ -71,31 +84,23 @@ def _prepare_swa(
     num_banks,
     low_pages,
     non_causal,
-    dummy_metadata,
 ):
     num_pages = 256 // page_size
-    request, active, left, right, anchor = 0, True, 0, 256, 0
-    if not dummy_metadata:
-        request = jnp.minimum(
-            _tile_field(tiles_ref, tile, 0), swa_page_ref.shape[0] - 1
-        )
-        active = _tile_field(tiles_ref, tile, 0) < swa_page_ref.shape[0]
-        _, left, right, anchor = swa_window(
-            tile,
-            tiles_ref,
-            positions_ref,
-            swa_page_ref,
-            bounds_ref,
-            page_size=page_size,
-            non_causal=non_causal,
-        )
+    request = jnp.minimum(_tile_field(tiles_ref, tile, 0), swa_page_ref.shape[0] - 1)
+    active = _tile_field(tiles_ref, tile, 0) < swa_page_ref.shape[0]
+    _, left, right, anchor = swa_window(
+        tile,
+        tiles_ref,
+        positions_ref,
+        swa_page_ref,
+        bounds_ref,
+        page_size=page_size,
+        non_causal=non_causal,
+    )
     bf16_bits = jnp.dtype(jnp.bfloat16).itemsize * 8
     low_mask = (1 << bf16_bits) - 1
     high_mask = ~low_mask
     for block in range(num_pages):
-        if dummy_metadata:
-            swa_ref[pl.ds(block * page_size, page_size)] = swa_kv_ref[block][0]
-            continue
         column = (
             anchor + block * page_size - swa_page_ref[request, 0]
         ) // cache_page_size
@@ -117,7 +122,7 @@ def _prepare_swa(
         swa_ref[rows] = pltpu.bitcast(words, jnp.bfloat16)
 
 
-def _prefill_kernel(
+def _csa2_kernel(
     # prefetch
     tiles_ref: Any,  # SMEM: [tile_capacity, 3], request/start/count
     positions_ref: Any,  # SMEM: [T], int32
@@ -128,7 +133,6 @@ def _prefill_kernel(
     q_ref: Any,  # VMEM: [bq, H, 512], BF16
     main_cache_ref: Any,  # VMEM: [bq, 512, 128], INT32
     main_scale_ref: Any,  # VMEM: [bq, 1, 512], FP32
-    swa_kv_ref: Any,  # VMEM: tuple of [1, page_size, 512] BF16 page slices
     sink_ref: Any,  # VMEM: [H, 1], FP32
     rope_ref: Any,  # VMEM: [bq, 2, 128], FP32
     # output
@@ -143,107 +147,44 @@ def _prefill_kernel(
     bq: int,
     block_q: int,
     page_size: int,
-    cache_page_size: int,
-    num_banks: int,
-    low_pages: int,
     scale: float,
     non_causal: bool,
-    dummy_metadata: bool = False,
-    benchmark_component: str | None = None,
-    dummy_scores_ref: Any = None,
-    benchmark_unpack_rows: int = 16,
-    external_accumulators: Any = None,
-    tile_index: Any = None,
+    accumulators: Any,
+    tile_index: Any,
     previous_output: Any = None,
     previous_rope: Any = None,
     previous_tile: Any = None,
-    swa_prepared: bool = False,
     swa_rhs_preloaded: bool = False,
     prepare_next: Any = None,
     preload_swa: Any = None,
-    keep_pv: bool = False,
     drain_only: bool = False,
 ) -> None:
-    if benchmark_component == "dma":
-        pltpu.touch(
-            (q_ref, main_cache_ref, main_scale_ref, swa_kv_ref, sink_ref, rope_ref)
-        )
-        pltpu.touch(output_ref)
-        return
     log2_e = math.log2(math.e)
-    tile = pl.program_id(0) if tile_index is None else tile_index
-    if dummy_metadata:
-        t0 = tile * bq
-        row_offset, valid_count = 0, bq
-        position_start, left, right, anchor = 0, 0, 256, 0
-        active, request = True, 0
-    else:
-        request, t0 = _tile_field(tiles_ref, tile, 0), _tile_field(tiles_ref, tile, 1)
-        position_start, left, right, anchor = swa_window(
-            tile,
-            tiles_ref,
-            positions_ref,
-            swa_page_ref,
-            bounds_ref,
-            page_size=page_size,
-            non_causal=non_causal,
-        )
-        read_start = jnp.minimum(t0, positions_ref.shape[0] - bq)
-        row_offset = t0 - read_start
-        valid_count = _tile_field(tiles_ref, tile, 2)
-        position_start -= row_offset
-        t0 = read_start
-        active = request < swa_page_ref.shape[0]
-        request = jnp.minimum(request, swa_page_ref.shape[0] - 1)
+    tile = tile_index
+    request, t0 = _tile_field(tiles_ref, tile, 0), _tile_field(tiles_ref, tile, 1)
+    position_start, left, right, anchor = swa_window(
+        tile,
+        tiles_ref,
+        positions_ref,
+        swa_page_ref,
+        bounds_ref,
+        page_size=page_size,
+        non_causal=non_causal,
+    )
+    read_start = jnp.minimum(t0, positions_ref.shape[0] - bq)
+    row_offset = t0 - read_start
+    valid_count = _tile_field(tiles_ref, tile, 2)
+    position_start -= row_offset
+    t0 = read_start
+    active = request < swa_page_ref.shape[0]
+    request = jnp.minimum(request, swa_page_ref.shape[0] - 1)
     key_positions = anchor + jnp.arange(256)
-    if not swa_prepared and not drain_only:
-        if benchmark_component == "mxu":
-            pltpu.touch(swa_ref)
-        else:
-            _prepare_swa(
-                tile,
-                tiles_ref,
-                positions_ref,
-                swa_page_ref,
-                bounds_ref,
-                swa_kv_ref,
-                swa_ref,
-                page_size=page_size,
-                cache_page_size=cache_page_size,
-                num_banks=num_banks,
-                low_pages=low_pages,
-                non_causal=non_causal,
-                dummy_metadata=dummy_metadata,
-            )
     num_heads = q_ref.shape[1]
     mxu_heads = pl.cdiv(num_heads, 16) * 16
-    mrb_stride = mxu_heads // 4
     # Separate QK/PV ranges let the next QK overlap the preceding PV.
     # Each range holds block_q results; together they must fit 256 MRB rows.
 
-    swa_capacity = 256 // mrb_stride
-    accumulator_slots = max(2 * block_q, min(bq, swa_capacity))
-
-    accumulators = external_accumulators
-    if accumulators is None:
-        accumulators = tuple(
-            tuple(
-                jax.empty_ref(
-                    jax.ShapeDtypeStruct((mxu_heads, 256), jnp.float32),
-                    memory_space=pltpu.ACC(mxu),
-                )
-                for _ in range(accumulator_slots)
-            )
-            for mxu in range(2)
-        )
-
-    groups = [
-        tuple(range(first, min(first + block_q, bq))) for first in range(0, bq, block_q)
-    ]
-
     def swa_qk_compute(first, size):
-        if benchmark_component == "vpu":
-            return
         for mxu in range(2):
             ks = pl.ds(mxu * 256, 256)
             if not swa_rhs_preloaded:
@@ -260,21 +201,9 @@ def _prefill_kernel(
 
     def swa_qk_pop(first, size):
         for r in range(size):
-            if benchmark_component == "vpu":
-                halves = [
-                    dummy_scores_ref[first + r, :, pl.ds(mxu * 256, 256)]
-                    for mxu in range(2)
-                ]
-            else:
-                halves = [
-                    pltpu.matmul_pop(accumulators[mxu][r])[:num_heads]
-                    for mxu in range(2)
-                ]
-            if benchmark_component == "mxu":
-                continue
-            if dummy_metadata:
-                swa_score_ref[first + r] = (halves[0] + halves[1]) * (scale * log2_e)
-                continue
+            halves = [
+                pltpu.matmul_pop(accumulators[mxu][r])[:num_heads] for mxu in range(2)
+            ]
             if non_causal:
                 start, end = left, right
             else:
@@ -287,11 +216,8 @@ def _prefill_kernel(
             )
 
     def main_unpack(indices):
-        if benchmark_component == "mxu":
-            pltpu.touch(main_kv_ref)
-            return
         # Split each 64-row read into 16-row conversions shared by QK and PV.
-        unpack_rows = benchmark_unpack_rows if benchmark_component == "vpu" else 64
+        unpack_rows = 64
         for i in indices:
             for row in range(0, 512, unpack_rows):
                 rows = pl.ds(row, unpack_rows)
@@ -307,8 +233,6 @@ def _prefill_kernel(
                         main_kv_ref[i, subrows, pl.ds(group * 128, 128)] = values
 
     def main_qk_compute(indices):
-        if benchmark_component == "vpu":
-            return
         tiles = [(r, i, block) for r, i in enumerate(indices) for block in range(2)]
 
         def push(tile_index):
@@ -334,25 +258,7 @@ def _prefill_kernel(
                     load_staged_rhs=tile_index % 2,
                 )
 
-    def main_qk_pop(indices):
-        if benchmark_component == "vpu":
-            return [dummy_scores_ref[i] for i in indices]
-        logits = []
-        for r, i in enumerate(indices):
-            main_logits = jnp.concatenate(
-                [
-                    pltpu.matmul_pop(accumulators[mxu][r])[:num_heads]
-                    for mxu in range(2)
-                ],
-                axis=1,
-            )
-            logits.append(main_logits)
-        return logits
-
     def softmax(indices, qk_values):
-        if benchmark_component == "mxu":
-            pltpu.touch((main_p_ref, swa_p_ref))
-            return
         for r, i in enumerate(indices):
             main_logits = qk_values[r]
             # Scale each key column after QK, using FP32 KV scales.
@@ -360,13 +266,12 @@ def _prefill_kernel(
             main_logits = main_logits * (kv_scales * (scale * log2_e))
 
             sink = sink_ref[...] * log2_e
-            if not dummy_metadata:
-                main_count = main_lengths_ref[
-                    jnp.minimum(t0 + i, main_lengths_ref.shape[0] - 1)
-                ]
-                main_logits = main_logits + jnp.where(
-                    jnp.arange(512)[None, :] < main_count, 0.0, -jnp.inf
-                )
+            main_count = main_lengths_ref[
+                jnp.minimum(t0 + i, main_lengths_ref.shape[0] - 1)
+            ]
+            main_logits = main_logits + jnp.where(
+                jnp.arange(512)[None, :] < main_count, 0.0, -jnp.inf
+            )
             swa_logits = swa_score_ref[i]
             logits = jnp.concatenate((main_logits, swa_logits), axis=1)
             maximum = jnp.maximum(sink, jnp.max(logits, axis=1, keepdims=True))
@@ -383,9 +288,6 @@ def _prefill_kernel(
             swa_p_ref[i] = exponentials[:, 512:].astype(jnp.bfloat16)
 
     def fused_pv(indices):
-        if benchmark_component == "vpu":
-            pltpu.touch((main_kv_ref, main_p_ref, swa_p_ref))
-            return
         tiles = [(r, i, block) for r, i in enumerate(indices) for block in range(2)]
 
         def push(tile_index):
@@ -427,18 +329,13 @@ def _prefill_kernel(
 
     def inverse_rope(indices, target=output_ref, rotations=rope_ref, previous=False):
         for r, i in enumerate(indices):
-            if benchmark_component == "vpu":
-                output = dummy_scores_ref[i]
-            else:
-                output = jnp.concatenate(
-                    [
-                        pltpu.matmul_pop(accumulators[mxu][block_q + r])[:num_heads]
-                        for mxu in range(2)
-                    ],
-                    axis=1,
-                )
-            if benchmark_component == "mxu":
-                continue
+            output = jnp.concatenate(
+                [
+                    pltpu.matmul_pop(accumulators[mxu][block_q + r])[:num_heads]
+                    for mxu in range(2)
+                ],
+                axis=1,
+            )
             tail = output[:, 384:]
             partner = jnp.take_along_axis(
                 tail,
@@ -449,10 +346,6 @@ def _prefill_kernel(
             rotated = (
                 tail * rotations[i, 0][None, :] + partner * rotations[i, 1][None, :]
             )
-            if dummy_metadata:
-                target[i, :, :384] = output[:, :384].astype(jnp.bfloat16)
-                target[i, :, 384:] = rotated.astype(jnp.bfloat16)
-                continue
             if previous:
                 last_tile = previous_tile
                 last_start = _tile_field(tiles_ref, last_tile, 1)
@@ -471,66 +364,33 @@ def _prefill_kernel(
             )
             target[i, :, 384:] = jnp.where(valid, rotated, 0).astype(jnp.bfloat16)
 
-    if keep_pv:
-        indices = tuple(range(bq))
-        if drain_only:
-            inverse_rope(indices)
-            return
-        swa_qk_compute(0, bq)
-        if prepare_next is not None:
-            prepare_next()
-        main_unpack(indices)
-        if previous_output is not None:
-            inverse_rope(indices, previous_output, previous_rope, previous=True)
-        swa_qk_pop(0, bq)
-        main_qk_compute(indices)
-        for r, i in enumerate(indices):
-            logits = jnp.concatenate(
-                [
-                    pltpu.matmul_pop(accumulators[mxu][r])[:num_heads]
-                    for mxu in range(2)
-                ],
-                axis=1,
-            )
-            softmax((i,), (logits,))
-        fused_pv(indices)
+    indices = tuple(range(bq))
+    if drain_only:
+        inverse_rope(indices)
         return
-
-    for first in range(0, bq, swa_capacity):
-        size = min(swa_capacity, bq - first)
-        swa_qk_compute(first, size)
-        if first == 0:
-            main_unpack(groups[0])
-        swa_qk_pop(first, size)
-    main_qk_compute(groups[0])
-    for step, indices in enumerate(groups):
-        if len(groups) == 1 and benchmark_component is None:
-            for r, i in enumerate(indices):
-                logits = jnp.concatenate(
-                    [
-                        pltpu.matmul_pop(accumulators[mxu][r])[:num_heads]
-                        for mxu in range(2)
-                    ],
-                    axis=1,
-                )
-                softmax((i,), (logits,))
-        else:
-            logits = main_qk_pop(indices)
-            if step + 1 < len(groups):
-                main_unpack(groups[step + 1])
-                main_qk_compute(groups[step + 1])
-            softmax(indices, logits)
-        if step:
-            inverse_rope(groups[step - 1])
-        fused_pv(indices)
-    inverse_rope(groups[-1])
+    swa_qk_compute(0, bq)
+    if prepare_next is not None:
+        prepare_next()
+    main_unpack(indices)
+    if previous_output is not None:
+        inverse_rope(indices, previous_output, previous_rope, previous=True)
+    swa_qk_pop(0, bq)
+    main_qk_compute(indices)
+    for r, i in enumerate(indices):
+        logits = jnp.concatenate(
+            [pltpu.matmul_pop(accumulators[mxu][r])[:num_heads] for mxu in range(2)],
+            axis=1,
+        )
+        softmax((i,), (logits,))
+    fused_pv(indices)
+    return
 
 
 @functools.partial(
     jax.jit,
-    static_argnames=("scale", "compress_ratio", "bq", "dummy_metadata"),
+    static_argnames=("scale", "compress_ratio", "bq"),
 )
-def csa2_prefill(
+def csa2(
     q: jax.Array,
     main_kv: jax.Array,
     main_kv_scale: jax.Array,
@@ -546,15 +406,13 @@ def csa2_prefill(
     scale: float = 512**-0.5,
     compress_ratio: int = 2,
     bq: int = 8,
-    dummy_metadata: bool = False,
 ) -> jax.Array:
-    """Ragged CSA2 prefill with FP32 scales and independent SWA visibility.
+    """Ragged CSA2 attention with FP32 scales and independent SWA visibility.
 
     Main KV is query-local packed FP8 [T,512,128], scales are FP32 [T,512].
     SWA uses one or two native BF16 page owners. starts [B+1] describes
     requests; repeated boundaries and output padding are supported.
     Explicit swa_bounds selects visibility independently of model layer stage.
-    dummy_metadata is only for the all-keys-valid mathematical benchmark.
     """
     non_causal = swa_bounds is not None
     if q.ndim != 3 or q.shape[2] != 512:
@@ -589,17 +447,6 @@ def csa2_prefill(
         if bank.shape[1:] != banks[0].shape[1:]:
             raise ValueError("SWA banks must have matching page shapes")
     cache_page_size = banks[0].shape[1]
-    if dummy_metadata and (
-        batch != 1
-        or tokens % bq
-        or len(banks) != 1
-        or cache_page_size != 64
-        or banks[0].shape[0] < (tokens // bq) * 4
-    ):
-        raise ValueError(
-            "dummy_metadata requires B=1, full query tiles and one SWA bank "
-            "with at least four 64-token pages per query tile"
-        )
     if cache_page_size not in (8, 16, 32, 64) and (
         cache_page_size < 128 or cache_page_size % 128
     ):
@@ -629,41 +476,17 @@ def csa2_prefill(
     if not tokens:
         return jnp.zeros_like(q)
     bq = min(bq, tokens, 128 // (pl.cdiv(heads, 16) * 4))
-    direct_output = batch == 1 and tokens % bq == 0
-    if dummy_metadata:
-        tiles = jnp.zeros((tokens // bq, 3), jnp.int32)
-        num_tiles = tokens // bq
-    elif direct_output:
-        offsets = jnp.arange(tokens // bq, dtype=jnp.int32) * bq
-        counts = jnp.clip(starts[-1] - offsets, 0, bq)
-        tiles = jnp.stack(
-            ((offsets >= starts[-1]).astype(jnp.int32), offsets, counts), 1
-        )
-        num_tiles = tokens // bq
-    else:
-        tiles, num_tiles = build_query_tiles(starts, tokens, bq)
-        # With one query per tile, empty requests add no tiles and padding
-        # contributes exactly its token count. Keep this bound static so
-        # single-token chunks do not retain unreachable RHS preloads/DMAs.
-        if bq == 1:
-            num_tiles = tokens
+    fixed_tiles = batch == 1 and tokens % bq == 0
+    tile_capacity = (
+        tokens // bq if fixed_tiles else min(tokens, pl.cdiv(tokens, bq) + batch)
+    )
     bounds = swa_bounds if non_causal else jnp.zeros((batch, 2), jnp.int32)
-    info = pltpu.get_tpu_info()
-    # SMEM pads each short matrix row to a full lane row. Leave three
-    # quarters for positions, counts, page tables and compiler temporaries.
-    tile_bytes = (
-        pl.cdiv(tiles.shape[0], info.num_sublanes)
-        * info.num_sublanes
-        * info.num_lanes
-        * jnp.dtype(jnp.int32).itemsize
-    )
-    tile_metadata = (
-        tiles.reshape(-1) if tile_bytes > info.smem_capacity_bytes // 4 else tiles
-    )
     scalars = (
-        (None,) * 5
-        if dummy_metadata
-        else (tile_metadata, positions, main_lengths, swa_metadata, bounds)
+        starts,
+        positions,
+        main_lengths,
+        swa_metadata,
+        bounds,
     )
     # Reserve three quarters of VMEM for four Q/KV buffers, decoded KV,
     # probabilities and compiler temporaries. Large batches stream metadata.
@@ -673,25 +496,20 @@ def csa2_prefill(
     num_pages = 256 // page_size
 
     kernel_fn = functools.partial(
-        _prefill_kernel,
+        _csa2_kernel,
         non_causal=non_causal,
         bq=bq,
         block_q=min(bq, 128 // (pl.cdiv(heads, 16) * 4)),
         page_size=page_size,
-        cache_page_size=cache_page_size,
-        num_banks=len(banks),
-        low_pages=banks[0].shape[0],
         scale=scale,
-        dummy_metadata=dummy_metadata,
     )
 
     def kernel(
-        tiles_ref,
+        plan_ref,
         positions_ref,
         lengths_ref,
         pages_ref,
         bounds_ref,
-        count_ref,
         q_hbm,
         kv_hbm,
         scales_hbm,
@@ -714,8 +532,24 @@ def csa2_prefill(
         input_sems,
         swa_sems,
         output_sems,
+        tile_scratch,
     ):
-        count = num_tiles if isinstance(num_tiles, int) else count_ref[0]
+        tiles_ref = tile_scratch
+        if fixed_tiles:
+            count = tokens // bq
+
+            def tile_body(tile, unused):
+                offset = tile * bq
+                tiles_ref[tile * 3] = (offset >= plan_ref[1]).astype(jnp.int32)
+                tiles_ref[tile * 3 + 1] = offset
+                tiles_ref[tile * 3 + 2] = jnp.clip(plan_ref[1] - offset, 0, bq)
+                return None
+
+            lax.fori_loop(0, count, tile_body, None)
+        else:
+            count = _fill_query_tiles(plan_ref, tiles_ref, tokens, bq)
+            if bq == 1:
+                count = tokens
         mxu_heads = pl.cdiv(heads, 16) * 16
         accumulators = tuple(
             tuple(
@@ -730,17 +564,13 @@ def csa2_prefill(
 
         def safe_tile(tile):
             if isinstance(tile, int):
-                limit = count if isinstance(count, int) else tiles.shape[0]
+                limit = count if isinstance(count, int) else tile_capacity
                 return min(max(tile, 0), limit - 1)
             return tile
 
         def rows(tile):
             tile = safe_tile(tile)
-            start = (
-                tile * bq
-                if dummy_metadata
-                else jnp.minimum(_tile_field(tiles_ref, tile, 1), tokens - bq)
-            )
+            start = jnp.minimum(_tile_field(tiles_ref, tile, 1), tokens - bq)
             return pl.ds(start, bq)
 
         def input_copies(tile, bank):
@@ -756,55 +586,43 @@ def csa2_prefill(
 
         def swa_copies(tile, bank):
             tile = safe_tile(tile)
-            if dummy_metadata:
-                return (
-                    pltpu.make_async_copy(
-                        swa_hbm[0].at[pl.ds(tile * 4, 4)],
-                        swa_buf.at[bank].reshape(4, 64, 512),
-                        swa_sems.at[bank, 0],
-                    ),
-                )
             request, left, right, anchor = 0, 0, 256, 0
-            if not dummy_metadata:
-                request = jnp.minimum(_tile_field(tiles_ref, tile, 0), batch - 1)
-                _, left, right, anchor = swa_window(
-                    tile,
-                    tiles_ref,
-                    positions_ref,
-                    pages_ref,
-                    bounds_ref,
-                    page_size=page_size,
-                    non_causal=non_causal,
-                )
+            request = jnp.minimum(_tile_field(tiles_ref, tile, 0), batch - 1)
+            _, left, right, anchor = swa_window(
+                tile,
+                tiles_ref,
+                positions_ref,
+                pages_ref,
+                bounds_ref,
+                page_size=page_size,
+                non_causal=non_causal,
+            )
             copies = []
             for block in range(num_pages):
                 for owner, source in enumerate(swa_hbm):
-                    if dummy_metadata:
-                        physical, offset = tile * num_pages + block, 0
-                    else:
-                        position = anchor + block * page_size
-                        column = (position - pages_ref[request, 0]) // cache_page_size
-                        physical = pages_ref[
-                            request, jnp.clip(column, 0, pages_ref.shape[1] - 3) + 2
-                        ]
-                        valid = (
-                            (position < right)
-                            & (position + page_size > left)
-                            & (column >= 0)
-                            & (column < pages_ref.shape[1] - 2)
-                            & (physical >= 0)
-                            & (physical < sum(owner.shape[0] for owner in banks))
+                    position = anchor + block * page_size
+                    column = (position - pages_ref[request, 0]) // cache_page_size
+                    physical = pages_ref[
+                        request, jnp.clip(column, 0, pages_ref.shape[1] - 3) + 2
+                    ]
+                    valid = (
+                        (position < right)
+                        & (position + page_size > left)
+                        & (column >= 0)
+                        & (column < pages_ref.shape[1] - 2)
+                        & (physical >= 0)
+                        & (physical < sum(owner.shape[0] for owner in banks))
+                    )
+                    if len(banks) == 2:
+                        valid &= (
+                            (physical < banks[0].shape[0])
+                            if owner == 0
+                            else (physical >= banks[0].shape[0])
                         )
-                        if len(banks) == 2:
-                            valid &= (
-                                (physical < banks[0].shape[0])
-                                if owner == 0
-                                else (physical >= banks[0].shape[0])
-                            )
-                            if owner:
-                                physical -= banks[0].shape[0]
-                        physical = jnp.where(valid, physical, 0)
-                        offset = jnp.where(valid, position % cache_page_size, 0)
+                        if owner:
+                            physical -= banks[0].shape[0]
+                    physical = jnp.where(valid, physical, 0)
+                    offset = jnp.where(valid, position % cache_page_size, 0)
                     index = block * len(banks) + owner
                     copies.append(
                         pltpu.make_async_copy(
@@ -821,32 +639,40 @@ def csa2_prefill(
 
         def output_copy(tile, bank):
             tile = safe_tile(tile)
+            if fixed_tiles:
+                source_rows, target_rows = pl.ds(0, bq), pl.ds(tile * bq, bq)
+            else:
+                start = _tile_field(tiles_ref, tile, 1)
+                size = _tile_field(tiles_ref, tile, 2)
+                offset = start - jnp.minimum(start, tokens - bq)
+                source_rows, target_rows = pl.ds(offset, size), pl.ds(start, size)
             return pltpu.make_async_copy(
-                outputs.at[bank], out_hbm.at[pl.ds(tile * bq, bq)], output_sems.at[bank]
+                outputs.at[bank, source_rows],
+                out_hbm.at[target_rows],
+                output_sems.at[bank],
             )
 
         def prepare(tile, bank, work_bank):
             tile = safe_tile(tile)
             if len(banks) == 1:
                 values = swa_buf[bank].reshape(256, 512)
-                if not dummy_metadata:
-                    active = _tile_field(tiles_ref, tile, 0) < batch
-                    _, left, right, anchor = swa_window(
-                        tile,
-                        tiles_ref,
-                        positions_ref,
-                        pages_ref,
-                        bounds_ref,
-                        page_size=page_size,
-                        non_causal=non_causal,
-                    )
-                    positions = anchor + 2 * jnp.arange(128)
-                    low = active & (positions >= left) & (positions < right)
-                    high = active & (positions + 1 >= left) & (positions + 1 < right)
-                    mask = jnp.where(low, 0xFFFF, 0) | jnp.where(high, ~0xFFFF, 0)
-                    values = pltpu.bitcast(
-                        pltpu.bitcast(values, jnp.int32) & mask[:, None], jnp.bfloat16
-                    )
+                active = _tile_field(tiles_ref, tile, 0) < batch
+                _, left, right, anchor = swa_window(
+                    tile,
+                    tiles_ref,
+                    positions_ref,
+                    pages_ref,
+                    bounds_ref,
+                    page_size=page_size,
+                    non_causal=non_causal,
+                )
+                positions = anchor + 2 * jnp.arange(128)
+                low = active & (positions >= left) & (positions < right)
+                high = active & (positions + 1 >= left) & (positions + 1 < right)
+                mask = jnp.where(low, 0xFFFF, 0) | jnp.where(high, ~0xFFFF, 0)
+                values = pltpu.bitcast(
+                    pltpu.bitcast(values, jnp.int32) & mask[:, None], jnp.bfloat16
+                )
                 swa_work[work_bank] = values
                 return
             _prepare_swa(
@@ -862,7 +688,6 @@ def csa2_prefill(
                 num_banks=len(banks),
                 low_pages=banks[0].shape[0],
                 non_causal=non_causal,
-                dummy_metadata=dummy_metadata,
             )
 
         def compute(tile, bank, sb, *, previous=True, drain=False, next_tile=True):
@@ -870,8 +695,6 @@ def csa2_prefill(
                 rope_saved[bank] = rope_buf[sb]
 
             def prepare_next():
-                if dummy_metadata:
-                    return
                 if next_tile is True:
                     prepare(tile + 1, (sb + 1) % 4, 1 - bank)
                 else:
@@ -883,11 +706,7 @@ def csa2_prefill(
             def preload_next(mxu):
                 def push():
                     pltpu.matmul_push_rhs(
-                        (
-                            swa_buf[(sb + 1) % 4].reshape(256, 512)
-                            if dummy_metadata
-                            else swa_work[1 - bank]
-                        )[:, pl.ds(mxu * 256, 256)],
+                        (swa_work[1 - bank])[:, pl.ds(mxu * 256, 256)],
                         1,
                         mxu,
                         transpose=True,
@@ -910,18 +729,15 @@ def csa2_prefill(
                 q_buf.at[sb],
                 kv_buf.at[sb],
                 scales_hbm.at[rows(tile)] if resident_metadata else scales_buf.at[sb],
-                (),
                 sink_ref,
                 rope_hbm.at[rows(tile)] if resident_metadata else rope_saved.at[bank],
                 outputs.at[bank],
                 decoded,
-                swa_buf.at[sb].reshape(256, 512)
-                if dummy_metadata
-                else swa_work.at[bank],
+                swa_work.at[bank],
                 swa_scores,
                 main_p,
                 swa_p,
-                external_accumulators=accumulators,
+                accumulators=accumulators,
                 tile_index=safe_tile(tile),
                 previous_tile=safe_tile(tile - 1),
                 previous_output=outputs.at[1 - bank]
@@ -934,9 +750,7 @@ def csa2_prefill(
                 )
                 if previous and not drain
                 else None,
-                keep_pv=True,
                 drain_only=drain,
-                swa_prepared=True,
                 swa_rhs_preloaded=previous,
                 prepare_next=prepare_next if not drain else None,
                 preload_swa=preload_next if not drain else None,
@@ -950,8 +764,7 @@ def csa2_prefill(
             if not previous:
                 for copy in swa_copies(tile, sb):
                     copy.wait()
-                if not dummy_metadata:
-                    prepare(tile, sb, bank)
+                prepare(tile, sb, bank)
 
             def wait_next():
                 for copy in swa_copies(tile + 1, (sb + 1) % 4):
@@ -1025,23 +838,27 @@ def csa2_prefill(
 
         output_copy(count - 1, (count - 1) % 2).wait()
 
-    tiled_output = pl.pallas_call(
+    metadata_space = pltpu.VMEM if resident_metadata else pltpu.HBM
+    spaces = (
+        pltpu.HBM,
+        pltpu.HBM,
+        metadata_space,
+        tuple(pltpu.HBM for _ in banks),
+        pltpu.VMEM,
+        metadata_space,
+    )
+    inputs = (q, main_kv, main_kv_scale[:, None, :], banks, sink[:, None], rope_cache)
+    # BlockSpec alone does not prevent an upstream whole-owner memory-space copy.
+    inputs = jax.tree.map(pltpu.with_memory_space_constraint, inputs, spaces)
+
+    return pl.pallas_call(
         kernel,
-        out_shape=jax.ShapeDtypeStruct((tiles.shape[0] * bq, heads, 512), jnp.bfloat16),
+        out_shape=jax.ShapeDtypeStruct(q.shape, q.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=6,
+            num_scalar_prefetch=5,
             grid=(),
-            in_specs=(
-                pl.BlockSpec(memory_space=pltpu.HBM),
-                pl.BlockSpec(memory_space=pltpu.HBM),
-                pl.BlockSpec(
-                    memory_space=pltpu.VMEM if resident_metadata else pltpu.HBM
-                ),
-                tuple(pl.BlockSpec(memory_space=pltpu.HBM) for _ in banks),
-                pl.BlockSpec(memory_space=pltpu.VMEM),
-                pl.BlockSpec(
-                    memory_space=pltpu.VMEM if resident_metadata else pltpu.HBM
-                ),
+            in_specs=jax.tree.map(
+                lambda space: pl.BlockSpec(memory_space=space), spaces
             ),
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
             scratch_shapes=(
@@ -1062,32 +879,15 @@ def csa2_prefill(
                 pltpu.SemaphoreType.DMA((4, 2 if resident_metadata else 4)),
                 pltpu.SemaphoreType.DMA((4, num_pages * len(banks))),
                 pltpu.SemaphoreType.DMA((2,)),
+                pltpu.SMEM((tile_capacity * 3,), jnp.int32),
             ),
         ),
         compiler_params=pltpu.CompilerParams(
             disable_bounds_checks=True,
             disable_semaphore_checks=True,
         ),
-        name="csa2_prefill_dummy" if dummy_metadata else "csa2_prefill",
+        name="csa2",
     )(
         *scalars,
-        jnp.asarray([num_tiles], jnp.int32),
-        q,
-        main_kv,
-        main_kv_scale[:, None, :],
-        banks,
-        sink[:, None],
-        rope_cache,
+        *inputs,
     )
-    if direct_output:
-        return tiled_output[:tokens]
-    # Fixed output windows avoid overlapping writes at ragged request tails.
-    # Compact only attention outputs; the much larger main KV stays in place.
-    boundaries = jnp.concatenate((starts, jnp.array([tokens], jnp.int32)))
-    counts = pl.cdiv(jnp.diff(boundaries), bq)
-    begins = jnp.concatenate((jnp.zeros(1, jnp.int32), jnp.cumsum(counts)[:-1]))
-    token_ids = jnp.arange(tokens)
-    requests = jnp.minimum(jnp.searchsorted(starts[1:], token_ids, side="right"), batch)
-    tile_ids = begins[requests] + (token_ids - boundaries[requests]) // bq
-    local_ids = token_ids - jnp.minimum(tiles[tile_ids, 1], tokens - bq)
-    return tiled_output[tile_ids * bq + local_ids]

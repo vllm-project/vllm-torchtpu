@@ -15,7 +15,7 @@ from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import (
     encode_csa2_kv,
     prepare_swa_metadata,
 )
-from vllm_torchtpu.kernels.deepseek_v41.csa2.prefill import csa2_prefill
+from vllm_torchtpu.kernels.deepseek_v41.csa2.csa2 import csa2
 
 
 def main() -> None:
@@ -113,7 +113,7 @@ def main() -> None:
             bq=6 if tokens <= 384 else 16,
         ):
             owner = publish(owner, records, values)
-            output = csa2_prefill(
+            output = csa2(
                 q,
                 words,
                 scales,

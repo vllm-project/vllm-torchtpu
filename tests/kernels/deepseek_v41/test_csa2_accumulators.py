@@ -8,12 +8,10 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import encode_csa2_kv
-from vllm_torchtpu.kernels.deepseek_v41.csa2.decode import csa2_decode
+from vllm_torchtpu.kernels.deepseek_v41.csa2.csa2 import csa2
 from vllm_torchtpu.kernels.deepseek_v41.csa2.pipeline import (
-    csa2_attention,
     csa2_pipeline,
 )
-from vllm_torchtpu.kernels.deepseek_v41.csa2.prefill import csa2_prefill
 from vllm_torchtpu.kernels.deepseek_v41.csa2.reference import prefill_reference
 
 
@@ -80,19 +78,8 @@ def test_decode_traces_on_pinned_jax():
         abstract_device=jax.sharding.AbstractDevice("TPU7x", 1, "tpu"),
     )
     with jax.sharding.use_abstract_mesh(mesh):
-        traced = jax.make_jaxpr(lambda *x: csa2_attention(*x, **kwargs))(*args)
+        traced = jax.make_jaxpr(lambda *x: csa2(*x, **kwargs))(*args)
         assert traced.out_avals[0].shape == args[0].shape
-        # Tracing both branches catches port/signature incompatibilities on CPU.
-        direct = jax.make_jaxpr(
-            lambda *x: csa2_decode(
-                *x[:4],
-                x[5][::6],
-                *x[6:],
-                swa_page=kwargs["swa_metadata"],
-                main_lengths=kwargs["main_lengths"],
-            )
-        )(*args)
-        assert direct.out_avals[0].dtype == jnp.bfloat16
 
 
 @pytest.mark.parametrize(
@@ -112,7 +99,7 @@ def test_decode_matches_ragged_reference_with_authoritative_counts(
         swa_bounds=kwargs["swa_bounds"],
         scale=kwargs["scale"],
     )
-    actual = csa2_attention(*args, **kwargs)
+    actual = csa2(*args, **kwargs)
     np.testing.assert_allclose(
         np.asarray(actual, np.float32),
         np.asarray(expected, np.float32),
@@ -151,9 +138,9 @@ def test_decode_gather_and_reuse_preserve_valid_counts():
     expected_scales = jnp.where(records >= 0, scales, 0)
     np.testing.assert_array_equal(gathered, expected_words)
     np.testing.assert_array_equal(gathered_scales, expected_scales)
-    expected = csa2_attention(*args, **kwargs)
+    expected = csa2(*args, **kwargs)
     np.testing.assert_allclose(output, expected, atol=3e-3, rtol=2e-2)
-    reused = csa2_attention(q, gathered, gathered_scales, *args[3:], **kwargs)
+    reused = csa2(q, gathered, gathered_scales, *args[3:], **kwargs)
     np.testing.assert_array_equal(reused, output)
 
 
@@ -162,7 +149,7 @@ def test_decode_ignores_finite_swa_outside_visible_window(stale_value):
     if jax.default_backend() != "tpu":
         pytest.skip("Compiled decode accumulator operations require TPU")
     args, kwargs = _decode_inputs(2, 64, 64)
-    expected = csa2_attention(*args, **kwargs)
+    expected = csa2(*args, **kwargs)
     cache = np.asarray(args[3]).copy()
     visible = np.zeros(cache.shape[:2], dtype=bool)
     for seq, first in enumerate(np.asarray(args[5])[::6]):
@@ -175,7 +162,7 @@ def test_decode_ignores_finite_swa_outside_visible_window(stale_value):
     # The cache owner is zero-initialized and stores finite BF16 values.
     cache[~visible] = stale_value
     stale = (*args[:3], jnp.asarray(cache), *args[4:])
-    actual = csa2_attention(*stale, **kwargs)
+    actual = csa2(*stale, **kwargs)
     assert np.isfinite(np.asarray(actual, np.float32)).all()
     np.testing.assert_allclose(actual, expected, atol=3e-3, rtol=2e-2)
 
@@ -225,7 +212,7 @@ def test_csa2_accumulator_pipeline_matches_reference(heads: int) -> None:
         rope,
     )
     expected = prefill_reference(*args, main_lengths=lengths, swa_metadata=metadata)
-    actual = csa2_prefill(*args, bq=6, main_lengths=lengths, swa_metadata=metadata)
+    actual = csa2(*args, bq=6, main_lengths=lengths, swa_metadata=metadata)
     np.testing.assert_allclose(
         np.asarray(actual, np.float32),
         np.asarray(expected, np.float32),
