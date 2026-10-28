@@ -28,7 +28,9 @@ from ...decls import (
     ModuleBinding,
     RecurrentCacheDecl,
     ResolvedModuleGeometry,
+    normalize_weight_dtypes,
 )
+from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec
 from ...fused_io_hook import fused_io
 from ...module import Module
@@ -43,6 +45,7 @@ from .decls import (
     GDN_GEOMETRY_METHODS,
     GDN_OPTIONS,
     GDN_PARAM_NAMES,
+    GDN_WEIGHT_NAMES,
     gdn_cache_decl,
     gdn_hf_params,
     resolve_gdn_binding,
@@ -89,6 +92,7 @@ class GDNModule(Module):
         geometry: Any = None,
         prefix: str = "linear_attn",
         gate: str | None = None,
+        weight_dtypes: Mapping[str, str] | None = None,
     ) -> None:
         self.geometry = geometry
         self.prefix = prefix
@@ -99,9 +103,14 @@ class GDNModule(Module):
             if self._explicit_gate is not None
             else (validate_gdn_gate(g_gate) if g_gate is not None else "silu")
         )
+        self.weight_dtypes = normalize_weight_dtypes(
+            weight_dtypes, GDN_WEIGHT_NAMES, "GDNModule", MegakernelConfigError
+        )
         opts: dict[str, Any] = {}
         if self._explicit_gate is not None or g_gate is not None:
             opts["gate"] = self.gate
+        if weight_dtypes is not None:
+            opts["weight_dtypes"] = self.weight_dtypes
         self.options = FrozenDict(opts)
 
     @classmethod
@@ -170,9 +179,11 @@ class GDNModule(Module):
 
     def weights(self, g: Any, ex: ExecSpec) -> list[WeightDecl]:
         lay = self.lin_in_layout(g, ex)
+        in_dt = FP8 if self.weight_dtypes["lin_in"] == "fp8" else BF16
+        out_dt = FP8 if self.weight_dtypes["lin_out"] == "fp8" else BF16
         return [
-            WeightDecl("lin_in", K=g.H, N=lay.NLI, dtype=FP8, stream_ring="static"),
-            WeightDecl("lin_out", K=lay.Z, N=g.H, dtype=FP8, stream_ring="static"),
+            WeightDecl("lin_in", K=g.H, N=lay.NLI, dtype=in_dt, stream_ring="static"),
+            WeightDecl("lin_out", K=lay.Z, N=g.H, dtype=out_dt, stream_ring="static"),
         ]
 
     def states(self, g: Any, ex: ExecSpec) -> list[StateDecl]:
@@ -260,15 +271,20 @@ class GDNModule(Module):
 
     def smalls(self, g: Any, ex: ExecSpec) -> list[SmallField]:
         lay = self.lin_in_layout(g, ex)
-        return [
-            SmallField("in_norm", g.H),
-            SmallField("in_s", lay.NLI),
-            SmallField("out_s", g.H),
-            SmallField("conv", 4 * lay.QKV),
-            SmallField("alog", 128),
-            SmallField("dtb", 128),
-            SmallField("gnorm", lay.VD),
-        ]
+        fields = [SmallField("in_norm", g.H)]
+        if self.weight_dtypes["lin_in"] == "fp8":
+            fields.append(SmallField("in_s", lay.NLI))
+        if self.weight_dtypes["lin_out"] == "fp8":
+            fields.append(SmallField("out_s", g.H))
+        fields.extend(
+            [
+                SmallField("conv", 4 * lay.QKV),
+                SmallField("alog", 128),
+                SmallField("dtb", 128),
+                SmallField("gnorm", lay.VD),
+            ]
+        )
+        return fields
 
     def shared_widths(self, g: Any, ex: ExecSpec) -> dict[str, int]:
         lay = self.lin_in_layout(g, ex)
@@ -276,7 +292,14 @@ class GDNModule(Module):
 
     def plan_params(self, g: Any, ex: ExecSpec, plan: Any) -> GDNParams:
         return derive_params(
-            g, ex, plan, self.tunables(ex), self.name, gate=self._effective_gate(g)
+            g,
+            ex,
+            plan,
+            self.tunables(ex),
+            self.name,
+            gate=self._effective_gate(g),
+            in_scaled=(self.weight_dtypes["lin_in"] == "fp8"),
+            out_scaled=(self.weight_dtypes["lin_out"] == "fp8"),
         )
 
     def scratch(self, g: Any, ex: ExecSpec, plan: Any) -> dict[str, Any]:
@@ -354,7 +377,7 @@ class GDNModule(Module):
                     pltpu.make_async_copy(recb, O[rec_out_key].at[o], sem.at[3]).start()
                 scr["xb2"][:, :Z] = scr["mix"][:, :Z].astype(BF16)
                 yo = stream.dmatmul("lin_out", scr["xb2"], H)
-                return yo * ctx.sm(slot, "out_s")
+                return yo * ctx.sm(slot, "out_s") if gp.out_scaled else yo
 
     def epilogue(self, ctx: Any) -> None:
         gp: GDNParams = ctx.module_params(self.name)
@@ -398,7 +421,11 @@ class GDNModule(Module):
 
     def hf_params(self, prefix: str | None = None, g: Any = None) -> list[HFParamDecl]:
         geom = self._require_geometry(g)
-        return gdn_hf_params(self.prefix if prefix is None else prefix, geom)
+        return gdn_hf_params(
+            self.prefix if prefix is None else prefix,
+            geom,
+            weight_dtypes=self.weight_dtypes,
+        )
 
     def cache_decl(self, g: Any = None) -> RecurrentCacheDecl:
         return gdn_cache_decl(self._require_geometry(g))

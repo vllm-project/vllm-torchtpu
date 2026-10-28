@@ -87,6 +87,8 @@ class GDNParams:
     conv_stage: bool = False
     head_major: bool = False
     gate: str = "silu"
+    in_scaled: bool = True
+    out_scaled: bool = True
     # Pool layout of the model's pool backend (set only for pool I/O: GPR or
     # fused); the slot geometry above and `page_base` come from it.
     pool_layout: Any = None
@@ -145,6 +147,8 @@ def derive_params(
     name: str,
     *,
     gate: str | None = None,
+    in_scaled: bool = True,
+    out_scaled: bool = True,
 ) -> GDNParams:
     """`GDNParams` for geometry `g` under `ex` and the module's tunables `tt`."""
     eff_gate = validate_gdn_gate(
@@ -278,6 +282,8 @@ def derive_params(
         conv_stage=bool(tt.conv_stage),
         head_major=bool(tt.gdn_head_major),
         gate=eff_gate,
+        in_scaled=bool(in_scaled),
+        out_scaled=bool(out_scaled),
         pool_layout=pool_layout,
     )
 

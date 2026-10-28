@@ -243,10 +243,16 @@ def slice_alias_targets(
 ) -> dict[str, Any]:
     """Slice `(w_buf, s_buf)` across `target_decls` driven by `VLLMAlias` metadata."""
     is_w_fp8 = ops.is_fp8(w_buf)
-    if is_w_fp8 != alias.already_fp8:
+    any_want_fp8 = any(jnp.dtype(d.dtype) == jnp.dtype(FP8) for d in target_decls)
+    if not alias.already_fp8 and is_w_fp8:
         raise ValueError(
-            f"Alias {alias.source!r} declared already_fp8={alias.already_fp8}, "
-            f"got is_fp8={is_w_fp8} (dtype={w_buf.dtype})"
+            f"Alias {alias.source!r} declared already_fp8=False, "
+            f"got is_fp8=True (dtype={w_buf.dtype})"
+        )
+    if alias.already_fp8 and not is_w_fp8 and any_want_fp8:
+        raise ValueError(
+            f"Alias {alias.source!r} declared already_fp8=True, "
+            f"got is_fp8=False (dtype={w_buf.dtype})"
         )
     d0 = target_decls[0]
     if len(target_decls) == 1 and d0.transform.flatten_tail and len(d0.shape) == 2:
@@ -301,7 +307,7 @@ def slice_alias_targets(
 
     if (
         alias.already_sharded
-        and alias.already_fp8
+        and is_w_fp8
         and f_grp is not None
         and fuse_groups is not None
         and tuple(d.name for d in target_decls) == fuse_groups.get(f_grp)
@@ -351,17 +357,18 @@ def slice_alias_targets(
             s_t = ops.slice_axis(s_buf, -1, start, stop)
 
         want_fp8 = jnp.dtype(d.dtype) == jnp.dtype(FP8)
-        if alias.already_fp8 and not want_fp8:
+        if is_w_fp8 and not want_fp8:
             if s_t is None:
                 raise ValueError(
                     f"Target {d.name!r} has dtype {d.dtype} in FP8 alias "
                     f"{alias.source!r} but no scale slice is available"
                 )
-            s_2d = ops.reshape(ops.cast(s_t, F32), (1, stop - start))
-            w_t = ops.dequantize(w_t, s_2d, d.dtype)
-        elif not alias.already_fp8 and want_fp8:
+            s_f32 = ops.cast(s_t, F32)
+            s_bcast = ops.reshape(s_f32, (*s_f32.shape[:-1], 1, int(s_f32.shape[-1])))
+            w_t = ops.dequantize(w_t, s_bcast, d.dtype)
+        elif not is_w_fp8 and want_fp8:
             w_t, s_t = ops.quantize_fp8(w_t)
-        elif not alias.already_fp8:
+        elif not is_w_fp8:
             w_t = ops.cast(w_t, d.dtype)
 
         if d.transform.flatten_tail and len(d.shape) == 2:

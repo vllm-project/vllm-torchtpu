@@ -24,7 +24,7 @@ from jax import lax
 
 from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec
-from ...ops import BF16, F32, gdn_gate_act, rnd, rup, validate_gdn_gate
+from ...ops import BF16, F32, FP8, gdn_gate_act, rnd, rup, validate_gdn_gate
 from .params import gdn_lin_in_layout
 
 
@@ -87,11 +87,19 @@ def gdn_reference(
     w_lin_in_l = w_lin_in_all[:, o_gdn] if w_lin_in_all.ndim == 4 else w_lin_in_all
     w_lin_out_l = w_lin_out_all[:, o_gdn] if w_lin_out_all.ndim == 4 else w_lin_out_all
 
-    lin_in_s_l = _slice_sm(
-        params["lin_in_s"] if "lin_in_s" in params else params["in_s"]
+    in_scaled = jnp.dtype(w_lin_in_all.dtype) == jnp.dtype(FP8)
+    out_scaled = jnp.dtype(w_lin_out_all.dtype) == jnp.dtype(FP8)
+    has_in_s = in_scaled and ("lin_in_s" in params or "in_s" in params)
+    has_out_s = out_scaled and ("lin_out_s" in params or "out_s" in params)
+    lin_in_s_l = (
+        _slice_sm(params["lin_in_s"] if "lin_in_s" in params else params["in_s"])
+        if has_in_s
+        else None
     )
-    lin_out_s_l = _slice_sm(
-        params["lin_out_s"] if "lin_out_s" in params else params["out_s"]
+    lin_out_s_l = (
+        _slice_sm(params["lin_out_s"] if "lin_out_s" in params else params["out_s"])
+        if has_out_s
+        else None
     )
     conv_w_l = _slice_sm(params["conv"])
     alog_l = _slice_sm(params["alog"])
@@ -125,8 +133,11 @@ def gdn_reference(
     gdn_partials = []
     for r in range(R):
         w_in = w_lin_in_l[r].astype(F32)
-        in_s = lin_in_s_l[r]
-        ybuf = rnd((xb @ w_in) * in_s)
+        ybuf = (
+            rnd((xb @ w_in) * lin_in_s_l[r])
+            if lin_in_s_l is not None
+            else rnd(xb @ w_in)
+        )
 
         cw = conv_w_l[r]
         taps = [cw[t * QKV : (t + 1) * QKV] for t in range(4)]
@@ -212,8 +223,11 @@ def gdn_reference(
             rec_out = rec_out.at[r].set(rec_cat)
         mix_r_arr = jnp.stack(mix_r, axis=0).astype(BF16).astype(F32)
         w_out = w_lin_out_l[r].astype(F32)
-        out_s = lin_out_s_l[r]
-        yo = (mix_r_arr @ w_out) * out_s
+        yo = (
+            (mix_r_arr @ w_out) * lin_out_s_l[r]
+            if lin_out_s_l is not None
+            else (mix_r_arr @ w_out)
+        )
         gdn_partials.append(yo.astype(BF16).astype(F32))
 
     delta_out = jnp.sum(jnp.stack(gdn_partials, axis=0), axis=0)

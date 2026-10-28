@@ -67,11 +67,19 @@ def gqa_reference(
     w_att_in_l = w_att_in_all[:, a] if w_att_in_all.ndim == 4 else w_att_in_all
     w_att_out_l = w_att_out_all[:, a] if w_att_out_all.ndim == 4 else w_att_out_all
 
-    att_in_s_l = _slice_sm(
-        params["att_in_s"] if "att_in_s" in params else params["in_s"]
+    in_scaled = jnp.dtype(w_att_in_all.dtype) == jnp.dtype(FP8)
+    out_scaled = jnp.dtype(w_att_out_all.dtype) == jnp.dtype(FP8)
+    has_in_s = in_scaled and ("att_in_s" in params or "in_s" in params)
+    has_out_s = out_scaled and ("att_out_s" in params or "out_s" in params)
+    att_in_s_l = (
+        _slice_sm(params["att_in_s"] if "att_in_s" in params else params["in_s"])
+        if has_in_s
+        else None
     )
-    att_out_s_l = _slice_sm(
-        params["att_out_s"] if "att_out_s" in params else params["out_s"]
+    att_out_s_l = (
+        _slice_sm(params["att_out_s"] if "att_out_s" in params else params["out_s"])
+        if has_out_s
+        else None
     )
     qn_l = _slice_sm(params["qn"])
     kn_l = _slice_sm(params["kn"])
@@ -92,8 +100,11 @@ def gqa_reference(
 
     for r in range(R):
         w_in = w_att_in_l[r].astype(F32)
-        in_s = att_in_s_l[r]
-        y = rnd((xb @ w_in) * in_s)
+        y = (
+            rnd((xb @ w_in) * att_in_s_l[r])
+            if att_in_s_l is not None
+            else rnd(xb @ w_in)
+        )
 
         qn = qn_l[r]
         kn = kn_l[r]
@@ -156,8 +167,11 @@ def gqa_reference(
             mix_r.append(rnd(oh * gh))
         mix_r_arr = jnp.stack(mix_r, axis=0).astype(BF16).astype(F32)
         w_out = w_att_out_l[r].astype(F32)
-        out_s = att_out_s_l[r]
-        yo = (mix_r_arr @ w_out) * out_s
+        yo = (
+            (mix_r_arr @ w_out) * att_out_s_l[r]
+            if att_out_s_l is not None
+            else (mix_r_arr @ w_out)
+        )
         att_partials.append(yo.astype(BF16).astype(F32))
 
     for r in range(R):

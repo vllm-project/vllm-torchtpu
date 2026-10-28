@@ -754,7 +754,9 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
                     _start_gdn_in(o, s_)
             y = stream.dmatmul("lin_in", scr["xb"], NLI)
             ybuf = scr["ybuf"]
-            ybuf[:, :NLI] = rnd(y * ctx.sm(slot, "in_s", NLI))
+            ybuf[:, :NLI] = (
+                rnd(y * ctx.sm(slot, "in_s", NLI)) if gp.in_scaled else rnd(y)
+            )
 
         ow, _ = stream.sp.lay["conv"]
         taps = [scr["sm"][slot, :, ow + t * QKV : ow + (t + 1) * QKV] for t in range(4)]
@@ -1044,7 +1046,7 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
                 scr["mix"][B:, :Z] = jnp.zeros((ex.MB - B, Z), F32)
             scr["xb2"][:, :Z] = scr["mix"][:, :Z].astype(BF16)
             yo = stream.dmatmul("lin_out", scr["xb2"], H)
-            return yo * ctx.sm(slot, "out_s")
+            return yo * ctx.sm(slot, "out_s") if gp.out_scaled else yo
 
 
 def gdn_fused_epilogue(ctx: Any, gp: Any) -> None:

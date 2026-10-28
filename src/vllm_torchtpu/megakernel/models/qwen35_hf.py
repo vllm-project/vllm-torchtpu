@@ -264,7 +264,7 @@ def qwen35_hf_oracle(
 
     backbone = states.get("_hf_backbone")
     if backbone is None:
-        m_def = get_model(QWEN35_MODEL_NAME)
+        m_def = getattr(g, "_model_def", None) or get_model(QWEN35_MODEL_NAME)
         hf_model = _instantiate_qwen35_hf_model(m_def, g, torch, transformers)
         _populate_qwen35_hf_state_dict(m_def, g, ex, weights, hf_model, torch)
         backbone = getattr(hf_model, "model", hf_model)

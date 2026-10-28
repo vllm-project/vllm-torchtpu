@@ -28,7 +28,9 @@ from .ring import egive, egive_group, es_wait, etake
 def gate_up(m: MoEEmit, i, w13):
     mp, scr, stream = m.mp, m.scr, m.stream
     IR, NSS = mp.IR, mp.NSS
-    h = stream.mm(scr["xb"][...], w13[...]) * scr["es"][i % NSS, :, : 2 * IR]
+    h = stream.mm(scr["xb"][...], w13[...])
+    if "es" in m.W:
+        h = h * scr["es"][i % NSS, :, : 2 * IR]
     return rnd(rnd(jax.nn.silu(rnd(h[:, :IR]))) * rnd(h[:, IR:])).astype(BF16)
 
 
@@ -37,11 +39,12 @@ def down(m: MoEEmit, i, mid, w2):
     MR = ex.MR
     CH, H, IR, NSS = mp.CH, mp.H, mp.IR, mp.NSS
     e, s, part = scr["elist"][i], i % NSS, scr["part"]
+    has_es = "es" in m.W
     wcol = jnp.sum(jnp.where(lane_e8 == e, scr["wn"][...], 0.0), axis=1, keepdims=True)
     for j in range(H // CH):
         lo = 2 * IR + j * CH
         y = stream.mm(mid, w2[:, j * CH : (j + 1) * CH])[0:MR]
-        y = rnd(y * scr["es"][s, :, lo : lo + CH])
+        y = rnd(y * scr["es"][s, :, lo : lo + CH]) if has_es else rnd(y)
         part[0:MR, j * CH : (j + 1) * CH] += wcol * y
 
 
@@ -92,7 +95,9 @@ def expert(m: MoEEmit, l_idx, i, carry):
                 egive(m, u, l_idx, t)
         h = acc[:, : 2 * IR]
     es_wait(m, i)
-    h = h * scr["es"][s, :, : 2 * IR]
+    has_es = "es" in m.W
+    if has_es:
+        h = h * scr["es"][s, :, : 2 * IR]
     mid_ = rnd(rnd(jax.nn.silu(rnd(h[:, :IR]))) * rnd(h[:, IR:]))
     xb2[:, :IR] = mid_.astype(BF16)
     wcol = jnp.sum(jnp.where(lane_e8 == e, scr["wn"][...], 0.0), axis=1, keepdims=True)
@@ -103,7 +108,7 @@ def expert(m: MoEEmit, l_idx, i, carry):
         for j in range(H // CH):
             lo = 2 * IR + j * CH
             y = stream.mm(xm, w2[:, j * CH : (j + 1) * CH])[0:MR]
-            y = rnd(y * scr["es"][s, :, lo : lo + CH])
+            y = rnd(y * scr["es"][s, :, lo : lo + CH]) if has_es else rnd(y)
             part[0:MR, j * CH : (j + 1) * CH] += wcol * y
         egive(m, u2, l_idx)
     elif not mp.unroll:
@@ -118,7 +123,11 @@ def expert(m: MoEEmit, l_idx, i, carry):
             return cc
 
         lax.fori_loop(0, T2, b2, 0)
-        y = rnd(acc[0:MR, :H] * scr["es"][s, :, 2 * IR :])
+        y = (
+            rnd(acc[0:MR, :H] * scr["es"][s, :, 2 * IR :])
+            if has_es
+            else rnd(acc[0:MR, :H])
+        )
         part[0:MR, :] += wcol * y
     else:
         TK2 = tk["e2"]
@@ -139,7 +148,11 @@ def expert(m: MoEEmit, l_idx, i, carry):
                     egive(m, u, l_idx, T13 + t)
             else:
                 egive(m, u, l_idx, T13 + t)
-        y = rnd(acc[0:MR, :H] * scr["es"][s, :, 2 * IR :])
+        y = (
+            rnd(acc[0:MR, :H] * scr["es"][s, :, 2 * IR :])
+            if has_es
+            else rnd(acc[0:MR, :H])
+        )
         part[0:MR, :] += wcol * y
     return carry
 
@@ -207,7 +220,8 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
             else:
                 egive(m, t, l_idx, t)
         es_wait(m, 0)
-        h0 = acc13[:, :BN] * scr["es"][0, :, :BN]
+        has_es = "es" in m.W
+        h0 = acc13[:, :BN] * scr["es"][0, :, :BN] if has_es else acc13[:, :BN]
         mid0 = rnd(rnd(jax.nn.silu(rnd(h0[:, :IR]))) * rnd(h0[:, IR:]))
         xb2[:, :IR] = mid0.astype(BF16)
 
@@ -257,11 +271,17 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
                 axis=1,
                 keepdims=True,
             )
-            y = rnd(acc[0:MR, :H] * scr["es"][s_cur, :, BN:])
+            y = (
+                rnd(acc[0:MR, :H] * scr["es"][s_cur, :, BN:])
+                if has_es
+                else rnd(acc[0:MR, :H])
+            )
             part[0:MR, :] += wcol * y
 
             es_wait(m, i + 1)
-            h_nxt = acc13[:, :BN] * scr["es"][s_nxt, :, :BN]
+            h_nxt = (
+                acc13[:, :BN] * scr["es"][s_nxt, :, :BN] if has_es else acc13[:, :BN]
+            )
             mid_nxt = rnd(rnd(jax.nn.silu(rnd(h_nxt[:, :IR]))) * rnd(h_nxt[:, IR:]))
             xb2[:, :IR] = mid_nxt.astype(BF16)
             return 0
@@ -299,5 +319,9 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
             axis=1,
             keepdims=True,
         )
-        y_last = rnd(acc[0:MR, :H] * scr["es"][s_last, :, BN:])
+        y_last = (
+            rnd(acc[0:MR, :H] * scr["es"][s_last, :, BN:])
+            if has_es
+            else rnd(acc[0:MR, :H])
+        )
         part[0:MR, :] += wcol_last * y_last

@@ -397,3 +397,35 @@ class ModuleBinding:
 
     def cache_decl(self, hf_config: Any) -> KVCacheDecl | RecurrentCacheDecl | None:
         return self.resolve(hf_config).cache_decl()
+
+
+def normalize_weight_dtypes(
+    raw: Any,
+    allowed: Sequence[str],
+    module_name: str,
+    err_cls: type[Exception] = ValueError,
+) -> FrozenDict:
+    """Validate and normalize per-weight dtype policies (`'fp8' | 'bf16'`)."""
+    out = {k: "fp8" for k in allowed}
+    if raw is None:
+        return FrozenDict(out)
+    if not isinstance(raw, Mapping):
+        raise err_cls(
+            f"{module_name} weight_dtypes must be a Mapping, got {type(raw).__name__}"
+        )
+    allowed_set = set(allowed)
+    for k, v in raw.items():
+        if k not in allowed_set:
+            raise err_cls(
+                f"{module_name} weight_dtypes got unknown weight {k!r}; "
+                f"supported: {sorted(allowed_set)}"
+            )
+        if v in ("fp8", "fp8_channel", "per_channel_fp8"):
+            out[k] = "fp8"
+        elif v == "bf16":
+            out[k] = "bf16"
+        else:
+            raise err_cls(
+                f"{module_name} weight_dtypes[{k!r}] must be 'fp8' or 'bf16', got {v!r}"
+            )
+    return FrozenDict(out)

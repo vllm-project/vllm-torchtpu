@@ -27,9 +27,12 @@ from ...decls import (
     ResolvedModuleGeometry,
     VLLMAlias,
     apply_decl_overrides,
+    normalize_weight_dtypes,
 )
 from ...errors import MegakernelConfigError
-from ...ops import F32, FP8
+from ...ops import BF16, F32, FP8
+
+GQA_WEIGHT_NAMES: tuple[str, ...] = ("att_in", "att_out")
 
 GQA_PARAM_NAMES: frozenset[str] = frozenset(
     {
@@ -71,7 +74,11 @@ GQA_FIELD_ALIASES: dict[str, str] = {
     "rope_theta": "theta",
 }
 
-GQA_OPTIONS: dict[str, Any] = {"qk_norm": True, "output_gate": True}
+GQA_OPTIONS: dict[str, Any] = {
+    "qk_norm": True,
+    "output_gate": True,
+    "weight_dtypes": None,
+}
 
 GQA_GEOMETRY_METHODS: dict[str, Any] = {
     "nh": lambda g, R: int(g.NH) // R,
@@ -90,6 +97,12 @@ def validate_gqa_options(options: Mapping[str, Any]) -> None:
             "GQAModule requires output_gate=True (the kernel always applies the "
             "sigmoid output gate)"
         )
+    normalize_weight_dtypes(
+        options.get("weight_dtypes"),
+        GQA_WEIGHT_NAMES,
+        "GQAModule",
+        MegakernelConfigError,
+    )
 
 
 def resolve_gqa_binding(
@@ -134,31 +147,48 @@ def gqa_hf_params(
     *,
     qk_norm: bool = True,
     output_gate: bool = True,
+    weight_dtypes: Mapping[str, str] | None = None,
 ) -> list[HFParamDecl]:
     """Return canonical (unfused) HF parameter declarations for `GQAModule`."""
     p = f"{prefix}." if prefix else ""
     H, NH, NKV, HD = int(geom.H), int(geom.NH), int(geom.NKV), int(geom.HD)
     q_dim = NH * (2 if output_gate else 1) * HD
     rename = geom.rename if isinstance(geom, ResolvedModuleGeometry) else {}
+    raw_wd = (
+        weight_dtypes
+        if weight_dtypes is not None
+        else (
+            geom.options.get("weight_dtypes")
+            if isinstance(geom, ResolvedModuleGeometry)
+            else None
+        )
+    )
+    w_dt = normalize_weight_dtypes(
+        raw_wd, GQA_WEIGHT_NAMES, "GQAModule", MegakernelConfigError
+    )
+    in_fp8 = w_dt["att_in"] == "fp8"
+    out_fp8 = w_dt["att_out"] == "fp8"
+    in_dt = FP8 if in_fp8 else BF16
+    out_dt = FP8 if out_fp8 else BF16
 
     def _n(canon: str) -> str:
         return rename.get(canon, canon)
 
     def _kv_decls(proj: str, order: int) -> list[HFParamDecl]:
         w_name, s_name = _n(f"{proj}_proj"), _n(f"{proj}_proj_s")
-        return [
+        out = [
             HFParamDecl(
                 name=w_name,
                 hf_name=f"{p}{proj}_proj.weight",
                 shape=(NKV, H, HD),
                 hf_shape=(NKV * HD, H),
-                dtype=FP8,
+                dtype=in_dt,
                 transform=ParamTransform(
                     fuse_into="att_in",
                     fuse_order=order,
                     fuse_axis=-1,
                     transpose=(0, 2, 1),
-                    quantize="fp8",
+                    quantize="fp8" if in_fp8 else None,
                     shard_axis=0,
                     kv_repeat=True,
                 ),
@@ -166,7 +196,7 @@ def gqa_hf_params(
                     VLLMAlias(
                         source=f"{p}{proj}_proj",
                         targets=(w_name,),
-                        scale_targets=(s_name,),
+                        scale_targets=(s_name,) if in_fp8 else (),
                         scale_source=f"{p}{proj}_proj.weight_scale",
                         shard_axis=-1,
                         already_sharded=True,
@@ -175,23 +205,27 @@ def gqa_hf_params(
                     ),
                 ),
             ),
-            HFParamDecl(
-                name=s_name,
-                hf_name=f"{p}{proj}_proj.weight_scale_inv",
-                shape=(NKV, HD),
-                hf_shape=(NKV * HD,),
-                dtype=F32,
-                transform=ParamTransform(
-                    fuse_into="att_in_s",
-                    fuse_order=order,
-                    fuse_axis=-1,
-                    scale_for=w_name,
-                    shard_axis=0,
-                    kv_repeat=True,
-                    small_field="in_s",
-                ),
-            ),
         ]
+        if in_fp8:
+            out.append(
+                HFParamDecl(
+                    name=s_name,
+                    hf_name=f"{p}{proj}_proj.weight_scale_inv",
+                    shape=(NKV, HD),
+                    hf_shape=(NKV * HD,),
+                    dtype=F32,
+                    transform=ParamTransform(
+                        fuse_into="att_in_s",
+                        fuse_order=order,
+                        fuse_axis=-1,
+                        scale_for=w_name,
+                        shard_axis=0,
+                        kv_repeat=True,
+                        small_field="in_s",
+                    ),
+                )
+            )
+        return out
 
     decls: list[HFParamDecl] = [
         HFParamDecl(
@@ -199,20 +233,24 @@ def gqa_hf_params(
             hf_name=f"{p}q_proj.weight",
             shape=(H, q_dim),
             hf_shape=(q_dim, H),
-            dtype=FP8,
+            dtype=in_dt,
             transform=ParamTransform(
                 fuse_into="att_in",
                 fuse_order=0,
                 fuse_axis=-1,
                 transpose=(1, 0),
-                quantize="fp8",
+                quantize="fp8" if in_fp8 else None,
                 shard_axis=-1,
             ),
             vllm_aliases=(
                 VLLMAlias(
                     source=f"{p}qkv_proj",
                     targets=(_n("q_proj"), _n("k_proj"), _n("v_proj")),
-                    scale_targets=(_n("q_proj_s"), _n("k_proj_s"), _n("v_proj_s")),
+                    scale_targets=(
+                        (_n("q_proj_s"), _n("k_proj_s"), _n("v_proj_s"))
+                        if in_fp8
+                        else ()
+                    ),
                     scale_source=f"{p}qkv_proj.weight_scale",
                     shard_axis=-1,
                     already_sharded=True,
@@ -222,7 +260,7 @@ def gqa_hf_params(
                 VLLMAlias(
                     source=f"{p}q_proj",
                     targets=(_n("q_proj"),),
-                    scale_targets=(_n("q_proj_s"),),
+                    scale_targets=(_n("q_proj_s"),) if in_fp8 else (),
                     scale_source=f"{p}q_proj.weight_scale",
                     shard_axis=-1,
                     already_sharded=True,
@@ -231,35 +269,44 @@ def gqa_hf_params(
                 ),
             ),
         ),
-        HFParamDecl(
-            name=_n("q_proj_s"),
-            hf_name=f"{p}q_proj.weight_scale_inv",
-            shape=(q_dim,),
-            hf_shape=(q_dim,),
-            dtype=F32,
-            transform=ParamTransform(
-                fuse_into="att_in_s",
-                fuse_order=0,
-                fuse_axis=-1,
-                scale_for=_n("q_proj"),
-                shard_axis=-1,
-                small_field="in_s",
-            ),
-        ),
-        *_kv_decls("k", 1),
-        *_kv_decls("v", 2),
+    ]
+    if in_fp8:
+        decls.append(
+            HFParamDecl(
+                name=_n("q_proj_s"),
+                hf_name=f"{p}q_proj.weight_scale_inv",
+                shape=(q_dim,),
+                hf_shape=(q_dim,),
+                dtype=F32,
+                transform=ParamTransform(
+                    fuse_into="att_in_s",
+                    fuse_order=0,
+                    fuse_axis=-1,
+                    scale_for=_n("q_proj"),
+                    shard_axis=-1,
+                    small_field="in_s",
+                ),
+            )
+        )
+    decls.extend(_kv_decls("k", 1))
+    decls.extend(_kv_decls("v", 2))
+    decls.append(
         HFParamDecl(
             name=_n("att_out"),
             hf_name=f"{p}o_proj.weight",
             shape=(NH * HD, H),
             hf_shape=(H, NH * HD),
-            dtype=FP8,
-            transform=ParamTransform(transpose=(1, 0), quantize="fp8", shard_axis=0),
+            dtype=out_dt,
+            transform=ParamTransform(
+                transpose=(1, 0),
+                quantize="fp8" if out_fp8 else None,
+                shard_axis=0,
+            ),
             vllm_aliases=(
                 VLLMAlias(
                     source=f"{p}o_proj",
                     targets=(_n("att_out"),),
-                    scale_targets=(_n("att_out_s"),),
+                    scale_targets=(_n("att_out_s"),) if out_fp8 else (),
                     scale_source=f"{p}o_proj.weight_scale",
                     shard_axis=0,
                     already_sharded=True,
@@ -267,21 +314,24 @@ def gqa_hf_params(
                     flipped=True,
                 ),
             ),
-        ),
-        HFParamDecl(
-            name=_n("att_out_s"),
-            hf_name=f"{p}o_proj.weight_scale_inv",
-            shape=(H,),
-            hf_shape=(H,),
-            dtype=F32,
-            transform=ParamTransform(
-                scale_for=_n("att_out"),
-                shard_axis=None,
-                replicate_ranks=True,
-                small_field="out_s",
-            ),
-        ),
-    ]
+        )
+    )
+    if out_fp8:
+        decls.append(
+            HFParamDecl(
+                name=_n("att_out_s"),
+                hf_name=f"{p}o_proj.weight_scale_inv",
+                shape=(H,),
+                hf_shape=(H,),
+                dtype=F32,
+                transform=ParamTransform(
+                    scale_for=_n("att_out"),
+                    shard_axis=None,
+                    replicate_ranks=True,
+                    small_field="out_s",
+                ),
+            )
+        )
     if qk_norm:
         decls.extend(
             [

@@ -48,7 +48,7 @@ def att_q(cx: GQAEmit, slot: Any) -> tuple[Any, Any, int, int, Any]:
     with sc("att_in"):
         y = stream.dmatmul("att_in", scr["xb"], NAI)
         ybuf = scr["ybuf"]
-        ybuf[:, :NAI] = rnd(y * ctx.sm(slot, "in_s", NAI))
+        ybuf[:, :NAI] = rnd(y * ctx.sm(slot, "in_s", NAI)) if ap.in_scaled else rnd(y)
     qn = ctx.sm(slot, "qn")
     kn = ctx.sm(slot, "kn")
     half = ROT // 2

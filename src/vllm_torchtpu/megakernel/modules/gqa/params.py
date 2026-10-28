@@ -79,6 +79,8 @@ class GQAParams:
     theta: float
     zero_centered_norm: bool
     rope_fp32: bool = False
+    in_scaled: bool = True
+    out_scaled: bool = True
 
     def qrow(self, b: int) -> tuple[int, int]:
         return b // self.PB, (b % self.PB) * self.nh
@@ -120,7 +122,15 @@ class GQATunables:
     }
 
 
-def derive_params(g: Any, ex: ExecSpec, plan: Any, tt: GQATunables) -> GQAParams:
+def derive_params(
+    g: Any,
+    ex: ExecSpec,
+    plan: Any,
+    tt: GQATunables,
+    *,
+    in_scaled: bool = True,
+    out_scaled: bool = True,
+) -> GQAParams:
     """`GQAParams` for geometry `g` under `ex` and the module's tunables `tt`."""
     tiles = ex.resolve_tiles(g)
     nh = g.NH // ex.R
@@ -260,6 +270,8 @@ def derive_params(g: Any, ex: ExecSpec, plan: Any, tt: GQATunables) -> GQAParams
         theta=g.theta,
         zero_centered_norm=bool(g.zero_centered_norm),
         rope_fp32=bool(tt.rope_fp32),
+        in_scaled=bool(in_scaled),
+        out_scaled=bool(out_scaled),
     )
 
 

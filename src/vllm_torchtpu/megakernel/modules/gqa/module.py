@@ -27,6 +27,7 @@ from ...decls import (
     KVCacheDecl,
     ModuleBinding,
     ResolvedModuleGeometry,
+    normalize_weight_dtypes,
 )
 from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec
@@ -43,6 +44,7 @@ from .decls import (
     GQA_GEOMETRY_METHODS,
     GQA_OPTIONS,
     GQA_PARAM_NAMES,
+    GQA_WEIGHT_NAMES,
     gqa_cache_decl,
     gqa_hf_params,
     resolve_gqa_binding,
@@ -77,6 +79,7 @@ class GQAModule(Module):
         prefix: str = "self_attn",
         qk_norm: bool = True,
         output_gate: bool = True,
+        weight_dtypes: Mapping[str, str] | None = None,
     ) -> None:
         # `PoolLayout` of the model's paged pools (None: the default page
         # packing `(2, HD // 4, 4, page_size)`, the only one the paged reads use).
@@ -85,7 +88,15 @@ class GQAModule(Module):
         self.prefix = prefix
         self.qk_norm = bool(qk_norm)
         self.output_gate = bool(output_gate)
-        opts = {"qk_norm": self.qk_norm, "output_gate": self.output_gate}
+        self.weight_dtypes = normalize_weight_dtypes(
+            weight_dtypes, GQA_WEIGHT_NAMES, "GQAModule", MegakernelConfigError
+        )
+        opts: dict[str, Any] = {
+            "qk_norm": self.qk_norm,
+            "output_gate": self.output_gate,
+        }
+        if weight_dtypes is not None:
+            opts["weight_dtypes"] = self.weight_dtypes
         self._validate_options(opts)
         self.options = FrozenDict(opts)
 
@@ -121,21 +132,25 @@ class GQAModule(Module):
     def weights(self, g: Any, ex: ExecSpec) -> list[WeightDecl]:
         nh = g.NH // ex.R
         nai = (2 * nh + 2) * g.HD
+        in_dt = FP8 if self.weight_dtypes["att_in"] == "fp8" else BF16
+        out_dt = FP8 if self.weight_dtypes["att_out"] == "fp8" else BF16
         return [
-            WeightDecl("att_in", K=g.H, N=nai, dtype=FP8, stream_ring="static"),
-            WeightDecl("att_out", K=nh * g.HD, N=g.H, dtype=FP8, stream_ring="static"),
+            WeightDecl("att_in", K=g.H, N=nai, dtype=in_dt, stream_ring="static"),
+            WeightDecl(
+                "att_out", K=nh * g.HD, N=g.H, dtype=out_dt, stream_ring="static"
+            ),
         ]
 
     def smalls(self, g: Any, ex: ExecSpec) -> list[SmallField]:
         nh = g.NH // ex.R
         nai = (2 * nh + 2) * g.HD
-        return [
-            SmallField("in_norm", g.H),
-            SmallField("in_s", nai),
-            SmallField("out_s", g.H),
-            SmallField("qn", g.HD),
-            SmallField("kn", g.HD),
-        ]
+        fields = [SmallField("in_norm", g.H)]
+        if self.weight_dtypes["att_in"] == "fp8":
+            fields.append(SmallField("in_s", nai))
+        if self.weight_dtypes["att_out"] == "fp8":
+            fields.append(SmallField("out_s", g.H))
+        fields.extend([SmallField("qn", g.HD), SmallField("kn", g.HD)])
+        return fields
 
     def states(self, g: Any, ex: ExecSpec) -> list[StateDecl]:
         if cache_exec(ex).paged_kv:
@@ -183,7 +198,14 @@ class GQAModule(Module):
     def plan_params(self, g: Any, ex: ExecSpec, plan: Any) -> GQAParams:
         if cache_exec(ex).paged_kv:
             self._check_pool_layout(plan)
-        return derive_params(g, ex, plan, self.tunables(ex))
+        return derive_params(
+            g,
+            ex,
+            plan,
+            self.tunables(ex),
+            in_scaled=(self.weight_dtypes["att_in"] == "fp8"),
+            out_scaled=(self.weight_dtypes["att_out"] == "fp8"),
+        )
 
     def _check_pool_layout(self, plan: Any) -> None:
         """`pool_layout` must give the same pool pages as the model's pool
@@ -264,7 +286,7 @@ class GQAModule(Module):
                 NO = nh * HD
                 scr["xb2"][:, :NO] = scr["mix"][:, :NO].astype(BF16)
                 yo = stream.dmatmul("att_out", scr["xb2"], H)
-        return yo * ctx.sm(slot, "out_s")
+        return yo * ctx.sm(slot, "out_s") if ap.out_scaled else yo
 
     def epilogue(self, ctx: Any) -> None:
         if cache_exec(ctx.ex).FUSED:
@@ -313,6 +335,7 @@ class GQAModule(Module):
             geom,
             qk_norm=self.qk_norm,
             output_gate=self.output_gate,
+            weight_dtypes=self.weight_dtypes,
         )
 
     def cache_decl(self, g: Any = None) -> KVCacheDecl:

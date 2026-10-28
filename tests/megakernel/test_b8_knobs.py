@@ -25,6 +25,7 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 import vllm_torchtpu.megakernel as mk
+from vllm_torchtpu.megakernel.models import qwen35
 
 
 @pytest.fixture(autouse=True)
@@ -354,3 +355,238 @@ def test_moe_col_chunk_h2560() -> None:
     )
     assert report.geometry.H == 1280
     report.assert_passed()
+
+
+class _Qwen35TinyBase(qwen35.Qwen35):
+    """Tiny 2-layer `Qwen35` base for mixed `weight_dtypes` + `hf=True` checks."""
+
+    name = "b8_qwen35_tiny_base"
+    supported_tp_sizes = (2, 8)
+    profiles = {}
+    default_hf_config = {
+        **qwen35.Qwen35.default_hf_config,
+        "vocab_size": 256,
+        "hidden_size": 256,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 256,
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 4,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "num_experts": 128,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 256,
+        "shared_expert_intermediate_size": 256,
+        "layer_types": ["linear_attention", "full_attention"],
+    }
+
+
+class _Bf16DenseModel(_Qwen35TinyBase):
+    """Tiny `Qwen35` with `bf16` dense projections and `fp8` routed experts."""
+
+    name = "b8_bf16_dense"
+    attn = dataclasses.replace(
+        qwen35.Qwen35.attn,
+        options={
+            **qwen35.Qwen35.attn.options,
+            "weight_dtypes": {"att_in": "bf16", "att_out": "bf16"},
+        },
+    )
+    linear = dataclasses.replace(
+        qwen35.Qwen35.linear,
+        options={
+            **qwen35.Qwen35.linear.options,
+            "weight_dtypes": {"lin_in": "bf16", "lin_out": "bf16"},
+        },
+    )
+    moe = dataclasses.replace(
+        qwen35.Qwen35.moe,
+        options={
+            **qwen35.Qwen35.moe.options,
+            "weight_dtypes": {"sh13": "bf16", "sh2": "bf16", "e13": "fp8_channel"},
+        },
+    )
+    schedule = mk.Schedule(
+        mixer=mk.FromHFLayerTypes(
+            "layer_types", {"full_attention": attn, "linear_attention": linear}
+        ),
+        ffn=moe,
+        pre_norm=qwen35.Qwen35.schedule.pre_norm,
+        post_norm=qwen35.Qwen35.schedule.post_norm,
+    )
+
+
+class _GQAOnlyBf16Model(_Qwen35TinyBase):
+    """Mixed policy: GQA `bf16` + GDN `fp8` + MoE `fp8` (shares `in_s`/`out_s`)."""
+
+    name = "b8_gqa_only_bf16"
+    attn = _Bf16DenseModel.attn
+    schedule = mk.Schedule(
+        mixer=mk.FromHFLayerTypes(
+            "layer_types",
+            {"full_attention": attn, "linear_attention": qwen35.Qwen35.linear},
+        ),
+        ffn=qwen35.Qwen35.moe,
+        pre_norm=qwen35.Qwen35.schedule.pre_norm,
+        post_norm=qwen35.Qwen35.schedule.post_norm,
+    )
+
+
+class _GDNOnlyBf16Model(_Qwen35TinyBase):
+    """Mixed policy: GQA `fp8` + GDN `bf16` + MoE `fp8` (shares `in_s`/`out_s`)."""
+
+    name = "b8_gdn_only_bf16"
+    linear = _Bf16DenseModel.linear
+    schedule = mk.Schedule(
+        mixer=mk.FromHFLayerTypes(
+            "layer_types",
+            {"full_attention": qwen35.Qwen35.attn, "linear_attention": linear},
+        ),
+        ffn=qwen35.Qwen35.moe,
+        pre_norm=qwen35.Qwen35.schedule.pre_norm,
+        post_norm=qwen35.Qwen35.schedule.post_norm,
+    )
+
+
+class _Sh13OnlyBf16Model(_Qwen35TinyBase):
+    """Mixed policy: MoE `sh13: bf16` + `sh2: fp8`."""
+
+    name = "b8_sh13_only_bf16"
+    moe = dataclasses.replace(
+        qwen35.Qwen35.moe,
+        options={**qwen35.Qwen35.moe.options, "weight_dtypes": {"sh13": "bf16"}},
+    )
+    schedule = dataclasses.replace(qwen35.Qwen35.schedule, ffn=moe)
+
+
+class _Bf16ExpertsModel(_Qwen35TinyBase):
+    """Policy with `bf16` routed experts (`e13: bf16, e2: bf16`)."""
+
+    name = "b8_bf16_experts"
+    moe = dataclasses.replace(
+        qwen35.Qwen35.moe,
+        options={
+            **qwen35.Qwen35.moe.options,
+            "weight_dtypes": {"e13": "bf16", "e2": "bf16"},
+        },
+    )
+    schedule = dataclasses.replace(qwen35.Qwen35.schedule, ffn=moe)
+
+
+def test_per_weight_dtype_policy() -> None:
+    with pytest.raises(mk.MegakernelConfigError, match="unknown weight"):
+        mk.GQAModule(weight_dtypes={"bad": "bf16"})
+    with pytest.raises(mk.MegakernelConfigError, match="must be 'fp8' or 'bf16'"):
+        mk.GDNModule(weight_dtypes={"lin_in": "int8"})
+    with pytest.raises(mk.MegakernelConfigError, match="share the same weight dtype"):
+        mk.MoEModule(weight_dtypes={"e13": "bf16", "e2": "fp8"})
+
+    g = _Bf16DenseModel.shrink(periods=1, R=2)
+    ex = mk.ExecSpec(
+        R=2,
+        B=4,
+        T=1,
+        ctx=256,
+        tiles=mk.Tiles(
+            bank=512 << 10, nbd=10, nbe=6, ebank=256 << 10, vmem_mib=32
+        ).with_modules({"gqa": {"kv_blk": 256}}),
+        interpret=True,
+        cache=mk.CacheExec(paged_kv=True, num_pages=128, pool_gather=False),
+    )
+    spec = _Bf16DenseModel.to_model_spec(g, R=2)
+    pl = mk.planner.plan(spec, ex)
+
+    # Scale smalls are dropped when dense projections are bf16 passthrough
+    for dropped in ("in_s", "out_s", "sh13_s", "sh2_s"):
+        assert dropped not in pl.smalls_layout
+    for retained in (
+        "in_norm",
+        "post_norm",
+        "qn",
+        "kn",
+        "conv",
+        "alog",
+        "dtb",
+        "gnorm",
+        "sh_gate",
+    ):
+        assert retained in pl.smalls_layout
+    for k_bf16 in ("att_in", "att_out", "lin_in", "lin_out", "sh13", "sh2"):
+        assert jnp.dtype(pl.weight_decls[k_bf16].dtype) == jnp.dtype(jnp.bfloat16)
+    for k_fp8 in ("e13", "e2"):
+        assert jnp.dtype(pl.weight_decls[k_fp8].dtype) == jnp.dtype(jnp.float8_e4m3fn)
+
+    # Mixed policies keep shared smalls names in smalls_layout while module params
+    # track each module's own static scale policy independently
+    pl_gqa_bf16 = mk.planner.plan(_GQAOnlyBf16Model.to_model_spec(g, R=2), ex)
+    assert "in_s" in pl_gqa_bf16.smalls_layout and "out_s" in pl_gqa_bf16.smalls_layout
+    assert not pl_gqa_bf16.module_params["gqa"].in_scaled
+    assert not pl_gqa_bf16.module_params["gqa"].out_scaled
+    assert pl_gqa_bf16.module_params["gdn"].in_scaled
+    assert pl_gqa_bf16.module_params["gdn"].out_scaled
+
+    pl_gdn_bf16 = mk.planner.plan(_GDNOnlyBf16Model.to_model_spec(g, R=2), ex)
+    assert "in_s" in pl_gdn_bf16.smalls_layout and "out_s" in pl_gdn_bf16.smalls_layout
+    assert pl_gdn_bf16.module_params["gqa"].in_scaled
+    assert pl_gdn_bf16.module_params["gqa"].out_scaled
+    assert not pl_gdn_bf16.module_params["gdn"].in_scaled
+    assert not pl_gdn_bf16.module_params["gdn"].out_scaled
+
+    pl_sh13_bf16 = mk.planner.plan(_Sh13OnlyBf16Model.to_model_spec(g, R=2), ex)
+    assert "sh13_s" not in pl_sh13_bf16.smalls_layout
+    assert "sh2_s" in pl_sh13_bf16.smalls_layout
+    assert not pl_sh13_bf16.module_params["moe"].sh13_scaled
+    assert pl_sh13_bf16.module_params["moe"].sh2_scaled
+
+    # Loading an FP8 vLLM checkpoint into a bf16-policy model dequantizes via
+    # slice_alias_targets
+    g_fp8 = _Qwen35TinyBase.shrink(periods=1, R=2)
+    w_hf_fp8 = mk.normalize_hf_for_vllm(
+        _Qwen35TinyBase,
+        ex,
+        mk.random_hf_weights(jax.random.key(3), g_fp8, model_def=_Qwen35TinyBase),
+        g=g_fp8,
+    )
+    src_fp8_vllm = mk.SyntheticVLLMWeightSource(_Qwen35TinyBase, ex, w_hf_fp8, g=g_fp8)
+    loaded_from_fp8 = mk.load_weights(_Bf16DenseModel, ex, src_fp8_vllm, g=g, tp_rank=0)
+    for k_bf16 in ("att_in", "att_out", "lin_in", "lin_out", "sh13", "sh2"):
+        assert jnp.dtype(loaded_from_fp8[k_bf16].dtype) == jnp.dtype(jnp.bfloat16)
+        max_abs = float(jnp.max(jnp.abs(loaded_from_fp8[k_bf16].astype(jnp.float32))))
+        assert max_abs > 0.0
+
+    try:
+        import torch
+        import transformers
+
+        has_tf = hasattr(transformers, "Qwen3_5MoeForCausalLM") and hasattr(
+            torch, "Tensor"
+        )
+    except ImportError:
+        has_tf = False
+
+    for model_cls, t_vals in (
+        (_Bf16DenseModel, (1, 4)),
+        (_GQAOnlyBf16Model, (1,)),
+        (_GDNOnlyBf16Model, (1,)),
+        (_Sh13OnlyBf16Model, (1,)),
+        (_Bf16ExpertsModel, (1,)),
+    ):
+        report = mk.verify_model(
+            model_cls,
+            R=2,
+            B_per_T=2,
+            T_values=t_vals,
+            seed=2,
+            hf=True,
+            approx_profiles=False,
+        )
+        report.assert_passed(allow_skipped=not has_tf)
+        by_name = {c.name: c for c in report.checks}
+        assert by_name["loader_parity"].status == "passed"
+        assert by_name["kernel_vs_reference"].status == "passed"
+        if has_tf:
+            assert by_name["reference_vs_hf"].status == "passed"
+

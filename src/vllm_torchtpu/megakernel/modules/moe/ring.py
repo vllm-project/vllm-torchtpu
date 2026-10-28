@@ -45,6 +45,8 @@ def fetch_e(m: MoEEmit, u, l_idx, t=None):
     bank = u % NBE
 
     def es_copy():
+        if "es" not in W:
+            return
         s = i % NSS
         pltpu.make_async_copy(
             W["es"].at[l_idx, w], scr["es"].at[s], scr["es_sem"].at[s]
@@ -141,6 +143,8 @@ def _unit_meta(m: MoEEmit, u, t):
 
 def _es_start(m: MoEEmit, i, w, l_idx):
     W, mp, scr = m.W, m.mp, m.scr
+    if "es" not in W:
+        return
     NSS = mp.NSS
     s = lax.rem(i, jnp.int32(NSS)) if not isinstance(i, int) else i % NSS
     pltpu.make_async_copy(
@@ -230,6 +234,8 @@ def fetch_loop(m: MoEEmit, nf, l_idx):
 
 def es_wait(m: MoEEmit, i):
     W, mp, sc, scr = m.W, m.mp, m.sc, m.scr
+    if "es" not in W:
+        return
     NSS = mp.NSS
     s = i % NSS
     with sc("swait", 3):

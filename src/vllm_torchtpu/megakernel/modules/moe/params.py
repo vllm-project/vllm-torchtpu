@@ -61,6 +61,8 @@ class MoEParams:
     ecopy_opt: int
     eps: float
     zero_centered_norm: bool
+    sh13_scaled: bool = True
+    sh2_scaled: bool = True
 
 
 @dataclass(frozen=True)
@@ -124,6 +126,8 @@ def derive_moe_params(
     moe_tp: bool,
     e_slots: int,
     module_name: str = "moe",
+    sh13_scaled: bool = True,
+    sh2_scaled: bool = True,
 ) -> MoEParams:
     """Resolve `MoEParams` from model geometry, `ExecSpec`, and `StreamPlan`."""
     tiles = ex.resolve_tiles(g)
@@ -199,4 +203,6 @@ def derive_moe_params(
         ecopy_opt=tt.ecopy_opt,
         eps=g.eps,
         zero_centered_norm=bool(getattr(g, "zero_centered_norm", True)),
+        sh13_scaled=bool(sh13_scaled),
+        sh2_scaled=bool(sh2_scaled),
     )

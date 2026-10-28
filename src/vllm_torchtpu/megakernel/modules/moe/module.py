@@ -30,6 +30,7 @@ from ...decls import (
     HFParamDecl,
     ModuleBinding,
     ResolvedModuleGeometry,
+    normalize_weight_dtypes,
 )
 from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec
@@ -43,6 +44,7 @@ from .decls import (
     MOE_GEOMETRY_METHODS,
     MOE_OPTIONS,
     MOE_PARAM_NAMES,
+    MOE_WEIGHT_NAMES,
     moe_hf_params,
     resolve_moe_binding,
     validate_moe_options,
@@ -75,6 +77,7 @@ class MoEModule(Module):
         shared_gate: bool = True,
         moe_tp: bool | None = None,
         e_slots: int | None = None,
+        weight_dtypes: Mapping[str, str] | None = None,
     ) -> None:
         self.geometry = geometry
         self.prefix = prefix
@@ -91,7 +94,12 @@ class MoEModule(Module):
             if self._explicit_e_slots is not None
             else int(getattr(geometry, "e_slots", 0))
         )
-        self._validate_options({"shared_gate": self.shared_gate})
+        self.weight_dtypes = normalize_weight_dtypes(
+            weight_dtypes, MOE_WEIGHT_NAMES, "MoEModule", MegakernelConfigError
+        )
+        self._validate_options(
+            {"shared_gate": self.shared_gate, "weight_dtypes": weight_dtypes}
+        )
         if geometry is not None:
             self._check_option_consistency(geometry)
         opts: dict[str, Any] = {"shared_gate": self.shared_gate}
@@ -99,6 +107,8 @@ class MoEModule(Module):
             opts["moe_tp"] = self.moe_tp
         if self._explicit_e_slots is not None or geometry is not None:
             opts["e_slots"] = self.e_slots
+        if weight_dtypes is not None:
+            opts["weight_dtypes"] = self.weight_dtypes
         self.options = FrozenDict(opts)
 
     def _check_option_consistency(self, g: Any) -> tuple[bool, int]:
@@ -164,15 +174,19 @@ class MoEModule(Module):
         ir = g.I // ex.R if moe_tp else g.I
         ew = e_slots if e_slots > 0 else (g.E if moe_tp else er)
         layout_e = "stacked" if ex.stack_e else "per_layer"
-        return [
+        sh13_dt = FP8 if self.weight_dtypes["sh13"] == "fp8" else BF16
+        sh2_dt = FP8 if self.weight_dtypes["sh2"] == "fp8" else BF16
+        e13_dt = FP8 if self.weight_dtypes["e13"] == "fp8" else BF16
+        e2_dt = FP8 if self.weight_dtypes["e2"] == "fp8" else BF16
+        w_list = [
             WeightDecl("router", K=g.H, N=g.E, dtype=BF16, stream_ring="static"),
-            WeightDecl("sh13", K=g.H, N=2 * isr, dtype=FP8, stream_ring="static"),
-            WeightDecl("sh2", K=isr, N=g.H, dtype=FP8, stream_ring="static"),
+            WeightDecl("sh13", K=g.H, N=2 * isr, dtype=sh13_dt, stream_ring="static"),
+            WeightDecl("sh2", K=isr, N=g.H, dtype=sh2_dt, stream_ring="static"),
             WeightDecl(
                 "e13",
                 K=g.H,
                 N=2 * ir,
-                dtype=FP8,
+                dtype=e13_dt,
                 stream_ring="dynamic",
                 layout=layout_e,
                 lead_dims=(ew,),
@@ -181,32 +195,36 @@ class MoEModule(Module):
                 "e2",
                 K=ir,
                 N=g.H,
-                dtype=FP8,
+                dtype=e2_dt,
                 stream_ring="dynamic",
                 layout=layout_e,
                 lead_dims=(ew,),
             ),
-            WeightDecl(
-                "es",
-                K=1,
-                N=2 * ir + g.H,
-                dtype=F32,
-                stream_ring="hbm",
-                lead_dims=(ew,),
-                fuse_from=("e13_s", "e2_s"),
-            ),
         ]
+        if self.weight_dtypes["e13"] == "fp8":
+            w_list.append(
+                WeightDecl(
+                    "es",
+                    K=1,
+                    N=2 * ir + g.H,
+                    dtype=F32,
+                    stream_ring="hbm",
+                    lead_dims=(ew,),
+                    fuse_from=("e13_s", "e2_s"),
+                )
+            )
+        return w_list
 
     def smalls(self, g: Any, ex: ExecSpec) -> list[SmallField]:
         moe_tp, e_slots = self._check_option_consistency(g)
         er = g.E // ex.R
         isr = g.IS // ex.R
-        fields = [
-            SmallField("post_norm", g.H),
-            SmallField("sh13_s", 2 * isr),
-            SmallField("sh2_s", g.H),
-            SmallField("sh_gate", g.H),
-        ]
+        fields = [SmallField("post_norm", g.H)]
+        if self.weight_dtypes["sh13"] == "fp8":
+            fields.append(SmallField("sh13_s", 2 * isr))
+        if self.weight_dtypes["sh2"] == "fp8":
+            fields.append(SmallField("sh2_s", g.H))
+        fields.append(SmallField("sh_gate", g.H))
         if not moe_tp and e_slots > er:
             fields.append(SmallField("ecopy", g.E))
         return fields
@@ -228,6 +246,8 @@ class MoEModule(Module):
             moe_tp=moe_tp,
             e_slots=e_slots,
             module_name=self.name,
+            sh13_scaled=(self.weight_dtypes["sh13"] == "fp8"),
+            sh2_scaled=(self.weight_dtypes["sh2"] == "fp8"),
         )
 
     def scratch(self, g: Any, ex: ExecSpec, plan: Any) -> dict[str, Any]:
@@ -241,10 +261,11 @@ class MoEModule(Module):
             "elist": pltpu.SMEM((nb_picks,), I32),
             "seen": pltpu.SMEM((8, 128), I32),
             "misc_sem": pltpu.SemaphoreType.DMA(()),
-            "es": pltpu.VMEM((mp.NSS, 1, 2 * mp.IR + mp.H), F32),
-            "es_sem": pltpu.SemaphoreType.DMA((mp.NSS,)),
             "st": pltpu.SMEM((1,), I32),
         }
+        if "es" in plan.hbm_weights:
+            scr["es"] = pltpu.VMEM((mp.NSS, 1, 2 * mp.IR + mp.H), F32)
+            scr["es_sem"] = pltpu.SemaphoreType.DMA((mp.NSS,))
         if mp.PIPE_EP:
             scr["acc13"] = pltpu.VMEM((ex.MB, 2 * mp.IR), F32)
         if mp.ECOPY:
@@ -337,11 +358,14 @@ class MoEModule(Module):
                 n_hit = route(m, l, pexp)
             with sc("moe_shared"):
                 g13 = stream.dmatmul("sh13", scr["xb"], 2 * ISR)
-                g13 = g13 * ctx.sm(slot, "sh13_s")
+                if mp.sh13_scaled:
+                    g13 = g13 * ctx.sm(slot, "sh13_s")
                 mid = rnd(rnd(jax.nn.silu(rnd(g13[:, :ISR]))) * rnd(g13[:, ISR:]))
                 scr["xb2"][:, :ISR] = mid.astype(BF16)
                 ysh = stream.dmatmul("sh2", scr["xb2"], H)
-                scr["part"][...] = ysh * ctx.sm(slot, "sh2_s") * scr["sg"][:, 0:1]
+                if mp.sh2_scaled:
+                    ysh = ysh * ctx.sm(slot, "sh2_s")
+                scr["part"][...] = ysh * scr["sg"][:, 0:1]
             with sc("moe_experts"):
                 if PIPE:
                     experts_piped(m, l, n_hit)
@@ -359,6 +383,7 @@ class MoEModule(Module):
             geom,
             shared_gate=self.shared_gate,
             moe_tp=moe_tp,
+            weight_dtypes=self.weight_dtypes,
         )
 
     def cache_decl(self, g: Any = None) -> None:

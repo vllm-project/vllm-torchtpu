@@ -23,7 +23,7 @@ import jax.numpy as jnp
 from jax import lax
 
 from ...exec_spec import ExecSpec
-from ...ops import BF16, F32, rnd
+from ...ops import BF16, F32, FP8, rnd
 
 
 def moe_reference(
@@ -72,42 +72,67 @@ def moe_reference(
 
     sh13_all = params["sh13"]
     sh13_l = sh13_all[:, layer_idx] if sh13_all.ndim == 4 else sh13_all
-    sh13_s_all = params["sh13_s"]
-    sh13_s_l = sh13_s_all[:, layer_idx] if sh13_s_all.ndim == 3 else sh13_s_all
+    sh13_s_all = (
+        params.get("sh13_s") if jnp.dtype(sh13_all.dtype) == jnp.dtype(FP8) else None
+    )
+    sh13_s_l = (
+        None
+        if sh13_s_all is None
+        else (sh13_s_all[:, layer_idx] if sh13_s_all.ndim == 3 else sh13_s_all)
+    )
     sh2_all = params["sh2"]
     sh2_l = sh2_all[:, layer_idx] if sh2_all.ndim == 4 else sh2_all
-    sh2_s_all = params["sh2_s"]
-    sh2_s_l = sh2_s_all[:, layer_idx] if sh2_s_all.ndim == 3 else sh2_s_all
+    sh2_s_all = (
+        params.get("sh2_s") if jnp.dtype(sh2_all.dtype) == jnp.dtype(FP8) else None
+    )
+    sh2_s_l = (
+        None
+        if sh2_s_all is None
+        else (sh2_s_all[:, layer_idx] if sh2_s_all.ndim == 3 else sh2_s_all)
+    )
 
     e13_all = params["e13"]
     e13_l_all = e13_all[:, layer_idx] if e13_all.ndim == 5 else e13_all
-    e13_s_all = params["e13_s"]
-    e13_s_l_all = e13_s_all[:, layer_idx] if e13_s_all.ndim == 4 else e13_s_all
+    e13_s_all = (
+        params.get("e13_s") if jnp.dtype(e13_all.dtype) == jnp.dtype(FP8) else None
+    )
+    e13_s_l_all = (
+        None
+        if e13_s_all is None
+        else (e13_s_all[:, layer_idx] if e13_s_all.ndim == 4 else e13_s_all)
+    )
     e2_all = params["e2"]
     e2_l_all = e2_all[:, layer_idx] if e2_all.ndim == 5 else e2_all
-    e2_s_all = params["e2_s"]
-    e2_s_l_all = e2_s_all[:, layer_idx] if e2_s_all.ndim == 4 else e2_s_all
+    e2_s_all = params.get("e2_s") if jnp.dtype(e2_all.dtype) == jnp.dtype(FP8) else None
+    e2_s_l_all = (
+        None
+        if e2_s_all is None
+        else (e2_s_all[:, layer_idx] if e2_s_all.ndim == 4 else e2_s_all)
+    )
 
     moe_partials = []
     for r in range(R):
         sh_gate = sh_gate_l[r]
         sg = jax.nn.sigmoid(jnp.sum(x_moe * sh_gate[None, :], axis=-1, keepdims=True))
         w_sh13 = sh13_l[r].astype(F32)
-        sh13_s = sh13_s_l[r]
-        g13 = (xb_moe @ w_sh13) * sh13_s
+        g13 = (
+            (xb_moe @ w_sh13) * sh13_s_l[r]
+            if sh13_s_l is not None
+            else (xb_moe @ w_sh13)
+        )
         mid_sh = (
             rnd(rnd(jax.nn.silu(rnd(g13[:, :ISR]))) * rnd(g13[:, ISR:]))
             .astype(BF16)
             .astype(F32)
         )
         w_sh2 = sh2_l[r].astype(F32)
-        sh2_s = sh2_s_l[r]
-        part_r = (mid_sh @ w_sh2) * sh2_s * sg
+        ysh = (mid_sh @ w_sh2) * sh2_s_l[r] if sh2_s_l is not None else (mid_sh @ w_sh2)
+        part_r = ysh * sg
 
         e13_l = e13_l_all[r]
-        e13_s_l = e13_s_l_all[r]
+        e13_s_l = None if e13_s_l_all is None else e13_s_l_all[r]
         e2_l = e2_l_all[r]
-        e2_s_l = e2_s_l_all[r]
+        e2_s_l = None if e2_s_l_all is None else e2_s_l_all[r]
 
         for b in range(B):
             for k in range(TOPK):
@@ -117,15 +142,21 @@ def moe_reference(
                 w_slot = e if is_tp else (e - r * ER)
                 w13_e = e13_l[w_slot].astype(F32)
                 w2_e = e2_l[w_slot].astype(F32)
-                s13 = e13_s_l[w_slot]
-                s2 = e2_s_l[w_slot]
-                h_e = (xb_moe[b : b + 1] @ w13_e) * s13
+                h_e = (
+                    (xb_moe[b : b + 1] @ w13_e) * e13_s_l[w_slot]
+                    if e13_s_l is not None
+                    else (xb_moe[b : b + 1] @ w13_e)
+                )
                 mid_e = (
                     rnd(rnd(jax.nn.silu(rnd(h_e[:, :IR]))) * rnd(h_e[:, IR:]))
                     .astype(BF16)
                     .astype(F32)
                 )
-                y_e = rnd((mid_e @ w2_e) * s2)
+                y_e = (
+                    rnd((mid_e @ w2_e) * e2_s_l[w_slot])
+                    if e2_s_l is not None
+                    else rnd(mid_e @ w2_e)
+                )
                 part_r = part_r.at[b : b + 1].add(top_w[b, k] * y_e)
 
         moe_partials.append(part_r.astype(BF16).astype(F32))
