@@ -251,3 +251,78 @@ def test_patch_gemma4_layer_config():
     )
     assert attn.head_dim == 512
     assert attn.num_kv_heads == 2
+
+
+def test_eager_dp_embed_multimodal_patching():
+    import sys
+    import types
+    from unittest.mock import Mock, patch
+
+    from vllm_torchtpu.models.vllm.gemma4_mm_patch import (
+        _make_eager_dp_embed_multimodal,
+        patch_gemma4_mm_model_classes,
+    )
+
+    # 1. Test _make_eager_dp_embed_multimodal wrapper
+    orig_embed = Mock(return_value=Mock(dim=lambda: 3))
+    wrapped = _make_eager_dp_embed_multimodal(orig_embed)
+
+    # Case A: When cudagraph is active, skip eager sharding
+    model_cg = SimpleNamespace(
+        is_encoder_cudagraph_active=True,
+        use_data_parallel=True,
+    )
+    pixel_mock = Mock(shape=(4, 16))
+    pixel_mock.__getitem__ = lambda self, idx: f"slice_{idx}"
+    wrapped(model_cg, pixel_values=pixel_mock)
+    orig_embed.assert_called_with(model_cg, pixel_values=pixel_mock)
+
+    # Case B: When use_data_parallel is False, skip eager sharding
+    orig_embed.reset_mock()
+    model_no_dp = SimpleNamespace(
+        is_encoder_cudagraph_active=False,
+        use_data_parallel=False,
+    )
+    wrapped(model_no_dp, pixel_values=pixel_mock)
+    orig_embed.assert_called_with(model_no_dp, pixel_values=pixel_mock)
+
+    # Case C: Eager DP mode with tp_size = 2, rank = 1
+    orig_embed.reset_mock()
+    model_dp = SimpleNamespace(
+        is_encoder_cudagraph_active=False,
+        use_data_parallel=True,
+    )
+    dist_mock = types.ModuleType("vllm.distributed")
+    dist_mock.get_tensor_model_parallel_world_size = lambda: 2
+    dist_mock.get_tensor_model_parallel_rank = lambda: 1
+    dist_mock.tensor_model_parallel_all_gather = lambda tensor, dim: (
+        "all_gathered",
+        tensor,
+        dim,
+    )
+
+    with patch.dict(sys.modules, {"vllm.distributed": dist_mock}):
+        result = wrapped(model_dp, pixel_values=pixel_mock)
+        orig_embed.assert_called_once_with(
+            model_dp, pixel_values="slice_slice(2, 4, None)"
+        )
+        assert result[0] == "all_gathered"
+        assert result[2] == 0
+
+    # 2. Test class patching on mock model module
+    mm_mod_mock = types.ModuleType("vllm.model_executor.models.gemma4_mm")
+
+    class MockGemma4:
+        supports_encoder_tp_data = False
+
+        def embed_multimodal(self, *args, **kwargs):
+            return "original_output"
+
+    mm_mod_mock.Gemma4ForConditionalGeneration = MockGemma4
+    with patch.dict(
+        sys.modules, {"vllm.model_executor.models.gemma4_mm": mm_mod_mock}
+    ):
+        patch_gemma4_mm_model_classes()
+        assert MockGemma4.supports_encoder_tp_data is True
+        assert getattr(MockGemma4.embed_multimodal, "_tpu_dp_patched", False)
+

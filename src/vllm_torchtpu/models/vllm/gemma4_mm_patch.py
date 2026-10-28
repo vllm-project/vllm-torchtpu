@@ -34,39 +34,110 @@ _TEXT_ONLY_ARCHITECTURES = {
 _orig_gemma4_layer_config = None
 
 
+def _make_eager_dp_embed_multimodal(orig_embed_multimodal):
+    """Wrap embed_multimodal with eager-mode data-parallel sharding."""
+
+    def patched_embed_multimodal(self, *args, **kwargs):
+        # When EncoderCudaGraphManager is active, the runner handles rank sharding
+        # and output gathering across DP ranks. Avoid redundant local sharding.
+        if getattr(self, "is_encoder_cudagraph_active", False):
+            return orig_embed_multimodal(self, *args, **kwargs)
+
+        use_dp = getattr(self, "use_data_parallel", None)
+        if use_dp is None:
+            mm_config = getattr(
+                getattr(self, "config", None), "multimodal_config", None
+            )
+            if mm_config is not None:
+                use_dp = getattr(mm_config, "mm_encoder_tp_mode", None) == "data"
+            else:
+                use_dp = False
+
+        if not use_dp:
+            return orig_embed_multimodal(self, *args, **kwargs)
+
+        try:
+            from vllm.distributed import (
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+                tensor_model_parallel_all_gather,
+            )
+
+            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank = get_tensor_model_parallel_rank()
+        except (ImportError, AttributeError):
+            tp_size = 1
+            tp_rank = 0
+
+        if tp_size <= 1:
+            return orig_embed_multimodal(self, *args, **kwargs)
+
+        pixel_values = kwargs.get("pixel_values")
+        if (
+            pixel_values is not None
+            and hasattr(pixel_values, "shape")
+            and len(pixel_values.shape) > 0
+        ):
+            num_items = pixel_values.shape[0]
+            items_per_rank = (num_items + tp_size - 1) // tp_size
+            start_idx = min(tp_rank * items_per_rank, num_items)
+            end_idx = min(start_idx + items_per_rank, num_items)
+
+            sharded_kwargs = dict(kwargs)
+            sharded_kwargs["pixel_values"] = pixel_values[start_idx:end_idx]
+
+            local_output = orig_embed_multimodal(self, *args, **sharded_kwargs)
+            if local_output is not None and hasattr(local_output, "dim"):
+                return tensor_model_parallel_all_gather(local_output, dim=0)
+            return local_output
+
+        return orig_embed_multimodal(self, *args, **kwargs)
+
+    setattr(patched_embed_multimodal, "_tpu_dp_patched", True)  # noqa: B010
+    return patched_embed_multimodal
+
+
 def patch_gemma4_mm_model_classes() -> None:
-    """Set supports_encoder_tp_data = True on Gemma4 multimodal model classes."""
-    try:
-        from vllm.model_executor.models.gemma4_mm import (
-            Gemma4ForConditionalGeneration,
-        )
+    """Set supports_encoder_tp_data and eager DP ViT on Gemma4 multimodal classes."""
+    for mod_path, cls_name in (
+        (
+            "vllm.model_executor.models.gemma4_mm",
+            "Gemma4ForConditionalGeneration",
+        ),
+        (
+            "vllm.model_executor.models.gemma4_unified",
+            "Gemma4UnifiedForConditionalGeneration",
+        ),
+    ):
+        try:
+            import sys
 
-        if not getattr(
-            Gemma4ForConditionalGeneration, "supports_encoder_tp_data", False
-        ):
-            Gemma4ForConditionalGeneration.supports_encoder_tp_data = True
-            logger.info(
-                "Applied TPU patch: enabled supports_encoder_tp_data on "
-                "Gemma4ForConditionalGeneration."
-            )
-    except (ImportError, AttributeError):
-        pass
+            mod = sys.modules.get(mod_path)
+            if mod is None:
+                __import__(mod_path)
+                mod = sys.modules.get(mod_path)
+            cls = getattr(mod, cls_name, None)
+            if cls is None:
+                continue
 
-    try:
-        from vllm.model_executor.models.gemma4_unified import (
-            Gemma4UnifiedForConditionalGeneration,
-        )
+            if not getattr(cls, "supports_encoder_tp_data", False):
+                cls.supports_encoder_tp_data = True
+                logger.info(
+                    "Applied TPU patch: enabled supports_encoder_tp_data on %s.",
+                    cls_name,
+                )
 
-        if not getattr(
-            Gemma4UnifiedForConditionalGeneration, "supports_encoder_tp_data", False
-        ):
-            Gemma4UnifiedForConditionalGeneration.supports_encoder_tp_data = True
-            logger.info(
-                "Applied TPU patch: enabled supports_encoder_tp_data on "
-                "Gemma4UnifiedForConditionalGeneration."
-            )
-    except (ImportError, AttributeError):
-        pass
+            orig_embed = getattr(cls, "embed_multimodal", None)
+            if orig_embed is not None and not getattr(
+                orig_embed, "_tpu_dp_patched", False
+            ):
+                cls.embed_multimodal = _make_eager_dp_embed_multimodal(orig_embed)
+                logger.info(
+                    "Applied TPU patch: enabled eager DP ViT on %s.",
+                    cls_name,
+                )
+        except (ImportError, AttributeError):
+            pass
 
 
 def patch_gemma4_attention_init() -> None:
