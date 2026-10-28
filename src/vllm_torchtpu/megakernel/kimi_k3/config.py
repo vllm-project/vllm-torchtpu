@@ -11,6 +11,7 @@ the standalone tools install overrides before building the program.
 import dataclasses
 import hashlib
 import json
+import os
 from typing import Any
 
 from vllm_torchtpu.megakernel.config import set_active_kernel_config
@@ -63,6 +64,12 @@ class KernelConfig:
     # Prefix keys in mla_flash_ktile tiles and a whole-window query tile under
     # mla_flash_qtile rows (False: the window's key tile, as before).
     mla_flash_prefix_tiles: bool = True
+    # Cached-prefix attention in FP8 (E4M3FN keys/values from the expansion, FP8
+    # queries, probabilities x16 in E4M3FN, FP32 statistics); the window's own
+    # keys stay BF16. K3_PREFILL_PREFIX_FP8=1 turns it on.
+    prefill_prefix_fp8: bool = dataclasses.field(
+        default_factory=lambda: os.environ.get("K3_PREFILL_PREFIX_FP8", "") == "1"
+    )
     # Prefill MoE expert parallelism: 8 (EP8/TP4, the pre-shard layout), 16
     # (EP16/TP2: 56 experts, TP2 within the chip) or 32 (28 whole experts);
     # 16 and 32 regroup the EP8 group's shards at load.
