@@ -1017,6 +1017,8 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
 
     def forward(self, input_ids, positions, inputs_embeds=None, **kwargs):
+        if envs.VLLM_TPU_QSA_MTP_UNION_STATS >= 0:
+            self._log_mtp_union_stats()
         # The route reads the padded bucket size outside both compiled graphs.
         if self.model_sp is None:
             return self.model(input_ids, positions, inputs_embeds, **kwargs)
@@ -1026,6 +1028,23 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
                 return self.model_sp(input_ids, positions, inputs_embeds, **kwargs)
         with bucket_filter.serving(bucket_filter.assigned(self.model)):
             return self.model(input_ids, positions, inputs_embeds, **kwargs)
+
+    def _log_mtp_union_stats(self):
+        """Debug only: print the verify rows' selection overlap (outside the graph)."""
+        self._mtp_union_calls = getattr(self, "_mtp_union_calls", 0) + 1
+        if self._mtp_union_calls % max(envs.VLLM_TPU_QSA_MTP_UNION_STATS_EVERY, 1):
+            return
+        from vllm_torchtpu.kernels.qwen4_exp.mtp_union_stats import (
+            format_mtp_union_stats,
+        )
+
+        for name, buffer in self.named_buffers():
+            if name.endswith("mtp_union_stats"):
+                values = buffer.cpu().tolist()
+                print(
+                    f"qsa mtp union stats {name}: {format_mtp_union_stats(values)}",
+                    flush=True,
+                )
 
     def embed_input_ids(self, input_ids):
         return self.model.embed_tokens(input_ids)

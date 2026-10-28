@@ -290,6 +290,29 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         # Set by a module whose graph is traced once for every token bucket (the
         # MTP draft): ops must not choose their structure by the token count.
         self.single_graph = False
+        # Debug only (VLLM_TPU_QSA_MTP_UNION_STATS = this layer's index): the
+        # verify rows' selection overlap per request, accumulated on device.
+        self._mtp_union_op = None
+        import re
+
+        layer = re.search(r"(?<!mtp\.)layers\.(\d+)\.", prefix)
+        if (
+            envs.VLLM_TPU_QSA_MTP_UNION_STATS >= 0
+            and layer is not None
+            and "mtp" not in prefix
+            and int(layer.group(1)) == envs.VLLM_TPU_QSA_MTP_UNION_STATS
+        ):
+            from vllm_torchtpu.kernels.qwen4_exp.mtp_union_stats import (
+                STATS,
+                build_mtp_union_stats_op,
+            )
+
+            self._mtp_union_op = build_mtp_union_stats_op()
+            self.register_buffer(
+                "mtp_union_stats",
+                torch.zeros(STATS, dtype=torch.int32, device=device),
+                persistent=False,
+            )
         kv_size = min(tp_size, self.total_num_kv_heads)
         kv_rank = tp_rank // max(tp_size // self.total_num_kv_heads, 1)
         with torch.device(device or "cpu"), set_default_torch_dtype(torch.bfloat16):
@@ -771,6 +794,14 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             picked = rows.clamp_min(0)
             output = torch.where(keep, output[picked], 0)
             selected = torch.where(keep, selected[picked], -1)
+        if getattr(self, "_mtp_union_op", None) is not None and rows is None:
+            self.mtp_union_stats.copy_(
+                self._mtp_union_op(
+                    selected,
+                    metadata.query_start_loc.to(torch.int32),
+                    self.mtp_union_stats,
+                )
+            )
         sink = getattr(self, "_selection_sink", None)
         if sink is not None and rows is None:
             # The target's selection for the MTP draft (bind_shared_selection).

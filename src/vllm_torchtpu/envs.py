@@ -109,6 +109,8 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_COMPACT_SCHEDULE: bool = False
     VLLM_TPU_QSA_DECODE_RPA_BKV: int = 256
     VLLM_TPU_QSA_DECODE_POOL_PAGE_TABLE: bool = False
+    VLLM_TPU_QSA_MTP_UNION_STATS: int = -1
+    VLLM_TPU_QSA_MTP_UNION_STATS_EVERY: int = 500
     VLLM_TPU_QSA_DECODE_POOL_PAGE_DMA: bool = False
     VLLM_TPU_QSA_INDEXER_SC_BOUNDED_COPY: bool = False
     VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY: bool = False
@@ -637,6 +639,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # query window instead of several serial ones. Same pages, same order.
     "VLLM_TPU_QSA_DECODE_POOL_PAGE_TABLE": env_bool(
         "VLLM_TPU_QSA_DECODE_POOL_PAGE_TABLE", default=False
+    ),
+    # Debug only: QSA layer index whose decode/verify steps accumulate the MTP
+    # rows' selection overlap (union vs per-row groups), printed every
+    # VLLM_TPU_QSA_MTP_UNION_STATS_EVERY forward calls. -1: off.
+    "VLLM_TPU_QSA_MTP_UNION_STATS": lambda: int(
+        os.getenv("VLLM_TPU_QSA_MTP_UNION_STATS", "-1")
+    ),
+    "VLLM_TPU_QSA_MTP_UNION_STATS_EVERY": lambda: int(
+        os.getenv("VLLM_TPU_QSA_MTP_UNION_STATS_EVERY", "500")
     ),
     # With the pool-page table: when the decode KV block holds whole pool
     # pages (VLLM_TPU_QSA_DECODE_KV_BLOCK a multiple of 13 kernel pages x 32
