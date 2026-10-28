@@ -465,7 +465,9 @@ def _wo_a_pipelined(
         grid=(num_groups // groups_per_step,),
         in_specs=[hbm, hbm, vmem, vmem],
         out_specs=hbm,
-        out_shape=jax.ShapeDtypeStruct((num_tokens, out_features), x.dtype),
+        # Pinned: with the small VMEM limit XLA would otherwise place the 16 MB
+        # output in VMEM and pay a copy back to HBM for the consumer.
+        out_shape=pltpu.HBM((num_tokens, out_features), x.dtype),
         scratch_shapes=[
             *scratch,
             *[pltpu.SemaphoreType.DMA((2,))] * 3,
