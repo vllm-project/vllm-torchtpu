@@ -18,11 +18,14 @@ import functools
 import jax
 import torch
 from torch_tpu._internal import pallas
+from vllm.models.qwen4_exp.common.hyperconnection import GroupedGemmaRMSNorm
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.qwen4_exp.ple import (
     decode_embeddings,
     resident_lookup_raw,
 )
+from vllm_torchtpu.kernels.qwen4_exp.ple_gate import normalized_gate_dot
 from vllm_torchtpu.kernels.qwen4_exp.pool import pooled_short_conv
 
 
@@ -78,3 +81,76 @@ def build_pooled_short_conv_op(dilation, state_len):
         return output
 
     return run
+
+
+@functools.cache
+def build_normalized_gate_dot_op(streams: int):
+    def fn(
+        key: jax.Array,
+        query: jax.Array,
+        key_inv: jax.Array,
+        query_inv: jax.Array,
+        key_weight: jax.Array,
+        query_weight: jax.Array,
+    ) -> jax.Array:
+        return normalized_gate_dot(
+            key,
+            query,
+            key_inv,
+            query_inv,
+            key_weight,
+            query_weight,
+            streams=streams,
+        )
+
+    op = pallas.jax_op(f"qwen4_exp::ple_gate_dot_s{streams}", fn)
+
+    @op.register_fake
+    def fake(key, query, key_inv, query_inv, key_weight, query_weight):
+        return key.new_empty((key.shape[0], streams), dtype=torch.bfloat16)
+
+    @op.register_kernel("cpu")
+    def cpu(key, query, key_inv, query_inv, key_weight, query_weight):
+        raise NotImplementedError("The fused PLE gate requires TPU tensors")
+
+    return op
+
+
+def build_normalized_gate_dot_dispatch(streams: int, hidden: int):
+    """Select the PLE gate implementation when the layer is constructed."""
+    if not envs.TPU_PLE_FUSED_GATE:
+
+        def dot(
+            key: torch.Tensor,
+            query: torch.Tensor,
+            norm_key: GroupedGemmaRMSNorm,
+            norm_query: GroupedGemmaRMSNorm,
+        ) -> torch.Tensor:
+            key = norm_key(key).unflatten(-1, (streams, hidden))
+            query = norm_query(query).unflatten(-1, (streams, hidden))
+            return (key * query).float().sum(dim=-1, keepdim=True).to(key.dtype)
+
+        return dot
+
+    native = build_normalized_gate_dot_op(streams)
+
+    def inverse_rms(raw: torch.Tensor, norm: GroupedGemmaRMSNorm) -> torch.Tensor:
+        grouped = raw.float().unflatten(-1, (streams, hidden))
+        return torch.rsqrt(grouped.square().mean(dim=-1) + norm.variance_epsilon)
+
+    def dispatch(
+        key: torch.Tensor,
+        query: torch.Tensor,
+        norm_key: GroupedGemmaRMSNorm,
+        norm_query: GroupedGemmaRMSNorm,
+    ) -> torch.Tensor:
+        return native(
+            key,
+            query,
+            inverse_rms(key, norm_key),
+            inverse_rms(query, norm_query),
+            norm_key.weight,
+            norm_query.weight,
+        ).unsqueeze(-1)
+
+    return dispatch
