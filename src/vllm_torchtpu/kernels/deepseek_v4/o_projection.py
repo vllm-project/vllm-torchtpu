@@ -230,6 +230,11 @@ WO_A_PREP_ROWS = 64
 WO_A_MIN_TOKENS = 512
 # VMEM Mosaic needs beyond the scratch buffers (the f32 dot result, spills).
 WO_A_VMEM_HEADROOM_BYTES = 8388608  # 8 MiB
+# Tokens per cos/sin cache gather check: one DMA when their positions are
+# consecutive, one per token otherwise.
+WO_A_GATHER_RUN = 32
+# Independent min chains in the scalar consecutiveness check of a gather run.
+WO_A_GATHER_CHAINS = 4
 
 
 def _pipelined_rows(num_tokens: int) -> int | None:
@@ -237,19 +242,25 @@ def _pipelined_rows(num_tokens: int) -> int | None:
     rows = min(WO_A_ROWS, num_tokens)
     if num_tokens < WO_A_MIN_TOKENS or num_tokens % rows or rows % WO_A_PREP_ROWS:
         return None
+    assert (
+        WO_A_GATHER_RUN > WO_A_GATHER_CHAINS and WO_A_PREP_ROWS % WO_A_GATHER_RUN == 0
+    )
     return rows
 
 
 def _pipelined_kernel(
+    # scalar prefetch
+    positions_ref: jax.Ref,  # SMEM (T,) int32
     # inputs
     x_hbm_ref: jax.Ref,  # HBM (T, G * H, head_dim) bf16
     w_hbm_ref: jax.Ref,  # HBM (D, G * R) fp8
     scale_hbm_ref: jax.Ref,  # HBM (1, G * R) f32
-    cos_sin_hbm_ref: jax.Ref,  # HBM (T, 2 * LANE) f32
+    cos_sin_cache_hbm_ref: jax.Ref,  # HBM (max_position, rotary_dim) f32
     # output
     out_hbm_ref: jax.Ref,  # HBM (T, G * R) bf16
     # scratch
     scale_ref: jax.Ref,  # (1, G * R) f32
+    cos_sin_rows_ref: jax.Ref,  # (T, rotary_dim) f32, the gathered cache rows
     cos_sin_ref: jax.Ref,  # (T, 2 * LANE) f32
     x_buf: jax.Ref,  # (2, rows, H, head_dim) bf16
     x_q_ref: jax.Ref,  # (2, rows, D) fp8
@@ -260,11 +271,13 @@ def _pipelined_kernel(
     w_sems: jax.Ref,  # (2,) DMA
     out_sems: jax.Ref,  # (2,) DMA
     x0_sems: jax.Ref,  # (rows // WO_A_PREP_ROWS,) DMA, block 0's sub-chunks
-    const_sems: jax.Ref,  # (2,) DMA, scale and cos_sin
+    const_sems: jax.Ref,  # (1,) DMA, scale
+    cos_sin_sems: jax.Ref,  # (T // WO_A_PREP_ROWS,) DMA, cache rows per sub-chunk
     *,
     num_groups: int,
     groups_per_step: int,
     head_dim: int,
+    inverse: bool,
 ) -> None:
     """``_kernel`` with quantize_activations, by row blocks of ``rows`` tokens.
 
@@ -275,7 +288,9 @@ def _pipelined_kernel(
     step holds an even number of blocks, so every slot index is static and the
     scheduler can tell the two x_q slots apart. DMA waits and branches sit only
     at segment tops; each segment's output DMA starts at its end, since a DMA
-    start orders the memory ops around it.
+    start orders the memory ops around it. Grid step 0 also does
+    gather_cos_sin's work: it gathers the cache rows of ``positions`` and
+    widens them into cos_sin_ref, a sub-chunk ahead of each block-0 prep.
     """
     num_tokens = cos_sin_ref.shape[0]
     _, rows, heads, _ = x_buf.shape
@@ -285,6 +300,7 @@ def _pipelined_kernel(
     num_steps = num_groups // groups_per_step
     total = num_groups * blocks
     prep_rows = WO_A_PREP_ROWS
+    run = WO_A_GATHER_RUN
     step = pl.program_id(0)
 
     def locate(l):
@@ -322,14 +338,61 @@ def _pipelined_kernel(
             out_sems.at[slot],
         )
 
-    def prep(r, slot, sub_copies=()):
+    def gather(chunk):
+        """Start the cache row copies of tokens [chunk * run, + run): one copy
+        when their positions are consecutive, one per token otherwise."""
+        row0 = chunk * run
+        # Strictly increasing and spanning run - 1 means consecutive. The min
+        # step is taken in a few independent chains: few live registers.
+        pos = [positions_ref[row0 + i] for i in range(run)]
+        p0 = pos[0]
+        chains = [pos[i + 1] - pos[i] for i in range(WO_A_GATHER_CHAINS)]
+        for i in range(WO_A_GATHER_CHAINS, run - 1):
+            k = i % WO_A_GATHER_CHAINS
+            chains[k] = jnp.minimum(chains[k], pos[i + 1] - pos[i])
+        consecutive = jnp.logical_and(
+            functools.reduce(jnp.minimum, chains) >= 1, pos[-1] - p0 == run - 1
+        )
+        sem = cos_sin_sems.at[row0 // prep_rows]
+
+        @pl.when(consecutive)
+        def _():
+            pltpu.make_async_copy(
+                cos_sin_cache_hbm_ref.at[pl.ds(p0, run)],
+                cos_sin_rows_ref.at[pl.ds(row0, run)],
+                sem,
+            ).start()
+
+        @pl.when(jnp.logical_not(consecutive))
+        def _():
+            @pl.loop(0, run)
+            def _(i):
+                pltpu.make_async_copy(
+                    cos_sin_cache_hbm_ref.at[positions_ref[row0 + i]],
+                    cos_sin_rows_ref.at[row0 + i],
+                    sem,
+                ).start()
+
+    def expand(s):
+        """gather_cos_sin's lane expansion of sub-chunk s's rows, once landed."""
+        sub = pl.ds(s * prep_rows, prep_rows)
+        rows_ref = cos_sin_rows_ref.at[sub]
+        pltpu.make_async_copy(rows_ref, rows_ref, cos_sin_sems.at[s]).wait()
+        cos, sin = _cos_sin_lanes(
+            rows_ref[...], rotary_dim=cos_sin_rows_ref.shape[1], inverse=inverse
+        )
+        cos_sin_ref[sub] = jnp.concatenate([cos, sin], axis=-1).astype(
+            cos_sin_ref.dtype
+        )
+
+    def prep(r, slot, sub_ready=None):
         """RoPE + per-row quantize of the x block in ``slot`` (row block r),
-        each sub-chunk after its copy in ``sub_copies``, if given."""
+        each sub-chunk after ``sub_ready(s)``, if given."""
         lo = head_dim - LANE
         for s in range(rows // prep_rows):
             sub = pl.ds(s * prep_rows, prep_rows)
-            if sub_copies:
-                sub_copies[s].wait()
+            if sub_ready is not None:
+                sub_ready(s)
             cos_sin = cos_sin_ref[pl.ds(r * rows + s * prep_rows, prep_rows)]
             # _rotate_gptj's sign is +-1, so folding it into sin is exact.
             cos, sin = cos_sin[:, :LANE], cos_sin[:, LANE:] * _gptj_sign()
@@ -365,15 +428,12 @@ def _pipelined_kernel(
 
     @pl.when(step == 0)
     def _():
-        # scale and cos_sin are fetched here, beside block 0, rather than
-        # staged in VMEM by XLA copies ahead of the call.
+        # scale is fetched here, beside block 0, rather than staged in VMEM by
+        # an XLA copy ahead of the call.
         scale_copy = pltpu.make_async_copy(scale_hbm_ref, scale_ref, const_sems.at[0])
-        cos_sin_copy = pltpu.make_async_copy(
-            cos_sin_hbm_ref, cos_sin_ref, const_sems.at[1]
-        )
-        cos_sin_copy.start()
         scale_copy.start()
-        # Block 0 by sub-chunks, so its prep starts after the first one lands.
+        # Block 0 by sub-chunks, so its prep starts after the first one lands,
+        # each one's cache rows requested just ahead of it.
         sub_copies = [
             pltpu.make_async_copy(
                 x_hbm_ref.at[pl.ds(s * prep_rows, prep_rows), pl.ds(0, heads)],
@@ -382,12 +442,22 @@ def _pipelined_kernel(
             )
             for s in range(rows // prep_rows)
         ]
-        for copy in sub_copies:
+        for s, copy in enumerate(sub_copies):
+            for chunk in range(s * prep_rows // run, (s + 1) * prep_rows // run):
+                gather(chunk)
             copy.start()
         w_copy(0).start()
+        if num_tokens > rows:
+            pl.loop(rows // run, num_tokens // run)(gather)
         x_copy(*locate(1)).start()
-        cos_sin_copy.wait()
-        prep(0, 0, sub_copies)
+
+        def sub_ready(s):
+            sub_copies[s].wait()
+            expand(s)
+
+        prep(0, 0, sub_ready)
+        for s in range(rows // prep_rows, num_tokens // prep_rows):
+            expand(s)
         scale_copy.wait()
 
     for l in range(per_step):
@@ -441,22 +511,29 @@ def _pipelined_kernel(
 
 def _wo_a_pipelined(
     x: jax.Array,  # [T, G * H, head_dim] bf16
+    positions: jax.Array,  # [T] int
+    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
     wo_a: jax.Array,  # [D, G * R] fp8
     wo_a_scale: jax.Array,  # [G * R] float32
-    cos_sin: jax.Array,  # [T, 2 * LANE] float32
     *,
+    inverse: bool,
     rows: int,
     name: str,
 ) -> jax.Array:
     num_tokens, num_heads, head_dim = x.shape
     reduction, out_features = wo_a.shape
+    assert reduction == SUBLANE * head_dim and num_heads % SUBLANE == 0
     num_groups = num_heads // SUBLANE
     lora_rank = out_features // num_groups
+    rotary_dim = cos_sin_cache.shape[1]
+    assert positions.shape == (num_tokens,)
+    assert rotary_dim % 2 == 0 and rotary_dim <= LANE
     groups_per_step = 1 if (num_tokens // rows) % 2 == 0 else 2
     assert num_groups % groups_per_step == 0
     scratch = [
         pltpu.VMEM((1, out_features), jnp.float32),
-        pltpu.VMEM(cos_sin.shape, cos_sin.dtype),
+        pltpu.VMEM((num_tokens, rotary_dim), cos_sin_cache.dtype),
+        pltpu.VMEM((num_tokens, 2 * LANE), jnp.float32),
         pltpu.VMEM((2, rows, SUBLANE, head_dim), x.dtype),
         pltpu.VMEM((2, rows, reduction), wo_a.dtype),
         pltpu.VMEM((2, rows, 1), jnp.float32),
@@ -475,19 +552,24 @@ def _wo_a_pipelined(
             num_groups=num_groups,
             groups_per_step=groups_per_step,
             head_dim=head_dim,
+            inverse=inverse,
         ),
-        grid=(num_groups // groups_per_step,),
-        in_specs=[hbm] * 4,
-        out_specs=hbm,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(num_groups // groups_per_step,),
+            in_specs=[hbm] * 4,
+            out_specs=hbm,
+            scratch_shapes=[
+                *scratch,
+                *[pltpu.SemaphoreType.DMA((2,))] * 3,
+                pltpu.SemaphoreType.DMA((rows // WO_A_PREP_ROWS,)),
+                pltpu.SemaphoreType.DMA((1,)),
+                pltpu.SemaphoreType.DMA((num_tokens // WO_A_PREP_ROWS,)),
+            ],
+        ),
         # Pinned: with the small VMEM limit XLA would otherwise place the 16 MB
         # output in VMEM and pay a copy back to HBM for the consumer.
         out_shape=pltpu.HBM((num_tokens, out_features), x.dtype),
-        scratch_shapes=[
-            *scratch,
-            *[pltpu.SemaphoreType.DMA((2,))] * 3,
-            pltpu.SemaphoreType.DMA((rows // WO_A_PREP_ROWS,)),
-            pltpu.SemaphoreType.DMA((2,)),
-        ],
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
             vmem_limit_bytes=scratch_bytes + WO_A_VMEM_HEADROOM_BYTES,
@@ -497,12 +579,13 @@ def _wo_a_pipelined(
     )(
         # Where their producers wrote them; otherwise XLA may stage them in
         # VMEM with copies ahead of the call.
+        pltpu.with_memory_space_constraint(positions, pltpu.HBM),
         pltpu.with_memory_space_constraint(x, pltpu.HBM),
         wo_a,
         pltpu.with_memory_space_constraint(
             wo_a_scale.reshape(1, out_features), pltpu.HBM
         ),
-        pltpu.with_memory_space_constraint(cos_sin, pltpu.HBM),
+        pltpu.with_memory_space_constraint(cos_sin_cache, pltpu.HBM),
     )
 
 
@@ -566,10 +649,6 @@ def wo_a_projection(
 
     assert cos_sin.ndim == 2 and cos_sin.shape == (num_tokens, 2 * LANE)
     assert head_dim % LANE == 0
-
-    rows = _pipelined_rows(num_tokens)
-    if quantize_activations and tile_t is tile_r is sub_t is None and rows:
-        return _wo_a_pipelined(x, wo_a, wo_a_scale, cos_sin, rows=rows, name=name)
 
     if tile_r is None:
         tile_r = lora_rank
@@ -647,6 +726,19 @@ def fused_reverse_rope_wo_a_projection(
     """``The RoPE-fused ``wo_a_projection``."""
     assert x.ndim == 3
     assert x.shape[2] == head_dim
+
+    rows = _pipelined_rows(x.shape[0])
+    if quantize_activations and tile_t is tile_r is sub_t is None and rows:
+        return _wo_a_pipelined(
+            x,
+            positions,
+            cos_sin_cache,
+            wo_a,
+            wo_a_scale,
+            inverse=inverse,
+            rows=rows,
+            name=name,
+        )
 
     cos_sin = gather_cos_sin(
         positions,
