@@ -319,10 +319,7 @@ def test_eager_dp_embed_multimodal_patching():
             return "original_output"
 
     mm_mod_mock.Gemma4ForConditionalGeneration = MockGemma4
-    with patch.dict(
-        sys.modules, {"vllm.model_executor.models.gemma4_mm": mm_mod_mock}
-    ):
+    with patch.dict(sys.modules, {"vllm.model_executor.models.gemma4_mm": mm_mod_mock}):
         patch_gemma4_mm_model_classes()
         assert MockGemma4.supports_encoder_tp_data is True
         assert getattr(MockGemma4.embed_multimodal, "_tpu_dp_patched", False)
-

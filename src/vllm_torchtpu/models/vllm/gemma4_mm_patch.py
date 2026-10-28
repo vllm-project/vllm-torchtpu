@@ -56,6 +56,7 @@ def _make_eager_dp_embed_multimodal(orig_embed_multimodal):
         if not use_dp:
             return orig_embed_multimodal(self, *args, **kwargs)
 
+        all_gather_fn = None
         try:
             from vllm.distributed import (
                 get_tensor_model_parallel_rank,
@@ -65,11 +66,12 @@ def _make_eager_dp_embed_multimodal(orig_embed_multimodal):
 
             tp_size = get_tensor_model_parallel_world_size()
             tp_rank = get_tensor_model_parallel_rank()
+            all_gather_fn = tensor_model_parallel_all_gather
         except (ImportError, AttributeError):
             tp_size = 1
             tp_rank = 0
 
-        if tp_size <= 1:
+        if tp_size <= 1 or all_gather_fn is None:
             return orig_embed_multimodal(self, *args, **kwargs)
 
         pixel_values = kwargs.get("pixel_values")
@@ -88,7 +90,7 @@ def _make_eager_dp_embed_multimodal(orig_embed_multimodal):
 
             local_output = orig_embed_multimodal(self, *args, **sharded_kwargs)
             if local_output is not None and hasattr(local_output, "dim"):
-                return tensor_model_parallel_all_gather(local_output, dim=0)
+                return all_gather_fn(local_output, dim=0)
             return local_output
 
         return orig_embed_multimodal(self, *args, **kwargs)
