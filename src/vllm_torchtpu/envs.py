@@ -133,6 +133,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_ADAPTIVE_2D_CHANNEL_SCALES: bool = False
+    MOE_ADAPTIVE_AG_LEAD_AXIS: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -1078,6 +1079,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # their own at load time. Squeezing the GMM [E, 1, 1, N] scales in the hot
     # path relayouts both scales of every MoE layer on every forward.
     "MOE_ADAPTIVE_2D_CHANNEL_SCALES": env_bool("MOE_ADAPTIVE_2D_CHANNEL_SCALES"),
+    # All-gather the adaptive fused MoE's FP8 activations over a new leading
+    # axis instead of tiled on the token axis. Same bytes; XLA then gathers
+    # straight into the row-major layout the kernel's token-row DMAs read,
+    # instead of gathering in {2,0,1} and relayouting the whole [T, H/128,
+    # 128] block (~140 us per layer at 8K tokens on tpu7x).
+    "MOE_ADAPTIVE_AG_LEAD_AXIS": env_bool("MOE_ADAPTIVE_AG_LEAD_AXIS"),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its
     # live rows, so one is the ladder off. Zero leaves the choice to the
