@@ -76,6 +76,13 @@ def validate_pcp_manager_config(vllm_config: Any) -> None:
         raise NotImplementedError("PCP x DCP does not support LoRA.")
     if getattr(model_config, "is_multimodal_model", False):
         raise NotImplementedError("PCP x DCP does not support multimodal inputs.")
+    max_model_len = int(model_config.max_model_len)
+    if max_model_len > envs.TPU_PCP_KV_WORKSPACE_TOKENS:
+        raise ValueError(
+            f"max_model_len ({max_model_len}) exceeds "
+            f"TPU_PCP_KV_WORKSPACE_TOKENS ({envs.TPU_PCP_KV_WORKSPACE_TOKENS}); "
+            "raise TPU_PCP_KV_WORKSPACE_TOKENS or lower --max-model-len."
+        )
 
 
 class PcpManager:
@@ -115,8 +122,10 @@ class PcpManager:
     def max_local_num_tokens(self) -> int:
         return self.sharding_plan.max_local_num_tokens
 
-    def num_reqs_in_chunk(self, is_prefilling: Any, capacity: int) -> int:
-        return self.sharding_plan.num_reqs_in_chunk(is_prefilling, capacity)
+    def num_reqs_in_chunk(
+        self, is_prefilling: Any, seq_lens: Any, capacity: int
+    ) -> int:
+        return self.sharding_plan.num_reqs_in_chunk(is_prefilling, seq_lens, capacity)
 
     def set_page_size(self, page_size: int) -> None:
         self.sharding_plan.set_page_size(page_size)

@@ -24,11 +24,13 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.pcp_kv_gather import pcp_chunk_pages
 from vllm_torchtpu.runner.pcp.head_tail_sharding_plan import (
     HeadTailPcpShardingPlan,
     mla_kv_page_size,
 )
+from vllm_torchtpu.runner.pcp.manager import validate_pcp_manager_config
 
 
 def _manager(page_size, workspace_tokens=262144, dcp_size=8):
@@ -103,3 +105,34 @@ def test_mla_kv_page_size_plain_and_uniform_groups():
 def test_mla_kv_page_size_requires_one_size(specs):
     with pytest.raises(ValueError, match="one MLA KV cache block size"):
         mla_kv_page_size(_config(*specs))
+
+
+def _pcp_manager_config(max_model_len):
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            use_mla=True,
+            hf_text_config=SimpleNamespace(index_topk=2048),
+            max_model_len=max_model_len,
+            is_multimodal_model=False,
+        ),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=2,
+            decode_context_parallel_size=8,
+            tensor_parallel_size=4,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            is_moe_model=False,
+            enable_expert_parallel=False,
+        ),
+        speculative_config=None,
+        lora_config=None,
+    )
+
+
+def test_max_model_len_must_fit_the_kv_workspace(monkeypatch):
+    """One request's context must fit the workspace on its own; the runner
+    chunks a step's split prefills to fit it otherwise."""
+    monkeypatch.setattr(envs, "TPU_PCP_KV_WORKSPACE_TOKENS", 1 << 20)
+    validate_pcp_manager_config(_pcp_manager_config(1 << 20))
+    with pytest.raises(ValueError, match="TPU_PCP_KV_WORKSPACE_TOKENS"):
+        validate_pcp_manager_config(_pcp_manager_config((1 << 20) + 1))

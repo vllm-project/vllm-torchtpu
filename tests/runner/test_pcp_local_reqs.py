@@ -25,6 +25,7 @@ import numpy as np
 import pytest
 import torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.runner.pcp.head_tail_sharding_plan import HeadTailPcpShardingPlan
 
 MAX_NUM_SEQS = 8
@@ -107,3 +108,58 @@ def test_local_reqs_fit_the_scaled_bucket(pcp_size, num_prefills):
         assert plan.local_num_split_reqs == 2 * num_prefills
         assert plan.rep_num_reqs == MAX_NUM_SEQS - num_prefills
         assert len(plan.host_metadata["ws_page_offset"]) == target
+
+
+@pytest.fixture
+def small_chunks(monkeypatch):
+    # 2-page gather chunks, so the workspace is not rounded up to 128 pages.
+    monkeypatch.setattr(envs, "TPU_PCP_KV_CHUNK_TOKENS", 1024)
+
+
+def _ws_manager(workspace_tokens):
+    # page 64 x DCP 8: 512-token virtual pages.
+    return HeadTailPcpShardingPlan(
+        pcp_size=2,
+        pcp_rank=0,
+        dcp_size=8,
+        page_size=64,
+        workspace_tokens=workspace_tokens,
+        max_num_batched_tokens=TOKEN_PADDINGS[-1],
+        max_num_seqs=MAX_NUM_SEQS,
+    )
+
+
+@pytest.mark.parametrize(
+    "is_prefilling,seq_lens,expected",
+    [
+        # 3 + 3 + 3 pages of a 8-page workspace: the third prefill waits.
+        ([True, True, True], [1500, 1100, 1300], 2),
+        # Decodes take no workspace.
+        ([False, True, False, True], [9000, 2000, 9000, 2000], 4),
+        # A first request alone always runs.
+        ([True, True], [4096, 1], 1),
+        ([True, True], [4096, 0], 2),
+    ],
+)
+def test_chunk_stops_at_the_kv_workspace(
+    is_prefilling, seq_lens, expected, small_chunks
+):
+    manager = _ws_manager(4096)
+    assert manager.num_ws_pages == 8
+    got = manager.num_reqs_in_chunk(
+        np.asarray(is_prefilling), np.asarray(seq_lens), capacity=64
+    )
+    assert got == expected
+
+
+def test_chunk_keeps_the_request_bucket_limit():
+    manager = _ws_manager(1 << 20)
+    # 5 prefills are 10 local requests, past a bucket of 9.
+    assert manager.num_reqs_in_chunk([True] * 5, [100] * 5, capacity=9) == 4
+
+
+@pytest.mark.parametrize("workspace_tokens", [4096, 4097, 5000, 8191])
+def test_workspace_holds_the_requested_tokens(workspace_tokens, small_chunks):
+    """Rounded up, so a `max_model_len <= workspace_tokens` request fits."""
+    manager = _ws_manager(workspace_tokens)
+    assert manager.num_ws_pages * manager.virtual_page_size >= workspace_tokens

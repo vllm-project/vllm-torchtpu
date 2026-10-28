@@ -128,7 +128,7 @@ Requirements:
 - No speculative decoding, LoRA, pipeline parallelism, data parallelism, or multimodal inputs.
 - MoE models also need `--enable-expert-parallel`.
 
-Sizing: 
+Sizing:
 
-- `TPU_PCP_KV_WORKSPACE_TOKENS` (default `1048576`) must hold the sum of the contexts of all split prefills in one step. 
-- `TPU_PCP_KV_CHUNK_TOKENS` sets the how many tokens we all-gather in each step.
+- `TPU_PCP_KV_WORKSPACE_TOKENS` (default `1048576`): if the split prefill contexts in a step sum to more than this, the runner splits the step into more forwards. Must be at least `--max-model-len`.
+- `TPU_PCP_KV_CHUNK_TOKENS` sets how many tokens are all-gathered in each step.

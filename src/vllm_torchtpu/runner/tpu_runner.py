@@ -492,7 +492,11 @@ SAMPLING_EPS = 1e-5
 
 
 def _compute_num_reqs_in_chunk(
-    runner: Any, start_index: int, num_reqs: int, capacity: int
+    runner: Any,
+    start_index: int,
+    num_reqs: int,
+    capacity: int,
+    num_scheduled_tokens: list[int],
 ) -> int:
     """Number of requests in the chunk starting at `start_index`.
 
@@ -502,6 +506,7 @@ def _compute_num_reqs_in_chunk(
     start_index: first request of this chunk.
     num_reqs: requests in the step.
     capacity: requests the attention metadata holds per forward.
+    num_scheduled_tokens: scheduled tokens of requests `[start_index, num_reqs)`.
     """
     pcp_manager = getattr(runner, "pcp_manager", None)
     if pcp_manager is None:
@@ -510,11 +515,10 @@ def _compute_num_reqs_in_chunk(
         # pcp manager splits a prefill request into head tail chunks, which means
         # num_reqs - start_index is not the local chunks number.
         rows = slice(start_index, num_reqs)
-        is_prefilling = (
-            runner.input_batch.num_computed_tokens_cpu[rows]
-            < runner.input_batch.num_prompt_tokens[rows]
-        )
-        return pcp_manager.num_reqs_in_chunk(is_prefilling, capacity)
+        num_computed = runner.input_batch.num_computed_tokens_cpu[rows]
+        is_prefilling = num_computed < runner.input_batch.num_prompt_tokens[rows]
+        seq_lens = num_computed + np.asarray(num_scheduled_tokens)
+        return pcp_manager.num_reqs_in_chunk(is_prefilling, seq_lens, capacity)
 
 
 def _validate_libtpu_version() -> None:
@@ -3097,7 +3101,7 @@ class TPUModelRunner(GPUModelRunner):
             assert self.num_reqs_most_model_len is not None
             chunk_capacity = self.num_reqs_most_model_len
         chunk_num_reqs = _compute_num_reqs_in_chunk(
-            self, start_index, num_reqs, chunk_capacity
+            self, start_index, num_reqs, chunk_capacity, num_scheduled_tokens_per_req
         )
         num_scheduled_tokens_per_req = num_scheduled_tokens_per_req[:chunk_num_reqs]
         end_index = start_index + chunk_num_reqs
@@ -3716,10 +3720,12 @@ class TPUModelRunner(GPUModelRunner):
         max_chunk_reqs = 0
         while start_index < num_reqs:
             use_max_model_len = self.most_model_len is None
+            num_scheduled_tokens = []
             for i in range(start_index, num_reqs):
                 req_id = self.input_batch.req_ids[i]
                 assert req_id is not None
                 num_tokens = scheduler_output.num_scheduled_tokens[req_id]
+                num_scheduled_tokens.append(num_tokens)
                 if (
                     not use_max_model_len
                     and self.most_model_len is not None
@@ -3733,7 +3739,7 @@ class TPUModelRunner(GPUModelRunner):
                 assert self.num_reqs_most_model_len is not None
                 chunk_reqs = self.num_reqs_most_model_len
             this_chunk_reqs = _compute_num_reqs_in_chunk(
-                self, start_index, num_reqs, chunk_reqs
+                self, start_index, num_reqs, chunk_reqs, num_scheduled_tokens
             )
             max_chunk_reqs = max(max_chunk_reqs, this_chunk_reqs)
             start_index += this_chunk_reqs

@@ -138,9 +138,13 @@ class PcpShardingPlan(ABC):
         split_block_tables: torch.Tensor | None = None,
     ) -> PcpMetadata | None: ...
 
-    def num_reqs_in_chunk(self, is_prefilling: Any, capacity: int) -> int:
+    def num_reqs_in_chunk(
+        self, is_prefilling: Any, seq_lens: Any, capacity: int
+    ) -> int:
         """Requests that fit `capacity` local requests, given whether each is
-        prefilling (a prefill can become `local_reqs_per_req` of them)."""
+        prefilling (a prefill can become `local_reqs_per_req` of them) and its
+        context length after this step (`seq_lens`)."""
+        del seq_lens
         # TODO(weiyulin): Remove once the head and tail chunks share one
         # page table row.
         num_local = 0

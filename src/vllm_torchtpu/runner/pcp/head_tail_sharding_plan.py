@@ -408,7 +408,9 @@ class HeadTailPcpShardingPlan(PcpShardingPlan):
         self.virtual_page_size = self.page_size * self.dcp_size
         # A multiple of `chunk_pages`, so the chunk loop never slices past it.
         chunk_pages = pcp_chunk_pages(self.page_size, self.dcp_size)
-        num_pages = max(1, self._workspace_tokens // self.virtual_page_size)
+        # Rounded up: a request of up to `workspace_tokens` (>= max_model_len,
+        # see `validate_pcp_manager_config`) always fits on its own.
+        num_pages = max(1, -(-self._workspace_tokens // self.virtual_page_size))
         self.num_ws_pages = -(-num_pages // chunk_pages) * chunk_pages
         logger.info(
             "PCP manager KV workspace: page_size=%d, %d workspace pages (%d tokens)",
@@ -416,6 +418,21 @@ class HeadTailPcpShardingPlan(PcpShardingPlan):
             self.num_ws_pages,
             self.num_ws_pages * self.virtual_page_size,
         )
+
+    def num_reqs_in_chunk(
+        self, is_prefilling: Any, seq_lens: Any, capacity: int
+    ) -> int:
+        """Also stop before the split prefills' contexts overflow the KV
+        workspace, so the runner runs the rest as more forwards."""
+        num_reqs = super().num_reqs_in_chunk(is_prefilling, seq_lens, capacity)
+        used_pages = 0
+        for i in range(num_reqs):
+            if not is_prefilling[i]:
+                continue
+            used_pages += -(-int(seq_lens[i]) // self.virtual_page_size)
+            if used_pages > self.num_ws_pages:
+                return max(i, 1)
+        return num_reqs
 
     def request_distribution_counts(
         self, chunk_num_decode: int, num_reqs: int
