@@ -25,6 +25,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# VLLM_TPU_QWEN4_FUSED_PREP_CHECK: log the accumulated mismatches every N checks.
+FUSED_CHECK_LOG_EVERY = 500
+
 
 def ngram_context_from_store(
     token_store, row_indices, context_lens, eos_token_id, ngram_size
@@ -296,7 +299,9 @@ class Qwen4ExpAdapter:
             ]
         return self._recent[0], self._recent[1]
 
-    def _speculative_ngram_context(self, snapshot, history, context, starts):
+    def _speculative_ngram_context(
+        self, snapshot, history, context, starts, current_override=None
+    ):
         """Correct and record n-gram context across speculative steps."""
         runner = self.runner
         rows = starts.shape[0] - 1
@@ -307,6 +312,8 @@ class Qwen4ExpAdapter:
             previous_np[i] = self._previous_rows.get(req_id, -1)
             self._current_rows[req_id] = snapshot.row_start + i
         previous, current = self._recent_buffers(runner.device)
+        if current_override is not None:
+            current = current_override
         history = merge_recent_ngram_context(
             history,
             *previous,
@@ -336,6 +343,9 @@ class Qwen4ExpAdapter:
     def prepare_inputs(self, snapshot):
         if envs.VLLM_TPU_QWEN4_FUSED_PREP and envs.VLLM_TPU_QWEN4_NGRAM_WINDOW != "check":
             return self._prepare_inputs_fused(snapshot)
+        return self._prepare_inputs_eager(snapshot)
+
+    def _prepare_inputs_eager(self, snapshot, current_override=None):
         runner = self.runner
         ctx = runner._attn_metadata_builder_ctx
         starts = ctx.query_start_loc
@@ -384,7 +394,7 @@ class Qwen4ExpAdapter:
             )
         if self.spec_window:
             history = self._speculative_ngram_context(
-                snapshot, history, context, starts
+                snapshot, history, context, starts, current_override
             )
         tables = []
         attention = f"{self.attention_prefix}.self_attn"
@@ -457,9 +467,17 @@ class Qwen4ExpAdapter:
         else:
             store = snapshot.token_store
         state_indices = starts if self.pooled else ctx.mamba_state_indices
+        check = envs.VLLM_TPU_QWEN4_FUSED_PREP_CHECK
+        reference = None
+        if check and snapshot.num_requests:
+            # Reference first, on copies of this step's record: the eager path
+            # as it would run without the flag.
+            clones = tuple(t.clone() for t in current) if current is not None else None
+            reference = (self._prepare_inputs_eager(snapshot, clones), clones)
+        seq_lens = ctx.seq_lens - 1 if check == "fault" else ctx.seq_lens
         context, history, slots, valid_tokens = self._fused_fn()(
             starts,
-            ctx.seq_lens,
+            seq_lens,
             state_indices,
             store,
             self._host_upload(scalars),
@@ -472,6 +490,16 @@ class Qwen4ExpAdapter:
             eos_token_id=self.config.eos_token_id,
             ngram_size=self.config.ngram_size,
         )
+        if reference is not None:
+            self._check_fused(
+                snapshot.num_requests,
+                reference,
+                current,
+                context,
+                history,
+                slots,
+                valid_tokens,
+            )
         tables = self._block_tables(snapshot, rows)
         return dict(
             query_start_loc=starts,
@@ -482,6 +510,40 @@ class Qwen4ExpAdapter:
             main_block_table=tables[0],
             compressed_block_table=tables[1],
         )
+
+    def _check_fused(self, n, reference, current, context, history, slots, valid_tokens):
+        """VLLM_TPU_QWEN4_FUSED_PREP_CHECK=check (``fault``: the fused program
+        reads context - 1, its positive control): on every step with live
+        requests compare the fused outputs and this step's speculative record
+        with the eager path's. Counts stay on device; one host read every
+        ``FUSED_CHECK_LOG_EVERY`` checks logs them."""
+        ref, ref_current = reference
+        bad = (history[:n] != ref["ngram_context"][:n]).any(dim=1).sum()
+        bad = bad + (context[:n] != ref["context_lens"][:n]).sum()
+        bad = bad + (slots[:n] != ref["state_slots"][:n]).sum()
+        bad = bad + (valid_tokens != ref["valid_tokens"]).sum()
+        if current is not None:
+            for got, want in zip(current, ref_current):
+                bad = bad + (got != want).reshape(got.shape[0], -1).any(dim=1).sum()
+        if getattr(self, "_fused_check_bad", None) is None:
+            self._fused_check_bad = torch.zeros((), dtype=torch.int64, device=bad.device)
+            self._fused_check_steps = self._fused_check_rows = 0
+            self._fused_check_multi = self._fused_check_max_rows = 0
+        self._fused_check_bad += bad
+        self._fused_check_steps += 1
+        self._fused_check_rows += n
+        self._fused_check_multi += n > 1
+        self._fused_check_max_rows = max(self._fused_check_max_rows, n)
+        if self._fused_check_steps % FUSED_CHECK_LOG_EVERY == 1:
+            logger.info(
+                "qwen4 fused prep check: %d mismatches in %d checked steps (%d rows, "
+                "%d steps with >1 row, max %d rows)",
+                int(self._fused_check_bad.item()),
+                self._fused_check_steps,
+                self._fused_check_rows,
+                self._fused_check_multi,
+                self._fused_check_max_rows,
+            )
 
     def _fused_fn(self):
         fn = getattr(self, "_fused", None)
