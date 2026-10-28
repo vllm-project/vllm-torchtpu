@@ -130,6 +130,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_RPA_BKV: int = 256
     VLLM_TPU_QSA_DECODE_POOL_PAGE_TABLE: bool = False
     VLLM_TPU_QSA_INDEXER_SC_BOUNDED_COPY: bool = False
+    VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY: bool = False
     VLLM_TPU_QSA_DECODE_RPA_LANES: int = 8
     VLLM_TPU_QSA_FUSED_KV_WRITE: bool = False
     VLLM_TPU_QSA_INDEXER_SHARD: bool = False
@@ -700,6 +701,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Same winners; selection time follows the context, not the table width.
     "VLLM_TPU_QSA_INDEXER_SC_BOUNDED_COPY": env_bool(
         "VLLM_TPU_QSA_INDEXER_SC_BOUNDED_COPY", default=False
+    ),
+    # Qwen4-exp prefill indexer: the same bounded SparseCore score copy for
+    # prefill chunks (rows early in a prompt see a short context).
+    "VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY": env_bool(
+        "VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY", default=False
     ),
     "VLLM_TPU_QSA_DECODE_RPA_LANES": env_nonnegative_int(
         "VLLM_TPU_QSA_DECODE_RPA_LANES", 8

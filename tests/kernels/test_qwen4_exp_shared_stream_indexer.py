@@ -562,3 +562,33 @@ def test_sc_bounded_copy_flag_selects_the_backend(monkeypatch, bounded):
             max_query_len=4,
         )
     assert seen == [SparseCoreTopK(bounded_copy=True) if bounded else None]
+
+
+@pytest.mark.parametrize("bounded", [False, True])
+def test_prefill_sc_bounded_copy_flag_selects_the_backend(monkeypatch, bounded):
+    """VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY does the same for prefill steps."""
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
+        SparseCoreTopK,
+    )
+
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    seen = []
+
+    class Stop(Exception):
+        pass
+
+    def capture(*args, **kwargs):
+        seen.append(kwargs.get("topk_backend"))
+        raise Stop
+
+    monkeypatch.setattr(pooled_qsa, "streamindex_topk", capture)
+    monkeypatch.setenv("VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY", "1" if bounded else "0")
+    # One 24-token prefill request: more tokens than request rows -> prefill.
+    with pytest.raises(Stop):
+        pooled_qsa.select_blocks(
+            **inputs(0, [24, 0], [600, 0], 24, "integer"),
+            ratio=RATIO,
+            block_topk=BLOCK_TOPK,
+        )
+    assert seen == [SparseCoreTopK(bounded_copy=True) if bounded else None]

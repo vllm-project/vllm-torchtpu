@@ -1015,6 +1015,13 @@ def select_blocks(
             enable_early_exit=True,
             chunk_tokens=chunk_tokens,
             components=qsa_indexing(ratio - 1),
+            # VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY: as the decode flag, for
+            # the prefill chunks' rows (short contexts early in a prompt).
+            **(
+                {"topk_backend": SparseCoreTopK(bounded_copy=True)}
+                if envs.VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY and shard is None
+                else {}
+            ),
         )
 
     pages_per_query = table.shape[1] * logical_pages
