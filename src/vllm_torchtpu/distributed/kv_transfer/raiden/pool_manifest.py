@@ -1377,6 +1377,9 @@ DSV41_SWA_CACHE_SUFFIX = ".swa_cache"
 # table exactly as `dsv4.csa.nope` and `dsv4.csa.rope.scale` do.
 TAG_DSV41_SWA_PLANES = ("dsv4.swa.p0", "dsv4.swa.p1")
 DSV4_CSA_COMPRESS_RATIO = 4
+# Halfplane Index-K: records per int32[128] owner row (see
+# vllm_torchtpu.kernels.deepseek_v41.index_key_layout.SLOTS).
+DSV41_INDEX_RECORDS_PER_ROW = 2
 
 _DSV4_STATE_TAG_BY_KV_TAG = {
     TAG_DSV4_CSA_NOPE: TAG_DSV4_STATE_CSA,
@@ -1770,6 +1773,25 @@ def _build_dsv41_pool_manifest(
                 stride_bytes,
                 layer_name,
             )
+            unit_rows, unit_bytes = rows, row_bytes
+            if layer_name.endswith(DSV4_INDEXER_CACHE_SUFFIX):
+                # Halfplane Index-K packs two records into each int32[128]
+                # owner row (low/high 16 bits of every word), so a record is
+                # not a byte range of its own: half a row carries half the
+                # channels of both records. A page still covers whole owner
+                # rows (IndexCacheRows enforces even rows, offset and stride),
+                # so it travels as owner rows and a partial tail rounds up to
+                # a whole row; the extra record is an unused sibling slot.
+                slots = DSV41_INDEX_RECORDS_PER_ROW
+                if rows % slots or offset_bytes % (row_bytes * slots) or (
+                    stride_bytes % (row_bytes * slots)
+                ):
+                    raise ManifestError(
+                        f"DSv4.1 Index-K cache {layer_name} pages must cover whole "
+                        f"{slots}-record owner rows: rows={rows}, "
+                        f"offset={offset_bytes}, stride={stride_bytes}"
+                    )
+                unit_rows, unit_bytes = rows // slots, row_bytes * slots
             pools.append(
                 PoolEntry(
                     tag=dsv4_group_tag(tag_base, group_index),
@@ -1778,7 +1800,9 @@ def _build_dsv41_pool_manifest(
                     base_offset_bytes=offset_bytes,
                     block_stride_bytes=stride_bytes,
                     num_blocks=num_blocks,
-                    regions=_dsv4_row_region(row_bytes=row_bytes, num_rows=rows),
+                    regions=_dsv4_row_region(
+                        row_bytes=unit_bytes, num_rows=unit_rows
+                    ),
                     dtype_tag=_dtype_tag(raw),
                 )
             )

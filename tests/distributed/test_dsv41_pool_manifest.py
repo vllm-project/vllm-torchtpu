@@ -371,3 +371,17 @@ def test_exact_loads_need_bounded_replay_and_prefix_aware_loads():
 def test_dsv4_skip_reason(skip, external, ok):
     reason = _skip_scheduler()._stage3_dsv4_skip_reason(skip, external, 1023)
     assert (reason is None) == ok, reason
+
+
+def test_index_k_pages_travel_as_whole_halfplane_owner_rows():
+    """Halfplane Index-K packs records 2r and 2r+1 into the low and high 16
+    bits of owner row r, so a partial tail must ship whole owner rows: half
+    a row would carry only half the channels of its records."""
+    pool = _pool(_build(), "dsv4.idx.r2.g3")
+    (region,) = pool.regions
+    assert (region.unit_bytes, region.num_units) == (512, 64)
+    assert pool.live_bytes_per_block == PAGE_BYTES
+    # 6 tokens at 2 tokens per record = 3 records: owner rows 0 and 1, where
+    # row 1 holds record 2 in its low halfplanes.
+    base = pool.base_offset_bytes + pool.block_stride_bytes
+    assert _live_byte_ranges(pool, 1, 6, 256) == [(base, base + 2 * 512)]

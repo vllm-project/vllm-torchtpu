@@ -368,8 +368,8 @@ class SWACache(NativeCacheView, DeepseekV4SWACache):
 class IndexerCache(NativeCacheView, upstream.DeepseekV4IndexerCache):
     def __init__(self, *args, **kwargs):
         config = get_current_vllm_config()
-        if getattr(config, "kv_transfer_config", None) is not None:
-            raise ValueError("Halfplane Index-K does not support external KV transfer")
+        # Stage-3 transfer moves Index-K pages as whole halfplane owner rows
+        # (see the DSv4.1 Index-K pools in raiden/pool_manifest.py).
         if getattr(config.cache_config, "kv_offloading_size", 0):
             raise ValueError("Halfplane Index-K does not support external KV offload")
         kwargs["head_dim"] = (
