@@ -729,13 +729,20 @@ def tq_ragged_paged_attention(
 ) -> tuple[jax.Array, jax.Array]:
     """Ragged paged attention over a compressed TurboQuant `uint8` KV cache.
 
-    Executes `_pack_new_tq_tokens_128`, `_update_tq_page_vreg`, and
-    `_dequant_tq_page_vreg` via `vmap` and delegates attention to `rpa_fn`
-    (e.g. `ref_ragged_paged_attention`).
+    When `rpa_fn` is the Pallas RPA v3 kernel (`ragged_paged_attention`), the
+    kernel fetches compressed `uint8` pages directly into VMEM (`btq_x2_ref`),
+    updates touched pages in VREGs, dequantizes active pages in VREGs on the
+    fly, and DMAs updated pages back to HBM. When `rpa_fn` is a reference
+    callable such as `ref_ragged_paged_attention` (CPU/TPU unit tests), the same
+    `_pack_new_tq_tokens_128`, `_update_tq_page_vreg`, and
+    `_dequant_tq_page_vreg` functions are executed via `vmap`.
 
     Returns `(new_kv_cache, outputs)`.
     """
-    from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel import merge_kv
+    from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel import (
+        merge_kv,
+        ragged_paged_attention,
+    )
 
     assert kv_cache.ndim == 4 and kv_cache.shape[3] == _WORD_SIZE, kv_cache.shape
     page_size = layout.page_size_from_words_128(kv_cache.shape[2])
@@ -760,11 +767,39 @@ def tq_ragged_paged_attention(
     dequant_fn = functools.partial(_dequant_tq_page_vreg, layout=layout, tables=tables)
     dequant_1 = functools.partial(dequant_fn, kv_dtype=compute_dtype)
     v_in = values.astype(compute_dtype)
+    tq_new_kv = None
+    update_fn = None
     if not skip_kv_update:
         nk_u, nv_i, n_meta = _quantize_kv_components(
             keys, values, layout, tables, rotated_key=k_rot
         )
         tq_new_kv = _pack_new_tq_tokens_128(nk_u, nv_i, n_meta, page_size, layout)
+        update_fn = functools.partial(_update_tq_page_vreg, layout=layout)
+
+    # Production passes the fused Pallas `ragged_paged_attention` kernel (which
+    # accepts the `tq_*` VMEM hooks); CPU unit tests pass `ref_ragged_paged_attention`.
+    if rpa_fn is ragged_paged_attention:
+        outputs, kv_cache = rpa_fn(
+            q_in,
+            k_in,
+            v_in,
+            kv_cache,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            sm_scale=sm_scale,
+            sliding_window=sliding_window,
+            soft_cap=soft_cap,
+            skip_kv_update=skip_kv_update,
+            tq_page_size=page_size,
+            tq_dequant_page_fn=dequant_fn,
+            tq_new_kv=tq_new_kv,
+            tq_update_page_fn=update_fn,
+        )
+        return kv_cache, outputs
+
+    if not skip_kv_update:
         max_num_seqs = kv_lens.shape[0]
         pages_per_seq = page_indices.shape[0] // max_num_seqs
         num_seqs = distribution[2]
@@ -787,6 +822,7 @@ def tq_ragged_paged_attention(
         slot_iota = jax.lax.broadcasted_iota(jnp.int32, (page_size, 1), 0)
 
         def _apply_tok(tok_i, cache):
+            assert tq_new_kv is not None
             slot_in_p = slot_in_pages[tok_i]
             page_i = page_indices[local_page[tok_i]]
             valid_mask = (slot_in_p >= 0) & (slot_iota == slot_in_p)
