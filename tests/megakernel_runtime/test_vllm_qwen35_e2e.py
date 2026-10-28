@@ -47,6 +47,7 @@ from vllm_torchtpu.megakernel.runtime import (
     check_post_mesh_eligibility,
     check_qsl_uniform,
     explicit_profile_settings,
+    facts_from_pool_layout,
     ir_required_buckets,
     pack_step_meta,
     parse_mk_buckets,
@@ -65,6 +66,20 @@ from vllm_torchtpu.megakernel_runtime.hooks import StepContext  # noqa: E402
 from vllm_torchtpu.megakernel_runtime.weight_collector import (  # noqa: E402
     WEIGHT_FLIPPED_ATTR,
 )
+
+_REAL_FRAMEWORK_SLOT_FACTS = MegakernelDriver._framework_slot_facts
+
+
+@pytest.fixture(autouse=True)
+def _framework_agrees_on_pool_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Synthetic backbones carry no framework GDN layers or cache config: let
+    the framework side of the bind-time slot check report the megakernel's
+    own `PoolLayout` facts (tests of the check itself override this)."""
+
+    def _facts(self: Any, runner: Any, linear_attn: Any, pool: Any) -> Any:
+        return facts_from_pool_layout(self.spec.cache_backend.layout, self.base_exec.R)
+
+    monkeypatch.setattr(MegakernelDriver, "_framework_slot_facts", _facts)
 
 
 @pytest.fixture(autouse=True)
@@ -1482,6 +1497,72 @@ def test_compile_hlo_check_config_errors_are_not_layout_errors() -> None:
     assert drv_layout._bound is False
     assert isinstance(runner._megakernel, driver_mod.DeclinedDriver)
     assert runner._megakernel.decline.code == "cache_layout_incompatible"
+
+
+def test_bind_caches_fails_closed_on_pool_slot_layout_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A framework slot layout that differs from the megakernel's `PoolLayout`
+    declines at bind, before any bucket compiles, with a named reason."""
+    import dataclasses
+
+    mesh = _cpu_mesh(1)
+    g = _tiny_geom(L=4, att_every=4)
+    ex_base = _tiny_exec(R=1, B=2, T=1, ctx=256, num_pages=96)
+    backbone = make_synthetic_qwen35_backbone(g, ex_base)
+    model = SimpleNamespace(model=backbone)
+    _allocate_aliased_pools(backbone, g, 96)
+    driver = MegakernelDriver(
+        model=model,
+        mesh=mesh,
+        tp_rank=0,
+        mode="ep",
+        geom=g,
+        base_exec=ex_base,
+        buckets=(2,),
+        verify_buckets=(),
+    )
+    mk = facts_from_pool_layout(driver.spec.cache_backend.layout, 1)
+    built: list[Any] = []
+    monkeypatch.setattr(
+        driver, "_build_all_buckets", lambda: built.append(1), raising=False
+    )
+    cases = {
+        "conv_state_dtype_unsupported": dataclasses.replace(
+            mk, conv_dtype="float32", conv_bytes=2 * mk.conv_bytes
+        ),
+        "pool_layout_mismatch": dataclasses.replace(
+            mk, slot_tokens=mk.slot_tokens + 512, ssm_dtype="float32"
+        ),
+    }
+    for code, fw in cases.items():
+        monkeypatch.setattr(driver, "_framework_slot_facts", lambda *_a, _f=fw: _f)
+        runner = SimpleNamespace(model=model, _unified_kv_layout=True, _megakernel=0)
+        with pytest.raises(driver_mod.LayoutDecline) as exc_info:
+            driver.bind_caches(runner)
+        assert exc_info.value.result.code == code
+        assert not driver._bound and not built
+        driver.bind_and_warmup(runner)
+        assert isinstance(runner._megakernel, driver_mod.DeclinedDriver)
+        assert runner._megakernel.decline.code == code
+        assert "megakernel=" in runner._megakernel.decline.message
+
+    # Without the framework's layout objects (no cache_config.block_size), the
+    # real framework-side derivation can't run: that declines too.
+    monkeypatch.setattr(
+        driver,
+        "_framework_slot_facts",
+        _REAL_FRAMEWORK_SLOT_FACTS.__get__(driver),
+    )
+    runner = SimpleNamespace(model=model, _unified_kv_layout=True)
+    with pytest.raises(driver_mod.LayoutDecline) as exc_info:
+        driver.bind_caches(runner)
+    assert exc_info.value.result.code == "pool_layout_unknown"
+
+    monkeypatch.setattr(driver, "_framework_slot_facts", lambda *_a: mk)
+    driver.bind_caches(runner)
+    assert driver._bound and built == [1]
+    assert driver.pool_layout_facts == mk
 
 
 def test_bind_caches_budget_overflow_is_config_error() -> None:

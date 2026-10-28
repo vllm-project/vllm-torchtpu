@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 from ..errors import EligibilityResult
-from . import checks, eligibility, policy, step_meta
+from . import checks, eligibility, layout_facts, policy, step_meta
 from .checks import (
     PoolScheduleInfo,
     SentinelVariantPlan,
@@ -42,6 +42,11 @@ from .eligibility import (
     check_startup_eligibility,
     check_step_eligibility,
     inspect_batch_shape,
+)
+from .layout_facts import (
+    PoolLayoutFacts,
+    compare_layout_facts,
+    facts_from_pool_layout,
 )
 from .policy import (
     DEFAULT_BUCKETS,
@@ -81,6 +86,7 @@ __all__ = [
     "EligibilityResult",
     "JaxStepMetaOps",
     "MKABCalibrator",
+    "PoolLayoutFacts",
     "PoolScheduleInfo",
     "SentinelVariantPlan",
     "StepDecision",
@@ -100,10 +106,13 @@ __all__ = [
     "check_startup_eligibility",
     "check_step_eligibility",
     "checks",
+    "compare_layout_facts",
     "eligibility",
     "explicit_profile_settings",
+    "facts_from_pool_layout",
     "inspect_batch_shape",
     "ir_required_buckets",
+    "layout_facts",
     "pack_step_meta",
     "parse_mk_buckets",
     "parse_mk_verify_buckets",

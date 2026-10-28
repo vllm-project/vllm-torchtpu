@@ -95,7 +95,7 @@ def test_runtime_package_ast_and_fresh_import_free_of_vllm_and_torch():
     """`megakernel/runtime/*.py` never imports `vllm`/`torch`/`os` and <= 400 lines."""
     runtime_dir = Path(mk_rt.__file__).parent
     py_files = sorted(runtime_dir.glob("*.py"))
-    assert len(py_files) == 5
+    assert len(py_files) == 6
 
     for py_path in py_files:
         src = py_path.read_text(encoding="utf-8")

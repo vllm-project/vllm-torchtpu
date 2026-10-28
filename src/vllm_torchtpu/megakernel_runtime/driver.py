@@ -58,6 +58,11 @@ from vllm_torchtpu.megakernel_runtime.exported_bridge import (
     execute_pooled_step_inplace,
 )
 from vllm_torchtpu.megakernel_runtime.hooks import StepContext, is_suppressed
+from vllm_torchtpu.megakernel_runtime.pool_facts import (
+    conv_qk_pair_layout_enabled,
+    framework_pool_layout_facts,
+    runner_block_size,
+)
 from vllm_torchtpu.megakernel_runtime.weight_collector import (
     find_backbone,
     get_routed_experts,
@@ -151,6 +156,14 @@ class MeshDecline(Exception):
 
     def __init__(self, result: _rt.EligibilityResult) -> None:
         super().__init__(result.message)
+        self.result = result
+
+
+class LayoutDecline(MegakernelLayoutError):
+    """The runner's cache layout isn't the one the megakernel was built for."""
+
+    def __init__(self, result: _rt.EligibilityResult) -> None:
+        super().__init__(f"MegakernelDriver: {result.message}")
         self.result = result
 
 
@@ -937,6 +950,7 @@ class MegakernelDriver:
                     f"alias pool[{r}] (unified KV+GDN cache layout is required)",
                 )
 
+        self._check_pool_layout_facts(runner, pools[0])
         self.raw_pools, self.num_pages, self.page_size = (
             pools,
             num_pages,
@@ -995,6 +1009,47 @@ class MegakernelDriver:
             fused_bkts,
             self.pool_gather,
             gpr_bkts,
+        )
+
+    def _framework_slot_facts(
+        self, runner: Any, linear_attn: Any, pool: torch.Tensor
+    ) -> _rt.PoolLayoutFacts:
+        block = runner_block_size(runner)
+        if block is None:
+            raise ValueError("runner has no cache_config.block_size")
+        return framework_pool_layout_facts(
+            pool=pool,
+            linear_attn=linear_attn,
+            block_size=block,
+            conv_qk_pair=conv_qk_pair_layout_enabled(),
+        )
+
+    def _check_pool_layout_facts(self, runner: Any, pool: torch.Tensor) -> None:
+        """Fail closed unless the framework lays out a recurrent slot exactly
+        as this megakernel's `PoolLayout` expects."""
+        mk_facts = _rt.facts_from_pool_layout(
+            self.spec.cache_backend.layout, int(self.base_exec.R)
+        )
+        try:
+            fw_facts = self._framework_slot_facts(
+                runner, self.backbone.layers[0].linear_attn, pool
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            msg = (
+                "can't derive the framework's recurrent pool slot layout "
+                f"({type(exc).__name__}: {exc}); skipping."
+            )
+            raise LayoutDecline(
+                _rt.EligibilityResult(False, "pool_layout_unknown", msg)
+            ) from exc
+        res = _rt.compare_layout_facts(mk_facts, fw_facts)
+        if not res.eligible:
+            raise LayoutDecline(res)
+        self.pool_layout_facts = mk_facts
+        logger.info(
+            "%s megakernel pool slot layout matches the framework (fingerprint %s)",
+            self._display_name,
+            mk_facts.fingerprint()[:16],
         )
 
     def _build_all_buckets(self) -> None:
