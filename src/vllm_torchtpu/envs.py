@@ -112,6 +112,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_POOL_PAGE_DMA: bool = False
     VLLM_TPU_QSA_INDEXER_SC_BOUNDED_COPY: bool = False
     VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY: bool = False
+    VLLM_TPU_DECODE_PALLAS_ALL_REDUCE: bool = False
     VLLM_TPU_QSA_DECODE_RPA_LANES: int = 8
     VLLM_TPU_QSA_DECODE_RPA_MAX_QUERIES: int = 0
     VLLM_TPU_QSA_FUSED_KV_WRITE: bool = False
@@ -656,6 +657,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # prefill chunks (rows early in a prompt see a short context).
     "VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY": env_bool(
         "VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY", default=False
+    ),
+    # Sum the decoder layers' TP partial outputs (GDN out_proj, QSA o_proj) on
+    # the Pallas reduce-scatter + all-gather for steps of at most 128 rows
+    # instead of XLA's all-reduce (latency-bound at decode sizes). Not
+    # bit-identical: each rank's f32 column sum is rounded once to bf16.
+    "VLLM_TPU_DECODE_PALLAS_ALL_REDUCE": env_bool(
+        "VLLM_TPU_DECODE_PALLAS_ALL_REDUCE", default=False
     ),
     "VLLM_TPU_QSA_DECODE_RPA_LANES": env_nonnegative_int(
         "VLLM_TPU_QSA_DECODE_RPA_LANES", 8

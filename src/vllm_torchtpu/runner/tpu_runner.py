@@ -5359,6 +5359,12 @@ class TPUModelRunner(GPUModelRunner):
 
             draft = self._async_drafter.draft_model if self._is_async_drafter else None
             arm(self.model, draft)
+        if envs.VLLM_TPU_DECODE_PALLAS_ALL_REDUCE:
+            from vllm_torchtpu.layers.adapter import decode_all_reduce
+
+            hidden = self.model_config.get_hidden_size()
+            if not decode_all_reduce.arm(self.device, hidden):
+                logger.warning("VLLM_TPU_DECODE_PALLAS_ALL_REDUCE: no TP mesh; off")
 
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()

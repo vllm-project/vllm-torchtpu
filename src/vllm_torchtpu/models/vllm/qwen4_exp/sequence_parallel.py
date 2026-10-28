@@ -156,4 +156,10 @@ def reduce(x: torch.Tensor, sequence_parallel: bool) -> torch.Tensor:
         return x
     if sequence_parallel:
         return tensor_model_parallel_reduce_scatter(x, 0)
+    # VLLM_TPU_DECODE_PALLAS_ALL_REDUCE: decode-size steps on the Pallas
+    # reduce-scatter + all-gather (see layers/adapter/decode_all_reduce).
+    from vllm_torchtpu.layers.adapter import decode_all_reduce
+
+    if decode_all_reduce.armed_for(x):
+        return decode_all_reduce.all_reduce_partial(x)
     return tensor_model_parallel_all_reduce(x)
