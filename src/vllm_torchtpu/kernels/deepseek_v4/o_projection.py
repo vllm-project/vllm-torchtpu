@@ -318,14 +318,20 @@ def _pipelined_kernel(
 
     def prep(r, slot):
         """RoPE + per-row quantize of the x block in ``slot`` (row block r)."""
+        lo = head_dim - LANE
         for s in range(rows // prep_rows):
             sub = pl.ds(s * prep_rows, prep_rows)
-            x = _rope_heads(
-                x_buf[slot, sub],
-                cos_sin_ref[pl.ds(r * rows + s * prep_rows, prep_rows)],
-                head_dim=head_dim,
-            )
-            x = x.reshape(prep_rows, -1)
+            cos_sin = cos_sin_ref[pl.ds(r * rows + s * prep_rows, prep_rows)]
+            cos, sin = cos_sin[:, :LANE], cos_sin[:, LANE:]
+            # Heads major first: the [rows, H * head_dim] relayout the dot needs
+            # is then one transpose, and cos/sin apply per row unbroadcast.
+            x_heads = jnp.swapaxes(x_buf[slot, sub], 0, 1)
+            parts = []
+            for xh in x_heads:
+                tail = xh[:, lo:].astype(jnp.float32)
+                roped = tail * cos + _rotate_gptj(tail) * sin
+                parts += [xh[:, :lo], roped.astype(xh.dtype)]
+            x = jnp.concatenate(parts, axis=-1)
             amax = jnp.max(jnp.abs(x), axis=1, keepdims=True)
             inv = (FP8_E4M3_MAX / jnp.maximum(amax, jnp.bfloat16(1e-30))).astype(
                 jnp.bfloat16
