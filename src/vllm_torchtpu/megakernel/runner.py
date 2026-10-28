@@ -39,7 +39,6 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 
 import vllm_torchtpu.distributed.utils as dist_utils
-from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.megakernel import (
     backend,
@@ -121,11 +120,10 @@ def build_program(vllm_config: Any, tp_rank: int) -> MegakernelProgram:
     if spec is not None and spec.method != "dspark":
         raise NotImplementedError("the K3 decoder speculates with DSpark only")
     config = MegakernelEngineConfig.from_vllm_config(vllm_config)
-    moe_reduce_dtype = tpu_envs.TPU_K3_MOE_REDUCE_DTYPE
     if config.attention_dp > 1:
         k3.check(config)
     aggregate = config.role == "aggregate"
-    if config.attention_dp > 1 or moe_reduce_dtype != "float32" or aggregate:
+    if config.attention_dp > 1 or aggregate:
         from vllm_torchtpu.megakernel.kimi_k3 import config as kernel_config
 
         # Kernel modules read the config at import: install it before the
@@ -134,7 +132,6 @@ def build_program(vllm_config: Any, tp_rank: int) -> MegakernelProgram:
             kernel_config.KernelConfig(
                 attention_dp=config.attention_dp,
                 dcp_group=config.decode_context_parallel_size,
-                moe_reduce_dtype=moe_reduce_dtype,
                 # The aggregate prefill shares the decode's EP8 experts.
                 prefill_expert_parallel=8 if aggregate else 16,
             )

@@ -5344,7 +5344,7 @@ def make_moe_fused_sp_repacked(mesh, *, seq_len, eps=1e-5, collective_id=42,
         partials, shared = partial_op(hidden, prefix, weights, length)
         reduced = ring_reduce_scatter_fp32(
             partials, mesh, tables,
-            collective_id=collective_id, dtype=jnp.dtype(_config().moe_reduce_dtype),
+            collective_id=collective_id, dtype=jnp.float32,
         )
         reduced = reduced.reshape(32, local_tokens, 3584)
         return tail_op(reduced, shared, prefix, weights, length)
@@ -5447,16 +5447,9 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
     if (
         cfg.prefill_fused_moe
         and cfg.prefill_expert_parallel == 16
-        and (
-            seq_len in (4096, 8192)
-            or (cfg.moe_reduce_dtype == "float32" and seq_len in (512, 1024, 2048))
-        )
+        and seq_len in (512, 1024, 2048, 4096, 8192)
     ):
-        if cfg.moe_reduce_dtype == "float32":
-            from .prefill_moe.fused import make_indexed_moe_sp_ring as make_packed_moe
-        else:
-            # Preserve the supported per-hop BF16 reduction implementation.
-            from .prefill_moe.layer import make_indexed_moe_sp_ring as make_packed_moe
+        from .prefill_moe.fused import make_indexed_moe_sp_ring as make_packed_moe
         return make_packed_moe(mesh, seq_len=seq_len)
     return _make_indexed_moe_sp_ring_reference(mesh, seq_len=seq_len)
 

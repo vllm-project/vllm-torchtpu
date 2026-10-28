@@ -90,11 +90,9 @@ class KernelConfig:
     # 16 and 32 regroup the EP8 group's shards at load.
     prefill_expert_parallel: int = 16
     # Packed dispatch/shared overlap and fused down/combine/reduce-scatter.
-    # EP16: FP32 at all serving windows, BF16 at 4K/8K only.
+    # EP16: all serving windows (FP32 reduce-scatter).
     # False: the unfused SparseCore gather/combine.
     prefill_fused_moe: bool = True
-    # Both prefill MoE rings: BF16 halves transfer bytes, rounding every hop.
-    moe_reduce_dtype: str = "float32"
     # Weight loading.
     read_streams: int = 4
     load_inflight_gb: float = 16.0
@@ -141,8 +139,6 @@ class KernelConfig:
             raise ValueError("fp8_wires holds t0 and/or t10")
         if self.prefill_expert_parallel not in (8, 16, 32):
             raise ValueError("prefill_expert_parallel is 8, 16 or 32")
-        if self.moe_reduce_dtype not in ("float32", "bfloat16"):
-            raise ValueError("moe_reduce_dtype is float32 or bfloat16")
         if self.mla_decode_ktile not in (1024, 2048):
             raise ValueError("mla_decode_ktile supports 1024 or experimental 2048")
         if self.mla_decode_ktile == 2048 and (

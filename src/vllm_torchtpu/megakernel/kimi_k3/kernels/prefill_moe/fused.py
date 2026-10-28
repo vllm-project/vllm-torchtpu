@@ -2129,10 +2129,6 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
         raise ValueError(
             "Fused prefill MoE supports 512, 1024, 2048, 4096 and 8192 token windows"
         )
-    if k._config().moe_reduce_dtype != "float32":
-        raise ValueError(
-            "Fused prefill MoE requires FP32 reduction; use the dispatcher for BF16"
-        )
     if mesh.size != 32 or tuple(mesh.axis_names) != ("k3_sp",):
         raise ValueError("Fused prefill MoE requires a flat 32-rank k3_sp mesh")
     from .layer import routed_experts_prepared
