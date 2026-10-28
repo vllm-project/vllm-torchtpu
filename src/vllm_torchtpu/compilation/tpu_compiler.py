@@ -6,7 +6,6 @@ PiecewiseBackend to compile FX graphs via TorchTPU's FX->MLIR->PjRt
 pipeline. Each shape bucket gets its own compiled executable.
 """
 
-import contextlib
 import copy
 import dataclasses
 import hashlib
@@ -29,7 +28,7 @@ from vllm.config import VllmConfig
 from vllm.config.utils import Range
 
 from vllm_torchtpu import envs, utils
-from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.compilation import cold_start, shape_variants
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -80,9 +79,17 @@ def _deserialize_entry(entry: Any) -> Callable[..., Any]:
 
     # Upstream PR #2068: Torch deep-copies the entry for reserialization,
     # which vLLM never uses. CompiledArtifact.__reduce__ reloads the executable.
-    with contextlib.suppress(AttributeError, TypeError):
-        entry.__deepcopy__ = lambda _memo: entry
-    return deserialize_bundled_cache_entry(entry)
+    state = vars(entry)
+    had_override = "__deepcopy__" in state
+    previous = state.get("__deepcopy__")
+    state["__deepcopy__"] = lambda _memo: entry
+    try:
+        return deserialize_bundled_cache_entry(entry)
+    finally:
+        if had_override:
+            state["__deepcopy__"] = previous
+        else:
+            del state["__deepcopy__"]
 
 
 _TPU_COMPILE_ENV_IGNORED = {
@@ -103,6 +110,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE",
     "VLLM_XLA_CHECK_RECOMPILATION",
     "TPU_PARALLEL_PRECOMPILE",
+    "TPU_COMPACT_COLD_START",
     # KV-transfer wiring: ports, socket paths, staging pool, pool sizes,
     # timeouts. Same reasoning as the Raiden group above. Every registry
     # entry not named here joins the cache key, so omitting these would
@@ -435,6 +443,9 @@ class TpuCompilerAdaptor(CompilerInterface):
         # guards -- correct for static shapes -- and lets the artifact cache work.
         from torch._subclasses.fake_tensor import FakeTensor
 
+        compaction = cold_start.current_compaction()
+        if compaction is not None:
+            compaction.backend_calls += 1
         fake_mode = next(
             (t.fake_mode for t in example_inputs if isinstance(t, FakeTensor)), None
         )
@@ -468,6 +479,8 @@ class TpuCompilerAdaptor(CompilerInterface):
                     "not be cached: %s",
                     e,
                 )
+        if compaction is not None and entry is not None:
+            compiled_fn = compaction.register(compiled_fn, entry)
         return compiled_fn, entry
 
     def _save_handle(

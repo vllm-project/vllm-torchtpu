@@ -14,6 +14,9 @@
 
 import importlib
 import os
+import pickle
+import sys
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -21,6 +24,32 @@ from unittest.mock import patch
 import pytest
 
 from vllm_torchtpu.env_override import _TPU_VMEM_BYTES_PER_TENSOR_CORE
+
+
+class _PortableArtifact:
+    def __init__(self, compiler_state=None):
+        self.compiler_state = compiler_state
+
+    def __reduce__(self):
+        return _restore_portable_artifact, ()
+
+    def __call__(self, boxed_args):
+        return (sum(boxed_args),)
+
+
+def _restore_portable_artifact():
+    return _PortableArtifact()
+
+
+class _PortableEntry:
+    guards_expr = None
+    sanitized_aot_config = None
+
+    def __init__(self, artifact):
+        self.artifact = artifact
+
+    def wrap_post_compile(self, example_inputs, aot_config, options):
+        return self.artifact
 
 
 class TestTpuCompilerCache:
@@ -425,6 +454,22 @@ class TestTpuCompilerCache:
         assert runtime(2, 3, 7) == 12
 
     @pytest.mark.cpu_test
+    @pytest.mark.parametrize("existing_override", [False, True])
+    def test_bundled_replay_restores_entry_state_for_disk_save(self, existing_override):
+        from vllm_torchtpu.compilation.tpu_compiler import _deserialize_entry
+
+        entry = _PortableEntry(_PortableArtifact())
+        if existing_override:
+            entry.__deepcopy__ = None
+        assert _deserialize_entry(entry)(2, 3, 7) == (12,)
+
+        assert ("__deepcopy__" in vars(entry)) is existing_override
+        if existing_override:
+            assert entry.__deepcopy__ is None
+        restored = pickle.loads(pickle.dumps(entry))
+        assert _deserialize_entry(restored)(2, 3, 7) == (12,)
+
+    @pytest.mark.cpu_test
     @pytest.mark.parametrize("reuse_caller_mode", [False, True])
     def test_replay_retraces_factory_ops_without_allocating_real_tensors(
         self, monkeypatch, tmp_path, reuse_caller_mode
@@ -523,3 +568,75 @@ class TestTpuCompilerCache:
         compiler._run_backend(None, [])
         compiler._run_backend(None, [])
         assert firsts == [1, 1]
+
+    @pytest.mark.cpu_test
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_cold_start_releases_all_old_owners_before_any_program_reload(
+        self, monkeypatch, enabled
+    ):
+        from vllm_torchtpu.compilation import cold_start, tpu_compiler
+
+        class CompilerState:
+            pass
+
+        owners = []
+
+        def backend(graph, inputs):
+            owner = CompilerState()
+            owners.append(weakref.ref(owner))
+            entry = _PortableEntry(_PortableArtifact(owner))
+
+            def runtime(*args):
+                return entry.artifact(args)
+
+            runtime.serialize = lambda: entry
+            return runtime
+
+        monkeypatch.setenv("TPU_COMPACT_COLD_START", str(int(enabled)))
+        monkeypatch.setattr(tpu_compiler, "_tpu_backend", backend)
+        runtimes = []
+        with cold_start.compact_cold_start() as state:
+            for _ in range(2):
+                runtime, entry = tpu_compiler.TpuCompilerAdaptor()._run_backend(
+                    None, []
+                )
+                runtimes.append(runtime)
+                # This is the normal cold-path disk save, before compaction.
+                assert pickle.dumps(entry)
+                del entry
+            assert all(runtime(2, 3, 7) == (12,) for runtime in runtimes)
+            assert all(owner() is not None for owner in owners)
+            if enabled:
+                assert state is not None and state.programs == 2
+                assert state.backend_calls == 2
+                original_restore = _restore_portable_artifact
+
+                def checked_restore():
+                    assert all(owner() is None for owner in owners)
+                    return original_restore()
+
+                state.drop_runnables()
+                assert all(owner() is None for owner in owners)
+                with monkeypatch.context() as guard:
+                    guard.setattr(
+                        sys.modules[__name__],
+                        "_restore_portable_artifact",
+                        checked_restore,
+                    )
+                    state.restore_runnables()
+                assert all(runtime(2, 3, 7) == (12,) for runtime in runtimes)
+                assert not state._pending
+        assert cold_start.current_compaction() is None
+
+    @pytest.mark.cpu_test
+    def test_cold_start_scope_resets_after_compilation_failure(self, monkeypatch):
+        from vllm_torchtpu.compilation import cold_start
+
+        monkeypatch.setenv("TPU_COMPACT_COLD_START", "1")
+        with (
+            pytest.raises(RuntimeError, match="compile failed"),
+            cold_start.compact_cold_start(),
+        ):
+            assert cold_start.current_compaction() is not None
+            raise RuntimeError("compile failed")
+        assert cold_start.current_compaction() is None
