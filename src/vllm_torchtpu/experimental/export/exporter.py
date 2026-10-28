@@ -24,6 +24,7 @@ import shutil
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from vllm_torchtpu import env_override
 from vllm_torchtpu.experimental.export import (
     api,
     sampling,
@@ -55,6 +56,32 @@ _MESH_AXIS_BY_ALIAS = {"dp": "data", "tp": "model", "ep": "model"}
 _MLIR_SHAPES = "shard_local"
 
 Sharding = list[str | list[str] | None]
+
+
+def _xla_option_overrides() -> dict[str, bool | int | float | str]:
+    """The XLA flags libtpu runs with, for `env_option_overrides`.
+
+    A runtime that does not import vLLM compiles with them from
+    `metadata.json` instead. Non-XLA libtpu flags are skipped.
+    """
+    overrides: dict[str, bool | int | float | str] = {}
+    for token in env_override.libtpu_init_args():
+        if not token.startswith("--xla_"):
+            continue
+        name, sep, value = token.removeprefix("--").partition("=")
+        overrides[name] = _option_value(value) if sep else True
+    return overrides
+
+
+def _option_value(text: str) -> bool | int | float | str:
+    if text in ("true", "false"):
+        return text == "true"
+    for parse in (int, float):
+        try:
+            return parse(text)
+        except ValueError:
+            pass
+    return text
 
 
 def _axis_sizes(cfg: api.TextOnlyLLMExportConfig) -> dict[str, int]:
@@ -871,6 +898,8 @@ def export(
         },
         "functions": functions_dict,
     }
+    if xla_options := _xla_option_overrides():
+        metadata_doc["compile_options"]["env_option_overrides"] = xla_options
 
     with open(os.path.join(output_dir, "metadata.json"), "w") as f:
         json.dump(metadata_doc, f, indent=2)
