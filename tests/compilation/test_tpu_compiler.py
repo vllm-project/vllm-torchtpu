@@ -377,6 +377,27 @@ class TestTpuCompilerCache:
             ):
                 importlib.reload(vllm_torchtpu.env_override)
 
+    def test_libtpu_init_args_lists_the_flags_libtpu_will_read(self):
+        """The user's flags, env_override's defaults, and flags set later."""
+        env_mock = {
+            "LIBTPU_INIT_ARGS": "--xla_user_flag=1 --tpu_user_flag",
+            "TPU_ACCELERATOR_TYPE": "v6e-8",
+        }
+        with patch.dict(os.environ, env_mock, clear=True):
+            import vllm_torchtpu.env_override
+
+            importlib.reload(vllm_torchtpu.env_override)
+            vllm_torchtpu.env_override.set_libtpu_flag_default("--xla_later", "2")
+
+            args = vllm_torchtpu.env_override.libtpu_init_args()
+            assert {
+                "--xla_user_flag=1",
+                "--tpu_user_flag",
+                "--xla_tpu_use_dynamic_smem_negotiation=true",
+                "--xla_later=2",
+            } <= set(args)
+            assert args == os.environ["LIBTPU_INIT_ARGS"].split()
+
     def test_envs_module_imports_only_the_standard_library(self):
         """env_override.py imports envs while the package's own __init__ is
         still running, which is only safe while envs.py depends on nothing

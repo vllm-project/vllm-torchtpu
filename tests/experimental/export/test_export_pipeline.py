@@ -606,6 +606,62 @@ def test_metadata_declares_the_speculative_config_it_was_exported_with(
     assert meta["serving_config"]["speculative_config"] == speculative
 
 
+def _export_metadata(tmp_path: Path) -> dict[str, Any]:
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny-torch",
+        vocab_size=32,
+        hidden_size=16,
+        num_layers=1,
+        num_q_heads=2,
+        num_kv_heads=2,
+        head_dim=8,
+        block_size=8,
+        num_blocks=16,
+        max_num_seqs=8,
+        max_model_len=64,
+        token_buckets=(8,),
+        req_buckets=(4, 8),
+        emit_byte_tokenizer=True,
+    )
+    out_dir = str(tmp_path / "exported")
+    with mock.patch.object(
+        tpu_lowering,
+        "lower_torch_callable_to_mlir",
+        side_effect=_mock_lower_torch_callable_to_mlir,
+    ):
+        exporter.export(_TinyTorchExportableLLM(cfg), out_dir)
+    return json.loads(Path(out_dir, "metadata.json").read_text())
+
+
+def test_metadata_declares_the_xla_flags_in_libtpu_init_args(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "LIBTPU_INIT_ARGS",
+        "--xla_tpu_use_dynamic_smem_negotiation=true"
+        " --xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes=67108864"
+        " --xla_tpu_scoped_vmem_limit_kib=0.5 --xla_tpu_mode=fast"
+        " --xla_tpu_enable_foo --tpu_megacore=false --xla_jf_bar=false",
+    )
+    overrides = _export_metadata(tmp_path)["compile_options"]["env_option_overrides"]
+    # Typed JSON values; a bare flag is true; non-XLA libtpu flags are dropped.
+    assert overrides == {
+        "xla_tpu_use_dynamic_smem_negotiation": True,
+        "xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes": 67108864,
+        "xla_tpu_scoped_vmem_limit_kib": 0.5,
+        "xla_tpu_mode": "fast",
+        "xla_tpu_enable_foo": True,
+        "xla_jf_bar": False,
+    }
+
+
+def test_metadata_has_no_xla_flags_without_libtpu_init_args(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("LIBTPU_INIT_ARGS", raising=False)
+    assert "env_option_overrides" not in _export_metadata(tmp_path)["compile_options"]
+
+
 def test_parse_args_takes_the_vllm_serve_command_line(capsys) -> None:
     # What a `vllm serve` benchmark config passes, model tag included: engine
     # arguments shape the artifact, frontend options are reported and ignored.
