@@ -12,6 +12,7 @@ VMEM limits or TPU timing.
 """
 
 import contextlib
+import dataclasses
 import io
 import json
 import math
@@ -76,6 +77,10 @@ BODY_CASE = (16, 7)
 FAST_CASES = ((16, 0), (16, 16), (32, 12))
 # A token count the kernel does not admit: the op body's psum path.
 CHAIN_ROWS = 128
+# (rows, n_valid) between two kernel sizes, through the op body with
+# TPU_MOE_TP_DECODE_PAD_ROWS: the kernel runs on the next size (32, 64). 48:36
+# is a batch-9 decode step (9 requests x 4 tokens) in a 48-token bucket.
+PAD_CASES = ((24, 20), (48, 36))
 # Row 0 of OUTLIER_CASE gets OUTLIER at OUTLIER_COLUMN (inside the second
 # 512-column block), and every weight on that column is zeroed, so it moves
 # nothing but quantization scales.
@@ -410,6 +415,32 @@ def test_op_body_psums_the_usual_path_at_other_token_counts(on_16_devices_b):
     # The usual path is stubbed with ones on real rows: the psum over 16 ranks
     # gives exactly 16 there and 0 on padded rows.
     assert on_16_devices_b["body_chain_exact"]
+
+
+@pytest.fixture(scope="module")
+def on_16_devices_c():
+    return _run_worker("c")
+
+
+@pytest.mark.parametrize("rows, n_valid", PAD_CASES)
+def test_op_body_pads_between_kernel_sizes_on_16_devices(
+    on_16_devices_c, rows, n_valid
+):
+    case = on_16_devices_c["pad"][f"{rows}:{n_valid}"]
+    assert case["ranks_identical"], case
+    assert case["padding_rows_positive_zero"], case
+    assert not case["races_found"], case
+    assert case["nan"] == 0, case
+    assert case["rel_l2"] <= TOLERANCE["rel_l2"], case
+    assert case["cos"] >= TOLERANCE["cos"], case
+    assert case["expected_rel_l2"] <= EXPECTED_REL_L2, case
+    # Main's path: the same rows in the next bucket's call (more padding rows
+    # after them) give the same output bits.
+    assert case["bitwise_vs_next_bucket"], case
+
+
+def test_op_body_keeps_the_usual_path_between_sizes_by_default(on_16_devices_c):
+    assert on_16_devices_c["pad_off_chain_exact"]
 
 
 def test_all_reduce_selftest_on_16_devices(on_16_devices_b):
@@ -844,6 +875,56 @@ def _worker(part):
         )
 
     result = {"cases": {}, "fast": {}}
+    if part == "c":
+        run_body_pad = jax.jit(
+            jax.shard_map(
+                adapter._op_body(
+                    dataclasses.replace(statics, pad_rows=True), N_RANKS, "d"
+                ),
+                mesh=mesh,
+                in_specs=body_specs,
+                out_specs=P("d"),
+                check_vma=False,
+            )
+        )
+        result["pad"] = {}
+        for rows, n_valid in PAD_CASES:
+            bucket = adapter._kernel_rows(rows, True)
+            x, scores = inputs(rows)
+            start = time.monotonic()
+            out, races = _interpret(run_body_pad, *body_operands(x, scores, n_valid))
+            case = checks(out, x, scores, rows, n_valid, races, start, f"pad{rows}")
+            more_x, more_scores = inputs(bucket)
+            x_next = jnp.concatenate([x, more_x[rows:]])
+            scores_next = jnp.concatenate([scores, more_scores[rows:]])
+            main, _ = _interpret(
+                run_body, *body_operands(x_next, scores_next, n_valid)
+            )
+            mine = np.asarray(out).reshape(N_RANKS, rows, c["h"])
+            main = np.asarray(main).reshape(N_RANKS, bucket, c["h"])[:, :rows]
+            case["bitwise_vs_next_bucket"] = bool(
+                np.array_equal(mine.view(np.uint16), main.view(np.uint16))
+            )
+            result["pad"][f"{rows}:{n_valid}"] = case
+
+        def ones_on_real_rows(x, scores, bias, is_pad, *weights_and_statics):
+            return jnp.where(is_pad[:, None], 0.0, 1.0).astype(x.dtype) * jnp.ones_like(
+                x
+            )
+
+        adapter._tp_chain = ones_on_real_rows
+        rows, n_valid = PAD_CASES[-1]
+        x, scores = inputs(rows)
+        out = np.asarray(
+            jax.block_until_ready(run_body(*body_operands(x, scores, n_valid)))
+        ).astype(np.float32)
+        want = np.zeros((rows, c["h"]), np.float32)
+        want[:n_valid] = N_RANKS
+        result["pad_off_chain_exact"] = bool(
+            np.array_equal(out.reshape(N_RANKS, rows, c["h"]), np.broadcast_to(want, (N_RANKS, rows, c["h"])))
+        )
+        print("RESULT " + json.dumps(result))
+        return
     if part == "a":
         result["race_control"] = _race_control()
     for rows, n_valid in CASES:

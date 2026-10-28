@@ -6,12 +6,14 @@ Under MoE tensor parallelism vLLM runs the shared expert, scales and adds the
 routed output, and all-reduces the sum over the TP group. For an armed layer
 one torch op does all of it: at the token counts the kernel admits (16, 32 and 64)
 one Pallas call per rank covers routing, the shared expert, the routed experts
-and the all-reduce; every other count runs the usual TP path (router top-k,
-fused_moe_func, the shared expert's linears) and a psum in the same exported
-program. The token count is static there, so one torch op serves every bucket.
-The op's output is reduced, so arming also takes the shared expert and the
-routed scale off the runner, and VllmMoERunner._fused_output_is_reduced turns
-the runner's all-reduce off for that layer.
+and the all-reduce (counts below 16, and with TPU_MOE_TP_DECODE_PAD_ROWS counts
+between two of them, run it on the next count with trailing padding rows);
+every other count runs the usual TP path (router top-k, fused_moe_func, the
+shared expert's linears) and a psum in the same exported program. The token
+count is static there, so one torch op serves every bucket. The op's output
+is reduced, so arming also takes the shared expert and the routed scale off
+the runner, and VllmMoERunner._fused_output_is_reduced turns the runner's
+all-reduce off for that layer.
 
 `arm` runs once at the end of TPUModelRunner.load_model, when the weights,
 the MTP drafter and the token-padding mask exist. It is collective over the TP
@@ -149,6 +151,9 @@ class _OpStatics:
     # TPU_MOE_TP_DECODE_AG_PAIRS: the all-reduce paths that exchange at least
     # this many rows all-gather by chip pairs (0: none). Same bits.
     ag_pairs: int = 0
+    # TPU_MOE_TP_DECODE_PAD_ROWS: a token count between two kernel row counts
+    # runs the kernel on the next one (see _kernel_rows). Same bits per row.
+    pad_rows: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -366,6 +371,7 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
         ),
         fast=bool(envs.TPU_MOE_TP_DECODE_FAST),
         ag_pairs=int(envs.TPU_MOE_TP_DECODE_AG_PAIRS),
+        pad_rows=bool(envs.TPU_MOE_TP_DECODE_PAD_ROWS),
     )
     return _Admitted(
         shared=shared,
@@ -491,6 +497,18 @@ def _tp_chain(
     return shared + routed * st.routed_scale
 
 
+def _kernel_rows(n: int, pad_rows: bool) -> int:
+    """The row count the kernel runs an n-row call on: n when the kernel has
+    that size; the smallest size above n when n is below the smallest size,
+    or, with pad_rows, between two sizes; otherwise n (the usual path)."""
+    larger = [m for m in kernel.ROW_BUCKETS if m > n]
+    if n in kernel.ROW_BUCKETS or not larger:
+        return n
+    if n < kernel.ROW_BUCKETS[0] or pad_rows:
+        return larger[0]
+    return n
+
+
 def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
     """The op's per-rank body under shard_map over `axis`: the fused kernel at
     the token counts it admits, else this rank's partial from the usual path
@@ -517,13 +535,14 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
         is_pad = pad_mask[:n]  # replicated, so n_valid agrees on every rank
         n_valid = n - jnp.sum(is_pad.astype(jnp.int32))
         weights = (w13, w2, s13, s2, sw13, ss13, sw2, ss2)
-        m = kernel.ROW_BUCKETS[0]
-        if n < m:
-            # A decode bucket below the kernel's smallest row bucket
-            # (TPU_TOKEN_BUCKET_EXTRA=4,8): run the kernel on `m` rows, the
-            # extra rows trailing padding. The kernel skips rows >= n_valid
-            # (admission requires TPU_MOE_SKIP_PADDED_TOKENS) and every row is
-            # independent, so the first n rows are bit for bit the m-row
+        m = _kernel_rows(n, statics.pad_rows)
+        if m != n:
+            # A decode bucket the kernel has no size for (4 and 8 from
+            # TPU_TOKEN_BUCKET_EXTRA, below its smallest size; 48, between
+            # sizes, with TPU_MOE_TP_DECODE_PAD_ROWS): run the kernel on `m`
+            # rows, the extra rows trailing padding. The kernel skips rows >=
+            # n_valid (admission requires TPU_MOE_SKIP_PADDED_TOKENS) and every
+            # row is independent, so the first n rows are bit for bit the m-row
             # bucket's; the plain-XLA fallback below costs far more.
             xp = jnp.pad(x, ((0, m - n), (0, 0)))
             sp = jnp.pad(scores, ((0, m - n), (0, 0)))

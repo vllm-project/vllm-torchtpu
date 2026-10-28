@@ -556,3 +556,105 @@ def test_op_body_runs_the_prefill_kernel_above_the_cap(monkeypatch, tokens, pref
     else:
         assert calls == [("chain", tokens)]
         assert bool(jnp.all(out == 2))  # the chain's partial, psummed over 2
+
+
+@pytest.mark.parametrize("pad_rows", [False, True])
+def test_pad_rows_arms_from_its_switch(harness, monkeypatch, pad_rows):
+    monkeypatch.setattr(envs, "TPU_MOE_TP_DECODE_PAD_ROWS", pad_rows)
+    assert moe_tp_decode.arm(harness.model({})) == 1
+    assert harness.statics[0].pad_rows is pad_rows
+
+
+@pytest.mark.parametrize(
+    ("n", "pad_rows", "want"),
+    [
+        (4, False, 16),  # below the smallest size: always padded, as on main
+        (8, True, 16),
+        (16, True, 16),
+        (24, False, 24),  # between sizes: the usual path unless switched on
+        (24, True, 32),
+        (32, True, 32),
+        (48, False, 48),
+        (48, True, 64),
+        (64, True, 64),
+        (128, True, 128),  # above the largest size: the usual path
+    ],
+)
+def test_kernel_rows(n, pad_rows, want):
+    assert moe_tp_decode._kernel_rows(n, pad_rows) == want
+
+
+@pytest.mark.parametrize(
+    ("tokens", "n_valid", "pad_rows", "want"),
+    [
+        (48, 36, True, ("kernel", 64, 36)),
+        (48, 36, False, ("chain", 48)),
+        (8, 5, False, ("kernel", 16, 5)),
+        (32, 30, True, ("kernel", 32, 30)),
+    ],
+)
+def test_op_body_pads_a_call_between_kernel_sizes(
+    monkeypatch, tokens, n_valid, pad_rows, want
+):
+    import jax
+    import jax.numpy as jnp
+
+    calls = []
+
+    def fake_kernel(x, scores, bias, n_valid, *args, **kwargs):
+        calls.append(("kernel", x.shape[0]))
+        valid = jnp.arange(x.shape[0])[:, None] < n_valid
+        return jnp.where(valid, x * 3 + jnp.arange(x.shape[0])[:, None], 0).astype(
+            x.dtype
+        )
+
+    def fake_chain(x, scores, bias, is_pad, *args):
+        calls.append(("chain", x.shape[0]))
+        return jnp.where(is_pad[:, None], 0, 1).astype(x.dtype) * jnp.ones_like(x)
+
+    monkeypatch.setattr(moe_tp_decode, "_tp_chain", fake_chain)
+    monkeypatch.setattr(
+        moe_tp_decode.kernel,
+        "can_use_moe_tp_decode",
+        lambda x, *a, **k: x.shape[0] in moe_tp_decode.kernel.ROW_BUCKETS,
+    )
+    monkeypatch.setattr(moe_tp_decode.kernel, "moe_tp_decode", fake_kernel)
+    statics = moe_tp_decode._OpStatics(
+        topk=TOPK,
+        routed_scale=ROUTED_SCALE,
+        activation="silu",
+        use_sparse_core=False,
+        onehot_threshold=0,
+        pad_rows=pad_rows,
+    )
+    body = moe_tp_decode._op_body(statics, n_ranks=2, axis="d")
+    f32, f8 = jnp.float32, jnp.float8_e4m3fn
+    x = jnp.arange(tokens * H, dtype=f32).reshape(tokens, H).astype(jnp.bfloat16)
+    operands = (
+        x,
+        jnp.zeros((tokens, E), f32),
+        jnp.zeros((E,), f32),
+        # The runner's padding mask is longer than any bucket.
+        jnp.arange(128) >= n_valid,
+        jnp.zeros((E, H, 2 * INTER), f8),
+        jnp.zeros((E, INTER, H), f8),
+        jnp.zeros((E, 1, 1, 2 * INTER), f32),
+        jnp.zeros((E, 1, 1, H), f32),
+        jnp.zeros((H, 2 * FS), f8),
+        jnp.zeros((2 * FS,), f32),
+        jnp.zeros((FS, H), f8),
+        jnp.zeros((H,), f32),
+        jnp.zeros((1, 1), jnp.int32),
+        jnp.zeros((1, 1), jnp.int32),
+    )
+    stacked = [jnp.stack([a, a]) for a in operands]
+    out = jax.vmap(body, axis_name="d")(*stacked)
+    assert out.shape == (2, tokens, H)
+    rows = jnp.arange(tokens)[:, None]
+    if want[0] == "kernel":
+        assert calls == [want[:2]]
+        expected = jnp.where(rows < n_valid, x * 3 + rows, 0).astype(x.dtype)
+    else:
+        assert calls == [want]
+        expected = jnp.where(rows < n_valid, 2.0, 0.0).astype(x.dtype)
+    assert bool(jnp.all(out == expected[None]))
