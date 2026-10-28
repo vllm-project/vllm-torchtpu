@@ -22,6 +22,7 @@ the same schedule and communication once per head pair.
 
 import functools
 import math
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -38,11 +39,23 @@ from vllm_torchtpu.kernels.experimental.batched_rpa.utils import (
     get_dtype_packing,
     strided_load,
 )
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import (
+    splash_attention_kernel as _splash_kernel,
+)
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import (
+    splash_attention_mask as _splash_mask,
+)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
     RuntimeScheduleField,
     TilePlanField,
-    build_pcp_streaming_schedule_inputs_from_metadata_jax,
     query_row_positions,
+)
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.stage_plan import (
+    PCP_STREAMING_RPA_SINGLE_GROUP_RUNGS,
+    PCP_STREAMING_RPA_VPAGE_GROUP_SIZE,
+    _build_writeback_segment_descriptors,
+    _compute_misaligned_writeback_slots,
+    _compute_pcp_capture_source_rows_for_cache_rank,
 )
 
 AXIS = "pcp"
@@ -2382,12 +2395,561 @@ def _pcp_streaming_attention_zero_history_output_multi_head_pallas_call(
     )
 
 
+def _get_pcp_rank_without_axis_index(pcp_axis_name: str, pcp_size: int) -> jax.Array:
+    """Select this PCP rank shard from replicated data without axis_index."""
+    ranks = jnp.arange(pcp_size, dtype=jnp.int32)
+    exchanged = lax.all_to_all(
+        ranks,
+        axis_name=pcp_axis_name,
+        split_axis=0,
+        concat_axis=0,
+        tiled=True,
+    )
+    return exchanged[0]
+
+
+def _gather_vpages_to_head_major(
+    kv_cache_local: jax.Array,
+    block_ids: jax.Array,
+    *,
+    kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    pcp_size: int,
+    interleave_size: int,
+    kv_layout: KVLayout,
+    pcp_axis_name: str,
+) -> tuple[jax.Array, jax.Array]:
+    """Gathers block_ids from all PCP ranks to head-major K and V.
+
+    Each is [kv_heads, num_vpages * page_size * pcp_size, head_dim]; pages are
+    transposed before the all-gather, at 1/pcp_size of the gathered volume.
+    """
+    num_vpages = int(block_ids.shape[0])
+    chunks_per_page = page_size // interleave_size
+    virtual_page_size = page_size * pcp_size
+    num_tokens = num_vpages * virtual_page_size
+
+    local_pages = kv_cache_local[block_ids]
+    if kv_layout == KVLayout.SEQ_ALONG_LANE:
+        local_hm = jnp.transpose(
+            local_pages.reshape(
+                num_vpages,
+                kv_heads,
+                2,
+                head_dim,
+                chunks_per_page,
+                interleave_size,
+            ),
+            (2, 1, 0, 4, 5, 3),
+        )
+        pages_hm = lax.all_gather(
+            local_hm, axis_name=pcp_axis_name, axis=4, tiled=True
+        ).reshape(2, kv_heads, num_tokens, head_dim)
+        return pages_hm[0], pages_hm[1]
+
+    packed_planes = local_pages.shape[2] * local_pages.shape[3]
+    local_hm = jnp.transpose(
+        local_pages.reshape(
+            num_vpages,
+            chunks_per_page,
+            interleave_size,
+            packed_planes,
+            head_dim,
+        ),
+        (3, 0, 1, 2, 4),
+    )
+    pages_hm = lax.all_gather(local_hm, axis_name=pcp_axis_name, axis=3, tiled=True)
+    # Skip StableHLO slice when 2 * kv_heads fills whole sublane packs; slicing
+    # after all_gather keeps axis 0 divisible by 4 so transpose is a zero-copy bitcast.
+    if packed_planes != 2 * kv_heads:
+        pages_hm = pages_hm[: 2 * kv_heads]
+    pages_hm = pages_hm.reshape(kv_heads, 2, num_tokens, head_dim)
+    return pages_hm[:, 0, :, :], pages_hm[:, 1, :, :]
+
+
+def _merge_attention_partials(
+    o_acc: jax.Array,
+    lse_acc: jax.Array,
+    o_part: jax.Array,
+    lse_part: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Merges normalized attention outputs [h, t, d] by natural-log LSE [h, t] in
+    f32.
+    """
+    lse_max = jnp.maximum(lse_acc, lse_part)
+    # A row with no keys in either partial has lse = -inf; a zero max keeps
+    # exp() finite.
+    lse_max = jnp.where(jnp.isneginf(lse_max), 0.0, lse_max)
+    w_acc = jnp.exp(lse_acc - lse_max)
+    w_part = jnp.exp(lse_part - lse_max)
+    w_sum = w_acc + w_part
+    # w_sum is 0 for an empty row and in [1, 2] otherwise, so the floor changes
+    # only empty rows.
+    inv_w_sum = 1.0 / jnp.maximum(w_sum, 1.0)
+    o_merged = (
+        o_acc * (w_acc * inv_w_sum)[..., None]
+        + o_part.astype(jnp.float32) * (w_part * inv_w_sum)[..., None]
+    )
+    return o_merged, lse_max + jnp.log(w_sum)
+
+
+def _gather_vpage_group_kv_and_seg(
+    kv_cache_local: jax.Array,
+    stage_plan: Any,
+    start: int | jax.Array,
+    group_size: int,
+    *,
+    kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    pcp_size: int,
+    interleave_size: int,
+    kv_layout: KVLayout,
+    pcp_axis_name: str,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Gathers unpacked K, V, and token segment IDs for one vpage group."""
+    virtual_page_size = page_size * pcp_size
+    block_ids = lax.dynamic_slice_in_dim(stage_plan.sorted_block_ids, start, group_size)
+    seg_ids = lax.dynamic_slice_in_dim(stage_plan.sorted_seg_ids, start, group_size)
+    valid_tokens = lax.dynamic_slice_in_dim(
+        stage_plan.sorted_vpage_valid_tokens, start, group_size
+    )
+    k_hm, v_hm = _gather_vpages_to_head_major(
+        kv_cache_local,
+        block_ids,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+        kv_layout=kv_layout,
+        pcp_axis_name=pcp_axis_name,
+    )
+    token_in_vpage = lax.broadcasted_iota(jnp.int32, (group_size, virtual_page_size), 1)
+    # Unwritten slots may hold NaN (fp8 pools are torch.empty); s @ v would
+    # spread it through zero softmax weights, so zero them here.
+    kv_valid = (token_in_vpage < valid_tokens[:, None]) & (seg_ids[:, None] >= 0)
+    kv_valid = kv_valid.reshape(1, group_size * virtual_page_size, 1)
+    k_hm = jnp.where(kv_valid, k_hm, jnp.zeros((), dtype=k_hm.dtype))
+    v_hm = jnp.where(kv_valid, v_hm, jnp.zeros((), dtype=v_hm.dtype))
+    kv_seg_ids = jnp.where(
+        token_in_vpage < valid_tokens[:, None], seg_ids[:, None], -2
+    ).reshape(group_size * virtual_page_size)
+    return k_hm, v_hm, kv_seg_ids
+
+
+def _attend_single_vpage_group(
+    kv_cache_local: jax.Array,
+    q_scaled_hm: jax.Array,
+    stage_plan: Any,
+    group_size: int,
+    *,
+    splash_cfg: _splash_kernel.SplashConfig,
+    kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    pcp_size: int,
+    interleave_size: int,
+    kv_layout: KVLayout,
+    pcp_axis_name: str,
+) -> jax.Array:
+    """Runs one Splash call without LSE residuals over a single vpage group."""
+    virtual_page_size = page_size * pcp_size
+    group_tokens = group_size * virtual_page_size
+    splash_single = _splash_kernel.make_splash_mha_single_device(
+        _splash_mask.FullMask((q_scaled_hm.shape[1], group_tokens)),
+        config=splash_cfg,
+        save_residuals=False,
+    )
+    k_hm, v_hm, kv_seg_ids = _gather_vpage_group_kv_and_seg(
+        kv_cache_local,
+        stage_plan,
+        0,
+        group_size,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+        kv_layout=kv_layout,
+        pcp_axis_name=pcp_axis_name,
+    )
+    splash_fn = _splash_kernel.SplashAttentionKernel(
+        splash_single.fwd_mask_info._replace(q_sequence=stage_plan.q_sequence),
+        splash_single.dkv_mask_info,
+        **{**splash_single.kwargs, "mask_function": _causal_mask_function},
+    )
+    o_group = splash_fn(
+        q_scaled_hm,
+        k_hm,
+        v_hm,
+        _splash_kernel.SegmentIds(q=stage_plan.q_seg_ids, kv=kv_seg_ids),
+        save_residuals=False,
+    )
+    return o_group.astype(jnp.float32)
+
+
+def _attend_vpage_group_with_lse(
+    group_idx: jax.Array,
+    carry: tuple[jax.Array, jax.Array],
+    *,
+    kv_cache_local: jax.Array,
+    q_scaled_hm: jax.Array,
+    stage_plan: Any,
+    splash_base: Any,
+    group_size: int,
+    kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    pcp_size: int,
+    interleave_size: int,
+    kv_layout: KVLayout,
+    pcp_axis_name: str,
+) -> tuple[jax.Array, jax.Array]:
+    """Accumulates one vpage group's output and log-sum-exp into running state."""
+    virtual_page_size = page_size * pcp_size
+    start = group_idx * group_size
+    k_hm, v_hm, kv_seg_ids = _gather_vpage_group_kv_and_seg(
+        kv_cache_local,
+        stage_plan,
+        start,
+        group_size,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+        kv_layout=kv_layout,
+        pcp_axis_name=pcp_axis_name,
+    )
+    splash_fn = _splash_kernel.SplashAttentionKernel(
+        splash_base.fwd_mask_info._replace(
+            q_sequence=stage_plan.q_sequence - start * virtual_page_size
+        ),
+        splash_base.dkv_mask_info,
+        **{**splash_base.kwargs, "mask_function": _causal_mask_function},
+    )
+    o_group, stats = splash_fn(
+        q_scaled_hm,
+        k_hm,
+        v_hm,
+        _splash_kernel.SegmentIds(q=stage_plan.q_seg_ids, kv=kv_seg_ids),
+        save_residuals=True,
+    )
+    return _merge_attention_partials(*carry, o_group, stats["logsumexp"])
+
+
+def _attend_multi_vpage_groups(
+    kv_cache_local: jax.Array,
+    q_scaled_hm: jax.Array,
+    stage_plan: Any,
+    group_size: int,
+    *,
+    splash_cfg: _splash_kernel.SplashConfig,
+    kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    pcp_size: int,
+    interleave_size: int,
+    kv_layout: KVLayout,
+    pcp_axis_name: str,
+) -> jax.Array:
+    """Streams Splash across multiple vpage groups with online LSE reduction."""
+    virtual_page_size = page_size * pcp_size
+    group_tokens = group_size * virtual_page_size
+    splash_base = _splash_kernel.make_splash_mha_single_device(
+        _splash_mask.FullMask((q_scaled_hm.shape[1], group_tokens)),
+        config=splash_cfg,
+        save_residuals=True,
+    )
+    start = 0
+    k_hm, v_hm, kv_seg_ids = _gather_vpage_group_kv_and_seg(
+        kv_cache_local,
+        stage_plan,
+        start,
+        group_size,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+        kv_layout=kv_layout,
+        pcp_axis_name=pcp_axis_name,
+    )
+    splash_fn = _splash_kernel.SplashAttentionKernel(
+        splash_base.fwd_mask_info._replace(q_sequence=stage_plan.q_sequence),
+        splash_base.dkv_mask_info,
+        **{**splash_base.kwargs, "mask_function": _causal_mask_function},
+    )
+    o_first, stats = splash_fn(
+        q_scaled_hm,
+        k_hm,
+        v_hm,
+        _splash_kernel.SegmentIds(q=stage_plan.q_seg_ids, kv=kv_seg_ids),
+        save_residuals=True,
+    )
+    lse_first = stats["logsumexp"]
+
+    num_groups = (stage_plan.num_active_vpages + group_size - 1) // group_size
+    body_fn = functools.partial(
+        _attend_vpage_group_with_lse,
+        kv_cache_local=kv_cache_local,
+        q_scaled_hm=q_scaled_hm,
+        stage_plan=stage_plan,
+        splash_base=splash_base,
+        group_size=group_size,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+        kv_layout=kv_layout,
+        pcp_axis_name=pcp_axis_name,
+    )
+    o_acc, _ = lax.fori_loop(
+        1,
+        num_groups,
+        body_fn,
+        (o_first.astype(jnp.float32), lse_first),
+    )
+    return o_acc
+
+
+def _dispatch_single_group_rungs(
+    rem_rungs: tuple[int, ...],
+    stage_plan: Any,
+    kv_cache_local: jax.Array,
+    q_scaled_hm: jax.Array,
+    vpage_group_size: int,
+    *,
+    splash_cfg: _splash_kernel.SplashConfig,
+    kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    pcp_size: int,
+    interleave_size: int,
+    kv_layout: KVLayout,
+    pcp_axis_name: str,
+) -> jax.Array:
+    """Dispatches to the smallest single-group rung covering active vpages."""
+    r0 = rem_rungs[0]
+
+    def _single_fn(_):
+        return _attend_single_vpage_group(
+            kv_cache_local,
+            q_scaled_hm,
+            stage_plan,
+            r0,
+            splash_cfg=splash_cfg,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            pcp_size=pcp_size,
+            interleave_size=interleave_size,
+            kv_layout=kv_layout,
+            pcp_axis_name=pcp_axis_name,
+        )
+
+    if len(rem_rungs) == 1:
+
+        def _fallback_fn(_):
+            return _attend_multi_vpage_groups(
+                kv_cache_local,
+                q_scaled_hm,
+                stage_plan,
+                vpage_group_size,
+                splash_cfg=splash_cfg,
+                kv_heads=kv_heads,
+                head_dim=head_dim,
+                page_size=page_size,
+                pcp_size=pcp_size,
+                interleave_size=interleave_size,
+                kv_layout=kv_layout,
+                pcp_axis_name=pcp_axis_name,
+            )
+
+    else:
+
+        def _fallback_fn(_):
+            return _dispatch_single_group_rungs(
+                rem_rungs[1:],
+                stage_plan,
+                kv_cache_local,
+                q_scaled_hm,
+                vpage_group_size,
+                splash_cfg=splash_cfg,
+                kv_heads=kv_heads,
+                head_dim=head_dim,
+                page_size=page_size,
+                pcp_size=pcp_size,
+                interleave_size=interleave_size,
+                kv_layout=kv_layout,
+                pcp_axis_name=pcp_axis_name,
+            )
+
+    return lax.cond(
+        stage_plan.num_active_vpages <= r0,
+        _single_fn,
+        _fallback_fn,
+        operand=None,
+    )
+
+
+def _attend_over_vpage_groups(
+    kv_cache_local: jax.Array,
+    q_scaled_hm: jax.Array,
+    stage_plan: Any,
+    *,
+    splash_cfg: _splash_kernel.SplashConfig,
+    vpage_group_size: int,
+    kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    pcp_size: int,
+    interleave_size: int,
+    kv_layout: KVLayout,
+    pcp_axis_name: str,
+) -> jax.Array:
+    """Runs Splash over the plan's active vpages, one vpage group per step.
+
+    Returns the f32 attention output [q_heads, local_tokens, head_dim].
+    """
+    total_vpages = stage_plan.sorted_block_ids.shape[0]
+    if total_vpages % vpage_group_size:
+        # dynamic_slice clamps a group that runs past the end, which would count its
+        # pages twice.
+        raise ValueError(
+            "The stage plan must hold whole vpage groups: "
+            f"{stage_plan.sorted_block_ids.shape=} {vpage_group_size=}."
+        )
+
+    if vpage_group_size == PCP_STREAMING_RPA_VPAGE_GROUP_SIZE:
+        virtual_page_size = page_size * pcp_size
+        rungs = tuple(
+            r
+            for r in PCP_STREAMING_RPA_SINGLE_GROUP_RUNGS
+            if r <= total_vpages and (r * virtual_page_size) % splash_cfg.block_kv == 0
+        )
+        if rungs:
+            return _dispatch_single_group_rungs(
+                rungs,
+                stage_plan,
+                kv_cache_local,
+                q_scaled_hm,
+                vpage_group_size,
+                splash_cfg=splash_cfg,
+                kv_heads=kv_heads,
+                head_dim=head_dim,
+                page_size=page_size,
+                pcp_size=pcp_size,
+                interleave_size=interleave_size,
+                kv_layout=kv_layout,
+                pcp_axis_name=pcp_axis_name,
+            )
+
+    if vpage_group_size >= 32 and (vpage_group_size & (vpage_group_size - 1)) == 0:
+        return lax.cond(
+            stage_plan.num_active_vpages <= vpage_group_size,
+            lambda _: _attend_single_vpage_group(
+                kv_cache_local,
+                q_scaled_hm,
+                stage_plan,
+                vpage_group_size,
+                splash_cfg=splash_cfg,
+                kv_heads=kv_heads,
+                head_dim=head_dim,
+                page_size=page_size,
+                pcp_size=pcp_size,
+                interleave_size=interleave_size,
+                kv_layout=kv_layout,
+                pcp_axis_name=pcp_axis_name,
+            ),
+            lambda _: _attend_multi_vpage_groups(
+                kv_cache_local,
+                q_scaled_hm,
+                stage_plan,
+                vpage_group_size,
+                splash_cfg=splash_cfg,
+                kv_heads=kv_heads,
+                head_dim=head_dim,
+                page_size=page_size,
+                pcp_size=pcp_size,
+                interleave_size=interleave_size,
+                kv_layout=kv_layout,
+                pcp_axis_name=pcp_axis_name,
+            ),
+            operand=None,
+        )
+    return _attend_multi_vpage_groups(
+        kv_cache_local,
+        q_scaled_hm,
+        stage_plan,
+        vpage_group_size,
+        splash_cfg=splash_cfg,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+        kv_layout=kv_layout,
+        pcp_axis_name=pcp_axis_name,
+    )
+
+
+def _causal_mask_function(q_ids: jax.Array, kv_ids: jax.Array) -> jax.Array:
+    return q_ids >= kv_ids
+
+
+def _route_current_kv_to_captured_kv(
+    current_kv_local: jax.Array,
+    cu_q_lens: jax.Array,
+    kv_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    local_tokens: int,
+    pcp_size: int,
+    interleave_size: int,
+    kv_layout: KVLayout,
+    pcp_axis_name: str,
+    window_offset: int | jax.Array = 0,
+) -> jax.Array:
+    """Routes current_kv_local rows to this cache rank's captured rows by token."""
+    my_rank = _get_pcp_rank_without_axis_index(pcp_axis_name, pcp_size)
+    src_rows, row_valid = _compute_pcp_capture_source_rows_for_cache_rank(
+        kv_lens,
+        cu_q_lens,
+        distribution,
+        my_rank,
+        local_tokens=local_tokens,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+        window_offset=window_offset,
+    )
+    zero = jnp.zeros((), dtype=current_kv_local.dtype)
+    if kv_layout == KVLayout.SEQ_ALONG_LANE:
+        # Tokens are the minor axis; lanes past local_tokens are padding.
+        all_kv = lax.all_gather(
+            current_kv_local[..., :local_tokens],
+            axis_name=pcp_axis_name,
+            axis=-1,
+            tiled=True,
+        )
+        captured = jnp.where(row_valid, all_kv[..., src_rows], zero)
+        pad = current_kv_local.shape[-1] - local_tokens
+        return jnp.pad(captured, [(0, 0)] * (captured.ndim - 1) + [(0, pad)])
+    all_kv = lax.all_gather(
+        current_kv_local, axis_name=pcp_axis_name, axis=0, tiled=True
+    )
+    row_valid = row_valid.reshape((local_tokens,) + (1,) * (current_kv_local.ndim - 1))
+    return jnp.where(row_valid, all_kv[src_rows], zero)
+
+
 def pcp_streaming_attention_page_groups_packed_local_from_metadata(
     q_local,
     current_kv_local,
     kv_cache_local,
     kv_lens,
-    page_indices,
     cu_q_lens,
     distribution,
     writeback_segment_descriptors,
@@ -2395,66 +2957,24 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
     *,
     pcp_size: int,
     interleave_size: int,
-    q_block_size: int = PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
-    sm_scale: float,
-    q_compute_size: int | None = None,
+    sm_scale: float | None = 1.0,
     num_lanes: int = 1,
     k_scale: float | None = None,
     v_scale: float | None = None,
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
     mesh_axis_names: tuple[str, ...] = (AXIS,),
     pcp_axis_name: str = AXIS,
+    stage_plan: Any,
+    vpage_group_size: int,
 ):
-    """Generate the narrow metadata schedule and run split PCP RPA.
+    """Unified local Tokamax Splash over [history + current].
 
-    The current causal pass consumes freshly packed local KV directly and
-    captures passing rows on their request-absolute cache owner. The captured
-    KV is written to the local cache immediately after the current pass, ending
-    the capture buffer lifetime before the history/output pass.
-    The history no-causal pass reads only tokens before the current request
-    chunk, so it is unaffected by the newly written current rows.
-
-    Args:
-        q_local: [local_tokens, kv_heads, q_per_kv, head_dim] compact Q rows
-            for the current PCP rank.
-        current_kv_local: Freshly computed packed KV rows. Legacy layout is
-            [local_tokens, packed_kv_heads_x2, kv_packing, head_dim];
-            SEQ_ALONG_LANE is
-            [2 * kv_heads, head_dim / kv_packing, kv_packing, local_tokens].
-        kv_cache_local: Local packed KV-cache shard. Legacy layout is
-            [pages, page_size, packed_kv_heads_x2, kv_packing, head_dim];
-            SEQ_ALONG_LANE is
-            [pages, 2 * kv_heads, head_dim / kv_packing, kv_packing,
-            page_size].
-        kv_lens: [max_num_seqs]. Total KV length for each request, including
-            the query tokens in the current prefill chunk.
-        page_indices: Flattened or 2D vLLM block table. Entries are reduced
-            modulo the local KV-cache block count before local page loads.
-        cu_q_lens: [max_num_seqs + 1]. Cumulative query-token offsets for the
-            current batch.
-        distribution: [3] vLLM request distribution metadata. The third entry
-            is the number of active requests considered by the schedule.
-        writeback_segment_descriptors: [3, max_segments] dense-source to
-            flat-cache copy descriptors for this cache rank.
-        writeback_num_segments: Number of active writeback descriptors.
-        pcp_size: Number of ranks in the PCP ring.
-        interleave_size: Number of consecutive global tokens assigned to one
-            rank before rotating to the next PCP rank. Must divide the KV page
-            size.
-        q_block_size: Static local Q tile size used by the Pallas kernel.
-        q_compute_size: Static Q rows consumed per multi-head softmax compute
-            step. Defaults to `q_block_size`.
-        sm_scale: Softmax scale applied to QK scores.
-        num_lanes: Number of independent schedule lanes. The metadata path
-            currently supports one lane.
-        k_scale: Optional dequantization scale for K.
-        v_scale: Optional dequantization scale for V.
-        mesh_axis_names: Names of the active JAX mesh axes.
-        pcp_axis_name: Mesh axis used as the PCP ring axis.
-
-    Returns:
-        A pair of local attention output and updated local KV cache.
+    Runs after local KV cache writeback.
     """
+    if num_lanes != 1:
+        raise NotImplementedError("Only num_lanes == 1 is supported.")
+    if pcp_axis_name not in mesh_axis_names:
+        raise ValueError(f"{pcp_axis_name=} must be in {mesh_axis_names=}.")
     _validate_packed_kv_layout(
         q_local, kv_cache_local, kv_layout=kv_layout, k_scale=k_scale, v_scale=v_scale
     )
@@ -2478,51 +2998,27 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
                 f"cache_tail={kv_cache_local.shape[2:]}."
             )
         page_size = kv_cache_local.shape[1]
-    (
-        tile_plan,
-        block_tables,
-        current_tile_ids,
-        current_group_starts,
-        current_meta,
-        history_tile_ids,
-        history_group_starts,
-        history_meta,
-    ) = build_pcp_streaming_schedule_inputs_from_metadata_jax(
-        kv_lens=kv_lens,
-        page_indices=page_indices,
-        cu_q_lens=cu_q_lens,
-        distribution=distribution,
-        global_bucket_tokens=q_local.shape[0] * pcp_size,
-        local_kv_cache_num_blocks=kv_cache_local.shape[0],
-        page_size=page_size,
-        pcp_size=pcp_size,
-        interleave_size=interleave_size,
-        q_block_size=q_block_size,
-        num_lanes=num_lanes,
-    )
 
-    m_state, l_state, acc_state, captured_kv_local = (
-        _pcp_streaming_attention_current_state_page_groups_multi_head_pallas_call(
-            q_local,
-            current_kv_local,
-            kv_cache_local[None, ...],
-            tile_plan,
-            block_tables,
-            current_tile_ids,
-            current_group_starts,
-            current_meta,
+    local_tokens, kv_heads, q_per_kv, head_dim = q_local.shape
+    q_heads = kv_heads * q_per_kv
+
+    captured_kv_local = lax.cond(
+        stage_plan.needs_reroute,
+        lambda kv_in: _route_current_kv_to_captured_kv(
+            kv_in,
+            cu_q_lens,
+            kv_lens,
+            distribution,
+            local_tokens=local_tokens,
             pcp_size=pcp_size,
             interleave_size=interleave_size,
-            q_block_size=q_block_size,
-            q_compute_size=q_compute_size,
-            sm_scale=sm_scale,
             kv_layout=kv_layout,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            mesh_axis_names=mesh_axis_names,
             pcp_axis_name=pcp_axis_name,
-        )
+        ),
+        lambda kv_in: kv_in,
+        current_kv_local,
     )
+
     kv_cache_local = write_captured_kv_to_local_cache(
         kv_cache_local,
         captured_kv_local,
@@ -2530,40 +3026,120 @@ def pcp_streaming_attention_page_groups_packed_local_from_metadata(
         writeback_num_segments,
         kv_layout=kv_layout,
     )
-    history_output = (
-        _pcp_streaming_attention_history_output_page_groups_multi_head_pallas_call(
-            q_local,
-            kv_cache_local[None, ...],
-            tile_plan,
-            block_tables,
-            history_tile_ids,
-            history_group_starts,
-            m_state,
-            l_state,
-            acc_state,
-            history_meta,
-            pcp_size=pcp_size,
-            interleave_size=interleave_size,
-            q_block_size=q_block_size,
-            q_compute_size=q_compute_size,
-            sm_scale=sm_scale,
-            kv_layout=kv_layout,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            mesh_axis_names=mesh_axis_names,
-            pcp_axis_name=pcp_axis_name,
+    # Synthetic unit-test PCPStagePlan fixtures omit block_tables when skipping
+    # multi-window writeback; keep window 0 outside lax.cond to preserve KV-cache
+    # input-output aliasing without an HBM relayout copy.
+    plan_block_tables = stage_plan.block_tables
+    if plan_block_tables is not None:
+        num_writeback_windows = jnp.where(
+            stage_plan.needs_reroute,
+            jnp.maximum(
+                1,
+                (
+                    jnp.asarray(stage_plan.max_writeback_count, dtype=jnp.int32)
+                    + local_tokens
+                    - 1
+                )
+                // local_tokens,
+            ),
+            1,
         )
+        max_wb_segments = int(writeback_segment_descriptors.shape[1])
+        local_num_blocks = int(kv_cache_local.shape[0])
+
+        def _write_overflow_window(
+            win_idx: jax.Array, cache_carry: jax.Array
+        ) -> jax.Array:
+            # Bind metadata to win_idx so XLA does not hoist 32K-row scatters to ENTRY.
+            win_idx_b, kv_lens_b, cu_q_lens_b, dist_b, block_tables_b = (
+                lax.optimization_barrier(
+                    (
+                        win_idx,
+                        kv_lens,
+                        cu_q_lens,
+                        distribution,
+                        plan_block_tables,
+                    )
+                )
+            )
+            window_offset = win_idx_b * local_tokens
+            captured_win = _route_current_kv_to_captured_kv(
+                current_kv_local,
+                cu_q_lens_b,
+                kv_lens_b,
+                dist_b,
+                local_tokens=local_tokens,
+                pcp_size=pcp_size,
+                interleave_size=interleave_size,
+                kv_layout=kv_layout,
+                pcp_axis_name=pcp_axis_name,
+                window_offset=window_offset,
+            )
+            my_rank = _get_pcp_rank_without_axis_index(pcp_axis_name, pcp_size)
+            win_slots, win_count, _ = _compute_misaligned_writeback_slots(
+                kv_lens_b,
+                cu_q_lens_b,
+                dist_b,
+                block_tables_b,
+                my_rank,
+                local_tokens=local_tokens,
+                local_kv_cache_num_blocks=local_num_blocks,
+                page_size=page_size,
+                pcp_size=pcp_size,
+                interleave_size=interleave_size,
+                window_offset=window_offset,
+            )
+            win_desc, win_num_seg = _build_writeback_segment_descriptors(
+                win_slots,
+                win_count,
+                max_segments=max_wb_segments,
+                kv_layout=kv_layout,
+                page_size=page_size,
+            )
+            return write_captured_kv_to_local_cache(
+                cache_carry,
+                captured_win,
+                win_desc,
+                win_num_seg,
+                kv_layout=kv_layout,
+            )
+
+        kv_cache_local = lax.fori_loop(
+            1, num_writeback_windows, _write_overflow_window, kv_cache_local
+        )
+    eff_q_scale = (
+        (1.0 if sm_scale is None else float(sm_scale))
+        * (1.0 if k_scale is None else float(k_scale))
+        * _splash_kernel.LOG2E
     )
-    output = _pcp_streaming_attention_zero_history_output_multi_head_pallas_call(
-        history_output,
-        tile_plan,
-        current_tile_ids,
-        current_group_starts,
-        m_state,
-        l_state,
-        acc_state,
-        current_meta,
-        q_block_size=q_block_size,
+    q_hm = jnp.transpose(q_local, (1, 2, 0, 3)).reshape(q_heads, local_tokens, head_dim)
+    q_scaled_hm = q_hm * jnp.asarray(eff_q_scale, dtype=q_hm.dtype)
+    virtual_page_size = page_size * pcp_size
+    splash_cfg = _splash_kernel.SplashConfig(
+        block_q=min(128, local_tokens),
+        block_kv=max(512, math.gcd(virtual_page_size, 1024)),
+        block_kv_compute=256,
+        num_stacked_q_heads=math.gcd(16, q_per_kv),
+        use_base2_exp=True,
+        q_prescaled_log2e=True,
+    )
+    o_acc = _attend_over_vpage_groups(
+        kv_cache_local,
+        q_scaled_hm,
+        stage_plan,
+        splash_cfg=splash_cfg,
+        vpage_group_size=vpage_group_size,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+        kv_layout=kv_layout,
         pcp_axis_name=pcp_axis_name,
     )
+    o_hm = (o_acc * (1.0 if v_scale is None else float(v_scale))).astype(q_local.dtype)
+    output = jnp.transpose(
+        o_hm.reshape(kv_heads, q_per_kv, local_tokens, head_dim), (2, 0, 1, 3)
+    )
+    output = jnp.where((stage_plan.q_seg_ids >= 0)[:, None, None, None], output, 0)
     return output, kv_cache_local

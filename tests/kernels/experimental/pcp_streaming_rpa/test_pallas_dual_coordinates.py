@@ -25,7 +25,10 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import wrapper as pcp_
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import (
     build_pcp_rank_major_token_order,
 )
-from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import TilePlanField
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
+    TilePlanField,
+    build_pcp_streaming_schedule_inputs_from_metadata_jax,
+)
 
 pytestmark = pytest.mark.multichip
 
@@ -168,7 +171,16 @@ def _naive_causal_attention(q, k, v, request_absolute_start, sm_scale):
 
 
 def _run_real_pallas(
-    q, current_kv, kv_cache, kv_lens, page_indices, cu_q_lens, distribution, mesh
+    q,
+    current_kv,
+    kv_cache,
+    kv_lens,
+    page_indices,
+    cu_q_lens,
+    distribution,
+    mesh,
+    *,
+    vpage_group_size: int = kernel.PCP_STREAMING_RPA_VPAGE_GROUP_SIZE,
 ):
     pallas_attention = (
         kernel.pcp_streaming_attention_page_groups_packed_local_from_metadata
@@ -183,51 +195,32 @@ def _run_real_pallas(
         cu_q_lens_local,
         distribution_local,
     ):
-        rank_major_query_rows = (
-            pcp_wrapper._compute_pcp_rank_major_query_row_mapping_from_metadata(
-                kv_lens_local,
-                cu_q_lens_local,
-                distribution_local,
-                local_padded_tokens=q_local.shape[0],
-                pcp_size=PCP_SIZE,
-                interleave_size=INTERLEAVE_SIZE,
-            )
-        )
-        block_tables = pcp_wrapper._reshape_metadata_page_indices_jax(
-            page_indices_local, kv_lens_local.shape[0]
-        )
-        writeback_mapping = pcp_wrapper._compute_pcp_kv_writeback_mapping(
-            rank_major_query_rows,
-            block_tables,
+        local_stage_plan = pcp_wrapper._stage_plan_mod.build_pcp_local_stage_plan(
+            kv_lens_local,
+            page_indices_local,
+            cu_q_lens_local,
+            distribution_local,
+            local_tokens=q_local.shape[0],
             local_kv_cache_num_blocks=kv_cache_local.shape[0],
             page_size=kv_cache_local.shape[1],
             pcp_size=PCP_SIZE,
             interleave_size=INTERLEAVE_SIZE,
-        )
-        cache_rank = jax.lax.axis_index(AXIS)
-        compact_slot_ids = pcp_wrapper._compact_writeback_slot_ids_for_cache_rank(
-            writeback_mapping, cache_rank
-        )
-        segment_descriptors, num_segments = (
-            pcp_wrapper._build_writeback_segment_descriptors(
-                compact_slot_ids,
-                writeback_mapping.writeback_counts[cache_rank],
-            )
+            vpage_group_size=vpage_group_size,
+            pcp_axis_name=AXIS,
         )
         return pallas_attention(
             q_local,
             current_kv_local,
             kv_cache_local,
             kv_lens_local,
-            page_indices_local,
             cu_q_lens_local,
             distribution_local,
-            segment_descriptors,
-            num_segments,
+            local_stage_plan.segment_descriptors,
+            local_stage_plan.num_segments,
+            stage_plan=local_stage_plan,
+            vpage_group_size=vpage_group_size,
             pcp_size=PCP_SIZE,
             interleave_size=INTERLEAVE_SIZE,
-            q_block_size=Q_BLOCK_SIZE,
-            q_compute_size=Q_BLOCK_SIZE,
             sm_scale=1.0 / math.sqrt(HEAD_DIM),
             mesh_axis_names=tuple(mesh.axis_names),
             pcp_axis_name=AXIS,
@@ -286,7 +279,7 @@ def test_real_pallas_uses_batch_flat_owner_with_long_history_and_padding(
     num_local_pages = (kv_len + PCP_SIZE * PAGE_SIZE - 1) // (PCP_SIZE * PAGE_SIZE)
     kv_cache = _pack_kv_cache(k_request, v_request, num_local_pages)
 
-    schedule_inputs = kernel.build_pcp_streaming_schedule_inputs_from_metadata_jax(
+    schedule_inputs = build_pcp_streaming_schedule_inputs_from_metadata_jax(
         kv_lens=np.array([kv_len], dtype=np.int32),
         page_indices=np.arange(num_local_pages, dtype=np.int32),
         cu_q_lens=np.array([0, q_len], dtype=np.int32),
@@ -483,8 +476,6 @@ def test_real_wrapper_writes_ring_captured_kv_before_history(release_jax_backend
         attention_sink=None,
         sm_scale=1.0 / math.sqrt(HEAD_DIM),
         cp_kv_cache_interleave_size=INTERLEAVE_SIZE,
-        q_block_size=Q_BLOCK_SIZE,
-        q_compute_size=Q_BLOCK_SIZE,
     )
     output.block_until_ready()
     new_cache.block_until_ready()
@@ -594,3 +585,105 @@ def test_real_pallas_multi_request_causal_positions(
     request_1 = output_request_major[q_lens[0] : sum(q_lens)]
     assert np.count_nonzero(request_1[:INTERLEAVE_SIZE]) > 0
     assert np.count_nonzero(token_order < 0) == (GLOBAL_BUCKET_TOKENS - sum(q_lens))
+
+
+def test_real_pallas_multi_group_merge_with_two_requests(release_jax_backend):
+    devices = _require_tpu_devices()
+    vpage_group_size = 2
+    q_lens = [120, 90]
+    request_absolute_starts = [580, 560]
+    kv_lens_list = [
+        start + q_len for start, q_len in zip(request_absolute_starts, q_lens)
+    ]
+    token_owner_starts = [0, q_lens[0]]
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    rng = np.random.default_rng(2028)
+    total_q = sum(q_lens)
+    total_kv = sum(kv_lens_list)
+    global_q = rng.normal(size=(total_q, 1, 1, HEAD_DIM)).astype(np.float32)
+    global_k = rng.normal(size=(total_kv, 1, HEAD_DIM)).astype(np.float32)
+    global_v = rng.normal(size=(total_kv, 1, HEAD_DIM)).astype(np.float32)
+
+    q_requests = [global_q[: q_lens[0]], global_q[q_lens[0] :]]
+    k_requests = [global_k[: kv_lens_list[0]], global_k[kv_lens_list[0] :]]
+    v_requests = [global_v[: kv_lens_list[0]], global_v[kv_lens_list[0] :]]
+
+    k_history_only = []
+    v_history_only = []
+    for k_req, v_req, start in zip(k_requests, v_requests, request_absolute_starts):
+        k_hist = k_req.copy()
+        v_hist = v_req.copy()
+        k_hist[start:] = 0.0
+        v_hist[start:] = 0.0
+        k_history_only.append(k_hist)
+        v_history_only.append(v_hist)
+
+    q_packed, token_order, inverse_order = _pack_multi_request_queries(
+        q_requests, token_owner_starts
+    )
+    kv_cache_hist, block_tables, total_local_pages = _pack_multi_request_kv_cache(
+        k_history_only, v_history_only
+    )
+    assert total_local_pages == 6
+
+    current_kv = _pack_current_kv_rank_major(
+        k_requests, v_requests, request_absolute_starts, token_order
+    )
+    mesh = jax.sharding.Mesh(np.asarray(devices[:PCP_SIZE]), (AXIS,))
+    output, new_cache = _run_real_pallas(
+        jnp.asarray(q_packed, dtype=jnp.bfloat16),
+        jnp.asarray(current_kv, dtype=jnp.bfloat16),
+        jnp.asarray(kv_cache_hist, dtype=jnp.bfloat16),
+        jnp.asarray(kv_lens_list, dtype=jnp.int32),
+        jnp.asarray(block_tables, dtype=jnp.int32),
+        jnp.asarray([0, q_lens[0], total_q], dtype=jnp.int32),
+        jnp.asarray([0, 0, len(q_lens)], dtype=jnp.int32),
+        mesh,
+        vpage_group_size=vpage_group_size,
+    )
+    output.block_until_ready()
+    new_cache.block_until_ready()
+
+    output_request_major = np.asarray(jax.device_get(output), dtype=np.float64)[
+        inverse_order
+    ]
+    u_bf16 = 2.0**-8
+    u_f32 = 2.0**-24
+    q_offset = 0
+    for req_idx, (q_len, start) in enumerate(zip(q_lens, request_absolute_starts)):
+        q_bf16_f64 = np.asarray(q_requests[req_idx], dtype=jnp.bfloat16).astype(
+            np.float64
+        )
+        k_bf16_f64 = np.asarray(k_requests[req_idx], dtype=jnp.bfloat16).astype(
+            np.float64
+        )
+        v_bf16_f64 = np.asarray(v_requests[req_idx], dtype=jnp.bfloat16).astype(
+            np.float64
+        )
+        expected = _naive_causal_attention(
+            q_bf16_f64, k_bf16_f64, v_bf16_f64, start, sm_scale
+        )
+        scores = np.einsum("thqd,shd->thqs", q_bf16_f64, k_bf16_f64) * sm_scale
+        max_abs_score = float(np.max(np.abs(scores)))
+        rms_v = float(np.sqrt(np.mean(v_bf16_f64**2)))
+        max_abs_v = float(np.max(np.abs(v_bf16_f64)))
+        max_abs_expected = float(np.max(np.abs(expected)))
+        tol_bf16 = (
+            2.0 * u_bf16 * max_abs_score * rms_v
+            + u_bf16 * max_abs_v
+            + 16.0 * u_f32 * max_abs_v
+            + u_bf16 * max_abs_expected
+        )
+        actual = output_request_major[q_offset : q_offset + q_len]
+        assert float(np.max(np.abs(actual - expected))) <= tol_bf16
+
+        group0_only = (
+            _naive_causal_attention(
+                q_bf16_f64, k_bf16_f64[:512], v_bf16_f64[:512], start, sm_scale
+            )
+            if req_idx == 0
+            else np.zeros_like(expected)
+        )
+        assert float(np.max(np.abs(group0_only - expected))) > tol_bf16
+        q_offset += q_len

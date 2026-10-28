@@ -40,7 +40,6 @@ pytestmark = [pytest.mark.multichip, pytest.mark.spawns_tpu_workers]
 WORLD_SIZE = 8
 PAGE_SIZE = 256
 LOCAL_PADDED_TOKENS = 2048
-Q_BLOCK_SIZE = 512
 PREFILL_TOKENS = 432
 MAX_MODEL_LEN = 16 * 1024
 NUM_HEADS = 16
@@ -272,8 +271,6 @@ def _build_compiled_steps(torch, mesh):
         soft_cap=None,
         skip_kv_update=False,
         cp_kv_cache_interleave_size=PAGE_SIZE,
-        q_block_size=Q_BLOCK_SIZE,
-        q_compute_size=128,
     )
     attention = pcp_streaming_jax_op(
         "pcp_barrier_regression::streaming_attention",

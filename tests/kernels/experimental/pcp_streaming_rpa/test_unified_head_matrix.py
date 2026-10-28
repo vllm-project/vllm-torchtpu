@@ -301,8 +301,6 @@ def _run_case(torch, sync, mesh, case: dict[str, object]):
         soft_cap=None,
         skip_kv_update=False,
         cp_kv_cache_interleave_size=int(case.get("interleave_size", PAGE_SIZE)),
-        q_block_size=LOCAL_TOKENS,
-        q_compute_size=64,
         kv_layout=kv_layout,
     )
     attention = pcp_streaming_jax_op(
