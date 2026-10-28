@@ -1340,7 +1340,9 @@ def test_bind_caches_rejects_compact_mamba_and_non_aliasing_la_cache() -> None:
     )
     driver.bind_and_warmup(runner_fallback)
     assert not driver._bound
-    assert runner_fallback._megakernel is None
+    declined = runner_fallback._megakernel
+    assert isinstance(declined, driver_mod.DeclinedDriver)
+    assert declined.decline.code == "cache_layout_incompatible"
 
     # Restore valid pool and verify `bind_and_warmup` does NOT swallow `ValueError`
     # raised inside `warmup()` as a cache-layout error.
@@ -1477,7 +1479,9 @@ def test_compile_hlo_check_config_errors_are_not_layout_errors() -> None:
 
     drv_layout = _driver_raising(MegakernelLayoutError("incompatible KV layout"))
     drv_layout.bind_and_warmup(runner)
-    assert drv_layout._bound is False and runner._megakernel is None
+    assert drv_layout._bound is False
+    assert isinstance(runner._megakernel, driver_mod.DeclinedDriver)
+    assert runner._megakernel.decline.code == "cache_layout_incompatible"
 
 
 def test_bind_caches_budget_overflow_is_config_error() -> None:

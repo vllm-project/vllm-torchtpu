@@ -19,6 +19,7 @@ import contextlib
 import dataclasses
 import time
 import types
+import zlib
 from collections.abc import Sequence
 from typing import Any
 
@@ -368,6 +369,85 @@ def _runner_hf_config(runner: Any) -> Any:
     return getattr(model_cfg, "hf_config", None) if model_cfg is not None else None
 
 
+# Decline codes a rank can vote with in `agree_on_decline` (index + 1 is the
+# vote; 0 means "can serve"). Unlisted codes vote as `other`.
+DECLINE_VOTE_CODES: tuple[str, ...] = (
+    "pallas_mesh_unavailable",
+    "pallas_mesh_mismatch",
+    "cache_layout_incompatible",
+    "pool_layout_unknown",
+    "pool_layout_mismatch",
+    "conv_state_dtype_unsupported",
+    "bind_error",
+    "other",
+)
+
+
+def _decline_vote(result: _rt.EligibilityResult | None) -> int:
+    if result is None:
+        return 0
+    code = result.code if result.code in DECLINE_VOTE_CODES else "other"
+    return DECLINE_VOTE_CODES.index(code) + 1
+
+
+def _tp_cpu_group() -> Any:
+    """The TP group's CPU (gloo) process group, or `None` on a single rank."""
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return None
+    from vllm.distributed import get_tp_group
+
+    tp_group = get_tp_group()
+    if int(getattr(tp_group, "world_size", 1)) <= 1:
+        return None
+    return tp_group.cpu_group
+
+
+def _all_reduce_max(t: torch.Tensor, group: Any) -> None:
+    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX, group=group)
+
+
+def buckets_token(keys: Sequence[tuple[int, int]]) -> int:
+    """A rank-independent 32-bit digest of a set of `(T, B)` bucket keys."""
+    return zlib.crc32(repr(sorted(keys)).encode("ascii"))
+
+
+def agree_on_decline(
+    local: _rt.EligibilityResult | None,
+    *,
+    token: int | None = None,
+    group: Any = None,
+) -> _rt.EligibilityResult | None:
+    """Make a megakernel decline rank-uniform across the TP group.
+
+    Every rank calls this at the same point with its own decline (`None` when
+    it can serve) and, optionally, a `token` that must be equal on every rank
+    (e.g. `buckets_token` of the compiled buckets). One MAX all-reduce of
+    `(vote, token, -token)`: if any rank declined, every rank declines, and
+    ranks that could serve get `peer_declined:<code>` with the declining
+    rank's code (the highest vote when several decline); if the tokens differ,
+    every rank declines with `bucket_set_mismatch`. A rank-local decline while
+    the other ranks run the megakernel's collectives would hang the job.
+    """
+    if group is None:
+        group = _tp_cpu_group()
+    if group is None:
+        return local
+    tok = int(token or 0)
+    t = torch.tensor([_decline_vote(local), tok, -tok], dtype=torch.int64)
+    _all_reduce_max(t, group)
+    vote, tok_max, tok_min = int(t[0]), int(t[1]), -int(t[2])
+    if vote != 0:
+        if local is not None:
+            return local
+        code = DECLINE_VOTE_CODES[vote - 1]
+        msg = f"Megakernel declined on another TP rank ({code}); skipping."
+        return _rt.EligibilityResult(False, f"peer_declined:{code}", msg)
+    if tok_max != tok_min:
+        msg = "Megakernel compiled bucket sets differ across TP ranks; skipping."
+        return _rt.EligibilityResult(False, "bucket_set_mismatch", msg)
+    return None
+
+
 class DeclinedDriver:
     """Stands in for a megakernel the adapter enabled but had to decline.
 
@@ -392,6 +472,8 @@ class DeclinedDriver:
 
     def bind_and_warmup(self, runner: Any) -> None:
         del runner
+        # Join the bind-time agreement the serving drivers on other ranks run.
+        agree_on_decline(self.decline)
         logger.warning(
             "%s megakernel declined (%s): %s",
             self._display_name,
@@ -737,14 +819,19 @@ class MegakernelDriver:
                 f"Invalid megakernel mode={req_mode!r}; expected 'ep' or 'tp'"
             )
         mode = req_mode if req_mode else ("ep" if loaded_ep else "tp")
+        mesh, mesh_decline = None, None
         try:
             mesh = _build_tp_rank_mesh(
                 r_cnt, fallback_mesh=getattr(runner, "mesh", None)
             )
         except MeshDecline as exc:
-            cls._log_startup_ineligible(exc.result)
+            mesh_decline = exc.result
+        # Before packing weights: an EP->TP reshard all-gathers across ranks.
+        mesh_decline = agree_on_decline(mesh_decline)
+        if mesh_decline is not None:
+            cls._log_startup_ineligible(mesh_decline)
             return DeclinedDriver(
-                exc.result,
+                mesh_decline,
                 tp_rank=tp_rank,
                 display_name=mdef.display_name or str(mdef.name),
                 stats_period_s=float(cfg["stats_period_s"]),
@@ -1296,8 +1383,11 @@ class MegakernelDriver:
         """Bind runner KV+GDN cache pools and warm up compiled megakernel buckets.
 
         Only `MegakernelLayoutError` (an incompatible runtime cache layout)
-        disables the megakernel and falls back to the stock path. Configuration
-        errors (`MegakernelConfigError`) and any other exception propagate.
+        disables the megakernel: the runner's `_megakernel` becomes a
+        `DeclinedDriver` that runs the stock path and reports the reason in the
+        step-mix stats. Configuration errors (`MegakernelConfigError`) and any
+        other exception propagate. Every TP rank agrees before warmup (which
+        runs the megakernel's collectives): if any rank declines, all do.
         """
         precompile_timed = getattr(runner, "_precompile_timed", None)
         eager_only = bool(getattr(runner, "enforce_eager", False))
@@ -1307,17 +1397,40 @@ class MegakernelDriver:
             else contextlib.nullcontext()
         )
         with ctx:
+            decline: _rt.EligibilityResult | None = None
+            voted = False
             try:
-                self.bind_caches(runner)
-            except MegakernelLayoutError as exc:
+                try:
+                    self.bind_caches(runner)
+                except MegakernelLayoutError as exc:
+                    decline = getattr(exc, "result", None) or _rt.EligibilityResult(
+                        False, "cache_layout_incompatible", str(exc)
+                    )
+                token = None if decline else buckets_token(list(self._bucket_steps))
+                decline = agree_on_decline(decline, token=token)
+                voted = True
+            finally:
+                if not voted:
+                    # This rank is raising: still vote, so the others decline
+                    # instead of waiting in the agreement.
+                    agree_on_decline(
+                        _rt.EligibilityResult(False, "bind_error", "bind failed")
+                    )
+            if decline is not None:
                 logger.warning(
                     "Disabling %s megakernel due to incompatible KV cache layout: %s",
                     getattr(self, "_display_name", "megakernel"),
-                    exc,
+                    decline.message,
                 )
                 self._bound = False
                 if runner is not None and hasattr(runner, "_megakernel"):
-                    runner._megakernel = None
+                    tracker = getattr(self, "step_mix_tracker", None)
+                    runner._megakernel = DeclinedDriver(
+                        decline,
+                        tp_rank=getattr(self, "tp_rank", 0),
+                        display_name=getattr(self, "_display_name", "megakernel"),
+                        stats_period_s=getattr(tracker, "period_s", 60.0),
+                    )
                 return
             self.warmup(runner, eager_only=eager_only)
 

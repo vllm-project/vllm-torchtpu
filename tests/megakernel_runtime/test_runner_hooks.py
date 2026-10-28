@@ -438,3 +438,168 @@ def test_runner_declined_step_passes_model_kwargs_to_stock() -> None:
             intermediate_tensors=it,
         )
     ]
+
+
+# --- Rank-uniform declines ---------------------------------------------------
+
+
+class _FakeTPGroup:
+    """Stands in for the TP group's CPU process group: `all_reduce(MAX)` folds
+    in the votes of the other ranks, which the test sets."""
+
+    def __init__(self, peer_votes: list[int], peer_tokens: list[int] | None = None):
+        self.peer_votes = peer_votes
+        self.peer_tokens = peer_tokens
+        self.calls = 0
+
+    def all_reduce_max(self, t: Any, group: Any) -> None:
+        assert group is self
+        self.calls += 1
+        mine = int(t[1])
+        toks = [mine] if self.peer_tokens is None else [mine, *self.peer_tokens]
+        if self.peer_tokens is None:
+            toks = [mine] * (1 + len(self.peer_votes))
+        t[0] = max([int(t[0]), *self.peer_votes])
+        t[1] = max(toks)
+        t[2] = max(-x for x in toks)
+
+
+@pytest.fixture
+def fake_tp_group(monkeypatch: pytest.MonkeyPatch) -> Any:
+    def make(
+        peer_votes: list[int], peer_tokens: list[int] | None = None
+    ) -> _FakeTPGroup:
+        g = _FakeTPGroup(peer_votes, peer_tokens)
+        monkeypatch.setattr(driver_mod, "_tp_cpu_group", lambda: g)
+        monkeypatch.setattr(driver_mod, "_all_reduce_max", g.all_reduce_max)
+        return g
+
+    return make
+
+
+def _vote(code: str) -> int:
+    return driver_mod.DECLINE_VOTE_CODES.index(code) + 1
+
+
+def test_agree_on_decline_is_rank_uniform(fake_tp_group: Any) -> None:
+    from vllm_torchtpu.megakernel.runtime import EligibilityResult
+
+    mine = EligibilityResult(False, "pallas_mesh_mismatch", "local")
+    # Nobody declines.
+    g = fake_tp_group([0, 0, 0])
+    assert driver_mod.agree_on_decline(None) is None and g.calls == 1
+    # This rank declines: it keeps its own reason.
+    fake_tp_group([0, 0])
+    assert driver_mod.agree_on_decline(mine) is mine
+    # A peer declines: this rank declines too, naming the peer's code.
+    fake_tp_group([0, _vote("pool_layout_mismatch")])
+    res = driver_mod.agree_on_decline(None)
+    assert res is not None and not res.eligible
+    assert res.code == "peer_declined:pool_layout_mismatch"
+    # Unlisted codes vote as `other`.
+    fake_tp_group([0])
+    odd = EligibilityResult(False, "something_new", "x")
+    assert driver_mod.agree_on_decline(odd) is odd
+    assert driver_mod._decline_vote(odd) == _vote("other")
+
+
+def test_agree_on_decline_single_rank_is_local(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_torchtpu.megakernel.runtime import EligibilityResult
+
+    def no_reduce(*_a: Any) -> None:
+        raise AssertionError("no collective on a single rank")
+
+    monkeypatch.setattr(driver_mod, "_tp_cpu_group", lambda: None)
+    monkeypatch.setattr(driver_mod, "_all_reduce_max", no_reduce)
+    mine = EligibilityResult(False, "pallas_mesh_mismatch", "local")
+    assert driver_mod.agree_on_decline(mine) is mine
+    assert driver_mod.agree_on_decline(None) is None
+
+
+def _bind_driver(bind: Any) -> Any:
+    drv = object.__new__(driver_mod.MegakernelDriver)
+    drv._bound = True
+    drv._bucket_steps = {(1, 8): None, (4, 4): None}
+    drv.bind_caches = bind
+    drv.warmed = []
+    drv.warmup = lambda runner, eager_only=False: drv.warmed.append(runner)
+    return drv
+
+
+def test_bind_and_warmup_peer_decline_skips_warmup(fake_tp_group: Any) -> None:
+    from types import SimpleNamespace
+
+    g = fake_tp_group([_vote("conv_state_dtype_unsupported")])
+    drv = _bind_driver(lambda runner: None)
+    runner = SimpleNamespace(_megakernel=drv)
+    drv.bind_and_warmup(runner)
+    assert g.calls == 1 and drv.warmed == [] and not drv._bound
+    assert isinstance(runner._megakernel, driver_mod.DeclinedDriver)
+    assert (
+        runner._megakernel.decline.code == "peer_declined:conv_state_dtype_unsupported"
+    )
+
+    g = fake_tp_group([0])
+    drv = _bind_driver(lambda runner: None)
+    runner = SimpleNamespace(_megakernel=drv)
+    drv.bind_and_warmup(runner)
+    assert g.calls == 1 and drv.warmed == [runner] and runner._megakernel is drv
+
+
+def test_bind_and_warmup_votes_before_raising(
+    fake_tp_group: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rank whose bind raises still joins the agreement (as `bind_error`)."""
+    from types import SimpleNamespace
+
+    votes: list[int] = []
+    g = fake_tp_group([0])
+    orig = g.all_reduce_max
+
+    def spy(t: Any, group: Any) -> None:
+        votes.append(int(t[0]))
+        orig(t, group)
+
+    monkeypatch.setattr(driver_mod, "_all_reduce_max", spy)
+
+    def bind(runner: Any) -> None:
+        raise ValueError("internal bug")
+
+    drv = _bind_driver(bind)
+    with pytest.raises(ValueError, match="internal bug"):
+        drv.bind_and_warmup(SimpleNamespace(_megakernel=drv))
+    assert votes == [_vote("bind_error")] and drv.warmed == []
+
+
+def test_declined_driver_joins_the_bind_agreement(fake_tp_group: Any) -> None:
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.megakernel.runtime import EligibilityResult
+
+    g = fake_tp_group([0])
+    dd = driver_mod.DeclinedDriver(
+        EligibilityResult(False, "pallas_mesh_unavailable", "m")
+    )
+    dd.bind_and_warmup(SimpleNamespace())
+    assert g.calls == 1
+
+
+def test_agree_on_decline_detects_bucket_set_mismatch(fake_tp_group: Any) -> None:
+    from types import SimpleNamespace
+
+    tok = driver_mod.buckets_token([(4, 4), (1, 8)])
+    assert tok == driver_mod.buckets_token([(1, 8), (4, 4)])
+    assert tok != driver_mod.buckets_token([(1, 8)])
+    fake_tp_group([0], peer_tokens=[tok])
+    assert driver_mod.agree_on_decline(None, token=tok) is None
+    fake_tp_group([0], peer_tokens=[tok + 1])
+    res = driver_mod.agree_on_decline(None, token=tok)
+    assert res is not None and res.code == "bucket_set_mismatch"
+
+    # bind_and_warmup agrees on the compiled bucket set before warmup.
+    g = fake_tp_group([0], peer_tokens=[driver_mod.buckets_token([(1, 8)])])
+    drv = _bind_driver(lambda runner: None)
+    runner = SimpleNamespace(_megakernel=drv)
+    drv.bind_and_warmup(runner)
+    assert g.calls == 1 and drv.warmed == []
+    assert runner._megakernel.decline.code == "bucket_set_mismatch"
