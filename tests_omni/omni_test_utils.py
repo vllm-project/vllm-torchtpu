@@ -55,27 +55,22 @@ def assert_parity(
     reference: torch.Tensor,
     *,
     name: str,
-    min_cos: float | None = None,
     max_rel_l2: float | None = None,
     max_abs: float | None = None,
 ) -> None:
     """Assert ``actual`` matches ``reference`` on each gate that is provided.
 
-    - ``min_cos``: cosine similarity lower bound.
     - ``max_rel_l2``: ``||actual - reference|| / ||reference||`` upper bound.
     - ``max_abs``: largest elementwise absolute difference upper bound.
 
     Metrics are computed in fp64.
     """
+    assert actual.shape == reference.shape, (
+        f"{name}: shape ({tuple(actual.shape)}) != ({tuple(reference.shape)})"
+    )
     actual_flat = actual.detach().cpu().double().flatten()
     reference_flat = reference.detach().cpu().double().flatten()
     diff = actual_flat - reference_flat
-    if min_cos is not None:
-        norm_product = actual_flat.norm() * reference_flat.norm()
-        cos = float(torch.dot(actual_flat, reference_flat) / norm_product)
-        assert cos >= min_cos, (
-            f"{name}: cosine similarity {cos:.6f} is below min {min_cos}"
-        )
     if max_rel_l2 is not None:
         rel_l2 = float(diff.norm() / reference_flat.norm())
         assert rel_l2 <= max_rel_l2, (
