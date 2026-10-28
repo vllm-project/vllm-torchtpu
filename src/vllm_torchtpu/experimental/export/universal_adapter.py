@@ -386,7 +386,7 @@ def load_dummy_vllm_model(vllm_config: Any) -> nn.Module:
     return load_vllm_model(vllm_config, load_format="dummy")
 
 
-@trace("export.load_model")
+@trace("export.create_vllm_config")
 def create_export_vllm_config(args: Any) -> Any:
     """Creates the `VllmConfig` an export runs with from parsed `EngineArgs`.
 
