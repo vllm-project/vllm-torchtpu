@@ -6524,6 +6524,12 @@ def stack(
     if batch_size % commit_rows:
         raise ValueError("mla_commit_tile_size must divide the batch")
     group_rows = batch_size // attention_dp
+    # The B64/B128 MoE overlaps and SP8 residual rows; verifies take those
+    # named in KernelConfig.verify_overlaps.
+    verify_overlaps = set(_config().verify_overlaps)
+
+    def plain_overlap(name):
+        return sequence_rows == 1 or name in verify_overlaps
     # Each local row owner holds tokens_per_pair rows; group d attends r of them.
     group_rows_per_pair = group_rows // sp_owners
     # The residual-stream rows a rank holds under DP row ownership: its own r,
@@ -7032,7 +7038,7 @@ def stack(
         ) if attention_dp_ownership else None
 
         sp8_residual = (attention_dp_ownership and attention_dp == 2
-                        and batch_size == 128 and sequence_rows == 1)
+                        and batch_size == 128 and plain_overlap("sp8"))
         # Expert/projection ABIs retain their existing pair ownership. Only
         # mixture rows and the following gathers use eight independent owners.
         sp8_rows_vmem = dp_owned_vmem if sp8_residual else None
@@ -8476,9 +8482,9 @@ def stack(
                     ),
                     after_experts=after_experts,
                     after_routing_scores=after_routing_scores,
-                    overlap_router_latent=(attention_dp == 2 and batch_size == 128 and sequence_rows == 1),
+                    overlap_router_latent=(attention_dp == 2 and batch_size == 128 and plain_overlap("router")),
                     # Verify steps of 64 rows overlap it too; at 128 verify rows it is slower.
-                    overlap_shared_reduction=(attention_dp == 2 and (batch_size == 64 or batch_size == 128 and sequence_rows == 1)),
+                    overlap_shared_reduction=(attention_dp == 2 and (batch_size == 64 or batch_size == 128 and plain_overlap("shared128"))),
                     token_scatter_output=moe_token_scatter_output,
                     routed_reduce_scatter=moe_routed_reduce_scatter,
                     token_pipeline=moe_token_pipeline,
@@ -8640,7 +8646,7 @@ def stack(
                     )
 
                 if (moe_token_scatter_output and attention_dp == 2
-                        and sp_owners == 4 and batch_size in (64, 128) and sequence_rows == 1):
+                        and sp_owners == 4 and batch_size in (64, 128) and plain_overlap("dense")):
                     _dense_scatter_rows(accumulator,owned_rows_vmem,
                         communication_workspace.shared_local_reduction_vmem,
                         communication_workspace.shared_host_reduction_vmem,
