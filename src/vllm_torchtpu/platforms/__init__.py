@@ -55,8 +55,11 @@ def _log_tpu_info() -> None:
 def register_tpu_platform() -> str:
     """vLLM out-of-tree platform plugin entry point."""
     from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+    from vllm_torchtpu.stall_watchdog import install_signal_dump
 
     _log_tpu_info()
+    # The API server loads platform plugins but not general ones.
+    install_signal_dump()
     return f"{TpuPlatform.__module__}.{TpuPlatform.__qualname__}"
 
 

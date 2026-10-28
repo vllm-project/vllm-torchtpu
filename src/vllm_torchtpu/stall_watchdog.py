@@ -36,10 +36,15 @@ def _seconds() -> float:
         return 0.0
 
 
+_installed = False
+
+
 def install_signal_dump() -> None:
-    """Register the SIGUSR2 stack dump in this process (any role)."""
-    if _seconds() <= 0:
+    """Register the SIGUSR2 stack dump in this process (any role), once."""
+    global _installed
+    if _seconds() <= 0 or _installed:
         return
+    _installed = True
     try:
         faulthandler.register(signal.SIGUSR2, file=sys.stderr, all_threads=True)
     except (AttributeError, ValueError, RuntimeError):
