@@ -37,3 +37,24 @@ def host_round_trip_small(ops: list[torch.Tensor], limit: int = SMALL_OPERAND_BY
             ops[i] = t.cpu().to(t.device)
             n += 1
     return n
+
+
+def hbm_summary(tensors, model) -> str:
+    """`"<total> GiB, <own> GiB not shared with model parameters"` of packed kernel operands: what they
+    add to HBM before the KV cache is sized (zero-copy parameter views cost nothing)."""
+    try:
+        params = {int(p.untyped_storage().data_ptr()) for p in model.parameters()}
+        total = own = 0
+        seen: set[int] = set()
+        for t in tensors:
+            ptr = int(t.untyped_storage().data_ptr())
+            if ptr in seen:
+                continue
+            seen.add(ptr)
+            n = t.untyped_storage().nbytes()
+            total += n
+            if ptr not in params:
+                own += n
+    except Exception as e:  # noqa: BLE001 - logging only, never fail the driver
+        return f"unknown ({type(e).__name__})"
+    return f"{total / 2**30:.2f} GiB, {own / 2**30:.2f} GiB not shared with model parameters"

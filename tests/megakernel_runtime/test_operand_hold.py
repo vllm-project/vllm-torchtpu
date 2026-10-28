@@ -47,3 +47,14 @@ def test_fresh_copy_is_an_op_result_with_equal_values():
     assert torch.empty_like(view).copy_(view)._version == 1  # positive control of the check
     assert own_operand(stack) is stack  # fresh stack: passed as is
     assert fresh_copy(torch.tensor(3.0)).shape == ()
+
+
+def test_hbm_summary_counts_only_copies_as_own():
+    """Packed operands: a parameter view is shared (total only), a fresh tensor is own; a storage
+    counted once even when two operands view it."""
+    from vllm_torchtpu.megakernel_runtime.operand_hold import hbm_summary
+
+    model = torch.nn.Linear(256, 256, bias=False)  # 256 KiB fp32 weight
+    fresh = torch.zeros(512, 512)  # 1 MiB
+    ops = [model.weight.view(-1), fresh, fresh[:10]]
+    assert hbm_summary(ops, model) == f"{(256 * 256 * 4 + 512 * 512 * 4) / 2**30:.2f} GiB, {512 * 512 * 4 / 2**30:.2f} GiB not shared with model parameters"

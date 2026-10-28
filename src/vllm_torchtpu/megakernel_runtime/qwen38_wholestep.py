@@ -132,6 +132,9 @@ class Qwen38WholeStep(nn.Module):
 
         n_trip = host_round_trip_small(ops)
         logger.info("Qwen3.8 whole-step: %d of %d operands host round-tripped", n_trip, len(ops))
+        from .operand_hold import hbm_summary
+
+        logger.info("Qwen3.8 whole-step: packed operands %s", hbm_summary(ops, model))
         self.n_w = len(ops)
         # How the operands are held decides what the compiled program sees: registered
         # buffers are re-materialised by `execute_as_strided` every step in the served segment
