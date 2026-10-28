@@ -233,6 +233,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TORCH_TPU_BASE_PORT",
     "TORCH_TPU_MP_RENDEZVOUS_PORT",
     "TPU_LOCAL_RANK_OFFSET",
+    # Multi-port DP: launch topology and rank plumbing only; each engine
+    # compiles the same programs as under internal-LB DP.
+    "TPU_MULTIPORT_DP_LOCAL_SIZE",
     "TPU_SHARDED_LOAD_SYNC_EVERY",
     "VLLM_TORCHTPU_IPC_KEY",
     "VLLM_TPU_DEBUG_PCP_LAYOUT",
