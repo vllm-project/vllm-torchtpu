@@ -180,6 +180,27 @@ class RaidenOffloadingWorkerMetadata(OffloadingWorkerMetadata):
         )
 
 
+# Store-on-evict (VLLM_TPU_RAIDEN_STORE_ON_EVICT) reads the device free queue's
+# LRU head; the engine's scheduler registers its block pool here.
+_BLOCK_POOL = None
+
+
+def register_block_pool(pool) -> None:
+    global _BLOCK_POOL
+    _BLOCK_POOL = pool
+
+
+def _cold_frontier(pool, limit: int) -> list[int]:
+    """Block ids of the first ``limit`` blocks of the free queue (LRU head)."""
+    queue = pool.free_block_queue
+    block = queue.fake_free_list_head.next_free_block
+    out = []
+    while block is not None and block is not queue.fake_free_list_tail and len(out) < limit:
+        out.append(block.block_id)
+        block = block.next_free_block
+    return out
+
+
 @dataclass
 class _ParkedStore:
     """A store job parked until every worker rank acknowledges the device fence."""
@@ -206,12 +227,64 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         assert isinstance(self.manager, RaidenOffloadingManager)
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
+        self._init_cold()
+
+    def _init_cold(self) -> None:
+        # Store-on-evict: store jobs wait here until one of their blocks reaches
+        # the LRU head of the device free queue, so the host holds what the
+        # device is about to drop instead of a copy of what it keeps.
+        self._cold_pending: dict[int, _ParkedStore] = {}
+        self._cold_by_block: dict[int, set[int]] = {}
+        self._cold_hashes: dict[int, list[tuple[int, object]]] = {}
+        self._cold_stats = dict.fromkeys(
+            ("parked", "promoted", "cancelled", "stale"), 0
+        )
+
+    def _cold_enabled(self) -> bool:
+        return tpu_envs.VLLM_TPU_RAIDEN_STORE_ON_EVICT and _BLOCK_POOL is not None
+
+    def _cold_drop(self, job_id: int) -> "_ParkedStore | None":
+        parked = self._cold_pending.pop(job_id, None)
+        if parked is None:
+            return None
+        for bid in parked.device_block_ids:
+            jobs = self._cold_by_block.get(bid)
+            if jobs is not None:
+                jobs.discard(job_id)
+                if not jobs:
+                    del self._cold_by_block[bid]
+        self._cold_hashes.pop(job_id, None)
+        return parked
+
+    def _promote_cold(self, new_fence_ids: set[int], cancelled: list[int]) -> None:
+        """Move parked jobs that touch the cold frontier into the fence stage.
+
+        A job whose blocks no longer hold the hashes they held when it was
+        parked (reused without a reported allocation) is cancelled instead.
+        """
+        pool = _BLOCK_POOL
+        frontier = _cold_frontier(pool, tpu_envs.VLLM_TPU_RAIDEN_COLD_FRONTIER_BLOCKS)
+        due = {jid for bid in frontier for jid in self._cold_by_block.get(bid, ())}
+        for job_id in due:
+            hashes = self._cold_hashes.get(job_id, [])
+            parked = self._cold_drop(job_id)
+            assert parked is not None
+            if any(pool.blocks[bid].block_hash != h for bid, h in hashes):
+                self._raiden_manager.on_store_job_cancelled(parked.keys)
+                cancelled.append(job_id)
+                self._cold_stats["stale"] += 1
+                continue
+            self._fence_pending[job_id] = parked
+            new_fence_ids.add(job_id)
+            self._cold_stats["promoted"] += 1
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         meta = super().build_connector_meta(scheduler_output)
         assert isinstance(meta, OffloadingConnectorMetadata)
+        if "_cold_pending" not in self.__dict__:
+            self._init_cold()
 
         manager = self._raiden_manager
 
@@ -226,9 +299,17 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 len(device_block_ids),
                 len(dst_spec.keys),
             )
-            self._fence_pending[job_id] = _ParkedStore(
-                keys=dst_spec.keys, device_block_ids=device_block_ids
-            )
+            parked = _ParkedStore(keys=dst_spec.keys, device_block_ids=device_block_ids)
+            if self._cold_enabled():
+                self._cold_pending[job_id] = parked
+                for bid in device_block_ids:
+                    self._cold_by_block.setdefault(bid, set()).add(job_id)
+                self._cold_hashes[job_id] = [
+                    (bid, _BLOCK_POOL.blocks[bid].block_hash) for bid in device_block_ids
+                ]
+                self._cold_stats["parked"] += 1
+                continue
+            self._fence_pending[job_id] = parked
             new_fence_ids.add(job_id)
 
         # Submit load jobs immediately: destination HBM blocks are freshly
@@ -261,6 +342,10 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         launched_flush_ids: set[int] = set()
         for job_id in flush_ids:
             parked = self._fence_pending.pop(job_id, None)
+            if parked is None:
+                parked = self._cold_drop(job_id)
+                if parked is not None:
+                    self._cold_stats["cancelled"] += 1
             if parked is not None:
                 manager.on_store_job_cancelled(parked.keys)
                 finished_store_ids.append(job_id)
@@ -274,6 +359,14 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             elif manager.is_job_launched(job_id):
                 launched_flush_ids.add(job_id)
         drained = manager.drain_jobs(launched_flush_ids) if launched_flush_ids else []
+        if self._cold_pending and self._cold_enabled():
+            self._promote_cold(new_fence_ids, finished_store_ids)
+        if self._cold_stats["parked"] and self._cold_stats["parked"] % 1000 == 0:
+            logger.info(
+                "Raiden store-on-evict: %s, %d jobs parked now",
+                " ".join(f"{k}={v}" for k, v in self._cold_stats.items()),
+                len(self._cold_pending),
+            )
 
         # Collect completed/drained jobs for the worker echo channel.
         for finished_job in list(drained) + manager.poll_finished_jobs():
