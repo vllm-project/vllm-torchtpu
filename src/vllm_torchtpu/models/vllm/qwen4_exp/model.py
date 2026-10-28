@@ -586,9 +586,17 @@ class Qwen4ExpBackbone(nn.Module):
             ple = cast(Qwen4ExpDecoderLayer, self.layers[self.host_ple_index]).ple
             assert ple is not None
             ple_inputs = PLEInputs(input_ids, query_start_loc, ngram_context)
-            if envs.VLLM_TPU_PLE_HOST_OVERLAP and self.host_ple_index > 0:
+            if (
+                envs.VLLM_TPU_PLE_HOST_OVERLAP
+                and self.host_ple_index > 0
+                and not sequence_parallel
+            ):
                 # Start the ids' copy now; finish it just before the PLE layer
-                # so the earlier layers run on the device meanwhile.
+                # so the earlier layers run on the device meanwhile. The
+                # sequence-parallel prefill graph keeps the single boundary: a
+                # split between its sharded layers leaves the SP all-gather
+                # with a symbolic size that the TPU compiler rejects, and its
+                # steps are long enough that the host lookup barely shows.
                 ple_token = ple.lookup_start(ple_inputs, query_start_loc[-1:])
             else:
                 ple_raw_embeddings = ple.lookup_for_model(
