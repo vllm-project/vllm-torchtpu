@@ -22,7 +22,7 @@ from jax.experimental.pallas import tpu_sc as plsc
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2 import config, memory_ref
 
 # Sub-chunks whose index and weight fetches may be in flight at once.
-INDEX_FETCH_DEPTH = 8
+INDEX_FETCH_DEPTH = 32
 # Rows per reduce pass and the pass loop's unroll. On tpu7x, four rows unrolled
 # by two schedule in ~33 bundles per 16 rows x 16 columns, against ~39 for one
 # 16-row pass, whose per-row weights, shifts and predicates overflow registers.
