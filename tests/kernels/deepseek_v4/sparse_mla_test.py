@@ -355,6 +355,102 @@ class CorrectnessTest(parameterized.TestCase):
         print(f"Max Diff Out: {np.max(diff_out)}")
         np.testing.assert_allclose(out_base, out_agent, rtol=0.1, atol=0.1)
 
+    @parameterized.named_parameters(
+        # Every chunk is one sequence's: all take the shared-KV path, the first
+        # sequence's over two row tiles.
+        ("chunk_aligned", (256, 256), (700, 0)),
+        # The chunk holding the sequence boundary keeps the gather path.
+        ("chunk_mixed", (320, 192), (0, 300)),
+        # The first sequence's chunks take a two-tile softmax step, then a
+        # one-tile step.
+        ("long_and_short_steps", (256, 256), (1100, 0)),
+        # The first sequence's chunks read past SHARED_KV_MAX_ROWS and gather.
+        ("past_shared_rows", (256, 256), (1600, 0)),
+    )
+    def test_shared_kv_prefill(self, seq_lens, firsts):
+        """Prefill tokens selecting a random top-k of their candidates, at a
+        page size and batch that compile the shared-KV path."""
+        topk = 512
+        num_heads = 64
+        head_dim = 512
+        page_size = 256
+        rng = np.random.default_rng(0)
+
+        num_seqs = len(seq_lens)
+        new_kv_lens = jnp.array(seq_lens, jnp.int32)
+        cu_q_lens = jnp.concatenate(
+            [jnp.array([0]), jnp.cumulative_sum(new_kv_lens, dtype=jnp.int32)]
+        )
+        total_tokens = int(cu_q_lens[-1])
+        assert total_tokens >= sparse_mla.SHARED_KV_MIN_TOKENS
+
+        # Token t of a sequence starting at compressed row `first` has
+        # first + t // 4 candidate rows and selects up to topk of them.
+        topk_indices, kv_lens = [], []
+        for n, first in zip(seq_lens, firsts):
+            for t in range(n):
+                candidates = first + t // 4
+                row = np.full(topk, -1, np.int32)
+                selected = min(candidates, topk)
+                row[:selected] = rng.choice(candidates, selected, replace=False)
+                topk_indices.append(row)
+            kv_lens.append(first + (n - 1) // 4)
+        topk_indices = jnp.array(np.stack(topk_indices))
+        kv_lens = jnp.array(kv_lens, jnp.int32)
+
+        pages_per_seq = 9
+        page_indices = jnp.array(
+            rng.permutation(num_seqs * pages_per_seq), dtype=jnp.int32
+        )
+        cache_kv_base, cache_kv_nope, cache_kv_rope = create_cache(
+            rng, num_seqs * pages_per_seq, page_size, head_dim, jnp.bfloat16
+        )
+        distribution = jnp.array([0, num_seqs, num_seqs], dtype=jnp.int32)
+        attention_sinks = generate_attention_sinks(rng, num_heads)
+        q = gen_random(rng, (total_tokens, num_heads, head_dim), jnp.bfloat16)
+        swa_accumution = gen_random(
+            rng, (total_tokens, num_heads, head_dim), jnp.bfloat16
+        )
+        swa_l = gen_random(rng, (total_tokens, num_heads), dtype=jnp.float32)
+        swa_m = gen_random(rng, (total_tokens, num_heads), dtype=jnp.float32)
+
+        out_base = ref_implementation(
+            q,
+            cache_kv_base,
+            kv_lens,
+            topk_indices,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            attention_sinks,
+            swa_accumution,
+            swa_l,
+            swa_m,
+            sm_scale=head_dim**-0.5,
+        )
+        out_agent = sparse_mla.sparse_ragged_paged_attention(
+            q,
+            cache_kv_nope,
+            cache_kv_rope,
+            topk_indices,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            attention_sinks,
+            swa_accumution,
+            swa_l,
+            swa_m,
+            sm_scale=head_dim**-0.5,
+            attention_kernel_batch_size=16,
+            gather_and_attention_chunk_size=128,
+        )
+        np.testing.assert_allclose(
+            np.asarray(out_base, np.float32),
+            np.asarray(out_agent, np.float32),
+            rtol=0.02,
+            atol=0.02,
+        )
+
 
 if __name__ == "__main__":
     absltest.main()

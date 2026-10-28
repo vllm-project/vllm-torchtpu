@@ -21,6 +21,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_gather
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
@@ -156,46 +157,205 @@ def _dequant_dsv4_fp8(bkv_nope: jax.Array):
     return (nope_fp8 * nope_scales).astype(jnp.bfloat16)
 
 
+def _dequant_cache_page(nope_words: jax.Array, rope_words: jax.Array):
+    """One cache page's int32 NoPE / RoPE words (`csa_cache_layout`) as bf16
+    KV rows `[page_size, NOPE_DIM + rope_dim]`, in token order."""
+    page_size = nope_words.shape[0]
+    nope = pltpu.bitcast(nope_words, jnp.uint8).reshape(page_size, -1)
+    nope = _dequant_dsv4_fp8(nope)
+
+    # Row r of the RoPE words holds tokens 4r + j in lanes [32 j, 32 j + 32),
+    # word k carrying bf16 values k (low half) and k + 32 (high half).
+    words = csa_cache_layout.ROPE_WORDS
+    lo = lax.bitcast_convert_type(jnp.left_shift(rope_words, 16), jnp.float32)
+    hi = lax.bitcast_convert_type(
+        jnp.bitwise_and(rope_words, jnp.int32(-65536)), jnp.float32
+    )
+    groups = csa_cache_layout.ROPE_TOKENS_PER_ROW
+    rope = jnp.concatenate(
+        [
+            jnp.concatenate(
+                [
+                    lo[:, j * words : (j + 1) * words],
+                    hi[:, j * words : (j + 1) * words],
+                ],
+                axis=1,
+            )
+            for j in range(groups)
+        ],
+        axis=0,
+    ).astype(jnp.bfloat16)  # row j * rows + r is token groups * r + j
+    # Back to token order with an exact one-hot matmul (one nonzero per row).
+    rows = rope_words.shape[0]
+    token = lax.broadcasted_iota(jnp.int32, (page_size, page_size), 0)
+    src = lax.broadcasted_iota(jnp.int32, (page_size, page_size), 1)
+    perm = (src == (token % groups) * rows + token // groups).astype(jnp.bfloat16)
+    rope = jnp.dot(perm, rope, preferred_element_type=jnp.float32)
+    return jnp.concatenate([nope, rope.astype(jnp.bfloat16)], axis=1)
+
+
+# Smallest padded batch that compiles the shared-KV path: decode-only batches
+# (at most max-num-seqs tokens) skip its per-chunk launch.
+SHARED_KV_MIN_TOKENS = 512
+# Query tokens stacked into one matmul on the shared-KV path: 4 x 64 heads
+# fill the MXU's 256 rows.
+SHARED_KV_TOKENS_PER_MATMUL = 4
+# Cache rows per short online-softmax step on the shared-KV path; a multiple
+# of 128.
+SHARED_KV_TILE_ROWS = 512
+# Most cache rows a chunk may read and still take the shared-KV path. Its cost
+# grows with the rows read, the gather path's with top-k, so long contexts are
+# cheaper gathered.
+SHARED_KV_MAX_ROWS = 1536
+# SHARED_KV_TILE_ROWS tiles per online-softmax step while whole steps remain.
+SHARED_KV_TILES_PER_STEP = 2
+# Query tokens per grid step of `topk_row_mask`.
+ROW_MASK_TOKENS = 32
+
+
+def _topk_row_mask_kernel(used_ref, topk_ref, mask_ref, *, num_rows: int):
+    # A token's membership row, split as row = 128 * hi + lo, is the count
+    # matrix onehot(hi)^T @ onehot(lo) over its top-k slots: one small matmul
+    # per token instead of a top-k x rows compare.
+    @pl.when(used_ref[pl.program_id(0)] != 0)
+    def _():
+        num_tokens, topk = topk_ref.shape
+        lanes = 128
+        num_hi = mask_ref.shape[1] // lanes
+        topk_indices = topk_ref[...]
+        valid = (topk_indices >= 0) & (topk_indices < num_rows)
+        hi = jnp.where(valid, topk_indices // lanes, -1)
+        lo = topk_indices % lanes
+        hi_iota = lax.broadcasted_iota(jnp.int32, (num_hi, topk), 0)
+        lo_iota = lax.broadcasted_iota(jnp.int32, (lanes, topk), 0)
+        for t in range(num_tokens):
+            hi_onehot = (hi[t : t + 1] == hi_iota).astype(jnp.bfloat16)
+            lo_onehot = (lo[t : t + 1] == lo_iota).astype(jnp.bfloat16)
+            counts = lax.dot_general(
+                hi_onehot,
+                lo_onehot,
+                (((1,), (1,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+            for j in range(num_hi):
+                mask_ref[pl.ds(t, 1), pl.ds(j * lanes, lanes)] = (
+                    counts[j : j + 1] > 0
+                ).astype(mask_ref.dtype)
+
+
+def topk_row_mask(
+    topk_indices: jax.Array,  # i32[num_tokens, topk]
+    used: jax.Array,  # i32[num_tokens // ROW_MASK_TOKENS]
+    num_rows: int,
+    num_cols: int,
+) -> jax.Array:
+    """i32[num_tokens, num_cols]: 1 where the token's top-k selects that cache
+    row of its sequence, 0 elsewhere (-1 padding and rows >= num_rows select
+    nothing). A row selected twice counts once, which matches the gather path
+    only because top-k positions are distinct. Rows of a block of
+    ROW_MASK_TOKENS tokens whose `used` is 0 are left unwritten. `num_cols` is
+    a multiple of 128."""
+    num_tokens, topk = topk_indices.shape
+    assert num_tokens % ROW_MASK_TOKENS == 0 and num_cols % 128 == 0
+    return pl.pallas_call(
+        functools.partial(_topk_row_mask_kernel, num_rows=num_rows),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(num_tokens // ROW_MASK_TOKENS,),
+            in_specs=[pl.BlockSpec((ROW_MASK_TOKENS, topk), lambda i, used: (i, 0))],
+            out_specs=pl.BlockSpec((ROW_MASK_TOKENS, num_cols), lambda i, used: (i, 0)),
+        ),
+        out_shape=jax.ShapeDtypeStruct((num_tokens, num_cols), jnp.int32),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        name="topk_row_mask",
+    )(used, topk_indices)
+
+
 def _attention_kernel(
     # Prefetch
-    kv_lens_ref,  # [max_num_seqs]
-    start_end_seq_idx_ref,  # [3] (start_seq_idx, end_seq_idx, num_valid_tokens)
+    # [max_num_seqs]; with `shared_kv`, one past the last cache row each
+    # token's top-k selects.
+    kv_lens_ref,
+    # Flat launch table; from offset launch_offset_ref[0]: (start_seq_idx,
+    # end_seq_idx, num_valid_tokens) and, with `shared_kv`, the rows the
+    # launch reads and (page_0, page_1, ...): the sequence's first pages.
+    launch_ref,
+    launch_offset_ref,  # [1]; an operand, so launches share one kernel
     sem_ids_ref,  # [2] (bi_sem_idx, bo_sem_idx)
     bo_ids_ref,  # [2] seq_idx_start of the in-flight bo DMA per bo sem
     # Input
     attention_sinks_ref,  # float32[num_q_heads]
     q_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
-    cache_kv_nope_hbm_ref,  # int32[chunk_size, topk, 128]
-    cache_kv_rope_hbm_ref,  # int32[chunk_size, topk // 4, 128]
+    # int32[chunk_size, topk, 128], or with `shared_kv` the whole cache
+    # int32[total_num_pages, page_size, 128].
+    cache_kv_nope_hbm_ref,
+    # int32[chunk_size, topk // 4, 128], or with `shared_kv` the whole cache
+    # int32[total_num_pages, page_size // 4, 128].
+    cache_kv_rope_hbm_ref,
     swa_accumution_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
     swa_l_hbm_ref,  # [max_num_tokens, num_l_heads]
     swa_m_hbm_ref,  # [max_num_tokens, num_l_heads]
+    # With `shared_kv`, first the input int32[max_num_tokens, mask_cols]: each
+    # token's top-k membership over its sequence's cache rows
+    # (`topk_row_mask`). Then:
     # Output
-    o_hbm_ref,  # [max_num_tokens, num_q_heads, head_dim]
+    #   o_hbm_ref  [max_num_tokens, num_q_heads, head_dim]
     # Scratch
-    bkv_nope_x2_ref,  # [2, batch_size, page_size * 4, 128]
-    bkv_rope_x2_ref,  # [2, batch_size, page_size, rope_dim]
-    bq_x2_ref,  # [2, batch_size, num_q_heads, head_dim]
-    bo_x2_ref,  # [2, batch_size, num_q_heads, head_dim]
-    bl_x2_ref,  # [2, batch_size, num_l_heads]
-    bm_x2_ref,  # [2, batch_size, num_l_heads]
-    swa_acc_x2_ref,  # [2, batch_size, num_q_heads, head_dim]
-    sems,  # [7, 2]
-    *,
+    #   bkv_nope_x2_ref  [2, batch_size, topk * 4, 128] u8; with `shared_kv`
+    #                    the cache pages int32[shared_pages, page_size, 128].
+    #   bkv_rope_x2_ref  [2, batch_size, topk, 128] bf16; with `shared_kv` the
+    #                    cache pages int32[shared_pages, page_size // 4, 128].
+    #   bq_x2_ref        [2, batch_size, num_q_heads, head_dim]
+    #   bo_x2_ref        [2, batch_size, num_q_heads, head_dim]
+    #   bl_x2_ref        [2, batch_size, num_l_heads]
+    #   bm_x2_ref        [2, batch_size, num_l_heads]
+    #   swa_acc_x2_ref   [2, batch_size, num_q_heads, head_dim]
+    #   sems             DMA [7, 2]
+    # and with `shared_kv`:
+    #   shared_bkv_ref   bf16[mask_cols, head_dim], the dequantized rows
+    #   bmask_x2_ref     int32[2, batch_size, mask_cols]
+    #   page_sems        DMA [2, shared_pages]
+    #   acc_ref          f32[batch_size * num_q_heads, head_dim]
+    #   m_ref, l_ref     f32[batch_size * num_q_heads, 128], lane-replicated
+    *refs,
     sm_scale: float,
     batch_size: int = 1,
+    shared_kv: bool = False,
 ):
+    """With `shared_kv`, every query token of the launch belongs to one
+    sequence and attends over its cache rows, read and dequantized once per
+    launch, masked to the rows its top-k selects, instead of over its own
+    gathered top-k rows."""
+    if shared_kv:
+        mask_hbm_ref, o_hbm_ref, *refs = refs
+        *refs, shared_bkv_ref, bmask_x2_ref, page_sems, acc_ref, m_ref, l_ref = refs
+    else:
+        o_hbm_ref, *refs = refs
+    (
+        bkv_nope_x2_ref,
+        bkv_rope_x2_ref,
+        bq_x2_ref,
+        bo_x2_ref,
+        bl_x2_ref,
+        bm_x2_ref,
+        swa_acc_x2_ref,
+        sems,
+    ) = refs
     assert q_hbm_ref.shape == o_hbm_ref.shape
 
     num_tokens, num_q_heads, head_dim = q_hbm_ref.shape
     assert kv_lens_ref.shape[0] == num_tokens
-    # csa_gather emits int32 words; these are the uint8 nope slabs
-    # [.., topk * 4, 128] and bf16 rope rows [.., topk // 2, 128] they encode,
-    # a free bitcast of the same bytes.
-    cache_kv_nope_hbm_ref = cache_kv_nope_hbm_ref.bitcast(jnp.uint8)
-    cache_kv_rope_hbm_ref = cache_kv_rope_hbm_ref.bitcast(jnp.bfloat16)
-    # The gathered rope buffer carries two top-k entries per row (csa_gather).
-    bkv_sz = cache_kv_rope_hbm_ref.shape[1] * 2
+    if shared_kv:
+        bkv_sz = shared_bkv_ref.shape[0]
+    else:
+        # csa_gather emits int32 words; these are the uint8 nope slabs
+        # [.., topk * 4, 128] and bf16 rope rows [.., topk // 2, 128] they
+        # encode, a free bitcast of the same bytes.
+        cache_kv_nope_hbm_ref = cache_kv_nope_hbm_ref.bitcast(jnp.uint8)
+        cache_kv_rope_hbm_ref = cache_kv_rope_hbm_ref.bitcast(jnp.bfloat16)
+        # The gathered rope buffer carries two top-k entries per row
+        # (csa_gather).
+        bkv_sz = cache_kv_rope_hbm_ref.shape[1] * 2
 
     q_dtype = q_hbm_ref.dtype
     q_packing = get_dtype_packing(q_dtype)
@@ -205,9 +365,10 @@ def _attention_kernel(
     assert head_dim % 128 == 0
     assert num_q_heads % q_packing == 0
 
-    start_seq_idx = start_end_seq_idx_ref[0]
-    end_seq_idx = start_end_seq_idx_ref[1]
-    num_valid_tokens = start_end_seq_idx_ref[2]
+    launch_offset = launch_offset_ref[0]
+    start_seq_idx = launch_ref[launch_offset]
+    end_seq_idx = launch_ref[launch_offset + 1]
+    num_valid_tokens = launch_ref[launch_offset + 2]
 
     batch_start_seq_idx = start_seq_idx + pl.program_id(0) * batch_size
     batch_end_seq_idx = batch_start_seq_idx + batch_size - 1
@@ -215,7 +376,7 @@ def _attention_kernel(
     def flash_attention_step1_qk_softmax(
         q,  # [bq_sz * num_q_heads, head_dim]
         kv,  # [bkv_sz, head_dim] <- Correspond to data from bkv_*_x2_ref
-        kv_len,  # scalar
+        kv_len,  # scalar, or None when every row is valid
         swa_m,  # [bq_sz * num_q_heads],
         swa_l,  # [bq_sz * num_q_heads],
         attention_sinks,  # [num_q_heads]
@@ -229,8 +390,9 @@ def _attention_kernel(
         # Follow FlashAttention-2 forward pass.
         s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
         s *= sm_scale
-        k_span = lax.broadcasted_iota(jnp.int32, s.shape, 1)
-        s = jnp.where(k_span < kv_len, s, jnp.finfo(s.dtype).min)
+        if kv_len is not None:
+            k_span = lax.broadcasted_iota(jnp.int32, s.shape, 1)
+            s = jnp.where(k_span < kv_len, s, jnp.finfo(s.dtype).min)
 
         s_rowmax = jnp.max(s, axis=1, keepdims=True)
         m_prev = swa_m
@@ -271,6 +433,18 @@ def _attention_kernel(
             cp.start()
 
     def _fetch_bkv_batch(seq_idx_start, bkv_sem_idx, *, wait=False):
+        if shared_kv:
+            # The cache rows are loaded once, by `load_shared_kv`; each batch
+            # fetches its tokens' masks.
+            _async_copy(
+                mask_hbm_ref.at[
+                    pl.ds(pl.multiple_of(seq_idx_start, batch_size), batch_size)
+                ],
+                bmask_x2_ref.at[bkv_sem_idx],
+                sems.at[0, bkv_sem_idx],
+                wait,
+            )
+            return
         sem_nope = sems.at[0, bkv_sem_idx]
         sem_rope = sems.at[6, bkv_sem_idx]
 
@@ -400,7 +574,76 @@ def _attention_kernel(
         q = bq_x2_ref.at[bq_sem_idx, batch_idx][...]
         return q
 
-    def load_bkv(bkv_sem_idx, batch_idx):
+    def load_shared_kv():
+        num_pages, page_size, _ = bkv_nope_x2_ref.shape
+        # The most rows any valid query token of the launch reads.
+        kv_rows = launch_ref[launch_offset + 3]
+
+        def page_copies(p):
+            page = launch_ref[launch_offset + 4 + p]
+            return (
+                pltpu.make_async_copy(
+                    cache_kv_nope_hbm_ref.at[page],
+                    bkv_nope_x2_ref.at[p],
+                    page_sems.at[0, p],
+                ),
+                pltpu.make_async_copy(
+                    cache_kv_rope_hbm_ref.at[page],
+                    bkv_rope_x2_ref.at[p],
+                    page_sems.at[1, p],
+                ),
+            )
+
+        # Pages past `kv_rows` may be unallocated; they are not read, and
+        # their rows are zeroed below.
+        for p in range(num_pages):
+
+            @pl.when(p * page_size < kv_rows)
+            def _():
+                for cp in page_copies(p):
+                    cp.start()
+
+        for p in range(num_pages):
+
+            @pl.when(p * page_size < kv_rows)
+            def _():
+                for cp in page_copies(p):
+                    cp.wait()
+
+                # Rows no token reads may hold other caches' bytes (see
+                # load_bkv), which can decode to NaN. RoPE rows are zeroed
+                # before the re-ordering matmul mixes them into the rows that
+                # are read.
+                rope_words = bkv_rope_x2_ref[p]
+                rope_token = (
+                    p * page_size
+                    + csa_cache_layout.ROPE_TOKENS_PER_ROW
+                    * lax.broadcasted_iota(jnp.int32, rope_words.shape, 0)
+                    + lax.broadcasted_iota(jnp.int32, rope_words.shape, 1)
+                    // csa_cache_layout.ROPE_WORDS
+                )
+                rope_words = jnp.where(rope_token < kv_rows, rope_words, 0)
+                bkv = _dequant_cache_page(bkv_nope_x2_ref[p], rope_words)
+                row = p * page_size + lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
+                bkv = jnp.where(row < kv_rows, bkv, 0)
+                shared_bkv_ref[pl.ds(p * page_size, page_size)] = bkv.astype(
+                    shared_bkv_ref.dtype
+                )
+
+            @pl.when(p * page_size >= kv_rows)
+            def _():
+                shared_bkv_ref[pl.ds(p * page_size, page_size)] = jnp.zeros(
+                    (page_size, head_dim), shared_bkv_ref.dtype
+                )
+
+        # The last tile's rows past the pages.
+        pad_rows = shared_bkv_ref.shape[0] - num_pages * page_size
+        if pad_rows:
+            shared_bkv_ref[pl.ds(num_pages * page_size, pad_rows)] = jnp.zeros(
+                (pad_rows, head_dim), shared_bkv_ref.dtype
+            )
+
+    def load_bkv(bkv_sem_idx, batch_idx, mask_rows):
         bkv_nope = bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx][...]
         # The gather nope is (4, 128) u8, reshape it to (1, 512) u8.
         bkv_nope = bkv_nope.reshape(bkv_sz, -1)
@@ -424,9 +667,10 @@ def _attention_kernel(
         # decodes to NaN.
         # We need to mask out the data by the actual kv_len to avoid NaN propagting
         # to the downstream computation.
-        kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
-        k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
-        bkv = jnp.where(k_span < kv_len, bkv, 0)
+        if mask_rows:
+            kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
+            k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
+            bkv = jnp.where(k_span < kv_len, bkv, 0)
         return bkv
 
     def load_swa_output(bq_sem_idx, batch_idx):
@@ -434,6 +678,115 @@ def _attention_kernel(
         swa_l = bl_x2_ref[bq_sem_idx, batch_idx, :num_q_heads][..., None]
         swa_m = bm_x2_ref[bq_sem_idx, batch_idx, :num_q_heads][..., None]
         return swa_acc, swa_l, swa_m
+
+    def process_shared_kv_batch(bi_sem_idx, bo_sem_idx, attention_sinks):
+        # Every token reads the same KV, so a group of tokens shares each
+        # matmul's weights instead of loading them once per token. A token's
+        # unselected rows get exactly zero weight from its mask. The batch
+        # walks the rows in tiles with an online softmax, stopping after the
+        # last row any of its tokens selects; within a tile the groups are
+        # independent, so one group's softmax overlaps another's matmuls.
+        group = _largest_divisor(batch_size, SHARED_KV_TOKENS_PER_MATMUL)
+        rows = group * num_q_heads
+        tile_rows = SHARED_KV_TILE_ROWS
+        mask_value = jnp.finfo(jnp.float32).min
+        firsts = range(0, batch_size, group)
+        # The softmax runs in base 2: m holds max(s) * log2(e), so each score
+        # takes one multiply (sm_scale * log2(e)) before exp2.
+        log2_e = 1.4426950408889634
+        score_scale = sm_scale * log2_e
+
+        def stats(ref, t):
+            return ref[bi_sem_idx, t, :num_q_heads][..., None]
+
+        kv_rows = kv_lens_ref[batch_start_seq_idx]
+        for t in range(1, batch_size):
+            kv_rows = jnp.maximum(kv_rows, kv_lens_ref[batch_start_seq_idx + t])
+        for g, first in enumerate(firsts):
+            tokens = range(first, first + group)
+            state = pl.ds(g * rows, rows)
+            m_ref[state] = jnp.broadcast_to(
+                jnp.concatenate([stats(bm_x2_ref, t) for t in tokens]) * log2_e,
+                (rows, m_ref.shape[1]),
+            )
+            l_ref[state] = jnp.broadcast_to(
+                jnp.concatenate([stats(bl_x2_ref, t) for t in tokens]),
+                (rows, l_ref.shape[1]),
+            )
+            acc_ref[state] = (
+                swa_acc_x2_ref[bi_sem_idx, pl.ds(first, group)]
+                .reshape(rows, head_dim)
+                .astype(acc_ref.dtype)
+            )
+
+        def walk_tile(row0, tile_rows):
+            bkv = shared_bkv_ref[pl.ds(row0, tile_rows)]
+
+            def scores(g, first):
+                state = pl.ds(g * rows, rows)
+                bq = bq_x2_ref[bi_sem_idx, pl.ds(first, group)].reshape(rows, head_dim)
+                s = jnp.einsum("nd,md->nm", bq, bkv, preferred_element_type=jnp.float32)
+                s *= score_scale
+                selected = bmask_x2_ref[
+                    bi_sem_idx, pl.ds(first, group), pl.ds(row0, tile_rows)
+                ]
+                selected = jnp.broadcast_to(
+                    selected[:, None, :], (group, num_q_heads, tile_rows)
+                ).reshape(s.shape)
+                s = jnp.where(selected != 0, s, mask_value)
+                m_prev = m_ref[state][:, :1]
+                m_curr = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
+                p = jnp.exp2(s - m_curr)
+                exp_m_diff = jnp.exp2(m_prev - m_curr)
+                l_curr = exp_m_diff * l_ref[state][:, :1] + jnp.sum(
+                    p, axis=1, keepdims=True
+                )
+                m_ref[state] = jnp.broadcast_to(m_curr, (rows, m_ref.shape[1]))
+                l_ref[state] = jnp.broadcast_to(l_curr, (rows, l_ref.shape[1]))
+                return state, p, exp_m_diff
+
+            def accumulate(state, p, exp_m_diff):
+                pv = jnp.einsum("nm,md->nd", p, bkv, preferred_element_type=jnp.float32)
+                acc_ref[state] = exp_m_diff * acc_ref[state] + pv
+
+            # As in `process`, the previous group's PV goes after this group's
+            # QK, so the MXU works while the VPU does the softmax.
+            pending = None
+            for g, first in enumerate(firsts):
+                current = scores(g, first)
+                if pending is not None:
+                    accumulate(*pending)
+                pending = current
+            accumulate(*pending)
+
+        # Each step rescales acc and updates m and l once, whatever its rows,
+        # so long steps amortize that; tiles left over take short steps.
+        num_tiles = cdiv(kv_rows, tile_rows)
+        long_rows = SHARED_KV_TILES_PER_STEP * tile_rows
+
+        @pl.loop(0, num_tiles // SHARED_KV_TILES_PER_STEP)
+        def _(i):
+            walk_tile(pl.multiple_of(i * long_rows, long_rows), long_rows)
+
+        @pl.loop(num_tiles - num_tiles % SHARED_KV_TILES_PER_STEP, num_tiles)
+        def _(i):
+            walk_tile(pl.multiple_of(i * tile_rows, tile_rows), tile_rows)
+
+        for g, first in enumerate(firsts):
+            state = pl.ds(g * rows, rows)
+            m = m_ref[state][:, :1]
+            l_total = l_ref[state][:, :1] + jnp.exp2(
+                jnp.concatenate([attention_sinks] * group) * log2_e - m
+            )
+            acc = acc_ref[state]
+            out = (
+                lax.div(acc, l_total)
+                if q_dtype == jnp.float32
+                else (acc * pl.reciprocal(l_total, approx=True)).astype(q_dtype)
+            )
+            bo_x2_ref[bo_sem_idx, pl.ds(first, group)] = out.reshape(
+                group, num_q_heads, head_dim
+            )
 
     def process():
         def get_next_seq_ids(seq_idx, bi_sem_idx):
@@ -458,13 +811,6 @@ def _attention_kernel(
         sem_ids_ref[1] = lax.select(bo_sem_idx == 0, 1, 0)
         attention_sinks = attention_sinks_ref[...][..., None]
 
-        prev_p = None
-        prev_bkv = None
-        prev_exp_m_diff = None
-        prev_l = None
-        prev_swa_acc = None
-        prev_out = None
-
         # Wait for cur blocks if not ready yet
         wait_fetch_bq_batch(batch_start_seq_idx, bi_sem_idx)
         wait_fetch_swa_batch(batch_start_seq_idx, bi_sem_idx)
@@ -474,23 +820,41 @@ def _attention_kernel(
         def _wait_send():
             wait_send_bo_batch(bo_sem_idx)
 
-        for batch_idx in range(batch_size):
-            bkv = load_bkv(bi_sem_idx, batch_idx)
-            bq = load_bq(bi_sem_idx, batch_idx)
+        if shared_kv:
+            process_shared_kv_batch(bi_sem_idx, bo_sem_idx, attention_sinks)
+            start_send_bo_batch(batch_start_seq_idx, bo_sem_idx)
+            return
 
-            if prev_out is not None:
-                # Artificial dependency to force MXU/VPU interleaving by limiting
-                # LLO's QK runahead
-                # We use jnp.where to prevent XLA from optimizing the dependency away.
-                # prev_out won't be inf in practice.
-                bq = jnp.where(prev_out == jnp.inf, prev_out, bq)
+        # A token whose top-k is full (kv_len == bkv_sz) reads no padding
+        # rows, so a batch of such tokens skips the kv_len masks.
+        full = kv_lens_ref[batch_start_seq_idx] >= bkv_sz
+        for t in range(1, batch_size):
+            full &= kv_lens_ref[batch_start_seq_idx + t] >= bkv_sz
+
+        @pl.when(full)
+        def _():
+            process_gathered_batch(bi_sem_idx, bo_sem_idx, attention_sinks, False)
+
+        @pl.when(jnp.logical_not(full))
+        def _():
+            process_gathered_batch(bi_sem_idx, bo_sem_idx, attention_sinks, True)
+
+    def process_gathered_batch(bi_sem_idx, bo_sem_idx, attention_sinks, mask_rows):
+        prev_p = None
+        prev_bkv = None
+        prev_exp_m_diff = None
+        prev_l = None
+        prev_swa_acc = None
+        for batch_idx in range(batch_size):
+            bkv = load_bkv(bi_sem_idx, batch_idx, mask_rows)
+            bq = load_bq(bi_sem_idx, batch_idx)
 
             swa_acc, swa_l, swa_m = load_swa_output(bi_sem_idx, batch_idx)
 
             p, exp_m_diff, l_total = flash_attention_step1_qk_softmax(
                 bq,
                 bkv,
-                kv_lens_ref[batch_start_seq_idx + batch_idx],
+                kv_lens_ref[batch_start_seq_idx + batch_idx] if mask_rows else None,
                 swa_m,
                 swa_l,
                 attention_sinks,
@@ -510,7 +874,6 @@ def _attention_kernel(
 
                 # Store output from acc to bo.
                 bo_x2_ref.at[bo_sem_idx, batch_idx - 1][...] = out
-                prev_out = out
 
             prev_p = p
             prev_bkv = bkv
@@ -532,6 +895,8 @@ def _attention_kernel(
         start_fetch_bq_batch(batch_start_seq_idx, 0)
         start_fetch_swa_batch(batch_start_seq_idx, 0)
         start_fetch_bkv_batch(batch_start_seq_idx, 0)
+        if shared_kv:
+            load_shared_kv()
 
     process()
 
@@ -651,7 +1016,7 @@ def sparse_ragged_paged_attention(
         `csa_cache_layout`).
       cache_kv_rope: the current kv cache for rope, 32 words per token.
       topk_indices: for each query token, the indices of the top k key tokens to
-        attend to.
+        attend to: distinct positions, then -1 padding.
       page_indices: flattened page indices look-up table by (seq_id, page_id).
       cu_q_lens: the cumulative sum of the effective query lengths. Similar to
         kv_lens, only the first num_seqs+1 values are valid.
@@ -698,14 +1063,21 @@ def sparse_ragged_paged_attention(
         swa_accumution: jax.Array,  # bf16[max_num_tokens, num_q_heads, head_dim]
         swa_l: jax.Array,  # float32[max_num_tokens, num_l_heads]
         swa_m: jax.Array,  # float32[max_num_tokens, num_l_heads]
-        start_seq_idx: int,
-        end_seq_idx: jax.Array,  # i32
-        num_valid_tokens: jax.Array,  # i32
+        # i32: the launch's entry of `launch` starts at `launch_offset`
+        # (`_attention_kernel`).
+        launch: jax.Array,
+        launch_offset: int,
+        num_steps: jax.Array,  # i32: grid steps of `kernel_batch_size` tokens
         kernel_batch_size: int,
+        # With these, cache_kv_* are the whole caches, kv_lens bounds each
+        # token's selected rows, and every token attends over the rows of
+        # the first `shared_pages` pages its mask selects.
+        shared_pages: int = 0,
+        row_mask: jax.Array | None = None,  # i32[max_num_tokens, mask_cols]
     ):
         batch_size = kernel_batch_size
-        end_seq_idx = jnp.maximum(start_seq_idx, end_seq_idx)
-        grid = (cdiv(end_seq_idx - start_seq_idx, batch_size),)
+        shared_kv = row_mask is not None
+        grid = (num_steps,)
         in_specs = [
             pl.BlockSpec(memory_space=pltpu.VMEM),  # attention_sinks
             pl.BlockSpec(memory_space=pltpu.HBM),  # q
@@ -718,18 +1090,38 @@ def sparse_ragged_paged_attention(
 
         out_specs = pl.BlockSpec(memory_space=pltpu.HBM)  # o
 
-        # One batch entry's worth of gathered top-k rows, per cache, in the
-        # uint8 / bf16 views the kernel bitcasts the int32 words to.
-        _, topk_rows, lanes = cache_kv_nope.shape
-        bkv_nope_double_buf = pltpu.VMEM(
-            (2, batch_size, topk_rows * 4, lanes),
-            jnp.uint8,
-        )
-        _, rope_rows, lanes = cache_kv_rope.shape
-        bkv_rope_double_buf = pltpu.VMEM(
-            (2, batch_size, rope_rows * 2, lanes),
-            jnp.bfloat16,
-        )
+        if shared_kv:
+            in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # row_mask
+            mask_cols = row_mask.shape[1]
+            _, page_size, lanes = cache_kv_nope.shape
+            bkv_nope_double_buf = pltpu.VMEM(
+                (shared_pages, page_size, lanes), cache_kv_nope.dtype
+            )
+            bkv_rope_double_buf = pltpu.VMEM(
+                (shared_pages, *cache_kv_rope.shape[1:]), cache_kv_rope.dtype
+            )
+            extra_scratch = [
+                pltpu.VMEM((mask_cols, head_dim), jnp.bfloat16),
+                pltpu.VMEM((2, batch_size, mask_cols), row_mask.dtype),
+                pltpu.SemaphoreType.DMA((2, shared_pages)),
+                pltpu.VMEM((batch_size * num_q_heads, head_dim), jnp.float32),
+                pltpu.VMEM((batch_size * num_q_heads, 128), jnp.float32),
+                pltpu.VMEM((batch_size * num_q_heads, 128), jnp.float32),
+            ]
+        else:
+            # One batch entry's worth of gathered top-k rows, per cache, in the
+            # uint8 / bf16 views the kernel bitcasts the int32 words to.
+            _, topk_rows, lanes = cache_kv_nope.shape
+            bkv_nope_double_buf = pltpu.VMEM(
+                (2, batch_size, topk_rows * 4, lanes),
+                jnp.uint8,
+            )
+            _, rope_rows, lanes = cache_kv_rope.shape
+            bkv_rope_double_buf = pltpu.VMEM(
+                (2, batch_size, rope_rows * 2, lanes),
+                jnp.bfloat16,
+            )
+            extra_scratch = []
 
         bq_double_bufq = pltpu.VMEM(
             (2, batch_size, num_q_heads, head_dim),
@@ -761,27 +1153,34 @@ def sparse_ragged_paged_attention(
             # Semaphores for double buffering of
             # bkv_nope, bq, bo, swa_acc, swa_l, swa_m, bkv_rope
             pltpu.SemaphoreType.DMA((7, 2)),
+            *extra_scratch,
         ]
 
         scalar_prefetches = (
             kv_lens,
-            jnp.array([start_seq_idx, end_seq_idx, num_valid_tokens], jnp.int32),
+            launch,
+            jnp.full((1,), launch_offset, jnp.int32),
             # (bi_sem_idx, bo_sem_idx)
             jnp.zeros((2,), jnp.int32),
             # seq_idx_start of the in-flight bo DMA per bo sem; -1 = none.
             jnp.full((2,), -1, jnp.int32),
         )
 
-        gathered_topk = cache_kv_nope.shape[1]
-        scope_name = (
-            f"SparseMLA-p_{gathered_topk}-bz_{batch_size}-gcz_{cache_kv_nope.shape[0]}"
-        )
+        if shared_kv:
+            scope_name = f"SparseMLA-shared_{mask_cols}-bz_{batch_size}"
+        else:
+            gathered_topk = cache_kv_nope.shape[1]
+            scope_name = (
+                f"SparseMLA-p_{gathered_topk}-bz_{batch_size}"
+                f"-gcz_{cache_kv_nope.shape[0]}"
+            )
         kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
                 functools.partial(
                     _attention_kernel,
                     sm_scale=sm_scale,
                     batch_size=batch_size,
+                    shared_kv=shared_kv,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=len(scalar_prefetches),
@@ -797,7 +1196,8 @@ def sparse_ragged_paged_attention(
                 ),
                 out_shape=jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
                 input_output_aliases={
-                    5: 0,  # Alias output activation with q
+                    # Alias output activation with q
+                    len(scalar_prefetches) + 1: 0,
                 },
                 name=scope_name,
             )
@@ -811,6 +1211,7 @@ def sparse_ragged_paged_attention(
             swa_accumution,
             swa_l,
             swa_m,
+            *([row_mask] if shared_kv else []),
         )
 
     tokens_per_seq = cu_q_lens[1:] - cu_q_lens[:-1]
@@ -848,33 +1249,127 @@ def sparse_ragged_paged_attention(
     gather_indices = (page_ids * page_size + token_offset).reshape(-1)
     num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
 
+    # A chunk whose tokens are one sequence's attends over that sequence's
+    # cache rows, dequantized once per chunk and masked per token to its
+    # top-k, and skips the gather, unless it reads more than
+    # SHARED_KV_MAX_ROWS rows.
+    pages_per_seq = num_page_indices // max_num_seqs
+    shared_rows = min(SHARED_KV_MAX_ROWS, pages_per_seq * page_size)
+    shared_pages = cdiv(shared_rows, page_size)
+    shared_kv_path = (
+        q.shape[0] >= SHARED_KV_MIN_TOKENS
+        # `by_chunk` below needs whole chunks; token buckets that compile the
+        # path are powers of two.
+        and q.shape[0] % gather_and_attention_chunk_size == 0
+        and gather_and_attention_chunk_size % ROW_MASK_TOKENS == 0
+    )
+    num_valid_tokens = cu_q_lens[distribution[2]]
+    if shared_kv_path:
+        # Every chunk's decision, and the scalars of both its launches, in
+        # one pass: per-launch scalar ops cost more than the empty launch.
+        chunk = gather_and_attention_chunk_size
+        kernel_batch_size = _largest_divisor(chunk, attention_kernel_batch_size)
+
+        def by_chunk(x):
+            return x.reshape(num_chunks, chunk)
+
+        is_valid = jnp.arange(q.shape[0]) < num_valid_tokens
+        # One past the last row each valid token selects (top-k pads with -1).
+        kv_rows = jnp.where(is_valid, jnp.max(topk_indices, axis=-1) + 1, 0)
+        is_valid = by_chunk(is_valid)
+        chunk_rows = jnp.max(by_chunk(kv_rows), axis=1)
+        chunk_seqs = seq_ids_segment[::chunk]
+        one_seq = jnp.all(
+            ~is_valid | (by_chunk(seq_ids_segment) == chunk_seqs[:, None]), axis=1
+        )
+        chunk_shared = is_valid[:, 0] & one_seq & (chunk_rows <= shared_rows)
+        starts = jnp.arange(num_chunks, dtype=jnp.int32) * chunk
+        # Each launch walks whole batches up to the chunk's last valid token.
+        batch_ends = starts + align_to(
+            jnp.clip(num_valid_tokens - starts, 0, chunk), kernel_batch_size
+        )
+        gather_ends = jnp.where(chunk_shared, starts, batch_ends)
+        shared_ends = jnp.where(chunk_shared, batch_ends, starts)
+        launch_steps = (
+            jnp.stack([gather_ends, shared_ends], axis=1) - starts[:, None]
+        ) // kernel_batch_size
+        valid_tokens = jnp.broadcast_to(num_valid_tokens, starts.shape)
+        # One row per chunk: its gather launch's entry (start, end, valid
+        # tokens), then its shared-KV launch's, which adds the rows it reads
+        # and the sequence's first pages. Every launch reads the whole table,
+        # so no launch needs scalar ops of its own.
+        launches = jnp.concatenate(
+            [
+                jnp.stack(
+                    [
+                        starts,
+                        gather_ends,
+                        valid_tokens,
+                        starts,
+                        shared_ends,
+                        valid_tokens,
+                        chunk_rows,
+                    ],
+                    axis=1,
+                ),
+                page_indices[
+                    chunk_seqs[:, None] * pages_per_seq + jnp.arange(shared_pages)
+                ],
+            ],
+            axis=1,
+            dtype=jnp.int32,
+        )
+        launch_width = launches.shape[1]
+        launches = launches.reshape(-1)
+        row_mask = topk_row_mask(
+            topk_indices,
+            jnp.repeat(chunk_shared.astype(jnp.int32), chunk // ROW_MASK_TOKENS),
+            shared_rows,
+            align_to(shared_pages * page_size, SHARED_KV_TILE_ROWS),
+        )
+
     for i in range(num_chunks):
         start_pos = i * gather_and_attention_chunk_size
         end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
         chunk_size = end_pos - start_pos
         indices = gather_indices[start_pos * topk : end_pos * topk]
 
-        # Batching
-        kernel_batch_size = _largest_divisor(chunk_size, attention_kernel_batch_size)
-        assert chunk_size % kernel_batch_size == 0
-        # The kernel grid walks [start_pos, batch_end) in `kernel_batch_size`
-        # steps, so `batch_end - start_pos` MUST be a multiple of
-        # `kernel_batch_size`.
-        batch_end = start_pos + (
-            cdiv(
+        if shared_kv_path:
+            num_valid_indices = launch_steps[i, 0] * kernel_batch_size * topk
+            gather_launch = dict(
+                launch=launches,
+                launch_offset=i * launch_width,
+                num_steps=launch_steps[i, 0],
+            )
+        else:
+            # Batching
+            kernel_batch_size = _largest_divisor(
+                chunk_size, attention_kernel_batch_size
+            )
+            assert chunk_size % kernel_batch_size == 0
+            # The kernel grid walks [start_pos, batch_end) in
+            # `kernel_batch_size` steps, so `batch_end - start_pos` MUST be a
+            # multiple of `kernel_batch_size`.
+            num_steps = cdiv(
                 jnp.maximum(
                     0,
                     jnp.minimum(
-                        cu_q_lens[distribution[2]],
+                        num_valid_tokens,
                         end_pos,
                     )
                     - start_pos,
                 ),
                 kernel_batch_size,
             )
-            * kernel_batch_size
-        )
-        num_valid_indices = jnp.maximum(0, batch_end - start_pos) * topk
+            batch_end = start_pos + num_steps * kernel_batch_size
+            num_valid_indices = num_steps * kernel_batch_size * topk
+            gather_launch = dict(
+                launch=jnp.array(
+                    [start_pos, batch_end, num_valid_tokens], jnp.int32
+                ),
+                launch_offset=0,
+                num_steps=num_steps,
+            )
 
         # For prefilling of short sequences (or early in the sequence), there are
         # very few number of KVs in the sequence, so different qs' selected topk
@@ -904,11 +1399,26 @@ def sparse_ragged_paged_attention(
             swa_accumution,
             swa_l,
             swa_m,
-            start_seq_idx=start_pos,
-            end_seq_idx=batch_end,
-            num_valid_tokens=cu_q_lens[distribution[2]],
             kernel_batch_size=kernel_batch_size,
+            **gather_launch,
         )
+        if shared_kv_path:
+            q = run_mla_kernel(
+                q,
+                cache_kv_nope,
+                cache_kv_rope,
+                kv_rows,
+                attention_sinks,
+                swa_accumution,
+                swa_l,
+                swa_m,
+                launch=launches,
+                launch_offset=i * launch_width + 3,
+                num_steps=launch_steps[i, 1],
+                kernel_batch_size=kernel_batch_size,
+                shared_pages=shared_pages,
+                row_mask=row_mask,
+            )
     return prepare_outputs(
         q, actual_num_q_heads, actual_head_dim
     )  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
