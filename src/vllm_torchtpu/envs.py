@@ -201,6 +201,9 @@ if TYPE_CHECKING:
     # Fuse MTP draft step 0 into compiled draft loop; requires
     # VLLM_TPU_FUSED_DRAFT_LOOP.
     TPU_DRAFT_STEP0_IN_LOOP: bool = False
+    # Fold greedy spec-decode verification, draft step-0 input prep, and
+    # post-loop steady-state bookkeeping on-device.
+    TPU_FOLD_SPEC_BOOKKEEPING: bool = False
 
 
 def env_with_choices(
@@ -1177,6 +1180,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # compiled draft loop program (_MtpFullDraftLoop). Requires
     # VLLM_TPU_FUSED_DRAFT_LOOP=1.
     "TPU_DRAFT_STEP0_IN_LOOP": env_bool("TPU_DRAFT_STEP0_IN_LOOP", default=False),
+    # Fold greedy spec-decode verification, draft step-0 input prep, and
+    # post-loop steady-state bookkeeping on-device.
+    "TPU_FOLD_SPEC_BOOKKEEPING": env_bool("TPU_FOLD_SPEC_BOOKKEEPING", default=False),
 }
 
 

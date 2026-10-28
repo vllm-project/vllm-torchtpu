@@ -284,7 +284,7 @@ def _greedy_rejection_sample_with_segment(
     synthetic_mode: bool,
 ) -> torch.Tensor:
     """Vectorized greedy speculative decoding validation in Torch."""
-    return _greedy_rejection_sample(
+    return greedy_rejection_sample(
         draft_token_ids,
         torch.argmax(target_logits, dim=-1).to(torch.int32),
         num_draft_tokens,
@@ -312,7 +312,7 @@ def _greedy_rejection_sample_from_argmax(
     synthetic_mode: bool,
 ) -> torch.Tensor:
     """Greedy validation from the target's argmax tokens, without logits."""
-    return _greedy_rejection_sample(
+    return greedy_rejection_sample(
         draft_token_ids,
         target_argmax.to(torch.int32),
         num_draft_tokens,
@@ -326,7 +326,7 @@ def _greedy_rejection_sample_from_argmax(
     )
 
 
-def _greedy_rejection_sample(
+def greedy_rejection_sample(
     draft_token_ids: torch.Tensor,
     target_logits_argmax: torch.Tensor,
     num_draft_tokens: torch.Tensor,
@@ -461,6 +461,9 @@ def _greedy_rejection_sample(
     selected_tokens[batch_range, accepted_count] = bonus_token_at_accepted_count
 
     return selected_tokens[:batch_size]
+
+
+_greedy_rejection_sample = greedy_rejection_sample
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)

@@ -126,7 +126,10 @@ from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
 )
 from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
-from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
+from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
+    RejectionSampler,
+    greedy_rejection_sample,
+)
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     CANDIDATE_BLOCK,
     apply_top_k_top_p,
@@ -167,6 +170,7 @@ from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
 from vllm_torchtpu.runner.static_decode_buffers import (
     StaticDecodeBufferTracker,
     build_fresh_verify_reference,
+    fold_verify_and_draft_prep,
     verify_static_decode_PrepareInputs,
 )
 from vllm_torchtpu.runner.tpu_pooling import (
@@ -186,6 +190,8 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncTPUCopyState,
     AsyncTPUModelRunnerOutput,
     SpecLogprobsChunk,
+    static_shape_args,
+    update_mamba_slot_read_offsets,
 )
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
@@ -351,6 +357,278 @@ def _spec_logprob_row_tokens(
     out = torch.zeros(num_rows + 1, dtype=torch.int64, device=next_tokens.device)
     out = out.scatter(0, rows.flatten(), tokens.flatten())
     return out[:num_rows, None]
+
+
+@dataclass
+class _PrecomputedDraftPrep:
+    """Bookkeeping outputs computed by the fused verify+draft-prep program and
+    the folded draft loop epilogue under `TPU_FOLD_SPEC_BOOKKEEPING=1`."""
+
+    draft_input_ids: torch.Tensor
+    gather_indices: torch.Tensor
+    num_rejected_knr: torch.Tensor
+    pos_step1: torch.Tensor
+    seq_lens_step1: torch.Tensor
+    bonus_full: torch.Tensor
+    spec_num_rejected: torch.Tensor
+    mamba_offsets_updated: bool = False
+    pos_req_expand_idx: torch.Tensor | None = None
+    pos_step1_offsets: torch.Tensor | None = None
+    valid_token_mask: torch.Tensor | None = None
+    valid_req_mask: torch.Tensor | None = None
+    valid_draft_mask: torch.Tensor | None = None
+    src_padded: torch.Tensor | None = None
+    next_seq_lens: torch.Tensor | None = None
+    next_positions: torch.Tensor | None = None
+    next_input_ids: torch.Tensor | None = None
+    next_draft_token_ids: torch.Tensor | None = None
+    steady_state_key: tuple[int, ...] | None = None
+
+
+def _stack_mamba_groups_impl(*groups: torch.Tensor) -> torch.Tensor:
+    return torch.stack(groups, dim=0)
+
+
+_stack_mamba_groups_compiled = _tpu_compile(_stack_mamba_groups_impl)
+
+
+def _stack_or_single_mamba_groups(groups: list[torch.Tensor]) -> torch.Tensor:
+    if len(groups) == 1:
+        return groups[0]
+    func = (
+        _stack_mamba_groups_compiled
+        if groups[0].device.type == "tpu"
+        else _stack_mamba_groups_impl
+    )
+    return func(*groups)
+
+
+def _fused_greedy_verify_and_draft_prep_from_top_tokens_impl(
+    tokens: torch.Tensor,
+    bonus_logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+    accept_u: torch.Tensor | None,
+    synthetic_conditional_rates: torch.Tensor | None,
+    synthetic_mode: bool,
+    chunk_input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    pad_req_idx: torch.Tensor,
+    positions: torch.Tensor,
+    base_seq_lens: torch.Tensor,
+    advance_draft_positions: bool,
+    max_num_reqs: int,
+    read_offsets: torch.Tensor | None = None,
+    stacked_groups: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, ...]:
+    bonus_token_ids = torch.index_select(tokens, 0, bonus_logits_indices).view(-1)
+    target_argmax = torch.index_select(tokens, 0, target_logits_indices).view(-1)
+    next_tokens = greedy_rejection_sample(
+        draft_token_ids,
+        target_argmax.to(torch.int32),
+        num_draft_tokens,
+        bonus_token_ids,
+        segment_ids,
+        group_indices,
+        max_draft_tokens,
+        accept_u,
+        synthetic_conditional_rates,
+        synthetic_mode,
+    )
+    prep_tensors = fold_verify_and_draft_prep(
+        next_tokens=next_tokens,
+        chunk_input_ids=chunk_input_ids,
+        draft_lengths=num_draft_tokens,
+        query_start_loc=query_start_loc,
+        pad_req_idx=pad_req_idx,
+        positions=positions,
+        base_seq_lens=base_seq_lens,
+        advance_draft_positions=advance_draft_positions,
+        max_num_reqs=max_num_reqs,
+        read_offsets=read_offsets,
+        stacked_groups=stacked_groups,
+    )
+    return (next_tokens, *prep_tensors)
+
+
+_compiled_fused_greedy_verify_and_draft_prep_from_top_tokens = static_shape_args(
+    torch.compile(
+        _fused_greedy_verify_and_draft_prep_from_top_tokens_impl,
+        backend="tpu",
+        fullgraph=True,
+        dynamic=False,
+    )
+)
+
+
+def _fused_greedy_verify_and_draft_prep_from_top_tokens(
+    tokens: torch.Tensor,
+    bonus_logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+    accept_u: torch.Tensor | None,
+    synthetic_conditional_rates: torch.Tensor | None,
+    synthetic_mode: bool,
+    chunk_input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    pad_req_idx: torch.Tensor,
+    positions: torch.Tensor,
+    base_seq_lens: torch.Tensor,
+    advance_draft_positions: bool,
+    max_num_reqs: int,
+    read_offsets: torch.Tensor | None = None,
+    stacked_groups: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, ...]:
+    func = (
+        _compiled_fused_greedy_verify_and_draft_prep_from_top_tokens
+        if tokens.device.type == "tpu"
+        else _fused_greedy_verify_and_draft_prep_from_top_tokens_impl
+    )
+    return func(
+        tokens,
+        bonus_logits_indices,
+        target_logits_indices,
+        draft_token_ids,
+        num_draft_tokens,
+        segment_ids,
+        group_indices,
+        max_draft_tokens,
+        accept_u,
+        synthetic_conditional_rates,
+        synthetic_mode,
+        chunk_input_ids,
+        query_start_loc,
+        pad_req_idx,
+        positions,
+        base_seq_lens,
+        advance_draft_positions,
+        max_num_reqs,
+        read_offsets,
+        stacked_groups,
+    )
+
+
+def _fused_greedy_verify_and_draft_prep_from_logits_impl(
+    logits: torch.Tensor,
+    bonus_logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+    accept_u: torch.Tensor | None,
+    synthetic_conditional_rates: torch.Tensor | None,
+    synthetic_mode: bool,
+    chunk_input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    pad_req_idx: torch.Tensor,
+    positions: torch.Tensor,
+    base_seq_lens: torch.Tensor,
+    advance_draft_positions: bool,
+    max_num_reqs: int,
+    read_offsets: torch.Tensor | None = None,
+    stacked_groups: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, ...]:
+    bonus_token_ids = torch.argmax(
+        torch.index_select(logits, 0, bonus_logits_indices), dim=-1
+    )
+    target_logits = torch.index_select(logits, 0, target_logits_indices)
+    next_tokens = greedy_rejection_sample(
+        draft_token_ids,
+        torch.argmax(target_logits, dim=-1).to(torch.int32),
+        num_draft_tokens,
+        bonus_token_ids,
+        segment_ids,
+        group_indices,
+        max_draft_tokens,
+        accept_u,
+        synthetic_conditional_rates,
+        synthetic_mode,
+    )
+    prep_tensors = fold_verify_and_draft_prep(
+        next_tokens=next_tokens,
+        chunk_input_ids=chunk_input_ids,
+        draft_lengths=num_draft_tokens,
+        query_start_loc=query_start_loc,
+        pad_req_idx=pad_req_idx,
+        positions=positions,
+        base_seq_lens=base_seq_lens,
+        advance_draft_positions=advance_draft_positions,
+        max_num_reqs=max_num_reqs,
+        read_offsets=read_offsets,
+        stacked_groups=stacked_groups,
+    )
+    return (next_tokens, *prep_tensors)
+
+
+_compiled_fused_greedy_verify_and_draft_prep_from_logits = static_shape_args(
+    torch.compile(
+        _fused_greedy_verify_and_draft_prep_from_logits_impl,
+        backend="tpu",
+        fullgraph=True,
+        dynamic=False,
+    )
+)
+
+
+def _fused_greedy_verify_and_draft_prep_from_logits(
+    logits: torch.Tensor,
+    bonus_logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+    accept_u: torch.Tensor | None,
+    synthetic_conditional_rates: torch.Tensor | None,
+    synthetic_mode: bool,
+    chunk_input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    pad_req_idx: torch.Tensor,
+    positions: torch.Tensor,
+    base_seq_lens: torch.Tensor,
+    advance_draft_positions: bool,
+    max_num_reqs: int,
+    read_offsets: torch.Tensor | None = None,
+    stacked_groups: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, ...]:
+    func = (
+        _compiled_fused_greedy_verify_and_draft_prep_from_logits
+        if logits.device.type == "tpu"
+        else _fused_greedy_verify_and_draft_prep_from_logits_impl
+    )
+    return func(
+        logits,
+        bonus_logits_indices,
+        target_logits_indices,
+        draft_token_ids,
+        num_draft_tokens,
+        segment_ids,
+        group_indices,
+        max_draft_tokens,
+        accept_u,
+        synthetic_conditional_rates,
+        synthetic_mode,
+        chunk_input_ids,
+        query_start_loc,
+        pad_req_idx,
+        positions,
+        base_seq_lens,
+        advance_draft_positions,
+        max_num_reqs,
+        read_offsets,
+        stacked_groups,
+    )
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -1041,6 +1319,11 @@ class TPUModelRunner(GPUModelRunner):
         self._static_decode_tracker: StaticDecodeBufferTracker | None = None
         self._pending_static_verify: dict[str, Any] | None = None
         self._last_step_used_static_decode: bool = False
+        self._fused_async_subst_done: bool = False
+        self._folded_steady_state_prep: _PrecomputedDraftPrep | None = None
+        self._fold_epilogue_mask_cache: dict[
+            tuple[int, ...], tuple[torch.Tensor, ...]
+        ] = {}
 
         self.speculative_config = self.vllm_config.speculative_config
         speculative_config = self.speculative_config
@@ -1349,6 +1632,13 @@ class TPUModelRunner(GPUModelRunner):
                 raise NotImplementedError(
                     "Unsupported speculative decoding method: "
                     f"{self.speculative_config.method}"
+                )
+            if envs.TPU_FOLD_SPEC_BOOKKEEPING and not isinstance(
+                self.drafter, Eagle3Proposer
+            ):
+                raise NotImplementedError(
+                    "TPU_FOLD_SPEC_BOOKKEEPING=1 is only supported with "
+                    f"Eagle3Proposer, got {type(self.drafter).__name__}."
                 )
 
     def _relayout_tables(self, model: torch.nn.Module | None) -> None:
@@ -2869,6 +3159,37 @@ class TPUModelRunner(GPUModelRunner):
             "async spec substitution requires the eagle3 drafts proposed "
             "earlier in sample_tokens"
         )
+        if (
+            envs.TPU_FOLD_SPEC_BOOKKEEPING
+            and len(next_tokens_per_chunk) == 1
+            and self.max_num_reqs is not None
+        ):
+            num_reqs = state.num_reqs_list[0]
+            spec_metadata = state.spec_decode_metadata_list[0]
+            draft_chunks_state = state.draft_chunks
+            precomputed_prep = (
+                draft_chunks_state[0]._precomputed_draft_prep
+                if draft_chunks_state and draft_chunks_state[0] is not None
+                else None
+            )
+            if (
+                precomputed_prep is not None
+                and precomputed_prep.src_padded is not None
+                and precomputed_prep.spec_num_rejected is not None
+            ):
+                self._folded_steady_state_prep = precomputed_prep
+                num_draft_per_req = (
+                    dict(enumerate(spec_metadata.draft_lengths_cpu[:num_reqs].tolist()))
+                    if spec_metadata is not None
+                    else {}
+                )
+                next_token_indices = {req_idx: req_idx for req_idx in range(num_reqs)}
+                return (
+                    [precomputed_prep.src_padded],
+                    next_token_indices,
+                    precomputed_prep.spec_num_rejected,
+                    num_draft_per_req,
+                )
         drafts_per_chunk = self._drafts_per_chunk(drafts, state.num_reqs_list)
         # Bucketed drafters keep the sampler's padded rows (an exact-count slice
         # would compile a program per request count); others keep exact rows.
@@ -3181,7 +3502,7 @@ class TPUModelRunner(GPUModelRunner):
         is_uniform_spec_step = False
         has_mrope_delta = False
         can_use_static_decode = False
-        if use_static_decode:
+        if use_static_decode or envs.TPU_FOLD_SPEC_BOOKKEEPING:
             is_uniform_scheduled = bool(
                 (
                     num_scheduled_tokens_per_req == max_num_scheduled_tokens_all_reqs
@@ -3211,7 +3532,8 @@ class TPUModelRunner(GPUModelRunner):
                 )
             )
             can_use_static_decode = (
-                is_uniform_scheduled
+                use_static_decode
+                and is_uniform_scheduled
                 and start_index == 0
                 and end_index == self.input_batch.num_reqs
                 and not has_mrope_delta
@@ -3398,6 +3720,7 @@ class TPUModelRunner(GPUModelRunner):
         else:
             assert self.num_reqs_most_model_len is not None
             target_num_reqs = self.num_reqs_most_model_len
+        assert target_num_reqs is not None
         padded_num_reqs = _get_padded_num_reqs_with_upper_limit(
             num_reqs, self.max_num_reqs
         )
@@ -3431,94 +3754,6 @@ class TPUModelRunner(GPUModelRunner):
         local_total_num_scheduled_tokens = layout_plan.local_num_tokens
         local_padded_total_num_scheduled_tokens = layout_plan.local_padded_num_tokens
         local_token_slice = layout_plan.token_slice
-        if layout_plan.kind is SequenceLayoutKind.ALL:
-            # Zero out to avoid spurious values from prev iteration.
-            self.input_ids_cpu[
-                total_num_scheduled_tokens:padded_total_num_scheduled_tokens
-            ] = 0
-            self.positions_cpu[
-                total_num_scheduled_tokens:padded_total_num_scheduled_tokens
-            ] = 0
-        self.input_ids = self.input_ids_cpu[local_token_slice].to(
-            self.device, non_blocking=True
-        )
-        if self.uses_mrope:
-            if layout_plan.kind is SequenceLayoutKind.ALL:
-                self.mrope_positions.cpu[
-                    :, total_num_scheduled_tokens:padded_total_num_scheduled_tokens
-                ] = 0
-            self.position_ids = self.mrope_positions.cpu[:, local_token_slice].to(
-                self.device, non_blocking=True
-            )
-        else:
-            self.position_ids = self.positions_cpu[local_token_slice].to(
-                self.device, non_blocking=True
-            )
-        self.seq_lens_np[num_reqs:target_num_reqs] = 0
-        if use_max_model_len:
-            seq_lens = self.seq_lens_cpu[: self.num_reqs_max_model_len].to(
-                self.device, non_blocking=True
-            )
-            target_num_reqs = self.num_reqs_max_model_len
-        else:
-            assert self.num_reqs_most_model_len is not None
-            seq_lens = self.seq_lens_cpu[: self.num_reqs_most_model_len].to(
-                self.device, non_blocking=True
-            )
-            target_num_reqs = self.num_reqs_most_model_len
-
-        # Async spec: seq_lens/positions were advanced optimistically (every
-        # draft from the previous step assumed accepted). Subtract the real
-        # per-request rejected count on-device, keyed by req position.
-        # req_id_to_index_copy is empty for zero-token results that
-        # _flush_disjoint_async_results() keeps until sample_tokens() waits on
-        # their copy. Nothing maps then, and under PCP the full-size index arrays
-        # below would not match this rank's shard of position_ids.
-        if (
-            self.scheduler_config.async_scheduling
-            and self.speculative_config
-            and self._pre_async_results is not None
-            and self._pre_async_results.spec_decode_num_rejected_tokens is not None
-            and self._pre_async_results.req_id_to_index_copy
-        ):
-            from vllm_torchtpu.runner.tpu_runner_async_output import (
-                subtract_num_rejected_tokens,
-            )
-
-            seq_idx_np = np.full(target_num_reqs, -1, dtype=np.int32)
-            pos_idx_np = np.full(padded_total_num_scheduled_tokens, -1, dtype=np.int32)
-            acc = 0
-            for i in range(num_reqs):
-                req_id = self.input_batch.req_ids[start_index + i]
-                n_sched = int(num_scheduled_tokens_per_req[i])
-                pos = self._pre_async_results.req_id_to_index_copy.get(req_id)
-                if pos is not None:
-                    seq_idx_np[i] = pos
-                    pos_idx_np[acc : acc + n_sched] = pos
-                acc += n_sched
-            seq_lens, self.position_ids = subtract_num_rejected_tokens(
-                seq_lens,
-                self.position_ids,
-                self._pre_async_results.spec_decode_num_rejected_tokens,
-                self._upload_unless_unchanged(
-                    "rejected_seq_idx", torch.from_numpy(seq_idx_np)
-                ),
-                self._upload_unless_unchanged(
-                    "rejected_pos_idx", torch.from_numpy(pos_idx_np)
-                ),
-            )
-
-        # For decode-only case, cache constant device tensors to skip H2D.
-        # query_start_loc, logits_indices, and request_distribution don't
-        # change between decode steps for a given (num_reqs, padded_num_reqs).
-        is_decode_only = max_num_scheduled_tokens_all_reqs == 1
-        decode_cache_key = (
-            num_reqs,
-            padded_num_reqs,
-            use_max_model_len,
-            layout_plan.descriptor.cache_key,
-        )
-
         # Speculative decoding metadata.
         spec_decode_metadata = None
         if self.speculative_config:
@@ -3544,6 +3779,150 @@ class TPUModelRunner(GPUModelRunner):
                         ),
                     )
                 )
+
+        self._fused_async_subst_done = False
+        folded_prep = self._folded_steady_state_prep
+        self._folded_steady_state_prep = None
+        self.seq_lens_np[num_reqs:target_num_reqs] = 0
+        can_use_folded_steady_state = False
+        if (
+            envs.TPU_FOLD_SPEC_BOOKKEEPING
+            and not envs.TPU_STATIC_DECODE_INPUTS_VERIFY
+            and folded_prep is not None
+            and is_uniform_spec_step
+            and start_index == 0
+            and end_index == self.input_batch.num_reqs
+            and layout_plan.kind is SequenceLayoutKind.ALL
+            and not has_mrope_delta
+            and spec_decode_metadata is not None
+            and folded_prep.next_seq_lens is not None
+            and folded_prep.next_positions is not None
+            and folded_prep.next_input_ids is not None
+            and folded_prep.next_draft_token_ids is not None
+            and folded_prep.next_draft_token_ids.shape
+            == spec_decode_metadata.target_logits_indices.shape
+        ):
+            pre_async_results = self._pre_async_results
+            expected_steady_key = (
+                num_reqs,
+                padded_num_reqs,
+                target_num_reqs,
+                padded_total_num_scheduled_tokens,
+                max_num_scheduled_tokens_all_reqs,
+            )
+            can_use_folded_steady_state = bool(
+                folded_prep.steady_state_key == expected_steady_key
+                and pre_async_results is not None
+                and pre_async_results.spec_decode_num_rejected_tokens
+                is folded_prep.spec_num_rejected
+                and pre_async_results.next_tokens_tpu is folded_prep.src_padded
+                and pre_async_results.req_id_to_index_copy
+                and all(
+                    pre_async_results.req_id_to_index_copy.get(
+                        self.input_batch.req_ids[start_index + i]
+                    )
+                    == i
+                    and int(num_scheduled_tokens_per_req[i])
+                    == max_num_scheduled_tokens_all_reqs
+                    for i in range(num_reqs)
+                )
+            )
+
+        if (
+            can_use_folded_steady_state
+            and folded_prep is not None
+            and folded_prep.next_seq_lens is not None
+            and folded_prep.next_positions is not None
+            and folded_prep.next_input_ids is not None
+            and folded_prep.next_draft_token_ids is not None
+            and spec_decode_metadata is not None
+        ):
+            seq_lens = folded_prep.next_seq_lens
+            self.position_ids = folded_prep.next_positions
+            self.input_ids = folded_prep.next_input_ids
+            spec_decode_metadata.draft_token_ids = folded_prep.next_draft_token_ids
+            self._fused_async_subst_done = True
+        else:
+            if layout_plan.kind is SequenceLayoutKind.ALL:
+                # Zero out to avoid spurious values from prev iteration.
+                self.input_ids_cpu[
+                    total_num_scheduled_tokens:padded_total_num_scheduled_tokens
+                ] = 0
+                self.positions_cpu[
+                    total_num_scheduled_tokens:padded_total_num_scheduled_tokens
+                ] = 0
+            self.input_ids = self.input_ids_cpu[local_token_slice].to(
+                self.device, non_blocking=True
+            )
+            if self.uses_mrope:
+                if layout_plan.kind is SequenceLayoutKind.ALL:
+                    self.mrope_positions.cpu[
+                        :, total_num_scheduled_tokens:padded_total_num_scheduled_tokens
+                    ] = 0
+                self.position_ids = self.mrope_positions.cpu[:, local_token_slice].to(
+                    self.device, non_blocking=True
+                )
+            else:
+                self.position_ids = self.positions_cpu[local_token_slice].to(
+                    self.device, non_blocking=True
+                )
+            seq_lens = self.seq_lens_cpu[:target_num_reqs].to(
+                self.device, non_blocking=True
+            )
+
+            # Async spec: seq_lens/positions were advanced optimistically (every
+            # draft from the previous step assumed accepted). Subtract the real
+            # per-request rejected count on-device, keyed by req position.
+            # req_id_to_index_copy is empty for zero-token results that
+            # _flush_disjoint_async_results() keeps until sample_tokens() waits on
+            # their copy. Nothing maps then, and under PCP the full-size index arrays
+            # below would not match this rank's shard of position_ids.
+            if (
+                self.scheduler_config.async_scheduling
+                and self.speculative_config
+                and self._pre_async_results is not None
+                and self._pre_async_results.spec_decode_num_rejected_tokens is not None
+                and self._pre_async_results.req_id_to_index_copy
+            ):
+                from vllm_torchtpu.runner.tpu_runner_async_output import (
+                    subtract_num_rejected_tokens,
+                )
+
+                seq_idx_np = np.full(target_num_reqs, -1, dtype=np.int32)
+                pos_idx_np = np.full(
+                    padded_total_num_scheduled_tokens, -1, dtype=np.int32
+                )
+                acc = 0
+                for i in range(num_reqs):
+                    req_id = self.input_batch.req_ids[start_index + i]
+                    n_sched = int(num_scheduled_tokens_per_req[i])
+                    pos = self._pre_async_results.req_id_to_index_copy.get(req_id)
+                    if pos is not None:
+                        seq_idx_np[i] = pos
+                        pos_idx_np[acc : acc + n_sched] = pos
+                    acc += n_sched
+                seq_lens, self.position_ids = subtract_num_rejected_tokens(
+                    seq_lens,
+                    self.position_ids,
+                    self._pre_async_results.spec_decode_num_rejected_tokens,
+                    self._upload_unless_unchanged(
+                        "rejected_seq_idx", torch.from_numpy(seq_idx_np)
+                    ),
+                    self._upload_unless_unchanged(
+                        "rejected_pos_idx", torch.from_numpy(pos_idx_np)
+                    ),
+                )
+
+        # For decode-only case, cache constant device tensors to skip H2D.
+        # query_start_loc, logits_indices, and request_distribution don't
+        # change between decode steps for a given (num_reqs, padded_num_reqs).
+        is_decode_only = max_num_scheduled_tokens_all_reqs == 1
+        decode_cache_key = (
+            num_reqs,
+            padded_num_reqs,
+            use_max_model_len,
+            layout_plan.descriptor.cache_key,
+        )
 
         # Default decode layouts keep logits_indices stable for a fixed
         # (num_reqs, padded_num_reqs) bucket. PCP streaming layouts provide
@@ -4304,9 +4683,13 @@ class TPUModelRunner(GPUModelRunner):
             # offset; clear it before this chunk's forward gathers it.
             self._reset_read_offsets_for_new_requests(start_index, num_reqs)
 
-            input_ids = self._apply_async_token_substitution(
-                self.input_ids, cur_input_indices, pre_next_tokens_indices
-            )
+            if self._fused_async_subst_done:
+                self._fused_async_subst_done = False
+                input_ids = self.input_ids
+            else:
+                input_ids = self._apply_async_token_substitution(
+                    self.input_ids, cur_input_indices, pre_next_tokens_indices
+                )
             # Async spec: the drafts the target verifies live in the substituted
             # input_ids (host input_ids_cpu holds placeholders), so re-source the
             # rejection sampler's draft_token_ids from the device.
@@ -4314,6 +4697,7 @@ class TPUModelRunner(GPUModelRunner):
                 self.scheduler_config.async_scheduling
                 and spec_decode_metadata is not None
                 and len(cur_input_indices) > 0
+                and spec_decode_metadata.draft_token_ids is None
             ):
                 from vllm_torchtpu.runner.tpu_runner_async_output import (
                     extract_draft_token_ids,
@@ -4765,26 +5149,12 @@ class TPUModelRunner(GPUModelRunner):
         """
         if self.mamba_slot_read_offsets is None or not indices_per_group:
             return
-        offsets = torch.zeros(
-            indices_per_group[0].shape[0],
-            dtype=torch.int32,
-            device=indices_per_group[0].device,
+        self.mamba_slot_read_offsets = update_mamba_slot_read_offsets(
+            self.mamba_slot_read_offsets,
+            indices_per_group,
+            next_tokens,
+            num_reqs,
         )
-        if next_tokens is not None:
-            # num_valid = accepted drafts + 1 (bonus); the checkpoint of the
-            # last accepted token is at offset num_valid - 1.
-            num_valid = (
-                (next_tokens[:num_reqs] != INVALID_TOKEN_ID).sum(dim=1).to(torch.int32)
-            )
-            offsets[:num_reqs] = (num_valid - 1).clamp(min=0)
-        if len(indices_per_group) == 1:
-            self.mamba_slot_read_offsets.index_put_(
-                (indices_per_group[0].long(),), offsets
-            )
-        else:
-            all_indices = torch.cat(indices_per_group, dim=0).long()
-            all_offsets = offsets.repeat(len(indices_per_group))
-            self.mamba_slot_read_offsets.index_put_((all_indices,), all_offsets)
 
     def _mamba_state_index_groups(self) -> list[torch.Tensor] | None:
         """This chunk's mamba state slot/block ids, one tensor per group.
@@ -4910,6 +5280,220 @@ class TPUModelRunner(GPUModelRunner):
             all_greedy=True,
         )
 
+    def _build_fold_verify_and_draft_prep_inputs(
+        self,
+        draft_chunk: DraftChunkInputs | None,
+        mamba_indices: list[torch.Tensor] | None,
+        can_defer_mamba_offsets: bool,
+    ) -> (
+        tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            bool,
+            int,
+            torch.Tensor | None,
+            torch.Tensor | None,
+            # Epilogue masks; all None when the next step cannot be folded.
+            tuple[torch.Tensor | None, ...],
+            tuple[int, ...],
+        ]
+        | None
+    ):
+        if not isinstance(self.drafter, Eagle3Proposer):
+            return None
+        drafter = self.drafter
+        if not drafter._draft_tp_matches_target:
+            return None
+        if (
+            draft_chunk is None
+            or draft_chunk.input_ids is None
+            or draft_chunk.attn_ctx.seq_lens is None
+            or draft_chunk.attn_ctx.query_start_loc is None
+        ):
+            return None
+        layout_plan = draft_chunk.sequence_layout_plan
+        if layout_plan is not None and layout_plan.kind is not SequenceLayoutKind.ALL:
+            return None
+        num_reqs = int(draft_chunk.num_reqs)
+        loop_bucket = int(drafter._loop_bucket(num_reqs))
+        pad_key = (loop_bucket, num_reqs, str(self.device))
+        pad_cache = drafter._async_pad_req_idx_cache
+        pad_req_idx = pad_cache.get(pad_key)
+        if pad_req_idx is None:
+            pad_req_idx_np = np.minimum(
+                np.arange(loop_bucket, dtype=np.int64), num_reqs - 1
+            )
+            pad_req_idx = torch.from_numpy(pad_req_idx_np).to(self.device)
+            pad_cache[pad_key] = pad_req_idx
+
+        advance_pos = bool(drafter.advance_draft_positions)
+
+        read_offsets: torch.Tensor | None = None
+        stacked_groups: torch.Tensor | None = None
+        if (
+            can_defer_mamba_offsets
+            and mamba_indices
+            and self.mamba_slot_read_offsets is not None
+        ):
+            read_offsets = self.mamba_slot_read_offsets
+            stacked_groups = _stack_or_single_mamba_groups(mamba_indices)
+
+        if self.speculative_config is None:
+            return None
+        spec_k = int(self.speculative_config.num_speculative_tokens)
+        query_len = 1 + spec_k
+        padded_num_reqs = _get_padded_num_reqs_with_upper_limit(
+            num_reqs, self.max_num_reqs
+        )
+        knr = int(draft_chunk.attn_ctx.seq_lens.shape[0])
+        padded_total_tokens = int(draft_chunk.input_ids.shape[0])
+        steady_key = (
+            num_reqs,
+            padded_num_reqs,
+            knr,
+            padded_total_tokens,
+            query_len,
+        )
+        reqs_dict = self.requests or {}
+        req_ids_all = self.input_batch.req_ids
+        start_idx = int(draft_chunk.start_index)
+        has_mrope_delta = bool(
+            self.uses_mrope
+            and any(
+                bool(reqs_dict[req_ids_all[idx]].mrope_position_delta)
+                if idx < len(req_ids_all) and req_ids_all[idx] in reqs_dict
+                else False
+                for idx in range(start_idx, start_idx + num_reqs)
+            )
+        )
+        can_fold_next_step = not has_mrope_delta and advance_pos and start_idx == 0
+        fold_cache = self._fold_epilogue_mask_cache
+        epilogue_tensors = (
+            fold_cache.get(steady_key)
+            if can_fold_next_step
+            else (None, None, None, None, None)
+        )
+        if epilogue_tensors is None:
+            req_expand_np = np.zeros(padded_total_tokens, dtype=np.int64)
+            offsets_np = np.zeros(padded_total_tokens, dtype=np.int32)
+            valid_tok_np = np.zeros(padded_total_tokens, dtype=np.int32)
+            total_valid_tokens = min(num_reqs * query_len, padded_total_tokens)
+            for req_idx in range(num_reqs):
+                tok_start = req_idx * query_len
+                tok_end = min(tok_start + query_len, padded_total_tokens)
+                if tok_start >= padded_total_tokens:
+                    break
+                req_expand_np[tok_start:tok_end] = min(req_idx, loop_bucket - 1)
+                offsets_np[tok_start:tok_end] = np.arange(
+                    tok_end - tok_start, dtype=np.int32
+                )
+            valid_tok_np[:total_valid_tokens] = 1
+            valid_req_np = np.zeros(knr, dtype=np.int32)
+            valid_req_np[: min(num_reqs, knr)] = 1
+            valid_draft_np = np.zeros(padded_total_tokens, dtype=np.int32)
+            valid_draft_np[: min(num_reqs * spec_k, padded_total_tokens)] = 1
+            epilogue_tensors = (
+                torch.from_numpy(req_expand_np).to(self.device),
+                torch.from_numpy(offsets_np).to(self.device),
+                torch.from_numpy(valid_tok_np).to(self.device),
+                torch.from_numpy(valid_req_np).to(self.device),
+                torch.from_numpy(valid_draft_np).to(self.device),
+            )
+            if len(fold_cache) >= 64:
+                fold_cache.pop(next(iter(fold_cache)))
+            fold_cache[steady_key] = epilogue_tensors
+
+        return (
+            draft_chunk.input_ids,
+            draft_chunk.attn_ctx.query_start_loc,
+            pad_req_idx,
+            draft_chunk.position_ids,
+            draft_chunk.attn_ctx.seq_lens,
+            advance_pos,
+            int(self.max_num_reqs),
+            read_offsets,
+            stacked_groups,
+            epilogue_tensors,
+            steady_key,
+        )
+
+    def _run_fold_greedy_verify_and_draft_prep(
+        self,
+        verify_inputs: torch.Tensor,
+        md: Any,
+        fold_prep_args: tuple[Any, ...],
+        sampling_generator: torch.Generator | None,
+        draft_chunk: DraftChunkInputs,
+        fused_fn: Callable[..., tuple[torch.Tensor, ...]],
+    ) -> torch.Tensor:
+        (
+            chunk_in_ids,
+            qsl_dev,
+            pad_req_idx,
+            pos_dev,
+            base_sl_dev,
+            advance_pos,
+            max_reqs,
+            read_offsets,
+            stacked_groups,
+            epilogue_tensors,
+            steady_key,
+        ) = fold_prep_args
+        assert self.rejection_sampler is not None
+        assert self.speculative_config is not None
+        accept_u = (
+            torch.rand(
+                md.draft_token_ids.shape,
+                dtype=torch.float32,
+                device=verify_inputs.device,
+                generator=sampling_generator,
+            )
+            if self.rejection_sampler.synthetic_mode
+            else None
+        )
+        fused_res = fused_fn(
+            verify_inputs,
+            md.bonus_logits_indices,
+            md.target_logits_indices,
+            md.draft_token_ids,
+            md.draft_lengths,
+            md.segment_ids,
+            md.group_indices,
+            self.speculative_config.num_speculative_tokens,
+            accept_u,
+            self.rejection_sampler.synthetic_conditional_rates,
+            self.rejection_sampler.synthetic_mode,
+            chunk_in_ids,
+            qsl_dev,
+            pad_req_idx,
+            pos_dev,
+            base_sl_dev,
+            advance_pos,
+            max_reqs,
+            read_offsets,
+            stacked_groups,
+        )
+        draft_chunk._precomputed_draft_prep = _PrecomputedDraftPrep(
+            draft_input_ids=fused_res[1],
+            gather_indices=fused_res[2],
+            num_rejected_knr=fused_res[3],
+            pos_step1=fused_res[4],
+            seq_lens_step1=fused_res[5],
+            bonus_full=fused_res[6],
+            spec_num_rejected=fused_res[7],
+            mamba_offsets_updated=read_offsets is not None,
+            pos_req_expand_idx=epilogue_tensors[0],
+            pos_step1_offsets=epilogue_tensors[1],
+            valid_token_mask=epilogue_tensors[2],
+            valid_req_mask=epilogue_tensors[3],
+            valid_draft_mask=epilogue_tensors[4],
+            steady_state_key=steady_key,
+        )
+        return fused_res[0]
+
     def _sample_spec_verify_chunk(
         self,
         logits: torch.Tensor,
@@ -4921,6 +5505,9 @@ class TPUModelRunner(GPUModelRunner):
         all_greedy: bool,
         sampling_generator: torch.Generator | None,
         top_tokens: bool = False,
+        draft_chunk: DraftChunkInputs | None = None,
+        mamba_indices: list[torch.Tensor] | None = None,
+        can_defer_mamba_offsets: bool = False,
     ) -> torch.Tensor:
         """Bonus-token sampling + draft rejection for one spec-verify chunk.
 
@@ -4929,9 +5516,31 @@ class TPUModelRunner(GPUModelRunner):
         each row's greedy token instead.
         """
         assert md.draft_token_ids is not None, "deferred draft_token_ids never filled"
+        assert self.rejection_sampler is not None
+        assert self.speculative_config is not None
+        fold_prep_args = (
+            self._build_fold_verify_and_draft_prep_inputs(
+                draft_chunk, mamba_indices, can_defer_mamba_offsets
+            )
+            if (
+                envs.TPU_FOLD_SPEC_BOOKKEEPING
+                and (top_tokens or all_greedy)
+                and grammar_output is None
+                and bool(self.scheduler_config.async_scheduling)
+                and self._is_async_drafter
+            )
+            else None
+        )
         if top_tokens:
-            assert self.rejection_sampler is not None
-            assert self.speculative_config is not None
+            if fold_prep_args is not None and draft_chunk is not None:
+                return self._run_fold_greedy_verify_and_draft_prep(
+                    logits,
+                    md,
+                    fold_prep_args,
+                    sampling_generator,
+                    draft_chunk,
+                    _fused_greedy_verify_and_draft_prep_from_top_tokens,
+                )
             bonus_token_ids, target_argmax = self.spec_bonus_and_target_tokens(
                 logits, md.bonus_logits_indices, md.target_logits_indices
             )
@@ -4958,6 +5567,15 @@ class TPUModelRunner(GPUModelRunner):
         req_temperatures = req_top_k = req_top_p = None
         topk_candidates = 0
         if all_greedy and grammar_output is None:
+            if fold_prep_args is not None and draft_chunk is not None:
+                return self._run_fold_greedy_verify_and_draft_prep(
+                    logits,
+                    md,
+                    fold_prep_args,
+                    sampling_generator,
+                    draft_chunk,
+                    _fused_greedy_verify_and_draft_prep_from_logits,
+                )
             bonus_token_ids, target_logits = self.spec_bonus_and_target_logits(
                 logits, md.bonus_logits_indices, md.target_logits_indices
             )
@@ -5118,14 +5736,33 @@ class TPUModelRunner(GPUModelRunner):
         elif is_spec_step:
             cur_start_idx = 0
             all_greedy = self.input_batch.all_greedy
-            for logits, num_reqs, md, mamba_indices in zip(
+            draft_chunks_for_verify = (
+                state.draft_chunks
+                if state.draft_chunks
+                and len(state.draft_chunks) == len(state.logits_list)
+                else [None] * len(state.logits_list)
+            )
+            can_defer_mamba_offsets = (
+                bool(envs.TPU_FOLD_SPEC_BOOKKEEPING)
+                and bool(self.scheduler_config.async_scheduling)
+                and not needs_logprobs
+            )
+            for logits, num_reqs, md, mamba_indices, cur_draft_chunk in zip(
                 state.logits_list,
                 state.num_reqs_list,
                 state.spec_decode_metadata_list,
                 mamba_idx_list,
+                draft_chunks_for_verify,
             ):
                 cur_end_idx = cur_start_idx + num_reqs
                 if md is not None:
+                    fold_verify_kwargs: dict[str, Any] = {}
+                    if envs.TPU_FOLD_SPEC_BOOKKEEPING:
+                        fold_verify_kwargs["draft_chunk"] = cur_draft_chunk
+                        fold_verify_kwargs["mamba_indices"] = mamba_indices
+                        fold_verify_kwargs["can_defer_mamba_offsets"] = (
+                            can_defer_mamba_offsets
+                        )
                     with self._stage_timing.stage("sample"):
                         next_tokens = self._sample_spec_verify_chunk(
                             logits,
@@ -5137,13 +5774,23 @@ class TPUModelRunner(GPUModelRunner):
                             all_greedy,
                             sampling_generator,
                             state.top_tokens,
+                            **fold_verify_kwargs,
                         )
                     combined_selected_tokens.append(next_tokens)
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(next_tokens)
-                    self._update_mamba_slot_read_offsets(
-                        mamba_indices, next_tokens, num_reqs
+                    precomputed_prep = (
+                        cur_draft_chunk._precomputed_draft_prep
+                        if cur_draft_chunk is not None
+                        else None
                     )
+                    if not (
+                        precomputed_prep is not None
+                        and precomputed_prep.mamba_offsets_updated
+                    ):
+                        self._update_mamba_slot_read_offsets(
+                            mamba_indices, next_tokens, num_reqs
+                        )
                     if needs_logprobs:
                         # Raw verify logits, one row per draft slot and bonus
                         # slot; each row paired with the token its slot chose.
@@ -7911,6 +8558,7 @@ class TPUModelRunner(GPUModelRunner):
             self._static_decode_tracker.reset()
         self._pending_static_verify = None
         self._last_step_used_static_decode = False
+        self._folded_steady_state_prep = None
         if self.input_batch.num_reqs != 0:
             cleanup_succeeded = False
             logger.warning(

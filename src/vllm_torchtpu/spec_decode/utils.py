@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from vllm_torchtpu.layers.core.attention_metadata import (
         AttentionMetadataBuilderContext,
     )
+    from vllm_torchtpu.runner.tpu_runner import _PrecomputedDraftPrep
 
 _DEFAULT_DRAFT_SEQUENCE_LAYOUT_PLAN = AllSequenceLayoutPlanner().prepare_dummy(
     num_tokens=0,
@@ -99,6 +100,12 @@ class DraftChunkInputs:
     hidden_states: torch.Tensor | None = None
     # Optional pre-built attention metadata from the target model's forward pass
     attn_metadata: Any = None
+    # Transient (positions, seq_lens) from _run_mtp_fused_loop when
+    # TPU_FOLD_SPEC_BOOKKEEPING folds post-loop bookkeeping.
+    _last_fused_loop_pos_sl: tuple[torch.Tensor, torch.Tensor] | None = None
+    # Precomputed verify + draft-prep tensors produced under
+    # TPU_FOLD_SPEC_BOOKKEEPING.
+    _precomputed_draft_prep: "_PrecomputedDraftPrep | None" = None
 
 
 @contextlib.contextmanager
