@@ -3446,6 +3446,17 @@ class TPUModelRunner(GPUModelRunner):
             fence.synchronize()
             self._input_staging_fence = None
 
+    def _upload_keyed(self, slot: str, host: torch.Tensor, values: bytes) -> torch.Tensor:
+        """`_upload_unless_unchanged` with the caller's value key (for dtypes
+        numpy cannot view)."""
+        key = (host.dtype, tuple(host.shape), values)
+        prev = self._h2d_reuse.get(slot)
+        if prev is not None and prev[0] == key:
+            return prev[1]
+        dev = host.to(self.device, non_blocking=True)
+        self._h2d_reuse[slot] = (key, dev, host)
+        return dev
+
     def _upload_unless_unchanged(self, slot: str, host: torch.Tensor) -> torch.Tensor:
         """`host.to(self.device)`, reusing `slot`'s previous upload when the
         values have not changed.
@@ -7880,6 +7891,19 @@ class TPUModelRunner(GPUModelRunner):
             self.input_batch.top_p_cpu_tensor[cur_start_idx:cur_end_idx]
         )
 
+        if envs.VLLM_TPU_SAMPLING_PARAMS_REUSE:
+            # Requests' sampling parameters rarely change between steps: reuse
+            # the previous uploads while the values match (keyed in float32,
+            # as numpy has no bfloat16).
+            return (
+                self._upload_keyed(
+                    "sampling_temps",
+                    temps_cpu.unsqueeze(1),
+                    temps_cpu.float().numpy().tobytes(),
+                ),
+                self._upload_unless_unchanged("sampling_top_k", top_k_cpu.unsqueeze(1)),
+                self._upload_unless_unchanged("sampling_top_p", top_p_cpu.unsqueeze(1)),
+            )
         return (
             temps_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
             top_k_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
