@@ -3771,6 +3771,7 @@ class TPUModelRunner(GPUModelRunner):
                 self._prefill_ckpt_offsets_cpu[:target_num_reqs],
             )
 
+        host_phases.mark("prep_host_and_uploads")
         self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,
             start_index=start_index,
@@ -3805,6 +3806,7 @@ class TPUModelRunner(GPUModelRunner):
             )
         )
 
+        host_phases.mark("prep_attention_metadata")
         if self.lora_config is not None:
             # Map this chunk's tokens and logits rows to adapter ids, padded
             # with 0 (no adapter) to the lengths the compiled graph reads.
@@ -5314,6 +5316,7 @@ class TPUModelRunner(GPUModelRunner):
             ):
                 cur_end_idx = cur_start_idx + num_reqs
                 if md is not None:
+                    host_phases.mark("sample_setup")
                     with self._stage_timing.stage("sample"):
                         next_tokens = self._sample_spec_verify_chunk(
                             logits,
@@ -5333,6 +5336,7 @@ class TPUModelRunner(GPUModelRunner):
                     self._update_mamba_slot_read_offsets(
                         mamba_indices, next_tokens, num_reqs
                     )
+                    host_phases.mark("spec_verify_and_read_offsets")
                     if needs_logprobs:
                         # Raw verify logits, one row per draft slot and bonus
                         # slot; each row paired with the token its slot chose.
@@ -5543,6 +5547,7 @@ class TPUModelRunner(GPUModelRunner):
             )
             logprobs = logprobs_lists
 
+        host_phases.mark("sample_rest")
         discard_sampled_tokens_req_indices = []
         num_reqs = self.input_batch.num_reqs
         req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
@@ -5568,7 +5573,7 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 request_seq_lens.append((i, req_state, seq_len, req_id))
 
-        host_phases.mark("sample_verify")
+        host_phases.mark("sample_req_loop")
         next_tokens_tpu = None
         copy_state = None
         if combined_selected_tokens:
