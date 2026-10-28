@@ -66,6 +66,7 @@ from vllm_torchtpu.omni.rope import (
     split_rope_natural_tables,
     wan_self_attention_fused,
 )
+from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 pytestmark = pytest.mark.omni
 
@@ -85,6 +86,18 @@ def test_register_omni_tpu_platform(monkeypatch):
 
     monkeypatch.setattr("vllm_torchtpu.omni.get_num_chips", lambda: 8)
     assert register_omni_tpu_platform() == "vllm_torchtpu.omni.platform.OmniTpuPlatform"
+
+
+def test_vllm_platform_accepts_omni_knobs():
+    # vLLM-Omni's stages run EngineArgs.create_engine_config, which validates
+    # the environment through vLLM's current_platform: TpuPlatform here, while
+    # OmniTpuPlatform is only current_omni_platform.
+    from vllm.platforms import current_platform
+
+    assert isinstance(current_platform, TpuPlatform)
+    assert not isinstance(current_platform, OmniTpuPlatform)
+    with patch.dict(os.environ, {"VLLM_OMNI_FOO": "1"}, clear=True):
+        current_platform.validate_environ(hard_fail=True)
 
 
 def test_platform_attributes():

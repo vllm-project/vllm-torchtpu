@@ -186,6 +186,19 @@ def test_external_prefixes_are_never_reported():
     assert found == [UnreadEnvVar("VLLM_TPU_GONE")]
 
 
+@pytest.mark.parametrize("installed, expected", [(True, ("VLLM_OMNI_",)), (False, ())])
+def test_omni_prefix_follows_the_installed_package(monkeypatch, installed, expected):
+    real_find_spec = tpu_platform.importlib.util.find_spec
+
+    def find_spec(name, *args, **kwargs):
+        if name == "vllm_omni":
+            return object() if installed else None
+        return real_find_spec(name, *args, **kwargs)
+
+    monkeypatch.setattr(tpu_platform.importlib.util, "find_spec", find_spec)
+    assert TpuPlatform.external_env_var_prefixes() == expected
+
+
 def _literal_environ_writes() -> set[str]:
     """Names written as os.environ[X] = ..., or os.environ.setdefault(X, ...)."""
     names = set()
@@ -214,11 +227,15 @@ def test_every_name_the_package_writes_is_known():
     written = _literal_environ_writes()
     assert "TORCH_TPU_TIER2_COMPILATION_CACHE" in written  # the scan works
     known = TpuPlatform.known_env_var_names() | set(vllm_envs.environment_variables)
-    assert sorted(written - known) == []
+    missing = sorted(written - known)
+    assert not missing, f"add to PACKAGE_WRITTEN_ENV_VARS or envs.py: {missing}"
 
 
 def test_written_list_has_no_stale_names():
-    assert sorted(PACKAGE_WRITTEN_ENV_VARS - _literal_environ_writes()) == []
+    stale = sorted(PACKAGE_WRITTEN_ENV_VARS - _literal_environ_writes())
+    assert not stale, (
+        f"no longer written; remove from PACKAGE_WRITTEN_ENV_VARS: {stale}"
+    )
 
 
 # Names a normal start sets: the compilation cache (env_override.py writes the
@@ -232,6 +249,13 @@ REAL_START_NAMES = [
     "TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT",
     "TPU_CHIPS_PER_PROCESS_BOUNDS",
     "RAY_USAGE_STATS_PROMPT_ENABLED",
+    # torch_tpu and JAX knobs that no registry lists.
+    "TORCH_TPU_ENABLE_DEBUG_CHECKS",
+    "TORCH_TPU_LAUNCH_BLOCKING",
+    "TORCH_TPU_DEVICES_PER_HOST",
+    "TORCH_TPU_INTERNAL_HANDSHAKE_PORT",
+    "JAX_COMPILATION_CACHE_DIR",
+    "JAX_TRACEBACK_FILTERING",
 ]
 
 

@@ -16,6 +16,7 @@
 # especially torch_tpu which might read them at import time.
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
+import importlib.util
 import os
 import time
 from typing import TYPE_CHECKING, Protocol, Union, cast
@@ -741,8 +742,16 @@ class TpuPlatform(Platform):
                     object.__setattr__(dp_metadata, "num_tokens_across_dp_cpu", tpu_t)
         return {}
 
-    # Prefixes owned by a reader that has no registry to check against.
-    external_env_var_prefixes: tuple[str, ...] = ()
+    @classmethod
+    def external_env_var_prefixes(cls) -> tuple[str, ...]:
+        """Prefixes owned by a reader that has no registry to check against."""
+        # vLLM-Omni reads its VLLM_OMNI_* knobs directly and has no registry.
+        # Its stages call EngineArgs.create_engine_config with this class as
+        # vLLM's current_platform (OmniTpuPlatform is only
+        # current_omni_platform), so the prefix must be known here.
+        if importlib.util.find_spec("vllm_omni") is not None:
+            return ("VLLM_OMNI_",)
+        return ()
 
     @classmethod
     def known_env_var_names(cls) -> set[str]:
@@ -770,7 +779,7 @@ class TpuPlatform(Platform):
             os.environ,
             cls.known_env_var_names(),
             vllm_envs.environment_variables,
-            cls.external_env_var_prefixes,
+            cls.external_env_var_prefixes(),
         )
         if not unread:
             return
