@@ -630,7 +630,11 @@ def _export_metadata(tmp_path: Path) -> dict[str, Any]:
         side_effect=_mock_lower_torch_callable_to_mlir,
     ):
         exporter.export(_TinyTorchExportableLLM(cfg), out_dir)
-    return json.loads(Path(out_dir, "metadata.json").read_text())
+    # Strict JSON: Python would otherwise accept NaN and Infinity.
+    return json.loads(
+        Path(out_dir, "metadata.json").read_text(),
+        parse_constant=lambda name: pytest.fail(f"{name} is not JSON"),
+    )
 
 
 def test_metadata_declares_the_xla_flags_in_libtpu_init_args(
@@ -641,7 +645,8 @@ def test_metadata_declares_the_xla_flags_in_libtpu_init_args(
         "--xla_tpu_use_dynamic_smem_negotiation=true"
         " --xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes=67108864"
         " --xla_tpu_scoped_vmem_limit_kib=0.5 --xla_tpu_mode=fast"
-        " --xla_tpu_enable_foo --tpu_megacore=false --xla_jf_bar=false",
+        " --xla_tpu_enable_foo --tpu_megacore=false --xla_jf_bar=false"
+        " --xla_tpu_limit=inf",
     )
     overrides = _export_metadata(tmp_path)["compile_options"]["env_option_overrides"]
     # Typed JSON values; a bare flag is true; non-XLA libtpu flags are dropped.
@@ -652,6 +657,8 @@ def test_metadata_declares_the_xla_flags_in_libtpu_init_args(
         "xla_tpu_mode": "fast",
         "xla_tpu_enable_foo": True,
         "xla_jf_bar": False,
+        # JSON has no infinity or NaN; the runtime would fail to parse them.
+        "xla_tpu_limit": "inf",
     }
 
 
