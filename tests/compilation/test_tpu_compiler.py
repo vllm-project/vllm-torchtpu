@@ -377,7 +377,7 @@ class TestTpuCompilerCache:
             ):
                 importlib.reload(vllm_torchtpu.env_override)
 
-    def test_libtpu_init_args_lists_the_flags_libtpu_will_read(self):
+    def test_experimental_libtpu_init_args_lists_the_flags_libtpu_will_read(self):
         """The user's flags, env_override's defaults, and flags set later."""
         env_mock = {
             "LIBTPU_INIT_ARGS": "--xla_user_flag=1 --tpu_user_flag",
@@ -389,7 +389,7 @@ class TestTpuCompilerCache:
             importlib.reload(vllm_torchtpu.env_override)
             vllm_torchtpu.env_override.set_libtpu_flag_default("--xla_later", "2")
 
-            args = vllm_torchtpu.env_override.libtpu_init_args()
+            args = vllm_torchtpu.env_override.experimental_libtpu_init_args()
             assert {
                 "--xla_user_flag=1",
                 "--tpu_user_flag",

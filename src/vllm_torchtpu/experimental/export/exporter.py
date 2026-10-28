@@ -65,7 +65,7 @@ def _xla_option_overrides() -> dict[str, bool | int | float | str]:
     `metadata.json` instead. Non-XLA libtpu flags are skipped.
     """
     overrides: dict[str, bool | int | float | str] = {}
-    for token in env_override.libtpu_init_args():
+    for token in env_override.experimental_libtpu_init_args():
         if not token.startswith("--xla_"):
             continue
         name, sep, value = token.removeprefix("--").partition("=")

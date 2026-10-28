@@ -176,11 +176,14 @@ def set_libtpu_flag_default(flag_name: str, value: str) -> None:
     logger.info("Appended default flag to LIBTPU_INIT_ARGS: %s", new_args)
 
 
-def libtpu_init_args() -> list[str]:
+def experimental_libtpu_init_args() -> list[str]:
     """The flags libtpu will read from ``LIBTPU_INIT_ARGS``, one per token.
 
     Includes the user's flags, the defaults added below at import, and any
     added since with :func:`set_libtpu_flag_default`.
+
+    Experimental: only the AOT exporter (``experimental/export``) uses this.
+    It may change or be removed at any time without notice.
     """
     return os.environ.get("LIBTPU_INIT_ARGS", "").split()
 
