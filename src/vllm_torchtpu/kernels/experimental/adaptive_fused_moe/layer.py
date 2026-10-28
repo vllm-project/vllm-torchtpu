@@ -24,6 +24,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.host import (
     HIDDEN_LANE_BLOCK,
     MAX_ROUTING_BLOCK,
@@ -453,12 +454,16 @@ def adaptive_fused_moe(
             # The rows go on the wire as they arrived. There is no scale to
             # carry, so nothing downstream builds or ships one.
             q_l, row_scale_l = rows_bf16, None
-        q_g = lax.all_gather(
-            q_l.reshape(t_local, hidden // HIDDEN_LANE_BLOCK, HIDDEN_LANE_BLOCK),
-            ax,
-            axis=0,
-            tiled=True,
-        )
+        q_rows = q_l.reshape(t_local, hidden // HIDDEN_LANE_BLOCK, HIDDEN_LANE_BLOCK)
+        if envs.MOE_ADAPTIVE_AG_LEAD_AXIS:
+            # Gathered over a new leading axis, XLA lands the rows in the
+            # row-major layout the kernel reads; tiled on the token axis it
+            # gathers in {2,0,1} and relayouts the whole block afterwards.
+            q_g = lax.all_gather(q_rows[None], ax, axis=0, tiled=True).reshape(
+                T, *q_rows.shape[1:]
+            )
+        else:
+            q_g = lax.all_gather(q_rows, ax, axis=0, tiled=True)
 
         scores = jax.nn.softmax(gate_l, axis=-1)
         select_rows = MAX_ROUTING_BLOCK
