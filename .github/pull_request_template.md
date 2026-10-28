@@ -10,6 +10,7 @@ PLEASE FILL IN THE PR DESCRIPTION HERE ENSURING ALL CHECKLIST ITEMS (AT THE BOTT
 - [ ] `[Core]`: Core runtime logic (Runner, KV cache pools, scheduler, speculative decoding, compilation, distributed)
 - [ ] `[Kernel]`: Compute kernels & custom ops (JAX / Pallas kernels, custom op bridges)
 - [ ] `[Model]`: Adding or improving models (model name must be in PR title, e.g., `[Model][Qwen] ...`)
+- [ ] `[Model Support]`: Enables a new model or fixes compatibility needed to run a model; exclude tuning of already supported models
 - [ ] `[Frontend]`: OpenAI API server, CLI, entrypoints, proxy/disaggregated serving
 - [ ] `[CI/Build]`: Docker images, Buildkite pipelines, dependency pins, pre-commit configuration
 - [ ] `[Doc]`: Documentation improvements, guides, docstrings

@@ -165,10 +165,41 @@ Tests requiring physical TPU hardware run in Buildkite CI.
 ## 6. Pull Request & Review Lifecycle
 
 ### Submitting a Pull Request
-When opening a pull request, please select the appropriate category prefix from the PR template (`[Bugfix]`, `[Core]`, `[Kernel]`, `[Model]`, `[Frontend]`, `[CI/Build]`, `[Doc]`, `[Misc]`) and complete the description and test plan checklists.
+When opening a pull request, please select the appropriate category prefix from the PR template (`[Bugfix]`, `[Core]`, `[Kernel]`, `[Model]`, `[Model Support]`, `[Frontend]`, `[CI/Build]`, `[Doc]`, `[Misc]`) and complete the description and test plan checklists.
 
 ### Reviewer Routing
 GitHub automatically requests reviews from the owners in `.github/CODEOWNERS` of the files a PR changes, and a PR needs an approval from a code owner of each area it touches before it can merge.
+
+### Issue and PR Labels
+
+Three labels help with triage:
+
+* `bug`: incorrect behavior, crashes, failures, demonstrated regressions, and their fixes.
+* `documentation`: guides, reference material, recipes, and documentation maintenance.
+* `model-support`: requests, onboarding, and compatibility work needed to run a model or architecture. Tuning an already supported model does not qualify by itself.
+
+Issue templates apply labels when an issue is submitted. The issue-labeling
+workflow also recognizes `[Bug]` / `[Bugfix]`, `[Doc]` / `[Docs]` /
+`[Documentation]`, and `[Model Support]` / `[New Model]` title tags on opening,
+editing, or reopening an issue. It does not search issue bodies or logs.
+
+Mergify labels PRs from the same title tags or checked categories in the PR
+description (`[Bugfix]`, `[Doc]`, and `[Model Support]`). Documentation paths
+(`docs/`, README files, and `CONTRIBUTING.md`) also trigger `documentation`.
+Unchecked categories do not match. The broader `[Model]` category, model names,
+and model implementation paths do not automatically trigger `model-support`.
+Contributors can select a category without changing their title. Maintainers
+can label unstructured reports and ambiguous cases manually.
+
+Both automations only add labels; they never remove existing labels. If a
+category was selected incorrectly, correct the title or checkbox before
+removing its label so automation does not add it again.
+
+Before rollout, a maintainer must ensure `bug`, `documentation`, and
+`model-support` exist under the repository's Labels settings and enable
+Mergify Workflow Automation for this repository. Keep the historical
+`new model` label; the new-model issue template uses `model-support` for
+new submissions. Existing open items are not bulk-labeled by this change.
 
 ---
 
