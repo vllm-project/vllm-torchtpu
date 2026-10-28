@@ -27,7 +27,7 @@ from . import exec_spec, pool_alias
 from .comm.params import CommParams, comm_params, ring_scratch, stage_scratch
 from .errors import MegakernelConfigError
 from .exec_spec import ExecSpec
-from .ops import BF16, F32, FP8, rup
+from .ops import BF16, F32, FP8, col_chunk, rup
 from .planner import Plan, extra_inputs, plan
 from .profiles.default import chip_budget
 from .spec import ModelSpec, ScratchReq
@@ -209,7 +209,7 @@ def build_scratch(
 
     B, MB = ex.B, ex.MB
     H, L = g.H, g.L
-    PC = min(1024, H)
+    PC = col_chunk(H)
     assert H % PC == 0, (H, PC)
     HPC = H // PC
     PR = rup(B * HPC, 16)

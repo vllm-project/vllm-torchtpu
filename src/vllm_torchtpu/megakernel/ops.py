@@ -49,6 +49,13 @@ def rup(n: int, k: int) -> int:
     return (n + k - 1) // k * k
 
 
+def col_chunk(width: int, cap: int = 1024) -> int:
+    """Largest multiple of 128 dividing `width` that is `<= cap`."""
+    if width <= 0 or width % 128 != 0:
+        raise ValueError(f"width={width} must be a positive multiple of 128")
+    return max(c for c in range(128, min(cap, width) + 1, 128) if width % c == 0)
+
+
 def rnd(x: jax.Array) -> jax.Array:
     """Round float32 tensor through bfloat16 back to float32.
 

@@ -105,7 +105,7 @@ from .modules import (
     Norm,
     NormModule,
 )
-from .ops import rup
+from .ops import col_chunk, rup
 from .planner import encode_ecopy
 from .pool import (
     POOL_STATE_NAME,
@@ -260,6 +260,7 @@ __all__ = [
     "cache_experimental",
     "check_fused_pooled_step_hlo",
     "check_pooled_step_hlo",
+    "col_chunk",
     "comm",
     "conv_to_raw_page",
     "decls",

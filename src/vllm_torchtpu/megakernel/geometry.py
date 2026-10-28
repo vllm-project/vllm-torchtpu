@@ -24,7 +24,7 @@ from .decls import REQUIRED, FrozenDict, _resolve_field_spec
 from .errors import MegakernelConfigError
 from .exec_spec import MAX_BATCH_ROWS, ExecSpec
 from .modules.gdn import GDNModule
-from .ops import validate_gdn_gate
+from .ops import col_chunk, validate_gdn_gate
 from .pool.config import cache_exec, resolved_max_pages_per_seq
 from .spec import ModelSpec
 
@@ -257,7 +257,7 @@ class ModelGeometry:
 
     def check(self, ex: ExecSpec) -> None:
         R, B, T, M = ex.R, ex.B, ex.T, ex.M
-        pc = min(1024, self.H)
+        pc = col_chunk(self.H) if self.H > 0 and self.H % 128 == 0 else 1024
         min_slots = self.E if self.moe_tp else self.ER(R)
         for cond, msg in (
             (

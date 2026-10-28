@@ -20,7 +20,7 @@ from typing import Any, ClassVar
 
 from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec, NumericsClass
-from ...ops import rup
+from ...ops import col_chunk, rup
 
 
 @dataclass(frozen=True)
@@ -138,7 +138,9 @@ def derive_moe_params(
     ir = g.I // ex.R if moe_tp else g.I
     ew = e_slots if e_slots > 0 else (g.E if moe_tp else er)
     extra = ew - er
-    ch = min(1024, g.H)
+    if g.H <= 0 or g.H % 128 != 0:
+        raise MegakernelConfigError(f"Dimension H={g.H} must be a multiple of 128")
+    ch = col_chunk(g.H)
     assert g.H % ch == 0, (g.H, ch)
     t13, t2 = plan.nt["e13"], plan.nt["e2"]
     te = t13 + t2

@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -293,3 +295,62 @@ def test_gdn_sigmoid_kernel_matches_reference_all_paths() -> None:
         jnp.max(jnp.abs(ref_sig.astype(jnp.float32) - ref_silu.astype(jnp.float32)))
     )
     assert diff > 1e-4
+
+
+class _H1280Model(_SynthBaseModel):
+    """Synthetic hybrid model with `H=1280` (`1280 % 1024 != 0`, `CH = 640`)."""
+
+    name = "b8_h1280"
+    default_hf_config = {
+        **_SynthBaseModel.default_hf_config,
+        "d_model": 1280,
+    }
+
+    @classmethod
+    def shrink(
+        cls,
+        hf_config_or_geom=None,
+        *,
+        periods: int = 2,
+        R: int = 8,
+        ex: mk.ExecSpec | None = None,
+    ) -> mk.ModelGeometry:
+        shrunk = dataclasses.replace(
+            super().shrink(hf_config_or_geom, periods=periods, R=R, ex=ex),
+            H=1280,
+        )
+        object.__setattr__(shrunk, "_model_def", cls)
+        return shrunk
+
+
+def test_moe_col_chunk_h2560() -> None:
+    assert mk.col_chunk(4096) == 1024
+    assert mk.col_chunk(2048) == 1024
+    assert mk.col_chunk(2560) == 640
+    assert mk.col_chunk(1920) == 640
+    assert mk.col_chunk(1536) == 768
+    assert mk.col_chunk(1280) == 640
+    assert mk.col_chunk(640) == 640
+
+    # H=2560 passes ModelGeometry.check and derives CH=640 in MoEParams
+    cfg_2560 = {**_SynthBaseModel.default_hf_config, "d_model": 2560}
+    g_2560 = _SynthBaseModel.derive_geometry(cfg_2560)
+    ex_2560 = mk.ExecSpec(R=2, B=4, T=1, ctx=2048)
+    g_2560.check(ex_2560)
+    pl_2560 = mk.planner.plan(_SynthBaseModel.to_model_spec(g_2560, R=2), ex_2560)
+    mp_2560 = pl_2560.module_params["moe"]
+    assert mp_2560.CH == 640
+    assert g_2560.H % mp_2560.CH == 0
+
+    # End-to-end kernel vs reference parity with H=1280 > 1024 (min(1024, H)=1024
+    # does not divide 1280; col_chunk(1280)=640 divides 1280 into 2 chunks)
+    report = mk.verify_model(
+        _H1280Model,
+        R=2,
+        B_per_T=2,
+        T_values=(1,),
+        hf=False,
+        approx_profiles=False,
+    )
+    assert report.geometry.H == 1280
+    report.assert_passed()
