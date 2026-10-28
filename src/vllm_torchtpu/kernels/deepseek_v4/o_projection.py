@@ -467,10 +467,6 @@ def _pipelined_kernel(
         if r == 0:
             w_copy(g).wait()
 
-            @pl.when(g + 1 < num_groups)
-            def _():
-                w_copy(g + 1).start()
-
         def fetch_next():
             x_copy(*locate(l + 1)).wait()
 
@@ -482,6 +478,12 @@ def _pipelined_kernel(
             pl.when(step + 1 < num_steps)(fetch_next)
         else:
             fetch_next()
+
+        if r == 0:
+            # After x: the next segment's top waits on that x block, not on w.
+            @pl.when(g + 1 < num_groups)
+            def _():
+                w_copy(g + 1).start()
 
         if l >= 2:
             out_copy(*locate(l - 2)).wait()
