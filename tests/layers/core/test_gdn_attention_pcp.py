@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from kernels.gdn.v3.gdn_pool_state_utils import (
@@ -437,27 +437,42 @@ def test_derive_pcp_ragged_exchange_descriptors_reconstructs_reorder(
     assert int(sizes.sum()) == int(lengths.sum())
 
 
-def test_pcp_ragged_exchange_layout_accepts_tpu_generation_7(monkeypatch):
+@pytest.mark.parametrize(
+    "chip",
+    (
+        pltpu.ChipVersion.TPU_7,
+        pltpu.ChipVersion.TPU_7X,
+        pltpu.ChipVersion.TPU_8I,
+    ),
+)
+def test_pcp_ragged_exchange_layout_accepts_validated_tpu_chip(monkeypatch, chip):
     monkeypatch.setattr(
         "vllm_torchtpu.layers.core.gdn_attention.pltpu.get_tpu_info",
-        lambda: SimpleNamespace(generation=7),
+        lambda: pltpu.get_tpu_info_for_chip(chip, 1),
     )
 
     _validate_pcp_ragged_exchange_layout_support()
 
 
-@pytest.mark.parametrize("generation", (4, 5, 6, 8))
-def test_pcp_ragged_exchange_layout_rejects_unvalidated_tpu_generation(
-    monkeypatch, generation
-):
+@pytest.mark.parametrize(
+    "chip",
+    (
+        pltpu.ChipVersion.TPU_V5E,
+        pltpu.ChipVersion.TPU_V5P,
+        pltpu.ChipVersion.TPU_V6E,
+        # Same generation as TPU 8i, but 16 sublanes per (8, 128) tile.
+        pltpu.ChipVersion.TPU_8T,
+    ),
+)
+def test_pcp_ragged_exchange_layout_rejects_unvalidated_tpu_chip(monkeypatch, chip):
     monkeypatch.setattr(
         "vllm_torchtpu.layers.core.gdn_attention.pltpu.get_tpu_info",
-        lambda: SimpleNamespace(generation=generation),
+        lambda: pltpu.get_tpu_info_for_chip(chip, 1),
     )
 
     with pytest.raises(
         NotImplementedError,
-        match="only validated on TPU generation 7",
+        match="only validated on TPU 7, 7x, and 8i",
     ):
         _validate_pcp_ragged_exchange_layout_support()
 

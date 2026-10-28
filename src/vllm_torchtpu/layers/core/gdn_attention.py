@@ -440,14 +440,26 @@ def _derive_pcp_ragged_exchange_descriptors(
     return jax.vmap(_summarize_rank)(rank_major, valid, run_starts, run_ids)
 
 
+# Chips with compile and numerical coverage for the explicit ragged-exchange
+# layout below, which pins an (8, 128) sublane x lane tiling. Gate on the chip
+# rather than the generation: TPU 8t is also generation 8 but has 16 sublanes.
+_VALIDATED_PCP_RAGGED_EXCHANGE_CHIPS = frozenset(
+    {
+        pltpu.ChipVersion.TPU_7,
+        pltpu.ChipVersion.TPU_7X,
+        pltpu.ChipVersion.TPU_8I,
+    }
+)
+
+
 def _validate_pcp_ragged_exchange_layout_support() -> None:
-    generation = pltpu.get_tpu_info().generation
-    # TODO: Validate this explicit tiled layout on TPU v4/v5e/v6 and relax
-    # this guard once compile and numerical coverage exists for those targets.
-    if generation != 7:
+    chip_version = pltpu.get_tpu_info().chip_version
+    # TODO: Validate this explicit tiled layout on other TPU chips and extend
+    # the allowlist once compile and numerical coverage exists for them.
+    if chip_version not in _VALIDATED_PCP_RAGGED_EXCHANGE_CHIPS:
         raise NotImplementedError(
-            "GDN PCP ragged exchange layout is only validated on TPU "
-            f"generation 7, got generation {generation}."
+            "GDN PCP ragged exchange layout is only validated on TPU 7, 7x, "
+            f"and 8i, got TPU {chip_version}."
         )
 
 
