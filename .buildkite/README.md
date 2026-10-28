@@ -22,6 +22,12 @@ steps not gated on it. The schedules keep clear of the hours the nightly's
 perf steps take. The integration pipeline also runs the lane, because its LKG
 promotion waits on two of its steps.
 
+A PR labeled `skip-tpu-ci` (it still needs `ready`) runs only the `tests` lane
+and the image build, and the lane's `Unit Tests on TPU` group is skipped through
+`SKIP_TPU_CI`, so what runs is the type check and the CPU unit tests. The
+post-merge build of such a PR does the same: `bootstrap.sh` reads the merged
+PR's labels from GitHub. Keep TPU steps of the `tests` lane inside that group.
+
 Releases and nightly images are published by the `vllm-torchtpu-release`
 pipeline in the TPU Release cluster; [`release/README.md`](release/README.md)
 has how to cut a release. Its nightly step runs

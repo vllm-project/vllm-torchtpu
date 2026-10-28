@@ -273,8 +273,9 @@ class Admission:
     # success may cover torn bytes. The finalizer treats the admission as
     # failed regardless of the poll verdict.
     poisoned: bool = False
-    # Loads only: owning request and destination device block IDs, reported
-    # through get_block_ids_with_load_errors on failure.
+    # Loads only: owning request and destination device block IDs. A failed
+    # load reaches vLLM by req_id (failed_recving); the block IDs only fill
+    # FinishedJob.failed_device_block_ids, the record of what it left unwritten.
     req_id: str | None = None
     dst_device_block_ids: list[int] = field(default_factory=list)
     # Loads only: the sub-hashes fetched via read_remote — from a peer or the
@@ -1395,6 +1396,7 @@ def derive_offload_namespace(
     num_kv_cache_tensors: int,
     cp_geometry: tuple[int, ...] = (),
     block_major_contract: BlockMajorContract | None = None,
+    offloaded_group_ids: tuple[int, ...] | None = None,
 ) -> bytes:
     """Derive a deterministic compatibility namespace prefixed to every store and
     registry key.
@@ -1403,7 +1405,8 @@ def derive_offload_namespace(
     hashing all configuration parameters that alter binary KV cache layout:
     - Model identity: model name, revision, quantization.
     - KV cache geometry: KV data type, kernel block size, per-block tensor shape,
-      device block size, and cache group/tensor counts.
+      device block size, cache group/tensor counts, and which groups are
+      offloaded when that is not all of them.
     - Distributed topology: world size (TP/PP) and context parallelism geometry
       (pcp_size, dcp_size, interleave_size) which alters rank-local token placement.
     - Hash scheme: prefix caching algorithm and namespace version salt.
@@ -1452,6 +1455,13 @@ def derive_offload_namespace(
             block_major_contract.bundle_row_bytes,
             block_major_contract.logical_fingerprint,
         )
+    if offloaded_group_ids is not None and offloaded_group_ids != tuple(
+        range(num_kv_cache_groups)
+    ):
+        # vLLM offloads only the prefix-cacheable groups; an engine that skips
+        # a group never stores its keys, so a peer expecting them would miss
+        # on every block.
+        material_fields += ("tpu-raiden-offload-ns3-groups", offloaded_group_ids)
     material = repr(material_fields)
     return hashlib.sha256(material.encode()).digest()[:16]
 
@@ -2385,7 +2395,10 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         # Verify CP scaling invariant: scheduler chunks at the logical all-CP-rank
         # block span, whereas KV cache specs are rank-local. Ensure tokens_per_block
         # scales by pcp_size * dcp_size so OffloadKey spans match scheduler blocks.
-        for group_config, group in zip(config.groups, kv_cache_config.kv_cache_groups):
+        # config.groups holds only the offloaded groups (vLLM leaves out groups
+        # that are not prefix-cacheable), so pair them by group id.
+        for group_config in config.groups:
+            group = kv_cache_config.kv_cache_groups[group_config.group_id]
             if isinstance(group.kv_cache_spec, AttentionSpec):
                 expected_cp_scale = parallel.pcp_size * parallel.dcp_size
                 assert group_config.tokens_per_block == (
@@ -2464,6 +2477,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             num_kv_cache_tensors=len(kv_cache_config.kv_cache_tensors),
             cp_geometry=cp_geometry,
             block_major_contract=self.block_major_contract,
+            offloaded_group_ids=tuple(group.group_id for group in config.groups),
         )
 
         # Shared-memory host pools (RAIDEN_SHM_KEY) are currently unsupported.

@@ -20,6 +20,9 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorTransferResults,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
 from vllm.sequence import IntermediateTensors
 
@@ -183,8 +186,8 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         def wait_for_save(self, nan_check=None):
             self.snapshot = nan_check
 
-        def get_finished(self, _finished_req_ids):
-            return {"r0"}, None
+        def get_transfer_results(self, _finished_req_ids):
+            return KVConnectorTransferResults(finished_sending={"r0"})
 
         def get_block_ids_with_load_errors(self):
             return set()
