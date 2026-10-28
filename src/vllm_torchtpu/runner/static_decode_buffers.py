@@ -32,6 +32,224 @@ from typing import Any
 import numpy as np
 import torch
 
+from vllm_torchtpu.runner.tpu_runner_async_output import (
+    INVALID_TOKEN_ID,
+    assemble_spec_next_tokens,
+    compute_async_draft_seeds_and_indices,
+    compute_num_rejected,
+    draft_seed_input_ids,
+    static_shape_args,
+    update_mamba_slot_read_offsets,
+)
+
+
+def fold_verify_and_draft_prep(
+    next_tokens: torch.Tensor,
+    chunk_input_ids: torch.Tensor,
+    draft_lengths: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    pad_req_idx: torch.Tensor,
+    positions: torch.Tensor,
+    base_seq_lens: torch.Tensor,
+    advance_draft_positions: bool,
+    max_num_reqs: int,
+    read_offsets: torch.Tensor | None = None,
+    stacked_groups: torch.Tensor | None = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Folded post-rejection bookkeeping + first-pass draft input preparation."""
+    batch_size = next_tokens.shape[0]
+    knr = query_start_loc.shape[0] - 1
+    eff_b = min(batch_size, knr)
+
+    next_token_ids_b, last_token_indices_b, num_rejected_b = (
+        compute_async_draft_seeds_and_indices(
+            next_tokens[:eff_b],
+            draft_lengths[:eff_b],
+            query_start_loc[: eff_b + 1],
+        )
+    )
+
+    gather_indices = torch.index_select(last_token_indices_b, 0, pad_req_idx)
+    seed_token_ids = torch.index_select(next_token_ids_b, 0, pad_req_idx)
+
+    draft_input_ids = draft_seed_input_ids(
+        chunk_input_ids, gather_indices, seed_token_ids
+    )
+
+    num_rejected_knr = (
+        torch.nn.functional.pad(num_rejected_b, (0, knr - eff_b))
+        if eff_b < knr
+        else num_rejected_b
+    )
+    pos_carry = (
+        torch.index_select(positions, 1, gather_indices)
+        if positions.ndim == 2
+        else torch.index_select(positions, 0, gather_indices)
+    )
+    pos_step1 = pos_carry + 1 if advance_draft_positions else pos_carry
+    seq_len_delta = 1 if advance_draft_positions else 0
+    seq_lens_step1 = base_seq_lens + seq_len_delta - num_rejected_knr
+
+    num_valid_full = (next_tokens != INVALID_TOKEN_ID).sum(dim=1)
+    last_valid_col_full = num_valid_full.clamp(min=1) - 1
+    bonus_full = next_tokens.gather(1, last_valid_col_full.unsqueeze(1))
+    spec_num_rejected = compute_num_rejected(next_tokens, draft_lengths)
+    if max_num_reqs > spec_num_rejected.shape[0]:
+        spec_num_rejected = torch.nn.functional.pad(
+            spec_num_rejected, (0, max_num_reqs - spec_num_rejected.shape[0])
+        )
+
+    if read_offsets is not None and stacked_groups is not None:
+        # Mask padded rows >= num_reqs using query_start_loc (constant after
+        # num_reqs) so static-shape compilation guarantees offset 0 on padding.
+        active_req_mask = query_start_loc[1 : eff_b + 1] > query_start_loc[:eff_b]
+        masked_next_tokens = torch.where(
+            active_req_mask.unsqueeze(1),
+            next_tokens[:eff_b],
+            INVALID_TOKEN_ID,
+        )
+        update_mamba_slot_read_offsets(
+            read_offsets=read_offsets,
+            groups=stacked_groups,
+            next_tokens=masked_next_tokens,
+            num_reqs=eff_b,
+        )
+
+    return (
+        draft_input_ids,
+        gather_indices,
+        num_rejected_knr,
+        pos_step1,
+        seq_lens_step1,
+        bonus_full,
+        spec_num_rejected,
+    )
+
+
+def fold_draft_loop_spec_bookkeeping(
+    drafts: torch.Tensor,
+    pos_step1: torch.Tensor,
+    seq_lens_end: torch.Tensor,
+    bonus_tokens: torch.Tensor,
+    assemble_bound: int,
+    num_loop_steps: int,
+    pos_req_expand_idx: torch.Tensor | None = None,
+    pos_step1_offsets: torch.Tensor | None = None,
+    valid_token_mask: torch.Tensor | None = None,
+    valid_req_mask: torch.Tensor | None = None,
+    valid_draft_mask: torch.Tensor | None = None,
+    seq_lens_is_step1: bool = False,
+) -> tuple[torch.Tensor, ...]:
+    """Fold substitution source assembly (`src_padded`) and optional next-step
+    steady-state `(next_seq_lens, next_positions, next_input_ids,
+    next_draft_token_ids)` preparation into the end of the draft loop.
+    """
+    batch_rows = bonus_tokens.shape[0]
+    drafts_b = (
+        torch.nn.functional.pad(drafts, (0, 0, 0, batch_rows - drafts.shape[0]))
+        if drafts.shape[0] < batch_rows
+        else drafts[:batch_rows]
+    )
+    src_flat = assemble_spec_next_tokens(bonus_tokens, drafts_b)
+    src_padded = (
+        torch.nn.functional.pad(src_flat, (0, assemble_bound - src_flat.shape[0]))
+        if src_flat.shape[0] < assemble_bound
+        else src_flat
+    )
+    if (
+        pos_req_expand_idx is None
+        or pos_step1_offsets is None
+        or valid_token_mask is None
+        or valid_req_mask is None
+        or valid_draft_mask is None
+    ):
+        return (drafts, src_padded)
+
+    # max(0, num_loop_steps - 1) mirrors the in-place seq_lens.add_(1) count
+    # performed in _MtpFusedLoop._run_loop across draft steps 1..K-1.
+    remaining_seq_delta = (
+        num_loop_steps + 1
+        if seq_lens_is_step1
+        else (num_loop_steps + 1) - max(0, num_loop_steps - 1)
+    )
+    next_seq_lens = (seq_lens_end + remaining_seq_delta) * valid_req_mask
+
+    pos_expanded = (
+        torch.index_select(pos_step1, -1, pos_req_expand_idx) + pos_step1_offsets
+    )
+    next_positions = pos_expanded * valid_token_mask
+
+    padded_total_tokens = valid_token_mask.shape[0]
+    if src_flat.shape[0] < padded_total_tokens:
+        next_input_ids_raw = torch.nn.functional.pad(
+            src_flat, (0, padded_total_tokens - src_flat.shape[0])
+        )
+    else:
+        next_input_ids_raw = src_flat[:padded_total_tokens]
+    next_input_ids = next_input_ids_raw.to(torch.int32) * valid_token_mask
+
+    if valid_draft_mask.ndim == 1:
+        drafts_flat = drafts_b.to(torch.int32).reshape(-1)
+        target_draft_len = valid_draft_mask.shape[0]
+        if drafts_flat.shape[0] < target_draft_len:
+            drafts_flat = torch.nn.functional.pad(
+                drafts_flat, (0, target_draft_len - drafts_flat.shape[0])
+            )
+        else:
+            drafts_flat = drafts_flat[:target_draft_len]
+        next_draft_token_ids = drafts_flat * valid_draft_mask
+    else:
+        next_draft_token_ids = (drafts_b.to(torch.int32) * valid_draft_mask).reshape(-1)
+
+    return (
+        drafts,
+        src_padded,
+        next_seq_lens,
+        next_positions,
+        next_input_ids,
+        next_draft_token_ids,
+    )
+
+
+@static_shape_args
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _compiled_fold_draft_loop_spec_bookkeeping(
+    drafts: torch.Tensor,
+    pos_step1: torch.Tensor,
+    seq_lens_end: torch.Tensor,
+    bonus_tokens: torch.Tensor,
+    assemble_bound: int,
+    num_loop_steps: int,
+    pos_req_expand_idx: torch.Tensor | None = None,
+    pos_step1_offsets: torch.Tensor | None = None,
+    valid_token_mask: torch.Tensor | None = None,
+    valid_req_mask: torch.Tensor | None = None,
+    valid_draft_mask: torch.Tensor | None = None,
+    seq_lens_is_step1: bool = False,
+) -> tuple[torch.Tensor, ...]:
+    return fold_draft_loop_spec_bookkeeping(
+        drafts=drafts,
+        pos_step1=pos_step1,
+        seq_lens_end=seq_lens_end,
+        bonus_tokens=bonus_tokens,
+        assemble_bound=assemble_bound,
+        num_loop_steps=num_loop_steps,
+        pos_req_expand_idx=pos_req_expand_idx,
+        pos_step1_offsets=pos_step1_offsets,
+        valid_token_mask=valid_token_mask,
+        valid_req_mask=valid_req_mask,
+        valid_draft_mask=valid_draft_mask,
+        seq_lens_is_step1=seq_lens_is_step1,
+    )
+
 
 class StaticDecodeBufferTracker:
     """Persistent host/device buffer and metadata tracker for
