@@ -110,7 +110,11 @@ def qsa_step_inputs(
         ring, _ = read_ring_and_tags(pool, ids, RING_ROWS * IDX_DIM, RING_ROWS * 2)
         ring = ring.reshape(nreq, RING_ROWS, IDX_DIM)
         rings.append(jnp.where((ctx > 0)[:, None, None], ring, 0).astype(jnp.bfloat16))
-    trig32 = trig.astype(jnp.float32)
+    # Gather the rows, then widen: converting the whole [max_model_len, 128] table every step cost
+    # 64 us (xprof j-1e002dca, convert f32[262144,128]); same values.
+    def trig32(rows):
+        return trig[rows].astype(jnp.float32)
+
     pos = _fit(positions.astype(jnp.int32), M)
     # First position of the group a verify window of T = 4 completes (stock: the group's
     # first member's position, from the step or from the ring tags).
@@ -124,8 +128,8 @@ def qsa_step_inputs(
         "qsa_mtab": jnp.stack(mtab) if layer_major_tables else jnp.concatenate(mtab),
         "qsa_off": jnp.asarray([max(m, 0) for m, _ in slots], jnp.int32),
         "qsa_scales": jnp.asarray([k_scale, v_scale], jnp.float32),
-        "qsa_rope": trig32[pos],
+        "qsa_rope": trig32(pos),
         "qsa_ctx": ctx,
         "qsa_ring": jnp.concatenate(rings),
-        "qsa_rope_ck": trig32[jnp.maximum(j0, 0)][:, None, :],
+        "qsa_rope_ck": trig32(jnp.maximum(j0, 0))[:, None, :],
     }
