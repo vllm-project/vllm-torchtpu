@@ -311,11 +311,10 @@ class TPUQwen4ExpConfig(VerifyAndUpdateConfig):
             compilation = vllm_config.compilation_config
             if compilation.splitting_ops is None:
                 compilation.splitting_ops = []
-            for op in (
-                "qwen4_exp::host_lookup",
-                "qwen4_exp::host_lookup_start",
-                "qwen4_exp::host_lookup_finish",
-            ):
+            ops = ["qwen4_exp::host_lookup"]
+            if envs.VLLM_TPU_PLE_HOST_OVERLAP:
+                ops += ["qwen4_exp::host_lookup_start", "qwen4_exp::host_lookup_finish"]
+            for op in ops:
                 if op not in compilation.splitting_ops:
                     compilation.splitting_ops.append(op)
         if qwen.get("engram_config", {}).get("dp_shared_memory", False):

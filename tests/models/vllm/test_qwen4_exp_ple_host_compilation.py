@@ -183,3 +183,13 @@ def test_model_declares_host_boundary_only_for_offload(monkeypatch, offload):
     assert cfg.compilation_config.splitting_ops == (
         ["qwen4_exp::host_lookup"] if offload else None
     )
+
+
+def test_overlap_adds_its_split_points_only_when_enabled(monkeypatch):
+    monkeypatch.setenv("VLLM_TPU_PLE_HOST_OVERLAP", "1")
+    cfg, _ = launch_config(monkeypatch, "compile-boundary-overlap", offload=True)
+    assert cfg.compilation_config.splitting_ops == [
+        "qwen4_exp::host_lookup",
+        "qwen4_exp::host_lookup_start",
+        "qwen4_exp::host_lookup_finish",
+    ]
