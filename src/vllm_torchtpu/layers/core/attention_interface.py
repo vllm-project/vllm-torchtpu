@@ -1036,7 +1036,17 @@ def sparse_mla_attention(
             )
             return output, kv_cache_nope, kv_cache_rope
 
-        q = jnp.concatenate([ql_nope, q_pe], axis=-1)
+        use_tq_split_q = (
+            tq_tables is not None
+            and envs.TPU_MLA_SPARSE_SPLIT_Q
+            and ql_nope.shape[-1] % 128 == 0
+            and ql_nope.shape[1] % sparse_mla_kernel.get_dtype_packing(ql_nope.dtype)
+            == 0
+        )
+        if use_tq_split_q:
+            q, split_kwargs = ql_nope, {"q_pe": q_pe}
+        else:
+            q, split_kwargs = jnp.concatenate([ql_nope, q_pe], axis=-1), {}
         output = sparse_mla_ragged_paged_attention(
             q,
             kv_cache_nope,
@@ -1049,15 +1059,17 @@ def sparse_mla_attention(
             k_scale=dequant_scale,
             cache_layout=cache_layout,
             **chunk_kwargs,
+            **split_kwargs,
             **packed_rope_kwargs,
             **tq_kwargs,
         )
 
         lkv_dim = ql_nope.shape[-1]
-        # The kernel's output is lkv_dim + rope_dim wide because it attends
-        # over concatenated (nope + rope) keys. Only the nope part is the MLA
-        # value (P @ latent); drop the rope tail before the W_UV projection.
-        output = output[..., :lkv_dim]
+        if not use_tq_split_q:
+            # The kernel's output is lkv_dim + rope_dim wide because it attends
+            # over concatenated (nope + rope) keys. Only the nope part is the MLA
+            # value (P @ latent); drop the rope tail before the W_UV projection.
+            output = output[..., :lkv_dim]
         if tq_tables is not None and not tq_prerotated:
             # Values were aggregated in the rotated basis: (P c H) H = P c.
             output = _tq_rotate(output, tq_tables)

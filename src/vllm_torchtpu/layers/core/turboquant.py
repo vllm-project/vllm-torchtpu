@@ -834,16 +834,32 @@ MLA_TQ_NOPE_BYTES = MLA_TQ_LATENT_DIM * MLA_TQ_BITS // 8  # 256 B/token.
 MLA_TQ_NORM_BYTE_OFFSET = 64  # After the 64 fp8 `k_pe` bytes in the RoPE row.
 
 
-# Default codebook: odd cubic in the offset-binary code `n` (0..15),
-# `c(n) = t + gamma * t**3` with `t = n - 7.5`. Only its shape matters (the
-# norm correction absorbs scale), and it fits the D=512 Lloyd-Max levels to
-# within 2% MSE while dequantizing in ~6 VPU ops instead of a select tree.
+# Default MLA codebook: exact IEEE `float8_e4m3fn` levels for SWAR byte ramp
+# `(sign << 7) | (3 * m + 2)` (`m = 0..7`), i.e. `±[2, 5, 8, 11, 14, 18, 24, 30] / 512`.
+# Unpacks 8 4-bit codes per `uint32` lane in 6 integer ALU ops directly into
+# `float8_e4m3fn` MXU operands, while matching unit-sphere D=512 Lloyd-Max cosine
+# similarity (`0.9950` vs `0.9952`). `MLA_TQ_FP8_SCALE` scales only the quantizer's
+# decision thresholds; dequant and norm correction use the exact unscaled levels.
+_MLA_FP8_POS_LEVELS = np.array(
+    [2, 5, 8, 11, 14, 18, 24, 30], dtype=np.float32
+) / np.float32(512.0)
+MLA_TQ_FP8_SCALE = 2.009064
+
+# Alternate odd-cubic codebook in offset-binary code `n` (`0..15`),
+# `c(n) = t + gamma * t**3` with `t = n - 7.5`.
 MLA_TQ_CUBIC_GAMMA = 0.0086873
-# Level spacing for coordinates of a rotated unit 512-vector (~N(0, 1/512)):
-# the MSE-optimal `alpha = 0.2413` for N(0, 1), divided by sqrt(512). Used only
-# for the quantizer's decision thresholds; dequant and the norm correction use
-# the unscaled levels.
 MLA_TQ_CUBIC_SCALE = 0.24130783 / math.sqrt(MLA_TQ_LATENT_DIM)
+
+
+def _mla_fp8_levels() -> np.ndarray:
+    return np.concatenate([-_MLA_FP8_POS_LEVELS[::-1], _MLA_FP8_POS_LEVELS])
+
+
+def is_mla_fp8_codebook(centroids: Any) -> bool:
+    c = np.asarray(centroids, dtype=np.float32)
+    return c.shape == (1 << MLA_TQ_BITS,) and np.allclose(
+        c, _mla_fp8_levels() * np.float32(MLA_TQ_FP8_SCALE)
+    )
 
 
 def _mla_cubic_levels() -> np.ndarray:
@@ -861,11 +877,12 @@ def is_mla_cubic_codebook(centroids: Any) -> bool:
 def make_mla_latent_tables(centroids: np.ndarray | None = None) -> TQTables:
     """Tables for the 512-dim MLA latent.
 
-    `centroids=None` selects the cubic codebook (offset-binary codes);
-    otherwise `centroids` are D=512 Lloyd-Max levels (sign-magnitude codes).
+    `centroids=None` selects the SWAR `float8_e4m3fn` codebook (sign-magnitude
+    codes); otherwise `centroids` may be cubic (offset-binary) or D=512
+    Lloyd-Max levels (sign-magnitude).
     """
     if centroids is None:
-        centroids = _mla_cubic_levels() * np.float32(MLA_TQ_CUBIC_SCALE)
+        centroids = _mla_fp8_levels() * np.float32(MLA_TQ_FP8_SCALE)
     sorted_c = np.sort(np.asarray(centroids, dtype=np.float32))
     assert sorted_c.shape == (1 << MLA_TQ_BITS,), sorted_c.shape
     return TQTables(
@@ -882,8 +899,8 @@ def quantize_mla_latent(
     """`latent` -> (`u8[T, 256]` packed 4-bit codes, `u8[T, 2]` bf16 norm bytes).
 
     Byte `i` holds code `i` in its low nibble and code `256 + i` in its high
-    nibble: offset-binary level indices for the cubic codebook, sign-magnitude
-    (bit 3 sign, bits 0-2 magnitude index) for Lloyd-Max.
+    nibble: sign-magnitude (bit 3 sign, bits 0-2 magnitude index) for the
+    default `fp8` and Lloyd-Max codebooks, or offset-binary for cubic.
     """
     x = latent.astype(jnp.float32)
     norm = jnp.sqrt(jnp.sum(x * x, axis=-1, keepdims=True))
@@ -895,12 +912,32 @@ def quantize_mla_latent(
         c_sq = jnp.sum(c * c, axis=-1, keepdims=True)
     else:
         half_levels = 1 << (MLA_TQ_BITS - 1)
-        pos_mids = jnp.asarray(tables.midpoints[half_levels:], dtype=jnp.float32)
-        mag_idx = jnp.sum(jnp.abs(rot)[..., None] >= pos_mids, axis=-1).astype(
-            jnp.uint8
+        m0, m1, m2, m3, m4, m5, m6 = (float(m) for m in tables.midpoints[half_levels:])
+        a = jnp.abs(rot)
+        b2 = a >= m3
+        b1 = a >= jnp.where(b2, m5, m1)
+        b0 = a >= jnp.where(
+            b2,
+            jnp.where(b1, m6, m4),
+            jnp.where(b1, m2, m0),
         )
-        pos_c_sq = jnp.asarray(tables.centroids[half_levels:] ** 2, dtype=jnp.float32)
-        c_sq = jnp.sum(pos_c_sq[mag_idx], axis=-1, keepdims=True)
+        mag_idx = (
+            (b2.astype(jnp.uint8) << jnp.uint8(2))
+            | (b1.astype(jnp.uint8) << jnp.uint8(1))
+            | b0.astype(jnp.uint8)
+        )
+        pos_levels = (
+            _MLA_FP8_POS_LEVELS
+            if is_mla_fp8_codebook(tables.centroids)
+            else tables.centroids[half_levels:]
+        )
+        s0, s1, s2, s3, s4, s5, s6, s7 = (float(v * v) for v in pos_levels)
+        c_sq_elem = jnp.where(
+            b2,
+            jnp.where(b1, jnp.where(b0, s7, s6), jnp.where(b0, s5, s4)),
+            jnp.where(b1, jnp.where(b0, s3, s2), jnp.where(b0, s1, s0)),
+        )
+        c_sq = jnp.sum(c_sq_elem, axis=-1, keepdims=True)
         codes = mag_idx | jnp.where(rot < 0.0, jnp.uint8(half_levels), jnp.uint8(0))
     norm = norm * jax.lax.rsqrt(c_sq + _CENTROID_NORM_EPS)
     half = MLA_TQ_LATENT_DIM // 2
@@ -911,6 +948,14 @@ def quantize_mla_latent(
 
 # Arithmetic dtype of the in-kernel cubic dequant (read at trace time).
 MLA_TQ_DEQUANT_DTYPE = jnp.bfloat16
+
+
+def _fp8_levels_vreg(code: jax.Array, dtype: Any = jnp.float32) -> jax.Array:
+    c = code.astype(jnp.uint32)
+    sign = (c & jnp.uint32(0x8)) << jnp.uint32(4)
+    mag = c & jnp.uint32(0x7)
+    fp8_u8 = (sign | (mag * jnp.uint32(3) + jnp.uint32(2))).astype(jnp.uint8)
+    return jax.lax.bitcast_convert_type(fp8_u8, jnp.float8_e4m3fn).astype(dtype)
 
 
 def _cubic_levels_vreg(code: jax.Array, dtype: Any = jnp.float32) -> jax.Array:
@@ -927,7 +972,17 @@ def dequant_mla_latent_vreg(
     out_dtype: jnp.dtype,
 ) -> jax.Array:
     """In-kernel inverse of `quantize_mla_latent`, in the rotated basis: `[N, 512]`."""
-    if is_mla_cubic_codebook(centroids):
+    if is_mla_fp8_codebook(centroids):
+        lo = packed & jnp.uint8(0xF)
+        hi = packed >> jnp.uint8(4)
+        vals = jnp.concatenate(
+            [
+                _fp8_levels_vreg(lo, MLA_TQ_DEQUANT_DTYPE),
+                _fp8_levels_vreg(hi, MLA_TQ_DEQUANT_DTYPE),
+            ],
+            axis=-1,
+        )
+    elif is_mla_cubic_codebook(centroids):
         lo = packed & jnp.uint8(0xF)
         hi = packed >> jnp.uint8(4)
         vals = jnp.concatenate(

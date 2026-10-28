@@ -204,3 +204,44 @@ def test_tq_ragged_paged_attention_and_skip_update(preset, head_dim):
     # Unallocated pages in the pool must remain all-zero.
     untouched = [p for p in range(num_pages) if p not in {2, 5, 1, 4}]
     assert not np.any(np.asarray(tq_cache)[untouched])
+
+
+@pytest.mark.parametrize("codebook", ["fp8", "cubic", "lloyd"])
+def test_mla_latent_roundtrip(codebook: str) -> None:
+    rng = np.random.default_rng(42)
+    if codebook == "fp8":
+        tables = tq.make_mla_latent_tables(None)
+        assert tq.is_mla_fp8_codebook(tables.centroids)
+        assert not tq.is_mla_cubic_codebook(tables.centroids)
+    elif codebook == "cubic":
+        tables = tq.make_mla_latent_tables(
+            tq._mla_cubic_levels() * np.float32(tq.MLA_TQ_CUBIC_SCALE)
+        )
+        assert tq.is_mla_cubic_codebook(tables.centroids)
+        assert not tq.is_mla_fp8_codebook(tables.centroids)
+    else:
+        x = rng.standard_normal(200_000) / np.sqrt(tq.MLA_TQ_LATENT_DIM)
+        c = np.quantile(x, (np.arange(16) + 0.5) / 16)
+        for _ in range(30):
+            idx = np.searchsorted((c[:-1] + c[1:]) / 2, x)
+            c = np.array([x[idx == i].mean() for i in range(16)])
+        tables = tq.make_mla_latent_tables(c.astype(np.float32))
+        assert not tq.is_mla_fp8_codebook(tables.centroids)
+        assert not tq.is_mla_cubic_codebook(tables.centroids)
+
+    outliers = 1.0 + 3.0 * (rng.random(tq.MLA_TQ_LATENT_DIM) < 0.02)
+    latent = jnp.asarray(
+        rng.standard_normal((64, tq.MLA_TQ_LATENT_DIM)) * outliers, jnp.bfloat16
+    )
+    packed, norm_bytes = tq.quantize_mla_latent(latent, tables)
+    assert packed.shape == (64, tq.MLA_TQ_NOPE_BYTES)
+    assert norm_bytes.shape == (64, 2)
+    recon = tq.dequant_mla_latent_ref(packed, norm_bytes, tables)
+    a = np.asarray(latent, np.float32)
+    b = np.asarray(recon, np.float32)
+    cos = np.sum(a * b, axis=-1) / (
+        np.linalg.norm(a, axis=-1) * np.linalg.norm(b, axis=-1)
+    )
+    assert float(cos.mean()) > 0.993, (codebook, float(cos.mean()))
+    rel_norm_err = np.abs(np.linalg.norm(b, axis=-1) / np.linalg.norm(a, axis=-1) - 1.0)
+    assert float(rel_norm_err.max()) < 0.01, (codebook, float(rel_norm_err.max()))

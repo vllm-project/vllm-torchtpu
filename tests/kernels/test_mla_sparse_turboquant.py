@@ -59,12 +59,18 @@ def _build(
     num_heads=8,
     cache_tokens=8192,
     k_scale=1.0,
-    codebook="cubic",
+    codebook="default",
 ):
     pages = cache_tokens // PAGE_SIZE
-    tables = tq.make_mla_latent_tables(
-        None if codebook == "cubic" else _lloyd_max(rng, NOPE_DIM)
-    )
+    if codebook == "default":
+        centroids = None
+    elif codebook == "cubic":
+        centroids = tq._mla_cubic_levels() * np.float32(tq.MLA_TQ_CUBIC_SCALE)
+    elif codebook == "lloyd":
+        centroids = _lloyd_max(rng, NOPE_DIM)
+    else:
+        raise ValueError(f"Unknown codebook: {codebook}")
+    tables = tq.make_mla_latent_tables(centroids)
     outliers = 1 + 3 * (rng.random(NOPE_DIM) < 0.02)
     latent = jnp.asarray(
         rng.standard_normal((cache_tokens, NOPE_DIM)) * outliers, jnp.bfloat16
@@ -141,10 +147,14 @@ def _reference(p, latent_rows, sm_scale, k_scale, kv_len=None):
     return jnp.einsum("thk,tkd->thd", jax.nn.softmax(s, -1), k)[..., :NOPE_DIM]
 
 
-def _run_tq(p, sm_scale, k_scale, topk=None, **kwargs):
+def _run_tq(p, sm_scale, k_scale, topk=None, split_q=False, **kwargs):
     hadamard = jnp.asarray(p["tables"].hadamard)
     q_nope = tq.rotate(p["q"][..., :NOPE_DIM], hadamard).astype(jnp.bfloat16)
-    q = jnp.concatenate([q_nope, p["q"][..., NOPE_DIM:]], -1)
+    if split_q:
+        q = q_nope
+        kwargs = {**kwargs, "q_pe": p["q"][..., NOPE_DIM:]}
+    else:
+        q = jnp.concatenate([q_nope, p["q"][..., NOPE_DIM:]], -1)
     out = sparse_mla.sparse_ragged_paged_attention(
         q,
         p["nope"],
@@ -159,6 +169,9 @@ def _run_tq(p, sm_scale, k_scale, topk=None, **kwargs):
         tq_centroids=tuple(float(c) for c in p["tables"].centroids),
         **kwargs,
     )
+    if split_q:
+        assert out.shape[-1] == NOPE_DIM, out.shape
+        return tq.rotate(out, hadamard)
     return tq.rotate(out[..., :NOPE_DIM], hadamard)
 
 
@@ -175,6 +188,28 @@ class SparseMlaTurboQuantTest(parameterized.TestCase):
 
     @parameterized.named_parameters(
         dict(testcase_name="prefill", query_tokens=128, topk=256, k_scale=1.0, kw={}),
+        dict(
+            testcase_name="prefill_split_q",
+            query_tokens=128,
+            topk=256,
+            k_scale=1.0,
+            kw=dict(split_q=True),
+        ),
+        dict(
+            testcase_name="decode_split_q",
+            query_tokens=16,
+            topk=2048,
+            k_scale=1.0,
+            kw=dict(split_q=True),
+        ),
+        dict(
+            testcase_name="prefill_cubic",
+            query_tokens=128,
+            topk=256,
+            k_scale=1.0,
+            kw={},
+            codebook="cubic",
+        ),
         dict(
             testcase_name="prefill_lloyd",
             query_tokens=128,
@@ -194,7 +229,7 @@ class SparseMlaTurboQuantTest(parameterized.TestCase):
         ),
     )
     def test_matches_dequantized_reference(
-        self, query_tokens, topk, k_scale, kw, codebook="cubic"
+        self, query_tokens, topk, k_scale, kw, codebook="default"
     ):
         p = _build(
             np.random.default_rng(2),

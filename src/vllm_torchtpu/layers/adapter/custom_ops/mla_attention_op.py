@@ -134,6 +134,63 @@ STREAMIDX_PACK_BKVP_CAP_TOKENS = 8
 STREAMIDX_PACK_BKVP = (32, 16)  # (T <= cap, T > cap)
 
 
+def _min_bkv_pages_for_smem(
+    bkv_p: int,
+    *,
+    num_tokens: int,
+    num_seqs: int,
+    pages_per_seq: int,
+    page_size: int,
+    chunk_tokens: int | None,
+    bq_sz: int,
+    static_q_len: int | None,
+    smem_cap: int,
+) -> int:
+    """Widen `bkv_p` by powers of two if needed so `StreamIndex` metadata fits SMEM."""
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+        metadata as _streamidx_meta,
+    )
+
+    def _cdiv(a: int, b: int) -> int:
+        return (a + b - 1) // b
+
+    if static_q_len == 1:
+        total_max_bq = num_seqs
+    elif static_q_len is not None:
+        total_max_bq = num_seqs * max(1, _cdiv(static_q_len, bq_sz))
+    else:
+        max_q_ub = _streamidx_meta.next_power_of_2(num_tokens)
+        total_max_bq = max(1, _cdiv(max_q_ub, bq_sz)) + num_seqs
+
+    if (
+        chunk_tokens is not None
+        and num_tokens % chunk_tokens == 0
+        and num_tokens > chunk_tokens
+    ):
+        num_chunks = num_tokens // chunk_tokens
+        per_chunk_bq = min(
+            total_max_bq, _cdiv(chunk_tokens, bq_sz) + min(num_seqs, chunk_tokens)
+        )
+        total_bq_ub = min(
+            num_chunks * per_chunk_bq,
+            total_max_bq + num_chunks - 1,
+            max(1, _cdiv(_streamidx_meta.next_power_of_2(num_tokens), bq_sz))
+            + num_chunks
+            + num_seqs
+            - 1,
+        )
+    else:
+        total_bq_ub = total_max_bq
+
+    while page_size * bkv_p < 8192:
+        max_bkv = max(1, _cdiv(pages_per_seq, bkv_p))
+        req_steps = max(1024, _cdiv(total_bq_ub * max_bkv, 1024) * 1024)
+        if req_steps <= smem_cap:
+            break
+        bkv_p *= 2
+    return bkv_p
+
+
 def _streamidx_block_sizes(
     num_tokens: int,
     small_bucket_bq: int | None,
@@ -141,6 +198,11 @@ def _streamidx_block_sizes(
     small_bucket_tokens: int,
     mixed_bkvp: int | None = None,
     decode_pack: bool = False,
+    *,
+    num_seqs: int = 0,
+    pages_per_seq: int = 0,
+    page_size: int = 0,
+    chunk_tokens: int | None = None,
 ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
     """(num_kv_pages_per_block, num_queries_per_block) for a padded token bucket.
 
@@ -148,25 +210,67 @@ def _streamidx_block_sizes(
     (q_len = gamma + 1) in a 128-row block scores ~124 padding rows. Buckets up
     to `small_bucket_tokens` take the small-bucket sizes instead; larger
     buckets take `mixed_bkvp` (TPU_STREAMIDX_MIXED_KV_PAGES) kv pages per MIXED
-    block when it is set.
+    block when it is set, or auto-widen `bkv_p` when 1M-context page counts
+    would otherwise exceed the 1 MiB SMEM metadata step budget.
     """
-    if small_bucket_bq is None or num_tokens > small_bucket_tokens:
-        if mixed_bkvp is None:
-            return STREAMIDX_KV_PAGES_PER_BLOCK, STREAMIDX_QUERIES_PER_BLOCK
-        return (
-            STREAMIDX_KV_PAGES_PER_BLOCK[:2] + (mixed_bkvp,),
-            STREAMIDX_QUERIES_PER_BLOCK,
-        )
-    if small_bucket_bkvp:
-        bkvp = small_bucket_bkvp
-    elif decode_pack:
-        bkvp = STREAMIDX_PACK_BKVP[num_tokens > STREAMIDX_PACK_BKVP_CAP_TOKENS]
+    is_large_bucket = small_bucket_bq is None or num_tokens > small_bucket_tokens
+    if is_large_bucket:
+        if mixed_bkvp is not None:
+            kv_pages = STREAMIDX_KV_PAGES_PER_BLOCK[:2] + (mixed_bkvp,)
+        else:
+            kv_pages = STREAMIDX_KV_PAGES_PER_BLOCK
+        q_per_block = STREAMIDX_QUERIES_PER_BLOCK
+        explicit_mix = mixed_bkvp is not None
     else:
-        bkvp = STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP
-    return (
-        STREAMIDX_KV_PAGES_PER_BLOCK[:2] + (bkvp,),
-        STREAMIDX_QUERIES_PER_BLOCK[:2] + (small_bucket_bq,),
-    )
+        assert small_bucket_bq is not None
+        if small_bucket_bkvp:
+            bkvp = small_bucket_bkvp
+        elif decode_pack:
+            bkvp = STREAMIDX_PACK_BKVP[num_tokens > STREAMIDX_PACK_BKVP_CAP_TOKENS]
+        else:
+            bkvp = STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP
+        kv_pages = STREAMIDX_KV_PAGES_PER_BLOCK[:2] + (bkvp,)
+        q_per_block = STREAMIDX_QUERIES_PER_BLOCK[:2] + (small_bucket_bq,)
+        explicit_mix = bool(small_bucket_bkvp)
+
+    if pages_per_seq > 0 and num_seqs > 0 and page_size > 0:
+        from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+            metadata as _streamidx_meta,
+        )
+
+        try:
+            smem_cap = _streamidx_meta.generate_max_steps(num_seqs, pages_per_seq)
+        except ValueError:
+            smem_cap = 0
+        if smem_cap > 0:
+            dec_bkvp = _min_bkv_pages_for_smem(
+                kv_pages[0],
+                num_tokens=num_tokens,
+                num_seqs=num_seqs,
+                pages_per_seq=pages_per_seq,
+                page_size=page_size,
+                chunk_tokens=chunk_tokens,
+                bq_sz=q_per_block[0],
+                static_q_len=1,
+                smem_cap=smem_cap,
+            )
+            mix_bkvp = (
+                kv_pages[2]
+                if explicit_mix
+                else _min_bkv_pages_for_smem(
+                    kv_pages[2],
+                    num_tokens=num_tokens,
+                    num_seqs=num_seqs,
+                    pages_per_seq=pages_per_seq,
+                    page_size=page_size,
+                    chunk_tokens=chunk_tokens,
+                    bq_sz=q_per_block[2],
+                    static_q_len=None,
+                    smem_cap=smem_cap,
+                )
+            )
+            return (dec_bkvp, kv_pages[1], mix_bkvp), q_per_block
+    return kv_pages, q_per_block
 
 
 _INDEXER_KV_CACHE_FALLBACK_LOGGED: set[tuple[str, str]] = set()
@@ -646,8 +750,20 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
+            idx_page_size = (
+                cache_kv.shape[3]
+                if kv_layout == KVLayout.SEQ_ALONG_LANE
+                else cache_kv.shape[1] * cache_kv.shape[2]
+            )
             kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
-                q.shape[0], *small_bucket, mixed_bkvp, decode_pack
+                q.shape[0],
+                *small_bucket,
+                mixed_bkvp,
+                decode_pack,
+                num_seqs=seq_lens.shape[0],
+                pages_per_seq=page_indices.shape[0] // seq_lens.shape[0],
+                page_size=idx_page_size,
+                chunk_tokens=chunk_tokens,
             )
             topk_indices = streamindex_topk(
                 q,
@@ -817,8 +933,20 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
+            idx_page_size = (
+                cache_kv.shape[3]
+                if kv_layout == KVLayout.SEQ_ALONG_LANE
+                else cache_kv.shape[1] * cache_kv.shape[2]
+            )
             kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
-                q.shape[0], *small_bucket, mixed_bkvp, decode_pack
+                q.shape[0],
+                *small_bucket,
+                mixed_bkvp,
+                decode_pack,
+                num_seqs=seq_lens.shape[0],
+                pages_per_seq=page_indices.shape[0] // seq_lens.shape[0],
+                page_size=idx_page_size,
+                chunk_tokens=chunk_tokens,
             )
             overlap = {}
             if qb_overlap:
@@ -1692,8 +1820,8 @@ class VllmTPUMLAAttention(MLAAttention):
         )
 
         if original_mla_get_backend is not None:
-            mla_attention.get_mla_prefill_backend = (
-                lambda config: TPUDummyMLAPrefillBackend
+            mla_attention.get_mla_prefill_backend = lambda config: (
+                TPUDummyMLAPrefillBackend
             )
         if original_selector_get_backend is not None:
             selector.get_mla_prefill_backend = lambda config: TPUDummyMLAPrefillBackend
