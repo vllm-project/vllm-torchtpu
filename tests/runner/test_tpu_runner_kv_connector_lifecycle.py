@@ -19,6 +19,9 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorTransferResults,
+)
 
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import (
@@ -46,7 +49,12 @@ def _recording_connector(events: list[str]) -> MagicMock:
         connector.metadata_bound = False
 
     connector.wait_for_save.side_effect = logged("save")
-    connector.get_finished.side_effect = logged("poll", ({"sent"}, {"loaded"}))
+    connector.get_transfer_results.side_effect = logged(
+        "poll",
+        KVConnectorTransferResults(
+            finished_sending={"sent"}, finished_recving={"loaded"}
+        ),
+    )
     connector.clear_connector_metadata.side_effect = clear
     connector.get_block_ids_with_load_errors.return_value = set()
     connector.build_connector_worker_meta.return_value = None
