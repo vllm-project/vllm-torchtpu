@@ -245,6 +245,10 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
     # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
+    # A static expert placement permutes expert weights and router tables at
+    # load (expert_placement.py); every program is the unplaced model's, so a
+    # placed server reuses its compile cache.
+    "TPU_EXPERT_PLACEMENT",
     # Pooling: the static pooler is a separate backend="tpu" helper outside the
     # backbone graph, and the KV cap reaches the hash through num_gpu_blocks.
     "VLLM_TPU_STATIC_POOLER",
