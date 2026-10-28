@@ -61,6 +61,7 @@ from vllm_torchtpu.megakernel_runtime.driver import (  # noqa: E402
     TorchStepMetaOps,
     prepare_step_inputs_eager,
 )
+from vllm_torchtpu.megakernel_runtime.hooks import StepContext  # noqa: E402
 from vllm_torchtpu.megakernel_runtime.weight_collector import (  # noqa: E402
     WEIGHT_FLIPPED_ATTR,
 )
@@ -2043,7 +2044,7 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
     # 6. Dummy runs (`bctx.position_ids_override is not None`) gate off MK
     runner._attn_metadata_builder_ctx.position_ids_override = pos_2
     assert not driver.can_run(ids_2, pos_2, runner=runner)
-    hit_dummy, out_dummy = driver.try_forward(runner, ids_2, pos_2)
+    hit_dummy, out_dummy = driver.try_forward(runner, StepContext(ids_2, pos_2))
     assert not hit_dummy and out_dummy is None
     runner._attn_metadata_builder_ctx.position_ids_override = None
     assert driver.can_run(ids_2, pos_2, runner=runner)
@@ -2278,7 +2279,7 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
     positions_t1 = torch.tensor([5, 9], dtype=torch.int32)
     ref_pools_j = tuple(_torch_to_jax(p.clone(), tp) for p in raw_pools_t)
 
-    hit_t1, out_t1 = driver.try_forward(runner, input_ids_t1, positions_t1)
+    hit_t1, out_t1 = driver.try_forward(runner, StepContext(input_ids_t1, positions_t1))
     assert hit_t1 and out_t1 is not None
     assert out_t1.shape == (2, g.H)
     for idx, p in enumerate(raw_pools_t):

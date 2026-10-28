@@ -7623,26 +7623,40 @@ class TPUModelRunner(GPUModelRunner):
         padding_state.update(num_valid_tokens, num_tokens_padded)
 
     def forward_model(
-        self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
+        self,
+        input_ids,
+        positions,
+        inputs_embeds=None,
+        intermediate_tensors=None,
+        model_kwargs=None,
     ):
+        hit, out = False, None
         if self._megakernel is not None:
+            # A megakernel step returns what the stock model would; both go
+            # through the normalization below.
             hit, out = self._megakernel.try_forward(
-                self, input_ids, positions, inputs_embeds, intermediate_tensors
+                self,
+                megakernel_runtime.StepContext(
+                    input_ids=input_ids,
+                    positions=positions,
+                    inputs_embeds=inputs_embeds,
+                    intermediate_tensors=intermediate_tensors,
+                    model_kwargs=model_kwargs,
+                ),
             )
-            if hit:
-                return out, None
 
-        # @support_torch_compile annotations will be put on the vLLM model if it
-        # supports torch.compile
-        kwargs = {}
-        if intermediate_tensors is not None:
-            kwargs["intermediate_tensors"] = intermediate_tensors
-        out = self.model(
-            input_ids=input_ids,
-            positions=positions,
-            inputs_embeds=inputs_embeds,
-            **kwargs,
-        )
+        if not hit:
+            # @support_torch_compile annotations will be put on the vLLM model
+            # if it supports torch.compile
+            kwargs = dict(model_kwargs) if model_kwargs else {}
+            if intermediate_tensors is not None:
+                kwargs["intermediate_tensors"] = intermediate_tensors
+            out = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                inputs_embeds=inputs_embeds,
+                **kwargs,
+            )
         # A stage before the last returns the tensors the next stage
         # consumes rather than hidden states to sample from.
         if isinstance(out, IntermediateTensors):

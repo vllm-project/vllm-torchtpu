@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .hooks import is_suppressed, suppressed
+from .hooks import StepContext, is_suppressed, suppressed
 
 _DRIVER_EXPORTS = frozenset(
     {
@@ -119,6 +119,7 @@ def __getattr__(name: str) -> Any:
 __all__ = [
     "MegakernelDriver",
     "PooledStepExport",
+    "StepContext",
     "TorchArrayOps",
     "TorchStepMetaOps",
     "VLLMWeightSource",

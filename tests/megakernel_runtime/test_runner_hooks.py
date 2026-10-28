@@ -195,6 +195,7 @@ def test_try_forward_never_engages_while_suppressed(
     import torch
 
     from vllm_torchtpu import megakernel_runtime as mkr
+    from vllm_torchtpu.megakernel_runtime import StepContext
 
     drv = _bare_driver(monkeypatch)
     runner = SimpleNamespace()
@@ -202,10 +203,10 @@ def test_try_forward_never_engages_while_suppressed(
     pos = torch.zeros((2,), dtype=torch.int32)
     with mkr.suppressed(runner):
         drv._prepared_step = ("stale",)
-        assert drv.try_forward(runner, ids, pos) == (False, None)
+        assert drv.try_forward(runner, StepContext(ids, pos)) == (False, None)
         assert drv._prepared_step is None
     assert drv.calls == []
-    hit, out = drv.try_forward(runner, ids, pos)
+    hit, out = drv.try_forward(runner, StepContext(ids, pos))
     assert hit and tuple(out.shape) == (2, 4)
     assert drv.calls == ["can_run", "run"]
 
@@ -261,3 +262,174 @@ def test_runner_dummy_run_forward_is_suppressed() -> None:
         if isinstance(c, ast.Call) and ast.unparse(c.func) == "self.forward_model"
     )
     assert n_guarded == len(fwd_calls)
+
+
+# --- Step context ------------------------------------------------------------
+
+
+def test_try_forward_unpacks_step_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_torchtpu.megakernel_runtime import StepContext
+
+    drv = _bare_driver(monkeypatch)
+    seen: dict[str, Any] = {}
+
+    def can_run(input_ids: Any, positions: Any, **kw: Any) -> bool:
+        seen.update(input_ids=input_ids, positions=positions, **kw)
+        return False
+
+    monkeypatch.setattr(drv, "can_run", can_run, raising=False)
+    runner = SimpleNamespace()
+    ids = torch.zeros((2,), dtype=torch.int32)
+    pos = torch.zeros((2,), dtype=torch.int32)
+    emb, it = object(), object()
+    ctx = StepContext(ids, pos, inputs_embeds=emb, intermediate_tensors=it)
+    assert drv.try_forward(runner, ctx) == (False, None)
+    assert seen["input_ids"] is ids and seen["positions"] is pos
+    assert seen["inputs_embeds"] is emb and seen["intermediate_tensors"] is it
+    assert seen["runner"] is runner
+
+
+@pytest.mark.parametrize("model_kwargs", [None, {}, {"extra": 1}])
+def test_try_forward_declines_unconsumed_model_kwargs(
+    monkeypatch: pytest.MonkeyPatch, model_kwargs: Any
+) -> None:
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_torchtpu.megakernel_runtime import StepContext
+
+    drv = _bare_driver(monkeypatch)
+    ids = torch.zeros((2,), dtype=torch.int32)
+    pos = torch.zeros((2,), dtype=torch.int32)
+    ctx = StepContext(ids, pos, model_kwargs=model_kwargs)
+    hit, out = drv.try_forward(SimpleNamespace(), ctx)
+    if model_kwargs:
+        assert (hit, out) == (False, None) and drv.calls == []
+    else:
+        assert hit and drv.calls == ["can_run", "run"]
+
+
+class _FakeIntermediateTensors:
+    pass
+
+
+def _runner_forward_model() -> Any:
+    """`TPUModelRunner.forward_model`; compiled from source without torch_tpu."""
+    try:
+        from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+    except ImportError:
+        pass
+    else:
+        return TPUModelRunner.forward_model
+    import ast
+    import textwrap
+    from pathlib import Path
+
+    import vllm_torchtpu
+    from vllm_torchtpu import megakernel_runtime
+
+    path = Path(vllm_torchtpu.__file__).parent / "runner" / "tpu_runner.py"
+    src = path.read_text(encoding="utf-8")
+    fn = next(
+        n
+        for n in ast.walk(ast.parse(src))
+        if isinstance(n, ast.FunctionDef) and n.name == "forward_model"
+    )
+    fn_src = textwrap.dedent(ast.get_source_segment(src, fn) or "")
+    ns: dict[str, Any] = {
+        "megakernel_runtime": megakernel_runtime,
+        "IntermediateTensors": _FakeIntermediateTensors,
+    }
+    exec(compile(fn_src, str(path), "exec"), ns)
+    return ns["forward_model"]
+
+
+def _raw_outputs() -> list[Any]:
+    import torch
+
+    h = torch.arange(6.0).reshape(3, 2)
+    aux = [torch.ones(3, 2)]
+    return [h, [h], (h,), (h, aux), [h, aux], _FakeIntermediateTensors()]
+
+
+@pytest.mark.parametrize("raw_idx", range(6))
+def test_runner_normalizes_megakernel_output_like_stock(raw_idx: int) -> None:
+    """A megakernel step's output goes through the stock normalization."""
+    from types import SimpleNamespace
+
+    import torch
+
+    forward_model = _runner_forward_model()
+    raw = _raw_outputs()[raw_idx]
+    stock_calls: list[dict[str, Any]] = []
+
+    def model(**kw: Any) -> Any:
+        stock_calls.append(kw)
+        return raw
+
+    class _Driver:
+        def __init__(self, hit: bool) -> None:
+            self.hit, self.ctx = hit, None
+
+        def try_forward(self, runner: Any, ctx: Any) -> tuple[bool, Any]:
+            self.ctx = ctx
+            return (True, raw) if self.hit else (False, None)
+
+    ids = torch.zeros((3,), dtype=torch.int32)
+    pos = torch.zeros((3,), dtype=torch.int32)
+    stock = forward_model(SimpleNamespace(_megakernel=None, model=model), ids, pos)
+    assert len(stock_calls) == 1
+    drv = _Driver(hit=True)
+    mk = forward_model(SimpleNamespace(_megakernel=drv, model=model), ids, pos)
+    assert len(stock_calls) == 1, "a megakernel hit must not run the stock model"
+    assert drv.ctx.input_ids is ids and drv.ctx.positions is pos
+    assert type(mk) is type(stock) and len(mk) == len(stock) == 2
+    assert mk[0] is stock[0]
+    assert mk[1] is stock[1]
+
+
+def test_runner_declined_step_passes_model_kwargs_to_stock() -> None:
+    from types import SimpleNamespace
+
+    import torch
+
+    forward_model = _runner_forward_model()
+    stock_calls: list[dict[str, Any]] = []
+    h = torch.zeros(2, 2)
+
+    def model(**kw: Any) -> Any:
+        stock_calls.append(kw)
+        return h
+
+    class _Decline:
+        ctx: Any = None
+
+        def try_forward(self, runner: Any, ctx: Any) -> tuple[bool, Any]:
+            self.ctx = ctx
+            return False, None
+
+    drv = _Decline()
+    runner = SimpleNamespace(_megakernel=drv, model=model)
+    ids = torch.zeros((2,), dtype=torch.int32)
+    pos = torch.zeros((2,), dtype=torch.int32)
+    it = object()
+    out = forward_model(
+        runner, ids, pos, intermediate_tensors=it, model_kwargs={"extra": 1}
+    )
+    assert out[0] is h and out[1] is None
+    assert drv.ctx.model_kwargs == {"extra": 1}
+    assert drv.ctx.intermediate_tensors is it
+    assert stock_calls == [
+        dict(
+            input_ids=ids,
+            positions=pos,
+            inputs_embeds=None,
+            extra=1,
+            intermediate_tensors=it,
+        )
+    ]

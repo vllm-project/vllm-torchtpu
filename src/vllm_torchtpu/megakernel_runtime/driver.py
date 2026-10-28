@@ -56,7 +56,7 @@ from vllm_torchtpu.megakernel_runtime.exported_bridge import (
     build_pooled_step_op,
     execute_pooled_step_inplace,
 )
-from vllm_torchtpu.megakernel_runtime.hooks import is_suppressed
+from vllm_torchtpu.megakernel_runtime.hooks import StepContext, is_suppressed
 from vllm_torchtpu.megakernel_runtime.weight_collector import (
     find_backbone,
     get_routed_experts,
@@ -1519,25 +1519,23 @@ class MegakernelDriver:
             return hidden_out[:out_rows]
         return F.pad(hidden_out, (0, 0, 0, out_rows - hidden_out.shape[0]))
 
-    def try_forward(
-        self,
-        runner: Any,
-        input_ids: torch.Tensor | None,
-        positions: torch.Tensor | None,
-        inputs_embeds: torch.Tensor | None = None,
-        intermediate_tensors: Any = None,
-    ) -> tuple[bool, Any]:
+    def try_forward(self, runner: Any, ctx: StepContext) -> tuple[bool, Any]:
         """Try to execute the current forward step on the megakernel.
 
-        Returns `(True, hidden_states)` when handled by the megakernel (or timed
-        by the A/B calibrator), or `(False, None)` to fall through to the runner's
-        default model forward. Always `(False, None)` inside
-        `megakernel_runtime.suppressed(runner)` (dummy / precompile / profile
-        runs), so those runs compile the stock graphs.
+        Returns `(True, out)` when handled by the megakernel (or timed by the
+        A/B calibrator), where `out` is what the stock model would return; or
+        `(False, None)` to fall through to the runner's stock model forward.
+        Always `(False, None)` inside `megakernel_runtime.suppressed(runner)`
+        (dummy / precompile / profile runs), so those runs compile the stock
+        graphs, and when `ctx.model_kwargs` is non-empty (this driver doesn't
+        consume extra model inputs).
         """
-        if is_suppressed(runner):
+        if is_suppressed(runner) or ctx.model_kwargs:
             self._prepared_step = None
             return False, None
+        input_ids, positions = ctx.input_ids, ctx.positions
+        inputs_embeds = ctx.inputs_embeds
+        intermediate_tensors = ctx.intermediate_tensors
         use_mk = self.can_run(
             input_ids,
             positions,

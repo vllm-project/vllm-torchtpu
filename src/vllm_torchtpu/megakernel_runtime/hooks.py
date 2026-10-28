@@ -20,10 +20,29 @@ load without pulling in the megakernel library.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Iterator
+import dataclasses
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 _SUPPRESS_ATTR = "_megakernel_suppress_depth"
+
+
+@dataclasses.dataclass(frozen=True)
+class StepContext:
+    """The inputs of one runner forward, exactly as the stock model gets them.
+
+    `model_kwargs` are the extra keyword arguments the runner passes to the
+    stock model's forward; a driver that can't consume them declines the step.
+    A driver that handles the step returns what the stock model would: hidden
+    states, or `(hidden_states, aux_hidden_states)`; the runner normalizes
+    both paths the same way.
+    """
+
+    input_ids: Any
+    positions: Any
+    inputs_embeds: Any = None
+    intermediate_tensors: Any = None
+    model_kwargs: Mapping[str, Any] | None = None
 
 
 @contextlib.contextmanager
