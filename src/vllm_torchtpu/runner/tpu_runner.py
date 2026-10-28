@@ -3514,9 +3514,22 @@ class TPUModelRunner(GPUModelRunner):
         return num_chunks, max_chunk_reqs
 
     def _needs_draft_proposals(self, scheduler_output: "SchedulerOutput") -> bool:
-        """DFlash/DSpark candidates are useful only once a prompt is complete."""
+        """DFlash/DSpark candidates are useful only once a prompt is complete.
+
+        A PD producer never decodes past the prompt: its one sampled token is
+        dropped and the consumer drafts for itself. It only needs the draft
+        context (`prepare_prefill_handoff`), not a ~0.5 s propose on every
+        request's last prefill chunk.
+        """
         if not isinstance(self.drafter, DFlashProposer):
             return True
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        if (
+            kv_transfer_config is not None
+            and kv_transfer_config.is_kv_producer
+            and not kv_transfer_config.is_kv_consumer
+        ):
+            return False
         for req_id, count in scheduler_output.num_scheduled_tokens.items():
             index = self.input_batch.req_id_to_index[req_id]
             computed = int(self.input_batch.num_computed_tokens_cpu[index])

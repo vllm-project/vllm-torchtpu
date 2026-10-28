@@ -116,10 +116,34 @@ def test_dflash_proposes_only_at_prompt_boundary_or_decode(
             num_computed_tokens_cpu=np.array(computed),
             num_prompt_tokens=np.array(prompts),
         ),
+        vllm_config=SimpleNamespace(kv_transfer_config=None),
     )
     output = SimpleNamespace(
         num_scheduled_tokens=dict(zip(ids, scheduled, strict=True))
     )
+    assert TPUModelRunner._needs_draft_proposals(runner, output) is needed
+
+
+@pytest.mark.parametrize(
+    "producer,consumer,needed", [(True, False, False), (False, True, True), (True, True, True)]
+)
+def test_pd_producer_only_builds_draft_context(producer, consumer, needed):
+    """A pure PD producer drops its one sampled token, so even its last prompt
+    chunk needs only the draft context, never a propose."""
+    runner = SimpleNamespace(
+        drafter=tpu_runner.DFlashProposer.__new__(tpu_runner.DFlashProposer),
+        input_batch=SimpleNamespace(
+            req_id_to_index={"0": 0},
+            num_computed_tokens_cpu=np.array([2048]),
+            num_prompt_tokens=np.array([4096]),
+        ),
+        vllm_config=SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(
+                is_kv_producer=producer, is_kv_consumer=consumer
+            )
+        ),
+    )
+    output = SimpleNamespace(num_scheduled_tokens={"0": 2048})
     assert TPUModelRunner._needs_draft_proposals(runner, output) is needed
 
 
