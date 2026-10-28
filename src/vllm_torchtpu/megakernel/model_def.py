@@ -177,7 +177,7 @@ class ModelDef:
         gdn_module: Module | None = None,
         moe_tp: bool | None = None,
         e_slots: int | None = None,
-        R: int = 8,
+        R: int | None = 8,
     ) -> ModelSpec:
         """Derive `ModelSpec` (`LayerType` + `SwitchSlot`s, deduping shared modules)."""
         return derive_model_spec(

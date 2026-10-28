@@ -202,6 +202,9 @@ def gqa_fused_init_buffers(ctx: Any) -> None:
                 jnp.logical_and(act_list[s], oks_s[0]), jnp.int32(1), jnp.int32(0)
             )
         else:
+            any_ok = oks_s[0]
+            for t in range(1, T):
+                any_ok = jnp.logical_or(any_ok, oks_s[t])
             same_s = oks_s[0]
             for t in range(1, T):
                 same_s = jnp.logical_and(
@@ -221,7 +224,7 @@ def gqa_fused_init_buffers(ctx: Any) -> None:
                 jnp.logical_and(act_list[s], same_s), jnp.logical_not(alias_prev)
             )
             scr["kv_mode"][s] = jnp.where(
-                act_list[s],
+                jnp.logical_and(act_list[s], any_ok),
                 jnp.where(do_fast, jnp.int32(1), jnp.int32(2)),
                 jnp.int32(0),
             )

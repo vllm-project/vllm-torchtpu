@@ -467,7 +467,9 @@ def test_m2_qwen35_hybrid_pack_and_step_vs_logical_reference(
     if T > 1:
         acc = jnp.asarray([1, 2], dtype=I32)
         vh = g.vh(R)
-        jit_accept = jax.jit(lambda st, a: GDNModule.accept(st, st, a, T=T, vh=vh))
+        jit_accept = jax.jit(
+            lambda st, a: GDNModule.accept(st, st, a, T=T, vh=vh, taps=3)
+        )
         acc_folded = jit_accept(out_st, acc)
         acc_unfolded = qwen35.accept_states(g, ex, ref_st, [1, 2])
         assert jnp.allclose(

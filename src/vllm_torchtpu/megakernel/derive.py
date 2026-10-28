@@ -196,7 +196,7 @@ def derive_model_spec(
     gdn_module: Module | None = None,
     moe_tp: bool | None = None,
     e_slots: int | None = None,
-    R: int = 8,
+    R: int | None = 8,
 ) -> ModelSpec:
     """Derive `ModelSpec` (`LayerType` + `SwitchSlot`s), failing closed on overrides."""
     g = cls.derive_geometry(hf_config_or_geom, moe_tp=moe_tp, e_slots=e_slots)
@@ -261,7 +261,7 @@ def derive_model_spec(
                 f"ModelDef {mname!r}: layer {lyr} slot 'ffn' binding {got_desc} "
                 "cannot be represented in ModelSpec"
             )
-    play = cls.pool_layout(g, R=R)
+    play = None if R is None else cls.pool_layout(g, R=R)
     branches: list[Module] = []
     counts: list[int] = []
     for b in sched.mixer[:p]:
@@ -287,7 +287,7 @@ def derive_model_spec(
         name=mname,
         config=g,
         layer_type=LayerType(name=lt_name, slots=(mixer_slot, ffn_mod)),
-        cache_backend=cls.pool_backend(g, R=R),
+        cache_backend=None if R is None else cls.pool_backend(g, R=R),
     )
 
 

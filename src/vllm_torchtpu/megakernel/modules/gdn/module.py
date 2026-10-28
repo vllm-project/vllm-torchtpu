@@ -172,7 +172,7 @@ class GDNModule(Module):
         *,
         T: int,
         vh: int,
-        taps: int = 3,
+        taps: int | None = None,
     ) -> dict[str, Any]:
         """Jittable on-device selection of post-verify GDN states from checkpoints."""
         return gdn_accept(states, ckpts, acc, T=T, vh=vh, taps=taps)

@@ -264,7 +264,12 @@ def run_kernel_vs_ref(
             step_d, _ = kernel.make_step(mesh, spec, ex_d)
             out_h, out_st = step_d(pos_m, hid_m, w_m, st_m)
             m_dir = _rec_h(out_h, ref_h, B, f"DirectHBM_T{T}")
-            u_st = {k: kernel.unfold(v, R) for k, v in out_st.items()}
+            u_st: dict[str, Any] = {}
+            for mod in spec.all_modules():
+                u_st.update(mod.unpack_kernel_states(out_st, g, ex_d))
+            for k, v in out_st.items():
+                if k not in u_st:
+                    u_st[k] = kernel.unfold(v, R)
             if int(T) > 1:
                 for mod in spec.all_modules():
                     g_nxt = mod.next_logical_states(u_st, g, ex_d)

@@ -892,3 +892,233 @@ def test_tile_rule_context_and_keyword_callable() -> None:
     with pytest.raises(ValueError, match="tiles.dense_acc_pair"):
         mk.Profile(name="b8_bad_ctx_exact", numerics="exact", tiles=long_ctx_approx)
 
+
+def test_b7_deferred_minors(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 1. random_hf_weights works without probing 'NKV' or requiring R in
+    #    supported_tp_sizes
+    g_base = _SynthBaseModel.derive_geometry()
+    assert getattr(g_base, "_model_def", None) is _SynthBaseModel
+    hf_w = mk.random_hf_weights(jax.random.key(0), g_base)
+    assert "att_out" in hf_w and "lin_q" in hf_w
+    g_q2 = qwen35.Qwen35.shrink(periods=1, R=2)
+    hf_q2 = mk.random_hf_weights(jax.random.key(1), g_q2)
+    assert "att_out" in hf_q2 and "lin_q" in hf_q2
+
+    # 2. GDNModule.accept / gdn_accept derives taps on unpadded logical layout
+    #    (taps=2, 3) and requires explicit taps on padded kernel layout
+    for taps in (2, 3):
+        R, ngdn, NS, T, qkv, vh, KD, VD = 2, 1, 2, 2, 16, 2, 4, 4
+        c_ckpt = jnp.arange(
+            R * ngdn * NS * (taps + T) * qkv, dtype=jnp.float32
+        ).reshape(R, ngdn, NS, taps + T, qkv)
+        r_ckpt = jnp.arange(
+            R * ngdn * NS * T * vh * KD * VD, dtype=jnp.float32
+        ).reshape(R, ngdn, NS * T * vh, KD, VD)
+        st_in = {
+            "conv": jnp.zeros((R, ngdn, NS, taps, qkv), dtype=jnp.float32),
+            "rec": jnp.zeros((R, ngdn, NS * vh, KD, VD), dtype=jnp.float32),
+        }
+        ckpts = {"conv_ckpt": c_ckpt, "rec_ckpt": r_ckpt}
+        acc = jnp.array([1, 2], dtype=jnp.int32)
+        out_auto = mk.GDNModule.accept(st_in, ckpts, acc, T=T, vh=vh)
+        out_expl = mk.GDNModule.accept(st_in, ckpts, acc, T=T, vh=vh, taps=taps)
+        np.testing.assert_array_equal(
+            np.asarray(out_auto["conv"]), np.asarray(out_expl["conv"])
+        )
+        np.testing.assert_array_equal(
+            np.asarray(out_auto["rec"]), np.asarray(out_expl["rec"])
+        )
+        assert out_auto["conv"].shape == (R, ngdn, NS, taps + T, qkv)
+
+    # Padded kernel layout (`rup(taps + T, 8) = 8` rows) at T=2 and T=4
+    for T in (2, 4):
+        ex_pad = mk.ExecSpec(R=2, B=2 * T, T=T, ctx=256)
+        lay_q = qwen35.GDNModule.lin_in_layout(g_q2, ex_pad)
+        taps_q = 3
+        hr = 8  # rup(3 + T, 8) == 8 for both T=2 and T=4
+        n_folded = ex_pad.R * g_q2.NGDN
+        c_pad = jnp.arange(
+            n_folded * ex_pad.NS * hr * lay_q.QKV, dtype=jnp.float32
+        ).reshape(n_folded, ex_pad.NS, hr, lay_q.QKV)
+        r_pad = jnp.arange(
+            n_folded * ex_pad.NS * T * lay_q.vh * g_q2.KD * g_q2.VD,
+            dtype=jnp.float32,
+        ).reshape(n_folded, ex_pad.NS * T * lay_q.vh, g_q2.KD, g_q2.VD)
+        st_pad = {
+            "conv": jnp.zeros_like(c_pad),
+            "rec": jnp.zeros(
+                (n_folded, ex_pad.NS * lay_q.vh, g_q2.KD, g_q2.VD), dtype=jnp.float32
+            ),
+            "conv_ckpt": c_pad,
+            "rec_ckpt": r_pad,
+        }
+        acc_pad = jnp.array([1, T], dtype=jnp.int32)
+        with pytest.raises(ValueError, match="explicit `taps`"):
+            mk.GDNModule.accept(st_pad, st_pad, acc_pad, T=T, vh=lay_q.vh)
+        out_q = qwen35.accept_states(g_q2, ex_pad, st_pad, acc_pad)
+        out_m = mk.GDNModule.accept(
+            st_pad, st_pad, acc_pad, T=T, vh=lay_q.vh, taps=taps_q
+        )
+        np.testing.assert_array_equal(
+            np.asarray(out_q["conv"]), np.asarray(out_m["conv"])
+        )
+        # Rows 0:3 of sequence 0 equal rows 1:4 of c_pad; rows 3:8 remain untouched
+        np.testing.assert_array_equal(
+            np.asarray(out_q["conv"][:, 0, :taps_q, :]),
+            np.asarray(c_pad[:, 0, 1 : 1 + taps_q, :]),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(out_q["conv"][:, 0, taps_q:, :]),
+            np.asarray(c_pad[:, 0, taps_q:, :]),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(out_q["conv"][:, 1, :taps_q, :]),
+            np.asarray(c_pad[:, 1, T : T + taps_q, :]),
+        )
+
+    # 3. scatter_pool_states clamps out-of-range KV page IDs to null page 0 (and
+    #    fires kernel_debug_check when pl.enable_debug_checks(True) is active)
+    play_s = _SynthBaseModel.pool_layout(g_base, R=2)
+    ex_s = mk.ExecSpec(
+        R=2,
+        B=2,
+        T=1,
+        ctx=256,
+        interpret=True,
+        cache=mk.CacheExec(
+            paged_kv=True, num_pages=32, pool_gather=False, check_ckpt_bounds=False
+        ),
+    )
+    pt_s, ckpt_s, _, _ = mk.pool.allocate_test_layout(play_s, ex_s)
+    pt_bad = pt_s.at[0, 0].set(999)  # out of range (>= num_pages=32)
+    raw_s = tuple(
+        jnp.ones((32, *play_s.kv_page_shape), dtype=jnp.float8_e4m3fn)
+        for _ in range(play_s.num_pools)
+    )
+    pos_s = jnp.array([0, 0], dtype=jnp.int32)
+    n_att = g_base.L // g_base.att_every
+    n_gdn = g_base.L - n_att
+    lay_s = mk.GDNModule.lin_in_layout(g_base, ex_s)
+    knew_s = jnp.zeros((n_att, ex_s.MR, play_s.hd), dtype=jnp.float8_e4m3fn)
+    vnew_s = jnp.zeros((n_att, ex_s.MR, play_s.hd), dtype=jnp.float8_e4m3fn)
+    conv_s = jnp.zeros((n_gdn, 8, lay_s.QKV), dtype=jnp.float32)
+    rec_s = jnp.zeros(
+        (n_gdn, ex_s.B * lay_s.vh, g_base.KD, g_base.VD), dtype=jnp.bfloat16
+    )
+    raw_after = mk.pool.scatter_pool_states(
+        play_s,
+        ex_s,
+        raw_s,
+        pos_s,
+        pt_bad,
+        knew_s,
+        vnew_s,
+        conv_s,
+        rec_s,
+        ckpt_s[:, :, :1],
+        active_seqs="all",
+    )
+    # Page 31 (last valid page) was NOT clobbered by clamping 999 -> 31; it went
+    # to null page 0
+    np.testing.assert_array_equal(
+        np.asarray(raw_after[0][31]).view(np.uint8),
+        np.asarray(raw_s[0][31]).view(np.uint8),
+    )
+    from jax.experimental import pallas as pl
+
+    with (
+        pl.enable_debug_checks(True),
+        pytest.raises(Exception, match="KV scatter page index outside"),
+    ):
+        mk.pool.scatter_pool_states(
+            play_s,
+            ex_s,
+            raw_s,
+            pos_s,
+            pt_bad,
+            knew_s,
+            vnew_s,
+            conv_s,
+            rec_s,
+            ckpt_s[:, :, :1],
+            active_seqs="all",
+        )
+
+    # 4. fused negative-pos at T > 1 sets kv_mode[s] == 0 when all tokens have p < 0
+    ex_f = mk.ExecSpec(
+        R=2,
+        B=4,
+        T=2,
+        ctx=256,
+        cache=mk.CacheExec(paged_kv=True, num_pages=64, fused_pool_io=True),
+    )
+
+    class _FakeCtx:
+        ex = ex_f
+        pos_ref = jnp.array([-1, -1, 5, 6], dtype=jnp.int32)
+        ST = {
+            "page_table": jnp.array([[3, 4], [5, 6]], dtype=jnp.int32),
+            "ckpt_indices": jnp.array([[[1, 2], [3, 4]]], dtype=jnp.int32),
+        }
+        scr = {
+            "kv_rd_pend": np.zeros((2,), dtype=np.int32),
+            "kv_wr_pend": np.zeros((2,), dtype=np.int32),
+            "kv_kp0": np.zeros((2,), dtype=np.int32),
+            "kv_mode": np.zeros((2,), dtype=np.int32),
+        }
+
+    mk.experimental.fused_pool_io.gqa_fused_init_buffers(_FakeCtx)
+    assert int(_FakeCtx.scr["kv_mode"][0]) == 0
+    assert int(_FakeCtx.scr["kv_mode"][1]) == 1
+
+    # 5. unpack_kernel_states is invoked during verify_model DirectHBM check,
+    #    and missing state key fails closed
+    called_unpack: list[str] = []
+    orig_unpack = mk.GQAModule.unpack_kernel_states
+
+    def spy_unpack(self, raw_states, g, ex):
+        called_unpack.append(self.name)
+        return orig_unpack(self, raw_states, g, ex)
+
+    monkeypatch.setattr(mk.GQAModule, "unpack_kernel_states", spy_unpack)
+    rep = mk.verify_model(
+        _SynthBaseModel, R=2, B_per_T=2, T_values=(1,), hf=False, approx_profiles=False
+    )
+    rep.assert_passed()
+    assert "gqa" in called_unpack
+
+    # Missing state key from unpack_kernel_states fails closed with "missing state key"
+    monkeypatch.setattr(
+        mk.GQAModule,
+        "unpack_kernel_states",
+        lambda self, raw_states, g, ex: {
+            "kc": orig_unpack(self, raw_states, g, ex)["kc"]
+        },
+    )
+    monkeypatch.setattr(
+        mk.verify_checks.kernel,
+        "make_step",
+        lambda mesh, spec, ex: (
+            (
+                lambda pos_m, hid_m, w_m, st_m: (
+                    hid_m,
+                    {k: v for k, v in st_m.items() if k != "vc"},
+                )
+            ),
+            {},
+        ),
+    )
+    monkeypatch.setattr(
+        mk.verify_checks.cache,
+        "make_pooled_step",
+        lambda mesh, spec, ex: (lambda pos_p, hid_p, w_p, raw_in, *a: (hid_p, raw_in)),
+    )
+    rep_missing = mk.verify_model(
+        _SynthBaseModel, R=2, B_per_T=2, T_values=(1,), hf=False, approx_profiles=False
+    )
+    assert not rep_missing.passed
+    assert any(
+        "missing state key 'vc'" in c.reason
+        for c in rep_missing.checks
+        if c.status == "failed"
+    )

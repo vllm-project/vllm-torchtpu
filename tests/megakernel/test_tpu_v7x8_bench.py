@@ -603,7 +603,9 @@ def test_m2_tpu_v7x8_full_ep_parity_and_latency():
             acc_dev = jax.device_put((jnp.arange(ex.NS, dtype=I32) % T) + 1, rep)
             vh = g.vh(8)
             acc_st = jax.jit(
-                lambda s, a, _t=T, _vh=vh: GDNModule.accept(s, s, a, T=_t, vh=_vh)
+                lambda s, a, _t=T, _vh=vh: GDNModule.accept(
+                    s, s, a, T=_t, vh=_vh, taps=3
+                )
             )(out_st_lib, acc_dev)
             jax.block_until_ready(acc_st["rec"])
             assert acc_st["conv"].shape == st_lib["conv"].shape

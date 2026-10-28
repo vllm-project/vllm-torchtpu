@@ -27,7 +27,7 @@ from ..errors import MegakernelConfigError
 from ..exec_spec import ExecSpec
 from ..ops import BF16, FP8, I32
 from .backend import check_ckpt_bounds, resolve_active_seqs
-from .checks import check_step_pool_metadata, safe_kv_page
+from .checks import check_step_pool_metadata
 from .config import cache_exec
 from .layout import PoolLayout
 from .scatter_ckpt import prepare_ckpt
@@ -145,9 +145,7 @@ def scatter_pool_states(
     lp_idx = jnp.where(p_in_range, lp_raw, jnp.int32(0))
     s_idx_arr = jnp.arange(NS, dtype=I32)[:, None]
     raw_kp = page_table[s_idx_arr, lp_idx].astype(I32)
-    kv_pages = jnp.where(
-        p_in_range, safe_kv_page(raw_kp, cache_exec(ex).num_pages), jnp.int32(0)
-    )
+    kv_pages = jnp.where(p_in_range, raw_kp, jnp.int32(0))
 
     conv_in, conv_buf_shape, conv_buf_dt, ckpt_geom = prepare_ckpt(
         layout,

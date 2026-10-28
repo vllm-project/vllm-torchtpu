@@ -32,7 +32,8 @@ from .qwen35_profile import DEFAULT_HF_CONFIG, PROFILE, QWEN35_MODEL_NAME
 
 def accept_states(g: Any, ex: ExecSpec, st: dict[str, Any], acc: Any) -> dict[str, Any]:
     """Delegate verify-mode GDN state selection to `GDNModule.accept`."""
-    return GDNModule.accept(st, st, acc, T=ex.T, vh=g.vh(ex.R))
+    taps = GDNModule(geometry=g).cache_decl(g).conv_taps
+    return GDNModule.accept(st, st, acc, T=ex.T, vh=g.vh(ex.R), taps=taps)
 
 
 _REEXPORTS = (

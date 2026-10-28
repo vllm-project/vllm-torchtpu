@@ -71,13 +71,13 @@ def _resolve_norm_mod(
 
 
 def resolve_spec_and_norms(
-    model_def: Any, ex: ExecSpec, g: Any = None
+    model_def: Any, ex: ExecSpec | None = None, g: Any = None
 ) -> tuple[ModelSpec, Any, Module | None, Module | None, Module | None]:
     """Resolve `(ModelSpec, geometry, pre_norm, post_norm, final_norm)`."""
     if not (isinstance(model_def, type) and issubclass(model_def, ModelDef)):
         raise TypeError(f"Expected a ModelDef subclass, got {model_def!r}")
     geom = model_def.geometry() if g is None else g
-    ms = model_def.to_model_spec(geom, R=ex.R)
+    ms = model_def.to_model_spec(geom, R=None if ex is None else ex.R)
     assert model_def.schedule is not None
     sched = model_def.schedule
     pre_n = _resolve_norm_mod(sched.pre_norm, geom, default_small_field="in_norm")

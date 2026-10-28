@@ -74,9 +74,7 @@ def random_hf_weights(
     HF checkpoint key) and emits only declared parameter names (`d.name`).
     """
     m_def, geom = _resolve_model_and_geom(g, model_def)
-    r_probe = max(int(getattr(geom, "NKV", 1)), 1)
-    ex_probe = ExecSpec(R=r_probe, B=r_probe, T=1, ctx=2048)
-    ms, geom, pre_n, post_n, final_n = resolve_spec_and_norms(m_def, ex_probe, g=geom)
+    ms, geom, pre_n, post_n, final_n = resolve_spec_and_norms(m_def, None, g=geom)
     L = int(geom.L)
     counts = _module_layer_counts(ms, L)
 

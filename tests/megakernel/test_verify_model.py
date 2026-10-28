@@ -1018,8 +1018,8 @@ def test_fused_serialized_rmw_aliased_kv_write_page(case: str):
         uf = np.asarray(r_f).reshape(R, -1, *r_f.shape[1:])
         us = np.asarray(r_s).reshape(R, -1, *r_s.shape[1:])
         np.testing.assert_array_equal(
-            uf[:, : play.reserved_pages].view(np.uint8),
-            us[:, : play.reserved_pages].view(np.uint8),
+            uf[:, play.reserved_pages :].view(np.uint8),
+            us[:, play.reserved_pages :].view(np.uint8),
         )
     st_f = mk.pool_to_states(g, ex, raw_f, pt, ckpt)
     st_s = mk.pool_to_states(g, ex, raw_s, pt, ckpt)

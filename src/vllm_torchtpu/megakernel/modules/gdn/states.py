@@ -26,6 +26,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from ...ops import BF16, F32, I32, U32, bswitch, rup
 from ...pool.backend import kernel_debug_check
+from ...pool.checks import safe_page_base
 from ...pool.config import cache_exec
 from .params import GDNParams, gdn_lin_in_layout
 
@@ -37,7 +38,7 @@ def gdn_accept(
     *,
     T: int,
     vh: int,
-    taps: int = 3,
+    taps: int | None = None,
 ) -> dict[str, Any]:
     """Jittable on-device selection of post-verify GDN states from checkpoints."""
     c_ckpt = ckpts["conv_ckpt"] if "conv_ckpt" in ckpts else ckpts.get("conv")
@@ -45,6 +46,23 @@ def gdn_accept(
     out = {k: v for k, v in states.items() if k not in ("conv_ckpt", "rec_ckpt")}
     if c_ckpt is None or r_ckpt is None:
         return out
+    if taps is None:
+        conv_st = states.get("conv")
+        if (
+            conv_st is not None
+            and conv_st.ndim == 5
+            and c_ckpt.ndim == 5
+            and int(c_ckpt.shape[-2]) == int(conv_st.shape[-2]) + int(T)
+        ):
+            taps = int(conv_st.shape[-2])
+        else:
+            raise ValueError(
+                "gdn_accept requires explicit `taps` when `conv` and `conv_ckpt` "
+                "are in padded kernel layout (expected unpadded logical layout "
+                f"conv_ckpt.shape[-2] == conv.shape[-2] + T, got "
+                f"conv={None if conv_st is None else conv_st.shape}, "
+                f"conv_ckpt={c_ckpt.shape}, T={T})"
+            )
 
     NS = c_ckpt.shape[-3]
     acc_arr = jnp.asarray(acc, dtype=I32)
@@ -118,7 +136,7 @@ def gdn_pb_in(ctx: Any, gp: GDNParams, sub: Any, s: Any) -> Any:
         "GDN gather checkpoint slot maps outside [0, num_pages)",
         interpret=bool(ex.interpret),
     )
-    return jnp.clip(pb, 0, cache_exec(ex).num_pages - GDN_PAGES)
+    return safe_page_base(pb, GDN_PAGES, cache_exec(ex).num_pages)
 
 
 def gpr_start(

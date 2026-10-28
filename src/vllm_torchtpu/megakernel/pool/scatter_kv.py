@@ -153,12 +153,24 @@ def scatter_kv(kc: ScatterKernel) -> None:
             def _():
                 b0 = s * T
                 num_pages = cache_exec(ex).num_pages
-                kp0 = safe_kv_page(kv_pages_ref[s, 0], num_pages)
+                raw_kp0 = kv_pages_ref[s, 0]
+                kernel_debug_check(
+                    jnp.logical_and(raw_kp0 >= 0, raw_kp0 < num_pages),
+                    "KV scatter page index outside [0, num_pages)",
+                    interpret=bool(interpret),
+                )
+                kp0 = safe_kv_page(raw_kp0, num_pages)
                 same_page = jnp.bool_(True)
                 for t in range(1, T):
+                    raw_kpt = kv_pages_ref[s, t]
+                    kernel_debug_check(
+                        jnp.logical_and(raw_kpt >= 0, raw_kpt < num_pages),
+                        "KV scatter page index outside [0, num_pages)",
+                        interpret=bool(interpret),
+                    )
                     same_page = jnp.logical_and(
                         same_page,
-                        safe_kv_page(kv_pages_ref[s, t], num_pages) == kp0,
+                        safe_kv_page(raw_kpt, num_pages) == kp0,
                     )
 
                 @pl.when(same_page)
