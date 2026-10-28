@@ -63,17 +63,21 @@ def scatter_gdn_ckpts_fast(
     layout: Qwen38GdnPoolLayout,
     interpret: bool = False,
     ring: int = RING,
+    prefetch: int = 1,
 ) -> Any:
     """Same contract as `scatter_gdn_ckpts` (per-rank arrays); returns the pool.
 
-    `ring` staging slots: checkpoint `i + 1` is loaded while `i` is converted,
-    and up to `ring` pool writes are in flight. Checkpoints addressed to the
+    `ring` staging slots: checkpoints `i + 1 .. i + prefetch` are loaded while `i` is
+    converted, and up to `ring` pool writes are in flight (`prefetch < ring`; 1 keeps one
+    load in flight, which leaves each step waiting on its own load's latency). Checkpoints addressed to the
     null block 0 (rows with no request, every row of a shadow call) are not
     written, as the stock pooled GDN kernel moves no bytes for padded rows:
     the null block's pages are also read (masked) as KV, and f32 state bytes
     there would carry FP8 NaN encodings.
     """
     RING_ = ring
+    P = prefetch
+    assert 1 <= P < RING_, (prefetch, ring)
     NL, NS, T = write_blocks.shape
     n = NL * NS * T
     vh, KD, VD, QKV = layout.n_v, layout.d_k, layout.d_v, layout.conv_dim
@@ -110,25 +114,27 @@ def scatter_gdn_ckpts_fast(
                 pltpu.make_async_copy(win_ref.at[i], cin.at[slot], sin.at[slot, 1]),
             )
 
-        for c in in_copies(0, 0):
-            c.start()
+        for k in range(min(P, n)):
+            for c in in_copies(k, k):
+                c.start()
 
         def body(i, carry):
             slot = lax.rem(i, RING_)
-            nslot = lax.rem(i + 1, RING_)
+            ahead = i + P
+            nslot = lax.rem(ahead, RING_)
 
-            # Slot `nslot` is reused by checkpoint i + 1: its write from
-            # i + 1 - RING must have landed before the prefetch overwrites it.
-            prev = ids_ref[jnp.maximum(i + 1 - RING_, 0)]
+            # Slot `nslot` is reused by checkpoint i + P: its write from
+            # i + P - RING must have landed before the prefetch overwrites it.
+            prev = ids_ref[jnp.clip(ahead - RING_, 0, n - 1)]
 
-            @pl.when((i + 1 >= RING_) & (prev != 0))
+            @pl.when((ahead >= RING_) & (ahead < n + RING_) & (prev != 0))
             def _():
                 for c in out_copies(nslot, prev):
                     c.wait()
 
-            @pl.when(i + 1 < n)
+            @pl.when(ahead < n)
             def _():
-                for c in in_copies(jnp.minimum(i + 1, n - 1), nslot):
+                for c in in_copies(jnp.minimum(ahead, n - 1), nslot):
                     c.start()
 
             for c in in_copies(i, slot):
@@ -154,9 +160,9 @@ def scatter_gdn_ckpts_fast(
             return carry
 
         lax.fori_loop(0, n, body, 0)
-        # Writes not yet waited on: the last RING - 1 checkpoints (the loop waits
-        # for i + 1 - RING when it reuses a slot).
-        for k in range(max(0, n - RING_ + 1), n):
+        # Writes not yet waited on: the last RING - P checkpoints (the loop waits
+        # for i + P - RING when it reuses a slot).
+        for k in range(max(0, n - RING_ + P), n):
 
             @pl.when(ids_ref[k] != 0)
             def _():

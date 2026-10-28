@@ -53,11 +53,13 @@ for NS in (2, 4, 8, 16):
         jax.jit(lambda p, c, r, w: gs.scatter_gdn_ckpts(p, c, r, w, layout=lay), donate_argnums=0),
         pool, conv, rec, wb,
     )
-    for ring in (4, 8):
+    for ring, pf in ((4, 1), (8, 1), (4, 2), (4, 3), (8, 3), (8, 6), (12, 6), (12, 10), (16, 12)):
         pool = jnp.zeros(shape, jnp.float8_e4m3fn)
-        out[f"fast_r{ring}_us"] = timed(
+        out[f"fast_r{ring}_p{pf}_us"] = timed(
             jax.jit(
-                lambda p, c, r, w, ring=ring: scatter_gdn_ckpts_fast(p, c, r, w, layout=lay, ring=ring),
+                lambda p, c, r, w, ring=ring, pf=pf: scatter_gdn_ckpts_fast(
+                    p, c, r, w, layout=lay, ring=ring, prefetch=pf
+                ),
                 donate_argnums=0,
             ),
             pool, conv, rec, wb,
