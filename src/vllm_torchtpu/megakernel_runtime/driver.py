@@ -145,35 +145,44 @@ def _get_pallas_mesh_fn() -> Any:
     return get_pallas_mesh
 
 
-def _build_tp_rank_mesh(r_cnt: int, fallback_mesh: Any = None) -> Any | None:
+class MeshDecline(Exception):
+    """`_build_tp_rank_mesh` can't build a correctly ordered TP mesh."""
+
+    def __init__(self, result: _rt.EligibilityResult) -> None:
+        super().__init__(result.message)
+        self.result = result
+
+
+def _build_tp_rank_mesh(r_cnt: int, fallback_mesh: Any = None) -> Any:
     """Build an `r_cnt`-device JAX `Mesh` with axis `'tp'` in TP-rank order.
 
     With `torch_tpu` this is always its Pallas mesh: `torch_tpu` binds
     partition `p` to TP rank `p` and requires every Pallas kernel in a program
     to share one device assignment, while the runner mesh may list the devices
     in another order (e.g. ICI ring order), which would send the megakernel's
-    remote DMAs, addressed by mesh position, to the wrong peers. Returns `None`
-    (the caller declines) when `torch_tpu` is present but its mesh is
-    unavailable or doesn't hold `r_cnt` devices. Without `torch_tpu` (CPU), the
-    runner mesh is used, then `jax.devices()`.
+    remote DMAs, addressed by mesh position, to the wrong peers. Raises
+    `MeshDecline` (`pallas_mesh_unavailable` / `pallas_mesh_mismatch`) when
+    `torch_tpu` is present but its mesh is unavailable or doesn't hold `r_cnt`
+    devices on axis `'tp'`. Without `torch_tpu` (CPU), the runner mesh is used,
+    then `jax.devices()`.
     """
     get_pallas_mesh = _get_pallas_mesh_fn()
     if get_pallas_mesh is not None:
         try:
             pallas_mesh = get_pallas_mesh(axis_names=("tp",))
         except Exception as exc:
-            logger.warning("Megakernel: get_pallas_mesh failed (%s); skipping.", exc)
-            return None
+            msg = f"Megakernel: get_pallas_mesh failed ({exc}); skipping."
+            raise MeshDecline(
+                _rt.EligibilityResult(False, "pallas_mesh_unavailable", msg)
+            ) from exc
         n_dev = int(pallas_mesh.devices.size)
-        if n_dev != r_cnt or tuple(pallas_mesh.axis_names) != ("tp",):
-            logger.warning(
-                "Megakernel: the Pallas mesh has %d devices on axes %s, expected "
-                "%d on ('tp',); skipping.",
-                n_dev,
-                tuple(pallas_mesh.axis_names),
-                r_cnt,
+        axes = tuple(pallas_mesh.axis_names)
+        if n_dev != r_cnt or axes != ("tp",):
+            msg = (
+                f"Megakernel: the Pallas mesh has {n_dev} devices on axes {axes}, "
+                f"expected {r_cnt} on ('tp',); skipping."
             )
-            return None
+            raise MeshDecline(_rt.EligibilityResult(False, "pallas_mesh_mismatch", msg))
         return pallas_mesh
     fb_devs = getattr(fallback_mesh, "devices", None)
     if fb_devs is not None and int(fb_devs.size) == r_cnt:
@@ -357,6 +366,59 @@ def _runner_hf_config(runner: Any) -> Any:
         getattr(runner, "vllm_config", None), "model_config", None
     )
     return getattr(model_cfg, "hf_config", None) if model_cfg is not None else None
+
+
+class DeclinedDriver:
+    """Stands in for a megakernel the adapter enabled but had to decline.
+
+    Every forward falls through to the stock model and is counted as
+    `stock_<code>` in the same periodic step-mix stats a serving driver logs,
+    so the decline shows up in serving stats and not only in the startup log.
+    It holds no weights or compiled programs.
+    """
+
+    def __init__(
+        self,
+        result: _rt.EligibilityResult,
+        *,
+        tp_rank: int = 0,
+        display_name: str = "megakernel",
+        stats_period_s: float = 60.0,
+    ) -> None:
+        self.decline = result
+        self.tp_rank, self._display_name = int(tp_rank), display_name
+        self.step_mix_tracker = _rt.StepMixTracker(period_s=float(stats_period_s))
+        self._step_key = f"stock_{result.code}"
+
+    def bind_and_warmup(self, runner: Any) -> None:
+        del runner
+        logger.warning(
+            "%s megakernel declined (%s): %s",
+            self._display_name,
+            self.decline.code,
+            self.decline.message,
+        )
+
+    def reset_stats(self) -> None:
+        self.step_mix_tracker.reset()
+
+    def try_forward(self, runner: Any, ctx: StepContext) -> tuple[bool, Any]:
+        del ctx
+        if is_suppressed(runner):
+            return False, None
+        _, summary = self.step_mix_tracker.note_step(self._step_key, False)
+        if summary is not None and self.tp_rank == 0:
+            elapsed, mk_cnt, total, pct, snap = summary
+            logger.info(
+                "%s megakernel step mix over %.0fs: %d/%d MK (%.1f%%) %s",
+                self._display_name,
+                elapsed,
+                mk_cnt,
+                total,
+                pct,
+                snap,
+            )
+        return False, None
 
 
 class MegakernelDriver:
@@ -614,8 +676,13 @@ class MegakernelDriver:
     @classmethod
     def maybe_create(
         cls, runner: Any, *, model_def: type[ModelDef] | None = None
-    ) -> MegakernelDriver | None:
-        """Create a `MegakernelDriver` for `runner` if enabled and compatible."""
+    ) -> MegakernelDriver | DeclinedDriver | None:
+        """Create a `MegakernelDriver` for `runner` if enabled and compatible.
+
+        Returns `None` when the megakernel is off or the model/config is
+        ineligible, and a `DeclinedDriver` when it is enabled and eligible but
+        the runtime environment can't host it (e.g. no usable Pallas mesh).
+        """
         cfg = _collect_runtime_config(runner)
         if not cfg["enabled"]:
             return None
@@ -670,9 +737,18 @@ class MegakernelDriver:
                 f"Invalid megakernel mode={req_mode!r}; expected 'ep' or 'tp'"
             )
         mode = req_mode if req_mode else ("ep" if loaded_ep else "tp")
-        mesh = _build_tp_rank_mesh(r_cnt, fallback_mesh=getattr(runner, "mesh", None))
-        if mesh is None:
-            return None
+        try:
+            mesh = _build_tp_rank_mesh(
+                r_cnt, fallback_mesh=getattr(runner, "mesh", None)
+            )
+        except MeshDecline as exc:
+            cls._log_startup_ineligible(exc.result)
+            return DeclinedDriver(
+                exc.result,
+                tp_rank=tp_rank,
+                display_name=mdef.display_name or str(mdef.name),
+                stats_period_s=float(cfg["stats_period_s"]),
+            )
         dev_kind = str(getattr(mesh.devices.flat[0], "device_kind", "") or "")
         owned = _rt.explicit_profile_settings(cfg)
         spec_tokens: int | None = None
@@ -1586,7 +1662,7 @@ class MegakernelDriver:
         return False, None
 
 
-def maybe_create(runner: Any) -> MegakernelDriver | None:
+def maybe_create(runner: Any) -> MegakernelDriver | DeclinedDriver | None:
     """Create a `MegakernelDriver` for `runner` if enabled for its model."""
     model_def = MegakernelDriver._resolve_model_def(runner=runner)
     if model_def is None:

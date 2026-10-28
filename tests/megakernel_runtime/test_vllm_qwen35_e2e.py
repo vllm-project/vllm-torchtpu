@@ -1635,6 +1635,88 @@ def test_maybe_create_disables_on_unsupported_tpu_chip(
         )
 
 
+def _to_namespace(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return SimpleNamespace(**{str(k): _to_namespace(v) for k, v in obj.items()})
+    if isinstance(obj, list):
+        return [_to_namespace(x) for x in obj]
+    return obj
+
+
+@pytest.mark.parametrize("bad", ["mismatch", "unavailable"])
+def test_maybe_create_declines_without_usable_pallas_mesh(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, bad: str
+) -> None:
+    """With torch_tpu but no usable Pallas mesh, `maybe_create` returns a
+    `DeclinedDriver` whose decline code shows up in the step-mix stats."""
+    import logging
+    import sys
+
+    from vllm_torchtpu import megakernel_runtime as mkr
+
+    g = _tiny_geom(L=4, att_every=4)
+    ex_base = _tiny_exec(R=8, B=4, T=1, ctx=256, num_pages=96)
+    backbone = make_synthetic_qwen35_backbone(g, ex_base)
+    backbone.layers = list(backbone.layers) * 15
+    hf_cfg = _to_namespace(
+        {
+            "model_type": "qwen3_5_moe",
+            "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+            "text_config": qwen35.DEFAULT_HF_CONFIG,
+        }
+    )
+    model_cfg = SimpleNamespace(hf_config=hf_cfg)
+    runner = SimpleNamespace(
+        model=SimpleNamespace(model=backbone),
+        model_config=model_cfg,
+        mesh=_cpu_mesh(8),
+        _unified_kv_layout=True,
+        supports_mm_inputs=False,
+        lora_config=None,
+        _pp_is_first=True,
+        _pp_is_last=True,
+        _pcp_enabled=False,
+        _dcp_enabled=False,
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=8,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+        ),
+        _dp_lockstep_enabled=lambda: False,
+        vllm_config=SimpleNamespace(
+            model_config=model_cfg,
+            additional_config={"megakernel": {"stats_period_s": 0}},
+        ),
+    )
+    fake_vllm_dist = SimpleNamespace(get_tensor_model_parallel_rank=lambda: 0)
+    monkeypatch.setitem(sys.modules, "vllm.distributed", fake_vllm_dist)
+    monkeypatch.setattr(driver_mod, "_resolve_tp_size", lambda _r: 8)
+
+    def get_pallas_mesh(**_kw: Any) -> Any:
+        if bad == "unavailable":
+            raise RuntimeError("no Pallas runtime")
+        return _cpu_mesh(4)
+
+    monkeypatch.setattr(driver_mod, "_get_pallas_mesh_fn", lambda: get_pallas_mesh)
+    monkeypatch.setattr(logging.getLogger("vllm"), "propagate", True)
+    code = f"pallas_mesh_{bad}"
+    with caplog.at_level(logging.INFO):
+        drv = MegakernelDriver.maybe_create(runner)
+        assert isinstance(drv, driver_mod.DeclinedDriver)
+        assert drv.decline.code == code and not drv.decline.eligible
+        assert "skipping" in caplog.text
+        drv.bind_and_warmup(runner)
+        ctx = StepContext(torch.zeros(2, dtype=torch.int32), torch.zeros(2))
+        with mkr.suppressed(runner):
+            assert drv.try_forward(runner, ctx) == (False, None)
+        assert drv.step_mix_tracker.counts == {}
+        caplog.clear()
+        assert drv.try_forward(runner, ctx) == (False, None)
+    # The periodic step-mix line names the decline category.
+    assert f"'stock_{code}': 1" in caplog.text
+    assert "0/1 MK" in caplog.text
+
+
 def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,

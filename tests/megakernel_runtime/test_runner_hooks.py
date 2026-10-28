@@ -99,7 +99,12 @@ def test_tp_mesh_with_torch_tpu_fails_closed(
             driver_mod, "_get_pallas_mesh_fn", _fake_pallas(pallas_mesh)
         )
     # Never falls back to the runner mesh once torch_tpu is present.
-    assert driver_mod._build_tp_rank_mesh(8, fallback_mesh=runner_mesh) is None
+    with pytest.raises(driver_mod.MeshDecline) as exc_info:
+        driver_mod._build_tp_rank_mesh(8, fallback_mesh=runner_mesh)
+    res = exc_info.value.result
+    assert not res.eligible
+    want = "pallas_mesh_unavailable" if bad == "raises" else "pallas_mesh_mismatch"
+    assert res.code == want and res.message
 
 
 def test_tp_mesh_without_torch_tpu_uses_runner_mesh_then_jax_devices(
