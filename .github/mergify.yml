@@ -29,9 +29,9 @@ pull_request_rules:
       - or:
           - 'title~=(?i)\[(?:docs?|documentation)\]'
           - 'body~=(?im)^[ \t]*[-*][ \t]+\[x\][ \t]+(?:`?\[docs?\]`?|documentation\b)'
-          - 'files~=^docs/'
-          - 'files~=(?i)(^|/)README(?:\.[^/]+)?$'
-          - 'files~=^CONTRIBUTING\.md$'
+          - and:
+              - 'files~=(?i)^(?:docs/|CONTRIBUTING\.md$|(?:.*/)?README(?:\.[^/]+)?$)'
+              - '-files~=(?i)^(?!docs/|CONTRIBUTING\.md$|(?:.*/)?README(?:\.[^/]+)?$)'
     actions:
       label:
         add: [documentation]
@@ -40,7 +40,7 @@ pull_request_rules:
     conditions:
       - -closed
       - or:
-          - 'title~=(?i)\[(?:model[ -]+support|new[ -]+model)\]'
+          - 'title~=(?i)\[(?:model(?:[ -]+support)?|new[ -]+model)\]'
           - 'body~=(?im)^[ \t]*[-*][ \t]+\[x\][ \t]+(?:`?\[model\]`?|model[ \t]+support\b)'
     actions:
       label:

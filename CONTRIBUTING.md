@@ -180,13 +180,15 @@ Three labels help with triage:
 
 Issue templates apply labels when an issue is submitted. The issue-labeling
 workflow also recognizes `[Bug]` / `[Bugfix]`, `[Doc]` / `[Docs]` /
-`[Documentation]`, and `[Model Support]` / `[New Model]` title tags on opening,
-editing, or reopening an issue. It does not search issue bodies or logs.
+`[Documentation]`, and `[Model]` / `[Model Support]` / `[New Model]` title tags
+on opening, editing, or reopening an issue. It does not search issue bodies
+or logs.
 
 Mergify labels PRs from the same title tags or checked categories in the PR
 description (`[Bugfix]`, `[Doc]`, and the existing `[Model]` category).
-Documentation paths (`docs/`, README files, and `CONTRIBUTING.md`) also
-trigger `documentation`.
+PRs changing only documentation paths (`docs/`, README files, and
+`CONTRIBUTING.md`) also trigger `documentation`. Mixed code/documentation PRs
+need an explicit documentation title tag or checked category to get that label.
 Unchecked categories do not match. Model names and model implementation paths
 alone do not automatically trigger `model-support`.
 Contributors can select a category without changing their title. Maintainers
@@ -195,12 +197,6 @@ can label unstructured reports and ambiguous cases manually.
 Both automations only add labels; they never remove existing labels. If a
 category was selected incorrectly, correct the title or checkbox before
 removing its label so automation does not add it again.
-
-Before rollout, a maintainer must ensure `bug`, `documentation`, and
-`model-support` exist under the repository's Labels settings and enable
-Mergify Workflow Automation for this repository. The new-model issue template
-uses `model-support` for new submissions. Existing open items are not
-bulk-labeled by this change.
 
 ---
 

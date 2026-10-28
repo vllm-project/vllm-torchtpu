@@ -40,7 +40,7 @@ jobs:
             const rules = [
               ['bug', /\[bug(?:fix)?\]/i],
               ['documentation', /\[(?:docs?|documentation)\]/i],
-              ['model-support', /\[(?:model[ -]+support|new[ -]+model)\]/i],
+              ['model-support', /\[(?:model(?:[ -]+support)?|new[ -]+model)\]/i],
             ];
             const existing = new Set(issue.labels.map(label => label.name));
             const labels = rules
