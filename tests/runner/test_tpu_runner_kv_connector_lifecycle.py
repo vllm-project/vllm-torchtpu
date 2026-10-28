@@ -100,6 +100,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
         _mtp_prefill_only=False,
         _fence_spec_kv_under_token_copy=fence,
         _is_dspark_pd_producer=False,
+        _adaptive_verification=None,
         is_pooling_model=False,
         drafter=SimpleNamespace(),
         spec_decode_manager=SimpleNamespace(propose_draft_token_ids=propose),
