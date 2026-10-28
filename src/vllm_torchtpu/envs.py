@@ -230,6 +230,8 @@ if TYPE_CHECKING:
     VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS: int = 33554432
     VLLM_TPU_SEGMENT_TOKENIZE_VERIFY: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
+    VLLM_TPU_RAIDEN_STORE_ON_EVICT: bool = False
+    VLLM_TPU_RAIDEN_COLD_FRONTIER_BLOCKS: int = 2048
     VLLM_TPU_WARM_SPEC_LOGITS_LENGTHS: bool = True
     VLLM_TPU_PLE_HOST_FAST_LOOKUP: bool = False
     VLLM_TPU_PLE_HOST_TIMING: bool = False
@@ -1474,6 +1476,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   - EP-DP lockstep: run_dp_dummy_draft only replays the per-step
     #     collective trace.
     "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP"),
+    # Raiden KV offload: hold store jobs until one of their blocks reaches the
+    # LRU head of the device free queue (the first COLD_FRONTIER_BLOCKS free
+    # blocks), so the host tier keeps what the device evicts (raiden_connector).
+    "VLLM_TPU_RAIDEN_STORE_ON_EVICT": env_bool("VLLM_TPU_RAIDEN_STORE_ON_EVICT"),
+    "VLLM_TPU_RAIDEN_COLD_FRONTIER_BLOCKS": env_nonnegative_int(
+        "VLLM_TPU_RAIDEN_COLD_FRONTIER_BLOCKS", 2048
+    ),
     # Precompile compute_selected_logits under no_grad (as served) and at the
     # spec-verify logits lengths (num_tokens_paddings up to
     # max_num_reqs * (K + 1)). 0 restores the old warm-up.

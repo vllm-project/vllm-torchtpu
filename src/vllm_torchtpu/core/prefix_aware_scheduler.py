@@ -40,6 +40,8 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.request import Request
 
+from vllm_torchtpu import envs
+
 logger = init_logger("vllm." + __name__)
 
 _LOG_EVERY = 1000
@@ -61,6 +63,11 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._paw_cold_tokens = 0
         self._paw_prompt_tokens = 0
         self._paw_scoring_broken = False
+
+        if envs.VLLM_TPU_RAIDEN_STORE_ON_EVICT:
+            from vllm_torchtpu.offload.raiden_connector import register_block_pool
+
+            register_block_pool(self.kv_cache_manager.block_pool)
 
         logger.info("PrefixAwareScheduler ACTIVE (window=%d)", self.WINDOW)
 
