@@ -76,12 +76,16 @@ def _xla_option_overrides() -> dict[str, bool | int | float | str]:
 def _option_value(text: str) -> bool | int | float | str:
     if text in ("true", "false"):
         return text == "true"
-    for parse in (int, float):
-        try:
-            return parse(text)
-        except ValueError:
-            pass
-    return text
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        number = float(text)
+    except ValueError:
+        return text
+    # JSON has no infinity or NaN.
+    return number if math.isfinite(number) else text
 
 
 def _axis_sizes(cfg: api.TextOnlyLLMExportConfig) -> dict[str, int]:
