@@ -1187,4 +1187,7 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         if identity is not None:
             self.pd_loaded_weight_identity = identity.finish()
             self.pd_loaded_ple_identity = identity.finish(name_fragment=".ple.")
+        for module in self.modules():
+            if isinstance(module, GatedResidual):
+                module.prepare_decode_weights()
         return set(dict(self.named_parameters()))

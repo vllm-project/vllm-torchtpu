@@ -109,6 +109,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_COMPACT_SCHEDULE: bool = False
     VLLM_TPU_QSA_DECODE_RPA_BKV: int = 256
     VLLM_TPU_QSA_DECODE_POOL_PAGE_TABLE: bool = False
+    VLLM_TPU_HC_FOLD_INJECT: bool = False
     VLLM_TPU_QSA_DECODE_POOL_PAGE_DMA: bool = False
     VLLM_TPU_QSA_INDEXER_SC_BOUNDED_COPY: bool = False
     VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY: bool = False
@@ -638,6 +639,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_DECODE_POOL_PAGE_TABLE": env_bool(
         "VLLM_TPU_QSA_DECODE_POOL_PAGE_TABLE", default=False
     ),
+    # Qwen4-exp HC (unfused path): compute the down projection and the
+    # injection logits in one matmul over a folded weight, and the norm's
+    # (1 + w) once in FP32 at load. Same per-column products; costs one extra
+    # copy of each HC's down + inject weights in HBM.
+    "VLLM_TPU_HC_FOLD_INJECT": env_bool("VLLM_TPU_HC_FOLD_INJECT", default=False),
     # With the pool-page table: when the decode KV block holds whole pool
     # pages (VLLM_TPU_QSA_DECODE_KV_BLOCK a multiple of 13 kernel pages x 32
     # keys, e.g. 3328), DMA each pool page's consecutive kernel pages at once

@@ -428,4 +428,7 @@ class Qwen4ExpMTP(nn.Module):
         }
         if missing:
             raise ValueError(f"Incomplete Qwen4Exp MTP checkpoint: {sorted(missing)}")
+        for module in self.modules():
+            if isinstance(module, GatedResidual):
+                module.prepare_decode_weights()
         return set(parameters)
