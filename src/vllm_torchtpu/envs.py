@@ -7,6 +7,43 @@ import sys
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+for _k, _v in {
+    "VLLM_TPU_DSV4_INDEXER_KV_LAYOUT": "sal",
+    "VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL": "1",
+    "VLLM_TPU_DSV4_MHC_FUSE_NORM": "1",
+    "TPU_STREAMIDX_STRICT_CAUSAL": "1",
+    "TPU_TOKEN_BUCKET_EXTRA": "8,24",
+    "TPU_SMALL_ALL_REDUCE": "1",
+    "TPU_STREAMIDX_SPLIT_MIXED_MIN_TOKENS": "128",
+    "TPU_DSV4_CSA_GATHER_NO_PAD": "1",
+    "TPU_DSPARK_VOCAB_PARALLEL_MARKOV": "1",
+    "TPU_DSPARK_SHARDED_CONTEXT_KV": "1",
+    "MOE_FUSED_EP_V2_MERGED_EXCHANGE": "1",
+    "MOE_FUSED_EP_V2_PALLAS_PLAN": "1",
+    "MOE_FUSED_EP_V2_DECODE_COMBINE": "1",
+    "MOE_FUSED_EP_V2_PALLAS_RESTORE": "1",
+    "MOE_FUSED_EP_V2_FUSED_SELECT": "1",
+    "TPU_DSV4_SC_TOPK_ONE_LAUNCH": "1",
+    "TPU_DSV4_SC_TOPK_COOP_MAX_ROWS": "16",
+    "TPU_FP8_LINEAR_PALLAS": "1",
+    "TPU_FP8_SKINNY_HBM_PIN_SITES": (
+        "attn.fused_wqa_wkv,attn.wq_b,attn.wo_b,shared_experts.gate_up_proj"
+    ),
+    "TPU_SAMPLER_FUSED_CHAIN": "1",
+    "TPU_SAMPLER_GRAPH_RNG": "1",
+    "TPU_LM_HEAD_HBM": "drafter",
+    "TPU_DSV4_INDEXER_KV_SPLIT_MIN_TOKENS": "128",
+    "TPU_DSV4_CSA_MASKED_DENSE_MAX_KV": "8192",
+    "TPU_DSV4_INDEXER_KV_SPLIT_A2A": "1",
+    "TPU_DSV4_HCA_MIXED_Q_BLOCK": "128",
+    "TPU_DSV4_HCA_MLA_PIPELINED": "1",
+    "TPU_DSV4_SWA_PADDED_LM": "1",
+    "TPU_DSV4_FUSED_QKV_ROPE": "1",
+    "TPU_BLOCK_HASH_REUSE": "1",
+    "TPU_REQUEST_TIMING_LOG": "1",
+}.items():
+    os.environ.setdefault(_k, _v)
+
 if TYPE_CHECKING:
     TPU_K3_SP_PREFILL: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0

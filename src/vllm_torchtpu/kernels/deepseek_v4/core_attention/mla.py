@@ -24,6 +24,30 @@ from jax.experimental.pallas import tpu as pltpu
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
+# Softmax is evaluated in base 2: exp(x) == exp2(x * log2(e)), allowing the
+# score scale and log2(e) to be folded into the post-max `- m_curr` FMA.
+_LOG2E = 1.4426950408889634
+
+# Number of independent FlashAttention-2 query-row chains per (bq, bkv) step
+# emitted stage-major so MXU (QK, PV) and VPU (max, exp2, sum, rescale) overlap.
+_PSPLIT = 4
+_PSPLIT_WIDE = 8
+_PSPLIT_WIDE_TILE = 16 * 1024 * 1024
+
+
+def _lane_fold(x, op):
+    """Folds a [..., rows, W] tile down to [..., rows, 128] with W/128 whole-vreg ops."""
+    w = x.shape[-1]
+    if w <= 128 or w % 128:
+        return x
+    parts = [x[..., j * 128 : (j + 1) * 128] for j in range(w // 128)]
+    while len(parts) > 1:
+        nxt = [op(parts[i], parts[i + 1]) for i in range(0, len(parts) - 1, 2)]
+        if len(parts) % 2:
+            nxt.append(parts[-1])
+        parts = nxt
+    return parts[0]
+
 
 def cdiv(a, b):
     assert b != 0
@@ -159,24 +183,24 @@ def _mla_ragged_paged_attention_kernel(
         head_m_ref = m_ref.at[:, : q.shape[1]]
         head_acc_ref = acc_ref.at[:, : q.shape[1]]
 
-        # Follow FlashAttention-2 forward pass.
+        # Follow FlashAttention-2 forward pass in base 2 with post-max scale folding.
+        scale = sm_scale * _LOG2E
         s = jnp.einsum("bnd,bmd->bnm", q, kv, preferred_element_type=jnp.float32)
-        s *= sm_scale
 
-        k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(jnp.int32, s.shape, 2)
-        mask = kv_lens_to_attend_segment.reshape(s.shape) <= k_span
+        k_span = lax.broadcasted_iota(jnp.int32, s.shape, 2)
+        seg = kv_lens_to_attend_segment.reshape(batch_size, q.shape[1], 1)
+        s = jnp.where(seg - bkv_idx * bkv_sz <= k_span, -1e30, s)
 
-        s = jnp.where(mask, jnp.finfo(s.dtype).min, s)
-        s_rowmax = jnp.max(s, axis=2)
+        s_rowmax = scale * jnp.max(_lane_fold(s, jnp.maximum), axis=2)
         m_prev = head_m_ref[...]
         m_curr = jnp.maximum(m_prev, s_rowmax)
         head_m_ref[...] = m_curr
-        p = jnp.exp(s - m_curr[:, :, None])
+        p = jnp.exp2(s * scale - m_curr[:, :, None])
 
         pv = jnp.einsum("bnm,bmd->bnd", p, kv, preferred_element_type=jnp.float32)
 
-        p_rowsum = jnp.sum(p, axis=2)
-        exp_m_diff = jnp.exp(m_prev - m_curr)
+        p_rowsum = jnp.sum(_lane_fold(p, jnp.add), axis=2)
+        exp_m_diff = jnp.exp2(m_prev - m_curr)
         l_prev = head_l_ref[...]
         l_curr = exp_m_diff * l_prev + p_rowsum
         head_l_ref[...] = l_curr
@@ -397,7 +421,7 @@ def _mla_ragged_paged_attention_kernel(
                     )
                 )
             l_ref[...] = jnp.stack(bl_list)
-            m_ref[...] = jnp.stack(bm_list)
+            m_ref[...] = jnp.stack(bm_list) * _LOG2E
 
     def start_fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx, enabled=True):
         return _fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx, enabled=enabled)
@@ -471,7 +495,10 @@ def _mla_ragged_paged_attention_kernel(
         # double-buffered DMA pipeline hands the bkv and bq semaphore across
         # sequence boundaries and assumes every sequence runs >=1 bkv and bq
         # iteration.
-        num_bkv = jnp.maximum(1, cdiv(kv_len_max, bkv_sz))
+        if bkv_p >= pages_per_seq:
+            num_bkv = 1
+        else:
+            num_bkv = jnp.maximum(1, cdiv(kv_len_max, bkv_sz))
         if static_q_len is None:
             assert batch_size == 1
             # Dynamic q length, no batching support.
@@ -481,7 +508,7 @@ def _mla_ragged_paged_attention_kernel(
             )
             num_bq = jnp.maximum(1, cdiv(q_len, bq_sz))
         else:
-            num_bq = jnp.maximum(1, cdiv(static_q_len, bq_sz))
+            num_bq = max(1, cdiv(static_q_len, bq_sz))
 
         def get_next_bq_ids(seq_idx, bq_idx, bq_sem_idx):
             next_bq_idx = bq_idx + 1
@@ -525,8 +552,8 @@ def _mla_ragged_paged_attention_kernel(
                 )
                 tokens_attend_b = jnp.broadcast_to(
                     tokens_attend[:, None, None],
-                    (bq_sz, num_q_heads, bkv_sz),
-                ).reshape(bq_sz * num_q_heads, bkv_sz)
+                    (bq_sz, num_q_heads, 1),
+                ).reshape(bq_sz * num_q_heads, 1)
                 kv_lens_to_attend_list.append(tokens_attend_b)
             kv_lens_to_attend_segment = jnp.stack(kv_lens_to_attend_list, axis=0)
 
@@ -589,20 +616,23 @@ def _mla_ragged_paged_attention_kernel(
             # Wait for cur bq if not ready yet
             wait_fetch_bq(batch_start_seq_idx, bq_idx, bq_sem_idx)
             wait_fetch_swa(batch_start_seq_idx, bq_idx, bq_sem_idx)
-            jax.lax.fori_loop(
-                0,
-                num_bkv,
-                compute_with_bkv,
-                (kv_lens_to_attend_segment,),
-                unroll=False,
-            )
+            if isinstance(num_bkv, int) and num_bkv == 1:
+                compute_with_bkv(0, (kv_lens_to_attend_segment,))
+            else:
+                jax.lax.fori_loop(
+                    0,
+                    num_bkv,
+                    compute_with_bkv,
+                    (kv_lens_to_attend_segment,),
+                    unroll=False,
+                )
 
             # Load acc and calculate final output.
             acc = acc_ref[...]
             attention_sinks = jnp.concat(
-                [attention_sinks_ref[...] for _ in range(bq_sz)]
+                [attention_sinks_ref[...] * _LOG2E for _ in range(bq_sz)]
             )
-            exp_attention_sinks = jnp.exp(attention_sinks[None, :] - m_ref[...])
+            exp_attention_sinks = jnp.exp2(attention_sinks[None, :] - m_ref[...])
             l_sum = l_ref[...] + exp_attention_sinks
             out = (
                 lax.div(acc, l_sum[:, :, None])
@@ -631,7 +661,10 @@ def _mla_ragged_paged_attention_kernel(
             # Send cur bo
             start_send_bo(batch_start_seq_idx, bq_idx, bo_sem_idx)
 
-        lax.fori_loop(0, num_bq, compute_with_bq, None, unroll=False)
+        if isinstance(num_bq, int) and num_bq == 1:
+            compute_with_bq(0, None)
+        else:
+            lax.fori_loop(0, num_bq, compute_with_bq, None, unroll=False)
 
     ### ------- Kernel start ------- ###
 

@@ -1320,7 +1320,6 @@ def _wrap_block_scale_weight_loader(weight_loader: Callable) -> Callable:
     return _wrapped
 
 
-@register_weight_loader_v2_supported_method
 def _site_listed(prefix: str, sites: str) -> bool:
     """`prefix` ends with one of the comma-separated `sites`, "."-bounded."""
     return any(
@@ -1359,6 +1358,7 @@ def _arm_fp8_linear_pallas(layer: torch.nn.Module, prefix: str) -> None:
     )
 
 
+@register_weight_loader_v2_supported_method
 class VllmFp8LinearMethodTPU(Fp8LinearMethod):
     """
     TPU FP8 linear method that keeps weights in FP8 at runtime and quantizes

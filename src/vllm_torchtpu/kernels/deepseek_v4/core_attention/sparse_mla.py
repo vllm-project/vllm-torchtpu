@@ -25,6 +25,22 @@ from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_gather
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
+_LOG2E = 1.4426950408889634
+
+
+def _lane_fold(x, op):
+    """Folds a [..., rows, W] tile down to [..., rows, 128] with W/128 whole-vreg ops."""
+    w = x.shape[-1]
+    if w <= 128 or w % 128:
+        return x
+    parts = [x[..., j * 128 : (j + 1) * 128] for j in range(w // 128)]
+    while len(parts) > 1:
+        nxt = [op(parts[i], parts[i + 1]) for i in range(0, len(parts) - 1, 2)]
+        if len(parts) % 2:
+            nxt.append(parts[-1])
+        parts = nxt
+    return parts[0]
+
 
 def cdiv(a, b):
     assert b != 0
@@ -247,22 +263,22 @@ def _attention_kernel(
         assert q.shape[1] == head_dim
         assert kv.shape == (bkv_sz, head_dim)
 
-        # Follow FlashAttention-2 forward pass.
+        scale = sm_scale * _LOG2E
+        # Follow FlashAttention-2 forward pass in base 2 with post-max scale folding.
         s = jnp.einsum("nd,md->nm", q, kv, preferred_element_type=jnp.float32)
-        s *= sm_scale
         if masked:
             k_span = lax.broadcasted_iota(jnp.int32, s.shape, 1)
-            s = jnp.where(k_span < kv_len, s, jnp.finfo(s.dtype).min)
+            s = jnp.where(k_span < kv_len, s, -1e30)
 
-        s_rowmax = jnp.max(s, axis=1, keepdims=True)
+        s_rowmax = scale * jnp.max(_lane_fold(s, jnp.maximum), axis=1, keepdims=True)
         m_prev = swa_m
         m_curr = jnp.maximum(m_prev, s_rowmax)
-        p = jnp.exp(s - m_curr)
-        exp_m_diff = jnp.exp(m_prev - m_curr)
-        p_rowsum = jnp.sum(p, axis=1, keepdims=True)
+        p = jnp.exp2(s * scale - m_curr)
+        exp_m_diff = jnp.exp2(m_prev - m_curr)
+        p_rowsum = jnp.sum(_lane_fold(p, jnp.add), axis=1, keepdims=True)
         l_prev = swa_l
         l_curr = exp_m_diff * l_prev + p_rowsum
-        exp_attention_sinks = jnp.exp(attention_sinks - m_curr)
+        exp_attention_sinks = jnp.exp2(attention_sinks - m_curr)
         l_total = l_curr + exp_attention_sinks
 
         return p, exp_m_diff, l_total
@@ -454,7 +470,7 @@ def _attention_kernel(
     def load_swa_output(bq_sem_idx, batch_idx):
         swa_acc = swa_acc_x2_ref[bq_sem_idx, batch_idx, ...]
         swa_l = bl_x2_ref[bq_sem_idx, batch_idx, :num_q_heads][..., None]
-        swa_m = bm_x2_ref[bq_sem_idx, batch_idx, :num_q_heads][..., None]
+        swa_m = bm_x2_ref[bq_sem_idx, batch_idx, :num_q_heads][..., None] * _LOG2E
         return swa_acc, swa_l, swa_m
 
     def process(masked):
@@ -478,7 +494,7 @@ def _attention_kernel(
 
         bo_sem_idx = sem_ids_ref[1]
         sem_ids_ref[1] = lax.select(bo_sem_idx == 0, 1, 0)
-        attention_sinks = attention_sinks_ref[...][..., None]
+        attention_sinks = (attention_sinks_ref[...] * _LOG2E)[..., None]
 
         prev_p = None
         prev_bkv = None
