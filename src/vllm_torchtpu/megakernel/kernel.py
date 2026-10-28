@@ -42,7 +42,6 @@ from .stream import TwoRing
 from .vmem import CorePlan, build_scratch, fit_default_tiles
 
 ABLATIONS = ("dense", "experts", "kv", "gdn_state", "attn", "gdn", "comm")
-COLLECTIVE_ID = 0
 
 
 @dataclass
@@ -400,6 +399,7 @@ def build(
                 aliases[2 + n_w_leaves + s_leaf_offset] = o_names.index(k)
             s_leaf_offset += n_s_leaves
 
+    coll_id = ex.resolved_collective_id if ex.R > 1 else None
     call = pl.pallas_call(
         kernel,
         out_shape=out_shape,
@@ -408,7 +408,7 @@ def build(
         scratch_shapes=[scratch[k] for k in s_names],
         input_output_aliases=aliases,
         compiler_params=pltpu.CompilerParams(
-            collective_id=COLLECTIVE_ID if ex.R > 1 else None,
+            collective_id=coll_id,
             vmem_limit_bytes=tiles.vmem_mib * 1024 * 1024,
             disable_bounds_checks=not tiles.bounds_checks,
         ),
@@ -426,6 +426,7 @@ def build(
         "exec": ex,
         "plan": p,
         "core_plan": core_plan,
+        "collective_id": coll_id,
         "T_TOTAL": sp.T_TOTAL,
         "vmem_scratch_bytes": core_plan.vmem_bytes,
         "vmem_shapes": {

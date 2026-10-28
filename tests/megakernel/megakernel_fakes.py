@@ -382,6 +382,7 @@ EXACT_FLIPS: list[tuple[str, str, Any, tuple[int, int], dict[str, Any]]] = [
     ("bounds_checks", "bounds_checks", True, (2, 4), {}),
     ("vmem_mib", "vmem_mib", 48, (2, 4), {}),
     ("smem_mib", "smem_mib", 2, (2, 4), {}),
+    ("collective_id", "collective_id", 47, (2, 4), {}),
     ("moe_group_rows", "moe.moe_group_rows", 0, (2, 4), {"moe.moe_unroll": True}),
     # PIPE_EP path: I=512 with a 64 KiB expert bank gives T13 = 2 * T2.
     (
