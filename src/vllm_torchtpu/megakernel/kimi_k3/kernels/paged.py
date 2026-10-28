@@ -271,7 +271,8 @@ def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, 
     else:
         logits, (conv, recurrent, new_keys, new_values) = result
     # DP2 returns shard-major rows; commit each to its shard-bank index,
-    # preserving untouched slots and ordered null-slot writes.
+    # preserving untouched slots and ordered null-slot writes, unless the
+    # stack already wrote them in place.
     inplace = kda_inplace_writes(batch_size=batch_size, attention_dp=dp,
                                  sequence_rows=decode_options.get("sequence_rows", 1),
                                  slot_reads=in_place, state_row=state_row)
