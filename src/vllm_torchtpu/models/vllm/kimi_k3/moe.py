@@ -20,7 +20,10 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.intra_chip import get_intra_chip_group
 from vllm_torchtpu.layers.adapter import moe_routing
-from vllm_torchtpu.layers.adapter.latent_proj_intra_chip import make_latent_projection
+from vllm_torchtpu.layers.adapter.latent_proj_intra_chip import (
+    IntraChipColumnParallelLinear,
+    make_latent_projection,
+)
 from vllm_torchtpu.layers.adapter.moe_hierarchical import (
     hierarchical_moe_parallel_config,
     hierarchical_split_or_none,
@@ -136,7 +139,7 @@ class KimiMoE(nn.Module):
                 raise ValueError("K3 SP prefill needs a physical two-core chip group")
         elif (
             self.use_ep
-            and self.tp_size == 32
+            and self.tp_size >= 8
             and os.environ.get("TPU_K3_MOE_LATENT_AR_OVERLAP", "0") == "1"
         ):
             try:
@@ -321,7 +324,14 @@ class KimiMoE(nn.Module):
         router_logits, _ = self.gate(hidden_states)
         latent = hidden_states
         if self.routed_expert_down_proj is not None:
-            latent, _ = self.routed_expert_down_proj(latent)
+            if sequence_parallel and isinstance(
+                self.routed_expert_down_proj, IntraChipColumnParallelLinear
+            ):
+                latent, _ = self.routed_expert_down_proj(
+                    latent, sequence_parallel=True
+                )
+            else:
+                latent, _ = self.routed_expert_down_proj(latent)
         if sequence_parallel:
             weights, ids = moe_routing.route(routed, latent, router_logits)
             latent, weights, ids = group.gather_moe_inputs(
@@ -351,7 +361,14 @@ class KimiMoE(nn.Module):
         if self.routed_expert_norm is not None:
             output = self.routed_expert_norm(output)
         if self.routed_expert_up_proj is not None:
-            output, _ = self.routed_expert_up_proj(output)
+            if sequence_parallel and isinstance(
+                self.routed_expert_up_proj, IntraChipColumnParallelLinear
+            ):
+                output, _ = self.routed_expert_up_proj(
+                    output, sequence_parallel=True
+                )
+            else:
+                output, _ = self.routed_expert_up_proj(output)
         if shared_output is not None:
             output = output + shared_output
         return output

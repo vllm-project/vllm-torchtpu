@@ -1348,20 +1348,22 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
 def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
     if tuning_key in tuned_params_mapping:
         return tuned_params_mapping[tuning_key]
-    if tuning_key.case == "mixed" and tuning_key.actual_num_q_heads == 3:
-        # Kimi-K3 TP=32 fallback across arbitrary max_num_seqs / pages_per_seq /
-        # max_num_tokens buckets (e.g. max_num_seqs=16 or 32, or sub-1K token
-        # buckets). Avoid falling back to the un-tuned (1, 16) tile which
-        # fragments MXU work across 32x too many query blocks.
+    if tuning_key.case == "mixed" and tuning_key.actual_num_q_heads in (3, 6, 12):
+        # Kimi-K3 TP=32 / TP=16 / TP=8 fallback across arbitrary max_num_seqs /
+        # pages_per_seq / max_num_tokens buckets. Scale query/KV block sizes by
+        # actual_num_q_heads so TP=8 (12 heads/core) stays within the 60 MiB
+        # VMEM budget while TP=32 (3 heads/core) keeps full 512-query tiles.
         page_tokens = tuning_key.page_size_per_kv_packing * tuning_key.kv_packing
+        is_tp32 = tuning_key.actual_num_q_heads == 3
+        max_q_block = 512 if is_tp32 else 128
         if page_tokens >= 256:
             # 256- or 324-token unified-pool / large pages.
             num_kv_pages = (
                 4
-                if tuning_key.max_num_tokens <= 1024
+                if (tuning_key.max_num_tokens <= 1024 or not is_tp32)
                 else 8
             )
-            num_queries = min(512, max(64, tuning_key.max_num_tokens))
+            num_queries = min(max_q_block, max(64, tuning_key.max_num_tokens))
             q_split = 2 if num_queries >= 128 else 1
             return TunableParams(
                 num_kv_pages_per_block=min(num_kv_pages, max(1, tuning_key.pages_per_seq)),
@@ -1372,18 +1374,25 @@ def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
             )
         elif page_tokens <= 32:
             # 16-token non-pooled pages.
-            num_queries = min(512, max(64, tuning_key.max_num_tokens))
-            q_split = 4 if num_queries >= 256 else 1
+            num_queries = min(max_q_block, max(64, tuning_key.max_num_tokens))
+            if is_tp32:
+                q_split = 4 if num_queries >= 256 else 1
+                max_kv_pages = 128
+                vmem_limit = 58720256
+            else:
+                q_split = 2 if num_queries >= 128 else 1
+                max_kv_pages = 64
+                vmem_limit = 62914560
             return TunableParams(
-                num_kv_pages_per_block=min(128, max(1, tuning_key.pages_per_seq)),
+                num_kv_pages_per_block=min(max_kv_pages, max(1, tuning_key.pages_per_seq)),
                 num_queries_per_block=num_queries,
-                vmem_limit_bytes=58720256,
+                vmem_limit_bytes=vmem_limit,
                 decode_batch_size=1,
                 q_split=q_split,
             )
     if (
         tuning_key.case in ("decode", "batched_decode", "decode_only")
-        and tuning_key.actual_num_q_heads == 3
+        and tuning_key.actual_num_q_heads in (3, 6, 12)
     ):
         page_tokens = tuning_key.page_size_per_kv_packing * tuning_key.kv_packing
         decode_batch_size = (

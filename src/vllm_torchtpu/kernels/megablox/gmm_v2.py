@@ -179,6 +179,16 @@ class WeightsRef(RhsRef):
 
     def get_scale(self, replicate_size: int | None = None) -> jax.Array:
         assert self.scale is not None
+        if len(self.scale.shape) == 2:
+            # Compact scale: [num_blocks, tile_n], no degenerate sublane axis.
+            s = self.scale[...]
+            if s.dtype != jnp.float32:
+                s = s.astype(jnp.float32)
+            if replicate_size is None:
+                return s
+            return jnp.broadcast_to(
+                s[:, None, :], (s.shape[0], replicate_size, s.shape[1])
+            )
         if replicate_size is not None:
             # Perform zero-stride load for efficient broadcasting across sublanes.
             return self.scale[:, pl.ds(0, replicate_size, 0), :]
@@ -245,6 +255,8 @@ class InputConfigs:
     dtype: jnp.dtype
     has_bias: bool = False
     has_scale: bool = False
+    # True when the scale is stored [G, blocks, N] rather than [G, blocks, 1, N].
+    scale_is_compact: bool = False
 
     @property
     def should_unpack(self) -> bool:
@@ -330,6 +342,8 @@ class IndexMaps:
         k_row = k_id * self.cfgs.tiles.tile_k
         b_row = k_row // self.cfgs.rhs_cfgs.quant_block_size
         b_tile_id = b_row // self.cfgs.num_quant_blocks_per_tile_k
+        if self.cfgs.rhs_cfgs.scale_is_compact:
+            return (group_id, b_tile_id, n_id)
         return (group_id, b_tile_id, 0, n_id)
 
     def out_index_map(self, n_id: jax.Array, gm_id: jax.Array, _: jax.Array):
@@ -371,8 +385,13 @@ def generate_block_specs(
             index_map.rhs_bias_index_map,
         )
     if cfgs.rhs_cfgs.has_scale:
+        scale_block = (
+            (None, cfgs.num_quant_blocks_per_tile_k, cfgs.tiles.tile_n)
+            if cfgs.rhs_cfgs.scale_is_compact
+            else (None, cfgs.num_quant_blocks_per_tile_k, 1, cfgs.tiles.tile_n)
+        )
         rhs_scale_block_spec = pl.BlockSpec(
-            (None, cfgs.num_quant_blocks_per_tile_k, 1, cfgs.tiles.tile_n),
+            scale_block,
             index_map.rhs_scale_index_map,
         )
 
@@ -1077,7 +1096,10 @@ def validate_inputs(
         assert rhs_bias.shape == (size_group, 1, size_n)
     if rhs_scale is not None:
         num_quant_blocks = rhs_scale.shape[1]
-        assert rhs_scale.shape == (size_group, num_quant_blocks, 1, size_n)
+        assert rhs_scale.shape in (
+            (size_group, num_quant_blocks, size_n),
+            (size_group, num_quant_blocks, 1, size_n),
+        )
         assert size_k % num_quant_blocks == 0
 
     assert group_offset.shape == (1,)
@@ -1177,11 +1199,13 @@ def make_gmm_configs(
         packing_factor,
     )
 
+    scale_is_compact = False
     if rhs_scale is not None:
         has_scale = True
         rhs_quant_dtype = rhs_quant_dtype or rhs.dtype
         num_blocks = rhs_scale.shape[1]
         block_size = dims.size_k // num_blocks
+        scale_is_compact = rhs_scale.ndim == 3
     else:
         has_scale = False
         block_size = dims.size_k
@@ -1192,6 +1216,7 @@ def make_gmm_configs(
         dtype=rhs.dtype,
         has_bias=rhs_bias is not None,
         has_scale=has_scale,
+        scale_is_compact=scale_is_compact,
     )
 
     lhs_q_dtype = None
@@ -1362,7 +1387,10 @@ def gmm_v2(
     # Prepare block specs.
     rhs_scale_spec = rhs_bias_spec = None
     if rhs_scale is not None:
-        rhs_scale = rhs_scale.astype(jnp.float32)
+        # Deliberately NOT `.astype(jnp.float32)` here: this is outside the
+        # Pallas call and the operand is HBM-pinned, so an upcast materialises
+        # the whole array in HBM and a narrow stored scale saves nothing.
+        # WeightsRef.get_scale widens per tile in VMEM instead.
         rhs_scale_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     if rhs_bias is not None:
         rhs_bias = rhs_bias.astype(jnp.float32)

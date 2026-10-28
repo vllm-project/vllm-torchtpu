@@ -202,8 +202,25 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
                 # gmm_v2 scale layout: [E, num_blocks, 1, N]
                 return _fresh(scale.movedim(-1, 1).unsqueeze(-2))
 
-            w13_scale_4d = _to_kernel_scale(w13_scale)
-            w2_scale_4d = _to_kernel_scale(w2_scale)
+            def _to_compact_scale(
+                u8: torch.Tensor, dtype: torch.dtype
+            ) -> torch.Tensor:
+                if dtype == torch.float8_e8m0fnu:
+                    return _fresh(u8.movedim(-1, 1).view(torch.float8_e8m0fnu))
+                return _fresh(e8m0_to_fp32(u8).movedim(-1, 1).to(dtype))
+
+            compact = envs.TPU_MOE_COMPACT_SCALE
+            if compact != "off":
+                narrow = (
+                    torch.float8_e8m0fnu
+                    if compact == "e8m0"
+                    else torch.bfloat16
+                )
+                w13_scale_4d = _to_compact_scale(w13_weight_scale, narrow)
+                w2_scale_4d = _to_compact_scale(w2_weight_scale, narrow)
+            else:
+                w13_scale_4d = _to_kernel_scale(w13_scale)
+                w2_scale_4d = _to_kernel_scale(w2_scale)
 
             # Unpack to native fp4 in the kernel's K-major layout once at load
             # [E, N, K/2] uint8 -> [E, K/2, N] torch.float4_e2m1fn_x2

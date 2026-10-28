@@ -80,10 +80,18 @@ class IntraChipColumnParallelLinear(ColumnParallelLinear):
     def forward(  # type: ignore[override]
         self,
         input_: torch.Tensor,
+        *,
+        sequence_parallel: bool = False,
     ) -> tuple[torch.Tensor, torch.nn.Parameter | None]:
+        if sequence_parallel:
+            input_ = self._chip_group.all_gather(input_, dim=0)
         bias = self.bias if not self.skip_bias_add else None
         output_parallel = self.quant_method.apply(self, input_, bias)
         output = self._chip_group.all_gather(output_parallel, dim=-1)
+        if sequence_parallel:
+            output = output.chunk(self._chip_group.world_size, dim=0)[
+                self._chip_group.rank_in_group
+            ].contiguous()
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
@@ -129,6 +137,42 @@ def shard_group_or_none(output_size: int):
     return group
 
 
+FP8_BLOCK = 128
+
+
+def _blockwise_fp8_config():
+    """fp8 whose scale is blockwise, so `quantized_matmul` reaches ``gmm_v2``."""
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config
+
+    class _BlockwiseFp8Config(VllmFp8Config):
+
+        def get_linear_config(self, layer):
+            config = super().get_linear_config(layer)
+            config.enable_quantized_matmul_kernel = True
+            config.requant_block_size = FP8_BLOCK
+            return config
+
+    return _BlockwiseFp8Config(
+        is_checkpoint_fp8_serialized=False,
+        activation_scheme="dynamic",
+    )
+
+
+def fp8_quant_config_or(
+    quant_config: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    """Under ``TPU_K3_FP8_LATENT_PROJ``, quantize the projection to fp8 at load."""
+    if quant_config is not None or not envs.TPU_K3_FP8_LATENT_PROJ:
+        return quant_config
+    logger.info_once(
+        "Latent MoE projections quantized to fp8 at load, blockwise at %d "
+        "(TPU_K3_FP8_LATENT_PROJ). This is lossy: e4m3 carries 3 mantissa "
+        "bits against bf16's 7.",
+        FP8_BLOCK,
+    )
+    return _blockwise_fp8_config()
+
+
 def make_latent_projection(
     input_size: int,
     output_size: int,
@@ -138,6 +182,7 @@ def make_latent_projection(
     prefix: str,
 ) -> ReplicatedLinear | IntraChipColumnParallelLinear:
     """The intra-chip sharded projection when it applies, else the replicated one."""
+    quant_config = fp8_quant_config_or(quant_config)
     group = shard_group_or_none(output_size)
     if group is None:
         return ReplicatedLinear(

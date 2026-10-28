@@ -42,7 +42,10 @@ from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import (
     build_kimi_dispatched_kda_op,
     build_kimi_pooled_kda_op,
 )
-from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    WEIGHT_FLIPPED_ATTR,
+)
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.sequence_layout import (
     is_pcp_streaming_attention_metadata,
@@ -505,6 +508,8 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 quant_config=quant_config,
                 prefix=f"{prefix}.g_proj",
             )
+            if envs.TPU_KDA_GPROJ_LAYOUT == "head_major":
+                setattr(self.g_proj, KEEP_VLLM_LAYOUT_ATTR, True)
         else:
             self.fused_fa_ga_proj = MergedColumnParallelLinear(
                 config.hidden_size,

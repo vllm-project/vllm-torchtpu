@@ -289,7 +289,9 @@ class KimiModel(nn.Module):
         num_tokens = hidden_states.shape[0]
         sequence_parallel = (
             self.sp_prefill
-            and num_tokens > 0
+            and num_tokens >= 1024
+            and (num_tokens == 1024 or num_tokens % 2048 == 0)
+            and num_tokens <= 8192
             and num_tokens % self.sp_group.world_size == 0
         )
         if sequence_parallel:
@@ -519,10 +521,16 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         # 944 GB host at 8 ranks before loading finishes). Lazily interleaving
         # expert dispatch with AutoWeightsLoader consumption frees each host
         # tensor as soon as its parameter is loaded.
+        num_layers = len(self.model.layers)
+
         def _ordinary_weights():
             for name, loaded_weight in mapper.apply(weights):
                 if name.startswith(("vision_tower.", "mm_projector.")):
                     continue
+                if name.startswith("model.layers."):
+                    layer_idx_str = name.split(".", 3)[2]
+                    if layer_idx_str.isdecimal() and int(layer_idx_str) >= num_layers:
+                        continue
                 if experts_use_weight and name.endswith(".weight_packed"):
                     name = name.replace(".weight_packed", ".weight")
 

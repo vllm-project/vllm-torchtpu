@@ -65,9 +65,12 @@ if TYPE_CHECKING:
     TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
+    TPU_KDA_GPROJ_LAYOUT: str = "head_major"
+    TPU_MOE_COMPACT_SCALE: str = "off"
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
+    TPU_MOE_COUNTING_SORT: bool = False
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
@@ -75,6 +78,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
+    TPU_K3_FP8_LATENT_PROJ: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
@@ -361,6 +365,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_GDN_CONV_QK_PAIR_LAYOUT": env_bool(
         "TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False
     ),
+    # How KDA's full-rank output-gate weight (`g_proj`) is stored. Its
+    # consumer reads the gate head-major, as [heads, head_dim, hidden], which
+    # is bitwise vLLM's [n_out, n_in] and is not the canonical (k, n) layout
+    # every other dense weight takes; storing it (k, n) costs a full transpose
+    # of the 5.5 MB weight on every KDA layer on every step. "canonical"
+    # restores that, as the paired control for measuring the difference.
+    "TPU_KDA_GPROJ_LAYOUT": env_with_choices(
+        "TPU_KDA_GPROJ_LAYOUT", "head_major", ["head_major", "canonical"]
+    ),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4
     # eval config turns it on, since a prefilled assistant turn needs it.
@@ -596,6 +609,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     else None,
     # Skip padded tokens from MoE, otherwise they will route like
     # real tokens and activate experts whose output is thrown away.
+    # MXFP4 routed-expert scales: "off" keeps the shipped f32 [E, blocks, 1, N]
+    # layout; "e8m0" and "bf16" store [E, blocks, N] in the narrow dtype and let
+    # gmm_v2 widen per tile in VMEM. Lossless either way -- E8M0 values are
+    # powers of two -- and it removes 20% (e8m0) or 10% (bf16) of every byte the
+    # routed GEMM fetches from HBM.
+    "TPU_MOE_COMPACT_SCALE": env_with_choices(
+        "TPU_MOE_COMPACT_SCALE", "off", ["off", "bf16", "e8m0"]
+    ),
     "TPU_MOE_SKIP_PADDED_TOKENS": env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
     # Hierarchical MoE parallelism: expert-parallel between chips,
     # tensor-parallel between the two chiplets of a chip. Off by
@@ -608,6 +629,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_ROUTER_TOPK": env_with_choices(
         "TPU_MOE_ROUTER_TOPK", "rowmax", ["sort", "rowmax"]
     ),
+    # Order the routed rows by expert id with a counting sort instead of two
+    # `jnp.argsort` calls.
+    "TPU_MOE_COUNTING_SORT": env_bool("TPU_MOE_COUNTING_SORT"),
     # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
     # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
     # program, instead of bracketing the per-rank compute with vLLM's
@@ -650,6 +674,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # time at TP=32; halving the bytes each core reads costs two on-package
     # all-gathers per layer. Independent of TPU_MOE_HIERARCHICAL_EP.
     "TPU_LATENT_PROJ_INTRA_CHIP_TP": env_bool("TPU_LATENT_PROJ_INTRA_CHIP_TP"),
+    "TPU_K3_FP8_LATENT_PROJ": env_bool("TPU_K3_FP8_LATENT_PROJ"),
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
     "TPU_ROPE_CACHE_TRUNCATE": env_bool("TPU_ROPE_CACHE_TRUNCATE"),

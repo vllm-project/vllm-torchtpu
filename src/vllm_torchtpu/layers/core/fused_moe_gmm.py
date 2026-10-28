@@ -41,6 +41,7 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
     token_block_alignment,
 )
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
+from vllm_torchtpu.layers.core import counting_sort
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -298,47 +299,61 @@ def prepare_routed_gmm_inputs(
     else:
         valid_mask = topk_indices_flat >= 0
     sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
-    # The keys take only `local_num_experts + 1` values, so a counting sort
-    # gives the positions and `group_sizes` without a second comparison sort.
-    # Ragged permute only: under the one-hot permute these positions break MTP.
-    ragged_permute = (
-        use_ep
-        and use_sparse_core
-        and token_indices_flat.shape[0] > onehot_moe_permute_threshold
-    )
-    argsort_revert_indices, bucket_counts = (
-        _counting_sort_positions(sort_keys, local_num_experts + 1)
-        if ragged_permute
-        else (None, None)
-    )
-    token_bits = max(1, (num_tokens_local - 1).bit_length())
-    packable = (local_num_experts + 1).bit_length() + token_bits < 31
-    sorted_indices = (
-        jnp.argsort(sort_keys)
-        if argsort_revert_indices is None or not packable
-        else None
-    )
-
-    if argsort_revert_indices is not None:
-        group_sizes_local = bucket_counts[:local_num_experts]
-    else:
-        argsort_revert_indices = jnp.argsort(sorted_indices)
-        topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
-        group_sizes_local = jax.nn.one_hot(
-            topk_indices_for_count, local_num_experts, dtype=jnp.int32
-        ) * valid_mask[:, None].astype(jnp.int32)
-        group_sizes_local = group_sizes_local.sum(axis=0)
-
-    if packable:
-        # Packing (key, token) into one int32 keeps the payload out of the sort
-        # and drops the follow-up gather. Equal packed values carry the same
-        # token id, so their order cannot matter.
-        packed = jax.lax.sort(
-            jnp.left_shift(sort_keys, token_bits) | token_indices_flat, is_stable=False
+    if envs.TPU_MOE_COUNTING_SORT and counting_sort.applicable(
+        sort_keys.shape[0]
+    ):
+        key_onehot = counting_sort.key_onehot(sort_keys, local_num_experts + 1)
+        argsort_revert_indices = counting_sort.sort_positions(key_onehot)
+        sorted_indices = counting_sort.invert_permutation(
+            argsort_revert_indices
         )
-        token_indices_sorted = jnp.bitwise_and(packed, (1 << token_bits) - 1)
-    else:
+        group_sizes_local = key_onehot[:, :local_num_experts].sum(axis=0)
         token_indices_sorted = token_indices_flat[sorted_indices]
+    else:
+        # The keys take only `local_num_experts + 1` values, so a counting sort
+        # gives the positions and `group_sizes` without a second comparison sort.
+        # Ragged permute only: under the one-hot permute these positions break MTP.
+        ragged_permute = (
+            use_ep
+            and use_sparse_core
+            and token_indices_flat.shape[0] > onehot_moe_permute_threshold
+        )
+        argsort_revert_indices, bucket_counts = (
+            _counting_sort_positions(sort_keys, local_num_experts + 1)
+            if ragged_permute
+            else (None, None)
+        )
+        token_bits = max(1, (num_tokens_local - 1).bit_length())
+        packable = (local_num_experts + 1).bit_length() + token_bits < 31
+        sorted_indices = (
+            jnp.argsort(sort_keys)
+            if argsort_revert_indices is None or not packable
+            else None
+        )
+
+        if argsort_revert_indices is not None:
+            group_sizes_local = bucket_counts[:local_num_experts]
+        else:
+            argsort_revert_indices = jnp.argsort(sorted_indices)
+            topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
+            group_sizes_local = jax.nn.one_hot(
+                topk_indices_for_count, local_num_experts, dtype=jnp.int32
+            ) * valid_mask[:, None].astype(jnp.int32)
+            group_sizes_local = group_sizes_local.sum(axis=0)
+
+        if packable:
+            # Packing (key, token) into one int32 keeps the payload out of the sort
+            # and drops the follow-up gather. Equal packed values carry the same
+            # token id, so their order cannot matter.
+            packed = jax.lax.sort(
+                jnp.left_shift(sort_keys, token_bits) | token_indices_flat,
+                is_stable=False,
+            )
+            token_indices_sorted = jnp.bitwise_and(
+                packed, (1 << token_bits) - 1
+            )
+        else:
+            token_indices_sorted = token_indices_flat[sorted_indices]
 
     if use_ep and use_sparse_core:
         if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
@@ -591,12 +606,11 @@ def fused_moe_func(
     (K-axis) in LSB-first order.
     """
 
-    # Convert 3D scale [experts, blocks, N] to 4D [experts, blocks, 1, N]
-    # expected by gmm_v2.
-    if w1_scale is not None and w1_scale.ndim == 3:
-        w1_scale = jnp.expand_dims(w1_scale, 2)
-    if w2_scale is not None and w2_scale.ndim == 3:
-        w2_scale = jnp.expand_dims(w2_scale, 2)
+    # A 3D scale [experts, blocks, N] is handed to gmm_v2 as-is: it accepts both
+    # that and the legacy 4D [experts, blocks, 1, N]. Do NOT re-add the
+    # degenerate axis -- for a narrow scale dtype it tiles T(2,128)/T(4,128)
+    # instead of f32's T(1,128) and pads the bytes straight back to 4 per
+    # element, which is the whole cost the narrow dtype exists to remove.
 
     num_tokens, hidden_size = hidden_states.shape
 
