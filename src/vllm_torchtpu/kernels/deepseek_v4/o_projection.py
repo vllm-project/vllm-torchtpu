@@ -235,6 +235,9 @@ WO_A_VMEM_HEADROOM_BYTES = 8388608  # 8 MiB
 WO_A_GATHER_RUN = 32
 # Independent min chains in the scalar consecutiveness check of a gather run.
 WO_A_GATHER_CHAINS = 4
+# DMAs (K row slices) per w group, started over the previous group's row
+# blocks so its transfer is spread rather than bunched at a group's start.
+WO_A_W_PARTS = 2
 
 
 def _pipelined_rows(num_tokens: int) -> int | None:
@@ -301,6 +304,7 @@ def _pipelined_kernel(
     total = num_groups * blocks
     prep_rows = WO_A_PREP_ROWS
     run = WO_A_GATHER_RUN
+    w_part_rows = w_buf.shape[1] // WO_A_W_PARTS
     step = pl.program_id(0)
 
     def locate(l):
@@ -322,11 +326,12 @@ def _pipelined_kernel(
             x_sems.at[slot],
         )
 
-    def w_copy(g):
+    def w_copy(g, part):
         col0 = pl.multiple_of(g * lora_rank, lora_rank)
+        k = pl.ds(part * w_part_rows, w_part_rows)
         return pltpu.make_async_copy(
-            w_hbm_ref.at[:, pl.ds(col0, lora_rank)],
-            w_buf.at[w_slot(g)],
+            w_hbm_ref.at[k, pl.ds(col0, lora_rank)],
+            w_buf.at[w_slot(g), k],
             w_sems.at[w_slot(g)],
         )
 
@@ -446,7 +451,8 @@ def _pipelined_kernel(
             for chunk in range(s * prep_rows // run, (s + 1) * prep_rows // run):
                 gather(chunk)
             copy.start()
-        w_copy(0).start()
+        for part in range(WO_A_W_PARTS):
+            w_copy(0, part).start()
         if num_tokens > rows:
             pl.loop(rows // run, num_tokens // run)(gather)
         x_copy(*locate(1)).start()
@@ -465,7 +471,8 @@ def _pipelined_kernel(
         _, r1, slot1 = locate(l + 1)
         last = l + 1 == per_step
         if r == 0:
-            w_copy(g).wait()
+            for part in range(WO_A_W_PARTS):
+                w_copy(g, part).wait()
 
         def fetch_next():
             x_copy(*locate(l + 1)).wait()
@@ -479,11 +486,14 @@ def _pipelined_kernel(
         else:
             fetch_next()
 
-        if r == 0:
-            # After x: the next segment's top waits on that x block, not on w.
+        # After x: the next segment's top waits on that x block, not on w.
+        parts = [p for p in range(WO_A_W_PARTS) if p * blocks // WO_A_W_PARTS == r]
+        if parts:
+
             @pl.when(g + 1 < num_groups)
             def _():
-                w_copy(g + 1).start()
+                for part in parts:
+                    w_copy(g + 1, part).start()
 
         if l >= 2:
             out_copy(*locate(l - 2)).wait()
@@ -525,6 +535,7 @@ def _wo_a_pipelined(
     num_tokens, num_heads, head_dim = x.shape
     reduction, out_features = wo_a.shape
     assert reduction == SUBLANE * head_dim and num_heads % SUBLANE == 0
+    assert reduction % WO_A_W_PARTS == 0
     num_groups = num_heads // SUBLANE
     lora_rank = out_features // num_groups
     rotary_dim = cos_sin_cache.shape[1]
