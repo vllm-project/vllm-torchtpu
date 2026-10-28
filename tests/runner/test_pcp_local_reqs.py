@@ -110,6 +110,21 @@ def test_local_reqs_fit_the_scaled_bucket(pcp_size, num_prefills):
         assert len(plan.host_metadata["ws_page_offset"]) == target
 
 
+@pytest.mark.parametrize("pcp_size", [2, 4])
+@pytest.mark.parametrize("num_prefills", [0, 3, MAX_NUM_SEQS])
+def test_decode_window_is_capped_at_max_num_seqs(pcp_size, num_prefills):
+    """Only prefills become two local requests: the decode window holds at
+    most `max_num_seqs` rows, in real and dummy steps alike."""
+    target = MAX_NUM_SEQS * _manager(pcp_size).local_reqs_per_req
+    plan = _prepare(_manager(pcp_size), num_prefills, target)
+    assert len(plan.host_metadata["rep_row_idx"]) == MAX_NUM_SEQS
+    dummy = _manager(pcp_size)
+    dummy.prepare_dummy(num_tokens=64, num_reqs=target, max_num_tokens=4096)
+    for key in ("rep_row_idx", "rep_seq_lens"):
+        assert len(dummy.host_metadata[key]) == len(plan.host_metadata[key])
+    assert dummy.host_metadata["rep_request_distribution"].max() <= MAX_NUM_SEQS
+
+
 @pytest.fixture
 def small_chunks(monkeypatch):
     # 2-page gather chunks, so the workspace is not rounded up to 128 pages.
