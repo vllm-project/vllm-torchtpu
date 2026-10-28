@@ -749,3 +749,19 @@ def test_draft_rows_static_across_token_buckets():
         buckets=(256,),
     )
     assert broken[256][-1] == (256,)
+
+
+def test_megakernel_paths_keep_the_sink_layer_on_attend():
+    """VLLM_TPU_QSA_DRAFT_SHARED_SELECTION: the draft reads the selection the target's last QSA layer
+    writes in `attend`. `select_for_kernel` returns no selection, so it refuses the sink layer, and
+    the served megakernel paths never take it: in-kernel attention is gated on
+    `segment_call.attention_rows`, which neither MK segment object defines (default 0 -> attend)."""
+    from vllm_torchtpu.models.vllm.qwen4_exp.qsa import Qwen4ExpQSA
+
+    with pytest.raises(NotImplementedError, match="shared-selection"):
+        Qwen4ExpQSA.select_for_kernel(NS(_selection_sink=torch.zeros(1, 1)), None, None, None)
+    try:
+        from vllm_torchtpu.megakernel_runtime.qwen38_driver import Qwen38Segments
+    except Exception:  # noqa: BLE001 - optional runtime deps
+        pytest.skip("megakernel runtime unavailable")
+    assert not hasattr(Qwen38Segments, "attention_rows")

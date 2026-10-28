@@ -780,6 +780,15 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         """Cache writes and the indexer only; the attention runs in the Qwen3.8
         segment megakernel (``QSASparseAttnBlock``). Returns its extra inputs:
         ``[pool, q, gate, pages, kv_lens, head-pair offset, (k, v) scales]``."""
+        if getattr(self, "_selection_sink", None) is not None:
+            # The select op returns no `selected`, so the MTP draft's shared selection
+            # (bind_shared_selection) would go stale on in-kernel steps. The served MK paths
+            # keep this layer on `attend` (segment_call.attention_rows unset); enabling
+            # in-kernel attention on the sink layer needs the select op to return `selected`.
+            raise NotImplementedError(
+                "select_for_kernel on the shared-selection sink layer: the draft's selection "
+                "would not be written (VLLM_TPU_QSA_DRAFT_SHARED_SELECTION)"
+            )
         assert self.pooled, "in-kernel QSA attention reads the unified pool"
         per_layer = cast(dict[str, AttentionMetadata], get_forward_context().attn_metadata)
         metadata = replace(
