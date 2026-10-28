@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -217,6 +218,248 @@ def _kernel(
         out_ref[rows] = (partial * scale).astype(out_dtype)
 
 
+# The pipelined prefill kernel (_pipelined_kernel). Tokens per x row block, i.e.
+# per wo_a dot: a group's weights are pushed into the MXU once per this many
+# tokens instead of once per 128.
+WO_A_ROWS = 512
+# Tokens per RoPE + quantize sub-chunk of a row block.
+WO_A_PREP_ROWS = 64
+# Calls with fewer tokens (the decode buckets) keep _kernel.
+WO_A_MIN_TOKENS = 512
+# VMEM Mosaic needs beyond the scratch buffers (the f32 dot result, spills).
+WO_A_VMEM_HEADROOM_BYTES = 8388608  # 8 MiB
+
+
+def _pipelined_rows(num_tokens: int) -> int | None:
+    """_pipelined_kernel's row block at ``num_tokens``, None if it does not apply."""
+    rows = min(WO_A_ROWS, num_tokens)
+    if num_tokens < WO_A_MIN_TOKENS or num_tokens % rows or rows % WO_A_PREP_ROWS:
+        return None
+    return rows
+
+
+def _pipelined_kernel(
+    # inputs
+    x_hbm_ref: jax.Ref,  # HBM (T, G * H, head_dim) bf16
+    w_hbm_ref: jax.Ref,  # HBM (D, G * R) fp8
+    scale_ref: jax.Ref,  # VMEM (1, G * R) f32
+    cos_sin_ref: jax.Ref,  # VMEM (T, 2 * LANE) f32
+    # output
+    out_hbm_ref: jax.Ref,  # HBM (T, G * R) bf16
+    # scratch
+    x_buf: jax.Ref,  # (2, rows, H, head_dim) bf16
+    x_q_ref: jax.Ref,  # (2, rows, D) fp8
+    x_rinv_ref: jax.Ref,  # (2, rows, 1) f32
+    w_buf: jax.Ref,  # (2, D, R) fp8
+    out_buf: jax.Ref,  # (2, rows, R) bf16
+    x_sems: jax.Ref,  # (2,) DMA
+    w_sems: jax.Ref,  # (2,) DMA
+    out_sems: jax.Ref,  # (2,) DMA
+    *,
+    num_groups: int,
+    groups_per_step: int,
+    head_dim: int,
+) -> None:
+    """``_kernel`` with quantize_activations, by row blocks of ``rows`` tokens.
+
+    Row block n (group g, rows r) is RoPE'd and quantized into x_q's slot n % 2,
+    then projected by one [rows, D] x [D, R] dot. Segment n of the schedule runs
+    the dot of block n (MXU) and the prep of block n + 1 (VPU), also across
+    group and grid-step edges, so the VPU work hides under the MXU work. A grid
+    step holds an even number of blocks, so every slot index is static and the
+    scheduler can tell the two x_q slots apart. DMA waits and branches sit only
+    at segment tops; each segment's output DMA starts at its end, since a DMA
+    start orders the memory ops around it.
+    """
+    num_tokens = cos_sin_ref.shape[0]
+    _, rows, heads, _ = x_buf.shape
+    lora_rank = w_buf.shape[2]
+    blocks = num_tokens // rows  # row blocks per group
+    per_step = groups_per_step * blocks  # even
+    num_steps = num_groups // groups_per_step
+    total = num_groups * blocks
+    prep_rows = WO_A_PREP_ROWS
+    step = pl.program_id(0)
+
+    def locate(l):
+        """(group, row block, slot) of step-local block l, which may lie in a
+        neighbouring step; l is static."""
+        q, l2 = divmod(l, per_step)
+        j, r = divmod(l2, blocks)
+        return (step + q) * groups_per_step + j, r, l % 2
+
+    def w_slot(g):
+        if groups_per_step == 1:
+            return g % 2
+        return (g - step * groups_per_step) % 2  # static
+
+    def x_copy(g, r, slot):
+        return pltpu.make_async_copy(
+            x_hbm_ref.at[pl.ds(r * rows, rows), pl.ds(g * heads, heads)],
+            x_buf.at[slot],
+            x_sems.at[slot],
+        )
+
+    def w_copy(g):
+        col0 = pl.multiple_of(g * lora_rank, lora_rank)
+        return pltpu.make_async_copy(
+            w_hbm_ref.at[:, pl.ds(col0, lora_rank)],
+            w_buf.at[w_slot(g)],
+            w_sems.at[w_slot(g)],
+        )
+
+    def out_copy(g, r, slot):
+        col0 = pl.multiple_of(g * lora_rank, lora_rank)
+        return pltpu.make_async_copy(
+            out_buf.at[slot],
+            out_hbm_ref.at[pl.ds(r * rows, rows), pl.ds(col0, lora_rank)],
+            out_sems.at[slot],
+        )
+
+    def prep(r, slot):
+        """RoPE + per-row quantize of the x block in ``slot`` (row block r)."""
+        for s in range(rows // prep_rows):
+            sub = pl.ds(s * prep_rows, prep_rows)
+            x = _rope_heads(
+                x_buf[slot, sub],
+                cos_sin_ref[pl.ds(r * rows + s * prep_rows, prep_rows)],
+                head_dim=head_dim,
+            )
+            x = x.reshape(prep_rows, -1)
+            amax = jnp.max(jnp.abs(x), axis=1, keepdims=True)
+            inv = (FP8_E4M3_MAX / jnp.maximum(amax, jnp.bfloat16(1e-30))).astype(
+                jnp.bfloat16
+            )
+            x_q_ref[slot, sub] = (x * inv).astype(jnp.float8_e4m3fn)
+            x_rinv_ref[slot, sub] = 1.0 / inv.astype(jnp.float32)
+
+    def dot(g, slot):
+        """wo_a dot + dequantize of the block in x_q's ``slot`` into out_buf."""
+        partial = jax.lax.dot_general(
+            x_q_ref[slot],
+            w_buf[w_slot(g)],
+            (((1,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
+        partial = partial * x_rinv_ref[slot]
+        col0 = pl.multiple_of(g * lora_rank, lora_rank)
+        out_buf[slot] = (partial * scale_ref[:, pl.ds(col0, lora_rank)]).astype(
+            out_buf.dtype
+        )
+
+    @pl.when(step == 0)
+    def _():
+        x_copy(*locate(0)).start()
+        w_copy(0).start()
+        x_copy(*locate(1)).start()
+        x_copy(*locate(0)).wait()
+        prep(0, 0)
+
+    for l in range(per_step):
+        g, r, slot = locate(l)
+        _, r1, slot1 = locate(l + 1)
+        last = l + 1 == per_step
+        if r == 0:
+            w_copy(g).wait()
+
+            @pl.when(g + 1 < num_groups)
+            def _():
+                w_copy(g + 1).start()
+
+        def fetch_next():
+            x_copy(*locate(l + 1)).wait()
+
+            @pl.when(step * per_step + l + 2 < total)
+            def _():
+                x_copy(*locate(l + 2)).start()
+
+        if last:
+            pl.when(step + 1 < num_steps)(fetch_next)
+        else:
+            fetch_next()
+
+        if l >= 2:
+            out_copy(*locate(l - 2)).wait()
+        else:
+            pl.when(step > 0)(lambda: out_copy(*locate(l - 2)).wait())
+
+        if not last:
+            dot(g, slot)
+            prep(r1, slot1)
+            out_copy(g, r, slot).start()
+            continue
+
+        # Peeled, so the dot and the next step's first prep share a block.
+        @pl.when(step + 1 < num_steps)
+        def _():
+            dot(g, slot)
+            prep(r1, slot1)
+            out_copy(g, r, slot).start()
+
+        @pl.when(step + 1 == num_steps)
+        def _():
+            dot(g, slot)
+            out_copy(g, r, slot).start()
+            out_copy(*locate(l - 1)).wait()
+            out_copy(g, r, slot).wait()
+
+
+def _wo_a_pipelined(
+    x: jax.Array,  # [T, G * H, head_dim] bf16
+    wo_a: jax.Array,  # [D, G * R] fp8
+    wo_a_scale: jax.Array,  # [G * R] float32
+    cos_sin: jax.Array,  # [T, 2 * LANE] float32
+    *,
+    rows: int,
+    name: str,
+) -> jax.Array:
+    num_tokens, num_heads, head_dim = x.shape
+    reduction, out_features = wo_a.shape
+    num_groups = num_heads // SUBLANE
+    lora_rank = out_features // num_groups
+    groups_per_step = 1 if (num_tokens // rows) % 2 == 0 else 2
+    assert num_groups % groups_per_step == 0
+    scratch = [
+        pltpu.VMEM((2, rows, SUBLANE, head_dim), x.dtype),
+        pltpu.VMEM((2, rows, reduction), wo_a.dtype),
+        pltpu.VMEM((2, rows, 1), jnp.float32),
+        pltpu.VMEM((2, reduction, lora_rank), wo_a.dtype),
+        pltpu.VMEM((2, rows, lora_rank), x.dtype),
+    ]
+    # x_rinv's trailing 1 is padded to a full lane tile.
+    scratch_bytes = sum(
+        math.prod(b.shape[:-1]) * max(b.shape[-1], LANE) * jnp.dtype(b.dtype).itemsize
+        for b in scratch
+    )
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
+    return pl.pallas_call(
+        functools.partial(
+            _pipelined_kernel,
+            num_groups=num_groups,
+            groups_per_step=groups_per_step,
+            head_dim=head_dim,
+        ),
+        grid=(num_groups // groups_per_step,),
+        in_specs=[hbm, hbm, vmem, vmem],
+        out_specs=hbm,
+        out_shape=jax.ShapeDtypeStruct((num_tokens, out_features), x.dtype),
+        scratch_shapes=[*scratch, *[pltpu.SemaphoreType.DMA((2,))] * 3],
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            vmem_limit_bytes=scratch_bytes + WO_A_VMEM_HEADROOM_BYTES,
+            disable_bounds_checks=True,
+        ),
+        name=name,
+    )(
+        # Where its producer wrote it; otherwise XLA may stage x in VMEM.
+        pltpu.with_memory_space_constraint(x, pltpu.HBM),
+        wo_a,
+        wo_a_scale.reshape(1, out_features),
+        cos_sin,
+    )
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -277,6 +520,10 @@ def wo_a_projection(
 
     assert cos_sin.ndim == 2 and cos_sin.shape == (num_tokens, 2 * LANE)
     assert head_dim % LANE == 0
+
+    rows = _pipelined_rows(num_tokens)
+    if quantize_activations and tile_t is tile_r is sub_t is None and rows:
+        return _wo_a_pipelined(x, wo_a, wo_a_scale, cos_sin, rows=rows, name=name)
 
     if tile_r is None:
         tile_r = lora_rank
