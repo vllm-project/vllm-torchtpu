@@ -16,27 +16,32 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     set -eu; \
     TOKEN=""; \
     if [ -f /run/secrets/gcloud_token ]; then TOKEN="$(cat /run/secrets/gcloud_token)"; fi; \
-    EXTRA_INDEX="${REGISTRY_URL}"; \
+    set --; \
+    if [ -n "${OVERRIDE_PACKAGE:-}" ] && [ -n "${OVERRIDE_VERSION:-}" ]; then \
+      set -- "$@" "${OVERRIDE_PACKAGE}==${OVERRIDE_VERSION}"; \
+    fi; \
+    if [ -n "${TORCH_TPU_VERSION:-}" ]; then \
+      set -- "$@" "torch-tpu==${TORCH_TPU_VERSION}"; \
+    fi; \
+    if [ -n "${TPU_SYNC_TORCH_VERSION:-}" ]; then \
+      set -- "$@" "tpu-sync-torch==${TPU_SYNC_TORCH_VERSION}"; \
+    fi; \
+    if [ "$#" -eq 0 ]; then \
+      echo "No override packages specified" >&2; \
+      exit 1; \
+    fi; \
     if [ -n "${TOKEN}" ]; then \
       export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken; \
       export UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD="${TOKEN}"; \
       EXTRA_INDEX="https://oauth2accesstoken:${TOKEN}@${REGISTRY_URL#https://}"; \
-    fi; \
-    PACKAGES=(); \
-    if [ -n "${OVERRIDE_PACKAGE:-}" ] && [ -n "${OVERRIDE_VERSION:-}" ]; then \
-      PACKAGES+=("${OVERRIDE_PACKAGE}==${OVERRIDE_VERSION}"); \
-    fi; \
-    if [ -n "${TORCH_TPU_VERSION:-}" ]; then \
-      PACKAGES+=("torch-tpu==${TORCH_TPU_VERSION}"); \
-    fi; \
-    if [ -n "${TPU_SYNC_TORCH_VERSION:-}" ]; then \
-      PACKAGES+=("tpu-sync-torch==${TPU_SYNC_TORCH_VERSION}"); \
-    fi; \
-    if [ ${#PACKAGES[@]} -eq 0 ]; then \
-      echo "No override packages specified" >&2; \
-      exit 1; \
-    fi; \
-    uv pip install --system --force-reinstall --no-deps \
-      --extra-index-url "${EXTRA_INDEX}" \
-      --extra-index-url https://pypi.org/simple \
-      "${PACKAGES[@]}"
+      uv pip install --system --force-reinstall --no-deps \
+        --index-strategy unsafe-best-match \
+        --extra-index-url "${EXTRA_INDEX}" \
+        --extra-index-url https://pypi.org/simple \
+        "$@"; \
+    else \
+      uv pip install --system --force-reinstall --no-deps \
+        --index-strategy unsafe-best-match \
+        --extra-index-url https://pypi.org/simple \
+        "$@"; \
+    fi
