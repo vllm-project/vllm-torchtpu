@@ -135,21 +135,50 @@ def _resolve_tp_size(runner: Any) -> int:
     return int(devs.size) if devs is not None else 0
 
 
-def _build_tp_rank_mesh(r_cnt: int, fallback_mesh: Any = None) -> Any:
-    """Build an `r_cnt`-device JAX `Mesh` with axis `'tp'` in TP-rank order."""
+def _get_pallas_mesh_fn() -> Any:
+    """Return `torch_tpu`'s `get_pallas_mesh`, or `None` without `torch_tpu`."""
+    try:
+        from torch_tpu._internal.pallas import get_pallas_mesh
+    except ImportError:
+        return None
+    return get_pallas_mesh
+
+
+def _build_tp_rank_mesh(r_cnt: int, fallback_mesh: Any = None) -> Any | None:
+    """Build an `r_cnt`-device JAX `Mesh` with axis `'tp'` in TP-rank order.
+
+    With `torch_tpu` this is always its Pallas mesh: `torch_tpu` binds
+    partition `p` to TP rank `p` and requires every Pallas kernel in a program
+    to share one device assignment, while the runner mesh may list the devices
+    in another order (e.g. ICI ring order), which would send the megakernel's
+    remote DMAs, addressed by mesh position, to the wrong peers. Returns `None`
+    (the caller declines) when `torch_tpu` is present but its mesh is
+    unavailable or doesn't hold `r_cnt` devices. Without `torch_tpu` (CPU), the
+    runner mesh is used, then `jax.devices()`.
+    """
+    get_pallas_mesh = _get_pallas_mesh_fn()
+    if get_pallas_mesh is not None:
+        try:
+            pallas_mesh = get_pallas_mesh(axis_names=("tp",))
+        except Exception as exc:
+            logger.warning("Megakernel: get_pallas_mesh failed (%s); skipping.", exc)
+            return None
+        n_dev = int(pallas_mesh.devices.size)
+        if n_dev != r_cnt or tuple(pallas_mesh.axis_names) != ("tp",):
+            logger.warning(
+                "Megakernel: the Pallas mesh has %d devices on axes %s, expected "
+                "%d on ('tp',); skipping.",
+                n_dev,
+                tuple(pallas_mesh.axis_names),
+                r_cnt,
+            )
+            return None
+        return pallas_mesh
     fb_devs = getattr(fallback_mesh, "devices", None)
     if fb_devs is not None and int(fb_devs.size) == r_cnt:
         if tuple(fallback_mesh.axis_names) == ("tp",):
             return fallback_mesh
         return jax.sharding.Mesh(np.asarray(fb_devs).reshape(-1), ("tp",))
-    try:
-        from torch_tpu._internal.pallas import get_pallas_mesh
-
-        pallas_mesh = get_pallas_mesh(axis_names=("tp",))
-        if int(pallas_mesh.devices.size) == r_cnt:
-            return pallas_mesh
-    except Exception as exc:
-        logger.debug("get_pallas_mesh unavailable (%s); using jax.devices()", exc)
     return jax.sharding.Mesh(np.asarray(jax.devices()[:r_cnt]), ("tp",))
 
 
@@ -641,6 +670,8 @@ class MegakernelDriver:
             )
         mode = req_mode if req_mode else ("ep" if loaded_ep else "tp")
         mesh = _build_tp_rank_mesh(r_cnt, fallback_mesh=getattr(runner, "mesh", None))
+        if mesh is None:
+            return None
         dev_kind = str(getattr(mesh.devices.flat[0], "device_kind", "") or "")
         owned = _rt.explicit_profile_settings(cfg)
         spec_tokens: int | None = None
