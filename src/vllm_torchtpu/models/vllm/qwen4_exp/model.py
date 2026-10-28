@@ -35,7 +35,7 @@ from vllm.model_executor.models.interfaces import (
     HasInnerState,
     IsHybrid,
 )
-from vllm.model_executor.models.qwen3_next import Qwen3NextSparseMoeBlock
+from vllm.model_executor.models.qwen3_next import Qwen3NextMLP, Qwen3NextSparseMoeBlock
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.v1.kv_cache_interface import MambaSpec
@@ -246,6 +246,25 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 self.self_attn
             )
         self.mlp = Qwen3NextSparseMoeBlock(vllm_config=cfg, prefix=prefix + ".mlp")
+        if (
+            envs.QWEN4_EXP_PREFILL_SP_SHARED_LOCAL
+            and envs.QWEN4_EXP_PREFILL_SP_MOE
+            and sp.enabled(tp.world_size)
+            and getattr(self.mlp, "shared_expert", None) is not None
+            and not getattr(self.mlp, "replicate_shared_expert", True)
+        ):
+            # Replicated copy of the TP-sliced shared expert for sequence-parallel steps
+            # (`_sequence_parallel_moe`); same prefix, so it takes the same quantization.
+            self.mlp.shared_expert_local = Qwen3NextMLP(
+                hidden_size=t.hidden_size,
+                intermediate_size=t.shared_expert_intermediate_size,
+                hidden_act=t.hidden_act,
+                quant_config=cfg.quant_config,
+                reduce_results=False,
+                expert_gate=self.mlp.shared_expert_gate,
+                disable_tp=True,
+                prefix=prefix + ".mlp.shared_expert",
+            )
         hc_up_tile = int(
             cfg.additional_config.get("qwen4_exp", {}).get("hc_prefill_up_tile", 0)
         )
@@ -425,6 +444,10 @@ class Qwen4ExpDecoderLayer(nn.Module):
             router_logits,
             attr="_adaptive_fused_moe_op_sp",
         )
+        local = getattr(mlp, "shared_expert_local", None)
+        if local is not None:
+            # This rank's rows through the replicated shared expert: no gather, no reduce.
+            return local(block) + output
         shared = sp.reduce(mlp.shared_expert(sp.gather(block, num_tokens)), True)
         return shared + output
 
@@ -1105,6 +1128,12 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         parameters = dict(self.named_parameters())
         loaded, source = set(), set()
         moe_mapper = moe_weights_mapper()
+        local_mapper = WeightsMapper(
+            orig_to_new_stacked={
+                "shared_expert_local.gate_proj": ("shared_expert_local.gate_up_proj", 0),
+                "shared_expert_local.up_proj": ("shared_expert_local.gate_up_proj", 1),
+            }
+        )
         layers = cast(Sequence[Qwen4ExpDecoderLayer], self.model.layers)
         moe_loaders = [AutoWeightsLoader(layer.mlp) for layer in layers]
         # Exactly the Qwen3.5 checkpoint projection mapping. HC remains
@@ -1132,6 +1161,17 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
                     loaded.update(
                         f"model.layers.{idx}.mlp.{target}" for target in targets
                     )
+                    if relative.startswith("shared_expert.") and hasattr(
+                        layer.mlp, "shared_expert_local"
+                    ):
+                        # The same tensor, unsliced, into the replicated copy.
+                        local = "shared_expert_local." + relative.split(".", 1)[1]
+                        targets = moe_loaders[int(idx)].load_weights(
+                            iter([(local, weight)]), mapper=local_mapper
+                        )
+                        loaded.update(
+                            f"model.layers.{idx}.mlp.{target}" for target in targets
+                        )
                     continue
                 if family == "ple":
                     assert layer.ple is not None
