@@ -37,11 +37,10 @@ _SAL_MAX_WAVE = 128
 def inner_kernel(
     cos_sin_vmem,
     out_vmem,
-    page_buffer_vmem,
+    segment_vmem,
     rope_out_vmem,
     positions_ref,
     rms_weight_vmem_ref,
-    window_vmem,
     kv_slot_mapping_ref,
     is_first_mask_ref,
     is_first_mask_rope_ref,
@@ -64,30 +63,7 @@ def inner_kernel(
         start_list.append(positions_ref[safe_idx] - window + 1)
     start = jnp.stack(start_list)  # (tile_n,)
 
-    window_u8 = window_vmem.bitcast(jnp.uint8).reshape(
-        2, tile_n, window, head_tiles, 4, 128
-    )
-    kv_window_u8 = window_u8.at[0]
-    score_window_u8 = window_u8.at[1]
-
-    compute.gather_from_page_buffer(
-        page_buffer=page_buffer_vmem,
-        positions_ref=positions_ref,
-        kv_window_u8=kv_window_u8,
-        score_window_u8=score_window_u8,
-        global_idx=global_idx,
-        num_tokens=cfgs.dims.size_n,
-        window=window,
-        block_size=cfgs.state_block_size,
-        pages_to_buffer_per_token=cfgs.pages_to_buffer_per_token,
-        field_rows=cfgs.field_rows,
-        state_rows_per_token=cfgs.state_rows_per_token,
-        overlap=cfgs.dims.overlap,
-        is_indexer=cfgs.dims.mode == config.Mode.CSA_INDEXER,
-    )
-
-    kv_val = window_vmem.at[0][...]  # (tile_n, window, head_tiles, 128)
-    scores_val = window_vmem.at[1][...]  # (tile_n, window, head_tiles, 128)
+    kv_val, scores_val = compute.window_from_segments(segment_vmem, cfgs)
     rms_weight_tiled = rms_weight_vmem_ref[...].astype(jnp.float32)  # (head_tiles, 128)
 
     # --- windowed softmax ---
@@ -224,7 +200,6 @@ def kernel_fn(
     # outputs (aliased)
     _out_cache_ref,
     _out_rope_cache_ref,
-    window_scratch_ref,
     *sal_scratch,
     cfgs: config.Configs,
 ):
@@ -273,7 +248,6 @@ def kernel_fn(
             scratches=(
                 positions_ref,
                 rms_weight_ref,
-                window_scratch_ref,
                 kv_slot_mapping_ref,
                 is_first_mask_ref,
                 is_first_mask_rope_ref,
@@ -464,13 +438,17 @@ def compress_norm_rope_store(
             # TODO: this is confusing, should probably find a better name for it
             pack_factor=cfgs.hbm_pack,
         )
-    # Look up each token's state pages here so the kernel keeps only those
-    # entries in SMEM; the full block table does not fit at long context lengths.
-    pages_per_token = cfgs.pages_to_buffer_per_token
-    offsets = jnp.arange(1 - pages_per_token, 1, dtype=positions.dtype)
-    window_blocks = jnp.maximum(
-        positions[:, None] // state_block_size + offsets[None, :], 0
+    # Look up the state page of each window segment here so the kernel keeps
+    # only those entries in SMEM; the full block table does not fit at long
+    # context lengths.
+    cfgs.check_segments()
+    segment_starts = (
+        positions[:, None]
+        - (cfgs.window - 1)
+        + jnp.arange(cfgs.segments_per_token, dtype=positions.dtype)[None, :]
+        * cfgs.segment_states
     )
+    window_blocks = jnp.maximum(segment_starts, 0) // state_block_size
     rows = token_to_req_indices[:, None] * block_table_stride
     token_pages = block_table[rows + window_blocks].reshape(-1)
     # Outer pallas_call operands, in call order. Optional operands are passed as
@@ -519,7 +497,7 @@ def compress_norm_rope_store(
         cfgs.dims.has_rope, cfgs.dims.has_rope_cache, len(scalar_prefetch)
     )
 
-    scratch_shapes = [pltpu.VMEM(cfgs.window_shape(), jnp.float32)]
+    scratch_shapes = []
     if seq_along_lane:
         # See kernel_fn: staged records, the run tables of the final store
         # (one slot per token + a sentinel), its read-modify-write tiles.

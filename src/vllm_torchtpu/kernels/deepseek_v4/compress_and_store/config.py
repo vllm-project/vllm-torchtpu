@@ -482,37 +482,40 @@ class Configs:
         """Number of physical HBM rows per page in RoPE cache."""
         return self.physical_page_size // self.hbm_pack
 
+    # --- window segments ---------------------------------------------------------
+    # A boundary token's window is `window` consecutive states starting at
+    # `position - window + 1`, a multiple of `compress_ratio`. It is fetched as
+    # `segments_per_token` row ranges of `segment_states` states each; every
+    # range lies inside one state page, because one of `compress_ratio` and
+    # `state_block_size` divides the other.
     @property
-    def pages_to_buffer_per_token(self) -> int:
-        """Pages that must be resident to cover one token's window (+1 guard)."""
-        return pl.cdiv(self.window, self.state_block_size) + 1
+    def segment_states(self) -> int:
+        """States per fetched row range: a page-aligned slice of the window."""
+        return min(self.dims.compress_ratio, self.state_block_size)
+
+    @property
+    def segments_per_token(self) -> int:
+        """Row ranges that tile one token's window."""
+        return self.window // self.segment_states
+
+    @property
+    def segment_rows(self) -> int:
+        """State-array rows in one fetched row range."""
+        return self.segment_states * self.state_rows_per_token
+
+    def check_segments(self) -> None:
+        """Raises unless every window segment lies inside one state page."""
+        ratio, block = self.dims.compress_ratio, self.state_block_size
+        if ratio % block and block % ratio:
+            raise ValueError(
+                f"compress_ratio {ratio} and state_block_size {block} must "
+                "divide one another for the window to be fetched by pages."
+            )
 
     # --- shapes (single source of truth for every reshape / BlockSpec) ---------
     @property
     def _tile_n(self) -> int:
         return self.tile_sizes.tile_n
-
-    def window_shape(self) -> tuple[int, ...]:
-        """f32 window scratch: (fields, tile, window, head_tiles, lane)."""
-        return (N_FIELDS, self._tile_n, self.window, self.head_tiles, LANE)
-
-    def window_bytes_shape(self) -> tuple[int, ...]:
-        """uint8 view of the window scratch; each f32 lane -> FP32_BYTES rows.
-
-        Note: that trailing FP32_BYTES (4) is bytes-per-f32, NOT the HBM SLOT_PACK
-        (also 4) -- they're numerically equal but mean different things.
-
-        Returns:
-          The shape of the window bytes scratch.
-        """
-        return (
-            N_FIELDS,
-            self._tile_n,
-            self.window,
-            self.head_tiles,
-            FP32_BYTES,
-            LANE,
-        )
 
     def output_shape(self) -> tuple[int, ...]:
         """Packed output tile / VMEM block: (tile, record_rows) + cache_last_dims."""
@@ -530,17 +533,27 @@ class Configs:
         padded = pl.cdiv(max(self.dims.size_n, 1), LANE) * LANE
         return (SAL_SUBLANE_GROUPS, SLOT_PACK, padded)
 
-    def page_buffer_shape(self) -> tuple[int, ...]:
-        """Page-buffer VMEM block: (tile, pages, state page rows) + cache_last_dims.
+    @property
+    def segment_buffer_dtype(self) -> jax.typing.DTypeLike:
+        """f32 for 128-lane state rows; 256-lane (indexer) rows stay uint8.
 
-        Pages are DMA'd whole out of the *state* array, so this is sized by
-        `state_physical_page_size`, not by the compressed-KV page.
+        Mosaic cannot view a 256-lane f32 VMEM buffer as uint8 rows, so the
+        indexer's segments are DMA'd as bytes and bitcast to f32 per value.
         """
-        return (
-            self._tile_n,
-            self.pages_to_buffer_per_token,
-            self.state_physical_page_size,
-        ) + self.cache_last_dims
+        return jnp.float32 if self.last_dim_size == LANE else jnp.uint8
+
+    def segment_buffer_shape(self) -> tuple[int, ...]:
+        """Window-segment VMEM block: (tile, segments, segment rows, ...).
+
+        A state row is `(SLOT_PACK, last_dim_size)` bytes, byte `b` of lane
+        `l` being byte `b` of f32 `l` (the byte-transposed layout
+        `proj_and_save_state` writes), so in an f32 buffer it is one
+        `last_dim_size`-lane row; a uint8 buffer keeps the cache's row shape.
+        """
+        lead = (self._tile_n, self.segments_per_token, self.segment_rows)
+        if self.segment_buffer_dtype == jnp.float32:
+            return lead + (self.last_dim_size,)
+        return lead + self.cache_last_dims
 
     def rope_output_shape(self) -> tuple[int, ...]:
         """RoPE output VMEM block: (tile, 4, lane)."""

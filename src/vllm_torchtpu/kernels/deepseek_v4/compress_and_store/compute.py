@@ -18,6 +18,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
+from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import config
 
 
 def interleaved_rope_vector(x, cos_val_32, sin_val_32):
@@ -385,122 +386,47 @@ def stage_sal_columns(
     ).reshape(groups, 4, lanes)
 
 
-def gather_from_page_buffer(
-    page_buffer,
-    positions_ref,
-    kv_window_u8,
-    score_window_u8,
-    *,
-    global_idx: jax.Array,
-    num_tokens: int,
-    window: int,
-    block_size: int,
-    pages_to_buffer_per_token: int,
-    field_rows: int,
-    state_rows_per_token: int,
-    overlap: bool,
-    is_indexer: bool = False,
-):
-    """Extracts kv_window, score_window from page buffer."""
-    tile_n = page_buffer.shape[0]
-    if is_indexer:
-        # CSA_INDEXER (layout 32x4x256)
-        # page_buffer shape: (tile_n, pages_to_buffer, 32, 4, 256)
-        for n in range(tile_n):
-            safe_idx = jnp.minimum(global_idx + n, num_tokens - 1)
-            pos = positions_ref[safe_idx]
+def window_from_segments(segments, cfgs):
+    """Reads a tile's kv and score windows out of its fetched state segments.
 
-            block_idx_curr = pos // block_size
-            pos_start = pos - window + 1
+    segments: the `cfgs.segment_buffer_shape()` ref of row ranges
+    `SegmentBufferRef` DMA'd. Returns kv and score, each
+    (tile_n, window, head_tiles, 128) f32, window position w taken from the
+    state at w of the window: the same values a whole-page gather picks.
 
-            for w in range(window):
-                pos_w = pos_start + w
-                block_idx_w = pos_w // block_size
-                p = block_idx_w - block_idx_curr + pages_to_buffer_per_token - 1
+    A state's rows are [kv | score] fields of `field_rows` rows, each field
+    [prev | curr] halves when windows overlap; the indexer's single 256-lane
+    row per field holds prev in lanes 0:128 and curr in lanes 128:256.
+    """
+    window = cfgs.window
+    head_tiles = cfgs.head_tiles
+    seg_states = cfgs.segment_states
+    rows_per_state = cfgs.state_rows_per_token
+    field_rows = cfgs.field_rows
+    overlap = cfgs.dims.overlap
+    is_indexer = cfgs.dims.mode == config.Mode.CSA_INDEXER
 
-                offset_in_block = pos_w % block_size
-                token_row_start = offset_in_block * 2
+    def read(seg, row, lanes):  # -> (tile_n, head_tiles, 128) f32
+        if segments.dtype == jnp.float32:
+            return segments[:, seg, row : row + head_tiles, lanes]
+        assert head_tiles == 1, head_tiles
+        return pltpu.bitcast(segments[:, seg, row, :, lanes], jnp.float32)
 
-                kv_row = token_row_start + 0
-                score_row = token_row_start + 1
-
-                valid_w = pos_w >= 0
-
-                @pl.when(valid_w)
-                def _():
-                    row_kv = page_buffer[n, p, kv_row][...]  # shape (4, 256)
-                    row_score = page_buffer[n, p, score_row][...]  # shape (4, 256)
-
-                    # `proj_and_save_state` stores the f32 state byte-transposed
-                    # (u8[s, l] == byte s of f32 l), so one (4, 256) row holds
-                    # 256 floats across its LANES. The prev/curr halves of the
-                    # overlapping state are therefore lanes 0:128 and 128:256.
-                    if overlap:
-                        is_prev = w < (window // 2)
-                        val_kv = jax.lax.select(
-                            is_prev,
-                            row_kv[:, 0:128],
-                            row_kv[:, 128:256],
-                        )
-                        val_score = jax.lax.select(
-                            is_prev,
-                            row_score[:, 0:128],
-                            row_score[:, 128:256],
-                        )
-                    else:
-                        val_kv = row_kv[:, 0:128]
-                        val_score = row_score[:, 0:128]
-
-                    kv_window_u8[n, w, 0, :, :] = val_kv
-                    score_window_u8[n, w, 0, :, :] = val_score
-
-    else:
-        # Standard HCA/CSA (last dim 128)
-        slots_per_part_head = kv_window_u8.shape[2]
-
-        for n in range(tile_n):
-            safe_idx = jnp.minimum(global_idx + n, num_tokens - 1)
-            pos = positions_ref[safe_idx]
-
-            block_idx_curr = pos // block_size
-            pos_start = pos - window + 1
-
-            @pl.loop(0, window)
-            def body_w(w):
-                pos_w = pos_start + w
-                block_idx_w = pos_w // block_size
-                p = block_idx_w - block_idx_curr + pages_to_buffer_per_token - 1
-
-                slots_per_part_row = field_rows
-                slots_per_token_row = state_rows_per_token
-                if overlap:
-                    is_prev = w < (window // 2)
-                    kv_slot_start_row = jax.lax.select(is_prev, 0, slots_per_part_row)
-                    score_slot_start_row = jax.lax.select(
-                        is_prev, 2 * slots_per_part_row, 3 * slots_per_part_row
-                    )
-                else:
-                    kv_slot_start_row = 0
-                    score_slot_start_row = slots_per_part_row
-
-                offset_in_block = pos_w % block_size
-
-                @pl.loop(0, slots_per_part_head, unroll=True)
-                def gather_loop(d_idx):
-                    kv_src_row = (
-                        offset_in_block * slots_per_token_row
-                        + kv_slot_start_row
-                        + d_idx
-                    )
-                    score_src_row = (
-                        offset_in_block * slots_per_token_row
-                        + score_slot_start_row
-                        + d_idx
-                    )
-
-                    kv_window_u8[n, w, d_idx, :, :] = page_buffer[
-                        n, p, kv_src_row, :, :
-                    ]
-                    score_window_u8[n, w, d_idx, :, :] = page_buffer[
-                        n, p, score_src_row, :, :
-                    ]
+    kv_list, score_list = [], []
+    for w in range(window):
+        seg, s = divmod(w, seg_states)
+        is_prev = w < window // 2
+        base = s * rows_per_state
+        lanes = slice(0, 128)
+        if is_indexer:
+            kv_row, score_row = base, base + 1
+            if overlap and not is_prev:
+                lanes = slice(128, 256)
+        elif overlap:
+            kv_row = base + (0 if is_prev else field_rows)
+            score_row = base + (2 if is_prev else 3) * field_rows
+        else:
+            kv_row, score_row = base, base + field_rows
+        kv_list.append(read(seg, kv_row, lanes))
+        score_list.append(read(seg, score_row, lanes))
+    return jnp.stack(kv_list, axis=1), jnp.stack(score_list, axis=1)

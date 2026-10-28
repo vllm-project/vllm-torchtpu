@@ -95,9 +95,9 @@ class CosSinRef(_BufferedRef):
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class PageBufferRef(_BufferedRef):
-    # VMEM block: cfgs.page_buffer_shape()
-    #   (tile_n, pages_to_buffer_per_token, page_size, hbm_pack, LANE) uint8
+class SegmentBufferRef(_BufferedRef):
+    # VMEM block: cfgs.segment_buffer_shape() of cfgs.segment_buffer_dtype,
+    #   (tile_n, segments_per_token, segment_rows, ...)
 
     def copy_in(self, src_ref, grid_indices):
         assert self.sem_recvs is not None
@@ -106,27 +106,37 @@ class PageBufferRef(_BufferedRef):
         sem = self.sem_recvs.at[slot]
         pid = grid_indices[0]
 
-        state_cache_ref, token_pages_ref = src_ref
+        state_cache_ref, token_pages_ref, positions_ref = src_ref
+        cfgs = self.cfgs
+        tile_n = cfgs.tile_sizes.tile_n
+        segments = cfgs.segments_per_token
+        seg_states = cfgs.segment_states
+        seg_rows = cfgs.segment_rows
 
-        tile_n = self.cfgs.tile_sizes.tile_n
-        pages_to_buffer_per_token = self.cfgs.pages_to_buffer_per_token
-
-        page_buffer_ref = cast(jax.Ref, self.window_ref.at[slot])
+        segment_u8 = cast(jax.Ref, self.window_ref.at[slot])
+        if segment_u8.dtype != jnp.uint8:
+            segment_u8 = segment_u8.bitcast(jnp.uint8).reshape(
+                tile_n, segments, seg_rows, *cfgs.cache_last_dims
+            )
         global_idx = pid * tile_n
 
-        @pl.loop(0, tile_n * pages_to_buffer_per_token, unroll=True)
+        @pl.loop(0, tile_n * segments, unroll=True)
         def loop_body(idx):
-            n = idx // pages_to_buffer_per_token
-            p = idx % pages_to_buffer_per_token
-            idx_n = global_idx + n
+            n = idx // segments
+            k = idx % segments
+            idx_n = jnp.minimum(global_idx + n, cfgs.dims.size_n - 1)
 
-            # compress_norm_rope_store looks up each token's window pages,
-            # oldest first.
-            page = token_pages_ref[idx_n * pages_to_buffer_per_token + p]
+            # Segment k holds window states [k, k + 1) * seg_states, starting
+            # at position - window + 1; a start before position 0 is masked by
+            # the body, so any in-page rows will do.
+            start = positions_ref[idx_n] - (cfgs.window - 1) + k * seg_states
+            offset = jnp.maximum(start, 0) % cfgs.state_block_size
+            page = token_pages_ref[idx_n * segments + k]
 
-            src = state_cache_ref.at[page, :, :, :]
-            dest = page_buffer_ref.at[n, p, :, :, :]
-            pltpu.make_async_copy(src, dest, sem).start()
+            src = state_cache_ref.at[
+                page, pl.ds(offset * cfgs.state_rows_per_token, seg_rows)
+            ]
+            pltpu.make_async_copy(src, segment_u8.at[n, k], sem).start()
 
     def wait_in(self, src_ref, grid_indices):
         assert self.sem_recvs is not None
@@ -439,7 +449,7 @@ def create_allocs_and_specs(
     is_first_mask_ref,
     is_first_mask_rope_ref,
 ) -> tuple[
-    tuple[CosSinRef | None, OutputRef, PageBufferRef, RoPEOutputRef | None],
+    tuple[CosSinRef | None, OutputRef, SegmentBufferRef, RoPEOutputRef | None],
     tuple[pl.BlockSpec | None, pl.BlockSpec, pl.BlockSpec, pl.BlockSpec | None],
     tuple[
         tuple[Any, ...] | None,
@@ -500,23 +510,25 @@ def create_allocs_and_specs(
     else:
         output_args = (cache_ref, kv_slot_mapping_ref)
 
-    # page_buffer
-    page_buffer_spec = pl.BlockSpec(
-        block_shape=cfgs.page_buffer_shape(),
+    # window segments
+    segment_shape = cfgs.segment_buffer_shape()
+    segment_spec = pl.BlockSpec(
+        block_shape=segment_shape,
         memory_space=pltpu.VMEM,
-        index_map=lambda i: (i, 0, 0, 0),
+        index_map=lambda i: (i,) + (0,) * (len(segment_shape) - 1),
     )
-    page_buffer_alloc = PageBufferRef.create(
-        spec=page_buffer_spec,
-        dtype_or_type=jnp.uint8,
+    segment_alloc = SegmentBufferRef.create(
+        spec=segment_spec,
+        dtype_or_type=cfgs.segment_buffer_dtype,
         buffer_type=pltpu.BufferType.INPUT,
         buffer_count=2,
         use_lookahead=False,
         cfgs=cfgs,
     )
-    page_buffer_args = (
+    segment_args = (
         cache_ref if state_cache_ref is None else state_cache_ref,
         token_pages_ref,
+        positions_ref,
     )
 
     # rope
@@ -539,7 +551,7 @@ def create_allocs_and_specs(
         rope_alloc = rope_spec = rope_args = None
 
     return (
-        (cos_sin_alloc, output_alloc, page_buffer_alloc, rope_alloc),
-        (cos_sin_spec, output_spec, page_buffer_spec, rope_spec),
-        (cos_sin_args, output_args, page_buffer_args, rope_args),
+        (cos_sin_alloc, output_alloc, segment_alloc, rope_alloc),
+        (cos_sin_spec, output_spec, segment_spec, rope_spec),
+        (cos_sin_args, output_args, segment_args, rope_args),
     )
