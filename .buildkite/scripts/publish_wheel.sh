@@ -26,8 +26,10 @@
 #      and version.
 #   2. Log in to PyPI: get a Google identity token for this VM's service
 #      account and trade it for a PyPI token (valid ~15 min, this project only).
-#   3. Upload with twine.
-#   4. Wait until the release is installable from PyPI.
+#   3. Sign each file with the same Google identity, so PyPI shows its
+#      provenance (PEP 740 attestation).
+#   4. Upload the files and their attestations with twine.
+#   5. Wait until the release is installable from PyPI.
 #
 # One-time PyPI setup, per project (vllm-torchtpu-core, vllm-torchtpu):
 #   Project -> Publishing -> Add a new publisher -> Google Cloud ->
@@ -36,8 +38,10 @@
 #
 # Environment:
 #   PUBLISH_PYPI   PyPI project name; the files must match it.
-#   PYPI_BASE_URL  Index to publish to (default: https://pypi.org).
 #   PYTHON         Interpreter for the venv (default: python3).
+#
+# Publishes to pypi.org only. The index is not configurable: the Google
+# identity token minted below is sent to it.
 #
 # CI only: must run on a GCE VM agent, after the matching build step.
 # ------------------------------------------------------
@@ -50,9 +54,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WHEEL_UTILS="${SCRIPT_DIR}/wheel_utils.py"
 PYTHON="${PYTHON:-python3}"
 PUBLISH_PYPI="${PUBLISH_PYPI:-}"
-INDEX_BASE="${PYPI_BASE_URL:-https://pypi.org}"
-INDEX_BASE="${INDEX_BASE%/}"
-UPLOAD_URL="${INDEX_BASE/https:\/\/pypi.org/https:\/\/upload.pypi.org}/legacy/"
+# Never read from the build's env: the identity token goes to INDEX_BASE.
+INDEX_BASE="https://pypi.org"
+UPLOAD_URL="https://upload.pypi.org/legacy/"
+OIDC_AUDIENCE="pypi"   # what pypi.org/_/oidc/audience answers
 
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/../release/lib.sh"
@@ -115,7 +120,7 @@ echo "--- Setting up isolated virtualenv"
 if command -v uv >/dev/null 2>&1; then
     uv venv "${WORK_DIR}/venv" --python "${PYTHON}"
     PY="${WORK_DIR}/venv/bin/python"
-    uv pip install --quiet --python "${PY}" id twine packaging pip
+    uv pip install --quiet --python "${PY}" id twine packaging pypi-attestations pip
 else
     # CI agents lack python3-venv, so create the venv without pip and
     # bootstrap pip with get-pip.py.
@@ -126,7 +131,7 @@ else
         https://bootstrap.pypa.io/get-pip.py \
         || die "could not download get-pip.py from bootstrap.pypa.io."
     "$PY" "${WORK_DIR}/get-pip.py" --quiet
-    "$PY" -m pip install --quiet id twine packaging
+    "$PY" -m pip install --quiet id twine packaging pypi-attestations
 fi
 
 # Check every file has the right project name and the tested version.
@@ -135,22 +140,25 @@ for dist in "${DISTS[@]}"; do
 done
 
 # --- Log in: trade a Google identity for a PyPI token ------------------------
-echo "--- Step 1: Querying OIDC audience from ${INDEX_BASE}"
+echo "--- Step 1: Checking the OIDC audience of ${INDEX_BASE}"
 AUDIENCE="$("$PY" "$WHEEL_UTILS" fetch_oidc_audience "${INDEX_BASE}")"
+[[ "${AUDIENCE}" == "${OIDC_AUDIENCE}" ]] \
+    || die "${INDEX_BASE} reports OIDC audience '${AUDIENCE}', expected" \
+        "'${OIDC_AUDIENCE}'."
 echo "Target PyPI URL  : ${INDEX_BASE}"
-echo "Expected Audience: ${AUDIENCE}"
+echo "Expected Audience: ${OIDC_AUDIENCE}"
 
 echo "--- Step 2: Minting GCP OIDC ID token"
-OIDC_TOKEN="$("$PY" -m id "${AUDIENCE}" 2>/dev/null || true)"
+OIDC_TOKEN="$("$PY" -m id "${OIDC_AUDIENCE}" 2>/dev/null || true)"
 # `id` may succeed with empty output, so check it looks like a JWT (3 parts).
 if [[ "$(printf '%s' "${OIDC_TOKEN}" | tr -cd '.' | wc -c | tr -d ' ')" != "2" ]]; then
     die "could not get an identity token. The publish step must run on a GCE" \
         "VM agent with a service account."
 fi
 
-# Fail early if the token isn't from Google. Logs only non-identifying claims.
-# Tokens are always passed via stdin, never argv or env.
-printf '%s' "${OIDC_TOKEN}" | "$PY" "$WHEEL_UTILS" verify_gcp_oidc_token
+# Fail early if the token isn't from Google or isn't for PyPI. Logs only
+# non-identifying claims. Tokens are always passed via stdin, never argv or env.
+printf '%s' "${OIDC_TOKEN}" | "$PY" "$WHEEL_UTILS" verify_gcp_oidc_token "${OIDC_AUDIENCE}"
 
 echo "--- Step 3: Exchanging GCP OIDC token for short-lived PyPI API token"
 # The PyPI token stays in memory only; it's never written to disk.
@@ -162,12 +170,21 @@ unset OIDC_TOKEN
 printf '%s' "${API_TOKEN}" | buildkite-agent redactor add >/dev/null 2>&1 || true
 echo "Successfully minted short-lived PyPI API token (redacted)."
 
+# --- Sign: provenance (PEP 740) ----------------------------------------------
+# Writes <file>.publish.attestation, signed with the Google identity Step 2
+# checked; PyPI shows it as the file's provenance. (Without that identity,
+# pypi_attestations would wait for an interactive login instead of failing.)
+echo "--- Step 4: Signing provenance attestations"
+"$PY" -m pypi_attestations sign "${DISTS[@]}"
+
 # --- Upload ------------------------------------------------------------------
-echo "--- Step 4: Uploading ${DISTS[*]##*/} to ${UPLOAD_URL}"
+echo "--- Step 5: Uploading ${DISTS[*]##*/} to ${UPLOAD_URL}"
 # --skip-existing makes a retry safe: files already on PyPI are left alone.
+# twine attaches only the attestation files it is given, so pass them too.
 TWINE_USERNAME="__token__" TWINE_PASSWORD="${API_TOKEN}" \
-    "$PY" -m twine upload --non-interactive --skip-existing \
-    --repository-url "${UPLOAD_URL}" "${DISTS[@]}"
+    "$PY" -m twine upload --non-interactive --skip-existing --attestations \
+    --repository-url "${UPLOAD_URL}" \
+    "${DISTS[@]}" "${WORK_DIR}"/dist/*.publish.attestation
 unset API_TOKEN
 
 # --- Wait until PyPI serves it -----------------------------------------------
@@ -177,7 +194,7 @@ unset API_TOKEN
 #                                manylinux_2_28_x86_64), whatever Python this
 #                                agent has. Pure-Python core wheels match too.
 #   --only-binary :all:          check the wheel; never build the sdist.
-echo "--- :hourglass: Waiting for ${PUBLISH_PYPI}==${VERSION} on PyPI"
+echo "--- Waiting for ${PUBLISH_PYPI}==${VERSION} on PyPI"
 for attempt in $(seq 1 20); do
     if "$PY" -m pip download --quiet --no-deps --no-cache-dir \
         --python-version 3.12 --platform manylinux_2_28_x86_64 \
