@@ -8,6 +8,7 @@ import jax
 import torch
 from vllm.v1.worker.utils import allocate_kv_cache as allocate_upstream_kv_cache
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.csa_cache_layout import ROW_WORDS
 from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout
 
