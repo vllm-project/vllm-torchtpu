@@ -41,6 +41,14 @@ kernel's either way. The count is the same on every TP rank (the ranks share
 the step's tokens). The drafter traces keep the sized op: the mask describes
 the target step's rows.
 
+With TPU_SMALL_ALL_REDUCE_CHIP_PAIRS=<rows> every kernel all-reduce of at
+least <rows> rows (up to the row cap) runs the two-shot by chip pairs
+(``all_reduce`` form "pairs"): each chip adds its two cores' blocks first and
+sends one piece over ICI per chip. Such a block skips the valid-rows
+all-reduce. At prebuild every rank checks that mesh indices 2i and 2i + 1 are
+the two cores of one chip, and the pairs form runs once at the row cap on
+known blocks; any rank's failure raises on every rank.
+
 With TPU_FUSED_OPROJ_AR a row-parallel per-channel FP8 layer served by the
 weight-streaming kernel (TPU_FP8_LINEAR_PALLAS) whose output this all-reduce
 would sum -- attention's o_proj -- takes ``row_parallel_or`` instead: one kernel
@@ -49,9 +57,11 @@ fp8_oproj_all_reduce.py), bitwise the two-call path, for blocks of at most
 16 rows inside the warmup. Everything else keeps the layer's own forward.
 """
 
+import faulthandler
+
 import jax
 import torch
-from jax.sharding import PartitionSpec
+from jax.sharding import NamedSharding, PartitionSpec
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
@@ -62,6 +72,9 @@ from vllm_torchtpu.distributed.ep_mesh import (
     get_ep_group,
 )
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
+from vllm_torchtpu.kernels.experimental.moe_tp_decode.all_reduce import (
+    check_chip_pairs,
+)
 from vllm_torchtpu.kernels.experimental.small_collectives import (
     all_reduce,
     reduce_scatter,
@@ -85,6 +98,8 @@ MAX_ROWS = 96
 # Largest DP combine, in rows per engine, the reduce-scatter takes: it beats
 # XLA through 24 rows, ties at 32 and loses at 64 (j-de6349e8).
 COMBINE_MAX_ROWS = 24
+# A wrong rank or mesh hangs the chip-pair self-test: dump every stack and exit.
+SELFTEST_TIMEOUT_S = 300
 
 
 def max_rows() -> int:
@@ -106,6 +121,8 @@ _VALID_TILE_ROWS = 0
 _RANK = None
 _CORES = 0
 _MESH_RANKS: tuple[int, ...] = ()
+# Blocks of at least this many rows take the chip-pair two-shot (0: none).
+_PAIR_ROWS = 0
 # Whether the DP group is the mesh, so its combine may take the kernel.
 _DP_COMBINE = False
 # The fused row-parallel FP8 matmul + all-reduce (TPU_FUSED_OPROJ_AR); built only
@@ -113,11 +130,12 @@ _DP_COMBINE = False
 _MM_AR_OP = None
 
 
-def _build_all_reduce(mesh, psum_above: int | None = None):
+def _build_all_reduce(mesh, psum_above: int | None = None, pair_rows: int = 0):
     """The all-reduce op over ``mesh``. With ``psum_above``, a block of more
     rows than that is summed by XLA's all-reduce instead of the kernel: the
     block's rows are concrete when JAX exports each bucket, so the choice
-    leaves no guard on the caller's trace."""
+    leaves no guard on the caller's trace. Blocks of at least ``pair_rows``
+    rows take the chip-pair two-shot (0: none)."""
     n = mesh.shape[EP_AXIS_NAME]
     spec = PartitionSpec(EP_AXIS_NAME)
 
@@ -125,7 +143,7 @@ def _build_all_reduce(mesh, psum_above: int | None = None):
         if psum_above is not None and block.shape[0] > psum_above:
             return jax.lax.psum(block, EP_AXIS_NAME)
         return all_reduce.small_all_reduce(
-            block, num_cores=n, axis=EP_AXIS_NAME, rank=rank
+            block, num_cores=n, axis=EP_AXIS_NAME, rank=rank, pair_rows=pair_rows
         )
 
     def fn(x: jax.Array, rank: jax.Array) -> jax.Array:
@@ -237,11 +255,121 @@ def _build_reduce_scatter(mesh):
     )
 
 
-def prebuild() -> None:
+def _gather(obj) -> list:
+    """all_gather_object over the EP group's CPU group, in group rank order."""
+    group = get_ep_group()
+    assert group is not None
+    seen = [None] * int(group.world_size)
+    torch.distributed.all_gather_object(seen, obj, group=group.cpu_group)
+    return seen
+
+
+def _chip_places(mesh, mesh_index: int) -> list[tuple[tuple[int, ...], int | None]]:
+    """(chip coords, core on chip) at each index of ``mesh``. Its devices
+    carry ids only (get_pallas_mesh builds them from the process group), so
+    every rank reports its own JAX device, the one TPU device its process
+    addresses, and it must be the mesh's device at the rank's index.
+    Collective."""
+    device = jax.local_devices()[0]
+    mine = dict(
+        mesh_index=mesh_index,
+        id=int(device.id),
+        coords=tuple(getattr(device, "coords", None) or ()),
+        core=getattr(device, "core_on_chip", None),
+    )
+    seen = sorted(_gather(mine), key=lambda s: s["mesh_index"])
+    ids = [int(d.id) for d in mesh.devices.flat]
+    if [(s["mesh_index"], s["id"]) for s in seen] != list(enumerate(ids)):
+        raise RuntimeError(
+            f"small all-reduce: the ranks' JAX devices {seen} are not the "
+            f"mesh's devices {ids} in mesh order"
+        )
+    return [(s["coords"], s["core"]) for s in seen]
+
+
+def _selftest_pairs(mesh, mesh_index: int, rows: int, hidden: int) -> bool:
+    """Whether the chip-pair two-shot, run once through ``mesh`` and the rank
+    operand on all_reduce.selftest_blocks, gives this rank the exact sum.
+    Collective: every rank makes the same call."""
+    from torch_tpu._internal import pallas
+
+    n = mesh.shape[EP_AXIS_NAME]
+    spec = PartitionSpec(EP_AXIS_NAME)
+    sharding = NamedSharding(mesh, spec)
+
+    def body(block, rank):
+        return all_reduce.small_all_reduce(
+            block, num_cores=n, axis=EP_AXIS_NAME, rank=rank, form="pairs"
+        )
+
+    sharded = jax.shard_map(
+        body, mesh=mesh, in_specs=(spec, spec), out_specs=spec, check_vma=False
+    )
+
+    def fn(x: jax.Array, rank: jax.Array) -> jax.Array:
+        return sharded(jax.device_put(x, sharding), jax.device_put(rank, sharding))
+
+    # pyrefly: ignore[no-matching-overload]
+    op = pallas.jax_op(
+        "pallas::small_all_reduce_pairs_selftest",
+        fn,
+        mesh=mesh,
+        input_partition_specs=(spec, spec),
+        output_partition_specs=spec,
+    )
+    op.register_fake(lambda x, rank: torch.empty_like(x))
+    blocks = all_reduce.selftest_blocks(n, rows, hidden)
+    mine = torch.from_numpy(blocks[mesh_index]).to(torch.bfloat16).to(_RANK.device)
+    faulthandler.dump_traceback_later(SELFTEST_TIMEOUT_S, exit=True)
+    try:
+        out = op(mine, _RANK).to(torch.float32).cpu().numpy()
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+    return all_reduce.selftest_ok(blocks, out)
+
+
+def _arm_chip_pairs(mesh, mesh_index: int, hidden: int) -> int:
+    """TPU_SMALL_ALL_REDUCE_CHIP_PAIRS: the rows from which blocks take the
+    chip-pair two-shot, once the mesh pairs every chip's two cores and the
+    form gives every rank the exact sum at the row cap. Collective; raises on
+    every rank when any rank fails."""
+    pair_rows = envs.TPU_SMALL_ALL_REDUCE_CHIP_PAIRS
+    if hidden <= 0 or hidden % (_CORES * LANES):
+        raise ValueError(
+            f"TPU_SMALL_ALL_REDUCE_CHIP_PAIRS: hidden size {hidden} is not a "
+            f"multiple of {_CORES} cores x {LANES} lanes"
+        )
+    places = _chip_places(mesh, mesh_index)
+    check_chip_pairs(places)
+    rows = max_rows()
+    ok = _selftest_pairs(mesh, mesh_index, rows, hidden)
+    seen = _gather(dict(mesh_index=mesh_index, ok=ok))
+    if not all(s["ok"] for s in seen):
+        raise RuntimeError(
+            "small all-reduce: the chip-pair self-test at "
+            f"{rows} x {hidden} failed (per rank): {seen}"
+        )
+    ids = [int(d.id) for d in mesh.devices.flat]
+    logger.info(
+        "Small all-reduce by chip pairs from %d rows; self-test at %d x %d "
+        "passed; pairs (mesh indices: device ids @ chip coords): %s",
+        pair_rows,
+        rows,
+        hidden,
+        "; ".join(
+            f"{i},{i + 1}: {ids[i]},{ids[i + 1]} @ {places[i][0]}"
+            for i in range(0, len(ids), 2)
+        ),
+    )
+    return pair_rows
+
+
+def prebuild(hidden_size: int = 0) -> None:
     """Build the ops and this core's rank tensor, outside any traced region:
-    the mesh comes from a collective. A no-op unless TPU_SMALL_ALL_REDUCE."""
+    the mesh comes from a collective. A no-op unless TPU_SMALL_ALL_REDUCE.
+    hidden_size is the model's, the width of the chip-pair self-test."""
     global _AR_OP, _AR_SIZED_OP, _RS_OP, _RANK, _CORES, _MESH_RANKS, _DP_COMBINE
-    global _AR_VALID_OP, _VALID_TILE_ROWS, _MM_AR_OP
+    global _AR_VALID_OP, _VALID_TILE_ROWS, _MM_AR_OP, _PAIR_ROWS
     if not envs.TPU_SMALL_ALL_REDUCE or _AR_OP is not None:
         return
     mesh = build_ep_mesh()
@@ -261,10 +389,16 @@ def prebuild() -> None:
     ep_group = get_ep_group()
     assert ep_group is not None  # build_ep_mesh() returned a mesh over it
     _MESH_RANKS = tuple(int(r) for r in ep_group.ranks)
-    _RANK = torch.tensor([ep_mesh_index()], dtype=torch.int32, device="tpu")
-    _AR_OP = _build_all_reduce(mesh)
+    mesh_index = ep_mesh_index()
+    assert mesh_index is not None
+    _RANK = torch.tensor([mesh_index], dtype=torch.int32, device="tpu")
+    if envs.TPU_SMALL_ALL_REDUCE_CHIP_PAIRS:
+        _PAIR_ROWS = _arm_chip_pairs(mesh, mesh_index, hidden_size)
+    _AR_OP = _build_all_reduce(mesh, pair_rows=_PAIR_ROWS)
     if envs.TPU_SMALL_ALL_REDUCE_DRAFT:
-        _AR_SIZED_OP = _build_all_reduce(mesh, psum_above=max_rows())
+        _AR_SIZED_OP = _build_all_reduce(
+            mesh, psum_above=max_rows(), pair_rows=_PAIR_ROWS
+        )
     _RS_OP = _build_reduce_scatter(mesh)
     if envs.TPU_SMALL_ALL_REDUCE_VALID_ROWS:
         from jax.experimental.pallas import tpu as pltpu
@@ -281,7 +415,8 @@ def prebuild() -> None:
     logger.info(
         "Small collectives armed | cores=%d | max_rows=%d | "
         "combine_max_rows=%d | one_shot_max_bytes=%d | tp_all_reduce=%s | "
-        "dp_combine=%s | outside_warmup=%s | valid_rows=%s | fused_oproj_ar=%s",
+        "dp_combine=%s | outside_warmup=%s | valid_rows=%s | fused_oproj_ar=%s | "
+        "chip_pairs=%s",
         _CORES,
         max_rows(),
         COMBINE_MAX_ROWS,
@@ -295,6 +430,7 @@ def prebuild() -> None:
         if _AR_VALID_OP is not None
         else "off",
         _MM_AR_OP is not None,
+        f"from {_PAIR_ROWS} rows" if _PAIR_ROWS else "off",
     )
 
 
@@ -340,15 +476,22 @@ def _valid_rows(rows: int, mask: torch.Tensor) -> torch.Tensor:
 
 def _small_all_reduce(x: torch.Tensor) -> torch.Tensor:
     """A block of at most max_rows rows inside the warmup: the valid-rows
-    all-reduce when armed and the block has a fold path, else the
-    two-shot/one-shot kernel (with the mask read, so every bucket lifts the
-    same buffers)."""
+    all-reduce when armed and the block has a fold path and is below the
+    chip-pair rows, else the kernel _AR_OP picks (with the mask read, so every
+    bucket lifts the same buffers)."""
     assert _AR_OP is not None, "init_small_all_reduce builds the ops first"
     mask = _padding_mask()
     if mask is None:
         return _AR_OP(x, _RANK)
     rows, hidden = x.shape
-    if all_reduce.fold_geometry(rows, hidden, _CORES, _VALID_TILE_ROWS) is not None:
+    # The cap rule (envs.bucket_gate_edge): `rows >= _PAIR_ROWS` with the
+    # caller's `rows <= max_rows()` would pin the traced token count when the
+    # pair rows are the row cap (64 and 64: ConstraintViolationError).
+    pairs = _PAIR_ROWS > 0 and rows > envs.bucket_gate_edge(_PAIR_ROWS)
+    if (
+        not pairs
+        and all_reduce.fold_geometry(rows, hidden, _CORES, _VALID_TILE_ROWS) is not None
+    ):
         assert _AR_VALID_OP is not None
         return _AR_VALID_OP(x, _valid_rows(rows, mask), _RANK)
     return _AR_OP(retain(x), _RANK)

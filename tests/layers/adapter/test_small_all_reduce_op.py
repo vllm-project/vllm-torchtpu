@@ -270,12 +270,20 @@ def test_draft_route_leaves_no_token_count_guard(monkeypatch, warmup, traces):
     assert len(graphs) == traces
 
 
+@pytest.mark.parametrize("pairs", [0, 64])
 @pytest.mark.parametrize("draft", [False, True])
-def test_prebuild_builds_the_sized_op_only_with_the_draft_flag(monkeypatch, draft):
+def test_prebuild_builds_the_sized_op_only_with_the_draft_flag(
+    monkeypatch, draft, pairs
+):
+    """And with TPU_SMALL_ALL_REDUCE_CHIP_PAIRS both all-reduce ops take the
+    pair rows _arm_chip_pairs returns."""
     import types
 
     monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE", True)
     monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE_DRAFT", draft)
+    monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE_CHIP_PAIRS", pairs)
+    monkeypatch.setattr(op, "_PAIR_ROWS", 0)
+    monkeypatch.setattr(op, "_arm_chip_pairs", lambda mesh, index, hidden: pairs)
     monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 32)
     # On by default (trial 5); its fused matmul + all-reduce op is covered below.
     monkeypatch.setattr(op.envs, "TPU_FUSED_OPROJ_AR", False)
@@ -295,7 +303,9 @@ def test_prebuild_builds_the_sized_op_only_with_the_draft_flag(monkeypatch, draf
     monkeypatch.setattr(
         op,
         "_build_all_reduce",
-        lambda mesh, psum_above=None: built.append(psum_above) or psum_above,
+        lambda mesh, psum_above=None, pair_rows=0: (
+            built.append((psum_above, pair_rows)) or psum_above
+        ),
     )
     monkeypatch.setattr(op, "_build_reduce_scatter", lambda mesh: "rs")
     import vllm.distributed.parallel_state as ps
@@ -303,8 +313,8 @@ def test_prebuild_builds_the_sized_op_only_with_the_draft_flag(monkeypatch, draf
     group = types.SimpleNamespace(ranks=list(MESH))
     monkeypatch.setattr(ps, "get_dp_group", lambda: group)
     monkeypatch.setattr(ps, "get_tp_group", lambda: group)
-    op.prebuild()
-    assert built == ([None, 32] if draft else [None])
+    op.prebuild(HIDDEN)
+    assert built == ([(None, pairs), (32, pairs)] if draft else [(None, pairs)])
     assert (op._AR_SIZED_OP == 32) if draft else op._AR_SIZED_OP is None
 
 
@@ -393,6 +403,77 @@ def test_valid_rows_op_takes_blocks_with_a_fold_path_with_the_mask_count(
     assert n_valid.dtype == torch.int32
     assert n_valid.tolist() == [5]
     ar.assert_not_called()
+
+
+@pytest.mark.parametrize("rows,pairs", [(32, False), (64, True), (96, True)])
+def test_chip_pair_rows_skip_the_valid_rows_op(
+    armed, valid_rows, monkeypatch, rows, pairs
+):
+    """TPU_SMALL_ALL_REDUCE_CHIP_PAIRS: a block of at least the pair rows takes
+    the plain op, which runs the chip-pair two-shot, its input carrying the
+    mask read."""
+    ar, _ = armed
+    monkeypatch.setattr(op, "_PAIR_ROWS", 64)
+    x = _block(rows)
+    op.all_reduce_or(x, MESH, _fallback)
+    assert ar.called is pairs
+    assert valid_rows.called is not pairs
+    if pairs:
+        (block, rank), _ = ar.call_args
+        torch.testing.assert_close(block, x, rtol=0, atol=0)
+        assert rank is op._RANK
+
+
+@torch.library.custom_op("small_ar_test::plain", mutates_args=())
+def _plain_op(x: torch.Tensor, rank: torch.Tensor) -> torch.Tensor:
+    return x.clone()
+
+
+_plain_op.register_fake(lambda x, rank: torch.empty_like(x))
+
+
+@torch.library.custom_op("small_ar_test::valid_rows", mutates_args=())
+def _valid_rows_op(
+    x: torch.Tensor, n_valid: torch.Tensor, rank: torch.Tensor
+) -> torch.Tensor:
+    return x.clone()
+
+
+_valid_rows_op.register_fake(lambda x, n_valid, rank: torch.empty_like(x))
+
+
+@pytest.mark.parametrize("rows,traced", [(32, "valid_rows"), (64, "plain")])
+def test_chip_pair_choice_keeps_the_token_count_dynamic(
+    armed, valid_rows, monkeypatch, rows, traced
+):
+    """Pair rows at the row cap (64 and 64), traced the way the backbone is
+    (token count marked dynamic): the choice is the cap rule `rows > 32`, so
+    the trace keeps the token count dynamic. `rows >= 64` beside the row cap's
+    `rows <= 64` pinned it to 64 (ConstraintViolationError)."""
+    monkeypatch.setattr(op.envs, "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 64)
+    monkeypatch.setattr(op, "_PAIR_ROWS", 64)
+    monkeypatch.setattr(op, "_AR_OP", _plain_op)
+    monkeypatch.setattr(op, "_AR_VALID_OP", _valid_rows_op)
+    targets = []
+
+    def backend(gm, example_inputs):
+        targets.extend(node.target for node in gm.graph.nodes)
+        return gm.forward
+
+    torch._dynamo.reset()
+    x = _block(rows)
+    torch._dynamo.mark_dynamic(x, 0)
+    compiled = torch.compile(
+        lambda x: op.all_reduce_or(x, MESH, _fallback), backend=backend, fullgraph=True
+    )
+    compiled(x)
+    torch._dynamo.reset()
+    called = {
+        name
+        for name in ("plain", "valid_rows")
+        if getattr(torch.ops.small_ar_test, name).default in targets
+    }
+    assert called == {traced}
 
 
 def test_valid_rows_count_is_the_whole_block_without_padding(
