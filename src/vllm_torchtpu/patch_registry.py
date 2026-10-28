@@ -100,11 +100,13 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_offload_fine_prefix_alignment", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_hybrid_kv_load_failure_recovery", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_block_pool_lifo_free", _ACTIVE),
+    Patch("vllm_torchtpu:_patch_vllm_abort_on_preemption", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_same_step_prefix_hits", _ENGINE),
     Patch(
         "vllm_torchtpu.core.eagle_block_drop:patch_disable_eagle_block_drop",
         _ENGINE,
     ),
+    Patch("vllm_torchtpu:_patch_dflash_drafting_slot_budget", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),
@@ -132,6 +134,9 @@ PATCHES = (
         refresh="vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings",
     ),
     Patch("vllm_torchtpu.layers.adapter.vision_attention", _ACTIVE),
+    # Out-of-tree FP32 rotary embedding (CUDA numerics). Must be registered
+    # before any RotaryEmbedding is constructed at model load.
+    Patch("vllm_torchtpu.layers.adapter.rotary_embedding", _ACTIVE),
     # Platform runtime configuration.
     Patch(
         "vllm_torchtpu.platforms.tpu_platform:_configure_torchtpu_eager_mode", _ACTIVE

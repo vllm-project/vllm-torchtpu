@@ -31,7 +31,13 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
+from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
+    config as compressor_config,
+)
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
+    RunLocalStateSpec,
+)
 from vllm_torchtpu.layers.core.attention_metadata import attention_block_table_width
 from vllm_torchtpu.logger import init_logger
 
@@ -101,6 +107,23 @@ class DsV4KVCacheAllocator:
         swa_layer_groups: list[list[str]] = []
         state_layer_names: list[str] = []
         for group in kv_cache_config.kv_cache_groups:
+            # vLLM's grouping compares neither the spec type nor prefix
+            # caching, so a cacheable window of the same size and block size
+            # can share a group with the run-local state; one side would then
+            # be prefix-cached wrongly. Layers keep their own spec only in the
+            # packed layout DSv4 uses; a merged group spec maps every layer
+            # to one spec, so this check cannot see a mix there.
+            run_local = {
+                isinstance(per_layer_spec(layer_name), RunLocalStateSpec)
+                for layer_name in group.layer_names
+                if layer_name not in self.runner.shared_kv_cache_layers
+            }
+            if len(run_local) > 1:
+                raise ValueError(
+                    "DeepSeek-V4 cache group mixes RunLocalStateSpec layers, "
+                    "which are not prefix-cacheable, with prefix-cacheable "
+                    f"layers: layers={group.layer_names}"
+                )
             swa_in_group: list[str] = []
             for layer_name in group.layer_names:
                 if layer_name in self.runner.shared_kv_cache_layers:
@@ -200,9 +223,17 @@ class DsV4KVCacheAllocator:
             spec = per_layer_spec(layer_name)
             page_size = spec.num_states
             if layer_name.endswith(self._DS_V4_INDEXER_CACHE_SUFFIX):
-                # Lightning indexer: 128 fp8 values + 1 e8m0 scale per token,
-                # padded to a 256B record; 4 tokens per row.
-                shape = (num_blocks, page_size // packing, packing, 256)
+                # SEQ_ALONG_LANE: token t is lane t of 32 fp8 groups + 1
+                # e8m0 scale group (132B/token of key traffic); the
+                # compressor state still addresses the page as
+                # (33, 4, 256) rows, hence exactly 256 tokens per page.
+                compressor_config.check_seq_along_lane_page_size(page_size)
+                shape = (
+                    num_blocks,
+                    compressor_config.SAL_SUBLANE_GROUPS,
+                    packing,
+                    page_size,
+                )
                 kv_caches[layer_name] = _create_cache(shape, layer_name)
             elif spec.tokens_per_state == self._DS_V4_CSA_COMPRESS_RATIO:
                 # CSA is split across two arrays, for NoPE and RoPE.

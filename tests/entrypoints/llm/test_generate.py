@@ -61,9 +61,12 @@ GREEDY_SAMPLING_PARAMS = SamplingParams(temperature=0.0, max_tokens=4)
 def llm():
     # pytest caches the fixture so we use weakref.proxy to
     # enable garbage collection
+    # Every call sends at most 4 prompts, so 8 sequences is the only request
+    # bucket a step uses; the default compiles them up to 64.
     llm = LLM(
         model=MODEL_NAME,
         max_num_batched_tokens=64,
+        max_num_seqs=8,
         max_model_len=64,
         tensor_parallel_size=1,
         # TODO: Reduce GPU memory utilization after KV cache optimization.

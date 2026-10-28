@@ -41,6 +41,7 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import (
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
+    from vllm.config.kernel import IrOpPriorityConfig
     from vllm.inputs import EngineInput
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
@@ -338,6 +339,57 @@ def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
         )
 
 
+def _validate_lora_config(vllm_config: "VllmConfig") -> None:
+    """Rejects LoRA settings that the TPU LoRA path does not support yet.
+
+    LoRA runs on a single chip with a dense model without speculative decoding.
+    Other settings fail here with the reason.
+    """
+    lora_config = vllm_config.lora_config
+    if lora_config is None:
+        return
+    model_config = vllm_config.model_config
+    parallel_config = vllm_config.parallel_config
+    unsupported = {
+        # RowParallelLinearWithLoRA adds the bias on rank 0 only, so the ranks
+        # would compile different graphs.
+        "tensor_parallel_size > 1": parallel_config.tensor_parallel_size > 1,
+        # Untested; each DP engine has its own LoRA manager.
+        "data_parallel_size > 1": parallel_config.data_parallel_size > 1,
+        # Untested.
+        "pipeline_parallel_size > 1": parallel_config.pipeline_parallel_size > 1,
+        # The LoRA mapping covers every token of the step, but the forward
+        # runs on a local slice of them.
+        "prefill_context_parallel_size > 1": (
+            parallel_config.prefill_context_parallel_size > 1
+        ),
+        # Untested.
+        "decode_context_parallel_size > 1": (
+            parallel_config.decode_context_parallel_size > 1
+        ),
+        # Verify steps sample several tokens per request, which the sampler
+        # mapping does not cover, and the drafter shares the target's
+        # embed_tokens, which LoRA wraps.
+        "speculative decoding": vllm_config.speculative_config is not None,
+        # FusedMoEWithLoRA requires a non-monolithic MoE; every TPU MoE method
+        # is monolithic.
+        "MoE models": model_config.is_moe,
+        # Only meaningful with tensor parallelism.
+        "fully_sharded_loras": lora_config.fully_sharded_loras,
+        # The TPU runner never sets the tower or connector mappings.
+        "enable_tower_connector_lora": lora_config.enable_tower_connector_lora,
+        # The LoRA ops multiply activations by LoRA weights without a cast.
+        f"lora_dtype {lora_config.lora_dtype} differing from the model dtype "
+        f"{model_config.dtype}": lora_config.lora_dtype != model_config.dtype,
+    }
+    rejected = [setting for setting, hit in unsupported.items() if hit]
+    if rejected:
+        raise ValueError(
+            f"LoRA on TPU does not support {'; '.join(rejected)}. Change these "
+            "settings or disable LoRA."
+        )
+
+
 def _register_tpu_kv_connectors() -> None:
     """Register TPU-specific KV connectors in vLLM's factory name registry.
 
@@ -432,6 +484,35 @@ class TpuPlatform(Platform):
     @classmethod
     def import_kernels(cls) -> None:
         return
+
+    @classmethod
+    def import_ir_kernels(cls) -> None:
+        """Register the TPU providers for vLLM IR ops on top of the built-ins.
+
+        ``IrOpPriorityConfig.set_default`` calls this in every worker before
+        installing the priorities from ``get_default_ir_op_priority``.
+        """
+        super().import_ir_kernels()
+        import vllm_torchtpu.layers.adapter.ir_ops  # noqa: F401
+
+    @classmethod
+    def get_default_ir_op_priority(
+        cls, vllm_config: "VllmConfig"
+    ) -> "IrOpPriorityConfig":
+        """Prefer the CUDA-numerics ``tpu`` RMSNorm providers over ``native``.
+
+        See ``vllm_torchtpu/layers/adapter/ir_ops.py``. Users can still force
+        ``native`` through ``--kernel-config`` for A/B comparisons.
+        """
+        from vllm.config.kernel import IrOpPriorityConfig
+
+        from vllm_torchtpu.layers.adapter.ir_ops import TPU_IR_PROVIDER
+
+        return IrOpPriorityConfig.with_default(
+            ["native"],
+            rms_norm=[TPU_IR_PROVIDER, "native"],
+            fused_add_rms_norm=[TPU_IR_PROVIDER, "native"],
+        )
 
     @classmethod
     def device_id_to_physical_device_id(cls, device_id: int) -> int:
@@ -634,10 +715,6 @@ class TpuPlatform(Platform):
         return False
 
     @classmethod
-    def get_lora_vocab_padding_size(cls) -> int:
-        return 1
-
-    @classmethod
     def inference_mode(cls):
         return True
 
@@ -815,10 +892,21 @@ class TpuPlatform(Platform):
                 ),
             )
         else:
+            # TPU never expands vLLM's "cudagraph_capture_sizes" placeholder
+            # (no static graph mode), and the runner needs integer buckets.
+            if strings := [
+                s for s in compilation_config.compile_sizes if isinstance(s, str)
+            ]:
+                raise ValueError(
+                    f"compile_sizes entries must be integers on TPU, got {strings}. "
+                    "List the token sizes to compile instead."
+                )
             compilation_config.compile_sizes = sorted(compilation_config.compile_sizes)
 
         if envs.TPU_MOE_SEQUENCE_PARALLEL:
             _configure_sequence_parallel_moe(vllm_config)
+        # After the sequence-parallel filter, which can drop the largest size.
+        _validate_token_budget_fits_compile_sizes(vllm_config)
 
         # Clear compile_ranges_split_points — TPU always pads to exact
         # compile_sizes so catch-all ranges are never used.
@@ -852,7 +940,19 @@ class TpuPlatform(Platform):
                 "Using bfloat16 instead.",
                 model_config.dtype,
             )
+            lora_config = vllm_config.lora_config
+            if lora_config is not None and lora_config.lora_dtype != torch.bfloat16:
+                # vLLM resolves lora_dtype "auto" to the model dtype before this
+                # hook, so "auto" and an explicit value look the same here. The
+                # LoRA weights must be in the dtype the model runs in.
+                logger.warning(
+                    "Using bfloat16 for LoRA instead of %s.", lora_config.lora_dtype
+                )
+                lora_config.lora_dtype = torch.bfloat16
             model_config.dtype = torch.bfloat16
+        # After the bfloat16 switch, so lora_dtype is checked against the
+        # dtype the model runs in.
+        _validate_lora_config(vllm_config)
 
         scheduler_config = vllm_config.scheduler_config
         cache_config = vllm_config.cache_config
@@ -1394,3 +1494,60 @@ def _configure_sequence_parallel_moe(vllm_config: VllmConfig) -> None:
             tp,
         )
     cc.compile_sizes = cast(list[int | str], kept)
+
+
+def _validate_token_budget_fits_compile_sizes(vllm_config: VllmConfig) -> None:
+    """Reject a per-step token budget larger than the largest compile size.
+
+    The runner pads every step to a compile size and asserts that one fits.
+    A server whose budget exceeds the largest compile size starts fine and
+    then crashes on the first large step, for example a decode server with
+    compile_sizes [256] and max_num_batched_tokens 16384 that resumes a
+    preempted request and recomputes its full prompt locally. Fail at startup
+    instead, without changing the user's config.
+
+    vLLM's scheduler bounds a step by max_num_batched_tokens and, when it is
+    smaller, by max_num_scheduled_tokens. vLLM fills max_num_scheduled_tokens
+    from max_num_batched_tokens under speculative decoding, so a set value
+    does not mean the user chose it.
+
+    Under prefill context parallelism a compile size counts rows on one rank.
+    The runner deals a step's tokens to ranks in chunks of
+    cp_kv_cache_interleave_size, round-robin from rank 0
+    (pcp_local_token_counts), so rank 0 holds the most rows and is the one
+    that must fit.
+
+    Raises:
+        ValueError: if a step of the full budget could put more rows on one
+            rank than the largest compile size.
+    """
+    cc = vllm_config.compilation_config
+    sc = vllm_config.scheduler_config
+    if not cc.compile_sizes:
+        return
+    pc = vllm_config.parallel_config
+    pcp = max(1, int(pc.prefill_context_parallel_size))
+    interleave = max(1, int(pc.cp_kv_cache_interleave_size)) if pcp > 1 else 1
+    cycle = pcp * interleave
+    largest = max(int(s) for s in cc.compile_sizes)
+    # The largest step whose rank-0 rows fit `largest`.
+    limit = (largest // interleave) * cycle + largest % interleave
+    budget_flag, budget = "--max-num-batched-tokens", sc.max_num_batched_tokens
+    scheduled = sc.max_num_scheduled_tokens
+    if scheduled is not None and scheduled < budget:
+        budget_flag, budget = "--max-num-scheduled-tokens", scheduled
+    if budget <= limit:
+        return
+    # Rank-0 rows of a full-budget step: the smallest compile size that fits.
+    min_compile_size = (budget // cycle) * interleave + min(budget % cycle, interleave)
+    layout = (
+        f", {pcp} prefill context parallel ranks, interleave {interleave}"
+        if pcp > 1
+        else ""
+    )
+    raise ValueError(
+        f"{budget_flag} ({budget}) exceeds the largest step that fits "
+        f"compile_sizes (largest entry {largest}{layout}: {limit} tokens), so "
+        f"a step could have no compiled size to pad to. Set {budget_flag} to "
+        f"at most {limit}, or add a compile size of at least {min_compile_size}."
+    )

@@ -243,6 +243,93 @@ def _staged_walk_products_compiled(
     )
 
 
+# Default cap on the number of recycled H2D host buffers registered on a runner.
+# Each metadata walk calls `zeros_h2d_source` at most twice (once for the
+# batched block table in `stage_block_table_uploads` / `build()`, and once for
+# compact Mamba slot indices in `_build_mamba_state_indices`). With MTP /
+# speculative decoding (`num_speculative_tokens` up to ~5), one decode step runs
+# 1 target walk + up to (K + 1) draft walks (+ 1 optional DP dummy walk) ~= 8
+# walks (16 buffers). Because draft walks run after the step's input-staging
+# fence is recorded, two consecutive decode steps can hold buffers in flight or
+# in the free list at once (~32 buffers); 64 gives a 2x generous upper bound.
+#
+# TODO: Extract this non-blocking H2D host-buffer staging, fence-lifetime
+# tracking, and recycling pool into a dedicated standalone class/module in a
+# future refactor instead of spreading the state across `TPUModelRunner` and
+# `attention_metadata`.
+_DEFAULT_MAX_H2D_BUFFERS = 64
+
+
+def _noop_release() -> None:
+    pass
+
+
+def stage_h2d_upload(runner: Any, host: torch.Tensor) -> torch.Tensor:
+    """`host.to(runner.device, non_blocking=True)`, keeping `host` alive until
+    the runner's next input-staging fence has been synchronized.
+
+    TorchTPU reads the CPU source asynchronously without holding a reference
+    to it, so a per-call buffer would otherwise be freed (and its memory
+    reused) while the transfer is still in flight. The runner moves the
+    `(host, release_cb)` entry from `_unfenced_h2d_sources` to
+    `_fenced_h2d_sources` when it records the fence and invokes `release_cb`
+    once that fence has been waited on. Only buffers registered on `runner`
+    by `zeros_h2d_source` are recycled into `_free_h2d_sources`; one-off
+    tensors use a no-op callback and are dropped after synchronization.
+    """
+    assert host.is_contiguous()
+    recycle = id(host) in runner._registered_h2d_sources
+    if recycle:
+        key = (host.numel(), host.dtype)
+
+        def release_cb() -> None:
+            free = runner._free_h2d_sources.pop(key, None)
+            if free is None:
+                free = []
+            free.append(host)
+            runner._free_h2d_sources[key] = free
+    else:
+        release_cb = _noop_release
+    runner._unfenced_h2d_sources.append((host, release_cb))
+    return host.to(runner.device, non_blocking=True)
+
+
+def zeros_h2d_source(
+    runner: Any,
+    numel: int,
+    dtype: torch.dtype = torch.int32,
+    max_buffers: int = _DEFAULT_MAX_H2D_BUFFERS,
+) -> torch.Tensor:
+    """Return a zeroed 1D CPU buffer of `(numel, dtype)`, recycling one
+    released by `_wait_input_staging_fence` when available.
+
+    Buffers up to `max_buffers` are registered in `runner._registered_h2d_sources`
+    so `stage_h2d_upload` recycles them into `runner._free_h2d_sources` once the
+    fence synchronizes. When `max_buffers` is reached, the least-recently-used
+    buffer in `runner._free_h2d_sources` is popped and unregistered before
+    registering the new buffer, bounding both `_registered_h2d_sources` and
+    `_free_h2d_sources`.
+    """
+    free = runner._free_h2d_sources.get((numel, dtype))
+    if free:
+        buf = free.pop().zero_()
+        if id(buf) in runner._registered_h2d_sources:
+            return buf
+    else:
+        buf = torch.zeros((numel,), dtype=dtype, device="cpu", pin_memory=PIN_MEMORY)
+    if len(runner._registered_h2d_sources) >= max_buffers:
+        for old_key, old_free in list(runner._free_h2d_sources.items()):
+            if old_free:
+                evicted = old_free.pop(0)
+                if not old_free:
+                    del runner._free_h2d_sources[old_key]
+                runner._registered_h2d_sources.discard(id(evicted))
+                break
+    if len(runner._registered_h2d_sources) < max_buffers:
+        runner._registered_h2d_sources.add(id(buf))
+    return buf
+
+
 class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
     """Single shared metadata builder for every TPU attention group."""
 
@@ -262,13 +349,6 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             self.target_block_size *= cp_world_size
         # Only mamba/GDN layers consume physical state slot ids; attention
         # groups leave AttentionMetadata.mamba_state_indices None.
-
-        block_table_obj = runner.input_batch.block_table[self.kv_cache_group_id]
-        self.block_tables_cpu = torch.zeros(
-            (runner.max_num_reqs, block_table_obj.max_num_blocks_per_req),
-            dtype=torch.int32,
-            device="cpu",
-        )
 
     def _mamba_row_plan(
         self, ctx: AttentionMetadataBuilderContext, target_num_blocks: int
@@ -387,17 +467,17 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             ).to(runner.device)
             input_positions = ctx.position_ids_override
         else:
-            block_tables = self.block_tables_cpu[:target_num_reqs, :target_num_blocks]
-            block_tables.zero_()
+            # Per-call buffer: a later chunk or draft walk must not overwrite a
+            # table whose upload is still in flight (see `stage_h2d_upload`).
+            flat = zeros_h2d_source(runner, target_num_reqs * target_num_blocks)
+            block_tables = flat.view(target_num_reqs, target_num_blocks)
             source_block_tables = block_table_obj.get_cpu_tensor()
             block_tables[: ctx.num_reqs, :target_num_blocks] = source_block_tables[
                 ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
             ]
             # Flatten on CPU before H2D to avoid device-side
             # as_strided/reshape materialization on every decode step.
-            block_tables_dev = block_tables.reshape(-1).to(
-                runner.device, non_blocking=True
-            )
+            block_tables_dev = stage_h2d_upload(runner, flat)
             input_positions = runner.position_ids
 
         mamba_ckpt_indices = None
@@ -487,12 +567,12 @@ def stage_block_table_uploads(
 ) -> None:
     """One batched H2D transfer for every block table a walk will build.
 
-    Packs all participating groups' rows into one flat CPU scratch, transfers
-    once, and hands each group's build() a flat view of its region via
-    `ctx.staged_block_tables` (instead of one small per-group H2D per build).
-    `gids` limits staging to a subset of groups; None stages every group.
-    Dummy runs stage the same layout zero-filled so warmup dispatches the
-    program sequence serving will. Views die with the per-chunk context.
+    Packs all participating groups' rows into one CPU buffer owned by this
+    walk, transfers once, and hands each group's build() a flat view of its
+    region via `ctx.staged_block_tables` (instead of one small per-group H2D
+    per build). `gids` limits staging to a subset of groups; None stages every
+    group. Dummy runs stage the same layout zero-filled so warmup dispatches
+    the program sequence serving will. Views die with the per-chunk context.
     """
     if not runner.attn_groups:
         # Pre-initialization dummy runs build metadata before the KV cache
@@ -517,14 +597,10 @@ def stage_block_table_uploads(
         return
 
     total = sum(num_reqs_padded * tnb for _, _, tnb in entries)
-    scratch = runner._block_table_stage_cpu
-    if scratch is None or scratch.numel() < total:
-        scratch = torch.zeros(
-            (total,), dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
-        )
-        runner._block_table_stage_cpu = scratch
-    flat = scratch[:total]
-    flat.zero_()
+    # Per-walk buffer: TorchTPU reads the CPU source until the async H2D
+    # drains, so a later chunk or draft walk must not refill a shared scratch
+    # (see `stage_h2d_upload`).
+    flat = zeros_h2d_source(runner, total)
 
     if ctx.position_ids_override is None:
         offset = 0
@@ -537,9 +613,9 @@ def stage_block_table_uploads(
                 ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
             ]
             offset += num_reqs_padded * target_num_blocks
-    # Dummy runs keep the zeroed scratch: same staged layout, null blocks.
+    # Dummy runs keep the zeroed buffer: same staged layout, null blocks.
 
-    staged_dev = flat.to(runner.device, non_blocking=True)
+    staged_dev = stage_h2d_upload(runner, flat)
 
     # One compiled program splits the staged tensor into per-group tables
     # and derives every unified-pool mamba group's state/checkpoint indices

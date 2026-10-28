@@ -27,6 +27,7 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -77,6 +78,53 @@ def _proxy_latency_interval() -> float:
 
 
 _PROXY_LATENCY = _ProxyLatencyTracker(_proxy_latency_interval())
+
+
+class _DecodeRouter:
+    """Picks a decode instance once a request's prefill returns.
+
+    round_robin cycles through the instances. least_loaded picks the one with
+    the fewest requests in flight through this proxy, ties round robin. The
+    counts change only on the event loop, so no lock is needed.
+    """
+
+    def __init__(self, num_decodes: int, policy: str, log_interval_s: float):
+        self.policy = policy
+        self.inflight = [0] * num_decodes
+        self.dispatched = [0] * num_decodes
+        self._cycle = itertools.cycle(range(num_decodes))
+        self._log_interval_s = log_interval_s
+        self._next_log = time.monotonic() + log_interval_s
+
+    def acquire(self) -> int:
+        if self.policy == "least_loaded":
+            low = min(self.inflight)
+            # Some index holds the minimum, so this stops within one lap.
+            for _ in range(len(self.inflight)):
+                idx = next(self._cycle)
+                if self.inflight[idx] == low:
+                    break
+        else:
+            idx = next(self._cycle)
+        self.inflight[idx] += 1
+        self.dispatched[idx] += 1
+        self._maybe_log()
+        return idx
+
+    def release(self, idx: int) -> None:
+        self.inflight[idx] -= 1
+
+    def _maybe_log(self) -> None:
+        if self._log_interval_s <= 0:
+            return
+        now = time.monotonic()
+        if now >= self._next_log:
+            self._next_log = now + self._log_interval_s
+            print(
+                f"PERF PROXY decode_routing policy={self.policy} "
+                f"dispatched={self.dispatched} inflight={self.inflight}",
+                flush=True,
+            )
 
 
 def _env_int(name: str, default: int) -> int:
@@ -299,11 +347,16 @@ async def lifespan(app: FastAPI):
 
     # Initialize round-robin iterators
     app.state.prefill_iterator = itertools.cycle(range(len(app.state.prefill_clients)))
-    app.state.decode_iterator = itertools.cycle(range(len(app.state.decode_clients)))
+    app.state.decode_router = _DecodeRouter(
+        len(app.state.decode_clients),
+        global_args.decode_routing,
+        _proxy_latency_interval(),
+    )
 
     print(
         f"Initialized {len(app.state.prefill_clients)} prefill clients "
-        f"and {len(app.state.decode_clients)} decode clients."
+        f"and {len(app.state.decode_clients)} decode clients "
+        f"(decode routing: {global_args.decode_routing})."
     )
 
     yield
@@ -345,6 +398,13 @@ def parse_args():
     parser.add_argument(
         "--decoder-ports", "--decoder-port", type=int, nargs="+", default=[9400]
     )
+    parser.add_argument(
+        "--decode-routing",
+        choices=["round_robin", "least_loaded"],
+        default=os.getenv("PROXY_DECODE_ROUTING", "round_robin"),
+        help="How a request picks its decode instance once prefill returns: "
+        "round_robin, or least_loaded (fewest requests in flight here).",
+    )
 
     args = parser.parse_args()
 
@@ -370,7 +430,7 @@ def get_next_client(app, service_type: str):
 
     Args:
         app: The FastAPI app instance
-        service_type: Either 'prefill' or 'decode'
+        service_type: 'prefill'
 
     Returns:
         The next client to use
@@ -378,9 +438,6 @@ def get_next_client(app, service_type: str):
     if service_type == "prefill":
         client_idx = next(app.state.prefill_iterator)
         return app.state.prefill_clients[client_idx]
-    elif service_type == "decode":
-        client_idx = next(app.state.decode_iterator)
-        return app.state.decode_clients[client_idx]
     else:
         raise ValueError(f"Unknown service type: {service_type}")
 
@@ -559,40 +616,54 @@ async def _handle_completions(api: str, request: Request):
         if kv_transfer_params:
             req_data["kv_transfer_params"] = kv_transfer_params
 
-        # Get the next decode client in round-robin fashion
-        decode_client_info = get_next_client(request.app, "decode")
+        # Pick the decode instance: the next in turn, or the least loaded.
+        router = request.app.state.decode_router
+        decode_idx = router.acquire()
+        decode_client_info = request.app.state.decode_clients[decode_idx]
+        released = False
+
+        def release_decode() -> None:
+            # Called from the stream's finally and again as the response's
+            # background task, which also covers a stream that never started.
+            nonlocal released
+            if not released:
+                released = True
+                router.release(decode_idx)
 
         logger.debug("Using %s %s", prefill_client_info, decode_client_info)
 
         # Stream response from decode service
         async def generate_stream():
-            t_decode_send = time.time()
-            t_decode_send_perf = time.perf_counter()
-            print(
-                f"PERF PROXY decode_send req_id={request_id} "
-                f"ts={t_decode_send:.6f}{kv_uuid_log}",
-                flush=True,
-            )
-            first = True
-            async for chunk in stream_from_decode(
-                decode_client_info, api, req_data, request_id, forwarded
-            ):
-                if first:
-                    t_first = time.time()
-                    t_first_perf = time.perf_counter()
-                    decode_first_ms = (t_first_perf - t_decode_send_perf) * 1000.0
-                    ttft_ms = (t_first_perf - t_request_recv_perf) * 1000.0
-                    _PROXY_LATENCY.record("decode_first", decode_first_ms)
-                    _PROXY_LATENCY.record("ttft", ttft_ms)
-                    print(
-                        f"PERF PROXY first_chunk req_id={request_id} "
-                        f"ts={t_first:.6f} "
-                        f"dur_from_decode_send_ms={decode_first_ms:.2f} "
-                        f"ttft_ms={ttft_ms:.2f}{kv_uuid_log}",
-                        flush=True,
-                    )
-                    first = False
-                yield chunk
+            try:
+                t_decode_send = time.time()
+                t_decode_send_perf = time.perf_counter()
+                print(
+                    f"PERF PROXY decode_send req_id={request_id} "
+                    f"decode={decode_idx} ts={t_decode_send:.6f}{kv_uuid_log}",
+                    flush=True,
+                )
+                first = True
+                async for chunk in stream_from_decode(
+                    decode_client_info, api, req_data, request_id, forwarded
+                ):
+                    if first:
+                        t_first = time.time()
+                        t_first_perf = time.perf_counter()
+                        decode_first_ms = (t_first_perf - t_decode_send_perf) * 1000.0
+                        ttft_ms = (t_first_perf - t_request_recv_perf) * 1000.0
+                        _PROXY_LATENCY.record("decode_first", decode_first_ms)
+                        _PROXY_LATENCY.record("ttft", ttft_ms)
+                        print(
+                            f"PERF PROXY first_chunk req_id={request_id} "
+                            f"ts={t_first:.6f} "
+                            f"dur_from_decode_send_ms={decode_first_ms:.2f} "
+                            f"ttft_ms={ttft_ms:.2f}{kv_uuid_log}",
+                            flush=True,
+                        )
+                        first = False
+                    yield chunk
+            finally:
+                release_decode()
 
         # text/event-stream when the caller asked for a stream, which is what
         # the decode instance is actually sending back. Declared as
@@ -603,7 +674,11 @@ async def _handle_completions(api: str, request: Request):
         media_type = (
             "text/event-stream" if req_data.get("stream") else "application/json"
         )
-        return StreamingResponse(generate_stream(), media_type=media_type)
+        return StreamingResponse(
+            generate_stream(),
+            media_type=media_type,
+            background=BackgroundTask(release_decode),
+        )
 
     except Exception as e:
         import sys
@@ -643,10 +718,14 @@ async def models():
 @app.get("/healthcheck")
 async def healthcheck():
     """Simple endpoint to check if the server is running."""
+    router = app.state.decode_router
     return {
         "status": "ok",
         "prefill_instances": len(app.state.prefill_clients),
         "decode_instances": len(app.state.decode_clients),
+        "decode_routing": router.policy,
+        "decode_inflight": router.inflight,
+        "decode_dispatched": router.dispatched,
     }
 
 
@@ -656,4 +735,9 @@ if __name__ == "__main__":
 
     import uvicorn
 
-    uvicorn.run(app, host=global_args.host, port=global_args.port)
+    uvicorn.run(
+        app,
+        host=global_args.host,
+        port=global_args.port,
+        timeout_keep_alive=_env_int("PROXY_TIMEOUT_KEEP_ALIVE_S", 60),
+    )

@@ -30,7 +30,9 @@ RANDOM_RANGE_RATIO="0.8"
 RANGE_RATIO_STYLE="min"
 MAX_MODEL_LEN=16384
 MAX_NUM_BATCHED_TOKENS=8192
-MAX_NUM_SEQS=512
+# Perf-only config (no lm-eval) at concurrency 64; 128..512 sequence buckets
+# are compiled at boot and never used.
+MAX_NUM_SEQS=64
 GPU_MEMORY_UTILIZATION=0.95
 KV_CACHE_DTYPE="fp8"
 

@@ -19,6 +19,9 @@ umask 000
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../../.." && pwd)"
 
+# shellcheck disable=SC1091
+source "${script_dir}/qwen35_pd_disagg_common_env.sh"
+
 ROLE="${ROLE:-all}"
 MODEL_PATH="${MODEL_PATH:-${QWEN35_A3B_FP8_MODEL_PATH:-Qwen/Qwen3.5-35B-A3B-FP8}}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-${MODEL_PATH}}"
@@ -32,10 +35,22 @@ DECODE_PORT="${DECODE_PORT:-9400}"
 PROXY_PORT="${PROXY_PORT:-8000}"
 
 PREFILL_PCP="${PREFILL_PCP:-8}"
-DECODE_DP="${DECODE_DP:-8}"
+DECODE_DP="${DECODE_DP:-4}"
 PREFILL_TP="${PREFILL_TP:-1}"
-DECODE_TP="${DECODE_TP:-1}"
+DECODE_TP="${DECODE_TP:-2}"
 DECODE_DCP="${DECODE_DCP:-1}"
+TPU_RAIDEN_DST_SHARDS="${TPU_RAIDEN_DST_SHARDS:-${DECODE_TP}}"
+# HND needs both peers' kernel page == cp_kv_cache_interleave_size (128).
+# Prefill block 384 already gives a 128-token page. The decode block is pinned
+# to 2432 (19 x 128): big enough to fit the TP2 GDN state, and not a multiple
+# of 256, so its page stays at 128.
+# (the page is in the Raiden layout fingerprint). Prefill block 384 gives a
+# 128-token page, matching the interleave below. The decode block is grown to
+# fit the TP2 GDN state (2304 tokens for Qwen3.5-35B), and the kernel page
+# is the largest supported size dividing it, so pin an odd multiple of 128
+# above that fit to keep its page at 128 too.
+PREFILL_BLOCK_SIZE="${PREFILL_BLOCK_SIZE:-384}"
+DECODE_BLOCK_SIZE="${DECODE_BLOCK_SIZE:-2432}"
 
 PREFILL_CTRL_PORT="${PREFILL_CTRL_PORT:-27000}"
 DECODE_CTRL_PORT="${DECODE_CTRL_PORT:-28000}"
@@ -321,13 +336,33 @@ case "${ROLE}" in
         fi
       fi
     fi
+
+    # --- Raiden telemetry --------------------------------------------------
+    # With the buffered backend, vLLM exports Raiden's samples as labeled
+    # tpu_raiden_* series; without a backend Raiden records nothing, so at
+    # least one series per engine shows the samples reached /metrics.
+    TELEMETRY_EXIT_CODE=0
+    if [[ ",${TPU_RAIDEN_TELEMETRY_BACKENDS:-}," == *,buffered,* ]]; then
+      for endpoint in "${target_prefill_host}:${PREFILL_PORT}" "${target_decode_host}:${DECODE_PORT}"; do
+        raiden_series="$(curl -fsS "http://${endpoint}/metrics" 2>/dev/null |
+          grep -cE '^tpu_raiden_[A-Za-z0-9_:]+\{' || true)"
+        echo "RAIDEN_TELEMETRY_SERIES ${endpoint} ${raiden_series:-0}"
+        if [[ "${raiden_series:-0}" -le 0 ]]; then
+          echo "ERROR: No tpu_raiden_* series on ${endpoint}/metrics" >&2
+          TELEMETRY_EXIT_CODE=1
+        fi
+      done
+      if [[ "${TELEMETRY_EXIT_CODE}" -eq 0 ]]; then
+        echo "RAIDEN_TELEMETRY_OK 1"
+      fi
+    fi
     set -e
 
     chmod -R 777 /perf_eval_results 2>/dev/null || true
 
     if [[ "${CORRECTNESS_EXIT_CODE}" -ne 0 || "${DIVERGENCE_EXIT_CODE}" -ne 0 \
-        || "${MTP_EXIT_CODE}" -ne 0 ]]; then
-      echo "ERROR: Disaggregation smoke tests failed (correctness=${CORRECTNESS_EXIT_CODE}, divergence=${DIVERGENCE_EXIT_CODE}, mtp=${MTP_EXIT_CODE})" >&2
+        || "${MTP_EXIT_CODE}" -ne 0 || "${TELEMETRY_EXIT_CODE}" -ne 0 ]]; then
+      echo "ERROR: Disaggregation smoke tests failed (correctness=${CORRECTNESS_EXIT_CODE}, divergence=${DIVERGENCE_EXIT_CODE}, mtp=${MTP_EXIT_CODE}, telemetry=${TELEMETRY_EXIT_CODE})" >&2
       exit 1
     fi
 

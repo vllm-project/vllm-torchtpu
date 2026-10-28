@@ -14,7 +14,7 @@
 
 # The integration suite on the Kueue fleet.
 #
-# qwen35-pcp8-dp8-disagg-correctness and qwen35-gpc-correctness run a second
+# qwen35-pcp8-2tp4dp-disagg-correctness and qwen35-gpc-correctness run a second
 # role on a second host (ROLE=decode or GPC_ROLE=worker). That is not one command on a Ray head, which is what
 # run_multihost.sh runs by default, so each has a JobSet naming its two roles
 # instead, and run_multihost.sh --manifest submits it.
@@ -62,6 +62,20 @@ steps:
         commands:
           - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_qwen35_p4d2_disagg_correctness.sh
 
+      # The same test on the production settings (qwen35_pd_disagg_common_env.sh);
+      # the step above stays on the defaults.
+      - label: "Integration: qwen35-pcp4-2tp2dp-disagg-correctness"
+        key: "integration_qwen35_pcp4_2tp2dp_disagg_correctness"
+        env:
+          SHAPE: *shape_8_core
+          TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
+          RUN_ROOT: "perf_eval_results/qwen35_pcp4_2tp2dp_disagg_ci"
+        <<: *integration_step
+        plugins:
+          - *kube_plugin
+        commands:
+          - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_qwen35_pcp4_2tp2dp_disagg_correctness.sh
+
       # The prefill and decode layout (ROLE, PREFILL_*, DECODE_*,
       # TPU_RAIDEN_DST_SHARDS, VLLM_KV_CACHE_LAYOUT) is the script's own default;
       # those names do not reach the pod.
@@ -87,12 +101,19 @@ steps:
         <<: *integration_step
         plugins:
           - *kube_plugin
+        # Each role compiles only what this benchmark runs: 512-token prompts at
+        # 4 req/s, prefill-only on P (at most 4 prompts in a 2048-token step),
+        # one recomputed token per request on D, whose running set peaked at
+        # 72. The defaults compile request buckets up to 256 on both and token
+        # buckets up to 2048 on D.
         commands:
           - >-
             .buildkite/kubernetes/run.sh
             env
             TPU_KV_RESHARD_TRANSPORT=zmq
             LOG_DIR=perf_eval_results/disagg_single_host
+            PREFILL_EXTRA_ARGS="--max-num-seqs 8"
+            DECODE_EXTRA_ARGS="--max-num-batched-tokens 128 --max-num-seqs 128"
             bash ./examples/disagg/run_disagg_single_host.sh
 
       - label: "Integration: qwen35-apc-correctness"
@@ -240,6 +261,11 @@ steps:
       queue: "kube"
     plugins:
       - *kube_plugin
+    # 35 short prompts with a 256-token budget: decode steps carry at most
+    # 35 tokens and pad to 64, prefill steps fill at most the budget, so
+    # [64, 256] is every token bucket a step can use and 64 sequences hold
+    # them all at once. The defaults compile 16..256 and request buckets
+    # up to 256.
     commands:
       - >-
         .buildkite/kubernetes/run_multihost.sh --topology 2x2x2
@@ -248,6 +274,8 @@ steps:
         --tensor-parallel-size 16
         --max-model-len 256
         --max-num-batched-tokens 256
+        --max-num-seqs 64
+        --compilation-config '{"compile_sizes":[64,256]}'
         --max-tokens 32
 
   # The role-per-host tests. Each holds two hosts - two engines of eight
@@ -259,8 +287,8 @@ steps:
   # None uploads artifacts. The pod is deleted when the run ends and these
   # submit a manifest rather than going through run.sh's upload wrapper, so the
   # logs are the record - as for the multihost step above.
-  - label: "Integration: qwen35-pcp8-dp8-disagg-correctness"
-    key: "integration_qwen35_pcp8_dp8_disagg_correctness"
+  - label: "Integration: qwen35-pcp8-2tp4dp-disagg-correctness"
+    key: "integration_qwen35_pcp8_2tp4dp_disagg_correctness"
     depends_on:
       - "build_docker"
     timeout_in_minutes: 1440

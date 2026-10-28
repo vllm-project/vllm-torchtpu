@@ -32,7 +32,7 @@ const COMMAND_DATA = {
         }
     },
     "source": {
-        cmd: `# 1. Clone vllm-torchtpu and create a virtual environment:\ngit clone https://github.com/vllm-project/vllm-torchtpu.git\ncd vllm-torchtpu\nuv venv --python 3.12 --seed\nsource .venv/bin/activate\nexport UV_TORCH_BACKEND=cpu\n\n# 2. Install in editable mode with vllm and test dependencies:\nVLLM_TARGET_DEVICE=empty uv pip install -e . --group vllm --group test\n\n# 3. (Optional) Editable vllm checkout for cross-repo development:\ngit clone --branch v0.31.0 --depth 1 https://github.com/vllm-project/vllm.git ../vllm\nVLLM_TARGET_DEVICE=empty uv pip install -e ../vllm --no-deps`,
+        cmd: `# 1. Clone vllm-torchtpu and create a virtual environment:\ngit clone https://github.com/vllm-project/vllm-torchtpu.git\ncd vllm-torchtpu\nuv venv --python 3.12 --seed\nsource .venv/bin/activate\nexport UV_TORCH_BACKEND=cpu\n\n# 2. Install in editable mode with vllm and test dependencies:\nVLLM_TARGET_DEVICE=empty uv pip install -e . --group vllm --group test\n\n# 3. (Optional) Editable vllm checkout for cross-repo development:\ngit clone --branch v0.32.0 --depth 1 https://github.com/vllm-project/vllm.git ../vllm\nVLLM_TARGET_DEVICE=empty uv pip install -e ../vllm --no-deps`,
         inst: "For development or debugging, install <code>vllm-torchtpu</code> in editable mode with <code>--group vllm --group test</code>. Optionally mount an editable <code>vllm</code> checkout."
     }
 };

@@ -37,6 +37,7 @@ def strided_load_bkv(
     kv_in_vref: jax.Ref,
     b_idx: int,
     start: int,
+    valid_mask: jax.Array | None = None,
     *,
     cfgs: configs.RpaConfigs,
 ) -> list[tuple[jax.Array, jax.Array]]:
@@ -65,11 +66,15 @@ def strided_load_bkv(
             cfgs.bkv_stride,
             dtype=cfgs.serve.dtype_kv,
         )
+        if valid_mask is not None:
+            v = jnp.where(valid_mask, v, jnp.zeros_like(v))
         return [(k, v)]
 
     kv = utils.strided_load(
         kv_ref, start, cfgs.bkv_sz * cfgs.bkv_stride, cfgs.bkv_stride
     )
+    if valid_mask is not None:
+        kv = jnp.where(valid_mask, kv, jnp.zeros_like(kv))
     bitwidth = jax.dtypes.itemsize_bits(cfgs.serve.dtype_kv)
 
     return utils.convert_to_target_bitwidth(
@@ -209,6 +214,8 @@ def get_scale_factors(
     return k, v, k_scale, v_scale
 
 
+# The `pl.when` region in `rpa_body` is a basic block boundary, so splitting
+# these keeps the mask arithmetic isolated to the bodies that need it.
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class StitchMetadata:
@@ -229,8 +236,25 @@ class ComputeMetadata:
     local_k_end: list[jax.Array] | None = None
 
 
-# The `pl.when` region in `rpa_body` is a basic block boundary, so splitting
-# these keeps the mask arithmetic isolated to the bodies that need it.
+def _compute_valid_kv_mask(
+    token: jax.Array,
+    b_idx: int,
+    stitch_meta: StitchMetadata,
+    step_meta: ComputeMetadata,
+) -> jax.Array:
+    """Builds a boolean mask for valid token slices before PV."""
+    # PV reduces over the whole tile: zero probabilities do not isolate NaNs
+    # from stale VMEM or another request in a fetched new-KV page.
+    valid = token < (
+        stitch_meta.bkv_sz_frm_cache[b_idx] + stitch_meta.bkv_sz_frm_new[b_idx]
+    )
+    if step_meta.local_k_start is not None:
+        valid &= token >= step_meta.local_k_start[b_idx]
+    if step_meta.local_k_end is not None:
+        valid &= token < step_meta.local_k_end[b_idx]
+    return valid
+
+
 def fetch_stitch_metadata(
     step: jax.Array,
     schedule_ref: schedule.RpaSchedule,
@@ -501,7 +525,18 @@ def rpa_body(
     v_b = []
 
     if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+        pack_dim = cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
+        token = (
+            lax.broadcasted_iota(jnp.int32, (pack_dim, cfgs.bkv_sz), 1)
+            if cfgs.serve.mask_invalid_v
+            else None
+        )
         for b_idx in range(cfgs.batch_size):
+            valid = (
+                _compute_valid_kv_mask(token, b_idx, stitch_meta, step_meta)
+                if token is not None
+                else None
+            )
             ks = []
             vs = []
             for kv_head in range(cfgs.model.num_kv_heads):
@@ -511,11 +546,18 @@ def rpa_body(
                 target_shape = (-1, cfgs.kv_vmem_lanes)
                 k_head_ref = k_slice.reshape(target_shape)
                 v_head_ref = v_slice.reshape(target_shape)
-                pack_dim = cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
 
                 # Load as uint32 to avoid dtype conversion during strided load
                 k_head_u32 = utils.strided_load(k_head_ref, 0, pack_dim, 1)
                 v_head_u32 = utils.strided_load(v_head_ref, 0, pack_dim, 1)
+                if valid is not None:
+                    # HND packs channels of one token together. Mask the words
+                    # before unpacking, including any co-located V scale channels.
+                    v_head_u32 = jnp.where(
+                        valid,
+                        v_head_u32[:, : cfgs.bkv_sz],
+                        jnp.zeros_like(v_head_u32[:, : cfgs.bkv_sz]),
+                    )
 
                 if cfgs.serve.dtype_kv == jnp.uint8:
                     fp4 = jnp.float4_e2m1fn
@@ -534,7 +576,17 @@ def rpa_body(
             k_b.append(jnp.stack(ks, axis=0))
             v_b.append(jnp.stack(vs, axis=0))
     else:
+        token = None
+        if cfgs.serve.mask_invalid_v:
+            token = lax.broadcasted_iota(
+                jnp.int32, (cfgs.bkv_sz, cfgs.aligned_kv_head_dim), 0
+            )
         for b_idx in range(cfgs.batch_size):
+            valid = (
+                _compute_valid_kv_mask(token, b_idx, stitch_meta, step_meta)
+                if token is not None
+                else None
+            )
             heads_per_load = pl.cdiv(cfgs.serve.packing_kv, 2)
             ks = []
             vs = []
@@ -543,6 +595,7 @@ def rpa_body(
                     kv_in_vref,
                     b_idx,
                     kv_head_start * 2,
+                    valid_mask=valid,
                     cfgs=cfgs,
                 )
                 ks.append(jnp.stack([k for k, _ in bkv_lst], axis=0))

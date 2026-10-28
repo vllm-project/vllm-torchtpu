@@ -46,13 +46,15 @@ class TPUQwen4ExpConfig(Qwen4ExpForCausalLMConfig):
                 f"To run without PLE for bring-up, pass --hf-overrides "
                 f"'{override}'; outputs then differ from the released model."
             )
-        # Released checkpoints label their QSA layers full_attention; the
-        # qwen_sparse_attention layer type needs the QSA indexer.
+        # transformers (>=5.18, see pyproject.toml) labels the checkpoint's
+        # full_attention (QSA) layers indexed_attention. TPU runs them as
+        # dense attention, which matches QSA within the max_model_len bound
+        # below.
         unsupported_layer_types = sorted(
-            set(text_config.layer_types or ()) - {"linear_attention", "full_attention"}
+            set(text_config.layer_types or ())
+            - {"linear_attention", "indexed_attention"}
         )
         if unsupported_layer_types:
-            # TODO(QSA): accept qwen_sparse_attention once the indexer lands.
             raise NotImplementedError(
                 f"Qwen4Exp layer types {unsupported_layer_types} are not "
                 "supported on TPU yet."

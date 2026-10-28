@@ -62,9 +62,12 @@ def _run_moe_generation(async_scheduling: bool, enable_expert_parallel: bool = F
             "chips; running here would silently reduce TP coverage"
         )
 
+    # Four ~6-token prompts and 4 output tokens: 8 sequences is the only
+    # request bucket a step uses; the default compiles them up to 64.
     llm = LLM(
         model=MOE_MODEL_NAME,
         max_num_batched_tokens=64,
+        max_num_seqs=8,
         max_model_len=64,
         tensor_parallel_size=tp_size,
         enable_expert_parallel=enable_expert_parallel,

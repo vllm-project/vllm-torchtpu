@@ -163,7 +163,9 @@ def test_chip_groups_partition_the_ranks(monkeypatch):
     monkeypatch.setattr(intra_chip, "get_chip_topology", lambda: topology)
     monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
-    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 16)
+    monkeypatch.setattr(
+        intra_chip, "_rank_to_device", lambda: {r: r for r in range(16)}
+    )
 
     groups = intra_chip._chip_rank_groups()
 
@@ -174,19 +176,50 @@ def test_chip_groups_partition_the_ranks(monkeypatch):
     assert flat == list(range(16)), "ranks must be partitioned, not sampled"
 
 
-def test_grouping_refuses_a_world_that_is_not_every_device(monkeypatch):
-    """With DP or PP in play, global rank no longer indexes the device order.
+def test_grouping_follows_each_ranks_device_not_its_rank(monkeypatch):
+    """Under DP, global rank does not index the device order.
 
-    Guessing would pair cores from different chips -- the collective would
-    still succeed and would still be the wrong two cores.
+    Grouping by rank position would pair cores from different chips -- the
+    collective would still succeed and would still be the wrong two cores.
     """
+    from vllm_torchtpu.distributed import intra_chip
+
+    topology = _topology_from(_tpu7x_two_hosts())
+    # Each chip's two cores land on non-adjacent ranks.
+    rank_to_device = {r: (r % 8) * 2 + r // 8 for r in range(16)}
+    monkeypatch.setattr(intra_chip, "get_chip_topology", lambda: topology)
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(intra_chip, "_rank_to_device", lambda: rank_to_device)
+
+    groups = intra_chip._chip_rank_groups()
+
+    assert groups is not None
+    chips = {frozenset(chip) for chip in topology.chips}
+    for group in groups:
+        assert frozenset(rank_to_device[r] for r in group) in chips
+    assert sorted(groups) == [[r, r + 8] for r in range(8)]
+
+
+@pytest.mark.parametrize(
+    "rank_to_device",
+    [
+        {r: (99 if r == 15 else r) for r in range(16)},  # a device on no chip
+        {r: r for r in range(4)},  # whole chips, but not the whole topology
+        {r: r for r in range(3)},  # half of a chip
+        {r: r // 2 * 2 for r in range(16)},  # two ranks on one device
+    ],
+    ids=["unknown-device", "subset-of-chips", "split-chip", "shared-device"],
+)
+def test_grouping_refuses_a_world_that_is_not_the_topology(monkeypatch, rank_to_device):
+    """The ranks must run on exactly the topology's devices, one each."""
     from vllm_torchtpu.distributed import intra_chip
 
     topology = _topology_from(_tpu7x_two_hosts())
     monkeypatch.setattr(intra_chip, "get_chip_topology", lambda: topology)
     monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
-    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 8)
+    monkeypatch.setattr(intra_chip, "_rank_to_device", lambda: rank_to_device)
 
     assert intra_chip._chip_rank_groups() is None
 

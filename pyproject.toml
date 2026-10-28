@@ -43,15 +43,20 @@ dependencies = [
     # installed torch at import time. Published to PyPI as nightly .dev
     # pre-releases, so it needs no registry source below.
     "tpu-sync-torch==0.0.1.dev20261012084241",
-    # Imported directly by src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py, so
-    # declared here rather than leaned on as a vLLM transitive.
+    # Imported directly by src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py and
+    # qwen4_exp/, so declared here rather than leaned on as a vLLM transitive.
     #
-    # Uncap upper bound in base dependencies so upstream vLLM HEAD canary builds
-    # (vllm-torchtpu-integration, requiring transformers>=5.16.1) can resolve.
-    # vllm-omni 0.31.0rc1 specifies its own <5.15 constraint in its package metadata
-    # for the -omni image. Monitored for potential structured-output spec-decode
-    # divergence (#1093) on transformers>=5.17.
-    "transformers>=5.10.4",
+    # qwen4_exp/ takes Qwen4ExpTextConfig from transformers, which relabels the
+    # checkpoint's full_attention layers on load:
+    # * before v5.18: qwen_sparse_attention
+    # * from v5.18 on: indexed_attention
+    #   (https://github.com/huggingface/transformers/pull/48974)
+    # qwen4_exp/ accepts only indexed_attention, hence the floor. vLLM 0.32.0
+    # and vllm-omni 0.32.0rc1 both take transformers>=5.16.1,<5.20.0. No upper
+    # bound in base dependencies, so upstream vLLM HEAD canary builds
+    # (vllm-torchtpu-integration) can resolve. Monitored for potential
+    # structured-output spec-decode divergence (#1093) on transformers>=5.17.
+    "transformers>=5.18.0",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
     # cpu.txt, ...) except tpu.txt, so it's missing
@@ -94,9 +99,11 @@ benchmarking = [
     "runai-model-streamer[gcs]>=0.17",
 ]
 
-# vLLM-Omni optional dependency
+# vLLM-Omni optional dependency. vllm-omni keeps major.minor aligned with vLLM.
+# 0.32.0rc1 is not on PyPI yet; until it is, add the `omni-git` dependency
+# group below, which supplies it from its git tag.
 omni = [
-    "vllm-omni==0.31.0rc1",
+    "vllm-omni==0.32.0rc1",
     # vllm-omni pulls torchaudio through s3tokenizer. The PyPI torchaudio is a
     # CUDA build that fails to load libcudart, and transformers imports
     # torchaudio whenever it is installed, so every vLLM import would fail.
@@ -129,7 +136,14 @@ torchtpu_layers = "vllm_torchtpu.layers:register_layers"
 vllm = [
     # Note: we **intentionally** build vllm from source, see README.
     # Keep vllm_test_utils on the same upstream tag below.
-    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.31.0",
+    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.32.0",
+]
+
+# Source for the `omni` extra's vllm-omni==0.32.0rc1 while that release is not
+# on PyPI: install `--extra omni --group omni-git`. Drop this group, and the
+# flag, once it is.
+omni-git = [
+    "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@v0.32.0rc1",
 ]
 
 # Required for running tests
@@ -142,7 +156,7 @@ test = [
     "pytest-cov",
     "parameterized",
     # Not published on PyPI; lives in vLLM's tests/ directory.
-    "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@v0.31.0#subdirectory=tests/vllm_test_utils",
+    "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@v0.32.0#subdirectory=tests/vllm_test_utils",
 ]
 
 [tool.pytest.ini_options]
