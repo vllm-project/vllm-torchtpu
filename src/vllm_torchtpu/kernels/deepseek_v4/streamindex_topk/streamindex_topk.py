@@ -1243,7 +1243,7 @@ def _effective_row_lengths(
     cp_size: int = 1,
     interleave_c: int = 1,
     kv_window: tuple[jax.Array, jax.Array] | None = None,
-    strict_causal: bool = False,
+    strict_causal: bool = True,
 ) -> jax.Array:  # i32[num_tokens]
     """Visible compressed KV positions per token row of the score matrix.
 
@@ -1326,7 +1326,7 @@ def streamindex_topk(
     return_scores: bool = False,
     uniform_q_len: int | None = None,
     split_mixed_blocks: bool = False,
-    strict_causal: bool = False,
+    strict_causal: bool = True,
     sc_topk_one_launch: bool = False,
     sc_topk_coop_max_rows: int = 0,
     kv_split: int = 1,

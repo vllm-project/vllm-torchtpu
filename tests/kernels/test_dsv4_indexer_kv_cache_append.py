@@ -1831,5 +1831,33 @@ class CoalescedKvAppendTest(parameterized.TestCase):
         np.testing.assert_array_equal(np.asarray(actual_64), np.asarray(expected_64))
 
 
+class OutOfOrderRunsTest(parameterized.TestCase):
+    """Rows of one granule arriving as several runs in one wave.
+
+    The DSv4 compressor packs a step's records by HBM row size (full rows of 4
+    first, then rows of 3, 2 and 1), so a chunk's partial edge rows reach the
+    writer after, and apart from, the full rows of the same 128-row granule.
+    """
+
+    def test_runs_sharing_a_granule(self):
+        rng = np.random.default_rng(0)
+        num_pages, page_size = 8, 256
+        cache = rng.integers(0, 256, (num_pages, 64, 4, page_size), np.uint8)
+        # A 60-token chunk at position 1003 of a request on pages (1, 4): rows
+        # 250..264, emitted as [252..255 | 1024..1031 | 250, 251 | 1032].
+        dst = np.array(
+            [252, 253, 254, 255, *range(1024, 1032), 250, 251, 1032, -1, -1, -1],
+            np.int32,
+        )
+        src = rng.integers(0, 256, (dst.size, 256), np.uint8)
+        got = kv_cache_append.scatter_rows(
+            jnp.asarray(cache), jnp.asarray(src), jnp.asarray(dst), _SAL, record_groups=33
+        )
+        want = kv_cache_append.scatter_rows_reference(
+            jnp.asarray(cache), jnp.asarray(src), jnp.asarray(dst), _SAL, record_groups=33
+        )
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
 if __name__ == "__main__":
     absltest.main()

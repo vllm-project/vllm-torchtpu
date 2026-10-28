@@ -28,6 +28,7 @@ from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.deepseek_v4.mhc import (
     fused_post_pre_kernel,
+    post_head_kernel,
     post_kernel,
     pre_kernel,
     utils,
@@ -85,10 +86,15 @@ def _mhc_pre_jax(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     gates_in_kernel: bool,
+    gates_max_tokens: int = -1,
+    token_block_size: int = 0,
+    single_stream: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Mix GEMM + stream collapse in Pallas, gates/Sinkhorn in XLA (or in
-    the kernel, with ``gates_in_kernel``)."""
-    return pre_kernel.mhc_pre(
+    the kernel, with ``gates_in_kernel``). With ``single_stream``,
+    ``residual`` is the one (..., hidden_size) stream that all hc_mult
+    streams are copies of."""
+    return _pre_kernel_fn(single_stream)(
         residual,
         utils.SplitFn(fn_hi, fn_mid, fn_lo),
         hc_scale,
@@ -99,6 +105,7 @@ def _mhc_pre_jax(
         hc_post_mult_value,
         sinkhorn_repeat,
         gates_in_kernel=gates_in_kernel,
+        **_kernel_kw(gates_max_tokens, token_block_size),
     )
 
 
@@ -117,10 +124,13 @@ def _mhc_pre_norm_jax(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     gates_in_kernel: bool,
+    gates_max_tokens: int = -1,
+    token_block_size: int = 0,
+    single_stream: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """``_mhc_pre_jax`` emitting the layer input RMS-normalized with
     ``norm_weight`` (the sublayer's input norm, which shares ``rms_eps``)."""
-    return pre_kernel.mhc_pre(
+    return _pre_kernel_fn(single_stream)(
         residual,
         utils.SplitFn(fn_hi, fn_mid, fn_lo),
         hc_scale,
@@ -131,6 +141,7 @@ def _mhc_pre_norm_jax(
         hc_post_mult_value,
         sinkhorn_repeat,
         gates_in_kernel=gates_in_kernel,
+        **_kernel_kw(gates_max_tokens, token_block_size),
         norm_weight=norm_weight,
         norm_eps=rms_eps,
     )
@@ -163,6 +174,9 @@ def _mhc_fused_post_pre_jax(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     gates_in_kernel: bool,
+    gates_max_tokens: int = -1,
+    token_block_size: int = 0,
+    fn_hbm: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """One layer's post and the next layer's pre as a single kernel."""
     return fused_post_pre_kernel.mhc_fused_post_pre(
@@ -179,6 +193,8 @@ def _mhc_fused_post_pre_jax(
         hc_post_mult_value,
         sinkhorn_repeat,
         gates_in_kernel=gates_in_kernel,
+        **_kernel_kw(gates_max_tokens, token_block_size),
+        **({"fn_hbm": True} if fn_hbm else {}),
     )
 
 
@@ -200,6 +216,9 @@ def _mhc_fused_post_pre_norm_jax(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     gates_in_kernel: bool,
+    gates_max_tokens: int = -1,
+    token_block_size: int = 0,
+    fn_hbm: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """``_mhc_fused_post_pre_jax`` emitting the RMS-normalized layer input."""
     return fused_post_pre_kernel.mhc_fused_post_pre(
@@ -216,8 +235,175 @@ def _mhc_fused_post_pre_norm_jax(
         hc_post_mult_value,
         sinkhorn_repeat,
         gates_in_kernel=gates_in_kernel,
+        **_kernel_kw(gates_max_tokens, token_block_size),
+        **({"fn_hbm": True} if fn_hbm else {}),
         norm_weight=norm_weight,
         norm_eps=rms_eps,
+    )
+
+
+def _mhc_pre_cat_jax(
+    residual: jax.Array,
+    fn_cat: jax.Array,
+    hc_scale: jax.Array,
+    hc_base: jax.Array,
+    *,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    gates_in_kernel: bool,
+    gates_max_tokens: int = -1,
+    token_block_size: int = 0,
+    single_stream: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``_mhc_pre_jax`` taking fn as its stacked (3 * M3, K) bf16 chunks."""
+    return _pre_call(
+        residual, utils.CatFn(fn_cat), hc_scale, hc_base, None,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_pre_eps,
+        hc_sinkhorn_eps=hc_sinkhorn_eps,
+        hc_post_mult_value=hc_post_mult_value,
+        sinkhorn_repeat=sinkhorn_repeat,
+        gates_in_kernel=gates_in_kernel,
+        single_stream=single_stream,
+        **_kernel_kw(gates_max_tokens, token_block_size),
+    )
+
+
+def _mhc_pre_cat_norm_jax(
+    residual: jax.Array,
+    fn_cat: jax.Array,
+    hc_scale: jax.Array,
+    hc_base: jax.Array,
+    norm_weight: jax.Array,
+    *,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    gates_in_kernel: bool,
+    gates_max_tokens: int = -1,
+    token_block_size: int = 0,
+    single_stream: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``_mhc_pre_cat_jax`` emitting the RMS-normalized layer input."""
+    return _pre_call(
+        residual, utils.CatFn(fn_cat), hc_scale, hc_base, norm_weight,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_pre_eps,
+        hc_sinkhorn_eps=hc_sinkhorn_eps,
+        hc_post_mult_value=hc_post_mult_value,
+        sinkhorn_repeat=sinkhorn_repeat,
+        gates_in_kernel=gates_in_kernel,
+        single_stream=single_stream,
+        **_kernel_kw(gates_max_tokens, token_block_size),
+    )
+
+
+def _pre_kernel_fn(single_stream: bool):
+    """``mhc_pre``, or its one-stream twin for the chain's first pre."""
+    return pre_kernel.mhc_pre_single_stream if single_stream else pre_kernel.mhc_pre
+
+
+def _kernel_kw(gates_max_tokens: int, token_block_size: int) -> dict:
+    kw: dict = {}
+    if gates_max_tokens >= 0:
+        kw["gates_max_tokens"] = gates_max_tokens
+    if token_block_size:
+        kw["token_block_size"] = token_block_size
+    return kw
+
+
+def _pre_call(residual, fn, hc_scale, hc_base, norm_weight, *, rms_eps, hc_pre_eps,
+              hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat,
+              single_stream=False, **kernel_opts):
+    norm = {} if norm_weight is None else dict(norm_weight=norm_weight, norm_eps=rms_eps)
+    return _pre_kernel_fn(single_stream)(
+        residual, fn, hc_scale, hc_base, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
+        hc_post_mult_value, sinkhorn_repeat, **norm, **kernel_opts,
+    )
+
+
+def _fused_call(x, residual, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base,
+                norm_weight, *, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
+                hc_post_mult_value, sinkhorn_repeat, **kernel_opts):
+    norm = {} if norm_weight is None else dict(norm_weight=norm_weight, norm_eps=rms_eps)
+    return fused_post_pre_kernel.mhc_fused_post_pre(
+        x, residual, post_layer_mix, comb_res_mix, fn, hc_scale, hc_base, rms_eps,
+        hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat,
+        **norm, **kernel_opts,
+    )
+
+
+def _mhc_fused_post_pre_cat_jax(
+    x: jax.Array,
+    residual: jax.Array,
+    post_layer_mix: jax.Array,
+    comb_res_mix: jax.Array,
+    fn_cat: jax.Array,
+    hc_scale: jax.Array,
+    hc_base: jax.Array,
+    *,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    gates_in_kernel: bool,
+    gates_max_tokens: int = -1,
+    token_block_size: int = 0,
+    fn_hbm: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``_mhc_fused_post_pre_jax`` taking fn as its stacked bf16 chunks."""
+    return _fused_call(
+        x, residual, post_layer_mix, comb_res_mix, utils.CatFn(fn_cat),
+        hc_scale, hc_base, None,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_pre_eps,
+        hc_sinkhorn_eps=hc_sinkhorn_eps,
+        hc_post_mult_value=hc_post_mult_value,
+        sinkhorn_repeat=sinkhorn_repeat,
+        gates_in_kernel=gates_in_kernel,
+        **_kernel_kw(gates_max_tokens, token_block_size),
+        **({"fn_hbm": True} if fn_hbm else {}),
+    )
+
+
+def _mhc_fused_post_pre_cat_norm_jax(
+    x: jax.Array,
+    residual: jax.Array,
+    post_layer_mix: jax.Array,
+    comb_res_mix: jax.Array,
+    fn_cat: jax.Array,
+    hc_scale: jax.Array,
+    hc_base: jax.Array,
+    norm_weight: jax.Array,
+    *,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    gates_in_kernel: bool,
+    gates_max_tokens: int = -1,
+    token_block_size: int = 0,
+    fn_hbm: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``_mhc_fused_post_pre_cat_jax`` emitting the RMS-normalized input."""
+    return _fused_call(
+        x, residual, post_layer_mix, comb_res_mix, utils.CatFn(fn_cat),
+        hc_scale, hc_base, norm_weight,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_pre_eps,
+        hc_sinkhorn_eps=hc_sinkhorn_eps,
+        hc_post_mult_value=hc_post_mult_value,
+        sinkhorn_repeat=sinkhorn_repeat,
+        gates_in_kernel=gates_in_kernel,
+        **_kernel_kw(gates_max_tokens, token_block_size),
+        **({"fn_hbm": True} if fn_hbm else {}),
     )
 
 
@@ -247,14 +433,74 @@ def _fake_mhc_pre(residual, *args, **kwargs):
     return _fake_pre_outputs(residual)
 
 
+def _as_streams(x: torch.Tensor, fn: torch.Tensor) -> torch.Tensor:
+    """A (..., hc_mult, hidden) stand-in for a single (..., hidden) stream.
+
+    ``fn`` is any fn operand: its last dim is hc_mult * hidden.
+    """
+    hc_mult = fn.shape[-1] // x.shape[-1]
+    return x.unsqueeze(-2).expand(*x.shape[:-1], hc_mult, x.shape[-1])
+
+
+def _fake_mhc_pre_single_stream(x, fn, *args, **kwargs):
+    """Abstract implementation for PyTorch Dynamo graph tracing."""
+    return _fake_pre_outputs(_as_streams(x, fn))
+
+
 def _fake_mhc_post(x, residual, post_layer_mix, comb_res_mix, *args, **kwargs):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
     return torch.empty_like(residual)
 
 
-def _fake_mhc_fused_post_pre(x, residual, *args, **kwargs):
+def _fake_mhc_fused_post_pre(x, residual, post_layer_mix, comb_res_mix, fn, *args,
+                             **kwargs):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
+    if residual.dim() == x.dim():
+        residual = _as_streams(residual, fn)
     return (torch.empty_like(residual), *_fake_pre_outputs(residual))
+
+
+class KernelOpts(NamedTuple):
+    """Static mHC kernel options beyond the gate constants (all name the op).
+
+    stacked_fn: the ops take fn as one stacked (3 * M3, K) bf16 array
+        (``utils.CatFn``, one MXU pass) instead of three chunks.
+    token_block: fused seam token block (0: the kernel default, 32).
+    fn_hbm: the fused seam reads fn from HBM in its own pipeline instead of
+        letting XLA prefetch it into VMEM (VLLM_TPU_DSV4_MHC_SEAM_FN_HBM).
+    gates_max_tokens: in-kernel gates up to this many tokens (-1: the kernel
+        default, 512; 0: no cap).
+    """
+
+    gates_in_kernel: bool = False
+    fuse_norm: bool = False
+    stacked_fn: bool = False
+    token_block: int = 0
+    gates_max_tokens: int = -1
+    fn_hbm: bool = False
+
+    def suffix(self) -> str:
+        return (
+            ("_gk" if self.gates_in_kernel else "")
+            + ("_n" if self.fuse_norm else "")
+            + ("_cat" if self.stacked_fn else "")
+            + (f"_tb{self.token_block}" if self.token_block else "")
+            + (f"_gm{self.gates_max_tokens}" if self.gates_max_tokens >= 0 else "")
+            + ("_fh" if self.fn_hbm else "")
+        )
+
+    def kernel_kwargs(self, *, fused: bool) -> dict:
+        kw = {
+            "gates_in_kernel": self.gates_in_kernel,
+            "gates_max_tokens": self.gates_max_tokens,
+            "token_block_size": self.token_block if fused else 0,
+        }
+        if fused and self.fn_hbm:
+            kw["fn_hbm"] = True
+        return kw
+
+    def fn_specs(self) -> tuple:
+        return (P(),) if self.stacked_fn else (P(), P(), P())
 
 
 def _mhc_pre_op(
@@ -263,43 +509,58 @@ def _mhc_pre_op(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
-    gates_in_kernel: bool,
-    fuse_norm: bool,
+    opts: KernelOpts,
+    *,
+    single_stream: bool = False,
 ):
-    op_name = "pallas::deepseek_v4_mhc_pre_v2" + _gate_suffix(
-        rms_eps,
-        hc_pre_eps,
-        hc_sinkhorn_eps,
-        hc_post_mult_value,
-        sinkhorn_repeat,
-        gates_in_kernel,
-        fuse_norm,
+    op_name = (
+        ("pallas::deepseek_v4_mhc_pre_res1_v2" if single_stream
+         else "pallas::deepseek_v4_mhc_pre_v2")
+        + _gate_suffix(
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            False,
+            False,
+        )
+        + opts.suffix()
     )
     op = _mhc_op_cache.get(op_name)
     if op is None:
+        fn = {
+            (False, False): _mhc_pre_jax,
+            (False, True): _mhc_pre_norm_jax,
+            (True, False): _mhc_pre_cat_jax,
+            (True, True): _mhc_pre_cat_norm_jax,
+        }[(opts.stacked_fn, opts.fuse_norm)]
         op = pallas.jax_op(
             op_name,
             functools.partial(
-                _mhc_pre_norm_jax if fuse_norm else _mhc_pre_jax,
+                fn,
                 rms_eps=rms_eps,
                 hc_pre_eps=hc_pre_eps,
                 hc_sinkhorn_eps=hc_sinkhorn_eps,
                 hc_post_mult_value=hc_post_mult_value,
                 sinkhorn_repeat=sinkhorn_repeat,
-                gates_in_kernel=gates_in_kernel,
+                **opts.kernel_kwargs(fused=False),
+                **({"single_stream": True} if single_stream else {}),
             ),
             mesh=get_pallas_op_mesh(),
             input_partition_specs=(
-                P(ATTN_DATA_AXIS, None, None),  # residual
-                P(),  # fn_hi
-                P(),  # fn_mid
-                P(),  # fn_lo
+                # residual (or the one stream)
+                P(ATTN_DATA_AXIS, None) if single_stream
+                else P(ATTN_DATA_AXIS, None, None),
+                *opts.fn_specs(),  # fn chunks (or the stacked chunks)
                 P(),  # hc_scale
                 P(),  # hc_base
-                *([P()] if fuse_norm else []),  # norm weight
+                *([P()] if opts.fuse_norm else []),  # norm weight
             ),
         )
-        op.register_fake(_fake_mhc_pre)
+        op.register_fake(
+            _fake_mhc_pre_single_stream if single_stream else _fake_mhc_pre
+        )
         _mhc_op_cache[op_name] = op
     return op
 
@@ -335,43 +596,55 @@ def _mhc_fused_post_pre_op(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
-    gates_in_kernel: bool,
-    fuse_norm: bool,
+    opts: KernelOpts,
+    *,
+    single_stream_residual: bool = False,
 ):
-    op_name = "pallas::deepseek_v4_mhc_fused_post_pre_v2" + _gate_suffix(
-        rms_eps,
-        hc_pre_eps,
-        hc_sinkhorn_eps,
-        hc_post_mult_value,
-        sinkhorn_repeat,
-        gates_in_kernel,
-        fuse_norm,
+    op_name = (
+        ("pallas::deepseek_v4_mhc_fused_post_pre_res1_v2" if single_stream_residual
+         else "pallas::deepseek_v4_mhc_fused_post_pre_v2")
+        + _gate_suffix(
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            False,
+            False,
+        )
+        + opts.suffix()
     )
     op = _mhc_op_cache.get(op_name)
     if op is None:
+        fn = {
+            (False, False): _mhc_fused_post_pre_jax,
+            (False, True): _mhc_fused_post_pre_norm_jax,
+            (True, False): _mhc_fused_post_pre_cat_jax,
+            (True, True): _mhc_fused_post_pre_cat_norm_jax,
+        }[(opts.stacked_fn, opts.fuse_norm)]
         op = pallas.jax_op(
             op_name,
             functools.partial(
-                _mhc_fused_post_pre_norm_jax if fuse_norm else _mhc_fused_post_pre_jax,
+                fn,
                 rms_eps=rms_eps,
                 hc_pre_eps=hc_pre_eps,
                 hc_sinkhorn_eps=hc_sinkhorn_eps,
                 hc_post_mult_value=hc_post_mult_value,
                 sinkhorn_repeat=sinkhorn_repeat,
-                gates_in_kernel=gates_in_kernel,
+                **opts.kernel_kwargs(fused=True),
             ),
             mesh=get_pallas_op_mesh(),
             input_partition_specs=(
                 P(ATTN_DATA_AXIS, None),  # x
-                P(ATTN_DATA_AXIS, None, None),  # residual
+                # residual (or the one stream it is hc_mult copies of)
+                P(ATTN_DATA_AXIS, None) if single_stream_residual
+                else P(ATTN_DATA_AXIS, None, None),
                 P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
                 P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
-                P(),  # fn_hi
-                P(),  # fn_mid
-                P(),  # fn_lo
+                *opts.fn_specs(),  # fn chunks (or the stacked chunks)
                 P(),  # hc_scale
                 P(),  # hc_base
-                *([P()] if fuse_norm else []),  # norm weight
+                *([P()] if opts.fuse_norm else []),  # norm weight
             ),
         )
         op.register_fake(_fake_mhc_fused_post_pre)
@@ -381,6 +654,33 @@ def _mhc_fused_post_pre_op(
 
 def _mhc_split_fn_jax(fn: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     return tuple(utils.split_fn3(fn))
+
+
+def _mhc_stack_fn_jax(fn: jax.Array) -> jax.Array:
+    return utils.cat_fn3(fn).cat
+
+
+def get_mhc_stack_fn_op():
+    """fn (f32) -> its three bf16 chunks stacked (3 * M3, K), for
+    ``KernelOpts.stacked_fn`` ops. Run once per weight at load."""
+    op_name = "pallas::deepseek_v4_mhc_stack_fn_v1"
+    op = _mhc_op_cache.get(op_name)
+    if op is None:
+        op = pallas.jax_op(
+            op_name,
+            _mhc_stack_fn_jax,
+            mesh=get_pallas_op_mesh(),
+            input_partition_specs=(P(),),
+        )
+
+        def _fake(fn):
+            return torch.empty(
+                (3 * fn.shape[0], fn.shape[1]), dtype=torch.bfloat16, device=fn.device
+            )
+
+        op.register_fake(_fake)
+        _mhc_op_cache[op_name] = op
+    return op
 
 
 def get_mhc_split_fn_op():
@@ -406,6 +706,128 @@ def get_mhc_split_fn_op():
     return op
 
 
+def _mhc_post_head_1_jax(
+    x: jax.Array,
+    residual: jax.Array,
+    post_layer_mix: jax.Array,
+    comb_res_mix: jax.Array,
+    hc_fn: jax.Array,
+    hc_scale: jax.Array,
+    hc_base: jax.Array,
+    *,
+    rms_eps: float,
+    hc_eps: float,
+    want_head: bool,
+    want_mean: bool,
+) -> jax.Array:
+    """Last post + hc head collapse or the stream mean, one kernel."""
+    return post_head_kernel.mhc_post_head(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_eps,
+        want_head=want_head,
+        want_mean=want_mean,
+    )[0]
+
+
+def _mhc_post_head_2_jax(
+    x: jax.Array,
+    residual: jax.Array,
+    post_layer_mix: jax.Array,
+    comb_res_mix: jax.Array,
+    hc_fn: jax.Array,
+    hc_scale: jax.Array,
+    hc_base: jax.Array,
+    *,
+    rms_eps: float,
+    hc_eps: float,
+) -> tuple[jax.Array, jax.Array]:
+    """Last post + hc head collapse and the stream mean, one kernel."""
+    h, m = post_head_kernel.mhc_post_head(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_eps,
+        want_head=True,
+        want_mean=True,
+    )
+    return h, m
+
+
+def get_mhc_post_head_op(
+    rms_eps: float, hc_eps: float, *, want_head: bool, want_mean: bool
+):
+    """``post`` fused with what consumes its streams at the end of the stack:
+    the hc head collapse (``want_head``) and/or DSpark's aux stream mean
+    (``want_mean``). Returns a tuple: (head,), (mean,) or (head, mean)."""
+    assert want_head or want_mean
+    op_name = (
+        "pallas::deepseek_v4_mhc_post_head_v1"
+        + f"_r{_name_float(rms_eps)}_e{_name_float(hc_eps)}"
+        + ("_h" if want_head else "")
+        + ("_m" if want_mean else "")
+    )
+    op = _mhc_op_cache.get(op_name)
+    if op is None:
+        both = want_head and want_mean
+        fn = (
+            functools.partial(
+                _mhc_post_head_2_jax,
+                rms_eps=rms_eps,
+                hc_eps=hc_eps,
+            )
+            if both
+            else functools.partial(
+                _mhc_post_head_1_jax,
+                rms_eps=rms_eps,
+                hc_eps=hc_eps,
+                want_head=want_head,
+                want_mean=want_mean,
+            )
+        )
+        raw_op = pallas.jax_op(
+            op_name,
+            fn,
+            mesh=get_pallas_op_mesh(),
+            input_partition_specs=(
+                P(ATTN_DATA_AXIS, None),  # x
+                P(ATTN_DATA_AXIS, None, None),  # residual
+                P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
+                P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
+                P(),  # hc_fn
+                P(),  # hc_scale
+                P(),  # hc_base
+            ),
+        )
+        if both:
+
+            def _fake2(x, residual, *args, **kwargs):
+                return (torch.empty_like(x), torch.empty_like(x))
+
+            raw_op.register_fake(_fake2)
+            op = raw_op
+        else:
+
+            def _fake1(x, residual, *args, **kwargs):
+                return torch.empty_like(x)
+
+            raw_op.register_fake(_fake1)
+            op = lambda *args: (raw_op(*args),)
+        _mhc_op_cache[op_name] = op
+    return op
+
+
 class MHCOps(NamedTuple):
     """The three registered mHC ops for one set of gate constants.
 
@@ -426,13 +848,21 @@ class MHCOps(NamedTuple):
         computed from it.
 
     With ``fuse_norm`` both ``pre`` and ``fused`` take one more trailing
-    argument, the sublayer's input-norm weight (hidden_size,), and return
-    layer_input already RMS-normalized with it.
+    argument, the sublayer's input-norm weight ((hidden_size,) or, to avoid a
+    per-call relayout, (1, hidden_size)), and return layer_input already
+    RMS-normalized with it. With ``KernelOpts.stacked_fn`` ``fn3`` is the
+    single stacked array from ``get_mhc_stack_fn_op``.
+
+    ``pre_single_stream`` / ``fused_from_single_stream`` are ``pre`` /
+    ``fused`` for a residual whose hc_mult streams are copies of one
+    (..., hidden_size) stream (the embedding), which is passed instead.
     """
 
     pre: Any
     fused: Any
     post: Any
+    pre_single_stream: Any = None
+    fused_from_single_stream: Any = None
 
 
 def get_mhc_ops(
@@ -444,6 +874,7 @@ def get_mhc_ops(
     *,
     gates_in_kernel: bool = False,
     fuse_norm: bool = False,
+    opts: KernelOpts | None = None,
 ) -> MHCOps:
     """Build (or fetch) every mHC op for these gate constants.
 
@@ -453,17 +884,22 @@ def get_mhc_ops(
     the returned ops and invoke them directly, keeping the op lookup out of
     the traced graph entirely.
     """
+    if opts is None:
+        opts = KernelOpts(gates_in_kernel=gates_in_kernel, fuse_norm=fuse_norm)
     consts = (
         rms_eps,
         hc_pre_eps,
         hc_sinkhorn_eps,
         hc_post_mult_value,
         sinkhorn_repeat,
-        gates_in_kernel,
-        fuse_norm,
+        opts,
     )
     return MHCOps(
         pre=_mhc_pre_op(*consts),
         fused=_mhc_fused_post_pre_op(*consts),
         post=get_mhc_post_op(),
+        pre_single_stream=_mhc_pre_op(*consts, single_stream=True),
+        fused_from_single_stream=_mhc_fused_post_pre_op(
+            *consts, single_stream_residual=True
+        ),
     )

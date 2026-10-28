@@ -7,6 +7,50 @@ import sys
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+for _k, _v in {
+    "VLLM_TPU_DSV4_MEGAKERNEL": "1",
+    "VLLM_TPU_DSV4_INDEXER_KV_LAYOUT": "sal",
+    "VLLM_TPU_DSV4_MK_TRACE_RUNS": "64",
+    "VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL": "1",
+    "VLLM_TPU_DSV4_MHC_FUSE_NORM": "1",
+    "VLLM_TPU_DSV4_MHC_STACKED_FN": "1",
+    "VLLM_TPU_DSV4_MHC_TOKEN_BLOCK": "128",
+    "VLLM_TPU_DSV4_MHC_GATES_MAX_TOKENS": "0",
+    "VLLM_TPU_DSV4_MHC_LOW_VMEM_MAX_TOKENS": "32",
+    "VLLM_TPU_DSV4_MHC_POST_HEAD": "1",
+    "TPU_STREAMIDX_STRICT_CAUSAL": "1",
+    "TPU_TOKEN_BUCKET_EXTRA": "8,24",
+    "TPU_SMALL_ALL_REDUCE": "1",
+    "TPU_STREAMIDX_SPLIT_MIXED_MIN_TOKENS": "128",
+    "TPU_DSV4_CSA_GATHER_NO_PAD": "1",
+    "TPU_DSPARK_VOCAB_PARALLEL_MARKOV": "1",
+    "TPU_DSPARK_SHARDED_CONTEXT_KV": "1",
+    "MOE_FUSED_EP_V2_MERGED_EXCHANGE": "1",
+    "MOE_FUSED_EP_V2_PALLAS_PLAN": "1",
+    "MOE_FUSED_EP_V2_DECODE_COMBINE": "1",
+    "MOE_FUSED_EP_V2_PALLAS_RESTORE": "1",
+    "MOE_FUSED_EP_V2_FUSED_SELECT": "1",
+    "TPU_DSV4_SC_TOPK_ONE_LAUNCH": "1",
+    "TPU_DSV4_SC_TOPK_COOP_MAX_ROWS": "16",
+    "TPU_FP8_LINEAR_PALLAS": "1",
+    "TPU_FP8_SKINNY_HBM_PIN_SITES": (
+        "attn.fused_wqa_wkv,attn.wq_b,attn.wo_b,shared_experts.gate_up_proj"
+    ),
+    "TPU_SAMPLER_FUSED_CHAIN": "1",
+    "TPU_SAMPLER_GRAPH_RNG": "1",
+    "TPU_LM_HEAD_HBM": "drafter",
+    "TPU_DSV4_INDEXER_KV_SPLIT_MIN_TOKENS": "128",
+    "TPU_DSV4_CSA_MASKED_DENSE_MAX_KV": "8192",
+    "TPU_DSV4_INDEXER_KV_SPLIT_A2A": "1",
+    "TPU_DSV4_HCA_MIXED_Q_BLOCK": "128",
+    "TPU_DSV4_HCA_MLA_PIPELINED": "1",
+    "TPU_DSV4_SWA_PADDED_LM": "1",
+    "TPU_DSV4_FUSED_QKV_ROPE": "1",
+    "TPU_BLOCK_HASH_REUSE": "1",
+    "TPU_REQUEST_TIMING_LOG": "1",
+}.items():
+    os.environ.setdefault(_k, _v)
+
 if TYPE_CHECKING:
     TPU_K3_SP_PREFILL: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
@@ -130,7 +174,7 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_STREAMIDX_SPLIT_MIXED: bool = False
-    TPU_STREAMIDX_STRICT_CAUSAL: bool = False
+    TPU_STREAMIDX_STRICT_CAUSAL: bool = True
     TPU_STREAMIDX_SPLIT_MIXED_MIN_TOKENS: int = 0
     TPU_DSV4_SC_TOPK_ONE_LAUNCH: bool = False
     TPU_DSV4_SC_TOPK_COOP_MAX_ROWS: int = 0
@@ -147,8 +191,18 @@ if TYPE_CHECKING:
     TPU_DSPARK_SHARDED_CONTEXT_KV: bool = False
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     VLLM_TPU_DSV4_INDEXER_KV_LAYOUT: str = "has"
-    VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL: bool = False
-    VLLM_TPU_DSV4_MHC_FUSE_NORM: bool = False
+    VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL: bool = True
+    VLLM_TPU_DSV4_MHC_FUSE_NORM: bool = True
+    VLLM_TPU_DSV4_MHC_STACKED_FN: bool = True
+    VLLM_TPU_DSV4_MHC_TOKEN_BLOCK: int = 128
+    VLLM_TPU_DSV4_MHC_GATES_MAX_TOKENS: int = 0
+    VLLM_TPU_DSV4_MHC_SMALL_BLOCK: int = 16
+    VLLM_TPU_DSV4_MHC_FN_CHUNKS: int = 3
+    VLLM_TPU_DSV4_MHC_LOW_VMEM_MAX_TOKENS: int = 32
+    VLLM_TPU_DSV4_MHC_SEAM_FN_HBM: str = ""
+    TPU_DSV4_MHC_AR_SEAM: bool = False
+    TPU_DSV4_MHC_MOE_AR_SEAM: int = 0
+    VLLM_TPU_DSV4_MHC_POST_HEAD: bool = True
     VLLM_TPU_DSV4_MEGAKERNEL: bool = False
     VLLM_TPU_DSV4_MK_AB: bool = False
     VLLM_TPU_DSV4_MK_BUCKETS: str = "16,32,64"
@@ -975,7 +1029,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_STREAMIDX_SPLIT_MIXED": env_bool("TPU_STREAMIDX_SPLIT_MIXED"),
     # Indexer rows see only the compressed groups complete at their own
     # position, (pos + 1) // ratio, in multi-token forwards.
-    "TPU_STREAMIDX_STRICT_CAUSAL": env_bool("TPU_STREAMIDX_STRICT_CAUSAL"),
+    "TPU_STREAMIDX_STRICT_CAUSAL": env_bool(
+        "TPU_STREAMIDX_STRICT_CAUSAL", default=True
+    ),
     # Smallest token bucket TPU_STREAMIDX_SPLIT_MIXED splits. Below it a batch
     # without a mixed sequence would score and top-k an empty second piece.
     "TPU_STREAMIDX_SPLIT_MIXED_MIN_TOKENS": env_int(
@@ -1059,10 +1115,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DeepSeek-V4 mHC: compute the post/comb gates (sigmoid, softmax and
     # Sinkhorn) inside the Pallas pre / fused seam kernels instead of as an
     # XLA epilogue of ~130 tiny ops per seam.
-    "VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL": env_bool("VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL"),
+    "VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL": env_bool(
+        "VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL", default=True
+    ),
     # DeepSeek-V4 mHC: the pre / fused seam kernels also apply the
     # sublayer's attn_norm / ffn_norm RMSNorm to the layer input they emit.
-    "VLLM_TPU_DSV4_MHC_FUSE_NORM": env_bool("VLLM_TPU_DSV4_MHC_FUSE_NORM"),
+    "VLLM_TPU_DSV4_MHC_FUSE_NORM": env_bool(
+        "VLLM_TPU_DSV4_MHC_FUSE_NORM", default=True
+    ),
+    "VLLM_TPU_DSV4_MHC_STACKED_FN": env_bool(
+        "VLLM_TPU_DSV4_MHC_STACKED_FN", default=True
+    ),
+    "VLLM_TPU_DSV4_MHC_TOKEN_BLOCK": env_int("VLLM_TPU_DSV4_MHC_TOKEN_BLOCK", 128),
+    "VLLM_TPU_DSV4_MHC_GATES_MAX_TOKENS": env_int(
+        "VLLM_TPU_DSV4_MHC_GATES_MAX_TOKENS", 0
+    ),
+    "VLLM_TPU_DSV4_MHC_SMALL_BLOCK": env_int("VLLM_TPU_DSV4_MHC_SMALL_BLOCK", 16),
+    "VLLM_TPU_DSV4_MHC_FN_CHUNKS": env_int("VLLM_TPU_DSV4_MHC_FN_CHUNKS", 3),
+    "VLLM_TPU_DSV4_MHC_LOW_VMEM_MAX_TOKENS": env_int(
+        "VLLM_TPU_DSV4_MHC_LOW_VMEM_MAX_TOKENS", 32
+    ),
+    "VLLM_TPU_DSV4_MHC_SEAM_FN_HBM": lambda: os.getenv(
+        "VLLM_TPU_DSV4_MHC_SEAM_FN_HBM", ""
+    ),
+    "TPU_DSV4_MHC_AR_SEAM": env_bool("TPU_DSV4_MHC_AR_SEAM"),
+    "TPU_DSV4_MHC_MOE_AR_SEAM": env_int("TPU_DSV4_MHC_MOE_AR_SEAM", 0),
+    "VLLM_TPU_DSV4_MHC_POST_HEAD": env_bool(
+        "VLLM_TPU_DSV4_MHC_POST_HEAD", default=True
+    ),
     # DeepSeek-V4 decode/verify megakernel: take every step whose requests
     # are all decode or verify windows (on every DP rank) through one fused
     # program instead of the per-op model forward.

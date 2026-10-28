@@ -55,16 +55,19 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor 
     VllmDeepseekCompressor,  # noqa: E501
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_mhc_op import (  # noqa: E501
+    KernelOpts,
     MHCOps,
     get_mhc_ops,
+    get_mhc_post_head_op,
     get_mhc_post_op,
     get_mhc_split_fn_op,
+    get_mhc_stack_fn_op,
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.deepseek_v4.attention import VllmDeepseekV4MLAAttention
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import mhc_collapse_head
 from vllm_torchtpu.models.vllm.deepseek_v4.moe import DeepseekV4MoE
-from vllm_torchtpu.utils import host_rss_gib, release_memory_to_os
+from vllm_torchtpu.utils import fresh_buffer, host_rss_gib, release_memory_to_os
 
 logger = init_logger(__name__)
 
@@ -105,6 +108,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         # The mHC kernels then emit attn_norm/ffn_norm-normalized inputs.
         self.fuse_norm = envs.VLLM_TPU_DSV4_MHC_FUSE_NORM
+        self.mhc_opts = KernelOpts(
+            gates_in_kernel=envs.VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL,
+            fuse_norm=self.fuse_norm,
+            stacked_fn=envs.VLLM_TPU_DSV4_MHC_STACKED_FN,
+            token_block=envs.VLLM_TPU_DSV4_MHC_TOKEN_BLOCK,
+            gates_max_tokens=envs.VLLM_TPU_DSV4_MHC_GATES_MAX_TOKENS,
+        )
         self.hc_mult = config.hc_mult
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
@@ -151,8 +161,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_eps,
                 self.hc_post_alpha,
                 self.hc_sinkhorn_iters,
-                gates_in_kernel=envs.VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL,
-                fuse_norm=self.fuse_norm,
+                opts=self.mhc_opts,
             )
             object.__setattr__(self, "_mhc_ops_instance", ops)
         return ops
@@ -161,18 +170,46 @@ class DeepseekV4DecoderLayer(nn.Module):
         """Split hc_attn_fn / hc_ffn_fn into the bf16 chunks the mHC ops take.
 
         The split depends only on the weight; doing it here, once after the
-        weights land, keeps it out of every forward.
+        weights land, keeps it out of every forward. Each buffer goes through
+        `fresh_buffer`: a view or an aliased clone would otherwise be
+        re-materialized as a `tt_jit_as_strided` program before every forward.
         """
-        split = get_mhc_split_fn_op()
-        for name in ("hc_attn_fn", "hc_ffn_fn"):
-            for suffix, chunk in zip(("hi", "mid", "lo"), split(getattr(self, name))):
-                self.register_buffer(f"{name}_{suffix}", chunk, persistent=False)
+        if self.mhc_opts.stacked_fn:
+            stack = get_mhc_stack_fn_op()
+            for name in ("hc_attn_fn", "hc_ffn_fn"):
+                self.register_buffer(
+                    f"{name}_cat",
+                    fresh_buffer(stack(getattr(self, name))),
+                    persistent=False,
+                )
+        else:
+            split = get_mhc_split_fn_op()
+            for name in ("hc_attn_fn", "hc_ffn_fn"):
+                for suffix, chunk in zip(
+                    ("hi", "mid", "lo"), split(getattr(self, name))
+                ):
+                    self.register_buffer(
+                        f"{name}_{suffix}", fresh_buffer(chunk), persistent=False
+                    )
+        if self.fuse_norm:
+            for norm_name in ("attn_norm", "ffn_norm"):
+                w = getattr(self, norm_name).weight
+                self.register_buffer(
+                    f"{norm_name}_w2d",
+                    fresh_buffer(w.detach().reshape(1, -1)),
+                    persistent=False,
+                )
 
-    def _fn3(self, name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _fn3(self, name: str) -> tuple[torch.Tensor, ...]:
+        if self.mhc_opts.stacked_fn:
+            return (getattr(self, f"{name}_cat"),)
         return tuple(getattr(self, f"{name}_{s}") for s in ("hi", "mid", "lo"))
 
     def _norm_arg(self, norm: RMSNorm) -> tuple[torch.Tensor, ...]:
-        return (norm.weight,) if self.fuse_norm else ()
+        if not self.fuse_norm:
+            return ()
+        name = "attn_norm" if norm is self.attn_norm else "ffn_norm"
+        return (getattr(self, f"{name}_w2d"),)
 
     def _norm(self, norm: RMSNorm, x: torch.Tensor) -> torch.Tensor:
         return x if self.fuse_norm else norm(x)
@@ -210,7 +247,18 @@ class DeepseekV4DecoderLayer(nn.Module):
         still owes. The chain is opened by the layer-0 attention pre, which
         has no preceding post, and closed by the caller.
         """
-        if residual is None:
+        if residual is None and x.dim() == 2:
+            # Chain start on the embedding: its hc_mult streams are copies
+            # of x, so the pre (and the seam below) read x once.
+            residual = x
+            post_mix, res_mix, x = self.mhc_ops.pre_single_stream(
+                x,
+                *self._fn3("hc_attn_fn"),
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                *self._norm_arg(self.attn_norm),
+            )
+        elif residual is None:
             # Chain start: a standalone pre, nothing to fuse it with.
             residual = x
             x, post_mix, res_mix = self.hc_pre(
@@ -231,7 +279,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         x = self._norm(self.attn_norm, x)
         x = self.attn(positions, x)
 
-        residual, post_mix, res_mix, x = self.mhc_ops.fused(
+        fused = (
+            self.mhc_ops.fused_from_single_stream
+            if residual.dim() == x.dim()
+            else self.mhc_ops.fused
+        )
+        residual, post_mix, res_mix, x = fused(
             x,
             residual,
             post_mix,
@@ -487,6 +540,31 @@ class DeepseekV4Model(nn.Module):
             object.__setattr__(self, "_mhc_post_op_instance", op)
         return op
 
+    def _post_head_op(self, want_head: bool, want_mean: bool):
+        """The fused post + head / aux-mean op; built in the runner's op
+        prebuild (``post_head_ops``) before compile."""
+        ops = self.__dict__.get("_post_head_ops")
+        if ops is None:
+            ops = {}
+            object.__setattr__(self, "_post_head_ops", ops)
+        key = (want_head, want_mean)
+        if key not in ops:
+            ops[key] = get_mhc_post_head_op(
+                self.rms_norm_eps,
+                self.hc_eps,
+                want_head=want_head,
+                want_mean=want_mean,
+            )
+        return ops[key]
+
+    @property
+    def post_head_ops(self):
+        """Prebuild every fused-tail variant outside the trace."""
+        if envs.VLLM_TPU_DSV4_MHC_POST_HEAD:
+            for key in ((True, False), (True, True), (False, True)):
+                self._post_head_op(*key)
+        return self.__dict__.get("_post_head_ops")
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -551,7 +629,8 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
-            hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+            # Left as the one stream the hc_mult streams start as copies of;
+            # the first layer reads it as such (DeepseekV4DecoderLayer).
         else:
             assert intermediate_tensors is not None
             hidden_states = typing.cast(
@@ -565,6 +644,11 @@ class DeepseekV4Model(nn.Module):
             moe_input_ids = self._dp_gather_hash_moe_input_ids(input_ids)
 
         residual, post_mix, res_mix = None, None, None
+        fuse_tail = (
+            envs.VLLM_TPU_DSV4_MHC_POST_HEAD
+            and get_pp_group().is_last_rank
+            and self.end_layer > self.start_layer
+        )
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None
         for idx, layer in enumerate(
@@ -580,12 +664,45 @@ class DeepseekV4Model(nn.Module):
                 residual,
             )
             if idx + 1 in self.aux_hidden_state_layers:
+                if fuse_tail and idx + 1 == self.end_layer:
+                    continue  # the fused tail below emits this aux mean
+                if fuse_tail:
+                    (aux_mean,) = self._post_head_op(False, True)(
+                        hidden_states,
+                        residual,
+                        post_mix,
+                        res_mix,
+                        self.hc_head_fn,
+                        self.hc_head_scale,
+                        self.hc_head_base,
+                    )
+                    aux_hidden_states.append(aux_mean)
+                    continue
                 # Reconstruct the full hc-stream state and collapse it the
                 # way the drafts were trained on: settle the deferred post,
                 # then mean over the hc streams (upstream numerics).
                 aux_recon = self.mhc_post_op(hidden_states, residual, post_mix, res_mix)
                 aux_hidden_states.append(aux_recon.mean(dim=1))
                 final_aux_recon = aux_recon
+
+        if fuse_tail:
+            # One kernel: last post + hc head (+ the final aux mean).
+            want_mean = self.end_layer in self.aux_hidden_state_layers
+            outs = self._post_head_op(True, want_mean)(
+                hidden_states,
+                residual,
+                post_mix,
+                res_mix,
+                self.hc_head_fn,
+                self.hc_head_scale,
+                self.hc_head_base,
+            )
+            if want_mean:
+                aux_hidden_states.append(outs[1])
+            hidden_states = self.norm(outs[0])
+            if aux_hidden_states:
+                return hidden_states, aux_hidden_states
+            return hidden_states
 
         if post_mix is not None:
             if (

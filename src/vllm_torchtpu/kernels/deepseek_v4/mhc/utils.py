@@ -113,6 +113,68 @@ def split_fn3(fn: jax.Array | SplitFn) -> SplitFn:
     return SplitFn(*(t.astype(jnp.bfloat16) for t in (fn_hi, fn_mid, fn_lo)))
 
 
+class CatFn(NamedTuple):
+    """fn's three bf16 chunks stacked along the output axis: (3 * M3, K).
+
+    One MXU pass against the stacked chunks yields the three partial
+    products side by side; the MXU pads the 24-wide output to its full
+    width anyway, so this costs one pass instead of three. The partials are
+    then summed (hi + mid) + lo, the order of the three-pass path.
+    """
+
+    cat: jax.Array
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return (self.cat.shape[0] // 3, self.cat.shape[1])
+
+
+def cat_fn3(fn: "jax.Array | SplitFn | CatFn") -> CatFn:
+    """``split_fn3`` chunks stacked as one (3 * M3, K) bf16 array."""
+    if isinstance(fn, CatFn):
+        assert fn.cat.dtype == jnp.bfloat16, fn.cat.dtype
+        return fn
+    return CatFn(jnp.concatenate(tuple(split_fn3(fn)), axis=0))
+
+
+def fn_operands(fn: "jax.Array | SplitFn | CatFn") -> tuple[jax.Array, ...]:
+    """The kernel's fn operands: one stacked array (CatFn) or three chunks."""
+    if isinstance(fn, CatFn):
+        return (cat_fn3(fn).cat,)
+    return tuple(split_fn3(fn))
+
+
+def mix_gemm(x_bf: jax.Array, fn_refs, hc_mult3: int, gemm_precision: str):
+    """x (tb, K) bf16 @ fn.T -> (tb, M3) f32, exact for bf16 x.
+
+    ``fn_refs``: three chunk refs (three MXU passes), or one stacked ref
+    (one pass, then the partials are summed in the three-pass order).
+    """
+    dn = (((1,), (1,)), ((), ()))
+    if len(fn_refs) == 1:
+        out = jax.lax.dot_general(
+            x_bf, fn_refs[0][...], dn, preferred_element_type=jnp.float32
+        )
+        acc = out[:, :hc_mult3]
+        if gemm_precision == "highest":
+            acc = acc + out[:, hc_mult3 : 2 * hc_mult3]
+            if out.shape[1] > 2 * hc_mult3:  # absent with a 2-chunk read
+                acc = acc + out[:, 2 * hc_mult3 :]
+        return acc
+    fn_hi_ref, fn_mid_ref, fn_lo_ref = fn_refs
+    acc = jax.lax.dot_general(
+        x_bf, fn_hi_ref[...], dn, preferred_element_type=jnp.float32
+    )
+    if gemm_precision == "highest":
+        acc = acc + jax.lax.dot_general(
+            x_bf, fn_mid_ref[...], dn, preferred_element_type=jnp.float32
+        )
+        acc = acc + jax.lax.dot_general(
+            x_bf, fn_lo_ref[...], dn, preferred_element_type=jnp.float32
+        )
+    return acc
+
+
 def mhc_pre_gates(
     mixes: jax.Array,
     sqrsum: jax.Array,
@@ -170,9 +232,16 @@ def gate_consts(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    max_tokens: int | None = None,
 ) -> "GateConsts | None":
-    """The in-kernel gate constants, or None for the XLA gates epilogue."""
-    if not gates_in_kernel or num_tokens > GATES_IN_KERNEL_MAX_TOKENS:
+    """The in-kernel gate constants, or None for the XLA gates epilogue.
+
+    ``max_tokens``: in-kernel only up to this many tokens (None: the module
+    default; 0: no cap -- worth it once the token block fills the 128 lanes
+    the token-major Sinkhorn runs on).
+    """
+    max_tokens = GATES_IN_KERNEL_MAX_TOKENS if max_tokens is None else max_tokens
+    if not gates_in_kernel or (max_tokens > 0 and num_tokens > max_tokens):
         return None
     return GateConsts(hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat)
 
@@ -231,6 +300,14 @@ def gates_in_block(
 
     lt = comb_logits.T  # (M*M, tb), row k = i * M + j
     c = [[lt[i * m + j : i * m + j + 1, :] for j in range(m)] for i in range(m)]
+    c = sinkhorn(c, m, eps, gates.sinkhorn_repeat)
+    comb_mix = jnp.concatenate([c[i][j] for i in range(m) for j in range(m)], 0).T
+    return pre_mix, post_mix, comb_mix
+
+
+def sinkhorn(c, m: int, eps: float, sinkhorn_repeat: int):
+    """Row softmax + Sinkhorn on c[i][j] (same-shape arrays), in the exact
+    op order of ``mhc_pre_gates``' token-major in-kernel form."""
     for i in range(m):
         mx = c[i][0]
         for j in range(1, m):
@@ -248,10 +325,9 @@ def gates_in_block(
         return [[c[i][j] / rows[i] for j in range(m)] for i in range(m)]
 
     c = col_norm(c)
-    for _ in range(gates.sinkhorn_repeat - 1):
+    for _ in range(sinkhorn_repeat - 1):
         c = col_norm(row_norm(c))
-    comb_mix = jnp.concatenate([c[i][j] for i in range(m) for j in range(m)], 0).T
-    return pre_mix, post_mix, comb_mix
+    return c
 
 
 def finish_layer_input(lay: jax.Array, norm_w_ref, norm_eps: float | None) -> jax.Array:
@@ -259,13 +335,21 @@ def finish_layer_input(lay: jax.Array, norm_w_ref, norm_eps: float | None) -> ja
 
     With ``norm_eps`` it is also RMS-normalized (vLLM ``rms_norm``: bf16
     input, f32 statistics), so the sublayer's own input norm can be skipped.
-    The weight multiply stays in f32 with one final rounding, which is what
-    XLA makes of rms_norm's bf16 ``x.to(weight.dtype) * weight``.
+    A bf16 weight follows rms_norm's ``x.to(weight.dtype) * weight`` (round,
+    then multiply); an f32 weight multiplies the f32 normalized value.
     """
     out = lay.astype(jnp.bfloat16)
     if norm_eps is None:
         return out
     x = out.astype(jnp.float32)
     var = jnp.mean(x * x, axis=-1, keepdims=True)
-    w = norm_w_ref[...].astype(jnp.float32)
-    return (x * jax.lax.rsqrt(var + norm_eps) * w).astype(jnp.bfloat16)
+    normed = x * jax.lax.rsqrt(var + norm_eps)
+    w = norm_w_ref[...]
+    if w.dtype == jnp.bfloat16:
+        # vLLM rms_norm: ``x.to(weight.dtype) * weight`` -- round to bf16,
+        # then a bf16 multiply. The f32 product of two bf16 values is exact,
+        # so one more rounding reproduces the bf16 multiply bit for bit.
+        # torch_tpu keeps that intermediate rounding (measured: dropping it
+        # moves 25% of elements by 1 ulp vs the served XLA rms_norm).
+        normed = normed.astype(jnp.bfloat16).astype(jnp.float32)
+    return (normed * w.astype(jnp.float32)).astype(jnp.bfloat16)

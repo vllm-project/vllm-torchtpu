@@ -81,7 +81,7 @@ def test_kernel_config_reads_the_env(monkeypatch):
         geom = SI.kernel_config(cfg, bucket).geometry()
         assert geom.strict_causal is want and AP.dims_of(geom).strict_causal is want
     monkeypatch.delenv("TPU_STREAMIDX_STRICT_CAUSAL")
-    assert SI.kernel_config(cfg, bucket).geometry().strict_causal is False
+    assert SI.kernel_config(cfg, bucket).geometry().strict_causal is True
 
 
 @pytest.mark.parametrize("strict", [False, True])

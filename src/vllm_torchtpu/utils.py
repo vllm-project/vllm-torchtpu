@@ -377,3 +377,11 @@ def synchronize_tensors(
     from torch_tpu._internal import sync
 
     sync.synchronize(tensors=tensors, wait=wait)
+
+
+def fresh_buffer(t: torch.Tensor) -> torch.Tensor:
+    """Return a copy of `t` backed by a fresh device buffer of its own shape."""
+    out = torch.clone(t, memory_format=torch.contiguous_format)
+    if out.device.type == "tpu":
+        out = out + 0
+    return out

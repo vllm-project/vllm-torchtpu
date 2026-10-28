@@ -30,6 +30,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
 from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     quantized_matmul,
@@ -274,6 +275,8 @@ class DSparkDeepseekV4Model(nn.Module):
     # mapping, and the per-layer loader.
     # The loader expects names already rewritten by ``_rewrite_dspark_name``.
     mhc_post_op = DeepseekV4Model.mhc_post_op
+    _post_head_op = DeepseekV4Model._post_head_op
+    post_head_ops = DeepseekV4Model.post_head_ops
     get_expert_mapping = DeepseekV4Model.get_expert_mapping
     load_weights = DeepseekV4Model.load_weights
 
@@ -364,8 +367,9 @@ class DSparkDeepseekV4Model(nn.Module):
     ) -> torch.Tensor:
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
-        # Expand to hc_mult copies for hyper-connections ([T,H] -> [T,hc,H]).
-        hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        # Left as the one stream the hc_mult streams start as copies of;
+        # the first layer reads it as such (DeepseekV4DecoderLayer).
+        hidden_states = inputs_embeds
 
         residual = post_mix = res_mix = None
         for layer in self.layers:
@@ -377,6 +381,17 @@ class DSparkDeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
             )
+        if envs.VLLM_TPU_DSV4_MHC_POST_HEAD:
+            (hidden_states,) = self._post_head_op(True, False)(
+                hidden_states,
+                residual,
+                post_mix,
+                res_mix,
+                self.hc_head_fn,
+                self.hc_head_scale,
+                self.hc_head_base,
+            )
+            return hidden_states
         hidden_states = self.mhc_post_op(hidden_states, residual, post_mix, res_mix)
         return mhc_collapse_head(
             hidden_states,

@@ -50,12 +50,8 @@ def _mixes_kernel(x_ref, fn_hi_ref, fn_mid_ref, fn_lo_ref, mixes_ref, sqrsum_ref
 
 def _mixes_collapse_kernel(
     x_ref,
-    fn_hi_ref,
-    fn_mid_ref,
-    fn_lo_ref,
-    sc_ref,
-    hb_ref,
     *refs,
+    n_fn,
     hc_mult,
     hidden_size,
     rms_eps,
@@ -72,11 +68,18 @@ def _mixes_collapse_kernel(
     ``gates`` is set: then they run in-block too (gate_a/gate_b =
     post_mix/comb_mix). refs: [norm_w_ref] (only with ``norm_eps``), then
     the outputs.
+
+    A (tb, hidden_size) block is one stream standing for all hc_mult
+    identical ones (the embedding before any post); it is repeated in VMEM
+    so the GEMM and the sums see the values the repeated HBM copy holds.
     """
+    fn_refs, (sc_ref, hb_ref), refs = refs[:n_fn], refs[n_fn : n_fn + 2], refs[n_fn + 2 :]
     *norm_w, gate_a_ref, gate_b_ref, layer_ref = refs
     m, h = hc_mult, hidden_size
     x = x_ref[...]
-    acc = _dot3(x, fn_hi_ref, fn_mid_ref, fn_lo_ref)
+    if x.shape[1] == h:
+        x = jnp.concatenate([x] * m, axis=1)
+    acc = utils.mix_gemm(x, fn_refs, m * (m + 2), "highest")
     xf = x.astype(jnp.float32)
     sqr = jnp.sum(xf * xf, axis=-1, keepdims=True)
     if gates is None:
@@ -190,7 +193,7 @@ def mhc_pre_mixes(
 )
 def mhc_pre_mixes_collapse(
     x2d: jax.Array,
-    fn: jax.Array | utils.SplitFn,
+    fn: jax.Array | utils.SplitFn | utils.CatFn,
     hc_scale: jax.Array,
     hc_base: jax.Array,
     rms_eps: float,
@@ -204,6 +207,9 @@ def mhc_pre_mixes_collapse(
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Mixes + in-block collapse: the full memory-bound half of ``mhc_pre``.
 
+    ``x2d`` is (T, hc_mult * hidden_size), or (T, hidden_size) when all
+    hc_mult streams are the same single stream.
+
     Returns (mixes (T, hc_mult3) f32 — raw, unscaled, for the XLA gates;
     sqrsum (T, 1) f32; layer_input2d (T, hidden_size) bf16). With
     ``gates``, mixes/sqrsum are replaced by the in-block post_mix
@@ -211,20 +217,22 @@ def mhc_pre_mixes_collapse(
     ``norm_eps``, layer_input2d is RMS-normalized.
     """
     assert x2d.dtype == jnp.bfloat16, x2d.dtype
-    num_tokens, hc_hidden = x2d.shape
-    hc_mult3 = fn.shape[0]
-    assert fn.shape == (hc_mult3, hc_hidden), (fn.shape, x2d.shape)
+    hc_mult3, hc_hidden = fn.shape
     # hc_mult3 = hc_mult * (hc_mult + 2) -> unique positive hc_mult.
     hc_mult = next(m for m in range(1, 64) if m * (m + 2) == hc_mult3)
     hidden_size = hc_hidden // hc_mult
+    num_tokens, x_width = x2d.shape
+    assert x_width in (hc_hidden, hidden_size), (fn.shape, x2d.shape)
 
-    fn_hi, fn_mid, fn_lo = utils.split_fn3(fn)
+    fn_ops = utils.fn_operands(fn)
     sc2d = hc_scale.reshape(1, 3).astype(jnp.float32)
     hb2d = hc_base.reshape(1, hc_mult3).astype(jnp.float32)
 
     def _vmem_need(tb: int) -> int:
         # Double-buffered bf16 x block + layer output, transient f32
-        # copy, resident bf16 fn chunks; x2 spill/scratch headroom.
+        # copy, resident bf16 fn chunks; x2 spill/scratch headroom. Also
+        # bounds a one-stream block: its x is a quarter the size, plus the
+        # repeated bf16 copy.
         return 2 * (
             tb * hc_hidden * (2 * 2 + 4)
             + tb * hidden_size * 2 * 2
@@ -252,11 +260,11 @@ def mhc_pre_mixes_collapse(
     norm_args = [] if norm_weight is None else [norm_weight.reshape(1, hidden_size)]
     norm_specs = [pl.BlockSpec((1, hidden_size), lambda i: (0, 0)) for _ in norm_args]
 
-    resident = pl.BlockSpec((hc_mult3, hc_hidden), lambda i: (0, 0))
     gate_widths = (hc_mult3, 1) if gates is None else (hc_mult, hc_mult * hc_mult)
     gate_a, gate_b, layer2d = pl.pallas_call(
         functools.partial(
             _mixes_collapse_kernel,
+            n_fn=len(fn_ops),
             hc_mult=hc_mult,
             hidden_size=hidden_size,
             rms_eps=rms_eps,
@@ -266,10 +274,8 @@ def mhc_pre_mixes_collapse(
         ),
         grid=(pl.cdiv(padded_tokens, tb),),
         in_specs=[
-            pl.BlockSpec((tb, hc_hidden), lambda i: (i, 0)),
-            resident,
-            resident,
-            resident,
+            pl.BlockSpec((tb, x_width), lambda i: (i, 0)),
+            *(pl.BlockSpec(f.shape, lambda i: (0, 0)) for f in fn_ops),
             pl.BlockSpec((1, 3), lambda i: (0, 0)),
             pl.BlockSpec((1, hc_mult3), lambda i: (0, 0)),
             *norm_specs,
@@ -286,7 +292,7 @@ def mhc_pre_mixes_collapse(
             jax.ShapeDtypeStruct((padded_tokens, hidden_size), jnp.bfloat16),
         ],
         compiler_params=compiler_params,
-    )(x2d, fn_hi, fn_mid, fn_lo, sc2d, hb2d, *norm_args)
+    )(x2d, *fn_ops, sc2d, hb2d, *norm_args)
 
     return cast(
         tuple[jax.Array, jax.Array, jax.Array],
@@ -296,7 +302,7 @@ def mhc_pre_mixes_collapse(
 
 def mhc_pre(
     residual: jax.Array,
-    fn: jax.Array | utils.SplitFn,
+    fn: jax.Array | utils.SplitFn | utils.CatFn,
     hc_scale: jax.Array,
     hc_base: jax.Array,
     rms_eps: float,
@@ -308,6 +314,7 @@ def mhc_pre(
     token_block_size: int = 64,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     gates_in_kernel: bool = False,
+    gates_max_tokens: int | None = None,
     norm_weight: jax.Array | None = None,
     norm_eps: float | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -327,13 +334,109 @@ def mhc_pre(
     outer_shape = residual.shape[:-2]
     hc_mult, hidden_size = residual.shape[-2:]
     x2d = residual.reshape(-1, hc_mult * hidden_size)
+    return _pre_from_2d(
+        x2d,
+        outer_shape,
+        hc_mult,
+        hidden_size,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        token_block_size=token_block_size,
+        vmem_limit_bytes=vmem_limit_bytes,
+        gates_in_kernel=gates_in_kernel,
+        gates_max_tokens=gates_max_tokens,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+    )
 
+
+def mhc_pre_single_stream(
+    x: jax.Array,
+    fn: jax.Array | utils.SplitFn | utils.CatFn,
+    hc_scale: jax.Array,
+    hc_base: jax.Array,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    *,
+    token_block_size: int = 64,
+    vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    gates_in_kernel: bool = False,
+    gates_max_tokens: int | None = None,
+    norm_weight: jax.Array | None = None,
+    norm_eps: float | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``mhc_pre`` of hc_mult identical streams, given the one stream.
+
+    x: (..., hidden_size) bf16 -- what ``mhc_pre`` would see repeated
+    hc_mult times on the stream axis, without the repeated copy in HBM.
+    Same outputs up to the gates' last f32 ulp: the one-stream block is
+    tiled differently by Mosaic (bit-identical in interpret mode).
+    """
+    assert x.dtype == jnp.bfloat16
+
+    outer_shape = x.shape[:-1]
+    hidden_size = x.shape[-1]
+    hc_mult = fn.shape[1] // hidden_size
+    return _pre_from_2d(
+        x.reshape(-1, hidden_size),
+        outer_shape,
+        hc_mult,
+        hidden_size,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        token_block_size=token_block_size,
+        vmem_limit_bytes=vmem_limit_bytes,
+        gates_in_kernel=gates_in_kernel,
+        gates_max_tokens=gates_max_tokens,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+    )
+
+
+def _pre_from_2d(
+    x2d: jax.Array,
+    outer_shape: tuple[int, ...],
+    hc_mult: int,
+    hidden_size: int,
+    fn: jax.Array | utils.SplitFn | utils.CatFn,
+    hc_scale: jax.Array,
+    hc_base: jax.Array,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    *,
+    token_block_size: int,
+    vmem_limit_bytes: int,
+    gates_in_kernel: bool,
+    gates_max_tokens: int | None,
+    norm_weight: jax.Array | None,
+    norm_eps: float | None,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """The kernel plus gates of ``mhc_pre`` on flattened streams."""
     gates = utils.gate_consts(
         x2d.shape[0],
         gates_in_kernel,
         hc_sinkhorn_eps,
         hc_post_mult_value,
         sinkhorn_repeat,
+        gates_max_tokens,
     )
     gate_a, gate_b, layer2d = mhc_pre_mixes_collapse(
         x2d,

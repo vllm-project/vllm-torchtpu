@@ -1374,3 +1374,15 @@ class TestMoERequantizationChunks:
         monkeypatch.setattr(fp8_mod, "_REQUANT_CHUNK_BYTES", chunk_bytes)
         chunked = fp8_mod._quantize_bf16_moe_weights(layer, activation="silu")
         self._same(whole, chunked)
+
+
+def test_fp8_linear_method_takes_weight_loader_v2():
+    """LinearBase picks weight_loader_v2 only for quant methods whose class
+    name is registered; the decorator must sit on the class, not a helper."""
+    from vllm.model_executor.layers.linear import WEIGHT_LOADER_V2_SUPPORTED
+
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+        VllmFp8LinearMethodTPU,
+    )
+
+    assert VllmFp8LinearMethodTPU.__name__ in WEIGHT_LOADER_V2_SUPPORTED
