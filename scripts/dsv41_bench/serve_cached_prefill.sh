@@ -40,6 +40,5 @@ exec vllm serve "$model" \
   --block-size 16 \
   --max-num-batched-tokens "$chunk" --max-num-seqs "$max_seqs" \
   "${server_args[@]}" \
-  --compilation-config "{\"compile_sizes\":[128,256,$chunk]}" \
   --speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"model\":\"$model\"}" \
   "$@"
