@@ -111,3 +111,23 @@ def _swapped_blocks_compare():
     a = np.asarray(jax.lax.bitcast_convert_type(ref, jnp.uint8)).reshape(NMB, 512, -1)
     b = np.asarray(jax.lax.bitcast_convert_type(got, jnp.uint8)).reshape(NMB, 512, -1)
     np.testing.assert_array_equal(b[1:, :399], a[1:, :399])
+
+
+def test_auto_ring_follows_the_checkpoint_count(monkeypatch):
+    """Unset ring/prefetch: deep prefetch from AUTO_MIN_CKPTS checkpoints (here forced low so the
+    small test pool takes it), bytes identical to the explicit settings."""
+    from vllm_torchtpu.megakernel_runtime import qwen38_scatter as sc
+
+    SHAPE = (NMB * 4, 128, 1, 4, 256)
+    LAYOUT = gs.Qwen38GdnPoolLayout(pool_shape=SHAPE, pool_dtype="float8_e4m3fn")
+    rng = np.random.default_rng(2)
+    pool = jax.lax.bitcast_convert_type(jnp.asarray(rng.integers(0, 256, size=SHAPE, dtype=np.uint8)), jnp.float8_e4m3fn)
+    conv = jnp.asarray(rng.standard_normal((NL, NS, 8, 1280)), jnp.float32)
+    rec = jnp.asarray(rng.standard_normal((NL, NS * T * 6, 128, 128)), jnp.float32).astype(jnp.bfloat16)
+    wb = jnp.asarray(1 + np.arange(NL * NS * T, dtype=np.int32).reshape(NL, NS, T))
+    monkeypatch.setattr(sc, "AUTO_MIN_CKPTS", 1)
+    auto = sc.scatter_gdn_ckpts_fast(pool, conv, rec, wb, layout=LAYOUT, interpret=True)
+    ref = sc.scatter_gdn_ckpts_fast(pool, conv, rec, wb, layout=LAYOUT, interpret=True, ring=4, prefetch=1)
+    a = np.asarray(jax.lax.bitcast_convert_type(auto, jnp.uint8)).reshape(NMB, 512, -1)
+    b = np.asarray(jax.lax.bitcast_convert_type(ref, jnp.uint8)).reshape(NMB, 512, -1)
+    np.testing.assert_array_equal(a[1:, :399], b[1:, :399])

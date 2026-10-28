@@ -41,6 +41,11 @@ from vllm_torchtpu.megakernel.models.qwen38_gdn_pool import (
 from .qwen38_gdn_state import Qwen38GdnPoolLayout, _conv_windows
 
 RING = 4
+# Deep prefetch for large calls (j-0158b3f2, 64 rows = 192 checkpoints: 132.6 -> 63.3 us at ring 12 /
+# prefetch 6); at <= 32 rows it buys nothing, so small calls keep ring 4 / prefetch 1. A load-in-flight
+# depth close to the ring starves the pool writes (prefetch = ring - 2 lost at every size).
+AUTO_MIN_CKPTS = 144
+AUTO_RING, AUTO_PREFETCH = 12, 6
 
 
 def _store_typed(ref: Any, vals: Any, interpret: bool) -> None:
@@ -62,24 +67,27 @@ def scatter_gdn_ckpts_fast(
     *,
     layout: Qwen38GdnPoolLayout,
     interpret: bool = False,
-    ring: int = RING,
-    prefetch: int = 1,
+    ring: int | None = None,
+    prefetch: int | None = None,
 ) -> Any:
     """Same contract as `scatter_gdn_ckpts` (per-rank arrays); returns the pool.
 
     `ring` staging slots: checkpoints `i + 1 .. i + prefetch` are loaded while `i` is
     converted, and up to `ring` pool writes are in flight (`prefetch < ring`; 1 keeps one
-    load in flight, which leaves each step waiting on its own load's latency). Checkpoints addressed to the
+    load in flight, which leaves each step waiting on its own load's latency). Unset: ring 4 /
+    prefetch 1 below `AUTO_MIN_CKPTS` checkpoints, `AUTO_RING` / `AUTO_PREFETCH` from there. Checkpoints addressed to the
     null block 0 (rows with no request, every row of a shadow call) are not
     written, as the stock pooled GDN kernel moves no bytes for padded rows:
     the null block's pages are also read (masked) as KV, and f32 state bytes
     there would carry FP8 NaN encodings.
     """
-    RING_ = ring
-    P = prefetch
-    assert 1 <= P < RING_, (prefetch, ring)
     NL, NS, T = write_blocks.shape
     n = NL * NS * T
+    if ring is None and prefetch is None:
+        ring, prefetch = (AUTO_RING, AUTO_PREFETCH) if n >= AUTO_MIN_CKPTS else (RING, 1)
+    RING_ = RING if ring is None else ring
+    P = 1 if prefetch is None else prefetch
+    assert 1 <= P < RING_, (prefetch, ring)
     vh, KD, VD, QKV = layout.n_v, layout.d_k, layout.d_v, layout.conv_dim
     rec = rec_ckpt.reshape(n, vh, KD, VD)  # row block (l, s, t), [layout: (s*T+t)*vh]
     win = _conv_windows(conv_ckpt.astype(jnp.float32), T).reshape(n, 3, QKV)
