@@ -193,6 +193,49 @@ elif [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_RE
       "Runs the perf/eval lane (\`run-perf-eval\` label)."
   fi
 fi
+# Echoes the labels of the PR a post-merge build on main merged, comma-separated
+# like BUILDKITE_PULL_REQUEST_LABELS. They do not reach the build, so they are
+# read from GitHub by the PR number GitHub puts at the end of a squash commit's
+# subject, with a token from the agent's GitHub App helper when it has one. Any
+# failure echoes nothing and the build runs everything.
+merged_pr_labels() {
+  local pr token
+  local auth=()
+  pr=$(head -n1 <<< "${BUILDKITE_MESSAGE:-}" | sed -nE 's/.*\(#([0-9]+)\)$/\1/p')
+  [[ -n "${pr}" ]] || return 0
+  token=$(/etc/buildkite-agent/git-credential-github-app get 2>/dev/null \
+    | sed -n 's/^password=//p' || true)
+  if [[ -n "${token}" ]]; then
+    auth=(-H "Authorization: token ${token}")
+  fi
+  curl -fsS --max-time 10 ${auth[@]+"${auth[@]}"} \
+    "https://api.github.com/repos/vllm-project/vllm-torchtpu/issues/${pr}/labels" 2>/dev/null \
+    | python3 -c 'import json, sys; print(",".join(l["name"] for l in json.load(sys.stdin)))' \
+      2>/dev/null || true
+}
+
+# skip-tpu-ci keeps only the tests lane, and SKIP_TPU_CI leaves out its TPU group
+# (pipeline_tests.yml reads it when the lane is uploaded), so the image build,
+# the type check and the CPU unit tests still run, on the PR and again on its
+# post-merge build. It overrides run-perf-eval and run-full-ci.
+if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]]; then
+  skip_labels="${pr_labels}"
+elif [[ "${BUILDKITE_BRANCH:-}" == "main" && "${BUILDKITE_SOURCE:-}" == "webhook" ]]; then
+  skip_labels="$(merged_pr_labels)"
+else
+  skip_labels=""
+fi
+if grep -qx "skip-tpu-ci" <<< "${skip_labels//,/$'\n'}"; then
+  SKIP_TPU_CI=1
+fi
+if [[ "${SKIP_TPU_CI:-0}" == "1" ]]; then
+  export SKIP_TPU_CI
+  default_lanes="tests"
+  buildkite-agent annotate --style info --context skip-tpu-ci \
+    "TPU steps not run (\`skip-tpu-ci\` label); the CPU steps still run."
+else
+  export SKIP_TPU_CI=0
+fi
 lanes="${CI_LANES:-${default_lanes}}"
 for lane in ${lanes}; do
   if [[ " ${ALL_LANES} " != *" ${lane} "* ]]; then
@@ -229,6 +272,8 @@ fi
 OMNI_IMAGE_SKIP=""
 if [[ " ${lanes} " != *" tests "* ]]; then
   OMNI_IMAGE_SKIP="Only the tests lane uses the -omni image; this build has none."
+elif [[ "${SKIP_TPU_CI}" == "1" ]]; then
+  OMNI_IMAGE_SKIP="Only TPU steps use the -omni image; skip-tpu-ci skips them."
 fi
 export OMNI_IMAGE_SKIP
 

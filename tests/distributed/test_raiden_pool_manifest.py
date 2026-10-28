@@ -582,8 +582,8 @@ def test_unified_pool_derives_logical_gdn_views_without_torch_ops(
     ssm_bytes = 8 * 64 * 32 * ssm_itemsize
     assert (conv.base_offset_bytes, conv.dtype_tag, conv.live_bytes_per_block) == (
         ssm_bytes,
-        "bfloat16",
-        2 * 768 * 2,
+        "float32",
+        2 * 768 * 4,
     )
     assert (ssm.base_offset_bytes, ssm.dtype_tag, ssm.live_bytes_per_block) == (
         0,
@@ -637,19 +637,19 @@ def test_unified_pool_views_are_kernel_tied_not_spec_tied():
         )
 
     drifted = build(
-        shapes=((2, 1, 768), (8, 64, 32)), dtypes=("torch.float32", "torch.float32")
+        shapes=((2, 1, 768), (8, 64, 32)), dtypes=("torch.bfloat16", "torch.float32")
     )
     matching = build(
-        shapes=((2, 768), (8, 64, 32)), dtypes=("torch.bfloat16", "torch.float32")
+        shapes=((2, 768), (8, 64, 32)), dtypes=("torch.float32", "torch.float32")
     )
     assert drifted.pool_dicts() == matching.pool_dicts()
 
     conv, ssm = drifted.pools
     ssm_bytes = 8 * 64 * 32 * 4
     assert (conv.dtype_tag, conv.base_offset_bytes, conv.live_bytes_per_block) == (
-        "bfloat16",
+        "float32",
         ssm_bytes,
-        2 * 768 * 2,
+        2 * 768 * 4,
     )
     assert (ssm.dtype_tag, ssm.base_offset_bytes, ssm.live_bytes_per_block) == (
         "float32",
@@ -658,11 +658,11 @@ def test_unified_pool_views_are_kernel_tied_not_spec_tied():
     )
 
 
-def test_unified_pool_conv_region_matches_kernel_state_plan():
-    """Pin the manifest's state model to the pooled kernel's state plan.
+def test_unified_pool_conv_region_matches_kernel_slot_sizing():
+    """Pin the manifest's state model to the pooled kernel's slot sizing.
 
     Uses the live Qwen3.5 full-width geometry and the same
-    ``gdn_pool_layout`` helpers ``_build_v3_pool_state_plan`` consumes, so a
+    ``gdn_pool_layout`` helpers the pooled kernel's slot sizing consumes, so a
     kernel-side layout change breaks this test instead of the nightly
     reshard pair.
     """
@@ -703,7 +703,7 @@ def test_unified_pool_conv_region_matches_kernel_state_plan():
     )
 
     conv, ssm = manifest.pools
-    assert conv.live_bytes_per_block == conv_bytes == 73_728
+    assert conv.live_bytes_per_block == conv_bytes == 147_456
     assert ssm.live_bytes_per_block == ssm_bytes == 4_194_304
     # The conv view starts exactly where the kernel's token plan places the
     # conv region (right after the SSM tokens).
@@ -1309,22 +1309,22 @@ def test_kimi_fp8_pool_keeps_the_bf16_pool_byte_geometry():
     bf16 = kimi_pool_manifest(3, kv_dtype="bfloat16")
     fp8 = kimi_pool_manifest(3, kv_dtype="float8_e4m3fn")
 
-    assert bf16.storages[0].shape[1:] == (81, 2, 640)
-    assert fp8.storages[0].shape[1:] == (81, 4, 640)
+    assert bf16.storages[0].shape[1:] == (85, 2, 640)
+    assert fp8.storages[0].shape[1:] == (85, 4, 640)
     assert [pool.tag for pool in fp8.pools] == [pool.tag for pool in bf16.pools]
     for bf16_pool, fp8_pool in zip(bf16.pools, fp8.pools):
         assert fp8_pool.base_offset_bytes == bf16_pool.base_offset_bytes
-        assert fp8_pool.block_stride_bytes == bf16_pool.block_stride_bytes == 207360
+        assert fp8_pool.block_stride_bytes == bf16_pool.block_stride_bytes == 217600
         assert fp8_pool.regions == bf16_pool.regions
         assert (bf16_pool.dtype_tag, fp8_pool.dtype_tag) == (
             "bfloat16",
             "float8_e4m3fn",
         )
     conv, ssm, fa = fp8.pools
-    # SSM is f32 and conv is bf16 whatever the pool dtype: 77 + 4 rows.
+    # SSM and conv are both f32 whatever the pool dtype: 77 + 8 rows.
     assert ssm.live_bytes_per_block == 3 * 128 * 128 * 4
     assert conv.base_offset_bytes == 77 * 2560
-    assert conv.live_bytes_per_block == 4 * 2560
+    assert conv.live_bytes_per_block == 8 * 2560
     assert fa.regions[0].unit_bytes == 2560
 
 

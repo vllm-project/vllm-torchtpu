@@ -77,11 +77,13 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
         token_buckets: Token bucket sizes; one forward_bucket{B}.mlir each.
         req_buckets: Request bucket sizes; one compute_logits_req{R}.mlir and
             sample_tokens_req{R}.mlir each.
-        architectures: HuggingFace architecture names written to config.json.
         emit_byte_tokenizer: Whether to emit a synthetic byte-level tokenizer.json
             (valid only for vocab_size <= 256 in small test models).
         hf_checkpoint_dir: Optional path to the HuggingFace checkpoint directory
-            containing config.json, tokenizer.json, and safetensors headers.
+            containing tokenizer.json, generation_config.json, and safetensors
+            headers.
+        speculative_config: Speculative decoding the runtime runs, recorded as
+            `serving_config.speculative_config` (vLLM's field names); None for none.
     """
 
     vocab_size: int = 151936
@@ -98,17 +100,12 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
     dtype: str = "bf16"
     token_buckets: tuple[int, ...] = (16, 32, 64, 128, 256)
     req_buckets: tuple[int, ...] = (8, 16, 32, 64)
-    architectures: tuple[str, ...] = ("Qwen3ForCausalLM",)
     emit_byte_tokenizer: bool = False
     hf_checkpoint_dir: str | None = None
     uses_mrope: bool = False
+    speculative_config: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        if not self.architectures:
-            raise ValueError(
-                f"{type(self).__name__}.architectures must name the model "
-                "architecture written to config.json"
-            )
         if self.emit_byte_tokenizer and self.vocab_size > 256:
             raise ValueError(
                 f"emit_byte_tokenizer requires vocab_size <= 256, got {self.vocab_size}"
@@ -125,6 +122,15 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
     @property
     def max_cu_seqs(self) -> int:
         """Length of query_start_loc: one cumulative offset per sequence plus 1."""
+        return self.max_num_seqs + 1
+
+    @property
+    def num_state_slots(self) -> int:
+        """Slots of each recurrent state pool: one per sequence plus null slot 0.
+
+        A recurrent layer's state is fixed-size per sequence, so its pool is sized
+        by `max_num_seqs`, not by the paged KV `num_blocks`.
+        """
         return self.max_num_seqs + 1
 
 

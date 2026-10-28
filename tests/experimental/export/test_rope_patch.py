@@ -223,13 +223,19 @@ def test_2d_and_3d_mrope_in_graph_matches_cached(interleaved: bool) -> None:
     assert out_k_1d is not None and out_k_1d.shape == k.shape
 
 
-def test_scaled_yarn_rope_is_not_patched() -> None:
+def test_scaled_yarn_rope_keeps_its_forward_and_computes_cache_rows() -> None:
     rope = _SyntheticRotaryEmbedding(scaling_factor=4.0)
+    positions = torch.tensor([0, 3, 511], dtype=torch.int32)
+    q, k = _qk(positions.numel())
+    ref_q, ref_k = copy.deepcopy(rope)(positions, q.clone(), k.clone())
     wrapper = nn.Module()
     wrapper.rope = rope
-    patched = rope_patch.patch_in_graph_rotary_embedding(wrapper)
-    assert patched == 0
-    assert "cos_sin_cache" in rope._buffers
+    assert rope_patch.patch_in_graph_rotary_embedding(wrapper) == 1
+    assert not hasattr(rope, "_in_graph_rope_inv_freq")
+    assert "cos_sin_cache" not in dict(wrapper.named_buffers(recurse=True))
+    out_q, out_k = rope(positions, q.clone(), k.clone())
+    torch.testing.assert_close(out_q, ref_q, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(out_k, ref_k, rtol=1e-5, atol=1e-5)
 
 
 def test_real_vllm_rotary_and_mrotary_modules_when_available() -> None:
@@ -277,3 +283,91 @@ def test_real_vllm_rotary_and_mrotary_modules_when_available() -> None:
     torch.testing.assert_close(out_1d_k, ref_1d_k, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(out_2d_q, ref_2d_q, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(out_2d_k, ref_2d_k, rtol=1e-5, atol=1e-5)
+
+
+def _vllm_config(max_model_len: int) -> MagicMock:
+    vllm_config = MagicMock()
+    vllm_config.compilation_config.custom_ops = ["none"]
+    vllm_config.model_config.max_model_len = max_model_len
+    return vllm_config
+
+
+def _assert_cache_buffers_gone(module: nn.Module) -> None:
+    names = [name for name, _ in module.named_buffers()]
+    assert not [n for n in names if "cos_sin_cache" in n], names
+
+
+def test_deepseek_yarn_rope_cache_is_computed_in_graph() -> None:
+    pytest.importorskip("vllm")
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
+        DeepseekScalingRotaryEmbedding,
+    )
+
+    with set_current_vllm_config(_vllm_config(2048)):
+        rope = DeepseekScalingRotaryEmbedding(
+            _HEAD_SIZE,
+            _HEAD_SIZE,
+            256,
+            10000.0,
+            False,
+            40.0,
+            torch.bfloat16,
+            beta_fast=32,
+            beta_slow=1,
+            mscale=0.707,
+            mscale_all_dim=0.707,
+        )
+    rows = rope.cos_sin_cache.shape[0]
+    positions = torch.tensor([0, 1, 7, 255, 4096, rows - 1])
+    q, k = _qk(positions.numel(), dtype=torch.bfloat16)
+    q, k = q.view(-1, _NUM_HEADS, _HEAD_SIZE), k.view(-1, _NUM_KV_HEADS, _HEAD_SIZE)
+    ref_q, ref_k = copy.deepcopy(rope).forward_native(positions, q, k)
+
+    assert rope_patch.patch_in_graph_rotary_embedding(rope) == 1
+    _assert_cache_buffers_gone(rope)
+    out_q, out_k = rope.forward_native(positions, q, k)
+    torch.testing.assert_close(out_q, ref_q, rtol=0, atol=3e-2)
+    torch.testing.assert_close(out_k, ref_k, rtol=0, atol=3e-2)
+
+
+@pytest.mark.parametrize("max_model_len", [512, 4096])
+def test_phi3_long_rope_cache_is_computed_in_graph(max_model_len: int) -> None:
+    pytest.importorskip("vllm")
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.rotary_embedding.phi3_long_rope_scaled_rope import (
+        Phi3LongRoPEScaledRotaryEmbedding,
+    )
+
+    rotary_dim = 48
+    with set_current_vllm_config(_vllm_config(max_model_len)):
+        rope = Phi3LongRoPEScaledRotaryEmbedding(
+            _HEAD_SIZE,
+            rotary_dim,
+            8192,
+            1024,
+            10000.0,
+            True,
+            torch.bfloat16,
+            short_factor=[1.0 + 0.1 * i for i in range(rotary_dim // 2)],
+            long_factor=[2.0 + i for i in range(rotary_dim // 2)],
+        )
+    # The long-factor table follows the short one, so positions select either.
+    assert rope.use_long_rope == (max_model_len > 1024)
+    positions = torch.tensor([0, 1, 9, 1023, 1024, 7000])
+    q, k = _qk(positions.numel(), dtype=torch.bfloat16)
+    ref_q, ref_k = copy.deepcopy(rope)(positions, q, k)
+
+    assert rope_patch.patch_in_graph_rotary_embedding(rope) == 1
+    _assert_cache_buffers_gone(rope)
+    out_q, out_k = rope(positions, q, k)
+    torch.testing.assert_close(out_q, ref_q, rtol=0, atol=3e-2)
+    torch.testing.assert_close(out_k, ref_k, rtol=0, atol=3e-2)
+
+
+def test_buffer_that_is_not_a_cos_sin_table_is_kept() -> None:
+    module = nn.Module()
+    noise = torch.rand(64, 16, generator=torch.Generator().manual_seed(0))
+    module.register_buffer("cos_sin_cache", noise, persistent=False)
+    assert rope_patch.patch_in_graph_rotary_embedding(module) == 0
+    assert module.cos_sin_cache is noise

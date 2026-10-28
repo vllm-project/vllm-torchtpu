@@ -82,6 +82,32 @@ _DTYPE_ALIASES = {
 }
 
 
+# Element type names `metadata.json` spells dtypes with.
+STABLEHLO_DTYPES = frozenset(
+    {
+        "i1",
+        "i8",
+        "i16",
+        "i32",
+        "i64",
+        "ui8",
+        "ui16",
+        "ui32",
+        "ui64",
+        "f16",
+        "bf16",
+        "f32",
+        "f64",
+        "f8E4M3FN",
+        "f8E5M2",
+        "f4E2M1FN",
+    }
+)
+
+# The `@main` type convention this exporter emits (see `exporter._MLIR_SHAPES`).
+MLIR_SHAPES = "shard_local"
+
+
 def canonical_dtype(dtype_str: str) -> str:
     """Normalizes a dtype spelling to its canonical short name."""
     key = dtype_str.strip().lower()
@@ -142,17 +168,14 @@ def parse_mlir_main_signature(
         parts = tensor_spec.split("x")
         dtype = canonical_dtype(parts[-1])
         shape = [int(d) for d in parts[:-1]] if len(parts) > 1 else []
-        donor = (
-            "jax.buffer_donor = true" in attrs
-            or "tf.aliasing_output" in attrs
-            or "buffer_donor = true" in attrs
-        )
+        alias = re.search(r"tf\.aliasing_output\s*=\s*(\d+)", attrs)
         inputs.append(
             {
                 "arg_index": arg_idx,
                 "shape": shape,
                 "dtype": dtype,
-                "buffer_donor": donor,
+                "aliasing_output": int(alias.group(1)) if alias else None,
+                "buffer_donor": alias is not None or "buffer_donor = true" in attrs,
             }
         )
 
@@ -192,6 +215,50 @@ def _require_key(entry: dict[str, Any], key: str, where: str) -> Any:
     return entry[key]
 
 
+def _shard_local_shape(
+    entry: dict[str, Any], axis_sizes: dict[str, int], where: str
+) -> list[int]:
+    """Validates `entry`'s global shape and sharding; returns one device's shape."""
+    shape = [int(d) for d in _require_key(entry, "shape", where)]
+    sharding = _require_key(entry, "sharding", where)
+    if not isinstance(sharding, list) or len(sharding) != len(shape):
+        raise ValueError(
+            f"{where}: sharding {sharding!r} needs one entry per dim of {shape}"
+        )
+    seen: set[str] = set()
+    local: list[int] = []
+    for dim, axes_entry in zip(shape, sharding, strict=True):
+        axes = (
+            []
+            if axes_entry is None
+            else [axes_entry]
+            if isinstance(axes_entry, str)
+            else list(axes_entry)
+        )
+        size = 1
+        for axis in axes:
+            if axis not in axis_sizes:
+                raise ValueError(f"{where}: sharding names unknown mesh axis {axis!r}")
+            if axis in seen:
+                raise ValueError(f"{where}: sharding uses mesh axis {axis!r} twice")
+            seen.add(axis)
+            size *= axis_sizes[axis]
+        if dim % size:
+            raise ValueError(
+                f"{where}: dim of {dim} does not split over {size} devices ({axes})"
+            )
+        local.append(dim // size)
+    return local
+
+
+def _check_dtype(entry: dict[str, Any], actual: str, where: str) -> None:
+    dtype = _require_key(entry, "dtype", where)
+    if dtype not in STABLEHLO_DTYPES:
+        raise ValueError(f"{where}: dtype {dtype!r} is not a StableHLO element type")
+    if canonical_dtype(dtype) != actual:
+        raise ValueError(f"{where}: metadata dtype {dtype}, MLIR has {actual}")
+
+
 def validate_exported_model_dir(output_dir: str) -> None:
     """Validates an exported model directory against the artifact contract."""
     if not os.path.isdir(output_dir):
@@ -209,6 +276,18 @@ def validate_exported_model_dir(output_dir: str) -> None:
             "Expected format_version == 2 in metadata.json, got "
             f"{meta.get('format_version')}"
         )
+
+    if meta.get("mlir_shapes") != MLIR_SHAPES:
+        raise ValueError(
+            f"Expected mlir_shapes == {MLIR_SHAPES!r} in metadata.json, got "
+            f"{meta.get('mlir_shapes')!r}"
+        )
+    mesh = meta.get("mesh") or {}
+    axis_names = mesh.get("axis_names") or []
+    mesh_shape = mesh.get("mesh_shape") or []
+    if len(axis_names) != len(mesh_shape) or len(set(axis_names)) != len(axis_names):
+        raise ValueError(f"metadata.json mesh is malformed: {mesh!r}")
+    axis_sizes = {str(a): int(n) for a, n in zip(axis_names, mesh_shape, strict=True)}
 
     functions = meta.get("functions")
     if not isinstance(functions, dict) or not functions:
@@ -269,19 +348,14 @@ def validate_exported_model_dir(output_dir: str) -> None:
                     )
                 actual = mlir_in_by_arg[arg_idx]
                 where = f"Input %arg{arg_idx} ({m_in.get('name')}) in {mlir_rel}"
-                if list(_require_key(m_in, "shape", where)) != actual["shape"]:
+                local = _shard_local_shape(m_in, axis_sizes, where)
+                if local != actual["shape"]:
                     raise ValueError(
-                        f"Shape mismatch for %arg{arg_idx} ({m_in.get('name')}) in "
-                        f"{mlir_rel}: metadata has {m_in.get('shape')}, MLIR has "
+                        f"{where}: shape {m_in.get('shape')} sharded "
+                        f"{m_in.get('sharding')} is {local} per device, MLIR has "
                         f"{actual['shape']}"
                     )
-                in_dtype = _require_key(m_in, "dtype", where)
-                if canonical_dtype(in_dtype) != actual["dtype"]:
-                    raise ValueError(
-                        f"Dtype mismatch for %arg{arg_idx} ({m_in.get('name')}) in "
-                        f"{mlir_rel}: metadata has {m_in.get('dtype')}, MLIR has "
-                        f"{actual['dtype']}"
-                    )
+                _check_dtype(m_in, actual["dtype"], where)
                 if bool(m_in.get("buffer_donor", False)) != actual["buffer_donor"]:
                     raise ValueError(
                         f"buffer_donor mismatch for %arg{arg_idx} "
@@ -289,6 +363,27 @@ def validate_exported_model_dir(output_dir: str) -> None:
                         f"{m_in.get('buffer_donor')}, MLIR has "
                         f"{actual['buffer_donor']}"
                     )
+
+            aliased: set[int] = set()
+            for actual in mlir_inputs:
+                if not actual["buffer_donor"]:
+                    continue
+                where = f"Donated %arg{actual['arg_index']} in {mlir_rel}"
+                target = actual["aliasing_output"]
+                if target is None:
+                    raise ValueError(f"{where} has no tf.aliasing_output")
+                if target >= len(mlir_outputs) or target in aliased:
+                    raise ValueError(
+                        f"{where} aliases result {target}, which is missing or "
+                        "already aliased"
+                    )
+                out = mlir_outputs[target]
+                if (out["shape"], out["dtype"]) != (actual["shape"], actual["dtype"]):
+                    raise ValueError(
+                        f"{where} is {actual['dtype']}{actual['shape']}, its aliased "
+                        f"result {out['dtype']}{out['shape']}"
+                    )
+                aliased.add(target)
 
             meta_outputs = spec.get("outputs", [])
             if len(meta_outputs) != len(mlir_outputs):
@@ -298,16 +393,11 @@ def validate_exported_model_dir(output_dir: str) -> None:
                 )
             for idx, (m_out, actual_out) in enumerate(zip(meta_outputs, mlir_outputs)):
                 where = f"Output {idx} ({m_out.get('name')}) in {mlir_rel}"
-                if list(_require_key(m_out, "shape", where)) != actual_out["shape"]:
+                local = _shard_local_shape(m_out, axis_sizes, where)
+                if local != actual_out["shape"]:
                     raise ValueError(
-                        f"Output {idx} ({m_out.get('name')}) shape mismatch in "
-                        f"{mlir_rel}: metadata has {m_out.get('shape')}, MLIR has "
+                        f"{where}: shape {m_out.get('shape')} sharded "
+                        f"{m_out.get('sharding')} is {local} per device, MLIR has "
                         f"{actual_out['shape']}"
                     )
-                out_dtype = _require_key(m_out, "dtype", where)
-                if canonical_dtype(out_dtype) != actual_out["dtype"]:
-                    raise ValueError(
-                        f"Output {idx} ({m_out.get('name')}) dtype mismatch in "
-                        f"{mlir_rel}: metadata has {m_out.get('dtype')}, MLIR has "
-                        f"{actual_out['dtype']}"
-                    )
+                _check_dtype(m_out, actual_out["dtype"], where)

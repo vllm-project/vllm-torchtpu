@@ -25,6 +25,7 @@ import torch
 from vllm.config import (
     CacheConfig,
     KVTransferConfig,
+    LoRAConfig,
     ModelConfig,
     ParallelConfig,
     VllmConfig,
@@ -44,6 +45,7 @@ from vllm_torchtpu.platforms.tpu_platform import (
     TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP,
     TPU_8I_MULTIHOST_TOPOLOGY_MAP,
     TpuPlatform,
+    _validate_lora_config,
     _validate_phased_profiling_config,
     get_tpu_multihost_topology,
 )
@@ -291,11 +293,17 @@ class TestTpuPlatform:
         vllm_config.compilation_config.mode = MagicMock()
         vllm_config.compilation_config.compile_sizes = [16, 32]
         vllm_config.scheduler_config = MagicMock()
-        vllm_config.scheduler_config.max_num_batched_tokens = 2048
+        # Within the largest compile size, which the platform requires.
+        vllm_config.scheduler_config.max_num_batched_tokens = 32
+        vllm_config.scheduler_config.max_num_seqs = 16
+        vllm_config.scheduler_config.max_num_scheduled_tokens = None
+        vllm_config.scheduler_config.enable_chunked_prefill = True
         vllm_config.scheduler_config.is_multimodal_model = False
         vllm_config.scheduler_config.async_scheduling = False
         vllm_config.speculative_config = None
+        vllm_config.lora_config = None
         vllm_config.parallel_config = MagicMock()
+        vllm_config.parallel_config.prefill_context_parallel_size = 1
         vllm_config.parallel_config.nnodes = 1
         vllm_config.parallel_config.node_rank = 0
         vllm_config.parallel_config.world_size = 1
@@ -578,6 +586,7 @@ class TestTpuPlatform:
         expected_type,
     ):
         vllm_config.compilation_config.compile_sizes = compile_sizes
+        vllm_config.scheduler_config.max_num_batched_tokens = max(compile_sizes)
         vllm_config.compilation_config.dynamic_shapes_config.type = shapes_type
 
         TpuPlatform.check_and_update_config(vllm_config)
@@ -585,6 +594,39 @@ class TestTpuPlatform:
         assert (
             vllm_config.compilation_config.dynamic_shapes_config.type == expected_type
         )
+
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_rejects_budget_above_compile_sizes(
+        self, mock_prepare_env, mock_apply_patches, vllm_config
+    ):
+        # A step of up to 2048 tokens would have no compile size to pad to.
+        vllm_config.scheduler_config.max_num_batched_tokens = 2048
+
+        with pytest.raises(ValueError, match=r"--max-num-batched-tokens \(2048\)"):
+            TpuPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.scheduler_config.max_num_batched_tokens == 2048
+        assert vllm_config.scheduler_config.max_num_scheduled_tokens is None
+
+    @pytest.mark.parametrize(
+        "compile_sizes",
+        [["cudagraph_capture_sizes"], [16, "cudagraph_capture_sizes"]],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_rejects_string_compile_sizes(
+        self, mock_prepare_env, mock_apply_patches, vllm_config, compile_sizes
+    ):
+        # TPU never expands vLLM's "cudagraph_capture_sizes" placeholder.
+        vllm_config.compilation_config.compile_sizes = compile_sizes
+
+        with pytest.raises(ValueError, match="compile_sizes entries must be integers"):
+            TpuPlatform.check_and_update_config(vllm_config)
 
     @pytest.mark.parametrize(
         ("linear", "max_model_len", "added"),
@@ -615,6 +657,7 @@ class TestTpuPlatform:
         monkeypatch.setenv("TPU_TOKEN_BUCKET_LINEAR", "1" if linear else "0")
         vllm_config.compilation_config.compile_sizes = None
         vllm_config.model_config.max_model_len = max_model_len
+        vllm_config.scheduler_config.max_num_batched_tokens = 2048
         vllm_config.scheduler_config.max_num_seqs = 8
 
         TpuPlatform.check_and_update_config(vllm_config)
@@ -694,6 +737,51 @@ class TestTpuPlatform:
                     TpuPlatform.check_and_update_config(vllm_config)
             else:
                 TpuPlatform.check_and_update_config(vllm_config)
+
+    @pytest.mark.parametrize(
+        ("model_dtype", "lora_dtype"),
+        [
+            # vLLM resolves lora_dtype "auto" to the model dtype.
+            (torch.float16, torch.float16),
+            (torch.float32, torch.float32),
+            # Set by hand to a dtype other than the model dtype.
+            (torch.float32, torch.float16),
+            # Set by hand to the dtype the model runs in on TPU.
+            (torch.float16, torch.bfloat16),
+        ],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_runs_lora_in_bfloat16(
+        self, mock_prepare_env, mock_apply_patches, vllm_config, model_dtype, lora_dtype
+    ):
+        """The TPU runs a float16 or float32 model in bfloat16; its LoRA weights
+        must follow, or the first forward fails on the LoRA dtype check."""
+        vllm_config.model_config.dtype = model_dtype
+        vllm_config.model_config.is_moe = False
+        vllm_config.lora_config = LoRAConfig(lora_dtype=lora_dtype)
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.model_config.dtype == torch.bfloat16
+        assert vllm_config.lora_config.lora_dtype == torch.bfloat16
+
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_rejects_unsupported_lora(
+        self, mock_prepare_env, mock_apply_patches, vllm_config
+    ):
+        vllm_config.model_config.is_moe = False
+        vllm_config.lora_config = LoRAConfig(
+            lora_dtype=torch.bfloat16, fully_sharded_loras=True
+        )
+
+        with pytest.raises(ValueError, match="LoRA on TPU"):
+            TpuPlatform.check_and_update_config(vllm_config)
 
     @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
@@ -887,6 +975,79 @@ class TestPhasedProfilingConfigValidation:
         monkeypatch.delenv("USE_PHASED_PROFILER", raising=False)
 
         _validate_phased_profiling_config(self._config())
+
+
+class TestLoRAConfigValidation:
+    """LoRA runs on a single chip with a dense model and no speculative
+    decoding; any other setting is rejected at startup, by name."""
+
+    @staticmethod
+    def _config(*, is_moe=False, speculative_config=None, lora=None, **parallel):
+        # By the time the platform hook runs, verify_with_model_config has
+        # resolved lora_dtype "auto" to the model dtype.
+        lora = {"lora_dtype": torch.bfloat16, **(lora or {})}
+        return SimpleNamespace(
+            lora_config=LoRAConfig(**lora),
+            model_config=SimpleNamespace(is_moe=is_moe, dtype=torch.bfloat16),
+            parallel_config=ParallelConfig(**parallel),
+            speculative_config=speculative_config,
+        )
+
+    @pytest.mark.parametrize(
+        "lora", [{}, {"default_mm_loras": {"image": "/adapters/image"}}]
+    )
+    def test_single_chip_dense_model_passes(self, lora):
+        _validate_lora_config(self._config(lora=lora))
+
+    def test_without_lora_nothing_is_checked(self):
+        config = self._config(tensor_parallel_size=2)
+        config.lora_config = None
+
+        _validate_lora_config(config)
+
+    @pytest.mark.parametrize(
+        "kwargs,setting",
+        [
+            ({"tensor_parallel_size": 2}, "tensor_parallel_size > 1"),
+            ({"data_parallel_size": 2}, "data_parallel_size > 1"),
+            ({"pipeline_parallel_size": 2}, "pipeline_parallel_size > 1"),
+            (
+                {"prefill_context_parallel_size": 2},
+                "prefill_context_parallel_size > 1",
+            ),
+            # DCP has to divide TP.
+            (
+                {"tensor_parallel_size": 2, "decode_context_parallel_size": 2},
+                "decode_context_parallel_size > 1",
+            ),
+            ({"speculative_config": object()}, "speculative decoding"),
+            ({"is_moe": True}, "MoE models"),
+            ({"lora": {"fully_sharded_loras": True}}, "fully_sharded_loras"),
+            (
+                {"lora": {"enable_tower_connector_lora": True}},
+                "enable_tower_connector_lora",
+            ),
+            (
+                {"lora": {"lora_dtype": torch.float16}},
+                "lora_dtype torch.float16 differing from the model dtype "
+                "torch.bfloat16",
+            ),
+        ],
+    )
+    def test_unsupported_setting_is_named(self, kwargs, setting):
+        with pytest.raises(ValueError, match=setting):
+            _validate_lora_config(self._config(**kwargs))
+
+    def test_every_unsupported_setting_is_listed(self):
+        config = self._config(
+            tensor_parallel_size=2, lora={"lora_dtype": torch.float16}
+        )
+
+        with pytest.raises(ValueError) as excinfo:
+            _validate_lora_config(config)
+
+        assert "tensor_parallel_size > 1" in str(excinfo.value)
+        assert "lora_dtype torch.float16" in str(excinfo.value)
 
 
 def test_config_hook_registers_tpu_kv_connectors_by_name():
