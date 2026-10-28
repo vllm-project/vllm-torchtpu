@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -12,6 +13,7 @@ from vllm.v1.outputs import (
 )
 
 INVALID_TOKEN_ID = -1
+from vllm_torchtpu import envs
 
 
 @dataclass
@@ -84,6 +86,12 @@ class AsyncTPUCopyState:
     spec_logprobs: list[SpecLogprobsChunk] | None = None
     # Device sources of `spec_logprobs`, kept alive until the copy lands.
     _spec_logprobs_tpu: list[LogprobsTensors] | None = None
+    # VLLM_TPU_SERIALIZE_COPY_WAIT: the worker's async-output thread
+    # (get_output) and its main thread (the deferred previous-results wait)
+    # can wait on the same state at once; the lock lets only one synchronize.
+    _wait_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )
 
     @classmethod
     def from_device_chunks(
@@ -124,6 +132,14 @@ class AsyncTPUCopyState:
     def wait(self) -> None:
         if self.completed:
             return
+        if not envs.VLLM_TPU_SERIALIZE_COPY_WAIT:
+            self._wait()
+            return
+        with self._wait_lock:
+            if not self.completed:
+                self._wait()
+
+    def _wait(self) -> None:
         self.copy_ready_event.synchronize()
         self.chunks_tpu = None
         self._spec_logprobs_tpu = None

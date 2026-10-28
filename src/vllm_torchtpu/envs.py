@@ -235,6 +235,7 @@ if TYPE_CHECKING:
     VLLM_TPU_LOG_POST_WARMUP_COMPILES: bool = False
     VLLM_TPU_CPU_PIN: str = "off"
     VLLM_TPU_HOST_PHASES: int = 0
+    VLLM_TPU_SERIALIZE_COPY_WAIT: bool = False
     VLLM_TPU_CPU_PIN_RESERVE: int = 2
     VLLM_TPU_CPU_PROBE_S: float = 0.0
     VLLM_TPU_FUSED_READ_OFFSET_UPDATE: bool = True
@@ -1459,6 +1460,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Log each rank's per-step host time by runner phase every N steps
     # (0 = off); runner/host_phases.py.
     "VLLM_TPU_HOST_PHASES": env_nonnegative_int("VLLM_TPU_HOST_PHASES", 0),
+    # Let only one thread synchronize a sampled-token copy at a time (the
+    # async-output thread and the deferred previous-results wait share one).
+    "VLLM_TPU_SERIALIZE_COPY_WAIT": env_bool("VLLM_TPU_SERIALIZE_COPY_WAIT"),
     "VLLM_TPU_CPU_PIN_RESERVE": env_nonnegative_int("VLLM_TPU_CPU_PIN_RESERVE", 2),
     # Log each worker's thread CPU placement every N seconds (0 = off).
     "VLLM_TPU_CPU_PROBE_S": env_float("VLLM_TPU_CPU_PROBE_S", 0.0),
