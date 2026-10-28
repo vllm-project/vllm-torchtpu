@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_SEND_GROUP_ROWS: int = 8
     TPU_DCP_MLA_SEND_SMALL_A2A: bool = True
     TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS: int = 8
+    TPU_DCP_MLA_SEND_SMALL_A2A_LIVE_ROWS: bool = False
     TPU_DCP_MLA_SEND_SMALL_A2A_MERGE: bool = False
     TPU_MLA_FUSED_SMALL_A2A: bool = True
     TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB: int = 16
@@ -648,6 +649,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MLA_SEND_SMALL_A2A": env_bool("TPU_DCP_MLA_SEND_SMALL_A2A", default=True),
     "TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS": env_int(
         "TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS", 8
+    ),
+    # With TPU_DCP_MLA_SEND_SMALL_A2A: each copy of the small all-to-all ends
+    # at the tile row holding the last real partial row, read from the step's
+    # real token count (data, so one program per bucket), instead of at the
+    # block's end. The padding tokens' partial rows (12 of 32 tokens at decode
+    # batch 5 with MTP 3) are not sent; the unpack zeroes them either way, so
+    # every received row the merge reads holds the same bits. Each peer takes
+    # one copy, its size picked at run time among the multiples of 8 rows.
+    # With TPU_DCP_MLA_SEND_SMALL_A2A_MERGE the same copies land in the merge
+    # kernel's VMEM receive scratch; the merge reads no row past them.
+    "TPU_DCP_MLA_SEND_SMALL_A2A_LIVE_ROWS": env_bool(
+        "TPU_DCP_MLA_SEND_SMALL_A2A_LIVE_ROWS", default=False
     ),
     # With TPU_DCP_MLA_SEND_SMALL_A2A, on the buckets it takes whose T * L
     # partial rows are whole 16-row chunks and at most 128 (T <= 32 at L = 4):

@@ -27,6 +27,17 @@ ranks x a few-KB int16 send block per destination), which XLA runs as a
 ragged all-to-all of 9-11 us on the served mirror; the same bytes in one
 round of remote DMAs need about one barrier plus one 7-peer round.
 
+With ``live_rows`` (data, the same on every core) only rows ``[row0, end)``
+of every block move, ``end`` being ``live_row0 + live_rows`` rounded up to a
+whole 8-row tile, in one copy per peer: one ``pl.when`` branch per multiple
+of 8 rows up to the block, each a copy of that static size, the last one the
+whole block, and the waits count the same size. Rows past ``end`` are left
+unwritten. The DCP merge's padding tokens fill the end of the block, so their
+partial rows are not sent. In merge mode the copies land in the VMEM
+receive scratch at the same rows; the merge reads only rows below
+``merge_row + merge_live`` and masks the rest of each chunk, so the
+unwritten rows never reach the result.
+
 As in ``all_gather``, one barrier per call is enough: a core leaves call k
 only after every peer's block of call k has landed and its own sends are
 done, and a peer sends call k + 1 only after the barrier of call k + 1, which
@@ -79,6 +90,13 @@ def reference(blocks, row0=0):
     out[:, :, :row0] = 0
     n = out.shape[0]
     return out.reshape(n, -1, out.shape[-1])
+
+
+def live_sizes(count, rows):
+    """``(size, taken)`` per multiple of 8 up to ``rows``: the one copy of
+    rows ``[0, count)`` of a span of ``rows``, ``count`` a multiple of 8 in
+    ``[8, rows]``. Sizes are static; ``taken`` (``size == count``) is data."""
+    return [(size, count == size) for size in range(8, rows + 1, 8)]
 
 
 def merge_sender_rows(num_cores):
@@ -152,6 +170,8 @@ def small_all_to_all(
     hbm_operand=False,
     merge_live=None,
     merge_row=None,
+    live_rows=None,
+    live_row0=0,
 ):
     """``lax.all_to_all(x, axis, 0, 0, tiled=True)`` of ``[n * block, V]``
     for rows ``[row0, block)`` of every block, inside a shard_map over a mesh
@@ -178,6 +198,11 @@ def small_all_to_all(
         ``tl = block - merge_row``.
       merge_row: merge mode's first partial row of a block (static); the row
         before it is the lse word row.
+      live_rows: int32 [1], the same on every core, or None. With it, rows of
+        every block from ``live_row0 + live_rows`` on, rounded up to a whole
+        8-row tile, are not moved (see the module docstring); the call is
+        named ``..._live``. Composes with merge mode.
+      live_row0: the block row ``live_rows`` counts from (static).
     """
     if x.ndim != 2:
         raise ValueError(f"small_all_to_all takes [n * block, V], got {x.shape}")
@@ -194,6 +219,7 @@ def small_all_to_all(
     data_rank = rank is not None
     data_lane = lane_axis is not None and lane is not None
     merge = merge_live is not None
+    sized = live_rows is not None
     if merge:
         tl = block - (merge_row or 0)
         if not (
@@ -222,6 +248,10 @@ def small_all_to_all(
             my_lane = lax.axis_index(lane_axis)
         if merge:
             live = jnp.clip(refs.pop(0)[0], 0, tl)
+        if sized:
+            end = live_row0 + refs.pop(0)[0]
+            sizes = live_sizes(jnp.clip((end - row0 + 7) & -8, 8, rows), rows)
+        if merge:
             x_ref, o_ref, recv_ref, w_ref, out_ref, *sems = refs
             send_sem, recv_sem, local_sem, out_sem = sems
         else:
@@ -237,31 +267,69 @@ def small_all_to_all(
             part = pl.ds(c * MERGE_CHUNK_ROWS, MERGE_CHUNK_ROWS)
             return pltpu.make_async_copy(out_ref.at[part], o_ref.at[part], out_sem)
 
+        def slot(size):
+            """Rows ``[row0, row0 + size)`` of slot ``me``."""
+            if merge:
+                if size == rows:
+                    return recv_ref.at[me]
+                return recv_ref.at[me, pl.ds(0, size)]
+            return o_ref.at[pl.ds(pl.multiple_of(me * block + row0, 8), size)]
+
+        def send(size):
+            """``size`` rows of block j from row ``row0`` into slot ``me`` of
+            core j; returns the copy of this core's own block."""
+            mine = slot(size)
+            for j in range(n):
+
+                @pl.when(jnp.int32(j) != me)
+                def _(j=j):
+                    pltpu.make_async_remote_copy(
+                        src_ref=x_ref.at[pl.ds(j * block + row0, size)],
+                        dst_ref=mine,
+                        send_sem=send_sem,
+                        recv_sem=recv_sem,
+                        device_id=peer(j),
+                        device_id_type=MESH,
+                    ).start()
+
+            own = x_ref.at[pl.ds(pl.multiple_of(me * block + row0, 8), size)]
+            return pltpu.make_async_copy(own, mine, local_sem)
+
+        def span(copies, size):
+            """A ref of ``copies`` copies of ``size`` rows, for byte counts."""
+            if merge:
+                if size == rows:
+                    return recv_ref.at[pl.ds(0, copies)]
+                return recv_ref.at[pl.ds(0, copies), pl.ds(0, size)]
+            return o_ref.at[pl.ds(0, copies * size)]
+
+        def wait(wait_sem, copies):
+            """Block until ``wait_sem`` has counted ``copies`` copies of the
+            rows sent."""
+            if not sized:
+                wait_bytes_of(span(copies, rows), wait_sem)
+                return
+            for size, taken in sizes:
+
+                @pl.when(taken)
+                def _(size=size):
+                    wait_bytes_of(span(copies, size), wait_sem)
+
         sem = pltpu.get_barrier_semaphore()
         for j in range(n):
             pl.semaphore_signal(sem, 1, device_id=peer(j), device_id_type=MESH)
         pl.semaphore_wait(sem, n)
 
-        if merge:
-            mine = recv_ref.at[me]
+        if sized:
+            for size, taken in sizes:
+
+                @pl.when(taken)
+                def _(size=size):
+                    send(size).start()
+
         else:
-            mine = o_ref.at[pl.ds(pl.multiple_of(me * block + row0, 8), rows)]
-        for j in range(n):  # block j into slot `me` of core j
-
-            @pl.when(jnp.int32(j) != me)
-            def _(j=j):
-                pltpu.make_async_remote_copy(
-                    src_ref=x_ref.at[pl.ds(j * block + row0, rows)],
-                    dst_ref=mine,
-                    send_sem=send_sem,
-                    recv_sem=recv_sem,
-                    device_id=peer(j),
-                    device_id_type=MESH,
-                ).start()
-
-        own = x_ref.at[pl.ds(pl.multiple_of(me * block + row0, 8), rows)]
-        local = pltpu.make_async_copy(own, mine, local_sem)
-        local.start()
+            local = send(rows)
+            local.start()
         if merge:
             for c in range(chunks):
 
@@ -272,11 +340,11 @@ def small_all_to_all(
                     )
                     chunk_out(c).start()
 
-            others = recv_ref.at[pl.ds(0, n - 1)]
+        wait(recv_sem, n - 1)
+        if sized:
+            wait(local_sem, 1)
         else:
-            others = o_ref.at[pl.ds(0, (n - 1) * rows)]
-        wait_bytes_of(others, recv_sem)
-        local.wait()
+            local.wait()
         if merge:
             merge_weights(
                 recv_ref, w_ref, num_cores=n, word_row=merge_row - 1 - row0, tl=tl
@@ -297,7 +365,7 @@ def small_all_to_all(
                     )
                     chunk_out(c).start()
 
-        wait_bytes_of(others, send_sem)
+        wait(send_sem, n - 1)
         if merge:
             for c in range(chunks):
                 chunk_out(c).wait()
@@ -312,11 +380,13 @@ def small_all_to_all(
         scalars.append(jnp.reshape(lane, (-1,))[:1].astype(jnp.int32))
     if merge:
         scalars.append(jnp.reshape(merge_live, (-1,))[:1].astype(jnp.int32))
+    if sized:
+        scalars.append(jnp.reshape(live_rows, (-1,))[:1].astype(jnp.int32))
     if hbm_operand:
         x = pltpu.with_memory_space_constraint(x, pltpu.HBM)
     out_shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
     scratch = [pltpu.SemaphoreType.DMA] * 3
-    name = f"small_all_to_all_n{n}_b{block}_r{row0}"
+    name = f"small_all_to_all_n{n}_b{block}_r{row0}" + ("_live" if sized else "")
     if merge:
         out_shape = jax.ShapeDtypeStruct((tl, vdim), jnp.bfloat16)
         scratch = [
