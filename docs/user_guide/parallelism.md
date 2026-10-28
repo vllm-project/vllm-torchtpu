@@ -82,6 +82,31 @@ On multi-chip and multi-host slices, `vllm-torchtpu` provides specialized MoE ex
 | `TPU_MOE_SEQUENCE_PARALLEL` | `0` | Keeps activations sequence-parallel entering MoE layers to replace all-reduce with reduce-scatter + all-gather. |
 | `TPU_LATENT_PROJ_INTRA_CHIP_TP` | `0` | Shards MLA latent projections across the 2 cores of each physical TPU v7x chip even when `TP=1`. |
 
+### Static Expert Placement
+
+With flat expert parallelism, rank `r` holds experts `r * S .. (r + 1) * S - 1` by default
+(`S` = experts per rank). `TPU_EXPERT_PLACEMENT` names a JSON table that assigns each
+routed layer's experts to ranks instead, for example to spread the most-used experts:
+
+```bash
+TPU_EXPERT_PLACEMENT=examples/expert_placement/glm52_ep16_c32_4k.json \
+  vllm serve zai-org/GLM-5.2-FP8 --tensor-parallel-size 16 --enable-expert-parallel ...
+```
+
+- **What changes:** each placed layer's expert map, EP weight filter and router rows
+  (gate weight and `e_score_correction_bias`) follow the table at load. Every token picks
+  the same experts with the same weights; only the order of its top-k sum can change. No
+  kernel changes and nothing runs per token.
+- **Table:** `layers["<n>"].cores[r]` lists the global expert ids of rank `r` in slot
+  order; every layer must be a permutation (no copies). Format and examples:
+  `examples/expert_placement/README.md`.
+- **Refused at load:** layers outside the routed decoder layers (dense or MTP layers),
+  `TPU_MOE_EP_TP_SIZE > 1`, `TPU_MOE_HIERARCHICAL_EP`, an `--expert-placement-strategy`
+  other than `linear`, grouped top-k and hash-routed layers.
+- **Check delivery:** every worker logs one line,
+  `[eplb] placement installed ep_rank=<r> layers=<n> table_sha256=<16 hex>`, or
+  `[eplb] placement none ep_rank=<r>` without a table.
+
 ---
 
 ## 4. Pipeline Parallelism (`--pipeline-parallel-size`)

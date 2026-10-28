@@ -115,6 +115,9 @@ PATCHES = (
         _ACTIVE,
     ),
     Patch("vllm_torchtpu.model_loader_patches:patch_moe_expert_write_staging", _ACTIVE),
+    # After the loader patches: wraps the Run:AI iterator the sharded streaming
+    # patch installed, so both weight streams reorder the router rows.
+    Patch("vllm_torchtpu.expert_placement:install_expert_placement", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_vocab_parallel_embedding", _ACTIVE),
     Patch(
         "vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings",
