@@ -517,6 +517,29 @@ def qsa_attention(
     )
     # Keep bucket shapes fixed while removing the decode prefix on device.
     rows = jnp.arange(len(query))
+    if envs.VLLM_TPU_QSA_PREFIX_SLICE:
+        # Contiguous dynamic slices instead of row gathers: the same rows (clamped at the
+        # last one), read at HBM rate rather than per-row index rate.
+        def shift(x):
+            return _shift_rows_up(x, prefix, capacity)
+
+        prefill_lengths = jnp.where(rows < starts[-1] - prefix, shift(lengths), 0)
+        prefilled, cache = _prefill_attention(
+            shift(query),
+            shift(gate),
+            shift(blocks),
+            prefill_lengths,
+            shift(table),
+            cache,
+            jnp.maximum(starts - prefix, 0),
+            **options,
+        )
+        output = jnp.where(
+            (rows < prefix)[:, None, None],
+            _pad_rows(decoded, len(query)),
+            _shift_rows_down(prefilled, prefix, capacity),
+        )
+        return jnp.where((lengths > 0)[:, None, None], output, 0), cache
     ids = jnp.minimum(rows + prefix, len(query) - 1)
     prefill_lengths = jnp.where(rows < starts[-1] - prefix, lengths[ids], 0)
     prefilled, cache = _prefill_attention(
@@ -535,6 +558,26 @@ def qsa_attention(
         prefilled[jnp.maximum(rows - prefix, 0)],
     )
     return jnp.where((lengths > 0)[:, None, None], output, 0), cache
+
+
+def _pad_rows(x: jax.Array, n: int) -> jax.Array:
+    """``x[min(r, len(x) - 1)]`` for ``r < n``: the last row repeated, a static concat."""
+    if len(x) >= n:
+        return x[:n]
+    return jnp.concatenate([x, jnp.broadcast_to(x[-1:], (n - len(x),) + x.shape[1:])])
+
+
+def _shift_rows_up(x: jax.Array, shift: jax.Array, max_shift: int) -> jax.Array:
+    """``x[min(r + shift, len(x) - 1)]`` for ``0 <= shift <= max_shift``, one dynamic slice."""
+    return jax.lax.dynamic_slice_in_dim(_pad_rows(x, len(x) + max_shift), shift, len(x), 0)
+
+
+def _shift_rows_down(x: jax.Array, shift: jax.Array, max_shift: int) -> jax.Array:
+    """``x[max(r - shift, 0)]`` for ``0 <= shift <= max_shift``, one dynamic slice."""
+    head = jnp.broadcast_to(x[:1], (max_shift,) + x.shape[1:])
+    return jax.lax.dynamic_slice_in_dim(
+        jnp.concatenate([head, x]), max_shift - shift, len(x), 0
+    )
 
 
 def qsa_step(
