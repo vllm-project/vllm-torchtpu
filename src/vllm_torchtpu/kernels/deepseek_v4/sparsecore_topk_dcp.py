@@ -35,6 +35,19 @@ level, and a rank sends each histogram once rather than to every peer. Every
 level of a pass costs those rounds' latency whatever the rows' length, so the
 kernel is for prefill-sized calls; decode keeps the candidate merge.
 
+With `one_round`, every rank instead sends its histograms to every rank, and
+each rank sums them in rank order and picks every row itself: the counts are
+exact integers, so all ranks reach the same state in one round per level.
+"auto" does so only for passes of few rows per subcore, where the rounds'
+latency outweighs the broadcast's bytes.
+
+With `no_restream`, the row buffer takes the tile memory the rest leaves, so
+longer parts stay resident; a pass that still streams copies each row's
+survivors (every key from the window up, with its column) into the rest of
+the buffer at CMP_LEVELS if they fit, and later levels and the emit read only
+those. With `pack16`, a pass whose bounds are all at most PACK16_MAX sends its
+counts as 16-bit pairs: a count never exceeds its rank's part length.
+
 The output is this rank's share of every row's top-k, as positions in its own
 part of the row, packed into a prefix and `-1` padded. Across the ranks the
 rows hold exactly the global top-k, so there is no candidate exchange and no
@@ -69,7 +82,7 @@ from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
 # most row parts a subcore holds at once. A pass over the rows exchanges
 # histograms once per level, so short parts are batched up to MAX_ROWS deep.
 ROW_WORDS = 64 * 1024
-SEG_WORDS = ROW_WORDS // 2
+SEG_WORDS = 32 * 1024
 MAX_ROWS = 8
 NUM_CORES = 2
 NUM_SUBCORES = 16
@@ -77,12 +90,43 @@ ROWS_PER_PASS = NUM_CORES * NUM_SUBCORES
 NUM_LEVELS = 1 + len(REFINEMENT_LEVELS)
 
 # Per-row selection state in SMEM, NF words per row: the row, its part's
-# length on this rank, and the selection.
-(F_ROW, F_LEN, F_PREFIX, F_SHIFT, F_QUOTA, F_DONE, F_KEEP, F_MINE, F_BEFORE) = range(9)
-NF = 9
+# length on this rank, the selection, and where its compacted survivors are.
+(
+    F_ROW,
+    F_LEN,
+    F_PREFIX,
+    F_SHIFT,
+    F_QUOTA,
+    F_DONE,
+    F_KEEP,
+    F_MINE,
+    F_BEFORE,
+    F_CMP,
+    F_COFF,
+    F_CLEN,
+    F_ABOVE,
+) = range(13)
+NF = 13
 # The state an owner sends back, one STATE_WORDS vector per row and rank.
 STATE_FIELDS = (F_PREFIX, F_SHIFT, F_QUOTA, F_DONE, F_KEEP, F_MINE, F_BEFORE)
 STATE_WORDS = LANES
+# Exchange: False two rounds/level, True one, "auto" one if <= ONE_ROUND_MAX_ROWS.
+ONE_ROUND = "auto"
+ONE_ROUND_MAX_ROWS = 2
+# One rank's histograms of one core's rows in the one-round exchange buffer.
+ALL_WORDS = NUM_SUBCORES * MAX_ROWS * NUM_BUCKETS
+# Re-streaming: False, "tile" (grow the row buffer) or True (tile + compaction).
+NO_RESTREAM = True
+# The levels at which a streamed row's survivors are compacted, if they fit.
+CMP_LEVELS = (1, 2)
+TILE_WORDS = 128 * 1024
+TILE_RESERVE = 16 * 1024
+SPMEM_WORDS = 2 * 1024 * 1024
+SPMEM_RESERVE = 4 * 1024
+# Sends histogram counts as 16-bit pairs when every bound of a pass is <= this.
+PACK16 = False
+PACK16_MAX = 0xFFFF
+HALF_BUCKETS = NUM_BUCKETS // 2
 
 
 def _align16(x):
@@ -123,6 +167,12 @@ def _vector_body(
     k: int,
     dcp_size: int,
     axis_name: str,
+    max_1r: int,
+    all_words: int,
+    compact: bool,
+    pack16: bool,
+    pack_max: int,
+    row_words: int,
     **_,
 ):
     del after_hbm
@@ -141,6 +191,9 @@ def _vector_body(
     my_slot = jnp.right_shift(sub, dcp_size.bit_length() - 1)
     block = per_owner * MAX_ROWS * NUM_BUCKETS
     state_block = per_owner * MAX_ROWS * STATE_WORDS
+    # A streamed pass's survivors (keys, then columns) past the two segments.
+    cand0 = 2 * SEG_WORDS
+    cand_half = ((row_words - cand0) // 2) & -LANES
 
     def vec_at(ref, idx):
         return ref[pl.ds(idx, LANES)][0]
@@ -198,11 +251,11 @@ def _vector_body(
 
         _signal(v2s_sem, core=core)
 
-    def handoff(first=False):
+    def handoff(first=False, ctrl=1):
         """Hands the staged data to the scalar subcore and waits for its round;
         the first round of a pass also tells it the pass goes on."""
         if first:
-            post(1)
+            post(ctrl)
         else:
             _signal(v2s_sem, core=core)
         pl.semaphore_wait(s2v_sem, 1)
@@ -214,13 +267,6 @@ def _vector_body(
             copy.start()
         for copy in copies:
             copy.wait()
-
-    def gather(srcs, words):
-        """Copies `words` from each rank's ref in `srcs` to its peer_vmem slot."""
-        copy_all(
-            (src, peer_vmem.at[pl.ds(d * rank_words, words)])
-            for d, src in enumerate(srcs)
-        )
 
     pltpu.sync_copy(lengths_hbm, len_vmem)
     pltpu.sync_copy(bounds_hbm, bnd_vmem)
@@ -250,7 +296,8 @@ def _vector_body(
     # The stream of a pass whose rows do not fit, after the rows' states in
     # state_smem: the rows_vmem half the next segment lands in, and the row
     # whose first segment is already on its way there (-1: none).
-    S_HALF, S_NEXT = MAX_ROWS * NF, MAX_ROWS * NF + 1
+    # S_COFF: the next free word of the pass's survivor buffers.
+    S_HALF, S_NEXT, S_COFF = MAX_ROWS * NF, MAX_ROWS * NF + 1, MAX_ROWS * NF + 2
 
     def num_segments(j):
         return jnp.right_shift(
@@ -266,8 +313,31 @@ def _vector_body(
             seg_sems.at[half],
         )
 
-    def for_segments(j, carry, *, stride, streamed, nrows, keys, body, then, live):
-        """Folds `body(part, length, col0, carry)` over row `j`'s segments.
+    def iota_cols(col0):
+        return lambda i: col0 + i * LANES + lane_iota
+
+    def compacted(j):
+        return jnp.bool_(False) if not compact else get(j, F_CMP) != 0
+
+    def for_segments(
+        j,
+        carry,
+        *,
+        stride,
+        streamed,
+        nrows,
+        keys,
+        body,
+        then,
+        live,
+        use_cmp=False,
+        self_cmp=None,
+    ):
+        """Folds `body(part, length, cols, carry)` over row `j`'s segments.
+
+        `cols(i)` gives the columns of the i-th 16-word chunk of `part`. With
+        `use_cmp`, a row whose survivors were compacted reads only those from
+        tile memory; `self_cmp` says row `j` is being compacted now.
 
         A pass whose rows fit tile memory fetches each once into its slot, and
         the row is one segment: level 0 (`keys=False`) masks it and turns it
@@ -282,12 +352,26 @@ def _vector_body(
         length = get(j, F_LEN)
 
         def resident(_, c):
-            part = rows_vmem.at[pl.ds(pl.multiple_of(j * stride, LANES), ROW_WORDS)]
+            part = rows_vmem.at[pl.ds(pl.multiple_of(j * stride, LANES), row_words)]
             if not keys:
                 mask_tail(part, length)
-            return body(part, length, 0, c)
+            return body(part, length, iota_cols(0), c)
 
-        segs = jnp.where(streamed, num_segments(j), 0)
+        cmp = compacted(j) if use_cmp else jnp.bool_(False)
+
+        def from_survivors(_, c):
+            off = pl.multiple_of(cand0 + get(j, F_COFF), LANES)
+            part = rows_vmem.at[pl.ds(off, cand_half)]
+            colpart = rows_vmem.at[
+                pl.ds(pl.multiple_of(off + cand_half, LANES), cand_half)
+            ]
+            return body(
+                part, get(j, F_CLEN), lambda i: colpart[pl.ds(i * LANES, LANES)], c
+            )
+
+        if compact and use_cmp:
+            pl.when(cmp)(functools.partial(drain, j))
+        segs = jnp.where(streamed & ~cmp, num_segments(j), 0)
         base = state_smem[S_HALF]
 
         @pl.when((segs > 0) & (state_smem[S_NEXT] != j))
@@ -302,6 +386,10 @@ def _vector_body(
             nxt = jnp.where(within, nxt, then)
             has_next = has_next | ~within
         has_next = has_next & (num_segments(nxt) > 0)
+        if compact:
+            has_next = has_next & ~compacted(nxt)
+        if self_cmp is not None:
+            has_next = has_next & ~((nxt == j) & self_cmp)
 
         def streamed_seg(seg, c):
             half = jnp.bitwise_and(base + seg, 1)
@@ -331,9 +419,11 @@ def _vector_body(
                 plsc.parallel_loop(
                     0, jnp.right_shift(seg_len + LANES - 1, 4), unroll=8
                 )(to_keys)
-            return body(part, seg_len, seg * SEG_WORDS, c)
+            return body(part, seg_len, iota_cols(seg * SEG_WORDS), c)
 
         carry = lax.fori_loop(0, jnp.where(streamed, 0, 1), resident, carry)
+        if use_cmp and compact:
+            carry = lax.fori_loop(0, jnp.where(cmp, 1, 0), from_survivors, carry)
         carry = lax.fori_loop(0, segs, streamed_seg, carry)
         state_smem[S_HALF] = jnp.bitwise_and(base + segs, 1)
         return carry
@@ -350,6 +440,54 @@ def _vector_body(
     def hist_row(j, carry, *, level, stride, streamed, nrows):
         """Level `level`'s histogram of row `j`."""
         hist = hist_vmem.at[pl.ds(pl.multiple_of(j * NUM_BUCKETS, LANES), NUM_BUCKETS)]
+        # At CMP_LEVELS a streamed row compacts its survivors if they fit.
+        cmp_here = compact and level in CMP_LEVELS
+        to_cmp = jnp.bool_(False)
+        if compact and 0 < level <= max(CMP_LEVELS):
+
+            def decide(_, t):
+                """Counts the survivors and reserves their room if they fit."""
+                if level == 1:
+                    bkt = get(j, F_PREFIX) + NUM_BUCKETS // 2
+                    above = jnp.int32(0)
+                else:
+                    bkt = jnp.bitwise_and(get(j, F_PREFIX), NUM_BUCKETS - 1)
+                    above = get(j, F_ABOVE)
+
+                def count_from(i, s):
+                    h = hist[pl.ds(i * LANES, LANES)]
+                    idx = i * LANES + lane_iota
+                    return (
+                        s[0] + jnp.where(idx >= bkt, h, 0),
+                        s[1] + jnp.where(idx > bkt, h, 0),
+                    )
+
+                zeros = jnp.zeros((LANES,), jnp.int32)
+                ge, gt = plsc.parallel_loop(
+                    0, NUM_BUCKETS // LANES, carry=(zeros, zeros)
+                )(count_from)
+                ge, gt = plsc.cumsum(ge)[LANES - 1], plsc.cumsum(gt)[LANES - 1]
+                put(j, F_ABOVE, above + gt)
+                coff = state_smem[S_COFF]
+                need = _align16(above + ge) + LANES
+                fits = (
+                    (get(j, F_DONE) == 0)
+                    & ~compacted(j)
+                    & (need <= cand_half - coff)
+                    & cmp_here
+                )
+
+                @pl.when(fits)
+                def _():
+                    put(j, F_COFF, coff)
+                    state_smem[S_COFF] = coff + need
+
+                return fits.astype(jnp.int32)
+
+            # Only a streamed pass compacts.
+            to_cmp = (
+                lax.fori_loop(0, jnp.where(streamed, 1, 0), decide, jnp.int32(0)) != 0
+            )
 
         def zero(i):
             hist[pl.ds(i * LANES, LANES)] = jnp.zeros((LANES,), jnp.int32)
@@ -357,7 +495,7 @@ def _vector_body(
         plsc.parallel_loop(0, NUM_BUCKETS // LANES, unroll=8)(zero)
         if level == 0:
 
-            def segment(part, length, col0, c):
+            def segment(part, length, cols, c):
                 def body(i):
                     key = monotone_key(part[pl.ds(i * LANES, LANES)])
                     part[pl.ds(i * LANES, LANES)] = key
@@ -373,7 +511,7 @@ def _vector_body(
             shift, mask = REFINEMENT_LEVELS[level - 1]
             lo_excl, hi_incl = key_window(get(j, F_PREFIX), get(j, F_SHIFT))
 
-            def segment(part, length, col0, c):
+            def segment(part, length, cols, c):
                 def body(i):
                     key = part[pl.ds(i * LANES, LANES)]
                     match = (key > lo_excl) & (key <= hi_incl)
@@ -381,8 +519,32 @@ def _vector_body(
                     hist_add(hist, bucket, match)
 
                 chunks = jnp.right_shift(length + (LANES - 1), 4)
-                plsc.parallel_loop(0, chunks, unroll=SCAN_UNROLL)(body)
-                return c
+                if not cmp_here:
+                    plsc.parallel_loop(0, chunks, unroll=SCAN_UNROLL)(body)
+                    return c
+
+                # Also keep every key from the window up, with its column.
+                def body_cmp(i, woff):
+                    body(i)
+                    key = part[pl.ds(i * LANES, LANES)]
+                    keep = key > lo_excl
+                    plsc.store_compressed(
+                        rows_vmem.at[pl.ds(woff, LANES)], key, mask=keep
+                    )
+                    plsc.store_compressed(
+                        rows_vmem.at[pl.ds(woff + cand_half, LANES)], cols(i), mask=keep
+                    )
+                    return woff + plsc.all_reduce_population_count(keep)[0]
+
+                def plain(_, w):
+                    plsc.parallel_loop(0, chunks, unroll=SCAN_UNROLL)(body)
+                    return w
+
+                def with_cmp(_, w):
+                    return plsc.parallel_loop(0, chunks, unroll=4, carry=w)(body_cmp)
+
+                c = lax.fori_loop(0, jnp.where(to_cmp, 0, 1), plain, c)
+                return lax.fori_loop(0, jnp.where(to_cmp, 1, 0), with_cmp, c)
 
             live = get(j, F_DONE) == 0
 
@@ -391,9 +553,10 @@ def _vector_body(
 
         @pl.when(live)
         def _():
-            for_segments(
+            start = cand0 + get(j, F_COFF) if cmp_here else 0
+            end = for_segments(
                 j,
-                0,
+                jnp.asarray(start, jnp.int32),
                 stride=stride,
                 streamed=streamed,
                 nrows=nrows,
@@ -401,14 +564,86 @@ def _vector_body(
                 body=segment,
                 then=0,  # the next level, or the emit, starts at row 0
                 live=row_live,
+                use_cmp=level > 1,
+                self_cmp=to_cmp if cmp_here else None,
             )
+            if cmp_here:
+
+                @pl.when(to_cmp)
+                def _():
+                    put(j, F_CMP, jnp.int32(1))
+                    put(j, F_CLEN, end - start)
+                    # -inf after the survivors, for the last chunk's tail.
+                    plsc.store_compressed(
+                        rows_vmem.at[pl.ds(end, LANES)],
+                        jnp.full((LANES,), KEY_NEG_INF, jnp.int32),
+                        mask=lane_iota >= 0,
+                    )
 
         pl.when(~live)(functools.partial(drain, j))
         return carry
 
+    # Packed 16-bit count pairs sit past the histograms in hist_vmem/peer_vmem.
+    pk_src = MAX_ROWS * NUM_BUCKETS
+    pk_dst = dcp_size * rank_words
+
+    def pack_hists(nrows):
+        """Buckets i and i + 128 of each row as one word, after hist_vmem's."""
+
+        def body(i):
+            src = jnp.right_shift(i, 3) * NUM_BUCKETS + jnp.bitwise_and(i, 7) * LANES
+            lo = hist_vmem[pl.ds(src, LANES)]
+            hi = hist_vmem[pl.ds(src + HALF_BUCKETS, LANES)]
+            hist_vmem[pl.ds(pk_src + i * LANES, LANES)] = jnp.bitwise_or(
+                lo, jnp.left_shift(hi, 16)
+            )
+
+        plsc.parallel_loop(0, nrows * (HALF_BUCKETS // LANES), unroll=4)(body)
+
+    def unpack_peers(nrows):
+        """Every rank's pairs back to 256 counts per row in its peer_vmem slot."""
+        for d in range(dcp_size):
+
+            def body(i):
+                w = peer_vmem[pl.ds(pk_dst + d * (rank_words // 2) + i * LANES, LANES)]
+                dst = (
+                    d * rank_words
+                    + jnp.right_shift(i, 3) * NUM_BUCKETS
+                    + jnp.bitwise_and(i, 7) * LANES
+                )
+                peer_vmem[pl.ds(dst, LANES)] = jnp.bitwise_and(w, 0xFFFF)
+                peer_vmem[pl.ds(dst + HALF_BUCKETS, LANES)] = jnp.bitwise_and(
+                    jnp.right_shift(w, 16), 0xFFFF
+                )
+
+            plsc.parallel_loop(0, nrows * (HALF_BUCKETS // LANES), unroll=4)(body)
+
+    def wire(nrows, packed):
+        """Words per row sent, their offset in hist_vmem, and peer_vmem's
+        landing offset of rank d."""
+        if not pack16:
+            return nrows * NUM_BUCKETS, 0, lambda d: d * rank_words
+        words = nrows * jnp.where(packed, HALF_BUCKETS, NUM_BUCKETS)
+        src = jnp.where(packed, pk_src, 0)
+        return (
+            words,
+            src,
+            lambda d: jnp.where(packed, pk_dst + d * (rank_words // 2), d * rank_words),
+        )
+
+    def land(src_refs, nrows, words, dst, packed):
+        """Copies each rank's sent words to peer_vmem and unpacks them."""
+        copy_all(
+            (src, peer_vmem.at[pl.ds(pl.multiple_of(dst(d), LANES), words)])
+            for d, src in enumerate(src_refs)
+        )
+        if pack16:
+            pl.when(packed)(functools.partial(unpack_peers, nrows))
+
     def select(j, level, publish):
         """Sums row `j`'s histograms over the ranks (in peer_vmem), picks the
-        bucket, and hands `publish(d, fields, bucket)` each rank's new state."""
+        bucket, hands `publish(d, fields, bucket)` each rank's new state, and
+        returns this rank's."""
         hb = j * NUM_BUCKETS
 
         def sum_ranks(i):
@@ -440,45 +675,79 @@ def _vector_body(
         fields[F_DONE] = done.astype(jnp.int32)
         # Each rank's entries in the bucket, and the lower ranks'.
         before = jnp.int32(0)
+        mine_self = before_self = jnp.int32(0)
         for d in range(dcp_size):
             mine = vec_at(peer_vmem, d * rank_words + hb + bucket)
-            publish(d, {**fields, F_MINE: mine, F_BEFORE: before}, bucket)
+            if publish is not None:
+                publish(d, {**fields, F_MINE: mine, F_BEFORE: before}, bucket)
+            mine_self = jnp.where(d == rank, mine, mine_self)
+            before_self = jnp.where(d == rank, before, before_self)
             before = before + mine
+        return {**fields, F_MINE: mine_self, F_BEFORE: before_self}
 
-    def exchange_owner(level, nrows):
-        """The owner of each row sums its histograms and sends back its state.
+    def exchange(level, nrows, ctrl, packed):
+        """Sums each row's histograms over the ranks and picks its bucket.
 
-        hist_shared holds [out | in] x rank x block: `out[d]` this rank's
-        histograms of rank d's rows, `in[d]` rank d's histograms of this
-        rank's rows; a block holds MAX_ROWS rows per owned subcore and moves
-        whole (a remote copy between different offsets needs a static size).
-        state_shared is laid out alike, with the states.
+        The owner exchange (`one` false): hist_shared holds [out | in] x rank
+        x block: `out[d]` this rank's histograms of rank d's rows, `in[d]`
+        rank d's histograms of this rank's rows; a block holds MAX_ROWS rows
+        per owned subcore and moves whole (a remote copy between different
+        offsets needs a static size). The owner of each row sums and picks,
+        and sends back the state through state_shared, laid out alike.
+
+        The one-round exchange (`one` true): every rank gets every rank's
+        histograms and picks every row itself. hist_shared holds parity x
+        rank x all_words: rank d's histograms of this core's rows, `nrows`
+        per subcore and subcore-major. The two parities alternate by level,
+        so a peer one level ahead never overwrites histograms still being
+        read. Packed, a row's histogram is 128 words on the wire.
         """
-        words = nrows * NUM_BUCKETS
+        if pack16:
+            pl.when(packed)(functools.partial(pack_hists, nrows))
+        if max_1r >= MAX_ROWS:
+            one = jnp.bool_(True)
+        elif max_1r <= 0:
+            one = jnp.bool_(False)
+        else:
+            one = nrows <= max_1r
+        has_owner, has_one = max_1r < MAX_ROWS, max_1r > 0
+        words, src, dst_of = wire(nrows, packed)
+        slot = (
+            rank_words if not pack16 else jnp.where(packed, rank_words // 2, rank_words)
+        )
+        base = (level % 2) * dcp_size * all_words + sub * words
+        # Where this subcore's histograms go, and where rank d's are read.
+        own_dst = (
+            jnp.where(my_owner == rank, dcp_size + my_owner, my_owner) * block
+            + my_slot * slot
+        )
+        dst = jnp.where(one, base + rank * all_words, own_dst)
+
+        def read_at(d):
+            return jnp.where(
+                one, base + d * all_words, (dcp_size + d) * block + my_slot * slot
+            )
+
         state_words = nrows * STATE_WORDS
         state_rows = MAX_ROWS * STATE_WORDS  # one subcore's slot of a state block
-        # Round 1: this subcore's histograms to its rows' owner.
-        dst = (
-            jnp.where(my_owner == rank, dcp_size + my_owner, my_owner) * block
-            + my_slot * rank_words
-        )
         pltpu.sync_copy(
-            hist_vmem.at[pl.ds(0, words)],
+            hist_vmem.at[pl.ds(pl.multiple_of(src, LANES), words)],
             hist_shared.at[pl.ds(pl.multiple_of(dst, LANES), words)],
         )
-        handoff(first=level == 0)
+        handoff(first=level == 0, ctrl=ctrl)
 
-        # The owner sums, picks and stages every rank's state.
-        @pl.when(my_owner == rank)
+        # Every rank picks its rows in one round, only the owner in two.
+        @pl.when(one | (my_owner == rank))
         def _():
-            gather(
+            land(
                 [
-                    hist_shared.at[
-                        pl.ds((dcp_size + d) * block + my_slot * rank_words, words)
-                    ]
+                    hist_shared.at[pl.ds(pl.multiple_of(read_at(d), LANES), words)]
                     for d in range(dcp_size)
                 ],
+                nrows,
                 words,
+                dst_of,
+                packed,
             )
 
             def row(j, c):
@@ -492,56 +761,75 @@ def _vector_body(
 
                 live = jnp.bool_(True) if level == 0 else get(j, F_DONE) == 0
 
+                # Owner stages every rank's state; one round keeps only this rank's.
                 @pl.when(live)
                 def _():
-                    select(j, level, publish)
+                    fields = select(j, level, publish if has_owner else None)
+                    if has_one:
 
-                @pl.when(~live)
-                def _():
-                    for d in range(dcp_size):
-                        state_vmem[pl.ds((d * MAX_ROWS + j) * STATE_WORDS, LANES)] = (
-                            jnp.zeros((LANES,), jnp.int32)
-                        )
+                        @pl.when(one)
+                        def _():
+                            for f, v in fields.items():
+                                put(j, f, v)
+
+                if has_owner:
+
+                    @pl.when(~live)
+                    def _():
+                        for d in range(dcp_size):
+                            state_vmem[
+                                pl.ds((d * MAX_ROWS + j) * STATE_WORDS, LANES)
+                            ] = jnp.zeros((LANES,), jnp.int32)
 
                 return c
 
             lax.fori_loop(0, nrows, row, 0)
-            copy_all(
-                (
-                    state_vmem.at[pl.ds(d * state_rows, state_words)],
-                    state_shared.at[
-                        pl.ds(
-                            pl.multiple_of(
-                                jnp.where(d == rank, dcp_size + d, d) * state_block
-                                + my_slot * state_rows,
-                                LANES,
-                            ),
-                            state_words,
+            if has_owner:
+
+                @pl.when(~one)
+                def _():
+                    copy_all(
+                        (
+                            state_vmem.at[pl.ds(d * state_rows, state_words)],
+                            state_shared.at[
+                                pl.ds(
+                                    pl.multiple_of(
+                                        jnp.where(d == rank, dcp_size + d, d)
+                                        * state_block
+                                        + my_slot * state_rows,
+                                        LANES,
+                                    ),
+                                    state_words,
+                                )
+                            ],
                         )
-                    ],
-                )
-                for d in range(dcp_size)
-            )
+                        for d in range(dcp_size)
+                    )
+
+        if not has_owner:
+            return
 
         # Round 2: the owners' states back to every rank.
-        handoff()
-        src = (dcp_size + my_owner) * state_block + my_slot * state_rows
-        pltpu.sync_copy(
-            state_shared.at[pl.ds(pl.multiple_of(src, LANES), state_words)],
-            state_vmem.at[pl.ds(0, state_words)],
-        )
+        @pl.when(~one)
+        def _():
+            handoff()
+            src = (dcp_size + my_owner) * state_block + my_slot * state_rows
+            pltpu.sync_copy(
+                state_shared.at[pl.ds(pl.multiple_of(src, LANES), state_words)],
+                state_vmem.at[pl.ds(0, state_words)],
+            )
 
-        def unpack(j, c):
-            v = state_vmem[pl.ds(j * STATE_WORDS, LANES)]
+            def unpack(j, c):
+                v = state_vmem[pl.ds(j * STATE_WORDS, LANES)]
 
-            @pl.when(v[len(STATE_FIELDS)] != 0)
-            def _():
-                for i, f in enumerate(STATE_FIELDS):
-                    put(j, f, v[i])
+                @pl.when(v[len(STATE_FIELDS)] != 0)
+                def _():
+                    for i, f in enumerate(STATE_FIELDS):
+                        put(j, f, v[i])
 
-            return c
+                return c
 
-        lax.fori_loop(0, nrows, unpack, 0)
+            lax.fori_loop(0, nrows, unpack, 0)
 
     def fill_row():
         def fill(i):
@@ -565,13 +853,13 @@ def _vector_body(
         gate = jnp.where(take_all_ties, lo_excl, hi_incl)
         whole_bucket = take_all_ties | (my_take <= 0)
 
-        def segment(part, length, col0, c: tuple[jax.Array, jax.Array]):
+        def segment(part, length, cols, c: tuple[jax.Array, jax.Array]):
             chunks = jnp.right_shift(length + (LANES - 1), 4)
 
             def emit(i, woff, sel):
                 plsc.store_compressed(
                     rowbuf_vmem.at[pl.ds(woff, LANES)],
-                    col0 + i * LANES + lane_iota,
+                    cols(i),
                     mask=sel,
                 )
                 return woff + plsc.all_reduce_population_count(sel)[0]
@@ -609,6 +897,7 @@ def _vector_body(
             body=segment,
             then=None,
             live=lambda i: jnp.bool_(True),
+            use_cmp=True,
         )
         row = get(j, F_ROW)
         pl.when(row < b)(functools.partial(write_row, row))
@@ -634,16 +923,21 @@ def _vector_body(
         nrows = jnp.int32(1)
         for r in range(2, MAX_ROWS + 1):
             nrows = nrows + ((r - 1) * ROWS_PER_PASS < left).astype(jnp.int32)
+        # Every count of the pass fits 16 bits if every bound does.
+        packed = (stride <= pack_max) if pack16 else jnp.bool_(False)
+        ctrl = nrows + LANES * packed.astype(jnp.int32)
         stride = jnp.maximum(_align16(stride), LANES)
-        streamed = nrows * stride > ROW_WORDS
+        streamed = nrows * stride > row_words
         state_smem[S_HALF] = jnp.int32(0)
         state_smem[S_NEXT] = jnp.int32(-1)
+        state_smem[S_COFF] = jnp.int32(0)
 
         def fetch(j, c):
             row = row0 + flat + ROWS_PER_PASS * j
             length = jnp.minimum(vec_at(len_vmem, row), n)
             put(j, F_ROW, row)
             put(j, F_LEN, length)
+            put(j, F_CMP, jnp.int32(0))
             words = _align16(length)
 
             @pl.when((words > 0) & ~streamed)
@@ -680,7 +974,7 @@ def _vector_body(
                 ),
                 0,
             )
-            exchange_owner(level, nrows)
+            exchange(level, nrows, ctrl, packed)
         lax.fori_loop(
             0,
             nrows,
@@ -722,13 +1016,16 @@ def _scalar_body(
     recv_sems,
     dcp_size: int,
     axis_name: str,
+    max_1r: int,
+    all_words: int,
+    pack16: bool,
     **_,
 ):
     """Runs the exchange rounds of this core with the same core of the peers.
 
     A round: wait for the 16 vector subcores to stage their data, send each
     peer its part, wait for every peer's part to arrive, release the subcores.
-    A pass runs NUM_LEVELS levels of two rounds.
+    A pass runs NUM_LEVELS levels of two rounds, or of one with `one_round`.
     """
     del scores_hbm, lengths_hbm, bounds_hbm, after_hbm, out_hbm
     rank = lax.axis_index(axis_name)
@@ -774,17 +1071,23 @@ def _scalar_body(
     block = per_owner * MAX_ROWS * NUM_BUCKETS
     state_block = per_owner * MAX_ROWS * LANES
 
-    def level_rounds(level):
+    def level_rounds(level, pk):
         if level > 0:
             staged()
         # out[d] (this rank's histograms of d's rows) to in[rank] at d.
-        send(
-            hist_shared,
-            lambda d: d * block,
-            lambda d: (dcp_size + rank) * block,
-            block,
-            0,
-        )
+        for p in (False, True) if pack16 else (False,):
+            run = functools.partial(
+                send,
+                hist_shared,
+                lambda d: d * block,
+                lambda d: (dcp_size + rank) * block,
+                block // 2 if p else block,  # packed: the slots' first halves
+                0,
+            )
+            if pack16:
+                pl.when(pk == int(p))(run)
+            else:
+                run()
         staged()
         send(
             state_shared,
@@ -794,15 +1097,45 @@ def _scalar_body(
             1,
         )
 
-    # The vectors post once at the start of every pass (1) and once at the end
-    # (0).
+    def level_round(level, nrows, pk):
+        """This rank's histograms (parity, rank) to the same block at every peer."""
+        par = level % 2
+        if level > 0:
+            staged()
+        src = par * dcp_size * all_words + rank * all_words
+        # A remote copy needs a static size: one variant per rows per subcore.
+        for p in (False, True) if pack16 else (False,):
+            per_row = HALF_BUCKETS if p else NUM_BUCKETS
+            for r in range(1, MAX_ROWS + 1):
+                pl.when((nrows == r) & ((pk == int(p)) if pack16 else True))(
+                    functools.partial(
+                        send,
+                        hist_shared,
+                        lambda d: src,
+                        lambda d: src,
+                        r * NUM_SUBCORES * per_row,
+                        par,
+                    )
+                )
+
+    # Vectors post rows/subcore (+16 if packed) at each pass start, 0 at the end.
     def pass_rounds(_):
         more = ctrl()
+        nrows = jnp.bitwise_and(more, LANES - 1)
+        pk = jnp.right_shift(more, 4)
 
         @pl.when(more > 0)
         def _():
             for level in range(NUM_LEVELS):
-                level_rounds(level)
+                if max_1r >= MAX_ROWS:
+                    level_round(level, nrows, pk)
+                elif max_1r <= 0:
+                    level_rounds(level, pk)
+                else:
+                    pl.when(nrows <= max_1r)(
+                        functools.partial(level_round, level, nrows, pk)
+                    )
+                    pl.when(nrows > max_1r)(functools.partial(level_rounds, level, pk))
 
         return more
 
@@ -819,6 +1152,10 @@ def sparsecore_topk_dcp(
     axis_name: str,
     scheduling_group_id: int | None = None,
     after: jax.Array | None = None,
+    one_round: bool | str | None = None,
+    one_round_max_rows: int | None = None,
+    no_restream: bool | str | None = None,
+    pack16: bool | None = None,
 ) -> jax.Array:  # i32[b, k]
     """This rank's share of the exact top-k of rows split over `axis_name`.
 
@@ -834,7 +1171,11 @@ def sparsecore_topk_dcp(
     other in program order, but may run independent ones in a different order
     on different ranks, which deadlocks: chain such calls by passing the
     previous call's output as `after` (any array; only its first `LANES`
-    words are read as a dependency, never used).
+    words are read as a dependency, never used). `one_round` picks the
+    exchange (None: `ONE_ROUND`; "auto": one round for passes of at most
+    `one_round_max_rows` rows per subcore), `no_restream` and `pack16` the
+    tile use and count width (None: `NO_RESTREAM`, `PACK16`); all give the
+    same output.
     """
     b, n = scores.shape
     if n % LANES:
@@ -861,8 +1202,41 @@ def sparsecore_topk_dcp(
     else:
         after = after.reshape(-1)[:LANES].astype(jnp.int32)
 
-    hist_words = 2 * NUM_SUBCORES * MAX_ROWS * NUM_BUCKETS
+    if one_round is None:
+        one_round = ONE_ROUND
+    if one_round_max_rows is None:
+        one_round_max_rows = ONE_ROUND_MAX_ROWS
+    if no_restream is None:
+        no_restream = NO_RESTREAM
+    if pack16 is None:
+        pack16 = PACK16
+    if one_round == "auto":
+        max_1r = max(0, min(one_round_max_rows, MAX_ROWS))
+    else:
+        max_1r = MAX_ROWS if one_round else 0
+    # One round: both parities of all ranks' max_1r rows; owner needs 2*ALL_WORDS.
+    all_words = NUM_SUBCORES * max_1r * NUM_BUCKETS
+    hist_words = max(2 * dcp_size * all_words, 2 * ALL_WORDS)
     state_words = 2 * NUM_SUBCORES * MAX_ROWS * LANES
+    # Row buffer: ROW_WORDS, or with `no_restream` the tile memory left in SPMEM.
+    pk_words = HALF_BUCKETS if pack16 else 0
+    row_words = ROW_WORDS
+    if no_restream:
+        tile = min(
+            TILE_WORDS - TILE_RESERVE,
+            (SPMEM_WORDS - hist_words - state_words - LANES) // NUM_SUBCORES
+            - SPMEM_RESERVE,
+        )
+        other = (
+            MAX_ROWS * (NUM_BUCKETS + pk_words) * (1 + dcp_size)
+            + NUM_BUCKETS
+            + k
+            + dcp_size * MAX_ROWS * STATE_WORDS
+            + 2 * (b + pad)
+            + 4 * LANES
+        )
+        row_words = max(ROW_WORDS, (tile - other) & -1024)
+    compact = no_restream is True and row_words - 2 * SEG_WORDS >= 4096
     vmesh = plsc.VectorSubcoreMesh(
         core_axis_name="core", subcore_axis_name="subcore", num_cores=NUM_CORES
     )
@@ -872,9 +1246,9 @@ def sparsecore_topk_dcp(
         (2,), pltpu.SemaphoreType.DMA.dtype
     )
     scratch_types = dict(
-        rows_vmem=vmem((ROW_WORDS,), jnp.int32),
-        hist_vmem=vmem((MAX_ROWS * NUM_BUCKETS,), jnp.int32),
-        peer_vmem=vmem((dcp_size * MAX_ROWS * NUM_BUCKETS,), jnp.int32),
+        rows_vmem=vmem((row_words,), jnp.int32),
+        hist_vmem=vmem((MAX_ROWS * (NUM_BUCKETS + pk_words),), jnp.int32),
+        peer_vmem=vmem((dcp_size * MAX_ROWS * (NUM_BUCKETS + pk_words),), jnp.int32),
         glob_vmem=vmem((NUM_BUCKETS + LANES,), jnp.int32),
         rowbuf_vmem=vmem((k + LANES,), jnp.int32),
         state_vmem=vmem((dcp_size * MAX_ROWS * STATE_WORDS,), jnp.int32),
@@ -882,7 +1256,7 @@ def sparsecore_topk_dcp(
         bnd_vmem=vmem((b + pad,), jnp.int32),
         ctrl_vmem=vmem((LANES,), jnp.int32),
         state_smem=pallas_core.CoreMemorySpace(pltpu.MemorySpace.SMEM, vmesh)(
-            (MAX_ROWS * NF + 2,), jnp.int32
+            (MAX_ROWS * NF + 3,), jnp.int32
         ),
         hist_shared=pltpu.VMEM_SHARED((hist_words,), jnp.int32),
         state_shared=pltpu.VMEM_SHARED((state_words,), jnp.int32),
@@ -900,7 +1274,22 @@ def sparsecore_topk_dcp(
         ),
         copy_sem=pltpu.SemaphoreType.DMA @ vmesh,
     )
-    params = dict(b=b, n=n, k=k, dcp_size=dcp_size, axis_name=axis_name)
+    params = dict(
+        b=b,
+        n=n,
+        k=k,
+        dcp_size=dcp_size,
+        axis_name=axis_name,
+        max_1r=max_1r,
+        all_words=all_words,
+        compact=compact,
+        pack16=bool(pack16),
+        pack_max=PACK16_MAX,
+        row_words=row_words,
+    )
+    tag = "_1r" if max_1r >= MAX_ROWS else f"_1r{max_1r}" if max_1r else ""
+    tag += f"_rw{row_words // 1024}" + ("c" if compact else "") if no_restream else ""
+    tag += "_p16" if pack16 else ""
     out = pl.kernel(
         [
             functools.partial(_vector_body, **params),
@@ -915,7 +1304,7 @@ def sparsecore_topk_dcp(
             disable_bounds_checks=True,
             needs_layout_passes=False,
         ),
-        name=f"sc_topk_dcp_b{b}_n{n}_k{k}_d{dcp_size}",
+        name=f"sc_topk_dcp_b{b}_n{n}_k{k}_d{dcp_size}{tag}",
         # pyrefly: ignore[bad-argument-count]
     )(words.reshape(-1), lengths, bounds, after)
     if scheduling_group_id is not None:
