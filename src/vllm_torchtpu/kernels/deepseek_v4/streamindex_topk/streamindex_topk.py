@@ -1082,12 +1082,12 @@ def _effective_row_lengths(
     if components is not None:
         token_pos = components.schedule.positions(token_pos)
     kv_len = seq_len // compression_ratio
-    visible = jnp.minimum(kv_len, (token_pos + 1) // compression_ratio)
+    visible = jnp.clip((token_pos + 1) // compression_ratio, 0, kv_len)
     if components is not None:
         visible = components.schedule.visible_lengths(visible)
     visible = cp_local_length(visible, cp_rank, cp_size, interleave_c)
     valid = token_ids < cu_q_lens[num_seqs]
-    return jnp.where(valid, jnp.minimum(visible, num_positions), 0)
+    return jnp.where(valid, jnp.clip(visible, 0, num_positions), 0)
 
 
 @functools.partial(
@@ -1306,12 +1306,16 @@ def streamindex_topk(
     q = prepare_q_inputs(q)
     head_dim = q.shape[-1]
     if components is not None:
-        components.keys.validate(cache_kv, head_dim, kv_layout)
-        components.schedule.validate(compression_ratio)
         if kv_layout != KVLayout.HEAD_ALONG_SUBLANE:
             raise NotImplementedError(
                 "StreamIndex components require HEAD_ALONG_SUBLANE layout."
             )
+        if components.keys.packing <= 0:
+            raise ValueError(
+                f"Key packing must be positive, got {components.keys.packing}."
+            )
+        components.keys.validate(cache_kv, head_dim, kv_layout)
+        components.schedule.validate(compression_ratio)
 
     if kv_layout == KVLayout.SEQ_ALONG_LANE:
         total_num_pages, kv_sublane_groups, kv_packing, page_size = cache_kv.shape
@@ -1341,6 +1345,13 @@ def streamindex_topk(
             raise ValueError(
                 f"bkv_sz ({page_size} * {bkv_p} = {bkv_sz}) must be a multiple of 128."
             )
+        if components is not None:
+            lane_chunk = math.gcd(bkv_sz, 256)
+            if lane_chunk % components.keys.packing != 0:
+                raise ValueError(
+                    f"Key packing ({components.keys.packing}) must divide "
+                    f"the KV lane chunk ({lane_chunk})."
+                )
 
     num_sublanes_total = max(
         align_to(pages_per_seq, bkv_p) * page_size // 128
