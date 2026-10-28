@@ -1399,14 +1399,22 @@ class VllmTPUIndexer(Indexer):
         positions,
         rotary_emb,
         q_b_layer: torch.nn.Module | None = None,
+        kw: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
         """`q_b_layer` (TPU_INDEXER_QB_OVERLAP): also return `q_b_layer(qr)`,
         run inside the top-k op, as `(topk, q)`; `q` None where the op could
-        not take it (the caller runs `q_b_layer` itself)."""
+        not take it (the caller runs `q_b_layer` itself).
+
+        `kw` (TPU_PREFILL_SEQ_PARALLEL): `wk_weights_proj` of every token of
+        the step, computed by the caller; `hidden_states` then holds only this
+        core's rows, and the top-k op reads the step's token count from `qr`."""
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
-        # Fused wk + weights_proj: one GEMM, then split
-        kw, _ = self.wk_weights_proj(hidden_states)
+        if kw is None:
+            # Fused wk + weights_proj: one GEMM, then split
+            kw, _ = self.wk_weights_proj(hidden_states)
+        else:
+            hidden_states = qr
         k = kw[:, : self.head_dim]
         weights = kw[:, self.head_dim :]
 
@@ -2171,6 +2179,10 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         permute_linear_output_channels(kv_layer, kv_index)
         self._rope_neox_permuted = True
 
+    def _reads_indexer_keys(self) -> bool:
+        """Whether this layer runs its own indexer (and so its key projection)."""
+        return self.is_sparse and self.indexer is not None and not self.skip_topk
+
     def _q_proj_layer(self):
         """The projection that produces `q`, whichever of the two is wired."""
         return self.q_b_proj if self.q_lora_rank is not None else self.q_proj
@@ -2190,11 +2202,17 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
         prefill_group=None,
+        token_split=None,
     ) -> torch.Tensor:
+        """`token_split` (TPU_PREFILL_SEQ_PARALLEL): `hidden_states` holds this
+        core's rows of the step. The q / kv latent and indexer key projections
+        run on them and are all-gathered; the output is this core's rows of the
+        o_proj sum (a reduce-scatter instead of the all-reduce)."""
         q_c = None
         kv_lora = None
         output_gate = None
         early_topk = None
+        index_kw: dict[str, torch.Tensor] = {}
 
         if self.kimi_preprocess is not None:
             assert self.fused_qkv_a_proj is not None
@@ -2222,6 +2240,17 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 )
 
                 qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+                if token_split is not None and self._reads_indexer_keys():
+                    assert self.indexer is not None
+                    qkv_lora, index_kw["kw"] = token_split.gather_columns(
+                        positions.shape[0],
+                        qkv_lora,
+                        self.indexer.wk_weights_proj(hidden_states)[0],
+                    )
+                elif token_split is not None:
+                    (qkv_lora,) = token_split.gather_columns(
+                        positions.shape[0], qkv_lora
+                    )
                 if self.gate_is_fused:
                     q_c, kv_lora, output_gate = qkv_lora.split(
                         [
@@ -2250,6 +2279,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                         positions,
                         self.indexer_rope_emb,
                         q_b_layer=self.q_b_proj,
+                        **index_kw,
                     )
                     if q is None:
                         q = self.q_b_proj(q_c)[0]
@@ -2312,13 +2342,13 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 topk_index = early_topk
             elif self.indexer is not None and not self.skip_topk:
                 topk_index = self.indexer(
-                    hidden_states, q_c, positions, self.indexer_rope_emb
+                    hidden_states, q_c, positions, self.indexer_rope_emb, **index_kw
                 )
             else:
                 # reuse the indices an earlier layer wrote into the shared buffer.
                 topk_index = self.topk_indices_buffer
             assert topk_index is not None
-            topk_indices = topk_index[: hidden_states.shape[0]]
+            topk_indices = topk_index[: q.shape[0]]
 
             # print(f"top_k_indices.shape: {topk_indices.shape}, topk_indices: {topk_indices[0]}")  # noqa: E501
 
@@ -2390,6 +2420,8 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                     getattr(self.o_proj, FP8_PALLAS_WEIGHT, None),
                     getattr(self.o_proj, FP8_PALLAS_SCALE, None),
                 )
+        if token_split is not None:
+            return token_split.project_reduce_scatter(attn_out, self.o_proj)
         if prefill_group is not None:
             return prefill_group.project_reduce_scatter(attn_out, self.o_proj)
         if envs.TPU_FUSED_OPROJ_AR:

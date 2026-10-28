@@ -62,7 +62,10 @@ from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
     plan_blocks,
 )
 from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kernel_v2 import (  # noqa: E501
+    _quantize_rows,
     fused_moe_prefill_stage_a,
+    gather_rows,
+    own_rows,
 )
 from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
@@ -83,6 +86,12 @@ _OP_ATTR = "_moe_tp_decode_op"
 # from on the FusedMoE layer.
 _OP_PREQUANT_ATTR = "_moe_tp_decode_op_prequant"
 PREQUANT_MOE_ATTR = "_tpu_prequant_moe_slot"
+# TPU_PREFILL_SEQ_PARALLEL: the op variants that take and return this core's
+# rows of the step (set by arm_token_split_op), and the slot on the FusedMoE
+# layer through which the decoder layer asks for them.
+_OP_SPLIT_ATTR = "_moe_tp_decode_op_split"
+_OP_SPLIT_PREQUANT_ATTR = "_moe_tp_decode_op_split_prequant"
+TOKEN_SPLIT_MOE_ATTR = "_tpu_token_split_moe_slot"
 # Non-persistent buffers of an armed layer: the shared expert's tensors (the
 # parameters themselves, not views: a view handed to the op is re-materialized
 # on every call), the f32 correction bias and this rank's mesh index.
@@ -564,11 +573,84 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
     return body
 
 
-def _get_op(mesh, statics: _OpStatics, prequant: bool = False):
+def _split_body(statics: _OpStatics, n_ranks: int, axis: str):
+    """The op's per-rank body for TPU_PREFILL_SEQ_PARALLEL: x, scores and the
+    optional x_q / x_scale hold this core's rows of the step (`own_rows`), and
+    so does the output. Each core routes and quantizes its own rows, the fp8
+    rows, scales and routes are all-gathered, and the fused MoE prefill kernel
+    runs as in _prefill_chain, without the all-gather after its
+    reduce-scatter. Every row's routing, quantization and sum are the ones
+    _op_body computes for it."""
+
+    def body(
+        x,
+        scores,
+        bias,
+        pad_mask,
+        w13,
+        w2,
+        s13,
+        s2,
+        sw13,
+        ss13,
+        sw2,
+        ss2,
+        rank,
+        e0,
+        *prequant,
+    ):
+        del e0
+        n = x.shape[0] * n_ranks
+        if statics.prefill_above is None or n <= statics.prefill_above:
+            raise ValueError(
+                f"the split MoE op serves only the prefill kernel's token counts, "
+                f"not {n}"
+            )
+        if plan_blocks(n, x.shape[1], w2.shape[1], sw2.shape[0], w13.dtype) is not None:
+            raise NotImplementedError(
+                "the split MoE op needs the stage-A prefill build (whole experts)"
+            )
+        logger.info(
+            "moe_tp_decode: split fused MoE prefill kernel traced for %d tokens", n
+        )
+        # The rank operand, not lax.axis_index: its partition-id is refused by
+        # XLA's SPMD partitioner in the model's whole-graph compile.
+        is_pad = own_rows(pad_mask[:n], rank.reshape(()), n_ranks)
+        w, ids = _route(x, scores, bias, is_pad, statics)
+        x_q, x_scale = prequant if prequant else _quantize_rows(x, w13.dtype)
+        x_q, x_scale, w, ids = (
+            gather_rows(a, axis) for a in (x_q, x_scale, w, ids.astype(jnp.int32))
+        )
+        return fused_moe_prefill_stage_a(
+            None,
+            w13,
+            w2,
+            s13,
+            s2,
+            sw13,
+            ss13,
+            sw2,
+            ss2,
+            None,
+            w,
+            ids,
+            axis_name=axis,
+            expert_start=None,
+            routed_scale=statics.routed_scale,
+            x_q=x_q,
+            x_scale=x_scale,
+            scatter=True,
+        ).astype(x.dtype)
+
+    return body
+
+
+def _get_op(mesh, statics: _OpStatics, prequant: bool = False, split: bool = False):
     """One jax_op per distinct closure; built at arming, never in a trace.
     `prequant`: the variant with two more per-rank operands, x_q [T, h/128,
-    128] fp8 and x_scale [T] f32 (TPU_FUSED_ADD_RMSNORM_QUANT_MOE)."""
-    key = (mesh, statics, prequant)
+    128] fp8 and x_scale [T] f32 (TPU_FUSED_ADD_RMSNORM_QUANT_MOE). `split`:
+    the variant over this core's rows of the step (`_split_body`)."""
+    key = (mesh, statics, prequant, split)
     op = _OPS.get(key)
     if op is not None:
         return op
@@ -576,7 +658,7 @@ def _get_op(mesh, statics: _OpStatics, prequant: bool = False):
     # Operands as moe_tp_decode_forward passes them; bias and the padding mask
     # are replicated, everything else is per rank.
     specs = (P(axis), P(axis), P(), P()) + (P(axis),) * (12 if prequant else 10)
-    body = _op_body(statics, int(mesh.size), axis)
+    body = (_split_body if split else _op_body)(statics, int(mesh.size), axis)
 
     sharded = jax.shard_map(
         body, mesh=mesh, in_specs=specs, out_specs=P(axis), check_vma=False
@@ -941,11 +1023,19 @@ def moe_tp_decode_forward(
     # bit for bit.
     slot = getattr(layer, PREQUANT_MOE_ATTR, None)
     prequant = None if slot is None else slot.value
-    op = getattr(quant_method, _OP_ATTR)
+    # TPU_PREFILL_SEQ_PARALLEL: the decoder layer fills this slot when x holds
+    # this core's rows of the step; the output then holds them too.
+    split_slot = getattr(layer, TOKEN_SPLIT_MOE_ATTR, None)
+    split = split_slot is not None and split_slot.value is not None
+    if split:
+        split_slot.value = None
+    op = getattr(quant_method, _OP_SPLIT_ATTR if split else _OP_ATTR)
     extra: tuple = ()
     if slot is not None and prequant is not None:
         slot.value = None
-        op = getattr(quant_method, _OP_PREQUANT_ATTR)
+        op = getattr(
+            quant_method, _OP_SPLIT_PREQUANT_ATTR if split else _OP_PREQUANT_ATTR
+        )
         extra = tuple(prequant)
     return op(
         x,
@@ -980,8 +1070,34 @@ def arm_prequant_op(layer: Any) -> int | None:
     entry = next(((k, v) for k, v in _OPS.items() if v is op), None)
     if entry is None:
         return None
-    (mesh, statics, prequant), _ = entry
-    if prequant or statics.prefill_above is None:
+    (mesh, statics, prequant, split), _ = entry
+    if prequant or split or statics.prefill_above is None:
         return None
     setattr(layer.quant_method, _OP_PREQUANT_ATTR, _get_op(mesh, statics, True))
     return statics.prefill_above
+
+
+def arm_token_split_op(layer: Any, slot: Any) -> tuple[Any, int, torch.Tensor] | None:
+    """TPU_PREFILL_SEQ_PARALLEL: build (at load, outside Dynamo) the split
+    variants of an armed layer's op and hand the layer `slot`, which the
+    decoder layer fills to ask for them. Returns the op's mesh, the token
+    count above which its prefill kernel runs and this rank's mesh index
+    operand (int32 [1, 1]), or None when the layer is not armed or has no
+    stage-A prefill kernel (FUSED_MOE_PREFILL_KERNEL_V2)."""
+    if not envs.FUSED_MOE_PREFILL_KERNEL_V2:
+        return None
+    op = getattr(layer.quant_method, _OP_ATTR, None)
+    if op is None:
+        return None
+    entry = next(((k, v) for k, v in _OPS.items() if v is op), None)
+    if entry is None:
+        return None
+    (mesh, statics, _, _), _ = entry
+    if statics.prefill_above is None or statics.use_ep:
+        return None
+    method = layer.quant_method
+    setattr(method, _OP_SPLIT_ATTR, _get_op(mesh, statics, split=True))
+    if getattr(method, _OP_PREQUANT_ATTR, None) is not None:
+        setattr(method, _OP_SPLIT_PREQUANT_ATTR, _get_op(mesh, statics, True, True))
+    setattr(layer, TOKEN_SPLIT_MOE_ATTR, slot)
+    return mesh, statics.prefill_above, layer._moe_tp_decode_rank
