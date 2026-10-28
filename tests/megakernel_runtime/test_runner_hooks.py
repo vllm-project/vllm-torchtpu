@@ -603,3 +603,74 @@ def test_agree_on_decline_detects_bucket_set_mismatch(fake_tp_group: Any) -> Non
     drv.bind_and_warmup(runner)
     assert g.calls == 1 and drv.warmed == []
     assert runner._megakernel.decline.code == "bucket_set_mismatch"
+
+
+def test_bind_and_warmup_agreement_error_propagates_after_one_collective(
+    fake_tp_group: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the agreement itself raises (e.g. a gloo timeout), the rank raises
+    after that one collective instead of voting again in a cleanup path."""
+    from types import SimpleNamespace
+
+    calls: list[int] = []
+
+    def boom(t: Any, group: Any) -> None:
+        calls.append(int(t[0]))
+        raise RuntimeError("gloo timeout")
+
+    fake_tp_group([0])
+    monkeypatch.setattr(driver_mod, "_all_reduce_max", boom)
+    drv = _bind_driver(lambda runner: None)
+    with pytest.raises(RuntimeError, match="gloo timeout"):
+        drv.bind_and_warmup(SimpleNamespace(_megakernel=drv))
+    assert calls == [0] and drv.warmed == []
+
+
+def _slot_check_driver(layers: list[Any]) -> Any:
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.megakernel.models.qwen35 import Qwen35
+
+    drv = object.__new__(driver_mod.MegakernelDriver)
+    drv.backbone = SimpleNamespace(layers=layers)
+    drv.spec = SimpleNamespace(
+        cache_backend=SimpleNamespace(layout=Qwen35.pool_layout(R=8))
+    )
+    drv.base_exec = SimpleNamespace(R=8)
+    drv._display_name = "test"
+    drv.seen = []
+    return drv
+
+
+def test_pool_slot_check_uses_first_recurrent_layer_and_skips_without_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.megakernel.runtime import facts_from_pool_layout
+
+    la = object()
+    layers = [
+        SimpleNamespace(linear_attn=None),
+        SimpleNamespace(),
+        SimpleNamespace(linear_attn=la),
+    ]
+    drv = _slot_check_driver(layers)
+
+    def facts(runner: Any, linear_attn: Any, pool: Any) -> Any:
+        drv.seen.append(linear_attn)
+        return facts_from_pool_layout(drv.spec.cache_backend.layout, 8)
+
+    monkeypatch.setattr(drv, "_framework_slot_facts", facts, raising=False)
+    drv._check_pool_layout_facts(SimpleNamespace(), object())
+    assert drv.seen == [la] and drv.pool_layout_facts is not None
+
+    # No recurrent layers: no slot to check, and no pool_layout_unknown decline.
+    drv = _slot_check_driver([SimpleNamespace(linear_attn=None), SimpleNamespace()])
+
+    def never(*_a: Any) -> Any:
+        raise AssertionError("no framework slot facts without recurrent layers")
+
+    monkeypatch.setattr(drv, "_framework_slot_facts", never, raising=False)
+    drv._check_pool_layout_facts(SimpleNamespace(), object())
+    assert drv.pool_layout_facts is None

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import os
 import time
 import types
 import zlib
@@ -344,6 +345,30 @@ def _pcp_or_dcp_enabled(runner: Any) -> bool:
     pcp = int(getattr(p_cfg, "prefill_context_parallel_size", 1) or 1)
     dcp = int(getattr(p_cfg, "decode_context_parallel_size", 1) or 1)
     return pcp > 1 or dcp > 1
+
+
+def _data_parallel_enabled(runner: Any, tp_size: int) -> bool:
+    """Whether the runner is one of several data-parallel engines, or its EP
+    group spans more ranks than its TP group (the megakernel agrees on the TP
+    group only). Reads config and group sizes only: no collective."""
+    p_cfg = getattr(runner, "parallel_config", None)
+    dp = int(os.environ.get("TORCH_TPU_DP_SIZE", "0") or 0) or int(
+        getattr(p_cfg, "data_parallel_size", 1) or 1
+    )
+    return dp > 1 or _ep_group_size() > int(tp_size)
+
+
+def _ep_group_size() -> int:
+    """vLLM's expert-parallel group size (1 when EP is off or unavailable)."""
+    try:
+        from vllm.distributed.parallel_state import get_ep_group
+    except ImportError:
+        return 1
+    try:
+        group = get_ep_group()
+    except (AssertionError, AttributeError, RuntimeError):
+        return 1
+    return int(getattr(group, "world_size", 1) or 1) if group is not None else 1
 
 
 def _runner_req_block_pairs(runner: Any) -> list[tuple[int, int]]:
@@ -816,6 +841,12 @@ class MegakernelDriver:
             tp_size=r_cnt,
             supported_tp_sizes=tp_sup,
         )
+        if el.eligible and _data_parallel_enabled(runner, r_cnt):
+            msg = (
+                "Megakernel agrees across the TP group only: data_parallel_size "
+                "> 1 or an EP group wider than TP is unsupported; skipping."
+            )
+            el = _rt.EligibilityResult(False, "dp_unsupported", msg)
         if not el.eligible:
             cls._log_startup_ineligible(el)
             return None
@@ -1027,13 +1058,22 @@ class MegakernelDriver:
     def _check_pool_layout_facts(self, runner: Any, pool: torch.Tensor) -> None:
         """Fail closed unless the framework lays out a recurrent slot exactly
         as this megakernel's `PoolLayout` expects."""
+        linear_attn = next(
+            (
+                la
+                for layer in self.backbone.layers
+                if (la := getattr(layer, "linear_attn", None)) is not None
+            ),
+            None,
+        )
+        if linear_attn is None:  # no recurrent layers: no recurrent slot
+            self.pool_layout_facts = None
+            return
         mk_facts = _rt.facts_from_pool_layout(
             self.spec.cache_backend.layout, int(self.base_exec.R)
         )
         try:
-            fw_facts = self._framework_slot_facts(
-                runner, self.backbone.layers[0].linear_attn, pool
-            )
+            fw_facts = self._framework_slot_facts(runner, linear_attn, pool)
         except (AttributeError, TypeError, ValueError) as exc:
             msg = (
                 "can't derive the framework's recurrent pool slot layout "
@@ -1453,24 +1493,21 @@ class MegakernelDriver:
         )
         with ctx:
             decline: _rt.EligibilityResult | None = None
-            voted = False
             try:
-                try:
-                    self.bind_caches(runner)
-                except MegakernelLayoutError as exc:
-                    decline = getattr(exc, "result", None) or _rt.EligibilityResult(
-                        False, "cache_layout_incompatible", str(exc)
-                    )
-                token = None if decline else buckets_token(list(self._bucket_steps))
-                decline = agree_on_decline(decline, token=token)
-                voted = True
-            finally:
-                if not voted:
-                    # This rank is raising: still vote, so the others decline
-                    # instead of waiting in the agreement.
-                    agree_on_decline(
-                        _rt.EligibilityResult(False, "bind_error", "bind failed")
-                    )
+                self.bind_caches(runner)
+            except MegakernelLayoutError as exc:
+                decline = getattr(exc, "result", None) or _rt.EligibilityResult(
+                    False, "cache_layout_incompatible", str(exc)
+                )
+            except BaseException:
+                # This rank is raising: still vote, so the others decline
+                # instead of waiting in the agreement.
+                agree_on_decline(
+                    _rt.EligibilityResult(False, "bind_error", "bind failed")
+                )
+                raise
+            token = None if decline else buckets_token(list(self._bucket_steps))
+            decline = agree_on_decline(decline, token=token)
             if decline is not None:
                 logger.warning(
                     "Disabling %s megakernel due to incompatible KV cache layout: %s",

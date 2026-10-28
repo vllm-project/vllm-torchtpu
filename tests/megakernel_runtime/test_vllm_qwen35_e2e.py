@@ -1802,6 +1802,74 @@ def test_maybe_create_declines_without_usable_pallas_mesh(
     assert "0/1 MK" in caplog.text
 
 
+@pytest.mark.parametrize("why", ["dp_size", "dp_env", "ep_wider_than_tp"])
+def test_maybe_create_declines_data_parallel_before_any_collective(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, why: str
+) -> None:
+    """DP engines (or an EP group wider than TP) are a named startup decline,
+    decided before the mesh, the TP agreement or weight packing."""
+    import logging
+    import sys
+
+    g = _tiny_geom(L=4, att_every=4)
+    ex_base = _tiny_exec(R=8, B=4, T=1, ctx=256, num_pages=96)
+    backbone = make_synthetic_qwen35_backbone(g, ex_base)
+    backbone.layers = list(backbone.layers) * 15
+    hf_cfg = _to_namespace(
+        {
+            "model_type": "qwen3_5_moe",
+            "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+            "text_config": qwen35.DEFAULT_HF_CONFIG,
+        }
+    )
+    model_cfg = SimpleNamespace(hf_config=hf_cfg)
+    runner = SimpleNamespace(
+        model=SimpleNamespace(model=backbone),
+        model_config=model_cfg,
+        mesh=_cpu_mesh(8),
+        _unified_kv_layout=True,
+        supports_mm_inputs=False,
+        lora_config=None,
+        _pp_is_first=True,
+        _pp_is_last=True,
+        _pcp_enabled=False,
+        _dcp_enabled=False,
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=8,
+            data_parallel_size=2 if why == "dp_size" else 1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+        ),
+        _dp_lockstep_enabled=lambda: False,
+        vllm_config=SimpleNamespace(
+            model_config=model_cfg, additional_config={"megakernel": True}
+        ),
+    )
+    if why == "dp_env":
+        monkeypatch.setenv("TORCH_TPU_DP_SIZE", "4")
+    else:
+        monkeypatch.delenv("TORCH_TPU_DP_SIZE", raising=False)
+    monkeypatch.setattr(
+        driver_mod, "_ep_group_size", lambda: 16 if why == "ep_wider_than_tp" else 8
+    )
+    monkeypatch.setattr(driver_mod, "_resolve_tp_size", lambda _r: 8)
+
+    def no_collective(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("must decline before any collective / mesh build")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.distributed",
+        SimpleNamespace(get_tensor_model_parallel_rank=no_collective),
+    )
+    monkeypatch.setattr(driver_mod, "_build_tp_rank_mesh", no_collective)
+    monkeypatch.setattr(driver_mod, "agree_on_decline", no_collective)
+    monkeypatch.setattr(logging.getLogger("vllm"), "propagate", True)
+    with caplog.at_level(logging.INFO):
+        assert MegakernelDriver.maybe_create(runner) is None
+    assert "data_parallel_size" in caplog.text
+
+
 def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
