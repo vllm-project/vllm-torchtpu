@@ -204,19 +204,16 @@ def prepare_boundary_batch(
     dest = jnp.where(is_decode_token, packed_index, dest_prefill)
     dest = jnp.where(is_boundary, dest, output_size)
 
-    # 6. Scatter to output once
-    def scatter(default_val, src):
-        return (
-            jnp.full((output_size,), default_val, dtype=src.dtype)
-            .at[dest]
-            .set(src, mode="drop")
-        )
-
-    return (
-        scatter(0, positions),
-        scatter(0, token_to_req_indices),
-        scatter(-1, kv_slot_mapping),
+    # 6. Scatter to output once: one row of (position, request, kv slot) per
+    # token, so the per-index cost of the scatter is paid once, not three times.
+    columns = (positions, token_to_req_indices, kv_slot_mapping)
+    defaults = jnp.array([0, 0, -1], dtype=positions.dtype)
+    rows = (
+        jnp.broadcast_to(defaults, (output_size, len(columns)))
+        .at[dest]
+        .set(jnp.stack(columns, axis=1), mode="drop")
     )
+    return rows[:, 0], rows[:, 1], rows[:, 2]
 
 
 def compressor_forward(
