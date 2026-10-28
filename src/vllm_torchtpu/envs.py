@@ -99,6 +99,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DRAFT_SHARED_SELECTION: bool = False
     VLLM_TPU_QWEN4_NGRAM_WINDOW: str = ""
     VLLM_TPU_QWEN4_FUSED_PREP: bool = False
+    VLLM_TPU_QWEN4_FUSED_PREP_CHECK: str = ""
     VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
@@ -584,6 +585,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # speculative record, slots) as one compiled program instead of ~20 eager
     # launches; models/vllm/qwen4_exp/inputs.py fused_step_inputs.
     "VLLM_TPU_QWEN4_FUSED_PREP": env_bool("VLLM_TPU_QWEN4_FUSED_PREP"),
+    # "check": compare the fused input preparation with the eager path on every
+    # live step (counts logged every 500 checks); "fault": its positive control.
+    "VLLM_TPU_QWEN4_FUSED_PREP_CHECK": lambda: os.getenv(
+        "VLLM_TPU_QWEN4_FUSED_PREP_CHECK", ""
+    ),
     "VLLM_TPU_QSA_DRAFT_SHARED_SELECTION": env_bool(
         "VLLM_TPU_QSA_DRAFT_SHARED_SELECTION"
     ),

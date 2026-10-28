@@ -327,10 +327,11 @@ def test_ngram_window_matches_full_store(spec):
         assert not torch.equal(ngram_context_from_window(narrow, dev_ctx, eos, ngram)[:n], ref[:n])
 
 
+@pytest.mark.parametrize("check", ["", "check", "fault"])
 @pytest.mark.parametrize("window", ["", "1"])
 @pytest.mark.parametrize("pooled", [False, True])
 @pytest.mark.parametrize("spec", [0, 3])
-def test_fused_prepare_inputs_matches_eager(monkeypatch, spec, pooled, window):
+def test_fused_prepare_inputs_matches_eager(monkeypatch, spec, pooled, window, check):
     """VLLM_TPU_QWEN4_FUSED_PREP: the one-program input preparation returns the
     eager path's kwargs and leaves the same speculative records, step after step,
     as requests move rows and drop out."""
@@ -362,6 +363,7 @@ def test_fused_prepare_inputs_matches_eager(monkeypatch, spec, pooled, window):
     r_fused, a_fused = make()
     r_fused.input_batch.token_ids_cpu_tensor.copy_(r_eager.input_batch.token_ids_cpu_tensor)
     monkeypatch.setattr(envs, "VLLM_TPU_QWEN4_NGRAM_WINDOW", window, raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_QWEN4_FUSED_PREP_CHECK", check, raising=False)
     monkeypatch.setattr(a_fused, "_fused_fn", lambda: inputs_mod.fused_step_inputs)
     attention = f"{a_eager.attention_prefix}.self_attn"
     main = torch.arange(rows * 3).reshape(rows, 3)
@@ -396,9 +398,15 @@ def test_fused_prepare_inputs_matches_eager(monkeypatch, spec, pooled, window):
                 adapter.prepare_inputs(ModelInputSnapshot(store, 0, n, num_tokens, tables, ids))
             )
         eager, fused = outs
+        if check == "fault":
+            continue
         assert eager.keys() == fused.keys()
         for key in eager:
             assert torch.equal(eager[key], fused[key]), (step, key)
         if spec:
             for got, ref in zip(a_fused._recent[1], a_eager._recent[1]):
                 assert torch.equal(got, ref), step
+    if check:
+        # check: the live comparison agrees; fault (context - 1): it catches it.
+        bad = int(a_fused._fused_check_bad)
+        assert (bad == 0) if check == "check" else (bad > 0), bad
