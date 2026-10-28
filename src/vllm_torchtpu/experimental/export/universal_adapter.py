@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import inspect
+import itertools
 import math
 import os
 from collections.abc import Mapping, Sequence
@@ -34,6 +36,26 @@ from vllm_torchtpu.experimental.export import (
 )
 from vllm_torchtpu.experimental.export.trace import trace
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+
+# The vLLM TPU runner's smallest request padding (`tpu_runner.MIN_NUM_SEQS`).
+_MIN_REQ_BUCKET = 8
+
+
+def default_req_buckets(max_num_seqs: int) -> tuple[int, ...]:
+    """Request buckets as the vLLM TPU runner pads `num_reqs` (`_get_req_paddings`).
+
+    Powers of two from 8 up to, and always ending with, `max_num_seqs`, so a batch is
+    padded to at most twice its size. A fixed list with a jump to `max_num_seqs`
+    (8, 16, 32, 64, 512) would run the LM head and the sampler on 512 rows for any
+    batch above 64.
+    """
+    buckets = []
+    size = _MIN_REQ_BUCKET
+    while size < max_num_seqs:
+        buckets.append(size)
+        size *= 2
+    buckets.append(max_num_seqs)
+    return tuple(buckets)
 
 
 def make_attention_metadata(
@@ -113,26 +135,32 @@ def check_supported_parallelism(parallel_cfg: Any) -> tuple[int, int]:
 
 
 def resolve_hf_checkpoint_dir(model: str | None) -> str | None:
-    """Returns the local checkpoint directory for a path or a cached Hub repo id.
+    """Returns the local checkpoint directory for a path or a Hub repo id.
 
     The companion files (`config.json`, `tokenizer.json`, `generation_config.json`)
-    and the safetensors metadata are read from this directory, so a repo id that is
-    not in the local Hub cache is an error rather than a silently thinner artifact.
+    and the safetensors metadata are read from this directory. For a repo id the
+    companion files are fetched into the Hub cache first: loading dummy weights
+    caches `config.json` alone, so the tokenizer would otherwise be missing. A
+    repo without `config.json` is an error rather than a silently thinner
+    artifact.
     """
     if not model or os.path.isdir(model):
         return model
     from transformers.utils import cached_file
 
     hint = (
-        f"--model {model!r} is neither a local directory nor a repo in the "
-        "HuggingFace cache; download it first or pass the checkpoint directory"
+        f"--model {model!r} is neither a local directory nor a HuggingFace Hub "
+        "repo with a config.json; pass the checkpoint directory"
     )
     try:
-        config_path = cached_file(model, "config.json", local_files_only=True)
+        config_path = cached_file(model, "config.json")
     except OSError as e:
         raise FileNotFoundError(hint) from e
     if config_path is None:
         raise FileNotFoundError(hint)
+    # A missing tokenizer.json is reported by the exporter, which requires it.
+    for name in ("tokenizer.json", "generation_config.json"):
+        cached_file(model, name, _raise_exceptions_for_missing_entries=False)
     return os.path.dirname(config_path)
 
 
@@ -254,11 +282,7 @@ def build_export_config_from_vllm(
         token_buckets = tuple(int(b) for b in token_buckets)
 
     if req_buckets is None:
-        default_reqs = [8, 16, 32, 64]
-        filtered = [r for r in default_reqs if r <= max_num_seqs]
-        if not filtered or filtered[-1] != max_num_seqs:
-            filtered.append(max_num_seqs)
-        req_buckets = tuple(sorted(set(filtered)))
+        req_buckets = default_req_buckets(max_num_seqs)
     else:
         req_buckets = tuple(int(r) for r in req_buckets)
 
@@ -433,6 +457,92 @@ def load_vllm_model(vllm_config: Any, *, load_format: str) -> nn.Module:
 _MAX_CONSTANT_ELEMENTS = 4096
 
 
+def _backbone_kwargs(
+    backbone: nn.Module,
+    *,
+    input_ids: Any,
+    positions: Any,
+    kv_caches: Sequence[Any],
+    attn_metadata: Any,
+) -> dict[str, Any]:
+    """Keyword arguments for `backbone.forward`, chosen from its signature.
+
+    vLLM backbones take `intermediate_tensors` (positionally, often with no
+    default) and read the KV caches and metadata from the forward context; the
+    caches and metadata are passed directly only to a forward that declares them.
+    """
+    params = inspect.signature(backbone.forward).parameters
+    kwargs: dict[str, Any] = {"input_ids": input_ids, "positions": positions}
+    if "intermediate_tensors" in params:
+        kwargs["intermediate_tensors"] = None
+    if "kv_caches" in params:
+        kwargs["kv_caches"] = kv_caches
+    if "attn_metadata" in params:
+        kwargs["attn_metadata"] = attn_metadata
+    return kwargs
+
+
+@contextlib.contextmanager
+def _weights_bound_in_place(module: nn.Module, weights: Mapping[str, Any]) -> Any:
+    """Rebinds `weights` on plain objects and restores shared submodules on exit.
+
+    `functional_call` rebinds module attributes only, while some layers hand a
+    parameter to a plain attribute object (vLLM MoE routers keep the gate's
+    `e_score_correction_bias`). In addition, when a submodule is reachable at
+    two paths in `named_modules()` (vLLM's `MoERunner` sets `self.gate = gate`
+    alongside `mlp.gate`), `functional_call` swaps the submodule's parameter
+    twice and leaves the bound `torch.Tensor` in `sub.__dict__` instead of
+    restoring `sub._parameters`, breaking the second forward pass. Snapshot
+    each submodule's parameter/buffer/attribute tables and restore them on exit.
+    """
+    bound: dict[int, Any] = {}
+    tensors = itertools.chain(
+        module.named_parameters(remove_duplicate=False),
+        module.named_buffers(remove_duplicate=False),
+    )
+    for name, tensor in tensors:
+        value = weights.get(name)
+        if isinstance(value, torch.Tensor):
+            bound[id(tensor)] = value
+    sub_snapshots: list[
+        tuple[nn.Module, dict[str, Any], dict[str, Any], dict[str, Any]]
+    ] = []
+    restore: list[tuple[Any, str, Any]] = []
+    try:
+        for sub in module.modules():
+            sub_snapshots.append(
+                (
+                    sub,
+                    dict(sub._parameters),
+                    dict(sub._buffers),
+                    dict(vars(sub)),
+                )
+            )
+            for holder in vars(sub).values():
+                if isinstance(holder, (nn.Module, torch.Tensor)) or not hasattr(
+                    holder, "__dict__"
+                ):
+                    continue
+                for attr, held in list(vars(holder).items()):
+                    if isinstance(held, torch.Tensor) and id(held) in bound:
+                        restore.append((holder, attr, held))
+                        setattr(holder, attr, bound[id(held)])
+        yield
+    finally:
+        for holder, attr, held in reversed(restore):
+            setattr(holder, attr, held)
+        for sub, orig_params, orig_buffers, orig_vars in reversed(sub_snapshots):
+            sub._parameters.clear()
+            sub._parameters.update(orig_params)
+            sub._buffers.clear()
+            sub._buffers.update(orig_buffers)
+            sub_vars = vars(sub)
+            for k in list(sub_vars):
+                if k not in orig_vars:
+                    del sub_vars[k]
+            sub_vars.update(orig_vars)
+
+
 def _is_recurrent_layer(layer: Any) -> bool:
     """Whether `layer` keeps fixed-size recurrent state (e.g. GDN linear attention)."""
     try:
@@ -442,10 +552,28 @@ def _is_recurrent_layer(layer: Any) -> bool:
     return isinstance(layer, MambaBase)
 
 
+def _check_recurrent_layer_supported(layer: Any) -> None:
+    """Raises unless export can bind `layer`'s state and drive its forward.
+
+    Export binds a recurrent layer's state as a conv/recurrent pair and hands
+    it the gated-delta-net style metadata, which only `GatedDeltaNetAttention`
+    layers read. Other recurrent layers (Mamba mixers, ShortConv) keep other
+    states and expect their own metadata type.
+    """
+    from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
+
+    if not isinstance(layer, GatedDeltaNetAttention):
+        raise NotImplementedError(
+            f"recurrent layer {type(layer).__name__} is not supported by export; "
+            "supported: GatedDeltaNetAttention (gated delta net linear attention, "
+            "e.g. Qwen3-Next)"
+        )
+
+
 def _recurrent_state_specs(
-    layer: Any, num_blocks: int, tp_size: int
+    layer: Any, num_slots: int, tp_size: int
 ) -> list[api.ShapeDtypeStruct]:
-    """Device-local `[num_blocks, ...]` specs of a recurrent layer's two states.
+    """Device-local `[num_slots, ...]` specs of a recurrent layer's two states.
 
     `get_state_shape` gives one block's device-local shapes. The conv state is
     split over the model axis along its channel dimension and the recurrent
@@ -466,7 +594,7 @@ def _recurrent_state_specs(
             sharding[split_dim + 1] = "model"
         specs.append(
             api.ShapeDtypeStruct(
-                shape=[num_blocks, *(int(d) for d in shape)],
+                shape=[num_slots, *(int(d) for d in shape)],
                 dtype=tpu_lowering.dtype_name(dtype),
                 sharding=sharding,
             )
@@ -554,9 +682,11 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         Same budget as `TPUWorker.determine_available_memory`: `kv_cache_memory_bytes`
         when given, otherwise the HBM limit of `devices` (default: this rank's TPU)
         times `gpu_memory_utilization`, minus the HBM already in use (the loaded
-        model). Export runs no profile pass, so activation scratch has to fit in the
-        headroom `gpu_memory_utilization` leaves. Collective: rank 0's artifact
-        serves every rank, so all ranks take the minimum.
+        model). Recurrent state pools are sized by `num_state_slots`, not by
+        `num_blocks`, so their bytes come off the budget first and the rest is
+        divided among KV blocks. Export runs no profile pass, so activation scratch
+        has to fit in the headroom `gpu_memory_utilization` leaves. Collective: rank
+        0's artifact serves every rank, so all ranks take the minimum.
         """
         from vllm_torchtpu import utils
 
@@ -574,11 +704,10 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                 f"({budget.total_limit} bytes total)"
             )
         num_blocks = self._export_config.num_blocks
-        kv_bytes = sum(
-            math.prod(s.shape) * tpu_lowering.torch_dtype(s.dtype).itemsize
-            for s in self.abstract_states()
-        )
-        fitted = max(available, 0) * num_blocks // kv_bytes
+        total_bytes = self._state_bytes(num_blocks)
+        block_bytes = self._state_bytes(num_blocks + 1) - total_bytes
+        fixed_bytes = total_bytes - num_blocks * block_bytes
+        fitted = max(available - fixed_bytes, 0) // block_bytes
         if (
             torch.distributed.is_initialized()
             and torch.distributed.get_world_size() > 1
@@ -592,13 +721,26 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             fitted = int(t.item())
         if fitted < 1:
             raise ValueError(
-                f"no KV cache block ({kv_bytes // num_blocks} bytes) fits in the KV "
-                f"budget: {limit_msg}; raise the budget or pass --num-blocks"
+                f"no KV cache block ({block_bytes} bytes) fits in the KV budget after "
+                f"{fixed_bytes} bytes of recurrent state: {limit_msg}; raise the "
+                "budget or pass --num-blocks"
             )
         self._export_config = dataclasses.replace(
             self._export_config, num_blocks=fitted
         )
         return fitted
+
+    def _state_bytes(self, num_blocks: int) -> int:
+        """Bytes of this rank's state tensors when exported with `num_blocks`."""
+        saved = self._export_config
+        self._export_config = dataclasses.replace(saved, num_blocks=num_blocks)
+        try:
+            return sum(
+                math.prod(s.shape) * tpu_lowering.torch_dtype(s.dtype).itemsize
+                for s in self.abstract_states()
+            )
+        finally:
+            self._export_config = saved
 
     def abstract_params(self) -> Mapping[str, api.ShapeDtypeStruct]:
         """Builds abstract specs for the model's parameters and buffers.
@@ -637,21 +779,16 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                 ),
             )
 
-        # Ensure lm_head.weight is present even when tied to embed_tokens.weight
-        if "lm_head.weight" not in params:
-            for cand in (
-                "model.embed_tokens.weight",
-                "embed_tokens.weight",
-                "transformer.wte.weight",
-            ):
-                if cand in params:
-                    emb_spec = params[cand]
-                    params["lm_head.weight"] = api.ShapeDtypeStruct(
-                        shape=emb_spec.shape,
-                        dtype=emb_spec.dtype,
-                        sharding=emb_spec.sharding,
-                    )
-                    break
+        # A tied LM head projects with the embedding; give it its own name, so the
+        # embedding stays a forward input and the head a compute_logits one.
+        tied = weight_mapper.tied_lm_head_alias(params)
+        if tied:
+            emb_spec = params[tied[1]]
+            params[tied[0]] = api.ShapeDtypeStruct(
+                shape=emb_spec.shape,
+                dtype=emb_spec.dtype,
+                sharding=emb_spec.sharding,
+            )
         return params
 
     def constant_names(self) -> set[str]:
@@ -710,8 +847,8 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         """The state tensors of each attention layer, or None if any is unknown.
 
         A paged attention layer holds one KV cache; a recurrent (GDN) layer holds
-        its conv and recurrent states, `[num_blocks, ...]` each and indexed by the
-        `mamba_state_indices` block of each request.
+        its conv and recurrent states, `[num_state_slots, ...]` each and indexed by
+        the `mamba_state_indices` slot of each request.
         """
         cfg = self._export_config
         act_dtype_str = tpu_lowering.dtype_name(cfg.dtype)
@@ -722,9 +859,20 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             from vllm_torchtpu.layers.adapter.attention import (
                 PallasAttentionBackend,
                 PallasAttentionBackendImpl,
+                PallasMLAttentionBackend,
+                PallasMLAttentionBackendImpl,
             )
         except Exception:
             return None
+        if any(
+            isinstance(getattr(layer, "impl", None), PallasMLAttentionBackendImpl)
+            and getattr(layer, "use_sparse", False)
+            for layer in attn_layers
+        ):
+            raise NotImplementedError(
+                "sparse MLA is not supported by export; supported: "
+                "dense MLA (e.g. DeepSeek-V2, DeepSeek-V3, Kimi-K2)"
+            )
         per_layer: list[list[api.ShapeDtypeStruct]] = []
         for layer in attn_layers:
             impl = getattr(layer, "impl", None)
@@ -748,10 +896,31 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                         )
                     ]
                 )
+            elif isinstance(impl, PallasMLAttentionBackendImpl) and not getattr(
+                layer, "use_sparse", False
+            ):
+                # MLA keeps one latent KV head of `head_size` (kv_lora_rank +
+                # qk_rope_head_dim), packed the way the MLA kernel reads it and
+                # replicated on every TP rank.
+                kv_dtype = getattr(
+                    layer, "kv_cache_quantized_dtype", None
+                ) or tpu_lowering.torch_dtype(act_dtype_str)
+                kv_shape = PallasMLAttentionBackend.get_kv_cache_shape(
+                    cfg.num_blocks, cfg.block_size, 1, layer.head_size, kv_dtype
+                )
+                per_layer.append(
+                    [
+                        api.ShapeDtypeStruct(
+                            shape=tuple(int(d) for d in kv_shape),
+                            dtype=tpu_lowering.dtype_name(kv_dtype),
+                        )
+                    ]
+                )
             elif _is_recurrent_layer(layer):
+                _check_recurrent_layer_supported(layer)
                 per_layer.append(
                     _recurrent_state_specs(
-                        layer, cfg.num_blocks, cfg.tensor_parallel_size
+                        layer, cfg.num_state_slots, cfg.tensor_parallel_size
                     )
                 )
             else:
@@ -761,7 +930,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
     def extra_user_inputs(self) -> list[tuple[str, tuple[int, ...]]]:
         """Control inputs beyond the standard six that `forward` takes.
 
-        Recurrent layers read each request's state block from
+        Recurrent layers read each request's state slot from
         `mamba_state_indices`.
         """
         if self._has_recurrent_layers():
@@ -860,22 +1029,21 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
 
                 def _call(kw: dict[str, Any]) -> Any:
                     if use_func:
-                        return torch.func.functional_call(
-                            backbone, call_weights, args=(), kwargs=kw
-                        )
+                        with _weights_bound_in_place(backbone, call_weights):
+                            return torch.func.functional_call(
+                                backbone, call_weights, args=(), kwargs=kw
+                            )
                     return backbone(**kw)
 
-                try:
-                    out = _call(
-                        {
-                            "input_ids": input_ids,
-                            "positions": positions,
-                            "kv_caches": working_kvs,
-                            "attn_metadata": forward_metadata,
-                        }
+                out = _call(
+                    _backbone_kwargs(
+                        backbone,
+                        input_ids=input_ids,
+                        positions=positions,
+                        kv_caches=working_kvs,
+                        attn_metadata=forward_metadata,
                     )
-                except TypeError:
-                    out = _call({"input_ids": input_ids, "positions": positions})
+                )
             finally:
                 if prev_do_not_compile is not None:
                     backbone.do_not_compile = prev_do_not_compile

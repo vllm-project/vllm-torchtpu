@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# Forked from vllm_torchtpu/kernels/gdn/v3/projection_scale.py.
+# Upstream V3 changes ported by hand through #1422.
+# This copy is owned by the PCP workstream and must not import from
+# kernels/gdn/v3. Upstream V3 changes are not picked up automatically;
+# see README.md in this directory.
 """FP8 QKVZ scale layouts shared by the Torch bridge and PCP kernel."""
 
 import math

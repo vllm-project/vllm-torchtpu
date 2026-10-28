@@ -394,6 +394,25 @@ def _extra_user_inputs(
     return list(extra_fn()) if callable(extra_fn) else []
 
 
+def _recurrent_serving_config(model: api.ExportableTextOnlyLLM) -> dict[str, int]:
+    """`num_state_slots` for a model with recurrent state, else nothing.
+
+    The runtime tells a recurrent state pool (`[num_state_slots, ...]`) from a
+    paged KV pool (`[num_blocks, ...]`) by its leading dimension, so the two must
+    differ.
+    """
+    if not any(n == "mamba_state_indices" for n, _ in _extra_user_inputs(model)):
+        return {}
+    cfg = model.export_config
+    if cfg.num_state_slots == cfg.num_blocks:
+        raise ValueError(
+            f"num_blocks ({cfg.num_blocks}) equals num_state_slots (max_num_seqs + 1), "
+            "so the runtime could not tell KV pools from recurrent state pools; pass "
+            "another --num-blocks"
+        )
+    return {"num_state_slots": cfg.num_state_slots}
+
+
 def _main_args_read(mlir_text: str) -> set[int]:
     """Indices of the `@main` arguments that its body reads."""
     header = re.search(r"func\.func public @main\((.*)\)[^\n]*\{\n", mlir_text)
@@ -584,9 +603,8 @@ def _export_text_only_llm_functions(
         }
 
     logits_variants: dict[str, Any] = {}
-    sample_tokens_variants: dict[str, Any] = {}
-    stochastic_variants: dict[str, Any] = {}
-    penalized_variants: dict[str, Any] = {}
+    # Sampler function -> request bucket -> variant, as export_samplers names them.
+    sampler_variants: dict[str, dict[str, Any]] = {}
 
     lm_head_struct = lowered[lm_head_name]
 
@@ -654,16 +672,13 @@ def _export_text_only_llm_functions(
             cfg.max_model_len,
             subdir=subdir,
         )
-        sample_tokens_variants[str(req_size)] = samplers["sample_tokens"]
-        stochastic_variants[str(req_size)] = samplers["sample_tokens_stochastic"]
-        penalized_variants[str(req_size)] = samplers["sample_tokens_penalized"]
+        for function, variant in samplers.items():
+            sampler_variants.setdefault(function, {})[str(req_size)] = variant
 
     return {
         "forward": forward_variants,
         "compute_logits": logits_variants,
-        "sample_tokens": sample_tokens_variants,
-        "sample_tokens_stochastic": stochastic_variants,
-        "sample_tokens_penalized": penalized_variants,
+        **sampler_variants,
     }
 
 
@@ -672,8 +687,10 @@ def _emit_model_companion_files(
 ) -> dict[str, Any]:
     """Copies companion files into the artifact; returns their `serving_config` entries.
 
-    `tokenizer.json` and `generation_config.json` are copied when the checkpoint has
-    them and declared in `serving_config` by path; the runtime reads no other file.
+    `tokenizer.json` (required unless a byte tokenizer is emitted),
+    `generation_config.json`, and the chat template (as `chat_template.jinja`), the
+    latter two when the checkpoint has them, are written and declared in
+    `serving_config` by path; the runtime reads no other file.
     """
     serving_config: dict[str, Any] = {}
 
@@ -712,6 +729,12 @@ def _emit_model_companion_files(
         serving_config["tokenizer_config"] = {
             "source": {"TokenizerPath": {"path": "tokenizer.json"}}
         }
+    else:
+        # The serving runtime reads the tokenizer only from this record.
+        raise FileNotFoundError(
+            f"no tokenizer.json in the checkpoint directory "
+            f"{cfg.hf_checkpoint_dir!r}; the serving artifact requires one"
+        )
 
     if cfg.hf_checkpoint_dir and os.path.isdir(cfg.hf_checkpoint_dir):
         src_gen = os.path.join(cfg.hf_checkpoint_dir, "generation_config.json")
@@ -720,7 +743,35 @@ def _emit_model_companion_files(
             shutil.copyfile(src_gen, dst_gen)
             serving_config["generation_config"] = {"path": "generation_config.json"}
 
+        chat_template = _hf_chat_template(cfg.hf_checkpoint_dir)
+        if chat_template is not None:
+            with open(os.path.join(output_dir, "chat_template.jinja"), "w") as f:
+                f.write(chat_template)
+            serving_config["chat_template"] = {"path": "chat_template.jinja"}
+
     return serving_config
+
+
+def _hf_chat_template(hf_checkpoint_dir: str) -> str | None:
+    """The checkpoint's chat template, as HuggingFace finds it.
+
+    `chat_template.jinja` takes precedence over `tokenizer_config.json`'s
+    `chat_template`, which is a template or a list of named templates (`default` is
+    the one chat requests use).
+    """
+    jinja_path = os.path.join(hf_checkpoint_dir, "chat_template.jinja")
+    if os.path.isfile(jinja_path):
+        with open(jinja_path) as f:
+            return f.read()
+    config_path = os.path.join(hf_checkpoint_dir, "tokenizer_config.json")
+    if not os.path.isfile(config_path):
+        return None
+    with open(config_path) as f:
+        template = json.load(f).get("chat_template")
+    if isinstance(template, list):
+        named = {t.get("name"): t.get("template") for t in template}
+        template = named.get("default")
+    return template if isinstance(template, str) else None
 
 
 @trace("export.export")
@@ -793,12 +844,15 @@ def export(
         "max_cu_seqs": cfg.max_cu_seqs,
         "block_size": cfg.block_size,
         "num_blocks": cfg.num_blocks,
+        **_recurrent_serving_config(model),
         "max_model_len": cfg.max_model_len,
         "tensor_parallel_size": tp_size,
         "pipeline_parallel_size": pp_size,
         "data_parallel_size": dp_size,
         **_emit_model_companion_files(cfg, output_dir),
     }
+    if cfg.speculative_config is not None:
+        serving_config["speculative_config"] = cfg.speculative_config
 
     metadata_doc: dict[str, Any] = {
         "format_version": 2,

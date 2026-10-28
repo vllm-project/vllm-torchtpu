@@ -171,6 +171,15 @@ class ServingConfigs:
     attention_scope: AttentionScope = AttentionScope.FULL
     return_lse: bool = False
     skip_kv_update: bool = False
+    mask_invalid_v: bool | None = None
+
+    def __post_init__(self):
+        if self.mask_invalid_v is None:
+            object.__setattr__(
+                self,
+                "mask_invalid_v",
+                self.kv_layout == KVLayout.SEQ_ALONG_LANE,
+            )
 
     @property
     def max_decode_bkv_p_new(self) -> int:

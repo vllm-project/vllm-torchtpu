@@ -5120,17 +5120,15 @@ class TPURaidenConnectorWorker:
             lower_gdn_state_shard_spans_sol,
             registration_source_bytes,
             sol_fa_geometry_from_manifest,
-            sol_gdn_conv_lane_bytes,
         )
 
         assert self._raiden_manifest is not None
         aliased_raw = self._raiden_manifest.binding == BINDING_ALIASED_RAW
         if aliased_raw and not self._stage3_kimi:
             # Raw transfers move physical bytes; admit only the fingerprinted
-            # tiled layout.  The whole-token QK pair-blocked conv layout is
-            # enforced downstream: the span lowering rejects any other conv
-            # region vocabulary, and the layout version rides the compared
-            # fingerprint payload.
+            # tiled layout.  The conv layout is enforced downstream: the
+            # span lowering requires whole-token conv segments, and the
+            # layout version rides the compared fingerprint payload.
             payload = self._raiden_layout_fingerprint_payload
             if not payload:
                 raise RuntimeError(
@@ -5156,13 +5154,11 @@ class TPURaidenConnectorWorker:
                 )
 
         physical_granule = 1024
-        conv_lane_bytes = None
         if _raiden_seq_on_lane_layout() and not self._stage3_kimi:
             if aliased_raw and payload.get("fa_kv_layout") != SOL_LAYOUT_TOKEN:
                 raise RuntimeError("HND GDN spans require an HND layout fingerprint")
             geometry = sol_fa_geometry_from_manifest(self._raiden_manifest)
             physical_granule = geometry.packing * geometry.page_tokens
-            conv_lane_bytes = sol_gdn_conv_lane_bytes(geometry)
 
         registrations = []
         for exact_tag, ordinal in self._stage3_state_registration_tags():
@@ -5207,7 +5203,6 @@ class TPURaidenConnectorWorker:
                     physical_granule_bytes=physical_granule,
                     num_key_heads=self._model_config_int("linear_num_key_heads", 0),
                     num_value_heads=self._model_config_int("linear_num_value_heads", 0),
-                    conv_lane_bytes=conv_lane_bytes,
                 )
             # Every admitted source byte is read; fan-out reads some of them
             # for several destinations.

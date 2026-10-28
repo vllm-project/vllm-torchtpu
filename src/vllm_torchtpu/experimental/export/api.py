@@ -82,6 +82,8 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
         hf_checkpoint_dir: Optional path to the HuggingFace checkpoint directory
             containing tokenizer.json, generation_config.json, and safetensors
             headers.
+        speculative_config: Speculative decoding the runtime runs, recorded as
+            `serving_config.speculative_config` (vLLM's field names); None for none.
     """
 
     vocab_size: int = 151936
@@ -101,6 +103,7 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
     emit_byte_tokenizer: bool = False
     hf_checkpoint_dir: str | None = None
     uses_mrope: bool = False
+    speculative_config: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.emit_byte_tokenizer and self.vocab_size > 256:
@@ -119,6 +122,15 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
     @property
     def max_cu_seqs(self) -> int:
         """Length of query_start_loc: one cumulative offset per sequence plus 1."""
+        return self.max_num_seqs + 1
+
+    @property
+    def num_state_slots(self) -> int:
+        """Slots of each recurrent state pool: one per sequence plus null slot 0.
+
+        A recurrent layer's state is fixed-size per sequence, so its pool is sized
+        by `max_num_seqs`, not by the paged KV `num_blocks`.
+        """
         return self.max_num_seqs + 1
 
 

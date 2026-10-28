@@ -19,9 +19,12 @@ import torch
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
+from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config.speculative import SpeculativeConfig
+
+logger = init_logger(__name__)
 
 # Placeholder token ID for rejected tokens
 PLACEHOLDER_TOKEN_ID = -1
@@ -69,6 +72,7 @@ class RejectionSampler:
         topk_candidates: int = 0,
         target_argmax: torch.Tensor | None = None,
         apply_topk_topp: bool = True,
+        draft_probs: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.forward(
             draft_token_ids=draft_token_ids,
@@ -87,6 +91,7 @@ class RejectionSampler:
             topk_candidates=topk_candidates,
             target_argmax=target_argmax,
             apply_topk_topp=apply_topk_topp,
+            draft_probs=draft_probs,
         )
 
     def forward(
@@ -107,6 +112,7 @@ class RejectionSampler:
         topk_candidates: int = 0,
         target_argmax: torch.Tensor | None = None,
         apply_topk_topp: bool = True,
+        draft_probs: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Performs rejection sampling for speculative decoding.
 
@@ -136,6 +142,10 @@ class RejectionSampler:
             path. The caller passes False only when no request sets top-k or
             top-p, where the two 31-step bisections over the vocabulary are
             the identity (7.5 ms per 512 rows on Flash). A separate graph.
+          draft_probs: float32 distribution each draft token was sampled
+            from (probabilistic drafting), shaped like target_logits. None
+            treats the draft as one-hot (greedy drafting). Used by the
+            non-greedy path; the greedy and synthetic decisions ignore it.
 
         Returns:
           A tensor of shape [batch_size, max_draft_tokens + 1] containing the
@@ -158,6 +168,21 @@ class RejectionSampler:
                     "Non-greedy rejection sampling requires temperatures, "
                     "top_k, top_p, accept_u, and recover_u."
                 )
+            # Checked eagerly: a mismatched q otherwise fails inside the
+            # compiled graph with an opaque tracing error, or, e.g. [rows, 1],
+            # broadcasts in p - q and returns wrong tokens.
+            if draft_probs is not None and draft_probs.shape != target_logits.shape:
+                raise ValueError(
+                    f"draft_probs shape {tuple(draft_probs.shape)} does not "
+                    f"match target_logits shape {tuple(target_logits.shape)}."
+                )
+            if draft_probs is not None and self.synthetic_mode:
+                # As upstream, the synthetic schedule decides acceptance; q
+                # only shapes the recovery distribution.
+                logger.warning_once(
+                    "Synthetic rejection sampling ignores draft_probs for the "
+                    "accept decision."
+                )
             return _random_rejection_sample_with_segment(
                 draft_token_ids,
                 target_logits,
@@ -175,6 +200,13 @@ class RejectionSampler:
                 self.synthetic_mode,
                 topk_candidates,
                 apply_topk_topp,
+                draft_probs,
+            )
+        if draft_probs is not None:
+            # As upstream, greedy verification is an argmax match; q plays no
+            # part, and computing it for an all-greedy batch is wasted work.
+            logger.warning_once(
+                "draft_probs passed to the greedy rejection path is ignored."
             )
         if self.synthetic_mode and accept_u is None:
             raise ValueError("Synthetic rejection sampling requires accept_u.")
@@ -449,8 +481,16 @@ def _random_rejection_sample_with_segment(
     synthetic_mode: bool,
     topk_candidates: int = 0,
     apply_topk_topp: bool = True,
+    draft_probs: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Vectorized non-greedy speculative decoding validation in Torch."""
+    """Vectorized non-greedy speculative decoding validation in Torch.
+
+    With `draft_probs` (the distribution q each draft token x was sampled
+    from) this is standard speculative sampling: accept iff u < p(x) / q(x),
+    recover from the residual max(0, p - q). Without it the draft is treated
+    as one-hot at x: accept iff u < p(x), recover from p with x removed.
+    Both are exact for the target distribution p.
+    """
     total_tokens = draft_token_ids.shape[0]
     batch_size = num_draft_tokens.shape[0]
     device = draft_token_ids.device
@@ -473,14 +513,25 @@ def _random_rejection_sample_with_segment(
         masked_logits = scaled_logits
     target_probs = torch.softmax(masked_logits, dim=-1)
 
-    # Accept test is the Leviathan ratio min(1, p(x) / q(x))
-    # Our draft is greedy for now, so for q: drafted token
-    # x (q(x) == 1, 0 elsewhere) and the ratio collapses to p(x).
-    # Accept iff u < p(x): torch.rand can return exactly 0.0, and u <= p(x)
-    # would then accept a token with p(x) == 0, e.g. one top-k masked out.
+    # Accept test is the Leviathan ratio min(1, p(x) / q(x)).
+    # Greedy drafting (draft_probs None) has q one-hot at the drafted token
+    # x, so the ratio collapses to p(x). Accept iff u < p(x): torch.rand can
+    # return exactly 0.0, and u <= p(x) would then accept a token with
+    # p(x) == 0, e.g. one top-k masked out. With draft_probs the same test
+    # reads u * q(x) < p(x); q(x) == 0 (a draft q could not have produced)
+    # rejects rather than divide by zero, as upstream does.
     target_token_probs = target_probs.gather(
         -1, safe_draft_token_ids.unsqueeze(-1)
     ).squeeze(-1)
+    if draft_probs is not None:
+        draft_token_probs = draft_probs.gather(
+            -1, safe_draft_token_ids.unsqueeze(-1)
+        ).squeeze(-1)
+        random_accept = (draft_token_probs > 0) & (
+            accept_u * draft_token_probs < target_token_probs
+        )
+    else:
+        random_accept = accept_u < target_token_probs
     if synthetic_mode:
         if synthetic_conditional_rates is None:
             raise ValueError(
@@ -492,25 +543,32 @@ def _random_rejection_sample_with_segment(
         accepted = torch.where(
             is_greedy,
             draft_token_ids == target_logits_argmax,
-            accept_u < target_token_probs,
+            random_accept,
         )
     accepted = accepted & valid_draft_token_ids
 
-    # On rejection, resample from the residual max(0, p - q). With q a delta at
-    # x, subtracting q only touches entry x, so the residual is just p with the
-    # drafted token zeroed out.
-    draft_token_mask = torch.nn.functional.one_hot(
-        safe_draft_token_ids, num_classes=vocab_size
-    ).to(torch.bool)
-    # Placeholder drafts have no q mass to subtract, so their recovery
-    # distribution remains the full target distribution. In particular, do
-    # not let the safe clamp above accidentally mask vocabulary token 0.
-    draft_token_mask = draft_token_mask & valid_draft_token_ids.unsqueeze(-1)
-    recovered_dist = torch.where(
-        draft_token_mask,
-        torch.tensor(0.0, dtype=target_probs.dtype, device=device),
-        target_probs,
-    )
+    # On rejection, resample from the residual max(0, p - q). Placeholder
+    # drafts have no q mass to subtract, so their recovery distribution
+    # remains the full target distribution.
+    if draft_probs is not None:
+        recovered_dist = torch.where(
+            valid_draft_token_ids.unsqueeze(-1),
+            torch.clamp(target_probs - draft_probs.to(target_probs.dtype), min=0.0),
+            target_probs,
+        )
+    else:
+        # With q a delta at x, subtracting q only touches entry x, so the
+        # residual is just p with the drafted token zeroed out. Do not let
+        # the safe clamp above accidentally mask vocabulary token 0.
+        draft_token_mask = torch.nn.functional.one_hot(
+            safe_draft_token_ids, num_classes=vocab_size
+        ).to(torch.bool)
+        draft_token_mask = draft_token_mask & valid_draft_token_ids.unsqueeze(-1)
+        recovered_dist = torch.where(
+            draft_token_mask,
+            torch.tensor(0.0, dtype=target_probs.dtype, device=device),
+            target_probs,
+        )
     recover_u = torch.clamp(
         recover_u,
         min=torch.finfo(target_probs.dtype).tiny,
