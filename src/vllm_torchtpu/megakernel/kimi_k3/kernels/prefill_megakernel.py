@@ -3150,13 +3150,17 @@ def mla_projections(hidden, weights, *, epsilon=1e-5, return_latent=False, query
     ``[T, 576]`` BF16: the normalized 512-lane latent then the 64 rope lanes
     (K3's MLA is NoPE; the rope lanes are used unrotated). It is the same on
     every rank.
+
+    ``sp_axis``: call inside a ``shard_map`` over that axis; each rank projects
+    1/axis-size of the window's rows (T must divide by the axis size) and the
+    low-rank results are all-gathered.
     """
     tokens = hidden.shape[0]
     if sp_axis is None:
         rows, local = tokens, hidden
     else:
         # The low-rank projections are not head-split: each rank projects one
-        # contiguous 1/32 of the window and the results are all-gathered.
+        # contiguous slice of the window and the results are all-gathered.
         rows = tokens // jax.lax.psum(1, sp_axis)
         local = jax.lax.dynamic_slice_in_dim(
             hidden, jax.lax.axis_index(sp_axis) * rows, rows
