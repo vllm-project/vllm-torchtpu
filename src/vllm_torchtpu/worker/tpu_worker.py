@@ -784,6 +784,11 @@ class TPUWorker(WorkerBase):
         from vllm_torchtpu import stall_watchdog
 
         stall_watchdog.arm()
+        if os.environ.get("VLLM_TPU_PY_SAMPLER_S"):
+            from vllm_torchtpu.runner import py_sampler
+
+            # Called on the step thread, which the sampler then watches.
+            py_sampler.start(self.rank)
         if envs.VLLM_TPU_CPU_PIN != "off" or envs.VLLM_TPU_CPU_PROBE_S > 0:
             from vllm_torchtpu.worker import cpu_pinning
 
