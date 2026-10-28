@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .hooks import is_suppressed, suppressed
+
 _DRIVER_EXPORTS = frozenset(
     {
         "MegakernelDriver",
@@ -128,6 +130,7 @@ __all__ = [
     "extract_ecopy_layer",
     "find_backbone",
     "get_routed_experts",
+    "is_suppressed",
     "load_vllm_weights",
     "make_typed_step_wrapper",
     "maybe_create",
@@ -135,4 +138,5 @@ __all__ = [
     "reshard_experts_ep_to_tp_local",
     "reshard_layer_experts_ep_to_tp",
     "sharded_jax_callable",
+    "suppressed",
 ]

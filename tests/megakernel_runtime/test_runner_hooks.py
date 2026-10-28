@@ -127,3 +127,137 @@ def test_get_pallas_mesh_fn_is_none_without_torch_tpu(
 
     monkeypatch.setitem(sys.modules, "torch_tpu", None)
     assert driver_mod._get_pallas_mesh_fn() is None
+
+
+# --- Suppression -------------------------------------------------------------
+
+
+def test_suppressed_nests_and_restores_on_error() -> None:
+    from types import SimpleNamespace
+    from unittest import mock
+
+    from vllm_torchtpu import megakernel_runtime as mkr
+
+    runner = SimpleNamespace()
+    assert not mkr.is_suppressed(runner) and not mkr.is_suppressed(None)
+    with mkr.suppressed(runner):
+        assert mkr.is_suppressed(runner)
+        with mkr.suppressed(runner):
+            assert mkr.is_suppressed(runner)
+        assert mkr.is_suppressed(runner)
+    assert not mkr.is_suppressed(runner)
+    with pytest.raises(RuntimeError, match="boom"), mkr.suppressed(runner):
+        raise RuntimeError("boom")
+    assert not mkr.is_suppressed(runner)
+    # Scoped to one runner; attribute-synthesizing mocks are never suppressed.
+    other = SimpleNamespace()
+    with mkr.suppressed(runner):
+        assert not mkr.is_suppressed(other)
+    assert not mkr.is_suppressed(mock.MagicMock())
+
+
+def _bare_driver(monkeypatch: pytest.MonkeyPatch, *, eligible: bool = True) -> Any:
+    """A `MegakernelDriver` with only the state `try_forward` touches."""
+    import torch
+
+    from vllm_torchtpu.megakernel import runtime as rt
+
+    drv = object.__new__(driver_mod.MegakernelDriver)
+    drv._prepared_step = None
+    drv.ab_calibrator = rt.MKABCalibrator(enabled=False, period_s=0.0)
+    drv.backbone = object()
+    calls: list[str] = []
+
+    def can_run(*_a: Any, **_k: Any) -> bool:
+        calls.append("can_run")
+        drv._prepared_step = ("prepared",)
+        return eligible
+
+    def run(input_ids: Any, positions: Any, **_k: Any) -> Any:
+        calls.append("run")
+        return torch.full((int(positions.shape[-1]), 4), 7.0)
+
+    monkeypatch.setattr(drv, "can_run", can_run, raising=False)
+    monkeypatch.setattr(
+        driver_mod.MegakernelDriver,
+        "__call__",
+        lambda self, *a, **k: run(*a, **k),
+    )
+    drv.calls = calls
+    return drv
+
+
+def test_try_forward_never_engages_while_suppressed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_torchtpu import megakernel_runtime as mkr
+
+    drv = _bare_driver(monkeypatch)
+    runner = SimpleNamespace()
+    ids = torch.zeros((2,), dtype=torch.int32)
+    pos = torch.zeros((2,), dtype=torch.int32)
+    with mkr.suppressed(runner):
+        drv._prepared_step = ("stale",)
+        assert drv.try_forward(runner, ids, pos) == (False, None)
+        assert drv._prepared_step is None
+    assert drv.calls == []
+    hit, out = drv.try_forward(runner, ids, pos)
+    assert hit and tuple(out.shape) == (2, 4)
+    assert drv.calls == ["can_run", "run"]
+
+
+def test_runner_dummy_run_forward_is_suppressed() -> None:
+    """`TPUModelRunner._dummy_run` calls `forward_model` inside `suppressed(self)`."""
+    import ast
+    from pathlib import Path
+
+    import vllm_torchtpu
+
+    src = (Path(vllm_torchtpu.__file__).parent / "runner" / "tpu_runner.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(src)
+    fn = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_dummy_run"
+    )
+
+    def _is_suppress(item: ast.withitem) -> bool:
+        call = item.context_expr
+        return (
+            isinstance(call, ast.Call)
+            and ast.unparse(call.func) == "megakernel_runtime.suppressed"
+            and [ast.unparse(a) for a in call.args] == ["self"]
+        )
+
+    def _calls_forward(node: ast.AST) -> bool:
+        return any(
+            isinstance(c, ast.Call) and ast.unparse(c.func) == "self.forward_model"
+            for c in ast.walk(node)
+        )
+
+    fwd_calls = [
+        c
+        for c in ast.walk(fn)
+        if isinstance(c, ast.Call) and ast.unparse(c.func) == "self.forward_model"
+    ]
+    assert fwd_calls, "_dummy_run no longer calls self.forward_model"
+    guarded = [
+        w
+        for w in ast.walk(fn)
+        if isinstance(w, ast.With)
+        and any(_is_suppress(i) for i in w.items)
+        and _calls_forward(w)
+    ]
+    n_guarded = sum(
+        1
+        for w in guarded
+        for c in ast.walk(w)
+        if isinstance(c, ast.Call) and ast.unparse(c.func) == "self.forward_model"
+    )
+    assert n_guarded == len(fwd_calls)

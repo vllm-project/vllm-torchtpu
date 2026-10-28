@@ -93,7 +93,7 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 
-from vllm_torchtpu import envs, utils
+from vllm_torchtpu import envs, megakernel_runtime, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
@@ -5271,8 +5271,6 @@ class TPUModelRunner(GPUModelRunner):
 
         # Ensure attention custom ops exist before any compile/inference path,
         self._initialize_pallas_kernels()
-        from vllm_torchtpu import megakernel_runtime
-
         self._megakernel = megakernel_runtime.maybe_create(self)
 
         from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
@@ -5648,6 +5646,9 @@ class TPUModelRunner(GPUModelRunner):
                 vllm_config=self.vllm_config,
                 kv_cache_bundle=self._kv_cache_bundle,
             ),
+            # Dummy, precompile and profile forwards always run (and so
+            # compile) the stock model, even where the megakernel would serve.
+            megakernel_runtime.suppressed(self),
         ):
             if self.supports_mm_inputs and self._pp_is_first:
                 input_ids, inputs_embeds = self._get_model_inputs(input_ids, None)
