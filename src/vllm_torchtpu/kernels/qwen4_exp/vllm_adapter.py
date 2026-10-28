@@ -28,17 +28,11 @@ from vllm_torchtpu.kernels.qwen4_exp.hc_resources import HcHardware
 
 def current_hc_hardware() -> HcHardware | None:
     """Read layout only after worker TPU initialization; never claim a device."""
-    module = getattr(torch, "tpu", None)
-    if module is None or not module.is_initialized():
+    # torch_tpu registers this public module dynamically.
+    # pyrefly: ignore[missing-attribute]
+    if not torch.tpu.is_initialized() or not pltpu.is_tpu_device():
         return None
-    try:
-        info = pltpu.get_tpu_info()
-    except ValueError as error:
-        # Pinned JAX reports an unrecognized device kind with this diagnostic.
-        if not str(error).startswith("Unsupported TPU device kind: "):
-            raise
-        return None
-    return HcHardware.from_tpu_info(info)
+    return HcHardware.from_tpu_info(pltpu.get_tpu_info())
 
 
 def _hardware_tag(hardware: HcHardware | None) -> str:
