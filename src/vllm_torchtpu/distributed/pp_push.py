@@ -54,6 +54,13 @@ creates its own rings, the engine its broadcast ring and every worker its
 reply ring, so the widening is installed in the engine process and, through
 ``widen_message_rings``, in every worker process; the ring size is the
 widest any pipeline in the process asked for.
+
+With ``TPU_PP_HANDOFF=ring`` the stages hand each forward on point to point
+as soon as it is done (``pp_ring``), so no step waits for later ones and
+the engine sends no pushes or settles. The engine keeps vLLM's ``stages``
+steps in flight, and the rings are widened as for the wave.
+``patch_executor_for_pp_handoff`` installs the engine side the flag
+selects.
 """
 
 import contextlib
@@ -268,6 +275,55 @@ def widen_message_rings(vllm_config: Any) -> None:
     stages = int(vllm_config.parallel_config.pipeline_parallel_size)
     if stages > 1:
         _widen_rpc_ring(stages)
+
+
+def ring_handoff() -> bool:
+    """Whether pipeline stages hand forwards on point to point (``pp_ring``)
+    rather than with the collective wave (``pp_wave``)."""
+    from vllm_torchtpu import envs
+
+    return envs.TPU_PP_HANDOFF == "ring"
+
+
+def patch_executor_for_pp_handoff(vllm_config: Any) -> None:
+    """Install the engine side of the hand-off ``TPU_PP_HANDOFF`` selects."""
+    if ring_handoff():
+        patch_executor_for_pp_ring(vllm_config)
+    else:
+        patch_executor_for_pp_wave(vllm_config)
+
+
+def patch_executor_for_pp_ring(vllm_config: Any) -> None:
+    """Install the ring hand-off's engine side: the wider ring buffers, and
+    draft tokens taken without asking the workers.
+
+    Does nothing without a pipeline; safe to call more than once per
+    process.
+    """
+    if vllm_config is None:
+        return
+    stages = int(vllm_config.parallel_config.pipeline_parallel_size)
+    if stages <= 1:
+        return
+    _widen_rpc_ring(stages)
+    from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+
+    if getattr(MultiprocExecutor, "_tpu_pp_ring_patch", False):
+        return
+
+    def take_draft_token_ids(self):
+        # A pipeline admits prefill-only MTP alone (pp_validation): its
+        # drafts exist to fill the draft layer's KV, and no step consumes
+        # them. The engine asks with a blocking call right after dispatching
+        # a step, which the last stage answers only once that step is done.
+        return None
+
+    MultiprocExecutor.take_draft_token_ids = take_draft_token_ids
+    MultiprocExecutor._tpu_pp_ring_patch = True
+    logger.info(
+        "PP ring: engine side installed, message ring %d chunks",
+        _ring_chunks_needed,
+    )
 
 
 def patch_executor_for_pp_wave(vllm_config: Any) -> None:

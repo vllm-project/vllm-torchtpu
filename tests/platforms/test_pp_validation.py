@@ -261,3 +261,30 @@ def test_raiden_accepts_stages_of_sparse_attention_layers(monkeypatch):
     validate_pipeline_parallel_config(
         _config(pp=8, kv_transfer=RAIDEN, layer_types=["deepseek_sparse_attention"] * 8)
     )
+
+
+@pytest.fixture
+def ring(monkeypatch):
+    monkeypatch.setenv("TPU_PP_HANDOFF", "ring")
+    monkeypatch.delenv("TPU_PP_RING_DEPTH", raising=False)
+
+
+def test_the_ring_keeps_the_rejections(ring):
+    with pytest.raises(NotImplementedError, match="tensor-parallel-size 1"):
+        validate_pipeline_parallel_config(_config(pp=2, tp=4))
+    with pytest.raises(NotImplementedError, match="async scheduling"):
+        validate_pipeline_parallel_config(_config(pp=2, async_scheduling=True))
+
+
+def test_the_ring_accepts_context_parallel_stages_and_raiden(ring, stage_meshes):
+    validate_pipeline_parallel_config(_config(pp=4, pcp=8, kv_transfer=RAIDEN))
+    validate_pipeline_parallel_config(_config(pp=8, kv_transfer=OFFLOAD))
+
+
+def test_the_ring_needs_a_depth_of_at_least_one(monkeypatch, ring):
+    monkeypatch.setenv("TPU_PP_RING_DEPTH", "0")
+    with pytest.raises(ValueError, match="TPU_PP_RING_DEPTH must be at least 1"):
+        validate_pipeline_parallel_config(_config(pp=2))
+    # the wave has no depth to check
+    monkeypatch.setenv("TPU_PP_HANDOFF", "wave")
+    validate_pipeline_parallel_config(_config(pp=2))

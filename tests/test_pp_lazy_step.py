@@ -556,6 +556,19 @@ def test_the_patch_needs_the_flag_and_more_than_two_stages(monkeypatch):
     assert not hasattr(FakeCore, "_tpu_pp_lazy_patch")
 
 
+def test_the_ring_hand_off_never_installs_the_lazy_loop(monkeypatch):
+    from vllm.v1.engine import core as engine_core
+
+    class FakeCore:
+        pass
+
+    monkeypatch.setattr(engine_core, "EngineCore", FakeCore)
+    monkeypatch.setattr(pp_lazy_step.envs, "TPU_PP_LAZY_PUSH", True)
+    monkeypatch.setenv("TPU_PP_HANDOFF", "ring")
+    pp_lazy_step.patch_engine_core_for_lazy_push(_config(4))
+    assert not hasattr(FakeCore, "_tpu_pp_lazy_patch")
+
+
 def test_lazy_push_is_off_in_setups_it_does_not_cover(monkeypatch):
     executor = _executor(monkeypatch)
     core = SimpleNamespace(
