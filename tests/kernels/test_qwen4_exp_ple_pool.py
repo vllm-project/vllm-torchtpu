@@ -13,8 +13,11 @@
 # limitations under the License.
 """Pooled state contracts: exact continuation and preservation of other owners."""
 
+import functools
+
 import jax
 import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 import pytest
 
@@ -551,3 +554,209 @@ def test_pooled_ple_history_matches_token_reference(fp8, kernel_size):
         else:
             np.testing.assert_array_equal(after, before)
         history = next_history
+
+
+def _history_reference(x, weight, history, starts, slots, initial, dilation):
+    """Dense per-token causal oracle independent of gather/scatter lowering."""
+    output = np.zeros_like(x)
+    updated = history.copy()
+    state_len = history.shape[1]
+    for request, (start, stop) in enumerate(zip(starts[:-1], starts[1:])):
+        slot = slots[request]
+        if slot < 0 or stop == start:
+            continue
+        prefix = history[slot] if initial[request] else np.zeros_like(history[slot])
+        for token in range(start, stop):
+            accum = np.zeros(x.shape[1], np.float32)
+            for tap in range(weight.shape[1]):
+                position = token - start - state_len + tap * dilation
+                value = (
+                    x[start + position]
+                    if position >= 0
+                    else prefix[state_len + position]
+                )
+                accum = accum + value.astype(np.float32) * weight[:, tap].astype(
+                    np.float32
+                )
+            pre = accum.astype(ml_dtypes.bfloat16).astype(np.float32)
+            output[token] = (pre / (1 + np.exp(-pre))).astype(ml_dtypes.bfloat16)
+        if state_len:
+            updated[slot] = np.concatenate((prefix, x[start:stop]))[-state_len:]
+    return output, updated
+
+
+def _history_inputs(tokens, kernel_size, initial):
+    rng = np.random.default_rng(1966)
+    requests, channels, dilation = 6, 8, 3
+    state_len = (kernel_size - 1) * dilation
+    starts = [0, 80, 81, 83, 85, 96, 96] if tokens == 128 else [0, 1, 1, 3, 3, 5, 5]
+    if tokens == 0:
+        starts = [0] * (requests + 1)
+    x = rng.normal(0, 0.2, (tokens, channels)).astype(ml_dtypes.bfloat16)
+    weight = rng.normal(0, 0.2, (channels, kernel_size)).astype(ml_dtypes.bfloat16)
+    history = rng.normal(0, 0.2, (requests, state_len, channels)).astype(
+        ml_dtypes.bfloat16
+    )
+    slots = np.asarray([0, 1, -1, 3, 4, -1], np.int32)
+    return (
+        x,
+        weight,
+        history,
+        np.asarray(starts, np.int32),
+        slots,
+        np.full(requests, initial),
+        dilation,
+    )
+
+
+@pytest.mark.parametrize("request_owned", [False, True])
+@pytest.mark.parametrize("initial", [False, True])
+@pytest.mark.parametrize("tokens,kernel_size", [(128, 4), (8, 4), (128, 1), (0, 4)])
+def test_history_gather_matches_dense_causal_reference(
+    request_owned, initial, tokens, kernel_size
+):
+    x, weight, history, starts, slots, initial, dilation = _history_inputs(
+        tokens, kernel_size, initial
+    )
+    if not request_owned:
+        slots = np.asarray([4, 1, -1, 0, 5, -1], np.int32)
+    expected, expected_history = _history_reference(
+        x, weight, history, starts, slots, initial, dilation
+    )
+    run = jax.jit(
+        functools.partial(
+            short_conv, dilation=dilation, request_owned_history=request_owned
+        )
+    )
+    output, updated = run(
+        *(jnp.asarray(a) for a in (x, weight, history, starts, slots, initial))
+    )
+    np.testing.assert_array_equal(np.asarray(output), expected)
+    if request_owned:
+        active = (slots >= 0) & (np.diff(starts) > 0)
+        np.testing.assert_array_equal(
+            np.asarray(updated)[active], expected_history[slots[active]]
+        )
+    else:
+        np.testing.assert_array_equal(np.asarray(updated), expected_history)
+    np.testing.assert_array_equal(
+        history, _history_inputs(tokens, kernel_size, bool(initial[0]))[2]
+    )
+
+
+@pytest.mark.parametrize("request_owned", [False, True])
+def test_history_with_no_requests_leaves_history_unchanged(request_owned):
+    x = jnp.ones((8, 4), jnp.bfloat16)
+    history = jnp.ones((0, 9, 4), jnp.bfloat16)
+    output, updated = short_conv(
+        x,
+        jnp.ones((4, 4), jnp.bfloat16),
+        history,
+        jnp.asarray([0]),
+        jnp.empty((0,), jnp.int32),
+        jnp.empty((0,), bool),
+        dilation=3,
+        request_owned_history=request_owned,
+    )
+    np.testing.assert_array_equal(output, np.zeros((8, 4)))
+    assert updated is history
+
+
+@pytest.mark.parametrize("request_owned", [False, True])
+def test_request_owned_history_gathers_scale_with_request_boundary(request_owned):
+    """Assert per-request and per-token history gather shapes."""
+    args = _history_inputs(128, 4, True)
+    graph = jax.make_jaxpr(
+        functools.partial(short_conv, dilation=3, request_owned_history=request_owned)
+    )(*(jax.ShapeDtypeStruct(a.shape, a.dtype) for a in args[:-1])).jaxpr
+    history = graph.invars[2]
+    gathered_shapes = [
+        eq.outvars[0].aval.shape
+        for eq in graph.eqns
+        if eq.primitive.name == "gather" and eq.invars[0] is history
+    ]
+    if request_owned:
+        assert gathered_shapes == [(6, 9, 8), (6, 6, 8), (6, 3, 8), (6, 9, 8)]
+        assert (128, 8) not in gathered_shapes
+    else:
+        assert gathered_shapes == [(128, 8)] * 4 + [(6, 9, 8)]
+
+
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("initial", [False, True])
+@pytest.mark.parametrize("kernel_size", [1, 4])
+def test_optimized_history_preserves_complete_pool(
+    monkeypatch, fp8, initial, kernel_size
+):
+    """Check pooled history and every pool byte with CPU storage fixtures.
+
+    Byte-backed CPU storage fixtures replace region DMA and typed IO.
+    """
+    from vllm_torchtpu.kernels.qwen4_exp import pool as pool_module
+
+    def read(owner, ids, *, elements, dtype):
+        pages = np.asarray(owner).view(np.uint8).reshape(owner.shape[0], -1)
+        rows = [
+            pages[max(int(i), 0), : elements * 2].copy().view(ml_dtypes.bfloat16)
+            for i in ids
+        ]
+        return jnp.asarray(np.stack(rows), dtype)
+
+    def write(owner, values, ids):
+        pages = np.asarray(owner).view(np.uint8).copy()
+        token_bytes = np.prod(owner.shape[2:]) * owner.dtype.itemsize
+        used = (values.shape[1] * 2 + token_bytes - 1) // token_bytes * token_bytes
+        for index, value in zip(np.asarray(ids), np.asarray(values)):
+            if index > 0:
+                page = pages[index].reshape(-1)
+                page[:used] = 0
+                payload = np.ascontiguousarray(value).view(np.uint8).reshape(-1)
+                page[: payload.size] = payload
+        return jnp.asarray(pages.view(np.dtype(owner.dtype)).reshape(owner.shape))
+
+    monkeypatch.setattr(pool_module, "read_region", read)
+    monkeypatch.setattr(pool_module, "write_region", write)
+    rng = np.random.default_rng(1966)
+    x, weight, history, starts, slots, initial, dilation = _history_inputs(
+        128, kernel_size, initial
+    )
+    carrier = jnp.float8_e4m3fn if fp8 else jnp.bfloat16
+    shape = (9, 16, 1, 4 if fp8 else 2, 128)
+    host = (
+        rng.integers(
+            0, 256, size=np.prod(shape) * np.dtype(carrier).itemsize, dtype=np.uint8
+        )
+        .view(np.dtype(carrier))
+        .reshape(shape)
+    )
+    ids = np.asarray([3, 5, 0, 7, 2, -1], np.int32)
+    history_slots = np.where(ids > 0, np.arange(len(ids)), -1).astype(np.int32)
+    expected_output, expected_history = _history_reference(
+        x, weight, history, starts, history_slots, initial, dilation
+    )
+    owner = jnp.asarray(host)
+    if history.shape[1]:
+        owner = write(owner, jnp.asarray(history.reshape(len(ids), -1)), ids)
+    before = np.asarray(owner).view(np.uint8).copy()
+    active = (ids > 0) & (np.diff(starts) > 0)
+    expected_pool = before.copy()
+    if history.shape[1]:
+        for request in np.flatnonzero(active):
+            payload = (
+                np.ascontiguousarray(expected_history[request])
+                .view(np.uint8)
+                .reshape(-1)
+            )
+            expected_pool[ids[request]].reshape(-1)[: payload.size] = payload
+    actual_pool, actual = pooled_short_conv(
+        jnp.asarray(x),
+        jnp.asarray(weight),
+        owner,
+        jnp.asarray(starts),
+        jnp.asarray(ids),
+        jnp.asarray(initial),
+        dilation=dilation,
+        state_len=history.shape[1],
+    )
+    np.testing.assert_array_equal(np.asarray(actual), expected_output)
+    np.testing.assert_array_equal(np.asarray(actual_pool).view(np.uint8), expected_pool)

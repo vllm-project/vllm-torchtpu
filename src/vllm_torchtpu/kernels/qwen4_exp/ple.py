@@ -110,11 +110,10 @@ def short_conv(
     """Configured dilated convolution with BF16 history [slots,state_len,C].
 
     Starts and slot indices are int32. The step metadata builder owns
-    monotone starts in [0,T] and unique in-range slots; -1 denotes padded
-    requests. Empty requests leave their slots untouched. Scratch is
-    O(T*C + R*state_len*C), never R times the largest request length. History stores
-    normalized gated values, not convolution results. Output is already
-    SiLU-activated and rounded to BF16.
+    monotone starts beginning at zero in [0,T] and unique in-range slots;
+    -1 denotes padded requests. Empty requests leave their slots untouched.
+    History stores normalized gated values, not convolution results. Output is
+    already SiLU-activated and rounded to BF16.
 
     Request-owned history uses identity slots for active requests. Its caller
     masks idle writes, so updated rows can be returned without a slot scatter.
@@ -136,14 +135,40 @@ def short_conv(
         distance = state_len - tap * dilation
         position = relative - distance
         # A one-tap convolution has no historical state and only distance 0.
-        past = (
-            history[safe_slots[req], jnp.clip(position + state_len, 0, state_len - 1)]
-            if state_len
-            else jnp.zeros_like(x)
-        )
-        past = jnp.where(has_initial_states[req, None], past, 0)
         current = x[jnp.clip(t - distance, 0, token_count - 1)]
-        value = jnp.where((position >= 0)[:, None], current, past)
+        if request_owned_history and distance == 0:
+            # Packed positions are nonnegative, so distance 0 reads no history.
+            value = current
+        elif (
+            request_owned_history
+            and state_len
+            and distance > 0
+            and requests * distance < token_count
+        ):
+            # History supplies rows with relative < distance; this gather has
+            # O(R*distance*C) elements. Inactive scatter destinations are out of
+            # bounds and are dropped.
+            offsets = jnp.arange(distance, dtype=jnp.int32)
+            past = history[safe_slots[:, None], state_len - distance + offsets]
+            past = jnp.where(has_initial_states[:, None, None], past, 0)
+            destinations = starts[:-1, None] + offsets
+            lengths = starts[1:] - starts[:-1]
+            active = (offsets < lengths[:, None]) & (slots[:, None] >= 0)
+            destinations = jnp.where(active, destinations, token_count)
+            value = jnp.where((position >= 0)[:, None], current, 0)
+            value = value.at[destinations.reshape(-1)].set(
+                past.reshape(-1, channels), mode="drop"
+            )
+        else:
+            past = (
+                history[
+                    safe_slots[req], jnp.clip(position + state_len, 0, state_len - 1)
+                ]
+                if state_len
+                else jnp.zeros_like(x)
+            )
+            past = jnp.where(has_initial_states[req, None], past, 0)
+            value = jnp.where((position >= 0)[:, None], current, past)
         accum = accum + value.astype(jnp.float32) * weight[:, tap].astype(jnp.float32)
     pre = _bf16(accum)
     output = _bf16(jax.nn.silu(pre.astype(jnp.float32)))
