@@ -29,7 +29,7 @@ from vllm_torchtpu.layers.adapter import moe_tp_decode
 
 # Steps above this many rows (prefill buckets on the TP path) keep XLA's
 # all-reduce; the kernel holds the whole [rows, hidden] partial in VMEM.
-MAX_ROWS = 128
+MAX_ROWS = 96
 
 _STATE: dict = {}
 

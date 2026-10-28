@@ -659,7 +659,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY", default=False
     ),
     # Sum the decoder layers' TP partial outputs (GDN out_proj, QSA o_proj) on
-    # the Pallas reduce-scatter + all-gather for steps of at most 128 rows
+    # the Pallas reduce-scatter + all-gather for steps of at most 96 rows
     # instead of XLA's all-reduce (latency-bound at decode sizes). Not
     # bit-identical: each rank's f32 column sum is rounded once to bf16.
     "VLLM_TPU_DECODE_PALLAS_ALL_REDUCE": env_bool(
