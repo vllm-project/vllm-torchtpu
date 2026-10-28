@@ -1176,7 +1176,10 @@ def send_small_unpack_local(
     holds the lse word row (`SEND_PAD_ROWS - 1`) to the block's end; rows
     before it stay unwritten and are never read. Partial rows past the real
     ones (padding tokens) arrive as the sender left them and are zeroed by
-    the unpack, as the row-group exchange does."""
+    the unpack, as the row-group exchange does. With
+    `TPU_DCP_MLA_SEND_SMALL_A2A_LIVE_ROWS` the copies stop at the tile row
+    holding the last real partial row (`rows` from the lse word row), so the
+    padding tokens' rows are not sent; the unpack zeroes them either way."""
     from vllm_torchtpu.kernels.experimental.small_collectives.all_to_all import (
         small_all_to_all,
     )
@@ -1184,6 +1187,9 @@ def send_small_unpack_local(
 
     block = x.shape[0] // world
     vdim = x.shape[1]
+    live = {}
+    if envs.TPU_DCP_MLA_SEND_SMALL_A2A_LIVE_ROWS:
+        live = dict(live_rows=jnp.reshape(rows, (1,)), live_row0=SEND_PAD_ROWS - 1)
     recv = small_all_to_all(
         x,
         num_cores=world,
@@ -1193,6 +1199,7 @@ def send_small_unpack_local(
         lane_axis=lane_axis,
         lane=None if lane_axis is None else jnp.reshape(lane, (1,)),
         hbm_operand=envs.TPU_SMALL_COLL_HBM_OPERAND,
+        **live,
     ).reshape(world, block, vdim)
     return _mask_unpack(recv, rows, block - SEND_PAD_ROWS)
 
@@ -1270,12 +1277,17 @@ def send_small_merge_local(
     exchange, then the unpack and `_merge_received` of its `live` (int32 [1],
     `real * local`) partial rows in the kernel's tail; rows past them are
     zero, as the incumbent merges the zeroed padding rows. Returns this
-    rank's bf16 `[T * local, V]`."""
+    rank's bf16 `[T * local, V]`. With `TPU_DCP_MLA_SEND_SMALL_A2A_LIVE_ROWS`
+    the copies stop at the tile row holding the last live partial row; the
+    merge reads no row past it."""
     from vllm_torchtpu.kernels.experimental.small_collectives.all_to_all import (
         small_all_to_all,
     )
     from vllm_torchtpu.kernels.mla.sparse.kernel import SEND_PAD_ROWS
 
+    sized = {}
+    if envs.TPU_DCP_MLA_SEND_SMALL_A2A_LIVE_ROWS:
+        sized = dict(live_rows=jnp.reshape(live, (1,)), live_row0=SEND_PAD_ROWS)
     return small_all_to_all(
         x,
         num_cores=world,
@@ -1287,6 +1299,7 @@ def send_small_merge_local(
         hbm_operand=envs.TPU_SMALL_COLL_HBM_OPERAND,
         merge_live=jnp.reshape(live, (1,)),
         merge_row=SEND_PAD_ROWS,
+        **sized,
     )
 
 

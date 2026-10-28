@@ -259,6 +259,68 @@ def test_a_wrong_rank_order_fails(merge_mesh):
     assert ok.all()
 
 
+def _run_live(mode, mesh, blocks, live):
+    """Merge mode with and without ``live_rows`` (as
+    TPU_DCP_MLA_SEND_SMALL_A2A_LIVE_ROWS passes it) in one program; per core
+    both merges [tl, V] bf16."""
+    n, _, block, _ = blocks.shape
+    tl = block - PAD
+    spec = P(AXIS)
+    sharding = NamedSharding(mesh, spec)
+    x = jax.device_put(jnp.asarray(blocks.reshape(n * n * block, V)), sharding)
+    r = jax.device_put(jnp.asarray(range(n), jnp.int32), sharding)
+    count = jnp.asarray([live], jnp.int32)
+
+    def body(x, r, count):
+        common = dict(
+            num_cores=n, axis=AXIS, row0=ROW0, rank=r, merge_live=count, merge_row=PAD
+        )
+        whole = a2a.small_all_to_all(x, **common)
+        sized = a2a.small_all_to_all(x, **common, live_rows=count, live_row0=PAD)
+        return whole, sized
+
+    fn = jax.jit(
+        jax.shard_map(
+            body,
+            mesh=mesh,
+            in_specs=(spec, spec, P()),
+            out_specs=(spec, spec),
+            check_vma=False,
+        )
+    )
+    with pytest.MonkeyPatch.context() as mp:
+        if mode == "interpret":
+            interpret = functools.partial(
+                pl.pallas_call, interpret=pltpu.InterpretParams()
+            )
+            mp.setattr(a2a.pl, "pallas_call", interpret)
+        whole, sized = fn(x, r, count)
+    return (
+        np.asarray(whole).reshape(n, tl, V),
+        np.asarray(sized).reshape(n, tl, V),
+    )
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize(
+    "tokens,live",
+    sorted(
+        set(CASES + [(16, 4), (32, 124)])
+        | {(t, p) for t in (16, 32) for p in range(0, t * LOCAL + 1, 8)}
+    ),
+)
+def test_live_rows_merge_equals_the_whole_block_merge(merge_mesh, tokens, live):
+    """With ``live_rows`` the copies end at the tile row holding the last live
+    partial row and land in the VMEM receive scratch at the same rows; the
+    merge reads no row past it, so it is bit for bit the whole-block merge.
+    Live counts at every multiple of 8 take every copy size, one tile to the
+    whole block."""
+    mode, mesh = merge_mesh
+    blocks = _send_blocks(tokens, live, seed=3 * tokens + live)
+    whole, sized = _run_live(mode, mesh, blocks, live)
+    np.testing.assert_array_equal(sized.view(np.int16), whole.view(np.int16))
+
+
 def test_rejects_shapes_without_a_merge_layout():
     x = jnp.zeros((N * (PAD + 64), V), jnp.int16)
     live = jnp.zeros((1,), jnp.int32)
