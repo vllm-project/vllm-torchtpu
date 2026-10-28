@@ -106,6 +106,8 @@ from vllm_torchtpu.distributed.kv_transfer.kv_save_nan_check import (
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorStats,
 )
+from vllm_torchtpu.distributed.pp_push import ring_handoff
+from vllm_torchtpu.distributed.pp_ring import PPRing
 from vllm_torchtpu.distributed.pp_wave import PPWave, pp_rank_flags
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
@@ -631,7 +633,7 @@ class TPUModelRunner(GPUModelRunner):
     input_ids: torch.Tensor
     empty_slot_mappings: dict[int, torch.Tensor]
     # Default for a runner built without __init__.
-    _pp_wave: PPWave | None = None
+    _pp_wave: PPWave | PPRing | None = None
     _dp_step_other_decode: bool = False
 
     @property
@@ -1099,8 +1101,8 @@ class TPUModelRunner(GPUModelRunner):
         self.mesh = self._create_mesh_for_parallelism()
         self.batch_counter = 0
 
-        # Hand-off wave over ICI; built in capture_model, where every stage
-        # reaches the same point.
+        # Hand-off between stages (TPU_PP_HANDOFF); built in capture_model,
+        # where every stage reaches the same point.
         self._pp_wave = None
         # A sparse model's shared top-k index table, when this stage's layers
         # cannot all recompute it; set at load time under a pipeline.
@@ -3676,6 +3678,35 @@ class TPUModelRunner(GPUModelRunner):
             num_chunks += 1
         return num_chunks, max_chunk_reqs
 
+    def _pp_forward_rows(self, scheduler_output: "SchedulerOutput") -> list[int]:
+        """The padded token count of each forward this step runs, in order,
+        as _prepare_inputs sizes them, without staging any tensors."""
+        planner = _get_sequence_layout_planner_for_runner(self)
+        num_reqs = self.input_batch.num_reqs
+        rows: list[int] = []
+        start_index = 0
+        while start_index < num_reqs:
+            counts = [
+                scheduler_output.num_scheduled_tokens[self.input_batch.req_ids[i]]
+                for i in range(start_index, num_reqs)
+            ]
+            if self.most_model_len is None or max(counts) > self.most_model_len:
+                chunk_reqs = self.num_reqs_max_model_len
+            else:
+                assert self.num_reqs_most_model_len is not None
+                chunk_reqs = self.num_reqs_most_model_len
+            counts = counts[:chunk_reqs]
+            rows.append(
+                planner.padded_num_tokens(
+                    runner=self,
+                    scheduler_output=scheduler_output,
+                    start_index=start_index,
+                    num_scheduled_tokens_per_req=np.array(counts, dtype=np.int32),
+                )
+            )
+            start_index += len(counts)
+        return rows
+
     def _dp_coordinated_step(
         self,
         local_num_tokens: int,
@@ -3887,6 +3918,10 @@ class TPUModelRunner(GPUModelRunner):
             local_any_decode=self._any_decode(scheduler_output),
         )
         self._dp_step_num_chunks = target_num_chunks
+        if isinstance(self._pp_wave, PPRing) and not self._pp_is_first:
+            # Post this step's receives first, so the previous stage can send
+            # while this one prepares its inputs.
+            self._pp_wave.begin_step(self._pp_forward_rows(scheduler_output))
 
         # Run the multimodal (vision) encoder. vLLM's base
         # GPUModelRunner.execute_model does this; our override must do it
@@ -6858,9 +6893,17 @@ class TPUModelRunner(GPUModelRunner):
                     f"{self._pp_topk_buffer.shape[0]} rows, fewer than the "
                     f"{self.max_num_tokens} tokens a hand-off carries"
                 )
-            self._pp_wave = PPWave(
-                self.device, self.max_num_tokens, self._pp_intermediate_template
-            )
+            if ring_handoff():
+                self._pp_wave = PPRing(
+                    self.device,
+                    self.max_num_tokens,
+                    self._pp_intermediate_template,
+                    depth=envs.TPU_PP_RING_DEPTH,
+                )
+            else:
+                self._pp_wave = PPWave(
+                    self.device, self.max_num_tokens, self._pp_intermediate_template
+                )
             self._pp_wave.warmup()
         if self.enforce_eager:
             return

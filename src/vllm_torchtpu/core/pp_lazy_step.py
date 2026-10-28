@@ -63,7 +63,7 @@ from typing import Any, cast
 import vllm.envs as vllm_envs
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.distributed.pp_push import wave_state
+from vllm_torchtpu.distributed.pp_push import ring_handoff, wave_state
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -439,13 +439,15 @@ def _lazy_push_blocker(core: Any, vllm_config: Any) -> str | None:
 
 def patch_engine_core_for_lazy_push(vllm_config: Any) -> None:
     """Have every engine core of a pipeline deeper than two stages run
-    ``LazyPushStepper`` when ``TPU_PP_LAZY_PUSH`` is set. Installed from the
-    platform's config check (in-process engines) and from the engine-core
-    process entry point; idempotent."""
+    ``LazyPushStepper`` when ``TPU_PP_LAZY_PUSH`` is set and the stages hand
+    off with the wave. Installed from the platform's config check
+    (in-process engines) and from the engine-core process entry point;
+    idempotent."""
     if (
         vllm_config is None
         or not envs.TPU_PP_LAZY_PUSH
         or vllm_config.parallel_config.pipeline_parallel_size <= 2
+        or ring_handoff()
     ):
         return
     from vllm.v1.engine.core import EngineCore

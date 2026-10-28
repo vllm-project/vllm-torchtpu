@@ -13,13 +13,18 @@
 # limitations under the License.
 """Pipeline-parallel paths of TPUModelRunner."""
 
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 
+from vllm_torchtpu.distributed.pp_ring import PPRing
+from vllm_torchtpu.distributed.pp_wave import PPWave
+from vllm_torchtpu.layers.core.sequence_layout import AllSequenceLayoutPlanner
+from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
@@ -205,3 +210,188 @@ class TestIntermediateStageSampleTokens:
         runner = _runner(execute_model_state=None, _pp_is_last=True)
 
         assert runner.sample_tokens(None) is None
+
+
+TEMPLATE = {
+    "hidden_states": ((8,), torch.bfloat16),
+    "residual": ((8,), torch.bfloat16),
+}
+
+
+class TestHandOffConstruction:
+    def _runner(self):
+        runner = SimpleNamespace(
+            _add_pipeline_chunk_buckets=lambda: None,
+            parallel_config=SimpleNamespace(pipeline_parallel_size=4),
+            _pp_wave=None,
+            _pp_intermediate_template=None,
+            _pp_topk_buffer=None,
+            max_num_tokens=64,
+            device=torch.device("cpu"),
+            enforce_eager=True,
+        )
+
+        def intermediate_tensors(num_tokens, zeros):
+            runner._pp_intermediate_template = TEMPLATE
+
+        runner._pp_intermediate_tensors = intermediate_tensors
+        return runner
+
+    @pytest.fixture
+    def built(self, monkeypatch):
+        built = []
+
+        class Fake:
+            def __init__(self, *args, **kwargs):
+                built.append((type(self).__name__, args, kwargs))
+
+            def warmup(self):
+                built.append("warmup")
+
+        monkeypatch.setattr(tpu_runner, "PPRing", type("PPRing", (Fake,), {}))
+        monkeypatch.setattr(tpu_runner, "PPWave", type("PPWave", (Fake,), {}))
+        return built
+
+    def test_the_ring_flag_builds_the_ring_with_its_depth(self, monkeypatch, built):
+        monkeypatch.setenv("TPU_PP_HANDOFF", "ring")
+        monkeypatch.setenv("TPU_PP_RING_DEPTH", "3")
+        runner = self._runner()
+
+        TPUModelRunner.capture_model(runner)
+
+        device = torch.device("cpu")
+        assert built == [("PPRing", (device, 64, TEMPLATE), {"depth": 3}), "warmup"]
+        assert type(runner._pp_wave).__name__ == "PPRing"
+
+    def test_the_default_builds_the_wave(self, monkeypatch, built):
+        monkeypatch.delenv("TPU_PP_HANDOFF", raising=False)
+        runner = self._runner()
+
+        TPUModelRunner.capture_model(runner)
+
+        device = torch.device("cpu")
+        assert built == [("PPWave", (device, 64, TEMPLATE), {}), "warmup"]
+
+
+class TestRingForwardRows:
+    def _runner(self, scheduled, *, max_reqs=8, most_model_len=None, most_reqs=None):
+        req_ids = [f"r{i}" for i in range(len(scheduled))]
+        runner = SimpleNamespace(
+            input_batch=SimpleNamespace(num_reqs=len(scheduled), req_ids=req_ids),
+            most_model_len=most_model_len,
+            num_reqs_max_model_len=max_reqs,
+            num_reqs_most_model_len=most_reqs,
+            num_tokens_paddings=[16, 32, 64, 128],
+            _dp_target_bucket=None,
+            sequence_layout_planner=AllSequenceLayoutPlanner(),
+        )
+        for name in ("_pp_forward_rows", "_count_input_chunks"):
+            setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
+        scheduler_output = SimpleNamespace(
+            num_scheduled_tokens=dict(zip(req_ids, scheduled)),
+            total_num_scheduled_tokens=sum(scheduled),
+        )
+        return runner, scheduler_output
+
+    def test_one_forward_pads_to_its_bucket(self):
+        runner, scheduler_output = self._runner([20, 5])
+        assert runner._pp_forward_rows(scheduler_output) == [32]
+
+    def test_requests_beyond_a_forward_split_like_the_chunk_count(self):
+        runner, scheduler_output = self._runner([1] * 5, max_reqs=2)
+        assert runner._pp_forward_rows(scheduler_output) == [16, 16, 16]
+        assert runner._count_input_chunks(scheduler_output)[0] == 3
+
+    def test_a_long_request_takes_the_max_model_len_split(self):
+        runner, scheduler_output = self._runner(
+            [100, 1, 1], max_reqs=2, most_model_len=8, most_reqs=4
+        )
+        # [100, 1] in max-model-len chunks of two, then [1] in a short one
+        assert runner._pp_forward_rows(scheduler_output) == [128, 16]
+        assert runner._count_input_chunks(scheduler_output)[0] == 2
+
+    def test_the_dp_bucket_raises_every_forward(self):
+        runner, scheduler_output = self._runner([20, 5])
+        runner._dp_target_bucket = 64
+        assert runner._pp_forward_rows(scheduler_output) == [64]
+
+
+class _Stop(Exception):
+    pass
+
+
+class TestRingStepPosting:
+    """execute_model posts a step's receives before preparing any forward."""
+
+    def _run(self, wave, *, first=False, tokens=37):
+        def stop():
+            raise _Stop
+
+        runner = SimpleNamespace(
+            execute_model_state=None,
+            _update_states=lambda _so: None,
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            _mtp_prefill_only=False,
+            _reorder_batch_for_rpa=lambda _so: (0, 0),
+            _count_input_chunks=lambda _so: (2, 1),
+            _dp_coordinated_step=lambda *_a, **_kw: (None, 2),
+            _pp_wave=wave,
+            _pp_is_first=first,
+            _pp_forward_rows=lambda _so: [32, 16],
+            supports_mm_inputs=False,
+            phase_based_profiler=None,
+            _is_async_drafter=False,
+            # the first call after the posting point
+            _greedy_top_tokens_this_step=stop,
+        )
+        scheduler_output = SimpleNamespace(
+            total_num_scheduled_tokens=tokens, scheduled_encoder_inputs={}
+        )
+        with patch.object(tpu_runner, "has_kv_transfer_group", return_value=False):
+            if tokens == 0:
+                return TPUModelRunner.execute_model(runner, scheduler_output)
+            with pytest.raises(_Stop):
+                TPUModelRunner.execute_model(runner, scheduler_output)
+        return None
+
+    def test_a_later_stage_posts_every_forward_of_the_step(self):
+        ring = MagicMock(spec=PPRing)
+        self._run(ring)
+        ring.begin_step.assert_called_once_with([32, 16])
+
+    def test_the_first_stage_posts_nothing(self):
+        ring = MagicMock(spec=PPRing)
+        self._run(ring, first=True)
+        ring.begin_step.assert_not_called()
+
+    def test_a_step_without_tokens_posts_nothing(self):
+        ring = MagicMock(spec=PPRing)
+        assert self._run(ring, tokens=0) is EMPTY_MODEL_RUNNER_OUTPUT
+        ring.begin_step.assert_not_called()
+
+    def test_the_wave_has_no_step_to_begin(self):
+        # The wave has no begin_step: reaching for it would raise.
+        wave = MagicMock(spec=PPWave)
+        self._run(wave)
+        assert wave.step.call_count == 1
+
+
+class TestRingPushAndSettle:
+    def test_push_and_settle_hand_nothing_on(self, monkeypatch):
+        from vllm.distributed import parallel_state
+
+        def no_transfer(*args, **kwargs):
+            raise AssertionError("the ring transferred something")
+
+        monkeypatch.setattr(torch.distributed, "isend", no_transfer)
+        monkeypatch.setattr(torch.distributed, "irecv", no_transfer)
+        monkeypatch.setattr(
+            parallel_state,
+            "get_pp_group",
+            lambda: SimpleNamespace(rank_in_group=1, world_size=4, ranks=[0, 1, 2, 3]),
+        )
+        ring = PPRing(torch.device("cpu"), 64, TEMPLATE)
+        runner = _runner(_pp_wave=ring)
+        for name in ("pp_push", "pp_settle"):
+            getattr(TPUModelRunner, name)(runner)
+        assert ring.transfers == 0 and not ring._sends
