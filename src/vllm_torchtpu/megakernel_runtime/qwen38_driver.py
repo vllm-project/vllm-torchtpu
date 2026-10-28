@@ -46,6 +46,7 @@ from .driver import (
     register_megakernel_driver,
 )
 from .exported_bridge import make_typed_step_wrapper, sharded_jax_callable
+from .operand_hold import hbm_summary
 from .qwen38_mtp_tail import MtpTailKind
 from .qwen38_segment_call import GDN_META, T_VERIFY, build_segment_call, segment_tiles
 from .qwen38_weights import head_groups, pack_segment_operands, segment_layers
