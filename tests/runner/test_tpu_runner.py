@@ -140,7 +140,8 @@ def test_pd_producer_only_builds_draft_context(producer, consumer, needed):
         vllm_config=SimpleNamespace(
             kv_transfer_config=SimpleNamespace(
                 is_kv_producer=producer, is_kv_consumer=consumer
-            )
+            ),
+            scheduler_config=SimpleNamespace(async_scheduling=False),
         ),
     )
     output = SimpleNamespace(num_scheduled_tokens={"0": 2048})

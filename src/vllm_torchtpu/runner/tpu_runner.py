@@ -3528,6 +3528,9 @@ class TPUModelRunner(GPUModelRunner):
             kv_transfer_config is not None
             and kv_transfer_config.is_kv_producer
             and not kv_transfer_config.is_kv_consumer
+            # Async scheduling substitutes the drafts proposed on the final
+            # prefill step into the next step, so it still needs them.
+            and not self.vllm_config.scheduler_config.async_scheduling
         ):
             return False
         for req_id, count in scheduler_output.num_scheduled_tokens.items():
