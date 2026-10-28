@@ -11,16 +11,82 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Exception types and shared numeric/normalization primitives for `megakernel`."""
+"""Core declarations, execution config, VMEM pool aliasing, and numeric primitives."""
 
-from . import errors, ops
+from . import (
+    decls,
+    errors,
+    exec_spec,
+    module,
+    module_options,
+    ops,
+    planner,
+    pool_alias,
+    profiles,
+    spec,
+)
 from .errors import MegakernelConfigError, MegakernelLayoutError
+from .exec_spec import DebugOptions, ExecSpec, Tiles, default_tiles
 from .ops import rup
+from .planner import encode_ecopy
+from .spec import (
+    REQUIRED,
+    ExtraInput,
+    FrozenDict,
+    HFParamDecl,
+    KVCacheDecl,
+    LayerType,
+    ModelSpec,
+    Module,
+    ModuleBinding,
+    ParamTransform,
+    RecurrentCacheDecl,
+    ResolvedModuleGeometry,
+    ScratchReq,
+    SmallField,
+    Spec,
+    StateDecl,
+    SwitchSlot,
+    VLLMAlias,
+    WeightDecl,
+)
 
 __all__ = [
+    "REQUIRED",
+    "DebugOptions",
+    "ExecSpec",
+    "ExtraInput",
+    "FrozenDict",
+    "HFParamDecl",
+    "KVCacheDecl",
+    "LayerType",
     "MegakernelConfigError",
     "MegakernelLayoutError",
+    "ModelSpec",
+    "Module",
+    "ModuleBinding",
+    "ParamTransform",
+    "RecurrentCacheDecl",
+    "ResolvedModuleGeometry",
+    "ScratchReq",
+    "SmallField",
+    "Spec",
+    "StateDecl",
+    "SwitchSlot",
+    "Tiles",
+    "VLLMAlias",
+    "WeightDecl",
+    "decls",
+    "default_tiles",
+    "encode_ecopy",
     "errors",
+    "exec_spec",
+    "module",
+    "module_options",
     "ops",
+    "planner",
+    "pool_alias",
+    "profiles",
     "rup",
+    "spec",
 ]

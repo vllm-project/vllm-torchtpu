@@ -372,9 +372,10 @@ def proj_and_save_state(
     tile_m = state_width
     tile_k = _select_tile_k(hidden_size)
 
-    # The token dimension must be an exact multiple of `tile_n`.
+    # The token dimension must be an exact multiple of `tile_n`. Every token
+    # tile streams the whole weight again, so tiles stay large.
     sublane_tile = 8
-    tile_n = min(128, pl.cdiv(num_tokens, sublane_tile) * sublane_tile)
+    tile_n = min(512, pl.cdiv(num_tokens, sublane_tile) * sublane_tile)
     padded_num_tokens = pl.cdiv(num_tokens, tile_n) * tile_n
     if padded_num_tokens != num_tokens:
         pad = padded_num_tokens - num_tokens

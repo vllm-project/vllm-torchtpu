@@ -55,6 +55,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor 
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import (
     VllmDeepseekV4Indexer,
+    static_verify_q_len,
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
@@ -369,6 +370,11 @@ class VllmDeepseekV4MLAAttention(
         # layers -- DSparkDeepseekV4ForCausalLM (DSV4 DSpark). Absent the
         # attribute a layer stays causal, so target layers are unaffected.
         non_causal = bool(getattr(self, "non_causal_multi_token_decode", False))
+        # Speculative verify windows (1 + K tokens) get the kernels' static
+        # query-length pass; the runner places them in the request
+        # distribution's middle segment. Draft layers need it too: their
+        # context-KV insert runs on the target's verify metadata.
+        verify_q_len = static_verify_q_len(vllm_config)
 
         wrapped_fn = functools.partial(
             _attention_csa if is_csa else _attention_hca,
@@ -378,6 +384,7 @@ class VllmDeepseekV4MLAAttention(
             swa_only=swa_only,
             two_caches_same_buffer=two_caches_same_buffer,
             non_causal_block=non_causal,
+            verify_q_len=verify_q_len,
         )
 
         op_type = "swa" if swa_only else ("csa" if is_csa else "hca")
@@ -388,6 +395,7 @@ class VllmDeepseekV4MLAAttention(
             f"_p{logical_page_size}"
             f"{'_aliased' if two_caches_same_buffer else ''}"
             f"{'_ncb' if non_causal else ''}"
+            f"{f'_vq{verify_q_len}' if verify_q_len else ''}"
             f"{'' if built_from_real_caches else '_prof'}"
         )
 
@@ -532,6 +540,12 @@ class VllmDeepseekV4MLAAttention(
         """Apply scaling RoPE to decoupled key states."""
         return self.kv_rope_op(kv, positions, self.mla_attn.rotary_emb.cos_sin_cache)
 
+    def _project_q(self, qr: torch.Tensor) -> torch.Tensor:
+        """Project the q latent to query heads: [num_tokens, heads, head_dim]."""
+        return self.wq_b(qr).view(
+            qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim
+        )
+
     def attention_impl(
         self,
         hidden_states: torch.Tensor,
@@ -542,9 +556,7 @@ class VllmDeepseekV4MLAAttention(
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         """Execute indexing, state compression, and kernel attention dispatch."""
-        q = self.wq_b(qr).view(
-            qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim
-        )
+        q = self._project_q(qr)
         q = self.qnorm_rope(q, positions)
         kv = self.kv_rope(kv, positions)
 

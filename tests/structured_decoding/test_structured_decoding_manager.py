@@ -343,8 +343,8 @@ class TestStructuredDecode:
         # Padded slots beyond vocab_size must be masked to -inf.
         assert torch.isneginf(out[:, vocab_size:]).all()
 
-    def test_smaller_vocab_dimension_raises_value_error(self):
-        """Logits dimension smaller than vocab_size must raise ValueError."""
+    def test_smaller_vocab_dimension_raises(self):
+        """Logits dimension smaller than vocab_size must raise AssertionError."""
         vocab_size = 64
         num_words = -(-vocab_size // 32)
         manager = make_manager(vocab_size=vocab_size)
@@ -353,12 +353,49 @@ class TestStructuredDecode:
         arange = torch.arange(32)
 
         with pytest.raises(
-            ValueError,
+            AssertionError,
             match=r"TPU logits vocab dimension must be at least vocab_size \(64\) "
             r"\(padded to hardware alignment boundary\), "
             r"but got logits\.shape\[-1\]=32",
         ):
             manager.apply_grammar_bitmask(logits, bitmask, arange)
+
+    def test_mismatched_batch_rows_raise_with_shapes(self):
+        """A bitmask with a different row count than the logits must raise."""
+        vocab_size = 64
+        num_words = -(-vocab_size // 32)
+        manager = make_manager(vocab_size=vocab_size)
+        logits = torch.randn(4, vocab_size)
+        bitmask = torch.zeros((3, num_words), dtype=torch.int32)
+        arange = torch.arange(32)
+
+        with pytest.raises(
+            AssertionError,
+            match=r"grammar_bitmask must have one row per logits row: "
+            r"logits\.shape\[0\]=4, grammar_bitmask\.shape\[0\]=3",
+        ):
+            manager.apply_grammar_bitmask(logits, bitmask, arange)
+
+    def test_compiled_mismatched_batch_rows_raise_with_shapes(self):
+        """Under fullgraph compile the caller still gets the AssertionError."""
+        vocab_size = 64
+        num_words = -(-vocab_size // 32)
+        manager = make_manager(vocab_size=vocab_size)
+        require = torch.ones((4, 1), dtype=torch.bool)
+        logits = torch.randn(4, vocab_size)
+        bitmask = torch.zeros((3, num_words), dtype=torch.int32)
+        arange = torch.arange(32)
+        torch._dynamo.reset()
+        compiled = torch.compile(
+            manager._structured_decode, backend="eager", fullgraph=True, dynamic=False
+        )
+
+        with pytest.raises(
+            AssertionError,
+            match=r"grammar_bitmask must have one row per logits row: "
+            r"logits\.shape\[0\]=4, grammar_bitmask\.shape\[0\]=3",
+        ):
+            compiled(require, bitmask, logits, arange)
 
     def test_structured_decode_with_padded_vocab(self):
         """End-to-end _structured_decode with mixed batch and hardware-padded logits."""

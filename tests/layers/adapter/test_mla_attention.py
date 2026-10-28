@@ -823,10 +823,8 @@ def test_qrep_local_view_matches_the_head_all_gather_order(monkeypatch):
         )
 
 
-def test_mla_wrapper_qrep_reshapes_group_heads_and_passes_both_views():
-    """With query replication the projection returns the group's heads. Viewing
-    them as `num_heads` would fold the extra heads into the token axis, which is
-    the `dcp_size * num_tokens` shape mismatch qrep used to crash on."""
+def _run_qrep_wrapper(rank_in_group, is_sparse=True, run_forward=True):
+    """Build (and optionally run) the MLA wrapper under query replication."""
     group_size, local_heads, num_tokens = 4, 2, 3
     wrapper = VllmMultiHeadLatentAttentionWrapper.__new__(
         VllmMultiHeadLatentAttentionWrapper
@@ -842,7 +840,7 @@ def test_mla_wrapper_qrep_reshapes_group_heads_and_passes_both_views():
     wrapper.v_head_dim = 2
     wrapper.dcp_q_replicate = True
     wrapper.dcp_group_size = group_size
-    wrapper.is_sparse = True
+    wrapper.is_sparse = is_sparse
     wrapper.indexer = None
     wrapper.skip_topk = True
     wrapper.topk_indices_buffer = torch.zeros((num_tokens, 8), dtype=torch.int32)
@@ -854,7 +852,7 @@ def test_mla_wrapper_qrep_reshapes_group_heads_and_passes_both_views():
     q_values = torch.arange(num_tokens * group_width, dtype=torch.bfloat16).view(
         num_tokens, group_width
     )
-    wrapper.q_proj = _FakeQProj(group_size, rank_in_group=2, out=q_values)
+    wrapper.q_proj = _FakeQProj(group_size, rank_in_group=rank_in_group, out=q_values)
     wrapper.kv_a_layernorm = lambda value: value
     wrapper.rotary_emb = None
     wrapper.g_proj = None
@@ -864,12 +862,22 @@ def test_mla_wrapper_qrep_reshapes_group_heads_and_passes_both_views():
     )
     wrapper.o_proj = lambda value: (value, None)
 
-    VllmMultiHeadLatentAttentionWrapper.forward(
-        wrapper,
-        positions=torch.arange(num_tokens),
-        hidden_states=torch.ones((num_tokens, 8), dtype=torch.bfloat16),
-    )
+    if run_forward:
+        VllmMultiHeadLatentAttentionWrapper.forward(
+            wrapper,
+            positions=torch.arange(num_tokens),
+            hidden_states=torch.ones((num_tokens, 8), dtype=torch.bfloat16),
+        )
 
+    return wrapper
+
+
+def test_mla_wrapper_qrep_reshapes_group_heads_and_passes_both_views():
+    """With query replication the projection returns the group's heads. Viewing
+    them as `num_heads` would fold the extra heads into the token axis, which is
+    the `dcp_size * num_tokens` shape mismatch qrep used to crash on."""
+    local_heads, group_size, num_tokens = 2, 4, 3
+    wrapper = _run_qrep_wrapper(rank_in_group=2)
     (q_nope, q_pe) = wrapper.mla_attn.call_args.args[0]
     rep_nope, rep_pe = wrapper.mla_attn.call_args.kwargs["q_dcp_replicated"]
     # The token axis survives; only the head axis carries the group.
@@ -884,10 +892,78 @@ def test_mla_wrapper_qrep_reshapes_group_heads_and_passes_both_views():
         local_heads * group_size,
         wrapper.qk_rope_head_dim,
     )
-    # And the local view is this rank's block of the replicated tensor.
+    # The sparse DCP path reads only the replicated heads, so the per-rank
+    # tensor is dead: it is the group's first `local_heads` on every rank.
+    torch.testing.assert_close(q_nope, rep_nope[:, :local_heads])
+    torch.testing.assert_close(q_pe, rep_pe[:, :local_heads])
+
+
+def test_mla_wrapper_qrep_dead_shard_is_rank_independent():
+    """A rank-dependent slice of the dead shard bakes the rank into the traced
+    graph, so every rank traces a different program and precompile peer replay
+    refuses every peer artifact."""
+    from vllm_torchtpu.compilation.tpu_compiler import _graph_fingerprint
+
+    passed = []
+    for rank in (0, 2):
+        wrapper = _run_qrep_wrapper(rank_in_group=rank)
+        passed.append(wrapper.mla_attn.call_args.args[0])
+    for got, want in zip(passed[1], passed[0]):
+        torch.testing.assert_close(got, want)
+
+    def _trace_fingerprint(rank: int, *, is_sparse: bool) -> str | None:
+        torch._dynamo.reset()
+        wrapper = _run_qrep_wrapper(
+            rank_in_group=rank, is_sparse=is_sparse, run_forward=False
+        )
+        if is_sparse:
+            wrapper.mla_attn = lambda _q, kv_c, k_pe, **kw: (
+                kw["q_dcp_replicated"][0].sum(dim=(-1, -2), keepdim=False).unsqueeze(-1)
+                + kv_c[:, :1]
+                + k_pe[:, 0, :1]
+            )
+        else:
+            wrapper.mla_attn = lambda q, kv_c, k_pe, **_kw: (
+                q[0].sum(dim=(-1, -2), keepdim=False).unsqueeze(-1)
+                + kv_c[:, :1]
+                + k_pe[:, 0, :1]
+            )
+        captured = []
+
+        def _capture(gm, _example_inputs):
+            captured.append(_graph_fingerprint(gm))
+            return gm.forward
+
+        compiled = torch.compile(wrapper.forward, backend=_capture, fullgraph=True)
+        compiled(
+            positions=torch.arange(3),
+            hidden_states=torch.ones((3, 8), dtype=torch.bfloat16),
+        )
+        assert len(captured) == 1 and captured[0] is not None
+        return captured[0]
+
+    assert _trace_fingerprint(0, is_sparse=True) == _trace_fingerprint(
+        2, is_sparse=True
+    )
+    # Negative control: when the per-rank slice is live (dense layer), ranks 0
+    # and 2 bake different slice offsets into the FX graph.
+    assert _trace_fingerprint(0, is_sparse=False) != _trace_fingerprint(
+        2, is_sparse=False
+    )
+
+
+def test_mla_wrapper_qrep_dense_layer_keeps_its_rank_block():
+    """Without the sparse DCP path nothing replaces the per-rank q, so it stays
+    this rank's block of the group's heads."""
+    local_heads = 2
+    wrapper = _run_qrep_wrapper(rank_in_group=2, is_sparse=False)
+    (q_nope, _) = wrapper.mla_attn.call_args.args[0]
+    assert wrapper.mla_attn.call_args.kwargs["q_dcp_replicated"] is None
+    full = wrapper.q_proj._out.view(q_nope.shape[0], -1, wrapper.qk_head_dim)
     start = 2 * local_heads
-    torch.testing.assert_close(q_nope, rep_nope[:, start : start + local_heads])
-    torch.testing.assert_close(q_pe, rep_pe[:, start : start + local_heads])
+    torch.testing.assert_close(
+        q_nope, full[:, start : start + local_heads, : wrapper.qk_nope_head_dim]
+    )
 
 
 def test_mla_forward_qrep_skips_the_gather_and_absorbs_group_heads(monkeypatch):

@@ -74,6 +74,16 @@ if [[ "$JOB_PRIORITY" == "$PRIORITY_ONCALL_FIX" ]]; then
   buildkite-agent annotate --style warning --context oncall-fix \
     "Runs at on-call priority (\`oncall-fix\` label): ahead of every other build, including main."
 fi
+# One concurrency group per author for the TPU steps of their PR builds; see
+# PR_TPU_JOBS_PER_AUTHOR. Keyed on the commit author's email, which every
+# webhook build carries: the Buildkite creator is missing whenever the GitHub
+# account is not linked to a Buildkite user.
+if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]]; then
+  pr_author="${BUILDKITE_BUILD_AUTHOR_EMAIL:-${BUILDKITE_BUILD_CREATOR_EMAIL:-}}"
+  if [[ -n "$pr_author" ]]; then
+    export PR_TPU_CONCURRENCY_GROUP="tpu-pr/${pr_author,,}"
+  fi
+fi
 
 # --- Check for explicit skip-ci or non-code/documentation-only changes ---
 echo "--- :git: Checking if CI build should be skipped"
@@ -156,27 +166,23 @@ if [[ "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
   upload_with_priority .buildkite/pipeline_promote.yml "$JOB_PRIORITY"
 fi
 
-# Release branch builds (releases/v<version>, e.g. releases/v0.29.0; see
-# RELEASE_BRANCH_REGEX in configs/pipeline_config.sh) also build and publish
-# vllm-torchtpu-core and the combined vllm-torchtpu wheel. PR builds never
-# release. Uploaded before the CI lanes so Buildkite places it after them; its
-# block step waits until the whole CI run has passed.
-if [[ "${BUILDKITE_BRANCH:-}" =~ ${RELEASE_BRANCH_REGEX} \
-      && "${BUILDKITE_PULL_REQUEST:-false}" == "false" ]]; then
-  echo "Release branch ${BUILDKITE_BRANCH}: uploading release fragment"
-  upload_with_priority .buildkite/pipeline_release_pypi.yml "$JOB_PRIORITY"
-fi
-
 # The suite's lanes, in upload order. Lane <lane> is
 # .buildkite/pipeline_<lane>.yml; no other file is uploaded as a lane. CI_LANES
 # picks a subset - a scheduled pipeline names its own lane. Without it a build runs every lane but
 # perf, which has scheduled builds of its own; nightly builds still run perf,
 # and so does the integration pipeline, whose LKG promotion waits on two perf
 # steps. A PR whose change needs perf/eval coverage asks for it with the
-# run-perf-eval label; adding the label to a ready PR starts a build.
+# run-perf-eval label, or the full nightly suite across every lane with
+# run-full-ci; adding either label to a ready PR starts a build.
 ALL_LANES="verify perf integration tests"
 default_lanes="verify integration tests"
 pr_labels="${BUILDKITE_PULL_REQUEST_LABELS:-}"
+if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]] \
+    && grep -qx "run-full-ci" <<< "${pr_labels//,/$'\n'}"; then
+  export NIGHTLY=1
+  buildkite-agent annotate --style info --context full-ci \
+    "Runs the full (nightly) suite (\`run-full-ci\` label)."
+fi
 if [[ "${NIGHTLY:-0}" == "1" || "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
   default_lanes="${ALL_LANES}"
 elif [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]] \
@@ -186,6 +192,49 @@ elif [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_RE
     buildkite-agent annotate --style info --context perf-eval \
       "Runs the perf/eval lane (\`run-perf-eval\` label)."
   fi
+fi
+# Echoes the labels of the PR a post-merge build on main merged, comma-separated
+# like BUILDKITE_PULL_REQUEST_LABELS. They do not reach the build, so they are
+# read from GitHub by the PR number GitHub puts at the end of a squash commit's
+# subject, with a token from the agent's GitHub App helper when it has one. Any
+# failure echoes nothing and the build runs everything.
+merged_pr_labels() {
+  local pr token
+  local auth=()
+  pr=$(head -n1 <<< "${BUILDKITE_MESSAGE:-}" | sed -nE 's/.*\(#([0-9]+)\)$/\1/p')
+  [[ -n "${pr}" ]] || return 0
+  token=$(/etc/buildkite-agent/git-credential-github-app get 2>/dev/null \
+    | sed -n 's/^password=//p' || true)
+  if [[ -n "${token}" ]]; then
+    auth=(-H "Authorization: token ${token}")
+  fi
+  curl -fsS --max-time 10 ${auth[@]+"${auth[@]}"} \
+    "https://api.github.com/repos/vllm-project/vllm-torchtpu/issues/${pr}/labels" 2>/dev/null \
+    | python3 -c 'import json, sys; print(",".join(l["name"] for l in json.load(sys.stdin)))' \
+      2>/dev/null || true
+}
+
+# skip-tpu-ci keeps only the tests lane, and SKIP_TPU_CI leaves out its TPU group
+# (pipeline_tests.yml reads it when the lane is uploaded), so the image build,
+# the type check and the CPU unit tests still run, on the PR and again on its
+# post-merge build. It overrides run-perf-eval and run-full-ci.
+if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]]; then
+  skip_labels="${pr_labels}"
+elif [[ "${BUILDKITE_BRANCH:-}" == "main" && "${BUILDKITE_SOURCE:-}" == "webhook" ]]; then
+  skip_labels="$(merged_pr_labels)"
+else
+  skip_labels=""
+fi
+if grep -qx "skip-tpu-ci" <<< "${skip_labels//,/$'\n'}"; then
+  SKIP_TPU_CI=1
+fi
+if [[ "${SKIP_TPU_CI:-0}" == "1" ]]; then
+  export SKIP_TPU_CI
+  default_lanes="tests"
+  buildkite-agent annotate --style info --context skip-tpu-ci \
+    "TPU steps not run (\`skip-tpu-ci\` label); the CPU steps still run."
+else
+  export SKIP_TPU_CI=0
 fi
 lanes="${CI_LANES:-${default_lanes}}"
 for lane in ${lanes}; do
@@ -223,6 +272,8 @@ fi
 OMNI_IMAGE_SKIP=""
 if [[ " ${lanes} " != *" tests "* ]]; then
   OMNI_IMAGE_SKIP="Only the tests lane uses the -omni image; this build has none."
+elif [[ "${SKIP_TPU_CI}" == "1" ]]; then
+  OMNI_IMAGE_SKIP="Only TPU steps use the -omni image; skip-tpu-ci skips them."
 fi
 export OMNI_IMAGE_SKIP
 

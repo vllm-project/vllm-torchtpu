@@ -1474,6 +1474,14 @@ class PallasAttentionBackendImpl(AttentionImpl):
         else:
             q_len, q_compute_dim = query.shape
 
+        if key is None:
+            # KV-shared layers get no K/V from vLLM. The kernel runs with
+            # skip_kv_update and reads all K/V from the target layer's cache,
+            # so zeros only fill the operand slots.
+            assert value is None and self.kv_sharing_target_layer_name is not None
+            key = query.new_zeros(q_len, self.num_kv_heads * self.head_size)
+            value = key
+
         if key.dim() == 3:
             k_len = key.shape[0]
             k_compute_dim = key.shape[1] * key.shape[2]

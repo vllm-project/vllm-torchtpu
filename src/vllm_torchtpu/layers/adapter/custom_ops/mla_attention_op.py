@@ -1317,10 +1317,17 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         if self.dcp_q_replicate:
             if self.is_sparse:
                 q_dcp_replicated = (q_nope, q_pe)
-            local_view = cast(
-                DCPGroupColumnParallelLinear, self._q_proj_layer()
-            )._local_view
-            q_nope, q_pe = local_view(q_nope), local_view(q_pe)
+            q_proj_layer = cast(DCPGroupColumnParallelLinear, self._q_proj_layer())
+            if q_dcp_replicated is not None and topk_indices is not None:
+                # The sparse DCP path reads only q_dcp_replicated, so this
+                # rank's shard is dead. Slice the same heads on every rank: a
+                # rank-dependent slice makes every rank trace a different graph,
+                # and precompile peer replay then refuses every peer artifact.
+                n = q_nope.shape[-2] // q_proj_layer.group_size
+                q_nope, q_pe = q_nope[..., :n, :], q_pe[..., :n, :]
+            else:
+                local_view = q_proj_layer._local_view
+                q_nope, q_pe = local_view(q_nope), local_view(q_pe)
 
         attn_out = self.mla_attn(
             (q_nope, q_pe),

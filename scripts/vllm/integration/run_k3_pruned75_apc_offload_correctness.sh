@@ -28,7 +28,7 @@
 #
 # Stage 1  cold/warm            smoke_prefix_cache_e2e_divergence.py
 #   One ~4.2k-token prompt sent twice. Pass: the repeat hits every whole
-#   block (6 x 648 = 3,888 tokens); token ids + logprobs equal the first run.
+#   block (6 x 680 = 4,080 tokens); token ids + logprobs equal the first run.
 #
 # Stage 2  state contamination  smoke_mamba_state_contamination.py
 #   Two different prefixes X and Y of equal length, each sent once for a
@@ -60,7 +60,7 @@
 #     large enough that an immediate repeat is always an HBM hit.
 #   * --max-num-seqs 1, synchronous scheduling: identical single-request
 #     batch shapes on every pass.
-#   * --max-num-batched-tokens == block size (648 at TP8): see the comment on
+#   * --max-num-batched-tokens == block size (680 at TP8): see the comment on
 #     MAX_NUM_BATCHED_TOKENS below.
 #
 #   MODEL=/path/to/Kimi-K3-pruned75 ./run_k3_pruned75_apc_offload_correctness.sh
@@ -88,11 +88,11 @@ BASE="http://127.0.0.1:${PORT}"
 
 TP_SIZE="${TP_SIZE:-8}"
 BLOCK_SIZE="${BLOCK_SIZE:-256}"
-# The engine raises the block size to fit one KDA state per block (256 -> 648
-# at TP8), so hits land on multiples of 648 tokens; the smokes read the real
+# The engine raises the block size to fit one KDA state per block (256 -> 680
+# at TP8), so hits land on multiples of 680 tokens; the smokes read the real
 # value from the engine log. 8192 holds every prompt here (<= ~4.5k tokens).
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
-# One prefill chunk = one KV block (the 648 the engine derives at TP8; checked
+# One prefill chunk = one KV block (the 680 the engine derives at TP8; checked
 # after boot). Hybrid prefix caching cuts chunks at block boundaries, so with
 # this a request resumed from a hit and the same request computed from scratch
 # run the identical sequence of chunk shapes from the hit onwards, and token
@@ -100,12 +100,12 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 # uncached run covers several blocks per chunk, the resumed one starts
 # mid-way, and K3's greedy output moves with chunk geometry alone -- two
 # uncached boots at 2048 vs 648 already disagree after ~30-60 tokens.
-MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-648}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-680}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
 # Decode is one token (max_num_seqs=1); a prefill chunk pads up to the budget.
 COMPILE_SIZES="${COMPILE_SIZES:-1,${MAX_NUM_BATCHED_TOKENS}}"
 # HBM budget in scheduler blocks (the engine would otherwise fit ~470). 64
-# blocks of 648 tokens is ~41k tokens: an order of magnitude above the largest
+# blocks of 680 tokens is ~44k tokens: an order of magnitude above the largest
 # request here (~7 attention blocks plus its KDA state blocks), so an immediate
 # repeat is always an HBM hit, and small enough that ~30 short filler prompts
 # turn the pool over twice. The host store holds ~430 blocks at the default
