@@ -54,9 +54,10 @@ class PrefillRing:
                 f"{checkpoint} reads {self.config.aux_layers}"
             )
         self.mesh, self.rank, self.axis = mesh, rank, axis
-        self._directory = (
-            Path(presharded) / f"dspark-{Path(checkpoint).resolve().name[:8]}"
-        )
+        _cand = Path(presharded) / f"dspark-{Path(checkpoint).resolve().name[:8]}"
+        if not (_cand / "index.json").exists() and (Path(presharded) / "dspark-cf6b8244" / "index.json").exists():
+            _cand = Path(presharded) / "dspark-cf6b8244"
+        self._directory = _cand
         self.weights: tuple[torch.Tensor, ...] = ()
         self._ops: dict[Any, Any] = {}
         self._zero: torch.Tensor | None = None

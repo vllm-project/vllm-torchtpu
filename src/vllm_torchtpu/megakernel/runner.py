@@ -124,18 +124,46 @@ def build_program(vllm_config: Any, tp_rank: int) -> MegakernelProgram:
     moe_reduce_dtype = tpu_envs.TPU_K3_MOE_REDUCE_DTYPE
     if config.attention_dp > 1:
         k3.check(config)
-    if config.attention_dp > 1 or moe_reduce_dtype != "float32":
+    needs_kernel_install = (
+        config.attention_dp > 1
+        or moe_reduce_dtype != "float32"
+        or config.workload_profile != "auto"
+        or config.prefill_rows is not None
+        or config.prefill_batches is not None
+        or config.spec_batches is not None
+    )
+    if needs_kernel_install:
         from vllm_torchtpu.megakernel.kimi_k3 import config as kernel_config
 
         # Kernel modules read the config at import: install it before the
         # program imports them.
-        kernel_config.install(
-            kernel_config.KernelConfig(
-                attention_dp=config.attention_dp,
-                dcp_group=config.decode_context_parallel_size,
-                moe_reduce_dtype=moe_reduce_dtype,
+        fields = {
+            "attention_dp": config.attention_dp,
+            "dcp_group": config.decode_context_parallel_size,
+            "moe_reduce_dtype": moe_reduce_dtype,
+        }
+        if hasattr(kernel_config.KernelConfig, "workload_profile"):
+            fields["workload_profile"] = config.workload_profile
+        if config.prefill_rows is not None and hasattr(
+            kernel_config.KernelConfig, "prefill_rows"
+        ):
+            fields["prefill_rows"] = config.prefill_rows
+        if config.prefill_batches is not None and hasattr(
+            kernel_config.KernelConfig, "prefill_batches"
+        ):
+            fields["prefill_batches"] = config.prefill_batches
+        if config.spec_batches is not None and hasattr(
+            kernel_config.KernelConfig, "spec_batches"
+        ):
+            fields["spec_batches"] = config.spec_batches
+        if hasattr(kernel_config.KernelConfig, "for_workload_profile"):
+            kc = kernel_config.KernelConfig.for_workload_profile(
+                config.workload_profile,
+                **{k: v for k, v in fields.items() if k != "workload_profile"},
             )
-        )
+        else:
+            kc = kernel_config.KernelConfig(**fields)
+        kernel_config.install(kc)
     # The prefill computes the rings of its loader config's draft; the
     # decoder drafts with the speculative config's model (and imports rings).
     if config.role == "prefill":
@@ -325,10 +353,14 @@ class MegakernelModelRunner(TPUModelRunner):
 
     def _num_draft_per_req(self, step_input: StepInput) -> dict[int, int]:
         """Drafts each request verifies this step, by batch index (vLLM's
-        async placeholders count them)."""
+        async placeholders count them). Only a request that is decoding
+        (its prompt computed up to the anchor token) verifies drafts: a
+        prompt chunk scheduled over the aggregated scheduler (``role()``'s
+        forced-role experiment) schedules prompt tokens, not drafts."""
         return {
             i: max(request.scheduled - 1, 0)
             if self.speculative_config is not None
+            and request.computed >= request.num_prompt_tokens - 1
             else 0
             for i, request in enumerate(step_input.requests)
         }
@@ -343,13 +375,22 @@ class MegakernelModelRunner(TPUModelRunner):
                 "after execute_model() returns None."
             )
         self._update_states(scheduler_output)
-        self._finished_req_ids_pending.update(scheduler_output.finished_req_ids)
-        if self.scheduler_config.async_scheduling:
-            self._flush_disjoint_async_results()
+        self._finished_req_ids_pending.update(
+            scheduler_output.finished_req_ids
+            | (scheduler_output.preempted_req_ids or set())
+        )
+        # The KV connector before the flush: the flush waits for the previous
+        # step's tokens (the device), and a prefill registers the blocks of the
+        # requests it finished for their transfer in the connector's setup.
         if scheduler_output.total_num_scheduled_tokens == 0:
             if not has_kv_transfer_group():
+                if self.scheduler_config.async_scheduling:
+                    self._flush_disjoint_async_results()
                 return EMPTY_MODEL_RUNNER_OUTPUT
-            return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+            output = self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+            if self.scheduler_config.async_scheduling:
+                self._flush_disjoint_async_results()
+            return output
         with set_forward_context(None, self.vllm_config):
             raiden_inline = dist_utils.get_raiden_inline_load()
             self.maybe_setup_kv_connector(
@@ -357,6 +398,8 @@ class MegakernelModelRunner(TPUModelRunner):
                 wait_for_completion=raiden_inline,
                 report_completion=not raiden_inline,
             )
+        if self.scheduler_config.async_scheduling:
+            self._flush_disjoint_async_results()
         step_input = self._prepare_step_input(scheduler_output)
         assert self.program is not None
         if (
@@ -477,4 +520,19 @@ class MegakernelModelRunner(TPUModelRunner):
             self.input_batch.token_ids_cpu[index, start : start + len(tokens)] = tokens
             self.input_batch.num_tokens_no_spec[index] = start + len(tokens)
             req_state.output_token_ids.extend(tokens)
+        spec_config = getattr(self, "speculative_config", None)
+        spec_mgr = getattr(self, "spec_decode_manager", None)
+        if spec_config is not None and spec_mgr is not None:
+            discard_set = set(discard)
+            n_decoding = len(request_seq_lens)
+            if self.program is not None and hasattr(
+                self.program, "draft_width_for_batch"
+            ):
+                k = int(self.program.draft_width_for_batch(n_decoding))
+            else:
+                k = int(spec_config.num_speculative_tokens)
+            spec_mgr._draft_token_ids = [
+                [0] * k if (k > 0 and i not in discard_set) else []
+                for i in range(num_reqs)
+            ]
         return final_output

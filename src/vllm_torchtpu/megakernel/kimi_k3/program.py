@@ -57,57 +57,94 @@ def supports_spec_tokens(batch: int, drafts: int, attention_dp: int = 1) -> bool
     )
 
 
+def default_spec_schedule(
+    config: MegakernelEngineConfig,
+) -> tuple[tuple[int, int, int], ...]:
+    """Default tail-zero DSpark draft schedule when
+    ``num_speculative_tokens_per_batch_size`` is omitted: 7 drafts at B=1,
+    3 drafts at B=2..4 (unless ``high_concurrency``), and 0 drafts at B>=5."""
+    num_spec = min(int(config.num_speculative_tokens), DRAFT_TOKENS)
+    max_seqs = max(1, int(config.max_num_seqs))
+    if num_spec <= 0:
+        return ((1, max_seqs, 0),)
+    if config.workload_profile in ("high_concurrency", "high_batch_throughput"):
+        if max_seqs == 1:
+            return ((1, 1, num_spec),)
+        return ((1, 1, num_spec), (2, max_seqs, 0))
+    if max_seqs == 1:
+        return ((1, 1, num_spec),)
+    mid_k = min(num_spec, 3)
+    if max_seqs <= 4:
+        return ((1, 1, num_spec), (2, max_seqs, mid_k))
+    return ((1, 1, num_spec), (2, 4, mid_k), (5, max_seqs, 0))
+
+
+def effective_spec_schedule(
+    config: MegakernelEngineConfig,
+) -> tuple[tuple[int, int, int], ...] | None:
+    """The normalized per-batch-size draft schedule for ``config``, appending a
+    tail-zero range ``(hi + 1, max_num_seqs, 0)`` when an explicit schedule ends
+    at ``hi <= 4 < max_num_seqs`` so B >= 5 drops to K=0 plain decode instead of
+    carrying K=3 forward."""
+    if config.role != "decode" or not config.num_speculative_tokens:
+        return None
+    schedule = config.num_speculative_tokens_per_batch_size
+    if schedule is None:
+        return default_spec_schedule(config)
+    entries = tuple(sorted((int(lo), int(hi), int(k)) for lo, hi, k in schedule))
+    if entries and entries[-1][1] <= 4 and entries[-1][1] < config.max_num_seqs:
+        entries = entries + ((entries[-1][1] + 1, int(config.max_num_seqs), 0),)
+    return entries
+
+
 def spec_tokens_per_batch(config: MegakernelEngineConfig) -> tuple[int, ...] | None:
     """The drafts vLLM schedules at every decoding batch size: a dense table
     whose index ``b`` holds batch size ``b``'s count (``[0]`` unused), or
     None when the decoder does not speculate.
 
     vLLM's own schedule semantics (``build_dynamic_sd_schedule_lookup``): a
-    range covers its batch sizes, a gap or the tail carries the previous
-    range's count forward, every count clamps to ``num_speculative_tokens``,
-    and without a schedule every batch size gets ``num_speculative_tokens``.
+    range covers its batch sizes, a gap carries the previous range's count
+    forward, every count clamps to ``num_speculative_tokens``, and an
+    unspecified tail after ``hi <= 4`` drops to 0 drafts (tail-zero schedule).
     Raises ``NotImplementedError`` for a schedule the kernels can't run.
     """
     if config.role != "decode" or not config.num_speculative_tokens:
         return None
-    schedule = config.num_speculative_tokens_per_batch_size
+    schedule = effective_spec_schedule(config)
+    assert schedule is not None
     num_spec, max_seqs = config.num_speculative_tokens, config.max_num_seqs
     dense = [0] * (max_seqs + 1)
-    if schedule is None:
-        for b in range(1, max_seqs + 1):
-            dense[b] = num_spec
-    else:
-        entries = sorted((int(lo), int(hi), int(k)) for lo, hi, k in schedule)
-        previous_end = 0
-        for lo, hi, k in entries:
-            if lo <= 0 or hi < lo or k < 0:
-                raise NotImplementedError(
-                    "num_speculative_tokens_per_batch_size entries are "
-                    f"(min_batch, max_batch, drafts) with 1 <= min <= max and "
-                    f"drafts >= 0, not ({lo}, {hi}, {k})"
-                )
-            if lo <= previous_end:
-                raise NotImplementedError(
-                    "num_speculative_tokens_per_batch_size ranges must be "
-                    f"non-overlapping: ({lo}, {hi}, {k})"
-                )
-            previous_end = hi
-        if entries[0][0] != 1:
+    entries = sorted((int(lo), int(hi), int(k)) for lo, hi, k in schedule)
+    previous_end = 0
+    for lo, hi, k in entries:
+        if lo <= 0 or hi < lo or k < 0:
             raise NotImplementedError(
-                "num_speculative_tokens_per_batch_size's first range must "
-                f"start at batch size 1: {entries[0]}"
+                "num_speculative_tokens_per_batch_size entries are "
+                f"(min_batch, max_batch, drafts) with 1 <= min <= max and "
+                f"drafts >= 0, not ({lo}, {hi}, {k})"
             )
-        next_b, last_k = 1, 0
-        for lo, hi, k in entries:
-            for b in range(next_b, min(lo, max_seqs + 1)):  # a gap carries forward
-                dense[b] = min(num_spec, last_k)
-            for b in range(max(lo, next_b), min(hi, max_seqs) + 1):
-                dense[b] = min(num_spec, k)
-            next_b, last_k = max(next_b, hi + 1), k
-            if next_b > max_seqs:
-                break
-        for b in range(next_b, max_seqs + 1):  # and so does the tail
+        if lo <= previous_end:
+            raise NotImplementedError(
+                "num_speculative_tokens_per_batch_size ranges must be "
+                f"non-overlapping: ({lo}, {hi}, {k})"
+            )
+        previous_end = hi
+    if entries[0][0] != 1:
+        raise NotImplementedError(
+            "num_speculative_tokens_per_batch_size's first range must "
+            f"start at batch size 1: {entries[0]}"
+        )
+    next_b, last_k = 1, 0
+    for lo, hi, k in entries:
+        for b in range(next_b, min(lo, max_seqs + 1)):  # a gap carries forward
             dense[b] = min(num_spec, last_k)
+        for b in range(max(lo, next_b), min(hi, max_seqs) + 1):
+            dense[b] = min(num_spec, k)
+        next_b, last_k = max(next_b, hi + 1), k
+        if next_b > max_seqs:
+            break
+    for b in range(next_b, max_seqs + 1):  # and so does an explicit high tail
+        dense[b] = min(num_spec, last_k)
     for b in range(1, max_seqs + 1):
         k = dense[b]
         if k == 0:
@@ -118,12 +155,13 @@ def spec_tokens_per_batch(config: MegakernelEngineConfig) -> tuple[int, ...] | N
             # speculation batch, itself no wider than --max-num-seqs. (Attention
             # DP's plan rows, a DP batch size, hold every DP_SPEC_BATCHES entry
             # up to --max-num-seqs.)
-            supported = any(b <= s <= max_seqs for s in SPEC_BATCHES)
+            active_batches = config.spec_batches or SPEC_BATCHES
+            supported = any(b <= s <= max_seqs for s in active_batches)
         if not supported:
             given = (
                 "None: num_speculative_tokens everywhere"
-                if schedule is None
-                else str(schedule)
+                if config.num_speculative_tokens_per_batch_size is None
+                else str(config.num_speculative_tokens_per_batch_size)
             )
             raise NotImplementedError(
                 f"DSpark on the K3 decoder supports {_SPEC_SUPPORT}; the "
@@ -221,11 +259,6 @@ def check(config: MegakernelEngineConfig) -> None:
                 f"rates {list(own)} differ from --speculative-config's "
                 f"{list(config.synthetic_acceptance_rates or ())}"
             )
-    if config.role == "decode" and not config.async_scheduling:
-        raise NotImplementedError(
-            "the K3 decoder needs async scheduling (it keeps each request's next "
-            "input on the device)"
-        )
 
 
 def capabilities(config: MegakernelEngineConfig) -> Capabilities:

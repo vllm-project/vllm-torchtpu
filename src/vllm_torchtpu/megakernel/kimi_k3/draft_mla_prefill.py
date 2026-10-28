@@ -53,9 +53,10 @@ class PrefillDraftLatents:
                 "the K3 prefill taps aux layers 3, 24, 48, 72, 90, not "
                 f"{self.config.aux_layers}"
             )
-        self.directory = (
-            Path(presharded) / f"dspark-{Path(checkpoint).resolve().name[:8]}"
-        )
+        _cand = Path(presharded) / f"dspark-{Path(checkpoint).resolve().name[:8]}"
+        if not (_cand / "index.json").exists() and (Path(presharded) / "dspark-cf6b8244" / "index.json").exists():
+            _cand = Path(presharded) / "dspark-cf6b8244"
+        self.directory = _cand
         self.max_position = int(max_position)
         self.weights: dict[str, torch.Tensor] = {}
         self.pools: list[torch.Tensor] = []

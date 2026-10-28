@@ -1348,23 +1348,74 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
 def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
     if tuning_key in tuned_params_mapping:
         return tuned_params_mapping[tuning_key]
-    else:
-        logger.warning(
-            "No tuned parameters found for the given tuning key: %s, "
-            "using default parameters",
-            tuning_key,
-        )
-        if tuning_key.case == "mixed":
-            return TunableParams(
-                num_kv_pages_per_block=1,
-                num_queries_per_block=16,
-                vmem_limit_bytes=62914560,
+    if tuning_key.case == "mixed" and tuning_key.actual_num_q_heads == 3:
+        # Kimi-K3 TP=32 fallback across arbitrary max_num_seqs / pages_per_seq /
+        # max_num_tokens buckets (e.g. max_num_seqs=16 or 32, or sub-1K token
+        # buckets). Avoid falling back to the un-tuned (1, 16) tile which
+        # fragments MXU work across 32x too many query blocks.
+        page_tokens = tuning_key.page_size_per_kv_packing * tuning_key.kv_packing
+        if page_tokens >= 256:
+            # 256- or 324-token unified-pool / large pages.
+            num_kv_pages = (
+                4
+                if tuning_key.max_num_tokens <= 1024
+                else 8
             )
-
-        # decode, batched_decode
+            num_queries = min(512, max(64, tuning_key.max_num_tokens))
+            q_split = 2 if num_queries >= 128 else 1
+            return TunableParams(
+                num_kv_pages_per_block=min(num_kv_pages, max(1, tuning_key.pages_per_seq)),
+                num_queries_per_block=num_queries,
+                vmem_limit_bytes=62914560,
+                decode_batch_size=1,
+                q_split=q_split,
+            )
+        elif page_tokens <= 32:
+            # 16-token non-pooled pages.
+            num_queries = min(512, max(64, tuning_key.max_num_tokens))
+            q_split = 4 if num_queries >= 256 else 1
+            return TunableParams(
+                num_kv_pages_per_block=min(128, max(1, tuning_key.pages_per_seq)),
+                num_queries_per_block=num_queries,
+                vmem_limit_bytes=58720256,
+                decode_batch_size=1,
+                q_split=q_split,
+            )
+    if (
+        tuning_key.case in ("decode", "batched_decode", "decode_only")
+        and tuning_key.actual_num_q_heads == 3
+    ):
+        page_tokens = tuning_key.page_size_per_kv_packing * tuning_key.kv_packing
+        decode_batch_size = (
+            min(8, tuning_key.max_num_tokens)
+            if 1 < tuning_key.max_num_tokens <= 128
+            else 1
+        )
+        num_kv_pages = 4 if page_tokens >= 256 else 64
         return TunableParams(
-            decode_batch_size=4,
-            num_kv_pages_per_block=3,
+            decode_batch_size=decode_batch_size,
+            num_kv_pages_per_block=min(
+                num_kv_pages, max(1, tuning_key.pages_per_seq)
+            ),
             num_queries_per_block=1,
             vmem_limit_bytes=62914560,
         )
+    logger.warning(
+        "No tuned parameters found for the given tuning key: %s, "
+        "using default parameters",
+        tuning_key,
+    )
+    if tuning_key.case == "mixed":
+        return TunableParams(
+            num_kv_pages_per_block=1,
+            num_queries_per_block=16,
+            vmem_limit_bytes=62914560,
+        )
+
+    # decode, batched_decode
+    return TunableParams(
+        decode_batch_size=4,
+        num_kv_pages_per_block=3,
+        num_queries_per_block=1,
+        vmem_limit_bytes=62914560,
+    )

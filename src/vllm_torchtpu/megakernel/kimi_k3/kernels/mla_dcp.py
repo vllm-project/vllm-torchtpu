@@ -232,7 +232,7 @@ def chunked(batch, force=False) -> bool:
     return batch > MAX_ROWS or force
 
 
-GROUPED_SPEC_SHAPES = ((4, 4), (8, 4), (8, 8), (16, 8), (32, 8), (32, 4), (64, 8), (64, 4))
+GROUPED_SPEC_SHAPES = ((4, 4), (8, 4), (8, 8), (16, 8), (16, 4), (32, 8), (32, 4), (64, 8), (64, 4))
 
 
 def _grouped_spec(batch, group, heads, sequence_rows):

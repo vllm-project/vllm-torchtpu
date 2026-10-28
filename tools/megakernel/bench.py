@@ -63,6 +63,19 @@ def add_arguments(parser, profile: bool = False) -> None:
         default="",
         help="file: rank 0 saves each case's timed greedy tokens [steps, batch] (npz)",
     )
+    decode.add_argument(
+        "--workload-profile",
+        default="auto",
+        choices=(
+            "auto",
+            "interactive_short",
+            "balanced_agg",
+            "decode_heavy",
+            "high_concurrency",
+            "high_batch_throughput",
+        ),
+        help="aggregated P+D workload profile preset for KernelConfig / KimiDecoder",
+    )
     prefill = sub.add_parser("prefill", help="the prefill stack")
     prefill.add_argument(
         "--prompts",

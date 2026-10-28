@@ -395,6 +395,7 @@ class DecodeOps:
         spec_shapes: tuple[tuple[int, int], ...],
         synthetic_rates=None,
         masked_ops: bool = False,
+        prefill_shapes: tuple[tuple[int, int], ...] = (),
     ) -> list:
         """The configured primary decoder graphs, using shape-only operands.
         ``synthetic_rates``: the rates, or ``drafts -> rates`` (per draft
@@ -479,6 +480,16 @@ class DecodeOps:
             add_verify(1, self.VERIFY_ROWS, single=True)
         for requests, spec_rows in spec_shapes:
             add_verify(requests, spec_rows)
+        for requests, rows_per in prefill_shapes:
+            rows = requests * rows_per
+            ids_size = 3 * rows + requests + requests * control.pages
+            add(
+                self._build_prefill_chunk(
+                    requests, rows_per, control.pages, tuple(aux_layers)
+                ),
+                rows,
+                ids_size,
+            )
         return calls
 
     @staticmethod
@@ -885,6 +896,201 @@ class DecodeOps:
             conv, recurrent, new_conv, new_recurrent, targets, source_rows=sources
         )
         return decisions, conv, recurrent
+
+    def prefill_shapes(
+        self, max_requests: int = 8, rows_per: int | tuple[int, ...] = 8
+    ) -> tuple[tuple[int, int], ...]:
+        """Compiled ``(requests, rows_per)`` buckets for multi-row prompt prefill."""
+        widths = (rows_per,) if isinstance(rows_per, int) else tuple(rows_per)
+        batches = kernel_config.active().prefill_batches or (1, 2, 4, 8)
+        limit = max(max(self.batch_sizes), max_requests * max(widths))
+        return tuple(
+            (r, s)
+            for s in widths
+            for r in batches
+            if r <= max_requests
+            and r * s <= min(64, limit)
+            and (self.attention_dp == 1 or r >= self.attention_dp)
+        )
+
+    def _build_prefill_chunk(
+        self,
+        requests: int,
+        rows_per: int,
+        pages: int,
+        aux_layers: tuple[int, ...] = (),
+    ) -> Any:
+        """Multi-row causal prompt chunk prefill over ``requests`` sequences of
+        ``rows_per`` tokens each on the decoder's resident weights.
+
+        ``ids`` is ``[tokens | positions | slots | valid_lengths | tables]`` of
+        length ``3 * rows + requests + requests * pages`` where ``rows =
+        requests * rows_per``:
+        - ``tokens`` ``[rows]``
+        - ``positions`` ``[rows]`` (``-1`` for padded tail rows)
+        - ``slots`` ``[rows]`` (``req.slot`` for valid rows, ``0`` for padded
+          rows; ``slots[r * rows_per]`` holds ``req.slot`` for active request
+          ``r``)
+        - ``valid_lengths`` ``[requests]`` (``1..rows_per`` for active
+          requests, ``0`` for padded requests)
+        - ``tables`` ``[requests * pages]``
+
+        Commits only each request's last valid token KDA post-state into its
+        persistent slot and skips MLA cache commits for ``positions < 0``.
+        """
+        aux_layers = tuple(aux_layers)
+        key = ("prefill_chunk", requests, rows_per, pages, aux_layers)
+        if key in self._ops:
+            return self._ops[key]
+        rows, paged, names = requests * rows_per, self.paged, self.names
+        count = len(names)
+        options = decode_options(rows)
+        options["defer_kda_commit"] = True
+        if rows >= 8 and self.attention_dp == 1:
+            options.update(
+                moe_routed_reduce_scatter=True,
+                moe_token_scatter_output=True,
+                attention_token_scatter=True,
+                sequence_parallel_pre_attention=True,
+            )
+        options.update(
+            sequence_rows=rows_per,
+            aux_hidden_layers=aux_layers,
+        )
+        pool_map, owner_table = self.pool_map, self.owner_table
+        pools = len(self.unified_pools)
+        placed = order = None
+        if self.attention_dp > 1:
+            placed = dp_group_rows(rows, self.attention_dp)
+            order = np.argsort(placed)
+
+        def body(*args):
+            weights = {name: args[i][0] for i, name in enumerate(names)}
+            conv, recurrent = args[count][0], args[count + 1][0]
+            pool = args[count + 2 : count + 2 + pools]
+            (ids,) = args[count + 2 + pools :]
+            old_conv, old_recurrent = conv, recurrent
+            tokens = ids[:rows]
+            positions = ids[rows : 2 * rows]
+            slots = ids[2 * rows : 3 * rows]
+            valid_lengths = ids[3 * rows : 3 * rows + requests]
+            tables = jnp.repeat(
+                ids[3 * rows + requests :].reshape(requests, pages), rows_per, axis=0
+            )
+            operands = (tokens, positions, tables, slots)
+            if order is not None:
+                operands = tuple(operand[order] for operand in operands)
+            state_row = (
+                jnp.zeros((1,), dtype=jnp.int32)
+                if (requests == 1 and self.attention_dp == 1)
+                else None
+            )
+            result = paged.decode_paged(
+                weights,
+                conv,
+                recurrent,
+                pool,
+                *operands,
+                batch_size=rows,
+                layers=NUM_LAYERS,
+                dcp_pool_map=pool_map,
+                dcp_owner_table=owner_table,
+                state_row=state_row,
+                **options,
+            )
+            if aux_layers:
+                _, aux, conv, recurrent, pool = result
+                if placed is not None:
+                    aux = aux[:, placed]
+            else:
+                _, conv, recurrent, pool = result
+                aux = None
+            req_slots = slots.reshape(requests, rows_per)[:, 0]
+            target_slots = jnp.where(valid_lengths > 0, req_slots, 0)
+            last_offset = jnp.clip(valid_lengths - 1, 0, rows_per - 1)
+            dp = self.attention_dp
+            if dp == 1:
+                sources = jnp.arange(requests, dtype=jnp.int32) * rows_per + jnp.where(
+                    target_slots == 0, rows_per - 1, last_offset
+                )
+                targets = target_slots
+            else:
+                share, bank = requests // dp, old_conv.shape[0] // dp
+                group = jax.lax.axis_index(AXIS) // (TP_SIZE // dp)
+                own = jax.lax.dynamic_slice_in_dim(target_slots, group * share, share)
+                own_off = jax.lax.dynamic_slice_in_dim(
+                    last_offset, group * share, share
+                )
+                rows_sel = jnp.arange(share, dtype=jnp.int32) * rows_per + jnp.where(
+                    own == 0, rows_per - 1, own_off
+                )
+                local = jnp.where(own == 0, 0, own - group * (bank - 1))
+                group_rows = share * rows_per
+                sources = jnp.concatenate(
+                    [rows_sel + k * group_rows for k in range(dp)]
+                )
+                targets = jnp.concatenate([local + k * bank for k in range(dp)])
+            conv, recurrent = paged._commit_kda_states(
+                old_conv,
+                old_recurrent,
+                conv,
+                recurrent,
+                targets,
+                source_rows=sources,
+            )
+            if aux is not None:
+                return (aux, conv[None], recurrent[None], *pool)
+            return (conv[None], recurrent[None], *pool)
+
+        in_specs = (P(AXIS),) * (count + 2 + pools) + (P(),)
+        out_specs = (
+            ((P(),) if aux_layers else ())
+            + (P(AXIS), P(AXIS))
+            + (P(AXIS),) * pools
+        )
+        export_key = repr(
+            (
+                "prefill_chunk",
+                requests,
+                rows_per,
+                pages,
+                NUM_LAYERS,
+                names,
+                sorted(options.items()),
+                pool_map,
+                owner_table,
+            )
+        )
+        self._ops[key] = register_op(
+            f"pallas::k3_decode_prefill{requests}x{rows_per}",
+            self.mesh,
+            body,
+            in_specs,
+            out_specs,
+            donate_argnums=tuple(range(count, count + 2 + pools)),
+            export_key=export_key,
+        )
+        return self._ops[key]
+
+    def prefill_chunk(
+        self,
+        requests: int,
+        rows_per: int,
+        pages: int,
+        ids: torch.Tensor,
+        aux_layers: tuple[int, ...] = (),
+    ) -> torch.Tensor | None:
+        """Execute a multi-row prompt prefill chunk and commit KDA/MLA states."""
+        aux_layers = tuple(aux_layers)
+        op = self._build_prefill_chunk(requests, rows_per, pages, aux_layers)
+        outputs = self._run(op, requests * rows_per, *self._operands(), ids)
+        if aux_layers:
+            aux, conv, recurrent, *pools = outputs
+            self._adopt(conv, recurrent, pools)
+            return aux
+        conv, recurrent, *pools = outputs
+        self._adopt(conv, recurrent, pools)
+        return None
 
 
 # Sampling parameters of a greedy plan entry: temperature, top_p, top_k, seed.

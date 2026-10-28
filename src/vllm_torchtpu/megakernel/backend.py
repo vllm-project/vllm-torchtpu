@@ -14,38 +14,85 @@ patches call it.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
 LOAD_FORMAT = "megakernel"
+# EXPERIMENT ONLY: run one program over vLLM's aggregated scheduler (see role()).
+FORCE_ROLE_ENV = "K3_MEGAKERNEL_FORCE_ROLE"
 # Model architectures with a megakernel program.
 ARCHITECTURES = ("KimiK3ForConditionalGeneration", "KimiLinearForCausalLM")
 # --model-loader-extra-config keys, by role.
 _LOADER_KEYS = {
-    "prefill": {"presharded", "draft"},
+    "prefill": {
+        "presharded",
+        "draft",
+        "aggregated_role",
+        "workload_profile",
+    },
     "decode": {
         "presharded",
         "attention_dp",
         "shared_blocks",
         "synthetic_acceptance_lengths",
+        "aggregated_role",
+        "workload_profile",
+        "prefill_rows",
+        "prefill_batches",
+        "spec_batches",
     },
 }
+
+
+def _int_tuple_or_none(value: Any) -> tuple[int, ...] | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return (int(value),)
+    if isinstance(value, str):
+        parsed = tuple(int(x.strip()) for x in value.split(",") if x.strip())
+        return parsed or None
+    parsed = tuple(int(x) for x in value)
+    return parsed or None
 
 
 def role(vllm_config: Any) -> str | None:
     """``"prefill"`` or ``"decode"`` when the backend is selected
     (``--load-format megakernel``), else None. Raises on a configuration the
-    backend can't serve."""
+    backend can't serve.
+
+    When no disaggregated P/D KV transfer config is given (or ``kv_role`` is
+    ``kv_both``), defaults to ``"decode"`` so a single ``vllm serve`` runs
+    ``KimiDecoder`` as a unified Aggregated (P+D) engine over vLLM's scheduler.
+    ``aggregated_role`` in ``--model-loader-extra-config`` or
+    ``K3_MEGAKERNEL_FORCE_ROLE=prefill|decode|aggregated`` can override the
+    selected program.
+    """
     load_config = getattr(vllm_config, "load_config", None)
     if getattr(load_config, "load_format", None) != LOAD_FORMAT:
         return None
     kv = getattr(vllm_config, "kv_transfer_config", None)
+    extra = getattr(load_config, "model_loader_extra_config", None) or {}
+    raw_agg_role = extra.get("aggregated_role") if isinstance(extra, dict) else None
+    agg_role = str(raw_agg_role).strip().lower() if raw_agg_role is not None else ""
+    forced = (
+        agg_role
+        or os.environ.get(FORCE_ROLE_ENV, "").strip().lower()
+        or os.environ.get("VLLM_MEGAKERNEL_ROLE", "").strip().lower()
+    )
     if kv is None or kv.is_kv_producer == kv.is_kv_consumer:
-        raise ValueError(
-            "the megakernel backend serves one role of a P/D pair: "
-            "a KV transfer config with "
-            "kv_role kv_producer (prefill) or kv_consumer (decode)"
-        )
+        if not forced or forced in ("decode", "aggregated", "kv_both"):
+            selected = "decode"
+        elif forced == "prefill":
+            selected = "prefill"
+        else:
+            raise ValueError(
+                f"aggregated megakernel role must be 'decode', 'prefill', or "
+                f"'aggregated', not {forced!r}"
+            )
+    else:
+        selected = "prefill" if kv.is_kv_producer else "decode"
     model_config = getattr(vllm_config, "model_config", None)
     architectures = (
         getattr(getattr(model_config, "hf_config", None), "architectures", None) or []
@@ -55,7 +102,6 @@ def role(vllm_config: Any) -> str | None:
             f"no megakernel program for {architectures}; "
             f"supported: {list(ARCHITECTURES)}"
         )
-    selected = "prefill" if kv.is_kv_producer else "decode"
     _loader_config(vllm_config, selected)
     return selected
 
@@ -187,6 +233,73 @@ def draft_ring_rows(vllm_config: Any) -> int:
     return LAYOUT.region("draft").rows
 
 
+def _extra_config(vllm_config: Any) -> dict:
+    load_config = getattr(vllm_config, "load_config", None)
+    if load_config is None:
+        return {}
+    selected = role(vllm_config)
+    if selected is None:
+        return {}
+    return _loader_config(vllm_config, selected)
+
+
+_WORKLOAD_PROFILE_PREFILL_BATCHES: dict[str, tuple[int, ...]] = {
+    "interactive_short": (1, 2, 4),
+    "balanced_agg": (1, 2, 4, 8),
+    "decode_heavy": (1, 2, 4),
+    "high_concurrency": (1, 2, 4, 8),
+    "high_batch_throughput": (1, 2, 4, 8),
+}
+_WORKLOAD_PROFILE_SPEC_BATCHES: dict[str, tuple[int, ...]] = {
+    "interactive_short": (1, 2, 4),
+    "balanced_agg": (1, 2, 4, 8),
+    "decode_heavy": (1, 2, 4, 8),
+    "high_concurrency": (1, 2, 4, 8),
+    "high_batch_throughput": (1, 2, 4, 8),
+}
+
+
+def is_kv_consumer(vllm_config: Any) -> bool:
+    """Whether ``vllm_config`` runs a disaggregated KV consumer whose
+    unified-pool KDA blocks are populated by a prefill producer."""
+    kv = getattr(vllm_config, "kv_transfer_config", None)
+    return bool(kv is not None and kv.is_kv_consumer and not kv.is_kv_producer)
+
+
+def workload_profile(vllm_config: Any) -> str:
+    """The workload profile preset in ``--model-loader-extra-config``
+    (default ``"auto"``)."""
+    val = _extra_config(vllm_config).get("workload_profile")
+    return str(val) if val is not None else "auto"
+
+
+def prefill_rows(vllm_config: Any) -> tuple[int, ...] | None:
+    """Multi-row causal prompt chunk sizes for the aggregated decoder."""
+    if role(vllm_config) != "decode":
+        return None
+    return _int_tuple_or_none(_extra_config(vllm_config).get("prefill_rows"))
+
+
+def prefill_batches(vllm_config: Any) -> tuple[int, ...] | None:
+    """Compiled prompt chunk request counts for the aggregated decoder."""
+    if role(vllm_config) != "decode":
+        return None
+    explicit = _int_tuple_or_none(_extra_config(vllm_config).get("prefill_batches"))
+    if explicit is not None:
+        return explicit
+    return _WORKLOAD_PROFILE_PREFILL_BATCHES.get(workload_profile(vllm_config))
+
+
+def spec_batches(vllm_config: Any) -> tuple[int, ...] | None:
+    """Compiled speculative verify request counts for the decoder."""
+    if role(vllm_config) != "decode":
+        return None
+    explicit = _int_tuple_or_none(_extra_config(vllm_config).get("spec_batches"))
+    if explicit is not None:
+        return explicit
+    return _WORKLOAD_PROFILE_SPEC_BATCHES.get(workload_profile(vllm_config))
+
+
 def capabilities(vllm_config: Any):
     """The selected program's :class:`Capabilities` (None: backend not selected)."""
     if role(vllm_config) is None:
@@ -194,4 +307,17 @@ def capabilities(vllm_config: Any):
     from vllm_torchtpu.megakernel.config import MegakernelEngineConfig
     from vllm_torchtpu.megakernel.kimi_k3 import program
 
-    return program.capabilities(MegakernelEngineConfig.from_vllm_config(vllm_config))
+    config = MegakernelEngineConfig.from_vllm_config(vllm_config)
+    caps = program.capabilities(config)
+    spec = getattr(vllm_config, "speculative_config", None)
+    if (
+        config.role == "decode"
+        and spec is not None
+        and getattr(spec, "num_speculative_tokens", 0)
+    ):
+        effective = program.effective_spec_schedule(config)
+        if effective is not None:
+            spec.num_speculative_tokens_per_batch_size = [
+                [int(lo), int(hi), int(k)] for lo, hi, k in effective
+            ]
+    return caps

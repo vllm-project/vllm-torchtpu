@@ -208,9 +208,10 @@ class MlaDsparkDraft:
         self.weights: dict[str, torch.Tensor] = {}
         self.pools: list[torch.Tensor] = []
         self.owner_table: tuple[int, ...] | None = None
-        self._presharded = (
-            Path(presharded) / f"dspark-{Path(checkpoint).resolve().name[:8]}"
-        )
+        _cand = Path(presharded) / f"dspark-{Path(checkpoint).resolve().name[:8]}"
+        if not (_cand / "index.json").exists() and (Path(presharded) / "dspark-cf6b8244" / "index.json").exists():
+            _cand = Path(presharded) / "dspark-cf6b8244"
+        self._presharded = _cand
         self._ops: dict[Any, Any] = {}
         self._aux_layers = tuple(int(layer) for layer in self.config.aux_layers)
         if self.rank == 0:
@@ -583,7 +584,132 @@ class MlaDsparkDraft:
             ).to("tpu")
         return self._ops[key]
 
-    def compilation_calls(self, control: Any, spec_alone: bool, spec_shapes) -> list:
+    def _build_commit_context(
+        self, requests: int, rows_per: int, pages: int
+    ) -> Any:
+        """Commit multi-row prompt prefill ``aux`` ``[layers, rows, hidden]``
+        into the draft's five MLA KV pools (skipping ``positions < 0``)."""
+        key = ("commit_context", requests, rows_per, pages)
+        if key in self._ops:
+            return self._ops[key]
+        c, mla = self.config, self.mla
+        layers = c.layers
+        rows = requests * rows_per
+        ctx_names = ("fc", "context_norm", "context_tile", "kv_norm", "rope", "rot")
+        count = len(ctx_names)
+
+        def body(*args):
+            import jax
+            import jax.numpy as jnp
+
+            fc, context_norm, context_tile, kv_norm, rope, rot = (
+                args[i][0] for i in range(count)
+            )
+            pools = args[count : count + layers]
+            aux, ids = args[count + layers :]
+            positions = ids[rows : 2 * rows]
+            tables = ids[3 * rows + requests :].reshape(requests, pages)
+            rank = jax.lax.axis_index(AXIS)
+            host = rank // 8
+            aux_flat = jnp.transpose(aux, (1, 0, 2)).reshape(rows, c.context_width)
+            aux_host = jax.lax.dynamic_slice_in_dim(
+                aux_flat, host * mla.FC_IN, mla.FC_IN, axis=1
+            )
+            fc_part = jnp.dot(
+                aux_host.astype(jnp.float32),
+                fc.astype(jnp.float32),
+                preferred_element_type=jnp.float32,
+            ).astype(jnp.bfloat16)
+            gathered_fc = jax.lax.all_gather(fc_part, AXIS, axis=0)
+            reduced_fc = jnp.sum(
+                gathered_fc.reshape(4, 8, rows, mla.CHUNK).astype(jnp.float32),
+                axis=0,
+            ).astype(jnp.bfloat16)
+            fc_out = jnp.transpose(reduced_fc, (1, 0, 2)).reshape(rows, c.hidden)
+            context = mla.rms_norm(fc_out, context_norm, c.eps)
+            tile = jnp.dot(
+                context.astype(jnp.float32),
+                context_tile.astype(jnp.float32),
+                preferred_element_type=jnp.float32,
+            ).astype(jnp.bfloat16)
+            all_tiles = jax.lax.all_gather(tile, AXIS, axis=0)[
+                : layers * mla.CONTEXT_TILES
+            ]
+            context_kv = jnp.transpose(
+                all_tiles.reshape(layers, mla.CONTEXT_TILES, rows, mla.TILE),
+                (0, 2, 1, 3),
+            ).reshape(layers, rows, mla.LANES)
+            c_kv = mla.rms_norm(
+                context_kv[:, :, : c.kv_lora], kv_norm[:, :, : c.kv_lora], c.eps
+            )
+            safe_pos = jnp.clip(positions, 0, rope.shape[0] - 1)
+            cs = rope[safe_pos]
+            cos32, sin32 = cs[:, : c.rope], cs[:, c.rope :]
+            k_pe = context_kv[:, :, c.kv_lora : c.latent]
+            rotated = jnp.dot(
+                k_pe.astype(jnp.float32),
+                rot.astype(jnp.float32),
+                preferred_element_type=jnp.float32,
+            )
+            k_pe_roped = (
+                k_pe.astype(jnp.float32) * cos32[None, :, :]
+                + rotated * sin32[None, :, :]
+            ).astype(jnp.bfloat16)
+            pad = jnp.zeros((layers, rows, mla.LANES - c.latent), jnp.bfloat16)
+            latents = jnp.concatenate((c_kv, k_pe_roped, pad), axis=-1)
+            pools = self._commit(
+                pools, latents, jnp.repeat(tables, rows_per, axis=0), positions
+            )
+            return tuple(pools)
+
+        in_specs = (P(AXIS),) * (count + layers) + (P(), P())
+        out_specs = (P(AXIS),) * layers
+        self._ops[key] = register_op(
+            f"pallas::k3_dspark_mla_commit_context_r{requests}x{rows_per}",
+            self.mesh,
+            body,
+            in_specs,
+            out_specs,
+            donate_argnums=tuple(range(count, count + layers)),
+            export_key=repr(
+                (
+                    "dspark_mla_commit_context",
+                    requests,
+                    rows_per,
+                    pages,
+                    self.attention_dp,
+                    self.max_position,
+                    dataclasses.astuple(self.config),
+                    self.owner_table,
+                )
+            ),
+        )
+        return self._ops[key]
+
+    def commit_context(
+        self,
+        aux: torch.Tensor,
+        ids: torch.Tensor,
+        requests: int,
+        rows_per: int,
+        pages: int,
+    ) -> None:
+        """Compute and commit context latents from multi-row prompt prefill."""
+        op = self._build_commit_context(requests, rows_per, pages)
+        ctx_weights = tuple(
+            self.weights[n]
+            for n in ("fc", "context_norm", "context_tile", "kv_norm", "rope", "rot")
+        )
+        pools = op(*ctx_weights, *self.pools, aux, ids)
+        self._adopt(pools)
+
+    def compilation_calls(
+        self,
+        control: Any,
+        spec_alone: bool,
+        spec_shapes,
+        prefill_shapes: tuple[tuple[int, int], ...] = (),
+    ) -> list:
         from vllm_torchtpu.megakernel.compilation import CompileCall
 
         c = self.config
@@ -641,4 +767,27 @@ class MlaDsparkDraft:
                         priority=2 * rows,
                     )
                 )
+        ctx_weights = tuple(
+            self.weights[n]
+            for n in ("fc", "context_norm", "context_tile", "kv_norm", "rope", "rot")
+        )
+        for requests, rows_per in prefill_shapes:
+            rows = requests * rows_per
+            ids_size = 3 * rows + requests + requests * control.pages
+            calls.append(
+                CompileCall(
+                    self._build_commit_context(requests, rows_per, control.pages),
+                    (
+                        *ctx_weights,
+                        *self.pools,
+                        torch.empty(
+                            (len(self.aux_layers), rows, c.hidden),
+                            dtype=torch.bfloat16,
+                        ),
+                        torch.empty(ids_size, dtype=torch.int32),
+                    ),
+                    {},
+                    priority=rows,
+                )
+            )
         return calls

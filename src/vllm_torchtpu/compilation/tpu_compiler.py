@@ -178,10 +178,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # Still listed: on this base `pp_shift.py` is a second caller, so the
     # module stays even though the fused EP op no longer needs it.
     "vllm_torchtpu/distributed/sharded_jax_op.py",
-    # And the mesh they export with. Since google-pytorch/torch_tpu#3522 the
-    # order is the process group's rank order rather than something
-    # `build_ep_mesh` chooses, but the file still decides the axis and the
-    # shape the kernel exports against.
+    # And the mesh they export with: `build_ep_mesh` decides the axis, the
+    # shape and the device order (the DeviceAssignment) the kernel runs on.
     "vllm_torchtpu/distributed/ep_mesh.py",
     "vllm_torchtpu/distributed/pcp.py",
     "vllm_torchtpu/distributed/pallas_shapes.py",

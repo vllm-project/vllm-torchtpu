@@ -86,6 +86,20 @@ def parser() -> argparse.ArgumentParser:
         choices=("auto", "bfloat16", "fp8", "fp8_e4m3"),
         help="cache encoding, as vLLM's --kv-cache-dtype (FP8 uses 512-token pages)",
     )
+    top.add_argument(
+        "--workload-profile",
+        default="",
+        choices=(
+            "",
+            "auto",
+            "interactive_short",
+            "balanced_agg",
+            "decode_heavy",
+            "high_concurrency",
+            "high_batch_throughput",
+        ),
+        help="apply a KernelConfig workload profile preset before --set overrides",
+    )
     commands = top.add_subparsers(dest="command", required=True)
     bench.add_arguments(
         commands.add_parser("bench", help="kernel-only timing of the serving ops")
@@ -103,7 +117,7 @@ def parser() -> argparse.ArgumentParser:
     return top
 
 
-def kernel_config(overrides: list[str]):
+def kernel_config(overrides: list[str], workload_profile: str = ""):
     from vllm_torchtpu.megakernel.kimi_k3 import config
 
     fields = {}
@@ -114,7 +128,12 @@ def kernel_config(overrides: list[str]):
                 f"--set {item!r}: expected FIELD=VALUE with a KernelConfig field"
             )
         fields[name] = value
-    return config.install(config.KernelConfig().replace(**fields))
+    base = (
+        config.KernelConfig.for_workload_profile(workload_profile)
+        if workload_profile and hasattr(config.KernelConfig, "for_workload_profile")
+        else config.KernelConfig()
+    )
+    return config.install(base.replace(**fields))
 
 
 def main(argv: list[str]) -> int:
@@ -161,7 +180,8 @@ def main(argv: list[str]) -> int:
         coverage = LineCoverage(args.coverage)
         coverage.start()  # before the kernels import: their module-level lines count
     k3.configure_cache(args.kv_cache_dtype)
-    config = kernel_config(args.set)  # before any kernel module is imported
+    profile_name = getattr(args, "workload_profile", "") or ""
+    config = kernel_config(args.set, profile_name)  # before any kernel module is imported
     harness.log(
         f"kernel config {config.key()}"
         + (f" ({', '.join(args.set)})" if args.set else " (defaults)")

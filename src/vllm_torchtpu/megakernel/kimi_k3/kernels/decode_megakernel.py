@@ -1955,6 +1955,7 @@ class AttentionCommunicationWorkspace:
     projection_staging_vmem: Any = None  # above B32: [2, 4 * payload, 128] BF16
     routed_send_vmem: Any = None  # above B32: [8 * lane payload, 128] FP32
     attention_gather_vmem: Any = None  # B4: private final-gather packets
+    routed_consumed: Any = None  # routed reduce-scatter: host-mates done reading their slots
 
 
 class _ScopedWait:
@@ -2452,6 +2453,7 @@ def moe(
         communication_workspace.expert_host_reduction_vmem
     )
     routed_send_vmem = communication_workspace.routed_send_vmem
+    routed_consumed = communication_workspace.routed_consumed
     send_semaphores = communication_workspace.send_semaphores
     receive_semaphores = communication_workspace.receive_semaphores
     reduction_phase = communication_workspace.reduction_phase
@@ -3007,6 +3009,7 @@ def moe(
         assert shared_transport_payload <= shared_local_reduction_vmem.shape[1]
         assert reduce_scatter_routed_output or expert_transport_payload <= expert_local_reduction_vmem.shape[1]
         assert routed_send_vmem is None or reduce_scatter_routed_output
+        assert routed_consumed is not None or not reduce_scatter_routed_output
 
         latent_output_copy.start()
         if reduce_scatter_routed_output:
@@ -3051,6 +3054,10 @@ def moe(
                 ),
                 expert_host_reduction_vmem.at[rank // 8],
             )
+            # The receive slots are read: host-mates' all-gathers may reuse them.
+            for offset in range(1, 8):
+                pl.semaphore_signal(routed_consumed, 1, device_id=(rank ^ offset,),
+                                    device_id_type=pl.DeviceIdType.MESH)
             _phase_end(t3)
             t4 = _phase_start("t4_routed_host")
             for offset in range(3, 0, -1):
@@ -3067,6 +3074,7 @@ def moe(
                 reduced_token,
                 expert_local_reduction_vmem.at[lane],
             )
+            pl.semaphore_wait(routed_consumed, 7)
             for offset in range(7, 0, -1):
                 expert_copy(lane_payload, offset).start()
             if overlap_shared_reduction and not token_pipeline:
@@ -6451,8 +6459,8 @@ def stack(
     dp_held_rows = batch_size if sp_owners == 1 else group_rows_per_pair
     default_streams = (
         {**DCP_B32_WEIGHT_STREAMS, **(DCP_B32_DECODE_RINGS if sequence_rows == 1 else {})}
-        if (batch_size in (32, 64) and attention_dp == 1
-            and not _config().weight_streams)
+        if ((batch_size in (32, 64) or (batch_size == 16 and sequence_rows > 1))
+            and attention_dp == 1 and not _config().weight_streams)
         else {}
     )
     projection_streams = _attention_projection_streams(
@@ -6652,8 +6660,11 @@ def stack(
         gather_wire = None
         if b4_attention_gather:
             *common, gather_wire = common
+        routed_consumed = None
+        if moe_routed_reduce_scatter:
+            *common, routed_consumed = common
         communication_workspace = AttentionCommunicationWorkspace(
-            *common, attention_gather_vmem=gather_wire
+            *common, attention_gather_vmem=gather_wire, routed_consumed=routed_consumed
         )
         if compact_outputs:
             # Attention's whole-batch output argument is shape-checked but
@@ -6673,13 +6684,13 @@ def stack(
 
         def kda_state_reads(ref, vmem, semaphore, state_index):
             """The copies of a layer's input KDA states into ``vmem``: one,
-            or one per row from its slot (``state_slots``)."""
+            or one per sequence's initial row from its slot (``state_slots``)."""
             if not slot_reads or select_state_row:
                 return (tpu.make_async_copy(kda_state_source(ref, state_index),
                                             kda_state_destination(vmem), semaphore), )
             return tuple(tpu.make_async_copy(ref.at[pl.ds(slots_ref[b], 1), state_index],
                                              vmem.at[pl.ds(b, 1)], semaphore)
-                         for b in range(batch_size))
+                         for b in range(0, batch_size, sequence_rows))
 
         def kda_state_destination(vmem):
             return vmem.at[pl.ds(0, 1)] if select_state_row else vmem
@@ -8935,6 +8946,7 @@ def stack(
         tpu.VMEM((batch_size, 4096), jnp.bfloat16),
         *projection_staging_scratch(batch_size, attention_dp),
         *routed_send_scratch(batch_size),
+        *((tpu.SemaphoreType.REGULAR,) if moe_routed_reduce_scatter else ()),
         # Four 7168-element BF16 wires, padded to 64 BF16 transport rows.
         # Private storage (see B4_ATTENTION_GATHER).
         *((tpu.VMEM((4, 32, 128), jnp.float32),)
@@ -8963,6 +8975,7 @@ def stack(
         "attention_features", "attention_output", "send_semaphores",
         "receive_semaphores", "reduction_phase", "latent_gather",
         *(("projection_staging", "routed_send") if batch_size > 32 else ()),
+        *(("routed_consumed",) if moe_routed_reduce_scatter else ()),
         *(("attention_gather",) if b4_attention_gather else ()),
         "headroom_pad",
     )

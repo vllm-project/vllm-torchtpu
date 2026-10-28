@@ -223,6 +223,8 @@ class MultiHeadLatentAttention(nn.Module):
         self.v_head_dim = int(config.v_head_dim)
         self.qk_head_dim = qk_head_dim
 
+        self.use_output_gate = bool(getattr(config, "mla_use_output_gate", False))
+        self.gate_is_fused = False
         self.mla_gate_is_fused = False
         if self.q_lora_rank is None:
             self.q_proj = ColumnParallelLinear(
@@ -240,7 +242,7 @@ class MultiHeadLatentAttention(nn.Module):
                 self.q_lora_rank,
                 self.kv_lora_rank + self.qk_rope_head_dim,
             ]
-            if config.mla_use_output_gate:
+            if self.use_output_gate:
                 qkv_a_output_sizes.append(config.num_attention_heads * self.v_head_dim)
                 self.fused_qkv_a_proj = MixedParallelMergedLinear(
                     config.hidden_size,
@@ -250,6 +252,7 @@ class MultiHeadLatentAttention(nn.Module):
                     quant_config=quant_config,
                     prefix=f"{prefix}.fused_qkv_a_proj",
                 )
+                self.gate_is_fused = True
                 self.mla_gate_is_fused = True
             else:
                 self.fused_qkv_a_proj = MergedColumnParallelLinear(
@@ -294,7 +297,7 @@ class MultiHeadLatentAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.g_proj",
             )
-            if (config.mla_use_output_gate and not self.mla_gate_is_fused)
+            if (self.use_output_gate and not self.gate_is_fused)
             else None
         )
         self.o_proj = RowParallelLinear(
@@ -328,8 +331,9 @@ class MultiHeadLatentAttention(nn.Module):
                 dtype=torch.float32,
             )
 
+        self._sp_prefill = bool(envs.TPU_K3_SP_PREFILL)
         self.prefill_group = (
-            FusedPrefillCollectives(prefix) if envs.TPU_K3_SP_PREFILL else None
+            FusedPrefillCollectives(prefix) if self._sp_prefill else None
         )
         mla_modules = MLAModules(
             g_proj=self.g_proj,
@@ -359,7 +363,7 @@ class MultiHeadLatentAttention(nn.Module):
             vllm_config.cache_config,
             quant_config,
             prefix,
-            gate_is_fused=self.mla_gate_is_fused,
+            gate_is_fused=self.gate_is_fused,
             non_causal_multi_token_decode=non_causal_multi_token_decode,
         )
 
@@ -371,9 +375,12 @@ class MultiHeadLatentAttention(nn.Module):
         wrapper = self.mla_attn
         wrapper.kimi_preprocess = None
         wrapper.kimi_gate_weight = None
+        gate_fused = getattr(
+            self, "gate_is_fused", getattr(self, "mla_gate_is_fused", False)
+        )
         if not (
             isinstance(group, FusedPrefillCollectives)
-            and self.mla_gate_is_fused
+            and gate_fused
             and weight is not None
             and weight.dtype == torch.bfloat16
             and weight.shape == (7168, 2496)
@@ -399,7 +406,10 @@ class MultiHeadLatentAttention(nn.Module):
             and getattr(self.mla_attn, "kimi_preprocess", None) is None
         ):
             hidden_states = group.all_gather(hidden_states, dim=0)
-        if sequence_parallel and isinstance(group, FusedPrefillCollectives):
+        if sequence_parallel and (
+            isinstance(group, FusedPrefillCollectives)
+            or hasattr(group, "project_reduce_scatter")
+        ):
             return self.mla_attn(positions, hidden_states, prefill_group=group)
         output = self.mla_attn(positions, hidden_states)
         return (
@@ -636,9 +646,10 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         # `fused` is the lazy result of a stack of views, and torch_tpu
         # re-materializes that lineage as a per-step `tt_jit_as_strided`
         # program at the dispatched op's boundary (same failure mode and fix as
-        # the w_scale case in quantization/fp8.py). A fresh buffer filled by
-        # copy_ breaks the lazy chain so PJRT ships a plain row-major buffer.
-        out = torch.empty_like(fused)
+        # the w_scale case in quantization/fp8.py). A fresh float32 buffer
+        # filled by copy_ breaks the lazy chain and avoids a per-layer
+        # bf16->f32 convert_element_type kernel before the Pallas call.
+        out = torch.empty(fused.shape, dtype=torch.float32, device=fused.device)
         out.copy_(fused)
         self.conv_weight_fused = out
         self._pack_prefill_projection()
@@ -647,8 +658,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         """Cache BF16 KDA input weights after the normal checkpoint loaders."""
         self.packed_prefill_weight = None
         if not (
-            isinstance(getattr(self, "prefill_group", None), FusedPrefillCollectives)
-            and self.use_full_rank_gate
+            getattr(self, "use_full_rank_gate", False)
             and self.num_heads == 3
             and self.head_dim == 128
         ):
@@ -683,8 +693,15 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         if self.packed_prefill_weight is not None:
             # Every token bucket must capture the same parameter list: the
             # serving compiler hands executables between traces by input ABI.
-            if sequence_parallel and isinstance(group, FusedPrefillCollectives):
+            if sequence_parallel and (
+                isinstance(group, FusedPrefillCollectives)
+                or hasattr(group, "gather_project")
+            ):
                 packed = group.gather_project(hidden_states, self.packed_prefill_weight)
+            elif sequence_parallel and hasattr(group, "all_gather_matmul"):
+                packed = group.all_gather_matmul(
+                    hidden_states, self.packed_prefill_weight
+                )
             else:
                 if sequence_parallel:
                     hidden_states = group.all_gather(hidden_states, dim=0)
@@ -693,15 +710,13 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 [1152, 128, 384, 128], dim=-1
             )
             beta = beta_pad[:, : self.num_heads]
-            query = mixed_qkv[:, : self.local_projection_size]
         else:
             if sequence_parallel:
                 hidden_states = group.all_gather(hidden_states, dim=0)
             projected, _ = self.fused_qkvb_proj(hidden_states)
-            query, key, value, beta = projected.split(
-                [self.local_projection_size] * 3 + [self.num_heads], dim=-1
+            mixed_qkv, beta = projected.split(
+                [3 * self.local_projection_size, self.num_heads], dim=-1
             )
-            mixed_qkv = torch.cat((query, key, value), dim=-1)
             if self.use_full_rank_gate:
                 assert self.f_a_proj is not None
                 f_a, _ = self.f_a_proj(hidden_states)
@@ -720,7 +735,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
 
         metadata = self._metadata()
         if metadata is None or self.kv_cache is None or self.kv_cache[0].numel() == 0:
-            output = torch.zeros_like(query)
+            output = torch.zeros_like(mixed_qkv[:, : self.local_projection_size])
         elif len(self.kv_cache) == 1:
             # Unified pool: the single attention-shaped buffer carries both
             # KDA state regions.

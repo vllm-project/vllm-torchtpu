@@ -41,6 +41,30 @@ def _build_attention_residual_op(eps: float):
     return op
 
 
+@cache
+def _build_attention_residual_with_inv_rms_op(eps: float):
+    from torch_tpu._internal import pallas
+
+    from vllm_torchtpu.kernels.kimi_k3.attention_residual import attention_residual
+
+    def core(
+        prefix: jax.Array,
+        history: jax.Array,
+        weight: jax.Array,
+        block_inv_rms: jax.Array,
+    ) -> jax.Array:
+        return attention_residual(
+            prefix, history, weight, block_inv_rms, eps=eps
+        )
+
+    suffix = float(eps).hex().replace(".", "_").replace("-", "m").replace("+", "p")
+    op = pallas.jax_op(f"pallas::kimi_attention_residual_inv_{suffix}", core)
+    op.register_fake(
+        lambda prefix, history, weight, block_inv_rms: torch.empty_like(prefix)
+    )
+    return op
+
+
 class SituAndMul(nn.Module):
     """Kimi's SITU gated activation.
 
@@ -179,32 +203,72 @@ class AttentionResidual(nn.Module):
         self._prefill_op = (
             _build_attention_residual_op(self.eps) if out.device.type == "tpu" else None
         )
+        self._prefill_inv_rms_op = (
+            _build_attention_residual_with_inv_rms_op(self.eps)
+            if out.device.type == "tpu"
+            else None
+        )
 
     def forward(
         self,
         prefix_sum: torch.Tensor,
         block_residuals: torch.Tensor,
+        block_inv_rms: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if block_residuals.shape[1] == 0:
+        num_blocks = (
+            block_residuals.shape[0]
+            if block_residuals.ndim == 2
+            else block_residuals.shape[1]
+        )
+        if num_blocks == 0:
             return prefix_sum
-        if self._prefill_op is not None and prefix_sum.shape[0] % 16 == 0:
+        if (
+            self._prefill_op is not None
+            and prefix_sum.shape[0] >= 128
+            and prefix_sum.shape[0] % 8 == 0
+        ):
+            prefill_inv_op = getattr(self, "_prefill_inv_rms_op", None)
+            if block_inv_rms is not None and prefill_inv_op is not None:
+                return prefill_inv_op(
+                    prefix_sum, block_residuals, self.folded_weight, block_inv_rms
+                )
             return self._prefill_op(prefix_sum, block_residuals, self.folded_weight)
         w = self.folded_weight
         if prefix_sum.shape[0] == 1:
             # With one token the per-slot statistics below are scalars that
             # XLA leaves unfused; reducing over the concatenated slots keeps
-            # them one vector. A shape branch, so bucket 1 gets its own trace
-            # (see compilation.shape_variants).
+            # them one vector. A shape branch, so bucket 1 gets its own trace.
             values = torch.cat(
-                (block_residuals, prefix_sum.unsqueeze(-2)), dim=-2
-            ).float()  # [1, K, hidden]
-            inv = torch.rsqrt(values.pow(2).mean(-1) + self.eps)
-            probabilities = ((values * w).sum(-1) * inv).softmax(dim=-1)
-            out = (probabilities.unsqueeze(-1) * values).sum(dim=-2)
+                (
+                    block_residuals.reshape(-1, prefix_sum.shape[-1]),
+                    prefix_sum,
+                ),
+                dim=0,
+            ).float()  # [K, hidden]
+            if block_inv_rms is not None:
+                inv_prefix = torch.rsqrt(
+                    prefix_sum.float().pow(2).mean(-1) + self.eps
+                )
+                inv = torch.cat(
+                    (block_inv_rms.float().reshape(-1), inv_prefix), dim=0
+                )
+            else:
+                inv = torch.rsqrt(values.pow(2).mean(-1) + self.eps)
+            probabilities = ((values * w).sum(-1) * inv).softmax(dim=0)
+            out = (probabilities.unsqueeze(-1) * values).sum(dim=0, keepdim=True)
             return out.to(block_residuals.dtype)
-        v_blocks = block_residuals.float()
+        if block_residuals.ndim == 2:
+            tokens, hidden = prefix_sum.shape
+            v_blocks = (
+                block_residuals.view(-1, tokens, hidden).transpose(0, 1).float()
+            )
+        else:
+            v_blocks = block_residuals.float()
         v_prefix = prefix_sum.float()
-        inv_blocks = torch.rsqrt(v_blocks.pow(2).mean(-1) + self.eps)
+        if block_inv_rms is not None:
+            inv_blocks = block_inv_rms.transpose(0, 1).float()
+        else:
+            inv_blocks = torch.rsqrt(v_blocks.pow(2).mean(-1) + self.eps)
         inv_prefix = torch.rsqrt(v_prefix.pow(2).mean(-1) + self.eps)
         scores = torch.cat(
             (

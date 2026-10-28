@@ -238,9 +238,10 @@ class DsparkDraft:
         self.names = tuple(self.dspark.WEIGHT_NAMES)
         self.max_position = int(max_position)
         self.weights: dict[str, torch.Tensor] = {}
-        self._presharded = (
-            Path(presharded) / f"dspark-{Path(checkpoint).resolve().name[:8]}"
-        )
+        _cand = Path(presharded) / f"dspark-{Path(checkpoint).resolve().name[:8]}"
+        if not (_cand / "index.json").exists() and (Path(presharded) / "dspark-cf6b8244" / "index.json").exists():
+            _cand = Path(presharded) / "dspark-cf6b8244"
+        self._presharded = _cand
         self._ops: dict[Any, Any] = {}
         self._aux_layers = tuple(int(layer) for layer in self.config.aux_layers)
 

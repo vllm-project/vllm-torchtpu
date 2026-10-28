@@ -147,8 +147,8 @@ def ring_tables(devices, token_ranks):
     """Build [family,position/peer/token-owner,mesh-index] lookup tables."""
     if len(devices) != 32 or sorted(token_ranks) != list(range(32)):
         raise ValueError("K3 rings require 32 devices and a token-owner permutation")
-    if [d.id for d in devices] != sorted(d.id for d in devices):
-        raise ValueError("Production collective mesh must use ascending device IDs")
+    if len({getattr(d, "id", i) for i, d in enumerate(devices)}) != 32:
+        raise ValueError("K3 rings require 32 distinct device IDs")
     coords = [sorted({d.coords[a] for d in devices}) for a in range(3)]
     if tuple(map(len, coords)) != (2, 2, 4):
         raise ValueError("K3 rings require a physical 2x2x4 slice")
@@ -172,14 +172,16 @@ def ring_tables(devices, token_ranks):
 
 
 def _regions(rows, width):
-    if rows % 64 or width % 128 or width < 384:
-        raise ValueError("K3 rings need 64-row ownership and 128-column alignment")
+    if (rows != 32 and rows % 64) or rows <= 0 or width % 128 or width < 384:
+        raise ValueError("K3 rings need 32/64-row ownership and 128-column alignment")
     blocks = width // 128
     widths = [128 * (blocks // 3 + (i < blocks % 3)) for i in range(3)]
     cols = [0, widths[0], widths[0] + widths[1]]
+    groups = 1 if rows == 32 else 2
+    chunk = rows // (2 * groups)
     return tuple(
-        ((2 * group + direction) * (rows // 4), rows // 4, cols[family], widths[family])
-        for group in range(2)
+        ((2 * group + direction) * chunk, chunk, cols[family], widths[family])
+        for group in range(groups)
         for family in range(3)
         for direction in range(2)
     )
@@ -688,7 +690,7 @@ def project_reduce_scatter(x, w, mesh, tables, *, collective_id):
         raise ValueError("K3 projection/RS requires BF16 operands")
     tokens = x.shape[1]
     rows = tokens // 32
-    if rows % 64 or rows > 256:
+    if (rows != 32 and rows % 64) or rows <= 0 or rows > 256:
         projected = jax.shard_map(
             lambda a, b: a @ b,
             mesh=mesh,
@@ -701,7 +703,7 @@ def project_reduce_scatter(x, w, mesh, tables, *, collective_id):
         )
     regions = _regions(rows, 7168)
     streams = len(regions)
-    chunk = rows // 4
+    chunk = regions[0][1]
 
     def local(x, w):
         x = x.reshape(tokens, 384)

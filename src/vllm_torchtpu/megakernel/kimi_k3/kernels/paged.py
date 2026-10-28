@@ -129,22 +129,24 @@ def commit_latent_rows(pools, rows, block_tables, positions, pool_map, *, group=
     pools = list(pools)
     packing = pools[0].shape[-2]
     page_tokens = pools[0].shape[-3] * packing
-    pages = positions[:rows.shape[0]] // page_tokens
-    owned = pages % group == member
+    raw_pos = positions[:rows.shape[0]]
+    safe_pos = jnp.maximum(raw_pos, 0)
+    pages = safe_pos // page_tokens
+    owned = (pages % group == member) & (raw_pos >= 0)
     # Local tables hold one entry per ``group`` global pages.
     blocks = block_tables[jnp.arange(rows.shape[0]), pages if global_pages else pages // group]
     # One fused commit for all MLA layers; the generic scatter below handles
     # other layouts and repeated pool maps (ordered by layer, not token).
     if (_config().fused_cache_commit
-            and rows.shape[0] in (1, 2, 4, 8, 16, 32, 48, 64)
+            and rows.shape[0] in (1, 2, 4, 8, 16, 24, 32, 48, 64)
             and rows.shape[1:] == (len(pool_map), 640)
             and 0 < len(pool_map) <= MLA_LAYERS and len(set(pool_map)) == len(pool_map)
             and all(0 <= index < len(pools) for index in pool_map)
             and all(pool.shape[0] > 0 and pool.shape[1:] == (128, packing, 640)
                     and pool.dtype == pools[0].dtype for pool in pools)):
-        return _commit_latent_rows_fused(pools, rows, positions, blocks, owned, pool_map)
-    pairs = positions[:rows.shape[0]] % page_tokens // packing
-    halves = positions[:rows.shape[0]] % packing
+        return _commit_latent_rows_fused(pools, rows, safe_pos, blocks, owned, pool_map)
+    pairs = safe_pos % page_tokens // packing
+    halves = safe_pos % packing
     # One scatter per pool for all rows; rows this rank does not own point
     # past the pool and are dropped.
     for layer, index in enumerate(pool_map):
@@ -260,10 +262,10 @@ def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, 
         conv, recurrent = conv_slots[state_index], recurrent_slots[state_index]
     pools = tuple(pool)
     result = decode_local(
-        weights, (conv, recurrent, *pools), tokens, positions, batch_size=batch_size,
+        weights, (conv, recurrent, *pools), tokens, jnp.maximum(positions, 0), batch_size=batch_size,
         block_tables=block_tables, dcp_pool_map=dcp_pool_map, dcp_owner_table=dcp_owner_table,
         state_row=state_row, state_slots=state_index if in_place else None,
-        live_rows=slots != 0, **decode_options)
+        live_rows=(slots != 0) & (positions >= 0), **decode_options)
     aux = None
     if decode_options.get("aux_hidden_layers"):
         logits, aux, (conv, recurrent, new_keys, new_values) = result

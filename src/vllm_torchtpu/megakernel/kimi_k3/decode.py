@@ -38,8 +38,15 @@ import torch
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.megakernel.backend import (
+    _WORKLOAD_PROFILE_PREFILL_BATCHES,
+    _WORKLOAD_PROFILE_SPEC_BATCHES,
+)
 from vllm_torchtpu.megakernel.bridge import hbm, materialize, register_global_op
-from vllm_torchtpu.megakernel.config import MegakernelEngineConfig
+from vllm_torchtpu.megakernel.config import (
+    MegakernelEngineConfig,
+    get_active_kernel_config,
+)
 from vllm_torchtpu.megakernel.kimi_k3.decode_ops import (
     GREEDY,
     Control,
@@ -115,6 +122,17 @@ class KimiDecoder:
         # compiled verifier/drafter shape is derived from it.
         self.spec_tokens = (spec_tokens_per_batch(config) or ()) if draft else ()
         self.groups = int(ops.attention_dp)
+        kcfg = get_active_kernel_config()
+        cfg_spec_batches = (
+            config.spec_batches
+            or getattr(kcfg, "spec_batches", None)
+            or _WORKLOAD_PROFILE_SPEC_BATCHES.get(config.workload_profile)
+        )
+        allowed_spec_batches = (
+            tuple(sorted(set(cfg_spec_batches)))
+            if cfg_spec_batches
+            else SPEC_BATCHES
+        )
         shapes = set()
         for b, k in enumerate(self.spec_tokens):
             if k and self.groups > 1:
@@ -130,11 +148,11 @@ class KimiDecoder:
                     ):
                         shapes.add((compiled, k + 1))
             elif k and (b >= 2 or k == 3):
-                compiled = next((s for s in SPEC_BATCHES if s >= b), 0)
+                compiled = next((s for s in allowed_spec_batches if s >= b), 0)
                 if not compiled or compiled > max(ops.batch_sizes):
                     raise ValueError(
                         f"K3 decode: no compiled speculation batch holds {b} "
-                        f"requests (batches {SPEC_BATCHES}, up to "
+                        f"requests (batches {allowed_spec_batches}, up to "
                         f"{max(ops.batch_sizes)})"
                     )
                 shapes.add((compiled, k + 1))
@@ -151,6 +169,7 @@ class KimiDecoder:
         # while they still follow its next token).
         self._drafts: dict[str, Any] = {}
         self._fresh: dict[str, int] = {}
+        self._slot_tokens: dict[str, int] = {}
         self._mode_rows: dict[tuple[int, ...], torch.Tensor] = {}
         self._pads: list[Any] = []  # draft states of padding groups
         self._compiled_layout: tuple | None = None
@@ -273,6 +292,21 @@ class KimiDecoder:
         self.forget(step_input.finished)
         return StepOutput(self._decode(step_input.requests, mask))
 
+    def _imports_kda_state(self) -> bool:
+        """Whether unified-pool KDA state blocks are populated by a prefill
+        producer. In Aggregated P+D mode (``kv_consumer=False`` / no KV
+        transfer group), ``KimiDecoder`` keeps KDA state exclusively in
+        ``self.ops.slots`` and never writes KDA blocks to the unified pool."""
+        kv_consumer = getattr(self.config, "kv_consumer", None)
+        if kv_consumer is not None:
+            return bool(kv_consumer)
+        try:
+            from vllm.distributed.kv_transfer import has_kv_transfer_group
+
+            return bool(has_kv_transfer_group())
+        except Exception:
+            return False
+
     def _admit(self, request: RequestInput, slot: int) -> None:
         """A request's first step: import its KDA state after the tokens
         computed before this step into ``slot``, and its DSpark ring. A
@@ -282,8 +316,12 @@ class KimiDecoder:
         # position computed - 1, where the transfer committed it. (When the
         # computed tokens end on a block boundary the request already holds
         # the next block too; vLLM's runners would copy the state into it.)
-        kda = kda_blocks_at_length(
-            request.block_tables, self._kda_groups, request.computed
+        kda = (
+            kda_blocks_at_length(
+                request.block_tables, self._kda_groups, request.computed
+            )
+            if self._imports_kda_state()
+            else np.zeros(len(self._kda_groups) or KDA_LAYERS, dtype=np.int32)
         )
         if self.groups > 1 and int(kda.max()) >= self._num_blocks:
             raise RuntimeError(
@@ -300,7 +338,7 @@ class KimiDecoder:
         kda_blocks = torch.from_numpy(kda).to("tpu")
         conv, recurrent = self._importer.import_state(*self.ops.slots, kda_blocks, slot)
         self.ops.slots = [conv, recurrent]
-        if self._ring:
+        if self._ring and kda.any():
             # The DSpark ring the prefill wrote beside the state (cold unless
             # it wrote one for exactly these tokens): the request's first
             # speculation starts from it instead of a cold ring.
@@ -513,7 +551,10 @@ class KimiDecoder:
             )
         if requests < 1 or (requests == 1 and 1 not in self.spec_batches):
             return 0
-        return next((b for b in self.spec_batches if b >= requests), 0)
+        return next(
+            (b for b, rows in self.spec_shapes if rows == rows_per and b >= requests),
+            0,
+        )
 
     def _modes_for(self, modes: tuple[int, ...]) -> torch.Tensor:
         if modes not in self._mode_rows:
@@ -551,6 +592,56 @@ class KimiDecoder:
         self.device_plan = layout.consumed(plan, len(entries))
         return True
 
+    def draft_width_for_batch(self, decoding_reqs: int) -> int:
+        """The number of DSpark drafts scheduled for ``decoding_reqs`` active
+        decoding requests (0 when not speculating or above the schedule tail)."""
+        if 0 < decoding_reqs < len(self.spec_tokens):
+            return int(self.spec_tokens[decoding_reqs])
+        return 0
+
+    def _prefill_shapes(self) -> tuple[tuple[int, int], ...]:
+        """Compiled ``(requests, rows_per)`` shapes for multi-row prompt prefill."""
+        if self.groups > 1 or not hasattr(self.ops, "prefill_chunk"):
+            return ()
+        kcfg = get_active_kernel_config()
+        cfg_rows = self.config.prefill_rows or getattr(kcfg, "prefill_rows", None)
+        rows_arg = cfg_rows or (8,)
+        default_cap = next(
+            (r for r in (1, 2, 4, 8) if r >= max(1, int(self.config.max_num_seqs))),
+            8,
+        )
+        cfg_batches = (
+            self.config.prefill_batches
+            or getattr(kcfg, "prefill_batches", None)
+            or _WORKLOAD_PROFILE_PREFILL_BATCHES.get(self.config.workload_profile)
+        )
+        if self.config.prefill_batches:
+            effective_batches = self.config.prefill_batches
+        elif cfg_batches:
+            effective_batches = tuple(r for r in cfg_batches if r <= default_cap) or (
+                min(cfg_batches),
+            )
+        else:
+            effective_batches = None
+        max_req = max(effective_batches) if effective_batches else default_cap
+        if hasattr(self.ops, "prefill_shapes"):
+            shapes = tuple(
+                self.ops.prefill_shapes(max_requests=max_req, rows_per=rows_arg)
+            )
+            if effective_batches is not None:
+                allowed_b = set(effective_batches)
+                shapes = tuple((r, k) for r, k in shapes if r in allowed_b)
+            if cfg_rows is not None:
+                allowed_k = set(cfg_rows)
+                shapes = tuple((r, k) for r, k in shapes if k in allowed_k)
+            return shapes
+        batches_list = effective_batches or tuple(
+            r for r in (1, 2, 4, 8) if r <= max_req
+        )
+        return tuple(
+            sorted({(int(r), int(k)) for r in batches_list for k in rows_arg})
+        )
+
     def _replay(
         self,
         slot: int,
@@ -559,19 +650,121 @@ class KimiDecoder:
         table: np.ndarray,
         group: int = 0,
     ) -> None:
-        """Tokens computed on this role (a recompute after a preemption):
-        one batch-one plain step per token (on a row of its DP ``group``),
-        their outputs discarded."""
-        batch = self.ops.batch_for(1)
-        for offset, token in enumerate(tokens):
-            entries = [(slot, True, int(token), start + offset, GREEDY)]
-            if self.groups > 1:
-                _, entries, tables, _ = self._place(
-                    [group], entries, [table], len(table)
+        """Single-request prompt replay wrapper over :meth:`_replay_batch`."""
+        pages = self._pages if self._pages is not None else len(table)
+        self._replay_batch([(slot, np.asarray(tokens, np.int32), start, table, group)], pages)
+
+    def _replay_batch(
+        self,
+        replays: Sequence[tuple[int, np.ndarray, int, np.ndarray, int]],
+        pages: int,
+    ) -> None:
+        """Ingest prompt tokens across one or more requests in multi-row causal
+        chunks (:meth:`DecodeOps.prefill_chunk`) when available, committing both
+        target MLA/KDA state and DSpark draft MLA latents (:meth:`commit_context`).
+        Falls back to batched plain steps when ``prefill_chunk`` is unavailable."""
+        items = [
+            [int(slot), np.asarray(tokens, np.int32), int(start), table, int(group), 0]
+            for slot, tokens, start, table, group in replays
+            if len(tokens) > 0
+        ]
+        if not items:
+            return
+        shapes = self._prefill_shapes()
+        if shapes:
+            aux_layers = (
+                tuple(self.draft.aux_layers)
+                if self.draft is not None and hasattr(self.draft, "commit_context")
+                else ()
+            )
+            rows_options = sorted({k for _, k in shapes})
+            max_r = max(r for r, _ in shapes)
+            while True:
+                active = [it for it in items if it[5] < len(it[1])]
+                if not active:
+                    break
+                candidate_items = active[:max_r]
+                max_rem = max(len(it[1]) - it[5] for it in candidate_items)
+                rows_per = rows_options[-1]
+                for candidate_k in rows_options:
+                    if max_rem <= candidate_k:
+                        rows_per = candidate_k
+                        break
+                r_options = sorted(r for r, k in shapes if k == rows_per)
+                batch_active = active[: r_options[-1]]
+                R = next(r for r in r_options if r >= len(batch_active))
+                total_rows = R * rows_per
+                tok_arr = np.zeros(total_rows, dtype=np.int32)
+                pos_arr = np.full(total_rows, -1, dtype=np.int32)
+                slot_arr = np.zeros(total_rows, dtype=np.int32)
+                vlen_arr = np.zeros(R, dtype=np.int32)
+                tbl_arr = np.zeros((R, pages), dtype=np.int32)
+                for r_idx, it in enumerate(batch_active):
+                    slot, tokens, start, table, _group, cursor = it
+                    rem = len(tokens) - cursor
+                    vlen = min(rows_per, rem)
+                    base = r_idx * rows_per
+                    tok_arr[base : base + vlen] = tokens[cursor : cursor + vlen]
+                    pos_arr[base : base + vlen] = start + cursor + np.arange(
+                        vlen, dtype=np.int32
+                    )
+                    slot_arr[base : base + vlen] = slot
+                    slot_arr[base] = slot
+                    vlen_arr[r_idx] = vlen
+                    width = min(pages, len(table))
+                    tbl_arr[r_idx, :width] = table[:width]
+                    it[5] = cursor + vlen
+                ids_np = np.concatenate(
+                    (tok_arr, pos_arr, slot_arr, vlen_arr, tbl_arr.reshape(-1))
                 )
-                self._sync_plan(entries, tables)
+                ids_tpu = torch.from_numpy(ids_np).to("tpu")
+                aux = self.ops.prefill_chunk(
+                    R, rows_per, pages, ids_tpu, aux_layers=aux_layers
+                )
+                if (
+                    aux is not None
+                    and self.draft is not None
+                    and hasattr(self.draft, "commit_context")
+                ):
+                    self.draft.commit_context(aux, ids_tpu, R, rows_per, pages)
+            return
+
+        # Fallback when prefill_chunk is unavailable (e.g. attention_dp > 1):
+        # step active replay requests together in batched plain_step calls.
+        while True:
+            active = [it for it in items if it[5] < len(it[1])]
+            if not active:
+                break
+            if self.groups > 1:
+                max_batch = max(self.ops.batch_sizes)
+                per_group_cap = max_batch // self.groups
+                group_counts = [0] * self.groups
+                batch_active = []
+                for it in active:
+                    g = it[4]
+                    if group_counts[g] < per_group_cap:
+                        batch_active.append(it)
+                        group_counts[g] += 1
             else:
-                self._sync_plan(entries, [table])
+                batch_active = active[: max(self.ops.batch_sizes)]
+            entries = []
+            tables = []
+            groups = []
+            for it in batch_active:
+                slot, tokens, start, table, group, cursor = it
+                entries.append(
+                    (slot, True, int(tokens[cursor]), start + cursor, GREEDY)
+                )
+                tables.append(table)
+                groups.append(group)
+                it[5] = cursor + 1
+            if self.groups > 1:
+                batch, entries, tables, _ = self._place(
+                    groups, entries, tables, pages
+                )
+            else:
+                batch = self.ops.batch_for(len(entries))
+            self._sync_plan(entries, tables)
             _, self.control = self.ops.plain_step(
                 self.control, batch, self.layout, self.sub_base, False
             )
@@ -587,6 +780,7 @@ class KimiDecoder:
             self._offered.pop(req, None)
             self._drafts.pop(req, None)
             self._fresh.pop(req, None)
+            self._slot_tokens.pop(req, None)
         if self.spec_req in finished:
             self.spec_req, self.draft_state, self.next_ids = None, None, None
 
@@ -655,37 +849,58 @@ class KimiDecoder:
         pages = self._pages
         assert pages is not None
         layout = self._prepare(pages)
-        entries, tables, decoding = [], [], []
+        entries, tables, decoding, replays = [], [], [], []
         for i, request in enumerate(requests):
             if request.scheduled <= 0:
                 continue
             table = self._mla_table(request)
             group = self._group_of(request) if self.groups > 1 else 0
-            if self.slot_map.group(request.req_id) not in (None, group):
-                # Only its old group held its state: placed in another group
-                # (after a preemption), it starts there as a new request.
-                self.slot_map.release([request.req_id])
+            if (
+                self.slot_map.group(request.req_id) not in (None, group)
+                or request.computed < self._slot_tokens.get(request.req_id, 0)
+                or (
+                    request.req_id in self.tracked
+                    and (
+                        request.partial
+                        or request.computed < request.num_prompt_tokens - 1
+                    )
+                )
+            ):
+                # Placed in another group or resumed/rewound after preemption:
+                # forget its stale slot and draft state so it starts fresh.
+                self.forget([request.req_id])
             fresh = request.req_id not in self.slot_map
             slot = self.slot_map.allocate(request.req_id, group)
             if fresh:
                 self.tracked.discard(request.req_id)
                 self._admit(request, slot)
+            self._slot_tokens[request.req_id] = request.end
             sampling = request.sampling.as_tuple()
             if request.req_id in self.tracked:
                 entries.append((slot, False, 0, 0, sampling))
             else:
                 # Scheduled slots past the known tokens are draft slots (vLLM
                 # pads a request starting to decode to the speculative width).
+                # In Aggregated P+D mode (no KDA state transfer), a fresh
+                # request starts from a zeroed KDA slot and must replay from 0
+                # even if prefix caching reported computed > 0.
+                start = (
+                    0
+                    if (fresh and not self._imports_kda_state())
+                    else request.computed
+                )
                 known = min(request.end, request.num_tokens)
-                tokens = request.token_ids[request.computed : known]
+                tokens = request.token_ids[start:known]
                 replay = len(tokens) - (0 if request.partial else 1)
-                if replay:
-                    self._replay(
-                        slot,
-                        tokens[:replay],
-                        request.computed,
-                        table,
-                        self._group_of(request) if self.groups > 1 else 0,
+                if replay > 0:
+                    replays.append(
+                        (
+                            slot,
+                            tokens[:replay],
+                            start,
+                            table,
+                            group,
+                        )
                     )
                 if request.partial:
                     continue
@@ -693,6 +908,8 @@ class KimiDecoder:
                 self.tracked.add(request.req_id)
             tables.append(table)
             decoding.append((i, request))
+        if replays:
+            self._replay_batch(replays, pages)
         sampled = any(entry[4][0] > 0 for entry in entries)
         emitted = None
         placed = None  # attention DP: the plan row of each decoding request
@@ -713,11 +930,10 @@ class KimiDecoder:
         compiled = self._spec_batch(len(decoding), k + 1, groups) if k else 0
         if self.spec_alone and len(decoding) == 1 and k == self.WIDTH - 1:
             emitted = self._speculate(decoding[0][1], entries, tables, sampled)
-        elif compiled and (
-            len(decoding) == 1 or any(r.scheduled > 1 for _, r in decoding)
-        ):
-            # A lone request speculates from its anchor-only first step;
-            # ``_fresh`` keeps its placeholder draft rows from being accepted.
+        elif compiled:
+            # Speculate from the anchor-only first step as well as continuing
+            # steps; ``_fresh`` keeps placeholder draft rows from being accepted
+            # while populating the draft state and draft KV cache on the anchor.
             emitted, placed = self._speculate_batched(
                 decoding, entries, tables, sampled, compiled, groups
             )
@@ -757,6 +973,10 @@ class KimiDecoder:
                 self.control, batch, layout, self.sub_base, sampled, mask_operand
             )
         decoded = [i for i, _ in decoding]
+        if emitted is None:
+            return torch.full(
+                (max(len(requests), 1), self.WIDTH), -1, dtype=torch.int32
+            ).to("tpu")
         if placed is not None:
             # Plan rows back to the runner's rows.
             position_of = dict(zip(decoded, placed, strict=True))
@@ -765,10 +985,6 @@ class KimiDecoder:
         else:
             position_of = {i: k for k, i in enumerate(decoded)}
         # Rows without a token this step: -1 rows around the decoded ones.
-        if emitted is None:
-            return torch.full(
-                (max(len(requests), 1), self.WIDTH), -1, dtype=torch.int32
-            ).to("tpu")
         blank = int(emitted.shape[0])
         index = torch.tensor(
             [position_of.get(r, blank) for r in range(len(requests))], dtype=torch.int64
@@ -856,7 +1072,11 @@ class KimiDecoder:
         modes = [0] * compiled
         for row, (_, r) in zip(rows, decoding, strict=True):
             states[row] = self._take_state(r.req_id)
-            modes[row] = int(self._fresh.get(r.req_id, 0) >= k and r.scheduled >= k)
+            modes[row] = int(
+                not entries[row][1]
+                and self._fresh.get(r.req_id, 0) >= k
+                and r.scheduled >= k
+            )
         padding = [row for row in range(compiled) if states[row] is None]
         for row in padding:  # padding groups (null slot): reused states
             states[row] = (
@@ -917,6 +1137,8 @@ class KimiDecoder:
             return emitted
 
         if self._compiled_layout != self.layout.key():
+            import inspect
+
             from torch_tpu._internal.sync import synchronize
 
             from vllm_torchtpu.megakernel.compilation import compile_ops
@@ -929,6 +1151,10 @@ class KimiDecoder:
                 [first, self.control, *self.ops.slots, *self.ops.unified_pools],
                 wait=False,
             )
+            p_shapes = self._prefill_shapes()
+            ops_kw: dict[str, Any] = {"masked_ops": True}
+            if "prefill_shapes" in inspect.signature(self.ops.compilation_calls).parameters:
+                ops_kw["prefill_shapes"] = p_shapes
             calls = self.ops.compilation_calls(
                 self.layout,
                 self.sub_base,
@@ -936,12 +1162,19 @@ class KimiDecoder:
                 self.spec_alone,
                 self.spec_shapes,
                 self.draft._synthetic_rates if self.draft is not None else None,
-                masked_ops=True,
+                **ops_kw,
             )
             if self.draft is not None:
+                draft_kw: dict[str, Any] = {}
+                if (
+                    hasattr(self.draft, "commit_context")
+                    and "prefill_shapes"
+                    in inspect.signature(self.draft.compilation_calls).parameters
+                ):
+                    draft_kw["prefill_shapes"] = p_shapes
                 calls.extend(
                     self.draft.compilation_calls(
-                        self.layout, self.spec_alone, self.spec_shapes
+                        self.layout, self.spec_alone, self.spec_shapes, **draft_kw
                     )
                 )
             calls.sort(key=lambda call: call.priority, reverse=True)
@@ -966,6 +1199,40 @@ class KimiDecoder:
             ]
             for emitted in outs:
                 materialize(emitted)
+
+        def prefill_chunks() -> None:
+            shapes = self._prefill_shapes()
+            if not shapes:
+                return
+            aux_layers = (
+                tuple(self.draft.aux_layers)
+                if self.draft is not None and hasattr(self.draft, "commit_context")
+                else ()
+            )
+            outs = []
+            for requests, rows_per in shapes:
+                total_rows = requests * rows_per
+                ids_np = np.zeros(
+                    3 * total_rows + requests + requests * pages, dtype=np.int32
+                )
+                ids_np[total_rows : 2 * total_rows] = -1
+                ids_tpu = torch.from_numpy(ids_np).to("tpu")
+                aux = self.ops.prefill_chunk(
+                    requests, rows_per, pages, ids_tpu, aux_layers=aux_layers
+                )
+                if (
+                    aux is not None
+                    and self.draft is not None
+                    and hasattr(self.draft, "commit_context")
+                ):
+                    self.draft.commit_context(aux, ids_tpu, requests, rows_per, pages)
+                if aux is not None:
+                    outs.append(aux)
+            for out in outs:
+                materialize(out)
+            materialize(self.ops.slots[1])
+            if getattr(self.draft, "pools", None):
+                materialize(self.draft.pools[0])
 
         def speculate(sampled: bool, offered=None, state=None) -> None:
             params = (0.7, 0.9, 20, 1) if sampled else GREEDY
@@ -1066,6 +1333,7 @@ class KimiDecoder:
                 speculate(sampled, state=states[0])
 
         speculating = self.draft is not None and (self.spec_alone or self.spec_batches)
+        prefill_chunks()
         for sampled in (False, True):
             plain(sampled)
             if speculating:

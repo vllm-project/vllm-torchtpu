@@ -55,6 +55,12 @@ class MegakernelEngineConfig:
     # Decoder attention data parallelism: groups of TP / attention_dp ranks,
     # each decoding its own requests with DCP over the group.
     attention_dp: int = 1
+    # Aggregated P+D workload profile and multi-row prompt prefill settings.
+    workload_profile: str = "auto"
+    prefill_rows: tuple[int, ...] | None = None
+    prefill_batches: tuple[int, ...] | None = None
+    spec_batches: tuple[int, ...] | None = None
+    kv_consumer: bool | None = None
 
     @classmethod
     def from_vllm_config(cls, vllm_config: Any) -> MegakernelEngineConfig:
@@ -97,6 +103,11 @@ class MegakernelEngineConfig:
                 spec, backend.synthetic_acceptance_lengths(vllm_config)
             ),
             attention_dp=backend.attention_dp(vllm_config),
+            workload_profile=backend.workload_profile(vllm_config),
+            prefill_rows=backend.prefill_rows(vllm_config),
+            prefill_batches=backend.prefill_batches(vllm_config),
+            spec_batches=backend.spec_batches(vllm_config),
+            kv_consumer=backend.is_kv_consumer(vllm_config),
         )
 
 

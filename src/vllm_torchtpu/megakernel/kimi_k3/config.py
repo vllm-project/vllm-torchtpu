@@ -15,6 +15,59 @@ from typing import Any
 
 from vllm_torchtpu.megakernel.config import set_active_kernel_config
 
+WORKLOAD_PROFILES: dict[str, dict[str, Any]] = {
+    "auto": {
+        "compile_batches": (1, 2, 4, 8, 16),
+        "prefill_rows": (8,),
+        "prefill_batches": (1, 2, 4, 8),
+        "spec_batches": (1, 2, 4, 8),
+        "spec_schedule": ((1, 1, 7), (2, 4, 3), (5, 64, 0)),
+    },
+    "interactive_short": {
+        "compile_batches": (1, 2, 4, 8),
+        "prefill_rows": (8,),
+        "prefill_batches": (1, 2, 4),
+        "spec_batches": (1, 2, 4),
+        "spec_schedule": ((1, 1, 7), (2, 4, 3), (5, 64, 0)),
+    },
+    "balanced_agg": {
+        "compile_batches": (1, 2, 4, 8, 16),
+        "prefill_rows": (8,),
+        "prefill_batches": (1, 2, 4, 8),
+        "spec_batches": (1, 2, 4, 8),
+        "spec_schedule": ((1, 1, 7), (2, 4, 3), (5, 64, 0)),
+    },
+    "decode_heavy": {
+        "compile_batches": (1, 2, 4, 8, 16, 32),
+        "prefill_rows": (8,),
+        "prefill_batches": (1, 2, 4),
+        "spec_batches": (1, 2, 4, 8),
+        "spec_schedule": ((1, 1, 7), (2, 4, 3), (5, 64, 0)),
+    },
+    "high_concurrency": {
+        "compile_batches": (1, 2, 4, 8, 16, 32, 64),
+        "prefill_rows": (8,),
+        "prefill_batches": (1, 2, 4, 8),
+        "spec_batches": (1, 2, 4, 8),
+        "spec_schedule": ((1, 1, 7), (2, 64, 0)),
+    },
+    "high_batch_throughput": {
+        "compile_batches": (1, 2, 4, 8, 16, 32, 64),
+        "prefill_rows": (8,),
+        "prefill_batches": (1, 2, 4, 8),
+        "spec_batches": (1, 2, 4, 8),
+        "spec_schedule": ((1, 1, 7), (2, 64, 0)),
+    },
+}
+
+
+def _int_tuple(value: Any) -> tuple[int, ...]:
+    if isinstance(value, int):
+        return (int(value),)
+    if isinstance(value, str):
+        return tuple(int(x.strip()) for x in value.split(",") if x.strip())
+    return tuple(int(x) for x in value)
+
 
 @dataclasses.dataclass(frozen=True)
 class KernelConfig:
@@ -73,6 +126,13 @@ class KernelConfig:
     # Weight loading.
     read_streams: int = 4
     load_inflight_gb: float = 16.0
+    # Aggregated P+D multi-row prompt prefill and workload-adaptive presets.
+    prefill_rows: tuple[int, ...] = (8,)
+    prefill_batches: tuple[int, ...] = (1, 2, 4, 8)
+    workload_profile: str = "auto"
+    agg_compile_batches: tuple[int, ...] = ()
+    agg_spec_schedule: tuple[tuple[int, int, int], ...] = ()
+    spec_batches: tuple[int, ...] = ()
     # Diagnostics (off in serving): dcp_skip and debug_skip skip named work, so
     # results are invalid (timing or hang bisection only); the rest add trace
     # scopes, VMEM reports or VMEM padding.
@@ -96,6 +156,65 @@ class KernelConfig:
             raise ValueError(
                 "mla_decode_ktile=2048 requires attention_dp=2 and dcp_group=16"
             )
+        rows = _int_tuple(self.prefill_rows)
+        if any(r not in (4, 8) for r in rows):
+            raise ValueError(f"prefill_rows entries must be 4 or 8, got {rows}")
+        object.__setattr__(self, "prefill_rows", rows)
+        object.__setattr__(self, "prefill_batches", _int_tuple(self.prefill_batches))
+        object.__setattr__(
+            self, "agg_compile_batches", _int_tuple(self.agg_compile_batches)
+        )
+        object.__setattr__(self, "spec_batches", _int_tuple(self.spec_batches))
+        if self.agg_spec_schedule:
+            object.__setattr__(
+                self,
+                "agg_spec_schedule",
+                tuple((int(lo), int(hi), int(k)) for lo, hi, k in self.agg_spec_schedule),
+            )
+        if self.workload_profile not in WORKLOAD_PROFILES:
+            raise ValueError(
+                f"workload_profile must be one of {tuple(WORKLOAD_PROFILES)}, "
+                f"got {self.workload_profile!r}"
+            )
+
+    @property
+    def prefill_chunk_rows(self) -> tuple[int, ...]:
+        return self.prefill_rows
+
+    def resolve_preset(self) -> dict[str, Any]:
+        """Return the resolved preset dictionary for ``self.workload_profile``."""
+        preset = dict(WORKLOAD_PROFILES[self.workload_profile])
+        if self.agg_compile_batches:
+            preset["compile_batches"] = self.agg_compile_batches
+        if self.prefill_rows != (8,) or self.workload_profile == "auto":
+            preset["prefill_rows"] = self.prefill_rows
+        if self.prefill_batches != (1, 2, 4, 8) or self.workload_profile == "auto":
+            preset["prefill_batches"] = self.prefill_batches
+        if self.spec_batches:
+            preset["spec_batches"] = self.spec_batches
+        if self.agg_spec_schedule:
+            preset["spec_schedule"] = self.agg_spec_schedule
+        return preset
+
+    @classmethod
+    def for_workload_profile(
+        cls, profile: str = "auto", **overrides: Any
+    ) -> "KernelConfig":
+        if profile not in WORKLOAD_PROFILES:
+            raise ValueError(
+                f"workload_profile must be one of {tuple(WORKLOAD_PROFILES)}, "
+                f"got {profile!r}"
+            )
+        preset = WORKLOAD_PROFILES[profile]
+        base = cls(
+            workload_profile=profile,
+            prefill_rows=preset["prefill_rows"],
+            prefill_batches=preset["prefill_batches"],
+            agg_compile_batches=preset["compile_batches"],
+            agg_spec_schedule=preset["spec_schedule"],
+            spec_batches=preset["spec_batches"],
+        )
+        return base.replace(**overrides) if overrides else base
 
     def key(self) -> str:
         """A stable digest of every field, for caches of compiled kernels."""
@@ -103,15 +222,32 @@ class KernelConfig:
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
     def replace(self, **fields: Any) -> "KernelConfig":
+        if "prefill_chunk_rows" in fields and "prefill_rows" not in fields:
+            fields["prefill_rows"] = fields.pop("prefill_chunk_rows")
+        else:
+            fields.pop("prefill_chunk_rows", None)
         return dataclasses.replace(
             self, **{name: _coerce(self, name, value) for name, value in fields.items()}
         )
 
 
+_INT_TUPLE_FIELDS = frozenset(
+    {"prefill_rows", "prefill_batches", "agg_compile_batches", "spec_batches"}
+)
+
+
 def _coerce(config: KernelConfig, name: str, value: Any) -> Any:
-    """Parse a command-line string into the field's type."""
+    """Parse a command-line string or JSON value into the field's type."""
+    if name in _INT_TUPLE_FIELDS:
+        return _int_tuple(value)
+    if name == "agg_spec_schedule":
+        if isinstance(value, str):
+            value = json.loads(value)
+        return tuple((int(lo), int(hi), int(k)) for lo, hi, k in value)
     current = getattr(config, name)
     if not isinstance(value, str):
+        if isinstance(current, tuple) and isinstance(value, list):
+            return tuple(value)
         return value
     if current is None:  # an optional override: parse by the declared type
         if value.lower() in ("", "none"):
