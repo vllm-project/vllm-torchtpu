@@ -351,7 +351,9 @@ def get_tile_sizes(
         )
         mixed_tile_size = vmem_fit
 
-    # Guarantee strictly positive tile sizes (>= 1) for Pallas grid compilation.
+    # Guarantee strictly positive tile sizes (>= 1) for Pallas grid compilation,
+    # keeping mixed_tile_size a power of two so triangular_block_size divides it.
     decode_tile_size = max(1, min(decode_tile_size, padded_batch_size))
     mixed_tile_size = max(1, min(mixed_tile_size, batch_size))
+    mixed_tile_size = 1 << (mixed_tile_size.bit_length() - 1)
     return decode_tile_size, mixed_tile_size
