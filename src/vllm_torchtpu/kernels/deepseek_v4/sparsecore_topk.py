@@ -770,6 +770,10 @@ def _sc_topk_direct(
     if p > 1:
         lengths = jnp.repeat(lengths, p)
     lengths_2d = jnp.pad(lengths[:, None], ((0, 0), (0, LANES - 1)))
+    if bounded_copy:
+        # Keep the lengths a buffer: XLA folds lengths known at compile time into
+        # a literal, which the SparseCore lowering cannot address as an operand.
+        lengths_2d = lax.optimization_barrier(lengths_2d)
 
     extra_inputs = ()
     if local_idxs is not None:
