@@ -23,7 +23,10 @@ Builds the vllm-torchtpu image from the repository root as the docker context.
 Options:
   -t, --image-tag TAG      Tag for the built image (default: vllm-torchtpu-local)
   -s, --vllm-source DIR    Local vLLM source tree to install in editable mode
+  -c, --vllm-commit-hash   Override the vLLM git ref/commit built in base
       --target TARGET      Dockerfile stage to build: prod, dev, ci, or omni (default: prod)
+      --cache-from REF     External BuildKit cache image/source (repeatable)
+      --inline-cache       Embed BuildKit inline cache metadata in the built image
   -h, --help               Show this help and exit
 
 Examples:
@@ -43,6 +46,11 @@ IMAGE_TAG="vllm-torchtpu-local"
 VLLM_SOURCE=""
 VLLM_COMMIT_HASH=""
 TARGET="prod"
+CACHE_FROM=()
+INLINE_CACHE="${DOCKER_INLINE_CACHE:-0}"
+if [[ -n "${DOCKER_CACHE_FROM:-}" ]]; then
+  CACHE_FROM+=("${DOCKER_CACHE_FROM}")
+fi
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -62,6 +70,14 @@ while [[ $# -gt 0 ]]; do
     --target)
       TARGET="$2"
       shift 2
+      ;;
+    --cache-from)
+      CACHE_FROM+=("$2")
+      shift 2
+      ;;
+    --inline-cache)
+      INLINE_CACHE="1"
+      shift
       ;;
     -h|--help)
       usage
@@ -145,13 +161,21 @@ fi
 
 echo "Build Target: $TARGET"
 DOCKER_ARGS=(
-  --progress=plain \
-  -f "${SCRIPT_DIR}/Dockerfile" \
-  -t "${IMAGE_TAG}" \
-  --target "${TARGET}" \
-  --build-arg VLLM_SOURCE="${VLLM_SOURCE}" \
-  --build-arg VLLM_COMMIT_HASH="${VLLM_COMMIT_HASH}" \
+  --progress=plain
+  -f "${SCRIPT_DIR}/Dockerfile"
+  -t "${IMAGE_TAG}"
+  --target "${TARGET}"
+  --build-arg VLLM_SOURCE="${VLLM_SOURCE}"
+  --build-arg VLLM_COMMIT_HASH="${VLLM_COMMIT_HASH}"
 )
+if [[ "${INLINE_CACHE}" == "1" ]]; then
+  DOCKER_ARGS+=(--build-arg BUILDKIT_INLINE_CACHE=1)
+fi
+for cache_ref in "${CACHE_FROM[@]}"; do
+  if [[ -n "${cache_ref}" ]]; then
+    DOCKER_ARGS+=(--cache-from "${cache_ref}")
+  fi
+done
 
 # Run docker build
 DOCKER_BUILDKIT=1 docker build "${DOCKER_ARGS[@]}" "${REPO_ROOT}"
