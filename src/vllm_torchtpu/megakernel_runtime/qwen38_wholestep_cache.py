@@ -56,6 +56,7 @@ def wholestep_qsa_writes(
     norm_eps: float,
     rotary_dim: int,
     max_query_len: int,
+    num_requests: int | None = None,
 ) -> Any:
     """Write every QSA layer's step tokens, in layer order; returns the pool.
 
@@ -63,8 +64,13 @@ def wholestep_qsa_writes(
       `[T, index_dim]` (the raw indexer key: `index_qk[:, -index_dim:]`).
     norms[i]: `(k_norm, index_k_norm)` weights. tables[i]: the runner's flat
       `(ring_ids, main_table, compressed_table)` of layer i's cache groups.
+    num_requests: the kernel's static request count (`M // T`). Requests past it are idle
+      padding (the driver calls the kernel only for steps that fit its bucket), so they are
+      cropped before the writers rather than read, merged and written back as no-ops.
     """
     n = len(context)
+    nreq = n if num_requests is None else min(n, num_requests)
+    context, starts = context[:nreq], starts[: nreq + 1]
     for (key, value, index_k), (nk, nik), (ring, main, comp), lay in zip(
         rows, norms, tables, layers, strict=True
     ):
@@ -79,9 +85,9 @@ def wholestep_qsa_writes(
             trig,
             starts,
             context,
-            ring.reshape(n, -1)[:, 0],
-            main.reshape(n, -1),
-            comp.reshape(n, -1),
+            ring.reshape(n, -1)[:nreq, 0],
+            main.reshape(n, -1)[:nreq],
+            comp.reshape(n, -1)[:nreq],
             compress_ratio=compress_ratio,
             norm_eps=norm_eps,
             rotary_dim=rotary_dim,

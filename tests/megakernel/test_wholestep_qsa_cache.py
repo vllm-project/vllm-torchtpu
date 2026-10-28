@@ -156,11 +156,12 @@ def stock(pool, per_layer, positions, trig, starts, context, main, comp, rings):
     return pool
 
 
-def whole(pool, per_layer, positions, trig, starts, context, main, comp, rings):
+def whole(pool, per_layer, positions, trig, starts, context, main, comp, rings, num_requests=None):
     fn = jax.jit(
         lambda pool, rows, norms, tabs, positions, trig, starts, context: wholestep_qsa_writes(
             pool, rows, norms, tabs, LAYERS, positions, trig, starts, context,
             compress_ratio=RATIO, norm_eps=1e-6, rotary_dim=ROTARY, max_query_len=T,
+            num_requests=num_requests,
         )
     )
     rows = [(p["key"], p["value"], p["index_qk"][:, -INDEX_DIM:]) for p in per_layer]
@@ -178,24 +179,29 @@ ACTIVE = [True, True, True, False, True, True, False, True]
 ACCEPTED = [1, 4, 2, 0, 3, 1, 0, 4]
 
 
+@pytest.mark.parametrize("pad", [0, 4])
 @pytest.mark.parametrize("fused", [False, True])
-def test_wholestep_qsa_writes_match_stock_over_two_steps(interpret, monkeypatch, fused):
+def test_wholestep_qsa_writes_match_stock_over_two_steps(interpret, monkeypatch, fused, pad):
+    """`pad` idle requests past the kernel's request count (the runner's max_num_seqs rows):
+    the whole-step writer crops them (`num_requests`) and must still match stock."""
     monkeypatch.setattr(envs, "VLLM_TPU_QSA_FUSED_KV_WRITE", fused)
     rng = np.random.default_rng(7 + fused)
-    main, comp, rings = tables(rng, CONTEXTS, ACTIVE)
+    contexts, active = CONTEXTS + [0] * pad, ACTIVE + [False] * pad
+    main, comp, rings = tables(rng, contexts, active)
     pool0 = jnp.asarray(rng.normal(0, 1, (PAGES, PAGE_ROWS, 1, 4, WIDTH)), jnp.float8_e4m3fn)
     trig = jnp.pad(jnp.asarray(rng.normal(0, 1, (4096, ROTARY)), jnp.bfloat16),
                    ((0, 0), (0, 128 - ROTARY)))
-    ctx = np.array(CONTEXTS, np.int32)
+    ctx = np.array(contexts, np.int32)
     p_stock = p_whole = pool0
     for _ in range(2):
-        positions, starts, per_layer = step_inputs(rng, ctx, ACTIVE)
+        positions, starts, per_layer = step_inputs(rng, ctx, active)
         context = jnp.asarray(ctx)
         p_stock = stock(p_stock, per_layer, positions, trig, starts, context, main, comp, rings)
-        p_whole = whole(p_whole, per_layer, positions, trig, starts, context, main, comp, rings)
+        p_whole = whole(p_whole, per_layer, positions, trig, starts, context, main, comp, rings,
+                        num_requests=len(CONTEXTS) if pad else None)
         assert not np.array_equal(raw(p_stock), raw(pool0)), "nothing written"
         np.testing.assert_array_equal(raw(p_whole), raw(p_stock))
-        ctx = ctx + np.where(ACTIVE, ACCEPTED, 0).astype(np.int32)
+        ctx = ctx + np.where(active, ACCEPTED + [0] * pad, 0).astype(np.int32)
 
 
 def test_check_catches_a_swapped_main_slot(interpret, monkeypatch):

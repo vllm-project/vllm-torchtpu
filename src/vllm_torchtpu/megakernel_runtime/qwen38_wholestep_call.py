@@ -189,6 +189,7 @@ def build_wholestep_call(
         return wholestep_qsa_writes(
             pool, rows, norms, tables, qsa_layers, positions, trig, starts, context,
             compress_ratio=4, norm_eps=norm_eps, rotary_dim=rotary_dim, max_query_len=T,
+            num_requests=M // T,
         )
 
     writes = jax.shard_map(
