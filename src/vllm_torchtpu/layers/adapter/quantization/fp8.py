@@ -87,7 +87,9 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
+    PREQUANT_ATTR,
     WEIGHT_FLIPPED_ATTR,
+    prequantized_matmul,
     quantized_matmul,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
@@ -1679,12 +1681,36 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             # Prevent the quantization of activations to FP8 (W8A16).
             out = torch.matmul(x, weight.to(x.dtype)) * layer.weight_scale.to(x.dtype)
         else:
-            out = quantized_matmul(
-                x,
-                weight,
-                layer.weight_scale,
-                w8a16_max_rows=self.w8a16_max_rows,
-            )
+            slot = getattr(layer, PREQUANT_ATTR, None)
+            prequant = None if slot is None else slot.value
+            if prequant is not None:
+                assert slot is not None
+                slot.value = None
+                x_q, x_scale = prequant
+                rows = x.numel() // x.shape[-1]
+                if x_q.shape == (rows, x.shape[-1]):
+                    out = prequantized_matmul(
+                        x,
+                        x_q,
+                        x_scale,
+                        weight,
+                        layer.weight_scale,
+                        w8a16_max_rows=self.w8a16_max_rows,
+                    )
+                else:
+                    out = quantized_matmul(
+                        x,
+                        weight,
+                        layer.weight_scale,
+                        w8a16_max_rows=self.w8a16_max_rows,
+                    )
+            else:
+                out = quantized_matmul(
+                    x,
+                    weight,
+                    layer.weight_scale,
+                    w8a16_max_rows=self.w8a16_max_rows,
+                )
         if bias is not None:
             out = out + bias
         return out

@@ -297,6 +297,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/distributed/dcp.py",
     "vllm_torchtpu/distributed/pallas_shapes.py",
     "vllm_torchtpu/layers/adapter/linear_common.py",
+    "vllm_torchtpu/layers/adapter/rmsnorm.py",
     "vllm_torchtpu/layers/adapter/router_topk.py",
     "vllm_torchtpu/layers/adapter/quantization",
     "vllm_torchtpu/layers/adapter/vision_attention.py",

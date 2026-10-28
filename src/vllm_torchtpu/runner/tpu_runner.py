@@ -5325,6 +5325,15 @@ class TPUModelRunner(GPUModelRunner):
             draft = self._async_drafter.draft_model if self._is_async_drafter else None
             arm(self.model, draft)
 
+        if envs.TPU_FUSED_ADD_RMSNORM and envs.TPU_FUSED_ADD_RMSNORM_QUANT:
+            from vllm_torchtpu.layers.adapter.rmsnorm import arm_prequant
+
+            n_pairs = arm_prequant(self.model)
+            logger.info(
+                "[rmsnorm] TPU_FUSED_ADD_RMSNORM_QUANT armed %d norm->fp8 pairs",
+                n_pairs,
+            )
+
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()
         self._initialize_quantization_kernels()

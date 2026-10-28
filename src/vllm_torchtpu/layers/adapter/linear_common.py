@@ -23,7 +23,10 @@ from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
-from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
+from vllm_torchtpu.kernels.quantized_matmul.util import (
+    xla_prequantized_matmul,
+    xla_quantized_matmul,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -51,6 +54,23 @@ KEEP_VLLM_LAYOUT_ATTR = "_tpu_keep_vllm_weight_layout"
 # (`dummy_loader`, `reload/layerwise`), where a second flip would transpose
 # back and silently corrupt the values.
 WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"
+
+# Attribute holding a PrequantSlot shared between a residual-stream TpuRMSNorm
+# and its paired per-channel FP8 linear consumer.
+PREQUANT_ATTR = "_tpu_prequant_slot"
+
+
+class PrequantSlot:
+    """Shared container passing ``(x_q, x_scale)`` from norm to paired linear.
+
+    Avoids storing a ``nn.Module`` reference on the norm so Dynamo lifts the
+    linear's parameters through the linear module path only.
+    """
+
+    __slots__ = ("value",)
+
+    def __init__(self) -> None:
+        self.value: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 def _get_x_q_dtype(w_q_dtype: jnp.dtype) -> jnp.dtype:
@@ -182,6 +202,116 @@ def quantized_matmul(
     orig_out_shape = (*x.shape[:-1], w_q.shape[-1])
     x_2d = x.reshape(-1, x.shape[-1])
     out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s, w8a16_max_rows)
+    return out_2d.reshape(orig_out_shape)
+
+
+_prequantized_matmul_op: Callable | None = None
+_prequantized_matmul_w8a16_op: Callable | None = None
+
+
+def _prequantized_matmul_jax(
+    x_q: jax.Array,
+    x_scale: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+) -> jax.Array:
+    return xla_prequantized_matmul(x_q, x_scale, w_q, w_s, jnp.bfloat16)
+
+
+def _prequantized_matmul_w8a16_jax(
+    x: jax.Array,
+    x_q: jax.Array,
+    x_scale: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+    w8a16_max_rows: int = 0,
+) -> jax.Array:
+    rows = x.shape[0]
+    use_w8a16 = 0 < rows <= w8a16_max_rows and jnp.issubdtype(w_q.dtype, jnp.floating)
+    if use_w8a16:
+        return xla_quantized_matmul(x, w_q, w_s, quantize_activation=False)
+    return xla_prequantized_matmul(x_q, x_scale, w_q, w_s, x.dtype)
+
+
+def get_prequantized_matmul_op() -> Callable:
+    """Build (outside Dynamo) the prequantized FP8 matmul custom ops."""
+    global _prequantized_matmul_op, _prequantized_matmul_w8a16_op
+    if (
+        _prequantized_matmul_op is not None
+        and _prequantized_matmul_w8a16_op is not None
+    ):
+        return _prequantized_matmul_op
+    with _quantized_matmul_kernel_op_lock:
+        if _prequantized_matmul_op is None:
+            op = pallas.jax_op("pallas::prequantized_matmul", _prequantized_matmul_jax)
+
+            def _fake(
+                x_q: torch.Tensor,
+                x_scale: torch.Tensor,
+                w_q: torch.Tensor,
+                w_s: torch.Tensor,
+            ) -> torch.Tensor:
+                del x_scale, w_s
+                return torch.empty(
+                    x_q.shape[0], w_q.shape[1], dtype=torch.bfloat16, device=x_q.device
+                )
+
+            op.register_fake(_fake)
+            _prequantized_matmul_op = op
+
+        if _prequantized_matmul_w8a16_op is None:
+            op_w8a16 = pallas.jax_op(
+                "pallas::prequantized_matmul_w8a16", _prequantized_matmul_w8a16_jax
+            )
+
+            def _fake_w8a16(
+                x: torch.Tensor,
+                x_q: torch.Tensor,
+                x_scale: torch.Tensor,
+                w_q: torch.Tensor,
+                w_s: torch.Tensor,
+                w8a16_max_rows: int = 0,
+            ) -> torch.Tensor:
+                del x_q, x_scale, w_s, w8a16_max_rows
+                return torch.empty(
+                    x.shape[0], w_q.shape[1], dtype=x.dtype, device=x.device
+                )
+
+            op_w8a16.register_fake(_fake_w8a16)
+            _prequantized_matmul_w8a16_op = op_w8a16
+
+        assert _prequantized_matmul_op is not None
+        return _prequantized_matmul_op
+
+
+def prequantized_matmul(
+    x: torch.Tensor,
+    x_q: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+    w8a16_max_rows: int = 0,
+) -> torch.Tensor:
+    """Per-channel FP8 linear consuming upstream ``(x_q, x_scale)``."""
+    orig_out_shape = (*x.shape[:-1], w_q.shape[-1])
+    if w8a16_max_rows > 0:
+        op_w8a16 = _prequantized_matmul_w8a16_op
+        if op_w8a16 is None:
+            raise RuntimeError(
+                "prequantized_matmul op not built: call get_prequantized_matmul_op() "
+                "at model load"
+            )
+        x_2d = x.reshape(-1, x.shape[-1])
+        out_2d = op_w8a16(x_2d, x_q, x_scale, w_q, w_s, w8a16_max_rows)
+        return out_2d.reshape(orig_out_shape)
+
+    op = _prequantized_matmul_op
+    if op is None:
+        raise RuntimeError(
+            "prequantized_matmul op not built: call get_prequantized_matmul_op() "
+            "at model load"
+        )
+    out_2d = op(x_q, x_scale, w_q, w_s)
     return out_2d.reshape(orig_out_shape)
 
 

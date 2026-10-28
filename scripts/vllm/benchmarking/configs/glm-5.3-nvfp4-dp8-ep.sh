@@ -53,8 +53,8 @@ RANDOM_RANGE_RATIO="0.0"
 # the GLM-5.2 NVFP4 recipe.
 export MOE_REQUANTIZE_BLOCK_SIZE="${MOE_REQUANTIZE_BLOCK_SIZE:-512}"
 
-# Optimized GLM-5.3-NVFP4 v7x-8 serving stack (+124.04% output tok/s/device:
-# 139.72 -> 313.03 tok/s/device at ISL=8192, OSL=1024, c=512; mmlu_pro=0.7643):
+# Optimized GLM-5.3-NVFP4 v7x-8 serving stack (+126.28% output tok/s/device:
+# 139.72 -> 316.16 tok/s/device at ISL=8192, OSL=1024, c=512; mmlu_pro=0.7643):
 # 1. Fused EP MoE v2 with W4A8 MXU matmuls + sharded schedule plan + padded-row skip
 export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-1}"
 export MOE_FUSED_EP_ENABLE_W4A8="${MOE_FUSED_EP_ENABLE_W4A8:-1}"
@@ -74,9 +74,13 @@ export VLLM_TPU_FAST_TOKEN_SUBSTITUTION="${VLLM_TPU_FAST_TOKEN_SUBSTITUTION:-1}"
 # 5. SparseCore async All-Gather offload (512 KiB threshold: keeps q_g >= 768 KiB on SparseCore while keeping 296 KiB MoE routing exchange on TensorCore ICI)
 export SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES="${SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES:-524288}"
 export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:+$LIBTPU_INIT_ARGS }--xla_enable_async_all_gather=true --xla_tpu_enable_sparse_core_collective_offload_all_gather=true --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=${SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES}"
-# 6. Load-time per-channel FP8 quantization of excluded BF16 dense MLP, shared-expert, and MLA linear projections (frees 9.23 GiB/chip for 2-wave C=32 KV cache + W8A8 prefill / W8A16 decode)
+# 6. Load-time per-channel FP8 quantization of excluded BF16 dense MLP, shared-expert, and MLA linear projections (frees 9.23 GiB/chip for 1-wave C=64 KV cache + W8A8 on T>=64 prefill/decode, W8A16 on T<=32)
 export QUANTIZE_ON_LOAD_PREFIXES="${QUANTIZE_ON_LOAD_PREFIXES:-shared_experts,layers.0.mlp,layers.1.mlp,layers.2.mlp,fused_qkv_a_proj,q_b_proj,o_proj}"
 export TPU_FP8_LINEAR_W8A16_MAX_ROWS="${TPU_FP8_LINEAR_W8A16_MAX_ROWS:-32}"
+# 7. One-pass Pallas fused add + RMSNorm + dynamic per-row FP8 quant on T>=1024 prefill/mixed buckets (eliminates 2-pass RMSNorm + amax/convert HBM round-trips across 156 residual-stream pairs)
+export TPU_FUSED_ADD_RMSNORM="${TPU_FUSED_ADD_RMSNORM:-1}"
+export TPU_FUSED_ADD_RMSNORM_QUANT="${TPU_FUSED_ADD_RMSNORM_QUANT:-1}"
+export TPU_FUSED_ADD_RMSNORM_MIN_TOKENS="${TPU_FUSED_ADD_RMSNORM_MIN_TOKENS:-1024}"
 
 # Server configuration:
 # - max-model-len=9216: exact nominal length for 8192 input + 1024 output.

@@ -195,6 +195,10 @@ if TYPE_CHECKING:
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
+    TPU_FUSED_ADD_RMSNORM: bool = False
+    TPU_FUSED_ADD_RMSNORM_MIN_TOKENS: int = 512
+    TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN: int = 4096
+    TPU_FUSED_ADD_RMSNORM_QUANT: bool = True
 
 
 def env_with_choices(
@@ -1157,6 +1161,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS": env_nonnegative_int(
         "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS", 8
     ),
+    # Run residual-stream RMSNorm (and fused add + RMSNorm) on >= MIN_TOKENS
+    # rows of >= MIN_HIDDEN width as a single Pallas pass instead of XLA's
+    # two-pass reduce + apply. Decode-sized buckets use the reference HLO path.
+    "TPU_FUSED_ADD_RMSNORM": env_bool("TPU_FUSED_ADD_RMSNORM"),
+    "TPU_FUSED_ADD_RMSNORM_MIN_TOKENS": env_int(
+        "TPU_FUSED_ADD_RMSNORM_MIN_TOKENS", 512
+    ),
+    "TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN": env_int(
+        "TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN", 4096
+    ),
+    # With TPU_FUSED_ADD_RMSNORM: emit per-row fp8 activation + scale from the
+    # same Pallas pass for paired per-channel FP8 linears so the consumer matmul
+    # skips its own amax + convert passes.
+    "TPU_FUSED_ADD_RMSNORM_QUANT": env_bool("TPU_FUSED_ADD_RMSNORM_QUANT", True),
 }
 
 

@@ -14,6 +14,7 @@
 """Out-of-tree (OOT) custom operator layers and wrappers for
 Multi-Head Latent Attention (MLA)."""
 
+import math
 from typing import Any, cast
 
 import jax
@@ -81,16 +82,17 @@ logger = init_logger(__name__)
 # traffic and not at all once any request in the batch is past `index_topk`
 # tokens.
 STREAMIDX_ENABLE_EARLY_EXIT = True
-# StreamIdx block sizes as (decode, prefill, MIXED), tuned by microbenchmark.
-STREAMIDX_KV_PAGES_PER_BLOCK = (2, 2, 2)
+# StreamIdx block sizes as (decode, prefill, MIXED), tuned on TPU v7x.
+STREAMIDX_KV_PAGES_PER_BLOCK = (3, 2, 3)
+STREAMIDX_LARGE_PAGE_KV_PAGES_PER_BLOCK = (2, 2, 2)
+STREAMIDX_MAX_BKV_TOKENS = 3072
 STREAMIDX_QUERIES_PER_BLOCK = (1, 128, 128)
 # MIXED-pass KV pages per block for small buckets when only the bq knob is set.
 STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP = 8
-# Small decode bucket (`num_tokens <= 32`) chunk and batch sizes when chunked.
-STREAMIDX_SMALL_DECODE_TOKENS = 32
-STREAMIDX_SMALL_DECODE_CHUNK_TOKENS = 8
-STREAMIDX_SMALL_DECODE_REQ_BATCH_SIZE = 8
-STREAMIDX_SMALL_DECODE_BKVP = 3
+# Decode request batching and single-chunk ceiling (`num_tokens <= 64`).
+STREAMIDX_DECODE_REQ_BATCH_SIZE = 16
+STREAMIDX_LARGE_PAGE_DECODE_REQ_BATCH_SIZE = 4
+STREAMIDX_SMALL_DECODE_TOKENS = 64
 
 
 def _streamidx_block_sizes(
@@ -98,6 +100,8 @@ def _streamidx_block_sizes(
     small_bucket_bq: int | None,
     small_bucket_bkvp: int | None,
     small_bucket_tokens: int,
+    *,
+    page_size: int = 1024,
 ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
     """(num_kv_pages_per_block, num_queries_per_block) for a padded token bucket.
 
@@ -105,11 +109,16 @@ def _streamidx_block_sizes(
     (q_len = gamma + 1) in a 128-row block scores ~124 padding rows. Buckets up
     to `small_bucket_tokens` take the small-bucket sizes instead.
     """
+    base_bkvp = (
+        STREAMIDX_KV_PAGES_PER_BLOCK
+        if page_size * max(STREAMIDX_KV_PAGES_PER_BLOCK) <= STREAMIDX_MAX_BKV_TOKENS
+        else STREAMIDX_LARGE_PAGE_KV_PAGES_PER_BLOCK
+    )
     if small_bucket_bq is None or num_tokens > small_bucket_tokens:
-        return STREAMIDX_KV_PAGES_PER_BLOCK, STREAMIDX_QUERIES_PER_BLOCK
+        return base_bkvp, STREAMIDX_QUERIES_PER_BLOCK
     bkvp = small_bucket_bkvp or STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP
     return (
-        STREAMIDX_KV_PAGES_PER_BLOCK[:2] + (bkvp,),
+        base_bkvp[:2] + (bkvp,),
         STREAMIDX_QUERIES_PER_BLOCK[:2] + (small_bucket_bq,),
     )
 
@@ -524,22 +533,32 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
             num_tokens = q.shape[0]
-            kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
-                num_tokens, *small_bucket
+            cache_page_size = (
+                int(cache_kv.shape[3])
+                if kv_layout == KVLayout.SEQ_ALONG_LANE
+                else int(cache_kv.shape[1] * cache_kv.shape[2])
             )
-            bucket_chunk_tokens = chunk_tokens
-            decode_req_batch_size = 4
-            if (
-                chunk_tokens is not None
-                and num_tokens <= STREAMIDX_SMALL_DECODE_TOKENS
-                and num_tokens % STREAMIDX_SMALL_DECODE_CHUNK_TOKENS == 0
-            ):
-                bucket_chunk_tokens = STREAMIDX_SMALL_DECODE_CHUNK_TOKENS
-                decode_req_batch_size = STREAMIDX_SMALL_DECODE_REQ_BATCH_SIZE
-                kv_pages_per_block = (
-                    STREAMIDX_SMALL_DECODE_BKVP,
-                    *kv_pages_per_block[1:],
+            kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
+                num_tokens, *small_bucket, page_size=cache_page_size
+            )
+            bucket_chunk_tokens = (
+                num_tokens
+                if (
+                    chunk_tokens is not None
+                    and num_tokens <= STREAMIDX_SMALL_DECODE_TOKENS
                 )
+                else chunk_tokens
+            )
+            max_rbs = (
+                STREAMIDX_DECODE_REQ_BATCH_SIZE
+                if cache_page_size * kv_pages_per_block[0] <= STREAMIDX_MAX_BKV_TOKENS
+                else STREAMIDX_LARGE_PAGE_DECODE_REQ_BATCH_SIZE
+            )
+            decode_req_batch_size = (
+                math.gcd(max_rbs, bucket_chunk_tokens)
+                if bucket_chunk_tokens is not None
+                else min(max_rbs, max(1, num_tokens))
+            )
             topk_indices = streamindex_topk(
                 q,
                 weights,
@@ -634,7 +653,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
             kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
-                q.shape[0], *small_bucket
+                q.shape[0], *small_bucket, page_size=STREAMIDX_MAX_BKV_TOKENS
             )
             local_topk = streamindex_topk_dcp(
                 q,
