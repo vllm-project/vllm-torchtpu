@@ -215,14 +215,29 @@ if not _user_has_flag("--xla_tpu_use_dynamic_smem_negotiation"):
 # offloaded to SparseCore. The chip family is detected from
 # TPU_ACCELERATOR_TYPE / GCE metadata and mapped to a VMEM constant above;
 # each flag is added only if the user hasn't supplied it explicitly.
+# An all-gather only moves data, so it is bit-exact on either engine, and
+# offloaded it runs asynchronously while the TensorCore keeps computing. Its
+# auto threshold is a fraction of the all-reduce's so that the MoE dispatch
+# gather of fp8 rows (about half the bytes of bf16 rows) still offloads at
+# the token counts where the bf16 gather did.
+SC_ALL_GATHER_OFFLOAD_DIVISOR = 2
 _sc_offload_bytes = _resolve_sc_offload_threshold_bytes()
 if _sc_offload_bytes is not None:
-    for _flag_name in (
-        "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes",
-        "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes",
+    _sc_all_gather_offload_bytes = _sc_offload_bytes
+    if envs.SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES is None:
+        _sc_all_gather_offload_bytes //= SC_ALL_GATHER_OFFLOAD_DIVISOR
+    for _flag_name, _flag_bytes in (
+        (
+            "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes",
+            _sc_offload_bytes,
+        ),
+        (
+            "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes",
+            _sc_all_gather_offload_bytes,
+        ),
     ):
         if not _user_has_flag(_flag_name):
-            _libtpu_extra_args.append(f"{_flag_name}={_sc_offload_bytes}")
+            _libtpu_extra_args.append(f"{_flag_name}={_flag_bytes}")
 
 if _libtpu_extra_args:
     _assembled = " ".join(_libtpu_extra_args)

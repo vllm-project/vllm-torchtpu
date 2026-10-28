@@ -329,17 +329,28 @@ class TestTpuCompilerCache:
         ]
 
     @pytest.mark.parametrize(
-        "value,expected_threshold",
+        "value,expected_threshold,expected_all_gather_threshold",
         [
-            ("12345", 12345),
-            ("auto", _TPU_VMEM_BYTES_PER_TENSOR_CORE["v6e"]),
-            ("", _TPU_VMEM_BYTES_PER_TENSOR_CORE["v6e"]),
-            ("0", None),
+            ("12345", 12345, 12345),
+            (
+                "auto",
+                _TPU_VMEM_BYTES_PER_TENSOR_CORE["v6e"],
+                _TPU_VMEM_BYTES_PER_TENSOR_CORE["v6e"] // 2,
+            ),
+            (
+                "",
+                _TPU_VMEM_BYTES_PER_TENSOR_CORE["v6e"],
+                _TPU_VMEM_BYTES_PER_TENSOR_CORE["v6e"] // 2,
+            ),
+            ("0", None, None),
         ],
     )
-    def test_env_override_sc_offload_threshold(self, value, expected_threshold):
-        """An explicit value is used as given, unset/empty/auto resolves
-        from the chip family, and 0 sets no flag at all."""
+    def test_env_override_sc_offload_threshold(
+        self, value, expected_threshold, expected_all_gather_threshold
+    ):
+        """An explicit value is used as given for both collectives,
+        unset/empty/auto resolves from the chip family (all-gathers from half
+        of it), and 0 sets no flag at all."""
         env_mock = {
             "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": value,
             "TPU_ACCELERATOR_TYPE": "v6e-8",
@@ -353,9 +364,11 @@ class TestTpuCompilerCache:
                 []
                 if expected_threshold is None
                 else [
-                    f"--xla_tpu_sparse_core_{op}_offload_min_size_in_bytes="
-                    f"{expected_threshold}"
-                    for op in ("all_reduce", "all_gather")
+                    f"--xla_tpu_sparse_core_{op}_offload_min_size_in_bytes={size}"
+                    for op, size in (
+                        ("all_reduce", expected_threshold),
+                        ("all_gather", expected_all_gather_threshold),
+                    )
                 ]
             )
             assert self._sc_offload_flags() == expected
