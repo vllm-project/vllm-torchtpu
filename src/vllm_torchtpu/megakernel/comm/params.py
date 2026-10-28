@@ -22,7 +22,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from ..errors import MegakernelConfigError
 from ..exec_spec import ExecSpec, Tiles
-from ..ops import BF16
+from ..ops import BF16, col_chunk, rup
 
 
 @dataclass(frozen=True)
@@ -50,9 +50,24 @@ class CommParams:
     N_HIER3: int = 3
 
 
-def comm_params(ex: ExecSpec, tiles: Tiles, H: int, PR: int, PC: int) -> CommParams:
+def comm_params(
+    ex: ExecSpec,
+    tiles: Tiles,
+    H: int,
+    PR: int | None = None,
+    PC: int | None = None,
+) -> CommParams:
     """Derive the all-reduce mode, payload layout, rounds, and peers for `ex`."""
     R, B, M, MR, MB = ex.R, ex.B, ex.M, ex.MR, ex.MB
+    if PC is None:
+        PC = col_chunk(H)
+    if H % PC != 0:
+        raise MegakernelConfigError(
+            f"all-reduce width H={H} must be divisible by column chunk PC={PC}"
+        )
+    HPC = H // PC
+    if PR is None:
+        PR = rup(B * HPC, 16)
     HIER = tiles.hier if R > 1 else 0
     RSAG = tiles.rsag and R > 1 and HIER == 0
     WAR = (
@@ -94,7 +109,7 @@ def comm_params(ex: ExecSpec, tiles: Tiles, H: int, PR: int, PC: int) -> CommPar
         H=H,
         PR=PR,
         PC=PC,
-        HPC=H // PC,
+        HPC=HPC,
         HIER=HIER,
         RSAG=RSAG,
         WAR=WAR,

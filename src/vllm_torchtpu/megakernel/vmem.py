@@ -27,7 +27,7 @@ from . import exec_spec, pool_alias
 from .comm.params import CommParams, comm_params, ring_scratch, stage_scratch
 from .errors import MegakernelConfigError
 from .exec_spec import ExecSpec
-from .ops import BF16, F32, FP8, col_chunk, rup
+from .ops import BF16, F32, FP8
 from .planner import Plan, extra_inputs, plan
 from .profiles.default import chip_budget
 from .spec import ModelSpec, ScratchReq
@@ -209,10 +209,6 @@ def build_scratch(
 
     B, MB = ex.B, ex.MB
     H, L = g.H, g.L
-    PC = col_chunk(H)
-    assert H % PC == 0, (H, PC)
-    HPC = H // PC
-    PR = rup(B * HPC, 16)
 
     tk, nt, kinds = p.tk, p.nt, p.kinds
     lay, S = p.smalls_layout, p.smalls_width
@@ -225,7 +221,7 @@ def build_scratch(
     NMIX = p.shared_widths["mix"]
     typed = bool(ex.interpret)
 
-    cp = comm_params(ex, tiles, H, PR, PC)
+    cp = comm_params(ex, tiles, H)
 
     vshape = {k: (tk[k], kinds[k][1]) for k in kinds}
     vdtype = {k: kinds[k][2] for k in kinds}

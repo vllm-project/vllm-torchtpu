@@ -821,3 +821,20 @@ def test_configurable_collective_id(monkeypatch: pytest.MonkeyPatch) -> None:
     assert info_ex["collective_id"] == 99
     assert seen[-1] == 99
 
+
+def test_comm_params_derives_pc_hpc_pr() -> None:
+    ex = mk.ExecSpec(R=8, B=4, T=1, ctx=2048)
+    tiles = mk.Tiles()
+
+    cp_4096 = mk.comm.comm_params(ex, tiles, 4096)
+    assert (cp_4096.PC, cp_4096.HPC, cp_4096.PR) == (1024, 4, 16)
+
+    cp_2560 = mk.comm.comm_params(ex, tiles, 2560)
+    assert (cp_2560.PC, cp_2560.HPC, cp_2560.PR) == (640, 4, 16)
+
+    # Custom secondary ring width (e.g. HCSublayer with width=128)
+    cp_hc = mk.comm.comm_params(ex, tiles, 128)
+    assert (cp_hc.PC, cp_hc.HPC, cp_hc.PR) == (128, 1, 16)
+    scr = mk.comm.ring_scratch(cp_hc)
+    assert "send" in scr and "recv" in scr and "ar_ssem" in scr and "ar_rsem" in scr
+
