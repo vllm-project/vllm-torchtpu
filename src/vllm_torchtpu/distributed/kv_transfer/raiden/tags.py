@@ -19,6 +19,8 @@ gate builds its expected tag list from them. The values are frozen; changing
 one is a coupled two-repo protocol change, not a refactor.
 """
 
+from collections.abc import Callable
+
 TAG_FA = "fa"
 TAG_GDN_CONV = "gdn.conv"
 TAG_GDN_SSM = "gdn.ssm"
@@ -72,3 +74,18 @@ def split_layer_tag(tag: str) -> tuple[str, int | None]:
 def class_tag(tag: str) -> str:
     """The tag with any per-layer suffix removed."""
     return split_layer_tag(tag)[0]
+
+
+def libtpu_key(package_version: Callable[[str], str] | None) -> str:
+    """libtpu identity for a layout fingerprint.
+
+    An injected ``package_version`` (tests) is used as given; otherwise the
+    build actually loaded, which may come from ``TPU_LIBRARY_PATH`` rather than
+    the pip package (see ``tpu_info.get_libtpu_cache_key``).
+    """
+    if package_version is not None:
+        return package_version("libtpu")
+    # Deferred so that importing this module does not import tpu_info.
+    from vllm_torchtpu.tpu_info import get_libtpu_cache_key
+
+    return get_libtpu_cache_key()

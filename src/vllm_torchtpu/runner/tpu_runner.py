@@ -28,7 +28,6 @@ import time
 from collections.abc import Callable, Collection, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from importlib import metadata as importlib_metadata
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Concatenate, cast
 
@@ -197,6 +196,7 @@ from vllm_torchtpu.spec_decode.utils import (
     normalize_draft_config,
 )
 from vllm_torchtpu.structured_decoding import StructuredDecodingManager
+from vllm_torchtpu.tpu_info import get_libtpu_version, get_tpu_library_path
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
 from vllm_torchtpu.tracing.options import resolve_profile_dir_and_opts
 from vllm_torchtpu.tracing.utils import (
@@ -526,7 +526,24 @@ def _get_sequence_layout_planner_for_runner(runner: Any):
 
 def _validate_libtpu_version() -> None:
     """Validate libtpu opportunistically if it is present."""
-    libtpu_version = importlib_metadata.version("libtpu")
+    library_path = get_tpu_library_path()
+    if library_path is not None:
+        # JAX loads TPU_LIBRARY_PATH in preference to the pip package and
+        # treats a custom library as head, so its version is not checkable.
+        logger.warning_once(
+            "Using the libtpu library at TPU_LIBRARY_PATH=%s; skipping the "
+            "libtpu package version check.",
+            library_path,
+        )
+        return
+    libtpu_version = get_libtpu_version()
+    if libtpu_version is None:
+        logger.warning_once(
+            "libtpu package metadata not found (TPU_LIBRARY_PATH=%s); "
+            "skipping the libtpu version check.",
+            envs.TPU_LIBRARY_PATH or "",
+        )
+        return
     parsed_version = version.parse(libtpu_version)
     if parsed_version < version.parse("0.0.35"):
         raise RuntimeError("Argmax is having accuracy issue with libtpu < 0.0.35")
