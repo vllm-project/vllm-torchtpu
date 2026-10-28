@@ -19,6 +19,9 @@ from typing import TYPE_CHECKING
 
 from vllm.model_executor.models.config import Qwen4ExpForCausalLMConfig
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.qwen4_exp.hc_prefill_policy import validate_hc_prefill_mode
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
@@ -29,6 +32,8 @@ class TPUQwen4ExpConfig(Qwen4ExpForCausalLMConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: VllmConfig) -> None:
         Qwen4ExpForCausalLMConfig.verify_and_update_config(vllm_config)
+        tile = envs.VLLM_TPU_HC_PREFILL_TILE
+        validate_hc_prefill_mode("auto" if tile is None else tile, full_mix=True)
         model_config = vllm_config.model_config
         text_config = model_config.hf_text_config
         parallel_config = vllm_config.parallel_config

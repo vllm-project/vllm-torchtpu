@@ -15,7 +15,7 @@
 
 Follows the layer structure of upstream vllm/models/qwen4_exp/nvidia/model.py;
 upstream enables Qwen4Exp only on CUDA and ROCm. Hyper-connections use the
-upstream torch implementation in qwen4_exp.common; the sublayers reuse the GDN,
+local TPU precision implementation; the sublayers reuse the GDN,
 gated attention and sparse MoE layers that Qwen3.5 runs on TPU.
 """
 
@@ -55,11 +55,11 @@ from vllm.model_executor.models.utils import (
     extract_layer_index,
     maybe_prefix,
 )
-from vllm.models.qwen4_exp.common.hyperconnection import (
+
+from vllm_torchtpu.models.vllm.qwen4_exp.hyperconnection import (
     GatedResidual,
     HyperConnectionConfig,
 )
-
 from vllm_torchtpu.models.vllm.qwen4_exp.ple import Qwen4ExpPLELayer
 
 
@@ -183,7 +183,8 @@ class Qwen4ExpModel(nn.Module):
         # Reduces the hc_count streams to the single stream fed to lm_head.
         # It only mixes, so it has no block_inject_weight.
         self.hyper_connection_mixer = GatedResidual(
-            _hc_config(vllm_config), use_combine=False
+            _hc_config(vllm_config),
+            use_combine=False,
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:

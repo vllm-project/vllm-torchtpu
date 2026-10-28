@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     REQUANTIZE_BLOCK_SIZE: int | None = None
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
+    VLLM_TPU_HC_PREFILL_TILE: int | None = None
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
@@ -402,6 +403,9 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # HC debug override: auto/unset uses the kernel policy, 0 uses Torch,
+    # positive multiples of 128 override tile/profitability for both components.
+    "VLLM_TPU_HC_PREFILL_TILE": env_nonnegative_int_or_auto("VLLM_TPU_HC_PREFILL_TILE"),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # DCP sparse MLA (SparseCore cache layout): gather and attend this many
