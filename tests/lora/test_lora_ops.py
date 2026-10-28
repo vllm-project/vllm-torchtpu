@@ -108,30 +108,20 @@ def test_rows_without_a_slot_stay_zero_with_a_nan_or_inf_input(bad):
     assert expanded[~NO_SLOT].isfinite().all()
 
 
-def test_dtype_mismatch_points_at_lora_dtype():
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "fullgraph_compile"])
+def test_dtype_mismatch_points_at_lora_dtype(compiled):
+    """The ops also run inside the compiled backbone, where a failed plain
+    assert surfaces as Dynamo Unsupported without this message."""
     lora_a = _stacked(RANK, HIDDEN, torch.bfloat16)
     lora_b = _stacked(OUT, RANK, torch.bfloat16)
     x = torch.randn(len(IDX), HIDDEN)
     buf = torch.randn(len(IDX), RANK)
     onehot = one_hot_slots(IDX, NUM_SLOTS)
 
-    with pytest.raises(AssertionError, match="lora_dtype must match the model dtype"):
-        bgmv_shrink(x, lora_a, onehot, 1.0)
-    with pytest.raises(AssertionError, match="lora_dtype must match the model dtype"):
-        bgmv_expand(buf, lora_b, onehot)
-
-
-def test_dtype_mismatch_message_survives_fullgraph_compile():
-    """The ops run inside the compiled backbone, where a failed plain assert
-    surfaces as Dynamo Unsupported without this message."""
-    lora_a = _stacked(RANK, HIDDEN, torch.bfloat16)
-    lora_b = _stacked(OUT, RANK, torch.bfloat16)
-    x = torch.randn(len(IDX), HIDDEN)
-    buf = torch.randn(len(IDX), RANK)
-    onehot = one_hot_slots(IDX, NUM_SLOTS)
-
-    shrink = torch.compile(bgmv_shrink, backend="eager", fullgraph=True)
-    expand = torch.compile(bgmv_expand, backend="eager", fullgraph=True)
+    shrink, expand = bgmv_shrink, bgmv_expand
+    if compiled:
+        shrink = torch.compile(bgmv_shrink, backend="eager", fullgraph=True)
+        expand = torch.compile(bgmv_expand, backend="eager", fullgraph=True)
     with pytest.raises(AssertionError, match="lora_dtype must match the model dtype"):
         shrink(x, lora_a, onehot, 1.0)
     with pytest.raises(AssertionError, match="lora_dtype must match the model dtype"):
