@@ -602,6 +602,7 @@ class TPUModelRunner(GPUModelRunner):
     empty_slot_mappings: dict[int, torch.Tensor]
     # Default for a runner built without __init__.
     _pp_wave: PPWave | None = None
+    _dp_step_other_decode: bool = False
 
     @property
     def _async_drafter(self) -> DFlashProposer | Eagle3Proposer:
