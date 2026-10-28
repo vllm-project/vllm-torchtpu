@@ -1095,7 +1095,13 @@ def select_blocks(
                 decode_req_batch_size=8 if len(q) >= 8 else 4,
                 enable_early_exit=True,
                 components=qsa_indexing(
-                    ratio - 1, per_token_scores=True, table_expansion=expansion
+                    ratio - 1,
+                    per_token_scores=True,
+                    table_expansion=expansion,
+                    # VLLM_TPU_QSA_DECODE_POOL_PAGE_DMA: one DMA per pool
+                    # page when the KV block holds whole pool pages (e.g.
+                    # VLLM_TPU_QSA_DECODE_KV_BLOCK=3328 = 8 x 13 x 32 keys).
+                    coalesce_entries=envs.VLLM_TPU_QSA_DECODE_POOL_PAGE_DMA,
                 ),
                 decode_passes=not mixed_only,
                 hoist_step_metadata=envs.VLLM_TPU_QSA_INDEXER_HOIST_META,

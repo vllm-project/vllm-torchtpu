@@ -129,6 +129,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_COMPACT_SCHEDULE: bool = False
     VLLM_TPU_QSA_DECODE_RPA_BKV: int = 256
     VLLM_TPU_QSA_DECODE_POOL_PAGE_TABLE: bool = False
+    VLLM_TPU_QSA_DECODE_POOL_PAGE_DMA: bool = False
     VLLM_TPU_QSA_INDEXER_SC_BOUNDED_COPY: bool = False
     VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY: bool = False
     VLLM_TPU_QSA_DECODE_RPA_LANES: int = 8
@@ -694,6 +695,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # query window instead of several serial ones. Same pages, same order.
     "VLLM_TPU_QSA_DECODE_POOL_PAGE_TABLE": env_bool(
         "VLLM_TPU_QSA_DECODE_POOL_PAGE_TABLE", default=False
+    ),
+    # With the pool-page table: when the decode KV block holds whole pool
+    # pages (VLLM_TPU_QSA_DECODE_KV_BLOCK a multiple of 13 kernel pages x 32
+    # keys, e.g. 3328), DMA each pool page's consecutive kernel pages at once
+    # instead of one 16 KiB descriptor per kernel page. Same bytes and order.
+    "VLLM_TPU_QSA_DECODE_POOL_PAGE_DMA": env_bool(
+        "VLLM_TPU_QSA_DECODE_POOL_PAGE_DMA", default=False
     ),
     # Qwen4-exp shared-stream decode indexer: SparseCore top-k copies only
     # each score row's live prefix (one subcore per row) instead of every

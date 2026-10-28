@@ -54,3 +54,6 @@ class StreamIndexComponents:
     # storage table instead of an expanded one, so the scalar-prefetched table
     # is `expansion` times smaller. (1, 1, 0) is the plain table.
     table_expansion: tuple[int, int, int] = (1, 1, 0)
+    # With table_expansion and a KV block of whole entries: one DMA per entry
+    # (its `expansion` kernel pages are consecutive) instead of one per page.
+    coalesce_entries: bool = False

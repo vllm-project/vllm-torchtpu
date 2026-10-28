@@ -68,6 +68,9 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
     table_expansion: tuple[int, int, int] = dataclasses.field(
         default=(1, 1, 0), metadata=dict(static=True)
     )
+    coalesce_entries: bool = dataclasses.field(
+        default=False, metadata=dict(static=True)
+    )
 
     @classmethod
     def create(  # pytype: disable=signature-mismatch
@@ -85,6 +88,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
         grid_rank: int = 1,
         chunk_idx: int = 0,
         table_expansion: tuple[int, int, int] = (1, 1, 0),
+        coalesce_entries: bool = False,
     ):
         assert buffer_type == pltpu.BufferType.INPUT
         standard_ref = pltpu.BufferedRef.create(
@@ -103,6 +107,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
             seq_batch_size=seq_batch_size,
             chunk_idx=chunk_idx,
             table_expansion=table_expansion,
+            coalesce_entries=coalesce_entries,
             **{
                 f.name: getattr(standard_ref, f.name)
                 for f in dataclasses.fields(pltpu.BufferedRef)
@@ -124,6 +129,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
         grid_rank: int = 1,
         chunk_idx: int = 0,
         table_expansion: tuple[int, int, int] = (1, 1, 0),
+        coalesce_entries: bool = False,
         **kwargs: Any,
     ):
         return cls.create(
@@ -140,6 +146,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
             grid_rank=grid_rank,
             chunk_idx=chunk_idx,
             table_expansion=table_expansion,
+            coalesce_entries=coalesce_entries,
         )
 
     def page_id(self, page_indices_ref: jax.Ref, seq: Any, start: Any, i: int) -> Any:
@@ -198,6 +205,36 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
         max_hbm_pages = reshaped_cache_hbm_ref.shape[0]
         num_page_indices = page_indices_ref.shape[0]
         effective_seq_idx = batch_tile_idx
+
+        expansion = self.table_expansion[0]
+        if self.coalesce_entries and expansion > 1 and self.bkv_p % expansion == 0:
+            # Blocks start on whole table entries and each entry's kernel
+            # pages are consecutive in HBM: one DMA per entry instead of one
+            # per kernel page (same bytes, same order, `expansion`x fewer
+            # descriptors). Clamped tails read in-bounds pages past the
+            # sequence, which the scores mask like any other.
+            run = expansion * self.page_size_per_kv_packing
+            for batch_idx in range(self.seq_batch_size):
+                kv_p_start = bkv_idx * self.bkv_p
+                for e in range(self.bkv_p // expansion):
+                    page = self.page_id(
+                        page_indices_ref,
+                        effective_seq_idx + batch_idx,
+                        kv_p_start,
+                        e * expansion,
+                    )
+                    offset = jnp.minimum(
+                        page * self.page_size_per_kv_packing,
+                        jnp.maximum(0, max_hbm_pages - run),
+                    )
+                    pltpu.make_async_copy(
+                        reshaped_cache_hbm_ref.at[pl.ds(offset, run)],
+                        vmem_dst.at[  # pytype: disable=attribute-error
+                            batch_idx, pl.ds(e * run, run)
+                        ],
+                        sem,
+                    ).start()
+            return
 
         for batch_idx in range(self.seq_batch_size):
             kv_p_start = bkv_idx * self.bkv_p

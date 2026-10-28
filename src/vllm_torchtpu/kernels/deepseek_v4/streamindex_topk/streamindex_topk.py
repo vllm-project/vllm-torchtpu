@@ -372,6 +372,7 @@ def kernel(
             seq_batch_size=seq_batch_size,
             chunk_idx=chunk_idx,
             table_expansion=table_expansion,
+            coalesce_entries=components is not None and components.coalesce_entries,
         )
     o_alloc = bref_override.StreamIndexOBufferedRef.output(
         spec=out_spec,
