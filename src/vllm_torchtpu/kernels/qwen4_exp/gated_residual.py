@@ -21,7 +21,11 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.qwen4_exp.hc_resources import HcHardware, supports_residual
+from vllm_torchtpu.kernels.qwen4_exp.hc_resources import (
+    RESIDUAL_PIPELINE,
+    HcHardware,
+    supports_residual,
+)
 
 
 def _kernel(residual_ref, block_ref, gates_ref, output_ref, *, branches, hidden):
@@ -80,12 +84,38 @@ def gated_residual_fn(
             functools.partial(_kernel, branches=branches, hidden=hidden),
             grid=(tokens // token_tile,),
             in_specs=(
-                pl.BlockSpec((token_tile, branches * hidden), lambda i: (i, 0)),
-                pl.BlockSpec((token_tile, hidden), lambda i: (i, 0)),
-                pl.BlockSpec((token_tile, branches), lambda i: (i, 0)),
+                pl.BlockSpec(
+                    (token_tile, branches * hidden),
+                    lambda i: (i, 0),
+                    pipeline_mode=RESIDUAL_PIPELINE,
+                ),
+                pl.BlockSpec(
+                    (token_tile, hidden),
+                    lambda i: (i, 0),
+                    pipeline_mode=RESIDUAL_PIPELINE,
+                ),
+                pl.BlockSpec(
+                    (token_tile, branches),
+                    lambda i: (i, 0),
+                    pipeline_mode=RESIDUAL_PIPELINE,
+                ),
             ),
-            out_specs=pl.BlockSpec((token_tile, branches * hidden), lambda i: (i, 0)),
+            out_specs=pl.BlockSpec(
+                (token_tile, branches * hidden),
+                lambda i: (i, 0),
+                pipeline_mode=RESIDUAL_PIPELINE,
+            ),
             out_shape=jax.ShapeDtypeStruct(residual.shape, residual.dtype),
+            compiler_params=pltpu.CompilerParams(vmem_limit_bytes=layout.vmem_bytes),
+            # Logical unpadded operand/output bytes, not exact DMA bus traffic.
+            cost_estimate=pl.CostEstimate(
+                flops=2 * tokens * branches * hidden,
+                transcendentals=0,
+                bytes_accessed=sum(
+                    a.size * a.dtype.itemsize for a in (residual, block, gates)
+                )
+                + residual.size * residual.dtype.itemsize,
+            ),
             name=f"gated_residual_b{branches}_h{hidden}_m{token_tile}",
         )(residual, block, gates)
 

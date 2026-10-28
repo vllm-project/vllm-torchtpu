@@ -22,7 +22,10 @@ import dataclasses
 import math
 
 import jax.numpy as jnp
+from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+RESIDUAL_PIPELINE = pl.Buffered(2)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -173,8 +176,11 @@ def supports_residual(
     def fp(cols):
         return _plane(tile, cols, hardware.fp32_rows, hardware.lanes, 4)
 
-    # Residual input/output, block, padded scalar gates; three hidden working
-    # planes cover promoted block/residual and the FP32 multiply/add result.
-    return 2 * bf(width) + bf(hidden) + fp(branches) + 3 * fp(hidden) <= (
-        hardware.vmem_bytes
+    # Match the explicit BlockSpec strategy for residual input/output, block
+    # input, and padded FP32 gates, including each plane's layout padding.
+    # Keep that conservative budget for single-tile calls too. The three live
+    # FP32 hidden working planes (block, residual, multiply/add) are not rings.
+    buffers = RESIDUAL_PIPELINE.buffer_count * (
+        2 * bf(width) + bf(hidden) + fp(branches)
     )
+    return buffers + 3 * fp(hidden) <= hardware.vmem_bytes

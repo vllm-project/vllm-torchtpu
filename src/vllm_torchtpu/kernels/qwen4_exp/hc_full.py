@@ -68,7 +68,8 @@ def _kernel(
         x_hbm.at[pl.ds(0, token_tile)], x_vm.at[0], x_sems.at[0]
     ).start()
 
-    def one_step(step, parity):
+    def one_step(step, parity, weight):
+        first = weight is None
         # The previous step started this input copy. Wait at its first read.
         pltpu.make_async_copy(
             x_vm.at[parity], x_vm.at[parity], x_sems.at[parity]
@@ -82,17 +83,15 @@ def _kernel(
                 x_sems.at[1 - parity],
             ).start()
 
-        @pl.when(step == 0)
-        def _wait_weight():
+        if first:
             weight_dma.wait()
+            weight = weight_vm[...].astype(jnp.float32)
 
         @pl.when(step >= 2)
         def _wait_prior_norm_output():
             pltpu.make_async_copy(
                 norm_vm.at[parity], norm_vm.at[parity], norm_sems.at[parity]
             ).wait()
-
-        weight = weight_vm[...].astype(jnp.float32)
 
         # Bound normalization FP32 work to one32-row branch strip. This does
         # not bound the later full-width logits/weighted epilogue footprint.
@@ -119,8 +118,7 @@ def _kernel(
             norm_sems.at[parity],
         ).start()
 
-        @pl.when(step == 0)
-        def _wait_down():
+        if first:
             down_dma.wait()
 
         down = jax.lax.dot_general(
@@ -131,8 +129,7 @@ def _kernel(
         ).astype(jnp.bfloat16)
         gate = jax.nn.silu(down.astype(jnp.float32) / branches).astype(jnp.bfloat16)
 
-        @pl.when(step == 0)
-        def _wait_up():
+        if first:
             up_dma.wait()
 
         # Match the BF16 up Linear output before NVIDIA's FP32 sigmoid/mix.
@@ -164,16 +161,23 @@ def _kernel(
             mixed_hbm.at[pl.ds(step * token_tile, token_tile)],
             mixed_sems.at[parity],
         ).start()
+        return weight
+
+    # Peel the first pair so weight waits/cast are static first-tile work.
+    # Down/up waits stay at their first reads, overlapping normalization.
+    tiles = tokens // token_tile
+    weight = one_step(0, 0, None)
+    if tiles > 1:
+        one_step(1, 1, weight)
 
     def step_pair(pair, carry):
-        one_step(2 * pair, 0)
-        one_step(2 * pair + 1, 1)
+        one_step(2 * pair, 0, weight)
+        one_step(2 * pair + 1, 1, weight)
         return carry
 
-    jax.lax.fori_loop(0, tokens // (2 * token_tile), step_pair, jnp.int32(0))
-    tiles = tokens // token_tile
-    if tiles % 2:
-        one_step(tiles - 1, 0)
+    jax.lax.fori_loop(1, tiles // 2, step_pair, jnp.int32(0))
+    if tiles > 1 and tiles % 2:
+        one_step(tiles - 1, 0, weight)
     # A one-tile call never started parity1; do not wait its semaphore.
     for parity in range(min(tiles, 2)):
         pltpu.make_async_copy(
@@ -247,5 +251,16 @@ def _full_mix(x, weight, down, up, *, branches, hidden, eps, token_tile, hardwar
             jax.ShapeDtypeStruct((tokens, width), jnp.bfloat16),
         ),
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=hardware.vmem_bytes),
+        # Two GEMMs at two FLOPs/MAC; normalization, SiLU and branch mixing.
+        # Count each logical rsqrt/sigmoid as one transcendental operation.
+        # Weights are read once; input and both outputs once per token. These
+        # unpadded logical bytes do not claim exact DMA bus traffic.
+        cost_estimate=pl.CostEstimate(
+            flops=4 * tokens * width * lowrank
+            + tokens * (7 * width + branches + 2 * lowrank),
+            transcendentals=tokens * (branches + lowrank + width),
+            bytes_accessed=sum(a.size * a.dtype.itemsize for a in (x, weight, down, up))
+            + tokens * (width + hidden) * x.dtype.itemsize,
+        ),
         name=f"qwen4exp_hc_branchstore32_m{token_tile}",
     )(x, weight, down, up)
