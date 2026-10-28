@@ -34,7 +34,7 @@ from vllm.compilation.compiler_interface import CompilerInterface
 from vllm.config import VllmConfig
 from vllm.config.utils import Range
 
-from vllm_torchtpu import envs, utils
+from vllm_torchtpu import envs, expert_placement, utils
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.logger import init_logger
 
@@ -457,6 +457,12 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
             else None,
         },
     }
+    # TPU_EXPERT_PLACEMENT is hashed as a path with the other env vars; the
+    # table it names sets the weight slots per rank (copies), which the
+    # compiled programs bake in.
+    placement = expert_placement.placement()
+    if placement is not None:
+        factors["expert_placement"] = placement.sha256
 
     repo_root = Path(__file__).resolve().parents[2]
     hash_obj = hashlib.sha256(

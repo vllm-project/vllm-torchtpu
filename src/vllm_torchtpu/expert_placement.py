@@ -16,14 +16,16 @@
 ``TPU_EXPERT_PLACEMENT`` names a JSON table (a path, a ``gs://`` URI or the name
 of a table shipped in ``expert_placements/``) that lists, per MoE layer, the
 global experts each EP rank holds in slot order:
-``{"experts": E, "shards": S, "layers": {"<n>": [[ids...], ...S ranks...]}}``,
-``E / S`` ids per rank and every expert exactly once across the ranks; other
-keys (such as ``meta``) are ignored. A table is a permutation of vLLM's linear
-placement: every rank keeps the same number of experts and no expert is copied.
+``{"experts": E, "shards": S, "layers": {"<n>": [[ids...], ...S ranks...]}}``.
+The first ``E / S`` ids of every rank hold every expert exactly once across the
+ranks: the primaries. Longer rank lists hold, after them, one extra copy of some
+experts, each on a rank that does not own it (expert copies, with the top-level
+``copy_share`` and ``copy_min_tokens``). Other keys (such as ``meta``) are
+ignored. Without copies a table is a permutation of vLLM's linear placement.
 
-A placed layer's expert map, the EP weight filter and the router's rows follow
-the table. The router rows are reordered so that rank r's experts become
-expert ids ``r * slots .. (r + 1) * slots - 1``, so every kernel keeps its
+A placed layer's expert map, the EP weight filter (copies included) and the router's
+rows follow the table. The router rows are reordered so that rank r's primaries become
+expert ids ``r * owned .. (r + 1) * owned - 1``, so every kernel keeps its
 contiguous-block ownership and nothing runs per token. Each token still picks
 the same experts with the same weights (an exact tie of biased scores may
 break the other way); only the order in which its top-k contributions are
@@ -32,6 +34,16 @@ summed can change. Layers the table does not list, and every layer under an
 linear placement. Only the router rows of layers whose expert map this process
 placed are reordered, and a weight stream that ends without the router weight
 (``.mlp.gate.weight``) of every placed layer is refused.
+
+Copy slots make a rank hold more weight slots than ``experts / ranks``. Only
+the FP8 grouped-matmul path serves them, and only for GLM-5.2: every layer with
+copy slots must list ``copy_share``, and the
+GLM-5.2 patch (``models/vllm/glm_moe_dsa_patch.py``) routes a share of their
+traffic to them (a layer's ``copy_share`` and the table's ``copy_min_tokens``,
+both validated here). Paths that own experts by id at ``experts / ranks`` per rank
+(moe_tp_decode, fused_moe_decode, fused EP, adaptive fused MoE) decline or refuse
+a layer with copy slots through their equal-block checks, and other MoE
+quantization methods are refused.
 
 Tables and deployments that cannot be placed safely are refused at load (list:
 the "Static Expert Placement" section of ``docs/user_guide/parallelism.md``).
@@ -80,16 +92,50 @@ _STATE: dict[str, object] = {}
 class Placement:
     experts: int
     ranks: int
+    # Primary experts per rank: across the ranks, every expert once.
+    owned: int
+    # Weight slots per rank: the primaries, then the copy slots.
     slots: int
     # Per layer and rank, the global expert in each slot.
     cores: dict[int, tuple[tuple[int, ...], ...]]
+    # Per layer that lists copy_share: per copied expert, the share of its
+    # (token, k) pairs its copy serves (GLM-5.2's copy routing).
+    shares: dict[int, dict[int, float]] = dataclasses.field(default_factory=dict)
+    # Tokens per rank of the MoE all-gather below which no pair is split.
+    copy_min_tokens: int = 0
     # sha256 of the table file's bytes (empty for a table parsed from a dict).
     sha256: str = ""
 
 
+def _parse_shares(
+    raw: dict, copied: dict[int, int], layer: int, source: str
+) -> dict[int, float]:
+    """A layer's copy_share: exactly its copied experts, each in [0, 1]."""
+    if not copied:
+        raise ValueError(
+            f"expert placement {source}: layer {layer} lists copy_share but the "
+            "table has no copy slots"
+        )
+    shares = {int(e): float(s) for e, s in raw.items()}
+    if set(shares) != set(copied):
+        raise ValueError(
+            f"expert placement {source}: layer {layer}'s copy_share must list "
+            "exactly its copied experts"
+        )
+    for expert, value in shares.items():
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(
+                f"expert placement {source}: layer {layer}'s copy_share for "
+                f"expert {expert} is {value}, outside [0, 1]"
+            )
+    return shares
+
+
 def parse(table: dict, source: str) -> Placement:
-    """Validate a placement table: each layer a permutation of the experts,
-    experts / shards to a rank."""
+    """Validate a placement table: each layer's primaries (the first experts /
+    shards ids of every rank) a permutation of the experts, then at most one
+    copy of an expert, on a rank that does not own it, and the copy routing
+    fields (copy_share, copy_min_tokens)."""
     experts = int(table["experts"])
     ranks = int(table["shards"])
     if experts % ranks:
@@ -97,8 +143,24 @@ def parse(table: dict, source: str) -> Placement:
             f"expert placement {source}: {experts} experts do not divide over "
             f"{ranks} ranks"
         )
-    slots = experts // ranks
-    cores = {}
+    owned = experts // ranks
+    # Every rank list holds as many slots as the first one: the primaries,
+    # then (if longer) the copy slots.
+    first = next(iter(table["layers"].values()), None)
+    slots = len(first[0]) if first else owned
+    copies = slots > owned
+    min_tokens = table.get("copy_min_tokens", 0)
+    if (
+        isinstance(min_tokens, bool)
+        or not isinstance(min_tokens, int)
+        or min_tokens < 0
+    ):
+        raise ValueError(
+            f"expert placement {source}: copy_min_tokens must be a non-negative "
+            f"integer, not {min_tokens!r}"
+        )
+    share_by_layer = {int(k): v for k, v in table.get("copy_share", {}).items()}
+    cores, shares = {}, {}
     for key, held in table["layers"].items():
         layer = int(key)
         if layer in cores:
@@ -111,13 +173,43 @@ def parse(table: dict, source: str) -> Placement:
                 f"expert placement {source}: layer {layer} must list {ranks} "
                 f"ranks of {slots} experts each"
             )
-        if sorted(e for c in rows for e in c) != list(range(experts)):
+        if sorted(e for c in rows for e in c[:owned]) != list(range(experts)):
             raise ValueError(
                 f"expert placement {source}: layer {layer} must hold each of the "
                 f"{experts} experts exactly once"
+                + (" among the primaries" if copies else "")
             )
+        copied = {e: r for r, c in enumerate(rows) for e in c[owned:]}
+        if any(not 0 <= e < experts for e in copied):
+            raise ValueError(
+                f"expert placement {source}: layer {layer} has an invalid copy id"
+            )
+        if len(copied) != ranks * (slots - owned):
+            raise ValueError(
+                f"expert placement {source}: layer {layer} holds an expert in "
+                "more than one copy slot"
+            )
+        if any(e in rows[r][:owned] for e, r in copied.items()):
+            raise ValueError(
+                f"expert placement {source}: layer {layer} holds a copy on the "
+                "rank that owns the expert"
+            )
+        if copied and layer not in share_by_layer:
+            raise ValueError(
+                f"expert placement {source}: layer {layer} has copy slots but no "
+                "copy_share (the share of each copied expert's pairs its copy "
+                "serves); copies that serve no traffic are not supported"
+            )
+        if layer in share_by_layer:
+            shares[layer] = _parse_shares(share_by_layer[layer], copied, layer, source)
         cores[layer] = rows
-    return Placement(experts, ranks, slots, cores)
+    unplaced = sorted(set(share_by_layer) - set(cores))
+    if unplaced:
+        raise ValueError(
+            f"expert placement {source}: copy_share lists layers {unplaced}, "
+            "which the table does not place"
+        )
+    return Placement(experts, ranks, owned, slots, cores, shares, min_tokens)
 
 
 def check_layers(
@@ -179,17 +271,31 @@ def _read(uri: str) -> bytes:
 
 @functools.cache
 def _load(uri: str) -> Placement:
+    """The table, read once per process: the placement, its copy routing
+    fields and the sha256 all come from these bytes."""
     raw = _read(uri)
     table = dataclasses.replace(
         parse(json.loads(raw), uri), sha256=hashlib.sha256(raw).hexdigest()
     )
     logger.info(
-        "Expert placement %s: %d layers, %d ranks x %d slots",
+        "Expert placement %s: %d layers, %d ranks x %d slots (%d primaries)",
         uri,
         len(table.cores),
         table.ranks,
         table.slots,
+        table.owned,
     )
+    fused_ep = (
+        envs.USE_MOE_FUSED_EP_KERNEL and envs.MOE_FUSED_EP_KERNEL_IMPL != "adaptive"
+    )
+    if table.slots > table.owned and (envs.USE_MOE_TP_DECODE_KERNEL or fused_ep):
+        # Their equal-block checks decline every layer with copy slots (adaptive
+        # fused MoE raises instead).
+        logger.warning(
+            "Expert placement %s: layers with copies run on the grouped-matmul "
+            "path, not on USE_MOE_TP_DECODE_KERNEL or the fused EP kernel",
+            uri,
+        )
     return table
 
 
@@ -239,13 +345,24 @@ def expert_map(table: Placement, layer: int, rank: int) -> list[int]:
 
 def virtual_order(table: Placement, layer: int) -> list[int]:
     """The global expert behind each router row after the reorder."""
-    return [e for c in table.cores[layer] for e in c]
+    # Copy slots have no router row: the router keeps one row per expert.
+    return [e for c in table.cores[layer] for e in c[: table.owned]]
 
 
 def local_expert_ids(name: str) -> frozenset[int] | None:
     """The experts this rank loads for a placed layer's weight, else None."""
     layer = layer_index(name) if _LOCAL_IDS else None
     return None if layer is None else _LOCAL_IDS.get(layer)
+
+
+def num_primary_experts(layer_name: str) -> int | None:
+    """Primaries per rank of a layer this worker placed with copy slots, else
+    None (every weight slot holds a primary)."""
+    table = placement()
+    layer = _placed_layer(table, layer_name)
+    if table is None or layer not in _LOCAL_IDS or table.slots == table.owned:
+        return None
+    return table.owned
 
 
 def permute_router_rows(name: str, tensor: torch.Tensor) -> torch.Tensor:
@@ -298,6 +415,19 @@ def _refuse_unsupported_load_format() -> None:
         )
 
 
+def _refuse_copies_without_fp8(layer_name: str, method: object) -> None:
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
+
+    if not isinstance(method, VllmFp8MoEMethodTPU):
+        raise NotImplementedError(
+            f"{layer_name}: TPU_EXPERT_PLACEMENT gives this layer expert "
+            "copies, which only the FP8 MoE method serves (through GLM-5.2's "
+            "copy routing on the grouped-matmul path); this layer uses "
+            f"{type(method).__name__}. Use a table without copies for this "
+            "checkpoint."
+        )
+
+
 def _check_deployment(table: Placement) -> None:
     """Once per process, at the first MoE layer: refuse EP x TP expert
     splitting and a table that lists a dense or MTP layer of this model."""
@@ -347,11 +477,13 @@ def _announce(table: Placement | None) -> None:
     _STATE["announced"] = True
     rank = _STATE.get("ep_rank", -1)
     if _LOCAL_IDS:
+        copies = table.slots - table.owned
         logger.info(
-            "[eplb] placement installed ep_rank=%d layers=%d table_sha256=%s",
+            "[eplb] placement installed ep_rank=%d layers=%d table_sha256=%s%s",
             rank,
             len(_LOCAL_IDS),
             table.sha256[:16],
+            f" copies={copies}" if copies else "",
         )
     else:
         raise ValueError(
@@ -366,7 +498,9 @@ def install_expert_placement() -> None:
     Each placed ``RoutedExperts`` rebuilds its expert map through
     ``ExpertMapManager.update`` (main's host-built map), with
     ``determine_expert_map`` answering from the table, before its weights are
-    created. Both loaders' weight streams reorder the router rows.
+    created (with copy slots, ``moe_config.num_local_experts`` follows, so the
+    weights get every slot). A placed layer with copy slots must get the FP8
+    MoE method. Both loaders' weight streams reorder the router rows.
     """
     if not envs.TPU_EXPERT_PLACEMENT:
         return
@@ -378,6 +512,7 @@ def install_expert_placement() -> None:
         return
     determine = expert_map_manager.determine_expert_map
     update_info = RoutedExperts.update_expert_map_info
+    get_quant_method = RoutedExperts._get_quant_method
     get_all_weights = default_loader.DefaultModelLoader.get_all_weights
     streamed = runai_streamer_loader.RunaiModelStreamerLoader._get_weights_iterator
     building: list[tuple[Placement, int]] = []
@@ -433,6 +568,8 @@ def install_expert_placement() -> None:
                 manager.update(manager.moe_parallel_config, manager.global_num_experts)
             finally:
                 building.pop()
+            # The weights are created with this count: the slots, copies included.
+            self.moe_config.num_local_experts = manager.local_num_experts
             _LOCAL_IDS[layer] = frozenset(table.cores[layer][manager.ep_rank])
             _STATE["ep_rank"] = manager.ep_rank
         elif use_ep:
@@ -440,6 +577,13 @@ def install_expert_placement() -> None:
                 "Expert placement: %s keeps vLLM's linear placement", self.layer_name
             )
         update_info(self)
+
+    def placed_quant_method(self, *args, **kwargs):
+        # RoutedExperts.__init__ picks the method right after the expert map.
+        method = get_quant_method(self, *args, **kwargs)
+        if num_primary_experts(self.layer_name) is not None:
+            _refuse_copies_without_fp8(self.layer_name, method)
+        return method
 
     def placed_all_weights(self, model_config, model):
         yield from _placed_stream(get_all_weights(self, model_config, model))
@@ -449,6 +593,7 @@ def install_expert_placement() -> None:
 
     expert_map_manager.determine_expert_map = determine_expert_map
     RoutedExperts.update_expert_map_info = update_expert_map_info
+    RoutedExperts._get_quant_method = placed_quant_method
     default_loader.DefaultModelLoader.get_all_weights = placed_all_weights
     runai_streamer_loader.RunaiModelStreamerLoader._get_weights_iterator = (
         placed_weights_iterator

@@ -154,6 +154,7 @@ def _glm_runner(mlp, *, n=2, h=256, i=128, e=4, dtype=torch.bfloat16):
         moe_config=SimpleNamespace(moe_parallel_config=par, in_dtype=dtype),
         _quant_method=qm,
         routed_experts=SimpleNamespace(
+            global_num_experts=n * e,
             w13_weight=torch.zeros((e, h, 2 * i), dtype=torch.float8_e4m3fn),
             w2_weight=torch.zeros((e, i, h), dtype=torch.float8_e4m3fn),
             w13_weight_scale_inv=torch.ones((e, 1, 1, 2 * i)),
@@ -184,6 +185,21 @@ def test_glm_admission(monkeypatch):
     other = DeepseekV2MLP(256, 128)
     other.act_fn = torch.nn.GELU()
     assert bridge._admit(_glm_runner(other), 2) is None
+
+
+def test_admission_declines_a_layer_with_expert_copies(monkeypatch):
+    """The kernel owns experts start .. start + e - 1 by id, so a layer with a
+    TPU_EXPERT_PLACEMENT copy slot (5 weight slots for 4 experts per rank)
+    stays on GMM."""
+    import vllm.distributed
+
+    monkeypatch.setattr(
+        vllm.distributed, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    runner = _glm_runner(DeepseekV2MLP(256, 128), e=5)
+    assert bridge._admit(runner, 2) is not None  # 10 experts: equal blocks
+    runner.routed_experts.global_num_experts = 8
+    assert bridge._admit(runner, 2) is None
 
 
 def test_admission_declines_attention_narrower_than_mesh(monkeypatch):

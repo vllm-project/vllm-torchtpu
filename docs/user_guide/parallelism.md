@@ -117,14 +117,33 @@ shipped in `src/vllm_torchtpu/expert_placements/`.
   weights and cost model. A table helps only when the busiest rank's expert load sets the
   MoE time; at low token counts per rank every rank streams most of its experts and a
   permutation changes little.
+- **Expert copies:** a rank list longer than `experts / shards` holds its primaries first
+  (the first `experts / shards` ids of every rank form the permutation) and then one extra
+  copy of some experts, each on a rank that does not own it. Only GLM-5.2's FP8
+  grouped-matmul path serves such a layer, and the table must list its `copy_share`
+  (per copied expert, the share of its (token, k) pairs its copy serves; no split below
+  the table's `copy_min_tokens` tokens per DP x PCP rank). The compile cache is keyed on
+  the table's contents.
+
+  ```json
+  {"experts": 256, "shards": 16, "copy_min_tokens": 64,
+   "layers": {"3": [["...16 primaries", 41], "...16 ranks"]},
+   "copy_share": {"3": {"41": 0.4, "...": 0.25}}}
+  ```
+
 - **Refused at load:** layers outside the routed decoder layers (dense or MTP layers),
   listed layers without expert parallelism, `TPU_MOE_EP_TP_SIZE > 1`,
   `TPU_MOE_HIERARCHICAL_EP`, an `--expert-placement-strategy` other than `linear`, grouped
   top-k, hash-routed layers, a table that places no layer, a `--load-format` that the
   default and Run:AI loaders do not serve, and a model whose router weight is not named
-  `.mlp.gate.weight` (the stream would not reorder it).
+  `.mlp.gate.weight` (the stream would not reorder it). With copies, also any other MoE
+  quantization method, adaptive fused MoE on such a layer, a layer without `copy_share`,
+  another model, `TPU_MOE_COLLECTION_CHUNK_SIZE > 0` and `TPU_MOE_FP8_ALL_GATHER`;
+  `USE_MOE_TP_DECODE_KERNEL`, `FUSED_MOE_DECODE_KERNEL` and the fused EP kernel leave such
+  a layer on the grouped-matmul path.
 - **Check delivery:** with a table, every expert-parallel worker logs one line,
-  `[eplb] placement installed ep_rank=<r> layers=<n> table_sha256=<16 hex>`.
+  `[eplb] placement installed ep_rank=<r> layers=<n> table_sha256=<16 hex>` (followed by
+  `copies=<copy slots per rank>` for a table with copies).
 
 ---
 

@@ -21,10 +21,15 @@ and SparseCore ragged branches). The router rows go through
 expert_placement.permute_router_rows and each rank's experts through
 expert_placement.expert_map, as at load. Pallas kernels that cannot run on CPU
 (gmm_v2 and the SparseCore gather / gather-reduce) are replaced by jnp
-references in both arms. Negative controls must change the output."""
+references in both arms. Negative controls must change the output.
+
+A table with expert copies (16 primaries + 1 copy slot per rank) keeps the
+output through fused_moe_func per rank too, with GLM-5.2's copy routing
+(route_to_copies, slot ids from experts_start = 17 * rank)."""
 
 import functools
 import json
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -32,11 +37,13 @@ import numpy as np
 import pytest
 import torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu import expert_placement as ep
 from vllm_torchtpu.kernels import router_topk
 from vllm_torchtpu.kernels.experimental.moe_tp_decode import kernel as mtk
 from vllm_torchtpu.layers.adapter import moe_tp_decode as mtd
 from vllm_torchtpu.layers.core import fused_moe_gmm as fmg
+from vllm_torchtpu.models.vllm import glm_moe_dsa_patch as glm
 
 E, RANKS, TOPK, SCALE = 256, 16, 8, 2.5
 SLOTS = E // RANKS
@@ -194,7 +201,7 @@ def _placed_experts(table, layer, w_all):
     """Each rank's slots filled through the expert map, as the loader does."""
     ranks = []
     for r in range(RANKS):
-        slot_expert = [0] * SLOTS
+        slot_expert = [0] * table.slots
         for expert, slot in enumerate(ep.expert_map(table, layer, r)):
             if slot >= 0:
                 slot_expert[slot] = expert
@@ -273,4 +280,111 @@ def test_placed_layer_matches_the_unplaced_layer(table, refs, tokens, path, bias
     }
     for name, (g, b, a13, a2) in controls.items():
         out, _ = run(x, g, b, a13, a2, is_pad)
+        assert not _same(out, base, valid), name
+
+
+COPY_SLOTS = SLOTS + 1
+
+
+@pytest.fixture
+def copies_table(tmp_path, monkeypatch):
+    """Returns use(hot): LAYER on 16 ranks x (16 primaries + 1 copy), rank r's
+    first primary hot[r]; rank r copies hot[r + 1], and the copy takes half of
+    that expert's pairs, as a solver would copy the hottest experts."""
+
+    def use(hot):
+        rest = [e for e in np.random.default_rng(1).permutation(E) if e not in hot]
+        step = SLOTS - 1
+        cores = [[hot[r], *rest[r * step : (r + 1) * step]] for r in range(RANKS)]
+        cores = [[int(e) for e in c] for c in cores]
+        copied = [cores[(r + 1) % RANKS][0] for r in range(RANKS)]
+        path = tmp_path / "copies.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "shards": RANKS,
+                    "experts": E,
+                    "layers": {
+                        str(LAYER): [c + [copied[r]] for r, c in enumerate(cores)]
+                    },
+                    "copy_share": {str(LAYER): {str(e): 0.5 for e in copied}},
+                }
+            )
+        )
+        monkeypatch.setenv("TPU_EXPERT_PLACEMENT", str(path))
+        ep._load.cache_clear()
+        table = ep.placement()
+        # LAYER placed in this process, as building it does.
+        monkeypatch.setattr(ep, "_LOCAL_IDS", {LAYER: frozenset(table.cores[LAYER][0])})
+        monkeypatch.setattr(ep, "_ROUTED", set())
+        return table
+
+    monkeypatch.setattr(glm, "_glm_moe_dsa", True)
+    monkeypatch.setattr(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 0, raising=False)
+    monkeypatch.setattr(envs, "TPU_MOE_FP8_ALL_GATHER", False, raising=False)
+    yield use
+    ep._load.cache_clear()
+
+
+def _copy_routed_layer():
+    """The routing state install_copy_routing registers (the same on every
+    rank but for the slot start, which the arms below pass themselves)."""
+    layer = torch.nn.Module()
+    layer.layer_name = f"model.layers.{LAYER}.mlp.experts"
+    layer.w13_weight = torch.zeros(1)
+    parallel = SimpleNamespace(use_ep=True, ep_rank=0, dp_size=1, pcp_size=1)
+    layer.moe_config = SimpleNamespace(moe_parallel_config=parallel)
+    assert glm.install_copy_routing(layer)
+    return layer
+
+
+@pytest.mark.parametrize("tokens", [64, 256, 1024])
+def test_copy_slots_keep_the_unplaced_output(copies_table, refs, tokens):
+    rng = np.random.default_rng(tokens)
+    router_w = jnp.asarray(rng.standard_normal((E, HIDDEN)) * 0.05, jnp.float32)
+    bias = jnp.asarray(rng.standard_normal(E) * 0.5, jnp.float32)
+    table = copies_table(np.argsort(-np.asarray(bias))[:RANKS].tolist())
+    w13 = jnp.asarray(rng.standard_normal((E, HIDDEN, 2 * INTER)) * 0.05, jnp.bfloat16)
+    w2 = jnp.asarray(rng.standard_normal((E, INTER, HIDDEN)) * 0.05, jnp.bfloat16)
+    x = jnp.asarray(rng.standard_normal((tokens, HIDDEN)), jnp.bfloat16)
+    is_pad = jnp.asarray(np.arange(tokens) >= tokens - 8)
+    valid = ~np.asarray(is_pad)
+
+    def route(gate, gate_bias):
+        scores = jax.nn.sigmoid(x.astype(jnp.float32) @ gate.T)
+        return mtd._route(x, scores, gate_bias, is_pad, _STATICS)
+
+    w, ids = route(router_w, bias)
+    linear13 = w13.reshape(RANKS, SLOTS, HIDDEN, 2 * INTER)
+    linear2 = w2.reshape(RANKS, SLOTS, INTER, HIDDEN)
+    base = _grouped(x, w, ids, linear13, linear2, lambda r: r * SLOTS)
+
+    placed13 = _placed_experts(table, LAYER, w13)
+    placed2 = _placed_experts(table, LAYER, w2)
+    assert placed13.shape[1] == COPY_SLOTS
+    pw, rows = route(*_router(LAYER, router_w, bias))
+    layer = _copy_routed_layer()
+    slot_ids = jnp.asarray(
+        glm.route_to_copies(layer, torch.from_numpy(np.array(rows))).numpy()
+    )
+    primary = (rows // SLOTS) * COPY_SLOTS + rows % SLOTS
+    # Some pairs, not all of the copied experts', go to the copies.
+    moved = np.asarray(slot_ids != primary)[valid]
+    copied_rows = np.isin(np.asarray(rows), np.asarray(layer._copy_rows))[valid]
+    assert 0 < moved.sum() < copied_rows.sum()
+
+    def run(ids_, start):
+        return _grouped(x, pw, ids_, placed13, placed2, start)
+
+    # Slot ids from each rank's first slot, over every slot.
+    served = run(slot_ids, lambda r: r * COPY_SLOTS)
+    assert _same(served, base, valid)
+
+    # Negative controls: each must change the output.
+    controls = {
+        # Rank r's copy slot also serves rank r + 1's first primary.
+        "router-row ids": run(rows, lambda r: r * SLOTS),
+        "slot ids from the primaries' start": run(slot_ids, lambda r: r * SLOTS),
+    }
+    for name, out in controls.items():
         assert not _same(out, base, valid), name

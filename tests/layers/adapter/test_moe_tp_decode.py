@@ -481,6 +481,19 @@ def test_arms_an_expert_range_on_ep_by_tp_weights(harness, ep_size, tp_size, ep_
     assert e0.tolist() == [[ep_rank * E]]
 
 
+def test_a_layer_with_expert_copies_stays_on_gmm(harness):
+    """A TPU_EXPERT_PLACEMENT copy slot gives a rank E + 1 weight slots, which
+    the kernel cannot address: it declines the layer and logs why."""
+    model = harness.model({"use_ep": True})
+    layer = model.layers[0].routed_experts
+    layer.w13_weight = torch.nn.Parameter(
+        torch.randn(E + 1, H, 2 * INTER).to(FP8), requires_grad=False
+    )
+    assert moe_tp_decode.arm(model) == 0
+    assert not _armed(model.layers[0])
+    assert f"{E + 1} local experts x ep" in harness.logs[-1]
+
+
 @pytest.mark.parametrize(
     ("prefill", "spec", "want"),
     [
