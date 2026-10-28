@@ -8,9 +8,9 @@ import numpy as np
 import pytest
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.deepseek_v41.csa2.prefill import (
+from vllm_torchtpu.kernels.deepseek_v41.csa2.csa2 import (
     build_query_tiles,
-    csa2_prefill,
+    csa2,
 )
 from vllm_torchtpu.kernels.deepseek_v41.csa2.reference import prefill_reference
 
@@ -146,6 +146,8 @@ def numpy_reference(args, kwargs):
         (16, True, True, 8, 64),
         (16, True, False, 128, 64),
         (6, False, False, 64, 32),
+        (16, False, False, 64, 32),
+        (16, False, True, 64, 32),
         (6, True, True, 128, 32),
     ],
 )
@@ -153,7 +155,7 @@ def test_prefill_visibility_and_tail_rows(bq, banked, non_causal, heads, page_si
     args, kwargs = prefill_inputs(banked, non_causal, heads, page_size)
     # CPU validates reference math; TPU exercises the buffered kernel itself.
     actual = (
-        csa2_prefill(*args, **kwargs, bq=bq)
+        csa2(*args, **kwargs, bq=bq)
         if jax.default_backend() == "tpu"
         else prefill_reference(*args, **kwargs)
     )
@@ -174,7 +176,7 @@ def test_prefill_traces_dynamic_tile_grid(bq, banked, non_causal):
         (1,), ("core",), abstract_device=jax.sharding.AbstractDevice("TPU7x", 1, "tpu")
     )
     with jax.sharding.use_abstract_mesh(mesh):
-        traced = jax.make_jaxpr(lambda *x: csa2_prefill(*x, **kwargs, bq=bq))(*args)
+        traced = jax.make_jaxpr(lambda *x: csa2(*x, **kwargs, bq=bq))(*args)
     assert traced.out_avals[0].shape == args[0].shape
 
 
@@ -204,7 +206,7 @@ def test_prefill_warmup_with_mostly_padding(tokens, requests):
     )
     expected = prefill_reference(*args, **kwargs)
     if jax.default_backend() == "tpu":
-        actual = csa2_prefill(*args, **kwargs, bq=6)
+        actual = csa2(*args, **kwargs, bq=6)
         np.testing.assert_allclose(actual, expected, atol=3e-3, rtol=3e-2)
         np.testing.assert_array_equal(actual[requests:], 0)
     else:
@@ -214,7 +216,7 @@ def test_prefill_warmup_with_mostly_padding(tokens, requests):
             abstract_device=jax.sharding.AbstractDevice("TPU7x", 1, "tpu"),
         )
         with jax.sharding.use_abstract_mesh(mesh):
-            traced = jax.make_jaxpr(lambda *x: csa2_prefill(*x, **kwargs, bq=6))(*args)
+            traced = jax.make_jaxpr(lambda *x: csa2(*x, **kwargs, bq=6))(*args)
         assert traced.out_avals[0].shape == expected.shape
 
 
@@ -244,7 +246,7 @@ def test_single_request_direct_output_preserves_padding(non_causal, valid_tokens
         swa_bounds=kwargs["swa_bounds"][1:2] if non_causal else None,
     )
     actual = (
-        csa2_prefill(*args, **kwargs, bq=16)
+        csa2(*args, **kwargs, bq=16)
         if jax.default_backend() == "tpu"
         else prefill_reference(*args, **kwargs)
     )
@@ -277,7 +279,7 @@ def test_prefill_carry_pipeline_short_batches(tokens):
         swa_metadata=kwargs["swa_metadata"][1:2],
         main_lengths=jnp.resize(kwargs["main_lengths"], (tokens,)),
     )
-    actual = csa2_prefill(*args, **kwargs, bq=8)
+    actual = csa2(*args, **kwargs, bq=8)
     expected = prefill_reference(*args, **kwargs)
     np.testing.assert_allclose(actual, expected, atol=3e-3, rtol=3e-2)
 
@@ -300,7 +302,7 @@ def test_prefill_streams_metadata_larger_than_vmem(ragged):
     )
     starts = jnp.array([0, 9, tokens - 5] if ragged else [0, tokens], jnp.int32)
     metadata = jnp.repeat(metadata, starts.shape[0] - 1, axis=0)
-    output = csa2_prefill(
+    output = csa2(
         q,
         jnp.zeros((tokens, 512, 128), jnp.int32),
         jnp.ones((tokens, 512), jnp.float32),

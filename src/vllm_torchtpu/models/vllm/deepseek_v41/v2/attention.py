@@ -1491,7 +1491,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     self.compress_ratio,
                     self.scale,
                     non_causal,
-                    decoder=self._ced_decoder,
                 )
                 output.copy_(result)
                 return None

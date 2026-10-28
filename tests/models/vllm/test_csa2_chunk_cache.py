@@ -260,8 +260,7 @@ def test_swa_pool_admits_million_token_context(record_property):
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("tokens", [1, 513])
-@pytest.mark.parametrize("decoder", [False, True])
-def test_chunk_cache_reuse_and_stage_invalidation(monkeypatch, tokens, decoder):
+def test_chunk_cache_reuse_and_stage_invalidation(monkeypatch, tokens):
     from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
         attention_kernels,
         csa2_adapter,
@@ -270,7 +269,6 @@ def test_chunk_cache_reuse_and_stage_invalidation(monkeypatch, tokens, decoder):
     gathered, consumed = [], []
 
     def gather(query, raw, high, scales, high_scales, selected, *args):
-        assert args[-1] is decoder
         gathered.append(selected)
         return (
             query * 2,
@@ -280,8 +278,7 @@ def test_chunk_cache_reuse_and_stage_invalidation(monkeypatch, tokens, decoder):
         )
 
     def attend(query, words, scales, raw, high, starts, *args):
-        assert args[-1] is decoder
-        consumed.append((words, scales, starts, args[-2]))
+        consumed.append((words, scales, starts, args[-1]))
         return query * 2
 
     monkeypatch.setattr(
@@ -316,7 +313,6 @@ def test_chunk_cache_reuse_and_stage_invalidation(monkeypatch, tokens, decoder):
             2,
             512**-0.5,
             False,
-            decoder=decoder,
         )
 
     with attention_kernels.gathered_kv_cache_scope():

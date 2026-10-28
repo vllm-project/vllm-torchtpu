@@ -15,8 +15,8 @@ from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import (
     prepare_swa_metadata,
     publish_csa2_kv,
 )
+from vllm_torchtpu.kernels.deepseek_v41.csa2.csa2 import csa2
 from vllm_torchtpu.kernels.deepseek_v41.csa2.pipeline import (
-    csa2_attention,
     csa2_gather_chunk_size,
     csa2_pipeline,
 )
@@ -89,9 +89,8 @@ def _attend(
     scale: float,
     non_causal: bool,
     bq: int,
-    decoder: bool,
 ) -> jax.Array:
-    return csa2_attention(
+    return csa2(
         q,
         words,
         scales,
@@ -106,7 +105,6 @@ def _attend(
         compress_ratio=ratio,
         scale=scale,
         bq=bq,
-        decoder=decoder,
     )
 
 
@@ -132,7 +130,6 @@ def _gather_attend(
     scale: float,
     non_causal: bool,
     bq: int,
-    decoder: bool,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     records, counts = prepare_main_records(
         selected, pages, main_starts, page_size=main_page_size
@@ -152,7 +149,6 @@ def _gather_attend(
         counts,
         chunk_size=csa2_gather_chunk_size(q.shape[0]),
         bq=bq,
-        decoder=decoder,
         scale=scale,
         compress_ratio=ratio,
     )
@@ -262,13 +258,13 @@ def initialize_csa2_ops() -> None:
         (
             "attend",
             _attend,
-            (P(),) * 12 + (None,) * 5,
+            (P(),) * 12 + (None,) * 4,
             lambda q, *_: torch.empty_like(q),
         ),
         (
             "gather_attend",
             _gather_attend,
-            (P(),) * 16 + (None,) * 6,
+            (P(),) * 16 + (None,) * 5,
             _fake_gather_attend,
         ),
         (
@@ -358,8 +354,6 @@ def attention(
     ratio: int,
     scale: float,
     non_causal: bool,
-    *,
-    decoder: bool = False,
 ) -> torch.Tensor:
     from . import attention_kernels
 
@@ -406,7 +400,6 @@ def attention(
             scale,
             non_causal,
             bq,
-            decoder,
         )
         if cache is not None:
             cache.put(main, records, layout, (words, scales), valid_counts=counts)
@@ -430,7 +423,6 @@ def attention(
         scale,
         non_causal,
         bq,
-        decoder,
     )
 
 
