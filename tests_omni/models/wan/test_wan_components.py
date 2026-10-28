@@ -514,14 +514,14 @@ HF_ENCODER_DTYPES = pytest.mark.parametrize(
 
 
 def _load_hf_encoder(model_cls, path, dtype, device):
-    """- Loads like the pipelines: from_pretrained(torch_dtype), then .to(device)."""
+    """Loads like the pipelines: from_pretrained(torch_dtype), then .to(device)."""
     return model_cls.from_pretrained(path, torch_dtype=dtype).to(device).eval()
 
 
 @HF_ENCODER_DTYPES
 @torch.no_grad()
 def test_wan_tiny_umt5_parity(tmp_path, dtype, limit_index):
-    """- UMT5 text encoder on TPU vs CPU fp32, on the tokens encode_prompt keeps."""
+    """UMT5 text encoder on TPU vs CPU fp32, on the tokens encode_prompt keeps."""
     config = UMT5Config(**_TINY_UMT5_CONFIG)
     torch.manual_seed(0)
     UMT5EncoderModel(config).save_pretrained(tmp_path)
@@ -555,7 +555,7 @@ def test_wan_tiny_umt5_parity(tmp_path, dtype, limit_index):
 @HF_ENCODER_DTYPES
 @torch.no_grad()
 def test_wan_tiny_clip_parity(tmp_path, dtype, limit_index):
-    """- CLIP vision encoder on TPU vs CPU fp32, on the penultimate hidden states
+    """CLIP vision encoder on TPU vs CPU fp32, on the penultimate hidden states
     that Wan2.1 I2V passes to the transformer."""
     torch.manual_seed(0)
     CLIPVisionModel(CLIPVisionConfig(**_TINY_CLIP_CONFIG)).save_pretrained(tmp_path)
