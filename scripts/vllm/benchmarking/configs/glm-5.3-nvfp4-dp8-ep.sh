@@ -53,8 +53,8 @@ RANDOM_RANGE_RATIO="0.0"
 # the GLM-5.2 NVFP4 recipe.
 export MOE_REQUANTIZE_BLOCK_SIZE="${MOE_REQUANTIZE_BLOCK_SIZE:-512}"
 
-# Optimized GLM-5.3-NVFP4 v7x-8 serving stack (+97.35% output tok/s/device:
-# 139.72 -> 275.74 tok/s/device at ISL=8192, OSL=1024, c=512; mmlu_pro=0.7643):
+# Optimized GLM-5.3-NVFP4 v7x-8 serving stack (+124.04% output tok/s/device:
+# 139.72 -> 313.03 tok/s/device at ISL=8192, OSL=1024, c=512; mmlu_pro=0.7643):
 # 1. Fused EP MoE v2 with W4A8 MXU matmuls + sharded schedule plan + padded-row skip
 export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-1}"
 export MOE_FUSED_EP_ENABLE_W4A8="${MOE_FUSED_EP_ENABLE_W4A8:-1}"
@@ -90,7 +90,7 @@ MAX_NUM_BATCHED_TOKENS="${GLM53_MAX_NUM_BATCHED_TOKENS:-1024}"
 MAX_NUM_SEQS="${GLM53_MAX_NUM_SEQS:-64}"
 
 SERVER_READY_WAIT_MIN="${GLM53_SERVER_READY_WAIT_MIN:-180}"
-GPU_MEMORY_UTILIZATION="${GLM53_GPU_MEMORY_UTILIZATION:-0.95}"
+GPU_MEMORY_UTILIZATION="${GLM53_GPU_MEMORY_UTILIZATION:-0.965}"
 KV_CACHE_DTYPE="fp8"
 
 # GLM-5.3 is an MLA model: tpu_platform.get_attn_backend_cls forces
@@ -99,8 +99,8 @@ KV_CACHE_DTYPE="fp8"
 # --enable-ep-weight-filter: each rank reads only its own experts plus dense
 # weights (model_loader_patches.py). --safetensors-load-strategy=prefetch
 # streams the 47 shards from local disk.
-# 292 KV blocks/rank = 32 concurrent 9216-token sequences/rank (2 balanced waves of 32+32 in the T=32 decode bucket).
-NUM_GPU_BLOCKS_OVERRIDE="${GLM53_NUM_GPU_BLOCKS_OVERRIDE:-292}"
+# 580 KV blocks/rank = 64 concurrent 9216-token sequences/rank (1 single wave of 64/64 in the T=64 decode bucket).
+NUM_GPU_BLOCKS_OVERRIDE="${GLM53_NUM_GPU_BLOCKS_OVERRIDE:-580}"
 EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--enable-ep-weight-filter --safetensors-load-strategy=prefetch --tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm45${NUM_GPU_BLOCKS_OVERRIDE:+ --num-gpu-blocks-override ${NUM_GPU_BLOCKS_OVERRIDE}}"
 
 # Greedy decoding for bench requests.
