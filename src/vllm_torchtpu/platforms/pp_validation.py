@@ -100,7 +100,8 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
     """Reject configurations the TPU pipeline-parallel path does not serve.
 
     Raises NotImplementedError naming the unsupported feature, and
-    ValueError for a ring hand-off depth below one.
+    ValueError for a ring hand-off depth below one or deeper than a
+    device's receive flags allow.
     """
     parallel_config = vllm_config.parallel_config
     if parallel_config.pipeline_parallel_size <= 1:
@@ -207,4 +208,12 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
         # none it could hand nothing on.
         raise ValueError(
             f"TPU_PP_RING_DEPTH must be at least 1, got {envs.TPU_PP_RING_DEPTH}."
+        )
+    if ring_handoff():
+        # Counts one receive per forward; the ring checks again with the
+        # tensors the model hands on.
+        from vllm_torchtpu.distributed.pp_ring import check_ring_receives
+
+        check_ring_receives(
+            parallel_config.pipeline_parallel_size, envs.TPU_PP_RING_DEPTH
         )

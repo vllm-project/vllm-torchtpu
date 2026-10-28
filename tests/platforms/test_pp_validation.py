@@ -288,3 +288,17 @@ def test_the_ring_needs_a_depth_of_at_least_one(monkeypatch, ring):
     # the wave has no depth to check
     monkeypatch.setenv("TPU_PP_HANDOFF", "wave")
     validate_pipeline_parallel_config(_config(pp=2))
+
+
+def test_the_ring_depth_stays_within_the_receive_flags(monkeypatch, ring):
+    monkeypatch.setenv("TPU_PP_RING_DEPTH", "6")
+    validate_pipeline_parallel_config(_config(pp=8))
+    monkeypatch.setenv("TPU_PP_RING_DEPTH", "7")
+    with pytest.raises(ValueError, match="at most 8 receives can be outstanding"):
+        validate_pipeline_parallel_config(_config(pp=8))
+    # four stages keep four steps in flight; the last of two holds one
+    validate_pipeline_parallel_config(_config(pp=4))
+    validate_pipeline_parallel_config(_config(pp=2))
+    # the wave posts no receives
+    monkeypatch.setenv("TPU_PP_HANDOFF", "wave")
+    validate_pipeline_parallel_config(_config(pp=8))

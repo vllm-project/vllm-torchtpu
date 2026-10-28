@@ -58,6 +58,8 @@ class _Transport:
         self.stride = stride
         self.cv = threading.Condition()
         self.posted = {}
+        # every receive posted, in the order it was posted
+        self.receives = []
         self.landed = {}
         self.sends = []
         self.views_sent = 0
@@ -74,6 +76,7 @@ class _Transport:
         with self.cv:
             assert key not in self.posted, f"receive {key} posted twice"
             self.posted[key] = tensor
+            self.receives.append(key)
             self.cv.notify_all()
         return _Work()
 
@@ -279,11 +282,16 @@ def test_every_forward_reaches_the_last_stage(monkeypatch, stages, side):
     assert len(transport.sends) == (1 + len(forwards)) * (stages - 1) * carried
     assert transport.posted == {}
     assert transport.views_sent == 0
+    # Each stage posts transfer by transfer, one receive per carried tensor.
+    for stage in range(1, stages):
+        tags = [tag for _, dst, tag in transport.receives if dst == stage]
+        assert tags == list(range(carried, carried * (2 + len(forwards))))
     for (stage, _), ring in rings.items():
         assert ring.transfers == 1 + len(forwards)
         assert ring.forwards == len(forwards)
         assert ring.sent == (len(forwards) if stage < stages - 1 else 0)
         assert ring.posted_through == (1 + len(forwards) if stage > 0 else 0)
+        assert ring.consumed_through == ring.posted_through
 
 
 def test_columns_hand_off_to_the_same_column(monkeypatch):
@@ -440,6 +448,165 @@ def test_receives_posted_for_forwards_that_never_ran_are_reported(monkeypatch):
     second.end_forward(None, 16)
     with pytest.raises(RuntimeError, match="1 receives were posted"):
         second.begin_step([8])
+
+
+class _Gated(_Transport):
+    """A receive blocks until ``gate`` opens, as a real one blocks until its
+    landing buffer and receive flag are taken."""
+
+    def __init__(self):
+        super().__init__()
+        self.gate = threading.Event()
+        self.callers = []
+
+    def irecv(self, tensor, src, tag):
+        self.callers.append(threading.current_thread())
+        if not self.gate.wait(TIMEOUT):
+            raise TimeoutError("a receive was never released")
+        return super().irecv(tensor, src, tag)
+
+
+def test_receives_are_posted_off_the_thread_that_runs_the_step(monkeypatch):
+    transport, rings = _build(monkeypatch, stages=2, transport=_Gated())
+    second = rings[1, 0]
+    second.begin_step([16, 8])
+    # begin_step has returned while the first receive is still being posted
+    assert _until(lambda: len(transport.callers) == 1)
+    assert second.posted_through == 0 and transport.posted == {}
+    got = []
+    forward = threading.Thread(
+        target=lambda: got.append(second.start_forward(16)), daemon=True
+    )
+    forward.start()
+    forward.join(0.3)
+    # the forward waits until its receive is posted
+    assert forward.is_alive() and got == []
+    transport.gate.set()
+    forward.join(TIMEOUT)
+    assert not forward.is_alive()
+    assert got[0]["hidden_states"].shape == (16, HIDDEN)
+    assert _until(lambda: second.posted_through == 2)
+    # in transfer order, from one thread that is not the step's
+    assert list(transport.posted) == [(0, 1, 1), (0, 1, 2)]
+    (poster,) = set(transport.callers)
+    assert poster is not threading.current_thread() and poster.name == "pp-ring-post"
+    assert second.start_forward(8)["hidden_states"].shape == (8, HIDDEN)
+    second.close()
+    assert not poster.is_alive()
+
+
+class _Watched(_Transport):
+    """Records, with each receive posted, the last transfer whose receives
+    a forward of ``ring`` had taken by then."""
+
+    def __init__(self):
+        super().__init__()
+        self.ring = None
+        self.taken_at_post = []
+
+    def irecv(self, tensor, src, tag):
+        transfer, index = divmod(tag, len(self.ring.carried))
+        self.taken_at_post.append((transfer, index, self.ring.consumed_through))
+        return super().irecv(tensor, src, tag)
+
+
+@pytest.mark.parametrize("side", [False, True], ids=["activations", "with_side"])
+def test_a_step_of_many_forwards_keeps_seven_receives_ahead(monkeypatch, side):
+    transport, rings = _build(monkeypatch, stages=2, side=side, transport=_Watched())
+    second = transport.ring = rings[1, 0]
+    carried = len(second.carried)
+    # the transfers whose receive calls fit in seven
+    ahead = 7 // carried
+    second.begin_step([8] * 9)
+    assert _until(lambda: second.posted_through == ahead)
+    # the next waits until a forward takes a receive
+    assert not _until(lambda: second.posted_through > ahead, seconds=0.3)
+    for taken in range(1, 10):
+        second.start_forward(8)
+        second.end_forward(None, 8)
+        want = min(9, taken + ahead)
+        assert _until(lambda want=want: second.posted_through == want)
+    calls = [(transfer, index) for transfer, index, _ in transport.taken_at_post]
+    assert calls == [(t, i) for t in range(1, 10) for i in range(carried)]
+    for transfer, index, taken in transport.taken_at_post:
+        # a transfer beyond the first ``ahead`` only once the forwards had
+        # taken the receives before it, never more than seven calls ahead
+        assert taken >= transfer - ahead
+        assert (transfer - 1 - taken) * carried + index + 1 <= 7
+    second.close()
+
+
+def test_closing_drops_receives_that_wait_for_room(monkeypatch):
+    _, rings = _build(monkeypatch, stages=2)
+    second = rings[1, 0]
+    second.begin_step([8] * 9)
+    assert _until(lambda: second.posted_through == 7)
+    poster = second._post_thread
+    second.close()
+    assert not poster.is_alive() and not second._to_post
+    assert [landing.cancelled() for *_, landing in second._posted] == (
+        [False] * 7 + [True] * 2
+    )
+
+
+def test_a_post_failure_surfaces_on_the_forward_that_waits_for_it(monkeypatch):
+    transport, rings = _build(monkeypatch, stages=2)
+    second = rings[1, 0]
+    transport.fail_recv = ValueError("no receive flag")
+    second.begin_step([16, 8])
+    with pytest.raises(RuntimeError, match="posting thread failed") as info:
+        second.start_forward(16)
+    assert isinstance(info.value.__cause__, ValueError)
+    # it stays failed: no later receive could be posted in order
+    with pytest.raises(RuntimeError, match="posting thread failed"):
+        second.begin_step([8])
+    with pytest.raises(RuntimeError, match="posting thread failed"):
+        second.close()
+    assert not second._to_post
+
+
+def test_each_forward_size_reuses_one_zero_residual(monkeypatch):
+    _, rings = _build(monkeypatch, stages=2)
+    second = rings[1, 0]
+    second.begin_step([16, 8, 16])
+    residuals = []
+    for rows in (16, 8, 16):
+        residuals.append(second.start_forward(rows)["residual"])
+        second.end_forward(None, rows)
+    sixteen, eight, again = residuals
+    assert again is sixteen and eight is not sixteen
+    # whole tensors, not views of a larger one
+    assert sixteen._base is None and eight._base is None
+    assert torch.equal(sixteen, torch.zeros(16, HIDDEN))
+    assert torch.equal(eight, torch.zeros(8, HIDDEN))
+    assert sorted(second._zero_residuals) == [8, 16]
+
+
+@pytest.mark.parametrize(
+    ("stages", "depth", "carried", "posted"),
+    [
+        # the last of two stages holds only the step it runs
+        (2, 50, 1, 1),
+        (2, 50, 2, 2),
+        # no more than the four steps the engine keeps in flight
+        (4, 50, 1, 4),
+        # a stage that sends: the step it begins and ``depth`` unsent forwards
+        (8, 2, 1, 3),
+        (8, 2, 2, 6),
+        (8, 6, 1, 7),
+        (8, 7, 1, 8),
+        (4, 3, 2, 8),
+    ],
+)
+def test_receives_a_device_can_have_posted(stages, depth, carried, posted):
+    assert pp_ring.ring_receives_posted(stages, depth, carried) == posted
+
+
+def test_a_ring_deeper_than_the_receive_flags_is_refused(monkeypatch):
+    with pytest.raises(ValueError, match="at most 8 receives can be outstanding"):
+        _build(monkeypatch, stages=4, side=True, depth=3)
+    _build(monkeypatch, stages=4, side=True, depth=2)
+    _build(monkeypatch, stages=2, side=True, depth=10)
 
 
 def test_rows_beyond_the_hand_off_are_refused(monkeypatch):
