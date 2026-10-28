@@ -993,6 +993,9 @@ class TPUModelRunner(GPUModelRunner):
         # TPU_SAMPLER_VERIFY_TRIM: the fused chain's target work on 8 rows
         # when the chunk's drafts fit (see _verify_trim_rows).
         self._sampler_verify_trim = bool(envs.TPU_SAMPLER_VERIFY_TRIM)
+        # TPU_SAMPLER_VERIFY_TRIM_ROWS: more target-row buckets, for the fused
+        # chain and the unfused non-greedy verify (see _verify_trim_rows).
+        self._sampler_verify_trim_rows = tuple(envs.TPU_SAMPLER_VERIFY_TRIM_ROWS)
         # TPU_SAMPLER_GRAPH_RNG: the fused chain draws its uniforms in-graph
         # from the default generator (= the sampling generator, see
         # _get_sampling_generator).
@@ -4558,13 +4561,22 @@ class TPUModelRunner(GPUModelRunner):
                 **self._sampler_kwargs(),
                 **trim_kwargs,
             )
+        verify_rows = 0
+        if self._sampler_verify_trim_rows and not all_greedy and grammar_output is None:
+            verify_rows = self._verify_trim_rows(
+                md.target_logits_indices.shape[0], md.draft_lengths_cpu
+            )
+        verify_kwargs = {"verify_rows": verify_rows} if verify_rows else {}
         if all_greedy and grammar_output is None:
             bonus_token_ids, target_logits = self.spec_bonus_and_target_logits(
                 logits, md.bonus_logits_indices, md.target_logits_indices
             )
         else:
             bonus_logits, target_logits = self.spec_gather_bonus_and_target_logits(
-                logits, md.bonus_logits_indices, md.target_logits_indices
+                logits,
+                md.bonus_logits_indices,
+                md.target_logits_indices,
+                **verify_kwargs,
             )
             if grammar_output is not None:
                 target_logits, bonus_logits = (
@@ -4628,9 +4640,18 @@ class TPUModelRunner(GPUModelRunner):
         assert req_temperatures is not None
         assert req_top_k is not None
         assert req_top_p is not None
-        recover_u = torch.rand_like(
-            target_logits, dtype=torch.float32, generator=sampling_generator
-        )
+        if verify_rows:
+            # Drawn at the untrimmed shape (today's stream), sliced in the graph.
+            recover_u = torch.rand(
+                (md.target_logits_indices.shape[0], target_logits.shape[-1]),
+                dtype=torch.float32,
+                device=target_logits.device,
+                generator=sampling_generator,
+            )
+        else:
+            recover_u = torch.rand_like(
+                target_logits, dtype=torch.float32, generator=sampling_generator
+            )
         return self.rejection_sampler(
             draft_token_ids=md.draft_token_ids,
             num_draft_tokens=md.draft_lengths,
@@ -4647,6 +4668,7 @@ class TPUModelRunner(GPUModelRunner):
             do_sampling=True,
             topk_candidates=topk_candidates,
             **self._sampler_kwargs(),
+            **verify_kwargs,
         )
 
     def sample_tokens(
@@ -6382,10 +6404,9 @@ class TPUModelRunner(GPUModelRunner):
             self.device
         )
         trim_variants: list[dict[str, Any]] = [{}]
-        if self._sampler_verify_trim and (
-            _VERIFY_TRIM_ROWS < num_tokens <= _VERIFY_TRIM_MAX_LEN
-        ):
-            trim_variants.append({"verify_rows": _VERIFY_TRIM_ROWS})
+        trim_variants += [
+            {"verify_rows": rows} for rows in self._verify_trim_buckets(num_tokens)
+        ]
         rng_kwargs: dict[str, Any] = {}
         default_gen = default_gen_state = None
         if self._sampler_graph_rng:
@@ -6605,6 +6626,22 @@ class TPUModelRunner(GPUModelRunner):
                         topk_candidates=blocks,
                     )
                     synchronize_tensors(out)
+                if self._sampler_verify_trim_rows:
+                    self._precompile_trimmed_rejection_sampler(
+                        dummy_logits,
+                        bonus_logits_indices,
+                        target_logits_indices,
+                        draft_token_ids,
+                        draft_lengths,
+                        segment_ids,
+                        group_indices,
+                        bonus_token_ids,
+                        warm_temps,
+                        warm_top_k,
+                        warm_top_p,
+                        warm_accept_u,
+                        warm_recover_u,
+                    )
                 if self._sampler_fused_chain:
                     self._precompile_spec_sample_verify_fused(
                         dummy_logits,
@@ -6621,6 +6658,59 @@ class TPUModelRunner(GPUModelRunner):
                     num_tokens,
                     num_reqs,
                 )
+
+    def _precompile_trimmed_rejection_sampler(
+        self,
+        dummy_logits: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        draft_lengths: torch.Tensor,
+        segment_ids: torch.Tensor,
+        group_indices: torch.Tensor,
+        bonus_token_ids: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor,
+        accept_u: torch.Tensor,
+        recover_u: torch.Tensor,
+    ) -> None:
+        """The unfused non-greedy verify (the synthetic-acceptance path) at
+        every TPU_SAMPLER_VERIFY_TRIM_ROWS bucket of this padded logits
+        length: the trimmed target gather, then the rejection sampler on the
+        untrimmed per-slot inputs with verify_rows."""
+        assert self.rejection_sampler is not None
+        assert self.speculative_config is not None
+        blocks = self._topk_candidate_blocks()
+        for rows in self._verify_trim_buckets(target_logits_indices.shape[0]):
+            _, target_logits = self.spec_gather_bonus_and_target_logits(
+                dummy_logits,
+                bonus_logits_indices,
+                target_logits_indices,
+                verify_rows=rows,
+            )
+            variants = [{}, *self._sampler_light_variants()]
+            if blocks:
+                variants.append({"topk_candidates": blocks})
+            for kwargs in variants:
+                out = self.rejection_sampler(
+                    draft_token_ids=draft_token_ids,
+                    num_draft_tokens=draft_lengths,
+                    target_logits=target_logits,
+                    bonus_token_ids=bonus_token_ids,
+                    segment_ids=segment_ids,
+                    group_indices=group_indices,
+                    max_draft_tokens=self.speculative_config.num_speculative_tokens,
+                    temperatures=temperatures,
+                    top_k=top_k,
+                    top_p=top_p,
+                    accept_u=accept_u,
+                    recover_u=recover_u,
+                    do_sampling=True,
+                    verify_rows=rows,
+                    **kwargs,
+                )
+                synchronize_tensors(out)
 
     def _precompile_top_token_verify(
         self,
@@ -7941,6 +8031,7 @@ class TPUModelRunner(GPUModelRunner):
         logits: torch.Tensor,
         bonus_logits_indices: torch.Tensor,
         target_logits_indices: torch.Tensor,
+        verify_rows: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Non-greedy verify prelude: gather the bonus-token logits and the
         # target_logits rows in ONE compiled region keyed on [num_reqs,
@@ -7950,28 +8041,54 @@ class TPUModelRunner(GPUModelRunner):
         # logits[indices] gathers are eager ops torch-tpu's DEFER_AND_FUSE fuses
         # with the live per-step dispatch into per-context programs (cold
         # recompiles).index_select is value-identical to logits[indices].
+        # verify_rows (static, TPU_SAMPLER_VERIFY_TRIM_ROWS): gather only the
+        # first that many target rows (_verify_trim_rows).
+        if verify_rows:
+            target_logits_indices = target_logits_indices[:verify_rows]
         bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
         target_logits = torch.index_select(logits, 0, target_logits_indices)
         return bonus_logits, target_logits
 
+    def _verify_trim_buckets(self, padded_logits_length: int) -> list[int]:
+        """The target-row counts a verify chunk of this padded logits length
+        may keep, smallest first; each one is precompiled.
+
+        TPU_SAMPLER_VERIFY_TRIM gives _VERIFY_TRIM_ROWS for lengths up to
+        _VERIFY_TRIM_MAX_LEN; TPU_SAMPLER_VERIFY_TRIM_ROWS adds its buckets
+        below the length.
+        """
+        buckets = {
+            rows
+            for rows in self._sampler_verify_trim_rows
+            if rows < padded_logits_length
+        }
+        if (
+            self._sampler_verify_trim
+            and _VERIFY_TRIM_ROWS < padded_logits_length <= _VERIFY_TRIM_MAX_LEN
+        ):
+            buckets.add(_VERIFY_TRIM_ROWS)
+        return sorted(buckets)
+
     def _verify_trim_rows(
         self, padded_logits_length: int, draft_lengths_cpu: np.ndarray
     ) -> int:
-        """TPU_SAMPLER_VERIFY_TRIM: the target rows the fused verify chain
-        keeps for this chunk, or 0 to keep all ``padded_logits_length``.
+        """TPU_SAMPLER_VERIFY_TRIM(_ROWS): the target rows the verify keeps
+        for this chunk, or 0 to keep all ``padded_logits_length``.
 
         get_spec_decode_metadata lays the chunk's real draft slots out first
         (request-major) and pads after them; a padding slot is never a valid
         slot of any request, so its target row reaches no output. Trimming to
-        _VERIFY_TRIM_ROWS is exact when every real slot fits.
+        a bucket is exact when every real slot fits.
         """
-        if not self._sampler_verify_trim:
-            return 0
-        if not (_VERIFY_TRIM_ROWS < padded_logits_length <= _VERIFY_TRIM_MAX_LEN):
-            return 0
-        if int(np.sum(draft_lengths_cpu)) > _VERIFY_TRIM_ROWS:
-            return 0
-        return _VERIFY_TRIM_ROWS
+        drafts = int(np.sum(draft_lengths_cpu))
+        return next(
+            (
+                rows
+                for rows in self._verify_trim_buckets(padded_logits_length)
+                if drafts <= rows
+            ),
+            0,
+        )
 
     def _sampler_kwargs(self) -> dict[str, Any]:
         """Static kwargs of the non-greedy sampler / verify graphs for the

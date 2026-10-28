@@ -323,6 +323,7 @@ if TYPE_CHECKING:
     TPU_SAMPLER_GRAPH_RNG: bool = True
     TPU_FP8_LINEAR_PALLAS_SITES: str = "q_b_proj,self_attn.o_proj,mlp.gate_up_proj"
     TPU_SAMPLER_VERIFY_TRIM: bool = False
+    TPU_SAMPLER_VERIFY_TRIM_ROWS: list[int] = []
 
 
 def env_with_choices(
@@ -2220,6 +2221,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # padding slots; the uniforms are drawn at the full shape and sliced, so
     # tokens and accept decisions are unchanged.
     "TPU_SAMPLER_VERIFY_TRIM": env_bool("TPU_SAMPLER_VERIFY_TRIM"),
+    # Target-row buckets for the non-greedy spec verify, e.g. "32,40,48": a
+    # chunk keeps the smallest listed bucket below its padded logits length
+    # that holds every real draft slot, and runs the rejection sampler's
+    # full-vocab target work on those rows only (27 of 64 rows are real drafts
+    # at 9 requests with MTP k=3). Applies to the fused chain and to the
+    # unfused path that synthetic acceptance takes. The uniforms are drawn at
+    # the full shape and sliced in the graph, so the random stream and every
+    # real slot's computation are unchanged. Empty (default): off.
+    "TPU_SAMPLER_VERIFY_TRIM_ROWS": lambda: sorted(
+        {
+            int(v)
+            for v in os.getenv("TPU_SAMPLER_VERIFY_TRIM_ROWS", "").split(",")
+            if v.strip()
+        }
+    ),
     # With TPU_SAMPLER_FUSED_CHAIN: the fused verify chain draws its three
     # uniforms (bonus_u, accept_u, recover_u) inside the compiled program
     # instead of as six eager programs before it. Dynamo cannot take a
