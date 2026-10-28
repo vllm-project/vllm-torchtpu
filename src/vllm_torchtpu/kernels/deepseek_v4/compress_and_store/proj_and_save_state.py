@@ -139,6 +139,7 @@ def kernel(
     num_m, num_k, num_n = cfgs.num_m, cfgs.num_k, cfgs.num_n
     last_dim = acc_ref.shape[-1]
     slots_per_m_tile = tile_m // last_dim
+    slots_per_token = acc_ref.shape[2]
     acc_ref_u8 = acc_ref.bitcast(jnp.uint8)
     # A CSA int32 NoPE array hosts the state too; write it as uint8 slabs.
     cache = csa_cache_layout.as_u8_slabs(cache)
@@ -153,13 +154,13 @@ def kernel(
 
         write_count_ref[0] = 0
 
-    def _dma_copy_out(token_base, n_idx_val, m_idx_val):
-        """Copies one state half of a finished token tile to the KV cache.
+    def _dma_copy_out(token_base, n_idx_val):
+        """Copies a finished token tile to the KV cache, one DMA per token.
 
-        It is issued in the grid step after the tile's last matmul, so the
-        accumulator stores have landed before the DMA reads them.
+        A token's kv and score states are adjacent slots in both the
+        accumulator and the cache. The copy is issued in the grid step after
+        the tile's last matmul, so the accumulator stores have landed.
         """
-        slot_offset = m_idx_val * slots_per_m_tile
         num_valid_writes = 0
         for i in range(tile_n):
             global_token_idx = token_base + n_idx_val * tile_n + i
@@ -172,11 +173,10 @@ def kernel(
             page_size_tokens = cfgs.token_page_size
             p = safe_slot_idx // page_size_tokens
             start_slot_token = safe_slot_idx % page_size_tokens
-            start_slot = start_slot_token + slot_offset
 
-            size = lax.select(valid, slots_per_m_tile, 0)
-            dest = cache.at[p, pl.ds(start_slot, size), :, :]
-            src = acc_ref_u8.at[n_idx_val, i, pl.ds(slot_offset, size), :, :]
+            size = lax.select(valid, slots_per_token, 0)
+            dest = cache.at[p, pl.ds(start_slot_token, size), :, :]
+            src = acc_ref_u8.at[n_idx_val, i, pl.ds(0, size), :, :]
             pltpu.make_async_copy(src, dest, sem_ref.at[0]).start()
 
         write_count_ref[0] = write_count_ref[0] + num_valid_writes
@@ -221,14 +221,10 @@ def kernel(
                 new_acc = existing_acc + ape_selected  # (tile_n, state_width)
                 store_to_acc_ref(acc_n, m_idx, slots_per_m_tile, new_acc)
 
-            # The tile that finished in the previous grid step: (m, n - 1), or
-            # the last token tile of the previous m.
-            write_n = jnp.where(n_idx > 0, n_idx - 1, num_n - 1)
-            write_m = jnp.where(n_idx > 0, m_idx, m_idx - 1)
-
             def process(copy_dma: bool, add_ape: bool):
                 if copy_dma:
-                    _dma_copy_out(token_base, write_n, write_m)
+                    # Token tile n - 1 finished in the previous grid step.
+                    _dma_copy_out(token_base, n_idx - 1)
 
                 prod = _matmul()
 
@@ -249,9 +245,7 @@ def kernel(
             is_last_k = k_idx == (num_k - 1)
             is_score = m_idx * tile_m >= state_width
 
-            copy_dma = (is_last_k & (n_idx > 0)) | (
-                (k_idx == 0) & (n_idx == 0) & (m_idx > 0)
-            )
+            copy_dma = (m_idx == num_m - 1) & is_last_k & (n_idx > 0)
             add_ape = is_last_k & is_score
 
             @pl.when(jnp.logical_not(copy_dma) & jnp.logical_not(add_ape))
@@ -308,7 +302,7 @@ def kernel(
         )
 
         # Epilogue: write the chunk's last tile.
-        _dma_copy_out(token_base, num_n - 1, num_m - 1)
+        _dma_copy_out(token_base, num_n - 1)
 
     if cfgs.num_chunks == 1:
         run_chunk(0)
