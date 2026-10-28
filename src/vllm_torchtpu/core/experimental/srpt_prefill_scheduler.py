@@ -191,9 +191,10 @@ class SrptPrefillScheduler(AsyncScheduler):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
-        # TPUModelRunner sets this on the outputs of the steps it runs; the
-        # shared empty output of a step without tokens lacks it, so the last
-        # report stands.
+        # TPUModelRunner sets this on the outputs of the steps it samples; the
+        # shared empty output of a step without tokens and idle DP dummy steps
+        # produce no output, so the last report stands until the next sampled
+        # step on this rank.
         decoding = getattr(model_runner_output, "other_rank_decoding", None)
         if decoding is not None:
             self._other_rank_decoding = decoding
