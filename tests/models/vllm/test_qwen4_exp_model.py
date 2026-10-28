@@ -139,59 +139,6 @@ def test_qwen_decoder_opts_into_compact_gdn_inputs(monkeypatch):
     assert "pooled_conv_state_dtype" not in attention.call_args.kwargs
 
 
-@pytest.mark.usefixtures("model_cpu_config_context")
-@pytest.mark.parametrize("full_tile", [0, 128])
-def test_model_constructs_real_hc_with_only_full_mix_option(monkeypatch, full_tile):
-    from vllm_torchtpu.kernels.qwen4_exp import vllm_adapter
-    from vllm_torchtpu.kernels.qwen4_exp.hc_resources import HcHardware
-    from vllm_torchtpu.models.vllm.qwen4_exp import model
-    from vllm_torchtpu.models.vllm.qwen4_exp.hyperconnection import GatedResidual
-
-    # CPU construction fixture: qualified layout facts, not actual TPU access.
-    monkeypatch.setattr(
-        vllm_adapter,
-        "current_hc_hardware",
-        lambda: HcHardware("7x", 64 << 20, 128, 16, 8, 256),
-    )
-    text = q4exp_text_config(
-        hidden_size=128,
-        hc_lowrank=32,
-        vocab_size=32,
-        num_hidden_layers=1,
-        ple_layer_ids=[],
-        layer_types=["linear_attention"],
-    )
-    cfg = NS(
-        model_config=NS(hf_text_config=text),
-        additional_config={"qwen4_exp": {"hc_prefill_full_tile": full_tile}},
-    )
-    # Construct the actual decoder and final mixer. Only unrelated distributed
-    # attention/MoE and vocabulary embedding are replaced with CPU fixtures.
-    monkeypatch.setattr(
-        model, "get_tp_group", lambda: NS(rank_in_group=0, world_size=1)
-    )
-    monkeypatch.setattr(
-        model, "Qwen4ExpGatedDeltaNetAttention", lambda *a, **kw: nn.Identity()
-    )
-    monkeypatch.setattr(model, "Qwen3NextSparseMoeBlock", lambda **kw: nn.Identity())
-    monkeypatch.setattr(model, "VocabParallelEmbedding", nn.Embedding)
-    with torch.device("cpu"):
-        backbone = model.Qwen4ExpBackbone(cfg)
-    decoder = backbone.layers[0]
-    connections = [
-        decoder.attn_hyper_connection,
-        decoder.mlp_hyper_connection,
-        backbone.hyper_connection_mixer,
-    ]
-    for connection in connections:
-        assert isinstance(connection, GatedResidual)
-        assert connection.prefill_full_tile == full_tile
-        assert (connection._prefill_full_op is not None) == bool(full_tile)
-    for connection in connections[:2]:
-        assert (connection._prefill_combine_op is not None) == bool(full_tile)
-    assert backbone.hyper_connection_mixer._prefill_combine_op is None
-
-
 @pytest.fixture
 def hc_model_boundaries(monkeypatch):
     from vllm_torchtpu.kernels.qwen4_exp import vllm_adapter
@@ -222,18 +169,11 @@ def hc_model_boundaries(monkeypatch):
 
 @pytest.mark.usefixtures("model_cpu_config_context")
 @pytest.mark.parametrize(
-    "options,full,combine",
-    [
-        ({}, "auto", "auto"),
-        ({"hc_prefill_full_tile": 0}, 0, 0),
-        ({"hc_prefill_full_tile": 128}, 128, 128),
-        ({"hc_prefill_full_tile": 0, "hc_prefill_combine_tile": "auto"}, 0, "auto"),
-        ({"hc_prefill_full_tile": "auto", "hc_prefill_combine_tile": 0}, "auto", 0),
-        ({"hc_prefill_full_tile": 128, "hc_prefill_combine_tile": 32}, 128, 32),
-    ],
+    "value,expected",
+    [(None, "auto"), ("auto", "auto"), ("0", 0), ("128", 128), ("256", 256)],
 )
-def test_model_hc_independent_modes_reach_all_constructors(
-    options, full, combine, hc_model_boundaries
+def test_model_hc_reads_typed_debug_override(
+    monkeypatch, value, expected, hc_model_boundaries
 ):
     from tests.models.vllm.test_qwen4_exp_hc_auto import (
         combine_selected,
@@ -241,6 +181,10 @@ def test_model_hc_independent_modes_reach_all_constructors(
         route_inputs,
     )
 
+    if value is None:
+        monkeypatch.delenv("VLLM_TPU_HC_PREFILL_TILE", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_TPU_HC_PREFILL_TILE", value)
     model = hc_model_boundaries
     text = q4exp_text_config(
         hidden_size=2560,
@@ -251,9 +195,7 @@ def test_model_hc_independent_modes_reach_all_constructors(
         ple_layer_ids=[],
         layer_types=["linear_attention"],
     )
-    cfg = NS(
-        model_config=NS(hf_text_config=text), additional_config={"qwen4_exp": options}
-    )
+    cfg = NS(model_config=NS(hf_text_config=text), additional_config={})
     with torch.device("meta"):
         backbone = model.Qwen4ExpBackbone(cfg)
     x, block = route_inputs(1024)
@@ -264,36 +206,9 @@ def test_model_hc_independent_modes_reach_all_constructors(
         backbone.hyper_connection_mixer,
     ]
     for connection in connections:
-        assert connection.prefill_full_tile == full
-        assert connection.prefill_combine_tile == combine
-        assert mix_selected(connection, x) is bool(full)
+        assert connection.prefill_full_tile == expected
+        assert connection.prefill_combine_tile == expected
+        assert mix_selected(connection, x) is bool(expected)
     for connection in connections[:2]:
-        assert combine_selected(connection, block, x, x) is bool(combine)
+        assert combine_selected(connection, block, x, x) is bool(expected)
     assert connections[2]._prefill_combine_op is None
-
-
-@pytest.mark.usefixtures("model_cpu_config_context")
-@pytest.mark.parametrize(
-    "key,value",
-    [
-        ("hc_prefill_full_tile", "128"),
-        ("hc_prefill_full_tile", True),
-        ("hc_prefill_full_tile", -128),
-        ("hc_prefill_combine_tile", False),
-        ("hc_prefill_combine_tile", "invalid"),
-    ],
-)
-def test_model_hc_rejects_malformed_modes(key, value, hc_model_boundaries):
-    text = q4exp_text_config(
-        hidden_size=128,
-        vocab_size=32,
-        num_hidden_layers=1,
-        ple_layer_ids=[],
-        layer_types=["linear_attention"],
-    )
-    cfg = NS(
-        model_config=NS(hf_text_config=text),
-        additional_config={"qwen4_exp": {key: value}},
-    )
-    with torch.device("meta"), pytest.raises(ValueError, match="HC prefill mode"):
-        hc_model_boundaries.Qwen4ExpBackbone(cfg)

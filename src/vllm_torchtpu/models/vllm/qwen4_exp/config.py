@@ -27,6 +27,7 @@ from vllm_torchtpu.gdn_pool_layout import (
     DEFAULT_POOLED_GDN_CONV_STATE_DTYPE,
     unified_kv_layout_enabled_for_architecture,
 )
+from vllm_torchtpu.kernels.qwen4_exp.hc_prefill_policy import validate_hc_prefill_mode
 from vllm_torchtpu.utils import torch_dtype_from_name
 
 from .ple_host import host_available_memory
@@ -133,6 +134,8 @@ class TPUQwen4ExpConfig(VerifyAndUpdateConfig):
         # Reuse upstream's text/config normalization, including removal of
         # mrope even though this class truthfully does not support vision.
         Qwen4ExpForCausalLMConfig.verify_and_update_config(vllm_config)
+        tile = envs.VLLM_TPU_HC_PREFILL_TILE
+        validate_hc_prefill_mode("auto" if tile is None else tile, full_mix=True)
         validate_config(vllm_config)
         qwen = vllm_config.additional_config.get("qwen4_exp", {})
         if qwen.get("engram_config", {}).get("cpu_offload", False):

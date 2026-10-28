@@ -303,3 +303,64 @@ def test_pd_admits_only_model_owned_fp8_dp8(monkeypatch, role, ssm_dtype):
     monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "0")
     with pytest.raises(ValueError, match="requires the dual-storage pool"):
         validate_config(cfg)
+
+
+@pytest.mark.parametrize("value", [None, "auto", "0", "128", "256"])
+def test_hc_env_override_preserves_s1_admission(monkeypatch, value):
+    from vllm.config import CacheConfig
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import config as model_config
+
+    if value is None:
+        monkeypatch.delenv("VLLM_TPU_HC_PREFILL_TILE", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_TPU_HC_PREFILL_TILE", value)
+    cfg = config()
+    cfg.model_config.multimodal_config = None
+    cfg.parallel_config.ubatch_size = 1
+    cfg.cache_config = CacheConfig(
+        block_size=128,
+        enable_prefix_caching=False,
+        mamba_ssm_cache_dtype="bfloat16",
+    )
+    monkeypatch.setattr(model_config, "native_cache_capacity", lambda cfg, specs: 32)
+    model_config.TPUQwen4ExpConfig.verify_and_update_config(cfg)
+    assert cfg.cache_config.kv_cache_layout == "BLHNC"
+    assert cfg.cache_config.num_gpu_blocks_override == 32
+    cfg.model_config.hf_text_config.linear_key_head_dim = 64
+    with pytest.raises(ValueError, match="GDN"):
+        model_config.TPUQwen4ExpConfig.verify_and_update_config(cfg)
+
+
+@pytest.mark.parametrize(
+    "value", ["true", "false", "-128", "127", "129", "128.0", "atuo"]
+)
+def test_config_rejects_invalid_hc_debug_override(monkeypatch, value):
+    from vllm.config import CacheConfig
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import config as model_config
+
+    monkeypatch.setenv("VLLM_TPU_HC_PREFILL_TILE", value)
+    cfg = config()
+    cfg.cache_config = CacheConfig(mamba_ssm_cache_dtype="bfloat16")
+    cfg.model_config.multimodal_config = None
+    cfg.parallel_config.ubatch_size = 1
+    with pytest.raises(ValueError, match="HC|VLLM_TPU_HC_PREFILL_TILE"):
+        model_config.TPUQwen4ExpConfig.verify_and_update_config(cfg)
+
+
+@pytest.mark.parametrize("value", [True, False, -128, 127])
+def test_config_validates_typed_hc_debug_override(monkeypatch, value):
+    from vllm.config import CacheConfig
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import config as model_config
+
+    monkeypatch.setitem(
+        envs.environment_variables, "VLLM_TPU_HC_PREFILL_TILE", lambda: value
+    )
+    cfg = config()
+    cfg.cache_config = CacheConfig(mamba_ssm_cache_dtype="bfloat16")
+    cfg.model_config.multimodal_config = None
+    cfg.parallel_config.ubatch_size = 1
+    with pytest.raises(ValueError, match="HC prefill"):
+        model_config.TPUQwen4ExpConfig.verify_and_update_config(cfg)

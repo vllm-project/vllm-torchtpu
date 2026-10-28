@@ -130,19 +130,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 self.self_attn
             )
         self.mlp = Qwen3NextSparseMoeBlock(vllm_config=cfg, prefix=prefix + ".mlp")
-        hc_options = cfg.additional_config.get("qwen4_exp", {})
-        hc_full_tile = hc_options.get("hc_prefill_full_tile", "auto")
-        hc_combine_tile = hc_options.get("hc_prefill_combine_tile")
-        self.attn_hyper_connection = GatedResidual(
-            hc_config(t),
-            prefill_full_tile=hc_full_tile,
-            prefill_combine_tile=hc_combine_tile,
-        )
-        self.mlp_hyper_connection = GatedResidual(
-            hc_config(t),
-            prefill_full_tile=hc_full_tile,
-            prefill_combine_tile=hc_combine_tile,
-        )
+        self.attn_hyper_connection = GatedResidual(hc_config(t))
+        self.mlp_hyper_connection = GatedResidual(hc_config(t))
 
     def forward(
         self,
@@ -235,15 +224,7 @@ class Qwen4ExpBackbone(nn.Module):
         ]
         for attention in attentions[1:]:
             attention.rope_cache = attentions[0].rope_cache
-        hc_options = cfg.additional_config.get("qwen4_exp", {})
-        hc_full_tile = hc_options.get("hc_prefill_full_tile", "auto")
-        hc_combine_tile = hc_options.get("hc_prefill_combine_tile")
-        self.hyper_connection_mixer = GatedResidual(
-            hc_config(t),
-            use_combine=False,
-            prefill_full_tile=hc_full_tile,
-            prefill_combine_tile=hc_combine_tile,
-        )
+        self.hyper_connection_mixer = GatedResidual(hc_config(t), use_combine=False)
 
     def forward(
         self,
