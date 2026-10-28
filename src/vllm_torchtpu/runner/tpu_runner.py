@@ -5407,6 +5407,12 @@ class TPUModelRunner(GPUModelRunner):
 
                 arm_runner_models(self)
 
+        # After moe_tp_decode and its prequant pairing: the split reuses their ops.
+        if envs.TPU_PREFILL_SEQ_PARALLEL:
+            from vllm_torchtpu.layers.adapter import prefill_token_split
+
+            prefill_token_split.arm(self.model, self.num_tokens_paddings)
+
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()
         self._initialize_quantization_kernels()

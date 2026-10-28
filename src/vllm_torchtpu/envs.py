@@ -314,6 +314,8 @@ if TYPE_CHECKING:
     TPU_FUSED_ADD_RMSNORM_QUANT: bool = True
     TPU_FUSED_ADD_RMSNORM_QUANT_MOE: bool = False
     TPU_FUSED_ADD_RMSNORM_SLICES: int = 0
+    TPU_PREFILL_SEQ_PARALLEL: bool = False
+    TPU_PREFILL_SEQ_PARALLEL_MIN_TOKENS: int = 256
     TPU_MTP_EH_PROJ_TP: bool = False
     TPU_MTP_ONEHOT_AR: bool = True
     TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS: int = 0
@@ -2273,6 +2275,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # in 10^4 logits differ from XLA's dot by 1-4 bf16 ulp (MXU accumulation order),
     # so "all" needs an accuracy check. "" = off. Default "drafter" (trial 6).
     "TPU_LM_HEAD_HBM": env_str("TPU_LM_HEAD_HBM", "drafter"),
+    # DeepSeek-V3.2-style models (GLM-5.2) with the fused MoE prefill kernel
+    # (USE_MOE_TP_DECODE_KERNEL, FUSED_MOE_PREFILL_KERNEL_V2): in buckets of at
+    # least TPU_PREFILL_SEQ_PARALLEL_MIN_TOKENS tokens, from the first MoE layer
+    # on, each TP core keeps only its rows of the residual stream (its block of
+    # each MoE reduce-scatter). o_proj's all-reduce becomes a reduce-scatter,
+    # the norms and the q / kv latent and indexer key projections run on the
+    # core's rows, the latents and the fp8 MoE input rows are all-gathered, the
+    # MoE drops the all-gather after its reduce-scatter, and the final norm's
+    # output is all-gathered once. Same sums; the o_proj sum's order and the
+    # norms' kernel (fewer rows per core) can move the last bf16 ulp.
+    "TPU_PREFILL_SEQ_PARALLEL": env_bool("TPU_PREFILL_SEQ_PARALLEL"),
+    "TPU_PREFILL_SEQ_PARALLEL_MIN_TOKENS": env_int(
+        "TPU_PREFILL_SEQ_PARALLEL_MIN_TOKENS", 256
+    ),
     # RMSNorm (and fused add + RMSNorm) on >= MIN_TOKENS rows of a >= MIN_HIDDEN
     # residual stream runs as one Pallas pass (layers/adapter/rmsnorm.py) instead of
     # XLA's reduce + re-read apply. Decode-sized batches are unchanged. Residual
