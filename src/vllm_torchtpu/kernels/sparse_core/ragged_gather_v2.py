@@ -23,6 +23,11 @@ from jax.experimental.pallas import tpu_sc as plsc
 
 from vllm_torchtpu.kernels.sparse_core import core_map_helper
 
+# Unroll factor of the column loop that repacks gathered rows. At 2 the
+# scheduler overlaps two column chunks and the loop runs near its one-load-per-
+# bundle bound on tpu7x; higher factors schedule worse there.
+REPACK_UNROLL = 2
+
 
 def calculate_col_size(hidden_size: int, packing: int) -> int:
     """Calculates the max column size bounded by VMEM limits and
@@ -172,7 +177,9 @@ def main_kernel_v2(
             idx_rem=idx_rem,
             unpack_col_chunk=unpack_col_chunk,
         )
-        plsc.parallel_loop(0, num_phys_cols, step=unpack_col_chunk)(col_loop_fn)
+        plsc.parallel_loop(
+            0, num_phys_cols, step=unpack_col_chunk, unroll=REPACK_UNROLL
+        )(col_loop_fn)
 
     def outer_pipeline(idx_ref):
         b = pl.program_id(0)
