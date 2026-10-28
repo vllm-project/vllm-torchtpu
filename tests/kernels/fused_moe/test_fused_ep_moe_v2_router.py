@@ -380,8 +380,9 @@ def test_normalized_selector_rejects_unsupported_tiles(topk, block_rows):
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("adapter_widen", [False, True])
+@pytest.mark.parametrize("near_ties", [False, True])
 def test_normalized_route_stage_keeps_scaling_and_invalid_sentinels(
-    monkeypatch, adapter_widen
+    monkeypatch, adapter_widen, near_ties
 ):
     """Exercise production wiring without running experts or TPU collectives."""
     import functools
@@ -410,7 +411,20 @@ def test_normalized_route_stage_keeps_scaling_and_invalid_sentinels(
         if adapter_widen:
             # fused_moe_ep._build_op.call passes this widened form to the layer.
             gate = gate.astype(jnp.float32)
-        bias = jnp.asarray(rng.normal(size=(384,)), dtype=jnp.float32)
+        if near_ties:
+            # Adjacent logits and cancelling bias expose changed Top6 membership.
+            ranks = rng.permutation(384).astype(np.float32)
+            near = np.float32(0.25) + ranks * np.spacing(np.float32(0.25))
+            if not adapter_widen:
+                near = np.float32(0.25) + ranks * np.float32(2**-11)
+            gate = jnp.broadcast_to(jnp.asarray(near, gate.dtype), (288, 384))
+            gate = gate.at[:3].set(
+                jnp.array([jnp.nan, -jnp.inf, jnp.inf], gate.dtype)[:, None]
+            )
+            old_scores = layer._apply_scoring_fn(gate[3], "sqrtsoftplus")
+            bias = -old_scores + jnp.asarray((np.arange(384) % 7) * 2**-23, jnp.float32)
+        else:
+            bias = jnp.asarray(rng.normal(size=(384,)), dtype=jnp.float32)
         mesh = jax.sharding.Mesh(np.array(jax.devices("cpu")[:1]), ("d",))
         args = (
             jnp.zeros((288, 128), jnp.bfloat16),
@@ -514,3 +528,33 @@ def test_fp32_sqrtsoftplus_validity_matches_generic_row_check():
         simplified = jnp.any(jnp.isfinite(gate), axis=-1, keepdims=True)
         np.testing.assert_array_equal(simplified, original)
         assert np.isfinite(np.asarray(scores)[0]).all()
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
+def test_specialized_softplus_preserves_finite_and_nonfinite_scores(dtype):
+    """The measured formula must retain overflow safety and invalid-row semantics."""
+    from vllm_torchtpu.kernels.fused_moe.v2.layer import _apply_scoring_fn
+
+    rng = np.random.default_rng(48)
+    bits = rng.integers(0, 2**32, 4096, dtype=np.uint32)
+    edge = np.array(
+        [
+            0.0,
+            -0.0,
+            np.nan,
+            np.inf,
+            -np.inf,
+            100,
+            -100,
+            np.finfo(np.float32).max,
+            -np.finfo(np.float32).max,
+        ],
+        np.float32,
+    )
+    logits = jnp.asarray(np.concatenate((edge, bits.view(np.float32))), dtype)
+    generic = _apply_scoring_fn(logits, "sqrtsoftplus")
+    specialized = _apply_scoring_fn(logits, "sqrtsoftplus", specialize_softplus=True)
+    np.testing.assert_array_equal(np.isnan(specialized), np.isnan(generic))
+    np.testing.assert_array_equal(np.isposinf(specialized), np.isposinf(generic))
+    np.testing.assert_allclose(specialized, generic, rtol=2e-6, atol=1e-6)
