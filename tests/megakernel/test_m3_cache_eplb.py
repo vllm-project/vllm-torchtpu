@@ -1226,14 +1226,14 @@ def test_unstacked_expert_weights_equivalence(T: int, B: int):
                 jnp.zeros((1, 4, 32, 16, 128), dtype=jnp.bfloat16),
                 (4, 16, 128, 32),
                 name="router",
-                allow_expert_reshape=False,
+                allow_merged_tiles=False,
             )
         with pytest.raises(mk.MegakernelConfigError, match="local shard has shape"):
             mk.kernel.unpack_local_weight(
                 jnp.zeros((8, 64, 256), dtype=jnp.float8_e4m3fn),
                 (8, 2, 128, 64),
                 name="e13",
-                allow_expert_reshape=True,
+                allow_merged_tiles=True,
             )
 
 

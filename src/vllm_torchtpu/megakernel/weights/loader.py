@@ -110,9 +110,11 @@ def load_weights(
     g: Any = None,
     tp_rank: int = 0,
     expert_placement: Any = None,
+    merged_tiles: bool = False,
 ) -> dict[str, Any]:
     """Generic per-rank weight loader over any `WeightSource` via `source.ops`."""
     ops = source.ops
+    use_merged_tiles = bool(merged_tiles or getattr(source, "merged_tiles", False))
     ms, geom, pre_n, post_n, final_n = resolve_spec_and_norms(model_def, ex, g=g)
     p = planner.plan(ms, ex)
     R, L = ex.R, int(geom.L)
@@ -249,6 +251,10 @@ def load_weights(
                     )
                     if is_passthrough:
                         per_layer_lists[wd.name].append(raw)
+                    elif use_merged_tiles:
+                        per_layer_lists[wd.name].append(
+                            ops.own(raw) if wd.layout == "per_layer" else raw
+                        )
                     else:
                         tiled = ops.reshape(
                             raw,
@@ -258,11 +264,16 @@ def load_weights(
                             ops.own(tiled) if wd.layout == "per_layer" else tiled
                         )
                 else:
+                    sh_el = (
+                        (*wd.lead_dims, wd.K * wd.N)
+                        if (use_merged_tiles and wd.K == 1 and len(wd.lead_dims) >= 1)
+                        else (*wd.lead_dims, wd.K, wd.N)
+                    )
                     per_layer_lists[wd.name].append(
                         ops.own(
                             ops.reshape(
                                 ops.cast(raw, wd.dtype),
-                                (*wd.lead_dims, wd.K, wd.N),
+                                sh_el,
                             )
                         )
                     )

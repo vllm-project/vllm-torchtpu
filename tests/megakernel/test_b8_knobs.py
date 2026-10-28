@@ -590,3 +590,178 @@ def test_per_weight_dtype_policy() -> None:
         if has_tf:
             assert by_name["reference_vs_hf"].status == "passed"
 
+
+def test_merged_tile_operand_layout() -> None:
+    # Direct unit test of unpack_local_weight for rank-3, rank-4, and rank-5 shapes
+    x3 = jnp.arange(2 * 128 * 64, dtype=jnp.bfloat16).reshape(2 * 128, 64)
+    u3 = mk.kernel.unpack_local_weight(
+        x3, (2, 128, 64), name="per_layer", allow_merged_tiles=True
+    )
+    assert u3.shape == (2, 128, 64)
+    u3_b = mk.kernel.unpack_local_weight(
+        x3[None], (2, 128, 64), name="per_layer", allow_merged_tiles=True
+    )
+    assert u3_b.shape == (2, 128, 64)
+
+    x4 = jnp.arange(3 * 2 * 128 * 64, dtype=jnp.bfloat16).reshape(3, 2 * 128, 64)
+    u4 = mk.kernel.unpack_local_weight(
+        x4, (3, 2, 128, 64), name="stacked", allow_merged_tiles=True
+    )
+    assert u4.shape == (3, 2, 128, 64)
+
+    x_es = jnp.arange(3 * 4 * 64, dtype=jnp.float32).reshape(3, 4, 64)
+    u_es = mk.kernel.unpack_local_weight(
+        x_es[None], (3, 4, 1, 64), name="es", allow_merged_tiles=True
+    )
+    assert u_es.shape == (3, 4, 1, 64)
+
+    # End-to-end step parity: merged_tiles=True vs merged_tiles=False (default)
+    R, ctx = 2, 256
+    mesh = Mesh(np.array(jax.devices("cpu")[:R]), ("tp",))
+    tp = NamedSharding(mesh, P("tp"))
+    g = _SynthBaseModel.derive_geometry()
+    spec = _SynthBaseModel.to_model_spec(g, R=R)
+    ex = mk.ExecSpec(
+        R=R,
+        B=4,
+        T=1,
+        ctx=ctx,
+        tiles=mk.Tiles(
+            bank=512 << 10, nbd=10, nbe=6, ebank=256 << 10, vmem_mib=32
+        ).with_modules({"gqa": {"kv_blk": 256}}),
+        interpret=True,
+        cache=mk.CacheExec(paged_kv=True, num_pages=128, pool_gather=False),
+    )
+    pl = mk.planner.plan(spec, ex)
+    pos, hid_l, w_l, st_l = mk.random_logical_inputs(
+        jax.random.key(19), g, ex, model_def=_SynthBaseModel
+    )
+    _, hid_mk, w_tiled, st_mk = mk.pack_inputs(
+        pos, hid_l, w_l, st_l, g, ex, mesh=mesh, build_default_pool=True
+    )
+    w_merged_host = mk.pack_logical_weights(
+        _SynthBaseModel, ex, w_l, g=g, merged_tiles=True
+    )
+    # Default pack_logical_weights keeps tiled layout; merged_tiles=True merges nt*tk
+    for k in pl.static_kinds:
+        nt_k, tk_k, n_k = pl.nt[k], pl.tk[k], pl.kinds[k][1]
+        assert w_tiled[k].shape[-3:] == (nt_k, tk_k, n_k)
+        assert w_merged_host[k].shape[-2:] == (nt_k * tk_k, n_k)
+        assert w_merged_host[k].ndim == w_tiled[k].ndim - 1
+        np.testing.assert_array_equal(
+            np.asarray(w_merged_host[k]).view(np.uint8),
+            np.asarray(w_tiled[k]).reshape(w_merged_host[k].shape).view(np.uint8),
+        )
+    assert w_tiled["es"].ndim == 5
+    assert w_merged_host["es"].ndim == 4
+    np.testing.assert_array_equal(
+        np.asarray(w_merged_host["es"]),
+        np.asarray(w_tiled["es"]).reshape(w_merged_host["es"].shape),
+    )
+
+    # load_weights with merged_tiles=True produces rank-3 stacked static operands
+    # that match reshaped default operands bit-for-bit across all TP ranks
+    src = mk.MappingWeightSource(w_l)
+    lw_def_ranks = [
+        mk.load_weights(_SynthBaseModel, ex, src, g=g, tp_rank=r) for r in range(R)
+    ]
+    lw_mrg_ranks = [
+        mk.load_weights(_SynthBaseModel, ex, src, g=g, tp_rank=r, merged_tiles=True)
+        for r in range(R)
+    ]
+    lw_default, lw_merged = lw_def_ranks[0], lw_mrg_ranks[0]
+    for k in pl.static_kinds:
+        assert lw_default[k].ndim == 4
+        assert lw_merged[k].ndim == 3
+        np.testing.assert_array_equal(
+            np.asarray(lw_merged[k]).view(np.uint8),
+            np.asarray(lw_default[k]).reshape(lw_merged[k].shape).view(np.uint8),
+        )
+    assert lw_default["es"].ndim == 4
+    assert lw_merged["es"].ndim == 3
+    np.testing.assert_array_equal(
+        np.asarray(lw_merged["es"]),
+        np.asarray(lw_default["es"]).reshape(lw_merged["es"].shape),
+    )
+
+    w_merged = {
+        k: (
+            tuple(jax.device_put(x, tp) for x in v)
+            if isinstance(v, tuple)
+            else jax.device_put(v, tp)
+        )
+        for k, v in w_merged_host.items()
+    }
+    w_lw_merged = {
+        k: (
+            tuple(
+                jax.device_put(
+                    jnp.stack([lw_mrg_ranks[r][k][i] for r in range(R)], axis=0), tp
+                )
+                for i in range(len(lw_merged[k]))
+            )
+            if isinstance(lw_merged[k], tuple)
+            else jax.device_put(
+                jnp.stack([lw_mrg_ranks[r][k] for r in range(R)], axis=0), tp
+            )
+        )
+        for k in pl.w_names
+    }
+
+    # DirectHBM make_step bit-exact between tiled, pack_logical_weights, and
+    # load_weights(merged_tiles=True) operands
+    step_d, _ = mk.make_step(mesh, spec, ex, donate_states=False)
+    out_d_tiled, _ = step_d(pos, hid_mk, w_tiled, st_mk)
+    out_d_merged, _ = step_d(pos, hid_mk, w_merged, st_mk)
+    out_d_lw_merged, _ = step_d(pos, hid_mk, w_lw_merged, st_mk)
+    np.testing.assert_array_equal(np.asarray(out_d_merged), np.asarray(out_d_tiled))
+    np.testing.assert_array_equal(np.asarray(out_d_lw_merged), np.asarray(out_d_tiled))
+
+    # PallasWriter make_pooled_step and make_flat_pooled_step bit-exact
+    play = _SynthBaseModel.pool_layout(g, R=R)
+    pt, ckpt, roff, _ = mk.pool.allocate_test_layout(play, ex)
+    base_pools = [
+        np.asarray(r).copy()
+        for r in mk.pool.states_to_pool(
+            play, ex, st_l, pt, ckpt[..., :1], jnp.maximum(roff, 0)
+        )
+    ]
+    step_p, _ = mk.PallasWriter(fused_pool_io=False).make_step(
+        mesh, spec, ex, donate=False
+    )
+    out_p_tiled, _ = step_p(
+        pos,
+        hid_mk,
+        w_tiled,
+        tuple(jax.device_put(r.copy(), tp) for r in base_pools),
+        pt,
+        ckpt,
+        roff,
+    )
+    out_p_merged, _ = step_p(
+        pos,
+        hid_mk,
+        w_merged,
+        tuple(jax.device_put(r.copy(), tp) for r in base_pools),
+        pt,
+        ckpt,
+        roff,
+    )
+    np.testing.assert_array_equal(np.asarray(out_p_merged), np.asarray(out_p_tiled))
+
+    flat_step, _, _, _ = mk.make_flat_pooled_step(
+        mesh, spec, ex, donate_pools=False, fused_pool_io=False
+    )
+    w_flat_tiled = []
+    w_flat_merged = []
+    for k in pl.w_names:
+        vt, vm = w_tiled[k], w_merged[k]
+        w_flat_tiled.extend(vt if isinstance(vt, tuple) else (vt,))
+        w_flat_merged.extend(vm if isinstance(vm, tuple) else (vm,))
+    pools_sh = tuple(jax.device_put(r.copy(), tp) for r in base_pools)
+    out_f_tiled = flat_step(pos, hid_mk, *w_flat_tiled, *pools_sh, pt, ckpt, roff)
+    out_f_merged = flat_step(pos, hid_mk, *w_flat_merged, *pools_sh, pt, ckpt, roff)
+    np.testing.assert_array_equal(
+        np.asarray(out_f_merged[0]), np.asarray(out_f_tiled[0])
+    )
+

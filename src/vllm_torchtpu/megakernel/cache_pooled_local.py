@@ -50,7 +50,7 @@ def run_local(
 ) -> tuple[jax.Array, tuple[jax.Array, ...]]:
     """One rank's step: unpack weights, run the kernel, write the pools back."""
     pb, ex_paged, use_fused, use_gpr = b.pb, b.ex_paged, b.use_fused, b.use_gpr
-    call, p, w_names, s_names, o_names = b.call, b.p, b.w_names, b.s_names, b.o_names
+    call, w_names, s_names, o_names = b.call, b.w_names, b.s_names, b.o_names
     wsh, has_rec, pool_key, pt_key = b.wsh, b.has_rec, b.pool_key, b.pt_key
     max_pt, _get_compiled = b.max_pt, b.get_compiled
     active_seqs = unwrap_active_seqs(active_seqs)
@@ -77,7 +77,7 @@ def run_local(
                 x,
                 kernel.target_weight_shape(wsh[k]),
                 name=k,
-                allow_expert_reshape=k in p.dynamic_kinds,
+                allow_merged_tiles=True,
             )
             for x in weights[k]
         )
@@ -86,7 +86,7 @@ def run_local(
             weights[k],
             kernel.target_weight_shape(wsh[k]),
             name=k,
-            allow_expert_reshape=k in p.dynamic_kinds,
+            allow_merged_tiles=True,
         )
         for k in w_names
     ]

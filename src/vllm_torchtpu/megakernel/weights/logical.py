@@ -37,10 +37,12 @@ from .eplb import default_eplb_cores, encode_eplb_ecopy, resolve_mapping_ecopy
 def _resolve_norm_mod(
     binding_or_mod: Any, g: Any, *, default_small_field: str | None = None
 ) -> Module | None:
-    if binding_or_mod is None:
-        return None
-    if isinstance(binding_or_mod, NormModule):
-        if binding_or_mod.small_field is None and default_small_field is not None:
+    if binding_or_mod is None or isinstance(binding_or_mod, Module):
+        if (
+            isinstance(binding_or_mod, NormModule)
+            and binding_or_mod.small_field is None
+            and default_small_field is not None
+        ):
             return NormModule(
                 binding_or_mod.prefix,
                 geometry=binding_or_mod.geometry or g,
@@ -50,26 +52,21 @@ def _resolve_norm_mod(
                 small_field=default_small_field,
             )
         return binding_or_mod
-    if isinstance(binding_or_mod, Module):
-        return binding_or_mod
     if isinstance(binding_or_mod, ModuleBinding):
+        b = binding_or_mod
         vals = {
             "hidden": int(g.H),
             "H": int(g.H),
             "eps": float(getattr(g, "eps", 1e-6)),
         }
-        opts = dict(binding_or_mod.options)
-        if opts.get("small_field") is None and default_small_field is not None:
-            opts["small_field"] = default_small_field
+        opts = {
+            **b.options,
+            "small_field": b.options.get("small_field") or default_small_field,
+        }
         res = ResolvedModuleGeometry(
-            binding_or_mod.module_cls,
-            binding_or_mod.prefix,
-            vals,
-            opts,
-            binding_or_mod.rename,
-            binding_or_mod.transforms,
+            b.module_cls, b.prefix, vals, opts, b.rename, b.transforms
         )
-        return binding_or_mod.module_cls._from_resolved(res)
+        return b.module_cls._from_resolved(res)
     return None
 
 
@@ -215,19 +212,14 @@ def load_logical_weights(
         grp.sort(key=lambda m: m.transform.fuse_order)
 
     canon_hf = {
-        d.name: _coerce_canonical_hf_entry(d, hf, fuse_members, has_layer_dim=True)
-        for d in per_layer
+        d.name: _coerce_canonical_hf_entry(
+            d, hf, fuse_members, has_layer_dim=(d not in final_d)
+        )
+        for d in decls
     }
-    canon_hf.update(
-        {
-            d.name: _coerce_canonical_hf_entry(d, hf, fuse_members, has_layer_dim=False)
-            for d in final_d
-        }
-    )
 
     if not moe_tp and ew > er:
-        if e_cores is None:
-            e_cores = default_eplb_cores(geom, R)
+        e_cores = default_eplb_cores(geom, R) if e_cores is None else e_cores
         known_names = {d.name for d in decls}
         non_exp = [d for d in decls if d.transform.expert_axis is None]
         exp_decls = [d for d in decls if d.transform.expert_axis is not None]
@@ -241,12 +233,12 @@ def load_logical_weights(
             _validate_decl_and_array(d, arr_d, known_names)
             if arr_d.shape != (L, *d.shape):
                 raise ValueError(
-                    f"EPLB parameter {d.name!r} has shape {arr_d.shape}, "
-                    f"expected {(L, *d.shape)}"
+                    f"EPLB {d.name!r} shape {arr_d.shape} != {(L, *d.shape)}"
                 )
             gathered = arr_d[l_idx, idx]
-            perm = (1, 0, *range(2, gathered.ndim))
-            exp_sharded[d.name] = jnp.transpose(gathered, perm)
+            exp_sharded[d.name] = jnp.transpose(
+                gathered, (1, 0, *range(2, gathered.ndim))
+            )
             if d.transform.fuse_into is not None:
                 exp_fuse.setdefault(d.transform.fuse_into, []).append(d)
             else:
@@ -265,7 +257,12 @@ def load_logical_weights(
 
 
 def pack_logical_weights(
-    model_def: Any, ex: ExecSpec, logical_weights: Mapping[str, Any], *, g: Any = None
+    model_def: Any,
+    ex: ExecSpec,
+    logical_weights: Mapping[str, Any],
+    *,
+    g: Any = None,
+    merged_tiles: bool = False,
 ) -> dict[str, Any]:
     """Pack all-ranks `logical_weights` into tiled megakernel weights (`weights_mk`)."""
     ms, geom, pre_n, post_n, final_n = resolve_spec_and_norms(model_def, ex, g=g)
@@ -314,10 +311,11 @@ def pack_logical_weights(
             set_sm(sm_field, logical_weights[l_key])
             populated_sm.add(sm_field)
 
-    if "ecopy" in lay:
-        ec = resolve_mapping_ecopy(logical_weights, None, geom, R)
-        if ec is not None:
-            set_sm("ecopy", ec)
+    if (
+        "ecopy" in lay
+        and (ec := resolve_mapping_ecopy(logical_weights, None, geom, R)) is not None
+    ):
+        set_sm("ecopy", ec)
 
     for slot in ms.layer_type.slots:
         if isinstance(slot, SwitchSlot):
@@ -328,29 +326,28 @@ def pack_logical_weights(
                     if l_key not in logical_weights:
                         raise ValueError(f"Missing {l_key!r} for {sm_field!r}")
                     arr = logical_weights[l_key]
-                    v_l = arr[:, lyr] if arr.shape[1] == L else arr[:, ord_idx]
-                    set_sm(sm_field, v_l, lyr=lyr)
+                    set_sm(
+                        sm_field,
+                        arr[:, lyr] if arr.shape[1] == L else arr[:, ord_idx],
+                        lyr=lyr,
+                    )
                     populated_sm.add(sm_field)
 
     for mod in ms.all_modules():
         if p.module_layer_counts.get(mod.name, 0) > 0:
             for sf in mod.smalls(geom, ex):
                 if sf.name != "ecopy" and sf.name not in populated_sm:
-                    raise ValueError(
-                        f"Module {mod.name!r} smalls() declared {sf.name!r}, "
-                        "but no HFParamDecl mapped to it"
-                    )
+                    raise ValueError(f"{mod.name!r} smalls() {sf.name!r} unmapped")
 
     def tile_w(arr: jax.Array, kind: str) -> jax.Array:
         *lead, k_in, n_in = arr.shape
         nt_, tk_, exp_n = p.nt[kind], p.tk[kind], p.kinds[kind][1]
         assert nt_ * tk_ == k_in and n_in == exp_n, (kind, k_in, nt_, tk_, n_in, exp_n)
-        return arr.reshape((*lead, nt_, tk_, n_in))
+        return arr if merged_tiles else arr.reshape((*lead, nt_, tk_, n_in))
 
     weights_mk: dict[str, Any] = {}
     for mod in ms.all_modules():
-        n_layers = p.module_layer_counts.get(mod.name, 0)
-        if n_layers == 0:
+        if (n_layers := p.module_layer_counts.get(mod.name, 0)) == 0:
             continue
         for wd in mod.weights(geom, ex):
             raw = (
@@ -371,15 +368,20 @@ def pack_logical_weights(
                     src = raw if is_seq else [raw[:, i] for i in range(n_layers)]
                     weights_mk[wd.name] = tuple(tile_w(x, wd.name) for x in src)
             else:
-                sh = (R, n_layers, *wd.lead_dims, wd.K, wd.N)
+                sh = (
+                    (R, n_layers, *wd.lead_dims, wd.K * wd.N)
+                    if (merged_tiles and wd.K == 1 and len(wd.lead_dims) >= 1)
+                    else (R, n_layers, *wd.lead_dims, wd.K, wd.N)
+                )
                 weights_mk[wd.name] = raw.reshape(sh).astype(wd.dtype)
 
     if "smalls" in p.w_names:
         weights_mk["smalls"] = sm
     if final_n is not None and "final_norm" in p.w_names:
         fn_decl = final_n.hf_params(g=geom)[0]
-        fn_key = fn_decl.name if fn_decl.name in logical_weights else "final_norm"
-        if fn_key in logical_weights:
+        if (
+            fn_key := fn_decl.name if fn_decl.name in logical_weights else "final_norm"
+        ) in logical_weights:
             fn_raw = logical_weights[fn_key]
             weights_mk["final_norm"] = jnp.broadcast_to(
                 fn_raw[None, None, :] if fn_raw.ndim == 1 else fn_raw, (R, 1, geom.H)
@@ -391,5 +393,6 @@ def load_hf(
     model_def: Any, ex: ExecSpec, hf: Mapping[str, Any], *, g: Any = None, **kw: Any
 ) -> dict[str, Any]:
     """Load and pack unsharded HF weights across `R = ex.R` ranks."""
+    mt = bool(kw.pop("merged_tiles", False))
     logical = load_logical_weights(model_def, ex, hf, g=g, **kw)
-    return pack_logical_weights(model_def, ex, logical, g=g)
+    return pack_logical_weights(model_def, ex, logical, g=g, merged_tiles=mt)
