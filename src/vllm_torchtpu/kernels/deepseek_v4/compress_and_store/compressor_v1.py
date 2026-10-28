@@ -205,7 +205,9 @@ def prepare_boundary_batch(
 
     # 5. Combine destination indices
     prefill_size = rope_pack * max_prefill_boundary
-    output_size = num_tokens + prefill_size
+    # Whole kernel tiles, so compress_norm_rope_store needs no padding.
+    tile = compress_kernel.TILE_N
+    output_size = (num_tokens + prefill_size + tile - 1) // tile * tile
 
     dest_prefill = K_aligned + tile_index * rope_pack + pos_within_tile
     dest = jnp.where(is_decode, index, dest_prefill)

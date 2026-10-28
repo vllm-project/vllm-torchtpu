@@ -33,6 +33,17 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import kv_cache_append
 # the staged lanes in VMEM, and DMAing the batch back to HBM.
 _SAL_MAX_WAVE = 128
 
+# Boundary tokens per grid step. HCA's window is 128 states, so its step
+# holds fewer tokens to stay in scoped VMEM.
+TILE_N = 8
+HCA_TILE_N = 4
+# Tokens whose records can share an HBM row (a 4-token RoPE row, a 4-token
+# HEAD_ALONG_SUBLANE indexer row) are merged within aligned groups of this
+# many; `prepare_boundary_batch` row-aligns prefill tokens to it.
+MERGE_GROUP = 4
+# Records staged per SEQ_ALONG_LANE transpose (`stage_sal_columns` takes <= 8).
+SAL_STAGE_CHUNK = 8
+
 
 def inner_kernel(
     cos_sin_vmem,
@@ -128,11 +139,15 @@ def inner_kernel(
         if cfgs.dims.seq_along_lane:
             # Stage the records as lanes of a cache-shaped VMEM array; the
             # cache is written from it once the pipeline is done (kernel_fn).
-            compute.stage_sal_columns(
-                records_t_ref,
-                jnp.stack([nope_val_padded[n].flatten() for n in range(tile_n)]),
-                global_idx,
-            )
+            chunk = min(tile_n, SAL_STAGE_CHUNK)
+            for c0 in range(0, tile_n, chunk):
+                compute.stage_sal_columns(
+                    records_t_ref,
+                    jnp.stack(
+                        [nope_val_padded[n].flatten() for n in range(c0, c0 + chunk)]
+                    ),
+                    global_idx + c0,
+                )
         elif cfgs.dims.mode == config.Mode.CSA_INDEXER:
             kv_slots = []
             for i in range(tile_n):
@@ -147,11 +162,12 @@ def inner_kernel(
                     # only applicable to csa-indexer
                     # out_vmem shape: (tile_n, 1, 4, 256)
                     slots_val = out_vmem[n, 0]
+                    g0 = n - n % MERGE_GROUP
                     out_vmem[n, 0] = compute.merge_slot_updates(
                         slots_val,
-                        kv_slots,
-                        nope_val_padded,
-                        n,
+                        kv_slots[g0 : g0 + MERGE_GROUP],
+                        nope_val_padded[g0 : g0 + MERGE_GROUP],
+                        n - g0,
                     )
 
         else:
@@ -171,10 +187,15 @@ def inner_kernel(
                 @pl.when(is_first)
                 def _merge_rope():
                     row = pltpu.bitcast(rope_out_vmem[n], jnp.int32)  # (1, 128)
-                    rope_out_vmem[n] = pltpu.bitcast(
-                        compute.merge_rope_row(row, kv_slots, words, rope_lane, n),
-                        jnp.uint8,
+                    g0 = n - n % MERGE_GROUP
+                    merged = compute.merge_rope_row(
+                        row,
+                        kv_slots[g0 : g0 + MERGE_GROUP],
+                        words[g0 : g0 + MERGE_GROUP],
+                        rope_lane,
+                        n - g0,
                     )
+                    rope_out_vmem[n] = pltpu.bitcast(merged, jnp.uint8)
 
     else:
         # hca: bitcast bf16 -> uint8 and match the output block shape.
@@ -300,11 +321,12 @@ def derive_aliases(
 
 def compute_is_first_mask(kv_slot_mapping, tile_n, pack_factor=4):
     """Determines, for every token in a sequence, whether it is the first token within
-    its execution tile to map to a particular physical HBM row.
+    its group of `tile_n` (the kernel's MERGE_GROUP) to map to a particular
+    physical HBM row.
 
-    If multiple tokens in the same tile map to the same row, only the first one is
+    If multiple tokens in the same group map to the same row, only the first one is
     responsible for writing the merged VMEM row buffer back to HBM. The
-    subsequent tokens in the same tile that conflict will skip the HBM write to
+    subsequent tokens in the same group that conflict will skip the HBM write to
     prevent overwriting each other's data and reduce memory traffic.
     """
     num_tokens = kv_slot_mapping.shape[0]
@@ -378,21 +400,30 @@ def compress_norm_rope_store(
     assert block_table.ndim == 1
     assert block_table.shape[0] % block_table_stride == 0
 
-    num_tokens = positions.shape[0]
     head_dim = rms_weight.shape[0]
     rope_head_dim = cos_sin_cache.shape[1] if cos_sin_cache is not None else 0
+    mode = _select_mode(head_dim, overlap)
+    tile_n = HCA_TILE_N if mode is config.Mode.HCA else TILE_N
+    # Every grid step reads tile_n tokens' scalars; pad to whole tiles with
+    # unwritten (-1 slot) tokens. `prepare_boundary_batch` already does.
+    pad = -positions.shape[0] % tile_n
+    if pad:
+        positions = jnp.pad(positions, (0, pad))
+        token_to_req_indices = jnp.pad(token_to_req_indices, (0, pad))
+        kv_slot_mapping = jnp.pad(kv_slot_mapping, (0, pad), constant_values=-1)
+    num_tokens = positions.shape[0]
 
     state_operand = None if state_cache is None or state_cache is cache else state_cache
     state_source = cache if state_operand is None else state_operand
 
     cfgs = config.Configs.make(
-        _select_mode(head_dim, overlap),
+        mode,
         size_n=num_tokens,
         physical_page_size=cache.shape[1],
         state_physical_page_size=state_source.shape[1],
         state_block_size=state_block_size,
         rms_eps=rms_eps,
-        tile_n=4,
+        tile_n=tile_n,
         head_dim=head_dim,
         rope_head_dim=rope_head_dim,
         compress_ratio=compress_ratio,
@@ -406,9 +437,9 @@ def compress_norm_rope_store(
         )
 
     if cfgs.dims.mode in (config.Mode.CSA, config.Mode.CSA_INDEXER):
-        assert cfgs.tile_sizes.tile_n % 4 == 0, (
-            f"tile_n must be a multiple of 4 for {cfgs.dims.mode.value}, "
-            f"got {cfgs.tile_sizes.tile_n}"
+        assert cfgs.tile_sizes.tile_n % MERGE_GROUP == 0, (
+            f"tile_n must be a multiple of {MERGE_GROUP} for "
+            f"{cfgs.dims.mode.value}, got {cfgs.tile_sizes.tile_n}"
         )
 
     if cfgs.dims.has_rope_cache and rope_cache is None:
@@ -429,12 +460,12 @@ def compress_norm_rope_store(
     else:
         is_first_mask = compute_is_first_mask(
             kv_slot_mapping,
-            cfgs.tile_sizes.tile_n,
+            MERGE_GROUP,
             pack_factor=cfgs.tokens_in_second_minor,
         )
         is_first_mask_rope = compute_is_first_mask(
             kv_slot_mapping,
-            cfgs.tile_sizes.tile_n,
+            MERGE_GROUP,
             # TODO: this is confusing, should probably find a better name for it
             pack_factor=cfgs.hbm_pack,
         )

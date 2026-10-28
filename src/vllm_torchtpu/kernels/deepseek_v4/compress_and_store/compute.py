@@ -331,13 +331,12 @@ def stage_sal_columns(
     rows_pad = sublane_tile
     groups_pad = pl.cdiv(groups, sublane_tile) * sublane_tile
     assert n <= rows_pad and lanes % n == 0, (n, rows_pad)
-    padded_records = jnp.concatenate(
-        [
-            records.astype(jnp.int32),
-            jnp.zeros((rows_pad - n, width), jnp.int32),
-        ],
-        axis=0,
-    ).astype(jnp.bfloat16)  # (8, width)
+    padded_records = records.astype(jnp.int32)
+    if n < rows_pad:
+        padded_records = jnp.concatenate(
+            [padded_records, jnp.zeros((rows_pad - n, width), jnp.int32)], axis=0
+        )
+    padded_records = padded_records.astype(jnp.bfloat16)  # (8, width)
 
     lane_offset = first_token % lanes
     token_idx = jax.lax.broadcasted_iota(jnp.int32, (rows_pad, lanes), 0)
