@@ -1881,12 +1881,11 @@ def _kv_pin(cfg) -> dict | None:
     cell = cfg.get("cell", "")
     rec = layers.kv_blocks_for(cell)
     if not rec:
-        # No full-model run is started for this: a campaign serves the full
-        # config at a segment's close on a changed output and in its final
-        # check, and golden's arm there records the cache (`_record_kv`).
+        # The cut keeps its own cache. Golden's full-config arm records a pin
+        # only outside a frozen segment (`_record_kv`).
         say(f"cell {cell} has no record of the full model's KV cache, so this cut keeps the "
             f"larger cache its dropped layers leave it, golden's arm and every candidate's alike. "
-            f"The first full-model job on this cell records one"
+            f"Golden's next full-config arm outside a frozen segment records one"
             + ("; a cells config fixes each cell's batch and context, so the larger cache "
                "changes no shape it serves" if cfg.get("cells") else ""))
     return rec
@@ -2003,6 +2002,16 @@ def _record_kv(cfg, seen: tuple, arm: str, source: str = "") -> None:
         return
     from perfkit import layers
 
+    # The record is a frozen input of a campaign corpus (perfkit corpus
+    # manifest), so inside a frozen segment a first record would change the
+    # corpus under every later layer job of the segment, and they would be
+    # refused. The segment stays as it was frozen, without a pin.
+    if os.environ.get("PERFKIT_CORPUS_MANIFEST") and not layers.kv_blocks_for(cfg["cell"]):
+        say(f"{arm}/{cfg['config']}: the full model allocates {blocks} KV cache blocks per engine, "
+            f"not recorded: this segment froze cell {cfg['cell']}'s corpus without a KV pin, and "
+            f"a frozen input does not change inside a segment. `perfkit layers kv --cell {cfg['cell']} "
+            f"--log <this server's log>` records it for the next segment")
+        return
     rec = layers.kv_record(cfg["cell"], blocks, tokens=tokens,
                            source=source or f"serve_e2e job {os.environ.get('PERFKIT_JOB_ID', '')}"
                                             f", arm {arm}", replace=False)
