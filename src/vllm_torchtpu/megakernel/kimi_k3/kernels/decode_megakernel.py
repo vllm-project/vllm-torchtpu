@@ -6122,9 +6122,10 @@ def _vmem_budget(persistent, regions, *, limit=None, spill_reserve=None):
 
 def _verify_dcp_layout(rows, heads, sequence_rows):
     """DCP chunking for attention-DP verifies: one sequence (4 rows) per chunk
-    and 3 ring slots, so a chunk's combine lands while the next two attend
-    (the default for 64 group rows is 2 slots, which waits on it). Empty:
-    the default layout."""
+    and 3 ring slots, so a chunk's combine lands while the next two attend.
+    The default is 4-row chunks with 2 slots at 64 group rows (each chunk
+    waits on the previous combine) and 8-row chunks with 3 slots at 16/32/48.
+    Empty: the default layout."""
     if sequence_rows == 4 and heads == 6 and rows >= 16 and rows % 4 == 0:
         return {"chunk_rows": 4, "ring": 3}
     return {}
