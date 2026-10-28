@@ -24,19 +24,23 @@ A placed layer's expert map, the EP weight filter and the router's rows follow
 the table. The router rows are reordered so that rank r's experts become
 expert ids ``r * slots .. (r + 1) * slots - 1``, so every kernel keeps its
 contiguous-block ownership and nothing runs per token. Each token still picks
-the same experts with the same weights; only the order in which its top-k
-contributions are summed can change. Layers the table does not list, and
-every layer under an ``mtp`` module (a draft model, whose layer numbers
-restart at 0), keep vLLM's linear placement.
+the same experts with the same weights (an exact tie of biased scores may
+break the other way); only the order in which its top-k contributions are
+summed can change. Layers the table does not list, and every layer under an
+``mtp`` module (a draft model, whose layer numbers restart at 0), keep vLLM's
+linear placement. Only the router rows of layers whose expert map this process
+placed are reordered, and a weight stream that ends without the router weight
+(``.mlp.gate.weight``) of every placed layer is refused.
 
 A table may list only the model's routed decoder layers: a layer below
 ``first_k_dense_replace`` (dense) or at or above ``num_hidden_layers`` (an MTP
 layer stored after the decoder, e.g. GLM-5.2's layer 78) is refused when the
 first MoE layer is built, and so are EP x TP expert splitting
 (``TPU_MOE_EP_TP_SIZE`` > 1), an ``--expert-placement-strategy`` other than
-``linear``, grouped top-k and hash-routed layers. Each worker logs one
-``[eplb] placement`` line with its EP rank (``installed`` with the table's
-sha256, or ``none``).
+``linear``, grouped top-k, hash-routed layers, MoE layers without expert
+parallelism, and a table that places no layer of the model. Each
+expert-parallel worker logs one ``[eplb] placement`` line with its EP rank
+(``installed`` with the table's sha256, or ``none``).
 """
 
 import dataclasses
@@ -55,6 +59,7 @@ logger = init_logger(__name__)
 
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 _ROUTER_RE = re.compile(r"\.mlp\.gate\.(weight|bias)$|e_score_correction_bias$")
+_ROUTER_WEIGHT_RE = re.compile(r"\.mlp\.gate\.weight$")
 # Load formats served by the two loaders whose weight streams are reordered.
 _STREAMED_LOAD_FORMATS = (
     "auto",
@@ -69,6 +74,8 @@ _STREAMED_LOAD_FORMATS = (
 )
 # Per placed layer, the experts this rank holds; recorded with its expert map.
 _LOCAL_IDS: dict[int, frozenset[int]] = {}
+# Placed layers whose router weight a weight stream has reordered.
+_ROUTED: set[int] = set()
 # This process's EP rank, the table checked against the model, and the
 # once-per-process marker lines.
 _STATE: dict[str, object] = {}
@@ -252,18 +259,40 @@ def local_expert_ids(name: str) -> frozenset[int] | None:
 
 
 def permute_router_rows(name: str, tensor: torch.Tensor) -> torch.Tensor:
-    """A placed layer's router weight or bias in the reordered row order."""
+    """A placed layer's router weight or bias in the reordered row order.
+
+    Only layers whose expert map this process placed are reordered, so the
+    router and the experts always follow the same order.
+    """
     table = placement() if _ROUTER_RE.search(name) else None
     layer = _placed_layer(table, name)
-    if table is None or layer is None:
+    if table is None or layer is None or layer not in _LOCAL_IDS:
         return tensor
     if tensor.shape[0] != table.experts:
         raise ValueError(
             f"expert placement: {name} has {tensor.shape[0]} rows, the table "
             f"{table.experts} experts"
         )
+    if _ROUTER_WEIGHT_RE.search(name):
+        _ROUTED.add(layer)
     order = torch.tensor(virtual_order(table, layer), device=tensor.device)
     return tensor.index_select(0, order)
+
+
+def _placed_stream(weights):
+    """A weight stream with the placed layers' router rows reordered; refused
+    if it ends without the router weight of every placed layer."""
+    _announce(placement())
+    for name, tensor in weights:
+        yield name, permute_router_rows(name, tensor)
+    missing = sorted(set(_LOCAL_IDS) - _ROUTED)
+    if missing:
+        raise ValueError(
+            f"expert placement: placed layers {missing} got no router weight "
+            "(.mlp.gate.weight) from the weight stream, so their experts would "
+            "not match their router; this model's router is not supported by "
+            "TPU_EXPERT_PLACEMENT"
+        )
 
 
 def _refuse_unsupported_load_format() -> None:
@@ -335,11 +364,9 @@ def _announce(table: Placement | None) -> None:
             table.sha256[:16],
         )
     else:
-        logger.warning(
-            "[eplb] placement EMPTY ep_rank=%d: TPU_EXPERT_PLACEMENT=%s placed no "
-            "layer of this model",
-            rank,
-            envs.TPU_EXPERT_PLACEMENT,
+        raise ValueError(
+            f"[eplb] placement EMPTY ep_rank={rank}: TPU_EXPERT_PLACEMENT="
+            f"{envs.TPU_EXPERT_PLACEMENT} placed no layer of this model; unset it"
         )
 
 
@@ -421,6 +448,12 @@ def install_expert_placement() -> None:
 
     def update_expert_map_info(self) -> None:
         use_ep = self.moe_config.moe_parallel_config.use_ep
+        if not use_ep and _placed_layer(placement(), self.layer_name) is not None:
+            raise ValueError(
+                f"TPU_EXPERT_PLACEMENT lists {self.layer_name}, which runs without "
+                "expert parallelism: pass --enable-expert-parallel or unset "
+                "TPU_EXPERT_PLACEMENT"
+            )
         table = placement() if use_ep else None
         if table is not None:
             _check_deployment(table)
@@ -442,14 +475,10 @@ def install_expert_placement() -> None:
         update_info(self)
 
     def placed_all_weights(self, model_config, model):
-        _announce(placement())
-        for name, tensor in get_all_weights(self, model_config, model):
-            yield name, permute_router_rows(name, tensor)
+        yield from _placed_stream(get_all_weights(self, model_config, model))
 
     def placed_weights_iterator(self, model_or_path, revision):
-        _announce(placement())
-        for name, tensor in streamed(self, model_or_path, revision):
-            yield name, permute_router_rows(name, tensor)
+        yield from _placed_stream(streamed(self, model_or_path, revision))
 
     expert_map_manager.determine_expert_map = determine_expert_map
     RoutedExperts.update_expert_map_info = update_expert_map_info

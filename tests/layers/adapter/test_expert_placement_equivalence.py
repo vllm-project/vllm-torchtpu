@@ -13,7 +13,9 @@
 # limitations under the License.
 """Static expert placement keeps a GLM-5.2-style EP16 MoE layer's output on the
 paths moe_tp_decode serves under expert parallelism: its fused kernel's
-routing and per-rank expert compaction (T <= 64), and the psum path, i.e.
+routing (fast and exact) and per-rank expert compaction (T <= 64), computed
+with dense per-expert FFNs in place of the kernel's matmuls, and the psum
+path, i.e.
 _route plus fused_moe_func per rank with experts_start = 16 * rank (one-hot
 and SparseCore ragged branches). The router rows go through
 expert_placement.permute_router_rows and each rank's experts through
@@ -108,7 +110,15 @@ def table(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("TPU_EXPERT_PLACEMENT", str(path))
     ep._load.cache_clear()
-    yield ep.placement()
+    table = ep.placement()
+    # Both layers' experts placed in this process, as building them does.
+    monkeypatch.setattr(
+        ep,
+        "_LOCAL_IDS",
+        {layer: frozenset(table.cores[layer][0]) for layer in table.cores},
+    )
+    monkeypatch.setattr(ep, "_ROUTED", set())
+    yield table
     ep._load.cache_clear()
 
 
@@ -153,15 +163,25 @@ def _psum_path(x, router_w, bias, w13, w2, is_pad):
 
 
 def _kernel_path(x, router_w, bias, w13, w2, is_pad):
-    """The fused kernel's math: its own routing (kernel._route) on the full
-    scores; rank r's local expert e weighted by routing column 16r + e."""
+    """The fused kernel's math: its fast routing (kernel._route_fast), or
+    kernel._route when the fast one flags a pick outside its window, as the
+    kernel falls back; then per rank the vector compaction
+    (kernel._compact_vector) of the experts picked in the rank's window
+    16r .. 16r + 15, each weighted by routing column 16r + e."""
     scores = jax.nn.sigmoid(x.astype(jnp.float32) @ router_w.T)
     n_valid = x.shape[0] - int(np.asarray(is_pad).sum())
-    weights = mtk._route(scores, bias[None, :], n_valid, topk=TOPK)
+    weights, flag = mtk._route_fast(scores, bias[None, :], n_valid, topk=TOPK)
+    exact = mtk._route(scores, bias[None, :], n_valid, topk=TOPK)
+    if float(np.asarray(flag).max()) == 0.0:
+        np.testing.assert_array_equal(np.asarray(weights), np.asarray(exact))
+    else:
+        weights = exact
     xf = x.astype(jnp.float32)
     total = jnp.zeros(x.shape, jnp.float32)
     for r in range(RANKS):
-        for e in range(SLOTS):
+        ids, count = mtk._compact_vector(weights, r * SLOTS, SLOTS)
+        active = np.asarray(ids)[0, : int(np.asarray(count)[0, 0])].astype(int)
+        for e in active:
             gate_up = xf @ w13[r, e].astype(jnp.float32)
             act = jax.nn.silu(gate_up[:, :INTER]) * gate_up[:, INTER:]
             down = act @ w2[r, e].astype(jnp.float32)
@@ -200,25 +220,29 @@ def _same(a, b, valid):
 
 
 @pytest.mark.parametrize(
-    ("tokens", "path"),
+    ("tokens", "path", "bias_scale"),
     [
-        (16, "kernel"),
-        (64, "kernel"),
-        (64, "psum"),  # one-hot sort-free
-        (256, "psum"),  # one-hot single sort
-        (1024, "psum"),  # SparseCore ragged dispatch and combine
+        (16, "kernel", 0.01),  # biased scores close together: fast routing
+        (64, "kernel", 0.5),  # a pick outside the fast window: exact routing
+        (64, "psum", 0.5),  # one-hot sort-free
+        (256, "psum", 0.5),  # one-hot single sort
+        (1024, "psum", 0.5),  # SparseCore ragged dispatch and combine
     ],
 )
-def test_placed_layer_matches_the_unplaced_layer(table, refs, tokens, path):
+def test_placed_layer_matches_the_unplaced_layer(table, refs, tokens, path, bias_scale):
     rng = np.random.default_rng(tokens)
     router_w = jnp.asarray(rng.standard_normal((E, HIDDEN)) * 0.05, jnp.float32)
-    bias = jnp.asarray(rng.standard_normal(E) * 0.5, jnp.float32)
+    bias = jnp.asarray(rng.standard_normal(E) * bias_scale, jnp.float32)
     w13 = jnp.asarray(rng.standard_normal((E, HIDDEN, 2 * INTER)) * 0.05, jnp.bfloat16)
     w2 = jnp.asarray(rng.standard_normal((E, INTER, HIDDEN)) * 0.05, jnp.bfloat16)
     x = jnp.asarray(rng.standard_normal((tokens, HIDDEN)), jnp.bfloat16)
     is_pad = jnp.asarray(np.arange(tokens) >= tokens - (3 if tokens <= 64 else 8))
     valid = ~np.asarray(is_pad)
     run = _kernel_path if path == "kernel" else _psum_path
+    if path == "kernel":
+        scores = jax.nn.sigmoid(x.astype(jnp.float32) @ router_w.T)
+        _, flag = mtk._route_fast(scores, bias[None, :], int(valid.sum()), topk=TOPK)
+        assert (float(np.asarray(flag).max()) == 0.0) == (bias_scale < 0.1)
 
     linear13 = w13.reshape(RANKS, SLOTS, HIDDEN, 2 * INTER)
     linear2 = w2.reshape(RANKS, SLOTS, INTER, HIDDEN)

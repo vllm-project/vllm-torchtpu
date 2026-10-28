@@ -61,8 +61,18 @@ def use_table(tmp_path, monkeypatch):
         return str(path)
 
     monkeypatch.setattr(ep, "_LOCAL_IDS", {})
+    monkeypatch.setattr(ep, "_ROUTED", set())
     yield use
     ep._load.cache_clear()
+
+
+def _mark_placed(rank=0):
+    """Record every table layer as placed on `rank`, as building its experts
+    does, so the router rows of those layers are reordered."""
+    table = ep.placement()
+    for layer, cores in table.cores.items():
+        ep._LOCAL_IDS[layer] = frozenset(cores[rank])
+    return table
 
 
 def test_maps_and_router_rows(use_table):
@@ -73,6 +83,9 @@ def test_maps_and_router_rows(use_table):
     assert ep.expert_map(table, 0, 0) == [1, -1, -1, 0]
     assert ep.expert_map(table, 0, 1) == [-1, 1, 0, -1]
     w = torch.arange(4.0).reshape(4, 1)
+    # Experts not placed by this process: the router keeps its order too.
+    assert ep.permute_router_rows("model.layers.0.mlp.gate.weight", w) is w
+    _mark_placed()
     out = ep.permute_router_rows("model.layers.0.mlp.gate.weight", w)
     assert out[:, 0].tolist() == [3.0, 0.0, 2.0, 1.0]
     assert (
@@ -257,6 +270,7 @@ def test_target_is_placed_and_the_mtp_draft_stays_linear(use_table, installed):
 
 def test_weight_streams_reorder_router_rows(use_table, installed, monkeypatch):
     use_table(_plain_table())
+    ep._LOCAL_IDS[0] = frozenset(ep.placement().cores[0][0])
     weights = [
         ("model.layers.0.mlp.gate.weight", torch.arange(4.0)),
         ("model.layers.0.mlp.experts.1.down_proj.weight", torch.ones(2)),
@@ -327,7 +341,7 @@ def _glm_table(layers, seed=0):
 
 def test_glm52_router_rows_follow_the_table(use_table):
     use_table(_glm_table(range(3, 78)))
-    table = ep.placement()
+    table = _mark_placed()
     rows = torch.arange(float(GLM_EXPERTS))
     order = ep.virtual_order(table, 40)
     for name in (GLM_GATE, GLM_BIAS):
@@ -355,6 +369,7 @@ def test_glm52_mtp_layer_is_placed_only_when_listed(use_table, listed):
     layer; the deployment check refuses a table that lists it
     (test_glm52_table_listing_mtp_or_dense_layers_is_refused)."""
     use_table(_glm_table([40, 78] if listed else [40]))
+    _mark_placed()
     rows = torch.arange(float(GLM_EXPERTS))
     assert ep.layer_index(GLM_MTP_EXPERTS) == (78 if listed else None)
     for name in (GLM_GATE, GLM_BIAS):
@@ -365,6 +380,7 @@ def test_glm52_mtp_layer_is_placed_only_when_listed(use_table, listed):
 
 def test_glm52_weight_streams_place_the_router(use_table, installed, monkeypatch):
     use_table(_glm_table([40]))
+    _mark_placed()
     order = [float(e) for e in ep.virtual_order(ep.placement(), 40)]
     rows = torch.arange(float(GLM_EXPERTS))
     scale_name = "model.layers.40.mlp.experts.7.down_proj.weight_scale_inv"
@@ -416,7 +432,7 @@ def test_glm52_placed_layer_matches_the_unplaced_layer(use_table):
     """Placing the router weight, its bias and the experts keeps a GLM-5.2
     layer's output; leaving any one of them in checkpoint order does not."""
     use_table(_glm_table([40]))
-    table = ep.placement()
+    table = _mark_placed()
     torch.manual_seed(0)
     x = torch.randn(32, 8, dtype=torch.float64)
     gate = torch.randn(GLM_EXPERTS, 8, dtype=torch.float64)
@@ -498,6 +514,7 @@ def worker(monkeypatch):
     def reset():
         ep._STATE.clear()
         ep._LOCAL_IDS.clear()
+        ep._ROUTED.clear()
 
     return reset
 
@@ -608,10 +625,11 @@ def test_glm52_weight_filter_loads_the_table_experts_on_16_ranks(
         assert all(len(r) == 1 for r in ranks), layer
 
 
-def _glm_router_stream(monkeypatch):
+def _glm_router_stream(monkeypatch, layers=GLM_PLACED):
     weights = [
-        (GLM_GATE.format(3), torch.arange(float(GLM_EXPERTS))),
-        (GLM_BIAS.format(3), torch.arange(float(GLM_EXPERTS))),
+        (name.format(layer), torch.arange(float(GLM_EXPERTS)))
+        for layer in layers
+        for name in (GLM_GATE, GLM_BIAS)
     ]
     loader = default_loader.DefaultModelLoader
     streamer = runai_streamer_loader.RunaiModelStreamerLoader
@@ -782,7 +800,7 @@ def test_glm52_dense_and_mtp_layers_are_untouched_by_a_full_table(
     use_table(_glm_table(range(3, 78), seed=11))
     _glm_config(monkeypatch)
     installed()
-    table = ep.placement()
+    table = _mark_placed()
     rows = torch.arange(float(GLM_EXPERTS))
     h = torch.zeros(4)
     for layer in (0, 1, 2):
@@ -846,3 +864,41 @@ def test_glm52_example_tables_validate(name):
     )
     assert sorted(table.cores) == list(range(3, 78))
     assert table.sha256 == hashlib.sha256(raw).hexdigest()
+
+
+def test_glm52_ep_off_with_a_table_is_refused(
+    use_table, installed, worker, monkeypatch
+):
+    use_table(_glm_table(GLM_PLACED))
+    _glm_config(monkeypatch)
+    installed()
+    experts = _GlmExperts("model.layers.3.mlp.experts", 0)
+    experts.moe_config.moe_parallel_config.use_ep = False
+    with pytest.raises(ValueError, match="without expert parallelism"):
+        RoutedExperts.update_expert_map_info(experts)
+
+
+def test_glm52_stream_missing_a_placed_router_is_refused(
+    use_table, installed, worker, monkeypatch
+):
+    use_table(_glm_table(GLM_PLACED))
+    _glm_config(monkeypatch)
+    _glm_router_stream(monkeypatch, layers=GLM_PLACED[:1])
+    installed()
+    _build_glm_worker(0)
+    loader = default_loader.DefaultModelLoader
+    with pytest.raises(ValueError, match=r"placed layers \[40, 77\] got no router"):
+        dict(loader.get_all_weights(None, None, None))
+
+
+def test_glm52_table_placing_no_layer_is_refused(
+    use_table, installed, worker, monkeypatch
+):
+    use_table(_glm_table(GLM_PLACED))
+    _glm_config(monkeypatch)
+    _glm_router_stream(monkeypatch)
+    installed()
+    _build_glm_worker(0, layers=(GLM_UNPLACED,))
+    loader = default_loader.DefaultModelLoader
+    with pytest.raises(ValueError, match="placement EMPTY"):
+        dict(loader.get_all_weights(None, None, None))

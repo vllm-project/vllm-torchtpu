@@ -95,15 +95,18 @@ TPU_EXPERT_PLACEMENT=examples/expert_placement/glm52_ep16_c32_4k.json \
 
 - **What changes:** each placed layer's expert map, EP weight filter and router rows
   (gate weight and `e_score_correction_bias`) follow the table at load. Every token picks
-  the same experts with the same weights; only the order of its top-k sum can change. No
-  kernel changes and nothing runs per token.
+  the same experts with the same weights (an exact tie of biased scores may break the other
+  way); only the order of its top-k sum can change. No kernel changes and nothing runs per
+  token.
 - **Table:** `layers["<n>"].cores[r]` lists the global expert ids of rank `r` in slot
   order; every layer must be a permutation (no copies). Format and examples:
   `examples/expert_placement/README.md`.
 - **Refused at load:** layers outside the routed decoder layers (dense or MTP layers),
-  `TPU_MOE_EP_TP_SIZE > 1`, `TPU_MOE_HIERARCHICAL_EP`, an `--expert-placement-strategy`
-  other than `linear`, grouped top-k and hash-routed layers.
-- **Check delivery:** every worker logs one line,
+  listed layers without expert parallelism, `TPU_MOE_EP_TP_SIZE > 1`,
+  `TPU_MOE_HIERARCHICAL_EP`, an `--expert-placement-strategy` other than `linear`, grouped
+  top-k, hash-routed layers, a table that places no layer, and a model whose router weight
+  is not named `.mlp.gate.weight` (the stream would not reorder it).
+- **Check delivery:** every expert-parallel worker logs one line,
   `[eplb] placement installed ep_rank=<r> layers=<n> table_sha256=<16 hex>`, or
   `[eplb] placement none ep_rank=<r>` without a table.
 
