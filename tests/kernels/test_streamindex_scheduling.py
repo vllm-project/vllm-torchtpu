@@ -14,12 +14,17 @@
 """Scheduling identities must belong to compiled call sites, not JIT traces."""
 
 import functools
+import io
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import cast
 
 import numpy as np
 import pytest
 import torch
 import torch.fx as fx
+
+from tests.kernels.streamindex_scheduling_helpers import fixture_inputs
 
 
 @torch.library.custom_op("streamindex_scheduling_test::identity", mutates_args=())
@@ -97,6 +102,206 @@ def test_repeated_nested_graph_owns_distinct_namespaces_without_weight_copy():
     torch.testing.assert_close(module(torch.ones(2)), torch.full((2,), 3.0))
 
 
+def test_prebound_outer_aliases_keep_inner_namespaces_independent():
+    from vllm_torchtpu.compilation.scheduling_groups import (
+        _bind_scheduling_group_namespaces,
+    )
+
+    inner = _graph()
+    inner.register_parameter("bias", torch.nn.Parameter(torch.ones(2)))
+    first = next(node for node in inner.graph.nodes if node.op == "call_function")
+    with inner.graph.inserting_before(first):
+        bias = inner.graph.get_attr("bias")
+        value = inner.graph.call_function(torch.add, (first.args[0], bias))
+    first.args = (value,)
+    inner.recompile()
+    root = torch.nn.Module()
+    root.inner = inner
+    graph = fx.Graph()
+    x = graph.placeholder("x")
+    graph.output(graph.call_module("inner", (x,)))
+    outer = fx.GraphModule(root, graph)
+    _bind_scheduling_group_namespaces(outer)
+
+    root = torch.nn.Module()
+    root.outer = outer
+    graph = fx.Graph()
+    x = graph.placeholder("x")
+    x = graph.call_module("outer", (x,))
+    graph.output(graph.call_module("outer", (x,)))
+    module = fx.GraphModule(root, graph)
+    _bind_scheduling_group_namespaces(module)
+    outers = [
+        cast(fx.GraphModule, module.get_submodule(str(node.target)))
+        for node in module.graph.nodes
+        if node.op == "call_module"
+    ]
+    inners = [
+        [
+            cast(fx.GraphModule, child.get_submodule(str(node.target)))
+            for node in child.graph.nodes
+            if node.op == "call_module"
+        ]
+        for child in outers
+    ]
+    assert [[_namespaces(child) for child in group] for group in inners] == [
+        [[1, 2, 3]],
+        [[4, 5, 6]],
+    ]
+    assert {id(child) for child in inners[0]}.isdisjoint(
+        id(child) for child in inners[1]
+    )
+    assert all(child.bias is inner.bias for group in inners for child in group)
+    torch.testing.assert_close(module(torch.ones(2)), torch.full((2,), 3.0))
+
+
+def test_nested_aliases_share_tensors_and_rebind_without_new_modules():
+    from vllm_torchtpu.compilation.scheduling_groups import (
+        _bind_scheduling_group_namespaces,
+    )
+
+    leaf = _graph()
+    leaf.register_parameter("weight", torch.nn.Parameter(torch.ones(2)))
+    leaf.register_buffer("bias", torch.ones(2))
+    first = next(node for node in leaf.graph.nodes if node.op == "call_function")
+    with leaf.graph.inserting_before(first):
+        weight = leaf.graph.get_attr("weight")
+        bias = leaf.graph.get_attr("bias")
+        value = leaf.graph.call_function(torch.add, (first.args[0], weight))
+        value = leaf.graph.call_function(torch.add, (value, bias))
+    first.args = (value,)
+    leaf.recompile()
+
+    def repeated(child):
+        root = torch.nn.Module()
+        root.left = child
+        root.right = child
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        x = graph.call_module("left", (x,))
+        x = graph.call_module("right", (x,))
+        graph.output(x)
+        return fx.GraphModule(root, graph)
+
+    outer = repeated(leaf)
+    module = repeated(outer)
+    _bind_scheduling_group_namespaces(module)
+    bodies = [
+        cast(fx.GraphModule, child._modules[str(inner.target)])
+        for node in module.graph.nodes
+        if node.op == "call_module"
+        for child in (cast(fx.GraphModule, module._modules[str(node.target)]),)
+        for inner in child.graph.nodes
+        if inner.op == "call_module"
+    ]
+    assert [_namespaces(child) for child in bodies] == [
+        [1, 2, 3],
+        [4, 5, 6],
+        [7, 8, 9],
+        [10, 11, 12],
+    ]
+    assert len({id(child) for child in bodies}) == 4
+    assert module._modules["left"] is outer
+    assert bodies[0] is leaf
+    assert all(
+        child.weight is leaf.weight and child.bias is leaf.bias for child in bodies
+    )
+    before = [
+        (id(child), tuple(child._modules), child.code) for child in module.modules()
+    ]
+    _bind_scheduling_group_namespaces(module)
+    assert [
+        (id(child), tuple(child._modules), child.code) for child in module.modules()
+    ] == before
+    torch.testing.assert_close(module(torch.ones(2)), torch.full((2,), 9.0))
+
+
+@pytest.mark.parametrize("kind", ["module", "parameter", "buffer", "attribute"])
+def test_clone_names_preserve_existing_attributes(kind):
+    from vllm_torchtpu.compilation.scheduling_groups import (
+        _bind_scheduling_group_namespaces,
+    )
+
+    root = torch.nn.Module()
+    root.child = _graph()
+    graph = fx.Graph()
+    x = graph.placeholder("x")
+    x = graph.call_module("child", (x,))
+    x = graph.call_module("child", (x,))
+    graph.output(x)
+    module = fx.GraphModule(root, graph)
+    collisions = {}
+    for name in ("_scheduling_child_1", "_scheduling_child_2"):
+        if kind == "module":
+            value = torch.nn.Identity()
+            module.add_module(name, value)
+            registry = module._modules
+        elif kind == "parameter":
+            value = torch.nn.Parameter(torch.ones(2))
+            module.register_parameter(name, value)
+            registry = module._parameters
+        elif kind == "buffer":
+            value = torch.ones(2)
+            module.register_buffer(name, value)
+            registry = module._buffers
+        else:
+            value = object()
+            module.__dict__[name] = value
+            registry = module.__dict__
+        collisions[name] = value
+    _bind_scheduling_group_namespaces(module)
+    assert all(registry[name] is value for name, value in collisions.items())
+    calls = [node for node in module.graph.nodes if node.op == "call_module"]
+    assert calls[0].target == "child"
+    assert calls[1].target not in collisions
+    assert _namespaces(module._modules[str(calls[1].target)]) == [4, 5, 6]
+    torch.testing.assert_close(module(torch.ones(2)), torch.ones(2))
+
+
+def test_dotted_module_aliases_receive_distinct_namespaces():
+    from vllm_torchtpu.compilation.scheduling_groups import (
+        _bind_scheduling_group_namespaces,
+    )
+
+    root = torch.nn.Module()
+    holder = torch.nn.Module()
+    child = _graph()
+    holder.add_module("left", child)
+    holder.add_module("right", child)
+    root.add_module("holder", holder)
+    graph = fx.Graph()
+    x = graph.placeholder("x")
+    x = graph.call_module("holder.left", (x,))
+    x = graph.call_module("holder.right", (x,))
+    graph.output(x)
+    module = fx.GraphModule(root, graph)
+    _bind_scheduling_group_namespaces(module)
+    assert _namespaces(cast(fx.GraphModule, module.get_submodule("holder.left"))) == [
+        1,
+        2,
+        3,
+    ]
+    second = next(node for node in module.graph.nodes if node.name == "holder_right")
+    assert _namespaces(module._modules[str(second.target)]) == [4, 5, 6]
+
+
+def test_export_round_trip_preserves_bound_call_sites():
+    from vllm_torchtpu.compilation.scheduling_groups import (
+        _bind_scheduling_group_namespaces,
+    )
+
+    program = torch.export.export(_graph(), (torch.ones(2),))
+    _bind_scheduling_group_namespaces(program.graph_module)
+    stream = io.BytesIO()
+    torch.export.save(program, stream)
+    stream.seek(0)
+    restored = torch.export.load(stream)
+    assert _namespaces(restored.graph_module) == [1, 2, 3]
+    _bind_scheduling_group_namespaces(restored.graph_module)
+    assert _namespaces(restored.graph_module) == [1, 2, 3]
+    torch.testing.assert_close(restored.module()(torch.ones(2)), torch.ones(2))
+
+
 def test_load_binds_the_same_call_sites_before_replay(monkeypatch):
     from vllm.config.utils import Range
 
@@ -133,56 +338,29 @@ def test_pairing_is_disjoint_for_different_chunk_counts():
             scoped_scheduling_group_id(*bad)
 
 
+@pytest.mark.parametrize("edited", ["binder", "compiler"])
 def test_changed_call_site_binding_invalidates_exported_runtime_cache(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, edited
 ):
+    from vllm.config import VllmConfig
+
     from tests.compilation.test_tpu_compiler import TestTpuCompilerCache
     from vllm_torchtpu.compilation import tpu_compiler
 
-    source = tmp_path / "src/vllm_torchtpu/compilation/tpu_compiler.py"
-    source.parent.mkdir(parents=True)
-    source.write_text("# first call-site binding\n")
-    monkeypatch.setattr(tpu_compiler, "__file__", str(source))
-    config = TestTpuCompilerCache._config()
+    compiler = tmp_path / "src/vllm_torchtpu/compilation/tpu_compiler.py"
+    compiler.parent.mkdir(parents=True)
+    compiler.write_text("# compiler implementation\n")
+    binder = compiler.with_name("scheduling_groups.py")
+    binder.write_text("# first call-site binding\n")
+    monkeypatch.setattr(tpu_compiler, "__file__", str(compiler))
+    config = cast(VllmConfig, TestTpuCompilerCache._config())
     first = tpu_compiler.compute_tpu_compilation_hash(config)
-    source.write_text("# changed call-site binding\n")
-    assert tpu_compiler.compute_tpu_compilation_hash(config) != first
-
-
-def fixture_inputs(tokens):
-    """Strictly ordered BF16 keys, fragmented pages, two live and six idle slots."""
-    pages = 80
-    rng = np.random.default_rng(42)
-    tables = np.zeros((8, pages), np.int32)
-    tables[:2] = rng.permutation(np.arange(1, 2 * pages + 1)).reshape(2, pages)
-    values = (np.arange(pages * 128, dtype=np.uint16) + 0x2000).copy()
-    cache_words = np.zeros((2 * pages + 1, 128, 256), np.uint16)
-    cache_words[:, :, 128] = 0x3F80
-    cache_words[0] = 0x3E80
-    for request in range(2):
-        for logical, physical in enumerate(tables[request]):
-            cache_words[physical, :, 0] = values[logical * 128 : (logical + 1) * 128]
-    cache = torch.from_numpy(cache_words.copy()).view(torch.bfloat16)
-    cache = cache.reshape(2 * pages + 1, 128, 1, 256)
-    query = torch.zeros((tokens, 4, 128), dtype=torch.bfloat16)
-    query[..., 0] = 1
-    counts = np.array([tokens // 2, tokens - tokens // 2] + [0] * 6, np.int32)
-    starts = np.r_[0, counts.cumsum()].astype(np.int32)
-    context = np.array([4096, 2048] + [0] * 6, np.int32)
-    requests = np.repeat(np.arange(8), counts).astype(np.int32)
-    lengths = np.concatenate(
-        [
-            context[request] + np.arange(1, count + 1)
-            for request, count in enumerate(counts)
-        ]
-    ).astype(np.int32)
-    return tuple(
-        [query, cache]
-        + [
-            torch.from_numpy(x.copy())
-            for x in (lengths, tables, requests, starts, context)
-        ]
-    )
+    if edited == "compiler":
+        compiler.write_text("# unrelated compiler edit\n")
+        assert tpu_compiler.compute_tpu_compilation_hash(config) == first
+    else:
+        binder.write_text("# changed call-site binding\n")
+        assert tpu_compiler.compute_tpu_compilation_hash(config) != first
 
 
 def check_selected(actual, lengths):
@@ -290,14 +468,18 @@ def native_selector(annotated=True):
     return op
 
 
-def selector_chain(op, layers=2):
+def selector_chain(
+    op: Callable[..., torch.Tensor], layers: int = 2
+) -> Callable[..., torch.Tensor]:
     def chain(query, cache, lengths, table, requests, starts, context):
+        selected: torch.Tensor | None = None
         for layer in range(layers):
             selected = op(query, cache, lengths, table, requests, starts, context)
             if layer + 1 < layers:
                 query = query + (
                     (selected.sum(dim=1) % 7).to(query.dtype)[:, None, None] / 1024
                 )
+        assert selected is not None
         return selected
 
     return chain
