@@ -2763,6 +2763,123 @@ class TestAllRanksKvBytesPerBlock(unittest.TestCase):
             _build_spec({"cpu_bytes_to_use": 1 << 20}, pp_size=2)
 
 
+class TestStoreOnEvict(unittest.TestCase):
+    """VLLM_TPU_RAIDEN_STORE_ON_EVICT: store jobs wait for the device free
+    queue's LRU head, run against a real vLLM BlockPool."""
+
+    _make_scheduler = TestSchedulerFenceFlow._make_scheduler
+    _stock_meta = TestSchedulerFenceFlow._stock_meta
+    _store_job = TestSchedulerFenceFlow._store_job
+    _build_meta = TestSchedulerFenceFlow._build_meta
+
+    def setUp(self):
+        from vllm.v1.core.block_pool import BlockPool
+
+        from vllm_torchtpu.offload import raiden_connector
+
+        self._env = patch.dict(
+            os.environ,
+            {
+                "VLLM_TPU_RAIDEN_STORE_ON_EVICT": "1",
+                "VLLM_TPU_RAIDEN_COLD_FRONTIER_BLOCKS": "2",
+            },
+        )
+        self._env.start()
+        self.pool = BlockPool(num_gpu_blocks=9, enable_caching=True, hash_block_size=4)
+        raiden_connector.register_block_pool(self.pool)
+
+    def tearDown(self):
+        from vllm_torchtpu.offload import raiden_connector
+
+        raiden_connector.register_block_pool(None)
+        self._env.stop()
+
+    def _cached(self, n, tag):
+        blocks = self.pool.get_new_blocks(n)
+        for i, b in enumerate(blocks):
+            key = (f"{tag}{i}".encode(), 0)
+            b._block_hash = key
+            self.pool.cached_block_hash_to_block.insert(key, b)
+        return blocks
+
+    def test_store_waits_for_the_cold_frontier(self):
+        manager = MagicMock()
+        sched = self._make_scheduler(manager)
+        held = self._cached(2, "A")  # blocks 1, 2, held by a running request
+        ids = [b.block_id for b in held]
+        meta = self._build_meta(sched, self._stock_meta(store_jobs={7: self._store_job([f"k{n}" for n in ids], ids)}))
+        self.assertEqual(meta.fence_job_ids, set())  # parked, not fenced
+        self.assertIn(7, sched._cold_pending)
+        # Freed, they join the LRU tail behind six never-used blocks: still warm.
+        self.pool.free_blocks(reversed(held))
+        meta = self._build_meta(sched, self._stock_meta())
+        self.assertEqual(meta.fence_job_ids, set())
+        # Allocation drains the six older free blocks; ours reach the head.
+        self.pool.get_new_blocks(6)
+        meta = self._build_meta(sched, self._stock_meta())
+        self.assertEqual(meta.fence_job_ids, {7})
+        self.assertNotIn(7, sched._cold_pending)
+        self.assertEqual(sched._fence_pending[7].device_block_ids, ids)
+
+    def test_a_held_block_is_never_stored(self):
+        manager = MagicMock()
+        sched = self._make_scheduler(manager)
+        held = self._cached(1, "H")
+        self.pool.get_new_blocks(7)  # free queue now empty except nothing
+        meta = self._build_meta(
+            sched, self._stock_meta(store_jobs={3: self._store_job(["k"], [held[0].block_id])})
+        )
+        meta = self._build_meta(sched, self._stock_meta())
+        # Held (ref > 0) blocks are not in the free queue, so not cold.
+        self.assertEqual(meta.fence_job_ids, set())
+        self.assertIn(3, sched._cold_pending)
+
+    def test_gdn_checkpoint_pages_travel_with_their_chunk(self):
+        manager = MagicMock()
+        sched = self._make_scheduler(manager)
+        attention = self._cached(2, "T")
+        checkpoint = self._cached(1, "G")  # GDN checkpoint page of the chunk
+        ids = [b.block_id for b in attention + checkpoint]
+        self._build_meta(sched, self._stock_meta(store_jobs={5: self._store_job([f"k{n}" for n in ids], ids)}))
+        self.pool.get_new_blocks(5)  # leave only our blocks to be freed
+        # Only the checkpoint is freed first and becomes cold: the whole job,
+        # attention pages included, moves to the fence stage together.
+        self.pool.free_blocks(checkpoint)
+        meta = self._build_meta(sched, self._stock_meta())
+        self.assertEqual(meta.fence_job_ids, {5})
+        self.assertEqual(sched._fence_pending[5].device_block_ids, ids)
+
+    def test_reallocation_flush_cancels_a_parked_store(self):
+        manager = MagicMock()
+        sched = self._make_scheduler(manager)
+        blocks = self._cached(2, "R")
+        ids = [b.block_id for b in blocks]
+        self._build_meta(sched, self._stock_meta(store_jobs={9: self._store_job([f"k{n}" for n in ids], ids)}))
+        meta = self._build_meta(sched, self._stock_meta(jobs_to_flush={9}))
+        manager.on_store_job_cancelled.assert_called_once_with([f"k{n}" for n in ids])
+        self.assertIn(9, meta.finished_store_job_ids)
+        self.assertNotIn(9, sched._cold_pending)
+        self.assertEqual(sched._cold_by_block, {})
+        self.assertEqual(meta.fence_job_ids, set())
+
+    def test_unreported_reuse_is_caught_by_the_hash_check(self):
+        manager = MagicMock()
+        sched = self._make_scheduler(manager)
+        blocks = self._cached(2, "S")
+        ids = [b.block_id for b in blocks]
+        self._build_meta(sched, self._stock_meta(store_jobs={4: self._store_job([f"k{n}" for n in ids], ids)}))
+        self.pool.free_blocks(reversed(blocks))
+        self.pool.get_new_blocks(6)
+        # A block of the job is evicted and rehashed without a reported flush.
+        blocks[0].reset_hash()
+        blocks[0]._block_hash = (b"other", 0)
+        meta = self._build_meta(sched, self._stock_meta())
+        self.assertEqual(meta.fence_job_ids, set())
+        self.assertIn(4, meta.finished_store_job_ids)
+        manager.on_store_job_cancelled.assert_called_once_with([f"k{n}" for n in ids])
+        self.assertEqual(sched._cold_stats["stale"], 1)
+
+
 class TestStorageConfig(unittest.TestCase):
     """resolve_storage_config: where the settings come from, and the checks
     that stop engine startup rather than let every save fail."""
