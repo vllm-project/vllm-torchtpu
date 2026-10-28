@@ -98,15 +98,22 @@ def topk_workspace_coords(
     topk: jax.Array,
     query_start_loc: jax.Array,
     ws_page_offset: jax.Array,
+    token_end: jax.Array,
     *,
     page_size: int,
     dcp_size: int,
     interleave: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Map global top-k positions to `(valid, owner_rank, ws_page, slot_in_page)`."""
+    """Map global top-k positions to `(valid, owner_rank, ws_page, slot_in_page)`.
+
+    Rows at or after `token_end` are invalid: they hold the decode rows'
+    rank-local cache indices or padding, not global positions, and the
+    attention kernel still gathers up to a kernel batch of them.
+    """
     seg = segment_of_rows(topk.shape[0], query_start_loc)
     offset = ws_page_offset[seg]
-    valid = topk >= 0
+    rows = jnp.arange(topk.shape[0], dtype=jnp.int32)
+    valid = (topk >= 0) & (rows[:, None] < token_end)
     p = jnp.maximum(topk, 0)
     cycle = dcp_size * interleave
     owner = (p // interleave) % dcp_size
@@ -122,7 +129,10 @@ def remap_topk_chunked(
     page_size: int,
     dcp_size: int,
 ) -> jax.Array:
-    """Map workspace coordinates to flat token indices in the chunked workspace."""
+    """Map workspace coordinates to flat token indices in the chunked workspace.
+
+    The shape of chunked workspace is `[chunk, dcp, chunk_pages, page_size]`
+    """
     valid, owner, ws_page, slot = coords
     chunk = ws_page // chunk_pages
     page = (chunk * dcp_size + owner) * chunk_pages + (ws_page - chunk * chunk_pages)

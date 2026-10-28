@@ -77,3 +77,34 @@ def test_page_table_width_capped_at_max_pages_per_seq():
 )
 def test_index_pages_per_block(virtual_page, expected):
     assert ws.index_pages_per_block(virtual_page) == expected
+
+
+def test_topk_rows_past_token_end_are_masked():
+    # Two split rows hold global positions; the decode row after them holds
+    # a rank-local cache index far past the workspace, the padding row junk.
+    page_size, dcp, interleave, chunk_pages = 4, 2, 1, 2
+    topk = jnp.asarray(
+        [[0, 9, -1], [3, 1, 2], [1 << 20, 7, -1], [-5, 1 << 30, 4]], jnp.int32
+    )
+    qsl = jnp.asarray([0, 2, 3, 4], jnp.int32)
+    ws_page_offset = jnp.asarray([0, 0, 0], jnp.int32)
+    coords = ws.topk_workspace_coords(
+        topk,
+        qsl,
+        ws_page_offset,
+        jnp.int32(2),
+        page_size=page_size,
+        dcp_size=dcp,
+        interleave=interleave,
+    )
+    valid = np.asarray(coords[0])
+    np.testing.assert_array_equal(valid[:2], np.asarray(topk[:2]) >= 0)
+    assert not valid[2:].any()
+    idx = np.asarray(
+        ws.remap_topk_chunked(
+            coords, chunk_pages=chunk_pages, page_size=page_size, dcp_size=dcp
+        )
+    )
+    # Masked rows read one in-bounds dummy key and nothing else.
+    np.testing.assert_array_equal(idx[2:], [[0, -1, -1], [0, -1, -1]])
+    assert idx[:2].max() < 2 * chunk_pages * dcp * page_size

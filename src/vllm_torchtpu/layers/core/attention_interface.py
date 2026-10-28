@@ -1448,6 +1448,7 @@ def sparse_mla_attention_pcp_prefill(
                 topk_idx,
                 qsl_,
                 ws_page_offset_,
+                qsl_[rd_[2]],
                 page_size=nope_spec.page_size,
                 dcp_size=dcp_size,
                 interleave=interleave_size,
@@ -1460,14 +1461,13 @@ def sparse_mla_attention_pcp_prefill(
             )
 
             # Gather only the chunks in use, then attend once (no merge).
+            # Workspace pages: [chunk, dcp, chunk_pages]
             num_ws_chunks = ws_req_.shape[0] // chunk_pages
             rows_per_chunk = dcp_size * chunk_pages
             ws_rows = num_ws_chunks * rows_per_chunk
 
             def gather_body(c, bufs):
                 buf_nope, buf_rope = bufs
-                # `ws_req` is padded to a multiple of `chunk_pages`, so this
-                # slice never runs off the end (dynamic_slice would shift it).
                 chunk_ids = jax.lax.dynamic_slice_in_dim(
                     pages, c * chunk_pages, chunk_pages
                 )
