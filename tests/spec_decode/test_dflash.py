@@ -1006,3 +1006,22 @@ def test_compiled_input_builders_compile_no_program_per_request_count(device, bu
     assert programs() == before, (
         f"{builder} builder compiled a program per request count"
     )
+
+
+@pytest.mark.parametrize(
+    "chunks,error",
+    [
+        ([], "^Draft context update requires captured prefill chunks\\.$"),
+        (
+            [SimpleNamespace(aux_hidden_states=None)],
+            "^Draft context update requires target aux hidden states\\.$",
+        ),
+    ],
+)
+def test_context_only_prefill_requires_captured_aux_states(chunks, error):
+    proposer = _make_proposer(draft_tp=8, target_tp=8)
+    proposer.draft_chunks = chunks
+    proposer._update_draft_kv_cache_from_target = mock.Mock()
+    with pytest.raises(RuntimeError, match=error):
+        proposer.update_context()
+    proposer._update_draft_kv_cache_from_target.assert_not_called()
