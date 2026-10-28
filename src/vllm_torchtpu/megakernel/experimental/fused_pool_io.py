@@ -81,7 +81,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from ..exec_spec import ExecSpec
 from ..fused_io_hook import FusedPoolIO, register_fused_io
-from ..ops import BF16, F32, FP8, I32, U32, bswitch, rnd, rup
+from ..ops import BF16, F32, FP8, I32, U32, bswitch, gdn_gate_act, rnd, rup
 from ..pool.checks import safe_kv_page, safe_page_base
 from ..pool.config import POOL_STATE_NAME, cache_exec
 from ..pool.layout import LANES
@@ -203,12 +203,10 @@ def gqa_fused_init_buffers(ctx: Any) -> None:
             )
         else:
             same_s = oks_s[0]
-            any_ok = oks_s[0]
             for t in range(1, T):
                 same_s = jnp.logical_and(
                     same_s, jnp.logical_and(oks_s[t], kps_s[t] == kp0_s)
                 )
-                any_ok = jnp.logical_or(any_ok, oks_s[t])
             alias_prev = jnp.bool_(False)
             for sp in range(s):
                 for tp in range(T):
@@ -223,7 +221,7 @@ def gqa_fused_init_buffers(ctx: Any) -> None:
                 jnp.logical_and(act_list[s], same_s), jnp.logical_not(alias_prev)
             )
             scr["kv_mode"][s] = jnp.where(
-                jnp.logical_and(act_list[s], any_ok),
+                act_list[s],
                 jnp.where(do_fast, jnp.int32(1), jnp.int32(2)),
                 jnp.int32(0),
             )
@@ -917,7 +915,8 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
                         )
                         val = (gnw[None, :] * val.astype(BF16)).astype(F32)
                         zz = ybuf[b, QKV : QKV + Z].reshape(vh, VD)
-                        scr["mix"][b, :Z] = rnd(val * jax.nn.silu(zz)).reshape(Z)
+                        g_act = gdn_gate_act(gp.gate)
+                        scr["mix"][b, :Z] = rnd(val * g_act(zz)).reshape(Z)
 
                         if interpret:
                             u32_out = pltpu.bitcast(s_bf16.reshape(vh * KD, VD), U32)

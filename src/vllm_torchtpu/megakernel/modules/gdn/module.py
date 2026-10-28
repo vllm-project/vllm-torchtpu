@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+from collections.abc import Mapping
 from typing import Any, ClassVar
 
 import jax
@@ -36,12 +38,16 @@ from ...spec import SmallField, StateDecl, WeightDecl
 from .conv import conv_step, gdn_in
 from .decls import (
     GDN_FIELD_ALIASES,
+    GDN_GATE_ACTS,
     GDN_GEOMETRY_FIELDS,
     GDN_GEOMETRY_METHODS,
+    GDN_OPTIONS,
     GDN_PARAM_NAMES,
     gdn_cache_decl,
     gdn_hf_params,
     resolve_gdn_binding,
+    validate_gdn_gate,
+    validate_gdn_options,
 )
 from .params import (
     GDNLinInLayout,
@@ -74,7 +80,7 @@ class GDNModule(Module):
     PARAM_NAMES = GDN_PARAM_NAMES
     GEOMETRY_FIELDS = GDN_GEOMETRY_FIELDS
     FIELD_ALIASES = GDN_FIELD_ALIASES
-    OPTIONS: ClassVar[dict[str, Any]] = {}
+    OPTIONS: ClassVar[dict[str, Any]] = GDN_OPTIONS
     GEOMETRY_METHODS = GDN_GEOMETRY_METHODS
 
     def __init__(
@@ -82,17 +88,60 @@ class GDNModule(Module):
         *,
         geometry: Any = None,
         prefix: str = "linear_attn",
+        gate: str | None = None,
     ) -> None:
         self.geometry = geometry
         self.prefix = prefix
-        self.options = FrozenDict()
+        self._explicit_gate = None if gate is None else validate_gdn_gate(gate)
+        g_gate = getattr(geometry, "gdn_gate", getattr(geometry, "gate", None))
+        self.gate = (
+            self._explicit_gate
+            if self._explicit_gate is not None
+            else (validate_gdn_gate(g_gate) if g_gate is not None else "silu")
+        )
+        opts: dict[str, Any] = {}
+        if self._explicit_gate is not None or g_gate is not None:
+            opts["gate"] = self.gate
+        self.options = FrozenDict(opts)
+
+    @classmethod
+    def _validate_options(cls, options: Mapping[str, Any]) -> None:
+        validate_gdn_options(options)
+
+    @classmethod
+    def bind(cls, prefix: str = "", **hf_fields_or_options: Any) -> ModuleBinding:
+        kw = dict(hf_fields_or_options)
+        for k in ("gate", "gdn_gate"):
+            if k in kw and isinstance(kw[k], str) and kw[k] in GDN_GATE_ACTS:
+                gate_lit = kw.pop(k)
+                b = super().bind(prefix, **kw)
+                return dataclasses.replace(
+                    b,
+                    fields={**b.fields, "gate": ("gdn_gate", gate_lit)},
+                    options={**b.options, "gate": gate_lit},
+                )
+        return super().bind(prefix, **kw)
+
+    def _effective_gate(self, g: Any = None) -> str:
+        if self._explicit_gate is not None:
+            return self._explicit_gate
+        geom = g if g is not None else self.geometry
+        g_gate = getattr(geom, "gdn_gate", getattr(geom, "gate", None))
+        return validate_gdn_gate(g_gate) if g_gate is not None else self.gate
 
     @classmethod
     def _resolve_binding(
         cls, binding: ModuleBinding, hf_config: Any
     ) -> ResolvedModuleGeometry:
+        eff_b = binding
+        opt_gate = binding.options.get("gate")
+        if opt_gate is not None and binding.fields.get("gate") == ("gdn_gate", "silu"):
+            eff_b = dataclasses.replace(
+                binding,
+                fields={**binding.fields, "gate": ("gdn_gate", opt_gate)},
+            )
         return resolve_gdn_binding(
-            cls, binding, super()._resolve_binding(binding, hf_config)
+            cls, eff_b, super()._resolve_binding(eff_b, hf_config)
         )
 
     @classmethod
@@ -226,7 +275,9 @@ class GDNModule(Module):
         return {"acc": lay.NLI, "ybuf": lay.NLI, "xb2": lay.Z, "mix": lay.Z}
 
     def plan_params(self, g: Any, ex: ExecSpec, plan: Any) -> GDNParams:
-        return derive_params(g, ex, plan, self.tunables(ex), self.name)
+        return derive_params(
+            g, ex, plan, self.tunables(ex), self.name, gate=self._effective_gate(g)
+        )
 
     def scratch(self, g: Any, ex: ExecSpec, plan: Any) -> dict[str, Any]:
         gp: GDNParams = plan.module_params[self.name]
@@ -390,4 +441,6 @@ class GDNModule(Module):
         assert state is not None, (
             "GDNModule.reference requires `state` with 'conv'/'rec'"
         )
-        return gdn_reference(params, x, state, g=self._require_geometry(g), **kw)
+        geom = self._require_geometry(g)
+        kw.setdefault("gate", self._effective_gate(geom))
+        return gdn_reference(params, x, state, g=geom, **kw)

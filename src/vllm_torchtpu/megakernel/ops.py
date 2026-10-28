@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import contextlib
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -26,6 +27,21 @@ F32 = jnp.float32
 I32 = jnp.int32
 U32 = jnp.uint32
 FP8 = jnp.float8_e4m3fn
+
+GDN_GATE_ACTS: frozenset[str] = frozenset({"silu", "sigmoid"})
+
+
+def validate_gdn_gate(gate: Any, err_cls: type[Exception] = ValueError) -> str:
+    """Validate GDN gated-norm activation name (`'silu' | 'sigmoid'`)."""
+    if not isinstance(gate, str) or gate not in GDN_GATE_ACTS:
+        raise err_cls(f"GDNModule gate must be 'silu' or 'sigmoid', got {gate!r}")
+    return gate
+
+
+def gdn_gate_act(gate: str, err_cls: type[Exception] = ValueError):
+    """Return the activation callable (`jax.nn.silu` or `jax.nn.sigmoid`) for `gate`."""
+    validate_gdn_gate(gate, err_cls)
+    return jax.nn.silu if gate == "silu" else jax.nn.sigmoid
 
 
 def rup(n: int, k: int) -> int:

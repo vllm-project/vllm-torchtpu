@@ -20,14 +20,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from .decls import (
-    REQUIRED,
-    FrozenDict,
-    _resolve_field_spec,
-)
+from .decls import REQUIRED, FrozenDict, _resolve_field_spec
 from .errors import MegakernelConfigError
 from .exec_spec import MAX_BATCH_ROWS, ExecSpec
 from .modules.gdn import GDNModule
+from .ops import validate_gdn_gate
 from .pool.config import cache_exec, resolved_max_pages_per_seq
 from .spec import ModelSpec
 
@@ -35,15 +32,16 @@ if TYPE_CHECKING:
     from .model_def import ModelDef
 
 _KNOWN_FROM_HF_KEYS = frozenset(
-    {
+    (
         "hidden",
         "layers",
         "vocab",
         "eps",
         "gdn_l2_eps",
+        "gdn_gate",
         "rope_theta",
         "rope_partial",
-    }
+    )
 )
 
 
@@ -162,6 +160,7 @@ _GEOM_FIELD_NAMES = (
     "gdn_l2_eps",
     "theta",
     "zero_centered_norm",
+    "gdn_gate",
 )
 
 
@@ -190,14 +189,17 @@ class ModelGeometry:
     gdn_l2_eps: float = 1e-6
     theta: float = 10_000.0
     zero_centered_norm: bool = False
+    gdn_gate: str = "silu"
 
     def _tuple_key(self) -> tuple[Any, ...]:
         return tuple(getattr(self, f) for f in _GEOM_FIELD_NAMES)
 
     def __eq__(self, other: object) -> Any:
-        if isinstance(other, ModelGeometry):
-            return self._tuple_key() == other._tuple_key()
-        return NotImplemented
+        return (
+            self._tuple_key() == other._tuple_key()
+            if isinstance(other, ModelGeometry)
+            else NotImplemented
+        )
 
     def __hash__(self) -> int:
         return hash(self._tuple_key())
@@ -307,6 +309,7 @@ class ModelGeometry:
             if n % 128 != 0:
                 raise MegakernelConfigError(f"Dimension {n} must be a multiple of 128")
         if self.NGDN > 0:
+            validate_gdn_gate(self.gdn_gate, MegakernelConfigError)
             if not (self.KH % R == 0 and self.VH % R == 0 and self.VH % self.KH == 0):
                 raise MegakernelConfigError(
                     f"Invalid GDN heads KH={self.KH}, VH={self.VH}, R={R}"
@@ -376,24 +379,17 @@ class ModelGeometry:
             IS=max(128 * R, min(self.IS, 512)),
             e_slots=e_slots,
         )
-        mdef = getattr(self, "_model_def", None)
-        if mdef is not None:
+        if (mdef := getattr(self, "_model_def", None)) is not None:
             object.__setattr__(shrunk, "_model_def", mdef)
         return shrunk
 
     def to_model_spec(self) -> ModelSpec:
         """Convert this geometry into its declarative `ModelSpec`."""
-        mdef = getattr(self, "_model_def", None)
-        if mdef is not None:
+        if (mdef := getattr(self, "_model_def", None)) is not None:
             return mdef.to_model_spec(self)
         raise MegakernelConfigError(
             "ModelGeometry is not bound to a ModelDef; call ModelDef.to_model_spec(g)"
         )
 
 
-__all__ = [
-    "FromHF",
-    "LMHead",
-    "ModelGeometry",
-    "_BoundFromHF",
-]
+__all__ = ["FromHF", "LMHead", "ModelGeometry", "_BoundFromHF"]

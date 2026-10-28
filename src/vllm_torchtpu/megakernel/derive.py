@@ -39,17 +39,12 @@ from .validate import describe_binding, model_label, validate_norms
 
 def _merged_cfg(hf_config: Any, extras: Mapping[str, Any]) -> dict[str, Any]:
     base: dict[str, Any] = {}
-    tc = _sub_cfg(hf_config, "text_config")
-    for src in (hf_config, tc):
+    for src in (hf_config, _sub_cfg(hf_config, "text_config")):
         if isinstance(src, Mapping):
             base.update(src)
         elif src is not None:
             base.update(
-                {
-                    k: v
-                    for k, v in vars(src).items()
-                    if not k.startswith("_") and v is not None
-                }
+                {k: v for k, v in vars(src).items() if k[:1] != "_" and v is not None}
             )
     for k, v in extras.items():
         if _lookup_raw_key(hf_config, k) is REQUIRED and v is not None:
@@ -58,7 +53,7 @@ def _merged_cfg(hf_config: Any, extras: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def instantiate_spec_module(
-    m: ModuleOrBinding, *, pool_layout: PoolLayout | None = None
+    m: ModuleOrBinding, *, pool_layout: PoolLayout | None = None, g: Any = None
 ) -> Module:
     """Instantiate a `ModelSpec` `Module` from a `ModuleBinding` or return `m`."""
     if isinstance(m, Module):
@@ -66,6 +61,10 @@ def instantiate_spec_module(
     opts = {k: v for k, v in m.options.items() if v is not None}
     if issubclass(m.module_cls, GQAModule):
         return m.module_cls(pool_layout=pool_layout, prefix=m.prefix, **opts)
+    if issubclass(m.module_cls, GDNModule) and (
+        getattr(g, "gdn_gate", "silu") != "silu" or "gate" in opts
+    ):
+        opts["gate"] = str(getattr(g, "gdn_gate", opts["gate"]))
     return m.module_cls(prefix=m.prefix, **opts)
 
 
@@ -78,11 +77,11 @@ def derive_model_geometry(
 ) -> ModelGeometry:
     """Derive hybrid GQA/GDN + MoE `ModelGeometry` from `cls` and `hf_config`."""
     if isinstance(hf_config, ModelGeometry):
-        rep: dict[str, Any] = {}
-        if moe_tp is not None:
-            rep["moe_tp"] = bool(moe_tp)
-        if e_slots is not None:
-            rep["e_slots"] = int(e_slots)
+        rep = {
+            k: fn(v)
+            for k, v, fn in (("moe_tp", moe_tp, bool), ("e_slots", e_slots, int))
+            if v is not None
+        }
         g = dataclasses.replace(hf_config, **rep)
         object.__setattr__(g, "_model_def", cls)
         return g
@@ -104,6 +103,7 @@ def derive_model_geometry(
             "rms_norm_eps": eps,
             "rope_theta": top.get("rope_theta"),
             "partial_rotary_factor": top.get("rope_partial"),
+            "gdn_gate": top.get("gdn_gate"),
         },
     )
     for rope_key in ("rope_parameters", "rope_scaling"):
@@ -133,12 +133,13 @@ def derive_model_geometry(
     gdn_b = cls._find_binding(GDNModule, sched)
     if gdn_b is not None:
         gdn_g = gdn_b.resolve(merged)
-        KH, VH = int(gdn_g.KH), int(gdn_g.VH)
-        KD, VD = int(gdn_g.KD), int(gdn_g.VD)
+        KH, VH, KD, VD = int(gdn_g.KH), int(gdn_g.VH), int(gdn_g.KD), int(gdn_g.VD)
         if "gdn_l2_eps" in gdn_b.explicit_fields or "gdn_l2_eps" not in top:
             gdn_l2_eps = float(gdn_g.gdn_l2_eps)
+        gdn_gate = str(gdn_g.gate)
     else:
         KH = VH = KD = VD = 0
+        gdn_gate = str(top.get("gdn_gate", "silu"))
 
     moe_b = cls._find_binding(MoEModule, sched)
     if moe_b is None:
@@ -182,6 +183,7 @@ def derive_model_geometry(
         gdn_l2_eps=gdn_l2_eps,
         theta=theta,
         zero_centered_norm=zc,
+        gdn_gate=gdn_gate,
     )
     object.__setattr__(g, "_model_def", cls)
     return g
@@ -266,7 +268,7 @@ def derive_model_spec(
         mod = (
             gdn_module
             if gdn_module is not None and issubclass(_module_cls_of(b), GDNModule)
-            else instantiate_spec_module(b, pool_layout=play)
+            else instantiate_spec_module(b, pool_layout=play, g=g)
         )
         if branches and branches[-1].name == mod.name:
             counts[-1] += 1
@@ -315,9 +317,7 @@ def resolve_model_schedule(cls: Any, hf_config_or_geom: Any = None) -> ResolvedS
     """Resolve per-layer schedule for `hf_config_or_geom`."""
     mname = model_label(cls)
     if not isinstance(cls.schedule, Schedule):
-        raise MegakernelConfigError(
-            f"ModelDef {mname!r}: `schedule` must be a Schedule"
-        )
+        raise MegakernelConfigError(f"ModelDef {mname!r}: `schedule` must be Schedule")
     if isinstance(hf_config_or_geom, ModelGeometry):
         g = hf_config_or_geom
         synth = _synth_layer_types(cls, g)
@@ -339,6 +339,8 @@ def hf_config_for_geometry(
                 updates[hf_k] = int(g.L)
             elif k == "hidden":
                 updates[hf_k] = int(g.H)
+            elif k == "gdn_gate":
+                updates[hf_k] = str(g.gdn_gate)
             elif k == "vocab" and max_vocab is not None:
                 v_sz = int(getattr(g, "V", out.get(hf_k, max_vocab)))
                 updates[hf_k] = min(v_sz, int(max_vocab))
@@ -350,16 +352,18 @@ def hf_config_for_geometry(
         "k_dim": int(g.KD),
         "v_dim": int(g.VD),
     }
-    moe_m = {
-        "experts": int(g.E),
-        "top_k": int(g.TOPK),
-        "inter": int(g.I),
-        "shared_inter": int(g.IS),
-    }
+    gdn_b = cls._find_binding(GDNModule, sched)
+    if gdn_b and (
+        "gate" in gdn_b.explicit_fields
+        or gdn_b.options.get("gate")
+        or g.gdn_gate != "silu"
+    ):
+        gdn_m["gate"] = str(g.gdn_gate)
+    moe_m = {"experts": g.E, "top_k": g.TOPK, "inter": g.I, "shared_inter": g.IS}
     for b, mapping in (
         (cls._find_binding(GQAModule, sched), gqa_m),
-        (cls._find_binding(GDNModule, sched), gdn_m),
-        (cls._find_binding(MoEModule, sched), moe_m),
+        (gdn_b, gdn_m),
+        (cls._find_binding(MoEModule, sched), {k: int(v) for k, v in moe_m.items()}),
     ):
         if b is not None:
             for canon, val in mapping.items():

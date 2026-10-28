@@ -22,8 +22,9 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec
-from ...ops import BF16, F32, rnd, rup
+from ...ops import BF16, F32, gdn_gate_act, rnd, rup, validate_gdn_gate
 from .params import gdn_lin_in_layout
 
 
@@ -39,6 +40,7 @@ def gdn_reference(
     multi_layer: bool = True,
     packed_conv: bool = False,
     flat_rec: bool = False,
+    gate: str | None = None,
 ) -> tuple[jax.Array, dict[str, Any]]:
     """Pure-JAX multi-rank GDN forward for one linear-attention layer (`gdn_idx`).
 
@@ -64,6 +66,13 @@ def gdn_reference(
     expand = vh // kh
     eps = float(getattr(g, "eps", 1e-6))
     l2_eps = float(getattr(g, "gdn_l2_eps", 1e-6))
+    eff_gate = validate_gdn_gate(
+        gate
+        if gate is not None
+        else getattr(g, "gdn_gate", getattr(g, "gate", "silu")),
+        MegakernelConfigError,
+    )
+    g_act = gdn_gate_act(eff_gate)
     xb = x[:B].astype(BF16).astype(F32)
 
     def _slice_sm(arr: Any) -> Any:
@@ -194,7 +203,7 @@ def gdn_reference(
             )
             val = (gnw[None, :] * val.astype(BF16)).astype(F32)
             zz = ybuf[b, QKV : QKV + Z].reshape(vh, VD)
-            mix_r.append(rnd(val * jax.nn.silu(zz)).reshape(Z))
+            mix_r.append(rnd(val * g_act(zz)).reshape(Z))
 
         rec_cat = jnp.concatenate(rec_r_list, axis=0)
         if has_multi_out:

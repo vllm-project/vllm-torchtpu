@@ -20,7 +20,7 @@ from typing import Any, ClassVar
 
 from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec, NumericsClass
-from ...ops import rup
+from ...ops import rup, validate_gdn_gate
 from ...pool.config import cache_exec
 
 
@@ -86,6 +86,7 @@ class GDNParams:
     GCONV_ROWS: int = 0
     conv_stage: bool = False
     head_major: bool = False
+    gate: str = "silu"
     # Pool layout of the model's pool backend (set only for pool I/O: GPR or
     # fused); the slot geometry above and `page_base` come from it.
     pool_layout: Any = None
@@ -137,9 +138,21 @@ def gdn_lin_in_layout(g: Any, ex_or_r: ExecSpec | int) -> GDNLinInLayout:
 
 
 def derive_params(
-    g: Any, ex: ExecSpec, plan: Any, tt: GDNTunables, name: str
+    g: Any,
+    ex: ExecSpec,
+    plan: Any,
+    tt: GDNTunables,
+    name: str,
+    *,
+    gate: str | None = None,
 ) -> GDNParams:
     """`GDNParams` for geometry `g` under `ex` and the module's tunables `tt`."""
+    eff_gate = validate_gdn_gate(
+        gate
+        if gate is not None
+        else getattr(g, "gdn_gate", getattr(g, "gate", "silu")),
+        MegakernelConfigError,
+    )
     tiles = ex.resolve_tiles(g)
     R, B, T = ex.R, ex.B, ex.T
     assert not (ex.VER and tiles.inplace), (
@@ -264,6 +277,7 @@ def derive_params(
         GCONV_ROWS=GCONV_ROWS,
         conv_stage=bool(tt.conv_stage),
         head_major=bool(tt.gdn_head_major),
+        gate=eff_gate,
         pool_layout=pool_layout,
     )
 
