@@ -103,71 +103,51 @@ def _select_kernel(x_ref, w_ref, i_ref, *, topk, n, v_ref=None, normalize=False)
         i_ref[j, :] = idx.astype(jnp.int32)
         x = jnp.where(picked, NEG, x)
 
-def _normalized_select_kernel(x_ref, w_ref, i_ref, *, topk, n, v_ref=None, normalize=True):
-    """One block of rows: take the top `topk` by repeated max-and-mask."""
-    # NaN is flushed to the sentinel so every row has a maximum some
-    # column equals; an all-NaN row selects expert 0 with weight NEG.
-    x = jnp.where(jnp.isnan(x_ref[...]), NEG, x_ref[...])  # [R, n] f32
+
+def _normalized_select_kernel(x_ref, w_ref, i_ref, *, topk, n, v_ref=None):
+    """Select and normalize Top6 in the measured row-major decode layout."""
+    x = jnp.where(jnp.isnan(x_ref[...]), NEG, x_ref[...])
     v = None if v_ref is None else v_ref[...]
     iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
-    output_columns = packed_weights = pair_first = total = None
-    encoded_ids = encoded_last = None
-    if normalize:
-        # Positive normal FP32 codes preserve expert order without numeric casts.
-        encoded_ids = jax.lax.bitcast_convert_type(
-            iota | jnp.int32(0x3F800000), jnp.float32
-        )
-        encoded_last = jax.lax.bitcast_convert_type(
-            jnp.int32(0x3F800000 | (n - 1)), jnp.float32
-        )
-        packed_shape = (x.shape[0], topk)
-        output_columns = jax.lax.broadcasted_iota(jnp.int32, packed_shape, 1)
-        packed_weights = jnp.zeros(packed_shape, jnp.float32)
+    pair_first = total = None
+    # Positive normal FP32 codes preserve ID order without numeric casts.
+    encoded_ids = jax.lax.bitcast_convert_type(
+        iota | jnp.int32(0x3F800000), jnp.float32
+    )
+    encoded_last = jax.lax.bitcast_convert_type(
+        jnp.int32(0x3F800000 | (n - 1)), jnp.float32
+    )
+    packed_shape = (x.shape[0], topk)
+    output_columns = jax.lax.broadcasted_iota(jnp.int32, packed_shape, 1)
+    packed_weights = jnp.zeros(packed_shape, jnp.float32)
     for j in range(topk):
-        m = jnp.max(x, axis=1, keepdims=True)  # [R,1] rowmax
+        m = jnp.max(x, axis=1, keepdims=True)
         ismax = x == m
-        # Lowest matching column; non-matching columns fill with the last
-        # expert so every index returned is a real expert.
-        if normalize:
-            assert encoded_ids is not None and encoded_last is not None
-            idx = jnp.min(jnp.where(ismax, encoded_ids, encoded_last), axis=1)
-            picked = encoded_ids == idx[:, None]
-        else:
-            idx = jnp.min(jnp.where(ismax, iota, n - 1), axis=1)
-            picked = iota == idx[:, None]
-        # noaux selects with biased scores but emits unbiased weights.
-        # A masked sum reads the resident tile without a dynamic lane gather.
+        idx = jnp.min(jnp.where(ismax, encoded_ids, encoded_last), axis=1)
+        picked = encoded_ids == idx[:, None]
         selected_weight = (
             m[:, 0] if v is None else jnp.sum(jnp.where(picked, v, 0.0), axis=1)
         )
-        if normalize:
-            assert output_columns is not None and packed_weights is not None
-            packed_weights = jnp.where(
-                output_columns == j, selected_weight[:, None], packed_weights
-            )
-            if j % 2 == 0:
-                pair_first = selected_weight
+        packed_weights = jnp.where(
+            output_columns == j, selected_weight[:, None], packed_weights
+        )
+        if j % 2 == 0:
+            pair_first = selected_weight
+        else:
+            assert pair_first is not None
+            pair_sum = pair_first + selected_weight
+            if j == 1:
+                total = pair_sum
             else:
-                assert pair_first is not None
-                pair_sum = pair_first + selected_weight
-                if j == 1:
-                    total = pair_sum
-                else:
-                    assert total is not None
-                    total = total + pair_sum
-        else:
-            w_ref[:, j] = selected_weight
-        if normalize:
-            i_ref[:, j] = jax.lax.bitcast_convert_type(idx, jnp.int32) & jnp.int32(
-                0x007FFFFF
-            )
-        else:
-            i_ref[:, j] = idx.astype(jnp.int32)
+                assert total is not None
+                total = total + pair_sum
+        i_ref[:, j] = jax.lax.bitcast_convert_type(idx, jnp.int32) & jnp.int32(
+            0x007FFFFF
+        )
         x = jnp.where(picked, NEG, x)
-    if normalize:
-        assert packed_weights is not None and total is not None
-        # Keep ((w0+w1)+(w2+w3))+(w4+w5), then write all six columns together.
-        w_ref[...] = packed_weights / jnp.maximum(total, 1e-20)[:, None]
+    assert total is not None
+    # Preserve the measured pairwise sum and write all six columns together.
+    w_ref[...] = packed_weights / jnp.maximum(total, 1e-20)[:, None]
 
 
 def _select_kernel_split(x_ref, v_ref, w_ref, i_ref, *, topk, n, normalize=False):
