@@ -154,9 +154,9 @@ class GDNConfig:
         #   so scale B^2 inversely with head_groups (head_groups * B**2 <= 16**2).
         #
         # B must divide the chunk: the intra-chunk solve walks the chunk in
-        # whole sub-blocks and `invert_triangular_matrix` drops any remainder
-        # rows, which silently truncates the chunk (e.g. 24 local value heads,
-        # Qwen3.5/3.6-27B at TP=2, gave B = 16 // 3 = 5 and 125 of 128 rows).
+        # whole sub-blocks and `invert_triangular_matrix` rejects a non-dividing
+        # B (e.g. 24 local value heads, Qwen3.5/3.6-27B at TP=2, would get
+        # B = 16 // 3 = 5, which does not divide a 128-row chunk).
         # Chunk sizes are powers of two, so pick the largest power of two
         # that satisfies the budget instead of the exact quotient.
         head_groups = pl.cdiv(self.num_v_heads, 8)

@@ -305,9 +305,9 @@ def test_tp_sharding_changes_the_physical_gdn_fit(vllm_config):
 
 
 def test_qwen3_5_27b_tp2_startup_fit(vllm_config):
-    """Qwen3.5/3.6-27B at TP=2: 16/48 linear heads shard to 8 K + 24 V heads
-    per rank. 24 heads is 3 head groups, the shape that previously derived a
-    non-dividing triangular block and failed engine startup."""
+    """Pins the Qwen3.5/3.6-27B TP=2 hybrid cache layout: 16 K / 48 V linear
+    heads shard to 8 K + 24 V local heads per rank, fitting in a 1792-token
+    cache block."""
     _configure_hybrid(vllm_config, tp_size=2)
     vllm_config.model_config.architecture = "Qwen3_5ForConditionalGeneration"
     vllm_config.model_config.hf_text_config = SimpleNamespace(
