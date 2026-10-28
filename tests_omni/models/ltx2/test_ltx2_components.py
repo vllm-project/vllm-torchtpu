@@ -59,19 +59,18 @@ from vllm_omni.diffusion.models.ltx2.ltx2_transformer import (
 from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
 from vllm_omni.platforms import current_omni_platform
 
-from tests_omni.omni_test_utils import (
-    assert_all_loaded,
-    assert_parity,
-    metrics,
-)
+from tests_omni.omni_test_utils import assert_all_loaded, assert_parity
 
 pytestmark = [pytest.mark.omni]
 
-# RoPE table bounds vs diffusers CPU, ~3% above the worst observed. Video is
-# loose because diffusers' first CPU cos call is sometimes off by up to 1.5e-4;
-# TPU otherwise matches to 6e-8.
-ROPE_MAX_ABS_ERR: dict[str, float] = {"video": 1.6e-4, "audio": 1.0e-3}
-ROPE_MAX_REL_L2: dict[str, float] = {"video": 6.9e-5, "audio": 5.3e-5}
+# TPU-built RoPE coords vs diffusers CPU: TPU fp32 division is a reciprocal
+# multiply, so timestamps divided by fps or sampling_rate land up to 1 ULP off.
+ROPE_COORDS_MAX_ABS = 1.3e-7
+# RoPE tables from identical CPU-built coords match to 1 fp32 ULP; bounds are
+# ~3% above. Fed TPU-built coords instead, a 1-ULP coord change can move a
+# ~1.4e4 rad angle to the next fp32 value (2^-10 apart).
+ROPE_MAX_ABS_ERR = 6.2e-8
+ROPE_MAX_REL_L2 = 3.6e-8
 
 # (TPU fp32, TPU bf16) rel_l2 bounds vs diffusers CPU fp32, ~3% above the
 # observed values. Both sides are deterministic across hosts; a CPU bf16
@@ -135,6 +134,15 @@ ROPE_SHARED_KWARGS: dict[str, object] = {
 }
 
 
+def _ref_rope_tables(
+    ref_rope: RefLTX2RotaryPosEmbed, coords: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # diffusers' first CPU call in a process can return a cos table up to
+    # 1.5e-4 off from later calls with the same input; use a later one.
+    ref_rope(coords)
+    return ref_rope(coords)
+
+
 def _assert_rope_parity(
     kind: str,
     tpu_out: tuple[torch.Tensor, torch.Tensor],
@@ -150,20 +158,16 @@ def _assert_rope_parity(
     assert tpu_cos.shape == expected_shape
     assert tpu_sin.shape == expected_shape
 
-    vs_f64 = {
-        "cos": metrics(tpu_cos, ref_cos),
-        "sin": metrics(tpu_sin, ref_sin),
-    }
     for name, tpu_tbl, ref_tbl in (
         ("cos", tpu_cos, ref_cos),
         ("sin", tpu_sin, ref_sin),
     ):
-        assert vs_f64[name]["rel_l2"] <= ROPE_MAX_REL_L2[kind], vs_f64[name]
-        torch.testing.assert_close(
-            tpu_tbl.cpu().double(),
-            ref_tbl.double(),
-            atol=ROPE_MAX_ABS_ERR[kind],
-            rtol=0,
+        assert_parity(
+            tpu_tbl,
+            ref_tbl,
+            name=f"{kind} RoPE {name}",
+            max_rel_l2=ROPE_MAX_REL_L2,
+            max_abs=ROPE_MAX_ABS_ERR,
         )
 
 
@@ -198,10 +202,12 @@ def test_ltx2_video_rope_on_tpu_matches_diffusers() -> None:
         fps=24.0,
     )
     assert tpu_coords.shape == (1, 3, 1536, 2)
-    torch.testing.assert_close(tpu_coords.cpu(), cpu_coords, rtol=0, atol=1e-6)
+    assert_parity(
+        tpu_coords, cpu_coords, name="video coords", max_abs=ROPE_COORDS_MAX_ABS
+    )
 
-    tpu_out = omni_rope(tpu_coords)
-    ref_out = ref_rope(cpu_coords)
+    tpu_out = omni_rope(cpu_coords.to("tpu"))
+    ref_out = _ref_rope_tables(ref_rope, cpu_coords)
 
     _assert_rope_parity(
         kind="video",
@@ -232,10 +238,12 @@ def test_ltx2_audio_rope_on_tpu_matches_diffusers() -> None:
         batch_size=1, num_frames=26, device=torch.device("cpu")
     )
     assert tpu_coords.shape == (1, 1, 26, 2)
-    torch.testing.assert_close(tpu_coords.cpu(), cpu_coords, rtol=0, atol=1e-6)
+    assert_parity(
+        tpu_coords, cpu_coords, name="audio coords", max_abs=ROPE_COORDS_MAX_ABS
+    )
 
-    tpu_out = omni_rope(tpu_coords)
-    ref_out = ref_rope(cpu_coords)
+    tpu_out = omni_rope(cpu_coords.to("tpu"))
+    ref_out = _ref_rope_tables(ref_rope, cpu_coords)
 
     _assert_rope_parity(
         kind="audio",
