@@ -104,6 +104,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QWEN4_FUSED_PREP_CHECK: str = ""
     VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
     VLLM_TPU_QSA_PREFIX_SLICE: bool = False
+    VLLM_TPU_QSA_INDEXER_UPDATE_SHIFT: bool = False
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
     VLLM_TPU_QSA_PREFILL_LEAN: bool = False
@@ -612,6 +613,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Mixed QSA steps: move the decode prefix off the prefill rows with contiguous dynamic
     # slices instead of row gathers (same values; prefill chunks spent ~3 ms/8K on the gathers).
     "VLLM_TPU_QSA_PREFIX_SLICE": env_bool("VLLM_TPU_QSA_PREFIX_SLICE", default=False),
+    # QSA indexer cache updates: build each token's compression-group members from static
+    # shifts and the ring / tag rows from a one-hot product instead of per-token row gathers
+    # (same values; ~3 ms of gathers per 8K prefill chunk).
+    "VLLM_TPU_QSA_INDEXER_UPDATE_SHIFT": env_bool(
+        "VLLM_TPU_QSA_INDEXER_UPDATE_SHIFT", default=False
+    ),
     # Qwen4-exp QSA decode/verify attention: present every head slot of the
     # main KV row (zero queries for the other layer's head) so all QSA layers
     # share one decode kernel configuration and XLA computes the decode
