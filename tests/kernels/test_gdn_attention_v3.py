@@ -363,11 +363,13 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
                     else:
                         self.assertEqual(got, expected, msg=label)
 
-    def _gdn_config(self, n_v, chunk_size, attention_mode=config.AttentionMode.GDN):
+    def _gdn_config(self, n_v, chunk_size, attention_mode=None, cfg_mod=config):
+        if attention_mode is None:
+            attention_mode = cfg_mod.AttentionMode.GDN
         n_kq = max(1, n_v // 4)
-        return config.GDNConfig(
-            mode=config.GDNMode.PER_SEQ,
-            dtypes=config.Dtypes(
+        return cfg_mod.GDNConfig(
+            mode=cfg_mod.GDNMode.PER_SEQ,
+            dtypes=cfg_mod.Dtypes(
                 act_in=jnp.dtype(jnp.bfloat16),
                 act_out=jnp.dtype(jnp.bfloat16),
                 compute=jnp.dtype(jnp.float32),
@@ -389,39 +391,153 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
         """B is a power of two dividing every mixed tile size, for any head count.
 
         Regression for Qwen3.5/3.6-27B at TP=2 (24 local value heads): the
-        exact quotient 16 // 3 = 5 does not divide 128, truncating the
-        intra-chunk inverse to 125 rows and failing startup with
+        exact quotient 16 // 3 = 5 does not divide 128 (or PCP's 64), truncating
+        the intra-chunk inverse and failing startup with
         "array split does not result in an equal division: rest is 1".
+        Covers both `kernels/gdn/v3` and its `kernels/experimental/gdn_pcp_fused`
+        fork.
         """
+        from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
+            config as pcp_config,
+        )
+
         expected_gdn = {8: 16, 16: 8, 24: 4, 32: 4, 40: 2, 48: 2, 64: 2}
-        for n_v in (1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64, 96, 128):
-            for attention_mode in config.AttentionMode:
-                for chunk_size in tiling.MIXED_TILE_SIZES:
-                    with self.subTest(
-                        n_v=n_v, mode=attention_mode, chunk_size=chunk_size
-                    ):
-                        cfg = self._gdn_config(n_v, chunk_size, attention_mode)
-                        b = cfg.triangular_block_size
-                        self.assertGreaterEqual(b, 2)
-                        self.assertEqual(b & (b - 1), 0, f"B={b} not a power of 2")
-                        effective = min(b, cfg.chunk_size)
-                        self.assertEqual(cfg.chunk_size % effective, 0)
-            if n_v in expected_gdn:
-                cfg = self._gdn_config(n_v, 128)
-                self.assertEqual(cfg.triangular_block_size, expected_gdn[n_v], n_v)
+        for fork_name, cfg_mod in (("v3", config), ("gdn_pcp_fused", pcp_config)):
+            for n_v in (1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64, 96, 128):
+                for attention_mode in cfg_mod.AttentionMode:
+                    for chunk_size in tiling.MIXED_TILE_SIZES:
+                        with self.subTest(
+                            fork=fork_name,
+                            n_v=n_v,
+                            mode=attention_mode,
+                            chunk_size=chunk_size,
+                        ):
+                            cfg = self._gdn_config(
+                                n_v, chunk_size, attention_mode, cfg_mod=cfg_mod
+                            )
+                            b = cfg.triangular_block_size
+                            self.assertGreaterEqual(b, 2)
+                            self.assertEqual(b & (b - 1), 0, f"B={b} not a power of 2")
+                            effective = min(b, cfg.chunk_size)
+                            self.assertEqual(cfg.chunk_size % effective, 0)
+                if n_v in expected_gdn:
+                    cfg = self._gdn_config(n_v, 128, cfg_mod=cfg_mod)
+                    self.assertEqual(
+                        cfg.triangular_block_size,
+                        expected_gdn[n_v],
+                        (fork_name, n_v),
+                    )
 
     def test_invert_triangular_matrix_rejects_non_dividing_block(self):
         """Negative control: a block size that does not divide the chunk
         fails at the solve instead of returning a truncated inverse."""
+        from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
+            compute_gdn as pcp_compute_gdn,
+        )
         from vllm_torchtpu.kernels.gdn.v3 import compute_gdn
 
         t = jnp.tril(jnp.ones((2, 128, 128), dtype=jnp.float32))
-        with self.assertRaisesRegex(AssertionError, "divisible"):
-            compute_gdn.invert_triangular_matrix(t, block_size=5)
-        # Divisors still work and the inverse keeps the full chunk.
-        for block_size in (16, 8, 4, 2):
-            inv = compute_gdn.invert_triangular_matrix(t, block_size=block_size)
-            self.assertEqual(inv.shape, t.shape)
+        for fork_name, mod in (
+            ("v3", compute_gdn),
+            ("gdn_pcp_fused", pcp_compute_gdn),
+        ):
+            with self.subTest(fork=fork_name):
+                with self.assertRaisesRegex(AssertionError, "divisible"):
+                    mod.invert_triangular_matrix(t, block_size=5)
+                # Divisors still work and the inverse keeps the full chunk.
+                for block_size in (16, 8, 4, 2):
+                    inv = mod.invert_triangular_matrix(t, block_size=block_size)
+                    self.assertEqual(inv.shape, t.shape)
+
+    def test_mixed_tile_clip_rounds_down_to_power_of_two(self):
+        """Small non-power-of-two token buckets round mixed_tile_size down to a
+        power of two so triangular_block_size divides the chunk on static/KDA
+        paths and under explicit overrides."""
+        mesh = AbstractMesh(
+            (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
+        )
+        d_k, d_v, kernel_size = 128, 128, 4
+        n_kq, n_v = 2, 8
+        dim = 2 * n_kq * d_k + n_v * d_v
+
+        with use_abstract_mesh(mesh):
+            limit = config.GDNConfig.get_vmem_limit_bytes(1)
+            _, mixed_override = tiling.get_tile_sizes(
+                batch_size=24,
+                num_seqs=1,
+                padded_batch_size=24,
+                n_kq=n_kq,
+                n_v=n_v,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
+                conv_state_dim_size=dim,
+                act_out_dtype=jnp.dtype(jnp.bfloat16),
+                recurrent_state_dtype=jnp.dtype(jnp.float32),
+                num_lanes=128,
+                decode_vmem_limit_bytes=limit,
+                mixed_vmem_limit_bytes=limit,
+                mixed_tile_size=64,
+            )
+            self.assertEqual(mixed_override, 16)
+
+            seen_cfgs = []
+
+            def _fake_pallas_call(kernel_fn, *, out_shape, **_kwargs):
+                seen_cfgs.append(kernel_fn.keywords["cfg"])
+                out_spec, states_spec = out_shape
+                return lambda *_args: (
+                    jnp.zeros(out_spec.shape, dtype=out_spec.dtype),
+                    states_spec,
+                )
+
+            for batch_size, expected_chunk in (
+                (1, 1),
+                (3, 2),
+                (5, 4),
+                (12, 8),
+                (24, 16),
+                (48, 32),
+            ):
+                seen_cfgs.clear()
+
+                with (
+                    self.subTest(batch_size=batch_size),
+                    mock.patch.object(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", False),
+                    mock.patch.object(wrapper.pl, "pallas_call", _fake_pallas_call),
+                ):
+                    wrapper.fused_conv1d_gdn.__wrapped__(
+                        qkv=jnp.zeros((batch_size, dim), dtype=jnp.bfloat16),
+                        b=jnp.zeros((batch_size, n_v), dtype=jnp.bfloat16),
+                        a=jnp.zeros((batch_size, n_v), dtype=jnp.bfloat16),
+                        states=(
+                            jnp.zeros((2, kernel_size - 1, dim), dtype=jnp.float32),
+                            jnp.zeros((2, n_v, d_k, d_v), dtype=jnp.float32),
+                        ),
+                        conv_weight=jnp.zeros(
+                            (dim, 1, kernel_size), dtype=jnp.bfloat16
+                        ),
+                        conv_bias=None,
+                        a_log=jnp.zeros((n_v,), dtype=jnp.float32),
+                        dt_bias=jnp.zeros((n_v,), dtype=jnp.float32),
+                        query_start_loc=jnp.array([0, batch_size], dtype=jnp.int32),
+                        state_indices=jnp.array([1], dtype=jnp.int32),
+                        distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
+                        seq_lens=jnp.array([batch_size], dtype=jnp.int32),
+                        n_kq=n_kq,
+                        n_v=n_v,
+                        d_k=d_k,
+                        d_v=d_v,
+                        kernel_size=kernel_size,
+                        prefill_only=True,
+                    )
+                self.assertEqual(len(seen_cfgs), 1)
+                per_seq_cfg = seen_cfgs[0]
+                self.assertEqual(per_seq_cfg.chunk_size, expected_chunk)
+                effective_b = min(
+                    per_seq_cfg.triangular_block_size, per_seq_cfg.chunk_size
+                )
+                self.assertEqual(per_seq_cfg.chunk_size % effective_b, 0)
 
     def test_invert_triangular_matrix_block_sizes_agree(self):
         """Every power-of-two block size inverts the same matrix identically,
