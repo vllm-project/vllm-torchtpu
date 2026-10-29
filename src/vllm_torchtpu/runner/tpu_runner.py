@@ -512,6 +512,12 @@ def _substitute_placeholder_token(
     return input_ids
 
 
+# VLLM_TPU_SUBST_STATIC_ARGS: the input ids reaching the async substitution can
+# carry the forward's dynamic-dim stamp, so the same shape compiled a second
+# time mid-run (~10 live compiles per run, ~70 ms each); strip it.
+_substitute_placeholder_token_static = _static_shape_args(_substitute_placeholder_token)
+
+
 logger = init_logger(__name__)
 
 
@@ -2532,7 +2538,12 @@ class TPUModelRunner(GPUModelRunner):
                 padded_token_in_tpu_pre_next_tokens_indices
             ).to(self.device, non_blocking=True)
 
-        return _substitute_placeholder_token(
+        substitute = (
+            _substitute_placeholder_token_static
+            if envs.VLLM_TPU_SUBST_STATIC_ARGS
+            else _substitute_placeholder_token
+        )
+        return substitute(
             input_ids,
             cur_input_indices,
             pre_next_tokens_indices,
