@@ -299,6 +299,26 @@ def test_packed_top6_normalizes_unbiased_weights(case):
     )
     np.testing.assert_array_equal(indices, original_i)
     np.testing.assert_allclose(weights, expected, rtol=2e-6, atol=1e-6)
+    # The fused output must retain the same selection/normalization contract,
+    # including nonfinite selected weights and lowest-ID ties.
+    gate = jnp.asarray(raw, jnp.bfloat16 if case == "nonfinite" else jnp.float32)
+    fused_weights, fused_ids, valid = router_ops.select_finalize_normalized_router(
+        jnp.asarray(scores),
+        jnp.asarray(raw),
+        gate,
+        scale=2.5,
+        invalid_id=384,
+        interpret=True,
+    )
+    expected_valid = np.isfinite(np.asarray(gate).astype(np.float32)).any(
+        axis=-1, keepdims=True
+    )
+    assert valid.shape == (288, 1) and valid.dtype == jnp.bool_
+    np.testing.assert_array_equal(valid, expected_valid)
+    np.testing.assert_array_equal(fused_ids, np.where(expected_valid, original_i, 384))
+    np.testing.assert_allclose(
+        fused_weights, np.where(expected_valid, expected * 2.5, 0), rtol=2e-6, atol=1e-6
+    )
     if case == "biased":
         _, unbiased_ids = _reference(raw, raw, topk=6)
         assert not np.array_equal(indices, unbiased_ids)
@@ -379,10 +399,17 @@ def test_normalized_selector_rejects_unsupported_tiles(topk, block_rows):
 
 
 @pytest.mark.cpu_test
-@pytest.mark.parametrize("adapter_widen", [False, True])
-@pytest.mark.parametrize("near_ties", [False, True])
+@pytest.mark.parametrize(
+    "adapter_widen,near_ties,scale,mesh_ep_ranks",
+    [
+        (False, False, 1.0, None),
+        (True, False, 2.5, (0,)),
+        (False, True, 2.5, (0,)),
+        (True, True, 1.0, None),
+    ],
+)
 def test_normalized_route_stage_keeps_scaling_and_invalid_sentinels(
-    monkeypatch, adapter_widen, near_ties
+    monkeypatch, adapter_widen, near_ties, scale, mesh_ep_ranks
 ):
     """Exercise production wiring without running experts or TPU collectives."""
     import functools
@@ -400,6 +427,16 @@ def test_normalized_route_stage_keeps_scaling_and_invalid_sentinels(
         "pallas_select",
         functools.partial(router_ops.pallas_select, interpret=True),
     )
+    fused_select = Mock(
+        wraps=functools.partial(
+            router_ops.select_finalize_normalized_router, interpret=True
+        )
+    )
+    finalize = Mock(
+        wraps=functools.partial(router_ops.finalize_normalized_router, interpret=True)
+    )
+    monkeypatch.setattr(layer, "select_finalize_normalized_router", fused_select)
+    monkeypatch.setattr(layer, "finalize_normalized_router", finalize)
     # Isolate the layer's function cache from other tests and from this A/B.
     monkeypatch.setattr(layer, "_LAYER_SM_CACHE", {})
     with jax.default_device(jax.devices("cpu")[0]):
@@ -454,23 +491,59 @@ def test_normalized_route_stage_keeps_scaling_and_invalid_sentinels(
                         topk=6,
                         renormalize=True,
                         mesh=mesh,
+                        mesh_ep_ranks=mesh_ep_ranks,
                         capacity=128,
                         weight_format=host.WeightFormat.BF16,
                         scoring_fn="sqrtsoftplus",
                         score_bias=bias,
-                        routed_scaling_factor=2.5,
+                        routed_scaling_factor=scale,
                         stage="route",
                     )
                 )
             )
         assert selected_tiles and all(tile == 288 for tile in selected_tiles)
+        assert fused_select.called
+        finalize.assert_not_called()
         (old_wire, old_weights, old_payload), (wire, weights, payload) = outputs
         np.testing.assert_array_equal(wire, old_wire)
         np.testing.assert_array_equal(payload, old_payload)
         np.testing.assert_allclose(weights, old_weights, rtol=2e-6, atol=1e-6)
         np.testing.assert_array_equal(weights[:3], 0)
         np.testing.assert_array_equal(payload[0, : 3 * 6], 384)
-        np.testing.assert_allclose(weights[3:].sum(axis=-1), 2.5, rtol=2e-6)
+        np.testing.assert_allclose(weights[3:].sum(axis=-1), scale, rtol=2e-6)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("dtype,scale", [(jnp.bfloat16, 1.0), (jnp.float32, 2.5)])
+def test_finalize_masks_invalid_ids_after_mesh_permutation(dtype, scale):
+    """The sentinel must not be mapped to expert zero by an EP permutation."""
+    from vllm_torchtpu.kernels.fused_moe.v2.layer import (
+        _relabel_expert_ids_to_mesh_order,
+    )
+
+    permutation = (3, 0, 7, 1, 6, 2, 5, 4)
+    ids = (np.arange(288)[:, None] * 6 + np.arange(6)) % 384
+    gate = jnp.ones((288, 384), dtype)
+    gate = gate.at[:3].set(jnp.array([jnp.nan, -jnp.inf, jnp.inf], dtype)[:, None])
+    # A single finite expert is enough to keep a row, including the final column.
+    gate = gate.at[3].set(-jnp.inf).at[3, 383].set(0)
+    weights = jnp.full((288, 6), 1 / 6, jnp.float32)
+    remapped = _relabel_expert_ids_to_mesh_order(
+        jnp.asarray(ids, jnp.int32), g_local=48, mesh_ep_ranks=permutation
+    )
+    expected_ids = np.argsort(permutation)[ids // 48] * 48 + ids % 48
+    np.testing.assert_array_equal(remapped, expected_ids)
+    out_weights, out_ids, valid = router_ops.finalize_normalized_router(
+        gate, weights, remapped, scale=scale, invalid_id=384, interpret=True
+    )
+    expected_valid = np.ones((288, 1), dtype=bool)
+    expected_valid[:3] = False
+    assert valid.shape == (288, 1) and valid.dtype == jnp.bool_
+    np.testing.assert_array_equal(valid, expected_valid)
+    np.testing.assert_array_equal(out_ids, np.where(expected_valid, expected_ids, 384))
+    np.testing.assert_allclose(
+        out_weights, np.where(expected_valid, np.asarray(weights) * scale, 0), rtol=2e-6
+    )
 
 
 def test_packed_top6_tpu_lowering_matches_numpy():
@@ -495,6 +568,17 @@ def test_packed_top6_tpu_lowering_matches_numpy():
     )(jnp.asarray(biased), jnp.asarray(raw))
     np.testing.assert_array_equal(indices, expected_ids)
     np.testing.assert_allclose(weights, expected_weights, rtol=2e-6, atol=1e-6)
+    fused_weights, fused_ids, valid = jax.jit(
+        lambda scores, values: router_ops.select_finalize_normalized_router(
+            scores, values, values, scale=2.5, invalid_id=384
+        )
+    )(jnp.asarray(biased), jnp.asarray(raw))
+    np.testing.assert_array_equal(fused_ids, expected_ids)
+    np.testing.assert_allclose(
+        fused_weights, expected_weights * 2.5, rtol=2e-6, atol=1e-6
+    )
+    assert valid.shape == (288, 1) and valid.dtype == jnp.bool_
+    np.testing.assert_array_equal(valid, True)
 
 
 @pytest.mark.cpu_test
