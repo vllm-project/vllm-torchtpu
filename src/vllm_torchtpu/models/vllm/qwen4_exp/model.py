@@ -1145,7 +1145,10 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             envs.VLLM_TPU_PLE_HOST_PRELOOKUP
             and self.model.host_ple_index is not None
             and inputs_embeds is None
+            and kwargs.get("ple_raw_embeddings") is None
         ):
+            # A megakernel driver that looked the rows up for this step and
+            # then fell back to stock left them in kwargs: reuse them.
             kwargs["ple_raw_embeddings"] = self._ple_prelookup(input_ids, kwargs)
         # The route reads the padded bucket size outside both compiled graphs.
         if self.model_sp is None:
