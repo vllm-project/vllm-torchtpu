@@ -22,6 +22,11 @@ if [ -z "${NEW_LKG_HASH}" ]; then
 fi
 
 TARGET_BRANCH="${TARGET_BRANCH:-main}"
+CURRENT_BRANCH="${BUILDKITE_BRANCH:-}"
+if [ -n "${CURRENT_BRANCH}" ] && [ "${CURRENT_BRANCH}" != "${TARGET_BRANCH}" ]; then
+  echo "Skipping LKG update: current branch '${CURRENT_BRANCH}' is not target '${TARGET_BRANCH}'."
+  exit 0
+fi
 MAX_ATTEMPTS=3
 LKG_PROMOTE_ENABLED="${LKG_PROMOTE_ENABLED:-false}"
 
