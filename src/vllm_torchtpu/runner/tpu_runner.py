@@ -11,7 +11,7 @@ import dataclasses
 import math
 import os
 import time
-from collections.abc import Callable, Collection, Iterator
+from collections.abc import Callable, Collection, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
@@ -119,6 +119,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.model_loader_patches import runai_metadata_cache
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.swa_cache import num_physical_blocks
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
@@ -386,6 +387,22 @@ def _spec_warmup_group_num_blocks(runner: Any, group: Any, max_pos: int) -> int:
             ),
         )
     return g_nblk
+
+
+def _spec_warmup_block_ids(
+    group: Any, block_ids: Iterable[int], num_blocks: int
+) -> list[int]:
+    """Fold synthetic warmup block IDs into the group's physical page range.
+
+    A group whose owner holds fewer pages than the shared block count (the
+    DeepSeek-V4.1 SWA pool) would otherwise be addressed past its owner, which
+    halts the TPU core. Warmup outputs are discarded; aliasing pages inside
+    the owner is harmless. Page 0 stays the null page.
+    """
+    capacity = num_physical_blocks(group.kv_cache_spec, num_blocks)
+    if capacity >= num_blocks:
+        return list(block_ids)
+    return [block and 1 + (block - 1) % (capacity - 1) for block in block_ids]
 
 
 @contextmanager
@@ -6255,7 +6272,9 @@ class TPUModelRunner(GPUModelRunner):
         max_nblk = 0
         for group in self.kv_cache_config.kv_cache_groups:
             group_num_blocks = _spec_warmup_group_num_blocks(self, group, max_pos)
-            block_ids_per_group.append(list(range(top - group_num_blocks, top)))
+            block_ids_per_group.append(
+                _spec_warmup_block_ids(group, range(top - group_num_blocks, top), top)
+            )
             max_nblk = max(max_nblk, group_num_blocks)
         if top <= max_nblk + 1:
             raise RuntimeError(
@@ -6659,7 +6678,14 @@ class TPUModelRunner(GPUModelRunner):
                         sampling_params=sp,
                         pooling_params=None,
                         block_ids=tuple(
-                            list(range(lo, lo + g_nblk)) for g_nblk in group_nblks
+                            _spec_warmup_block_ids(
+                                g,
+                                range(lo, lo + g_nblk),
+                                int(self.kv_cache_config.num_blocks),
+                            )
+                            for g, g_nblk in zip(
+                                self.kv_cache_config.kv_cache_groups, group_nblks
+                            )
                         ),
                         num_computed_tokens=0,
                         lora_request=None,
@@ -6737,7 +6763,15 @@ class TPUModelRunner(GPUModelRunner):
                                 sampling_params=sp,
                                 pooling_params=None,
                                 block_ids=tuple(
-                                    list(range(lo, lo + g_nblk)) for g_nblk in mix_nblks
+                                    _spec_warmup_block_ids(
+                                        g,
+                                        range(lo, lo + g_nblk),
+                                        int(self.kv_cache_config.num_blocks),
+                                    )
+                                    for g, g_nblk in zip(
+                                        self.kv_cache_config.kv_cache_groups,
+                                        mix_nblks,
+                                    )
                                 ),
                                 num_computed_tokens=0,
                                 lora_request=None,
@@ -6817,7 +6851,9 @@ class TPUModelRunner(GPUModelRunner):
         max_nblk = 0
         for group in self.kv_cache_config.kv_cache_groups:
             g_nblk = _spec_warmup_group_num_blocks(self, group, max_pos)
-            block_ids_per_group.append(list(range(1, 1 + g_nblk)))
+            block_ids_per_group.append(
+                _spec_warmup_block_ids(group, range(1, 1 + g_nblk), top)
+            )
             max_nblk = max(max_nblk, g_nblk)
         if top <= max_nblk + 1:
             logger.warning("skip spec-decode warmup P=%d: not enough kv blocks", P)

@@ -233,7 +233,13 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
     """Single shared metadata builder for every TPU attention group."""
 
     def __init__(
-        self, kv_cache_spec, layer_names, vllm_config, device, runner, kv_cache_group_id
+        self,
+        kv_cache_spec,
+        layer_names,
+        vllm_config,
+        device,
+        runner,
+        kv_cache_group_id,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.runner = runner

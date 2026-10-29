@@ -14,7 +14,8 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels as ak
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("width", [6144, 49408, 98816])
 @pytest.mark.parametrize("mode", ["regular", "padded", "draft", "ordered", "publish"])
-def test_decode_route(monkeypatch, width, mode):
+@pytest.mark.parametrize("banked", [False, True])
+def test_decode_route(monkeypatch, width, mode, banked):
     monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
     tpu_info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
     monkeypatch.setattr(pltpu, "get_tpu_info", lambda: tpu_info)
@@ -32,7 +33,8 @@ def test_decode_route(monkeypatch, width, mode):
     elif mode == "draft":
         requests = jnp.arange(rows, dtype=jnp.int32) % count
     candidates = jnp.zeros((rows, 128 if mode == "publish" else 0), jnp.int32)
-    pool = (jnp.zeros((128, 128), jnp.int32),) * 2
+    words = jnp.zeros((256, 128), jnp.int32)
+    pool = (words[:128], words[128:]) if banked else words
     calls = []
 
     def new_select(
@@ -99,7 +101,8 @@ def test_decode_route(monkeypatch, width, mode):
 @pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="TPU decode pipeline")
 @pytest.mark.parametrize("width", [49408, 98816])
 @pytest.mark.parametrize("candidate_count", [0, 2048])
-def test_decode_route_tpu_matches_existing(monkeypatch, width, candidate_count):
+@pytest.mark.parametrize("banked", [False, True])
+def test_decode_route_tpu_matches_existing(monkeypatch, width, candidate_count, banked):
     rng = np.random.default_rng(721)
     count, queries, page = 4, 6, 128
     keys = jnp.asarray(rng.normal(size=(count * width, 128)), jnp.bfloat16)
@@ -108,7 +111,7 @@ def test_decode_route_tpu_matches_existing(monkeypatch, width, candidate_count):
     encoded = layout.encode_records(keys)
     words = (encoded[::2] | (encoded[1::2] << layout.KEY_BITS)).astype(jnp.int32)
     bank_rows = words.shape[0] // 2
-    pool = (words[:bank_rows], words[bank_rows:])
+    pool = (words[:bank_rows], words[bank_rows:]) if banked else words
     page_order = rng.permutation(count * width // page).reshape(count, -1)
     records = jnp.asarray(
         (page_order[:, :, None] * page + np.arange(page)).reshape(count, width),
