@@ -266,6 +266,7 @@ if TYPE_CHECKING:
     VLLM_TPU_GC_STATS_S: float = 0.0
     VLLM_TPU_GC_DISABLE_AFTER_S: float = -1.0
     VLLM_TPU_MTP_LOOP_REBIND_SEQ_LENS: bool = False
+    VLLM_TPU_PAD_EAGER_GLUE: bool = False
     VLLM_TPU_CPU_PIN_RESERVE: int = 2
     VLLM_TPU_CPU_PROBE_S: float = 0.0
     VLLM_TPU_FUSED_READ_OFFSET_UPDATE: bool = True
@@ -1610,6 +1611,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fused MTP loop: advance seq_lens by rebinding the draft metadata field
     # in the graph instead of an in-place add (no AOT copy-back epilogue).
     "VLLM_TPU_MTP_LOOP_REBIND_SEQ_LENS": env_bool("VLLM_TPU_MTP_LOOP_REBIND_SEQ_LENS"),
+    # Pad the async-spec rejected-count subtraction and the draft seed glue to
+    # precompiled bucket shapes so they stop cold-compiling in serving.
+    "VLLM_TPU_PAD_EAGER_GLUE": env_bool("VLLM_TPU_PAD_EAGER_GLUE"),
     "VLLM_TPU_CPU_PIN_RESERVE": env_nonnegative_int("VLLM_TPU_CPU_PIN_RESERVE", 2),
     # Log each worker's thread CPU placement every N seconds (0 = off).
     "VLLM_TPU_CPU_PROBE_S": env_float("VLLM_TPU_CPU_PROBE_S", 0.0),

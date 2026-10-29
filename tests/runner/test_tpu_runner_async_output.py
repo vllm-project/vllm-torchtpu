@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
+from unittest import mock
+
 import numpy as np
 import pytest
 import torch
@@ -239,3 +242,150 @@ def test_get_output_attaches_spec_logprobs():
         1,
     ]
     assert out.logprobs.slice_request(2, 1).logprobs[:, 0].tolist() == [-6.0]
+
+
+# VLLM_TPU_PAD_EAGER_GLUE: subtract_num_rejected_tokens_padded.
+
+_PAD_MAX_NUM_REQS = 32
+_PAD_TOKEN_BUCKETS = (16, 32, 64, 128)
+_PAD_REQ_BUCKETS = (8, 32)
+
+
+def _subtract_case(rng, num_reqs, num_tokens, num_prev, device, mrope=False):
+    """Random inputs as the runner builds them: `num_reqs` live requests in a
+    `num_tokens`-slot batch, each mapped (or not, -1) to one of the previous
+    step's `num_prev` rejection counts."""
+    seq_lens = torch.from_numpy(rng.integers(100, 10_000, num_reqs, dtype=np.int32))
+    pos_shape = (3, num_tokens) if mrope else (num_tokens,)
+    positions = torch.from_numpy(rng.integers(100, 10_000, pos_shape, dtype=np.int32))
+    num_rejected = torch.from_numpy(rng.integers(0, 4, num_prev, dtype=np.int32))
+    seq_idx = rng.integers(-1, num_prev, num_reqs, dtype=np.int32)
+    pos_idx = rng.integers(-1, num_prev, num_tokens, dtype=np.int32)
+    return tuple(
+        t.to(device)
+        for t in (
+            seq_lens,
+            positions,
+            num_rejected,
+            torch.from_numpy(seq_idx),
+            torch.from_numpy(pos_idx),
+        )
+    )
+
+
+@pytest.mark.parametrize("mrope", [False, True])
+def test_subtract_num_rejected_tokens_padded_matches_unpadded(device, mrope):
+    import vllm_torchtpu.runner.tpu_runner_async_output as ao
+
+    rng = np.random.default_rng(0)
+    for num_reqs in _PAD_REQ_BUCKETS:
+        for num_tokens in _PAD_TOKEN_BUCKETS:
+            for num_prev in (1, 2, 7, 19, _PAD_MAX_NUM_REQS):
+                args = _subtract_case(
+                    rng, num_reqs, num_tokens, num_prev, device, mrope
+                )
+                ref_seq, ref_pos = subtract_num_rejected_tokens(*args)
+                seq, pos = ao.subtract_num_rejected_tokens_padded(
+                    *args, pad_len=_PAD_MAX_NUM_REQS
+                )
+                assert seq.dtype == ref_seq.dtype and pos.dtype == ref_pos.dtype
+                assert torch.equal(seq.cpu(), ref_seq.cpu())
+                assert torch.equal(pos.cpu(), ref_pos.cpu())
+
+
+def _record_keys(monkeypatch, ao, name, keys):
+    impl = getattr(ao, name)
+
+    def recorded(*args):
+        keys.add(tuple(tuple(a.shape) for a in args if isinstance(a, torch.Tensor)))
+        return impl(*args)
+
+    monkeypatch.setattr(ao, name, recorded)
+
+
+def test_subtract_num_rejected_tokens_padded_bounds_program_keys(monkeypatch):
+    """Flag off, the one eager program's key is the product of the three input
+    lengths; flag on, the seq_lens half sees one key per request bucket, the
+    positions half one per token bucket, and the pad one per previous count."""
+    import vllm_torchtpu.runner.tpu_runner_async_output as ao
+
+    pad_keys, seq_keys, pos_keys = set(), set(), set()
+    _record_keys(monkeypatch, ao, "_pad_num_rejected_impl", pad_keys)
+    _record_keys(monkeypatch, ao, "_subtract_seq_lens_impl", seq_keys)
+    _record_keys(monkeypatch, ao, "_subtract_positions_impl", pos_keys)
+    unpadded_keys = set()
+    rng = np.random.default_rng(1)
+    for num_reqs in _PAD_REQ_BUCKETS:
+        for num_tokens in _PAD_TOKEN_BUCKETS:
+            for num_prev in range(1, _PAD_MAX_NUM_REQS + 1):
+                args = _subtract_case(rng, num_reqs, num_tokens, num_prev, "cpu")
+                unpadded_keys.add(tuple(tuple(a.shape) for a in args))
+                ao.subtract_num_rejected_tokens_padded(*args, pad_len=_PAD_MAX_NUM_REQS)
+    n_buckets = len(_PAD_REQ_BUCKETS) * len(_PAD_TOKEN_BUCKETS)
+    assert len(unpadded_keys) == n_buckets * _PAD_MAX_NUM_REQS
+    assert len(seq_keys) == len(_PAD_REQ_BUCKETS)
+    assert len(pos_keys) == len(_PAD_TOKEN_BUCKETS)
+    # Every count below the pad length; the full-length one skips the pad.
+    assert len(pad_keys) == _PAD_MAX_NUM_REQS - 1
+
+
+def test_subtract_num_rejected_tokens_padded_fault_control(monkeypatch):
+    """The equality check catches a pad that moves the real counts (a left
+    pad), and does not depend on the pad value: the padded tail is never
+    indexed, so a nonzero right pad is still exact."""
+    import vllm_torchtpu.runner.tpu_runner_async_output as ao
+
+    def check(pad_fn) -> bool:
+        monkeypatch.setattr(ao, "_pad_num_rejected_impl", pad_fn)
+        rng = np.random.default_rng(2)
+        for num_prev in (1, 5, 17):
+            args = _subtract_case(rng, 8, 64, num_prev, "cpu")
+            ref = subtract_num_rejected_tokens(*args)
+            out = ao.subtract_num_rejected_tokens_padded(
+                *args, pad_len=_PAD_MAX_NUM_REQS
+            )
+            if not all(torch.equal(a, b) for a, b in zip(ref, out)):
+                return False
+        return True
+
+    def left_pad(nr, pad_len):
+        return torch.nn.functional.pad(nr, (pad_len - nr.shape[0], 0))
+
+    def nonzero_right_pad(nr, pad_len):
+        return torch.nn.functional.pad(nr, (0, pad_len - nr.shape[0]), value=7)
+
+    assert not check(left_pad)
+    assert check(nonzero_right_pad)
+
+
+def test_precompile_subtract_num_rejected_covers_runtime_keys(monkeypatch):
+    """Every key a runtime sweep reaches is one the precompile warmed."""
+    import vllm_torchtpu.runner.tpu_runner_async_output as ao
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    warmed = {"pad": set(), "seq": set(), "pos": set()}
+    _record_keys(monkeypatch, ao, "_pad_num_rejected_impl", warmed["pad"])
+    _record_keys(monkeypatch, ao, "_subtract_seq_lens_impl", warmed["seq"])
+    _record_keys(monkeypatch, ao, "_subtract_positions_impl", warmed["pos"])
+    runner = mock.MagicMock(
+        max_num_reqs=_PAD_MAX_NUM_REQS,
+        num_reqs_max_model_len=_PAD_REQ_BUCKETS[0],
+        num_reqs_most_model_len=_PAD_REQ_BUCKETS[1],
+        num_tokens_paddings=list(_PAD_TOKEN_BUCKETS),
+        device=torch.device("cpu"),
+    )
+    runner._precompile_timed.return_value = contextlib.nullcontext()
+    TPUModelRunner._precompile_subtract_num_rejected(runner)
+    precompiled = {k: set(v) for k, v in warmed.items()}
+    for v in warmed.values():
+        v.clear()
+    rng = np.random.default_rng(3)
+    for num_reqs in _PAD_REQ_BUCKETS:
+        for num_tokens in _PAD_TOKEN_BUCKETS:
+            for num_prev in range(1, _PAD_MAX_NUM_REQS + 1):
+                ao.subtract_num_rejected_tokens_padded(
+                    *_subtract_case(rng, num_reqs, num_tokens, num_prev, "cpu"),
+                    pad_len=_PAD_MAX_NUM_REQS,
+                )
+    for k in warmed:
+        assert warmed[k] <= precompiled[k], k

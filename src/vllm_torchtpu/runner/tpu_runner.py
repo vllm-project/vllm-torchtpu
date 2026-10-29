@@ -3443,6 +3443,7 @@ class TPUModelRunner(GPUModelRunner):
         ):
             from vllm_torchtpu.runner.tpu_runner_async_output import (
                 subtract_num_rejected_tokens,
+                subtract_num_rejected_tokens_padded,
             )
 
             seq_idx_np = np.full(target_num_reqs, -1, dtype=np.int32)
@@ -3456,21 +3457,7 @@ class TPUModelRunner(GPUModelRunner):
                     seq_idx_np[i] = pos
                     pos_idx_np[acc : acc + n_sched] = pos
                 acc += n_sched
-            # The compiled program only for shapes warmup compiled (steady
-            # decode); prefill/mixed steps keep the eager ops rather than
-            # compiling mid-serve.
-            subtract = (
-                _subtract_num_rejected_tokens_compiled
-                if envs.VLLM_TPU_SUBTRACT_REJECTED_COMPILED
-                and (
-                    self._pre_async_results.spec_decode_num_rejected_tokens.shape[0],
-                    self.position_ids.shape[-1],
-                    seq_lens.shape[0],
-                )
-                in self.__dict__.get("_subtract_compiled_shapes", ())
-                else subtract_num_rejected_tokens
-            )
-            seq_lens, self.position_ids = subtract(
+            subtract_args = (
                 seq_lens,
                 self.position_ids,
                 self._pre_async_results.spec_decode_num_rejected_tokens,
@@ -3481,6 +3468,26 @@ class TPUModelRunner(GPUModelRunner):
                     "rejected_pos_idx", torch.from_numpy(pos_idx_np)
                 ),
             )
+            if envs.VLLM_TPU_PAD_EAGER_GLUE:
+                seq_lens, self.position_ids = subtract_num_rejected_tokens_padded(
+                    *subtract_args, pad_len=self.max_num_reqs
+                )
+            else:
+                # The compiled program only for shapes warmup compiled (steady
+                # decode); prefill/mixed steps keep the eager ops rather than
+                # compiling mid-serve.
+                subtract = (
+                    _subtract_num_rejected_tokens_compiled
+                    if envs.VLLM_TPU_SUBTRACT_REJECTED_COMPILED
+                    and (
+                        self._pre_async_results.spec_decode_num_rejected_tokens.shape[0],
+                        self.position_ids.shape[-1],
+                        seq_lens.shape[0],
+                    )
+                    in self.__dict__.get("_subtract_compiled_shapes", ())
+                    else subtract_num_rejected_tokens
+                )
+                seq_lens, self.position_ids = subtract(*subtract_args)
 
         # For decode-only case, cache constant device tensors to skip H2D.
         # query_start_loc, logits_indices, and request_distribution don't
@@ -6833,6 +6840,46 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     synchronize_tensors(out)
                     logger.info("  -- num_tokens: %d, next_len: %d", num_tokens, nlen)
+        if envs.VLLM_TPU_PAD_EAGER_GLUE and self.speculative_config is not None:
+            self._precompile_subtract_num_rejected()
+
+    def _precompile_subtract_num_rejected(self) -> None:
+        """Warm `subtract_num_rejected_tokens_padded` (VLLM_TPU_PAD_EAGER_GLUE):
+        the pad per previous-step request count, the seq_lens half per request
+        bucket and the positions half per token bucket."""
+        from vllm_torchtpu.runner.tpu_runner_async_output import (
+            subtract_num_rejected_tokens_padded,
+        )
+
+        pad_len = self.max_num_reqs
+        target_reqs = sorted(
+            {
+                n
+                for n in (self.num_reqs_max_model_len, self.num_reqs_most_model_len)
+                if n is not None
+            }
+        )
+
+        def run(num_rejected_len: int, num_reqs: int, num_tokens: int) -> None:
+            seq_lens, positions = subtract_num_rejected_tokens_padded(
+                torch.zeros(num_reqs, dtype=torch.int32).to(self.device),
+                torch.zeros(num_tokens, dtype=torch.int32).to(self.device),
+                torch.zeros(num_rejected_len, dtype=torch.int32).to(self.device),
+                torch.full((num_reqs,), -1, dtype=torch.int32).to(self.device),
+                torch.full((num_tokens,), -1, dtype=torch.int32).to(self.device),
+                pad_len=pad_len,
+            )
+            synchronize_tensors(seq_lens)
+            synchronize_tensors(positions)
+
+        # Served from execute_model's no_grad; dynamo guards on grad mode.
+        with self._precompile_timed("subtract_num_rejected"), torch.no_grad():
+            for num_rejected_len in range(1, pad_len + 1):
+                run(num_rejected_len, target_reqs[0], self.num_tokens_paddings[0])
+            for num_reqs in target_reqs:
+                run(pad_len, num_reqs, self.num_tokens_paddings[0])
+            for num_tokens in self.num_tokens_paddings:
+                run(pad_len, target_reqs[0], num_tokens)
 
     def _precompile_rejection_sampler(self) -> None:
         """Warm the spec-decode verify path so it doesn't recompile at runtime.
