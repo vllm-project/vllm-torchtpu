@@ -1064,9 +1064,10 @@ class TPUModelRunner(GPUModelRunner):
         scheduler_output,
         wait_for_completion: bool = False,
         report_completion: bool = True,
-    ) -> None:
+        after_forward: bool = False,
+    ) -> Callable[[], None] | None:
         if not has_kv_transfer_group():
-            return
+            return None
         kv_connector = get_kv_transfer_group()
         assert scheduler_output.kv_connector_metadata is not None
         # Upstream parity (gpu_model_runner calls this before every forward;
@@ -1077,12 +1078,21 @@ class TPUModelRunner(GPUModelRunner):
         kv_connector.handle_preemptions(scheduler_output.kv_connector_metadata)
         kv_connector.bind_connector_metadata(scheduler_output.kv_connector_metadata)
         # forward_context is unused by TPUConnector; pass None.
+        if after_forward:
+            start = getattr(kv_connector, "start_load_kv_for_forward", None)
+            if start is not None:
+                return start(
+                    None,
+                    wait_for_completion=wait_for_completion,
+                    report_completion=report_completion,
+                )
         if wait_for_completion:
             kv_connector.start_load_kv(
                 None, wait_for_completion=True, report_completion=report_completion
             )
         else:
             kv_connector.start_load_kv(None)
+        return None
 
     def maybe_wait_for_kv_save(self, nan_check: KVSaveNanCheck | None = None) -> None:
         if has_kv_transfer_group():
@@ -3460,13 +3470,16 @@ class TPUModelRunner(GPUModelRunner):
             self._pp_wave.before_step(scheduler_output.total_num_scheduled_tokens)
         # Update cached state
         self._update_states(scheduler_output)
-        # Publish completed requests before draining the previous batch's CPU
-        # results or issuing this batch's computation. The producer output has
-        # already fenced its main and draft KV before reaching the scheduler.
+        # Loads and block-reuse protection precede computation. Pure PP
+        # registration can overlap device execution, before results escape.
         with set_forward_context(None, self.vllm_config):
             raiden_inline = dist_utils.get_raiden_inline_load()
-            self.maybe_setup_kv_connector(
+            publish_kv = self.maybe_setup_kv_connector(
                 scheduler_output,
+                after_forward=(
+                    self._pp_wave is not None
+                    and scheduler_output.total_num_scheduled_tokens > 0
+                ),
                 wait_for_completion=raiden_inline,
                 report_completion=(
                     scheduler_output.total_num_scheduled_tokens == 0
@@ -3779,6 +3792,10 @@ class TPUModelRunner(GPUModelRunner):
                     intermediate_tensors=intermediate_tensors,
                 )
 
+            if publish_kv is not None:
+                publish_kv()
+                publish_kv = None
+
             if nan_check is not None:
                 assert isinstance(hidden_states, torch.Tensor), (
                     "KV store NaN checking requires final hidden states"
@@ -3927,6 +3944,10 @@ class TPUModelRunner(GPUModelRunner):
 
             start_index = end_index
             chunk_index += 1
+
+        # A step containing only padding must not strand its registration.
+        if publish_kv is not None:
+            publish_kv()
 
         if not self._pp_is_last:
             self._pp_pending_scheduler_output = scheduler_output

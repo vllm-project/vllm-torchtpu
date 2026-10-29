@@ -24,9 +24,9 @@ import queue
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
@@ -987,6 +987,46 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
             wait_for_completion=wait_for_completion,
             report_completion=report_completion,
         )
+
+    def start_load_kv_for_forward(
+        self,
+        _,
+        wait_for_completion: bool = False,
+        report_completion: bool = True,
+    ) -> Callable[[], None] | None:
+        """Defer pure PP producer registration until a forward is submitted."""
+        worker = self.connector_worker
+        metadata = self._connector_metadata
+        assert worker is not None
+        assert isinstance(metadata, TPUConnectorMetadata)
+        if (
+            isinstance(worker, TPURaidenConnectorWorker)
+            and worker.is_producer
+            and _engine_is_pipeline(worker.vllm_config)
+            and worker._raiden_stage3_enabled()
+            and not _use_raiden_dsv4_admission()
+            and not _use_raiden_glm_admission()
+            and not _uses_tp_stage3_source(worker.vllm_config)
+            and metadata.reqs_to_send
+            and not metadata.reqs_to_load
+            and not metadata.reqs_to_release
+            and not metadata.reqs_to_expire
+        ):
+            # The runner invokes this in the same execute_model call, before
+            # handoff/results or metadata rebinding. No thread or snapshot is
+            # needed; source retention and KV-ready fencing remain unchanged.
+            return partial(
+                worker.process_send_load,
+                metadata,
+                wait_for_completion=wait_for_completion,
+                report_completion=report_completion,
+            )
+        self.start_load_kv(
+            None,
+            wait_for_completion=wait_for_completion,
+            report_completion=report_completion,
+        )
+        return None
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """Layer-wise load is not supported on TPU."""

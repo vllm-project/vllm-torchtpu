@@ -1,5 +1,6 @@
 """TPU Multi Connector wrapper for combining disagg and offloading."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -25,6 +26,27 @@ class TPUMultiConnector(MultiConnector):
     the connector is instantiated, so children injected at init time would
     be invisible to them.
     """
+
+    def start_load_kv_for_forward(
+        self, forward_context, **kwargs
+    ) -> Callable[[], None] | None:
+        callbacks = []
+        for connector in self._connectors:
+            start = getattr(connector, "start_load_kv_for_forward", None)
+            if start is None:
+                connector.start_load_kv(forward_context, **kwargs)
+            else:
+                callback = start(forward_context, **kwargs)
+                if callback is not None:
+                    callbacks.append(callback)
+        if not callbacks:
+            return None
+
+        def publish() -> None:
+            for callback in callbacks:
+                callback()
+
+        return publish
 
     def get_handshake_metadata(self) -> TPUMultiHandshakeMetadata | None:
         children = tuple(c.get_handshake_metadata() for c in self._connectors)

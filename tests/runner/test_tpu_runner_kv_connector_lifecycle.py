@@ -84,6 +84,7 @@ def test_execute_model_starts_transfer_before_draining_previous_results(
 
     runner.maybe_setup_kv_connector.assert_called_once_with(
         scheduler_output,
+        after_forward=False,
         wait_for_completion=inline,
         report_completion=num_tokens == 0 or not inline,
     )
