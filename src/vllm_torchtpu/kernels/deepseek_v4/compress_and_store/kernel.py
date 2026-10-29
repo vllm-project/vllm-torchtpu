@@ -483,16 +483,18 @@ def compress_norm_rope_store(
     max_idx = jnp.max(jnp.where(valid, indices, -1))
     grid_size = jnp.where(max_idx >= 0, pl.cdiv(max_idx + 1, cfgs.tile_sizes.tile_n), 0)
 
-    if seq_along_lane:
-        # Unread under SAL (no row merging, no RoPE cache); keep SMEM for the
-        # final store's run tables instead.
-        is_first_mask = is_first_mask_rope = jnp.zeros((1,), jnp.bool_)
-    else:
+    # Only the row-merging writers read a mask (see
+    # `buffered_ref.create_allocs_and_specs`): the HEAD_ALONG_SUBLANE indexer's
+    # NoPE rows and CSA's RoPE rows. Elsewhere it is a placeholder, which also
+    # keeps SMEM for SAL's run tables.
+    is_first_mask = is_first_mask_rope = jnp.zeros((1,), jnp.bool_)
+    if cfgs.dims.mode == config.Mode.CSA_INDEXER and not seq_along_lane:
         is_first_mask = compute_is_first_mask(
             kv_slot_mapping,
             cfgs.tile_sizes.tile_n,
             pack_factor=cfgs.tokens_in_second_minor,
         )
+    if cfgs.dims.has_rope_cache:
         is_first_mask_rope = compute_is_first_mask(
             kv_slot_mapping,
             cfgs.tile_sizes.tile_n,
