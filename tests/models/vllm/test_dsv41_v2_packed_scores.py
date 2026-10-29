@@ -10,7 +10,7 @@ from jax.sharding import Mesh
 
 from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout
 from vllm_torchtpu.kernels.deepseek_v41.index_selection import packed_scores
-from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels as ak
+from vllm_torchtpu.models.vllm.deepseek_v41.v2 import indexer_impl as indexer_ops
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
     ROW_WORDS,
     _split_words,
@@ -123,7 +123,7 @@ def _paged_inputs(rng, tokens, width, lengths, q_dtype=jnp.bfloat16):
 def test_paged_index_scores_matches_dense(tokens, width, lengths):
     rng = np.random.default_rng(width)
     q, pool, records, weights, n = _paged_inputs(rng, tokens, width, lengths)
-    actual = ak.paged_index_scores_jax(
+    actual = indexer_ops.paged_index_scores_jax(
         q, pool, jnp.asarray(records), weights, n, None, PAGE
     )
     expected = _paged_reference(q, weights, pool, records, lengths)
@@ -175,7 +175,7 @@ def test_paged_index_scores_grouped_decode_requests(tokens, requests):
     weights = jnp.asarray(rng.standard_normal((tokens, 4)), jnp.float32)
     lengths = jnp.full((tokens,), width, jnp.int32)
     req_arr = jnp.asarray(requests, jnp.int32)
-    grouped = ak.paged_index_scores_jax(
+    grouped = indexer_ops.paged_index_scores_jax(
         q, pool, jnp.asarray(records), weights, lengths, req_arr, PAGE
     )
     expanded_records = np.asarray(records)[np.asarray(requests)]
@@ -188,7 +188,7 @@ def test_paged_index_scores_fp32_query_matches_dense():
     q, pool, records, weights, n = _paged_inputs(
         rng, 2, 1024, (1024, 512), q_dtype=jnp.float32
     )
-    actual = ak.paged_index_scores_jax(
+    actual = indexer_ops.paged_index_scores_jax(
         q, pool, jnp.asarray(records), weights, n, None, PAGE
     )
     expected = _paged_reference(q, weights, pool, records, n)
@@ -206,7 +206,7 @@ def test_score_word_rows_wrapper_mesh_and_standalone():
         "get_vllm_model_wrapper_context",
         side_effect=RuntimeError("no context"),
     ):
-        standalone = ak._score_word_rows(q, weights, words)
+        standalone = indexer_ops._score_word_rows(q, weights, words)
     np.testing.assert_allclose(np.asarray(standalone), reference, rtol=1e-6, atol=1e-5)
     mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
     with (
@@ -215,7 +215,7 @@ def test_score_word_rows_wrapper_mesh_and_standalone():
             "jax.shard_map", side_effect=lambda fn, **kw: lambda *args: fn(*args)
         ) as shard_map,
     ):
-        sharded = ak._score_word_rows(q, weights, words)
+        sharded = indexer_ops._score_word_rows(q, weights, words)
     shard_map.assert_called_once()
     np.testing.assert_allclose(np.asarray(sharded), reference, rtol=1e-6, atol=1e-5)
 

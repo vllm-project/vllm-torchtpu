@@ -388,6 +388,11 @@ def _topk_kernel(
     )
 
 
+def supports_topk_width(k: int) -> bool:
+    """Whether the direct selector supports this output width."""
+    return 0 < k <= 4096 and k % LANES == 0
+
+
 def _sc_topk_direct(
     scores: jax.Array,  # f32[b, n]
     k: int,
@@ -531,7 +536,7 @@ def sparsecore_topk(
     b, n = scores.shape
     if n % LANES != 0:
         raise ValueError(f"{n=} must be a multiple of {LANES}")
-    if k % LANES != 0 or not 0 < k <= 4096:
+    if not supports_topk_width(k):
         raise ValueError(f"{k=} must be a positive multiple of {LANES}, at most 4096")
 
     if row_lengths is None:

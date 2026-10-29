@@ -618,18 +618,18 @@ class TestBenchDecodeIndexerSplit:
             ),
             patch("jax.lax.optimization_barrier", side_effect=lambda x: x),
             patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels.paged_index_scores_jax",
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl.paged_index_scores_jax",
                 return_value=jnp.ones((4, 64), dtype=jnp.float32),
             ),
             patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels.select_indices_jax",
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl.select_indices_jax",
                 return_value=(
                     jnp.zeros((4, 32), dtype=jnp.int32),
                     jnp.zeros((4, 32), dtype=jnp.int32),
                 ),
             ),
             patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels.paged_indexer_jax",
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl.paged_indexer_jax",
                 return_value=(
                     jnp.zeros((4, 32), dtype=jnp.int32),
                     jnp.zeros((4, 32), dtype=jnp.int32),
@@ -708,11 +708,13 @@ class TestBenchDecodeIndexerSplit:
                 assert res_legacy["max_tile"] == bdis.LEGACY_TILE[1]
 
     def test_worker_legacy_visible_branches(self, tmp_path):
-        from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels as ak
+        from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
+            indexer_impl as indexer_ops,
+        )
 
-        orig_vis = ak._visible_top_k
+        orig_vis = indexer_ops._visible_top_k
         mock_vis = MagicMock(return_value="mock_result")
-        ak._visible_top_k = mock_vis
+        indexer_ops._visible_top_k = mock_vis
 
         ctx = common.WorkerContext(0, 1, 1, None, tmp_path)
         args_legacy = argparse.Namespace(
@@ -760,7 +762,7 @@ class TestBenchDecodeIndexerSplit:
                 mock_wrap.return_value.mesh = None
 
                 bdis.worker(ctx, args_legacy)
-                legacy_vis = ak._visible_top_k
+                legacy_vis = indexer_ops._visible_top_k
 
                 # 1. scores.shape[0] < 16 -> lengths set to None
                 scores_small = np.zeros((8, 2048), dtype=np.float32)
@@ -774,7 +776,7 @@ class TestBenchDecodeIndexerSplit:
                 args_large, _ = mock_vis.call_args
                 assert args_large[3] == "orig_len"
         finally:
-            ak._visible_top_k = orig_vis
+            indexer_ops._visible_top_k = orig_vis
 
     def test_worker_verify_scores_stage(self, tmp_path):
         ctx = common.WorkerContext(0, 2, 2, None, tmp_path)
@@ -833,7 +835,7 @@ class TestBenchDecodeIndexerSplit:
             ) as mock_wrap,
             patch("torch_tpu._internal.pallas.jax_op", side_effect=dummy_op),
             patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels.paged_index_scores_jax",
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl.paged_index_scores_jax",
                 return_value=jnp.ones((4, 64), dtype=jnp.float32),
             ),
             patch.object(

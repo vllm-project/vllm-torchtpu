@@ -22,7 +22,6 @@ import torch
 from vllm_torchtpu.kernels.deepseek_v4.core_attention import sparse_mla
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
-    _compact_selected,
     _pad_compacted_records,
     compact_records,
     compute_chunk_union_gather_indices,
@@ -35,6 +34,7 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
     sparse_ragged_paged_attention_union_gather,
     unpack_union_rope_words,
 )
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl import _compact_selected
 
 
 class TestCompactRecords:

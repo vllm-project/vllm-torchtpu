@@ -96,7 +96,14 @@ def test_chunked_attention_preserves_requests_and_reusable_kv(
             **kwargs,
         )
 
-    expected = attend(q, expected_words, expected_scales)
+    # The selector may return any order within the valid prefix. Compare the
+    # unsorted gather pipeline with attention over the same sorted KV records.
+    order = jnp.argsort(jnp.where(records >= 0, records, jnp.iinfo(jnp.int32).max))
+    expected = attend(
+        q,
+        jnp.take_along_axis(expected_words, order[:, :, None], axis=1),
+        jnp.take_along_axis(expected_scales, order, axis=1),
+    )
     output, gathered_words, gathered_scales = csa2_pipeline(
         q,
         word_banks,

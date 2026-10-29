@@ -15,10 +15,7 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention import (
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
     _attend_window,
     _attention_state,
-    _visible_top_k,
     paged_attention_jax,
-    paged_index_scores_jax,
-    paged_indexer_jax,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
     IndexCacheRows,
@@ -30,6 +27,11 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
     merge_sub_rows,
     scatter_cache_values,
     split_halves,
+)
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl import (
+    _visible_top_k,
+    paged_index_scores_jax,
+    paged_indexer_jax,
 )
 
 
@@ -358,12 +360,14 @@ def test_shared_index_scores_grouped_queries_match_dense(layout):
 
 @pytest.mark.parametrize("rows,tokens", [(1, 16), (2, 32)])
 def test_shared_index_scores_large_query_groups_keep_matmul(monkeypatch, rows, tokens):
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
+        indexer_impl as indexer_ops,
+    )
 
     def unexpected_word_score(*args, **kwargs):
         raise AssertionError("large prefill groups must not unroll the packed scorer")
 
-    monkeypatch.setattr(attention_kernels, "_score_word_rows", unexpected_word_score)
+    monkeypatch.setattr(indexer_ops, "_score_word_rows", unexpected_word_score)
     rng = np.random.default_rng(29)
     width, page = 257, 16
     pool, _, _, lengths, q, weights = _request_inputs(rng, rows, tokens, width)
@@ -382,7 +386,9 @@ def test_index_score_tiles_by_request_rows_are_bitwise(monkeypatch, per_token):
     # Wide decode contexts span several key tiles. Request-row (grouped) and
     # per-token word-row tiles only change loop blocking: every key score must
     # be bitwise identical to the historical 512-key tiling.
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
+        indexer_impl as indexer_ops,
+    )
 
     rng = np.random.default_rng(1913)
     rows, width, page = 16, 5000, 16
@@ -403,8 +409,8 @@ def test_index_score_tiles_by_request_rows_are_bitwise(monkeypatch, per_token):
         args = (q, pool, jnp.asarray(records), weights, jnp.asarray(lengths))
         kwargs = {"requests": jnp.asarray(requests), "page_records": page}
     got = paged_index_scores_jax(*args, **kwargs)
-    monkeypatch.setattr(attention_kernels, "_INDEX_KEYS_PER_ITER", 512 * rows)
-    monkeypatch.setattr(attention_kernels, "_INDEX_WORD_KEYS_PER_ITER", 512)
+    monkeypatch.setattr(indexer_ops, "_INDEX_KEYS_PER_ITER", 512 * rows)
+    monkeypatch.setattr(indexer_ops, "_INDEX_WORD_KEYS_PER_ITER", 512)
     expected = paged_index_scores_jax(*args, **kwargs)
     valid = (records[requests] >= 0) & (np.arange(width) < lengths[:, None])
     np.testing.assert_array_equal(np.asarray(got)[valid], np.asarray(expected)[valid])
@@ -412,7 +418,9 @@ def test_index_score_tiles_by_request_rows_are_bitwise(monkeypatch, per_token):
 
 def test_candidate_filter_sparsecore_selection_matches_top_k(monkeypatch):
     """Unordered candidate scoring on SparseCore selects the top_k set."""
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
+        indexer_impl as indexer_ops,
+    )
 
     def fake_sparsecore(scores, k, lengths):
         columns = jnp.arange(scores.shape[1])[None]
@@ -421,7 +429,7 @@ def test_candidate_filter_sparsecore_selection_matches_top_k(monkeypatch):
         # Reversed, like an unordered selection.
         return jnp.where(values > -jnp.inf, indices, -1)[:, ::-1]
 
-    monkeypatch.setattr(attention_kernels, "_sparsecore_top_k", fake_sparsecore)
+    monkeypatch.setattr(indexer_ops, "_sparsecore_top_k", fake_sparsecore)
     rng = np.random.default_rng(9)
     width, topk, block_size, tokens = 4096, 64, 16, 4
     pool, records, _, lengths, q, weights = _request_inputs(rng, tokens, tokens, width)
@@ -446,7 +454,7 @@ def test_candidate_filter_sparsecore_selection_matches_top_k(monkeypatch):
     ordered, _ = paged_indexer_jax(*args, unordered=False)
     got, _ = paged_indexer_jax(*args, unordered=True)
     np.testing.assert_array_equal(
-        np.asarray(got), np.asarray(attention_kernels._compact_selected(ordered))
+        np.asarray(got), np.asarray(indexer_ops._compact_selected(ordered))
     )
     assert (np.asarray(got)[-1] == -1).all()
 
@@ -715,7 +723,7 @@ def test_paged_indexer_unordered_is_precompacted(
 def test_paged_indexer_candidate_filter_shared_tiles_and_decode_branches(
     unordered, decode_mode
 ):
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl import (
         select_indices_jax,
     )
 
