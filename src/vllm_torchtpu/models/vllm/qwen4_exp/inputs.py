@@ -119,6 +119,7 @@ def fused_step_inputs(
     spec_window: int,
     eos_token_id: int,
     ngram_size: int,
+    functional: bool = False,
 ):
     """``Qwen4ExpAdapter.prepare_inputs``'s device work as one function, so it
     compiles to one program (VLLM_TPU_QWEN4_FUSED_PREP) instead of ~20 eager
@@ -128,7 +129,10 @@ def fused_step_inputs(
     ``store`` is the device token store, or with ``window`` the uploaded
     ``ngram_window_from_host`` array. ``current``'s three record tensors are
     updated in place exactly like ``_speculative_ngram_context``. Returns
-    (context, history, slots, valid_tokens).
+    (context, history, slots, valid_tokens). With ``functional``
+    (VLLM_TPU_QWEN4_FUSED_PREP_FUNCTIONAL) ``current`` is left alone and its
+    updated record is returned as a fifth item instead: input mutations cost a
+    per-tensor eager copy-back after the program.
     """
     rows = starts.shape[0] - 1
     row_start = scalars[0]
@@ -158,12 +162,21 @@ def fused_step_inputs(
             (starts[:-1, None].to(torch.int64) + offsets).clamp(0, ids.shape[0] - 1)
         ]
         target = torch.where(valid_rows, row_range + row_start, tokens.shape[0] - 1)
-        tokens.index_copy_(0, target, torch.cat([history, chunk], dim=1))
-        recent_context.index_copy_(0, target, context)
-        recent_lengths.index_copy_(
-            0, target, lengths_now.to(torch.int64).clamp(max=spec_window)
-        )
+        new_tokens = torch.cat([history, chunk], dim=1)
+        new_lengths = lengths_now.to(torch.int64).clamp(max=spec_window)
+        if functional:
+            record = (
+                tokens.index_copy(0, target, new_tokens),
+                recent_context.index_copy(0, target, context),
+                recent_lengths.index_copy(0, target, new_lengths),
+            )
+        else:
+            tokens.index_copy_(0, target, new_tokens)
+            recent_context.index_copy_(0, target, context)
+            recent_lengths.index_copy_(0, target, new_lengths)
     valid_tokens = torch.arange(ids.shape[0], device=ids.device) < starts[-1]
+    if functional:
+        return context, history, slots, valid_tokens, (record if spec_window else None)
     return context, history, slots, valid_tokens
 
 
@@ -486,7 +499,8 @@ class Qwen4ExpAdapter:
             clones = tuple(t.clone() for t in current) if current is not None else None
             reference = (self._prepare_inputs_eager(snapshot, clones), clones)
         seq_lens = ctx.seq_lens - 1 if check == "fault" else ctx.seq_lens
-        context, history, slots, valid_tokens = self._fused_fn()(
+        functional = envs.VLLM_TPU_QWEN4_FUSED_PREP_FUNCTIONAL
+        out = self._fused_fn()(
             starts,
             seq_lens,
             state_indices,
@@ -500,7 +514,11 @@ class Qwen4ExpAdapter:
             spec_window=self.spec_window,
             eos_token_id=self.config.eos_token_id,
             ngram_size=self.config.ngram_size,
+            functional=functional,
         )
+        context, history, slots, valid_tokens = out[:4]
+        if functional and current is not None:
+            current = self._recent[1] = out[4]
         if reference is not None:
             self._check_fused(
                 snapshot.num_requests,
@@ -611,8 +629,9 @@ class Qwen4ExpAdapter:
                         spec_window=self.spec_window,
                         eos_token_id=self.config.eos_token_id,
                         ngram_size=self.config.ngram_size,
+                        functional=envs.VLLM_TPU_QWEN4_FUSED_PREP_FUNCTIONAL,
                     )
-                    synchronize_tensors(out)
+                    synchronize_tensors(out[:4])
         logger.info(
             "Compiled fused qwen4 step inputs for rows %s x %d token buckets",
             sorted({r for r in rows_options if r}),

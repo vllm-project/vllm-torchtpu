@@ -102,6 +102,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QWEN4_NGRAM_WINDOW: str = ""
     VLLM_TPU_QWEN4_FUSED_PREP: bool = False
     VLLM_TPU_QWEN4_FUSED_PREP_CHECK: str = ""
+    VLLM_TPU_QWEN4_FUSED_PREP_FUNCTIONAL: bool = False
     VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
     VLLM_TPU_QSA_PREFIX_SLICE: bool = False
     VLLM_TPU_QSA_INDEXER_UPDATE_SHIFT: bool = False
@@ -605,6 +606,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # live step (counts logged every 500 checks); "fault": its positive control.
     "VLLM_TPU_QWEN4_FUSED_PREP_CHECK": lambda: os.getenv(
         "VLLM_TPU_QWEN4_FUSED_PREP_CHECK", ""
+    ),
+    # The fused program returns the updated speculative record instead of
+    # mutating its inputs (no eager copy-back per record tensor after it).
+    "VLLM_TPU_QWEN4_FUSED_PREP_FUNCTIONAL": env_bool(
+        "VLLM_TPU_QWEN4_FUSED_PREP_FUNCTIONAL"
     ),
     "VLLM_TPU_QSA_DRAFT_SHARED_SELECTION": env_bool(
         "VLLM_TPU_QSA_DRAFT_SHARED_SELECTION"
