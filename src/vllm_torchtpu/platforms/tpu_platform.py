@@ -468,6 +468,7 @@ class TpuPlatform(Platform):
         "TPU_KERNEL_RELOAD_MODULES",
         "TPU_MOE_ROUTER_TOPK",
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
+        "SKIP_MAMBA_SCHEDULER_BLOCKS",
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
         "VLLM_TPU_INDEXER_KV_CACHE_MODE",
@@ -1297,6 +1298,16 @@ class TpuPlatform(Platform):
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:
         return True
+
+    @classmethod
+    def register_custom_kv_cache_specs(cls, vllm_config: VllmConfig) -> None:
+        # Unconditional: the manager is only used for specs the runner emits
+        # under SKIP_MAMBA_SCHEDULER_BLOCKS.
+        from vllm_torchtpu.core.runner_slot_mamba import (
+            register_runner_slot_mamba_spec,
+        )
+
+        register_runner_slot_mamba_spec()
 
 
 def _get_exponential_token_paddings(

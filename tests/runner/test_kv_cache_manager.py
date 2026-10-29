@@ -17,6 +17,7 @@ Moved verbatim out of `tests/runner/test_tpu_runner.py` alongside the code
 they cover; see vllm-project/vllm-torchtpu#713.
 """
 
+import dataclasses
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -33,6 +34,7 @@ from vllm.config import (
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -45,6 +47,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_torchtpu import utils
+from vllm_torchtpu.core.runner_slot_mamba import RunnerSlotMambaSpec
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
     PallasBatchedRPAAttentionBackend,
@@ -97,6 +100,16 @@ class DummyMamba(MambaBase):
     @property
     def mamba_type(self):
         return "dummy"
+
+
+class DummyGdn(DummyMamba):
+    """DummyMamba reporting the GDN backend, as Qwen's GDN layers do."""
+
+    def get_kv_cache_spec(self, vllm_config):
+        return dataclasses.replace(
+            super().get_kv_cache_spec(vllm_config),
+            mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+        )
 
 
 class _FakeReserveSpec:
@@ -644,6 +657,59 @@ class TestKVCacheManager:
             mamba_spec = kv_cache_specs[layer_name]
             assert isinstance(mamba_spec, MambaSpec)
             assert mamba_spec.page_size_padded == expected_padded_size
+
+    @pytest.mark.parametrize(
+        "flag, uniform_mamba_layout, expect_runner_slot",
+        [(False, False, False), (True, False, True), (True, True, False)],
+        ids=["flag_off", "compact", "uniform_mamba_layout"],
+    )
+    @patch("vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config")
+    @patch(
+        "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",
+        return_value=4096,
+    )
+    @patch(
+        "vllm_torchtpu.utils.torch.accelerator.get_memory_info",
+        return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024),
+    )
+    def test_get_kv_cache_spec_gdn_runner_slot_flag(
+        self,
+        mock_mem_info,
+        mock_get_page_size,
+        mock_get_layers,
+        monkeypatch,
+        flag,
+        uniform_mamba_layout,
+        expect_runner_slot,
+    ):
+        """SKIP_MAMBA_SCHEDULER_BLOCKS: GDN specs reach vLLM as
+        RunnerSlotMambaSpec only when compact-mamba sizing gave the runner
+        its own GDN slots."""
+        if flag:
+            monkeypatch.setenv("SKIP_MAMBA_SCHEDULER_BLOCKS", "1")
+        else:
+            monkeypatch.delenv("SKIP_MAMBA_SCHEDULER_BLOCKS", raising=False)
+        self.runner._uniform_mamba_layout = uniform_mamba_layout
+
+        mock_attn = _attention_layer_mock()
+        mock_attn.attn_type = AttentionType.DECODER
+        mock_attn.num_kv_heads = 2
+        mock_attn.head_size = 128
+        mock_attn.kv_sharing_target_layer_name = None
+        mock_attn.sliding_window = None
+        layers = {"attn_0": mock_attn}
+        layers.update({f"gdn_{i}": DummyGdn() for i in range(3)})
+        mock_get_layers.return_value = layers
+
+        kv_cache_specs = self.runner.get_kv_cache_spec()
+
+        assert (self.runner._mamba_num_blocks is not None) == (not uniform_mamba_layout)
+        assert type(kv_cache_specs["attn_0"]) is FullAttentionSpec
+        for i in range(3):
+            spec = kv_cache_specs[f"gdn_{i}"]
+            expected = RunnerSlotMambaSpec if expect_runner_slot else MambaSpec
+            assert type(spec) is expected
+            assert spec.page_size_padded == 203776
 
     @patch.object(
         TpuPlatform, "_find_non_ssm_backend", return_value=PallasMLAttentionBackend

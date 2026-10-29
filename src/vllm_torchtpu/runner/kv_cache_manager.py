@@ -66,6 +66,7 @@ from vllm_torchtpu.block_major_pool import (
     BlockMajorPoolLayout,
     unified_block_major_enabled,
 )
+from vllm_torchtpu.core.runner_slot_mamba import maybe_runner_slot_mamba_spec
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kv_cache_materializer import (
     build_kernel_block_size_by_group_id,
@@ -237,6 +238,14 @@ class KVCacheManager:
                 self._update_mamba_page_size_padded(layers, block_size)
 
         hma_enabled = not self.runner.scheduler_config.disable_hybrid_kv_cache_manager
+        # Compact-mamba sizing (above) gave the GDN layers their own slot
+        # arrays, indexed by the runner's per-request slot ids: their scheduler
+        # blocks are never read.
+        runner_owns_mamba_slots = (
+            not self.runner._unified_kv_layout
+            and not self.runner._uniform_mamba_layout
+            and self.runner._mamba_num_blocks is not None
+        )
 
         kv_cache_spec: dict[str, KVCacheSpec] = {}
         # DSv4 layers whose specs must reach vLLM verbatim; see
@@ -247,7 +256,11 @@ class KVCacheManager:
             if isinstance(attn_module, MambaBase):
                 spec = attn_module.get_kv_cache_spec(self.runner.vllm_config)
                 if spec is not None:
-                    kv_cache_spec[layer_name] = spec
+                    kv_cache_spec[layer_name] = maybe_runner_slot_mamba_spec(
+                        spec,
+                        self.runner.vllm_config,
+                        runner_owns_slots=runner_owns_mamba_slots,
+                    )
             # DSv4's attention, SWA, compressor and indexer caches all build
             # their own specs, as the reference does.
             elif is_cache_for_ds_v4(attn_module):
