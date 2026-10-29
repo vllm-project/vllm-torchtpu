@@ -261,6 +261,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FUSED_READ_OFFSET_UPDATE: bool = True
     VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE: bool = False
     VLLM_TPU_BLOCK_TABLE_PACK_DELTA: bool = False
+    VLLM_TPU_TOKEN_PADDING_REUSE: bool = False
     VLLM_TPU_STAGE_TIMING_ONLY_WITH_SINK: bool = False
     VLLM_TPU_STAGED_WALK_CLASS_GATHER: bool = False
     VLLM_TPU_WARMED_SUBSTITUTE_SOURCE: bool = False
@@ -1593,6 +1594,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # With UPLOAD_REUSE: re-pack only the block tables that changed since the
     # previous pack of the same layout (per-table versions).
     "VLLM_TPU_BLOCK_TABLE_PACK_DELTA": env_bool("VLLM_TPU_BLOCK_TABLE_PACK_DELTA"),
+    # Skip the token-padding mask's synchronous H2D when its rows are the same
+    # as the last write (layers/adapter/token_padding.py).
+    "VLLM_TPU_TOKEN_PADDING_REUSE": env_bool("VLLM_TPU_TOKEN_PADDING_REUSE"),
     # Host-path pieces (q38f-int: default off, toggled per arm).
     # Record stage-timing device events only when a KV connector consumes them.
     "VLLM_TPU_STAGE_TIMING_ONLY_WITH_SINK": env_bool(
