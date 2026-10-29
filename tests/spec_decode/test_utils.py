@@ -201,3 +201,37 @@ def test_fit_rows_returns_slices_or_pads_the_leading_dim():
     out = utils.fit_rows(t, 6, value=-1)
     assert out.dtype == torch.int32 and out.shape == (6, 2)
     assert torch.equal(out[:4], t) and out[4:].eq(-1).all()
+
+
+def test_sample_draft_tokens_greedy_rows_take_argmax():
+    logits = torch.tensor([[0.0, 2.0, 1.0], [3.0, 0.0, 0.0]])
+    temperatures = torch.zeros(2)
+    # Noise that would pick a different token if it were honored.
+    uniform = torch.tensor([[0.5, 1e-6, 0.5], [1e-6, 0.5, 0.5]])
+    token_ids, probs = utils.sample_draft_tokens(logits, temperatures, uniform)
+    assert token_ids.tolist() == [1, 0]
+    assert probs.shape == (2, 3) and probs.dtype == torch.float32
+    torch.testing.assert_close(probs.sum(-1), torch.ones(2))
+
+
+def test_sample_draft_tokens_keeps_the_sampled_distribution():
+    logits = torch.tensor([[0.0, 1.0, 2.0, 3.0]])
+    temperatures = torch.tensor([[2.0]])
+    # Gumbel-max via exponential noise: argmax(p / -log(u)). A u close to 1
+    # gives tiny noise, so that entry wins however small its probability.
+    uniform = torch.tensor([[0.3, 1.0 - 1e-7, 0.3, 0.3]])
+    token_ids, probs = utils.sample_draft_tokens(logits, temperatures, uniform)
+    assert token_ids.tolist() == [1]
+    torch.testing.assert_close(probs, torch.softmax(logits / 2.0, dim=-1))
+
+
+def test_sample_draft_tokens_mixed_rows_and_temperature_shape():
+    logits = torch.tensor([[5.0, 0.0], [0.0, 5.0], [1.0, 1.0]])
+    temperatures = torch.tensor([0.0, 1.0, 0.5])  # 1-D form
+    uniform = torch.full((3, 2), 0.5)
+    uniform[2, 0] = 1.0 - 1e-7  # row 2 samples token 0 under equal logits
+    token_ids, probs = utils.sample_draft_tokens(logits, temperatures, uniform)
+    assert token_ids.tolist() == [0, 1, 0]
+    # Greedy rows are scaled by 1 (not 0): finite, normalized probabilities.
+    assert torch.isfinite(probs).all()
+    torch.testing.assert_close(probs[2], torch.tensor([0.5, 0.5]))
