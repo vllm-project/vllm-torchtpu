@@ -923,6 +923,7 @@ def test_propose_pads_each_step_to_coordinated_chunk_bound(
         _hidden_states_dtype=torch.float32,
         _dp_lockstep_enabled=lambda: True,
         _dp_step_num_chunks=3,
+        _dp_step_max_reqs=1,
         _dp_target_bucket=64,
     )
     proposer.draft_model = SimpleNamespace(
@@ -1006,6 +1007,367 @@ def test_loop_bucket_constant_under_sharded_lockstep():
     )
     assert rep._loop_bucket(1) == 16
     assert rep._loop_bucket(33) == 64
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("draft_tp, has_moe", [(2, False), (1, True)])
+@pytest.mark.parametrize("uses_mrope", [False, True])
+@pytest.mark.parametrize(
+    "buckets, max_reqs, max_capacity, most_capacity, expected",
+    [
+        (
+            [16, 32, 64, 128, 256, 512, 1024],
+            64,
+            64,
+            None,
+            {
+                16: [16],
+                32: [16, 32],
+                64: [16, 32, 64],
+                128: [16, 32, 64],
+                256: [16, 32, 64],
+                512: [16, 32, 64],
+                1024: [16, 32, 64],
+            },
+        ),
+        (
+            [8, 16, 24, 32, 48, 64],
+            50,
+            8,
+            33,
+            {
+                8: [8],
+                16: [8, 16],
+                24: [8, 16, 24],
+                32: [8, 16, 24, 32],
+                48: [8, 16, 24, 32, 48],
+                64: [8, 16, 24, 32, 48],
+            },
+        ),
+        (
+            [8, 16, 24, 32, 48, 64],
+            17,
+            17,
+            None,
+            {
+                8: [8],
+                16: [8, 16],
+                24: [8, 16, 24],
+                32: [8, 16, 24],
+                48: [8, 16, 24],
+                64: [8, 16, 24],
+            },
+        ),
+    ],
+)
+def test_mtp_dp_precompile_covers_first_pass_gather_shapes(
+    monkeypatch,
+    draft_tp,
+    has_moe,
+    uses_mrope,
+    buckets,
+    max_reqs,
+    max_capacity,
+    most_capacity,
+    expected,
+):
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+
+    monkeypatch.setattr(e3, "synchronize_tensors", lambda *a: None)
+    proposer = _make_proposer(draft_tp=draft_tp, target_tp=2, method="mtp")
+    proposer._draft_has_moe_cache = has_moe
+    proposer.runner = SimpleNamespace(
+        enforce_eager=False,
+        _dp_lockstep_enabled=lambda: True,
+        _dp_step_max_reqs=0,  # Startup has not coordinated a serving step.
+        max_num_reqs=max_reqs,
+        num_reqs_max_model_len=max_capacity,
+        num_reqs_most_model_len=most_capacity,
+        num_tokens_paddings=buckets,
+        device=torch.device("cpu"),
+        _hidden_states_dtype=torch.float32,
+        uses_mrope=uses_mrope,
+        _precompile_timed=lambda _: contextlib.nullcontext(),
+    )
+    proposer.draft_model = SimpleNamespace(config=SimpleNamespace(hidden_size=8))
+    for name in (
+        "_precompile_combine_hidden_states",
+        "_precompile_draft_seed",
+        "_precompile_compute_logits",
+    ):
+        monkeypatch.setattr(proposer, name, lambda: None)
+    gather = inspect.unwrap(Eagle3Proposer._draft_gather_carries).__get__(proposer)
+    seen = []
+
+    def record_gather(hidden, positions, last_hidden, indices):
+        T, p = hidden.shape[0], indices.shape[0]
+        assert hidden.shape == last_hidden.shape == (T, 8)
+        assert hidden.dtype == last_hidden.dtype == torch.float32
+        assert positions.shape == ((3, T) if uses_mrope else (T,))
+        assert positions.dtype == torch.int32
+        assert indices.dtype == torch.int64
+        out = gather(hidden, positions, last_hidden, indices)
+        assert out[0].shape == out[2].shape == (p, 8)
+        assert out[1].shape == ((3, p) if uses_mrope else (p,))
+        seen.append((T, p, hidden is last_hidden))
+        return out
+
+    proposer._draft_gather_carries = record_gather
+    proposer.precompile()
+    # T is coordinated across all chunks, so P may exceed THIS chunk's
+    # request count/capacity; it is still bounded by T and the global chunk cap.
+    # Tensor-returning MTP aliases the carries; tuple-returning MTP need not.
+    # Dynamo specializes on duplicate tensor arguments as well as their shape.
+    assert sorted(seen) == [
+        (T, p, aliases)
+        for T, ps in expected.items()
+        for p in ps
+        for aliases in (False, True)
+    ]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "method, draft_tp, lockstep, enforce_eager",
+    [
+        ("mtp", 2, False, False),
+        ("mtp", 1, True, False),
+        ("eagle3", 2, True, False),
+        ("qwen3_next_mtp", 2, True, False),
+        ("mtp", 2, True, True),
+    ],
+)
+def test_gather_aot_leaves_other_draft_paths_unchanged(
+    monkeypatch, method, draft_tp, lockstep, enforce_eager
+):
+    proposer = _make_proposer(draft_tp=draft_tp, target_tp=2, method=method)
+    proposer._draft_has_moe_cache = False
+    proposer.runner = SimpleNamespace(
+        enforce_eager=enforce_eager, _dp_lockstep_enabled=lambda: lockstep
+    )
+    for name in (
+        "_precompile_combine_hidden_states",
+        "_precompile_draft_seed",
+        "_precompile_compute_logits",
+    ):
+        monkeypatch.setattr(proposer, name, lambda: None)
+
+    def unexpected_gather(*args):
+        pytest.fail("gather AOT must only run for MTP EP-DP dynamic P")
+
+    proposer._draft_gather_carries = unexpected_gather
+    proposer.precompile()
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("method", ["mtp", "eagle3", "qwen3_next_mtp"])
+@pytest.mark.parametrize("draft_tp, has_moe", [(2, False), (1, True), (1, False)])
+@pytest.mark.parametrize("lockstep", [False, True])
+@pytest.mark.parametrize(
+    "dp_reqs, local_reqs, expected",
+    [(1, 1, 16), (16, 1, 16), (17, 1, 32), (32, 17, 32), (33, 17, 64)],
+)
+def test_mtp_loop_bucket_uses_dp_request_bound(
+    method, draft_tp, has_moe, lockstep, dp_reqs, local_reqs, expected
+):
+    proposer = _make_proposer(draft_tp=draft_tp, target_tp=2, method=method)
+    proposer._draft_has_moe_cache = has_moe
+    proposer.runner = SimpleNamespace(
+        num_tokens_paddings=[16, 32, 64],
+        max_num_reqs=64,
+        num_reqs_max_model_len=8,
+        _dp_step_max_reqs=dp_reqs,
+        _dp_lockstep_enabled=lambda: lockstep,
+    )
+    if not lockstep or (draft_tp == 1 and not has_moe):
+        expected = 16 if local_reqs <= 16 else 32
+    elif method != "mtp":
+        expected = 64
+    assert proposer._loop_bucket(local_reqs) == expected
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "dp_reqs, capacity, target_bucket, loop_bucket, active",
+    [(1, 32, 64, 16, 1), (17, 8, 64, 32, 8), (17, 32, 32, 32, 17)],
+)
+def test_mtp_dummy_limits_queries_without_shrinking_metadata(
+    monkeypatch, dp_reqs, capacity, target_bucket, loop_bucket, active
+):
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+
+    monkeypatch.setattr(e3, "synchronize_tensors", lambda *a: None)
+    proposer = _make_proposer(draft_tp=2, target_tp=2, method="mtp")
+    proposer.speculative_config.num_speculative_tokens = 3
+    proposer.runner = SimpleNamespace(
+        _dp_step_max_reqs=dp_reqs,
+        _dp_target_bucket=target_bucket,
+        num_reqs_max_model_len=capacity,
+        max_num_reqs=64,
+        num_tokens_paddings=[16, 32, 64],
+        device=torch.device("cpu"),
+        _hidden_states_dtype=torch.float32,
+        uses_mrope=False,
+        _dp_lockstep_enabled=lambda: True,
+    )
+    proposer.draft_model = SimpleNamespace(
+        config=SimpleNamespace(hidden_size=8),
+        model=SimpleNamespace(use_aux_hidden_state=False),
+    )
+    trace = []
+
+    def forward(*, chunk, step_idx, input_ids, **kwargs):
+        ctx = chunk.attn_ctx
+        assert chunk.num_reqs == ctx.num_reqs == active
+        assert ctx.seq_lens.shape == (capacity,)
+        qsl = ctx.query_start_loc if step_idx == 0 else kwargs["loop_query_start_loc"]
+        dist = (
+            ctx.request_distribution
+            if step_idx == 0
+            else kwargs["loop_request_distribution"]
+        )
+        assert qsl.tolist() == list(range(active + 1)) + [active] * (capacity - active)
+        assert chunk.query_start_loc_np.tolist() == ctx.query_start_loc.tolist()
+        assert dist.tolist() == [active] * 3
+        assert int(qsl[-1]) <= input_ids.shape[0]
+        trace.append((step_idx, input_ids.shape[0]))
+        hidden = torch.zeros((input_ids.shape[0], 8))
+        return hidden, hidden
+
+    proposer._forward_draft = forward
+    carries = []
+
+    def propose_token(hidden):
+        carries.append(hidden.shape[0])
+        return torch.zeros(hidden.shape[0], dtype=torch.int32)
+
+    proposer._draft_propose_token = propose_token
+    proposer.run_dp_dummy_draft(1)
+    assert trace == [(0, target_bucket), (1, loop_bucket), (2, loop_bucket)]
+    assert carries == [loop_bucket] * 3
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("num_steps", [1, 2, 3])
+@pytest.mark.parametrize("num_real_chunks", [0, 1, 2, 3])
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize("uses_mrope", [False, True])
+def test_mtp_dp_bucket_pairs_idle_and_uneven_chunks(
+    monkeypatch, num_steps, num_real_chunks, is_async, uses_mrope
+):
+    """A most-model-len real chunk may exceed the dummy's max-model-len cap."""
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+
+    monkeypatch.setattr(e3, "synchronize_tensors", lambda *a: None)
+    chunk_sizes = [1, 17, 5][:num_real_chunks]
+    num_reqs = sum(chunk_sizes)
+    proposer = _make_proposer(draft_tp=2, target_tp=2, method="mtp")
+    proposer.speculative_config.num_speculative_tokens = num_steps
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(
+            num_reqs=num_reqs, req_ids=[str(i) for i in range(num_reqs)]
+        ),
+        max_num_reqs=64,
+        num_reqs_max_model_len=8,
+        num_reqs_most_model_len=32,
+        num_tokens_paddings=[8, 16, 32, 64],
+        device=torch.device("cpu"),
+        uses_mrope=uses_mrope,
+        _hidden_states_dtype=torch.float32,
+        _dp_lockstep_enabled=lambda: True,
+        _dp_step_num_chunks=3,
+        _dp_step_max_reqs=17,
+        _dp_target_bucket=64,
+    )
+    proposer.draft_model = SimpleNamespace(
+        config=SimpleNamespace(hidden_size=8),
+        model=SimpleNamespace(use_aux_hidden_state=False),
+    )
+    proposer.draft_chunks = []
+    start = 0
+    for nr in chunk_sizes:
+        qsl = np.minimum(np.arange(33, dtype=np.int32), nr)
+        proposer.draft_chunks.append(
+            _make_chunk(
+                input_ids=torch.zeros(64, dtype=torch.int32),
+                position_ids=torch.zeros(
+                    (3, 64) if uses_mrope else (64,), dtype=torch.int32
+                ),
+                query_start_loc_np=qsl,
+                start_index=start,
+                num_reqs=nr,
+                device=torch.device("cpu"),
+                hidden_states=torch.zeros((64, 8)),
+                attn_ctx=SimpleNamespace(
+                    use_max_model_len=False,
+                    position_ids_override=None,
+                    query_start_loc=torch.from_numpy(qsl),
+                ),
+            )
+        )
+        start += nr
+    for name in ("_draft_gather_carries", "_draft_seed_input_ids"):
+        setattr(
+            proposer,
+            name,
+            inspect.unwrap(getattr(Eagle3Proposer, name)).__get__(proposer),
+        )
+    trace = []
+
+    def forward(*, chunk, step_idx, input_ids, positions, target_hidden_states, **kw):
+        n = 64 if step_idx == 0 else 32
+        assert input_ids.shape == (n,)
+        assert positions.shape == ((3, n) if uses_mrope else (n,))
+        assert target_hidden_states.shape == (n, 8)
+        assert kw["num_tokens_padded"] == n
+        if step_idx > 0:
+            qsl = kw["loop_query_start_loc"]
+            dist = kw["loop_request_distribution"]
+            assert int(qsl[-1]) == chunk.num_reqs <= n
+            assert dist.tolist() == [chunk.num_reqs] * 3
+            assert qsl.shape == (9 if chunk.attn_ctx.use_max_model_len else 33,)
+        elif chunk.attn_ctx.position_ids_override is None:
+            assert input_ids[: chunk.num_reqs].tolist() == [7] * chunk.num_reqs
+        trace.append(("forward", step_idx, n))
+        hidden = torch.full((n, 8), chunk.start_index * 10 + step_idx + 1)
+        return hidden, hidden
+
+    proposer._forward_draft = forward
+
+    def propose_token(hidden):
+        trace.append(("head", hidden.shape[0]))
+        return hidden[:, 0].to(torch.int32)
+
+    proposer._draft_propose_token = propose_token
+    if num_real_chunks == 0:
+        proposer.run_dp_dummy_draft(3)
+        result = []
+    else:
+        result = proposer.propose(
+            sampled_token_ids=[[7]] * num_reqs,
+            discard_sampled_tokens_req_indices=[],
+            num_rejected_tokens_np=None,
+            scheduler_output=SimpleNamespace(
+                num_scheduled_tokens={}, scheduled_spec_decode_tokens={}
+            ),
+            return_device=is_async,
+            next_tokens_per_chunk=(
+                [torch.full((nr, 1), 7, dtype=torch.int32) for nr in chunk_sizes]
+                if is_async
+                else None
+            ),
+        )
+    assert trace == [
+        event
+        for step in range(num_steps)
+        for _ in range(3)
+        for event in [("forward", step, 64 if step == 0 else 32), ("head", 32)]
+    ]
+    assert (result.tolist() if is_async and num_real_chunks else result) == [
+        [chunk.start_index * 10 + step + 1 for step in range(num_steps)]
+        for chunk in proposer.draft_chunks
+        for _ in range(chunk.num_reqs)
+    ]
 
 
 @pytest.mark.cpu_test

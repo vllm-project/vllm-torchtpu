@@ -1942,9 +1942,9 @@ class Eagle3Proposer:
 
         Warms the wrappers across their bucket shapes so they don't recompile on
         the first real propose(): combine_hidden_states (token-count buckets),
-        seed_input_ids ((token, index) buckets), and the lm-head/argmax
-        compute_logits (num_reqs buckets). The draft forward and the per-step
-        fused propose/verify programs are warmed by a real-path lifecycle
+        seed_input_ids and MTP EP-DP carry gathers ((token, index) buckets),
+        and the lm-head/argmax compute_logits (num_reqs buckets). The draft
+        forward and per-step fused propose/verify programs use a real-path lifecycle
         warmup, not here (a zeros-precompile of those emits programs that never
         match the runtime eager fusion).
         """
@@ -1952,6 +1952,7 @@ class Eagle3Proposer:
             return
         self._precompile_combine_hidden_states()
         self._precompile_draft_seed()
+        self._precompile_draft_gather()
         self._precompile_compute_logits()
 
     def _draft_hidden_size(self) -> int:
@@ -2036,7 +2037,14 @@ class Eagle3Proposer:
 
         runner = self.runner
         if self._dp_lockstep_sharded():
-            num_reqs = runner.max_num_reqs
+            if self.speculative_config.method == "mtp":
+                assert 0 < num_reqs <= runner._dp_step_max_reqs, (
+                    "MTP chunk exceeds the coordinated DP request bound: "
+                    f"{num_reqs=} dp_max_reqs={runner._dp_step_max_reqs}"
+                )
+                num_reqs = runner._dp_step_max_reqs
+            else:
+                num_reqs = runner.max_num_reqs
         return _get_padded_token_len(runner.num_tokens_paddings, num_reqs)
 
     def _precompile_combine_hidden_states(self) -> None:
@@ -2092,6 +2100,52 @@ class Eagle3Proposer:
                     nti = torch.zeros(p, dtype=torch.int32).to(runner.device)
                     out = self._draft_seed_input_ids(ids, lti, nti)
                     synchronize_tensors(out)
+
+    def _precompile_draft_gather(self) -> None:
+        if self.speculative_config.method != "mtp" or not self._dp_lockstep_sharded():
+            return
+        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
+
+        runner = self.runner
+        max_chunk_reqs = runner.num_reqs_max_model_len
+        if runner.num_reqs_most_model_len is not None:
+            max_chunk_reqs = max(max_chunk_reqs, runner.num_reqs_most_model_len)
+        max_loop_bucket = _get_padded_token_len(
+            runner.num_tokens_paddings, min(runner.max_num_reqs, max_chunk_reqs)
+        )
+        loop_buckets = [t for t in runner.num_tokens_paddings if t <= max_loop_bucket]
+        hidden_size = self._draft_hidden_size()
+        # The DP bound spans ALL chunks, not just this chunk's requests or
+        # dummy metadata capacity. Each request schedules >=1 token, and T is
+        # coordinated from per-rank TOTAL tokens, so P <= T. Only token buckets
+        # up to pad(max chunk capacity) are reachable P, even when T is larger.
+        with (
+            set_model_tag("eagle_head"),
+            runner._precompile_timed("drafter gather_carries"),
+        ):
+            for T in runner.num_tokens_paddings:
+                hidden = torch.zeros(
+                    (T, hidden_size),
+                    dtype=runner._hidden_states_dtype,
+                    device=runner.device,
+                )
+                last_hidden = torch.zeros_like(hidden)
+                positions = torch.zeros(
+                    (3, T) if runner.uses_mrope else (T,),
+                    dtype=torch.int32,
+                    device=runner.device,
+                )
+                for p in loop_buckets:
+                    if p > T:
+                        break
+                    indices = torch.zeros(p, dtype=torch.int64, device=runner.device)
+                    # _unwrap_model_out accepts both aliased tensor outputs and
+                    # distinct tuple outputs; Dynamo guards duplicate arguments.
+                    for head_hidden in (hidden, last_hidden):
+                        out = self._draft_gather_carries(
+                            hidden, positions, head_hidden, indices
+                        )
+                        synchronize_tensors(out)
 
     def _precompile_compute_logits(self) -> None:
         from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
@@ -2163,9 +2217,16 @@ class Eagle3Proposer:
         )
 
         actual_num_reqs = min(bucket, num_reqs)
+        dummy_num_reqs = num_reqs
         qsl_np = np.arange(num_reqs + 1, dtype=np.int32)
+        if self.speculative_config.method == "mtp":
+            # Keep max-model-len metadata capacity even when a real chunk uses
+            # the larger most-model-len request bound. Only dummy queries shrink.
+            actual_num_reqs = min(actual_num_reqs, runner._dp_step_max_reqs)
+            dummy_num_reqs = actual_num_reqs
+            qsl_np = np.minimum(qsl_np, actual_num_reqs)
         attn_ctx = AttentionMetadataBuilderContext(
-            num_reqs=num_reqs,
+            num_reqs=dummy_num_reqs,
             start_index=0,
             use_max_model_len=True,
             seq_lens=torch.ones(num_reqs, dtype=torch.int32, device=runner.device),
@@ -2187,11 +2248,11 @@ class Eagle3Proposer:
             query_start_loc_np=qsl_np,
             attn_ctx=attn_ctx,
             start_index=0,
-            num_reqs=num_reqs,
+            num_reqs=dummy_num_reqs,
             aux_hidden_states=[],
         )
         # Match propose's first-pass and loop buckets.
-        p = self._loop_bucket(num_reqs)
+        p = self._loop_bucket(dummy_num_reqs)
         draft_hidden = self._draft_hidden_size()
         dtype = runner._hidden_states_dtype
         # First-pass lm-head input mirrors the gathered carry [p, hidden].
