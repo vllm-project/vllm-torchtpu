@@ -19,40 +19,43 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 
+_LANE_GATHER = jax.lax.GatherDimensionNumbers(
+    offset_dims=(),
+    collapsed_slice_dims=(1,),
+    start_index_map=(1,),
+    operand_batching_dims=(0,),
+    start_indices_batching_dims=(0,),
+)
 
-def interleaved_rope_vector(x, cos_val_32, sin_val_32):
-    """Applies interleaved Rotary Position Embedding (RoPE) to a vector."""
-    # x: (tile_n, 1, 128)
+
+def swap_lane_pairs(x):
+    """Swaps adjacent lanes, [1, 0, 3, 2, ...], of a (rows, 128) array."""
+    swap_indices = jnp.bitwise_xor(jnp.arange(x.shape[-1]), 1)
+    return jax.lax.gather(
+        x,
+        jnp.broadcast_to(swap_indices, x.shape)[:, :, None],
+        dimension_numbers=_LANE_GATHER,
+        slice_sizes=(1, 1),
+        unique_indices=True,
+        mode=jax.lax.GatherScatterMode.PROMISE_IN_BOUNDS,
+    )
+
+
+def interleaved_rope_vector(x, x_swapped, cos_val_32, sin_val_32):
+    """Applies interleaved Rotary Position Embedding (RoPE) to a vector.
+
+    `x_swapped` must equal `swap_lane_pairs(x)`; a caller can often compute it
+    off the critical path, since the swap commutes with elementwise ops.
+    """
+    # x, x_swapped: (tile_n, 1, 128)
     # cos_val_32: (tile_n, 1, 32)
     # sin_val_32: (tile_n, 1, 32)
     tile_n = x.shape[0]
 
     # We work with 2D tensors for gather to keep dimensions simple.
     x_2d = jnp.squeeze(x, axis=1)  # (tile_n, 128)
-
-    # swap adjacent pairs: [1, 0, 3, 2, ...]
+    x_swapped_2d = jnp.squeeze(x_swapped, axis=1)
     iota = jnp.arange(128)
-    swap_indices = jnp.bitwise_xor(iota, 1)  # (128,)
-    swap_coords = jnp.broadcast_to(swap_indices, (tile_n, 128))[
-        :, :, None
-    ]  # (tile_n, 128, 1)
-
-    gather_dn = jax.lax.GatherDimensionNumbers(
-        offset_dims=(),
-        collapsed_slice_dims=(1,),
-        start_index_map=(1,),
-        operand_batching_dims=(0,),
-        start_indices_batching_dims=(0,),
-    )
-
-    x_swapped_2d = jax.lax.gather(
-        x_2d,
-        swap_coords,
-        dimension_numbers=gather_dn,
-        slice_sizes=(1, 1),
-        unique_indices=True,
-        mode=jax.lax.GatherScatterMode.PROMISE_IN_BOUNDS,
-    )
 
     # cos_val_32/sin_val_32 are (tile_n, 1, 32). Squeeze to (tile_n, 32)
     cos_32 = jnp.squeeze(cos_val_32, axis=1).astype(x.dtype)
@@ -72,7 +75,7 @@ def interleaved_rope_vector(x, cos_val_32, sin_val_32):
     cos_dup_2d = jax.lax.gather(
         cos_pairs,
         dup_coords,
-        dimension_numbers=gather_dn,
+        dimension_numbers=_LANE_GATHER,
         slice_sizes=(1, 1),
         unique_indices=False,
         mode=jax.lax.GatherScatterMode.PROMISE_IN_BOUNDS,
@@ -81,7 +84,7 @@ def interleaved_rope_vector(x, cos_val_32, sin_val_32):
     sin_dup_2d = jax.lax.gather(
         sin_pairs,
         dup_coords,
-        dimension_numbers=gather_dn,
+        dimension_numbers=_LANE_GATHER,
         slice_sizes=(1, 1),
         unique_indices=False,
         mode=jax.lax.GatherScatterMode.PROMISE_IN_BOUNDS,

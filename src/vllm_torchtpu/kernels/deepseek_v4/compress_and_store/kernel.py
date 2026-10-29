@@ -118,10 +118,9 @@ def inner_kernel(
 
     # --- rms norm ---
     variance = jnp.mean(jnp.square(compressed), axis=(1, 2), keepdims=True)
+    inv_rms = jax.lax.rsqrt(variance + cfgs.dims.rms_eps)
     normed = (
-        compressed
-        * jax.lax.rsqrt(variance + cfgs.dims.rms_eps)
-        * rms_weight_tiled[None, :, :]
+        compressed * inv_rms * rms_weight_tiled[None, :, :]
     )  # (tile_n, head_tiles, 128)
 
     # --- rope ---
@@ -129,12 +128,21 @@ def inner_kernel(
     if cfgs.dims.has_rope:
         rope_slot = cfgs.rope_slot
         rope_val = normed[:, rope_slot : rope_slot + 1]
+        # The lane swap commutes with the norm's products, so swapping
+        # `compressed` gives the same values while the variance is reduced.
+        rope_swapped = (
+            compute.swap_lane_pairs(compressed[:, rope_slot])[:, None]
+            * inv_rms
+            * compute.swap_lane_pairs(rms_weight_tiled[rope_slot : rope_slot + 1])
+        )
 
         cos_sin = cos_sin_vmem[...][:, None, :]
         cos_val = cos_sin[:, :, : cfgs.half_rope]
         sin_val = cos_sin[:, :, cfgs.half_rope :]
 
-        rope_ropped = compute.interleaved_rope_vector(rope_val, cos_val, sin_val)
+        rope_ropped = compute.interleaved_rope_vector(
+            rope_val, rope_swapped, cos_val, sin_val
+        )
         if head_tiles > 1:
             normed = jnp.concatenate([normed[:, :rope_slot], rope_ropped], axis=1)
         else:
