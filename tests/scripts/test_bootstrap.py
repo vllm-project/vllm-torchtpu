@@ -15,7 +15,9 @@
 
 from __future__ import annotations
 
+import http.client
 import http.server
+import importlib
 import json
 import os
 import pathlib
@@ -27,6 +29,7 @@ import tempfile
 import threading
 import unittest
 from typing import Any
+from unittest import mock
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _SCRIPTS_DIR = _REPO_ROOT / ".buildkite" / "scripts"
@@ -34,11 +37,6 @@ _GOLDENS_PATH = (
     pathlib.Path(__file__).resolve().parent / "fixtures" / "bootstrap_goldens.json"
 )
 _BK_BIN = shutil.which("bk")
-
-if str(_SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS_DIR))
-
-import bootstrap as bp  # noqa: E402
 
 _FAKE_AGENT_BODY = """
 import json
@@ -60,8 +58,10 @@ def append_jsonl(name: str, obj: object) -> None:
 append_jsonl("commands.jsonl", shlex.join(["buildkite-agent", *args]))
 
 if args[:2] == ["meta-data", "set"]:
+    print("agent: meta-data set", flush=True)
     append_jsonl("metadata.jsonl", {"key": args[2], "value": args[3]})
 elif args[:1] == ["annotate"]:
+    print("agent: annotate", flush=True)
     style = ""
     context = ""
     body_parts = []
@@ -83,10 +83,13 @@ elif args[:1] == ["annotate"]:
 elif args[:2] == ["pipeline", "upload"]:
     content = sys.stdin.read()
     if "--dry-run" in args:
+        if os.environ.get("TEST_DRY_RUN_FAIL") == "1":
+            sys.exit(1)
         doc = yaml.safe_load(content) or {}
         clean = {k: v for k, v in doc.items() if not k.startswith("x-")}
         json.dump(clean, sys.stdout)
     else:
+        print("agent: pipeline upload", flush=True)
         tracked_vars = (
             "JOB_PRIORITY",
             "PR_TPU_CONCURRENCY_GROUP",
@@ -122,9 +125,38 @@ if args[:1] in (["diff"], ["diff-tree"]):
     sys.exit(0)
 if args[:1] == ["ls-remote"]:
     head = os.environ.get("TEST_VLLM_UPSTREAM_HEAD", "upstreamhead0000")
-    sys.stdout.write(f"{head}\\tHEAD\\n")
+    if head:
+        sys.stdout.write(f"{head}\\tHEAD\\n")
     sys.exit(0)
 sys.exit(f"Unexpected git command: {args!r}")
+"""
+
+_CHILD_BOOTSTRAP_RUNNER = """
+import io
+import pathlib
+import sys
+
+scripts_dir, repo_arg, helper_arg, api_url = sys.argv[1:5]
+sys.path.insert(0, scripts_dir)
+import bootstrap as bp
+
+if isinstance(sys.stdout, io.TextIOWrapper):
+    sys.stdout.reconfigure(line_buffering=True)
+if isinstance(sys.stderr, io.TextIOWrapper):
+    sys.stderr.reconfigure(line_buffering=True)
+
+repo_root = pathlib.Path(repo_arg)
+effects = bp.BootstrapEffects(
+    repo_root=repo_root,
+    credential_helper=pathlib.Path(helper_arg),
+    github_api_url=api_url,
+)
+try:
+    rc = bp.run_bootstrap(repo_root=repo_root, effects=effects)
+except bp.BootstrapError as exc:
+    print(str(exc), file=sys.stderr)
+    sys.exit(1)
+sys.exit(rc)
 """
 
 
@@ -138,12 +170,26 @@ def _read_jsonl(path: pathlib.Path) -> list[Any]:
     ]
 
 
+def _install_stubs(bin_dir: pathlib.Path) -> None:
+    for name, body in (
+        ("buildkite-agent", _FAKE_AGENT_BODY),
+        ("git", _FAKE_GIT_BODY),
+    ):
+        path = bin_dir / name
+        path.write_text(f"#!{sys.executable}\n{body.lstrip()}", encoding="utf-8")
+        path.chmod(path.stat().st_mode | stat.S_IEXEC)
+
+    py3_link = bin_dir / "python3"
+    if not py3_link.exists():
+        py3_link.symlink_to(sys.executable)
+
+
 def _run_bootstrap_case(
     case_input: dict[str, Any],
     *,
     fixture_files: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Run `bootstrap.sh` against stub `buildkite-agent`, `git`, and GitHub API."""
+    """Run `bootstrap.py` against stub `buildkite-agent`, `git`, and GitHub API."""
     labels_map: dict[str, list[str]] = case_input.get("github_labels") or {}
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = pathlib.Path(tmp)
@@ -151,6 +197,7 @@ def _run_bootstrap_case(
         bin_dir = tmp_path / "bin"
         log_dir.mkdir()
         bin_dir.mkdir()
+        _install_stubs(bin_dir)
 
         if fixture_files is not None:
             repo_dir = tmp_path / "repo"
@@ -159,25 +206,11 @@ def _run_bootstrap_case(
                 dest = repo_dir / rel
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_text(content, encoding="utf-8")
-            shutil.copytree(_SCRIPTS_DIR, repo_dir / ".buildkite" / "scripts")
-            bootstrap_sh = repo_dir / ".buildkite" / "scripts" / "bootstrap.sh"
+            scripts_dir = repo_dir / ".buildkite" / "scripts"
+            shutil.copytree(_SCRIPTS_DIR, scripts_dir)
         else:
             repo_dir = _REPO_ROOT
-            bootstrap_sh = _SCRIPTS_DIR / "bootstrap.sh"
-
-        for name, body in (
-            ("buildkite-agent", _FAKE_AGENT_BODY),
-            ("git", _FAKE_GIT_BODY),
-        ):
-            path = bin_dir / name
-            path.write_text(f"#!{sys.executable}\n{body.lstrip()}", encoding="utf-8")
-            path.chmod(path.stat().st_mode | stat.S_IEXEC)
-
-        # Also put sys.executable's directory on PATH so `python3` resolves to an
-        # interpreter with PyYAML when the test runs inside a virtualenv.
-        py3_link = bin_dir / "python3"
-        if not py3_link.exists():
-            py3_link.symlink_to(sys.executable)
+            scripts_dir = _SCRIPTS_DIR
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
@@ -218,7 +251,6 @@ def _run_bootstrap_case(
                 "TEST_VLLM_UPSTREAM_HEAD": case_input.get(
                     "vllm_upstream_head", "upstreamhead0000"
                 ),
-                "GITHUB_API_URL": f"http://127.0.0.1:{port}",
                 "BUILDKITE_COMMIT": "HEAD",
                 "BUILDKITE_BRANCH": "feature-branch",
                 "BUILDKITE_PULL_REQUEST": "false",
@@ -226,8 +258,18 @@ def _run_bootstrap_case(
                 "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-ci",
                 **case_input["env"],
             }
+            # Invoke Python without `-u` so line_buffering=True in bootstrap.py
+            # is exercised over a real stdout pipe shared with child processes.
             proc = subprocess.run(
-                ["bash", str(bootstrap_sh)],
+                [
+                    sys.executable,
+                    "-c",
+                    _CHILD_BOOTSTRAP_RUNNER,
+                    str(scripts_dir),
+                    str(repo_dir),
+                    str(tmp_path / "missing-credential-helper"),
+                    f"http://127.0.0.1:{port}",
+                ],
                 cwd=repo_dir,
                 env=run_env,
                 capture_output=True,
@@ -240,6 +282,7 @@ def _run_bootstrap_case(
 
         return {
             "exit_code": proc.returncode,
+            "stdout": proc.stdout.splitlines(),
             "commands": _read_jsonl(log_dir / "commands.jsonl"),
             "metadata": _read_jsonl(log_dir / "metadata.jsonl"),
             "annotations": _read_jsonl(log_dir / "annotations.jsonl"),
@@ -248,9 +291,26 @@ def _run_bootstrap_case(
 
 
 class TestBootstrapGoldensAndUnits(unittest.TestCase):
-    """Verify exact parity with recorded `main` goldens and pure helper edge cases."""
+    """Verify exact parity with recorded `main` goldens and helper edge cases."""
 
     maxDiff = None
+    bp: Any
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        had_bp = "bootstrap" in sys.modules
+        had_cap = "cap_pr_tpu_concurrency" in sys.modules
+        with mock.patch.object(sys, "path", [str(_SCRIPTS_DIR), *sys.path]):
+            cls.bp = importlib.import_module("bootstrap")
+
+        def _cleanup_modules() -> None:
+            if not had_bp:
+                sys.modules.pop("bootstrap", None)
+            if not had_cap:
+                sys.modules.pop("cap_pr_tpu_concurrency", None)
+
+        cls.addClassCleanup(_cleanup_modules)
 
     def _validate_upload(self, content: str, label: str) -> None:
         if not _BK_BIN:
@@ -275,7 +335,7 @@ class TestBootstrapGoldensAndUnits(unittest.TestCase):
         golden_bundle = json.loads(_GOLDENS_PATH.read_text(encoding="utf-8"))
         fixture_files: dict[str, str] = golden_bundle["fixture_files"]
         cases: list[dict[str, Any]] = golden_bundle["cases"]
-        self.assertGreaterEqual(len(cases), 13)
+        self.assertGreaterEqual(len(cases), 17)
 
         for case in cases:
             with self.subTest(case=case["name"]):
@@ -323,8 +383,9 @@ class TestBootstrapGoldensAndUnits(unittest.TestCase):
                 for idx, upload in enumerate(res["uploads"]):
                     self._validate_upload(upload["content"], f"real_{name}[{idx}]")
 
-    def test_constants_stay_in_sync_with_pipeline_config_sh(self) -> None:
+    def test_shell_wrapper_and_pipeline_config_upload_cli(self) -> None:
         config_sh = _SCRIPTS_DIR / "configs" / "pipeline_config.sh"
+        bootstrap_sh = _SCRIPTS_DIR / "bootstrap.sh"
         names = (
             "PRIORITY_ONCALL_FIX",
             "PRIORITY_POST_MERGE",
@@ -343,14 +404,115 @@ class TestBootstrapGoldensAndUnits(unittest.TestCase):
             text=True,
             check=True,
         )
-        shell_vals = {}
-        for line in proc.stdout.splitlines():
-            key, val = line.split("=", 1)
-            shell_vals[key] = int(val)
-        py_vals = {name: getattr(bp, name) for name in names}
+        shell_vals = {
+            k: int(v)
+            for k, v in (line.split("=", 1) for line in proc.stdout.splitlines())
+        }
+        py_vals = {name: getattr(self.bp, name) for name in names}
         self.assertEqual(py_vals, shell_vals)
 
-    def test_pure_planning_and_credential_helper_edge_cases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            log_dir = tmp_path / "logs"
+            bin_dir = tmp_path / "bin"
+            log_dir.mkdir()
+            bin_dir.mkdir()
+            _install_stubs(bin_dir)
+
+            sample_yaml = tmp_path / "sample.yml"
+            sample_yaml.write_text(
+                "steps:\n"
+                '  - label: "TPU step"\n'
+                '    if: \'build.env("NIGHTLY") == "1"\'\n'
+                "    agents:\n"
+                '      queue: "kube"\n'
+                "    env:\n"
+                '      SHAPE: "tpu7x-standard-1t/1x1x1"\n'
+                "    commands:\n"
+                "      - echo hi\n",
+                encoding="utf-8",
+            )
+            base_env = {
+                "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                "HOME": str(tmp_path),
+                "TEST_LOG_DIR": str(log_dir),
+                "NIGHTLY": "1",
+                "PR_TPU_CONCURRENCY_GROUP": "tpu-pr/dev@example.com",
+            }
+            # 1. Shell `upload_with_priority` delegates to `bootstrap.py upload`
+            # and flushes its `---` group header before child output on a pipe.
+            upload_proc = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    f'source "{config_sh}" && upload_with_priority "{sample_yaml}"',
+                ],
+                cwd=tmp_path,
+                env=base_env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertEqual(
+                upload_proc.stdout.splitlines(),
+                [
+                    f"--- :pipeline: Uploading {sample_yaml} with priority 2",
+                    "agent: pipeline upload",
+                ],
+            )
+            uploads = _read_jsonl(log_dir / "uploads.jsonl")
+            self.assertEqual(len(uploads), 1)
+            self.assertEqual(uploads[0]["args"], ["--no-interpolation"])
+            parsed = json.loads(uploads[0]["content"])
+            self.assertEqual(parsed["priority"], 2)
+            self.assertEqual(parsed["steps"][0]["if"], '"1" == "1"')
+            self.assertEqual(
+                parsed["steps"][0]["concurrency_group"], "tpu-pr/dev@example.com"
+            )
+
+            # 2. Dry-run failure falls back to uncapped upload with stderr warning.
+            fallback_proc = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    f'source "{config_sh}" && upload_with_priority "{sample_yaml}" 9',
+                ],
+                cwd=tmp_path,
+                env={**base_env, "TEST_DRY_RUN_FAIL": "1"},
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertIn("WARNING: could not put", fallback_proc.stderr)
+            uploads = _read_jsonl(log_dir / "uploads.jsonl")
+            self.assertEqual(uploads[1]["args"], [])
+            self.assertTrue(uploads[1]["content"].startswith("priority: 9\n"))
+
+            # 3. Direct `bash bootstrap.sh` wrapper preserves `---` group order.
+            wrapper_proc = subprocess.run(
+                ["bash", str(bootstrap_sh)],
+                cwd=_REPO_ROOT,
+                env={
+                    **base_env,
+                    "NIGHTLY": "0",
+                    "BUILDKITE_PULL_REQUEST": "false",
+                    "BUILDKITE_BRANCH": "main",
+                    "BUILDKITE_SOURCE": "schedule",
+                },
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            lines = wrapper_proc.stdout.splitlines()
+            start_idx = lines.index("--- Starting Buildkite Bootstrap")
+            finish_idx = lines.index("--- Buildkite Bootstrap Finished")
+            self.assertLess(start_idx, finish_idx)
+            for idx, line in enumerate(lines):
+                if line.startswith("--- :pipeline: Uploading "):
+                    self.assertEqual(lines[idx + 1], "agent: pipeline upload")
+
+    def test_pure_planning_and_github_error_resilience(self) -> None:
+        bp = self.bp
         # .pyrefly-baseline.json is skippable; .pyrefly-baseline-full.json is not.
         self.assertTrue(bp.only_docs_changed([".pyrefly-baseline.json", "README.md"]))
         self.assertFalse(
@@ -380,7 +542,8 @@ class TestBootstrapGoldensAndUnits(unittest.TestCase):
         )
         self.assertIsNotNone(plan_missing.missing_ci_lanes_error)
 
-        # Credential helper supplies GitHub App token to Authorization header.
+        # Credential helper supplies GitHub App token; timeout or HTTPException
+        # never crashes post-merge bootstrap and falls back cleanly.
         seen_auth: list[str | None] = []
 
         class AuthHandler(http.server.BaseHTTPRequestHandler):
@@ -395,7 +558,8 @@ class TestBootstrapGoldensAndUnits(unittest.TestCase):
                 return
 
         with tempfile.TemporaryDirectory() as tmp:
-            helper = pathlib.Path(tmp) / "git-credential-github-app"
+            tmp_path = pathlib.Path(tmp)
+            helper = tmp_path / "git-credential-github-app"
             helper.write_text(
                 "#!/usr/bin/env bash\n"
                 "echo username=x-access-token\n"
@@ -403,24 +567,66 @@ class TestBootstrapGoldensAndUnits(unittest.TestCase):
                 encoding="utf-8",
             )
             helper.chmod(helper.stat().st_mode | stat.S_IEXEC)
+
+            slow_helper = tmp_path / "slow-credential-helper"
+            slow_helper.write_text("#!/usr/bin/env bash\nsleep 5\n", encoding="utf-8")
+            slow_helper.chmod(slow_helper.stat().st_mode | stat.S_IEXEC)
+
             server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), AuthHandler)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
+                api_url = f"http://127.0.0.1:{server.server_address[1]}"
                 effects = bp.BootstrapEffects(
-                    repo_root=_REPO_ROOT, credential_helper=helper
+                    repo_root=_REPO_ROOT,
+                    credential_helper=helper,
+                    github_api_url=api_url,
                 )
-                labels = effects.merged_pr_labels(
-                    "42",
-                    github_api_url=f"http://127.0.0.1:{server.server_address[1]}",
-                    env={},
+                labels = effects.merged_pr_labels("42", env={})
+
+                # Credential helper timeout (SubprocessError) is caught and
+                # proceeds unauthenticated rather than crashing post-merge CI.
+                timeout_effects = bp.BootstrapEffects(
+                    repo_root=_REPO_ROOT,
+                    credential_helper=slow_helper,
+                    credential_timeout=0.05,
+                    github_api_url=api_url,
                 )
+                timeout_labels = timeout_effects.merged_pr_labels("42", env={})
             finally:
                 server.shutdown()
                 server.server_close()
 
-        self.assertEqual(labels, ("skip-tpu-ci",))
-        self.assertEqual(seen_auth, ["token ghs_tok"])
+            self.assertEqual(labels, ("skip-tpu-ci",))
+            self.assertEqual(timeout_labels, ("skip-tpu-ci",))
+            self.assertEqual(seen_auth, ["token ghs_tok", None])
+
+            # http.client.HTTPException (e.g. IncompleteRead) returns () so the
+            # post-merge build runs everything instead of failing bootstrap.
+            with mock.patch(
+                "urllib.request.urlopen",
+                side_effect=http.client.IncompleteRead(b"partial", 10),
+            ):
+                http_err_effects = bp.BootstrapEffects(
+                    repo_root=_REPO_ROOT,
+                    credential_helper=tmp_path / "none",
+                )
+                self.assertEqual(http_err_effects.merged_pr_labels("42", env={}), ())
+
+            # Empty `git ls-remote` output returns "" (matching `awk '{ print $1 }'`).
+            bin_dir = tmp_path / "bin"
+            log_dir = tmp_path / "logs"
+            bin_dir.mkdir()
+            log_dir.mkdir()
+            _install_stubs(bin_dir)
+            empty_head = http_err_effects.vllm_upstream_head(
+                env={
+                    "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                    "TEST_LOG_DIR": str(log_dir),
+                    "TEST_VLLM_UPSTREAM_HEAD": "",
+                }
+            )
+            self.assertEqual(empty_head, "")
 
 
 if __name__ == "__main__":

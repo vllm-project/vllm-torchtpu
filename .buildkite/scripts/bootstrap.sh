@@ -13,4 +13,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-exec python3 "$(dirname "${BASH_SOURCE[0]}")/bootstrap.py" "$@"
+exec python3 -u "$(dirname "${BASH_SOURCE[0]}")/bootstrap.py" "$@"
