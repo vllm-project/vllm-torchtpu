@@ -1650,6 +1650,92 @@ def test_attention_residual_single_token_matches_batched_rows() -> None:
         torch.testing.assert_close(alone, batched[row : row + 1])
 
 
+def test_attention_residual_kernel_only_from_min_tokens() -> None:
+    """Row counts below the kernel threshold mix inline even when they are
+    16-row tiles; from the threshold on, the fused kernel takes them."""
+    torch.manual_seed(0)
+    module = _attention_residual_stub(hidden=64, eps=1e-5)
+    ref_prefix = torch.randn(2032, 64, dtype=torch.bfloat16)
+    ref_blocks = torch.randn(2032, 4, 64, dtype=torch.bfloat16)
+    expected_2032 = module(ref_prefix, ref_blocks)
+
+    calls: list[int] = []
+
+    def fake_prefill_op(
+        prefix: torch.Tensor, _history: torch.Tensor, _weight: torch.Tensor
+    ) -> torch.Tensor:
+        calls.append(prefix.shape[0])
+        return torch.zeros_like(prefix)
+
+    module._prefill_op = fake_prefill_op
+
+    for n in (16, 32, 64, 128, 256, 512, 1024):
+        module(
+            torch.randn(n, 64, dtype=torch.bfloat16),
+            torch.randn(n, 4, 64, dtype=torch.bfloat16),
+        )
+    actual_2032 = module(ref_prefix, ref_blocks)
+    assert calls == []
+    torch.testing.assert_close(actual_2032, expected_2032)
+
+    for n in (2048, 2049, 4096):
+        module(
+            torch.randn(n, 64, dtype=torch.bfloat16),
+            torch.randn(n, 4, 64, dtype=torch.bfloat16),
+        )
+    assert calls == [2048, 4096]
+
+
+@pytest.mark.parametrize("backed_size_oblivious", [False, True])
+def test_attention_residual_min_tokens_trace_guards(
+    backed_size_oblivious: bool,
+) -> None:
+    """Traces on either side of _ATTNRES_KERNEL_MIN_TOKENS refuse buckets on the
+    other side so shape_variants gives decode and prefill distinct traces."""
+    torch.manual_seed(0)
+    module = _attention_residual_stub(hidden=64, eps=1e-5)
+    module._prefill_op = lambda prefix, _history, _weight: prefix
+    graphs = []
+
+    def capture(graph, _inputs):
+        graphs.append(graph)
+        return graph.forward
+
+    def trace_env_for(num_tokens: int):
+        graphs.clear()
+        prefix_sum = torch.randn(num_tokens, 64, dtype=torch.bfloat16)
+        block_residuals = torch.randn(num_tokens, 8, 64, dtype=torch.bfloat16)
+        mark_dynamic(prefix_sum, 0)
+        mark_dynamic(block_residuals, 0)
+        torch._dynamo.reset()
+        with fx_config.patch(backed_size_oblivious=backed_size_oblivious):
+            compiled = torch.compile(
+                module, backend=capture, fullgraph=True, dynamic=False
+            )
+            compiled(prefix_sum, block_residuals)
+        return trace_shape_env(graphs[0])
+
+    decode_env = trace_env_for(512)
+    # The threshold is checked before the multiple-of-16 test, so bucket 8
+    # shares the trace of the 16-aligned buckets below the threshold.
+    assert unsupported_reason(decode_env, 8) is None
+    assert unsupported_reason(decode_env, 16) is None
+    assert unsupported_reason(decode_env, 1024) is None
+    assert unsupported_reason(decode_env, 2032) is None
+    if backed_size_oblivious:
+        # The TPU platform enables size-oblivious shapes when 1 is in
+        # compile_sizes so s0 == 1 emits a guard instead of 0/1 specialization.
+        assert unsupported_reason(decode_env, 1) is not None
+    assert unsupported_reason(decode_env, 2048) is not None
+
+    prefill_env = trace_env_for(2048)
+    assert unsupported_reason(prefill_env, 2048) is None
+    assert unsupported_reason(prefill_env, 8192) is None
+    assert unsupported_reason(prefill_env, 512) is not None
+    assert unsupported_reason(prefill_env, 2032) is not None
+    assert unsupported_reason(prefill_env, 2049) is not None
+
+
 def test_attention_residual_single_token_trace_is_its_own_bucket() -> None:
     """The one-token structure must not leak into other token buckets.
 
