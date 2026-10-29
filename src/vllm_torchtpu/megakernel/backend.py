@@ -38,6 +38,7 @@ LOAD_FORMAT = "megakernel"
 PROGRAMS = {
     "KimiK3ForConditionalGeneration": "kimi_k3",
     "KimiLinearForCausalLM": "kimi_k3",
+    "Qwen3_5MoeForCausalLM": "qwen38",
 }
 
 
@@ -95,20 +96,36 @@ def _loader_config(vllm_config: Any, selected: str) -> dict:
             f"--model-loader-extra-config for the megakernel {selected} role "
             f"takes {sorted(keys)}, not {sorted(unknown)}{hint}"
         )
-    if not value.get("presharded"):
+    if (
+        "presharded" in keys
+        and not value.get("presharded")
+        and value.get("synthetic_seed") is None
+    ):
         raise ValueError(
             "--load-format megakernel needs --model-loader-extra-config "
-            '\'{"presharded": "<dir>"}\': the TP32 pre-shard directory '
-            "(e.g. /path/to/kimi-k3-tp32)"
+            '\'{"presharded": "<dir>"}\': the pre-shard directory of the '
+            "program (e.g. /path/to/kimi-k3-tp32)"
         )
     return value
 
 
-def presharded(vllm_config: Any) -> Path:
+def presharded(vllm_config: Any) -> Path | None:
+    """The program's pre-shard directory (None: synthetic weights)."""
     selected = role(vllm_config)
     if selected is None:
         raise ValueError("the megakernel backend is not selected (--load-format)")
-    return Path(_loader_config(vllm_config, selected)["presharded"])
+    path = _loader_config(vllm_config, selected).get("presharded")
+    return Path(path) if path else None
+
+
+def synthetic_seed(vllm_config: Any) -> int | None:
+    """The seed of random weights in place of a pre-shard (``synthetic_seed``
+    in the loader config of a program that takes it), for timing runs."""
+    selected = role(vllm_config)
+    if selected is None:
+        return None
+    seed = _loader_config(vllm_config, selected).get("synthetic_seed")
+    return None if seed is None else int(seed)
 
 
 def draft(vllm_config: Any) -> Path | None:

@@ -215,12 +215,14 @@ ignore = [
 "src/vllm_torchtpu/kernels/mla/kv_cache_utils.py" = ["TID251"]
 "src/vllm_torchtpu/kernels/partial_kv_update.py" = ["TID251"]
 "src/vllm_torchtpu/kernels/pool_adapters.py" = ["TID251"]
-# The K3 megakernel backend binds its programs to torch and vLLM; its kernels
-# (megakernel/common/, megakernel/kimi_k3/kernels/) stay JAX and Pallas only.
+# The megakernel backend binds its programs to torch and vLLM; its kernels
+# (megakernel/common/, megakernel/kimi_k3/kernels/, the rest of
+# megakernel/qwen38/) stay JAX and Pallas only.
 "src/vllm_torchtpu/megakernel/{bridge,compilation,dp_blocks,export_cache,loader,program,runner}.py" = [
     "TID251",
 ]
 "src/vllm_torchtpu/megakernel/kimi_k3/*.py" = ["TID251"]
+"src/vllm_torchtpu/megakernel/qwen38/{program,stage,weights}.py" = ["TID251"]
 
 # Pallas runs a kernel closure the moment it is defined: `pl.when` and
 # `pl.loop` trace the body during the decorator call, inside the iteration

@@ -407,6 +407,8 @@ def from_vllm(vllm_config: Any, tp_rank: int):
                 moe_reduce_dtype=moe_reduce_dtype,
             )
         )
+    presharded = backend.presharded(vllm_config)
+    assert presharded is not None  # K3's loader keys have no synthetic_seed
     if config.pipeline_parallel_size > 1:
         from vllm.distributed import get_pp_group
         from vllm.distributed.parallel_state import get_pcp_group
@@ -428,7 +430,7 @@ def from_vllm(vllm_config: Any, tp_rank: int):
             )
         return build_stage(
             config,
-            backend.presharded(vllm_config),
+            presharded,
             stage=stage,
             mesh=get_or_create_pcp_mesh(AXIS),
             core=get_pcp_group().rank_in_group,
@@ -440,4 +442,4 @@ def from_vllm(vllm_config: Any, tp_rank: int):
         draft = backend.draft(vllm_config)
     else:
         draft = Path(str(spec.model)) if spec is not None else None
-    return build(config, backend.presharded(vllm_config), draft, tp_rank=tp_rank)
+    return build(config, presharded, draft, tp_rank=tp_rank)
