@@ -43,6 +43,14 @@ ENV CXX=g++
 ENV CC=gcc
 ENV VLLM_TARGET_DEVICE=empty
 
+# Wheels that are not in the torch-tpu registry, as space-separated gs:// URIs.
+# The install step below downloads them with the gcloud token and passes them
+# to uv as a find-links directory, so a pin in pyproject.toml can resolve to
+# one of them. The token's account needs storage.objects.get on each bucket.
+# The step runs with --no-sources because [tool.uv.sources] in pyproject.toml
+# limits torch-tpu to the registry index, which hides find-links wheels.
+ARG EXTRA_WHEEL_URIS="gs://helper-wheels-ali/torch_tpu-0.1.1.dev20260928182719-cp312-cp312-manylinux_2_31_x86_64.whl"
+
 # Install all dependencies from pyproject.toml. We mount the gcloud token secret
 # to authenticate with the private torch-tpu registry, falling back to PyPI for other packages.
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -51,13 +59,28 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     TOKEN=""; \
     if [ -f /run/secrets/gcloud_token ]; then TOKEN="$(cat /run/secrets/gcloud_token)"; fi; \
     if [ -z "${TOKEN}" ]; then echo "Missing BuildKit secret gcloud_token for registry mode" >&2; exit 1; fi; \
+    EXTRA_WHEEL_DIR=/tmp/extra-wheels; \
+    mkdir -p "${EXTRA_WHEEL_DIR}"; \
+    for uri in ${EXTRA_WHEEL_URIS}; do \
+      object="${uri#gs://}"; \
+      echo "Downloading extra wheel ${uri}"; \
+      if ! curl -fsSL --retry 3 -H "Authorization: Bearer ${TOKEN}" \
+          -o "${EXTRA_WHEEL_DIR}/${object##*/}" \
+          "https://storage.googleapis.com/${object}"; then \
+        echo "[docker-build] Failed to download extra wheel ${uri}. The build token's account needs storage.objects.get on gs://${object%%/*}." >&2; \
+        exit 1; \
+      fi; \
+    done; \
     export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken; \
     export UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD="${TOKEN}"; \
     uv pip install --system \
       --index https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/ \
       --extra-index-url https://pypi.org/simple \
+      --find-links "${EXTRA_WHEEL_DIR}" \
       --index-strategy unsafe-best-match \
-      -r pyproject.toml
+      --no-sources \
+      -r pyproject.toml; \
+    rm -rf "${EXTRA_WHEEL_DIR}"
 
 
 # Variant 2: The CI Environment (CI/CD Variant)
