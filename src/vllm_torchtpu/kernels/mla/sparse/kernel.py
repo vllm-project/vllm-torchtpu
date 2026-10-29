@@ -1010,6 +1010,18 @@ def _chunk_kernel_batch_size(
     return small_chunk, _largest_divisor(chunk_size, batch_cap)
 
 
+def supports_split_q(q_nope: jax.Array, q_pe: jax.Array) -> bool:
+    """Whether `(q_nope, q_pe)` satisfies the `q_pe=` split-Q kernel envelope."""
+    return (
+        q_nope.ndim == 3
+        and q_pe.ndim == 3
+        and q_pe.shape[:2] == q_nope.shape[:2]
+        and q_pe.dtype == q_nope.dtype
+        and q_nope.shape[-1] % 128 == 0
+        and q_nope.shape[1] % get_dtype_packing(q_nope.dtype) == 0
+    )
+
+
 def prepare_q_inputs(
     q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim],
 ):
@@ -1220,12 +1232,12 @@ def sparse_ragged_paged_attention(
     _, actual_num_q_heads, actual_head_dim = q.shape
 
     if q_pe is not None:
-        if q_pe.shape[:2] != q.shape[:2] or q_pe.dtype != q.dtype:
+        if q_pe.ndim != 3 or q_pe.shape[:2] != q.shape[:2] or q_pe.dtype != q.dtype:
             raise ValueError(
-                f"q_pe {q_pe.shape}/{q_pe.dtype} must match q_nope "
+                f"q_pe {q_pe.shape}/{q_pe.dtype} must be 3D and match q_nope "
                 f"{q.shape}/{q.dtype} in tokens, heads and dtype"
             )
-        if actual_head_dim % 128 or actual_num_q_heads % get_dtype_packing(q.dtype):
+        if not supports_split_q(q, q_pe):
             raise ValueError(
                 f"split q needs a 128-multiple nope dim and packed heads, got {q.shape}"
             )
