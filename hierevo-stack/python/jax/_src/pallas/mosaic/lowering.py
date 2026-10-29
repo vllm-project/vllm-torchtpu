@@ -5590,6 +5590,7 @@ def _dma_start_lowering_rule(
     priority: int,
     add: bool,
     _unsafe_no_write_effect: bool = False,
+    strict_ordering: bool = False,
 ):
   del _unsafe_no_write_effect
   if add:
@@ -5632,6 +5633,7 @@ def _dma_start_lowering_rule(
         core_id=core_id,
         subcore_id=subcore_id,
         priority=priority,
+        strict_ordering=strict_ordering,
     )
     return []
 
@@ -5648,7 +5650,9 @@ def _dma_start_lowering_rule(
 def _dma_wait_lowering_rule(ctx: LoweringRuleContext, *args, tree,
                             device_id_type: primitives.DeviceIdType,
                             is_wait_send: bool = False,
-                            _unsafe_no_write_effect: bool = False):
+                            _unsafe_no_write_effect: bool = False,
+                            strict_ordering: bool = False,
+                            wait_threshold: int | None = None):
   del _unsafe_no_write_effect
   src, dst, sem, src_sem, device_id = _dma_unflatten(tree, args)
   if is_wait_send and device_id is None:
@@ -5682,6 +5686,12 @@ def _dma_wait_lowering_rule(ctx: LoweringRuleContext, *args, tree,
     )
 
   def _dma_wait(src_ref, dst_ref, sem, src_sem) -> list[ir.Value]:
+    if wait_threshold is not None and not is_wait_send and device_id is None:
+      threshold_val = ir_constant(
+          wait_threshold, mlir_type=_dtype_to_ir_type(jnp.int32)
+      )
+      tpu.sem_wait(sem, threshold_val)
+      return []
     tpu.wait_dma(
         source=src_ref,
         target=dst_ref,
@@ -5691,6 +5701,7 @@ def _dma_wait_lowering_rule(ctx: LoweringRuleContext, *args, tree,
         core_id=core_id,
         subcore_id=subcore_id,
         wait_target=not is_wait_send,
+        strict_ordering=strict_ordering,
     )
     return []
 

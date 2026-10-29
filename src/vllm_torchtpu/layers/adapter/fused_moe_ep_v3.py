@@ -172,6 +172,13 @@ def served_config(
     config = Config.for_shape(
         hidden=hidden, inter=inter, experts_per_shard=experts_per_shard, top_k=top_k
     )
+    if config.sorted_rows is None:
+        # Avoid exposed SparseCore sort buffer allocation and HBM copy overhead
+        # (which allocates an 86k-row buffer and incurs ~120ms of %copy per step
+        # across layers in prefill on TPU v7x). The per-row token fetch
+        # pipelines asynchronously directly under the result push, and enables
+        # pallas_transport to overlap ICI communication with compute.
+        config = dataclasses.replace(config, sorted_rows=False)
     config = apply_config_overrides(config, envs.TPU_MOE_FUSED_EP_V3_CONFIG)
     logger.info_once(
         "Fused EP MoE (latest kernel) settings for hidden=%d inter=%d "

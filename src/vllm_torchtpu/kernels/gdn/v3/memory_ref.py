@@ -157,6 +157,8 @@ class BaseBufferedRef(pltpu.BufferedRef):
         metadata_ref: MetadataRef,
         source_memory_space=None,
         is_trivial_windowing: bool = False,
+        priority: int = 0,
+        strict_ordering: bool = False,
         **fields,
     ):
         create_kwargs = {}
@@ -174,6 +176,8 @@ class BaseBufferedRef(pltpu.BufferedRef):
             buffer_count=buffer_count,
             grid_rank=1,
             use_lookahead=use_lookahead,
+            priority=priority,
+            strict_ordering=strict_ordering,
             **create_kwargs,
         )
         return cls(
@@ -211,7 +215,7 @@ class InBufferedRef(BaseBufferedRef):
                     src_ref.at[pl.ds(r_base_aligned, dma_rows)],
                     vmem_ref.at[idx, pl.ds(0, dma_rows)],
                     sem,
-                ).start()
+                ).start(priority=self.priority, strict_ordering=self.strict_ordering)
             return
 
         for idx in range(self.cfg.seq_tile_size):
@@ -221,7 +225,7 @@ class InBufferedRef(BaseBufferedRef):
                 src_ref.at[pl.ds(r_base, dma_size)],
                 vmem_ref.at[idx, pl.ds(0, dma_size)],
                 sem,
-            ).start()
+            ).start(priority=self.priority, strict_ordering=self.strict_ordering)
 
     def wait_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_recvs is not None
@@ -241,7 +245,7 @@ class InBufferedRef(BaseBufferedRef):
                     jnp.where(r_size > 0, pl.cdiv(r_prefix + r_size, 16) * 16, 0), 16
                 )
                 ref = vmem_ref.at[idx, pl.ds(0, dma_rows)]
-                pltpu.make_async_copy(ref, ref, sem).wait()
+                pltpu.make_async_copy(ref, ref, sem).wait(strict_ordering=self.strict_ordering)
             return
 
         dma_size = 0
@@ -252,7 +256,7 @@ class InBufferedRef(BaseBufferedRef):
             vmem_ref.at[0, pl.ds(0, dma_size)],
             vmem_ref.at[0, pl.ds(0, dma_size)],
             sem,
-        ).wait()
+        ).wait(strict_ordering=self.strict_ordering)
 
 
 @jax.tree_util.register_dataclass
@@ -273,7 +277,7 @@ class OutBufferedRef(BaseBufferedRef):
                 vmem_ref.at[idx, pl.ds(0, dma_size)],
                 dst_ref.at[pl.ds(r_base, dma_size)],
                 sem,
-            ).start()
+            ).start(priority=self.priority, strict_ordering=self.strict_ordering)
 
     def wait_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
@@ -291,7 +295,7 @@ class OutBufferedRef(BaseBufferedRef):
             vmem_ref.at[0, pl.ds(0, dma_size)],
             vmem_ref.at[0, pl.ds(0, dma_size)],
             sem,
-        ).wait()
+        ).wait(strict_ordering=self.strict_ordering)
 
 
 @jax.tree_util.register_dataclass
@@ -327,7 +331,7 @@ class StateInBufferedRef(BaseBufferedRef):
                 src_ref.at[pl.ds(state_idx, dma_size)],
                 vmem_ref.at[idx, pl.ds(0, dma_size)],
                 sem,
-            ).start()
+            ).start(priority=self.priority, strict_ordering=self.strict_ordering)
 
     def wait_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_recvs is not None
@@ -345,7 +349,7 @@ class StateInBufferedRef(BaseBufferedRef):
                 has_initial_state = self.metadata_ref.s_idx_has_initial_state[s_idx]
                 should_read = jnp.logical_and(is_first_tile, has_initial_state)
                 ref = vmem_ref.at[idx, pl.ds(0, jnp.where(should_read, 1, 0))]
-                pltpu.make_async_copy(ref, ref, sem).wait()
+                pltpu.make_async_copy(ref, ref, sem).wait(strict_ordering=self.strict_ordering)
             return
 
         dma_size = 0
@@ -356,11 +360,12 @@ class StateInBufferedRef(BaseBufferedRef):
             should_read = jnp.logical_and(is_first_tile, has_initial_state)
             dma_size += jnp.where(should_read, 1, 0)
 
-        # NOTE: With bounds checks disabled, the self-copy descriptor may
-        # nominally exceed the window row; it is never executed, only used
-        # to wait for the same number of bytes `copy_in` issued.
-        wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
-        pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+        @pl.when(dma_size > 0)
+        def _():
+            wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
+            pltpu.make_async_copy(wait_ref, wait_ref, sem).wait(
+                strict_ordering=self.strict_ordering
+            )
 
 
 @jax.tree_util.register_dataclass
@@ -400,7 +405,7 @@ class StateOutBufferedRef(BaseBufferedRef):
                 vmem_ref.at[idx, pl.ds(0, dma_size)],
                 dst_ref.at[pl.ds(state_idx, dma_size)],
                 sem,
-            ).start()
+            ).start(priority=self.priority, strict_ordering=self.strict_ordering)
 
     def wait_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
@@ -418,7 +423,7 @@ class StateOutBufferedRef(BaseBufferedRef):
                 num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
                 n = jnp.where(is_last_tile, num_ckpts, 0)
                 ref = vmem_ref.at[idx, pl.ds(0, n)]
-                pltpu.make_async_copy(ref, ref, sem).wait()
+                pltpu.make_async_copy(ref, ref, sem).wait(strict_ordering=self.strict_ordering)
             return
 
         dma_size = 0
@@ -428,11 +433,12 @@ class StateOutBufferedRef(BaseBufferedRef):
             num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
             dma_size += jnp.where(is_last_tile, num_ckpts, 0)
 
-        # NOTE: With bounds checks disabled, the self-copy descriptor may
-        # nominally exceed the window row; it is never executed, only used
-        # to wait for the same number of bytes `copy_out` issued.
-        wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
-        pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+        @pl.when(dma_size > 0)
+        def _():
+            wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
+            pltpu.make_async_copy(wait_ref, wait_ref, sem).wait(
+                strict_ordering=self.strict_ordering
+            )
 
 
 @jax.tree_util.register_dataclass
@@ -505,7 +511,7 @@ class ExternalStateInBufferedRef(StateInBufferedRef):
                 self._region_slice(src_ref, state_idx, nblocks),
                 vmem_ref.at[idx, 0, pl.ds(0, nblocks)],
                 sem,
-            ).start()
+            ).start(priority=self.priority, strict_ordering=self.strict_ordering)
 
     def wait_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_recvs is not None
@@ -524,7 +530,7 @@ class ExternalStateInBufferedRef(StateInBufferedRef):
                 should_read = jnp.logical_and(is_first_tile, has_initial_state)
                 nblocks = jnp.where(should_read, self.region.nblocks, 0)
                 ref = vmem_ref.at[idx, 0, pl.ds(0, nblocks)]
-                pltpu.make_async_copy(ref, ref, sem).wait()
+                pltpu.make_async_copy(ref, ref, sem).wait(strict_ordering=self.strict_ordering)
             return
 
         dma_size = 0
@@ -535,13 +541,12 @@ class ExternalStateInBufferedRef(StateInBufferedRef):
             should_read = jnp.logical_and(is_first_tile, has_initial_state)
             dma_size += jnp.where(should_read, 1, 0)
 
-        # Each slot's copy covers one full region tile (all nblocks), read
-        # into position 0 of its row; wait per slot. NOTE: With bounds checks
-        # disabled, the descriptor may nominally exceed the window row; it is
-        # never executed, only used to wait for the same number of bytes
-        # `copy_in` issued.
-        wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
-        pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+        @pl.when(dma_size > 0)
+        def _():
+            wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
+            pltpu.make_async_copy(wait_ref, wait_ref, sem).wait(
+                strict_ordering=self.strict_ordering
+            )
 
 
 @jax.tree_util.register_dataclass
@@ -632,7 +637,7 @@ class ExternalStateOutBufferedRef(StateOutBufferedRef):
                 vmem_ref.at[idx, 0, pl.ds(0, dma_size)],
                 self.compact_output_ref.at[s_idx, pl.ds(0, dma_size)],
                 sem,
-            ).start()
+            ).start(priority=self.priority, strict_ordering=self.strict_ordering)
 
     def copy_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         if self.compact_output_ref is not None:
@@ -662,7 +667,7 @@ class ExternalStateOutBufferedRef(StateOutBufferedRef):
                     vmem_ref.at[idx, t, pl.ds(0, nblocks)],
                     self._region_slice(dst_ref, state_idx, nblocks),
                     sem,
-                ).start()
+                ).start(priority=self.priority, strict_ordering=self.strict_ordering)
 
     def wait_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
@@ -686,13 +691,13 @@ class ExternalStateOutBufferedRef(StateOutBufferedRef):
                 if self.compact_output_ref is not None:
                     n = jnp.where(is_last_tile, num_ckpts * self._unit(), 0)
                     ref = vmem_ref.at[idx, 0, pl.ds(0, n)]
-                    pltpu.make_async_copy(ref, ref, sem).wait()
+                    pltpu.make_async_copy(ref, ref, sem).wait(strict_ordering=self.strict_ordering)
                     continue
                 for t in range(self._first_ckpt(), self.cfg.window_size):
                     should_write = jnp.logical_and(is_last_tile, t < num_ckpts)
                     nblocks = jnp.where(should_write, self.region.nblocks, 0)
                     ref = vmem_ref.at[idx, t, pl.ds(0, nblocks)]
-                    pltpu.make_async_copy(ref, ref, sem).wait()
+                    pltpu.make_async_copy(ref, ref, sem).wait(strict_ordering=self.strict_ordering)
             return
 
         dma_size = 0
@@ -703,12 +708,12 @@ class ExternalStateOutBufferedRef(StateOutBufferedRef):
             num_ckpts = jnp.maximum(num_ckpts - self._first_ckpt(), 0)
             dma_size += jnp.where(is_last_tile, num_ckpts, 0)
 
-        # Each checkpoint's copy covers one full region tile; wait for that
-        # many region tiles along the window dim of one sequence row (the
-        # descriptor may nominally exceed it, see the NOTE in
-        # ExternalStateInBufferedRef.wait_in).
-        wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
-        pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+        @pl.when(dma_size > 0)
+        def _():
+            wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
+            pltpu.make_async_copy(wait_ref, wait_ref, sem).wait(
+                strict_ordering=self.strict_ordering
+            )
 
 
 def create_allocs(
@@ -783,6 +788,7 @@ def create_allocs(
         use_lookahead=pipeline_mode.use_lookahead,
         cfg=cfg,
         metadata_ref=metadata_ref,
+        priority=1,
     )
     qkv_alloc = in_buffered_partial(spec=qkv_spec, dtype_or_type=qkv_ref)
     b_alloc = in_buffered_partial(spec=b_spec, dtype_or_type=b_ref)
@@ -795,6 +801,7 @@ def create_allocs(
         use_lookahead=pipeline_mode.use_lookahead,
         cfg=cfg,
         metadata_ref=metadata_ref,
+        priority=1,
     )
 
     if cfg.state_plan is None:
@@ -842,6 +849,7 @@ def create_allocs(
         recurrent_in_alloc = state_in_partial(
             spec=block_spec_partial(block_shape=recurrent_in_shape),
             dtype_or_type=recurrent_state_ref,
+            priority=1,
         )
         state_out_partial = functools.partial(
             StateOutBufferedRef.output,
@@ -857,6 +865,7 @@ def create_allocs(
         recurrent_out_alloc = state_out_partial(
             spec=block_spec_partial(block_shape=recurrent_out_shape),
             dtype_or_type=recurrent_state_ref,
+            priority=1,
         )
     else:
         # Both state regions stream from/to the one external source ref
@@ -939,6 +948,7 @@ def create_allocs(
             spec=block_spec_partial(block_shape=recurrent_in_shape),
             dtype_or_type=conv_state_ref,
             region=plan.recurrent,
+            priority=1,
         )
         ext_out_partial = functools.partial(
             ExternalStateOutBufferedRef.output,
@@ -970,6 +980,7 @@ def create_allocs(
                 dtype_or_type=conv_state_ref,
                 region=plan.recurrent,
                 compact_output_ref=recurrent_state_output_ref,
+                priority=1,
             )
 
     return (

@@ -627,7 +627,10 @@ def _is_push_stream(
   if not is_local:
     return False
   if core_type == tpu_core.CoreType.SC_VECTOR_SUBCORE:
-    return src == MemorySpace.VMEM and dst != MemorySpace.VMEM
+    return (src == MemorySpace.VMEM and dst != MemorySpace.VMEM) or (
+        src == MemorySpace.VMEM_SHARED and dst == MemorySpace.SMEM)
+  if core_type == tpu_core.CoreType.SC_SCALAR_SUBCORE:
+    return src == MemorySpace.VMEM_SHARED and dst == MemorySpace.SMEM
   return False
 
 
@@ -642,8 +645,9 @@ def _dma_start_lowering_rule(
     priority: int,
     add: bool,
     _unsafe_no_write_effect: bool = False,
+    strict_ordering: bool = False,
 ):
-  del _unsafe_no_write_effect
+  del _unsafe_no_write_effect, strict_ordering
   src_ref, dst_ref, sem, src_sem, device_id = _dma_unflatten(
       tree, args
   )
@@ -763,8 +767,10 @@ def _dma_wait_lowering_rule(
     device_id_type: pallas_primitives.DeviceIdType,
     is_wait_send: bool = False,
     _unsafe_no_write_effect: bool = False,
+    strict_ordering: bool = False,
+    wait_threshold: int | None = None,
 ):
-  del _unsafe_no_write_effect
+  del _unsafe_no_write_effect, strict_ordering, wait_threshold
   src_ref, dst_ref, sem, src_sem, device_id = _dma_unflatten(tree, args)
   src_aval, dst_aval, sem_aval, src_sem_aval, device_id_aval = _dma_unflatten(
       tree, ctx.avals_in

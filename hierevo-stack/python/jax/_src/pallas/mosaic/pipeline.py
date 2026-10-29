@@ -603,6 +603,8 @@ class BufferedRef(BufferedRefBase):
   # New style prefetch with folded emit_pipeline await. New is False here.
   await_prefetch: bool = jax.tree.static(default=False)
   output_wait_read_only: bool = jax.tree.static(default=False)
+  priority: int = jax.tree.static(default=0)
+  strict_ordering: bool = jax.tree.static(default=False)
 
   @property
   def spec(self):
@@ -657,6 +659,8 @@ class BufferedRef(BufferedRefBase):
       tiling: Tiling | None = None,
       is_trivial_windowing: bool = False,
       prefetched_count: int = 0,
+      priority: int = 0,
+      strict_ordering: bool = False,
   ) -> BufferedRef:
     """Create a BufferedRef.
 
@@ -712,6 +716,8 @@ class BufferedRef(BufferedRefBase):
           tiling=None,
           is_trivial_windowing=is_trivial_windowing,
           has_allocated_buffer=False,
+          priority=priority,
+          strict_ordering=strict_ordering,
       )
     else:
       if use_lookahead and grid_rank is None:
@@ -770,6 +776,8 @@ class BufferedRef(BufferedRefBase):
           is_trivial_windowing=is_trivial_windowing,
           has_allocated_buffer=True,
           prefetched_count=prefetched_count,
+          priority=priority,
+          strict_ordering=strict_ordering,
       )
 
   @classmethod
@@ -856,10 +864,18 @@ class BufferedRef(BufferedRefBase):
     assert self.copy_in_slot is not None
     return self.copy_in_slot
 
+  def _slot_rem(self, cumulative_slot):
+    n = self.buffer_count
+    if n == 1:
+      return jnp.uint32(0)
+    if n & (n - 1) == 0:
+      return lax.bitwise_and(cumulative_slot, jnp.uint32(n - 1))
+    return lax.rem(cumulative_slot, jnp.uint32(n))
+
   @property
   def current_copy_in_slot(self):
     """Index in multiple buffer corresponding to the current slot."""
-    return lax.rem(self.cumulative_copy_in, jnp.uint32(self.buffer_count))
+    return self._slot_rem(self.cumulative_copy_in)
 
   @property
   def cumulative_copy_out(self):
@@ -870,7 +886,7 @@ class BufferedRef(BufferedRefBase):
   @property
   def current_copy_out_slot(self):
     """Index in multiple buffer corresponding to the current copy slot."""
-    return lax.rem(self.cumulative_copy_out, jnp.uint32(self.buffer_count))
+    return self._slot_rem(self.cumulative_copy_out)
 
   @property
   def cumulative_wait_in(self):
@@ -881,7 +897,7 @@ class BufferedRef(BufferedRefBase):
   @property
   def current_wait_in_slot(self):
     """Index in multiple buffer corresponding to the current wait slot."""
-    return lax.rem(self.cumulative_wait_in, jnp.uint32(self.buffer_count))
+    return self._slot_rem(self.cumulative_wait_in)
 
   @property
   def cumulative_wait_out(self):
@@ -892,7 +908,7 @@ class BufferedRef(BufferedRefBase):
   @property
   def current_wait_out_slot(self):
     """Index in multiple buffer corresponding to the current wait slot."""
-    return lax.rem(self.cumulative_wait_out, jnp.uint32(self.buffer_count))
+    return self._slot_rem(self.cumulative_wait_out)
 
   @property
   def next_fetch_indices(self):
@@ -1037,7 +1053,7 @@ class BufferedRef(BufferedRefBase):
         src_ref,
         self._window_ref_at(slot, dst_slice),
         self.sem_recvs.at[slot],
-    ).start()
+    ).start(priority=self.priority, strict_ordering=self.strict_ordering)
 
   def _copy_out_at(self, slot, dst_ref, grid_indices):
     """Describes the copy of the HBM dma slice out of ``slot``."""
@@ -1046,21 +1062,33 @@ class BufferedRef(BufferedRefBase):
     src_ref = self._window_ref_at(slot, self._to_window_slice(dst_slice))
     dst_ref, sem = dst_ref.at[dst_slice], self.sem_sends.at[slot]
     if self.output_wait_read_only:  # The semaphore tracks the source read.
-      return tpu_primitives.make_async_copy(src_ref, dst_ref, src_sem=sem)
-    return tpu_primitives.make_async_copy(src_ref, dst_ref, sem)
+      return tpu_primitives.make_async_copy(
+          src_ref,
+          dst_ref,
+          src_sem=sem,
+          priority=self.priority,
+          strict_ordering=self.strict_ordering,
+      )
+    return tpu_primitives.make_async_copy(
+        src_ref,
+        dst_ref,
+        sem,
+        priority=self.priority,
+        strict_ordering=self.strict_ordering,
+    )
 
   def _wait_out_copy(self, copy):
     if self.output_wait_read_only:
-      copy.wait_read()
+      copy.wait_read(strict_ordering=self.strict_ordering)
     else:
-      copy.wait()
+      copy.wait(strict_ordering=self.strict_ordering)
 
   def copy_out(self, dst_ref, grid_indices):
     """Starts copy of HBM dma slice from the current slot."""
     assert self.is_output
     if not self.is_buffered: return
     copy = self._copy_out_at(self.current_copy_out_slot, dst_ref, grid_indices)
-    copy.start()
+    copy.start(priority=self.priority, strict_ordering=self.strict_ordering)
     if self.out_buffer_count == 1:  # Single-buffered outputs are synchronous.
       self._wait_out_copy(copy)
 
@@ -1081,7 +1109,7 @@ class BufferedRef(BufferedRefBase):
             wait_slot, dst_slice
         ),  # only dst shape is important
         self.sem_recvs.at[wait_slot],
-    ).wait()
+    ).wait(strict_ordering=self.strict_ordering)
 
   def wait_out(self, dst_ref, grid_indices):
     """Waits for output copy to finish."""
@@ -1096,7 +1124,7 @@ class BufferedRef(BufferedRefBase):
     """Waits until the output copies have been written to ``dst_ref``."""
     if not self.is_buffered or self.is_trivial_windowing: return
     copy = self._copy_out_at(self.current_wait_out_slot, dst_ref, grid_indices)
-    copy.wait_write()
+    copy.wait_write(strict_ordering=self.strict_ordering)
 
   def advance_next_fetch(self, grid):
     if self.next_fetch is None:
@@ -1607,6 +1635,8 @@ def _make_pipeline_allocations(
     out_specs=(),
     tiling: Tiling | None = None,
     grid=(),
+    priority: int = 0,
+    strict_ordering: bool = False,
 ):
   """Create BufferedRefs for the pipeline.
 
@@ -1634,10 +1664,16 @@ def _make_pipeline_allocations(
     buffer_count = 2
     use_lookahead = False
     prefetched_count = 0
+    in_priority = priority
+    in_strict_ordering = strict_ordering
     if has_buffering := in_spec.pipeline_mode is not None:
       buffer_count = in_spec.pipeline_mode.buffer_count
       use_lookahead = in_spec.pipeline_mode.use_lookahead
       prefetched_count = in_spec.pipeline_mode.prefetched_count
+      in_priority = getattr(in_spec.pipeline_mode, "priority", in_priority)
+      in_strict_ordering = getattr(
+          in_spec.pipeline_mode, "strict_ordering", in_strict_ordering
+      )
     if use_lookahead and grid is None:
       raise ValueError("Grid must be specified when using lookahead.")
     is_trivial = _spec_has_trivial_windowing(in_spec, grid, in_aval.shape)
@@ -1656,13 +1692,21 @@ def _make_pipeline_allocations(
         tiling=tiling,
         is_trivial_windowing=is_trivial,
         prefetched_count=prefetched_count,
+        priority=in_priority,
+        strict_ordering=in_strict_ordering,
     )
   in_brefs = jax.tree.map(make_input_bref, in_specs, in_refs)
   def make_output_bref(out_spec, out_ref):
     out_aval = _ref_to_value_aval(out_ref)
     buffer_count = 2
+    out_priority = priority
+    out_strict_ordering = strict_ordering
     if has_buffering := out_spec.pipeline_mode is not None:
       buffer_count = out_spec.pipeline_mode.buffer_count
+      out_priority = getattr(out_spec.pipeline_mode, "priority", out_priority)
+      out_strict_ordering = getattr(
+          out_spec.pipeline_mode, "strict_ordering", out_strict_ordering
+      )
       if out_spec.pipeline_mode.use_lookahead:
         raise ValueError("Output buffering does not support lookahead.")
       if out_spec.pipeline_mode.revisit is not None:
@@ -1687,6 +1731,8 @@ def _make_pipeline_allocations(
         source_memory_space=sms,
         tiling=tiling,
         is_trivial_windowing=is_trivial,
+        priority=out_priority,
+        strict_ordering=out_strict_ordering,
     )
   out_brefs = jax.tree.map(make_output_bref, out_specs, out_refs)
   return (*in_brefs, *out_brefs)
@@ -1875,6 +1921,8 @@ def _emit_pipeline(
     num_cores: int | None = None,
     core_id: jax.Array | int | None = None,
     _explicit_indices: bool = False,
+    priority: int = 0,
+    strict_ordering: bool = False,
 ):
   """Creates a function to emit a manual pallas pipeline.
 
@@ -1945,6 +1993,8 @@ def _emit_pipeline(
               out_specs=out_specs,
               grid=grid,
               tiling=tiling,
+              priority=priority,
+              strict_ordering=strict_ordering,
           )
       )
     if isinstance(allocations, list):
@@ -1971,6 +2021,8 @@ def _emit_pipeline(
                 out_specs=out_specs,
                 grid=grid,
                 tiling=tiling,
+                priority=priority,
+                strict_ordering=strict_ordering,
             ),
         )
     elif len(allocations) == len(in_specs) + len(out_specs):
@@ -2138,6 +2190,8 @@ def emit_pipeline_with_allocations(
     in_specs=(),
     out_specs=(),
     _explicit_indices: bool = False,
+    priority: int = 0,
+    strict_ordering: bool = False,
 ):
   """Creates pallas pipeline and top-level allocation preparation functions.
 
@@ -2156,16 +2210,22 @@ def emit_pipeline_with_allocations(
         pipeline that can be created at the top-level of a pallas call to be
         reused across multiple invocations of the inner pipeline.
   """
-  make_allocations = functools.partial(_make_pipeline_allocations,
-                    in_specs=in_specs,
-                    out_specs=out_specs,
-                    grid=grid)
+  make_allocations = functools.partial(
+      _make_pipeline_allocations,
+      in_specs=in_specs,
+      out_specs=out_specs,
+      grid=grid,
+      priority=priority,
+      strict_ordering=strict_ordering,
+  )
   pipeline = emit_pipeline(
       body,
       grid=grid,
       in_specs=in_specs,
       out_specs=out_specs,
       _explicit_indices=_explicit_indices,
+      priority=priority,
+      strict_ordering=strict_ordering,
   )
   return pipeline, make_allocations
 
@@ -2223,6 +2283,8 @@ def emit_pipeline(
     no_pipelining: bool = False,
     output_wait_read_only: bool = False,
     _explicit_indices: bool = False,
+    priority: int = 0,
+    strict_ordering: bool = False,
 ):
   in_specs = _normalize_specs(in_specs)
   out_specs = _normalize_specs(out_specs)
@@ -2294,6 +2356,8 @@ def emit_pipeline(
           _explicit_indices=_explicit_indices,
           num_cores=num_cores,
           core_id=core_id,
+          priority=priority,
+          strict_ordering=strict_ordering,
       )(
           *in_refs,
           *out_refs,
@@ -2458,6 +2522,8 @@ def emit_pipeline(
         output_wait_read_only=output_wait_read_only,
         _explicit_indices=_explicit_indices,
         num_cores=num_cores,
+        priority=priority,
+        strict_ordering=strict_ordering,
     )
 
   return wrapped

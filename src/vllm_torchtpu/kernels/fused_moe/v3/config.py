@@ -73,7 +73,7 @@ COMPACT_MESSAGE_TOKENS = LANES // 2
 COMBINE_UNROLL_DEFAULT = 32
 # Columns of the intermediate the FFN kernel activates and requantizes per
 # pass, so the live bf16 intermediate stays small.
-ACTIVATION_COLUMNS_PER_PASS_DEFAULT = 512
+ACTIVATION_COLUMNS_PER_PASS_DEFAULT = 1024
 # The fewest words of a row table the shard-tables kernel zeroes per grid
 # step.
 TABLES_ZERO_WORDS_DEFAULT = 8192
@@ -85,7 +85,53 @@ WEIGHT_DMA_PRIORITIES = (0, 1)
 # top_k): the fields tuned off the defaults for that shape and nothing else.
 # The layer consults it when the caller passes no Config; a caller's own
 # Config is taken as it is.
-TUNED_BY_SHAPE = {}
+TUNED_BY_SHAPE = {
+    # Qwen3.5-397B-A17B on TPU v7x: hidden=4096, inter=1024.
+    # The default 3 weight slots / 2 prefetch causes memory bandwidth stalls
+    # when compute per expert is faster than HBM weight refill.
+    # Expanding weight slots to 4 and prefetch depth to 3 fits in TPU v7x VMEM
+    # (48 MiB / 62.72 MiB budget) and provides 3 stages of overlap to hide HBM
+    # weight refills. Expanding result slots to 4 provides double-buffering for
+    # both compute and result commit drains. Disabling sorted_rows eliminates
+    # the 352MB intermediate sort buffer allocation and exposed SparseCore sort
+    # overhead (86k rows per layer in prefill), enabling in-kernel asynchronous
+    # DMA streaming under pallas_transport.
+    (4096, 1024, 64, 10): {
+        "weight_slots": 4,
+        "weight_prefetch": 3,
+        "result_slots": 4,
+        "row_fetch_ahead": 2,
+        "sorted_rows": False,
+    },
+    (4096, 1024, 64, 8): {
+        "weight_slots": 4,
+        "weight_prefetch": 3,
+        "result_slots": 4,
+        "row_fetch_ahead": 2,
+        "sorted_rows": False,
+    },
+    (4096, 1024, 80, 10): {
+        "weight_slots": 4,
+        "weight_prefetch": 3,
+        "result_slots": 4,
+        "row_fetch_ahead": 2,
+        "sorted_rows": False,
+    },
+    (4096, 1024, 80, 8): {
+        "weight_slots": 4,
+        "weight_prefetch": 3,
+        "result_slots": 4,
+        "row_fetch_ahead": 2,
+        "sorted_rows": False,
+    },
+    (4096, 1024): {
+        "weight_slots": 4,
+        "weight_prefetch": 3,
+        "result_slots": 4,
+        "row_fetch_ahead": 2,
+        "sorted_rows": False,
+    },
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -314,8 +360,10 @@ class Config:
         """The record for a layer shape: the defaults, with the fields
         TUNED_BY_SHAPE holds for (hidden, inter, experts_per_shard, top_k)
         on top."""
-        tuned = TUNED_BY_SHAPE.get((hidden, inter, experts_per_shard, top_k),
-                                   {})
+        tuned = TUNED_BY_SHAPE.get(
+            (hidden, inter, experts_per_shard, top_k),
+            TUNED_BY_SHAPE.get((hidden, inter, experts_per_shard),
+                               TUNED_BY_SHAPE.get((hidden, inter), {})))
         return cls(**tuned)
 
     @property

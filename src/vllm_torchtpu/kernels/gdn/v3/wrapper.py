@@ -899,7 +899,9 @@ def outer_kernel(
             allocations=allocations,
         )
 
-    _run()
+    @pl.when(num_tiles > 0)
+    def _():
+        _run()
 
 
 @jax.jit(
@@ -1079,8 +1081,7 @@ def fused_conv1d_gdn(
         recurrent_out_dtype = recurrent_state.dtype
         conv_state = conv_state.astype(jnp.float32)
 
-    b = b.astype(jnp.float32)
-    a = a.astype(jnp.float32)
+    assert a.dtype == b.dtype == qkv.dtype
 
     # Step 1: Validate inputs.
     is_kda = attention_mode == config.AttentionMode.KDA
@@ -1157,12 +1158,11 @@ def fused_conv1d_gdn(
         and mixed_tile_size % 8 == 0
     ):
         qkv_2d = bf16_qkv_mode == 2
+        act_in_dtype = qkv.dtype
     else:
         bf16_qkv_mode = 0
         qkv_2d = False
-        qkv = qkv.astype(jnp.float32)
-    act_in_dtype = qkv.dtype
-    assert a.dtype == b.dtype == jnp.float32
+        act_in_dtype = jnp.dtype(jnp.float32)
 
     packing = 16 if qkv_2d else (4 // act_in_dtype.itemsize)
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
@@ -1222,8 +1222,7 @@ def fused_conv1d_gdn(
             # padded_batch_size stays a multiple of 16, which f32 rows accept.
             bf16_qkv_mode = 0
             qkv_2d = False
-            qkv = qkv.astype(jnp.float32)
-            act_in_dtype = qkv.dtype
+            act_in_dtype = jnp.dtype(jnp.float32)
 
     spec_tile_cap = tiling.spec_window_tile_cap(
         window=window_size,
@@ -1264,11 +1263,12 @@ def fused_conv1d_gdn(
     # lane multiple of n_v * d_k rather than of n_v.
     gate_dim = n_v * d_k if is_kda else n_v
     gate_padding_size = (pl.cdiv(gate_dim, num_lanes) * num_lanes) - gate_dim
-    qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
+    if batch_padding_size:
+        qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
     if bf16_qkv_mode == 1:
         qkv = qkv.reshape(padded_batch_size, 2, dim // 2)
     elif bf16_qkv_mode == 0:
-        qkv = qkv.reshape(padded_batch_size, 1, -1)
+        qkv = qkv.reshape(padded_batch_size, 1, -1).astype(jnp.float32)
     if not is_kda:
         # Fuse b and a [N, n_v] -> [2, N_pad, 128] into a single HBM pad where
         # both leading-index slices remain 100% contiguous [N_pad, 1, 128].
@@ -1276,15 +1276,17 @@ def fused_conv1d_gdn(
             jnp.stack((b, a), axis=0),
             ((0, 0), (0, batch_padding_size), (0, num_v_padding_size)),
         )
-        b = ba_padded[0].reshape(padded_batch_size, 1, -1)
-        a = ba_padded[1].reshape(padded_batch_size, 1, -1)
+        b = ba_padded[0].reshape(padded_batch_size, 1, -1).astype(jnp.float32)
+        a = ba_padded[1].reshape(padded_batch_size, 1, -1).astype(jnp.float32)
         a_log = jnp.pad(a_log, ((0, num_v_padding_size)))
         dt_bias = jnp.pad(dt_bias, ((0, num_v_padding_size)))
     else:
-        b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
-        a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
-        b = b.reshape(padded_batch_size, 1, -1)
-        a = a.reshape(padded_batch_size, 1, -1)
+        if batch_padding_size or num_v_padding_size:
+            b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
+        if batch_padding_size or gate_padding_size:
+            a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
+        b = b.reshape(padded_batch_size, 1, -1).astype(jnp.float32)
+        a = a.reshape(padded_batch_size, 1, -1).astype(jnp.float32)
 
     # Step 3: States and weights pre-processing.
     # TODO(kyuyeunk): To eliminate runtime cost, move this logic into model

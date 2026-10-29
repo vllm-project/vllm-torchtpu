@@ -17,6 +17,7 @@ Gathers routed token activations into contiguous per-expert buffers prior to
 grouped expert FFN execution.
 """
 import functools
+import inspect
 
 import jax
 import jax.numpy as jnp
@@ -96,17 +97,17 @@ def sparse_core_program(body,
                                                      out_types)
     if not in_place_outputs:
         program = pl.kernel(body,
-                            tuple(out_types),
+                            out_type=tuple(out_types),
                             mesh=mesh,
                             scratch_types=tuple(scratch_types),
                             compiler_params=compiler_params,
                             name=name)
 
         @jax.jit
-        def run(*operands):
+        def run_direct(*operands):
             return tuple(program(*operands))
 
-        return run
+        return run_direct
 
     new_ref, tree_util, core_map = _jax_private()
 
