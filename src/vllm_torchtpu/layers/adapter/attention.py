@@ -2543,7 +2543,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         if num_tokens <= num_seqs:
             return decoded
         prefilled = prefill_op(kv_cache, ql_nope, q_pe, kv_c_normed, k_pe, *metadata)
-        num_decode_tokens = md.query_start_loc[md.request_distribution[0]]
+        # Indexed on device: a tensor-valued Python index is a data-dependent
+        # int, which the fullgraph backbone trace cannot hold.
+        num_decode_tokens = md.query_start_loc.index_select(
+            0, md.request_distribution[:1]
+        )
         token = torch.arange(lead, device=decoded.device)
         is_decode = (token < num_decode_tokens)[:, None, None]
         head = torch.where(is_decode, decoded, prefilled[:lead])

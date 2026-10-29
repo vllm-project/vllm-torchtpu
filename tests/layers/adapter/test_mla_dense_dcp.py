@@ -115,3 +115,41 @@ def test_forward_requires_built_ops():
     layer.mla_dcp_ops = None
     with pytest.raises(AssertionError, match="never built"):
         _impl()._forward_dense_mla_dcp(layer, *args)
+
+
+@pytest.mark.parametrize("num_tokens,num_decode", [(4, 4), (12, 3)])
+def test_dispatch_traces_whole_graph_with_dynamic_tokens(
+    collectives, num_tokens, num_decode
+):
+    """The backbone runs under torch.compile(fullgraph=True) with a dynamic token
+    dimension: no step of the dispatch may read a device value into Python."""
+    layer, (ql, q_pe, kv_c, k_pe, cache, md) = _step(num_tokens, 8, num_decode)
+
+    def decode_op(cache, q, q_pe, kv_c, k_pe, *metadata):
+        del q_pe, kv_c, k_pe, metadata
+        return cache + 1, torch.ones_like(q), q.new_zeros(q.shape[:2])
+
+    def prefill_op(cache, q, *rest):
+        del cache, rest
+        return torch.full_like(q, 2.0)
+
+    layer.mla_dcp_ops = (decode_op, prefill_op)
+    impl = _impl()
+
+    def step(ql, q_pe, kv_c, k_pe, cache, qsl, dist):
+        md_ = SimpleNamespace(
+            seq_lens=md.seq_lens,
+            block_tables=md.block_tables,
+            query_start_loc=qsl,
+            request_distribution=dist,
+        )
+        return impl._forward_dense_mla_dcp(layer, ql, q_pe, kv_c, k_pe, cache, md_)
+
+    for t in (ql, q_pe, kv_c, k_pe):
+        torch._dynamo.mark_dynamic(t, 0)
+    compiled = torch.compile(step, fullgraph=True, backend="eager", dynamic=True)
+    out = compiled(
+        ql, q_pe, kv_c, k_pe, cache, md.query_start_loc, md.request_distribution
+    )
+    assert torch.equal(out[:num_decode], torch.ones(num_decode, LOCAL_HEADS, LKV))
+    assert torch.equal(out[num_decode:], torch.full_like(out[num_decode:], 2.0))
