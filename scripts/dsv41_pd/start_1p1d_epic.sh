@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 1P1D（Stage-3 Raiden）启动脚本，跑 cszhz/vllm-torchtpu 的 pd/dsv41-1p1d 分支（= 最新 epic/dsv41 + PD 提交）。
+# 1P1D（Stage-3 Raiden）启动脚本，跑 cszhz/vllm-torchtpu 的 cszhz/dsv41-1p1d 分支（= 最新 epic/dsv41 + PD 提交）。
 #   2z6z: bash start_1p1d_epic.sh prefill   → :8100
 #   clsk: bash start_1p1d_epic.sh decode    → :8200
 # vllm serve 的参数照 epic/dsv41 的 scripts/dsv41_bench/serve_cached_prefill.sh（server_steps 基准）：

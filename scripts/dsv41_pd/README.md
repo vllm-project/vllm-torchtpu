@@ -1,6 +1,6 @@
 # DeepSeek-V4.1-Flash 1P1D (Stage-3 Raiden) on two v7x hosts
 
-Deployment and benchmark scripts used with this branch (`pd/dsv41-1p1d` = epic/dsv41 + PD
+Deployment and benchmark scripts used with this branch (`cszhz/dsv41-1p1d` = epic/dsv41 + PD
 commits). Paths are those of the original setup (`/zzlfs/temu/...`); adjust before reuse.
 
 Topology: P and D are each one 4-chip v7x host, DP8 / TP1 / EP8. A proxy on the P host
