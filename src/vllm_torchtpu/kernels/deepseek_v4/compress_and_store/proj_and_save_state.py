@@ -26,12 +26,29 @@ from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 # Tokens whose f32 accumulators stay resident in VMEM while one weight block is
 # reused across them; each weight block is read from HBM once per this many.
 # Costs 2 * tokens * state_width * 4 bytes of VMEM (8 MiB at state_width 1024),
-# next to two (tile_k, state_width) bf16 weight buffers (8 MiB at tile_k 2048);
+# next to two (k_tiles_per_step * tile_k, state_width) bf16 weight buffers
+# (8 MiB at tile_k 2048, 16 MiB with both K tiles of hidden 4096 in one step);
 # 1024 is the largest serving token padding, so every call is a single block.
 MAX_RESIDENT_TOKENS = 1024
 # Slot mappings read from SMEM back to back before their tokens' write DMAs are
 # issued, so the load latency is paid once per group instead of once per token.
 SLOT_LOAD_GROUP = 8
+# From this many tokens on, one grid step covers the whole hidden dim: it runs
+# one dot per K tile and adds them in K order, as one step per K tile would, so
+# the sums are unchanged and the grid has a step per (m tile, token tile) only.
+# Below it a step per K tile keeps the first weight fetch, which no compute
+# hides, at one K tile.
+FUSE_K_MIN_TOKENS = 256
+# ... and only for m tiles this wide. On tpu7x, a dot with at least two
+# 256-wide output tiles gives each matrix unit whole output tiles, each summed
+# over all its K chunks, wherever it runs. A narrower one is split over the two
+# units along K, and where the split falls depends on what else the step runs,
+# so two dots in one step would sum in another order than one dot per step.
+FUSE_K_MIN_TILE_M = 512
+# ... and only while the two buffers of a whole-hidden weight block take at
+# most this much VMEM, so the step stays under the default scoped VMEM limit
+# next to the accumulators (hidden 4096 fuses; 7168 at CSA would need 28 MiB).
+FUSE_K_MAX_WEIGHT_BYTES = 16 * 1024 * 1024
 
 
 @dataclasses.dataclass(frozen=True)
@@ -39,7 +56,8 @@ class TileSizes:
     """Tile sizes for Pallas kernel."""
 
     tile_m: int  # output dimension
-    tile_k: int  # hidden dimension
+    tile_k: int  # hidden dimension of one dot
+    k_tiles_per_step: int  # K tiles one grid step accumulates
     tile_n: int  # sequence length
     tiles_per_block: int  # token tiles sharing one fetch of a weight block
 
@@ -69,7 +87,10 @@ class Configs:
 
     @property
     def num_k(self) -> int:
-        return pl.cdiv(self.dims.size_k, self.tile_sizes.tile_k)
+        return pl.cdiv(
+            self.dims.size_k,
+            self.tile_sizes.tile_k * self.tile_sizes.k_tiles_per_step,
+        )
 
     @property
     def num_n(self) -> int:
@@ -198,8 +219,8 @@ def kernel(
         write_counts_ref[buf_idx_val] = num_valid_writes
 
     def inner_kernel(
-        tiled_wgate_ref,  # (tile_k, tile_m)
-        tiled_hidden_states_ref,  # (tile_n, tile_k)
+        tiled_wgate_ref,  # (k_tiles_per_step * tile_k, tile_m)
+        tiled_hidden_states_ref,  # (tile_n, k_tiles_per_step * tile_k)
         tiled_positions_ref,  # (tile_n,)
     ):
         b_idx = pl.program_id(0)
@@ -208,12 +229,15 @@ def kernel(
         j_idx = pl.program_id(3)
         n_idx = b_idx * tiles_per_block + j_idx
         buf_idx = j_idx
+        tile_k = cfgs.tile_sizes.tile_k
+        k_tiles_per_step = cfgs.tile_sizes.k_tiles_per_step
 
         state_width = cfgs.dims.size_m // 2
 
-        def _matmul():
-            lhs = tiled_hidden_states_ref[...]
-            rhs = tiled_wgate_ref[...]
+        def _matmul(kk):
+            k_tile = pl.ds(kk * tile_k, tile_k)
+            lhs = tiled_hidden_states_ref[:, k_tile]
+            rhs = tiled_wgate_ref[k_tile, :]
             prod = lax.dot_general(
                 lhs,
                 rhs,
@@ -259,18 +283,23 @@ def kernel(
                 prev_buf_idx = jnp.where(j_idx == 0, tiles_per_block - 1, j_idx - 1)
                 _dma_copy_out(n_idx - 1, prev_buf_idx)
 
-            # 3. Matmul
-            prod = _matmul()
+            for kk in range(k_tiles_per_step):
+                # 3. Matmul
+                prod = _matmul(kk)
 
-            # 4. Unified Accumulate/Assign
-            acc_val = load_from_acc_ref(acc_ref.at[m_idx, buf_idx], dtype=jnp.float32)
-            old_acc = lax.select(
-                k_idx > 0,
-                acc_val,
-                jnp.zeros_like(acc_val),
-            )
-            new_acc = old_acc + prod
-            store_to_acc_ref(acc_ref.at[m_idx, buf_idx], new_acc)
+                # 4. Unified Accumulate/Assign. The accumulator is read after
+                # the dot, so the add stays a separate f32 add of the K tile's
+                # partial sum rather than becoming the dot's initial value.
+                acc_val = load_from_acc_ref(
+                    acc_ref.at[m_idx, buf_idx], dtype=jnp.float32
+                )
+                old_acc = (
+                    acc_val
+                    if kk > 0
+                    else lax.select(k_idx > 0, acc_val, jnp.zeros_like(acc_val))
+                )
+                new_acc = old_acc + prod
+                store_to_acc_ref(acc_ref.at[m_idx, buf_idx], new_acc)
 
             # 5. APE addition if last
             if add_ape:
@@ -307,13 +336,14 @@ def kernel(
         def matmul_ape_only():
             process(False, True)
 
+    step_k = cfgs.tile_sizes.tile_k * cfgs.tile_sizes.k_tiles_per_step
     wkv_spec = pl.BlockSpec(
-        (cfgs.tile_sizes.tile_k, cfgs.tile_sizes.tile_m),
+        (step_k, cfgs.tile_sizes.tile_m),
         lambda b, m, k, j: (k, m),
         memory_space=pltpu.VMEM,
     )
     hidden_states_spec = pl.BlockSpec(
-        (cfgs.tile_sizes.tile_n, cfgs.tile_sizes.tile_k),
+        (cfgs.tile_sizes.tile_n, step_k),
         lambda b, m, k, j: (b * tiles_per_block + j, k),
         memory_space=pltpu.VMEM,
     )
@@ -397,6 +427,13 @@ def proj_and_save_state(
     state_width = state_dim // 2
     tile_m = state_width
     tile_k = _select_tile_k(hidden_size)
+    fused_weight_bytes = 2 * hidden_size * tile_m * wkv_wgate.dtype.itemsize
+    fuse_k = (
+        num_tokens >= FUSE_K_MIN_TOKENS
+        and tile_m >= FUSE_K_MIN_TILE_M
+        and fused_weight_bytes <= FUSE_K_MAX_WEIGHT_BYTES
+    )
+    k_tiles_per_step = hidden_size // tile_k if fuse_k else 1
 
     # The token dimension must be an exact multiple of `tile_n`.
     sublane_tile = 8
@@ -422,7 +459,11 @@ def proj_and_save_state(
     )
 
     tile_sizes = TileSizes(
-        tile_m=tile_m, tile_k=tile_k, tile_n=tile_n, tiles_per_block=tiles_per_block
+        tile_m=tile_m,
+        tile_k=tile_k,
+        k_tiles_per_step=k_tiles_per_step,
+        tile_n=tile_n,
+        tiles_per_block=tiles_per_block,
     )
 
     cfgs = Configs(
