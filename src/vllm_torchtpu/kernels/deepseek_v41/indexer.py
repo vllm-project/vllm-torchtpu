@@ -492,6 +492,28 @@ def native_paged_scores(
     )[:, :capacity]
 
 
+def pipeline_score_topk_unrolled(
+    num_tiles: int,
+    prepare: Callable[[jax.Array], Any],
+    score: Callable[[Any, int | None], jax.Array],
+    select: Callable[[jax.Array, jax.Array, int | None], Any],
+    write: Callable[[jax.Array, Any, Any], Any],
+    output: Any,
+) -> Any:
+    """Leave independent score/selection tiles available to the scheduler.
+
+    Use for tuned small-query batches; score lifetimes are not bounded here.
+    """
+    if num_tiles < 1:
+        raise ValueError("The score/top-k pipeline requires at least one tile")
+    for tile in range(num_tiles):
+        index = jnp.int32(tile)
+        scores = score(prepare(index), None)
+        selected = select(index, scores, None)
+        output = write(index, selected, output)
+    return output
+
+
 def pipeline_score_topk_bounded(
     num_tiles: int,
     prepare: Callable[[jax.Array], Any],
