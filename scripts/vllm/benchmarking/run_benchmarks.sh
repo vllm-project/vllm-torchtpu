@@ -259,7 +259,7 @@ PORT="${PORT:-8000}"
 # the `vllm bench serve --help` this replaces imported all of vLLM, 6-50s per
 # config with the chips idle, and a missing subcommand still fails the first
 # benchmark call with its own error.
-if [ "$DRY_RUN" != "1" ] && ! python3 -c 'import importlib.util, sys; sys.exit(importlib.util.find_spec("vllm") is None)'; then
+if ! python3 -c 'import importlib.util, sys; sys.exit(importlib.util.find_spec("vllm") is None)'; then
     echo "ERROR: vLLM is not installed."
     exit 1
 fi
@@ -357,7 +357,7 @@ start_vllm_server() {
     if [ -n "$MODEL_URI" ]; then
         serve_target="$MODEL_URI"
         extra_args="$extra_args --load-format runai_streamer --served-model-name $MODEL"
-    elif [ -n "${SERVED_MODEL_NAME:-}" ]; then
+    elif [ "$BENCHMARK_MODE" = "spec_bench" ] && [ -n "${SERVED_MODEL_NAME:-}" ]; then
         extra_args="$extra_args --served-model-name $SERVED_MODEL_NAME"
     fi
     if [ -n "$extra_server_flags" ]; then
