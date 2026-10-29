@@ -40,5 +40,6 @@ scheduling, wave delay 40 ms; D async scheduling, `MAX_NUM_SEQS=32`,
 - `bench_cached_prefill.py`, `run_table.sh`, `quick_set.sh`: "cached + new" TTFT / prefill
   (prefill = P's `request_prefill_time`, TTFT = client to first token).
 - `tpot_bench.py`: TPOT (CLI / Server) over the full-batch window, shared cached prefix.
+- `tps_bench.py`: prefill throughput of P alone (N cached+new requests, one per DP rank, TPS from wall time).
 - `pd_logprob_check.py`: PD vs direct-D first-token logprobs on fresh text.
 - `transfer_stats.py`, `d_breakdown.py`: KV transfer latency and D-side timing breakdown.
