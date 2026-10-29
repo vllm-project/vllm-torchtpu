@@ -58,9 +58,10 @@ logger = init_logger(__name__)
 # 24 and 48 are serving token buckets too (TPU_TOKEN_BUCKET_EXTRA); without them
 # 24-/48-row verify steps (6 or 12 requests) run stock.
 # 96 rows (24 requests, the default seat cap; a serving token bucket) runs as row
-# chunks of at most KERNEL_ROWS. 128+ is left out: the segment program shares the
-# stock hyper-connection code, which branches at its 128-row prefill tile.
-DEFAULT_BUCKETS = (4, 8, 16, 24, 32, 48, 64, 96)
+# chunks of at most KERNEL_ROWS; 128 (32 requests, the c32 full load) as 2 x 64. The
+# stock hyper-connections the programs trace keep their small-row path at 128 rows
+# (hyperconnection.verify_rows); larger buckets are left out.
+DEFAULT_BUCKETS = (4, 8, 16, 24, 32, 48, 64, 96, 128)
 # The segment kernel's row limit (Qwen38InnerGeometry.check: B <= M <= 64).
 KERNEL_ROWS = 64
 
