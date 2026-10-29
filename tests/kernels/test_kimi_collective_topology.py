@@ -110,6 +110,55 @@ def test_ring_tables_preserve_physical_links_and_torch_token_order():
                 assert tokens[peers[(pos - direction * 32) % 32]] == owners[rank]
 
 
+def _physical_devices(physical):
+    return [
+        SimpleNamespace(
+            id=i, coords=(p // 16, p // 8 % 2, p // 2 % 4), core_on_chip=int(p % 2)
+        )
+        for i, p in enumerate(physical)
+    ]
+
+
+def test_ring_tables_resolve_id_only_proxies_through_jax_devices(monkeypatch):
+    """torch_tpu Pallas mesh devices expose only ``id``; look up the rest."""
+    import jax
+
+    rng = np.random.default_rng(74)
+    physical_devices = _physical_devices(rng.permutation(32))
+    owners = rng.permutation(32)
+    # The process lists devices in its own order, not the mesh's.
+    listed = [physical_devices[i] for i in rng.permutation(32)]
+    monkeypatch.setattr(jax, "devices", lambda *args, **kwargs: listed)
+    mesh_order = rng.permutation(32)
+    proxies = [SimpleNamespace(id=int(i)) for i in mesh_order]
+
+    expected = ring_tables([physical_devices[i] for i in mesh_order], owners)
+    np.testing.assert_array_equal(ring_tables(proxies, owners), expected)
+
+
+def test_mla_chip_layout_resolves_id_only_proxies(monkeypatch):
+    import jax
+
+    from vllm_torchtpu.kernels.kimi_k3.collectives import mla_chip_layout
+
+    rng = np.random.default_rng(793)
+    physical_devices = _physical_devices(rng.permutation(32))
+    owners = rng.permutation(32)
+    monkeypatch.setattr(jax, "devices", lambda *args, **kwargs: physical_devices)
+    proxies = [SimpleNamespace(id=d.id) for d in physical_devices]
+    assert mla_chip_layout(proxies, owners) == mla_chip_layout(physical_devices, owners)
+
+
+def test_ring_tables_reject_proxies_this_process_cannot_locate(monkeypatch):
+    import jax
+
+    physical_devices = _physical_devices(range(32))
+    monkeypatch.setattr(jax, "devices", lambda *args, **kwargs: physical_devices[:8])
+    proxies = [SimpleNamespace(id=d.id) for d in physical_devices]
+    with pytest.raises(ValueError, match="whole slice"):
+        ring_tables(proxies, tuple(range(32)))
+
+
 @pytest.mark.parametrize("rows", [128, 256])
 @pytest.mark.parametrize("width", [2176, 3584, 7168])
 def test_ring_regions_cover_payload_once(rows, width):

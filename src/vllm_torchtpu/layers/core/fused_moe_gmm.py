@@ -64,6 +64,7 @@ ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VE
 _ONEHOT_AUTO_CAP = 512
 # Fixed at import, like the other MoE algorithm selectors.
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
+_OWNER_OUTPUT_MIN_ROUTES = envs.TPU_MOE_OWNER_OUTPUT_MIN_ROUTES
 
 
 def resolve_onehot_permute_threshold() -> int:
@@ -299,14 +300,10 @@ def prepare_routed_gmm_inputs(
     else:
         valid_mask = topk_indices_flat >= 0
     sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
-    if envs.TPU_MOE_COUNTING_SORT and counting_sort.applicable(
-        sort_keys.shape[0]
-    ):
+    if envs.TPU_MOE_COUNTING_SORT and counting_sort.applicable(sort_keys.shape[0]):
         key_onehot = counting_sort.key_onehot(sort_keys, local_num_experts + 1)
         argsort_revert_indices = counting_sort.sort_positions(key_onehot)
-        sorted_indices = counting_sort.invert_permutation(
-            argsort_revert_indices
-        )
+        sorted_indices = counting_sort.invert_permutation(argsort_revert_indices)
         group_sizes_local = key_onehot[:, :local_num_experts].sum(axis=0)
         token_indices_sorted = token_indices_flat[sorted_indices]
     else:
@@ -349,9 +346,7 @@ def prepare_routed_gmm_inputs(
                 jnp.left_shift(sort_keys, token_bits) | token_indices_flat,
                 is_stable=False,
             )
-            token_indices_sorted = jnp.bitwise_and(
-                packed, (1 << token_bits) - 1
-            )
+            token_indices_sorted = jnp.bitwise_and(packed, (1 << token_bits) - 1)
         else:
             token_indices_sorted = token_indices_flat[sorted_indices]
 
@@ -502,6 +497,8 @@ def moe_gmm(
             valid_count = group_sizes.sum(dtype=jnp.int32)[None]
             if (
                 envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() == "on"
+                # Decode-sized route counts stay on the fused dense combine.
+                and gmm2_res.shape[0] >= _OWNER_OUTPUT_MIN_ROUTES
                 and can_use_blockwise_onehot_unpermute(
                     gmm2_res,
                     token_indices_sorted,

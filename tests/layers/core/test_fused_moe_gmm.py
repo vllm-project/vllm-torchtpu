@@ -77,6 +77,21 @@ def test_owner_output_mode_rejects_invalid_value(monkeypatch):
         getter()
 
 
+def test_owner_output_min_routes_defaults_above_decode_batches(monkeypatch):
+    monkeypatch.delenv("TPU_MOE_OWNER_OUTPUT_MIN_ROUTES", raising=False)
+    getter = envs.environment_variables["TPU_MOE_OWNER_OUTPUT_MIN_ROUTES"]
+    # 64 decode tokens at top-8 (512 routes) stay on the dense combine;
+    # 1024-token prefill buckets (8192 routes) use the blockwise kernel.
+    assert 64 * 8 < getter() <= 1024 * 8
+
+
+def test_owner_output_min_routes_rejects_negative(monkeypatch):
+    monkeypatch.setenv("TPU_MOE_OWNER_OUTPUT_MIN_ROUTES", "-1")
+    getter = envs.environment_variables["TPU_MOE_OWNER_OUTPUT_MIN_ROUTES"]
+    with pytest.raises(ValueError, match="TPU_MOE_OWNER_OUTPUT_MIN_ROUTES"):
+        getter()
+
+
 @pytest.mark.parametrize("configured_version", ["v1", "v2", "v3"])
 @pytest.mark.parametrize(
     "use_ep,use_sparse_core,threshold,dtype,hidden,topk,num_tokens,source_rows,sc_lanes,expected_path",
@@ -466,8 +481,18 @@ def test_prepare_routed_gmm_inputs_keeps_original_combine_metadata():
     np.testing.assert_array_equal(group_sizes, np.array([3, 2]))
 
 
-@pytest.mark.parametrize(("mode", "owner_called"), [("on", True), ("off", False)])
-def test_output_onehot_owner_kernel_respects_mode(mode, owner_called):
+@pytest.mark.parametrize(
+    ("mode", "min_routes", "owner_called"),
+    [
+        ("on", 0, True),
+        ("on", 4, True),
+        # Decode-sized batches (fewer routes than the gate) keep the dense
+        # one-hot combine even when the kernel is enabled and supported.
+        ("on", 5, False),
+        ("off", 0, False),
+    ],
+)
+def test_output_onehot_owner_kernel_respects_mode(mode, min_routes, owner_called):
     x = jnp.zeros((4, 2), dtype=jnp.bfloat16)
     w1 = jnp.zeros((2, 2, 4), dtype=jnp.bfloat16)
     w2 = jnp.zeros((2, 2, 2), dtype=jnp.bfloat16)
@@ -487,6 +512,7 @@ def test_output_onehot_owner_kernel_respects_mode(mode, owner_called):
             "TPU_MOE_OWNER_OUTPUT_MODE",
             mode,
         ),
+        patch.object(fused_moe_gmm, "_OWNER_OUTPUT_MIN_ROUTES", min_routes),
         patch.object(
             fused_moe_gmm,
             "gmm_wrapper",

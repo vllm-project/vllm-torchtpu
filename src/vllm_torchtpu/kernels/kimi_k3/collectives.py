@@ -24,8 +24,39 @@ CYCLES = (
 )
 
 
+def with_physical_location(devices):
+    """Resolve each mesh device to one exposing ``coords`` and ``core_on_chip``.
+
+    Native JAX devices carry both and pass through unchanged. Under torch_tpu,
+    ``build_ep_mesh`` holds ``get_pallas_mesh`` proxies that carry only the
+    global device ``id``; every worker's ``jax.devices()`` lists the whole
+    slice under those same ids with its physical location (as
+    ``distributed.chip_topology`` relies on), so look each proxy up there.
+    """
+    devices = list(devices)
+    if all(hasattr(device, "coords") for device in devices):
+        return devices
+    by_id = {int(device.id): device for device in jax.devices()}
+    missing = sorted(
+        int(device.id)
+        for device in devices
+        if not hasattr(device, "coords") and int(device.id) not in by_id
+    )
+    if missing:
+        raise ValueError(
+            f"K3 rings need the physical location of device ids {missing}, but "
+            f"this process's jax.devices() only lists ids {sorted(by_id)}; the "
+            "worker must see the whole slice"
+        )
+    return [
+        device if hasattr(device, "coords") else by_id[int(device.id)]
+        for device in devices
+    ]
+
+
 def mla_chip_layout(devices, owners):
     """Physical pairs and same-core groups, ordered by Torch token ownership."""
+    devices = with_physical_location(devices)
     chips = {}
     for index, device in enumerate(devices):
         chips.setdefault(tuple(device.coords), []).append(index)
@@ -149,6 +180,7 @@ def ring_tables(devices, token_ranks):
         raise ValueError("K3 rings require 32 devices and a token-owner permutation")
     if len({getattr(d, "id", i) for i, d in enumerate(devices)}) != 32:
         raise ValueError("K3 rings require 32 distinct device IDs")
+    devices = with_physical_location(devices)
     coords = [sorted({d.coords[a] for d in devices}) for a in range(3)]
     if tuple(map(len, coords)) != (2, 2, 4):
         raise ValueError("K3 rings require a physical 2x2x4 slice")
