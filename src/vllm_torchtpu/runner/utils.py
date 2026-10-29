@@ -16,6 +16,7 @@
 import datetime
 import json
 import os
+from collections.abc import Iterable
 from enum import Enum
 from typing import Any
 
@@ -48,16 +49,39 @@ PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY = (
 PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY = (
     "phased_profiler_prefill_only_kv_len_threshold"
 )
+# Narrow what gets captured. All default to off, i.e. one capture per phase.
+# A list of phase names (e.g. ["decode_only", "prefill_heavy"]): only these.
+PHASED_PROFILER_ONLY_PHASES_KEY = "phased_profiler_only_phases"
+# A list of request counts: one capture per phase at each, keyed by the
+# engine's own num_reqs (per DP engine, not the global concurrency).
+PHASED_PROFILER_TARGET_CONCURRENCY_KEY = "phased_profiler_target_concurrency"
+# Key captures on (phase, num_reqs) and name them <phase>_concur_<num_reqs>.
+# Implied by a target concurrency. On its own it is unbounded: every request
+# count a ramp passes through gets its own capture.
+PHASED_PROFILER_TRACK_CONCURRENCY_KEY = "phased_profiler_track_concurrency"
 
-# Diagnostics-only knob: it steers profiling and never changes the compiled
-# graph, so `_patch_vllm_config_hash_ignore_diagnostics` keeps it out of the
+# Diagnostics-only knobs: they steer profiling and never change the compiled
+# graph, so `_patch_vllm_config_hash_ignore_diagnostics` keeps them out of the
 # TPU compile cache key.
 HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset(
     {
         PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
         PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
+        PHASED_PROFILER_ONLY_PHASES_KEY,
+        PHASED_PROFILER_TARGET_CONCURRENCY_KEY,
+        PHASED_PROFILER_TRACK_CONCURRENCY_KEY,
     }
 )
+
+
+def config_list(value: Any) -> list[str]:
+    """An additional_config list knob as strings: a JSON list, or one
+    comma-separated string (the shape a shell-built --additional-config
+    takes most easily). None and "" are empty."""
+    if value is None:
+        return []
+    items = value.split(",") if isinstance(value, str) else list(value)
+    return [str(item).strip() for item in items if str(item).strip()]
 
 
 class InferencePhase(Enum):
@@ -173,6 +197,9 @@ class PhaseBasedProfiler:
         prefill_kv_len_threshold: int = PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD,
         standard_opts: dict[str, Any] | None = None,
         advanced_opts: dict[str, Any] | None = None,
+        only_phases: Iterable[str] = (),
+        target_concurrencies: Iterable[int] = (),
+        track_concurrency: bool = False,
     ):
         self.profiling_n_steps_left: int = 0
         self.profile_dir_with_phase_suffix: str | None = None
@@ -197,6 +224,30 @@ class PhaseBasedProfiler:
             InferencePhase.DECODE_HEAVY: False,
             InferencePhase.BALANCED: False,
         }
+        # Narrowing filters (see the *_KEY constants above). Neither consumes a
+        # step: a step they skip leaves the phase eligible for a later one.
+        known_phases = {phase.name.lower() for phase in self.inference_phase_seen}
+        self.only_phases: frozenset[str] = frozenset(
+            phase.strip().lower() for phase in only_phases
+        )
+        if unknown := self.only_phases - known_phases:
+            raise ValueError(
+                f"{PHASED_PROFILER_ONLY_PHASES_KEY}: unknown phases "
+                f"{sorted(unknown)}; choose from {sorted(known_phases)}."
+            )
+        self.target_concurrencies: frozenset[int] = frozenset(
+            int(c) for c in target_concurrencies
+        )
+        if any(c <= 0 for c in self.target_concurrencies):
+            raise ValueError(
+                f"{PHASED_PROFILER_TARGET_CONCURRENCY_KEY} must be positive "
+                f"request counts, got {sorted(self.target_concurrencies)}."
+            )
+        self.track_concurrency: bool = track_concurrency or bool(
+            self.target_concurrencies
+        )
+        # (phase, num_reqs) pairs captured so far, when tracking concurrency.
+        self.profiled_concurrencies: set[tuple[InferencePhase, int]] = set()
         self.current_phase: str = ""
         self.worker_rank = worker_rank
         self.world_size = world_size
@@ -221,6 +272,15 @@ class PhaseBasedProfiler:
             logger.info(
                 "Will skip prefill-only steps until min KV len >= %d.",
                 self.prefill_kv_len_threshold,
+            )
+        if self.only_phases:
+            logger.info(
+                "Will only profile phases: %s.", ", ".join(sorted(self.only_phases))
+            )
+        if self.target_concurrencies:
+            logger.info(
+                "Will only profile at num_reqs %s.",
+                ", ".join(map(str, sorted(self.target_concurrencies))),
             )
 
     def _write_batch_composition_stats_to_file_helper(
@@ -251,8 +311,25 @@ class PhaseBasedProfiler:
         current_determined_phase = determine_phase_from_batch_composition_stats(
             batch_composition_stats
         )
+        concurrency = (
+            int(batch_composition_stats.get("num_reqs", 0))
+            if self.track_concurrency
+            else 0
+        )
         for phase, has_been_seen in self.inference_phase_seen.items():
-            if has_been_seen or phase != current_determined_phase:
+            if phase != current_determined_phase:
+                continue
+            if self.track_concurrency:
+                if (phase, concurrency) in self.profiled_concurrencies:
+                    continue
+            elif has_been_seen:
+                continue
+            if self.only_phases and phase.name.lower() not in self.only_phases:
+                continue
+            if (
+                self.target_concurrencies
+                and concurrency not in self.target_concurrencies
+            ):
                 continue
 
             if (
@@ -289,6 +366,9 @@ class PhaseBasedProfiler:
             self.inference_phase_seen[phase] = True
             self.profiling_n_steps_left = self.num_steps_to_profile_for
             self.current_phase = phase.name.lower()
+            if self.track_concurrency:
+                self.profiled_concurrencies.add((phase, concurrency))
+                self.current_phase += f"_concur_{concurrency}"
 
             logger.info("Starting profiling for %s phase", self.current_phase)
             logger.info("Batch composition stats: %s", batch_composition_stats)
@@ -384,9 +464,26 @@ class PhaseBasedProfiler:
             # is CANONICAL_TS_POLL_TIMEOUT_S.
             profiler_trace.clear_canonical_ts_marker(phase_dir)
 
+    def _all_captures_done(self) -> bool:
+        """Whether no step can start another capture."""
+        wanted = [
+            phase
+            for phase in self.inference_phase_seen
+            if not self.only_phases or phase.name.lower() in self.only_phases
+        ]
+        if self.target_concurrencies:
+            return all(
+                (phase, c) in self.profiled_concurrencies
+                for phase in wanted
+                for c in self.target_concurrencies
+            )
+        if self.track_concurrency:
+            return False
+        return all(self.inference_phase_seen[phase] for phase in wanted)
+
     def step(self, batch_composition_stats: dict) -> None:
         """Steps the profiler and logs batch composition stats."""
-        have_seen_all_phases = all(self.inference_phase_seen.values())
+        have_seen_all_phases = self._all_captures_done()
         # A batch with no work has no phase -- the classifier divides by
         # total_num_scheduled_tokens. execute_model already returns before
         # calling us in that case, so this only keeps the invariant local.
