@@ -171,97 +171,7 @@ def _deserialize_entry(entry: Any) -> Callable[..., Any]:
     return deserialize_bundled_cache_entry(entry)
 
 
-_TPU_COMPILE_ENV_IGNORED = {
-    # Startup, diagnostics, and orchestration only; these do not affect the
-    # compiled model or custom-kernel lowering.
-    "DP_SCHED_ENABLED",
-    "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS",
-    "PYTHON_TRACER_LEVEL",
-    "RAY_USAGE_STATS_ENABLED",
-    "TPU_NAME",
-    "USE_PHASED_PROFILER",
-    # Raiden KV-transfer orchestration/identity only; consumed at serving time
-    # by the KV connector and never affect the compiled graph.
-    "TPU_RAIDEN_CONTROLLER_ADDRESS",
-    "TPU_RAIDEN_ENGINE_ID",
-    "TPU_RAIDEN_JOB_NAME",
-    "TPU_RAIDEN_TRANSFER_PARALLELISM",
-    "TPU_WORKER_ID",
-    "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE",
-    "VLLM_XLA_CHECK_RECOMPILATION",
-    "TPU_PARALLEL_PRECOMPILE",
-    "TPU_PRECOMPILE_BIGGEST_FIRST",
-    "TPU_PRECOMPILE_PEER_REPLAY",
-    # KV-transfer wiring: ports, socket paths, staging pool, pool sizes,
-    # timeouts. Same reasoning as the Raiden group above. Every registry
-    # entry not named here joins the cache key, so omitting these would
-    # recompile the world whenever an operator retuned a port.
-    "TPU_IPC_SOCKET_DIR",
-    "TPU_KV_CHANNEL_EXECUTOR_MAX_WORKERS",
-    "TPU_KV_COORD_EXECUTOR_MAX_WORKERS",
-    "TPU_KV_LATENCY_LOG_INTERVAL",
-    "TPU_KV_PIN_SHM",
-    "TPU_KV_SHM_POOL_GB",
-    "TPU_KV_STAGE_WAITER_POOL_SIZE",
-    "TPU_KV_STAGE_WAIT_TIMEOUT_SECS",
-    "TPU_KV_TRANSFER_CHANNEL_NUMBER",
-    "TPU_KV_TRANSFER_NAMESPACE",
-    "TPU_KV_TRANSFER_PORT",
-    # Compiles the same artifacts, just eagerly at startup.
-    "TPU_KV_WARMUP_ENABLED",
-    "TPU_NODE_ID",
-    "TPU_P2P_WAIT_PULL_TIMEOUT",
-    "TPU_RAIDEN_INLINE_LOAD",
-    "TPU_RAIDEN_POOL_STAGING_LEASES",
-    "TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT",
-    "TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S",
-    "TPU_RAIDEN_STAGE3_STATUS_PROBE_S",
-    "TPU_RAIDEN_TEST_REGISTRATION_DELAY_S",
-    "TPU_RAIDEN_TRANSFER_NUM_SLOTS",
-    "TPU_SIDE_CHANNEL_PORT",
-    # The HBM reserve that feeds block-count sizing comes from
-    # kv_transfer_config, not from this variable.
-    "TPU_USE_RAIDEN_CONNECTOR",
-    # Pipeline chunk sizing: scheduling and the extra token buckets, which
-    # are keyed by shape inside the same cache.
-    "TPU_PP_DYNAMIC_CHUNKS",
-    "TPU_PP_CHUNK_SLACK",
-    # Engine-side timing of the pipeline pushes; the workers' programs are
-    # the same either way.
-    "TPU_PP_LAZY_PUSH",
-    # Startup and host-side knobs: ports, an IPC secret, two raiden startup
-    # checks, the raiden offload storage tier, offload retry and drain
-    # limits, a weight-load sync cadence, a debug log switch, and the
-    # local-rank offsets, which move a worker to a different chip without
-    # changing the executable it runs.
-    "DEBUG_TPU_LOCAL_RANK_OFFSET",
-    "EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK",
-    "RAIDEN_DISABLE_SINGLETON_WORKER",
-    "RAIDEN_SHM_KEY",
-    "RAIDEN_STORAGE_CAPACITY_GB",
-    "RAIDEN_STORAGE_PATH",
-    "RAIDEN_STORAGE_PROPERTIES",
-    "RAIDEN_STORAGE_TYPE",
-    # Compiles the same spec-decode artifacts, just eagerly at startup.
-    "SPEC_WARMUP",
-    "TORCH_TPU_BASE_PORT",
-    "TORCH_TPU_MP_RENDEZVOUS_PORT",
-    "TPU_LOCAL_RANK_OFFSET",
-    "TPU_SHARDED_LOAD_SYNC_EVERY",
-    "VLLM_TORCHTPU_IPC_KEY",
-    "VLLM_TPU_DEBUG_PCP_LAYOUT",
-    "VLLM_TPU_OFFLOAD_SAVE_RETRIES",
-    "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S",
-    # Scheduler prefix-cache hit length only.
-    "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP",
-    "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
-    # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
-    "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
-    # Pooling: the static pooler is a separate backend="tpu" helper outside the
-    # backbone graph, and the KV cap reaches the hash through num_gpu_blocks.
-    "VLLM_TPU_STATIC_POOLER",
-    "VLLM_TPU_POOLING_KV_CACHE_TOKENS",
-}
+_TPU_COMPILE_ENV_IGNORED = set(envs.COMPILE_IGNORED_FACTORS)
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
     "LIBTPU_INIT_ARGS",
@@ -387,17 +297,11 @@ def _reloadable_kernel_relpaths(repo_root: Path) -> list[str]:
 
 def _tpu_compile_env_factors() -> dict[str, Any]:
     """Return TorchTPU plugin env values that can affect compilation."""
-    factors = {}
-    for name, getter in envs.environment_variables.items():
-        if name in _TPU_COMPILE_ENV_IGNORED:
-            continue
-        try:
-            factors[name] = getter()
-        except Exception as exc:
-            logger.warning(
-                "Skipping TPU compile environment variable %s: %s", name, exc
-            )
-    return factors
+    return envs.compile_factors(
+        on_error=lambda name, exc: logger.warning(
+            "Skipping TPU compile environment variable %s: %s", name, exc
+        )
+    )
 
 
 def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:

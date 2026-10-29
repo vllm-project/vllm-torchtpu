@@ -34,6 +34,7 @@ from vllm_torchtpu import envs, patch_registry
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.pp_validation import validate_pipeline_parallel_config
+from vllm_torchtpu.platforms.preflight import preflight_check
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
     unified_kv_layout_enabled,
     update_tpu_block_size_and_slot_config,
@@ -748,12 +749,7 @@ class TpuPlatform(Platform):
             "Use --data-parallel-size and --enable-expert-parallel instead."
         )
         _validate_phased_profiling_config(vllm_config)
-        if "USE_MOE_EP_KERNEL" in os.environ:
-            raise ValueError(
-                "USE_MOE_EP_KERNEL is no longer supported and enables "
-                "nothing. Unset it; the fused expert-parallel MoE kernel is "
-                "USE_MOE_FUSED_EP_KERNEL=1."
-            )
+        preflight_check(vllm_config)
         patch_registry.apply(
             "platform_activation", model_config=vllm_config.model_config
         )

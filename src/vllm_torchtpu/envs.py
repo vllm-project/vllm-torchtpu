@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import functools
+import hashlib
+import json
 import os
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -194,6 +197,22 @@ if TYPE_CHECKING:
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
+    TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE: bool = False
+    VLLM_TPU_STRICT_ENV: bool = False
+    VLLM_TORCHTPU_COMPILE_FACTORS_DIGEST: str | None = None
+
+
+ENV_CHOICES: dict[
+    str,
+    tuple[str | None, list[str] | Callable[[], list[str]], bool],
+] = {}
+REMOVED_ENVS: dict[str, str] = {
+    "USE_MOE_EP_KERNEL": (
+        "USE_MOE_EP_KERNEL is no longer supported and enables nothing. "
+        "Unset it; the fused expert-parallel MoE kernel is USE_MOE_FUSED_EP_KERNEL=1."
+    ),
+}
+DEPRECATED_ENVS: dict[str, str] = {}
 
 
 def env_with_choices(
@@ -214,6 +233,7 @@ def env_with_choices(
     Returns:
         Lambda function for environment_variables dict
     """
+    ENV_CHOICES[env_name] = (default, choices, case_sensitive)
 
     def _get_validated_env() -> str | None:
         value = os.getenv(env_name)
@@ -380,7 +400,12 @@ def env_optional_int(env_name: str) -> Callable[[], int | None]:
         value = os.getenv(env_name)
         if value is None or value == "":
             return None
-        return int(value)
+        try:
+            return int(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid value '{value}' for {env_name}: must be an integer."
+            ) from exc
 
     return _get_optional_int_env
 
@@ -1146,38 +1171,169 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS": env_nonnegative_int(
         "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS", 8
     ),
+    "VLLM_TPU_STRICT_ENV": env_bool("VLLM_TPU_STRICT_ENV", default=False),
+    "VLLM_TORCHTPU_COMPILE_FACTORS_DIGEST": lambda: os.getenv(
+        "VLLM_TORCHTPU_COMPILE_FACTORS_DIGEST"
+    ),
 }
 
+COMPILE_IGNORED_FACTORS: frozenset[str] = frozenset(
+    {
+        "DEBUG_TPU_LOCAL_RANK_OFFSET",
+        "DP_SCHED_ENABLED",
+        "EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK",
+        "PYTHON_TRACER_LEVEL",
+        "RAIDEN_DISABLE_SINGLETON_WORKER",
+        "RAIDEN_SHM_KEY",
+        "RAIDEN_STORAGE_CAPACITY_GB",
+        "RAIDEN_STORAGE_PATH",
+        "RAIDEN_STORAGE_PROPERTIES",
+        "RAIDEN_STORAGE_TYPE",
+        "RAY_USAGE_STATS_ENABLED",
+        "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
+        "SPEC_WARMUP",
+        "TORCH_TPU_BASE_PORT",
+        "TORCH_TPU_MP_RENDEZVOUS_PORT",
+        "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
+        "TPU_IPC_SOCKET_DIR",
+        "TPU_KV_CHANNEL_EXECUTOR_MAX_WORKERS",
+        "TPU_KV_COORD_EXECUTOR_MAX_WORKERS",
+        "TPU_KV_LATENCY_LOG_INTERVAL",
+        "TPU_KV_PIN_SHM",
+        "TPU_KV_SHM_POOL_GB",
+        "TPU_KV_STAGE_WAITER_POOL_SIZE",
+        "TPU_KV_STAGE_WAIT_TIMEOUT_SECS",
+        "TPU_KV_TRANSFER_CHANNEL_NUMBER",
+        "TPU_KV_TRANSFER_NAMESPACE",
+        "TPU_KV_TRANSFER_PORT",
+        "TPU_KV_WARMUP_ENABLED",
+        "TPU_LOCAL_RANK_OFFSET",
+        "TPU_NAME",
+        "TPU_NODE_ID",
+        "TPU_P2P_WAIT_PULL_TIMEOUT",
+        "TPU_PARALLEL_PRECOMPILE",
+        "TPU_PP_CHUNK_SLACK",
+        "TPU_PP_DYNAMIC_CHUNKS",
+        "TPU_PP_LAZY_PUSH",
+        "TPU_PRECOMPILE_BIGGEST_FIRST",
+        "TPU_PRECOMPILE_PEER_REPLAY",
+        "TPU_RAIDEN_CONTROLLER_ADDRESS",
+        "TPU_RAIDEN_ENGINE_ID",
+        "TPU_RAIDEN_INLINE_LOAD",
+        "TPU_RAIDEN_JOB_NAME",
+        "TPU_RAIDEN_POOL_STAGING_LEASES",
+        "TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT",
+        "TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S",
+        "TPU_RAIDEN_STAGE3_STATUS_PROBE_S",
+        "TPU_RAIDEN_TEST_REGISTRATION_DELAY_S",
+        "TPU_RAIDEN_TRANSFER_NUM_SLOTS",
+        "TPU_RAIDEN_TRANSFER_PARALLELISM",
+        "TPU_SHARDED_LOAD_SYNC_EVERY",
+        "TPU_SIDE_CHANNEL_PORT",
+        "TPU_USE_RAIDEN_CONNECTOR",
+        "TPU_WORKER_ID",
+        "USE_PHASED_PROFILER",
+        "VLLM_TORCHTPU_COMPILE_FACTORS_DIGEST",
+        "VLLM_TORCHTPU_IPC_KEY",
+        "VLLM_TPU_DEBUG_PCP_LAYOUT",
+        "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP",
+        "VLLM_TPU_OFFLOAD_SAVE_RETRIES",
+        "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S",
+        "VLLM_TPU_POOLING_KV_CACHE_TOKENS",
+        "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS",
+        "VLLM_TPU_STATIC_POOLER",
+        "VLLM_TPU_STRICT_ENV",
+        "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE",
+        "VLLM_XLA_CHECK_RECOMPILATION",
+    }
+)
 
-def __getattr__(name: str) -> Any:
-    """
-    Gets environment variables lazily.
 
-    NOTE: After enable_envs_cache() invocation (which triggered after service
-    initialization), all environment variables will be cached.
-    """
+def compile_factors(
+    on_error: Callable[[str, Exception], None] | None = None,
+) -> dict[str, Any]:
+    """Collect compilation-relevant TPU environment factors."""
+    factors: dict[str, Any] = {}
+    for name in sorted(environment_variables):
+        if name in COMPILE_IGNORED_FACTORS:
+            continue
+        try:
+            factors[name] = _uncached_get(name)
+        except Exception as exc:
+            if on_error is not None:
+                on_error(name, exc)
+            else:
+                raise
+    return factors
+
+
+def compile_factors_digest() -> str:
+    """Compute 16-hex SHA-256 digest of canonical compile factors."""
+    payload = json.dumps(
+        compile_factors(), sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+_envs_cache_enabled: bool = False
+
+
+def _uncached_get(name: str) -> Any:
     if name in environment_variables:
         return environment_variables[name]()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+__getattr__ = _uncached_get
+
+
 def enable_envs_cache() -> None:
-    """
-    Enables caching of environment variables by wrapping the module's __getattr__
-    function with functools.cache(). This improves performance by avoiding
-    repeated re-evaluation of environment variables.
-
-    NOTE: This should be called after service initialization. Once enabled,
-    environment variable values are cached and will not reflect changes to
-    os.environ until the process is restarted.
-    """
-    # Tag __getattr__ with functools.cache
-    global __getattr__
-    __getattr__ = functools.cache(__getattr__)
-
-    # Cache all environment variables
+    """Enables caching of environment variables via functools.cache()."""
+    global __getattr__, _envs_cache_enabled
+    _envs_cache_enabled = True
+    __getattr__ = functools.cache(_uncached_get)
     for key in environment_variables:
         __getattr__(key)
+
+
+def disable_envs_cache() -> None:
+    """Disables caching and restores uncached __getattr__."""
+    global __getattr__, _envs_cache_enabled
+    _envs_cache_enabled = False
+    __getattr__ = _uncached_get
+
+
+@contextlib.contextmanager
+def patch(**overrides: Any) -> Iterator[None]:
+    """Temporarily override environment variables with hermetic isolation."""
+    for key in overrides:
+        if key not in environment_variables:
+            raise KeyError(f"Unknown TPU environment variable '{key}'")
+    global __getattr__, _envs_cache_enabled
+    was_cache_enabled = _envs_cache_enabled
+    old_env = dict(os.environ)
+    try:
+        for key, value in overrides.items():
+            if value is None or (
+                value == "" and key in ENV_CHOICES and ENV_CHOICES[key][0] == ""
+            ):
+                os.environ.pop(key, None)
+            elif type(value) is bool:
+                os.environ[key] = "1" if value else "0"
+            else:
+                os.environ[key] = str(value)
+        if was_cache_enabled:
+            enable_envs_cache()
+        else:
+            disable_envs_cache()
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(old_env)
+        if was_cache_enabled:
+            enable_envs_cache()
+        else:
+            disable_envs_cache()
 
 
 def __dir__() -> list[str]:
@@ -1193,3 +1349,24 @@ def use_raiden_glm_admission() -> bool:
 def is_indexer_kv_cache_mode_explicit() -> bool:
     """True when VLLM_TPU_INDEXER_KV_CACHE_MODE was explicitly set."""
     return "VLLM_TPU_INDEXER_KV_CACHE_MODE" in os.environ
+
+
+def raw_environ_snapshot() -> dict[str, str]:
+    """Return a snapshot of os.environ for startup validation."""
+    return dict(os.environ)
+
+
+def set_env_override(name: str, value: str) -> None:
+    """Set an environment variable in os.environ."""
+    os.environ[name] = value
+    if _envs_cache_enabled:
+        enable_envs_cache()
+
+
+def is_rank_zero_env() -> bool:
+    """True when the current process is rank 0 on node 0."""
+    return (
+        os.getenv("RANK", "0") == "0"
+        and os.getenv("NODE_RANK", "0") == "0"
+        and os.getenv("TPU_WORKER_ID", "0") in ("0", "")
+    )
