@@ -189,6 +189,13 @@ def _build_op(
     from vllm_torchtpu.compilation.moe_preprocessing import prepare_moe_preprocessing
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
 
+    moe_layer = fused_ep_moe_v2
+    if envs.MOE_FUSED_EP_KERNEL_IMPL == "push":
+        # Same operands and admission as v2; only the dispatch differs.
+        from vllm_torchtpu.kernels.experimental.push_fused_moe import (
+            fused_ep_moe_push as moe_layer,
+        )
+
     preprocess_topology = prepare_moe_preprocessing(mesh)
 
     key = (
@@ -225,7 +232,7 @@ def _build_op(
         # bf16 gate output -- which is what the model's gate matmul produces --
         # fails inside the kernel on a dtype mismatch. Widen at the boundary;
         # softmax runs in f32 on this path anyway.
-        return fused_ep_moe_v2(
+        return moe_layer(
             x,
             w1,
             w2,

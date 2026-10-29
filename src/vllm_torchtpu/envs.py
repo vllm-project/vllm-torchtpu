@@ -81,6 +81,8 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_PREPROCESS_BACKEND: str = "native"
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
+    MOE_FUSED_EP_PUSH_SC_PREPUSH: int = 2
+    MOE_FUSED_EP_PUSH_TC_EXCHANGE: bool = False
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_PP_DYNAMIC_CHUNKS: bool = True
@@ -658,8 +660,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Explicit implementation selection also enables fused EP. When unset,
     # preserve the legacy enable flag and v2 behavior. Adaptive owns its
     # admission, automatically supports FP4 and never falls back to GMM.
+    # "push" is v2 with the activation all-gather replaced by point-to-point
+    # push dispatch (kernels/experimental/push_fused_moe), same admission.
     "MOE_FUSED_EP_KERNEL_IMPL": env_with_choices(
-        "MOE_FUSED_EP_KERNEL_IMPL", None, ["v2", "adaptive"]
+        "MOE_FUSED_EP_KERNEL_IMPL", None, ["v2", "adaptive", "push"]
     ),
     # Opt in to NVFP4 W4A8 in fused EP MoE v2. Requires the fused EP switch
     # above; defaults off so enabling fused EP alone preserves NVFP4 W4A16.
@@ -687,6 +691,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE": lambda: int(
         os.getenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", "0") or 0
     ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: how many destination expert-visit
+    # positions the SparseCore pushes before the TensorCore MoE kernel starts
+    # (clamped to [1, experts per shard]); the kernel pushes the rest.
+    "MOE_FUSED_EP_PUSH_SC_PREPUSH": env_int("MOE_FUSED_EP_PUSH_SC_PREPUSH", 2),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: run the routing-metadata exchange as a
+    # TensorCore remote-DMA kernel instead of XLA's (SparseCore-offloaded)
+    # all-gather, keeping it off the SparseCore queue.
+    "MOE_FUSED_EP_PUSH_TC_EXCHANGE": env_bool("MOE_FUSED_EP_PUSH_TC_EXCHANGE"),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
     # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device
