@@ -20,6 +20,8 @@ from vllm.distributed import (
 )
 from vllm.model_executor.layers.linear import RowParallelLinear
 
+from vllm_torchtpu import transforms
+
 
 @RowParallelLinear.register_oot
 class TpuRowParallelLinear(RowParallelLinear):
@@ -31,8 +33,8 @@ class TpuRowParallelLinear(RowParallelLinear):
     so adding it afterwards sums the same terms in a different order and keeps
     the graphs identical.
 
-    Only the deferred case is overridden; everything else delegates to
-    ``super().forward()``.
+    Only the deferred case (or an active ``transforms.microbatch`` region) is
+    overridden; everything else delegates to ``super().forward()``.
     """
 
     def forward(
@@ -45,22 +47,36 @@ class TpuRowParallelLinear(RowParallelLinear):
             and not self.skip_bias_add
             and self.bias is not None
         )
-        if not defer_bias:
+        if not defer_bias and not transforms.is_microbatch_active():
             return super().forward(input_)
 
-        if self.input_is_parallel:
-            input_parallel = input_
-        else:
-            split_input = split_tensor_along_last_dim(
-                input_, num_partitions=self.tp_size
+        with transforms.microbatching.pipeline_stage():
+            if self.input_is_parallel:
+                input_parallel = input_
+            else:
+                split_input = split_tensor_along_last_dim(
+                    input_, num_partitions=self.tp_size
+                )
+                input_parallel = split_input[self.tp_rank].contiguous()
+
+            bias_ = (
+                None
+                if (defer_bias or self.tp_rank > 0 or self.skip_bias_add)
+                else self.bias
             )
-            input_parallel = split_input[self.tp_rank].contiguous()
+            output_parallel = self.quant_method.apply(
+                self, input_parallel, bias_
+            )
 
-        output_parallel = self.quant_method.apply(self, input_parallel, None)
-        output = tensor_model_parallel_all_reduce(output_parallel)
-        output = output + self.bias
+        if self.reduce_results and self.tp_size > 1:
+            with transforms.microbatching.pipeline_stage():
+                output = tensor_model_parallel_all_reduce(output_parallel)
+                if defer_bias:
+                    output = output + self.bias
+        else:
+            output = output_parallel
 
-        # skip_bias_add is False here, so there is no bias left to return.
         if not self.return_bias:
             return output
-        return output, None
+        output_bias = self.bias if self.skip_bias_add else None
+        return output, output_bias

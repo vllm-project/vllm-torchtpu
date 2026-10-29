@@ -20,6 +20,7 @@ from typing import Any, Literal, overload
 import torch
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu import transforms
 from vllm_torchtpu.kernels.lse_rescale import lse_rescale_head_major
 
 
@@ -88,25 +89,38 @@ def cp_lse_ag_out_rs(
         return (output, lse) if return_lse else output
 
     # TODO(weiyulin): Evaluate if we need LSE and reduce to be fp32.
-    lse = lse.to(torch.float32)
-    lses = group.all_gather(lse.unsqueeze(0).contiguous(), dim=0)
-    merged_lse = torch.logsumexp(lses, dim=0)
+    with transforms.microbatching.pipeline_stage():
+        lse = lse.to(torch.float32)
+        lses = group.all_gather(lse.unsqueeze(0).contiguous(), dim=0)
+        merged_lse = torch.logsumexp(lses, dim=0)
 
-    if output.device.type == "tpu":
-        # Head-major, so the reduce-scatter's leading axis is the heads and
-        # it reads the weighted partial without a transposing copy.
-        wire_dtype = str(rs_dtype or torch.float32).removeprefix("torch.")
-        weighted = _lse_rescale_head_major(output, lse, merged_lse, wire_dtype)
-        merged = group.reduce_scatter(weighted, dim=0).transpose(0, 1).contiguous()
-    else:
-        # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
-        weight = torch.exp(lse - merged_lse).unsqueeze(-1)
-        weighted = output.to(torch.float32) * weight
-        weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
-        if rs_dtype is not None:
-            weighted = weighted.to(rs_dtype)
-        merged = group.reduce_scatter(weighted.contiguous(), dim=1)
-    merged = merged.to(output.dtype)
+        if output.device.type == "tpu":
+            # Head-major, so the reduce-scatter's leading axis is the heads and
+            # it reads the weighted partial without a transposing copy.
+            wire_dtype = str(rs_dtype or torch.float32).removeprefix("torch.")
+            weighted = _lse_rescale_head_major(
+                output, lse, merged_lse, wire_dtype
+            )
+        else:
+            # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
+            weight = torch.exp(lse - merged_lse).unsqueeze(-1)
+            weighted = output.to(torch.float32) * weight
+            weighted = torch.where(
+                weight > 0, weighted, torch.zeros_like(weighted)
+            )
+            if rs_dtype is not None:
+                weighted = weighted.to(rs_dtype)
+
+    with transforms.microbatching.pipeline_stage():
+        if output.device.type == "tpu":
+            merged = (
+                group.reduce_scatter(weighted, dim=0)
+                .transpose(0, 1)
+                .contiguous()
+            )
+        else:
+            merged = group.reduce_scatter(weighted.contiguous(), dim=1)
+        merged = merged.to(output.dtype)
     if not return_lse:
         return merged
 

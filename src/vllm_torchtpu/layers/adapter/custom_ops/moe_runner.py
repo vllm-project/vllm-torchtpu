@@ -18,7 +18,7 @@ from collections.abc import Callable
 from vllm.model_executor.layers.fused_moe.runner import moe_runner as _moe_runner
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import envs, transforms
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
     adaptive_fused_moe_supported,
 )
@@ -151,3 +151,16 @@ class VllmMoERunner(MoERunner):
                 return shared_output, hidden_states
             return hidden_states
         return super()._maybe_combine(shared_output, hidden_states)
+
+    def _maybe_reduce_final_output(
+        self,
+        shared_and_routed_output,
+        og_hidden_dim_post_xform: int | None,
+        fused_output_is_reduced: bool,
+    ):
+        with transforms.microbatching.pipeline_stage():
+            return super()._maybe_reduce_final_output(
+                shared_and_routed_output,
+                og_hidden_dim_post_xform,
+                fused_output_is_reduced,
+            )

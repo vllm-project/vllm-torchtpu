@@ -99,8 +99,10 @@ class _MockRowParallelOProj(nn.Module):
     def forward(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        partial = torch.nn.functional.linear(x, self.weight)
-        out = tensor_model_parallel_all_reduce(partial)
+        with transforms.microbatching.pipeline_stage():
+            partial = torch.nn.functional.linear(x, self.weight)
+        with transforms.microbatching.pipeline_stage():
+            out = tensor_model_parallel_all_reduce(partial)
         return out, None
 
 
@@ -175,8 +177,10 @@ def test_collective_to_compute_all_gather_gate_up_proj() -> None:
 
         def forward(self, x_shard: torch.Tensor) -> torch.Tensor:
             with transforms.microbatch(min_len=1024, groups=2):
-                x_full = tensor_model_parallel_all_gather(x_shard, dim=0)
-                gate_up, _ = self.gate_up_proj(x_full)
+                with transforms.microbatching.pipeline_stage():
+                    x_full = tensor_model_parallel_all_gather(x_shard, dim=0)
+                with transforms.microbatching.pipeline_stage():
+                    gate_up, _ = self.gate_up_proj(x_full)
             return gate_up + 1.0
 
     model = AllGatherMLP().eval()
@@ -561,14 +565,16 @@ def test_qwen35_gdn_and_moe_layer_microbatch_pipeline(monkeypatch) -> None:
             already_sequence_parallel: bool = False,
         ) -> torch.Tensor:
             del already_sequence_parallel
-            mask = self.local_padding_mask[: hidden_states.shape[0]]
-            router_logits = self.gate(hidden_states) * mask
-            shared_out = self.shared_expert(hidden_states) * mask
-            routed_out = torch.ops.tpu_transforms_test.fused_moe(
-                hidden_states, router_logits
-            )
-            combined = shared_out + routed_out
-            return tensor_model_parallel_all_reduce(combined)
+            with transforms.microbatching.pipeline_stage():
+                mask = self.local_padding_mask[: hidden_states.shape[0]]
+                router_logits = self.gate(hidden_states) * mask
+                shared_out = self.shared_expert(hidden_states) * mask
+                routed_out = torch.ops.tpu_transforms_test.fused_moe(
+                    hidden_states, router_logits
+                )
+                combined = shared_out + routed_out
+            with transforms.microbatching.pipeline_stage():
+                return tensor_model_parallel_all_reduce(combined)
 
     class _MockDecoderLayer(nn.Module):
         def __init__(
@@ -712,12 +718,15 @@ def test_qwen35_sequence_parallel_moe_microbatch(monkeypatch) -> None:
             already_sequence_parallel: bool = False,
         ) -> torch.Tensor:
             assert already_sequence_parallel
-            router_logits = self.gate(hidden_states)
-            shared_out = self.shared_expert(hidden_states)
-            routed_out = torch.ops.tpu_transforms_test.fused_moe(
-                hidden_states, router_logits
-            )
-            return tensor_model_parallel_all_reduce(shared_out + routed_out)
+            with transforms.microbatching.pipeline_stage():
+                router_logits = self.gate(hidden_states)
+                shared_out = self.shared_expert(hidden_states)
+                routed_out = torch.ops.tpu_transforms_test.fused_moe(
+                    hidden_states, router_logits
+                )
+                combined = shared_out + routed_out
+            with transforms.microbatching.pipeline_stage():
+                return tensor_model_parallel_all_reduce(combined)
 
     class _MockSPLayer(nn.Module):
         def __init__(self, dim: int) -> None:
@@ -757,5 +766,83 @@ def test_qwen35_sequence_parallel_moe_microbatch(monkeypatch) -> None:
     out_hs, out_res = gm_sp(*inputs_sp)
     torch.testing.assert_close(out_hs, ref_hs, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(out_res, ref_res, rtol=1e-4, atol=1e-4)
+
+
+@torch.library.custom_op("tpu_transforms_test::arbitrary_op_alpha", mutates_args=())
+def _arbitrary_op_alpha(x: torch.Tensor) -> torch.Tensor:
+    return x * 2.0 + 1.0
+
+
+@_arbitrary_op_alpha.register_fake
+def _(x: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+@torch.library.custom_op("tpu_transforms_test::arbitrary_op_beta", mutates_args=())
+def _arbitrary_op_beta(x: torch.Tensor) -> torch.Tensor:
+    return x - 0.5
+
+
+@_arbitrary_op_beta.register_fake
+def _(x: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+def test_explicit_pipeline_stage_without_op_name_heuristics() -> None:
+    """Verify that `transforms.microbatching.pipeline_stage` partitions arbitrary
+    operations into Stage 1 and Stage 2 purely from explicit stage scopes, with
+    zero reliance on collective or compute op-name heuristics."""
+
+    def _fn(x: torch.Tensor) -> torch.Tensor:
+        with transforms.microbatch(min_len=1024, groups=2):
+            with transforms.microbatching.pipeline_stage():
+                y = torch.ops.tpu_transforms_test.arbitrary_op_alpha(x)
+            with transforms.microbatching.pipeline_stage():
+                z = torch.ops.tpu_transforms_test.arbitrary_op_beta(y)
+        return z
+
+    gm, inputs = _capture_dynamic_fx_graph(_fn, torch.randn(1024, 16))
+    rewritten = transforms.apply_microbatch_pass(gm, inputs, size=1024)
+    assert rewritten == 1
+    assert _count_targets(gm, "microbatch_stage_enter") == 0
+    assert _count_targets(gm, "microbatch_stage_exit") == 0
+
+    op_sequence = [
+        getattr(n.target, "__name__", str(n.target)).lower()
+        for n in gm.graph.nodes
+        if n.op == "call_function"
+        and any(
+            k in getattr(n.target, "__name__", str(n.target)).lower()
+            for k in (
+                "arbitrary_op_alpha",
+                "arbitrary_op_beta",
+                "microbatch_barrier_2",
+                "cat",
+            )
+        )
+    ]
+    assert len(op_sequence) == 7
+    assert "arbitrary_op_alpha" in op_sequence[0]
+    assert "microbatch_barrier_2" in op_sequence[1]
+    assert "arbitrary_op_beta" in op_sequence[2]
+    assert "arbitrary_op_alpha" in op_sequence[3]
+    assert "microbatch_barrier_2" in op_sequence[4]
+    assert "arbitrary_op_beta" in op_sequence[5]
+    assert "cat" in op_sequence[6]
+
+    phs = [n for n in gm.graph.nodes if n.op == "placeholder"]
+    x_1024 = torch.randn(1024, 16)
+    ref = (x_1024 * 2.0 + 1.0) - 0.5
+    call_args = [
+        1024
+        if isinstance(ph.meta.get("example_value"), torch.SymInt)
+        else x_1024
+        for ph in phs
+    ]
+    out = gm(*call_args)
+    if isinstance(out, tuple):
+        out = out[0]
+    torch.testing.assert_close(out, ref)
+
 
 

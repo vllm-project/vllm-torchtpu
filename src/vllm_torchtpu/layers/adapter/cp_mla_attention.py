@@ -301,6 +301,33 @@ def _merge_chunked(
         return _merge_chunked_lse_gathered(
             output, lse, group, chunks, rs_dtype, vspace=vspace
         )
+    if not torch.compiler.is_compiling():
+        step = output.shape[0] // chunks
+        if envs.TPU_DCP_MERGE_RS_BF16 or envs.TPU_DCP_MERGE_WEIGHTED_HM or vspace:
+            lse_f32 = lse.to(torch.float32)
+            pieces: list[torch.Tensor] = []
+            for c in range(chunks):
+                pieces.append(
+                    _weighted_reduce_scatter(
+                        output[c * step : (c + 1) * step],
+                        lse_f32[c * step : (c + 1) * step],
+                        _gather_lse(lse_f32[c * step : (c + 1) * step], group),
+                        group,
+                        rs_dtype,
+                        vspace=vspace,
+                    )
+                )
+            return torch.cat(pieces, dim=0)
+        pieces = [
+            cp_lse_ag_out_rs(
+                output[c * step : (c + 1) * step],
+                lse[c * step : (c + 1) * step],
+                group,
+                rs_dtype=rs_dtype,
+            )
+            for c in range(chunks)
+        ]
+        return torch.cat(pieces, dim=0)
     use_barrier = not bool(envs.TPU_DCP_MLA_MERGE_PIECES)
     if envs.TPU_DCP_MERGE_RS_BF16 or envs.TPU_DCP_MERGE_WEIGHTED_HM or vspace:
         # `cp_lse_ag_out_rs` op for op, except the scatter-sum's wire dtype
@@ -358,20 +385,27 @@ def _weighted_reduce_scatter(
         return _weighted_reduce_scatter_vspace(output, weight, vspace, group, rs_dtype)
     # The heads-major operand feeds the f32 or the bf16 (RS_BF16=1)
     # reduce-scatter; RS_BF16=2's all-to-all keeps the tokens-major operand.
+    total_tokens = (
+        output.shape[0]
+        if torch.compiler.is_compiling()
+        else output.shape[0] * max(int(envs.TPU_DCP_MERGE_CHUNKED), 1)
+    )
     if (
         envs.TPU_DCP_MERGE_WEIGHTED_HM
         and envs.TPU_DCP_MERGE_RS_BF16 != 2
-        and output.shape[0] * max(int(envs.TPU_DCP_MERGE_CHUNKED), 1)
+        and total_tokens
         > envs.bucket_gate_edge(envs.TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS)
     ):
         return _weighted_reduce_scatter_heads_major(
             output, lse_f32, merged_lse, group, rs_dtype
         )
     # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
-    weight = torch.exp(lse_f32 - merged_lse).unsqueeze(-1)
-    weighted = output.to(torch.float32) * weight
-    weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
-    return _scatter_sum(weighted, group, rs_dtype).to(output.dtype)
+    with transforms.microbatching.pipeline_stage():
+        weight = torch.exp(lse_f32 - merged_lse).unsqueeze(-1)
+        weighted = output.to(torch.float32) * weight
+        weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
+    with transforms.microbatching.pipeline_stage():
+        return _scatter_sum(weighted, group, rs_dtype).to(output.dtype)
 
 
 def _scatter_sum(
@@ -416,25 +450,37 @@ def _weighted_reduce_scatter_vspace(
     `where(w > 0, (o_h @ W_UV_h) * w, 0)`, reduce-scattered over heads, with
     the operand built heads-major in one computation (TPU_DCP_MERGE_VSPACE_FUSED).
     Wire dtype as `_weighted_reduce_scatter_heads_major`'s."""
-    w_uv, w_uv_scale = vspace
-    wire = torch.bfloat16 if envs.TPU_DCP_MERGE_RS_BF16 == 1 else rs_dtype
-    wire = wire or torch.float32
-    if output.device.type == "tpu":
-        from vllm_torchtpu.layers.adapter.dcp_vspace import vspace_weighted_heads_major
+    with transforms.microbatching.pipeline_stage():
+        w_uv, w_uv_scale = vspace
+        wire = torch.bfloat16 if envs.TPU_DCP_MERGE_RS_BF16 == 1 else rs_dtype
+        wire = wire or torch.float32
+        if output.device.type == "tpu":
+            from vllm_torchtpu.layers.adapter.dcp_vspace import (
+                vspace_weighted_heads_major,
+            )
 
-        x = vspace_weighted_heads_major(output, weight, w_uv, w_uv_scale, wire)
-    else:
-        # The same arithmetic in torch (host tests): o's dtype operands, f32
-        # accumulation, the weight on the f32 product, one rounding.
-        v = torch.bmm(
-            output.transpose(0, 1).to(torch.float32),
-            w_uv.to(output.dtype).to(torch.float32),
+            x = vspace_weighted_heads_major(
+                output, weight, w_uv, w_uv_scale, wire
+            )
+        else:
+            # The same arithmetic in torch (host tests): o's dtype operands, f32
+            # accumulation, the weight on the f32 product, one rounding.
+            v = torch.bmm(
+                output.transpose(0, 1).to(torch.float32),
+                w_uv.to(output.dtype).to(torch.float32),
+            )
+            if w_uv_scale is not None:
+                v = v * w_uv_scale.to(torch.float32).reshape(
+                    v.shape[0], 1, -1
+                )
+            w = weight.to(torch.float32).transpose(0, 1).unsqueeze(-1)
+            x = torch.where(w > 0, v * w, torch.zeros_like(v)).to(wire)
+    with transforms.microbatching.pipeline_stage():
+        return (
+            group.reduce_scatter(x.contiguous(), dim=0)
+            .transpose(0, 1)
+            .to(output.dtype)
         )
-        if w_uv_scale is not None:
-            v = v * w_uv_scale.to(torch.float32).reshape(v.shape[0], 1, -1)
-        w = weight.to(torch.float32).transpose(0, 1).unsqueeze(-1)
-        x = torch.where(w > 0, v * w, torch.zeros_like(v)).to(wire)
-    return group.reduce_scatter(x.contiguous(), dim=0).transpose(0, 1).to(output.dtype)
 
 
 def _weighted_reduce_scatter_heads_major(
@@ -455,19 +501,27 @@ def _weighted_reduce_scatter_heads_major(
     bf16 (each f32 product rounded once, as `_scatter_sum`'s
     `.to(bfloat16)`), the RS_BF16 merge, heads-major.
     """
-    wire = torch.bfloat16 if envs.TPU_DCP_MERGE_RS_BF16 == 1 else rs_dtype
-    if output.device.type == "tpu":
-        from vllm_torchtpu.distributed.dcp_comm import _lse_rescale_head_major
+    with transforms.microbatching.pipeline_stage():
+        wire = torch.bfloat16 if envs.TPU_DCP_MERGE_RS_BF16 == 1 else rs_dtype
+        if output.device.type == "tpu":
+            from vllm_torchtpu.distributed.dcp_comm import (
+                _lse_rescale_head_major,
+            )
 
-        name = str(wire or torch.float32).removeprefix("torch.")
-        x = _lse_rescale_head_major(output, lse_f32, merged_lse, name)
-    else:
-        w = torch.exp(lse_f32 - merged_lse).transpose(0, 1).unsqueeze(-1)
-        x = output.transpose(0, 1).to(torch.float32) * w
-        x = torch.where(w > 0, x, torch.zeros_like(x))
-        if wire is not None:
-            x = x.to(wire)
-    return group.reduce_scatter(x.contiguous(), dim=0).transpose(0, 1).to(output.dtype)
+            name = str(wire or torch.float32).removeprefix("torch.")
+            x = _lse_rescale_head_major(output, lse_f32, merged_lse, name)
+        else:
+            w = torch.exp(lse_f32 - merged_lse).transpose(0, 1).unsqueeze(-1)
+            x = output.transpose(0, 1).to(torch.float32) * w
+            x = torch.where(w > 0, x, torch.zeros_like(x))
+            if wire is not None:
+                x = x.to(wire)
+    with transforms.microbatching.pipeline_stage():
+        return (
+            group.reduce_scatter(x.contiguous(), dim=0)
+            .transpose(0, 1)
+            .to(output.dtype)
+        )
 
 
 def _merge_chunked_lse_gathered(
@@ -490,6 +544,30 @@ def _merge_chunked_lse_gathered(
     is unchanged.
     """
     lse_f32 = lse.to(torch.float32)
+    if not torch.compiler.is_compiling():
+        step = output.shape[0] // chunks
+        if envs.TPU_DCP_MLA_MERGE_PIECES >= 2:
+            head = _gather_lse(lse_f32[:step], group)
+            rest = _gather_lse(lse_f32[step:], group)
+            rows = [head] + [
+                rest[:, (c - 1) * step : c * step] for c in range(1, chunks)
+            ]
+        else:
+            gathered = _gather_lse(lse_f32, group)
+            rows = [gathered[:, c * step : (c + 1) * step] for c in range(chunks)]
+        pieces: list[torch.Tensor] = []
+        for c in range(chunks):
+            pieces.append(
+                _weighted_reduce_scatter(
+                    output[c * step : (c + 1) * step],
+                    lse_f32[c * step : (c + 1) * step],
+                    rows[c],
+                    group,
+                    rs_dtype,
+                    vspace=vspace,
+                )
+            )
+        return torch.cat(pieces, dim=0)
     use_barrier = not bool(envs.TPU_DCP_MLA_MERGE_PIECES)
     if envs.TPU_DCP_MLA_MERGE_PIECES >= 2:
         with transforms.microbatch(

@@ -1,16 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Graph-level compilation transforms for TorchTPU (e.g. ``transforms.microbatch``).
 
-Provides a user-facing context manager ``transforms.microbatch(min_len=..., groups=...)``
-that brackets a model region with zero-overhead FX marker ops during Dynamo tracing:
+Provides user-facing context managers ``transforms.microbatch(min_len=..., groups=...)``
+and ``transforms.microbatching.pipeline_stage()`` that bracket a model region and its
+pipeline stages with zero-overhead FX marker ops during Dynamo tracing:
 
 .. code-block:: python
 
     from vllm_torchtpu import transforms
 
     with transforms.microbatch(min_len=1024, groups=2):
-        x_full = tensor_model_parallel_all_gather(x_shard, dim=0)
-        gate_up, _ = self.gate_up_proj(x_full)
+        with transforms.microbatching.pipeline_stage():
+            x_full = tensor_model_parallel_all_gather(x_shard, dim=0)
+        with transforms.microbatching.pipeline_stage():
+            gate_up, _ = self.gate_up_proj(x_full)
 
 During per-bucket compilation in :class:`TpuCompilerAdaptor`,
 :func:`apply_microbatch_pass` inspects the concrete token bucket ``size``:
@@ -18,11 +21,11 @@ During per-bucket compilation in :class:`TpuCompilerAdaptor`,
 - When ``size < min_len`` (or ``groups <= 1`` or ``size`` is not divisible by
   ``groups * min_chunk_multiple``), the marker ops are stripped in-place and the
   region executes unsplit with zero overhead.
-- When ``size >= min_len``, the bracketed region is automatically partitioned
-  into a 2-stage pipeline (``Collective -> Compute`` or ``Compute -> Collective``),
-  live-in token tensors are sliced along ``split_dim`` into ``groups`` chunks,
-  shared weights/parameters are reused without duplication, and a 2-barrier
-  diamond pipeline schedule overlaps ``Stage2(g)`` with ``Stage1(g + 1)`` using
+- When ``size >= min_len``, the bracketed region is partitioned into stages using
+  the explicit ``transforms.microbatching.pipeline_stage`` markers, live-in token
+  tensors are sliced along ``split_dim`` into ``groups`` chunks, shared weights
+  and parameters are reused without duplication, and a 2-barrier diamond pipeline
+  schedule overlaps ``Stage2(g)`` with ``Stage1(g + 1)`` using
   ``jax.lax.optimization_barrier`` before concatenating live-out tensors along
   ``split_dim``.
 """
@@ -72,6 +75,30 @@ def _(
 
 
 @torch.library.custom_op(
+    "tpu_transforms::microbatch_stage_enter", mutates_args=()
+)
+def _microbatch_stage_enter_op(token: torch.Tensor) -> torch.Tensor:
+    return token.clone()
+
+
+@_microbatch_stage_enter_op.register_fake
+def _(token: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(token)
+
+
+@torch.library.custom_op(
+    "tpu_transforms::microbatch_stage_exit", mutates_args=()
+)
+def _microbatch_stage_exit_op(token: torch.Tensor) -> torch.Tensor:
+    return token.clone()
+
+
+@_microbatch_stage_exit_op.register_fake
+def _(token: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(token)
+
+
+@torch.library.custom_op(
     "tpu_transforms::microbatch_stage_boundary", mutates_args=()
 )
 def _microbatch_stage_boundary_op(token: torch.Tensor) -> torch.Tensor:
@@ -97,6 +124,14 @@ def _(token: torch.Tensor) -> torch.Tensor:
 # preserve them until `apply_microbatch_pass` runs in `TpuCompilerAdaptor`.
 torch.fx.node.has_side_effect(torch.ops.tpu_transforms.microbatch_enter)
 torch.fx.node.has_side_effect(torch.ops.tpu_transforms.microbatch_enter.default)
+torch.fx.node.has_side_effect(torch.ops.tpu_transforms.microbatch_stage_enter)
+torch.fx.node.has_side_effect(
+    torch.ops.tpu_transforms.microbatch_stage_enter.default
+)
+torch.fx.node.has_side_effect(torch.ops.tpu_transforms.microbatch_stage_exit)
+torch.fx.node.has_side_effect(
+    torch.ops.tpu_transforms.microbatch_stage_exit.default
+)
 torch.fx.node.has_side_effect(torch.ops.tpu_transforms.microbatch_stage_boundary)
 torch.fx.node.has_side_effect(
     torch.ops.tpu_transforms.microbatch_stage_boundary.default
@@ -109,11 +144,24 @@ _ENTER_TARGETS = {
     torch.ops.tpu_transforms.microbatch_enter,
     torch.ops.tpu_transforms.microbatch_enter.default,
 }
+_STAGE_ENTER_TARGETS = {
+    _microbatch_stage_enter_op,
+    torch.ops.tpu_transforms.microbatch_stage_enter,
+    torch.ops.tpu_transforms.microbatch_stage_enter.default,
+}
+_STAGE_EXIT_TARGETS = {
+    _microbatch_stage_exit_op,
+    torch.ops.tpu_transforms.microbatch_stage_exit,
+    torch.ops.tpu_transforms.microbatch_stage_exit.default,
+}
 _STAGE_BOUNDARY_TARGETS = {
     _microbatch_stage_boundary_op,
     torch.ops.tpu_transforms.microbatch_stage_boundary,
     torch.ops.tpu_transforms.microbatch_stage_boundary.default,
 }
+_ALL_STAGE_MARKER_TARGETS = (
+    _STAGE_ENTER_TARGETS | _STAGE_EXIT_TARGETS | _STAGE_BOUNDARY_TARGETS
+)
 _EXIT_TARGETS = {
     _microbatch_exit_op,
     torch.ops.tpu_transforms.microbatch_exit,
@@ -177,6 +225,7 @@ def _select_barrier_op_for_node(node: fx.Node) -> Any:
 
 
 _ACTIVE_TOKENS: list[torch.Tensor] = []
+_ACTIVE_STAGE_DEPTH: list[int] = []
 
 
 def is_microbatch_active() -> bool:
@@ -185,8 +234,46 @@ def is_microbatch_active() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# User-Facing Context Manager & Helpers
+# User-Facing Context Managers & Helpers
 # ---------------------------------------------------------------------------
+
+
+class _PipelineStageContext:
+    """Context manager marking a pipeline stage inside ``with transforms.microbatch(...)``.
+
+    Can be invoked either as ``with transforms.microbatching.pipeline_stage():``
+    or ``with transforms.microbatching.pipeline_stage:``. When evaluated outside
+    an active ``with transforms.microbatch(...)`` block, it is a zero-overhead
+    no-op and emits no FX nodes.
+    """
+
+    def __init__(self) -> None:
+        self._entered_stack: list[bool] = []
+
+    def __call__(self) -> _PipelineStageContext:
+        return _PipelineStageContext()
+
+    def __enter__(self) -> None:
+        if not _ACTIVE_TOKENS:
+            self._entered_stack.append(False)
+            return
+        if _ACTIVE_STAGE_DEPTH[-1] > 0:
+            _ACTIVE_STAGE_DEPTH[-1] += 1
+            self._entered_stack.append(False)
+            return
+        _ACTIVE_STAGE_DEPTH[-1] += 1
+        self._entered_stack.append(True)
+        torch.ops.tpu_transforms.microbatch_stage_enter(_ACTIVE_TOKENS[-1])
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        entered = self._entered_stack.pop() if self._entered_stack else False
+        if _ACTIVE_TOKENS and _ACTIVE_STAGE_DEPTH:
+            _ACTIVE_STAGE_DEPTH[-1] -= 1
+        if entered and _ACTIVE_TOKENS:
+            torch.ops.tpu_transforms.microbatch_stage_exit(_ACTIVE_TOKENS[-1])
+
+
+pipeline_stage = _PipelineStageContext()
 
 
 @contextlib.contextmanager
@@ -229,9 +316,11 @@ def microbatch(
         int(min_chunk_multiple),
     )
     _ACTIVE_TOKENS.append(token)
+    _ACTIVE_STAGE_DEPTH.append(0)
     try:
         yield
     finally:
+        _ACTIVE_STAGE_DEPTH.pop()
         _ACTIVE_TOKENS.pop()
         torch.ops.tpu_transforms.microbatch_exit(token)
 
@@ -242,9 +331,39 @@ def stage_boundary() -> None:
         torch.ops.tpu_transforms.microbatch_stage_boundary(_ACTIVE_TOKENS[-1])
 
 
+# Attach `.pipeline_stage` and `.stage_boundary` onto `microbatch` and provide
+# the `transforms.microbatching` namespace so callers can write:
+#   - `with transforms.microbatching.pipeline_stage():`
+#   - `with transforms.microbatch.pipeline_stage():`
+#   - `with transforms.pipeline_stage():`
+setattr(microbatch, "pipeline_stage", pipeline_stage)
+setattr(microbatch, "stage_boundary", stage_boundary)
+
+
+class _MicrobatchingNamespace:
+    """Namespace and callable alias for ``transforms.microbatching``."""
+
+    pipeline_stage = pipeline_stage
+    stage_boundary = staticmethod(stage_boundary)
+    microbatch = staticmethod(microbatch)
+    is_microbatch_active = staticmethod(is_microbatch_active)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return microbatch(*args, **kwargs)
+
+
+microbatching = _MicrobatchingNamespace()
+
+
 # ---------------------------------------------------------------------------
-# FX Region Discovery & Classification
+# FX Region Discovery & Stage Partitioning
 # ---------------------------------------------------------------------------
+
+
+def _is_stage_marker(node: fx.Node) -> bool:
+    return (
+        node.op == "call_function" and node.target in _ALL_STAGE_MARKER_TARGETS
+    )
 
 
 @dataclass
@@ -302,7 +421,7 @@ def _find_microbatch_regions(graph: fx.Graph) -> list[_MicrobatchRegion]:
     if len(regions) <= 1:
         return regions
 
-    # Coalesce immediately back-to-back collective-free regions that share the
+    # Coalesce immediately back-to-back single-stage regions that share the
     # same parameters (e.g. `input_layernorm` in DecoderLayer followed directly
     # by `in_proj_qkvz`/`qkv_proj` at the start of Attention).
     merged: list[_MicrobatchRegion] = [regions[0]]
@@ -317,8 +436,8 @@ def _find_microbatch_regions(graph: fx.Graph) -> list[_MicrobatchRegion]:
             and prev.min_chunk_multiple == reg.min_chunk_multiple
             and prev.boundary_node is None
             and reg.boundary_node is None
-            and not any(_is_collective_start(n) for n in prev.body_nodes)
-            and not any(_is_collective_start(n) for n in reg.body_nodes)
+            and not any(_is_stage_marker(n) for n in prev.body_nodes)
+            and not any(_is_stage_marker(n) for n in reg.body_nodes)
         ):
             graph.erase_node(prev.exit_node)
             reg.exit_node.replace_input_with(reg.enter_node, prev.enter_node)
@@ -335,120 +454,6 @@ def _target_name(node: fx.Node) -> str:
     if node.op not in ("call_function", "call_method"):
         return ""
     return getattr(node.target, "__name__", str(node.target)).lower()
-
-
-def _is_collective_start(node: fx.Node) -> bool:
-    """True if ``node`` initiates a distributed collective communication op."""
-    name = _target_name(node)
-    if not name or "wait_tensor" in name:
-        return False
-    return any(
-        kw in name
-        for kw in (
-            "all_gather",
-            "reduce_scatter",
-            "all_reduce",
-            "all_to_all",
-            "dcp_lse_ag",
-            "dcp_reduce_scatter",
-            "cp_lse_ag_out_rs",
-        )
-    )
-
-
-def _is_wait_tensor(node: fx.Node) -> bool:
-    return "wait_tensor" in _target_name(node)
-
-
-def _is_heavy_compute_op(node: fx.Node) -> bool:
-    """True if ``node`` is a matrix multiplication or Pallas/TPU compute kernel."""
-    name = _target_name(node)
-    if not name or _is_collective_start(node) or _is_wait_tensor(node):
-        return False
-    return any(
-        kw in name
-        for kw in (
-            "mm",
-            "bmm",
-            "matmul",
-            "linear",
-            "addmm",
-            "dot",
-            "conv",
-            "vspace_weighted",
-            "lse_rescale",
-            "fp8_linear",
-            "tpu_matmul",
-            "gmm",
-            "ragged_dot",
-            "fused_moe",
-        )
-    )
-
-
-def _partition_region_stages(
-    body_nodes: list[fx.Node],
-    boundary_node: fx.Node | None,
-) -> tuple[list[fx.Node], list[fx.Node]]:
-    """Split ``body_nodes`` into ``(stage1_nodes, stage2_nodes)`` for diamond pipelining.
-
-    Supports both:
-    - ``Compute -> Collective`` (and ``[LSE_AG +] Compute -> Collective``):
-      ``Stage 1`` runs all nodes prior to the final collective start node;
-      ``Stage 2`` runs the final collective, its ``wait_tensor``, and any
-      trailing view/cast ops.
-    - ``Collective -> Compute`` (e.g. ``all_gather -> gate_up_proj``):
-      ``Stage 1`` runs the initial collective chain (through ``wait_tensor`` and
-      any reshape/view before the first heavy compute op); ``Stage 2`` runs the
-      heavy compute op and everything after it.
-    """
-    if not body_nodes:
-        return [], []
-
-    if boundary_node is not None and boundary_node in body_nodes:
-        idx = body_nodes.index(boundary_node)
-        stage1 = body_nodes[:idx]
-        stage2 = body_nodes[idx + 1 :]
-        if stage1 and stage2:
-            return stage1, stage2
-        body_nodes = stage1 + stage2
-
-    coll_indices = [i for i, n in enumerate(body_nodes) if _is_collective_start(n)]
-    compute_indices = [i for i, n in enumerate(body_nodes) if _is_heavy_compute_op(n)]
-
-    if coll_indices and compute_indices:
-        last_coll_idx = coll_indices[-1]
-        first_coll_idx = coll_indices[0]
-        # Case 1: Compute occurs before the last collective (Compute -> Collective,
-        # or LSE_AG -> Compute -> ReduceScatter).
-        if any(c_idx < last_coll_idx for c_idx in compute_indices):
-            return body_nodes[:last_coll_idx], body_nodes[last_coll_idx:]
-
-        # Case 2: Collective occurs before Compute (Collective -> Compute,
-        # e.g. all_gather -> gate_up_proj).
-        first_compute_after_coll = next(
-            (c_idx for c_idx in compute_indices if c_idx > first_coll_idx), None
-        )
-        if first_compute_after_coll is not None:
-            return (
-                body_nodes[:first_compute_after_coll],
-                body_nodes[first_compute_after_coll:],
-            )
-
-    # Fallback: if there is at least one collective and arithmetic ops (e.g.
-    # logsumexp / exp / mul / where -> reduce_scatter), split right before the
-    # last collective or right after the first collective's wait_tensor.
-    if coll_indices:
-        last_coll_idx = coll_indices[-1]
-        if last_coll_idx > 0:
-            return body_nodes[:last_coll_idx], body_nodes[last_coll_idx:]
-        wait_idx = next(
-            (i for i, n in enumerate(body_nodes) if _is_wait_tensor(n)), 0
-        )
-        split_at = min(wait_idx + 1, len(body_nodes))
-        return body_nodes[:split_at], body_nodes[split_at:]
-
-    return body_nodes, []
 
 
 def _node_tensor_val(node: fx.Node) -> torch.Tensor | None:
@@ -473,26 +478,66 @@ _PASSTHROUGH_VIEW_CAST_OPS = (
 )
 
 
+def _partition_region_stages(
+    raw_nodes: list[fx.Node],
+) -> tuple[list[fx.Node], list[fx.Node]]:
+    """Split ``raw_nodes`` into ``(stage1_nodes, stage2_nodes)`` using explicit
+    ``transforms.microbatching.pipeline_stage`` (or ``stage_boundary``) markers.
+    """
+    body_nodes: list[fx.Node] = []
+    stage_spans: list[tuple[int, int]] = []
+    open_stage_start: int | None = None
+    boundary_idx: int | None = None
+
+    for n in raw_nodes:
+        if n.op == "call_function" and n.target in _STAGE_ENTER_TARGETS:
+            if open_stage_start is None:
+                open_stage_start = len(body_nodes)
+        elif n.op == "call_function" and n.target in _STAGE_EXIT_TARGETS:
+            if open_stage_start is not None:
+                stage_spans.append((open_stage_start, len(body_nodes)))
+                open_stage_start = None
+        elif n.op == "call_function" and n.target in _STAGE_BOUNDARY_TARGETS:
+            boundary_idx = len(body_nodes)
+        else:
+            body_nodes.append(n)
+
+    if not body_nodes:
+        return [], []
+
+    if boundary_idx is not None and 0 < boundary_idx < len(body_nodes):
+        return body_nodes[:boundary_idx], body_nodes[boundary_idx:]
+
+    if len(stage_spans) >= 2:
+        split_idx = (
+            stage_spans[1][0]
+            if stage_spans[1][0] > 0
+            else stage_spans[0][1]
+        )
+        if 0 < split_idx < len(body_nodes):
+            return body_nodes[:split_idx], body_nodes[split_idx:]
+
+    if len(stage_spans) == 1:
+        start_0, end_0 = stage_spans[0]
+        has_work_after = end_0 < len(body_nodes) and any(
+            _target_name(n) not in _PASSTHROUGH_VIEW_CAST_OPS
+            for n in body_nodes[end_0:]
+        )
+        if has_work_after and end_0 > 0:
+            return body_nodes[:end_0], body_nodes[end_0:]
+        if start_0 > 0:
+            return body_nodes[:start_0], body_nodes[start_0:]
+
+    return body_nodes, []
+
+
 def _is_weight_only_input(node: fx.Node, region_set: set[fx.Node]) -> bool:
-    """True when ``node`` is a model parameter/weight/scale/cache rather than a token activation."""
+    """True when ``node`` is a model parameter/attribute or scalar metadata buffer."""
     if "_microbatch_pieces" in node.meta:
         return False
     if node.op == "get_attr":
         return True
-    lower_name = node.name.lower()
-    if lower_name.startswith("l_self_") or any(
-        kw in lower_name
-        for kw in (
-            "weight",
-            "scale",
-            "bias",
-            "cache",
-            "table",
-            "w_uv",
-            "w_uk",
-            "rank",
-        )
-    ):
+    if node.name.lower().startswith("l_self_"):
         return True
     val = _node_tensor_val(node)
     if isinstance(val, torch.nn.Parameter):
@@ -502,53 +547,15 @@ def _is_weight_only_input(node: fx.Node, region_set: set[fx.Node]) -> bool:
     # e.g. `small_all_reduce_op.retain`), treat `node` as a metadata buffer.
     in_region_users = [u for u in node.users if u in region_set]
     if in_region_users and all(
-        "select" in _target_name(u) and len(u.args) >= 3 and u.args[1] == 0 and u.args[2] == 0
+        "select" in _target_name(u)
+        and len(u.args) >= 3
+        and u.args[1] == 0
+        and u.args[2] == 0
         for u in in_region_users
     ):
         return True
 
-    # Trace through view/cast ops inside `region_set` to see how `node` is consumed.
-    frontier = [
-        (node, u) for u in node.users if u in region_set
-    ]
-    if not frontier:
-        return False
-    saw_compute_rhs = False
-    while frontier:
-        src, user = frontier.pop()
-        name = _target_name(user)
-        if "vspace_weighted" in name:
-            if len(user.args) >= 3 and src in user.args[2:]:
-                saw_compute_rhs = True
-                continue
-            return False
-        if "addmm" in name:
-            if len(user.args) >= 3 and src is not user.args[1]:
-                saw_compute_rhs = True
-                continue
-            return False
-        if any(
-            kw in name
-            for kw in (
-                "mm",
-                "bmm",
-                "linear",
-                "matmul",
-                "fp8_linear",
-                "tpu_matmul",
-            )
-        ):
-            if user.args and user.args[0] is not src:
-                saw_compute_rhs = True
-                continue
-            return False
-        if name in _PASSTHROUGH_VIEW_CAST_OPS:
-            for next_u in user.users:
-                if next_u in region_set:
-                    frontier.append((user, next_u))
-            continue
-        return False
-    return saw_compute_rhs
+    return False
 
 
 def _sym_or_int_key(v: Any) -> tuple[str, Any]:
@@ -615,11 +622,11 @@ def _hoist_external_buffer_slices(
     microbatch ``g`` automatically receives ``mask[g * step : (g + 1) * step]``.
     """
     region_set = {
-        n for n in region.body_nodes if n is not region.boundary_node
+        n for n in region.body_nodes if not _is_stage_marker(n)
     }
     hoisted: list[fx.Node] = []
     for n in list(region.body_nodes):
-        if n is region.boundary_node:
+        if _is_stage_marker(n):
             continue
         if any(inp in region_set for inp in n.all_input_nodes):
             continue
@@ -851,6 +858,9 @@ def _emit_barrier_2(
 def _erase_marker_nodes(region: _MicrobatchRegion, graph: fx.Graph) -> None:
     if region.exit_node in graph.nodes:
         graph.erase_node(region.exit_node)
+    for n in reversed(region.body_nodes):
+        if _is_stage_marker(n) and n in graph.nodes:
+            graph.erase_node(n)
     if region.boundary_node is not None and region.boundary_node in graph.nodes:
         graph.erase_node(region.boundary_node)
     if region.enter_node in graph.nodes:
@@ -880,7 +890,7 @@ def _rewrite_single_region(
 
     _hoist_external_buffer_slices(region, split_dim, size)
     body_nodes = [
-        n for n in region.body_nodes if n is not region.boundary_node
+        n for n in region.body_nodes if not _is_stage_marker(n)
     ]
     if not body_nodes:
         _erase_marker_nodes(region, graph)
@@ -901,7 +911,7 @@ def _rewrite_single_region(
         if any(
             user not in region_set
             and user is not region.exit_node
-            and user is not region.boundary_node
+            and not _is_stage_marker(user)
             for user in n.users
         ):
             live_out_nodes.append(n)
@@ -931,9 +941,7 @@ def _rewrite_single_region(
         graph, token_dim_expr, live_in_nodes
     )
 
-    stage1_nodes, stage2_nodes = _partition_region_stages(
-        region.body_nodes, region.boundary_node
-    )
+    stage1_nodes, stage2_nodes = _partition_region_stages(region.body_nodes)
     stage1_set = set(stage1_nodes)
     stage2_set = set(stage2_nodes)
 
