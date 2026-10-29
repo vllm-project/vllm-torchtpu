@@ -11,16 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Union-aware bounded prefill, measured TPU7x Q24/KV2/D256 only.
-
-Uses the low-memory output schedule from standalone qsa_prefill v0.4.
-Dispatch uses work bounds and calibrated per-stage costs; query buckets
-are aligned to Q256 and subdivided into bounded outer chunks.
-
-Keeps the validated TC paired-page kernel for reusable/small KV unions. SC
-bounds selected-KV compute for large unions. Dispatch is outside both kernels;
-all metadata and branch costs belong to the end-to-end call.
-"""
+"""Bounded TC/SC prefill with request-local work accounting."""
 
 import jax
 import jax.numpy as jnp
@@ -28,11 +19,21 @@ from jax import lax
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.qwen4_exp import block_sparse_gqa_prefill as candidate
-from vllm_torchtpu.kernels.sparse_gqa_prefill.grouped import sc_grouped_attention
-from vllm_torchtpu.kernels.sparse_gqa_prefill.selector import (
-    select_sc,
-    tc_selected_by_static_bound,
+from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import (
+    _paired_working_set,
+    get_sparse_prefill_tiles,
+    prefill_vmem_limit,
 )
+from vllm_torchtpu.kernels.sparse_gqa_prefill.cost_model import (
+    CALIBRATED_PROFILE,
+    COST_MODELS,
+    PrefillCalibration,
+    sc_cost,
+    tc_cost,
+)
+from vllm_torchtpu.kernels.sparse_gqa_prefill.grouped import sc_grouped_attention
+from vllm_torchtpu.kernels.sparse_gqa_prefill.occupancy import active_counts
+from vllm_torchtpu.kernels.sparse_gqa_prefill.selector import select_sc
 from vllm_torchtpu.kernels.sparse_gqa_prefill.tuned_block_sizes import (
     PREFILL_DISPATCH_CHUNK_QUERIES,
     SC_CHUNK_SIZE,
@@ -48,7 +49,7 @@ def adaptive_prefill(
     cache: jax.Array,
     starts: jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
-    """Attend within the measured envelope; cache is returned unchanged.
+    """Attend with a bounded workspace; cache is returned unchanged.
 
     Request starts include padded slots. Inactive token rows have length zero
     and group IDs -1; each active row has a unique valid prefix of selected
@@ -69,11 +70,31 @@ def adaptive_prefill(
         v_scale=1.0,
     ):
         raise NotImplementedError(
-            "Adaptive prefill requires the measured TPU7x "
-            "Q24/KV2/D256, page1664 envelope; "
+            "Adaptive prefill requires native packed BF16/FP8 KV, "
+            "ratio4/KV2, aligned dimensions, sufficient VMEM and SparseCore; "
             "use block_sparse_gqa_attention for other configurations"
         )
     arrays = (q, gate, blocks, lengths, table)
+    profile = PrefillCalibration(
+        q.shape[1],
+        2,
+        q.shape[2],
+        4,
+        cache.shape[1],
+        blocks.shape[1],
+        pltpu.get_tpu_info().chip_version,
+    )
+    if profile != CALIBRATED_PROFILE:
+        query_block, kv_tile = get_sparse_prefill_tiles(q, cache, kv_heads=2, ratio=4)
+        return candidate.block_sparse_gqa_attention(
+            *arrays,
+            cache,
+            starts,
+            kv_heads=2,
+            ratio=4,
+            query_block=query_block,
+            kv_tile=kv_tile,
+        )
     # Preserve the one-chunk schedule at the calibrated common bucket.
     if len(q) <= PREFILL_DISPATCH_CHUNK_QUERIES and len(q) % 256 == 0:
         return _one_chunk(arrays, cache, starts)
@@ -81,7 +102,13 @@ def adaptive_prefill(
     full_chunks, tail = divmod(len(q), PREFILL_DISPATCH_CHUNK_QUERIES)
     num_tiles = (table.shape[1] * cache.shape[1] + 255) // 256
     choices = _select_sc_for_full_chunks(
-        blocks, lengths, starts, cache, full_chunks, num_tiles
+        blocks,
+        lengths,
+        starts,
+        cache,
+        full_chunks,
+        num_tiles,
+        _tc_plan(q, blocks, table, cache, PREFILL_DISPATCH_CHUNK_QUERIES),
     )
     # Carry only the final output. In particular, do not slice/materialize
     # all full-chunk Q/gate inputs before the TC/SC branch, or concatenate
@@ -103,7 +130,14 @@ def adaptive_prefill(
     def remainder(output):
         offset = full_chunks * PREFILL_DISPATCH_CHUNK_QUERIES
         choose = _select_sc_for_tail(
-            blocks, lengths, starts, cache, offset, tail, num_tiles
+            blocks,
+            lengths,
+            starts,
+            cache,
+            offset,
+            tail,
+            num_tiles,
+            _tc_plan(q, blocks, table, cache, tail),
         )
         return _write_chunk(
             arrays, cache, starts, output, offset, tail, choose, tail=True
@@ -126,12 +160,12 @@ def adaptive_prefill(
     return output, cache
 
 
-def _select_sc_for_full_chunks(blocks, lengths, starts, cache, full_chunks, num_tiles):
+def _select_sc_for_full_chunks(
+    blocks, lengths, starts, cache, full_chunks, num_tiles, plan
+):
     """Select full outer chunks without materializing query or gate chunks."""
     choices = None
-    if full_chunks and not tc_selected_by_static_bound(
-        queries=PREFILL_DISPATCH_CHUNK_QUERIES, num_tiles=num_tiles, dtype=cache.dtype
-    ):
+    if full_chunks:
 
         def select_chunk(data):
             chunk_index, chunk_blocks, chunk_lengths = data
@@ -143,6 +177,7 @@ def _select_sc_for_full_chunks(blocks, lengths, starts, cache, full_chunks, num_
                 PREFILL_DISPATCH_CHUNK_QUERIES,
                 num_tiles,
                 cache.dtype,
+                plan,
             )
 
         choices = lax.map(
@@ -161,12 +196,14 @@ def _select_sc_for_full_chunks(blocks, lengths, starts, cache, full_chunks, num_
     return choices
 
 
-def _select_sc_for_tail(blocks, lengths, starts, cache, offset, tail, num_tiles):
+def _select_sc_for_tail(blocks, lengths, starts, cache, offset, tail, num_tiles, plan):
     """Pad only tail metadata for selection, at the tail's original call site."""
     padded = (tail + 255) // 256 * 256
     ids = jnp.pad(blocks[offset:], ((0, padded - tail), (0, 0)), constant_values=-1)
     ls = jnp.pad(lengths[offset:], (0, padded - tail))
-    return _select_sc_for_chunk(ids, ls, starts, offset, tail, num_tiles, cache.dtype)
+    return _select_sc_for_chunk(
+        ids, ls, starts, offset, tail, num_tiles, cache.dtype, plan
+    )
 
 
 def _direct_tc(query, gate, blocks, lengths, table, cache):
@@ -187,44 +224,25 @@ def _direct_tc(query, gate, blocks, lengths, table, cache):
 
 
 def _ragged_tc_write(arrays, cache, starts, output, offset, size):
-    local = jnp.clip(starts - offset, 0, size)
-
-    def request(req, output):
-        count = (local[req + 1] - local[req] + 255) // 256
-
-        def tile(i, output):
-            first = offset + local[req] + i * 256
-            rows = min(256, len(output))
-            start = jnp.minimum(first, len(output) - rows)
-            indices = start + jnp.arange(rows, dtype=jnp.int32)
-            valid = (indices >= first) & (indices < offset + local[req + 1])
-            tile_query, tile_gate, tile_blocks, tile_lengths = tuple(
-                jnp.pad(
-                    jnp.where(
-                        valid.reshape((rows,) + (1,) * (x.ndim - 1)),
-                        lax.dynamic_slice_in_dim(x, start, rows),
-                        -1 if k == 2 else 0,
-                    ),
-                    ((0, 256 - rows),) + ((0, 0),) * (x.ndim - 1),
-                    constant_values=-1 if k == 2 else 0,
-                )
-                for k, x in enumerate(arrays[:4])
-            )
-            # A clipped final tile can begin before this request. All its
-            # live queries still use this request's table, including when
-            # the first query lane is masked.
-            _, _, _, _, page_table = arrays
-            tile_table = jnp.broadcast_to(page_table[first], (256, page_table.shape[1]))
-            result = _direct_tc(
-                tile_query, tile_gate, tile_blocks, tile_lengths, tile_table, cache
-            )[:rows]
-            old = lax.dynamic_slice_in_dim(output, start, rows)
-            result = jnp.where(valid[:, None, None], result, old)
-            return lax.dynamic_update_slice_in_dim(output, result, start, axis=0)
-
-        return lax.fori_loop(0, count, tile, output)
-
-    return lax.fori_loop(0, len(starts) - 1, request, output)
+    query, gate, blocks, lengths, table = arrays
+    return candidate._ragged_prefill(
+        query,
+        gate,
+        blocks,
+        lengths,
+        table,
+        cache,
+        starts,
+        output,
+        offset,
+        size,
+        ratio=4,
+        kv_heads=2,
+        query_block=256,
+        kv_tile=256,
+        k_scale=1.0,
+        v_scale=1.0,
+    )
 
 
 def _nonempty_request_starts_are_q256_aligned(starts):
@@ -245,23 +263,98 @@ def _tc(query, gate, blocks, lengths, table, cache, starts):
     )
 
 
-def _select_sc_for_chunk(ids, lengths, starts, offset, size, num_tiles, dtype):
+def _tc_plan(query, blocks, table, cache, size):
+    num_tiles = (table.shape[1] * cache.shape[1] + 255) // 256
+    words = ((num_tiles * 2 + 127) // 128) * 128
+    return candidate._ragged_plan(
+        size,
+        query.shape[1],
+        cache.shape[4],
+        words,
+        table.shape[1] * cache.shape[1] // 4,
+        table.shape[1],
+        blocks.shape[1],
+        256,
+        query_dtype=query.dtype,
+    )
+
+
+def _select_sc_for_chunk(ids, lengths, starts, offset, size, num_tiles, dtype, plan):
+    padding = (-len(lengths)) % 256
+    ids = jnp.pad(ids, ((0, padding), (0, 0)), constant_values=-1)
+    lengths = jnp.pad(lengths, (0, padding))
     local = jnp.clip(starts - offset, 0, size)
     aligned = _nonempty_request_starts_are_q256_aligned(local)
-    # A boundary inside a TC tile changes the padded schedule; its fitted
-    # Q256 union costs no longer describe the actual work. Keep TC there.
+    sc_queries = (
+        (size + SC_CHUNK_SIZE[jnp.dtype(dtype)] - 1)
+        // SC_CHUNK_SIZE[jnp.dtype(dtype)]
+        * SC_CHUNK_SIZE[jnp.dtype(dtype)]
+    )
+    model = COST_MODELS[jnp.dtype(dtype)]
+    pack_tiles, source_rows, _ = plan
+
+    def ragged(_):
+        target = sc_cost(model, lengths[:sc_queries]) * 1.02
+        tiles = jnp.sum((jnp.diff(local) + 255) // 256, dtype=jnp.int32)
+        calls_lower = (tiles + pack_tiles - 1) // pack_tiles
+        lower = tc_cost(
+            model,
+            queries=calls_lower * pack_tiles * 256,
+            num_tiles=num_tiles,
+            tile_visits=jnp.int32(0),
+            launches=calls_lower,
+        )
+
+        def fine(_):
+            first, ends, total = candidate._request_tiles(starts, offset, size, 256)
+            calls = candidate._ragged_call_count(
+                first, ends, total, source_rows, pack_tiles, offset + size
+            )
+
+            def request(req, visits):
+                count = (local[req + 1] - local[req] + 255) // 256
+
+                def tile(i, visits):
+                    first = local[req] + i * 256
+                    rows = min(256, len(lengths))
+                    start = jnp.minimum(first, len(lengths) - rows)
+                    indices = start + jnp.arange(rows)
+                    live = (indices >= first) & (indices < local[req + 1])
+                    ls = jnp.pad(
+                        jnp.where(
+                            live, lax.dynamic_slice_in_dim(lengths, start, rows), 0
+                        ),
+                        (0, 256 - rows),
+                    )
+                    bs = jnp.pad(
+                        lax.dynamic_slice_in_dim(ids, start, rows),
+                        ((0, 256 - rows), (0, 0)),
+                        constant_values=-1,
+                    )
+                    return visits + active_counts(bs, ls, num_tiles=num_tiles).sum()
+
+                return lax.fori_loop(0, count, tile, visits)
+
+            visits = lax.fori_loop(0, len(local) - 1, request, jnp.int32(0))
+            return (
+                tc_cost(
+                    model,
+                    queries=calls * pack_tiles * 256,
+                    num_tiles=num_tiles,
+                    tile_visits=visits,
+                    launches=calls,
+                )
+                > target
+            )
+
+        return lax.cond(lower > target, lambda _: jnp.array(True), fine, None)
+
     return lax.cond(
         aligned,
         lambda _: select_sc(
-            ids,
-            lengths,
-            num_tiles=num_tiles,
-            dtype=dtype,
-            sc_queries=(size + SC_CHUNK_SIZE[jnp.dtype(dtype)] - 1)
-            // SC_CHUNK_SIZE[jnp.dtype(dtype)]
-            * SC_CHUNK_SIZE[jnp.dtype(dtype)],
+            ids, lengths, num_tiles=num_tiles, dtype=dtype, sc_queries=sc_queries
         ),
-        lambda _: jnp.array(False),
+        ragged,
         None,
     )
 
@@ -269,12 +362,15 @@ def _select_sc_for_chunk(ids, lengths, starts, offset, size, num_tiles, dtype):
 def _one_chunk(arrays, cache, starts):
     q, gate, blocks, lengths, table = arrays
     num_tiles = (table.shape[1] * cache.shape[1] + 255) // 256
-    if tc_selected_by_static_bound(
-        queries=len(q), num_tiles=num_tiles, dtype=cache.dtype
-    ):
-        return _tc(q, gate, blocks, lengths, table, cache, starts), cache
     choose = _select_sc_for_chunk(
-        blocks, lengths, starts, 0, len(q), num_tiles, cache.dtype
+        blocks,
+        lengths,
+        starts,
+        0,
+        len(q),
+        num_tiles,
+        cache.dtype,
+        _tc_plan(q, blocks, table, cache, len(q)),
     )
 
     def sc(_):
@@ -421,13 +517,13 @@ def _sc_prefill(q, gate, blocks, lengths, table, cache, *, chunk_size):
 
 
 def is_supported_by_adaptive_prefill(
-    query: jax.Array,
-    gate: jax.Array,
-    blocks: jax.Array,
-    lengths: jax.Array,
-    table: jax.Array,
-    cache: jax.Array,
-    starts: jax.Array,
+    query: jax.Array | jax.ShapeDtypeStruct,
+    gate: jax.Array | jax.ShapeDtypeStruct,
+    blocks: jax.Array | jax.ShapeDtypeStruct,
+    lengths: jax.Array | jax.ShapeDtypeStruct,
+    table: jax.Array | jax.ShapeDtypeStruct,
+    cache: jax.Array | jax.ShapeDtypeStruct,
+    starts: jax.Array | jax.ShapeDtypeStruct,
     *,
     kv_heads: int,
     ratio: int,
@@ -436,7 +532,7 @@ def is_supported_by_adaptive_prefill(
 ) -> bool:
     """Static eligibility only; request metadata obeys qsa_attention's contract."""
     # Keep these stages consecutive: early failures must not inspect later inputs.
-    if not _has_tested_query_and_request_geometry(query, gate, kv_heads, ratio, starts):
+    if not _has_query_and_request_geometry(query, gate, kv_heads, ratio, starts):
         return False
     if not _has_supported_cache_and_index_metadata(
         query, blocks, lengths, table, cache, starts
@@ -445,20 +541,31 @@ def is_supported_by_adaptive_prefill(
     if not _has_unit_scales(k_scale, v_scale):
         return False
     packing = 32 // jax.dtypes.itemsize_bits(cache.dtype)
-    if cache.shape[2:] != (4 // packing, packing, 256):
+    if cache.shape[2:] != ((4 + packing - 1) // packing, packing, query.shape[2]):
         return False
     info = pltpu.get_tpu_info()
     return (
-        info.chip_version == pltpu.ChipVersion.TPU_7X and info.sparse_core is not None
+        info.sparse_core is not None
+        and _paired_working_set(
+            query.shape[1],
+            2,
+            query.shape[2],
+            packing,
+            jax.dtypes.itemsize_bits(cache.dtype) // 8,
+            8,
+            128,
+        )
+        <= prefill_vmem_limit()
     )
 
 
-def _has_tested_query_and_request_geometry(query, gate, kv_heads, ratio, starts):
-    """Check the query contract and tested geometry before request offsets."""
+def _has_query_and_request_geometry(query, gate, kv_heads, ratio, starts):
+    """Check query geometry before request offsets."""
     if (  # noqa: SIM103 - Keep one truth test per predicate.
         query.ndim != 3
-        or query.shape[1:] != (24, 256)
-        or not 1 <= query.shape[0] <= 262144
+        or min(query.shape) <= 0
+        or query.shape[1] % 2
+        or query.shape[2] % 128
         or gate.shape != query.shape
         or query.dtype != jnp.bfloat16
         or gate.dtype != jnp.bfloat16
@@ -478,14 +585,17 @@ def _has_supported_cache_and_index_metadata(
     if (  # noqa: SIM103 - Keep one truth test per predicate.
         cache.ndim != 5
         or cache.shape[0] == 0
-        or cache.shape[1] != 1664
+        or cache.shape[1] <= 0
+        or cache.shape[1] % 128
         or cache.dtype not in (jnp.bfloat16, jnp.float8_e4m3fn)
         or cache.size * jax.dtypes.itemsize_bits(cache.dtype) // 8 > 16 * 2**30
-        or blocks.shape != (len(query), 512)
+        or blocks.ndim != 2
+        or blocks.shape[0] != len(query)
+        or blocks.shape[1] <= 0
         or lengths.shape != (len(query),)
         or table.ndim != 2
         or table.shape[0] != len(query)
-        or not 1 <= table.shape[1] <= (262144 + 1663) // 1664
+        or table.shape[1] <= 0
         or any(x.dtype != jnp.int32 for x in (blocks, lengths, table, starts))
     ):
         return False

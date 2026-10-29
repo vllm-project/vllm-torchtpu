@@ -17,6 +17,7 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+from jax.experimental.pallas import tpu as pltpu
 
 # Fixed geometry of the calibrated schedule, not hardware capacity limits.
 TC_QUERY_BLOCK = 256
@@ -36,6 +37,21 @@ class PrefillCostModel(NamedTuple):
     sc_fixed_ms: float
     sc_query_ms: float
     sc_attention_tile_ms: float
+
+
+class PrefillCalibration(NamedTuple):
+    query_heads: int
+    kv_heads: int
+    head_dim: int
+    ratio: int
+    page_size: int
+    budget: int
+    chip: pltpu.ChipVersion
+
+
+CALIBRATED_PROFILE = PrefillCalibration(
+    24, 2, 256, 4, 1664, 512, pltpu.ChipVersion.TPU_7X
+)
 
 
 # Calibrated coefficients convert the schedule's work counts to milliseconds.
@@ -89,7 +105,12 @@ def estimate_static_bounds_ms(
 
 
 def tc_cost(
-    model: PrefillCostModel, *, queries: int, num_tiles: int, tile_visits: jax.Array
+    model: PrefillCostModel,
+    *,
+    queries: int | jax.Array,
+    num_tiles: int,
+    tile_visits: jax.Array,
+    launches: int | jax.Array = 1,
 ) -> jax.Array:
     """Estimate TC time from scheduled queries, mask words, and tile visits."""
     words = (
@@ -97,7 +118,7 @@ def tc_cost(
         // _MASK_WORD_ALIGNMENT
     ) * _MASK_WORD_ALIGNMENT
     return (
-        model.tc_fixed_ms
+        model.tc_fixed_ms * launches
         + model.tc_query_ms * queries
         + model.tc_mask_word_ms * queries * words
         + model.tc_tile_ms * tile_visits.astype(jnp.float32)

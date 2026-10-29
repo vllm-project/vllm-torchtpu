@@ -14,6 +14,7 @@
 """QSA block-sparse prefill with query-block reuse across paged KV tiles."""
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -23,7 +24,12 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import utils
 from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import (
-    PAIRED_PAGE_VMEM_MIB,
+    TC_METADATA_BITSET_TARGET_BYTES,
+    TC_METADATA_MAX_BATCH_BLOCKS,
+    TC_PACKING_TARGET_BYTES,
+    TC_SELECTION_TARGET_BYTES,
+    _paired_working_set,
+    prefill_vmem_limit,
     supports_paired_prefill,
 )
 from vllm_torchtpu.kernels.qwen4_exp.rounding import bf16
@@ -33,6 +39,7 @@ def _kernel(
     table_ref,
     active_tiles_ref,
     active_counts_ref,
+    last_page_ref,
     query_ref,
     bitset_ref,
     lengths_ref,
@@ -79,16 +86,13 @@ def _kernel(
 
     def copy_tiles(tile, kv_ref, sem_ref):
         copies = []
-        # One mask word covers ratio * 32 tokens. Split there because a
-        # shared pool page may contain an odd number of these segments.
-        copy_rows = min(kv_tile, physical_page_size, ratio * 32)
+        copy_rows = math.gcd(kv_tile, physical_page_size, ratio * 32)
         for offset in range(0, kv_tile, copy_rows):
             logical = tile * kv_tile + offset
             page = logical // physical_page_size
             in_page = logical % physical_page_size
-            # An odd final logical page has no second half. Its selection
-            # word is zero; repeat a valid DMA address without exposing it.
-            address = block * pages_per_query + jnp.minimum(page, pages_per_query - 1)
+            # Masked segments repeat an owned page's DMA address.
+            address = block * pages_per_query + jnp.minimum(page, last_page_ref[block])
             physical = table_ref[address]
             destination = (
                 kv_ref if copy_rows == kv_tile else kv_ref.at[pl.ds(offset, copy_rows)]
@@ -132,9 +136,6 @@ def _kernel(
             )
         return pairs
 
-    # B64 is the largest production query tile that fits the full-model v7
-    # scoped-VMEM limit while retaining FP32 online-softmax state. Larger
-    # query blocks reuse one resident KV tile across multiple B64 subtiles.
     query_tile = min(query_block, 256)
     num_query_tiles = query_block // query_tile
     # Preserve -inf initialization and all-masked-row guards exactly.
@@ -263,6 +264,110 @@ def _kernel(
     output_ref[...] = jnp.concatenate(output_tiles, axis=0).astype(output_ref.dtype)
 
 
+def _selection_batch_rows(budget, groups, words):
+    """Plan logical arrays; fusion, sort scratch and layouts affect allocations."""
+    index_bytes = jnp.dtype(jnp.int32).itemsize
+    mask_bytes = jnp.dtype(jnp.bool_).itemsize
+    slots = budget + 1
+    # Masked/sorted complete IDs, selected IDs with tail, and word indices.
+    id_arrays_bytes = (budget + budget + slots + slots) * index_bytes
+    scatter_indices_bytes = slots * 2 * index_bytes
+    # Prefix, valid complete IDs, unique complete IDs, and selected IDs with tail.
+    mask_arrays_bytes = (budget + budget + budget + slots) * mask_bytes
+    mask_arrays_bytes += slots * jnp.dtype(jnp.uint32).itemsize
+    packed_bitset_bytes = words * index_bytes
+    # Complete count, tail ID, and row iota.
+    row_scalars_bytes = 3 * index_bytes
+    row_bytes = (
+        id_arrays_bytes
+        + scatter_indices_bytes
+        + mask_arrays_bytes
+        + packed_bitset_bytes
+        + row_scalars_bytes
+    )
+    return max(1, TC_SELECTION_TARGET_BYTES // row_bytes)
+
+
+def _selection_bitset(blocks, lengths, *, ratio, groups, words):
+    rows, budget = blocks.shape
+    if not rows or not groups or not words:
+        return _selection_bitset_chunk(
+            blocks, lengths, ratio=ratio, groups=groups, words=words
+        )
+    chunk = min(rows, _selection_batch_rows(budget, groups, words))
+    if rows == chunk:
+        return _selection_bitset_chunk(
+            blocks, lengths, ratio=ratio, groups=groups, words=words
+        )
+    padding = (-rows) % chunk
+    chunks = (rows + padding) // chunk
+    bs = jnp.pad(blocks, ((0, padding), (0, 0)), constant_values=-1).reshape(
+        chunks, chunk, budget
+    )
+    ls = jnp.pad(lengths, (0, padding)).reshape(chunks, chunk)
+    bits = lax.map(
+        lambda data: _selection_bitset_chunk(
+            *data, ratio=ratio, groups=groups, words=words
+        ),
+        (bs, ls),
+    )
+    return bits.reshape(rows + padding, words)[:rows]
+
+
+def _selection_bitset_chunk(blocks, lengths, *, ratio, groups, words):
+    """Deduplicate complete groups before signed bitmask accumulation."""
+    rows, slots = blocks.shape
+    if not words or not groups or not rows:
+        return jnp.zeros((rows, words), jnp.int32)
+    complete = jnp.minimum(lengths // ratio, groups)
+    tail = lengths // ratio
+    prefix = jnp.arange(slots)[None, :] < jnp.minimum(complete[:, None], slots)
+    valid = (
+        prefix & (lengths[:, None] > 0) & (blocks >= 0) & (blocks < complete[:, None])
+    )
+    sentinel = jnp.iinfo(jnp.int32).max
+    masked_blocks = jnp.where(valid, blocks, sentinel)
+    ordered = lax.sort(masked_blocks, dimension=1, is_stable=False)
+    unique = jnp.concatenate(
+        (jnp.ones((rows, 1), dtype=jnp.bool_), ordered[:, 1:] != ordered[:, :-1]),
+        axis=1,
+    )[:, :slots]
+    unique &= ordered != sentinel
+    # Complete groups precede the implicit tail, so the tail is already unique.
+    selected = jnp.concatenate((ordered, tail[:, None]), axis=1)
+    selected_unique = jnp.concatenate(
+        (
+            unique,
+            ((lengths > 0) & (lengths % ratio != 0) & (tail < groups))[:, None],
+        ),
+        axis=1,
+    )
+    word = jnp.where(selected_unique, selected // 32, words)
+    row = jnp.broadcast_to(jnp.arange(rows)[:, None], selected.shape)
+    indices = jnp.stack((row, word), axis=-1)
+    masks = jnp.where(
+        selected_unique,
+        jnp.uint32(1) << (selected % 32).astype(jnp.uint32),
+        jnp.uint32(0),
+    )
+    masks = lax.bitcast_convert_type(masks, jnp.int32)
+    # Distinct bit positions sum to their OR; bit31 is one signed contribution.
+    packed = lax.scatter_add(
+        jnp.zeros((rows, words), jnp.int32),
+        indices,
+        masks,
+        lax.ScatterDimensionNumbers(
+            update_window_dims=(),
+            inserted_window_dims=(0, 1),
+            scatter_dims_to_operand_dims=(0, 1),
+        ),
+        indices_are_sorted=False,
+        unique_indices=False,
+        mode="drop",
+    )
+    return packed
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -290,6 +395,39 @@ def block_sparse_gqa_prefill(
     v_scale: float = 1.0,
     bf16_io: bool = False,
 ):
+    return _prefill(
+        query,
+        blocks,
+        lengths,
+        page_table,
+        cache,
+        None,
+        ratio=ratio,
+        kv_heads=kv_heads,
+        query_block=query_block,
+        kv_tile=kv_tile,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        bf16_io=bf16_io,
+    )
+
+
+def _prefill(
+    query,
+    blocks,
+    lengths,
+    page_table,
+    cache,
+    bitset,
+    *,
+    ratio,
+    kv_heads,
+    query_block,
+    kv_tile,
+    k_scale,
+    v_scale,
+    bf16_io,
+):
     """Run exact selected-group attention with query-block KV reuse."""
     tokens, query_heads, head_dim = query.shape
     pages, physical_page_size, head_axis, packing, cache_dim = cache.shape
@@ -302,11 +440,12 @@ def block_sparse_gqa_prefill(
         ):
             raise ValueError(
                 "Paired pages require BF16 queries, native BF16/FP8 KV, "
-                "128-aligned pages/dimensions and a TPU7x tile "
-                "within the paired VMEM footprint"
+                "128-aligned pages/dimensions and sufficient VMEM"
             )
-    elif kv_tile // ratio != 32 or max(physical_page_size, kv_tile) % min(
-        physical_page_size, kv_tile
+    elif (
+        ratio <= 0
+        or kv_tile != ratio * 32
+        or math.gcd(physical_page_size, kv_tile) % 128
     ):
         raise ValueError(
             "Each KV tile must use one selection word or two mask segments"
@@ -318,20 +457,45 @@ def block_sparse_gqa_prefill(
     head_dim = cache_dim
     if packing != (2 if cache.dtype == jnp.bfloat16 else 4):
         raise ValueError("Cache packing does not match its dtype")
+    vmem_limit = prefill_vmem_limit()
+    if (
+        _paired_working_set(
+            query_heads,
+            kv_heads,
+            head_dim,
+            packing,
+            jax.dtypes.itemsize_bits(cache.dtype) // 8,
+            query_block,
+            kv_tile,
+        )
+        > vmem_limit
+    ):
+        raise ValueError("Sparse prefill tile exceeds available VMEM")
 
     groups = page_table.shape[1] * physical_page_size // ratio
     num_kv_tiles = (groups * ratio + kv_tile - 1) // kv_tile
     words_per_tile = kv_tile // (ratio * 32)
     words = ((num_kv_tiles * words_per_tile + 127) // 128) * 128
     nblocks = tokens // query_block
+    bitset_row_bytes = words * jnp.dtype(jnp.int32).itemsize
     native_query_width = ((query_block + 127) // 128) * 128
-    if (
+    live = jnp.clip(
+        lengths.reshape(nblocks, query_block).max(axis=1),
+        0,
+        page_table.shape[1] * physical_page_size,
+    )
+    last_page = jnp.maximum((live - 1) // physical_page_size, 0)
+    if bitset is None and (
         (paired_pages or cache.dtype == jnp.bfloat16)
         and query_block == 256
-        and tokens * words * 4 >= 16 * 1024**2
+        and tokens * bitset_row_bytes >= TC_METADATA_BITSET_TARGET_BYTES
     ):
-        batch = 8
-        while batch > 1 and batch * query_block * words * 4 >= 16 * 1024**2:
+        batch = TC_METADATA_MAX_BATCH_BLOCKS
+        while (
+            batch > 1
+            and batch * query_block * bitset_row_bytes
+            >= TC_METADATA_BITSET_TARGET_BYTES
+        ):
             batch //= 2
         table, active_tiles, active_counts, block_bits_native = (
             _prepare_metadata_bounded(
@@ -346,46 +510,18 @@ def block_sparse_gqa_prefill(
             )
         )
     else:
-        tail = lengths // ratio
-        selected = jnp.concatenate((blocks, tail[:, None]), axis=1)
-        valid = jnp.concatenate(
-            (
-                (blocks >= 0) & (blocks < groups),
-                ((lengths > 0) & (lengths % ratio != 0) & (tail < groups))[:, None],
-            ),
-            axis=1,
-        )
-        invalid = words + jnp.arange(blocks.shape[1] + 1, dtype=jnp.int32)
-        indices = jnp.where(valid, selected // 32, invalid[None, :])
-        weights = jnp.where(valid, jnp.int32(1) << (selected % 32), 0)
-        bitset = jax.vmap(
-            lambda row, weight: (
-                jnp.zeros((words,), jnp.int32).at[row].add(weight, mode="drop")
+        if bitset is None:
+            bitset = _selection_bitset(
+                blocks, lengths, ratio=ratio, groups=groups, words=words
             )
-        )(indices, weights)
-
-        nblocks = tokens // query_block
-        block_bits = bitset.reshape(nblocks, query_block, words)
-        if paired_pages:
-            active = jnp.any(
-                block_bits[:, :, : 2 * num_kv_tiles].reshape(
-                    nblocks, query_block, num_kv_tiles, 2
-                )
-                != 0,
-                axis=(1, 3),
-            )
-        else:
-            active = jnp.any(block_bits[:, :, :num_kv_tiles] != 0, axis=1)
-        native_query_width = ((query_block + 127) // 128) * 128
-        block_bits_native = jnp.pad(
-            block_bits.transpose(0, 2, 1),
-            ((0, 0), (0, 0), (0, native_query_width - query_block)),
+        table, active_tiles, active_counts, block_bits_native = _metadata_from_bits(
+            bitset,
+            page_table,
+            query_block=query_block,
+            kv_tile=kv_tile,
+            ratio=ratio,
+            physical_page_size=physical_page_size,
         )
-        active_tiles = jax.vmap(
-            lambda row: jnp.nonzero(row, size=num_kv_tiles, fill_value=0)[0]
-        )(active).astype(jnp.int32)
-        active_counts = jnp.sum(active, axis=1, dtype=jnp.int32)
-        table = page_table.reshape(nblocks, query_block, -1)[:, 0]
 
     query_tile = min(query_block, 256)
     state_shape = (
@@ -411,7 +547,7 @@ def block_sparse_gqa_prefill(
             v_scale=v_scale,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=3,
+            num_scalar_prefetch=4,
             grid=(nblocks,),
             in_specs=[
                 pl.BlockSpec(
@@ -439,24 +575,28 @@ def block_sparse_gqa_prefill(
                 pltpu.VMEM((*state_shape, head_dim), jnp.float32),
             ],
         ),
-        # B128 retains two B64 FP32 online-softmax states so one resident KV
-        # tile can serve twice as many queries.  The compiled production
-        # kernel needs about 40.44 MB at the full T8192 production shape, just
-        # above the effective limit produced by a 36 MiB setting.
-        # FP8 paired pages need 61.13 MiB at Q256 on v7; the tuned allowance
-        # remains below its 64 MiB per core. Preserve the KV128 budgets.
+        cost_estimate=pl.CostEstimate(
+            flops=4 * tokens * query_heads * head_dim * kv_tile * num_kv_tiles,
+            transcendentals=2 * tokens * query_heads * kv_tile * num_kv_tiles,
+            bytes_accessed=(
+                query.size * (2 if bf16_io else 4)
+                + block_bits_native.nbytes
+                + lengths.nbytes
+                + table.nbytes
+                + active_tiles.nbytes
+                + active_counts.nbytes
+                + last_page.nbytes
+                + tokens * query_heads * head_dim * (2 if bf16_io else 4)
+                + nblocks
+                * num_kv_tiles
+                * kv_tile
+                * math.prod(cache.shape[2:])
+                * (jax.dtypes.itemsize_bits(cache.dtype) // 8)
+            ),
+        ),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
-            vmem_limit_bytes=(
-                PAIRED_PAGE_VMEM_MIB[query_block]
-                if paired_pages
-                else 61
-                if query_block > 128
-                else 38
-                if query_block > 64
-                else 32
-            )
-            * 1024**2,
+            vmem_limit_bytes=vmem_limit,
             disable_bounds_checks=True,
         ),
         out_shape=jax.ShapeDtypeStruct(
@@ -471,12 +611,282 @@ def block_sparse_gqa_prefill(
         table.reshape(-1),
         active_tiles.reshape(-1),
         active_counts,
+        last_page,
         query.astype(jnp.bfloat16 if bf16_io else jnp.float32),
         block_bits_native,
         lengths[:, None],
         cache.reshape(pages * physical_page_size, head_axis, packing, head_dim),
     )
     return output[:, :, :original_head_dim]
+
+
+def _metadata_from_bits(
+    bitset, page_table, *, query_block, kv_tile, ratio, physical_page_size
+):
+    tokens, words = bitset.shape
+    nblocks = tokens // query_block
+    num_kv_tiles = (page_table.shape[1] * physical_page_size + kv_tile - 1) // kv_tile
+    block_bits = bitset.reshape(nblocks, query_block, words)
+    if kv_tile == 256 and physical_page_size % 128 == 0 and ratio == 4:
+        active = jnp.any(
+            block_bits[:, :, : 2 * num_kv_tiles].reshape(
+                nblocks, query_block, num_kv_tiles, 2
+            )
+            != 0,
+            axis=(1, 3),
+        )
+    else:
+        active = jnp.any(block_bits[:, :, :num_kv_tiles] != 0, axis=1)
+    native_width = ((query_block + 127) // 128) * 128
+    native_bits = jnp.pad(
+        block_bits.transpose(0, 2, 1),
+        ((0, 0), (0, 0), (0, native_width - query_block)),
+    )
+    tiles = jax.vmap(lambda row: jnp.nonzero(row, size=num_kv_tiles, fill_value=0)[0])(
+        active
+    ).astype(jnp.int32)
+    counts = jnp.sum(active, axis=1, dtype=jnp.int32)
+    table = page_table.reshape(nblocks, query_block, -1)[:, 0]
+    return table, tiles, counts, native_bits
+
+
+def _gate_output(output, gate, lengths):
+    output = bf16(
+        bf16(output).astype(jnp.float32)
+        * bf16(jax.nn.sigmoid(gate.astype(jnp.float32))).astype(jnp.float32)
+    )
+    return jnp.where((lengths > 0)[:, None, None], output, 0)
+
+
+def _ragged_plan(
+    size,
+    query_heads,
+    head_dim,
+    words,
+    groups,
+    columns,
+    budget,
+    query_block,
+    *,
+    query_dtype=jnp.bfloat16,
+):
+    """Plan packed arrays and compaction; gate temporaries are excluded."""
+    index_bytes = jnp.dtype(jnp.int32).itemsize
+    mask_bytes = jnp.dtype(jnp.bool_).itemsize
+    query_bytes = query_heads * head_dim * jnp.dtype(query_dtype).itemsize
+    result_bytes = query_heads * head_dim * jnp.dtype(jnp.bfloat16).itemsize
+    result_compaction_bytes = result_bytes + result_bytes  # result, compact
+    output_window_bytes = query_bytes + query_bytes  # old, window
+    compaction_bytes = result_compaction_bytes + output_window_bytes
+    # Source index/length and tile ID/first/end.
+    source_metadata_bytes = 5 * index_bytes
+    # Packed index, destination, bit-row index, and packed length.
+    packed_metadata_bytes = 4 * index_bytes
+    compaction_metadata_bytes = 2 * index_bytes  # result tile, result row
+    row_masks_bytes = 3 * mask_bytes  # live, valid, current
+    row_metadata_bytes = (
+        source_metadata_bytes
+        + packed_metadata_bytes
+        + compaction_metadata_bytes
+        + row_masks_bytes
+    )
+    pack_row_bytes = (
+        max(query_bytes + result_bytes, compaction_bytes)
+        + words * index_bytes  # source bits
+        + words * index_bytes  # packed bits
+        + columns * index_bytes
+        + budget * index_bytes
+        + row_metadata_bytes
+    )
+    # Each tile also has tile_slots, tile_first and tile_end descriptors.
+    pack_tile_bytes = query_block * pack_row_bytes + 3 * index_bytes
+    pack_tiles = min(size, max(1, TC_PACKING_TARGET_BYTES // pack_tile_bytes))
+    # Selection scratch is row-chunked separately from its output bitsets.
+    source_rows = min(size, pack_tiles * query_block)
+    selection_rows = min(source_rows, _selection_batch_rows(budget, groups, words))
+    return pack_tiles, source_rows, selection_rows
+
+
+def _request_tiles(starts, offset, size, query_block):
+    local = jnp.clip(starts, offset, offset + size)
+    counts = (jnp.diff(local) + query_block - 1) // query_block
+    cumulative = jnp.cumsum(counts)
+    total = cumulative[-1]
+    # Every nonempty tile contains at least one true query row.
+    slots = jnp.arange(size, dtype=jnp.int32)
+    requests = jnp.searchsorted(cumulative, slots, side="right")
+    previous = jnp.concatenate((jnp.zeros(1, jnp.int32), cumulative))
+    first = (
+        jnp.take(local, requests, mode="fill", fill_value=offset + size)
+        + (slots - jnp.take(previous, requests, mode="fill", fill_value=0))
+        * query_block
+    )
+    ends = jnp.minimum(
+        first + query_block,
+        jnp.take(local, requests + 1, mode="fill", fill_value=offset + size),
+    )
+    return (
+        jnp.where(slots < total, first, offset + size),
+        jnp.where(slots < total, ends, offset + size),
+        total,
+    )
+
+
+def _ragged_call_count(first, ends, total, source_rows, pack_tiles, limit):
+    def group(state):
+        cursor, calls = state
+        stop = jnp.minimum(
+            jnp.searchsorted(
+                ends, jnp.minimum(first[cursor] + source_rows, limit), side="right"
+            ),
+            total,
+        )
+        return stop, calls + (stop - cursor + pack_tiles - 1) // pack_tiles
+
+    return lax.while_loop(
+        lambda state: state[0] < total, group, (jnp.int32(0), jnp.int32(0))
+    )[1]
+
+
+def _ragged_prefill(
+    query,
+    gate,
+    blocks,
+    lengths,
+    page_table,
+    cache,
+    starts,
+    output,
+    offset,
+    size,
+    *,
+    ratio,
+    kv_heads,
+    query_block,
+    kv_tile,
+    k_scale,
+    v_scale,
+):
+    if size == 0:
+        return output
+    first, ends, total = _request_tiles(starts, offset, size, query_block)
+    groups = page_table.shape[1] * cache.shape[1] // ratio
+    num_tiles = (page_table.shape[1] * cache.shape[1] + kv_tile - 1) // kv_tile
+    words = ((num_tiles * (kv_tile // (ratio * 32)) + 127) // 128) * 128
+    pack_tiles, source_rows, _ = _ragged_plan(
+        size,
+        query.shape[1],
+        cache.shape[4],
+        words,
+        groups,
+        page_table.shape[1],
+        blocks.shape[1],
+        query_block,
+        query_dtype=query.dtype,
+    )
+
+    def batch(state):
+        cursor, output = state
+        source_first = first[cursor]
+        limit = jnp.minimum(source_first + source_rows, offset + size)
+        stop = jnp.minimum(jnp.searchsorted(ends, limit, side="right"), total)
+        source_end = ends[stop - 1]
+        source_indices = source_first + jnp.arange(source_rows, dtype=jnp.int32)
+        live = source_indices < source_end
+        source_lengths = jnp.where(
+            live, jnp.take(lengths, source_indices, mode="fill", fill_value=0), 0
+        )
+        source_blocks = jnp.where(
+            live[:, None],
+            jnp.take(blocks, source_indices, axis=0, mode="fill", fill_value=-1),
+            -1,
+        )
+        bits = _selection_bitset(
+            source_blocks, source_lengths, ratio=ratio, groups=groups, words=words
+        )
+        source_tile = jnp.searchsorted(ends, source_indices, side="right")
+        source_tile_first = jnp.take(
+            first, source_tile, mode="fill", fill_value=len(query)
+        )
+        source_tile_end = jnp.take(
+            ends, source_tile, mode="fill", fill_value=len(query)
+        )
+
+        def pack(i, output):
+            tile_slots = cursor + i * pack_tiles + jnp.arange(pack_tiles)
+            tile_first = jnp.take(
+                first, tile_slots, mode="fill", fill_value=offset + size
+            )
+            tile_end = jnp.take(ends, tile_slots, mode="fill", fill_value=offset + size)
+            indices = tile_first[:, None] + jnp.arange(query_block)[None, :]
+            valid = (tile_slots[:, None] < stop) & (indices < tile_end[:, None])
+            # Positive out-of-bounds indices are dropped, including unused tail tiles.
+            destination = jnp.where(valid, indices, len(query)).reshape(-1)
+            bit_rows = jnp.where(valid, indices - source_first, source_rows).reshape(-1)
+            packed_query = jnp.take(
+                query, destination, axis=0, mode="fill", fill_value=0
+            )
+            packed_bits = jnp.take(bits, bit_rows, axis=0, mode="fill", fill_value=0)
+            packed_lengths = jnp.take(
+                source_lengths, bit_rows, mode="fill", fill_value=0
+            )
+            owners = jnp.take(page_table, tile_first, axis=0, mode="fill", fill_value=0)
+            packed_table = jnp.broadcast_to(
+                owners[:, None], (pack_tiles, query_block, page_table.shape[1])
+            ).reshape(pack_tiles * query_block, -1)
+            result = _prefill(
+                packed_query,
+                None,
+                packed_lengths,
+                packed_table,
+                cache,
+                packed_bits,
+                ratio=ratio,
+                kv_heads=kv_heads,
+                query_block=query_block,
+                kv_tile=kv_tile,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                bf16_io=True,
+            )
+            result_tile = source_tile - (cursor + i * pack_tiles)
+            current = (
+                live
+                & (result_tile >= 0)
+                & (result_tile < pack_tiles)
+                & (source_tile < stop)
+                & (source_indices >= source_tile_first)
+                & (source_indices < source_tile_end)
+            )
+            result_row = jnp.where(
+                current,
+                result_tile * query_block + source_indices - source_tile_first,
+                len(result),
+            )
+            compact = jnp.take(result, result_row, axis=0, mode="fill", fill_value=0)
+            old = jnp.take(output, source_indices, axis=0, mode="fill", fill_value=0)
+            window = jnp.where(current[:, None, None], compact, old)
+            # Arange row indices and their full H/D windows are disjoint,
+            # including distinct positive out-of-bounds rows.
+            return output.at[source_indices].set(
+                window, mode="drop", indices_are_sorted=True, unique_indices=True
+            )
+
+        output = lax.fori_loop(
+            0, (stop - cursor + pack_tiles - 1) // pack_tiles, pack, output
+        )
+        raw = jnp.take(output, source_indices, axis=0, mode="fill", fill_value=0)
+        source_gate = jnp.take(gate, source_indices, axis=0, mode="fill", fill_value=0)
+        gated = _gate_output(raw, source_gate, source_lengths)
+        window = jnp.where(live[:, None, None], gated, raw)
+        output = output.at[source_indices].set(
+            window, mode="drop", indices_are_sorted=True, unique_indices=True
+        )
+        return stop, output
+
+    return lax.while_loop(
+        lambda state: state[0] < total, batch, (jnp.int32(0), output)
+    )[1]
 
 
 def block_sparse_gqa_attention(
@@ -499,7 +909,7 @@ def block_sparse_gqa_attention(
     real = starts[1:] - starts[:-1]
 
     def run_aligned(_):
-        return block_sparse_gqa_prefill(
+        raw = block_sparse_gqa_prefill(
             query,
             blocks,
             lengths,
@@ -513,40 +923,27 @@ def block_sparse_gqa_attention(
             v_scale=v_scale,
             bf16_io=True,
         )
+        return _gate_output(raw, gate, lengths)
 
     def run_with_padding(_):
-        padded = ((real + query_block - 1) // query_block) * query_block
-        offsets = jnp.concatenate((jnp.zeros((1,), jnp.int32), jnp.cumsum(padded)))
-        max_tokens = (
-            (len(query) + (query_block - 1) * (len(starts) - 1) + query_block - 1)
-            // query_block
-            * query_block
-        )
-        req = jnp.searchsorted(starts[1:], jnp.arange(len(query)), side="right")
-        req = jnp.minimum(req, len(real) - 1)
-        positions = jnp.arange(len(query)) - starts[req]
-        valid = jnp.arange(len(query)) < starts[-1]
-        slots = jnp.where(valid, offsets[req] + positions, max_tokens)
-
-        def align(array, fill):
-            shape = (max_tokens, *array.shape[1:])
-            return jnp.full(shape, fill, array.dtype).at[slots].set(array, mode="drop")
-
-        output = block_sparse_gqa_prefill(
-            align(query, 0),
-            align(blocks, -1),
-            align(lengths, 0),
-            align(page_table, 0),
+        return _ragged_prefill(
+            query,
+            gate,
+            blocks,
+            lengths,
+            page_table,
             cache,
+            starts,
+            jnp.zeros_like(query),
+            0,
+            len(query),
             ratio=ratio,
             kv_heads=kv_heads,
             query_block=query_block,
             kv_tile=kv_tile,
             k_scale=k_scale,
             v_scale=v_scale,
-            bf16_io=True,
         )
-        return output[jnp.minimum(slots, max_tokens - 1)]
 
     # Both lax.cond branches are traced. A statically unaligned total cannot
     # enter run_aligned, whose core rejects its shape before execution.
@@ -561,11 +958,7 @@ def block_sparse_gqa_attention(
             run_with_padding,
             None,
         )
-    output = bf16(
-        bf16(output).astype(jnp.float32)
-        * bf16(jax.nn.sigmoid(gate.astype(jnp.float32))).astype(jnp.float32)
-    )
-    return jnp.where((lengths > 0)[:, None, None], output, 0), cache
+    return output, cache
 
 
 @functools.partial(
@@ -599,27 +992,16 @@ def _prepare_metadata_bounded(
     native_query_width = ((query_block + 127) // 128) * 128
     nblocks = tokens // query_block
 
+    batch_size = min(
+        batch_size,
+        max(1, _selection_batch_rows(blocks.shape[1], groups, words) // query_block),
+    )
+
     def one(inputs):
         selected_blocks, live_lengths = inputs
-        tail = live_lengths // ratio
-        selected = jnp.concatenate((selected_blocks, tail[:, None]), axis=1)
-        valid = jnp.concatenate(
-            (
-                (selected_blocks >= 0) & (selected_blocks < groups),
-                ((live_lengths > 0) & (live_lengths % ratio != 0) & (tail < groups))[
-                    :, None
-                ],
-            ),
-            axis=1,
+        bits = _selection_bitset(
+            selected_blocks, live_lengths, ratio=ratio, groups=groups, words=words
         )
-        invalid = words + jnp.arange(blocks.shape[1] + 1, dtype=jnp.int32)
-        indices = jnp.where(valid, selected // 32, invalid[None, :])
-        weights = jnp.where(valid, jnp.int32(1) << (selected % 32), 0)
-        bits = jax.vmap(
-            lambda row, weight: jnp.zeros((words,), jnp.int32)
-            .at[row]
-            .add(weight, mode="drop")
-        )(indices, weights)
         if paired_pages:
             active = jnp.any(
                 bits[:, : 2 * num_kv_tiles].reshape(query_block, num_kv_tiles, 2) != 0,
