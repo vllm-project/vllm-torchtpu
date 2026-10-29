@@ -237,6 +237,7 @@ if TYPE_CHECKING:
     VLLM_TPU_VERIFY_FUSED: bool = False
     VLLM_TPU_VERIFY_FUSED_CHECK: int = 0
     VLLM_TPU_VERIFY_FUSED_CHECK_FAULT: bool = False
+    VLLM_TPU_DRAFT_SEED_FUSED: bool = False
     VLLM_TPU_CPU_PIN_RESERVE: int = 2
     VLLM_TPU_CPU_PROBE_S: float = 0.0
     VLLM_TPU_FUSED_READ_OFFSET_UPDATE: bool = True
@@ -1461,6 +1462,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # verify chunks; _FAULT perturbs the compared copy (positive control).
     "VLLM_TPU_VERIFY_FUSED_CHECK": env_nonnegative_int("VLLM_TPU_VERIFY_FUSED_CHECK", 0),
     "VLLM_TPU_VERIFY_FUSED_CHECK_FAULT": env_bool("VLLM_TPU_VERIFY_FUSED_CHECK_FAULT"),
+    # Async draft seed + input shift/scatter + gather pad as one program
+    # (eagle3._async_seed_inputs_impl).
+    "VLLM_TPU_DRAFT_SEED_FUSED": env_bool("VLLM_TPU_DRAFT_SEED_FUSED"),
     "VLLM_TPU_CPU_PIN_RESERVE": env_nonnegative_int("VLLM_TPU_CPU_PIN_RESERVE", 2),
     # Log each worker's thread CPU placement every N seconds (0 = off).
     "VLLM_TPU_CPU_PROBE_S": env_float("VLLM_TPU_CPU_PROBE_S", 0.0),
