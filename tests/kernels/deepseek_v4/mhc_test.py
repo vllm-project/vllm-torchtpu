@@ -590,5 +590,43 @@ class MhcPrePallasTpuTest(parameterized.TestCase):
         )
 
 
+@pytest.mark.tpu_test
+class MhcSingleStreamPallasTpuTest(parameterized.TestCase):
+    """The single-stream sites vs the references on hc_mult repeated
+    copies. Needs TPU hardware."""
+
+    def setUp(self):
+        super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
+
+    @parameterized.product(num_tokens=[1, 17, 128, 1024], hidden_size=[256, 4096])
+    def test_pre_matches_repeated_reference(self, num_tokens, hidden_size):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import pre_kernel
+
+        rng = np.random.default_rng(11)
+        residual, fn, hc_scale, hc_base = _make_pre_inputs(rng, num_tokens, hidden_size)
+        x = jnp.asarray(residual[:, 0]).astype(jnp.bfloat16)
+        fn_j = jnp.asarray(fn)
+        consts = (
+            jnp.asarray(hc_scale),
+            jnp.asarray(hc_base),
+            RMS_EPS,
+            HC_PRE_EPS,
+            HC_SINKHORN_EPS,
+            HC_POST_MULT_VALUE,
+            20,
+        )
+
+        want = _ref_mhc_pre(jnp.repeat(x[:, None, :], HC_MULT, axis=1), fn_j, *consts)
+        got = pre_kernel.mhc_pre_single_stream(x, utils.fold_fn_streams(fn_j), *consts)
+
+        for g, w, tol in zip(got, want, ("f32", "f32", "bf16")):
+            rtol, atol = (
+                (BF16_RTOL, BF16_ATOL) if tol == "bf16" else (F32_RTOL, F32_ATOL)
+            )
+            np.testing.assert_allclose(_to_np(g), _to_np(w), rtol=rtol, atol=atol)
+
+
 if __name__ == "__main__":
     absltest.main()

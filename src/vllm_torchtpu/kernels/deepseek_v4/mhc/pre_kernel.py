@@ -61,6 +61,7 @@ def _mixes_collapse_kernel(
     rms_eps,
     hc_pre_eps,
     gates,
+    single_stream,
 ):
     """Mixes kernel plus the in-block collapse.
 
@@ -71,18 +72,19 @@ def _mixes_collapse_kernel(
     ``mix_b_ref``); with them, the kernel stages the gate logits and, on
     its last step, writes the post and comb gates there instead.
 
-    A (tb, hidden_size) block is one stream standing for all hc_mult
-    identical ones (the embedding before any post); it is repeated in VMEM
-    so the GEMM and the sums see exactly the values the repeated HBM
-    copy would have held.
+    With ``single_stream``, the (tb, hidden_size) block is one stream
+    standing for all hc_mult identical ones (the embedding before any
+    post) and fn arrives folded over the streams
+    (``utils.fold_fn_streams``): the GEMM, the squared sum and the
+    collapse run once on the stream instead of on hc_mult copies of it.
     """
     m, h = hc_mult, hidden_size
     x = x_ref[...]
-    if x.shape[1] == h:
-        x = jnp.concatenate([x] * m, axis=1)
     acc = _dot3(x, fn_hi_ref, fn_mid_ref, fn_lo_ref)
     xf = x.astype(jnp.float32)
     sqr = jnp.sum(xf * xf, axis=-1, keepdims=True)
+    if single_stream:
+        sqr = sqr * m
     if gates is None:
         mix_a_ref[...] = acc
         mix_b_ref[...] = sqr
@@ -100,9 +102,15 @@ def _mixes_collapse_kernel(
     # Same op order as utils.mhc_pre_gates for bit-level agreement.
     scaled = acc[:, :m] * jax.lax.rsqrt(sqr / (m * h) + rms_eps)
     pre_mix = jax.nn.sigmoid(scaled * sc_ref[0, 0] + hb_ref[:, :m]) + hc_pre_eps
-    lay = pre_mix[:, 0:1] * xf[:, :h]
-    for i in range(1, m):
-        lay = lay + pre_mix[:, i : i + 1] * xf[:, i * h : (i + 1) * h]
+    if single_stream:
+        weight = pre_mix[:, 0:1]
+        for i in range(1, m):
+            weight = weight + pre_mix[:, i : i + 1]
+        lay = weight * xf
+    else:
+        lay = pre_mix[:, 0:1] * xf[:, :h]
+        for i in range(1, m):
+            lay = lay + pre_mix[:, i : i + 1] * xf[:, i * h : (i + 1) * h]
     layer_ref[...] = lay.astype(jnp.bfloat16)
 
     if gates is not None:
@@ -196,6 +204,7 @@ def mhc_pre_mixes(
         "token_block_size",
         "vmem_limit_bytes",
         "gates",
+        "fn_folded",
     ),
 )
 def mhc_pre_mixes_collapse(
@@ -209,11 +218,13 @@ def mhc_pre_mixes_collapse(
     token_block_size: int = 64,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     gates: gates_kernel.GateConsts | None = None,
+    fn_folded: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Mixes + in-block collapse: the full memory-bound half of ``mhc_pre``.
 
-    ``x2d`` is (T, hc_mult * hidden_size), or (T, hidden_size) when all
-    hc_mult streams are the same single stream.
+    ``x2d`` is (T, hc_mult * hidden_size); with ``fn_folded``, it is
+    (T, hidden_size), the one stream all hc_mult streams are copies of,
+    and ``fn`` is folded over the streams (``utils.fold_fn_streams``).
 
     Returns (mixes (T, hc_mult3) f32 — raw, unscaled, for the XLA gates;
     sqrsum (T, 1) f32; layer_input2d (T, hidden_size) bf16). With
@@ -223,11 +234,10 @@ def mhc_pre_mixes_collapse(
     """
     assert x2d.dtype == jnp.bfloat16, x2d.dtype
     hc_mult3, hc_hidden = fn.shape[-2:]
-    # hc_mult3 = hc_mult * (hc_mult + 2) -> unique positive hc_mult.
-    hc_mult = next(m for m in range(1, 64) if m * (m + 2) == hc_mult3)
-    hidden_size = hc_hidden // hc_mult
+    hc_mult = utils.hc_mult_of(hc_mult3)
+    hidden_size = hc_hidden if fn_folded else hc_hidden // hc_mult
     num_tokens, x_width = x2d.shape
-    assert x_width in (hc_hidden, hidden_size), (fn.shape, x2d.shape)
+    assert x_width == hc_hidden, (fn.shape, x2d.shape)
 
     fn_chunks, fn_specs = utils.fn_chunk_operands(fn)
     sc2d = hc_scale.reshape(1, 3).astype(jnp.float32)
@@ -267,6 +277,7 @@ def mhc_pre_mixes_collapse(
             rms_eps=rms_eps,
             hc_pre_eps=hc_pre_eps,
             gates=gates,
+            single_stream=fn_folded,
         ),
         grid=(padded_tokens // tb,),
         in_specs=[
@@ -356,14 +367,17 @@ def mhc_pre_single_stream(
     """``mhc_pre`` of hc_mult identical streams, given the one stream.
 
     x: (..., hidden_size) bf16 -- what ``mhc_pre`` would see repeated
-    hc_mult times on the stream axis. Same outputs, bit for bit, without
-    the repeated copy in HBM.
+    hc_mult times on the stream axis. fn: the pre's fn folded over the
+    streams, (hc_mult3, hidden_size) f32 or its (3, hc_mult3, hidden_size)
+    bf16 chunks (``utils.fold_fn_streams``). Same outputs as ``mhc_pre``
+    up to f32 reassociation: the stream sums are taken in fn and in the
+    gate weights instead of over hc_mult copies of x.
     """
     assert x.dtype == jnp.bfloat16
 
     outer_shape = x.shape[:-1]
     hidden_size = x.shape[-1]
-    hc_mult = fn.shape[-1] // hidden_size
+    hc_mult = utils.hc_mult_of(fn.shape[-2])
     post_mix, comb_mix, layer2d = mhc_pre_mixes_collapse(
         x.reshape(-1, hidden_size),
         fn,
@@ -376,6 +390,7 @@ def mhc_pre_single_stream(
         gates=gates_kernel.GateConsts(
             hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
         ),
+        fn_folded=True,
     )
     return (
         post_mix.reshape(*outer_shape, hc_mult, 1),

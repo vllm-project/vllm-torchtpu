@@ -80,6 +80,23 @@ def trim_to(num_tokens: int, *arrays: jax.Array) -> tuple[jax.Array, ...]:
     return tuple(a[:num_tokens] for a in arrays)
 
 
+def hc_mult_of(hc_mult3: int) -> int:
+    """hc_mult from the mix width hc_mult3 = hc_mult * (hc_mult + 2)."""
+    return next(m for m in range(1, 64) if m * (m + 2) == hc_mult3)
+
+
+def fold_fn_streams(fn: jax.Array) -> jax.Array:
+    """fn (hc_mult3, hc_mult * hidden) f32 summed over its hc_mult stream
+    slices, in stream order: (hc_mult3, hidden), the projection hc_mult
+    identical streams see as one (``mhc_pre_single_stream``)."""
+    hc_mult = hc_mult_of(fn.shape[0])
+    slices = jnp.split(fn, hc_mult, axis=1)
+    folded = slices[0]
+    for s in slices[1:]:
+        folded = folded + s
+    return folded
+
+
 def split_fn3(fn: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     """3-chunk bf16 split of fn (8 mantissa bits each = f32's 24).
 

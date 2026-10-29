@@ -31,6 +31,7 @@ from vllm_torchtpu.kernels.deepseek_v4.mhc import (
     post_head_kernel,
     post_kernel,
     pre_kernel,
+    utils,
 )
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_pallas_op_mesh,
@@ -108,7 +109,8 @@ def _mhc_pre_single_stream_jax(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """``pre`` of hc_mult copies of one stream, reading the stream once."""
+    """``pre`` of hc_mult copies of one stream, reading the stream once;
+    fn is folded over the streams (``utils.fold_fn_streams``)."""
     return pre_kernel.mhc_pre_single_stream(
         x,
         fn,
@@ -290,15 +292,14 @@ def _fake_mhc_pre(residual, fn, hc_scale, hc_base, *args, **kwargs):
     return _fake_pre_outputs(residual)
 
 
-def _as_streams(x: torch.Tensor, fn: torch.Tensor) -> torch.Tensor:
+def _as_streams(x: torch.Tensor, hc_mult: int) -> torch.Tensor:
     """A (..., hc_mult, hidden) stand-in for a single (..., hidden) stream."""
-    hc_mult = fn.shape[-1] // x.shape[-1]
     return x.unsqueeze(-2).expand(*x.shape[:-1], hc_mult, x.shape[-1])
 
 
 def _fake_mhc_pre_single_stream(x, fn, hc_scale, hc_base, *args, **kwargs):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
-    return _fake_pre_outputs(_as_streams(x, fn))
+    return _fake_pre_outputs(_as_streams(x, utils.hc_mult_of(fn.shape[-2])))
 
 
 def _fake_mhc_post(x, residual, post_layer_mix, comb_res_mix, *args, **kwargs):
@@ -320,7 +321,7 @@ def _fake_mhc_fused_post_pre(
 ):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
     if residual.dim() == x.dim():
-        residual = _as_streams(residual, fn)
+        residual = _as_streams(residual, fn.shape[-1] // x.shape[-1])
     return (torch.empty_like(residual), *_fake_pre_outputs(residual))
 
 
@@ -376,7 +377,7 @@ def _mhc_pre_single_stream_op(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
 ):
-    op_name = "pallas::deepseek_v4_mhc_pre_single_stream_v1" + _gate_suffix(
+    op_name = "pallas::deepseek_v4_mhc_pre_single_stream_v2" + _gate_suffix(
         rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
     )
     op = _mhc_op_cache.get(op_name)
@@ -618,7 +619,8 @@ class MHCOps(NamedTuple):
         computed from it.
     ``pre_single_stream(x, fn, hc_scale, hc_base)`` / ``fused_from_single_stream``
         ``pre`` / ``fused`` for a residual whose hc_mult streams are copies
-        of one (..., hidden_size) stream, which is passed instead.
+        of one (..., hidden_size) stream, which is passed instead;
+        ``pre_single_stream`` takes fn folded over the streams.
     ``fused_with_shared(routed, shared, residual, ...)``
         ``fused`` on an MoE output given as its routed sum (before the
         routed scale) and its f32 shared-expert output.

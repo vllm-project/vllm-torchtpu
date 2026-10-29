@@ -86,6 +86,17 @@ def _split_hc_fn(fn: torch.Tensor) -> torch.Tensor:
     return torch.stack((hi, mid, lo))
 
 
+def _fold_hc_fn(fn: torch.Tensor, hc_mult: int) -> torch.Tensor:
+    """fn summed over its hc_mult stream slices in f32, in stream order, as
+    the mHC kernels' ``utils.fold_fn_streams``: what hc_mult copies of one
+    stream see as a single projection."""
+    slices = fn.detach().to("cpu", torch.float32).chunk(hc_mult, dim=1)
+    folded = slices[0]
+    for piece in slices[1:]:
+        folded = folded + piece
+    return folded
+
+
 class DeepseekV4DecoderLayer(nn.Module):
     """Single transformer decoder layer for DeepSeek-V4 with MHC residual stream."""
 
@@ -158,11 +169,21 @@ class DeepseekV4DecoderLayer(nn.Module):
                 torch.zeros(3, mix_hc, hc_dim, dtype=torch.bfloat16),
                 persistent=False,
             )
+        # hc_attn_fn folded over the streams, split the same way, for the
+        # chain-start pre on the embedding's single stream.
+        self.register_buffer(
+            "hc_attn_fn_folded_chunks",
+            torch.zeros(3, mix_hc, self.hidden_size, dtype=torch.bfloat16),
+            persistent=False,
+        )
 
     def split_hc_fns(self) -> None:
         """Refresh the fn chunks from the loaded fn weights."""
         self.hc_attn_fn_chunks.copy_(_split_hc_fn(self.hc_attn_fn))
         self.hc_ffn_fn_chunks.copy_(_split_hc_fn(self.hc_ffn_fn))
+        self.hc_attn_fn_folded_chunks.copy_(
+            _split_hc_fn(_fold_hc_fn(self.hc_attn_fn, self.hc_mult))
+        )
 
     @property
     def mhc_ops(self) -> MHCOps:
@@ -232,7 +253,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             # of x, so the pre (and the seam below) read x once.
             residual = x
             post_mix, res_mix, x = self.mhc_ops.pre_single_stream(
-                x, self.hc_attn_fn_chunks, self.hc_attn_scale, self.hc_attn_base
+                x,
+                self.hc_attn_fn_folded_chunks,
+                self.hc_attn_scale,
+                self.hc_attn_base,
             )
         elif residual is None:
             # Chain start: a standalone pre, nothing to fuse it with.
