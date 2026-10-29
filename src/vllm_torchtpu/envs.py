@@ -238,6 +238,7 @@ if TYPE_CHECKING:
     VLLM_TPU_HOST_PHASES: int = 0
     VLLM_TPU_SERIALIZE_COPY_WAIT: bool = False
     VLLM_TPU_PINNED_TOKEN_COPY: bool = False
+    VLLM_TPU_STALL_WATCHDOG_S: float = 0.0
     VLLM_TPU_CPU_PIN_RESERVE: int = 2
     VLLM_TPU_CPU_PROBE_S: float = 0.0
     VLLM_TPU_FUSED_READ_OFFSET_UPDATE: bool = True
@@ -1477,6 +1478,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Copy sampled tokens into reused pinned host buffers instead of a fresh
     # pageable tensor every step (runner/tpu_runner_async_output.py).
     "VLLM_TPU_PINNED_TOKEN_COPY": env_bool("VLLM_TPU_PINNED_TOKEN_COPY"),
+    # Dump all processes' stacks when no step starts for N s with live
+    # requests (stall_watchdog.py; read directly there, registered here).
+    "VLLM_TPU_STALL_WATCHDOG_S": env_float("VLLM_TPU_STALL_WATCHDOG_S", 0.0),
     "VLLM_TPU_CPU_PIN_RESERVE": env_nonnegative_int("VLLM_TPU_CPU_PIN_RESERVE", 2),
     # Log each worker's thread CPU placement every N seconds (0 = off).
     "VLLM_TPU_CPU_PROBE_S": env_float("VLLM_TPU_CPU_PROBE_S", 0.0),
