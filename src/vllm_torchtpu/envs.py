@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
+    SKIP_MAMBA_SCHEDULER_BLOCKS: bool = True
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
     TPU_RAIDEN_QWEN35_ADMISSION: bool = False
     TPU_RAIDEN_KIMIK3_ADMISSION: bool = False
@@ -593,6 +594,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # everything else on the per-layer KV caches.
     "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": env_optional_bool(
         "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL"
+    ),
+    # Debug escape hatch; 0 opts out. On the compact-mamba layout
+    # (TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0) with prefix caching off, the
+    # scheduler stops charging GDN layers one block per group per request from
+    # the attention pool: the runner keeps GDN state in its own slot arrays and
+    # never reads those blocks. Applies only where that holds (GDN layers, no
+    # speculative decoding, no KV connector); everything else keeps vLLM's
+    # stock accounting either way. Read by the model runner;
+    # TpuPlatform.additional_env_vars carries it to Ray workers. See
+    # core/runner_slot_mamba.py.
+    "SKIP_MAMBA_SCHEDULER_BLOCKS": env_bool(
+        "SKIP_MAMBA_SCHEDULER_BLOCKS", default=True
     ),
     # Destination (decode-side) page geometry in tokens, required on the
     # producer: the byte-span lowering splits declarations at destination
