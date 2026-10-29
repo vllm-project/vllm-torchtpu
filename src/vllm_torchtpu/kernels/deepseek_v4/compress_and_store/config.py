@@ -494,15 +494,11 @@ class Configs:
 
         A compressed token's window starts on a multiple of compress_ratio, so
         a run of gcd(compress_ratio, state_block_size) positions starting there
-        stays in one state page and one prev/curr half. The indexer keeps the
-        halves in the two lane halves of a row, so it fetches one position.
-        The DMA addressing (`buffered_ref.WindowRef`) needs a power-of-two
-        state block size.
+        stays in one state page and one prev/curr half. The DMA addressing
+        (`buffered_ref.WindowRef`) needs a power-of-two state block size.
         """
         bs = self.state_block_size
         assert bs > 0 and bs & (bs - 1) == 0, f"state_block_size {bs}"
-        if self.dims.mode == Mode.CSA_INDEXER:
-            return 1
         return math.gcd(self.dims.compress_ratio, self.state_block_size)
 
     # --- shapes (single source of truth for every reshape / BlockSpec) ---------

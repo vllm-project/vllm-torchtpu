@@ -122,9 +122,12 @@ class WindowRef(_BufferedRef):
         return window.bitcast(jnp.uint8).reshape(self.cfgs.window_bytes_shape())
 
     def _dst(self, window_u8, n, w):
-        chunk = self.cfgs.window_chunk
-        if self.cfgs.dims.mode == config.Mode.CSA_INDEXER:
-            return window_u8.at[n, w, :, 0]  # (N_FIELDS, 4, LANE)
+        cfgs = self.cfgs
+        chunk = cfgs.window_chunk
+        if cfgs.dims.mode == config.Mode.CSA_INDEXER:
+            # Rows of one field each, matching the state's row order.
+            rows = window_u8.reshape(cfgs.tile_sizes.tile_n, -1, *window_u8.shape[-2:])
+            return rows.at[n, pl.ds(w * config.N_FIELDS, chunk * config.N_FIELDS)]
         # (chunk, N_FIELDS, head_tiles, 4, LANE)
         return window_u8.at[n, pl.ds(w, chunk)]
 
@@ -146,7 +149,10 @@ class WindowRef(_BufferedRef):
         is_indexer = cfgs.dims.mode == config.Mode.CSA_INDEXER
         window_u8 = self._window_u8(slot)
 
-        if not is_indexer:
+        if is_indexer:
+            # One state row per field; see the copy below.
+            assert rows_per_token == config.N_FIELDS and cfgs.head_tiles == 1
+        else:
             # Token state rows are [kv, score] x [prev, curr] x field_rows.
             num_pages, page_rows = state_cache_ref.shape[:2]
             assert page_rows % rows_per_token == 0, (page_rows, rows_per_token)
@@ -183,7 +189,7 @@ class WindowRef(_BufferedRef):
                     # curr in 128:256.
                     src = state_cache_ref.at[
                         page,
-                        pl.ds(offset * rows_per_token, config.N_FIELDS),
+                        pl.ds(offset * rows_per_token, chunk * rows_per_token),
                         :,
                         pl.ds(half * config.LANE, config.LANE),
                     ]
