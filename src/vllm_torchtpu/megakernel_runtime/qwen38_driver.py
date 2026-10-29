@@ -589,6 +589,15 @@ class Qwen38SegmentDriver:
         self.whole_calls = 0
         self.whole_dry = False  # `wholedry=1`: decide and count as whole=1, run stock (AL control)
         self.seg_buckets: frozenset[int] = frozenset(buckets)  # what the segment program compiles
+        # `wholecheck=N`: the first N real whole-eligible steps run the whole-step program
+        # without GDN / QSA cache writes, then stock; log MK vs stock, serve stock.
+        self.wholecheck_left = 0
+        self.whole_shadow = None
+        self.wholecheck_warm: set[int] = set()
+        self.wholecheck_agg: dict[int, list[float]] = {}
+        # `wholefault=1`: positive control; each checked step also runs the shadow on the step's
+        # token ids rolled by one row (a row-misaligned embedding / PLE input) and logs its diff.
+        self.whole_fault = False
 
     @classmethod
     def maybe_create(cls, runner: Any) -> Qwen38SegmentDriver | None:
@@ -662,6 +671,8 @@ class Qwen38SegmentDriver:
         drv.noaot = _parse_flag(raw, "noaot", False)
         drv.whole = _parse_flag(raw, "whole", False)
         drv.whole_dry = _parse_flag(raw, "wholedry", False)
+        drv.wholecheck_left = _parse_int(raw, "wholecheck") or 0
+        drv.whole_fault = _parse_flag(raw, "wholefault", False)
         cap = _parse_int(raw, "wholecap")
         if cap is not None:
             drv.whole_cap = cap
@@ -1264,6 +1275,8 @@ class Qwen38SegmentDriver:
                     segments=self.segments,
                     whole=whole,
                 )
+            if self.wholecheck_left > 0:
+                self._attach_whole_shadow(runner, whole)
             logger.info(
                 "Qwen3.8 whole-step megakernel attached: layers 3..46, context cap %d, rows <= %d, "
                 "budget %d, max_groups %d, %d operands, hold %s", self.whole_cap, self.whole_max_rows,
@@ -1272,6 +1285,78 @@ class Qwen38SegmentDriver:
         except Exception:
             logger.exception("Qwen3.8 whole-step: setup failed; segment program only")
             self.whole_program = None
+
+    def _attach_whole_shadow(self, runner: Any, whole: Any) -> None:
+        """`wholecheck=N`: the whole-step program again, writing no GDN checkpoints (shadow
+        segments for the head groups and L47) and no QSA cache rows; the packed operands are
+        the served module's (a shallow copy shares its buffers)."""
+        import copy
+
+        from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpWholeStepModel
+
+        shadow_seg = Qwen38Segments(
+            runner.model, self.g, self.mesh, self.buckets, shared=self.segments,
+            head=bool(self.segments.head_groups),
+        )
+        shadow_seg.bind_pool()
+        sw = copy.copy(whole)
+        sw.write, sw.tag = False, "whole_shadow"
+        sw.bind_pool(self.segments.pool, self.segments.layout)
+        with self._contexts(runner, "model_mk_whole_shadow"):
+            self.whole_shadow = Qwen4ExpWholeStepModel(
+                vllm_config=self.whole_cfg,
+                prefix="model_mk_whole_shadow",
+                backbone=runner.model.model,
+                segments=shadow_seg,
+                whole=sw,
+            )
+        logger.info("Qwen3.8 whole-step shadow check attached: %d steps", self.wholecheck_left)
+
+    def _whole_shadow_step(self, runner: Any, input_ids: Any, positions: Any, kw: dict,
+                           rows: int, real: bool) -> Any:
+        """Whole-step shadow (no cache writes), then stock; log the diff on real steps, serve stock."""
+        with self._contexts(runner, "model_mk_whole_shadow"):
+            mk = self.whole_shadow(input_ids=input_ids, positions=positions, **kw)
+        stock = runner.model(input_ids=input_ids, positions=positions, **kw)
+        if not real:  # warmup: compile this bucket's shadow program, compare nothing
+            return stock
+        rel, max_abs, agree = self._vs_stock(runner, mk, stock)
+        if self.whole_fault:
+            with self._contexts(runner, "model_mk_whole_shadow"):
+                bad = self.whole_shadow(input_ids=input_ids.roll(1, 0), positions=positions, **kw)
+            f_rel, f_max, f_agree = self._vs_stock(runner, bad, stock)
+            logger.info(
+                "qwen38 whole-step shadow FAULT CONTROL rows=%d mean_rel=%.4g max_abs=%.4g "
+                "top1_agree=%.4f", rows, f_rel, f_max, f_agree,
+            )
+        self.wholecheck_left -= 1
+        agg = self.wholecheck_agg.setdefault(rows, [0.0, 0.0, 0.0, 0.0])
+        agg[0] += 1
+        agg[1] += rel
+        agg[2] = max(agg[2], rel)
+        agg[3] += agree
+        logger.info(
+            "qwen38 whole-step shadow check rows=%d mean_rel=%.4g max_abs=%.4g top1_agree=%.4f "
+            "(%d left)", rows, rel, max_abs, agree, self.wholecheck_left,
+        )
+        if self.wholecheck_left == 0:
+            logger.info(
+                "qwen38 whole-step shadow check summary {rows: (n, mean_rel, max_rel, top1_agree)}: %s",
+                {r: (int(a[0]), round(a[1] / a[0], 5), round(a[2], 5), round(a[3] / a[0], 4))
+                 for r, a in sorted(self.wholecheck_agg.items())},
+            )
+        return stock
+
+    @staticmethod
+    def _vs_stock(runner: Any, mk: Any, stock: Any) -> tuple[float, float, float]:
+        """(mean rel diff, max abs diff, top-1 agreement) of the first outputs."""
+        mk_h = mk[0] if isinstance(mk, (tuple, list)) else mk
+        st_h = stock[0] if isinstance(stock, (tuple, list)) else stock
+        d = (mk_h.float() - st_h.float()).abs()
+        rel = float(d.mean() / st_h.float().abs().mean().clamp_min(1e-6))
+        top_mk = runner.model.compute_logits(mk_h).argmax(-1)
+        top_st = runner.model.compute_logits(st_h).argmax(-1)
+        return rel, float(d.max()), float((top_mk == top_st).float().mean())
 
     def _whole_self_check(self, runner: Any) -> None:
         """Loud error if `whole=1` but no whole-step call ran in the first model steps after
@@ -1562,6 +1647,19 @@ class Qwen38SegmentDriver:
         try:
             if self.check_left > 0 and self.shadow is not None:
                 out = self._shadow_step(runner, input_ids, positions, kw)
+            elif (
+                self.wholecheck_left > 0
+                and self.whole_shadow is not None
+                and self._whole_eligible(runner, n_req, rows)
+                and (
+                    rows not in self.wholecheck_warm
+                    or (getattr(runner, "warmup_done", False) and _real_traffic(kw))
+                )
+            ):
+                real = bool(getattr(runner, "warmup_done", False)) and _real_traffic(kw)
+                self.wholecheck_warm.add(rows)
+                self._note(f"wholecheck_b{rows}" if real else f"wholecheck_warm_b{rows}")
+                out = self._whole_shadow_step(runner, input_ids, positions, kw, rows, real)
             elif self._whole_eligible(runner, n_req, rows):
                 self.whole_calls += 1
                 self._count("drafts_whole", n_req * (T_VERIFY - 1))
