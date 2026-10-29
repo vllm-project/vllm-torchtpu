@@ -76,7 +76,9 @@ class CosSinRef(_BufferedRef):
         def loop_body(i):
             global_idx = pid * tile_n + i
             position = positions_ref[global_idx]
-            compressed_pos = (position // compress_ratio) * compress_ratio
+            compressed_pos = (
+                _divmod_static(position, compress_ratio)[0] * compress_ratio
+            )
 
             src = cos_sin_cache_ref.at[
                 compressed_pos, pl.ds(0, self.window_ref.shape[-1])
@@ -100,6 +102,17 @@ def _divmod_pow2(x, d: int):
     """
     assert d > 0 and d & (d - 1) == 0, d
     return x >> (d.bit_length() - 1), x & (d - 1)
+
+
+def _divmod_static(x, d: int):
+    """Floor `divmod(x, d)` of a scalar for a static `d`.
+
+    Slot and position math feeds every per-token DMA; `_divmod_pow2` keeps it
+    to a shift and a mask for the power-of-two page sizes it usually meets.
+    """
+    if d & (d - 1) == 0:
+        return _divmod_pow2(x, d)
+    return x // d, x % d
 
 
 @jax.tree_util.register_dataclass
@@ -237,9 +250,9 @@ class OutputRef(_BufferedRef):
 
             @pl.when(valid)
             def _read_nope():
-                p = kv_slot // page_size
+                p, s = _divmod_static(kv_slot, page_size)
                 # we fetch the entire tile (4, 128), with 4 pages per tile
-                s_row = (kv_slot % page_size) // (self.cfgs.tokens_in_second_minor)
+                s_row = _divmod_static(s, self.cfgs.tokens_in_second_minor)[0]
                 src = cache_ref.at[p, s_row, :, :]
                 dest = dest_ref.at[n, 0, :, :]
                 pltpu.make_async_copy(src, dest, sem).start()
@@ -296,10 +309,8 @@ class OutputRef(_BufferedRef):
 
                 @pl.when(valid)
                 def _write_nope():
-                    p = kv_slot // self.cfgs.kv_block_size
-                    s_row = (kv_slot % self.cfgs.kv_block_size) // (
-                        self.cfgs.tokens_in_second_minor
-                    )
+                    p, s = _divmod_static(kv_slot, self.cfgs.kv_block_size)
+                    s_row = _divmod_static(s, self.cfgs.tokens_in_second_minor)[0]
                     src = src_ref.at[n, 0, :, :]
                     dest = cache_ref.at[p, s_row, :, :]
                     pltpu.make_async_copy(src, dest, sem).start()
@@ -315,8 +326,7 @@ class OutputRef(_BufferedRef):
 
                 @pl.when(kv_slot >= 0)
                 def _write_nope():
-                    p = kv_slot // self.cfgs.physical_page_size
-                    s = kv_slot % self.cfgs.physical_page_size
+                    p, s = _divmod_static(kv_slot, self.cfgs.physical_page_size)
 
                     @pl.loop(0, self.cfgs.record_rows, unroll=True)
                     def write_loop(o):
@@ -404,9 +414,8 @@ class RoPEOutputRef(_BufferedRef):
             def _read_rope():
                 # divide by 4 because we pack 4 pages into 1 tile
                 # layout: [num_page, kv_block_size / 4, 4, 256]
-                rope_slot = kv_slot // 4
-                rope_p = rope_slot // self.cfgs.rope_page_size
-                s_row = rope_slot % self.cfgs.rope_page_size
+                rope_slot = _divmod_static(kv_slot, 4)[0]
+                rope_p, s_row = _divmod_static(rope_slot, self.cfgs.rope_page_size)
                 src = rope_cache_ref.at[rope_p, s_row, :, :]
                 dest = dest_ref.at[n, :, :]
                 pltpu.make_async_copy(src, dest, sem).start()
@@ -460,9 +469,8 @@ class RoPEOutputRef(_BufferedRef):
 
             @pl.when(valid & is_first)
             def _write_rope():
-                rope_slot = kv_slot // 4
-                rope_p = rope_slot // self.cfgs.rope_page_size
-                s_row = rope_slot % self.cfgs.rope_page_size
+                rope_slot = _divmod_static(kv_slot, 4)[0]
+                rope_p, s_row = _divmod_static(rope_slot, self.cfgs.rope_page_size)
                 src_rope = src_ref.at[n, :, :]
                 dest_rope = rope_cache_ref.at[rope_p, s_row, :, :]
                 pltpu.make_async_copy(src_rope, dest_rope, sem).start()
