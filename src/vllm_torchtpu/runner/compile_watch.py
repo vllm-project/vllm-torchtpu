@@ -32,15 +32,24 @@ def _trigger_frame() -> str:
     while frame is not None:
         path = frame.f_code.co_filename
         if "/vllm_torchtpu/" in path and not path.endswith("compile_watch.py"):
+            loc = frame.f_locals
             shapes = [
                 f"{name}={tuple(value.shape)}"
-                for name, value in frame.f_locals.items()
+                for name, value in loc.items()
                 if isinstance(value, torch.Tensor)
             ][:8]
-            return (
-                f"{path.rsplit('/', 1)[-1]}:{frame.f_lineno} {frame.f_code.co_name}"
-                + (f" [{' '.join(shapes)}]" if shapes else "")
-            )
+            label = f"{path.rsplit('/', 1)[-1]}:{frame.f_lineno} {frame.f_code.co_name}"
+            fn = loc.get("fn")
+            if fn is not None and isinstance(loc.get("args"), tuple):
+                # A generic wrapper (e.g. eagle3._static_shape_args): name the
+                # wrapped function and its tensor args' shapes/dtypes.
+                label += f" -> {getattr(fn, '__qualname__', repr(fn))}"
+                shapes = [
+                    f"a{i}={tuple(v.shape)}:{str(v.dtype).replace('torch.', '')}"
+                    for i, v in enumerate(loc["args"])
+                    if isinstance(v, torch.Tensor)
+                ][:8]
+            return label + (f" [{' '.join(shapes)}]" if shapes else "")
         frame = frame.f_back
     return "?"
 

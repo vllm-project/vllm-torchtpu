@@ -2594,6 +2594,8 @@ class Eagle3Proposer:
         self._precompile_compute_logits()
         if envs.VLLM_TPU_DRAFT_CARRY_FUSED and self._draft_rows:
             self._precompile_draft_rows_carry_and_token()
+        if envs.VLLM_TPU_DRAFT_SEED_FUSED and envs.VLLM_TPU_FUSED_ASYNC_DRAFT_SEED:
+            self._precompile_async_seed_inputs()
 
     def _draft_hidden_size(self) -> int:
         """Width of the hidden state the draft's lm_head consumes.
@@ -2757,6 +2759,43 @@ class Eagle3Proposer:
                     nti = torch.zeros(p, dtype=torch.int32).to(runner.device)
                     out = self._draft_seed_input_ids(ids, lti, nti)
                     synchronize_tensors(out)
+
+    def _precompile_async_seed_inputs(self) -> None:
+        """`_async_seed_inputs_compiled` at every reachable (token bucket T,
+        sampler request bucket width, loop bucket p, query-start width)."""
+        import bisect
+
+        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
+
+        runner = self.runner
+        k = self.speculative_config.num_speculative_tokens
+        reqs = sorted(runner.num_reqs_paddings)
+        qsl_widths = {
+            w + 1
+            for w in (runner.num_reqs_max_model_len, runner.num_reqs_most_model_len)
+            if w
+        }
+        with runner._precompile_timed("drafter fused async seed"):
+            for T in runner.num_tokens_paddings:
+                for width in reqs:
+                    if not runner._spec_verify_bucket_reachable(T, width):
+                        continue
+                    prev = reqs[bisect.bisect_left(reqs, width) - 1] if width != reqs[0] else 0
+                    ps = {
+                        _get_padded_token_len(runner.num_tokens_paddings, n)
+                        for n in range(prev + 1, width + 1)
+                    }
+                    for p in sorted(ps):
+                        for q in sorted(qsl_widths):
+                            nt = torch.zeros((width, k + 1), dtype=torch.int32).to(
+                                runner.device
+                            )
+                            nd = torch.zeros(width, dtype=torch.int32).to(runner.device)
+                            qsl = torch.zeros(q, dtype=torch.int32).to(runner.device)
+                            n_dev = torch.tensor(1, dtype=torch.int64).to(runner.device)
+                            ids = torch.zeros(T, dtype=torch.int32).to(runner.device)
+                            out = _async_seed_inputs_compiled(nt, nd, qsl, n_dev, ids, p)
+                            synchronize_tensors(out)
 
     def _precompile_draft_rows_carry_and_token(self) -> None:
         """`_draft_rows_carry_and_token` at every (token bucket T, loop bucket
