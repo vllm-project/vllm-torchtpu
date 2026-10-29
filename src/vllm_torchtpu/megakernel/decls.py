@@ -135,6 +135,10 @@ class ParamTransform:
     replicate_ranks: bool = False
     head_reduce: str | None = None
     channel_splits: tuple[int, ...] | None = None
+    # Number of distinct shards along `shard_axis` (or per `channel_splits`
+    # entry); when R is larger, consecutive ranks share each shard.
+    shard_groups: int | None = None
+    split_groups: tuple[int | None, ...] | None = None
     flatten_tail: bool = False
     expert_axis: int | None = None
     small_field: str | None = None
@@ -145,6 +149,35 @@ class ParamTransform:
             or not all(type(i) is int for i in self.transpose)
         ):
             raise TypeError("transpose must be a permutation tuple or None")
+        if self.shard_groups is not None and (
+            isinstance(self.shard_groups, bool)
+            or not isinstance(self.shard_groups, int)
+            or self.shard_groups <= 0
+        ):
+            raise ValueError(
+                f"ParamTransform.shard_groups must be a positive int or None, "
+                f"got {self.shard_groups!r}"
+            )
+        if self.split_groups is not None:
+            if self.channel_splits is None:
+                raise ValueError(
+                    "ParamTransform.split_groups requires channel_splits to be set"
+                )
+            if len(self.split_groups) != len(self.channel_splits):
+                raise ValueError(
+                    f"len(split_groups)={len(self.split_groups)} != "
+                    f"len(channel_splits)={len(self.channel_splits)}"
+                )
+            for group_val in self.split_groups:
+                if group_val is not None and (
+                    isinstance(group_val, bool)
+                    or not isinstance(group_val, int)
+                    or group_val <= 0
+                ):
+                    raise ValueError(
+                        "ParamTransform.split_groups entries must be positive int "
+                        f"or None, got {group_val!r}"
+                    )
 
 
 _TRANSFORM_FIELD_NAMES = frozenset(f.name for f in dataclasses.fields(ParamTransform))

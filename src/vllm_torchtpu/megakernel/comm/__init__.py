@@ -13,7 +13,7 @@
 # limitations under the License.
 """In-kernel inter-rank collectives and their build-time parameters."""
 
-from . import params, ring
+from . import params, replication, ring
 from .params import CommParams, comm_params, ring_scratch, stage_scratch
 from .ring import AllReduceRing
 
@@ -22,6 +22,7 @@ __all__ = [
     "CommParams",
     "comm_params",
     "params",
+    "replication",
     "ring",
     "ring_scratch",
     "stage_scratch",

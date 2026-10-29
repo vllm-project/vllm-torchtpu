@@ -43,6 +43,12 @@ from typing import Any, Protocol
 import jax
 import jax.numpy as jnp
 
+from ..comm.replication import (
+    shard_count,
+    slice_rank_ranges,
+    split_sharded_width,
+    unsharded_target_ranges,
+)
 from ..decls import HFParamDecl, VLLMAlias
 from ..exec_spec import ExecSpec
 from ..ops import F32, FP8
@@ -210,8 +216,10 @@ def target_axis_widths(decl: HFParamDecl, R: int, split_axis: int) -> tuple[int,
     dim_ax = split_axis % len(decl.shape)
     full_w = int(decl.shape[dim_ax])
     tf = decl.transform
+    if tf.channel_splits is not None and dim_ax == len(decl.shape) - 1:
+        return full_w, split_sharded_width(R, tf.channel_splits, tf.split_groups)
     if tf.shard_axis is not None and (tf.shard_axis % len(decl.shape)) == dim_ax:
-        return full_w, full_w // R
+        return full_w, full_w // shard_count(R, tf.shard_groups)
     return full_w, full_w
 
 
@@ -324,31 +332,25 @@ def slice_alias_targets(
 
     out = {}
     off = 0
+    single = len(target_decls) == 1
     for d, (full_w, sharded_w) in zip(target_decls, widths, strict=True):
-        if not alias.already_sharded:
-            if d.transform.shard_axis is not None and full_w != sharded_w:
-                start = off + tp_rank * sharded_w
-                stop = start + sharded_w
-            else:
-                start, stop = off, off + full_w
-            off += full_w
-        else:
-            start, stop = off, off + sharded_w
+        if alias.already_sharded:
+            rngs = [(off, off + sharded_w)]
             off += sharded_w
-
-        w_t = (
-            w_buf
-            if len(target_decls) == 1 and start == 0 and stop == actual_w
-            else ops.slice_axis(w_buf, split_axis, start, stop)
-        )
-        if s_buf is None:
-            s_t = None
-        elif split_axis != -1 or (
-            len(target_decls) == 1 and start == 0 and stop == expected_s_w
-        ):
-            s_t = s_buf
         else:
-            s_t = ops.slice_axis(s_buf, -1, start, stop)
+            rngs = unsharded_target_ranges(
+                d, off, full_w, sharded_w, split_axis, R, tp_rank
+            )
+            off += full_w
+
+        w_t = slice_rank_ranges(
+            ops, w_buf, split_axis, rngs, actual_w if single else -1
+        )
+        s_t = (
+            s_buf
+            if s_buf is None or split_axis != -1
+            else slice_rank_ranges(ops, s_buf, -1, rngs, expected_s_w if single else -1)
+        )
 
         want_fp8 = jnp.dtype(d.dtype) == jnp.dtype(FP8)
         if alias.already_fp8 and not want_fp8:
@@ -357,7 +359,7 @@ def slice_alias_targets(
                     f"Target {d.name!r} has dtype {d.dtype} in FP8 alias "
                     f"{alias.source!r} but no scale slice is available"
                 )
-            s_2d = ops.reshape(ops.cast(s_t, F32), (1, stop - start))
+            s_2d = ops.reshape(ops.cast(s_t, F32), (1, sharded_w))
             w_t = ops.dequantize(w_t, s_2d, d.dtype)
         elif not alias.already_fp8 and want_fp8:
             w_t, s_t = ops.quantize_fp8(w_t)
