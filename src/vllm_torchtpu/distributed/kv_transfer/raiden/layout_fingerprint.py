@@ -238,7 +238,7 @@ def measured_kimi_k3_layout_fingerprint(
         raise ValueError("state_fragment_heads must be positive")
     if state_fragments <= 0:
         raise ValueError("state_fragments must be positive")
-    if not any(pool.tag == TAG_FA for pool in manifest.pools):
+    if not any(class_tag(pool.tag) == TAG_FA for pool in manifest.pools):
         raise ValueError("Kimi layout fingerprint requires an FA pool")
     version = package_version or importlib.metadata.version
     payload: dict[str, Any] = {

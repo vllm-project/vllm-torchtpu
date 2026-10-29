@@ -514,11 +514,11 @@ def test_latent_moe_transform_leaves_reduction_to_vllm_runner() -> None:
     torch.testing.assert_close(transform(hidden_states), hidden_states.square())
 
 
-def test_model_has_no_public_cache_or_pp_api() -> None:
+def test_model_has_no_public_cache_api() -> None:
     parameters = inspect.signature(KimiLinearForCausalLM.forward).parameters
     assert "cache" not in parameters
     assert "use_cache" not in parameters
-    assert not supports_pp(KimiLinearForCausalLM)
+    assert supports_pp(KimiLinearForCausalLM)
     assert not hasattr(kimi, "KimiK3Cache")
     assert not hasattr(kimi, "MLACache")
 
@@ -1166,7 +1166,12 @@ def test_kda_construction_rejects_heads_not_divisible_by_tp(
         kimi_attention, "get_tensor_model_parallel_world_size", lambda: 3
     )
     config = _kda_config(num_heads=2)
-    fake_vllm_config = SimpleNamespace(speculative_config=None)
+    fake_vllm_config = SimpleNamespace(
+        speculative_config=None,
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=3, pipeline_parallel_size=1
+        ),
+    )
 
     with pytest.raises(ValueError, match="divisible by TP size"):
         kimi_attention.KimiDeltaAttention(config, fake_vllm_config, prefix="z")
@@ -1762,6 +1767,10 @@ def test_kimi_model_wires_declared_optional_features(
         "VocabParallelEmbedding",
     ):
         monkeypatch.setattr(kimi_model, name, Recorder)
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=0, world_size=1),
+    )
     config = KimiLinearConfig(
         num_hidden_layers=2,
         hidden_act="situ",
@@ -1773,6 +1782,7 @@ def test_kimi_model_wires_declared_optional_features(
         model_config=SimpleNamespace(hf_text_config=config),
         quant_config=None,
         compilation_config=SimpleNamespace(mode=CompilationMode.NONE),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
     )
 
     model = kimi_model.KimiModel(vllm_config=vllm_config)
@@ -2004,6 +2014,7 @@ def test_sp_prefill_trace_accepts_dynamic_token_dimension():
     model.attn_res_block_size = 12
     model.output_attn_res = _attention_residual_stub(hidden=3584, eps=1e-5)
     model.layers = nn.ModuleList()
+    model.start_layer = model.end_layer = 0
     model.norm = nn.Identity()
     graphs = []
 
@@ -2481,6 +2492,7 @@ def test_sp_prefill_divisible_shapes_preserve_token_ownership(
         world_size=32, rank_in_group=rank, all_gather=gather
     )
     model.layers = nn.ModuleList([Layer()])
+    model.start_layer, model.end_layer = 0, 1
     actual = model.forward(None, positions, inputs_embeds=hidden)
     if capture_aux:
         actual, auxiliary = actual

@@ -914,6 +914,34 @@ class RaidenOffloadingManager(OffloadingManager):
         account for fails the job closed (rollback + recompute).
         """
         assert len(keys) == len(device_block_ids), (len(keys), len(device_block_ids))
+        # A peer read leaves no local entry, so `prepare_store` can offer a
+        # key that another request is still reading from a peer. That load
+        # owns the key's sub-hashes in `_hash_to_admission`; admitting them
+        # here would take over its completions and the load would never
+        # finish. Leave such keys to the load; they are offered again on
+        # their next appearance.
+        held_keys = {
+            key
+            for key in keys
+            if any(
+                sub_hash in self._hash_to_admission
+                for sub_hash in self._sub_hashes(key)
+            )
+        }
+        if held_keys:
+            self._inflight_store_keys.difference_update(held_keys)
+            kept = [
+                (key, block_id)
+                for key, block_id in zip(keys, device_block_ids)
+                if key not in held_keys
+            ]
+            keys = [key for key, _ in kept]
+            device_block_ids = [block_id for _, block_id in kept]
+            if not keys:
+                self._finished.append(
+                    FinishedJob(job_id=job_id, op=AdmissionOp.STORE, success=True)
+                )
+                return
         with self._eviction_lock:
             for key in keys:
                 self._evicted_sub_hashes.pop(key, None)
@@ -1024,30 +1052,46 @@ class RaidenOffloadingManager(OffloadingManager):
         # pinned in the local host pool. The slice is the only record of a peer
         # block — read_remote writes nothing to the local directory, so no live
         # probe could rediscover it. Only the BYTES are non-local: every
-        # destination is one of this instance's HBM blocks. The two destination
+        # destination is one of this instance's HBM blocks. The destination
         # lists are disjoint subsequences of `device_ids`, each preserving its
         # batch's hash-to-block pairing, because load() and read_remote() both
-        # require block_hashes[i] to line up with device_block_ids[i]. One
-        # read_remote call takes a peer's slices and storage slices together.
+        # require block_hashes[i] to line up with device_block_ids[i]. A
+        # read_remote call's peer slices must all name one peer, so each peer
+        # gets its own call; storage slices join the first one.
         remote_hashes: list[bytes] = []
-        remote_slices: list[object] = []
-        dst_device_ids_for_remote: list[int] = []
+        remote_batches: dict[object, tuple[list[bytes], list[object], list[int]]] = {}
         local_hashes: list[bytes] = []
         dst_device_ids_for_local: list[int] = []
         for sub_hash, dev_id in zip(sub_hashes, device_ids):
             block = self._pending_remote_slices.pop(sub_hash, None)
             if block is not None:
                 remote_hashes.append(sub_hash)
-                remote_slices.append(block)
-                dst_device_ids_for_remote.append(dev_id)
+                peer = (
+                    cast(Any, block).raiden_id
+                    if cast(Any, block).status == self._block_status.REMOTE
+                    else None
+                )
+                batch = remote_batches.setdefault(peer, ([], [], []))
+                batch[0].append(sub_hash)
+                batch[1].append(block)
+                batch[2].append(dev_id)
             else:
                 local_hashes.append(sub_hash)
                 dst_device_ids_for_local.append(dev_id)
+        storage = remote_batches.pop(None, None)
+        if storage is not None:
+            first = next(iter(remote_batches.values()), None)
+            if first is None:
+                remote_batches[None] = storage
+            else:
+                first[0].extend(storage[0])
+                first[1].extend(storage[1])
+                first[2].extend(storage[2])
 
         def _fail_launch(
             what: str, failed_hashes: list[bytes], in_flight: list[bytes]
         ) -> None:
-            # failed_hashes is the batch whose launch failed.
+            # failed_hashes includes rejected and unlaunched batches.
             logger.error(
                 "TPURaidenOffloadingConnector: load job %d (req %s): %s launch failed "
                 "(%d local, %d remote sub-blocks)",
@@ -1070,11 +1114,11 @@ class RaidenOffloadingManager(OffloadingManager):
                 failed_sub_hashes=list(failed_hashes),
             )
             if in_flight:
-                # The other launch already succeeded: the job must stay
-                # non-terminal until its transfer resolves, then the
+                # Earlier launches succeeded: the job must stay
+                # non-terminal until their transfers resolve, then the
                 # finalizer runs the failure cleanup exactly once.
                 self._admissions[job_id] = admission
-                for sub_hash in in_flight:
+                for sub_hash in sub_hashes:
                     self._hash_to_admission[sub_hash] = admission
                 return
             # Nothing in flight: immediately terminal. The finalizer keeps
@@ -1089,11 +1133,17 @@ class RaidenOffloadingManager(OffloadingManager):
         ):
             _fail_launch("load()", local_hashes, [])
             return
-        if remote_hashes and not self._store.read_remote(
-            remote_hashes, remote_slices, dst_device_ids_for_remote
-        ):
-            _fail_launch("read_remote()", remote_hashes, local_hashes)
-            return
+        in_flight = list(local_hashes)
+        for peer_hashes, peer_slices, peer_device_ids in remote_batches.values():
+            if not self._store.read_remote(peer_hashes, peer_slices, peer_device_ids):
+                launched = set(in_flight)
+                _fail_launch(
+                    "read_remote()",
+                    [h for h in remote_hashes if h not in launched],
+                    in_flight,
+                )
+                return
+            in_flight.extend(peer_hashes)
         admission = Admission(
             job_id=job_id,
             op=AdmissionOp.LOAD,
@@ -1645,6 +1695,32 @@ def resolve_kernel_geometry(
     return kernel_block_size, per_block_shape, spec0.dtype, spec0.block_size
 
 
+def view_on_current_storage(
+    view: torch.Tensor, source: torch.Tensor | None
+) -> torch.Tensor:
+    """``view`` rebuilt on the current storage of ``source``, the runner's
+    tensor for the pool ``view`` covers (from offset 0). A runner that donates
+    its pools to every op re-binds ``source`` to each fresh buffer with
+    ``Tensor.set_``; ``view`` stays on the buffer it was built from, which the
+    first op deletes."""
+    if source is None:
+        return view
+    import torch
+
+    storage = source.untyped_storage()
+    assert view.storage_offset() == 0, view.storage_offset()
+    assert view.numel() * view.element_size() == storage.nbytes(), (
+        "registered view does not cover its pool storage: "
+        f"view_bytes={view.numel() * view.element_size()}, "
+        f"storage_bytes={storage.nbytes()}"
+    )
+    return (
+        torch.empty(0, dtype=view.dtype, device=source.device)
+        .set_(storage)
+        .view(view.shape)
+    )
+
+
 class RaidenStoreOffloadingWorker(OffloadingWorker):
     """Worker-side endpoint that registers local TPU HBM device buffers with
     the Controller.
@@ -1675,6 +1751,7 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         controller_address: str,
         rank: int,
         block_major_contract: BlockMajorContract | None = None,
+        pool_sources: list[torch.Tensor] | None = None,
         # This rank's storage-tier config, from
         # `build_worker_storage_backend_config`. Empty registers no storage
         # backend, which is right only when the store has no storage tier:
@@ -1684,6 +1761,7 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         import numpy as np
         import torch
 
+        self._pool_sources = list(pool_sources or ())
         # Set before either branch below starts the registration thread.
         self._backend_configs = list(backend_configs)
 
@@ -1802,6 +1880,14 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
         # Hold strong references to ensure PyTorch tensors remain allocated
         # while Raiden C++ retains raw pointers to their underlying storage.
         self._device_tensors = [[t] for t in device_tensors]
+        # Each view's pool tensor, matched while both still share a storage:
+        # registration rebuilds the views on the pools' storage at that time.
+        source_of = {int(s.untyped_storage().data_ptr()): s for s in self._pool_sources}
+        self._view_sources = (
+            [source_of.get(int(t.untyped_storage().data_ptr())) for t in device_tensors]
+            if source_of
+            else [None] * len(device_tensors)
+        )
         self._host_blocks_to_allocate = host_blocks_to_allocate
         self._controller_address = controller_address
         self._rank = rank
@@ -1846,6 +1932,12 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
                 try:
                     from tpu_sync.api.torch import kv_cache_manager as _kcm
 
+                    self._device_tensors = [
+                        [view_on_current_storage(view, source)]
+                        for [view], source in zip(
+                            self._device_tensors, self._view_sources, strict=True
+                        )
+                    ]
                     # Registers the storage backend this rank writes its
                     # shards through; omitted when there is no storage tier.
                     # Any, not the inferred list type: a type checker matches
@@ -2539,6 +2631,9 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
 
         self._manager: RaidenOffloadingManager | None = None
         self._worker: RaidenStoreOffloadingWorker | None = None
+        # The runner's tensor per KV pool storage (set by the connector before
+        # the worker is built); see RaidenStoreOffloadingWorker.
+        self.pool_sources: list[torch.Tensor] = []
 
     def get_manager(self) -> OffloadingManager:
         if self._manager is None:
@@ -2644,6 +2739,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 controller_address=controller_address,
                 rank=rank,
                 block_major_contract=self.block_major_contract,
+                pool_sources=self.pool_sources,
                 backend_configs=backend_configs,
             )
         return self._worker

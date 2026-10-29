@@ -632,6 +632,8 @@ def _pooled_kda_regions(
     spec: Any,
     row_bytes: int,
     page_bytes: int,
+    extra_conv_rows: int = 0,
+    sub_blocks: int = 1,
 ) -> dict[str, tuple[int, tuple[RegionSpec, ...]]]:
     """Expose KDA's live state through Qwen's two state pool tags.
 
@@ -642,6 +644,15 @@ def _pooled_kda_regions(
     retains aligned, padded source-head shards in rank order. The KDA pool
     adapter restores logical tap/QKV/head order on load and reverses it on
     store, so each source shard transfers as one contiguous byte range.
+
+    ``extra_conv_rows`` extends the convolution region over that many rows
+    after its taps: the megakernel's DSpark draft ring
+    (``megakernel.kimi_k3.layout``), carried with the state.
+
+    ``sub_blocks``: the page stacks that many equal state blocks, each laid
+    out as above over an equal share of the spec's state (a prefill rank
+    holding the states of several decode ranks); each region then has one
+    unit per stacked block.
     """
     shapes = tuple(getattr(spec, "shapes", ()))
     dtypes = tuple(getattr(spec, "dtypes", ()))
@@ -651,6 +662,18 @@ def _pooled_kda_regions(
     try:
         conv_bytes = math.prod(shapes[0]) * pooled_gdn_state_itemsize(conv_dtype)
         ssm_bytes = math.prod(shapes[1]) * pooled_gdn_state_itemsize(ssm_dtype)
+        if (
+            sub_blocks <= 0
+            or conv_bytes % sub_blocks
+            or ssm_bytes % sub_blocks
+            or page_bytes % (sub_blocks * row_bytes)
+        ):
+            raise ValueError(
+                f"KDA state and page do not split into {sub_blocks} state blocks"
+            )
+        conv_bytes //= sub_blocks
+        ssm_bytes //= sub_blocks
+        page_bytes //= sub_blocks
         layout = derive_pooled_gdn_state_layout(
             ssm_bytes=ssm_bytes,
             conv_bytes=conv_bytes,
@@ -658,27 +681,27 @@ def _pooled_kda_regions(
         )
     except ValueError as exc:
         raise ManifestError(str(exc)) from exc
-    if layout.required_bytes > page_bytes:
+    if layout.required_bytes + extra_conv_rows * row_bytes > page_bytes:
         raise ManifestError(
             "KDA state exceeds its pooled page: "
             f"state={layout.required_bytes}, "
+            f"extra={extra_conv_rows * row_bytes}, "
             f"page={page_bytes}"
         )
     if str(ssm_dtype) != "torch.float32" or row_bytes % 4:
         raise ManifestError("KDA transfer requires f32 SSM and word-aligned pool rows")
+    conv_rows = layout.conv_tokens + extra_conv_rows
+    if sub_blocks == 1:
+        ssm = RegionSpec("gdn_ssm", 0, ssm_bytes, ssm_bytes, 1)
+        conv = RegionSpec("kda_conv_rank_blocks", 0, row_bytes, row_bytes, conv_rows)
+    else:
+        ssm = RegionSpec("gdn_ssm", 0, page_bytes, ssm_bytes, sub_blocks)
+        conv = RegionSpec(
+            "kda_conv_rank_blocks", 0, page_bytes, conv_rows * row_bytes, sub_blocks
+        )
     return {
-        TAG_GDN_SSM: (
-            0,
-            (RegionSpec("gdn_ssm", 0, ssm_bytes, ssm_bytes, 1),),
-        ),
-        TAG_GDN_CONV: (
-            layout.ssm_tokens * row_bytes,
-            (
-                RegionSpec(
-                    "kda_conv_rank_blocks", 0, row_bytes, row_bytes, layout.conv_tokens
-                ),
-            ),
-        ),
+        TAG_GDN_SSM: (0, (ssm,)),
+        TAG_GDN_CONV: (layout.ssm_tokens * row_bytes, (conv,)),
     }
 
 
@@ -993,11 +1016,19 @@ def build_kimi_k3_pool_manifest(
     kv_cache_groups: Sequence[Any],
     raw_tensors: Sequence[Any],
     mamba_group_ordinal_by_layer: Mapping[str, int] | None = None,
+    extra_state_rows: int = 0,
+    per_layer_tags: bool = False,
+    sub_blocks: int = 1,
 ) -> PoolManifest:
     """Describe K3's packed MLA/KDA rows using the shared hybrid pool tags.
 
     Only the layout differs from Qwen: storage binding, pool admission and
     Stage-3 transfers all use the same model-independent machinery.
+    ``extra_state_rows``: state-block rows after the conv taps that travel
+    with them (see ``_pooled_kda_regions``); both peers must agree.
+    ``per_layer_tags`` suffixes every tag with the layer index, as in
+    ``build_qwen35_pool_manifest``. ``sub_blocks``: every block stacks that
+    many decode-sized blocks (see ``_pooled_kda_regions``).
     """
     entries: list[tuple[Any, PoolEntry]] = []
     for layer_name in _ordered_layers(named_kv_caches):
@@ -1021,7 +1052,12 @@ def build_kimi_k3_pool_manifest(
         num_blocks, rows, packing, width = shape
         # The packing axis fills one 32-bit word, so a packed row is
         # 4 * width bytes for either dtype and only its token count differs.
-        if min(shape) <= 0 or packing * _element_size(tensor) != 4:
+        if (
+            min(shape) <= 0
+            or packing * _element_size(tensor) != 4
+            or sub_blocks <= 0
+            or rows % sub_blocks
+        ):
             raise ManifestError(
                 f"Kimi cache {layer_name} has invalid packed-row geometry"
             )
@@ -1045,7 +1081,11 @@ def build_kimi_k3_pool_manifest(
             )
         if is_state:
             layouts = _pooled_kda_regions(
-                spec=spec, row_bytes=row_bytes, page_bytes=page_bytes
+                spec=spec,
+                row_bytes=row_bytes,
+                page_bytes=page_bytes,
+                extra_conv_rows=extra_state_rows,
+                sub_blocks=sub_blocks,
             )
             suffix = _state_tag_suffix(layer_name, mamba_group_ordinal_by_layer)
             tags = (TAG_GDN_CONV, TAG_GDN_SSM)
@@ -1072,6 +1112,17 @@ def build_kimi_k3_pool_manifest(
                     ),
                 )
             )
+    if per_layer_tags:
+        tagged = []
+        for tensor, entry in entries:
+            layer_index = layer_index_from_name(entry.layer_name)
+            if layer_index is None:
+                raise ManifestError(
+                    f"per-layer pool tags need a layer index in {entry.layer_name}"
+                )
+            entry = dataclasses.replace(entry, tag=layer_tag(entry.tag, layer_index))
+            tagged.append((tensor, entry))
+        entries = tagged
     return _bind_pool_manifest(entries, raw_tensors)
 
 

@@ -45,6 +45,7 @@ from vllm.model_executor.models.interfaces import (
     IsHybrid,
     SupportsEncoderCudaGraph,
     SupportsMultiModal,
+    SupportsPP,
     SupportsQuant,
 )
 from vllm.model_executor.models.kimi_k25 import KimiK25MediaPixelInputs
@@ -59,6 +60,8 @@ from vllm.model_executor.models.utils import (
     WeightsMapper,
     _flatten_embeddings,
     init_vllm_registered_model,
+    make_empty_intermediate_tensors_factory,
+    make_layers,
     maybe_prefix,
 )
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
@@ -76,9 +79,14 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.megakernel import backend as megakernel_backend
 from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
-from .attention import KimiDeltaAttention, MultiHeadLatentAttention, kda_state_dtype
+from .attention import (
+    KimiDeltaAttention,
+    MultiHeadLatentAttention,
+    kda_state_dtype,
+)
 from .collective_ops import TokenShardCollectives
 from .kimi_vit import KimiK3MoonViT3dPretrainedModel
 from .layers import AttentionResidual, KimiMLP
@@ -239,15 +247,21 @@ class KimiModel(nn.Module):
             quant_config=vllm_config.quant_config,
             prefix=f"{prefix}.embed_tokens",
         )
-        self.layers = nn.ModuleList(
-            [
-                KimiDecoderLayer(
-                    config,
-                    vllm_config,
-                    prefix=f"{prefix}.layers.{layer_idx}",
-                )
-                for layer_idx in range(config.num_hidden_layers)
-            ]
+        # Under pipeline parallelism (the megakernel prefill's stages), this
+        # stage's layers (the rest are placeholders): their KV caches are the
+        # stage's.
+        if (
+            vllm_config.parallel_config.pipeline_parallel_size > 1
+            and megakernel_backend.role(vllm_config) != "prefill"
+        ):
+            raise NotImplementedError(
+                "Kimi runs pipeline-parallel only as the megakernel prefill "
+                "(--load-format megakernel, kv_producer)"
+            )
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda prefix: KimiDecoderLayer(config, vllm_config, prefix=prefix),
+            prefix=f"{prefix}.layers",
         )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.aux_hidden_state_layers: tuple[int, ...] = ()
@@ -295,7 +309,8 @@ class KimiModel(nn.Module):
         if 0 in self.aux_hidden_state_layers:
             aux_hidden_states.append(hidden_states)
 
-        for layer_idx, layer in enumerate(self.layers):
+        for layer_idx in range(self.start_layer, self.end_layer):
+            layer = self.layers[layer_idx]
             hidden_states, block_residuals = layer(
                 positions,
                 hidden_states,
@@ -318,8 +333,9 @@ class KimiModel(nn.Module):
         return hidden_states
 
 
-class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
-    """Kimi text model for TPU."""
+class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
+    """Kimi text model for TPU. Pipeline stages run only as the megakernel
+    prefill (its program takes the stage hand-off)."""
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -369,6 +385,9 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states"], self.config.hidden_size
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -428,6 +447,8 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         config = cast(KimiLinearConfig, vllm_config.model_config.hf_text_config)
         kda_config = config.linear_attn_config
         assert kda_config is not None
+        # Under prefill context parallelism the TPU block-size code passes TP x
+        # PCP here: a megakernel prefill stage's cores split the heads.
         local_heads = (
             kda_config["num_heads"] // vllm_config.parallel_config.tensor_parallel_size
         )
@@ -550,6 +571,7 @@ class KimiK3ForConditionalGeneration(
     SupportsQuant,
     HasInnerState,
     IsHybrid,
+    SupportsPP,
 ):
     """Kimi-K3 with upstream preprocessing and TPU model execution."""
 
@@ -622,6 +644,9 @@ class KimiK3ForConditionalGeneration(
                     architectures=["KimiLinearForCausalLM"],
                 ),
             )
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
         self.media_placeholder = config.media_placeholder_token_id
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
@@ -995,20 +1020,16 @@ class KimiK3ForConditionalGeneration(
         cls,
         vllm_config: VllmConfig,
     ) -> tuple[torch.dtype, torch.dtype]:
-        text_config = vllm_config.model_config.hf_config.text_config
-        return KimiLinearForCausalLM.get_mamba_state_dtype_from_config(
-            vllm_config.with_hf_config(text_config)
-        )
+        # hf_text_config is the text model's: no derived config, whose
+        # validation would rerun on a parallel config the caller is adjusting.
+        return KimiLinearForCausalLM.get_mamba_state_dtype_from_config(vllm_config)
 
     @classmethod
     def get_mamba_state_shape_from_config(
         cls,
         vllm_config: VllmConfig,
     ) -> tuple[tuple[int, int], tuple[int, int, int]]:
-        text_config = vllm_config.model_config.hf_config.text_config
-        return KimiLinearForCausalLM.get_mamba_state_shape_from_config(
-            vllm_config.with_hf_config(text_config)
-        )
+        return KimiLinearForCausalLM.get_mamba_state_shape_from_config(vllm_config)
 
     @classmethod
     def get_mamba_state_copy_func(cls):

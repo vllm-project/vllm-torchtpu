@@ -228,6 +228,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "_patch_vllm_hybrid_pcp_block_sizes",
         "_patch_vllm_dcp_fine_prefix_hits",
         "_patch_vllm_mamba_split_scheduler_block_size",
+        "_patch_vllm_megakernel_prefix_hits",
         "_patch_vllm_offloading_config_build",
         "_patch_vllm_offload_all_ranks_kv_bytes",
         "_patch_vllm_offload_fine_prefix_alignment",
@@ -236,6 +237,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "_patch_vllm_same_step_prefix_hits",
         "patch_disable_eagle_block_drop",
         "_patch_dflash_drafting_slot_budget",
+        "install",
         "_patch_vllm_merge_multimodal_embeddings",
     ]
     assert stages["platform_activation"] == (

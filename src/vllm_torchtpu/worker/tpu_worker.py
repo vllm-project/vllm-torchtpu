@@ -474,10 +474,17 @@ class TPUWorker(WorkerBase):
         is_last_rank = pp_group.is_last_rank
 
         # TODO: Fix device assignment
+        runner_cls = TPUModelRunner
+        from vllm_torchtpu.megakernel import backend as megakernel
+
+        if megakernel.role(self.vllm_config) is not None:
+            from vllm_torchtpu.megakernel.runner import MegakernelModelRunner
+
+            runner_cls = MegakernelModelRunner
         # WorkerBase declares `nn.Module | None`; this worker always holds a
         # TPUModelRunner from here on.
         # pyrefly: ignore[bad-override-mutable-attribute]
-        self.model_runner: TPUModelRunner = TPUModelRunner(
+        self.model_runner: TPUModelRunner = runner_cls(
             self.vllm_config,
             self.devices[0],
             profiler_rank=self.profile_rank,

@@ -425,6 +425,55 @@ def lower_kda_state_shard_spans(
     )
 
 
+def lower_kda_state_fanout_spans(
+    *,
+    tag: str,
+    block_id: int,
+    transfer_rank: int,
+    fan_out: int,
+    regions: Sequence[object],
+) -> PoolSpanRegistration:
+    """Send each of a rank's stacked KDA state blocks to the decode rank it
+    belongs to: stacked block g of rank r goes whole to unit ``fan_out * r +
+    g``, whose state block has the same layout."""
+    if not tag:
+        raise ValueError("state pool tag must not be empty")
+    if block_id < 0:
+        raise ValueError("state block id must be non-negative")
+    if transfer_rank < 0:
+        raise ValueError("transfer rank must be non-negative")
+    if fan_out <= 0:
+        raise ValueError("fan_out must be positive")
+    if tag == TAG_GDN_SSM or tag.startswith(f"{TAG_GDN_SSM}."):
+        expected_name = "gdn_ssm"
+    elif tag == TAG_GDN_CONV or tag.startswith(f"{TAG_GDN_CONV}."):
+        expected_name = "kda_conv_rank_blocks"
+    else:
+        raise ValueError(f"unsupported KDA state tag {tag!r}")
+    if len(regions) != 1:
+        raise ValueError(f"KDA state fan-out requires one region ({tag})")
+    region = regions[0]
+    size = int(_region_value(region, "unit_bytes"))
+    if (
+        _region_value(region, "name") != expected_name
+        or int(_region_value(region, "offset_bytes")) != 0
+        or int(_region_value(region, "num_units")) != fan_out
+        or int(_region_value(region, "units_per_stride")) != 1
+        or int(_region_value(region, "stride_bytes")) <= size
+        or size <= 0
+    ):
+        raise ValueError(
+            f"KDA state fan-out requires one unit per stacked state block ({tag})"
+        )
+    spans = tuple(
+        PoolByteSpan(
+            0, g * size, 0, 0, size, dst_unit_ordinal=fan_out * transfer_rank + g
+        )
+        for g in range(fan_out)
+    )
+    return PoolSpanRegistration(tag, (int(block_id),), spans, fan_out * size)
+
+
 def lower_glm_row_spans(
     *,
     tag: str,
@@ -723,5 +772,139 @@ def lower_dsv4_row_spans(
         block_ids=tuple(int(block_id) for block_id in block_ids),
         spans=spans,
         declared_bytes=sum(span.size_bytes for span in spans),
+        dst_space_version=1,
+    )
+
+
+def lower_dcp_page_spans(
+    *,
+    tag: str,
+    transfer_rank: int,
+    live_bytes_per_block: int,
+    block_ids: Sequence[int],
+    sub_blocks: int = 1,
+) -> PoolSpanRegistration:
+    """Lower one rank's share of a decode-context-parallel cache.
+
+    Under vLLM decode context parallelism every rank holds a different page
+    under each of the request's logical block ids (rank r: global page
+    ``N j + r`` at logical block j), so no page is replicated and there is
+    nothing to stripe: rank r sends every one of its blocks, whole, to the
+    destination unit of the same ordinal, which holds the same share. Spans
+    address the request-global compact byte space (block j at ``j *
+    live_bytes_per_block``) so the controller can still clip a destination
+    prefix hit (``dst_skip_bytes``, whole logical blocks); every destination
+    unit is covered over the same extents (full final page included).
+
+    ``sub_blocks``: each source block stacks that many equal destination
+    pages, page i of rank r's block j going to unit ``sub_blocks * r + i``
+    at its block j (a prefill context-parallel rank whose block holds the
+    pages of several decode-context-parallel ranks).
+    """
+    if not tag:
+        raise ValueError("pool tag must not be empty")
+    if transfer_rank < 0:
+        raise ValueError("transfer rank must be non-negative")
+    if live_bytes_per_block <= 0:
+        raise ValueError("live_bytes_per_block must be positive")
+    if sub_blocks <= 0 or live_bytes_per_block % sub_blocks:
+        raise ValueError(
+            f"a block of {live_bytes_per_block} live bytes does not split "
+            f"into {sub_blocks} destination pages"
+        )
+    page_bytes = live_bytes_per_block // sub_blocks
+    spans = tuple(
+        PoolByteSpan(
+            src_block_ordinal=j,
+            src_offset_bytes=i * page_bytes,
+            dst_block_index=0,
+            dst_offset_bytes=j * page_bytes,
+            size_bytes=page_bytes,
+            dst_unit_ordinal=sub_blocks * transfer_rank + i,
+        )
+        for j in range(len(block_ids))
+        for i in range(sub_blocks)
+    )
+    return PoolSpanRegistration(
+        tag=tag,
+        block_ids=tuple(int(block_id) for block_id in block_ids),
+        spans=spans,
+        declared_bytes=len(spans) * page_bytes,
+        dst_space_version=1,
+    )
+
+
+def lower_dcp_page_spans_to_dcp(
+    *,
+    tag: str,
+    transfer_rank: int,
+    live_bytes_per_block: int,
+    block_ids: Sequence[int],
+    src_dcp_size: int,
+    dst_dcp_size: int,
+    dst_units: int,
+    num_tokens: int,
+    page_tokens: int,
+    sub_blocks: int = 1,
+) -> PoolSpanRegistration:
+    """Lower one rank's share of a decode-context-parallel cache to a
+    destination with a smaller DCP degree that divides it.
+
+    Source rank r holds global page ``src_dcp_size * j + r`` at logical
+    block j. At the destination, page g belongs to every unit u with
+    ``u % dst_dcp_size == g % dst_dcp_size`` (the DCP groups are
+    contiguous destination units, so each group holds a full copy), at local page
+    ``g // dst_dcp_size`` of its compact byte space. Pages past the
+    destination's ``ceil(num_tokens / (page_tokens * dst_dcp_size))``
+    blocks are padding and are not sent, so every destination unit is
+    covered over the same extents.
+
+    ``sub_blocks``: each source block stacks that many pages (a prefill
+    context-parallel rank of a pipeline stage), page i of rank r's block j
+    being global page ``src_dcp_size * j + sub_blocks * r + i``;
+    ``src_dcp_size`` counts the pages of a logical block and
+    ``page_tokens`` a page's tokens.
+    """
+    if not tag:
+        raise ValueError("pool tag must not be empty")
+    if live_bytes_per_block <= 0:
+        raise ValueError("live_bytes_per_block must be positive")
+    if sub_blocks <= 0 or live_bytes_per_block % sub_blocks:
+        raise ValueError(
+            f"a block of {live_bytes_per_block} live bytes does not split "
+            f"into {sub_blocks} destination pages"
+        )
+    if not 0 <= transfer_rank * sub_blocks < src_dcp_size:
+        raise ValueError("transfer rank must be a source DCP rank")
+    if src_dcp_size % dst_dcp_size or dst_units % dst_dcp_size:
+        raise ValueError(
+            "destination DCP size must divide the source DCP size and the "
+            "destination unit count"
+        )
+    page_bytes = live_bytes_per_block // sub_blocks
+    dst_blocks = -(-int(num_tokens) // (page_tokens * dst_dcp_size))
+    spans = []
+    for j in range(len(block_ids)):
+        for i in range(sub_blocks):
+            page = src_dcp_size * j + sub_blocks * transfer_rank + i
+            local = page // dst_dcp_size
+            if local >= dst_blocks:
+                continue
+            for unit in range(page % dst_dcp_size, dst_units, dst_dcp_size):
+                spans.append(
+                    PoolByteSpan(
+                        src_block_ordinal=j,
+                        src_offset_bytes=i * page_bytes,
+                        dst_block_index=0,
+                        dst_offset_bytes=local * page_bytes,
+                        size_bytes=page_bytes,
+                        dst_unit_ordinal=unit,
+                    )
+                )
+    return PoolSpanRegistration(
+        tag=tag,
+        block_ids=tuple(int(block_id) for block_id in block_ids),
+        spans=tuple(spans),
+        declared_bytes=len(spans) * page_bytes,
         dst_space_version=1,
     )

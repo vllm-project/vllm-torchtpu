@@ -2850,8 +2850,8 @@ class TestTPURaidenConnectorWorker:
         worker._admit_raiden_hybrid_kv_cache.assert_called_once()
 
         monkeypatch.setattr(tpu_envs, "TPU_RAIDEN_POOL_TAGS_PER_LAYER", True)
-        with pytest.raises(ValueError, match="POOL_TAGS_PER_LAYER"):
-            worker.register_runner(SimpleNamespace())
+        worker.register_runner(SimpleNamespace())
+        assert worker._admit_raiden_hybrid_kv_cache.call_count == 2
 
     @pytest.mark.parametrize("is_producer", [True, False])
     def test_kimi_stage3_requires_destination_shards(self, monkeypatch, is_producer):
@@ -2960,6 +2960,184 @@ class TestTPURaidenConnectorWorker:
         assert params["src_controller_address"] == f"{hosts[dp_rank]}:{27340 + dp_rank}"
         assert params["src_data_replica_idx"] == dp_rank
         assert params["src_parallelism"] == 8
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {},
+            {"pp_size": 2, "parallelism": 16},
+            {"pcp_size": 4, "parallelism": 16},
+            {"tp_size": 2},
+            {"interleave_size": 512},
+            {"dst_dcp": 8},
+            {"dst_shards": 16},
+        ],
+    )
+    def test_kimi_pp4_pcp8_prefill_admission(self, overrides):
+        settings = {
+            "pp_size": 4,
+            "pcp_size": 8,
+            "tp_size": 1,
+            "interleave_size": 2048,
+            "dst_dcp": 32,
+            "dst_shards": 32,
+            "parallelism": 32,
+            **overrides,
+        }
+        worker = _make_raiden_worker(
+            tp_rank=0,
+            tp_size=settings["tp_size"],
+            pcp_size=settings["pcp_size"],
+            pp_size=settings["pp_size"],
+            interleave_size=settings["interleave_size"],
+            block_size=2048,
+            architecture="KimiK3ForConditionalGeneration",
+        )
+        worker.vllm_config.kv_transfer_config.kv_connector_extra_config = {
+            "destination_decode_context_parallel_size": settings["dst_dcp"]
+        }
+        with (
+            patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden"),
+            patch(
+                f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM",
+                settings["parallelism"],
+            ),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_DST_SHARDS", settings["dst_shards"]),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_POOL_TAGS_PER_LAYER", True),
+            patch(
+                "vllm.distributed.parallel_state.get_pp_group",
+                return_value=SimpleNamespace(rank_in_group=2),
+            ),
+            patch("vllm_torchtpu.distributed.pcp.get_pcp_rank", return_value=5),
+        ):
+            if overrides:
+                with pytest.raises(ValueError, match="pp4pcp8_prefill"):
+                    worker._raiden_hybrid_admission_topology()
+                return
+            assert worker._raiden_hybrid_admission_topology() == "pp4pcp8_prefill"
+            assert worker._local_raiden_transfer_rank() == 21
+            worker._validate_stage3_transfer_parallelism(32)
+
+    def test_kimi_pp4_pcp8_scheduler_waits_for_every_stage_rank(self):
+        scheduler = _make_raiden_scheduler(
+            is_producer=True, pcp_size=8, pp_size=4, block_size=2048
+        )
+        scheduler.vllm_config.model_config.architecture = (
+            "KimiK3ForConditionalGeneration"
+        )
+        with (
+            _stage3_producer_env(),
+            patch(f"{_MOD}.tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER", True),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_KIMIK3_ADMISSION", True),
+        ):
+            assert scheduler.get_finished_count() == 32
+            assert not scheduler._stage3_register_ahead_enabled()
+
+    def test_kimi_pp4_pcp8_rank_fans_its_blocks_out(self):
+        from .raiden_test_utils import kimi_pool_manifest
+
+        worker = _make_raiden_worker(
+            tp_rank=0,
+            tp_size=1,
+            pcp_size=8,
+            pp_size=4,
+            block_size=648,
+            interleave_size=648,
+            architecture="KimiK3ForConditionalGeneration",
+        )
+        worker.vllm_config.kv_transfer_config.kv_connector_extra_config = {
+            "destination_decode_context_parallel_size": 32
+        }
+        manifest = kimi_pool_manifest(3, sub_blocks=4, per_layer_tags=True)
+        page_bytes = manifest.pools[2].live_bytes_per_block // 4
+        worker._raiden_manifest = manifest
+        worker._stage3_row_geometry = {"fa.l4": (4 * page_bytes, 2560)}
+        worker._stage3_state_group_count = 1
+        worker._raiden_controller_facade = facade = _FakeRaidenControllerFacade()
+        worker._raiden_controller_address = "prefill.test:27000"
+        worker._raiden_work_unit = SimpleNamespace(rank=21)
+        metadata = TPUConnectorMetadata()
+        metadata.reqs_to_send["request"] = SimpleNamespace(
+            uuid=123,
+            local_block_ids=[40, 31],
+            mamba_state_block_ids=[9],
+            num_tokens=6000,
+            expiration_time=1e20,
+        )
+        with (
+            patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden"),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 32),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_DST_SHARDS", 32),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_POOL_TAGS_PER_LAYER", True),
+            patch(
+                "vllm.distributed.parallel_state.get_pp_group",
+                return_value=SimpleNamespace(rank_in_group=2),
+            ),
+            patch("vllm_torchtpu.distributed.pcp.get_pcp_rank", return_value=5),
+        ):
+            worker._register_stage3_request_row_spans(metadata)
+
+        (call,) = facade.register_request_blocks_calls
+        assert call["block_ids"] == [40, 31]
+        fa, conv, ssm = call["pool_spans"]
+        assert fa.tag == "fa.l4" and fa.block_ids == (40, 31)
+        assert [
+            (s.src_block_ordinal, s.src_offset_bytes, s.dst_offset_bytes)
+            + (s.size_bytes, s.dst_unit_ordinal)
+            for s in fa.spans
+        ] == [
+            (j, i * page_bytes, j * page_bytes, page_bytes, 20 + i)
+            for j in range(2)
+            for i in range(4)
+        ]
+        # Each layer's state comes from this rank's own block of its group.
+        assert (conv.tag, ssm.tag) == ("gdn.conv.g0.l1", "gdn.ssm.g0.l1")
+        for state in (conv, ssm):
+            assert state.block_ids == (9,)
+            assert [s.dst_unit_ordinal for s in state.spans] == [20, 21, 22, 23]
+
+    def test_kimi_pp4_pcp8_producer_fingerprints_like_its_decoder(self):
+        from .raiden_test_utils import kimi_pool_manifest
+
+        stacked = kimi_pool_manifest(3, sub_blocks=4, per_layer_tags=True)
+        decode_sized = kimi_pool_manifest(3, per_layer_tags=True)
+        # A bf16 pool packs two tokens per row.
+        decode_block = decode_sized.storages[0].shape[1] * 2
+        stage_block = stacked.storages[0].shape[1] * 2
+        producer = _make_raiden_worker(
+            tp_rank=0,
+            tp_size=1,
+            pcp_size=8,
+            pp_size=4,
+            block_size=stage_block,
+            architecture="KimiK3ForConditionalGeneration",
+        )
+        decoder = _make_raiden_worker(
+            tp_rank=0,
+            tp_size=32,
+            is_producer=False,
+            block_size=decode_block,
+            architecture="KimiK3ForConditionalGeneration",
+        )
+        with (
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 32),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_DST_SHARDS", 32),
+            patch(
+                "vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint."
+                "_default_layout_getter",
+                return_value=([3, 2, 1, 0], [[2, 128], [2, 1]], 0),
+            ),
+            patch("importlib.metadata.version", return_value="test"),
+        ):
+            expected = decoder._measure_stage3_layout(decode_sized)[0]
+            # A producer block holding a single decode rank's state does not.
+            for block_size, manifest, matches in (
+                (stage_block, stacked, True),
+                (decode_block, decode_sized, False),
+            ):
+                producer.vllm_config.cache_config.block_size = block_size
+                measured = producer._measure_stage3_layout(manifest)[0]
+                assert (measured == expected) is matches
 
     @pytest.mark.parametrize(
         ("kv_dtype", "block_size"), [("bfloat16", 162), ("float8_e4m3fn", 324)]
@@ -5067,6 +5245,69 @@ class TestTPURaidenConnectorWorker:
 
         expected_errors = {41, 43} if terminal_result == "failure" else set()
         assert worker.get_block_ids_with_load_errors() == expected_errors
+
+    def test_v4_stage3_layout_fingerprint_mismatch_fails_without_waiting(self):
+        # The controller rejects peers whose layout fingerprints differ before
+        # it plans the transfer (no receiver is armed), so the load fails at
+        # once instead of waiting out the pull timeout for a native terminal.
+        scheduler = _make_raiden_scheduler(is_producer=False, block_size=1024)
+        req = MagicMock()
+        req.request_id = "mismatch-load"
+        req.num_prompt_tokens = 1537
+        req.kv_transfer_params = {
+            "req_id": "mismatch-load",
+            "uuid": 912,
+            "num_tokens": 1536,
+            "src_controller_address": "source-controller.test:27000",
+            "src_job_name": "prefill",
+            "src_engine_id": "source-engine",
+            "src_data_replica_idx": 0,
+            "src_parallelism": 8,
+            "dst_tp_size": 1,
+            "dst_dcp_size": 1,
+        }
+        blocks = MagicMock()
+        blocks.get_block_ids.return_value = ([41, 43],)
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True):
+            scheduler.update_state_after_alloc(req, blocks, 1536)
+            meta = scheduler.build_connector_meta()
+
+        worker = _make_raiden_worker(
+            tp_rank=0, tp_size=1, is_producer=False, dp_size=8, pcp_size=1
+        )
+        engine = _FakeRaidenEngine()
+        engine.poll_results = [([], [], [])]
+        facade = _FakeRaidenControllerFacade()
+        facade.start_transfer = MagicMock(
+            side_effect=RuntimeError(
+                "Remote Controller Server execution failed: Layout fingerprint "
+                "mismatch between source and destination"
+            )
+        )
+        worker._raiden_transfer_engine = engine
+        worker._raiden_controller_facade = facade
+        worker._raiden_controller_address = "dest-controller.test:28000"
+        worker._new_raiden_controller_facade = MagicMock(return_value=facade)
+        worker._raiden_work_unit = SimpleNamespace(job_name="decode")
+        worker._raiden_manifest = SimpleNamespace(
+            tag_counts=lambda: {"fa": 15, "gdn.conv": 45, "gdn.ssm": 45}
+        )
+        worker._new_raiden_id = MagicMock(
+            side_effect=lambda fields: SimpleNamespace(**fields)
+        )
+        worker._raiden_hbm_memory_type = MagicMock(return_value="HBM")
+
+        with (
+            patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 8, create=True),
+            patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=300.0),
+        ):
+            worker.process_send_load(meta)
+            _flush_stage3_submits(worker)
+            assert worker.get_finished() == (set(), {"mismatch-load"})
+
+        assert worker.get_block_ids_with_load_errors() == {41, 43}
+        assert worker._stage3_pending_controller_failures == {}
 
     def test_v4_stage3_uncertain_rpc_times_out_before_recompute(self):
         # Exercise the no-native-terminal fallback without duplicating the
@@ -8018,6 +8259,7 @@ class TestContextParallelRegisterAhead:
             for gate in (
                 "_use_raiden_glm_admission",
                 "_use_raiden_dsv4_admission",
+                "_is_kimi",
                 "_uses_tp_stage3_source",
             ):
                 with patch(f"{_MOD}.{gate}", return_value=True):

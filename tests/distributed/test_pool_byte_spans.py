@@ -29,6 +29,7 @@ from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import (
     lower_dsv4_row_spans,
     lower_gdn_state_shard_spans,
     lower_glm_row_spans,
+    lower_kda_state_fanout_spans,
     lower_kda_state_shard_spans,
 )
 from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import (
@@ -304,6 +305,81 @@ def test_kimi_fa_row_spans_trim_the_tail_to_the_dtype_row(
     full_page, tail = registration.spans
     assert full_page.size_bytes == fa.live_bytes_per_block == 217600
     assert tail.size_bytes == tail_rows * 2560
+
+
+def _block_live_bytes(block: bytes, pool) -> bytes:
+    """A pool's compact live bytes in one physical block."""
+    live = bytearray()
+    for region in pool.regions:
+        for unit in range(region.num_units):
+            start = pool.base_offset_bytes + region.offset_bytes
+            start += unit * region.stride_bytes
+            live += block[start : start + region.unit_bytes * region.units_per_stride]
+    return bytes(live)
+
+
+def test_kda_stage_fans_stacked_states_out_to_decode_ranks():
+    # A K3 PP x PCP8 rank holds 12 KDA heads: the state blocks of four TP32
+    # decode ranks, stacked in one block.
+    source_manifest = kimi_pool_manifest(3, sub_blocks=4, per_layer_tags=True)
+    destination_manifest = kimi_pool_manifest(3, per_layer_tags=True)
+    tags = ["gdn.conv.g0.l1", "gdn.ssm.g0.l1", "fa.l4"]
+    assert [pool.tag for pool in source_manifest.pools] == tags
+    assert [pool.tag for pool in destination_manifest.pools] == tags
+    fingerprints = [
+        measured_kimi_k3_layout_fingerprint(
+            manifest,
+            page_tokens=manifest.storages[0].shape[1] * 2,
+            state_fragment_heads=3,
+            state_fragments=fragments,
+            layout_getter=lambda tensor: ([3, 2, 1, 0], [[2, 128], [2, 1]], 0),
+            package_version=lambda package: "test",
+        )
+        for manifest, fragments in ((source_manifest, 4), (destination_manifest, 1))
+    ]
+    assert fingerprints[0] == fingerprints[1]
+
+    page_bytes = destination_manifest.pools[0].block_stride_bytes
+    assert source_manifest.pools[0].block_stride_bytes == 4 * page_bytes
+    block = np.random.default_rng(0).integers(0, 256, 4 * page_bytes, np.uint8)
+    block = block.tobytes()
+    rank = 5
+    for source_pool, dest_pool in zip(
+        source_manifest.pools[:2], destination_manifest.pools[:2]
+    ):
+        registration = lower_kda_state_fanout_spans(
+            tag=source_pool.tag,
+            block_id=17,
+            transfer_rank=rank,
+            fan_out=4,
+            regions=source_pool.regions,
+        )
+        source = _block_live_bytes(block, source_pool)
+        assert registration.block_ids == (17,)
+        assert registration.declared_bytes == len(source)
+        destinations = {}
+        for span in registration.spans:
+            assert span.dst_offset_bytes == 0
+            assert span.size_bytes == dest_pool.live_bytes_per_block
+            destinations[span.dst_unit_ordinal] = source[
+                span.src_offset_bytes : span.src_offset_bytes + span.size_bytes
+            ]
+        assert destinations == {
+            4 * rank + g: _block_live_bytes(
+                block[g * page_bytes : (g + 1) * page_bytes], dest_pool
+            )
+            for g in range(4)
+        }
+        # A decode-sized state block (its four conv rows included) has
+        # nothing to fan out.
+        with pytest.raises(ValueError, match="stacked state block"):
+            lower_kda_state_fanout_spans(
+                tag=dest_pool.tag,
+                block_id=17,
+                transfer_rank=rank,
+                fan_out=4,
+                regions=dest_pool.regions,
+            )
 
 
 def test_gdn_conv_pair_shards_reassemble_rank_blocks():

@@ -454,6 +454,19 @@ class CausalDepthwiseConv1d(nn.Module):
         parameter.data.copy_(loaded_weight)
 
 
+def kda_head_shards(vllm_config: VllmConfig) -> int:
+    """The ways KDA heads are split: TP, and on a megakernel prefill
+    pipeline stage also its context-parallel ranks (each keeps its own heads'
+    states)."""
+    from vllm_torchtpu.megakernel import backend
+
+    parallel = vllm_config.parallel_config
+    shards = parallel.tensor_parallel_size
+    if backend.role(vllm_config) == "prefill" and parallel.pipeline_parallel_size > 1:
+        shards *= parallel.prefill_context_parallel_size
+    return shards
+
+
 class KimiDeltaAttention(nn.Module, MambaBase):
     """KDA registered with vLLM and executed by TPU Pallas custom ops."""
 
@@ -475,9 +488,10 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.head_dim = int(kda_config["head_dim"])
         self.total_heads = int(kda_config["num_heads"])
-        if self.total_heads % self.tp_size:
+        shards = kda_head_shards(vllm_config)
+        if self.total_heads % shards:
             raise ValueError("KDA num_heads must be divisible by TP size")
-        self.num_heads = self.total_heads // self.tp_size
+        self.num_heads = self.total_heads // shards
         self.projection_size = self.total_heads * self.head_dim
         self.local_projection_size = self.num_heads * self.head_dim
         self.conv_size = int(kda_config["short_conv_kernel_size"])

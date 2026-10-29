@@ -35,7 +35,10 @@ dependencies = [
     # torch==2.13.0 above; a mismatched pair fails at operator-registration time,
     # not at install time.
     "torchvision==0.28.0",
-    "torch_tpu==0.2.0",
+    # A nightly: a pipeline stage that spans several devices (PP x PCP) needs
+    # torch_tpu to compile each process group's programs for the group's own
+    # devices, first shipped in the 0.2.1 nightlies.
+    "torch_tpu==0.2.1.dev20261017150216",
     # High-bandwidth PJRT raw-transfer / KV-cache DMA engine backing the
     # raiden KV connector (disaggregated serving) and host KV offload; the
     # import name is `tpu_sync`. The wheel bundles one extension per
@@ -212,6 +215,12 @@ ignore = [
 "src/vllm_torchtpu/kernels/mla/kv_cache_utils.py" = ["TID251"]
 "src/vllm_torchtpu/kernels/partial_kv_update.py" = ["TID251"]
 "src/vllm_torchtpu/kernels/pool_adapters.py" = ["TID251"]
+# The K3 megakernel backend binds its programs to torch and vLLM; its kernels
+# (megakernel/common/, megakernel/kimi_k3/kernels/) stay JAX and Pallas only.
+"src/vllm_torchtpu/megakernel/{bridge,compilation,dp_blocks,export_cache,loader,program,runner}.py" = [
+    "TID251",
+]
+"src/vllm_torchtpu/megakernel/kimi_k3/*.py" = ["TID251"]
 
 # Pallas runs a kernel closure the moment it is defined: `pl.when` and
 # `pl.loop` trace the body during the decorator call, inside the iteration
@@ -223,14 +232,28 @@ ignore = [
 # tools/check_b023_baseline.py counts the findings per file and fails when a
 # file gains one. Both move together.
 "src/vllm_torchtpu/kernels/**" = ["B023"]
+# The megakernel kernels (one file per role, several thousand lines) keep
+# their own dense 120-column layout, so `ruff format` skips them (see
+# [tool.ruff.format]); B023 is exempt for the reason above, under the same
+# ratchet.
+"src/vllm_torchtpu/megakernel/common/**" = ["B023", "E501", "E701", "E702", "E741"]
+"src/vllm_torchtpu/megakernel/kimi_k3/kernels/**" = [
+    "B023", "E501", "E701", "E702", "E741",
+]
 
 # Library code logs through vllm_torchtpu.logger. Tests, scripts and
 # command-line tools print to the terminal on purpose.
 "!src/**" = ["T20"]
 "src/vllm_torchtpu/tools/merge_xplane.py" = ["T20"]
+# Opt-in VMEM and pool reports (KernelConfig.vmem_report, a pool's report).
+"src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py" = ["T20"]
 
 [tool.ruff.format]
 docstring-code-format = true
+exclude = [
+    "src/vllm_torchtpu/megakernel/common/**",
+    "src/vllm_torchtpu/megakernel/kimi_k3/kernels/**",
+]
 
 [tool.pymarkdown]
 # The docs site (Python-Markdown) only nests a list indented by 4 spaces. MD007
@@ -274,6 +297,7 @@ ignore-missing-imports = [
     "google.protobuf", "google.protobuf.*",
     "jax", "jax.*",
     "jaxlib", "jaxlib.*",
+    "ml_dtypes", "ml_dtypes.*",
     "numpy", "numpy.*",
     "packaging", "packaging.*",
     "pathwaysutils", "pathwaysutils.*",
@@ -282,9 +306,11 @@ ignore-missing-imports = [
     "ray", "ray.*",
     "requests", "requests.*",
     "sympy", "sympy.*",
+    "tiktoken", "tiktoken.*",
     "torch", "torch.*",
     "torch_tpu", "torch_tpu.*",
     "runai_model_streamer", "runai_model_streamer.*",
+    "safetensors", "safetensors.*",
     "tpu_sync", "tpu_sync.*",
     "tqdm", "tqdm.*",
     "transformers", "transformers.*",
