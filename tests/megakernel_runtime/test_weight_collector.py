@@ -1182,6 +1182,119 @@ def test_load_vllm_weights_non_qwen_synth_hybrid_model() -> None:
         )
 
 
+def _bf16_experts_geom() -> tuple[qwen35.Qwen35Geometry, ExecSpec]:
+    g = qwen35.Qwen35Geometry(
+        L=4,
+        att_every=4,
+        H=256,
+        NH=4,
+        NKV=2,
+        HD=256,
+        ROT=64,
+        KH=2,
+        VH=4,
+        KD=128,
+        VD=128,
+        E=128,
+        TOPK=2,
+        I=256,
+        IS=256,
+        moe_tp=False,
+        e_slots=68,
+    )
+    ex = ExecSpec(
+        R=2,
+        B=4,
+        T=1,
+        ctx=256,
+        stack_e=False,
+        tiles=replace(TINY_TILES, bank=512 << 10),
+        interpret=True,
+        cache=CacheExec(paged_kv=True, num_pages=64, max_pages_per_seq=2),
+    )
+    return g, ex
+
+
+def _to_bf16_experts(experts: Any) -> None:
+    """Dequantize fp8 experts in place (as an unquantized checkpoint loads)."""
+    for w in ("w13_weight", "w2_weight"):
+        s = getattr(experts, f"{w}_scale").data.float()
+        deq = (getattr(experts, w).data.float() * s).to(torch.bfloat16)
+        setattr(experts, w, torch.nn.Parameter(deq, requires_grad=False))
+        delattr(experts, f"{w}_scale")
+
+
+def test_bf16_experts_load_without_scales() -> None:
+    """bf16 routed experts load with no scale (same packed weights as their fp8
+    source dequantized by the library); fp8 experts still require a scale."""
+    import dataclasses
+
+    class Bf16Experts(qwen35.Qwen35):
+        name = "test_bf16_experts"
+        moe = dataclasses.replace(
+            qwen35.Qwen35.moe,
+            options={
+                **qwen35.Qwen35.moe.options,
+                "weight_dtypes": {"e13": "bf16", "e2": "bf16"},
+            },
+        )
+        schedule = dataclasses.replace(qwen35.Qwen35.schedule, ffn=moe)
+
+    g, ex = _bf16_experts_geom()
+    torch.manual_seed(0)
+    backbone = make_synthetic_qwen35_backbone(g, ex)
+    ref = load_vllm_weights(Bf16Experts, backbone, ex, g=g, tp_rank=1)
+    for layer in backbone.layers:
+        _to_bf16_experts(layer.mlp.experts)
+    got = load_vllm_weights(Bf16Experts, backbone, ex, g=g, tp_rank=1)
+    assert len(got["w_flat"]) == len(ref["w_flat"])
+    for a, b in zip(got["w_flat"], ref["w_flat"], strict=True):
+        assert a.dtype == b.dtype and a.shape == b.shape
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+    # An fp8 expert weight without its scale is a clear error.
+    torch.manual_seed(0)
+    bb_fp8 = make_synthetic_qwen35_backbone(g, ex)
+    delattr(bb_fp8.layers[0].mlp.experts, "w13_weight_scale")
+    with pytest.raises(ValueError, match="w13_weight.* is missing its scale"):
+        load_vllm_weights(qwen35.Qwen35, bb_fp8, ex, g=g, tp_rank=1)
+
+
+def test_reshard_bf16_experts_ep_to_tp_without_scales() -> None:
+    g, ex_ep = _bf16_experts_geom()
+    g_tp = replace(g, moe_tp=True, e_slots=0)
+    torch.manual_seed(0)
+    fp8_mlp = make_synthetic_qwen35_backbone(g, ex_ep).layers[0].mlp
+    torch.manual_seed(0)
+    bf16_mlp = make_synthetic_qwen35_backbone(g, ex_ep).layers[0].mlp
+    _to_bf16_experts(bf16_mlp.experts)
+
+    def gather(t: torch.Tensor) -> torch.Tensor:
+        return torch.cat([t, t], dim=0)
+
+    kw = dict(tp_rank=1, g=g_tp, ex=ex_ep, all_gather_fn=gather)
+    reshard_layer_experts_ep_to_tp(fp8_mlp, **kw)
+    reshard_layer_experts_ep_to_tp(bf16_mlp, **kw)
+    ir = g.I // ex_ep.R
+    bf16_ex, fp8_ex = bf16_mlp.experts, fp8_mlp.experts
+    assert tuple(bf16_ex.w13_weight.shape) == (g.E, g.H, 2 * ir)
+    assert tuple(bf16_ex.w2_weight.shape) == (g.E, ir, g.H)
+    assert bf16_ex.w13_weight.dtype == torch.bfloat16
+    assert not hasattr(bf16_ex, "w13_weight_scale")
+    assert not hasattr(bf16_ex, "w2_weight_scale")
+    # Same slices as the fp8 path, dequantized.
+    for w, s in (("w13_weight", "w13_weight_scale"), ("w2_weight", "w2_weight_scale")):
+        sc = getattr(fp8_ex, s).data.float().reshape(g.E, 1, -1)
+        deq = (getattr(fp8_ex, w).data.float() * sc).to(torch.bfloat16)
+        assert torch.equal(getattr(bf16_ex, w).data, deq)
+
+    torch.manual_seed(0)
+    bad = make_synthetic_qwen35_backbone(g, ex_ep).layers[0].mlp
+    delattr(bad.experts, "w2_weight_scale")
+    with pytest.raises(ValueError, match="missing w2_weight_scale"):
+        reshard_layer_experts_ep_to_tp(bad, **kw)
+
+
 def test_bridge_and_weight_collector_have_no_vllm_imports() -> None:
     """Verify `exported_bridge` and `weight_collector` are framework-portable.
 

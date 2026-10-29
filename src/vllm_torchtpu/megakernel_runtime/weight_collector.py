@@ -387,16 +387,23 @@ class VLLMWeightSource:
                 w.is_contiguous(),
                 "expert weights must be contiguous for zero-copy views",
             )
-            s_raw = self._read_scale(layer, proj_obj, alias)
-            _need(s_raw is not None, f"Expert weight {alias.source!r} missing scale")
-            assert s_raw is not None
-            exp_e, exp_n = int(w.shape[0]), int(w.shape[-1])
-            _need(
-                s_raw.numel() == exp_e * exp_n,
-                f"Expert scale for {alias.source!r} has shape {tuple(s_raw.shape)} "
-                f"({s_raw.numel()} elems), expected ({exp_e}, {exp_n})",
-            )
-            s_buf = s_raw.float().reshape(exp_e, exp_n).contiguous()
+            # bf16 (unquantized) experts carry no scale; fp8 experts must.
+            if self._ops.is_fp8(w):
+                s_raw = self._read_scale(layer, proj_obj, alias)
+                _need(
+                    s_raw is not None,
+                    f"FP8 expert weight {alias.source!r} is missing its scale "
+                    "(weight_scale / weight_scale_inv)",
+                )
+                assert s_raw is not None
+                exp_e, exp_n = int(w.shape[0]), int(w.shape[-1])
+                _need(
+                    s_raw.numel() == exp_e * exp_n,
+                    f"Expert scale for {alias.source!r} has shape "
+                    f"{tuple(s_raw.shape)} ({s_raw.numel()} elems), "
+                    f"expected ({exp_e}, {exp_n})",
+                )
+                s_buf = s_raw.float().reshape(exp_e, exp_n).contiguous()
             w_buf = w
         elif len(target_decls) == 1 and len(d0.shape) == 1:
             w_buf = w.reshape(-1)
@@ -514,13 +521,14 @@ def load_vllm_weights(
 def reshard_experts_ep_to_tp_local(
     w13_all: torch.Tensor,
     w2_all: torch.Tensor,
-    s13_all: torch.Tensor,
-    s2_all: torch.Tensor,
+    s13_all: torch.Tensor | None,
+    s2_all: torch.Tensor | None,
     tp_rank: int,
     g: Any,
     ex: ExecSpec,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Slice global `E`-expert weights/scales into `tp_rank`'s TP-sharded tensors."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Slice global `E`-expert weights/scales into `tp_rank`'s TP-sharded tensors
+    (scales `None` for bf16 experts)."""
     ir = g.I // ex.R
     g0 = tp_rank * ir
     u0 = g.I + tp_rank * ir
@@ -529,6 +537,8 @@ def reshard_experts_ep_to_tp_local(
         torch.cat([w13_all[:, :, g0 : g0 + ir], w13_all[:, :, u0 : u0 + ir]], dim=-1)
     )
     w2_tp = _own(w2_all[:, g0 : g0 + ir, :])
+    if s13_all is None or s2_all is None:
+        return w13_tp, w2_tp, None, None
 
     s13_flat = s13_all.float().reshape(g.E, 2 * g.I)
     s2_flat = s2_all.float().reshape(g.E, g.H)
@@ -596,6 +606,13 @@ def apply_tp_moe_flags(experts: Any, *, prebuild_moe_fn: Any = None) -> None:
             )
 
 
+def _expert_scale_attr(experts: Any, weight: str) -> str:
+    for attr in (f"{weight}_scale_inv", f"{weight}_scale"):
+        if hasattr(experts, attr):
+            return attr
+    raise ValueError(f"FP8 experts are missing {weight}_scale (or _scale_inv)")
+
+
 def reshard_layer_experts_ep_to_tp(
     mlp: Any,
     tp_rank: int,
@@ -611,18 +628,19 @@ def reshard_layer_experts_ep_to_tp(
     w13_ep = experts.w13_weight.data[:er].contiguous()
     w2_ep = experts.w2_weight.data[:er].contiguous()
 
-    s13_attr = (
-        "w13_weight_scale_inv"
-        if hasattr(experts, "w13_weight_scale_inv")
-        else "w13_weight_scale"
+    # bf16 (unquantized) experts carry no scales; fp8 experts must.
+    fp8 = w13_ep.dtype == torch.float8_e4m3fn
+    _need(
+        fp8 == (w2_ep.dtype == torch.float8_e4m3fn),
+        f"w13/w2 expert dtypes differ ({w13_ep.dtype} vs {w2_ep.dtype})",
     )
-    s2_attr = (
-        "w2_weight_scale_inv"
-        if hasattr(experts, "w2_weight_scale_inv")
-        else "w2_weight_scale"
-    )
-    s13_ep = getattr(experts, s13_attr).data[:er].reshape(er, 2 * g.I).contiguous()
-    s2_ep = getattr(experts, s2_attr).data[:er].reshape(er, g.H).contiguous()
+    s13_attr = s2_attr = ""
+    s13_ep = s2_ep = None
+    if fp8:
+        s13_attr = _expert_scale_attr(experts, "w13_weight")
+        s2_attr = _expert_scale_attr(experts, "w2_weight")
+        s13_ep = getattr(experts, s13_attr).data[:er].reshape(er, 2 * g.I).contiguous()
+        s2_ep = getattr(experts, s2_attr).data[:er].reshape(er, g.H).contiguous()
 
     if all_gather_fn is None:
         _need(
@@ -634,8 +652,8 @@ def reshard_layer_experts_ep_to_tp(
     else:
         w13_all = all_gather_fn(w13_ep)
         w2_all = all_gather_fn(w2_ep)
-        s13_all = all_gather_fn(s13_ep)
-        s2_all = all_gather_fn(s2_ep)
+        s13_all = all_gather_fn(s13_ep) if fp8 else None
+        s2_all = all_gather_fn(s2_ep) if fp8 else None
 
     w13_tp, w2_tp, s13_tp, s2_tp = reshard_experts_ep_to_tp_local(
         w13_all, w2_all, s13_all, s2_all, tp_rank=tp_rank, g=g, ex=ex
@@ -645,23 +663,18 @@ def reshard_layer_experts_ep_to_tp(
 
     experts.w13_weight = torch.nn.Parameter(w13_tp, requires_grad=False)
     experts.w2_weight = torch.nn.Parameter(w2_tp, requires_grad=False)
-    s13_new_param = torch.nn.Parameter(s13_tp, requires_grad=False)
-    s2_new_param = torch.nn.Parameter(s2_tp, requires_grad=False)
-    setattr(experts, s13_attr, s13_new_param)
-    setattr(experts, s2_attr, s2_new_param)
+    synced = [experts.w13_weight, experts.w2_weight]
+    if s13_tp is not None and s2_tp is not None:
+        s13_new_param = torch.nn.Parameter(s13_tp, requires_grad=False)
+        s2_new_param = torch.nn.Parameter(s2_tp, requires_grad=False)
+        setattr(experts, s13_attr, s13_new_param)
+        setattr(experts, s2_attr, s2_new_param)
+        synced += [s13_new_param, s2_new_param]
 
     if w13_tp.device.type == "tpu":
         from torch_tpu._internal import sync
 
-        sync.synchronize(
-            tensors=[
-                experts.w13_weight,
-                experts.w2_weight,
-                s13_new_param,
-                s2_new_param,
-            ],
-            wait=True,
-        )
+        sync.synchronize(tensors=synced, wait=True)
 
     apply_tp_moe_flags(mlp.experts, prebuild_moe_fn=prebuild_moe_fn)
 
