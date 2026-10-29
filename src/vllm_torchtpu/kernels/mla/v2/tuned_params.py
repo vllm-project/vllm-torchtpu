@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from vllm_torchtpu.logger import init_logger
 
@@ -1345,9 +1345,71 @@ tuned_params_mapping: dict[TuningKey, TunableParams] = {
 }
 
 
+# Wildcard for the two metadata-padding fields. They size the scalar-prefetched
+# page table, not the tiles, so an entry keyed with ANY_SIZE serves every
+# max_num_seqs / pages_per_seq; an exact entry still takes precedence.
+ANY_SIZE = 0
+
+
+def _k3_tp32_fp8_page256_entries() -> dict[TuningKey, TunableParams]:
+    """Kimi-K3 at TP32 (3 local heads), FP8 KV in 256-token pages.
+
+    Measured on one v7x TensorCore with the serving call (BF16 Q, 8192-token
+    chunk, 128 x 322 page table): at 8K / 40K / 80K of context the mixed
+    kernel takes 2.07 / 5.94 / 11.08 ms per layer with (512, 4, 2) against
+    29.3 / 77.0 / 136.6 ms with the untuned default; batched decode of 16 x
+    80K-token sequences takes 1.53 ms with (32 pages, batch 4) against 1.86.
+    """
+    entries: dict[TuningKey, TunableParams] = {}
+    for tokens in (1024, 2048, 4096, 8192, 16384):
+        key = TuningKey(
+            case="mixed",
+            max_num_tokens=tokens,
+            actual_num_q_heads=3,
+            actual_lkv_dim=512,
+            actual_r_dim=64,
+            q_dtype="bfloat16",
+            page_size_per_kv_packing=64,
+            kv_packing=4,
+            max_num_seqs=ANY_SIZE,
+            pages_per_seq=ANY_SIZE,
+        )
+        entries[key] = TunableParams(
+            num_kv_pages_per_block=4,
+            num_queries_per_block=512,
+            q_split=2,
+            vmem_limit_bytes=62914560,
+        )
+    # The decode key carries the call's head count and nope dim but the
+    # dataclass defaults for the cache geometry (attention_interface.py).
+    for tokens in [2**i for i in range(15)]:
+        key = TuningKey(
+            case="batched_decode",
+            max_num_tokens=tokens,
+            actual_num_q_heads=3,
+            actual_lkv_dim=128,
+            actual_r_dim=64,
+            max_num_seqs=ANY_SIZE,
+            pages_per_seq=ANY_SIZE,
+        )
+        entries[key] = TunableParams(
+            decode_batch_size=4,
+            num_kv_pages_per_block=32,
+            num_queries_per_block=1,
+            vmem_limit_bytes=62914560,
+        )
+    return entries
+
+
+tuned_params_mapping.update(_k3_tp32_fp8_page256_entries())
+
+
 def get_tuned_params(tuning_key: TuningKey) -> TunableParams:
     if tuning_key in tuned_params_mapping:
         return tuned_params_mapping[tuning_key]
+    any_size_key = replace(tuning_key, max_num_seqs=ANY_SIZE, pages_per_seq=ANY_SIZE)
+    if any_size_key in tuned_params_mapping:
+        return tuned_params_mapping[any_size_key]
     else:
         logger.warning(
             "No tuned parameters found for the given tuning key: %s, "
