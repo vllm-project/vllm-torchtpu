@@ -289,6 +289,8 @@ class ServerStepWorker:
         assert group.world_size == 8
         assert not hasattr(self, "_sync_capture")
         scenario = DECODE_SCENARIO
+        ranks_per_chip = scenario.dp_size // scenario.physical_chips
+        profile_rank = rank - rank % ranks_per_chip
         original = runner._dp_coordinated_step
         state = {
             "rank": rank,
@@ -297,7 +299,9 @@ class ServerStepWorker:
             "active": False,
             "completed": False,
             "rows": [],
-            "profile_rank": rank,
+            "profile_rank": profile_rank,
+            "capture_index": 0,
+            "captures": [],
         }
         self._sync_capture = state
         root = Path(output_dir) / "synchronized-profile"
@@ -308,6 +312,7 @@ class ServerStepWorker:
             if state["completed"]:
                 return result
             state["ticks"] += 1
+            profile_rank = rank - rank % ranks_per_chip + state["capture_index"]
             tokens = int(args[0] if args else kwargs["num_tokens"])
             n = runner.input_batch.num_reqs
             contexts = [int(v) for v in runner.input_batch.num_computed_tokens_cpu[:n]]
@@ -327,11 +332,30 @@ class ServerStepWorker:
                 synchronize_device()
                 dist.barrier(group=group.cpu_group)
                 state["stop_boundary_ns"] = time.time_ns()
-                self.profile(is_start=False)
+                if rank == profile_rank:
+                    self.profile(is_start=False)
                 # No rank may dispatch subsequent compute during trace export.
                 dist.barrier(group=group.cpu_group)
                 state["export_done_ns"] = time.time_ns()
                 state["active"] = False
+                state["captures"].append(
+                    {
+                        key: state[key]
+                        for key in (
+                            "profile_rank",
+                            "rows",
+                            "captured_steps",
+                            "start_boundary_ns",
+                            "stop_boundary_ns",
+                            "export_done_ns",
+                        )
+                    }
+                )
+                state["capture_index"] += 1
+                if state["capture_index"] < ranks_per_chip:
+                    state["captured_steps"] = 0
+                    state["rows"] = []
+                    return result
                 state["completed"] = True
                 runner._dp_coordinated_step = original
                 (root / f"rank-{rank}-capture.json").write_text(
@@ -352,15 +376,20 @@ class ServerStepWorker:
                 assert len({r["tick"] for r in gathered}) == 1, gathered
                 synchronize_device()
                 dist.barrier(group=group.cpu_group)
-                self.profile(
-                    is_start=True,
-                    profile_prefix="steady-decode",
-                    profiler_kwargs={
-                        "host_tracer_level": 1,
-                        "python_tracer_level": 0,
-                        "device_tracer_level": 1,
-                    },
-                )
+                # A collector can see both device timelines but only resolve
+                # its worker's compiled HLO. Alternate owners in two windows
+                # so each device has a profile with its own symbol metadata.
+                state["profile_rank"] = profile_rank
+                if rank == profile_rank:
+                    self.profile(
+                        is_start=True,
+                        profile_prefix="steady-decode",
+                        profiler_kwargs={
+                            "host_tracer_level": 1,
+                            "python_tracer_level": 0,
+                            "device_tracer_level": 1,
+                        },
+                    )
                 dist.barrier(group=group.cpu_group)
                 state["start_boundary_ns"] = time.time_ns()
                 state["start_ranks"] = gathered
@@ -376,6 +405,9 @@ class ServerStepWorker:
     def synchronized_profile_check(self):
         state = self._sync_capture
         assert state["completed"] and state["captured_steps"] == 6, state
+        assert len(state["captures"]) == (
+            DECODE_SCENARIO.dp_size // DECODE_SCENARIO.physical_chips
+        ), state
         return _gather_dp(state)
 
     def benchmark_begin(self, scenario: str) -> list[dict]:

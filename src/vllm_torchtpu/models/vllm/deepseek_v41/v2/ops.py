@@ -114,7 +114,10 @@ def rotary(x, positions, config, *, compressed, inverse=False):
     return torch.cat((x[..., :-dim], rotated.to(x.dtype)), -1)
 
 
-def round_fp8_activation(x, block_size=32):
+def quantize_fp8_activation(
+    x: torch.Tensor, block_size: int = 32
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return FP8 values and power-of-two FP32 scales per block."""
     if x.shape[-1] % block_size:
         raise ValueError("FP8 block size must divide contraction dimension")
     blocks = x.float().unflatten(-1, (-1, block_size))
@@ -122,6 +125,12 @@ def round_fp8_activation(x, block_size=32):
         2.0, torch.ceil(torch.log2(blocks.abs().amax(-1).clamp_min(1e-4) / 448))
     )
     values = (blocks / scales.unsqueeze(-1)).clamp(-448, 448).to(torch.float8_e4m3fn)
+    return values.flatten(-2), scales
+
+
+def round_fp8_activation(x, block_size=32):
+    values, scales = quantize_fp8_activation(x, block_size)
+    values = values.unflatten(-1, (-1, block_size))
     return (values.float() * scales.unsqueeze(-1)).flatten(-2).to(x.dtype)
 
 

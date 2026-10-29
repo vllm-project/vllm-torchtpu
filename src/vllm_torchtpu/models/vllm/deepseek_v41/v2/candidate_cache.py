@@ -13,7 +13,7 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
     candidate,
     tuned_block_sizes,
 )
-from vllm_torchtpu.kernels.deepseek_v41.index_selection.gather import (
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.gather_index_keys import (
     gather_packed_candidate_keys,
     is_supported_by_gather_packed_candidate_keys,
 )
@@ -146,7 +146,7 @@ def select_candidate_cache_jax(
     page_records: int,
     request_tile: int | None,
 ) -> jax.Array:
-    from .attention_kernels import paged_indexer_jax
+    from .indexer_impl import paged_indexer_jax
 
     groups = records.shape[0]
     queries = candidate.request_query_count(q.shape[0], groups)

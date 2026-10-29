@@ -13,7 +13,7 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.streaming_topk import (
 
 
 @pytest.mark.parametrize("block,threshold", [(8192, 8192), (16384, 32768)])
-@pytest.mark.parametrize("width", [65536, 65408])
+@pytest.mark.parametrize("width", [32768, 49408, 98816, 65536, 65408])
 @pytest.mark.parametrize(
     "distribution",
     [
@@ -23,6 +23,7 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.streaming_topk import (
         "equal",
         "cross_block_ties",
         "signed_zero",
+        "subnormal",
         "masked",
     ],
 )
@@ -44,6 +45,12 @@ def test_streaming_topk_contract(block, threshold, width, distribution):
     elif distribution == "signed_zero":
         scores[:] = 0
         scores[:, ::2] = np.float32(-0.0)
+    elif distribution == "subnormal":
+        patterns = np.array(
+            [0, 1, 0x80000000, 0x80000001, 0x007FFFFF, 0x807FFFFF, 0x10000, 0x80010000],
+            np.uint32,
+        )
+        scores[:] = np.resize(patterns, width).view(np.float32)
     elif distribution == "masked":
         scores[:, ::3] = -np.inf
         scores[:4] = -np.inf

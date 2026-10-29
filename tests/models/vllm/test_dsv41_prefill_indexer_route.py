@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels as ak
+from vllm_torchtpu.models.vllm.deepseek_v41.v2 import indexer_impl as indexer_ops
 
 
 @pytest.mark.cpu_test
@@ -78,16 +78,16 @@ def test_prefill_route_excludes_decode_and_mixed(
     def select(scores, lengths):
         return jnp.where(lengths[:, None] > 0, scores[:, :512].astype(jnp.int32), -1)
 
-    monkeypatch.setattr(ak, "paged_index_scores_jax", old_score)
-    monkeypatch.setattr(ak, "_prefill_score", new_score)
-    monkeypatch.setattr(ak, "_prefill_top_k", lambda s, n, **kw: select(s, n))
+    monkeypatch.setattr(indexer_ops, "paged_index_scores_jax", old_score)
+    monkeypatch.setattr(indexer_ops, "_prefill_score", new_score)
+    monkeypatch.setattr(indexer_ops, "_prefill_top_k", lambda s, n, **kw: select(s, n))
     monkeypatch.setattr(
-        ak,
+        indexer_ops,
         "select_indices_jax",
         lambda s, n, c, *args: (select(s, n), c),
     )
     with jax.disable_jit():
-        selected, published = ak.paged_indexer_jax(
+        selected, published = indexer_ops.paged_indexer_jax(
             q,
             pool,
             records,
@@ -116,13 +116,13 @@ def test_short_prefill_returns_all_valid_indices(monkeypatch, length):
     def unexpected(*args, **kwargs):
         raise AssertionError("All visible keys fit: no scoring or TopK required")
 
-    monkeypatch.setattr(ak, "_prefill_score", unexpected)
-    monkeypatch.setattr(ak, "paged_index_scores_jax", unexpected)
+    monkeypatch.setattr(indexer_ops, "_prefill_score", unexpected)
+    monkeypatch.setattr(indexer_ops, "paged_index_scores_jax", unexpected)
     records = jnp.arange(2048, dtype=jnp.int32)[None]
     records = records.at[0, 128:256].set(-1)
     lengths = jnp.full((2048,), length, jnp.int32).at[-4:].set(0)
     with jax.disable_jit():
-        selected, _ = ak.paged_indexer_jax(
+        selected, _ = indexer_ops.paged_indexer_jax(
             jnp.zeros((2048, 32, 128), jnp.bfloat16),
             jnp.zeros((128, 128), jnp.int32),
             records,
