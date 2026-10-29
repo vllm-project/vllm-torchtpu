@@ -412,6 +412,16 @@ class Qwen4ExpDecoderLayer(nn.Module):
         )
 
         router_logits, _ = mlp.gate(block)
+        if envs.VLLM_TPU_MOE_EXPERT_HIST > 0:
+            from vllm_torchtpu.layers.adapter import moe_routing
+
+            # This rank's SP shard of the rows; softmax keeps the top-k order.
+            moe_routing.count_expert_hist(
+                routed,
+                "expert_hist_sp",
+                router_logits.float().topk(routed.moe_config.experts_per_token, dim=-1)[1],
+                router_logits,
+            )
         w1_scale, w2_scale = adaptive_moe.runtime_channel_scales(
             routed, routed.w13_weight_scale_inv, routed.w2_weight_scale_inv
         )
