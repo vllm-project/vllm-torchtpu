@@ -257,17 +257,21 @@ def _stage3_trim_window_pages(
     allocator freed the pages that fell behind the window and pointed them at
     the null block. Those entries get dropped here.
     """
-    ids = [int(block_id) for block_id in block_ids]
     skipped = min(
         _stage3_skipped_window_pages(
             num_tokens=num_tokens, page_tokens=page_tokens, window_tokens=window_tokens
         ),
-        len(ids),
+        len(block_ids),
     )
     if not skipped:
-        return ids
-    dropped, kept = ids[:skipped], ids[skipped:]
-    if any(block_id != _STAGE3_NULL_BLOCK_ID for block_id in dropped):
+        return list(map(int, block_ids))
+    # A long sliding-window request drops ~10^4 pages in each of ~50 groups,
+    # on every producer send and consumer load: check the dropped prefix with
+    # list.count and convert only the kept pages.
+    dropped = list(block_ids[:skipped])
+    kept = list(map(int, block_ids[skipped:]))
+    if dropped.count(_STAGE3_NULL_BLOCK_ID) != len(dropped):
+        ids = list(map(int, block_ids))
         raise ValueError(
             "Stage-3 sliding-window trim dropped pages that are not the null "
             f"block: group={group_label}, dropped={dropped}, ids={ids}, "
@@ -278,7 +282,8 @@ def _stage3_trim_window_pages(
     if len(set(kept)) != len(kept):
         raise ValueError(
             "Stage-3 sliding-window block table still repeats a page after "
-            f"trimming: group={group_label}, kept={kept}, ids={ids}, "
+            f"trimming: group={group_label}, kept={kept}, "
+            f"ids={list(map(int, block_ids))}, "
             f"skipped={skipped}, "
             f"num_tokens={num_tokens}, page_tokens={page_tokens}, "
             f"window={window_tokens}"
@@ -525,6 +530,66 @@ class _Stage3RegisteredSend:
     local_block_ids: tuple[int, ...]
     num_tokens: int
     expiration_time: float
+
+
+def _stage3_profiled(label: str, fn: Any, *args: Any, **kwargs: Any) -> Any:
+    """Runs fn under cProfile when TPU_STAGE3_PROFILE=1 (diagnostics only)."""
+    if os.environ.get("TPU_STAGE3_PROFILE") != "1":
+        return fn(*args, **kwargs)
+    import cProfile
+    import io
+    import pstats
+
+    prof = cProfile.Profile()
+    result = prof.runcall(fn, *args, **kwargs)
+    out = io.StringIO()
+    pstats.Stats(prof, stream=out).sort_stats("tottime").print_stats(12)
+    logger.info("Stage-3 profile %s:\n%s", label, out.getvalue())
+    return result
+
+
+def _register_request_blocks_prelowered(
+    facade: Any,
+    *,
+    req_id: str,
+    uuid: int,
+    unit: Any,
+    block_ids: list[int],
+    pool_spans: Sequence[Any],
+) -> None:
+    """facade.register_request_blocks, handing the C++ ReshardClient the
+    registrations' pre-built wire tuples (DSv4 spans: ~10^5 per long request,
+    whose per-field conversion in the Python wrapper took ~70 ms)."""
+    impl = getattr(facade, "_impl", None)
+    if impl is None or not pool_spans or any(
+        getattr(entry, "wire_spans", None) is None for entry in pool_spans
+    ):
+        facade.register_request_blocks(
+            req_id=req_id,
+            uuid=uuid,
+            unit=unit,
+            block_ids=block_ids,
+            pool_spans=pool_spans,
+        )
+        return
+    from tpu_sync.api.torch import reshard_client as _reshard_client
+
+    impl.register_request_blocks(
+        str(req_id),
+        int(uuid),
+        _reshard_client._unit_tuple(unit),
+        [int(b) for b in block_ids],
+        [
+            {
+                "tag": str(entry.tag),
+                "block_ids": list(entry.block_ids),
+                "declared_bytes": int(entry.declared_bytes),
+                "dst_space_version": int(entry.dst_space_version),
+                "spans": list(entry.wire_spans),
+            }
+            for entry in pool_spans
+        ],
+    )
 
 
 def _get_extra_config(vllm_config: VllmConfig) -> dict[str, Any]:
@@ -3980,10 +4045,19 @@ class TPURaidenConnectorWorker:
                 # materialize the model's typed KV views and wait before
                 # handing them to the external transfer engine. Admission's
                 # raw storage buffers alone do not express those writes.
+                t_sync = time.perf_counter()
                 synchronize_tensors(self._flattened_kv_cache_tensors(), wait=True)
+                self._stage3_last_sync_ms = (time.perf_counter() - t_sync) * 1000
             if self._raiden_stage3_enabled():
                 if _use_raiden_dsv4_admission():
-                    self._register_stage3_request_blocks_dsv4(metadata)
+                    if metadata.reqs_to_send:
+                        _stage3_profiled(
+                            "producer register",
+                            self._register_stage3_request_blocks_dsv4,
+                            metadata,
+                        )
+                    else:
+                        self._register_stage3_request_blocks_dsv4(metadata)
                 elif _use_raiden_glm_admission() or _uses_tp_stage3_source(
                     self.vllm_config
                 ):
@@ -4824,6 +4898,7 @@ class TPURaidenConnectorWorker:
                 raise ValueError(
                     "Stage-3 producer send metadata requires a positive expiration_time"
                 )
+            t_lower = time.perf_counter()
             group_blocks = self._stage3_dsv4_group_blocks(req_meta, num_tokens)
             if self._stage3_dsv4_debug_enabled() and req_id not in self._stage3_registered_sends:
                 logger.info(
@@ -4886,8 +4961,10 @@ class TPURaidenConnectorWorker:
                         f"for req_id={req_id}"
                     )
                 continue
+            t_rpc = time.perf_counter()
             try:
-                facade.register_request_blocks(
+                _register_request_blocks_prelowered(
+                    facade,
                     req_id=req_id,
                     uuid=uuid,
                     unit=self._raiden_work_unit,
@@ -4928,6 +5005,9 @@ class TPURaidenConnectorWorker:
                 json.dumps(
                     {
                         "event": "raiden_stage3_dsv4_request_blocks_registered",
+                        "sync_ms": round(getattr(self, "_stage3_last_sync_ms", 0.0), 1),
+                        "lower_ms": round((t_rpc - t_lower) * 1000, 1),
+                        "rpc_ms": round((time.perf_counter() - t_rpc) * 1000, 1),
                         "req_id": req_id,
                         "uuid": uuid,
                         "num_tokens": num_tokens,
@@ -5840,10 +5920,15 @@ class TPURaidenConnectorWorker:
         """
         task = pending.task
         if task is None:
-            task = self._stage_stage3_submit_task(pending, synchronous)
+            t_stage = time.perf_counter()
+            task = _stage3_profiled(
+                "consumer stage", self._stage_stage3_submit_task, pending, synchronous
+            )
             if task is None:
                 return
             pending.task = task
+            pending.stage_ms = (time.perf_counter() - t_stage) * 1000
+        pending.dispatched_at = time.perf_counter()
         if self._stage3_sharded_consumer():
             self._stage3_tp_submits.add(pending.destination_req_id)
             if self.tp_rank != 0:
@@ -6052,6 +6137,13 @@ class TPURaidenConnectorWorker:
                     "state_group_count": self._stage3_state_group_count,
                     "destination_pages": len(pending.local_blocks),
                     "controller_submit_ms": outcome.submit_ms,
+                    "stage_ms": round(getattr(pending, "stage_ms", 0.0), 1),
+                    "queued_ms": round(
+                        (outcome.attempted_at - getattr(pending, "dispatched_at", outcome.attempted_at)) * 1000, 1
+                    ),
+                    "apply_delay_ms": round(
+                        (time.perf_counter() - outcome.attempted_at) * 1000 - outcome.submit_ms, 1
+                    ),
                 },
                 sort_keys=True,
             ),
