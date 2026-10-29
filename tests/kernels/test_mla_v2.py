@@ -567,3 +567,117 @@ def test_return_lse_on_other_kernel_paths(kwargs, distribution) -> None:
     np.testing.assert_array_equal(np.asarray(out_lse), np.asarray(out))
     np.testing.assert_array_equal(np.asarray(updated_lse), np.asarray(updated))
     np.testing.assert_allclose(np.asarray(lse), reference, atol=1e-4, rtol=0)
+
+
+@pytest.mark.parametrize(
+    ("q_lens", "kv_lens", "distribution", "decode_batch_size", "chunk_prefill_size"),
+    [
+        ([1], [9], [1, 1, 1], 1, None),
+        ([4], [389], [0, 0, 1], 1, None),
+        ([1] * 5, [9, 127, 128, 257, 389], [5, 5, 5], 4, None),
+        ([4, 4], [129, 389], [0, 2, 2], 1, 4),
+        (
+            [1, 1, 1, 1, 1, 4, 4, 3, 19],
+            [9, 127, 128, 257, 389, 129, 389, 257, 389],
+            [5, 7, 9],
+            4,
+            4,
+        ),
+    ],
+    ids=["short_decode", "long_prefill", "batched_decode", "prefills", "mixed_batch"],
+)
+@pytest.mark.parametrize("num_kv_pages_per_block", [1, 2])
+@pytest.mark.parametrize("transpose", [False, True])
+@pytest.mark.parametrize("cache_dtype", [jnp.bfloat16, jnp.float8_e4m3fn])
+def test_shared_cache_reads_current_tokens_without_inserting(
+    q_lens,
+    kv_lens,
+    distribution,
+    decode_batch_size,
+    chunk_prefill_size,
+    num_kv_pages_per_block,
+    transpose,
+    cache_dtype,
+):
+    """A reader must use the owner's full cache, including this step's tokens."""
+    if jax.devices()[0].platform != "tpu":
+        pytest.skip("MLA Pallas kernel requires TPU")
+    rng = np.random.default_rng(47)
+    heads, latent_dim, rope_dim, page_size = 4, 128, 128, 128
+    num_seqs = len(q_lens)
+    tokens = sum(q_lens)
+    pages_per_seq = (max(kv_lens) + page_size - 1) // page_size
+    total_pages = num_seqs * pages_per_seq
+    cu_q_lens = np.concatenate([[0], np.cumsum(q_lens)]).astype(np.int32)
+    packing = 4 if cache_dtype == jnp.float8_e4m3fn else 2
+    q = rng.normal(0, 0.1, (heads, tokens, latent_dim)).astype(np.float32)
+    qr = rng.normal(0, 0.1, (tokens, heads, rope_dim)).astype(np.float32)
+    source = rng.normal(
+        0, 0.2, (num_seqs, pages_per_seq * page_size, latent_dim + rope_dim)
+    )
+    # Distinct sequence/page means expose addressing errors in long contexts.
+    source += 0.5 * np.arange(num_seqs)[:, None, None]
+    source += 0.25 * (np.arange(pages_per_seq * page_size) // page_size)[None, :, None]
+    source = np.asarray(jnp.asarray(source, cache_dtype))
+    page_indices = rng.permutation(total_pages).astype(np.int32)
+    physical_pages = np.empty_like(
+        source.reshape(total_pages, page_size, latent_dim + rope_dim)
+    )
+    physical_pages[page_indices] = source.reshape(physical_pages.shape)
+    cached = (
+        physical_pages.transpose(0, 2, 1)
+        if transpose
+        else physical_pages.reshape(total_pages, page_size // packing, packing, -1)
+    )
+    snapshot = cached.copy()
+    scale = (latent_dim + rope_dim) ** -0.5
+    output, new_cache = mla_ragged_paged_attention(
+        jnp.asarray(q, jnp.bfloat16),
+        jnp.asarray(qr, jnp.bfloat16),
+        jnp.full((tokens, latent_dim), 9, cache_dtype),
+        jnp.full((tokens, rope_dim), 11, cache_dtype),
+        jnp.asarray(cached),
+        jnp.asarray(kv_lens, jnp.int32),
+        jnp.asarray(page_indices),
+        jnp.asarray(cu_q_lens),
+        jnp.asarray(distribution, jnp.int32),
+        num_kv_pages_per_block=num_kv_pages_per_block,
+        num_queries_per_block=(1, 16, 16),
+        decode_batch_size=decode_batch_size,
+        transpose_kv_cache=transpose,
+        chunk_prefill_size=chunk_prefill_size,
+        skip_kv_update=True,
+        sm_scale=scale,
+        k_scale=1.5,
+        v_scale=1.5,
+    )
+    output.block_until_ready()
+    # Build the reference from exactly the BF16 queries and rounded cached KV.
+    query = np.concatenate(
+        (
+            np.asarray(jnp.asarray(q, jnp.bfloat16), np.float32).transpose(1, 0, 2),
+            np.asarray(jnp.asarray(qr, jnp.bfloat16), np.float32),
+        ),
+        -1,
+    )
+    expected = []
+    for seq_idx, (q_len, kv_len) in enumerate(zip(q_lens, kv_lens)):
+        start, end = cu_q_lens[seq_idx : seq_idx + 2]
+        kv = np.asarray(source[seq_idx, :kv_len], np.float32) * 1.5
+        logits = np.einsum("thd,sd->ths", query[start:end], kv) * scale
+        mask = (
+            np.arange(kv_len)[None, :] <= (kv_len - q_len + np.arange(q_len))[:, None]
+        )
+        logits = np.where(mask[:, None, :], logits, -np.inf)
+        probs = np.exp(logits - logits.max(-1, keepdims=True))
+        probs /= probs.sum(-1, keepdims=True)
+        expected.append(
+            np.einsum("ths,sd->thd", probs, kv[:, :latent_dim]).transpose(1, 0, 2)
+        )
+    np.testing.assert_allclose(
+        np.asarray(output, np.float32),
+        np.concatenate(expected, axis=1),
+        atol=0.01,
+        rtol=0.03,
+    )
+    np.testing.assert_array_equal(np.asarray(new_cache), snapshot)

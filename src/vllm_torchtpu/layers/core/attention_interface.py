@@ -691,6 +691,7 @@ def mla_attention(
     sm_scale: float | None = None,
     use_causal_mask: bool = True,
     return_lse: bool = False,
+    skip_kv_update: bool = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Main shared interface for Multi-Head Latent Attention (MLA).
 
@@ -716,6 +717,8 @@ def mla_attention(
         k_scale: Optional scalar parameter quantization scale for latent keys.
         v_scale: Optional scalar parameter quantization scale for latent values.
         sm_scale: Softmax temperature scale factor.
+        skip_kv_update: Read all keys from an earlier layer's cache without
+            inserting this layer's KV inputs.
         return_lse: Also return each (token, head)'s log-sum-exp of the scaled
             scores, f32 `(T, N)`, with which this output can be merged with the
             output of the same queries over a disjoint set of keys (context
@@ -828,6 +831,7 @@ def mla_attention(
             v_scale=v_scale,
             use_causal_mask=use_causal_mask,
             return_lse=return_lse,
+            skip_kv_update=skip_kv_update,
         )
         out, new_cache = results[0], results[1]
 
@@ -882,11 +886,13 @@ def sparse_mla_attention(
     sm_scale: float | None = None,
     k_scale: float | None = None,
     *,
+    skip_kv_update: bool = False,
     allow_masked_dense: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Sharded wrapper for the GLM-5.2 sparse (DSA) MLA Pallas kernel.
 
     Args:
+      skip_kv_update: Read the source layer's caches without inserting new KV.
       ql_nope: Query nope latents (`[num_tokens, num_heads, lkv_dim]`).
       q_pe: Decoupled RoPE query components (`[num_tokens, num_heads, rope_dim]`).
       kv_c_normed: This step's compressed KV latents (`[num_tokens, lkv_dim]`).
@@ -981,17 +987,18 @@ def sparse_mla_attention(
         query_start_loc_,
         request_distribution_,
     ):
-        kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache(
-            kv_cache_nope,
-            kv_cache_rope,
-            kv_c_normed,
-            k_pe,
-            seq_lens_,
-            block_tables_,
-            query_start_loc_,
-            nope_spec=nope_spec,
-            rope_spec=rope_spec,
-        )
+        if not skip_kv_update:
+            kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache(
+                kv_cache_nope,
+                kv_cache_rope,
+                kv_c_normed,
+                k_pe,
+                seq_lens_,
+                block_tables_,
+                query_start_loc_,
+                nope_spec=nope_spec,
+                rope_spec=rope_spec,
+            )
 
         # Opt-in masked-dense routing builds Q inside each device branch.
         if allow_masked_dense and mla_dispatch.applies(
@@ -1075,6 +1082,7 @@ def sparse_mla_attention_dcp(
     sm_scale: float | None = None,
     k_scale: float | None = None,
     *,
+    skip_kv_update: bool = False,
     dcp_size: int,
     interleave_size: int,
     dcp_axis_name: str = streamindex_topk.DCP_AXIS_NAME,
@@ -1082,6 +1090,7 @@ def sparse_mla_attention_dcp(
     """Sparse MLA attention over a DCP position-sharded latent cache.
 
     Args:
+      skip_kv_update: Read the source layer's caches without inserting new KV.
       ql_nope, q_pe: replicated queries, `[num_tokens, num_heads, *]`.
       kv_c_normed, k_pe: this step's latents, replicated and identical on every
         rank; the write mask, not the data, is what differs per rank.
@@ -1180,20 +1189,21 @@ def sparse_mla_attention_dcp(
         request_distribution_,
     ):
         dcp_rank = streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size)
-        kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache_dcp(
-            kv_cache_nope,
-            kv_cache_rope,
-            kv_c_normed,
-            k_pe,
-            seq_lens_,
-            block_tables_,
-            query_start_loc_,
-            dcp_rank,
-            nope_spec=nope_spec,
-            rope_spec=rope_spec,
-            dcp_size=dcp_size,
-            interleave_size=interleave_size,
-        )
+        if not skip_kv_update:
+            kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache_dcp(
+                kv_cache_nope,
+                kv_cache_rope,
+                kv_c_normed,
+                k_pe,
+                seq_lens_,
+                block_tables_,
+                query_start_loc_,
+                dcp_rank,
+                nope_spec=nope_spec,
+                rope_spec=rope_spec,
+                dcp_size=dcp_size,
+                interleave_size=interleave_size,
+            )
 
         # A rank owning none of a token's top-k still has to be handed one
         # valid entry: the kernel derives `kv_len` from the `-1` tail and

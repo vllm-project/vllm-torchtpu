@@ -91,6 +91,9 @@ from vllm_torchtpu.utils import synchronize_tensors
 
 if TYPE_CHECKING:
     from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        VllmTPUMLAAttention,
+    )
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
     class _TpuKVCacheBackend(Protocol):
@@ -255,28 +258,39 @@ class KVCacheManager:
                 spec = attn_module.get_kv_cache_spec(self.runner.vllm_config)
                 if spec is not None:
                     kv_cache_spec[layer_name] = spec
-            # Classic Attention path
-            elif isinstance(attn_module, Attention):
-                if (
-                    kv_tgt_layer := attn_module.kv_sharing_target_layer_name
-                ) is not None:
-                    if kv_tgt_layer not in layers:
-                        raise ValueError(
-                            f"Layer {layer_name} reuses KV cache from missing "
-                            f"target layer {kv_tgt_layer}."
-                        )
-                    target_module = layers[kv_tgt_layer]
-                    if not isinstance(target_module, Attention):
-                        raise ValueError(
-                            f"Layer {layer_name} reuses KV cache from "
-                            f"non-attention target layer {kv_tgt_layer}."
-                        )
-                    if target_module.kv_sharing_target_layer_name is not None:
-                        raise ValueError(
-                            f"Layer {layer_name} reuses KV cache from "
-                            f"{kv_tgt_layer}, which is itself a shared KV "
-                            "layer."
-                        )
+            elif isinstance(attn_module, (Attention, MLAAttention)) and (
+                attn_module.kv_sharing_target_layer_name is not None
+            ):
+                kv_tgt_layer = attn_module.kv_sharing_target_layer_name
+                if kv_tgt_layer not in layers:
+                    raise ValueError(
+                        f"Layer {layer_name} reuses KV cache from missing "
+                        f"target layer {kv_tgt_layer}."
+                    )
+                target_module = layers[kv_tgt_layer]
+                if not (
+                    isinstance(attn_module, Attention)
+                    and isinstance(target_module, Attention)
+                    or isinstance(attn_module, MLAAttention)
+                    and isinstance(target_module, MLAAttention)
+                ):
+                    raise ValueError(
+                        f"Layer {layer_name} reuses KV cache from "
+                        f"incompatible attention target layer {kv_tgt_layer}."
+                    )
+                if target_module.kv_sharing_target_layer_name is not None:
+                    raise ValueError(
+                        f"Layer {layer_name} reuses KV cache from "
+                        f"{kv_tgt_layer}, which is itself a shared KV "
+                        "layer."
+                    )
+                if isinstance(attn_module, MLAAttention):
+                    assert isinstance(target_module, MLAAttention)
+                    self._validate_shared_mla_cache_layout(
+                        layer_name, attn_module, kv_tgt_layer, target_module
+                    )
+                else:
+                    assert isinstance(target_module, Attention)
                     self._validate_shared_kv_cache_layout(
                         layer_name,
                         attn_module,
@@ -284,16 +298,11 @@ class KVCacheManager:
                         target_module,
                         hma_enabled,
                     )
-                    # The layer doesn't need its own KV cache and will use that of
-                    # the target layer. We skip creating a KVCacheSpec for it, so
-                    # that KV cache management logic will act as this layer does
-                    # not exist, and doesn't allocate KV cache for the layer. This
-                    # enables the memory saving of cross-layer kv sharing, allowing
-                    # a given amount of memory to accommodate longer context lengths
-                    # or enable more requests to be processed simultaneously.
-                    self.runner.shared_kv_cache_layers[layer_name] = kv_tgt_layer
-                    continue
+                self.runner.shared_kv_cache_layers[layer_name] = kv_tgt_layer
+                continue
 
+            # Classic Attention path
+            elif isinstance(attn_module, Attention):
                 if attn_module.attn_type == AttentionType.DECODER:
                     if isinstance(attn_module, ChunkedLocalAttention):
                         logger.warning_once(
@@ -556,6 +565,40 @@ class KVCacheManager:
                     "and matching k/v scales."
                 )
 
+    @staticmethod
+    def _validate_shared_mla_cache_layout(
+        layer_name: str,
+        attn_module: MLAAttention,
+        target_layer_name: str,
+        target_module: MLAAttention,
+    ) -> None:
+        # Query dimensions and KV-B projections may differ: only the compressed
+        # latent/rotary storage and its dequantization must match.
+        fields = (
+            "kv_lora_rank",
+            "qk_rope_head_dim",
+            "head_size",
+            "use_sparse",
+            "kv_cache_dtype",
+        )
+        mismatches = [
+            field
+            for field in fields
+            if getattr(attn_module, field) != getattr(target_module, field)
+        ]
+        if (
+            attn_module.kv_cache_dtype != "auto"
+            or target_module.kv_cache_dtype != "auto"
+        ):
+            for field in ("_k_scale_float", "_v_scale_float"):
+                if getattr(attn_module, field) != getattr(target_module, field):
+                    mismatches.append(field)
+        if mismatches:
+            raise ValueError(
+                f"Layer {layer_name} cannot reuse MLA KV cache from "
+                f"{target_layer_name}: incompatible {', '.join(mismatches)}."
+            )
+
     def _maybe_add_kv_sharing_layers_to_kv_cache_groups(
         self, kv_cache_config: KVCacheConfig
     ) -> None:
@@ -590,7 +633,9 @@ class KVCacheManager:
             runner_only_attn_layers,
         )
 
-    def _add_shared_kv_cache_aliases(self, kv_caches: dict[str, torch.Tensor]) -> None:
+    def _add_shared_kv_cache_aliases[CacheT](
+        self, kv_caches: dict[str, CacheT]
+    ) -> None:
         if not self.runner.shared_kv_cache_layers:
             return
         for layer_name in self.runner.shared_kv_cache_layers:
@@ -609,6 +654,16 @@ class KVCacheManager:
                     "allocated."
                 )
             kv_caches[layer_name] = kv_caches[target_layer_name]
+            layers = self.runner.vllm_config.compilation_config.static_forward_context
+            layer = layers.get(layer_name)
+            if isinstance(layer, MLAAttention) and layer.use_sparse:
+                shared_layer = cast("VllmTPUMLAAttention", layer)
+                owner = cast("VllmTPUMLAAttention", layers[target_layer_name])
+                specs = owner.mla_kv_spec
+                shared_layer.mla_kv_spec = specs
+                mla_dispatch.admit_layer(
+                    self.runner, shared_layer, specs, specs[0].page_size
+                )
 
     def _update_attention_page_size_padded(
         self, layers: dict[str, AttentionLayerBase], block_size: int

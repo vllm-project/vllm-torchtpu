@@ -375,6 +375,7 @@ def _mla_ragged_paged_attention_kernel(
     q_split: int = 1,
     debug_mode: bool = False,
     return_lse: bool = False,
+    skip_kv_update: bool = False,
 ):
     del lse_in_hbm_ref
     assert ql_nope_hbm_ref.shape == o_hbm_ref.shape
@@ -770,7 +771,9 @@ def _mla_ragged_paged_attention_kernel(
             q_len = q_end - q_start
 
             kv_left = jnp.maximum(kv_len - kv_len_start, 0)
-            kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
+            kv_left_frm_cache = (
+                kv_left if skip_kv_update else jnp.maximum(kv_left - q_len, 0)
+            )
 
             kv_left_frm_new = jnp.maximum(kv_left - kv_left_frm_cache, 0)
 
@@ -983,7 +986,9 @@ def _mla_ragged_paged_attention_kernel(
             q_len = q_end - q_start
 
             kv_left = jnp.maximum(kv_len - kv_len_start, 0)
-            kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
+            kv_left_frm_cache = (
+                kv_left if skip_kv_update else jnp.maximum(kv_left - q_len, 0)
+            )
             kv_left_frm_cache_per_kv_packing = unsigned_cdiv(
                 kv_left_frm_cache, kv_packing
             )
@@ -1701,6 +1706,8 @@ def _mla_ragged_paged_attention_kernel(
 
     # TODO: Split out the KV handling functions into separate files.
     def start_update_kv_cache(start_seq_idx, bkv_sem_idx, offsets, update_szs):
+        if skip_kv_update:
+            return
         for b in range(batch_size):
             offset = offsets[b]
             update_sz = update_szs[b]
@@ -1718,6 +1725,8 @@ def _mla_ragged_paged_attention_kernel(
                 _update_kv_cache_fn(start_seq_idx, b, bkv_sem_idx, offset, update_sz)
 
     def wait_update_kv_cache(bkv_sem_idx):
+        if skip_kv_update:
+            return
         for b in range(batch_size):
             update_sz = bkv_update_ids_ref[b, bkv_sem_idx + 4]
 
@@ -1909,10 +1918,13 @@ def _mla_ragged_paged_attention_kernel(
                 # files.
                 # Pack and align new KVs in VMEM if the block has new KVs.
                 # We may have to do this for each block of KV in VMEM.
-                if not transpose_kv_cache:
-                    _pack_new_kv(bkv_sem_idx, offsets, update_szs)
-                else:
-                    _pack_new_transposed_kv(bkv_sem_idx, bkv_idx, offsets, update_szs)
+                if not skip_kv_update:
+                    if not transpose_kv_cache:
+                        _pack_new_kv(bkv_sem_idx, offsets, update_szs)
+                    else:
+                        _pack_new_transposed_kv(
+                            bkv_sem_idx, bkv_idx, offsets, update_szs
+                        )
 
                 # Start updating bkv to kv cache if applicable.
                 # Only needed in first bq loop.
@@ -2310,6 +2322,7 @@ def prepare_outputs(
         "p_same_dtype_as_v",
         "use_causal_mask",
         "return_lse",
+        "skip_kv_update",
         "debug_mode",
     ),
     donate_argnames=("cache_kv",),
@@ -2349,6 +2362,7 @@ def mla_ragged_paged_attention(
     p_same_dtype_as_v: bool = True,
     use_causal_mask: bool = True,
     return_lse: bool = False,
+    skip_kv_update: bool = False,
     # Debug params.
     debug_mode: bool = False,
 ) -> (
@@ -2401,6 +2415,8 @@ def mla_ragged_paged_attention(
         AV attention in two separate steps to make them be more parallelized
         with VALU ops instead of batched matmul in one step.
       p_same_dtype_as_v: if true, cast p to the same dtype as v before p @ v.
+      skip_kv_update: if true, read every key from cache and ignore new KV
+        inputs. The source layer must have already cached this step's tokens.
       return_lse: if true, also return the log-sum-exp of the scaled scores per
         (token, head) as f32 `[max_num_tokens, actual_num_q_heads]`, for
         merging partial attention outputs across ranks. Rows of tokens outside
@@ -2672,6 +2688,7 @@ def mla_ragged_paged_attention(
                     use_causal_mask=use_causal_mask,
                     debug_mode=debug_mode,
                     return_lse=return_lse,
+                    skip_kv_update=skip_kv_update,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=len(scalar_prefetches),

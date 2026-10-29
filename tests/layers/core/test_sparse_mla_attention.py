@@ -260,6 +260,53 @@ class SparseMlaAttentionTest(parameterized.TestCase):
         )
         return (nope_cache, rope_cache), output
 
+    @parameterized.parameters((NOPE_SPEC, ROPE_SPEC), (NOPE_SC_SPEC, ROPE_SC_SPEC))
+    def test_shared_cache_preserves_owner_tokens(self, nope_spec, rope_spec):
+        self._require_tpu()
+        tokens = TOKEN_PAD
+        kv_c, k_pe = self._random_latents(tokens)
+        ql_nope, q_pe = self._random_queries(tokens)
+        block_tables = self._block_tables(1)
+        args = (
+            ql_nope,
+            q_pe,
+            _quantize_fp8(kv_c, self.k_scale),
+            _quantize_fp8(k_pe, self.k_scale),
+        )
+        tail = (
+            jnp.asarray(_causal_topk(list(range(tokens)), tokens), jnp.int32),
+            jnp.asarray([tokens], jnp.int32),
+            block_tables,
+            jnp.asarray([0, tokens], jnp.int32),
+            jnp.asarray([0, 0, 1], jnp.int32),
+            self._make_mesh(),
+            nope_spec,
+            rope_spec,
+        )
+        owner_nope, owner_rope, expected = attention_interface.sparse_mla_attention(
+            *args,
+            *_empty_pair(nope_spec, rope_spec),
+            *tail,
+            sm_scale=self.sm_scale,
+            k_scale=self.k_scale,
+        )
+        snapshot = (np.asarray(owner_nope).copy(), np.asarray(owner_rope).copy())
+        reader_nope, reader_rope, actual = attention_interface.sparse_mla_attention(
+            ql_nope,
+            q_pe,
+            jnp.full_like(args[2], 9),
+            jnp.full_like(args[3], 11),
+            owner_nope,
+            owner_rope,
+            *tail,
+            sm_scale=self.sm_scale,
+            k_scale=self.k_scale,
+            skip_kv_update=True,
+        )
+        np.testing.assert_array_equal(np.asarray(reader_nope), snapshot[0])
+        np.testing.assert_array_equal(np.asarray(reader_rope), snapshot[1])
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
     def test_sparsecore_writer_to_attention(self):
         """The uint32 writer feeds the SparseCore-layout mode directly."""
         self._require_tpu()
