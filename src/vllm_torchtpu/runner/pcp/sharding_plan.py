@@ -54,6 +54,12 @@ def grow_host_token_buffers(runner: Any, required: int) -> None:
         new[:current] = old
         setattr(runner, name, new)
     runner.positions_np = runner.positions_cpu.numpy()
+    if getattr(runner, "uses_mrope", False):
+        old = runner.mrope_positions
+        new = runner._make_buffer(3, required + 1, dtype=torch.int32)
+        copy_len = min(current + 1, int(old.cpu.shape[1]))
+        new.cpu[:, :copy_len] = old.cpu[:, :copy_len]
+        runner.mrope_positions = new
 
 
 class PcpShardingPlan(ABC):

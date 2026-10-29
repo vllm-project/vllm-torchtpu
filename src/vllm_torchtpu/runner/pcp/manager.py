@@ -15,8 +15,10 @@
 `PCPManager`.
 
 `PcpManager` delegates to a stateful `PcpShardingPlan` (`sharding_plan.py`),
-which owns the PCP/DCP topology and the state of the step it last prepared.
-`HeadTailPcpShardingPlan` (`head_tail_sharding_plan.py`) is the only plan so far.
+which owns the PCP/DCP topology and the state of the step it last prepared:
+`HeadTailPcpShardingPlan` (`head_tail_sharding_plan.py`) for sparse MLA, and
+`InterleavedPcpShardingPlan` (`interleaved_sharding_plan.py`) for Qwen GDN
+hybrids.
 """
 
 from __future__ import annotations
@@ -27,7 +29,11 @@ import torch
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.pcp import get_pcp_group
+from vllm_torchtpu.gdn_pool_layout import QWEN_GDN_ARCHITECTURES
 from vllm_torchtpu.runner.pcp.head_tail_sharding_plan import HeadTailPcpShardingPlan
+from vllm_torchtpu.runner.pcp.interleaved_sharding_plan import (
+    InterleavedPcpShardingPlan,
+)
 from vllm_torchtpu.runner.pcp.sharding_plan import (
     PcpShardingPlan,
     grow_host_token_buffers,
@@ -47,26 +53,31 @@ def validate_pcp_manager_config(vllm_config: Any) -> None:
     sparse_mla = bool(getattr(model_config, "use_mla", False)) and hasattr(
         hf_config, "index_topk"
     )
+    gdn_hybrid = getattr(model_config, "architecture", None) in QWEN_GDN_ARCHITECTURES
     plan = envs.TPU_PCP_SHARDING_PLAN.lower()
-    if not sparse_mla or plan != "headtail":
+    if pcp_size <= 1:
         raise NotImplementedError(
-            "The PCP manager only supports sparse MLA + headtail, got "
-            f"sparse_mla={sparse_mla} + {plan}."
+            "USE_TPU_PCP_MANAGER needs prefill_context_parallel_size > 1, got "
+            f"pcp={pcp_size}."
         )
-    if pcp_size <= 1 or dcp_size <= 1:
+    if sparse_mla and plan == "headtail":
+        if dcp_size != tp_size * pcp_size:
+            raise NotImplementedError(
+                "PCP x DCP on sparse MLA requires decode_context_parallel_size "
+                "== tensor_parallel_size * prefill_context_parallel_size, got "
+                f"dcp={dcp_size}, tp={tp_size}, pcp={pcp_size}."
+            )
+    elif gdn_hybrid and plan == "interleaved":
+        _validate_interleaved_config(vllm_config, pcp_size, dcp_size)
+    else:
         raise NotImplementedError(
-            "USE_TPU_PCP_MANAGER needs prefill and decode context parallel "
-            f"sizes > 1, got pcp={pcp_size}, dcp={dcp_size}."
+            "The PCP manager only supports sparse MLA + headtail and Qwen GDN "
+            f"hybrids + interleaved, got sparse_mla={sparse_mla} "
+            f"gdn_hybrid={gdn_hybrid} + {plan}."
         )
     if parallel_config.is_moe_model and not parallel_config.enable_expert_parallel:
         raise NotImplementedError(
             "PCP on an MoE model requires --enable-expert-parallel."
-        )
-    if dcp_size != tp_size * pcp_size:
-        raise NotImplementedError(
-            "PCP x DCP requires decode_context_parallel_size == "
-            "tensor_parallel_size * prefill_context_parallel_size, got "
-            f"dcp={dcp_size}, tp={tp_size}, pcp={pcp_size}."
         )
     if int(parallel_config.pipeline_parallel_size) != 1:
         raise NotImplementedError("PCP x DCP does not support pipeline parallelism.")
@@ -78,8 +89,45 @@ def validate_pcp_manager_config(vllm_config: Any) -> None:
         )
     if vllm_config.lora_config is not None:
         raise NotImplementedError("PCP x DCP does not support LoRA.")
-    if getattr(model_config, "is_multimodal_model", False):
+    multimodal_config = getattr(model_config, "multimodal_config", None)
+    if multimodal_config is not None and not getattr(
+        multimodal_config, "language_model_only", False
+    ):
         raise NotImplementedError("PCP x DCP does not support multimodal inputs.")
+
+
+def _validate_interleaved_config(
+    vllm_config: Any, pcp_size: int, dcp_size: int
+) -> None:
+    """`batched_rpa_new` with `sharding_mode="interleaved"`."""
+    parallel_config = vllm_config.parallel_config
+    model_config = vllm_config.model_config
+    if dcp_size != pcp_size:
+        # DCP shards the full-attention KV (not the GDN state) over the PCP
+        # ranks: one logical block is one page on each, the kernel's striping.
+        raise NotImplementedError(
+            "PCP on GDN hybrids requires decode_context_parallel_size == "
+            f"prefill_context_parallel_size, got dcp={dcp_size}, pcp={pcp_size}."
+        )
+    if int(parallel_config.cp_kv_cache_interleave_size) <= 0:
+        raise NotImplementedError(
+            "The interleaved PCP plan requires cp_kv_cache_interleave_size > 0."
+        )
+    # Raiden locates KV by the legacy token interleave; the kernel stripes it
+    # by page.
+    if (
+        vllm_config.kv_transfer_config is not None
+        or envs.TPU_KV_RESHARD_TRANSPORT.lower() == "raiden"
+        or envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER
+    ):
+        raise NotImplementedError(
+            "The interleaved PCP plan does not support KV transfer (Raiden) yet."
+        )
+    hf_config = getattr(model_config, "hf_text_config", None)
+    if getattr(hf_config, "head_dim", None) == 64:
+        raise NotImplementedError("PCP RPA does not support head_dim == 64.")
+    if model_config.get_sliding_window() is not None:
+        raise NotImplementedError("PCP RPA supports full attention only.")
 
 
 class PcpManager:
@@ -97,6 +145,17 @@ class PcpManager:
         parallel_config = vllm_config.parallel_config
         group = get_pcp_group()
         pcp_rank = 0 if group is None else int(group.rank_in_group)
+        max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        if envs.TPU_PCP_SHARDING_PLAN.lower() == "interleaved":
+            return cls(
+                InterleavedPcpShardingPlan(
+                    pcp_size=parallel_config.prefill_context_parallel_size,
+                    pcp_rank=pcp_rank,
+                    dcp_size=parallel_config.decode_context_parallel_size,
+                    interleave_size=parallel_config.cp_kv_cache_interleave_size,
+                    max_num_batched_tokens=max_num_batched_tokens,
+                )
+            )
         return cls(
             HeadTailPcpShardingPlan(
                 pcp_size=parallel_config.prefill_context_parallel_size,
@@ -104,9 +163,7 @@ class PcpManager:
                 dcp_size=parallel_config.decode_context_parallel_size,
                 page_size=vllm_config.cache_config.block_size,
                 workspace_tokens=envs.TPU_PCP_KV_WORKSPACE_TOKENS,
-                max_num_batched_tokens=(
-                    vllm_config.scheduler_config.max_num_batched_tokens
-                ),
+                max_num_batched_tokens=max_num_batched_tokens,
                 max_num_seqs=vllm_config.scheduler_config.max_num_seqs,
             )
         )

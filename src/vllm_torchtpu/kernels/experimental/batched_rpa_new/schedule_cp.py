@@ -157,15 +157,13 @@ class RingAttention:
 
     self._pending_send = (sends, receives, send_op, slot)
 
-  def finish(self, step: int | jax.Array, schedule_ref, total_steps):
-    """Close out the step's hop: drain pipelined sends, release credit."""
-    assert self._pending_send is not None
-    sends, receives, send_op, _ = self._pending_send
-    self._pending_send = None
+  def wait_prev_send(self, step: int | jax.Array, schedule_ref):
+    """Wait for the send from (step - 1), out of slot (step - 1) % n_buffer.
 
-    # Overlapped send draining: wait for the send from (step - 1),
-    # which has already had a full step of compute to complete in the
-    # background.
+    Call before the pipeline prefetches step + 2: that prefetch reuses the
+    same slot, and at a hop-0 step (a new KV block or sequence) it overwrites
+    the slot from HBM, which must not race the block still being forwarded.
+    """
     prev_step = step - 1
     prev_sends = jnp.logical_and(
         prev_step >= 0,
@@ -177,6 +175,13 @@ class RingAttention:
     @pl.when(prev_sends)
     def _wait_prev_send():
       self._remote_copy(prev_slot, prev_slot).wait_send()
+
+  def finish(self, step: int | jax.Array, schedule_ref, total_steps):
+    """Close out the step's hop: drain the last send, release credit."""
+    del schedule_ref
+    assert self._pending_send is not None
+    sends, receives, send_op, _ = self._pending_send
+    self._pending_send = None
 
     # If this is the last step in the pipeline, also drain the current step's
     # send.
@@ -195,6 +200,228 @@ class RingAttention:
           device_id=self.prev_id,
           device_id_type=pl.DeviceIdType.MESH,
       )
+
+
+class HeadTailCausalMask(schedule.ContiguousCausalMask):
+  """Causal mask for DualChunkSwap (Head-Tail) query layout in Pass 2."""
+
+  @classmethod
+  def get_causal_end_k_idx(
+      cls,
+      *,
+      q_idx: jax.Array,
+      q_sz_task: jax.Array,
+      q_position: jax.Array,
+      kv_cache_len: jax.Array,
+      kv_new_len: jax.Array,
+      cp_rank: jax.Array | int,
+      cfgs: configs.RpaConfigs,
+      q_start: jax.Array | int = 0,
+  ) -> jax.Array:
+    del kv_cache_len, q_start
+    cp_size = cfgs.serve.cp_group_size
+    assert cp_size is not None
+    num_chunks = 2 * cp_size
+    chunk_size = (kv_new_len + num_chunks - 1) // num_chunks
+    head_start = cp_rank * chunk_size
+    head_len = jnp.clip(kv_new_len - head_start, 0, chunk_size)
+    tail_start = (num_chunks - 1 - cp_rank) * chunk_size
+    tail_jump = jnp.maximum((tail_start - head_start) - head_len, 0)
+    last_row = jnp.maximum(q_idx * cfgs.bq_sz + q_sz_task - 1, 0)
+    max_q_pos = (
+        q_position
+        + last_row
+        + jnp.where(last_row >= head_len, tail_jump, 0)
+    )
+    return max_q_pos // cfgs.bkv_sz + 1
+
+  @classmethod
+  def fetch_compute_metadata(
+      cls,
+      step: jax.Array,
+      schedule_ref: schedule.RpaSchedule,
+      q_positions_ref: jax.Ref,
+      kv_cache_lens_ref: jax.Ref,
+      cp_rank_ref: jax.Ref,
+      *,
+      cfgs: configs.RpaConfigs,
+      kv_new_lens_ref: jax.Ref | None = None,
+      cu_q_lens_ref: jax.Ref | None = None,
+  ) -> schedule.ComputeMetadata:
+    base_meta = super().fetch_compute_metadata(
+        step,
+        schedule_ref,
+        q_positions_ref,
+        kv_cache_lens_ref,
+        cp_rank_ref,
+        cfgs=cfgs,
+        kv_new_lens_ref=kv_new_lens_ref,
+    )
+    assert kv_new_lens_ref is not None
+    cp_size = cfgs.serve.cp_group_size
+    assert cp_size is not None
+    num_chunks = 2 * cp_size
+    cp_rank = cp_rank_ref[0]
+    ht_meta_list = []
+    for b_idx in range(cfgs.batch_size):
+      s_idx = schedule_ref.s_idx[step, b_idx]
+      is_valid = s_idx != -1
+      q_idx = schedule_ref.q_idx[step, b_idx]
+      kv_new_len_val = jnp.where(is_valid, kv_new_lens_ref[s_idx], 0)
+      chunk_size = (kv_new_len_val + num_chunks - 1) // num_chunks
+      head_start = cp_rank * chunk_size
+      head_len = jnp.clip(kv_new_len_val - head_start, 0, chunk_size)
+      tail_start = (num_chunks - 1 - cp_rank) * chunk_size
+      tail_jump = jnp.maximum((tail_start - head_start) - head_len, 0)
+      ht_meta_list.append((q_idx * cfgs.bq_sz, head_len, tail_jump))
+    return dataclasses.replace(base_meta, interleave_meta=ht_meta_list)
+
+  @classmethod
+  def generate_mask(
+      cls,
+      shape: tuple[int, int, int, int],
+      *,
+      bq_start: int,
+      step_meta: schedule.ComputeMetadata,
+      cfgs: configs.RpaConfigs,
+  ) -> list[jax.Array]:
+    b, k_heads, tq, s = shape
+    if not cfgs.serve.has_new_kv and cfgs.model.sliding_window is None:
+      return schedule.CacheOnlyMask.generate_mask(
+          shape, bq_start=bq_start, step_meta=step_meta, cfgs=cfgs
+      )
+    assert step_meta.interleave_meta is not None
+    masks = []
+    kv_iota = jax.lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 2)
+    q_iota = jax.lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 1)
+    q_iota //= cfgs.aligned_num_q_heads_per_kv_head
+
+    for b_idx in range(b):
+      q_block_base, head_len, tail_jump = step_meta.interleave_meta[b_idx]
+      row_in_seq = q_block_base + bq_start + q_iota
+      extra_jump = jnp.where(row_in_seq >= head_len, tail_jump, 0)
+      q_kv_diff = (q_iota + extra_jump) - kv_iota
+      offset = step_meta.causal_offset[b_idx] - bq_start
+      mask_b = q_kv_diff >= offset
+      if (sliding_window := cfgs.model.sliding_window) is not None:
+        mask_b = jnp.logical_and(mask_b, q_kv_diff < sliding_window + offset)
+      if step_meta.local_k_start is not None:
+        mask_b = jnp.logical_and(
+            mask_b, kv_iota >= step_meta.local_k_start[b_idx]
+        )
+      if step_meta.local_k_end is not None:
+        mask_b = jnp.logical_and(mask_b, kv_iota < step_meta.local_k_end[b_idx])
+      masks.append(mask_b)
+    return masks
+
+
+class InterleavedCausalMask(schedule.ContiguousCausalMask):
+  """Causal mask for round-robin chunk-interleaved query layout in Pass 2."""
+
+  @classmethod
+  def get_causal_end_k_idx(
+      cls,
+      *,
+      q_idx: jax.Array,
+      q_sz_task: jax.Array,
+      q_position: jax.Array,
+      kv_cache_len: jax.Array,
+      kv_new_len: jax.Array,
+      cp_rank: jax.Array | int,
+      cfgs: configs.RpaConfigs,
+      q_start: jax.Array | int = 0,
+  ) -> jax.Array:
+    del kv_cache_len, kv_new_len, cp_rank
+    interleave_size = cfgs.serve.cp_kv_cache_interleave_size
+    cp_size = cfgs.serve.cp_group_size
+    assert interleave_size is not None and cp_size is not None
+    offset = lax.rem(q_start, interleave_size)
+    last_row = jnp.maximum(q_idx * cfgs.bq_sz + q_sz_task - 1, 0)
+    crossed_chunks = lax.div(offset + last_row, interleave_size)
+    max_q_pos = (
+        q_position
+        + last_row
+        + crossed_chunks * ((cp_size - 1) * interleave_size)
+    )
+    return max_q_pos // cfgs.bkv_sz + 1
+
+  @classmethod
+  def fetch_compute_metadata(
+      cls,
+      step: jax.Array,
+      schedule_ref: schedule.RpaSchedule,
+      q_positions_ref: jax.Ref,
+      kv_cache_lens_ref: jax.Ref,
+      cp_rank_ref: jax.Ref,
+      *,
+      cfgs: configs.RpaConfigs,
+      kv_new_lens_ref: jax.Ref | None = None,
+      cu_q_lens_ref: jax.Ref | None = None,
+  ) -> schedule.ComputeMetadata:
+    base_meta = super().fetch_compute_metadata(
+        step,
+        schedule_ref,
+        q_positions_ref,
+        kv_cache_lens_ref,
+        cp_rank_ref,
+        cfgs=cfgs,
+        kv_new_lens_ref=kv_new_lens_ref,
+    )
+    assert cu_q_lens_ref is not None
+    interleave_size = cfgs.serve.cp_kv_cache_interleave_size
+    assert interleave_size is not None
+    interleave_meta_list = []
+    for b_idx in range(cfgs.batch_size):
+      s_idx = schedule_ref.s_idx[step, b_idx]
+      q_idx = schedule_ref.q_idx[step, b_idx]
+      q_start = cu_q_lens_ref[jnp.maximum(s_idx, 0)]
+      offset = lax.rem(q_start, interleave_size)
+      interleave_meta_list.append((q_idx * cfgs.bq_sz, offset))
+    return dataclasses.replace(base_meta, interleave_meta=interleave_meta_list)
+
+  @classmethod
+  def generate_mask(
+      cls,
+      shape: tuple[int, int, int, int],
+      *,
+      bq_start: int,
+      step_meta: schedule.ComputeMetadata,
+      cfgs: configs.RpaConfigs,
+  ) -> list[jax.Array]:
+    b, k_heads, tq, s = shape
+    if not cfgs.serve.has_new_kv and cfgs.model.sliding_window is None:
+      return schedule.CacheOnlyMask.generate_mask(
+          shape, bq_start=bq_start, step_meta=step_meta, cfgs=cfgs
+      )
+    assert step_meta.interleave_meta is not None
+    interleave_size = cfgs.serve.cp_kv_cache_interleave_size
+    cp_size = cfgs.serve.cp_group_size
+    assert interleave_size is not None and cp_size is not None
+    masks = []
+    kv_iota = jax.lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 2)
+    q_iota = jax.lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 1)
+    q_iota //= cfgs.aligned_num_q_heads_per_kv_head
+
+    for b_idx in range(b):
+      q_block_base, offset = step_meta.interleave_meta[b_idx]
+      row_in_seq = q_block_base + bq_start + q_iota
+      crossed_chunks = lax.div(offset + row_in_seq, interleave_size)
+      extra_jump = crossed_chunks * ((cp_size - 1) * interleave_size)
+      q_kv_diff = (q_iota + extra_jump) - kv_iota
+      causal_offset = step_meta.causal_offset[b_idx] - bq_start
+      mask_b = q_kv_diff >= causal_offset
+      if (sliding_window := cfgs.model.sliding_window) is not None:
+        mask_b = jnp.logical_and(
+            mask_b, q_kv_diff < sliding_window + causal_offset
+        )
+      if step_meta.local_k_start is not None:
+        mask_b = jnp.logical_and(
+            mask_b, kv_iota >= step_meta.local_k_start[b_idx]
+        )
+      if step_meta.local_k_end is not None:
+        mask_b = jnp.logical_and(mask_b, kv_iota < step_meta.local_k_end[b_idx])
+      masks.append(mask_b)
+    return masks
 
 
 class CPMetadataComputer(schedule.BaseMetadataComputer):
@@ -221,8 +448,60 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
     return self.extra_refs[0][0] if self.extra_refs else 0
 
   @property
+  def cp_rank_val(self):
+    return self.rank
+
+  @property
   def new_kv_page_indices_ref(self):
     return self.extra_refs[1] if len(self.extra_refs) > 1 else None
+
+  @jax.named_scope("seq_loop_cp")
+  def seq_loop(
+      self,
+      s_idx,
+      carry: schedule.LoopCarry,
+      *,
+      cu_q_lens_ref,
+      q_positions_ref,
+      kv_cache_lens_ref,
+      kv_new_lens_ref,
+      kv_new_starts_ref,
+      update_kv_cache_ref,
+  ) -> schedule.LoopCarry:
+    q_start = cu_q_lens_ref[s_idx]
+    q_end = cu_q_lens_ref[s_idx + 1]
+    q_len = q_end - q_start
+    q_position = q_positions_ref[s_idx]
+    kv_cache_len = kv_cache_lens_ref[s_idx]
+    kv_new_len = kv_new_lens_ref[s_idx]
+    k_len = kv_cache_len + kv_new_len
+    update_kv_cache = update_kv_cache_ref[s_idx]
+
+    kv_new_start = kv_new_starts_ref[s_idx]
+
+    num_q = pl.cdiv(q_len, self.cfgs.bq_sz)
+    num_q = jnp.where(
+        (q_len == 0) & (kv_new_len > 0) & (update_kv_cache != 0),
+        1,
+        num_q,
+    )
+    num_k = pl.cdiv(k_len, self.cfgs.bkv_sz)
+
+    q_loop_fn = functools.partial(
+        self.q_loop,
+        s_idx=s_idx,
+        q_start=q_start,
+        q_end=q_end,
+        q_position=q_position,
+        kv_cache_len=kv_cache_len,
+        kv_new_len=kv_new_len,
+        num_k=num_k,
+        num_q=num_q,
+        update_kv_cache=update_kv_cache,
+        kv_new_start=kv_new_start,
+    )
+
+    return jax.lax.fori_loop(0, num_q, q_loop_fn, carry)
 
   @jax.named_scope("k_loop_cp")
   def k_loop(
@@ -432,11 +711,44 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
     return self.advance_carry(carry)
 
 
+class HeadTailCPMetadataComputer(CPMetadataComputer):
+  """CP metadata computer with DualChunkSwap (Head-Tail) causal mask."""
+
+  rpa_cases: ClassVar[tuple[configs.RpaCase, ...]] = (configs.RpaCase.MIXED,)
+  mask_computer_cls: ClassVar[type[schedule.BaseMaskComputer]] = (
+      HeadTailCausalMask
+  )
+
+
+class InterleavedCPMetadataComputer(CPMetadataComputer):
+  """CP metadata computer with chunk-interleaved causal mask."""
+
+  rpa_cases: ClassVar[tuple[configs.RpaCase, ...]] = (configs.RpaCase.MIXED,)
+  mask_computer_cls: ClassVar[type[schedule.BaseMaskComputer]] = (
+      InterleavedCausalMask
+  )
+
+
 class RingCacheMetadataComputer(schedule.BaseMetadataComputer):
   """PCP Ring metadata computer rotating page-striped KV cache across ranks."""
 
   rpa_cases: ClassVar[tuple[configs.RpaCase, ...]] = (configs.RpaCase.MIXED,)
+  mask_computer_cls: ClassVar[type[schedule.BaseMaskComputer]] = (
+      schedule.CacheOnlyMask
+  )
   ring_enabled: ClassVar[bool] = True
+
+  @classmethod
+  def get_rpa_schedule(
+      cls, cfgs: configs.RpaConfigs, multiplier: int = 1
+  ) -> schedule.RpaSchedule:
+    # `cfgs.dma_kv_new_size` follows `cp_group_size`, so Pass 1 sizes its
+    # (unused) new-KV DMA slots with Pass 2's CP struct.
+    return CPMetadataComputer.get_rpa_schedule(cfgs, multiplier=multiplier)
+
+  @property
+  def max_q_lens_ref(self):
+    return self.extra_refs[1] if len(self.extra_refs) > 1 else None
 
   @classmethod
   def get_ring_sems_spec(cls) -> RingSems:
@@ -455,6 +767,51 @@ class RingCacheMetadataComputer(schedule.BaseMetadataComputer):
   ) -> RingAttention:
     return RingAttention(cfgs, ring_sems, kv_window_ref=kv_window_ref)
 
+  @jax.named_scope("seq_loop_cp_ring")
+  def seq_loop(
+      self,
+      s_idx,
+      carry: schedule.LoopCarry,
+      *,
+      cu_q_lens_ref,
+      q_positions_ref,
+      kv_cache_lens_ref,
+      kv_new_lens_ref,
+      kv_new_starts_ref,
+      update_kv_cache_ref,
+  ) -> schedule.LoopCarry:
+    del kv_new_starts_ref
+    q_start = cu_q_lens_ref[s_idx]
+    q_end = cu_q_lens_ref[s_idx + 1]
+    q_len = q_end - q_start
+    if self.max_q_lens_ref is not None:
+      q_len_for_num_q = self.max_q_lens_ref[s_idx]
+    else:
+      q_len_for_num_q = q_len
+    q_position = q_positions_ref[s_idx]
+    kv_cache_len = kv_cache_lens_ref[s_idx]
+    kv_new_len = kv_new_lens_ref[s_idx]
+    k_len = kv_cache_len + kv_new_len
+    update_kv_cache = update_kv_cache_ref[s_idx]
+
+    num_q = pl.cdiv(q_len_for_num_q, self.cfgs.bq_sz)
+    num_k = pl.cdiv(k_len, self.cfgs.bkv_sz)
+
+    q_loop_fn = functools.partial(
+        self.q_loop,
+        s_idx=s_idx,
+        q_start=q_start,
+        q_end=q_end,
+        q_position=q_position,
+        kv_cache_len=kv_cache_len,
+        kv_new_len=kv_new_len,
+        num_k=num_k,
+        num_q=num_q,
+        update_kv_cache=update_kv_cache,
+    )
+
+    return jax.lax.fori_loop(0, num_q, q_loop_fn, carry)
+
   @jax.named_scope("q_loop_cp_ring")
   def q_loop(
       self,
@@ -470,8 +827,9 @@ class RingCacheMetadataComputer(schedule.BaseMetadataComputer):
       num_k,
       num_q,
       update_kv_cache,
+      **kwargs,
   ) -> schedule.LoopCarry:
-    del q_position, kv_new_len, num_k, num_q, update_kv_cache
+    del q_position, kv_new_len, num_k, num_q, update_kv_cache, kwargs
     cfgs = self.cfgs
     cp_size = cfgs.serve.cp_group_size
     assert cp_size is not None
@@ -573,6 +931,109 @@ class RingCacheMetadataComputer(schedule.BaseMetadataComputer):
     return self.advance_carry(carry)
 
 
+def derive_head_tail_local_schedule(
+    global_cu_q_lens: jax.Array,
+    global_kv_cache_lens: jax.Array,
+    cp_rank: jax.Array,
+    cp_group_size: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+  """Derives `(local_cu_q_lens, q_positions, max_q_lens)` for Head-Tail PCP."""
+  global_q_lens = global_cu_q_lens[1:] - global_cu_q_lens[:-1]
+  num_chunks = 2 * cp_group_size
+  chunk_size = (global_q_lens + num_chunks - 1) // num_chunks
+  rank = cp_rank[0]
+
+  def _local_q_lens(r: jax.Array) -> jax.Array:
+    head_len = jnp.clip(global_q_lens - r * chunk_size, 0, chunk_size)
+    tail_start = (num_chunks - 1 - r) * chunk_size
+    tail_len = jnp.clip(global_q_lens - tail_start, 0, chunk_size)
+    return head_len + tail_len
+
+  local_cu_q_lens = jnp.concatenate([
+      jnp.zeros((1,), dtype=global_cu_q_lens.dtype),
+      jnp.cumsum(_local_q_lens(rank), dtype=global_cu_q_lens.dtype),
+  ])
+
+  # Rank 0's tail is the partial last chunk, so any rank can hold the most rows.
+  all_ranks = jnp.arange(cp_group_size, dtype=global_cu_q_lens.dtype)[:, None]
+  max_q_lens = jnp.max(_local_q_lens(all_ranks), axis=0).astype(jnp.int32)
+  q_positions = (global_kv_cache_lens + rank * chunk_size).astype(jnp.int32)
+  return local_cu_q_lens, q_positions, max_q_lens
+
+
+def derive_interleaved_local_schedule(
+    global_cu_q_lens: jax.Array,
+    global_kv_cache_lens: jax.Array,
+    cp_rank: jax.Array,
+    cp_group_size: int,
+    interleave_size: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+  """Derives `(local_cu_q_lens, q_positions, max_q_lens)` for Interleaved PCP."""
+  if interleave_size <= 0:
+    raise ValueError(f"Expected interleave_size > 0, got {interleave_size}.")
+  cycle = cp_group_size * interleave_size
+  rank = cp_rank[0]
+
+  def _prefix_rank_tokens(g: jax.Array, r: jax.Array) -> jax.Array:
+    return (g // cycle) * interleave_size + jnp.clip(
+        (g % cycle) - r * interleave_size, 0, interleave_size
+    )
+
+  local_cu_q_lens = _prefix_rank_tokens(global_cu_q_lens, rank).astype(
+      global_cu_q_lens.dtype
+  )
+
+  all_ranks = jnp.arange(cp_group_size, dtype=global_cu_q_lens.dtype)[:, None]
+  all_cu_q_lens = _prefix_rank_tokens(global_cu_q_lens[None, :], all_ranks)
+  all_local_q_lens = all_cu_q_lens[:, 1:] - all_cu_q_lens[:, :-1]
+  max_q_lens = jnp.max(all_local_q_lens, axis=0).astype(jnp.int32)
+
+  starts = global_cu_q_lens[:-1]
+  cycle_base = (starts // cycle) * cycle
+  chunk_start = cycle_base + rank * interleave_size
+  chunk_start = jnp.where(
+      chunk_start + interleave_size <= starts,
+      chunk_start + cycle,
+      chunk_start,
+  )
+  first_offset = jnp.maximum(chunk_start - starts, 0)
+  q_positions = (global_kv_cache_lens + first_offset).astype(jnp.int32)
+  return local_cu_q_lens, q_positions, max_q_lens
+
+
+def derive_pcp_local_schedule(
+    global_cu_q_lens: jax.Array,
+    global_kv_cache_lens: jax.Array,
+    cp_rank: jax.Array,
+    cp_group_size: int,
+    *,
+    sharding_mode: str = "head_tail",
+    cp_kv_cache_interleave_size: int | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+  """Dispatches PCP local schedule derivation by `sharding_mode`."""
+  if sharding_mode == "head_tail":
+    return derive_head_tail_local_schedule(
+        global_cu_q_lens, global_kv_cache_lens, cp_rank, cp_group_size
+    )
+  if sharding_mode == "interleaved":
+    if cp_kv_cache_interleave_size is None:
+      raise ValueError(
+          "cp_kv_cache_interleave_size is required when"
+          " sharding_mode='interleaved'."
+      )
+    return derive_interleaved_local_schedule(
+        global_cu_q_lens,
+        global_kv_cache_lens,
+        cp_rank,
+        cp_group_size,
+        cp_kv_cache_interleave_size,
+    )
+  raise ValueError(
+      f"Unsupported sharding_mode={sharding_mode!r}; expected 'head_tail' or"
+      " 'interleaved'."
+  )
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class StripedCacheScheduler(schedule.BaseScheduler):
@@ -628,6 +1089,8 @@ class RingCacheScheduler(StripedCacheScheduler):
     ring_mesh_axis_names: Full tuple of mesh axis names when inside a multi-axis
       shard_map.
     is_packed_lse: Defaults to True for ring cache phase.
+    max_q_lens: Optional [max_num_seqs] upper bound on local query length across
+      all ranks so all ranks execute identical ring rotation steps.
   """
 
   computer_cls: ClassVar[type[schedule.BaseMetadataComputer]] = (
@@ -644,16 +1107,62 @@ class RingCacheScheduler(StripedCacheScheduler):
   is_packed_lse: bool = dataclasses.field(
       default=True, metadata=dict(static=True)
   )
+  max_q_lens: jax.Array | None = None
 
   @property
   def extra_scalars(self) -> tuple[jax.Array, ...]:
-    return (self.cp_rank,)
+    if self.max_q_lens is None:
+      return (self.cp_rank,)
+    return (self.cp_rank, self.max_q_lens)
 
   def get_kv_lens(
       self, q_lens: jax.Array, page_size: int = 1
   ) -> tuple[jax.Array, jax.Array]:
     del page_size
     return self.cache_lens, jnp.zeros_like(q_lens)
+
+  @classmethod
+  def from_global_metadata(
+      cls,
+      global_cu_q_lens: jax.Array,
+      global_seq_lens: jax.Array,
+      global_distribution: jax.Array,
+      *,
+      cp_rank: jax.Array,
+      cp_group_size: int,
+      sharding_mode: str = "head_tail",
+      cp_kv_cache_interleave_size: int | None = None,
+      ring_axis_name: str = "pcp",
+      ring_mesh_axis_names: tuple[str, ...] | None = None,
+      is_packed_lse: bool = False,
+      global_cache_lens: jax.Array | None = None,
+  ) -> tuple["RingCacheScheduler", jax.Array, jax.Array]:
+    """Builds `(RingCacheScheduler, local_cu_q_lens, local_distribution)` from Global metadata."""
+    global_q_lens = global_cu_q_lens[1:] - global_cu_q_lens[:-1]
+    if global_cache_lens is None:
+      global_cache_lens = global_seq_lens - global_q_lens
+    local_cu_q_lens, q_positions, max_q_lens = derive_pcp_local_schedule(
+        global_cu_q_lens,
+        global_cache_lens,
+        cp_rank,
+        cp_group_size,
+        sharding_mode=sharding_mode,
+        cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+    )
+    local_distribution = jnp.array(
+        [0, 0, global_distribution[2]], dtype=global_distribution.dtype
+    )
+    scheduler = cls(
+        cache_lens=global_cache_lens,
+        cp_rank=cp_rank,
+        cp_group_size=cp_group_size,
+        q_positions=q_positions,
+        ring_axis_name=ring_axis_name,
+        ring_mesh_axis_names=ring_mesh_axis_names,
+        is_packed_lse=is_packed_lse,
+        max_q_lens=max_q_lens,
+    )
+    return scheduler, local_cu_q_lens, local_distribution
 
 
 @jax.tree_util.register_dataclass
@@ -671,6 +1180,8 @@ class StripedNewTokensScheduler(schedule.BaseScheduler):
     new_kv_page_indices: Optional page table mapping logical new-KV pages to
       physical pages in the all-gathered new_kv buffer.
     is_packed_lse: Whether to store LSE in packed 1-row-per-token layout.
+    cp_kv_cache_interleave_size: Optional chunk interleave size for Interleaved
+      PCP causal masking.
   """
 
   computer_cls: ClassVar[type[schedule.BaseMetadataComputer]] = (
@@ -688,6 +1199,9 @@ class StripedNewTokensScheduler(schedule.BaseScheduler):
   new_kv_page_indices: jax.Array | None = None
   is_packed_lse: bool = dataclasses.field(
       default=False, metadata=dict(static=True)
+  )
+  cp_kv_cache_interleave_size: int | None = dataclasses.field(
+      default=None, metadata=dict(static=True)
   )
 
   @property
@@ -722,3 +1236,206 @@ class StripedNewTokensScheduler(schedule.BaseScheduler):
   ) -> tuple[jax.Array, jax.Array]:
     del q_lens, page_size
     return self.cache_lens, self.new_lens
+
+  @classmethod
+  def from_global_metadata(
+      cls,
+      global_cu_q_lens: jax.Array,
+      global_seq_lens: jax.Array,
+      global_distribution: jax.Array,
+      *,
+      cp_rank: jax.Array,
+      cp_group_size: int,
+      sharding_mode: str = "head_tail",
+      cp_kv_cache_interleave_size: int | None = None,
+      update_kv_cache: jax.Array | bool | None = None,
+      new_kv_page_indices: jax.Array | None = None,
+      is_packed_lse: bool = False,
+      global_cache_lens: jax.Array | None = None,
+  ) -> tuple["StripedNewTokensScheduler", jax.Array, jax.Array]:
+    """Builds `(StripedNewTokensScheduler, local_cu_q_lens, local_distribution)` from Global metadata."""
+    global_q_lens = global_cu_q_lens[1:] - global_cu_q_lens[:-1]
+    if global_cache_lens is None:
+      global_cache_lens = global_seq_lens - global_q_lens
+    local_cu_q_lens, q_positions, _ = derive_pcp_local_schedule(
+        global_cu_q_lens,
+        global_cache_lens,
+        cp_rank,
+        cp_group_size,
+        sharding_mode=sharding_mode,
+        cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+    )
+    local_distribution = jnp.array(
+        [0, 0, global_distribution[2]], dtype=global_distribution.dtype
+    )
+    sched_cls = (
+        HeadTailNewTokensScheduler
+        if sharding_mode == "head_tail"
+        else InterleavedNewTokensScheduler
+    )
+    scheduler = sched_cls(
+        new_lens=global_q_lens,
+        cache_lens=global_cache_lens,
+        cp_rank=cp_rank,
+        cp_group_size=cp_group_size,
+        q_positions=q_positions,
+        update_kv_cache=update_kv_cache,
+        new_kv_page_indices=new_kv_page_indices,
+        is_packed_lse=is_packed_lse,
+        cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+    )
+    return scheduler, local_cu_q_lens, local_distribution
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class HeadTailNewTokensScheduler(StripedNewTokensScheduler):
+  """StripedNewTokensScheduler using HeadTailCPMetadataComputer."""
+
+  computer_cls: ClassVar[type[schedule.BaseMetadataComputer]] = (
+      HeadTailCPMetadataComputer
+  )
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class InterleavedNewTokensScheduler(StripedNewTokensScheduler):
+  """StripedNewTokensScheduler using InterleavedCPMetadataComputer."""
+
+  computer_cls: ClassVar[type[schedule.BaseMetadataComputer]] = (
+      InterleavedCPMetadataComputer
+  )
+
+
+def unpermute_head_tail_kv(
+    gathered_kv: jax.Array,
+    global_cu_q_lens: jax.Array,
+    cp_group_size: int,
+) -> jax.Array:
+  """Unpermutes rank-major Head-Tail `gathered_kv` `[P, T_local, ...]` to request-major `[P * T_local, ...]`."""
+  local_max_tokens = gathered_kv.shape[1]
+  total_capacity = cp_group_size * local_max_tokens
+  global_q_lens = global_cu_q_lens[1:] - global_cu_q_lens[:-1]
+  max_num_seqs = global_q_lens.shape[0]
+  num_chunks = 2 * cp_group_size
+  chunk_size = (global_q_lens + num_chunks - 1) // num_chunks
+
+  ranks = jnp.arange(cp_group_size, dtype=jnp.int32)[:, None]
+  head_starts = ranks * chunk_size[None, :]
+  head_lens = jnp.clip(
+      global_q_lens[None, :] - head_starts, 0, chunk_size[None, :]
+  )
+  tail_starts = (num_chunks - 1 - ranks) * chunk_size[None, :]
+  tail_lens = jnp.clip(
+      global_q_lens[None, :] - tail_starts, 0, chunk_size[None, :]
+  )
+  local_q_lens = head_lens + tail_lens
+  local_starts = jnp.concatenate(
+      [
+          jnp.zeros((cp_group_size, 1), dtype=jnp.int32),
+          jnp.cumsum(local_q_lens, axis=1, dtype=jnp.int32)[:, :-1],
+      ],
+      axis=1,
+  )
+
+  g = jnp.arange(total_capacity, dtype=jnp.int32)
+  s = jnp.minimum(
+      jnp.searchsorted(global_cu_q_lens[1:], g, side="right"),
+      max_num_seqs - 1,
+  )
+  pos_in_seq = jnp.maximum(g - global_cu_q_lens[s], 0)
+  cs = jnp.maximum(chunk_size[s], 1)
+  c = jnp.minimum(pos_in_seq // cs, num_chunks - 1)
+  off_in_chunk = pos_in_seq - c * cs
+  is_tail = c >= cp_group_size
+  r = jnp.where(is_tail, num_chunks - 1 - c, c)
+  local_idx = (
+      local_starts[r, s]
+      + jnp.where(is_tail, head_lens[r, s], 0)
+      + off_in_chunk
+  )
+  src_idx = jnp.clip(r * local_max_tokens + local_idx, 0, total_capacity - 1)
+  flat_kv = gathered_kv.reshape(total_capacity, *gathered_kv.shape[2:])
+  return flat_kv[src_idx]
+
+
+def unpermute_interleaved_kv(
+    gathered_kv: jax.Array,
+    cp_group_size: int,
+    interleave_size: int,
+) -> jax.Array:
+  """Unpermutes rank-major Interleaved `gathered_kv` `[P, T_local, ...]` to request-major `[P * T_local, ...]`."""
+  if interleave_size <= 0:
+    raise ValueError(f"Expected interleave_size > 0, got {interleave_size}.")
+  local_max_tokens = gathered_kv.shape[1]
+  total_capacity = cp_group_size * local_max_tokens
+  trailing_shape = gathered_kv.shape[2:]
+  aligned_local_tokens = utils.align_to(local_max_tokens, interleave_size)
+  if aligned_local_tokens != local_max_tokens:
+    pad_width = [(0, 0)] * gathered_kv.ndim
+    pad_width[1] = (0, aligned_local_tokens - local_max_tokens)
+    gathered_kv = jnp.pad(gathered_kv, pad_width)
+  num_local_chunks = aligned_local_tokens // interleave_size
+  reshaped = gathered_kv.reshape(
+      cp_group_size, num_local_chunks, interleave_size, *trailing_shape
+  )
+  unpermuted = jnp.swapaxes(reshaped, 0, 1).reshape(
+      cp_group_size * aligned_local_tokens, *trailing_shape
+  )
+  return unpermuted[:total_capacity]
+
+
+def unpermute_pcp_kv(
+    gathered_kv: jax.Array,
+    global_cu_q_lens: jax.Array,
+    cp_group_size: int,
+    *,
+    sharding_mode: str = "head_tail",
+    cp_kv_cache_interleave_size: int | None = None,
+) -> jax.Array:
+  """Dispatches rank-major KV unpermutation by `sharding_mode`."""
+  if sharding_mode == "head_tail":
+    return unpermute_head_tail_kv(gathered_kv, global_cu_q_lens, cp_group_size)
+  if sharding_mode == "interleaved":
+    if cp_kv_cache_interleave_size is None:
+      raise ValueError(
+          "cp_kv_cache_interleave_size is required when"
+          " sharding_mode='interleaved'."
+      )
+    return unpermute_interleaved_kv(
+        gathered_kv, cp_group_size, cp_kv_cache_interleave_size
+    )
+  raise ValueError(
+      f"Unsupported sharding_mode={sharding_mode!r}; expected 'head_tail' or"
+      " 'interleaved'."
+  )
+
+
+def merge_attn_results(
+    out1: jax.Array,
+    lse1: jax.Array,
+    out2: jax.Array,
+    lse2: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+  """Merges two partial attention outputs using log-sum-exp (LSE)."""
+  lse1_f32 = lse1.astype(jnp.float32)
+  lse2_f32 = lse2.astype(jnp.float32)
+  max_lse = jnp.maximum(lse1_f32, lse2_f32)
+  safe_max_lse = jnp.where(jnp.isneginf(max_lse), 0.0, max_lse)
+  exp1 = jnp.where(
+      jnp.isneginf(lse1_f32), 0.0, jnp.exp(lse1_f32 - safe_max_lse)
+  )
+  exp2 = jnp.where(
+      jnp.isneginf(lse2_f32), 0.0, jnp.exp(lse2_f32 - safe_max_lse)
+  )
+  sum_exp = exp1 + exp2
+  safe_denom = jnp.where(sum_exp > 0.0, sum_exp, 1.0)
+  w1 = (exp1 / safe_denom)[..., None]
+  w2 = (exp2 / safe_denom)[..., None]
+  merged_out = (
+      out1.astype(jnp.float32) * w1 + out2.astype(jnp.float32) * w2
+  ).astype(out2.dtype)
+  merged_lse = jnp.where(
+      sum_exp > 0.0, safe_max_lse + jnp.log(safe_denom), -jnp.inf
+  ).astype(lse2.dtype)
+  return merged_out, merged_lse

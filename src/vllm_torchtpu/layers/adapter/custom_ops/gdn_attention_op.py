@@ -34,6 +34,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.block_major_pool import (
     BlockMajorPoolLayout,
     flat_manager_ids,
@@ -75,6 +76,15 @@ from vllm_torchtpu.utils import fresh_buffer
 _GDN_PCP_AXIS_NAME = "pcp"
 _GDN_TP_AXIS_NAME = "tp"
 _GDN_PCP_TP_STATE_AXIS = (_GDN_TP_AXIS_NAME, _GDN_PCP_AXIS_NAME)
+
+
+def _is_pcp_token_layout(attn_metadata: Any) -> bool:
+    """Whether the step's tokens are PCP-packed. The PCP manager's interleaved
+    plan packs them as the legacy streaming layout does."""
+    return bool(envs.USE_TPU_PCP_MANAGER) or is_pcp_streaming_attention_metadata(
+        attn_metadata
+    )
+
 
 if TYPE_CHECKING:
 
@@ -1088,7 +1098,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self, hidden_states: torch.Tensor, state_pool: torch.Tensor, attn_metadata
     ) -> torch.Tensor:
         """Run the mandatory fused path for an allocated pooled PCP call."""
-        if not is_pcp_streaming_attention_metadata(attn_metadata):
+        if not _is_pcp_token_layout(attn_metadata):
             raise RuntimeError(
                 "PCP is configured with a unified pool, but attention "
                 "metadata does not use the PCP streaming sequence layout."
@@ -1268,7 +1278,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 )
                 if mamba_request_distribution is not None:
                     request_distribution = mamba_request_distribution
-                use_pcp_streaming = is_pcp_streaming_attention_metadata(attn_metadata)
+                use_pcp_streaming = _is_pcp_token_layout(attn_metadata)
                 if not use_pcp_streaming and self.num_spec > 0:
                     assert slot_read_offsets is not None, (
                         "Speculative decoding with GDN layers requires "

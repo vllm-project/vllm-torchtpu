@@ -90,6 +90,15 @@ from vllm_torchtpu.layers.adapter.cp_mla_attention import (
     all_gather_q_nope_pe_heads,
     merge_lse_partials_scatter_heads,
 )
+from vllm_torchtpu.layers.adapter.pcp_attention import (
+    build_pcp_kernels as _build_pcp_kernels,
+)
+from vllm_torchtpu.layers.adapter.pcp_attention import (
+    forward_with_pcp as _forward_with_pcp,
+)
+from vllm_torchtpu.layers.adapter.pcp_attention import (
+    pcp_kernel_sharding_mode as _pcp_kernel_sharding_mode,
+)
 from vllm_torchtpu.layers.adapter.pcp_kv_gather import (
     is_pcp_kv_gather_metadata,
     pcp_chunk_pages,
@@ -224,32 +233,20 @@ def _reshape_packed_kv_cache(kv_cache: jax.Array, shape: tuple[int, ...]) -> jax
     return packed.reshape(packed_shape).transpose(1, 2, 3, 0, 4)
 
 
-def _pallas_rpa_kernel_impl(
+def _to_kernel_kv_cache(
     kv_cache: jax.Array,
+    block_tables: jax.Array,
     query: jax.Array,
     key: jax.Array,
-    value: jax.Array,
-    seq_lens: jax.Array,
-    block_tables: jax.Array,
-    query_start_loc: jax.Array,
-    request_distribution: jax.Array,
-    sinks: jax.Array | None,
-    q_scale: float | None,
-    k_scale: float | None,
-    v_scale: float | None,
     *,
-    mesh: jax.sharding.Mesh,
-    sliding_window: int | None,
-    skip_kv_update: bool,
-    rpa_func,
-    sm_scale: float | None = None,
-    soft_cap: float | None = None,
-    shard: bool = True,
-    kv_block_cap: int | None = None,
-    use_causal_mask: bool = True,
-    kv_layout: batched_rpa_configs.KVLayout | None = None,
-    block_major: bool = False,
-) -> tuple[jax.Array, jax.Array]:
+    kv_layout: batched_rpa_configs.KVLayout | None,
+    block_major: bool,
+) -> tuple[jax.Array, jax.Array, Callable[[jax.Array], jax.Array]]:
+    """View the vLLM pool as the RPA kernel's native page layout.
+
+    Returns the kernel's KV cache, the block tables in its pages, and the
+    inverse view for the updated cache.
+    """
     pool_shape = kv_cache.shape
     # Fold the block-major pool's `(num_blocks, rows_per_block, *page)` layout so
     # the kernel indexes flat kernel blocks along dim 0. Both reshapes compile to
@@ -289,6 +286,55 @@ def _pallas_rpa_kernel_impl(
             (pool_shape[0] * page_stride, *native_shape[1:]),
         )
         block_tables = block_tables * page_stride
+
+    def to_pool(new_kv_cache: jax.Array) -> jax.Array:
+        if len(pool_shape) == 4:
+            # A 4-D pool is never block-major, so the ndim == 4 branch set this.
+            assert packed_pool_shape is not None
+            new_kv_cache = _reshape_packed_kv_cache(
+                new_kv_cache, packed_pool_shape
+            ).reshape(pool_shape)
+        if block_major:
+            new_kv_cache = new_kv_cache.reshape(pool_shape)
+        return new_kv_cache
+
+    return kv_cache, block_tables, to_pool
+
+
+def _pallas_rpa_kernel_impl(
+    kv_cache: jax.Array,
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    sinks: jax.Array | None,
+    q_scale: float | None,
+    k_scale: float | None,
+    v_scale: float | None,
+    *,
+    mesh: jax.sharding.Mesh,
+    sliding_window: int | None,
+    skip_kv_update: bool,
+    rpa_func,
+    sm_scale: float | None = None,
+    soft_cap: float | None = None,
+    shard: bool = True,
+    kv_block_cap: int | None = None,
+    use_causal_mask: bool = True,
+    kv_layout: batched_rpa_configs.KVLayout | None = None,
+    block_major: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    kv_cache, block_tables, to_pool = _to_kernel_kv_cache(
+        kv_cache,
+        block_tables,
+        query,
+        key,
+        kv_layout=kv_layout,
+        block_major=block_major,
+    )
     metadata = AttentionMetadata(
         # NOTE: vLLM applies RoPE before attention,
         # so input_positions is not consumed here.
@@ -319,15 +365,7 @@ def _pallas_rpa_kernel_impl(
         use_causal_mask=use_causal_mask,
         kv_layout=kv_layout,
     )
-    if len(pool_shape) == 4:
-        # A 4-D pool is never block-major, so the ndim == 4 branch set this.
-        assert packed_pool_shape is not None
-        new_kv_cache = _reshape_packed_kv_cache(
-            new_kv_cache, packed_pool_shape
-        ).reshape(pool_shape)
-    if block_major:
-        new_kv_cache = new_kv_cache.reshape(pool_shape)
-    return new_kv_cache, outputs
+    return to_pool(new_kv_cache), outputs
 
 
 def _pallas_rpa_kernel_default(
@@ -902,6 +940,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # Set by initialize_kernel() when PCP routes this layer to the
         # streaming kernel.
         self._pcp_streaming = False
+        # Set by initialize_kernel() under the PCP manager
+        # (`USE_TPU_PCP_MANAGER=1`): the cache and new-tokens PCP passes.
+        self.rpa_pcp_cache_kernel = None
+        self.rpa_pcp_new_kernel = None
         # DCP (Decode Context Parallelism) state. Populated by initialize_kernel()
         # when decode_context_parallel_size > 1.
         self.dcp_world_size = 1
@@ -1155,6 +1197,24 @@ class PallasAttentionBackendImpl(AttentionImpl):
         self._kernel_config_cache[config_key] = rpa_kernel_impl
         return rpa_kernel_impl
 
+    def _run_pcp_forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        return _forward_with_pcp(
+            cache_kernel=self.rpa_pcp_cache_kernel,
+            new_kernel=self.rpa_pcp_new_kernel,
+            query=query,
+            key=key,
+            value=value,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+        )
+
     def _run_dcp_forward(
         self,
         layer: AttentionLayer,
@@ -1356,6 +1416,24 @@ class PallasAttentionBackendImpl(AttentionImpl):
             parallel_config is not None
             and parallel_config.prefill_context_parallel_size > 1
         )
+        if pcp_configured and envs.USE_TPU_PCP_MANAGER:
+            assert parallel_config is not None
+            self._validate_pcp_streaming_support(skip_kv_update)
+            if self._bm_kernel:
+                raise NotImplementedError(
+                    "USE_TPU_PCP_MANAGER=1 does not support the block-major "
+                    "unified pool (VLLM_TPU_BLOCK_MAJOR_KV=1)."
+                )
+            self.decode_query_size = 1
+            self.rpa_pcp_cache_kernel, self.rpa_pcp_new_kernel = _build_pcp_kernels(
+                sm_scale=self.scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                sharding_mode=_pcp_kernel_sharding_mode(envs.TPU_PCP_SHARDING_PLAN),
+                cp_kv_cache_interleave_size=parallel_config.cp_kv_cache_interleave_size,
+                kv_layout=self.kv_layout,
+            )
+            return
         if pcp_configured:
             self._validate_pcp_streaming_support(skip_kv_update)
             self.decode_query_size = 1
@@ -1534,15 +1612,20 @@ class PallasAttentionBackendImpl(AttentionImpl):
         vllm_config = cast("VllmConfig | None", ctx.vllm_config)
         parallel_config = None if vllm_config is None else vllm_config.parallel_config
 
-        if self.dcp_world_size > 1:
+        if self.rpa_pcp_new_kernel is not None or self.dcp_world_size > 1:
             if sink is not None or ctx.kv_cache_bundle is not None:
                 raise NotImplementedError(
-                    "DCP attention does not support attention sinks or "
+                    "DCP/PCP attention does not support attention sinks or "
                     "the bundled KV cache path."
                 )
-            outputs = self._run_dcp_forward(
-                layer, query, key, value, kv_cache, attn_metadata
-            )
+            if self.rpa_pcp_new_kernel is not None:
+                outputs = self._run_pcp_forward(
+                    query, key, value, kv_cache, attn_metadata
+                )
+            else:
+                outputs = self._run_dcp_forward(
+                    layer, query, key, value, kv_cache, attn_metadata
+                )
             if outputs.shape[-1] > self.head_size:
                 outputs = outputs[..., : self.head_size]
             if query_dim == 2:

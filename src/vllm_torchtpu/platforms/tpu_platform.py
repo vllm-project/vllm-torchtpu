@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from vllm.inputs import EngineInput
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
     from vllm.v1.attention.backend import AttentionBackend
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
     from vllm.v1.attention.selector import AttentionSelectorConfig
@@ -659,6 +660,13 @@ class TpuPlatform(Platform):
                     # Frozen dataclass fallback.
                     object.__setattr__(dp_metadata, "num_tokens_across_dp_cpu", tpu_t)
         return {}
+
+    @classmethod
+    def pre_register_and_update(
+        cls, parser: "FlexibleArgumentParser | None" = None
+    ) -> None:
+        super().pre_register_and_update(parser)
+        patch_registry.apply("pre_config")
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:

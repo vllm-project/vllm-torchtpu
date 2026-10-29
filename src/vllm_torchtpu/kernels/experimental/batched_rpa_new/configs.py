@@ -141,6 +141,7 @@ class ServingConfigs:
   max_schedule_size_multiplier: int = 16
   decode_query_size: int = 1
   cp_group_size: int | None = None
+  cp_kv_cache_interleave_size: int | None = None
   ring_axis_name: str | None = None
   ring_mesh_axis_names: tuple[str, ...] | None = None
   paged_new_kv: bool = False

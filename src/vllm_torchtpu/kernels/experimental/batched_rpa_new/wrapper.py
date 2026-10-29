@@ -582,6 +582,12 @@ class RingBlockSizeCalculator(BaseBlockSizeCalculator):
     # and prevents compiler register spills while maximizing compute per step.
     return min(super().max_bkv_sz, 1024)
 
+  # TODO(weiyulin): `calculate_vmem_usage` underestimates the ring's compute
+  # scratch: Qwen3.5 (head_dim 256, 8 Q heads per KV head) picked bq 768 /
+  # bkv 1024 and needed 82M of 64M VMEM. Cap bq at the legacy PCP kernel's
+  # q block until the estimate covers it.
+  max_bq_sz = 512
+
   def fits(self, batch_size: int, bq_sz: int, bkv_sz: int) -> bool:
     bq_c_sz = self.compute_tile_size(batch_size, bq_sz, bkv_sz)
     used = self.calculate_vmem_usage(batch_size, bq_c_sz, bkv_sz)
@@ -603,7 +609,10 @@ class RingBlockSizeCalculator(BaseBlockSizeCalculator):
     step_sz = self.mxu_column_size
     min_bkv_sz = step_sz
 
-    max_bq = utils.align_to(max(serve_cfgs.total_q_tokens, step_sz), step_sz)
+    max_bq = min(
+        utils.align_to(max(serve_cfgs.total_q_tokens, step_sz), step_sz),
+        max(self.max_bq_sz, step_sz),
+    )
 
     local_kv_tokens = (
         serve_cfgs.pages_per_seq * serve_cfgs.page_size
@@ -907,6 +916,7 @@ def ragged_paged_attention(
       kv_layout=kv_layout,
       decode_query_size=decode_query_size,
       cp_group_size=scheduler.cp_group_size,
+      cp_kv_cache_interleave_size=scheduler.cp_kv_cache_interleave_size,
       ring_axis_name=scheduler.ring_axis_name,
       ring_mesh_axis_names=scheduler.ring_mesh_axis_names,
       paged_new_kv=scheduler.paged_new_kv,
@@ -968,6 +978,14 @@ def ragged_paged_attention(
 
   q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
   kv_cache_lens, kv_new_lens = scheduler.get_kv_lens(q_lens, page_size)
+  # Offset of each sequence's new KV in `new_kv_hbm`. Under CP the new KV is
+  # the all-gathered global stream, so it is not the local `cu_q_lens`.
+  if scheduler.paged_new_kv:
+    kv_new_starts = jnp.zeros_like(kv_new_lens)
+  elif scheduler.cp_group_size is not None:
+    kv_new_starts = jnp.cumsum(kv_new_lens) - kv_new_lens
+  else:
+    kv_new_starts = cu_q_lens[:-1]
   q_positions = (
       scheduler.q_positions
       if scheduler.q_positions is not None
@@ -1027,6 +1045,7 @@ def ragged_paged_attention(
         q_positions,
         kv_cache_lens,
         kv_new_lens,
+        kv_new_starts,
         distribution,
         cfgs=cfgs,
         update_kv_cache=update_kv_cache,
@@ -1038,6 +1057,7 @@ def ragged_paged_attention(
         q_positions,
         kv_cache_lens,
         kv_new_lens,
+        kv_new_starts,
         cp_rank,
         page_indices,
         schedule_hbm,

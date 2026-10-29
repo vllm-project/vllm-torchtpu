@@ -28,7 +28,11 @@ from vllm_torchtpu import _patch_vllm_hybrid_pcp_block_sizes
 
 
 def _config(
-    *, pcp: int, enable_prefix_caching: bool = False, connector_enabled: bool = False
+    *,
+    pcp: int,
+    dcp: int = 1,
+    enable_prefix_caching: bool = False,
+    connector_enabled: bool = False,
 ):
     return SimpleNamespace(
         cache_config=SimpleNamespace(
@@ -39,7 +43,7 @@ def _config(
             get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBNHC,
         ),
         parallel_config=SimpleNamespace(
-            decode_context_parallel_size=1,
+            decode_context_parallel_size=dcp,
             prefill_context_parallel_size=pcp,
         ),
         kv_transfer_config=object() if connector_enabled else None,
@@ -221,6 +225,92 @@ def test_hybrid_full_attention_mamba_dcp_recovers_pcp_1():
         2048,
         512,
     ]
+
+
+def _hybrid_kv_cache_config(block_size: int = 512):
+    return KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["attn"], _full_spec(block_size=block_size)),
+            KVCacheGroupSpec(["gdn"], _mamba_spec(block_size=block_size)),
+        ],
+    )
+
+
+def _coordinator(kv_cache_config, *, dcp, scheduler_block_size):
+    from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
+
+    return get_kv_cache_coordinator(
+        kv_cache_config=kv_cache_config,
+        max_model_len=4096,
+        max_in_flight_tokens=4096,
+        use_eagle=False,
+        enable_caching=True,
+        enable_kv_cache_events=False,
+        dcp_world_size=dcp,
+        # vLLM's Scheduler hard-codes it.
+        pcp_world_size=1,
+        scheduler_block_size=scheduler_block_size,
+        # Divides every group's block size, as resolve's prefix-cache unit.
+        hash_block_size=512,
+    )
+
+
+def test_hybrid_dcp_over_pcp_folds_the_cp_factor_once():
+    """dcp == pcp (the PCP manager) shards the same attention pages as PCP
+    alone: one logical block is one page on each rank, attention and Mamba."""
+    _patch_vllm_hybrid_pcp_block_sizes()
+    from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+
+    kv_cache_config = _hybrid_kv_cache_config()
+    scheduler_block_size, _ = resolve_kv_cache_block_sizes(
+        kv_cache_config, _config(pcp=4, dcp=4)
+    )
+    assert scheduler_block_size == 2048
+    assert (
+        scheduler_block_size
+        == resolve_kv_cache_block_sizes(_hybrid_kv_cache_config(), _config(pcp=4))[0]
+    )
+
+    coordinator = _coordinator(
+        kv_cache_config, dcp=4, scheduler_block_size=scheduler_block_size
+    )
+    assert coordinator.dcp_world_size == 1
+    assert [manager.block_size for manager in coordinator.single_type_managers] == [
+        2048,
+        2048,
+    ]
+
+
+def test_hybrid_dcp_without_pcp_keeps_mamba_unsharded():
+    """The same block sizes without PCP (a DCP-only decode engine) still keep
+    Mamba at its physical block size."""
+    _patch_vllm_hybrid_pcp_block_sizes()
+
+    coordinator = _coordinator(
+        _hybrid_kv_cache_config(), dcp=4, scheduler_block_size=2048
+    )
+    assert coordinator.dcp_world_size == 4
+    assert [manager.block_size for manager in coordinator.single_type_managers] == [
+        2048,
+        512,
+    ]
+
+
+def test_hybrid_dcp_off_the_pcp_axis_is_left_to_vllm():
+    _patch_vllm_hybrid_pcp_block_sizes()
+    from vllm.v1.core import kv_cache_utils
+
+    kv_cache_config = _hybrid_kv_cache_config()
+    vllm_config = _config(pcp=4, dcp=2)
+    assert _resolve_outcome(
+        kv_cache_utils.resolve_kv_cache_block_sizes, kv_cache_config, vllm_config
+    ) == _resolve_outcome(
+        kv_cache_utils._tpu_original_resolve_kv_cache_block_sizes,
+        kv_cache_config,
+        vllm_config,
+    )
 
 
 def test_hybrid_pcp_patch_keeps_non_mamba_scope():

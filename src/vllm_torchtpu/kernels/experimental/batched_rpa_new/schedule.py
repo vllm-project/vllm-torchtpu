@@ -493,6 +493,203 @@ class LoopCarry:
   count: jax.Array | int
 
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class ComputeMetadata:
+  """Scalars needed to build the QK mask, but not needed by the stitch."""
+
+  causal_offset: list[jax.Array]
+  local_k_start: list[jax.Array] | None = None
+  local_k_end: list[jax.Array] | None = None
+  interleave_meta: list[tuple[jax.Array, ...]] | None = None
+
+
+class BaseMaskComputer(ABC):
+  """Pluggable causal and valid-KV mask strategy for schedule and main kernels."""
+
+  @classmethod
+  @abstractmethod
+  def get_causal_end_k_idx(
+      cls,
+      *,
+      q_idx: jax.Array,
+      q_sz_task: jax.Array,
+      q_position: jax.Array,
+      kv_cache_len: jax.Array,
+      kv_new_len: jax.Array,
+      cp_rank: jax.Array | int,
+      cfgs: configs.RpaConfigs,
+      q_start: jax.Array | int = 0,
+  ) -> jax.Array:
+    """Returns the exclusive upper bound KV block index for causal masking."""
+
+  @classmethod
+  @abstractmethod
+  def fetch_compute_metadata(
+      cls,
+      step: jax.Array,
+      schedule_ref: RpaSchedule,
+      q_positions_ref: jax.Ref,
+      kv_cache_lens_ref: jax.Ref,
+      cp_rank_ref: jax.Ref,
+      *,
+      cfgs: configs.RpaConfigs,
+      kv_new_lens_ref: jax.Ref | None = None,
+      cu_q_lens_ref: jax.Ref | None = None,
+  ) -> ComputeMetadata:
+    """Fetches per-batch-item scalars needed for QK mask generation."""
+
+  @classmethod
+  @abstractmethod
+  def generate_mask(
+      cls,
+      shape: tuple[int, int, int, int],
+      *,
+      bq_start: int,
+      step_meta: ComputeMetadata,
+      cfgs: configs.RpaConfigs,
+  ) -> list[jax.Array]:
+    """Generates the QK boolean mask list across the batch dimension."""
+
+
+class ContiguousCausalMask(BaseMaskComputer):
+  """Standard causal mask where query positions in a block are contiguous."""
+
+  @classmethod
+  def get_causal_end_k_idx(
+      cls,
+      *,
+      q_idx: jax.Array,
+      q_sz_task: jax.Array,
+      q_position: jax.Array,
+      kv_cache_len: jax.Array,
+      kv_new_len: jax.Array,
+      cp_rank: jax.Array | int,
+      cfgs: configs.RpaConfigs,
+      q_start: jax.Array | int = 0,
+  ) -> jax.Array:
+    del kv_cache_len, kv_new_len, cp_rank, q_start
+    return (q_position + q_idx * cfgs.bq_sz + q_sz_task - 1) // cfgs.bkv_sz + 1
+
+  @classmethod
+  def fetch_compute_metadata(
+      cls,
+      step: jax.Array,
+      schedule_ref: RpaSchedule,
+      q_positions_ref: jax.Ref,
+      kv_cache_lens_ref: jax.Ref,
+      cp_rank_ref: jax.Ref,
+      *,
+      cfgs: configs.RpaConfigs,
+      kv_new_lens_ref: jax.Ref | None = None,
+      cu_q_lens_ref: jax.Ref | None = None,
+  ) -> ComputeMetadata:
+    del kv_new_lens_ref, cu_q_lens_ref
+    causal_offset_list = []
+    cp_size = cfgs.serve.cp_group_size
+    cp_rank = cp_rank_ref[0]
+
+    local_k_start_list = [] if not cfgs.serve.has_cache_kv else None
+    local_k_end_list = [] if not cfgs.serve.has_new_kv else None
+
+    for b_idx in range(cfgs.batch_size):
+      s_idx = schedule_ref.s_idx[step, b_idx]
+      is_valid = s_idx != -1
+      q_idx = schedule_ref.q_idx[step, b_idx]
+      k_idx = schedule_ref.k_idx[step, b_idx]
+      if cfgs.ring_enabled:
+        assert cp_size is not None
+        hop = jax.lax.rem(k_idx, cp_size)
+        k_idx = k_idx // cp_size
+        src_rank = jax.lax.rem(cp_rank + cp_size - hop, cp_size)
+      else:
+        src_rank = cp_rank
+
+      k_id = jnp.where(is_valid, k_idx * cfgs.bkv_sz, 0)
+      q_position = jnp.where(is_valid, q_positions_ref[s_idx], 0)
+
+      # Causal base offset: K_base - Q_base
+      q_base = q_idx * cfgs.bq_sz + q_position
+      causal_offset = k_id - q_base
+      causal_offset_list.append(causal_offset)
+
+      if local_k_start_list is not None:
+        kv_cache_len_val = jnp.where(is_valid, kv_cache_lens_ref[s_idx], 0)
+        local_k_start_list.append(kv_cache_len_val - k_id)
+      if local_k_end_list is not None:
+        kv_cache_len_val = jnp.where(is_valid, kv_cache_lens_ref[s_idx], 0)
+        if cfgs.ring_enabled:
+          assert cp_size is not None
+          kv_cache_len_val = utils.cp_local_cache_len(
+              kv_cache_len_val, cp_size, src_rank, cfgs.serve.page_size
+          )
+        local_k_end_list.append(kv_cache_len_val - k_id)
+
+    return ComputeMetadata(
+        causal_offset=causal_offset_list,
+        local_k_start=local_k_start_list,
+        local_k_end=local_k_end_list,
+    )
+
+  @classmethod
+  def generate_mask(
+      cls,
+      shape: tuple[int, int, int, int],
+      *,
+      bq_start: int,
+      step_meta: ComputeMetadata,
+      cfgs: configs.RpaConfigs,
+  ) -> list[jax.Array]:
+    b, k_heads, tq, s = shape
+
+    if not cfgs.serve.has_new_kv and cfgs.model.sliding_window is None:
+      return CacheOnlyMask.generate_mask(
+          shape, bq_start=bq_start, step_meta=step_meta, cfgs=cfgs
+      )
+
+    masks = []
+    kv_iota = jax.lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 2)
+    q_iota = jax.lax.broadcasted_iota(jnp.int32, (k_heads, tq, s), 1)
+    q_iota //= cfgs.aligned_num_q_heads_per_kv_head
+    q_kv_diff = q_iota - kv_iota
+
+    for b_idx in range(b):
+      offset = step_meta.causal_offset[b_idx] - bq_start
+      mask_b = q_kv_diff >= offset
+      if (sliding_window := cfgs.model.sliding_window) is not None:
+        mask_b = jnp.logical_and(mask_b, q_kv_diff < sliding_window + offset)
+
+      if step_meta.local_k_start is not None:
+        mask_b = jnp.logical_and(
+            mask_b, kv_iota >= step_meta.local_k_start[b_idx]
+        )
+      if step_meta.local_k_end is not None:
+        mask_b = jnp.logical_and(mask_b, kv_iota < step_meta.local_k_end[b_idx])
+
+      masks.append(mask_b)
+
+    return masks
+
+
+class CacheOnlyMask(ContiguousCausalMask):
+  """Mask for cache-only passes where all queries attend to all valid cached KV."""
+
+  @classmethod
+  def generate_mask(
+      cls,
+      shape: tuple[int, int, int, int],
+      *,
+      bq_start: int,
+      step_meta: ComputeMetadata,
+      cfgs: configs.RpaConfigs,
+  ) -> list[jax.Array]:
+    del bq_start, cfgs
+    b, _, _, s = shape
+    kv_iota = jax.lax.broadcasted_iota(jnp.int32, (1, 1, s), 2)
+    assert step_meta.local_k_end is not None
+    return [kv_iota < step_meta.local_k_end[b_idx] for b_idx in range(b)]
+
+
 class BaseMetadataComputer:
   """Base metadata scheduler computing seq -> q -> k loops."""
 
@@ -501,6 +698,11 @@ class BaseMetadataComputer:
       configs.RpaCase.MIXED,
   )
   ring_enabled: ClassVar[bool] = False
+  mask_computer_cls: ClassVar[type[BaseMaskComputer]] = ContiguousCausalMask
+
+  @property
+  def cp_rank_val(self) -> jax.Array | int:
+    return 0
 
   @classmethod
   def get_rpa_schedule(
@@ -730,19 +932,29 @@ class BaseMetadataComputer:
       num_k,
       num_q,
       update_kv_cache,
+      kv_new_start=None,
   ) -> LoopCarry:
     cfgs = self.cfgs
     q_src = q_start + q_idx * cfgs.bq_sz
     q_sz_task = jnp.clip(q_end - q_src, 0, cfgs.bq_sz)
+    if kv_new_start is None:
+      kv_new_start = q_start
 
     start_k_idx = 0
     if (sliding_window := cfgs.model.sliding_window) is not None:
       sw_start_idx = q_position + q_idx * cfgs.bq_sz - sliding_window + 1
       start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
 
-    end_k_idx_causal = (
-        q_position + q_idx * cfgs.bq_sz + q_sz_task - 1
-    ) // cfgs.bkv_sz + 1
+    end_k_idx_causal = self.mask_computer_cls.get_causal_end_k_idx(
+        q_idx=q_idx,
+        q_sz_task=q_sz_task,
+        q_position=q_position,
+        kv_cache_len=kv_cache_len,
+        kv_new_len=kv_new_len,
+        cp_rank=self.cp_rank_val,
+        cfgs=cfgs,
+        q_start=q_start,
+    )
     end_k_idx = jnp.minimum(num_k, end_k_idx_causal)
 
     if not cfgs.serve.has_cache_kv:
@@ -763,7 +975,7 @@ class BaseMetadataComputer:
         q_sz_task=q_sz_task,
         kv_cache_len=kv_cache_len,
         kv_new_len=kv_new_len,
-        kv_new_start=q_start,
+        kv_new_start=kv_new_start,
         end_k_idx=end_k_idx,
         num_k=num_k,
         num_q=num_q,
@@ -782,6 +994,7 @@ class BaseMetadataComputer:
       q_positions_ref,
       kv_cache_lens_ref,
       kv_new_lens_ref,
+      kv_new_starts_ref,
       update_kv_cache_ref,
   ) -> LoopCarry:
     q_start = cu_q_lens_ref[s_idx]
@@ -807,6 +1020,7 @@ class BaseMetadataComputer:
         num_k=num_k,
         num_q=num_q,
         update_kv_cache=update_kv_cache,
+        kv_new_start=kv_new_starts_ref[s_idx],
     )
 
     return jax.lax.fori_loop(0, num_q, q_loop_fn, carry)
@@ -817,6 +1031,7 @@ class BaseMetadataComputer:
       q_positions_ref: jax.Ref,
       kv_cache_lens_ref: jax.Ref,
       kv_new_lens_ref: jax.Ref,
+      kv_new_starts_ref: jax.Ref,
       update_kv_cache_ref: jax.Ref,
       distribution_ref: jax.Ref,
   ) -> LoopCarry:
@@ -827,6 +1042,7 @@ class BaseMetadataComputer:
         q_positions_ref=q_positions_ref,
         kv_cache_lens_ref=kv_cache_lens_ref,
         kv_new_lens_ref=kv_new_lens_ref,
+        kv_new_starts_ref=kv_new_starts_ref,
         update_kv_cache_ref=update_kv_cache_ref,
     )
     start_seq_idx, end_seq_idx = self.cfgs.seq_range(distribution_ref)  # pyrefly: ignore[bad-argument-type]
@@ -842,6 +1058,7 @@ def rpa_metadata_schedule_kernel(
     q_positions_ref: jax.Ref,
     kv_cache_lens_ref: jax.Ref,
     kv_new_lens_ref: jax.Ref,
+    kv_new_starts_ref: jax.Ref,
     update_kv_cache_ref: jax.Ref,
     distribution_ref: jax.Ref,
     extra_scalars_ref: Sequence[jax.Ref],
@@ -878,6 +1095,8 @@ def rpa_metadata_schedule_kernel(
     kv_cache_lens_ref: [max_num_seqs]. Existing kv cache length of each
       sequence.
     kv_new_lens_ref: [max_num_seqs]. New kv length of each sequence.
+    kv_new_starts_ref: [max_num_seqs]. Offset of each sequence's new KV in
+      `new_kv_hbm`.
     update_kv_cache_ref: [max_num_seqs]. 1 if this sequence writes its new KV
       back to the paged cache.
     distribution_ref: [3]. Cumulative sum of number of decode, prefill, and
@@ -902,6 +1121,7 @@ def rpa_metadata_schedule_kernel(
       q_positions_ref=q_positions_ref,
       kv_cache_lens_ref=kv_cache_lens_ref,
       kv_new_lens_ref=kv_new_lens_ref,
+      kv_new_starts_ref=kv_new_starts_ref,
       update_kv_cache_ref=update_kv_cache_ref,
       distribution_ref=distribution_ref,
   )
@@ -926,6 +1146,7 @@ def generate_rpa_metadata(
     q_positions: jax.Array,
     kv_cache_lens: jax.Array,
     kv_new_lens: jax.Array,
+    kv_new_starts: jax.Array,
     distribution: jax.Array,
     cfgs: configs.RpaConfigs,
     *,
@@ -950,7 +1171,7 @@ def generate_rpa_metadata(
       ),
       out_shape=schedule_hbm,
       grid_spec=pltpu.PrefetchScalarGridSpec(
-          num_scalar_prefetch=7,
+          num_scalar_prefetch=8,
           in_specs=[],
           out_specs=schedule_hbm.out_specs(),
           scratch_shapes=[
@@ -965,6 +1186,7 @@ def generate_rpa_metadata(
       q_positions,
       kv_cache_lens,
       kv_new_lens,
+      kv_new_starts,
       update_kv_cache,
       distribution,
       extra_scalars,
@@ -989,6 +1211,10 @@ class BaseScheduler(ABC):
       ...
 
     @property
+    def cp_kv_cache_interleave_size(self) -> int | None:
+      ...
+
+    @property
     def ring_axis_name(self) -> str | None:
       ...
 
@@ -1010,6 +1236,7 @@ class BaseScheduler(ABC):
 
   else:
     cp_group_size = None
+    cp_kv_cache_interleave_size = None
     ring_axis_name = None
     ring_mesh_axis_names = None
     is_packed_lse = False

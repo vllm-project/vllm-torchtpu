@@ -782,6 +782,41 @@ def _patch_vllm_offload_all_ranks_kv_bytes() -> None:
     logger.info("Applied TPU patch: all-ranks KV bytes per block for offloading.")
 
 
+def _patch_vllm_dcp_over_pcp_head_check() -> None:
+    """Skip vLLM's GQA DCP head checks when DCP spans the PCP axis.
+
+    `ParallelConfig` allows DCP over the PCP axis (`dcp == pcp`), but
+    `ModelConfig.verify_with_parallel_config` still checks GQA as if DCP
+    reused the TP ranks (`tp > num_kv_heads`, `dcp <= tp / num_kv_heads`).
+    Over the PCP axis every DCP rank keeps all of its TP-local KV heads and
+    only the full-attention pages are sharded, so the head checks do not apply.
+    """
+    from vllm.config.model import ModelConfig
+
+    if getattr(ModelConfig, "_tpu_dcp_over_pcp_head_check_patched", False):
+        return
+
+    original_verify = ModelConfig.verify_with_parallel_config
+
+    def verify_with_parallel_config(self, parallel_config):
+        dcp = parallel_config.decode_context_parallel_size
+        if (
+            self.use_mla
+            or dcp <= 1
+            or dcp != parallel_config.prefill_context_parallel_size
+        ):
+            return original_verify(self, parallel_config)
+        # The config is validated on assignment; restore it untouched.
+        object.__setattr__(parallel_config, "decode_context_parallel_size", 1)
+        try:
+            return original_verify(self, parallel_config)
+        finally:
+            object.__setattr__(parallel_config, "decode_context_parallel_size", dcp)
+
+    ModelConfig.verify_with_parallel_config = verify_with_parallel_config
+    ModelConfig._tpu_dcp_over_pcp_head_check_patched = True
+
+
 def _patch_vllm_kimi_kda_layer_counts() -> None:
     """Patch ModelConfig.get_num_layers_by_block_type to report accurate counts
     for Kimi models with KDA using linear_attn_config (e.g. Kimi-K3).
@@ -818,6 +853,11 @@ def _patch_vllm_kimi_kda_layer_counts() -> None:
     logger.info(
         "Applied TPU patch: accurate layer counts for Kimi-K3 / KDA hybrid models."
     )
+
+
+# Set on a `KVCacheConfig` whose hybrid model runs DCP over the PCP axis
+# (dcp == pcp > 1, the PCP manager): the CP size the coordinator folds in.
+_DCP_OVER_PCP_ATTR = "_tpu_dcp_over_pcp_world_size"
 
 
 def _patch_vllm_hybrid_pcp_block_sizes() -> None:
@@ -890,8 +930,9 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
         spec: KVCacheSpec, pcp: int, dcp: int = 1
     ) -> KVCacheSpec:
         """Restate a rank-local spec in the logical (all-ranks) page size."""
-        assert not (pcp > 1 and dcp > 1), (
-            f"Concurrent PCP and DCP are not supported: got pcp={pcp}, dcp={dcp}."
+        assert pcp == 1 or dcp in (1, pcp), (
+            "PCP and DCP must share one context-parallel axis (dcp == pcp): "
+            f"got pcp={pcp}, dcp={dcp}."
         )
         if isinstance(spec, UniformTypeKVCacheSpecs):
             effective_specs = {
@@ -928,11 +969,15 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
         pcp = parallel_config.prefill_context_parallel_size
         groups = kv_cache_config.kv_cache_groups
 
-        if len(groups) <= 1 or dcp != 1 or pcp == 1:
+        # DCP over the PCP axis (dcp == pcp, the PCP manager) shards the same
+        # attention pages that PCP alone does.
+        if len(groups) <= 1 or dcp not in (1, pcp) or pcp == 1:
             return original_resolve(kv_cache_config, vllm_config)
 
         if not _is_attention_mamba_hybrid(groups):
             return original_resolve(kv_cache_config, vllm_config)
+        if dcp == pcp:
+            setattr(kv_cache_config, _DCP_OVER_PCP_ATTR, pcp)
 
         group_block_sizes = [
             _effective_block_size(group.kv_cache_spec, pcp) for group in groups
@@ -997,7 +1042,12 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
         ):
             groups = kv_cache_config.kv_cache_groups
             logical_pcp_world_size = pcp_world_size
-            if pcp_world_size == 1 and _is_attention_mamba_hybrid(groups):
+            # DCP over the PCP axis: block sizes alone cannot tell it from
+            # DCP without PCP, so `resolve_kv_cache_block_sizes` records it.
+            recorded_cp = getattr(kv_cache_config, _DCP_OVER_PCP_ATTR, None)
+            if recorded_cp is not None and dcp_world_size == recorded_cp:
+                logical_pcp_world_size = recorded_cp
+            elif pcp_world_size == 1 and _is_attention_mamba_hybrid(groups):
                 # vLLM 0.26's Scheduler already folds PCP into
                 # scheduler_block_size, but hard-codes pcp_world_size=1 when
                 # constructing KVCacheManager. Recover the folded PCP factor
@@ -1029,9 +1079,11 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                     )
 
             if logical_pcp_world_size > 1 and _is_attention_mamba_hybrid(groups):
-                if dcp_world_size != 1:
+                if dcp_world_size not in (1, logical_pcp_world_size):
                     raise ValueError(
-                        "TPU hybrid PCP cache coordination does not support DCP."
+                        "TPU hybrid PCP cache coordination supports DCP only "
+                        "over the PCP axis (dcp == pcp), got "
+                        f"dcp={dcp_world_size}, pcp={logical_pcp_world_size}."
                     )
                 # The generic coordinator only needs logical token
                 # granularity. Encoding PCP into each group spec and then
@@ -1050,7 +1102,10 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                         for group in kv_cache_config.kv_cache_groups
                     ],
                 )
+                # The specs now hold the CP factor; DCP over the PCP axis adds
+                # no second one.
                 pcp_world_size = 1
+                dcp_world_size = 1
 
             return original_factory(
                 kv_cache_config,

@@ -32,7 +32,12 @@ if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
 Stage = Literal[
-    "import", "platform_activation", "engine_core", "worker_init", "model_load"
+    "import",
+    "pre_config",
+    "platform_activation",
+    "engine_core",
+    "worker_init",
+    "model_load",
 ]
 
 
@@ -107,6 +112,13 @@ PATCHES = (
     ),
     Patch("vllm_torchtpu:_patch_dflash_drafting_slot_budget", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
+    # Before `VllmConfig.__post_init__` validates the model against the
+    # parallel config: ahead of platform activation, and again in the engine
+    # core's handshake.
+    Patch(
+        "vllm_torchtpu:_patch_vllm_dcp_over_pcp_head_check",
+        ("pre_config", "engine_core"),
+    ),
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_force_v1_runner_tpu", _ACTIVE),
@@ -198,6 +210,7 @@ def apply(stage: Stage, *, model_config: "ModelConfig | None" = None) -> None:
     """
     if stage not in (
         "import",
+        "pre_config",
         "platform_activation",
         "engine_core",
         "worker_init",

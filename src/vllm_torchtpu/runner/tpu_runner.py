@@ -1748,7 +1748,7 @@ class TPUModelRunner(GPUModelRunner):
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         with set_current_vllm_config(self.vllm_config):
             self.kv_cache_manager.initialize_kv_cache(kv_cache_config)
-        if self.pcp_manager is not None:
+        if self.pcp_manager is not None and self.model_config.use_mla:
             self.pcp_manager.set_page_size(mla_kv_page_size(kv_cache_config))
 
     def get_kv_prewarm_shapes(self) -> list[int]:
