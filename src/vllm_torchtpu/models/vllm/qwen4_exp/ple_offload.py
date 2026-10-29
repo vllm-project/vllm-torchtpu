@@ -144,3 +144,58 @@ def _host_lookup_finish_fake(
         (dp_size, local_tokens, embedding_dim),
         dtype=torch.int8 if fp8 else torch.int16,
     )
+
+
+# VLLM_TPU_PLE_HOST_PRELOOKUP: the lookup runs before the backbone is called
+# (Qwen4ExpForCausalLM.forward) and its rows enter the graph as an input, so the
+# TP graph has no host boundary: one program launch per step instead of the
+# piece before the PLE layer plus the piece after it.
+_prelookup_check = {"left": 0, "checked": 0, "bad": 0, "armed": False}
+
+
+def prelookup_rows(ple, inputs, valid_tokens: torch.Tensor, ids_fn) -> torch.Tensor:
+    """``ple``'s raw host rows for ``inputs``: ids on the device by ``ids_fn``
+    (the compiled ``_lookup_ids``), one blocking copy of the ids, the host
+    gather, and the upload. Same ids, gather and layout as ``host_lookup``."""
+    table = ple.ple_embedding.ngram_embedding
+    assert isinstance(table, HostPLETable)
+    ids = ids_fn(inputs, valid_tokens)
+    host_ids = ids.cpu()
+    check = envs.VLLM_TPU_PLE_HOST_PRELOOKUP_CHECK
+    if check:
+        _check_prelookup(ple, table, inputs, valid_tokens, host_ids, check)
+    raw = table.lookup_host(host_ids)
+    dp_size = ple.parallel.dp_group.world_size if ple.parallel.across_dp else 1
+    return raw.reshape(
+        dp_size, inputs.input_ids.shape[0], table.embedding_dim * ids.shape[-1]
+    ).to(inputs.input_ids.device, non_blocking=raw.is_pinned())
+
+
+def _check_prelookup(ple, table, inputs, valid_tokens, host_ids, check: str) -> None:
+    """VLLM_TPU_PLE_HOST_PRELOOKUP_CHECK=N (``fault:N``, its positive control,
+    shifts the reference's tokens by one): for the first N live steps compare
+    the gathered rows with the eager in-graph-style lookup of the same inputs."""
+    c = _prelookup_check
+    if not c["armed"]:
+        c["armed"] = True
+        c["left"] = int(check.split(":")[-1] or 0)
+    if c["left"] <= 0 or not bool((host_ids >= 0).any()):
+        return
+    c["left"] -= 1
+    ref_inputs = inputs
+    if check.startswith("fault"):
+        ref_inputs = type(inputs)(
+            torch.roll(inputs.input_ids, 1), inputs.query_start_loc, inputs.ngram_context
+        )
+    ref_ids = ple._lookup_ids(ref_inputs, valid_tokens).cpu()
+    ref = table.lookup_host(ref_ids).clone()
+    got = table.lookup_host(host_ids)
+    c["checked"] += 1
+    c["bad"] += int(not (torch.equal(ref_ids, host_ids) and torch.equal(ref, got)))
+    if c["left"] == 0 or c["checked"] % 500 == 0:
+        logger.warning(
+            "PLE prelookup check (%s): %d of %d live steps differed",
+            check,
+            c["bad"],
+            c["checked"],
+        )

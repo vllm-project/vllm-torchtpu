@@ -193,3 +193,66 @@ def test_overlap_adds_its_split_points_only_when_enabled(monkeypatch):
         "qwen4_exp::host_lookup_start",
         "qwen4_exp::host_lookup_finish",
     ]
+
+
+@pytest.mark.parametrize("check", ["", "4", "fault:4"])
+@pytest.mark.parametrize("fp8", [False, True])
+def test_prelookup_rows_match_host_boundary(monkeypatch, fp8, check):
+    """VLLM_TPU_PLE_HOST_PRELOOKUP: the rows looked up ahead of the backbone
+    equal the host boundary's for the same ids; the check mode passes clean
+    and its fault control (reference tokens shifted) is caught."""
+    from vllm.forward_context import override_forward_context
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.models.vllm.qwen4_exp import ple_offload
+    from vllm_torchtpu.models.vllm.qwen4_exp.ple import PLEInputs
+    from vllm_torchtpu.models.vllm.qwen4_exp.ple_offload import (
+        host_lookup,
+        prelookup_rows,
+    )
+    from vllm_torchtpu.models.vllm.qwen4_exp.ple_storage import HostPLETable
+
+    width, heads, start, rows = 24, 3, 17, 11
+    bits = (torch.arange(rows * width) * 73 + 159).reshape(rows, width)
+    bits = bits.to(torch.int8 if fp8 else torch.int16)
+    embedding = HostPLETable.__new__(HostPLETable)
+    torch.nn.Module.__init__(embedding)
+    embedding._finalized = True
+    embedding.storage_dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
+    embedding.shard_indices = NS(
+        org_vocab_start_index=start, org_vocab_end_index=start + rows
+    )
+    embedding.embedding_dim = width
+    embedding._shared_table = None
+    embedding.weight = torch.nn.Parameter(
+        bits.view(embedding.storage_dtype), requires_grad=False
+    )
+
+    def lookup_ids(inputs, valid_tokens):
+        return (inputs.input_ids[:, None] + torch.arange(heads)).to(torch.int32)
+
+    ple = NS(
+        ple_embedding=NS(ngram_embedding=embedding),
+        parallel=NS(across_dp=False, dp_group=NS(world_size=1)),
+        _lookup_ids=lookup_ids,
+    )
+    monkeypatch.setattr(envs, "VLLM_TPU_PLE_HOST_PRELOOKUP_CHECK", check, raising=False)
+    monkeypatch.setattr(
+        ple_offload,
+        "_prelookup_check",
+        {"left": 0, "checked": 0, "bad": 0, "armed": False},
+    )
+    context = NS(no_compile_layers={"ple": ple})
+    for count in (7, 16):
+        tokens = (torch.arange(count, dtype=torch.int32) * 3) % (rows + 4) + start - 2
+        inputs = PLEInputs(tokens, torch.tensor([0, count]), torch.zeros(1, 2))
+        got = prelookup_rows(ple, inputs, torch.tensor([count]), lookup_ids)
+        with override_forward_context(context):
+            want = host_lookup(
+                lookup_ids(inputs, None), count, heads * width, 1, fp8, "ple"
+            )
+        assert torch.equal(got, want)
+    if check:
+        bad = ple_offload._prelookup_check["bad"]
+        assert ple_offload._prelookup_check["checked"] == 2
+        assert (bad == 0) if check == "4" else (bad == 2), bad

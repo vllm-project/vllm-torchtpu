@@ -518,6 +518,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         "positions": 0,
         "inputs_embeds": 0,
         "valid_tokens": 0,
+        "ple_raw_embeddings": 1,
     }
 )
 class Qwen4ExpBackbone(nn.Module):
@@ -589,6 +590,7 @@ class Qwen4ExpBackbone(nn.Module):
         valid_tokens,
         main_block_table,
         compressed_block_table,
+        ple_raw_embeddings=None,
     ):
         """The replicated-TP backbone; sequence-parallel steps go to
         ``Qwen4ExpBackboneSP``, a separate compiled graph over the same layers."""
@@ -597,6 +599,7 @@ class Qwen4ExpBackbone(nn.Module):
             positions,
             inputs_embeds,
             sequence_parallel=False,
+            ple_raw_embeddings=ple_raw_embeddings,
             query_start_loc=query_start_loc,
             ngram_context=ngram_context,
             state_slots=state_slots,
@@ -620,12 +623,13 @@ class Qwen4ExpBackbone(nn.Module):
         valid_tokens,
         main_block_table,
         compressed_block_table,
+        ple_raw_embeddings=None,
     ):
         # Resolve host lookup before any decoder work so shape arithmetic
         # stays in the main graph and model preparation precedes the D2H wait.
-        ple_raw_embeddings = None
+        # VLLM_TPU_PLE_HOST_PRELOOKUP hands the rows in, so no host boundary.
         ple_token = None
-        if self.host_ple_index is not None:
+        if self.host_ple_index is not None and ple_raw_embeddings is None:
             ple = cast(Qwen4ExpDecoderLayer, self.layers[self.host_ple_index]).ple
             assert ple is not None
             ple_inputs = PLEInputs(input_ids, query_start_loc, ngram_context)
@@ -909,6 +913,7 @@ class Qwen4ExpSegmentModel(nn.Module):
         "positions": 0,
         "inputs_embeds": 0,
         "valid_tokens": 0,
+        "ple_raw_embeddings": 1,
     }
 )
 class Qwen4ExpBackboneSP(nn.Module):
@@ -938,12 +943,14 @@ class Qwen4ExpBackboneSP(nn.Module):
         valid_tokens,
         main_block_table,
         compressed_block_table,
+        ple_raw_embeddings=None,
     ):
         return self._backbone._forward_impl(
             input_ids,
             positions,
             inputs_embeds,
             sequence_parallel=True,
+            ple_raw_embeddings=ple_raw_embeddings,
             query_start_loc=query_start_loc,
             ngram_context=ngram_context,
             state_slots=state_slots,
@@ -1059,7 +1066,38 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
 
+    def _ple_prelookup(self, input_ids, kwargs):
+        """VLLM_TPU_PLE_HOST_PRELOOKUP: the host PLE rows, computed here in
+        eager code ahead of the backbone call (see ple_offload.prelookup_rows)."""
+        from vllm_torchtpu.spec_decode.eagle3 import _static_shape_args
+
+        from .ple_offload import prelookup_rows
+
+        backbone = self.model
+        ple = cast(Qwen4ExpDecoderLayer, backbone.layers[backbone.host_ple_index]).ple
+        assert ple is not None
+        fn = self.__dict__.get("_ple_ids_fn")
+        if fn is None:
+            fn = self._ple_ids_fn = _static_shape_args(
+                torch.compile(
+                    ple._lookup_ids, backend="tpu", fullgraph=True, dynamic=False
+                )
+            )
+        starts = kwargs["query_start_loc"]
+        return prelookup_rows(
+            ple,
+            PLEInputs(input_ids, starts, kwargs["ngram_context"]),
+            starts[-1:],
+            fn,
+        )
+
     def forward(self, input_ids, positions, inputs_embeds=None, **kwargs):
+        if (
+            envs.VLLM_TPU_PLE_HOST_PRELOOKUP
+            and self.model.host_ple_index is not None
+            and inputs_embeds is None
+        ):
+            kwargs["ple_raw_embeddings"] = self._ple_prelookup(input_ids, kwargs)
         # The route reads the padded bucket size outside both compiled graphs.
         if self.model_sp is None:
             return self.model(input_ids, positions, inputs_embeds, **kwargs)
