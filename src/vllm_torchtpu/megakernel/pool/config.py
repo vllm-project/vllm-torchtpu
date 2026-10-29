@@ -26,6 +26,7 @@ import dataclasses
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
+from ..errors import MegakernelConfigError
 from ..exec_spec import NumericsClass
 
 if TYPE_CHECKING:
@@ -76,6 +77,8 @@ class CacheExec:
     # (device-to-host sync + Python loop). In-kernel routing to shared null
     # page 0 always applies.
     check_ckpt_bounds: bool = False
+    dcp_kv_sharded: bool = False
+    dcp_size: int = 1  # Ranks sharing one KV head group (`R // NKV`)
 
     def __post_init__(self) -> None:
         if not any(
@@ -177,5 +180,22 @@ __all__ = [
     "PoolBackend",
     "cache_exec",
     "resolved_max_pages_per_seq",
+    "check_dcp_interleave",
+    "dcp_group",
     "with_cache",
 ]
+
+
+def check_dcp_interleave(interleave: int, page_size: int) -> None:
+    """Validate that DCP interleave size matches megakernel page size."""
+    if int(interleave) != int(page_size):
+        raise MegakernelConfigError(
+            f"cp_kv_cache_interleave_size ({interleave}) "
+            f"must equal page_size ({page_size})"
+        )
+
+
+def dcp_group(ex: ExecSpec) -> int:
+    """Ranks that token-shard one KV head group's pages (1 when unsharded)."""
+    cx = cache_exec(ex)
+    return cx.dcp_size if cx.dcp_kv_sharded else 1

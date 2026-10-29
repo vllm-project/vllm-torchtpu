@@ -99,7 +99,10 @@ def baseline_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
     else:
         t = DECODE_TILES
     if R not in (1, 8) and t.hier != 0:
-        t = dataclasses.replace(t, hier=0)
+        if R > 8 and (R & (R - 1)) == 0:
+            t = dataclasses.replace(t, hier=3, rsag=False)
+        else:
+            t = dataclasses.replace(t, hier=0)
     return t
 
 

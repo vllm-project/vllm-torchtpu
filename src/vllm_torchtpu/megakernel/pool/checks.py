@@ -23,7 +23,7 @@ import numpy as np
 from jax.experimental import pallas as pl
 
 from ..ops import I32
-from .config import cache_exec
+from .config import cache_exec, dcp_group
 
 if TYPE_CHECKING:
     from ..exec_spec import ExecSpec
@@ -83,6 +83,7 @@ def _validate_pool_metadata_host(
     active_kv_pages: set[int] = set()
     kv_write_owner: dict[int, int] = {}
     seen_kv_targets: set[tuple[int, int]] = set()
+    dcp_g = dcp_group(ex)
 
     for s in range(NS):
         if not bool(act_s[s]):
@@ -90,7 +91,7 @@ def _validate_pool_metadata_host(
         seq_pos = pos[s * T : (s + 1) * T]
         for t in range(T):
             p_tok = int(seq_pos[t])
-            lp_tok = p_tok // page_size
+            lp_tok = (p_tok // page_size) // dcp_g
             if p_tok < 0 or lp_tok >= pt.shape[1]:
                 if check_bounds:
                     raise ValueError(
@@ -121,7 +122,9 @@ def _validate_pool_metadata_host(
                 )
             seen_kv_targets.add(target)
 
-        max_lp = min(pt.shape[1], max(0, int(np.max(seq_pos)) // page_size + 1))
+        max_lp = min(
+            pt.shape[1], max(0, (int(np.max(seq_pos)) // page_size) // dcp_g + 1)
+        )
         for lp in range(max_lp):
             p_id = int(pt[s, lp])
             if p_id <= 0 or p_id >= num_pages:

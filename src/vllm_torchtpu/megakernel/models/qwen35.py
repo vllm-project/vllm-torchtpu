@@ -71,7 +71,7 @@ class Qwen35(ModelDef):
     """Declarative model definition for Qwen3.5-397B-A17B."""
 
     display_name = "Qwen3.5"
-    supported_tp_sizes = (8,)
+    supported_tp_sizes = (8, 32)
     geometry_cls = Qwen35Geometry
     layer_type_name = "qwen35_layer"
     default_hf_config = DEFAULT_HF_CONFIG
