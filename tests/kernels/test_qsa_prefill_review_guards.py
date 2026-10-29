@@ -23,10 +23,11 @@ import pytest
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from tests.kernels.prefill_work_model_helpers import work_model
 from vllm_torchtpu.kernels.qwen4_exp import block_sparse_gqa_prefill as tc
 from vllm_torchtpu.kernels.qwen4_exp import prefill_tiles
 from vllm_torchtpu.kernels.sparse_gqa_prefill import adaptive, grouped
-from vllm_torchtpu.kernels.sparse_gqa_prefill.cost_model import COST_MODELS, tc_cost
+from vllm_torchtpu.kernels.sparse_gqa_prefill.cost_model import tc_cost
 
 
 @pytest.fixture
@@ -177,10 +178,13 @@ def test_ragged_schedule_may_select_sc_and_counts_request_local_unions():
             rows,
             1024,
             jnp.bfloat16,
-            tc._ragged_plan(rows, 24, 256, 2048, 65536, 158, 512, 256),
+            tc._ragged_plan(
+                rows, 24, 256, 2048, 65536, 158, 512, 256, request_capacity=rows
+            ),
+            work_model(jnp.bfloat16),
         )
     )
-    model = COST_MODELS[jnp.dtype(jnp.bfloat16)]
+    model = work_model(jnp.bfloat16)
     one = tc_cost(
         model, queries=256, num_tiles=1024, tile_visits=jnp.int32(8), launches=1
     )
@@ -222,7 +226,7 @@ def test_ragged_general_tc_uses_bounded_pack_and_each_requests_table(
     )
     actual, _ = run(*args, padded)
     expected, _ = run(*args, short)
-    plan = tc._ragged_plan(17, 4, 128, 128, 32, 1, 4, 128)
+    plan = tc._ragged_plan(17, 4, 128, 128, 32, 1, 4, 128, request_capacity=17)
     assert sizes and set(sizes) == {plan[0] * 128}
     np.testing.assert_array_equal(actual, expected)
     np.testing.assert_array_equal(np.asarray(actual[:, 0, 0]), [1] * 3 + [3.5] * 14)
@@ -284,7 +288,10 @@ def test_tiny_ragged_selector_traces_both_branches(tokens):
             size=tokens,
             num_tiles=1024,
             dtype=jnp.bfloat16,
-            plan=tc._ragged_plan(tokens, 24, 256, 2048, 65536, 158, 512, 256),
+            plan=tc._ragged_plan(
+                tokens, 24, 256, 2048, 65536, 158, 512, 256, request_capacity=tokens
+            ),
+            model=work_model(),
         )
     )(ids, lengths, starts)
     assert choose.shape == ()
@@ -292,22 +299,22 @@ def test_tiny_ragged_selector_traces_both_branches(tokens):
 
 @pytest.mark.parametrize(
     "heads,page_size,budget",
-    [(12, 1664, 512), (24, 896, 512), (48, 1664, 512), (24, 1664, 16), (24, 1664, 256)],
+    [(12, 128, 512), (24, 896, 512), (24, 256, 16), (24, 2048, 256)],
 )
-def test_noncalibrated_geometry_uses_generic_tc(
+def test_geometry_and_page_use_the_work_model_route(
     monkeypatch, tpu_info, heads, page_size, budget
 ):
     recorded = []
 
-    def tc_only(*args, **kwargs):
-        recorded.append(kwargs)
-        return jnp.zeros_like(args[0]), args[5]
+    def selected(arrays, cache, starts, model):
+        recorded.append(model)
+        return jnp.zeros_like(arrays[0]), cache
 
     def forbidden(*args, **kwargs):
-        raise AssertionError("Noncalibrated geometry used fitted latency coefficients")
+        raise AssertionError("Legal geometry bypassed the work model")
 
-    monkeypatch.setattr(tc, "block_sparse_gqa_attention", tc_only)
-    monkeypatch.setattr(adaptive, "_one_chunk", forbidden)
+    monkeypatch.setattr(tc, "block_sparse_gqa_attention", forbidden)
+    monkeypatch.setattr(adaptive, "_one_chunk", selected)
     query = jnp.zeros((256, heads, 256), jnp.bfloat16)
     cache = jnp.zeros((1, page_size, 2, 2, 256), jnp.bfloat16)
     output, returned = adaptive.adaptive_prefill(
@@ -318,16 +325,17 @@ def test_noncalibrated_geometry_uses_generic_tc(
         jnp.zeros((256, 1), jnp.int32),
         cache,
         jnp.array([0, 256], jnp.int32),
+        kv_heads=2,
+        ratio=4,
     )
     assert output.shape == query.shape and returned is cache
-    assert len(recorded) == 1
-    assert (recorded[0]["query_block"], recorded[0]["kv_tile"]) == (
-        prefill_tiles.get_sparse_prefill_tiles(query, cache, kv_heads=2, ratio=4)
-    )
+    assert len(recorded) == 1 and recorded[0].budget == budget
 
 
 @pytest.mark.parametrize("bf16_io", [False, True])
-def test_tc_cost_counts_cast_boundary_bytes(monkeypatch, tpu_info, bf16_io):
+def test_tc_hint_counts_cast_boundaries_and_main_matrix_products(
+    monkeypatch, tpu_info, bf16_io
+):
     query = jnp.zeros((128, 4, 128), jnp.bfloat16)
     blocks, lengths, table = metadata_inputs()
     cache = jnp.zeros((4, 128, 2, 2, 128), jnp.bfloat16)
@@ -345,19 +353,23 @@ def test_tc_cost_counts_cast_boundary_bytes(monkeypatch, tpu_info, bf16_io):
     boundary_dtype = jnp.bfloat16 if bf16_io else jnp.float32
     assert args[4].dtype == output.dtype == boundary_dtype
     repeated_kv_bytes = 4 * 128 * 2 * 2 * 128 * 2
-    assert captured["cost_estimate"].bytes_accessed == (
-        sum(x.nbytes for x in args[:-1]) + output.nbytes + repeated_kv_bytes
+    cost = captured["cost_estimate"]
+    assert cost.flops == 4 * 128 * 4 * 128 * 128 * 4
+    assert cost.transcendentals == 262144 + 2048
+    assert (
+        cost.bytes_accessed
+        == sum(x.nbytes for x in args[:-1]) + output.nbytes + repeated_kv_bytes
     )
 
 
-def test_sc_indices_use_each_rows_table_and_costs_cover_compact_traffic(
+def test_sc_indices_keep_row_ownership_and_only_gather_has_a_byte_hint(
     monkeypatch, tpu_info
 ):
     original_call = pl.pallas_call
-    costs = []
+    costs: list[bool | pl.CostEstimate] = []
 
     def interpreted(kernel, **kwargs):
-        costs.append(kwargs["cost_estimate"])
+        costs.append("cost_estimate" in kwargs)
         return original_call(kernel, **kwargs, interpret=True)
 
     def gather(kernel, **kwargs):
@@ -398,14 +410,16 @@ def test_sc_indices_use_each_rows_table_and_costs_cover_compact_traffic(
         np.testing.assert_array_equal(
             values[row, : int(lengths[row])], 1 if row % 2 == 0 else 9
         )
-    assert len(costs) == 2
-    assert costs[1].bytes_accessed >= compact.nbytes * 2
-    assert all(
-        c.flops >= 0 and c.transcendentals >= 0 and c.bytes_accessed > 0 for c in costs
-    )
+    assert len(costs) == 2 and costs[0] is False
+    gather_cost = costs[1]
+    assert isinstance(gather_cost, pl.CostEstimate)
+    assert gather_cost.flops == gather_cost.transcendentals == 0
+    assert gather_cost.bytes_accessed == compact.nbytes * 2 + compact.shape[0] * 2 * 4
 
 
-def test_sc_attention_cost_counts_padded_heads_and_gate(monkeypatch, tpu_info):
+def test_sc_attention_hint_separates_score_alpha_and_gate_transcendentals(
+    monkeypatch, tpu_info
+):
     captured = []
 
     def compact(*args, **kwargs):
@@ -433,13 +447,16 @@ def test_sc_attention_cost_counts_padded_heads_and_gate(monkeypatch, tpu_info):
     )
     cost, args = captured[0]
     assert args[1].nbytes > query.nbytes
+    assert cost.flops == 134217728
+    assert cost.transcendentals == 262144 + 128 + 16384
     assert cost.bytes_accessed == sum(x.nbytes for x in args) + args[1].nbytes
+    assert args[1].dtype == args[2].dtype == output.dtype == jnp.bfloat16
     assert output.shape == query.shape
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float8_e4m3fn])
 def test_zero_visit_tc_cost_bounds_all_nonnegative_visit_counts(dtype):
-    model = COST_MODELS[jnp.dtype(dtype)]
+    model = work_model(dtype)
     assert all(coefficient >= 0 for coefficient in model)
     launches = jnp.array([0, 1, 3, 256], jnp.int32)
     visits = jnp.array([0, 1, 23, 1024], jnp.int32)
@@ -482,13 +499,18 @@ def test_ragged_lower_bound_skips_only_resolved_sc_work(
         if requests == 2
         else jnp.arange(257, dtype=jnp.int32)
     )
-    model = COST_MODELS[jnp.dtype(dtype)]
-    launches = jnp.sum((jnp.diff(starts) + 255) // 256, dtype=jnp.int32)
+    model = work_model(dtype)
+    plan = tc._ragged_plan(256, 24, 256, 128, 416, 1, 512, 256, request_capacity=256)
+    tile_count = jnp.sum((jnp.diff(starts) + 255) // 256, dtype=jnp.int32)
+    launches = (tile_count + plan[0] - 1) // plan[0]
+    live_prefix = jnp.concatenate((jnp.zeros(1, jnp.int32), jnp.cumsum(lengths > 0)))
+    live_rows = live_prefix[starts[1:]] - live_prefix[starts[:-1]]
+    minimum_visits = jnp.sum((live_rows + 255) // 256)
     lower = tc_cost(
         model,
-        queries=256 * launches,
+        queries=256 * plan[0] * launches,
         num_tiles=7,
-        tile_visits=jnp.int32(0),
+        tile_visits=minimum_visits,
         launches=launches,
     )
     target = adaptive.sc_cost(model, lengths) * 1.02
@@ -503,7 +525,8 @@ def test_ragged_lower_bound_skips_only_resolved_sc_work(
             256,
             7,
             dtype,
-            tc._ragged_plan(256, 24, 256, 128, 416, 1, 512, 256),
+            tc._ragged_plan(256, 24, 256, 128, 416, 1, 512, 256, request_capacity=256),
+            work_model(dtype),
         )
     assert bool(actual) == expected_sc
     assert len(calls) == expected_fine_calls

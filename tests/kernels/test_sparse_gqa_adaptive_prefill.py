@@ -31,6 +31,7 @@ from vllm_torchtpu.kernels.sparse_gqa_prefill.adaptive import (
     adaptive_prefill,
     is_supported_by_adaptive_prefill,
 )
+from vllm_torchtpu.kernels.sparse_gqa_prefill.cost_model import prefill_cost_model
 from vllm_torchtpu.kernels.sparse_gqa_prefill.selector import select_sc
 
 
@@ -163,7 +164,11 @@ def test_adaptive_prefill_preserves_mixed_outputs_with_bounded_memory(
         pytest.skip("Adaptive SparseCore schedule is measured on TPU7x")
     args = _make_inputs(tokens, context, fp8, sc_first)
     cache = np.asarray(args[5]).copy()
-    compiled = jax.jit(adaptive_prefill).lower(*args).compile()
+    compiled = (
+        jax.jit(functools.partial(adaptive_prefill, kv_heads=2, ratio=4))
+        .lower(*args)
+        .compile()
+    )
     hlo = compiled.as_text()
     assert hlo is not None
     assert ("sc_compact_grouped_prefill" in hlo) == (context > 8192)
@@ -199,7 +204,15 @@ def test_adaptive_prefill_preserves_mixed_outputs_with_bounded_memory(
                     functools.partial(
                         select_sc,
                         num_tiles=math.ceil(args[4].shape[1] * 1664 / 256),
-                        dtype=args[5].dtype,
+                        model=prefill_cost_model(
+                            args[0],
+                            args[2],
+                            args[4],
+                            args[5],
+                            kv_heads=2,
+                            ratio=4,
+                            kv_tile=256,
+                        ),
                     )
                 )(args[2][i : i + 8192], args[3][i : i + 8192])
             )
@@ -273,7 +286,14 @@ def test_full_256k_compiler_workspace_growth_is_bounded_by_metadata(
         args = _abstract_args(jnp.float8_e4m3fn if fp8 else jnp.bfloat16)
         for i in range(5):
             args[i] = jax.ShapeDtypeStruct((tokens, *args[i].shape[1:]), args[i].dtype)
-        compiled = jax.jit(adaptive_prefill, donate_argnums=(5,)).lower(*args).compile()
+        compiled = (
+            jax.jit(
+                functools.partial(adaptive_prefill, kv_heads=2, ratio=4),
+                donate_argnums=(5,),
+            )
+            .lower(*args)
+            .compile()
+        )
         memory = compiled.memory_analysis()
         assert memory is not None
         temporary.append(memory.temp_size_in_bytes)
@@ -298,7 +318,11 @@ def test_output_only_attention_does_not_copy_unused_physical_cache(
         args[i] = jax.ShapeDtypeStruct(shape, args[i].dtype)
     for capacity in (79, 463):
         args[5] = jax.ShapeDtypeStruct((capacity, *args[5].shape[1:]), args[5].dtype)
-        compiled = jax.jit(lambda *xs: adaptive_prefill(*xs)[0]).lower(*args).compile()
+        compiled = (
+            jax.jit(lambda *xs: adaptive_prefill(*xs, kv_heads=2, ratio=4)[0])
+            .lower(*args)
+            .compile()
+        )
         memory = compiled.memory_analysis()
         assert memory is not None
         record_property(
