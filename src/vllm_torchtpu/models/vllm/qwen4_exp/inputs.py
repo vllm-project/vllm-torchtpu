@@ -5,10 +5,12 @@ import math
 import time
 from typing import TYPE_CHECKING, cast
 
+import numpy as np
 import torch
 from vllm.forward_context import set_forward_context
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.compilation import bucket_filter
 from vllm_torchtpu.kv_cache_materializer import LayerKVCache
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.logger import init_logger
@@ -360,6 +362,7 @@ class Qwen4ExpAdapter:
 
     def _prepare_inputs_eager(self, snapshot, current_override=None):
         runner = self.runner
+        self._route_shared_local(snapshot)
         ctx = runner._attn_metadata_builder_ctx
         starts = ctx.query_start_loc
         rows = starts.shape[0] - 1
@@ -657,6 +660,22 @@ class Qwen4ExpAdapter:
                 bad, n, self._ngram_check_bad, left - 1,
             )
 
+    def _route_shared_local(self, snapshot):
+        """Host route for QWEN4_EXP_PREFILL_SP_SHARED_LOCAL: the replica's SP graph takes
+        the step only if every prefill piece (a request with more tokens than a verify
+        window) is at least the configured length."""
+        model = getattr(self.runner, "model", None)
+        qsl = getattr(self.runner, "query_start_loc_np", None)
+        if getattr(model, "model_sp_local", None) is None or not isinstance(qsl, np.ndarray):
+            return
+        qsl = qsl[snapshot.row_start : snapshot.row_start + snapshot.num_requests + 1]
+        pieces = np.diff(qsl)
+        pieces = pieces[pieces > max(self.spec_window, 1)]
+        model.sp_shared_local_step = bool(
+            pieces.size
+            and int(pieces.min()) >= envs.QWEN4_EXP_PREFILL_SP_SHARED_LOCAL_MIN_PIECE
+        )
+
     def dummy_run(
         self, num_tokens, num_reqs, profile_prefix=None, *, dp_lockstep=False
     ):
@@ -767,7 +786,7 @@ class Qwen4ExpAdapter:
         ids = (
             torch.arange(num_tokens, dtype=torch.int32, device=runner.device) * 37 + 17
         ) % self.config.vocab_size
-        return self._dummy_forward(
+        result = self._dummy_forward(
             ids,
             positions,
             kwargs,
@@ -776,6 +795,20 @@ class Qwen4ExpAdapter:
             profile_prefix,
             active_rows=active,
         )
+        model = getattr(runner, "model", None)
+        local = getattr(model, "model_sp_local", None)
+        if local is not None and bucket_filter.module_serves(local, num_tokens):
+            # Compile the shared-expert replica's SP graph for its buckets too, so a long
+            # prefill step never compiles mid-serve.
+            model.sp_shared_local_step = True
+            try:
+                self._dummy_forward(
+                    ids, positions, kwargs, metadata, num_tokens, profile_prefix,
+                    active_rows=active,
+                )
+            finally:
+                model.sp_shared_local_step = False
+        return result
 
     def _idle_run(self, num_tokens, num_reqs):
         """Participate in remote work without touching local live owners."""
