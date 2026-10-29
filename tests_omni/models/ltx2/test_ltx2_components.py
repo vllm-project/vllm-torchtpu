@@ -73,9 +73,8 @@ ROPE_COORDS_MAX_ABS = 1.3e-7
 ROPE_MAX_ABS_ERR = 6.2e-8
 ROPE_MAX_REL_L2 = 3.6e-8
 
-# (TPU fp32, TPU bf16) rel_l2 bounds vs diffusers CPU fp32, ~3% above the
-# observed values. Both sides are deterministic across hosts; a CPU bf16
-# reference is not (its error moved 3.3% between hosts), so it is not used.
+# (TPU fp32, TPU bf16) rel_l2 and max_abs bounds vs diffusers CPU fp32, ~3%
+# above the observed values. Both sides are deterministic across hosts.
 DIT_MAX_REL_L2: dict[tuple[str, str], tuple[float, float]] = {
     ("t2v", "video"): (4.3e-3, 9.3e-3),
     ("t2v", "audio"): (2.7e-3, 6.2e-3),
@@ -84,9 +83,21 @@ DIT_MAX_REL_L2: dict[tuple[str, str], tuple[float, float]] = {
     ("modality", "video"): (3.3e-3, 7.1e-3),
     ("modality", "audio"): (3.1e-3, 6.2e-3),
 }
+DIT_MAX_ABS: dict[tuple[str, str], tuple[float, float]] = {
+    ("t2v", "video"): (8.5e-3, 2.0e-2),
+    ("t2v", "audio"): (5.6e-3, 1.6e-2),
+    ("stg", "video"): (8.6e-3, 1.9e-2),
+    ("stg", "audio"): (5.8e-3, 1.6e-2),
+    ("modality", "video"): (7.1e-3, 1.3e-2),
+    ("modality", "audio"): (5.8e-3, 1.3e-2),
+}
 CONNECTOR_MAX_REL_L2: dict[str, tuple[float, float]] = {
     "video": (2.8e-3, 5.9e-3),
     "audio": (2.7e-3, 5.6e-3),
+}
+CONNECTOR_MAX_ABS: dict[str, tuple[float, float]] = {
+    "video": (1.6e-2, 2.7e-2),
+    "audio": (1.1e-2, 2.3e-2),
 }
 
 
@@ -449,17 +460,20 @@ def test_ltx2_tiny_transformer_parity(
 
     for modality, ref_out, idx in (("video", ref_video, 0), ("audio", ref_audio, 1)):
         fp32_max, bf16_max = DIT_MAX_REL_L2[(variant, modality)]
+        fp32_max_abs, bf16_max_abs = DIT_MAX_ABS[(variant, modality)]
         assert_parity(
             tpu_outputs[torch.float32][idx],
             ref_out,
             name=f"DiT {variant} {modality} TPU fp32",
             max_rel_l2=fp32_max,
+            max_abs=fp32_max_abs,
         )
         assert_parity(
             tpu_outputs[torch.bfloat16][idx],
             ref_out,
             name=f"DiT {variant} {modality} TPU bf16",
             max_rel_l2=bf16_max,
+            max_abs=bf16_max_abs,
         )
 
 
@@ -538,15 +552,18 @@ def test_ltx2_tiny_connectors_parity(
 
     for modality, ref_out, idx in (("video", ref_video, 0), ("audio", ref_audio, 1)):
         fp32_max, bf16_max = CONNECTOR_MAX_REL_L2[modality]
+        fp32_max_abs, bf16_max_abs = CONNECTOR_MAX_ABS[modality]
         assert_parity(
             tpu_outputs[torch.float32][idx],
             ref_out,
             name=f"connectors {modality} TPU fp32",
             max_rel_l2=fp32_max,
+            max_abs=fp32_max_abs,
         )
         assert_parity(
             tpu_outputs[torch.bfloat16][idx],
             ref_out,
             name=f"connectors {modality} TPU bf16",
             max_rel_l2=bf16_max,
+            max_abs=bf16_max_abs,
         )
