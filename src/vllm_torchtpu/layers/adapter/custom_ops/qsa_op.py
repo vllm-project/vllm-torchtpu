@@ -19,6 +19,8 @@ from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import (
     pooled_qsa_shared_step,
     pooled_qsa_step,
     pooled_qsa_token_select_step,
+    request_window_shape,
+    request_window_shard,
 )
 from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import qsa_step
 
@@ -595,6 +597,7 @@ def _shard_ops(with_rows: bool):
             main_slot=-1,
             max_query_len=1,
             merged=False,
+            request_window=None,
         ):
             return attend_shapes(
                 q, lengths, context, pool, None, compress_ratio, token_topk
@@ -741,6 +744,10 @@ def _token_select_op():
     ):
         tokens, head_dim = qgate.shape[0], nq.shape[0]
         heads = qgate.shape[1] // (2 * head_dim)
+        slots = context.shape[0]
+        rows = -(-tokens // shard_size)
+        if request_window_shard(tokens, slots, shard_size, max_query_len):
+            rows = request_window_shape(slots, shard_size, max_query_len)[1]
         return (
             torch.empty_like(pool),
             qgate.new_empty((tokens, heads, head_dim)),
@@ -748,9 +755,7 @@ def _token_select_op():
             positions.new_empty((tokens,), dtype=torch.int32),
             positions.new_empty((tokens,), dtype=torch.int32),
             positions.new_empty((starts.shape[0],), dtype=torch.int32),
-            positions.new_empty(
-                (tokens // shard_size, token_topk // compress_ratio), dtype=torch.int32
-            ),
+            positions.new_empty((rows, token_topk // compress_ratio), dtype=torch.int32),
         )
 
     return select
@@ -779,10 +784,14 @@ def build_pooled_qsa_token_shard_op(tp_group):
 
     def run(*args, shard_index, kv_heads, **kwargs):
         tokens, slots = args[0].shape[0], args[12].shape[0]
-        assert tokens % world == 0 and tokens // world > slots, (
-            f"token-sharded indexer: {tokens} tokens do not shard over TP "
-            f"{world} with more rows than {slots} request slots"
-        )
+        query_len = kwargs.get("max_query_len", 1)
+        # Verify-sized steps shard request windows (VLLM_TPU_QSA_INDEXER_REQ_SHARD).
+        window = None
+        if request_window_shard(tokens, slots, world, query_len):
+            window = request_window_shape(slots, world, query_len)
+        # Buckets that fit neither layout gather the replicated selection's
+        # slices (same collective in every bucket of the graph).
+
         args = list(args)
         for index in (8, 11, 12, 13, 14, 15):
             args[index] = args[index].to(torch.int32)
@@ -805,11 +814,14 @@ def build_pooled_qsa_token_shard_op(tp_group):
             args[14],
             args[12],
             pool,
-            _all_gather_ranks(blocks, tp_group).reshape(tokens, -1),
+            _all_gather_ranks(blocks, tp_group).reshape(-1, blocks.shape[-1])[
+                : world * blocks.shape[0] if window is not None else tokens
+            ],
             kv_heads=kv_heads,
             compress_ratio=kwargs["compress_ratio"],
             token_topk=kwargs["token_topk"],
             merged=True,
+            **({"request_window": window} if window is not None else {}),
             **attend_kwargs,
         )
         pool.copy_(updated)

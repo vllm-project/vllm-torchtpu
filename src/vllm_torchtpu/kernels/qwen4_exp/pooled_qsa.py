@@ -881,6 +881,65 @@ def token_shard_step(starts, context, shard_index, rows):
     return base, sub_starts, (context + before).astype(context.dtype)
 
 
+def request_window_shard(tokens, slots, size, max_query_len):
+    """Whether a token-sharded step shards request windows: a verify-sized
+    step (at most ``max_query_len`` rows per request slot) would hand a
+    ``tokens / size`` row slice fewer rows than request slots, which the
+    indexer reads as a one-token step. Static per bucket."""
+    return max_query_len > 1 and tokens <= slots * max_query_len and size > 1
+
+
+def token_shard_rows_ok(tokens, slots, size):
+    """Whether contiguous ``tokens / size`` row shards keep the ragged
+    prefill indexer (more rows than request slots). Static per bucket."""
+    return tokens % size == 0 and tokens // size > slots
+
+
+def request_window_shape(slots, size, max_query_len):
+    """``(S, W)``: requests and rows per request-window shard."""
+    per_shard = -(-slots // size)
+    return per_shard, per_shard * max_query_len
+
+
+def request_window_step(starts, context, table, shard_index, slots, window):
+    """Request window ``shard_index`` of a verify step.
+
+    Returns ``(first, sub_starts, sub_context, sub_table, own)``: the shard's
+    first request, its ``slots`` requests' starts (re-based to the window),
+    contexts and table rows, and ``own(x)``, the window's ``window`` rows of
+    a per-row array. Padding requests past the step's slots are empty.
+    """
+    size = -(-len(context) // slots)
+    extra = slots * size - len(context)
+    first = shard_index.reshape(()).astype(jnp.int32) * slots
+    starts = jnp.concatenate([starts, jnp.full((extra,), starts[-1], starts.dtype)])
+    context = jnp.concatenate([context, jnp.zeros((extra,), context.dtype)])
+    table = jnp.concatenate([table, jnp.zeros((extra, table.shape[1]), table.dtype)])
+    row = starts[first]
+    sub_starts = jnp.clip(
+        jax.lax.dynamic_slice_in_dim(starts, first, slots + 1) - row, 0, window
+    ).astype(starts.dtype)
+    sub_context = jax.lax.dynamic_slice_in_dim(context, first, slots)
+    sub_table = jax.lax.dynamic_slice_in_dim(table, first, slots)
+
+    def own(x):
+        padded = jnp.concatenate([x, jnp.zeros((window, *x.shape[1:]), x.dtype)])
+        return jax.lax.dynamic_slice_in_dim(padded, row, window)
+
+    return first, sub_starts, sub_context, sub_table, own
+
+
+def request_window_merge(gathered, req, starts, slots, window):
+    """``[tokens, k]`` blocks from the gathered ``[size * window, k]`` request
+    windows: row ``t`` of request ``r`` is row ``t - starts[r // slots * slots]``
+    of window ``r // slots``. Rows outside every request read row 0 (their
+    lengths are zero)."""
+    shard = req // slots
+    row = jnp.arange(len(req), dtype=jnp.int32) - starts[jnp.minimum(shard * slots, len(starts) - 1)]
+    index = jnp.clip(shard * window + row, 0, len(gathered) - 1)
+    return gathered[index]
+
+
 def compressed_kernel_pages(pages: jax.Array, pool: jax.Array, slot: int = 0, ratio: int = 4) -> jax.Array:
     """Flat kernel-page ids of compressed block-table columns `pages`.
 
@@ -1350,7 +1409,12 @@ def _pooled_qsa(
     on token rows ``[index * T / size, (index + 1) * T / size)`` only and
     returns the same tuple with that shard's ``[T / size, k]`` blocks in place
     of ``candidates``; all-gather them for ``pooled_qsa_shard_attend`` with
-    ``merged``.
+    ``merged``. On a verify-sized step (``request_window_shard``) the shard is
+    a request window instead: requests ``[index * S, (index + 1) * S)`` and
+    their first ``S * max_query_len`` rows (``request_window_step``), so the
+    shard keeps the verify indexer; it returns ``[S * max_query_len, k]``
+    blocks, and ``request_window_merge`` maps the gathered windows back to
+    the step's rows.
     """
     # Keep the Runner's flat group tables at the Torch boundary. Static JAX
     # shapes reconstruct their per-request rows inside the operator.
@@ -1405,6 +1469,59 @@ def _pooled_qsa(
         starts = jnp.arange(len(rows) + 1, dtype=jnp.int32)
         context = jnp.maximum(lengths - 1, 0)
         keep = picked = None
+    if token_shard is not None and request_window_shard(
+        len(iq), len(context), token_shard[1], max_query_len
+    ):
+        assert rows is None, "the request-window shard covers whole verify steps"
+        index, size = token_shard
+        slots, window = request_window_shape(len(context), size, max_query_len)
+        first, sub_starts, sub_context, sub_table, own = request_window_step(
+            starts, context, compressed_table, index, slots, window
+        )
+        local = jnp.arange(window, dtype=jnp.int32)
+        blocks = select_blocks(
+            own(iq),
+            pool,
+            # Rows past the shard's last request belong to the next shard.
+            jnp.where(local < sub_starts[-1], own(lengths), 0),
+            sub_table,
+            jnp.clip(own(req) - first, 0, slots - 1),
+            sub_starts,
+            sub_context,
+            ratio=compress_ratio,
+            block_topk=token_topk // compress_ratio,
+            slot=compressed_slot,
+            max_query_len=max_query_len,
+        )
+        return pool, q, gate, lengths, req, starts, blocks
+    if token_shard is not None and not token_shard_rows_ok(
+        len(iq), len(context), token_shard[1]
+    ):
+        # Neither layout fits this bucket (a small mixed step of a graph that
+        # shards its verify steps): keep the replicated indexer and hand each
+        # rank its slice, so every bucket of the graph has the same all-gather.
+        index, size = token_shard
+        width = -(-len(iq) // size)
+        blocks = select_blocks(
+            iq,
+            pool,
+            lengths,
+            compressed_table,
+            req,
+            starts,
+            context,
+            ratio=compress_ratio,
+            block_topk=token_topk // compress_ratio,
+            slot=compressed_slot,
+            max_query_len=max_query_len,
+        )
+        blocks = jnp.concatenate(
+            [blocks, jnp.zeros((width * size - len(iq), blocks.shape[1]), blocks.dtype)]
+        )
+        base = index.reshape(()).astype(jnp.int32) * width
+        return pool, q, gate, lengths, req, starts, jax.lax.dynamic_slice_in_dim(
+            blocks, base, width
+        )
     if token_shard is not None:
         assert rows is None, "the token shard covers the all-token prefill path"
         index, size = token_shard
@@ -1805,17 +1922,21 @@ def _shard_attend(
     main_slot,
     max_query_len,
     merged,
+    request_window=None,
 ):
     """Merge the gathered candidates, attend, and pick ``rows`` if given.
 
     ``gathered`` is ``[ranks, tokens, k, 2]`` candidates, or ``[tokens, k]``
-    already merged blocks when ``merged``. ``k_scale``/``v_scale`` are the
+    already merged blocks when ``merged``, or the ``[ranks * W, k]`` request
+    windows when ``request_window=(S, W)``. ``k_scale``/``v_scale`` are the
     FP8 scales (1.0 for BF16 KV).
     """
     block_topk = token_topk // compress_ratio
     main_table = main_table.reshape(len(context), -1)
 
     def merge(_):
+        if request_window is not None:
+            return request_window_merge(gathered, req, starts, *request_window)
         if merged:
             return gathered
         return pooled_qsa_shard_merge(gathered, compress_ratio, token_topk)
@@ -1868,6 +1989,7 @@ def pooled_qsa_shard_attend_step(
     main_slot: int = -1,
     max_query_len: int = 1,
     merged: bool = False,
+    request_window: tuple[int, int] | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Finish ``pooled_qsa_shard_select_step``: merge, attend, select."""
     return _shard_attend(
@@ -1889,6 +2011,7 @@ def pooled_qsa_shard_attend_step(
         main_slot=main_slot,
         max_query_len=max_query_len,
         merged=merged,
+        request_window=request_window,
     )
 
 
