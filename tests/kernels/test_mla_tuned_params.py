@@ -133,5 +133,5 @@ def test_k3_tp32_batched_decode_tuned_params() -> None:
     )
     tuned = get_tuned_params(key)
 
-    assert tuned.num_kv_pages_per_block == 32
-    assert tuned.decode_batch_size == 4
+    assert tuned.num_kv_pages_per_block == 8
+    assert tuned.decode_batch_size == 8

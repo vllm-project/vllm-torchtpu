@@ -1357,9 +1357,11 @@ def _k3_tp32_fp8_page256_entries() -> dict[TuningKey, TunableParams]:
     Measured on one v7x TensorCore with the serving call (BF16 Q, 8192-token
     chunk, 128 x 322 page table): at 8K / 40K / 80K of context the mixed
     kernel takes 2.07 / 5.94 / 11.08 ms per layer with (512, 4, 2) against
-    29.3 / 77.0 / 136.6 ms with the untuned default; batched decode of 16 x
-    80K-token sequences takes 0.57 ms with (32 pages, batch 4) against 0.88
-    (cache donated, as in serving).
+    29.3 / 77.0 / 136.6 ms with the untuned default. Batched decode (cache
+    donated, as in serving) with (8 pages, batch 8) is within 1.19x of the
+    best tile and never slower than the default over 2K-80K contexts and
+    1-64 sequences: 16 x 80K takes 0.59 ms against 0.88, 64 x 2K 0.26 ms
+    against 0.30.
     """
     entries: dict[TuningKey, TunableParams] = {}
     for tokens in (1024, 2048, 4096, 8192, 16384):
@@ -1394,8 +1396,8 @@ def _k3_tp32_fp8_page256_entries() -> dict[TuningKey, TunableParams]:
             pages_per_seq=ANY_SIZE,
         )
         entries[key] = TunableParams(
-            decode_batch_size=4,
-            num_kv_pages_per_block=32,
+            decode_batch_size=8,
+            num_kv_pages_per_block=8,
             num_queries_per_block=1,
             vmem_limit_bytes=62914560,
         )
