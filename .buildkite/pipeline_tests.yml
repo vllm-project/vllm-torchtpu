@@ -252,6 +252,7 @@ steps:
         key: "unit_tests_general_nightly"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") == "1"'
+        parallelism: 3
         env:
           SHAPE: *shape_single
         plugins:
