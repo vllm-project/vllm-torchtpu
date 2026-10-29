@@ -7044,6 +7044,7 @@ class TPUModelRunner(GPUModelRunner):
             self._precompile_pooler_subgraphs()
             self._precompile_mamba_rollback_helpers()
             self._precompile_subtract_rejected()
+            self._precompile_spec_tail()
             precompile_inputs = getattr(
                 self.model_adapter, "precompile_fused_inputs", None
             )
@@ -7412,6 +7413,40 @@ class TPUModelRunner(GPUModelRunner):
                 if rows >= self.max_num_reqs:
                     break
                 rows *= 2
+
+    def _precompile_spec_tail(self) -> None:
+        """VLLM_TPU_SPEC_TAIL_COMPILED: compile the one-chunk spec tail for
+        every live request count (exact-count drafts, the sampler's padded
+        rows), so serving never compiles it."""
+        if not (
+            envs.VLLM_TPU_SPEC_TAIL_COMPILED
+            and self.speculative_config
+            and self.scheduler_config.async_scheduling
+        ):
+            return
+        k = self.speculative_config.num_speculative_tokens
+        bound = self.max_num_reqs * (1 + k)
+        bucketed = getattr(getattr(self, "drafter", None), "bucketed_drafts", False)
+        with self._precompile_timed("async-spec substitution tail"):
+            for num_reqs in range(1, self.max_num_reqs + 1):
+                rows = _get_padded_num_reqs_with_upper_limit(num_reqs, self.max_num_reqs)
+                next_tokens = torch.full((rows, k + 1), -1, dtype=torch.int32).to(
+                    self.device
+                )
+                drafts = torch.zeros(
+                    (rows if bucketed else num_reqs, k), dtype=torch.int32
+                ).to(self.device)
+                draft_lengths = torch.zeros(rows, dtype=torch.int32).to(self.device)
+                synchronize_tensors(
+                    _spec_tail_compiled(
+                        next_tokens,
+                        drafts,
+                        draft_lengths,
+                        rows if bucketed else num_reqs,
+                        None if bucketed else num_reqs,
+                        bound,
+                    )
+                )
 
     def _precompile_mamba_rollback_helpers(self) -> None:
         """Warm the compiled rollback scatters at every bucket length.
