@@ -1540,6 +1540,15 @@ class Qwen38SegmentDriver:
         first_warm = self.warm and self.mk_calls == 1
         if first_warm:
             self._tp_barrier("before the first (compiling) call")
+        model = runner.model
+        if (
+            envs.VLLM_TPU_PLE_HOST_PRELOOKUP
+            and getattr(model.model, "host_ple_index", None) is not None
+            and "ple_raw_embeddings" not in kw
+        ):
+            # One host PLE lookup for either path: the rows go in as an input, so the
+            # megakernel programs have no host boundary either.
+            kw = dict(kw, ple_raw_embeddings=model._ple_prelookup(input_ids, kw))
         try:
             if self.check_left > 0 and self.shadow is not None:
                 out = self._shadow_step(runner, input_ids, positions, kw)
