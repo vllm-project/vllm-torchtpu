@@ -765,3 +765,85 @@ def test_a_graph_slicing_this_ranks_rows_is_never_replayed_by_another_rank(
     assert _fingerprint_at_rank(monkeypatch, replicated, 0) == _fingerprint_at_rank(
         monkeypatch, replicated, 1
     )
+
+
+class TestPrecompileProgress:
+    """A waiter reads its bucket owner's precompile progress: it compiles the
+    bucket itself when the owner failed it, and fails the boot when the owner
+    skipped the subgraph or reported nothing before the backstop."""
+
+    def _dirs(self, tmp_path):
+        root = tmp_path / "hash"
+        own = root / "rank_1_0" / "backbone"
+        peer = root / "rank_0_0" / "backbone"
+        own.mkdir(parents=True)
+        peer.mkdir(parents=True)
+        return str(own), str(peer)
+
+    def test_owner_status_pending_failed_skipped(self, tmp_path):
+        import time
+
+        from vllm_torchtpu.compilation.tpu_compiler import PrecompileProgress
+
+        own, peer = self._dirs(tmp_path)
+        waiter = PrecompileProgress(own, subgraph=1)
+        since = time.time() - 1
+        assert waiter.owner_status(0, 512, since) == "pending"  # nothing yet
+        owner = PrecompileProgress(peer, subgraph=1)
+        owner.started()
+        assert waiter.owner_status(0, 512, since) == "pending"
+        owner.saved.append(256)
+        owner.failed[512] = "MemoryError('vmem')"
+        owner.finished()
+        assert waiter.owner_status(0, 256, since) == "pending"  # saved: wait for file
+        assert waiter.owner_status(0, 512, since).startswith("failed")
+        assert waiter.owner_status(0, 1024, since).startswith("failed")
+        # Another subgraph: the owner went on to subgraph 2 without starting 1.
+        other = PrecompileProgress(own, subgraph=1)
+        PrecompileProgress(peer, subgraph=2).started()
+        assert other.owner_status(0, 512, since) != "skipped"  # it did start 1
+        # Subgraph 0 was never started although the owner is past it: skipped.
+        skipped = PrecompileProgress(own, subgraph=0)
+        assert skipped.owner_status(0, 512, since) == "skipped"
+        lagging = PrecompileProgress(str(tmp_path / "hash" / "rank_1_0" / "mtp"), 0)
+        assert lagging.owner_status(0, 512, since) == "pending"  # other module
+
+    def test_wait_fails_fast_on_a_skipped_subgraph_and_at_the_backstop(
+        self, tmp_path, monkeypatch
+    ):
+        import time
+
+        import pytest
+
+        from vllm_torchtpu.compilation import tpu_compiler as tc
+
+        own, peer = self._dirs(tmp_path)
+        monkeypatch.setattr(tc, "_PEER_POLL_S", 0.01)
+        adaptor = tc.TpuCompilerAdaptor.__new__(tc.TpuCompilerAdaptor)
+        adaptor.cache_dir = own
+        waiter = tc.PrecompileProgress(own, subgraph=1)
+        # Owner moved on to subgraph 2 after we started waiting: diverged.
+        def owner_skips():
+            time.sleep(0.05)
+            tc.PrecompileProgress(peer, subgraph=2).started()
+
+        import threading
+
+        threading.Thread(target=owner_skips).start()
+        with tc.wait_for_peer_artifact(5.0, waiter):
+            tc.set_peer_owner(0, 512)
+            with pytest.raises(tc.PeerDivergedError, match="rank 0 skipped"):
+                adaptor._replay_from_peer("artifact_x", None, False, "fp")
+        # Owner says it failed the bucket: compile here (None), no error.
+        tc.PrecompileProgress(peer, subgraph=3).started()
+        failed = tc.PrecompileProgress(peer, subgraph=3)
+        failed.failed[512] = "boom"
+        failed.finished()
+        with tc.wait_for_peer_artifact(5.0, tc.PrecompileProgress(own, subgraph=3)):
+            tc.set_peer_owner(0, 512)
+            assert adaptor._replay_from_peer("artifact_y", None, False, "fp") is None
+        # Nothing reported at all: the backstop fails the boot, naming the rank.
+        with tc.wait_for_peer_artifact(0.05, tc.PrecompileProgress(own, subgraph=4)):
+            tc.set_peer_owner(0, 512)
+            with pytest.raises(tc.PeerDivergedError, match="rank 0 reported nothing"):
+                adaptor._replay_from_peer("artifact_z", None, False, "fp")
