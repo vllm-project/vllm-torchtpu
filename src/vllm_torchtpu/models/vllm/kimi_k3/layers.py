@@ -162,6 +162,11 @@ class KimiMLP(nn.Module):
         return hidden_states
 
 
+# Below 512 tokens (decode batches), XLA fuses the inline reduction into <0.7 ms
+# across all layers, whereas dispatching 186 Pallas grid launches adds ~5 ms.
+_ATTNRES_PREFILL_MIN_TOKENS = 512
+
+
 class AttentionResidual(nn.Module):
     """K3 attention residual with a fused kernel for tiled prefill."""
 
@@ -200,7 +205,11 @@ class AttentionResidual(nn.Module):
     ) -> torch.Tensor:
         if block_residuals.shape[1] == 0:
             return prefix_sum
-        if self._prefill_op is not None and prefix_sum.shape[0] % 16 == 0:
+        if (
+            self._prefill_op is not None
+            and prefix_sum.shape[0] >= _ATTNRES_PREFILL_MIN_TOKENS
+            and prefix_sum.shape[0] % 16 == 0
+        ):
             return self._prefill_op(prefix_sum, block_residuals, self.folded_weight)
         w = self.folded_weight
         if prefix_sum.shape[0] == 1:

@@ -1652,6 +1652,34 @@ def test_attention_residual_single_token_matches_batched_rows() -> None:
         torch.testing.assert_close(alone, batched[row : row + 1])
 
 
+def test_attention_residual_prefill_op_threshold() -> None:
+    """Decode batches (<512) stay on XLA fusion; prefill (>=512) uses Pallas."""
+    torch.manual_seed(0)
+    module = _attention_residual_stub(hidden=64, eps=1e-5)
+    calls: list[int] = []
+
+    def fake_prefill_op(
+        prefix: torch.Tensor, _history: torch.Tensor, _weight: torch.Tensor
+    ) -> torch.Tensor:
+        calls.append(prefix.shape[0])
+        return prefix
+
+    module._prefill_op = fake_prefill_op
+
+    for n in (16, 32, 64, 128, 256):
+        module(
+            torch.randn(n, 64, dtype=torch.bfloat16),
+            torch.randn(n, 4, 64, dtype=torch.bfloat16),
+        )
+    assert calls == []
+
+    module(
+        torch.randn(512, 64, dtype=torch.bfloat16),
+        torch.randn(512, 4, 64, dtype=torch.bfloat16),
+    )
+    assert calls == [512]
+
+
 def test_attention_residual_single_token_trace_is_its_own_bucket() -> None:
     """The one-token structure must not leak into other token buckets.
 
