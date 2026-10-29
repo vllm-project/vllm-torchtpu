@@ -23,7 +23,12 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
 )
-from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
+from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    can_fuse_mlp,
+    get_packing_factor,
+    gmm_v2,
+    gmm_v2_fused_mlp,
+)
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
@@ -184,6 +189,16 @@ def quantize_to_native_fp4_kmajor(
     return packed, scale
 
 
+def _is_fp4_weight(rhs: jax.Array) -> bool:
+    # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
+    # fp4 accuracy (error compounds across MoE layers) with no decode speedup
+    # (decode is weight-HBM-bound). fp8/int4 weights keep the default fp8 act.
+    return (
+        jnp.issubdtype(rhs.dtype, jnp.floating)
+        and jax.dtypes.itemsize_bits(rhs.dtype) == 4
+    )
+
+
 def gmm_wrapper(
     lhs,
     rhs,
@@ -196,13 +211,6 @@ def gmm_wrapper(
     preferred_element_type=None,
     rhs_quant_dtype=None,
 ):
-    # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
-    # fp4 accuracy (error compounds across MoE layers) with no decode speedup
-    # (decode is weight-HBM-bound). fp8/int4 weights keep the default fp8 act.
-    is_fp4_weight = (
-        jnp.issubdtype(rhs.dtype, jnp.floating)
-        and jax.dtypes.itemsize_bits(rhs.dtype) == 4
-    )
     return gmm_v2(
         lhs=lhs,
         rhs=rhs,
@@ -213,7 +221,7 @@ def gmm_wrapper(
         zero_initialize=zero_initialize,
         fuse_act=fuse_act,
         preferred_element_type=preferred_element_type,
-        maybe_quantize_lhs=not is_fp4_weight,
+        maybe_quantize_lhs=not _is_fp4_weight(rhs),
         rhs_quant_dtype=rhs_quant_dtype,
     )
 
@@ -438,34 +446,59 @@ def moe_gmm(
     """
     group_offset = jnp.array([0], dtype=jnp.int32)
 
-    gmm1_res = gmm_wrapper(
-        x,
-        w1,
-        w1_scale,
-        w1_bias,
-        group_sizes,
-        group_offset,
-        zero_initialize=False,
+    # One kernel for both legs keeps the gate/up output in VMEM instead of
+    # writing it to HBM for the down leg to read back.
+    fused_kwargs = dict(
         fuse_act=activation,
+        preferred_element_type=x.dtype,
+        maybe_quantize_lhs=not _is_fp4_weight(w1),
         rhs_quant_dtype=rhs_quant_dtype,
     )
-    packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
-    gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
+    if _is_fp4_weight(w1) == _is_fp4_weight(w2) and can_fuse_mlp(
+        x, w1, w2, group_sizes, w1_scale, w1_bias, w2_scale, w2_bias, **fused_kwargs
+    ):
+        gmm2_res = gmm_v2_fused_mlp(
+            x,
+            w1,
+            w2,
+            group_sizes,
+            w1_scale,
+            w1_bias,
+            w2_scale,
+            w2_bias,
+            group_offset[0],
+            **fused_kwargs,
+        )
+    else:
+        gmm1_res = gmm_wrapper(
+            x,
+            w1,
+            w1_scale,
+            w1_bias,
+            group_sizes,
+            group_offset,
+            zero_initialize=False,
+            fuse_act=activation,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
+        packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
+        gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
+
+        gmm2_res = gmm_wrapper(
+            gmm1_res,
+            w2,
+            w2_scale,
+            w2_bias,
+            group_sizes,
+            group_offset,
+            zero_initialize=False,
+            preferred_element_type=x.dtype,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
 
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
 
-    gmm2_res = gmm_wrapper(
-        gmm1_res,
-        w2,
-        w2_scale,
-        w2_bias,
-        group_sizes,
-        group_offset,
-        zero_initialize=False,
-        preferred_element_type=x.dtype,
-        rhs_quant_dtype=rhs_quant_dtype,
-    )
     # The destination-major kernel packs source indices into 20 bits and
     # processes 16-lane SparseCore tiles.
     use_local_ragged_combine = (
