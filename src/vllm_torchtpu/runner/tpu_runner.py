@@ -3456,9 +3456,18 @@ class TPUModelRunner(GPUModelRunner):
                     seq_idx_np[i] = pos
                     pos_idx_np[acc : acc + n_sched] = pos
                 acc += n_sched
+            # The compiled program only for shapes warmup compiled (steady
+            # decode); prefill/mixed steps keep the eager ops rather than
+            # compiling mid-serve.
             subtract = (
                 _subtract_num_rejected_tokens_compiled
                 if envs.VLLM_TPU_SUBTRACT_REJECTED_COMPILED
+                and (
+                    self._pre_async_results.spec_decode_num_rejected_tokens.shape[0],
+                    self.position_ids.shape[-1],
+                    seq_lens.shape[0],
+                )
+                in self.__dict__.get("_subtract_compiled_shapes", ())
                 else subtract_num_rejected_tokens
             )
             seq_lens, self.position_ids = subtract(
@@ -7534,10 +7543,10 @@ class TPUModelRunner(GPUModelRunner):
 
     def _precompile_subtract_rejected(self) -> None:
         """VLLM_TPU_SUBTRACT_REJECTED_COMPILED: compile the rejected-count
-        correction for steady spec decode at every request bucket: the previous
-        step's padded rows, this step's request slots, and the token bucket
-        that holds `rows * (1 + K)` verify tokens. Other combinations (e.g. a
-        prefill joining) compile on first use."""
+        correction for steady spec decode at every request count (exact and
+        bucketed source rows), this step's request slots, and the token bucket
+        that holds `rows * (1 + K)` verify tokens. Other shapes (a prefill
+        joining) stay on the eager ops; see `_subtract_compiled_shapes`."""
         if not (
             envs.VLLM_TPU_SUBTRACT_REJECTED_COMPILED
             and self.speculative_config
@@ -7550,34 +7559,26 @@ class TPUModelRunner(GPUModelRunner):
             for n in (self.num_reqs_max_model_len, self.num_reqs_most_model_len)
             if n
         }
+        shapes: set[tuple[int, int, int]] = set()
+        for n in range(1, self.max_num_reqs + 1):
+            if n * width > self.num_tokens_paddings[-1]:
+                break
+            tokens = _get_padded_token_len(self.num_tokens_paddings, n * width)
+            for rows in {n, _get_padded_num_reqs_with_upper_limit(n, self.max_num_reqs)}:
+                for target in targets:
+                    shapes.add((rows, tokens, target))
         with self._precompile_timed("async-spec rejected-count correction"):
-            rows = MIN_NUM_SEQS
-            while True:
-                rows = min(rows, self.max_num_reqs)
-                if rows * width <= self.num_tokens_paddings[-1]:
-                    tokens = _get_padded_token_len(
-                        self.num_tokens_paddings, rows * width
+            for rows, tokens, target in sorted(shapes):
+                synchronize_tensors(
+                    _subtract_num_rejected_tokens_compiled(
+                        torch.zeros(target, dtype=torch.int32).to(self.device),
+                        torch.zeros(tokens, dtype=torch.int32).to(self.device),
+                        torch.zeros(rows, dtype=torch.int32).to(self.device),
+                        torch.full((target,), -1, dtype=torch.int32).to(self.device),
+                        torch.full((tokens,), -1, dtype=torch.int32).to(self.device),
                     )
-                    num_rejected = torch.zeros(rows, dtype=torch.int32).to(self.device)
-                    positions = torch.zeros(tokens, dtype=torch.int32).to(self.device)
-                    pos_idx = torch.full((tokens,), -1, dtype=torch.int32).to(
-                        self.device
-                    )
-                    for target in targets:
-                        seq_lens = torch.zeros(target, dtype=torch.int32).to(
-                            self.device
-                        )
-                        seq_idx = torch.full((target,), -1, dtype=torch.int32).to(
-                            self.device
-                        )
-                        synchronize_tensors(
-                            _subtract_num_rejected_tokens_compiled(
-                                seq_lens, positions, num_rejected, seq_idx, pos_idx
-                            )
-                        )
-                if rows >= self.max_num_reqs:
-                    break
-                rows *= 2
+                )
+        self._subtract_compiled_shapes = frozenset(shapes)
 
     def _precompile_spec_tail(self) -> None:
         """VLLM_TPU_SPEC_TAIL_COMPILED: compile the one-chunk spec tail for
