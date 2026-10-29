@@ -602,6 +602,7 @@ class TPUModelRunner(GPUModelRunner):
     empty_slot_mappings: dict[int, torch.Tensor]
     # Default for a runner built without __init__.
     _pp_wave: PPWave | None = None
+    _dp_step_other_decode: bool = False
 
     @property
     def _async_drafter(self) -> DFlashProposer | Eagle3Proposer:
@@ -838,6 +839,9 @@ class TPUModelRunner(GPUModelRunner):
         self._dp_step_num_chunks: int = 0
         self._dp_step_max_reqs: int = 0
         self._dp_step_has_encoder_inputs = False
+        # Whether another DP rank ran a decode this step; SrptPrefillScheduler
+        # applies VLLM_TPU_SRPT_ATTN_WORK_CAP only while some rank decodes.
+        self._dp_step_other_decode = False
         self.check_recompilation = vllm_envs.VLLM_XLA_CHECK_RECOMPILATION
         self.use_spmd = vllm_envs.VLLM_XLA_USE_SPMD
 
@@ -3637,12 +3641,16 @@ class TPUModelRunner(GPUModelRunner):
         local_num_chunks: int,
         local_num_reqs: int = 0,
         has_encoder_inputs: bool = False,
+        local_any_decode: bool = False,
     ) -> "tuple[int | None, int]":
         """Return the DP-wide padded token bucket and forward chunk count."""
+        self._dp_step_other_decode = False
         if not self._dp_lockstep_enabled():
             return None, local_num_chunks
         from vllm.distributed.parallel_state import get_dp_group
 
+        dp_group = get_dp_group()
+        dp_rank, dp_size = dp_group.rank_in_group, dp_group.world_size
         # Token/chunk metadata is synchronized on vLLM's CPU DP group. The
         # model forward below receives this result explicitly as
         # num_tokens_across_dp, so set_forward_context does not run a second
@@ -3653,12 +3661,16 @@ class TPUModelRunner(GPUModelRunner):
                 int(local_num_chunks),
                 int(local_num_reqs),
                 int(has_encoder_inputs),
+                # The highest and the lowest decoding rank, so each rank can
+                # tell under a MAX reduction whether another one decodes.
+                int(local_any_decode) * (dp_rank + 1),
+                int(local_any_decode) * (dp_size - dp_rank),
             ],
             dtype=torch.int64,
             device="cpu",
         )
         torch.distributed.all_reduce(
-            t, op=torch.distributed.ReduceOp.MAX, group=get_dp_group().cpu_group
+            t, op=torch.distributed.ReduceOp.MAX, group=dp_group.cpu_group
         )
         bucket = _get_padded_token_len(self.num_tokens_paddings, int(t[0].item()))
         # Spec-decode draft forwards size themselves off the step's DP-wide
@@ -3667,7 +3679,27 @@ class TPUModelRunner(GPUModelRunner):
         # second collective.
         self._dp_step_max_reqs = int(t[2].item())
         self._dp_step_has_encoder_inputs = bool(t[3].item())
+        highest, lowest = int(t[4].item()) - 1, dp_size - int(t[5].item())
+        self._dp_step_other_decode = highest >= 0 and (
+            highest != lowest or highest != dp_rank
+        )
         return bucket, int(t[1].item())
+
+    def _any_decode(self, scheduler_output: "SchedulerOutput") -> bool:
+        """Whether this step schedules a request past its prompt; computed
+        only for the SRPT attention work cap, which reads it."""
+        if not envs.VLLM_TPU_SRPT_ATTN_WORK_CAP:
+            return False
+        batch = self.input_batch
+        indices = [
+            batch.req_id_to_index[r] for r in scheduler_output.num_scheduled_tokens
+        ]
+        return bool(
+            (
+                batch.num_computed_tokens_cpu[indices]
+                >= batch.num_prompt_tokens[indices]
+            ).any()
+        )
 
     def _execute_dp_mm_encoder(
         self, scheduler_output: "SchedulerOutput | None" = None
@@ -3811,6 +3843,7 @@ class TPUModelRunner(GPUModelRunner):
             local_num_chunks,
             local_num_reqs=local_max_chunk_reqs,
             has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
+            local_any_decode=self._any_decode(scheduler_output),
         )
         self._dp_step_num_chunks = target_num_chunks
 
@@ -5219,6 +5252,9 @@ class TPUModelRunner(GPUModelRunner):
                 pooler_output=pooler_output,
                 kv_connector_output=kv_connector_output,
             )
+            # Read by SrptPrefillScheduler.update_from_output.
+            # pyrefly: ignore[missing-attribute]
+            model_runner_output.other_rank_decoding = self._dp_step_other_decode
 
             async_output = AsyncTPUModelRunnerOutput(
                 model_runner_output=model_runner_output,

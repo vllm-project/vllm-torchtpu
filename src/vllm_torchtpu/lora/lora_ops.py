@@ -45,9 +45,10 @@ def bgmv_shrink(
     Returns:
         [T, r] in the dtype of x.
     """
-    assert x.dtype == lora_a_stacked.dtype, (
+    torch._assert(
+        x.dtype == lora_a_stacked.dtype,
         f"LoRA weights are {lora_a_stacked.dtype} but activations are "
-        f"{x.dtype}; lora_dtype must match the model dtype"
+        f"{x.dtype}; lora_dtype must match the model dtype",
     )
     a = lora_a_stacked.squeeze(1)
     # Masks after projecting, on the rank side, so the intermediate is
@@ -74,9 +75,10 @@ def bgmv_expand(
     Returns:
         [T, out], the LoRA delta alone; the caller adds it to the base output.
     """
-    assert buf.dtype == lora_b_stacked.dtype, (
+    torch._assert(
+        buf.dtype == lora_b_stacked.dtype,
         f"LoRA weights are {lora_b_stacked.dtype} but activations are "
-        f"{buf.dtype}; lora_dtype must match the model dtype"
+        f"{buf.dtype}; lora_dtype must match the model dtype",
     )
     b = lora_b_stacked.squeeze(1)
     # Masks before projecting, on the rank side, so the intermediate is
