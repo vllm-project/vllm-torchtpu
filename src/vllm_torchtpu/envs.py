@@ -114,6 +114,7 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
+    TPU_PRECOMPILE_PEER_WAIT_S: float = 600.0
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_SPEC_STATIC_VERIFY: bool = True
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
@@ -328,6 +329,19 @@ def env_float(env_name: str, default: float) -> Callable[[], float]:
             ) from exc
 
     return _get_float_env
+
+
+def env_nonnegative_float(env_name: str, default: float) -> Callable[[], float]:
+    """Float knob that must not be negative; a negative value raises."""
+    parse_float = env_float(env_name, default)
+
+    def _get_nonnegative_float_env() -> float:
+        value = parse_float()
+        if value < 0:
+            raise ValueError(f"Invalid value '{value}' for {env_name}: must be >= 0.")
+        return value
+
+    return _get_nonnegative_float_env
 
 
 def env_str(env_name: str, default: str) -> Callable[[], str]:
@@ -829,6 +843,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per host and the others wait for its artifact. Off compiles every bucket
     # on every rank, sharing only through the Tier-2 cache.
     "TPU_PRECOMPILE_PEER_REPLAY": env_bool("TPU_PRECOMPILE_PEER_REPLAY", default=False),
+    # Under TPU_PRECOMPILE_PEER_REPLAY, how long a rank waits for a bucket's
+    # owner to save it before compiling the bucket itself. Raise it for a model
+    # whose biggest bucket compiles in longer than this: a waiter that times
+    # out compiles concurrently with the owner.
+    "TPU_PRECOMPILE_PEER_WAIT_S": env_nonnegative_float(
+        "TPU_PRECOMPILE_PEER_WAIT_S", 600.0
+    ),
     # Token-axis chunk size for the GLM-5.2 / DSv4 StreamIndex top-k kernel.
     # Cutting the flat token axis into `chunk_tokens`-sized pieces lets each
     # chunk's SparseCore top-k overlap the next chunk's TensorCore scoring.

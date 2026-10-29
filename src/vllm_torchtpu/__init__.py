@@ -544,10 +544,7 @@ def _patch_vllm_compile_all_ranges() -> None:
             compile_rotated(self, local_rank)
             return
 
-        from vllm_torchtpu.compilation.tpu_compiler import (
-            PEER_WAIT_S,
-            wait_for_peer_artifact,
-        )
+        from vllm_torchtpu.compilation.tpu_compiler import wait_for_peer_artifact
 
         host = host_slot()
         if host is None:
@@ -576,7 +573,7 @@ def _patch_vllm_compile_all_ranges() -> None:
 
         for range_entry in mine:
             compile_entry(self, range_entry)
-        with wait_for_peer_artifact(PEER_WAIT_S):
+        with wait_for_peer_artifact(envs.TPU_PRECOMPILE_PEER_WAIT_S):
             for _, _, range_entry in sorted(others, key=lambda o: o[:2]):
                 compile_entry(self, range_entry)
 
