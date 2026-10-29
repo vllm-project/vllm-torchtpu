@@ -131,6 +131,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     VLLM_TPU_MOE_EXPERT_HIST: int = 0
+    VLLM_TPU_MOE_EXPERT_PLACEMENT: str = ""
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_ADAPTIVE_2D_CHANNEL_SCALES: bool = False
@@ -1074,6 +1075,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # which holds warmup, is dropped). Rows whose router logits are all equal
     # (padding) are not counted.
     "VLLM_TPU_MOE_EXPERT_HIST": lambda: int(os.getenv("VLLM_TPU_MOE_EXPERT_HIST", "0")),
+    # Path of a static per-layer expert placement table (json, see
+    # layers/adapter/moe_placement.py): each EP rank loads the logical experts
+    # of its physical slots and the router rows are permuted to physical order,
+    # so every MoE kernel sees physical ids unchanged. Empty: linear placement.
+    "VLLM_TPU_MOE_EXPERT_PLACEMENT": lambda: os.getenv("VLLM_TPU_MOE_EXPERT_PLACEMENT", ""),
     # Build each rank's two consumed routing-plan slices instead of
     # replicating the full T * topk * experts plan arithmetic on every rank.
     "MOE_FUSED_EP_V2_SHARDED_PLAN": env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),

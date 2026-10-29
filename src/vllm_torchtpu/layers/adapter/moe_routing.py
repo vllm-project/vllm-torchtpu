@@ -177,6 +177,14 @@ def count_expert_hist(layer, buffer: str, topk_ids, router_logits) -> None:
     live = router_logits.amax(dim=-1) > router_logits.amin(dim=-1)
     weights = live[:, None].expand_as(topk_ids).reshape(-1).to(hist.dtype)
     hist.index_add_(0, topk_ids.reshape(-1).long(), weights)
+    ties = getattr(layer, buffer + "_ties", None)
+    if ties is not None:
+        # Rows whose k-th and (k+1)-th router logits are equal: the top-k SET
+        # then depends on the tie-break (lower expert index wins).
+        k = topk_ids.shape[-1]
+        top = router_logits.topk(k + 1, dim=-1)[0]
+        tie = (top[:, k - 1] == top[:, k]) & live
+        ties.add_(torch.stack([live.sum(), tie.sum()]).to(ties.dtype))
 
 
 def _route(layer, hidden_states, router_logits, input_ids):
@@ -388,6 +396,9 @@ def register_experts_start_buffer(layer, *, device: torch.device) -> None:
                 name,
                 torch.zeros(layer.global_num_experts, dtype=torch.int32, device=device),
                 persistent=False,
+            )
+            layer.register_buffer(
+                name + "_ties", torch.zeros(2, dtype=torch.int32, device=device), persistent=False
             )
 
 

@@ -41,6 +41,7 @@ from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.adapter import moe_placement
 from vllm_torchtpu.compilation import bucket_filter
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
@@ -246,6 +247,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 self.self_attn
             )
         self.mlp = Qwen3NextSparseMoeBlock(vllm_config=cfg, prefix=prefix + ".mlp")
+        moe_placement.apply_expert_map(self.mlp.experts.routed_experts, index)
         hc_up_tile = int(
             cfg.additional_config.get("qwen4_exp", {}).get("hc_prefill_up_tile", 0)
         )
@@ -1058,8 +1060,12 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
                     # The SP backbone's layers count the same model layer.
                     key = (name.split("layers.", 1)[-1], "sp" if path.endswith("_sp") else "routed")
                     counts = hist.cpu().tolist()
+                    tie_buf = getattr(m, path + "_ties", None)
+                    counts.extend(tie_buf.cpu().tolist() if tie_buf is not None else [0, 0])
                     prev = merged.get(key)
                     merged[key] = counts if prev is None else [a + b for a, b in zip(prev, counts)]
+                    if tie_buf is not None:
+                        tie_buf.zero_()
                 hist.zero_()
         from vllm.distributed import get_tensor_model_parallel_rank
 
@@ -1069,9 +1075,10 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
         start = self._hist_calls - n
         for (layer, path), counts in sorted(merged.items()):
-            if sum(counts):
+            if sum(counts[:-2]):
                 print("EXPERT_HIST " + json.dumps(
-                    {"calls": [start, self._hist_calls], "layer": layer, "path": path, "counts": counts}
+                    {"calls": [start, self._hist_calls], "layer": layer, "path": path,
+                     "counts": counts[:-2], "rows": counts[-2], "boundary_ties": counts[-1]}
                 ), flush=True)
 
     def embed_input_ids(self, input_ids):
@@ -1204,6 +1211,8 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             verify_moe_checkpoint(
                 layer.mlp, f"model.layers.{i}.mlp.", source, moe_mapper, f"layer{i}"
             )
+            # Static expert placement: the router emits physical expert ids.
+            moe_placement.permute_router_rows(layer.mlp.gate.weight, i)
             if layer.ple is not None:
                 layer.ple.finalize_weights()
             if layer.layer_type == "full_attention":

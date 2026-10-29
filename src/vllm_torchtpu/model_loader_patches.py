@@ -81,6 +81,9 @@ def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
         return False
     if not name.endswith(_EXPERT_WEIGHT_SUFFIXES):
         return False
+    keeps = getattr(local_expert_ids, "keeps", None)
+    if keeps is not None:
+        return not keeps(name, expert_id)
     return expert_id not in local_expert_ids
 
 
@@ -150,6 +153,9 @@ def _compute_local_expert_ids() -> set[int] | None:
         placement=parallel_config.expert_placement_strategy,
     )
     if local_ids is not None:
+        from vllm_torchtpu.layers.adapter import moe_placement
+
+        local_ids = moe_placement.fetch_filter(local_ids, ep_rank, ep_size)
         logger.info(
             "[sharded-ep-load] ep_size=%d ep_rank=%d placement=%s: "
             "this rank keeps %d/%d experts",
