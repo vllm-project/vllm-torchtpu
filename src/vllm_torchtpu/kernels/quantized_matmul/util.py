@@ -13,12 +13,15 @@
 # limitations under the License.
 """Utility functions for quantized matmul kernel."""
 
+import functools
 from collections.abc import Callable
 from typing import Any
 
 import jax
 import jax.numpy as jnp
 from jax._src import dtypes
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.quantized_matmul.tuned_block_sizes import TunedValue
 
@@ -64,6 +67,101 @@ def quantize_tensor(
     return data_q, scale.astype(jnp.float32)
 
 
+# Rows of x per grid step of `quantize_rows`.
+QUANTIZE_BLOCK_ROWS = 256
+# Rows quantized together inside a step; the 8-bit output tile is 32 rows tall,
+# so a dynamically indexed group must start on a multiple of 32.
+QUANTIZE_GROUP_ROWS = 32
+# Columns converted and stored per step of a row group.
+QUANTIZE_LANE_CHUNK = 512
+_LANES = 128
+# Lanes of the row-scale output: one vreg row, so it is stored unrelaid.
+_SCALE_LANES = _LANES
+
+
+def _quantize_rows_kernel(x_ref, q_ref, s_ref, *, group_rows: int):
+    k = x_ref.shape[1]
+
+    def quantize_group(rows):
+        # quantize_block's ops, with the group read twice from VMEM, column
+        # chunk by chunk, instead of held in vregs between the max and the
+        # convert. max is exact, so the lane blocks may be folded in any order.
+        if k % QUANTIZE_LANE_CHUNK:
+            x_q, scale = quantize_block(
+                x_ref[rows, :], axis=1, target_dtype=q_ref.dtype
+            )
+            q_ref[rows, :] = x_q
+        else:
+            folded = jnp.abs(x_ref[rows, 0:_LANES])
+            for c in range(_LANES, k, _LANES):
+                folded = jnp.maximum(folded, jnp.abs(x_ref[rows, c : c + _LANES]))
+            abs_max = jnp.max(folded, axis=1, keepdims=True)
+            scale = scale_from_abs_max(abs_max, q_ref.dtype)
+            for c in range(0, k, QUANTIZE_LANE_CHUNK):
+                cols = slice(c, c + QUANTIZE_LANE_CHUNK)
+                q_ref[rows, cols] = quantize_with_scale(
+                    x_ref[rows, cols], scale, q_ref.dtype
+                )
+        s_ref[rows, :] = jnp.broadcast_to(scale, (scale.shape[0], _SCALE_LANES))
+
+    num_groups = x_ref.shape[0] // group_rows
+    if num_groups == 1:
+        quantize_group(slice(None))
+        return
+
+    def body(g, carry):
+        quantize_group(pl.ds(pl.multiple_of(g * group_rows, group_rows), group_rows))
+        return carry
+
+    jax.lax.fori_loop(0, num_groups, body, 0)
+
+
+def quantize_rows(
+    x: jax.Array, dtype: jnp.dtype, interpret: bool = False
+) -> tuple[jax.Array, jax.Array]:
+    """`quantize_tensor(x, dtype)` for a 2-D ``x``, in one pass over ``x``.
+
+    Each row group runs `quantize_block`'s own ops in VMEM, so the values and
+    scales are those `quantize_tensor` computes, while ``x`` is read from HBM
+    once instead of once for the abs-max reduce and once for the convert.
+    Returns ``x_q`` ``[m, k]`` and the f32 row scales ``[m, 1]``.
+    """
+    m, k = x.shape
+    block_rows = min(QUANTIZE_BLOCK_ROWS, m)
+    group_rows = QUANTIZE_GROUP_ROWS
+    if block_rows % group_rows:
+        group_rows = block_rows
+    x_q, scale = pl.pallas_call(
+        functools.partial(_quantize_rows_kernel, group_rows=group_rows),
+        out_shape=(
+            jax.ShapeDtypeStruct((m, k), dtype),
+            jax.ShapeDtypeStruct((m, _SCALE_LANES), jnp.float32),
+        ),
+        grid=(pl.cdiv(m, block_rows),),
+        in_specs=[pl.BlockSpec((block_rows, k), lambda i: (i, 0))],
+        out_specs=(
+            pl.BlockSpec((block_rows, k), lambda i: (i, 0)),
+            pl.BlockSpec((block_rows, _SCALE_LANES), lambda i: (i, 0)),
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",),
+            vmem_limit_bytes=_quantize_rows_vmem_bytes(block_rows, k, x.dtype, dtype),
+        ),
+        name="quantize_rows",
+        interpret=interpret,
+    )(x)
+    return x_q, scale[:, :1]
+
+
+def _quantize_rows_vmem_bytes(rows: int, k: int, x_dtype, q_dtype) -> int:
+    """Double-buffered blocks plus room for one group's f32 temporaries."""
+    block = rows * (
+        k * (dtypes.itemsize_bits(x_dtype) + dtypes.itemsize_bits(q_dtype)) // 8
+        + _SCALE_LANES * 4
+    )
+    return 2 * block + 4 * QUANTIZE_GROUP_ROWS * k * 4 + (4 << 20)
+
+
 def next_multiple(x, multiple):
     return ((x + multiple - 1) // multiple) * multiple
 
@@ -83,6 +181,7 @@ def xla_quantized_matmul(
     w_scale: jax.Array,
     quantize_activation=True,
     out_dtype: jnp.dtype | None = None,
+    quantize_in_one_pass: bool = False,
 ) -> jax.Array:
     """
     Reference (pure JAX) implementation of the quantized matmul kernel.
@@ -98,6 +197,8 @@ def xla_quantized_matmul(
         w_q: Weight quantized array. [n_input_features, n_output_features]
         w_scale: Weight quantization scale. [n_output_features]
         out_dtype: Output dtype; defaults to ``x.dtype``.
+        quantize_in_one_pass: Quantize ``x`` with the `quantize_rows` TPU
+            kernel instead of XLA ops; same values, one read of ``x``.
 
     Returns:
         Output of the quantized matmul.
@@ -107,7 +208,10 @@ def xla_quantized_matmul(
         if quantize_activation and jnp.issubdtype(w_q.dtype, jnp.integer):
             acc_dtype = jnp.int32
 
-        x_q, x_scale = quantize_tensor(x, w_q.dtype)
+        if quantize_in_one_pass:
+            x_q, x_scale = quantize_rows(x, w_q.dtype)
+        else:
+            x_q, x_scale = quantize_tensor(x, w_q.dtype)
         out = jax.lax.dot_general(
             x_q,
             w_q,
