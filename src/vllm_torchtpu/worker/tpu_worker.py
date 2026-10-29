@@ -777,6 +777,9 @@ class TPUWorker(WorkerBase):
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
+        from vllm_torchtpu.runner.hostmem_release import start_heap_profiler
+
+        start_heap_profiler()
         if getattr(self, "speculative_config", None) is not None:
             # Record the warm-up traces under the serving thread count. Other
             # models keep upstream's warm-up at the startup count.

@@ -201,38 +201,51 @@ def report_and_maybe_drop() -> None:
         logger.exception("[hostmem] report failed; continuing")
 
 
+def _heap_prefix() -> str:
+    import os
+
+    prefix = os.environ.get("VLLM_TPU_HEAPDUMP_PREFIX", "")
+    return f"{prefix}_r{os.environ.get('RANK', os.getpid())}" if prefix else ""
+
+
+def start_heap_profiler() -> None:
+    """Start gperftools' heap profiler for this worker (compile and warmup
+    only, so weight loading is not slowed). Needs libtcmalloc (not _minimal)
+    preloaded; HEAP_PROFILE_INUSE_INTERVAL etc. are read at start."""
+    if not envs.VLLM_TPU_POST_WARMUP_HEAPDUMP or not _heap_prefix():
+        return
+    try:
+        process = ctypes.CDLL(None)
+        if hasattr(process, "HeapProfilerStart"):
+            process.HeapProfilerStart(_heap_prefix().encode())
+            logger.info("[hostmem] heap profiler started: %s", _heap_prefix())
+    except Exception:
+        logger.exception("[hostmem] heap profiler start failed; continuing")
+
+
 def _heap_dump() -> None:
-    """With gperftools' heap profiler running (HEAPPROFILE set at process
-    start), dump the live heap now and copy it next to the job outputs."""
+    """Dump the live heap now and copy every dump of this worker next to the
+    job outputs."""
     import glob
     import os
     import shutil
 
     process = ctypes.CDLL(None)
-    # gperftools rewrites HEAPPROFILE in place at startup, so the prefix comes
-    # from a separate variable set to the same value.
-    prefix = os.environ.get("VLLM_TPU_HEAPDUMP_PREFIX", "")
+    prefix = _heap_prefix()
     if not hasattr(process, "HeapProfilerDump") or not prefix:
         logger.info("[hostmem] heap profiler not running; no heap dump")
         return
-    pid = os.getpid()
-    before = set(glob.glob(f"{prefix}*.heap"))
     process.HeapProfilerDump(b"warm")
-    new = [f for f in glob.glob(f"{prefix}*.heap") if f not in before]
-    # Child processes write <prefix>_<pid>.NNNN.heap, the parent <prefix>.NNNN.heap.
-    files = [f for f in new if f"_{pid}." in f] or [
-        f for f in new if f.startswith(prefix + ".")
-    ]
     out = os.path.join(os.environ.get("CDK_OUTPUT_DIR", "/tmp/cdk_output"), "hprof")
     os.makedirs(out, exist_ok=True)
-    if files:
-        dst = os.path.join(out, f"rank{os.environ.get('RANK', os.getpid())}.{os.getpid()}.heap")
-        shutil.copy(files[-1], dst)
-        with open(f"/proc/{os.getpid()}/maps") as f, open(dst + ".maps", "w") as g:
-            g.write(f.read())
-        logger.info("[hostmem] heap dump %s -> %s", files[-1], dst)
-    else:
-        logger.info("[hostmem] heap dump: no new file for pid %d among %s", pid, new)
+    files = sorted(glob.glob(f"{prefix}.*.heap"))
+    for f in files:
+        shutil.copy(f, os.path.join(out, os.path.basename(f)))
+    with open(f"/proc/{os.getpid()}/maps") as f, open(
+        os.path.join(out, os.path.basename(prefix) + ".maps"), "w"
+    ) as g:
+        g.write(f.read())
+    logger.info("[hostmem] heap dumps %s -> %s", files, out)
 
 
 def _report_and_maybe_drop(mode: str) -> None:
