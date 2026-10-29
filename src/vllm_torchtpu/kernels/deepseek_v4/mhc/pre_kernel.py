@@ -28,16 +28,13 @@ def _dot3(x, fn_hi_ref, fn_mid_ref, fn_lo_ref):
     """3-pass exact GEMM: x is bf16 (its low chunks are zero), so three
     bf16 passes against the resident fn chunks reproduce HIGHEST. The
     dimension numbers contract x dim 1 with fn dim 1 (i.e. x @ fn.T) so
-    fn needs no transpose on the host side."""
+    fn needs no transpose on the host side. The three chunks are stacked
+    into one N=3*hc_mult3 GEMM so x streams through the MXU once."""
     dn = (((1,), (1,)), ((), ()))
-    acc = jax.lax.dot_general(x, fn_hi_ref[...], dn, preferred_element_type=jnp.float32)
-    acc = acc + jax.lax.dot_general(
-        x, fn_mid_ref[...], dn, preferred_element_type=jnp.float32
-    )
-    acc = acc + jax.lax.dot_general(
-        x, fn_lo_ref[...], dn, preferred_element_type=jnp.float32
-    )
-    return acc
+    fn_all = jnp.concatenate([fn_hi_ref[...], fn_mid_ref[...], fn_lo_ref[...]])
+    acc3 = jax.lax.dot_general(x, fn_all, dn, preferred_element_type=jnp.float32)
+    n = fn_hi_ref.shape[0]
+    return (acc3[:, :n] + acc3[:, n : 2 * n]) + acc3[:, 2 * n :]
 
 
 def _mixes_kernel(x_ref, fn_hi_ref, fn_mid_ref, fn_lo_ref, mixes_ref, sqrsum_ref):
