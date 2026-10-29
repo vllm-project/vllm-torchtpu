@@ -49,6 +49,10 @@ FUSE_K_MIN_TILE_M = 512
 # most this much VMEM, so the step stays under the default scoped VMEM limit
 # next to the accumulators (hidden 4096 fuses; 7168 at CSA would need 28 MiB).
 FUSE_K_MAX_WEIGHT_BYTES = 16 * 1024 * 1024
+# Token tile of a fused-K step when the call has at least two of them: half
+# the grid steps of a 128 tile, and each weight tile loaded into a matrix unit
+# serves 256 rows instead of 128.
+FUSED_K_TILE_N = 256
 
 
 @dataclasses.dataclass(frozen=True)
@@ -453,7 +457,10 @@ def proj_and_save_state(
 
     # The token dimension must be an exact multiple of `tile_n`.
     sublane_tile = 8
-    tile_n = min(128, pl.cdiv(num_tokens, sublane_tile) * sublane_tile)
+    max_tile_n = 128
+    if fuse_k and num_tokens >= 2 * FUSED_K_TILE_N:
+        max_tile_n = FUSED_K_TILE_N
+    tile_n = min(max_tile_n, pl.cdiv(num_tokens, sublane_tile) * sublane_tile)
     num_n = pl.cdiv(num_tokens, tile_n)
     # At least 2 tiles per block: the last tile of a block is written out one
     # step into the next block, after that step's wait on its slot.
