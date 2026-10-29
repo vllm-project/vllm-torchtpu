@@ -18,12 +18,34 @@ if str(_SCRIPTS) not in sys.path:
 import server_step_worker as worker  # noqa: E402
 from bench_cached_extend import (  # noqa: E402
     assert_no_compilation,
+    expected_prefix_hit,
     summarize_extend,
     summarize_startup,
 )
 from server_step_worker import SCENARIO, token_counts  # noqa: E402
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.parametrize(
+    "prefix,extend,alignment,expected",
+    [
+        (98304, 0, 256, 98048),
+        (98304, 0, 512, 97792),
+        (98304, 16384, 512, 98304),
+        (98305, 0, 512, 98304),
+        (98305, 16384, 512, 98304),
+    ],
+)
+def test_prefix_hits_follow_finalized_cache_alignment(
+    prefix, extend, alignment, expected
+):
+    assert expected_prefix_hit(prefix, extend, alignment) == expected
+
+
+def test_prefix_hit_rejects_invalid_alignment():
+    with pytest.raises(ValueError, match="alignment must be positive"):
+        expected_prefix_hit(98304, 0, 0)
 
 
 def test_compilation_audit_excludes_startup_and_handles_new_year():

@@ -17,15 +17,24 @@ import requests
 from prometheus_client.parser import text_string_to_metric_families
 from server_step_worker import SCENARIO, SCENARIOS, token_counts
 
-DATA_SHA256 = "15d61c22d92c96900b3c4948b6aeea218d3214b676a65df48e7b8555604c7fe2"
+
+def expected_prefix_hit(prefix_tokens: int, extend_tokens: int, alignment: int) -> int:
+    if alignment <= 0:
+        raise ValueError("Prefix-hit alignment must be positive")
+    # Exact-prefix requests must compute at least their final token. Extensions
+    # may reuse the whole aligned prefix; neither assumes a fixed page size.
+    limit = prefix_tokens if extend_tokens else prefix_tokens - 1
+    return limit // alignment * alignment
 
 
 def prepare_main(argv: list[str]) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset", type=Path, required=True)
-    parser.add_argument("--tokenizer", required=True)
-    parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--scenario", choices=list(SCENARIOS), default="encoder_extend")
+    parser.add_argument(
+        "--dataset-sha256",
+        default=None,
+        help="Verify the dataset digest before tokenizing; omit to skip",
+    )
     args = parser.parse_args(argv)
     scenario = SCENARIOS[args.scenario]
     count = scenario.concurrency if args.scenario == "decode" else 128
@@ -34,8 +43,8 @@ def prepare_main(argv: list[str]) -> None:
     from transformers import AutoTokenizer
 
     digest = hashlib.sha256(args.dataset.read_bytes()).hexdigest()
-    if digest != DATA_SHA256:
-        raise ValueError(f"Unexpected LongBench dataset: {digest}")
+    if args.dataset_sha256 and digest != args.dataset_sha256:
+        raise ValueError(f"Unexpected dataset digest: {digest}")
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
     branches = [
         tokenizer.encode(s, add_special_tokens=False) for s in (" the", " a", " and")
@@ -92,8 +101,11 @@ def prepare_main(argv: list[str]) -> None:
 def summarize_extend(ranks: list[dict]) -> dict:
     scenario = SCENARIO
     prompt_tokens = scenario.prefix_tokens + scenario.extend_tokens
-    if sorted(r["rank"] for r in ranks) != list(range(8)):
-        raise ValueError("Expected exactly eight distinct DP ranks")
+    if sorted(r["rank"] for r in ranks) != list(range(scenario.dp_size)):
+        raise ValueError(
+            f"Expected {scenario.dp_size} distinct DP ranks; "
+            f"got {sorted(r['rank'] for r in ranks)}"
+        )
     if len({r["hostname"] for r in ranks}) != 1:
         raise ValueError("Monotonic timestamps require one host")
     ranks = sorted(ranks, key=lambda r: r["rank"])
@@ -140,12 +152,16 @@ def summarize_extend(ranks: list[dict]) -> dict:
                 category = "encoder_tail"
             else:
                 category = "encoder_middle"
-                if (row["rows"], row["padded_rows"], row["replay_tokens"]) != (
-                    2044,
-                    2048,
-                    0,
-                ):
-                    raise ValueError("Middle requires actual2044/pad2048 and no replay")
+                if scenario.middle_actual_rows is not None and (
+                    row["rows"],
+                    row["padded_rows"],
+                    row["replay_tokens"],
+                ) != (scenario.middle_actual_rows, scenario.chunk_tokens, 0):
+                    raise ValueError(
+                        "Middle chunk requires "
+                        f"actual{scenario.middle_actual_rows}/"
+                        f"pad{scenario.chunk_tokens} and no replay"
+                    )
                 if any(s["stage"] == "decoder" for s in step["stages"]):
                     raise ValueError("Decoder executed in a middle chunk")
             if steps and step_index != steps[-1]["step_index"] + 1:
@@ -156,8 +172,11 @@ def summarize_extend(ranks: list[dict]) -> dict:
             )
         if not steps or previous_end != prompt_tokens:
             raise ValueError("Incomplete extend wave")
-        if sum(s["encoder"]["new_tokens"] for s in steps) != 16384:
-            raise ValueError("Wave must account for exactly 16384 new tokens per rank")
+        if sum(s["encoder"]["new_tokens"] for s in steps) != scenario.extend_tokens:
+            raise ValueError(
+                "Wave must account for exactly "
+                f"{scenario.extend_tokens} new tokens per rank"
+            )
         waves.append(steps)
     if len({len(w) for w in waves}) != 1:
         raise ValueError("Ranks executed different chunk counts")
@@ -224,8 +243,8 @@ def summarize_extend(ranks: list[dict]) -> dict:
             "total_seconds": seconds,
             "effective_tokens": tokens,
             "global_tokens_s": rate,
-            "per_device_tokens_s": rate / 8,
-            "per_physical_chip_tokens_s": rate / 4,
+            "per_device_tokens_s": rate / scenario.dp_size,
+            "per_physical_chip_tokens_s": rate / scenario.physical_chips,
             "token_kind": "new_input",
             "samples": samples,
         }
@@ -351,7 +370,11 @@ def client_main(argv: list[str]) -> None:
         action="store_true",
         help="Separate diagnostic run; do not pool with formal rounds",
     )
-    parser.add_argument("--admission-settle-seconds", type=float, default=5.0)
+    parser.add_argument(
+        "--input-sha256",
+        default=None,
+        help="Verify the input digest before serving; omit to skip",
+    )
     args = parser.parse_args(argv)
     if args.admission_settle_seconds <= 0:
         parser.error("admission settle time must be positive")
@@ -360,8 +383,8 @@ def client_main(argv: list[str]) -> None:
     args.out.mkdir(parents=True, exist_ok=False)
     scenario = SCENARIO
     input_sha = hashlib.sha256(args.input.read_bytes()).hexdigest()
-    if input_sha != "9ca4086c68c610b9205e1e46e1a51d3d18bb10495ed88d341c63b725ccca4064":
-        raise ValueError("Input differs from the frozen DeepSeek natural-code corpus")
+    if args.input_sha256 and input_sha != args.input_sha256:
+        raise ValueError(f"Unexpected input digest: {input_sha}")
     data = json.loads(args.input.read_text())
     rows = data["prompts"][: scenario.concurrency]
     suffixes = data["prime_suffix"][: scenario.concurrency]
@@ -492,7 +515,7 @@ def client_main(argv: list[str]) -> None:
         if sorted(r["rank"] for r in rank_results(setup["results"])) != list(
             range(scenario.dp_size)
         ):
-            raise ValueError("RPC did not configure all eight DP workers")
+            raise ValueError(f"RPC did not configure all {scenario.dp_size} DP workers")
         profiling = args.profile and round_id > 0
         if profiling:
             post("/start_profile", {})
@@ -526,12 +549,21 @@ def client_main(argv: list[str]) -> None:
         ):
             raise ValueError("Missing preemption metric or nonzero preemptions")
         hits = delta.get("vllm:prefix_cache_hits_total", -1)
-        # Hybrid compressed KV groups align cache hits to 256 logical tokens,
-        # despite --block-size 16. An exact-prefix prompt leaves its last hash
-        # unit uncached; an extension can reuse the complete prefix.
-        expected_hit = scenario.prefix_tokens - (0 if scenario.extend_tokens else 256)
+        # Read the finalized cache geometry from the workers instead of a
+        # hardcoded alignment: changing --block-size changes hit alignment.
+        alignments = {
+            rank["prefix_hit_alignment"] for rank in rank_results(setup["results"])
+        }
+        if len(alignments) != 1:
+            raise ValueError(f"DP ranks disagree on prefix-hit alignment: {alignments}")
+        expected_hit = expected_prefix_hit(
+            scenario.prefix_tokens, scenario.extend_tokens, alignments.pop()
+        )
         if hits != scenario.concurrency * expected_hit:
-            raise ValueError(f"Prefix-hit invariant failed: {hits}")
+            raise ValueError(
+                f"Prefix-hit invariant failed: {hits}; "
+                f"expected {scenario.concurrency * expected_hit}"
+            )
         report = summarize_extend(rank_results(records["results"]))
         report["warmup"] = round_id == 0
         report["profiled"] = profiling

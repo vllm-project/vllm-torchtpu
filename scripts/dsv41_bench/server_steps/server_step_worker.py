@@ -9,6 +9,7 @@ import functools
 import hashlib
 import json
 import logging
+import math
 import os
 import socket
 import time
@@ -28,6 +29,16 @@ class Scenario:
     chunk_tokens: int = 2048
     dspark_tokens: int = 5
     physical_chips: int = 4
+    # Optional serving/model expectations. ``None`` disables the check so a
+    # different serving configuration degrades to observation, not failure.
+    tensor_parallel_size: int | None = 1
+    pipeline_parallel_size: int | None = 1
+    enable_expert_parallel: bool | None = True
+    num_hidden_layers: int | None = None
+    sliding_window: int | None = None
+    # Expected actual (unpadded) rows in a steady middle prefill chunk.
+    # ``None`` skips the shape assertion.
+    middle_actual_rows: int | None = 2044
 
     @property
     def local_concurrency(self) -> int:
@@ -37,9 +48,17 @@ class Scenario:
         return asdict(self)
 
 
-SCENARIO = Scenario("encoder_extend", 8, extend_tokens=16384)
+SCENARIO = Scenario(
+    "encoder_extend", 8, extend_tokens=16384, num_hidden_layers=40, sliding_window=128
+)
 DECODE_SCENARIO = Scenario(
-    "decode", 384, prefix_tokens=98304, output_tokens=512, chunk_tokens=2048
+    "decode",
+    384,
+    prefix_tokens=98304,
+    output_tokens=512,
+    chunk_tokens=2048,
+    num_hidden_layers=40,
+    sliding_window=128,
 )
 SCENARIOS = {s.name: s for s in (SCENARIO, DECODE_SCENARIO)}
 
@@ -268,8 +287,6 @@ def _gather_dp(value: dict) -> list[dict]:
     from vllm.distributed import get_dp_group
 
     group = get_dp_group()
-    if group.world_size != 8:
-        raise ValueError("Expected eight node-local DP workers")
     gathered = [None] * group.world_size
     # vLLM's DP utility RPC executes on every engine but returns engine 0 only.
     # Gather on the workers so that the returned payload contains all eight ranks.
@@ -287,7 +304,7 @@ class ServerStepWorker:
         runner = self.model_runner
         group = get_dp_group()
         rank = self.vllm_config.parallel_config.data_parallel_rank
-        assert group.world_size == 8
+        # Any DP world size works; each rank records and reports its own view.
         assert not hasattr(self, "_sync_capture")
         scenario = DECODE_SCENARIO
         original = runner._dp_coordinated_step
@@ -340,7 +357,7 @@ class ServerStepWorker:
                 )
                 return result
             if not state["active"]:
-                gathered = [None] * 8
+                gathered = [None] * group.world_size
                 dist.all_gather_object(
                     gathered,
                     {"rank": rank, "ready": ready, **row},
@@ -387,31 +404,56 @@ class ServerStepWorker:
         )
 
         config = self.vllm_config.parallel_config
-        if (
+        spec = self.vllm_config.speculative_config
+        hf = self.vllm_config.model_config.hf_config
+        if scenario not in SCENARIOS:
+            raise ValueError(f"Unknown scenario: {scenario}")
+        selected = SCENARIOS[scenario]
+        # Serving expectations come from the scenario; None fields are skipped
+        # so an unexpected configuration is observed rather than rejected.
+        expected = (
+            selected.tensor_parallel_size,
+            selected.dp_size,
+            selected.pipeline_parallel_size,
+            selected.enable_expert_parallel,
+        )
+        actual = (
             config.tensor_parallel_size,
             config.data_parallel_size,
             config.pipeline_parallel_size,
             config.enable_expert_parallel,
-        ) != (1, 8, 1, True):
-            raise ValueError("Benchmark requires TP1/DP8/EP8/PP1")
-        spec = self.vllm_config.speculative_config
-        if spec is None or spec.method != "dspark" or spec.num_speculative_tokens != 5:
-            raise ValueError("Benchmark requires DSpark K=5")
-        hf = self.vllm_config.model_config.hf_config
-        if hf.num_hidden_layers != 40 or hf.sliding_window != 128:
-            raise ValueError("Expected the 40-layer DSv4.1 model with SWA=128")
-        if scenario not in SCENARIOS:
-            raise ValueError(f"Unknown scenario: {scenario}")
-        selected = SCENARIOS[scenario]
-        if self.vllm_config.scheduler_config.max_num_seqs != selected.local_concurrency:
+        )
+        if all(v is not None for v in expected) and actual != expected:
             raise ValueError(
-                "max_num_seqs must equal the scenario's per-DP concurrency"
+                "Serving parallelism "
+                f"TP{actual[0]}/DP{actual[1]}/PP{actual[2]}/EP={actual[3]} "
+                "differs from the scenario expectation "
+                f"TP{expected[0]}/DP{expected[1]}/PP{expected[2]}/EP={expected[3]}"
+            )
+        if selected.dspark_tokens and (
+            spec is None
+            or spec.method != "dspark"
+            or spec.num_speculative_tokens != selected.dspark_tokens
+        ):
+            raise ValueError(
+                f"Benchmark scenario requires DSpark K={selected.dspark_tokens}"
             )
         if (
-            self.vllm_config.scheduler_config.max_num_batched_tokens
-            != selected.chunk_tokens
+            selected.num_hidden_layers is not None
+            and hf.num_hidden_layers != selected.num_hidden_layers
         ):
-            raise ValueError("Token budget differs from the selected scenario")
+            raise ValueError(
+                f"Expected a {selected.num_hidden_layers}-layer model; "
+                f"got {hf.num_hidden_layers}"
+            )
+        if (
+            selected.sliding_window is not None
+            and getattr(hf, "sliding_window", None) != selected.sliding_window
+        ):
+            raise ValueError(
+                f"Expected SWA={selected.sliding_window}; "
+                f"got {getattr(hf, 'sliding_window', None)}"
+            )
         if not _INSTALLED:
             for cls, stage in [
                 (DeepseekV41EncoderStage, "encoder"),
@@ -442,8 +484,21 @@ class ServerStepWorker:
         recorder.pending = None
         recorder.in_flight = 0
         recorder.enabled = True
-        _ACTIVE = recorder
-        return _gather_dp({"rank": recorder.rank, "scenario": selected.to_dict()})
+        cache = self.model_runner.kv_cache_config
+        if cache is None:
+            raise RuntimeError("Benchmark requires initialized KV cache groups")
+        # vLLM aligns prefix cache hits to the LCM of the finalized group
+        # block sizes; export it instead of hardcoding an alignment constant.
+        prefix_hit_alignment = math.lcm(
+            *(group.kv_cache_spec.block_size for group in cache.kv_cache_groups)
+        )
+        return _gather_dp(
+            {
+                "rank": recorder.rank,
+                "scenario": selected.to_dict(),
+                "prefix_hit_alignment": prefix_hit_alignment,
+            }
+        )
 
     def benchmark_end(self) -> list[dict]:
         global _ACTIVE

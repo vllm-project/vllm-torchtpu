@@ -39,8 +39,10 @@ python scripts/dsv41_bench/server_steps/bench_cached_extend.py prepare \
   --out /path/to/dsv41-code-96k-c128.json
 ```
 
-The client verifies the frozen input SHA256:
-`9ca4086c68c610b9205e1e46e1a51d3d18bb10495ed88d341c63b725ccca4064`.
+Digest checks are optional: pass `--dataset-sha256` (prepare) or
+`--input-sha256` (client) to enforce the frozen-corpus digests
+(`15d61c22…c7fe2` for the dataset, `9ca4086c…ca4064` for the prepared
+input); omit them to benchmark a different corpus without failing.
 The first eight deterministic code windows are used for this scenario. They
 have distinct prefixes, but come from adjacent windows of the same document;
 they are not eight unrelated documents. Prime requests branch immediately
@@ -50,6 +52,24 @@ new-input token count.
 The corpus methodology follows SGL-JAX DSA's `bench_dsa_cache_hit.py`:
 freeze natural-code inputs and verify actual cache behavior. This implementation
 uses vLLM worker-extension RPCs and DeepSeek tokenizer IDs.
+
+## Parameterized serving configuration
+
+Serving topology and geometry are parameterized; nothing is fixed at a
+single constant:
+
+- `run.py --tp/--dp` override the scenario defaults; `--compile-buckets`
+  overrides the derived `compile_sizes`.
+- `serve_cached_prefill.sh` reads `BLOCK_SIZE`, `DSPARK_TOKENS` and
+  `COMPILE_SIZES` (in addition to the existing `TP/DP/CHUNK/MAX_SEQS`).
+- The worker's scenario expectations (TP/DP/PP/EP, DSpark K, layer count,
+  SWA width) are scenario fields; setting a field to `None` skips that
+  check instead of failing the run.
+- Prefix-hit validation derives the alignment from the workers' finalized
+  KV cache geometry (`math.lcm` of group block sizes), not a hardcoded
+  256-token constant, so `--block-size` changes do not fail the run.
+- Compilation lines in a formal round are recorded in the summary; pass
+  `bench_decode.py --strict-compilation` to make them fatal again.
 
 ## Run cold startup and serving
 

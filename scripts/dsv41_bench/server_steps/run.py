@@ -18,7 +18,7 @@ from pathlib import Path
 
 import requests
 from bench_cached_extend import assert_no_compilation, summarize_startup
-from server_step_worker import DECODE_SCENARIO
+from server_step_worker import DECODE_SCENARIO, SCENARIO
 
 
 def cache_inventory(root: Path) -> dict:
@@ -78,11 +78,18 @@ def main() -> None:
     parser.add_argument("--cache-dir", type=Path, required=True)
     parser.add_argument("--cache-mode", choices=["cold", "reuse"], required=True)
     parser.add_argument("--startup-timeout", type=float, default=3000)
+    parser.add_argument("--tp", type=int, help="Tensor-parallel size (default 1)")
     parser.add_argument(
-        "--scenario", choices=["encoder_extend", "decode"], default="encoder_extend"
+        "--dp", type=int, help="Data-parallel size (default: scenario dp_size)"
     )
     parser.add_argument("--rounds", type=int)
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument(
+        "--compile-buckets",
+        type=int,
+        nargs="+",
+        help="Override the scenario-derived compile_sizes list",
+    )
     args = parser.parse_args()
     if args.rounds is None:
         args.rounds = 1 if args.scenario == "decode" else 5
@@ -121,17 +128,20 @@ def main() -> None:
     env["TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE"] = "disabled"
     env["KV_BYTES"] = "auto"
     decode = args.scenario == "decode"
-    buckets = [384, DECODE_SCENARIO.chunk_tokens] if decode else [128, 256, 2048]
+    scenario = DECODE_SCENARIO if decode else SCENARIO
+    tp = args.tp if args.tp is not None else scenario.tensor_parallel_size or 1
+    dp = args.dp if args.dp is not None else scenario.dp_size
+    buckets = args.compile_buckets or (
+        [384, scenario.chunk_tokens] if decode else [128, 256, scenario.chunk_tokens]
+    )
     env.update(
-        TP="1",
-        DP="8",
-        CHUNK=str(DECODE_SCENARIO.chunk_tokens) if decode else "2048",
-        MAX_SEQS=str(DECODE_SCENARIO.local_concurrency) if decode else "1",
+        TP=str(tp),
+        DP=str(dp),
+        CHUNK=str(scenario.chunk_tokens),
+        MAX_SEQS=str(scenario.local_concurrency) if decode else "1",
     )
     if decode:
-        env["MAX_MODEL_LEN"] = str(
-            DECODE_SCENARIO.prefix_tokens + DECODE_SCENARIO.output_tokens
-        )
+        env["MAX_MODEL_LEN"] = str(scenario.prefix_tokens + scenario.output_tokens)
         env["USE_PHASED_PROFILER"] = "0"
     else:
         env.pop("MAX_MODEL_LEN", None)
@@ -195,7 +205,7 @@ def main() -> None:
         "model_config_sha256": hashlib.sha256(
             (model / "config.json").read_bytes()
         ).hexdigest(),
-        "parallelism": "TP1/DP8/EP8/PP1 on one v7x-8 host",
+        "parallelism": f"TP{tp}/DP{dp}/EP8/PP1 on one v7x-8 host",
     }
     identity_path = args.cache_dir / "benchmark-identity.json"
     if args.cache_mode == "reuse":

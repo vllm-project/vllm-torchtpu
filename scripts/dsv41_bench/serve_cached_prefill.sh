@@ -5,8 +5,10 @@ set -Eeuo pipefail
 model=${MODEL_PATH:-/models/DeepSeek-V4.1-Flash}
 tp=${TP:-1}
 dp=${DP:-8}
-chunk=${CHUNK:-2048}
 max_seqs=${MAX_SEQS:-1}
+block_size=${BLOCK_SIZE:-16}
+dspark_tokens=${DSPARK_TOKENS:-5}
+compile_sizes=${COMPILE_SIZES:-"[128,256,$chunk]"}
 export TPU_RECLAIM_COMPILE_MEMORY=1
 export OMP_NUM_THREADS=1 NEW_MODEL_DESIGN=1 MODEL_IMPL_TYPE=vllm VLLM_TARGET_DEVICE=tpu
 export VLLM_USE_BREAKABLE_CUDAGRAPH=0 VLLM_USE_AOT_COMPILE=0 VLLM_DISABLE_COMPILE_CACHE=0
@@ -32,9 +34,9 @@ exec vllm serve "$model" \
   --async-scheduling --enable-prefix-caching --kv-cache-dtype fp8 \
   --attention-config '{"indexer_kv_dtype":"fp8"}' \
   --engram-config '{"dp_shared_memory":false}' \
-  --block-size 16 \
+  --block-size "$block_size" \
   --max-num-batched-tokens "$chunk" --max-num-seqs "$max_seqs" \
   "${server_args[@]}" \
-  --compilation-config "{\"compile_sizes\":[128,256,$chunk]}" \
-  --speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"model\":\"$model\"}" \
+  --compilation-config "{\"compile_sizes\":$compile_sizes}" \
+  --speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":$dspark_tokens,\"model\":\"$model\"}" \
   "$@"
