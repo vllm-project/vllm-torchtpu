@@ -105,8 +105,8 @@ def _divmod_pow2(x, d: int):
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class WindowRef(_BufferedRef):
-    # VMEM block: cfgs.window_shape()
-    #   (tile_n, window, N_FIELDS, head_tiles, LANE) f32
+    # VMEM block: cfgs.window_shape(), f32, several tokens per vreg
+    #   (tile_n / P, window, N_FIELDS, P * head_tiles, LANE)
     #
     # Each token's window is DMA'd straight from its state rows: only the
     # (prev or curr) kv and score rows its positions use, `window_chunk`
@@ -122,14 +122,11 @@ class WindowRef(_BufferedRef):
         return window.bitcast(jnp.uint8).reshape(self.cfgs.window_bytes_shape())
 
     def _dst(self, window_u8, n, w):
+        # (chunk, N_FIELDS, head_tiles, 4, LANE): token n's rows of its group.
         cfgs = self.cfgs
-        chunk = cfgs.window_chunk
-        if cfgs.dims.mode == config.Mode.CSA_INDEXER:
-            # Rows of one field each, matching the state's row order.
-            rows = window_u8.reshape(cfgs.tile_sizes.tile_n, -1, *window_u8.shape[-2:])
-            return rows.at[n, pl.ds(w * config.N_FIELDS, chunk * config.N_FIELDS)]
-        # (chunk, N_FIELDS, head_tiles, 4, LANE)
-        return window_u8.at[n, pl.ds(w, chunk)]
+        group, member = divmod(n, cfgs.window_tokens_per_vreg)
+        rows = pl.ds(member * cfgs.head_tiles, cfgs.head_tiles)
+        return window_u8.at[group, pl.ds(w, cfgs.window_chunk), :, rows]
 
     def copy_in(self, src_ref, grid_indices):
         assert self.sem_recvs is not None
@@ -187,12 +184,13 @@ class WindowRef(_BufferedRef):
                     # `proj_and_save_state` stores the f32 state byte-transposed:
                     # one (4, 256) row per field holds prev in lanes 0:128 and
                     # curr in 128:256.
-                    src = state_cache_ref.at[
-                        page,
-                        pl.ds(offset * rows_per_token, chunk * rows_per_token),
-                        :,
-                        pl.ds(half * config.LANE, config.LANE),
-                    ]
+                    src = (
+                        state_cache_ref.at[
+                            page, pl.ds(offset * rows_per_token, chunk * rows_per_token)
+                        ]
+                        .reshape(chunk, config.N_FIELDS, 1, *state_cache_ref.shape[2:])
+                        .at[..., pl.ds(half * config.LANE, config.LANE)]
+                    )
                 else:
                     src = state_rows.at[page, pl.ds(offset, chunk), :, half]
                 dst = self._dst(window_u8, n, w)

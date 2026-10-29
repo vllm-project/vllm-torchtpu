@@ -56,6 +56,7 @@ from jax.experimental import pallas as pl
 LANE = 128  # bytes per sub-slot / TPU lane width
 SLOT_PACK = 4  # sub-slots packed into one physical HBM slot row
 N_FIELDS = 2  # values stored per token: kv + score
+F32_SUBLANES = 8  # rows of one f32 vector register
 FP32_BYTES = 4
 CSA_COMPRESS_RATIO = 4  # the compress ratio that selects Mode.CSA
 # SEQ_ALONG_LANE indexer cache: tokens per page (one per lane of the 256-byte
@@ -506,9 +507,31 @@ class Configs:
     def _tile_n(self) -> int:
         return self.tile_sizes.tile_n
 
+    @property
+    def window_tokens_per_vreg(self) -> int:
+        """Tokens whose head_tiles rows share one f32 vreg of the window.
+
+        A token's field is head_tiles rows; packing several tokens into the
+        sublanes of one vreg keeps the windowed softmax on full vregs.
+        """
+        tokens = max(1, min(self._tile_n, F32_SUBLANES // self.head_tiles))
+        assert self._tile_n % tokens == 0, (self._tile_n, tokens)
+        return tokens
+
     def window_shape(self) -> tuple[int, ...]:
-        """f32 window block: (tile, window, fields, head_tiles, lane)."""
-        return (self._tile_n, self.window, N_FIELDS, self.head_tiles, LANE)
+        """f32 window block: (tile / P, window, fields, P x head_tiles, lane).
+
+        P = `window_tokens_per_vreg`: token p * P + q of a tile owns rows
+        [q * head_tiles, (q + 1) * head_tiles) of window group p.
+        """
+        tokens = self.window_tokens_per_vreg
+        return (
+            self._tile_n // tokens,
+            self.window,
+            N_FIELDS,
+            tokens * self.head_tiles,
+            LANE,
+        )
 
     def window_bytes_shape(self) -> tuple[int, ...]:
         """uint8 view of the window block; each f32 lane -> FP32_BYTES rows.
@@ -519,14 +542,7 @@ class Configs:
         Returns:
           The shape of the window bytes view.
         """
-        return (
-            self._tile_n,
-            self.window,
-            N_FIELDS,
-            self.head_tiles,
-            FP32_BYTES,
-            LANE,
-        )
+        return self.window_shape()[:-1] + (FP32_BYTES, LANE)
 
     def output_shape(self) -> tuple[int, ...]:
         """Packed output tile / VMEM block: (tile, record_rows) + cache_last_dims."""

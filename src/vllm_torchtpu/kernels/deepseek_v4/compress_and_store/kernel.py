@@ -77,22 +77,27 @@ def inner_kernel(
         idx = global_idx + i
         safe_idx = jax.lax.select(idx < cfgs.dims.size_n, idx, 0)
         start_list.append(positions_ref[safe_idx] - window + 1)
-    start = jnp.stack(start_list)  # (tile_n,)
+    # The window packs window_tokens_per_vreg tokens per vreg (see
+    # `config.Configs.window_shape`); give each row its token's start.
+    tokens_per_vreg = cfgs.window_tokens_per_vreg
+    group_rows = tokens_per_vreg * head_tiles
+    row_start = jnp.stack(
+        [start_list[r // head_tiles] for r in range(tile_n * head_tiles)]
+    ).reshape(tile_n // tokens_per_vreg, 1, group_rows, 1)
 
-    kv_val = window_vmem[:, :, 0]  # (tile_n, window, head_tiles, 128)
-    scores_val = window_vmem[:, :, 1]  # (tile_n, window, head_tiles, 128)
+    kv_val = window_vmem[:, :, 0]  # (groups, window, group_rows, 128)
+    scores_val = window_vmem[:, :, 1]  # (groups, window, group_rows, 128)
     rms_weight_tiled = rms_weight_vmem_ref[...].astype(jnp.float32)  # (head_tiles, 128)
 
     # --- windowed softmax ---
-    curr_pos = start[:, None] + jnp.arange(window)[None, :]  # (tile_n, window)
-    mask = curr_pos >= 0  # (tile_n, window)
-    mask_float = mask.astype(scores_val.dtype)
-    mask_float_reshaped = mask_float[:, :, None, None]  # (tile_n, window, 1, 1)
+    curr_pos = row_start + jax.lax.broadcasted_iota(jnp.int32, (1, window, 1, 1), 1)
+    mask = curr_pos >= 0  # (groups, window, group_rows, 1)
     neg_inf = jnp.array(-jnp.inf, dtype=scores_val.dtype)
-    masked_scores = jnp.where(mask_float_reshaped > 0.5, scores_val, neg_inf)
+    masked_scores = jnp.where(mask, scores_val, neg_inf)
     weights = jax.nn.softmax(masked_scores, axis=1)
-    kv_val = jnp.where(mask_float_reshaped > 0.5, kv_val, 0.0)
-    compressed = jnp.sum(weights * kv_val, axis=1)  # (tile_n, head_tiles, 128)
+    kv_val = jnp.where(mask, kv_val, 0.0)
+    compressed = jnp.sum(weights * kv_val, axis=1)  # (groups, group_rows, 128)
+    compressed = compressed.reshape(tile_n, head_tiles, 128)
 
     # --- rms norm ---
     variance = jnp.mean(jnp.square(compressed), axis=(1, 2), keepdims=True)
