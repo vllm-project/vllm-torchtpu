@@ -330,7 +330,7 @@ def test_planner_transitive_imports_exclude_vmem_kernel_and_cache():
     while queue:
         path = queue.pop()
         rel = path.relative_to(pkg_root).as_posix()
-        if rel in reachable or path.name == "__init__.py":
+        if rel in reachable or rel == "__init__.py":
             continue
         reachable.add(rel)
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -346,16 +346,23 @@ def test_planner_transitive_imports_exclude_vmem_kernel_and_cache():
             if node.module:
                 mod_path = base / node.module.replace(".", "/")
                 candidates.append(mod_path.with_suffix(".py"))
+                candidates.append(mod_path / "__init__.py")
                 for alias in node.names:
                     candidates.append(mod_path / f"{alias.name}.py")
             else:
                 for alias in node.names:
                     candidates.append(base / f"{alias.name}.py")
             for cand in candidates:
-                if cand.is_file() and cand.name != "__init__.py":
+                if cand.is_file() and cand != pkg_root / "__init__.py":
                     queue.append(cand)
 
-    assert {"planner.py", "spec.py", "exec_spec.py", "ops.py"} <= reachable
+    assert {
+        "planner.py",
+        "spec.py",
+        "exec_spec.py",
+        "ops/__init__.py",
+        "ops/base.py",
+    } <= reachable
     forbidden = {
         r
         for r in reachable

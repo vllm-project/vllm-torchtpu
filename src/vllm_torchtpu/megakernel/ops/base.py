@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared numeric, normalization, rotary, and routing primitives."""
+"""Shared numeric, normalization, rotary, and activation primitives."""
 
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ BF16 = jnp.bfloat16
 F32 = jnp.float32
 I32 = jnp.int32
 U32 = jnp.uint32
+U8 = jnp.uint8
 FP8 = jnp.float8_e4m3fn
 
 
