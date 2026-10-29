@@ -900,6 +900,11 @@ def compressed_kernel_pages(pages: jax.Array, pool: jax.Array, slot: int = 0, ra
     return (scaled + first).reshape(-1)
 
 
+# Largest expanded kernel-page table the ragged prefill indexer prefetches
+# into SMEM (64 request slots at max_model_len 262144 fit; 96 do not).
+PREFILL_PAGE_TABLE_SMEM_BYTES = 512 * 1024
+
+
 def select_blocks(
     query,
     pool,
@@ -999,12 +1004,23 @@ def select_blocks(
         num_decodes = decode_prefix(starts)
         seq_lens = context + query_lens
         chunk_tokens = 512 if len(query) % 512 == 0 else None
+        # The scalar-prefetched kernel-page table holds every request slot's
+        # whole row (slots x max_model_len / 128 pages). Past the SMEM budget
+        # (e.g. 96 slots at 262144 tokens: 768 KiB) hand StreamIndex the
+        # pool-page table and let its KV reader expand each entry, as the
+        # decode path's VLLM_TPU_QSA_DECODE_POOL_PAGE_TABLE does.
+        expansion = (1, 1, 0)
+        pages = table
+        if len(table) * table.shape[1] * logical_pages * 4 > PREFILL_PAGE_TABLE_SMEM_BYTES:
+            expansion = (logical_pages, physical_pages, slot * logical_pages)
+        else:
+            pages = expand_pages(table).reshape(len(table), -1)
         return topk(
             jnp.pad(query, ((0, 0), (0, 0), (0, width - query.shape[-1]))),
             jnp.full(query.shape[:2], query.shape[-1] ** -0.5, jnp.float32),
             cache,
             seq_lens,
-            expand_pages(table).reshape(len(table), -1),
+            pages,
             starts,
             jnp.asarray([num_decodes, num_decodes, num_seqs], dtype=jnp.int32),
             k=block_topk,
@@ -1014,7 +1030,7 @@ def select_blocks(
             decode_req_batch_size=8,
             enable_early_exit=True,
             chunk_tokens=chunk_tokens,
-            components=qsa_indexing(ratio - 1),
+            components=qsa_indexing(ratio - 1, table_expansion=expansion),
             # VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY: as the decode flag, for
             # the prefill chunks' rows (short contexts early in a prompt).
             **(
