@@ -1563,12 +1563,13 @@ def test_bind_caches_fails_closed_on_pool_slot_layout_mismatch(
     assert driver.pool_layout_facts == mk
 
 
+@pytest.mark.parametrize("fused, gather", [("auto", None), (True, True)])
 def test_bind_caches_adopts_an_fp32_conv_framework_pool(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, fused: Any, gather: Any
 ) -> None:
     """A framework that stores the pooled conv state as fp32 is served: the
     megakernel switches its layout to an f32 conv window (split pool I/O),
-    and fused pool I/O / in-kernel gather are off."""
+    and fused pool I/O / in-kernel gather are off, explicit options too."""
     import dataclasses
 
     import jax.numpy as jnp
@@ -1588,7 +1589,8 @@ def test_bind_caches_adopts_an_fp32_conv_framework_pool(
         base_exec=ex_base,
         buckets=(2,),
         verify_buckets=(),
-        fused_pool_io="auto",
+        fused_pool_io=fused,
+        pool_gather=gather,
     )
     bf16 = facts_from_pool_layout(driver.spec.cache_backend.layout, 1)
     assert bf16.conv_dtype == "bfloat16"
@@ -1601,6 +1603,7 @@ def test_bind_caches_adopts_an_fp32_conv_framework_pool(
     assert driver.pool_layout_facts == fw
     assert not driver.spec.cache_backend.supports_fused_io
     assert not driver.fused_pool_io
+    assert driver.pool_gather is False and driver.profile.pool_gather is False
     assert lay == dataclasses.replace(
         qwen35.qwen35_spec(g).cache_backend.layout, conv_dtype=jnp.float32
     )

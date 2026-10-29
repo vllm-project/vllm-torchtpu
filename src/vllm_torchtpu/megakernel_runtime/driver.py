@@ -1026,7 +1026,7 @@ class MegakernelDriver:
         logger.info(
             "%s megakernel bound to %d unified pools (profile=%s, "
             "num_pages=%d, page_size=%d, max_pages_per_seq=%d, decode_buckets=%s, "
-            "verify_buckets=%s, fused_pool_io=%s, fused_buckets=%s, "
+            "verify_buckets=%s, conv_dtype=%s, fused_pool_io=%s, fused_buckets=%s, "
             "pool_gather=%s, gpr_buckets=%s)",
             self._display_name,
             len(self.raw_pools),
@@ -1036,6 +1036,7 @@ class MegakernelDriver:
             self.max_pages_per_seq,
             self.buckets,
             self.verify_buckets,
+            _rt.layout_facts.dtype_name(self.spec.cache_backend.layout.conv_dtype),
             self.fused_pool_io,
             fused_bkts,
             self.pool_gather,
@@ -1058,10 +1059,16 @@ class MegakernelDriver:
     def _adopt_framework_conv_dtype(self, conv_dtype: str) -> None:
         """Store the conv window in the dtype the framework's pool uses.
 
-        The split pool I/O path implements bf16 and f32 conv; fused pool I/O
-        and in-kernel gather (GPR) stage bf16 only, so an f32 layout turns
-        them off (the pool backend reports them unsupported). Other dtypes are
-        left to the layout comparison, which declines them.
+        An f32 conv window is served on the split pool I/O path: fused pool
+        I/O and in-kernel gather (GPR) implement f32 conv too but are not
+        validated on TPU yet, so this turns both off, including an explicit
+        `fused_pool_io` / `pool_gather` option (logged). Other dtypes are left
+        to the layout comparison, which declines them.
+
+        This replaces `self.spec` / `self.profile` before the comparison; on a
+        decline the whole driver is replaced, so nothing else sees them.
+        `PoolBackend.with_layout` raises `ValueError` (voted `bind_error`) for
+        a backend not built by `make_pool_backend`.
         """
         layout = self.spec.cache_backend.layout
         if (
@@ -1073,13 +1080,23 @@ class MegakernelDriver:
         self.spec = dataclasses.replace(
             self.spec, cache_backend=self.spec.cache_backend.with_layout(f32_layout)
         )
-        if self.fused_pool_io:
-            self.fused_pool_io = False
+        cleared = [
+            f"{name}={val!r}"
+            for name, val in (
+                ("fused_pool_io", self.fused_pool_io),
+                ("pool_gather", self.profile.pool_gather),
+            )
+            if val is True
+        ]
+        self.fused_pool_io = False
+        self.pool_gather = False
+        self.profile = dataclasses.replace(self.profile, pool_gather=False)
         logger.info(
             "%s megakernel: the framework stores the pooled conv state as fp32; "
             "using split pool I/O with an f32 conv window (fused pool I/O and "
-            "in-kernel gather stage bf16 conv and are off)",
+            "in-kernel gather are off for f32 conv until validated on TPU%s)",
             self._display_name,
+            f"; cleared {', '.join(cleared)}" if cleared else "",
         )
 
     def _check_pool_layout_facts(self, runner: Any, pool: torch.Tensor) -> None:
