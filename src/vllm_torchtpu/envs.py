@@ -254,6 +254,7 @@ if TYPE_CHECKING:
     VLLM_TPU_CPU_PROBE_S: float = 0.0
     VLLM_TPU_POST_WARMUP_HOSTMEM: str = "off"
     VLLM_TPU_POST_WARMUP_HOSTMEM_DETAIL: bool = False
+    VLLM_TPU_POST_WARMUP_HEAPDUMP: bool = False
     VLLM_TPU_FUSED_READ_OFFSET_UPDATE: bool = True
     VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE: bool = False
     VLLM_TPU_STAGE_TIMING_ONLY_WITH_SINK: bool = False
@@ -1544,6 +1545,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_POST_WARMUP_HOSTMEM_DETAIL": env_bool(
         "VLLM_TPU_POST_WARMUP_HOSTMEM_DETAIL", default=False
     ),
+    # With HEAPPROFILE set (gperftools libtcmalloc preloaded), dump each
+    # worker's live heap at the end of warmup into $CDK_OUTPUT_DIR/hprof.
+    "VLLM_TPU_POST_WARMUP_HEAPDUMP": env_bool("VLLM_TPU_POST_WARMUP_HEAPDUMP"),
     # Async scheduling: wait for the previous step's sampled-token copy after
     # launching this step's draft rather than before it (sample_tokens).
     "VLLM_TPU_DEFER_PREV_RESULTS_WAIT": env_bool(

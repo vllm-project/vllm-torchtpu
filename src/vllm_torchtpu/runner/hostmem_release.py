@@ -201,7 +201,36 @@ def report_and_maybe_drop() -> None:
         logger.exception("[hostmem] report failed; continuing")
 
 
+def _heap_dump() -> None:
+    """With gperftools' heap profiler running (HEAPPROFILE set at process
+    start), dump the live heap now and copy it next to the job outputs."""
+    import glob
+    import os
+    import shutil
+
+    process = ctypes.CDLL(None)
+    if not hasattr(process, "HeapProfilerDump") or not os.environ.get("HEAPPROFILE"):
+        logger.info("[hostmem] heap profiler not running; no heap dump")
+        return
+    process.HeapProfilerDump(b"warm")
+    prefix = os.environ["HEAPPROFILE"]
+    files = sorted(glob.glob(f"{prefix}.{os.getpid()}.*.heap"), key=os.path.getmtime)
+    out = os.path.join(os.environ.get("CDK_OUTPUT_DIR", "/tmp/cdk_output"), "hprof")
+    os.makedirs(out, exist_ok=True)
+    if files:
+        dst = os.path.join(out, f"rank{os.environ.get('RANK', os.getpid())}.{os.getpid()}.heap")
+        shutil.copy(files[-1], dst)
+        with open(f"/proc/{os.getpid()}/maps") as f, open(dst + ".maps", "w") as g:
+            g.write(f.read())
+        logger.info("[hostmem] heap dump %s -> %s", files[-1], dst)
+
+
 def _report_and_maybe_drop(mode: str) -> None:
+    if envs.VLLM_TPU_POST_WARMUP_HEAPDUMP:
+        try:
+            _heap_dump()
+        except Exception:
+            logger.exception("[hostmem] heap dump failed; continuing")
     start = time.perf_counter()
     before = _status()
     summary, runnables = _census()
