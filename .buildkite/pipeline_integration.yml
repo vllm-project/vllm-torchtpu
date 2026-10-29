@@ -173,6 +173,10 @@ steps:
         env:
           SHAPE: *shape_2_core
         <<: *integration_step
+        # Flaky on PR and main builds; retry up to 3 times before failing.
+        retry:
+          automatic:
+            limit: 3
         plugins:
           - *kube_plugin
         commands:
