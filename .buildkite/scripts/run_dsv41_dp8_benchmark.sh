@@ -36,6 +36,8 @@ uv pip freeze --system > "$results/pip-freeze.txt"
 
 # Each pytest process releases the TPU before the serving process starts.
 if [[ "$scenario" == decode ]]; then
+  python .buildkite/scripts/patch_runai_gcs_metadata.py \
+    | tee "$results/runai-gcs-metadata-patch.json"
   python -m pytest -q tests/kernels/test_dsv41_decode_index_scores.py \
     -k 'grouped_decode or write_flat_rows_with_ragged_lengths' \
     --junitxml="$results/kernel-scores.xml"
