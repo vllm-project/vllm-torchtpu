@@ -508,6 +508,31 @@ def _ensure_tuple_output(graph: fx.GraphModule) -> tuple[fx.GraphModule, bool]:
     return graph, True
 
 
+def code_layout_overrides(size: int | None) -> dict[str, str]:
+    """The XLA options of one bucket's program: without shared code functions
+    when the bucket is at most TPU_NO_CODE_FUNCTIONS_MAX_TOKENS tokens."""
+    limit = envs.TPU_NO_CODE_FUNCTIONS_MAX_TOKENS
+    if size is None or limit <= 0 or size > limit:
+        return {}
+    return {"xla_tpu_enable_deduplicated_calls": "DISABLED"}
+
+
+def code_layout_options(size: int | None):
+    """A context that compiles one bucket's program with its code layout
+    options (code_layout_overrides); an empty context when it has none."""
+    overrides = code_layout_overrides(size)
+    if not overrides:
+        return contextlib.nullcontext()
+    from torch_tpu._internal.compiler_options import custom_compiler_options
+
+    logger.info(
+        "[TpuCompilerAdaptor] Compiling the %d-token program with %s",
+        size,
+        overrides,
+    )
+    return custom_compiler_options(overrides)
+
+
 def _single_size(compile_range: Range) -> int | None:
     """The token bucket a compile range pins, or None for a size range."""
     return compile_range.start if compile_range.is_single_size() else None
@@ -553,6 +578,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         self,
         graph: fx.GraphModule,
         example_inputs: list[Any],
+        size: int | None = None,
     ) -> tuple[Callable[..., Any], Any | None]:
         """Compile `graph` with TpuBackend, and grab its serializable entry.
 
@@ -591,7 +617,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
 
         config.reset_scheduling_group_ids()
-        with torch._guards.tracing(tracing_ctx):
+        with torch._guards.tracing(tracing_ctx), code_layout_options(size):
             compiled_fn = _tpu_backend(graph, example_inputs)
 
         # Read `serialize` off the object TpuBackend returned, before any
@@ -862,7 +888,7 @@ class TpuCompilerAdaptor(CompilerInterface):
                 shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
             return compiled_fn, handle
 
-        compiled_fn, entry = self._run_backend(graph, example_inputs)
+        compiled_fn, entry = self._run_backend(graph, example_inputs, size)
 
         if was_wrapped:
             # Undo _ensure_tuple_output on the result side, so callers see the
@@ -946,7 +972,7 @@ class TpuCompilerAdaptor(CompilerInterface):
             fingerprint = (
                 _graph_fingerprint(graph) if envs.TPU_PRECOMPILE_PEER_REPLAY else None
             )
-            compiled_fn, entry = self._run_backend(graph, example_inputs)
+            compiled_fn, entry = self._run_backend(graph, example_inputs, size)
             # Self-heal: overwrite the artifact vLLM will hand us again next
             # run. Without this a single stale entry recompiles forever.
             if (
