@@ -16,6 +16,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 echo "--- Cleaning up old Docker images and cache"
 bash "${SCRIPT_DIR}/cleanup_docker.sh"
 
@@ -72,9 +73,33 @@ if [[ "${TORCHTPU_NIGHTLY:-0}" != "1" && "${CI_IMAGE_REBUILD:-0}" != "1" ]] \
 fi
 
 if [[ "${TORCHTPU_NIGHTLY:-0}" != "1" ]]; then
+  # Reuse pre-COPY layers from the trusted main parent image only (never PR or
+  # unmerged branch images); BuildKit re-evaluates keys if deps or args changed.
+  CACHE_ARGS=()
+  PARENT_SHA=""
+  if [[ "${CI_IMAGE_REBUILD:-0}" != "1" ]]; then
+    if [[ -n "${BUILDKITE_MERGE_QUEUE_BASE_COMMIT:-}" ]]; then
+      PARENT_SHA="${BUILDKITE_MERGE_QUEUE_BASE_COMMIT}"
+    elif [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]]; then
+      git -C "${REPO_ROOT}" fetch --quiet origin "+refs/heads/main:refs/remotes/origin/main" 2>/dev/null || true
+      PARENT_SHA="$(git -C "${REPO_ROOT}" merge-base origin/main HEAD 2>/dev/null || true)"
+    elif [[ "${BUILDKITE_BRANCH:-}" == "main" ]]; then
+      PARENT_SHA="$(git -C "${REPO_ROOT}" rev-parse --verify --quiet HEAD^ 2>/dev/null || true)"
+    fi
+  fi
+  if [[ -n "${PARENT_SHA}" ]]; then
+    CACHE_IMAGE_TAG="${IMAGE_REPO}:${PARENT_SHA}-${VLLM_COMMIT_HASH}"
+    if docker manifest inspect "${CACHE_IMAGE_TAG}" >/dev/null 2>&1; then
+      echo "--- cache-from ${CACHE_IMAGE_TAG}: found"
+      CACHE_ARGS=(--cache-from "${CACHE_IMAGE_TAG}")
+    else
+      echo "--- cache-from ${CACHE_IMAGE_TAG}: missing"
+    fi
+  fi
+
   echo "--- Building Docker Image: ${BASE_IMAGE_TAG} (target: ${TARGET})"
   # Run build_image.sh and pass VLLM_COMMIT_HASH directly as a build argument
-  ./docker/build_image.sh --target "${TARGET}" -t "${BASE_IMAGE_TAG}" -c "${VLLM_COMMIT_HASH}"
+  "${REPO_ROOT}/docker/build_image.sh" --target "${TARGET}" -t "${BASE_IMAGE_TAG}" -c "${VLLM_COMMIT_HASH}" ${CACHE_ARGS[@]+"${CACHE_ARGS[@]}"}
 
   # Publish image tag metadata for downstream test steps
   buildkite-agent meta-data set "CI_IMAGE_TAG${IMAGE_SUFFIX:-}" "${BASE_IMAGE_TAG}"
