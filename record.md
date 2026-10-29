@@ -468,3 +468,14 @@ python scripts/dsv41_bench/server_steps/run.py --scenario decode \
 - 优化候选源层 dense logits；继续核对计算必要性和调度，不能仅由分项名称推断。
 - 修复八个逻辑设备的稳定符号覆盖，按相同口径完成全部设备验收。
 - 提前准备原型先解释启动内存失败，再决定是否重测；未验证的原型继续与默认实现分离。
+
+## Sparse MQA token-major 实验（2026-10-29）
+
+隔离实验和 LLO 归因见 [布局实验报告](docs/deepseek_v41/sparse_mqa_layouts.md)。
+同一组 288-query 输入，四 token 原生交错打包的 gather + logits 为
+470.776 µs，field-major 基线为 651.001 µs；不含缓存打包、Top-K 或服务路径。
+单独 logits 为 175.026 µs，仍慢于基线 156.625 µs。K/scale 合并为一路 DMA
+的对照仍为 174.785 µs；差异定位到矩阵输入布局及 MXU 加载/调度路径，
+不能把全部差值等同于硬件转置延迟。纯 token-major 输入的最佳已测重排版
+为 859.704 µs（gather + logits），未超过原版。
+实验代码放在 `scripts/dsv41_bench/`，生产 kernel 和缓存写入未改。
