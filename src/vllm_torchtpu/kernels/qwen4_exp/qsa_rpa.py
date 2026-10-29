@@ -179,7 +179,17 @@ def qsa_attention(
             k_scale=k_scale,
             v_scale=v_scale,
         ):
-            return adaptive_prefill(query, gate, blocks, lengths, table, cache, starts)
+            return adaptive_prefill(
+                query,
+                gate,
+                blocks,
+                lengths,
+                table,
+                cache,
+                starts,
+                kv_heads=kv_heads,
+                ratio=ratio,
+            )
 
         query_block, kv_tile = get_sparse_prefill_tiles(
             query, cache, kv_heads=kv_heads, ratio=ratio

@@ -22,10 +22,11 @@ import pytest
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from tests.kernels.prefill_work_model_helpers import work_model
 from vllm_torchtpu.kernels.qwen4_exp import block_sparse_gqa_prefill as tc
 from vllm_torchtpu.kernels.qwen4_exp.rounding import bf16
 from vllm_torchtpu.kernels.sparse_gqa_prefill import adaptive
-from vllm_torchtpu.kernels.sparse_gqa_prefill.cost_model import COST_MODELS, tc_cost
+from vllm_torchtpu.kernels.sparse_gqa_prefill.cost_model import sc_cost, tc_cost
 
 
 @pytest.fixture
@@ -114,7 +115,17 @@ def test_general_tc_packs_preserve_owner_tail_and_nonconstant_gate(
     np.testing.assert_array_equal(actual, expected(args))
     assert cache is args[5]
     words = ((columns * 896 // 128 + 127) // 128) * 128
-    plan = tc._ragged_plan(tokens, 4, 128, words, columns * 896 // 4, columns, 4, 128)
+    plan = tc._ragged_plan(
+        tokens,
+        4,
+        128,
+        words,
+        columns * 896 // 4,
+        columns,
+        4,
+        128,
+        request_capacity=tokens,
+    )
     assert all(shape[0] <= max(tokens, plan[0] * 128) for shape, *_ in core_calls)
     for _, counts, bits, lengths, _ in core_calls:
         inactive = np.asarray(lengths).reshape(len(counts), -1).max(axis=1) == 0
@@ -130,11 +141,30 @@ def test_adaptive_forced_tc_and_offset_preserve_prefix_and_gate(
         adaptive, "_select_sc_for_chunk", lambda *args: jnp.array(False)
     )
     with jax.disable_jit():
-        actual, cache = adaptive._one_chunk(args[:5], args[5], args[6])
+        actual, cache = adaptive._one_chunk(args[:5], args[5], args[6], work_model())
         prefix = jnp.full_like(args[0], 13)
-        updated = adaptive._write_tc_chunk(args[:5], args[5], args[6], prefix, 17, 256)
+        updated = adaptive._write_tc_chunk(
+            args[:5],
+            args[5],
+            args[6],
+            prefix,
+            17,
+            256,
+            kv_heads=2,
+            ratio=4,
+            kv_tile=256,
+        )
         middle = adaptive._write_tc_chunk(
-            args[:5], args[5], args[6], prefix, 17, 128, tail=True
+            args[:5],
+            args[5],
+            args[6],
+            prefix,
+            17,
+            128,
+            tail=True,
+            kv_heads=2,
+            ratio=4,
+            kv_tile=256,
         )
     np.testing.assert_array_equal(actual, expected(args))
     np.testing.assert_array_equal(updated[:17], prefix[:17])
@@ -145,7 +175,7 @@ def test_adaptive_forced_tc_and_offset_preserve_prefix_and_gate(
     assert cache is args[5]
 
 
-def test_padded_request_capacity_does_not_change_pack_shape(core_calls):
+def test_padded_request_capacity_preserves_output_and_static_bounds(core_calls):
     args = inputs(17, [0, 3, 17])
     run = functools.partial(
         tc.block_sparse_gqa_attention, kv_heads=2, ratio=4, query_block=128, kv_tile=128
@@ -155,7 +185,9 @@ def test_padded_request_capacity_does_not_change_pack_shape(core_calls):
         short_shapes = [shape for shape, *_ in core_calls]
         core_calls.clear()
         padded, _ = run(*args[:-1], jnp.pad(args[-1], (0, 1024), constant_values=17))
-    assert short_shapes == [shape for shape, *_ in core_calls]
+    # Padded capacity loosens the static bound, within the true-row/byte ceiling.
+    assert all(shape[0] <= 2 * 128 for shape in short_shapes)
+    assert all(shape[0] <= 17 * 128 for shape, *_ in core_calls)
     np.testing.assert_array_equal(short, padded)
 
 
@@ -178,6 +210,7 @@ def test_multiple_source_windows_preserve_both_output_sentinels(
         budget,
         query_block,
         *,
+        request_capacity: int,
         query_dtype=jnp.bfloat16,
     ):
         _, _, selection_rows = original_plan(
@@ -190,6 +223,7 @@ def test_multiple_source_windows_preserve_both_output_sentinels(
             budget,
             query_block,
             query_dtype=query_dtype,
+            request_capacity=request_capacity,
         )
         source_rows = min(size, query_block)
         tile_rows.append(query_block)
@@ -207,7 +241,16 @@ def test_multiple_source_windows_preserve_both_output_sentinels(
     sentinel = jnp.full_like(args[0], 13)
     with jax.disable_jit():
         actual = adaptive._write_tc_chunk(
-            args[:5], args[5], args[6], sentinel, offset, size, tail=True
+            args[:5],
+            args[5],
+            args[6],
+            sentinel,
+            offset,
+            size,
+            tail=True,
+            kv_heads=2,
+            ratio=4,
+            kv_tile=256,
         )
     wanted = sentinel.at[offset : offset + size].set(
         expected(args)[offset : offset + size]
@@ -225,7 +268,7 @@ def test_multiple_source_windows_preserve_both_output_sentinels(
 def test_tile_descriptors_and_call_count_match_actual_packs(size, split):
     starts = jnp.array([0, 0, split, split, size, size], jnp.int32)
     first, ends, total = tc._request_tiles(starts, 0, size, 128)
-    plan = tc._ragged_plan(size, 24, 256, 128, 416, 1, 512, 128)
+    plan = tc._ragged_plan(size, 24, 256, 128, 416, 1, 512, 128, request_capacity=size)
     pack_tiles, source_rows, _ = plan
     reference_tiles = [
         (lo + step, min(lo + step + 128, hi))
@@ -261,10 +304,12 @@ def test_tile_descriptors_and_call_count_match_actual_packs(size, split):
 def test_batched_cost_uses_external_calls_and_bounds_fine_cost(dtype):
     starts = jnp.arange(257, dtype=jnp.int32)
     first, ends, tiles = tc._request_tiles(starts, 0, 256, 256)
-    pack_tiles, source_rows, _ = tc._ragged_plan(256, 24, 256, 128, 416, 1, 512, 256)
+    pack_tiles, source_rows, _ = tc._ragged_plan(
+        256, 24, 256, 128, 416, 1, 512, 256, request_capacity=256
+    )
     calls = tc._ragged_call_count(first, ends, tiles, source_rows, pack_tiles, 256)
     assert int(calls) < int(tiles)
-    model = COST_MODELS[jnp.dtype(dtype)]
+    model = work_model(dtype)
     lower = tc_cost(
         model,
         queries=calls * pack_tiles * 256,
@@ -285,7 +330,7 @@ def test_batched_cost_uses_external_calls_and_bounds_fine_cost(dtype):
 def test_selection_rows_have_separate_scratch_bound_at_long_context(monkeypatch):
     words, budget = 2048, 512
     _, source_rows, selection_rows = tc._ragged_plan(
-        8192, 24, 256, words, words * 32, 1024, budget, 256
+        8192, 24, 256, words, words * 32, 1024, budget, 256, request_capacity=8192
     )
     index_bytes = jnp.dtype(jnp.int32).itemsize
     mask_bytes = jnp.dtype(jnp.bool_).itemsize
@@ -296,7 +341,7 @@ def test_selection_rows_have_separate_scratch_bound_at_long_context(monkeypatch)
     assert selection_rows * row_bytes <= tc.TC_SELECTION_TARGET_BYTES
     monkeypatch.setattr(tc, "TC_SELECTION_TARGET_BYTES", row_bytes * 2)
     _, same_source_rows, limited_rows = tc._ragged_plan(
-        8192, 24, 256, words, words * 32, 1024, budget, 256
+        8192, 24, 256, words, words * 32, 1024, budget, 256, request_capacity=8192
     )
     assert same_source_rows == source_rows
     assert limited_rows == 2
@@ -306,7 +351,7 @@ def test_long_mixed_requests_use_packed_source_windows():
     size, query_block = 8192, 256
     starts = [0, 1, size]
     pack_tiles, source_rows, selection_rows = tc._ragged_plan(
-        size, 24, 256, 2176, 65728, 158, 512, query_block
+        size, 24, 256, 2176, 65728, 158, 512, query_block, request_capacity=size
     )
     assert (pack_tiles, source_rows, selection_rows) == (15, 3840, 3840)
     reference_tiles = [
@@ -345,7 +390,7 @@ def test_long_mixed_requests_use_packed_source_windows():
 def test_source_block_gather_is_in_the_packing_byte_bound():
     size, budget, query_block = 8192, 65536, 256
     pack_tiles, source_rows, selection_rows = tc._ragged_plan(
-        size, 24, 256, 2176, 65728, 158, budget, query_block
+        size, 24, 256, 2176, 65728, 158, budget, query_block, request_capacity=size
     )
     row_bytes = 4 * (24 * 256 * 2) + 2 * 2176 * 4 + 158 * 4 + budget * 4 + 16
     assert pack_tiles == 3
@@ -353,7 +398,9 @@ def test_source_block_gather_is_in_the_packing_byte_bound():
     assert source_rows * row_bytes <= 256 * 1024**2
     assert source_rows * budget * 4 <= 256 * 1024**2
     assert selection_rows <= source_rows
-    assert tc._ragged_plan(256, 24, 256, 128, 416, 1, 512, 256) == (20, 256, 256)
+    assert tc._ragged_plan(
+        256, 24, 256, 128, 416, 1, 512, 256, request_capacity=256
+    ) == (20, 256, 256)
 
 
 def test_true_query_selection_is_shared_between_pack_calls(core_calls, monkeypatch):
@@ -407,10 +454,11 @@ def test_aligned_selection_keeps_one_call_without_ragged_descriptors(monkeypatch
             256,
             7,
             jnp.bfloat16,
-            tc._ragged_plan(256, 24, 256, 128, 416, 1, 512, 256),
+            tc._ragged_plan(256, 24, 256, 128, 416, 1, 512, 256, request_capacity=256),
+            work_model(jnp.bfloat16),
         )
     assert not bool(choice)
-    assert calls == [1]
+    assert calls == []
 
 
 @pytest.mark.parametrize("ratio,groups,words", [(4, 416, 128), (8, 65536, 2176)])
@@ -504,7 +552,7 @@ def test_cheap_batched_lower_bounds_fragmented_fine_work(requests, dtype):
             first, ends, total, source_rows, pack_tiles, 256
         )
         assert int(cheap_calls) <= int(actual_calls)
-        model = COST_MODELS[jnp.dtype(dtype)]
+        model = work_model(dtype)
         lower = tc_cost(
             model,
             queries=cheap_calls * pack_tiles * 256,
@@ -522,7 +570,7 @@ def test_cheap_batched_lower_bounds_fragmented_fine_work(requests, dtype):
         assert bool(lower <= fine)
 
 
-@pytest.mark.parametrize("requests,expected_fine", [(8, 1), (256, 0)])
+@pytest.mark.parametrize("requests,expected_fine", [(8, 0), (32, 1), (256, 0)])
 def test_fast_sc_skips_descriptors_and_undecided_can_choose_batched_tc(
     monkeypatch, requests, expected_fine
 ):
@@ -537,10 +585,226 @@ def test_fast_sc_skips_descriptors_and_undecided_can_choose_batched_tc(
     starts = jnp.asarray(np.linspace(0, 256, requests + 1, dtype=np.int32))
     ids = jnp.full((256, 512), -1, jnp.int32).at[:, :16].set(jnp.arange(16))
     lengths = jnp.full(256, 64, jnp.int32)
-    plan = tc._ragged_plan(256, 24, 256, 128, 416, 1, 512, 256)
+    plan = tc._ragged_plan(256, 24, 256, 128, 416, 1, 512, 256, request_capacity=256)
+    model = work_model(jnp.bfloat16)
     with jax.disable_jit():
         choose = adaptive._select_sc_for_chunk(
-            ids, lengths, starts, 0, 256, 7, jnp.bfloat16, plan
+            ids,
+            lengths,
+            starts,
+            0,
+            256,
+            7,
+            jnp.bfloat16,
+            plan,
+            model,
         )
     assert bool(choose) == (requests == 256)
     assert len(descriptors) == expected_fine
+
+
+def test_request_capacity_bounds_partial_tiles_and_preserves_many_request_plan():
+    import itertools
+
+    for lengths in itertools.product([0, 1, 127, 128, 255, 256, 257], repeat=3):
+        size = sum(lengths)
+        if not size:
+            continue
+        actual = sum((n + 255) // 256 for n in lengths)
+        upper = min(size, (size + 255) // 256 + min(len(lengths), size) - 1)
+        assert actual <= upper
+        pack, _, _ = tc._ragged_plan(
+            size, 8, 128, 128, 32, 2, 16, 256, request_capacity=len(lengths)
+        )
+        assert 1 <= pack <= upper
+    assert tc._ragged_plan(256, 8, 128, 128, 32, 2, 16, 256, request_capacity=2) == (
+        2,
+        256,
+        256,
+    )
+    assert tc._ragged_plan(
+        256, 24, 256, 128, 416, 1, 512, 256, request_capacity=256
+    ) == (20, 256, 256)
+
+
+def test_two_short_requests_choose_tc_after_capacity_is_accounted(monkeypatch):
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    query = jax.ShapeDtypeStruct((256, 4, 128), jnp.bfloat16)
+    blocks = jnp.tile(jnp.arange(16, dtype=jnp.int32), (256, 1))
+    lengths = 64 + jnp.arange(256, dtype=jnp.int32) % 4
+    table = jax.ShapeDtypeStruct((256, 1), jnp.int32)
+    cache = jax.ShapeDtypeStruct((4, 256, 1, 4, 128), jnp.float8_e4m3fn)
+    model = work_model(
+        jnp.float8_e4m3fn,
+        heads=4,
+        dim=128,
+        budget=16,
+        page_size=256,
+        kv_heads=1,
+        ratio=4,
+    )
+    plan = adaptive._tc_plan(
+        query,
+        blocks,
+        table,
+        cache,
+        256,
+        kv_heads=1,
+        ratio=4,
+        kv_tile=256,
+        request_capacity=2,
+    )
+    assert plan == (2, 256, 256)
+    choose = adaptive._select_sc_for_chunk(
+        blocks,
+        lengths,
+        jnp.array([0, 128, 256], jnp.int32),
+        0,
+        256,
+        1,
+        cache.dtype,
+        plan,
+        model,
+    )
+    assert not bool(choose)
+
+
+@pytest.mark.parametrize(
+    "size,starts,offset",
+    [
+        (256, [0, 128, 256], 0),
+        (128, [0, 17, 145, 273], 17),
+        (17, [0, 3, 17], 0),
+        (256, [0, 0, 0], 0),
+    ],
+)
+def test_single_pack_tc_bound_matches_independent_fine_work(
+    monkeypatch, size, starts, offset
+):
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    model = work_model(
+        jnp.float8_e4m3fn,
+        heads=4,
+        dim=128,
+        budget=16,
+        page_size=256,
+        kv_heads=1,
+        ratio=4,
+    )
+    lengths = 64 + np.arange(size, dtype=np.int32) % 4
+    if starts[-1] == 0:
+        lengths[:] = 0
+    ids = np.tile(np.arange(16, dtype=np.int32), (size, 1))
+    ids[lengths == 0] = -1
+    plan = tc._ragged_plan(
+        size, 4, 128, 128, 64, 1, 16, 256, request_capacity=len(starts) - 1
+    )
+    pack, source_rows, _ = plan
+    local = np.clip(np.asarray(starts) - offset, 0, size)
+    visits, tiles = 0, 0
+    for lo, hi in zip(local[:-1], local[1:]):
+        for first in range(int(lo), int(hi), 256):
+            touched = set()
+            for row in range(first, min(first + 256, int(hi))):
+                if lengths[row] > 0:
+                    for group in ids[row]:
+                        if group >= 0:
+                            touched.update(
+                                token // 256
+                                for token in range(int(group) * 4, (int(group) + 1) * 4)
+                            )
+                    touched.update(
+                        token // 256
+                        for token in range(
+                            int(lengths[row]) // 4 * 4, int(lengths[row])
+                        )
+                    )
+            visits += len(touched)
+            tiles += 1
+    assert source_rows == size and tiles <= pack
+    calls = int(tiles > 0)
+    fine = tc_cost(
+        model,
+        queries=calls * pack * 256,
+        num_tiles=1,
+        tile_visits=jnp.int32(visits),
+        launches=calls,
+    )
+    upper = tc_cost(
+        model, queries=pack * 256, num_tiles=1, tile_visits=jnp.int32(pack), launches=1
+    )
+    assert float(fine) <= float(upper)
+    sc_rows = (size + model.sc_chunk - 1) // model.sc_chunk * model.sc_chunk
+    ls = jnp.pad(jnp.asarray(lengths), (0, sc_rows - size))
+    target = float(sc_cost(model, ls)) * 1.02
+    choice = adaptive._select_sc_for_chunk(
+        jnp.asarray(ids),
+        jnp.asarray(lengths),
+        jnp.asarray(starts, jnp.int32),
+        offset,
+        size,
+        1,
+        jnp.float8_e4m3fn,
+        plan,
+        model,
+    )
+    assert bool(choice) == (float(fine) > target)
+
+
+def test_single_pack_static_tc_skips_runtime_descriptor_work(monkeypatch):
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    descriptors = []
+    original = tc._request_tiles
+
+    def observed(*args):
+        descriptors.append(1)
+        return original(*args)
+
+    monkeypatch.setattr(tc, "_request_tiles", observed)
+    model = work_model(
+        jnp.float8_e4m3fn,
+        heads=4,
+        dim=128,
+        budget=16,
+        page_size=256,
+        kv_heads=1,
+        ratio=4,
+    )
+    with jax.disable_jit():
+        choice = adaptive._select_sc_for_chunk(
+            jnp.tile(jnp.arange(16, dtype=jnp.int32), (256, 1)),
+            jnp.full(256, 64, jnp.int32),
+            jnp.array([0, 128, 256], jnp.int32),
+            0,
+            256,
+            1,
+            jnp.float8_e4m3fn,
+            (2, 256, 256),
+            model,
+        )
+    assert not bool(choice)
+    assert descriptors == []
+
+
+def test_empty_request_partition_keeps_output_and_skips_core(core_calls):
+    args = inputs(17, [0, 0, 0])
+    sentinel = jnp.full_like(args[0], 13)
+    with jax.disable_jit():
+        result = tc._ragged_prefill(
+            *args[:6],
+            args[6],
+            sentinel,
+            0,
+            17,
+            ratio=4,
+            kv_heads=2,
+            query_block=128,
+            kv_tile=128,
+            k_scale=1.0,
+            v_scale=1.0,
+        )
+    np.testing.assert_array_equal(result, sentinel)
+    assert core_calls == []

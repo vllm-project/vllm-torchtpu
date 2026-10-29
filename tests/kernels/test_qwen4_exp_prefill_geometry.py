@@ -27,6 +27,7 @@ from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
 )
 from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import get_sparse_prefill_tiles
 from vllm_torchtpu.kernels.sparse_gqa_prefill.adaptive import adaptive_prefill
+from vllm_torchtpu.kernels.sparse_gqa_prefill.cost_model import prefill_cost_model
 
 
 @pytest.mark.parametrize("tokens", [17, 256, 512, 4096, 8192, 8448, 16640])
@@ -210,7 +211,11 @@ def test_general_paired_geometry(tokens, heads, kv_heads, dim, fp8):
 def test_adaptive_short_tail_and_padded_request_boundaries(tokens, ragged, fp8):
     args, _ = inputs(tokens, 24, 2, 256, fp8, ragged=ragged)
     before = [np.asarray(x).copy() for x in args]
-    compiled = jax.jit(adaptive_prefill).lower(*args).compile()
+    compiled = (
+        jax.jit(functools.partial(adaptive_prefill, kv_heads=2, ratio=4))
+        .lower(*args)
+        .compile()
+    )
     hlo = compiled.as_text()
     assert hlo is not None
     assert "prefill_paired_pages" in hlo
@@ -282,11 +287,17 @@ def test_aligned_requests_keep_sc_gathers_local_with_padded_slots(fp8):
         functools.partial(
             select_sc,
             num_tiles=math.ceil(args[4].shape[1] * 1664 / 256),
-            dtype=args[5].dtype,
+            model=prefill_cost_model(
+                args[0], args[2], args[4], args[5], kv_heads=2, ratio=4, kv_tile=256
+            ),
         )
     )
     assert bool(choose(args[2], args[3]))
-    compiled = jax.jit(adaptive_prefill).lower(*args).compile()
+    compiled = (
+        jax.jit(functools.partial(adaptive_prefill, kv_heads=2, ratio=4))
+        .lower(*args)
+        .compile()
+    )
     before = [np.asarray(x).copy() for x in args]
     output, returned = compiled(*args)
     check_reference(args, output, kv_heads=2, rows=[1, 255, 256, 510])
@@ -329,7 +340,9 @@ def test_live_tail_smaller_than_sc_microchunk(fp8):
         functools.partial(
             select_sc,
             num_tiles=math.ceil(pages * 1664 / 256),
-            dtype=args[5].dtype,
+            model=prefill_cost_model(
+                args[0], args[2], args[4], args[5], kv_heads=2, ratio=4, kv_tile=256
+            ),
             sc_queries=SC_CHUNK_SIZE[jnp.dtype(args[5].dtype)],
         )
     )
@@ -340,7 +353,11 @@ def test_live_tail_smaller_than_sc_microchunk(fp8):
         )
     )
     before = [np.asarray(x).copy() for x in args]
-    compiled = jax.jit(adaptive_prefill).lower(*args).compile()
+    compiled = (
+        jax.jit(functools.partial(adaptive_prefill, kv_heads=2, ratio=4))
+        .lower(*args)
+        .compile()
+    )
     output, returned = compiled(*args)
     check_reference(args, output, kv_heads=2, rows=[0, 15])
     np.testing.assert_array_equal(compiled(*args)[0], output)

@@ -149,18 +149,6 @@ def gather_interleaved(
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel")
         ),
-        cost_estimate=pl.CostEstimate(
-            flops=batch
-            * capacity
-            * head_axes
-            * (20 + 4 * (padded_budget // 128 + padded_table // 128)),
-            transcendentals=0,
-            bytes_accessed=4
-            * batch
-            * (capacity // tile_k)
-            * (1 + padded_budget + padded_table)
-            + 4 * batch * capacity * head_axes,
-        ),
         name="sc_prefill_prepare_interleaved_indices",
     )(
         lengths,
@@ -211,7 +199,8 @@ def gather_interleaved(
                 transcendentals=0,
                 bytes_accessed=padded
                 * (
-                    4 + 2 * packing * dim * (jax.dtypes.itemsize_bits(cache.dtype) // 8)
+                    jnp.dtype(jnp.int32).itemsize
+                    + 2 * packing * dim * jnp.dtype(cache.dtype).itemsize
                 ),
             ),
             name="sc_prefill_interleaved_gather",
@@ -417,7 +406,10 @@ def sc_grouped_attention(
         (None, kv_heads, head_group * query_group, dim), lambda b, *_: (b, 0, 0, 0)
     )
     state = (kv_heads, head_group * query_group, 128)
-    packed_elements = batch * kv_heads * head_group * dim
+    packed_query, packed_gate = pack(q), pack(gate)
+    score_elements = batch * kv_heads * head_group * query_group * capacity
+    alpha_elements = batch * kv_heads * head_group * (capacity // tile_k)
+    output_elements = batch * kv_heads * head_group * dim
     y = pl.pallas_call(
         functools.partial(
             _attention,
@@ -451,18 +443,16 @@ def sc_grouped_attention(
         ),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
         cost_estimate=pl.CostEstimate(
-            flops=batch
-            * kv_heads
-            * head_group
-            * query_group
-            * capacity
-            * (4 * dim + 10),
-            transcendentals=2 * batch * kv_heads * head_group * query_group * capacity
-            + packed_elements,
-            bytes_accessed=6 * packed_elements + compact.nbytes + lengths.nbytes,
+            flops=4 * score_elements * dim,
+            transcendentals=score_elements + alpha_elements + output_elements,
+            bytes_accessed=packed_query.nbytes
+            + packed_gate.nbytes
+            + output_elements * jnp.dtype(jnp.bfloat16).itemsize
+            + compact.nbytes
+            + lengths.nbytes,
         ),
         name="sc_compact_grouped_prefill",
-    )(lengths, pack(q), pack(gate), compact)
+    )(lengths, packed_query, packed_gate, compact)
     y = y.reshape(
         batch // query_group, kv_heads, head_group, query_group, dim
     ).transpose(0, 3, 1, 2, 4)

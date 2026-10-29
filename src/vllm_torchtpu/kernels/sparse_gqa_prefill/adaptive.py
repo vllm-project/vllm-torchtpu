@@ -25,18 +25,19 @@ from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import (
     prefill_vmem_limit,
 )
 from vllm_torchtpu.kernels.sparse_gqa_prefill.cost_model import (
-    CALIBRATED_PROFILE,
-    COST_MODELS,
-    PrefillCalibration,
+    prefill_cost_model,
     sc_cost,
     tc_cost,
 )
 from vllm_torchtpu.kernels.sparse_gqa_prefill.grouped import sc_grouped_attention
 from vllm_torchtpu.kernels.sparse_gqa_prefill.occupancy import active_counts
-from vllm_torchtpu.kernels.sparse_gqa_prefill.selector import select_sc
+from vllm_torchtpu.kernels.sparse_gqa_prefill.selector import (
+    select_sc,
+    tc_selected_by_static_bound,
+)
 from vllm_torchtpu.kernels.sparse_gqa_prefill.tuned_block_sizes import (
     PREFILL_DISPATCH_CHUNK_QUERIES,
-    SC_CHUNK_SIZE,
+    sc_chunk_size,
 )
 
 
@@ -48,6 +49,9 @@ def adaptive_prefill(
     table: jax.Array,
     cache: jax.Array,
     starts: jax.Array,
+    *,
+    kv_heads: int,
+    ratio: int,
 ) -> tuple[jax.Array, jax.Array]:
     """Attend with a bounded workspace; cache is returned unchanged.
 
@@ -64,43 +68,50 @@ def adaptive_prefill(
         table,
         cache,
         starts,
-        kv_heads=2,
-        ratio=4,
+        kv_heads=kv_heads,
+        ratio=ratio,
         k_scale=1.0,
         v_scale=1.0,
     ):
         raise NotImplementedError(
             "Adaptive prefill requires native packed BF16/FP8 KV, "
-            "ratio4/KV2, aligned dimensions, sufficient VMEM and SparseCore; "
+            "aligned dimensions, sufficient VMEM and SparseCore; "
             "use block_sparse_gqa_attention for other configurations"
         )
     arrays = (q, gate, blocks, lengths, table)
-    profile = PrefillCalibration(
-        q.shape[1],
-        2,
-        q.shape[2],
-        4,
-        cache.shape[1],
-        blocks.shape[1],
-        pltpu.get_tpu_info().chip_version,
+    query_block, kv_tile = get_sparse_prefill_tiles(
+        q, cache, kv_heads=kv_heads, ratio=ratio
     )
-    if profile != CALIBRATED_PROFILE:
-        query_block, kv_tile = get_sparse_prefill_tiles(q, cache, kv_heads=2, ratio=4)
+    if (
+        _paired_working_set(
+            q.shape[1],
+            kv_heads,
+            q.shape[2],
+            cache.shape[3],
+            jnp.dtype(cache.dtype).itemsize,
+            256,
+            kv_tile,
+        )
+        > prefill_vmem_limit()
+        or sc_chunk_size(cache, budget=blocks.shape[1], ratio=ratio) == 0
+    ):
         return candidate.block_sparse_gqa_attention(
             *arrays,
             cache,
             starts,
-            kv_heads=2,
-            ratio=4,
+            kv_heads=kv_heads,
+            ratio=ratio,
             query_block=query_block,
             kv_tile=kv_tile,
         )
-    # Preserve the one-chunk schedule at the calibrated common bucket.
+    model = prefill_cost_model(
+        q, blocks, table, cache, kv_heads=kv_heads, ratio=ratio, kv_tile=kv_tile
+    )
     if len(q) <= PREFILL_DISPATCH_CHUNK_QUERIES and len(q) % 256 == 0:
-        return _one_chunk(arrays, cache, starts)
+        return _one_chunk(arrays, cache, starts, model)
 
     full_chunks, tail = divmod(len(q), PREFILL_DISPATCH_CHUNK_QUERIES)
-    num_tiles = (table.shape[1] * cache.shape[1] + 255) // 256
+    num_tiles = (table.shape[1] * cache.shape[1] + kv_tile - 1) // kv_tile
     choices = _select_sc_for_full_chunks(
         blocks,
         lengths,
@@ -108,7 +119,18 @@ def adaptive_prefill(
         cache,
         full_chunks,
         num_tiles,
-        _tc_plan(q, blocks, table, cache, PREFILL_DISPATCH_CHUNK_QUERIES),
+        _tc_plan(
+            q,
+            blocks,
+            table,
+            cache,
+            PREFILL_DISPATCH_CHUNK_QUERIES,
+            kv_heads=kv_heads,
+            ratio=ratio,
+            kv_tile=kv_tile,
+            request_capacity=len(starts) - 1,
+        ),
+        model,
     )
     # Carry only the final output. In particular, do not slice/materialize
     # all full-chunk Q/gate inputs before the TC/SC branch, or concatenate
@@ -125,6 +147,9 @@ def adaptive_prefill(
             i * PREFILL_DISPATCH_CHUNK_QUERIES,
             PREFILL_DISPATCH_CHUNK_QUERIES,
             choose,
+            kv_heads=kv_heads,
+            ratio=ratio,
+            kv_tile=kv_tile,
         )
 
     def remainder(output):
@@ -137,10 +162,31 @@ def adaptive_prefill(
             offset,
             tail,
             num_tiles,
-            _tc_plan(q, blocks, table, cache, tail),
+            _tc_plan(
+                q,
+                blocks,
+                table,
+                cache,
+                tail,
+                kv_heads=kv_heads,
+                ratio=ratio,
+                kv_tile=kv_tile,
+                request_capacity=len(starts) - 1,
+            ),
+            model,
         )
         return _write_chunk(
-            arrays, cache, starts, output, offset, tail, choose, tail=True
+            arrays,
+            cache,
+            starts,
+            output,
+            offset,
+            tail,
+            choose,
+            tail=True,
+            kv_heads=kv_heads,
+            ratio=ratio,
+            kv_tile=kv_tile,
         )
 
     if full_chunks and tail:
@@ -161,7 +207,7 @@ def adaptive_prefill(
 
 
 def _select_sc_for_full_chunks(
-    blocks, lengths, starts, cache, full_chunks, num_tiles, plan
+    blocks, lengths, starts, cache, full_chunks, num_tiles, plan, model
 ):
     """Select full outer chunks without materializing query or gate chunks."""
     choices = None
@@ -178,6 +224,7 @@ def _select_sc_for_full_chunks(
                 num_tiles,
                 cache.dtype,
                 plan,
+                model,
             )
 
         choices = lax.map(
@@ -196,17 +243,30 @@ def _select_sc_for_full_chunks(
     return choices
 
 
-def _select_sc_for_tail(blocks, lengths, starts, cache, offset, tail, num_tiles, plan):
+def _select_sc_for_tail(
+    blocks, lengths, starts, cache, offset, tail, num_tiles, plan, model
+):
     """Pad only tail metadata for selection, at the tail's original call site."""
     padded = (tail + 255) // 256 * 256
     ids = jnp.pad(blocks[offset:], ((0, padded - tail), (0, 0)), constant_values=-1)
     ls = jnp.pad(lengths[offset:], (0, padded - tail))
     return _select_sc_for_chunk(
-        ids, ls, starts, offset, tail, num_tiles, cache.dtype, plan
+        ids, ls, starts, offset, tail, num_tiles, cache.dtype, plan, model
     )
 
 
-def _direct_tc(query, gate, blocks, lengths, table, cache):
+def _direct_tc(
+    query,
+    gate,
+    blocks,
+    lengths,
+    table,
+    cache,
+    *,
+    kv_heads: int,
+    ratio: int,
+    kv_tile: int,
+):
     output, _ = candidate.block_sparse_gqa_attention(
         query,
         gate,
@@ -215,15 +275,26 @@ def _direct_tc(query, gate, blocks, lengths, table, cache):
         table,
         cache,
         jnp.array([0, len(query)], jnp.int32),
-        kv_heads=2,
-        ratio=4,
+        kv_heads=kv_heads,
+        ratio=ratio,
         query_block=256,
-        kv_tile=256,
+        kv_tile=kv_tile,
     )
     return output
 
 
-def _ragged_tc_write(arrays, cache, starts, output, offset, size):
+def _ragged_tc_write(
+    arrays,
+    cache,
+    starts,
+    output,
+    offset,
+    size,
+    *,
+    kv_heads: int,
+    ratio: int,
+    kv_tile: int,
+):
     query, gate, blocks, lengths, table = arrays
     return candidate._ragged_prefill(
         query,
@@ -236,10 +307,10 @@ def _ragged_tc_write(arrays, cache, starts, output, offset, size):
         output,
         offset,
         size,
-        ratio=4,
-        kv_heads=2,
+        ratio=ratio,
+        kv_heads=kv_heads,
         query_block=256,
-        kv_tile=256,
+        kv_tile=kv_tile,
         k_scale=1.0,
         v_scale=1.0,
     )
@@ -250,58 +321,114 @@ def _nonempty_request_starts_are_q256_aligned(starts):
     return jnp.all((starts[:-1] % 256 == 0) | (jnp.diff(starts) == 0))
 
 
-def _tc(query, gate, blocks, lengths, table, cache, starts):
+def _tc(
+    query,
+    gate,
+    blocks,
+    lengths,
+    table,
+    cache,
+    starts,
+    *,
+    kv_heads: int,
+    ratio: int,
+    kv_tile: int,
+):
     aligned = _nonempty_request_starts_are_q256_aligned(starts)
     arrays = (query, gate, blocks, lengths, table)
     return lax.cond(
         aligned,
-        lambda _: _direct_tc(query, gate, blocks, lengths, table, cache),
+        lambda _: _direct_tc(
+            query,
+            gate,
+            blocks,
+            lengths,
+            table,
+            cache,
+            kv_heads=kv_heads,
+            ratio=ratio,
+            kv_tile=kv_tile,
+        ),
         lambda _: _ragged_tc_write(
-            arrays, cache, starts, jnp.zeros_like(query), 0, len(query)
+            arrays,
+            cache,
+            starts,
+            jnp.zeros_like(query),
+            0,
+            len(query),
+            kv_heads=kv_heads,
+            ratio=ratio,
+            kv_tile=kv_tile,
         ),
         None,
     )
 
 
-def _tc_plan(query, blocks, table, cache, size):
-    num_tiles = (table.shape[1] * cache.shape[1] + 255) // 256
-    words = ((num_tiles * 2 + 127) // 128) * 128
+def _tc_plan(
+    query,
+    blocks,
+    table,
+    cache,
+    size,
+    *,
+    kv_heads: int,
+    ratio: int,
+    kv_tile: int,
+    request_capacity: int,
+):
+    num_tiles = (table.shape[1] * cache.shape[1] + kv_tile - 1) // kv_tile
+    words = ((num_tiles * (kv_tile // (ratio * 32)) + 127) // 128) * 128
     return candidate._ragged_plan(
         size,
         query.shape[1],
         cache.shape[4],
         words,
-        table.shape[1] * cache.shape[1] // 4,
+        table.shape[1] * cache.shape[1] // ratio,
         table.shape[1],
         blocks.shape[1],
         256,
+        request_capacity=request_capacity,
         query_dtype=query.dtype,
     )
 
 
-def _select_sc_for_chunk(ids, lengths, starts, offset, size, num_tiles, dtype, plan):
+def _select_sc_for_chunk(
+    ids, lengths, starts, offset, size, num_tiles, dtype, plan, model
+):
+    sc_queries = (size + model.sc_chunk - 1) // model.sc_chunk * model.sc_chunk
+    pack_tiles, source_rows, _ = plan
+    # One packed call bounds both the aligned and request-local schedules.
+    if (
+        source_rows == size
+        and candidate._request_tile_capacity(size, 256, len(starts) - 1) <= pack_tiles
+        and tc_selected_by_static_bound(
+            queries=pack_tiles * 256,
+            num_tiles=num_tiles,
+            model=model,
+            sc_queries=sc_queries,
+        )
+    ):
+        return jnp.array(False)
     padding = (-len(lengths)) % 256
     ids = jnp.pad(ids, ((0, padding), (0, 0)), constant_values=-1)
     lengths = jnp.pad(lengths, (0, padding))
     local = jnp.clip(starts - offset, 0, size)
     aligned = _nonempty_request_starts_are_q256_aligned(local)
-    sc_queries = (
-        (size + SC_CHUNK_SIZE[jnp.dtype(dtype)] - 1)
-        // SC_CHUNK_SIZE[jnp.dtype(dtype)]
-        * SC_CHUNK_SIZE[jnp.dtype(dtype)]
-    )
-    model = COST_MODELS[jnp.dtype(dtype)]
-    pack_tiles, source_rows, _ = plan
 
     def ragged(_):
         target = sc_cost(model, lengths[:sc_queries]) * 1.02
         tiles = jnp.sum((jnp.diff(local) + 255) // 256, dtype=jnp.int32)
         calls_lower = (tiles + pack_tiles - 1) // pack_tiles
+        live_prefix = jnp.concatenate(
+            (jnp.zeros(1, jnp.int32), jnp.cumsum(lengths[:size] > 0, dtype=jnp.int32))
+        )
+        live_per_request = live_prefix[local[1:]] - live_prefix[local[:-1]]
+        visits_lower = jnp.sum((live_per_request + 255) // 256, dtype=jnp.int32)
         lower = tc_cost(
             model,
             queries=calls_lower * pack_tiles * 256,
             num_tiles=num_tiles,
-            tile_visits=jnp.int32(0),
+            tile_visits=visits_lower,
             launches=calls_lower,
         )
 
@@ -331,7 +458,16 @@ def _select_sc_for_chunk(ids, lengths, starts, offset, size, num_tiles, dtype, p
                         ((0, 256 - rows), (0, 0)),
                         constant_values=-1,
                     )
-                    return visits + active_counts(bs, ls, num_tiles=num_tiles).sum()
+                    return (
+                        visits
+                        + active_counts(
+                            bs,
+                            ls,
+                            num_tiles=num_tiles,
+                            ratio=model.ratio,
+                            kv_tile=model.kv_tile,
+                        ).sum()
+                    )
 
                 return lax.fori_loop(0, count, tile, visits)
 
@@ -352,16 +488,17 @@ def _select_sc_for_chunk(ids, lengths, starts, offset, size, num_tiles, dtype, p
     return lax.cond(
         aligned,
         lambda _: select_sc(
-            ids, lengths, num_tiles=num_tiles, dtype=dtype, sc_queries=sc_queries
+            ids, lengths, num_tiles=num_tiles, model=model, sc_queries=sc_queries
         ),
         ragged,
         None,
     )
 
 
-def _one_chunk(arrays, cache, starts):
+def _one_chunk(arrays, cache, starts, model):
+    kv_heads, ratio, kv_tile = model.kv_heads, model.ratio, model.kv_tile
     q, gate, blocks, lengths, table = arrays
-    num_tiles = (table.shape[1] * cache.shape[1] + 255) // 256
+    num_tiles = (table.shape[1] * cache.shape[1] + kv_tile - 1) // kv_tile
     choose = _select_sc_for_chunk(
         blocks,
         lengths,
@@ -370,7 +507,18 @@ def _one_chunk(arrays, cache, starts):
         len(q),
         num_tiles,
         cache.dtype,
-        _tc_plan(q, blocks, table, cache, len(q)),
+        _tc_plan(
+            q,
+            blocks,
+            table,
+            cache,
+            len(q),
+            kv_heads=kv_heads,
+            ratio=ratio,
+            kv_tile=kv_tile,
+            request_capacity=len(starts) - 1,
+        ),
+        model,
     )
 
     def sc(_):
@@ -381,26 +529,89 @@ def _one_chunk(arrays, cache, starts):
             lengths,
             table,
             cache,
-            chunk_size=SC_CHUNK_SIZE[jnp.dtype(cache.dtype)],
+            chunk_size=model.sc_chunk,
+            kv_heads=kv_heads,
+            ratio=ratio,
+            kv_tile=kv_tile,
         )
         return output
 
     return lax.cond(
-        choose, sc, lambda _: _tc(q, gate, blocks, lengths, table, cache, starts), None
+        choose,
+        sc,
+        lambda _: _tc(
+            q,
+            gate,
+            blocks,
+            lengths,
+            table,
+            cache,
+            starts,
+            kv_heads=kv_heads,
+            ratio=ratio,
+            kv_tile=kv_tile,
+        ),
+        None,
     ), cache
 
 
-def _write_chunk(arrays, cache, starts, output, offset, size, choose, *, tail=False):
+def _write_chunk(
+    arrays,
+    cache,
+    starts,
+    output,
+    offset,
+    size,
+    choose,
+    *,
+    tail=False,
+    kv_heads: int,
+    ratio: int,
+    kv_tile: int,
+):
     def tc(output):
-        return _write_tc_chunk(arrays, cache, starts, output, offset, size, tail=tail)
+        return _write_tc_chunk(
+            arrays,
+            cache,
+            starts,
+            output,
+            offset,
+            size,
+            tail=tail,
+            kv_heads=kv_heads,
+            ratio=ratio,
+            kv_tile=kv_tile,
+        )
 
     def sc(output):
-        return _write_sc_chunk(arrays, cache, output, offset, size, tail=tail)
+        return _write_sc_chunk(
+            arrays,
+            cache,
+            output,
+            offset,
+            size,
+            tail=tail,
+            kv_heads=kv_heads,
+            ratio=ratio,
+            kv_tile=kv_tile,
+        )
 
     return lax.cond(choose, sc, tc, output)
 
 
-def _write_tc_chunk(arrays, cache, starts, output, offset, size, *, tail=False):
+def _write_tc_chunk(
+    arrays,
+    cache,
+    starts,
+    output,
+    offset,
+    size,
+    *,
+    tail=False,
+    kv_heads: int,
+    ratio: int,
+    kv_tile: int,
+):
     """Write aligned TC work or request-local ragged tiles into the final output."""
     local = jnp.clip(starts - offset, 0, size)
     aligned = _nonempty_request_starts_are_q256_aligned(local)
@@ -421,7 +632,17 @@ def _write_tc_chunk(arrays, cache, starts, output, offset, size, *, tail=False):
                 lax.dynamic_slice_in_dim(x, offset, size) for x in arrays
             )
         query, gate, blocks, lengths, table = chunk_arrays
-        result = _direct_tc(query, gate, blocks, lengths, table, cache)[:size]
+        result = _direct_tc(
+            query,
+            gate,
+            blocks,
+            lengths,
+            table,
+            cache,
+            kv_heads=kv_heads,
+            ratio=ratio,
+            kv_tile=kv_tile,
+        )[:size]
         return lax.dynamic_update_slice_in_dim(output, result, offset, axis=0)
 
     # Align only one request-local Q256 tile directly into the final
@@ -430,14 +651,35 @@ def _write_tc_chunk(arrays, cache, starts, output, offset, size, *, tail=False):
     return lax.cond(
         aligned,
         direct,
-        lambda out: _ragged_tc_write(arrays, cache, starts, out, offset, size),
+        lambda out: _ragged_tc_write(
+            arrays,
+            cache,
+            starts,
+            out,
+            offset,
+            size,
+            kv_heads=kv_heads,
+            ratio=ratio,
+            kv_tile=kv_tile,
+        ),
         output,
     )
 
 
-def _write_sc_chunk(arrays, cache, output, offset, size, *, tail=False):
+def _write_sc_chunk(
+    arrays,
+    cache,
+    output,
+    offset,
+    size,
+    *,
+    tail=False,
+    kv_heads: int,
+    ratio: int,
+    kv_tile: int,
+):
     """Gather and write one SC microchunk at a time, including a padded tail."""
-    chunk = SC_CHUNK_SIZE[jnp.dtype(cache.dtype)]
+    chunk = sc_chunk_size(cache, budget=arrays[2].shape[1], ratio=ratio)
 
     def micro(i, output):
         start = offset + i * chunk
@@ -451,8 +693,8 @@ def _write_sc_chunk(arrays, cache, output, offset, size, *, tail=False):
             lengths,
             table,
             cache,
-            kv_heads=2,
-            ratio=4,
+            kv_heads=kv_heads,
+            ratio=ratio,
             query_group=8,
             tile_k=256,
         )
@@ -478,8 +720,8 @@ def _write_sc_chunk(arrays, cache, output, offset, size, *, tail=False):
             lengths,
             table,
             cache,
-            kv_heads=2,
-            ratio=4,
+            kv_heads=kv_heads,
+            ratio=ratio,
             query_group=8,
             tile_k=256,
         )
@@ -487,7 +729,19 @@ def _write_sc_chunk(arrays, cache, output, offset, size, *, tail=False):
     return output
 
 
-def _sc_prefill(q, gate, blocks, lengths, table, cache, *, chunk_size):
+def _sc_prefill(
+    q,
+    gate,
+    blocks,
+    lengths,
+    table,
+    cache,
+    *,
+    chunk_size,
+    kv_heads: int,
+    ratio: int,
+    kv_tile: int,
+):
     def step(kv, inputs):
         query, gate, blocks, lengths, table = inputs
         out, kv = sc_grouped_attention(
@@ -497,8 +751,8 @@ def _sc_prefill(q, gate, blocks, lengths, table, cache, *, chunk_size):
             lengths,
             table,
             kv,
-            kv_heads=2,
-            ratio=4,
+            kv_heads=kv_heads,
+            ratio=ratio,
             query_group=8,
             tile_k=256,
         )
@@ -538,22 +792,28 @@ def is_supported_by_adaptive_prefill(
         query, blocks, lengths, table, cache, starts
     ):
         return False
+    if cache.shape[1] % ratio:
+        return False
     if not _has_unit_scales(k_scale, v_scale):
         return False
     packing = 32 // jax.dtypes.itemsize_bits(cache.dtype)
-    if cache.shape[2:] != ((4 + packing - 1) // packing, packing, query.shape[2]):
+    if cache.shape[2:] != (
+        (2 * kv_heads + packing - 1) // packing,
+        packing,
+        query.shape[2],
+    ):
         return False
     info = pltpu.get_tpu_info()
     return (
         info.sparse_core is not None
         and _paired_working_set(
             query.shape[1],
-            2,
+            kv_heads,
             query.shape[2],
             packing,
             jax.dtypes.itemsize_bits(cache.dtype) // 8,
             8,
-            128,
+            256,
         )
         <= prefill_vmem_limit()
     )
@@ -564,13 +824,15 @@ def _has_query_and_request_geometry(query, gate, kv_heads, ratio, starts):
     if (  # noqa: SIM103 - Keep one truth test per predicate.
         query.ndim != 3
         or min(query.shape) <= 0
-        or query.shape[1] % 2
+        or kv_heads <= 0
+        or query.shape[1] % kv_heads
         or query.shape[2] % 128
         or gate.shape != query.shape
         or query.dtype != jnp.bfloat16
         or gate.dtype != jnp.bfloat16
-        or kv_heads != 2
-        or ratio != 4
+        or ratio <= 0
+        or 256 % ratio
+        or (ratio * 32) % 128
         or starts.ndim != 1
         or starts.shape[0] < 2
     ):

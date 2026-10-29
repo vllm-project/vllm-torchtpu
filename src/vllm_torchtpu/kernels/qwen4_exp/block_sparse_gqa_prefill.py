@@ -529,6 +529,8 @@ def _prefill(
         kv_heads,
         query_tile * (query_heads // kv_heads),
     )
+    score_elements = tokens * query_heads * kv_tile * num_kv_tiles
+    alpha_elements = tokens * query_heads * num_kv_tiles
     output = pl.pallas_call(
         functools.partial(
             _kernel,
@@ -576,22 +578,23 @@ def _prefill(
             ],
         ),
         cost_estimate=pl.CostEstimate(
-            flops=4 * tokens * query_heads * head_dim * kv_tile * num_kv_tiles,
-            transcendentals=2 * tokens * query_heads * kv_tile * num_kv_tiles,
+            flops=4 * score_elements * head_dim,
+            transcendentals=score_elements + alpha_elements,
             bytes_accessed=(
-                query.size * (2 if bf16_io else 4)
+                2
+                * query.size
+                * jnp.dtype(jnp.bfloat16 if bf16_io else jnp.float32).itemsize
                 + block_bits_native.nbytes
                 + lengths.nbytes
                 + table.nbytes
                 + active_tiles.nbytes
                 + active_counts.nbytes
                 + last_page.nbytes
-                + tokens * query_heads * head_dim * (2 if bf16_io else 4)
                 + nblocks
                 * num_kv_tiles
                 * kv_tile
                 * math.prod(cache.shape[2:])
-                * (jax.dtypes.itemsize_bits(cache.dtype) // 8)
+                * jnp.dtype(cache.dtype).itemsize
             ),
         ),
         compiler_params=pltpu.CompilerParams(
@@ -658,6 +661,13 @@ def _gate_output(output, gate, lengths):
     return jnp.where((lengths > 0)[:, None, None], output, 0)
 
 
+def _request_tile_capacity(size: int, query_block: int, request_capacity: int) -> int:
+    """Bound tiles in a partition with at most request_capacity nonempty pieces."""
+    return min(
+        size, (size + query_block - 1) // query_block + min(request_capacity, size) - 1
+    )
+
+
 def _ragged_plan(
     size,
     query_heads,
@@ -668,9 +678,12 @@ def _ragged_plan(
     budget,
     query_block,
     *,
+    request_capacity: int,
     query_dtype=jnp.bfloat16,
 ):
     """Plan packed arrays and compaction; gate temporaries are excluded."""
+    if request_capacity <= 0:
+        raise ValueError("Request capacity must be positive")
     index_bytes = jnp.dtype(jnp.int32).itemsize
     mask_bytes = jnp.dtype(jnp.bool_).itemsize
     query_bytes = query_heads * head_dim * jnp.dtype(query_dtype).itemsize
@@ -700,7 +713,9 @@ def _ragged_plan(
     )
     # Each tile also has tile_slots, tile_first and tile_end descriptors.
     pack_tile_bytes = query_block * pack_row_bytes + 3 * index_bytes
-    pack_tiles = min(size, max(1, TC_PACKING_TARGET_BYTES // pack_tile_bytes))
+    # Splitting a partition into n requests adds at most n-1 partial tiles.
+    tile_capacity = _request_tile_capacity(size, query_block, request_capacity)
+    pack_tiles = min(tile_capacity, max(1, TC_PACKING_TARGET_BYTES // pack_tile_bytes))
     # Selection scratch is row-chunked separately from its output bitsets.
     source_rows = min(size, pack_tiles * query_block)
     selection_rows = min(source_rows, _selection_batch_rows(budget, groups, words))
@@ -782,6 +797,7 @@ def _ragged_prefill(
         page_table.shape[1],
         blocks.shape[1],
         query_block,
+        request_capacity=len(starts) - 1,
         query_dtype=query.dtype,
     )
 

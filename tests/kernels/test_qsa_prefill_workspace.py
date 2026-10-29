@@ -73,7 +73,7 @@ def test_selection_chunks_match_unique_prefix_and_tail(
     ],
 )
 def test_default_plan_and_separate_selection_chunks(args, expected):
-    plan = tc._ragged_plan(*args)
+    plan = tc._ragged_plan(*args, request_capacity=args[0])
     assert plan == expected
     pack_tiles, source_rows, selection_rows = plan
     assert source_rows <= pack_tiles * args[-1]
@@ -82,8 +82,8 @@ def test_default_plan_and_separate_selection_chunks(args, expected):
 
 def test_compaction_inventory_uses_actual_query_dtype():
     args = (256, 24, 256, 128, 416, 1, 512, 256)
-    bf16 = tc._ragged_plan(*args, query_dtype=jnp.bfloat16)
-    fp32 = tc._ragged_plan(*args, query_dtype=jnp.float32)
+    bf16 = tc._ragged_plan(*args, query_dtype=jnp.bfloat16, request_capacity=args[0])
+    fp32 = tc._ragged_plan(*args, query_dtype=jnp.float32, request_capacity=args[0])
     assert fp32[0] < bf16[0]
     assert fp32[1:] == bf16[1:]
 
