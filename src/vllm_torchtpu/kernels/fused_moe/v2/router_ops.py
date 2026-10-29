@@ -29,15 +29,67 @@ import functools
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+
+from vllm_torchtpu.kernels.fused_moe.v2.tuned_block_sizes import (
+    NORMALIZED_ROUTER_BLOCK_ROWS,
+)
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 NEG = -3.0e38  # below any real softmax score (>=0); avoids inf
 
-# Keep the measured row-tile table here so this kernel remains standalone.
-# Key: (tokens, experts, topk, requested block_rows); measured on TPU v7x.
+
 _SELECTOR_ROW_TILES = {(2048, 384, 6, 256): 2048}
 
 
-def _select_kernel(x_ref, w_ref, i_ref, *, topk, n, v_ref=None):
+def normalized_router_block_rows(
+    gate: jax.Array,
+    *,
+    topk: int,
+    scoring_fn: str,
+    renormalize: bool,
+    has_bias: bool,
+    has_hash: bool,
+) -> int | None:
+    """Return a measured normalized-selector tile, or retain generic routing.
+
+    The serving adapter widens gate logits to FP32 before calling the layer.
+    Scoring and finite-row checks support both that form and direct BF16 inputs.
+    """
+    if (
+        scoring_fn != "sqrtsoftplus"
+        or not renormalize
+        or not has_bias
+        or has_hash
+        or gate.dtype not in (jnp.bfloat16, jnp.float32)
+        or jax.default_backend() != "tpu"
+    ):
+        return None
+    key = (pltpu.get_tpu_info().chip_version, *gate.shape, topk)
+    block_rows = NORMALIZED_ROUTER_BLOCK_ROWS.get(key)
+    if block_rows is None:
+        logger.warning_once(
+            "[moe_router] No normalized selector tile for %s; using generic routing",
+            key,
+        )
+    return block_rows
+
+
+def _select_kernel(
+    x_ref,
+    w_ref,
+    i_ref,
+    *,
+    topk,
+    n,
+    v_ref=None,
+    normalize=False,
+    finalize_valid=None,
+    scale=1.0,
+    invalid_id=384,
+):
     """One block of rows: take the top `topk` by repeated max-and-mask."""
     # NaN is flushed to the sentinel so every row has a maximum some
     # column equals; an all-NaN row selects expert 0 with weight NEG.
@@ -45,6 +97,11 @@ def _select_kernel(x_ref, w_ref, i_ref, *, topk, n, v_ref=None):
     x = jnp.where(jnp.isnan(raw), NEG, raw)  # [n, R] f32
     v = None if v_ref is None else v_ref[...].T
     iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 0).astype(jnp.float32)
+    packed_weights = output_slots = pair_first = total = None
+    if normalize:
+        packed_shape = (topk, x.shape[1])
+        packed_weights = jnp.zeros(packed_shape, jnp.float32)
+        output_slots = jax.lax.broadcasted_iota(jnp.int32, packed_shape, 0)
     for j in range(topk):
         m = jnp.max(x, axis=0, keepdims=True)  # [1,R] rowmax
         ismax = x == m
@@ -54,24 +111,64 @@ def _select_kernel(x_ref, w_ref, i_ref, *, topk, n, v_ref=None):
         picked = iota == idx[None, :]
         # noaux selects with biased scores but emits unbiased weights.
         # A masked sum reads the resident tile without a dynamic lane gather.
-        w_ref[j, :] = (
+        selected_weight = (
             m[0, :] if v is None else jnp.sum(jnp.where(picked, v, 0.0), axis=0)
         )
-        i_ref[j, :] = idx.astype(jnp.int32)
+        if normalize:
+            assert packed_weights is not None and output_slots is not None
+            packed_weights = jnp.where(
+                output_slots == j, selected_weight[None, :], packed_weights
+            )
+            if j % 2 == 0:
+                pair_first = selected_weight
+            else:
+                assert pair_first is not None
+                pair_sum = pair_first + selected_weight
+                if j == 1:
+                    total = pair_sum
+                else:
+                    assert total is not None
+                    total = total + pair_sum
+        else:
+            w_ref[j, :] = selected_weight
+        output_id = idx.astype(jnp.int32)
+        if finalize_valid is not None:
+            output_id = jnp.where(
+                finalize_valid[0, :], output_id, jnp.int32(invalid_id)
+            )
+        i_ref[j, :] = output_id
         x = jnp.where(picked, NEG, x)
+    if normalize:
+        assert packed_weights is not None and total is not None
+        weights = packed_weights / jnp.maximum(total, 1e-20)[None, :]
+        if finalize_valid is not None:
+            if scale != 1.0:
+                weights = weights * jnp.float32(scale)
+            weights = jnp.where(finalize_valid, weights, jnp.float32(0))
+        w_ref[...] = weights
 
 
-def _select_kernel_split(x_ref, v_ref, w_ref, i_ref, *, topk, n):
+def _select_kernel_split(x_ref, v_ref, w_ref, i_ref, *, topk, n, normalize=False):
     """Select by x_ref and read the selected weights from v_ref.
 
     Pallas passes input refs before output refs, so the two-input call needs
     this signature. Forward v_ref as a keyword to reuse _select_kernel's
     selection loop while keeping its one-input call unchanged.
     """
-    _select_kernel(x_ref, w_ref, i_ref, topk=topk, n=n, v_ref=v_ref)
+    _select_kernel(
+        x_ref, w_ref, i_ref, topk=topk, n=n, v_ref=v_ref, normalize=normalize
+    )
 
 
-def pallas_select(scores, topk=10, block_rows=256, weight_scores=None, interpret=False):
+def pallas_select(
+    scores: jax.Array,
+    topk: int = 10,
+    block_rows: int = 256,
+    weight_scores: jax.Array | None = None,
+    interpret: bool = False,
+    *,
+    normalize: bool = False,
+) -> list[jax.Array]:
     """Top-k over [R, N] scores -> (weights f32, indices i32) [R, topk].
 
     With `weight_scores=None`, return the selected scores as weights.
@@ -80,41 +177,152 @@ def pallas_select(scores, topk=10, block_rows=256, weight_scores=None, interpret
     to select with `scores=raw_scores + correction_bias` while returning
     unbiased weights from `weight_scores=raw_scores`. Here `raw_scores` are
     the scores after the scoring function, before adding the bias.
-    Normalization and routed scaling are applied by the caller.
+    By default, normalization and routed scaling are applied by the caller.
+    `normalize=True` packs and normalizes Top6 weights for the measured
+    [288,384] two-table tile. Validity masking and scaling remain in the caller.
 
     `interpret` runs the kernel body on the host, which is what lets the
     selection rule be tested without a chip; it does not gate Mosaic
     lowering. Serving never sets it.
     """
     R, N = scores.shape
+    if normalize and not (
+        (R, N, topk, block_rows) == (288, 384, 6, 288)
+        and scores.dtype == jnp.float32
+        and weight_scores is not None
+        and weight_scores.dtype == jnp.float32
+    ):
+        raise ValueError(
+            "Normalized selection requires FP32 [288,384] scores and weights, "
+            "topk=6, block_rows=288"
+        )
     assert R % block_rows == 0, (R, block_rows)
-    block_rows = _SELECTOR_ROW_TILES.get((R, N, topk, block_rows), block_rows)
-    # The token axis is minor in the transposed output: partial tiles need 128.
-    if block_rows != R and block_rows % 128:
-        block_rows = 128 if R % 128 == 0 else R
+    if not normalize:
+        block_rows = _SELECTOR_ROW_TILES.get((R, N, topk, block_rows), block_rows)
+        # The token axis is minor in the transposed output: partial tiles need 128.
+        if block_rows != R and block_rows % 128:
+            block_rows = 128 if R % 128 == 0 else R
     if weight_scores is not None and weight_scores.shape != scores.shape:
         raise ValueError(
             f"weight_scores {weight_scores.shape} must match scores {scores.shape}"
         )
     grid = (R // block_rows,)
+    output_shape = (topk, R)
     out_shapes = (
-        jax.ShapeDtypeStruct((topk, R), jnp.float32),
-        jax.ShapeDtypeStruct((topk, R), jnp.int32),
+        jax.ShapeDtypeStruct(output_shape, jnp.float32),
+        jax.ShapeDtypeStruct(output_shape, jnp.int32),
     )
     in_spec = pl.BlockSpec((block_rows, N), lambda i: (i, 0))
     bs = (in_spec,) if weight_scores is None else (in_spec, in_spec)
-    os = (
-        pl.BlockSpec((topk, block_rows), lambda i: (0, i)),
-        pl.BlockSpec((topk, block_rows), lambda i: (0, i)),
-    )
+    output_spec = pl.BlockSpec((topk, block_rows), lambda i: (0, i))
+    os = (output_spec, output_spec)
     kernel = _select_kernel if weight_scores is None else _select_kernel_split
     operands = (scores,) if weight_scores is None else (scores, weight_scores)
     result = pl.pallas_call(
-        functools.partial(kernel, topk=topk, n=N),
+        functools.partial(kernel, topk=topk, n=N, normalize=normalize),
         grid=grid,
         in_specs=list(bs),
         out_specs=list(os),
         out_shape=list(out_shapes),
         interpret=interpret,
     )(*operands)
+
     return [result[0].T, result[1].T]
+
+
+def _finalize_kernel(
+    gate_ref,
+    weights_ref,
+    ids_ref,
+    out_weights_ref,
+    out_ids_ref,
+    valid_ref,
+    *,
+    scale,
+    invalid_id,
+):
+    valid = jnp.any(
+        jnp.isfinite(gate_ref[...].astype(jnp.float32)), axis=1, keepdims=True
+    ).T
+    weights = weights_ref[...]
+    if scale != 1.0:
+        weights = weights * jnp.float32(scale)
+    out_weights_ref[...] = jnp.where(valid, weights, jnp.float32(0))
+    out_ids_ref[...] = jnp.where(valid, ids_ref[...], jnp.int32(invalid_id))
+    valid_ref[...] = valid
+
+
+def finalize_normalized_router(
+    gate: jax.Array,
+    weights: jax.Array,
+    ids: jax.Array,
+    *,
+    scale: float,
+    invalid_id: int,
+    interpret: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Finalize a normalized route after any expert-ID remapping.
+
+    Every finite admitted logit has a finite sqrtsoftplus score; checking
+    logits also excludes padding whose -inf logits score a finite zero.
+    """
+    assert gate.shape == (288, 384)
+    assert weights.shape == ids.shape == (288, 6)
+    shapes = (
+        jax.ShapeDtypeStruct((6, 288), jnp.float32),
+        jax.ShapeDtypeStruct((6, 288), jnp.int32),
+        jax.ShapeDtypeStruct((1, 288), jnp.bool_),
+    )
+    result = pl.pallas_call(
+        functools.partial(_finalize_kernel, scale=scale, invalid_id=invalid_id),
+        out_shape=shapes,
+        interpret=interpret,
+    )(gate, weights.T, ids.T)
+    return result[0].T, result[1].T, result[2].T
+
+
+def _select_finalize_kernel(
+    x_ref, v_ref, gate_ref, w_ref, i_ref, valid_ref, *, scale, invalid_id
+):
+    valid = jnp.any(
+        jnp.isfinite(gate_ref[...].astype(jnp.float32)), axis=1, keepdims=True
+    ).T
+    _select_kernel(
+        x_ref,
+        w_ref,
+        i_ref,
+        topk=6,
+        n=384,
+        v_ref=v_ref,
+        normalize=True,
+        finalize_valid=valid,
+        scale=scale,
+        invalid_id=invalid_id,
+    )
+    valid_ref[...] = valid
+
+
+def select_finalize_normalized_router(
+    scores: jax.Array,
+    weight_scores: jax.Array,
+    gate: jax.Array,
+    *,
+    scale: float,
+    invalid_id: int,
+    interpret: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Select and finalize the admitted identity-mesh decode route."""
+    assert scores.shape == weight_scores.shape == gate.shape == (288, 384)
+    assert scores.dtype == weight_scores.dtype == jnp.float32
+    assert gate.dtype in (jnp.float32, jnp.bfloat16)
+    shapes = (
+        jax.ShapeDtypeStruct((6, 288), jnp.float32),
+        jax.ShapeDtypeStruct((6, 288), jnp.int32),
+        jax.ShapeDtypeStruct((1, 288), jnp.bool_),
+    )
+    result = pl.pallas_call(
+        functools.partial(_select_finalize_kernel, scale=scale, invalid_id=invalid_id),
+        out_shape=shapes,
+        interpret=interpret,
+    )(scores, weight_scores, gate)
+    return result[0].T, result[1].T, result[2].T
