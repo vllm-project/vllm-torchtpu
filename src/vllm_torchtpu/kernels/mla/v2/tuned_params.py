@@ -1358,7 +1358,8 @@ def _k3_tp32_fp8_page256_entries() -> dict[TuningKey, TunableParams]:
     chunk, 128 x 322 page table): at 8K / 40K / 80K of context the mixed
     kernel takes 2.07 / 5.94 / 11.08 ms per layer with (512, 4, 2) against
     29.3 / 77.0 / 136.6 ms with the untuned default; batched decode of 16 x
-    80K-token sequences takes 1.53 ms with (32 pages, batch 4) against 1.86.
+    80K-token sequences takes 0.57 ms with (32 pages, batch 4) against 0.88
+    (cache donated, as in serving).
     """
     entries: dict[TuningKey, TunableParams] = {}
     for tokens in (1024, 2048, 4096, 8192, 16384):
