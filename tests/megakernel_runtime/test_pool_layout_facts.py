@@ -192,3 +192,19 @@ def test_f32_conv_pool_layout_matches_an_fp32_conv_framework(
     assert mk.conv_bytes == fw.conv_bytes == 18432
     assert compare_layout_facts(mk, fw).eligible
     assert mk.fingerprint() != _mk_facts().fingerprint()
+
+
+def test_dtype_name_accepts_jax_scalar_types_and_dtypes() -> None:
+    """`dtype_name` names jax scalar types (`jnp.float32`, the form a
+    `PoolLayout` stores), dtypes, strings and torch dtypes alike."""
+    import jax.numpy as jnp
+    import numpy as np
+
+    from vllm_torchtpu.megakernel.runtime.layout_facts import dtype_name
+
+    assert dtype_name(jnp.float32) == "float32"
+    assert dtype_name(jnp.bfloat16) == "bfloat16"
+    assert dtype_name(np.dtype("float32")) == "float32"
+    assert dtype_name("bfloat16") == "bfloat16"
+    assert dtype_name(torch.bfloat16) == "bfloat16"
+    assert dtype_name(torch.float8_e4m3fn) == "float8_e4m3fn"

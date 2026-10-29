@@ -41,6 +41,11 @@ CONV_ORDER_TAPS_QKV = "taps_qkv"
 
 def dtype_name(dt: Any) -> str:
     """Canonical dtype name (`'bfloat16'`, ...) for torch / jax / numpy / str."""
+    if not isinstance(dt, str):
+        try:  # jax / numpy dtypes and scalar types (`jnp.float32`)
+            return jnp.dtype(dt).name
+        except TypeError:
+            pass
     s = str(dt).strip()
     for pfx in ("torch.", "jax.numpy.", "numpy."):
         s = s.removeprefix(pfx)
