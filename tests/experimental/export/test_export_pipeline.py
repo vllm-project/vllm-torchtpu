@@ -1903,3 +1903,153 @@ def test_zero_temperature_rows_take_the_argmax() -> None:
         uniform,
     )
     assert tokens.squeeze(-1).tolist() == [1, 0]
+
+
+class _TinyMtpExportableLLM(_TinyTorchExportableLLM):
+    """The tiny model with an MTP layer: its own `mtp.fc`, the target's embedding
+    and LM head, and one paged KV state."""
+
+    def mtp_abstract_params(self) -> Mapping[str, api.ShapeDtypeStruct]:
+        cfg = self._cfg
+        return {
+            "mtp.fc.weight": api.ShapeDtypeStruct(
+                (2 * cfg.hidden_size, cfg.hidden_size), cfg.dtype
+            )
+        }
+
+    def mtp_shared_params(self) -> Sequence[str]:
+        return ["model.embed_tokens.weight", "lm_head.weight"]
+
+    def mtp_abstract_states(self) -> Sequence[api.ShapeDtypeStruct]:
+        cfg = self._cfg
+        return [
+            api.ShapeDtypeStruct(
+                (cfg.num_blocks, cfg.block_size, 2 * cfg.num_kv_heads, cfg.head_dim),
+                cfg.dtype,
+            )
+        ]
+
+    def mtp_draft(
+        self,
+        weights: Mapping[str, torch.Tensor],
+        kv_caches: Sequence[torch.Tensor],
+        *,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        kv_lens: torch.Tensor,
+        block_tables: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        req_dist: torch.Tensor,
+        last_token_indices: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> tuple[Sequence[torch.Tensor], torch.Tensor]:
+        del positions, kv_lens, block_tables, query_start_loc, req_dist
+        emb = weights["model.embed_tokens.weight"][input_ids.to(torch.int64)]
+        fused = torch.cat([emb, hidden_states.to(emb.dtype)], dim=-1)
+        rows = torch.matmul(fused, weights["mtp.fc.weight"])[
+            last_token_indices.to(torch.int64)
+        ]
+        logits = torch.matmul(rows, weights["lm_head.weight"])
+        return list(kv_caches), logits.argmax(dim=-1).to(torch.int32).view(-1, 1)
+
+
+def _export_mtp(tmp_path: Path, model_cls: type = _TinyMtpExportableLLM) -> str:
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny-torch",
+        vocab_size=32,
+        hidden_size=16,
+        num_layers=1,
+        num_q_heads=2,
+        num_kv_heads=2,
+        head_dim=8,
+        block_size=8,
+        num_blocks=16,
+        max_num_seqs=8,
+        max_model_len=64,
+        token_buckets=(8, 16),
+        req_buckets=(4, 8),
+        emit_byte_tokenizer=True,
+        speculative_config={"method": "mtp", "num_speculative_tokens": 1},
+    )
+    out_dir = str(tmp_path / "exported")
+    with mock.patch.object(
+        tpu_lowering,
+        "lower_torch_callable_to_mlir",
+        side_effect=_mock_lower_torch_callable_to_mlir,
+    ):
+        exporter.export(model_cls(cfg), out_dir)
+    return out_dir
+
+
+def test_mtp_draft_follows_the_contract(tmp_path) -> None:
+    out_dir = _export_mtp(tmp_path)
+    meta = json.loads(Path(out_dir, "metadata.json").read_text())
+    functions = meta["functions"]
+    assert set(functions["mtp_draft"]) == set(functions["forward"]) == {"8", "16"}
+    assert meta["serving_config"]["speculative_config"]["method"] == "mtp"
+
+    variant = functions["mtp_draft"]["16"]
+    by_name = {i["name"]: i for i in variant["inputs"]}
+    assert Path(out_dir, variant["file_path"]).is_file()
+    # The forward's controls, shifted input_ids, then the last accepted rows.
+    user = [i["name"] for i in variant["inputs"] if i["argument_type"] == "user_io"]
+    assert user == [
+        "input_ids",
+        "positions",
+        "kv_lens",
+        "block_tables",
+        "query_start_loc",
+        "req_dist",
+        "last_token_indices",
+    ]
+    assert by_name["last_token_indices"]["shape"] == [8]
+    assert by_name["hidden_states"]["argument_type"] == "intermediate"
+    assert by_name["hidden_states"]["shape"] == [16, 16]
+
+    # Shared weights bind the target's slots; the MTP layer's own get new ones.
+    forward_slots = {
+        i["name"]: i["index"]
+        for i in functions["forward"]["16"]["inputs"]
+        if i["argument_type"] == "weight"
+    }
+    logits_slots = {
+        i["name"]: i["index"]
+        for i in functions["compute_logits"]["4"]["inputs"]
+        if i["argument_type"] == "weight"
+    }
+    assert (
+        by_name["model.embed_tokens.weight"]["index"]
+        == forward_slots["model.embed_tokens.weight"]
+    )
+    assert by_name["lm_head.weight"]["index"] == logits_slots["lm_head.weight"]
+    assert "mtp.fc.weight" not in forward_slots
+    assert by_name["mtp.fc.weight"]["index"] not in forward_slots.values()
+
+    # The MTP KV is a donated state numbered after the target's.
+    target_states = [
+        i for i in functions["forward"]["16"]["inputs"] if i["argument_type"] == "state"
+    ]
+    mtp_state = by_name["mtp_kv_cache_layer_0"]
+    assert mtp_state["buffer_donor"] is True
+    assert mtp_state["index"] == len(target_states)
+    draft = [o for o in variant["outputs"] if o["name"] == "draft_tokens"]
+    assert draft[0]["shape"] == [8, 1] and draft[0]["dtype"] == "i32"
+
+
+def test_mtp_needs_a_model_that_drafts(tmp_path) -> None:
+    with pytest.raises(ValueError, match="mtp_abstract_params"):
+        _export_mtp(tmp_path, model_cls=_TinyTorchExportableLLM)
+
+
+def test_validator_rejects_mtp_draft_missing_a_bucket(tmp_path) -> None:
+    out_dir = _export_mtp(tmp_path)
+    meta_path = Path(out_dir, "metadata.json")
+    meta = json.loads(meta_path.read_text())
+    del meta["functions"]["mtp_draft"]["8"]
+    meta_path.write_text(json.dumps(meta))
+    with pytest.raises(ValueError, match="differ from forward buckets"):
+        validator.validate_exported_model_dir(out_dir)
+    del meta["functions"]["mtp_draft"]
+    meta_path.write_text(json.dumps(meta))
+    with pytest.raises(ValueError, match="exports no mtp_draft"):
+        validator.validate_exported_model_dir(out_dir)
