@@ -83,7 +83,9 @@ def mtp_union_step(selected, query_start_loc, stats):
 
 @functools.cache
 def build_mtp_union_stats_op():
-    def core(selected, query_start_loc, stats):
+    def core(
+        selected: jax.Array, query_start_loc: jax.Array, stats: jax.Array
+    ) -> jax.Array:
         return mtp_union_step(selected, query_start_loc, stats)
 
     op = pallas.jax_op("qwen4_exp::qsa_mtp_union_stats_v1", core)
