@@ -665,6 +665,7 @@ class TestKVCacheManager:
         mock_find_non_ssm_backend,
     ):
         mock_mla = MagicMock(spec=MLAAttention)
+        mock_mla.kv_sharing_target_layer_name = None
         mock_mla.num_kv_heads = 1
         mock_mla.head_size = 576
         layers = {"mla_0": mock_mla}
@@ -2363,3 +2364,128 @@ class TestUpdateAttentionPageSizePadded:
                 256, 2, 256, torch.bfloat16
             )
         )
+
+
+def _mla_layer_mock(target=None, sparse=True):
+    layer = MagicMock(spec=MLAAttention)
+    layer.kv_sharing_target_layer_name = target
+    layer.kv_lora_rank = 512
+    layer.qk_rope_head_dim = 64
+    layer.head_size = 576
+    layer.use_sparse = sparse
+    layer.kv_cache_dtype = "fp8_e4m3" if sparse else "auto"
+    layer._k_scale_float = layer._v_scale_float = 1.0
+    return layer
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+@pytest.mark.parametrize("invalid", [None, "missing", "chain", "type"])
+def test_shared_mla_spec_allocates_only_owner(monkeypatch, sparse, invalid):
+    owner, reader = _mla_layer_mock(sparse=sparse), _mla_layer_mock("owner", sparse)
+    # Query and decompression dimensions need not match the source.
+    owner.qk_nope_head_dim, reader.qk_nope_head_dim = 128, 192
+    runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            cache_config=SimpleNamespace(
+                block_size=16,
+                cache_dtype=owner.kv_cache_dtype,
+            )
+        ),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        _unified_kv_layout=False,
+        _hybrid_uniform_page_size_bytes=None,
+        shared_kv_cache_layers={},
+        kv_cache_dtype=torch.bfloat16,
+        speculative_config=None,
+        _is_async_drafter=False,
+    )
+    manager = KVCacheManager(runner)
+    monkeypatch.setattr(manager, "_update_attention_page_size_padded", lambda *a: None)
+    monkeypatch.setattr(
+        manager, "_pad_native_attention_regions", lambda specs, *a: specs
+    )
+    layers = {"owner": owner, "reader": reader}
+    if invalid == "missing":
+        reader.kv_sharing_target_layer_name = "absent"
+    elif invalid == "chain":
+        owner.kv_sharing_target_layer_name = "owner"
+    elif invalid == "type":
+        layers = {"reader": reader, "owner": _attention_layer_mock()}
+    with (
+        patch(
+            "vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config",
+            return_value=layers,
+        ),
+        patch.object(
+            TpuPlatform, "_find_non_ssm_backend", return_value=PallasMLAttentionBackend
+        ),
+    ):
+        if invalid is not None:
+            message = {
+                "missing": "missing",
+                "chain": "itself a shared",
+                "type": "incompatible attention",
+            }[invalid]
+            with pytest.raises(ValueError, match=message):
+                manager.get_kv_cache_spec()
+            return
+        specs = manager.get_kv_cache_spec()
+    assert set(specs) == {"owner"}
+    assert isinstance(specs["owner"], MLAAttentionSpec)
+    assert runner.shared_kv_cache_layers == {"reader": "owner"}
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("kv_lora_rank", 256),
+        ("qk_rope_head_dim", 128),
+        ("head_size", 640),
+        ("use_sparse", False),
+        ("kv_cache_dtype", "auto"),
+        ("_k_scale_float", 2.0),
+        ("_v_scale_float", 2.0),
+    ],
+)
+def test_shared_mla_rejects_incompatible_cache(field, value):
+    owner, reader = _mla_layer_mock(), _mla_layer_mock("owner")
+    setattr(reader, field, value)
+    with pytest.raises(ValueError, match=field):
+        KVCacheManager._validate_shared_mla_cache_layout(
+            "reader", reader, "owner", owner
+        )
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+def test_shared_mla_aliases_cache_and_sparse_layout(sparse):
+    owner, reader = _mla_layer_mock(sparse=sparse), _mla_layer_mock("owner", sparse)
+    owner.mla_kv_spec = (SimpleNamespace(page_size=16), object())
+    runner = SimpleNamespace(
+        shared_kv_cache_layers={"reader": "owner"},
+        vllm_config=SimpleNamespace(
+            compilation_config=SimpleNamespace(
+                static_forward_context={"owner": owner, "reader": reader},
+            )
+        ),
+    )
+    caches = {"owner": (torch.ones(4), torch.ones(2)) if sparse else torch.ones(8)}
+    with patch(
+        "vllm_torchtpu.runner.kv_cache_manager.mla_dispatch.admit_layer"
+    ) as admit:
+        KVCacheManager(runner)._add_shared_kv_cache_aliases(caches)
+    assert caches["reader"] is caches["owner"]
+    if sparse:
+        assert reader.mla_kv_spec is owner.mla_kv_spec
+        admit.assert_called_once_with(runner, reader, owner.mla_kv_spec, 16)
+    else:
+        admit.assert_not_called()
+    context = {"model.layers.0.attn": owner, "model.layers.1.attn": reader}
+    utils.tpu_bind_kv_cache(
+        {
+            "model.layers.0.attn": caches["owner"],
+            "model.layers.1.attn": caches["reader"],
+        },
+        context,
+        [],
+    )
+    assert reader.kv_cache is owner.kv_cache

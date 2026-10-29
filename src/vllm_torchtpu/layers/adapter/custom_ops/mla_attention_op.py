@@ -59,7 +59,11 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
-from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
+from vllm_torchtpu.kernels.mla.kv_cache_utils import (
+    OOB_PAGE,
+    SparseMLAKVCacheSpec,
+    _row_positions,
+)
 from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
     PallasMLAttentionBackendImpl,
@@ -881,6 +885,8 @@ class TPUDummyMLAPrefillBackend:
 class VllmTPUMLAAttention(MLAAttention):
     """TPU-optimized out-of-tree wrapper for Multi-Head Latent Attention."""
 
+    mla_kv_spec: tuple[SparseMLAKVCacheSpec, SparseMLAKVCacheSpec]
+
     def __init__(
         self,
         num_heads: int,
@@ -899,6 +905,7 @@ class VllmTPUMLAAttention(MLAAttention):
         use_sparse: bool = False,
         indexer: object | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
+        kv_sharing_target_layer_name: str | None = None,
         **extra_impl_args,
     ):
         torch.nn.Module.__init__(self)
@@ -954,7 +961,7 @@ class VllmTPUMLAAttention(MLAAttention):
 
         # For compatibility reasons.
         self.prefix = prefix
-        self.kv_sharing_target_layer_name = None
+        self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
         self.attn_type = AttentionType.DECODER
         self.sliding_window = None
 
