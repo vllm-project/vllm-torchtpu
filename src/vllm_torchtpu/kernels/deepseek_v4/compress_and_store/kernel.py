@@ -334,26 +334,20 @@ def compute_is_first_mask(kv_slot_mapping, tile_n, pack_factor=4):
     prevent overwriting each other's data and reduce memory traffic.
     """
     num_tokens = kv_slot_mapping.shape[0]
-    pad_len = (tile_n - (num_tokens % tile_n)) % tile_n
-    if pad_len > 0:
-        kv_slots_padded = jnp.pad(kv_slot_mapping, (0, pad_len), constant_values=-1)
-    else:
-        kv_slots_padded = kv_slot_mapping
+    row_idxs = kv_slot_mapping // pack_factor
+    valid = kv_slot_mapping >= 0
+    pos_in_tile = jnp.arange(num_tokens) % tile_n
 
-    total_tokens = kv_slots_padded.shape[0]
-    num_tiles = total_tokens // tile_n
-    kv_slots_tiled = kv_slots_padded.reshape(num_tiles, tile_n)
-
-    row_idxs = kv_slots_tiled // pack_factor
-    valid = kv_slots_tiled >= 0
-
-    eq = row_idxs[:, None, :] == row_idxs[:, :, None]
-    tril = jnp.tril(jnp.ones((tile_n, tile_n), dtype=bool), k=-1)
-    conflict = eq & tril[None, :, :] & valid[:, None, :]
-    has_conflict = jnp.any(conflict, axis=-1)
-    is_first = valid & ~has_conflict
-
-    return is_first.flatten()[:num_tokens]
+    # Compare each token with the up to tile_n - 1 tokens before it in its tile,
+    # one static shift at a time, so it stays a single elementwise fusion.
+    has_conflict = jnp.zeros((num_tokens,), jnp.bool_)
+    for shift in range(1, min(tile_n, num_tokens)):
+        earlier_row = jnp.pad(row_idxs[:-shift], (shift, 0))
+        earlier_valid = jnp.pad(valid[:-shift], (shift, 0))
+        has_conflict |= (
+            (pos_in_tile >= shift) & earlier_valid & (earlier_row == row_idxs)
+        )
+    return valid & ~has_conflict
 
 
 @functools.partial(
