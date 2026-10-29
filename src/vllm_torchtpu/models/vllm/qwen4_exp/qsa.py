@@ -45,6 +45,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import build_compact_pooled_
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 from .config import require_unified_pool
+from .qsa_geometry import validate_qsa_geometry
 
 
 @dataclass(frozen=True)
@@ -180,22 +181,6 @@ class _Indexer(nn.Module):
         )
 
 
-_KV_SCALE_NAMES = {
-    "k_proj.k_scale": "_k_scale",
-    "k_proj.output_scale": "_k_scale",
-    "attn.k_scale": "_k_scale",
-    "attn._k_scale": "_k_scale",
-    "k_scale": "_k_scale",
-    "_k_scale": "_k_scale",
-    "v_proj.v_scale": "_v_scale",
-    "v_proj.output_scale": "_v_scale",
-    "attn.v_scale": "_v_scale",
-    "attn._v_scale": "_v_scale",
-    "v_scale": "_v_scale",
-    "_v_scale": "_v_scale",
-}
-
-
 class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
     """Config-derived gated attention with a fully replicated MQA indexer.
 
@@ -208,6 +193,12 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
     supports_dcp = False
     k_proj: ColumnParallelLinear
     v_proj: ColumnParallelLinear
+    _k_scale: torch.Tensor
+    _v_scale: torch.Tensor
+    _k_scale_cpu: torch.Tensor
+    _v_scale_cpu: torch.Tensor
+    _k_scale_float: float
+    _v_scale_float: float
 
     def __init__(
         self,
@@ -223,8 +214,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         topk_backend_key: str | None = None,
     ):
         super().__init__()
-        if tp_size <= 0:
-            raise ValueError(f"QSA requires positive tp_size, got {tp_size}")
+        validate_qsa_geometry(config, tp_size=tp_size, cache_dtype=cache_dtype)
         if not 0 <= tp_rank < tp_size:
             raise ValueError("QSA requires an in-range TP rank")
         self.tp_rank, self.tp_size, self.prefix = tp_rank, tp_size, prefix
@@ -238,31 +228,6 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         self.head_dim = int(config.head_dim)
         self.total_num_heads = int(config.num_attention_heads)
         self.total_num_kv_heads = int(config.num_key_value_heads)
-        if self.total_num_heads <= 0 or self.total_num_heads % tp_size:
-            raise ValueError(
-                f"QSA num_attention_heads={self.total_num_heads} must be positive "
-                f"and divisible by tp_size={tp_size}"
-            )
-        if self.total_num_kv_heads <= 0 or (
-            self.total_num_kv_heads % tp_size and tp_size % self.total_num_kv_heads
-        ):
-            raise ValueError(
-                f"QSA num_key_value_heads={self.total_num_kv_heads} must be positive "
-                f"and shard or replicate evenly across tp_size={tp_size}"
-            )
-        if int(config.indexer_kv_heads) != 1:
-            raise ValueError(
-                f"QSA indexer_kv_heads={config.indexer_kv_heads} must be 1 "
-                "for the replicated MQA indexer"
-            )
-        if (
-            self.head_dim <= 0
-            or int(config.indexer_head_dim) <= 0
-            or int(config.indexer_n_heads) <= 0
-        ):
-            raise ValueError(
-                "QSA head_dim, indexer_head_dim and indexer_n_heads must be positive"
-            )
         self.num_heads = self.total_num_heads // tp_size
         self.num_kv_heads = max(self.total_num_kv_heads // tp_size, 1)
         self.index_head_dim = int(config.indexer_head_dim)
@@ -284,22 +249,28 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 tp_rank=tp_rank,
                 tp_size=tp_size,
             )
-            for name in ("k_proj", "v_proj"):
-                setattr(
-                    self,
-                    name,
-                    ColumnParallelLinear(
-                        self.hidden_size,
-                        self.total_num_kv_heads * self.head_dim,
-                        bias=False,
-                        params_dtype=torch.bfloat16,
-                        quant_config=None,
-                        prefix=prefix + "." + name,
-                        return_bias=False,
-                        tp_rank=kv_rank,
-                        tp_size=kv_size,
-                    ),
-                )
+            self.k_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.total_num_kv_heads * self.head_dim,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                quant_config=None,
+                prefix=prefix + ".k_proj",
+                return_bias=False,
+                tp_rank=kv_rank,
+                tp_size=kv_size,
+            )
+            self.v_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.total_num_kv_heads * self.head_dim,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                quant_config=None,
+                prefix=prefix + ".v_proj",
+                return_bias=False,
+                tp_rank=kv_rank,
+                tp_size=kv_size,
+            )
             # Upstream RowParallelLinear cannot take explicit TP geometry.
             # Reuse its constituent mechanisms: local unquantized linear and
             # the same TP reduction; loader slices columns exactly once.
@@ -328,7 +299,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         with torch.device(device or "cpu"):
             set_default_quant_scales(self, register_buffer=True)
         self.cache_owners: tuple[torch.Tensor, ...] = ()
-        self._loaded = set()
+        self._loaded: set[str] = set()
         self._op = partial(
             build_compact_pooled_qsa_op(
                 topk_backend=self.topk_backend, topk_backend_key=self.topk_backend_key
@@ -375,8 +346,8 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         }
         loaded = set()
         for name, weight in weights:
-            if name in _KV_SCALE_NAMES:
-                target = _KV_SCALE_NAMES[name]
+            if name in ("_k_scale", "_v_scale"):
+                target = name
                 if weight.numel() != 1:
                     raise ValueError(f"QSA {name} requires one per-tensor scale")
                 value = float(weight.detach().float().cpu().item())
@@ -386,9 +357,14 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                     raise ValueError(f"Duplicate QSA checkpoint scale: {target}")
                 # Keep the serialized buffer and host scalar consistent. The
                 # compiled kernel specializes on this immutable layer scale.
-                getattr(self, target).fill_(value)
-                getattr(self, target + "_cpu").fill_(value)
-                setattr(self, target + "_float", value)
+                if target == "_k_scale":
+                    self._k_scale.fill_(value)
+                    self._k_scale_cpu.fill_(value)
+                    self._k_scale_float = value
+                else:
+                    self._v_scale.fill_(value)
+                    self._v_scale_cpu.fill_(value)
+                    self._v_scale_float = value
                 loaded.add(target)
                 continue
             if (

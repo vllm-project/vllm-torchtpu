@@ -13,6 +13,9 @@
 # limitations under the License.
 """QSA checkpoint loading, producer rounding and native cache binding contracts."""
 
+from collections.abc import Callable
+from typing import cast
+
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
@@ -66,20 +69,8 @@ def test_flat_rope_rows_preserve_logical_cos_sin_and_padding(rotary_dim):
     assert torch.count_nonzero(cache[:, rotary_dim:]) == 0
 
 
-@pytest.mark.parametrize(
-    "k_name,v_name",
-    [
-        ("k_proj.k_scale", "v_proj.v_scale"),
-        ("k_proj.output_scale", "v_proj.output_scale"),
-        ("attn.k_scale", "attn.v_scale"),
-        ("attn._k_scale", "attn._v_scale"),
-        ("k_scale", "v_scale"),
-        ("_k_scale", "_v_scale"),
-    ],
-)
-def test_cuda_checkpoint_scale_aliases_keep_write_and_read_scales_consistent(
-    k_name, v_name, monkeypatch
-):
+def test_checkpoint_scales_keep_write_and_read_scales_consistent(monkeypatch):
+    k_name, v_name = "_k_scale", "_v_scale"
     monkeypatch.setattr(
         "vllm.model_executor.parameter.get_tensor_model_parallel_rank", lambda: 0
     )
@@ -171,7 +162,12 @@ def test_alternative_config_drives_checkpoint_cache_and_custom_op(
             torch.empty(2, 2, dtype=torch.int32),
             torch.empty(2, 2, dtype=torch.int32),
         )
-        qsa_forward_context(monkeypatch, model, metadata)
+        qsa_forward_context(
+            monkeypatch,
+            model,
+            metadata,
+            request_distribution=torch.tensor([0, 0, 2], dtype=torch.int32),
+        )
         output, selected = model.forward_with_indices(
             torch.empty(7, 128, dtype=torch.bfloat16),
             torch.empty(7, dtype=torch.int64),
@@ -296,7 +292,12 @@ def test_model_cache_binding_reaches_real_custom_op_schema(dtype, monkeypatch):
             torch.empty(2, 2, dtype=torch.int32),
             torch.empty(2, 2, dtype=torch.int32),
         )
-        qsa_forward_context(monkeypatch, model, metadata)
+        qsa_forward_context(
+            monkeypatch,
+            model,
+            metadata,
+            request_distribution=torch.tensor([0, 0, 2], dtype=torch.int32),
+        )
         output, selected = model.forward_with_indices(
             torch.empty(7, 2560, dtype=torch.bfloat16),
             torch.empty(7, dtype=torch.int64),
@@ -369,9 +370,11 @@ def test_checkpoint_head_packing_and_kv_replication(tp, rank, monkeypatch):
             rtol=0,
             atol=0,
         )
-        assert (
-            module.get_attn_backend().get_supported_kernel_block_sizes()[0].base == 128
-        )
+        from vllm.v1.attention.backend import MultipleOf
+
+        block_size = module.get_attn_backend().get_supported_kernel_block_sizes()[0]
+        assert isinstance(block_size, MultipleOf)
+        assert block_size.base == 128
         assert module.get_attn_backend().__name__ == "Qwen4ExpPooledQSABackend"
         assert (
             get_qsa_cache_specs(module.config, module.tp_size, module.cache_dtype)[1][
@@ -450,6 +453,7 @@ def test_static_indexer_backend_cache_and_owner_contract(
             main,
             index,
             *metadata,
+            request_distribution=torch.tensor([0, 0, 1], dtype=torch.int64),
             compress_ratio=4,
             token_topk=64,
             norm_eps=1e-6,
@@ -512,7 +516,7 @@ def test_actual_model_keeps_static_backend_when_binding_compact_owners(monkeypat
     main = torch.zeros((2, 128, 1, 2, 256), dtype=torch.bfloat16)
     index = torch.zeros((2, 16, 1, 2, 128), dtype=torch.bfloat16)
     with pytest.raises(TypeError):
-        layer.bind_pool(main)
+        cast(Callable[..., None], layer.bind_pool)(main)
     layer.bind_pool(main, index)
     assert seen == [(backend, "reference-v1/forward")]
     assert layer.cache_owners == (main, index)
@@ -551,6 +555,7 @@ def test_compact_selector_forwards_logical_ids_and_existing_resource_budget(
             jnp.array([0, 0, 1, 1], jnp.int32),
             jnp.array([0, 2, 2], jnp.int32),
             jnp.array([3, 0], jnp.int32),
+            request_distribution=jnp.array([0, 0, 2], jnp.int32),
             ratio=4,
             block_topk=16,
             logical_block_size=256,
@@ -578,6 +583,7 @@ def test_output_projection_tp2_partial_sum_matches_tp1(monkeypatch):
     checkpoint[rows, rows + 256] = 0.25
     attended = ((torch.arange(3 * 512).reshape(3, 512) % 7) / 4).to(torch.bfloat16)
     partials = []
+    expected = None
     for size, rank in [(1, 0), (2, 0), (2, 1)]:
         monkeypatch.setattr(
             "vllm.model_executor.parameter.get_tensor_model_parallel_rank",
@@ -598,4 +604,5 @@ def test_output_projection_tp2_partial_sum_matches_tp1(monkeypatch):
         else:
             partials.append(output)
     # Binary-exact inputs isolate rank slicing/reduction from BF16 sum rounding.
+    assert expected is not None
     torch.testing.assert_close(partials[0] + partials[1], expected, rtol=0, atol=0)

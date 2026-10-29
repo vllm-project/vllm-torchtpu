@@ -13,8 +13,6 @@
 # limitations under the License.
 """Single admission boundary for the FP8, text-only TPU S1 implementation."""
 
-import math
-
 import torch
 from vllm.model_executor.models.config import (
     Qwen4ExpForCausalLMConfig,
@@ -31,6 +29,7 @@ from vllm_torchtpu.kernels.qwen4_exp.hc_prefill_policy import validate_hc_prefil
 from vllm_torchtpu.utils import torch_dtype_from_name
 
 from .ple_host import host_available_memory
+from .qsa_geometry import validate_qsa_geometry
 
 
 def require_unified_pool() -> None:
@@ -285,36 +284,10 @@ def validate_config(cfg):
         raise ValueError(
             "Qwen4Exp GDN requires head dimensions divisible by 128 and conv kernel > 1"
         )
-    if (
-        t.num_attention_heads % t.num_key_value_heads
-        or t.num_attention_heads % tp
-        or (
-            t.num_key_value_heads % tp
-            if t.num_key_value_heads >= tp
-            else tp % t.num_key_value_heads
-        )
-    ):
+    validate_qsa_geometry(t, tp_size=tp, cache_dtype=c.cache_dtype)
+    if c.block_size % t.indexer_compress_ratio:
         raise ValueError(
-            "Qwen4Exp QSA requires integral query/KV head sharding or replication"
-        )
-    rotary_dim = int(t.head_dim * t.partial_rotary_factor)
-    theta = t.rope_parameters["rope_theta"]
-    if (
-        t.indexer_kv_heads != 1
-        or c.block_size % t.indexer_compress_ratio
-        or t.indexer_budget % t.indexer_compress_ratio
-        or rotary_dim <= 0
-        or rotary_dim % 2
-        or rotary_dim > min(t.head_dim, t.indexer_head_dim)
-        or not math.isfinite(theta)
-        or theta <= 0
-        or not math.isfinite(t.rms_norm_eps)
-        or t.rms_norm_eps <= 0
-        or (c.cache_dtype in ("fp8", "fp8_e4m3") and t.head_dim % 2)
-    ):
-        raise ValueError(
-            "Qwen4Exp QSA geometry violates compression, RoPE or FP8 packing "
-            "constraints"
+            "Qwen4Exp QSA page size must be divisible by indexer_compress_ratio"
         )
     if m.max_model_len > t.max_position_embeddings:
         raise ValueError("Qwen4Exp context exceeds model position capacity")
@@ -360,11 +333,6 @@ def validate_config(cfg):
     if block_topk % 16 or not 16 <= block_topk <= 4096:
         raise ValueError(
             "Qwen4Exp StreamIndex top-k must be aligned to 16 in [16,4096]"
-        )
-    if c.cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3"):
-        raise ValueError(
-            "Qwen4Exp QSA requires BF16 or per-tensor FP8 E4M3 KV (auto, "
-            "bfloat16, fp8, fp8_e4m3)"
         )
     # Request slots are sized from max_num_seqs and checked against HBM in
     # Qwen4ExpPooledCache.allocate. Active work remains bounded by the token budget;
