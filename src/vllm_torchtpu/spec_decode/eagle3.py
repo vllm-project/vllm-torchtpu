@@ -2609,6 +2609,8 @@ class Eagle3Proposer:
         self._precompile_compute_logits()
         if envs.VLLM_TPU_DRAFT_CARRY_FUSED and self._draft_rows:
             self._precompile_draft_rows_carry_and_token()
+        if envs.VLLM_TPU_DRAFT_SEED_FUSED and envs.VLLM_TPU_FUSED_ASYNC_DRAFT_SEED:
+            self._precompile_async_seed_inputs()
 
     def _draft_hidden_size(self) -> int:
         """Width of the hidden state the draft's lm_head consumes.
@@ -2773,9 +2775,6 @@ class Eagle3Proposer:
                     nti = torch.zeros(p, dtype=torch.int32).to(runner.device)
                     out = self._draft_seed_input_ids(ids, lti, nti)
                     synchronize_tensors(out)
-
-
-
 
     def _precompile_async_seed_inputs(self) -> None:
         """`_async_seed_inputs_compiled` at every reachable (token bucket T,
