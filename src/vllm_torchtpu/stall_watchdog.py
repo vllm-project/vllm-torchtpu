@@ -9,7 +9,8 @@ the logs. With N > 0:
   plugin) registers ``faulthandler`` on SIGUSR2, so the signal prints all its
   threads' Python stacks to stderr without stopping it;
 - each worker watches its own steps: when requests are still live in its
-  batch but no step has started for N seconds, it dumps its stacks once per
+  batch but no step with scheduled tokens has started for N seconds (empty
+  schedules do not count), it dumps its stacks once per
   stall, and rank 0 also signals its parent (engine core) and grandparent
   (API server) so their stacks land in the same log.
 """
@@ -67,6 +68,13 @@ def note_step(live_reqs: int) -> None:
     """Called by the runner as each step starts."""
     global _last_step, _live_reqs
     _last_step = time.monotonic()
+    _live_reqs = live_reqs
+
+
+def note_live(live_reqs: int) -> None:
+    """A step that scheduled no tokens: keeps the live-request count current
+    without counting as progress."""
+    global _live_reqs
     _live_reqs = live_reqs
 
 

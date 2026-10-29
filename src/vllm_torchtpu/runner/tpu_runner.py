@@ -4005,7 +4005,13 @@ class TPUModelRunner(GPUModelRunner):
         # Update cached state
         self._update_states(scheduler_output)
         host_phases.mark("update_states")
-        stall_watchdog.note_step(self.input_batch.num_reqs)
+        # Zero-token steps do not count as progress: an engine that keeps
+        # sending empty schedules while requests are live is stalled too (the
+        # c32 freezes: no device work for tens of seconds, yet steps arriving).
+        if scheduler_output.total_num_scheduled_tokens > 0:
+            stall_watchdog.note_step(self.input_batch.num_reqs)
+        else:
+            stall_watchdog.note_live(self.input_batch.num_reqs)
         if self.scheduler_config.async_scheduling:
             self._flush_disjoint_async_results()
         if scheduler_output.total_num_scheduled_tokens == 0:
