@@ -79,38 +79,38 @@ _LANES = 128
 _SCALE_LANES = _LANES
 
 
-def _quantize_rows_kernel(x_ref, q_ref, s_ref, *, group_rows: int):
+def _quantize_row_group(x_ref, x_rows, q_ref, q_rows, s_ref):
+    """`quantize_block` on rows ``x_rows`` of x, written to ``q_rows`` of q and s."""
     k = x_ref.shape[1]
-
-    def quantize_group(rows):
-        # quantize_block's ops, with the group read twice from VMEM, column
-        # chunk by chunk, instead of held in vregs between the max and the
-        # convert. max is exact, so the lane blocks may be folded in any order.
-        if k % QUANTIZE_LANE_CHUNK:
-            x_q, scale = quantize_block(
-                x_ref[rows, :], axis=1, target_dtype=q_ref.dtype
+    # quantize_block's ops, with the group read twice from VMEM, column chunk
+    # by chunk, instead of held in vregs between the max and the convert. max
+    # is exact, so the lane blocks may be folded in any order.
+    if k % QUANTIZE_LANE_CHUNK:
+        x_q, scale = quantize_block(x_ref[x_rows, :], axis=1, target_dtype=q_ref.dtype)
+        q_ref[q_rows, :] = x_q
+    else:
+        folded = jnp.abs(x_ref[x_rows, 0:_LANES])
+        for c in range(_LANES, k, _LANES):
+            folded = jnp.maximum(folded, jnp.abs(x_ref[x_rows, c : c + _LANES]))
+        abs_max = jnp.max(folded, axis=1, keepdims=True)
+        scale = scale_from_abs_max(abs_max, q_ref.dtype)
+        for c in range(0, k, QUANTIZE_LANE_CHUNK):
+            cols = slice(c, c + QUANTIZE_LANE_CHUNK)
+            q_ref[q_rows, cols] = quantize_with_scale(
+                x_ref[x_rows, cols], scale, q_ref.dtype
             )
-            q_ref[rows, :] = x_q
-        else:
-            folded = jnp.abs(x_ref[rows, 0:_LANES])
-            for c in range(_LANES, k, _LANES):
-                folded = jnp.maximum(folded, jnp.abs(x_ref[rows, c : c + _LANES]))
-            abs_max = jnp.max(folded, axis=1, keepdims=True)
-            scale = scale_from_abs_max(abs_max, q_ref.dtype)
-            for c in range(0, k, QUANTIZE_LANE_CHUNK):
-                cols = slice(c, c + QUANTIZE_LANE_CHUNK)
-                q_ref[rows, cols] = quantize_with_scale(
-                    x_ref[rows, cols], scale, q_ref.dtype
-                )
-        s_ref[rows, :] = jnp.broadcast_to(scale, (scale.shape[0], _SCALE_LANES))
+    s_ref[q_rows, :] = jnp.broadcast_to(scale, (scale.shape[0], _SCALE_LANES))
 
+
+def _quantize_rows_kernel(x_ref, q_ref, s_ref, *, group_rows: int):
     num_groups = x_ref.shape[0] // group_rows
     if num_groups == 1:
-        quantize_group(slice(None))
+        _quantize_row_group(x_ref, slice(None), q_ref, slice(None), s_ref)
         return
 
     def body(g, carry):
-        quantize_group(pl.ds(pl.multiple_of(g * group_rows, group_rows), group_rows))
+        rows = pl.ds(pl.multiple_of(g * group_rows, group_rows), group_rows)
+        _quantize_row_group(x_ref, rows, q_ref, rows, s_ref)
         return carry
 
     jax.lax.fori_loop(0, num_groups, body, 0)
