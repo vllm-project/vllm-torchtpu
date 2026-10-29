@@ -525,6 +525,37 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        # Static EPLB (DSV41_EPLB_SLOTS_PER_RANK + DSV41_EPLB_PLAN): R extra
+        # local slots per rank, loaded with copies of hot logical experts
+        # straight from the checkpoint. Everything below (dequant, padding,
+        # requant) then treats them as ordinary local experts.
+        from vllm_torchtpu.layers.adapter import eplb_static
+
+        self._eplb_spec = None
+        pcfg = layer.moe_config.moe_parallel_config
+        if eplb_static.enabled() and pcfg.use_ep:
+            spec = eplb_static.spec_for(
+                getattr(layer, "layer_name", ""),
+                layer.global_num_experts,
+                pcfg.ep_size,
+            )
+            if spec is not None and num_experts == spec.g:
+                self._eplb_spec = spec
+                num_experts = num_experts + spec.r
+                extra_weight_attrs["weight_loader"] = eplb_static.wrap_weight_loader(
+                    layer, extra_weight_attrs["weight_loader"], spec, pcfg.ep_rank
+                )
+                eplb_static.extend_ep_weight_filter()
+                logger.info(
+                    "Static EPLB: %s (layer %s) rank %d allocates %d+%d expert "
+                    "slots; replica sources %s",
+                    getattr(layer, "layer_name", "?"),
+                    spec.layer,
+                    pcfg.ep_rank,
+                    spec.g,
+                    spec.r,
+                    spec.local_sources(pcfg.ep_rank),
+                )
         Mxfp4MoEMethod.create_weights(
             self,
             layer,
@@ -760,6 +791,19 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             )
 
         setattr(self, FUSED_MOE_EP_OP_ATTR, op)
+        eplb_spec = getattr(self, "_eplb_spec", None)
+        if eplb_spec is not None:
+            if op is None:
+                raise ValueError(
+                    "static EPLB (DSV41_EPLB_*) allocated replica expert slots "
+                    "but the fused EP kernel was not armed for this layer; the "
+                    "GMM fallback does not understand replica slots"
+                )
+            from vllm_torchtpu.layers.adapter.fused_moe_ep import EPLB_TABLE_ATTR
+
+            table = torch.tensor(eplb_spec.table(), dtype=torch.int32, device=device)
+            layer.register_buffer("_tpu_eplb_table", table, persistent=False)
+            setattr(self, EPLB_TABLE_ATTR, layer._tpu_eplb_table)
         if op is not None:
             reason = fused_moe_ep_unsupported_reason(
                 layer,

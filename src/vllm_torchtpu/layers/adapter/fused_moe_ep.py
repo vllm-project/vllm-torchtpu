@@ -121,6 +121,8 @@ _RANK_BUFFER: Any = None
 # (`Fp8Config.get_quant_method`), so this is per-layer state without a registry
 # that has to be torn down between models in one process.
 FUSED_MOE_EP_OP_ATTR = "_fused_moe_ep_op"
+# The static-EPLB replica table (see eplb_static), recorded on the same owner.
+EPLB_TABLE_ATTR = "_eplb_table"
 
 
 def _squeeze_channel_scale(
@@ -184,6 +186,7 @@ def _build_op(
     *,
     token_replica_groups=None,
     logical_intermediate_size: int | None = None,
+    has_eplb: bool = False,
 ):
     """The op for this closure, built once per distinct closure and reused."""
     from vllm_torchtpu.compilation.moe_preprocessing import prepare_moe_preprocessing
@@ -206,6 +209,7 @@ def _build_op(
         has_hash_ids,
         token_replica_groups,
         logical_intermediate_size,
+        has_eplb,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -306,6 +310,76 @@ def _build_op(
             hash_topk_ids=hash_ids.astype(jnp.int32),
         )
 
+    # Static EPLB: one more operand, the replicated [E_logical, ep] i32 replica
+    # table, after the score bias / hash ids. A separate signature per
+    # combination because torch_tpu reads static argnums off the signature.
+    def moe_eplb(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        eplb_table: jax.Array,
+    ) -> jax.Array:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            eplb_table=eplb_table.astype(jnp.int32),
+        )
+
+    def moe_with_score_bias_eplb(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        score_bias: jax.Array,
+        eplb_table: jax.Array,
+    ) -> jax.Array:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            score_bias=score_bias.astype(jnp.float32),
+            eplb_table=eplb_table.astype(jnp.int32),
+        )
+
+    def moe_with_hash_ids_eplb(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        hash_ids: jax.Array,
+        eplb_table: jax.Array,
+    ) -> jax.Array:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            hash_topk_ids=hash_ids.astype(jnp.int32),
+            eplb_table=eplb_table.astype(jnp.int32),
+        )
+
     assert not (has_score_bias and has_hash_ids)
     spec = PartitionSpec(EP_AXIS_NAME)
     # The score-correction bias is indexed by GLOBAL expert id and read by
@@ -320,6 +394,7 @@ def _build_op(
         (spec,) * 7
         + ((PartitionSpec(),) if has_score_bias else ())
         + ((spec,) if has_hash_ids else ())
+        + ((PartitionSpec(),) if has_eplb else ())
     )
     # Stock jax_op. It used to size its outputs from the export's avals, where
     # a shard_map result is recorded as replicated, so this rank's 2048 rows
@@ -328,11 +403,11 @@ def _build_op(
     # takes output_partition_specs itself now, which is the same information
     # without a copy of anyone's source.
     if has_score_bias:
-        fn = moe_with_score_bias
+        fn = moe_with_score_bias_eplb if has_eplb else moe_with_score_bias
     elif has_hash_ids:
-        fn = moe_with_hash_ids
+        fn = moe_with_hash_ids_eplb if has_eplb else moe_with_hash_ids
     else:
-        fn = moe
+        fn = moe_eplb if has_eplb else moe
     op = jax_op(
         name,
         fn,
@@ -392,6 +467,9 @@ def fused_moe_ep(
             _squeeze_channel_scale_checked(w2_scale),
         )
     extra = tuple(t for t in (score_bias, hash_ids) if t is not None)
+    eplb_table = getattr(owner, EPLB_TABLE_ATTR, None)
+    if eplb_table is not None:
+        extra = extra + (eplb_table,)
     return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
 
 
@@ -635,7 +713,16 @@ def prebuild_fused_moe_ep(
     # silently. `local_experts * ep` is exactly the `e_total` the kernel will
     # derive from the global weight, so requiring the gate width to match it is
     # the same check the kernel would make if it made one.
-    if layer.global_num_experts != local_experts * ep:
+    eplb_spec = getattr(getattr(layer, "quant_method", None), "_eplb_spec", None)
+    eplb_slots = eplb_spec.r if eplb_spec is not None else 0
+    if eplb_spec is not None and (
+        eplb_spec.ep != ep or eplb_spec.num_experts != layer.global_num_experts
+    ):
+        raise ValueError(
+            f"static EPLB spec (E={eplb_spec.num_experts}, ep={eplb_spec.ep}) "
+            f"does not match the layer (E={layer.global_num_experts}, ep={ep})"
+        )
+    if layer.global_num_experts + ep * eplb_slots != local_experts * ep:
         logger.warning_once(
             "Fused EP MoE not engaged: the kernel needs one equal contiguous "
             "expert block per shard, but %d global experts over ep=%d does "
@@ -679,7 +766,18 @@ def prebuild_fused_moe_ep(
         has_hash_ids,
         token_replica_groups=token_replica_groups,
         logical_intermediate_size=logical_intermediate_size,
+        has_eplb=eplb_spec is not None,
     )
+    if eplb_spec is not None:
+        logger.info(
+            "Static EPLB armed for %s (layer %s): %d replica slots/rank, "
+            "E_phys=%d, replicated experts=%s",
+            getattr(layer, "layer_name", "?"),
+            eplb_spec.layer,
+            eplb_spec.r,
+            eplb_spec.num_physical,
+            sorted({e for row in eplb_spec.slots for e in row if e >= 0}),
+        )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
         "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s "
