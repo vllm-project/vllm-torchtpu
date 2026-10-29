@@ -251,6 +251,17 @@ steps:
           RUN_ROOT: "perf_eval_results/k3_pruned75_apc_offload_ci"
           SERVED_MODEL_NAME: "mgoin/Kimi-K3-pruned75"
         <<: *integration_step
+        # Retry only infrastructure failures: lost Buildkite agents (exit -1) and
+        # Kubernetes launcher temporary infra failures (exit 75 EX_TEMPFAIL on
+        # Kueue preemption, node eviction, or unscheduled pod timeout), never
+        # smoke/server failures (exit 1). Remove once agent/node preemptions are
+        # absorbed upstream without surfacing to Buildkite.
+        retry:
+          automatic:
+            - exit_status: -1
+              limit: 2
+            - exit_status: 75
+              limit: 2
         plugins:
           - *kube_plugin
         commands:

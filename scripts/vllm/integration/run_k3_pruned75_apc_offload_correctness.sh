@@ -169,12 +169,15 @@ fail() {
 }
 
 SERVER_PID=""
-# shellcheck disable=SC2317  # invoked via the EXIT trap
-cleanup() {
+TPU_INIT_RACE_REGEX="PjRtClient is not initialized|START_SESSION failed|PRE_START_SESSION_BARRIER|Failed to start the gRPC server|unix:///var/run/tpu-plugin/vbar\.sock|Failed to acquire a TPU device node"
+
+stop_server_processes() {
   if [[ -n "${SERVER_PID}" ]]; then
     kill -TERM "${SERVER_PID}" 2>/dev/null || true
     sleep 5
     kill -KILL "${SERVER_PID}" 2>/dev/null || true
+    wait "${SERVER_PID}" 2>/dev/null || true
+    SERVER_PID=""
   fi
   # Retitled workers outlive the parent and keep /dev/vfio open. Match the
   # comm name: a -f pattern would also match this script's command line.
@@ -182,24 +185,85 @@ cleanup() {
   sleep 3
   pkill -KILL '^VLLM' 2>/dev/null || true
 }
+
+wait_tpu_devices_free() {
+  local deadline=$((SECONDS + 180))
+  while [[ "${SECONDS}" -lt "${deadline}" ]]; do
+    local held=0
+    for link in /proc/[0-9]*/fd/*; do
+      local target
+      target="$(readlink "${link}" 2>/dev/null || true)"
+      if [[ "${target}" =~ ^/dev/(accel|vfio/)[0-9]+$ ]]; then
+        held=1
+        break
+      fi
+    done
+    [[ "${held}" -eq 0 ]] && return 0
+    sleep 1
+  done
+  echo "WARNING: TPU device nodes still open after 180s drain wait"
+}
+
+dump_server_errors() {
+  [[ -f "${SERVER_LOG}" ]] || return 0
+  echo "--- server.log root-cause error lines (WorkerProc / EngineCore) ---"
+  grep -E "ERROR|CRITICAL|RuntimeError:|AttributeError:|TypeError:|ValueError:|AssertionError:|TPU initialization failed|PjRtClient|halted unexpectedly|EngineDeadError" \
+    "${SERVER_LOG}" | tail -40 || true
+  echo "--- server.log tail (last 80 lines) ---"
+  tail -80 "${SERVER_LOG}" || true
+}
+
+# shellcheck disable=SC2317  # invoked via the EXIT trap
+cleanup() {
+  stop_server_processes
+}
 trap cleanup EXIT
 
 mkdir -p "${LOG_DIR}" || exit 1
-echo "===== launching ${SERVED_MODEL_NAME} from ${MODEL} (TP${TP_SIZE} + EP) \
-on port ${PORT} ====="
+STARTUP_MAX_ATTEMPTS="${STARTUP_MAX_ATTEMPTS:-2}"
 boot_start="${SECONDS}"
-( serve ) >"${SERVER_LOG}" 2>&1 &
-SERVER_PID=$!
+for ((attempt = 1; attempt <= STARTUP_MAX_ATTEMPTS; attempt++)); do
+  wait_tpu_devices_free
+  echo "===== launching ${SERVED_MODEL_NAME} from ${MODEL} (TP${TP_SIZE} + EP) \
+on port ${PORT} (attempt ${attempt}/${STARTUP_MAX_ATTEMPTS}) ====="
+  boot_start="${SECONDS}"
+  ( serve ) >"${SERVER_LOG}" 2>&1 &
+  SERVER_PID=$!
 
-deadline=$((SECONDS + STARTUP_TIMEOUT_S))
-until curl -sf --max-time 10 "${BASE}/health" >/dev/null; do
-  if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
-    tail -80 "${SERVER_LOG}" || true
-    fail "server exited during startup (see ${SERVER_LOG})"
+  deadline=$((SECONDS + STARTUP_TIMEOUT_S))
+  startup_failed_reason=""
+  until curl -sf --max-time 10 "${BASE}/health" >/dev/null; do
+    if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+      startup_failed_reason="server exited during startup (see ${SERVER_LOG})"
+      break
+    fi
+    if grep -q "WorkerProc failed to start" "${SERVER_LOG}" 2>/dev/null; then
+      # Give APIServer a brief window to flush its traceback before teardown.
+      sleep 10
+      startup_failed_reason="WorkerProc failed to start during startup (see ${SERVER_LOG})"
+      break
+    fi
+    if [[ "${SECONDS}" -ge "${deadline}" ]]; then
+      startup_failed_reason="server did not become healthy in ${STARTUP_TIMEOUT_S}s"
+      break
+    fi
+    sleep 15
+  done
+
+  if [[ -z "${startup_failed_reason}" ]]; then
+    break
   fi
-  [[ "${SECONDS}" -lt "${deadline}" ]] \
-    || fail "server did not become healthy in ${STARTUP_TIMEOUT_S}s"
-  sleep 15
+
+  dump_server_errors
+  if [[ "${attempt}" -lt "${STARTUP_MAX_ATTEMPTS}" ]] \
+    && grep -qE "${TPU_INIT_RACE_REGEX}" "${SERVER_LOG}" 2>/dev/null; then
+    echo "WARNING: attempt ${attempt} hit transient TPU slice/device init race; tearing down and retrying..."
+    cp -f "${SERVER_LOG}" "${LOG_DIR}/server_attempt_${attempt}.log" 2>/dev/null || true
+    stop_server_processes
+    sleep 5
+    continue
+  fi
+  fail "${startup_failed_reason}"
 done
 echo "server is healthy after $((SECONDS - boot_start))s"
 
@@ -287,6 +351,7 @@ awk '/KVCacheStore up/{seen=1} seen' "${SERVER_LOG}" \
   | tail -20 || true
 
 if [[ "${#failed[@]}" -gt 0 ]]; then
+  dump_server_errors
   fail "failed stages: ${failed[*]} (logs in ${LOG_DIR})"
 fi
 echo "K3_APC_OFFLOAD_OK"
