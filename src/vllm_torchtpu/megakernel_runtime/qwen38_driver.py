@@ -588,6 +588,7 @@ class Qwen38SegmentDriver:
         self.whole_program = None
         self.whole_calls = 0
         self.whole_dry = False  # `wholedry=1`: decide and count as whole=1, run stock (AL control)
+        self.seg_buckets: frozenset[int] = frozenset(buckets)  # what the segment program compiles
 
     @classmethod
     def maybe_create(cls, runner: Any) -> Qwen38SegmentDriver | None:
@@ -726,7 +727,20 @@ class Qwen38SegmentDriver:
         cfg = copy.copy(runner.vllm_config)
         cc = copy.copy(runner.vllm_config.compilation_config)
         paddings = set(int(x) for x in (cc.compile_sizes or []))
-        cc.compile_sizes = sorted(b for b in self.buckets if not paddings or b in paddings)
+        sizes = [b for b in self.buckets if not paddings or b in paddings]
+        # `wholeabove=seg` with a context cap covering the model length: the whole-step program
+        # serves every step up to `wholerows`, so the segment program compiles only the buckets
+        # above it. Traced at its first (> wholerows) call, its graph cannot serve the small
+        # buckets (c32combo boot B j-8f465e36: "Token bucket 8 ... assumes s72 >= 48").
+        max_len = int(getattr(runner.vllm_config.model_config, "max_model_len", 0) or 0)
+        if (
+            self.whole and self.whole_above == "seg" and not self.whole_dry
+            and self.check_left == 0 and max_len and self.whole_cap >= max_len
+        ):
+            top = min(WHOLE_MAX_ROWS, self.whole_max_rows)
+            sizes = [b for b in sizes if b > top] or sizes
+        self.seg_buckets = frozenset(sizes)
+        cc.compile_sizes = sorted(sizes)
         object.__setattr__(cfg, "compilation_config", cc)
         return cfg
 
@@ -1484,6 +1498,11 @@ class Qwen38SegmentDriver:
             above = rows > min(WHOLE_MAX_ROWS, self.whole_max_rows)
             self._note(f"stock_above_whole_b{rows}" if above else "stock_whole_ctx")
             self._count("drafts_stock", n_req * (T_VERIFY - 1))
+            return False, None
+        if rows not in self.seg_buckets and not self._whole_eligible(runner, n_req, rows):
+            # A bucket the segment program does not compile (`_segment_config`), e.g. the
+            # whole-step program failed to attach: stock.
+            self._note(f"stock_noseg_b{rows}")
             return False, None
         if self.whole_dry and self.whole_program is not None:
             # `wholedry=1`: the same eligibility decision and per-path draft counters, but the
