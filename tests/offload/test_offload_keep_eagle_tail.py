@@ -4,7 +4,7 @@
 With speculative decoding on and no KV cache group annotated as a drafter
 group, the pinned vLLM flags every group as one, and every tier lookup pops
 the last chunk of the hit. keep_unannotated_eagle_tail clears that flag on
-the unannotated groups only (vLLM main's behavior, vllm-project/vllm#52735).
+the unannotated groups only (vLLM main's behavior, vllm-project/vllm#52771).
 """
 
 from types import SimpleNamespace
