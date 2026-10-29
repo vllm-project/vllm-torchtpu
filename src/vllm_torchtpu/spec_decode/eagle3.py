@@ -785,7 +785,10 @@ class Eagle3Proposer:
             ):
                 self._mtp_fused_loop = build_mtp_fused_loop(
                     vllm_config=self.draft_vllm_config,
-                    prefix=f"mtp_fused_loop_k{K}",
+                    # Separate compile-cache folder per seq_lens mode, so a
+                    # cached in-place-add graph is never loaded for rebind.
+                    prefix=f"mtp_fused_loop_k{K}"
+                    + ("_rebind" if envs.VLLM_TPU_MTP_LOOP_REBIND_SEQ_LENS else ""),
                     mtp=draft_model,
                     num_steps=K - 1,
                     dynamic_arg_dims=draft_dims,
@@ -851,16 +854,27 @@ class Eagle3Proposer:
                 mesh=self.runner.mesh, vllm_config=self.draft_vllm_config
             ),
         ):
+            rebind = envs.VLLM_TPU_MTP_LOOP_REBIND_SEQ_LENS
             if not self._mtp_fused_loop_warm:
                 # The first call traces and compiles; like the loop-step
                 # program's, its outputs can carry symbolic sizes, so run it
                 # again compiled. The repeat rewrites the same KV entries;
-                # seq_lens is put back first because the program advanced it.
+                # seq_lens is put back first because the program advanced it
+                # (in place, or by rebinding the metadata field).
                 seq_lens_step1 = seq_lens.clone()
                 self._mtp_fused_loop(input_ids, positions, hidden_states, seq_lens)
                 seq_lens.copy_(seq_lens_step1)
+                if rebind:
+                    for md in attn_metadata.values():
+                        md.seq_lens = seq_lens
                 self._mtp_fused_loop_warm = True
-            return self._mtp_fused_loop(input_ids, positions, hidden_states, seq_lens)
+            out = self._mtp_fused_loop(input_ids, positions, hidden_states, seq_lens)
+            if rebind:
+                # Leave the step-1 tensor in place: these metadata objects are
+                # dropped after this call either way.
+                for md in attn_metadata.values():
+                    md.seq_lens = seq_lens
+            return out
 
     def _draft_model_for_step(self, step_idx: int) -> torch.nn.Module:
         """The compiled program draft step `step_idx` runs.
