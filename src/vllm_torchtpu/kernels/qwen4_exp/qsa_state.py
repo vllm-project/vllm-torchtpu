@@ -96,7 +96,8 @@ def write_ring_and_tags(
     ring_tokens, ring_rows = region_rows(pool, ring_elements, ring.dtype)
     tag_tokens, tag_rows = region_rows(pool, tag_elements, tags.dtype)
     tokens = ring_tokens + tag_tokens
-    assert tokens <= pool.shape[1]
+    if tokens > pool.shape[1]:
+        raise ValueError("QSA state regions exceed the physical page capacity")
     payload = tuple(pool.shape[2:])
     lanes = pool.shape[-1]
     batch = get_ring_tag_dma_batch(

@@ -62,7 +62,7 @@ def _build_compact_pooled_qsa_op(
     op = pallas.jax_op(
         _op_name("compact_pooled_qsa", topk_backend, topk_backend_key),
         functools.partial(compact_pooled_qsa_step, topk_backend=topk_backend),
-        donate_argnums=(10, 11),
+        donate_argnums=(10, 11),  # pool, index_pool
     )
 
     @op.register_fake
@@ -84,6 +84,7 @@ def _build_compact_pooled_qsa_op(
         ring_ids,
         main_table,
         compressed_table,
+        request_distribution: torch.Tensor,
         compress_ratio,
         token_topk,
         norm_eps,
@@ -101,13 +102,70 @@ def _build_compact_pooled_qsa_op(
             ),
         )
 
-    def run(*args, **kwargs):
-        args = list(args)
-        for index in (8, 12, 13, 14, 15, 16):
-            args[index] = args[index].to(torch.int32)
-        updated, index_updated, output, blocks = op(*args, **kwargs)
-        args[10].copy_(updated)
-        args[11].copy_(index_updated)
+    def run(
+        qgate: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        index_qk: torch.Tensor,
+        nq: torch.Tensor,
+        nk: torch.Tensor,
+        niq: torch.Tensor,
+        nik: torch.Tensor,
+        positions: torch.Tensor,
+        trig: torch.Tensor,
+        pool: torch.Tensor,
+        index_pool: torch.Tensor,
+        starts: torch.Tensor,
+        context: torch.Tensor,
+        ring_ids: torch.Tensor,
+        main_table: torch.Tensor,
+        compressed_table: torch.Tensor,
+        request_distribution: torch.Tensor,
+        compress_ratio: int,
+        token_topk: int,
+        norm_eps: float,
+        rotary_dim: int,
+        k_scale: float = 1.0,
+        v_scale: float = 1.0,
+        scheduling_group_namespace: int = 0,
+    ):
+        # The native QSA kernels consume positions and request/page metadata as int32.
+        positions = positions.to(torch.int32)
+        starts = starts.to(torch.int32)
+        context = context.to(torch.int32)
+        ring_ids = ring_ids.to(torch.int32)
+        main_table = main_table.to(torch.int32)
+        compressed_table = compressed_table.to(torch.int32)
+        request_distribution = request_distribution.to(torch.int32)
+        updated, index_updated, output, blocks = op(
+            qgate,
+            key,
+            value,
+            index_qk,
+            nq,
+            nk,
+            niq,
+            nik,
+            positions,
+            trig,
+            pool,
+            index_pool,
+            starts,
+            context,
+            ring_ids,
+            main_table,
+            compressed_table,
+            request_distribution,
+            compress_ratio,
+            token_topk,
+            norm_eps,
+            rotary_dim,
+            k_scale,
+            v_scale,
+            scheduling_group_namespace,
+        )
+        pool.copy_(updated)
+        index_pool.copy_(index_updated)
         return output, blocks
 
     return run

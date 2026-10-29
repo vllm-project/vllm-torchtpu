@@ -20,10 +20,13 @@ batched RPA compute body.
 """
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
+from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.qwen4_exp.decode_indexer import _request_bounds
 from vllm_torchtpu.kernels.qwen4_exp.qsa import (
     bf16,
     quantize_kv,
@@ -31,12 +34,12 @@ from vllm_torchtpu.kernels.qwen4_exp.qsa import (
 from vllm_torchtpu.kernels.sparse_gqa_decode.batching import (
     attend_in_chunks,
 )
-from vllm_torchtpu.kernels.sparse_gqa_decode.batching import (
-    rpa_query_batch_size as rpa_query_batch_size,
-)
 from vllm_torchtpu.kernels.sparse_gqa_decode.metadata import (
     virtual_page_metadata as sparse_page_metadata,
 )
+
+# Performance scheduling cap; SMEM capacity is checked separately.
+RPA_MAX_QUERY_BATCH = 64
 
 
 def pack_rows(key, value, *, fp8, k_scale=1.0, v_scale=1.0):
@@ -119,7 +122,7 @@ def _rpa_attention_batch(
     return out, next_cache.reshape(cache.shape)
 
 
-def rpa_attention(
+def _rpa_attention_in_chunks(
     q, gate, blocks, lengths, table, cache, *, kv_heads, ratio, k_scale=1.0, v_scale=1.0
 ):
     attend = functools.partial(
@@ -129,86 +132,37 @@ def rpa_attention(
         k_scale=k_scale,
         v_scale=v_scale,
     )
-    return attend_in_chunks(attend, q, gate, blocks, lengths, table, cache)
+    return attend_in_chunks(
+        attend,
+        q,
+        gate,
+        blocks,
+        lengths,
+        table,
+        cache,
+        batch_size=rpa_query_batch_size(
+            blocks.shape[1] + 1,
+            query=q,
+            cache=cache,
+            kv_heads=kv_heads,
+            ratio=ratio,
+        ),
+    )
 
 
-def qsa_attention(
+def rpa_attention(
     query,
     gate,
     blocks,
     lengths,
     table,
     cache,
-    starts,
     *,
     kv_heads,
     ratio,
     k_scale=1.0,
     v_scale=1.0,
 ):
-    """Use query-block reuse for large buckets, per-query attention otherwise.
-
-    T<=request capacity can include multi-token prefill. Each row still uses
-    its own request table, selected groups and causal length on that route.
-    T>padded request capacity is a static scheduling heuristic, not a semantic
-    mode classifier, safety requirement or proven profitability boundary.
-    Per-request starts/context and per-query causal lengths are authoritative.
-    """
-    if len(query) > len(starts) - 1:
-        from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
-            block_sparse_gqa_attention,
-        )
-        from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import (
-            get_sparse_prefill_tiles,
-        )
-        from vllm_torchtpu.kernels.sparse_gqa_prefill.adaptive import (
-            adaptive_prefill,
-            is_supported_by_adaptive_prefill,
-        )
-
-        if is_supported_by_adaptive_prefill(
-            query,
-            gate,
-            blocks,
-            lengths,
-            table,
-            cache,
-            starts,
-            kv_heads=kv_heads,
-            ratio=ratio,
-            k_scale=k_scale,
-            v_scale=v_scale,
-        ):
-            return adaptive_prefill(
-                query,
-                gate,
-                blocks,
-                lengths,
-                table,
-                cache,
-                starts,
-                kv_heads=kv_heads,
-                ratio=ratio,
-            )
-
-        query_block, kv_tile = get_sparse_prefill_tiles(
-            query, cache, kv_heads=kv_heads, ratio=ratio
-        )
-        return block_sparse_gqa_attention(
-            query,
-            gate,
-            blocks,
-            lengths,
-            table,
-            cache,
-            starts,
-            kv_heads=kv_heads,
-            ratio=ratio,
-            query_block=query_block,
-            kv_tile=kv_tile,
-            k_scale=k_scale,
-            v_scale=v_scale,
-        )
     from vllm_torchtpu.kernels.sparse_gqa_decode import plan_decode
     from vllm_torchtpu.kernels.sparse_gqa_decode.decode import execute_decode
 
@@ -236,7 +190,7 @@ def qsa_attention(
             k_scale=k_scale,
             v_scale=v_scale,
         )
-    return rpa_attention(
+    return _rpa_attention_in_chunks(
         query,
         gate,
         blocks,
@@ -247,6 +201,220 @@ def qsa_attention(
         ratio=ratio,
         k_scale=k_scale,
         v_scale=v_scale,
+    )
+
+
+def rpa_query_batch_size(
+    page_columns: int,
+    *,
+    query: jax.Array | jax.ShapeDtypeStruct,
+    cache: jax.Array | jax.ShapeDtypeStruct,
+    kv_heads: int,
+    ratio: int,
+) -> int:
+    from vllm_torchtpu.kernels.experimental.batched_rpa import configs, schedule
+
+    if page_columns < 1 or ratio < 1:
+        raise ValueError("QSA page width and compression ratio must be positive")
+    info = pltpu.get_tpu_info()
+    batch = RPA_MAX_QUERY_BATCH
+    while batch:
+        cfgs = configs.RpaConfigs(
+            block=configs.BlockSizes(bq_sz=1, bq_c_sz=1, bkv_sz=256, batch_size=8),
+            model=configs.ModelConfigs(
+                num_q_heads=query.shape[1],
+                num_kv_heads=kv_heads,
+                head_dim=cache.shape[-1],
+                mask_value=float(jnp.finfo(jnp.float32).min),
+            ),
+            serve=configs.ServingConfigs(
+                num_seqs=batch,
+                page_size=ratio,
+                total_q_tokens=batch,
+                num_page_indices=batch * page_columns,
+                dtype_q=jnp.dtype(jnp.float32),
+                dtype_kv=cache.dtype,
+                dtype_out=jnp.dtype(jnp.float32),
+                skip_kv_update=True,
+            ),
+            mode=configs.RpaCase.DECODE,
+            vmem_limit_bytes=info.vmem_capacity_bytes,
+        )
+        scratch = schedule.BaseMetadataComputer.get_rpa_schedule(cfgs).scratch_shapes()
+        scratch_bytes = sum(
+            math.prod(ref.shape) * ref.dtype.itemsize
+            for ref in jax.tree.leaves(scratch)
+        )
+        scalar_shapes = (
+            (batch + 1,),
+            (batch,),
+            (batch,),
+            (batch,),
+            (batch * page_columns,),
+        )
+        scalar_bytes = sum(
+            math.prod(shape) * jnp.dtype(jnp.int32).itemsize for shape in scalar_shapes
+        )
+        # Schedule generation has distribution[3] in place of the page table.
+        scalar_bytes = max(
+            scalar_bytes, (4 * batch + 1 + 3) * jnp.dtype(jnp.int32).itemsize
+        )
+        if scratch_bytes + scalar_bytes <= info.smem_capacity_bytes:
+            return batch
+        batch //= 2
+    raise ValueError(
+        "One QSA page-table row and the RPA schedule exceed SMEM capacity; "
+        "reduce the sparse page budget."
+    )
+
+
+def _prefill_attention(
+    query,
+    gate,
+    blocks,
+    lengths,
+    table,
+    cache,
+    starts,
+    *,
+    kv_heads,
+    ratio,
+    k_scale=1.0,
+    v_scale=1.0,
+):
+    from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
+        block_sparse_gqa_attention,
+    )
+    from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import (
+        get_sparse_prefill_tiles,
+    )
+    from vllm_torchtpu.kernels.sparse_gqa_prefill.adaptive import (
+        adaptive_prefill,
+        is_supported_by_adaptive_prefill,
+    )
+
+    if is_supported_by_adaptive_prefill(
+        query,
+        gate,
+        blocks,
+        lengths,
+        table,
+        cache,
+        starts,
+        kv_heads=kv_heads,
+        ratio=ratio,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    ):
+        return adaptive_prefill(
+            query,
+            gate,
+            blocks,
+            lengths,
+            table,
+            cache,
+            starts,
+            kv_heads=kv_heads,
+            ratio=ratio,
+        )
+
+    query_block, kv_tile = get_sparse_prefill_tiles(
+        query, cache, kv_heads=kv_heads, ratio=ratio
+    )
+    return block_sparse_gqa_attention(
+        query,
+        gate,
+        blocks,
+        lengths,
+        table,
+        cache,
+        starts,
+        kv_heads=kv_heads,
+        ratio=ratio,
+        query_block=query_block,
+        kv_tile=kv_tile,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+
+
+def qsa_attention(
+    query,
+    gate,
+    blocks,
+    lengths,
+    table,
+    cache,
+    starts,
+    *,
+    request_distribution: jax.Array,
+    kv_heads,
+    ratio,
+    k_scale=1.0,
+    v_scale=1.0,
+):
+    """Use Runner order: decode/verify prefix, then prefill in original rows."""
+    tokens = len(query)
+    if tokens == 0:
+        return jnp.zeros_like(query), cache
+    prefix_tokens, active_tokens = _request_bounds(starts, request_distribution, tokens)
+    options = dict(kv_heads=kv_heads, ratio=ratio, k_scale=k_scale, v_scale=v_scale)
+
+    def decode_batch(_):
+        return rpa_attention(query, gate, blocks, lengths, table, cache, **options)
+
+    def prefill_batch(_):
+        positions = jnp.arange(tokens, dtype=jnp.int32)
+        suffix = (positions >= prefix_tokens) & (positions < active_tokens)
+        output, owner = _prefill_attention(
+            query,
+            gate,
+            blocks,
+            jnp.where(suffix, lengths, 0),
+            table,
+            cache,
+            jnp.clip(starts, prefix_tokens, active_tokens),
+            **options,
+        )
+        batch = min(
+            tokens,
+            rpa_query_batch_size(
+                blocks.shape[1] + 1,
+                query=query,
+                cache=cache,
+                kv_heads=kv_heads,
+                ratio=ratio,
+            ),
+        )
+
+        def prefix(index, state):
+            output, owner = state
+            positions = index * batch + jnp.arange(batch, dtype=jnp.int32)
+            valid = positions < prefix_tokens
+            rows = jnp.minimum(positions, tokens - 1)
+            result, owner = _rpa_attention_batch(
+                jnp.where(valid[:, None, None], query[rows], 0),
+                gate[rows],
+                jnp.where(valid[:, None], blocks[rows], -1),
+                jnp.where(valid, lengths[rows], 0),
+                table[rows],
+                owner,
+                **options,
+            )
+            destination = jnp.where(valid, positions, tokens)
+            return output.at[destination].set(result, mode="drop"), owner
+
+        return jax.lax.fori_loop(
+            0, (prefix_tokens + batch - 1) // batch, prefix, (output, owner)
+        )
+
+    return jax.lax.cond(
+        active_tokens == 0,
+        lambda _: (jnp.zeros_like(query), cache),
+        lambda _: jax.lax.cond(
+            prefix_tokens == active_tokens, decode_batch, prefill_batch, None
+        ),
+        None,
     )
 
 
