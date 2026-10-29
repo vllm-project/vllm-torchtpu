@@ -90,8 +90,8 @@ def setup(monkeypatch):
     return op, forbidden
 
 
-def make_layer(fp4):
-    e, h, i = 1, 512, 256
+def make_layer(fp4, e=1):
+    h, i = 512, 256
     layer = torch.nn.Module()
     layer.activation = "silu"
     layer.renormalize = True
@@ -155,9 +155,9 @@ def mock_conversion(monkeypatch, fp4):
         def prepare(layer, **kw):
             return (
                 layer.w13_weight,
-                torch.ones(1, 1, 1, 512),
+                torch.ones(len(layer.w13_weight), 1, 1, 512),
                 layer.w2_weight,
-                torch.ones(1, 1, 1, 512),
+                torch.ones(len(layer.w2_weight), 1, 1, 512),
                 "float8_e4m3fn",
                 None,
             )
@@ -211,6 +211,16 @@ def test_admission_failure_never_falls_back(setup, monkeypatch, fp4, failure):
     if fp4:
         conversion.assert_not_called()
         assert layer.w13_weight.dtype == torch.uint8
+    setup[1].assert_not_called()
+
+
+def test_admission_raises_on_a_layer_with_expert_copies(setup, monkeypatch):
+    # TPU_EXPERT_PLACEMENT copy slots: 1 primary + 1 copy per rank at EP8.
+    layer, method = make_layer(False, e=2), make_method(False)
+    mock_conversion(monkeypatch, False)
+    with pytest.raises(ValueError, match="equal contiguous expert blocks"):
+        method.process_weights_after_loading(layer)
+    assert getattr(method, bridge.FUSED_MOE_EP_OP_ATTR) is None
     setup[1].assert_not_called()
 
 

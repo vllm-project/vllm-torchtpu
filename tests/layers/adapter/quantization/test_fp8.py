@@ -1223,6 +1223,7 @@ class TestOnlineFp8Quantization:
         method = MagicMock(spec=VllmFp8MoEMethodTPU)
         # MagicMock does not inherit the class attribute's False value.
         method._use_adaptive_fused_moe = False
+        method._serve_copies = False
         method._tpu_activation_str = "silu"
         x = torch.randn(4, 64, dtype=torch.bfloat16)
         router_logits = torch.randn(4, 8, dtype=torch.bfloat16)

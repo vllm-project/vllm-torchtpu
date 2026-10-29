@@ -31,6 +31,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.model_loader import default_loader, runai_streamer_loader
 
 import vllm_torchtpu
+from vllm_torchtpu import envs
 from vllm_torchtpu import expert_placement as ep
 from vllm_torchtpu.model_loader_patches import _should_skip
 
@@ -116,20 +117,97 @@ def test_gs_uri_is_read_with_gcloud(monkeypatch):
 @pytest.mark.parametrize(
     ("case", "match"),
     [
-        ("copies", "must list 2 ranks of 2 experts each"),
         ("listed_twice", "layer 0 is listed twice"),
     ],
 )
 def test_invalid_tables_are_refused(use_table, case, match):
     table = _plain_table()
-    if case == "copies":
-        # Rank 0 also holds a copy of expert 2, rank 1 one of expert 3.
-        table["layers"] = {"0": [[3, 0, 2], [2, 1, 3]]}
-    else:
-        table["layers"]["00"] = table["layers"]["0"]
+    table["layers"]["00"] = table["layers"]["0"]
     use_table(table)
     with pytest.raises(ValueError, match=match):
         ep.placement()
+
+
+def _copies_table():
+    return {
+        "shards": 2,
+        "experts": 4,
+        "layers": {"0": [[3, 0, 2], [2, 1, 0]]},
+        "copy_share": {"0": {"2": 0.5, "0": 0.5}},
+    }
+
+
+def test_copies_table_maps_every_slot(use_table, monkeypatch):
+    use_table(_copies_table())
+    table = ep.placement()
+    assert (table.ranks, table.owned, table.slots, table.experts) == (2, 2, 3, 4)
+    # Router rows follow the primaries only; each rank maps its copy too.
+    assert ep.virtual_order(table, 0) == [3, 0, 2, 1]
+    assert ep.expert_map(table, 0, 0) == [1, -1, 2, 0]
+    assert ep.expert_map(table, 0, 1) == [2, 1, 0, -1]
+    # Only a layer this worker placed reports its primaries.
+    assert ep.num_primary_experts(TARGET) is None
+    monkeypatch.setattr(ep, "_LOCAL_IDS", {0: frozenset(table.cores[0][0])})
+    monkeypatch.setattr(ep, "_ROUTED", set())
+    out = ep.permute_router_rows("model.layers.0.mlp.gate.weight", torch.arange(4.0))
+    assert out.tolist() == [3.0, 0.0, 2.0, 1.0]
+    assert ep.num_primary_experts(TARGET) == 2
+    assert ep.num_primary_experts(DRAFT) is None
+    assert ep.num_primary_experts("model.layers.1.mlp.experts") is None
+    use_table(_plain_table())
+    assert ep.num_primary_experts(TARGET) is None
+
+
+@pytest.mark.parametrize(
+    ("case", "match"),
+    [
+        ("duplicate_primary", "exactly once among the primaries"),
+        ("invalid_copy", "invalid copy id"),
+        ("duplicate_copy", "more than one copy slot"),
+        ("own_copy", "on the rank that owns the expert"),
+        ("uneven", "must list 2 ranks of 3 experts each"),
+        ("no_share", "layer 0 has copy slots but no copy_share"),
+        ("share_layer", r"copy_share lists layers \[5\]"),
+        ("share_experts", "copy_share must list exactly its copied experts"),
+        ("share_range", r"is 1.5, outside \[0, 1\]"),
+        ("min_tokens", "copy_min_tokens must be a non-negative integer"),
+    ],
+)
+def test_invalid_copies_tables_are_refused(use_table, case, match):
+    table = _copies_table()
+    layer = table["layers"]["0"]
+    if case == "duplicate_primary":
+        layer[0] = [3, 3, 2]
+    elif case == "invalid_copy":
+        layer[0][-1] = 4
+    elif case == "duplicate_copy":
+        layer[1][-1] = 2
+    elif case == "own_copy":
+        layer[0][-1] = 3
+    elif case == "uneven":
+        layer[1].append(3)
+    elif case == "no_share":
+        del table["copy_share"]
+    elif case == "share_layer":
+        table["copy_share"]["5"] = {"2": 0.5}
+    elif case == "share_experts":
+        table["copy_share"]["0"] = {"2": 0.5}
+    elif case == "share_range":
+        table["copy_share"]["0"] = {"2": 0.5, "0": 1.5}
+    else:
+        table["copy_min_tokens"] = True
+    use_table(table)
+    with pytest.raises(ValueError, match=match):
+        ep.placement()
+
+
+def test_copies_table_warns_when_a_kernel_would_decline_it(
+    use_table, monkeypatch, eplb_lines
+):
+    monkeypatch.setattr(envs, "USE_MOE_TP_DECODE_KERNEL", True, raising=False)
+    use_table(_copies_table())
+    ep.placement()
+    assert "layers with copies run on the grouped-matmul path" in eplb_lines[-1]
 
 
 class _Experts(torch.nn.Module):
@@ -181,6 +259,9 @@ def installed(monkeypatch):
         RoutedExperts, "update_expert_map_info", RoutedExperts.update_expert_map_info
     )
     monkeypatch.setattr(
+        RoutedExperts, "_get_quant_method", RoutedExperts._get_quant_method
+    )
+    monkeypatch.setattr(
         RoutedExperts, "_tpu_expert_placement_patch", False, raising=False
     )
     loader = default_loader.DefaultModelLoader
@@ -224,6 +305,153 @@ def test_target_is_placed_and_the_mtp_draft_stays_linear(use_table, installed):
     )
     assert target_rows.tolist() == [float(e) for e in ep.virtual_order(table, 0)]
     assert ep.permute_router_rows("mtp.layers.0.mlp.gate.weight", rows) is rows
+
+
+def test_fp8_weight_loader_fills_the_copy_slot(use_table, installed, monkeypatch):
+    """vLLM's RoutedExperts.weight_loader, with the FP8 MoE method's
+    block-scaled parameters, loads a copied expert into its copy slot on the
+    copy rank: the weights and both block scales of slot `owned`."""
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.fused_moe.config import (
+        FusedMoEConfig,
+        FusedMoEParallelConfig,
+        MoEActivation,
+        RoutingMethodType,
+    )
+
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+        VllmFp8Config,
+        VllmFp8MoEMethodTPU,
+    )
+
+    use_table(_copies_table())
+    installed()
+    config = SimpleNamespace(
+        load_config=SimpleNamespace(load_format="auto"),
+        parallel_config=SimpleNamespace(
+            enable_expert_parallel=True, expert_placement_strategy="linear"
+        ),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(expert_dtype="fp8")),
+    )
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.fp8."
+        "get_tensor_model_parallel_world_size",
+        lambda: 1,
+    )
+    hidden, inter, rank = 256, 256, 1
+    parallel = FusedMoEParallelConfig(
+        tp_size=1,
+        pcp_size=1,
+        dp_size=1,
+        ep_size=2,
+        tp_rank=0,
+        pcp_rank=0,
+        dp_rank=0,
+        ep_rank=rank,
+        sp_size=1,
+        use_ep=True,
+        all2all_backend="allgather_reducescatter",
+        enable_eplb=False,
+    )
+    manager = expert_map_manager.ExpertMapManager(
+        max_num_batched_tokens=16,
+        top_k=2,
+        global_num_experts=4,
+        num_redundant_experts=0,
+        num_expert_group=None,
+        moe_parallel_config=parallel,
+        placement_strategy="linear",
+        enable_eplb=False,
+    )
+    moe_config = FusedMoEConfig(
+        num_experts=4,
+        experts_per_token=2,
+        hidden_dim=hidden,
+        intermediate_size=inter,
+        num_local_experts=manager.local_num_experts,
+        num_logical_experts=4,
+        activation=MoEActivation.SILU,
+        device=torch.device("cpu"),
+        routing_method=RoutingMethodType.Renormalize,
+        moe_parallel_config=parallel,
+        in_dtype=torch.bfloat16,
+    )
+    quant = VllmFp8Config(
+        is_checkpoint_fp8_serialized=True,
+        activation_scheme="dynamic",
+        weight_block_size=[128, 128],
+    )
+    quant.vllm_config = config
+    with set_current_vllm_config(config):
+        layer = RoutedExperts(
+            layer_name=TARGET,
+            params_dtype=torch.bfloat16,
+            moe_config=moe_config,
+            quant_config=quant,
+            expert_map_manager=manager,
+        )
+    assert isinstance(layer.quant_method, VllmFp8MoEMethodTPU)
+    slots = 3
+    assert layer.w13_weight.shape == (slots, 2 * inter, hidden)
+    assert layer.w13_weight_scale_inv.shape == (slots, 2 * inter // 128, 2)
+    params = {
+        "w13": (layer.w13_weight, layer.w13_weight_scale_inv),
+        "w2": (layer.w2_weight, layer.w2_weight_scale_inv),
+    }
+    for weight, scale in params.values():
+        weight.data.fill_(7.0)
+        scale.data.fill_(-1.0)
+    gen = torch.Generator().manual_seed(0)
+    data = {
+        "w1": torch.full((inter, hidden), 2.0).to(torch.float8_e4m3fn),
+        "w3": torch.full((inter, hidden), 3.0).to(torch.float8_e4m3fn),
+        "w2": torch.full((hidden, inter), 4.0).to(torch.float8_e4m3fn),
+    }
+    scales = {sid: torch.rand(2, 2, generator=gen) + 0.5 for sid in data}
+    expert = 0  # copied to rank 1's slot 2; owned by rank 0
+    for sid in ("w1", "w3", "w2"):
+        weight, scale = params["w2" if sid == "w2" else "w13"]
+        layer.weight_loader(weight, data[sid], f"{sid}.weight", sid, expert)
+        layer.weight_loader(scale, scales[sid], f"{sid}.weight_scale_inv", sid, expert)
+
+    w13, s13 = (t.data.float() for t in params["w13"])
+    w2, s2 = (t.data.float() for t in params["w2"])
+    primaries = slice(0, 2)
+    # The primaries' slots are untouched.
+    assert torch.all(w13[primaries] == 7.0) and torch.all(w2[primaries] == 7.0)
+    assert torch.all(s13[primaries] == -1.0) and torch.all(s2[primaries] == -1.0)
+    owned = 2
+    torch.testing.assert_close(w13[owned, :inter], data["w1"].float())
+    torch.testing.assert_close(w13[owned, inter:], data["w3"].float())
+    torch.testing.assert_close(w2[owned], data["w2"].float())
+    torch.testing.assert_close(s13[owned, :2], scales["w1"])
+    torch.testing.assert_close(s13[owned, 2:], scales["w3"])
+    torch.testing.assert_close(s2[owned], scales["w2"])
+
+
+def test_copies_need_the_fp8_moe_method(use_table, installed, monkeypatch):
+    """RoutedExperts picks its quant method right after the expert map; a
+    placed layer with copy slots must get the FP8 MoE method."""
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
+
+    fp8 = VllmFp8MoEMethodTPU.__new__(VllmFp8MoEMethodTPU)
+    other = SimpleNamespace()
+    picked = []
+    monkeypatch.setattr(RoutedExperts, "_get_quant_method", lambda self, *a: picked[-1])
+    use_table(_copies_table())
+    installed()
+    layer = _Experts(TARGET, rank=0)
+    RoutedExperts.update_expert_map_info(layer)
+    picked.append(fp8)
+    assert RoutedExperts._get_quant_method(layer, TARGET, None, None) is fp8
+    picked.append(other)
+    with pytest.raises(NotImplementedError, match="only the FP8 MoE method"):
+        RoutedExperts._get_quant_method(layer, TARGET, None, None)
+    # The MTP draft is not placed, so any method serves it.
+    draft = _Experts(DRAFT, rank=0)
+    RoutedExperts.update_expert_map_info(draft)
+    assert RoutedExperts._get_quant_method(draft, DRAFT, None, None) is other
 
 
 def test_unsupported_load_format_is_refused_at_construction(
@@ -658,3 +886,61 @@ def test_glm52_table_placing_no_layer_is_refused(
     loader = default_loader.DefaultModelLoader
     with pytest.raises(ValueError, match="placement EMPTY"):
         dict(loader.get_all_weights(None, None, None))
+
+
+def _glm_copies_table(layers, seed=0):
+    """16 ranks x (16 primaries + 1 copy): a random permutation per listed
+    layer, and rank r copies the first primary of rank r + 1."""
+    table = _glm_table(layers, seed)
+    table["copy_share"] = {}
+    for key, cores in table["layers"].items():
+        copied = [cores[(r + 1) % GLM_RANKS][0] for r in range(GLM_RANKS)]
+        table["layers"][key] = [c + [copied[r]] for r, c in enumerate(cores)]
+        table["copy_share"][key] = {str(e): 0.5 for e in copied}
+    return table
+
+
+def test_glm52_copies_load_every_slot_on_16_ranks(
+    use_table, installed, worker, monkeypatch, eplb_lines
+):
+    """Each rank builds 17 slots for a placed layer and keeps its 16
+    primaries and its copy; over the ranks every expert is loaded once as a
+    primary and the copied ones once more. The installed line keeps its
+    prefix and names the copy slots."""
+    path = use_table(_glm_copies_table(GLM_PLACED, seed=5))
+    with open(path, "rb") as f:
+        sha16 = hashlib.sha256(f.read()).hexdigest()[:16]
+    _glm_config(monkeypatch)
+    _glm_router_stream(monkeypatch)
+    installed()
+    table = ep.placement()
+    loader = default_loader.DefaultModelLoader
+    held = {layer: [0] * GLM_EXPERTS for layer in GLM_PLACED}
+    for rank in range(GLM_RANKS):
+        worker()
+        built = _build_glm_worker(rank)
+        linear = set(range(GLM_OWNED * rank, GLM_OWNED * (rank + 1)))
+        for layer in GLM_PLACED:
+            experts = built[layer]
+            assert experts.local_num_experts == GLM_OWNED + 1
+            assert experts.moe_config.num_local_experts == GLM_OWNED + 1
+            assert ep.num_primary_experts(experts.layer_name) == GLM_OWNED
+            local = experts._expert_map.tolist()
+            assert [local[e] for e in table.cores[layer][rank]] == list(
+                range(GLM_OWNED + 1)
+            )
+            for e in range(GLM_EXPERTS):
+                name = GLM_CKPT.format(layer, e, "gate_proj", "weight")
+                held[layer][e] += not _should_skip(name, linear)
+        for layer in (GLM_UNPLACED, GLM_MTP):
+            assert built[layer].local_num_experts == GLM_OWNED
+            assert ep.num_primary_experts(built[layer].layer_name) is None
+        dict(loader.get_all_weights(None, None, None))
+    for layer in GLM_PLACED:
+        copied = {c[GLM_OWNED] for c in table.cores[layer]}
+        assert held[layer] == [2 if e in copied else 1 for e in range(GLM_EXPERTS)]
+    assert [m for m in eplb_lines if m.startswith("[eplb]")] == [
+        f"[eplb] placement installed ep_rank={r} layers={len(GLM_PLACED)} "
+        f"table_sha256={sha16} copies=1"
+        for r in range(GLM_RANKS)
+    ]

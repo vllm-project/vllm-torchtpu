@@ -537,6 +537,10 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool, float] | None:
         or (shared_gate_weight is not None and shared_gate_weight.numel() != h)
     ):
         return None
+    # The kernel owns experts start .. start + e - 1 by id: one equal block per
+    # rank, so a layer with TPU_EXPERT_PLACEMENT copy slots stays on GMM.
+    if expert_parallel and e * par.ep_size != layer.global_num_experts:
+        return None
     return shared, expert_parallel, routed_scale
 
 

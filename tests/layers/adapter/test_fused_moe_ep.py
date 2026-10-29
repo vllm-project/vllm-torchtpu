@@ -334,6 +334,17 @@ def test_refused_when_the_expert_blocks_are_not_equal():
     assert _prebuild(_layer(global_num_experts=4 * _STUB_EP)) == "op"
 
 
+def test_a_layer_with_expert_copies_stays_on_gmm(monkeypatch):
+    """A TPU_EXPERT_PLACEMENT copy slot (5 weight slots for 4 experts per
+    shard) breaks the equal expert blocks: the kernel declines and logs it."""
+    logged = []
+    monkeypatch.setattr(
+        bridge.logger, "warning_once", lambda fmt, *args: logged.append(fmt % args)
+    )
+    assert _prebuild(_layer(experts=5, global_num_experts=4 * _STUB_EP)) is None
+    assert "one equal contiguous expert block per shard" in logged[-1]
+
+
 def test_refused_on_a_non_silu_activation():
     assert _prebuild(_layer(), activation="gelu") is None
 

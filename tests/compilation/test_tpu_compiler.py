@@ -73,6 +73,38 @@ class TestTpuCompilerCache:
 
         assert disabled != enabled
 
+    def test_tpu_hash_covers_the_expert_placement_contents(self, tmp_path):
+        """Two tables at one path must not share compiled executables: copy
+        slots change the expert weights' shapes."""
+        import json
+
+        from vllm_torchtpu import expert_placement
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+
+        plain = {"shards": 2, "experts": 4, "layers": {"0": [[3, 0], [2, 1]]}}
+        copies = {
+            **plain,
+            "layers": {"0": [[3, 0, 2], [2, 1, 0]]},
+            "copy_share": {"0": {"2": 0.5, "0": 0.5}},
+        }
+        path = tmp_path / "placement.json"
+        keys = []
+        with (
+            patch(
+                "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+                return_value=[],
+            ),
+            patch.dict(os.environ, {"TPU_EXPERT_PLACEMENT": str(path)}),
+        ):
+            for table in (plain, copies, plain):
+                path.write_text(json.dumps(table))
+                expert_placement._load.cache_clear()
+                keys.append(compute_tpu_compilation_hash(self._config()))
+        expert_placement._load.cache_clear()
+
+        assert keys[0] != keys[1]
+        assert keys[0] == keys[2]
+
     def test_tpu_hash_ignores_the_phased_profiler_switch(self):
         """Selecting a profiler must not bust the compile cache: otherwise a
         profiled run recompiles everything, and so does the next plain one."""

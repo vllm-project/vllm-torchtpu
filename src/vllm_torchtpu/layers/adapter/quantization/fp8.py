@@ -797,6 +797,8 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
 
     _use_adaptive_fused_moe: bool = False
     _adaptive_fused_moe_op: torch.library.CustomOpDef | None = None
+    # Whether GLM-5.2's copy routing sends traffic to TPU_EXPERT_PLACEMENT copies.
+    _serve_copies: bool = False
 
     def __init__(self, quant_config: Fp8Config, moe_config):
         FusedMoEMethodBase.__init__(self, moe_config)
@@ -1092,6 +1094,13 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 activation=activation_str,
             )
             return
+        if envs.TPU_EXPERT_PLACEMENT:
+            from vllm_torchtpu.models.vllm import glm_moe_dsa_patch
+
+            # A layer the table gives copy slots: GLM-5.2's copy routing sends a
+            # share of the copied experts' pairs to the copies, so the routed
+            # slot ids span every slot.
+            self._serve_copies = glm_moe_dsa_patch.install_copy_routing(layer)
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
@@ -1198,6 +1207,14 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # custom_routing_function -> select_experts); shared across all TPU MoE
         # methods so the routing-simulation hook lives in exactly one place.
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+        experts_start = layer._experts_start
+        if self._serve_copies:
+            from vllm_torchtpu.models.vllm import glm_moe_dsa_patch
+
+            # Router-row ids become slot ids (rank * slots + slot), each pair
+            # on its primary or its copy; the rank's slots start the interval.
+            topk_ids = glm_moe_dsa_patch.route_to_copies(layer, topk_ids)
+            experts_start = layer._copy_slots_start
 
         # Either reason to take the collectives from vLLM leaves the routing
         # tensors local here, still holding this rank's own tokens. (The third
@@ -1225,7 +1242,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             "w2_bias": getattr(layer, "w2_bias", None),
             "topk_weights": topk_weights,
             "topk_ids": topk_ids,
-            "experts_start": layer._experts_start,
+            "experts_start": experts_start,
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
         }
