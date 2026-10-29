@@ -610,11 +610,17 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         return compressor_jax_op
 
     def _pair_op(self, indexer_compressor: "VllmDeepseekCompressor"):
-        """The op of `forward_with_indexer`, built on first use like
-        `compressor_op`, once its state block sizes are final."""
-        op = self.__dict__.get("_pair_op_instance")
-        if op is not None:
-            return op
+        """The op of `forward_with_indexer`. The runner prebuilds it through
+        the attention layer's `compressor_pair_op`, once before KV cache init
+        and again after it, so it is cached per state block sizes: the first
+        build bakes in the base class's sizes, not this host's."""
+        block_sizes = (
+            self.state_cache.block_size,
+            indexer_compressor.state_cache.block_size,
+        )
+        cached = self.__dict__.get("_pair_op_instance")
+        if cached is not None and cached[0] == block_sizes:
+            return cached[1]
         wrapped_fn = functools.partial(
             _compressor_jax_csa_indexer,
             state_block_size=self.state_cache.block_size,
@@ -678,7 +684,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
 
             op.register_fake(_fake_pair)
             _compressor_op_cache[op_name] = op
-        object.__setattr__(self, "_pair_op_instance", op)
+        object.__setattr__(self, "_pair_op_instance", (block_sizes, op))
         return op
 
     @staticmethod

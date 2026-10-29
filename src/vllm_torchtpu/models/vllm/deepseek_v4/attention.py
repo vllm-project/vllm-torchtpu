@@ -524,6 +524,16 @@ class VllmDeepseekV4MLAAttention(
         object.__setattr__(self, "_kv_rope_op_instance", op)
         return op
 
+    @property
+    def compressor_pair_op(self):
+        """The op of `forward_with_indexer`, or None on a layer without both
+        compressors. The runner builds it before tracing: building an op is
+        not traceable."""
+        compressor = getattr(self.mla_attn, "compressor", None)
+        if compressor is None or self.indexer is None:
+            return None
+        return compressor._pair_op(self.indexer.compressor)
+
     def qnorm_rope(
         self,
         q: torch.Tensor,
