@@ -26,7 +26,7 @@ from . import (
     profiles,
     spec,
 )
-from .comm import AllReduceRing
+from .comm import AllReduceHandle, AllReduceRing, spmd_safe_axis_index
 from .errors import MegakernelConfigError, MegakernelLayoutError
 from .exec_spec import DebugOptions, ExecSpec, Tiles, default_tiles
 from .ops import rup
@@ -55,6 +55,7 @@ from .spec import (
 
 __all__ = [
     "REQUIRED",
+    "AllReduceHandle",
     "AllReduceRing",
     "DebugOptions",
     "ExecSpec",
@@ -93,4 +94,5 @@ __all__ = [
     "profiles",
     "rup",
     "spec",
+    "spmd_safe_axis_index",
 ]

@@ -170,8 +170,8 @@ class AllReduceRing:
         for d in descs:
             d.wait_recv()
 
-    def allreduce(self, slot, x, first):
-        """Reduce-sum `x [MB, H]` f32 partial across all `R` ranks on `slot`."""
+    def pack_slot(self, slot, x, first):
+        """Pack `x [MB, H]` f32 partial into `slot` scratch and return `val`."""
         self._used_slots.update((slot,) if isinstance(slot, int) else (0, 1))
         cp, scr, me, sc = self.cp, self.scr, self.me, self.sc
         WAR, MR, B, HPC, PR, PC = cp.WAR, cp.MR, cp.B, cp.HPC, cp.PR, cp.PC
@@ -216,8 +216,17 @@ class AllReduceRing:
             else:
                 send[slot] = val.astype(BF16)
                 recv[slot, me] = send[slot]
+        return val
+
+    def allreduce(self, slot, x, first):
+        """Reduce-sum `x [MB, H]` f32 partial across all `R` ranks on `slot`."""
+        val = self.pack_slot(slot, x, first)
         if not self.comm:
             return rnd(val)
+        cp, scr, me, sc = self.cp, self.scr, self.me, self.sc
+        HIER, RSAG, R = cp.HIER, cp.RSAG, cp.R
+        send, recv = scr["send"], scr["recv"]
+        c_idx = lax.rem(me, 2)
         with sc("ar_comm"):
             self.ar_round(slot, 0)
         if HIER == 4:
