@@ -1588,7 +1588,7 @@ def test_bind_caches_adopts_an_fp32_conv_framework_pool(
         geom=g,
         base_exec=ex_base,
         buckets=(2,),
-        verify_buckets=(),
+        verify_buckets=(4,),
         fused_pool_io=fused,
         pool_gather=gather,
     )
@@ -1604,6 +1604,25 @@ def test_bind_caches_adopts_an_fp32_conv_framework_pool(
     assert not driver.spec.cache_backend.supports_fused_io
     assert not driver.fused_pool_io
     assert driver.pool_gather is False and driver.profile.pool_gather is False
+    from vllm_torchtpu.megakernel import runtime as _rt
+
+    # Every bucket, the T=4 verify bucket included, is planned on the split
+    # pool I/O path: neither fused pool I/O nor in-kernel gather (GPR).
+    planned = {
+        (T, b): _rt.bucket_exec_spec(
+            driver.spec,
+            driver.base_exec,
+            driver.profile,
+            bucket_t=b,
+            tokens_per_seq=T,
+            fused_pool_io=driver.fused_pool_io,
+            fused_pool_io_max_b=driver.fused_pool_io_max_b,
+            fused_pool_io_min_b_hi=driver.fused_pool_io_min_b_hi,
+        )[1:]
+        for T, b in driver.bucket_policy.iter_buckets()
+    }
+    assert (4, 4) in planned
+    assert all(not fused and not gpr for fused, gpr in planned.values()), planned
     assert lay == dataclasses.replace(
         qwen35.qwen35_spec(g).cache_backend.layout, conv_dtype=jnp.float32
     )
