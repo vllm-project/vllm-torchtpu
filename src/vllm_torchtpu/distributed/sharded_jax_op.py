@@ -28,7 +28,8 @@ instead of forking the method, this derives it from the installed one and
 changes the single line that builds the output placeholders. If upstream
 reworks that line the derivation no-ops and the caller falls back to stock,
 which is wrong only in the way described above and fails loudly on a shape
-mismatch rather than silently.
+mismatch rather than silently. A torch_tpu whose ``JaxCallable`` takes
+``output_partition_specs`` sizes the placeholders itself, and is used as is.
 """
 
 import inspect
@@ -132,6 +133,14 @@ def _build_sharded_callable_cls():
 _SHARDED_CALLABLE_CLS = None
 
 
+def _stock_sizes_sharded_outputs() -> bool:
+    """Whether the installed ``JaxCallable`` takes ``output_partition_specs``
+    and sizes each output placeholder from it, making the derivation in
+    `_build_sharded_callable_cls` unnecessary."""
+    params = inspect.signature(pallas_impl.JaxCallable.__init__).parameters
+    return "output_partition_specs" in params
+
+
 def sharded_jax_op(
     name: str,
     fn: Callable[..., object],
@@ -157,7 +166,11 @@ def sharded_jax_op(
     """
     global _SHARDED_CALLABLE_CLS
     if _SHARDED_CALLABLE_CLS is None:
-        _SHARDED_CALLABLE_CLS = _build_sharded_callable_cls()
+        _SHARDED_CALLABLE_CLS = (
+            pallas_impl.JaxCallable
+            if _stock_sizes_sharded_outputs()
+            else _build_sharded_callable_cls()
+        )
     if "::" not in name or len(name.split("::")) != 2:
         raise ValueError(f"Op name {name} must be 'namespace::op', with one '::'.")
 
@@ -191,6 +204,18 @@ def sharded_jax_op(
             "output_partition_specs": str(output_partition_specs),
         },
     )
+    # One spec per output leaf: the stock normalizer only recognizes a lone
+    # spec when it is a tuple, which PartitionSpec no longer is.
+    output_specs_kwarg = (
+        {
+            "output_partition_specs": jax.tree.leaves(
+                output_partition_specs,
+                is_leaf=lambda s: isinstance(s, PartitionSpec),
+            )
+        }
+        if _stock_sizes_sharded_outputs()
+        else {}
+    )
     wrapped_fn = _SHARDED_CALLABLE_CLS(
         name=name,
         jit_fn=jit_fn,
@@ -199,6 +224,7 @@ def sharded_jax_op(
         input_partition_specs=input_partition_specs,
         static_argnums=static_argnums,
         donate_argnums=donate_argnums,
+        **output_specs_kwarg,
     )
 
     op = torch.library.custom_op(name, wrapped_fn, mutates_args=())
