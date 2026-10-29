@@ -233,7 +233,7 @@ def place_rope_words(kv_slots, words, rope_lane):
     Token ``j`` of a row owns words ``[32 j, 32 j + 32)`` (see
     `csa_cache_layout`), and word 0 of `words` (`rope_words_tiled`) is at lane
     `rope_lane`. The rotations do not depend on which row is being written,
-    so they are done once per tile, ahead of `merge_rope_row`.
+    so they are done once per tile, ahead of `merge_rope_rows`.
     """
     per_row = csa_cache_layout.ROPE_TOKENS_PER_ROW
     width = csa_cache_layout.ROPE_WORDS
@@ -249,21 +249,25 @@ def place_rope_words(kv_slots, words, rope_lane):
     return placed
 
 
-def merge_rope_row(
-    row,  # (1, 128) int32, the RoPE row as read from HBM
+def merge_rope_rows(
+    rows,  # (tile_n, 128) int32, each token's RoPE row as read from HBM
     placed,  # place_rope_words(...)
-    n,  # int, the token whose row this is
 ):
-    """Writes every tile token whose RoPE lands in token n's row into it."""
+    """Writes every tile token's RoPE words into each row that holds it.
+
+    Row n gets the words of every token whose row key equals token n's, in
+    token order. All rows are merged at once, so only the rows of row-writer
+    tokens are meaningful; the others are never written back.
+    """
     width = csa_cache_layout.ROPE_WORDS
-    window = jax.lax.broadcasted_iota(jnp.int32, row.shape, 1) >> (
+    window = jax.lax.broadcasted_iota(jnp.int32, (1, rows.shape[-1]), 1) >> (
         width.bit_length() - 1
     )
-    curr_key = placed[n][0]
+    row_keys = jnp.stack([key for key, _, _ in placed])[:, None]  # (tile_n, 1)
     for key, pos, words in placed:
-        hit = (key == curr_key) & (curr_key >= 0)
-        row = jnp.where(hit & (window == pos), words, row)
-    return row
+        hit = (row_keys == key) & (key >= 0) & (window == pos)
+        rows = jnp.where(hit, words, rows)
+    return rows
 
 
 def merge_slot_updates(

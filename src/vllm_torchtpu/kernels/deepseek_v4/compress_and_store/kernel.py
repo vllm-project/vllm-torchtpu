@@ -199,16 +199,11 @@ def inner_kernel(
                 words,
                 rope_lane,
             )
-            for n in range(tile_n):
-                is_first = is_first_mask_rope_ref[global_idx + n]
-
-                @pl.when(is_first)
-                def _merge_rope():
-                    row = pltpu.bitcast(rope_out_vmem[n], jnp.int32)  # (1, 128)
-                    rope_out_vmem[n] = pltpu.bitcast(
-                        compute.merge_rope_row(row, placed, n),
-                        jnp.uint8,
-                    )
+            # Every token's row is merged; only the row writers' rows (those
+            # `is_first_mask_rope` marks) were read and are written back.
+            rows = pltpu.bitcast(rope_out_vmem[...], jnp.int32)  # (tile_n, 1, 128)
+            rows = compute.merge_rope_rows(rows.reshape(tile_n, -1), placed)
+            rope_out_vmem[...] = pltpu.bitcast(rows[:, None, :], jnp.uint8)
 
     else:
         # hca: bitcast bf16 -> uint8 and match the output block shape.
