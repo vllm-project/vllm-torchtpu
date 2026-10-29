@@ -82,6 +82,8 @@ def _spawn_with_cpu_devices(R: int, tag: str) -> None:
 
 def _stage_round_count(cp: comm.CommParams) -> int:
     """Count intermediate BF16 roundings inside one `AllReduceRing.allreduce`."""
+    if cp.HIER == 4:
+        return 2 if cp.N_HOSTS > 1 else 1
     if cp.HIER == 3:
         return cp.N_HIER3 - 1
     if cp.HIER == 2:
@@ -94,12 +96,7 @@ def _stage_round_count(cp: comm.CommParams) -> int:
 def _bf16_2layer_2slot_bound(
     x0_f64: np.ndarray, x1_f64: np.ndarray, n_stage: int
 ) -> float:
-    """Derive worst-case `max_abs` error bound vs `float64` across 4 reductions.
-
-    Each of 4 reductions applies `n_stage` BF16 roundings (`u = 2^-8`) at magnitude
-    at most `step_bound`, and 4 `add_residual` calls round running sums bounded by
-    `1, 2, 3, 4` times `step_bound` (`1 + 2 + 3 + 4 = 10`).
-    """
+    """Derive worst-case `max_abs` error bound vs `float64` across 4 reductions."""
     u_bf16 = 2.0**-8
     step_bound = float(
         max(
@@ -115,6 +112,7 @@ def _execute_2layer_2slot_ring(
     *,
     hier: int,
     rsag: bool,
+    hier_group: int = 8,
     war: int = 1,
     H: int = 1024,
     B: int = 4,
@@ -128,11 +126,13 @@ def _execute_2layer_2slot_ring(
     devs = jax.devices("cpu")
     assert len(devs) >= R, f"Expected >= {R} CPU devices, found {len(devs)}"
 
-    tiles = dataclasses.replace(_TINY_TILES, hier=hier, rsag=rsag, war=war, mb8=2)
+    tiles = dataclasses.replace(
+        _TINY_TILES, hier=hier, hier_group=hier_group, rsag=rsag, war=war, mb8=2
+    )
     ex = ExecSpec(B=B, T=1, R=R, ctx=128, tiles=tiles, interpret=True)
     pc = H // 2 if war == 0 else H
     pr = ex.B * (H // pc)
-    cp = comm.comm_params(ex, tiles, H=H, PR=pr, PC=pc)
+    cp = comm.comm_params(ex, tiles, H=H, PR=pr, PC=pc, n_ar_slots=2)
     scratch = {
         "res": pltpu.VMEM((ex.MB, H), F32),
         **comm.ring_scratch(cp),
@@ -157,7 +157,6 @@ def _execute_2layer_2slot_ring(
             pl.semaphore_wait(barrier, R - 1)
 
         scr["res"][...] = jnp.zeros((ex.MB, H), F32)
-        # 2 layers x 2 alternating slots (`slot = step % 2`, `first = layer == 0`).
         for step_idx in range(4):
             layer = step_idx // 2
             slot = step_idx % 2
@@ -264,6 +263,63 @@ def _check_negative_control_in_process() -> None:
     )
 
 
+def _check_hier4_single_and_two_group_r8_in_process() -> None:
+    _, _, out_rsag, _, _, _ = _execute_2layer_2slot_ring(8, hier=0, rsag=True)
+    _, _, out_h4_1g, _, cp1, scr1 = _execute_2layer_2slot_ring(
+        8, hier=4, rsag=False, hier_group=8
+    )
+    assert cp1.HIER == 4 and cp1.HIER_GROUP == 8 and cp1.N_HOSTS == 1
+    assert "ih_recv" not in scr1 and "s2_send" not in scr1
+    assert np.array_equal(out_h4_1g, out_rsag)
+
+    for seed in (0, 17, 42):
+        for b_cnt in (1, 3, 5):
+            for war, H in ((1, 1024), (0, 2048)):
+                x0_f64, x1_f64, out_h4_2g, _, cp2, scr2 = _execute_2layer_2slot_ring(
+                    8,
+                    hier=4,
+                    rsag=False,
+                    hier_group=4,
+                    war=war,
+                    H=H,
+                    B=b_cnt,
+                    seed=seed,
+                    heavy_tail=True,
+                )
+                assert cp2.HIER == 4 and cp2.HIER_GROUP == 4 and cp2.N_HOSTS == 2
+                assert "ih_recv" in scr2 and "s2_send" in scr2
+                host_sum = 2.0 * (np.sum(x0_f64, axis=0) + np.sum(x1_f64, axis=0))
+                bound = _bf16_2layer_2slot_bound(
+                    x0_f64, x1_f64, _stage_round_count(cp2)
+                )
+                for r in range(1, 8):
+                    assert np.array_equal(out_h4_2g[r], out_h4_2g[0])
+                assert float(np.max(np.abs(out_h4_2g[0] - host_sum))) <= bound
+
+
+def _check_hier4_r16_and_r32_in_process() -> None:
+    for R_val, expected_hosts in ((16, 2), (32, 4)):
+        for b_cnt in (3, 5):
+            x0_f64, x1_f64, out_all, _, cp, scr = _execute_2layer_2slot_ring(
+                R_val,
+                hier=4,
+                rsag=False,
+                hier_group=8,
+                B=b_cnt,
+                seed=17,
+                heavy_tail=True,
+            )
+            assert cp.HIER == 4 and cp.HIER_GROUP == 8 and expected_hosts == cp.N_HOSTS
+            assert "ih_recv" in scr and "s2_send" in scr
+            host_sum = 2.0 * (np.sum(x0_f64, axis=0) + np.sum(x1_f64, axis=0))
+            host0_only = 2.0 * (np.sum(x0_f64[:8], axis=0) + np.sum(x1_f64[:8], axis=0))
+            bound = _bf16_2layer_2slot_bound(x0_f64, x1_f64, _stage_round_count(cp))
+            for r in range(1, R_val):
+                assert np.array_equal(out_all[r], out_all[0])
+            assert float(np.max(np.abs(out_all[0] - host_sum))) <= bound
+            assert float(np.max(np.abs(out_all[0] - host0_only))) > bound
+
+
 def test_allreduce_ring_modes_vs_float64_host_sum():
     """Verify flat, RS+AG, and hier 1/2/3 at R=8 against `numpy.float64` host sum."""
     if len(jax.devices("cpu")) < 8:
@@ -278,6 +334,63 @@ def test_allreduce_ring_wrong_peer_offset_negative_control():
         _spawn_with_cpu_devices(8, "neg_ctrl")
         return
     _check_negative_control_in_process()
+
+
+def test_allreduce_ring_hier4_single_and_two_group_r8():
+    """Verify 1-group bitwise match vs `rsag` and 2-group `hier=4` at R=8."""
+    if len(jax.devices("cpu")) < 8:
+        _spawn_with_cpu_devices(8, "hier4_r8")
+        return
+    _check_hier4_single_and_two_group_r8_in_process()
+
+
+def test_allreduce_ring_hier4_multihost_r16_and_r32():
+    """Verify two-level `hier=4` at `R=16` (2 groups) and `R=32` (4 groups)."""
+    _spawn_with_cpu_devices(32, "hier4_r16_r32")
+
+
+@pytest.mark.parametrize(
+    "R,bad_group,H", [(8, 3, 3072), (8, 16, 2048), (8, 1, 2048), (24, 8, 1024)]
+)
+def test_allreduce_ring_hier4_rejects_bad_hier_group(R: int, bad_group: int, H: int):
+    """Verify `comm_params` rejects invalid `hier_group` values for `hier=4`."""
+    tiles = dataclasses.replace(_TINY_TILES, hier=4, hier_group=bad_group, war=1, mb8=2)
+    ex = ExecSpec(B=4, T=1, R=R, ctx=128, tiles=tiles, interpret=True)
+    with pytest.raises(MegakernelConfigError, match="unsupported all-reduce mode"):
+        comm.comm_params(ex, tiles, H=H, PR=ex.B, PC=H, n_ar_slots=2)
+
+    tiles_cw = dataclasses.replace(_TINY_TILES, hier=4, hier_group=8, war=1, mb8=2)
+    ex_cw = ExecSpec(B=4, T=1, R=8, ctx=128, tiles=tiles_cw, interpret=True)
+    with pytest.raises(MegakernelConfigError, match="multiple of 128"):
+        comm.comm_params(ex_cw, tiles_cw, H=512, PR=4, PC=512, n_ar_slots=2)
+    tiles_bad_hier = dataclasses.replace(
+        _TINY_TILES, hier=9, hier_group=8, war=1, mb8=2
+    )
+    ex_bad_hier = ExecSpec(B=4, T=1, R=8, ctx=128, tiles=tiles_bad_hier, interpret=True)
+    with pytest.raises(MegakernelConfigError, match="unsupported all-reduce mode"):
+        comm.comm_params(
+            ex_bad_hier, tiles_bad_hier, H=1024, PR=4, PC=1024, n_ar_slots=2
+        )
+
+
+def test_allreduce_ring_hier4_rejects_single_allreduce_slot():
+    """Verify `hier=4` rejects 1 all-reduce slot for both 1-host and 2-host meshes."""
+    for hg in (4, 8):
+        tiles_hg = dataclasses.replace(_TINY_TILES, hier=4, hier_group=hg, war=1, mb8=2)
+        ex_hg = ExecSpec(B=4, T=1, R=8, ctx=128, tiles=tiles_hg, interpret=True)
+        with pytest.raises(
+            MegakernelConfigError, match="hier=4 needs 2 all-reduce slots"
+        ):
+            comm.comm_params(ex_hg, tiles_hg, H=2048, PR=4, PC=2048, n_ar_slots=1)
+    tiles = dataclasses.replace(_TINY_TILES, hier=4, hier_group=4, war=1, mb8=2)
+    ex = ExecSpec(B=4, T=1, R=8, ctx=128, tiles=tiles, interpret=True)
+
+    cp_ok = comm.comm_params(ex, tiles, H=2048, PR=4, PC=2048, n_ar_slots=2)
+    assert cp_ok.N_HOSTS == 2
+
+    tiles_h0 = dataclasses.replace(_TINY_TILES, hier=0, hier_group=1, war=1, mb8=2)
+    ex_h0 = ExecSpec(B=4, T=1, R=8, ctx=128, tiles=tiles_h0, interpret=True)
+    comm.comm_params(ex_h0, tiles_h0, H=2048, PR=4, PC=2048, n_ar_slots=1)
 
 
 def test_comm_module_import_preserves_host_xla_flags():
@@ -313,7 +426,12 @@ def test_comm_params_invalid_raises_config_error() -> None:
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
-        if sys.argv[1] == "r8_modes":
+        tag = sys.argv[1]
+        if tag == "r8_modes":
             _check_r8_modes_in_process()
-        elif sys.argv[1] == "neg_ctrl":
+        elif tag == "neg_ctrl":
             _check_negative_control_in_process()
+        elif tag == "hier4_r8":
+            _check_hier4_single_and_two_group_r8_in_process()
+        elif tag == "hier4_r16_r32":
+            _check_hier4_r16_and_r32_in_process()
