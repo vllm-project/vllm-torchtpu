@@ -639,10 +639,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_DECODE_POOL_PAGE_TABLE": env_bool(
         "VLLM_TPU_QSA_DECODE_POOL_PAGE_TABLE", default=False
     ),
-    # Qwen4-exp HC (unfused path): compute the down projection and the
-    # injection logits in one matmul over a folded weight, and the norm's
-    # (1 + w) once in FP32 at load. Same per-column products; costs one extra
-    # copy of each HC's down + inject weights in HBM.
+    # Qwen4-exp HC: compute the down projection and the injection logits in
+    # one matmul over a folded [down; inject] weight, which every path reads.
+    # Same per-column products; costs one extra copy of each HC's down +
+    # inject weights in HBM.
     "VLLM_TPU_HC_FOLD_INJECT": env_bool("VLLM_TPU_HC_FOLD_INJECT", default=False),
     # With the pool-page table: when the decode KV block holds whole pool
     # pages (VLLM_TPU_QSA_DECODE_KV_BLOCK a multiple of 13 kernel pages x 32

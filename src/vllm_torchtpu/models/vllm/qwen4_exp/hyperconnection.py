@@ -112,18 +112,14 @@ class GatedResidual(common_hc.GatedResidual):
 
     def prepare_decode_weights(self):
         """After weight loading. VLLM_TPU_HC_FOLD_INJECT: one [low_rank + hc,
-        hc * hidden] weight so the unfused mix computes the down projection and
-        the injection logits in one matmul (the same per-column products);
-        and the norm's (1 + w) once in FP32 instead of on every call. Costs
-        one extra copy of the down and inject weights in HBM."""
+        hc * hidden] weight (down rows, then inject rows) so the unfused mix
+        computes the down projection and the injection logits in one matmul
+        (the same per-column products). Every path reads the down and inject
+        weights from it, so all token buckets keep the same graph inputs in the
+        same order (the shape-variant hand-over requires it). Costs one extra
+        copy of the down and inject weights in HBM."""
         if not envs.VLLM_TPU_HC_FOLD_INJECT:
             return
-        if self.config.hc_per_branch_norm:
-            self.register_buffer(
-                "_norm_scale_f32",
-                (1.0 + self.hc_norm.weight.float()).detach(),
-                persistent=False,
-            )
         if hasattr(self, "input_mix_weight_down") and hasattr(
             self, "block_inject_weight"
         ):
@@ -134,9 +130,17 @@ class GatedResidual(common_hc.GatedResidual):
                 "_down_inject_weight", folded.detach(), persistent=False
             )
 
-    def _norm_scale(self):
-        scale = getattr(self, "_norm_scale_f32", None)
-        return 1.0 + self.hc_norm.weight.float() if scale is None else scale
+    def _down_weight(self):
+        folded = getattr(self, "_down_inject_weight", None)
+        if folded is None:
+            return self.input_mix_weight_down.weight
+        return folded[: self.input_mix_weight_down.weight.shape[0]]
+
+    def _inject_weight(self):
+        folded = getattr(self, "_down_inject_weight", None)
+        if folded is None:
+            return self.block_inject_weight.weight
+        return folded[self.input_mix_weight_down.weight.shape[0] :]
 
     def _normalize(self, hyper_input):
         if not self.config.hc_per_branch_norm:
@@ -163,7 +167,7 @@ class GatedResidual(common_hc.GatedResidual):
                 values * torch.rsqrt(variance + self.hc_norm.variance_epsilon)
             )
         output = torch.cat(normalized, dim=-1)
-        return (output * self._norm_scale()).to(hyper_input.dtype)
+        return (output * (1.0 + self.hc_norm.weight.float())).to(hyper_input.dtype)
 
     def disable_decode_fused(self):
         """Keep the unfused mix at every token count.
@@ -178,11 +182,11 @@ class GatedResidual(common_hc.GatedResidual):
     def _decode_weights(self):
         weights = (
             self.hc_norm.weight,
-            self.input_mix_weight_down.weight,
+            self._down_weight(),
             self.input_mix_weight_up.weight,
         )
         if hasattr(self, "block_inject_weight"):
-            weights += (self.block_inject_weight.weight,)
+            weights += (self._inject_weight(),)
         return weights
 
     def _decode_fused(self, hyper_input) -> bool:
@@ -207,7 +211,7 @@ class GatedResidual(common_hc.GatedResidual):
         """
         if not hasattr(self, "block_inject_weight"):
             return hyper_input, norm
-        injection = F.linear(norm, self.block_inject_weight.weight)
+        injection = F.linear(norm, self._inject_weight())
         return hyper_input, 2.0 * torch.sigmoid(injection.float() / self.hc_count)
 
     def mix(self, hyper_input):
@@ -236,7 +240,7 @@ class GatedResidual(common_hc.GatedResidual):
             mixed, norm = self._prefill_full_op(
                 hyper_input,
                 self.hc_norm.weight,
-                self.input_mix_weight_down.weight,
+                self._down_weight(),
                 self.input_mix_weight_up.weight,
             )
             return mixed, self._residual(hyper_input, norm)
@@ -253,7 +257,7 @@ class GatedResidual(common_hc.GatedResidual):
             gate = both[..., :low_rank] / self.hc_count
         else:
             residual = None
-            gate = F.linear(norm, self.input_mix_weight_down.weight) / self.hc_count
+            gate = F.linear(norm, self._down_weight()) / self.hc_count
         # TorchTPU can lower BF16 SiLU through BF16 logistic/tanh, rounding
         # negative tails to zero. Compute the activation in FP32 and round
         # once, matching NVIDIA hc_silu's BF16 result boundary.
@@ -298,7 +302,7 @@ class GatedResidual(common_hc.GatedResidual):
             # The fused decode mix already produced the injection gate.
             injection = hyper_input_normed
         else:
-            injection = F.linear(hyper_input_normed, self.block_inject_weight.weight)
+            injection = F.linear(hyper_input_normed, self._inject_weight())
             injection = 2.0 * torch.sigmoid(injection.float() / self.hc_count)
         if (
             self._prefill_combine_op is not None

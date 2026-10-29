@@ -262,15 +262,14 @@ def test_hc_tpu_negative_silu_preserves_mix_gate(compiled):
 
 @pytest.mark.parametrize("per_branch", [False, True])
 def test_hc_fold_inject_keeps_mix_and_combine(monkeypatch, per_branch):
-    """VLLM_TPU_HC_FOLD_INJECT: the folded down+inject matmul and the
-    precomputed FP32 norm scale give the unfused mix and combine outputs."""
+    """VLLM_TPU_HC_FOLD_INJECT: the folded down+inject matmul gives the
+    unfused mix and combine outputs."""
     module, flat, block = hc_fixture(per_branch)
     mixed, residual = module.mix(flat)
     expected = (mixed, module.combine(block, residual))
     monkeypatch.setenv("VLLM_TPU_HC_FOLD_INJECT", "1")
     module.prepare_decode_weights()
     assert hasattr(module, "_down_inject_weight")
-    assert hasattr(module, "_norm_scale_f32") == per_branch
     mixed, residual = module.mix(flat)
     torch.testing.assert_close(mixed, expected[0], rtol=0, atol=0)
     combined = module.combine(block, residual)
