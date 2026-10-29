@@ -188,7 +188,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
 )
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
-from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer, _static_shape_args
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     fit_rows,
@@ -430,7 +430,8 @@ def _verify_fused_impl(
     )
 
 
-_verify_fused_compiled = _tpu_compile(_verify_fused_impl)
+# Strip any dynamic-dim marks a caller's tensor carries (see eagle3).
+_verify_fused_compiled = _static_shape_args(_tpu_compile(_verify_fused_impl))
 
 
 def _reset_read_offsets(
