@@ -15,7 +15,6 @@
 
 # shellcheck disable=SC2034  # Variables are sourced by run_benchmarks.sh
 # Configuration for Gemma-4-31B-it MTP Speculative Decoding Benchmark on TPU v7x-8.
-# Matches: https://docs.google.com/spreadsheets/d/1tJDNUZ7DS2eSlyTpoEKgPHa-kY1djbTDLqPWWtDOrR0 (gid=1078954007)
 
 MODEL="google/gemma-4-31B-it"
 SERVED_MODEL_NAME="gemma-4-31b-it"

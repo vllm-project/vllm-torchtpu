@@ -15,7 +15,6 @@
 
 # shellcheck disable=SC2034  # Variables are sourced by run_benchmarks.sh
 # Configuration for Qwen3.5-397B-A17B-FP8 MTP Speculative Decoding Benchmark on TPU v7x-8.
-# Matches: https://docs.google.com/spreadsheets/d/1tJDNUZ7DS2eSlyTpoEKgPHa-kY1djbTDLqPWWtDOrR0 (gid=0)
 
 MODEL="Qwen/Qwen3.5-397B-A17B-FP8"
 TENSOR_PARALLELISM=8

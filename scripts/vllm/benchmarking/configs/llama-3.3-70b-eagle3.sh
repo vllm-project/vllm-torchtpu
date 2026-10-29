@@ -15,7 +15,6 @@
 
 # shellcheck disable=SC2034  # Variables are sourced by run_benchmarks.sh
 # Configuration for Llama-3.3-70B-Instruct Eagle3 Speculative Decoding Benchmark on TPU v7x-8.
-# Matches: https://docs.google.com/spreadsheets/d/1tJDNUZ7DS2eSlyTpoEKgPHa-kY1djbTDLqPWWtDOrR0 (gid=120868918)
 
 MODEL="meta-llama/Llama-3.3-70B-Instruct"
 TENSOR_PARALLELISM=8
