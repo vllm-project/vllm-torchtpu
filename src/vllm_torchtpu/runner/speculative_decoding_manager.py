@@ -48,6 +48,12 @@ class SpecDecodeMetadata:
     # scheduling execute_model re-sources the drafts from the device and
     # uploads this only for a chunk with nothing substituted.
     deferred_draft_token_ids_cpu: np.ndarray | None = None
+    # VLLM_TPU_SPEC_VERIFY_DRAFT_PAD: the draft-side arrays (draft_token_ids,
+    # target_logits_indices, segment_ids, group_indices) are padded to a
+    # draft-row bucket instead of padded_logits_length; the verify uniforms
+    # are still drawn at this many rows (the old width) and sliced, so the
+    # random stream is unchanged. 0 = not padded differently.
+    verify_rng_rows: int = 0
 
     def upload_deferred_draft_token_ids(self, device: torch.device) -> torch.Tensor:
         assert self.deferred_draft_token_ids_cpu is not None
@@ -284,14 +290,14 @@ class SpeculativeDecodingManager:
         if cache_key == self._meta_cache_key:
             assert self._meta_cache is not None
             assert self._meta_cache_np is not None
-            logits_indices, target_logits_indices, padded_logits_length = (
+            logits_indices, target_logits_indices, padded_logits_length, draft_rows = (
                 self._meta_cache_np
             )
             # draft_token_ids depends on this step's input_ids_cpu content —
             # always re-extracted and re-transferred.
             all_token_ids = self.runner.input_ids_cpu.numpy()
             draft_token_ids = all_token_ids[logits_indices[target_logits_indices + 1]]
-            padded_draft_token_ids = np.zeros(padded_logits_length, dtype=np.int32)
+            padded_draft_token_ids = np.zeros(draft_rows, dtype=np.int32)
             padded_draft_token_ids[: draft_token_ids.shape[0]] = draft_token_ids
             return SpecDecodeMetadata(
                 draft_token_ids=(
@@ -311,6 +317,7 @@ class SpeculativeDecodingManager:
                 deferred_draft_token_ids_cpu=(
                     padded_draft_token_ids if defer_draft_token_ids else None
                 ),
+                verify_rng_rows=self._meta_cache.verify_rng_rows,
             )
 
         # [num_reqs]
@@ -366,6 +373,11 @@ class SpeculativeDecodingManager:
 
         padded_logits_indices = np.zeros(padded_logits_length, dtype=np.int32)
         padded_logits_indices[: logits_indices.shape[0]] = logits_indices
+        # Draft-side arrays: padded_logits_length, or a tighter draft-row
+        # bucket under VLLM_TPU_SPEC_VERIFY_DRAFT_PAD.
+        draft_rows = self.runner._verify_draft_rows(
+            target_logits_indices.shape[0], padded_logits_length, padded_num_reqs
+        )
 
         padded_bonus_logits_indices = np.zeros(padded_num_reqs, dtype=np.int32)
         padded_bonus_logits_indices[: bonus_logits_indices.shape[0]] = (
@@ -375,10 +387,10 @@ class SpeculativeDecodingManager:
         padded_num_draft_tokens = np.zeros(padded_num_reqs, dtype=np.int32)
         padded_num_draft_tokens[: num_draft_tokens.shape[0]] = num_draft_tokens
 
-        padded_draft_token_ids = np.zeros(padded_logits_length, dtype=np.int32)
+        padded_draft_token_ids = np.zeros(draft_rows, dtype=np.int32)
         padded_draft_token_ids[: draft_token_ids.shape[0]] = draft_token_ids
 
-        padded_target_logits_indices = np.zeros(padded_logits_length, dtype=np.int32)
+        padded_target_logits_indices = np.zeros(draft_rows, dtype=np.int32)
         padded_target_logits_indices[: target_logits_indices.shape[0]] = (
             target_logits_indices
         )
@@ -393,11 +405,11 @@ class SpeculativeDecodingManager:
         )
 
         padded_segment_ids = np.full(
-            padded_logits_length, num_draft_tokens.shape[0], dtype=np.int64
+            draft_rows, num_draft_tokens.shape[0], dtype=np.int64
         )
         padded_segment_ids[: segment_ids.shape[0]] = segment_ids
 
-        padded_group_indices = np.zeros(padded_logits_length, dtype=np.int32)
+        padded_group_indices = np.zeros(draft_rows, dtype=np.int32)
         padded_group_indices[: group_indices.shape[0]] = group_indices
 
         # CPU -> TPU copy.
@@ -433,6 +445,9 @@ class SpeculativeDecodingManager:
             deferred_draft_token_ids_cpu=(
                 padded_draft_token_ids if defer_draft_token_ids else None
             ),
+            verify_rng_rows=(
+                padded_logits_length if draft_rows != padded_logits_length else 0
+            ),
         )
         # draft_lengths_cpu aliases the caller's array; copy so a later caller
         # mutation can't diverge the cache from its key.
@@ -443,5 +458,6 @@ class SpeculativeDecodingManager:
             logits_indices,
             target_logits_indices,
             padded_logits_length,
+            draft_rows,
         )
         return metadata
