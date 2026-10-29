@@ -210,32 +210,19 @@ def publish_csa2_kv(
     words: jax.Array | tuple[jax.Array, jax.Array],
     scales: jax.Array | tuple[jax.Array, jax.Array],
     records: jax.Array,
-    latent: jax.Array,
-) -> tuple[
-    jax.Array | tuple[jax.Array, jax.Array], jax.Array | tuple[jax.Array, jax.Array]
-]:
-    """Quantize unique current records once and publish words plus scalar scales.
-
-    A pair of banks has concatenated record addressing. Negative records skip
-    both stores. Valid record IDs must be unique and in range. Arrays retain
-    their shared owner's physical row geometry; no full-cache concatenation
-    or intermediate expanded KV is produced.
-    """
-    encoded, encoded_scales = encode_csa2_kv(latent)
-    return publish_csa2_encoded(words, scales, records, encoded, encoded_scales)
-
-
-@functools.partial(jax.jit, donate_argnums=(0, 1))
-def publish_csa2_encoded(
-    words: jax.Array | tuple[jax.Array, jax.Array],
-    scales: jax.Array | tuple[jax.Array, jax.Array],
-    records: jax.Array,
     encoded_words: jax.Array,
     encoded_scales: jax.Array,
 ) -> tuple[
     jax.Array | tuple[jax.Array, jax.Array], jax.Array | tuple[jax.Array, jax.Array]
 ]:
-    """Publish pre-encoded CSA2 words and scales without re-encoding latent rows."""
+    """Publish ``encode_csa2_kv``-format words plus scalar scales per record.
+
+    The fused compressor encodes each new record once, in its kernel. A pair
+    of banks has concatenated record addressing. Negative records skip both
+    stores. Valid record IDs must be unique and in range. Arrays retain their
+    shared owner's physical row geometry; no full-cache concatenation or
+    intermediate expanded KV is produced.
+    """
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
     from jax.experimental.pallas import tpu_sc as plsc
@@ -322,7 +309,7 @@ def publish_csa2_encoded(
             needs_layout_passes=True,
             disable_bounds_checks=True,
         ),
-        name="csa2_publish_encoded_words_scales",
+        name="csa2_publish_words_scales",
     )(
         ids,
         values,

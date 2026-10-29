@@ -146,8 +146,7 @@ def test_matches_dense_chain(tokens, kind):
 def _assert_close_ulps(actual, expected, max_ulps=2, max_fraction=1e-4):
     """The RMSNorm reduction and rsqrt differ between Mosaic and XLA, so a few
     elements land 1-2 BF16 ulps apart before RoPE (TPU census: at most 2 ulp,
-    under 5e-5 of elements; W1 saw the same against the unfused chain). The
-    matmul and the in-kernel RoPE are bitwise (test_modes_agree_with_full_output).
+    under 5e-5 of elements; W1 saw the same against the unfused chain).
     Inputs whose RoPE output cancels to near zero can amplify this further, so
     keep these cases free of that by construction rather than widening the bound."""
     a = np.asarray(actual).view(np.uint16).astype(np.int32)
@@ -161,29 +160,17 @@ def _assert_close_ulps(actual, expected, max_ulps=2, max_fraction=1e-4):
 
 
 @pytest.mark.parametrize("tokens", [288, 2048])
-def test_modes_agree_with_full_output(tokens):
+def test_kv_only_mode_agrees_with_full_output(tokens):
     _requires_tpu()
     args = _inputs(tokens, _positions(tokens, "jumps"))
-    # Modes are compared with the kernel's own full output: same arithmetic,
-    # so bitwise. (Against the dense chain see test_matches_dense_chain.)
-    qr_full, rotated = jax.jit(qa_rope.fused_qa_kv_norm_rope)(*args)
-    qr_kept, pre_rope = jax.jit(
-        functools.partial(qa_rope.fused_qa_kv_norm_rope, rotate_kv=False)
-    )(*args)
+    # Compared with the kernel's own full output: same arithmetic, so
+    # bitwise. (Against the dense chain see test_matches_dense_chain.)
+    _, rotated = jax.jit(qa_rope.fused_qa_kv_norm_rope)(*args)
     _, kv_only = jax.jit(
         functools.partial(qa_rope.fused_qa_kv_norm_rope, emit_qr=False)
     )(*args)
     np.testing.assert_array_equal(
         np.asarray(kv_only, np.float32), np.asarray(rotated, np.float32)
-    )
-    np.testing.assert_array_equal(
-        np.asarray(qr_kept, np.float32), np.asarray(qr_full, np.float32)
-    )
-    # The in-kernel RoPE alone is bitwise against the dense rotation.
-    cos, sin = _split(args[-1])
-    np.testing.assert_array_equal(
-        np.asarray(rotated, np.float32),
-        np.asarray(reference.rotate(pre_rope, cos, sin), np.float32),
     )
 
 

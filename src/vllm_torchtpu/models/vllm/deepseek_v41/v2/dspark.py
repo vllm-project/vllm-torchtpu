@@ -42,7 +42,6 @@ from .attention import (
     _cache_slots,
     _insert,
     _token_requests,
-    _uses_qa_rope,
     stage_attention_cache_scope,
 )
 from .attention_kernels import initialize_indexer, initialize_paged_attention
@@ -89,21 +88,27 @@ def _remap_dspark_name(name: str, *, enable_confidence_head: bool = True) -> str
     return f"model.layers.{stage}.{rest}"
 
 
+def _context_kv(
+    attn: DeepseekV41Attention, x: torch.Tensor, positions: torch.Tensor
+) -> torch.Tensor:
+    """One draft layer's normalized, rotated context KV rows."""
+    if attn._fused_preprocess:
+        # KV only: skips the qr columns, their norm and projection.
+        return attn._qa_kv_norm_rope(x, positions, emit_qr=False)
+    _, _, kv = attn._split_qkv_and_norm(attn._fused_wqa_wkv_gemm(x))
+    return attn._rotate(kv, positions)
+
+
 def _insert_context_kv(
     attn: DeepseekV41Attention,
     kv: torch.Tensor,
     positions: torch.Tensor,
     metadata,
-    *,
-    rotated: bool = False,
 ) -> None:
-    """Rotate (unless ``rotated``) and write normalized context KV rows into
-    one draft layer's SWA cache."""
+    """Write rotated context KV rows into one draft layer's SWA cache."""
     swa_cache = attn.swa_cache_layer.kv_cache
     if metadata is None or not swa_cache.numel():
         return
-    if not rotated:
-        kv = attn._rotate(kv, positions)
     if isinstance(metadata, torch.Tensor):
         swa_slots = metadata
         swa_valid = swa_slots >= 0
@@ -271,15 +276,10 @@ class DSparkDeepseekV41Model(nn.Module):
             main_x = target_hidden_states
         for i, layer in enumerate(cast(Iterable[DeepseekV41DecoderLayer], self.layers)):
             attn = layer.attn
-            rotated = False
-            if _uses_qa_rope(attn, main_x):
-                # kv-only: skips the qr columns, norm and projection.
-                _, kv, rotated = attn._qa_kv_norm_rope(main_x, positions, emit_qr=False)
-            else:
-                qr_kv = attn._fused_wqa_wkv_gemm(main_x)
-                _, _, kv = attn._split_qkv_and_norm(qr_kv)
             layer_md = None if metadata is None else metadata[i]
-            _insert_context_kv(attn, kv, positions, layer_md, rotated=rotated)
+            _insert_context_kv(
+                attn, _context_kv(attn, main_x, positions), positions, layer_md
+            )
         return main_x
 
     def forward(

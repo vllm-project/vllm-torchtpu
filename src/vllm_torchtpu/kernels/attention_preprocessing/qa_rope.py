@@ -63,12 +63,11 @@ def _qa_rope_kernel(
     chunk,
     eps,
     emit_qr,
-    rotate_kv,
 ):
     refs = list(refs)
     gamma_qr_ref: Any = refs.pop(0) if emit_qr else None
     gamma_kv_ref = refs.pop(0)
-    rope_rows_ref: Any = refs.pop(0) if rotate_kv else None
+    rope_rows_ref = refs.pop(0)
     qr_out_ref: Any = refs.pop(0) if emit_qr else None
     kv_out_ref, weight_ref, weight_sems, projected_ref = refs
     tile = pl.program_id(0)
@@ -124,9 +123,6 @@ def _qa_rope_kernel(
             projected_ref[:, :rank], gamma_qr_ref[...][None, :], eps
         )
     kv = native_rms_norm(projected_ref[:, kv_start:], gamma_kv_ref[...][None, :], eps)
-    if not rotate_kv:
-        kv_out_ref[...] = kv
-        return
     if kv_out_ref.shape[-1] > _LANE:
         kv_out_ref[:, :-_LANE] = kv[:, :-_LANE]
     cos, sin = rope_gather.coefficients(rope_rows_ref[...])
@@ -188,11 +184,10 @@ def fused_qa_kv_norm_rope(
     weight_scale: jax.Array,
     gamma_qr: jax.Array,
     gamma_kv: jax.Array,
-    rope_rows: jax.Array | None,
+    rope_rows: jax.Array,
     *,
     eps: float = 1e-6,
     emit_qr: bool = True,
-    rotate_kv: bool = True,
     config: QARopeConfig | None = None,
 ) -> tuple[jax.Array | None, jax.Array]:
     """Return ``(qr, kv)``: BF16 ``[T, rank]`` (None if not emitted), ``[T, 512]``.
@@ -200,19 +195,17 @@ def fused_qa_kv_norm_rope(
     ``weight`` is FP8 ``[hidden, rank + head_dim]`` in the canonical (k, n)
     layout, qr columns first, with one FP32 scale per column. ``rope_rows`` is
     the per-step ``[T, rotary_dim]`` FP32 ``rope_gather.gather_rows`` of the
-    model's ``cos_sin_cache`` (unused, may be None, when ``rotate_kv=False``).
-    Token counts that are not a multiple of 16 are zero-padded internally.
+    model's ``cos_sin_cache``; ``kv`` leaves rotated. Token counts that are
+    not a multiple of 16 are zero-padded internally.
     """
     tokens, hidden = x.shape
     rank, head_dim = gamma_qr.shape[0], gamma_kv.shape[0]
     _check_inputs(x, weight, weight_scale, gamma_qr, gamma_kv, eps)
-    if rotate_kv:
-        rope_gather.check_rope_rows(rope_rows, tokens, head_dim)
+    rope_gather.check_rope_rows(rope_rows, tokens, head_dim)
     padded = -(-tokens // _ROW_ALIGN) * _ROW_ALIGN
     if padded != tokens:
         x = jnp.pad(x, ((0, padded - tokens), (0, 0)))
-        if rotate_kv:
-            rope_rows = jnp.pad(rope_rows, ((0, padded - tokens), (0, 0)))
+        rope_rows = jnp.pad(rope_rows, ((0, padded - tokens), (0, 0)))
     column0 = 0 if emit_qr else rank
     width = weight.shape[1] - column0
     if config is None:
@@ -237,11 +230,11 @@ def fused_qa_kv_norm_rope(
         operands.append(gamma_qr)
         out_specs.append(pl.BlockSpec((tb, rank), rows))
         out_shape.append(jax.ShapeDtypeStruct((padded, rank), jnp.bfloat16))
-    in_specs.append(pl.BlockSpec((head_dim,), fixed, once))
-    operands.append(gamma_kv)
-    if rotate_kv:
-        in_specs.append(pl.BlockSpec((tb, rope_rows.shape[1]), rows))
-        operands.append(rope_rows)
+    in_specs += [
+        pl.BlockSpec((head_dim,), fixed, once),
+        pl.BlockSpec((tb, rope_rows.shape[1]), rows),
+    ]
+    operands += [gamma_kv, rope_rows]
     out_specs.append(pl.BlockSpec((tb, head_dim), rows))
     out_shape.append(jax.ShapeDtypeStruct((padded, head_dim), jnp.bfloat16))
 
@@ -264,7 +257,6 @@ def fused_qa_kv_norm_rope(
             chunk=config.weight_chunk,
             eps=eps,
             emit_qr=emit_qr,
-            rotate_kv=rotate_kv,
         ),
         grid_spec=grid_spec,
         out_shape=tuple(out_shape),
@@ -272,9 +264,7 @@ def fused_qa_kv_norm_rope(
             dimension_semantics=("arbitrary",),
             vmem_limit_bytes=config.vmem_limit_bytes,
         ),
-        name=f"qa_rope_t{tb}"
-        + ("" if emit_qr else "_kv")
-        + ("" if rotate_kv else "_norope"),
+        name=f"qa_rope_t{tb}" + ("" if emit_qr else "_kv"),
     )(*operands)
     qr, kv = outputs if emit_qr else (None, outputs[0])
     if padded != tokens:
@@ -308,13 +298,3 @@ def _check_inputs(x, weight, scale, gamma_qr, gamma_kv, eps):
         raise ValueError("qr and KV widths must be multiples of 128 lanes")
     if eps <= 0:
         raise ValueError("RMSNorm epsilon must be positive")
-
-
-def supported(x, weight, weight_scale, gamma_qr, gamma_kv, rope_rows):
-    """Whether ``fused_qa_kv_norm_rope`` accepts these concrete lowering inputs."""
-    try:
-        _check_inputs(x, weight, weight_scale, gamma_qr, gamma_kv, 1e-6)
-        rope_gather.check_rope_rows(rope_rows, x.shape[0], gamma_kv.shape[0])
-    except ValueError:
-        return False
-    return True

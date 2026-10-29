@@ -142,9 +142,11 @@ def test_block_sizes_do_not_change_values(tokens):
 
 
 @pytest.mark.parametrize("heads,head_dim", [(4, 512), (6, 512), (8, 0)])
-def test_supported_rejects_invalid_small_grid(heads, head_dim):
+def test_invalid_small_grid_fails_at_trace_time(heads, head_dim):
     qr = jax.ShapeDtypeStruct((32, 1280), jnp.bfloat16)
     weight = jax.ShapeDtypeStruct((1280, heads * 512), jnp.float8_e4m3fn)
     scales = jax.ShapeDtypeStruct((heads * 512,), jnp.float32)
     rows = jax.ShapeDtypeStruct((32, 64), jnp.float32)
-    assert not qb_rope.supported(qr, weight, scales, rows, head_dim)
+    call = functools.partial(qb_rope.fused_qb_rope, head_dim=head_dim)
+    with pytest.raises((ValueError, StopIteration)):
+        jax.eval_shape(call, qr, weight, scales, rows)

@@ -12,8 +12,7 @@ import pytest
 import torch
 
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention as v2_attn
-from vllm_torchtpu.models.vllm.deepseek_v41.v2 import compress_rope_op as bridge
-from vllm_torchtpu.models.vllm.deepseek_v41.v2 import csa2_adapter
+from vllm_torchtpu.models.vllm.deepseek_v41.v2 import csa2_adapter, preprocess_ops
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import PagedCacheRows
 
 
@@ -33,7 +32,7 @@ def _fixture(monkeypatch, ratio, banks, replay):
     attn = object.__new__(v2_attn.DeepseekV41Attention)
     torch.nn.Module.__init__(attn)
     attn.compress_ratio = ratio
-    attn._compress_rope_enabled = True
+    attn._csa2 = attn._fused_preprocess = True
     attn.prefix = "main"
     attn.window_size = 128
     attn._config = {"index_topk": 1}
@@ -79,9 +78,29 @@ def _fixture(monkeypatch, ratio, banks, replay):
     )
     monkeypatch.setattr(v2_attn, "get_forward_context", lambda: ctx)
     monkeypatch.setattr(
-        v2_attn, "get_rope_rows_op", lambda: lambda cache, pos: cache[pos]
+        preprocess_ops, "rope_rows", lambda: lambda cache, pos: cache[pos]
     )
     return attn, positions, state, main
+
+
+def _torch_op(fn):
+    """Run a JAX bridge on Torch CPU tensors, as the registered op would."""
+
+    def call(*args):
+        arrays = [
+            jnp.asarray(a.float().numpy(), jnp.bfloat16)
+            if a.dtype == torch.bfloat16
+            else jnp.asarray(a.numpy())
+            for a in args
+        ]
+        return tuple(
+            torch.from_numpy(np.array(a, dtype=np.float32)).bfloat16()
+            if a.dtype == jnp.bfloat16
+            else torch.from_numpy(np.array(a))
+            for a in fn(*arrays)
+        )
+
+    return call
 
 
 @pytest.mark.parametrize("ratio,banks", [(1, 1), (1, 2), (2, 1), (2, 2)])
@@ -92,7 +111,20 @@ def test_fused_compressor_wiring(monkeypatch, ratio, banks, defer, replay):
     captured = {}
     kernel_banks = banks if ratio == 2 else 0
 
-    def kernel(x, weight, gamma, rows, hp, valid, pool, write, read, *, ratio, eps):
+    def kernel(
+        x,
+        weight,
+        gamma,
+        rows,
+        hp,
+        valid,
+        pool=None,
+        write=None,
+        read=None,
+        *,
+        ratio,
+        eps,
+    ):
         assert hp.shape == valid.shape == (6, 1)
         assert hp.dtype == valid.dtype == jnp.int32
         assert eps == 1e-5
@@ -104,6 +136,8 @@ def test_fused_compressor_wiring(monkeypatch, ratio, banks, defer, replay):
             assert len(pools) == kernel_banks
             updated = tuple(p + i + 7 for i, p in enumerate(pools))
             pool = updated if isinstance(pool, tuple) else updated[0]
+        else:
+            assert pool is write is read is None
         return (
             jnp.ones((6, 512), jnp.bfloat16),
             jnp.zeros((6, 128), jnp.int32),
@@ -111,35 +145,20 @@ def test_fused_compressor_wiring(monkeypatch, ratio, banks, defer, replay):
             pool,
         )
 
-    monkeypatch.setattr(bridge.compress_rope, "fused_compress_rope", kernel)
-
-    def get_op(ratio, banks, *, eps):
-        fn = bridge._bridge(ratio, banks, eps)
-
-        def call(*args):
-            arrays = [
-                jnp.asarray(a.float().numpy(), jnp.bfloat16)
-                if a.dtype == torch.bfloat16
-                else jnp.asarray(a.numpy())
-                for a in args
-            ]
-            result = fn(*arrays)
-            return tuple(
-                torch.from_numpy(np.array(a, dtype=np.float32)).bfloat16()
-                if a.dtype == jnp.bfloat16
-                else torch.from_numpy(np.array(a))
-                for a in result
-            )
-
-        return call
-
-    monkeypatch.setattr(v2_attn, "get_compress_rope_op", get_op)
+    monkeypatch.setattr(preprocess_ops.compress_kernel, "fused_compress_rope", kernel)
+    monkeypatch.setattr(
+        preprocess_ops,
+        "compress_rope",
+        lambda ratio, banks, eps: _torch_op(
+            preprocess_ops._compress_bridge(ratio, banks, eps)
+        ),
+    )
     publish = MagicMock()
     insert = MagicMock()
-    monkeypatch.setattr(csa2_adapter, "publish_main_encoded", publish)
+    monkeypatch.setattr(csa2_adapter, "publish_main", publish)
     monkeypatch.setattr(v2_attn, "_insert", insert)
     with v2_attn.stage_attention_cache_scope():
-        result = attn._fused_compress_global_kv(
+        result = attn._write_csa2_global_kv(
             torch.zeros(6, 16, dtype=torch.bfloat16),
             positions,
             defer_index_write=defer,
@@ -153,6 +172,7 @@ def test_fused_compressor_wiring(monkeypatch, ratio, banks, defer, replay):
     np.testing.assert_array_equal(captured["valid"][:, 0], valid)
     expected_slots = (positions // ratio) % 8 + torch.tensor([0, 0, 0, 8, 8, 0])
     expected = main.row_indices(expected_slots).masked_fill(~torch.tensor(valid), -1)
+    assert publish.call_args.args[0] is main
     assert torch.equal(publish.call_args.args[1], expected)
     if ratio == 2:
         np.testing.assert_array_equal(captured["hp"][:, 0], [0, 1, 1, 0, 1, 0])
@@ -161,6 +181,8 @@ def test_fused_compressor_wiring(monkeypatch, ratio, banks, defer, replay):
         assert torch.all(state.raw == 7)
         if banks == 2:
             assert torch.all(state.raw_hi == 8)
+    else:
+        np.testing.assert_array_equal(captured["hp"][:, 0], [1] * 6)
     if defer:
         insert.assert_not_called()
         assert torch.equal(
@@ -175,9 +197,34 @@ def test_fused_compressor_wiring(monkeypatch, ratio, banks, defer, replay):
     attn.compressor.project.assert_not_called()
 
 
+def test_encoder_global_kv_uses_fused_compressor(monkeypatch):
+    monkeypatch.setattr(
+        v2_attn,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={"main": object()}),
+    )
+    attn = SimpleNamespace(
+        _fused_preprocess=True,
+        kv_cache=torch.ones(1),
+        compressor=SimpleNamespace(project=MagicMock(side_effect=AssertionError)),
+        _write_csa2_global_kv=MagicMock(),
+    )
+    hidden, positions = torch.zeros(2, 16), torch.arange(2, dtype=torch.int32)
+    v2_attn.DeepseekV41Attention.write_encoder_global_kv(attn, hidden, positions)
+    attn._write_csa2_global_kv.assert_called_once_with(
+        hidden, positions, defer_index_write=False
+    )
+
+
+def test_csa2_main_cache_rejects_latent_writes():
+    main = _cache(512, torch.uint8, scale=True)
+    with pytest.raises(NotImplementedError, match="fused compressor"):
+        main.write(torch.tensor([0, 1]), torch.zeros(2, 512, dtype=torch.bfloat16))
+
+
 @pytest.mark.parametrize("ratio,banks", [(1, 0), (2, 1), (2, 2)])
 def test_empty_real_bridge_and_fake_contract(ratio, banks):
-    fn = bridge._bridge(ratio, banks)
+    fn = preprocess_ops._compress_bridge(ratio, banks, 1e-6)
     shapes = [(0, 16), (16, ratio * 512), (512,), (0, 64), (0, 1), (0, 1)]
     dtypes = [
         jnp.bfloat16,
@@ -204,7 +251,7 @@ def test_empty_real_bridge_and_fake_contract(ratio, banks):
         )
         for shape, dtype in zip(shapes, dtypes)
     ]
-    fake = bridge._fake(ratio, banks)(*torch_args)
+    fake = preprocess_ops._compress_fake(banks)(*torch_args)
     assert len(inspect.signature(fn).parameters) == len(args)
     assert len(actual) == len(fake) == 3 + banks
     for real, traced, expected in zip(actual, abstract, fake):
@@ -214,79 +261,61 @@ def test_empty_real_bridge_and_fake_contract(ratio, banks):
         assert actual[3 + i] is args[6 + i]
 
 
-def test_reject_invalid_bank_mode_before_registration():
-    with pytest.raises(ValueError, match="one/two banks"):
-        bridge.get_compress_rope_op(2, 0)
-
-
 def test_group_and_token_rows_share_independent_stage_entries(monkeypatch):
     attn, positions, _, _ = _fixture(monkeypatch, 2, 1, False)
     gather = MagicMock(side_effect=lambda cache, pos: cache[pos])
-    monkeypatch.setattr(v2_attn, "get_rope_rows_op", lambda: gather)
+    monkeypatch.setattr(preprocess_ops, "rope_rows", lambda: gather)
     with v2_attn.stage_attention_cache_scope():
         token = attn._rope_rows(positions)
         grouped = attn._group_positions(positions)
-        group = attn._rope_rows(grouped, role="group")
+        group = attn._rope_rows(grouped, 2)
         assert attn._group_positions(positions) is grouped
         assert attn._rope_rows(positions) is token
-        assert attn._rope_rows(grouped, role="group") is group
+        assert attn._rope_rows(grouped, 2) is group
         assert gather.call_count == 2
 
 
-def test_register_only_matching_signatures_and_donations(monkeypatch):
-    registered = []
+def test_register_matching_signatures_donations_and_names(monkeypatch):
+    registered = {}
 
     def register(name, fn, **kwargs):
         count = len(inspect.signature(fn).parameters)
         assert count == len(kwargs["input_partition_specs"])
-        registered.append((name, count, kwargs["donate_argnums"]))
+        registered[name] = (count, kwargs["donate_argnums"])
         return SimpleNamespace(register_fake=lambda fake: None)
 
-    monkeypatch.setattr(bridge, "_ops", {})
-    monkeypatch.setattr(bridge, "get_pallas_op_mesh", lambda: None)
-    monkeypatch.setattr(bridge.pallas, "jax_op", register)
+    monkeypatch.setattr(preprocess_ops, "_ops", {})
+    monkeypatch.setattr(preprocess_ops, "get_pallas_op_mesh", lambda: None)
+    monkeypatch.setattr(preprocess_ops.pallas, "jax_op", register)
+    with pytest.raises(ValueError, match="one/two banks"):
+        preprocess_ops.compress_rope(2, 0, 1e-5)
+    assert not registered
     for ratio, banks in ((1, 0), (2, 1), (2, 2)):
-        bridge.get_compress_rope_op(ratio, banks, eps=1e-5)
-    assert [entry[1:] for entry in registered] == [(6, ()), (9, (6,)), (10, (6, 7))]
-    with pytest.raises(ValueError):
-        bridge.get_compress_rope_op(2)
-
-
-def test_new_preprocessing_flag_defaults_off(monkeypatch):
-    from vllm_torchtpu import envs
-
-    monkeypatch.delenv("VLLM_TPU_FUSED_DSV41_ATTENTION_PREPROCESS", raising=False)
-    assert not envs.environment_variables["VLLM_TPU_FUSED_DSV41_ATTENTION_PREPROCESS"]()
-
-
-def test_legacy_qb_fallback_does_not_enter_new_kernel(monkeypatch):
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import projection_rope as module
-
-    monkeypatch.setattr(module, "is_supported", lambda *args: False)
-    fused = MagicMock(side_effect=AssertionError("new path without shared rows"))
-    monkeypatch.setattr(module.qb_rope, "fused_qb_rope", fused)
-    monkeypatch.setattr(
-        module, "xla_quantized_matmul", lambda *a: jnp.zeros((1, 32768))
-    )
-    monkeypatch.setattr(module, "rope", lambda x, *a: x)
-    assert module.projection_rope(
-        jnp.zeros((1, 1280)), None, None, None, None
-    ).shape == (1, 64, 512)
-    fused.assert_not_called()
+        preprocess_ops.compress_rope(ratio, banks, 1e-5)
+    preprocess_ops.rope_rows()
+    preprocess_ops.qb_rope()
+    for emit_qr in (True, False):
+        for eps in (1e-6, 1e-5):
+            preprocess_ops.qa_rope(emit_qr, eps)
+            preprocess_ops.qa_rope(emit_qr, eps)  # cached, not re-registered
+    compress = {k: v for k, v in registered.items() if "compress" in k}
+    assert sorted(compress.values()) == [(6, ()), (9, (6,)), (10, (6, 7))]
+    assert registered["pallas::dsv41_rope_rows"] == (2, ())
+    assert registered["pallas::dsv41_qb_rope"] == (4, ())
+    qa = [k for k in registered if "qa_kv_norm_rope" in k]
+    assert len(qa) == 4 and len(registered) == 9
 
 
 @pytest.mark.parametrize("banks", [1, 2])
-def test_encoded_publication_preserves_banks_without_encoding(monkeypatch, banks):
+def test_publication_preserves_banks_and_rejects_bad_shapes(banks):
     from vllm_torchtpu.kernels.deepseek_v41.csa2 import cache as kernels
 
-    encoded = MagicMock(side_effect=AssertionError("encoded twice"))
-    monkeypatch.setattr(kernels, "encode_csa2_kv", encoded)
     pool = jnp.zeros((8, 128), jnp.int32)
     scales = jnp.zeros((8,), jnp.float32)
     if banks == 2:
         pool = (pool, pool)
         scales = (scales, scales)
-    result = kernels.publish_csa2_encoded.__wrapped__(
+    result = kernels.publish_csa2_kv.__wrapped__(
         pool,
         scales,
         jnp.zeros((0,), jnp.int32),
@@ -294,9 +323,8 @@ def test_encoded_publication_preserves_banks_without_encoding(monkeypatch, banks
         jnp.zeros((0, 1), jnp.float32),
     )
     assert result[0] is pool and result[1] is scales
-    encoded.assert_not_called()
     with pytest.raises(ValueError, match="incompatible shapes"):
-        kernels.publish_csa2_encoded.__wrapped__(
+        kernels.publish_csa2_kv.__wrapped__(
             pool,
             scales,
             jnp.zeros((1, 1), jnp.int32),

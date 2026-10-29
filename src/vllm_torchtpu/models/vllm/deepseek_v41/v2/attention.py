@@ -20,14 +20,13 @@ from vllm.models.deepseek_v41 import attention as upstream
 from vllm.models.deepseek_v41 import compressor as compressor_upstream
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import cache_capacity
 from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
 )
 
-from . import csa2_adapter
+from . import csa2_adapter, preprocess_ops
 from .attention_kernels import (
     gathered_kv_cache_scope,
     paged_attention,
@@ -43,10 +42,8 @@ from .cache import (
 )
 from .candidate_cache import prepare_candidate_cache, select_candidate_cache
 from .ced import prefix_replay_enabled
-from .compress_rope_op import get_compress_rope_op
 from .ops import device_hooks, rms_norm, rotary, round_fp8_activation
 from .projection_rope import initialize_projection_rope
-from .qa_rope_op import get_qa_rope_op, get_rope_rows_op
 from .swa_cache import DeepseekV41SWASpec
 
 logger = init_logger(__name__)
@@ -434,15 +431,6 @@ class IndexerCache(NativeCacheView, upstream.DeepseekV4IndexerCache):
         return AttentionBackend
 
 
-def _uses_qa_rope(attn, hidden_states):
-    """Whether ``attn`` runs the fused Q-A/KV op (``_qa_kv_norm_rope``)."""
-    return (
-        getattr(attn, "_qa_rope_enabled", False)
-        and hidden_states.dtype == torch.bfloat16
-        and hidden_states.dim() == 2
-    )
-
-
 def _value(output):
     return output[0] if isinstance(output, tuple) else output
 
@@ -545,10 +533,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
     # True once `_init_local_q_weights` built the gathered weights.
     _local_q_attn = False
     _q_projection_rope_op: Any = None
-    _compress_rope_op: Any = None
-    _compress_rope_enabled = False
-    # True once `process_weights_after_loading` qualified the fused Q-A/KV op.
-    _qa_rope_enabled = False
+    # TP1 FP8-KV layers run the fused Q-A/KV, Q-B and compressor kernels.
+    _fused_preprocess = False
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads):
@@ -581,6 +567,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             and self.n_local_heads == 64
         )
         self._csa2 = bool(self.compress_ratio) and csa2_supported
+        self._fused_preprocess = csa2_supported
         self.swa_cache_layer.native_pages = self._csa2
         if self.compress_ratio:
             logger.info_once(
@@ -653,15 +640,21 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             .expand(-1, self.padded_heads, self.head_dim)
             .contiguous()
         )
-        qr_kv, kv_score, indexer_weights = self._run_parallel_input_projections(
-            hidden_states
-        )
-        kv_rotated = False
-        if _uses_qa_rope(self, hidden_states):
-            qr, kv, kv_rotated = self._qa_kv_norm_rope(hidden_states, positions)
-            assert qr is not None  # emit_qr defaults to True
-            qr_scale = None
+        if self._fused_preprocess:
+            # One kernel projects, normalizes and rotates qr/kv; the
+            # compressor projects inside its own kernel.
+            assert not self._sp_sharded_input  # TP1; SP needs TP > 1
+            qr, kv = self._qa_kv_norm_rope(hidden_states, positions)
+            qr_scale = kv_score = None
+            indexer_weights = (
+                _value(self.indexer.weights_proj(hidden_states))
+                if self.indexer is not None and not self._all_indices_fit
+                else None
+            )
         else:
+            qr_kv, kv_score, indexer_weights = self._run_parallel_input_projections(
+                hidden_states
+            )
             qr, qr_scale, kv = self._split_qkv_and_norm(qr_kv)
         # This rank's SP token shard of qr, before the gather.
         swa_kv = getattr(getattr(self, "swa_cache_layer", None), "kv_cache", None)
@@ -714,32 +707,22 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             positions,
             o_padded,
         )
-        kwargs = {"kv_rotated": True} if kv_rotated else {}
         if qr_local is not None:
-            projected = self._prepare_and_attn_fn(*args, qr_local=qr_local, **kwargs)
+            projected = self._prepare_and_attn_fn(*args, qr_local=qr_local)
             if projected is not None:
                 # The fused q/attention/wo_a op already produced wo_b's input.
                 return _value(self.wo_b(projected))
         else:
-            self._prepare_and_attn_fn(*args, **kwargs)
+            self._prepare_and_attn_fn(*args)
         o = o_padded[:, : self.n_local_heads, :]
         return self._o_proj(o, positions)
 
     def _run_parallel_input_projections(self, hidden_states):
-        # None when `_qa_kv_norm_rope` produces qr and kv instead.
-        qr_kv = (
-            None
-            if _uses_qa_rope(self, hidden_states)
-            else self._fused_wqa_wkv_gemm(hidden_states)
-        )
+        qr_kv = self._fused_wqa_wkv_gemm(hidden_states)
         kv_score = (
-            None
-            if self._compress_rope_enabled
-            else (
-                self.compressor.project(hidden_states)
-                if self.compressor is not None and not self._ced_global_from_encoder
-                else None
-            )
+            self.compressor.project(hidden_states)
+            if self.compressor is not None and not self._ced_global_from_encoder
+            else None
         )
         index_weights = (
             _value(self.indexer.weights_proj(hidden_states))
@@ -776,46 +759,34 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
     def _qa_kv_norm_rope(self, hidden_states, positions, *, emit_qr=True):
         """Fused ``_fused_wqa_wkv_gemm`` -> ``_split_qkv_and_norm`` -> SWA ``_rotate``.
 
-        Returns ``(qr | None, kv, kv_rotated)``. SP-sharded input leaves kv
-        unrotated: its rows are a token shard of the gathered ``positions``.
+        Returns ``(qr, kv)``, or the rotated ``kv`` alone without ``emit_qr``.
         """
-        rotate = not self._sp_sharded_input and positions.dtype == torch.int32
-        op = get_qa_rope_op(
-            self.kv_norm.variance_epsilon, emit_qr=emit_qr, rotate_kv=rotate
-        )
         layer = self.fused_wqa_wkv
-        args = [
+        return preprocess_ops.qa_rope(emit_qr, self.kv_norm.variance_epsilon)(
             hidden_states,
             layer.weight,
             layer.weight_scale,
             self.q_norm.weight,
             self.kv_norm.weight,
-        ]
-        if rotate:
-            args.append(self._rope_rows(positions))
-        out = op(*args)
-        qr, kv = out if emit_qr else (None, out)
-        return qr, kv, rotate
-
-    def _rope_rows(self, positions, *, role="token"):
-        """This step's ``_tpu_rope_cache`` rows, gathered once per stage."""
-        stage_cache = _active_stage_attn_cache
-        key = (
-            "rope_rows",
-            role,
-            self.compress_ratio if role == "group" else 1,
-            id(self._tpu_rope_cache),
+            self._rope_rows(positions),
         )
+
+    def _rope_rows(self, positions, ratio=1):
+        """``_tpu_rope_cache`` rows at ``positions``, gathered once per stage.
+
+        ``ratio`` > 1 marks ``_group_positions(positions)``; ratio-1 groups
+        share the token rows of the Q-A/KV and Q-B kernels.
+        """
+        assert positions.dtype == torch.int32
+        table = self._tpu_rope_cache
+        stage_cache = _active_stage_attn_cache
+        key = ("rope_rows", id(table), ratio)
         cached = stage_cache.get(key) if stage_cache is not None else None
-        if (
-            cached is not None
-            and cached[0] is positions
-            and cached[1] is self._tpu_rope_cache
-        ):
+        if cached is not None and cached[0] is positions and cached[1] is table:
             return cached[2]
-        rows = get_rope_rows_op()(self._tpu_rope_cache, positions)
+        rows = preprocess_ops.rope_rows()(table, positions)
         if stage_cache is not None:
-            stage_cache[key] = (positions, self._tpu_rope_cache, rows)
+            stage_cache[key] = (positions, table, rows)
         return rows
 
     def _group_positions(self, positions):
@@ -853,146 +824,104 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             inverse=inverse,
         ).squeeze(0)
 
-    def _fused_compress_global_kv(self, hidden_states, positions, *, defer_index_write):
-        """Run fused C1/C2 preprocessing and publish the parent CSA2 payload."""
+    def _write_csa2_global_kv(self, hidden_states, positions, *, defer_index_write):
+        """Fused compressor: one kernel projects, pools (reading and writing the
+        ratio-2 state ring), normalizes, rotates and CSA2-encodes the records."""
         metadata = get_forward_context().attn_metadata
         if not isinstance(metadata, dict):
             return None
-        weight = self.compressor.fused_wkv_wgate.weight
-        gamma = self.compressor.norm.weight
-        if (
-            hidden_states.dtype != torch.bfloat16
-            or weight.dtype != torch.bfloat16
-            or gamma.dtype not in (torch.bfloat16, torch.float32)
-            or positions.dtype != torch.int32
-        ):
-            logger.warning_once(
-                "Fused compressor fallback: activation=%s weight=%s "
-                "gamma=%s positions=%s",
-                hidden_states.dtype,
-                weight.dtype,
-                gamma.dtype,
-                positions.dtype,
-            )
-            return self._write_global_kv_fallback(
-                hidden_states, positions, defer_index_write
-            )
+        compressor = self.compressor
+        ratio = self.compress_ratio
         kv_meta = metadata[self.prefix]
-        indexer = self.indexer
-        index_cache = indexer.k_cache.kv_cache
-        idx_meta = metadata[indexer.k_cache.prefix]
-        stage_cache = _active_stage_attn_cache
-        valid_token = (
-            torch.arange(positions.shape[0], device=positions.device)
-            < (kv_meta.query_start_loc[-1])
-        )
-        group_positions = self._group_positions(positions)
-        valid = valid_token & ((positions + 1) % self.compress_ratio == 0)
+        index_k = self.indexer.k_cache
+        rows = torch.arange(positions.shape[0], device=positions.device)
+        valid = (rows < kv_meta.query_start_loc[-1]) & ((positions + 1) % ratio == 0)
         starts = _window_starts()
         if starts is not None:
+            # Shared prefix rows must survive replay unchanged.
             valid = valid & ~_replayed(kv_meta, positions, starts, self.window_size)
         compressed_slots = _cache_slots(
-            self.kv_cache,
-            kv_meta,
-            positions,
-            compress_ratio=self.compress_ratio,
+            self.kv_cache, kv_meta, positions, compress_ratio=ratio
         )
         index_slots = _cache_slots(
-            index_cache,
-            idx_meta,
+            index_k.kv_cache,
+            metadata[index_k.prefix],
             positions,
-            compress_ratio=indexer.k_cache.compress_ratio,
+            compress_ratio=index_k.compress_ratio,
         )
-        if self.compress_ratio == 1:
-            state = None
-            write = read = None
-            has_prev = torch.ones_like(positions)
-            banks = 0
-        else:
-            state_metadata = metadata[self.compressor.state_cache.prefix]
-            state_cache = self.compressor.state_cache.kv_cache
-            state_rows = state_cache.shape[1]
-            requests = _token_requests(state_metadata, positions).clamp(
-                max=state_metadata.query_start_loc.numel() - 2
-            )
-            request_starts = state_metadata.query_start_loc[requests]
-            request_ends = state_metadata.query_start_loc[requests + 1]
-            state_slots = _cache_slots(
-                state_cache, state_metadata, positions, ring=True
-            )
-            previous_slots = _cache_slots(
-                state_cache, state_metadata, positions - 1, ring=True
-            )
-            state_records = state_cache.row_indices(state_slots)
-            previous_records = state_cache.row_indices(previous_slots)
-            rows = torch.arange(positions.shape[0], device=positions.device)
-            has_prev = (rows != request_starts).to(torch.int32)
-            write_valid = (state_slots >= 0) & (rows >= request_ends - state_rows)
-            write = state_records.masked_fill(~write_valid, -1).int()
-            read = previous_records.masked_fill(
-                has_prev.to(torch.bool) | (state_slots < 0), -1
-            ).int()
-            state = state_cache.raw
-            if state_cache.raw_hi is None:
-                banks = 1
-            else:
-                state = (state_cache.raw, state_cache.raw_hi)
-                banks = 2
-        rows = self._rope_rows(group_positions, role="group")
-        op = get_compress_rope_op(
-            self.compress_ratio, banks, eps=self.compressor.rms_norm_eps
-        )
+        group_positions = self._group_positions(positions)
         args = [
             hidden_states,
-            weight,
-            gamma,
-            rows,
-            has_prev[:, None].int(),
-            valid[:, None].int(),
+            compressor.fused_wkv_wgate.weight,
+            compressor.norm.weight,
+            self._rope_rows(group_positions, ratio),
         ]
-        if self.compress_ratio == 2:
-            args.extend(state if isinstance(state, tuple) else (state,))
-            args.extend((write, read))
-        result = op(*args)
-        latent, words, scales = result[:3]
-        if self.compress_ratio == 2:
-            new_states = result[3:]
-            state_cache = self.compressor.state_cache.kv_cache
-            if banks == 1:
-                state_cache.raw.copy_(new_states[0])
-            else:
-                state_cache.raw.copy_(new_states[0])
-                state_cache.raw_hi.copy_(new_states[1])
-        csa2_adapter.publish_main_encoded(
+        pools = ()
+        if ratio == 1:
+            args += [torch.ones_like(positions[:, None]), valid[:, None].int()]
+        else:
+            state_meta = metadata[compressor.state_cache.prefix]
+            state_cache = compressor.state_cache.kv_cache
+            pools = tuple(
+                p for p in (state_cache.raw, state_cache.raw_hi) if p is not None
+            )
+            starts_loc = state_meta.query_start_loc
+            requests = _token_requests(state_meta, positions).clamp(
+                max=starts_loc.numel() - 2
+            )
+            # A request's first row pools with the ring's stored predecessor;
+            # only its last ring-capacity rows are stored.
+            has_prev = rows != starts_loc[requests]
+            slots = _cache_slots(state_cache, state_meta, positions, ring=True)
+            previous = _cache_slots(state_cache, state_meta, positions - 1, ring=True)
+            stored = (slots >= 0) & (
+                rows >= starts_loc[requests + 1] - state_cache.shape[1]
+            )
+            args += [
+                has_prev[:, None].int(),
+                valid[:, None].int(),
+                *pools,
+                state_cache.row_indices(slots).masked_fill(~stored, -1).int(),
+                state_cache.row_indices(previous)
+                .masked_fill(has_prev | (slots < 0), -1)
+                .int(),
+            ]
+        op = preprocess_ops.compress_rope(ratio, len(pools), compressor.rms_norm_eps)
+        latent, words, scales, *states = op(*args)
+        for pool, state in zip(pools, states, strict=True):
+            pool.copy_(state)
+        records = self.kv_cache.row_indices(compressed_slots.clamp(min=0))
+        csa2_adapter.publish_main(
             self.kv_cache,
-            self.kv_cache.row_indices(compressed_slots.clamp(min=0)).masked_fill(
-                ~valid | (compressed_slots < 0), -1
-            ),
+            records.masked_fill(~valid | (compressed_slots < 0), -1),
             words,
             scales,
         )
+        return self._write_index_keys(
+            latent, group_positions, index_slots, valid, defer_index_write
+        )
+
+    def _write_index_keys(self, latent, group_positions, slots, valid, defer):
+        """Invalidate the stage's candidates; write index K, or return it with
+        its records for the deferred paged write."""
+        indexer = self.indexer
+        index_cache = indexer.k_cache.kv_cache
+        stage_cache = _active_stage_attn_cache
         if stage_cache is not None:
             version_key = ("candidate_index_version", indexer.k_cache.prefix)
             stage_cache[version_key] = stage_cache.get(version_key, 0) + 1
         keys = indexer.k_norm(_value(indexer.wk(latent)))
         keys = self._quantize_indexer(self._rotate(keys, group_positions))
         if (
-            defer_index_write
+            defer
             and isinstance(index_cache, PagedCacheRows)
             and self.window_size % 64 == 0
             and not self._all_indices_fit
         ):
-            records = index_cache.row_indices(index_slots.clamp(min=0))
-            return records.masked_fill(~valid | (index_slots < 0), -1), keys
-        _insert(index_cache, index_slots, keys, valid)
+            records = index_cache.row_indices(slots.clamp(min=0))
+            return records.masked_fill(~valid | (slots < 0), -1), keys
+        _insert(index_cache, slots, keys, valid)
         return None
-
-    def _write_global_kv_fallback(self, hidden_states, positions, defer_index_write):
-        return self._write_global_kv(
-            self.compressor.project(hidden_states),
-            positions,
-            defer_index_write=defer_index_write,
-        )
 
     def _write_global_kv(self, kv_score, positions, *, defer_index_write=True):
         metadata = get_forward_context().attn_metadata
@@ -1116,21 +1045,9 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             self._rotate(latent, group_positions),
             valid,
         )
-        if stage_cache is not None:
-            version_key = ("candidate_index_version", indexer.k_cache.prefix)
-            stage_cache[version_key] = stage_cache.get(version_key, 0) + 1
-        keys = indexer.k_norm(_value(indexer.wk(latent)))
-        keys = self._quantize_indexer(self._rotate(keys, group_positions))
-        if (
-            defer_index_write
-            and isinstance(index_cache, PagedCacheRows)
-            and self.window_size % 64 == 0
-            and not self._all_indices_fit
-        ):
-            records = index_cache.row_indices(index_slots.clamp(min=0))
-            return records.masked_fill(~valid | (index_slots < 0), -1), keys
-        _insert(index_cache, index_slots, keys, valid)
-        return None
+        return self._write_index_keys(
+            latent, group_positions, index_slots, valid, defer_index_write
+        )
 
     def write_encoder_global_kv(
         self, hidden_states, positions, *, sp_sharded: bool = False
@@ -1139,15 +1056,16 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         metadata = get_forward_context().attn_metadata
         if not isinstance(metadata, dict) or not self.kv_cache.numel():
             return
-        if self._compress_rope_enabled and not sp_sharded:
-            self._fused_compress_global_kv(
+        if self._fused_preprocess:
+            assert not sp_sharded  # fused preprocessing is TP1; SP needs TP > 1
+            self._write_csa2_global_kv(
                 hidden_states, positions, defer_index_write=False
             )
-        else:
-            kv_score = self.compressor.project(hidden_states)
-            if sp_sharded:
-                kv_score = sp_all_gather(kv_score)[: positions.shape[0]]
-            self._write_global_kv(kv_score, positions, defer_index_write=False)
+            return
+        kv_score = self.compressor.project(hidden_states)
+        if sp_sharded:
+            kv_score = sp_all_gather(kv_score)[: positions.shape[0]]
+        self._write_global_kv(kv_score, positions, defer_index_write=False)
 
     def _prepare_tpu(
         self,
@@ -1160,12 +1078,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         positions,
         output,
         qr_local=None,
-        kv_rotated=False,
     ):
         """Attend into ``output``, or return the ``wo_b`` input when the fused
         q/attention/``wo_a`` op (``qr_local``) ran; else ``None``.
 
-        ``kv_rotated``: ``_qa_kv_norm_rope`` already applied the SWA RoPE."""
+        With ``_fused_preprocess``, ``kv`` already carries its SWA RoPE."""
         metadata = get_forward_context().attn_metadata
         if not isinstance(metadata, dict) or not self.swa_cache_layer.kv_cache.numel():
             output.zero_()
@@ -1476,7 +1393,12 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             and bool(self.compress_ratio)
         )
         q = None
-        if not fused_qo:
+        if self._fused_preprocess:
+            # Shares the step's gathered rows with the Q-A/KV kernel.
+            q = preprocess_ops.qb_rope()(
+                qr, self.wq_b.weight, self.wq_b.weight_scale, self._rope_rows(positions)
+            )
+        elif not fused_qo:
             # V4.1 normalizes qr before projection; neither route renormalizes q.
             if (
                 self._q_projection_rope_op is not None
@@ -1484,26 +1406,20 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 and positions.dtype == torch.int32
                 and self._tpu_rope_cache.dtype == torch.float32
             ):
-                q_args = [
+                q = self._q_projection_rope_op(
                     qr,
                     self.wq_b.weight,
                     self.wq_b.weight_scale,
                     positions,
                     self._tpu_rope_cache,
-                ]
-                if self._qa_rope_enabled:
-                    # Share the step's gathered rows with the Q-A/KV kernel.
-                    q_args.append(self._rope_rows(positions))
-                    q = initialize_projection_rope(shared_rows=True)(*q_args)
-                else:
-                    q = self._q_projection_rope_op(*q_args)
+                )
             else:
                 # Other weight/rotary layouts retain the original model path.
                 q = _value(self.wq_b(qr)).reshape(-1, self.n_local_heads, self.head_dim)
                 q = self._rotate(q, positions)
         # Match upstream's plain BF16 cache selected by this backend. Packed
         # FP8/NVFP4 cache numerics must not be imposed on BF16 cache rows.
-        if not kv_rotated:
+        if not self._fused_preprocess:
             kv = self._rotate(kv, positions)
         if self._csa2:
             assert csa2_write_records is not None
@@ -1513,10 +1429,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         weights = None
         pending_index_write = None
         if self.compressor is not None and not self._ced_global_from_encoder:
-            if self._compress_rope_enabled:
-                if self._sp_sharded_input:
-                    hidden_states = sp_all_gather(hidden_states)[: positions.shape[0]]
-                pending_index_write = self._fused_compress_global_kv(
+            if self._fused_preprocess:
+                pending_index_write = self._write_csa2_global_kv(
                     hidden_states, positions, defer_index_write=True
                 )
             else:
@@ -2183,31 +2097,22 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         else:
             self._full_attn_sink.copy_(self.attn_sink.detach().float())
         self._init_local_q_weights()
-        self._compress_rope_enabled = False
-        if (
-            envs.VLLM_TPU_FUSED_DSV41_ATTENTION_PREPROCESS
-            and self.compressor is not None
-            and self._csa2
-            and tp_size == 1
-            and self.wo_a.weight.device.type == "tpu"
-            and self.compressor.compress_ratio in (1, 2)
-        ):
-            layer = self.compressor.fused_wkv_wgate
-            self._compress_rope_enabled = (
-                layer.weight.dtype == torch.bfloat16
-                and getattr(layer, WEIGHT_FLIPPED_ATTR, False)
-                and layer.weight.shape
-                == (self.hidden_size, self.compressor.compress_ratio * 512)
-                and self.compressor.norm.weight.dtype in (torch.bfloat16, torch.float32)
-                and self.compressor.norm.weight.numel() == 512
-            )
-            if self._compress_rope_enabled:
-                ratio = self.compressor.compress_ratio
-                get_rope_rows_op()
-                for banks in (0,) if ratio == 1 else (1, 2):
-                    get_compress_rope_op(ratio, banks, eps=self.compressor.rms_norm_eps)
         self._q_projection_rope_op = None
-        if (
+        if self._fused_preprocess:
+            self._check_fused_weights()
+            # Register before TorchDynamo captures the first model forward.
+            eps = self.kv_norm.variance_epsilon
+            preprocess_ops.rope_rows()
+            preprocess_ops.qa_rope(True, eps)
+            preprocess_ops.qa_rope(False, eps)  # DSpark context KV
+            preprocess_ops.qb_rope()
+            if self.compressor is not None:
+                ratio = self.compress_ratio
+                for banks in (0,) if ratio == 1 else (1, 2):
+                    preprocess_ops.compress_rope(
+                        ratio, banks, self.compressor.rms_norm_eps
+                    )
+        elif (
             tp_size == 1
             and self.wo_a.weight.device.type == "tpu"
             and self.wq_b.weight.shape == (1280, 32768)
@@ -2219,50 +2124,65 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             and self._config["qk_rope_head_dim"] == 64
         ):
             self._q_projection_rope_op = initialize_projection_rope()
-        self._qa_rope_enabled = (
-            envs.VLLM_TPU_FUSED_DSV41_ATTENTION_PREPROCESS
-            and tp_size == 1
-            and self._qa_rope_supported()
-        )
-        # Register before TorchDynamo captures the first model forward.
-        if self._qa_rope_enabled:
-            eps = self.kv_norm.variance_epsilon
-            get_rope_rows_op()
-            if self._q_projection_rope_op is not None:
-                initialize_projection_rope(shared_rows=True)
-            for emit_qr in (True, False):
-                for rotate_kv in (True, False):
-                    get_qa_rope_op(eps, emit_qr=emit_qr, rotate_kv=rotate_kv)
         if self.wo_a.weight.device.type == "tpu":
             _ = self.o_proj_op
 
-    def _qa_rope_supported(self):
-        """Per-channel FP8 ``fused_wqa_wkv`` in the canonical (k, n) layout."""
-        layer = getattr(self, "fused_wqa_wkv", None)
-        if layer is None:
-            return False
-        weight = layer.weight
-        scale = getattr(layer, "weight_scale", None)
-        width = self.q_lora_rank + self.head_dim
+    def _check_fused_weights(self):
+        """The fused kernels' weight layouts; anything else is a load error."""
+
+        def per_channel_fp8(layer, k, n):
+            scale = getattr(layer, "weight_scale", None)
+            return (
+                getattr(layer, WEIGHT_FLIPPED_ATTR, False)
+                and layer.weight.dtype == torch.float8_e4m3fn
+                and layer.weight.shape == (k, n)
+                and scale is not None
+                and scale.dtype == torch.float32
+                and scale.shape == (n,)
+            )
+
         rotary_dim = self._config["qk_rope_head_dim"]
-        return (
-            weight.device.type == "tpu"
-            and getattr(layer, WEIGHT_FLIPPED_ATTR, False)
-            and weight.dtype == torch.float8_e4m3fn
-            and weight.shape == (self.hidden_size, width)
-            and scale is not None
-            and scale.dtype == torch.float32
-            and scale.shape == (width,)
-            and self.q_lora_rank % 128 == 0
-            and self.head_dim % 128 == 0
-            and self.q_norm.weight.dtype == self.kv_norm.weight.dtype
-            and self.q_norm.weight.dtype in (torch.bfloat16, torch.float32)
-            and self.q_norm.variance_epsilon == self.kv_norm.variance_epsilon
-            and self._tpu_rope_cache.dtype == torch.float32
-            and self._tpu_rope_cache.shape[1] == rotary_dim
-            and 0 < rotary_dim <= 128
-            and rotary_dim % 2 == 0
-        )
+        problems = []
+        if not per_channel_fp8(
+            self.fused_wqa_wkv, self.hidden_size, self.q_lora_rank + self.head_dim
+        ):
+            problems.append("fused_wqa_wkv must be per-channel FP8 [hidden, rank+512]")
+        if not per_channel_fp8(
+            self.wq_b, self.q_lora_rank, self.n_local_heads * self.head_dim
+        ):
+            problems.append("wq_b must be per-channel FP8 [rank, heads*512]")
+        if (
+            self.q_norm.weight.dtype != self.kv_norm.weight.dtype
+            or self.q_norm.weight.dtype not in (torch.bfloat16, torch.float32)
+            or self.q_norm.variance_epsilon != self.kv_norm.variance_epsilon
+        ):
+            problems.append("q_norm/kv_norm must share a BF16/FP32 dtype and epsilon")
+        if (
+            self.q_lora_rank % 128
+            or self._tpu_rope_cache.dtype != torch.float32
+            or self._tpu_rope_cache.shape[1] != rotary_dim
+            or not 0 < rotary_dim <= 128
+            or rotary_dim % 2
+        ):
+            problems.append("needs a 128-lane q_lora_rank and FP32 rotary table")
+        if self.compressor is not None:
+            layer = self.compressor.fused_wkv_wgate
+            norm = self.compressor.norm.weight
+            if not (
+                getattr(layer, WEIGHT_FLIPPED_ATTR, False)
+                and layer.weight.dtype == torch.bfloat16
+                and layer.weight.shape == (self.hidden_size, self.compress_ratio * 512)
+                and norm.dtype in (torch.bfloat16, torch.float32)
+                and norm.numel() == 512
+            ):
+                problems.append(
+                    "compressor must be BF16 [hidden, ratio*512] with a 512 norm"
+                )
+        if problems:
+            raise NotImplementedError(
+                f"{self.prefix}: fused DeepSeek-V4.1 attention preprocessing "
+                "(TP1, FP8 KV) " + "; ".join(problems)
+            )
 
     def _o_proj(self, output, positions):
         assert output.dtype == torch.bfloat16

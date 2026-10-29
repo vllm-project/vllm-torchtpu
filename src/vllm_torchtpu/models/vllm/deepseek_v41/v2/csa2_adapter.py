@@ -29,9 +29,13 @@ _ops: dict[str, Any] = {}
 
 
 def _publish_main(
-    raw: jax.Array, scales: jax.Array, records: jax.Array, values: jax.Array
+    raw: jax.Array,
+    scales: jax.Array,
+    records: jax.Array,
+    words: jax.Array,
+    word_scales: jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
-    return publish_csa2_kv(raw, scales, records, values)
+    return publish_csa2_kv(raw, scales, records, words, word_scales)
 
 
 def _publish_main_banked(
@@ -40,44 +44,13 @@ def _publish_main_banked(
     scales: jax.Array,
     high_scales: jax.Array,
     records: jax.Array,
-    values: jax.Array,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    words, scale = publish_csa2_kv((raw, high), (scales, high_scales), records, values)
-    return *words, *scale
-
-
-def _publish_main_encoded(
-    raw: jax.Array,
-    scales: jax.Array,
-    records: jax.Array,
     words: jax.Array,
-    encoded_scales: jax.Array,
-) -> tuple[jax.Array, jax.Array]:
-    from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import publish_csa2_encoded
-
-    return publish_csa2_encoded(raw, scales, records, words, encoded_scales)
-
-
-def _publish_main_encoded_banked(
-    raw: jax.Array,
-    high: jax.Array,
-    scales: jax.Array,
-    high_scales: jax.Array,
-    records: jax.Array,
-    words: jax.Array,
-    encoded_scales: jax.Array,
+    word_scales: jax.Array,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import publish_csa2_encoded
-
-    low_words, low_scales = publish_csa2_encoded(
-        (raw, high),
-        (scales, high_scales),
-        records,
-        words,
-        encoded_scales,
+    banks, scale = publish_csa2_kv(
+        (raw, high), (scales, high_scales), records, words, word_scales
     )
-    assert isinstance(low_words, tuple) and isinstance(low_scales, tuple)
-    return low_words[0], low_words[1], low_scales[0], low_scales[1]
+    return *banks, *scale
 
 
 def _publish_swa(raw: jax.Array, records: jax.Array, values: jax.Array) -> jax.Array:
@@ -268,24 +241,12 @@ def initialize_csa2_ops() -> None:
         (
             "publish_main",
             _publish_main,
-            (P(),) * 4,
+            (P(),) * 5,
             lambda r, s, *_: (torch.empty_like(r), torch.empty_like(s)),
         ),
         (
             "publish_main_banked",
             _publish_main_banked,
-            (P(),) * 6,
-            lambda r, h, s, hs, *_: tuple(torch.empty_like(x) for x in (r, h, s, hs)),
-        ),
-        (
-            "publish_main_encoded",
-            _publish_main_encoded,
-            (P(),) * 5,
-            lambda r, s, *_: (torch.empty_like(r), torch.empty_like(s)),
-        ),
-        (
-            "publish_main_encoded_banked",
-            _publish_main_encoded_banked,
             (P(),) * 7,
             lambda r, h, s, hs, *_: tuple(torch.empty_like(x) for x in (r, h, s, hs)),
         ),
@@ -324,16 +285,12 @@ def initialize_csa2_ops() -> None:
         "metadata": 3,
         "publish_main": 2,
         "publish_main_banked": 4,
-        "publish_main_encoded": 2,
-        "publish_main_encoded_banked": 4,
         "publish_swa_banked": 2,
         "gather_attend": 4,
     }
     donated = {
         "publish_main": (0, 1),
         "publish_main_banked": (0, 1, 2, 3),
-        "publish_main_encoded": (0, 1),
-        "publish_main_encoded_banked": (0, 1, 2, 3),
         "publish_swa": (0,),
         "publish_swa_banked": (0, 1),
     }
@@ -357,47 +314,22 @@ def initialize_csa2_ops() -> None:
 
 
 def publish_main(
-    cache: "PagedCacheRows", records: torch.Tensor, values: torch.Tensor
-) -> None:
-    assert cache.scale is not None
-    if cache.raw_hi is None:
-        raw, scale = _ops["publish_main"](cache.raw, cache.scale, records.int(), values)
-        cache.raw.copy_(raw)
-        cache.scale.copy_(scale)
-    else:
-        assert cache.scale_hi is not None
-        raw, high, scale, high_scale = _ops["publish_main_banked"](
-            cache.raw, cache.raw_hi, cache.scale, cache.scale_hi, records.int(), values
-        )
-        cache.raw.copy_(raw)
-        cache.raw_hi.copy_(high)
-        cache.scale.copy_(scale)
-        cache.scale_hi.copy_(high_scale)
-
-
-def publish_main_encoded(
     cache: "PagedCacheRows",
     records: torch.Tensor,
     words: torch.Tensor,
     scales: torch.Tensor,
 ) -> None:
+    """Publish the fused compressor's CSA2 words/scales at physical ``records``."""
     assert cache.scale is not None
+    args = (records.int(), words, scales.reshape(-1))
     if cache.raw_hi is None:
-        raw, scale = _ops["publish_main_encoded"](
-            cache.raw, cache.scale, records.int(), words, scales.reshape(-1)
-        )
+        raw, scale = _ops["publish_main"](cache.raw, cache.scale, *args)
         cache.raw.copy_(raw)
         cache.scale.copy_(scale)
     else:
         assert cache.scale_hi is not None
-        raw, high, scale, high_scale = _ops["publish_main_encoded_banked"](
-            cache.raw,
-            cache.raw_hi,
-            cache.scale,
-            cache.scale_hi,
-            records.int(),
-            words,
-            scales.reshape(-1),
+        raw, high, scale, high_scale = _ops["publish_main_banked"](
+            cache.raw, cache.raw_hi, cache.scale, cache.scale_hi, *args
         )
         cache.raw.copy_(raw)
         cache.raw_hi.copy_(high)

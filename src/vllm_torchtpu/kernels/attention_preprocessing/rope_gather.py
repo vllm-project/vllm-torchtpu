@@ -80,10 +80,3 @@ def check_rope_rows(rope_rows, tokens, head_dim):
     rotary_dim = rope_rows.shape[1]
     if rotary_dim % 2 or not 0 < rotary_dim <= _LANE or rotary_dim >= head_dim:
         raise ValueError("Rotary dim must be even, at most one lane block")
-
-
-def split_cos_sin(cos_sin_cache, positions):
-    """Reference helper: gathered ``(cos, sin)`` halves, clamped like gather_rows."""
-    rows = gather_rows(cos_sin_cache, positions)
-    half = cos_sin_cache.shape[1] // 2
-    return rows[:, :half], rows[:, half:]

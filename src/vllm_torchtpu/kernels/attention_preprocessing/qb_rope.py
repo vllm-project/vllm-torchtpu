@@ -449,22 +449,3 @@ def _check_projection_shapes(qr, weight, scale):
         raise ValueError("Use one weight scale per output column")
     if scale.dtype != jnp.float32:
         raise ValueError("Weight scales must be FP32")
-
-
-def supported(qr, weight, weight_scale, rope_rows, head_dim=512) -> bool:
-    """Whether ``fused_qb_rope`` accepts these concrete lowering inputs."""
-    try:
-        _check_projection_shapes(qr, weight, weight_scale)
-        if head_dim <= 0 or head_dim % _LANE or weight.shape[1] % head_dim:
-            return False
-        rope_gather.check_rope_rows(rope_rows, qr.shape[0], head_dim)
-        heads = weight.shape[1] // head_dim
-        if heads % 4:
-            return False
-        padded = -(-qr.shape[0] // _ROW_ALIGN) * _ROW_ALIGN
-        config = select_config(padded, qr.shape[1], weight.shape[1], heads)
-        segment = _segment_tokens(config, padded, qr.shape[1], heads, head_dim)
-        check_config(config, segment, heads)
-    except (ValueError, StopIteration):
-        return False
-    return True

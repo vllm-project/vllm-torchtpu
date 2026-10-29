@@ -507,18 +507,3 @@ def _check_ring(state, ring_write, ring_read, tokens, ratio):
         if records.shape != (tokens,) or not jnp.issubdtype(records.dtype, jnp.integer):
             raise ValueError("Ring records must be integer [tokens]")
     return len(pools)
-
-
-def supported(x, weight, gamma, rope_rows, ratio) -> bool:
-    """Whether ``fused_compress_rope`` accepts these concrete lowering inputs."""
-    if ratio not in (1, 2) or x.ndim != 2 or x.shape[0] == 0:
-        return False
-    if x.dtype != jnp.bfloat16 or weight.dtype != jnp.bfloat16:
-        return False
-    if weight.shape != (x.shape[1], ratio * _DIM) or gamma.shape != (_DIM,):
-        return False
-    try:
-        rope_gather.check_rope_rows(rope_rows, x.shape[0], _DIM)
-    except ValueError:
-        return False
-    return True
