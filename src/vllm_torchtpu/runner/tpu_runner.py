@@ -5149,6 +5149,7 @@ class TPUModelRunner(GPUModelRunner):
             bonus_logits, target_logits = self.spec_gather_bonus_and_target_logits(
                 logits, md.bonus_logits_indices, md.target_logits_indices
             )
+            host_phases.mark("vfy_gather")
             if grammar_output is not None:
                 target_logits, bonus_logits = (
                     self.structured_decoding_manager.mask_spec_logits(
@@ -5188,6 +5189,7 @@ class TPUModelRunner(GPUModelRunner):
                 topk_candidates = self._sampler_topk_candidates(
                     cur_start_idx, cur_end_idx, grammar_output
                 )
+                host_phases.mark("vfy_params")
                 bonus_u = torch.rand_like(
                     bonus_logits, dtype=torch.float32, generator=sampling_generator
                 )
@@ -5201,6 +5203,7 @@ class TPUModelRunner(GPUModelRunner):
                     topk_candidates=topk_candidates,
                     apply_topk_topp=self._sampler_applies_topk_topp(),
                 ).view(-1)
+                host_phases.mark("vfy_bonus_sample")
         accept_u = None
         assert self.rejection_sampler is not None
         assert self.speculative_config is not None
@@ -5229,6 +5232,7 @@ class TPUModelRunner(GPUModelRunner):
         recover_u = torch.rand_like(
             target_logits, dtype=torch.float32, generator=sampling_generator
         )
+        host_phases.mark("vfy_rand")
         return self.rejection_sampler(
             draft_token_ids=draft_token_ids,
             num_draft_tokens=md.draft_lengths,
@@ -5343,6 +5347,7 @@ class TPUModelRunner(GPUModelRunner):
                             state.top_tokens,
                             min_toks,
                         )
+                    host_phases.mark("vfy_rejection")
                     combined_selected_tokens.append(next_tokens)
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(next_tokens)
