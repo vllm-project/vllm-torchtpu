@@ -66,6 +66,7 @@ def shifted_post_pre_rms(
     norm_weight: jax.Array | None = None,
     norm_eps: float = 1e-06,
     fused_gates: bool = True,
+    donate_flat: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Update residuals and collapse with incoming pre; predict next gates.
 
@@ -73,6 +74,15 @@ def shifted_post_pre_rms(
     Activations are BF16; gates are FP32. Weight is packed BF16 [20480,128].
     Three-component mixing and BF16 residual/collapse rounding are retained;
     streamed square sums change the reference reduction order.
+
+    ``donate_flat`` opts into the in-place contract: the tile kernel declares
+    the residual output as an alias of the ``flat`` operand, so ``flat`` is
+    overwritten and the residual write costs no extra HBM traffic.  **It is a
+    contract change, not a pure addition**: the caller must guarantee that
+    ``flat`` (and the tensor it was flattened from) is not read after the call.
+    The current seam call site satisfies this -- ``flat`` is consumed only as
+    the second Pallas operand and the caller rebinds the name immediately -- but
+    the guarantee lives in the caller, so the default stays ``False``.
 
     With ``fused_gates`` the gate tensors are token-major (``[T,M]`` /
     ``[T,M,M]``) at both ends: the previous seam's output feeds this seam's
@@ -415,6 +425,7 @@ def shifted_post_pre_rms(
             hc_post_mult_value=hc_post_mult_value,
             sinkhorn_repeat=sinkhorn_repeat,
             norm_eps=norm_eps,
+            donate_flat=donate_flat,
             constrain_activations_to_hbm=constrain_activations_to_hbm,
         )
 
@@ -600,6 +611,7 @@ def _fused_gates_call(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     norm_eps: float,
+    donate_flat: bool,
     constrain_activations_to_hbm: bool,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """One Pallas launch: activation tile loop plus the gate epilogue.
@@ -935,8 +947,12 @@ def _fused_gates_call(
             else arg
         )
 
+    # {input_index: output_index}; this JAX build consumes a dict and does
+    # `for i_idx, o_idx in input_output_aliases.items()`.
+    alias_kwargs = {"input_output_aliases": {1: 3}} if donate_flat else {}
     gpre, gpost, gcomb, residual, value = pl.pallas_call(
         kernel,
+        **alias_kwargs,
         in_specs=[hbm] * 6
         + [pl.BlockSpec(memory_space=pltpu.VMEM)] * 2
         + [tuple(pl.BlockSpec(memory_space=pltpu.HBM) for _ in norm_args)],
