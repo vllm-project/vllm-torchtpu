@@ -351,15 +351,16 @@ def stage_sal_columns(
     # TPU register tiles have 8 sublanes; pad both matmul dimensions to a
     # multiple of `sublane_tile`.
     sublane_tile = 8
-    rows_pad = sublane_tile
+    rows_pad = pl.cdiv(n, sublane_tile) * sublane_tile
     groups_pad = pl.cdiv(groups, sublane_tile) * sublane_tile
-    assert n <= rows_pad and len(lane_offsets) == n, (n, rows_pad)
+    # The staged lanes then span at most two 128-lane tiles.
+    assert n <= lanes and len(lane_offsets) == n, (n, lanes)
     padded_records = records.astype(jnp.int32)
     if n < rows_pad:
         padded_records = jnp.concatenate(
             [padded_records, jnp.zeros((rows_pad - n, width), jnp.int32)], axis=0
         )
-    padded_records = padded_records.astype(jnp.bfloat16)  # (8, width)
+    padded_records = padded_records.astype(jnp.bfloat16)  # (rows_pad, width)
 
     lane_offset = first_lane & (lanes - 1)
     token_idx = jax.lax.broadcasted_iota(jnp.int32, (rows_pad, lanes), 0)
@@ -368,7 +369,7 @@ def stage_sal_columns(
     for i, offset in enumerate(lane_offsets):
         lane_i = jnp.where(offset >= 0, (lane_offset + offset) & (lanes - 1), -1)
         target_lane = jnp.where(token_idx == i, lane_i, target_lane)
-    place = (lane_idx == target_lane).astype(jnp.bfloat16)  # (8, 128)
+    place = (lane_idx == target_lane).astype(jnp.bfloat16)  # (rows_pad, 128)
 
     # Row `out_row = byte_in_word * groups_pad + group_idx` picks byte
     # `4 * group_idx + byte_in_word` (the 4 byte planes stacked).
@@ -384,7 +385,7 @@ def stage_sal_columns(
         padded_records,
         (((1,), (1,)), ((), ())),
         preferred_element_type=jnp.float32,
-    )  # (4 * groups_pad, 8)
+    )  # (4 * groups_pad, rows_pad)
     placed = jnp.dot(
         planes.astype(jnp.bfloat16), place, preferred_element_type=jnp.float32
     ).astype(jnp.int32)  # (4 * groups_pad, 128)
