@@ -386,7 +386,12 @@ def _sharded_runai_weights_iterator(
 
         def _device_sync() -> None:
             try:
+                from torch_tpu._internal import sync as _tpu_sync
+                _tpu_sync.synchronize(wait=True)
                 torch.accelerator.synchronize()
+                import ctypes, gc
+                gc.collect()
+                ctypes.CDLL(None).malloc_trim(0)
             except Exception:
                 logger.warning_once(
                     "[sharded-ep-load] torch.accelerator.synchronize() unavailable "
@@ -895,6 +900,7 @@ class ExpertParamStager:
     def flush_all(self) -> None:
         for param, _ in list(self._staged.values()):
             self.flush(param)
+        self._pool.clear()
 
     def __len__(self) -> int:
         return len(self._staged)
