@@ -124,3 +124,38 @@ def test_summarize_spec_bench_multi_batch(tmp_path: Path):
     table_text = format_summary_table(summary)
     assert "TPU — max_num_seqs = 1" in table_text
     assert "TPU — max_num_seqs = 4" in table_text
+
+
+def test_summarize_spec_bench_keeps_zero_values(tmp_path: Path):
+    """A field that is present with value 0 must not fall back to an alias key."""
+    results_dir = tmp_path / "results"
+    path = results_dir / "bs1" / "k0_rep1.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "duration": 0.0,
+                "benchmark_duration": 99.0,
+                "completed": 0,
+                "output_throughput": 0.0,
+                "output_token_throughput": 123.0,
+            }
+        )
+    )
+
+    summary = aggregate_spec_results(results_dir)
+
+    assert summary[1][0]["e2e_s"] == 0.0
+    assert summary[1][0]["output_throughput"] == 0.0
+
+
+def test_summarize_spec_bench_completed_is_int(tmp_path: Path):
+    """`completed` is a request count: report the fewest completed across reps."""
+    results_dir = tmp_path / "results"
+    _create_mock_result(results_dir / "bs1" / "k0_rep1.json", 100.0, completed=99)
+    _create_mock_result(results_dir / "bs1" / "k0_rep2.json", 100.0, completed=100)
+
+    summary = aggregate_spec_results(results_dir)
+
+    assert summary[1][0]["completed"] == 99
+    assert isinstance(summary[1][0]["completed"], int)
