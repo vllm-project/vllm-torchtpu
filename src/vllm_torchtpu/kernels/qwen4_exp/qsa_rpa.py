@@ -625,6 +625,13 @@ def dcp_combine(out_pair, lse_pair, gate, rank, *, out_dtype=jnp.bfloat16):
     return jnp.where(finite[..., None], gated, 0).astype(out_dtype)
 
 
+def dcp_combine_step(
+    out_pair: jax.Array, lse_pair: jax.Array, gate: jax.Array, rank: jax.Array
+) -> jax.Array:
+    """``dcp_combine`` with a fully annotated signature for ``jax_op``."""
+    return dcp_combine(out_pair, lse_pair, gate, rank)
+
+
 def qsa_attention(
     query,
     gate,

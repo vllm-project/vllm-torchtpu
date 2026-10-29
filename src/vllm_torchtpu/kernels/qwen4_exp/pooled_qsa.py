@@ -2258,12 +2258,36 @@ def pooled_qsa_dcp_step(
 
 
 def pooled_qsa_token_select_dcp_step(
-    qgate, key, value, index_qk, nq, nk, niq, nik, positions, trig, pool, starts, context,
-    ring_ids, main_table, compressed_table, shard_index, dcp_rank,
-    compress_ratio: int, token_topk: int, norm_eps: float, rotary_dim: int, shard_size: int,
-    dcp_size: int = 2, k_scale: float = 1.0, v_scale: float = 1.0, compressed_slot: int = 0,
-    main_slot: int = -1, max_query_len: int = 1,
-):
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    shard_index: jax.Array,
+    dcp_rank: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    shard_size: int,
+    dcp_size: int = 2,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """``pooled_qsa_token_select_step`` whose main-KV writes follow the DCP
     ownership (``qsa_cache_writes(dcp=...)``)."""
     return _pooled_qsa(
@@ -2276,11 +2300,26 @@ def pooled_qsa_token_select_dcp_step(
 
 
 def pooled_qsa_shard_attend_dcp_step(
-    q, gate, lengths, req, starts, main_table, context, pool, gathered, dcp_rank,
-    kv_heads: int, compress_ratio: int, token_topk: int, dcp_size: int = 2,
-    k_scale: float = 1.0, v_scale: float = 1.0, main_slot: int = -1,
-    max_query_len: int = 1, merged: bool = False,
-):
+    q: jax.Array,
+    gate: jax.Array,
+    lengths: jax.Array,
+    req: jax.Array,
+    starts: jax.Array,
+    main_table: jax.Array,
+    context: jax.Array,
+    pool: jax.Array,
+    gathered: jax.Array,
+    dcp_rank: jax.Array,
+    kv_heads: int,
+    compress_ratio: int,
+    token_topk: int,
+    dcp_size: int = 2,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+    merged: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """``pooled_qsa_shard_attend_step`` over this rank's DCP main-KV rows:
     returns ``(pool, out, lse, selected)`` for ``qsa_rpa.dcp_combine``."""
     return _shard_attend(
