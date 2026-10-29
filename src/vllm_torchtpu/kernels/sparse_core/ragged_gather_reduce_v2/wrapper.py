@@ -191,12 +191,13 @@ def ragged_gather_reduce_v2(
         subcore_axis_name=cfg.subcore_axis_name,
     )
 
-    # The output gets one extra row: the kernel's garbage scatter destination.
+    # The output gets one extra row per SIMD lane: the kernel's garbage scatter
+    # destinations.
     out = core_map_helper.kernel(
         functools.partial(main_kernel, cfg=cfg),
         out_type=jax.ShapeDtypeStruct(
             (
-                cfg.padded_input_size // reduce_group_size + 1,
+                cfg.padded_input_size // reduce_group_size + cfg.sc_info.num_lanes,
                 cfg.aligned_hidden_size,
             ),
             jnp.float32,

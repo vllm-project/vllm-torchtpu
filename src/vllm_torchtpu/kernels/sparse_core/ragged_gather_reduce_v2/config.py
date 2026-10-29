@@ -125,16 +125,15 @@ class Config:
         words_per_subcore = self.sc_info.vmem_capacity_bytes // 4
         num_simd_lanes = self.sc_info.num_lanes
         # Input-size-independent resident scratch (32-bit words): prev-row carry
-        # (col_size), out_vmem + column gather double-buffer (3*lanes*col_chunk),
-        # the num_rows + next-window-first-row vectors (2*lanes), and 6 row
-        # index/dma buffers + the row gather pipeline double-buffers (10*row_chunk).
+        # (col_size), the double-buffered output and column gather
+        # (4*lanes*col_chunk), and the num_rows + next-window-first-row vectors
+        # (2*lanes). Each window row keeps its sort index, source row and weight.
         fixed = (
             self.col_size
-            + 3 * num_simd_lanes * self.col_chunk_size
+            + 4 * num_simd_lanes * self.col_chunk_size
             + 2 * num_simd_lanes
-            + 10 * self.row_chunk_size
         )
-        window = (int(words_per_subcore * 0.9) - fixed) // self.row_chunk_size
+        window = (int(words_per_subcore * 0.9) - fixed) // (3 * self.row_chunk_size)
         return max(1, min(window, max(1, self.max_blocks_per_partition)))
 
     @property
