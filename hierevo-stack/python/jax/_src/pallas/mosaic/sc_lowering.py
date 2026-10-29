@@ -1,0 +1,1070 @@
+# Copyright 2025 The JAX Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Lowering for Pallas TPU SparseCore."""
+
+from collections.abc import Sequence
+import functools
+from typing import Any, NoReturn, cast
+import warnings
+
+from jax._src import core as jax_core
+from jax._src import debugging
+from jax._src import lax
+from jax._src import numpy as jnp
+from jax._src import state
+from jax._src import tree_util
+from jax._src import util
+from jax._src.lib.mlir import ir
+from jax._src.lib.mlir.dialects import arith
+from jax._src.lib.mlir.dialects import memref
+from jax._src.lib.mlir.dialects import vector
+from jax._src.pallas import core as pallas_core
+from jax._src.pallas import primitives as pallas_primitives
+from jax._src.pallas.mosaic import core as tpu_core
+from jax._src.pallas.mosaic import lowering as tc_lowering
+from jax._src.pallas.mosaic import primitives as tpu_primitives
+from jax._src.pallas.mosaic import sc_core
+from jax._src.state import indexing
+from jax._src.state import primitives as state_primitives
+from jax.experimental.mosaic.dialects import tpu
+
+
+map, unsafe_map = util.safe_map, map
+zip, unsafe_zip = util.safe_zip, zip
+
+
+MemorySpace = tpu_core.MemorySpace
+CoreMemorySpace = pallas_core.CoreMemorySpace
+
+ShapedAbstractValue = tc_lowering.ShapedAbstractValue
+
+LoweringContext = tc_lowering.LoweringContext
+LoweringRuleContext = tc_lowering.LoweringRuleContext
+MosaicGridMapping = tc_lowering.MosaicGridMapping
+
+_dtype_to_ir_type = tc_lowering._dtype_to_ir_type
+_transform_ref = tc_lowering._transform_ref
+_dma_unflatten = tpu_primitives._dma_unflatten
+_get_ref_and_transforms = tpu_primitives._get_ref_and_transforms
+
+
+register_lowering_rule = functools.partial(
+    tc_lowering.register_lowering_rule,
+    kernel_types=(
+        tpu_core.CoreType.SC_SCALAR_SUBCORE,
+        tpu_core.CoreType.SC_VECTOR_SUBCORE,
+    ),
+)
+
+
+@register_lowering_rule(state_primitives.get_p)
+def _get_lowering_rule(ctx: LoweringRuleContext, ref, *flat_transforms, tree):
+  return _load_lowering_rule(
+      ctx, ref, None, *flat_transforms, tree=tree, expand=False
+  )
+
+
+def _load_vreg(
+    ctx: LoweringRuleContext,
+    out_vec_type: ir.VectorType,
+    ref: ir.Value,
+    starts: Sequence[ir.Value],
+    mask: ir.Value | None,
+    expand: bool = False,
+) -> ir.Value:
+  if mask is not None:
+    # TODO(naumsmogers): once we support non-expand masked loads, differentiate
+    # ops here.
+    assert expand
+    if not ctx.forward_compatible:
+      return tpu.expand_load_vreg(out_vec_type, ref, indices=starts, mask=mask)
+    # TODO: b/481866110 - Remove tpu.vector_load in favor of
+    # tpu.expand_load_vreg above after 10/20/2026.
+    return tpu.vector_load(
+        out_vec_type, ref, indices=starts, strides=[], mask=mask
+    )
+  assert not expand
+  return tpu.load(
+      out_vec_type,
+      ref,
+      indices=starts,
+      sublane_mask=[True] * sc_core.get_sparse_core_info().num_lanes,
+  )
+
+
+def _vector_load(
+    ctx: LoweringRuleContext,
+    memref_vec_type: ir.VectorType,
+    ref: ir.Value,
+    starts: Sequence[ir.Value],
+    mask: ir.Value | None,
+    expand: bool = False,
+) -> ir.Value:
+  if mask is not None:
+    # TODO(naumsmogers): once we support non-expand masked loads, differentiate
+    # ops here.
+    assert expand
+    mask_memref_type = ir.VectorType.get(
+        memref_vec_type.shape, ir.IntegerType.get_signless(1)
+    )
+    mask_memref_rank = vector.shape_cast(mask_memref_type, mask)
+    if not ctx.forward_compatible:
+      return tpu.vector_expand_load(
+          result=memref_vec_type,
+          base=ref,
+          indices=starts,
+          mask=mask_memref_rank,
+          expand_dim=len(memref_vec_type.shape) - 1,
+      )
+    else:
+      return tpu.vector_load(
+          memref_vec_type,
+          ref,
+          indices=starts,
+          strides=[],
+          mask=mask_memref_rank,
+      )
+  else:
+    assert not expand
+    return tpu.vector_load(
+        memref_vec_type, ref, indices=starts, strides=[], mask=None
+    )
+
+
+def _load_lowering_rule(
+    ctx: LoweringRuleContext, ref, mask, *flat_transforms, tree, expand
+):
+  if expand and mask is None:
+    raise ValueError("Expand load requires a mask")
+  if not expand and mask is not None:
+    # TODO(naumsmogers): Support non-expand masked loads.
+    raise NotImplementedError("Non-expand load does not support masks")
+
+  ref_aval, *_flat_index_avals = ctx.avals_in
+  assert isinstance(ref_aval, state.AbstractRef)
+  [out_aval] = ctx.avals_out
+  assert isinstance(out_aval, jax_core.ShapedArray)
+
+  transforms = list(tree_util.tree_unflatten(tree, flat_transforms))
+  tref_aval = state.transform_type(transforms, ref_aval)
+  assert isinstance(tref_aval, state.AbstractRef)
+
+  ref_memory_space = tpu_core.memory_space_to_tpu_memory_space(
+      tref_aval.memory_space, ctx.lowering_context.kernel_type
+  )
+  if (
+      ref_memory_space is MemorySpace.HBM
+      or ref_memory_space is MemorySpace.VMEM_SHARED
+  ):
+    raise NotImplementedError(
+        f"Get does not support loading from {ref_memory_space!r}."
+        " Copy the data to a core-local memory space, e.g. VMEM,"
+        " via `pltpu.async_copy`."
+    )
+
+  if not transforms or not isinstance(transforms[-1], indexing.NDIndexer):
+    transforms.append(indexing.NDIndexer.make_trivial_indexer(tref_aval.shape))
+  *prev_transforms, indexer = transforms
+  ref_block_shape, *_ = ctx.block_shapes
+  ref, ref_block_shape = _transform_ref(
+      ref,
+      ref_aval,
+      ref_block_shape,
+      prev_transforms,
+      kernel_type=ctx.lowering_context.kernel_type,
+  )
+  starts, sizes, strides, squeeze_dims, _ = tc_lowering._indexer_to_start_size_stride(
+      indexer, ref_block_shape, cast_to_index=True
+  )
+  for first_nontrivial_dim, s in enumerate(sizes):
+    if s != 1:
+      break
+  else:
+    first_nontrivial_dim = len(sizes)
+  if any(squeeze_dims[first_nontrivial_dim:]):
+    raise NotImplementedError(
+        "Integer indexing of refs that follows a non-trivial slice is not"
+        " supported on SC"
+    )
+  if not all(s == 1 for s in strides):
+    raise NotImplementedError(
+        f"Get only supports slices with stride 1, got {strides}"
+    )
+
+  if (out_aval.ndim == 0) != (ref_memory_space is MemorySpace.SMEM):
+    message = "Get only supports loading scalars from SMEM."
+    if ref_memory_space is MemorySpace.SMEM:
+      message += f" Trying to load an array of shape {out_aval.shape}."
+    elif ref_memory_space is MemorySpace.VMEM:
+      message += (
+          " To load a scalar from VMEM, load an array first and then extract a"
+          " particular element, e.g. ``v = ref[pl.ds(idx, ...)]; v[0]``."
+      )
+    else:
+      message += f" Trying to load a scalar from {ref_memory_space!r}."
+    raise NotImplementedError(message)
+  if out_aval.ndim == 0:
+    if mask is not None:
+      raise NotImplementedError("Get does not support masked scalar loads")
+    return memref.load(ref, starts)
+
+  if not ctx.lowering_context.needs_layout_passes:
+    _check_aval_is_supported("Get", out_aval)
+  out_vec_type = ir.VectorType.get(
+      out_aval.shape, _dtype_to_ir_type(out_aval.dtype)
+  )
+  if not ctx.lowering_context.needs_layout_passes:
+    return _load_vreg(ctx, out_vec_type, ref, starts, mask, expand)
+  # Load at the full memref rank, keeping integer-indexed dims as size 1,
+  # because apply-vector-layout requires the vector rank to match the memref.
+  memref_vec_shape = cast(
+      Sequence[int],
+      [1 if squeeze else s for s, squeeze in zip(sizes, squeeze_dims)],
+  )
+  memref_vec_type = ir.VectorType.get(
+      memref_vec_shape, _dtype_to_ir_type(out_aval.dtype)
+  )
+  load_val = _vector_load(ctx, memref_vec_type, ref, starts, mask, expand)
+  return vector.shape_cast(out_vec_type, load_val)
+
+
+@register_lowering_rule(state_primitives.swap_p)
+def _swap_lowering_rule(
+    ctx: LoweringRuleContext, ref, val, *flat_transforms, tree
+):
+  return _store_lowering_rule(
+      ctx,
+      ref,
+      val,
+      None,
+      *flat_transforms,
+      tree=tree,
+      add=False,
+      compress=False,
+  )
+
+
+def _store_lowering_rule(
+    ctx: LoweringRuleContext,
+    ref,
+    val,
+    mask,
+    *flat_transforms,
+    tree,
+    add,
+    compress,
+):
+  if compress and mask is None:
+    raise ValueError("Compress swap requires a mask")
+  if not compress and mask is not None:
+    # TODO(naumsmogers): Support non-compress masked stores.
+    raise NotImplementedError("Non-compress swap does not support masks")
+
+  ref_aval, _, *_flat_index_avals = ctx.avals_in
+  assert isinstance(ref_aval, state.AbstractRef)
+  [out_aval] = ctx.avals_out
+  assert isinstance(out_aval, jax_core.ShapedArray)
+
+  transforms = list(tree_util.tree_unflatten(tree, flat_transforms))
+  tref_aval = state.transform_type(transforms, ref_aval)
+  assert isinstance(tref_aval, state.AbstractRef)
+
+  ref_memory_space = tpu_core.memory_space_to_tpu_memory_space(
+      tref_aval.memory_space, ctx.lowering_context.kernel_type
+  )
+  if (
+      ref_memory_space is MemorySpace.HBM
+      or ref_memory_space is MemorySpace.VMEM_SHARED
+  ):
+    raise NotImplementedError(
+        f"Swap does not support storing to {ref_memory_space!r}."
+        " Copy the data to a core-local memory space, e.g. VMEM,"
+        " via `pltpu.async_copy`."
+    )
+
+  if not transforms or not isinstance(transforms[-1], indexing.NDIndexer):
+    transforms.append(indexing.NDIndexer.make_trivial_indexer(tref_aval.shape))
+  *prev_transforms, indexer = transforms
+  ref_block_shape, *_ = ctx.block_shapes
+  ref, ref_block_shape = _transform_ref(
+      ref,
+      ref_aval,
+      ref_block_shape,
+      prev_transforms,
+      kernel_type=ctx.lowering_context.kernel_type,
+  )
+  starts, sizes, strides, squeeze_dims, _ = tc_lowering._indexer_to_start_size_stride(
+      indexer, ref_block_shape, cast_to_index=True
+  )
+  for first_nontrivial_dim, s in enumerate(sizes):
+    if s != 1:
+      break
+  else:
+    first_nontrivial_dim = len(sizes)
+  if any(squeeze_dims[first_nontrivial_dim:]):
+    raise NotImplementedError(
+        "Integer indexing of refs that follows a non-trivial slice is not"
+        " supported on SC"
+    )
+  if not all(s == 1 for s in strides):
+    raise NotImplementedError(
+        f"Swap only supports slices with stride 1, got {strides}"
+    )
+
+  if (out_aval.ndim == 0) != (ref_memory_space is MemorySpace.SMEM):
+    message = "Swap only supports scalars in SMEM."
+    if ref_memory_space is MemorySpace.SMEM:
+      message += f" Trying to swap an array of shape {out_aval.shape}."
+    else:
+      message += f" Trying to swap a scalar in {ref_memory_space!r}."
+    raise NotImplementedError(message)
+
+  if out_aval.ndim == 0:
+    if mask is not None:
+      raise NotImplementedError("Swap does not support masked scalar stores")
+    if add:
+      # TODO(slebedev): We can use memref.atomic_rmw here, but the SC compiler
+      # doesn't support it yet.
+      raise NotImplementedError("Swap does not support atomic scalar adds")
+    old_val = memref.load(ref, starts)
+    memref.store(val, ref, starts)
+    return old_val
+
+  if not ctx.lowering_context.needs_layout_passes:
+    _check_aval_is_supported("Swap", out_aval)
+  out_vec_type = ir.VectorType.get(
+      out_aval.shape, _dtype_to_ir_type(out_aval.dtype)
+  )
+  if not ctx.lowering_context.needs_layout_passes:
+    old_val = _load_vreg(ctx, out_vec_type, ref, starts, mask, expand=compress)
+    if mask is not None:
+      # TODO(naumsmogers): once we support non-compress masked stores,
+      # differentiate ops here.
+      assert compress
+      if not ctx.forward_compatible:
+        tpu.compress_store_vreg(val, ref, indices=starts, mask=mask, add=add)
+      else:
+        # TODO: b/481866110 - Remove tpu.vector_store in favor of
+        # tpu.compress_store_vreg above after 10/13/2026.
+        tpu.vector_store(
+            val, ref, indices=starts, strides=[], mask=mask, add=add
+        )
+    else:
+      assert not compress
+      tpu.store(
+          val,
+          ref,
+          indices=starts,
+          sublane_mask=[True] * sc_core.get_sparse_core_info().num_lanes,
+          add=add,
+      )
+    return old_val
+  # Load and store at the full memref rank, keeping integer-indexed dims as
+  # size 1, because apply-vector-layout requires the vector rank to match
+  # the memref.
+  memref_vec_shape = cast(
+      Sequence[int],
+      [1 if squeeze else s for s, squeeze in zip(sizes, squeeze_dims)],
+  )
+  memref_vec_type = ir.VectorType.get(
+      memref_vec_shape, _dtype_to_ir_type(out_aval.dtype)
+  )
+  old_val = _vector_load(
+      ctx, memref_vec_type, ref, starts, mask, expand=compress
+  )
+  old_val = vector.shape_cast(out_vec_type, old_val)
+  val_memref_rank = vector.shape_cast(memref_vec_type, val)
+  if mask is not None:
+    assert compress
+    mask_memref_type = ir.VectorType.get(
+        memref_vec_shape, ir.IntegerType.get_signless(1)
+    )
+    mask_memref_rank = vector.shape_cast(mask_memref_type, mask)
+    if not ctx.forward_compatible:
+      # TODO(naumsmogers): once we support non-compress masked stores,
+      # differentiate ops here.
+      tpu.vector_compress_store(
+          val_memref_rank,
+          ref,
+          indices=starts,
+          mask=mask_memref_rank,
+          compress_dim=len(memref_vec_shape) - 1,
+          add=add,
+      )
+    else:
+      tpu.vector_store(
+          val_memref_rank,
+          ref,
+          starts,
+          strides=[],
+          mask=mask_memref_rank,
+          add=add,
+      )
+  else:
+    assert not compress
+    tpu.vector_store(
+        val_memref_rank, ref, starts, strides=[], mask=None, add=add
+    )
+  return old_val
+
+
+@register_lowering_rule(lax.iota_p,
+                        kernel_types=[tpu_core.CoreType.SC_VECTOR_SUBCORE])
+def _iota_lowering_rule_sc(ctx: LoweringRuleContext, dtype, shape, dimension,
+                           sharding):
+  sc_info = sc_core.get_sparse_core_info()
+  if shape != (sc_info.num_lanes,):
+    raise ValueError(
+        f"Unsupported iota shape for SC vector subcore. Got {shape}, supported "
+        f"shape is {(sc_info.num_lanes,)}."
+    )
+  [out_aval] = ctx.avals_out
+  out_type = ir.VectorType.get(
+      [sc_info.num_lanes], _dtype_to_ir_type(out_aval.dtype)
+  )
+  return tpu.iota(out_type, dimensions=[dimension])
+
+
+def _check_aval_is_supported(caller: str, aval: jax_core.ShapedArray) -> None:
+  supported_shapes = sc_core.supported_shapes(aval.dtype)
+  if aval.shape in supported_shapes:
+    return
+  if not supported_shapes:
+    raise NotImplementedError(f"{caller} does not support {aval.dtype} arrays")
+  else:
+    raise NotImplementedError(
+        f"{caller} only supports {aval.dtype} arrays of shapes"
+        f" [{', '.join(map(repr, supported_shapes))}], got {aval.shape}"
+    )
+
+
+@register_lowering_rule(debugging.debug_print_p)
+def _debug_print_lowering_rule(
+    ctx: LoweringRuleContext,
+    *dyn_args,
+    fmt: str,
+    ordered,
+    partitioned,
+    in_tree,
+    static_args,
+    np_printoptions,
+    has_placeholders,
+    logging_record,
+):
+  del partitioned, np_printoptions, logging_record
+  def fail(reason: str) -> NoReturn:
+    raise NotImplementedError(
+        f"pl.debug_print() {reason} when lowering to SparseCore"
+    )
+
+  if ordered:
+    fail("does not support ordered print")
+  if has_placeholders:
+    fail("does not support placeholders")
+
+  args, kwargs = debugging.merge_callback_args(in_tree, dyn_args, static_args)
+  if kwargs:
+    fail("does not support keyword arguments")
+  avals, _ = debugging.merge_callback_args(
+      in_tree, list(ctx.avals_in), static_args
+  )
+
+  match args:
+    case []:
+      tpu.log(inputs=[], tag=fmt)
+    case [state.TransformedRef() as tref]:
+      ref, transforms = _get_ref_and_transforms(tref)
+      ref_aval, _ = _get_ref_and_transforms(avals[0])
+      assert isinstance(ref_aval, state.AbstractRef)
+      ref, _ = _transform_ref(
+          ref,
+          ref_aval,
+          ref_aval.shape,
+          transforms,
+          kernel_type=ctx.lowering_context.kernel_type,
+      )
+      tpu.log_buffer(ref, avals[0].shape, fmt)
+    case [arg] if isinstance(arg.type, ir.MemRefType):
+      tpu.log_buffer(arg, avals[0].shape, fmt)
+    case [arg]:
+      tpu.log(inputs=[arg], tag=fmt)
+    case _:
+      fail("does not support multiple inputs")
+  return []
+
+
+def _prepare_dma_refs(
+    src_ref,
+    dst_ref,
+    src_aval,
+    dst_aval,
+    core_type: tpu_core.CoreType,
+    is_add: bool = False,
+):
+  """Prepares the DMA source and destination references."""
+  src_ref_orig, dst_ref_orig = src_ref, dst_ref
+  src_memory_space = tpu_core.memory_space_to_tpu_memory_space(
+      src_aval.memory_space, core_type
+  )
+  dst_memory_space = tpu_core.memory_space_to_tpu_memory_space(
+      dst_aval.memory_space, core_type
+  )
+  src_ref, src_transforms = _get_ref_and_transforms(src_ref)
+  dst_ref, dst_transforms = _get_ref_and_transforms(dst_ref)
+  src_aval, src_transforms_aval = _get_ref_and_transforms(src_aval)
+  dst_aval, dst_transforms_aval = _get_ref_and_transforms(dst_aval)
+  match src_memory_space, dst_memory_space:
+    case MemorySpace.HBM | MemorySpace.VMEM_SHARED, MemorySpace.VMEM:
+      if _has_indirect_offsets(dst_transforms, dst_transforms_aval, core_type):
+        raise ValueError(
+            "Only the source ref can be indexed when doing a gather via"
+            " `pltpu.async_copy`"
+        )
+      dst_ref, _ = _transform_ref(
+          dst_ref,
+          dst_aval,
+          dst_aval.shape,
+          dst_transforms,
+          kernel_type=core_type,
+      )
+      dst_ref_shape = tuple(ir.MemRefType(dst_ref.type).shape)
+      indirect_offsets, src_transforms = _extract_indirect_offsets(
+          src_transforms, dst_ref_shape, src_transforms_aval, core_type
+      )
+      src_ref, _ = _transform_ref(
+          src_ref,
+          src_aval,
+          src_aval.shape,
+          src_transforms,
+          kernel_type=core_type,
+      )
+      indirect_offsets_ref_str = "src_ref"
+    case MemorySpace.VMEM, MemorySpace.HBM | MemorySpace.VMEM_SHARED:
+      if is_add and dst_memory_space is not MemorySpace.VMEM_SHARED:
+        raise ValueError(
+            "Scatter from VMEM with `add=True` via `pltpu.async_copy` is only"
+            " supported when the destination is in VMEM_SHARED, got"
+            f" {dst_memory_space!r}"
+        )
+      if _has_indirect_offsets(src_transforms, src_transforms_aval, core_type):
+        raise ValueError(
+            "Only the destination ref can be indexed when doing a scatter via"
+            " `pltpu.async_copy`"
+        )
+      src_ref, _ = _transform_ref(
+          src_ref,
+          src_aval,
+          src_aval.shape,
+          src_transforms,
+          kernel_type=core_type,
+      )
+      src_ref_shape = tuple(ir.MemRefType(src_ref.type).shape)
+      indirect_offsets, dst_transforms = _extract_indirect_offsets(
+          dst_transforms, src_ref_shape, dst_transforms_aval, core_type
+      )
+      dst_ref, _ = _transform_ref(
+          dst_ref,
+          dst_aval,
+          dst_aval.shape,
+          dst_transforms,
+          kernel_type=core_type,
+      )
+      indirect_offsets_ref_str = "dst_ref"
+    case _:  # Indirect DMA is not supported.
+      if (
+          # fmt: off
+          _has_indirect_offsets(src_transforms, src_transforms_aval, core_type) or
+          _has_indirect_offsets(dst_transforms, dst_transforms_aval, core_type)
+          # fmt: on
+      ):
+        raise NotImplementedError(
+            "Scatter/gather via `pltpu.async_copy` from"
+            f" {src_memory_space!r} to {dst_memory_space!r} is not"
+            " supported"
+        )
+      if is_add:
+        raise ValueError(
+            "DMAs with `add=True` are only supported from HBM/VMEM_SHARED to "
+            "VMEM or from VMEM to VMEM_SHARED. "
+            f"Got (src, dst)={(src_aval.memory_space, dst_aval.memory_space)}"
+        )
+      indirect_offsets = None
+      indirect_offsets_ref_str = ""
+  if is_add and indirect_offsets is None:
+    raise NotImplementedError(
+        "DMAs with `add=True` must (for now) specify offsets of the"
+        " majormost dimension. You can do this by writing"
+        " `pltpu.async_copy(..., {ref}={ref}.at[jnp.arange(vec_dim)], ...)`"
+        " or `pltpu.async_copy(..., {ref}={ref}.at[indices_ref],"
+        " ...)`.".format(ref=indirect_offsets_ref_str)
+    )
+  if indirect_offsets is None:
+    # If typical DMA path, don't alter the refs.
+    return src_ref_orig, dst_ref_orig, None, False
+  return src_ref, dst_ref, indirect_offsets, indirect_offsets_ref_str == "dst_ref"
+
+
+def _is_push_stream(
+    ctx: LoweringRuleContext, src_aval: Any, dst_aval: Any, is_local: bool
+) -> bool:
+  """Returns whether a transfer is a SparseCore push stream (DMA)."""
+  core_type = ctx.lowering_context.kernel_type
+  src = tpu_core.memory_space_to_tpu_memory_space(
+      src_aval.memory_space, core_type)
+  dst = tpu_core.memory_space_to_tpu_memory_space(
+      dst_aval.memory_space, core_type)
+  if not is_local:
+    return False
+  if core_type == tpu_core.CoreType.SC_VECTOR_SUBCORE:
+    return src == MemorySpace.VMEM and dst != MemorySpace.VMEM
+  return False
+
+
+# TODO(slebedev): Use the TC rule once we align the ``LoweringRuleContext``
+# with the TC lowering.
+@register_lowering_rule(tpu_primitives.dma_start_p)
+def _dma_start_lowering_rule(
+    ctx: LoweringRuleContext,
+    *args,
+    tree,
+    device_id_type: pallas_primitives.DeviceIdType,
+    priority: int,
+    add: bool,
+    _unsafe_no_write_effect: bool = False,
+):
+  del _unsafe_no_write_effect
+  src_ref, dst_ref, sem, src_sem, device_id = _dma_unflatten(
+      tree, args
+  )
+  src_aval, dst_aval, sem_aval, src_sem_aval, device_id_aval = _dma_unflatten(
+      tree, ctx.avals_in
+  )
+
+  src_ref, dst_ref, indirect_offsets, _ = _prepare_dma_refs(
+      src_ref,
+      dst_ref,
+      src_aval,
+      dst_aval,
+      ctx.lowering_context.kernel_type,
+      add,
+  )
+  if add and indirect_offsets is None:
+    # TODO: Support regular DMA with add=True.
+    raise NotImplementedError(
+        "DMAs with `add=True` must (for now) specify offsets of the majormost "
+        "dimension. You can do this by writing "
+        "`pltpu.async_copy(..., dst_ref=ref.at[jnp.arange(vec_dim)], ...)` or "
+        "`pltpu.async_copy(..., dst_ref=ref.at[iota_ref], ...)`."
+    )
+  is_local = device_id is None
+  core_index = None
+  subcore_index = None
+  if device_id is not None:
+    if sem_aval is not None and isinstance(
+        sem_aval.memory_space, pallas_core.CoreMemorySpace
+    ):
+      dest_mesh = sem_aval.memory_space.mesh
+    else:
+      dest_mesh = None
+    device_id, core_index, subcore_index = tc_lowering._device_id_to_logical(
+        ctx, device_id, device_id_type, device_id_aval, dest_mesh
+    )
+
+  # If not ``None``, we lower to an indirect DMA instead.
+  if indirect_offsets is None:
+    is_push = _is_push_stream(ctx, src_aval, dst_aval, is_local)
+    if is_push and sem is not None:
+      warnings.warn(
+          "Destination semaphore is ignored for push streams (VMEM to HBM, "
+          "VMEM_SHARED or SMEM) on SparseCore; pass `sem=None` to "
+          "`async_copy` to suppress this warning.",
+          sc_core.SparseCorePushStreamWarning,
+      )
+    if is_local and not is_push and src_sem is not None:
+      # Local non-stream DMAs have no source semaphore in Mosaic, so `src_sem`
+      # would have no effect, we reject it instead of silently ignoring it.
+      raise ValueError(
+          "Source semaphore (`src_sem`) on a local copy is only supported for "
+          "push streams (VMEM to HBM, VMEM_SHARED or SMEM) on SparseCore; pass "
+          "`src_sem=None` and use `wait()`, which already guarantees "
+          "completion of this transfer."
+      )
+
+    def _dma_start(src_ref, dst_ref, sem, src_sem):
+      tpu.enqueue_dma(
+          source=src_ref,
+          target=dst_ref,
+          target_semaphore=sem,
+          source_semaphore=src_sem,
+          device_id=device_id,
+          priority=priority,
+          core_id=core_index,
+          subcore_id=subcore_index,
+      )
+      return []
+
+    return tc_lowering.lower_with_transformed_refs(
+        _dma_start,
+        [src_ref, dst_ref, sem, src_sem],
+        [src_aval, dst_aval, sem_aval, src_sem_aval],
+        kernel_type=ctx.lowering_context.kernel_type,
+    )
+
+  if device_id is not None:
+    raise NotImplementedError(
+        "Scatter/gather to or from a remote device via `pltpu.async_copy` is"
+        " not supported"
+    )
+  if sem is None or src_sem is not None:
+    raise NotImplementedError(
+        "Specifying `sem=None` or `src_sem` in async_copy is not yet "
+        "implemented for scatters/gathers."
+    )
+
+  offset_filter = None
+  if indirect_offsets.ignored_value is not None:
+    offset_filter = tc_lowering._ensure_mlir_value(
+        indirect_offsets.ignored_value, jax_core.ShapedArray((), jnp.int32)
+    )
+
+  sem_aval, _ = _get_ref_and_transforms(sem_aval)
+  sem, _ = _transform_ref(
+      sem, sem_aval, sem_aval.shape, kernel_type=ctx.lowering_context.kernel_type
+  )
+  tpu.enqueue_indirect_dma(
+      src_ref,
+      dst_ref,
+      indirect_offsets.values,
+      sem,
+      add=add,
+      offset_filter=offset_filter,
+  )
+  return []
+
+
+# TODO(slebedev): Use the TC rule once we align the ``LoweringRuleContext``
+# with the TC lowering.
+@register_lowering_rule(tpu_primitives.dma_wait_p)
+def _dma_wait_lowering_rule(
+    ctx: LoweringRuleContext,
+    *args,
+    tree,
+    device_id_type: pallas_primitives.DeviceIdType,
+    is_wait_send: bool = False,
+    _unsafe_no_write_effect: bool = False,
+):
+  del _unsafe_no_write_effect
+  src_ref, dst_ref, sem, src_sem, device_id = _dma_unflatten(tree, args)
+  src_aval, dst_aval, sem_aval, src_sem_aval, device_id_aval = _dma_unflatten(
+      tree, ctx.avals_in
+  )
+  if is_wait_send:
+    # `wait_send` pre-swaps (src, dst, dst_sem, src_sem); undo it so that the
+    # operands match the `enqueue_dma` they are awaiting.
+    # TODO(rdyro): Stop swapping in wait_send.
+    src_ref, dst_ref, src_aval, dst_aval = dst_ref, src_ref, dst_aval, src_aval
+    sem, src_sem, sem_aval, src_sem_aval = src_sem, sem, src_sem_aval, sem_aval
+
+  src_ref, dst_ref, indirect_offsets, is_scatter = _prepare_dma_refs(
+      src_ref,
+      dst_ref,
+      src_aval,
+      dst_aval,
+      ctx.lowering_context.kernel_type,
+  )
+  is_local = device_id is None
+  core_id = None
+  subcore_id = None
+  if device_id is not None:
+    if sem_aval is not None and isinstance(
+        sem_aval.memory_space, pallas_core.CoreMemorySpace
+    ):
+      dest_mesh = sem_aval.memory_space.mesh
+    else:
+      dest_mesh = None
+    device_id, core_id, subcore_id = tc_lowering._device_id_to_logical(
+        ctx, device_id, device_id_type, device_id_aval, dest_mesh
+    )
+
+  # If not ``None``, we lower to an indirect DMA instead of a regular DMA.
+  if indirect_offsets is None:
+    if is_local and is_wait_send and not _is_push_stream(
+        ctx, src_aval, dst_aval, is_local
+    ):
+      raise ValueError(
+          "`wait_read()` on a local copy is only supported for push streams "
+          "(VMEM to HBM, VMEM_SHARED or SMEM) on SparseCore; use `wait()` to "
+          "await this transfer and guarantee both read and write completion."
+      )
+
+    def _dma_wait(src_ref, dst_ref, sem, src_sem):
+      # Mosaic's verifier temporarily requires any source semaphore passed to a
+      # wait to live on the issuing core, which only holds for the enqueue.
+      # TODO(rdyro): Always pass it once that is relaxed.
+      tpu.wait_dma(
+          source=src_ref,
+          target=dst_ref,
+          source_semaphore=src_sem if is_wait_send else None,
+          target_semaphore=sem,
+          device_id=device_id,
+          core_id=core_id,
+          subcore_id=subcore_id,
+          wait_target=not is_wait_send,
+      )
+      return []
+    return tc_lowering.lower_with_transformed_refs(
+        _dma_wait,
+        [src_ref, dst_ref, sem, src_sem],
+        [src_aval, dst_aval, sem_aval, src_sem_aval],
+        kernel_type=ctx.lowering_context.kernel_type,
+    )
+
+  if device_id is not None:
+    raise NotImplementedError(
+        "Scatter/gather to or from a remote device via `pltpu.async_copy` is"
+        " not supported"
+    )
+  if sem is None:
+    raise NotImplementedError(
+        "Specifying `sem=None` in async_copy is not yet implemented for"
+        " scatters/gathers: the compiler requires a semaphore."
+    )
+  # Indirect transfers have one semaphore tracking only the local side: the
+  # source for scatters and destination for gathers. `wait_read()` is therefore
+  # valid for scatters, but unsupported for gathers.
+  # TODO(rdyro): Scatters lack a write fence; `wait()` only awaits the read.
+  if is_wait_send and not is_scatter:
+    raise ValueError(
+        "`wait_read()` is only supported for scatters, not gathers; use `wait()`"
+        " to await the write into the local destination."
+    )
+  sem_aval, _ = _get_ref_and_transforms(sem_aval)
+  sem, _ = _transform_ref(
+      sem, sem_aval, sem_aval.shape, kernel_type=ctx.lowering_context.kernel_type
+  )
+  tpu.wait_indirect_dma(sem, src_ref, dst_ref)
+  return []
+
+
+def _extract_indirect_offsets_from_indices(
+    indices: Sequence[Any],
+    indices_aval: Sequence[Any],
+    core_type: tpu_core.CoreType,
+    indexer_shape: tuple[int | Any, ...],
+    expected_shape: tuple[int, ...] | None = None,
+) -> sc_core.Indices | None:
+  """Extracts the indirect offsets from the indices, if there are any.
+
+  Note that it ignores any dimensions other than major. The indices might
+  need to be split further to deal with slicing of minor dimensions.
+  """
+  match indices_aval:
+    case [sc_core.Indices(offsets_aval), *_]:
+      offsets = indices[0]
+      assert isinstance(offsets, sc_core.Indices)
+      extracted = _extract_indirect_offsets_from_indices(
+          [offsets.values, *indices[1:]],
+          [offsets_aval, *indices_aval[1:]],
+          core_type,
+          indexer_shape,
+          expected_shape,
+      )
+      if extracted is None:
+        return None
+      return sc_core.Indices(
+          extracted.values, ignored_value=offsets.ignored_value
+      )
+
+    case [jax_core.AbstractValue() as offsets_aval, *_] if (
+        # fmt: off
+        isinstance(offsets_aval, state.AbstractRef) or
+        (isinstance(offsets_aval, jax_core.ShapedArray) and offsets_aval.shape)
+    ):  # fmt: on
+      if len(offsets_aval.shape) != 1:
+        raise NotImplementedError(
+            "Only 1D indices are supported by scatter/gather via"
+            " `pltpu.async_copy` on SparseCore, got rank"
+            f" {len(offsets_aval.shape)}"
+        )
+      shape = (*offsets_aval.shape, *indexer_shape[len(offsets_aval.shape) :])
+      if expected_shape is not None and shape != expected_shape:
+        raise NotImplementedError(
+            "The indexer shape in scatter/gather via `pltpu.async_copy` does"
+            f" not match the expected shape. Want: {expected_shape}, got:"
+            f" {shape}."
+        )
+      offsets = indices[0]
+      assert isinstance(offsets, ir.Value)
+    case [state.TransformedRef() as offsets_aval, *_]:
+      if offsets_aval.dtype != jnp.dtype("int32"):
+        raise NotImplementedError(
+            "Only int32 indices are supported by scatter/gather via"
+            " `pltpu.async_copy` with a dynamically-shaped indexer"
+        )
+      offsets_ref = indices[0]
+      assert isinstance(offsets_ref, state.TransformedRef)
+      offsets, _ = _transform_ref(
+          offsets_ref.ref,
+          offsets_aval.ref,
+          offsets_aval.ref.shape,  # The shape before the indexing.
+          offsets_ref.transforms,
+          kernel_type=core_type,
+      )
+      assert isinstance(offsets, ir.Value)
+    case _:
+      return None
+
+  if isinstance(offsets_aval, (state.AbstractRef, state.TransformedRef)):
+    offsets_memory_space = tpu_core.memory_space_to_tpu_memory_space(
+        offsets_aval.memory_space, core_type=core_type
+    )
+    if isinstance(offsets_memory_space, CoreMemorySpace):
+      offsets_memory_space = offsets_memory_space.memory_space
+    if offsets_memory_space is not MemorySpace.VMEM:
+      raise NotImplementedError(
+          "Indices for scatter/gather via `pltpu.async_copy` must be in VMEM,"
+          f" got {offsets_memory_space!r}"
+      )
+  return sc_core.Indices(offsets)
+
+
+def _extract_indirect_offsets(
+    transforms: Sequence[state.Transform],
+    expected_shape: tuple[int, ...],
+    transforms_aval: Sequence[state.Transform],
+    core_type: tpu_core.CoreType,
+) -> tuple[sc_core.Indices | None, Sequence[state.Transform]]:
+  for i, (indexer, indexer_aval) in enumerate(zip(transforms, transforms_aval)):
+    if not isinstance(indexer, indexing.NDIndexer):
+      continue
+    assert isinstance(indexer_aval, indexing.NDIndexer)
+    offsets = _extract_indirect_offsets_from_indices(
+        indexer.indices,
+        indexer_aval.indices,
+        core_type,
+        indexer.get_indexer_shape(),
+        expected_shape,
+    )
+    if offsets is None:
+      continue
+    # The slices applied to other dimensions are processed independently of
+    # indirect offsets.
+    split_indices = (indexing.Slice(0, indexer.shape[0]), *indexer.indices[1:])
+    split_indexer = indexing.NDIndexer(split_indices, indexer.shape, ())
+    if i != len(transforms) - 1:
+      raise NotImplementedError(
+          "The indexed ref in scatter/gather via `pltpu.async_copy` cannot have"
+          " any transforms following the indexer"
+      )
+    return offsets, [*transforms[:i], split_indexer]
+
+  return None, transforms
+
+
+def _has_indirect_offsets(
+    transforms: Sequence[state.Transform],
+    transforms_aval: Sequence[state.Transform],
+    core_type: tpu_core.CoreType,
+) -> bool:
+  return any(
+      _extract_indirect_offsets_from_indices(
+          indexer.indices,
+          indexer_aval.indices,  # pyrefly: ignore[missing-attribute]
+          core_type,
+          indexer.get_indexer_shape(),
+      )
+      is not None
+      for indexer, indexer_aval in zip(transforms, transforms_aval)
+      if isinstance(indexer, indexing.NDIndexer)
+  )
+
+
+@register_lowering_rule(jax_core.empty_ref_p)
+def _empty_ref_lowering_rule(ctx: LoweringRuleContext, ty, memory_space, pin):
+  del ty, memory_space, pin
+  [aval_out] = ctx.avals_out
+  return tc_lowering._alloc_value(aval_out, ctx=ctx)
+
+
+@register_lowering_rule(
+    lax.sort_p, kernel_types=[tpu_core.CoreType.SC_VECTOR_SUBCORE]
+)
+def _sort_lowering_rule(
+    ctx: LoweringRuleContext, *xs, dimension, is_stable, num_keys
+):
+  del is_stable  # Unused, always stable.
+  if dimension not in (0, -1):
+    raise ValueError(f"Unsupported dimension: {dimension}")
+  if num_keys != 1:
+    raise NotImplementedError("Multiple sort keys not supported")
+  sc_info = sc_core.get_sparse_core_info()
+  supported_shape = (sc_info.num_lanes,)
+  for i, aval in enumerate(ctx.avals_in):
+    if aval.shape != supported_shape:
+      raise NotImplementedError(
+          f"Unsupported shape for operand {i} of SC sort: Got {aval.shape}, "
+          f"expected {supported_shape}"
+      )
+  keys = xs[0]
+  values = xs[1:]
+  mask_type = ir.VectorType.get(
+      [sc_info.num_lanes], ir.IntegerType.get_signless(1))
+  mask = arith.constant(mask_type, ir.DenseElementsAttr.get_splat(
+      mask_type, ir.BoolAttr.get(True)))
+  key_dtype = ctx.avals_in[0].dtype
+  if key_dtype not in (jnp.float32, jnp.int32, jnp.uint32):
+    raise NotImplementedError(f"Unsupported key dtype for sort: {key_dtype}")
+  sign_bit_vec = None
+  if key_dtype == jnp.int32:
+    i32 = ir.IntegerType.get_signless(32)
+    sign_bit_vec = vector.broadcast(
+        keys.type, arith.constant(i32, ir.IntegerAttr.get(i32, 0x80000000))
+    )
+    keys = arith.xori(keys, sign_bit_vec)
+  if not values:
+    _, sorted_keys, _ = tpu.sort(
+        mask_type, keys.type, keys.type, keys, keys, mask=mask
+    )
+    if sign_bit_vec is not None:
+      sorted_keys = arith.xori(sorted_keys, sign_bit_vec)
+    return (sorted_keys,)
+  results: list[ir.Value] = []
+  for value in values:
+    _, sorted_keys, sorted_value = tpu.sort(
+        mask_type, keys.type, value.type, keys, value, mask=mask
+    )
+    if not results:
+      if sign_bit_vec is not None:
+        sorted_keys = arith.xori(sorted_keys, sign_bit_vec)
+      results.append(sorted_keys)
+    results.append(sorted_value)
+  return tuple(results)
+
+
+@register_lowering_rule(
+    lax.rev_p, kernel_types=[tpu_core.CoreType.SC_VECTOR_SUBCORE]
+)
+def _rev_lowering_rule(ctx: LoweringRuleContext, x, dimensions):
+  del ctx  # Unused.
+  if dimensions != (0,):
+    raise NotImplementedError(f"Invalid dimensions for SC lax.rev: {dimensions}")
+  i32 = ir.IntegerType.get_signless(32)
+  vec_dim = sc_core.get_sparse_core_info().num_lanes
+  cdim = arith.constant(i32, ir.IntegerAttr.get(i32, vec_dim - 1))
+  cdim_vec = vector.broadcast(ir.VectorType.get((vec_dim,), cdim.type), cdim)
+  return tpu.dynamic_gather(
+      x,
+      arith.subi(cdim_vec, tpu.iota(cdim_vec.type, dimensions=[0])),
+      dimensions=[0],
+  )

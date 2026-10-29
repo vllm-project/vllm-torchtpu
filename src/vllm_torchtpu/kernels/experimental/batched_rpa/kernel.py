@@ -2171,7 +2171,7 @@ def rpa_kernel(
             ],
         ),
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=cfgs.vmem_limit_bytes,
+            vmem_limit_bytes=min(cfgs.vmem_limit_bytes, 67043328),
             disable_bounds_checks=True,
             flags={
                 "XLA_TPU_EVENLY_DISTRIBUTE_CRITICAL_NODES": True,
