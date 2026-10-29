@@ -187,6 +187,9 @@ def prepare_boundary_batch(
     num_tokens = positions.shape[0]
     max_prefill_boundary = num_tokens // compress_ratio + 1 + num_reqs
     output_size = num_tokens + rope_pack * max_prefill_boundary
+    # Spares compress_norm_rope_store padding the batch to its tile size.
+    align = compress_kernel.TOKEN_ALIGN
+    output_size = -(-output_size // align) * align
 
     packed_index = jnp.cumsum(is_boundary.astype(jnp.int32)) - 1
     is_decode = is_boundary & is_decode_token

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import math
 from typing import cast
 
 import jax
@@ -32,6 +33,19 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import kv_cache_append
 # HBM->VMEM reads into a `_SAL_MAX_WAVE`-slot VMEM buffer (`rmw_ref`), patching
 # the staged lanes in VMEM, and DMAing the batch back to HBM.
 _SAL_MAX_WAVE = 128
+
+# Boundary tokens per grid step. A step's per-token work is short dependency
+# chains, which more tokens fill better. CSA and the indexer keep it a multiple
+# of 4: `prepare_boundary_batch` aligns each prefill 4-token cache row to 4, so
+# a row is never split across steps. The indexer's SEQ_ALONG_LANE staging
+# takes at most 8 (`compute.stage_sal_columns`). HCA has one boundary token per
+# 128 and a 512 KiB window per token, so it keeps 4 and two steps to overlap
+# the window fetch with compute.
+CSA_TILE_N = 16
+INDEXER_TILE_N = 8
+HCA_TILE_N = 4
+# Per-token inputs whose length is a multiple of this need no padding.
+TOKEN_ALIGN = math.lcm(CSA_TILE_N, INDEXER_TILE_N, HCA_TILE_N)
 
 
 def inner_kernel(
@@ -381,14 +395,26 @@ def compress_norm_rope_store(
     state_operand = None if state_cache is None or state_cache is cache else state_cache
     state_source = cache if state_operand is None else state_operand
 
+    mode = _select_mode(head_dim, overlap)
+    tile_n = {
+        config.Mode.CSA: CSA_TILE_N,
+        config.Mode.CSA_INDEXER: INDEXER_TILE_N,
+        config.Mode.HCA: HCA_TILE_N,
+    }[mode]
+    if pad := -num_tokens % tile_n:
+        # Every grid step reads tile_n entries of each per-token input.
+        positions = jnp.pad(positions, (0, pad))
+        token_to_req_indices = jnp.pad(token_to_req_indices, (0, pad))
+        kv_slot_mapping = jnp.pad(kv_slot_mapping, (0, pad), constant_values=-1)
+        num_tokens += pad
     cfgs = config.Configs.make(
-        _select_mode(head_dim, overlap),
+        mode,
         size_n=num_tokens,
         physical_page_size=cache.shape[1],
         state_physical_page_size=state_source.shape[1],
         state_block_size=state_block_size,
         rms_eps=rms_eps,
-        tile_n=4,
+        tile_n=tile_n,
         head_dim=head_dim,
         rope_head_dim=rope_head_dim,
         compress_ratio=compress_ratio,
