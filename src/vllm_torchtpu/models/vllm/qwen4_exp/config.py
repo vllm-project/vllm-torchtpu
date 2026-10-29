@@ -512,6 +512,18 @@ def validate_config(cfg):
             "Qwen4Exp TPU requires PP/CP1, "
             "linear expert placement and no DBO/EPLB/elastic EP"
         )
+    from .pool_layout import MAIN_KV_DCP_ENV, main_kv_dcp
+
+    # The QSA main-KV split over TP rank pairs is this model's own path (vLLM's
+    # decode_context_parallel_size stays 1, rejected above): it shards the
+    # unified pool's main-KV pages, so it needs that pool and pairs of ranks.
+    if main_kv_dcp() > 1 and (
+        not use_unified_pool() or p.tensor_parallel_size < 2 or p.tensor_parallel_size % 2
+    ):
+        raise ValueError(
+            f"{MAIN_KV_DCP_ENV}=2 needs the unified pool and an even "
+            f"tensor_parallel_size >= 2, got tp={p.tensor_parallel_size}"
+        )
     # SparseCore top-k writes 16-lane vectors; this is a kernel boundary,
     # independent of checkpoint head counts and compression geometry.
     block_topk = t.indexer_budget // t.indexer_compress_ratio
