@@ -113,6 +113,11 @@ def add_arguments(parser) -> None:
         default="",
         help="speculate with this checkpoint's MTP layer (three drafts per step)",
     )
+    decode.add_argument(
+        "--trace",
+        default="",
+        help="save an xprof trace of each batch's last step here (TRACE_RANKS)",
+    )
 
     preshard = sub.add_parser("preshard", help="write the decoder's rank cache")
     preshard.add_argument("--checkpoint", required=True)
@@ -611,9 +616,10 @@ def decode(args) -> None:
             ]
             harness.sync()
             begin = time.perf_counter()
-            output = decoder.step(StepInput(requests=rows, finished=finished))
-            assert output.tokens is not None
-            materialize(output.tokens)
+            with trace(args.trace, f"decode-b{batch}", step == args.steps - 1):
+                output = decoder.step(StepInput(requests=rows, finished=finished))
+                assert output.tokens is not None
+                materialize(output.tokens)
             finished = ()
             if step:  # the first imports the requests' states
                 times.append((time.perf_counter() - begin) * 1e3)

@@ -28,6 +28,7 @@ from .decode_megakernel import KV_BUFFERS
 from .mtp_c2_layout import cache_contract
 from .mtp_config import weight_shapes
 from .mtp_dense import native_experts, native_project
+from .paged_kv import PoolPages
 
 BF16 = jnp.bfloat16
 F32 = jnp.float32
@@ -53,8 +54,15 @@ def _round_bf16_f32(value):
 
 def _fused_stack(
     config, layout, context, target, weights, state, tokens, positions, hidden, interpret,
+    *, paged=None,
 ):
-    requests = len(state)
+    """One draft call for every request. ``paged`` (``{"pool", "tables",
+    "pages_per_block"}``) reads the draft KV from vLLM's MTP layer pool
+    (``paged_kv``) through the ``[requests, width]`` rank-local block table
+    instead of ``state``'s caches (``state`` unused), the pool a read-only
+    operand; the call's new key/value columns (FP8 ``[1, requests, 2, D]``) are
+    returned as the state's ``"columns"`` for the caller to commit."""
+    requests = len(state) if paged is None else paged["tables"].shape[0]
     c, tp, rows = config.target, layout.tp, max(8, requests)
     # Wide lane reductions run per eight-row tile: Mosaic associates a 16-row one
     # differently.
@@ -124,16 +132,28 @@ def _fused_stack(
         "copy_sem": tpu.SemaphoreType.DMA,
         **inbox,
     }
+    if paged is not None:
+        scratch["new_columns"] = tpu.VMEM((requests, 2, hd), jnp.float8_e4m3fn)
 
-    def kernel(position_ref, token_ref, embedding_ref, lm_ref, *args):
+    def kernel(position_ref, token_ref, *args):
+        tables_ref = None
+        if paged is not None:
+            tables_ref, args = args[0], args[1:]
+        embedding_ref, lm_ref, args = args[0], args[1], args[2:]
         w = dict(zip(names, args[: len(names)], strict=True))
-        # Input state refs are aliased to outputs below; no historical KV copy.
-        leaves = 2 * requests
-        hidden_ref = args[len(names) + leaves]
-        logits_out, token_out = args[len(names) + leaves + 1 : len(names) + leaves + 3]
-        caches = args[len(names) + leaves + 3 : len(names) + 2 * leaves + 3]
-        hidden_out = args[len(names) + 2 * leaves + 3]
-        r = dict(zip(scratch, args[len(names) + 2 * leaves + 4 :], strict=True))
+        if paged is not None:
+            # The pool is read only; the call's columns leave for the commit.
+            pool_ref, hidden_ref = args[len(names)], args[len(names) + 1]
+            logits_out, token_out, columns_out, hidden_out = args[len(names) + 2 : len(names) + 6]
+            r = dict(zip(scratch, args[len(names) + 6 :], strict=True))
+        else:
+            # Input state refs are aliased to outputs below; no historical KV copy.
+            leaves = 2 * requests
+            hidden_ref = args[len(names) + leaves]
+            logits_out, token_out = args[len(names) + leaves + 1 : len(names) + leaves + 3]
+            caches = args[len(names) + leaves + 3 : len(names) + 2 * leaves + 3]
+            hidden_out = args[len(names) + 2 * leaves + 3]
+            r = dict(zip(scratch, args[len(names) + 2 * leaves + 4 :], strict=True))
         rank = jax.lax.axis_index("tp")
         barrier = tpu.get_barrier_semaphore()
         for peer in range(1, tp):
@@ -261,10 +281,24 @@ def _fused_stack(
             queries.append(rope(norm(packed[:, :hd], r["qn"][...]), position_ref[request]))
             keys.append(rope(norm(r["key"][request, :], r["kn"][...]), position_ref[request]))
             gates.append(jax.nn.sigmoid(packed[:, hd:].astype(F32)).astype(BF16))
+        if paged is not None:
+            for request in range(requests):
+                for kind, row in enumerate((keys[request], r["value"][request, :])):
+                    encoded = jnp.clip(row.astype(F32), -448, 448).astype(jnp.float8_e4m3fn)
+                    r["new_columns"][request, kind] = encoded
+            copy(r["new_columns"], columns_out.at[0])
+            key_caches = PoolPages(
+                (pool_ref,), jnp.int32(0), tables_ref, 0, paged["pages_per_block"]
+            )
+            value_caches = None
+        else:
+            key_caches = tuple(caches[2 * request].at[0, 0] for request in range(requests))
+            value_caches = tuple(
+                caches[2 * request + 1].at[0, 0] for request in range(requests)
+            )
         attended = attend_paged_batched_append(
             jnp.stack(queries), jnp.stack(keys), r["value"][:requests, :],
-            tuple(caches[2 * request].at[0, 0] for request in range(requests)),
-            tuple(caches[2 * request + 1].at[0, 0] for request in range(requests)),
+            key_caches, value_caches,
             position_ref, rank, native_layout, (1.0, 1.0), pl.DeviceIdType.MESH,
             {name: r[name] for name in inbox}, buffers=KV_BUFFERS)
         for request in range(requests):
@@ -366,6 +400,38 @@ def _fused_stack(
             position_ref[request] >= 0, result[request].astype(jnp.int32), token_ref[request])
             for request in range(requests)))
 
+    if paged is not None:
+        arguments = (
+            positions,
+            tokens,
+            paged["tables"].astype(jnp.int32),
+            target["emb"],
+            target["lmw"],
+            *(weights[name] for name in names),
+            paged["pool"],
+            hidden,
+        )
+        result = pl.pallas_call(
+            kernel,
+            out_shape=(
+                jax.ShapeDtypeStruct((requests, layout.vocab_shard_padded), F32),
+                jax.ShapeDtypeStruct((requests,), jnp.int32),
+                jax.ShapeDtypeStruct((1, requests, 2, hd), jnp.float8_e4m3fn),
+                jax.ShapeDtypeStruct((rows, h), BF16),
+            ),
+            grid_spec=tpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=3,
+                in_specs=[pl.BlockSpec(memory_space=tpu.HBM)] * (len(arguments) - 3),
+                out_specs=[pl.BlockSpec(), pl.BlockSpec(), *[pl.BlockSpec(memory_space=tpu.HBM)] * 2],
+                scratch_shapes=tuple(scratch.values()),
+            ),
+            compiler_params=tpu.CompilerParams(
+                collective_id=89, vmem_limit_bytes=64 << 20, shape_invariant_numerics=True
+            ),
+            interpret=interpret,
+            name="qwen_native_bf16_mtp_draft_fused_paged",
+        )(*arguments)
+        return result[1], result[0], {"columns": result[2]}, result[3][:requests]
     arguments = (
         positions, tokens, target["emb"], target["lmw"],
         *(weights[name] for name in names),

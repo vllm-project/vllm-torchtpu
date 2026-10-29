@@ -480,13 +480,17 @@ class QwenDecoder:
 
     def _draft_op(self, batch: int):
         """The MTP step's second op: per request, repair the accepted drafts'
-        MTP KV rows from the target's hidden states, then propose the next
-        step's three drafts."""
+        MTP KV rows from the target's hidden states; then propose the next
+        step's three drafts (one draft call per draft for all requests)."""
         key = ("draft", batch)
         op = self._ops.get(key)
         if op is not None:
             return op
-        from vllm_torchtpu.megakernel.qwen38.kernels import mtp_cache_batch, mtp_decode
+        from vllm_torchtpu.megakernel.qwen38.kernels import (
+            mtp_cache_batch,
+            mtp_decode,
+            mtp_decode_c2_fused,
+        )
         from vllm_torchtpu.megakernel.qwen38.kernels.mtp_config import MTPConfig
         from vllm_torchtpu.megakernel.qwen38.kernels.paged_kv import commit_columns
 
@@ -508,20 +512,16 @@ class QwenDecoder:
             target = {"emb": embedding, "lmw": head}
             repair = {f: mw[f] for f in mtp_cache_batch.FAMILIES}
 
-            def draft_request(b, carry):
-                mtp_pool, new_drafts = carry
+            def repair_request(b, mtp_pool):
                 table = lax.dynamic_slice_in_dim(tables, b, 1)
                 states = lax.dynamic_index_in_dim(hidden, b, keepdims=False)
                 position = jnp.maximum(
                     lax.dynamic_index_in_dim(positions, b, keepdims=False), 0
                 )
                 accepted = lax.dynamic_index_in_dim(counts, b, keepdims=False)
-                alive = accepted >= 0
-                accepted = jnp.maximum(accepted, 0)
-                proposals = lax.dynamic_index_in_dim(drafts[slots], b, keepdims=False)
-                # Repair: accepted draft j (1..count) at row p + j - 1, from the
-                # target's hidden after the row before it.
-                repaired = (jnp.arange(MTP_DRAFTS) < accepted) & alive
+                # Accepted draft j (1..count) at row p + j - 1, from the target's
+                # hidden after the row before it.
+                repaired = jnp.arange(MTP_DRAFTS) < accepted
                 repaired_rows = position + jnp.arange(MTP_DRAFTS)
                 kv = mtp_cache_batch._cache_batch_stack(
                     mtp_config,
@@ -530,7 +530,7 @@ class QwenDecoder:
                     embedding,
                     repair,
                     None,
-                    proposals,
+                    lax.dynamic_index_in_dim(drafts[slots], b, keepdims=False),
                     repaired_rows,
                     states[:MTP_DRAFTS],
                     repaired,
@@ -544,13 +544,20 @@ class QwenDecoder:
                     jnp.repeat(table, MTP_DRAFTS, axis=0),
                     pages_per_block=1,
                 )
-                # Drafts: from the target's hidden after the last accepted row
-                # and the pending token, at the rows after the repaired ones.
-                token = lax.dynamic_slice_in_dim(bank[slots], b, 1)
-                row = (position + accepted)[None]
-                state = lax.dynamic_index_in_dim(states, accepted, keepdims=True)
-                proposed = []
-                for _ in range(MTP_DRAFTS):
+                return mtp_pool
+
+            mtp_pool = lax.fori_loop(0, batch, repair_request, mtp_pool)
+            # Drafts: from the target's hidden after the last accepted row and
+            # the pending token, at the rows after the repaired ones.
+            live = positions >= 0
+            accepted = jnp.maximum(counts, 0)
+            token = bank[slots]
+            rows = jnp.where(live, positions + accepted, -1)
+            state = jnp.take_along_axis(hidden, accepted[:, None, None], axis=1)[:, 0]
+            pool = {"tables": tables, "pages_per_block": 1}
+            proposed = []
+            for _ in range(MTP_DRAFTS):
+                if batch == 1:
                     token, _, written, state = mtp_decode._native_stack(
                         mtp_config,
                         layout,
@@ -559,32 +566,32 @@ class QwenDecoder:
                         mw,
                         None,
                         token,
-                        row,
+                        jnp.maximum(rows, 0),
                         state,
                         False,
-                        paged={"pool": mtp_pool, "tables": table, "pages_per_block": 1},
+                        paged={"pool": mtp_pool, **pool},
                     )
-                    (mtp_pool,) = commit_columns(
-                        (mtp_pool,),
-                        written["columns"],
-                        jnp.where(alive, row, -1),
-                        table,
-                        pages_per_block=1,
+                else:
+                    token, _, written, state = mtp_decode_c2_fused._fused_stack(
+                        mtp_config,
+                        layout,
+                        0,
+                        target,
+                        mw,
+                        (),
+                        token,
+                        rows,
+                        state,
+                        False,
+                        paged={"pool": mtp_pool, **pool},
                     )
-                    proposed.append(token)
-                    row = row + 1
-                new_drafts = lax.dynamic_update_slice_in_dim(
-                    new_drafts, jnp.concatenate(proposed)[None], b, axis=0
+                assert isinstance(written, dict)  # the paged calls' columns
+                (mtp_pool,) = commit_columns(
+                    (mtp_pool,), written["columns"], rows, tables, pages_per_block=1
                 )
-                return mtp_pool, new_drafts
-
-            mtp_pool, new_drafts = lax.fori_loop(
-                0,
-                batch,
-                draft_request,
-                (mtp_pool, jnp.zeros((batch, MTP_DRAFTS), jnp.int32)),
-            )
-            live = positions >= 0
+                proposed.append(token)
+                rows = jnp.where(live, rows + 1, -1)
+            new_drafts = jnp.stack(proposed, axis=1)
             drafts = drafts.at[jnp.where(live, slots, drafts.shape[0])].set(
                 new_drafts, mode="drop"
             )

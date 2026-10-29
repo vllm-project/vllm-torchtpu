@@ -1077,6 +1077,26 @@
     },
     {
       "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/mtp_decode_c2_fused.py",
+      "name": "unbound-name",
+      "concise_description": "`columns_out` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/mtp_decode_c2_fused.py",
+      "name": "unbound-name",
+      "concise_description": "`pool_ref` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/mtp_decode_c2_fused.py",
+      "name": "unbound-name",
+      "concise_description": "`caches` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/mtp_decode_c2_fused.py",
+      "name": "unbound-name",
+      "concise_description": "`caches` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/mtp_decode_c2_fused.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `astype`"
     },
