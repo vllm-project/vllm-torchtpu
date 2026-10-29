@@ -32,10 +32,29 @@ def _label(frame) -> str:
     return f"{path}:{code.co_name}"
 
 
+def _raw_path(rank: int) -> str | None:
+    """Where VLLM_TPU_PY_SAMPLER_RAW writes this rank's samples: the job's synced
+    server outputs directory when there is one."""
+    job = os.environ.get("CDK_JOB_ID")
+    for base in (
+        f"/cdk-outputs/outputs/{job}-vllm-server" if job else None,
+        os.environ.get("CDK_OUTPUT_DIR"),
+        "/tmp",
+    ):
+        if base and os.path.isdir(base):
+            return os.path.join(base, f"pysampler_rank{rank}.tsv")
+    return None
+
+
 def _run(target_ident: int, seconds: float, interval: float, rank: int) -> None:
     self_counts: collections.Counter = collections.Counter()
     incl_counts: collections.Counter = collections.Counter()
     samples = 0
+    # VLLM_TPU_PY_SAMPLER_RAW=1: also keep every sample as (wall ns, stack id)
+    # so it can be cut by step and straggler rank against the Perfetto trace.
+    raw = os.environ.get("VLLM_TPU_PY_SAMPLER_RAW") == "1"
+    stacks: dict[str, int] = {}
+    rows: list[tuple[int, int]] = []
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         time.sleep(interval)
@@ -43,6 +62,14 @@ def _run(target_ident: int, seconds: float, interval: float, rank: int) -> None:
         if frame is None:
             continue
         samples += 1
+        if raw:
+            names = []
+            f = frame
+            while f is not None:
+                names.append(_label(f))
+                f = f.f_back
+            key = ";".join(names)
+            rows.append((time.time_ns(), stacks.setdefault(key, len(stacks))))
         self_counts[_label(frame)] += 1
         seen = set()
         while frame is not None:
@@ -53,6 +80,15 @@ def _run(target_ident: int, seconds: float, interval: float, rank: int) -> None:
             frame = frame.f_back
     if not samples:
         return
+    if raw:
+        path = _raw_path(rank)
+        if path:
+            with open(path, "w") as out:
+                for key, sid in stacks.items():
+                    out.write(f"S\t{sid}\t{key}\n")
+                for t, sid in rows:
+                    out.write(f"{t}\t{sid}\n")
+            logger.info("PYSAMPLER rank=%d raw samples -> %s", rank, path)
     def top(counter, n):
         return " | ".join(
             f"{100 * c / samples:.1f}% {name}" for name, c in counter.most_common(n)
