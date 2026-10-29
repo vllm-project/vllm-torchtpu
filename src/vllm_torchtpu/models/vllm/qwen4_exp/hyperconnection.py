@@ -157,7 +157,11 @@ class GatedResidual(common_hc.GatedResidual):
         hand-over refuses a bucket whose inputs moved). The checkpoint
         parameter stays as loaded for other readers (the megakernel).
         """
-        if not (envs.TPU_QWEN4_HC_DECODE_FUSED and hasattr(self, "input_mix_weight_up")):
+        if not (
+            envs.TPU_QWEN4_HC_DECODE_FUSED
+            and envs.TPU_QWEN4_HC_DECODE_UP_T
+            and hasattr(self, "input_mix_weight_up")
+        ):
             return
         up = self.input_mix_weight_up.weight.detach()
         self.register_buffer("_up_t", up.t().contiguous(), persistent=False)

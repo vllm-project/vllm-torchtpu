@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_QWEN4_HC_DECODE_FUSED: bool = False
     TPU_QWEN4_HC_DECODE_MIN_ROWS: int = 48
+    TPU_QWEN4_HC_DECODE_UP_T: bool = True
     QWEN4_EXP_PREFILL_SP: bool = False
     QWEN4_EXP_PREFILL_SP_MIN_TOKENS: int = 1024
     QWEN4_EXP_PREFILL_SP_MOE: bool = False
@@ -957,6 +958,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The fused decode HC call for buckets of at least this many rows (below
     # it the weight fetch dominates and XLA's chain is as fast: 24 rows 11.0
     # vs 9.1 us, 48 rows 11.6 vs 13.1, 96 rows 12.8 vs 22.7 per call site).
+    # With the fused decode HC: keep `up` transposed for its weight fetch.
+    "TPU_QWEN4_HC_DECODE_UP_T": env_bool("TPU_QWEN4_HC_DECODE_UP_T", default=True),
     "TPU_QWEN4_HC_DECODE_MIN_ROWS": lambda: int(
         os.getenv("TPU_QWEN4_HC_DECODE_MIN_ROWS", "48")
     ),
