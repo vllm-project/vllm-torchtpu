@@ -445,6 +445,14 @@ class RaidenOffloadingManager(OffloadingManager):
         # holds nothing for the key. Every other store/skip/touch decision
         # probes the directory itself.
         self._inflight_store_keys: set[OffloadKey] = set()
+        # Store-on-evict: in-flight keys whose job is still parked (not yet
+        # submitted, its device blocks not yet at the LRU head). A lookup on
+        # one answers MISS rather than HIT_PENDING
+        # (VLLM_TPU_RAIDEN_PARKED_LOOKUP_MISS): most parked jobs are cancelled
+        # long before they are promoted, so waiting on one can hold a request
+        # for many steps although its data is still on the device.
+        self._parked_store_keys: set[OffloadKey] = set()
+        self.parked_lookup_misses = 0
 
         # Peer and storage-tier location slices cached from lookups and
         # consumed during `prepare_load`.
@@ -584,8 +592,22 @@ class RaidenOffloadingManager(OffloadingManager):
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         return RequestOffloadingContext()
 
+    def mark_parked(self, keys) -> None:
+        """Store-on-evict parked these keys' job (see `_parked_store_keys`)."""
+        self._parked_store_keys.update(keys)
+
+    def unmark_parked(self, keys) -> None:
+        """Their job left the park (promoted to the fence stage, or cancelled)."""
+        self._parked_store_keys.difference_update(keys)
+
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         if key in self._inflight_store_keys:
+            if (
+                key in self._parked_store_keys
+                and envs.VLLM_TPU_RAIDEN_PARKED_LOOKUP_MISS
+            ):
+                self.parked_lookup_misses += 1
+                return LookupResult.MISS
             return LookupResult.HIT_PENDING
         sub_hashes = self._sub_hashes(key)
         # A probe across all sub-hashes, not a claim: the store pins every
@@ -1084,6 +1106,7 @@ class RaidenOffloadingManager(OffloadingManager):
     def on_store_job_cancelled(self, keys: list[OffloadKey]) -> None:
         """A fence-pending (never admitted) store job was cancelled."""
         self._inflight_store_keys.difference_update(keys)
+        self._parked_store_keys.difference_update(keys)
 
     def is_job_launched(self, job_id: int) -> bool:
         """Whether a job has been admitted+launched and is not yet terminal."""
