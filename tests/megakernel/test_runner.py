@@ -230,6 +230,7 @@ def test_the_chunk_profile_times_the_program(monkeypatch):
         vllm_config=None,
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
         cache_config=SimpleNamespace(block_size=2048),
+        kv_cache_config=None,
         max_model_len=65536,
         _stage=lambda: SimpleNamespace(time_steps=time_steps),
     )
@@ -240,6 +241,34 @@ def test_the_chunk_profile_times_the_program(monkeypatch):
     assert [(t, p) for t, p, _ in report["samples"]] == timed
     assert (8192, 0) in timed
     assert all(ms == (t + p) / 1000 for t, p, ms in report["samples"])
+
+
+def test_the_chunk_granule_holds_whole_scheduler_blocks_in_align_mode(monkeypatch):
+    from vllm_torchtpu.megakernel import backend
+
+    monkeypatch.setattr(
+        backend,
+        "capabilities",
+        lambda config: SimpleNamespace(page_aligned_chunks=True),
+    )
+
+    def granularity(mode):
+        instance = SimpleNamespace(
+            vllm_config=None,
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=32768),
+            cache_config=SimpleNamespace(block_size=640, mamba_cache_mode=mode),
+            kv_cache_config=SimpleNamespace(has_mamba_layers=True),
+            parallel_config=SimpleNamespace(prefill_context_parallel_size=8),
+            max_model_len=262144,
+            _stage=lambda: SimpleNamespace(
+                time_steps=lambda points: [1.0] * len(points)
+            ),
+        )
+        return MegakernelModelRunner.profile_pipeline_chunks(instance)["granularity"]
+
+    # The scheduler clips align-mode chunks to its 8 x 640-token blocks.
+    assert granularity("align") == 5120
+    assert granularity("none") == 4480
 
 
 def test_a_program_that_is_no_pipeline_stage_refuses_a_pipeline(monkeypatch):

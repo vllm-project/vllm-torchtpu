@@ -288,6 +288,20 @@ class MegakernelModelRunner(TPUModelRunner):
         granularity = chunk_granularity(
             self.cache_config.block_size, tokens, capabilities.page_aligned_chunks
         )
+        # In mamba "align" mode the scheduler clips every chunk end to its own
+        # blocks, which span all PCP ranks: a granule of fewer tokens would
+        # clip a chunk that only fits a granule to nothing.
+        if (
+            self.kv_cache_config is not None
+            and self.kv_cache_config.has_mamba_layers
+            and self.cache_config.mamba_cache_mode == "align"
+        ):
+            scheduler_block = (
+                self.cache_config.block_size
+                * self.parallel_config.prefill_context_parallel_size
+            )
+            if scheduler_block <= tokens:
+                granularity = -(-granularity // scheduler_block) * scheduler_block
         points = profile_points(
             [*chunk_buckets(tokens, granularity), tokens], tokens, self.max_model_len
         )
