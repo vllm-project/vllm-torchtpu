@@ -86,6 +86,8 @@ steps:
     key: "unit_tests_cpu_pr"
     <<: *cpu_unit_test_defaults
     if: 'build.env("NIGHTLY") != "1"'
+    # bktec splits the files across the shards by recorded timing.
+    parallelism: 2
     plugins:
       - *kube_plugin
       - tests#v1.0.0:
