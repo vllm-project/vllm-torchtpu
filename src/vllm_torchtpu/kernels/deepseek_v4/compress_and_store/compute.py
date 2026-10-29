@@ -315,9 +315,14 @@ def merge_slot_updates(
 def stage_sal_columns(
     records_t_ref,  # (groups, 4, padded_tokens) uint8 VMEM, SEQ_ALONG_LANE
     records,  # (n, record_bytes) uint8, HEAD_ALONG_SUBLANE records
-    first_token,  # traced int, multiple of n: lane of records[0]
+    first_lane,  # traced int >= 0
+    lane_offsets,  # n traced ints: record i goes to lane first_lane + offset
+    num_staged,  # traced int: the offsets >= 0 are exactly 0..num_staged-1
 ):
-    """Copies `records` into lanes `[first_token, first_token + n)`.
+    """Copies record `i` into lane `first_lane + lane_offsets[i]`, if >= 0.
+
+    The staged lanes `[first_lane, first_lane + num_staged)` may run into the
+    next 128-lane tile.
 
     In the SEQ_ALONG_LANE layout (`streamindex_topk.KVLayout.SEQ_ALONG_LANE`)
     each token is one lane: sublane group `g` of lane `t` holds bytes
@@ -341,7 +346,7 @@ def stage_sal_columns(
     sublane_tile = 8
     rows_pad = sublane_tile
     groups_pad = pl.cdiv(groups, sublane_tile) * sublane_tile
-    assert n <= rows_pad and lanes % n == 0, (n, rows_pad)
+    assert n <= rows_pad and len(lane_offsets) == n, (n, rows_pad)
     padded_records = records.astype(jnp.int32)
     if n < rows_pad:
         padded_records = jnp.concatenate(
@@ -349,12 +354,14 @@ def stage_sal_columns(
         )
     padded_records = padded_records.astype(jnp.bfloat16)  # (8, width)
 
-    lane_offset = first_token % lanes
+    lane_offset = first_lane & (lanes - 1)
     token_idx = jax.lax.broadcasted_iota(jnp.int32, (rows_pad, lanes), 0)
     lane_idx = jax.lax.broadcasted_iota(jnp.int32, (rows_pad, lanes), 1)
-    place = ((lane_idx == lane_offset + token_idx) & (token_idx < n)).astype(
-        jnp.bfloat16
-    )  # (8, 128)
+    target_lane = jnp.full((rows_pad, lanes), -1, jnp.int32)
+    for i, offset in enumerate(lane_offsets):
+        lane_i = jnp.where(offset >= 0, (lane_offset + offset) & (lanes - 1), -1)
+        target_lane = jnp.where(token_idx == i, lane_i, target_lane)
+    place = (lane_idx == target_lane).astype(jnp.bfloat16)  # (8, 128)
 
     # Row `out_row = byte_in_word * groups_pad + group_idx` picks byte
     # `4 * group_idx + byte_in_word` (the 4 byte planes stacked).
@@ -382,15 +389,19 @@ def stage_sal_columns(
         )
     words = pltpu.bitcast(words[:groups], jnp.uint32)  # (groups, 128)
 
-    tile_start_lane = pl.multiple_of((first_token // lanes) * lanes, lanes)
-    staging_tile = records_t_ref[:, :, pl.ds(tile_start_lane, lanes)]
-    current_words = pltpu.bitcast(staging_tile.reshape(groups * 4, lanes), jnp.uint32)
     tile_lanes = jax.lax.broadcasted_iota(jnp.int32, (groups, lanes), 1)
-    updated_words = jnp.where(
-        (tile_lanes >= lane_offset) & (tile_lanes < lane_offset + n),
-        words,
-        current_words,
-    )
-    records_t_ref[:, :, pl.ds(tile_start_lane, lanes)] = pltpu.bitcast(
-        updated_words, jnp.uint8
-    ).reshape(groups, 4, lanes)
+
+    def update_tile(start_lane, mask):
+        tile = records_t_ref.at[:, :, pl.ds(pl.multiple_of(start_lane, lanes), lanes)]
+        current_words = pltpu.bitcast(tile[...].reshape(groups * 4, lanes), jnp.uint32)
+        tile[...] = pltpu.bitcast(
+            jnp.where(mask, words, current_words), jnp.uint8
+        ).reshape(groups, 4, lanes)
+
+    end = lane_offset + num_staged
+    tile_start_lane = first_lane - lane_offset
+    update_tile(tile_start_lane, (tile_lanes >= lane_offset) & (tile_lanes < end))
+
+    @pl.when(end > lanes)
+    def _next_tile():
+        update_tile(tile_start_lane + lanes, tile_lanes < end - lanes)

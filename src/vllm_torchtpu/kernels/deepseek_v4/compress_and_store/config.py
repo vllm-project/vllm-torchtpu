@@ -533,12 +533,13 @@ class Configs:
         return (self._tile_n, self.record_rows) + self.cache_last_dims
 
     def records_t_shape(self) -> tuple[int, ...]:
-        """SEQ_ALONG_LANE: VMEM staging of every token's record, as cache lanes.
+        """SEQ_ALONG_LANE: VMEM staging of the slotted tokens' records, as lanes.
 
         `(SAL_SUBLANE_GROUPS, SLOT_PACK, padded_tokens)` = `(33, 4, padded_tokens)`
-        uint8 (32 fp8 sublane groups of 4 bytes + 1 scale group): token `t` is
-        lane `t`, laid out like a cache page (see `compute.stage_sal_columns`),
-        so the final store is a lane-tile copy.
+        uint8 (32 fp8 sublane groups of 4 bytes + 1 scale group): lane `i` holds
+        the i-th token with a kv slot, laid out like a cache page (see
+        `compute.stage_sal_columns` and `kernel.kernel_fn`), so the final store
+        is a lane-tile copy.
         """
         assert self.dims.seq_along_lane
         padded = pl.cdiv(max(self.dims.size_n, 1), LANE) * LANE

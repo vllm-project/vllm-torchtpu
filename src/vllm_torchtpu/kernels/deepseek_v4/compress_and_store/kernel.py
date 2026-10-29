@@ -59,6 +59,8 @@ def inner_kernel(
     is_first_mask_ref,
     is_first_mask_rope_ref,
     records_t_ref=None,
+    staged_slots_ref=None,
+    num_staged_ref=None,
     *,
     cfgs: config.Configs,
 ):
@@ -141,12 +143,28 @@ def inner_kernel(
                 last_dim_size=cfgs.last_dim_size,
             )
         if cfgs.dims.seq_along_lane:
-            # Stage the records as lanes of a cache-shaped VMEM array; the
-            # cache is written from it once the pipeline is done (kernel_fn).
+            # Stage the records of the tokens with a kv slot as consecutive
+            # lanes of a cache-shaped VMEM array, and their slots alongside;
+            # the cache is written from them once the pipeline is done
+            # (kernel_fn).
+            first_lane = num_staged_ref[0]
+            num_staged = first_lane
+            lane_offsets = []
+            for i in range(tile_n):
+                slot = kv_slot_mapping_ref[global_idx + i]
+                staged = slot >= 0
+                # Branch-free: an unstaged slot is overwritten or left past
+                # the end.
+                staged_slots_ref[num_staged] = slot
+                lane_offsets.append(jnp.where(staged, num_staged - first_lane, -1))
+                num_staged = num_staged + staged.astype(jnp.int32)
+            num_staged_ref[0] = num_staged
             compute.stage_sal_columns(
                 records_t_ref,
                 jnp.stack([nope_val_padded[n].flatten() for n in range(tile_n)]),
-                global_idx,
+                first_lane,
+                lane_offsets,
+                num_staged - first_lane,
             )
         elif cfgs.dims.mode == config.Mode.CSA_INDEXER:
             kv_slots = []
@@ -222,13 +240,15 @@ def kernel_fn(
     """Pallas kernel entry point.
 
     `sal_scratch` is only used when the indexer cache is SEQ_ALONG_LANE. It is
-    then `(records_t, run_src, run_dst, rmw, sems)`, and the cache is written
-    in two phases:
+    then `(records_t, staged_slots, num_staged, run_src, run_dst, rmw, sems)`,
+    and the cache is written in two phases:
 
-    1. During the pipeline, each grid step copies its records into
-       `records_t`, a VMEM buffer laid out like the cache.
+    1. During the pipeline, each grid step copies the records of its tokens
+       that have a kv slot into the next lanes of `records_t`, a VMEM buffer
+       laid out like the cache, and their slots into `staged_slots`.
     2. After the pipeline, one pass copies `records_t` into the cache, one
-       128-lane tile at a time.
+       128-lane tile at a time. With no slot-less tokens between staged
+       records, it moves none of them.
 
     The write can't happen inside the pipeline. One 128-lane tile holds tokens
     from many grid steps, so each step would have to read the tile, update it
@@ -248,7 +268,11 @@ def kernel_fn(
         is_first_mask_ref=is_first_mask_ref,
         is_first_mask_rope_ref=is_first_mask_rope_ref,
     )
-    records_t_ref = sal_scratch[0] if cfgs.dims.seq_along_lane else None
+    sal_staging = ()
+    if cfgs.dims.seq_along_lane:
+        records_t_ref, staged_slots_ref, num_staged_ref = sal_scratch[:3]
+        num_staged_ref[0] = 0
+        sal_staging = (records_t_ref, staged_slots_ref, num_staged_ref)
 
     pipeline_func = pltpu.emit_pipeline(
         body=functools.partial(inner_kernel, cfgs=cfgs),
@@ -268,26 +292,24 @@ def kernel_fn(
                 is_first_mask_ref,
                 is_first_mask_rope_ref,
             )
-            + ((records_t_ref,) if records_t_ref is not None else ()),
+            + sal_staging,
             allocations=allocations,
         )
 
     _run()
 
     if cfgs.dims.seq_along_lane:
-        _, run_src_ref, run_dst_ref, rmw_ref, sems = sal_scratch
+        *_, run_src_ref, run_dst_ref, rmw_ref, sems = sal_scratch
         ops = kv_cache_append._SalTiles(
             records_t_ref, _out_cache_ref, rmw_ref, config.SAL_PAGE_SIZE
         )
-        # Only the grid's tokens were staged; kv slot -1 marks the rest.
-        num_tokens = jnp.minimum(grid_size * cfgs.tile_sizes.tile_n, cfgs.dims.size_n)
         num_runs = kv_cache_append._find_runs(
             ops,
-            kv_slot_mapping_ref,
+            staged_slots_ref,
             run_src_ref,
             run_dst_ref,
             num_rows=_out_cache_ref.shape[0] * config.SAL_PAGE_SIZE,
-            num_tokens=num_tokens,
+            num_tokens=num_staged_ref[0],
         )
         kv_cache_append._write_runs(
             ops,
@@ -517,11 +539,14 @@ def compress_norm_rope_store(
 
     scratch_shapes = []
     if seq_along_lane:
-        # See kernel_fn: staged records, the run tables of the final store
-        # (one slot per token + a sentinel), its read-modify-write tiles.
+        # See kernel_fn: staged records, their slots (one per token + one an
+        # unstaged token may write) and count, the run tables of the final
+        # store (one slot per token + a sentinel), its read-modify-write tiles.
         wave = max(1, min(num_tokens, _SAL_MAX_WAVE))
         scratch_shapes += [
             pltpu.VMEM(cfgs.records_t_shape(), jnp.uint8),
+            pltpu.SMEM((num_tokens + 1,), jnp.int32),
+            pltpu.SMEM((1,), jnp.int32),
             pltpu.SMEM((num_tokens + 1,), jnp.int32),
             pltpu.SMEM((num_tokens + 1,), jnp.int32),
             pltpu.VMEM(
