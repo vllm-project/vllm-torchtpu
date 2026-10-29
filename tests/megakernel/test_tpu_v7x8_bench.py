@@ -1087,11 +1087,12 @@ def _time_pooled_step_fn(
 
 
 def _assert_driver_created_from_real_qwen35_config(mesh: Mesh, g: Any) -> None:
-    """Assert `megakernel_runtime.maybe_create` creates `MegakernelDriver` on TPU."""
+    """Assert `megakernel_runtime.maybe_create` serves the Qwen3.5 template on TPU."""
     import types
     import unittest.mock as mock
 
     from vllm_torchtpu.megakernel_runtime import driver as driver_mod
+    from vllm_torchtpu.megakernel_runtime.models.qwen35.adapter import Qwen35Program
 
     frozen_cfg = load_frozen_qwen35_config_json()
     fake_mlp = types.SimpleNamespace(
@@ -1132,19 +1133,18 @@ def _assert_driver_created_from_real_qwen35_config(mesh: Mesh, g: Any) -> None:
         )
         with (
             mock.patch.dict(sys.modules, {"vllm.distributed": fake_dist}),
-            mock.patch.object(driver_mod, "_resolve_tp_size", return_value=8),
             mock.patch.object(driver_mod, "_build_tp_rank_mesh", return_value=mesh),
             mock.patch.object(
-                driver_mod.MegakernelDriver,
+                Qwen35Program,
                 "_prepare_and_pack_weights",
                 return_value={"w_flat": []},
             ),
         ):
             drv = driver_mod.maybe_create(runner)
         assert drv is not None, "maybe_create silently returned None on real config"
-        assert isinstance(drv, driver_mod.MegakernelDriver)
-        assert drv.model_def is qwen35.Qwen35
-        assert drv.geom == dataclasses.replace(qwen35.FULL_EP, e_slots=g.E // 8)
+        assert isinstance(drv, driver_mod.ProgramDriver)
+        assert drv.program.model_def is qwen35.Qwen35
+        assert drv.program.geom == dataclasses.replace(qwen35.FULL_EP, e_slots=g.E // 8)
 
 
 def test_m3_tpu_v7x8_paged_eplb_tp_bench():

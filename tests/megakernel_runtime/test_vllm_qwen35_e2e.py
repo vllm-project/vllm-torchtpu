@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""End-to-end CPU tests for `MegakernelDriver`, metadata prep, and speculative slots."""
+"""End-to-end CPU tests for the Qwen3.5 template program, metadata prep, and
+speculative slots."""
 
 from __future__ import annotations
 
@@ -57,17 +58,52 @@ from vllm_torchtpu.megakernel.runtime import (
     resolve_step_positions,
     select_bucket,
 )
-from vllm_torchtpu.megakernel_runtime.driver import (  # noqa: E402
-    MegakernelDriver,
-    TorchStepMetaOps,
+from vllm_torchtpu.megakernel_runtime.config import (  # noqa: E402
+    collect_config,
+    resolve_plugin_ref,
+)
+from vllm_torchtpu.megakernel_runtime.declines import LayoutDecline  # noqa: E402
+from vllm_torchtpu.megakernel_runtime.driver import TorchStepMetaOps  # noqa: E402
+from vllm_torchtpu.megakernel_runtime.hooks import StepContext  # noqa: E402
+from vllm_torchtpu.megakernel_runtime.models import (  # noqa: E402
+    qwen35 as qwen_plugin,
+)
+from vllm_torchtpu.megakernel_runtime.models.qwen35 import (  # noqa: E402
+    adapter as qwen_adapter,
+)
+from vllm_torchtpu.megakernel_runtime.models.qwen35.adapter import (  # noqa: E402
+    Qwen35Program,
     prepare_step_inputs_eager,
 )
-from vllm_torchtpu.megakernel_runtime.hooks import StepContext  # noqa: E402
+from vllm_torchtpu.megakernel_runtime.plugin import Bucket, RunnerView  # noqa: E402
 from vllm_torchtpu.megakernel_runtime.weight_collector import (  # noqa: E402
     WEIGHT_FLIPPED_ATTR,
 )
 
-_REAL_FRAMEWORK_SLOT_FACTS = MegakernelDriver._framework_slot_facts
+_REAL_FRAMEWORK_SLOT_FACTS = Qwen35Program._framework_slot_facts
+
+
+def _qwen_driver(
+    *, ab: bool = False, stats_period_s: float = 60.0, **kw: Any
+) -> driver_mod.ProgramDriver:
+    """A `ProgramDriver` over a directly built (loaded) `Qwen35Program`."""
+    prog = Qwen35Program(**kw)
+    view = RunnerView(None, tp_rank=prog.tp_rank)
+    return driver_mod.ProgramDriver(
+        prog,
+        view=view,
+        tp_rank=prog.tp_rank,
+        stats_period_s=stats_period_s,
+        ab=ab,
+        backbone=prog.backbone,
+    )
+
+
+def _decided(driver: driver_mod.ProgramDriver) -> tuple[int, int, int]:
+    """`(num_reqs, T, bucket)` of the step `can_run` routed to the megakernel."""
+    assert driver._pending is not None
+    d = driver._pending[0]
+    return (d.num_reqs, d.tokens_per_seq, d.bucket_t)
 
 
 @pytest.fixture(autouse=True)
@@ -79,7 +115,7 @@ def _framework_agrees_on_pool_layout(monkeypatch: pytest.MonkeyPatch) -> None:
     def _facts(self: Any, runner: Any, linear_attn: Any, pool: Any) -> Any:
         return facts_from_pool_layout(self.spec.cache_backend.layout, self.base_exec.R)
 
-    monkeypatch.setattr(MegakernelDriver, "_framework_slot_facts", _facts)
+    monkeypatch.setattr(Qwen35Program, "_framework_slot_facts", _facts)
 
 
 @pytest.fixture(autouse=True)
@@ -540,11 +576,17 @@ def test_bucket_parsing_and_selection() -> None:
             }
         )
     )
-    cfg_runner = driver_mod._collect_runtime_config(fake_runner, raw="")
-    assert cfg_runner["enabled"]
+    qwen_hf = SimpleNamespace(architectures=["Qwen3_5MoeForCausalLM"])
+
+    def _resolved(runner: Any) -> tuple[Any, dict[str, Any]]:
+        cfg = collect_config("", runner.vllm_config.additional_config)
+        _, opts = resolve_plugin_ref(cfg, qwen_hf)
+        return cfg, qwen_adapter.parse_options(opts)
+
+    rt_cfg, cfg_runner = _resolved(fake_runner)
+    assert rt_cfg.enabled and rt_cfg.ab is True
     assert cfg_runner["mode"] == "tp"
     assert cfg_runner["buckets"] == (16, 32)
-    assert cfg_runner["ab"] is True
     assert cfg_runner["profile"] is None
 
     # Named profile selection via `additional_config`
@@ -553,8 +595,8 @@ def test_bucket_parsing_and_selection() -> None:
             additional_config={"megakernel": {"profile": "qwen35-candidate30"}}
         )
     )
-    cfg_runner_c30 = driver_mod._collect_runtime_config(fake_runner_c30, raw="")
-    assert cfg_runner_c30["enabled"]
+    rt_c30, cfg_runner_c30 = _resolved(fake_runner_c30)
+    assert rt_c30.enabled
     assert cfg_runner_c30["profile"] == "qwen35-candidate30"
     assert cfg_runner_c30["pool_gather"] == "auto"
 
@@ -1307,7 +1349,7 @@ def test_step_meta_bitwise_parity_base_vs_head_and_jax() -> None:
 
 
 def test_bind_caches_rejects_compact_mamba_and_non_aliasing_la_cache() -> None:
-    """Verify `bind_caches` rejects compact-mamba or non-aliasing `la.kv_cache`."""
+    """Verify `bind` rejects compact-mamba or non-aliasing `la.kv_cache`."""
     mesh = _cpu_mesh(1)
     g = _tiny_geom(L=4, att_every=4)
     ex_base = _tiny_exec(R=1, B=2, T=1, ctx=256, num_pages=96)
@@ -1315,7 +1357,7 @@ def test_bind_caches_rejects_compact_mamba_and_non_aliasing_la_cache() -> None:
     model = SimpleNamespace(model=backbone)
     raw_pools_t = _allocate_aliased_pools(backbone, g, 96)
 
-    driver = MegakernelDriver(
+    driver = _qwen_driver(
         model=model,
         mesh=mesh,
         tp_rank=0,
@@ -1328,20 +1370,20 @@ def test_bind_caches_rejects_compact_mamba_and_non_aliasing_la_cache() -> None:
 
     runner_compact = SimpleNamespace(model=model, _unified_kv_layout=False)
     with pytest.raises(ValueError, match="_unified_kv_layout must be True"):
-        driver.bind_caches(runner_compact)
+        driver.bind(runner_compact)
 
     backbone.layers[0].linear_attn.kv_cache = []
     runner_ok = SimpleNamespace(model=model, _unified_kv_layout=True)
     with pytest.raises(ValueError, match="must alias pool"):
-        driver.bind_caches(runner_ok)
+        driver.bind(runner_ok)
 
     separate_pool = torch.zeros_like(raw_pools_t[0])
     backbone.layers[0].linear_attn.kv_cache = [separate_pool]
     with pytest.raises(ValueError, match="must alias pool"):
-        driver.bind_caches(runner_ok)
+        driver.bind(runner_ok)
 
     backbone.layers[0].linear_attn.kv_cache = [raw_pools_t[0]]
-    driver.bind_caches(runner_ok)
+    driver.bind(runner_ok)
     assert driver._bound
 
     # `bind_and_warmup` falls back gracefully to stock if `bind_caches` fails
@@ -1375,17 +1417,16 @@ def test_bind_caches_rejects_compact_mamba_and_non_aliasing_la_cache() -> None:
         driver.warmup = orig_warmup  # type: ignore[method-assign]
 
     # Verify `_verify_torchtpu_compile_debug` fails closed on `stablehlo_forward_text`
-    driver.bind_caches(runner_ok)
+    driver.bind(runner_ok)
     with pytest.raises(RuntimeError, match="empty stablehlo_forward_text"):
-        driver._verify_torchtpu_compile_debug(
+        driver.program.check_compiled_ir(
             SimpleNamespace(stablehlo_forward_text=[]),
-            tokens_per_seq=1,
-            bucket_t=2,
+            Bucket(1, 2),
         )
-    assert driver._torchtpu_ir_error is not None
-    assert not driver._torchtpu_ir_checked_buckets
+    assert driver.program._torchtpu_ir_error is not None
+    assert not driver.program._torchtpu_ir_checked_buckets
 
-    driver._torchtpu_ir_error = None
+    driver.program._torchtpu_ir_error = None
     inlined_only_ir = (
         "module @jit_step {\n"
         "  func.func public @main(\n"
@@ -1405,12 +1446,11 @@ def test_bind_caches_rejects_compact_mamba_and_non_aliasing_la_cache() -> None:
         "}\n"
     )
     with pytest.raises(RuntimeError, match="expected >= 1 donated pool arguments"):
-        driver._verify_torchtpu_compile_debug(
+        driver.program.check_compiled_ir(
             SimpleNamespace(stablehlo_forward_text=[inlined_only_ir]),
-            tokens_per_seq=1,
-            bucket_t=2,
+            Bucket(1, 2),
         )
-    assert not driver._torchtpu_ir_checked_buckets
+    assert not driver.program._torchtpu_ir_checked_buckets
 
     valid_donor_ir = inlined_only_ir.replace(
         "%arg0: tensor<96x2x64x4x128xf8E4M3FN>",
@@ -1422,23 +1462,21 @@ def test_bind_caches_rejects_compact_mamba_and_non_aliasing_la_cache() -> None:
         "    return %0#0, %cp",
     )
     with pytest.raises(RuntimeError, match="full-pool copy"):
-        driver._verify_torchtpu_compile_debug(
+        driver.program.check_compiled_ir(
             SimpleNamespace(stablehlo_forward_text=[donor_with_copy_ir]),
-            tokens_per_seq=1,
-            bucket_t=2,
+            Bucket(1, 2),
         )
 
-    driver._torchtpu_ir_error = None
-    driver._verify_torchtpu_compile_debug(
+    driver.program._torchtpu_ir_error = None
+    driver.program.check_compiled_ir(
         SimpleNamespace(stablehlo_forward_text=[valid_donor_ir]),
-        tokens_per_seq=1,
-        bucket_t=2,
+        Bucket(1, 2),
     )
-    assert driver._torchtpu_ir_checked_buckets == {(1, 2)}
+    assert driver.program._torchtpu_ir_checked_buckets == {(1, 2)}
 
     # Regression for BLOCKER 2: a `pool_gather=True` profile builds T=1 (split)
     # and T=4 (GPR) buckets cleanly in `bind_caches`.
-    driver_gpr = MegakernelDriver(
+    driver_gpr = _qwen_driver(
         model=model,
         mesh=mesh,
         tp_rank=0,
@@ -1446,13 +1484,13 @@ def test_bind_caches_rejects_compact_mamba_and_non_aliasing_la_cache() -> None:
         geom=g,
         base_exec=ex_base,
         profile=mk.Profile(name="test-gpr", numerics="approx", pool_gather=True),
-        weights=driver.weights,
+        weights=driver.program.weights,
         buckets=(2,),
         verify_buckets=(4,),
     )
-    driver_gpr.bind_caches(runner_ok)
-    assert driver_gpr._bucket_gpr == {(1, 2): False, (4, 4): True}
-    assert driver_gpr._bucket_fused_io == {(1, 2): False, (4, 4): False}
+    driver_gpr.bind(runner_ok)
+    assert driver_gpr.program._bucket_gpr == {(1, 2): False, (4, 4): True}
+    assert driver_gpr.program._bucket_fused_io == {(1, 2): False, (4, 4): False}
 
 
 def test_compile_hlo_check_config_errors_are_not_layout_errors() -> None:
@@ -1469,14 +1507,15 @@ def test_compile_hlo_check_config_errors_are_not_layout_errors() -> None:
     with pytest.raises(MegakernelConfigError, match="compile_hlo_check=1 requires"):
         check_compile_hlo_mesh(mock_mesh, True)
 
-    def _driver_raising(exc: Exception) -> MegakernelDriver:
-        drv = object.__new__(MegakernelDriver)
+    def _driver_raising(exc: Exception) -> driver_mod.ProgramDriver:
+        program = SimpleNamespace(display_name="test")
+        drv = driver_mod.ProgramDriver(program, view=RunnerView(None))
         drv._bound = True
 
         def _bind(runner: Any) -> None:
             raise exc
 
-        drv.bind_caches = _bind  # type: ignore[method-assign]
+        drv.bind = _bind  # type: ignore[method-assign]
         return drv
 
     runner = SimpleNamespace(_megakernel="mk")
@@ -1512,7 +1551,7 @@ def test_bind_caches_fails_closed_on_pool_slot_layout_mismatch(
     backbone = make_synthetic_qwen35_backbone(g, ex_base)
     model = SimpleNamespace(model=backbone)
     _allocate_aliased_pools(backbone, g, 96)
-    driver = MegakernelDriver(
+    driver = _qwen_driver(
         model=model,
         mesh=mesh,
         tp_rank=0,
@@ -1522,10 +1561,10 @@ def test_bind_caches_fails_closed_on_pool_slot_layout_mismatch(
         buckets=(2,),
         verify_buckets=(),
     )
-    mk = facts_from_pool_layout(driver.spec.cache_backend.layout, 1)
+    mk = facts_from_pool_layout(driver.program.spec.cache_backend.layout, 1)
     built: list[Any] = []
     monkeypatch.setattr(
-        driver, "_build_all_buckets", lambda: built.append(1), raising=False
+        driver.program, "build", lambda _b: built.append(1) or (lambda *_a: None)
     )
     cases = {
         "conv_state_dtype_unsupported": dataclasses.replace(mk, conv_dtype="float16"),
@@ -1534,10 +1573,12 @@ def test_bind_caches_fails_closed_on_pool_slot_layout_mismatch(
         ),
     }
     for code, fw in cases.items():
-        monkeypatch.setattr(driver, "_framework_slot_facts", lambda *_a, _f=fw: _f)
+        monkeypatch.setattr(
+            driver.program, "_framework_slot_facts", lambda *_a, _f=fw: _f
+        )
         runner = SimpleNamespace(model=model, _unified_kv_layout=True, _megakernel=0)
-        with pytest.raises(driver_mod.LayoutDecline) as exc_info:
-            driver.bind_caches(runner)
+        with pytest.raises(LayoutDecline) as exc_info:
+            driver.bind(runner)
         assert exc_info.value.result.code == code
         assert not driver._bound and not built
         driver.bind_and_warmup(runner)
@@ -1548,17 +1589,17 @@ def test_bind_caches_fails_closed_on_pool_slot_layout_mismatch(
     # Without the framework's layout objects (no cache_config.block_size), the
     # real framework-side derivation can't run: that declines too.
     monkeypatch.setattr(
-        driver,
+        driver.program,
         "_framework_slot_facts",
-        _REAL_FRAMEWORK_SLOT_FACTS.__get__(driver),
+        _REAL_FRAMEWORK_SLOT_FACTS.__get__(driver.program),
     )
     runner = SimpleNamespace(model=model, _unified_kv_layout=True)
-    with pytest.raises(driver_mod.LayoutDecline) as exc_info:
-        driver.bind_caches(runner)
+    with pytest.raises(LayoutDecline) as exc_info:
+        driver.bind(runner)
     assert exc_info.value.result.code == "pool_layout_unknown"
 
-    monkeypatch.setattr(driver, "_framework_slot_facts", lambda *_a: mk)
-    driver.bind_caches(runner)
+    monkeypatch.setattr(driver.program, "_framework_slot_facts", lambda *_a: mk)
+    driver.bind(runner)
     assert driver._bound and built == [1]
     assert driver.pool_layout_facts == mk
 
@@ -1580,7 +1621,7 @@ def test_bind_caches_adopts_an_fp32_conv_framework_pool(
     backbone = make_synthetic_qwen35_backbone(g, ex_base)
     model = SimpleNamespace(model=backbone)
     _allocate_aliased_pools(backbone, g, 96)
-    driver = MegakernelDriver(
+    drv = _qwen_driver(
         model=model,
         mesh=mesh,
         tp_rank=0,
@@ -1592,14 +1633,16 @@ def test_bind_caches_adopts_an_fp32_conv_framework_pool(
         fused_pool_io=fused,
         pool_gather=gather,
     )
+    driver = drv.program
     bf16 = facts_from_pool_layout(driver.spec.cache_backend.layout, 1)
     assert bf16.conv_dtype == "bfloat16"
     fw = dataclasses.replace(bf16, conv_dtype="float32", conv_bytes=2 * bf16.conv_bytes)
     monkeypatch.setattr(driver, "_framework_slot_facts", lambda *_a: fw)
-    monkeypatch.setattr(driver, "_build_all_buckets", lambda: None, raising=False)
-    driver.bind_caches(SimpleNamespace(model=model, _unified_kv_layout=True))
+    monkeypatch.setattr(driver, "build", lambda _b: (lambda *_a: None))
+    drv.bind(SimpleNamespace(model=model, _unified_kv_layout=True))
+    assert drv._bound and drv.pool_layout_facts == fw
     lay = driver.spec.cache_backend.layout
-    assert lay.conv_dtype == jnp.float32 and driver._bound
+    assert lay.conv_dtype == jnp.float32
     assert driver.pool_layout_facts == fw
     assert not driver.spec.cache_backend.supports_fused_io
     assert not driver.fused_pool_io
@@ -1639,7 +1682,7 @@ def test_bind_caches_budget_overflow_is_config_error() -> None:
     backbone = make_synthetic_qwen35_backbone(g, ex_base)
     model = SimpleNamespace(model=backbone)
     _allocate_aliased_pools(backbone, g, 96)
-    driver = MegakernelDriver(
+    driver = _qwen_driver(
         model=model,
         mesh=mesh,
         tp_rank=0,
@@ -1669,25 +1712,25 @@ def test_driver_validates_profile_before_packing_and_uses_profile_buckets(
     def _no_pack(*_a: Any, **_k: Any) -> Any:
         raise AssertionError("weights packed before the configuration was validated")
 
-    monkeypatch.setattr(MegakernelDriver, "_prepare_and_pack_weights", _no_pack)
+    monkeypatch.setattr(Qwen35Program, "_prepare_and_pack_weights", _no_pack)
     kw = dict(model=model, tp_rank=0, mode="ep", geom=g, base_exec=ex_base)
     with pytest.raises(ValueError, match="unknown megakernel profile"):
-        MegakernelDriver(mesh=_cpu_mesh(1), profile="nope", **kw)
+        Qwen35Program(mesh=_cpu_mesh(1), profile="nope", **kw)
 
     class _MockDevice:
         id = 0
 
     mock_mesh = SimpleNamespace(devices=np.array([_MockDevice()], dtype=object))
     with pytest.raises(MegakernelConfigError, match="compile_hlo_check=1 requires"):
-        MegakernelDriver(mesh=mock_mesh, compile_hlo_check=True, **kw)
+        Qwen35Program(mesh=mock_mesh, compile_hlo_check=True, **kw)
 
     prof = Profile(name="b1-test-buckets", buckets=(2,), verify_buckets=(4,))
     monkeypatch.setitem(profile_mod._REGISTRY, prof.name, prof)
-    drv = MegakernelDriver(
+    drv = Qwen35Program(
         mesh=_cpu_mesh(1), profile=prof.name, weights={"w_flat": []}, **kw
     )
-    assert (drv.buckets, drv.verify_buckets) == ((2,), (4,))
-    drv2 = MegakernelDriver(
+    assert (drv.decode_buckets, drv.verify_buckets) == ((2,), (4,))
+    drv2 = Qwen35Program(
         mesh=_cpu_mesh(1),
         profile=prof.name,
         weights={"w_flat": []},
@@ -1695,9 +1738,9 @@ def test_driver_validates_profile_before_packing_and_uses_profile_buckets(
         verify_buckets=(),
         **kw,
     )
-    assert (drv2.buckets, drv2.verify_buckets) == ((8,), ())
-    drv3 = MegakernelDriver(mesh=_cpu_mesh(1), weights={"w_flat": []}, **kw)
-    assert drv3.buckets == DEFAULT_BUCKETS
+    assert (drv2.decode_buckets, drv2.verify_buckets) == ((8,), ())
+    drv3 = Qwen35Program(mesh=_cpu_mesh(1), weights={"w_flat": []}, **kw)
+    assert drv3.decode_buckets == DEFAULT_BUCKETS
     assert drv3.verify_buckets == DEFAULT_VERIFY_BUCKETS
 
 
@@ -1755,7 +1798,7 @@ def test_maybe_create_disables_on_unsupported_tpu_chip(
     )
     fake_vllm_dist = SimpleNamespace(get_tensor_model_parallel_rank=lambda: 0)
     monkeypatch.setitem(sys.modules, "vllm.distributed", fake_vllm_dist)
-    monkeypatch.setattr(driver_mod, "_resolve_tp_size", lambda _r: 8)
+    monkeypatch.setattr(RunnerView, "device_kind", property(lambda _v: "TPU v5 lite"))
     monkeypatch.setattr(
         driver_mod, "_build_tp_rank_mesh", lambda _r, fallback_mesh=None: fallback_mesh
     )
@@ -1767,17 +1810,20 @@ def test_maybe_create_disables_on_unsupported_tpu_chip(
         )
     monkeypatch.setattr(logging.getLogger("vllm"), "propagate", True)
     with caplog.at_level(logging.WARNING):
-        assert MegakernelDriver.maybe_create(runner) is None
+        drv = driver_mod.ProgramDriver.maybe_create(runner)
+    # `create` declines (before the mesh); every rank gets a DeclinedDriver.
+    assert isinstance(drv, driver_mod.DeclinedDriver)
+    assert drv.decline.code == "unsupported_tpu_chip"
     assert "Megakernel disabled: Unsupported TPU" in caplog.text
 
-    # Unresolvable runner returns None from maybe_create; __init__ raises ValueError
+    # No template serves an unresolvable arch: maybe_create returns None.
     unresolvable_runner = SimpleNamespace(
         model=SimpleNamespace(model=SimpleNamespace(layers=[])),
         vllm_config=SimpleNamespace(additional_config={"megakernel": True}),
     )
-    assert MegakernelDriver.maybe_create(unresolvable_runner) is None
-    with pytest.raises(ValueError, match="could not resolve ModelDef"):
-        MegakernelDriver(
+    assert driver_mod.ProgramDriver.maybe_create(unresolvable_runner) is None
+    with pytest.raises(ValueError, match="Cannot locate decoder backbone"):
+        Qwen35Program(
             model=SimpleNamespace(model=SimpleNamespace(layers=[])),
             mesh=_cpu_mesh(1),
         )
@@ -1838,7 +1884,6 @@ def test_maybe_create_declines_without_usable_pallas_mesh(
     )
     fake_vllm_dist = SimpleNamespace(get_tensor_model_parallel_rank=lambda: 0)
     monkeypatch.setitem(sys.modules, "vllm.distributed", fake_vllm_dist)
-    monkeypatch.setattr(driver_mod, "_resolve_tp_size", lambda _r: 8)
 
     def get_pallas_mesh(**_kw: Any) -> Any:
         if bad == "unavailable":
@@ -1849,7 +1894,7 @@ def test_maybe_create_declines_without_usable_pallas_mesh(
     monkeypatch.setattr(logging.getLogger("vllm"), "propagate", True)
     code = f"pallas_mesh_{bad}"
     with caplog.at_level(logging.INFO):
-        drv = MegakernelDriver.maybe_create(runner)
+        drv = driver_mod.ProgramDriver.maybe_create(runner)
         assert isinstance(drv, driver_mod.DeclinedDriver)
         assert drv.decline.code == code and not drv.decline.eligible
         assert "skipping" in caplog.text
@@ -1915,7 +1960,6 @@ def test_maybe_create_declines_data_parallel_before_any_collective(
     monkeypatch.setattr(
         driver_mod, "_ep_group_size", lambda: 16 if why == "ep_wider_than_tp" else 8
     )
-    monkeypatch.setattr(driver_mod, "_resolve_tp_size", lambda _r: 8)
 
     def no_collective(*_a: Any, **_k: Any) -> Any:
         raise AssertionError("must decline before any collective / mesh build")
@@ -1929,7 +1973,7 @@ def test_maybe_create_declines_data_parallel_before_any_collective(
     monkeypatch.setattr(driver_mod, "agree_on_decline", no_collective)
     monkeypatch.setattr(logging.getLogger("vllm"), "propagate", True)
     with caplog.at_level(logging.INFO):
-        assert MegakernelDriver.maybe_create(runner) is None
+        assert driver_mod.ProgramDriver.maybe_create(runner) is None
     assert "data_parallel_size" in caplog.text
 
 
@@ -1961,10 +2005,9 @@ def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
             driver_mod.logger, "_logger", logging.getLogger(driver_mod.logger._name)
         )
     monkeypatch.setattr(logging.getLogger("vllm"), "propagate", True)
-    monkeypatch.setattr(driver_mod, "_resolve_tp_size", lambda _r: 8)
     monkeypatch.setattr(driver_mod, "_build_tp_rank_mesh", lambda *_a, **_k: mesh8)
     monkeypatch.setattr(
-        MegakernelDriver,
+        Qwen35Program,
         "_prepare_and_pack_weights",
         lambda *_a, **_k: {"w_flat": []},
     )
@@ -2005,13 +2048,13 @@ def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
         ),
     )
     drv = driver_mod.maybe_create(runner)
-    assert drv is not None
-    assert isinstance(drv, driver_mod.MegakernelDriver)
-    assert drv.model_def is qwen35.Qwen35
-    assert drv.profile.name == "qwen35-test-default"
-    assert drv.profile.pool_gather is None
-    assert drv.buckets == (4, 16)
-    assert drv.verify_buckets == ()
+    assert isinstance(drv, driver_mod.ProgramDriver)
+    prog = drv.program
+    assert prog.model_def is qwen35.Qwen35
+    assert prog.profile.name == "qwen35-test-default"
+    assert prog.profile.pool_gather is None
+    assert prog.decode_buckets == (4, 16)
+    assert prog.verify_buckets == ()
 
     # 2. Explicit `buckets=0` on a non-speculative runner disables gracefully at INFO.
     runner_off = SimpleNamespace(
@@ -2027,7 +2070,9 @@ def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
     )
     caplog.clear()
     with caplog.at_level(logging.INFO):
-        assert MegakernelDriver.maybe_create(runner_off) is None
+        off = driver_mod.ProgramDriver.maybe_create(runner_off)
+    assert isinstance(off, driver_mod.DeclinedDriver)
+    assert off.decline.code == "empty_buckets"
     assert "both bucket lists empty" in caplog.text
 
     # 3. Model default profile with `buckets=()` on a non-speculative runner
@@ -2040,17 +2085,21 @@ def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
         model_default=True,
     )
     register_profile(empty_default, replace=True)
-    assert MegakernelDriver.maybe_create(runner) is None
+    empty = driver_mod.ProgramDriver.maybe_create(runner)
+    assert isinstance(empty, driver_mod.DeclinedDriver)
+    assert empty.decline.code == "empty_buckets"
 
     # 4. Supported TP sizes: default Qwen35.supported_tp_sizes == (8,) rejects tp=4;
     #    declaring (4, 8) on the model OR (4,) on the profile accepts tp=4.
     register_profile(custom_default, replace=True)
     mesh4 = _cpu_mesh(4)
-    monkeypatch.setattr(driver_mod, "_resolve_tp_size", lambda _r: 4)
+    runner.mesh = mesh4
     monkeypatch.setattr(driver_mod, "_build_tp_rank_mesh", lambda *_a, **_k: mesh4)
     caplog.clear()
     with caplog.at_level(logging.WARNING):
-        assert MegakernelDriver.maybe_create(runner) is None
+        tp4 = driver_mod.ProgramDriver.maybe_create(runner)
+    assert isinstance(tp4, driver_mod.DeclinedDriver)
+    assert tp4.decline.code == "unsupported_tp_size"
     assert "Megakernel requires 8 TPU devices in mesh, got 4" in caplog.text
 
     tp4_profile = Profile(
@@ -2061,13 +2110,13 @@ def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
         model_default=True,
     )
     register_profile(tp4_profile, replace=True)
-    drv_tp4_prof = MegakernelDriver.maybe_create(runner)
-    assert drv_tp4_prof is not None and drv_tp4_prof.profile.name == "qwen35-test-tp4"
+    drv_tp4_prof = driver_mod.ProgramDriver.maybe_create(runner)
+    assert drv_tp4_prof.program.profile.name == "qwen35-test-tp4"
 
     register_profile(custom_default, replace=True)
     monkeypatch.setattr(qwen35.Qwen35, "supported_tp_sizes", (4, 8))
-    drv_tp4_model = MegakernelDriver.maybe_create(runner)
-    assert drv_tp4_model is not None and drv_tp4_model.buckets == (4, 16)
+    drv_tp4_model = driver_mod.ProgramDriver.maybe_create(runner)
+    assert drv_tp4_model.program.decode_buckets == (4, 16)
 
     # 5. Table-driven check that every startup code in `check_startup_eligibility`
     #    and `check_post_mesh_eligibility` maps through `_VLLM_STARTUP_MESSAGES`.
@@ -2107,14 +2156,18 @@ def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
     ):
         dec = check_startup_eligibility(**{**base_st, **ov})
         assert not dec.eligible and dec.code == exp_code
-        msg = driver_mod._VLLM_STARTUP_MESSAGES.get(dec.code, dec.message)
+        msgs = {
+            **driver_mod._VLLM_STARTUP_MESSAGES,
+            "unaligned_cache_layout": qwen_adapter.UNALIGNED_LAYOUT_MESSAGE,
+        }
+        msg = msgs.get(dec.code, dec.message)
         assert expected_substr in msg
 
     base_post = dict(
         tp_size=8,
         mesh_size=8,
         device_kind="TPU v7x",
-        bucket_policy=drv.bucket_policy,
+        bucket_policy=prog.bucket_policy,
     )
     for ov, exp_code, expected_substr in (
         (
@@ -2141,7 +2194,7 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
     model = SimpleNamespace(model=backbone)
     _allocate_aliased_pools(backbone, g, 96)
 
-    driver = MegakernelDriver(
+    driver = _qwen_driver(
         model=model,
         mesh=mesh,
         tp_rank=0,
@@ -2180,7 +2233,7 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
         mamba_slot_read_offsets=None,
         mrope_positions=None,
     )
-    driver.bind_caches(runner)
+    driver.bind(runner)
 
     max_reqs_padded = 128
     attn_md = SimpleNamespace(
@@ -2198,8 +2251,8 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
         )
         for _ in range(3)
     ]
-    md_dict = {driver.attn_layer_name: attn_md}
-    for name, m_md in zip(driver.mamba_layer_names, mamba_mds, strict=True):
+    md_dict = {driver.program.attn_layer_name: attn_md}
+    for name, m_md in zip(driver.program.mamba_layer_names, mamba_mds, strict=True):
         md_dict[name] = m_md
 
     monkeypatch.setattr(
@@ -2220,8 +2273,7 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
     req_dist_cpu.copy_(torch.tensor([2, 2, 2], dtype=torch.int32))
     qsl_np[:3] = [0, 1, 2]
     assert driver.can_run(ids_2, pos_2, runner=runner)
-    assert driver._prepared_step is not None
-    assert driver._prepared_step[5:8] == (2, 1, 2)
+    assert _decided(driver) == (2, 1, 2)
 
     # 2. Single-request prefill (1 req, 8 tokens or 4 tokens in non-spec mode) -> False
     runner._attn_metadata_builder_ctx.num_reqs = 1
@@ -2242,8 +2294,7 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
     # `[1, 2, 2]`, while `qsl_np[:3]` is updated to `[0, 1, 2]`.
     qsl_np[:3] = [0, 1, 2]
     assert driver.can_run(ids_2, pos_2, runner=runner)
-    assert driver._prepared_step is not None
-    assert driver._prepared_step[5:8] == (2, 1, 2)
+    assert _decided(driver) == (2, 1, 2)
 
     # 4. Spec decode enabled (`mamba_slot_read_offsets` present, 4-col ckpt):
     #    4a. Uniform T=4 verify (1 req, 4 tokens) -> True (mk_t4_b4)
@@ -2255,8 +2306,7 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
     comb_dist_cpu.copy_(torch.tensor([0, 0, 1, 1, 1, 1], dtype=torch.int32))
     qsl_np[:2] = [0, 4]
     assert driver.can_run(ids_4, pos_4, runner=runner)
-    assert driver._prepared_step is not None
-    assert driver._prepared_step[5:8] == (1, 4, 4)
+    assert _decided(driver) == (1, 4, 4)
 
     #    4b. T=1 plain decode under spec decode (`ckpt.shape == (128, 4)`, 2 active
     #        reqs with 1 token each): must dispatch as (num_reqs=2, T=1, bkt=2), NOT
@@ -2265,8 +2315,7 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
     comb_dist_cpu.copy_(torch.tensor([2, 2, 2, 2, 2, 2], dtype=torch.int32))
     qsl_np[:3] = [0, 1, 2]
     assert driver.can_run(ids_2, pos_2, runner=runner)
-    assert driver._prepared_step is not None
-    assert driver._prepared_step[5:8] == (2, 1, 2)
+    assert _decided(driver) == (2, 1, 2)
 
     #    4c. Variable draft lengths under spec decode ([4, 2] tokens, both windowed
     #        so comb_dist_cpu[3] == 2 == num_reqs) -> False (stock_mixed)
@@ -2353,34 +2402,21 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
     pos_mrope_eq = torch.tensor([[5, 9], [5, 9], [5, 9]], dtype=torch.int32)
     assert driver.can_run(ids_2, pos_mrope_eq, runner=runner)
 
-    # 8. Unsupported runner/backbone configurations gate off `can_run`
-    runner._unified_kv_layout = False
-    assert not driver.can_run(ids_2, pos_2, runner=runner)
-    runner._unified_kv_layout = True
-
-    runner.supports_mm_inputs = True
-    assert not driver.can_run(ids_2, pos_2, runner=runner)
-    runner.supports_mm_inputs = False
-
-    runner.lora_config = object()
-    assert not driver.can_run(ids_2, pos_2, runner=runner)
-    runner.lora_config = None
-
-    runner._pp_is_last = False
-    assert not driver.can_run(ids_2, pos_2, runner=runner)
-    runner._pp_is_last = True
-
-    runner._pcp_enabled = True
-    assert not driver.can_run(ids_2, pos_2, runner=runner)
-    runner._pcp_enabled = False
-
-    runner.parallel_config.decode_context_parallel_size = 2
-    assert not driver.can_run(ids_2, pos_2, runner=runner)
-    runner.parallel_config.decode_context_parallel_size = 1
-
-    runner._dp_lockstep_enabled = lambda: True
-    assert not driver.can_run(ids_2, pos_2, runner=runner)
-    runner._dp_lockstep_enabled = lambda: False
+    # 8. Static runner configurations (unified layout, MM, LoRA, PP, PCP/DCP,
+    #    DP lockstep) are startup declines (`check_runner_capabilities`, the
+    #    template's `create`); aux hidden-state capture also gates every step.
+    for attr, val in (
+        ("supports_mm_inputs", True),
+        ("lora_config", object()),
+        ("_pp_is_last", False),
+        ("_pcp_enabled", True),
+        ("_dp_lockstep_enabled", lambda: True),
+    ):
+        old = getattr(runner, attr)
+        setattr(runner, attr, val)
+        caps = qwen_plugin.PLUGIN.capabilities
+        assert driver_mod.check_runner_capabilities(runner, caps, tp_size=1)
+        setattr(runner, attr, old)
 
     backbone.aux_hidden_state_layers = (1,)
     assert not driver.can_run(ids_2, pos_2, runner=runner)
@@ -2404,7 +2440,7 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
 def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify `MegakernelDriver` warmup, `T=1`, `T=4`, and speculative accept."""
+    """Verify the Qwen3.5 program's warmup, `T=1`, `T=4`, and speculative accept."""
     mesh = _cpu_mesh(1)
     tp = NamedSharding(mesh, P("tp"))
     unsh = NamedSharding(mesh, P())
@@ -2479,7 +2515,7 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
         mamba_slot_read_offsets=roff_slot_buf,
     )
 
-    driver = MegakernelDriver(
+    driver = _qwen_driver(
         model=model,
         mesh=mesh,
         tp_rank=0,
@@ -2495,14 +2531,14 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
     # 1. `bind_and_warmup` binds pools, compiles (1, 2) and (4, 4), runs sentinel check,
     #    and restores pools
     driver.bind_and_warmup(runner)
-    assert driver._hlo_checked_buckets == {(1, 2), (4, 4)}
-    assert driver._bucket_fused_io == {(1, 2): False, (4, 4): False}
+    assert driver.program._hlo_checked_buckets == {(1, 2), (4, 4)}
+    assert driver.program._bucket_fused_io == {(1, 2): False, (4, 4): False}
     # Qwen3.5 default profile: split pool I/O everywhere (GPR is opt-in; it never
     # applies at T=1 and "auto" only selects it for WIDE verify buckets, B > 16).
-    assert driver.profile.name == "qwen35-baseline"
-    assert driver._bucket_gpr == {(1, 2): False, (4, 4): False}
+    assert driver.program.profile.name == "qwen35-baseline"
+    assert driver.program._bucket_gpr == {(1, 2): False, (4, 4): False}
     # Each bucket step has its own code object (separate Dynamo cache entries)
-    step_t1, step_t4 = driver._bucket_steps[(1, 2)], driver._bucket_steps[(4, 4)]
+    step_t1, step_t4 = driver._steps[(1, 2)], driver._steps[(4, 4)]
     assert step_t1.__code__ is not step_t4.__code__
     assert (step_t1.__code__.co_name, step_t4.__code__.co_name) == (
         "step_t1_b2",
@@ -2554,8 +2590,8 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
         )
         for sub in range(3)
     ]
-    md_dict = {driver.attn_layer_name: attn_md}
-    for name, m_md in zip(driver.mamba_layer_names, mamba_mds, strict=True):
+    md_dict = {driver.program.attn_layer_name: attn_md}
+    for name, m_md in zip(driver.program.mamba_layer_names, mamba_mds, strict=True):
         md_dict[name] = m_md
 
     monkeypatch.setattr(
@@ -2584,7 +2620,7 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
         assert p.data_ptr() == orig_data_ptrs[idx]
 
     # Independent pure-JAX `qwen35.reference_step` check
-    hid_t1_bf16 = driver.embed_tokens(input_ids_t1).to(torch.bfloat16)
+    hid_t1_bf16 = driver.program.embed_tokens(input_ids_t1).to(torch.bfloat16)
     hid_l_t1 = _torch_to_jax(hid_t1_bf16, unsh)
     pos_j_t1 = jnp.asarray([5, 9], dtype=jnp.int32)
     ref_out_t1, _ = qwen35.reference_step(
@@ -2599,7 +2635,9 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
 
     # Independent split 3-stage `qwen35.make_pooled_step` oracle
     ex_t1 = with_cache(
-        replace(driver.base_exec, B=2, T=1), fused_pool_io=False, pool_gather=False
+        replace(driver.program.base_exec, B=2, T=1),
+        fused_pool_io=False,
+        pool_gather=False,
     )
     step_ref_t1, _ = qwen35.make_pooled_step(
         mesh, g, ex_t1, donate_pools=False, fused_pool_io=False
@@ -2653,12 +2691,14 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
     assert out_t4.shape == (4, g.H)
 
     ex_t4 = with_cache(
-        replace(driver.base_exec, B=4, T=4), fused_pool_io=False, pool_gather=False
+        replace(driver.program.base_exec, B=4, T=4),
+        fused_pool_io=False,
+        pool_gather=False,
     )
     step_ref_t4, _ = qwen35.make_pooled_step(
         mesh, g, ex_t4, donate_pools=False, fused_pool_io=False
     )
-    hid_t4_bf16 = driver.embed_tokens(input_ids_t4).to(torch.bfloat16)
+    hid_t4_bf16 = driver.program.embed_tokens(input_ids_t4).to(torch.bfloat16)
     hid_in_t4_pad = torch.nn.functional.pad(hid_t4_bf16, (0, 0, 0, ex_t4.M - 4))
     pos_j_t4 = jnp.asarray([6, 7, 8, 9], dtype=jnp.int32)
     pt_ref_t4 = jnp.asarray([[140, 141]], dtype=jnp.int32)
@@ -2705,8 +2745,7 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
     input_ids_t1_after_t4 = torch.tensor([19, 0], dtype=torch.int32)
     positions_t1_after_t4 = torch.tensor([8, 0], dtype=torch.int32)
     assert driver.can_run(input_ids_t1_after_t4, positions_t1_after_t4, runner=runner)
-    assert driver._prepared_step is not None
-    assert driver._prepared_step[5:8] == (1, 1, 2)
+    assert _decided(driver) == (1, 1, 2)
     out_t1_after_t4 = driver(
         input_ids_t1_after_t4, positions_t1_after_t4, num_tokens=2, runner=runner
     )
@@ -2717,7 +2756,7 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
         assert torch.equal(p[15:19].view(torch.uint8), slot3_before[idx])
 
     # Independent `make_pooled_step` oracle (read=3/11/19, write=1/9/17 for seq 0)
-    hid_c_bf16 = driver.embed_tokens(input_ids_t1_after_t4).to(torch.bfloat16)
+    hid_c_bf16 = driver.program.embed_tokens(input_ids_t1_after_t4).to(torch.bfloat16)
     hid_in_c_pad = torch.nn.functional.pad(hid_c_bf16, (0, 0, 0, ex_t1.M - 2))
     pos_j_c = jnp.asarray([8, 0], dtype=jnp.int32)
     pt_ref_c = jnp.asarray([[140, 141], [0, 0]], dtype=jnp.int32)
@@ -2758,7 +2797,7 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
     assert driver.can_run(input_ids_t4_d, positions_t4_d, runner=runner)
     out_t4_d = driver(input_ids_t4_d, positions_t4_d, num_tokens=4, runner=runner)
 
-    hid_d_bf16 = driver.embed_tokens(input_ids_t4_d).to(torch.bfloat16)
+    hid_d_bf16 = driver.program.embed_tokens(input_ids_t4_d).to(torch.bfloat16)
     hid_in_d_pad = torch.nn.functional.pad(hid_d_bf16, (0, 0, 0, ex_t4.M - 4))
     pos_j_d = jnp.asarray([9, 10, 11, 12], dtype=jnp.int32)
     hid_ref_d, ref_pools_j = step_ref_t4(
@@ -2789,7 +2828,7 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
     assert driver.can_run(input_ids_t4_acc, positions_t4_acc, runner=runner)
     out_t4_acc = driver(input_ids_t4_acc, positions_t4_acc, num_tokens=4, runner=runner)
 
-    hid_e_bf16 = driver.embed_tokens(input_ids_t4_acc).to(torch.bfloat16)
+    hid_e_bf16 = driver.program.embed_tokens(input_ids_t4_acc).to(torch.bfloat16)
     hid_in_e_pad = torch.nn.functional.pad(hid_e_bf16, (0, 0, 0, ex_t4.M - 4))
     pos_j_e = jnp.asarray([11, 12, 13, 14], dtype=jnp.int32)
     roff_ref_e = jnp.asarray([[2], [2], [2]], dtype=jnp.int32)
@@ -2830,14 +2869,20 @@ def test_megakernel_runtime_package_has_no_model_names_and_no_legacy_exports():
     for py_path in py_files:
         src = py_path.read_text(encoding="utf-8")
         tree = ast.parse(src, filename=str(py_path))
-        # The shorthand table names the built-in templates by string.
+        # The shorthand table and the removed-export replacements name the
+        # built-in templates by string.
+        table = {"plugin.py": "SHORTHANDS", "__init__.py": "_MOVED"}.get(py_path.name)
         allowed: set[int] = set()
-        if py_path.name == "plugin.py":
+        if table is not None:
             node = next(
                 n
                 for n in tree.body
-                if isinstance(n, ast.AnnAssign)
-                and getattr(n.target, "id", "") == "SHORTHANDS"
+                if isinstance(n, (ast.Assign, ast.AnnAssign))
+                and table
+                in [
+                    getattr(t, "id", "")
+                    for t in (getattr(n, "targets", None) or [n.target])
+                ]
             )
             allowed = set(range(node.lineno, (node.end_lineno or node.lineno) + 1))
         low = "\n".join(
@@ -2879,9 +2924,15 @@ def test_megakernel_runtime_package_has_no_model_names_and_no_legacy_exports():
         assert not hasattr(mkr, attr), f"megakernel_runtime still exports {attr}"
 
     for cls_attr in ("_step_mix", "_torchtpu_ir_checked", "_ir_required_buckets"):
-        assert not hasattr(MegakernelDriver, cls_attr), (
-            f"MegakernelDriver still defines {cls_attr}"
-        )
+        for cls in (driver_mod.ProgramDriver, Qwen35Program):
+            assert not hasattr(cls, cls_attr), f"{cls.__name__} defines {cls_attr}"
+    for moved, hint in (
+        ("MegakernelDriver", "ProgramDriver"),
+        ("prepare_step_inputs_eager", "adapter.prepare_step_inputs_eager"),
+    ):
+        assert moved not in mkr.__all__ and not hasattr(drv_mod, moved)
+        with pytest.raises(AttributeError, match=hint):
+            getattr(mkr, moved)
 
     for attr in (
         "parse_megakernel_config",
@@ -3016,7 +3067,7 @@ def _base_driver_inspect_step_detail_ref(
 def test_driver_inspect_step_detail_differential_and_unprepared_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Differential test of `MegakernelDriver._inspect_step_detail` vs base."""
+    """Differential test of `ProgramDriver._inspect_step_detail` vs base."""
     qsl_t1 = np.array([0, 1, 2], dtype=np.int32)
     qsl_t4 = np.array([0, 4, 8], dtype=np.int32)
     qsl_mix = np.array([0, 1, 5], dtype=np.int32)
@@ -3061,7 +3112,7 @@ def test_driver_inspect_step_detail_differential_and_unprepared_call(
                                 if ns is not None:
                                     attn_md.num_seqs = ns
                                 m0 = SimpleNamespace(mamba_request_distribution=m_dist)
-                                got = MegakernelDriver._inspect_step_detail(
+                                got = driver_mod.ProgramDriver._inspect_step_detail(
                                     attn_md, m0, runner=runner
                                 )
                                 exp = _base_driver_inspect_step_detail_ref(
@@ -3078,7 +3129,7 @@ def test_driver_inspect_step_detail_differential_and_unprepared_call(
     backbone = make_synthetic_qwen35_backbone(g, ex_base)
     model = SimpleNamespace(model=backbone)
     _allocate_aliased_pools(backbone, g, 96)
-    driver = MegakernelDriver(
+    driver = _qwen_driver(
         model=model,
         mesh=mesh,
         tp_rank=0,
@@ -3088,7 +3139,7 @@ def test_driver_inspect_step_detail_differential_and_unprepared_call(
         buckets=(2,),
         verify_buckets=(),
     )
-    driver.bind_caches(SimpleNamespace(model=model, _unified_kv_layout=True))
+    driver.bind(SimpleNamespace(model=model, _unified_kv_layout=True))
     attn_md_call = SimpleNamespace(
         block_tables=torch.zeros((4,), dtype=torch.int32),
         seq_lens=torch.ones((2,), dtype=torch.int32),
@@ -3103,8 +3154,8 @@ def test_driver_inspect_step_detail_differential_and_unprepared_call(
         )
         for _ in range(3)
     ]
-    md_dict = {driver.attn_layer_name: attn_md_call}
-    for name, m_md in zip(driver.mamba_layer_names, m_mds_call, strict=True):
+    md_dict = {driver.program.attn_layer_name: attn_md_call}
+    for name, m_md in zip(driver.program.mamba_layer_names, m_mds_call, strict=True):
         md_dict[name] = m_md
     monkeypatch.setattr(
         driver_mod,

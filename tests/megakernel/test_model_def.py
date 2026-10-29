@@ -1150,6 +1150,12 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
 
     from vllm_torchtpu.megakernel.models import qwen35_profile
     from vllm_torchtpu.megakernel_runtime import driver as driver_mod
+    from vllm_torchtpu.megakernel_runtime.models.qwen35 import adapter as qwen_adapter
+
+    def _declined(drv: Any) -> bool:
+        # A checkpoint the template doesn't serve: `create` declines, so every
+        # rank runs stock under a `DeclinedDriver`.
+        return isinstance(drv, driver_mod.DeclinedDriver)
 
     monkeypatch.setattr(
         driver_mod,
@@ -1279,9 +1285,7 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
         dict_to_namespace(nested_vlm),
     ):
         assert Qwen35.validate_hf_config(valid_cfg).eligible
-        assert driver_mod.MegakernelDriver._validate_runner_hf_config(
-            _make_runner(valid_cfg)
-        )
+        assert qwen_adapter.validate_hf_config(valid_cfg).eligible
 
     # 2) Different layer count (48 vs 60) logs differing fields (L, NGDN, NATT) and
     #    maybe_create returns None without raising (both dict and attribute-style)
@@ -1297,10 +1301,8 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
         caplog.clear()
         with caplog.at_level(logging.WARNING):
             assert not Qwen35.validate_hf_config(cand_48l).eligible
-            assert not driver_mod.MegakernelDriver._validate_runner_hf_config(
-                _make_runner(cand_48l)
-            )
-            assert driver_mod.maybe_create(_make_runner(cand_48l)) is None
+            assert not qwen_adapter.validate_hf_config(cand_48l).eligible
+            assert _declined(driver_mod.maybe_create(_make_runner(cand_48l)))
         assert "L=48 (expected 60)" in caplog.text
 
     # 3) Missing required key logs only the missing key (never embeds the config dict)
@@ -1315,7 +1317,7 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
     }
     caplog.clear()
     with caplog.at_level(logging.WARNING):
-        assert driver_mod.maybe_create(_make_runner(cfg_missing_theta)) is None
+        assert _declined(driver_mod.maybe_create(_make_runner(cfg_missing_theta)))
     assert "missing HF key 'rope_theta'" in caplog.text
     assert "num_attention_heads" not in caplog.text
 
@@ -1326,7 +1328,7 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
     }
     caplog.clear()
     with caplog.at_level(logging.WARNING):
-        assert driver_mod.maybe_create(_make_runner(cfg_2048h)) is None
+        assert _declined(driver_mod.maybe_create(_make_runner(cfg_2048h)))
     assert "H=2048 (expected 4096)" in caplog.text
 
     # 5) Dense config WITH geometry (has hidden_size, no num_experts) and WITHOUT
@@ -1351,10 +1353,8 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
         caplog.clear()
         with caplog.at_level(logging.WARNING):
             assert not Qwen35.validate_hf_config(dense_cand).eligible
-            assert not driver_mod.MegakernelDriver._validate_runner_hf_config(
-                _make_runner(dense_cand)
-            )
-            assert driver_mod.maybe_create(_make_runner(dense_cand)) is None
+            assert not qwen_adapter.validate_hf_config(dense_cand).eligible
+            assert _declined(driver_mod.maybe_create(_make_runner(dense_cand)))
         assert "Qwen35 supports MoE checkpoints only" in caplog.text
 
     # 6) Scaled RoPE (YaRN in rope_parameters or linear in rope_scaling) is rejected
@@ -1384,37 +1384,25 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
         caplog.clear()
         with caplog.at_level(logging.WARNING):
             assert not Qwen35.validate_hf_config(scaled_cfg).eligible
-            assert not driver_mod.MegakernelDriver._validate_runner_hf_config(
-                _make_runner(scaled_cfg)
-            )
-            assert driver_mod.maybe_create(_make_runner(scaled_cfg)) is None
+            assert not qwen_adapter.validate_hf_config(scaled_cfg).eligible
+            assert _declined(driver_mod.maybe_create(_make_runner(scaled_cfg)))
         assert "unsupported" in caplog.text and "rope_type" in caplog.text
 
 
 def test_validate_runner_hf_config_frozen_qwen35_config_json(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """Frozen Qwen3.5 `config.json` passes `_validate_runner_hf_config` (skippable)."""
+    """Frozen Qwen3.5 `config.json` passes `validate_hf_config` (skippable)."""
     import json
-    import types
 
     import frozen_utils
 
-    from vllm_torchtpu.megakernel_runtime import driver as driver_mod
-
-    def _make_runner(hf_cfg: Any) -> Any:
-        mc = types.SimpleNamespace(hf_config=hf_cfg)
-        vc = types.SimpleNamespace(
-            model_config=mc, additional_config={"megakernel": {"enabled": True}}
-        )
-        return types.SimpleNamespace(model_config=mc, vllm_config=vc)
+    from vllm_torchtpu.megakernel_runtime.models.qwen35 import adapter as qwen_adapter
 
     frozen_cfg = frozen_utils.load_frozen_qwen35_config_json()
     for valid_cfg in (frozen_cfg, frozen_utils.dict_to_namespace(frozen_cfg)):
         assert Qwen35.validate_hf_config(valid_cfg).eligible
-        assert driver_mod.MegakernelDriver._validate_runner_hf_config(
-            _make_runner(valid_cfg)
-        )
+        assert qwen_adapter.validate_hf_config(valid_cfg).eligible
 
     # Verify SHA-256 mismatch on first candidate falls back to DEFAULT_FROZEN_DIR
     bad_dir = tmp_path / "bad_frozen"

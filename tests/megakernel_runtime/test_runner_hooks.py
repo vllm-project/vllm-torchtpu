@@ -162,20 +162,20 @@ def test_suppressed_nests_and_restores_on_error() -> None:
 
 
 def _bare_driver(monkeypatch: pytest.MonkeyPatch, *, eligible: bool = True) -> Any:
-    """A `MegakernelDriver` with only the state `try_forward` touches."""
+    """A `ProgramDriver` with only the state `try_forward` touches."""
     import torch
 
     from vllm_torchtpu.megakernel import runtime as rt
 
-    drv = object.__new__(driver_mod.MegakernelDriver)
-    drv._prepared_step = None
+    drv = object.__new__(driver_mod.ProgramDriver)
+    drv._pending = None
     drv.ab_calibrator = rt.MKABCalibrator(enabled=False, period_s=0.0)
-    drv.backbone = object()
+    drv._backbone = None
     calls: list[str] = []
 
     def can_run(*_a: Any, **_k: Any) -> bool:
         calls.append("can_run")
-        drv._prepared_step = ("prepared",)
+        drv._pending = ("prepared",)
         return eligible
 
     def run(input_ids: Any, positions: Any, **_k: Any) -> Any:
@@ -184,7 +184,7 @@ def _bare_driver(monkeypatch: pytest.MonkeyPatch, *, eligible: bool = True) -> A
 
     monkeypatch.setattr(drv, "can_run", can_run, raising=False)
     monkeypatch.setattr(
-        driver_mod.MegakernelDriver,
+        driver_mod.ProgramDriver,
         "__call__",
         lambda self, *a, **k: run(*a, **k),
     )
@@ -207,9 +207,9 @@ def test_try_forward_never_engages_while_suppressed(
     ids = torch.zeros((2,), dtype=torch.int32)
     pos = torch.zeros((2,), dtype=torch.int32)
     with mkr.suppressed(runner):
-        drv._prepared_step = ("stale",)
+        drv._pending = ("stale",)
         assert drv.try_forward(runner, StepContext(ids, pos)) == (False, None)
-        assert drv._prepared_step is None
+        assert drv._pending is None
     assert drv.calls == []
     hit, out = drv.try_forward(runner, StepContext(ids, pos))
     assert hit and tuple(out.shape) == (2, 4)
@@ -517,12 +517,17 @@ def test_agree_on_decline_single_rank_is_local(monkeypatch: pytest.MonkeyPatch) 
 
 
 def _bind_driver(bind: Any) -> Any:
-    drv = object.__new__(driver_mod.MegakernelDriver)
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.megakernel_runtime.plugin import RunnerView
+
+    program = SimpleNamespace(display_name="test")
+    drv = driver_mod.ProgramDriver(program, view=RunnerView(None))
     drv._bound = True
-    drv._bucket_steps = {(1, 8): None, (4, 4): None}
-    drv.bind_caches = bind
+    drv._steps = {(1, 8): None, (4, 4): None}
+    drv.bind = bind
     drv.warmed = []
-    drv.warmup = lambda runner, eager_only=False: drv.warmed.append(runner)
+    drv.warmup = lambda runner: drv.warmed.append(runner)
     return drv
 
 
@@ -630,8 +635,9 @@ def _slot_check_driver(layers: list[Any]) -> Any:
     from types import SimpleNamespace
 
     from vllm_torchtpu.megakernel.models.qwen35 import Qwen35
+    from vllm_torchtpu.megakernel_runtime.models.qwen35.adapter import Qwen35Program
 
-    drv = object.__new__(driver_mod.MegakernelDriver)
+    drv = object.__new__(Qwen35Program)
     drv.backbone = SimpleNamespace(layers=layers)
     drv.spec = SimpleNamespace(
         cache_backend=SimpleNamespace(layout=Qwen35.pool_layout(R=8))

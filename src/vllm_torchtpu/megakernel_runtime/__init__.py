@@ -20,14 +20,18 @@ from typing import Any
 from .errors import MegakernelUnsupported
 from .hooks import StepContext, is_suppressed, suppressed
 
-_DRIVER_EXPORTS = frozenset(
-    {
-        "MegakernelDriver",
-        "ProgramDriver",
-        "TorchStepMetaOps",
-        "prepare_step_inputs_eager",
-    }
-)
+_DRIVER_EXPORTS = frozenset({"ProgramDriver", "TorchStepMetaOps"})
+
+# Removed names -> their replacement (an `AttributeError` says where to go).
+_MOVED = {
+    "MegakernelDriver": (
+        "megakernel_runtime.ProgramDriver with "
+        "megakernel_runtime.models.qwen35.adapter.Qwen35Program"
+    ),
+    "prepare_step_inputs_eager": (
+        "megakernel_runtime.models.qwen35.adapter.prepare_step_inputs_eager"
+    ),
+}
 
 _BRIDGE_EXPORTS = frozenset(
     {
@@ -95,11 +99,14 @@ def __getattr__(name: str) -> Any:
         from . import weight_collector
 
         return getattr(weight_collector, name)
+    if name in _MOVED:
+        raise AttributeError(
+            f"module {__name__!r} no longer exports {name!r}; use {_MOVED[name]}"
+        )
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [
-    "MegakernelDriver",
     "MegakernelUnsupported",
     "PooledStepExport",
     "ProgramDriver",
@@ -120,7 +127,6 @@ __all__ = [
     "load_vllm_weights",
     "make_typed_step_wrapper",
     "maybe_create",
-    "prepare_step_inputs_eager",
     "reshard_experts_ep_to_tp_local",
     "reshard_layer_experts_ep_to_tp",
     "sharded_jax_callable",

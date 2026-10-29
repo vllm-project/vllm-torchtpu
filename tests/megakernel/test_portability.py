@@ -279,9 +279,17 @@ def test_no_model_names_in_core_and_runtime():
     rt_root = pkg_root.parent / "megakernel_runtime"
     forbidden_tokens = ("qwen", "llama", "deepseek", "mistral", "gemma")
 
-    # Templates under `megakernel_runtime/models/` are plugins, and the
-    # runtime's shorthand table names them by string (one assignment).
-    shorthand_lines = _assignment_lines(rt_root / "plugin.py", "SHORTHANDS")
+    # Templates under `megakernel_runtime/models/` are plugins; the runtime
+    # names them by string in two tables: the shorthand templates and the
+    # replacements of removed exports.
+    allowed = {
+        "megakernel_runtime/plugin.py": _assignment_lines(
+            rt_root / "plugin.py", "SHORTHANDS"
+        ),
+        "megakernel_runtime/__init__.py": _assignment_lines(
+            rt_root / "__init__.py", "_MOVED"
+        ),
+    }
     checked = 0
     for root in (pkg_root, rt_root):
         for path in sorted(root.rglob("*.py")):
@@ -298,7 +306,7 @@ def test_no_model_names_in_core_and_runtime():
             for lineno, line in enumerate(
                 path.read_text(encoding="utf-8").splitlines(), 1
             ):
-                if rel == "megakernel_runtime/plugin.py" and lineno in shorthand_lines:
+                if lineno in allowed.get(rel, ()):
                     continue
                 low = line.lower()
                 for tok in forbidden_tokens:

@@ -48,6 +48,7 @@ from vllm.config.utils import Range
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.megakernel_runtime.salt import compile_cache_salt
 
 logger = init_logger(__name__)
 
@@ -443,6 +444,11 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
             else None,
         },
     }
+    # A megakernel plugin's cache-layout request digest, or None: then no
+    # factor is added and stock compile keys stay byte-identical.
+    mk_salt = compile_cache_salt(vllm_config)
+    if mk_salt is not None:
+        factors["megakernel_layout"] = mk_salt
 
     repo_root = Path(__file__).resolve().parents[2]
     hash_obj = hashlib.sha256(

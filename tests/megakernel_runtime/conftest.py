@@ -22,3 +22,21 @@ from tests.megakernel.conftest import register_megakernel_cpu_plugin
 
 def pytest_configure(config: pytest.Config) -> None:
     register_megakernel_cpu_plugin(config)
+
+
+@pytest.fixture(autouse=True)
+def _std_megakernel_loggers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Route the runtime's and the templates' lazy vLLM loggers to `logging`
+    when vLLM is absent (CPU)."""
+    import importlib
+    import logging
+
+    for name in (
+        "vllm_torchtpu.megakernel_runtime.driver",
+        "vllm_torchtpu.megakernel_runtime.models.qwen35.adapter",
+    ):
+        lazy = importlib.import_module(name).logger
+        try:
+            lazy._resolve()
+        except ModuleNotFoundError:
+            monkeypatch.setattr(lazy, "_logger", logging.getLogger(lazy._name))
