@@ -1166,6 +1166,9 @@ class SparseMlaLayerBranchTest(parameterized.TestCase):
 
         with (
             mock.patch.object(
+                attention_interface.envs, "TPU_MLA_SPARSE_SPLIT_Q", False
+            ),
+            mock.patch.object(
                 attention_interface,
                 "sparse_mla_ragged_paged_attention",
                 side_effect=sparse_kernel,

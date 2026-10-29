@@ -626,12 +626,14 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
             sparse_mla.SPARSECORE_CACHE_LAYOUT,
             sparse_mla.TENSORCORE_CACHE_LAYOUT,
         ),
+        return_lse=(True, False),
     )
-    def test_split_q_lse_matches_concat(self, query_tokens, seq_q, cache_layout):
-        """TPU_MLA_SPARSE_SPLIT_Q on (`q_pe=`, `lse_lane_dense=True`) == off.
-
-        DCP-shaped: 64 heads, per-row live counts incl. empty rows and rows
-        past the 512 cap. Out and lse must match bit for bit.
+    def test_split_q_lse_matches_concat(
+        self, query_tokens, seq_q, cache_layout, return_lse
+    ):
+        """TPU_MLA_SPARSE_SPLIT_Q on (`q_pe=`) == off across DCP (`return_lse=True`,
+        `lse_lane_dense=True`, `topk_cap=512`) and non-DCP (`return_lse=False`,
+        `topk_cap=None`) lowerings. Out (and lse when returned) must match bit for bit.
         """
         if jax.devices()[0].platform != "tpu":
             self.skipTest("Sparse MLA attention requires a TPU")
@@ -658,7 +660,7 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         q_pe = problem["q"][..., NOPE_DIM:]
 
         def run(split):
-            out, lse = sparse_mla.sparse_ragged_paged_attention(
+            res = sparse_mla.sparse_ragged_paged_attention(
                 q_nope if split else problem["q"],
                 problem[f"{cache_layout}_nope"],
                 problem[f"{cache_layout}_rope"],
@@ -668,21 +670,29 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
                 distribution,
                 sm_scale=0.125,
                 k_scale=0.75,
-                return_lse=True,
+                return_lse=return_lse,
                 cache_layout=cache_layout,
-                **({"topk_cap": 512} if sparsecore else {}),
-                **({"q_pe": q_pe, "lse_lane_dense": True} if split else {}),
+                **({"topk_cap": 512} if return_lse and sparsecore else {}),
+                **(
+                    {"q_pe": q_pe, **({"lse_lane_dense": True} if return_lse else {})}
+                    if split
+                    else {}
+                ),
             )
-            return out[..., :NOPE_DIM], jnp.where(owns[:, None], lse, -jnp.inf)
+            if return_lse:
+                out, lse = res
+                return out[..., :NOPE_DIM], jnp.where(owns[:, None], lse, -jnp.inf)
+            return res[..., :NOPE_DIM], None
 
         (ref, ref_lse), (out, lse) = jax.block_until_ready((run(False), run(True)))
         np.testing.assert_array_equal(
             np.asarray(jax.lax.bitcast_convert_type(out, jnp.uint16)),
             np.asarray(jax.lax.bitcast_convert_type(ref, jnp.uint16)),
         )
-        np.testing.assert_array_equal(
-            np.asarray(lse).view(np.uint32), np.asarray(ref_lse).view(np.uint32)
-        )
+        if return_lse:
+            np.testing.assert_array_equal(
+                np.asarray(lse).view(np.uint32), np.asarray(ref_lse).view(np.uint32)
+            )
 
     def test_topk_cap_validation(self):
         q = jnp.zeros((16, 8, HEAD_DIM), jnp.bfloat16)
