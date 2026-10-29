@@ -195,6 +195,7 @@ def _kernel(
     table_ref,
     active_tiles_ref,
     active_counts_ref,
+    live_tiles_ref,
     query_ref,
     bitset_ref,
     lengths_ref,
@@ -226,6 +227,7 @@ def _kernel(
     query_tile: int = 256,
     lean: bool = False,
     mask_lanes: bool = False,
+    live_tiles: bool = False,
 ):
     block = pl.program_id(0)
     # The model produces BF16 queries.  A BF16 call boundary can avoid a large
@@ -315,15 +317,17 @@ def _kernel(
     mass_ref[...] = jnp.zeros(mass_ref.shape, jnp.float32)
     accumulator_ref[...] = jnp.zeros(accumulator_ref.shape, jnp.float32)
 
-    def compute_tile(tile, kv_ref):
+    def compute_tile(tile, kv_ref, live_query_tiles):
         logical = tile * kv_tile
         # Dynamic scalar indexing must address a native 128-wide row.  Keep
         # query bits on that row and slice the statically known live prefix.
         # Query blocks longer than 256 rows store one bitset per 256 rows.
         parts = bitset_ref.shape[0]
         live = query_block // parts
+        # Only the parts that cover the live query tiles.
+        live_parts = min(parts, -(-live_query_tiles * query_tile // live))
         pieces = []
-        for part in range(parts):
+        for part in range(live_parts):
             tile_words = kv_tile // (ratio * 32)
             if mask_lanes and tile_words > 1 and (ratio * 32) % 128 == 0:
                 # Each word covers whole 128-lane columns of the tile: test
@@ -355,8 +359,8 @@ def _kernel(
                 word = bitset_ref[part, tile, :live]
                 group_in_tile = row // ratio
                 pieces.append(((word[:, None] >> group_in_tile[None, :]) & 1) != 0)
-        visible = pieces[0] if parts == 1 else jnp.concatenate(pieces, axis=0)
-        visible &= logical + row[None, :] <= positions[:, None]
+        visible = pieces[0] if live_parts == 1 else jnp.concatenate(pieces, axis=0)
+        visible &= logical + row[None, :] <= positions[: visible.shape[0], None]
         written = logical + lax.broadcasted_iota(
             jnp.int32, (kv_tile, head_dim), 0
         ) < jnp.max(lengths_ref[:, 0])
@@ -379,7 +383,7 @@ def _kernel(
                 key = key.astype(jnp.bfloat16)
                 value = value.astype(jnp.bfloat16)
             key_values.append((key, value))
-        for query_tile_index in range(num_query_tiles):
+        def query_tile_step(query_tile_index):
             start = query_tile_index * query_tile
             tile_visible = visible[start : start + query_tile]
             for head, (key, value) in enumerate(key_values):
@@ -447,41 +451,56 @@ def _kernel(
                     acc * alpha[:, None] + weighted
                 )
 
-    @pl.when(count > 0)
-    def prefetch_first():
-        start_tile(active_tile(0), kv0_ref, sem0_ref)
+        for query_tile_index in range(live_query_tiles):
+            query_tile_step(query_tile_index)
 
-    @pl.when(count > 1)
-    def prefetch_second():
-        start_tile(active_tile(1), kv1_ref, sem1_ref)
+    def visit_tiles(live_query_tiles):
+        @pl.when(count > 0)
+        def prefetch_first():
+            start_tile(active_tile(0), kv0_ref, sem0_ref)
 
-    def pair_step(pair, _):
-        slot = pair * 2
-        tile = active_tile(slot)
-        wait_tile(tile, kv0_ref, sem0_ref)
-        compute_tile(tile, kv0_ref)
+        @pl.when(count > 1)
+        def prefetch_second():
+            start_tile(active_tile(1), kv1_ref, sem1_ref)
 
-        @pl.when(slot + 2 < count)
-        def prefetch_next_even():
-            start_tile(active_tile(slot + 2), kv0_ref, sem0_ref)
+        def pair_step(pair, _):
+            slot = pair * 2
+            tile = active_tile(slot)
+            wait_tile(tile, kv0_ref, sem0_ref)
+            compute_tile(tile, kv0_ref, live_query_tiles)
 
-        tile = active_tile(slot + 1)
-        wait_tile(tile, kv1_ref, sem1_ref)
-        compute_tile(tile, kv1_ref)
+            @pl.when(slot + 2 < count)
+            def prefetch_next_even():
+                start_tile(active_tile(slot + 2), kv0_ref, sem0_ref)
 
-        @pl.when(slot + 3 < count)
-        def prefetch_next_odd():
-            start_tile(active_tile(slot + 3), kv1_ref, sem1_ref)
+            tile = active_tile(slot + 1)
+            wait_tile(tile, kv1_ref, sem1_ref)
+            compute_tile(tile, kv1_ref, live_query_tiles)
 
-        return None
+            @pl.when(slot + 3 < count)
+            def prefetch_next_odd():
+                start_tile(active_tile(slot + 3), kv1_ref, sem1_ref)
 
-    lax.fori_loop(0, count // 2, pair_step, None)
+            return None
 
-    @pl.when(count % 2 != 0)
-    def consume_odd():
-        tile = active_tile(count - 1)
-        wait_tile(tile, kv0_ref, sem0_ref)
-        compute_tile(tile, kv0_ref)
+        lax.fori_loop(0, count // 2, pair_step, None)
+
+        @pl.when(count % 2 != 0)
+        def consume_odd():
+            tile = active_tile(count - 1)
+            wait_tile(tile, kv0_ref, sem0_ref)
+            compute_tile(tile, kv0_ref, live_query_tiles)
+
+    if live_tiles:
+        # Query tiles past the block's real rows hold only request padding
+        # (rows are block-aligned prefixes). Pick a tile loop specialized to
+        # the live count once per block: a branch inside the loop would break
+        # its software pipeline.
+        live = jnp.clip(live_tiles_ref[block], 1, num_query_tiles)
+        for variant in range(1, num_query_tiles + 1):
+            pl.when(live == variant)(functools.partial(visit_tiles, variant))
+    else:
+        visit_tiles(num_query_tiles)
 
     output_tiles = []
     for query_tile_index in range(num_query_tiles):
@@ -694,9 +713,10 @@ def block_sparse_gqa_prefill(
             query_tile=query_tile,
             **({"lean": True} if envs.VLLM_TPU_QSA_PREFILL_LEAN else {}),
             **({"mask_lanes": True} if envs.VLLM_TPU_QSA_PREFILL_MASK_LANES else {}),
+            **({"live_tiles": True} if envs.VLLM_TPU_QSA_PREFILL_LIVE_TILES else {}),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=3,
+            num_scalar_prefetch=4,
             grid=(nblocks,),
             in_specs=[
                 pl.BlockSpec(
@@ -758,6 +778,13 @@ def block_sparse_gqa_prefill(
         table.reshape(-1),
         active_tiles.reshape(-1),
         active_counts,
+        # Query tiles per block that hold a real row (rows with a length).
+        (
+            jnp.sum(lengths.reshape(nblocks, query_block) > 0, axis=1, dtype=jnp.int32)
+            + query_tile
+            - 1
+        )
+        // query_tile,
         query.astype(jnp.bfloat16 if bf16_io else jnp.float32),
         block_bits_native,
         lengths[:, None],
