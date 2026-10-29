@@ -40,6 +40,7 @@ from vllm_torchtpu.kernels.qwen4_exp.qsa_state import (
     write_ring_and_tags,
 )
 from vllm_torchtpu.kernels.qwen4_exp.tuned_block_sizes import (
+    _COMPILER_SMEM_RESERVE,
     get_main_kv_dma_batch,
 )
 
@@ -52,6 +53,8 @@ def _write_main_cache_universal(pool, rows, page, logical, valid):
     An outer ``lax.cond`` cannot be used here: XLA then copies the multi-GiB
     cache to reconcile the two aliased branch outputs.
     """
+    if len(rows) == 0:
+        return pool
     tile = 128
 
     if len(rows) % tile or pool.shape[1] % tile:
@@ -142,6 +145,8 @@ def write_main_cache(
     valid: jax.Array,
 ) -> jax.Array:
     """Batch independent row DMAs while preserving duplicate write order."""
+    if len(rows) == 0:
+        return pool
     tile = 128
     batch = get_main_kv_dma_batch(pool, rows)
     if batch == 1:
@@ -312,29 +317,32 @@ def write_compressed(pool, keys, complete, req, logical, starts, context, table,
     values = jnp.pad(values, ((0, 0), (0, 0), (0, width - keys.shape[-1])))
 
     tile = 128
-    if len(keys) >= tile and len(keys) % tile == 0:
-        # A complete ratio-4 prefill page contains sixteen adjacent carrier
-        # rows. Pack them in VMEM and issue one 16 KiB DMA instead of sixteen
-        # 1 KiB writes. Only compact routing scalars live in SMEM; the full
-        # fallback metadata is block-loaded into VMEM so T8192 fits v7 SMEM.
-        pair_lanes = tuple(range(2 * ratio - 1, tile, 2 * ratio))
-        expected = jnp.zeros((tile,), jnp.bool_).at[jnp.asarray(pair_lanes)].set(True)
-        tiled_write = write.reshape(-1, tile)
-        tiled_pair = pair.reshape(-1, tile)
-        tiled_mask = mask.reshape(-1, tile, 2)
+    word_bytes = jnp.dtype(jnp.int32).itemsize
+    words_per_tile = tile * (1 + 1 + 2) + 2
+    metadata_tiles = (
+        pltpu.get_tpu_info().smem_capacity_bytes - _COMPILER_SMEM_RESERVE
+    ) // (words_per_tile * word_bytes)
+    if metadata_tiles < 1:
+        raise ValueError("One QSA compressed-write metadata tile exceeds SMEM capacity")
+    chunk_size = min((len(keys) + tile - 1) // tile, metadata_tiles) * tile
+    pair_lanes = tuple(range(2 * ratio - 1, tile, 2 * ratio))
+    expected = jnp.zeros((tile,), jnp.bool_).at[jnp.asarray(pair_lanes)].set(True)
+
+    def update(owner, indices, active, masks, rows):
+        tiled_pair = indices.reshape(-1, tile)
+        tiled_mask = masks.reshape(-1, tile, 2)
         first_pair = tiled_pair[:, pair_lanes[0]]
         bulk = (
-            jnp.all(tiled_write == expected[None], axis=1)
+            jnp.all(active.reshape(-1, tile) == expected[None], axis=1)
             & jnp.all(tiled_mask[:, pair_lanes], axis=(1, 2))
             & jnp.all(
                 tiled_pair[:, pair_lanes]
-                == first_pair[:, None]
-                + jnp.arange(len(pair_lanes), dtype=tiled_pair.dtype)[None],
+                == first_pair[:, None] + jnp.arange(len(pair_lanes))[None],
                 axis=1,
             )
         )
 
-        def tiled_kernel(
+        def kernel(
             first_ref,
             bulk_ref,
             indices_ref,
@@ -345,19 +353,23 @@ def write_compressed(pool, keys, complete, req, logical, starts, context, table,
             updated,
         ):
             program = pl.program_id(0)
+            first = program * tile
 
             @pl.when(bulk_ref[program] != 0)
             def store_tile():
-                def copy(rows, semaphore):
+                def copy(packed, semaphore):
                     bf = (
-                        rows.bitcast(jnp.bfloat16)
+                        packed.bitcast(jnp.bfloat16)
                         if pool.dtype != jnp.bfloat16
-                        else rows
+                        else packed
                     )
                     for output, lane in enumerate(pair_lanes):
-                        bf[output] = values_ref[lane]
-                    target = updated.at[pl.ds(first_ref[program], len(pair_lanes))]
-                    pltpu.async_copy(rows, target, semaphore).wait()
+                        bf[output] = values_ref[pl.ds(lane * 2, 2), :]
+                    pltpu.async_copy(
+                        packed,
+                        updated.at[pl.ds(first_ref[program], len(pair_lanes))],
+                        semaphore,
+                    ).wait()
 
                 pl.run_scoped(
                     copy,
@@ -368,30 +380,42 @@ def write_compressed(pool, keys, complete, req, logical, starts, context, table,
             @pl.when(bulk_ref[program] == 0)
             def store_edges():
                 for lane in range(tile):
+                    row = first + lane
 
-                    @pl.when(active_ref[lane] != 0)
-                    def store_row(*, lane=lane):
-                        def copy(row, semaphore, *, lane=lane):
-                            target = updated.at[indices_ref[lane]]
+                    @pl.when(active_ref[row] != 0)
+                    def store_row(*, lane=lane, row=row):
+                        def copy(packed, semaphore):
+                            target = updated.at[indices_ref[row]]
                             bf = (
-                                row.bitcast(jnp.bfloat16)
+                                packed.bitcast(jnp.bfloat16)
                                 if pool.dtype != jnp.bfloat16
-                                else row
+                                else packed
                             )
-                            pltpu.async_copy(target, row, semaphore).wait()
-                            local_row = jnp.broadcast_to(
-                                jnp.arange(2)[:, None], (2, width)
+                            full_pair = (masks_ref[row, 0] != 0) & (
+                                masks_ref[row, 1] != 0
                             )
-                            row_mask = (
-                                jnp.where(
-                                    local_row == 0,
-                                    masks_ref[lane, 0],
-                                    masks_ref[lane, 1],
+
+                            @pl.when(full_pair)
+                            def initialize_pair():
+                                bf[...] = values_ref[pl.ds(lane * 2, 2), :]
+
+                            @pl.when(~full_pair)
+                            def merge_pair():
+                                pltpu.async_copy(target, packed, semaphore).wait()
+                                half = jnp.broadcast_to(
+                                    jnp.arange(2)[:, None], (2, width)
                                 )
-                                != 0
-                            )
-                            bf[...] = jnp.where(row_mask, values_ref[lane], bf[...])
-                            pltpu.async_copy(row, target, semaphore).wait()
+                                row_mask = (
+                                    jnp.where(
+                                        half == 0, masks_ref[row, 0], masks_ref[row, 1]
+                                    )
+                                    != 0
+                                )
+                                bf[...] = jnp.where(
+                                    row_mask, values_ref[pl.ds(lane * 2, 2), :], bf[...]
+                                )
+
+                            pltpu.async_copy(packed, target, semaphore).wait()
 
                         pl.run_scoped(
                             copy,
@@ -399,106 +423,52 @@ def write_compressed(pool, keys, complete, req, logical, starts, context, table,
                             pltpu.SemaphoreType.DMA,
                         )
 
-        view = pl.pallas_call(
-            tiled_kernel,
+        return pl.pallas_call(
+            kernel,
             grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=2,
-                grid=(len(keys) // tile,),
+                num_scalar_prefetch=5,
+                grid=(len(indices) // tile,),
                 in_specs=[
-                    pl.BlockSpec((tile,), lambda program, *_: (program,)),
-                    pl.BlockSpec((tile,), lambda program, *_: (program,)),
-                    pl.BlockSpec((tile, 2), lambda program, *_: (program, 0)),
-                    pl.BlockSpec((tile, 2, width), lambda program, *_: (program, 0, 0)),
+                    pl.BlockSpec((tile * 2, width), lambda program, *_: (program, 0)),
                     pl.BlockSpec(memory_space=pltpu.HBM),
                 ],
                 out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
             ),
-            out_shape=jax.ShapeDtypeStruct(view.shape, view.dtype),
+            out_shape=jax.ShapeDtypeStruct(owner.shape, owner.dtype),
             input_output_aliases={6: 0},
             name="qwen4_exp_compressed_kv_page_tiled_scatter",
         )(
             first_pair.astype(jnp.int32),
             bulk.astype(jnp.int32),
-            pair.astype(jnp.int32),
-            write.astype(jnp.int32),
-            mask.astype(jnp.int32),
-            values,
-            view,
+            indices,
+            active,
+            masks,
+            rows.reshape(len(indices) * 2, width),
+            owner,
         )
-        return view.reshape(pool.shape)
 
-    def per_pair_kernel(indices, active, row_mask, values_ref, old, updated):
-        t = pl.program_id(0)
+    padding = (-len(keys)) % chunk_size
 
-        @pl.when(active[t] != 0)
-        def store():
-            def copy(tile, semaphore):
-                target = updated.at[indices[t]]
-                bf = tile.bitcast(jnp.bfloat16) if pool.dtype != jnp.bfloat16 else tile
-                full_pair = (row_mask[t, 0] != 0) & (row_mask[t, 1] != 0)
+    def split(x):
+        x = jnp.pad(x, ((0, padding),) + ((0, 0),) * (x.ndim - 1))
+        return x.reshape(-1, chunk_size, *x.shape[1:])
 
-                @pl.when(full_pair)
-                def initialize_full_pair():
-                    # Both BF16 rows cover every byte in the packed carrier;
-                    # no old value is semantically observable.
-                    bf[...] = values_ref[0]
-
-                @pl.when(~full_pair)
-                def merge_partial_pair():
-                    pltpu.async_copy(target, tile, semaphore).wait()
-                    row = jnp.broadcast_to(jnp.arange(2)[:, None], (2, width))
-                    mask = jnp.where(row == 0, row_mask[t, 0], row_mask[t, 1]) != 0
-                    bf[...] = jnp.where(mask, values_ref[0], bf[...])
-
-                pltpu.async_copy(tile, target, semaphore).wait()
-
-            pl.run_scoped(
-                copy, pltpu.VMEM((packing, width), pool.dtype), pltpu.SemaphoreType.DMA
-            )
-
-    def update(view, indices, active, row_mask, rows):
-        return pl.pallas_call(
-            per_pair_kernel,
-            grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=3,
-                grid=(len(indices),),
-                in_specs=[
-                    pl.BlockSpec((1, 2, width), lambda t, *args: (t, 0, 0)),
-                    pl.BlockSpec(memory_space=pltpu.HBM),
-                ],
-                out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+    chunks = tuple(
+        map(
+            split,
+            (
+                pair.astype(jnp.int32),
+                write.astype(jnp.int32),
+                mask.astype(jnp.int32),
+                values,
             ),
-            out_shape=jax.ShapeDtypeStruct(view.shape, view.dtype),
-            input_output_aliases={4: 0},
-        )(indices, active, row_mask, rows, view)
+        )
+    )
 
-    pair = pair.astype(jnp.int32)
-    write = write.astype(jnp.int32)
-    mask = mask.astype(jnp.int32)
-    # Scalar prefetch contains index, active and two mask words per query;
-    # values use the VMEM BlockSpec above. Match the shared metadata reserve,
-    # retaining half of SMEM for pipeline/compiler state.512 bounds scan work,
-    # not a chip capacity or the size of the BF16 values operand.
-    scalar_budget = (pltpu.get_tpu_info().smem_capacity_bytes - 32 * 1024) // 2
-    max_rows = scalar_budget // (4 * jnp.dtype(jnp.int32).itemsize)
-    if max_rows < 1:
-        raise ValueError("QSA pair metadata exceeds the scalar-prefetch budget")
-    chunk_size = min(len(keys), 512, 1 << (max_rows.bit_length() - 1))
-    if len(keys) <= chunk_size:
-        view = update(view, pair, write, mask, values)
-    else:
-        padding = (-len(keys)) % chunk_size
+    def step(owner, inputs):
+        return update(owner, *inputs), None
 
-        def split(x):
-            x = jnp.pad(x, ((0, padding),) + ((0, 0),) * (x.ndim - 1))
-            return x.reshape(-1, chunk_size, *x.shape[1:])
-
-        chunks = tuple(map(split, (pair, write, mask, values)))
-
-        def step(owner, inputs):
-            return update(owner, *inputs), None
-
-        view, _ = jax.lax.scan(step, view, chunks)
+    view, _ = jax.lax.scan(step, view, chunks)
     return view.reshape(pool.shape)
 
 
@@ -513,6 +483,7 @@ def select_blocks(
     *,
     ratio,
     block_topk,
+    request_distribution: jax.Array | None = None,
     topk_backend: TopKBackend | None = None,
     scheduling_group_namespace: int | None = None,
 ):
@@ -539,6 +510,7 @@ def select_blocks(
         req,
         starts=starts,
         context=context,
+        request_distribution=request_distribution,
         ratio=ratio,
         block_topk=block_topk,
         topk_backend=topk_backend,
@@ -563,6 +535,7 @@ def pooled_qsa_step(
     ring_ids: jax.Array,
     main_table: jax.Array,
     compressed_table: jax.Array,
+    request_distribution: jax.Array,
     compress_ratio: int,
     token_topk: int,
     norm_eps: float,
@@ -571,7 +544,14 @@ def pooled_qsa_step(
     v_scale: float = 1.0,
     *,
     topk_backend: TopKBackend | None = None,
+    scheduling_group_namespace: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    if len(qgate) == 0:
+        return (
+            pool,
+            jnp.empty((0, qgate.shape[1] // 2), jnp.bfloat16),
+            jnp.empty((0, token_topk + compress_ratio - 1), jnp.int32),
+        )
     # Keep the Runner's flat group tables at the Torch boundary. Static JAX
     # shapes reconstruct their per-request rows inside the operator.
     main_table = main_table.reshape(len(context), -1)
@@ -644,7 +624,9 @@ def pooled_qsa_step(
         context,
         ratio=compress_ratio,
         block_topk=token_topk // compress_ratio,
+        request_distribution=request_distribution,
         topk_backend=topk_backend,
+        scheduling_group_namespace=scheduling_group_namespace,
     )
     output, pool = qsa_attention(
         q,
@@ -654,6 +636,7 @@ def pooled_qsa_step(
         main_table[req],
         pool,
         starts,
+        request_distribution=request_distribution,
         kv_heads=k.shape[1],
         ratio=compress_ratio,
         k_scale=k_scale if fp8 else 1.0,

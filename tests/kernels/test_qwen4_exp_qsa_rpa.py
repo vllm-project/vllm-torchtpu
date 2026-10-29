@@ -21,8 +21,10 @@ import numpy as np
 import pytest
 import qwen4_exp_qsa_reference as qsa
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.qwen4_exp import qsa_rpa
+from vllm_torchtpu.kernels.sparse_gqa_decode.batching import rpa_query_batch_size
 
 
 @pytest.fixture
@@ -38,7 +40,9 @@ def test_virtual_pages_preserve_sparse_order_and_tail(page_metadata_backend):
     blocks = blocks[:, :2]
     lengths = jnp.array([133, 0], jnp.int32)
     table = jnp.array([[7, 2], [0, 1]], jnp.int32)
-    pages, lens, starts, _ = qsa_rpa.virtual_page_metadata(blocks, lengths, table)
+    pages, lens, starts, _ = qsa_rpa.virtual_page_metadata(
+        blocks, lengths, table, ratio=4, page_size=128
+    )
     np.testing.assert_array_equal(pages, [[64, 224, 65], [0, 0, 0]])
     np.testing.assert_array_equal(lens, [9, 0])
     np.testing.assert_array_equal(starts, [0, 1, 1])
@@ -72,7 +76,11 @@ def test_virtual_pages_match_scalar_addressing(
             )
         expected_lengths.append(count * ratio + tail)
     pages, lens, starts, _ = qsa_rpa.virtual_page_metadata(
-        jnp.asarray(blocks), jnp.asarray(lengths), jnp.asarray(table), ratio=ratio
+        jnp.asarray(blocks),
+        jnp.asarray(lengths),
+        jnp.asarray(table),
+        ratio=ratio,
+        page_size=128,
     )
     np.testing.assert_array_equal(pages, expected)
     np.testing.assert_array_equal(lens, expected_lengths)
@@ -291,10 +299,19 @@ def test_one_kv_head_rpa_lifecycle(fp8):
 
 
 @pytest.mark.parametrize("budget", [16, 512, 2048, 4096])
-def test_query_batch_bounds_scalar_page_metadata(budget):
-    batch = qsa_rpa.rpa_query_batch_size(budget + 1)
+def test_query_batch_bounds_scalar_page_metadata(budget, monkeypatch):
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    batch = rpa_query_batch_size(
+        budget + 1,
+        query=jax.ShapeDtypeStruct((1, 24, 256), jnp.bfloat16),
+        cache=jax.ShapeDtypeStruct((1, 128, 1, 2, 256), jnp.bfloat16),
+        kv_heads=2,
+        ratio=4,
+    )
     assert 0 < batch <= 64
-    assert batch * (budget + 1) * 4 <= 160 * 1024
+    schedule_bytes = (128 * (8 * (5 + 2 + 3 * 64 + 4) + 5) + 1) * 4
+    assert schedule_bytes + (batch * (budget + 5) + 1) * 4 <= info.smem_capacity_bytes
     if budget == 512:
         assert batch == 64
 
@@ -322,7 +339,16 @@ def test_empty_step_preserves_native_owners(fp8):
     args += [jnp.zeros(n, jnp.bfloat16) for n in (256, 256, 128, 128)]
     args += [jnp.zeros(0, jnp.int32), jnp.zeros((128, 128), jnp.bfloat16)]
     result = qsa_rpa.qsa_step(
-        *args,
+        args[0],
+        args[1],
+        args[2],
+        args[3],
+        args[4],
+        args[5],
+        args[6],
+        args[7],
+        args[8],
+        args[9],
         *state,
         jnp.array([0], jnp.int32),
         jnp.zeros(0, jnp.int32),
@@ -333,6 +359,7 @@ def test_empty_step_preserves_native_owners(fp8):
         token_topk=2048,
         norm_eps=1e-6,
         rotary_dim=64,
+        request_distribution=jnp.zeros(3, jnp.int32),
     )
     for actual, expected in zip(result[:4], state):
         np.testing.assert_array_equal(actual, expected)

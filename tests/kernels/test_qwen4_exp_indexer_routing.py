@@ -116,6 +116,7 @@ def test_shared_schedule_forwards_backend_and_causal_metadata(
                 context,
                 ratio=4,
                 block_topk=16,
+                request_distribution=jnp.array([1, 1, 2], jnp.int32),
                 topk_backend=backend,
                 scheduling_group_namespace=namespace,
             )
@@ -129,6 +130,7 @@ def test_shared_schedule_forwards_backend_and_causal_metadata(
                 starts=starts,
                 context=context,
                 block_topk=16,
+                request_distribution=jnp.array([1, 1, 2], jnp.int32),
                 topk_backend=backend,
                 scheduling_group_namespace=namespace,
             )
@@ -139,11 +141,16 @@ def test_shared_schedule_forwards_backend_and_causal_metadata(
             n = min(16, (int(context[request]) + local + 1) // 4)
             expected[row, :n] = np.arange(n)
     np.testing.assert_array_equal(got, expected)
-    assert all(
-        (c[2]["num_queries_per_block"] != 1) == (tokens > requests) for c in seen
+    decode_rows = sum(
+        np.count_nonzero(lens > 0)
+        for lens, cu, kw in seen
+        if kw["num_queries_per_block"] == 1
     )
-    if tokens == 512:
-        assert seen[0][2]["chunk_tokens"] == 512
+    prefill_rows = sum(
+        int(cu[-1]) for lens, cu, kw in seen if kw["num_queries_per_block"] != 1
+    )
+    assert decode_rows == 1
+    assert prefill_rows == int(counts[1])
 
 
 def test_default_is_original_sparsecore_and_jit_backend_identity(monkeypatch):
@@ -161,7 +168,7 @@ def test_default_is_original_sparsecore_and_jit_backend_identity(monkeypatch):
     monkeypatch.setattr(decode_indexer, "streamindex_topk", record)
     monkeypatch.setattr(decode_indexer, "decode_query_chunk_size", lambda _: 4)
     fn = decode_indexer.select_decode_blocks
-    fn.clear_cache()
+    jax.clear_caches()
     args = (
         jnp.zeros((1, 1, 128), jnp.bfloat16),
         jnp.zeros((1, 32, 1, 128), jnp.bfloat16),
@@ -173,7 +180,7 @@ def test_default_is_original_sparsecore_and_jit_backend_identity(monkeypatch):
     np.testing.assert_array_equal(fn(*args, topk_backend=ReferenceTopK()), 2)
     np.testing.assert_array_equal(fn(*args), 1)
     assert traces == [SparseCoreTopK(), ReferenceTopK()]
-    fn.clear_cache()
+    jax.clear_caches()
 
 
 def test_nonpooled_step_passes_original_request_geometry_and_backend(monkeypatch):
@@ -223,6 +230,7 @@ def test_nonpooled_step_passes_original_request_geometry_and_backend(monkeypatch
         token_topk=64,
         norm_eps=1e-6,
         rotary_dim=2,
+        request_distribution=jnp.array([1, 1, 2], jnp.int32),
         topk_backend=backend,
     )
     assert len(seen) == 1
@@ -263,6 +271,9 @@ def test_native_schedule_matches_independent_visibility(tokens, requests, altern
             req,
             starts=starts,
             context=context,
+            request_distribution=jnp.array(
+                [1 if tokens == 4 else 0, 1 if tokens == 4 else 0, 2], jnp.int32
+            ),
             **kwargs,
         )
     )
@@ -290,7 +301,8 @@ def test_native_factories_accept_default_and_bound_backend_without_backend_init(
     from jax._src import xla_bridge
     from torch_tpu._internal import pallas
 
-    initialized = torch.tpu.is_initialized()
+    device_module = torch.get_device_module("tpu")
+    initialized = device_module.is_initialized()
     clients = tuple(xla_bridge._backends)
     for name, fn in [
         ("pooled", pooled_qsa.pooled_qsa_step),
@@ -302,7 +314,7 @@ def test_native_factories_accept_default_and_bound_backend_without_backend_init(
         ]:
             op = pallas.jax_op(f"qsa_routing_schema::{name}_{label}", core)
             assert "topk_backend" not in str(op._schema)
-    assert torch.tpu.is_initialized() == initialized
+    assert device_module.is_initialized() == initialized
     assert tuple(xla_bridge._backends) == clients
 
 
@@ -358,6 +370,7 @@ def test_pooled_step_forwards_backend_before_attention(monkeypatch):
         token_topk=64,
         norm_eps=1e-6,
         rotary_dim=2,
+        request_distribution=jnp.array([1, 1, 1], jnp.int32),
         topk_backend=backend,
     )
     assert seen == [backend]
@@ -373,7 +386,7 @@ def test_cached_decode_selector_separates_namespace_and_backend(monkeypatch):
     monkeypatch.setattr(decode_indexer, "streamindex_topk", record)
     monkeypatch.setattr(decode_indexer, "decode_query_chunk_size", lambda _: 4)
     fn = decode_indexer.select_decode_blocks
-    fn.clear_cache()
+    jax.clear_caches()
     args = (
         jnp.zeros((1, 1, 128), jnp.bfloat16),
         jnp.zeros((1, 32, 1, 128), jnp.bfloat16),
@@ -392,4 +405,4 @@ def test_cached_decode_selector_separates_namespace_and_backend(monkeypatch):
             fn(*args, topk_backend=selector, scheduling_group_namespace=ns), expected
         )
     assert traces == [(3, backend), (4, backend), (3, SparseCoreTopK())]
-    fn.clear_cache()
+    jax.clear_caches()

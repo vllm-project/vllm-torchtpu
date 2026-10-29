@@ -19,7 +19,7 @@ import hashlib
 import math
 import runpy
 import sys
-import types
+from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
 import jax
@@ -30,10 +30,10 @@ import pytest
 from jax.experimental.pallas import tpu as pltpu
 from test_sparse_gqa_decode import _specs
 
-from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import qsa_attention
-from vllm_torchtpu.kernels.sparse_gqa_decode import abi, schedule
+from vllm_torchtpu.kernels.sparse_gqa_decode import abi, qsa_decode_attention, schedule
 from vllm_torchtpu.kernels.sparse_gqa_decode.eligibility import plan_decode
 from vllm_torchtpu.kernels.sparse_gqa_decode.planning import (
+    DecodeLaunch,
     make_config,
     resource_usage,
 )
@@ -51,8 +51,9 @@ def test_benchmark_provenance_records_late_loaded_sources(monkeypatch, tmp_path)
     source = tmp_path / "late_kernel.py"
     source.write_text("# controlled late-loaded source\n")
     name = "vllm_torchtpu.kernels.sparse_gqa_decode._late_probe"
-    module = types.ModuleType(name)
-    module.__file__ = str(source)
+    spec = spec_from_file_location(name, source)
+    assert spec is not None
+    module = module_from_spec(spec)
     monkeypatch.setitem(sys.modules, name, module)
     after = provenance([])
     assert name not in before["loaded_sources"]
@@ -130,17 +131,15 @@ def test_planned_routing_reuses_plan_and_actual_small_chunk(monkeypatch):
         calls.append(result)
         return result
 
-    def execute(*a, launch, **kw):
-        assert launch is calls[0]
+    def execute(*a, launch: DecodeLaunch, **kw):
+        assert launch is not None and launch is calls[0]
         smaller = launch.config_for_batch(3)
         assert smaller.serve.num_seqs == 3 and smaller.serve.num_page_indices == 3 * 513
         return a[0], a[5]
 
     monkeypatch.setattr(public, "plan_decode", counted)
     monkeypatch.setattr(decode, "execute_decode", execute)
-    qsa_rpa.qsa_attention(
-        *args, jax.ShapeDtypeStruct((9,), jnp.int32), kv_heads=2, ratio=4
-    )
+    qsa_rpa.rpa_attention(*args, kv_heads=2, ratio=4)
     assert len(calls) == 1
 
 
@@ -160,7 +159,7 @@ def test_policy_static_identity_and_layout_constraints(monkeypatch):
         for n in [128, 256, 1024]
     ]
     assert all(x is not None for x in plans)
-    assert len({x.policy for x in plans}) == 3
+    assert len({x.policy for x in plans if x is not None}) == 3
     from vllm_torchtpu.kernels.sparse_gqa_decode import decode
 
     def check_page(*inputs, ratio, page_size):
@@ -169,6 +168,7 @@ def test_policy_static_identity_and_layout_constraints(monkeypatch):
 
     monkeypatch.setattr(decode, "virtual_page_metadata", check_page)
     for launch in plans:
+        assert launch is not None
         with pytest.raises(RuntimeError, match="metadata checked"):
             decode._attend(*args, launch=launch, k_scale=1.0, v_scale=1.0)
     assert (
@@ -185,22 +185,6 @@ def test_policy_static_identity_and_layout_constraints(monkeypatch):
     with pytest.raises(ValueError, match="scalar"):
         abi.output_aliases((None,), ())
     assert abi.output_aliases((None,) * 4, (None,)) == {4: 0, 6: 1}
-
-
-def test_module_entry_signature_remains_compatible(monkeypatch):
-    import vllm_torchtpu.kernels.sparse_gqa_decode as public
-    from vllm_torchtpu.kernels.sparse_gqa_decode import decode
-
-    args = _specs()
-
-    def checked(*inputs, kv_heads, ratio, k_scale, v_scale):
-        assert (kv_heads, ratio, k_scale, v_scale) == (2, 4, 0.375, 2.5)
-        return inputs[0], inputs[5]
-
-    monkeypatch.setattr(public, "qsa_decode_attention", checked)
-    assert decode.qsa_decode_attention(
-        *args, kv_heads=2, ratio=4, k_scale=0.375, v_scale=2.5
-    ) == (args[0], args[5])
 
 
 @pytest.mark.tpu_test
@@ -283,8 +267,13 @@ def test_schedule_fields_against_scalar_task_oracle(fp8, batch):
             np.asarray(actual.total_wait_o_out.data)[step]
             == lasts * cfg.o_bytes_per_token // 512
         )
-    for name in schedule.UNUSED_FIELDS:
-        np.testing.assert_array_equal(np.asarray(getattr(actual, name).data), 0)
+    for ref in (
+        actual.q_idx,
+        actual.do_writeback,
+        actual.dma_kv_new,
+        actual.total_wait_kv_out,
+    ):
+        np.testing.assert_array_equal(np.asarray(ref.data), 0)
 
 
 @pytest.mark.tpu_test
@@ -350,8 +339,7 @@ def test_all_head_analytic_causal_duplicates_and_cache():
     exe = (
         jax.jit(
             functools.partial(
-                qsa_attention,
-                starts=jnp.arange(batch + 1, dtype=jnp.int32),
+                qsa_decode_attention,
                 kv_heads=kv,
                 ratio=ratio,
                 k_scale=ks,
@@ -363,17 +351,15 @@ def test_all_head_analytic_causal_duplicates_and_cache():
         .compile()
     )
     hlo = exe.as_text()
-    assert "fused_qsa_decode" in hlo
+    assert hlo is not None and "fused_qsa_decode" in hlo
     stats = exe.memory_analysis()
-    mem = {
-        k: getattr(stats, k)
-        for k in [
-            "argument_size_in_bytes",
-            "output_size_in_bytes",
-            "alias_size_in_bytes",
-            "temp_size_in_bytes",
-        ]
-    }
+    assert stats is not None
+    mem = dict(
+        argument_size_in_bytes=stats.argument_size_in_bytes,
+        output_size_in_bytes=stats.output_size_in_bytes,
+        alias_size_in_bytes=stats.alias_size_in_bytes,
+        temp_size_in_bytes=stats.temp_size_in_bytes,
+    )
     # Compiled alias size tests outer donation, not every internal operation.
     assert mem["alias_size_in_bytes"] >= cache_host.nbytes
     actual, returned = jax.block_until_ready(exe(*args))
@@ -412,3 +398,6 @@ def test_all_head_analytic_causal_duplicates_and_cache():
     np.testing.assert_array_equal(
         np.asarray(returned).view(np.uint8), cache_host.view(np.uint8)
     )
+
+    assert mem["temp_size_in_bytes"] < 2 * 1024**3
+    return mem

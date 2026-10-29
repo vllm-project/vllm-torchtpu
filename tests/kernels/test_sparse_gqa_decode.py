@@ -14,8 +14,11 @@
 
 """Decode dispatch, arithmetic, tail masking and cache ownership."""
 
+import dataclasses
 import functools
+import hashlib
 import math
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -23,7 +26,9 @@ import numpy as np
 import pytest
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import qsa_attention, rpa_attention
+from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import (
+    _rpa_attention_in_chunks as rpa_attention,
+)
 from vllm_torchtpu.kernels.sparse_gqa_decode import (
     is_supported_by_fused_decode,
     qsa_decode_attention,
@@ -159,18 +164,23 @@ def _check_case(
     ks, vs = (0.375, 2.5) if fp8 else (1.0, 1.0)
     opts = dict(kv_heads=kv_heads, ratio=ratio, k_scale=ks, v_scale=vs)
     host = tuple(np.asarray(x).copy() for x in args)
-    reference, _ = jax.jit(functools.partial(rpa_attention, **opts))(*args)
+    reference_compiled = (
+        jax.jit(functools.partial(rpa_attention, **opts)).lower(*args).compile()
+    )
+    reference, _ = reference_compiled(*args)
     compiled = (
         jax.jit(
             functools.partial(
-                qsa_attention, starts=jnp.arange(batch + 1, dtype=jnp.int32), **opts
+                qsa_decode_attention,
+                **opts,
             ),
             donate_argnums=(5,),
         )
         .lower(*args)
         .compile()
     )
-    assert "fused_qsa_decode" in compiled.as_text()
+    text = compiled.as_text()
+    assert text is not None and "fused_qsa_decode" in text
     out, cache = compiled(*args)
     actual, expected = np.asarray(out, np.float32), np.asarray(reference, np.float32)
     assert np.isfinite(actual).all()
@@ -228,6 +238,39 @@ def _check_case(
             < 0.01
         )
 
+    repeated, repeated_cache = jax.block_until_ready(compiled(*args[:-1], cache))
+    np.testing.assert_array_equal(
+        np.asarray(repeated).view(np.uint8), np.asarray(out).view(np.uint8)
+    )
+    np.testing.assert_array_equal(
+        np.asarray(repeated_cache).view(np.uint8), host[5].view(np.uint8)
+    )
+    for value, before in zip(args[:-1], host[:-1]):
+        assert np.asarray(value).tobytes() == before.tobytes()
+    memory = compiled.memory_analysis()
+    reference_memory = reference_compiled.memory_analysis()
+    assert memory is not None and reference_memory is not None
+    return dict(
+        input_sha256=[hashlib.sha256(value.tobytes()).hexdigest() for value in host],
+        output_sha256=hashlib.sha256(np.asarray(out).tobytes()).hexdigest(),
+        input_cache_repeat_exact=True,
+        relative_l2=float(
+            np.linalg.norm(actual - expected) / max(np.linalg.norm(expected), 1e-12)
+        ),
+        memory=dict(
+            arguments=memory.argument_size_in_bytes,
+            outputs=memory.output_size_in_bytes,
+            temporary=memory.temp_size_in_bytes,
+            alias=memory.alias_size_in_bytes,
+        ),
+        reference_memory=dict(
+            arguments=reference_memory.argument_size_in_bytes,
+            outputs=reference_memory.output_size_in_bytes,
+            temporary=reference_memory.temp_size_in_bytes,
+            alias=reference_memory.alias_size_in_bytes,
+        ),
+    )
+
 
 def _specs(fp8=False):
     packing = 4 if fp8 else 2
@@ -249,10 +292,12 @@ def _specs(fp8=False):
     "case",
     [
         "supported",
+        "divisible_heads",
         "heads",
         "page",
         "budget",
         "batch",
+        "empty",
         "dtype",
         "table",
         "scale",
@@ -260,30 +305,43 @@ def _specs(fp8=False):
     ],
 )
 def test_decode_eligibility_rejects_invalid_contracts(monkeypatch, fp8, case):
-    chip = pltpu.ChipVersion.TPU_V5P if case == "hardware" else pltpu.ChipVersion.TPU_7X
-    monkeypatch.setattr(
-        pltpu, "get_tpu_info", lambda: pltpu.get_tpu_info_for_chip(chip, 1)
-    )
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    if case == "hardware":
+        info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_V5P, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
     args = _specs(fp8)
     changes = {
-        "heads": (0, (8, 12, 256)),
+        "heads": (0, (8, 3, 256)),
+        "divisible_heads": (0, (8, 12, 256)),
+        "batch": (0, (257, 24, 256)),
         "page": (5, (158, 130, *args[5].shape[2:])),
         "budget": (2, (8, 0)),
-        "batch": (0, (257, 24, 256)),
         "table": (4, (8, 0)),
     }
     if case in changes:
         i, shape = changes[case]
         args[i] = jax.ShapeDtypeStruct(shape, args[i].dtype)
+        if case in ("heads", "divisible_heads", "batch"):
+            args[1] = jax.ShapeDtypeStruct(shape, args[1].dtype)
+    if case == "empty":
+        args[:5] = [
+            jax.ShapeDtypeStruct((0, *arg.shape[1:]), arg.dtype) for arg in args[:5]
+        ]
     if case == "dtype":
         args[0] = jax.ShapeDtypeStruct(args[0].shape, jnp.float32)
     scale = jax.ShapeDtypeStruct((), jnp.float32) if case == "scale" else 1.0
     assert is_supported_by_fused_decode(
         *args, kv_heads=2, ratio=4, k_scale=scale, v_scale=1.0
-    ) == (case == "supported")
-    if case != "supported":
-        with pytest.raises(NotImplementedError, match="requires TPU7x"):
-            qsa_decode_attention(*args, kv_heads=2, k_scale=scale)
+    ) == (case in ("supported", "divisible_heads"))
+    if case not in ("supported", "divisible_heads"):
+        with pytest.raises(NotImplementedError, match="Fused decode requires"):
+            concrete = [
+                jnp.zeros((1, *arg.shape[1:]) if i == 5 else arg.shape, arg.dtype)
+                for i, arg in enumerate(args)
+            ]
+            qsa_decode_attention(
+                *concrete, kv_heads=2, ratio=4, k_scale=cast(float, scale)
+            )
 
 
 @pytest.mark.parametrize("supported", [False, True])
@@ -312,10 +370,8 @@ def test_qsa_decode_dispatch_preserves_rpa_fallback(monkeypatch, supported):
     from vllm_torchtpu.kernels.sparse_gqa_decode import decode
 
     monkeypatch.setattr(decode, "execute_decode", fused)
-    monkeypatch.setattr(qsa_rpa, "rpa_attention", baseline)
-    out, cache = qsa_rpa.qsa_attention(
-        *args, jax.ShapeDtypeStruct((9,), jnp.int32), kv_heads=2, ratio=4
-    )
+    monkeypatch.setattr(qsa_rpa, "_rpa_attention_in_chunks", baseline)
+    out, cache = qsa_rpa.rpa_attention(*args, kv_heads=2, ratio=4)
     assert used == (["fused"] if supported else ["rpa"])
     assert out is args[0]
     assert cache is args[5]
@@ -373,7 +429,7 @@ def test_decode_eligibility_rejects_empty_or_overflowing_metadata(monkeypatch, c
         i, shape = {
             "empty_page": (5, (1, 0, 2, 2, 256)),
             "physical_overflow": (5, (2**24, 128, 2, 2, 256)),
-            "logical_overflow": (4, (8, 2**31 // 1664 + 2)),
+            "logical_overflow": (4, (8, 2**31 // args[5].shape[1] + 2)),
             "table_overflow": (4, (8, 2**28)),
         }[case]
         args[i] = jax.ShapeDtypeStruct(shape, args[i].dtype)
@@ -474,8 +530,6 @@ def test_geometry_and_resource_limits(monkeypatch, case):
 
 
 def test_launch_bound_tracks_selected_tiles_and_hardware(monkeypatch):
-    import dataclasses
-
     from vllm_torchtpu.kernels.sparse_gqa_decode.planning import query_batch_size
 
     info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)

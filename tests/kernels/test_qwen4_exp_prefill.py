@@ -156,13 +156,14 @@ def test_nonpooled_prefill_bounds_expansion_and_preserves_request_ownership(
     ids = jnp.arange(tokens, dtype=jnp.int32) % requests
     lens = jnp.where(jnp.arange(tokens) % 17 == 0, 0, 262144).astype(jnp.int32)
     table = jnp.broadcast_to(jnp.arange(requests)[:, None] * 100, (requests, pages))
-    actual = decode_indexer.select_decode_blocks.__wrapped__(
-        jnp.zeros((tokens, 4, 128), jnp.bfloat16),
-        jnp.zeros((1, 32, 1, 128), jnp.bfloat16),
-        lens,
-        table,
-        ids,
-    )
+    with jax.disable_jit():
+        actual = decode_indexer.select_decode_blocks(
+            jnp.zeros((tokens, 4, 128), jnp.bfloat16),
+            jnp.zeros((1, 32, 1, 128), jnp.bfloat16),
+            lens,
+            table,
+            ids,
+        )
     expected = jnp.where(lens > 0, ids * 100 + lens, -1)
     np.testing.assert_array_equal(
         actual, jnp.broadcast_to(expected[:, None], actual.shape)
@@ -171,19 +172,31 @@ def test_nonpooled_prefill_bounds_expansion_and_preserves_request_ownership(
     assert chunk_shapes and all(q <= limit and n == q * pages for q, n in chunk_shapes)
 
 
-def test_pooled_prefill_keeps_live_requests_after_empty_rows(monkeypatch):
+def test_pooled_prefill_keeps_live_requests_after_empty_rows(monkeypatch, tpu_info):
+    seen = []
+
     def transport(q, weights, cache, lengths, table, starts, distribution, **kwargs):
-        assert kwargs["components"].schedule.causal_position_offset == 3
-        np.testing.assert_array_equal(distribution, [0, 0, 3])
-        return streamindex._effective_row_lengths(
-            lengths,
-            starts,
-            distribution,
-            len(q),
-            65536,
-            4,
-            components=kwargs["components"],
-        )
+        offset = kwargs["components"].schedule.causal_position_offset
+        if kwargs["num_queries_per_block"] == 1:
+            assert offset == 0
+            visible = lengths // 4
+        else:
+            assert offset == 3
+            jax.debug.callback(
+                lambda dist: seen.append((offset, np.asarray(dist))),
+                distribution,
+                ordered=True,
+            )
+            visible = streamindex._effective_row_lengths(
+                lengths,
+                starts,
+                distribution,
+                len(q),
+                65536,
+                4,
+                components=kwargs["components"],
+            )
+        return jnp.broadcast_to(visible[:, None], (len(q), kwargs["k"]))
 
     monkeypatch.setattr(decode_indexer, "streamindex_topk", transport)
     actual = pooled_qsa.select_blocks(
@@ -196,8 +209,16 @@ def test_pooled_prefill_keeps_live_requests_after_empty_rows(monkeypatch):
         jnp.array([0, 0, 2048]),
         ratio=4,
         block_topk=512,
+        request_distribution=jnp.array([0, 0, 3], jnp.int32),
     )
-    np.testing.assert_array_equal(actual, [0, 0, 0, 512, 512, 512, 513, 513])
+    jax.block_until_ready(actual)
+    jax.effects_barrier()
+    assert len(seen) == 1 and seen[0][0] == 3
+    np.testing.assert_array_equal(seen[0][1], [0, 0, 3])
+    expected = jnp.array([0, 0, 0, 512, 512, 512, 513, 513])
+    np.testing.assert_array_equal(
+        actual, jnp.broadcast_to(expected[:, None], actual.shape)
+    )
 
 
 @pytest.mark.parametrize("heads,dim,ratio", [(1, 256, 4), (4, 64, 8), (8, 256, 4)])

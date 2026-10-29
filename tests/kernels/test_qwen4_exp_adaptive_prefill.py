@@ -83,14 +83,23 @@ def test_qwen_dispatch_preserves_existing_paths(monkeypatch, fp8, case):
         "block_sparse_gqa_attention",
         functools.partial(capture, "prefill"),
     )
-    monkeypatch.setattr(qsa_rpa, "rpa_attention", functools.partial(capture, "decode"))
+    monkeypatch.setattr(
+        qsa_rpa, "_rpa_attention_in_chunks", functools.partial(capture, "decode")
+    )
     monkeypatch.setattr(
         decode,
         "execute_decode",
         functools.partial(capture, "fused_decode"),
     )
     scale = 2.0 if case == "scale" else 1.0
-    output, cache = qsa_rpa.qsa_attention(*args, kv_heads=2, ratio=4, v_scale=scale)
+    if case == "decode":
+        output, cache = qsa_rpa.rpa_attention(
+            *args[:6], kv_heads=2, ratio=4, v_scale=scale
+        )
+    else:
+        output, cache = qsa_rpa._prefill_attention(
+            *args, kv_heads=2, ratio=4, v_scale=scale
+        )
     expected = (
         "adaptive"
         if case in ("supported", "slots", "tail", "padded")
@@ -146,11 +155,19 @@ def test_qwen_adaptive_entry_masks_padding_and_matches_paired_prefill(fp8, ragge
         jnp.array([0, 1] + [tokens - 3] * 7 if ragged_tail else [0, tokens], jnp.int32),
     )
     compiled = (
-        jax.jit(functools.partial(qsa_rpa.qsa_attention, kv_heads=2, ratio=4))
+        jax.jit(
+            functools.partial(
+                qsa_rpa.qsa_attention,
+                kv_heads=2,
+                ratio=4,
+                request_distribution=jnp.array([0, 0, len(args[-1]) - 1], jnp.int32),
+            )
+        )
         .lower(*args)
         .compile()
     )
     hlo = compiled.as_text()
+    assert hlo is not None
     assert "fused_qsa_decode" not in hlo
     if not ragged_tail:
         assert "sc_compact_grouped_prefill" in hlo
