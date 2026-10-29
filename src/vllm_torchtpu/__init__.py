@@ -565,6 +565,8 @@ def _patch_vllm_compile_all_ranges() -> None:
 
         from vllm_torchtpu.compilation.tpu_compiler import (
             PEER_WAIT_S,
+            PrecompileProgress,
+            set_peer_owner,
             wait_for_peer_artifact,
         )
 
@@ -591,12 +593,42 @@ def _patch_vllm_compile_all_ranges() -> None:
                 mine.append(range_entry)
             else:
                 # In the order the owners finish them: by turn, small first.
-                others.append((turn, range_entry.compile_range.end, range_entry))
+                others.append((turn, range_entry.compile_range.end, owner, range_entry))
 
-        for range_entry in mine:
-            compile_entry(self, range_entry)
-        with wait_for_peer_artifact(PEER_WAIT_S):
-            for _, _, range_entry in sorted(others, key=lambda o: o[:2]):
+        # What this rank built is reported to the peers waiting on it, so a
+        # waiter can tell a slow owner from one that failed a bucket or skipped
+        # this subgraph (see PrecompileProgress).
+        adaptor = getattr(self.vllm_backend.compiler_manager, "compiler", None)
+        progress = PrecompileProgress(
+            getattr(adaptor, "cache_dir", None), self.piecewise_compile_index
+        )
+        progress.started()
+        try:
+            for range_entry in mine:
+                end = range_entry.compile_range.end
+                try:
+                    compile_entry(self, range_entry)
+                except Exception as e:
+                    progress.failed[end] = repr(e)[:300]
+                    raise
+                start = range_entry.compile_range.start
+                artifact = (
+                    f"artifact_compile_range_{start}_{end}"
+                    f"_subgraph_{self.piecewise_compile_index}"
+                )
+                if progress.cache_dir is None or os.path.exists(
+                    os.path.join(progress.cache_dir, artifact)
+                ):
+                    progress.saved.append(end)
+                else:
+                    progress.failed[end] = "no artifact saved (not serializable)"
+        finally:
+            progress.finished()
+        # Owner slot -> its global rank (the rank_<r>_<dp> cache dirs).
+        rank_base = int(os.environ.get("RANK", local_rank)) - slot
+        with wait_for_peer_artifact(PEER_WAIT_S, progress):
+            for _, end, owner, range_entry in sorted(others, key=lambda o: o[:2]):
+                set_peer_owner(rank_base + owner, end)
                 compile_entry(self, range_entry)
 
     if envs.TPU_PARALLEL_PRECOMPILE:
