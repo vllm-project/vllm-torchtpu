@@ -485,11 +485,6 @@ class Configs:
         return self.physical_page_size // self.hbm_pack
 
     @property
-    def pages_to_buffer_per_token(self) -> int:
-        """Pages that must be resident to cover one token's window (+1 guard)."""
-        return pl.cdiv(self.window, self.state_block_size) + 1
-
-    @property
     def window_chunk(self) -> int:
         """Window positions fetched from the state array by one DMA.
 

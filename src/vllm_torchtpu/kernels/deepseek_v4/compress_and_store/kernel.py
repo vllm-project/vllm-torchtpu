@@ -236,7 +236,7 @@ def inner_kernel(
 
 def kernel_fn(
     # prefetched inputs (scalar)
-    token_pages_ref,
+    window_rows_ref,
     positions_ref,
     kv_slot_mapping_ref,
     is_first_mask_ref,
@@ -280,7 +280,7 @@ def kernel_fn(
         state_cache_ref=state_cache_ref,
         cos_sin_cache_ref=cos_sin_cache_ref,
         positions_ref=positions_ref,
-        token_pages_ref=token_pages_ref,
+        window_rows_ref=window_rows_ref,
         kv_slot_mapping_ref=kv_slot_mapping_ref,
         is_first_mask_ref=is_first_mask_ref,
         is_first_mask_rope_ref=is_first_mask_rope_ref,
@@ -501,20 +501,28 @@ def compress_norm_rope_store(
             # TODO: this is confusing, should probably find a better name for it
             pack_factor=cfgs.hbm_pack,
         )
-    # Look up each token's state pages here so the kernel keeps only those
-    # entries in SMEM; the full block table does not fit at long context lengths.
-    pages_per_token = cfgs.pages_to_buffer_per_token
-    offsets = jnp.arange(1 - pages_per_token, 1, dtype=positions.dtype)
-    window_blocks = jnp.maximum(
-        positions[:, None] // state_block_size + offsets[None, :], 0
+    # Look up the first state row of each token's window chunks here, so the
+    # kernel keeps only those entries in SMEM (the full block table does not
+    # fit at long context lengths) and starts each chunk's DMA from one load.
+    # A compressed token's window is chunk-aligned already; rounding only keeps
+    # a padding token's reads inside one page. Positions before 0 read block 0
+    # and are masked in the kernel.
+    chunk = cfgs.window_chunk
+    chunk_pos = ((positions - cfgs.window + 1) & -chunk)[:, None] + jnp.arange(
+        0, cfgs.window, chunk, dtype=positions.dtype
     )
+    window_blocks = jnp.maximum(chunk_pos // state_block_size, 0)
     rows = token_to_req_indices[:, None] * block_table_stride
-    token_pages = block_table[rows + window_blocks].reshape(-1)
+    window_pages = block_table[rows + window_blocks]
+    window_rows = (
+        window_pages * cfgs.state_physical_page_size
+        + (chunk_pos % state_block_size) * cfgs.state_rows_per_token
+    ).reshape(-1)
     # Outer pallas_call operands, in call order. Optional operands are passed as
     # None to keep kernel_fn's argument positions fixed; pallas drops the Nones
     # when indexing, so alias indices count only the operands actually present.
     scalar_prefetch = (
-        token_pages,
+        window_rows,
         positions,
         kv_slot_mapping,
         is_first_mask,

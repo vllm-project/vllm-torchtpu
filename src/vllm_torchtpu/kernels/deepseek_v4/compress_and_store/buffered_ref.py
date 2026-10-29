@@ -172,64 +172,54 @@ class WindowRef(_BufferedRef):
         sem = self.sem_recvs.at[slot]
         pid = grid_indices[0]
 
-        state_cache_ref, token_pages_ref, positions_ref = src_ref
+        state_cache_ref, window_rows_ref = src_ref
         cfgs = self.cfgs
         tile_n = cfgs.tile_sizes.tile_n
         window = cfgs.window
         chunk = cfgs.window_chunk
-        block_size = cfgs.state_block_size
-        pages_per_token = cfgs.pages_to_buffer_per_token
+        chunks_per_token = window // chunk
         rows_per_token = cfgs.state_rows_per_token
         is_indexer = cfgs.dims.mode == config.Mode.CSA_INDEXER
         window_u8 = self._window_u8(slot)
 
+        # State rows of all pages, flat: `window_rows` holds each chunk's first.
+        num_pages, page_rows = state_cache_ref.shape[:2]
+        flat_rows = state_cache_ref.reshape(
+            num_pages * page_rows, *state_cache_ref.shape[2:]
+        )
         if is_indexer:
             # One state row per field; see the copy below.
             assert rows_per_token == config.N_FIELDS and cfgs.head_tiles == 1
         else:
             # Token state rows are [kv, score] x [prev, curr] x field_rows.
-            num_pages, page_rows = state_cache_ref.shape[:2]
             assert page_rows % rows_per_token == 0, (page_rows, rows_per_token)
             # Its rows must line up with the window's (head_tiles, 4, LANE).
             assert cfgs.field_rows == cfgs.head_tiles
             assert cfgs.hbm_pack == config.FP32_BYTES
-            state_rows = state_cache_ref.reshape(
-                num_pages,
-                page_rows // rows_per_token,
-                config.N_FIELDS,
-                cfgs.overlap_factor,
-                cfgs.field_rows,
-                cfgs.hbm_pack,
-                config.LANE,
-            )
 
         for n in range(tile_n):
             idx = jnp.minimum(pid * tile_n + n, cfgs.dims.size_n - 1)
-            pos = positions_ref[idx]
-            # A compressed token's window is chunk-aligned already; rounding
-            # only keeps a padding token's reads inside one page.
-            start = (pos - window + 1) & -chunk
-            pos_block, _ = _divmod_pow2(pos, block_size)
-            for w in range(0, window, chunk):
-                block, offset = _divmod_pow2(start + w, block_size)
-                # compress_norm_rope_store looks up each token's window pages,
-                # oldest first.
-                p = block - pos_block + pages_per_token - 1
-                page = token_pages_ref[idx * pages_per_token + p]
+            for c in range(chunks_per_token):
+                w = c * chunk
+                row = window_rows_ref[idx * chunks_per_token + c]
+                rows = flat_rows.at[pl.ds(row, chunk * rows_per_token)]
                 half = w // cfgs.dims.compress_ratio if cfgs.dims.overlap else 0
                 if is_indexer:
                     # `proj_and_save_state` stores the f32 state byte-transposed:
                     # one (4, 256) row per field holds prev in lanes 0:128 and
                     # curr in 128:256.
-                    src = (
-                        state_cache_ref.at[
-                            page, pl.ds(offset * rows_per_token, chunk * rows_per_token)
-                        ]
-                        .reshape(chunk, config.N_FIELDS, 1, *state_cache_ref.shape[2:])
-                        .at[..., pl.ds(half * config.LANE, config.LANE)]
-                    )
+                    src = rows.reshape(
+                        chunk, config.N_FIELDS, 1, *state_cache_ref.shape[2:]
+                    ).at[..., pl.ds(half * config.LANE, config.LANE)]
                 else:
-                    src = state_rows.at[page, pl.ds(offset, chunk), :, half]
+                    src = rows.reshape(
+                        chunk,
+                        config.N_FIELDS,
+                        cfgs.overlap_factor,
+                        cfgs.field_rows,
+                        cfgs.hbm_pack,
+                        config.LANE,
+                    ).at[:, :, half]
                 dst = self._dst(window_u8, n, w)
                 pltpu.make_async_copy(src, dst, sem).start()
 
@@ -480,7 +470,7 @@ def create_allocs_and_specs(
     state_cache_ref,
     cos_sin_cache_ref,
     positions_ref,
-    token_pages_ref,
+    window_rows_ref,
     kv_slot_mapping_ref,
     is_first_mask_ref,
     is_first_mask_rope_ref,
@@ -562,8 +552,7 @@ def create_allocs_and_specs(
     )
     window_args = (
         cache_ref if state_cache_ref is None else state_cache_ref,
-        token_pages_ref,
-        positions_ref,
+        window_rows_ref,
     )
 
     # rope
