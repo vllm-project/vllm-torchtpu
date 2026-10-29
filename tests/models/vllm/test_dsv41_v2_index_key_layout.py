@@ -7,6 +7,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
+    indexer_impl as indexer_ops,  # noqa: E402
+)
+
 pytestmark = pytest.mark.cpu_test
 
 
@@ -186,7 +190,7 @@ def test_model_startup_registers_real_jax_ops_on_cpu(monkeypatch):
         deepseek_v41_mhc_op.initialize_shifted_mhc()
         initialize_mhc_post()
         attention_kernels.initialize_paged_attention()
-        attention_kernels.initialize_indexer()
+        indexer_ops.initialize_indexer()
         assert all(
             operation is not None
             for operation in (
@@ -196,8 +200,8 @@ def test_model_startup_registers_real_jax_ops_on_cpu(monkeypatch):
                 cache._read_index_values_2bank_op,
                 cache._write_index_values_op,
                 cache._write_index_values_after_op,
-                attention_kernels._indexer_op,
-                attention_kernels._indexer_2bank_op,
+                indexer_ops._indexer_op,
+                indexer_ops._indexer_2bank_op,
                 candidate_cache._prepare_op,
                 candidate_cache._prepare_2bank_op,
                 candidate_cache._select_op,
@@ -206,11 +210,11 @@ def test_model_startup_registers_real_jax_ops_on_cpu(monkeypatch):
         )
         # Re-entering initialization must retain the already registered ops.
         read = cache._read_values_op
-        indexer = attention_kernels._indexer_op
+        indexer = indexer_ops._indexer_op
         cache.initialize_cache_ops()
-        attention_kernels.initialize_indexer()
+        indexer_ops.initialize_indexer()
         assert cache._read_values_op is read
-        assert attention_kernels._indexer_op is indexer
+        assert indexer_ops._indexer_op is indexer
 
 
 @pytest.mark.parametrize("after", [False, True])
@@ -253,7 +257,6 @@ def test_packed_candidate_shape_and_route_bounds(monkeypatch, rows):
     from jax.sharding import Mesh
 
     from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
-        attention_kernels,
         candidate_cache,
     )
     from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
@@ -302,7 +305,7 @@ def test_packed_candidate_shape_and_route_bounds(monkeypatch, rows):
         cached_calls.append(q.shape[:2])
         return jnp.full((q.shape[0] * q.shape[1], 512), -1, jnp.int32)
 
-    monkeypatch.setattr(attention_kernels, "paged_indexer_jax", fallback)
+    monkeypatch.setattr(indexer_ops, "paged_indexer_jax", fallback)
     monkeypatch.setattr(candidate_cache.candidate, "candidate_indexer", cached)
     selected = jax.eval_shape(
         lambda q,

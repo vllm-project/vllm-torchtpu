@@ -289,10 +289,12 @@ def worker(ctx: common.WorkerContext, args: argparse.Namespace) -> dict[str, Any
 
     from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention import _gather_query_rows
     from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
-        _compact_selected,
         _pad_compacted_records,
-        _visible_top_k,
         compact_records,
+    )
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl import (
+        _compact_selected,
+        _visible_top_k,
         initialize_indexer,
         paged_indexer,
         paged_indexer_jax,

@@ -53,7 +53,13 @@ import vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels as v2_kernels
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention import (
     _index_page_records,
 )
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
+    ROW_WORDS,
+    IndexCacheRows,
+    gather_cache_page_values,
+    gather_cache_values,
+)
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl import (
     _INDEX_KEYS_PER_ITER,
     _INDEX_MAX_TILE,
     _visible_top_k,
@@ -61,12 +67,6 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
     paged_index_scores_jax,
     paged_indexer,
     update_and_select_jax,
-)
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
-    ROW_WORDS,
-    IndexCacheRows,
-    gather_cache_page_values,
-    gather_cache_values,
 )
 
 

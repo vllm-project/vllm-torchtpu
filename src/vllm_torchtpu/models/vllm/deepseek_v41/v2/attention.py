@@ -27,7 +27,6 @@ from . import csa2_adapter
 from .attention_kernels import (
     gathered_kv_cache_scope,
     paged_attention,
-    paged_indexer,
     sparse_fp8_attention,
     sparse_fp8_attention_qo,
 )
@@ -39,6 +38,7 @@ from .cache import (
 )
 from .candidate_cache import prepare_candidate_cache, select_candidate_cache
 from .ced import prefix_replay_enabled
+from .indexer_impl import paged_indexer
 from .ops import device_hooks, rms_norm, rotary, round_fp8_activation
 from .projection_rope import initialize_projection_rope
 

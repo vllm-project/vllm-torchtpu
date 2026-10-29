@@ -26,6 +26,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
+    indexer_impl as indexer_ops,  # noqa: E402
+)
+
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("TPU_SKIP_MDS_QUERY", "true")
 
@@ -37,9 +41,6 @@ import torch
 from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_gather
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
     attention as v2_attn,
-)
-from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
-    attention_kernels as v2_ak,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
     ROW_WORDS,
@@ -526,11 +527,11 @@ class TestIntegratedAttentionKernelsDecode:
             sc_called.append((scores.shape, k, lengths_arg.shape))
             return jnp.zeros((scores.shape[0], k), dtype=jnp.int32)
 
-        monkeypatch.setattr(v2_ak, "_sparsecore_top_k", mock_sc_top_k)
+        monkeypatch.setattr(indexer_ops, "_sparsecore_top_k", mock_sc_top_k)
 
         # 1. Under , scores.shape[0] < 16 executes _sparsecore_top_k
         # when unordered=True
-        out_sc = v2_ak._visible_top_k(
+        out_sc = indexer_ops._visible_top_k(
             scores_small, 64, bound=jnp.max(lengths), lengths=lengths, unordered=True
         )
         assert len(sc_called) == 1
@@ -538,7 +539,7 @@ class TestIntegratedAttentionKernelsDecode:
         assert out_sc.shape == (3, 64)
 
         # 2. Fallback path when unordered=False
-        out_fallback = v2_ak._visible_top_k(
+        out_fallback = indexer_ops._visible_top_k(
             scores_small, 64, bound=jnp.max(lengths), lengths=None, unordered=False
         )
         assert out_fallback.shape == (3, 64)
@@ -557,7 +558,7 @@ class TestIntegratedAttentionKernelsDecode:
         requests = jnp.arange(tokens, dtype=jnp.int32)
 
         monkeypatch.setattr(
-            v2_ak,
+            indexer_ops,
             "_sparsecore_top_k",
             lambda s, k, lengths_arg: jnp.zeros((s.shape[0], k), dtype=jnp.int32),
         )
@@ -565,7 +566,7 @@ class TestIntegratedAttentionKernelsDecode:
         # 1. SparseCore top-k branch in candidate_context
         # (candidates.shape[1] * block_size >= 2048)
         candidates_sc = jnp.zeros((tokens, 128), dtype=jnp.int32)  # 128 * 16 = 2048
-        sel_sc, cand_sc = v2_ak.paged_indexer_jax(
+        sel_sc, cand_sc = indexer_ops.paged_indexer_jax(
             q,
             pool,
             records,
@@ -586,7 +587,7 @@ class TestIntegratedAttentionKernelsDecode:
         # 2. Fallback lax.top_k branch in candidate_context
         # (candidates.shape[1] * block_size < 2048)
         candidates_fb = jnp.zeros((tokens, 8), dtype=jnp.int32)  # 8 * 16 = 128 < 2048
-        sel_fb, cand_fb = v2_ak.paged_indexer_jax(
+        sel_fb, cand_fb = indexer_ops.paged_indexer_jax(
             q,
             pool,
             records,
@@ -621,7 +622,7 @@ class TestIntegratedAttentionKernelsDecode:
         batch_max = lengths.max()
 
         # Case 1: page_records > 0
-        up1, sel1, pub1 = v2_ak.update_and_select_jax(
+        up1, sel1, pub1 = indexer_ops.update_and_select_jax(
             q,
             pool,
             records,
@@ -642,7 +643,7 @@ class TestIntegratedAttentionKernelsDecode:
         assert sel1.shape == (tokens, topk)
 
         # Case 2: page_records == 0 (disables page gathers)
-        up2, sel2, pub2 = v2_ak.update_and_select_jax(
+        up2, sel2, pub2 = indexer_ops.update_and_select_jax(
             q,
             pool,
             records,

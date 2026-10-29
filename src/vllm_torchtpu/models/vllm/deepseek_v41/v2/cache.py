@@ -713,6 +713,10 @@ def _scatter_rows(cache: jax.Array, slots: jax.Array, values: jax.Array) -> jax.
     return rows.at[slots].set(values, mode="drop").reshape(cache.shape)
 
 
+def _has_hi_bank(cache) -> bool:
+    return "raw_hi" in getattr(cache, "__dict__", {}) and cache.raw_hi is not None
+
+
 def _cache_num_rows(cache: jax.Array | tuple[jax.Array, jax.Array]) -> int:
     import jax.numpy as jnp
 
