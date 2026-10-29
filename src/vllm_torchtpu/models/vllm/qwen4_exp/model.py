@@ -1013,6 +1013,58 @@ class Qwen4ExpWholeStepModel(nn.Module):
         )
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "inputs_embeds": 0,
+        "valid_tokens": 0,
+        "ple_raw_embeddings": 1,
+    }
+)
+class Qwen4ExpBackbonePreLookup(nn.Module):
+    """The replicated-TP backbone for the buckets whose host PLE rows are
+    looked up before the call (VLLM_TPU_PLE_HOST_PRELOOKUP): the rows come in
+    as an input, so this graph has no host boundary. Its own compiled module
+    (like ``Qwen4ExpBackboneSP``) over the backbone's layers, serving only its
+    buckets (compilation/bucket_filter): a graph without the boundary and one
+    with it cannot be handed buckets by one trace."""
+
+    def __init__(self, *, backbone):
+        super().__init__()
+        object.__setattr__(self, "_backbone", backbone)
+
+    def forward(
+        self,
+        input_ids,
+        positions,
+        inputs_embeds=None,
+        *,
+        query_start_loc,
+        ngram_context,
+        state_slots,
+        context_lens,
+        valid_tokens,
+        main_block_table,
+        compressed_block_table,
+        ple_raw_embeddings=None,
+    ):
+        return self._backbone._forward_impl(
+            input_ids,
+            positions,
+            inputs_embeds,
+            sequence_parallel=False,
+            query_start_loc=query_start_loc,
+            ngram_context=ngram_context,
+            state_slots=state_slots,
+            context_lens=context_lens,
+            valid_tokens=valid_tokens,
+            main_block_table=main_block_table,
+            compressed_block_table=compressed_block_table,
+            ple_raw_embeddings=ple_raw_embeddings,
+        )
+
+
 class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
     requires_raw_input_tokens = True
     hf_to_vllm_mapper = WeightsMapper(
@@ -1061,6 +1113,24 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             # One rule for the router, both bucket filters and retraces.
             bucket_filter.assign(self.model_sp, eligible)
             bucket_filter.assign(self.model, lambda n: not eligible(n))
+        self.model_pre = None
+        if envs.VLLM_TPU_PLE_HOST_PRELOOKUP and self.model.host_ple_index is not None:
+            limit = envs.VLLM_TPU_PLE_HOST_PRELOOKUP_MAX_TOKENS
+            sp_serves = bucket_filter.assigned(self.model_sp) if self.model_sp else None
+
+            def pre_serves(n, limit=limit, sp_serves=sp_serves):
+                return n <= limit and not (sp_serves is not None and sp_serves(n))
+
+            self.model_pre = Qwen4ExpBackbonePreLookup(
+                vllm_config=vllm_config, backbone=self.model
+            )
+            bucket_filter.assign(self.model_pre, pre_serves)
+            main_serves = bucket_filter.assigned(self.model)
+            bucket_filter.assign(
+                self.model,
+                lambda n: not pre_serves(n)
+                and (main_serves is None or main_serves(n)),
+            )
         self.lm_head = ParallelLMHead(
             self.config.vocab_size, self.config.hidden_size, prefix="lm_head"
         )
@@ -1108,22 +1178,32 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         )
 
     def forward(self, input_ids, positions, inputs_embeds=None, **kwargs):
-        if (
-            envs.VLLM_TPU_PLE_HOST_PRELOOKUP
-            and self.model.host_ple_index is not None
-            and inputs_embeds is None
-            and kwargs.get("ple_raw_embeddings") is None
-            and input_ids.shape[0] <= envs.VLLM_TPU_PLE_HOST_PRELOOKUP_MAX_TOKENS
-        ):
-            # Larger (prefill/mixed) buckets keep the in-graph boundary: their
-            # host gather is long enough that overlapping it with the layers
-            # before the PLE layer beats saving the second program launch.
-            # A megakernel driver that looked the rows up for this step and
-            # then fell back to stock left them in kwargs: reuse them.
-            kwargs["ple_raw_embeddings"] = self._ple_prelookup(input_ids, kwargs)
-        # The route reads the padded bucket size outside both compiled graphs.
+        # The route reads the padded bucket size outside the compiled graphs.
+        rows = kwargs.pop("ple_raw_embeddings", None)
+        if self.model_pre is not None and inputs_embeds is None:
+            serves_pre = bucket_filter.assigned(self.model_pre)
+            if serves_pre(input_ids.shape[0]):
+                # Decode-sized buckets: rows looked up here (or by a megakernel
+                # driver that then fell back to stock), no host boundary.
+                # Larger (prefill/mixed) buckets keep the boundary: their host
+                # gather is long enough that overlapping it with the layers
+                # before the PLE layer beats saving the second program launch.
+                if rows is None:
+                    rows = self._ple_prelookup(input_ids, kwargs)
+                with bucket_filter.serving(serves_pre), set_model_tag("backbone_pre"):
+                    return self.model_pre(
+                        input_ids,
+                        positions,
+                        inputs_embeds,
+                        ple_raw_embeddings=rows,
+                        **kwargs,
+                    )
         if self.model_sp is None:
-            return self.model(input_ids, positions, inputs_embeds, **kwargs)
+            serves = bucket_filter.assigned(self.model)
+            if serves is None:
+                return self.model(input_ids, positions, inputs_embeds, **kwargs)
+            with bucket_filter.serving(serves):
+                return self.model(input_ids, positions, inputs_embeds, **kwargs)
         serves_sp = bucket_filter.assigned(self.model_sp)
         if serves_sp(input_ids.shape[0]):
             with bucket_filter.serving(serves_sp), set_model_tag("backbone_sp"):
