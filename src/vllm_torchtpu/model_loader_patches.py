@@ -60,7 +60,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import envs, expert_placement
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -80,6 +80,9 @@ def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
         return False
     if not name.endswith(_EXPERT_WEIGHT_SUFFIXES):
         return False
+    placed_ids = expert_placement.local_expert_ids(name)
+    if placed_ids is not None:
+        return expert_id not in placed_ids
     return expert_id not in local_expert_ids
 
 
