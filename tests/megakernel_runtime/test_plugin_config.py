@@ -359,8 +359,8 @@ def test_plugin_key_and_arch_resolution() -> None:
     assert cfg_mod.resolve_plugin_ref(on, SimpleNamespace(architectures=["X"])) is None
     by_type = SimpleNamespace(architectures=None, model_type="qwen3_5_moe")
     assert cfg_mod.resolve_plugin_ref(on, by_type)[0].shorthand == "qwen35"
-    by_cls = type("Qwen3_5MoeForCausalLM", (), {})()
-    assert cfg_mod.resolve_plugin_ref(on, None, by_cls)[0].shorthand == "qwen35"
+    # Only the HF config resolves the arch (the compile-cache salt has no model).
+    assert cfg_mod.resolve_plugin_ref(on, None) is None
     with pytest.raises(MegakernelConfigError, match="invalid plugin"):
         cfg_mod.parse_config({"plugin": "a.b:not an attr"})
 

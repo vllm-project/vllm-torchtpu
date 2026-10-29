@@ -43,10 +43,9 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.megakernel import MegakernelLayoutError
 from vllm_torchtpu.megakernel import runtime as _rt
 from vllm_torchtpu.megakernel_runtime.config import (
-    collect_config,
     import_plugin,
     resolve_callable,
-    resolve_plugin_ref,
+    select_plugin,
 )
 from vllm_torchtpu.megakernel_runtime.fingerprint import (
     agreement_token,
@@ -790,12 +789,9 @@ class ProgramDriver:
         add_cfg = getattr(
             getattr(runner, "vllm_config", None), "additional_config", None
         )
-        cfg = collect_config(envs.VLLM_TPU_MEGAKERNEL, add_cfg)
-        if not cfg.enabled:
-            return None
         view = RunnerView(runner)
-        resolved = resolve_plugin_ref(cfg, view.hf_config, view.model)
-        if resolved is None:
+        cfg, resolved = select_plugin(envs.VLLM_TPU_MEGAKERNEL, add_cfg, view.hf_config)
+        if not cfg.enabled or resolved is None:
             return None
         ref, options = resolved
         plugin, module = import_plugin(ref)

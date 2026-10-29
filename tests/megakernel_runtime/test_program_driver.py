@@ -263,6 +263,46 @@ def test_agreement_one_peer_decline_and_plugin_mismatch(
     assert drv.decline.code == "plugin_mismatch"
 
 
+def test_driver_and_salt_resolve_the_same_plugin(
+    toy: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vllm_torchtpu.megakernel_runtime import config as cfg_mod
+    from vllm_torchtpu.megakernel_runtime import salt as salt_mod
+
+    _no_group(monkeypatch)
+    seen: dict[str, list[Any]] = {"driver": [], "salt": []}
+
+    def spy(who: str) -> Any:
+        def imp(ref: Any) -> Any:
+            seen[who].append((ref.module, ref.attr))
+            return cfg_mod.import_plugin(ref)
+
+        return imp
+
+    monkeypatch.setattr(driver_mod, "import_plugin", spy("driver"))
+    monkeypatch.setattr(salt_mod, "import_plugin", spy("salt"))
+    qwen_arch = SimpleNamespace(architectures=["Qwen3_5MoeForCausalLM"])
+    qwen_type = SimpleNamespace(architectures=None, model_type="qwen3_5_moe")
+    other = SimpleNamespace(architectures=["LlamaForCausalLM"])
+    cases = [
+        (qwen_arch, True),
+        (qwen_type, "qwen35"),
+        (None, {"plugin": "qwen35"}),
+        (other, True),
+        (None, True),
+        (other, {"plugin": "toy_mk_plugin"}),
+    ]
+    for hf, mk in cases:
+        seen["driver"].clear()
+        seen["salt"].clear()
+        model = type("Qwen3_5MoeForCausalLM", (), {})()  # never used to resolve
+        runner = testing.fake_runner(model=model, hf_config=hf, megakernel=mk)
+        driver_mod.ProgramDriver.maybe_create(runner)
+        salt_mod.compile_cache_salt(runner.vllm_config)
+        assert seen["driver"] == seen["salt"], (hf, mk, seen)
+    assert seen["driver"] == [("toy_mk_plugin", "PLUGIN")]
+
+
 def test_create_runs_no_collective(toy: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     def boom(*_a: Any, **_k: Any) -> Any:
         raise AssertionError("create ran a collective")

@@ -26,26 +26,19 @@ import hashlib
 import os
 from typing import Any
 
-from .config import (
-    collect_config,
-    import_plugin,
-    resolve_callable,
-    resolve_plugin_ref,
-)
+from .config import import_plugin, resolve_callable, select_plugin
 from .fingerprint import canonical_json
 
 
 def compile_cache_salt(vllm_config: Any) -> str | None:
     """`sha256(canonical(layout_request(vllm_config, options)))[:16]`, or `None`."""
-    cfg = collect_config(
+    model_cfg = getattr(vllm_config, "model_config", None)
+    cfg, resolved = select_plugin(
         os.environ.get("VLLM_TPU_MEGAKERNEL", ""),
         getattr(vllm_config, "additional_config", None),
+        getattr(model_cfg, "hf_config", None),
     )
-    if not cfg.enabled:
-        return None
-    model_cfg = getattr(vllm_config, "model_config", None)
-    resolved = resolve_plugin_ref(cfg, getattr(model_cfg, "hf_config", None))
-    if resolved is None:
+    if not cfg.enabled or resolved is None:
         return None
     ref, options = resolved
     plugin, module = import_plugin(ref)

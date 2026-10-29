@@ -206,7 +206,7 @@ class PluginRef:
     shorthand: str | None = None
 
 
-def _hf_arch_candidates(hf_config: Any, model: Any) -> list[str]:
+def _hf_arch_candidates(hf_config: Any) -> list[str]:
     def sub(cfg: Any, key: str) -> Any:
         if isinstance(cfg, Mapping):
             return cfg.get(key)
@@ -220,17 +220,13 @@ def _hf_arch_candidates(hf_config: Any, model: Any) -> list[str]:
         for root in (hf_config, sub(hf_config, "text_config")):
             if root is not None and (mt := sub(root, "model_type")):
                 cands.append(str(mt))
-    if model is not None:
-        cands.append(type(model).__name__)
-        m_cfg = getattr(model, "config", None)
-        if m_cfg is not None and m_cfg is not hf_config:
-            cands.extend(_hf_arch_candidates(m_cfg, None))
     return cands
 
 
-def shorthand_for_arch(hf_config: Any, model: Any = None) -> str | None:
-    """The shorthand template that serves this checkpoint's arch, if any."""
-    for cand in _hf_arch_candidates(hf_config, model):
+def shorthand_for_arch(hf_config: Any) -> str | None:
+    """The shorthand template that serves this checkpoint's arch, if any (from
+    the HF config's `architectures` / `model_type` only)."""
+    for cand in _hf_arch_candidates(hf_config):
         for name, sh in SHORTHANDS.items():
             if cand in sh.architectures or cand in sh.model_types:
                 return name
@@ -238,7 +234,7 @@ def shorthand_for_arch(hf_config: Any, model: Any = None) -> str | None:
 
 
 def resolve_plugin_ref(
-    cfg: MegakernelConfig, hf_config: Any = None, model: Any = None
+    cfg: MegakernelConfig, hf_config: Any = None
 ) -> tuple[PluginRef, dict[str, Any]] | None:
     """Resolve the plugin and its `options` (`None` if no template matches the
     arch). Top-level template keys are forwarded into `options` only for a
@@ -250,7 +246,7 @@ def resolve_plugin_ref(
         mod, _, attr = cfg.plugin.partition(":")
         ref = PluginRef(mod.strip(), attr.strip() or "PLUGIN")
     else:
-        name = shorthand_for_arch(hf_config, model)
+        name = shorthand_for_arch(hf_config)
         if name is None:
             return None
         ref = PluginRef(SHORTHANDS[name].module, shorthand=name)
@@ -264,6 +260,15 @@ def resolve_plugin_ref(
             )
         options = {**cfg.legacy, **options}
     return ref, options
+
+
+def select_plugin(
+    env_raw: Any, additional_config: Any, hf_config: Any
+) -> tuple[MegakernelConfig, tuple[PluginRef, dict[str, Any]] | None]:
+    """The config and the resolved plugin: the one resolution both the driver
+    and the compile-cache salt use."""
+    cfg = collect_config(env_raw, additional_config)
+    return cfg, (resolve_plugin_ref(cfg, hf_config) if cfg.enabled else None)
 
 
 def import_plugin(ref: PluginRef) -> tuple[MegakernelPlugin, ModuleType]:
@@ -329,5 +334,6 @@ __all__ = [
     "parse_config",
     "resolve_callable",
     "resolve_plugin_ref",
+    "select_plugin",
     "shorthand_for_arch",
 ]
