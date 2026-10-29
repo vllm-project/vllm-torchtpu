@@ -78,6 +78,11 @@ def _context_paths() -> dict[int, list[tuple]]:
         obj, path = stack.pop()
         if isinstance(obj, torch.Tensor):
             found.setdefault(id(obj), []).append(path)
+            for d, size in enumerate(obj.shape):
+                found.setdefault(("dim", int(size)), []).append((path, d))
+            continue
+        if isinstance(obj, int) and not isinstance(obj, bool):
+            found.setdefault(("int", obj), []).append(path)
             continue
         if id(obj) in visited or len(path) > 5:
             continue
@@ -96,6 +101,17 @@ def _context_paths() -> dict[int, list[tuple]]:
                 if hasattr(obj, k):
                     stack.append((getattr(obj, k), path + (("a", k),)))
     return found
+
+
+def _int_source(src: tuple, args: tuple) -> Any:
+    kind = src[0]
+    if kind == "arg":
+        return args[src[1]]
+    if kind == "size":
+        return args[src[1]].shape[src[2]]
+    if kind == "ctxsize":
+        return _resolve(src[1]).shape[src[2]]
+    return _resolve(src[1])
 
 
 def _resolve(path: tuple) -> Any:
@@ -131,8 +147,8 @@ class _Layout:
         self.samples: list[tuple[tuple, tuple, Any, Any]] = []
         self.template: list[Any] | None = None
         self.fill_args: list[tuple[int, int]] = []
-        self.fill_sizes: list[tuple[int, int, int]] = []
-        self.fill_ctx: list[tuple[int, tuple]] = []
+        self.fill_sizes: list[tuple[int, tuple, tuple]] = []
+        self.fill_ctx: list[tuple[int, tuple, tuple]] = []
         self.out_spec: Any = None
         self.ready = False
         self.dead = False
@@ -186,52 +202,47 @@ def _classify(layout: _Layout) -> str | None:
     for i in range(n):
         vals = [s[1][i] for s in samples]
         v0 = vals[0]
-        argpos = [j for j, a in enumerate(samples[0][0]) if a is v0]
+        argpos = [j for j, a in enumerate(samples[0][0])
+                  if a is v0 and not isinstance(a, int)]
         if argpos and all(s[1][i] is s[0][argpos[0]] for s in samples):
             kinds.append((_ARG, argpos[0]))
             continue
         if isinstance(v0, int) and not isinstance(v0, bool):
-            varied = len(set(vals)) >= 2
-            # An int argument passed through.
-            same_arg = [
-                j for j, a in enumerate(samples[0][0])
-                if isinstance(a, int) and not isinstance(a, bool)
-                and all(isinstance(s[0][j], int) and s[0][j] == s[1][i]
-                        for s in samples)
-            ]
-            if same_arg and varied:
-                kinds.append((_ARG, same_arg[0]))
-                continue
-            cands = None
-            for args, flat, *_ in samples:
-                here = {
-                    (j, d)
-                    for j, a in enumerate(args)
-                    if isinstance(a, torch.Tensor)
-                    for d, size in enumerate(a.shape)
-                    if size == flat[i]
-                }
-                cands = here if cands is None else cands & here
-            if cands and varied:
-                kinds.append((_SIZE, *min(cands)))
-                continue
-            if not varied:
-                # Never varied: a size if one matched on every call, else a
-                # constant (the check / canary catch a wrong guess).
-                kinds.append((_SIZE, *min(cands)) if cands else (_CONST, v0))
-                continue
-            return f"flat[{i}] int varies {sorted(set(vals))[:6]} with no matching arg size"
-        if all(v is v0 for v in vals):
-            if any(v0 is a for s in samples for a in s[0]):
-                return f"flat[{i}] {_describe(v0)} is an argument only sometimes"
-            kinds.append((_CONST, v0))
+            # Every int is filled from a source read on each call: an int
+            # argument, a size of a tensor argument, an int field or a tensor
+            # size in the forward context. Never a recorded constant.
+            srcs = None
+            for args, flat, _, _, ctxmap in samples:
+                x = flat[i]
+                here = {("arg", j) for j, a in enumerate(args)
+                        if isinstance(a, int) and not isinstance(a, bool) and a == x}
+                here |= {("size", j, d) for j, a in enumerate(args)
+                         if isinstance(a, torch.Tensor)
+                         for d, size in enumerate(a.shape) if size == x}
+                here |= {("ctxint", path) for path in ctxmap.get(("int", x), ())}
+                here |= {("ctxsize", path, d) for path, d in ctxmap.get(("dim", x), ())}
+                srcs = here if srcs is None else srcs & here
+            if not srcs:
+                return (f"flat[{i}] int {sorted(set(vals))[:6]} has no argument or "
+                        "forward-context source")
+            order = {"arg": 0, "size": 1, "ctxsize": 2, "ctxint": 3}
+            ranked = sorted(srcs, key=lambda c: (order[c[0]], str(c)))
+            kinds.append((_SIZE, ranked[0], list(ranked[1:4])))
             continue
+        # Read through the forward context: resolve it on every call, even
+        # when it was the same object on every recorded one.
         ctx = None
         for s in samples:
             here = set(s[4].get(id(s[1][i]), ()))
             ctx = here if ctx is None else ctx & here
         if ctx:
-            kinds.append((_CTX, min(ctx, key=len)))
+            kinds.append((_CTX, min(ctx, key=len),
+                          (v0.dtype, {tuple(v.shape) for v in vals})))
+            continue
+        if all(v is v0 for v in vals):
+            if any(v0 is a for s in samples for a in s[0]):
+                return f"flat[{i}] {_describe(v0)} is an argument only sometimes"
+            kinds.append((_CONST, v0))
             continue
         same_shape = all(
             isinstance(v, torch.Tensor) and isinstance(v0, torch.Tensor)
@@ -249,7 +260,7 @@ def _classify(layout: _Layout) -> str | None:
     layout.template = [k[1] if k[0] == _CONST else None for k in kinds]
     layout.fill_args = [(i, k[1]) for i, k in enumerate(kinds) if k[0] == _ARG]
     layout.fill_sizes = [(i, k[1], k[2]) for i, k in enumerate(kinds) if k[0] == _SIZE]
-    layout.fill_ctx = [(i, k[1]) for i, k in enumerate(kinds) if k[0] == _CTX]
+    layout.fill_ctx = [(i, k[1], k[2]) for i, k in enumerate(kinds) if k[0] == _CTX]
     layout.out_spec = spec
     layout.ready = True
     layout.samples = []
@@ -271,6 +282,7 @@ class FlatArgsForward:
         self.checks = 0
         self.check_mismatches = 0
         self.undecided = 0
+        self.refusals = 0
         self.canary = envs.VLLM_TPU_AOT_FLAT_ARGS_CANARY
         self.check = envs.VLLM_TPU_AOT_FLAT_ARGS_CHECK
 
@@ -292,18 +304,60 @@ class FlatArgsForward:
         self.last_ctx = seen.get("ctx", {})
         return ret, seen.get("flat"), seen.get("out")
 
-    def _build(self, layout: _Layout, args: tuple) -> list[Any]:
+    def _build(self, layout: _Layout, args: tuple, strict: bool = True) -> list[Any] | None:
+        """The flat list for this call, or None when a per-call guard fails:
+        an int's alternative sources disagree, or a forward-context tensor
+        has another dtype or a shape not verified yet."""
         flat = list(layout.template)
         for i, j in layout.fill_args:
             flat[i] = args[j]
-        for i, j, d in layout.fill_sizes:
-            flat[i] = args[j].shape[d]
-        for i, path in layout.fill_ctx:
-            flat[i] = _resolve(path)
+        for i, src, alts in layout.fill_sizes:
+            v = _int_source(src, args)
+            if strict:
+                for alt in alts:
+                    if _int_source(alt, args) != v:
+                        return None
+            flat[i] = v
+        for i, path, (dtype, shapes) in layout.fill_ctx:
+            t = _resolve(path)
+            if t.dtype != dtype or (strict and tuple(t.shape) not in shapes):
+                return None
+            flat[i] = t
         return flat
 
+    def _refused(self, layout: _Layout, args: tuple, kwargs: dict, vals: tuple) -> Any:
+        """A guard refused the template: run the full walk, then learn from it.
+        New shapes of forward-context tensors and int sources that agree with
+        the walk are kept; a primary int source that disagrees kills the
+        layout."""
+        self.refusals += 1
+        ret, flat, _ = self._record(args, kwargs)
+        if flat is None or len(flat) != len(layout.template):
+            layout.dead = True
+            return ret
+        for entry in layout.fill_sizes:
+            i, src, alts = entry
+            if _int_source(src, vals) != flat[i]:
+                layout.dead = True
+                logger.warning("AOT_FLAT_ARGS %s: flat[%d] int source %s disagrees "
+                               "with the walk; layout off", self.label, i, src)
+                return ret
+            alts[:] = [a for a in alts if _int_source(a, vals) == flat[i]]
+        for i, path, (dtype, shapes) in layout.fill_ctx:
+            t = flat[i]
+            if t is not _resolve(path) or t.dtype != dtype:
+                layout.dead = True
+                logger.warning("AOT_FLAT_ARGS %s: flat[%d] context path %s disagrees "
+                               "with the walk; layout off", self.label, i, path)
+                return ret
+            shapes.add(tuple(t.shape))
+        if self.refusals in (1, 10, 100, 1000) or self.refusals % 10000 == 0:
+            logger.info("AOT_FLAT_ARGS %s: %d guard refusals (verified by the walk "
+                        "and learned)", self.label, self.refusals)
+        return ret
+
     def _compare(self, layout: _Layout, args: tuple, flat: tuple) -> int:
-        built = self._build(layout, args)
+        built = self._build(layout, args, strict=False)
         if len(built) != len(flat):
             return max(len(built), len(flat))
         bad = 0
@@ -359,20 +413,26 @@ class FlatArgsForward:
         if self.checks < self.check:
             ret, flat, _ = self._record(args, kwargs)
             self.checks += 1
+            if self._build(layout, vals) is None:
+                self.refusals += 1
             self.check_mismatches += self._compare(layout, vals, flat)
             if self.checks % 500 == 0 or self.checks == self.check:
-                logger.info("AOT_FLAT_ARGS_CHECK %s checks=%d mismatched_positions=%d",
-                            self.label, self.checks, self.check_mismatches)
+                logger.info("AOT_FLAT_ARGS_CHECK %s checks=%d mismatched_positions=%d "
+                            "guard_refusals=%d", self.label, self.checks,
+                            self.check_mismatches, self.refusals)
             return ret
         if self.canary and self.calls % self.canary == 0:
             ret, flat, _ = self._record(args, kwargs)
             bad = self._compare(layout, vals, flat)
-            if bad:
+            if bad > 0:
                 self.off = True
                 logger.error("AOT_FLAT_ARGS %s: canary found %d stale flat args; "
                              "cache off", self.label, bad)
             return ret
-        return _apply_spec(layout.out_spec, self.compiled(*self._build(layout, vals)))
+        flat = self._build(layout, vals)
+        if flat is None:
+            return self._refused(layout, args, kwargs, vals)
+        return _apply_spec(layout.out_spec, self.compiled(*flat))
 
 
 def patch_aot_flat_args() -> None:
