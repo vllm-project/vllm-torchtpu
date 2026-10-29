@@ -53,7 +53,56 @@ _STORE_OPS = {
     "DELETE_SUBSCR",
 }
 _RECORD_CALLS = 16
-_ARG, _SIZE, _CONST = 0, 1, 2
+_ARG, _SIZE, _CONST, _CTX = 0, 1, 2, 3
+_CTX_WALK_NODES = 50000
+
+
+def _forward_context() -> Any:
+    try:
+        from vllm.forward_context import get_forward_context, is_forward_context_available
+    except ImportError:
+        return None
+    return get_forward_context() if is_forward_context_available() else None
+
+
+def _context_paths() -> dict[int, list[tuple]]:
+    """Every tensor reachable from the active forward context (attributes,
+    dict values, list items; no modules), by id, with its access paths."""
+    root = _forward_context()
+    found: dict[int, list[tuple]] = {}
+    if root is None:
+        return found
+    stack: list[tuple[Any, tuple]] = [(root, ())]
+    visited: set[int] = set()
+    while stack and len(visited) < _CTX_WALK_NODES:
+        obj, path = stack.pop()
+        if isinstance(obj, torch.Tensor):
+            found.setdefault(id(obj), []).append(path)
+            continue
+        if id(obj) in visited or len(path) > 5:
+            continue
+        visited.add(id(obj))
+        if isinstance(obj, dict):
+            stack.extend((v, path + (("k", k),)) for k, v in obj.items()
+                         if isinstance(k, (str, int)))
+        elif isinstance(obj, (list, tuple)):
+            stack.extend((v, path + (("i", i),)) for i, v in enumerate(obj))
+        elif isinstance(obj, torch.nn.Module) or callable(obj):
+            continue
+        elif hasattr(obj, "__dict__"):
+            stack.extend((v, path + (("a", k),)) for k, v in vars(obj).items())
+        elif hasattr(obj, "__slots__"):
+            for k in obj.__slots__:
+                if hasattr(obj, k):
+                    stack.append((getattr(obj, k), path + (("a", k),)))
+    return found
+
+
+def _resolve(path: tuple) -> Any:
+    obj = _forward_context()
+    for kind, key in path:
+        obj = getattr(obj, key) if kind == "a" else obj[key]
+    return obj
 
 
 def _compiled_fn_name(fn: Callable) -> str | None:
@@ -75,7 +124,7 @@ def _compiled_fn_name(fn: Callable) -> str | None:
 class _Layout:
     """What one argument layout of the forward needs to rebuild its flat list."""
 
-    __slots__ = ("samples", "template", "fill_args", "fill_sizes", "out_spec",
+    __slots__ = ("samples", "template", "fill_args", "fill_sizes", "fill_ctx", "out_spec",
                  "ready", "dead", "reason")
 
     def __init__(self) -> None:
@@ -83,6 +132,7 @@ class _Layout:
         self.template: list[Any] | None = None
         self.fill_args: list[tuple[int, int]] = []
         self.fill_sizes: list[tuple[int, int, int]] = []
+        self.fill_ctx: list[tuple[int, tuple]] = []
         self.out_spec: Any = None
         self.ready = False
         self.dead = False
@@ -153,7 +203,7 @@ def _classify(layout: _Layout) -> str | None:
                 kinds.append((_ARG, same_arg[0]))
                 continue
             cands = None
-            for args, flat, _, _ in samples:
+            for args, flat, *_ in samples:
                 here = {
                     (j, d)
                     for j, a in enumerate(args)
@@ -166,14 +216,22 @@ def _classify(layout: _Layout) -> str | None:
                 kinds.append((_SIZE, *min(cands)))
                 continue
             if not varied:
-                # Never varied yet: undecidable between a size and a constant.
-                layout.reason = f"flat[{i}] int {v0} has not varied"
-                return None
+                # Never varied: a size if one matched on every call, else a
+                # constant (the check / canary catch a wrong guess).
+                kinds.append((_SIZE, *min(cands)) if cands else (_CONST, v0))
+                continue
             return f"flat[{i}] int varies {sorted(set(vals))[:6]} with no matching arg size"
         if all(v is v0 for v in vals):
             if any(v0 is a for s in samples for a in s[0]):
                 return f"flat[{i}] {_describe(v0)} is an argument only sometimes"
             kinds.append((_CONST, v0))
+            continue
+        ctx = None
+        for s in samples:
+            here = set(s[4].get(id(s[1][i]), ()))
+            ctx = here if ctx is None else ctx & here
+        if ctx:
+            kinds.append((_CTX, min(ctx, key=len)))
             continue
         same_shape = all(
             isinstance(v, torch.Tensor) and isinstance(v0, torch.Tensor)
@@ -191,6 +249,7 @@ def _classify(layout: _Layout) -> str | None:
     layout.template = [k[1] if k[0] == _CONST else None for k in kinds]
     layout.fill_args = [(i, k[1]) for i, k in enumerate(kinds) if k[0] == _ARG]
     layout.fill_sizes = [(i, k[1], k[2]) for i, k in enumerate(kinds) if k[0] == _SIZE]
+    layout.fill_ctx = [(i, k[1]) for i, k in enumerate(kinds) if k[0] == _CTX]
     layout.out_spec = spec
     layout.ready = True
     layout.samples = []
@@ -221,6 +280,7 @@ class FlatArgsForward:
 
         def recorder(*flat):
             seen["flat"] = flat
+            seen["ctx"] = _context_paths()
             seen["out"] = out = compiled(*flat)
             return out
 
@@ -229,6 +289,7 @@ class FlatArgsForward:
             ret = self.fn(*args, **kwargs)
         finally:
             self.globals[self.name] = compiled
+        self.last_ctx = seen.get("ctx", {})
         return ret, seen.get("flat"), seen.get("out")
 
     def _build(self, layout: _Layout, args: tuple) -> list[Any]:
@@ -237,6 +298,8 @@ class FlatArgsForward:
             flat[i] = args[j]
         for i, j, d in layout.fill_sizes:
             flat[i] = args[j].shape[d]
+        for i, path in layout.fill_ctx:
+            flat[i] = _resolve(path)
         return flat
 
     def _compare(self, layout: _Layout, args: tuple, flat: tuple) -> int:
@@ -270,7 +333,7 @@ class FlatArgsForward:
             if flat is None:
                 layout.dead = True
                 return ret
-            layout.samples.append((vals, flat, ret, out))
+            layout.samples.append((vals, flat, ret, out, self.last_ctx))
             if len(layout.samples) >= _RECORD_CALLS:
                 reason = _classify(layout)
                 if reason is not None:
@@ -280,9 +343,10 @@ class FlatArgsForward:
                                 self.label, key[:2], reason)
                 elif layout.ready:
                     logger.info(
-                        "AOT_FLAT_ARGS %s: caching %d flat args (%d args, %d sizes)",
+                        "AOT_FLAT_ARGS %s: caching %d flat args (%d args, %d sizes, "
+                        "%d forward-context fields)",
                         self.label, len(layout.template), len(layout.fill_args),
-                        len(layout.fill_sizes))
+                        len(layout.fill_sizes), len(layout.fill_ctx))
                 else:
                     layout.samples = layout.samples[-_RECORD_CALLS:]
                     if len(layout.samples) and self.calls == 0:
