@@ -21,22 +21,25 @@ from jax.sharding import Mesh
 
 from vllm_torchtpu.kernels.deepseek_v4.core_attention import sparse_mla
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels
+from vllm_torchtpu.models.vllm.deepseek_v41.v2 import indexer_impl as indexer_ops
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
     _pad_compacted_records,
+    initialize_paged_attention,
+    paged_attention,
+    slice_token_parallel_attention_inputs,
+    sparse_fp8_attention,
+    sparse_fp8_attention_jax,
+)
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl import (
     _prefix_count,
     _sparsecore_top_k,
     _threshold_top_k,
     _visible_top_k,
     initialize_indexer,
-    initialize_paged_attention,
-    paged_attention,
     paged_index_scores_jax,
     paged_indexer,
     paged_indexer_jax,
     select_indices_jax,
-    slice_token_parallel_attention_inputs,
-    sparse_fp8_attention,
-    sparse_fp8_attention_jax,
     update_and_select_jax,
     write_index_keys,
 )
@@ -451,7 +454,7 @@ class TestSelectIndicesJax:
         sc_lengths = jnp.array([1024, 2048, 4096, 8192], dtype=jnp.int32)
         sc_candidates = jnp.full((count, 16), -1, dtype=jnp.int32)
         with mock.patch(
-            "vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels._sparsecore_top_k",
+            "vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl._sparsecore_top_k",
             side_effect=lambda s, k, n: jnp.broadcast_to(
                 jnp.arange(k, dtype=jnp.int32), (s.shape[0], k)
             ),
@@ -648,7 +651,7 @@ class TestThresholdAndVisibleTopK:
         scores_large = jnp.asarray(rng.standard_normal((16, 2048)), dtype=jnp.float32)
         lengths_large = jnp.full((16,), 2048, dtype=jnp.int32)
         with mock.patch(
-            "vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels._sparsecore_top_k",
+            "vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl._sparsecore_top_k",
             return_value=jnp.zeros((16, 64), dtype=jnp.int32),
         ) as mock_sc:
             res_sc = _visible_top_k(
@@ -919,7 +922,7 @@ class TestPagedIndexerJax:
         records_large = jnp.zeros((16, 4096), dtype=jnp.int32)
         lengths_large = jnp.full((tokens,), 3000, dtype=jnp.int32)
         with mock.patch.object(
-            attention_kernels,
+            indexer_ops,
             "_sparsecore_top_k",
             return_value=jnp.zeros((tokens, topk), dtype=jnp.int32),
         ) as mock_sc_topk:
@@ -1019,13 +1022,13 @@ class TestIndexerOpAndWrapper:
     def test_initialize_indexer_and_fake(self):
         mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
         with set_vllm_model_wrapper_context(mesh=mesh):
-            attention_kernels._indexer_op = None
+            indexer_ops._indexer_op = None
             initialize_indexer()
-            assert attention_kernels._indexer_op is not None
+            assert indexer_ops._indexer_op is not None
             # Test early return branch
-            saved_op = attention_kernels._indexer_op
+            saved_op = indexer_ops._indexer_op
             initialize_indexer()
-            assert attention_kernels._indexer_op is saved_op
+            assert indexer_ops._indexer_op is saved_op
 
         # Verify fake registration by calling op with meta device tensors
         q = torch.empty((4, 4, 128), dtype=torch.bfloat16, device="meta")
@@ -1039,7 +1042,7 @@ class TestIndexerOpAndWrapper:
         requests = torch.empty((4,), dtype=torch.int32, device="meta")
         batch_max = torch.empty((1,), dtype=torch.int32, device="meta")
 
-        f_pool, f_sel, f_pub = attention_kernels._indexer_op(
+        f_pool, f_sel, f_pub = indexer_ops._indexer_op(
             q,
             pool,
             records,
@@ -1078,7 +1081,7 @@ class TestIndexerOpAndWrapper:
 
         # 1) batch_max is None (default)
         with mock.patch.object(
-            attention_kernels,
+            indexer_ops,
             "_indexer_op",
             return_value=(mock_cache.raw, records, candidates),
         ) as mock_op:
@@ -1104,7 +1107,7 @@ class TestIndexerOpAndWrapper:
 
         # 2) explicit batch_max
         with mock.patch.object(
-            attention_kernels,
+            indexer_ops,
             "_indexer_op",
             return_value=(mock_cache.raw, records, candidates),
         ) as mock_op:
