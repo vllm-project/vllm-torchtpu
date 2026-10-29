@@ -186,6 +186,7 @@ if TYPE_CHECKING:
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = True
     TPU_PRECOMPILE_PEER_REPLAY: bool = True
     TPU_PRECOMPILE_TRACE_FIRST: bool = False
+    TPU_NO_CODE_FUNCTIONS_MAX_TOKENS: int = 0
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_DCP_INDEXER_A2A_MERGE: bool = True
     TPU_DCP_INDEXER_HIST_MERGE: bool = True
@@ -1655,6 +1656,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # before the next group is even traced, so the groups run one after
     # another and most ranks wait. Needs TPU_PARALLEL_PRECOMPILE.
     "TPU_PRECOMPILE_TRACE_FIRST": env_bool("TPU_PRECOMPILE_TRACE_FIRST", default=False),
+    # Compile every program whose token bucket is at most this many tokens
+    # without XLA's shared code functions (HLO functions), so its layers' code
+    # runs in program order instead of reloading shared functions' overlays.
+    # Larger buckets keep the compiler's choice: their code would not fit in
+    # HBM beside the KV cache. 0 leaves every program to the compiler.
+    "TPU_NO_CODE_FUNCTIONS_MAX_TOKENS": env_int(
+        "TPU_NO_CODE_FUNCTIONS_MAX_TOKENS", 0
+    ),
     # Token-axis chunk size for the GLM-5.2 / DSv4 StreamIndex top-k kernel.
     # Cutting the flat token axis into `chunk_tokens`-sized pieces lets each
     # chunk's SparseCore top-k overlap the next chunk's TensorCore scoring.
