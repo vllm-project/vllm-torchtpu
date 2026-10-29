@@ -77,9 +77,9 @@ def shifted_post_pre_rms(
 
     ``donate_flat`` opts into the in-place contract: the tile kernel declares
     the residual output as an alias of the ``flat`` operand, so ``flat`` is
-    overwritten and the residual write costs no extra HBM traffic.  **It is a
-    contract change, not a pure addition**: the caller must guarantee that
-    ``flat`` (and the tensor it was flattened from) is not read after the call.
+    overwritten. Storage reuse does not eliminate the residual output DMA.
+    This changes the caller's contract: ``flat`` (and the tensor it was
+    flattened from) must not be read after the call.
     The current seam call site satisfies this -- ``flat`` is consumed only as
     the second Pallas operand and the caller rebinds the name immediately -- but
     the guarantee lives in the caller, so the default stays ``False``.
