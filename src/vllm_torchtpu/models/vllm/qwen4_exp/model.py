@@ -42,6 +42,7 @@ from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import bucket_filter
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 from . import sequence_parallel as sp
@@ -62,6 +63,9 @@ from .ple_storage import SharedPLEOptions
 from .pool_layout import POOLED_GDN_CONV_STATE_DTYPE
 from .pooled_ple import Qwen4ExpPooledPLE
 from .qsa import QSAMetadata, Qwen4ExpQSA
+
+
+logger = init_logger(__name__)
 
 
 def _parameter_storage_key(parameter):
@@ -1134,6 +1138,13 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         if self.sp_shared_local_step and self.model_sp_local is not None:
             serves_local = bucket_filter.assigned(self.model_sp_local)
             if serves_local(input_ids.shape[0]):
+                self._sp_local_steps = getattr(self, "_sp_local_steps", 0) + 1
+                if self._sp_local_steps in (1, 10, 100) or self._sp_local_steps % 1000 == 0:
+                    # Warmup takes the first one or two; served steps show up after.
+                    logger.info(
+                        "qwen4_exp: backbone_sp_local step %d (%d tokens)",
+                        self._sp_local_steps, input_ids.shape[0],
+                    )
                 with bucket_filter.serving(serves_local), set_model_tag(
                     "backbone_sp_local"
                 ):
