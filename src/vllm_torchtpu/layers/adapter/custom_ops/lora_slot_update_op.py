@@ -34,6 +34,15 @@ from torch_tpu._internal import pallas
 def _compute_slot_update(
     stacked_weights: list[jax.Array], slot_weights: jax.Array, slot_index: jax.Array
 ) -> list[jax.Array]:
+    # stacked_weights: N tensors, the i-th shaped [max_loras, *slot_shape_i].
+    #   slot_shape_i differs per tensor: a linear layer has lora_a
+    #   [max_loras, 1, max_lora_rank, input_size] and lora_b
+    #   [max_loras, 1, output_size, max_lora_rank]; the embedding has lora_a
+    #   [max_loras, vocab_size, max_lora_rank].
+    # slot_weights: [sum_i prod(slot_shape_i)], every tensor's slot flattened
+    #   and concatenated in stacked_weights order.
+    # slot_index: [1] int32, the slot to write.
+    # Returns N tensors shaped like stacked_weights.
     updated, offset = [], 0
     for weights in stacked_weights:
         slot_size = math.prod(weights.shape[1:])
@@ -70,7 +79,14 @@ def write_adapter_to_slot(
     slot_index: torch.Tensor,
 ) -> None:
     """Writes one slot of every stacked tensor from slot_weights, packed in
-    stacked_weights order."""
+    stacked_weights order.
+
+    Args:
+        stacked_weights: N tensors, the i-th shaped [max_loras, *slot_shape_i].
+        slot_weights: [sum_i prod(slot_shape_i)], same dtype as
+            stacked_weights.
+        slot_index: [1] int32, on the same device.
+    """
     updated = _slot_update_op(stacked_weights, slot_weights, slot_index)
     for weights, new_weights in zip(stacked_weights, updated):
         # Writes the result back into the donated tensor. XLA aliases the
