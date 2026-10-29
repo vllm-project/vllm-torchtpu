@@ -1,0 +1,1203 @@
+{
+  "fixture_files": {
+    "pyproject.toml": "[dependency-groups]\nvllm = [\n    \"vllm @ git+https://github.com/vllm-project/vllm.git@a1b2c3d4e5f6\",\n]\n",
+    ".buildkite/pipeline_build.yml": "steps:\n  - group: \"Docker Image Build\"\n    key: \"build_docker_group\"\n    steps:\n      - label: \"Build CI image\"\n        key: \"build_docker\"\n        agents:\n          queue: docker-build\n        commands:\n          - echo build\n      - label: \"Build Omni image\"\n        key: \"build_docker_omni\"\n        skip: \"${OMNI_IMAGE_SKIP:-}\"\n        agents:\n          queue: docker-build\n        commands:\n          - echo build-omni\n",
+    ".buildkite/pipeline_tests.yml": "x-tpu-defaults: &tpu_defaults\n  agents:\n    queue: \"kube\"\n  env:\n    SHAPE: \"${KUBE_SHAPE_SINGLE:-tpu7x-standard-1t/1x1x1}\"\n\nsteps:\n  - label: \"Unit Tests - CPU (PR)\"\n    key: \"unit_tests_cpu_pr\"\n    if: 'build.env(\"NIGHTLY\") != \"1\"'\n    agents:\n      queue: \"kube\"\n    env:\n      SHAPE: \"cpu\"\n    commands:\n      - pytest\n  - group: \"Unit Tests on TPU\"\n    if: '\"${SKIP_TPU_CI:-0}\" != \"1\"'\n    steps:\n      - label: \"Unit Tests - TPU\"\n        key: \"unit_tests_general_pr\"\n        <<: *tpu_defaults\n        if: 'build.env(\"NIGHTLY\") != \"1\"'\n        commands:\n          - pytest -m tpu_test\n",
+    ".buildkite/pipeline_integration.yml": "steps:\n  - group: \"Integration Tests on TPU\"\n    key: \"integration_tpu\"\n    steps:\n      - label: \"E2E Correctness\"\n        key: \"e2e_correctness\"\n        agents:\n          queue: \"kube\"\n        env:\n          SHAPE: \"tpu7x-standard-1t/1x1x1\"\n        commands:\n          - bash test.sh\n",
+    ".buildkite/pipeline_perf.yml": "steps:\n  - group: \"Perf and Eval on TPU\"\n    steps:\n      - label: \"Perf Suite\"\n        if: 'build.env(\"NIGHTLY\") == \"1\"'\n        agents:\n          queue: \"kube\"\n        env:\n          SHAPE: \"tpu7x-standard-1t/1x1x1\"\n        commands:\n          - bash bench.sh\n",
+    ".buildkite/pipeline_verify.yml": "steps:\n  - label: \"Support matrices and verified commit\"\n    key: \"nightly_report\"\n    if: 'build.env(\"NIGHTLY\") == \"1\" || build.tag =~ /^v?[0-9]+/'\n    agents:\n      queue: cpu\n    commands:\n      - bash report.sh\n",
+    ".buildkite/pipeline_promote.yml": "steps:\n  - wait\n  - label: \":arrow_up: Promote vLLM to Last Known Good (LKG)\"\n    key: \"promote_lkg\"\n    agents:\n      queue: cpu\n    commands:\n      - bash promote.sh\n"
+  },
+  "cases": [
+    {
+      "name": "pr_default",
+      "input": {
+        "env": {
+          "BUILDKITE_PULL_REQUEST": "123",
+          "BUILDKITE_PULL_REQUEST_LABELS": "ready",
+          "BUILDKITE_BUILD_AUTHOR_EMAIL": "Alice@example.com"
+        },
+        "git_diff": [
+          "src/vllm_torchtpu/runner/tpu_runner.py"
+        ]
+      },
+      "expected": {
+        "exit_code": 0,
+        "commands": [
+          "buildkite-agent meta-data set JOB_PRIORITY 6",
+          "buildkite-agent meta-data set WORKLOAD_PRIORITY pre-merge",
+          "git fetch origin main --depth=20 --quiet",
+          "git fetch origin HEAD --depth=20 --quiet",
+          "git diff --name-only origin/main...HEAD",
+          "buildkite-agent meta-data set VLLM_COMMIT_HASH a1b2c3d4e5f6",
+          "buildkite-agent pipeline upload --dry-run --format json",
+          "buildkite-agent pipeline upload --no-interpolation",
+          "buildkite-agent pipeline upload --dry-run --format json",
+          "buildkite-agent pipeline upload --no-interpolation",
+          "buildkite-agent pipeline upload --dry-run --format json",
+          "buildkite-agent pipeline upload --no-interpolation",
+          "buildkite-agent pipeline upload --dry-run --format json",
+          "buildkite-agent pipeline upload --no-interpolation"
+        ],
+        "metadata": [
+          {
+            "key": "JOB_PRIORITY",
+            "value": "6"
+          },
+          {
+            "key": "WORKLOAD_PRIORITY",
+            "value": "pre-merge"
+          },
+          {
+            "key": "VLLM_COMMIT_HASH",
+            "value": "a1b2c3d4e5f6"
+          }
+        ],
+        "annotations": [],
+        "uploads": [
+          {
+            "args": [
+              "--no-interpolation"
+            ],
+            "env": {
+              "JOB_PRIORITY": "6",
+              "PR_TPU_CONCURRENCY_GROUP": "tpu-pr/alice@example.com",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "{\"priority\": 6, \"steps\": [{\"label\": \"Support matrices and verified commit\", \"key\": \"nightly_report\", \"if\": \"build.env(\\\"NIGHTLY\\\") == \\\"1\\\" || build.tag =~ /^v?[0-9]+/\", \"agents\": {\"queue\": \"cpu\"}, \"commands\": [\"bash report.sh\"]}]}\n"
+          },
+          {
+            "args": [
+              "--no-interpolation"
+            ],
+            "env": {
+              "JOB_PRIORITY": "6",
+              "PR_TPU_CONCURRENCY_GROUP": "tpu-pr/alice@example.com",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "{\"priority\": 6, \"steps\": [{\"group\": \"Integration Tests on TPU\", \"key\": \"integration_tpu\", \"steps\": [{\"label\": \"E2E Correctness\", \"key\": \"e2e_correctness\", \"agents\": {\"queue\": \"kube\"}, \"env\": {\"SHAPE\": \"tpu7x-standard-1t/1x1x1\"}, \"commands\": [\"bash test.sh\"], \"concurrency_group\": \"tpu-pr/alice@example.com\", \"concurrency\": 40, \"concurrency_method\": \"eager\"}]}]}\n"
+          },
+          {
+            "args": [
+              "--no-interpolation"
+            ],
+            "env": {
+              "JOB_PRIORITY": "6",
+              "PR_TPU_CONCURRENCY_GROUP": "tpu-pr/alice@example.com",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "{\"priority\": 6, \"steps\": [{\"label\": \"Unit Tests - CPU (PR)\", \"key\": \"unit_tests_cpu_pr\", \"if\": \"build.env(\\\"NIGHTLY\\\") != \\\"1\\\"\", \"agents\": {\"queue\": \"kube\"}, \"env\": {\"SHAPE\": \"cpu\"}, \"commands\": [\"pytest\"]}, {\"group\": \"Unit Tests on TPU\", \"if\": \"\\\"${SKIP_TPU_CI:-0}\\\" != \\\"1\\\"\", \"steps\": [{\"agents\": {\"queue\": \"kube\"}, \"env\": {\"SHAPE\": \"${KUBE_SHAPE_SINGLE:-tpu7x-standard-1t/1x1x1}\"}, \"label\": \"Unit Tests - TPU\", \"key\": \"unit_tests_general_pr\", \"if\": \"build.env(\\\"NIGHTLY\\\") != \\\"1\\\"\", \"commands\": [\"pytest -m tpu_test\"], \"concurrency_group\": \"tpu-pr/alice@example.com\", \"concurrency\": 40, \"concurrency_method\": \"eager\"}]}]}\n"
+          },
+          {
+            "args": [
+              "--no-interpolation"
+            ],
+            "env": {
+              "JOB_PRIORITY": "6",
+              "PR_TPU_CONCURRENCY_GROUP": "tpu-pr/alice@example.com",
+              "SKIP_TPU_CI": "0",
+              "OMNI_IMAGE_SKIP": ""
+            },
+            "content": "{\"priority\": 6, \"steps\": [{\"group\": \"Docker Image Build\", \"key\": \"build_docker_group\", \"steps\": [{\"label\": \"Build CI image\", \"key\": \"build_docker\", \"agents\": {\"queue\": \"docker-build\"}, \"commands\": [\"echo build\"]}, {\"label\": \"Build Omni image\", \"key\": \"build_docker_omni\", \"skip\": \"${OMNI_IMAGE_SKIP:-}\", \"agents\": {\"queue\": \"docker-build\"}, \"commands\": [\"echo build-omni\"]}]}]}\n"
+          }
+        ]
+      }
+    },
+    {
+      "name": "pr_no_author",
+      "input": {
+        "env": {
+          "BUILDKITE_PULL_REQUEST": "123",
+          "BUILDKITE_PULL_REQUEST_LABELS": "ready"
+        },
+        "git_diff": [
+          "src/vllm_torchtpu/runner/tpu_runner.py"
+        ]
+      },
+      "expected": {
+        "exit_code": 0,
+        "commands": [
+          "buildkite-agent meta-data set JOB_PRIORITY 6",
+          "buildkite-agent meta-data set WORKLOAD_PRIORITY pre-merge",
+          "git fetch origin main --depth=20 --quiet",
+          "git fetch origin HEAD --depth=20 --quiet",
+          "git diff --name-only origin/main...HEAD",
+          "buildkite-agent meta-data set VLLM_COMMIT_HASH a1b2c3d4e5f6",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload"
+        ],
+        "metadata": [
+          {
+            "key": "JOB_PRIORITY",
+            "value": "6"
+          },
+          {
+            "key": "WORKLOAD_PRIORITY",
+            "value": "pre-merge"
+          },
+          {
+            "key": "VLLM_COMMIT_HASH",
+            "value": "a1b2c3d4e5f6"
+          }
+        ],
+        "annotations": [],
+        "uploads": [
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "6",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "priority: 6\nsteps:\n  - label: \"Support matrices and verified commit\"\n    key: \"nightly_report\"\n    if: 'build.env(\"NIGHTLY\") == \"1\" || build.tag =~ /^v?[0-9]+/'\n    agents:\n      queue: cpu\n    commands:\n      - bash report.sh\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "6",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "priority: 6\nsteps:\n  - group: \"Integration Tests on TPU\"\n    key: \"integration_tpu\"\n    steps:\n      - label: \"E2E Correctness\"\n        key: \"e2e_correctness\"\n        agents:\n          queue: \"kube\"\n        env:\n          SHAPE: \"tpu7x-standard-1t/1x1x1\"\n        commands:\n          - bash test.sh\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "6",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "priority: 6\nx-tpu-defaults: &tpu_defaults\n  agents:\n    queue: \"kube\"\n  env:\n    SHAPE: \"${KUBE_SHAPE_SINGLE:-tpu7x-standard-1t/1x1x1}\"\n\nsteps:\n  - label: \"Unit Tests - CPU (PR)\"\n    key: \"unit_tests_cpu_pr\"\n    if: 'build.env(\"NIGHTLY\") != \"1\"'\n    agents:\n      queue: \"kube\"\n    env:\n      SHAPE: \"cpu\"\n    commands:\n      - pytest\n  - group: \"Unit Tests on TPU\"\n    if: '\"${SKIP_TPU_CI:-0}\" != \"1\"'\n    steps:\n      - label: \"Unit Tests - TPU\"\n        key: \"unit_tests_general_pr\"\n        <<: *tpu_defaults\n        if: 'build.env(\"NIGHTLY\") != \"1\"'\n        commands:\n          - pytest -m tpu_test\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "6",
+              "SKIP_TPU_CI": "0",
+              "OMNI_IMAGE_SKIP": ""
+            },
+            "content": "priority: 6\nsteps:\n  - group: \"Docker Image Build\"\n    key: \"build_docker_group\"\n    steps:\n      - label: \"Build CI image\"\n        key: \"build_docker\"\n        agents:\n          queue: docker-build\n        commands:\n          - echo build\n      - label: \"Build Omni image\"\n        key: \"build_docker_omni\"\n        skip: \"${OMNI_IMAGE_SKIP:-}\"\n        agents:\n          queue: docker-build\n        commands:\n          - echo build-omni\n"
+          }
+        ]
+      }
+    },
+    {
+      "name": "pr_skip_tpu_ci",
+      "input": {
+        "env": {
+          "BUILDKITE_PULL_REQUEST": "123",
+          "BUILDKITE_PULL_REQUEST_LABELS": "ready,run-full-ci,skip-tpu-ci"
+        },
+        "git_diff": [
+          "src/vllm_torchtpu/runner/tpu_runner.py"
+        ]
+      },
+      "expected": {
+        "exit_code": 0,
+        "commands": [
+          "buildkite-agent meta-data set JOB_PRIORITY 6",
+          "buildkite-agent meta-data set WORKLOAD_PRIORITY pre-merge",
+          "git fetch origin main --depth=20 --quiet",
+          "git fetch origin HEAD --depth=20 --quiet",
+          "git diff --name-only origin/main...HEAD",
+          "buildkite-agent meta-data set VLLM_COMMIT_HASH a1b2c3d4e5f6",
+          "buildkite-agent annotate --style info --context full-ci 'Runs the full (nightly) suite (`run-full-ci` label).'",
+          "buildkite-agent annotate --style info --context skip-tpu-ci 'TPU steps not run (`skip-tpu-ci` label); the CPU steps still run.'",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload"
+        ],
+        "metadata": [
+          {
+            "key": "JOB_PRIORITY",
+            "value": "6"
+          },
+          {
+            "key": "WORKLOAD_PRIORITY",
+            "value": "pre-merge"
+          },
+          {
+            "key": "VLLM_COMMIT_HASH",
+            "value": "a1b2c3d4e5f6"
+          }
+        ],
+        "annotations": [
+          {
+            "style": "info",
+            "context": "full-ci",
+            "body": "Runs the full (nightly) suite (`run-full-ci` label)."
+          },
+          {
+            "style": "info",
+            "context": "skip-tpu-ci",
+            "body": "TPU steps not run (`skip-tpu-ci` label); the CPU steps still run."
+          }
+        ],
+        "uploads": [
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "6",
+              "NIGHTLY": "1",
+              "SKIP_TPU_CI": "1"
+            },
+            "content": "priority: 6\nx-tpu-defaults: &tpu_defaults\n  agents:\n    queue: \"kube\"\n  env:\n    SHAPE: \"${KUBE_SHAPE_SINGLE:-tpu7x-standard-1t/1x1x1}\"\n\nsteps:\n  - label: \"Unit Tests - CPU (PR)\"\n    key: \"unit_tests_cpu_pr\"\n    if: '\"1\" != \"1\"'\n    agents:\n      queue: \"kube\"\n    env:\n      SHAPE: \"cpu\"\n    commands:\n      - pytest\n  - group: \"Unit Tests on TPU\"\n    if: '\"${SKIP_TPU_CI:-0}\" != \"1\"'\n    steps:\n      - label: \"Unit Tests - TPU\"\n        key: \"unit_tests_general_pr\"\n        <<: *tpu_defaults\n        if: '\"1\" != \"1\"'\n        commands:\n          - pytest -m tpu_test\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "6",
+              "NIGHTLY": "1",
+              "SKIP_TPU_CI": "1",
+              "OMNI_IMAGE_SKIP": "Only TPU steps use the -omni image; skip-tpu-ci skips them."
+            },
+            "content": "priority: 6\nsteps:\n  - group: \"Docker Image Build\"\n    key: \"build_docker_group\"\n    steps:\n      - label: \"Build CI image\"\n        key: \"build_docker\"\n        agents:\n          queue: docker-build\n        commands:\n          - echo build\n      - label: \"Build Omni image\"\n        key: \"build_docker_omni\"\n        skip: \"${OMNI_IMAGE_SKIP:-}\"\n        agents:\n          queue: docker-build\n        commands:\n          - echo build-omni\n"
+          }
+        ]
+      }
+    },
+    {
+      "name": "pr_run_full_ci",
+      "input": {
+        "env": {
+          "BUILDKITE_PULL_REQUEST": "123",
+          "BUILDKITE_PULL_REQUEST_LABELS": "ready,run-full-ci",
+          "BUILDKITE_BUILD_AUTHOR_EMAIL": "Alice@example.com"
+        },
+        "git_diff": [
+          "src/vllm_torchtpu/runner/tpu_runner.py"
+        ]
+      },
+      "expected": {
+        "exit_code": 0,
+        "commands": [
+          "buildkite-agent meta-data set JOB_PRIORITY 6",
+          "buildkite-agent meta-data set WORKLOAD_PRIORITY pre-merge",
+          "git fetch origin main --depth=20 --quiet",
+          "git fetch origin HEAD --depth=20 --quiet",
+          "git diff --name-only origin/main...HEAD",
+          "buildkite-agent meta-data set VLLM_COMMIT_HASH a1b2c3d4e5f6",
+          "buildkite-agent annotate --style info --context full-ci 'Runs the full (nightly) suite (`run-full-ci` label).'",
+          "buildkite-agent pipeline upload --dry-run --format json",
+          "buildkite-agent pipeline upload --no-interpolation",
+          "buildkite-agent pipeline upload --dry-run --format json",
+          "buildkite-agent pipeline upload --no-interpolation",
+          "buildkite-agent pipeline upload --dry-run --format json",
+          "buildkite-agent pipeline upload --no-interpolation",
+          "buildkite-agent pipeline upload --dry-run --format json",
+          "buildkite-agent pipeline upload --no-interpolation",
+          "buildkite-agent pipeline upload --dry-run --format json",
+          "buildkite-agent pipeline upload --no-interpolation"
+        ],
+        "metadata": [
+          {
+            "key": "JOB_PRIORITY",
+            "value": "6"
+          },
+          {
+            "key": "WORKLOAD_PRIORITY",
+            "value": "pre-merge"
+          },
+          {
+            "key": "VLLM_COMMIT_HASH",
+            "value": "a1b2c3d4e5f6"
+          }
+        ],
+        "annotations": [
+          {
+            "style": "info",
+            "context": "full-ci",
+            "body": "Runs the full (nightly) suite (`run-full-ci` label)."
+          }
+        ],
+        "uploads": [
+          {
+            "args": [
+              "--no-interpolation"
+            ],
+            "env": {
+              "JOB_PRIORITY": "6",
+              "PR_TPU_CONCURRENCY_GROUP": "tpu-pr/alice@example.com",
+              "NIGHTLY": "1",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "{\"priority\": 6, \"steps\": [{\"label\": \"Support matrices and verified commit\", \"key\": \"nightly_report\", \"if\": \"\\\"1\\\" == \\\"1\\\" || build.tag =~ /^v?[0-9]+/\", \"agents\": {\"queue\": \"cpu\"}, \"commands\": [\"bash report.sh\"]}]}\n"
+          },
+          {
+            "args": [
+              "--no-interpolation"
+            ],
+            "env": {
+              "JOB_PRIORITY": "6",
+              "PR_TPU_CONCURRENCY_GROUP": "tpu-pr/alice@example.com",
+              "NIGHTLY": "1",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "{\"priority\": 6, \"steps\": [{\"group\": \"Perf and Eval on TPU\", \"steps\": [{\"label\": \"Perf Suite\", \"if\": \"\\\"1\\\" == \\\"1\\\"\", \"agents\": {\"queue\": \"kube\"}, \"env\": {\"SHAPE\": \"tpu7x-standard-1t/1x1x1\"}, \"commands\": [\"bash bench.sh\"], \"concurrency_group\": \"tpu-pr/alice@example.com\", \"concurrency\": 40, \"concurrency_method\": \"eager\"}]}]}\n"
+          },
+          {
+            "args": [
+              "--no-interpolation"
+            ],
+            "env": {
+              "JOB_PRIORITY": "6",
+              "PR_TPU_CONCURRENCY_GROUP": "tpu-pr/alice@example.com",
+              "NIGHTLY": "1",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "{\"priority\": 6, \"steps\": [{\"group\": \"Integration Tests on TPU\", \"key\": \"integration_tpu\", \"steps\": [{\"label\": \"E2E Correctness\", \"key\": \"e2e_correctness\", \"agents\": {\"queue\": \"kube\"}, \"env\": {\"SHAPE\": \"tpu7x-standard-1t/1x1x1\"}, \"commands\": [\"bash test.sh\"], \"concurrency_group\": \"tpu-pr/alice@example.com\", \"concurrency\": 40, \"concurrency_method\": \"eager\"}]}]}\n"
+          },
+          {
+            "args": [
+              "--no-interpolation"
+            ],
+            "env": {
+              "JOB_PRIORITY": "6",
+              "PR_TPU_CONCURRENCY_GROUP": "tpu-pr/alice@example.com",
+              "NIGHTLY": "1",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "{\"priority\": 6, \"steps\": [{\"label\": \"Unit Tests - CPU (PR)\", \"key\": \"unit_tests_cpu_pr\", \"if\": \"\\\"1\\\" != \\\"1\\\"\", \"agents\": {\"queue\": \"kube\"}, \"env\": {\"SHAPE\": \"cpu\"}, \"commands\": [\"pytest\"]}, {\"group\": \"Unit Tests on TPU\", \"if\": \"\\\"${SKIP_TPU_CI:-0}\\\" != \\\"1\\\"\", \"steps\": [{\"agents\": {\"queue\": \"kube\"}, \"env\": {\"SHAPE\": \"${KUBE_SHAPE_SINGLE:-tpu7x-standard-1t/1x1x1}\"}, \"label\": \"Unit Tests - TPU\", \"key\": \"unit_tests_general_pr\", \"if\": \"\\\"1\\\" != \\\"1\\\"\", \"commands\": [\"pytest -m tpu_test\"], \"concurrency_group\": \"tpu-pr/alice@example.com\", \"concurrency\": 40, \"concurrency_method\": \"eager\"}]}]}\n"
+          },
+          {
+            "args": [
+              "--no-interpolation"
+            ],
+            "env": {
+              "JOB_PRIORITY": "6",
+              "PR_TPU_CONCURRENCY_GROUP": "tpu-pr/alice@example.com",
+              "NIGHTLY": "1",
+              "SKIP_TPU_CI": "0",
+              "OMNI_IMAGE_SKIP": ""
+            },
+            "content": "{\"priority\": 6, \"steps\": [{\"group\": \"Docker Image Build\", \"key\": \"build_docker_group\", \"steps\": [{\"label\": \"Build CI image\", \"key\": \"build_docker\", \"agents\": {\"queue\": \"docker-build\"}, \"commands\": [\"echo build\"]}, {\"label\": \"Build Omni image\", \"key\": \"build_docker_omni\", \"skip\": \"${OMNI_IMAGE_SKIP:-}\", \"agents\": {\"queue\": \"docker-build\"}, \"commands\": [\"echo build-omni\"]}]}]}\n"
+          }
+        ]
+      }
+    },
+    {
+      "name": "pr_run_perf_eval",
+      "input": {
+        "env": {
+          "BUILDKITE_PULL_REQUEST": "123",
+          "BUILDKITE_PULL_REQUEST_LABELS": "ready,run-perf-eval"
+        },
+        "git_diff": [
+          "src/vllm_torchtpu/runner/tpu_runner.py"
+        ]
+      },
+      "expected": {
+        "exit_code": 0,
+        "commands": [
+          "buildkite-agent meta-data set JOB_PRIORITY 6",
+          "buildkite-agent meta-data set WORKLOAD_PRIORITY pre-merge",
+          "git fetch origin main --depth=20 --quiet",
+          "git fetch origin HEAD --depth=20 --quiet",
+          "git diff --name-only origin/main...HEAD",
+          "buildkite-agent meta-data set VLLM_COMMIT_HASH a1b2c3d4e5f6",
+          "buildkite-agent annotate --style info --context perf-eval 'Runs the perf/eval lane (`run-perf-eval` label).'",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload"
+        ],
+        "metadata": [
+          {
+            "key": "JOB_PRIORITY",
+            "value": "6"
+          },
+          {
+            "key": "WORKLOAD_PRIORITY",
+            "value": "pre-merge"
+          },
+          {
+            "key": "VLLM_COMMIT_HASH",
+            "value": "a1b2c3d4e5f6"
+          }
+        ],
+        "annotations": [
+          {
+            "style": "info",
+            "context": "perf-eval",
+            "body": "Runs the perf/eval lane (`run-perf-eval` label)."
+          }
+        ],
+        "uploads": [
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "6",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "priority: 6\nsteps:\n  - label: \"Support matrices and verified commit\"\n    key: \"nightly_report\"\n    if: 'build.env(\"NIGHTLY\") == \"1\" || build.tag =~ /^v?[0-9]+/'\n    agents:\n      queue: cpu\n    commands:\n      - bash report.sh\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "6",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "priority: 6\nsteps:\n  - group: \"Perf and Eval on TPU\"\n    steps:\n      - label: \"Perf Suite\"\n        if: 'build.env(\"NIGHTLY\") == \"1\"'\n        agents:\n          queue: \"kube\"\n        env:\n          SHAPE: \"tpu7x-standard-1t/1x1x1\"\n        commands:\n          - bash bench.sh\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "6",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "priority: 6\nsteps:\n  - group: \"Integration Tests on TPU\"\n    key: \"integration_tpu\"\n    steps:\n      - label: \"E2E Correctness\"\n        key: \"e2e_correctness\"\n        agents:\n          queue: \"kube\"\n        env:\n          SHAPE: \"tpu7x-standard-1t/1x1x1\"\n        commands:\n          - bash test.sh\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "6",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "priority: 6\nx-tpu-defaults: &tpu_defaults\n  agents:\n    queue: \"kube\"\n  env:\n    SHAPE: \"${KUBE_SHAPE_SINGLE:-tpu7x-standard-1t/1x1x1}\"\n\nsteps:\n  - label: \"Unit Tests - CPU (PR)\"\n    key: \"unit_tests_cpu_pr\"\n    if: 'build.env(\"NIGHTLY\") != \"1\"'\n    agents:\n      queue: \"kube\"\n    env:\n      SHAPE: \"cpu\"\n    commands:\n      - pytest\n  - group: \"Unit Tests on TPU\"\n    if: '\"${SKIP_TPU_CI:-0}\" != \"1\"'\n    steps:\n      - label: \"Unit Tests - TPU\"\n        key: \"unit_tests_general_pr\"\n        <<: *tpu_defaults\n        if: 'build.env(\"NIGHTLY\") != \"1\"'\n        commands:\n          - pytest -m tpu_test\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "6",
+              "SKIP_TPU_CI": "0",
+              "OMNI_IMAGE_SKIP": ""
+            },
+            "content": "priority: 6\nsteps:\n  - group: \"Docker Image Build\"\n    key: \"build_docker_group\"\n    steps:\n      - label: \"Build CI image\"\n        key: \"build_docker\"\n        agents:\n          queue: docker-build\n        commands:\n          - echo build\n      - label: \"Build Omni image\"\n        key: \"build_docker_omni\"\n        skip: \"${OMNI_IMAGE_SKIP:-}\"\n        agents:\n          queue: docker-build\n        commands:\n          - echo build-omni\n"
+          }
+        ]
+      }
+    },
+    {
+      "name": "pr_oncall_fix",
+      "input": {
+        "env": {
+          "BUILDKITE_PULL_REQUEST": "123",
+          "BUILDKITE_PULL_REQUEST_LABELS": "ready,oncall-fix"
+        },
+        "git_diff": [
+          "src/vllm_torchtpu/runner/tpu_runner.py"
+        ]
+      },
+      "expected": {
+        "exit_code": 0,
+        "commands": [
+          "buildkite-agent meta-data set JOB_PRIORITY 12",
+          "buildkite-agent meta-data set WORKLOAD_PRIORITY oncall-fix",
+          "buildkite-agent annotate --style warning --context oncall-fix 'Runs at on-call priority (`oncall-fix` label): ahead of every other build, including main.'",
+          "git fetch origin main --depth=20 --quiet",
+          "git fetch origin HEAD --depth=20 --quiet",
+          "git diff --name-only origin/main...HEAD",
+          "buildkite-agent meta-data set VLLM_COMMIT_HASH a1b2c3d4e5f6",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload"
+        ],
+        "metadata": [
+          {
+            "key": "JOB_PRIORITY",
+            "value": "12"
+          },
+          {
+            "key": "WORKLOAD_PRIORITY",
+            "value": "oncall-fix"
+          },
+          {
+            "key": "VLLM_COMMIT_HASH",
+            "value": "a1b2c3d4e5f6"
+          }
+        ],
+        "annotations": [
+          {
+            "style": "warning",
+            "context": "oncall-fix",
+            "body": "Runs at on-call priority (`oncall-fix` label): ahead of every other build, including main."
+          }
+        ],
+        "uploads": [
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "12",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "priority: 12\nsteps:\n  - label: \"Support matrices and verified commit\"\n    key: \"nightly_report\"\n    if: 'build.env(\"NIGHTLY\") == \"1\" || build.tag =~ /^v?[0-9]+/'\n    agents:\n      queue: cpu\n    commands:\n      - bash report.sh\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "12",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "priority: 12\nsteps:\n  - group: \"Integration Tests on TPU\"\n    key: \"integration_tpu\"\n    steps:\n      - label: \"E2E Correctness\"\n        key: \"e2e_correctness\"\n        agents:\n          queue: \"kube\"\n        env:\n          SHAPE: \"tpu7x-standard-1t/1x1x1\"\n        commands:\n          - bash test.sh\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "12",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "priority: 12\nx-tpu-defaults: &tpu_defaults\n  agents:\n    queue: \"kube\"\n  env:\n    SHAPE: \"${KUBE_SHAPE_SINGLE:-tpu7x-standard-1t/1x1x1}\"\n\nsteps:\n  - label: \"Unit Tests - CPU (PR)\"\n    key: \"unit_tests_cpu_pr\"\n    if: 'build.env(\"NIGHTLY\") != \"1\"'\n    agents:\n      queue: \"kube\"\n    env:\n      SHAPE: \"cpu\"\n    commands:\n      - pytest\n  - group: \"Unit Tests on TPU\"\n    if: '\"${SKIP_TPU_CI:-0}\" != \"1\"'\n    steps:\n      - label: \"Unit Tests - TPU\"\n        key: \"unit_tests_general_pr\"\n        <<: *tpu_defaults\n        if: 'build.env(\"NIGHTLY\") != \"1\"'\n        commands:\n          - pytest -m tpu_test\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "12",
+              "SKIP_TPU_CI": "0",
+              "OMNI_IMAGE_SKIP": ""
+            },
+            "content": "priority: 12\nsteps:\n  - group: \"Docker Image Build\"\n    key: \"build_docker_group\"\n    steps:\n      - label: \"Build CI image\"\n        key: \"build_docker\"\n        agents:\n          queue: docker-build\n        commands:\n          - echo build\n      - label: \"Build Omni image\"\n        key: \"build_docker_omni\"\n        skip: \"${OMNI_IMAGE_SKIP:-}\"\n        agents:\n          queue: docker-build\n        commands:\n          - echo build-omni\n"
+          }
+        ]
+      }
+    },
+    {
+      "name": "pr_docs_only",
+      "input": {
+        "env": {
+          "BUILDKITE_PULL_REQUEST": "123",
+          "BUILDKITE_PULL_REQUEST_LABELS": "ready"
+        },
+        "git_diff": [
+          "README.md",
+          "docs/getting_started/docker.md",
+          ".pyrefly-baseline.json"
+        ]
+      },
+      "expected": {
+        "exit_code": 0,
+        "commands": [
+          "buildkite-agent meta-data set JOB_PRIORITY 6",
+          "buildkite-agent meta-data set WORKLOAD_PRIORITY pre-merge",
+          "git fetch origin main --depth=20 --quiet",
+          "git fetch origin HEAD --depth=20 --quiet",
+          "git diff --name-only origin/main...HEAD"
+        ],
+        "metadata": [
+          {
+            "key": "JOB_PRIORITY",
+            "value": "6"
+          },
+          {
+            "key": "WORKLOAD_PRIORITY",
+            "value": "pre-merge"
+          }
+        ],
+        "annotations": [],
+        "uploads": []
+      }
+    },
+    {
+      "name": "skip_ci_message",
+      "input": {
+        "env": {
+          "BUILDKITE_PULL_REQUEST": "123",
+          "BUILDKITE_PULL_REQUEST_LABELS": "ready",
+          "BUILDKITE_MESSAGE": "[Doc] Fix typo [skip ci]"
+        },
+        "git_diff": [
+          "src/vllm_torchtpu/runner/tpu_runner.py"
+        ]
+      },
+      "expected": {
+        "exit_code": 0,
+        "commands": [
+          "buildkite-agent meta-data set JOB_PRIORITY 6",
+          "buildkite-agent meta-data set WORKLOAD_PRIORITY pre-merge"
+        ],
+        "metadata": [
+          {
+            "key": "JOB_PRIORITY",
+            "value": "6"
+          },
+          {
+            "key": "WORKLOAD_PRIORITY",
+            "value": "pre-merge"
+          }
+        ],
+        "annotations": [],
+        "uploads": []
+      }
+    },
+    {
+      "name": "main_post_merge_default",
+      "input": {
+        "env": {
+          "BUILDKITE_BRANCH": "main",
+          "BUILDKITE_PULL_REQUEST": "false",
+          "BUILDKITE_SOURCE": "webhook",
+          "BUILDKITE_MESSAGE": "[Core] Improve runner (#456)"
+        },
+        "git_diff": [
+          "src/vllm_torchtpu/runner/tpu_runner.py"
+        ],
+        "github_labels": {
+          "456": [
+            "ready"
+          ]
+        }
+      },
+      "expected": {
+        "exit_code": 0,
+        "commands": [
+          "buildkite-agent meta-data set JOB_PRIORITY 11",
+          "buildkite-agent meta-data set WORKLOAD_PRIORITY post-merge",
+          "git fetch origin HEAD --depth=2 --quiet",
+          "git diff --name-only 'HEAD^' HEAD",
+          "buildkite-agent meta-data set VLLM_COMMIT_HASH a1b2c3d4e5f6",
+          "github-api GET /repos/vllm-project/vllm-torchtpu/issues/456/labels auth=none",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload"
+        ],
+        "metadata": [
+          {
+            "key": "JOB_PRIORITY",
+            "value": "11"
+          },
+          {
+            "key": "WORKLOAD_PRIORITY",
+            "value": "post-merge"
+          },
+          {
+            "key": "VLLM_COMMIT_HASH",
+            "value": "a1b2c3d4e5f6"
+          }
+        ],
+        "annotations": [],
+        "uploads": [
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "11",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "priority: 11\nsteps:\n  - label: \"Support matrices and verified commit\"\n    key: \"nightly_report\"\n    if: 'build.env(\"NIGHTLY\") == \"1\" || build.tag =~ /^v?[0-9]+/'\n    agents:\n      queue: cpu\n    commands:\n      - bash report.sh\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "11",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "priority: 11\nsteps:\n  - group: \"Integration Tests on TPU\"\n    key: \"integration_tpu\"\n    steps:\n      - label: \"E2E Correctness\"\n        key: \"e2e_correctness\"\n        agents:\n          queue: \"kube\"\n        env:\n          SHAPE: \"tpu7x-standard-1t/1x1x1\"\n        commands:\n          - bash test.sh\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "11",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "priority: 11\nx-tpu-defaults: &tpu_defaults\n  agents:\n    queue: \"kube\"\n  env:\n    SHAPE: \"${KUBE_SHAPE_SINGLE:-tpu7x-standard-1t/1x1x1}\"\n\nsteps:\n  - label: \"Unit Tests - CPU (PR)\"\n    key: \"unit_tests_cpu_pr\"\n    if: 'build.env(\"NIGHTLY\") != \"1\"'\n    agents:\n      queue: \"kube\"\n    env:\n      SHAPE: \"cpu\"\n    commands:\n      - pytest\n  - group: \"Unit Tests on TPU\"\n    if: '\"${SKIP_TPU_CI:-0}\" != \"1\"'\n    steps:\n      - label: \"Unit Tests - TPU\"\n        key: \"unit_tests_general_pr\"\n        <<: *tpu_defaults\n        if: 'build.env(\"NIGHTLY\") != \"1\"'\n        commands:\n          - pytest -m tpu_test\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "11",
+              "SKIP_TPU_CI": "0",
+              "OMNI_IMAGE_SKIP": ""
+            },
+            "content": "priority: 11\nsteps:\n  - group: \"Docker Image Build\"\n    key: \"build_docker_group\"\n    steps:\n      - label: \"Build CI image\"\n        key: \"build_docker\"\n        agents:\n          queue: docker-build\n        commands:\n          - echo build\n      - label: \"Build Omni image\"\n        key: \"build_docker_omni\"\n        skip: \"${OMNI_IMAGE_SKIP:-}\"\n        agents:\n          queue: docker-build\n        commands:\n          - echo build-omni\n"
+          }
+        ]
+      }
+    },
+    {
+      "name": "main_post_merge_skip_tpu_ci",
+      "input": {
+        "env": {
+          "BUILDKITE_BRANCH": "main",
+          "BUILDKITE_PULL_REQUEST": "false",
+          "BUILDKITE_SOURCE": "webhook",
+          "BUILDKITE_MESSAGE": "[CI/Build] Adjust script (#457)"
+        },
+        "git_diff": [
+          ".buildkite/scripts/nightly_report.sh"
+        ],
+        "github_labels": {
+          "457": [
+            "ready",
+            "skip-tpu-ci"
+          ]
+        }
+      },
+      "expected": {
+        "exit_code": 0,
+        "commands": [
+          "buildkite-agent meta-data set JOB_PRIORITY 11",
+          "buildkite-agent meta-data set WORKLOAD_PRIORITY post-merge",
+          "git fetch origin HEAD --depth=2 --quiet",
+          "git diff --name-only 'HEAD^' HEAD",
+          "buildkite-agent meta-data set VLLM_COMMIT_HASH a1b2c3d4e5f6",
+          "github-api GET /repos/vllm-project/vllm-torchtpu/issues/457/labels auth=none",
+          "buildkite-agent annotate --style info --context skip-tpu-ci 'TPU steps not run (`skip-tpu-ci` label); the CPU steps still run.'",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload"
+        ],
+        "metadata": [
+          {
+            "key": "JOB_PRIORITY",
+            "value": "11"
+          },
+          {
+            "key": "WORKLOAD_PRIORITY",
+            "value": "post-merge"
+          },
+          {
+            "key": "VLLM_COMMIT_HASH",
+            "value": "a1b2c3d4e5f6"
+          }
+        ],
+        "annotations": [
+          {
+            "style": "info",
+            "context": "skip-tpu-ci",
+            "body": "TPU steps not run (`skip-tpu-ci` label); the CPU steps still run."
+          }
+        ],
+        "uploads": [
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "11",
+              "SKIP_TPU_CI": "1"
+            },
+            "content": "priority: 11\nx-tpu-defaults: &tpu_defaults\n  agents:\n    queue: \"kube\"\n  env:\n    SHAPE: \"${KUBE_SHAPE_SINGLE:-tpu7x-standard-1t/1x1x1}\"\n\nsteps:\n  - label: \"Unit Tests - CPU (PR)\"\n    key: \"unit_tests_cpu_pr\"\n    if: 'build.env(\"NIGHTLY\") != \"1\"'\n    agents:\n      queue: \"kube\"\n    env:\n      SHAPE: \"cpu\"\n    commands:\n      - pytest\n  - group: \"Unit Tests on TPU\"\n    if: '\"${SKIP_TPU_CI:-0}\" != \"1\"'\n    steps:\n      - label: \"Unit Tests - TPU\"\n        key: \"unit_tests_general_pr\"\n        <<: *tpu_defaults\n        if: 'build.env(\"NIGHTLY\") != \"1\"'\n        commands:\n          - pytest -m tpu_test\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "11",
+              "SKIP_TPU_CI": "1",
+              "OMNI_IMAGE_SKIP": "Only TPU steps use the -omni image; skip-tpu-ci skips them."
+            },
+            "content": "priority: 11\nsteps:\n  - group: \"Docker Image Build\"\n    key: \"build_docker_group\"\n    steps:\n      - label: \"Build CI image\"\n        key: \"build_docker\"\n        agents:\n          queue: docker-build\n        commands:\n          - echo build\n      - label: \"Build Omni image\"\n        key: \"build_docker_omni\"\n        skip: \"${OMNI_IMAGE_SKIP:-}\"\n        agents:\n          queue: docker-build\n        commands:\n          - echo build-omni\n"
+          }
+        ]
+      }
+    },
+    {
+      "name": "nightly_schedule",
+      "input": {
+        "env": {
+          "BUILDKITE_BRANCH": "main",
+          "BUILDKITE_PULL_REQUEST": "false",
+          "BUILDKITE_SOURCE": "schedule",
+          "NIGHTLY": "1"
+        },
+        "git_diff": [
+          "README.md"
+        ]
+      },
+      "expected": {
+        "exit_code": 0,
+        "commands": [
+          "buildkite-agent meta-data set JOB_PRIORITY 1",
+          "buildkite-agent meta-data set VLLM_COMMIT_HASH a1b2c3d4e5f6",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload"
+        ],
+        "metadata": [
+          {
+            "key": "JOB_PRIORITY",
+            "value": "1"
+          },
+          {
+            "key": "VLLM_COMMIT_HASH",
+            "value": "a1b2c3d4e5f6"
+          }
+        ],
+        "annotations": [],
+        "uploads": [
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "1",
+              "NIGHTLY": "1",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "priority: 1\nsteps:\n  - label: \"Support matrices and verified commit\"\n    key: \"nightly_report\"\n    if: '\"1\" == \"1\" || build.tag =~ /^v?[0-9]+/'\n    agents:\n      queue: cpu\n    commands:\n      - bash report.sh\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "1",
+              "NIGHTLY": "1",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "priority: 1\nsteps:\n  - group: \"Perf and Eval on TPU\"\n    steps:\n      - label: \"Perf Suite\"\n        if: '\"1\" == \"1\"'\n        agents:\n          queue: \"kube\"\n        env:\n          SHAPE: \"tpu7x-standard-1t/1x1x1\"\n        commands:\n          - bash bench.sh\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "1",
+              "NIGHTLY": "1",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "priority: 1\nsteps:\n  - group: \"Integration Tests on TPU\"\n    key: \"integration_tpu\"\n    steps:\n      - label: \"E2E Correctness\"\n        key: \"e2e_correctness\"\n        agents:\n          queue: \"kube\"\n        env:\n          SHAPE: \"tpu7x-standard-1t/1x1x1\"\n        commands:\n          - bash test.sh\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "1",
+              "NIGHTLY": "1",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "priority: 1\nx-tpu-defaults: &tpu_defaults\n  agents:\n    queue: \"kube\"\n  env:\n    SHAPE: \"${KUBE_SHAPE_SINGLE:-tpu7x-standard-1t/1x1x1}\"\n\nsteps:\n  - label: \"Unit Tests - CPU (PR)\"\n    key: \"unit_tests_cpu_pr\"\n    if: '\"1\" != \"1\"'\n    agents:\n      queue: \"kube\"\n    env:\n      SHAPE: \"cpu\"\n    commands:\n      - pytest\n  - group: \"Unit Tests on TPU\"\n    if: '\"${SKIP_TPU_CI:-0}\" != \"1\"'\n    steps:\n      - label: \"Unit Tests - TPU\"\n        key: \"unit_tests_general_pr\"\n        <<: *tpu_defaults\n        if: '\"1\" != \"1\"'\n        commands:\n          - pytest -m tpu_test\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "1",
+              "NIGHTLY": "1",
+              "SKIP_TPU_CI": "0",
+              "OMNI_IMAGE_SKIP": ""
+            },
+            "content": "priority: 1\nsteps:\n  - group: \"Docker Image Build\"\n    key: \"build_docker_group\"\n    steps:\n      - label: \"Build CI image\"\n        key: \"build_docker\"\n        agents:\n          queue: docker-build\n        commands:\n          - echo build\n      - label: \"Build Omni image\"\n        key: \"build_docker_omni\"\n        skip: \"${OMNI_IMAGE_SKIP:-}\"\n        agents:\n          queue: docker-build\n        commands:\n          - echo build-omni\n"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ci_lanes_perf",
+      "input": {
+        "env": {
+          "BUILDKITE_BRANCH": "main",
+          "BUILDKITE_PULL_REQUEST": "false",
+          "BUILDKITE_SOURCE": "schedule",
+          "CI_LANES": "perf"
+        },
+        "git_diff": [
+          "src/vllm_torchtpu/runner/tpu_runner.py"
+        ]
+      },
+      "expected": {
+        "exit_code": 0,
+        "commands": [
+          "buildkite-agent meta-data set JOB_PRIORITY 11",
+          "buildkite-agent meta-data set WORKLOAD_PRIORITY post-merge",
+          "buildkite-agent meta-data set VLLM_COMMIT_HASH a1b2c3d4e5f6",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload"
+        ],
+        "metadata": [
+          {
+            "key": "JOB_PRIORITY",
+            "value": "11"
+          },
+          {
+            "key": "WORKLOAD_PRIORITY",
+            "value": "post-merge"
+          },
+          {
+            "key": "VLLM_COMMIT_HASH",
+            "value": "a1b2c3d4e5f6"
+          }
+        ],
+        "annotations": [],
+        "uploads": [
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "11",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "priority: 11\nsteps:\n  - group: \"Perf and Eval on TPU\"\n    steps:\n      - label: \"Perf Suite\"\n        if: 'build.env(\"NIGHTLY\") == \"1\"'\n        agents:\n          queue: \"kube\"\n        env:\n          SHAPE: \"tpu7x-standard-1t/1x1x1\"\n        commands:\n          - bash bench.sh\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "11",
+              "SKIP_TPU_CI": "0",
+              "OMNI_IMAGE_SKIP": "Only the tests lane uses the -omni image; this build has none."
+            },
+            "content": "priority: 11\nsteps:\n  - group: \"Docker Image Build\"\n    key: \"build_docker_group\"\n    steps:\n      - label: \"Build CI image\"\n        key: \"build_docker\"\n        agents:\n          queue: docker-build\n        commands:\n          - echo build\n      - label: \"Build Omni image\"\n        key: \"build_docker_omni\"\n        skip: \"${OMNI_IMAGE_SKIP:-}\"\n        agents:\n          queue: docker-build\n        commands:\n          - echo build-omni\n"
+          }
+        ]
+      }
+    },
+    {
+      "name": "integration_pipeline",
+      "input": {
+        "env": {
+          "BUILDKITE_BRANCH": "main",
+          "BUILDKITE_PULL_REQUEST": "false",
+          "BUILDKITE_SOURCE": "schedule",
+          "BUILDKITE_PIPELINE_SLUG": "vllm-torchtpu-integration"
+        },
+        "git_diff": [
+          "src/vllm_torchtpu/runner/tpu_runner.py"
+        ],
+        "vllm_upstream_head": "9f8e7d6c5b4a3210fedcba9876543210abcdef12"
+      },
+      "expected": {
+        "exit_code": 0,
+        "commands": [
+          "buildkite-agent meta-data set JOB_PRIORITY 11",
+          "buildkite-agent meta-data set WORKLOAD_PRIORITY post-merge",
+          "git ls-remote https://github.com/vllm-project/vllm.git HEAD",
+          "buildkite-agent meta-data set VLLM_COMMIT_HASH 9f8e7d6c5b4a3210fedcba9876543210abcdef12",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload"
+        ],
+        "metadata": [
+          {
+            "key": "JOB_PRIORITY",
+            "value": "11"
+          },
+          {
+            "key": "WORKLOAD_PRIORITY",
+            "value": "post-merge"
+          },
+          {
+            "key": "VLLM_COMMIT_HASH",
+            "value": "9f8e7d6c5b4a3210fedcba9876543210abcdef12"
+          }
+        ],
+        "annotations": [],
+        "uploads": [
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "11"
+            },
+            "content": "priority: 11\nsteps:\n  - wait\n  - label: \":arrow_up: Promote vLLM to Last Known Good (LKG)\"\n    key: \"promote_lkg\"\n    agents:\n      queue: cpu\n    commands:\n      - bash promote.sh\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "11",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "priority: 11\nsteps:\n  - label: \"Support matrices and verified commit\"\n    key: \"nightly_report\"\n    if: 'build.env(\"NIGHTLY\") == \"1\" || build.tag =~ /^v?[0-9]+/'\n    agents:\n      queue: cpu\n    commands:\n      - bash report.sh\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "11",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "priority: 11\nsteps:\n  - group: \"Perf and Eval on TPU\"\n    steps:\n      - label: \"Perf Suite\"\n        if: 'build.env(\"NIGHTLY\") == \"1\"'\n        agents:\n          queue: \"kube\"\n        env:\n          SHAPE: \"tpu7x-standard-1t/1x1x1\"\n        commands:\n          - bash bench.sh\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "11",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "priority: 11\nsteps:\n  - group: \"Integration Tests on TPU\"\n    key: \"integration_tpu\"\n    steps:\n      - label: \"E2E Correctness\"\n        key: \"e2e_correctness\"\n        agents:\n          queue: \"kube\"\n        env:\n          SHAPE: \"tpu7x-standard-1t/1x1x1\"\n        commands:\n          - bash test.sh\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "11",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "priority: 11\nx-tpu-defaults: &tpu_defaults\n  agents:\n    queue: \"kube\"\n  env:\n    SHAPE: \"${KUBE_SHAPE_SINGLE:-tpu7x-standard-1t/1x1x1}\"\n\nsteps:\n  - label: \"Unit Tests - CPU (PR)\"\n    key: \"unit_tests_cpu_pr\"\n    if: 'build.env(\"NIGHTLY\") != \"1\"'\n    agents:\n      queue: \"kube\"\n    env:\n      SHAPE: \"cpu\"\n    commands:\n      - pytest\n  - group: \"Unit Tests on TPU\"\n    if: '\"${SKIP_TPU_CI:-0}\" != \"1\"'\n    steps:\n      - label: \"Unit Tests - TPU\"\n        key: \"unit_tests_general_pr\"\n        <<: *tpu_defaults\n        if: 'build.env(\"NIGHTLY\") != \"1\"'\n        commands:\n          - pytest -m tpu_test\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "11",
+              "SKIP_TPU_CI": "0",
+              "OMNI_IMAGE_SKIP": ""
+            },
+            "content": "priority: 11\nsteps:\n  - group: \"Docker Image Build\"\n    key: \"build_docker_group\"\n    steps:\n      - label: \"Build CI image\"\n        key: \"build_docker\"\n        agents:\n          queue: docker-build\n        commands:\n          - echo build\n      - label: \"Build Omni image\"\n        key: \"build_docker_omni\"\n        skip: \"${OMNI_IMAGE_SKIP:-}\"\n        agents:\n          queue: docker-build\n        commands:\n          - echo build-omni\n"
+          }
+        ]
+      }
+    },
+    {
+      "name": "release_tag",
+      "input": {
+        "env": {
+          "BUILDKITE_BRANCH": "v0.19.0",
+          "BUILDKITE_TAG": "v0.19.0",
+          "BUILDKITE_PULL_REQUEST": "false",
+          "BUILDKITE_SOURCE": "webhook",
+          "BUILDKITE_COMMIT": "v0.19.0"
+        },
+        "git_diff": [
+          "pyproject.toml"
+        ]
+      },
+      "expected": {
+        "exit_code": 0,
+        "commands": [
+          "buildkite-agent meta-data set JOB_PRIORITY 2",
+          "git fetch origin v0.19.0 --depth=2 --quiet",
+          "git diff --name-only 'v0.19.0^' v0.19.0",
+          "buildkite-agent meta-data set VLLM_COMMIT_HASH a1b2c3d4e5f6",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload"
+        ],
+        "metadata": [
+          {
+            "key": "JOB_PRIORITY",
+            "value": "2"
+          },
+          {
+            "key": "VLLM_COMMIT_HASH",
+            "value": "a1b2c3d4e5f6"
+          }
+        ],
+        "annotations": [],
+        "uploads": [
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "2",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "priority: 2\nsteps:\n  - label: \"Support matrices and verified commit\"\n    key: \"nightly_report\"\n    if: 'build.env(\"NIGHTLY\") == \"1\" || build.tag =~ /^v?[0-9]+/'\n    agents:\n      queue: cpu\n    commands:\n      - bash report.sh\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "2",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "priority: 2\nsteps:\n  - group: \"Integration Tests on TPU\"\n    key: \"integration_tpu\"\n    steps:\n      - label: \"E2E Correctness\"\n        key: \"e2e_correctness\"\n        agents:\n          queue: \"kube\"\n        env:\n          SHAPE: \"tpu7x-standard-1t/1x1x1\"\n        commands:\n          - bash test.sh\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "2",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "priority: 2\nx-tpu-defaults: &tpu_defaults\n  agents:\n    queue: \"kube\"\n  env:\n    SHAPE: \"${KUBE_SHAPE_SINGLE:-tpu7x-standard-1t/1x1x1}\"\n\nsteps:\n  - label: \"Unit Tests - CPU (PR)\"\n    key: \"unit_tests_cpu_pr\"\n    if: 'build.env(\"NIGHTLY\") != \"1\"'\n    agents:\n      queue: \"kube\"\n    env:\n      SHAPE: \"cpu\"\n    commands:\n      - pytest\n  - group: \"Unit Tests on TPU\"\n    if: '\"${SKIP_TPU_CI:-0}\" != \"1\"'\n    steps:\n      - label: \"Unit Tests - TPU\"\n        key: \"unit_tests_general_pr\"\n        <<: *tpu_defaults\n        if: 'build.env(\"NIGHTLY\") != \"1\"'\n        commands:\n          - pytest -m tpu_test\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "2",
+              "SKIP_TPU_CI": "0",
+              "OMNI_IMAGE_SKIP": ""
+            },
+            "content": "priority: 2\nsteps:\n  - group: \"Docker Image Build\"\n    key: \"build_docker_group\"\n    steps:\n      - label: \"Build CI image\"\n        key: \"build_docker\"\n        agents:\n          queue: docker-build\n        commands:\n          - echo build\n      - label: \"Build Omni image\"\n        key: \"build_docker_omni\"\n        skip: \"${OMNI_IMAGE_SKIP:-}\"\n        agents:\n          queue: docker-build\n        commands:\n          - echo build-omni\n"
+          }
+        ]
+      }
+    },
+    {
+      "name": "vllm_commit_hash_override",
+      "input": {
+        "env": {
+          "BUILDKITE_BRANCH": "feature-branch",
+          "BUILDKITE_PULL_REQUEST": "false",
+          "BUILDKITE_SOURCE": "ui",
+          "VLLM_COMMIT_HASH_OVERRIDE": "deadbeefcafe1234"
+        },
+        "git_diff": [
+          "src/vllm_torchtpu/runner/tpu_runner.py"
+        ]
+      },
+      "expected": {
+        "exit_code": 0,
+        "commands": [
+          "buildkite-agent meta-data set JOB_PRIORITY 2",
+          "git fetch origin HEAD --depth=2 --quiet",
+          "git diff --name-only 'HEAD^' HEAD",
+          "buildkite-agent meta-data set VLLM_COMMIT_HASH deadbeefcafe1234",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload",
+          "buildkite-agent pipeline upload"
+        ],
+        "metadata": [
+          {
+            "key": "JOB_PRIORITY",
+            "value": "2"
+          },
+          {
+            "key": "VLLM_COMMIT_HASH",
+            "value": "deadbeefcafe1234"
+          }
+        ],
+        "annotations": [],
+        "uploads": [
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "2",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "priority: 2\nsteps:\n  - label: \"Support matrices and verified commit\"\n    key: \"nightly_report\"\n    if: 'build.env(\"NIGHTLY\") == \"1\" || build.tag =~ /^v?[0-9]+/'\n    agents:\n      queue: cpu\n    commands:\n      - bash report.sh\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "2",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "priority: 2\nsteps:\n  - group: \"Integration Tests on TPU\"\n    key: \"integration_tpu\"\n    steps:\n      - label: \"E2E Correctness\"\n        key: \"e2e_correctness\"\n        agents:\n          queue: \"kube\"\n        env:\n          SHAPE: \"tpu7x-standard-1t/1x1x1\"\n        commands:\n          - bash test.sh\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "2",
+              "SKIP_TPU_CI": "0"
+            },
+            "content": "priority: 2\nx-tpu-defaults: &tpu_defaults\n  agents:\n    queue: \"kube\"\n  env:\n    SHAPE: \"${KUBE_SHAPE_SINGLE:-tpu7x-standard-1t/1x1x1}\"\n\nsteps:\n  - label: \"Unit Tests - CPU (PR)\"\n    key: \"unit_tests_cpu_pr\"\n    if: 'build.env(\"NIGHTLY\") != \"1\"'\n    agents:\n      queue: \"kube\"\n    env:\n      SHAPE: \"cpu\"\n    commands:\n      - pytest\n  - group: \"Unit Tests on TPU\"\n    if: '\"${SKIP_TPU_CI:-0}\" != \"1\"'\n    steps:\n      - label: \"Unit Tests - TPU\"\n        key: \"unit_tests_general_pr\"\n        <<: *tpu_defaults\n        if: 'build.env(\"NIGHTLY\") != \"1\"'\n        commands:\n          - pytest -m tpu_test\n"
+          },
+          {
+            "args": [],
+            "env": {
+              "JOB_PRIORITY": "2",
+              "SKIP_TPU_CI": "0",
+              "OMNI_IMAGE_SKIP": ""
+            },
+            "content": "priority: 2\nsteps:\n  - group: \"Docker Image Build\"\n    key: \"build_docker_group\"\n    steps:\n      - label: \"Build CI image\"\n        key: \"build_docker\"\n        agents:\n          queue: docker-build\n        commands:\n          - echo build\n      - label: \"Build Omni image\"\n        key: \"build_docker_omni\"\n        skip: \"${OMNI_IMAGE_SKIP:-}\"\n        agents:\n          queue: docker-build\n        commands:\n          - echo build-omni\n"
+          }
+        ]
+      }
+    },
+    {
+      "name": "invalid_ci_lanes",
+      "input": {
+        "env": {
+          "BUILDKITE_BRANCH": "main",
+          "BUILDKITE_PULL_REQUEST": "false",
+          "BUILDKITE_SOURCE": "schedule",
+          "CI_LANES": "bogus"
+        },
+        "git_diff": [
+          "src/vllm_torchtpu/runner/tpu_runner.py"
+        ]
+      },
+      "expected": {
+        "exit_code": 1,
+        "commands": [
+          "buildkite-agent meta-data set JOB_PRIORITY 11",
+          "buildkite-agent meta-data set WORKLOAD_PRIORITY post-merge",
+          "buildkite-agent meta-data set VLLM_COMMIT_HASH a1b2c3d4e5f6"
+        ],
+        "metadata": [
+          {
+            "key": "JOB_PRIORITY",
+            "value": "11"
+          },
+          {
+            "key": "WORKLOAD_PRIORITY",
+            "value": "post-merge"
+          },
+          {
+            "key": "VLLM_COMMIT_HASH",
+            "value": "a1b2c3d4e5f6"
+          }
+        ],
+        "annotations": [],
+        "uploads": []
+      }
+    }
+  ]
+}
