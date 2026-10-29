@@ -133,7 +133,7 @@ steps:
   - group: "DeepSeek-V4.1-Flash on TPU"
     depends_on: "build_docker"
     steps:
-      - label: "DeepSeek-V4.1-Flash: DP8 full-forward smoke + GSM8K"
+      - label: "DeepSeek-V4.1-Flash: DP8 C384 DSpark + full GSM8K"
         key: "dsv41_flash_dp8_ep_gsm8k"
         timeout_in_minutes: 180
         agents:
@@ -148,7 +148,7 @@ steps:
             env MODEL_URI=gs://wdhongtw-hf-flat/deepseek-ai/DeepSeek-V4.1-Flash
             bash ./scripts/vllm/benchmarking/run_eval_flow.sh
             --config deepseek-v41-flash-dp8-ep
-            --run-lm-eval --skip-perf-check
+            --run-lm-eval --lm-eval-limit none --skip-perf-check
             --results-dir /perf_eval_results/deepseek-v41-flash-dp8-ep
         artifact_paths:
           - "perf_eval_results/**/*"

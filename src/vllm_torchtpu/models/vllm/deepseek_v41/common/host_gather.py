@@ -3,10 +3,22 @@
 """Gather paired host embedding rows without separate tensor dispatches."""
 
 import ctypes
+import os
+from concurrent.futures import ThreadPoolExecutor
+from functools import cache
 
 import numpy as np
 import torch
 from numba import njit
+
+
+@cache
+def _gather_pool() -> ThreadPoolExecutor:
+    # The caller copies one half; one persistent worker copies the other.
+    return ThreadPoolExecutor(max_workers=1, thread_name_prefix="engram-gather")
+
+
+os.register_at_fork(after_in_child=_gather_pool.cache_clear)
 
 
 @njit(nogil=True, cache=True)
@@ -37,7 +49,7 @@ def gather_weight_scale(
     raw_out: torch.Tensor,
     scale_out: torch.Tensor,
 ) -> None:
-    """Copy both byte tables into caller-owned CPU buffers in one row loop."""
+    """Gather paired rows with two copy threads and compiled row copies."""
     tensors = (weight, scales, indices, raw_out, scale_out)
     if any(tensor.device.type != "cpu" for tensor in tensors):
         raise ValueError("Paired host gather requires CPU tensors")
@@ -62,13 +74,37 @@ def gather_weight_scale(
     if indices.ndim == 1:
         index_array = index_array[:, None]
     with torch.profiler.record_function("engram::gather_weight_scale"):
-        _gather_weight_scale(
-            _host_array(weight, np.dtype(np.uint8)),
-            _host_array(scales, np.dtype(np.uint8)),
-            index_array,
-            _host_array(raw_out, np.dtype(np.uint8)),
-            _host_array(scale_out, np.dtype(np.uint8)),
+        weight_array = _host_array(weight, np.dtype(np.uint8))
+        scale_array = _host_array(scales, np.dtype(np.uint8))
+        raw_array = _host_array(raw_out, np.dtype(np.uint8))
+        scale_out_array = _host_array(scale_out, np.dtype(np.uint8))
+        tokens, heads = index_array.shape
+        if tokens < 2:
+            _gather_weight_scale(
+                weight_array, scale_array, index_array, raw_array, scale_out_array
+            )
+            return
+        middle = tokens // 2
+        pool = _gather_pool()
+        future = pool.submit(
+            _gather_weight_scale,
+            weight_array,
+            scale_array,
+            index_array[:middle],
+            raw_array[: middle * heads],
+            scale_out_array[: middle * heads],
         )
+        try:
+            _gather_weight_scale(
+                weight_array,
+                scale_array,
+                index_array[middle:],
+                raw_array[middle * heads :],
+                scale_out_array[middle * heads :],
+            )
+        finally:
+            # Even on failure, no writer may outlive the borrowed tensor storage.
+            future.result()
 
 
 def _host_array(tensor: torch.Tensor, dtype: np.dtype) -> np.ndarray:

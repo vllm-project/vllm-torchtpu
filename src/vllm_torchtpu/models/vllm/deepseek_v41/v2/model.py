@@ -630,6 +630,27 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             # Enqueue the lookup without blocking CPU Engram preparation behind
             # the previous chunk. The compiled stage consumes its device buffer.
             synchronize_tensors((inputs_embeds,), wait=False)
+        if self._ced_enabled:
+            context = upstream.get_forward_context()
+            metadata = context.attn_metadata
+            first = (
+                next(iter(metadata.values())) if isinstance(metadata, dict) else None
+            )
+            # Upload window bounds before Engram's blocking hash D2H.
+            requests = first.seq_lens.shape[0] if first is not None else 1
+            hits = tuple(getattr(first, "replay_starts_cpu", None) or ())[:requests]
+            window_starts = torch.tensor(
+                hits + (0,) * (requests - len(hits)),
+                dtype=positions.dtype,
+                device=positions.device,
+            )
+            encoder_context = replace(
+                context,
+                additional_kwargs={
+                    **context.additional_kwargs,
+                    "deepseek_v41_window_starts": window_starts,
+                },
+            )
         offload_engram = self._has_cpu_offloaded_engram()
         if offload_engram:
             input_ids_prep = (
@@ -655,26 +676,8 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     inputs_embeds,
                     lookback_token_ids,
                 )
-            context = upstream.get_forward_context()
-            metadata = context.attn_metadata
-            first = (
-                next(iter(metadata.values())) if isinstance(metadata, dict) else None
-            )
-            # Keep the window bounds upload after Engram's blocking hash D2H.
-            requests = first.seq_lens.shape[0] if first is not None else 1
-            hits = tuple(getattr(first, "replay_starts_cpu", None) or ())[:requests]
-            window_starts = torch.tensor(
-                hits + (0,) * (requests - len(hits)),
-                dtype=positions.dtype,
-                device=positions.device,
-            )
-            encoder_context = replace(
-                context,
-                additional_kwargs={
-                    **context.additional_kwargs,
-                    "deepseek_v41_window_starts": window_starts,
-                },
-            )
+            # CED locals are initialized above; the non-CED path returns early.
+            # pyrefly: ignore[unbound-name]
             with override_forward_context(encoder_context):
                 if getattr(self, "_engram_split_layer", None) is None:
                     encoded = self.encoder_stage(
@@ -705,6 +708,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         else:
             hidden, pre_mix = encoded
             encoder_aux = []
+        # pyrefly: ignore[unbound-name]
         if context.dp_metadata is not None and hidden.device.type == "tpu":
             # Host bucket coordination depends only on scheduling metadata.
             # Enqueue the encoder before Gloo waits for other DP replicas.
@@ -716,6 +720,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 positions.shape[0],
                 self._ced_compile_sizes,
             )
+            # pyrefly: ignore[unbound-name]
             if first is not None
             else None
         )
@@ -743,6 +748,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 synchronize_tensors((hidden, pre_mix))
 
         if plan is None:
+            # pyrefly: ignore[unbound-name]
             decoder_metadata = metadata
             decoder_positions, decoder_ids = positions, input_ids
             decoder_hidden, decoder_mix = hidden, pre_mix
@@ -778,6 +784,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 key: replace(
                     value, input_positions=decoder_positions, query_start_loc=bounds
                 )
+                # pyrefly: ignore[unbound-name]
                 for key, value in metadata.items()
             }
             decoder_padding = torch.arange(

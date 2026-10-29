@@ -136,8 +136,14 @@ persistent compilation caches disabled and no profile: prefill runs one warmup
 plus five formal rounds; decode runs one warmup plus one formal round.
 They already avoid a second server start,
 so skipping the diagnostic prefill warmup does not speed up these CI cases.
-The quality lane uses `deepseek-v41-flash-dp8-ep` with full forward and
-the inherited GSM8K accuracy floor. TP8 serving recipes have been removed.
+The quality lane evaluates the complete GSM8K test split with 384 client requests
+in flight and 48 requests per DP rank. `deepseek-v41-flash-dp8-ep` uses the decode
+benchmark's CED, DSpark K5, FP8 KV, Engram offload, topology MoE preprocessing,
+98,816-token context limit and `[288,2048]` compile buckets. It retains the
+inherited GSM8K quality floor. GSM8K keeps its natural prompts and generation
+lengths; the concurrency setting does not imply a continuously full decode batch.
+`run_eval_flow.sh --lm-eval-limit none` selects the full split; numeric limits
+remain available for smoke runs. TP8 serving recipes have been removed.
 
 The same lane runs these CPU regressions on PRs as well as branch builds; the
 expensive DP8 benchmarks remain branch-only:
