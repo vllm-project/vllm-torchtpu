@@ -572,7 +572,12 @@ def test_metadata_has_one_serving_config_with_what_the_runtime_reads(tmp_path) -
 def test_metadata_declares_the_speculative_config_it_was_exported_with(
     tmp_path,
 ) -> None:
-    speculative = {"method": "mtp", "num_speculative_tokens": 1}
+    speculative = {
+        "method": "ngram",
+        "num_speculative_tokens": 4,
+        "prompt_lookup_max": 3,
+        "prompt_lookup_min": 3,
+    }
     cfg = api.TextOnlyLLMExportConfig(
         model_name="tiny-torch",
         vocab_size=32,
@@ -705,23 +710,41 @@ def test_parse_args_takes_the_vllm_serve_command_line(capsys) -> None:
         assert flag not in ignored, ignored
 
 
-def test_export_speculative_config_is_none_without_the_flag() -> None:
+def test_export_speculative_config_keeps_vllm_field_names() -> None:
     assert cli.export_speculative_config(None) is None
+    assert cli.export_speculative_config(
+        '{"method": "ngram", "num_speculative_tokens": 4, "prompt_lookup_max": 3}'
+    ) == {
+        "method": "ngram",
+        "num_speculative_tokens": 4,
+        "prompt_lookup_max": 3,
+        "prompt_lookup_min": 3,
+    }
 
 
 @pytest.mark.parametrize(
     "raw, error",
     [
+        ({"method": "mtp", "num_speculative_tokens": 1}, "not supported"),
+        ({"method": "ngram", "prompt_lookup_max": 3}, "num_speculative_tokens"),
+        ({"method": "ngram", "num_speculative_tokens": 2}, "prompt_lookup_max"),
         (
-            '{"method": "ngram", "num_speculative_tokens": 4, "prompt_lookup_max": 3}',
-            "no longer drafts with ngram",
+            {"method": "ngram", "num_speculative_tokens": 0, "prompt_lookup_max": 3},
+            "num_speculative_tokens",
         ),
-        ({"method": "mtp", "num_speculative_tokens": 1}, "not supported yet"),
-        ({"method": "eagle", "num_speculative_tokens": 1}, "not supported yet"),
+        (
+            {
+                "method": "ngram",
+                "num_speculative_tokens": 2,
+                "prompt_lookup_max": 3,
+                "model": "x",
+            },
+            "fields",
+        ),
     ],
 )
-def test_export_speculative_config_rejects_every_method_for_now(
-    raw: Any, error: str
+def test_export_speculative_config_rejects_what_the_runtime_cannot_run(
+    raw: dict[str, Any], error: str
 ) -> None:
     with pytest.raises(ValueError, match=error):
         cli.export_speculative_config(raw)
