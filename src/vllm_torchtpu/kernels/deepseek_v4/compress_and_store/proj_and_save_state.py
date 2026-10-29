@@ -143,8 +143,25 @@ def kernel(
     # A CSA int32 NoPE array hosts the state too; write it as uint8 slabs.
     cache = csa_cache_layout.as_u8_slabs(cache)
     num_m = cfgs.num_m
+    rows_per_token = num_m * slots_per_m_tile
+    # A slot is page * page_size + row, i.e. the row of the flattened cache.
+    cache_rows = cache.reshape(-1, *cache.shape[2:])
+    acc_rows = acc_ref_u8.reshape(-1, *cache.shape[2:])
     for slot in range(tiles_per_block):
         write_counts_ref[slot] = 0
+
+    def _wait_for_writes(buf_idx_val, num_tokens):
+        """Waits for all bytes of ``num_tokens`` state writes from a slot.
+
+        A DMA signals its semaphore by the amount it moved, so the wait is a
+        descriptor of the same total size; only its size is used.
+        """
+        rows = num_tokens * rows_per_token
+        pltpu.make_async_copy(
+            acc_rows.at[pl.ds(0, rows)],
+            cache_rows.at[pl.ds(0, rows)],
+            sem_ref.at[buf_idx_val],
+        ).wait()
 
     def _dma_copy_out(n_idx_val, buf_idx_val):
         """Copys one token tile, every m tile, from accumulator to the KV cache.
@@ -159,8 +176,6 @@ def kernel(
         (however, this is awaiting RAW no-hazard flag to land)
         """
         num_valid_writes = 0
-        # A slot is page * page_size + row, i.e. the row of the flattened cache.
-        cache_rows = cache.reshape(-1, *cache.shape[2:])
         for i in range(tile_n):
             if i % SLOT_LOAD_GROUP == 0:
                 group_slots = [
@@ -237,7 +252,7 @@ def kernel(
 
                 @pl.when(count > 0)
                 def _do_wait():
-                    pl.semaphore_wait(sem_ref.at[buf_idx], count)
+                    _wait_for_writes(buf_idx, count)
 
             # 2. Launch DMA for the PREVIOUS token tile
             if copy_dma:
@@ -333,7 +348,7 @@ def kernel(
 
         @pl.when(count > 0)
         def _wait_epilogue(b=b, count=count):
-            pl.semaphore_wait(sem_ref.at[b], count)
+            _wait_for_writes(b, count)
 
 
 def _select_tile_k(size_k: int, cap: int = 3584, align: int = 128) -> int:
@@ -422,7 +437,7 @@ def proj_and_save_state(
             (cfgs.num_m, tiles_per_block, tile_n, slots_per_m_tile, 1, last_dim),
             jnp.float32,
         ),
-        pltpu.SemaphoreType.REGULAR((tiles_per_block,)),
+        pltpu.SemaphoreType.DMA((tiles_per_block,)),
         pltpu.SMEM((tiles_per_block,), jnp.int32),
     ]
 
