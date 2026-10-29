@@ -242,6 +242,8 @@ if TYPE_CHECKING:
     VLLM_TPU_HOST_PHASES: int = 0
     VLLM_TPU_SERIALIZE_COPY_WAIT: bool = False
     VLLM_TPU_PINNED_TOKEN_COPY: bool = False
+    VLLM_TPU_SAMPLING_PARAMS_REUSE: bool = False
+    VLLM_TPU_STAGE_ENTRIES_CACHE: bool = False
     VLLM_TPU_STALL_WATCHDOG_S: float = 0.0
     VLLM_TPU_SAMPLING_PARAMS_REUSE: bool = False
     VLLM_TPU_CPU_PIN_RESERVE: int = 2
@@ -1503,6 +1505,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Copy sampled tokens into reused pinned host buffers instead of a fresh
     # pageable tensor every step (runner/tpu_runner_async_output.py).
     "VLLM_TPU_PINNED_TOKEN_COPY": env_bool("VLLM_TPU_PINNED_TOKEN_COPY"),
+    # Reuse the padded per-request temperature / top-k / top-p uploads while
+    # their values repeat (tpu_runner._build_padded_sampling_params).
+    "VLLM_TPU_SAMPLING_PARAMS_REUSE": env_bool("VLLM_TPU_SAMPLING_PARAMS_REUSE"),
+    # Keep the per-group (block table, width) list the staged metadata walk
+    # builds, instead of re-walking every KV cache group each step.
+    "VLLM_TPU_STAGE_ENTRIES_CACHE": env_bool("VLLM_TPU_STAGE_ENTRIES_CACHE"),
     # Dump all processes' stacks when no step starts for N s with live
     # requests (stall_watchdog.py; read directly there, registered here).
     "VLLM_TPU_STALL_WATCHDOG_S": env_float("VLLM_TPU_STALL_WATCHDOG_S", 0.0),
