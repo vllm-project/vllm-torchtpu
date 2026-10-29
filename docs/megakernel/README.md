@@ -5,6 +5,8 @@ role runs the tpu-megakernel Pallas kernels instead of vLLM's layer stack.
 vLLM still provides scheduling, prefix caching, the Raiden KV transfer
 between the roles, sampling parameters and the OpenAI API.
 
+For Qwen3.8 on the same backend, see [qwen38.md](qwen38.md).
+
 ## Requirements
 
 - Two 32-chip TPU v7x slices (four hosts each, 2x2x4): one for prefill and
