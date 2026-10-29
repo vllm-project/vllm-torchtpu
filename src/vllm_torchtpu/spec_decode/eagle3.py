@@ -33,6 +33,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
+from vllm_torchtpu.runner import host_phases
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _force_draft_tp1,
@@ -1418,6 +1419,7 @@ class Eagle3Proposer:
         # IndexShare: each chunk's step-0 top-k rows, saved right after its
         # compaction (see _mtp_compact_and_save).
         saved_topk_per_chunk: list[list[torch.Tensor]] = []
+        host_phases.mark("dp_entry")
         for ci, chunk in enumerate(chunks):
             if uses_aux_hidden_state:
                 with set_model_tag("eagle_head"):
@@ -1440,6 +1442,7 @@ class Eagle3Proposer:
                     # MTP: does not use combine_hidden_states
                     target_hidden_states = self._mtp_target_hidden_states(chunk)
 
+            host_phases.mark("dp_target_hidden")
             (input_ids, positions, last_token_indices, num_rejected) = (
                 self._prepare_draft_inputs(
                     chunk,
@@ -1455,6 +1458,7 @@ class Eagle3Proposer:
                     device_seed=device_seed,
                 )
             )
+            host_phases.mark("dp_prepare_inputs")
             rejected_per_chunk.append(num_rejected)
             rejected_np_per_chunk.append(
                 None if isinstance(num_rejected, torch.Tensor) else num_rejected
@@ -1476,6 +1480,7 @@ class Eagle3Proposer:
                     else None
                 ),
             )
+            host_phases.mark("dp_forward0")
             if self._draft_rows:
                 # Back from the fixed draft_rows length to the p carry rows.
                 rows = last_token_indices.shape[0]
@@ -1513,6 +1518,7 @@ class Eagle3Proposer:
                         last_hidden_carry, last_token_indices.ge(0)
                     )
                 )
+            host_phases.mark("dp_carries")
             hidden_carry_per_chunk.append(hidden_carry)
             positions_carry_per_chunk.append(positions_carry)
             with set_model_tag("eagle_head"):
@@ -1520,6 +1526,7 @@ class Eagle3Proposer:
                     [self._draft_propose_token(last_hidden_carry)]
                 )
 
+        host_phases.mark("dp_token0")
         # EP-DP lockstep: a rank with fewer chunks than the step's coordinated
         # bound pads with dummy chunks. Collectives pair across ranks in
         # emission order, so each draft step's padding runs right after this
@@ -1638,6 +1645,7 @@ class Eagle3Proposer:
                     )
                 loop_hidden[ci] = hidden
 
+            host_phases.mark("dp_loop_setup")
             if self._mtp_fused_loop is not None and not runner._dp_lockstep_enabled():
                 # Fused: each chunk's steps 1..K-1 in one dispatch. Chunk-major
                 # is fine here: the separate path is step-major only for
@@ -1676,6 +1684,7 @@ class Eagle3Proposer:
                         run_draft_step(ci, step)
                     pad_dp_draft_step(step)
 
+        host_phases.mark("dp_loop")
         # Assemble [total_num_reqs, K]. Each chunk's tokens are padded to p; slice
         # to the real num_reqs at the end. Sync slices on the host (the [p, K] D2H
         # is constant-shape, so no recompile); async keeps the device slice
@@ -2299,6 +2308,8 @@ class Eagle3Proposer:
             loop_query_start_loc=loop_query_start_loc,
             loop_request_distribution=loop_request_distribution,
         )
+        if step_idx == 0:
+            host_phases.mark("dp_fwd0_metadata")
 
         num_tokens = input_ids.shape[0]
 
@@ -2336,6 +2347,8 @@ class Eagle3Proposer:
                 # only reads the top-k table.
                 model(**kwargs)
                 self._mtp_loop_model_warm = True
+            if step_idx == 0:
+                host_phases.mark("dp_fwd0_ctx")
             out = model(**kwargs)
 
         return self._unwrap_model_out(out)
