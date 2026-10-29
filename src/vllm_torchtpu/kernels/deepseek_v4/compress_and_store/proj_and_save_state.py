@@ -29,6 +29,9 @@ from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 # next to two (tile_k, state_width) bf16 weight buffers (8 MiB at tile_k 2048);
 # 1024 is the largest serving token padding, so every call is a single block.
 MAX_RESIDENT_TOKENS = 1024
+# Slot mappings read from SMEM back to back before their tokens' write DMAs are
+# issued, so the load latency is paid once per group instead of once per token.
+SLOT_LOAD_GROUP = 8
 
 
 @dataclasses.dataclass(frozen=True)
@@ -159,8 +162,12 @@ def kernel(
         # A slot is page * page_size + row, i.e. the row of the flattened cache.
         cache_rows = cache.reshape(-1, *cache.shape[2:])
         for i in range(tile_n):
-            global_token_idx = n_idx_val * tile_n + i
-            global_slot_idx = slot_mapping[global_token_idx]
+            if i % SLOT_LOAD_GROUP == 0:
+                group_slots = [
+                    slot_mapping[n_idx_val * tile_n + t]
+                    for t in range(i, min(i + SLOT_LOAD_GROUP, tile_n))
+                ]
+            global_slot_idx = group_slots[i % SLOT_LOAD_GROUP]
             valid = global_slot_idx >= 0
             num_valid_writes = num_valid_writes + lax.select(valid, 1, 0)
 
