@@ -84,14 +84,14 @@ class TpuCompilationHandle:
 _tpu_backend = TpuBackend()
 
 # How long a rank waits for the rank of its host that compiles a bucket, and
-# how often it looks. The wait is bounded for a peer that never saves the
-# artifact (its serialize() failed, it crashed, or it does not exist); the rank
-# then compiles the bucket itself. A single bucket compiles in well under this
-# even with every rank of the host compiling at once (~165 s for the biggest
-# Qwen3.5-397B bucket at DP8), so a timeout costs one redundant compile rather
-# than stalling startup for an hour.
-PEER_WAIT_S = 600.0
-_PEER_POLL_S = 0.5
+# how often it looks. The owner reports what it built in its precompile
+# progress file (`PrecompileProgress`), so a waiter stops at once when the
+# owner failed a bucket (it compiles it itself) or skipped the whole subgraph
+# (the ranks diverged: the boot fails). The timeout is only the backstop for
+# an owner that reports nothing at all; the boot then fails too, naming it.
+PEER_WAIT_S = float(os.environ.get("TPU_PRECOMPILE_PEER_WAIT_S", "900"))
+_PEER_POLL_S = 5.0
+_PEER_WAIT_LOG_S = 60.0
 # get_attr tensors up to this size are hashed by value; bigger ones, which are
 # weights rather than constants, by dtype and shape.
 _FINGERPRINT_MAX_NUMEL = 1 << 16
@@ -157,8 +157,100 @@ def agree_all_ranks(ok: bool) -> bool:
     return bool(flag.item())
 
 
+class PeerDivergedError(RuntimeError):
+    """The rank that owns a bucket never compiled its subgraph, or never
+    reported back: the ranks are not building the same program, and serving
+    would hang at the first collective. Failing the boot says which rank."""
+
+
+class PrecompileProgress:
+    """One rank's precompile progress for one piecewise subgraph, appended to
+    `rank_<r>_<dp>/.precompile_progress` (JSON lines) next to its artifacts:
+    `start`, then `finish` with the buckets it saved and those it failed.
+    Peers waiting on its artifacts read it to tell a slow owner from one that
+    failed a bucket or skipped the subgraph."""
+
+    FILE = ".precompile_progress"
+
+    def __init__(self, cache_dir: str | None, subgraph: int):
+        self.cache_dir = cache_dir
+        self.subgraph = subgraph
+        self.prefix = os.path.basename(os.path.normpath(cache_dir)) if cache_dir else ""
+        self.saved: list[int] = []
+        self.failed: dict[int, str] = {}
+
+    @staticmethod
+    def _rank_dir(cache_dir: str) -> str:
+        return os.path.dirname(os.path.normpath(cache_dir))
+
+    def _append(self, event: str, **fields: Any) -> None:
+        if not self.cache_dir:
+            return
+        record = dict(
+            event=event, prefix=self.prefix, subgraph=self.subgraph, t=time.time(), **fields
+        )
+        path = os.path.join(self._rank_dir(self.cache_dir), self.FILE)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        except OSError as e:
+            logger.warning("[TpuCompilerAdaptor] Could not record progress: %s", e)
+
+    def started(self) -> None:
+        self._append("start")
+
+    def finished(self) -> None:
+        self._append(
+            "finish",
+            saved=sorted(self.saved),
+            failed={str(k): v for k, v in sorted(self.failed.items())},
+        )
+
+    def owner_records(self, owner_global_rank: int) -> list[dict]:
+        """The owner's progress records (every DP rank dir of that rank)."""
+        if not self.cache_dir:
+            return []
+        root = os.path.dirname(self._rank_dir(self.cache_dir))
+        records: list[dict] = []
+        for path in glob.glob(
+            os.path.join(glob.escape(root), f"rank_{owner_global_rank}_*", self.FILE)
+        ):
+            try:
+                with open(path) as f:
+                    records.extend(json.loads(line) for line in f if line.strip())
+            except (OSError, ValueError):
+                continue
+        return records
+
+    def owner_status(self, owner_global_rank: int, size: int, since: float) -> str:
+        """`pending`, `failed: <reason>`, or `skipped` for the owner's bucket
+        `size` of this subgraph. Skipped: the owner has moved past this
+        subgraph -- started a later one of this module, or recorded something
+        since we began waiting -- without ever starting it."""
+        records = [
+            r for r in self.owner_records(owner_global_rank) if r.get("prefix") == self.prefix
+        ]
+        mine = [r for r in records if r.get("subgraph") == self.subgraph]
+        for r in mine:
+            if r.get("event") == "finish":
+                reason = r.get("failed", {}).get(str(size))
+                if reason is not None:
+                    return f"failed: {reason}"
+                if size not in r.get("saved", []):
+                    return "failed: not built by its owner"
+        if mine:
+            return "pending"
+        later = [r for r in records if r.get("subgraph", -1) > self.subgraph]
+        if later and any(r.get("t", 0) >= since for r in later):
+            return "skipped"
+        return "pending"
+
+
 @contextlib.contextmanager
-def wait_for_peer_artifact(timeout_s: float):
+def wait_for_peer_artifact(
+    timeout_s: float, progress: PrecompileProgress | None = None
+):
     """Within this block, `compile` waits up to `timeout_s` for another rank
     of this host to save the bucket, and replays it, before compiling it.
 
@@ -166,10 +258,20 @@ def wait_for_peer_artifact(timeout_s: float):
     but does not wait for one.
     """
     _peer_wait.timeout_s = timeout_s
+    _peer_wait.progress = progress
     try:
         yield
     finally:
         _peer_wait.timeout_s = 0.0
+        _peer_wait.progress = None
+        _peer_wait.owner = None
+
+
+def set_peer_owner(owner_global_rank: int | None, size: int | None) -> None:
+    """The rank that owns the bucket about to be compiled (inside
+    `wait_for_peer_artifact`)."""
+    _peer_wait.owner = owner_global_rank
+    _peer_wait.size = size
 
 
 def _graph_fingerprint(graph: fx.GraphModule) -> str | None:
@@ -808,12 +910,56 @@ class TpuCompilerAdaptor(CompilerInterface):
         time, or what appeared was built from a different graph -- then the
         ranks do not trace the same program and waiting on would not help.
         """
-        deadline = time.monotonic() + getattr(_peer_wait, "timeout_s", 0.0)
+        timeout_s = getattr(_peer_wait, "timeout_s", 0.0)
+        start = time.monotonic()
+        started_wall = time.time()
+        deadline = start + timeout_s
+        next_log = start + _PEER_WAIT_LOG_S
+        progress = getattr(_peer_wait, "progress", None)
+        owner = getattr(_peer_wait, "owner", None)
+        size = getattr(_peer_wait, "size", None)
         paths = self._peer_paths(key)
         while not paths and time.monotonic() < deadline:
+            if progress is not None and owner is not None and size is not None:
+                status = progress.owner_status(owner, size, started_wall)
+                if status.startswith("failed"):
+                    logger.warning(
+                        "[TpuCompilerAdaptor] rank %d did not build %s (%s); "
+                        "compiling it here",
+                        owner,
+                        key,
+                        status,
+                    )
+                    return None
+                if status == "skipped":
+                    message = (
+                        f"rank {owner} skipped subgraph {progress.subgraph} of "
+                        f"{progress.prefix} (it never started compiling {key}) while "
+                        f"this rank was waiting for it: the ranks are not building "
+                        f"the same program (check rank {owner} for a fallback)"
+                    )
+                    logger.error("[TpuCompilerAdaptor] %s", message)
+                    raise PeerDivergedError(message)
+            now = time.monotonic()
+            if now >= next_log:
+                next_log = now + _PEER_WAIT_LOG_S
+                logger.warning(
+                    "[TpuCompilerAdaptor] waited %.0f s for rank %s's artifact %s",
+                    now - start,
+                    owner,
+                    key,
+                )
             time.sleep(_PEER_POLL_S)
             paths = self._peer_paths(key)
         if not paths:
+            if timeout_s > 0 and owner is not None:
+                message = (
+                    f"rank {owner} reported nothing for {key} in {timeout_s:.0f} s "
+                    "(TPU_PRECOMPILE_PEER_WAIT_S); failing the boot rather than "
+                    "serving a program it may not have built"
+                )
+                logger.error("[TpuCompilerAdaptor] %s", message)
+                raise PeerDivergedError(message)
             return None
         compiled_fn = self._replay(paths[0], graph, was_wrapped, fingerprint)
         return None if compiled_fn is None else (compiled_fn, paths[0])
