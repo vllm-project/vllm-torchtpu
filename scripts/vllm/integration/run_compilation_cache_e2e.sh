@@ -35,8 +35,11 @@
 #            Verifies that generated prompt text matches 100% between Cold and Warm runs
 #            (deterministic generation with temperature=0).
 #   [Test 5] Tier-3 Binary & MD5 Checksum Consistency Check (Cold vs Warm):
-#            Verifies that Tier-3 binary artifacts exist and maintain 100% identical
-#            MD5 checksums between Cold and Warm runs.
+#            Verifies that every Cold-run Tier-3 binary artifact is preserved
+#            with a 100% identical MD5 checksum in the Warm run, and that any
+#            additive Tier-3 .bin file comes strictly from pre-torch.compile
+#            eager weight-loading ops (0.000s spent compiling during/after
+#            torch.compile).
 #
 # Usage: ./scripts/vllm/integration/run_compilation_cache_e2e.sh [model_name]
 # Example: ./scripts/vllm/integration/run_compilation_cache_e2e.sh Qwen/Qwen3-0.6B
@@ -49,10 +52,14 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
 CACHE_DIR="$(mktemp -d /tmp/compilation_cache_e2e_XXXXXX)"
 mkdir -p "${CACHE_DIR}"
 
-# Ensure all temporary cache files are deleted when the script finishes or errors out
+# Ensure all temporary cache files are deleted when the script finishes or errors out,
+# after briefly settling stdout so the Kubernetes remote log collector captures the
+# final [Test N PASSED/FAILED] banner before pod termination.
 cleanup() {
   echo "=== 🧹 Cleaning up temporary compilation cache artifacts... ==="
   rm -rf "${CACHE_DIR}" 2>/dev/null || true
+  sync 2>/dev/null || true
+  sleep "${COMPILATION_CACHE_E2E_LOG_FLUSH_SECS:-3}"
 }
 trap cleanup EXIT
 
@@ -103,11 +110,17 @@ mkdir -p "${TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT}" "${VLLM_CACHE_ROOT}"
 
 TEST_PROMPT="The capital of France is"
 
+COLD_RC=0
 python3 examples/offline_inference.py --model "${MODEL}" \
   --max-model-len 256 --max-num-batched-tokens 256 --max-tokens 8 \
-  --prompt "${TEST_PROMPT}" 2>&1 | tee "${CACHE_DIR}/cold_run.log"
+  --prompt "${TEST_PROMPT}" 2>&1 | tee "${CACHE_DIR}/cold_run.log" || COLD_RC=$?
 
-sync && sleep 10
+sync
+
+if [ "${COLD_RC}" -ne 0 ]; then
+  echo "❌ [Test 1 FAILED] Cold run offline_inference.py exited with status ${COLD_RC}!"
+  exit "${COLD_RC}"
+fi
 
 if grep -q "Compiling FX graph" "${CACHE_DIR}/cold_run.log"; then
   echo "✅ [Test 1 PASSED] Cold run triggered FX graph compilation as expected."
@@ -175,11 +188,17 @@ echo "=== 🏃 [Test 3] Warm Start Cache Hit Verification"
 echo "================================================================="
 clean_tpu_processes
 
+WARM_RC=0
 python3 examples/offline_inference.py --model "${MODEL}" \
   --max-model-len 256 --max-num-batched-tokens 256 --max-tokens 8 \
-  --prompt "${TEST_PROMPT}" 2>&1 | tee "${CACHE_DIR}/warm_run.log"
+  --prompt "${TEST_PROMPT}" 2>&1 | tee "${CACHE_DIR}/warm_run.log" || WARM_RC=$?
 
-sync && sleep 10
+sync
+
+if [ "${WARM_RC}" -ne 0 ]; then
+  echo "❌ [Test 3 FAILED] Warm run offline_inference.py exited with status ${WARM_RC}!"
+  exit "${WARM_RC}"
+fi
 
 # Evaluate total compilation time across all shapes for cold vs warm runs
 COLD_COMP_TIME=$(python3 -c "
@@ -245,23 +264,18 @@ fi
 
 # ==============================================================================
 # [Test 5] Cache File & MD5 Consistency Check (Cold vs Warm)
-# Description: Compares Tier-3 binary artifact MD5sums between Cold and Warm runs
-#              to audit cache file consistency.
+# Description: Verifies that every Cold Tier-3 binary artifact is preserved with
+#              an identical MD5 checksum in the Warm run, and that any additive
+#              Warm .bin entry comes strictly from pre-torch.compile eager
+#              weight-loading ops rather than torch.compile recompilation.
 # ==============================================================================
 echo "================================================================="
 echo "=== 🔍 [Test 5] Cache File & MD5 Consistency Check (Cold vs Warm)"
 echo "================================================================="
-if [ ! -s "${CACHE_DIR}/tier3_cold.txt" ]; then
-  echo "❌ [Test 5 FAILED] No Tier-3 binary cache files were generated!"
-  exit 1
-fi
-
-if diff -u "${CACHE_DIR}/tier3_cold.txt" "${CACHE_DIR}/tier3_warm.txt"; then
-  echo "✅ [Test 5 PASSED] Tier-3 cache files and MD5sums are 100% identical between Cold and Warm runs!"
-else
-  echo "❌ [Test 5 FAILED] Tier-3 cache files or MD5sums changed between Cold and Warm runs!"
-  exit 1
-fi
+python3 ./scripts/vllm/integration/check_tier3_cache_consistency.py \
+  --cold-md5 "${CACHE_DIR}/tier3_cold.txt" \
+  --warm-md5 "${CACHE_DIR}/tier3_warm.txt" \
+  --warm-log "${CACHE_DIR}/warm_run.log"
 
 echo "================================================================="
 echo "🎉 Compilation Cache E2E Test Suite Completed!"
