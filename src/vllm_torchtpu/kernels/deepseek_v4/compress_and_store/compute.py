@@ -225,32 +225,44 @@ def rope_words_tiled(rope_slot_ropped, rope_head_dim):
     return bits | (pltpu.roll(bits, bits.shape[-1] - half, 2) << 16)
 
 
-def merge_rope_row(
-    row,  # (1, 128) int32, the RoPE row as read from HBM
-    kv_slots,  # (tile_n,) int, token index of every token in the tile
-    words,  # rope_words_tiled(...)
-    rope_lane,  # int, lane of RoPE word 0 in `words`
-    n,  # int, the token whose row this is
-):
-    """Writes every tile token whose RoPE lands in token n's row into it.
+def place_rope_words(kv_slots, words, rope_lane):
+    """Every tile token's RoPE words, rotated to their window of its row.
 
+    kv_slots: sequence of tile_n scalar ints. Returns one (row key, window,
+    rotated words) per token; the row key is -1 for a token with no slot.
     Token ``j`` of a row owns words ``[32 j, 32 j + 32)`` (see
-    `csa_cache_layout`), so one rotation puts a token's words in its window.
+    `csa_cache_layout`), and word 0 of `words` (`rope_words_tiled`) is at lane
+    `rope_lane`. The rotations do not depend on which row is being written,
+    so they are done once per tile, ahead of `merge_rope_row`.
     """
     per_row = csa_cache_layout.ROPE_TOKENS_PER_ROW
     width = csa_cache_layout.ROPE_WORDS
-    lanes = row.shape[-1]
-    window = jax.lax.broadcasted_iota(jnp.int32, row.shape, 1) // width
-    curr_slot = kv_slots[n]
-    curr_row = curr_slot // per_row
+    lanes = words.shape[-1]
+    # Powers of two: shifts and masks are floor `//` and `%`, with no sign fix-up.
+    assert per_row & (per_row - 1) == 0 and lanes & (lanes - 1) == 0
+    placed = []
+    for i, slot in enumerate(kv_slots):
+        key = jnp.where(slot >= 0, slot >> (per_row.bit_length() - 1), -1)
+        pos = slot & (per_row - 1)
+        rotation = (pos * width - rope_lane) & (lanes - 1)
+        placed.append((key, pos, pltpu.roll(words[i], rotation, 1)))
+    return placed
 
-    for i in range(kv_slots.shape[0]):
-        slot_i = kv_slots[i]
-        hit = (slot_i >= 0) & (curr_slot >= 0) & (slot_i // per_row == curr_row)
-        pos_i = slot_i % per_row
-        for j in range(per_row):
-            placed = pltpu.roll(words[i], (j * width - rope_lane) % lanes, 1)
-            row = jnp.where(hit & (pos_i == j) & (window == j), placed, row)
+
+def merge_rope_row(
+    row,  # (1, 128) int32, the RoPE row as read from HBM
+    placed,  # place_rope_words(...)
+    n,  # int, the token whose row this is
+):
+    """Writes every tile token whose RoPE lands in token n's row into it."""
+    width = csa_cache_layout.ROPE_WORDS
+    window = jax.lax.broadcasted_iota(jnp.int32, row.shape, 1) >> (
+        width.bit_length() - 1
+    )
+    curr_key = placed[n][0]
+    for key, pos, words in placed:
+        hit = (key == curr_key) & (curr_key >= 0)
+        row = jnp.where(hit & (window == pos), words, row)
     return row
 
 

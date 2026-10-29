@@ -162,10 +162,11 @@ def inner_kernel(
             # `csa_cache_layout`); rope_out_vmem holds each row-writer's row.
             words = compute.rope_words_tiled(rope_ropped, cfgs.dims.rope_head_dim)
             rope_lane = config.LANE - cfgs.dims.rope_head_dim
-            kv_slots = []
-            for i in range(tile_n):
-                kv_slots.append(kv_slot_mapping_ref[global_idx + i])
-            kv_slots = jnp.stack(kv_slots)
+            placed = compute.place_rope_words(
+                [kv_slot_mapping_ref[global_idx + i] for i in range(tile_n)],
+                words,
+                rope_lane,
+            )
             for n in range(tile_n):
                 is_first = is_first_mask_rope_ref[global_idx + n]
 
@@ -173,7 +174,7 @@ def inner_kernel(
                 def _merge_rope():
                     row = pltpu.bitcast(rope_out_vmem[n], jnp.int32)  # (1, 128)
                     rope_out_vmem[n] = pltpu.bitcast(
-                        compute.merge_rope_row(row, kv_slots, words, rope_lane, n),
+                        compute.merge_rope_row(row, placed, n),
                         jnp.uint8,
                     )
 
