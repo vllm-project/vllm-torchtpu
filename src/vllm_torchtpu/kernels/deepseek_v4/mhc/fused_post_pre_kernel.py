@@ -75,20 +75,31 @@ def _fused_kernel(
         x_bf = (shared_ref[...] + x_ref[...].astype(jnp.float32) * routed_scale).astype(
             jnp.bfloat16
         )
-    if res_ref.shape[1] == hidden_size:
-        # One stream standing for hc_mult identical ones (the chain's start).
-        old_bf = [res_ref[...]] * hc_mult
+    single_stream = res_ref.shape[1] == hidden_size
+    if single_stream:
+        # One stream standing for hc_mult identical ones (the chain's start):
+        # sum_i comb_ij * old is (sum_i comb_ij) * old, one term per stream.
+        old_bf = [res_ref[...]]
+        comb_terms = []
+        for j in range(hc_mult):
+            col = comb[:, j : j + 1]
+            for i in range(1, hc_mult):
+                col = col + comb[:, i * hc_mult + j : i * hc_mult + j + 1]
+            comb_terms.append([col])
     else:
         old_bf = [
             res_ref[:, i * hidden_size : (i + 1) * hidden_size] for i in range(hc_mult)
+        ]
+        comb_terms = [
+            [comb[:, k : k + 1] for k in range(j, hc_mult * hc_mult, hc_mult)]
+            for j in range(hc_mult)
         ]
 
     streams_bf = []
     for j in range(hc_mult):
         acc = post[:, j : j + 1] * x_bf.astype(jnp.float32)
-        for i in range(hc_mult):
-            k = i * hc_mult + j
-            acc = acc + comb[:, k : k + 1] * old_bf[i].astype(jnp.float32)
+        for c, old in zip(comb_terms[j], old_bf, strict=True):
+            acc = acc + c * old.astype(jnp.float32)
         # Round to bf16 BEFORE the GEMM: the unfused path's pre reads the
         # bf16 residual that post stored, and parity requires matching it.
         new_bf = acc.astype(jnp.bfloat16)

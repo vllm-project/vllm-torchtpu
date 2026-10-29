@@ -627,6 +627,27 @@ class MhcSingleStreamPallasTpuTest(parameterized.TestCase):
             )
             np.testing.assert_allclose(_to_np(g), _to_np(w), rtol=rtol, atol=atol)
 
+    @parameterized.product(num_tokens=[1, 17, 128, 1024], hidden_size=[256, 4096])
+    def test_seam_matches_repeated_reference(self, num_tokens, hidden_size):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import fused_post_pre_kernel
+
+        args = list(_fused_args(np.random.default_rng(12), num_tokens, hidden_size))
+        res1 = args[1][..., 0, :]
+        args_rep = list(args)
+        args_rep[1] = jnp.repeat(res1[..., None, :], HC_MULT, axis=-2)
+        args[1] = res1
+
+        want = _ref_mhc_fused_post_pre(*args_rep)
+        got = fused_post_pre_kernel.mhc_fused_post_pre(*args, token_block_size=128)
+
+        for g, w, tol in zip(got, want, ("bf16", "f32", "f32", "bf16")):
+            rtol, atol = (
+                (BF16_RTOL, BF16_ATOL)
+                if tol == "bf16"
+                else (FUSED_SMALL_H_RTOL, FUSED_F32_ATOL)
+            )
+            np.testing.assert_allclose(_to_np(g), _to_np(w), rtol=rtol, atol=atol)
+
 
 if __name__ == "__main__":
     absltest.main()
