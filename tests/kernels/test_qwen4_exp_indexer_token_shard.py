@@ -142,6 +142,8 @@ VERIFY_STARTS, VERIFY_CONTEXT = [0, 4, 8, 8], [1661, 1663, 0]
         (VERIFY_STARTS, VERIFY_CONTEXT),
         # A short verify request and a decode: windows hold partial requests.
         ([0, 3, 4, 4], [1661, 1663, 0]),
+        # A request with more rows than a verify (a short prefill piece).
+        ([0, 7, 8, 8], [1661, 1663, 0]),
     ],
 )
 @pytest.mark.parametrize("size", [2, 4, 8])
@@ -172,7 +174,7 @@ def test_request_window_shards_compose_to_the_pooled_step(
     np.testing.assert_array_equal(
         np.asarray(new_pool).view(np.uint8), np.asarray(want_pool).view(np.uint8)
     )
-    window = pooled_qsa.request_window_shape(slots, size, 4)
+    window = pooled_qsa.request_window_shape(tokens, size)
     assert results[0][-1].shape[0] == window[1]
     gathered = jnp.concatenate([result[-1] for result in results])
     _, out, selected = jax.jit(
@@ -191,24 +193,23 @@ def test_request_window_shards_compose_to_the_pooled_step(
 
 
 def test_request_window_layout():
-    starts = jnp.asarray([0, 4, 8, 12, 13, 13], jnp.int32)
-    context = jnp.asarray([10, 20, 30, 40, 0], jnp.int32)
-    table = jnp.arange(10, dtype=jnp.int32).reshape(5, 2)
+    # Rows 0-3 request 0, 4-9 request 1, 10-12 request 2, request 3 idle.
+    starts = jnp.asarray([0, 4, 10, 13, 13], jnp.int32)
+    context = jnp.asarray([10, 20, 30, 0], jnp.int32)
+    table = jnp.arange(8, dtype=jnp.int32).reshape(4, 2)
+    width, window = pooled_qsa.request_window_shape(14, 2)
+    assert (width, window) == (7, 8)
     first, sub, ctx, rows, own = pooled_qsa.request_window_step(
-        starts, context, table, jnp.asarray([1], jnp.int32), 2, 8
+        starts, context, table, jnp.asarray([1], jnp.int32), width, window
     )
-    assert int(first) == 2
-    np.testing.assert_array_equal(np.asarray(sub), [0, 4, 5])
-    np.testing.assert_array_equal(np.asarray(ctx), [30, 40])
-    np.testing.assert_array_equal(np.asarray(rows), [[4, 5], [6, 7]])
-    np.testing.assert_array_equal(np.asarray(own(jnp.arange(16))), np.arange(8, 16))
-    # The last window pads past the step's slots with empty requests.
-    first, sub, ctx, rows, own = pooled_qsa.request_window_step(
-        starts, context, table, jnp.asarray([2], jnp.int32), 2, 8
+    # Window 1 owns rows 7-13: request 1's last three rows, then request 2.
+    assert int(first) == 1
+    np.testing.assert_array_equal(np.asarray(sub), [0, 3, 6, 6, 6, 6, 6, 6])
+    np.testing.assert_array_equal(np.asarray(ctx), [23, 30, 0, 0, 0, 0, 0])
+    np.testing.assert_array_equal(np.asarray(rows[:3]), [[2, 3], [4, 5], [6, 7]])
+    np.testing.assert_array_equal(np.asarray(own(jnp.arange(14))), [7, 8, 9, 10, 11, 12, 13, 0])
+    gathered = jnp.arange(16)[:, None] * jnp.ones((1, 3), jnp.int32)
+    merged = pooled_qsa.request_window_merge(gathered, 14, width, window)
+    np.testing.assert_array_equal(
+        np.asarray(merged[:, 0]), [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14]
     )
-    np.testing.assert_array_equal(np.asarray(sub), [0, 0, 0])
-    np.testing.assert_array_equal(np.asarray(ctx), [0, 0])
-    gathered = jnp.arange(24)[:, None] * jnp.ones((1, 3), jnp.int32)
-    req = jnp.asarray([0] * 4 + [1] * 4 + [2] * 4 + [3], jnp.int32)
-    merged = pooled_qsa.request_window_merge(gathered, req, starts, 2, 8)
-    np.testing.assert_array_equal(np.asarray(merged[:, 0]), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
