@@ -367,11 +367,6 @@
     },
     {
       "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "bad-assignment",
-      "concise_description": "`FusedWeightsRef` is not assignable to variable `rhs_ref` with type `WeightsRef`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
       "name": "unbound-name",
       "concise_description": "`zero_size` may be uninitialized"
     },
