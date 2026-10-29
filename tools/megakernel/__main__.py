@@ -35,6 +35,10 @@ Commands (Kimi-K3; see each module's docstring):
     preshard verify             a rebuilt sample of one rank against an existing
                                 pre-shard
 
+Qwen3.8 (the prefill's pipeline stages; see ``qwen38.py``):
+
+    qwen38 bench --prompts 8192x1,2048x4,8192x1@32768   each stage's step time
+
 From the login node the tool runs itself as 32 processes (8 per host) on the
 allocation ``--jobid`` (default ``$JOBID``). ``--set`` overrides a
 ``KernelConfig`` field (``vllm_torchtpu.megakernel.kimi_k3.config``) to compare
@@ -49,7 +53,7 @@ import os
 import sys
 import tempfile
 
-from tools.megakernel import bench, check, harness, k3, k3_stage, preshard
+from tools.megakernel import bench, check, harness, k3, k3_stage, preshard, qwen38
 
 LLO_FLAGS = (
     "--xla_jf_dump_to={dir} --xla_jf_dump_llo_text=true "
@@ -117,6 +121,9 @@ def parser() -> argparse.ArgumentParser:
             "preshard", help="write the checkpoints in the kernels' per-rank layout"
         )
     )
+    qwen38.add_arguments(
+        commands.add_parser("qwen38", help="the Qwen3.8 prefill stage (qwen38.py)")
+    )
     return top
 
 
@@ -138,6 +145,8 @@ def main(argv: list[str]) -> int:
     args = parser().parse_args(argv)
     if args.command == "preshard":
         return run_preshard(argv, args)
+    if args.command == "qwen38":
+        return run_qwen38(argv, args)
     if not args.presharded:
         raise SystemExit("set --presharded to the TP32 pre-shard directory")
     if not harness.is_worker():
@@ -226,6 +235,21 @@ def run_preshard(argv: list[str], args) -> int:
     status = preshard.run(args, harness.log_host)
     harness.log("done")
     return status
+
+
+def run_qwen38(argv: list[str], args) -> int:
+    """The Qwen3.8 stage commands: 32 workers as the K3 commands, with the
+    pool layout the server's recipe selects."""
+    if not harness.is_worker():
+        if not args.jobid:
+            raise SystemExit(
+                "set --jobid (or $JOBID) to a running four-host allocation"
+            )
+        return harness.launch(argv, args.jobid, args.venv, qwen38.environment())
+    harness.init()
+    qwen38.run(args)
+    harness.log("done")
+    return 0
 
 
 if __name__ == "__main__":

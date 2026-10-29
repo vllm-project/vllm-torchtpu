@@ -140,7 +140,7 @@ def _prompt_tokens(rng, corpus, size):
 
 
 @contextmanager
-def _trace(directory: str, tag: str, last: bool):
+def trace(directory: str, tag: str, last: bool):
     """Rank 0 saves an xprof trace of the last repeat under ``directory``
     (``TRACE_RANKS``, e.g. ``0,8,16,24``: those ranks, under ``rank<r>/``)."""
     ranks = [int(r) for r in os.environ.get("TRACE_RANKS", "0").split(",")]
@@ -278,7 +278,7 @@ def run_decode(args, records: harness.Records) -> None:
         bridge.materialize(decoder.step(rows_for(batch, context, False, tag)).tokens)
         times, outs = [], []
         for repeat in range(args.repeats):
-            with _trace(args.trace, tag, repeat == args.repeats - 1):
+            with trace(args.trace, tag, repeat == args.repeats - 1):
                 started = time.perf_counter()
                 for _ in range(args.steps):
                     outs.append(
@@ -429,7 +429,7 @@ def run_prefill(args, records: harness.Records) -> None:
                 )
                 for r in range(count)
             ]
-            with _trace(args.trace, tag, repeat == args.repeats):
+            with trace(args.trace, tag, repeat == args.repeats):
                 started = time.perf_counter()
                 bridge.materialize(prefiller.step(mk.StepInput(rows)).tokens)
                 elapsed = 1e3 * (time.perf_counter() - started)
