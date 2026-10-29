@@ -29,6 +29,7 @@ residual) and mixes it; this fuses attn-combine with mlp-mix.
 """
 
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -339,7 +340,8 @@ def _hc_decode_mix(
         compiler_params=pltpu.CompilerParams(
             # Weights are fetched on the first tile only: keep tiles in order.
             dimension_semantics=("arbitrary",),
-            vmem_limit_bytes=56 << 20,
+            # TPU_QWEN4_HC_DECODE_VMEM_MB: debug knob (t128 core-halt bisect).
+            vmem_limit_bytes=int(os.environ.get("TPU_QWEN4_HC_DECODE_VMEM_MB", "56")) << 20,
         ),
         interpret=interpret,
         name=f"qwen4exp_hc_decode{'_combine' if prologue else ''}",
