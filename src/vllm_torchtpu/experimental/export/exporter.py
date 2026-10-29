@@ -45,6 +45,9 @@ _USER_INPUT_NAMES = (
     "req_dist",
 )
 _NUM_USER_INPUTS = len(_USER_INPUT_NAMES)
+# `mtp_draft_bucket{B}` takes the forward's user inputs, `input_ids` shifted by
+# one token, and then the row of each request's last accepted token.
+_MTP_LAST_TOKEN_INDICES = "last_token_indices"
 
 # Mesh axes of the artifact. Expert parallelism runs on the tensor-parallel
 # devices, so expert dimensions are split over `model` too.
@@ -486,6 +489,41 @@ def _params_read_by_forward(
     return {n: s for n, s in params_map.items() if n == lm_head_name or n in kept}
 
 
+def _mtp_requested(cfg: api.TextOnlyLLMExportConfig) -> bool:
+    """Whether the artifact declares MTP drafting (`speculative_config`)."""
+    return bool(cfg.speculative_config) and (
+        cfg.speculative_config.get("method") == "mtp"
+    )
+
+
+def _mtp_params(
+    model: api.ExportableTextOnlyLLM, params_map: Mapping[str, Any]
+) -> tuple[dict[str, Any], list[str]]:
+    """The MTP layer's own weights, and every weight `mtp_draft` reads, in order.
+
+    The shared weights (embedding, LM head) bind the target's slots, so the
+    artifact stores them once; a shared name must be one of the target's.
+    """
+    for method in (
+        "mtp_abstract_params",
+        "mtp_shared_params",
+        "mtp_abstract_states",
+        "mtp_draft",
+    ):
+        if not callable(getattr(model, method, None)):
+            raise ValueError(
+                f"speculative_config method 'mtp' needs a model with {method}()"
+            )
+    own = dict(model.mtp_abstract_params())  # type: ignore[attr-defined]
+    shared = list(model.mtp_shared_params())  # type: ignore[attr-defined]
+    target = model.abstract_params()
+    if clash := sorted(set(own) & set(target)):
+        raise ValueError(f"MTP parameters reuse target parameter names: {clash}")
+    if missing := sorted(set(shared) - set(target)):
+        raise ValueError(f"MTP shares parameters the target does not have: {missing}")
+    return own, shared + list(own)
+
+
 def _export_text_only_llm_functions(
     model: api.ExportableTextOnlyLLM,
     params_map: Mapping[str, Any],
@@ -495,8 +533,11 @@ def _export_text_only_llm_functions(
     *,
     constants: frozenset[str] = frozenset(),
     subdir: str = "subgraphs",
+    mtp_weight_names: Sequence[str] = (),
+    mtp_own: frozenset[str] = frozenset(),
 ) -> dict[str, dict[str, Any]]:
-    """Lowers `forward`, `compute_logits`, and the samplers across all buckets."""
+    """Lowers `forward`, `compute_logits`, the samplers and, with MTP drafting,
+    `mtp_draft` across all buckets."""
     cfg: api.TextOnlyLLMExportConfig = model.export_config
     act_dtype_str = tpu_lowering.dtype_name(cfg.dtype)
     tp_size = cfg.tensor_parallel_size
@@ -506,7 +547,9 @@ def _export_text_only_llm_functions(
     os.makedirs(target_dir, exist_ok=True)
 
     lm_head_name = _lm_head_name(params_map)
-    forward_names = [n for n in params_map if n != lm_head_name] or list(params_map)
+    forward_names = [
+        n for n in params_map if n != lm_head_name and n not in mtp_own
+    ] or list(params_map)
     lm_head_spec = params_map[lm_head_name]
     lm_head_entry = _weight_input_entry(
         lm_head_name,
@@ -706,11 +749,166 @@ def _export_text_only_llm_functions(
         for function, variant in samplers.items():
             sampler_variants.setdefault(function, {})[str(req_size)] = variant
 
-    return {
+    functions: dict[str, dict[str, Any]] = {
         "forward": forward_variants,
         "compute_logits": logits_variants,
         **sampler_variants,
     }
+    if mtp_weight_names:
+        functions["mtp_draft"] = _export_mtp_draft(
+            model,
+            params_map,
+            layouts,
+            weight_slots,
+            target_dir,
+            subdir,
+            mtp_weight_names=mtp_weight_names,
+            first_state_index=len(state_entries),
+            constants=constants,
+        )
+    return functions
+
+
+def _export_mtp_draft(
+    model: api.ExportableTextOnlyLLM,
+    params_map: Mapping[str, Any],
+    layouts: Mapping[str, _TensorLayout],
+    weight_slots: Mapping[str, int],
+    target_dir: str,
+    subdir: str,
+    *,
+    mtp_weight_names: Sequence[str],
+    first_state_index: int,
+    constants: frozenset[str],
+) -> dict[str, Any]:
+    """Lowers `mtp_draft_bucket{B}` for every forward bucket.
+
+    Inputs: the forward's user inputs with `input_ids` shifted by one token,
+    `last_token_indices`, the weights `mtp_draft` reads (shared ones bound to
+    the target's slots), the MTP layer's paged KV (states numbered after the
+    target's, each donated) and the forward's `hidden_states` intermediate.
+    Outputs: the updated states and `draft_tokens` `[max_num_seqs, k]`.
+    """
+    cfg: api.TextOnlyLLMExportConfig = model.export_config
+    act_dtype_str = tpu_lowering.dtype_name(cfg.dtype)
+    axis_sizes = _axis_sizes(cfg)
+    k = int(cfg.speculative_config["num_speculative_tokens"])  # type: ignore[index]
+    state_specs = list(model.mtp_abstract_states())  # type: ignore[attr-defined]
+    state_entries = []
+    for spec in state_specs:
+        sharding = (
+            _state_sharding(spec.shape, cfg.tensor_parallel_size)
+            if spec.sharding is None
+            else list(spec.sharding)
+        )
+        state_entries.append(
+            (_global_shape(spec.shape, sharding, axis_sizes), sharding, spec.dtype)
+        )
+    lowered = _lowered_params(params_map, layouts)
+    reshapes = _weight_reshapes(layouts)
+
+    variants: dict[str, Any] = {}
+    for b_idx, bucket_size in enumerate(cfg.token_buckets):
+        user_inputs = [
+            *_user_inputs(cfg, bucket_size),
+            (_MTP_LAST_TOKEN_INDICES, (cfg.max_num_seqs,)),
+        ]
+        hidden = api.ShapeDtypeStruct((bucket_size, cfg.hidden_size), act_dtype_str)
+        mlir = tpu_lowering.lower_torch_mtp_draft_to_mlir(
+            model,
+            user_inputs=user_inputs,
+            weight_names=mtp_weight_names,
+            params_map=lowered,
+            state_specs=state_specs,
+            hidden_states=hidden,
+            bucket_size=bucket_size,
+            weight_reshapes=reshapes,
+        )
+        file = f"mtp_draft_bucket{bucket_size}.mlir"
+        rel = f"{subdir}/{file}" if subdir else file
+        with open(os.path.join(target_dir, file), "w") as f:
+            f.write(mlir)
+
+        inputs: list[dict[str, Any]] = [
+            _io_entry(
+                arg_index=i,
+                index=i,
+                name=name,
+                shape=shape,
+                dtype="i32",
+                argument_type="user_io",
+            )
+            for i, (name, shape) in enumerate(user_inputs)
+        ]
+        weight_start = len(user_inputs)
+        for w_i, w_name in enumerate(mtp_weight_names):
+            inputs.append(
+                _weight_input_entry(
+                    w_name,
+                    params_map[w_name],
+                    layouts[w_name],
+                    arg_index=weight_start + w_i,
+                    slot=weight_slots[w_name],
+                    buffer_donor=False,
+                    constant=w_name in constants,
+                )
+            )
+        state_start = weight_start + len(mtp_weight_names)
+        for s_i, (s_shape, s_sharding, s_dtype) in enumerate(state_entries):
+            inputs.append(
+                _io_entry(
+                    arg_index=state_start + s_i,
+                    index=first_state_index + s_i,
+                    name=f"mtp_kv_cache_layer_{s_i}",
+                    shape=s_shape,
+                    dtype=s_dtype,
+                    argument_type="state",
+                    sharding=s_sharding,
+                    buffer_donor=True,
+                )
+            )
+        inputs.append(
+            _io_entry(
+                arg_index=state_start + len(state_entries),
+                index=0,
+                name="hidden_states",
+                shape=[bucket_size, cfg.hidden_size],
+                dtype=act_dtype_str,
+                argument_type="intermediate",
+            )
+        )
+        outputs: list[dict[str, Any]] = [
+            _io_entry(
+                arg_index=s_i,
+                index=first_state_index + s_i,
+                name=f"mtp_kv_cache_out_layer_{s_i}",
+                shape=s_shape,
+                dtype=s_dtype,
+                argument_type="state",
+                sharding=s_sharding,
+                is_input=False,
+            )
+            for s_i, (s_shape, s_sharding, s_dtype) in enumerate(state_entries)
+        ]
+        outputs.append(
+            _io_entry(
+                arg_index=len(state_entries),
+                index=0,
+                name="draft_tokens",
+                shape=[cfg.max_num_seqs, k],
+                dtype="i32",
+                argument_type="user_io",
+                is_input=False,
+            )
+        )
+        variants[str(bucket_size)] = {
+            "file_path": rel,
+            "subgraph_index": b_idx,
+            "compile_size": bucket_size,
+            "inputs": inputs,
+            "outputs": outputs,
+        }
+    return variants
 
 
 def _emit_model_companion_files(
@@ -836,6 +1034,17 @@ def export(
     dp_size = int(getattr(cfg, "data_parallel_size", 1) or 1)
     pp_size = int(getattr(cfg, "pipeline_parallel_size", 1) or 1)
     params_map = _params_read_by_forward(model, model.abstract_params())
+    mtp_own: dict[str, Any] = {}
+    mtp_weight_names: list[str] = []
+    if _mtp_requested(cfg):
+        mtp_own, mtp_weight_names = _mtp_params(model, params_map)
+        target = model.abstract_params()
+        # A shared weight the forward does not read (e.g. an untied LM head is
+        # kept anyway) still needs its slot.
+        for name in mtp_weight_names:
+            if name not in mtp_own and name not in params_map:
+                params_map[name] = target[name]
+        params_map = {**params_map, **mtp_own}
     constant_names_fn = getattr(model, "constant_names", None)
     constants = frozenset(
         constant_names_fn() if callable(constant_names_fn) else ()
@@ -862,6 +1071,8 @@ def export(
         output_dir,
         constants=constants,
         subdir=subdir,
+        mtp_weight_names=mtp_weight_names,
+        mtp_own=frozenset(mtp_own),
     )
     functions_dict.update(llm_funcs)
     # `serving_config` holds only what the runtime reads: the capacities the

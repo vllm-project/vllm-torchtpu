@@ -362,3 +362,72 @@ def lower_torch_forward_to_mlir(
     return set_aliasing_outputs(
         mlir_text, {arg: i for i, arg in enumerate(donate_argnums)}
     )
+
+
+def lower_torch_mtp_draft_to_mlir(
+    model: api.ExportableTextOnlyLLM,
+    *,
+    user_inputs: Sequence[tuple[str, tuple[int, ...] | int]],
+    weight_names: Sequence[str],
+    params_map: Mapping[str, api.ShapeDtypeStruct],
+    state_specs: Sequence[api.ShapeDtypeStruct],
+    hidden_states: api.ShapeDtypeStruct,
+    bucket_size: int,
+    weight_reshapes: Mapping[str, tuple[int, ...]] | None = None,
+) -> str:
+    """Lowers `model.mtp_draft` for `bucket_size` to StableHLO MLIR text.
+
+    `@main` takes the user inputs (the forward controls, the shifted
+    `input_ids` and `last_token_indices`), the weights, the MTP layer's states
+    and then `hidden_states`, the forward's intermediate output. It returns the
+    updated states, each donated by its input, and `draft_tokens`.
+    """
+    reshapes = dict(weight_reshapes or {})
+    num_user = len(user_inputs)
+    num_weights = len(weight_names)
+    state_start = num_user + num_weights
+    num_states = len(state_specs)
+    donate_argnums = tuple(range(state_start, state_start + num_states))
+    hidden_arg = state_start + num_states
+
+    all_specs = [
+        *(
+            api.ShapeDtypeStruct(
+                (shape,) if isinstance(shape, int) else tuple(shape), "i32"
+            )
+            for _, shape in user_inputs
+        ),
+        *(
+            api.ShapeDtypeStruct(
+                tuple(int(d) for d in params_map[n].shape),
+                dtype_name(params_map[n].dtype),
+            )
+            for n in weight_names
+        ),
+        *state_specs,
+        hidden_states,
+    ]
+
+    def _torch_mtp_entry(*args: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        user_args = {name: args[i] for i, (name, _) in enumerate(user_inputs)}
+        w_dict = {weight_names[i]: args[num_user + i] for i in range(num_weights)}
+        for name, shape in reshapes.items():
+            if name in w_dict:
+                w_dict[name] = w_dict[name].reshape(shape)
+        updated_kvs, draft_tokens = model.mtp_draft(  # type: ignore[attr-defined]
+            w_dict,
+            list(args[state_start:hidden_arg]),
+            hidden_states=args[hidden_arg],
+            **user_args,
+        )
+        return (*updated_kvs, draft_tokens)
+
+    mlir_text = lower_torch_callable_to_mlir(
+        _torch_mtp_entry,
+        all_specs,
+        donate_argnums=donate_argnums,
+        module_name=f"mtp_draft_bucket{bucket_size}",
+    )
+    return set_aliasing_outputs(
+        mlir_text, {arg: i for i, arg in enumerate(donate_argnums)}
+    )
