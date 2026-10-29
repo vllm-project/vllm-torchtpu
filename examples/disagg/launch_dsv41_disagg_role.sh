@@ -61,6 +61,8 @@ case "${ROLE}" in
     ENABLE_DSPARK="${ENABLE_DSPARK:-0}"
     DSPARK_TOKENS="${DSPARK_TOKENS:-5}"
     ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-0}"
+    ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-1}"
+    PREFIX_CACHE_RETENTION_INTERVAL="${PREFIX_CACHE_RETENTION_INTERVAL:-1024}"
     MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
     if [[ "${MAX_NUM_BATCHED_TOKENS}" == "2048" ]]; then
       COMPILE_SIZES="${COMPILE_SIZES:-[512, 2048]}"
@@ -77,6 +79,8 @@ case "${ROLE}" in
     ENABLE_DSPARK="${ENABLE_DSPARK:-1}"
     DSPARK_TOKENS="${DSPARK_TOKENS:-5}"
     ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-${ENABLE_DSPARK}}"
+    ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-0}"
+    PREFIX_CACHE_RETENTION_INTERVAL="${PREFIX_CACHE_RETENTION_INTERVAL:-0}"
     MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-384}"
     if [[ "${ENABLE_DSPARK}" == "1" ]]; then
       COMPILE_SIZES="${COMPILE_SIZES:-[16, 40, 48, 64, 96, 192, ${MAX_NUM_BATCHED_TOKENS}]}"
@@ -151,6 +155,7 @@ export VLLM_ENGINE_READY_TIMEOUT_S=7200
 export OMP_NUM_THREADS=6 GOMP_SPINCOUNT=1000
 export USE_PHASED_PROFILER=false VLLM_LOG_POST_WARMUP_HBM=1
 export VLLM_PLUGINS=torchtpu,torchtpu_layers
+export VLLM_SERVER_DEV_MODE="${VLLM_SERVER_DEV_MODE:-1}"
 export PYTHONPATH="/workspace/sitecustomize_bench:/workspace/vllm:/workspace/vllm-torchtpu/src"
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1200
 export TORCHINDUCTOR_AUTOGRAD_CACHE=0 SPEC_WARMUP=0 VLLM_SPEC_WARMUP=0
@@ -218,6 +223,22 @@ else
   async_flag="--no-async-scheduling"
 fi
 
+if [[ "${ENABLE_PREFIX_CACHING}" == "1" ]]; then
+  prefix_cache_flags=(--enable-prefix-caching --prefix-cache-retention-interval "${PREFIX_CACHE_RETENTION_INTERVAL}")
+else
+  prefix_cache_flags=(--no-enable-prefix-caching)
+fi
+
+ENABLE_TOOL_AND_REASONING_PARSERS="${ENABLE_TOOL_AND_REASONING_PARSERS:-1}"
+parser_flags=()
+if [[ "${ENABLE_TOOL_AND_REASONING_PARSERS}" == "1" ]]; then
+  parser_flags=(
+    --enable-auto-tool-choice
+    --tool-call-parser deepseek_v41
+    --reasoning-parser deepseek_v41
+  )
+fi
+
 args=(
   serve "${MODEL_PATH}"
   --host 0.0.0.0 --port "${PORT}"
@@ -235,7 +256,9 @@ args=(
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}"
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}"
   --no-disable-hybrid-kv-cache-manager
-  --no-enable-prefix-caching
+  --enable-prompt-tokens-details
+  "${prefix_cache_flags[@]}"
+  "${parser_flags[@]}"
   "${async_flag}"
   --kv-transfer-config "${kv_cfg}"
   --compilation-config "{\"compile_sizes\": ${COMPILE_SIZES}}"

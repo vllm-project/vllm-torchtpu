@@ -385,7 +385,11 @@ def get_next_client(app, service_type: str):
 
 
 async def send_request_to_prefill(
-    client_info: dict, endpoint: str, req_data: dict, request_id: str
+    client_info: dict,
+    endpoint: str,
+    req_data: dict,
+    request_id: str,
+    requested_dp_rank: int | None = None,
 ):
     """
     Send a request to a service using a client from the pool.
@@ -407,7 +411,14 @@ async def send_request_to_prefill(
     }
     inflight = client_info.get("dp_inflight") or []
     dp_rank = None
-    if inflight:
+    if requested_dp_rank is not None:
+        if inflight:
+            dp_rank = int(requested_dp_rank) % len(inflight)
+            inflight[dp_rank] += 1
+            headers["X-data-parallel-rank"] = str(dp_rank)
+        else:
+            headers["X-data-parallel-rank"] = str(int(requested_dp_rank))
+    elif inflight:
         rr = next(client_info["dp_rr"])
         n_dp = len(inflight)
         dp_rank = min(range(n_dp), key=lambda r: (inflight[r], (r - rr) % n_dp))
@@ -521,6 +532,8 @@ async def _handle_completions(api: str, request: Request):
     try:
         t_request_recv_perf = time.perf_counter()
         req_data = await request.json()
+        requested_dp_rank = req_data.pop("dp_rank", None)
+        req_data.pop("rid", None)
         request_id = str(uuid.uuid4())
         print(
             f"PERF PROXY req_received req_id={request_id} ts={time.time():.6f}",
@@ -563,7 +576,11 @@ async def _handle_completions(api: str, request: Request):
             flush=True,
         )
         response = await send_request_to_prefill(
-            prefill_client_info, api, req_data, request_id
+            prefill_client_info,
+            api,
+            req_data,
+            request_id,
+            requested_dp_rank=requested_dp_rank,
         )
         t_prefill_recv = time.time()
         t_prefill_recv_perf = time.perf_counter()
@@ -643,6 +660,30 @@ async def handle_completions(request: Request):
 @app.post("/v1/chat/completions")
 async def handle_chat_completions(request: Request):
     return await _handle_completions("/v1/chat/completions", request)
+
+
+@app.post("/flush_cache")
+@app.post("/reset_prefix_cache")
+async def reset_prefix_cache(request: Request):
+    """Forward cache reset to all prefill and decode instances."""
+    results = []
+    for role, clients in (
+        ("prefill", request.app.state.prefill_clients),
+        ("decode", request.app.state.decode_clients),
+    ):
+        for c in clients:
+            try:
+                resp = await c["client"].post("/reset_prefix_cache")
+                results.append(
+                    {
+                        "role": role,
+                        "status_code": resp.status_code,
+                        "body": resp.json() if resp.status_code == 200 else resp.text,
+                    }
+                )
+            except Exception as exc:
+                results.append({"role": role, "error": str(exc)})
+    return {"status": "ok", "results": results}
 
 
 @app.get("/healthcheck")

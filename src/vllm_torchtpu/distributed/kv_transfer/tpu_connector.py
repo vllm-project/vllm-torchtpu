@@ -2276,6 +2276,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             group_block_ids=normalized_group_block_ids,
         )
         params: dict[str, Any] = {
+            "do_remote_prefill": True,
             "req_id": request.request_id,
             "uuid": uuid,
             "num_tokens": num_tokens,
