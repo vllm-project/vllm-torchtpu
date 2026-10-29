@@ -54,8 +54,6 @@ def test_tiles_follow_local_footprint_not_tensor_parallel_degree(
     expected = (256, 256)
     if heads == 48:
         expected = (128, 256 if fp8 else 128)
-    elif heads == 24 and kv_heads == 3 and not fp8:
-        expected = (128, 256)
     assert (query_block, kv_tile) == expected
 
 
@@ -185,7 +183,9 @@ def test_general_paired_geometry(tokens, heads, kv_heads, dim, fp8):
         )
     )
     compiled = run.lower(*args).compile()
-    assert "prefill_paired_pages" in compiled.as_text()
+    hlo = compiled.as_text()
+    assert hlo is not None
+    assert "prefill_paired_pages" in hlo
     before = [np.asarray(x).copy() for x in args]
     out, returned = compiled(*args)
     check_reference(
@@ -211,7 +211,9 @@ def test_adaptive_short_tail_and_padded_request_boundaries(tokens, ragged, fp8):
     args, _ = inputs(tokens, 24, 2, 256, fp8, ragged=ragged)
     before = [np.asarray(x).copy() for x in args]
     compiled = jax.jit(adaptive_prefill).lower(*args).compile()
-    assert "prefill_paired_pages" in compiled.as_text()
+    hlo = compiled.as_text()
+    assert hlo is not None
+    assert "prefill_paired_pages" in hlo
     out, returned = compiled(*args)
     rows = [0, tokens - 2] + ([128, 129, 384, 385] if ragged else [])
     check_reference(args, out, kv_heads=2, rows=rows)
@@ -251,7 +253,9 @@ def test_other_compression_ratio_uses_general_tc():
         .lower(*args)
         .compile()
     )
-    assert "prefill_paired_pages" not in compiled.as_text()
+    hlo = compiled.as_text()
+    assert hlo is not None
+    assert "prefill_paired_pages" not in hlo
     output, _ = compiled(*args)
     check_reference(
         args, output, kv_heads=4, rows=[0, 128, 254], ratio=8, page_size=128
