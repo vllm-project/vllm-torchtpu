@@ -429,6 +429,17 @@ class Qwen4ExpAdapter:
         self._host_keep = (getattr(self, "_host_keep", ()) + (host,))[-8:]
         return host.to(self.runner.device, non_blocking=True)
 
+    def _scalars_upload(self, scalars):
+        """The step's [row_start, num_requests, previous rows] upload, reused
+        while its values repeat (steady decode of the same request set)."""
+        key = scalars.tobytes()
+        prev = getattr(self, "_scalars_prev", None)
+        if prev is not None and prev[0] == key:
+            return prev[1]
+        dev = self._host_upload(scalars)
+        self._scalars_prev = (key, dev)
+        return dev
+
     def _prepare_inputs_fused(self, snapshot):
         """VLLM_TPU_QWEN4_FUSED_PREP: ``prepare_inputs`` with its device work in
         one compiled program (``fused_step_inputs``) fed by at most two uploads."""
@@ -480,7 +491,7 @@ class Qwen4ExpAdapter:
             seq_lens,
             state_indices,
             store,
-            self._host_upload(scalars),
+            self._scalars_upload(scalars),
             previous,
             current,
             snapshot.input_ids,
