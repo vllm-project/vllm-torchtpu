@@ -254,6 +254,9 @@ if TYPE_CHECKING:
     VLLM_TPU_CPU_PROBE_S: float = 0.0
     VLLM_TPU_FUSED_READ_OFFSET_UPDATE: bool = True
     VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE: bool = False
+    VLLM_TPU_AOT_FLAT_ARGS: bool = False
+    VLLM_TPU_AOT_FLAT_ARGS_CHECK: int = 0
+    VLLM_TPU_AOT_FLAT_ARGS_CANARY: int = 1024
     VLLM_TPU_STAGE_TIMING_ONLY_WITH_SINK: bool = False
     VLLM_TPU_STAGED_WALK_CLASS_GATHER: bool = False
     VLLM_TPU_WARMED_SUBSTITUTE_SOURCE: bool = False
@@ -1559,6 +1562,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE": env_bool(
         "VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE", default=False
     ),
+    # AOT-compiled forwards reuse their flat graph-argument list instead of
+    # re-walking every lifted parameter per call (compilation/aot_flat_args.py).
+    # CHECK=N: first N calls compare the template with the rebuilt list;
+    # CANARY=K: every K-th call re-walks and switches the cache off on a miss.
+    "VLLM_TPU_AOT_FLAT_ARGS": env_bool("VLLM_TPU_AOT_FLAT_ARGS"),
+    "VLLM_TPU_AOT_FLAT_ARGS_CHECK": env_nonnegative_int("VLLM_TPU_AOT_FLAT_ARGS_CHECK", 0),
+    "VLLM_TPU_AOT_FLAT_ARGS_CANARY": env_nonnegative_int("VLLM_TPU_AOT_FLAT_ARGS_CANARY", 1024),
     # Host-path pieces (q38f-int: default off, toggled per arm).
     # Record stage-timing device events only when a KV connector consumes them.
     "VLLM_TPU_STAGE_TIMING_ONLY_WITH_SINK": env_bool(

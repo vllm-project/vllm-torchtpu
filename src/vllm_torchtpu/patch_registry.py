@@ -94,6 +94,7 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_hybrid_kv_load_failure_recovery", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_block_pool_lifo_free", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_same_step_prefix_hits", _ENGINE),
+    Patch("vllm_torchtpu.compilation.aot_flat_args:patch_aot_flat_args", _ACTIVE),
     Patch(
         "vllm_torchtpu.core.eagle_block_drop:patch_disable_eagle_block_drop",
         _ENGINE,
