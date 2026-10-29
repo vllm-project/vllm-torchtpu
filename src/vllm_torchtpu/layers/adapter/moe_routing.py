@@ -163,6 +163,23 @@ def route(
     duplicated in each quant method; centralizing it here means the simulation
     hook -- and any future routing-path change -- lives in exactly one place.
     """
+    routed = _route(layer, hidden_states, router_logits, input_ids)
+    count_expert_hist(layer, "expert_hist", routed[1], router_logits)
+    return routed
+
+
+def count_expert_hist(layer, buffer: str, topk_ids, router_logits) -> None:
+    """Debug (VLLM_TPU_MOE_EXPERT_HIST): add this step's routed expert ids to
+    ``layer.<buffer>``, skipping rows whose logits are all equal (padding)."""
+    hist = getattr(layer, buffer, None)
+    if hist is None:
+        return
+    live = router_logits.amax(dim=-1) > router_logits.amin(dim=-1)
+    weights = live[:, None].expand_as(topk_ids).reshape(-1).to(hist.dtype)
+    hist.index_add_(0, topk_ids.reshape(-1).long(), weights)
+
+
+def _route(layer, hidden_states, router_logits, input_ids):
     topk = layer.moe_config.experts_per_token
     simulated = maybe_simulate_routing(hidden_states, router_logits, topk)
     if simulated is not None:
@@ -365,6 +382,13 @@ def register_experts_start_buffer(layer, *, device: torch.device) -> None:
         else None
     )
     layer.register_buffer("_experts_start", buffer, persistent=False)
+    if envs.VLLM_TPU_MOE_EXPERT_HIST > 0:
+        for name in ("expert_hist", "expert_hist_sp"):
+            layer.register_buffer(
+                name,
+                torch.zeros(layer.global_num_experts, dtype=torch.int32, device=device),
+                persistent=False,
+            )
 
 
 def validate_linear_ep_placement(layer) -> None:

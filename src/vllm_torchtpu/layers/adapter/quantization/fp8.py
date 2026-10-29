@@ -1157,6 +1157,14 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # one program. Keyed on the same predicate `supports_internal_mk` uses,
         # so ownership and the path that exercises it cannot disagree.
         if self._use_adaptive_fused_moe:
+            if envs.VLLM_TPU_MOE_EXPERT_HIST > 0:
+                # Softmax is monotonic, so the logits' top-k is the kernel's.
+                moe_routing.count_expert_hist(
+                    layer,
+                    "expert_hist_sp",
+                    router_logits.float().topk(layer.moe_config.experts_per_token, dim=-1)[1],
+                    router_logits,
+                )
             w1_scale, w2_scale = adaptive_moe.runtime_channel_scales(
                 layer, layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
             )

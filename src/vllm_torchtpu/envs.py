@@ -130,6 +130,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
+    VLLM_TPU_MOE_EXPERT_HIST: int = 0
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_ADAPTIVE_2D_CHANNEL_SCALES: bool = False
@@ -1066,6 +1067,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_FUSED_EP_KERNEL_MIN_TOKENS": lambda: int(
         os.getenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", "1024")
     ),
+    # Debug: when > 0, every MoE layer counts its routed top-k expert ids in
+    # device buffers -- the routed path (decode) and the fused EP path (SP
+    # prefill) apart -- and the model logs every window of this many forward
+    # calls as one EXPERT_HIST json line per layer and path (the first window,
+    # which holds warmup, is dropped). Rows whose router logits are all equal
+    # (padding) are not counted.
+    "VLLM_TPU_MOE_EXPERT_HIST": lambda: int(os.getenv("VLLM_TPU_MOE_EXPERT_HIST", "0")),
     # Build each rank's two consumed routing-plan slices instead of
     # replicating the full T * topk * experts plan arithmetic on every rank.
     "MOE_FUSED_EP_V2_SHARDED_PLAN": env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),

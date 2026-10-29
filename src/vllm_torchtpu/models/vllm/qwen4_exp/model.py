@@ -1017,6 +1017,8 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
 
     def forward(self, input_ids, positions, inputs_embeds=None, **kwargs):
+        if envs.VLLM_TPU_MOE_EXPERT_HIST > 0:
+            self._expert_hist_window()
         # The route reads the padded bucket size outside both compiled graphs.
         if self.model_sp is None:
             return self.model(input_ids, positions, inputs_embeds, **kwargs)
@@ -1026,6 +1028,41 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
                 return self.model_sp(input_ids, positions, inputs_embeds, **kwargs)
         with bucket_filter.serving(bucket_filter.assigned(self.model)):
             return self.model(input_ids, positions, inputs_embeds, **kwargs)
+
+    def _expert_hist_window(self):
+        """Debug only: every N forward calls, log each MoE layer's routed expert
+        counts over the last N calls (decode path and SP prefill path apart) as
+        EXPERT_HIST json lines on TP rank 0, then zero them. The first window
+        holds warmup and is dropped unlogged."""
+        self._hist_calls = getattr(self, "_hist_calls", 0) + 1
+        n = envs.VLLM_TPU_MOE_EXPERT_HIST
+        if self._hist_calls % n:
+            return
+        merged = {}
+        for name, m in self.named_modules():
+            for path in ("expert_hist", "expert_hist_sp"):
+                hist = getattr(m, path, None)
+                if hist is None:
+                    continue
+                if self._hist_calls > n:
+                    # The SP backbone's layers count the same model layer.
+                    key = (name.split("layers.", 1)[-1], "sp" if path.endswith("_sp") else "routed")
+                    counts = hist.cpu().tolist()
+                    prev = merged.get(key)
+                    merged[key] = counts if prev is None else [a + b for a, b in zip(prev, counts)]
+                hist.zero_()
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        if not merged or get_tensor_model_parallel_rank() != 0:
+            return
+        import json
+
+        start = self._hist_calls - n
+        for (layer, path), counts in sorted(merged.items()):
+            if sum(counts):
+                print("EXPERT_HIST " + json.dumps(
+                    {"calls": [start, self._hist_calls], "layer": layer, "path": path, "counts": counts}
+                ), flush=True)
 
     def embed_input_ids(self, input_ids):
         return self.model.embed_tokens(input_ids)
