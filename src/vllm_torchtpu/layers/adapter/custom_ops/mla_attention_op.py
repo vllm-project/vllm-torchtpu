@@ -944,6 +944,15 @@ class VllmTPUMLAAttention(MLAAttention):
             if original_selector_get_backend is not None:
                 selector.get_mla_prefill_backend = original_selector_get_backend
 
+        dcp_size = getattr(self.impl, "dcp_size", 1)
+        if dcp_size > 1 and not use_sparse:
+            # The dense forward attends this rank's KV shard as if it were the
+            # whole sequence, which is silently wrong.
+            raise NotImplementedError(
+                f"Dense MLA ({prefix}) does not support "
+                f"--decode-context-parallel-size={dcp_size} yet."
+            )
+
         # Set after super(), not through it: upstream's
         # process_weights_after_loading gathers W_UK_T on the flag too, and
         # this class does that itself once the weight is on device.
