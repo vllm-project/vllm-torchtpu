@@ -22,6 +22,7 @@ import torch
 from torch.nn import Parameter
 from torch_tpu._internal import pallas
 from vllm.config import CacheConfig, get_current_vllm_config_or_none
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import mla_attention
 from vllm.model_executor.layers.attention.attention import get_attention_context
@@ -64,8 +65,14 @@ from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
     PallasMLAttentionBackendImpl,
     VllmTPUDeepseekV32IndexerBackend,
+    _retain_buffers,
 )
-from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+from vllm_torchtpu.layers.adapter.linear_common import (
+    DCP_ROWS_ATTR,
+    WEIGHT_FLIPPED_ATTR,
+    get_prequantized_matmul_op,
+    prequantized_matmul,
+)
 from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on_load
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
@@ -73,6 +80,19 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 logger = init_logger(__name__)
+
+
+def _after_jax(x: jax.Array, dep: jax.Array) -> jax.Array:
+    """Order `x` after `dep` in the scheduler without data dependency."""
+    return jax.lax.optimization_barrier((x, dep))[0]
+
+
+def _fake_after(x: torch.Tensor, dep: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+_after = pallas.jax_op("pallas::after", _after_jax)
+_after.register_fake(_fake_after)
 
 # Skip indexer scoring when every sequence in the batch is shorter than
 # `index_topk`, where the top-k is the identity and the scores decide nothing.
@@ -972,55 +992,78 @@ class VllmTPUMLAAttention(MLAAttention):
         # duration of that call. `kv_b_proj`'s parameters are cleared a few
         # lines below once `W_UK_T`/`W_UV` are extracted, and it never runs a
         # forward pass, so this view is the only consumer either way.
-        flipped = getattr(self.kv_b_proj, WEIGHT_FLIPPED_ATTR, False)
-        kv_b_weight = None
-        if flipped:
-            kv_b_weight = cast(torch.Tensor, self.kv_b_proj.weight)
-            self.kv_b_proj.weight = Parameter(
-                kv_b_weight.transpose(0, 1).contiguous(), requires_grad=False
-            )
-        try:
-            super().process_weights_after_loading(act_dtype)
-        finally:
+        already_extracted = (
+            getattr(self, "W_UK_T", None) is not None
+            and "weight" in self.kv_b_proj._parameters
+            and self.kv_b_proj._parameters["weight"] is None
+        )
+        if not already_extracted:
+            flipped = getattr(self.kv_b_proj, WEIGHT_FLIPPED_ATTR, False)
+            kv_b_weight = None
             if flipped:
-                assert kv_b_weight is not None
-                self.kv_b_proj.weight = Parameter(kv_b_weight, requires_grad=False)
+                kv_b_weight = cast(torch.Tensor, self.kv_b_proj.weight)
+                self.kv_b_proj.weight = Parameter(
+                    kv_b_weight.transpose(0, 1).contiguous(), requires_grad=False
+                )
+            # Hide dcp_q_replicate from super() so upstream does not register
+            # W_UK_T_dcp_qrep as an nn.Parameter before TPU quantization/gather.
+            has_qrep_attr = hasattr(self, "dcp_q_replicate")
+            dcp_q_replicate = getattr(self, "dcp_q_replicate", False)
+            if dcp_q_replicate:
+                self.dcp_q_replicate = False
+            try:
+                super().process_weights_after_loading(act_dtype)
+            finally:
+                if has_qrep_attr:
+                    self.dcp_q_replicate = dcp_q_replicate
+                if flipped:
+                    assert kv_b_weight is not None
+                    self.kv_b_proj.weight = Parameter(kv_b_weight, requires_grad=False)
 
         device = torch.device("tpu")
 
-        if should_quantize_on_load(self.prefix):
-            W_UK_T, w_uk_scale = quantize_tensor(
-                self.W_UK_T.to(torch.float32), torch.float8_e4m3fn, axis=1
-            )
-            W_UV, w_uv_scale = quantize_tensor(
-                self.W_UV.to(torch.float32), torch.float8_e4m3fn, axis=1
-            )
-            self.W_UK_T = Parameter(W_UK_T, requires_grad=False)
-            self.W_UV = Parameter(W_UV, requires_grad=False)
-            self.W_UK_T_scale = Parameter(
-                fresh_buffer(w_uk_scale.to(act_dtype)).to(device), requires_grad=False
-            )
-            self.W_UV_scale = Parameter(
-                fresh_buffer(w_uv_scale.to(act_dtype)).to(device), requires_grad=False
-            )
+        if not already_extracted:
+            if should_quantize_on_load(self.prefix):
+                W_UK_T, w_uk_scale = quantize_tensor(
+                    self.W_UK_T.to(torch.float32), torch.float8_e4m3fn, axis=1
+                )
+                W_UV, w_uv_scale = quantize_tensor(
+                    self.W_UV.to(torch.float32), torch.float8_e4m3fn, axis=1
+                )
+                self.W_UK_T = Parameter(W_UK_T, requires_grad=False)
+                self.W_UV = Parameter(W_UV, requires_grad=False)
+                self.W_UK_T_scale = Parameter(
+                    fresh_buffer(w_uk_scale.to(act_dtype)).to(device),
+                    requires_grad=False,
+                )
+                self.W_UV_scale = Parameter(
+                    fresh_buffer(w_uv_scale.to(act_dtype)).to(device),
+                    requires_grad=False,
+                )
 
-        # move W_UK_T and W_UV into fresh contiguous buffers
-        self.W_UK_T = Parameter(fresh_buffer(self.W_UK_T), requires_grad=False)
-        self.W_UV = Parameter(fresh_buffer(self.W_UV), requires_grad=False)
+            # move W_UK_T and W_UV into fresh contiguous buffers
+            self.W_UK_T = Parameter(fresh_buffer(self.W_UK_T), requires_grad=False)
+            self.W_UV = Parameter(fresh_buffer(self.W_UV), requires_grad=False)
 
-        # Keep W_UK_T/W_UV in the activation dtype unless quantized on load via
-        # QUANTIZE_ON_LOAD_PREFIXES. There is no quantized bmm for these two, so
-        # forward_mla upcasts them back to the activation dtype before torch.bmm
-        # anyway; quantizing them on load is strictly a memory-saving technique
-        # `kv_cache_quantized_dtype` still governs the KV cache itself.
-        self.W_UK_T = Parameter(self.W_UK_T.to(device), requires_grad=False)
-        self.W_UV = Parameter(self.W_UV.to(device), requires_grad=False)
+            # Keep W_UK_T/W_UV in the activation dtype unless quantized on load via
+            # QUANTIZE_ON_LOAD_PREFIXES. There is no quantized bmm for these two, so
+            # forward_mla upcasts them back to the activation dtype before torch.bmm
+            # anyway; quantizing them on load is strictly a memory-saving technique
+            # `kv_cache_quantized_dtype` still governs the KV cache itself.
+            self.W_UK_T = Parameter(self.W_UK_T.to(device), requires_grad=False)
+            self.W_UV = Parameter(self.W_UV.to(device), requires_grad=False)
 
         # Query replication attends with the whole DCP group's heads, so the
         # absorbed W_UK_T has to span them too. Gathered once here rather than
         # gathering q every step -- that trade is the point of qrep.
+        prev_w_o = getattr(self, "W_O_dcp_qrep", None)
+        prev_w_o_scale = getattr(self, "W_O_dcp_qrep_scale", None)
         self.W_UK_T_dcp_qrep = None
         self.W_UK_T_dcp_qrep_scale = None
+        self.W_UV_dcp_qrep = None
+        self.W_UV_dcp_qrep_scale = None
+        self.W_O_dcp_qrep = None
+        self.W_O_dcp_qrep_scale = None
         if self.dcp_q_replicate:
             dcp_group = get_dcp_group()
             if dcp_group is None or int(dcp_group.world_size) <= 1:
@@ -1035,6 +1078,44 @@ class VllmTPUMLAAttention(MLAAttention):
                 self.W_UK_T_dcp_qrep_scale = fresh_buffer(
                     dcp_group.all_gather(self.W_UK_T_scale.contiguous(), dim=0)
                 )
+            o = getattr(self, "o_proj", None)
+            weight_dcp = getattr(o, "weight_dcp", None) if o is not None else None
+            if o is not None and weight_dcp is not None:
+                scale_dcp = cast(torch.Tensor, o.weight_scale_dcp)
+                if (
+                    prev_w_o is not None
+                    and prev_w_o_scale is not None
+                    and prev_w_o.shape == weight_dcp.shape
+                    and prev_w_o.dtype == weight_dcp.dtype
+                    and prev_w_o.device == weight_dcp.device
+                ):
+                    with torch.no_grad():
+                        prev_w_o.copy_(weight_dcp)
+                        prev_w_o_scale.copy_(scale_dcp)
+                    self.W_O_dcp_qrep = prev_w_o
+                    self.W_O_dcp_qrep_scale = prev_w_o_scale
+                else:
+                    self.W_O_dcp_qrep = weight_dcp
+                    self.W_O_dcp_qrep_scale = scale_dcp
+                del o.weight_dcp, o.weight_scale_dcp
+                get_prequantized_matmul_op()
+            elif o is not None and prev_w_o is not None:
+                self.W_O_dcp_qrep = prev_w_o
+                self.W_O_dcp_qrep_scale = prev_w_o_scale
+            elif o is not None:
+                logger.warning_once(
+                    "TPU_DCP_MLA_OPROJ_ALL_REDUCE needs an FP8 o_proj from an "
+                    "FP8 checkpoint; keeping the reduce-scatter."
+                )
+            # The group's W_UV too, so W_UV can run before the merge.
+            if envs.TPU_DCP_MLA_UV_BEFORE_MERGE:
+                self.W_UV_dcp_qrep = fresh_buffer(
+                    dcp_group.all_gather(self.W_UV.contiguous(), dim=0)
+                )
+                if hasattr(self, "W_UV_scale"):
+                    self.W_UV_dcp_qrep_scale = fresh_buffer(
+                        dcp_group.all_gather(self.W_UV_scale.contiguous(), dim=0)
+                    )
 
         # Safely detach and clear kv_b_proj parameter buffers without breaking
         # PyTorch attribute integrity
@@ -1051,7 +1132,14 @@ class VllmTPUMLAAttention(MLAAttention):
                 tensors.extend([self.W_UK_T_scale, self.W_UV_scale])
             tensors.extend(
                 t
-                for t in (self.W_UK_T_dcp_qrep, self.W_UK_T_dcp_qrep_scale)
+                for t in (
+                    self.W_UK_T_dcp_qrep,
+                    self.W_UK_T_dcp_qrep_scale,
+                    self.W_UV_dcp_qrep,
+                    self.W_UV_dcp_qrep_scale,
+                    self.W_O_dcp_qrep,
+                    self.W_O_dcp_qrep_scale,
+                )
                 if t is not None
             )
             synchronize_tensors(tensors)
@@ -1077,7 +1165,7 @@ class VllmTPUMLAAttention(MLAAttention):
         k_pe: torch.Tensor,
         output: torch.Tensor | None = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | list[tuple[torch.Tensor, torch.Tensor]]:
         attn_metadata, _, kv_cache, _ = get_attention_context(self.layer_name)
 
         return cast(PallasMLAttentionBackendImpl, self.impl).forward(
@@ -1190,6 +1278,16 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             topk_indices_buffer=self.topk_indices_buffer,
             non_causal_multi_token_decode=non_causal_multi_token_decode,
         )
+        if (
+            envs.TPU_DCP_MLA_OPROJ_ALL_REDUCE
+            and envs.TPU_DCP_MLA_UV_BEFORE_MERGE
+            and self.mla_attn.dcp_q_replicate
+            and self.g_proj is None
+            and not self.gate_is_fused
+            and getattr(self.o_proj, "bias", None) is None
+        ):
+            setattr(self.o_proj, DCP_ROWS_ATTR, True)
+            self.mla_attn.o_proj = self.o_proj
 
         self.prefix = prefix
 
@@ -1339,9 +1437,31 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         )
 
         if output_gate is not None:
+            assert isinstance(attn_out, torch.Tensor)
             attn_out *= output_gate.sigmoid()
         elif self.g_proj is not None:
+            assert isinstance(attn_out, torch.Tensor)
             attn_out *= self.g_proj(hidden_states)[0].sigmoid()
+        w_o = getattr(self.mla_attn, "W_O_dcp_qrep", None)
+        if w_o is not None:
+            s_o = cast(torch.Tensor, self.mla_attn.W_O_dcp_qrep_scale)
+            assert s_o is not None
+            if isinstance(attn_out, torch.Tensor):
+                attn_out = _retain_buffers(attn_out, w_o, s_o)
+            else:
+                outs: list[torch.Tensor] = []
+                for x, x_scale in attn_out:
+                    y = prequantized_matmul(x, x_scale, w_o, s_o)
+                    if outs:
+                        y = _after(y, outs[-1])
+                    outs.append(tensor_model_parallel_all_reduce(y))
+                out = outs[0] if len(outs) == 1 else torch.cat(outs)
+                return _retain_buffers(
+                    out,
+                    cast(torch.Tensor, self.o_proj.weight),
+                    cast(torch.Tensor, getattr(self.o_proj, "weight_scale", None)),
+                )
+        assert isinstance(attn_out, torch.Tensor)
         if prefill_group is not None:
             return prefill_group.project_reduce_scatter(attn_out, self.o_proj)
         return self.o_proj(attn_out)[0]

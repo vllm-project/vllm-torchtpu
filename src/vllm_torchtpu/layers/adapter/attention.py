@@ -85,10 +85,15 @@ from vllm_torchtpu.layers.adapter.cp_attention import (
 from vllm_torchtpu.layers.adapter.cp_attention import (
     forward_with_dcp as _forward_with_dcp,
 )
+from vllm_torchtpu.layers.adapter.cp_attention import (
+    is_dcp_duplicate_o_proj_enabled as _is_dcp_duplicate_o_proj_enabled,
+)
 from vllm_torchtpu.layers.adapter.cp_mla_attention import (
     all_gather_heads,
     all_gather_q_nope_pe_heads,
     merge_lse_partials_scatter_heads,
+    project_uv_heads,
+    weight_lse_partials,
 )
 from vllm_torchtpu.layers.core.attention_interface import (
     attention,
@@ -113,6 +118,62 @@ logger = init_logger(__name__)
 
 # TPU requires the head size to be a multiple of 128.
 TPU_HEAD_SIZE_ALIGNMENT = 128
+
+
+def _keep_input_fn(a: jax.Array, b: jax.Array) -> jax.Array:
+    del b
+    return a
+
+
+def _keep_input_fake(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(a)
+
+
+_keep_input = pallas.jax_op("pallas::keep_input", _keep_input_fn)
+_keep_input.register_fake(_keep_input_fake)
+
+
+def _retain_buffers(out: torch.Tensor, *buffers: torch.Tensor | None) -> torch.Tensor:
+    """Lift unused weight buffers during warmup so bucket traces share signatures."""
+    from vllm_torchtpu.compilation import shape_variants
+
+    if not shape_variants.in_warmup():
+        return out
+    for buf in buffers:
+        if buf is None:
+            continue
+        if out.device.type == "tpu":
+            out = _keep_input(out.contiguous(), buf)
+        else:
+            value = buf[(0,) * buf.dim()].to(out.dtype)
+            out = out + (value - value)
+    return out
+
+
+def _uv_before_merge_applies(num_tokens: int, is_backbone: bool) -> bool:
+    """True when W_UV should run before the DCP LSE merge."""
+    min_tokens = envs.TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS
+    if min_tokens <= 0:
+        return True
+    if not is_backbone:
+        return False
+    return num_tokens > envs.bucket_gate_edge(min_tokens)
+
+
+def _oproj_all_reduce_applies(num_tokens: int, is_backbone: bool) -> bool:
+    """True when a backbone step should take the replicated o_proj all-reduce."""
+    if not is_backbone:
+        return False
+    if (
+        envs.TPU_DCP_LSE_MERGE_A2A
+        and num_tokens <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
+    ):
+        return False
+    min_tokens = envs.TPU_DCP_MLA_OPROJ_ALL_REDUCE_MIN_TOKENS
+    if min_tokens <= 0:
+        return True
+    return num_tokens > envs.bucket_gate_edge(min_tokens)
+
 
 _SPARSE_MLA_DCP_INPUT_PARTITION_SPECS = (
     P(DCP_AXIS_NAME),  # kv_cache_nope, this rank's position shard
@@ -1159,7 +1220,13 @@ class PallasAttentionBackendImpl(AttentionImpl):
         value: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        *,
+        dcp_duplicate_o_proj: bool = False,
     ) -> torch.Tensor:
+        q_dcp_replicated = (
+            self.dcp_world_size > 1
+            and query.shape[1] == self.num_heads * self.dcp_world_size
+        )
         return _forward_with_dcp(
             layer=layer,
             query=query,
@@ -1175,6 +1242,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
             dcp_rank=self.dcp_rank,
             kv_layout=self.kv_layout,
             decode_query_size=self.decode_query_size,
+            q_dcp_replicated=q_dcp_replicated,
+            dcp_duplicate_o_proj=dcp_duplicate_o_proj,
         )
 
     def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
@@ -1382,6 +1451,22 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     "DCP with HND requires the CUSTOM attention backend "
                     "and head_size != 64."
                 )
+            layer_dup_o_proj = bool(
+                getattr(layer, "dcp_duplicate_o_proj", False)
+                or getattr(self, "dcp_duplicate_o_proj", False)
+            )
+            if layer_dup_o_proj:
+                assert self.num_kv_heads == 1, (
+                    "DCP duplicate o_proj requires num_kv_heads == 1 per rank "
+                    f"(got {self.num_kv_heads})."
+                )
+            elif _is_dcp_duplicate_o_proj_enabled(vllm_config):
+                logger.warning_once(
+                    "TPU_DCP_DUPLICATE_O_PROJ is enabled, but this attention "
+                    "layer did not swap o_proj to DCPGroupRowParallelLinear "
+                    "(only Qwen3-Next / Qwen3.5 is currently patched); "
+                    "falling back to standard DCP reduce-scatter."
+                )
             dcp_group = _get_dcp_group()
             if dcp_group is not None:
                 self.dcp_world_size = int(dcp_group.world_size)
@@ -1464,7 +1549,19 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # For determine_available_memory case.
         if kv_cache.numel() == 0:
             if output is None:
-                output = torch.ones_like(query)
+                use_dup = self.dcp_world_size > 1 and (
+                    bool(getattr(layer, "dcp_duplicate_o_proj", False))
+                    or bool(getattr(self, "dcp_duplicate_o_proj", False))
+                )
+                num_tokens = key.shape[0] if use_dup else query.shape[0]
+                out_heads = (
+                    self.num_heads * self.dcp_world_size if use_dup else self.num_heads
+                )
+                if query.dim() == 3:
+                    out_shape = (num_tokens, out_heads, self.head_size)
+                else:
+                    out_shape = (num_tokens, out_heads * self.head_size)
+                output = torch.ones(out_shape, dtype=query.dtype, device=query.device)
             return output
 
         query_dim = query.dim()
@@ -1488,10 +1585,19 @@ class PallasAttentionBackendImpl(AttentionImpl):
         else:
             k_len, k_compute_dim = key.shape
 
-        assert q_compute_dim == self.head_size * self.num_heads
-        assert k_compute_dim == self.head_size * self.num_kv_heads
+        local_q_dim = self.head_size * self.num_heads
+        if (
+            self.dcp_world_size > 1
+            and query.numel() == k_len * local_q_dim * self.dcp_world_size
+        ):
+            q_len = k_len
+            q_compute_dim = local_q_dim * self.dcp_world_size
+            query = query.view(q_len, q_compute_dim // self.head_size, self.head_size)
+        else:
+            assert q_compute_dim == local_q_dim
+            query = query.view(q_len, self.num_heads, self.head_size)
 
-        query = query.view(q_len, self.num_heads, self.head_size)
+        assert k_compute_dim == self.head_size * self.num_kv_heads
         key = key.view(k_len, self.num_kv_heads, self.head_size)
         value = value.view(k_len, self.num_kv_heads, self.head_size)
         assert key.shape == value.shape
@@ -1544,15 +1650,36 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     "DCP attention does not support attention sinks or "
                     "the bundled KV cache path."
                 )
+            dcp_duplicate_o_proj = self.dcp_world_size > 1 and bool(
+                getattr(layer, "dcp_duplicate_o_proj", False)
+                or getattr(self, "dcp_duplicate_o_proj", False)
+                or (
+                    output is not None
+                    and output.numel()
+                    == k_len * self.num_heads * self.dcp_world_size * self.head_size
+                )
+            )
+            if dcp_duplicate_o_proj:
+                assert self.num_kv_heads == 1, (
+                    "DCP duplicate o_proj requires num_kv_heads == 1 per rank "
+                    f"(got {self.num_kv_heads})."
+                )
             outputs = self._run_dcp_forward(
-                layer, query, key, value, kv_cache, attn_metadata
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                dcp_duplicate_o_proj=dcp_duplicate_o_proj,
             )
             if outputs.shape[-1] > self.head_size:
                 outputs = outputs[..., : self.head_size]
             if query_dim == 2:
-                outputs = outputs.reshape(q_len, self.num_heads * self.head_size)
+                out_num_heads = outputs.shape[1]
+                outputs = outputs.reshape(q_len, out_num_heads * self.head_size)
             if output is not None:
-                output.copy_(outputs)
+                output.copy_(outputs.view_as(output))
             return outputs
 
         use_pcp_streaming = is_pcp_streaming_attention_metadata(attn_metadata)
@@ -2374,7 +2501,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
         **kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | list[tuple[torch.Tensor, torch.Tensor]]:
         """Executes complete TPU multi-head latent attention evaluation."""
         assert isinstance(q, tuple) and len(q) == 2, (
             "q must be a tuple of (q_nope, q_pe)"
@@ -2417,6 +2544,27 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             w_uk_t_src = layer.W_UK_T
             w_uk_t_scale = getattr(layer, "W_UK_T_scale", None)
         attn_heads = layer.num_heads * (self.dcp_size if use_qrep else 1)
+        is_backbone = vllm_compilation_backends.model_tag == "backbone"
+        w_uv_qrep = getattr(layer, "W_UV_dcp_qrep", None) if use_qrep else None
+        w_uv_qrep_scale = (
+            getattr(layer, "W_UV_dcp_qrep_scale", None)
+            if w_uv_qrep is not None
+            else None
+        )
+        retain_uv_pair = (
+            w_uv_qrep is not None
+            and is_backbone
+            and envs.TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS > 0
+        )
+        w_uv_local = getattr(layer, "W_UV", None) if retain_uv_pair else None
+        w_uv_local_scale = (
+            getattr(layer, "W_UV_scale", None) if retain_uv_pair else None
+        )
+        w_o_qrep = getattr(layer, "W_O_dcp_qrep", None) if use_qrep else None
+        # W_UV runs before the DCP merge, so the merge carries v_head_dim.
+        uv_first = w_uv_qrep is not None and _uv_before_merge_applies(
+            q_nope.shape[0], is_backbone
+        )
 
         # Evaluate projection matrices directly across input precision
         # (`bfloat16`/`float16`/`fp8`) without dynamic `.to(torch.float32)` casting
@@ -2503,10 +2651,37 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 # comparison would pin its graph to the first size, and the
                 # large buckets fail with ShapeSpecializationError. So the
                 # drafter keeps the reduce-scatter, as with the flag off.
+                wire_dtype = partial.dtype
+                oproj_all_reduce = (
+                    uv_first
+                    and w_o_qrep is not None
+                    and _oproj_all_reduce_applies(partial.shape[0], is_backbone)
+                )
+                if uv_first:
+                    assert w_uv_qrep is not None
+                    narrow = envs.TPU_DCP_RS_OUT_PRECISION and is_backbone
+                    partial = project_uv_heads(
+                        partial,
+                        w_uv_qrep,
+                        w_uv_qrep_scale,
+                        out_dtype=wire_dtype if narrow else torch.float32,
+                    )
+                if oproj_all_reduce:
+                    assert w_o_qrep is not None
+                    if retain_uv_pair:
+                        partial = _retain_buffers(partial, w_uv_local, w_uv_local_scale)
+                    return weight_lse_partials(
+                        partial,
+                        lse,
+                        w_o_qrep.dtype,
+                        envs.TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS
+                        or partial.shape[0],
+                    )
                 outputs = merge_lse_partials_scatter_heads(
                     partial,
                     lse,
-                    is_backbone=vllm_compilation_backends.model_tag == "backbone",
+                    is_backbone=is_backbone,
+                    wire_dtype=wire_dtype,
                 )
             else:
                 if not hasattr(layer, "sparse_mla_op") or layer.sparse_mla_op is None:
@@ -2544,22 +2719,31 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 attn_metadata.request_distribution,
             )
 
-        outputs_t = outputs.reshape(-1, layer.num_heads, layer.kv_lora_rank).transpose(
-            0, 1
-        )
-        w_uv = (
-            layer.W_UV.to(outputs_t.dtype)
-            if layer.W_UV.dtype != outputs_t.dtype
-            else layer.W_UV
-        )
-        out_proj = torch.bmm(outputs_t, w_uv)
-        if hasattr(layer, "W_UV_scale"):
-            out_proj = out_proj * layer.W_UV_scale
-        outputs = (
-            out_proj.transpose(0, 1)
-            .to(input_dtype)
-            .reshape(-1, layer.num_heads * layer.v_head_dim)
-        )
+        if uv_first:
+            outputs = outputs.to(input_dtype).reshape(
+                -1, layer.num_heads * layer.v_head_dim
+            )
+            if retain_uv_pair:
+                outputs = _retain_buffers(outputs, w_uv_local, w_uv_local_scale)
+        else:
+            outputs_t = outputs.reshape(
+                -1, layer.num_heads, layer.kv_lora_rank
+            ).transpose(0, 1)
+            w_uv = (
+                layer.W_UV.to(outputs_t.dtype)
+                if layer.W_UV.dtype != outputs_t.dtype
+                else layer.W_UV
+            )
+            out_proj = torch.bmm(outputs_t, w_uv)
+            if getattr(layer, "W_UV_scale", None) is not None:
+                out_proj = out_proj * layer.W_UV_scale
+            outputs = (
+                out_proj.transpose(0, 1)
+                .to(input_dtype)
+                .reshape(-1, layer.num_heads * layer.v_head_dim)
+            )
+            if retain_uv_pair:
+                outputs = _retain_buffers(outputs, w_uv_qrep, w_uv_qrep_scale)
 
         if output is not None and outputs is not output:
             output.copy_(outputs)

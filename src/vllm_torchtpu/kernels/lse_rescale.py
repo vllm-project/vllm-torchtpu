@@ -1,0 +1,144 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Pallas log-sum-exp rescale of attention partials (head-major or quantized)."""
+
+import jax
+import jax.numpy as jnp
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+
+
+def _kernel(lse_ref, merged_ref, x_ref, o_ref):
+    weight = jnp.exp(lse_ref[...] - merged_ref[...])
+    x = pltpu.einshape("thd->htd", x_ref[...])
+    for head in range(x.shape[0]):
+        w = weight[:, head : head + 1]
+        y = x[head].astype(jnp.float32) * w
+        # Guard against NaN * 0 = NaN on zero-weight partials.
+        o_ref[head] = jnp.where(w > 0, y, 0.0).astype(o_ref.dtype)
+
+
+def lse_rescale_head_major(
+    output: jax.Array,
+    lse: jax.Array,
+    merged_lse: jax.Array,
+    out_dtype: str,
+) -> jax.Array:
+    """`out[h, t] = output[t, h] * exp(lse[t, h] - merged_lse[t, h])` in
+    `out_dtype`, and 0 where that weight is 0.
+
+    Args:
+      output: `[T, H, D]`, a rank's partial attention output.
+      lse: `[T, H]` f32, its log-sum-exp.
+      merged_lse: `[T, H]` f32, the log-sum-exp over every rank.
+      out_dtype: dtype name of the result.
+
+    Returns:
+      `[H, T, D]` in `out_dtype`.
+    """
+    tokens, heads, dim = output.shape
+    dtype = jnp.dtype(out_dtype)
+    info = pltpu.get_tpu_info()
+    row_bytes = heads * dim * (output.dtype.itemsize + dtype.itemsize)
+    tile = info.num_sublanes * 4 // min(output.dtype.itemsize, dtype.itemsize)
+    block = max(tile, info.vmem_capacity_bytes // 4 // row_bytes // tile * tile)
+    block = min(block, tokens)
+    return pl.pallas_call(
+        _kernel,
+        grid=(pl.cdiv(tokens, block),),
+        in_specs=[
+            pl.BlockSpec((block, heads), lambda i: (i, 0)),
+            pl.BlockSpec((block, heads), lambda i: (i, 0)),
+            pl.BlockSpec((block, heads, dim), lambda i: (i, 0, 0)),
+        ],
+        out_specs=pl.BlockSpec((heads, block, dim), lambda i: (0, i, 0)),
+        out_shape=jax.ShapeDtypeStruct((heads, tokens, dim), dtype),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",),
+            vmem_limit_bytes=info.vmem_capacity_bytes * 3 // 4,
+        ),
+    )(lse, merged_lse, output)
+
+
+def _quantize_kernel(lse_ref, merged_ref, x_ref, q_ref, s_ref):
+    weight = jnp.exp(lse_ref[...] - merged_ref[...])
+    heads, _, dim = x_ref.shape
+    head_max = jnp.concatenate(
+        [
+            jnp.max(jnp.abs(x_ref[head].astype(jnp.float32)), axis=1, keepdims=True)
+            for head in range(heads)
+        ],
+        axis=1,
+    )
+    peak = jnp.max(jnp.where(weight > 0, head_max * weight, 0.0), axis=1, keepdims=True)
+    q_max = float(jnp.finfo(q_ref.dtype).max)
+    scale = jnp.where(peak > 0, peak / q_max, 1.0)
+    factor = weight / scale
+    for head in range(heads):
+        f = factor[:, head : head + 1]
+        x = jnp.where(f > 0, x_ref[head].astype(jnp.float32) * f, 0.0)
+        q_ref[:, head * dim : (head + 1) * dim] = jnp.clip(x, -q_max, q_max).astype(
+            q_ref.dtype
+        )
+    s_ref[...] = scale
+
+
+def lse_rescale_quantize(
+    output: jax.Array,
+    lse: jax.Array,
+    merged_lse: jax.Array,
+    start: int,
+    out_dtype: str,
+) -> tuple[jax.Array, jax.Array]:
+    """Weighted tokens `start : start + R`, token-major and quantized per token.
+
+    Args:
+      output: `[H, T, D]`, a rank's partial attention output, head-major.
+      lse: `[R, H]` f32, the log-sum-exp of those `R` tokens.
+      merged_lse: `[R, H]` f32, their log-sum-exp over every rank.
+      start: the first token; a multiple of 128.
+      out_dtype: dtype name of the quantized result (a float8 type).
+
+    Returns:
+      `q` `[R, H * D]` in `out_dtype` and `scale` `[R, 1]` f32.
+    """
+    heads, _, dim = output.shape
+    rows = lse.shape[0]
+    block = 128
+    if start % block:
+        raise ValueError(f"{start=} is not a multiple of {block}")
+    offset = start // block
+    dtype = jnp.dtype(out_dtype)
+    block_bytes = block * heads * dim * (output.dtype.itemsize + dtype.itemsize)
+    return pl.pallas_call(
+        _quantize_kernel,
+        grid=(pl.cdiv(rows, block),),
+        in_specs=[
+            pl.BlockSpec((block, heads), lambda i: (i, 0)),
+            pl.BlockSpec((block, heads), lambda i: (i, 0)),
+            pl.BlockSpec((heads, block, dim), lambda i: (0, offset + i, 0)),
+        ],
+        out_specs=[
+            pl.BlockSpec((block, heads * dim), lambda i: (i, 0)),
+            pl.BlockSpec((block, 1), lambda i: (i, 0)),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((rows, heads * dim), dtype),
+            jax.ShapeDtypeStruct((rows, 1), jnp.float32),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",),
+            vmem_limit_bytes=4 * block_bytes + (4 << 20),
+        ),
+    )(lse, merged_lse, output)

@@ -18,6 +18,25 @@ from __future__ import annotations
 from typing import Any, Literal, overload
 
 import torch
+from torch_tpu._internal import pallas
+
+from vllm_torchtpu.kernels.lse_rescale import lse_rescale_head_major
+
+
+def _fake_lse_rescale_head_major(
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    merged_lse: torch.Tensor,
+    out_dtype: str,
+) -> torch.Tensor:
+    tokens, heads, dim = output.shape
+    return output.new_empty((heads, tokens, dim), dtype=getattr(torch, out_dtype))
+
+
+_lse_rescale_head_major = pallas.jax_op(
+    "pallas::lse_rescale_head_major", lse_rescale_head_major
+)
+_lse_rescale_head_major.register_fake(_fake_lse_rescale_head_major)
 
 
 @overload
@@ -72,17 +91,66 @@ def cp_lse_ag_out_rs(
     lses = group.all_gather(lse.unsqueeze(0).contiguous(), dim=0)
     merged_lse = torch.logsumexp(lses, dim=0)
 
-    # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
-    weight = torch.exp(lse - merged_lse).unsqueeze(-1)
-    weighted = output.to(torch.float32) * weight
-    weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
-
-    if rs_dtype is not None:
-        weighted = weighted.to(rs_dtype)
-    merged = group.reduce_scatter(weighted.contiguous(), dim=1).to(output.dtype)
+    if output.device.type == "tpu":
+        wire_dtype = str(rs_dtype or torch.float32).removeprefix("torch.")
+        weighted = _lse_rescale_head_major(output, lse, merged_lse, wire_dtype)
+        merged = group.reduce_scatter(weighted, dim=0).transpose(0, 1).contiguous()
+    else:
+        weight = torch.exp(lse - merged_lse).unsqueeze(-1)
+        weighted = output.to(torch.float32) * weight
+        weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
+        if rs_dtype is not None:
+            weighted = weighted.to(rs_dtype)
+        merged = group.reduce_scatter(weighted.contiguous(), dim=1)
+    merged = merged.to(output.dtype)
     if not return_lse:
         return merged
 
     heads = merged.shape[1]
     start = int(group.rank_in_group) * heads
     return merged, merged_lse[:, start : start + heads]
+
+
+@overload
+def cp_lse_ag_out_scale(
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    group: Any | None,
+    return_lse: Literal[False] = False,
+) -> torch.Tensor: ...
+
+
+@overload
+def cp_lse_ag_out_scale(
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    group: Any | None,
+    return_lse: Literal[True],
+) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+
+def cp_lse_ag_out_scale(
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    group: Any | None,
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Rescale partial attention outputs by global merged LSE without reduce-scatter."""
+    if group is None or int(group.world_size) == 1:
+        return (output, lse) if return_lse else output
+
+    lse_f32 = lse.to(torch.float32)
+    lses = group.all_gather(lse_f32.unsqueeze(0).contiguous(), dim=0)
+    merged_lse = torch.logsumexp(lses, dim=0)
+
+    # Stay token-major (no reduce-scatter on head axis), so XLA fuses the
+    # rescale directly with the downstream output gate.
+    # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
+    weight = torch.exp(lse_f32 - merged_lse).unsqueeze(-1)
+    weighted = output.to(torch.float32) * weight
+    weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
+    scaled = weighted.to(output.dtype)
+
+    if not return_lse:
+        return scaled
+    return scaled, merged_lse

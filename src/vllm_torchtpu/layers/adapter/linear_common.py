@@ -23,7 +23,10 @@ from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
-from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
+from vllm_torchtpu.kernels.quantized_matmul.util import (
+    xla_prequantized_matmul,
+    xla_quantized_matmul,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -51,6 +54,10 @@ KEEP_VLLM_LAYOUT_ATTR = "_tpu_keep_vllm_weight_layout"
 # (`dummy_loader`, `reload/layerwise`), where a second flip would transpose
 # back and silently corrupt the values.
 WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"
+
+# Set on a row-parallel FP8 linear whose rows are also gathered over the DCP
+# group (`weight_dcp`, `weight_scale_dcp`) for TPU_DCP_MLA_OPROJ_ALL_REDUCE.
+DCP_ROWS_ATTR = "_tpu_dcp_rows"
 
 
 def _get_x_q_dtype(w_q_dtype: jnp.dtype) -> jnp.dtype:
@@ -183,6 +190,48 @@ def quantized_matmul(
     x_2d = x.reshape(-1, x.shape[-1])
     out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s, w8a16_max_rows)
     return out_2d.reshape(orig_out_shape)
+
+
+_prequantized_matmul_op: Callable | None = None
+
+
+def _prequantized_matmul_jax(
+    x_q: jax.Array, x_scale: jax.Array, w_q: jax.Array, w_s: jax.Array
+) -> jax.Array:
+    return xla_prequantized_matmul(x_q, x_scale, w_q, w_s, jnp.bfloat16)
+
+
+def get_prequantized_matmul_op() -> Callable:
+    """Build or return the cached prequantized matmul op outside Dynamo."""
+    global _prequantized_matmul_op
+    if _prequantized_matmul_op is not None:
+        return _prequantized_matmul_op
+    with _quantized_matmul_kernel_op_lock:
+        if _prequantized_matmul_op is not None:
+            return _prequantized_matmul_op
+        op = pallas.jax_op("pallas::prequantized_matmul", _prequantized_matmul_jax)
+
+        def _fake(x_q, x_scale, w_q, w_s):
+            del x_scale, w_s
+            return torch.empty(
+                x_q.shape[0], w_q.shape[1], dtype=torch.bfloat16, device=x_q.device
+            )
+
+        op.register_fake(_fake)
+        _prequantized_matmul_op = op
+        return op
+
+
+def prequantized_matmul(
+    x_q: torch.Tensor, x_scale: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor
+) -> torch.Tensor:
+    """Per-channel FP8 linear on pre-quantized `(x_q, x_scale)` activations."""
+    op = _prequantized_matmul_op
+    if op is None:
+        raise RuntimeError(
+            "prequantized_matmul op not built: call get_prequantized_matmul_op()"
+        )
+    return op(x_q, x_scale, w_q, w_s)
 
 
 def _quantized_matmul_fp4_jax(

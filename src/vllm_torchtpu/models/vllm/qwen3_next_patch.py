@@ -25,6 +25,7 @@ serves every bucket under TPU_MOE_SEQUENCE_PARALLEL=1:
   computations across layers.
 """
 
+import threading
 from itertools import islice
 
 import torch
@@ -38,12 +39,89 @@ from vllm.model_executor.models import qwen3_next
 from vllm.sequence import IntermediateTensors
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.distributed.dcp import get_dcp_group
+from vllm_torchtpu.layers.adapter.cp_attention import (
+    DCPGroupRowParallelLinear,
+    is_dcp_duplicate_o_proj_enabled,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
 UPSTREAM_DECODER_LAYER_FORWARD = qwen3_next.Qwen3NextDecoderLayer.forward
 UPSTREAM_MODEL_FORWARD = qwen3_next.Qwen3NextModel.forward
+UPSTREAM_ATTENTION_INIT = qwen3_next.Qwen3NextAttention.__init__
+UPSTREAM_PROJECT_QKV_GATE = qwen3_next.Qwen3NextAttention._project_qkv_gate
+UPSTREAM_ATTENTION_FORWARD = qwen3_next.Qwen3NextAttention.forward
+
+_INIT_LOCK = threading.Lock()
+
+
+def patched_attention_init(self, *args, **kwargs):
+    use_dcp_o_dup = is_dcp_duplicate_o_proj_enabled()
+    with _INIT_LOCK:
+        orig_row_parallel = qwen3_next.RowParallelLinear
+        if use_dcp_o_dup:
+            qwen3_next.RowParallelLinear = DCPGroupRowParallelLinear
+        try:
+            UPSTREAM_ATTENTION_INIT(self, *args, **kwargs)
+        finally:
+            qwen3_next.RowParallelLinear = orig_row_parallel
+
+    self.dcp_duplicate_o_proj = bool(
+        use_dcp_o_dup and getattr(self.o_proj, "orep_active", False)
+    )
+    if self.dcp_duplicate_o_proj:
+        assert getattr(self, "num_kv_heads", 1) == 1, (
+            "DCP duplicate o_proj requires num_kv_heads == 1 per rank "
+            f"(got {getattr(self, 'num_kv_heads', None)})."
+        )
+        self.attn.dcp_duplicate_o_proj = True
+        impl = getattr(self.attn, "impl", None)
+        if impl is not None:
+            impl.dcp_duplicate_o_proj = True
+        self.use_fused_qk_norm_rope_gate = False
+
+
+def patched_project_qkv_gate(self, qkv, positions):
+    q, k, v, gate = UPSTREAM_PROJECT_QKV_GATE(self, qkv, positions)
+    if getattr(self, "dcp_duplicate_o_proj", False):
+        dcp_group = get_dcp_group()
+        if dcp_group is None:
+            raise RuntimeError(
+                "DCP group not initialized; cannot run dcp_duplicate_o_proj."
+            )
+        dcp_size = int(dcp_group.world_size)
+        if dcp_size > 1 and q.shape[-1] == self.num_heads * self.head_dim:
+            q_reshaped = q.view(-1, self.num_heads, self.head_dim)
+            if gate is not None:
+                orig_gate_shape = gate.shape[:-1]
+                gate_reshaped = gate.view(-1, self.num_heads, self.head_dim)
+                qg_local = torch.cat([q_reshaped, gate_reshaped], dim=0)
+                qg_across_dcp = dcp_group.all_gather(qg_local, dim=1)
+                q_across, gate_across = torch.chunk(qg_across_dcp, 2, dim=0)
+                q = q_across.reshape(-1, self.num_heads * dcp_size * self.head_dim)
+                gate = gate_across.reshape(
+                    *orig_gate_shape, self.num_heads * dcp_size * self.head_dim
+                )
+            else:
+                q_across = dcp_group.all_gather(q_reshaped.contiguous(), dim=1)
+                q = q_across.reshape(-1, self.num_heads * dcp_size * self.head_dim)
+    return q, k, v, gate
+
+
+def patched_attention_forward(self, positions, hidden_states):
+    if not getattr(self, "dcp_duplicate_o_proj", False):
+        return UPSTREAM_ATTENTION_FORWARD(self, positions, hidden_states)
+    qkv, _ = self.qkv_proj(hidden_states)
+    q, k, v, gate = self._project_qkv_gate(qkv, positions)
+    dcp_size = int(getattr(self.o_proj, "group_size", 1))
+    output_shape = torch.Size((k.shape[0], self.num_heads * dcp_size * self.head_dim))
+    attn_output = self.attn(q, k, v, output_shape=output_shape)
+    if gate is not None:
+        attn_output = attn_output * torch.sigmoid(gate)
+    output, _ = self.o_proj(attn_output)
+    return output
 
 
 def _check_tokens_divide_by_tp(num_tokens: int) -> None:
@@ -187,7 +265,11 @@ def patched_model_forward(
 
 
 def maybe_patch_qwen3_next(*args: object, **kwargs: object) -> None:
-    """Install trace-stable forwards when TPU_MOE_SEQUENCE_PARALLEL=1."""
+    """Install attention patches and trace-stable sequence-parallel forwards."""
+    qwen3_next.Qwen3NextAttention.__init__ = patched_attention_init
+    qwen3_next.Qwen3NextAttention._project_qkv_gate = patched_project_qkv_gate
+    qwen3_next.Qwen3NextAttention.forward = patched_attention_forward
+
     if not envs.TPU_MOE_SEQUENCE_PARALLEL:
         return None
     qwen3_next.Qwen3NextDecoderLayer.forward = patched_decoder_layer_forward
