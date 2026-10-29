@@ -173,7 +173,7 @@ def _bare_driver(monkeypatch: pytest.MonkeyPatch, *, eligible: bool = True) -> A
     drv._backbone = None
     calls: list[str] = []
 
-    def can_run(*_a: Any, **_k: Any) -> bool:
+    def route(*_a: Any, **_k: Any) -> bool:
         calls.append("can_run")
         drv._pending = ("prepared",)
         return eligible
@@ -182,7 +182,7 @@ def _bare_driver(monkeypatch: pytest.MonkeyPatch, *, eligible: bool = True) -> A
         calls.append("run")
         return torch.full((int(positions.shape[-1]), 4), 7.0)
 
-    monkeypatch.setattr(drv, "can_run", can_run, raising=False)
+    monkeypatch.setattr(drv, "_route", route, raising=False)
     monkeypatch.setattr(
         driver_mod.ProgramDriver,
         "__call__",
@@ -282,20 +282,21 @@ def test_try_forward_unpacks_step_context(monkeypatch: pytest.MonkeyPatch) -> No
     drv = _bare_driver(monkeypatch)
     seen: dict[str, Any] = {}
 
-    def can_run(input_ids: Any, positions: Any, **kw: Any) -> bool:
-        seen.update(input_ids=input_ids, positions=positions, **kw)
+    def route(ctx: Any, runner: Any) -> bool:
+        seen.update(ctx=ctx, runner=runner)
         return False
 
-    monkeypatch.setattr(drv, "can_run", can_run, raising=False)
+    monkeypatch.setattr(drv, "_route", route, raising=False)
     runner = SimpleNamespace()
     ids = torch.zeros((2,), dtype=torch.int32)
     pos = torch.zeros((2,), dtype=torch.int32)
     emb, it = object(), object()
     ctx = StepContext(ids, pos, inputs_embeds=emb, intermediate_tensors=it)
     assert drv.try_forward(runner, ctx) == (False, None)
-    assert seen["input_ids"] is ids and seen["positions"] is pos
-    assert seen["inputs_embeds"] is emb and seen["intermediate_tensors"] is it
-    assert seen["runner"] is runner
+    # The runner's step context reaches the routing decision unchanged.
+    assert seen["ctx"] is ctx and seen["runner"] is runner
+    assert (ctx.input_ids, ctx.positions) == (ids, pos)
+    assert ctx.inputs_embeds is emb and ctx.intermediate_tensors is it
 
 
 @pytest.mark.parametrize("model_kwargs", [None, {}, {"extra": 1}])

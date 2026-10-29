@@ -1051,11 +1051,11 @@ class Qwen35Program:
             self._prepared = (attn_md, m_mds)
         return decision
 
-    @torch.no_grad()
     def forward(
         self, decision: mk_rt.StepDecision | None, ctx: Any, fwd: ForwardView
     ) -> torch.Tensor:
-        """Execute one full-backbone decode (`T=1`) or MTP verify (`T=4`) step."""
+        """Execute one full-backbone decode (`T=1`) or MTP verify (`T=4`) step
+        (the runtime calls it under `torch.no_grad()`)."""
         input_ids, positions = ctx.input_ids, ctx.positions
         prepared, self._prepared = self._prepared, None
         if decision is not None and prepared is not None:

@@ -349,7 +349,7 @@ def _req_block_pairs(runner: Any) -> Iterator[tuple[int, int]]:
     return iter(pairs)
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(slots=True)
 class ForwardView:
     """What a program sees of one forward step besides its `StepContext`.
 
@@ -359,7 +359,8 @@ class ForwardView:
     the row count the stock model would return. `batch_shape(attn_md, m0)`
     is the runtime's host-only batch inspection; the program passes its
     attention and first recurrent layer metadata, used only when the runner
-    can't describe the batch itself.
+    can't describe the batch itself. Built once per step by the runtime;
+    programs treat it as read-only.
     """
 
     attn_metadata: Mapping[str, Any] | None

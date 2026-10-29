@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import contextlib
-import dataclasses
 import functools
 import os
 import time
@@ -768,7 +767,9 @@ class ProgramDriver:
         self._buckets: list[Bucket] = []
         self._steps: dict[tuple[int, int], StepFn] = {}
         self._bound = False
-        self._pending: tuple[Any, ForwardView] | None = None
+        self._pending: tuple[Any, ForwardView, StepContext] | None = None
+        self._inspect: Any = None
+        self._inspect_runner: Any = None
         self.pool_layout_facts: Any = None
         self.step_mix_tracker = _rt.StepMixTracker(period_s=float(stats_period_s))
         self.ab_calibrator = _rt.MKABCalibrator(
@@ -1030,13 +1031,15 @@ class ProgramDriver:
 
     def _forward_view(self, runner: Any, num_tokens: int | None = None) -> ForwardView:
         md = getattr(get_forward_context(), "attn_metadata", None)
-        mrope = getattr(getattr(runner, "mrope_positions", None), "np", None)
+        if runner is not self._inspect_runner or self._inspect is None:
+            self._inspect = functools.partial(_inspect_step_detail, runner=runner)
+            self._inspect_runner = runner
         return ForwardView(
-            attn_metadata=md if isinstance(md, dict) else None,
-            mrope_positions=mrope if runner is not None else None,
-            steps=self._steps,
-            num_tokens=num_tokens,
-            inspect=functools.partial(_inspect_step_detail, runner=runner),
+            md if isinstance(md, dict) else None,
+            getattr(getattr(runner, "mrope_positions", None), "np", None),
+            self._steps,
+            num_tokens,
+            self._inspect,
         )
 
     def can_run(
@@ -1048,27 +1051,30 @@ class ProgramDriver:
         runner: Any = None,
     ) -> bool:
         """Return `True` if the current forward step should run on the megakernel."""
+        ctx = StepContext(input_ids, positions, inputs_embeds, intermediate_tensors)
+        return self._route(ctx, runner)
+
+    def _route(self, ctx: StepContext, runner: Any) -> bool:
         self._pending = None
         self.ab_calibrator.last_decision = ("stock_early", "stock")
         if (
             not self._bound
-            or input_ids is None
-            or inputs_embeds is not None
-            or intermediate_tensors is not None
+            or ctx.input_ids is None
+            or ctx.inputs_embeds is not None
+            or ctx.intermediate_tensors is not None
             or _aux_hidden_layers(self._backbone)
         ):
             return False
         bctx = getattr(runner, "_attn_metadata_builder_ctx", None)
         if getattr(bctx, "position_ids_override", None) is not None:
             return False
-        ctx = StepContext(input_ids, positions, inputs_embeds, intermediate_tensors)
         fwd = self._forward_view(runner)
         decision = self.program.decide(ctx, fwd)
         if decision is None:
             return False
         if not decision.eligible:
             return self._note_step(decision.reason, False)
-        self._pending = (decision, fwd)
+        self._pending = (decision, fwd, ctx)
         return self._note_step(decision.reason, True)
 
     def _note_step(self, key: str, run: bool) -> bool:
@@ -1108,12 +1114,13 @@ class ProgramDriver:
         n_tok = int(num_tokens if num_tokens is not None else input_ids.shape[0])
         if pending is None:
             decision, fwd = None, self._forward_view(runner, n_tok)
+            ctx = StepContext(input_ids, positions)
         else:
-            decision, fwd = (
-                pending[0],
-                dataclasses.replace(pending[1], num_tokens=n_tok),
-            )
-        return self.program.forward(decision, StepContext(input_ids, positions), fwd)
+            decision, fwd, ctx = pending
+            fwd.num_tokens = n_tok
+            if ctx.input_ids is not input_ids or ctx.positions is not positions:
+                ctx = StepContext(input_ids, positions)
+        return self.program.forward(decision, ctx, fwd)
 
     def try_forward(self, runner: Any, ctx: StepContext) -> tuple[bool, Any]:
         """Try to execute the current forward step on the megakernel.
@@ -1132,13 +1139,7 @@ class ProgramDriver:
         input_ids, positions = ctx.input_ids, ctx.positions
         inputs_embeds = ctx.inputs_embeds
         intermediate_tensors = ctx.intermediate_tensors
-        use_mk = self.can_run(
-            input_ids,
-            positions,
-            inputs_embeds=inputs_embeds,
-            intermediate_tensors=intermediate_tensors,
-            runner=runner,
-        )
+        use_mk = self._route(ctx, runner)
         ab_t0 = time.perf_counter() if self.ab_calibrator.enabled else None
         if use_mk:
             assert input_ids is not None and positions is not None
