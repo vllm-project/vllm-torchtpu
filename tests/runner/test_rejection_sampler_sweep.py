@@ -158,9 +158,26 @@ def _no_collectives(*args, **kwargs):
     raise AssertionError("eager collective in the rejection-sampler sweep")
 
 
+@pytest.fixture
+def wide_dynamo_limits():
+    """Every shape and variant is its own dynamic=False graph; the runner widens
+    Dynamo's limits for that (TPUModelRunner.__init__), which this test skips.
+
+    Use config.patch rather than monkeypatch.setattr: since pytest 9.2.0,
+    monkeypatch's undo deletes torch config entries (they are not in the module
+    ``__dict__``), and every later compile in the session then fails.
+    """
+    with torch._dynamo.config.patch(
+        cache_size_limit=1024, accumulated_recompile_limit=1024
+    ):
+        yield
+
+
 @pytest.mark.parametrize("optional_paths", [False, True])
 @pytest.mark.parametrize("synthetic", [False, True])
-def test_rotated_sweep_holds_no_collective(monkeypatch, synthetic, optional_paths):
+def test_rotated_sweep_holds_no_collective(
+    monkeypatch, wide_dynamo_limits, synthetic, optional_paths
+):
     """Rotation lets ranks reach each shape at different times, so a collective
     anywhere in the sweep would deadlock them. Run the real sweep on CPU, with
     the real rejection sampler and verify preludes recorded as they compile,
@@ -189,10 +206,6 @@ def test_rotated_sweep_holds_no_collective(monkeypatch, synthetic, optional_path
         monkeypatch.setattr(torch.distributed, name, _no_collectives)
     monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda out: None)
     monkeypatch.delenv(FLAG, raising=False)
-    # Every shape and variant is its own dynamic=False graph; the runner widens
-    # Dynamo's limits for that (TPUModelRunner.__init__), which this test skips.
-    monkeypatch.setattr(torch._dynamo.config, "cache_size_limit", 1024)
-    monkeypatch.setattr(torch._dynamo.config, "accumulated_recompile_limit", 1024)
 
     spec_config = (
         SimpleNamespace(
