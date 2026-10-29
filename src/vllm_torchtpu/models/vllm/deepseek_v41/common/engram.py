@@ -738,6 +738,9 @@ class Engram(upstream.Engram):
         if self._staged_raw is None:
             super().prepare_embeddings(hash_ids)
             return
+        if self.uses_hbm_lookup:
+            self._hbm_prepare(hash_ids)
+            return
         dp_size = self.embed_tokens.dp_size
         num_tokens, remainder = divmod(hash_ids.shape[0], dp_size)
         if remainder or num_tokens > self._host_raw.shape[0]:
@@ -792,9 +795,114 @@ class Engram(upstream.Engram):
         upload.copy_from(host_words[: raw_words + scale_words])
         self.activate_prepared_embeddings(num_tokens, upload)
 
+    @property
+    def uses_hbm_lookup(self) -> bool:
+        """``TPU_DSV41_ENGRAM_HBM``: rows come from the HBM copy of the host
+        head shard through ``engram_hbm`` instead of the host exchange."""
+        from .engram_hbm import should_use_hbm_lookup
+
+        return should_use_hbm_lookup(
+            staged_raw=self._staged_raw,
+            dp_size=int(self.embed_tokens.dp_size),
+            layer_hash_index=int(getattr(self, "layer_hash_index", -1)),
+        )
+
+    def upload_hbm_table(self):
+        """Copy this rank's host head shard to HBM once; returns
+        (table, scales, shard metadata, rows per rank)."""
+        state = getattr(self, "_hbm_table", None)
+        if state is not None:
+            return state
+        from .engram_hbm import gather_shard_meta, upload_table
+
+        emb = self.embed_tokens
+        weight, scales = emb._storage()
+        meta = gather_shard_meta(
+            int(emb.head_start),
+            int(emb.vocab_start_idx),
+            int(emb.vocab_end_idx),
+            int(weight.shape[0]),
+        )
+        rows = max(m[3] for m in meta)
+        device = cast(torch.Tensor, self._staged_raw).device
+        table, table_scales = upload_table(weight, scales, device, rows)
+        self._hbm_table = (table, table_scales, meta, rows)
+        logger.info(
+            "[DSV41] Engram HBM table: layer=%d rows/rank=%d bytes=%d",
+            self.layer_hash_index,
+            rows,
+            table.numel() + table_scales.numel(),
+        )
+        return self._hbm_table
+
+    def _hbm_prepare(self, hash_ids: torch.Tensor) -> None:
+        """Look this rank's tokens up on device; ``_ready_rows`` returns them."""
+        from vllm.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
+        from vllm.models.deepseek_v41.common.engram import DEAD_ID
+
+        from vllm_torchtpu.distributed.ep_mesh import ep_mesh_index
+
+        from .engram_hbm import build_lookup_op
+
+        table, table_scales, meta, rows = self.upload_hbm_table()
+        emb = self.embed_tokens
+        num_tokens = int(hash_ids.shape[0])
+        if is_forward_context_available():
+            sizes = get_forward_context().additional_kwargs.get(
+                "tpu_num_tokens_across_dp_cpu"
+            )
+            if sizes:
+                num_tokens = max(num_tokens, *(int(s) for s in sizes))
+        if num_tokens > self._host_raw.shape[0]:
+            raise ValueError("Engram hashes exceed the configured staging capacity")
+        if not num_tokens:
+            cols = int(emb.part_n_hash_cols) * int(emb.dp_size)
+            self._active_upload = None
+            self._hbm_rows = table.new_empty(
+                (0, cols, int(self._host_raw.shape[-1])), dtype=torch.bfloat16
+            )
+            return
+        if hash_ids.shape[0] < num_tokens:
+            pad = hash_ids.new_full(
+                (num_tokens - hash_ids.shape[0], *hash_ids.shape[1:]), DEAD_ID
+            )
+            hash_ids = torch.cat((hash_ids, pad), dim=0)
+        op = build_lookup_op(
+            int(self.layer_hash_index),
+            num_tokens,
+            int(emb.n_hash_cols),
+            int(emb.part_n_hash_cols),
+            rows,
+            int(self._host_raw.shape[-1]),
+            int(emb.block_size),
+            int(emb.dp_size),
+            meta,
+        )
+        rank = getattr(self, "_hbm_rank", None)
+        if rank is None:
+            rank = torch.tensor(
+                [[cast(int, ep_mesh_index())]], dtype=torch.int32, device=table.device
+            )
+            self._hbm_rank = rank
+        hashes = hash_ids.to(device=table.device, dtype=torch.int32)
+        embedded = op(hashes, table, table_scales, rank)
+        if num_tokens >= 2:
+            torch._dynamo.mark_dynamic(embedded, 0)
+        self._active_upload = None
+        self._hbm_rows = embedded
+
     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
         if self._staged_raw is None:
             return super()._ready_rows(num_tokens)
+        # Set only by ``_hbm_prepare``; read as a plain attribute so the
+        # compiled stage does not trace the env/EP-mesh gating.
+        hbm_rows = getattr(self, "_hbm_rows", None)
+        if hbm_rows is not None:
+            # The device lookup already dequantized this step's rows.
+            return hbm_rows[:num_tokens]
         local_num_tokens = num_tokens
         assert self._active_raw is not None
         num_tokens = self._active_raw.shape[0]
