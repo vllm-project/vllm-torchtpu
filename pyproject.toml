@@ -44,7 +44,7 @@ dependencies = [
     # supported torch ABI and dispatches to the variant matching the
     # installed torch at import time. Deployments provide the exact pinned
     # wheel when it is unavailable from the package index.
-    "tpu-sync-torch==0.0.1.dev20261021092211",
+    "tpu-sync-torch==0.0.1.dev20261027031458",
     # Imported directly by src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py, so
     # declared here rather than leaned on as a vLLM transitive.
     #
