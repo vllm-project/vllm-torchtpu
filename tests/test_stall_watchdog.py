@@ -18,6 +18,7 @@ def test_dumps_once_per_stall_only_with_live_requests(monkeypatch):
     monkeypatch.setattr(
         stall_watchdog.faulthandler, "dump_traceback", lambda **kw: dumps.append(1)
     )
+    monkeypatch.setattr(stall_watchdog, "_armed", True)
     stall_watchdog.note_step(0)
     stall_watchdog._last_step = time.monotonic() - 10
     threading.Thread(target=stall_watchdog._watch, args=(0.2, 3), daemon=True).start()

@@ -781,6 +781,9 @@ class TPUWorker(WorkerBase):
         # Warmup (dummy runs, spec-decode warmup requests) is over: steps from here
         # on serve real requests (read by the megakernel check mode).
         self.model_runner.warmup_done = True
+        from vllm_torchtpu import stall_watchdog
+
+        stall_watchdog.arm()
         if envs.VLLM_TPU_CPU_PIN != "off" or envs.VLLM_TPU_CPU_PROBE_S > 0:
             from vllm_torchtpu.worker import cpu_pinning
 
