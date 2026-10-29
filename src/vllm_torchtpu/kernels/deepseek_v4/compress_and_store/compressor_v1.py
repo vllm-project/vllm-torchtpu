@@ -179,6 +179,9 @@ def prepare_boundary_batch(
     Layout: [ decode_packed (0..K-1) | pad (K..K_aligned-1) |
     prefill_row_tiled (K_aligned..) | pad ]
 
+    A prefill tile is `rope_pack` slots holding the tokens of one cache row of
+    `rope_pack` kv slots; with `rope_pack` 1 the prefill tokens are dense.
+
     The boundary tokens, in token order, are the packed list the layout is
     defined on: a token's packed index is its rank among them. Every quantity is
     evaluated at the token itself, so the only data movement is one scatter of
@@ -286,6 +289,9 @@ def compressor_forward(
 
     is_decode_token = token_index < query_start_loc[distribution[0]]
     is_boundary = (kv_slot_mapping >= 0) & is_real_token
+    # HCA stores every record on its own, with no shared cache row to keep
+    # within one grid step, so its boundary tokens are packed densely.
+    is_hca = config.select_mode(head_dim, overlap) is config.Mode.HCA
 
     boundary_positions, boundary_req, boundary_kv_slot = prepare_boundary_batch(
         positions=positions,
@@ -295,6 +301,7 @@ def compressor_forward(
         is_decode_token=is_decode_token,
         compress_ratio=compress_ratio,
         num_reqs=num_reqs,
+        rope_pack=1 if is_hca else 4,
     )
 
     cache, rope_cache = compress_kernel.compress_norm_rope_store(
