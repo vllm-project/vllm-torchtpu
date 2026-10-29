@@ -12,18 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Experimental TPU7x sparse decode.
+"""TPU7x sparse decode.
 
-JAX-facing API; page lookup indirectly imports the existing MLA/Torch helper.
+JAX-facing API with per-query physical page lookup.
 Callers guarantee valid group/page IDs and lengths, and thread returned cache
 ownership through outer jit donation. Shape eligibility does not inspect IDs.
 """
 
 import jax
 
-from .decode import execute_decode as _decode
-from .eligibility import is_supported_by_fused_decode as is_supported_by_fused_decode
-from .eligibility import plan_decode as plan_decode
+from vllm_torchtpu.kernels.sparse_gqa_decode.decode import execute_decode as _decode
+from vllm_torchtpu.kernels.sparse_gqa_decode.eligibility import (
+    is_supported_by_fused_decode as is_supported_by_fused_decode,
+)
+from vllm_torchtpu.kernels.sparse_gqa_decode.eligibility import (
+    plan_decode as plan_decode,
+)
 
 
 def qsa_decode_attention(
@@ -35,7 +39,7 @@ def qsa_decode_attention(
     cache: jax.Array,
     *,
     kv_heads: int,
-    ratio: int = 4,
+    ratio: int,
     k_scale: float = 1.0,
     v_scale: float = 1.0,
 ) -> tuple[jax.Array, jax.Array]:

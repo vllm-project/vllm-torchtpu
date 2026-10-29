@@ -50,6 +50,7 @@ def make_config(
         ),
         serve=configs.ServingConfigs(
             num_seqs=batch,
+            # Selected groups are virtual RPA pages of ratio tokens.
             page_size=ratio,
             total_q_tokens=batch,
             num_page_indices=batch * (groups + 1),
@@ -185,7 +186,7 @@ def _plan_launch(
         resources = resource_usage(cfgs)
         if resources.fits(info):
             return DecodeLaunch(policy=policy, config=cfgs, resources=resources)
-        size //= 2
+        size = 1 << ((size - 1).bit_length() - 1) if size > 1 else 0
     return None
 
 
@@ -198,9 +199,11 @@ def query_batch_size(
     groups: int,
     cache_dtype: jnp.dtype,
 ) -> int:
-    """Largest power-of-two launch fitting resources; zero means use RPA."""
+    """Try the actual batch, then smaller power-of-two resource fits."""
     info = pltpu.get_tpu_info()
-    capacity = 1 << (batch - 1).bit_length()
+    if batch <= 0:
+        return 0
+    capacity = batch
     cfgs = make_config(
         capacity, heads, dim, kv_heads, ratio, groups, cache_dtype, info=info
     )

@@ -1,7 +1,8 @@
 # Fused sparse GQA decode
 
-QSA uses fused decode on supported TPU7x inputs and retains batched RPA
-otherwise; prefill is unchanged. [Eligibility][eligibility] requires BF16
+QSA uses fused decode on supported TPU7x inputs and bounded batched RPA
+otherwise. Prefill layouts without aligned TC DMA segments also use bounded RPA.
+[Eligibility][eligibility] requires BF16
 Q/gate, divisible positive Q/KV heads, lane-aligned dimensions, native
 `HEAD_ALONG_SUBLANE` BF16/FP8 cache, nonempty metadata and int32-bounded
 addresses, positive finite K/V scales, and a positive ratio dividing page and tile.
@@ -19,7 +20,8 @@ The 256-token tile and eight lanes balance scheduling work and live buffers;
 this measured policy is not a hardware law or universal optimum. [Planning][planning]
 derives capacity from shapes, schedule/scalar bytes and live buffers against
 SMEM/VMEM budgets; conservative compiler headroom is not measured peak use.
-No fitting single-query plan means RPA fallback; larger batches are chunked.
+The actual batch is tried before smaller power-of-two chunks. No fitting
+single-query plan means RPA fallback.
 Benchmark maxima do not define eligibility.
 
 ## DMA, ownership and rounding

@@ -31,15 +31,10 @@ from vllm_torchtpu.kernels.qwen4_exp.qsa import (
     bf16,
     quantize_kv,
 )
-from vllm_torchtpu.kernels.sparse_gqa_decode.batching import (
-    attend_in_chunks,
-)
+from vllm_torchtpu.kernels.sparse_gqa_decode import batching
 from vllm_torchtpu.kernels.sparse_gqa_decode.metadata import (
     virtual_page_metadata as sparse_page_metadata,
 )
-
-# Performance scheduling cap; SMEM capacity is checked separately.
-RPA_MAX_QUERY_BATCH = 64
 
 
 def pack_rows(key, value, *, fp8, k_scale=1.0, v_scale=1.0):
@@ -54,7 +49,7 @@ def pack_rows(key, value, *, fp8, k_scale=1.0, v_scale=1.0):
     return joined
 
 
-def virtual_page_metadata(blocks, lengths, table, *, ratio=4, page_size=128):
+def virtual_page_metadata(blocks, lengths, table, *, ratio: int, page_size: int):
     """Map sparse pages and pack the legacy RPA request metadata."""
     pages, kv_lens = sparse_page_metadata(
         blocks, lengths, table, ratio=ratio, page_size=page_size
@@ -132,7 +127,7 @@ def _rpa_attention_in_chunks(
         k_scale=k_scale,
         v_scale=v_scale,
     )
-    return attend_in_chunks(
+    return batching.attend_in_chunks(
         attend,
         q,
         gate,
@@ -140,7 +135,7 @@ def _rpa_attention_in_chunks(
         lengths,
         table,
         cache,
-        batch_size=rpa_query_batch_size(
+        batch_size=batching.rpa_query_batch_size(
             blocks.shape[1] + 1,
             query=q,
             cache=cache,
@@ -204,70 +199,6 @@ def rpa_attention(
     )
 
 
-def rpa_query_batch_size(
-    page_columns: int,
-    *,
-    query: jax.Array | jax.ShapeDtypeStruct,
-    cache: jax.Array | jax.ShapeDtypeStruct,
-    kv_heads: int,
-    ratio: int,
-) -> int:
-    from vllm_torchtpu.kernels.experimental.batched_rpa import configs, schedule
-
-    if page_columns < 1 or ratio < 1:
-        raise ValueError("QSA page width and compression ratio must be positive")
-    info = pltpu.get_tpu_info()
-    batch = RPA_MAX_QUERY_BATCH
-    while batch:
-        cfgs = configs.RpaConfigs(
-            block=configs.BlockSizes(bq_sz=1, bq_c_sz=1, bkv_sz=256, batch_size=8),
-            model=configs.ModelConfigs(
-                num_q_heads=query.shape[1],
-                num_kv_heads=kv_heads,
-                head_dim=cache.shape[-1],
-                mask_value=float(jnp.finfo(jnp.float32).min),
-            ),
-            serve=configs.ServingConfigs(
-                num_seqs=batch,
-                page_size=ratio,
-                total_q_tokens=batch,
-                num_page_indices=batch * page_columns,
-                dtype_q=jnp.dtype(jnp.float32),
-                dtype_kv=cache.dtype,
-                dtype_out=jnp.dtype(jnp.float32),
-                skip_kv_update=True,
-            ),
-            mode=configs.RpaCase.DECODE,
-            vmem_limit_bytes=info.vmem_capacity_bytes,
-        )
-        scratch = schedule.BaseMetadataComputer.get_rpa_schedule(cfgs).scratch_shapes()
-        scratch_bytes = sum(
-            math.prod(ref.shape) * ref.dtype.itemsize
-            for ref in jax.tree.leaves(scratch)
-        )
-        scalar_shapes = (
-            (batch + 1,),
-            (batch,),
-            (batch,),
-            (batch,),
-            (batch * page_columns,),
-        )
-        scalar_bytes = sum(
-            math.prod(shape) * jnp.dtype(jnp.int32).itemsize for shape in scalar_shapes
-        )
-        # Schedule generation has distribution[3] in place of the page table.
-        scalar_bytes = max(
-            scalar_bytes, (4 * batch + 1 + 3) * jnp.dtype(jnp.int32).itemsize
-        )
-        if scratch_bytes + scalar_bytes <= info.smem_capacity_bytes:
-            return batch
-        batch //= 2
-    raise ValueError(
-        "One QSA page-table row and the RPA schedule exceed SMEM capacity; "
-        "reduce the sparse page budget."
-    )
-
-
 def _prefill_attention(
     query,
     gate,
@@ -316,6 +247,21 @@ def _prefill_attention(
             starts,
             kv_heads=kv_heads,
             ratio=ratio,
+        )
+
+    mask_tile = ratio * jnp.iinfo(jnp.int32).bits
+    if math.gcd(cache.shape[1], mask_tile) % pltpu.get_tpu_info().num_lanes:
+        return _rpa_attention_in_chunks(
+            query,
+            gate,
+            blocks,
+            lengths,
+            table,
+            cache,
+            kv_heads=kv_heads,
+            ratio=ratio,
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
 
     query_block, kv_tile = get_sparse_prefill_tiles(
@@ -378,7 +324,7 @@ def qsa_attention(
         )
         batch = min(
             tokens,
-            rpa_query_batch_size(
+            batching.rpa_query_batch_size(
                 blocks.shape[1] + 1,
                 query=query,
                 cache=cache,

@@ -16,6 +16,38 @@
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+
+from vllm_torchtpu.kernels.sparse_gqa_decode.planning import VMEM_USABLE_FRACTION
+
+
+def _vector_gather_rows(
+    table: jax.Array | jax.ShapeDtypeStruct,
+    logical: jax.Array | jax.ShapeDtypeStruct,
+) -> int | None:
+    if table.shape[0] == 0 or jax.default_backend() != "tpu":
+        return None
+    from vllm_torchtpu.kernels.mla.sparse.kernel import _GATHER_PAGE_CHUNK
+
+    info = pltpu.get_tpu_info()
+    padded_pages = pl.cdiv(table.shape[1], _GATHER_PAGE_CHUNK) * _GATHER_PAGE_CHUNK
+    # Bound the gather kernel's Python-unrolled windows by one vector row.
+    if (
+        padded_pages > info.num_lanes
+        or table.dtype != jnp.int32
+        or logical.dtype != jnp.int32
+    ):
+        return None
+    rows = info.num_sublanes
+    elements = rows * pl.cdiv(logical.shape[1], info.num_lanes) * info.num_lanes
+    table_bytes = rows * padded_pages * table.dtype.itemsize
+    index_bytes = elements * logical.dtype.itemsize
+    output_bytes = elements * jnp.dtype(jnp.int32).itemsize
+    staging_bytes = table_bytes + index_bytes + output_bytes
+    if staging_bytes > info.vmem_capacity_bytes * VMEM_USABLE_FRACTION:
+        return None
+    return rows
 
 
 def virtual_page_metadata(
@@ -23,15 +55,19 @@ def virtual_page_metadata(
     lengths: jax.Array,
     table: jax.Array,
     *,
-    ratio: int = 4,
-    page_size: int = 128,
+    ratio: int,
+    page_size: int,
 ) -> tuple[jax.Array, jax.Array]:
     """Map groups of ratio tokens through physical pages of page_size tokens.
 
     page_size comes from the original cache shape; the returned RPA page has
     ratio tokens. Valid group/page IDs and bounded lengths are caller contracts.
     """
+    if ratio <= 0 or page_size <= 0 or page_size % ratio:
+        raise ValueError("Physical page size must be positive and divisible by ratio")
     batch, budget = blocks.shape
+    if table.ndim != 2 or table.shape[0] != batch or table.shape[1] == 0:
+        raise ValueError("Page tables must have one nonempty row per query")
     complete = lengths // ratio
     count = jnp.minimum(complete, budget)
     columns = jnp.arange(budget + 1)[None, :]
@@ -41,16 +77,20 @@ def virtual_page_metadata(
         (columns == count[:, None]) & ((lengths % ratio)[:, None] > 0)
     )
     safe = jnp.where(valid, groups, 0)
-    # Reuse sparse MLA's vector lookup for small page tables; the generic
-    # gather lowers to a slower indirect lookup on this path.
-    from vllm_torchtpu.kernels.mla.sparse.kernel import gather_page_ids
+    logical = jnp.clip(safe // (page_size // ratio), 0, table.shape[1] - 1)
+    gather_rows = _vector_gather_rows(table, logical)
+    if gather_rows is None:
+        physical = jnp.take_along_axis(table, logical, axis=1)
+    else:
+        from vllm_torchtpu.kernels.mla.sparse.kernel import gather_page_ids
 
-    physical = gather_page_ids(
-        table.reshape(-1),
-        safe // (page_size // ratio),
-        jnp.arange(batch, dtype=jnp.int32),
-        batch,
-    )
+        physical = gather_page_ids(
+            table.reshape(-1),
+            logical,
+            jnp.arange(batch, dtype=jnp.int32),
+            batch,
+            block_tokens=gather_rows,
+        )
     pages = jnp.where(
         valid, physical * (page_size // ratio) + safe % (page_size // ratio), 0
     )

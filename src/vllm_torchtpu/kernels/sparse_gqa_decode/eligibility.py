@@ -18,23 +18,30 @@ import jax
 import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
-from .abi import RPA_WAIT_ROW_WORDS
-from .planning import DecodeLaunch, _plan_launch, make_config
-from .tuned_block_sizes import DEFAULT_POLICY, DecodePolicy
+from vllm_torchtpu.kernels.sparse_gqa_decode.abi import RPA_WAIT_ROW_WORDS
+from vllm_torchtpu.kernels.sparse_gqa_decode.planning import (
+    DecodeLaunch,
+    _plan_launch,
+    make_config,
+)
+from vllm_torchtpu.kernels.sparse_gqa_decode.tuned_block_sizes import (
+    DEFAULT_POLICY,
+    DecodePolicy,
+)
 
 
 def plan_decode(
-    q: jax.Array,
-    gate: jax.Array,
-    blocks: jax.Array,
-    lengths: jax.Array,
-    table: jax.Array,
-    cache: jax.Array,
+    q: jax.Array | jax.ShapeDtypeStruct,
+    gate: jax.Array | jax.ShapeDtypeStruct,
+    blocks: jax.Array | jax.ShapeDtypeStruct,
+    lengths: jax.Array | jax.ShapeDtypeStruct,
+    table: jax.Array | jax.ShapeDtypeStruct,
+    cache: jax.Array | jax.ShapeDtypeStruct,
     *,
     kv_heads: int,
     ratio: int,
-    k_scale: float,
-    v_scale: float,
+    k_scale: object,
+    v_scale: object,
     policy: DecodePolicy = DEFAULT_POLICY,
 ) -> DecodeLaunch | None:
     """Static eligibility; callers supply valid per-query selected groups."""
@@ -100,7 +107,7 @@ def plan_decode(
     ):
         return None
     cfgs = make_config(
-        1 << (q.shape[0] - 1).bit_length(),
+        q.shape[0],
         q.shape[1],
         q.shape[2],
         kv_heads,
@@ -114,17 +121,17 @@ def plan_decode(
 
 
 def is_supported_by_fused_decode(
-    q: jax.Array,
-    gate: jax.Array,
-    blocks: jax.Array,
-    lengths: jax.Array,
-    table: jax.Array,
-    cache: jax.Array,
+    q: jax.Array | jax.ShapeDtypeStruct,
+    gate: jax.Array | jax.ShapeDtypeStruct,
+    blocks: jax.Array | jax.ShapeDtypeStruct,
+    lengths: jax.Array | jax.ShapeDtypeStruct,
+    table: jax.Array | jax.ShapeDtypeStruct,
+    cache: jax.Array | jax.ShapeDtypeStruct,
     *,
     kv_heads: int,
     ratio: int,
-    k_scale: float,
-    v_scale: float,
+    k_scale: object,
+    v_scale: object,
 ) -> bool:
     """Shape/static envelope only; callers guarantee metadata contents valid."""
     return (

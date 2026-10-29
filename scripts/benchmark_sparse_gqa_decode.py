@@ -33,7 +33,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import qsa_attention, rpa_attention
+from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import (
+    _rpa_attention_in_chunks as rpa_attention,
+)
+from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import (
+    qsa_attention,
+)
 
 
 def provenance(devices):
@@ -50,10 +55,13 @@ def provenance(devices):
 
     sources = {}
     for name, module in sorted(sys.modules.items()):
-        if name.startswith("vllm_torchtpu.kernels.") and getattr(
-            module, "__file__", None
+        if (
+            name.startswith("vllm_torchtpu.kernels.")
+            and module is not None
+            and module.__spec__ is not None
+            and module.__spec__.origin is not None
         ):
-            path = Path(module.__file__).resolve()
+            path = Path(module.__spec__.origin).resolve()
             sources[name] = dict(
                 path=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest()
             )
@@ -67,8 +75,7 @@ def provenance(devices):
             dict(
                 id=d.id,
                 kind=d.device_kind,
-                coords=getattr(d, "coords", None),
-                core_on_chip=getattr(d, "core_on_chip", None),
+                platform=d.platform,
                 process_index=d.process_index,
             )
             for d in devices
@@ -132,12 +139,12 @@ def main():
         "--batches", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 64, 128, 256]
     )
     parser.add_argument("--contexts", type=int, nargs="+", default=[8192])
-    parser.add_argument("--page-size", type=int, default=1664)
+    parser.add_argument("--page-size", type=int, required=True)
     parser.add_argument("--fp8", action="store_true")
     parser.add_argument("--heads", type=int, default=24)
-    parser.add_argument("--kv-heads", type=int, default=2)
+    parser.add_argument("--kv-heads", type=int, required=True)
     parser.add_argument("--dim", type=int, default=256)
-    parser.add_argument("--ratio", type=int, default=4)
+    parser.add_argument("--ratio", type=int, required=True)
     parser.add_argument("--groups", type=int, default=512)
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--trace", action="store_true")
@@ -178,16 +185,25 @@ def main():
             starts = jnp.arange(batch + 1, dtype=jnp.int32)
             funcs = {
                 "rpa": functools.partial(rpa_attention, **opts),
-                "fused": functools.partial(qsa_attention, starts=starts, **opts),
+                "fused": functools.partial(
+                    qsa_attention,
+                    starts=starts,
+                    request_distribution=jnp.array([batch, batch, batch], jnp.int32),
+                    **opts,
+                ),
             }
             compiled, owned, outputs, memory = {}, {}, {}, {}
+            exe = None
+            cache = None
             for label, fn in funcs.items():
                 exe = jax.jit(fn, donate_argnums=(5,)).lower(*inputs).compile()
                 hlo = exe.as_text()
+                assert hlo is not None
                 (directory / f"{label}.hlo.txt").write_text(hlo)
                 if label == "fused":
                     assert "fused_qsa_decode" in hlo
                 stats = exe.memory_analysis()
+                assert stats is not None
                 memory[label] = dict(
                     temp_bytes=stats.temp_size_in_bytes,
                     argument_bytes=stats.argument_size_in_bytes,
