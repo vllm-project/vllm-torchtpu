@@ -15,8 +15,10 @@
 
 Outputs are compared token for token only between runs with the same config
 and batch shape, since programs for different buckets, and eager versus
-compiled mode, round differently. Correctness against independent math uses
-the adapter merged into the base weights, compared by distribution.
+compiled mode, round differently. Other runs are compared by distribution, or
+may pick a different token where the top two are nearly tied. Correctness
+against independent math uses the adapter merged into the base weights,
+compared by distribution.
 """
 
 import contextlib
@@ -69,6 +71,12 @@ ORACLE_PROMPTS = PROMPTS + [
     "Monday comes after",
 ]
 FIRST_TOKEN = SamplingParams(temperature=0.0, max_tokens=1, logprobs=20)
+# Largest gap between the top two logprobs at which two programs that round
+# differently may pick different greedy tokens. The lm_head adapter's logits
+# lie in 32-64, where a bf16 step is 0.25, so this allows 8 steps against the
+# 1-2 that rounding moves them. Dropping the delta changes the first token of
+# every prompt, mostly with a larger gap.
+NEAR_TIE_LOGPROB_GAP = 2.0
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -195,6 +203,22 @@ def _greedy(llm, lora_request):
     return [list(output.outputs[0].token_ids) for output in outputs]
 
 
+def _greedy_steps(llm, lora_request, logprobs):
+    """Greedy tokens of each prompt, with the top logprobs of each step."""
+    params = SamplingParams(temperature=0.0, max_tokens=8, logprobs=logprobs)
+    outputs = llm.generate(PROMPTS, params, lora_request=lora_request, use_tqdm=False)
+    return [
+        (
+            list(o.outputs[0].token_ids),
+            [
+                {t: lp.logprob for t, lp in step.items()}
+                for step in o.outputs[0].logprobs
+            ],
+        )
+        for o in outputs
+    ]
+
+
 def _first_token_distributions(llm, lora_request=None):
     outputs = llm.generate(
         ORACLE_PROMPTS, FIRST_TOKEN, lora_request=lora_request, use_tqdm=False
@@ -205,13 +229,43 @@ def _first_token_distributions(llm, lora_request=None):
     ]
 
 
+def _total_variation(x, y):
+    """A token outside one side's top 20 counts as 0 there."""
+    return 0.5 * sum(abs(x.get(t, 0.0) - y.get(t, 0.0)) for t in x.keys() | y.keys())
+
+
 def _mean_total_variation(p, q):
-    """Mean over prompts; a token outside one side's top 20 counts as 0 there."""
-    distances = [
-        0.5 * sum(abs(x.get(t, 0.0) - y.get(t, 0.0)) for t in x.keys() | y.keys())
-        for x, y in zip(p, q)
-    ]
+    """Mean over prompts."""
+    distances = [_total_variation(x, y) for x, y in zip(p, q)]
     return sum(distances) / len(distances)
+
+
+def _aligned_mean_total_variation(p, q):
+    """Mean over the steps of each prompt up to the first one whose greedy
+    tokens differ; after it, the two runs continue from different text."""
+    distances = []
+    for (p_tokens, p_steps), (q_tokens, q_steps) in zip(p, q):
+        for p_token, q_token, x, y in zip(p_tokens, q_tokens, p_steps, q_steps):
+            distances.append(
+                _total_variation(
+                    {t: math.exp(lp) for t, lp in x.items()},
+                    {t: math.exp(lp) for t, lp in y.items()},
+                )
+            )
+            if p_token != q_token:
+                break
+    return sum(distances) / len(distances)
+
+
+def _assert_same_tokens_but_for_a_near_tie(tokens, expected, steps, prompt):
+    """tokens follow expected until a step where the other top token is
+    nearly tied with it; after that step, the text differs."""
+    for token, expected_token, logprobs in zip(tokens, expected, steps):
+        if token != expected_token:
+            assert token in logprobs, prompt
+            gap = logprobs[expected_token] - logprobs[token]
+            assert gap <= NEAR_TIE_LOGPROB_GAP, (prompt, gap)
+            return
 
 
 def _xla_cache_entries(worker):
@@ -239,12 +293,14 @@ def lora_llm():
 
 
 class TestLoRAEngine:
-    # First in the class, so the engine has not filled any slot yet.
     def test_new_adapters_swap_in_without_compiling(self, lora_llm, adapters):
         """OpenRL sends a new adapter id at every step. Filling a free slot,
         replacing an adapter in a full set of slots, and swapping in more new
         ids must compile nothing, also through the add_lora RPC, which runs
         with grad enabled."""
+        # Without this, a test that runs earlier on the shared engine would
+        # fill the slots and leave filling a free slot untested.
+        assert not lora_llm.llm_engine.list_loras()
         base = _greedy(lora_llm, None)
         entries = lora_llm.collective_rpc(_xla_cache_entries)
         assert _greedy(lora_llm, adapters["a"]) != base
@@ -307,8 +363,9 @@ class TestLoRAEngine:
 def lora_outputs(adapters):
     with _engine(**LORA_ARGS) as llm:
         return {
-            "base": _greedy(llm, None),
-            "lm_head": _greedy(llm, adapters["lm_head"]),
+            "base": _greedy_steps(llm, None, logprobs=20),
+            # The top two, to tell a near tie in the fast path test.
+            "lm_head": _greedy_steps(llm, adapters["lm_head"], logprobs=2),
             "oracle": _first_token_distributions(llm, adapters["a"]),
         }
 
@@ -317,13 +374,21 @@ def lora_outputs(adapters):
 def base_outputs():
     with _engine() as llm:
         return {
-            "base": _greedy(llm, None),
+            "base": _greedy_steps(llm, None, logprobs=20),
             "oracle": _first_token_distributions(llm),
         }
 
 
 def test_requests_without_an_adapter_match_the_base_model(lora_outputs, base_outputs):
-    assert lora_outputs["base"] == base_outputs["base"]
+    """Without an adapter, the LoRA engine must stay much closer to the base
+    model than an adapter moves it. Its graph also holds the LoRA ops, so it
+    may round differently; a request that picks up an adapter's delta puts the
+    ratio near 1."""
+    noise = _aligned_mean_total_variation(lora_outputs["base"], base_outputs["base"])
+    adapter_effect = _mean_total_variation(
+        lora_outputs["oracle"], base_outputs["oracle"]
+    )
+    assert noise < 0.5 * adapter_effect, (noise, adapter_effect)
 
 
 def test_lora_matches_the_adapter_merged_into_the_weights(
@@ -355,7 +420,10 @@ def _count_fast_path_steps(worker):
 
 def test_greedy_top_tokens_keep_the_lm_head_delta(monkeypatch, adapters, lora_outputs):
     # The lm_head delta decides tokens here, so dropping it would show.
-    assert lora_outputs["lm_head"] != lora_outputs["base"]
+    lm_head = lora_outputs["lm_head"]
+    assert [tokens for tokens, _ in lm_head] != [
+        tokens for tokens, _ in lora_outputs["base"]
+    ]
     monkeypatch.setenv("TPU_GREEDY_TOP_TOKENS", "1")
 
     with _engine(**LORA_ARGS) as llm:
@@ -365,7 +433,10 @@ def test_greedy_top_tokens_keep_the_lm_head_delta(monkeypatch, adapters, lora_ou
             lambda worker: worker.model_runner.fast_path_steps
         )
 
-    assert tokens == lora_outputs["lm_head"]
+    # The fast path compiles the argmax with the logits, so it may round them
+    # differently from the full-logits path.
+    for prompt, fast, (expected, steps) in zip(PROMPTS, tokens, lm_head):
+        _assert_same_tokens_but_for_a_near_tie(fast, expected, steps, prompt)
     assert fast_path_steps[0] > 0
 
 

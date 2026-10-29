@@ -24,7 +24,11 @@ import torch
 from vllm import SamplingParams
 from vllm import logger as vllm_logger
 from vllm.config import LoRAConfig
-from vllm.lora.layers import LogitsProcessorWithLoRA, LoRAMapping
+from vllm.lora.layers import (
+    BaseLayerWithLoRA,
+    LogitsProcessorWithLoRA,
+    LoRAMapping,
+)
 from vllm.lora.layers import logits_processor as lora_lp_module
 from vllm.model_executor.layers import logits_processor as lp_module
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -181,6 +185,23 @@ def test_head_owner_resolves_through_the_lora_wrapper(monkeypatch):
     owner = _lora_owner(monkeypatch)
 
     assert greedy_top_tokens.resolve_head_owner(owner, dp_lockstep=False) is owner
+
+
+def test_resolve_head_owner_refuses_other_logits_processor_wrappers():
+    """Such a wrapper forwards get_top_tokens to the processor it wraps, so
+    the vocabulary-parallel argmax would skip the wrapper's own logits."""
+
+    class Wrapper(BaseLayerWithLoRA):
+        def __init__(self, base_layer):
+            super().__init__()
+            self.base_layer = base_layer
+
+    owner = _Owner(_shards(torch.zeros(8, 2), 1)[0])
+    owner.logits_processor = Wrapper(owner.logits_processor)
+    assert hasattr(owner.logits_processor, "get_top_tokens")
+
+    with pytest.raises(NotImplementedError, match="no module with an lm_head"):
+        greedy_top_tokens.resolve_head_owner(owner, dp_lockstep=False)
 
 
 def _batch(*params, max_num_logprobs=None):

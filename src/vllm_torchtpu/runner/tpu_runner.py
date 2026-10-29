@@ -5583,17 +5583,8 @@ class TPUModelRunner(GPUModelRunner):
         if not supports_lora(model):
             raise ValueError(f"{model.__class__.__name__} does not support LoRA yet.")
         self.lora_manager = TPUWorkerLoRAManager(
-            vllm_config, device, model.embedding_modules
+            vllm_config, device, model.embedding_modules, self.max_num_tokens
         )
-        # vLLM sizes the LoRA index buffers to max_num_batched_tokens, but the
-        # runner pads each step's LoRA mapping to its compile size, and a
-        # compile size set by the user may exceed max_num_batched_tokens.
-        # Without this, such a mapping does not fit and the engine fails at
-        # startup. max_num_tokens is the largest compile size. vLLM's LoRA code
-        # reads this value only to size those buffers. We might need to revisit
-        # this if it starts to use the value for anything else.
-        if self.max_num_tokens > self.lora_manager.max_num_batched_tokens:
-            self.lora_manager.max_num_batched_tokens = self.max_num_tokens
         return self.lora_manager.create_lora_manager(model, vllm_config)
 
     def lora_slot_write_hbm_bytes(self) -> int:
@@ -5604,6 +5595,20 @@ class TPUModelRunner(GPUModelRunner):
         lora_manager = self.lora_manager
         assert isinstance(lora_manager, TPUWorkerLoRAManager)
         return lora_manager.slot_write_hbm_bytes()
+
+    def post_profile_hbm_reserves(self) -> utils.HbmReserves:
+        """HBM that profile_run does not see, which the KV cache budget must
+        leave free.
+
+        TPUWorker.determine_available_memory and the KV cache manager's
+        block-count overrides both subtract it. Without one shared source, a
+        reserve added to only one of them would let the other fill that HBM
+        with KV blocks.
+        """
+        return utils.HbmReserves(
+            kv_connector=utils.estimate_kv_connector_hbm_reserve(self.vllm_config),
+            lora_slot_write=self.lora_slot_write_hbm_bytes(),
+        )
 
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()

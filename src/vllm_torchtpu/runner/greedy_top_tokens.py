@@ -59,7 +59,15 @@ def resolve_head_owner(model: torch.nn.Module, dp_lockstep: bool) -> torch.nn.Mo
     for module in model.modules():
         processor = getattr(module, "logits_processor", None)
         head = getattr(module, "lm_head", None)
-        if hasattr(processor, "get_top_tokens") and hasattr(head, "shard_indices"):
+        # vLLM's LoRA wrappers forward attribute lookups to the layer they
+        # wrap, so checking the instance would find the base layer's
+        # get_top_tokens and drop the wrapper's change to the logits. Checking
+        # the class makes such a wrapper fail here; top_tokens handles the
+        # LoRA one.
+        has_top_tokens = isinstance(processor, LogitsProcessorWithLoRA) or hasattr(
+            type(processor), "get_top_tokens"
+        )
+        if has_top_tokens and hasattr(head, "shard_indices"):
             break
     else:
         raise NotImplementedError(

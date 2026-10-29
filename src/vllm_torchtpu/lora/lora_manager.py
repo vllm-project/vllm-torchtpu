@@ -17,6 +17,7 @@ import contextlib
 from collections.abc import Iterator
 
 import torch
+from vllm.config import VllmConfig
 from vllm.lora.layers import (
     BaseLayerWithLoRA,
     ColumnParallelLinearWithLoRA,
@@ -305,6 +306,23 @@ class TPUWorkerLoRAManager(LRUCacheWorkerLoRAManager):
     """
 
     _manager_cls = TPULoRAModelManager
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        device: torch.device,
+        embedding_modules: dict[str, str],
+        max_num_tokens: int,
+    ):
+        super().__init__(vllm_config, device, embedding_modules)
+        # vLLM sizes the LoRA index buffers to max_num_batched_tokens, but the
+        # runner pads each step's LoRA mapping to its compile size, and a
+        # compile size set by the user may exceed max_num_batched_tokens.
+        # Without this, such a mapping does not fit and the engine fails at
+        # startup. max_num_tokens is the runner's largest compile size. vLLM's
+        # LoRA code reads this value only to size those buffers. We might need
+        # to revisit this if it starts to use the value for anything else.
+        self.max_num_batched_tokens = max(self.max_num_batched_tokens, max_num_tokens)
 
     def _load_adapter(self, lora_request: LoRARequest) -> LoRAModel:
         """Loads the adapter and rejects it if any LoRA weight is NaN or Inf.

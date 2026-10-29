@@ -900,12 +900,10 @@ class KVCacheManager:
         Matches `TPUWorker.determine_available_memory()`: the
         `utils.compute_hbm_budget` result (which reserves the
         `gpu_memory_utilization` cap minus
-        `utils.estimate_kv_connector_hbm_reserve` (HBM a connector allocates
-        after profile_run, such as the offload H2D
-        staging pool) and `TPUModelRunner.lora_slot_write_hbm_bytes` (HBM an
-        adapter swap holds while it runs). Sizing overrides against this
-        budget keeps them from filling these reserves back up with KV blocks
-        and defeating the worker-side subtraction.
+        `TPUModelRunner.post_profile_hbm_reserves` (HBM allocated after
+        profile_run, such as the offload H2D staging pool). Sizing overrides
+        against this budget keeps them from filling these reserves back up
+        with KV blocks and defeating the worker-side subtraction.
         """
         if kv_cache_memory_bytes := self.runner.cache_config.kv_cache_memory_bytes:
             return kv_cache_memory_bytes
@@ -914,9 +912,7 @@ class KVCacheManager:
         )
         return utils.min_across_ep_dp(
             self.runner.vllm_config.parallel_config,
-            budget.available
-            - utils.estimate_kv_connector_hbm_reserve(self.runner.vllm_config)
-            - self.runner.lora_slot_write_hbm_bytes(),
+            budget.available - sum(self.runner.post_profile_hbm_reserves()),
         )
 
     def _maybe_set_compact_mamba_num_blocks_override(

@@ -526,26 +526,19 @@ class TPUWorker(WorkerBase):
 
         # Some KV connectors allocate HBM AFTER profile_run completes — e.g.,
         # an offload spec with a host<->device transfer staging buffer, or a
-        # P/D disagg connector with NCCL receive buffers. vLLM's normal
-        # accounting misses those bytes. Ask the active connector how much
-        # to reserve and subtract from the KV-cache budget. Returns 0 if no
-        # connector needs a reserve. The connector owns the size formula.
-        kv_connector_hbm_reserve = utils.estimate_kv_connector_hbm_reserve(
-            self.vllm_config
-        )
-        # An adapter swap holds memory only while it runs, so profile_run
-        # does not see it.
-        lora_slot_write_hbm_bytes = self.model_runner.lora_slot_write_hbm_bytes()
+        # P/D disagg connector with NCCL receive buffers. An adapter swap
+        # holds HBM only while it runs. vLLM's normal accounting misses those
+        # bytes, so subtract them from the KV-cache budget.
+        reserves = self.model_runner.post_profile_hbm_reserves()
         available = utils.min_across_ep_dp(
-            self.parallel_config,
-            budget.available - kv_connector_hbm_reserve - lora_slot_write_hbm_bytes,
+            self.parallel_config, budget.available - sum(reserves)
         )
 
         total_hbm_limit_gb = round(budget.total_limit / utils.GBYTES, 2)
         total_hbm_limit_cap_gb = round(budget.cap / utils.GBYTES, 2)
         total_hbm_used_gb = round(budget.total_used / utils.GBYTES, 2)
-        kv_connector_hbm_reserve_gb = round(kv_connector_hbm_reserve / utils.GBYTES, 2)
-        lora_slot_write_hbm_gb = round(lora_slot_write_hbm_bytes / utils.GBYTES, 2)
+        kv_connector_hbm_reserve_gb = round(reserves.kv_connector / utils.GBYTES, 2)
+        lora_slot_write_hbm_gb = round(reserves.lora_slot_write / utils.GBYTES, 2)
         total_hbm_avail_gb = round(available / utils.GBYTES, 2)
         logger.info(
             "Memory statistics | "
@@ -564,12 +557,18 @@ class TPUWorker(WorkerBase):
         )
 
         if available <= 0:
-            raise ValueError(
-                f"{total_hbm_used_gb=}GiB exceeds "
-                f"{total_hbm_limit_cap_gb=}GiB by "
-                f"{-total_hbm_avail_gb}GiB. Please consider "
+            fix = (
                 f"increasing --gpu-memory-utilization from "
-                f"{gpu_memory_utilization} to a larger value."
+                f"{gpu_memory_utilization} to a larger value"
+            )
+            if reserves.lora_slot_write > 0:
+                fix += ", or lowering --max-loras or --max-lora-rank"
+            raise ValueError(
+                f"{total_hbm_used_gb=}GiB plus the HBM reserved after the "
+                f"memory profile ({kv_connector_hbm_reserve_gb=}GiB, "
+                f"{lora_slot_write_hbm_gb=}GiB) exceeds "
+                f"{total_hbm_limit_cap_gb=}GiB by "
+                f"{-total_hbm_avail_gb}GiB. Please consider {fix}."
             )
 
         cap = self._pooling_kv_cache_cap_bytes()
