@@ -33,7 +33,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
-from tpu_release import wait_for_tpu_release
+from tpu_release import is_tpu_init_race, wait_for_tpu_release
 from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.sampling_params import StructuredOutputsParams
@@ -1732,14 +1732,13 @@ _SERVE_ERROR_LINE = re.compile(r"\b(ERROR|CRITICAL)\b|Traceback|Timed out")
 # health poll waits out the whole startup deadline.
 _WORKER_START_FAILED = "WorkerProc failed to start"
 
-# A worker group whose TPU slice never forms: libtpu times out at its
-# PRE_START_SESSION_BARRIER and init_process_group then fails with this. It
-# hits a fresh server now and then on CI whatever the change under test (build
-# 3390, a typing-only commit whose next run passed), and a new launch on fresh
-# ports comes up, so it gets one more attempt. Any other startup failure is
-# reported as is.
-_TPU_INIT_RACE = "PjRtClient is not initialized"
-DP_SERVER_START_ATTEMPTS = 2
+# A worker group whose TPU slice never forms: older libtpu surfaced barrier
+# timeouts as "PjRtClient is not initialized", while libtpu>=0.0.50 raises
+# "TPU initialization failed:" with START_SESSION / gRPC server / vbar.sock /
+# VFIO node errors (see tpu_release.TPU_INIT_RACE_MARKERS). A fresh launch on
+# new ports after device release recovers, while non-transient startup errors
+# fail immediately.
+DP_SERVER_START_ATTEMPTS = 3
 
 # Prometheus renders the same counters the in-process reader exposes, with a
 # `_total` suffix.
@@ -1939,7 +1938,7 @@ def _startup_error(log_path: str, message: str) -> _ServeStartupError:
         f"{message}\n--- full log: {kept} ---\n"
         "--- error lines ---\n" + "\n".join(errors[-40:]) + "\n"
         "--- tail ---\n" + "\n".join(lines[-40:]),
-        retryable=_TPU_INIT_RACE in text,
+        retryable=is_tpu_init_race(text),
     )
 
 
@@ -1964,6 +1963,7 @@ def _start_server(
 
     A server that fails to come up is stopped before the error is raised.
     """
+    wait_for_tpu_release()
     port = _pick_free_port()
     cmd = [
         sys.executable,

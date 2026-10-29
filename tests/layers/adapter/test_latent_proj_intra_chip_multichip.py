@@ -39,7 +39,11 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = [pytest.mark.multichip, pytest.mark.spawns_tpu_workers]
+pytestmark = [
+    pytest.mark.multichip,
+    pytest.mark.spawns_tpu_workers,
+    pytest.mark.timeout(1800),
+]
 
 WORLD_SIZE = 8
 # The real K3 latent-projection shapes, scaled down only in the token count.
@@ -237,6 +241,29 @@ def _run_worker(result_dir: Path) -> None:
         raise SystemExit(1)
 
 
+def _tpu_release_module():
+    tests_root = str(Path(__file__).resolve().parents[2])
+    if tests_root not in sys.path:
+        sys.path.insert(0, tests_root)
+    import tpu_release
+
+    return tpu_release
+
+
+def _has_worker_init_race(result_dir: Path, stdout: str) -> bool:
+    tpu_release = _tpu_release_module()
+    if tpu_release.is_tpu_init_race(stdout):
+        return True
+    for path in result_dir.glob("rank_*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if tpu_release.is_tpu_init_race(str(payload.get("error", ""))):
+            return True
+    return False
+
+
 def _run_worker_group_once(result_dir: Path) -> subprocess.CompletedProcess[str]:
     process = subprocess.Popen(
         _worker_command(result_dir),
@@ -245,6 +272,7 @@ def _run_worker_group_once(result_dir: Path) -> subprocess.CompletedProcess[str]
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        errors="replace",
         start_new_session=True,
     )
     try:
@@ -252,24 +280,36 @@ def _run_worker_group_once(result_dir: Path) -> subprocess.CompletedProcess[str]
     except subprocess.TimeoutExpired as exc:
         os.killpg(process.pid, signal.SIGTERM)
         output = exc.output or ""
-        process.wait(timeout=60)
+        try:
+            process.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=30)
     return subprocess.CompletedProcess(process.args, process.returncode, output, "")
 
 
 def _run_worker_group(result_dir: Path) -> subprocess.CompletedProcess[str]:
-    """Run the workers, retrying through the device-teardown race.
+    """Run the workers, retrying through transient TPU slice/device init races.
 
-    In the full CI session an in-process engine test runs before this file,
-    and its workers release the TPUs asynchronously. Spawned too soon after,
-    this test's workers fail init_process_group with "PjRtClient is not
-    initialized" (CI build 3112). That is a transient resource race, not a
-    code defect, so wait for the devices to drain and try again.
+    In the full CI session an earlier test's workers may still be releasing TPU
+    VFIO nodes, or libtpu>=0.0.50 may hit a transient START_SESSION / gRPC
+    server / vbar.sock bootstrap race across the 8-core slice. Wait for device
+    nodes to drain, clear stale rank JSONs, and retry up to 3 attempts.
     """
+    tpu_release = _tpu_release_module()
+    tpu_release.wait_for_tpu_release()
     completed = _run_worker_group_once(result_dir)
     attempts = 1
-    while "PjRtClient is not initialized" in (completed.stdout or "") and attempts < 3:
+    while (
+        completed.returncode != 0
+        and _has_worker_init_race(result_dir, completed.stdout or "")
+        and attempts < 3
+    ):
         attempts += 1
-        time.sleep(60)
+        tpu_release.wait_for_tpu_release()
+        time.sleep(5)
+        for stale in result_dir.glob("rank_*.json"):
+            stale.unlink(missing_ok=True)
         completed = _run_worker_group_once(result_dir)
     return completed
 

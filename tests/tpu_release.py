@@ -28,6 +28,26 @@ _POLL_INTERVAL_S = 0.5
 # genuinely wedged.
 _DEFAULT_TIMEOUT_S = 180.0
 
+# Transient TPU slice/session/VFIO bootstrap failures across libtpu releases.
+# Older libtpu surfaced slice formation timeouts as "PjRtClient is not
+# initialized", whereas libtpu>=0.0.50 raises "TPU initialization failed:" with
+# specific gRPC session, barrier, vbar socket, or VFIO node acquisition errors.
+# Match these specific substrings rather than bare "TPU initialization failed"
+# so deterministic flag/configuration errors fail immediately without retry.
+TPU_INIT_RACE_MARKERS: tuple[str, ...] = (
+    "PjRtClient is not initialized",
+    "START_SESSION failed",
+    "PRE_START_SESSION_BARRIER",
+    "Failed to start the gRPC server",
+    "Failed to connect to unix:///var/run/tpu-plugin/vbar.sock",
+    "Failed to acquire a TPU device node",
+)
+
+
+def is_tpu_init_race(text: str) -> bool:
+    """Return True if ``text`` carries a transient TPU slice/device init race."""
+    return any(marker in text for marker in TPU_INIT_RACE_MARKERS)
+
 
 def _fd_links() -> list[str]:
     """Every open file descriptor of every process this one can see.

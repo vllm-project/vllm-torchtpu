@@ -77,3 +77,108 @@ def test_raises_and_names_the_holder_when_the_chip_never_frees(monkeypatch):
 
     with pytest.raises(RuntimeError, match="4242"):
         tpu_release.wait_for_tpu_release(timeout=0.0)
+
+
+@pytest.mark.parametrize(
+    "log_text",
+    [
+        "RuntimeError: PjRtClient is not initialized",
+        (
+            "RuntimeError: failed to retrieve the PjRt client: "
+            "TPU initialization failed: GRPC_ERROR error message: "
+            "START_SESSION failed: deadline exceeded"
+        ),
+        "libtpu timed out at PRE_START_SESSION_BARRIER",
+        "TPU initialization failed: Failed to start the gRPC server.",
+        (
+            "TPU initialization failed: Failed to connect to "
+            "unix:///var/run/tpu-plugin/vbar.sock"
+        ),
+        "TPU initialization failed: Failed to acquire a TPU device node",
+    ],
+)
+def test_recognizes_transient_tpu_init_race_messages(log_text: str):
+    assert tpu_release.is_tpu_init_race(log_text)
+
+
+@pytest.mark.parametrize(
+    "log_text",
+    [
+        "",
+        "TPU initialization failed: Invalid argument: Unknown flag --xla_bad",
+        "AssertionError: output mismatch",
+        "xla::ifrt::PjRtClient::~PjRtClient()",
+    ],
+)
+def test_rejects_deterministic_errors_as_non_retryable(log_text: str):
+    assert not tpu_release.is_tpu_init_race(log_text)
+
+
+def test_cp_mla_launch_retries_libtpu_050_start_session_race_and_clears_stale_json(
+    monkeypatch, tmp_path
+):
+    import json
+    import subprocess
+
+    from layers.adapter import test_cp_mla_merge_multichip as cp_mla
+
+    calls = 0
+
+    def fake_launch_once(result_dir, _extra):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            (result_dir / "rank_3.json").write_text(
+                json.dumps(
+                    {
+                        "rank": 3,
+                        "error": (
+                            "RuntimeError('failed to retrieve the PjRt client: "
+                            "TPU initialization failed: GRPC_ERROR error message: "
+                            "START_SESSION failed')"
+                        ),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return subprocess.CompletedProcess(["worker"], 1, "worker failed", "")
+        assert not list(result_dir.glob("rank_*.json"))
+        (result_dir / "rank_0.json").write_text(
+            json.dumps({"rank": 0, "ok": True}), encoding="utf-8"
+        )
+        return subprocess.CompletedProcess(["worker"], 0, "ok", "")
+
+    monkeypatch.setattr(cp_mla, "_launch_once", fake_launch_once)
+    monkeypatch.setattr(cp_mla.time, "sleep", lambda _: None)
+    monkeypatch.setattr(tpu_release, "wait_for_tpu_release", lambda *a, **kw: None)
+
+    completed = cp_mla._launch(tmp_path, [])
+    assert completed.returncode == 0
+    assert calls == 2
+    assert not (tmp_path / "rank_3.json").exists()
+
+
+def test_latent_proj_does_not_retry_non_init_failure(monkeypatch, tmp_path):
+    import json
+    import subprocess
+
+    from layers.adapter import test_latent_proj_intra_chip_multichip as latent
+
+    calls = 0
+
+    def fake_once(result_dir):
+        nonlocal calls
+        calls += 1
+        (result_dir / "rank_0.json").write_text(
+            json.dumps({"rank": 0, "error": "AssertionError('max diff 0.25')"}),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(["worker"], 1, "AssertionError", "")
+
+    monkeypatch.setattr(latent, "_run_worker_group_once", fake_once)
+    monkeypatch.setattr(latent.time, "sleep", lambda _: None)
+    monkeypatch.setattr(tpu_release, "wait_for_tpu_release", lambda *a, **kw: None)
+
+    completed = latent._run_worker_group(tmp_path)
+    assert completed.returncode == 1
+    assert calls == 1
