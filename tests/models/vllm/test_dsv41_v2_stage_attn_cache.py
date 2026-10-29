@@ -25,7 +25,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
-import torch.nn.functional as F
 
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention as v2_attn
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels as v2_kernels
@@ -501,7 +500,12 @@ class TestCompressorStateAndGlobalKvAddressingCache:
         forward_ctx.attn_metadata = None
         assert comp.forward(torch.ones(count, 10), positions) is None
 
-    def test_write_global_kv_addressing_cached_and_uncached(self, monkeypatch):
+    @pytest.mark.cpu_test
+    @pytest.mark.parametrize("packed_fp8", [False, True])
+    @pytest.mark.parametrize("short_context", [False, True])
+    def test_write_global_kv_addressing_cached_and_uncached(
+        self, monkeypatch, packed_fp8, short_context
+    ):
         """Verify _write_global_kv cache hits/misses across ratios."""
         count = 4
         positions = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
@@ -535,7 +539,7 @@ class TestCompressorStateAndGlobalKvAddressingCache:
         attn.compress_ratio = 2
         attn.window_size = 128
         attn._config = {"index_topk": 4}
-        attn._max_model_len = 1000
+        attn._max_model_len = 8 if short_context else 1000
         attn._rotate = lambda x, p: x
         attn._quantize_indexer = lambda x: x
         attn.compressor = lambda score, pos: torch.ones(count, 8)
@@ -544,7 +548,9 @@ class TestCompressorStateAndGlobalKvAddressingCache:
         kv_cache_mock.shape = (4, 32, 128)
         attn.kv_cache = kv_cache_mock
 
-        idx_cache_mock = MagicMock(spec=IndexCacheRows)
+        idx_cache_mock = MagicMock(
+            spec=v2_attn.PackedFP8IndexCacheRows if packed_fp8 else IndexCacheRows
+        )
         idx_cache_mock.shape = (4, 32, 128)
         idx_cache_mock.row_indices = lambda slots: slots + 100
 
@@ -564,30 +570,33 @@ class TestCompressorStateAndGlobalKvAddressingCache:
         # Subcase A: Matching ratios and shapes (idx_col = kv_col fast path)
         # Miss then hit
         with v2_attn.stage_attention_cache_scope():
-            # First call (cache miss) with defer_index_write=True
-            ret1 = attn._write_global_kv(
-                torch.ones(count, 10), positions, defer_index_write=True
-            )
-            assert ret1 is not None
-            assert len(ret1) == 2  # (records, keys)
-            assert len(inserted_slots) == 1
+            # A cache miss publishes both caches before any selection runs.
+            ret1 = attn._write_global_kv(torch.ones(count, 10), positions)
+            assert ret1 is None
+            assert len(inserted_slots) == 2
             slots1 = inserted_slots[0]
-
-            # Second call (cache hit) with defer_index_write=False
-            ret2 = attn._write_global_kv(
-                torch.ones(count, 10), positions, defer_index_write=False
+            index_slots1 = inserted_slots[1]
+            assert (
+                v2_attn._active_stage_attn_cache[("candidate_index_version", "idx_pfx")]
+                == 1
             )
+
+            # Address reuse still writes fresh K and invalidates candidate reuse.
+            ret2 = attn._write_global_kv(torch.ones(count, 10), positions)
             assert ret2 is None
-            assert len(inserted_slots) == 3  # kv_cache inserted + idx_cache inserted
-            assert torch.equal(inserted_slots[1], slots1)
+            assert len(inserted_slots) == 4
+            assert torch.equal(inserted_slots[2], slots1)
+            assert torch.equal(inserted_slots[3], index_slots1)
+            assert (
+                v2_attn._active_stage_attn_cache[("candidate_index_version", "idx_pfx")]
+                == 2
+            )
 
         # Subcase B: Differing ratio (idx_ratio != self.compress_ratio) -> else branch
         inserted_slots.clear()
         indexer_mock.k_cache.compress_ratio = 4
         with v2_attn.stage_attention_cache_scope():
-            attn._write_global_kv(
-                torch.ones(count, 10), positions, defer_index_write=False
-            )
+            attn._write_global_kv(torch.ones(count, 10), positions)
             assert len(inserted_slots) == 2
 
         # Subcase C: stage_cache is None -> fallback to _cache_slots
@@ -599,7 +608,7 @@ class TestCompressorStateAndGlobalKvAddressingCache:
         monkeypatch.setattr(
             v2_attn, "_cache_slots", lambda *a, **kw: fallback_slots.pop(0)
         )
-        attn._write_global_kv(torch.ones(count, 10), positions, defer_index_write=False)
+        attn._write_global_kv(torch.ones(count, 10), positions)
         assert len(inserted_slots) == 2
 
 
@@ -886,7 +895,7 @@ class TestCompressedAttentionAndQuerySplitCaching:
         qr = torch.ones((count, 16), dtype=torch.bfloat16)
         weights = torch.ones((count, 2), dtype=torch.float32)
         lengths = torch.tensor([[1], [2], [3], [4]], dtype=torch.int32)
-        swa_slots = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+        swa_slots = torch.ones(count, dtype=torch.bool)
         requests = torch.tensor([0, 0, 1, 1], dtype=torch.int32)
 
         attn: Any = object.__new__(v2_attn.DeepseekV41Attention)
@@ -895,6 +904,7 @@ class TestCompressedAttentionAndQuerySplitCaching:
         attn._tp_rank = 0
         attn._fp8_kv = True
         attn._config = {"index_topk": 2}
+        attn._max_model_len = 8
         attn.candidate_block_size = 1
         attn.candidate_block_buffer = None
         attn.indexer = SimpleNamespace(
@@ -904,20 +914,20 @@ class TestCompressedAttentionAndQuerySplitCaching:
         )
         attn._project_index_q = lambda q, p: q
 
-        monkeypatch.setattr(
-            v2_attn,
-            "paged_indexer",
-            lambda q, c, r, req, w, lengths_arg, *a, **kw: (
-                c,
+        attn.indexer.indexer_op = MagicMock(
+            side_effect=lambda q, *a, **kw: (
                 torch.zeros(q.shape[0], 2, dtype=torch.int32),
-                None,
-            ),
+                kw["candidates"],
+            )
         )
+        attn.indexer.indexer_op.candidate_blocks = None
+        attn.indexer.indexer_op.candidate_write = False
         # TP=2 all-gather of each rank's part (only the split branch calls it).
         monkeypatch.setattr(v2_attn, "_gather_query_rows", lambda x: torch.cat([x, x]))
 
-        index_cache_mock = MagicMock(spec=IndexCacheRows)
-        index_cache_mock.raw = MagicMock()
+        index_cache_mock = SimpleNamespace(
+            raw=torch.zeros((4, ROW_WORDS), dtype=torch.int32)
+        )
         index_records = torch.zeros((count, 4), dtype=torch.int32)
 
         # 1. Test split=True (TP=2) miss then hit
@@ -932,7 +942,6 @@ class TestCompressedAttentionAndQuerySplitCaching:
                 weights,
                 lengths,
                 swa_slots,
-                None,
             )
             assert sel1.shape[0] == count
 
@@ -946,7 +955,6 @@ class TestCompressedAttentionAndQuerySplitCaching:
                 weights,
                 lengths,
                 swa_slots,
-                None,
             )
             assert torch.equal(sel1, sel2)
 
@@ -962,7 +970,6 @@ class TestCompressedAttentionAndQuerySplitCaching:
                 weights,
                 lengths,
                 swa_slots,
-                None,
             )
             assert sel_tp1.shape[0] == count
 
@@ -975,7 +982,6 @@ class TestCompressedAttentionAndQuerySplitCaching:
                 weights,
                 lengths,
                 swa_slots,
-                None,
             )
             assert torch.equal(sel_tp1, sel_tp1_cached)
 
@@ -990,44 +996,8 @@ class TestCompressedAttentionAndQuerySplitCaching:
             weights,
             lengths,
             swa_slots,
-            None,
         )
         assert sel_nocache.shape[0] == count
-
-    def test_topk_indices_buffer_padding_and_truncation_branches(self):
-        """Test selected indices padding vs slicing against topk_indices_buffer."""
-        # Case A: stage_cache is None -> copy_ with padding
-        buf = torch.full((8, 4), -1, dtype=torch.int32)
-        sel = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
-        count = 2
-        capacity = 4
-        buf.copy_(
-            F.pad(
-                sel,
-                (0, buf.shape[-1] - sel.shape[-1], 0, buf.shape[0] - count),
-                value=-1,
-            )
-        )
-        res_uncached = buf[:count, : min(capacity, buf.shape[-1])]
-        assert res_uncached.shape == (2, 4)
-        assert torch.equal(res_uncached[:, :2], sel)
-        assert torch.equal(
-            res_uncached[:, 2:], torch.full((2, 2), -1, dtype=torch.int32)
-        )
-
-        # Case B: stage_cache is not None, selected width < target_width -> F.pad
-        target_width = 4
-        sel_narrow = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
-        padded = F.pad(sel_narrow, (0, target_width - sel_narrow.shape[-1]), value=-1)
-        assert padded.shape == (2, 4)
-        assert torch.equal(padded[:, :2], sel_narrow)
-        assert torch.equal(padded[:, 2:], torch.full((2, 2), -1, dtype=torch.int32))
-
-        # Case C: stage_cache is not None, selected width >= target_width -> slice
-        sel_wide = torch.tensor([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]], dtype=torch.int32)
-        sliced = sel_wide[:, :target_width]
-        assert sliced.shape == (2, 4)
-        assert torch.equal(sliced, sel_wide[:, :4])
 
     def test_untiled_and_non_fp8_fallback_branches(self, monkeypatch):
         """Test untiled and non-fp8_kv fallback paths in _prepare_tpu."""

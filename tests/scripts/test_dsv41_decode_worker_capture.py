@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Capture decode draft shapes without consuming device output."""
 
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,8 +46,10 @@ def test_decode_captures_scheduled_drafts_and_native_prepare_shapes():
     assert len(recorder.stages) == 1
 
 
-def test_synchronized_profile_writes_to_requested_directory(tmp_path, monkeypatch):
-    rank = 0
+@pytest.mark.parametrize("rank", range(8))
+def test_synchronized_profile_rotates_collectors_and_writes_both_windows(
+    tmp_path, monkeypatch, rank
+):
     calls, barriers, syncs = [], [], []
     group = SimpleNamespace(world_size=8, cpu_group="cpu")
 
@@ -83,9 +86,25 @@ def test_synchronized_profile_writes_to_requested_directory(tmp_path, monkeypatc
     worker.synchronized_profile_arm(output_dir=str(tmp_path))
     for _ in range(7):
         assert runner._dp_coordinated_step(288) == "native"
+    assert runner._dp_coordinated_step is not original
+    assert len(calls) == (2 if rank % 2 == 0 else 0)
+    for _ in range(7):
+        assert runner._dp_coordinated_step(288) == "native"
     assert runner._dp_coordinated_step is original
     assert len(calls) == 2
-    assert len(barriers) == 4 and len(syncs) == 2
+    assert [call["is_start"] for call in calls] == [True, False]
+    assert len(barriers) == 8 and len(syncs) == 4
     capture = worker.synchronized_profile_check()
     assert all(r["completed"] and r["captured_steps"] == 6 for r in capture)
-    assert (tmp_path / "synchronized-profile" / f"rank-{rank}-capture.json").is_file()
+    saved = json.loads(
+        (tmp_path / "synchronized-profile" / f"rank-{rank}-capture.json").read_text()
+    )
+    windows = saved["captures"]
+    chip_first_rank = rank - rank % 2
+    assert [window["profile_rank"] for window in windows] == [
+        chip_first_rank,
+        chip_first_rank + 1,
+    ]
+    assert all(
+        window["captured_steps"] == len(window["rows"]) == 6 for window in windows
+    )

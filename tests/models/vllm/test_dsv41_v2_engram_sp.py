@@ -444,9 +444,7 @@ def test_write_encoder_global_kv_sp_sharded_matches_tp(monkeypatch):
     attn: Any = SimpleNamespace(
         kv_cache=torch.ones(1),
         compressor=SimpleNamespace(project=fake_project),
-        _write_global_kv=lambda kv_score, pos, defer_index_write=True: (
-            recorded_kv_scores.append((kv_score, defer_index_write))
-        ),
+        _write_global_kv=lambda kv_score, pos: (recorded_kv_scores.append(kv_score)),
     )
     v2_attn.DeepseekV41Attention.write_encoder_global_kv(
         attn, hidden_full, positions, sp_sharded=False
@@ -456,9 +454,8 @@ def test_write_encoder_global_kv_sp_sharded_matches_tp(monkeypatch):
     )
     assert projected_rows == [num_tokens, chunk]
     assert len(recorded_kv_scores) == 2
-    assert recorded_kv_scores[0][1] is False and recorded_kv_scores[1][1] is False
     torch.testing.assert_close(
-        recorded_kv_scores[1][0], recorded_kv_scores[0][0], rtol=0, atol=0
+        recorded_kv_scores[1], recorded_kv_scores[0], rtol=0, atol=0
     )
 
 
@@ -474,8 +471,8 @@ def test_select_paged_indices_projects_index_q_on_local_query_shard(monkeypatch)
     positions = torch.arange(count, dtype=torch.int64)
     weights = torch.randn(count, n_head, dtype=torch.float32)
     lengths = torch.full((count, 1), 8, dtype=torch.int64)
-    swa_slots = torch.arange(count, dtype=torch.int64)
-    swa_slots[-2:] = -1
+    swa_slots = torch.ones(count, dtype=torch.bool)
+    swa_slots[-2:] = False
     records = torch.zeros((1, 8), dtype=torch.int32)
     requests = torch.zeros(count, dtype=torch.int64)
     w_idx_q = torch.randn(q_lora, n_head * head_dim, dtype=torch.bfloat16)
@@ -496,39 +493,39 @@ def test_select_paged_indices_projects_index_q_on_local_query_shard(monkeypatch)
         lambda x: x.repeat(tp, 1),
     )
 
-    def fake_paged_indexer(
+    def fake_indexer(
         q_part,
+        weights_part,
         index_cache,
         recs,
-        weights_part,
         lengths_part,
-        candidates_part,
-        write_records,
-        write_keys,
         requests_part,
+        *,
+        candidates,
         **kwargs,
     ):
-        del recs, weights_part, lengths_part, candidates_part
-        del write_records, write_keys, requests_part, kwargs
+        del recs, weights_part, lengths_part, candidates
+        del requests_part, kwargs
         captured_q_parts.append(q_part)
         sel = torch.zeros((q_part.shape[0], topk), dtype=torch.int32)
         pub = torch.zeros((q_part.shape[0], 0), dtype=torch.int32)
-        return index_cache.raw, sel, pub
+        return sel, pub
 
-    monkeypatch.setattr(v2_attn, "paged_indexer", fake_paged_indexer)
+    fake_indexer.candidate_blocks = None
+    fake_indexer.candidate_write = False
 
     for rank in range(tp):
         attn: Any = SimpleNamespace(
             indexer=SimpleNamespace(
                 n_head=n_head,
                 head_dim=head_dim,
-                indexer_op=SimpleNamespace(
-                    candidate_blocks=None, candidate_write=False
-                ),
+                indexer_op=fake_indexer,
             ),
             candidate_block_buffer=torch.zeros((count, 0), dtype=torch.int32),
             _tp_rank=torch.tensor(rank, dtype=torch.int32),
             _config={"index_topk": topk},
+            _max_model_len=16,
+            compress_ratio=2,
             candidate_block_size=16,
             _fp8_kv=True,
             _project_index_q=lambda q_in, pos_in: (
@@ -546,7 +543,6 @@ def test_select_paged_indices_projects_index_q_on_local_query_shard(monkeypatch)
             weights,
             lengths,
             swa_slots,
-            None,
         )
         assert selected.shape == (count, topk)
 
