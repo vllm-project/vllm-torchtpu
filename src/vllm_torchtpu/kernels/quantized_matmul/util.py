@@ -309,12 +309,20 @@ def quantize_block(data, axis, target_dtype):
         axis=axis,
         keepdims=True,
     )
-    dtype_max, dtype_min = get_max_min(target_dtype)
-    scale = abs_max / dtype_max
-    scale = jnp.where(scale == 0, 1.0, scale)
+    scale = scale_from_abs_max(abs_max, target_dtype)
+    return quantize_with_scale(data, scale, target_dtype), scale
 
+
+def scale_from_abs_max(abs_max, target_dtype):
+    """`quantize_block`'s scale for a block whose largest magnitude is abs_max."""
+    dtype_max, _ = get_max_min(target_dtype)
+    scale = abs_max / dtype_max
+    return jnp.where(scale == 0, 1.0, scale)
+
+
+def quantize_with_scale(data, scale, target_dtype):
+    """`quantize_block`'s values for data under its scale."""
+    dtype_max, dtype_min = get_max_min(target_dtype)
     if jnp.issubdtype(target_dtype, jnp.floating):
-        data_q = (data / scale).clip(dtype_min, dtype_max).astype(target_dtype)
-    else:
-        data_q = jnp.round(data / scale).astype(target_dtype)
-    return data_q, scale
+        return (data / scale).clip(dtype_min, dtype_max).astype(target_dtype)
+    return jnp.round(data / scale).astype(target_dtype)
