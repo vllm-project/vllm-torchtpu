@@ -176,18 +176,38 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
             num_external_computed_tokens,
         )
         physical_cache_config = self.cache_config
-        if physical_cache_config.block_size == self.block_size:
-            return original_split(self, *args)
-
-        scheduler_cache_config = copy.copy(physical_cache_config)
-        scheduler_cache_config.block_size = self.block_size
-        # schedule() calls this method synchronously on the EngineCore thread,
-        # and the upstream implementation contains no callback or await point.
-        self.cache_config = scheduler_cache_config
-        try:
+        target_block_size = (
+            self.hash_block_size
+            if getattr(self, "mamba_partial_cache_hit", False)
+            else self.block_size
+        )
+        if physical_cache_config.block_size == target_block_size:
             num_new_tokens = original_split(self, *args)
-        finally:
-            self.cache_config = physical_cache_config
+        else:
+            scheduler_cache_config = copy.copy(physical_cache_config)
+            scheduler_cache_config.block_size = target_block_size
+            # schedule() calls this method synchronously on the EngineCore thread,
+            # and the upstream implementation contains no callback or await point.
+            self.cache_config = scheduler_cache_config
+            try:
+                num_new_tokens = original_split(self, *args)
+            finally:
+                self.cache_config = physical_cache_config
+        if getattr(self, "mamba_partial_cache_hit", False) and getattr(
+            self, "use_eagle", False
+        ):
+            hash_block = self.hash_block_size
+            start = (
+                request.num_computed_tokens
+                + num_new_local_computed_tokens
+                + num_external_computed_tokens
+            )
+            end = start + num_new_tokens
+            eagle_tail = (
+                request.num_prompt_tokens // hash_block * hash_block - hash_block
+            )
+            if start < eagle_tail < end:
+                num_new_tokens = eagle_tail - start
         # A scheduler block wider than the prefill budget (DCP/PCP: 256 x
         # ranks tokens) leaves chunks inside it wherever the shared token
         # budget cuts them. A program that declares ``page_aligned_chunks``
@@ -1643,6 +1663,227 @@ def _patch_vllm_same_step_prefix_hits() -> None:
     logger.info(
         "Applied TPU patch: no prefix-cache hits on blocks the "
         "current step has not written."
+    )
+
+
+def _patch_vllm_scheduler_srpt() -> None:
+    """Apply APC-aware SRPT + aging and decode-priority ordering to FCFS Scheduler.
+
+    Gated at runtime by ``K3_SCHED_POLICY=srpt`` (default off) and only active
+    when the scheduler is using FCFS queueing:
+    - Sorts ``self.waiting`` and ``self.skipped_waiting`` stably by
+      ``effective_remaining_prefill - aging_tok_per_s * (now - arrival_time)``
+      (``K3_SRPT_AGING_TOK_PER_S``, default ``256``), where
+      ``effective_remaining_prefill`` uses ``num_tokens - 1 - effective_computed``
+      and accounts for cached prefix blocks when APC is enabled.
+    - Stable-orders ``self.running`` so active decodes (``remaining_prefill == 0``)
+      stay at the front and longest remaining prefills sit at the tail (preempted
+      last-in/longest-first).
+    """
+    import functools
+    import os
+    import time
+
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    current_schedule = Scheduler.schedule
+    if getattr(current_schedule, "_tpu_srpt_scheduler_patch", False):
+        return
+
+    def _is_fcfs_scheduler(scheduler) -> bool:
+        policy = getattr(scheduler, "policy", None)
+        if policy is not None:
+            policy_str = str(getattr(policy, "value", getattr(policy, "name", policy)))
+            if policy_str.strip().lower() not in ("fcfs", "schedulingpolicy.fcfs"):
+                return False
+        waiting = getattr(scheduler, "waiting", None)
+        if waiting is not None and type(waiting).__name__ == "PriorityRequestQueue":
+            return False
+        return True
+
+    def _estimate_prefix_cached_tokens(
+        scheduler, req, max_cache_hit_length: int
+    ) -> int:
+        if max_cache_hit_length <= 0 or getattr(
+            req, "skip_reading_prefix_cache", False
+        ):
+            return 0
+        cache_config = getattr(scheduler, "cache_config", None)
+        if (
+            cache_config is not None
+            and getattr(cache_config, "enable_prefix_caching", True) is False
+        ):
+            return 0
+        cached_attr = getattr(req, "num_cached_tokens", None)
+        if cached_attr is not None and int(cached_attr) > 0:
+            return min(max_cache_hit_length, int(cached_attr))
+        kv_cache_manager = getattr(scheduler, "kv_cache_manager", None)
+        if kv_cache_manager is None:
+            return 0
+        lookup_enabled = getattr(kv_cache_manager, "prefix_cache_lookup_enabled", None)
+        if callable(lookup_enabled):
+            try:
+                if not lookup_enabled(req):
+                    return 0
+            except Exception:
+                pass
+        block_hashes = getattr(req, "block_hashes", None)
+        coordinator = getattr(kv_cache_manager, "coordinator", None)
+        if coordinator is not None and block_hashes:
+            find_hit = getattr(coordinator, "find_longest_cache_hit", None)
+            if callable(find_hit):
+                try:
+                    hit = find_hit(block_hashes, max_cache_hit_length)
+                    if isinstance(hit, tuple) and len(hit) >= 2:
+                        return min(max_cache_hit_length, max(0, int(hit[1])))
+                    if isinstance(hit, int):
+                        return min(max_cache_hit_length, max(0, hit))
+                except Exception:
+                    pass
+        block_pool = getattr(kv_cache_manager, "block_pool", None)
+        if block_pool is not None and block_hashes:
+            get_cached = getattr(block_pool, "get_cached_block", None)
+            if callable(get_cached):
+                block_size = int(
+                    getattr(scheduler, "hash_block_size", None)
+                    or getattr(scheduler, "block_size", None)
+                    or getattr(cache_config, "block_size", 64)
+                    or 64
+                )
+                group_ids = getattr(kv_cache_manager, "kv_cache_group_ids", None)
+                if group_ids is None:
+                    groups = getattr(
+                        getattr(scheduler, "kv_cache_config", None),
+                        "kv_cache_groups",
+                        None,
+                    )
+                    group_ids = list(range(len(groups))) if groups else [0]
+                max_blocks = max_cache_hit_length // max(1, block_size)
+                hits = 0
+                for b_hash in block_hashes[:max_blocks]:
+                    try:
+                        if get_cached(b_hash, group_ids) is None:
+                            break
+                    except TypeError:
+                        if get_cached(b_hash) is None:
+                            break
+                    hits += 1
+                if hits > 0:
+                    return min(max_cache_hit_length, hits * block_size)
+        get_computed = getattr(kv_cache_manager, "get_computed_blocks", None)
+        if callable(get_computed) and not getattr(
+            kv_cache_manager, "enable_kv_cache_events", False
+        ):
+            try:
+                res = get_computed(req)
+                if isinstance(res, tuple) and len(res) >= 2:
+                    return min(max_cache_hit_length, max(0, int(res[1])))
+            except Exception:
+                pass
+        return 0
+
+    def _effective_remaining_prefill(
+        scheduler, req, *, include_prefix_cache: bool
+    ) -> int:
+        num_computed = int(getattr(req, "num_computed_tokens", 0) or 0)
+        num_prompt = getattr(req, "num_prompt_tokens", None)
+        if (
+            not include_prefix_cache
+            and num_prompt is not None
+            and num_computed >= int(num_prompt)
+            and not getattr(req, "is_prefill_chunk", False)
+        ):
+            return 0
+        raw_num_tokens = getattr(req, "num_tokens", None)
+        if raw_num_tokens is None:
+            raw_num_tokens = num_prompt if num_prompt is not None else 0
+        num_tokens = int(raw_num_tokens or 0)
+        max_prefill_idx = max(0, num_tokens - 1)
+        effective_computed = num_computed
+        ext_computed = int(getattr(req, "num_external_computed_tokens", 0) or 0)
+        if ext_computed > 0:
+            effective_computed = max(effective_computed, num_computed + ext_computed)
+        if include_prefix_cache and effective_computed == 0:
+            effective_computed = max(
+                effective_computed,
+                _estimate_prefix_cached_tokens(scheduler, req, max_prefill_idx),
+            )
+        return max(0, max_prefill_idx - effective_computed)
+
+    def _sort_waiting_queue(
+        scheduler, queue, aging_tok_per_s: float, now: float
+    ) -> None:
+        if not queue or len(queue) <= 1:
+            return
+        items = list(queue)
+        max_arr = max(
+            (
+                float(getattr(r, "arrival_time", 0.0) or 0.0)
+                for r in items
+                if getattr(r, "arrival_time", None) is not None
+            ),
+            default=0.0,
+        )
+        ref_now = max(now, max_arr)
+
+        def _waiting_key(req) -> float:
+            rem = float(
+                _effective_remaining_prefill(scheduler, req, include_prefix_cache=True)
+            )
+            arr = getattr(req, "arrival_time", None)
+            if arr is None or aging_tok_per_s == 0.0:
+                return rem
+            age = max(0.0, ref_now - float(arr))
+            return rem - aging_tok_per_s * age
+
+        items.sort(key=_waiting_key)
+        if isinstance(queue, list):
+            queue[:] = items
+        else:
+            queue.clear()
+            queue.extend(items)
+
+    @functools.wraps(current_schedule)
+    def schedule(self, *args, **kwargs):
+        policy_raw = os.environ.get("K3_SCHED_POLICY")
+        if policy_raw is None:
+            policy_raw = getattr(envs, "K3_SCHED_POLICY", "")
+        if policy_raw.strip().lower() == "srpt" and _is_fcfs_scheduler(self):
+            aging_raw = os.environ.get("K3_SRPT_AGING_TOK_PER_S")
+            if aging_raw is not None and aging_raw.strip() != "":
+                try:
+                    aging_tok_per_s = float(aging_raw)
+                except ValueError:
+                    aging_tok_per_s = 256.0
+            else:
+                aging_tok_per_s = float(getattr(envs, "K3_SRPT_AGING_TOK_PER_S", 256.0))
+            now = float(time.time())
+            _sort_waiting_queue(
+                self, getattr(self, "skipped_waiting", None), aging_tok_per_s, now
+            )
+            _sort_waiting_queue(
+                self, getattr(self, "waiting", None), aging_tok_per_s, now
+            )
+            running = getattr(self, "running", None)
+            if running and len(running) > 1:
+                items = list(running)
+                items.sort(
+                    key=lambda r: _effective_remaining_prefill(
+                        self, r, include_prefix_cache=False
+                    )
+                )
+                if isinstance(running, list):
+                    running[:] = items
+                else:
+                    running.clear()
+                    running.extend(items)
+        return current_schedule(self, *args, **kwargs)
+
+    schedule._tpu_srpt_scheduler_patch = True
+    schedule._tpu_orig = current_schedule
+    Scheduler.schedule = schedule
+    logger.info(
+        "Applied TPU patch: APC-aware SRPT scheduler policy (K3_SCHED_POLICY=srpt)."
     )
 
 

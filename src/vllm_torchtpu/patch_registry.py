@@ -83,6 +83,12 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_hybrid_kv_load_failure_recovery", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_block_pool_lifo_free", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_same_step_prefix_hits", _ENGINE),
+    Patch("vllm_torchtpu:_patch_vllm_scheduler_srpt", _ENGINE),
+    Patch("vllm_torchtpu.core.prefill_srpt:patch_scheduler_prefill_srpt", _ENGINE),
+    Patch(
+        "vllm_torchtpu.core.decode_interleave:patch_scheduler_decode_interleave",
+        _ENGINE,
+    ),
     Patch("vllm_torchtpu.megakernel.dp_blocks:install", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Process setup and runner selection.

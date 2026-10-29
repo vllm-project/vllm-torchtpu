@@ -145,6 +145,14 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
+    TPU_SCHED_PREFILL_SRPT: bool = False
+    TPU_SCHED_PREFILL_SRPT_MAX_HOLD_STEPS: int = 0
+    TPU_SCHED_DECODE_INTERLEAVE_STEPS: int = 0
+    TPU_SCHED_DECODE_INTERLEAVE_ADAPTIVE: bool = False
+    TPU_SCHED_DECODE_FINISH_TOKENS: int = 0
+    TPU_SCHED_DECODE_FINISH_MAX_STEPS: int = 32
+    K3_SCHED_POLICY: str = ""
+    K3_SRPT_AGING_TOK_PER_S: float = 256.0
 
 
 def env_with_choices(
@@ -893,6 +901,36 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": env_nonnegative_int(
         "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE", 0
     ),
+    # Reorder waiting and running prefills by remaining uncomputed tokens
+    # (shortest remaining prefill time first, with cache-warmth tie-breaker).
+    "TPU_SCHED_PREFILL_SRPT": env_bool("TPU_SCHED_PREFILL_SRPT", False),
+    # Maximum scheduler steps a running prefill may be held back by SRPT before
+    # being released unconditionally. 0 means unlimited hold.
+    "TPU_SCHED_PREFILL_SRPT_MAX_HOLD_STEPS": env_int(
+        "TPU_SCHED_PREFILL_SRPT_MAX_HOLD_STEPS", 0
+    ),
+    # Interleave pure-decode steps between chunked prefill steps (N pure-decode
+    # steps per prefill step when > 0).
+    "TPU_SCHED_DECODE_INTERLEAVE_STEPS": env_int(
+        "TPU_SCHED_DECODE_INTERLEAVE_STEPS", 0
+    ),
+    # Scale decode-interleave cadence dynamically with running decode batch size.
+    "TPU_SCHED_DECODE_INTERLEAVE_ADAPTIVE": env_bool(
+        "TPU_SCHED_DECODE_INTERLEAVE_ADAPTIVE", False
+    ),
+    # Hold new/resumed prefills when any running decode has <= this many output
+    # tokens remaining so near-completion decodes finish and free KV blocks.
+    "TPU_SCHED_DECODE_FINISH_TOKENS": env_int("TPU_SCHED_DECODE_FINISH_TOKENS", 0),
+    # Maximum consecutive finish-mode pure-decode steps before forcing a
+    # prefill step to avoid starving waiting prefills.
+    "TPU_SCHED_DECODE_FINISH_MAX_STEPS": env_int(
+        "TPU_SCHED_DECODE_FINISH_MAX_STEPS", 32
+    ),
+    # Kimi-K3 FCFS scheduler policy override ("srpt" enables APC-aware SRPT +
+    # aging on waiting/skipped_waiting and decode-priority ordering on running).
+    "K3_SCHED_POLICY": env_str("K3_SCHED_POLICY", ""),
+    # Aging rate in tokens/second for K3_SCHED_POLICY=srpt waiting queues.
+    "K3_SRPT_AGING_TOK_PER_S": env_float("K3_SRPT_AGING_TOK_PER_S", 256.0),
 }
 
 
