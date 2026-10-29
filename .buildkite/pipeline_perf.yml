@@ -49,6 +49,7 @@ steps:
   - group: "Perf and Eval on TPU"
     steps:
       - label: "Perf/Eval: General suite (TPU v7x-8)"
+        key: "perf_eval_general_tpu_v7x_8"
         <<: *perf_step
         parallelism: 3
         env:
@@ -69,6 +70,7 @@ steps:
               gemma-4-26b-fp8-dp4-tp2-multimodal
 
       - label: "Perf/Eval: qwen3-0.6b-tp1"
+        key: "perf_qwen3_0_6b_tp1"
         <<: *perf_step
         env:
           SHAPE: *shape_2_core
