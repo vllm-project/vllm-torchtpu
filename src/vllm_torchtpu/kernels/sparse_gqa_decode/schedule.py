@@ -172,24 +172,37 @@ def generate(
         )
     )
     meta = jnp.pad(meta, ((0, 0), (0, 0), (0, pltpu.get_tpu_info().num_lanes - lanes)))
-    names = field_names(shape)
+    fields = (
+        ("s_idx", shape.s_idx),
+        ("q_idx", shape.q_idx),
+        ("k_idx", shape.k_idx),
+        ("is_last_k", shape.is_last_k),
+        ("do_writeback", shape.do_writeback),
+        ("dma_q", shape.dma_q),
+        ("dma_kv_cache", shape.dma_kv_cache),
+        ("dma_kv_new", shape.dma_kv_new),
+        ("total_wait_kv_in", shape.total_wait_kv_in),
+        ("total_wait_kv_out", shape.total_wait_kv_out),
+        ("total_wait_q_in", shape.total_wait_q_in),
+        ("total_wait_o_out", shape.total_wait_o_out),
+        ("total_wait_lse_out", shape.total_wait_lse_out),
+    )
+    names = tuple(name for name, _ in fields)
+    if names != field_names(shape):
+        raise ValueError("RpaSchedule field order changed")
     out_shape = [
-        jax.ShapeDtypeStruct(
-            (steps, getattr(shape, name).data.size // steps), jnp.int32
-        )
-        for name in names
+        jax.ShapeDtypeStruct((steps, ref.data.size // steps), jnp.int32)
+        for _, ref in fields
     ]
     outputs = pl.pallas_call(
         functools.partial(_kernel, cfgs=cfgs, names=names),
         out_shape=out_shape,
         name="qsa_decode_schedule",
     )(meta)
-    result = {
-        name: dataclasses.replace(getattr(shape, name), data=value.reshape(-1))
-        for name, value in zip(names, outputs)
-    }
-    return dataclasses.replace(
-        shape,
-        **result,
-        actual_steps=((ends[-1:] + lanes - 1) // lanes).astype(jnp.int32),
+    return jax.tree.unflatten(
+        jax.tree.structure(shape),
+        [
+            *(value.reshape(-1) for value in outputs),
+            ((ends[-1:] + lanes - 1) // lanes).astype(jnp.int32),
+        ],
     )

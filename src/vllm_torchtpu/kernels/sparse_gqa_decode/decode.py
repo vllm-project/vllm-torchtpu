@@ -89,33 +89,3 @@ def execute_decode(
         cache,
         batch_size=launch.chunk_queries,
     )
-
-
-def qsa_decode_attention(
-    q: jax.Array,
-    gate: jax.Array,
-    blocks: jax.Array,
-    lengths: jax.Array,
-    table: jax.Array,
-    cache: jax.Array,
-    *,
-    kv_heads: int,
-    ratio: int,
-    k_scale: float = 1.0,
-    v_scale: float = 1.0,
-) -> tuple[jax.Array, jax.Array]:
-    """Retain the existing module entry; internal dispatch uses execute_decode."""
-    from . import qsa_decode_attention as checked_decode
-
-    return checked_decode(
-        q,
-        gate,
-        blocks,
-        lengths,
-        table,
-        cache,
-        kv_heads=kv_heads,
-        ratio=ratio,
-        k_scale=k_scale,
-        v_scale=v_scale,
-    )

@@ -23,6 +23,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.qwen4_exp import pooled_qsa, qsa_rpa, qsa_state
+from vllm_torchtpu.kernels.sparse_gqa_decode import batching
 
 
 @pytest.fixture
@@ -205,7 +206,7 @@ def test_state_capacity_has_explicit_error_before_launch(monkeypatch):
 @pytest.mark.parametrize("columns", [0, -1])
 def test_rpa_rejects_nonpositive_width(columns):
     with pytest.raises(ValueError, match="positive"):
-        qsa_rpa.rpa_query_batch_size(
+        batching.rpa_query_batch_size(
             columns,
             query=jax.ShapeDtypeStruct((1, 4, 128), jnp.bfloat16),
             cache=jax.ShapeDtypeStruct((1, 128, 1, 2, 128), jnp.bfloat16),
@@ -229,7 +230,7 @@ def test_rpa_one_row_exact_capacity_boundary(monkeypatch, lanes, columns):
         ),
     )
     assert (
-        qsa_rpa.rpa_query_batch_size(
+        batching.rpa_query_batch_size(
             columns,
             query=jax.ShapeDtypeStruct((1, 4, 128), jnp.bfloat16),
             cache=jax.ShapeDtypeStruct((1, 128, 1, 2, 128), jnp.bfloat16),
@@ -248,7 +249,7 @@ def test_rpa_one_row_exact_capacity_boundary(monkeypatch, lanes, columns):
         ),
     )
     with pytest.raises(ValueError, match="One QSA page-table row.*SMEM capacity"):
-        qsa_rpa.rpa_query_batch_size(
+        batching.rpa_query_batch_size(
             columns,
             query=jax.ShapeDtypeStruct((1, 4, 128), jnp.bfloat16),
             cache=jax.ShapeDtypeStruct((1, 128, 1, 2, 128), jnp.bfloat16),
@@ -332,7 +333,7 @@ def test_suffix_keeps_original_rows_and_prefix_tail_drops(
 
     monkeypatch.setattr(qsa_rpa, "_prefill_attention", prefill)
     monkeypatch.setattr(qsa_rpa, "_rpa_attention_batch", attend)
-    monkeypatch.setattr(qsa_rpa, "rpa_query_batch_size", lambda *a, **kw: 3)
+    monkeypatch.setattr(batching, "rpa_query_batch_size", lambda *a, **kw: 3)
     with jax.disable_jit():
         output, owner = qsa_rpa.qsa_attention(
             query,
