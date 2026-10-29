@@ -75,28 +75,63 @@ def _compiled_fn_name(fn: Callable) -> str | None:
 class _Layout:
     """What one argument layout of the forward needs to rebuild its flat list."""
 
-    __slots__ = ("samples", "template", "fill_args", "fill_sizes", "out_index",
-                 "out_tuple", "ready", "dead")
+    __slots__ = ("samples", "template", "fill_args", "fill_sizes", "out_spec",
+                 "ready", "dead", "reason")
 
     def __init__(self) -> None:
         self.samples: list[tuple[tuple, tuple, Any, Any]] = []
         self.template: list[Any] | None = None
         self.fill_args: list[tuple[int, int]] = []
         self.fill_sizes: list[tuple[int, int, int]] = []
-        self.out_index: int | None = None
-        self.out_tuple: tuple[int, ...] | None = None
+        self.out_spec: Any = None
         self.ready = False
         self.dead = False
+        self.reason = ""
 
 
-def _classify(layout: _Layout) -> None:
-    """Fill the layout from its recorded calls, or mark it dead."""
+def _describe(v: Any) -> str:
+    if isinstance(v, torch.Tensor):
+        kind = "Parameter" if isinstance(v, torch.nn.Parameter) else "Tensor"
+        return f"{kind}{tuple(v.shape)}:{v.dtype}"
+    return f"{type(v).__name__}={v!r}"[:80]
+
+
+def _out_spec(ret: Any, out: Any) -> Any:
+    """How the forward's return value is built from the graph outputs, or
+    raise ValueError: ('o', k) for out[k], ('n',) for None, or a tuple/list
+    of specs."""
+    if ret is None:
+        return ("n",)
+    if isinstance(ret, (tuple, list)):
+        return (type(ret), [_out_spec(r, out) for r in ret])
+    for k, o in enumerate(out):
+        if o is ret:
+            return ("o", k)
+    raise ValueError(f"returns {_describe(ret)}, not a graph output")
+
+
+def _apply_spec(spec: Any, out: Any) -> Any:
+    if spec[0] == "o":
+        return out[spec[1]]
+    if spec[0] == "n":
+        return None
+    return spec[0](_apply_spec(s, out) for s in spec[1])
+
+
+def _same(a: Any, b: Any) -> bool:
+    if isinstance(a, (tuple, list)):
+        return (isinstance(b, type(a)) and len(a) == len(b)
+                and all(_same(x, y) for x, y in zip(a, b)))
+    return a is b
+
+
+def _classify(layout: _Layout) -> str | None:
+    """Fill the layout from its recorded calls. Returns a reason when it can
+    never be cached (layout.dead), None when ready or still undecided."""
     samples = layout.samples
-    first_flat = samples[0][1]
-    n = len(first_flat)
+    n = len(samples[0][1])
     if any(len(s[1]) != n for s in samples):
-        layout.dead = True
-        return
+        return "flat length varies"
     kinds: list[tuple] = []
     for i in range(n):
         vals = [s[1][i] for s in samples]
@@ -106,6 +141,17 @@ def _classify(layout: _Layout) -> None:
             kinds.append((_ARG, argpos[0]))
             continue
         if isinstance(v0, int) and not isinstance(v0, bool):
+            varied = len(set(vals)) >= 2
+            # An int argument passed through.
+            same_arg = [
+                j for j, a in enumerate(samples[0][0])
+                if isinstance(a, int) and not isinstance(a, bool)
+                and all(isinstance(s[0][j], int) and s[0][j] == s[1][i]
+                        for s in samples)
+            ]
+            if same_arg and varied:
+                kinds.append((_ARG, same_arg[0]))
+                continue
             cands = None
             for args, flat, _, _ in samples:
                 here = {
@@ -116,57 +162,39 @@ def _classify(layout: _Layout) -> None:
                     if size == flat[i]
                 }
                 cands = here if cands is None else cands & here
-            if cands and len({s[1][i] for s in samples}) >= 2:
+            if cands and varied:
                 kinds.append((_SIZE, *min(cands)))
                 continue
-            if all(v == v0 for v in vals):
-                # Never varied: undecidable between a size and a constant.
-                return
-            layout.dead = True
-            return
-        if all(v is v0 for v in vals) and not any(
-            v0 is a for s in samples for a in s[0]
-        ):
+            if not varied:
+                # Never varied yet: undecidable between a size and a constant.
+                layout.reason = f"flat[{i}] int {v0} has not varied"
+                return None
+            return f"flat[{i}] int varies {sorted(set(vals))[:6]} with no matching arg size"
+        if all(v is v0 for v in vals):
+            if any(v0 is a for s in samples for a in s[0]):
+                return f"flat[{i}] {_describe(v0)} is an argument only sometimes"
             kinds.append((_CONST, v0))
             continue
-        layout.dead = True
-        return
-    # The forward must return graph outputs unchanged.
-    out_index = out_tuple = None
-    ret0, out0 = samples[0][2], samples[0][3]
-    if not isinstance(out0, (tuple, list)):
-        layout.dead = True
-        return
-    idx = [k for k, o in enumerate(out0) if o is ret0]
-    if idx and all(s[2] is s[3][idx[0]] for s in samples):
-        out_index = idx[0]
-    elif isinstance(ret0, tuple):
-        pos = []
-        for r in ret0:
-            m = [k for k, o in enumerate(out0) if o is r]
-            if not m:
-                layout.dead = True
-                return
-            pos.append(m[0])
-        if all(
-            isinstance(s[2], tuple)
-            and len(s[2]) == len(pos)
-            and all(r is s[3][k] for r, k in zip(s[2], pos))
-            for s in samples
-        ):
-            out_tuple = tuple(pos)
-        else:
-            layout.dead = True
-            return
-    else:
-        layout.dead = True
-        return
+        same_shape = all(
+            isinstance(v, torch.Tensor) and isinstance(v0, torch.Tensor)
+            and v.shape == v0.shape for v in vals
+        )
+        return (f"flat[{i}] {_describe(v0)} changes identity across calls and is "
+                f"not an argument (same shape: {same_shape}; "
+                f"{len({id(v) for v in vals})} distinct of {len(vals)})")
+    try:
+        spec = _out_spec(samples[0][2], samples[0][3])
+    except ValueError as e:
+        return str(e)
+    if not all(_same(_apply_spec(spec, s[3]), s[2]) for s in samples):
+        return "return structure varies"
     layout.template = [k[1] if k[0] == _CONST else None for k in kinds]
     layout.fill_args = [(i, k[1]) for i, k in enumerate(kinds) if k[0] == _ARG]
     layout.fill_sizes = [(i, k[1], k[2]) for i, k in enumerate(kinds) if k[0] == _SIZE]
-    layout.out_index, layout.out_tuple = out_index, out_tuple
+    layout.out_spec = spec
     layout.ready = True
     layout.samples = []
+    return None
 
 
 class FlatArgsForward:
@@ -183,6 +211,7 @@ class FlatArgsForward:
         self.calls = 0
         self.checks = 0
         self.check_mismatches = 0
+        self.undecided = 0
         self.canary = envs.VLLM_TPU_AOT_FLAT_ARGS_CANARY
         self.check = envs.VLLM_TPU_AOT_FLAT_ARGS_CHECK
 
@@ -243,10 +272,12 @@ class FlatArgsForward:
                 return ret
             layout.samples.append((vals, flat, ret, out))
             if len(layout.samples) >= _RECORD_CALLS:
-                _classify(layout)
-                if layout.dead:
-                    logger.info("AOT_FLAT_ARGS %s: layout %s not cacheable",
-                                self.label, key)
+                reason = _classify(layout)
+                if reason is not None:
+                    layout.dead = True
+                    layout.samples = []
+                    logger.info("AOT_FLAT_ARGS %s: layout %s not cacheable: %s",
+                                self.label, key[:2], reason)
                 elif layout.ready:
                     logger.info(
                         "AOT_FLAT_ARGS %s: caching %d flat args (%d args, %d sizes)",
@@ -254,6 +285,11 @@ class FlatArgsForward:
                         len(layout.fill_sizes))
                 else:
                     layout.samples = layout.samples[-_RECORD_CALLS:]
+                    if len(layout.samples) and self.calls == 0:
+                        self.undecided += 1
+                        if self.undecided in (1, 100, 1000):
+                            logger.info("AOT_FLAT_ARGS %s: layout %s undecided: %s",
+                                        self.label, key[:2], layout.reason)
             return ret
         self.calls += 1
         if self.checks < self.check:
@@ -272,10 +308,7 @@ class FlatArgsForward:
                 logger.error("AOT_FLAT_ARGS %s: canary found %d stale flat args; "
                              "cache off", self.label, bad)
             return ret
-        out = self.compiled(*self._build(layout, vals))
-        if layout.out_index is not None:
-            return out[layout.out_index]
-        return tuple(out[k] for k in layout.out_tuple)
+        return _apply_spec(layout.out_spec, self.compiled(*self._build(layout, vals)))
 
 
 def patch_aot_flat_args() -> None:
