@@ -460,6 +460,51 @@ def _prefill_attention(
     )
 
 
+def _with_lse_channel(attend):
+    """``attend(..., return_lse=True) -> (out, lse, cache)`` as ``(out_ext, cache)``
+    with ``lse`` appended to ``out``'s lane axis, so the decode/prefill routing
+    moves both with the same row selects."""
+
+    def run(*args, **kwargs):
+        out, lse, cache = attend(*args, **kwargs)
+        return jnp.concatenate([out.astype(jnp.float32), lse[..., None]], axis=-1), cache
+
+    return run
+
+
+def _split_lse_channel(output, lengths, cache):
+    live = (lengths > 0)[:, None]
+    out = jnp.where(live[..., None], output[..., :-1], 0)
+    lse = jnp.where(live, output[..., -1], -jnp.inf)
+    return out, lse, cache
+
+
+def dcp_combine(out_pair, lse_pair, gate, rank, *, out_dtype=jnp.bfloat16):
+    """Merge a DCP group's partial attention for this rank's heads, then gate.
+
+    ``out_pair`` [size, T, size * H, D] f32 and ``lse_pair`` [size, T, size * H]
+    are every group rank's ``qsa_attention(dcp=...)`` results over the group's
+    concatenated heads (rank 0's first); ``gate`` [T, H, D] is this rank's
+    gate; ``rank`` int32 ``[1]``. Rows no rank owns a key of stay 0. The gate
+    rounding matches the replicated kernels'.
+    """
+    size, tokens, heads_all, dim = out_pair.shape
+    heads = heads_all // size
+    start = rank.reshape(()).astype(jnp.int32) * heads
+    out_pair = jax.lax.dynamic_slice_in_dim(out_pair, start, heads, axis=2)
+    lse_pair = jax.lax.dynamic_slice_in_dim(lse_pair, start, heads, axis=2)
+    top = jnp.max(lse_pair, axis=0)
+    finite = jnp.isfinite(top)
+    weight = jnp.where(finite[None], jnp.exp(lse_pair - jnp.where(finite, top, 0)[None]), 0)
+    total = jnp.sum(weight, axis=0)
+    out = jnp.sum(weight[..., None] * out_pair, axis=0) / jnp.where(total > 0, total, 1)[..., None]
+    gated = bf16(
+        bf16(out).astype(jnp.float32)
+        * bf16(jax.nn.sigmoid(gate.astype(jnp.float32))).astype(jnp.float32)
+    )
+    return jnp.where(finite[..., None], gated, 0).astype(out_dtype)
+
+
 def qsa_attention(
     query,
     gate,
@@ -475,6 +520,7 @@ def qsa_attention(
     v_scale=1.0,
     kv_head_offset=0,
     max_query_len=1,
+    dcp=None,
 ):
     """Route a decode prefix to per-row decode and the remaining rows to prefill.
 
@@ -489,12 +535,25 @@ def qsa_attention(
 
     ``kv_head_offset`` reads this layer's KV heads after that many other heads
     of each cache row (the second layer of a paired main KV page).
+
+    ``dcp=(rank, size)`` (VLLM_TPU_QSA_MAIN_KV_DCP): attend only this rank's
+    main-KV rows and return ``(out, lse, cache)``: ``out`` [T, heads, D] f32
+    normalized over the owned keys and NOT gated, ``lse`` [T, heads] f32
+    (natural log, ``-inf`` when the row owns no key). ``dcp_combine`` merges
+    the pair.
     """
     options = dict(kv_heads=kv_heads, ratio=ratio, k_scale=k_scale, v_scale=v_scale)
     if kv_head_offset:
         options["kv_head_offset"] = kv_head_offset
+    if dcp is not None:
+        options.update(dcp=dcp, return_lse=True)
+        decode_fn = _with_lse_channel(decode_attention)
+        prefill_fn = _with_lse_channel(_prefill_attention)
+    else:
+        decode_fn, prefill_fn = decode_attention, _prefill_attention
     if len(query) <= (len(starts) - 1) * max_query_len:
-        return decode_attention(query, gate, blocks, lengths, table, cache, **options)
+        output, cache = decode_fn(query, gate, blocks, lengths, table, cache, **options)
+        return _split_lse_channel(output, lengths, cache) if dcp is not None else (output, cache)
 
     # RPA rows: one per request row, times the tokens a verify request holds.
     capacity = min(len(query), (len(starts) - 1) * max_query_len)
@@ -506,7 +565,7 @@ def qsa_attention(
     # the cache threads through both kernels exactly once.
     prefix = short_request_prefix_tokens(starts, capacity)
     decode_lengths = jnp.where(jnp.arange(capacity) < prefix, lengths[:capacity], 0)
-    decoded, cache = decode_attention(
+    decoded, cache = decode_fn(
         query[:capacity],
         gate[:capacity],
         blocks[:capacity],
@@ -524,7 +583,7 @@ def qsa_attention(
             return _shift_rows_up(x, prefix, capacity)
 
         prefill_lengths = jnp.where(rows < starts[-1] - prefix, shift(lengths), 0)
-        prefilled, cache = _prefill_attention(
+        prefilled, cache = prefill_fn(
             shift(query),
             shift(gate),
             shift(blocks),
@@ -539,10 +598,12 @@ def qsa_attention(
             _pad_rows(decoded, len(query)),
             _shift_rows_down(prefilled, prefix, capacity),
         )
+        if dcp is not None:
+            return _split_lse_channel(output, lengths, cache)
         return jnp.where((lengths > 0)[:, None, None], output, 0), cache
     ids = jnp.minimum(rows + prefix, len(query) - 1)
     prefill_lengths = jnp.where(rows < starts[-1] - prefix, lengths[ids], 0)
-    prefilled, cache = _prefill_attention(
+    prefilled, cache = prefill_fn(
         query[ids],
         gate[ids],
         blocks[ids],
@@ -557,6 +618,8 @@ def qsa_attention(
         decoded[jnp.minimum(rows, capacity - 1)],
         prefilled[jnp.maximum(rows - prefix, 0)],
     )
+    if dcp is not None:
+        return _split_lse_channel(output, lengths, cache)
     return jnp.where((lengths > 0)[:, None, None], output, 0), cache
 
 
