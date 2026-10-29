@@ -132,7 +132,10 @@ def derive_metadata(
 
     # 4. Compressed KV Cache Slot Mapping (Virtual -> Physical)
     kv_idx = positions // compress_ratio
-    kv_page_idx = kv_idx // kv_block_size
+    # `(p // r) // b == p // (r * b)`. Written over the page's token count,
+    # which every compressor on a KV table shares, the lookup below is one
+    # expression XLA computes once for all of them.
+    kv_page_idx = positions // (compress_ratio * kv_block_size)
     kv_page_offset = kv_idx % kv_block_size
 
     kv_page_number = kv_block_table[req * kv_block_table_stride + kv_page_idx]
