@@ -271,6 +271,7 @@ if TYPE_CHECKING:
     VLLM_TPU_BLOCK_TABLE_PACK_DELTA: bool = False
     VLLM_TPU_TOKEN_PADDING_REUSE: bool = False
     VLLM_TPU_FAST_METADATA_BUILD: bool = False
+    VLLM_TPU_AOT_SKIP_GUARD_CHECK: bool = False
     VLLM_TPU_PLE_HOST_PRELOOKUP: bool = False
     VLLM_TPU_PLE_HOST_PRELOOKUP_CHECK: str = ""
     VLLM_TPU_PLE_HOST_PRELOOKUP_MAX_TOKENS: int = 128
@@ -1636,6 +1637,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Staged metadata walk: build every group's AttentionMetadata inline instead
     # of one builder call per group (tpu_runner._build_attention_metadata_staged).
     "VLLM_TPU_FAST_METADATA_BUILD": env_bool("VLLM_TPU_FAST_METADATA_BUILD"),
+    # Freshly AOT-compiled models skip the per-call Dynamo guard check when
+    # vLLM does not evaluate guards (as it already does for cached artifacts).
+    "VLLM_TPU_AOT_SKIP_GUARD_CHECK": env_bool("VLLM_TPU_AOT_SKIP_GUARD_CHECK"),
     # Qwen4Exp host PLE: look the rows up before the backbone call and pass them
     # in, so the TP graph has no host boundary (models/vllm/qwen4_exp).
     "VLLM_TPU_PLE_HOST_PRELOOKUP": env_bool("VLLM_TPU_PLE_HOST_PRELOOKUP"),
