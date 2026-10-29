@@ -340,30 +340,6 @@ def _sample_from_logits_impl(
     return torch.argmax(final_logits, dim=-1, keepdim=True)
 
 
-def _read_offsets_values_impl(
-    groups: list[torch.Tensor],
-    next_tokens: torch.Tensor,
-    num_reqs: torch.Tensor,
-    dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """The (indices, values) `_update_read_offsets_impl` scatters, without
-    the scatter: the caller applies one eager index_put_, so no compiled
-    program mutates the slot buffer (and pays an aot mutation epilogue)."""
-    width = groups[0].shape[0]
-    rows = next_tokens.shape[0]
-    if rows >= width:
-        next_tokens = next_tokens[:width]
-    else:
-        next_tokens = torch.nn.functional.pad(
-            next_tokens, (0, 0, 0, width - rows), value=INVALID_TOKEN_ID
-        )
-    num_valid = (next_tokens != INVALID_TOKEN_ID).sum(dim=1)
-    valid = torch.arange(width, device=next_tokens.device) < num_reqs
-    offsets = torch.where(valid, (num_valid - 1).clamp(min=0), 0).to(dtype)
-    indices = torch.cat(groups, dim=0).long() if len(groups) > 1 else groups[0].long()
-    return indices, offsets.repeat(len(groups))
-
-
 def _verify_fused_impl(
     logits: torch.Tensor,
     bonus_logits_indices: torch.Tensor,
@@ -382,9 +358,7 @@ def _verify_fused_impl(
     max_draft_tokens: int,
     synthetic_mode: bool,
     topk_candidates: int,
-    read_offset_groups: list[torch.Tensor] | None = None,
     num_reqs: torch.Tensor | None = None,
-    read_offset_dtype: torch.dtype = torch.int32,
 ):
     """Non-greedy spec verify of one chunk as one program
     (VLLM_TPU_VERIFY_FUSED): the bonus/target logit gathers, the bonus-token
@@ -414,13 +388,14 @@ def _verify_fused_impl(
         synthetic_mode,
         topk_candidates,
     )
-    if read_offset_groups is None:
+    if num_reqs is None:
         return next_tokens
-    assert num_reqs is not None
-    indices, offsets = _read_offsets_values_impl(
-        read_offset_groups, next_tokens, num_reqs, read_offset_dtype
-    )
-    return next_tokens, indices, offsets
+    # Per-row read offsets (`_update_read_offsets_impl` before its group
+    # pad/scatter): rows past num_reqs take 0.
+    num_valid = (next_tokens != INVALID_TOKEN_ID).sum(dim=1)
+    valid = torch.arange(next_tokens.shape[0], device=next_tokens.device) < num_reqs
+    row_offsets = torch.where(valid, (num_valid - 1).clamp(min=0), 0)
+    return next_tokens, row_offsets
 
 
 # Strip any dynamic-dim marks a caller's tensor carries (see eagle3).
@@ -4932,15 +4907,26 @@ class TPUModelRunner(GPUModelRunner):
             and self.mamba_slot_read_offsets.device.type == "tpu"
         )
         if fold_ro:
-            out, ro_idx, ro_val = _verify_fused_compiled(
-                *args,
-                list(ro_groups),
-                self._num_reqs_tensor(ro_num_reqs),
-                self.mamba_slot_read_offsets.dtype,
+            out, row_offsets = _verify_fused_compiled(
+                *args, self._num_reqs_tensor(ro_num_reqs)
             )
-            # One eager scatter instead of a compiled program that mutates the
-            # slot buffer (and its aot mutation epilogue).
-            self.mamba_slot_read_offsets.index_put_((ro_idx,), ro_val)
+            # Pad/truncate to the slot groups' width and scatter eagerly, instead
+            # of a compiled program that mutates the slot buffer (and its aot
+            # mutation epilogue). Padded rows' slots are the null block.
+            groups = list(ro_groups)
+            width = groups[0].shape[0]
+            rows = row_offsets.shape[0]
+            vals = (
+                row_offsets[:width]
+                if rows >= width
+                else torch.nn.functional.pad(row_offsets, (0, width - rows))
+            ).to(self.mamba_slot_read_offsets.dtype)
+            if len(groups) > 1:
+                idx = torch.cat(groups, dim=0).long()
+                vals = vals.repeat(len(groups))
+            else:
+                idx = groups[0].long()
+            self.mamba_slot_read_offsets.index_put_((idx,), vals)
             self._fused_read_offsets_applied = True
         else:
             out = _verify_fused_compiled(*args)
@@ -6938,7 +6924,36 @@ class TPUModelRunner(GPUModelRunner):
         candidates = [0]
         if blocks := self._topk_candidate_blocks():
             candidates.append(blocks)
+        # With the read-offset fold on, only the num_reqs variant runs.
+        fold_ro = bool(
+            envs.VLLM_TPU_VERIFY_FUSED_READ_OFFSETS
+            and self.mamba_slot_read_offsets is not None
+        )
         for topk_candidates in candidates:
+            if fold_ro:
+                synchronize_tensors(
+                    _verify_fused_compiled(
+                        dummy_logits,
+                        bonus_logits_indices,
+                        target_logits_indices,
+                        temps,
+                        top_k,
+                        top_p,
+                        bonus_u,
+                        warm_accept_u,
+                        warm_recover_u,
+                        draft_token_ids,
+                        draft_lengths,
+                        segment_ids,
+                        group_indices,
+                        self.rejection_sampler.synthetic_conditional_rates,
+                        self.speculative_config.num_speculative_tokens,
+                        self.rejection_sampler.synthetic_mode,
+                        topk_candidates,
+                        self._num_reqs_tensor(1),
+                    )
+                )
+                continue
             out = _verify_fused_compiled(
                 dummy_logits,
                 bonus_logits_indices,
@@ -6959,42 +6974,6 @@ class TPUModelRunner(GPUModelRunner):
                 topk_candidates,
             )
             synchronize_tensors(out)
-            if not (
-                envs.VLLM_TPU_VERIFY_FUSED_READ_OFFSETS
-                and self.mamba_slot_read_offsets is not None
-            ):
-                continue
-            # Read-offset variant: one slot group at each kernel request width.
-            widths = {
-                w
-                for w in (self.num_reqs_max_model_len, self.num_reqs_most_model_len)
-                if w
-            }
-            for width in widths:
-                groups = [torch.zeros(width, dtype=torch.int32).to(self.device)]
-                out = _verify_fused_compiled(
-                    dummy_logits,
-                    bonus_logits_indices,
-                    target_logits_indices,
-                    temps,
-                    top_k,
-                    top_p,
-                    bonus_u,
-                    warm_accept_u,
-                    warm_recover_u,
-                    draft_token_ids,
-                    draft_lengths,
-                    segment_ids,
-                    group_indices,
-                    self.rejection_sampler.synthetic_conditional_rates,
-                    self.speculative_config.num_speculative_tokens,
-                    self.rejection_sampler.synthetic_mode,
-                    topk_candidates,
-                    groups,
-                    self._num_reqs_tensor(1),
-                    self.mamba_slot_read_offsets.dtype,
-                )
-                synchronize_tensors(out)
 
     def _precompile_top_token_verify(
         self,
