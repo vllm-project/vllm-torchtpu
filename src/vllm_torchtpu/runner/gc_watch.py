@@ -12,9 +12,8 @@ import gc
 import threading
 import time
 
-from vllm.logger import init_logger
-
 from vllm_torchtpu import envs
+from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
