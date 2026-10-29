@@ -279,7 +279,9 @@ def main() -> None:
     if args.candidate == "adaptive":
         from vllm_torchtpu.kernels.sparse_gqa_prefill.adaptive import adaptive_prefill
 
-        functions["prefill"] = jax.jit(adaptive_prefill)
+        functions["prefill"] = jax.jit(
+            functools.partial(adaptive_prefill, kv_heads=2, ratio=4)
+        )
     for tokens in args.tokens:
         for context in args.contexts:
             for pattern in args.patterns:
