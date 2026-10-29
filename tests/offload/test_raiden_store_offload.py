@@ -697,24 +697,31 @@ class TestLookup(unittest.TestCase):
         del self.store.entries[sub_hashes(_key(0))[2]]
         self.assertEqual(self.manager.lookup(_key(0), _ctx()), LookupResult.MISS)
 
-    def test_parked_store_key_is_a_miss_not_pending(self):
-        # Store-on-evict: an in-flight key whose job is still parked answers
-        # MISS (the request recomputes) and is counted; once promoted it is a
-        # pending save again. VLLM_TPU_RAIDEN_PARKED_LOOKUP_MISS=0 restores
-        # HIT_PENDING.
+    def test_parked_store_key_lookup_modes(self):
+        # Store-on-evict, a lookup on a key whose job is still parked
+        # (VLLM_TPU_RAIDEN_PARKED_LOOKUP): "promote" (default) answers
+        # HIT_PENDING and asks the connector to store that job now; "miss"
+        # answers MISS; "wait" is plain HIT_PENDING. Unparked in-flight keys
+        # are always HIT_PENDING.
         key = _key(0)
         self.manager._inflight_store_keys.add(key)
         self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT_PENDING)
+        self.assertEqual(self.manager.demanded_parked_keys, set())
         self.manager.mark_parked([key])
-        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.MISS)
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT_PENDING)
+        self.assertEqual(self.manager.demanded_parked_keys, {key})
+        self.assertEqual(self.manager.parked_lookup_promotions, 1)
+        with patch.dict(os.environ, {"VLLM_TPU_RAIDEN_PARKED_LOOKUP": "miss"}):
+            self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.MISS)
         self.assertEqual(self.manager.parked_lookup_misses, 1)
-        with patch.dict(os.environ, {"VLLM_TPU_RAIDEN_PARKED_LOOKUP_MISS": "0"}):
+        self.manager.unmark_parked([key])
+        self.assertEqual(self.manager.demanded_parked_keys, set())
+        self.manager.mark_parked([key])
+        with patch.dict(os.environ, {"VLLM_TPU_RAIDEN_PARKED_LOOKUP": "wait"}):
             self.assertEqual(
                 self.manager.lookup(key, _ctx()), LookupResult.HIT_PENDING
             )
-        self.manager.unmark_parked([key])
-        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT_PENDING)
-        self.manager.mark_parked([key])
+        self.assertEqual(self.manager.demanded_parked_keys, set())
         self.manager.on_store_job_cancelled([key])
         self.assertNotIn(key, self.manager._parked_store_keys)
 
@@ -752,6 +759,24 @@ class TestStoreJobLifecycle(unittest.TestCase):
         out = self.manager.prepare_store(keys, _ctx())
         self.assertEqual(out.keys_to_store, keys)
         self.manager.submit_store_job(7, keys, device_blocks)
+
+    def test_mamba_end_only_keeps_the_last_recurrent_chunk(self):
+        """VLLM_TPU_RAIDEN_MAMBA_END_ONLY: of a recurrent-state group only the
+        last chunk a store call offers is stored; attention chunks all are."""
+        from vllm.v1.kv_offload.base import make_offload_key
+
+        attn = [make_offload_key(_key(i), 0) for i in range(3)]
+        mamba = [make_offload_key(_key(i), 1) for i in range(3)]
+        keys = [k for pair in zip(attn, mamba) for k in pair]
+        self.manager.mamba_end_only_groups = frozenset({1})
+        with patch.dict(os.environ, {"VLLM_TPU_RAIDEN_MAMBA_END_ONLY": "1"}):
+            out = self.manager.prepare_store(keys, _ctx())
+        self.assertEqual(out.keys_to_store, attn[:2] + [attn[2], mamba[2]])
+        self.assertEqual(self.manager.mamba_end_only_skipped, 2)
+        # Off by default: every chunk is offered.
+        other = [make_offload_key(_key(10 + i), 1) for i in range(2)]
+        out = self.manager.prepare_store(other, _ctx())
+        self.assertEqual(out.keys_to_store, other)
 
     def test_submit_expands_sub_hashes_and_device_blocks(self):
         self._admit([_key(0), _key(1)], [5, 9])
@@ -2844,6 +2869,24 @@ class TestStoreOnEvict(unittest.TestCase):
         keys = [f"k{n}" for n in ids]
         manager.mark_parked.assert_called_once_with(keys)
         manager.unmark_parked.assert_called_once_with(keys)
+
+    def test_a_demanded_parked_job_is_promoted_at_once(self):
+        """VLLM_TPU_RAIDEN_PARKED_LOOKUP=promote: a parked job whose key a
+        lookup reached moves to the fence stage at the next step, though its
+        blocks are nowhere near the LRU head."""
+        manager = MagicMock()
+        manager.demanded_parked_keys = set()
+        sched = self._make_scheduler(manager)
+        held = self._cached(2, "D")
+        ids = [b.block_id for b in held]
+        keys = [f"k{n}" for n in ids]
+        self._build_meta(sched, self._stock_meta(store_jobs={8: self._store_job(keys, ids)}))
+        self.assertIn(8, sched._cold_pending)
+        manager.demanded_parked_keys.add(keys[1])
+        meta = self._build_meta(sched, self._stock_meta())
+        self.assertEqual(meta.fence_job_ids, {8})
+        self.assertNotIn(8, sched._cold_pending)
+        self.assertEqual(manager.demanded_parked_keys, set())
 
     def test_a_held_block_is_never_stored(self):
         manager = MagicMock()

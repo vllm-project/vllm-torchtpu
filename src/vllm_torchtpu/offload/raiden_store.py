@@ -102,6 +102,7 @@ from vllm.v1.kv_offload.base import (
     OffloadKey,
     PrepareStoreOutput,
     ReqContext,
+    get_offload_group_idx,
     RequestOffloadingContext,
     ScheduleEndContext,
     TransferResult,
@@ -446,13 +447,21 @@ class RaidenOffloadingManager(OffloadingManager):
         # probes the directory itself.
         self._inflight_store_keys: set[OffloadKey] = set()
         # Store-on-evict: in-flight keys whose job is still parked (not yet
-        # submitted, its device blocks not yet at the LRU head). A lookup on
-        # one answers MISS rather than HIT_PENDING
-        # (VLLM_TPU_RAIDEN_PARKED_LOOKUP_MISS): most parked jobs are cancelled
-        # long before they are promoted, so waiting on one can hold a request
-        # for many steps although its data is still on the device.
+        # submitted, its device blocks not yet at the LRU head). How a lookup
+        # on one is answered is VLLM_TPU_RAIDEN_PARKED_LOOKUP: most parked jobs
+        # are cancelled long before they are promoted, so plain HIT_PENDING can
+        # hold a request for many steps.
         self._parked_store_keys: set[OffloadKey] = set()
         self.parked_lookup_misses = 0
+        # VLLM_TPU_RAIDEN_PARKED_LOOKUP=promote: parked keys a lookup reached,
+        # for the connector to promote (store now) at its next step.
+        self.demanded_parked_keys: set[OffloadKey] = set()
+        self.parked_lookup_promotions = 0
+        # Recurrent-state (mamba "align") groups whose per-chunk checkpoints
+        # are stored only at the end of each store call
+        # (VLLM_TPU_RAIDEN_MAMBA_END_ONLY; set by the connector scheduler).
+        self.mamba_end_only_groups: frozenset[int] = frozenset()
+        self.mamba_end_only_skipped = 0
 
         # Peer and storage-tier location slices cached from lookups and
         # consumed during `prepare_load`.
@@ -599,15 +608,25 @@ class RaidenOffloadingManager(OffloadingManager):
     def unmark_parked(self, keys) -> None:
         """Their job left the park (promoted to the fence stage, or cancelled)."""
         self._parked_store_keys.difference_update(keys)
+        self.demanded_parked_keys.difference_update(keys)
 
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         if key in self._inflight_store_keys:
-            if (
-                key in self._parked_store_keys
-                and envs.VLLM_TPU_RAIDEN_PARKED_LOOKUP_MISS
-            ):
-                self.parked_lookup_misses += 1
-                return LookupResult.MISS
+            if key in self._parked_store_keys:
+                mode = envs.VLLM_TPU_RAIDEN_PARKED_LOOKUP
+                if mode == "miss":
+                    self.parked_lookup_misses += 1
+                    return LookupResult.MISS
+                if mode == "promote":
+                    # Wanted now: store it now. The request waits one copy,
+                    # not until the block reaches the LRU head (most parked
+                    # jobs are cancelled first). A MISS would lose the hit:
+                    # the device frees attention tails before the recurrent
+                    # checkpoint, so a parked checkpoint is what completes the
+                    # boundary.
+                    if key not in self.demanded_parked_keys:
+                        self.parked_lookup_promotions += 1
+                    self.demanded_parked_keys.add(key)
             return LookupResult.HIT_PENDING
         sub_hashes = self._sub_hashes(key)
         # A probe across all sub-hashes, not a claim: the store pins every
@@ -768,7 +787,33 @@ class RaidenOffloadingManager(OffloadingManager):
         self._pending_remote_slices.update(remote_slices)
         return RaidenLoadStoreSpec(keys)
 
+    def _mamba_end_only(self, keys):
+        """VLLM_TPU_RAIDEN_MAMBA_END_ONLY: of each recurrent-state group, keep
+        only the last chunk a store call offers (the end of what the request
+        has computed so far: a prefill step's last chunk, the prompt's last
+        full chunk). A turn resumes from its previous turn's prompt end, so the
+        state at every intermediate chunk is ~37 host pages per chunk that no
+        lookup reads; a lookup ending mid-prefix finds the latest stored state
+        before it (the suffix lookup scans back) and loads a shorter hit."""
+        groups = self.mamba_end_only_groups
+        if not groups or not envs.VLLM_TPU_RAIDEN_MAMBA_END_ONLY:
+            return keys
+        last: dict[int, int] = {}
+        for i, key in enumerate(keys):
+            group = get_offload_group_idx(key)
+            if group in groups:
+                last[group] = i
+        keep = set(last.values())
+        kept = [
+            key
+            for i, key in enumerate(keys)
+            if i in keep or get_offload_group_idx(key) not in groups
+        ]
+        self.mamba_end_only_skipped += len(keys) - len(kept)
+        return kept
+
     def prepare_store(self, keys, req_context: ReqContext) -> PrepareStoreOutput | None:
+        keys = self._mamba_end_only(keys)
         # The Raiden directory is the sole authority on what is stored: probe
         # it per key, so a key whose entries were displaced from the LRU is
         # re-offered here on its next appearance. A key is skipped only when
@@ -1107,6 +1152,7 @@ class RaidenOffloadingManager(OffloadingManager):
         """A fence-pending (never admitted) store job was cancelled."""
         self._inflight_store_keys.difference_update(keys)
         self._parked_store_keys.difference_update(keys)
+        self.demanded_parked_keys.difference_update(keys)
 
     def is_job_launched(self, job_id: int) -> bool:
         """Whether a job has been admitted+launched and is not yet terminal."""

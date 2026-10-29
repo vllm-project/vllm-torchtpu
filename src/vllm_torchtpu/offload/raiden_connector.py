@@ -229,6 +229,11 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         super().__init__(spec, vllm_config, kv_cache_config)
         assert isinstance(self.manager, RaidenOffloadingManager)
         self._raiden_manager: RaidenOffloadingManager = self.manager
+        self._raiden_manager.mamba_end_only_groups = frozenset(
+            config.group_idx
+            for config in self.config.kv_group_configs
+            if config.requires_cow_source
+        )
         self._fence_pending: dict[int, _ParkedStore] = {}
         self._init_cold()
 
@@ -268,6 +273,15 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         pool = _BLOCK_POOL
         frontier = _cold_frontier(pool, tpu_envs.VLLM_TPU_RAIDEN_COLD_FRONTIER_BLOCKS)
         due = {jid for bid in frontier for jid in self._cold_by_block.get(bid, ())}
+        demanded = self._raiden_manager.demanded_parked_keys
+        if demanded:
+            # Jobs a lookup is waiting on (VLLM_TPU_RAIDEN_PARKED_LOOKUP=promote).
+            due |= {
+                jid
+                for jid, parked in self._cold_pending.items()
+                if not demanded.isdisjoint(parked.keys)
+            }
+            demanded.clear()
         for job_id in due:
             hashes = self._cold_hashes.get(job_id, [])
             parked = self._cold_drop(job_id)
@@ -393,11 +407,14 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         if stats["steps"] % _STATS_EVERY == 0:
             logger.info(
                 "TPURaidenOffloadingConnector stats (blocks): %s | store-on-evict "
-                "jobs: %s parked_now=%d parked_lookup_misses=%d",
+                "jobs: %s parked_now=%d parked_lookup_misses=%d "
+                "parked_lookup_promotions=%d mamba_end_only_skipped=%d",
                 " ".join(f"{k}={v}" for k, v in stats.items()),
                 " ".join(f"{k}={v}" for k, v in self._cold_stats.items()),
                 len(self._cold_pending),
                 getattr(manager, "parked_lookup_misses", 0),
+                getattr(manager, "parked_lookup_promotions", 0),
+                getattr(manager, "mamba_end_only_skipped", 0),
             )
 
         # Return empty load_jobs/store_jobs: workers act as passive DMA endpoints.
