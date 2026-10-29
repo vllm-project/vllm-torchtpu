@@ -30,16 +30,23 @@ fi
 
 echo "--- Checking ${STEP_KEY} Outcome (Hardware: ${CI_TPU_VERSION:-v6})"
 
-# Try to get the custom string you saved
+# Try to get the custom string you saved, while still checking the step outcome
+# so `soft_fail: true` steps stay non-blocking downstream.
 CUSTOM_STATUS=$(buildkite-agent meta-data get "${STEP_KEY}" --default "")
+STEP_OUTCOME=$(buildkite-agent step get "outcome" --step "${STEP_KEY}" || echo "skipped")
 
 if [ -n "$CUSTOM_STATUS" ]; then
     OUTCOME="$CUSTOM_STATUS"
 else
-    OUTCOME=$(buildkite-agent step get "outcome" --step "${STEP_KEY}" || echo "skipped")
+    OUTCOME="$STEP_OUTCOME"
 fi
 
-echo "Step ${STEP_KEY} outcome: ${OUTCOME}"
+SOFT_FAILED="false"
+if [ "${STEP_OUTCOME}" = "soft_failed" ] || [ "${OUTCOME}" = "soft_failed" ]; then
+    SOFT_FAILED="true"
+fi
+
+echo "Step ${STEP_KEY} outcome: ${OUTCOME} (soft_failed=${SOFT_FAILED})"
 message=""
 
 case $OUTCOME in
@@ -63,7 +70,8 @@ esac
 # Save the results using the hardware-specific prefix.
 buildkite-agent meta-data set "${TPU_METADATA_PREFIX}${CI_TARGET}_category" "${CI_CATEGORY}"
 buildkite-agent meta-data set "${TPU_METADATA_PREFIX}${CI_TARGET}:${CI_STAGE}" "${message}"
+buildkite-agent meta-data set "${TPU_METADATA_PREFIX}${CI_TARGET}:${CI_STAGE}:soft_failed" "${SOFT_FAILED}"
 
-if [ "${OUTCOME}" != "passed" ] && [ "${OUTCOME}" != "skipped" ] && [ "${OUTCOME}" != "unverified" ] && [ "${OUTCOME}" != "not enough HBM" ]; then
+if [ "${SOFT_FAILED}" != "true" ] && [ "${OUTCOME}" != "passed" ] && [ "${OUTCOME}" != "skipped" ] && [ "${OUTCOME}" != "unverified" ] && [ "${OUTCOME}" != "not enough HBM" ]; then
     exit 1
 fi

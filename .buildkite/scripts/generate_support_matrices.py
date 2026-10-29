@@ -148,8 +148,15 @@ def main() -> None:
                 result = get_buildkite_metadata(
                     f"{tpu_metadata_prefix}{model}:{stage}", default="❓ Untested"
                 )
+                soft_failed = (
+                    get_buildkite_metadata(
+                        f"{tpu_metadata_prefix}{model}:{stage}:soft_failed",
+                        default="false",
+                    )
+                    == "true"
+                )
                 row[stage] = result
-                if result not in valid_outcomes:
+                if result not in valid_outcomes and not soft_failed:
                     any_failed = True
 
             model_rows.append(row)
@@ -265,9 +272,16 @@ def main() -> None:
                     raw_res = get_buildkite_metadata(
                         f"{tpu_metadata_prefix}{feature}:{stage}", default="❓ Untested"
                     )
+                    soft_failed = (
+                        get_buildkite_metadata(
+                            f"{tpu_metadata_prefix}{feature}:{stage}:soft_failed",
+                            default="false",
+                        )
+                        == "true"
+                    )
                     formatted_res = format_status(raw_res)
                     row[stage] = formatted_res
-                    if formatted_res not in valid_feature_outcomes:
+                    if formatted_res not in valid_feature_outcomes and not soft_failed:
                         any_failed = True
 
             rows.append(row)
