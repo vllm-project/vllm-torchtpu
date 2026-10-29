@@ -453,11 +453,9 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             metadata.state_slots,
             metadata.main_block_table,
             metadata.compressed_block_table,
-            **(
-                {"k_scale": self._k_scale_float, "v_scale": self._v_scale_float}
-                if self.fp8_kv
-                else {}
-            ),
+            cast(torch.Tensor, per_layer[self.prefix].request_distribution),
+            k_scale=cast(float, self._k_scale_float) if self.fp8_kv else 1.0,
+            v_scale=cast(float, self._v_scale_float) if self.fp8_kv else 1.0,
         )
         output = self.o_proj(output)
         if self.tp_size > 1:

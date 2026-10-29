@@ -27,6 +27,15 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
 from vllm_torchtpu.kernels.qwen4_exp.indexer_components import qsa_indexing
 
 
+def _request_bounds(starts, distribution, tokens):
+    """Runner boundaries are [decode_end, verify_end, active_request_end]."""
+    if distribution.shape != (3,) or distribution.dtype != jnp.int32:
+        raise ValueError("QSA request_distribution must be int32[3]")
+    return jnp.minimum(starts[distribution[1]], tokens), jnp.minimum(
+        starts[distribution[2]], tokens
+    )
+
+
 def decode_query_chunk_size(pages_per_query: int) -> int:
     """Bound scalar-prefetched page tables with room for scoring metadata."""
     if pages_per_query < 1:
@@ -61,6 +70,7 @@ def select_decode_blocks(
     block_topk=512,
     starts=None,
     context=None,
+    request_distribution: jax.Array | None = None,
     topk_backend: TopKBackend | None = None,
     scheduling_group_namespace: int | None = None,
 ):
@@ -73,9 +83,8 @@ def select_decode_blocks(
     by the table capacity are the caller's contract. Only complete groups enter
     top-k; the attention caller adds the current partial group's tokens.
 
-    Supplying starts/context enables ragged query-block reuse for T>R;
-    omission retains per-query scheduling. T<=R is always a valid conservative
-    per-query route, including multi-token requests with padded idle slots.
+    Ragged scheduling requires starts, context and Runner request_distribution.
+    Without starts/context, every supplied query uses its own causal length.
 
     Winner order is unspecified. The default SparseCore backend chooses lower
     group IDs at exact boundary-score ties. Alternatives follow TopKBackend's
@@ -124,6 +133,7 @@ def select_decode_blocks(
         request_ids,
         starts=starts,
         context=context,
+        request_distribution=request_distribution,
         ratio=compress_ratio,
         block_topk=block_topk,
         topk_backend=topk_backend,
@@ -142,6 +152,7 @@ def select_index_blocks(
     context,
     ratio,
     block_topk,
+    request_distribution: jax.Array | None = None,
     topk_backend: TopKBackend | None = None,
     scheduling_group_namespace: int | None = None,
     vmem_limit_bytes: int | None = None,
@@ -150,11 +161,8 @@ def select_index_blocks(
     """Share ragged query-block reuse and bounded per-query scoring schedules.
 
     ``cache`` is the reader's BF16 or byte-carrier view; ``table`` addresses
-    those physical pages. Small padded token buckets conservatively use
-    per-query causal lengths, even when a request contains multiple queries.
-    T>padded request capacity is a static scheduling heuristic, not a semantic
-    mode classifier, safety requirement or proven profitability boundary.
-    Per-request starts/context and per-query causal lengths are authoritative.
+    those physical pages. Runner order is decode, verify, then prefill/mixed.
+    Decode and verify rows use per-query causal lengths; the suffix shares KV.
     The default SC/QSA prefill composition opts into query-sized score capacity.
     Injected backends stay full unless prefix_capacity explicitly certifies their
     reduced-pitch contract together with this extent-preserving QSA schedule.
@@ -171,34 +179,6 @@ def select_index_blocks(
     scale = query_width**-0.5
     if (starts is None) != (context is None):
         raise ValueError("starts and context must be supplied together")
-    if starts is not None and context is not None and len(query) > len(context):
-        if prefix_capacity is None and default_backend:
-            prefix_capacity = max(block_topk, (len(query) + ratio - 1) // ratio)
-        query_lens = starts[1:] - starts[:-1]
-        num_seqs = jnp.max(
-            jnp.where(query_lens > 0, jnp.arange(len(context), dtype=jnp.int32) + 1, 0)
-        )
-        return streamindex_topk(
-            query,
-            jnp.full(query.shape[:2], scale, jnp.float32),
-            cache,
-            context + query_lens,
-            table.reshape(-1),
-            starts,
-            jnp.asarray([0, 0, num_seqs], dtype=jnp.int32),
-            k=block_topk,
-            compression_ratio=ratio,
-            num_kv_pages_per_block=(max(1, 256 // page_size),) * 3,
-            num_queries_per_block=(1, 128, 128),
-            decode_req_batch_size=8,
-            enable_early_exit=True,
-            chunk_tokens=512 if len(query) % 512 == 0 else None,
-            components=qsa_indexing(ratio - 1),
-            prefix_capacity=prefix_capacity,
-            topk_backend=topk_backend,
-            scheduling_group_namespace=scheduling_group_namespace,
-            **resource_options,
-        )
 
     batch = len(query)
     chunk_size = min(batch, decode_query_chunk_size(table.shape[1]))
@@ -225,18 +205,112 @@ def select_index_blocks(
             **resource_options,
         )
 
-    if batch <= chunk_size:
-        return select_chunk(query, lengths, request_ids)
-    padding = (-batch) % chunk_size
-    query = jnp.pad(query, ((0, padding), (0, 0), (0, 0)))
-    lens = jnp.pad(lengths, (0, padding))
-    req = jnp.pad(request_ids, (0, padding))
-    chunks = (
-        query.reshape(-1, chunk_size, *query.shape[1:]),
-        lens.reshape(-1, chunk_size),
-        req.reshape(-1, chunk_size),
+    def per_query():
+        if batch <= chunk_size:
+            return select_chunk(query, lengths, request_ids)
+        padding = (-batch) % chunk_size
+        padded_query = jnp.pad(query, ((0, padding), (0, 0), (0, 0)))
+        lens = jnp.pad(lengths, (0, padding))
+        req = jnp.pad(request_ids, (0, padding))
+        chunks = (
+            padded_query.reshape(-1, chunk_size, *query.shape[1:]),
+            lens.reshape(-1, chunk_size),
+            req.reshape(-1, chunk_size),
+        )
+        _, selected = jax.lax.scan(
+            lambda carry, inputs: (carry, select_chunk(*inputs)), None, chunks
+        )
+        return selected.reshape(-1, block_topk)[:batch]
+
+    if starts is None or context is None:
+        return per_query()
+    if request_distribution is None:
+        raise ValueError("Ragged QSA selection requires Runner request_distribution")
+    prefix_tokens, active_tokens = _request_bounds(starts, request_distribution, batch)
+    if prefix_capacity is None and default_backend:
+        prefix_capacity = max(block_topk, (batch + ratio - 1) // ratio)
+
+    def prefill_query(q, cu, history):
+        counts = cu[1:] - cu[:-1]
+        num_seqs = jnp.max(
+            jnp.where(counts > 0, jnp.arange(len(counts), dtype=jnp.int32) + 1, 0)
+        )
+        return streamindex_topk(
+            q,
+            jnp.full(q.shape[:2], scale, jnp.float32),
+            cache,
+            jnp.where(counts > 0, history + counts, 0),
+            table.reshape(-1),
+            cu,
+            jnp.array([0, 0, num_seqs], jnp.int32),
+            k=block_topk,
+            compression_ratio=ratio,
+            num_kv_pages_per_block=(max(1, 256 // page_size),) * 3,
+            num_queries_per_block=(1, 128, 128),
+            decode_req_batch_size=8,
+            enable_early_exit=True,
+            chunk_tokens=512 if len(q) % 512 == 0 else None,
+            components=qsa_indexing(ratio - 1),
+            prefix_capacity=prefix_capacity,
+            topk_backend=topk_backend,
+            scheduling_group_namespace=scheduling_group_namespace,
+            **resource_options,
+        )
+
+    def mixed():
+        from vllm_torchtpu.kernels.sparse_gqa_prefill.tuned_block_sizes import (
+            PREFILL_DISPATCH_CHUNK_QUERIES,
+        )
+
+        window = min(batch, PREFILL_DISPATCH_CHUNK_QUERIES)
+        output = jnp.full((batch + window, block_topk), -1, jnp.int32)
+
+        def prefix(index, output):
+            first = index * chunk_size
+            rows = jnp.minimum(first + jnp.arange(chunk_size), batch - 1)
+            valid = first + jnp.arange(chunk_size) < prefix_tokens
+            result = select_chunk(
+                query[rows], jnp.where(valid, lengths[rows], 0), request_ids[rows]
+            )
+            return jax.lax.dynamic_update_slice(output, result, (first, 0))
+
+        output = jax.lax.fori_loop(
+            0, (prefix_tokens + chunk_size - 1) // chunk_size, prefix, output
+        )
+
+        def prefill(index, output):
+            first = prefix_tokens + index * window
+            positions = first + jnp.arange(window, dtype=jnp.int32)
+            rows = jnp.minimum(positions, batch - 1)
+            valid = positions < active_tokens
+            local_starts = jnp.clip(starts - first, 0, window)
+            progress = jnp.clip(first - starts[:-1], 0, starts[1:] - starts[:-1])
+            result = prefill_query(
+                jnp.where(valid[:, None, None], query[rows], 0),
+                local_starts,
+                context + progress,
+            )
+            result = jnp.where((valid & (lengths[rows] > 0))[:, None], result, -1)
+            return jax.lax.dynamic_update_slice(output, result, (first, 0))
+
+        output = jax.lax.fori_loop(
+            0, (active_tokens - prefix_tokens + window - 1) // window, prefill, output
+        )
+        return output[:batch]
+
+    return jax.lax.cond(
+        active_tokens == 0,
+        lambda _: jnp.full((batch, block_topk), -1, jnp.int32),
+        lambda _: jax.lax.cond(
+            prefix_tokens == active_tokens,
+            lambda _: per_query(),
+            lambda _: jax.lax.cond(
+                prefix_tokens == 0,
+                lambda _: prefill_query(query, starts, context),
+                lambda _: mixed(),
+                None,
+            ),
+            None,
+        ),
+        None,
     )
-    _, selected = jax.lax.scan(
-        lambda carry, inputs: (carry, select_chunk(*inputs)), None, chunks
-    )
-    return selected.reshape(-1, block_topk)[:batch]
