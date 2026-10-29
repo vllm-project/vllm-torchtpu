@@ -63,7 +63,7 @@ def test_default_tiles_fit_vmem_for_every_model_config(name: str, paged: bool):
         assert t.nbd <= default.nbd and t.nbe <= default.nbe
         shrunk |= (t.nbd, t.nbe) != (default.nbd, default.nbe)
         core_plan, _ = vmem.build_scratch(spec, fitted)  # raises if over budget
-        assert core_plan.vmem_bytes <= t.vmem_mib * (1 << 20)
+        assert core_plan.vmem_bytes <= vmem.fit_vmem_budget_bytes(t)
     if name.startswith("qwen35_full"):
         assert shrunk  # the 64-row buckets need shallower rings
 
@@ -116,3 +116,21 @@ def test_fit_raises_instead_of_returning_an_over_budget_plan(monkeypatch):
         vmem.fit_default_tiles(spec, ex)
     with pytest.raises(mk.MegakernelConfigError, match="do not fit"):
         mk.build(spec, ex)
+
+
+def test_tpu_v7x_budget_leaves_llo_spill_and_io_window_headroom():
+    """`fit_vmem_budget_bytes` reserves >= 6 MiB below the 62 MiB Mosaic
+    `vmem_limit_bytes` (8 MiB below the 64 MiB TPU v7x VMEM) so 60-layer
+    Qwen3.5 at `(T=4, B=40..64)` fits both Mosaic's 62 MiB scoped VMEM limit
+    (after Pallas I/O window refs and lowered temporaries, up to ~5.0 MiB at
+    B=64) and XLA:TPU's 63.94 MiB VMEM limit (after ~3.70 MiB LLO register
+    spill slots)."""
+    assert default_chip.TPU_V7X.vmem_mib == 62
+    assert vmem.fit_vmem_budget_bytes(mk.default_tiles(48)) <= 56 * (1 << 20)
+    spec = qwen35.qwen35_spec(qwen35.FULL_EP)
+    for B in (40, 48, 56, 64):
+        ex = mk.ExecSpec(B=B, T=4, R=8, ctx=4096)
+        fitted = vmem.fit_default_tiles(spec, ex)
+        assert fitted.tiles.vmem_mib == 62
+        core_plan, _ = vmem.build_scratch(spec, fitted)
+        assert core_plan.vmem_bytes <= 56 * (1 << 20)

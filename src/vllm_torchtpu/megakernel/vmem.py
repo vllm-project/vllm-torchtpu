@@ -380,8 +380,24 @@ def build_scratch(
 # Smallest dense / expert ring depth `fit_default_tiles` shrinks to (one slot
 # in use, one being refilled).
 MIN_RING_DEPTH = 2
+# Non-scratch VMEM headroom (MiB) reserved by `fit_default_tiles` below
+# `tiles.vmem_mib` (the Mosaic `vmem_limit_bytes`). `core_plan.vmem_bytes`
+# counts only Pallas `scratch_shapes`; Mosaic also places Pallas I/O window
+# refs and compiler-lowered VMEM temporaries (~0.85-4.96 MiB across B=48..64)
+# inside `vmem_limit_bytes`, and XLA:TPU's LLO register allocator places spill
+# slots (~3.70 MiB on 60-layer hybrid MoE at B >= 40) in hardware VMEM (63.94 MiB
+# on TPU v7x). Reserving 6 MiB below the 62 MiB Mosaic limit caps default-tile
+# static scratch at 56 MiB so both Mosaic scoped VMEM (<= 62 MiB) and XLA:TPU
+# total VMEM (<= 63.94 MiB) fit on every default bucket.
+FIT_VMEM_HEADROOM_MIB = 6
 # VMEM budget used while probing a candidate (the real budget is checked after).
 _PROBE_VMEM_MIB = 1 << 20
+
+
+def fit_vmem_budget_bytes(tiles: exec_spec.Tiles) -> int:
+    """Maximum static `scratch_shapes` VMEM bytes allowed by `fit_default_tiles`."""
+    eff_mib = max(0, tiles.vmem_mib - FIT_VMEM_HEADROOM_MIB)
+    return eff_mib * 1024 * 1024
 
 
 def _ring_bytes(core_plan: CorePlan) -> tuple[int, int]:
@@ -402,15 +418,16 @@ def fit_default_tiles(model_spec: ModelSpec, ex: ExecSpec) -> ExecSpec:
     No-op when `ex.tiles` is set (explicit and profile tiles are never changed;
     an over-budget plan raises in `build_scratch`). Otherwise starts from
     `default_tiles(B, R)` sized for the device's chip (`chip_budget()`) and,
-    while the planned VMEM scratch exceeds
-    `vmem_mib`, drops one slot from the larger allocated weight ring (dense
-    `nbd` or expert `nbe`), down to `MIN_RING_DEPTH`. Raises
-    `MegakernelConfigError` if the plan does not fit even then.
+    while the planned VMEM scratch exceeds `fit_vmem_budget_bytes(t)`
+    (`vmem_mib - FIT_VMEM_HEADROOM_MIB`), drops one slot from the larger
+    allocated weight ring (dense `nbd` or expert `nbe`), down to
+    `MIN_RING_DEPTH`. Raises `MegakernelConfigError` if the plan does not fit
+    even then.
     """
     if ex.tiles is not None:
         return ex
     t = exec_spec.default_tiles(ex.B, R=ex.R, chip=chip_budget())
-    budget = t.vmem_mib * 1024 * 1024
+    budget = fit_vmem_budget_bytes(t)
     while True:
         probe = dataclasses.replace(
             ex, tiles=dataclasses.replace(t, vmem_mib=_PROBE_VMEM_MIB)
