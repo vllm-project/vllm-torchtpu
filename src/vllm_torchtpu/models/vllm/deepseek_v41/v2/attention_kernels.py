@@ -1100,7 +1100,7 @@ def sparse_fp8_attention_jax(
 
     ``max_requests`` bounds requests per batch (see `_attend_window`).
     ``precompacted`` skips ``compact_records`` when ``main_records`` already has
-    valid indices sorted ascending at the prefix and ``-1`` at the tail.
+    valid indices at the prefix and ``-1`` at the tail; their order is arbitrary.
     """
     from vllm_torchtpu.kernels.deepseek_v4.core_attention.sparse_mla import (
         sparse_ragged_paged_attention,

@@ -15,6 +15,7 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2 import indexer_impl as indexer_op
 @pytest.mark.parametrize("width", [6144, 49408, 98816])
 @pytest.mark.parametrize("mode", ["regular", "padded", "draft", "ordered", "publish"])
 def test_decode_route(monkeypatch, width, mode):
+    topk = 512
     monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
     tpu_info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
     monkeypatch.setattr(pltpu, "get_tpu_info", lambda: tpu_info)
@@ -45,7 +46,9 @@ def test_decode_route(monkeypatch, width, mode):
         page_records,
         candidate_count,
         candidate_block_size,
+        k,
     ):
+        assert k == topk
         calls.append(True)
         assert page_records == 128
         assert pages.shape == (count, (1 << (width - 1).bit_length()) // 128)
@@ -57,7 +60,7 @@ def test_decode_route(monkeypatch, width, mode):
         assert grouped_weights.shape == (count, queries, heads)
         np.testing.assert_array_equal(grouped_weights.reshape(weights.shape), weights)
         np.testing.assert_array_equal(limits.reshape(-1), lengths)
-        result = jnp.where(lengths[:, None] > 0, jnp.full((rows, 512), 2), -1)
+        result = jnp.where(lengths[:, None] > 0, jnp.full((rows, topk), 2), -1)
         assert candidate_block_size == 8
         if mode == "publish":
             assert candidate_count == 128
@@ -69,7 +72,7 @@ def test_decode_route(monkeypatch, width, mode):
         return jnp.ones((q.shape[0], records.shape[1]), jnp.float32)
 
     def old_select(scores, lengths, candidates, *args):
-        result = jnp.where(lengths[:, None] > 0, scores[:, :512].astype(jnp.int32), -1)
+        result = jnp.where(lengths[:, None] > 0, scores[:, :topk].astype(jnp.int32), -1)
         return result, candidates
 
     monkeypatch.setattr(indexer_ops, "_decode_select", new_select)
@@ -84,7 +87,7 @@ def test_decode_route(monkeypatch, width, mode):
             lengths,
             candidates,
             requests,
-            512,
+            topk,
             8,
             mode == "publish",
             False,
@@ -94,7 +97,7 @@ def test_decode_route(monkeypatch, width, mode):
     optimized = mode in ("regular", "padded", "publish")
     assert bool(calls) == optimized
     expected = np.where(np.asarray(lengths)[:, None] > 0, 2 if optimized else 1, -1)
-    np.testing.assert_array_equal(selected, np.broadcast_to(expected, (rows, 512)))
+    np.testing.assert_array_equal(selected, np.broadcast_to(expected, (rows, topk)))
     np.testing.assert_array_equal(published, 3 if mode == "publish" else candidates)
 
 

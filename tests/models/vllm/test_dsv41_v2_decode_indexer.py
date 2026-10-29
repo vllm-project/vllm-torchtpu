@@ -37,9 +37,10 @@ Target modules and diff lines:
      * SparseCore path with rows >= 16
      * Fallback path: unordered=False, lengths=None, width < 2048,
        width % 16 != 0, k % 16 != 0
-   - paged_indexer_jax, update_and_select_jax, initialize_indexer, paged_indexer
+   - paged_indexer_jax, select_indexer_jax, initialize_indexer, paged_indexer
 """
 
+from functools import partial
 from types import SimpleNamespace
 
 import jax
@@ -49,7 +50,7 @@ import pytest
 import torch
 
 import vllm_torchtpu.models.vllm.deepseek_v41.v2.attention as v2_attn
-import vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels as v2_kernels
+from vllm_torchtpu.models.vllm.deepseek_v41.v2 import indexer_impl as indexer_ops
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention import (
     _index_page_records,
 )
@@ -59,6 +60,9 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
     gather_cache_page_values,
     gather_cache_values,
 )
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_cache import (
+    PackedFP8IndexCacheRows,
+)
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl import (
     _INDEX_KEYS_PER_ITER,
     _INDEX_MAX_TILE,
@@ -66,7 +70,7 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl import (
     initialize_indexer,
     paged_index_scores_jax,
     paged_indexer,
-    update_and_select_jax,
+    select_indexer_jax,
 )
 
 
@@ -342,7 +346,7 @@ class TestAttentionKernelsDecodeIndexer:
             sparsecore_calls.append((scores.shape, k))
             return jnp.zeros((scores.shape[0], k), dtype=jnp.int32)
 
-        monkeypatch.setattr(v2_kernels, "_sparsecore_top_k", mock_sc_top_k)
+        monkeypatch.setattr(indexer_ops, "_sparsecore_top_k", mock_sc_top_k)
 
         bound = jnp.int32(2048)
 
@@ -399,19 +403,18 @@ class TestAttentionKernelsDecodeIndexer:
         assert out_thresh.shape == (16, 16)
 
     def test_paged_indexer_and_wrappers_dispatch(self, monkeypatch):
-        """Covers paged_indexer, update_and_select_jax, and initialize_indexer."""
+        """Covers paged_indexer, select_indexer_jax, and initialize_indexer."""
         # 1. paged_indexer wrapper with batch_max=None and page_records
         called_args = []
 
         def mock_op(*args):
             called_args.append(args)
             return (
-                args[1],
-                torch.zeros(args[0].shape[0], args[9], dtype=torch.int32),
+                torch.zeros(args[0].shape[0], args[8], dtype=torch.int32),
                 args[5],
             )
 
-        monkeypatch.setattr(v2_kernels, "_indexer_op", mock_op)
+        monkeypatch.setattr(indexer_ops, "_indexer_op", mock_op)
 
         q = torch.zeros(4, 2, 128)
         pool = torch.zeros(16, ROW_WORDS, dtype=torch.int32)
@@ -420,8 +423,6 @@ class TestAttentionKernelsDecodeIndexer:
         weights = torch.zeros(4, 256)
         lengths = torch.tensor([10, 20, 30, 40], dtype=torch.int32)
         candidates = torch.zeros(4, 8, dtype=torch.int32)
-        write_records = torch.zeros(0, dtype=torch.int32)
-        write_keys = torch.zeros(0, 128)
         requests = torch.arange(4, dtype=torch.int32)
 
         # Without batch_max (defaults to lengths.max()) and without
@@ -433,8 +434,6 @@ class TestAttentionKernelsDecodeIndexer:
             weights,
             lengths,
             candidates,
-            write_records,
-            write_keys,
             requests,
             topk=16,
             block_size=16,
@@ -442,10 +441,9 @@ class TestAttentionKernelsDecodeIndexer:
             candidate_filter=False,
         )
         assert len(called_args) == 1
-        # page_records arg is index 15
-        assert called_args[0][15] == 0
-        # batch_max arg is index 9
-        assert int(called_args[0][9].item()) == 40
+        # page_records follows the eight tensor inputs and five selectors.
+        assert called_args[0][13] == 0
+        assert int(called_args[0][7].item()) == 40
 
         # With explicit batch_max and page_records
         paged_indexer(
@@ -455,8 +453,6 @@ class TestAttentionKernelsDecodeIndexer:
             weights,
             lengths,
             candidates,
-            write_records,
-            write_keys,
             requests,
             topk=16,
             block_size=16,
@@ -466,29 +462,25 @@ class TestAttentionKernelsDecodeIndexer:
             page_records=32,
         )
         assert len(called_args) == 2
-        assert called_args[1][15] == 32
-        assert int(called_args[1][9].item()) == 50
+        assert called_args[1][13] == 32
+        assert int(called_args[1][7].item()) == 50
 
-        # 2. update_and_select_jax with page_records=0 vs page_records=64
+        # 2. select_indexer_jax with page_records=0 vs page_records=64
         q_j = jnp.zeros((2, 2, 128), dtype=jnp.bfloat16)
         pool_j = jnp.zeros((16, ROW_WORDS), dtype=jnp.int32)
         records_j = jnp.full((2, 256), -1, dtype=jnp.int32)
         weights_j = jnp.zeros((2, 2), dtype=jnp.float32)
         lengths_j = jnp.array([10, 20], dtype=jnp.int32)
         cand_j = jnp.full((2, 4), -1, dtype=jnp.int32)
-        wrec_j = jnp.zeros((0,), dtype=jnp.int32)
-        wkeys_j = jnp.zeros((0, 128), dtype=jnp.bfloat16)
         req_j = jnp.arange(2, dtype=jnp.int32)
 
-        up_pool0, sel0, pub0 = update_and_select_jax(
+        sel0, pub0 = select_indexer_jax(
             q_j,
             pool_j,
             records_j,
             weights_j,
             lengths_j,
             cand_j,
-            wrec_j,
-            wkeys_j,
             req_j,
             topk=16,
             block_size=16,
@@ -500,15 +492,13 @@ class TestAttentionKernelsDecodeIndexer:
         )
         assert sel0.shape == (2, 16)
 
-        up_pool64, sel64, pub64 = update_and_select_jax(
+        sel64, pub64 = select_indexer_jax(
             q_j,
             pool_j,
             records_j,
             weights_j,
             lengths_j,
             cand_j,
-            wrec_j,
-            wkeys_j,
             req_j,
             topk=16,
             block_size=16,
@@ -520,7 +510,9 @@ class TestAttentionKernelsDecodeIndexer:
         )
         assert sel64.shape == (2, 16)
 
-    def test_initialize_indexer_and_fake_handler(self):
+    @pytest.mark.cpu_test
+    @pytest.mark.parametrize("bank_count", [1, 2])
+    def test_initialize_indexer_and_fake_handler(self, bank_count):
         """Covers initialize_indexer custom op and fake tensor registration."""
         from jax.sharding import Mesh
 
@@ -530,13 +522,13 @@ class TestAttentionKernelsDecodeIndexer:
 
         mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
         with set_vllm_model_wrapper_context(mesh=mesh):
-            v2_kernels._indexer_op = None
+            indexer_ops._indexer_op = None
             initialize_indexer()
-            assert v2_kernels._indexer_op is not None
+            assert indexer_ops._indexer_op is not None
             # Test early return branch
-            saved_op = v2_kernels._indexer_op
+            saved_op = indexer_ops._indexer_op
             initialize_indexer()
-            assert v2_kernels._indexer_op is saved_op
+            assert indexer_ops._indexer_op is saved_op
 
         # Verify fake registration by calling op with meta device tensors
         q = torch.empty((4, 2, 128), dtype=torch.bfloat16, device="meta")
@@ -545,20 +537,21 @@ class TestAttentionKernelsDecodeIndexer:
         weights = torch.empty((4, 256), dtype=torch.float32, device="meta")
         lengths = torch.empty((4,), dtype=torch.int32, device="meta")
         candidates = torch.empty((4, 8), dtype=torch.int32, device="meta")
-        write_recs = torch.empty((0,), dtype=torch.int32, device="meta")
-        keys = torch.empty((0, 128), dtype=torch.bfloat16, device="meta")
         requests = torch.empty((4,), dtype=torch.int32, device="meta")
         batch_max = torch.empty((1,), dtype=torch.int32, device="meta")
 
-        f_pool, f_sel, f_pub = v2_kernels._indexer_op(
+        op = (
+            indexer_ops._indexer_op
+            if bank_count == 1
+            else indexer_ops._indexer_2bank_op
+        )
+        f_sel, f_pub = op(
             q,
-            pool,
+            *((pool,) * bank_count),
             records,
             weights,
             lengths,
             candidates,
-            write_recs,
-            keys,
             requests,
             batch_max,
             16,
@@ -568,7 +561,6 @@ class TestAttentionKernelsDecodeIndexer:
             False,
             32,
         )
-        assert f_pool.shape == pool.shape
         assert f_sel.shape == (4, 16)
         assert f_pub.shape == candidates.shape
 
@@ -586,17 +578,24 @@ class TestAttentionSelectPagedIndicesDecode:
         attn._tp_rank = tp_rank
         attn._fp8_kv = True
         attn._config = {"index_topk": 4}
+        attn._max_model_len = 196608
+        attn.candidate_source_layer = 20
         attn.candidate_block_size = 16
         attn.candidate_block_buffer = torch.full((128, 8), -1, dtype=torch.int32)
         attn.indexer = SimpleNamespace(
             head_dim=128,
             n_head=2,
-            indexer_op=SimpleNamespace(
-                candidate_blocks=torch.zeros(1),
+            indexer_op=v2_attn.SparseMQAIndexer(
+                SimpleNamespace(prefix="source-a"),
+                4,
+                torch.zeros(1),
+                16,
+                candidate_source_layer=20,
                 candidate_write=candidate_write,
             ),
         )
         attn._project_index_q = lambda q, p: q
+        attn._project_index_q_unquantized = lambda q, p: torch.zeros(q.shape[0], 2, 128)
 
         monkeypatch.setattr(
             v2_attn, "get_tensor_model_parallel_world_size", lambda: ranks
@@ -608,11 +607,35 @@ class TestAttentionSelectPagedIndicesDecode:
         )
         return attn
 
+    def _make_selection_call(self, attn, count, *, cache_offset=0, packed=False):
+        cache_type = PackedFP8IndexCacheRows if packed else IndexCacheRows
+        cache = cache_type(
+            torch.zeros((64, 128 if packed else ROW_WORDS), dtype=torch.int32),
+            (
+                (4, 16, 132 if packed else 128),
+                torch.uint8 if packed else torch.bfloat16,
+                32 * 256,
+                cache_offset,
+            ),
+        )
+        return partial(
+            attn._select_paged_indices,
+            qr=torch.zeros(count, 128),
+            positions=torch.arange(count, dtype=torch.int32),
+            index_cache=cache,
+            records=torch.zeros(count, 256, dtype=torch.int32),
+            requests=torch.arange(count, dtype=torch.int32),
+            weights=torch.zeros(count, 2),
+            lengths=torch.full((count, 1), 50, dtype=torch.int32),
+            swa_valid=torch.ones(count, dtype=torch.bool),
+        )
+
     @pytest.mark.parametrize("count", [1, 16, 17, 32])
+    @pytest.mark.parametrize("packed", [False, True], ids=["bf16", "fp8"])
     def test_select_paged_indices_split_part_and_padding_calculation(
-        self, count, monkeypatch
+        self, count, packed, monkeypatch
     ):
-        """Verifies part = (count + ranks - 1) // ranks and padding = ranks."""
+        """Split queries keep their owners; FP8 padding has no request owner."""
         ranks = 8
         attn = self._setup_mock_attn(monkeypatch, ranks=ranks)
 
@@ -625,8 +648,6 @@ class TestAttentionSelectPagedIndicesDecode:
             weights_part,
             lengths_part,
             candidates_part,
-            write_records,
-            write_keys,
             requests_part,
             *args,
             **kwargs,
@@ -635,44 +656,32 @@ class TestAttentionSelectPagedIndicesDecode:
             captured_args["lengths_part_shape"] = lengths_part.shape
             captured_args["page_records"] = kwargs.get("page_records")
             expected_part = max(2, ((count + ranks - 1) // ranks + 1) & ~1)
+            live = min(count, expected_part)
+            torch.testing.assert_close(
+                requests_part[:live], torch.arange(live, dtype=torch.int32)
+            )
+            assert torch.all(requests_part[live:] == (-1 if packed else 0))
+            assert torch.all(lengths_part[live:] == 0)
             return (
-                index_cache.raw,
                 torch.zeros(expected_part, 4, dtype=torch.int32),
                 candidates_part,
             )
 
-        monkeypatch.setattr(v2_attn, "paged_indexer", mock_paged_indexer)
+        monkeypatch.setattr(indexer_ops, "paged_indexer", mock_paged_indexer)
+        monkeypatch.setattr(indexer_ops, "paged_fp8_indexer", mock_paged_indexer)
 
-        raw = torch.zeros((64, ROW_WORDS), dtype=torch.int32)
-        layout = ((4, 16, 128), torch.bfloat16, 32 * 256, 16 * 256)
-        index_cache_mock = IndexCacheRows(raw, layout)
-
-        qr = torch.zeros(count, 128)
-        positions = torch.arange(count, dtype=torch.int32)
-        records = torch.zeros(count, 256, dtype=torch.int32)
-        requests = torch.arange(count, dtype=torch.int32)
-        weights = torch.zeros(count, 2)
-        lengths = torch.full((count, 1), 50, dtype=torch.int32)
-        swa_slots = torch.zeros(count, 1, dtype=torch.int32)
+        select = self._make_selection_call(
+            attn, count, cache_offset=16 * 256, packed=packed
+        )
 
         with v2_attn.stage_attention_cache_scope():
-            selected = attn._select_paged_indices(
-                qr,
-                positions,
-                index_cache_mock,
-                records,
-                requests,
-                weights,
-                lengths,
-                swa_slots,
-                None,
-            )
+            selected = select()
 
         assert selected.shape == (count, 4)
         expected_part = max(2, ((count + ranks - 1) // ranks + 1) & ~1)
         assert captured_args["q_part_shape"][0] == expected_part
         assert captured_args["lengths_part_shape"][0] == expected_part
-        assert captured_args["page_records"] == 16
+        assert captured_args["page_records"] == (0 if packed else 16)
 
     def test_select_paged_indices_candidate_write_and_published_buffer(
         self, monkeypatch
@@ -689,8 +698,6 @@ class TestAttentionSelectPagedIndicesDecode:
             weights_part,
             lengths_part,
             candidates_part,
-            write_records,
-            write_keys,
             requests_part,
             *args,
             **kwargs,
@@ -699,41 +706,15 @@ class TestAttentionSelectPagedIndicesDecode:
             # published part
             pub_part = torch.full((part, 8), 42, dtype=torch.int32)
             return (
-                index_cache.raw,
                 torch.zeros(part, 4, dtype=torch.int32),
                 pub_part,
             )
 
-        monkeypatch.setattr(v2_attn, "paged_indexer", mock_paged_indexer)
+        monkeypatch.setattr(indexer_ops, "paged_indexer", mock_paged_indexer)
 
-        raw = torch.zeros((64, ROW_WORDS), dtype=torch.int32)
-        index_cache_mock = SimpleNamespace(raw=raw)
+        select = self._make_selection_call(attn, count)
 
-        qr = torch.zeros(count, 128)
-        positions = torch.arange(count, dtype=torch.int32)
-        records = torch.zeros(count, 256, dtype=torch.int32)
-        requests = torch.arange(count, dtype=torch.int32)
-        weights = torch.zeros(count, 2)
-        lengths = torch.full((count, 1), 50, dtype=torch.int32)
-        swa_slots = torch.zeros(count, 1, dtype=torch.int32)
-
-        # Also supply pending_index_write to test pending_index_write is not None
-        pending_write = (
-            torch.tensor([1, 2], dtype=torch.int32),
-            torch.zeros(2, 128),
-        )
-
-        selected = attn._select_paged_indices(
-            qr,
-            positions,
-            index_cache_mock,
-            records,
-            requests,
-            weights,
-            lengths,
-            swa_slots,
-            pending_write,
-        )
+        selected = select()
 
         assert selected.shape == (count, 4)
         # candidate_block_buffer [:count] must have received 42
@@ -762,8 +743,6 @@ class TestAttentionSelectPagedIndicesDecode:
             weights_part,
             lengths_part,
             candidates_part,
-            write_records,
-            write_keys,
             requests_part,
             *args,
             **kwargs,
@@ -771,35 +750,15 @@ class TestAttentionSelectPagedIndicesDecode:
             assert q_part.shape[0] == count
             assert candidates_part.shape == (count, 0)
             return (
-                index_cache.raw,
                 torch.zeros(count, 4, dtype=torch.int32),
                 candidates_part,
             )
 
-        monkeypatch.setattr(v2_attn, "paged_indexer", mock_paged_indexer)
+        monkeypatch.setattr(indexer_ops, "paged_indexer", mock_paged_indexer)
 
-        raw = torch.zeros((64, ROW_WORDS), dtype=torch.int32)
-        index_cache_mock = SimpleNamespace(raw=raw)
+        select = self._make_selection_call(attn, count)
 
-        qr = torch.zeros(count, 128)
-        positions = torch.arange(count, dtype=torch.int32)
-        records = torch.zeros(count, 256, dtype=torch.int32)
-        requests = torch.arange(count, dtype=torch.int32)
-        weights = torch.zeros(count, 2)
-        lengths = torch.full((count, 1), 50, dtype=torch.int32)
-        swa_slots = torch.zeros(count, 1, dtype=torch.int32)
-
-        selected = attn._select_paged_indices(
-            qr,
-            positions,
-            index_cache_mock,
-            records,
-            requests,
-            weights,
-            lengths,
-            swa_slots,
-            None,
-        )
+        selected = select()
 
         assert selected.shape == (count, 4)
         assert len(gather_called) == 0  # No gather called when split=False
@@ -819,8 +778,6 @@ class TestAttentionSelectPagedIndicesDecode:
             weights_part,
             lengths_part,
             candidates_part,
-            write_records,
-            write_keys,
             requests_part,
             *args,
             **kwargs,
@@ -830,83 +787,42 @@ class TestAttentionSelectPagedIndicesDecode:
             part = max(2, ((count + ranks - 1) // ranks + 1) & ~1)
             assert q_part.shape[0] == part
             return (
-                index_cache.raw,
                 torch.zeros(part, 4, dtype=torch.int32),
                 candidates_part,
             )
 
-        monkeypatch.setattr(v2_attn, "paged_indexer", mock_paged_indexer)
+        monkeypatch.setattr(indexer_ops, "paged_indexer", mock_paged_indexer)
 
-        raw = torch.zeros((64, ROW_WORDS), dtype=torch.int32)
-        index_cache_mock = SimpleNamespace(raw=raw)
-
-        qr = torch.zeros(count, 128)
-        positions = torch.arange(count, dtype=torch.int32)
-        records = torch.zeros(count, 256, dtype=torch.int32)
-        requests = torch.arange(count, dtype=torch.int32)
-        weights = torch.zeros(count, 2)
-        lengths = torch.full((count, 1), 50, dtype=torch.int32)
-        swa_slots = torch.zeros(count, 1, dtype=torch.int32)
+        select = self._make_selection_call(attn, count)
 
         with v2_attn.stage_attention_cache_scope():
             # Call 1: cache miss
-            sel1 = attn._select_paged_indices(
-                qr,
-                positions,
-                index_cache_mock,
-                records,
-                requests,
-                weights,
-                lengths,
-                swa_slots,
-                None,
-            )
+            sel1 = select()
             assert sel1.shape == (count, 4)
             assert call_count == 1
 
             # Call 2: cache hit
-            sel2 = attn._select_paged_indices(
-                qr,
-                positions,
-                index_cache_mock,
-                records,
-                requests,
-                weights,
-                lengths,
-                swa_slots,
-                None,
-            )
+            sel2 = select()
             assert sel2.shape == (count, 4)
             assert call_count == 2
 
-            # Call 3: split Index-K owner returns both banks.
+            # Selection must leave both banks of the Index-K owner unchanged.
             raw_lo = torch.zeros((32, ROW_WORDS), dtype=torch.int32)
             raw_hi = torch.zeros((32, ROW_WORDS), dtype=torch.int32)
             layout = ((4, 16, 128), torch.bfloat16, 32 * 256, 0)
             index_cache_2b = IndexCacheRows((raw_lo, raw_hi), layout)
             monkeypatch.setattr(
-                v2_attn,
+                indexer_ops,
                 "paged_indexer",
                 lambda q_part, idx_c, *a, **kw: (
-                    (torch.ones_like(raw_lo), torch.full_like(raw_hi, 2)),
                     torch.zeros(q_part.shape[0], 4, dtype=torch.int32),
                     a[3],
                 ),
             )
-            sel3 = attn._select_paged_indices(
-                qr,
-                positions,
-                index_cache_2b,
-                records,
-                requests,
-                weights,
-                lengths,
-                swa_slots,
-                None,
-            )
+            sel3 = select(index_cache=index_cache_2b)
             assert sel3.shape == (count, 4)
-            assert torch.all(index_cache_2b.raw == 1)
-            assert torch.all(index_cache_2b.raw_hi == 2)
+            assert torch.all(index_cache_2b.raw == 0)
+            assert torch.all(index_cache_2b.raw_hi == 0)
 
 
 @pytest.mark.cpu_test
@@ -924,83 +840,3 @@ def test_candidate_envelope_keeps_token_rows_dynamic():
         q = torch.zeros((rows, 32, 128), dtype=torch.bfloat16)
         torch._dynamo.mark_dynamic(q, 0, min=2, max=4096)
         torch.testing.assert_close(compiled(q), q + 1)
-
-
-@pytest.mark.cpu_test
-def test_candidate_cache_reuses_only_within_stage_and_source_version(monkeypatch):
-    """Four reindexes share keys; publication, source and new stage invalidate."""
-    attn = TestAttentionSelectPagedIndicesDecode()._setup_mock_attn(
-        monkeypatch, ranks=1
-    )
-    attn._config = {"index_topk": 512}
-    attn.compress_ratio = 1
-    attn.candidate_block_size = 8
-    attn.candidate_source_layer = 20
-    attn.candidate_block_buffer = torch.zeros((12, 2048), dtype=torch.int32)
-    attn.indexer.k_cache = SimpleNamespace(prefix="source-a")
-    cache = SimpleNamespace(raw=torch.zeros((128, 128), dtype=torch.int32))
-    q = torch.zeros((12, 32, 128), dtype=torch.bfloat16)
-    positions = torch.arange(12, dtype=torch.int32)
-    records = torch.arange(2 * 98304, dtype=torch.int32).reshape(2, -1)
-    requests = torch.arange(2, dtype=torch.int32).repeat_interleave(6)
-    weights = torch.ones((12, 32))
-    lengths = torch.full((12, 1), 98304, dtype=torch.int32)
-    swa_valid = torch.ones(12, dtype=torch.bool)
-    prepared = []
-    used = []
-
-    def prepare(cache, records, candidates, requests, lengths, **kwargs):
-        result = object()
-        prepared.append((result, requests.clone()))
-        return result
-
-    def select(
-        q,
-        cache,
-        records,
-        weights,
-        lengths,
-        candidates,
-        requests,
-        batch_max,
-        prepared,
-        **kwargs,
-    ):
-        used.append(prepared)
-        return torch.zeros((12, 512), dtype=torch.int32)
-
-    def old(q, cache, records, weights, lengths, candidates, *args, **kwargs):
-        return cache.raw, torch.zeros((12, 512), dtype=torch.int32), candidates + 1
-
-    monkeypatch.setattr(v2_attn, "_index_page_records", lambda cache: 128)
-    monkeypatch.setattr(v2_attn, "prepare_candidate_cache", prepare)
-    monkeypatch.setattr(v2_attn, "select_candidate_cache", select)
-    monkeypatch.setattr(v2_attn, "paged_indexer", old)
-
-    def run(mapping):
-        return attn._select_paged_indices(
-            q, positions, cache, records, mapping, weights, lengths, swa_valid, None
-        )
-
-    with v2_attn.stage_attention_cache_scope():
-        for _ in range(4):
-            run(requests)
-        assert len(prepared) == 1
-        assert all(x is prepared[0][0] for x in used)
-        attn.indexer.indexer_op.candidate_write = True
-        run(requests)
-        attn.indexer.indexer_op.candidate_write = False
-        run(requests)
-        assert len(prepared) == 2
-        attn.indexer.k_cache.prefix = "source-b"
-        run(requests)
-        assert len(prepared) == 3
-        v2_attn._active_stage_attn_cache[("candidate_index_version", "source-b")] = 1
-        run(requests)
-        assert len(prepared) == 4
-    with v2_attn.stage_attention_cache_scope():
-        reordered = requests.flip(0)
-        run(reordered)
-        assert len(prepared) == 5
-        torch.testing.assert_close(prepared[-1][1], reordered)
-    assert len(used) == 8

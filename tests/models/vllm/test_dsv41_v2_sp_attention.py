@@ -537,8 +537,8 @@ def test_write_encoder_global_kv_branches(monkeypatch):
     """Test write_encoder_global_kv early returns and sp_sharded gather."""
     attn = _create_mock_attention()
     written_calls: list[dict] = []
-    attn._write_global_kv = lambda kv, pos, defer_index_write=False: (
-        written_calls.append({"kv": kv, "pos": pos, "defer": defer_index_write})
+    attn._write_global_kv = lambda kv, pos: (
+        written_calls.append({"kv": kv, "pos": pos})
     )
 
     # 1. Metadata not dict -> early return
@@ -686,9 +686,7 @@ def test_prepare_tpu_branches(monkeypatch):
     attn._quantize_indexer = lambda x: x
     attn._write_global_kv = MagicMock(return_value=None)
 
-    def fake_select_paged(
-        qr, pos, cache, records, reqs, weights, lengths, slots, pending
-    ):
+    def fake_select_paged(qr, pos, cache, records, reqs, weights, lengths, slots):
         return torch.zeros((count, 2), dtype=torch.int32)
 
     monkeypatch.setattr(attn, "_select_paged_indices", fake_select_paged)
@@ -859,18 +857,21 @@ def test_select_paged_indices_split_branches(monkeypatch):
             candidate_blocks=torch.zeros(4, 4), candidate_write=True
         ),
     )
-    attn._project_index_q = MagicMock(return_value=torch.randn(32, 2, 128))
+    attn._project_index_q = MagicMock(
+        side_effect=lambda q, pos: torch.zeros(q.shape[0], 2, 128)
+    )
     attn.candidate_block_buffer = torch.zeros(32, 16, dtype=torch.int32)
 
-    fake_paged_indexer = MagicMock(
-        return_value=(
-            torch.zeros(10, 128),
-            torch.zeros(32, 32),
-            torch.zeros(32, 16, dtype=torch.int32),
+    attn.indexer.indexer_op = MagicMock(
+        side_effect=lambda q, *a, **kw: (
+            torch.zeros(q.shape[0], 32, dtype=torch.int32),
+            torch.zeros_like(kw["candidates"]),
         )
     )
-    monkeypatch.setattr(v2_attn, "paged_indexer", fake_paged_indexer)
-    monkeypatch.setattr(v2_attn, "tensor_model_parallel_all_gather", lambda x, dim=0: x)
+    attn.indexer.indexer_op.candidate_blocks = torch.zeros(4, 4)
+    attn.indexer.indexer_op.candidate_write = True
+    attn.candidate_source_layer = 20
+    monkeypatch.setattr(v2_attn, "_gather_query_rows", lambda x: x.repeat(2, 1))
 
     qr = torch.randn(4, 512)
     positions = torch.arange(4)
@@ -879,11 +880,10 @@ def test_select_paged_indices_split_branches(monkeypatch):
     requests = torch.arange(4)
     weights = torch.ones(4, 2)
     lengths = torch.full((4, 1), 10)
-    swa_slots = torch.arange(4)
+    swa_slots = torch.ones(4, dtype=torch.bool)
 
-    # 1. TP = 2 (split = True), candidate_write = True, pending_write is not None
+    # 1. TP = 2 (split = True), candidate_write = True
     monkeypatch.setattr(v2_attn, "get_tensor_model_parallel_world_size", lambda: 2)
-    pending_write = (torch.tensor([0]), torch.randn(1, 128))
     selected = v2_attn.DeepseekV41Attention._select_paged_indices(
         attn,
         qr,
@@ -894,12 +894,11 @@ def test_select_paged_indices_split_branches(monkeypatch):
         weights,
         lengths,
         swa_slots,
-        pending_write,
     )
     assert selected.shape == (4, 32)
     attn._project_index_q.assert_called()
 
-    # 2. TP = 2 (split = True), candidate_write = False, pending_write is None
+    # 2. TP = 2 (split = True), candidate_write = False
     attn.indexer.indexer_op.candidate_write = False
     attn._fp8_kv = False
     selected2 = v2_attn.DeepseekV41Attention._select_paged_indices(
@@ -912,7 +911,6 @@ def test_select_paged_indices_split_branches(monkeypatch):
         weights,
         lengths,
         swa_slots,
-        None,
     )
     assert selected2.shape == (4, 32)
 
@@ -921,11 +919,6 @@ def test_select_paged_indices_split_branches(monkeypatch):
     attn.indexer.indexer_op.candidate_blocks = None
     attn.indexer.indexer_op.candidate_write = False
     attn._project_index_q = MagicMock(return_value=torch.randn(4, 2, 128))
-    fake_paged_indexer.return_value = (
-        torch.zeros(10, 128),
-        torch.zeros(4, 32),
-        torch.zeros(4, 0, dtype=torch.int32),
-    )
     selected_single = v2_attn.DeepseekV41Attention._select_paged_indices(
         attn,
         qr,
@@ -936,6 +929,5 @@ def test_select_paged_indices_split_branches(monkeypatch):
         weights,
         lengths,
         swa_slots,
-        None,
     )
     assert selected_single.shape == (4, 32)

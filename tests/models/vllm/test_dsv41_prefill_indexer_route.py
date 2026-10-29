@@ -10,6 +10,14 @@ import pytest
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import indexer_impl as indexer_ops
 
 
+@pytest.fixture(autouse=True)
+def tpu_info_for_cpu_routing(monkeypatch):
+    from jax.experimental.pallas import tpu as pltpu
+
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+
+
 @pytest.mark.cpu_test
 @pytest.mark.parametrize(
     "rows,live,mixed,mode,marker,width,length",
