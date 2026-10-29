@@ -343,10 +343,6 @@ def subtract_num_rejected_tokens(
     return seq_lens, positions
 
 
-def _pad_num_rejected_impl(num_rejected: torch.Tensor, pad_len: int) -> torch.Tensor:
-    return torch.nn.functional.pad(num_rejected, (0, pad_len - num_rejected.shape[0]))
-
-
 def _subtract_seq_lens_impl(
     seq_lens: torch.Tensor,
     num_rejected: torch.Tensor,
@@ -386,11 +382,7 @@ def _padded_subtract_programs():
     compile_static = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     return tuple(
         _static_shape_args(compile_static(fn))
-        for fn in (
-            _pad_num_rejected_impl,
-            _subtract_seq_lens_impl,
-            _subtract_positions_impl,
-        )
+        for fn in (_subtract_seq_lens_impl, _subtract_positions_impl)
     )
 
 
@@ -400,29 +392,23 @@ def subtract_num_rejected_tokens_padded(
     num_rejected: torch.Tensor,
     seq_lens_subtract_indices: torch.Tensor,
     positions_subtract_indices: torch.Tensor,
-    pad_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """`subtract_num_rejected_tokens` as three static-shape programs
+    """`subtract_num_rejected_tokens` as two static-shape programs
     (VLLM_TPU_PAD_EAGER_GLUE).
 
     The fused eager version is keyed on (len(seq_lens), len(positions),
     len(num_rejected)) -- the request bucket times the token bucket times the
     previous step's unpadded request count -- so serving keeps reaching new
-    keys. Here `num_rejected` is zero-padded to `pad_len` (keyed on its own
-    length only), then the seq_lens half is keyed on the request bucket and
-    the positions half on the token bucket. Every index is below the unpadded
+    keys. Under the flag the producers (`compute_num_rejected` and the
+    runner's assemblers) hand over `num_rejected` already zero-padded to
+    max_num_reqs, so the seq_lens half is keyed on the request bucket and the
+    positions half on the token bucket. Every index is below the unpadded
     length, so the padding is never read and the result is unchanged.
     """
     if num_rejected.device.type == "tpu":
-        pad, sub_seq, sub_pos = _padded_subtract_programs()
+        sub_seq, sub_pos = _padded_subtract_programs()
     else:  # the tpu backend cannot trace CPU tensors (unit tests)
-        pad, sub_seq, sub_pos = (
-            _pad_num_rejected_impl,
-            _subtract_seq_lens_impl,
-            _subtract_positions_impl,
-        )
-    if num_rejected.shape[0] < pad_len:
-        num_rejected = pad(num_rejected, pad_len)
+        sub_seq, sub_pos = _subtract_seq_lens_impl, _subtract_positions_impl
     return (
         sub_seq(seq_lens, num_rejected, seq_lens_subtract_indices),
         sub_pos(positions, num_rejected, positions_subtract_indices),
@@ -441,7 +427,7 @@ def extract_draft_token_ids(
 
 
 def compute_num_rejected(
-    next_tokens: torch.Tensor, num_draft: torch.Tensor
+    next_tokens: torch.Tensor, num_draft: torch.Tensor, pad: int = 0
 ) -> torch.Tensor:
     """Per-request rejected-draft count from the rejection output, on-device.
 
@@ -449,7 +435,12 @@ def compute_num_rejected(
         next_tokens: rejection output ``[>=num_reqs, K+1]`` padded with
             INVALID_TOKEN_ID.
         num_draft: ``[num_reqs]`` scheduled draft count per request.
+        pad: zero rows appended to the result (VLLM_TPU_PAD_EAGER_GLUE), in
+            the same per-num_reqs program rather than one of its own.
     """
     num_reqs = num_draft.shape[0]
     num_valid = (next_tokens[:num_reqs] != INVALID_TOKEN_ID).sum(dim=1)
-    return (num_draft - num_valid + 1).clamp(min=0).to(torch.int32)
+    num_rejected = (num_draft - num_valid + 1).clamp(min=0).to(torch.int32)
+    if pad:
+        num_rejected = torch.nn.functional.pad(num_rejected, (0, pad))
+    return num_rejected
