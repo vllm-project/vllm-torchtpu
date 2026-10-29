@@ -1,0 +1,18 @@
+# epic/dsv41 pyproject.toml 依赖（2026-10-28）；torch-tpu 0.2.0rc1 只在私有源，这里用 PyPI 上的 0.2.0 正式版。
+tpu-info
+portpicker
+pathwaysutils
+vllm @ git+https://github.com/vllm-project/vllm.git@v0.31.1rc0
+torch==2.13.0
+torchvision==0.28.0
+torch-tpu==0.2.0
+tpu-sync-torch==0.0.1.dev20261012084241
+transformers>=5.16.1,<5.19
+numba==0.65.0
+jax==0.11.2
+jaxlib==0.11.2
+libtpu==0.0.50
+ray[default]
+ray[data]
+runai-model-streamer[gcs]
+xxhash
