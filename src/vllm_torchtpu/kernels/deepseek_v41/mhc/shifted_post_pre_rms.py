@@ -77,19 +77,19 @@ def shifted_post_pre_rms(
 
     ``donate_flat`` opts into the in-place contract: the tile kernel declares
     the residual output as an alias of the ``flat`` operand, so ``flat`` is
-    overwritten and the residual write costs no extra HBM traffic.  **It is a
-    contract change, not a pure addition**: the caller must guarantee that
-    ``flat`` (and the tensor it was flattened from) is not read after the call.
+    overwritten. Storage reuse does not eliminate the residual output DMA.
+    This changes the caller's contract: ``flat`` (and the tensor it was
+    flattened from) must not be read after the call.
     The current seam call site satisfies this -- ``flat`` is consumed only as
     the second Pallas operand and the caller rebinds the name immediately -- but
     the guarantee lives in the caller, so the default stays ``False``.
 
-    With ``fused_gates`` the gate tensors are token-major (``[T,M]`` /
+    With ``fused_gates`` and T <= 512 the gate tensors are token-major (``[T,M]`` /
     ``[T,M,M]``) at both ends: the previous seam's output feeds this seam's
     input unchanged, the gate math runs on the tile kernel's tail, and the seam
-    costs one Pallas launch and no layout hop.  ``fused_gates=False`` keeps the
-    two-launch path for A/B and as an escape hatch; both paths are bitwise
-    identical.
+    costs one Pallas launch and no layout hop. Larger batches and
+    ``fused_gates=False`` use the two-launch path without residual aliasing.
+    Both paths were bitwise identical for tested T=96..512.
 
     Returns:
         (residual [T,M*D], next_post [T,M,1], next_comb [T,M,M],
@@ -402,7 +402,9 @@ def shifted_post_pre_rms(
                 copy.wait()
         store_projection(projection_buf[...], num_tiles - 1)
 
-    if fused_gates:
+    # Fusion is validated through T=512. T=2048 exceeds the 50 MiB scoped
+    # VMEM budget with three input buffers; retain the two-launch path there.
+    if fused_gates and t <= 512:
         return _fused_gates_call(
             x,
             flat,
