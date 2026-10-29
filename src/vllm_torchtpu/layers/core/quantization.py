@@ -20,6 +20,7 @@ operations, to match the JAX reference implementation in
 
 Key functions:
 - e8m0_to_fp32: Convert e8m0 (8-bit exponent) scales to float32
+- e8m0_to_fp32_bits: Decode e8m0 scales to CPU-compatible bits on device
 - unpack_uint8_to_fp4: Unpack uint8 to FP4 e2m1 float values
 - dequantize_mxfp4_packed: Dequantize MXFP4 packed weights
 - quantize_tensor_to_fp4: Quantize float tensor to FP4 with block scaling
@@ -115,6 +116,7 @@ def e8m0_to_fp32(u8: torch.Tensor) -> torch.Tensor:
         float32 tensor with actual scale values.
 
     FIXME: TPU-specific behavior difference for large exponents (u8 >= 254).
+        Use `e8m0_to_fp32_bits` for device-safe decoding.
         - u8=254 -> exponent=127 -> 2^127 ≈ 1.7e38
         - On CPU: torch.ldexp correctly returns 1.7e38
         - On TPU: torch.ldexp overflows to inf (due to float32 limits)
