@@ -68,10 +68,10 @@ def quantize_tensor(
 
 
 # Rows of x per grid step of `quantize_rows`.
-QUANTIZE_BLOCK_ROWS = 256
+QUANTIZE_BLOCK_ROWS = 128
 # Rows quantized together inside a step; the 8-bit output tile is 32 rows tall,
 # so a dynamically indexed group must start on a multiple of 32.
-QUANTIZE_GROUP_ROWS = 32
+QUANTIZE_GROUP_ROWS = 64
 # Columns converted and stored per step of a row group.
 QUANTIZE_LANE_CHUNK = 512
 _LANES = 128
