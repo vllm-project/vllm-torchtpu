@@ -20,6 +20,7 @@ from typing import Any, Protocol, cast
 import numpy as np
 import torch
 
+from vllm_torchtpu.distributed import dcp_dense_mla
 from vllm_torchtpu.distributed.pcp import all_reduce_sum as _pcp_all_reduce_sum
 
 
@@ -321,11 +322,7 @@ class AllSequenceLayoutPlanner:
         # pyrefly: ignore[unsupported-delete]
         del (
             scheduler_output,
-            start_index,
-            num_reqs,
-            num_scheduled_tokens_per_req,
             use_max_model_len,
-            target_num_reqs,
             padded_num_reqs,
         )
         padded_num_tokens = _first_ge(
@@ -334,6 +331,20 @@ class AllSequenceLayoutPlanner:
         dp_target_bucket = runner._dp_target_bucket
         if dp_target_bucket is not None and dp_target_bucket > padded_num_tokens:
             padded_num_tokens = int(dp_target_bucket)
+        if dcp_dense_mla.active() is not None:
+            scheduled = [int(n) for n in num_scheduled_tokens_per_req[:num_reqs]]
+            dcp_dense_mla.check_prefill_pool(
+                runner.input_batch.num_computed_tokens_cpu[
+                    start_index : start_index + num_reqs
+                ],
+                scheduled,
+            )
+            padded_num_tokens = dcp_dense_mla.padded_num_tokens(
+                runner.num_tokens_paddings,
+                padded_num_tokens,
+                scheduled,
+                target_num_reqs,
+            )
 
         return SequenceLayoutPlan(
             descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,

@@ -1007,6 +1007,7 @@ def mla_attention_dcp_prefill(
     mesh: Mesh,
     *,
     dcp_size: int,
+    interleave_size: int,
     max_model_len: int,
     sm_scale: float | None = None,
     q_scale: float | None = None,
@@ -1017,9 +1018,8 @@ def mla_attention_dcp_prefill(
     """Dense MLA of the step's prefill tokens over a DCP-sharded latent cache.
 
     Each rank attends its own heads over the whole context, all-gathered from
-    the group (see `mla_v2_dcp.mla_prefill_dcp_local`); needs
-    `interleave_size == page_size`. The cache is only read: store the step's
-    tokens with `mla_attention_dcp_decode` first.
+    the group (see `mla_v2_dcp.mla_prefill_dcp_local`). The cache is only
+    read: store the step's tokens with `mla_attention_dcp_decode` first.
 
     Args:
       q_TNA, q_rope_TNH: `[T, heads, *]` this rank's own heads, sharded over
@@ -1045,6 +1045,12 @@ def mla_attention_dcp_prefill(
     def _local(q, q_rope, k, k_rope, cache, seq_lens, block_tables, qsl, dist):
         block_tables = jnp.mod(block_tables, jnp.int32(cache.shape[0]))
         page_size = cache.shape[1] * cache.shape[2]
+        if interleave_size != page_size:
+            raise ValueError(
+                f"Dense MLA DCP prefill needs --cp-kv-cache-interleave-size "
+                f"equal to the cache page size {page_size}, got {interleave_size}: "
+                "the gathered pool lists whole pages in global order."
+            )
         tiles = _mla_v2_tiles(
             q,
             q_rope,

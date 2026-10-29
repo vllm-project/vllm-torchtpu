@@ -51,6 +51,7 @@ from vllm_torchtpu.block_major_pool import (
     kernel_view,
     unified_block_major_enabled,
 )
+from vllm_torchtpu.distributed import dcp_dense_mla
 from vllm_torchtpu.distributed.dcp import get_dcp_group as _get_dcp_group
 from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
@@ -1985,6 +1986,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             parallel_config, "cp_kv_cache_interleave_size", 1
         )
         self._dcp_mesh = None
+        model_config = getattr(get_current_vllm_config_or_none(), "model_config", None)
+        self._max_model_len = getattr(model_config, "max_model_len", None)
 
         if self.dcp_size > 1 and envs.TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER:
             logger.info_once(
@@ -2362,6 +2365,190 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         return sparse_mla_dcp_impl
 
+    def _build_mla_dcp_ops(
+        self,
+        layer: Any,
+        q_scale: float | None = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
+    ):
+        """Dense MLA under DCP: `(store + decode op, prefill op)`.
+
+        The decode op stores the step's tokens each rank owns and returns the
+        DCP group's heads of the leading tokens as partials for an LSE merge;
+        the prefill op attends each rank's own heads over the context gathered
+        from the group (`attention_interface.mla_attention_dcp_*`).
+        """
+        from vllm_torchtpu.layers.core.attention_interface import (
+            mla_attention_dcp_decode,
+            mla_attention_dcp_prefill,
+        )
+
+        mesh = self._dcp_mesh
+        # Set in __init__ when dcp_size > 1, the only case that builds these.
+        assert mesh is not None and self._max_model_len is not None
+        dcp_size, interleave = self.dcp_size, self.dcp_interleave_size
+        max_model_len = self._max_model_len
+        dcp_dense_mla.enable(dcp_size, interleave, max_model_len)
+        scales = dict(sm_scale=layer.scale, q_scale=q_scale, k_scale=k_scale)
+        scales["v_scale"] = v_scale
+        replicated, sharded = P(), P(DCP_AXIS_NAME)
+        metadata_specs = (replicated,) * 4
+
+        def _metadata(seq_lens, block_tables, query_start_loc, request_distribution):
+            return AttentionMetadata(
+                input_positions=None,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                query_start_loc=query_start_loc,
+                request_distribution=request_distribution,
+            )
+
+        def mla_dcp_decode_core(
+            kv_cache: jax.Array,
+            q_nope: jax.Array,
+            q_pe: jax.Array,
+            kv_c_normed: jax.Array,
+            k_pe: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            md = _metadata(
+                seq_lens, block_tables, query_start_loc, request_distribution
+            )
+            return mla_attention_dcp_decode(
+                q_nope,
+                q_pe,
+                kv_c_normed,
+                k_pe,
+                kv_cache,
+                md,
+                mesh,
+                dcp_size=dcp_size,
+                interleave_size=interleave,
+                **scales,
+            )
+
+        def mla_dcp_prefill_core(
+            kv_cache: jax.Array,
+            q_nope: jax.Array,
+            q_pe: jax.Array,
+            kv_c_normed: jax.Array,
+            k_pe: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+        ) -> jax.Array:
+            md = _metadata(
+                seq_lens, block_tables, query_start_loc, request_distribution
+            )
+            return mla_attention_dcp_prefill(
+                q_nope,
+                q_pe,
+                kv_c_normed,
+                k_pe,
+                kv_cache,
+                md,
+                mesh,
+                dcp_size=dcp_size,
+                interleave_size=interleave,
+                max_model_len=max_model_len,
+                **scales,
+            )
+
+        name = layer.layer_name.replace(".", "_")
+        decode_op = pcp_streaming_jax_op(
+            f"pallas::mla_attention_dcp_decode_{name}",
+            mla_dcp_decode_core,
+            donate_argnums=(0,),
+            mesh=mesh,
+            input_partition_specs=(sharded, *(replicated,) * 4, *metadata_specs),
+            output_partition_specs=(sharded, sharded, sharded),
+        )
+        prefill_op = pcp_streaming_jax_op(
+            f"pallas::mla_attention_dcp_prefill_{name}",
+            mla_dcp_prefill_core,
+            donate_argnums=None,
+            mesh=mesh,
+            input_partition_specs=(sharded, sharded, sharded, replicated, replicated)
+            + metadata_specs,
+            output_partition_specs=(sharded,),
+        )
+
+        # vLLM traces with dynamic token counts; size outputs from the inputs.
+        def _fake_decode(kv_cache, q_nope, *rest, **kwargs):
+            del rest, kwargs
+            return (
+                torch.empty_like(kv_cache),
+                torch.empty_like(q_nope),
+                q_nope.new_empty(q_nope.shape[:2], dtype=torch.float32),
+            )
+
+        def _fake_prefill(kv_cache, q_nope, *rest, **kwargs):
+            del kv_cache, rest, kwargs
+            return torch.empty_like(q_nope)
+
+        decode_op.register_fake(_fake_decode)
+        prefill_op.register_fake(_fake_prefill)
+        return decode_op, prefill_op
+
+    def _forward_dense_mla_dcp(
+        self,
+        layer: Any,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: Any,
+    ) -> torch.Tensor:
+        """Dense MLA under DCP, `[T, local_heads, kv_lora_rank]`.
+
+        The leading `min(T, num_seqs)` tokens go through the decode op, which
+        is exact for the 1-token sequences the runner puts first. Buckets
+        wider than the sequence count also run the prefill op; the runner pads
+        every step with a multi-token request into such a bucket
+        (`dcp_dense_mla.padded_num_tokens`).
+        """
+        ops = getattr(layer, "mla_dcp_ops", None)
+        assert ops is not None, (
+            "dense MLA DCP ops were never built; "
+            "`process_weights_after_loading` must run first."
+        )
+        decode_op, prefill_op = ops
+        md = attn_metadata
+        metadata = (
+            md.seq_lens,
+            md.block_tables,
+            md.query_start_loc,
+            md.request_distribution,
+        )
+        num_tokens, num_seqs = ql_nope.shape[0], md.seq_lens.shape[0]
+        lead = min(num_tokens, num_seqs)
+        q_lead, q_pe_lead = all_gather_q_nope_pe_heads(
+            ql_nope[:lead], q_pe[:lead], layer.kv_lora_rank
+        )
+        new_cache, partial, lse = decode_op(
+            kv_cache, q_lead, q_pe_lead, kv_c_normed, k_pe, *metadata
+        )
+        kv_cache.copy_(new_cache)
+        decoded = merge_lse_partials_scatter_heads(
+            partial,
+            lse,
+            is_backbone=vllm_compilation_backends.model_tag == "backbone",
+        )
+        if num_tokens <= num_seqs:
+            return decoded
+        prefilled = prefill_op(kv_cache, ql_nope, q_pe, kv_c_normed, k_pe, *metadata)
+        num_decode_tokens = md.query_start_loc[md.request_distribution[0]]
+        token = torch.arange(lead, device=decoded.device)
+        is_decode = (token < num_decode_tokens)[:, None, None]
+        head = torch.where(is_decode, decoded, prefilled[:lead])
+        return torch.cat([head, prefilled[lead:]])
+
     def forward(
         self,
         layer: Any,
@@ -2532,17 +2719,28 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
             # Only the sparse path receives a tuple of caches.
             assert isinstance(kv_cache, torch.Tensor)
-            outputs = layer.mla_op(
-                kv_cache,
-                ql_nope_flat,
-                q_pe_flat,
-                kv_c_normed_flat,
-                k_pe_flat,
-                attn_metadata.seq_lens,
-                attn_metadata.block_tables,
-                attn_metadata.query_start_loc,
-                attn_metadata.request_distribution,
-            )
+            if self.dcp_size > 1:
+                outputs = self._forward_dense_mla_dcp(
+                    layer,
+                    ql_nope_flat,
+                    q_pe_flat,
+                    kv_c_normed_flat,
+                    k_pe_flat,
+                    kv_cache,
+                    attn_metadata,
+                )
+            else:
+                outputs = layer.mla_op(
+                    kv_cache,
+                    ql_nope_flat,
+                    q_pe_flat,
+                    kv_c_normed_flat,
+                    k_pe_flat,
+                    attn_metadata.seq_lens,
+                    attn_metadata.block_tables,
+                    attn_metadata.query_start_loc,
+                    attn_metadata.request_distribution,
+                )
 
         outputs_t = outputs.reshape(-1, layer.num_heads, layer.kv_lora_rank).transpose(
             0, 1

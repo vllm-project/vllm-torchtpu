@@ -945,12 +945,16 @@ class VllmTPUMLAAttention(MLAAttention):
                 selector.get_mla_prefill_backend = original_selector_get_backend
 
         dcp_size = getattr(self.impl, "dcp_size", 1)
-        if dcp_size > 1 and not use_sparse:
-            # The dense forward attends this rank's KV shard as if it were the
-            # whole sequence, which is silently wrong.
+        vllm_config = get_current_vllm_config_or_none()
+        if (
+            dcp_size > 1
+            and not use_sparse
+            and getattr(vllm_config, "speculative_config", None) is not None
+        ):
+            # The dense DCP decode path attends 1-token sequences only.
             raise NotImplementedError(
-                f"Dense MLA ({prefix}) does not support "
-                f"--decode-context-parallel-size={dcp_size} yet."
+                f"Dense MLA ({prefix}) under --decode-context-parallel-size="
+                f"{dcp_size} does not support speculative decoding."
             )
 
         # Set after super(), not through it: upstream's
@@ -1074,10 +1078,15 @@ class VllmTPUMLAAttention(MLAAttention):
 
         dcp_size = getattr(impl, "dcp_size", 1)
         self.sparse_mla_dcp_op = None
+        self.mla_dcp_ops = None
         if dcp_size > 1:
             self.sparse_mla_dcp_op = impl._build_sparse_mla_dcp_op(
                 self, dcp_size, impl.dcp_interleave_size
             )
+            if not self.use_sparse:
+                self.mla_dcp_ops = impl._build_mla_dcp_ops(
+                    self, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
+                )
 
     def forward(
         self,
