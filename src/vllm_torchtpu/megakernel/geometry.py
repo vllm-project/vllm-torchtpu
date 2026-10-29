@@ -293,11 +293,12 @@ class ModelGeometry:
             if not cond:
                 raise MegakernelConfigError(msg)
         cx = cache_exec(ex)
+        dcp_g = self.G(ex.R) if (cx.dcp_kv_sharded and self.G(ex.R) > 1) else 1
         if cx.paged_kv and not (
             cx.page_size == 128
             and ex.ctx % cx.page_size == 0
             and cx.num_pages >= 1
-            and resolved_max_pages_per_seq(ex) >= ex.ctx // cx.page_size
+            and resolved_max_pages_per_seq(ex) * dcp_g >= ex.ctx // cx.page_size
         ):
             raise MegakernelConfigError(
                 f"Invalid paged_kv config: page_size={cx.page_size}, ctx={ex.ctx}, "

@@ -25,7 +25,7 @@ from jax.experimental.pallas import tpu as pltpu
 from ..ops import FP8, I32
 from .backend import kernel_debug_check
 from .checks import safe_kv_page
-from .config import cache_exec
+from .config import cache_exec, dcp_group
 from .scatter_ctx import ScatterKernel, batch_to_i32_cols, is_active
 
 
@@ -52,7 +52,8 @@ def scatter_single_token_across_att(
     page_size, h4 = sg.page_size, sg.h4
     p = pos_ref[b_idx]
     p_pos = jnp.maximum(p, jnp.int32(0))
-    p_ok = jnp.logical_and(p >= 0, lax.div(p_pos, page_size) < sg.pt_cols)
+    dcp_g = dcp_group(ex)
+    p_ok = jnp.logical_and(p >= 0, lax.div(p_pos, page_size) < sg.pt_cols * dcp_g)
     kernel_debug_check(
         p_ok,
         "KV scatter pos outside [0, page_table.shape[1] * page_size)",
@@ -61,68 +62,75 @@ def scatter_single_token_across_att(
     ln = lax.rem(p_pos, page_size)
     raw_kp = kv_pages_ref[s_idx, t_idx]
     num_pages = cache_exec(ex).num_pages
+    own_kv = jnp.logical_and(p_ok, raw_kp >= 0) if dcp_g > 1 else p_ok
     kernel_debug_check(
-        jnp.logical_and(raw_kp >= 0, raw_kp < num_pages),
+        jnp.logical_or(~own_kv, jnp.logical_and(raw_kp >= 0, raw_kp < num_pages)),
         "KV scatter page index outside [0, num_pages)",
         interpret=bool(interpret),
     )
-    kp = jnp.where(p_ok, safe_kv_page(raw_kp, num_pages), jnp.int32(0))
-    mask_ln = jnp.logical_and(p_ok, lane_iota == ln)
+    kp = jnp.where(own_kv, safe_kv_page(raw_kp, num_pages), jnp.int32(0))
+    mask_ln = jnp.logical_and(own_kv, lane_iota == ln)
     sh_b = lax.rem(ln + (page_size - lax.rem(b_idx, page_size)), page_size)
 
-    pltpu.make_async_copy(
-        raw_out_refs[0].at[kp], kv_page.at[0], sem_kv_rd.at[0]
-    ).start()
-
-    for g_idx in range(NATT):
-        k_slot = g_idx & 1
-        nxt_slot = 1 - k_slot
-        if g_idx >= 1:
-            pltpu.make_async_copy(
-                kv_page.at[nxt_slot],
-                raw_out_refs[g_idx - 1].at[kp],
-                sem_kv_wr.at[nxt_slot],
-            ).wait()
-        if g_idx + 1 < NATT:
-            pltpu.make_async_copy(
-                raw_out_refs[g_idx + 1].at[kp],
-                kv_page.at[nxt_slot],
-                sem_kv_rd.at[nxt_slot],
-            ).start()
+    @pl.when(own_kv)
+    def _():
         pltpu.make_async_copy(
-            raw_out_refs[g_idx].at[kp],
-            kv_page.at[k_slot],
-            sem_kv_rd.at[k_slot],
-        ).wait()
-
-        k_cols = k_cols_buf[g_idx] if NS > 1 else batch_to_i32_cols(kc, knew_buf[g_idx])
-        v_cols = v_cols_buf[g_idx] if NS > 1 else batch_to_i32_cols(kc, vnew_buf[g_idx])
-        k_col = pltpu.roll(k_cols, sh_b, 1)
-        v_col = pltpu.roll(v_cols, sh_b, 1)
-        k_view = kv_page.at[k_slot, 0].bitcast(I32).reshape(h4, page_size)
-        v_view = kv_page.at[k_slot, 1].bitcast(I32).reshape(h4, page_size)
-        k_new = jnp.where(mask_ln, k_col, k_view[...])
-        v_new = jnp.where(mask_ln, v_col, v_view[...])
-        if bool(interpret):
-            kv_page[k_slot, 0] = lax.bitcast_convert_type(k_new, FP8).swapaxes(1, 2)
-            kv_page[k_slot, 1] = lax.bitcast_convert_type(v_new, FP8).swapaxes(1, 2)
-        else:
-            k_view[...] = k_new
-            v_view[...] = v_new
-
-        pltpu.make_async_copy(
-            kv_page.at[k_slot],
-            raw_out_refs[g_idx].at[kp],
-            sem_kv_wr.at[k_slot],
+            raw_out_refs[0].at[kp], kv_page.at[0], sem_kv_rd.at[0]
         ).start()
 
-    if NATT >= 1:
-        last_slot = (NATT - 1) & 1
-        pltpu.make_async_copy(
-            kv_page.at[last_slot],
-            raw_out_refs[NATT - 1].at[kp],
-            sem_kv_wr.at[last_slot],
-        ).wait()
+        for g_idx in range(NATT):
+            k_slot = g_idx & 1
+            nxt_slot = 1 - k_slot
+            if g_idx >= 1:
+                pltpu.make_async_copy(
+                    kv_page.at[nxt_slot],
+                    raw_out_refs[g_idx - 1].at[kp],
+                    sem_kv_wr.at[nxt_slot],
+                ).wait()
+            if g_idx + 1 < NATT:
+                pltpu.make_async_copy(
+                    raw_out_refs[g_idx + 1].at[kp],
+                    kv_page.at[nxt_slot],
+                    sem_kv_rd.at[nxt_slot],
+                ).start()
+            pltpu.make_async_copy(
+                raw_out_refs[g_idx].at[kp],
+                kv_page.at[k_slot],
+                sem_kv_rd.at[k_slot],
+            ).wait()
+
+            k_cols = (
+                k_cols_buf[g_idx] if NS > 1 else batch_to_i32_cols(kc, knew_buf[g_idx])
+            )
+            v_cols = (
+                v_cols_buf[g_idx] if NS > 1 else batch_to_i32_cols(kc, vnew_buf[g_idx])
+            )
+            k_col = pltpu.roll(k_cols, sh_b, 1)
+            v_col = pltpu.roll(v_cols, sh_b, 1)
+            k_view = kv_page.at[k_slot, 0].bitcast(I32).reshape(h4, page_size)
+            v_view = kv_page.at[k_slot, 1].bitcast(I32).reshape(h4, page_size)
+            k_new = jnp.where(mask_ln, k_col, k_view[...])
+            v_new = jnp.where(mask_ln, v_col, v_view[...])
+            if bool(interpret):
+                kv_page[k_slot, 0] = lax.bitcast_convert_type(k_new, FP8).swapaxes(1, 2)
+                kv_page[k_slot, 1] = lax.bitcast_convert_type(v_new, FP8).swapaxes(1, 2)
+            else:
+                k_view[...] = k_new
+                v_view[...] = v_new
+
+            pltpu.make_async_copy(
+                kv_page.at[k_slot],
+                raw_out_refs[g_idx].at[kp],
+                sem_kv_wr.at[k_slot],
+            ).start()
+
+        if NATT >= 1:
+            last_slot = (NATT - 1) & 1
+            pltpu.make_async_copy(
+                kv_page.at[last_slot],
+                raw_out_refs[NATT - 1].at[kp],
+                sem_kv_wr.at[last_slot],
+            ).wait()
 
 
 def scatter_kv(kc: ScatterKernel) -> None:
@@ -153,12 +161,13 @@ def scatter_kv(kc: ScatterKernel) -> None:
             def _():
                 b0 = s * T
                 num_pages = cache_exec(ex).num_pages
-                kp0 = safe_kv_page(kv_pages_ref[s, 0], num_pages)
-                same_page = jnp.bool_(True)
+                dcp_g = dcp_group(ex)
+                raw_kp0 = kv_pages_ref[s, 0]
+                kp0 = safe_kv_page(raw_kp0, num_pages)
+                same_page = raw_kp0 >= 0
                 for t in range(1, T):
                     same_page = jnp.logical_and(
-                        same_page,
-                        safe_kv_page(kv_pages_ref[s, t], num_pages) == kp0,
+                        same_page, kv_pages_ref[s, t] == raw_kp0
                     )
 
                 @pl.when(same_page)
@@ -169,7 +178,7 @@ def scatter_kv(kc: ScatterKernel) -> None:
                         p_t = pos_ref[b0 + t]
                         p_t_pos = jnp.maximum(p_t, jnp.int32(0))
                         p_ok_t = jnp.logical_and(
-                            p_t >= 0, lax.div(p_t_pos, page_size) < sg.pt_cols
+                            p_t >= 0, lax.div(p_t_pos, page_size) < sg.pt_cols * dcp_g
                         )
                         p_ok_list.append(p_ok_t)
                         kernel_debug_check(

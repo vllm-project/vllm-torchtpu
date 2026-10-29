@@ -28,7 +28,7 @@ from ..exec_spec import ExecSpec
 from ..ops import BF16, FP8, I32
 from .backend import check_ckpt_bounds, resolve_active_seqs
 from .checks import check_step_pool_metadata, safe_kv_page
-from .config import cache_exec
+from .config import cache_exec, dcp_group
 from .layout import PoolLayout
 from .scatter_ckpt import prepare_ckpt
 from .scatter_ctx import ScatterGeom, ScatterKernel
@@ -140,13 +140,25 @@ def scatter_pool_states(
     pt_cols = page_table.shape[1]
     pos_raw = pos[: NS * T].reshape(NS, T)
     pos_st = jnp.maximum(pos_raw, jnp.int32(0))
-    lp_raw = lax.div(pos_st, page_size)
-    p_in_range = jnp.logical_and(pos_raw >= 0, lp_raw < pt_cols)
-    lp_idx = jnp.where(p_in_range, lp_raw, jnp.int32(0))
     s_idx_arr = jnp.arange(NS, dtype=I32)[:, None]
+    dcp_g = dcp_group(ex)
+    if dcp_g > 1:
+        gi = lax.rem(lax.axis_index("tp"), dcp_g)
+        blk_g = lax.div(pos_st, page_size)
+        lp_raw = lax.div(blk_g, dcp_g)
+        p_in_range = jnp.logical_and(
+            jnp.logical_and(pos_raw >= 0, lp_raw < pt_cols),
+            lax.rem(blk_g, dcp_g) == gi,
+        )
+    else:
+        lp_raw = lax.div(pos_st, page_size)
+        p_in_range = jnp.logical_and(pos_raw >= 0, lp_raw < pt_cols)
+    lp_idx = jnp.where(p_in_range, lp_raw, jnp.int32(0))
     raw_kp = page_table[s_idx_arr, lp_idx].astype(I32)
     kv_pages = jnp.where(
-        p_in_range, safe_kv_page(raw_kp, cache_exec(ex).num_pages), jnp.int32(0)
+        p_in_range,
+        safe_kv_page(raw_kp, cache_exec(ex).num_pages),
+        jnp.int32(-1) if dcp_g > 1 else jnp.int32(0),
     )
 
     conv_in, conv_buf_shape, conv_buf_dt, ckpt_geom = prepare_ckpt(

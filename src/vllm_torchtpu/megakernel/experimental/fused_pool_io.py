@@ -166,12 +166,19 @@ def _gqa_seq_active(ctx: Any, s: Any) -> Any:
 def _gqa_tok_kp(ctx: Any, s: Any, t: int) -> tuple[Any, Any]:
     ex, ST, pos_ref = ctx.ex, ctx.ST, ctx.pos_ref
     pt_ref = ST["page_table"]
-    page_size = cache_exec(ex).page_size
-    num_pages = cache_exec(ex).num_pages
+    cx = cache_exec(ex)
+    page_size, num_pages = cx.page_size, cx.num_pages
+    dcp_g = cx.dcp_size if cx.dcp_kv_sharded else 1
     p_raw = pos_ref[s * ex.T + t]
     p_pos = jnp.maximum(p_raw, jnp.int32(0))
-    lp_raw = lax.div(p_pos, page_size)
-    p_ok = jnp.logical_and(p_raw >= 0, lp_raw < pt_ref.shape[1])
+    blk = lax.div(p_pos, page_size)
+    lp_raw = lax.div(blk, dcp_g)
+    own = (
+        (lax.rem(blk, dcp_g) == lax.rem(ctx.me, dcp_g))
+        if dcp_g > 1
+        else jnp.bool_(True)
+    )
+    p_ok = jnp.logical_and(jnp.logical_and(p_raw >= 0, lp_raw < pt_ref.shape[1]), own)
     lp = jnp.where(p_ok, lp_raw, jnp.int32(0))
     kp = jnp.where(p_ok, safe_kv_page(pt_ref[s, lp], num_pages), jnp.int32(0))
     return kp, p_ok
@@ -291,13 +298,12 @@ def gqa_fused_kv_rmw(ctx: Any, ap: Any, a_cur: Any) -> None:
     """Modify prefetched KV pages with `knew_o`/`vnew_o` and start DMA writeback."""
     if "kv" in ctx.skip:
         return
-    ex, scr, ST, pos_ref = ctx.ex, ctx.scr, ctx.ST, ctx.pos_ref
+    ex, scr, pos_ref = ctx.ex, ctx.scr, ctx.pos_ref
     raw_refs = ctx.raw_refs
     NS, T = ex.NS, ex.T
     HD = ap.HD
     h4 = HD // 4
     interpret = bool(ex.interpret)
-    pt_ref = ST["page_table"]
     kv_scat = scr["kv_scat_page"]
     rd_sem, wr_sem = scr["kv_rd_sem"], scr["kv_wr_sem"]
     rd_pend, wr_pend = scr["kv_rd_pend"], scr["kv_wr_pend"]
@@ -339,11 +345,8 @@ def gqa_fused_kv_rmw(ctx: Any, ap: Any, a_cur: Any) -> None:
                 v_cur = v_view[...]
             for t in range(T):
                 b_t = b0 + t
-                p_raw = pos_ref[b_t]
-                p_t = jnp.maximum(p_raw, jnp.int32(0))
-                p_ok = jnp.logical_and(
-                    p_raw >= 0, lax.div(p_t, page_size) < pt_ref.shape[1]
-                )
+                p_t = jnp.maximum(pos_ref[b_t], jnp.int32(0))
+                _, p_ok = _gqa_tok_kp(ctx, s, t)
                 ln_t = lax.rem(p_t, page_size)
                 mask_ln = jnp.logical_and(p_ok, lane_iota_kv == ln_t)
                 if interpret:
@@ -399,93 +402,88 @@ def gqa_fused_kv_rmw(ctx: Any, ap: Any, a_cur: Any) -> None:
                     b0 = s * T
                     for t in range(T):
                         b_t = b0 + t
-                        p_raw = pos_ref[b_t]
-                        p_t = jnp.maximum(p_raw, jnp.int32(0))
-                        lp_raw = lax.div(p_t, page_size)
-                        p_ok = jnp.logical_and(p_raw >= 0, lp_raw < pt_ref.shape[1])
-                        lp_t = jnp.where(p_ok, lp_raw, jnp.int32(0))
+                        p_t = jnp.maximum(pos_ref[b_t], jnp.int32(0))
                         ln_t = lax.rem(p_t, page_size)
-                        kp_t = jnp.where(
-                            p_ok,
-                            safe_kv_page(pt_ref[s, lp_t], cache_exec(ex).num_pages),
-                            jnp.int32(0),
-                        )
-                        bswitch(
-                            a_cur,
-                            [
-                                lambda r=r, s=s, kp_t=kp_t: pltpu.make_async_copy(
-                                    r.at[kp_t], kv_scat.at[s], rd_sem.at[s]
-                                ).start()
-                                for r in raw_refs
-                            ],
-                        )
-                        mask_ln = jnp.logical_and(p_ok, lane_iota_kv == ln_t)
-                        if interpret:
-                            mask_b = lane_iota_kv == b_t
-                            k_col = jnp.sum(
-                                jnp.where(mask_b, k_cols, jnp.int32(0)),
-                                axis=1,
-                                keepdims=True,
+                        kp_t, p_ok = _gqa_tok_kp(ctx, s, t)
+
+                        @pl.when(p_ok)
+                        def _rmw_t(b_t=b_t, kp_t=kp_t, ln_t=ln_t, p_ok=p_ok):
+                            bswitch(
+                                a_cur,
+                                [
+                                    lambda r=r, s=s, kp_t=kp_t: pltpu.make_async_copy(
+                                        r.at[kp_t], kv_scat.at[s], rd_sem.at[s]
+                                    ).start()
+                                    for r in raw_refs
+                                ],
                             )
-                            v_col = jnp.sum(
-                                jnp.where(mask_b, v_cols, jnp.int32(0)),
-                                axis=1,
-                                keepdims=True,
+                            mask_ln = jnp.logical_and(p_ok, lane_iota_kv == ln_t)
+                            if interpret:
+                                mask_b = lane_iota_kv == b_t
+                                k_col = jnp.sum(
+                                    jnp.where(mask_b, k_cols, jnp.int32(0)),
+                                    axis=1,
+                                    keepdims=True,
+                                )
+                                v_col = jnp.sum(
+                                    jnp.where(mask_b, v_cols, jnp.int32(0)),
+                                    axis=1,
+                                    keepdims=True,
+                                )
+                            else:
+                                sh_t = lax.rem(
+                                    ln_t
+                                    + (
+                                        cache_exec(ex).page_size
+                                        - b_t % cache_exec(ex).page_size
+                                    ),
+                                    cache_exec(ex).page_size,
+                                )
+                                k_col = pltpu.roll(k_cols, sh_t, 1)
+                                v_col = pltpu.roll(v_cols, sh_t, 1)
+                            _gqa_wait_kv_rd(raw_refs, scr, s)
+                            if interpret:
+                                k_old = lax.bitcast_convert_type(
+                                    jnp.swapaxes(kv_scat[s, 0], 1, 2), I32
+                                )
+                                v_old = lax.bitcast_convert_type(
+                                    jnp.swapaxes(kv_scat[s, 1], 1, 2), I32
+                                )
+                                k_cur = jnp.where(mask_ln, k_col, k_old)
+                                v_cur = jnp.where(mask_ln, v_col, v_old)
+                                kv_scat[s, 0] = lax.bitcast_convert_type(
+                                    k_cur, FP8
+                                ).swapaxes(1, 2)
+                                kv_scat[s, 1] = lax.bitcast_convert_type(
+                                    v_cur, FP8
+                                ).swapaxes(1, 2)
+                            else:
+                                k_view = (
+                                    kv_scat.at[s, 0]
+                                    .bitcast(I32)
+                                    .reshape(h4, cache_exec(ex).page_size)
+                                )
+                                v_view = (
+                                    kv_scat.at[s, 1]
+                                    .bitcast(I32)
+                                    .reshape(h4, cache_exec(ex).page_size)
+                                )
+                                k_cur = jnp.where(mask_ln, k_col, k_view[...])
+                                v_cur = jnp.where(mask_ln, v_col, v_view[...])
+                                k_view[...] = k_cur
+                                v_view[...] = v_cur
+                            bswitch(
+                                a_cur,
+                                [
+                                    lambda r=r, s=s, kp_t=kp_t: pltpu.make_async_copy(
+                                        kv_scat.at[s], r.at[kp_t], wr_sem.at[s]
+                                    ).start()
+                                    for r in raw_refs
+                                ],
                             )
-                        else:
-                            sh_t = lax.rem(
-                                ln_t
-                                + (
-                                    cache_exec(ex).page_size
-                                    - b_t % cache_exec(ex).page_size
-                                ),
-                                cache_exec(ex).page_size,
-                            )
-                            k_col = pltpu.roll(k_cols, sh_t, 1)
-                            v_col = pltpu.roll(v_cols, sh_t, 1)
-                        _gqa_wait_kv_rd(raw_refs, scr, s)
-                        if interpret:
-                            k_old = lax.bitcast_convert_type(
-                                jnp.swapaxes(kv_scat[s, 0], 1, 2), I32
-                            )
-                            v_old = lax.bitcast_convert_type(
-                                jnp.swapaxes(kv_scat[s, 1], 1, 2), I32
-                            )
-                            k_cur = jnp.where(mask_ln, k_col, k_old)
-                            v_cur = jnp.where(mask_ln, v_col, v_old)
-                            kv_scat[s, 0] = lax.bitcast_convert_type(
-                                k_cur, FP8
-                            ).swapaxes(1, 2)
-                            kv_scat[s, 1] = lax.bitcast_convert_type(
-                                v_cur, FP8
-                            ).swapaxes(1, 2)
-                        else:
-                            k_view = (
-                                kv_scat.at[s, 0]
-                                .bitcast(I32)
-                                .reshape(h4, cache_exec(ex).page_size)
-                            )
-                            v_view = (
-                                kv_scat.at[s, 1]
-                                .bitcast(I32)
-                                .reshape(h4, cache_exec(ex).page_size)
-                            )
-                            k_cur = jnp.where(mask_ln, k_col, k_view[...])
-                            v_cur = jnp.where(mask_ln, v_col, v_view[...])
-                            k_view[...] = k_cur
-                            v_view[...] = v_cur
-                        bswitch(
-                            a_cur,
-                            [
-                                lambda r=r, s=s, kp_t=kp_t: pltpu.make_async_copy(
-                                    kv_scat.at[s], r.at[kp_t], wr_sem.at[s]
-                                ).start()
-                                for r in raw_refs
-                            ],
-                        )
-                        pltpu.make_async_copy(
-                            kv_scat.at[s], raw_refs[0].at[0], wr_sem.at[s]
-                        ).wait()
+                            pltpu.make_async_copy(
+                                kv_scat.at[s], raw_refs[0].at[0], wr_sem.at[s]
+                            ).wait()
 
 
 def gqa_fused_epilogue(ctx: Any) -> None:

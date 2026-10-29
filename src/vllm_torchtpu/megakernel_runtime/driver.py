@@ -54,6 +54,7 @@ from vllm_torchtpu.megakernel import (
 from vllm_torchtpu.megakernel import (
     runtime as _rt,
 )
+from vllm_torchtpu.megakernel.pool.config import check_dcp_interleave
 from vllm_torchtpu.megakernel_runtime.exported_bridge import (
     build_pooled_step_op,
     execute_pooled_step_inplace,
@@ -72,6 +73,7 @@ from vllm_torchtpu.megakernel_runtime.weight_collector import (
 )
 
 logger = init_logger(__name__)
+
 
 _VLLM_STARTUP_MESSAGES: dict[str, str] = {
     "unaligned_cache_layout": (
@@ -336,15 +338,110 @@ def _extract_step_sc(
     return s, (c if c is not None else s)
 
 
-def _pcp_or_dcp_enabled(runner: Any) -> bool:
-    if getattr(runner, "_pcp_enabled", False) or getattr(runner, "_dcp_enabled", False):
+def _pcp_enabled(runner: Any) -> bool:
+    if getattr(runner, "_pcp_enabled", False):
         return True
-    p_cfg = getattr(runner, "parallel_config", None)
-    if p_cfg is None:
+    p_cfg = getattr(runner, "parallel_config", None) or getattr(
+        getattr(runner, "vllm_config", None), "parallel_config", None
+    )
+    return (
+        p_cfg is not None
+        and int(getattr(p_cfg, "prefill_context_parallel_size", 1) or 1) > 1
+    )
+
+
+def _dcp_size(runner: Any) -> int:
+    p_cfg = getattr(runner, "parallel_config", None) or getattr(
+        getattr(runner, "vllm_config", None), "parallel_config", None
+    )
+    if p_cfg is not None:
+        dcp = int(getattr(p_cfg, "decode_context_parallel_size", 1) or 1)
+        if dcp > 1:
+            return dcp
+    return 1
+
+
+def _pcp_or_dcp_enabled(runner: Any) -> bool:
+    return (
+        _pcp_enabled(runner)
+        or bool(getattr(runner, "_dcp_enabled", False))
+        or _dcp_size(runner) > 1
+    )
+
+
+def _check_dcp_compatible(runner: Any, geom: Any, r_cnt: int) -> bool:
+    if _pcp_enabled(runner):
+        logger.warning(
+            "Megakernel does not support prefill context parallelism (PCP); skipping."
+        )
         return False
-    pcp = int(getattr(p_cfg, "prefill_context_parallel_size", 1) or 1)
-    dcp = int(getattr(p_cfg, "decode_context_parallel_size", 1) or 1)
-    return pcp > 1 or dcp > 1
+    dcp = _dcp_size(runner)
+    if dcp <= 1:
+        return True
+    g_kv = r_cnt // max(1, int(geom.NKV))
+    if dcp != g_kv:
+        logger.warning(
+            "Megakernel DCP requires decode_context_parallel_size == R // NKV (%d), "
+            "got %d; skipping.",
+            g_kv,
+            dcp,
+        )
+        return False
+    return True
+
+
+def _check_host_major_mesh(mesh: Any, group_size: int = 8) -> bool:
+    devs = list(np.asarray(mesh.devices).flat)
+    if len(devs) < 2 * group_size:
+        return True
+    proc_ids = [getattr(d, "process_index", None) for d in devs]
+    if any(p is None for p in proc_ids):
+        return True
+    int_pids = [int(p) for p in proc_ids if p is not None]
+    if len(set(int_pids)) <= 1:
+        return True
+    base_pid = int_pids[0]
+    for r, pid in enumerate(int_pids):
+        if pid != base_pid + (r // group_size):
+            logger.warning(
+                "Megakernel multi-host mesh requires host-major rank ordering "
+                "(process_index == base + r // %d), got %s; skipping.",
+                group_size,
+                int_pids,
+            )
+            return False
+    return True
+
+
+def expected_pool_shape(
+    geom: Any,
+    r_cnt: int,
+    num_pages: int,
+    page_size: int = 128,
+) -> tuple[int, int, int, int, int]:
+    """Expected (num_pages, 2 * kvh, hd // 4, 4, page_size) pool shape."""
+    kvh_expected = max(1, int(geom.NKV) // int(r_cnt))
+    hd4_expected = int(geom.HD) // 4
+    return (num_pages, 2 * kvh_expected, hd4_expected, 4, int(page_size))
+
+
+def validate_pool_shape(
+    shape: tuple[int, ...],
+    geom: Any,
+    r_cnt: int,
+    page_size: int = 128,
+) -> None:
+    """Validate raw pool shape matches expected megakernel layout."""
+    if int(page_size) != 128:
+        raise MegakernelLayoutError(
+            f"Megakernel requires page_size == 128, got {page_size}"
+        )
+    if len(shape) != 5:
+        raise MegakernelLayoutError(f"pool shape must have 5 dims, got {shape}")
+    num_pages = int(shape[0])
+    expected = expected_pool_shape(geom, r_cnt, num_pages, page_size)
+    if tuple(shape) != expected:
+        raise MegakernelLayoutError(f"pool shape {tuple(shape)} != {expected}")
 
 
 def _data_parallel_enabled(runner: Any, tp_size: int) -> bool:
@@ -426,6 +523,14 @@ def _decline_vote(result: _rt.EligibilityResult | None) -> int:
         return 0
     code = result.code if result.code in DECLINE_VOTE_CODES else "other"
     return DECLINE_VOTE_CODES.index(code) + 1
+
+
+def _tp_rank() -> int:
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return 0
+    from vllm.distributed import get_tensor_model_parallel_rank
+
+    return int(get_tensor_model_parallel_rank())
 
 
 def _tp_cpu_group() -> Any:
@@ -712,7 +817,6 @@ class MegakernelDriver:
         return self.bucket_policy.max_verify_bucket
 
     def _build_spec(self, mode: str, r_cnt: int, geom: Any = None) -> Any:
-        del r_cnt
         if geom is None:
             e_slots = (
                 int(get_routed_experts(self.backbone.layers[0].mlp).w13_weight.shape[0])
@@ -724,7 +828,7 @@ class MegakernelDriver:
                 moe_tp=(mode == "tp"),
                 e_slots=0 if mode == "tp" else e_slots,
             )
-        return self.model_def.to_model_spec(geom)
+        return self.model_def.to_model_spec(geom, R=r_cnt)
 
     def _prepare_and_pack_weights(
         self, *, mode: str, reshard_ep_to_tp: bool, expert_placement: Any
@@ -835,7 +939,7 @@ class MegakernelDriver:
             multimodal_inputs=bool(getattr(runner, "supports_mm_inputs", False)),
             lora_enabled=getattr(runner, "lora_config", None) is not None,
             pipeline_parallel=pp_multi,
-            context_parallel=_pcp_or_dcp_enabled(runner),
+            context_parallel=_pcp_enabled(runner),
             dp_lockstep=bool(callable(dp_fn) and dp_fn()),
             aux_hidden_states=bool(getattr(backbone, "aux_hidden_state_layers", ())),
             tp_size=r_cnt,
@@ -850,10 +954,10 @@ class MegakernelDriver:
         if not el.eligible:
             cls._log_startup_ineligible(el)
             return None
+        if not _check_dcp_compatible(runner, d_geom, r_cnt):
+            return None
 
-        from vllm.distributed import get_tensor_model_parallel_rank
-
-        tp_rank = int(get_tensor_model_parallel_rank())
+        tp_rank = _tp_rank()
         loaded_ep = (
             int(get_routed_experts(backbone.layers[0].mlp).w13_weight.shape[0]) < tot_e
         )
@@ -880,6 +984,8 @@ class MegakernelDriver:
                 display_name=mdef.display_name or str(mdef.name),
                 stats_period_s=float(cfg["stats_period_s"]),
             )
+        if not _check_host_major_mesh(mesh):
+            return None
         dev_kind = str(getattr(mesh.devices.flat[0], "device_kind", "") or "")
         owned = _rt.explicit_profile_settings(cfg)
         spec_tokens: int | None = None
@@ -967,7 +1073,14 @@ class MegakernelDriver:
             )
             _need_layout(
                 tuple(pool.shape) == expected_shape,
-                f"pool[{r}] shape {tuple(pool.shape)} != {expected_shape}",
+                f"pool[{r}] shape {tuple(pool.shape)} != expected {expected_shape} "
+                f"(num_pages, 2*kvh, hd//4, 4, page_size)",
+            )
+            validate_pool_shape(
+                tuple(pool.shape),
+                self.geom,
+                self.base_exec.R,
+                page_size=page_size,
             )
             for g_idx in range(g_per_att):
                 la_cache = _unwrap(
@@ -1005,13 +1118,31 @@ class MegakernelDriver:
         ]
         self.attn_layer_name = self.backbone.layers[g_per_att].self_attn.attn.layer_name
 
+        dcp_kv_sharded = bool(
+            _dcp_size(runner) > 1
+            and not getattr(runner, "_mk_replicated_dcp_kv", False)
+        )
+        if dcp_kv_sharded:
+            p_cfg = getattr(runner, "parallel_config", None) or getattr(
+                getattr(runner, "vllm_config", None), "parallel_config", None
+            )
+            interleave = getattr(p_cfg, "cp_kv_cache_interleave_size", None)
+            if interleave is not None:
+                check_dcp_interleave(int(interleave), int(self.page_size))
+        dcp_factor = _dcp_size(runner) if dcp_kv_sharded else 1
         c_kw = dict(
             num_pages=self.num_pages,
             page_size=self.page_size,
-            max_pages_per_seq=self.max_pages_per_seq,
+            max_pages_per_seq=self.max_pages_per_seq * dcp_factor,
         )
-        self.base_exec = _rt.align_cache_exec(
+        aligned_exec = _rt.align_cache_exec(
             self.base_exec, self.profile, self.geom, **c_kw
+        )
+        self.base_exec = with_cache(
+            aligned_exec,
+            max_pages_per_seq=self.max_pages_per_seq,
+            dcp_kv_sharded=dcp_kv_sharded,
+            dcp_size=dcp_factor,
         )
         self._runner_token_paddings = tuple(
             int(x) for x in getattr(runner, "num_tokens_paddings", ())
@@ -1637,7 +1768,7 @@ class MegakernelDriver:
                 or getattr(runner, "lora_config", None) is not None
                 or not getattr(runner, "_pp_is_first", True)
                 or not getattr(runner, "_pp_is_last", True)
-                or _pcp_or_dcp_enabled(runner)
+                or not _check_dcp_compatible(runner, self.geom, self.base_exec.R)
                 or (callable(dp_fn) and dp_fn())
             ):
                 return False

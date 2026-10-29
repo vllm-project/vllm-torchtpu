@@ -1212,7 +1212,7 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
         "Qwen3_5ForCausalLM",
     )
     assert Qwen35.hf_model_type == ("qwen3_5_moe", "qwen3_5", "qwen3_5_moe_text")
-    assert Qwen35.supported_tp_sizes == (8,)
+    assert Qwen35.supported_tp_sizes == (8, 32)
     assert Qwen35.display_name == "Qwen3.5"
 
     # Dense Qwen3.5 config fails closed with "Qwen35 supports MoE checkpoints only"
