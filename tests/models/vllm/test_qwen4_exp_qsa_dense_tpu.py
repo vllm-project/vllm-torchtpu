@@ -141,7 +141,10 @@ def test_complete_layer_dense_context_against_plain_torch(fp8, tmp_path):
             model.finalize_weights()
             if fp8:
                 model.load_weights(
-                    [("_k_scale", torch.tensor(0.375)), ("_v_scale", torch.tensor(2.5))]
+                    [
+                        ("_k_scale", torch.tensor(0.375)),
+                        ("_v_scale", torch.tensor(2.5)),
+                    ]
                 )
             cpu_owners, _ = qsa_test_pools(model, 20)
             owners = [owner.to("tpu") for owner in cpu_owners]
@@ -179,7 +182,12 @@ def test_complete_layer_dense_context_against_plain_torch(fp8, tmp_path):
                 # production forward context, not the legacy metadata fields.
                 per_layer = {
                     model.prefix: SimpleNamespace(
-                        block_tables=metadata.main_block_table
+                        block_tables=metadata.main_block_table,
+                        request_distribution=torch.tensor(
+                            [1, 1, 1] if count == 1 else [0, 0, 1],
+                            dtype=torch.int32,
+                            device="tpu",
+                        ),
                     ),
                     model.prefix + ".raw_ring": SimpleNamespace(
                         block_tables=metadata.state_slots
