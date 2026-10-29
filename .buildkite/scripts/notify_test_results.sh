@@ -39,5 +39,5 @@ if [ "${V6_ANY_FAILED}" = "true" ] || [ "${V7_ANY_FAILED}" = "true" ] ; then
   echo "${FAILURE_LABEL}"
   exit 1
 else
-  echo "All models & features passed."
+  echo "All blocking models & features passed (soft_fail stages excluded; soft-failed stages still show ❌ in the matrix)."
 fi

@@ -30,8 +30,9 @@ fi
 
 echo "--- Checking ${STEP_KEY} Outcome (Hardware: ${CI_TPU_VERSION:-v6})"
 
-# Try to get the custom string you saved, while still checking the step outcome
-# so `soft_fail: true` steps stay non-blocking downstream.
+# Read any custom status string stored under the step key (e.g. "unverified"
+# or "not enough HBM"), and query Buildkite's step outcome separately so
+# `soft_fail: true` steps stay non-blocking even when custom metadata is set.
 CUSTOM_STATUS=$(buildkite-agent meta-data get "${STEP_KEY}" --default "")
 STEP_OUTCOME=$(buildkite-agent step get "outcome" --step "${STEP_KEY}" || echo "skipped")
 

@@ -103,6 +103,14 @@ def format_status(raw: str) -> str:
     return raw
 
 
+def is_soft_failed(prefix: str, name: str, stage: str) -> bool:
+    """Returns True when a stage recorded a non-blocking soft_failed outcome."""
+    return (
+        get_buildkite_metadata(f"{prefix}{name}:{stage}:soft_failed", default="false")
+        == "true"
+    )
+
+
 def main() -> None:
     tpu_version = os.environ.get("TPU_VERSION", "tpu6e")
     if tpu_version.startswith("v7") or "7x" in tpu_version or "tpu7" in tpu_version:
@@ -148,13 +156,7 @@ def main() -> None:
                 result = get_buildkite_metadata(
                     f"{tpu_metadata_prefix}{model}:{stage}", default="❓ Untested"
                 )
-                soft_failed = (
-                    get_buildkite_metadata(
-                        f"{tpu_metadata_prefix}{model}:{stage}:soft_failed",
-                        default="false",
-                    )
-                    == "true"
-                )
+                soft_failed = is_soft_failed(tpu_metadata_prefix, model, stage)
                 row[stage] = result
                 if result not in valid_outcomes and not soft_failed:
                     any_failed = True
@@ -272,13 +274,7 @@ def main() -> None:
                     raw_res = get_buildkite_metadata(
                         f"{tpu_metadata_prefix}{feature}:{stage}", default="❓ Untested"
                     )
-                    soft_failed = (
-                        get_buildkite_metadata(
-                            f"{tpu_metadata_prefix}{feature}:{stage}:soft_failed",
-                            default="false",
-                        )
-                        == "true"
-                    )
+                    soft_failed = is_soft_failed(tpu_metadata_prefix, feature, stage)
                     formatted_res = format_status(raw_res)
                     row[stage] = formatted_res
                     if formatted_res not in valid_feature_outcomes and not soft_failed:

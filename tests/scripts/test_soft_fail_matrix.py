@@ -74,7 +74,12 @@ else:
 class TestSoftFailSupportMatrix(unittest.TestCase):
     """Verify soft_fail steps record failing cells without failing the build."""
 
-    def _make_fake_agent(self, tmpdir: str, outcomes: dict[str, str]) -> pathlib.Path:
+    def _make_fake_agent(
+        self,
+        tmpdir: str,
+        outcomes: dict[str, str],
+        meta: dict[str, str] | None = None,
+    ) -> pathlib.Path:
         bin_dir = pathlib.Path(tmpdir) / "bin"
         bin_dir.mkdir(parents=True, exist_ok=True)
         agent_path = bin_dir / "buildkite-agent"
@@ -82,7 +87,8 @@ class TestSoftFailSupportMatrix(unittest.TestCase):
         agent_path.chmod(agent_path.stat().st_mode | stat.S_IXUSR)
         state_path = pathlib.Path(tmpdir) / "bk_state.json"
         state_path.write_text(
-            json.dumps({"meta": {}, "outcomes": outcomes}), encoding="utf-8"
+            json.dumps({"meta": dict(meta or {}), "outcomes": outcomes}),
+            encoding="utf-8",
         )
         return state_path
 
@@ -119,7 +125,9 @@ class TestSoftFailSupportMatrix(unittest.TestCase):
 
     def test_record_step_result_hard_failed_exits_nonzero(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            state_path = self._make_fake_agent(tmp, {"tpu7x_Qwen_Accuracy": "failed"})
+            state_path = self._make_fake_agent(
+                tmp, {"tpu7x_Qwen_Accuracy": "hard_failed"}
+            )
             env = {
                 **os.environ,
                 "PATH": f"{tmp}/bin:{os.environ.get('PATH', '')}",
@@ -144,6 +152,42 @@ class TestSoftFailSupportMatrix(unittest.TestCase):
             self.assertEqual(
                 meta["v7Qwen/Qwen3.5-397B-A17B:Accuracy/Correctness:soft_failed"],
                 "false",
+            )
+
+    def test_record_step_result_custom_status_with_soft_failed_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = self._make_fake_agent(
+                tmp,
+                {"tpu7x_Qwen_Benchmark": "soft_failed"},
+                meta={"tpu7x_Qwen_Benchmark": "tput_below_threshold"},
+            )
+            env = {
+                **os.environ,
+                "PATH": f"{tmp}/bin:{os.environ.get('PATH', '')}",
+                "FAKE_BK_STATE": str(state_path),
+                "CI_TPU_VERSION": "tpu7x",
+                "CI_TARGET": "Qwen/Qwen3.5-397B-A17B",
+                "CI_STAGE": "Benchmark",
+                "CI_CATEGORY": "text-only",
+            }
+            proc = subprocess.run(
+                ["sh", str(_RECORD_SCRIPT), "tpu7x_Qwen_Benchmark"],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr + proc.stdout)
+            self.assertIn(
+                "Step tpu7x_Qwen_Benchmark outcome: tput_below_threshold "
+                "(soft_failed=true)",
+                proc.stdout,
+            )
+            meta = json.loads(state_path.read_text(encoding="utf-8"))["meta"]
+            self.assertEqual(meta["v7Qwen/Qwen3.5-397B-A17B:Benchmark"], "❌ Failing")
+            self.assertEqual(
+                meta["v7Qwen/Qwen3.5-397B-A17B:Benchmark:soft_failed"],
+                "true",
             )
 
     def test_generate_support_matrices_soft_fail_vs_hard_fail(self) -> None:
@@ -205,6 +249,65 @@ class TestSoftFailSupportMatrix(unittest.TestCase):
             meta_store["v7Qwen/Qwen3.5-397B-A17B:Accuracy/Correctness:soft_failed"] = (
                 "false"
             )
+            os.chdir(tmp)
+            try:
+                generate_support_matrices.main()
+            finally:
+                os.chdir(old_cwd)
+            self.assertEqual(meta_store["v7_CI_TESTS_FAILED"], "true")
+
+    def test_generate_support_matrices_feature_soft_fail_vs_hard_fail(self) -> None:
+        meta_store = {
+            "feature-list": "Speculative decoding",
+            "v7Speculative decoding_category": "feature support matrix",
+            "v7Speculative decoding:CorrectnessTest": "❌ Failing",
+            "v7Speculative decoding:CorrectnessTest:soft_failed": "true",
+            "v7Speculative decoding:PerformanceTest": "✅ Passing",
+        }
+        captured_csv: list[dict[str, str]] = []
+
+        def fake_get(key: str, default: str = "") -> str:
+            return meta_store.get(key, default)
+
+        def fake_set(key: str, value: str) -> None:
+            meta_store[key] = value
+
+        def fake_upload(file_path: str) -> None:
+            if file_path.endswith("feature_support_matrix.csv"):
+                with open(file_path, encoding="utf-8") as f:
+                    captured_csv.extend(csv.DictReader(f))
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.dict(os.environ, {"TPU_VERSION": "v7x"}, clear=False),
+            mock.patch.object(
+                generate_support_matrices,
+                "get_buildkite_metadata",
+                side_effect=fake_get,
+            ),
+            mock.patch.object(
+                generate_support_matrices,
+                "set_buildkite_metadata",
+                side_effect=fake_set,
+            ),
+            mock.patch.object(
+                generate_support_matrices,
+                "upload_buildkite_artifact",
+                side_effect=fake_upload,
+            ),
+        ):
+            old_cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                generate_support_matrices.main()
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(meta_store["v7_CI_TESTS_FAILED"], "false")
+            self.assertEqual(len(captured_csv), 1)
+            self.assertEqual(captured_csv[0]["CorrectnessTest"], "❌ Failing")
+
+            meta_store["v7Speculative decoding:CorrectnessTest:soft_failed"] = "false"
             os.chdir(tmp)
             try:
                 generate_support_matrices.main()
