@@ -771,7 +771,9 @@ class Qwen38SegmentDriver:
 
         stack = contextlib.ExitStack()
         stack.enter_context(set_model_tag(tag))
-        cfg = (getattr(self, "whole_cfg", None) if tag == "model_mk_whole" else None) or (
+        # Both whole-step programs (served and `wholecheck` shadow) compile only the whole buckets.
+        whole_tag = tag in ("model_mk_whole", "model_mk_whole_shadow")
+        cfg = (getattr(self, "whole_cfg", None) if whole_tag else None) or (
             getattr(self, "cfg", None) or runner.vllm_config
         )
         stack.enter_context(set_vllm_model_wrapper_context(mesh=runner.mesh, vllm_config=cfg))
