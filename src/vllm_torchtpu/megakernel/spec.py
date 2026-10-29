@@ -22,6 +22,7 @@ tunables) lives in `exec_spec`.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -179,6 +180,50 @@ class ModelSpec:
     # Optional cache backend (layout + gather / scatter callbacks); None for
     # models without a page-based cache.
     cache_backend: Any = None
+
+    def __post_init__(self) -> None:
+        layout = getattr(self.cache_backend, "layout", None)
+        if layout is None:
+            return
+        cloned: dict[int, Module] = {}
+        changed = False
+
+        def _bind_mod(m: Module) -> Module:
+            nonlocal changed
+            bind = getattr(m, "with_cache_layout", None)
+            if bind is None:
+                return m
+            if id(m) not in cloned:
+                m_new = bind(layout)
+                if m_new is not m:
+                    changed = True
+                cloned[id(m)] = m_new
+            return cloned[id(m)]
+
+        new_slots = tuple(
+            SwitchSlot(
+                name=s.name,
+                branches=tuple(_bind_mod(b) for b in s.branches),
+                branch_counts=s.branch_counts,
+            )
+            if isinstance(s, SwitchSlot)
+            else _bind_mod(s)
+            for s in self.layer_type.slots
+        )
+        if changed:
+            object.__setattr__(
+                self,
+                "layer_type",
+                LayerType(name=self.layer_type.name, slots=new_slots),
+            )
+
+    def with_layout(self, layout: Any) -> ModelSpec:
+        """Return a copy of this `ModelSpec` with `cache_backend` bound to `layout`."""
+        if self.cache_backend is None:
+            raise ValueError(f"ModelSpec {self.name!r} has no cache_backend")
+        return dataclasses.replace(
+            self, cache_backend=self.cache_backend.with_layout(layout)
+        )
 
     def all_modules(self) -> list[Module]:
         """Return unique active modules in deterministic declaration order."""

@@ -539,3 +539,30 @@ def test_f32_conv_non_interpret_lowers_cleanly(T: int, fused: bool, gpr: bool):
     jaxpr_str = str(jaxpr)
     assert "decode_megakernel" in jaxpr_str
     assert "gather_gdn_states" not in jaxpr_str
+
+
+def test_model_spec_with_layout_clones_gdn_module_without_mutating_shared_pool_layout():
+    """Replacing `cache_backend` with a new `PoolLayout` (or calling
+    `ModelSpec.with_layout`) clones `GDNModule` instances so building a bf16
+    step after an f32 step never mutates the f32 spec's `GDNModule.pool_layout`.
+    """
+    mesh = _cpu_mesh(2)
+    g = _tiny_geom()
+    ex = mk.with_cache(_tiny_exec(R=2, B=4, T=2), pool_gather=True)
+    spec_bf16 = qwen35.qwen35_spec(g)
+    spec_f32, f32_lay = _with_conv_dtype(spec_bf16, jnp.float32)
+
+    gdn_bf16 = next(m for m in spec_bf16.all_modules() if m.name == "gdn")
+    gdn_f32 = next(m for m in spec_f32.all_modules() if m.name == "gdn")
+    assert gdn_bf16 is not gdn_f32
+    assert gdn_bf16.pool_layout is spec_bf16.cache_backend.layout
+    assert gdn_f32.pool_layout is f32_lay
+    assert jnp.dtype(gdn_bf16.conv_dtype(g)) == jnp.dtype(jnp.bfloat16)
+    assert jnp.dtype(gdn_f32.conv_dtype(g)) == jnp.dtype(jnp.float32)
+
+    # Building a bf16 step after an f32 step must leave `gdn_f32.pool_layout` intact.
+    mk.PallasWriter().make_step(mesh, spec_f32, ex)
+    mk.PallasWriter().make_step(mesh, spec_bf16, ex)
+    assert gdn_f32.pool_layout is f32_lay
+    assert jnp.dtype(gdn_f32.conv_dtype(g)) == jnp.dtype(jnp.float32)
+    assert jnp.dtype(gdn_bf16.conv_dtype(g)) == jnp.dtype(jnp.bfloat16)

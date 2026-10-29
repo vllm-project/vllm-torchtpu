@@ -58,10 +58,6 @@ def make_flat_pooled_step(
     """
     ms = resolve_model_spec(model_spec)
     pb = require_pool_backend(ms)
-    if pb.layout is not None:
-        for m in ms.all_modules():
-            if getattr(m, "name", None) == "gdn" and hasattr(m, "pool_layout"):
-                m.pool_layout = pb.layout
     pb.layout.validate(ex)
     use_fused = should_fuse_pool_io(
         ms,
