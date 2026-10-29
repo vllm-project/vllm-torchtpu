@@ -598,6 +598,9 @@ class Qwen38SegmentDriver:
         # `wholefault=1`: positive control; each checked step also runs the shadow on the step's
         # token ids rolled by one row (a row-misaligned embedding / PLE input) and logs its diff.
         self.whole_fault = False
+        # `wholecheckrows=16:24`: check (and compile the shadow programs for) only these
+        # buckets; default every whole-step bucket.
+        self.wholecheck_rows: frozenset[int] = frozenset()
 
     @classmethod
     def maybe_create(cls, runner: Any) -> Qwen38SegmentDriver | None:
@@ -673,6 +676,9 @@ class Qwen38SegmentDriver:
         drv.whole_dry = _parse_flag(raw, "wholedry", False)
         drv.wholecheck_left = _parse_int(raw, "wholecheck") or 0
         drv.whole_fault = _parse_flag(raw, "wholefault", False)
+        for part in raw.split(","):
+            if part.startswith("wholecheckrows="):
+                drv.wholecheck_rows = frozenset(int(x) for x in part[len("wholecheckrows=") :].split(":"))
         cap = _parse_int(raw, "wholecap")
         if cap is not None:
             drv.whole_cap = cap
@@ -772,8 +778,11 @@ class Qwen38SegmentDriver:
         stack = contextlib.ExitStack()
         stack.enter_context(set_model_tag(tag))
         # Both whole-step programs (served and `wholecheck` shadow) compile only the whole buckets.
-        whole_tag = tag in ("model_mk_whole", "model_mk_whole_shadow", "model_mk_segcut_shadow")
-        cfg = (getattr(self, "whole_cfg", None) if whole_tag else None) or (
+        if tag in ("model_mk_whole_shadow", "model_mk_segcut_shadow"):
+            cfg = getattr(self, "check_cfg", None) or getattr(self, "whole_cfg", None)
+        else:
+            cfg = getattr(self, "whole_cfg", None) if tag == "model_mk_whole" else None
+        cfg = cfg or (
             getattr(self, "cfg", None) or runner.vllm_config
         )
         stack.enter_context(set_vllm_model_wrapper_context(mesh=runner.mesh, vllm_config=cfg))
@@ -1303,14 +1312,24 @@ class Qwen38SegmentDriver:
             Qwen4ExpWholeStepShadowModel,
         )
 
-        def write_free_segments(stop_before_last: bool) -> Any:
-            seg = Qwen38Segments(
-                runner.model, self.g, self.mesh, self.buckets, shared=self.segments,
-                head=bool(self.segments.head_groups),
-            )
-            seg.bind_pool()
-            seg.stop_before_last = stop_before_last
-            return seg
+        # One write-free segments instance for both programs: each instance registers its
+        # kernels as custom ops named by tag, and two instances re-register the same names
+        # (j-3628e449: TP2 failed with no schema for qwen38_mk::seg_l1_shadow, the other ranks
+        # waited PEER_WAIT_S = 3600 s for its artifact). `stop_before_last` only stops
+        # `forward_segments`; the whole-step forward does not read it.
+        seg = Qwen38Segments(
+            runner.model, self.g, self.mesh, self.buckets, shared=self.segments,
+            head=bool(self.segments.head_groups),
+        )
+        seg.bind_pool()
+        seg.stop_before_last = True
+        # Compile the shadow programs only for the checked buckets.
+        rows = sorted(self.wholecheck_rows) or list(self.whole_cfg.compilation_config.compile_sizes)
+        self.wholecheck_rows = frozenset(rows)
+        self.check_cfg = copy.copy(self.whole_cfg)
+        cc = copy.copy(self.whole_cfg.compilation_config)
+        cc.compile_sizes = rows
+        object.__setattr__(self.check_cfg, "compilation_config", cc)
 
         sw = copy.copy(whole)
         sw.write, sw.tag = False, "whole_shadow"
@@ -1320,10 +1339,10 @@ class Qwen38SegmentDriver:
         # steps ran the shadow's write-free graph).
         with self._contexts(runner, "model_mk_whole_shadow"):
             self.whole_shadow = Qwen4ExpWholeStepShadowModel(
-                vllm_config=self.whole_cfg,
+                vllm_config=self.check_cfg,
                 prefix="model_mk_whole_shadow",
                 backbone=runner.model.model,
-                segments=write_free_segments(False),
+                segments=seg,
                 whole=sw,
             )
         # Cut reference: the segment program over the same layers 3..46, stopped before the
@@ -1331,12 +1350,15 @@ class Qwen38SegmentDriver:
         # at the same point, so a double cache write in L47 cannot enter the comparison).
         with self._contexts(runner, "model_mk_segcut_shadow"):
             self.whole_cut_ref = Qwen4ExpSegmentCutModel(
-                vllm_config=self.whole_cfg,
+                vllm_config=self.check_cfg,
                 prefix="model_mk_segcut_shadow",
                 backbone=runner.model.model,
-                segments=write_free_segments(True),
+                segments=seg,
             )
-        logger.info("Qwen3.8 whole-step shadow check attached: %d steps", self.wholecheck_left)
+        logger.info(
+            "Qwen3.8 whole-step shadow check attached: %d steps, buckets %s",
+            self.wholecheck_left, sorted(self.wholecheck_rows),
+        )
 
     def _whole_shadow_step(self, runner: Any, input_ids: Any, positions: Any, kw: dict,
                            rows: int, real: bool, n_req: int = 0) -> Any:
@@ -1710,6 +1732,7 @@ class Qwen38SegmentDriver:
             elif (
                 self.wholecheck_left > 0
                 and self.whole_shadow is not None
+                and rows in self.wholecheck_rows
                 and self._whole_eligible(runner, n_req, rows)
                 and (
                     rows not in self.wholecheck_warm
