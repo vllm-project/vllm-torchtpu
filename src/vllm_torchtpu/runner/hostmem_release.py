@@ -80,20 +80,29 @@ def _census() -> tuple[str, list[Any]]:
     # bytes are not GC-tracked: reach them through their tracked holders.
     seen: set[int] = set()
     big_n = big_bytes = 0
+    big_str_n = big_str = 0
     # Untracked containers (a dict of only bytes, say) are scanned one level down.
     untracked = []
     for batch in (objs, untracked):
         for i in range(0, len(batch), 4096):
             for r in gc.get_referents(*batch[i : i + 4096]):
-                if isinstance(r, (bytes, bytearray, memoryview)):
-                    n = r.nbytes if isinstance(r, memoryview) else len(r)
-                    if n >= _BIG and id(r) not in seen:
-                        seen.add(id(r))
-                        big_n += 1
-                        big_bytes += n
-                elif batch is objs and isinstance(r, (dict, tuple, list)):
-                    if not gc.is_tracked(r):
-                        untracked.append(r)
+                # A dead weakref.proxy raises ReferenceError on isinstance().
+                try:
+                    if isinstance(r, (bytes, bytearray, memoryview, str)):
+                        n = r.nbytes if isinstance(r, memoryview) else len(r)
+                        if n >= _BIG and id(r) not in seen:
+                            seen.add(id(r))
+                            if isinstance(r, str):
+                                big_str_n += 1
+                                big_str += n
+                            else:
+                                big_n += 1
+                                big_bytes += n
+                    elif batch is objs and isinstance(r, (dict, tuple, list)):
+                        if not gc.is_tracked(r):
+                            untracked.append(r)
+                except ReferenceError:
+                    continue
     exe_size = ""
     if executables:
         try:
@@ -109,7 +118,8 @@ def _census() -> tuple[str, list[Any]]:
         _log_detail(objs)
     summary = (
         f"objects={len(objs)} {types} serialize_attrs={len(runnables)} "
-        f"bytes>=1M: n={big_n} total={big_bytes >> 20}M{exe_size}"
+        f"bytes>=1M: n={big_n} total={big_bytes >> 20}M "
+        f"str>=1M: n={big_str_n} total={big_str >> 20}M{exe_size}"
     )
     del objs, executables
     return summary, runnables
@@ -177,10 +187,20 @@ def _release_heap() -> None:
 
 
 def report_and_maybe_drop() -> None:
-    """Called at the end of compile_or_warm_up_model, before the GC freeze."""
+    """Called at the end of compile_or_warm_up_model, before the GC freeze.
+
+    Diagnostic only: a failure is logged and never takes the worker down.
+    """
     mode = envs.VLLM_TPU_POST_WARMUP_HOSTMEM
     if mode not in ("report", "drop"):
         return
+    try:
+        _report_and_maybe_drop(mode)
+    except Exception:
+        logger.exception("[hostmem] report failed; continuing")
+
+
+def _report_and_maybe_drop(mode: str) -> None:
     start = time.perf_counter()
     before = _status()
     summary, runnables = _census()
