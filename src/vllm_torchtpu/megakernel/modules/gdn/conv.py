@@ -96,21 +96,42 @@ def conv_step(ctx: Any, gp: GDNParams, o: Any, slot: Any, ybuf: Any) -> Any:
 
                     @pl.when(has_gpr_input(ctx, gp, o, s_))
                     def _(s_=s_):
-                        gpr_conv_copy(ctx, gp, raw_refs[0], s_, 0, sem.at[0]).wait()
+                        cp = gpr_conv_copy(ctx, gp, raw_refs[0], s_, 0, sem.at[0])
+                        if isinstance(cp, tuple):
+                            for c in cp:
+                                c.wait()
+                        else:
+                            cp.wait()
 
                 for s_ in range(NS):
-                    if ex.interpret:
-                        raw_hr = pltpu.bitcast(scr["gpr_conv"][s_], BF16).reshape(
-                            2 * gp.GCONV_ROWS, 128
-                        )
+                    if gp.conv_is_f32:
+                        if ex.interpret:
+                            raw_hr = pltpu.bitcast(scr["gpr_conv"][s_], F32).reshape(
+                                gp.GCONV_ROWS, 128
+                            )
+                        else:
+                            raw_hr = (
+                                scr["gpr_conv"]
+                                .at[s_]
+                                .bitcast(F32)
+                                .reshape(gp.GCONV_ROWS, 128)
+                            )
+                        raw_hr = raw_hr[:hr_rows_128, :].reshape(gp.HR, QKV)
                     else:
+                        if ex.interpret:
+                            raw_hr = pltpu.bitcast(scr["gpr_conv"][s_], BF16).reshape(
+                                2 * gp.GCONV_ROWS, 128
+                            )
+                        else:
+                            raw_hr = (
+                                scr["gpr_conv"]
+                                .at[s_]
+                                .bitcast(BF16)
+                                .reshape(2 * gp.GCONV_ROWS, 128)
+                            )
                         raw_hr = (
-                            scr["gpr_conv"]
-                            .at[s_]
-                            .bitcast(BF16)
-                            .reshape(2 * gp.GCONV_ROWS, 128)
+                            raw_hr[:hr_rows_128, :].reshape(gp.HR, QKV).astype(F32)
                         )
-                    raw_hr = raw_hr[:hr_rows_128, :].reshape(gp.HR, QKV).astype(F32)
                     keep = jnp.logical_and(
                         has_gpr_input(ctx, gp, o, s_), conv_row_iota < 3
                     )
@@ -150,7 +171,7 @@ def conv_step(ctx: Any, gp: GDNParams, o: Any, slot: Any, ybuf: Any) -> Any:
             convb[0:B, :] = s1
             convb[B : 2 * B, :] = s2
             convb[2 * B : 3 * B, :] = x
-        if GPR:
+        if GPR and not gp.conv_is_f32:
             scr["convb16"][...] = convb[...].astype(BF16)
         if "gdn_state" not in skip:
             pltpu.make_async_copy(

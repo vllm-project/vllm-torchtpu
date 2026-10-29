@@ -181,8 +181,22 @@ def gpr_wait(
 
 
 def gpr_conv_copy(ctx: Any, gp: GDNParams, r: Any, sq: int, pb: Any, sem: Any) -> Any:
-    return pltpu.make_async_copy(
-        r.at[pb, 0, pl.ds(0, gp.GCONV_ROWS)], ctx.scr["gpr_conv"].at[sq], sem
+    if gp.GCONV_ROWS <= 64:
+        return pltpu.make_async_copy(
+            r.at[pb, 0, pl.ds(0, gp.GCONV_ROWS)], ctx.scr["gpr_conv"].at[sq], sem
+        )
+    tail = gp.GCONV_ROWS - 64
+    return (
+        pltpu.make_async_copy(
+            r.at[pb, 0, pl.ds(0, 64)],
+            ctx.scr["gpr_conv"].at[sq, pl.ds(0, 64)],
+            sem,
+        ),
+        pltpu.make_async_copy(
+            r.at[pb, 1, pl.ds(0, tail)],
+            ctx.scr["gpr_conv"].at[sq, pl.ds(64, tail)],
+            sem,
+        ),
     )
 
 
@@ -196,20 +210,25 @@ def gpr_conv_start(ctx: Any, gp: GDNParams, o: Any) -> None:
 
             @pl.when(has_gpr_input(ctx, gp, o, sq))
             def _(sq=sq):
-                gpr_conv_copy(
+                cp = gpr_conv_copy(
                     ctx,
                     gp,
                     r,
                     sq,
                     gdn_pb_in(ctx, gp, sub, sq) + gp.pool_layout.conv_page,
                     ctx.scr["st_sem"].at[0],
-                ).start()
+                )
+                if isinstance(cp, tuple):
+                    for c in cp:
+                        c.start()
+                else:
+                    cp.start()
 
     bswitch(g_pool, [lambda r=r: issue(r) for r in raw_refs])
 
 
 def conv_out_src(ctx: Any, gp: GDNParams) -> Any:
-    return ctx.scr["convb16"] if gp.GPR else ctx.scr["convb"]
+    return ctx.scr["convb16"] if (gp.GPR and not gp.conv_is_f32) else ctx.scr["convb"]
 
 
 class _GprRecIn:

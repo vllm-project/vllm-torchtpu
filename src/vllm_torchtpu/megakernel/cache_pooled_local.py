@@ -30,7 +30,7 @@ from .cache_common import (
     validate_page_table_shape,
 )
 from .pool import check_ckpt_bounds
-from .pool.config import cache_exec
+from .pool.config import cache_exec, with_cache
 
 if TYPE_CHECKING:
     from .cache_pooled import PooledBuild
@@ -129,8 +129,13 @@ def run_local(
         if use_fused:
             raw_out = tuple(out_map_f[pool_key]) if pool_key in out_map_f else raw_in
         else:
+            ex_scatter = (
+                with_cache(ex_paged, pool_gather=False, fused_pool_io=False)
+                if pb.layout.conv_itemsize == 4
+                else ex_paged
+            )
             raw_out = pb.scatter_states(
-                ex_paged,
+                ex_scatter,
                 raw_in,
                 pos,
                 page_table,

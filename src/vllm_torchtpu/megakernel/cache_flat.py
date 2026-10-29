@@ -58,7 +58,11 @@ def make_flat_pooled_step(
     """
     ms = resolve_model_spec(model_spec)
     pb = require_pool_backend(ms)
-    pb.layout.validate(ex)
+    pb.layout.validate(
+        with_cache(ex, pool_gather=False, fused_pool_io=False)
+        if pb.layout.conv_itemsize == 4
+        else ex
+    )
     use_fused = should_fuse_pool_io(
         ms,
         ex,
@@ -74,7 +78,8 @@ def make_flat_pooled_step(
         fused_pool_io=use_fused,
         pool_gather=use_gpr,
     )
-    pb.layout.validate(ex_paged)
+    if pb.layout.conv_itemsize != 4:
+        pb.layout.validate(ex_paged)
     _build_cache: dict[tuple[str, bool, int, bool], tuple[Any, dict[str, Any]]] = {}
 
     def _get_compiled(
@@ -204,8 +209,13 @@ def make_flat_pooled_step(
                     else tuple(raw_pools)
                 )
                 return (hid, *raw_out)
+            ex_scatter = (
+                with_cache(ex_paged, pool_gather=False, fused_pool_io=False)
+                if pb.layout.conv_itemsize == 4
+                else ex_paged
+            )
             raw_out = pb.scatter_states(
-                ex_paged,
+                ex_scatter,
                 raw_pools,
                 pos,
                 page_table,

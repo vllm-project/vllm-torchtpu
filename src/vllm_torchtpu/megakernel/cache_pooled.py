@@ -100,7 +100,11 @@ def make_pooled_step(
     """
     ms = resolve_model_spec(model_spec)
     pb = require_pool_backend(ms)
-    pb.layout.validate(ex)
+    pb.layout.validate(
+        with_cache(ex, pool_gather=False, fused_pool_io=False)
+        if pb.layout.conv_itemsize == 4
+        else ex
+    )
     use_fused = should_fuse_pool_io(
         ms,
         ex,
@@ -116,7 +120,8 @@ def make_pooled_step(
         fused_pool_io=use_fused,
         pool_gather=use_gpr,
     )
-    pb.layout.validate(ex_paged)
+    if pb.layout.conv_itemsize != 4:
+        pb.layout.validate(ex_paged)
     # Module extra inputs (`Module.extra_inputs`) follow the pool arguments.
     extras = extra_inputs(ms, ex_paged)
     n_extra = len(extras)

@@ -583,6 +583,7 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
     layout = gp.pool_layout
     page = layout.kv_page_shape
     CPR = layout.conv_page_rows
+    conv_is_f32 = bool(gp.conv_is_f32)
 
     in_page = scr["gdn_in_page"]
     out_page = scr["gdn_out_page"]
@@ -768,7 +769,7 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
         gnw = ctx.sm(slot, "gnorm")[0, :].astype(BF16)
         expand = vh // kh
         row_iota_conv = lax.broadcasted_iota(I32, (A_conv, QKV), 0)
-        conv_live = rup(3 * qkv_128, 16)
+        conv_live = rup(3 * qkv_128, 8) if conv_is_f32 else rup(3 * qkv_128, 16)
         conv_fast = (
             gp.conv_stage
             and QKV % 128 == 0
@@ -802,25 +803,40 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
                 ).reshape(SSM_U32_CAP, 128)
                 u32_in = jnp.where(act_in, raw_ssm_u32[:ssm_u32_rows, :], jnp.uint32(0))
                 s_bf16 = pltpu.bitcast(u32_in, BF16).reshape(vh, KD, VD)
-                raw_conv = (
-                    pltpu.bitcast(in_page[slot_i, REC_PAGES], BF16)
-                    .reshape(CPR, LANES)[:conv8_rows, :]
-                    .reshape(A_conv, QKV)
-                    .astype(F32)
-                )
+                if conv_is_f32:
+                    raw_conv = (
+                        pltpu.bitcast(in_page[slot_i, REC_PAGES], F32)
+                        .reshape(CPR, LANES)[:conv8_rows, :]
+                        .reshape(A_conv, QKV)
+                    )
+                else:
+                    raw_conv = (
+                        pltpu.bitcast(in_page[slot_i, REC_PAGES], BF16)
+                        .reshape(CPR, LANES)[:conv8_rows, :]
+                        .reshape(A_conv, QKV)
+                        .astype(F32)
+                    )
             else:
                 in_view = (
                     in_page.at[slot_i, pl.ds(0, REC_PAGES)]
                     .bitcast(U32)
                     .reshape(SSM_U32_CAP, 128)
                 )
-                raw_conv = (
-                    in_page.at[slot_i, REC_PAGES]
-                    .bitcast(BF16)
-                    .reshape(CPR, LANES)[:conv8_rows, :]
-                    .reshape(A_conv, QKV)
-                    .astype(F32)
-                )
+                if conv_is_f32:
+                    raw_conv = (
+                        in_page.at[slot_i, REC_PAGES]
+                        .bitcast(F32)
+                        .reshape(CPR, LANES)[:conv8_rows, :]
+                        .reshape(A_conv, QKV)
+                    )
+                else:
+                    raw_conv = (
+                        in_page.at[slot_i, REC_PAGES]
+                        .bitcast(BF16)
+                        .reshape(CPR, LANES)[:conv8_rows, :]
+                        .reshape(A_conv, QKV)
+                        .astype(F32)
+                    )
             raw_conv = jnp.where(act_in, raw_conv, 0.0)
             c0 = raw_conv[0:1, :]
             c1 = raw_conv[1:2, :]
@@ -924,20 +940,23 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
                         scr["mix"][b, :Z] = rnd(val * g_act(zz)).reshape(Z)
 
                         if interpret:
-                            u32_out = pltpu.bitcast(s_bf16.reshape(vh * KD, VD), U32)
-                            u32_p = (
+                            bf16_pairs = s_bf16.reshape(ssm_u32_rows, 2, VD).swapaxes(
+                                1, 2
+                            )
+                            bf16_p = (
                                 jnp.pad(
-                                    u32_out,
-                                    ((0, SSM_U32_CAP - ssm_u32_rows), (0, 0)),
+                                    bf16_pairs,
+                                    ((0, SSM_U32_CAP - ssm_u32_rows), (0, 0), (0, 0)),
                                 )
                                 if ssm_u32_rows < SSM_U32_CAP
-                                else u32_out
+                                else bf16_pairs
                             )
                             out_page[
                                 slot_o,
                                 pl.ds(t * GDN_PAGES, REC_PAGES),
                             ] = (
-                                lax.bitcast_convert_type(u32_p, FP8)
+                                lax.bitcast_convert_type(bf16_p, FP8)
+                                .reshape(SSM_U32_CAP, VD, 4)
                                 .swapaxes(1, 2)
                                 .reshape(REC_PAGES, *page)
                             )
@@ -953,7 +972,11 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
                                     cst[3 * qkv_128 : conv_live, :] = jnp.zeros(
                                         (conv_live - 3 * qkv_128, 128), F32
                                     )
-                                conv_taps = cst[0:conv_live, :].astype(BF16)
+                                conv_taps = (
+                                    cst[0:conv_live, :]
+                                    if conv_is_f32
+                                    else cst[0:conv_live, :].astype(BF16)
+                                )
                                 conv_p = (
                                     jnp.pad(
                                         conv_taps,
@@ -966,19 +989,18 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
                                 c0_f = jnp.broadcast_to(c0, (A_conv, QKV))
                                 c1_f = jnp.broadcast_to(c1, (A_conv, QKV))
                                 c2_f = jnp.broadcast_to(c2, (A_conv, QKV))
-                                w_conv = (
+                                w_conv = jnp.where(
+                                    row_iota_conv == 0,
+                                    c0_f,
                                     jnp.where(
-                                        row_iota_conv == 0,
-                                        c0_f,
-                                        jnp.where(
-                                            row_iota_conv == 1,
-                                            c1_f,
-                                            jnp.where(row_iota_conv == 2, c2_f, 0.0),
-                                        ),
-                                    )
-                                    .astype(BF16)
-                                    .reshape(conv8_rows, 128)
+                                        row_iota_conv == 1,
+                                        c1_f,
+                                        jnp.where(row_iota_conv == 2, c2_f, 0.0),
+                                    ),
                                 )
+                                if not conv_is_f32:
+                                    w_conv = w_conv.astype(BF16)
+                                w_conv = w_conv.reshape(conv8_rows, 128)
                                 conv_p = (
                                     jnp.pad(
                                         w_conv,
@@ -987,10 +1009,14 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
                                     if conv8_rows < CPR
                                     else w_conv
                                 )
+                            conv_isz = 4 if conv_is_f32 else 2
                             out_page[slot_o, t * GDN_PAGES + REC_PAGES] = (
                                 lax.bitcast_convert_type(
                                     conv_p.reshape(
-                                        page[0], page[1], page[2] // 2, page[3]
+                                        page[0],
+                                        page[1],
+                                        page[2] // conv_isz,
+                                        page[3],
                                     ),
                                     FP8,
                                 )
@@ -1012,7 +1038,11 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
                                     cst[3 * qkv_128 : conv_live, :] = jnp.zeros(
                                         (conv_live - 3 * qkv_128, 128), F32
                                     )
-                                conv_head = cst[0:conv_live, :].astype(BF16)
+                                conv_head = (
+                                    cst[0:conv_live, :]
+                                    if conv_is_f32
+                                    else cst[0:conv_live, :].astype(BF16)
+                                )
                             else:
                                 c0_f = jnp.broadcast_to(c0, (A_conv, QKV))
                                 c1_f = jnp.broadcast_to(c1, (A_conv, QKV))
@@ -1025,10 +1055,12 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
                                         c1_f,
                                         jnp.where(row_iota_conv == 2, c2_f, 0.0),
                                     ),
-                                ).astype(BF16)
+                                )
+                                if not conv_is_f32:
+                                    w_conv = w_conv.astype(BF16)
                             cv = (
                                 out_page.at[slot_o, t * GDN_PAGES + REC_PAGES]
-                                .bitcast(BF16)
+                                .bitcast(F32 if conv_is_f32 else BF16)
                                 .reshape(CPR, LANES)
                             )
                             if conv_fast:

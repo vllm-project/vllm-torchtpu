@@ -20,6 +20,7 @@ from collections.abc import Mapping
 from typing import Any, ClassVar
 
 import jax
+import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 from ...decls import (
@@ -246,11 +247,12 @@ class GDNModule(Module):
         lay = self.lin_in_layout(g, ex)
         taps = self.cache_decl(g).conv_taps
         if ex.VER:
+            conv_is_f32 = jnp.dtype(self.cache_decl(g).conv_dtype) == jnp.dtype(F32)
             return [
                 StateDecl(
                     "conv_ckpt",
                     shape=(ex.NS, rup(taps + ex.T, 8), lay.QKV),
-                    dtype=BF16 if cache_exec(ex).GPR else F32,
+                    dtype=BF16 if (cache_exec(ex).GPR and not conv_is_f32) else F32,
                     access="w",
                 ),
                 StateDecl(
@@ -340,7 +342,8 @@ class GDNModule(Module):
                 scr["gpr_conv"] = pltpu.VMEM(
                     (ex.NS, gp.GCONV_ROWS, *gp.pool_layout.kv_page_shape[2:]), FP8
                 )
-                scr["convb16"] = pltpu.VMEM((ex.NS, gp.HR, gp.QKV), BF16)
+                if not gp.conv_is_f32:
+                    scr["convb16"] = pltpu.VMEM((ex.NS, gp.HR, gp.QKV), BF16)
         return scr
 
     def init_buffers(self, ctx: Any) -> None:
