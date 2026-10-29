@@ -11,10 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Standalone analytical TPU serving roofline and step floor package."""
+"""Analytical TPU serving roofline, step floor, and megakernel plan adapter."""
 
 from __future__ import annotations
 
+from .adapter import (
+    PlanReconciliation,
+    floor_for_profile,
+    floor_from_plan,
+    reconcile_plan_vs_standalone,
+)
 from .chips import CHIPS, TOPOLOGIES, ChipSpec, SliceTopology
 from .collectives import (
     Collective,
@@ -47,16 +53,20 @@ __all__ = [
     "ModelGeometry",
     "ModuleCost",
     "Parallel",
+    "PlanReconciliation",
     "SliceTopology",
     "StepFloor",
     "StepShape",
     "dtypes_from_hf_config",
     "ep_busiest_experts",
     "experts_touched",
+    "floor_for_profile",
+    "floor_from_plan",
     "from_hf_config",
     "load_hf_config",
     "pass_costs",
     "plan",
+    "reconcile_plan_vs_standalone",
     "spec_cycle_floor",
     "step_floor",
     "collective_ici_hops",
