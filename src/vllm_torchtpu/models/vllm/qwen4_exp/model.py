@@ -322,6 +322,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         ple_raw_embeddings=None,
         sequence_parallel=False,
         sp_pad=0,
+        shared_local=False,
     ):
         """``sequence_parallel``: ``hidden`` and the result are this TP rank's
         token shard; the token-indexed inputs still cover the whole step.
@@ -377,7 +378,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
             block = sp.unpad(block, rows)
         block = torch.where(valid_tokens[:, None], block, 0)
         if sequence_parallel:
-            moe = self._sequence_parallel_moe(block, num_tokens)
+            moe = self._sequence_parallel_moe(block, num_tokens, shared_local)
         else:
             moe = self.mlp(block)
         return self.mlp_hyper_connection.combine(sp.pad_shard(moe, sp_pad), residual)
@@ -426,7 +427,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         )
         return hidden + sp.pad_shard(addend, sp_pad)
 
-    def _sequence_parallel_moe(self, block, num_tokens):
+    def _sequence_parallel_moe(self, block, num_tokens, shared_local=False):
         """The MoE block's output at this rank's rows of a sharded step.
 
         With a token-sharded adaptive EP op (QWEN4_EXP_PREFILL_SP_MOE=1) the
@@ -464,7 +465,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
             router_logits,
             attr="_adaptive_fused_moe_op_sp",
         )
-        local = getattr(mlp, "shared_expert_local", None)
+        # `shared_local` is static per compiled graph (Qwen4ExpBackboneSPLocal).
+        local = getattr(mlp, "shared_expert_local", None) if shared_local else None
         if local is not None:
             # This rank's rows through the replicated shared expert: no gather, no reduce.
             return local(block) + output
@@ -613,6 +615,7 @@ class Qwen4ExpBackbone(nn.Module):
         inputs_embeds,
         *,
         sequence_parallel: bool,
+        shared_local: bool = False,
         query_start_loc,
         ngram_context,
         state_slots,
@@ -672,6 +675,7 @@ class Qwen4ExpBackbone(nn.Module):
                 ple_raw_embeddings,
                 sequence_parallel=sequence_parallel,
                 sp_pad=sp_pad,
+                shared_local=shared_local,
             )
         mixed = self.hyper_connection_mixer.mix(hidden)[0]
         if sp_pad:
@@ -962,6 +966,55 @@ class Qwen4ExpBackboneSP(nn.Module):
         "valid_tokens": 0,
     }
 )
+class Qwen4ExpBackboneSPLocal(nn.Module):
+    """The sequence-parallel graph with the shared expert on local rows
+    (QWEN4_EXP_PREFILL_SP_SHARED_LOCAL): a class of its own, since two instances
+    of one compiled class share one graph. The host route sends it only steps
+    whose prefill pieces are all long (QWEN4_EXP_PREFILL_SP_SHARED_LOCAL_MIN_PIECE),
+    so short and batched prompts keep the TP shared expert's numerics."""
+
+    def __init__(self, *, backbone):
+        super().__init__()
+        object.__setattr__(self, "_backbone", backbone)
+
+    def forward(
+        self,
+        input_ids,
+        positions,
+        inputs_embeds=None,
+        *,
+        query_start_loc,
+        ngram_context,
+        state_slots,
+        context_lens,
+        valid_tokens,
+        main_block_table,
+        compressed_block_table,
+    ):
+        return self._backbone._forward_impl(
+            input_ids,
+            positions,
+            inputs_embeds,
+            sequence_parallel=True,
+            shared_local=True,
+            query_start_loc=query_start_loc,
+            ngram_context=ngram_context,
+            state_slots=state_slots,
+            context_lens=context_lens,
+            valid_tokens=valid_tokens,
+            main_block_table=main_block_table,
+            compressed_block_table=compressed_block_table,
+        )
+
+
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "inputs_embeds": 0,
+        "valid_tokens": 0,
+    }
+)
 class Qwen4ExpWholeStepModel(nn.Module):
     """A third compiled program: the backbone with the whole-step megakernel.
 
@@ -1027,6 +1080,9 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         self.config = vllm_config.model_config.hf_text_config
         self.model = Qwen4ExpBackbone(vllm_config)
         self.model_sp = None
+        self.model_sp_local = None
+        # Set on the host per step by the input adapter: every prefill piece is long.
+        self.sp_shared_local_step = False
         tp_size = sp.tp_world_size()
         if sp.enabled(tp_size):
             self.model_sp = Qwen4ExpBackboneSP(
@@ -1054,6 +1110,17 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             # One rule for the router, both bucket filters and retraces.
             bucket_filter.assign(self.model_sp, eligible)
             bucket_filter.assign(self.model, lambda n: not eligible(n))
+            if any(
+                hasattr(layer.mlp, "shared_expert_local") for layer in self.model.layers
+            ):
+                piece = envs.QWEN4_EXP_PREFILL_SP_SHARED_LOCAL_MIN_PIECE
+                self.model_sp_local = Qwen4ExpBackboneSPLocal(
+                    vllm_config=vllm_config, backbone=self.model
+                )
+                # Same weights and replicas as model_sp: it holds the backbone unregistered.
+                bucket_filter.assign(
+                    self.model_sp_local, lambda n: eligible(n) and n >= piece
+                )
         self.lm_head = ParallelLMHead(
             self.config.vocab_size, self.config.hidden_size, prefix="lm_head"
         )
@@ -1064,6 +1131,15 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         if self.model_sp is None:
             return self.model(input_ids, positions, inputs_embeds, **kwargs)
         serves_sp = bucket_filter.assigned(self.model_sp)
+        if self.sp_shared_local_step and self.model_sp_local is not None:
+            serves_local = bucket_filter.assigned(self.model_sp_local)
+            if serves_local(input_ids.shape[0]):
+                with bucket_filter.serving(serves_local), set_model_tag(
+                    "backbone_sp_local"
+                ):
+                    return self.model_sp_local(
+                        input_ids, positions, inputs_embeds, **kwargs
+                    )
         if serves_sp(input_ids.shape[0]):
             with bucket_filter.serving(serves_sp), set_model_tag("backbone_sp"):
                 return self.model_sp(input_ids, positions, inputs_embeds, **kwargs)
