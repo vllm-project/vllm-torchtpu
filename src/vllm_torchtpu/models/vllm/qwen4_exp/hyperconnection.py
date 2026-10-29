@@ -222,6 +222,14 @@ class GatedResidual(common_hc.GatedResidual):
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if not hasattr(self, "input_mix_weight_down"):
             raise RuntimeError("mix was disabled for this hyper-connection")
+        folded = getattr(self, "_down_inject_weight", None)
+        if folded is not None:
+            # First use of the folded weight, ahead of the norm weight, on every
+            # path: graph inputs are ordered by first use, and the shape-variant
+            # hand-over needs every token bucket to take them in one order (the
+            # prefill full-mix op slices the folded weight before it consumes
+            # the norm weight; the unfused path would read the norm first).
+            folded = folded.view(folded.shape)
         if self._decode_fused(hyper_input):
             out = self._decode_mix_op(hyper_input, *self._decode_weights())
             if hasattr(self, "block_inject_weight"):
@@ -245,7 +253,6 @@ class GatedResidual(common_hc.GatedResidual):
             )
             return mixed, self._residual(hyper_input, norm)
         norm = self._normalize(hyper_input)
-        folded = getattr(self, "_down_inject_weight", None)
         if folded is not None:
             # Down projection and injection logits in one matmul.
             both = F.linear(norm, folded)
