@@ -190,9 +190,13 @@ def _async_seed_inputs_impl(
     return draft_input_ids, gather_indices, num_rejected
 
 
-_async_seed_inputs_compiled = torch.compile(
-    backend="tpu", fullgraph=True, dynamic=False
-)(_async_seed_inputs_impl)
+# The chunk's input_ids carry the draft forward's dynamic-dim marks; see
+# _static_shape_args.
+_async_seed_inputs_compiled = _static_shape_args(
+    torch.compile(backend="tpu", fullgraph=True, dynamic=False)(
+        _async_seed_inputs_impl
+    )
+)
 
 
 def _async_draft_seed(*args: torch.Tensor):
