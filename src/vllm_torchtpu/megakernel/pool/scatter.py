@@ -105,6 +105,11 @@ def scatter_pool_states(
         and has_gdn
         and not bool(interpret)
     )
+    if use_conv_partial and layout.conv_itemsize != 2:
+        raise MegakernelConfigError(
+            "scatter_pool_states: the partial conv page write (GPR) stores bf16 "
+            f"conv; layout.conv_dtype is {layout.conv_dtype}"
+        )
     act_mode, active_mask = resolve_active_seqs(
         active_seqs,
         default_mode="from_ckpt" if has_gdn else "all",

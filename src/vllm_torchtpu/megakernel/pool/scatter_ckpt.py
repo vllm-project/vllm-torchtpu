@@ -60,7 +60,8 @@ def prepare_ckpt(
         taps = layout.conv_taps
         ssm_u32_rows = (vh * KD) // 2
         conv_rows = (taps * QKV) // LANES
-        conv_rows_pad = ((conv_rows + 15) // 16) * 16
+        conv_rows_pad = layout.conv_rows_pad(ex.R)
+        conv_tile = 32 // layout.conv_itemsize  # sublane tile rows: 16 bf16 / 8 f32
         qkv_128 = QKV // LANES
         # The direct path reads `taps + 1` rows per token (the last one masked
         # to zero) when `tail_row` is true (`(taps + 1) * qkv_128 == conv_rows_pad`),
@@ -77,7 +78,7 @@ def prepare_ckpt(
             T > 1
             and conv.ndim == 4
             and conv.shape[2] >= min_direct_rows
-            and ((conv.shape[2] * qkv_128) % 16 == 0 or bool(interpret))
+            and ((conv.shape[2] * qkv_128) % conv_tile == 0 or bool(interpret))
         )
         if direct_conv:
             conv_in = conv
@@ -100,7 +101,7 @@ def prepare_ckpt(
                     conv_4d[:, :, None, 0:taps, :],
                     (conv_4d.shape[0], NS, T, taps, QKV),
                 )
-            conv_flat = conv_win.astype(BF16).reshape(
+            conv_flat = conv_win.astype(layout.conv_dtype).reshape(
                 conv_4d.shape[0], NS * T, conv_rows, LANES
             )
             if conv_rows_pad > conv_rows:
@@ -110,7 +111,7 @@ def prepare_ckpt(
                 )
             conv_in = conv_flat.reshape(conv_4d.shape[0], NS * T * conv_rows_pad, LANES)
             conv_buf_shape = (2, T * conv_rows_pad, LANES)
-            conv_buf_dt = BF16
+            conv_buf_dt = layout.conv_dtype
         ckpt_is_3d = ckpt_indices.ndim == 3
         ckpt_t_off = ckpt_indices.shape[-1] - T
     else:
@@ -133,6 +134,7 @@ def prepare_ckpt(
         qkv_128=qkv_128,
         direct_conv=direct_conv,
         conv_tail_row=direct_conv and tail_row,
+        conv_store_dt=layout.conv_dtype,
         ckpt_is_3d=ckpt_is_3d,
         ckpt_t_off=ckpt_t_off,
         ckpt_ndim=ckpt_indices.ndim if has_gdn else 0,
@@ -210,10 +212,14 @@ def start_scatter_seq(
     KD, VD, taps, ssm_u32_rows = sg.KD, sg.VD, sg.taps, sg.ssm_u32_rows
     conv_rows, conv_rows_pad = sg.conv_rows, sg.conv_rows_pad
     direct_conv, conv_tail_row = sg.direct_conv, sg.conv_tail_row
+    store_dt = BF16 if sg.conv_store_dt is None else sg.conv_store_dt
+    store_isz = jnp.dtype(store_dt).itemsize
+    # `jnp.bfloat16(0.0)` for bf16 (the scalar type is callable).
+    store_zero = store_dt(0.0) if callable(store_dt) else jnp.dtype(store_dt).type(0.0)
 
     @pl.when(is_active(kc, s))
     def _():
-        conv_bf16: Any = conv_buf[slot, 0].astype(BF16) if conv_tail_row else None
+        conv_bf16: Any = conv_buf[slot, 0].astype(store_dt) if conv_tail_row else None
         for t in range(T):
             s_km = rec_buf[slot, pl.ds(t * vh, vh)]
             if bool(interpret):
@@ -243,13 +249,13 @@ def start_scatter_seq(
                     w4 = jnp.where(
                         w4_row_iota < taps,
                         conv_bf16[1 + t : 2 + taps + t, :],
-                        jnp.bfloat16(0.0),
+                        store_zero,
                     )
                     conv_taps = w4.reshape(conv_rows_pad, LANES)
                 else:
                     taps_128 = (
                         conv_buf[slot, 0, 1 + t : 1 + taps + t, :]
-                        .astype(BF16)
+                        .astype(store_dt)
                         .reshape(conv_rows, LANES)
                     )
                     if conv_rows_pad > conv_rows:
@@ -274,7 +280,7 @@ def start_scatter_seq(
                         conv_pad.reshape(
                             page_shape[0],
                             page_shape[1],
-                            page_shape[2] // 2,
+                            page_shape[2] // store_isz,
                             page_shape[3],
                         ),
                         FP8,
@@ -283,7 +289,7 @@ def start_scatter_seq(
                     .reshape(page_shape)
                 )
             else:
-                page_buf.at[slot, t * pps + conv_page].bitcast(BF16).reshape(
+                page_buf.at[slot, t * pps + conv_page].bitcast(store_dt).reshape(
                     conv_page_rows, LANES
                 )[:conv_rows_pad, :] = conv_taps
 

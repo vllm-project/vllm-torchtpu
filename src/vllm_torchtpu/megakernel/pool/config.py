@@ -149,6 +149,15 @@ class PoolBackend:
     page_table_state_name: str = "page_table"
     supports_fused_io: bool = False
     supports_pool_gather: bool = False
+    # `layout -> PoolBackend` with the same callbacks and options (set by
+    # `make_pool_backend`); see `with_layout`.
+    rebuild: Any = dataclasses.field(default=None, compare=False, repr=False)
+
+    def with_layout(self, layout: PoolLayout) -> PoolBackend:
+        """The same backend over `layout` (e.g. another conv storage dtype)."""
+        if self.rebuild is None:
+            raise ValueError("this PoolBackend was not built by make_pool_backend")
+        return self.rebuild(layout)
 
     @property
     def num_pools(self) -> int:

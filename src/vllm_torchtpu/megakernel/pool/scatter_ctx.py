@@ -75,6 +75,8 @@ class ScatterGeom:
     # Direct path reading `conv_taps + 1` rows per token (exactly the padded
     # window); False: `conv_taps` rows plus zero padding.
     conv_tail_row: bool = False
+    # Pool storage dtype of the conv window (`PoolLayout.conv_dtype`).
+    conv_store_dt: Any = None
     ckpt_is_3d: bool = False
     ckpt_t_off: int = 0
     ckpt_ndim: int = 0

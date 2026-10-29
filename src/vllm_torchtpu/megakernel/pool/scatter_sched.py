@@ -125,10 +125,13 @@ def ckpt_prologue(kc: ScatterKernel) -> None:
                             (rec_u32_cap, LANES), U32
                         )
                 if not use_conv_partial:
+                    store_dt = BF16 if sg.conv_store_dt is None else sg.conv_store_dt
                     for t in range(T):
-                        page_buf.at[slot, t * pps + conv_page].bitcast(BF16).reshape(
-                            conv_page_rows, LANES
-                        )[...] = jnp.zeros((conv_page_rows, LANES), BF16)
+                        page_buf.at[slot, t * pps + conv_page].bitcast(
+                            store_dt
+                        ).reshape(conv_page_rows, LANES)[...] = jnp.zeros(
+                            (conv_page_rows, LANES), store_dt
+                        )
 
 
 def scatter_ckpt_states(kc: ScatterKernel) -> None:

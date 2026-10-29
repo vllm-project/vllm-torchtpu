@@ -111,18 +111,21 @@ def gather_gdn_states(
     rec_u32_cap = layout.rec_u32_rows
     conv_page = layout.conv_page
     conv_page_rows = layout.conv_page_rows
+    # The pool stores the conv window as `layout.conv_dtype` (bf16 or f32).
+    conv_store_dt = layout.conv_dtype
+    conv_tile = 32 // layout.conv_itemsize  # sublane tile rows: 16 bf16 / 8 f32
     ssm_u32_rows = (vh * KD) // 2
     conv_rows = (taps * QKV) // LANES
-    conv_rows_pad = ((conv_rows + 15) // 16) * 16
+    conv_rows_pad = layout.conv_rows_pad(ex.R)
     qkv_128 = QKV // LANES
     direct_conv = (
         T > 1
         and (HR * qkv_128) <= conv_page_rows
-        and ((HR * qkv_128) % 16 == 0 or bool(interpret))
+        and ((HR * qkv_128) % conv_tile == 0 or bool(interpret))
     )
     hr_rows_128 = HR * qkv_128
     conv_raw_shape = conv_shape if direct_conv else (ngdn, NS * conv_rows_pad, LANES)
-    conv_raw_dt = conv_dt if direct_conv else BF16
+    conv_raw_dt = conv_dt if direct_conv else conv_store_dt
     ckpt_is_3d = ckpt_indices.ndim == 3
     ckpt_k = ckpt_indices.shape[-1]
     roff_is_2d = read_offsets.ndim == 2
@@ -221,7 +224,7 @@ def gather_gdn_states(
                 if direct_conv:
                     raw_hr = (
                         page_buf.at[p_slot, conv_page]
-                        .bitcast(BF16)
+                        .bitcast(conv_store_dt)
                         .reshape(conv_page_rows, LANES)[:hr_rows_128, :]
                         .reshape(HR, QKV)
                         .astype(conv_dt)
@@ -237,7 +240,7 @@ def gather_gdn_states(
                     )
                     conv_buf[g_slot, sub, pl.ds(c0, conv_rows_pad), :] = (
                         page_buf.at[p_slot, conv_page]
-                        .bitcast(BF16)
+                        .bitcast(conv_store_dt)
                         .reshape(conv_page_rows, LANES)[:conv_rows_pad, :]
                     )
 
