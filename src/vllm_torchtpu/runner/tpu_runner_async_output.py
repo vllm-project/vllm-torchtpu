@@ -350,7 +350,11 @@ def extract_draft_token_ids(
     """Gather the draft tokens the target just verified, from the (post-async-
     substitution) device ``input_ids``.
     """
-    return input_ids[logits_indices[target_logits_indices + 1]]
+    # index_select is ~2x cheaper on the host than advanced indexing (eager
+    # TPU microbench j-14dfb410: 17-21 vs 39-49 us per call); same values.
+    return input_ids.index_select(
+        0, logits_indices.index_select(0, target_logits_indices + 1)
+    )
 
 
 def compute_num_rejected(
