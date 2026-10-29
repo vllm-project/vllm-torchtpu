@@ -26,6 +26,7 @@ from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
 from vllm_torchtpu.layers.core.attention_metadata import (
@@ -127,6 +128,7 @@ class DFlashProposer:
         self._max_model_len = vllm_config.model_config.max_model_len
         self.draft_model = None
         self._draft_has_moe_cache: bool | None = None
+        self._write_only_context_kv = False
         self._draft_attn_layer_names: set[str] | None = None
         self.draft_chunks: list[DraftChunkInputs] | None = None
         self._static_attn_tensors_cache: dict[
@@ -261,6 +263,32 @@ class DFlashProposer:
                     attn_impl.layer_idx = i
                     attn_impl.use_causal_mask = layer_causal_list[i]
                     attn_impl.initialize_kernel(attn_obj)
+
+        self._write_only_context_kv = (
+            envs.VLLM_TPU_DFLASH_WRITE_ONLY_KV and self._context_kv_write_supported()
+        )
+        if envs.VLLM_TPU_DFLASH_WRITE_ONLY_KV and not self._write_only_context_kv:
+            logger.info(
+                "VLLM_TPU_DFLASH_WRITE_ONLY_KV is set, but this draft's KV cache "
+                "layout or parallelism is not supported yet; keeping the RPA "
+                "context-KV update."
+            )
+
+    def _context_kv_write_supported(self) -> bool:
+        """Whether every draft attention layer can take the write-only context
+        update. TODO: a TP-sharded draft writes a head-sharded pool; enable it
+        once that path is validated."""
+        assert self.draft_model is not None
+        if not self._draft_replicated:
+            return False
+        for layer in self.draft_model.model.layers:
+            attn_impl = layer.self_attn.attn.impl
+            if not (
+                isinstance(attn_impl, PallasAttentionBackendImpl)
+                and attn_impl.supports_kv_cache_write()
+            ):
+                return False
+        return True
 
     def _load_draft_model(self) -> None:
         logger.info("Loading DFlash draft model...")
@@ -1055,6 +1083,20 @@ class DFlashProposer:
         roped_q_all = dummy_q_roped_flat.view(L, num_ctx, nq, hd)
 
         # 2. update kv cache in the compiled graph so XLA can fuse the mutations
+        if self._write_only_context_kv:
+            # Same cache bytes as the RPA call below, without the attention it
+            # computes and discards; the dummy query above is then dead code.
+            for i, layer in enumerate(self.draft_model.model.layers):
+                attn_obj = layer.self_attn.attn
+                attn_obj.impl.write_kv_cache(
+                    attn_obj,
+                    roped_k_all[i],
+                    all_v[i],
+                    attn_obj.kv_cache,
+                    draft_md_tuple[i],
+                )
+            return hidden_states
+
         for i, layer in enumerate(self.draft_model.model.layers):
             attn_obj = layer.self_attn.attn
             kv_cache = attn_obj.kv_cache
