@@ -35,11 +35,24 @@ CYCLES = (
 )
 
 
+@functools.lru_cache(maxsize=1)
+def _runtime_devices_by_id():
+    return {int(d.id): d for d in jax.devices()}
+
+
+def located(device):
+    """The device itself if it carries ``coords``, else the runtime's device
+    with the same global id: Torchtpu's Pallas mesh devices carry only an id."""
+    if getattr(device, "coords", None) is None:
+        return _runtime_devices_by_id()[int(device.id)]
+    return device
+
+
 def mla_chip_layout(devices, owners):
     """Physical pairs and same-core groups, ordered by Torch token ownership."""
     chips = {}
     for index, device in enumerate(devices):
-        chips.setdefault(tuple(device.coords), []).append(index)
+        chips.setdefault(tuple(located(device).coords), []).append(index)
     pairs = tuple(
         tuple(sorted(pair, key=lambda i: owners[i]))
         for _, pair in sorted(chips.items())
@@ -160,6 +173,7 @@ def ring_tables(devices, token_ranks):
         raise ValueError("K3 rings require 32 devices and a token-owner permutation")
     if [d.id for d in devices] != sorted(d.id for d in devices):
         raise ValueError("Production collective mesh must use ascending device IDs")
+    devices = [located(d) for d in devices]
     coords = [sorted({d.coords[a] for d in devices}) for a in range(3)]
     if tuple(map(len, coords)) != (2, 2, 4):
         raise ValueError("K3 rings require a physical 2x2x4 slice")

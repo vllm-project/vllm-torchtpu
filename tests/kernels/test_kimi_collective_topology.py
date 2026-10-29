@@ -167,3 +167,24 @@ def test_mla_chip_layout_rejects_incomplete_pairs(chip_count, cores):
     ]
     with pytest.raises(ValueError, match="sixteen two-core chips"):
         mla_chip_layout(devices, tuple(range(len(devices))))
+
+
+def test_ring_tables_locate_id_only_mesh_devices(monkeypatch) -> None:
+    from vllm_torchtpu.kernels.kimi_k3 import collectives
+
+    physical = [
+        SimpleNamespace(
+            id=i,
+            coords=((i // 2) // 8, (i // 2) // 4 % 2, (i // 2) % 4),
+            core_on_chip=i % 2,
+        )
+        for i in range(32)
+    ]
+    monkeypatch.setattr(
+        collectives, "_runtime_devices_by_id", lambda: {d.id: d for d in physical}
+    )
+    id_only = [SimpleNamespace(id=i) for i in range(32)]
+
+    np.testing.assert_array_equal(
+        ring_tables(id_only, list(range(32))), ring_tables(physical, list(range(32)))
+    )
