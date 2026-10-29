@@ -74,6 +74,11 @@ def _post_pre_rms_jax(
         sinkhorn_repeat=repeats,
         norm_weight=norm_weight,
         norm_eps=norm_eps,
+        # Contract: `flat` is `residual.flatten(1)` and the seam caller rebinds
+        # `residual` immediately, so the operand is dead once the kernel starts
+        # writing the residual back.  Opt in here (the kernel default stays
+        # False) so the residual output reuses `flat`'s HBM buffer.
+        donate_flat=True,
     )
 
 
