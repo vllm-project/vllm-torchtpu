@@ -209,6 +209,90 @@ def _commit_kda_states(conv_slots, recurrent_slots, conv, recurrent, slots, sour
         ),
     )(slots, *((source_rows,) if selected else ()), conv_slots, recurrent_slots, conv, recurrent)
 
+
+def _commit_kda_states_pipelined(conv_slots, recurrent_slots, conv, recurrent, slots,
+                                 source_rows=None, chunks=3, depth=3):
+    """``_commit_kda_states`` with the reads and writes overlapped: each row
+    moves in ``chunks`` layer chunks through a ring of ``depth`` VMEM buffers,
+    reading unit ``u + depth - 1`` while unit ``u`` writes. At most two writes
+    are in flight (``u - 1`` and ``u``); the same bytes of two rows are
+    ``chunks`` >= 2 units apart, so writes to a repeated (null) slot still
+    land in input order."""
+    batch = slots.shape[0]
+    selected = source_rows is not None
+    prefetch = 2 if selected else 1
+    layers = conv.shape[1]
+    assert layers % chunks == 0 and chunks >= 2 and depth >= 2
+    span = layers // chunks
+    units = batch * chunks
+
+    def body(indices, *args):
+        sources, args = (args[0], args[1:]) if selected else (None, args)
+        (old_conv, old_state, new_conv, new_state, out_conv, out_state,
+         conv_buffer, state_buffer, semaphores) = args
+        del old_conv, old_state
+
+        def copies(unit, slot, write):
+            row, chunk = unit // chunks, unit % chunks
+            layer = pl.ds(chunk * span, span)
+            if write:
+                target = indices[row]
+                pairs = ((conv_buffer.at[slot], out_conv.at[pl.ds(target, 1), layer]),
+                         (state_buffer.at[slot], out_state.at[pl.ds(target, 1), layer]))
+            else:
+                source = sources[row] if sources is not None else row
+                pairs = ((new_conv.at[pl.ds(source, 1), layer], conv_buffer.at[slot]),
+                         (new_state.at[pl.ds(source, 1), layer], state_buffer.at[slot]))
+            return tuple(
+                tpu.make_async_copy(src, dst, semaphores.at[int(write), slot, kind])
+                for kind, (src, dst) in enumerate(pairs))
+
+        def start(unit, write):
+            for item in copies(unit, unit % depth, write):
+                item.start()
+
+        def wait(unit, write):
+            for item in copies(unit, unit % depth, write):
+                item.wait()
+
+        for unit in range(min(depth - 1, units)):
+            start(unit, False)
+
+        @pl.loop(0, units)
+        def step(unit):
+            wait(unit, False)
+            start(unit, True)
+
+            @pl.when(unit >= 1)
+            def _():
+                wait(unit - 1, True)
+
+            @pl.when(unit + depth - 1 < units)
+            def _():
+                start(unit + depth - 1, False)
+
+        wait(units - 1, True)
+
+    return pl.pallas_call(
+        body,
+        name="kda_selected_state_commit" if selected else "kda_state_commit",
+        out_shape=(jax.ShapeDtypeStruct(conv_slots.shape, conv_slots.dtype),
+                   jax.ShapeDtypeStruct(recurrent_slots.shape, recurrent_slots.dtype)),
+        input_output_aliases={prefetch: 0, prefetch + 1: 1},
+        grid_spec=tpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=prefetch,
+            in_specs=[pl.BlockSpec(memory_space=tpu.HBM)] * 4,
+            out_specs=[pl.BlockSpec(memory_space=tpu.HBM)] * 2,
+            scratch_shapes=(
+                tpu.VMEM((depth, 1, span, *conv.shape[2:]), conv.dtype),
+                tpu.VMEM((depth, 1, span, *recurrent.shape[2:]), recurrent.dtype),
+                tpu.SemaphoreType.DMA((2, depth, 2)),
+            ),
+        ),
+        compiler_params=tpu.CompilerParams(vmem_limit_bytes=48 * 1024**2),
+    )(slots, *((source_rows,) if selected else ()), conv_slots, recurrent_slots, conv, recurrent)
+
+
 def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, block_tables,
                  slots, *, batch_size, dcp_pool_map, dcp_owner_table=None, state_row=None,
                  defer_kda_commit=False, **decode_options):
@@ -275,8 +359,10 @@ def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, 
         # Keep the input banks alive until acceptance. Return the native
         # post-states without touching persistent slots or gathering rows.
         conv_slots, recurrent_slots = conv, recurrent
-    elif batch_size > 16 and dp in (1, 2):
-        conv_slots, recurrent_slots = _commit_kda_states(
+    elif batch_size >= _config().kda_commit_pallas_min_batch and dp in (1, 2):
+        commit = (_commit_kda_states_pipelined if _config().kda_commit_pipelined
+                  else _commit_kda_states)
+        conv_slots, recurrent_slots = commit(
             conv_slots, recurrent_slots, conv, recurrent, state_index)
     else:
         conv_slots = conv_slots.at[state_index].set(conv)

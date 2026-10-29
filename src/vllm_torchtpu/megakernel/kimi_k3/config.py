@@ -45,8 +45,17 @@ class KernelConfig:
     b16_compact_experts: bool = True
     shared_expert_finishers: bool = True
     compact_overflow: bool = True
+    # Grouped MXFP4 routes (B8-B128): plan the expert visit order and row lists
+    # once per layer instead of rescanning routes every expert pair.
+    expert_plan: bool = True
     b4_attention_gather: bool = True
     fused_cache_commit: bool = True
+    # Plain decode's KDA state commit: the Pallas row copy from this batch
+    # (XLA's scatter below it); pipelined overlaps its reads and writes.
+    kda_commit_pallas_min_batch: int = 1
+    kda_commit_pipelined: bool = True
+    # Residual mixtures score the owned prefix rows in one dense pass.
+    mix_prefix_scores: bool = True
     decode_no_hlo_calls: bool = True  # no deduplicated HLO calls at B8..B128, DP B2/B4
     shard_routing: bool = False
     kda_staged: bool = False
