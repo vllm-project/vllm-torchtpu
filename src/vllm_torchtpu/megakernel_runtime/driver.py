@@ -1055,6 +1055,33 @@ class MegakernelDriver:
             conv_qk_pair=conv_qk_pair_layout_enabled(),
         )
 
+    def _adopt_framework_conv_dtype(self, conv_dtype: str) -> None:
+        """Store the conv window in the dtype the framework's pool uses.
+
+        The split pool I/O path implements bf16 and f32 conv; fused pool I/O
+        and in-kernel gather (GPR) stage bf16 only, so an f32 layout turns
+        them off (the pool backend reports them unsupported). Other dtypes are
+        left to the layout comparison, which declines them.
+        """
+        layout = self.spec.cache_backend.layout
+        if (
+            conv_dtype != "float32"
+            or _rt.layout_facts.dtype_name(layout.conv_dtype) == "float32"
+        ):
+            return
+        f32_layout = dataclasses.replace(layout, conv_dtype=jax.numpy.float32)
+        self.spec = dataclasses.replace(
+            self.spec, cache_backend=self.spec.cache_backend.with_layout(f32_layout)
+        )
+        if self.fused_pool_io:
+            self.fused_pool_io = False
+        logger.info(
+            "%s megakernel: the framework stores the pooled conv state as fp32; "
+            "using split pool I/O with an f32 conv window (fused pool I/O and "
+            "in-kernel gather stage bf16 conv and are off)",
+            self._display_name,
+        )
+
     def _check_pool_layout_facts(self, runner: Any, pool: torch.Tensor) -> None:
         """Fail closed unless the framework lays out a recurrent slot exactly
         as this megakernel's `PoolLayout` expects."""
@@ -1069,9 +1096,6 @@ class MegakernelDriver:
         if linear_attn is None:  # no recurrent layers: no recurrent slot
             self.pool_layout_facts = None
             return
-        mk_facts = _rt.facts_from_pool_layout(
-            self.spec.cache_backend.layout, int(self.base_exec.R)
-        )
         try:
             fw_facts = self._framework_slot_facts(runner, linear_attn, pool)
         except (AttributeError, TypeError, ValueError) as exc:
@@ -1082,6 +1106,10 @@ class MegakernelDriver:
             raise LayoutDecline(
                 _rt.EligibilityResult(False, "pool_layout_unknown", msg)
             ) from exc
+        self._adopt_framework_conv_dtype(fw_facts.conv_dtype)
+        mk_facts = _rt.facts_from_pool_layout(
+            self.spec.cache_backend.layout, int(self.base_exec.R)
+        )
         res = _rt.compare_layout_facts(mk_facts, fw_facts)
         if not res.eligible:
             raise LayoutDecline(res)

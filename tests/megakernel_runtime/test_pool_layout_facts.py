@@ -164,9 +164,10 @@ def test_runner_block_size() -> None:
 
 
 def test_framework_as_checked_out_matches_or_declines_by_conv_dtype() -> None:
-    """With the tree's own `gdn_pool_layout` default: a bf16 conv pool matches,
-    an fp32 one (the stock GDN kernel's only option once it requires fp32
-    conv) is declined at bind as `conv_state_dtype_unsupported`."""
+    """With the tree's own `gdn_pool_layout` default: a bf16 conv pool matches a
+    bf16-conv `PoolLayout`; an fp32 one (the stock GDN kernel's only option
+    once it requires fp32 conv) doesn't (`conv_state_dtype_unsupported`); the
+    driver then switches to an f32-conv layout before comparing."""
     fw = _fw_facts()
     res = compare_layout_facts(_mk_facts(), fw)
     if fw.conv_dtype == "bfloat16":

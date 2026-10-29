@@ -1528,9 +1528,7 @@ def test_bind_caches_fails_closed_on_pool_slot_layout_mismatch(
         driver, "_build_all_buckets", lambda: built.append(1), raising=False
     )
     cases = {
-        "conv_state_dtype_unsupported": dataclasses.replace(
-            mk, conv_dtype="float32", conv_bytes=2 * mk.conv_bytes
-        ),
+        "conv_state_dtype_unsupported": dataclasses.replace(mk, conv_dtype="float16"),
         "pool_layout_mismatch": dataclasses.replace(
             mk, slot_tokens=mk.slot_tokens + 512, ssm_dtype="float32"
         ),
@@ -1563,6 +1561,49 @@ def test_bind_caches_fails_closed_on_pool_slot_layout_mismatch(
     driver.bind_caches(runner)
     assert driver._bound and built == [1]
     assert driver.pool_layout_facts == mk
+
+
+def test_bind_caches_adopts_an_fp32_conv_framework_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A framework that stores the pooled conv state as fp32 is served: the
+    megakernel switches its layout to an f32 conv window (split pool I/O),
+    and fused pool I/O / in-kernel gather are off."""
+    import dataclasses
+
+    import jax.numpy as jnp
+
+    mesh = _cpu_mesh(1)
+    g = _tiny_geom(L=4, att_every=4)
+    ex_base = _tiny_exec(R=1, B=2, T=1, ctx=256, num_pages=96)
+    backbone = make_synthetic_qwen35_backbone(g, ex_base)
+    model = SimpleNamespace(model=backbone)
+    _allocate_aliased_pools(backbone, g, 96)
+    driver = MegakernelDriver(
+        model=model,
+        mesh=mesh,
+        tp_rank=0,
+        mode="ep",
+        geom=g,
+        base_exec=ex_base,
+        buckets=(2,),
+        verify_buckets=(),
+        fused_pool_io="auto",
+    )
+    bf16 = facts_from_pool_layout(driver.spec.cache_backend.layout, 1)
+    assert bf16.conv_dtype == "bfloat16"
+    fw = dataclasses.replace(bf16, conv_dtype="float32", conv_bytes=2 * bf16.conv_bytes)
+    monkeypatch.setattr(driver, "_framework_slot_facts", lambda *_a: fw)
+    monkeypatch.setattr(driver, "_build_all_buckets", lambda: None, raising=False)
+    driver.bind_caches(SimpleNamespace(model=model, _unified_kv_layout=True))
+    lay = driver.spec.cache_backend.layout
+    assert lay.conv_dtype == jnp.float32 and driver._bound
+    assert driver.pool_layout_facts == fw
+    assert not driver.spec.cache_backend.supports_fused_io
+    assert not driver.fused_pool_io
+    assert lay == dataclasses.replace(
+        qwen35.qwen35_spec(g).cache_backend.layout, conv_dtype=jnp.float32
+    )
 
 
 def test_bind_caches_budget_overflow_is_config_error() -> None:
