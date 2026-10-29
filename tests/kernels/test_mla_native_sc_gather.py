@@ -21,9 +21,8 @@ from absl.testing import absltest
 
 from vllm_torchtpu.kernels.mla.sparse import native_sc_cache_layout, native_sc_gather
 
-pytestmark = pytest.mark.tpu_test
 
-
+@pytest.mark.tpu_test
 class NativeScGatherTest(absltest.TestCase):
     def test_combined_gather_is_byte_exact(self):
         if jax.devices()[0].platform != "tpu":
@@ -70,9 +69,8 @@ class NativeScGatherTest(absltest.TestCase):
                 np.testing.assert_array_equal(np.asarray(gathered_rope), expected_rope)
 
     def test_packed_rope_gather_matches_the_padded_cache(self):
-        """``packed_rope``: a 64-byte-per-token ROPE cache gathers to the same
-        rows as the padded one, rope tail zeroed, with and without a live
-        bound."""
+        """A 64-byte-per-token ROPE cache gathers to the same rows as the
+        128-byte padded one, rope tail zeroed, derived from cache shapes."""
         if jax.devices()[0].platform != "tpu":
             self.skipTest("native-SC gather requires a TPU SparseCore")
 
@@ -109,7 +107,6 @@ class NativeScGatherTest(absltest.TestCase):
                         jnp.asarray(flat_indices.reshape(query_tokens, topk)),
                         out_size=count,
                         atoms_per_batch=atoms,
-                        packed_rope=True,
                         **live_kwargs,
                     )
                 )
@@ -183,14 +180,11 @@ class NativeScGatherTest(absltest.TestCase):
                     np.asarray(gathered_rope)[:groups], expected_rope[:groups]
                 )
 
-    def test_exported_mlir_has_no_allocate_buffer(self):
-        """Ensure native-SC gather lowers without AllocateBuffer custom calls.
 
-        When torch_tpu inlines custom-kernel functions across chunks/layers and
-        runs mlir::createCSEPass(), zero-operand AllocateBuffer ops with
-        has_side_effect=false get CSE-merged into a single buffer, causing XLA
-        CopyInsertion to materialize hundreds of HBM-to-HBM copy(%empty) ops.
-        """
+class NativeScGatherCpuTest(absltest.TestCase):
+    def test_exported_mlir_has_no_allocate_buffer(self):
+        """Ensure native-SC gather lowers without AllocateBuffer custom calls
+        for both 64B (16-word) and 128B (32-word) SparseCore RoPE shapes."""
         from unittest import mock
 
         from jax._src import tpu_info as src_tpu_info
@@ -200,7 +194,6 @@ class NativeScGatherTest(absltest.TestCase):
 
         info = src_tpu_info.get_tpu_info_for_chip(src_tpu_info.ChipVersion.TPU_7X, 1)
         nope = jax.ShapeDtypeStruct((1024, 128), jnp.uint32)
-        rope = jax.ShapeDtypeStruct((256, 128), jnp.uint32)
         idx = jax.ShapeDtypeStruct((256, 2048), jnp.int32)
         live = jax.ShapeDtypeStruct((), jnp.int32)
 
@@ -215,20 +208,45 @@ class NativeScGatherTest(absltest.TestCase):
                 live_multiple=16 * 512,
             )
 
-        with (
-            mock.patch.object(src_tpu_info, "get_tpu_info", return_value=info),
-            mock.patch.object(src_tpu_info, "is_tpu_device", return_value=True),
-            mock.patch.object(tpu_info, "get_tpu_info", return_value=info),
-            mock.patch.object(tpu_info, "is_tpu_device", return_value=True),
-            mock.patch.object(pltpu, "get_tpu_info", return_value=info),
-            pl.pallas_export_experimental(dynamic_shapes=False),
-        ):
-            exported = jax.export.export(jax.jit(fn), platforms=["tpu"])(
-                nope, rope, idx, live
-            )
-            mlir_str = str(exported.mlir_module())
+        for rope_rows in (128, 256):
+            rope = jax.ShapeDtypeStruct((rope_rows, 128), jnp.uint32)
+            with (
+                self.subTest(rope_rows=rope_rows),
+                mock.patch.object(src_tpu_info, "get_tpu_info", return_value=info),
+                mock.patch.object(src_tpu_info, "is_tpu_device", return_value=True),
+                mock.patch.object(tpu_info, "get_tpu_info", return_value=info),
+                mock.patch.object(tpu_info, "is_tpu_device", return_value=True),
+                mock.patch.object(pltpu, "get_tpu_info", return_value=info),
+                pl.pallas_export_experimental(dynamic_shapes=False),
+            ):
+                exported = jax.export.export(jax.jit(fn), platforms=["tpu"])(
+                    nope, rope, idx, live
+                )
+                mlir_str = str(exported.mlir_module())
+            self.assertNotIn("AllocateBuffer", mlir_str)
 
-        self.assertNotIn("AllocateBuffer", mlir_str)
+    def test_rejects_mismatched_or_unsupported_rope_row_widths(self):
+        """Negative controls: invalid rope_cache shapes fail before lowering."""
+        nope = jnp.zeros((4, 256, 128), jnp.uint32)
+        idx = jnp.zeros((16, 64), jnp.int32)
+        for bad_rope_shape, match in (
+            # Not divisible across the 1024 nope tokens (14848 % 1024 == 512).
+            ((4, 29, 128), "must divide"),
+            # 16 tokens/row -> 8 words/token (not a multiple of 16 lanes).
+            ((4, 16, 128), "derived rope_words"),
+            # 2 tokens/row -> 64 words/token (4 * 64 > 128).
+            ((4, 128, 128), "derived rope_words"),
+        ):
+            with (
+                self.subTest(bad_rope_shape=bad_rope_shape),
+                self.assertRaisesRegex(ValueError, match),
+            ):
+                native_sc_gather.dsa_gather_native_sc(
+                    nope,
+                    jnp.zeros(bad_rope_shape, jnp.uint32),
+                    idx,
+                    out_size=16 * 64,
+                )
 
 
 if __name__ == "__main__":

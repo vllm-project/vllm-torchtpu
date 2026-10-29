@@ -86,7 +86,7 @@ def token_bytes(cache: jax.Array, spec: SparseMLAKVCacheSpec) -> np.ndarray:
     """
     rows = np.asarray(cache).reshape(spec.num_pages, spec.page_size, -1)
     if spec.layout is KVCacheLayout.SPARSECORE:
-        # nope [P, S, 128] u32 and rope [P, S // 4, 128] u32.
+        # nope [P, S, 128] u32 and rope [P, S // tokens_per_row, 128] u32.
         rows = unpack4(rows)
     # TENSORCORE nope [P, S, 4, 128] and rope [P, S // 4, 4, 128] are already
     # byte images -- the reshape above is the whole decode.
@@ -266,16 +266,16 @@ class UpdateSparseMLAKvCacheTest(parameterized.TestCase):
         for token in range(num_tokens):
             np.testing.assert_array_equal(sc_words[3, token], expected[token])
 
-        # ...and the two layouts hold the same bytes, differing only in how
-        # the 32-bit packing is expressed.
-        np.testing.assert_array_equal(
-            token_bytes(
-                caches[KVCacheLayout.SPARSECORE], specs[KVCacheLayout.SPARSECORE]
-            ),
-            token_bytes(
-                caches[KVCacheLayout.TENSORCORE], specs[KVCacheLayout.TENSORCORE]
-            ),
+        # ...and the two layouts hold the same logical bytes, differing only in
+        # how the 32-bit packing is expressed (and TC's 128B zero-padded tail).
+        sc_bytes = token_bytes(
+            caches[KVCacheLayout.SPARSECORE], specs[KVCacheLayout.SPARSECORE]
         )
+        tc_bytes = token_bytes(
+            caches[KVCacheLayout.TENSORCORE], specs[KVCacheLayout.TENSORCORE]
+        )
+        np.testing.assert_array_equal(sc_bytes, tc_bytes[..., : sc_bytes.shape[-1]])
+        self.assertEqual(int(np.count_nonzero(tc_bytes[..., sc_bytes.shape[-1] :])), 0)
 
 
 class PackingTest(parameterized.TestCase):
@@ -467,18 +467,17 @@ class UpdateSparseMLAKvCacheDcpTest(parameterized.TestCase):
             layout=KVCacheLayout.SPARSECORE,
         ),
         dict(
-            testcase_name="d4_i8_sc_packed_rope",
-            dcp_size=4,
-            interleave_size=8,
-            layout=KVCacheLayout.SPARSECORE,
-            packed_rope=True,
-        ),
-        dict(
-            testcase_name="d8_i4_sc_packed_rope",
+            testcase_name="d8_i4_sc",
             dcp_size=8,
             interleave_size=4,
             layout=KVCacheLayout.SPARSECORE,
-            packed_rope=True,
+        ),
+        dict(
+            testcase_name="d4_i8_sc_128b_rope",
+            dcp_size=4,
+            interleave_size=8,
+            layout=KVCacheLayout.SPARSECORE,
+            rope_dim=128,
         ),
     )
     def test_rows_land_where_the_interleave_says(
@@ -486,7 +485,7 @@ class UpdateSparseMLAKvCacheDcpTest(parameterized.TestCase):
         dcp_size,
         interleave_size,
         layout=KVCacheLayout.TENSORCORE,
-        packed_rope=False,
+        rope_dim=ROPE_DIM,
     ):
         """Each row reaches exactly one rank, at the reference (page, slot).
 
@@ -503,9 +502,8 @@ class UpdateSparseMLAKvCacheDcpTest(parameterized.TestCase):
             layout,
             TOTAL_PAGES,
             PAGE_SIZE,
-            ROPE_DIM,
+            rope_dim,
             KV_PACKING,
-            packed_rope=packed_rope,
         )
         inputs = self._inputs(dcp_size, interleave_size)
         shards = self._run_group(
@@ -661,8 +659,8 @@ def _emulate_native_rope_gather(
     return out
 
 
-class PackedRopeTest(parameterized.TestCase):
-    """`TPU_SPARSE_MLA_PACKED_ROPE`: 64 bytes per rope token, eight to a row."""
+class SparseCoreRopePackingTest(parameterized.TestCase):
+    """Generic SparseCore RoPE packing: 64B/token (8 tokens/row) by default."""
 
     PACKED = SparseMLAKVCacheSpec.create(
         KVCacheType.ROPE,
@@ -671,14 +669,13 @@ class PackedRopeTest(parameterized.TestCase):
         PAGE_SIZE,
         ROPE_DIM,
         KV_PACKING,
-        packed_rope=True,
     )
     PADDED = SparseMLAKVCacheSpec.create(
         KVCacheType.ROPE,
         KVCacheLayout.SPARSECORE,
         TOTAL_PAGES,
         PAGE_SIZE,
-        ROPE_DIM,
+        128,
         KV_PACKING,
     )
     NOPE = SparseMLAKVCacheSpec.create(
@@ -690,10 +687,12 @@ class PackedRopeTest(parameterized.TestCase):
         KV_PACKING,
     )
 
-    def test_packed_spec_halves_the_rope_cache(self):
+    def test_default_sparsecore_spec_halves_the_rope_cache(self):
         self.assertEqual(self.PACKED.token_bytes, ROPE_DIM)
         self.assertEqual(self.PACKED.tokens_per_row, 8)
         self.assertEqual(self.PACKED.shape, (TOTAL_PAGES, PAGE_SIZE // 8, 128))
+        self.assertEqual(self.PADDED.token_bytes, 128)
+        self.assertEqual(self.PADDED.tokens_per_row, 4)
         self.assertEqual(self.PADDED.shape, (TOTAL_PAGES, PAGE_SIZE // 4, 128))
         packed, padded = _empty(self.PACKED), _empty(self.PADDED)
         self.assertEqual(packed.nbytes, TOTAL_PAGES * PAGE_SIZE * ROPE_DIM)
@@ -707,40 +706,69 @@ class PackedRopeTest(parameterized.TestCase):
             (nope + padded.nbytes) // (TOTAL_PAGES * PAGE_SIZE), LKV_DIM + 128
         )
 
-    @parameterized.named_parameters(
-        dict(
-            testcase_name="rope_tc",
-            cache_type=KVCacheType.ROPE,
-            layout=KVCacheLayout.TENSORCORE,
-        ),
-        dict(
-            testcase_name="nope_sc",
-            cache_type=KVCacheType.NOPE,
-            layout=KVCacheLayout.SPARSECORE,
-        ),
-    )
-    def test_only_sparsecore_rope_can_be_packed(self, cache_type, layout):
-        with self.assertRaisesRegex(ValueError, "packed rope"):
-            SparseMLAKVCacheSpec.create(
-                cache_type,
-                layout,
+    def test_generic_alignment_and_xla_tile_fallback(self):
+        """Narrower RoPE dims align up to 64B and zero-pad their tail; pages
+        whose 8-token row count would be XLA-tile-padded fall back to 128B."""
+        spec_32 = SparseMLAKVCacheSpec.create(
+            KVCacheType.ROPE,
+            KVCacheLayout.SPARSECORE,
+            TOTAL_PAGES,
+            PAGE_SIZE,
+            32,
+            KV_PACKING,
+        )
+        self.assertEqual((spec_32.token_bytes, spec_32.tokens_per_row), (64, 8))
+        raw = np.full((4, 32), 0x5A, np.uint8)
+        k_pe = jax.lax.bitcast_convert_type(jnp.asarray(raw), jnp.float8_e4m3fn)
+        kv_c = jnp.zeros((4, LKV_DIM), jnp.float8_e4m3fn)
+        _, rope_32 = update_sparse_mla_kv_cache_jax(
+            _empty(self.NOPE),
+            _empty(spec_32),
+            kv_c,
+            k_pe,
+            jnp.asarray([4], jnp.int32),
+            jnp.asarray([1], jnp.int32),
+            jnp.asarray([0, 4], jnp.int32),
+            nope_spec=self.NOPE,
+            rope_spec=spec_32,
+        )
+        decoded = token_bytes(rope_32, spec_32)[1, :4]
+        np.testing.assert_array_equal(decoded[:, :32], raw)
+        self.assertEqual(int(np.count_nonzero(decoded[:, 32:])), 0)
+
+        for fallback_page in (4, 96):
+            spec_fb = SparseMLAKVCacheSpec.create(
+                KVCacheType.ROPE,
+                KVCacheLayout.SPARSECORE,
                 TOTAL_PAGES,
-                PAGE_SIZE,
+                fallback_page,
                 ROPE_DIM,
                 KV_PACKING,
-                packed_rope=True,
             )
+            self.assertEqual(
+                (spec_fb.token_bytes, spec_fb.tokens_per_row),
+                (128, 4),
+            )
+            self.assertEqual(spec_fb.shape, (TOTAL_PAGES, fallback_page // 4, 128))
 
-    def test_packed_rope_rejects_non_64b_head_dim(self):
-        with self.assertRaisesRegex(ValueError, "expects unpadded head_dim == 64B"):
+    def test_invalid_sparsecore_rope_shapes_rejected(self):
+        with self.assertRaisesRegex(ValueError, "must not exceed"):
             SparseMLAKVCacheSpec.create(
                 KVCacheType.ROPE,
                 KVCacheLayout.SPARSECORE,
                 TOTAL_PAGES,
                 PAGE_SIZE,
-                32,
+                192,
                 KV_PACKING,
-                packed_rope=True,
+            )
+        with self.assertRaisesRegex(ValueError, "page_size"):
+            SparseMLAKVCacheSpec.create(
+                KVCacheType.ROPE,
+                KVCacheLayout.SPARSECORE,
+                TOTAL_PAGES,
+                2,
+                ROPE_DIM,
+                kv_packing=1,
             )
 
     def test_packed_writer_matches_the_host_layout(self):

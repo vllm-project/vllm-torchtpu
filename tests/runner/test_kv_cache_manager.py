@@ -59,7 +59,7 @@ from vllm_torchtpu.runner.kv_cache_dsv4 import DsV4KVCacheAllocator
 from vllm_torchtpu.runner.kv_cache_manager import (
     KVCacheManager,
     check_kv_caches_cover_block_ids,
-    packed_rope_page_size_bytes,
+    sparse_mla_page_size_bytes,
 )
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.tpu_worker import TPUWorker
@@ -155,24 +155,34 @@ def test_check_kv_caches_cover_block_ids_rejects_missing_attention_cache():
         )
 
 
-@pytest.mark.parametrize("packed_rope", [False, True])
+@pytest.mark.parametrize("rope_layout", ["sparsecore", "tensorcore"])
 @pytest.mark.parametrize("use_sparse", [False, True])
-def test_packed_rope_page_size_bytes(monkeypatch, packed_rope, use_sparse):
-    """Only a sparse MLA layer with the flag on gets the packed page; anything
-    else keeps the padded MLA page (None)."""
-    monkeypatch.setenv("TPU_SPARSE_MLA_PACKED_ROPE", "1" if packed_rope else "0")
+def test_sparse_mla_page_size_bytes(monkeypatch, rope_layout, use_sparse):
+    """Sparse MLA layers measure their allocated (nope, rope) page size
+    (576 B/token on SparseCore, 640 B/token on TensorCore); dense MLA layers
+    and unconfigured mocks return None."""
+    monkeypatch.setenv("TPU_SPARSE_MLA_ROPE_LAYOUT", rope_layout)
     layer = SimpleNamespace(head_size=576, use_sparse=use_sparse)
-    got = packed_rope_page_size_bytes(layer, 256, torch.float8_e4m3fn)
-    assert got == (576 * 256 if packed_rope and use_sparse else None)
+    got = sparse_mla_page_size_bytes(layer, 256, torch.float8_e4m3fn)
+    expected = (
+        None if not use_sparse else (576 if rope_layout == "sparsecore" else 640) * 256
+    )
+    assert got == expected
+    assert (
+        sparse_mla_page_size_bytes(
+            MagicMock(spec=MLAAttention), 256, torch.float8_e4m3fn
+        )
+        is None
+    )
 
 
-@pytest.mark.parametrize("packed_rope", [False, True])
-def test_get_kv_cache_spec_sparse_mla_packed_rope(monkeypatch, packed_rope):
-    """TPU_SPARSE_MLA_PACKED_ROPE shrinks a sparse MLA layer's published
-    page from 640 to 576 B/token, and the TPU normalizer keeps it there;
-    off, the spec is the padded one exactly as before. Runs on CPU: the
-    runner is a mock carrying only what `get_kv_cache_spec` reads."""
-    monkeypatch.setenv("TPU_SPARSE_MLA_PACKED_ROPE", "1" if packed_rope else "0")
+@pytest.mark.parametrize("layout", ["sparsecore", "tensorcore"])
+def test_get_kv_cache_spec_sparse_mla(monkeypatch, layout):
+    """By default (SparseCore), a sparse MLA layer publishes its 576 B/token
+    page and the TPU normalizer preserves it; on TensorCore it publishes the
+    640 B/token padded page. Runs on CPU."""
+    monkeypatch.setenv("TPU_SPARSE_MLA_NOPE_LAYOUT", layout)
+    monkeypatch.setenv("TPU_SPARSE_MLA_ROPE_LAYOUT", layout)
     runner = MagicMock(spec=TPUModelRunner)
     runner.block_size = 16
     runner.kv_cache_dtype = torch.float8_e4m3fn
@@ -210,7 +220,7 @@ def test_get_kv_cache_spec_sparse_mla_packed_rope(monkeypatch, packed_rope):
     ):
         spec = runner.get_kv_cache_spec()["mla_0"]
 
-    token_bytes = 576 if packed_rope else 640
+    token_bytes = 576 if layout == "sparsecore" else 640
     assert isinstance(spec, MLAAttentionSpec)
     assert spec.page_size_bytes == token_bytes * runner.block_size
     assert spec.state_content_bytes == token_bytes

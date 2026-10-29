@@ -1632,30 +1632,24 @@ def test_indexer_kv_layout_and_op_resolution_raiden_glm_admission(monkeypatch, c
         mla_attention_op._resolve_indexer_kv_cache_mode(cache_has, k_packed, mode="sal")
 
 
-def test_sparse_page_size_drops_the_rope_padding_with_packed_rope(monkeypatch):
-    """TPU_SPARSE_MLA_PACKED_ROPE: a sparse layer's page shrinks from 640 to
-    576 B/token; off, it is the padded MLA page exactly as before."""
+def test_sparse_page_size_packs_rope_by_default_on_sparsecore(monkeypatch):
+    """SparseCore sparse MLA packs the 64B fp8 RoPE cache to 8 tokens/row
+    (576 B/token total) by default; TensorCore keeps the 128B padded RoPE page
+    (640 B/token total), and TPU_SPARSE_MLA_PACKED_ROPE is removed."""
+    assert not hasattr(envs, "TPU_SPARSE_MLA_PACKED_ROPE")
     block_size, fp8 = 256, torch.float8_e4m3fn
     padded = PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
         block_size, 1, 576, fp8
     )
     assert padded == 640 * block_size
 
-    monkeypatch.delenv("TPU_SPARSE_MLA_PACKED_ROPE", raising=False)
-    assert not envs.TPU_SPARSE_MLA_PACKED_ROPE
-    assert (
-        PallasMLAttentionBackend.get_sparse_kv_cache_page_size_bytes(
-            block_size, 576, fp8
-        )
-        == padded
-    )
-
-    monkeypatch.setenv("TPU_SPARSE_MLA_PACKED_ROPE", "1")
     nope, rope = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
         3, block_size, 576, fp8
     )
-    assert rope.packed_rope and not nope.packed_rope
+    assert nope.shape == (3, block_size, 128)
     assert rope.shape == (3, block_size // 8, 128)
+    assert rope.token_bytes == 64
+    assert rope.tokens_per_row == 8
     assert (
         PallasMLAttentionBackend.get_sparse_kv_cache_page_size_bytes(
             block_size, 576, fp8
@@ -1664,16 +1658,16 @@ def test_sparse_page_size_drops_the_rope_padding_with_packed_rope(monkeypatch):
         == padded - 64 * block_size
     )
 
-
-@pytest.mark.parametrize(
-    "layout_env", ["TPU_SPARSE_MLA_NOPE_LAYOUT", "TPU_SPARSE_MLA_ROPE_LAYOUT"]
-)
-def test_packed_rope_refuses_tensorcore_layouts(monkeypatch, layout_env):
-    """Only the native SparseCore gather reads packed rows: a TensorCore cache
-    (dsa_gather, masked-dense) must fail at allocation, not at the first step."""
-    monkeypatch.setenv("TPU_SPARSE_MLA_PACKED_ROPE", "1")
-    monkeypatch.setenv(layout_env, "tensorcore")
-    with pytest.raises(ValueError, match="TPU_SPARSE_MLA_PACKED_ROPE"):
-        PallasMLAttentionBackend.get_sparse_kv_cache_specs(
-            2, 256, 576, torch.float8_e4m3fn
+    monkeypatch.setenv("TPU_SPARSE_MLA_NOPE_LAYOUT", "tensorcore")
+    monkeypatch.setenv("TPU_SPARSE_MLA_ROPE_LAYOUT", "tensorcore")
+    _, rope_tc = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+        3, block_size, 576, fp8
+    )
+    assert rope_tc.shape == (3, block_size // 4, 4, 128)
+    assert rope_tc.token_bytes == 128
+    assert (
+        PallasMLAttentionBackend.get_sparse_kv_cache_page_size_bytes(
+            block_size, 576, fp8
         )
+        == padded
+    )

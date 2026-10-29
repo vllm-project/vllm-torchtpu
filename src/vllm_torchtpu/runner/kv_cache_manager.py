@@ -137,17 +137,15 @@ def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
     )
 
 
-def packed_rope_page_size_bytes(
+def sparse_mla_page_size_bytes(
     attn_module: MLAAttention, block_size: int, kv_cache_dtype: torch.dtype
 ) -> int | None:
-    """A sparse MLA layer's page bytes under `TPU_SPARSE_MLA_PACKED_ROPE`.
+    """A sparse MLA layer's page bytes from its (nope, rope) layout specs.
 
-    None when the flag is off or the layer is not sparse, so the caller keeps
-    the padded `PallasMLAttentionBackend.get_kv_cache_page_size_bytes`.
+    None when the layer is not sparse, so dense MLA keeps the padded
+    `PallasMLAttentionBackend.get_kv_cache_page_size_bytes`.
     """
-    if not envs.TPU_SPARSE_MLA_PACKED_ROPE or not getattr(
-        attn_module, "use_sparse", False
-    ):
+    if getattr(attn_module, "use_sparse", False) is not True:
         return None
     return PallasMLAttentionBackend.get_sparse_kv_cache_page_size_bytes(
         block_size, attn_module.head_size, kv_cache_dtype
@@ -259,9 +257,9 @@ class KVCacheManager:
         # DSv4 layers whose specs must reach vLLM verbatim; see
         # `is_cache_for_ds_v4`.
         ds_v4_layers: set[str] = set()
-        # Sparse MLA layers sized for packed rope, which the normalizer's
-        # padded MLA page formula does not model.
-        packed_rope_layers: set[str] = set()
+        # Sparse MLA layers sized from their allocated (nope, rope) specs,
+        # which the normalizer's dense MLA page formula does not model.
+        sparse_mla_layers: set[str] = set()
         for layer_name, attn_module in layers.items():
             # Linear Attention path
             if isinstance(attn_module, MambaBase):
@@ -374,14 +372,14 @@ class KVCacheManager:
             elif isinstance(attn_module, MLAAttention):
                 if layer_name in kv_cache_spec:
                     continue
-                packed_page_size = (
+                sparse_page_size = (
                     None
                     if self.runner._hybrid_uniform_page_size_bytes is not None
-                    else packed_rope_page_size_bytes(
+                    else sparse_mla_page_size_bytes(
                         attn_module, block_size, self.runner.kv_cache_dtype
                     )
                 )
-                if packed_page_size is not None:
+                if sparse_page_size is not None:
                     # Published as `customize_spec` would, but from the
                     # (nope, rope) arrays actually allocated.
                     kv_cache_spec[layer_name] = MLAAttentionSpec(
@@ -390,11 +388,11 @@ class KVCacheManager:
                         head_size=attn_module.head_size,
                         dtype=self.runner.kv_cache_dtype,
                         cache_dtype_str=cache_dtype_str,
-                        page_size_padded=packed_page_size,
+                        page_size_padded=sparse_page_size,
                         num_head_slots=1,
-                        state_content_bytes=packed_page_size // block_size,
+                        state_content_bytes=sparse_page_size // block_size,
                     )
-                    packed_rope_layers.add(layer_name)
+                    sparse_mla_layers.add(layer_name)
                     continue
                 page_size_padded = (
                     self.runner._hybrid_uniform_page_size_bytes
@@ -463,7 +461,7 @@ class KVCacheManager:
             kv_cache_spec,
             self.runner.kv_cache_dtype,
             enable_unified_kv_layout=self.runner._unified_kv_layout,
-            exempt_layers=ds_v4_layers | packed_rope_layers,
+            exempt_layers=ds_v4_layers | sparse_mla_layers,
             attention_backend=cast("type[PallasAttentionBackend] | None", backend_cls),
         )
         if (
@@ -706,7 +704,7 @@ class KVCacheManager:
                 )
             elif isinstance(m, MLAAttention):
                 attn_page_sizes.add(
-                    packed_rope_page_size_bytes(
+                    sparse_mla_page_size_bytes(
                         m, block_size, self.runner.kv_cache_dtype
                     )
                     or PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
@@ -729,7 +727,7 @@ class KVCacheManager:
                 "vLLM's unify_kv_cache_spec_page_size leaving a stale "
                 "page_size_padded behind when layer head_dims differ. "
                 "Note: A model mixing sparse and dense MLA layers pads "
-                "to the dense size, neutralizing packed rope savings.",
+                "to the dense size, neutralizing sparse MLA RoPE savings.",
                 uniform_page_size_bytes,
                 sorted(attn_page_sizes),
             )
@@ -778,7 +776,15 @@ class KVCacheManager:
         if block_size is None:
             block_size = self.runner.vllm_config.cache_config.block_size
         assert block_size is not None
-        attn_page_size_bytes = attention_backend.get_kv_cache_page_size_bytes(
+        attn_page_size_bytes = (
+            sparse_mla_page_size_bytes(
+                first_attn_module,
+                block_size,
+                self.runner.kv_cache_dtype,
+            )
+            if isinstance(first_attn_module, MLAAttention)
+            else None
+        ) or attention_backend.get_kv_cache_page_size_bytes(
             block_size,
             num_kv_heads,
             first_attn_module.head_size,

@@ -39,10 +39,7 @@ NUM_LANES = 16
 ROPE_PACKING = 4
 QUADS_PER_ATOM = 16
 OCCURRENCES_PER_ATOM = QUADS_PER_ATOM * ROPE_PACKING
-ROPE_WORDS = 32  # one rope token on the SparseCore view of the rope cache
-# One rope token under packed rope (`TPU_SPARSE_MLA_PACKED_ROPE`): its 64 fp8
-# bytes alone, eight tokens per 128-word cache row instead of four.
-PACKED_ROPE_WORDS = 16
+ROPE_WORDS = 32  # max words per rope token (128B padded view)
 
 
 def _delta_swap(x, y, shift, mask):
@@ -249,7 +246,6 @@ def _kernel(
         "wait_mode",
         "serve_pipelined",
         "live_multiple",
-        "packed_rope",
     ),
 )
 def dsa_gather_native_sc(
@@ -263,36 +259,52 @@ def dsa_gather_native_sc(
     serve_pipelined: bool = True,
     num_live_indices: jax.Array | None = None,
     live_multiple: int = 1,
-    packed_rope: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Gather explicit native-SC ``uint32`` NOPE and ROPE cache rows.
 
-    ``nope_cache`` has one 128-word row per token. ``rope_cache`` has one
-    128-word row per group of four tokens; each token owns a consecutive
-    32-word quarter. The returned ROPE is register-transposed into the grouped
-    TensorCore format expected by the shared attention consumer.
+    ``nope_cache`` has one 128-word row per token. ``rope_cache`` packs
+    ``128 // rope_words`` tokens into each 128-word row (e.g. eight 16-word
+    64B tokens or four 32-word 128B tokens), with ``rope_words`` derived from
+    the cache shapes. The returned ROPE is register-transposed into the grouped
+    TensorCore format expected by the shared attention consumer, with any lanes
+    past ``4 * rope_words`` zeroed.
 
     ``num_live_indices`` (traced i32 scalar, optional) gathers only the logical
     batches covering the first ``num_live_indices`` rows; later rows are left
     unwritten. ``live_multiple`` is a static promise that ``num_live_indices``
     is a multiple of it; when that multiple covers whole owner rounds the
     per-owner tail guard is dropped.
-
-    ``packed_rope`` reads a ROPE cache whose tokens own 16-word eighths of a
-    row (`SparseMLAKVCacheSpec.packed_rope`) instead of 32-word quarters. The
-    gathered output is the same: the rope lanes past each token's 64 bytes are
-    zeroed, exactly as the padded cache stores them.
     """
     if wait_mode not in ("overlap_rope", "before_rope"):
         raise ValueError(f"unknown {wait_mode=}")
     if nope_cache.dtype != jnp.uint32 or nope_cache.shape[-1] != 128:
         raise ValueError("native-SC NOPE must be explicit uint32[...,128]")
     if rope_cache.dtype != jnp.uint32 or rope_cache.shape[-1] != 128:
-        raise ValueError("native-SC ROPE must be quarter-major uint32[...,128]")
+        raise ValueError("native-SC ROPE must be banded uint32[...,128]")
     if indices.dtype != jnp.int32 or indices.ndim != 2:
         raise ValueError("indices must be int32[query, topk]")
     if indices.size != out_size:
         raise ValueError(f"indices has {indices.size} values, expected {out_size}")
+
+    nope_rows_view = nope_cache.reshape(-1, 128)
+    num_tokens = nope_rows_view.shape[0]
+    if num_tokens <= 0 or rope_cache.size % num_tokens != 0:
+        raise ValueError(
+            f"ROPE cache ({rope_cache.size} words) must divide evenly across "
+            f"NOPE tokens ({num_tokens})"
+        )
+    rope_words = rope_cache.size // num_tokens
+    if (
+        rope_words <= 0
+        or rope_words % NUM_LANES != 0
+        or ROPE_PACKING * rope_words > 128
+        or 128 % rope_words != 0
+    ):
+        raise ValueError(
+            f"derived rope_words ({rope_words}) must be a positive multiple of "
+            f"{NUM_LANES} dividing 128 with {ROPE_PACKING} * rope_words <= 128"
+        )
+    rope_rows_view = rope_cache.reshape(-1, rope_words)
 
     tpu_info = pltpu.get_tpu_info()
     sc_info = tpu_info.sparse_core if tpu_info is not None else None
@@ -320,14 +332,6 @@ def dsa_gather_native_sc(
     batches_per_owner = num_batches // num_owners
     live = num_live_indices is not None
     scratch_types = {"sem_ref": pltpu.SemaphoreType.DMA((ROPE_PACKING,))}
-    rope_words = PACKED_ROPE_WORDS if packed_rope else ROPE_WORDS
-    nope_rows_view = nope_cache.reshape(-1, 128)
-    rope_rows_view = rope_cache.reshape(-1, rope_words)
-    if packed_rope and rope_rows_view.shape[0] != nope_rows_view.shape[0]:
-        raise ValueError(
-            f"packed rope cache holds {rope_rows_view.shape[0]} tokens, the NOPE "
-            f"cache {nope_rows_view.shape[0]}"
-        )
     operands = [
         nope_rows_view,
         rope_rows_view,
@@ -397,8 +401,7 @@ def dsa_gather_native_sc(
         scratch_types=scratch_types,
         mesh=mesh,
         name=(
-            f"sc_native_sc_gather_a{atoms_per_batch}_{wait_mode}_"
+            f"sc_native_sc_gather_a{atoms_per_batch}_rw{rope_words}_{wait_mode}_"
             f"{'pipe' if serve_pipelined else 'nopipe'}{'_live' if live else ''}"
-            f"{'_packedrope' if packed_rope else ''}"
         ),
     )(*operands)
