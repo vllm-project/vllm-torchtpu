@@ -479,6 +479,70 @@ def calculate_block_sizes(
     return decode_block_sizes, prefill_block_sizes
 
 
+def _select_rpa_metadata(
+    use_compact: jax.Array,
+    cu_q_lens: jax.Array,
+    q_offsets: jax.Array,
+    kv_cache_lens: jax.Array,
+    kv_new_lens: jax.Array,
+    distribution: jax.Array,
+    compact_cfgs: configs.RpaConfigs,
+    streamed_cfgs: configs.RpaConfigs,
+) -> tuple[schedule.RpaSchedule, schedule.RpaSchedule]:
+    """Select shared metadata without capturing per-layer Q/K/V or KV buffers."""
+    computer_cls = schedule.BaseMetadataComputer
+    compact_shape = computer_cls.get_rpa_schedule(
+        compact_cfgs, multiplier=compact_cfgs.max_schedule_size_multiplier
+    )
+    streamed_shape = computer_cls.get_rpa_schedule(
+        streamed_cfgs, multiplier=streamed_cfgs.max_schedule_size_multiplier
+    )
+    compact_leaves, compact_tree = jax.tree.flatten(compact_shape)
+    streamed_leaves, streamed_tree = jax.tree.flatten(streamed_shape)
+    # Streaming adds chunk_steps. Other leaves are flattened int32 buffers;
+    # their logical dimensions and config remain in the individual tree defs.
+    assert len(compact_leaves) + 1 == len(streamed_leaves)
+    common_sizes = [
+        max(x.shape[0], compact_leaves[i].shape[0])
+        if i < len(compact_leaves)
+        else x.shape[0]
+        for i, x in enumerate(streamed_leaves)
+    ]
+
+    def generate(cfgs):
+        metadata = schedule.generate_rpa_metadata(
+            cu_q_lens,
+            q_offsets,
+            kv_cache_lens,
+            kv_new_lens,
+            distribution,
+            cfgs=cfgs,
+            computer_cls=computer_cls,
+        )
+        leaves = jax.tree.leaves(metadata)
+        return tuple(
+            jnp.pad(leaves[i], ((0, size - leaves[i].shape[0]),))
+            if i < len(leaves)
+            else jnp.zeros((size,), dtype=streamed_leaves[i].dtype)
+            for i, size in enumerate(common_sizes)
+        )
+
+    buffers = jax.lax.cond(
+        use_compact,
+        lambda: generate(compact_cfgs),
+        lambda: generate(streamed_cfgs),
+    )
+    compact = jax.tree.unflatten(
+        compact_tree,
+        [x[: spec.shape[0]] for x, spec in zip(buffers, compact_leaves)],
+    )
+    streamed = jax.tree.unflatten(
+        streamed_tree,
+        [x[: spec.shape[0]] for x, spec in zip(buffers, streamed_leaves)],
+    )
+    return compact, streamed
+
+
 @jax.jit(
     static_argnames=(
         "sm_scale",
@@ -630,9 +694,22 @@ def ragged_paged_attention(
     # Keep scalar prefetch for buckets that fit the original SMEM path. At a
     # 1 Mi-token page table, the Qwen FP8/HND geometry runs with ten rows
     # (160 KiB) and fails with eleven (176 KiB) in the old scheduler.
+    compact_pages = 0
     if stream_page_indices is None:
         legacy_limit = 160 * 1024 if pages_per_seq >= 4096 else 512 * 1024
         stream_page_indices = num_page_indices * 4 > legacy_limit
+        if (
+            stream_page_indices
+            and cp_group_size is None
+            and attention_scope == configs.AttentionScope.FULL
+        ):
+            row_alignment = pltpu.get_tpu_info().num_lanes
+            compact_pages = 160 * 1024 // page_indices.dtype.itemsize // max_num_seqs
+            compact_pages = min(compact_pages, pages_per_seq)
+            compact_pages = compact_pages // row_alignment * row_alignment
+            if compact_pages >= pages_per_seq:
+                compact_pages = 0
+    assert stream_page_indices is not None
     model_cfgs = configs.ModelConfigs(
         num_q_heads=num_q_heads,
         num_kv_heads=num_kv_heads,
@@ -748,66 +825,61 @@ def ragged_paged_attention(
         kv_new_lens = q_lens
         q_offsets = global_kv_cache_lens
 
-    def run_rpa_kernel(
-        mode: configs.RpaCase,
-        o_hbm_alias_q_hbm: jax.Array,
-        kv_cache: jax.Array,
-        lse_hbm_in: jax.Array | None,
-    ):
-        if mode == configs.RpaCase.DECODE:
-            effective_blocks = decode_block_sizes or default_decode
-        else:
-            effective_blocks = prefill_block_sizes or default_prefill
-        cfgs = configs.RpaConfigs(
+    if cp_group_size is not None:
+        computer_cls = schedule_cp.CPMetadataComputer
+        extra_scalars = (cp_rank,) if cp_rank is not None else ()
+    else:
+        computer_cls = schedule.BaseMetadataComputer
+        extra_scalars = ()
+
+    def mode_configs(mode, serving, defaults):
+        effective_blocks = (
+            decode_block_sizes or defaults[0]
+            if mode == configs.RpaCase.DECODE
+            else prefill_block_sizes or defaults[1]
+        )
+        return configs.RpaConfigs(
             block=effective_blocks,
             model=model_cfgs,
-            serve=serve_cfgs,
+            serve=serving,
             vmem_limit_bytes=vmem_limit_bytes,
             mode=mode,
         )
+
+    def run_rpa_kernel(
+        cfgs,
+        metadata,
+        indices,
+        o_hbm_alias_q_hbm,
+        kv_cache,
+        lse_hbm_in,
+    ):
         cfgs.validate_inputs(
             q=queries,
             k=keys,
             v=values,
             kv_cache=kv_cache,
             kv_lens=kv_lens,
-            page_indices=page_indices,
+            page_indices=indices,
             cu_q_lens=cu_q_lens,
             distribution=distribution,
         )
-        # Select metadata computer class.
-        if cp_group_size is not None:
-            computer_cls = schedule_cp.CPMetadataComputer
-            extra_scalars = (cp_rank,) if cp_rank is not None else ()
-        else:
-            computer_cls = schedule.BaseMetadataComputer
-            extra_scalars = ()
-        schedule_hbm = schedule.generate_rpa_metadata(
-            cu_q_lens,
-            q_offsets,
-            kv_cache_lens,
-            kv_new_lens,
-            distribution,
-            cfgs=cfgs,
-            computer_cls=computer_cls,
-            extra_scalars=extra_scalars,
-        )
-        kernel_page_indices = page_indices
-        if stream_page_indices:
-            group_size = serve_cfgs.page_table_group_size
+        kernel_page_indices = indices
+        if cfgs.serve.stream_page_indices:
+            group_size = cfgs.serve.page_table_group_size
             extra_rows = pl.cdiv(max_num_seqs, group_size) * group_size - max_num_seqs
-            if serve_cfgs.page_table_row_stride == serve_cfgs.pages_per_seq:
+            if cfgs.serve.page_table_row_stride == cfgs.serve.pages_per_seq:
                 kernel_page_indices = jnp.pad(
-                    page_indices, (0, extra_rows * serve_cfgs.pages_per_seq)
+                    indices, (0, extra_rows * cfgs.serve.pages_per_seq)
                 )
             else:
                 kernel_page_indices = jnp.pad(
-                    page_indices.reshape(max_num_seqs, serve_cfgs.pages_per_seq),
+                    indices.reshape(max_num_seqs, cfgs.serve.pages_per_seq),
                     (
                         (0, extra_rows),
                         (
                             0,
-                            serve_cfgs.page_table_row_stride - serve_cfgs.pages_per_seq,
+                            cfgs.serve.page_table_row_stride - cfgs.serve.pages_per_seq,
                         ),
                     ),
                 ).reshape(-1)
@@ -817,7 +889,7 @@ def ragged_paged_attention(
             kv_cache_lens,
             kv_new_lens,
             kernel_page_indices,
-            schedule_hbm,
+            metadata,
             o_hbm_alias_q_hbm,
             new_kv_hbm,
             kv_cache,
@@ -832,12 +904,71 @@ def ragged_paged_attention(
             lse_out = None
         return o_out, kv_out, lse_out
 
-    o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
-        configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm_init
-    )
-    o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
-        configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm
-    )
+    compact_serving = None
+    compact_defaults = None
+    use_compact = None
+    if compact_pages:
+        compact_serving = dataclasses.replace(
+            serve_cfgs,
+            num_page_indices=max_num_seqs * compact_pages,
+            stream_page_indices=False,
+            max_schedule_size_multiplier=40 if compact_pages >= 4096 else 16,
+        )
+        compact_defaults = calculate_block_sizes(
+            model_cfgs,
+            compact_serving,
+            vmem_limit_bytes,
+            decode_query_size=decode_query_size,
+        )
+        compact_indices = page_indices.reshape(max_num_seqs, pages_per_seq)
+        compact_indices = compact_indices[:, :compact_pages].reshape(-1)
+        active = jnp.arange(max_num_seqs) < distribution[2]
+        fits = jnp.all(jnp.where(active, kv_lens <= compact_pages * page_size, True))
+        use_compact = fits & (distribution[0] == distribution[2])
+
+    state = (q_hbm, kv_cache, lse_hbm_init)
+    for mode in (configs.RpaCase.DECODE, configs.RpaCase.MIXED):
+        cfgs = mode_configs(mode, serve_cfgs, (default_decode, default_prefill))
+        if compact_pages:
+            assert compact_serving is not None
+            assert compact_defaults is not None
+            assert use_compact is not None
+            compact_cfgs = mode_configs(mode, compact_serving, compact_defaults)
+            compact_metadata, streamed_metadata = _select_rpa_metadata(
+                use_compact,
+                cu_q_lens,
+                q_offsets,
+                kv_cache_lens,
+                kv_new_lens,
+                distribution,
+                compact_cfgs,
+                cfgs,
+            )
+            # Only this conditional captures layer-specific data. Metadata's
+            # conditional has identical operands across layers and can be CSE'd.
+            state = jax.lax.cond(
+                use_compact,
+                lambda args, cfg=compact_cfgs, meta=compact_metadata: run_rpa_kernel(
+                    cfg, meta, compact_indices, *args
+                ),
+                lambda args, cfg=cfgs, meta=streamed_metadata: run_rpa_kernel(
+                    cfg, meta, page_indices, *args
+                ),
+                state,
+            )
+        else:
+            metadata = schedule.generate_rpa_metadata(
+                cu_q_lens,
+                q_offsets,
+                kv_cache_lens,
+                kv_new_lens,
+                distribution,
+                cfgs=cfgs,
+                computer_cls=computer_cls,
+                extra_scalars=extra_scalars,
+            )
+            state = run_rpa_kernel(cfgs, metadata, page_indices, *state)
+    o_hbm_alias_q_hbm, kv_cache, lse_hbm = state
     # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
     o_hbm = prepare_outputs(o_hbm_alias_q_hbm)
     # after: [kv_heads, max_tokens, q_per_kv, d]
