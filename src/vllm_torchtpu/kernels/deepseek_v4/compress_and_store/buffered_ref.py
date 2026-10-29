@@ -93,11 +93,40 @@ class CosSinRef(_BufferedRef):
         pltpu.make_async_copy(vmem_ref, vmem_ref, sem).wait()
 
 
+def _divmod_pow2(x, d: int):
+    """Floor `divmod(x, d)` of a scalar for a power-of-two `d`, negative x too.
+
+    A shift and a mask, where `//` and `%` lower to a sign fix-up each.
+    """
+    assert d > 0 and d & (d - 1) == 0, d
+    return x >> (d.bit_length() - 1), x & (d - 1)
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class PageBufferRef(_BufferedRef):
-    # VMEM block: cfgs.page_buffer_shape()
-    #   (tile_n, pages_to_buffer_per_token, page_size, hbm_pack, LANE) uint8
+class WindowRef(_BufferedRef):
+    # VMEM block: cfgs.window_shape()
+    #   (tile_n, window, N_FIELDS, head_tiles, LANE) f32
+    #
+    # Each token's window is DMA'd straight from its state rows: only the
+    # (prev or curr) kv and score rows its positions use, `window_chunk`
+    # positions per DMA.
+
+    @property
+    def _dmas_per_slot(self) -> int:
+        cfgs = self.cfgs
+        return cfgs.tile_sizes.tile_n * (cfgs.window // cfgs.window_chunk)
+
+    def _window_u8(self, slot):
+        window = cast(jax.Ref, self.window_ref.at[slot])
+        return window.bitcast(jnp.uint8).reshape(self.cfgs.window_bytes_shape())
+
+    def _dst(self, window_u8, n, w):
+        chunk = self.cfgs.window_chunk
+        if self.cfgs.dims.mode == config.Mode.CSA_INDEXER:
+            return window_u8.at[n, w, :, 0]  # (N_FIELDS, 4, LANE)
+        # (chunk, N_FIELDS, head_tiles, 4, LANE)
+        return window_u8.at[n, pl.ds(w, chunk)]
 
     def copy_in(self, src_ref, grid_indices):
         assert self.sem_recvs is not None
@@ -106,35 +135,72 @@ class PageBufferRef(_BufferedRef):
         sem = self.sem_recvs.at[slot]
         pid = grid_indices[0]
 
-        state_cache_ref, token_pages_ref = src_ref
+        state_cache_ref, token_pages_ref, positions_ref = src_ref
+        cfgs = self.cfgs
+        tile_n = cfgs.tile_sizes.tile_n
+        window = cfgs.window
+        chunk = cfgs.window_chunk
+        block_size = cfgs.state_block_size
+        pages_per_token = cfgs.pages_to_buffer_per_token
+        rows_per_token = cfgs.state_rows_per_token
+        is_indexer = cfgs.dims.mode == config.Mode.CSA_INDEXER
+        window_u8 = self._window_u8(slot)
 
-        tile_n = self.cfgs.tile_sizes.tile_n
-        pages_to_buffer_per_token = self.cfgs.pages_to_buffer_per_token
+        if not is_indexer:
+            # Token state rows are [kv, score] x [prev, curr] x field_rows.
+            num_pages, page_rows = state_cache_ref.shape[:2]
+            assert page_rows % rows_per_token == 0, (page_rows, rows_per_token)
+            # Its rows must line up with the window's (head_tiles, 4, LANE).
+            assert cfgs.field_rows == cfgs.head_tiles
+            assert cfgs.hbm_pack == config.FP32_BYTES
+            state_rows = state_cache_ref.reshape(
+                num_pages,
+                page_rows // rows_per_token,
+                config.N_FIELDS,
+                cfgs.overlap_factor,
+                cfgs.field_rows,
+                cfgs.hbm_pack,
+                config.LANE,
+            )
 
-        page_buffer_ref = cast(jax.Ref, self.window_ref.at[slot])
-        global_idx = pid * tile_n
-
-        @pl.loop(0, tile_n * pages_to_buffer_per_token, unroll=True)
-        def loop_body(idx):
-            n = idx // pages_to_buffer_per_token
-            p = idx % pages_to_buffer_per_token
-            idx_n = global_idx + n
-
-            # compress_norm_rope_store looks up each token's window pages,
-            # oldest first.
-            page = token_pages_ref[idx_n * pages_to_buffer_per_token + p]
-
-            src = state_cache_ref.at[page, :, :, :]
-            dest = page_buffer_ref.at[n, p, :, :, :]
-            pltpu.make_async_copy(src, dest, sem).start()
+        for n in range(tile_n):
+            idx = jnp.minimum(pid * tile_n + n, cfgs.dims.size_n - 1)
+            pos = positions_ref[idx]
+            # A compressed token's window is chunk-aligned already; rounding
+            # only keeps a padding token's reads inside one page.
+            start = (pos - window + 1) & -chunk
+            pos_block, _ = _divmod_pow2(pos, block_size)
+            for w in range(0, window, chunk):
+                block, offset = _divmod_pow2(start + w, block_size)
+                # compress_norm_rope_store looks up each token's window pages,
+                # oldest first.
+                p = block - pos_block + pages_per_token - 1
+                page = token_pages_ref[idx * pages_per_token + p]
+                half = w // cfgs.dims.compress_ratio if cfgs.dims.overlap else 0
+                if is_indexer:
+                    # `proj_and_save_state` stores the f32 state byte-transposed:
+                    # one (4, 256) row per field holds prev in lanes 0:128 and
+                    # curr in 128:256.
+                    src = state_cache_ref.at[
+                        page,
+                        pl.ds(offset * rows_per_token, config.N_FIELDS),
+                        :,
+                        pl.ds(half * config.LANE, config.LANE),
+                    ]
+                else:
+                    src = state_rows.at[page, pl.ds(offset, chunk), :, half]
+                dst = self._dst(window_u8, n, w)
+                pltpu.make_async_copy(src, dst, sem).start()
 
     def wait_in(self, src_ref, grid_indices):
         assert self.sem_recvs is not None
         assert self.window_ref is not None
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
-        pltpu.make_async_copy(vmem_ref, vmem_ref, sem).wait()
+        # Every DMA of a slot moves the same number of bytes.
+        dst = self._dst(self._window_u8(slot), 0, 0)
+        for _ in range(self._dmas_per_slot):
+            pltpu.make_async_copy(dst, dst, sem).wait()
 
 
 @jax.tree_util.register_dataclass
@@ -439,7 +505,7 @@ def create_allocs_and_specs(
     is_first_mask_ref,
     is_first_mask_rope_ref,
 ) -> tuple[
-    tuple[CosSinRef | None, OutputRef, PageBufferRef, RoPEOutputRef | None],
+    tuple[CosSinRef | None, OutputRef, WindowRef, RoPEOutputRef | None],
     tuple[pl.BlockSpec | None, pl.BlockSpec, pl.BlockSpec, pl.BlockSpec | None],
     tuple[
         tuple[Any, ...] | None,
@@ -500,23 +566,24 @@ def create_allocs_and_specs(
     else:
         output_args = (cache_ref, kv_slot_mapping_ref)
 
-    # page_buffer
-    page_buffer_spec = pl.BlockSpec(
-        block_shape=cfgs.page_buffer_shape(),
+    # window
+    window_spec = pl.BlockSpec(
+        block_shape=cfgs.window_shape(),
         memory_space=pltpu.VMEM,
-        index_map=lambda i: (i, 0, 0, 0),
+        index_map=lambda i: (i, 0, 0, 0, 0),
     )
-    page_buffer_alloc = PageBufferRef.create(
-        spec=page_buffer_spec,
-        dtype_or_type=jnp.uint8,
+    window_alloc = WindowRef.create(
+        spec=window_spec,
+        dtype_or_type=jnp.float32,
         buffer_type=pltpu.BufferType.INPUT,
         buffer_count=2,
         use_lookahead=False,
         cfgs=cfgs,
     )
-    page_buffer_args = (
+    window_args = (
         cache_ref if state_cache_ref is None else state_cache_ref,
         token_pages_ref,
+        positions_ref,
     )
 
     # rope
@@ -539,7 +606,7 @@ def create_allocs_and_specs(
         rope_alloc = rope_spec = rope_args = None
 
     return (
-        (cos_sin_alloc, output_alloc, page_buffer_alloc, rope_alloc),
-        (cos_sin_spec, output_spec, page_buffer_spec, rope_spec),
-        (cos_sin_args, output_args, page_buffer_args, rope_args),
+        (cos_sin_alloc, output_alloc, window_alloc, rope_alloc),
+        (cos_sin_spec, output_spec, window_spec, rope_spec),
+        (cos_sin_args, output_args, window_args, rope_args),
     )

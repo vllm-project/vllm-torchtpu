@@ -45,6 +45,7 @@ Modes:
 
 import dataclasses
 import enum
+import math
 from typing import Any
 
 import jax
@@ -487,28 +488,45 @@ class Configs:
         """Pages that must be resident to cover one token's window (+1 guard)."""
         return pl.cdiv(self.window, self.state_block_size) + 1
 
+    @property
+    def window_chunk(self) -> int:
+        """Window positions fetched from the state array by one DMA.
+
+        A compressed token's window starts on a multiple of compress_ratio, so
+        a run of gcd(compress_ratio, state_block_size) positions starting there
+        stays in one state page and one prev/curr half. The indexer keeps the
+        halves in the two lane halves of a row, so it fetches one position.
+        The DMA addressing (`buffered_ref.WindowRef`) needs a power-of-two
+        state block size.
+        """
+        bs = self.state_block_size
+        assert bs > 0 and bs & (bs - 1) == 0, f"state_block_size {bs}"
+        if self.dims.mode == Mode.CSA_INDEXER:
+            return 1
+        return math.gcd(self.dims.compress_ratio, self.state_block_size)
+
     # --- shapes (single source of truth for every reshape / BlockSpec) ---------
     @property
     def _tile_n(self) -> int:
         return self.tile_sizes.tile_n
 
     def window_shape(self) -> tuple[int, ...]:
-        """f32 window scratch: (fields, tile, window, head_tiles, lane)."""
-        return (N_FIELDS, self._tile_n, self.window, self.head_tiles, LANE)
+        """f32 window block: (tile, window, fields, head_tiles, lane)."""
+        return (self._tile_n, self.window, N_FIELDS, self.head_tiles, LANE)
 
     def window_bytes_shape(self) -> tuple[int, ...]:
-        """uint8 view of the window scratch; each f32 lane -> FP32_BYTES rows.
+        """uint8 view of the window block; each f32 lane -> FP32_BYTES rows.
 
         Note: that trailing FP32_BYTES (4) is bytes-per-f32, NOT the HBM SLOT_PACK
         (also 4) -- they're numerically equal but mean different things.
 
         Returns:
-          The shape of the window bytes scratch.
+          The shape of the window bytes view.
         """
         return (
-            N_FIELDS,
             self._tile_n,
             self.window,
+            N_FIELDS,
             self.head_tiles,
             FP32_BYTES,
             LANE,
@@ -529,18 +547,6 @@ class Configs:
         assert self.dims.seq_along_lane
         padded = pl.cdiv(max(self.dims.size_n, 1), LANE) * LANE
         return (SAL_SUBLANE_GROUPS, SLOT_PACK, padded)
-
-    def page_buffer_shape(self) -> tuple[int, ...]:
-        """Page-buffer VMEM block: (tile, pages, state page rows) + cache_last_dims.
-
-        Pages are DMA'd whole out of the *state* array, so this is sized by
-        `state_physical_page_size`, not by the compressed-KV page.
-        """
-        return (
-            self._tile_n,
-            self.pages_to_buffer_per_token,
-            self.state_physical_page_size,
-        ) + self.cache_last_dims
 
     def rope_output_shape(self) -> tuple[int, ...]:
         """RoPE output VMEM block: (tile, 4, lane)."""
