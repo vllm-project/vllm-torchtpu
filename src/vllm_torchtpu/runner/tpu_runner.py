@@ -3040,6 +3040,15 @@ class TPUModelRunner(GPUModelRunner):
             off += n
         return out
 
+    def _rejected_pad(self, chunk_rows: list[int]) -> tuple[int, int]:
+        """(chunk index, rows) of the zero padding the rejection counts carry
+        so they reach max_num_reqs (VLLM_TPU_PAD_EAGER_GLUE): appended by the
+        last chunk's producer, so no program of its own is keyed on the
+        length. (-1, 0) when the flag is off or the rows already reach it."""
+        if not envs.VLLM_TPU_PAD_EAGER_GLUE or not chunk_rows:
+            return -1, 0
+        return len(chunk_rows) - 1, max(0, self.max_num_reqs - sum(chunk_rows))
+
     def _assemble_async_spec_substitution(self, drafts, next_tokens_per_chunk, state):
         """Async-spec substitution assembler.
 
@@ -3095,17 +3104,26 @@ class TPUModelRunner(GPUModelRunner):
         num_draft_per_req: dict[int, int] = {}
         req_offset = 0
         padded_req_offset = 0
+        last_chunk, rejected_pad = self._rejected_pad(
+            [
+                nt.shape[0] if bucketed else n
+                for nt, n in zip(next_tokens_per_chunk, state.num_reqs_list)
+            ]
+        )
         # Uniform `1+K` source span per request: req position `p` maps to source
         # `[p*(1+K) .. p*(1+K)+K]`, and `req_id_to_index_copy` stores `p` (the
         # index builder multiplies by the stride). All chunks carry their next
         # proposals, even if they did not verify drafts in the current step.
-        for nt_chunk, num_reqs, md, drafts_chunk in zip(
-            next_tokens_per_chunk,
-            state.num_reqs_list,
-            state.spec_decode_metadata_list,
-            drafts_per_chunk,
+        for ci, (nt_chunk, num_reqs, md, drafts_chunk) in enumerate(
+            zip(
+                next_tokens_per_chunk,
+                state.num_reqs_list,
+                state.spec_decode_metadata_list,
+                drafts_per_chunk,
+            )
         ):
             chunk_padded_num_reqs = nt_chunk.shape[0] if bucketed else num_reqs
+            pad = rejected_pad if ci == last_chunk else 0
             drafts_chunk = fit_rows(drafts_chunk, chunk_padded_num_reqs)
             src = assemble_spec_next_tokens(
                 nt_chunk, drafts_chunk, None if bucketed else num_reqs
@@ -3113,7 +3131,9 @@ class TPUModelRunner(GPUModelRunner):
             if md is not None:
                 num_rejected_chunks.append(
                     compute_num_rejected(
-                        nt_chunk, fit_rows(md.draft_lengths, chunk_padded_num_reqs)
+                        nt_chunk,
+                        fit_rows(md.draft_lengths, chunk_padded_num_reqs),
+                        pad,
                     )
                 )
                 for r in range(num_reqs):
@@ -3123,7 +3143,9 @@ class TPUModelRunner(GPUModelRunner):
                 # correction or speculative output-placeholder rollback.
                 num_rejected_chunks.append(
                     torch.zeros(
-                        chunk_padded_num_reqs, dtype=torch.int32, device=nt_chunk.device
+                        chunk_padded_num_reqs + pad,
+                        dtype=torch.int32,
+                        device=nt_chunk.device,
                     )
                 )
             next_tokens_tpu_chunks.append(src)
@@ -3168,11 +3190,18 @@ class TPUModelRunner(GPUModelRunner):
         num_draft_per_req: dict[int, int] = {}
         req_offset = 0
         padded_req_offset = 0
-        for sel, n, drafts_chunk in zip(
-            combined_selected_tokens, combined_real_lens, drafts_per_chunk
+        last_chunk, rejected_pad = self._rejected_pad(
+            [
+                sel.numel() if bucketed else n
+                for sel, n in zip(combined_selected_tokens, combined_real_lens)
+            ]
+        )
+        for ci, (sel, n, drafts_chunk) in enumerate(
+            zip(combined_selected_tokens, combined_real_lens, drafts_per_chunk)
         ):
             flat = sel.view(-1)
             chunk_padded_num_reqs = flat.shape[0] if bucketed else n
+            pad = rejected_pad if ci == last_chunk else 0
             bonus = (flat if bucketed else flat[:n]).unsqueeze(1)  # [rows, 1]
             drafts_chunk = fit_rows(drafts_chunk, chunk_padded_num_reqs)
             src = torch.cat(
@@ -3180,7 +3209,9 @@ class TPUModelRunner(GPUModelRunner):
             )  # [chunk_padded_num_reqs, 1+K] = [bonus, draft_1..K]
             next_tokens_tpu_chunks.append(src.reshape(-1))
             num_rejected_chunks.append(
-                torch.zeros(chunk_padded_num_reqs, dtype=torch.int32, device=src.device)
+                torch.zeros(
+                    chunk_padded_num_reqs + pad, dtype=torch.int32, device=src.device
+                )
             )
             for r in range(n):
                 next_token_indices[req_offset + r] = padded_req_offset + r
@@ -3470,7 +3501,7 @@ class TPUModelRunner(GPUModelRunner):
             )
             if envs.VLLM_TPU_PAD_EAGER_GLUE:
                 seq_lens, self.position_ids = subtract_num_rejected_tokens_padded(
-                    *subtract_args, pad_len=self.max_num_reqs
+                    *subtract_args
                 )
             else:
                 # The compiled program only for shapes warmup compiled (steady
@@ -6845,13 +6876,12 @@ class TPUModelRunner(GPUModelRunner):
 
     def _precompile_subtract_num_rejected(self) -> None:
         """Warm `subtract_num_rejected_tokens_padded` (VLLM_TPU_PAD_EAGER_GLUE):
-        the pad per previous-step request count, the seq_lens half per request
-        bucket and the positions half per token bucket."""
+        the seq_lens half per request bucket, the positions half per token
+        bucket, both on the max_num_reqs-long padded rejection counts."""
         from vllm_torchtpu.runner.tpu_runner_async_output import (
             subtract_num_rejected_tokens_padded,
         )
 
-        pad_len = self.max_num_reqs
         target_reqs = sorted(
             {
                 n
@@ -6859,27 +6889,27 @@ class TPUModelRunner(GPUModelRunner):
                 if n is not None
             }
         )
+        num_rejected = torch.zeros(self.max_num_reqs, dtype=torch.int32).to(
+            self.device
+        )
 
-        def run(num_rejected_len: int, num_reqs: int, num_tokens: int) -> None:
+        def run(num_reqs: int, num_tokens: int) -> None:
             seq_lens, positions = subtract_num_rejected_tokens_padded(
                 torch.zeros(num_reqs, dtype=torch.int32).to(self.device),
                 torch.zeros(num_tokens, dtype=torch.int32).to(self.device),
-                torch.zeros(num_rejected_len, dtype=torch.int32).to(self.device),
+                num_rejected,
                 torch.full((num_reqs,), -1, dtype=torch.int32).to(self.device),
                 torch.full((num_tokens,), -1, dtype=torch.int32).to(self.device),
-                pad_len=pad_len,
             )
             synchronize_tensors(seq_lens)
             synchronize_tensors(positions)
 
         # Served from execute_model's no_grad; dynamo guards on grad mode.
         with self._precompile_timed("subtract_num_rejected"), torch.no_grad():
-            for num_rejected_len in range(1, pad_len + 1):
-                run(num_rejected_len, target_reqs[0], self.num_tokens_paddings[0])
             for num_reqs in target_reqs:
-                run(pad_len, num_reqs, self.num_tokens_paddings[0])
+                run(num_reqs, self.num_tokens_paddings[0])
             for num_tokens in self.num_tokens_paddings:
-                run(pad_len, target_reqs[0], num_tokens)
+                run(target_reqs[0], num_tokens)
 
     def _precompile_rejection_sampler(self) -> None:
         """Warm the spec-decode verify path so it doesn't recompile at runtime.
