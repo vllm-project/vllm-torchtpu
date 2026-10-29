@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Dense JAX reference for the V4.1 compressor path up to CSA2 encoding.
 
-Mirrors epic/dsv41 ``DeepseekCompressor.project`` + ``save_compress_norm`` +
+Mirrors the unfused model ``DeepseekCompressor.project`` + ``save_compress_norm`` +
 ``_rotate(latent, group_positions)`` + ``encode_csa2_kv``. Ring rows are
 gathered by the caller (``ring_prev``), exactly as ``save_compress_norm`` reads
 ``stored`` before publishing.

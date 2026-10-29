@@ -29,7 +29,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.attention_preprocessing import rope_gather
-from vllm_torchtpu.kernels.attention_preprocessing.serial import (
+from vllm_torchtpu.kernels.attention_preprocessing.rope_gather import (
     _LANE,
     _lane_gather,
     _quantize_rows,

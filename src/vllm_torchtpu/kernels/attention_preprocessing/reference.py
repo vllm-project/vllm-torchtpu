@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Independent dense JAX references for the serial preprocessing kernels."""
+"""Independent dense JAX references for the fused preprocessing kernels."""
 
 import jax
 import jax.numpy as jnp

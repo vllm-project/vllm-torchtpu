@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """RoPE rows for the attention-preprocessing kernels.
 
-The model's ``cos_sin_cache`` (epic's ``_tpu_rope_cache``) is
+The model's ``cos_sin_cache`` (the model's ``_tpu_rope_cache``) is
 ``[max_position, rotary_dim]`` FP32 with ``[cos | sin]`` packed side by side.
 Every layer of one forward step uses the same positions, so the caller gathers
 the ``[tokens, rotary_dim]`` rows once per step (``gather_rows``) and every
@@ -13,7 +13,38 @@ non-contiguous positions cost up to 2-3x the kernel itself.
 import jax
 import jax.numpy as jnp
 
-from vllm_torchtpu.kernels.attention_preprocessing.serial import _LANE, _lane_gather
+_LANE = 128
+
+
+def _quantize_rows(x):
+    values = x.astype(jnp.float32)
+    limit = float(jnp.finfo(jnp.float8_e4m3fn).max)
+    scale = jnp.max(jnp.abs(values), axis=-1, keepdims=True) / limit
+    scale = jnp.where(scale == 0, 1.0, scale)
+    encoded = jnp.clip(values / scale, -limit, limit)
+    return encoded.astype(jnp.float8_e4m3fn), scale
+
+
+def _lane_gather(operand, indices):
+    rank = operand.ndim
+    lanes = indices.shape[0]
+    coords = jnp.broadcast_to(indices, (*operand.shape[:-1], lanes))[..., None]
+    batching = tuple(range(rank - 1))
+    dimension_numbers = jax.lax.GatherDimensionNumbers(
+        offset_dims=(),
+        collapsed_slice_dims=(rank - 1,),
+        start_index_map=(rank - 1,),
+        operand_batching_dims=batching,
+        start_indices_batching_dims=batching,
+    )
+    return jax.lax.gather(
+        operand,
+        coords,
+        dimension_numbers=dimension_numbers,
+        slice_sizes=(1,) * rank,
+        unique_indices=False,
+        mode=jax.lax.GatherScatterMode.PROMISE_IN_BOUNDS,
+    )
 
 
 def gather_rows(cos_sin_cache: jax.Array, positions: jax.Array) -> jax.Array:

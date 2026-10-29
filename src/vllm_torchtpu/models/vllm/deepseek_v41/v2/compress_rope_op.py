@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Typed Torch bridges for the fused DeepSeek-V4.1 compressor."""
 
+import functools
 from typing import Any, cast
 
 import jax
+import jax.numpy as jnp
 import torch
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
@@ -11,22 +13,17 @@ from torch_tpu._internal import pallas
 from vllm_torchtpu.kernels.attention_preprocessing import compress_rope
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import get_pallas_op_mesh
 
-_ops: dict[tuple[int, int], Any] = {}
+_ops: dict[tuple[int, int, float], Any] = {}
 
 
-def _run(
-    x,
-    weight,
-    gamma,
-    rows,
-    has_prev,
-    valid,
-    *,
-    ratio,
-    state=None,
-    write=None,
-    read=None,
-):
+def _run(x, weight, gamma, rows, has_prev, valid, state, write, read, *, ratio, eps):
+    if x.shape[0] == 0:
+        return (
+            jnp.zeros((0, 512), jnp.bfloat16),
+            jnp.zeros((0, 128), jnp.int32),
+            jnp.zeros((0, 1), jnp.float32),
+            state,
+        )
     return compress_rope.fused_compress_rope(
         x,
         weight,
@@ -38,10 +35,14 @@ def _run(
         write,
         read,
         ratio=ratio,
+        eps=eps,
     )
 
 
-def _bridge(ratio: int, banks: int):
+def _bridge(ratio: int, banks: int, eps: float = 1e-6):
+    if (ratio, banks) not in ((1, 0), (2, 1), (2, 2)):
+        raise ValueError("Use ratio 1 without state, or ratio 2 with one/two banks")
+    run = functools.partial(_run, ratio=ratio, eps=eps)
     if ratio == 1:
 
         def ratio1(
@@ -52,8 +53,8 @@ def _bridge(ratio: int, banks: int):
             has_prev: jax.Array,
             valid: jax.Array,
         ) -> tuple[jax.Array, jax.Array, jax.Array]:
-            latent, words, scales, _ = _run(
-                x, weight, gamma, rows, has_prev, valid, ratio=1
+            latent, words, scales, _ = run(
+                x, weight, gamma, rows, has_prev, valid, None, None, None
             )
             return latent, words, scales
 
@@ -71,20 +72,10 @@ def _bridge(ratio: int, banks: int):
             write: jax.Array,
             read: jax.Array,
         ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-            latent, words, scales, new_state = _run(
-                x,
-                weight,
-                gamma,
-                rows,
-                has_prev,
-                valid,
-                ratio=2,
-                state=state,
-                write=write,
-                read=read,
+            latent, words, scales, updated = run(
+                x, weight, gamma, rows, has_prev, valid, state, write, read
             )
-            assert isinstance(new_state, jax.Array)
-            return latent, words, scales, new_state
+            return latent, words, scales, updated
 
         return ratio2_one
 
@@ -100,56 +91,47 @@ def _bridge(ratio: int, banks: int):
         write: jax.Array,
         read: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-        latent, words, scales, new_state = _run(
+        latent, words, scales, updated = run(
             x,
             weight,
             gamma,
             rows,
             has_prev,
             valid,
-            ratio=2,
-            state=(state_low, state_high),
-            write=write,
-            read=read,
+            (state_low, state_high),
+            write,
+            read,
         )
-        assert isinstance(new_state, tuple)
-        return latent, words, scales, new_state[0], new_state[1]
+        assert isinstance(updated, tuple)
+        return latent, words, scales, updated[0], updated[1]
 
     return ratio2_two
 
 
 def _fake(ratio, banks):
     def fake(x, weight, gamma, rows, has_prev, valid, *state_and_ring):
-        latent = x.new_empty((x.shape[0], 512))
+        latent = x.new_empty((x.shape[0], 512), dtype=torch.bfloat16)
         words = x.new_empty((x.shape[0], 128), dtype=torch.int32)
         scales = x.new_empty((x.shape[0], 1), dtype=torch.float32)
-        if ratio == 1:
-            return latent, words, scales
-        states = tuple(x.new_empty(a.shape) for a in state_and_ring[:banks])
+        states = tuple(torch.empty_like(a) for a in state_and_ring[:banks])
         return latent, words, scales, *states
 
     return fake
 
 
-def get_compress_rope_op(ratio: int, banks: int = 0) -> Any:
-    """Return the pre-registered ratio/bank-specific compressor operation."""
-    if ratio == 1:
-        banks = 0
-    if ratio not in (1, 2) or banks not in (0, 1, 2):
-        raise ValueError(
-            "Compressor bridge supports ratio 1 or ratio 2 with one/two banks"
-        )
-    key = ratio, banks
+def get_compress_rope_op(ratio: int, banks: int = 0, *, eps: float = 1e-6) -> Any:
+    """Return the pre-registered ratio/bank/epsilon-specific operation."""
+    function = _bridge(ratio, banks, float(eps))
+    key = ratio, banks, float(eps)
     if key in _ops:
         return _ops[key]
-    function = _bridge(ratio, banks)
-    tensor_count = 6 if ratio == 1 else 8 + banks
+    eps_tag = float(eps).hex().replace(".", "_").replace("+", "p").replace("-", "m")
     op = pallas.jax_op(
-        f"pallas::dsv41_compress_rope_r{ratio}_b{banks}",
+        f"pallas::dsv41_compress_rope_r{ratio}_b{banks}_e{eps_tag}",
         function,
         mesh=get_pallas_op_mesh(),
         donate_argnums=tuple(range(6, 6 + banks)),
-        input_partition_specs=cast(Any, (P(),) * tensor_count),
+        input_partition_specs=cast(Any, (P(),) * (6 if ratio == 1 else 8 + banks)),
     )
     op.register_fake(_fake(ratio, banks))
     _ops[key] = op

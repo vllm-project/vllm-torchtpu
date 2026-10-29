@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """V4.1 compressor for integration: projection, pooling, RMSNorm, RoPE, CSA2.
 
-Same arithmetic as ``compress_serial._compress_kernel``. Differences:
+Projection, pooling, normalization, and encoding use FP32 intermediates:
 
 * RoPE comes from a per-step ``[tokens, rotary_dim]`` block of packed
   ``cos_sin_cache`` rows at each token's group start
@@ -14,7 +14,7 @@ Same arithmetic as ``compress_serial._compress_kernel``. Differences:
   semaphore each, on its own DMA priority. Only the first token tile waits,
   chunk by chunk, so its matmul starts after the first chunk instead of the
   whole 5-10 MiB weight;
-* ratio 2 reads and writes the compressor state ring itself (epic's
+* ratio 2 reads and writes the compressor state ring itself (unfused model's
   ``save_compress_norm``): each FP32 ``[2*512]`` ring record is one
   ``(8, 128)`` tile of the shared INT32 ``[rows, 128]`` pool, 4 KiB
   contiguous. A record is staged as one ``(8, 128)`` VMEM tile and moved by
@@ -35,10 +35,10 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.attention_preprocessing import rope_gather
-from vllm_torchtpu.kernels.attention_preprocessing.compress_serial import (
-    _encode_csa2,
+from vllm_torchtpu.kernels.attention_preprocessing.rope_gather import (
+    _LANE,
+    _lane_gather,
 )
-from vllm_torchtpu.kernels.attention_preprocessing.serial import _LANE, _lane_gather
 from vllm_torchtpu.kernels.attention_preprocessing.tuned_block_sizes import (
     COMPRESS_ROPE_TUNING,
     CompressConfig,
@@ -48,6 +48,21 @@ _DIM = 512
 _ROW_ALIGN = 16  # BF16 activation tiles are (16, 128)
 _POOL_LANES = 128  # INT32 words per pool row (512 bytes)
 _RECORD_ROWS = 2 * _DIM // _POOL_LANES  # pool rows per FP32 ratio-2 record
+
+
+def _encode_csa2(values):
+    """FP32 [rows,512] post-RoPE -> INT32 words [rows,128], FP32 scales [rows,1]."""
+    scale = jnp.maximum(jnp.max(jnp.abs(values), axis=-1, keepdims=True), 1e-4)
+    scale = scale / 448.0
+    quantized = (values / scale).astype(jnp.float8_e4m3fn)
+    planes = [
+        jax.lax.bitcast_convert_type(
+            quantized[:, g * _LANE : (g + 1) * _LANE], jnp.uint8
+        ).astype(jnp.uint32)
+        for g in range(_DIM // _LANE)
+    ]
+    words = planes[0] | (planes[1] << 8) | (planes[2] << 16) | (planes[3] << 24)
+    return jax.lax.bitcast_convert_type(words, jnp.int32), scale
 
 
 def _compress_rope_kernel(*refs, eps, ratio, tb, chunk, banks):
@@ -250,6 +265,17 @@ def _compress_rope_kernel(*refs, eps, ratio, tb, chunk, banks):
         ring_wait(write_offsets, write_stage, ring_sems.at[1], False)
 
 
+def scalar_prefetch_bytes(tokens: int, token_block: int) -> int:
+    """Two pair tables plus two offsets, each padded to a 64-word SMEM tile."""
+
+    def padded_words(words):
+        return -(-words // 64) * 64
+
+    return 4 * (
+        2 * padded_words(2 * tokens) + 2 * padded_words(tokens // token_block + 1)
+    )
+
+
 def _largest_divisor(n, cap, multiple):
     for d in range(min(n, cap) // multiple * multiple, 0, -multiple):
         if n % d == 0:
@@ -377,6 +403,11 @@ def fused_compress_rope(
     check_config(config, padded, width)
     tb = config.token_block
     tiles = padded // tb
+    if ratio == 2:
+        capacity = pltpu.get_tpu_info().smem_capacity_bytes
+        # Reserve half for compiler scratch/spills and the pipeline's controls.
+        if scalar_prefetch_bytes(padded, tb) > capacity // 2:
+            raise ValueError("Compressor scalar-prefetch tables exceed SMEM budget")
     rotary_dim = rope_rows.shape[1]
 
     once = pl.Buffered(buffer_count=1)

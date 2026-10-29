@@ -20,7 +20,7 @@ import jax
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
-from vllm_torchtpu.kernels.attention_preprocessing import qb_rope, rope_gather
+from vllm_torchtpu.kernels.attention_preprocessing import qb_rope
 from vllm_torchtpu.kernels.deepseek_v4.rope import rope
 from vllm_torchtpu.kernels.quantized_matmul.projection_rope import chain, is_supported
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
@@ -47,9 +47,7 @@ def projection_rope(
         return chain(x, w, scale, pos, cache)
     # Every other case: one kernel writes Q in the attention layout,
     # with no HBM round trip of the projection and no separate relayout.
-    if rows is None:
-        rows = rope_gather.gather_rows(cache, pos)
-    if qb_rope.supported(x, w, scale, rows):
+    if rows is not None and qb_rope.supported(x, w, scale, rows):
         return qb_rope.fused_qb_rope(x, w, scale, rows)
     projected = xla_quantized_matmul(x, w, scale).reshape(x.shape[0], 64, 512)
     return rope(projected, pos, cache)

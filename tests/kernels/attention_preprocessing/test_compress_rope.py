@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""In-kernel ring reads/writes and chunked weight copy reproduce the pipelined
-compressor plus epic's ring update.
+"""In-kernel ring reads/writes and chunked weight copy match the dense reference
+compressor plus the model's ring update.
 
 The kernel copies its weight and ring records by DMA, which interpret mode
 does not discharge, so the value checks run on TPU only.
@@ -14,8 +14,8 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.attention_preprocessing import (
+    compress_reference,
     compress_rope,
-    compress_serial,
     rope_gather,
 )
 from vllm_torchtpu.kernels.attention_preprocessing.tuned_block_sizes import (
@@ -158,10 +158,8 @@ def test_ring_arguments_are_checked():
 @pytest.mark.parametrize(
     ("ratio", "banks"), [(1, 1), (2, 1), (2, 2)], ids=["r1", "r2", "r2-2bank"]
 )
-# The pipelined reference needs 256-row multiples; 288 etc. are covered by
-# test_block_sizes_do_not_change_values against the kernel itself.
 @pytest.mark.parametrize("tokens", [256, 512, 2048])
-def test_matches_pipelined_compressor_and_epic_ring(tokens, ratio, banks):
+def test_matches_reference_compressor_and_ring(tokens, ratio, banks):
     _tpu()
     i = _inputs(tokens, ratio, banks=banks)
     # Reference: the caller-gathered ring row of every has_prev == 0 row.
@@ -171,14 +169,14 @@ def test_matches_pipelined_compressor_and_epic_ring(tokens, ratio, banks):
         ring_prev[reads >= 0] = i["stored"][reads[reads >= 0]]
     cos, sin = i["rows"][:, :32], i["rows"][:, 32:]
     score, latent, words, scales = jax.jit(
-        functools.partial(compress_serial.fused_compress_pipelined, ratio=ratio)
+        functools.partial(compress_reference.compress, ratio=ratio)
     )(
         i["x"],
         i["weight"],
         i["gamma"],
-        i["has_prev"],
+        i["has_prev"][:, 0],
         jnp.asarray(ring_prev),
-        i["valid"],
+        i["valid"][:, 0],
         cos,
         sin,
     )
@@ -189,11 +187,11 @@ def test_matches_pipelined_compressor_and_epic_ring(tokens, ratio, banks):
     rows = np.asarray(i["valid"][:, 0]) != 0
     np.testing.assert_array_equal(np.asarray(actual[1])[rows], np.asarray(words)[rows])
     assert not np.asarray(actual[1])[~rows].any()
-    np.testing.assert_array_equal(np.asarray(actual[2]), np.asarray(scales))
+    np.testing.assert_array_equal(np.asarray(actual[2]), np.asarray(scales[:, None]))
     if ratio == 1:
         assert actual[3] is None
         return
-    # epic writes the FP32 projection of each published row; nothing else.
+    # The model writes the FP32 projection of each published row; nothing else.
     expected = i["stored"].copy()
     writes = np.asarray(i["ring_write"])
     expected[writes[writes >= 0]] = np.asarray(score)[writes >= 0]
@@ -235,3 +233,9 @@ def test_block_sizes_do_not_change_values(tokens, config, ratio):
         np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
     if ratio == 2:
         np.testing.assert_array_equal(_pool(base[3]), _pool(other[3]))
+
+
+def test_scalar_prefetch_size_includes_tiling_padding():
+    assert compress_rope.scalar_prefetch_bytes(2048, 512) == 33280
+    assert compress_rope.scalar_prefetch_bytes(288, 288) == 5120
+    assert compress_rope.scalar_prefetch_bytes(65536, 512) > 1024 * 1024

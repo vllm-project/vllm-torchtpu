@@ -123,8 +123,9 @@ def get_qa_rope_op(eps: float, *, emit_qr: bool, rotate_kv: bool) -> Any:
     key = (float(eps), emit_qr, rotate_kv)
     if key in _ops:
         return _ops[key]
+    eps_tag = float(eps).hex().replace(".", "_").replace("+", "p").replace("-", "m")
     op = pallas.jax_op(
-        f"pallas::dsv41_qa_kv_norm_rope_{len(_ops)}",
+        f"pallas::dsv41_qa_kv_norm_rope_q{int(emit_qr)}_r{int(rotate_kv)}_e{eps_tag}",
         _bridge(float(eps), emit_qr, rotate_kv),
         mesh=get_pallas_op_mesh(),
         input_partition_specs=cast(Any, (P(),) * (6 if rotate_kv else 5)),

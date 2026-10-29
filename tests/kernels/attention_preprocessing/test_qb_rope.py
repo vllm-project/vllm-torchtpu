@@ -13,7 +13,6 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.attention_preprocessing import (
-    qb_overlap3,
     qb_rope,
     reference,
     rope_gather,
@@ -57,11 +56,14 @@ def test_matches_precomputed_coefficients(tokens, heads, kind):
         positions[:4] = -1
     qr, weight, scale, rows = _inputs(tokens, heads, positions)
     cos, sin = _split(rows)
-    expected = jax.jit(qb_overlap3.fused_qb_rope_overlap3)(qr, weight, scale, cos, sin)
+    expected = jax.jit(reference.qb_rope)(qr, weight, scale, cos, sin)
     actual = jax.jit(qb_rope.fused_qb_rope)(qr, weight, scale, rows)
     assert actual.shape == (tokens, heads, 512) and actual.dtype == jnp.bfloat16
-    np.testing.assert_array_equal(
-        np.asarray(actual, np.float32), np.asarray(expected, np.float32)
+    np.testing.assert_allclose(
+        np.asarray(actual, np.float32),
+        np.asarray(expected, np.float32),
+        atol=1e-2,
+        rtol=1e-2,
     )
 
 
@@ -137,3 +139,12 @@ def test_block_sizes_do_not_change_values(tokens):
         atol=1e-2,
         rtol=1e-2,
     )
+
+
+@pytest.mark.parametrize("heads,head_dim", [(4, 512), (6, 512), (8, 0)])
+def test_supported_rejects_invalid_small_grid(heads, head_dim):
+    qr = jax.ShapeDtypeStruct((32, 1280), jnp.bfloat16)
+    weight = jax.ShapeDtypeStruct((1280, heads * 512), jnp.float8_e4m3fn)
+    scales = jax.ShapeDtypeStruct((heads * 512,), jnp.float32)
+    rows = jax.ShapeDtypeStruct((32, 64), jnp.float32)
+    assert not qb_rope.supported(qr, weight, scales, rows, head_dim)

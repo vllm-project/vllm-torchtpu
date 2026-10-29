@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Q-B projection and interleaved RoPE for integration into the model.
 
-Same pipeline and numerics as ``qb_overlap3``. RoPE input is the per-step
+RoPE input is the per-step
 ``[tokens, rotary_dim]`` row block from ``rope_gather.gather_rows`` (packed
 ``[cos | sin]``), shared by every layer of the forward step.
 
@@ -23,7 +23,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.attention_preprocessing import rope_gather
-from vllm_torchtpu.kernels.attention_preprocessing.serial import (
+from vllm_torchtpu.kernels.attention_preprocessing.rope_gather import (
     _LANE,
     _lane_gather,
     _quantize_rows,
@@ -438,7 +438,7 @@ def fused_qb_rope(
 
 
 def _check_projection_shapes(qr, weight, scale):
-    """``serial._check_projection`` without its fixed 256-row token block."""
+    """Validate nonempty activations and canonical per-channel FP8 weights."""
     if qr.ndim != 2 or weight.ndim != 2 or qr.shape[0] == 0:
         raise ValueError("Use non-empty rank-2 activations and weights")
     if qr.dtype != jnp.bfloat16 or weight.dtype != jnp.float8_e4m3fn:
@@ -455,7 +455,16 @@ def supported(qr, weight, weight_scale, rope_rows, head_dim=512) -> bool:
     """Whether ``fused_qb_rope`` accepts these concrete lowering inputs."""
     try:
         _check_projection_shapes(qr, weight, weight_scale)
+        if head_dim <= 0 or head_dim % _LANE or weight.shape[1] % head_dim:
+            return False
         rope_gather.check_rope_rows(rope_rows, qr.shape[0], head_dim)
-    except ValueError:
+        heads = weight.shape[1] // head_dim
+        if heads % 4:
+            return False
+        padded = -(-qr.shape[0] // _ROW_ALIGN) * _ROW_ALIGN
+        config = select_config(padded, qr.shape[1], weight.shape[1], heads)
+        segment = _segment_tokens(config, padded, qr.shape[1], heads, head_dim)
+        check_config(config, segment, heads)
+    except (ValueError, StopIteration):
         return False
-    return weight.shape[1] % head_dim == 0 and (weight.shape[1] // head_dim) % 4 == 0
+    return True

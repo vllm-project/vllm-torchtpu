@@ -44,7 +44,7 @@ def _split(rows):
 
 
 def _expected(x, weight, scale, gamma_qr, gamma_kv, rows, eps=1e-6):
-    """Dense chain in epic order: linear (BF16 out) -> native norm -> RoPE."""
+    """Dense chain in model order: linear (BF16 out) -> native norm -> RoPE."""
     projected = reference.projection(x, weight, scale).astype(jnp.float32)
     qr = qa_rope.native_rms_norm(projected[:, :RANK], gamma_qr[None, :], eps)
     kv = qa_rope.native_rms_norm(projected[:, RANK:], gamma_kv[None, :], eps)
@@ -146,7 +146,7 @@ def test_matches_dense_chain(tokens, kind):
 def _assert_close_ulps(actual, expected, max_ulps=2, max_fraction=1e-4):
     """The RMSNorm reduction and rsqrt differ between Mosaic and XLA, so a few
     elements land 1-2 BF16 ulps apart before RoPE (TPU census: at most 2 ulp,
-    under 5e-5 of elements; W1 saw the same against the epic chain). The
+    under 5e-5 of elements; W1 saw the same against the unfused chain). The
     matmul and the in-kernel RoPE are bitwise (test_modes_agree_with_full_output).
     Inputs whose RoPE output cancels to near zero can amplify this further, so
     keep these cases free of that by construction rather than widening the bound."""

@@ -1,65 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Initial serial tiles requested for the prefill correctness baseline.
-
-These are design inputs, not measured optimal tile sizes.
-"""
+"""Validated tile configurations and measured TPU7x tuning entries."""
 
 import dataclasses
-
-TOKEN_BLOCK = 256
-HEAD_BLOCK = 8
-
-# Preserve the baseline tile's output size with full 16-head BF16 rows.
-QB_TOKEN_BLOCK = 128
-QB_HEAD_BLOCK = 16
-QB_QUANT_TOKEN_BLOCK = 64
-
-QB_OUTPUT_BUFFERS = 2
-
-# Strided-staging Q-B: 256 tokens per weight window restores the serial
-# kernel's weight reuse; one 256-column slice of every head is staged at a time.
-QB2_TOKEN_BLOCK = 256
-QB2_HEAD_BLOCK = 16
-QB2_COLUMN_BLOCK = 256
-QB2_QUANT_TOKEN_BLOCK = 64
-QB2_VMEM_LIMIT_BYTES = 56 * 1024 * 1024
-
-# Double-buffered Q-A tiles: 2 x 2.5 MiB activations + 8.75 MiB FP8 weight.
-COMPRESS_TOKEN_BLOCK = 256
-# Rows of post-matmul work held in registers at once.
-COMPRESS_FRAGMENT = 32
-COMPRESS_VMEM_LIMIT_BYTES = 48 * 1024 * 1024
-
-# Packed-pair Q-B: 256-token weight reuse, 16-head windows, 4 output word tiles
-# (512 KiB each) in flight.
-QB3_TOKEN_BLOCK = 256
-QB3_HEAD_BLOCK = 16
-QB3_QUANT_TOKEN_BLOCK = 64
-QB3_OUTPUT_SLOTS = 4
-QB3_VMEM_LIMIT_BYTES = 56 * 1024 * 1024
-
-QA_TOKEN_BLOCK = 256
-QA_VMEM_LIMIT_BYTES = 48 * 1024 * 1024
-
-# Compressor: 256-token tiles; the BF16 [5120, 1024] weight stays resident.
-CMP_TOKEN_BLOCK = 256
-CMP_VMEM_LIMIT_BYTES = 56 * 1024 * 1024
-
-# Overlapped Q-B: packed-pair layout; pair g-1 is post-processed while pair g's
-# matmul issues. 16 output word slots (two steps of pairs, 8 MiB) in flight.
-QB5_TOKEN_BLOCK = 256
-QB5_HEAD_BLOCK = 16
-QB5_QUANT_TOKEN_BLOCK = 64
-QB5_VMEM_LIMIT_BYTES = 56 * 1024 * 1024
-
-# Overlapped Q-B with larger token tiles: matmul-only ablation measured 124.7
-# (256) / 105.2 (512) / 95.1 (1024) us, from fewer weight pushes per row.
-# Output slots are recycled per head pair.
-QB6_TOKEN_BLOCK = 512
-QB6_HEAD_BLOCK = 16
-QB6_QUANT_TOKEN_BLOCK = 64
-QB6_OUTPUT_SLOTS = 8
-QB6_VMEM_LIMIT_BYTES = 60 * 1024 * 1024
 
 
 @dataclasses.dataclass(frozen=True)
@@ -116,7 +58,7 @@ class CompressConfig:
     semaphore; the first token tile waits for each chunk before its matmul.
     The chunk is also the matmul's N, which changes FP32 accumulation on
     TPU7x (128 vs 256 measured not bitwise), so keep the default 256 unless
-    re-validated against the epic chain.
+    re-validated against the unfused model chain.
     """
 
     token_block: int
