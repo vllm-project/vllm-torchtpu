@@ -200,8 +200,11 @@ class TestSoftFailSupportMatrix(unittest.TestCase):
             "v7Qwen/Qwen3.5-397B-A17B:Benchmark": "✅ Passing",
         }
         captured_csv: list[dict[str, str]] = []
+        soft_failed_lookups: list[str] = []
 
         def fake_get(key: str, default: str = "") -> str:
+            if key.endswith(":soft_failed"):
+                soft_failed_lookups.append(key)
             return meta_store.get(key, default)
 
         def fake_set(key: str, value: str) -> None:
@@ -239,6 +242,15 @@ class TestSoftFailSupportMatrix(unittest.TestCase):
                 os.chdir(old_cwd)
 
             self.assertEqual(meta_store["v7_CI_TESTS_FAILED"], "false")
+            self.assertEqual(
+                meta_store["v7_CI_SOFT_FAILED"],
+                "Qwen/Qwen3.5-397B-A17B:Accuracy/Correctness",
+            )
+            # Only the failing cell is checked for soft_failed.
+            self.assertEqual(
+                soft_failed_lookups,
+                ["v7Qwen/Qwen3.5-397B-A17B:Accuracy/Correctness:soft_failed"],
+            )
             self.assertEqual(len(captured_csv), 1)
             self.assertEqual(
                 captured_csv[0]["Accuracy/Correctness"],
@@ -255,6 +267,7 @@ class TestSoftFailSupportMatrix(unittest.TestCase):
             finally:
                 os.chdir(old_cwd)
             self.assertEqual(meta_store["v7_CI_TESTS_FAILED"], "true")
+            self.assertEqual(meta_store["v7_CI_SOFT_FAILED"], "")
 
     def test_generate_support_matrices_feature_soft_fail_vs_hard_fail(self) -> None:
         meta_store = {
