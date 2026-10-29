@@ -1,0 +1,89 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Fast CPU checks in the tests lane on the Kueue fleet; rendered in the
+# precheck stage ahead of TPU steps on gated builds.
+
+# Carries the launcher and the service account that may submit a workload.
+# Repeated per step rather than merged in, because a step's `plugins:` is a list
+# and a YAML merge key replaces it wholesale.
+x-kube-plugin: &kube_plugin
+  kubernetes:
+    podTemplate: tpu-launcher
+
+x-cpu-unit-test-defaults: &cpu_unit_test_defaults
+  depends_on: "build_docker"
+  # The fleet's cpu queue: a pod with no chip on an autoscaled CPU node, through
+  # the same launcher as the TPU steps.
+  timeout_in_minutes: 120
+  agents:
+    queue: "kube"
+  # Plain bktec: these steps set fail-on-no-tests, so an
+  # empty collection is a failure here rather than a shard emptied by a marker.
+  commands:
+    - .buildkite/kubernetes/run.sh bktec run
+  env:
+    SHAPE: "cpu"
+    # Without it JAX looks for a TPU.
+    JAX_PLATFORMS: "cpu"
+
+x-tests-plugin-defaults: &tests_plugin_defaults
+  suite-slug: tpu-ci
+  test-runner: pytest
+  test-file-pattern: "tests/**/{test_*,*_test}.py"
+  install-client: false
+  oidc-lifetime: 7200
+
+steps:
+  # pyrefly in the CI image against .pyrefly-baseline-full.json.
+  # The pod already runs that image, but typecheck_full.sh decides it is
+  # outside a container by looking for /.dockerenv, which a pod does not have,
+  # and would try to start Docker.
+  - label: "Type Check - Full Environment"
+    key: "typecheck_full"
+    <<: *cpu_unit_test_defaults
+    plugins:
+      - *kube_plugin
+    commands:
+      - .buildkite/kubernetes/run.sh env TYPECHECK_IN_PLACE=1 bash tools/typecheck_full.sh
+
+  - label: "Unit Tests - CPU (PR)"
+    key: "unit_tests_cpu_pr"
+    <<: *cpu_unit_test_defaults
+    if: 'build.env("NIGHTLY") != "1"'
+    # bktec splits the files across the shards by recorded timing. It does not
+    # know the marker filter, so a shard can get only TPU-marked files and
+    # collect nothing; exit 5 (no tests collected) is tolerated per shard, as
+    # in the TPU steps.
+    parallelism: 3
+    commands:
+      - .buildkite/kubernetes/run.sh bash -c 'bktec run || [ $$? -eq 5 ]'
+    plugins:
+      - *kube_plugin
+      - tests#v1.0.0:
+          <<: *tests_plugin_defaults
+          test-file-pattern: "tests/**/{test_*,*_test}.py"
+          test-cmd: "pytest -sv --timeout=600 -m 'not tpu_test and not multichip and not nightly' --junit-xml={{resultPath}} {{testExamples}}"
+
+  - label: "Unit Tests - CPU (Nightly)"
+    key: "unit_tests_cpu_nightly"
+    <<: *cpu_unit_test_defaults
+    if: 'build.env("NIGHTLY") == "1"'
+    plugins:
+      - *kube_plugin
+      - tests#v1.0.0:
+          <<: *tests_plugin_defaults
+          test-file-pattern: "tests/**/{test_*,*_test}.py"
+          fail-on-no-tests: true
+          test-cmd: "pytest -sv --timeout=600 -m 'not tpu_test and not multichip' --junit-xml={{resultPath}} {{testExamples}}"

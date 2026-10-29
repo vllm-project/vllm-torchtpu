@@ -11,14 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Advances the pinned upstream vLLM commit on the integration pipeline once all
+# tpu and report stage dependencies added by render_pipeline.py have passed.
 steps:
-  # Promote only after every step uploaded before this one has finished and
-  # passed. bootstrap.sh uploads this file first, so Buildkite places it after
-  # all test lanes; the wait covers whatever the lanes upload (including steps
-  # added later), instead of a hand-kept depends_on list that drifts when step
-  # keys change. soft_fail steps count as passed.
-  - wait
-
   - label: ":arrow_up: Promote vLLM to Last Known Good (LKG)"
     key: "promote_lkg"
     agents:

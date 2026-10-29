@@ -78,7 +78,7 @@ fi
 # PR_TPU_JOBS_PER_AUTHOR. Keyed on the commit author's email, which every
 # webhook build carries: the Buildkite creator is missing whenever the GitHub
 # account is not linked to a Buildkite user.
-if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]]; then
+if [[ "${CI_RUN_TPU:-0}" != "1" && "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]]; then
   pr_author="${BUILDKITE_BUILD_AUTHOR_EMAIL:-${BUILDKITE_BUILD_CREATOR_EMAIL:-}}"
   if [[ -n "$pr_author" ]]; then
     export PR_TPU_CONCURRENCY_GROUP="tpu-pr/${pr_author,,}"
@@ -156,43 +156,6 @@ VLLM_COMMIT_HASH="${VLLM_COMMIT_HASH_OVERRIDE:-$VLLM_COMMIT_HASH}"
 buildkite-agent meta-data set "VLLM_COMMIT_HASH" "${VLLM_COMMIT_HASH}"
 echo "Using vLLM commit: ${VLLM_COMMIT_HASH}"
 
-# Since Buildkite prepends uploaded steps (inserts in reverse order),
-# uploading the test steps first and build steps last ensures they
-# are displayed and queued in correct order: Build -> Tests.
-
-if [[ "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
-  # Upload promote step FIRST so Buildkite places it LAST after test steps (Step 8)
-  echo "Uploading Promotion Pipeline Fragment"
-  upload_with_priority .buildkite/pipeline_promote.yml "$JOB_PRIORITY"
-fi
-
-# The suite's lanes, in upload order. Lane <lane> is
-# .buildkite/pipeline_<lane>.yml; no other file is uploaded as a lane. CI_LANES
-# picks a subset - a scheduled pipeline names its own lane. Without it a build runs every lane but
-# perf, which has scheduled builds of its own; nightly builds still run perf,
-# and so does the integration pipeline, whose LKG promotion waits on two perf
-# steps. A PR whose change needs perf/eval coverage asks for it with the
-# run-perf-eval label, or the full nightly suite across every lane with
-# run-full-ci; adding either label to a ready PR starts a build.
-ALL_LANES="verify perf integration tests"
-default_lanes="verify integration tests"
-pr_labels="${BUILDKITE_PULL_REQUEST_LABELS:-}"
-if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]] \
-    && grep -qx "run-full-ci" <<< "${pr_labels//,/$'\n'}"; then
-  export NIGHTLY=1
-  buildkite-agent annotate --style info --context full-ci \
-    "Runs the full (nightly) suite (\`run-full-ci\` label)."
-fi
-if [[ "${NIGHTLY:-0}" == "1" || "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
-  default_lanes="${ALL_LANES}"
-elif [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]] \
-    && grep -qx "run-perf-eval" <<< "${pr_labels//,/$'\n'}"; then
-  default_lanes="${ALL_LANES}"
-  if [[ -z "${CI_LANES:-}" ]]; then
-    buildkite-agent annotate --style info --context perf-eval \
-      "Runs the perf/eval lane (\`run-perf-eval\` label)."
-  fi
-fi
 # Echoes the labels of the PR a post-merge build on main merged, comma-separated
 # like BUILDKITE_PULL_REQUEST_LABELS. They do not reach the build, so they are
 # read from GitHub by the PR number GitHub puts at the end of a squash commit's
@@ -214,70 +177,34 @@ merged_pr_labels() {
       2>/dev/null || true
 }
 
-# skip-tpu-ci keeps only the tests lane, and SKIP_TPU_CI leaves out its TPU group
-# (pipeline_tests.yml reads it when the lane is uploaded), so the image build,
-# the type check and the CPU unit tests still run, on the PR and again on its
-# post-merge build. It overrides run-perf-eval and run-full-ci.
+pr_labels="${BUILDKITE_PULL_REQUEST_LABELS:-}"
 if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]]; then
+  if grep -qx "run-full-ci" <<< "${pr_labels//,/$'\n'}"; then
+    buildkite-agent annotate --style info --context full-ci \
+      "Runs the full (nightly) suite (\`run-full-ci\` label)."
+  elif [[ "${NIGHTLY:-0}" != "1" && "${BUILDKITE_PIPELINE_SLUG:-}" != "${INTEGRATION_SLUG}" && -z "${CI_LANES:-}" ]] \
+      && grep -qx "run-perf-eval" <<< "${pr_labels//,/$'\n'}"; then
+    buildkite-agent annotate --style info --context perf-eval \
+      "Runs the perf/eval lane (\`run-perf-eval\` label)."
+  fi
   skip_labels="${pr_labels}"
 elif [[ "${BUILDKITE_BRANCH:-}" == "main" && "${BUILDKITE_SOURCE:-}" == "webhook" ]]; then
   skip_labels="$(merged_pr_labels)"
 else
   skip_labels=""
 fi
+
 if grep -qx "skip-tpu-ci" <<< "${skip_labels//,/$'\n'}"; then
   SKIP_TPU_CI=1
 fi
 if [[ "${SKIP_TPU_CI:-0}" == "1" ]]; then
-  export SKIP_TPU_CI
-  default_lanes="tests"
+  export SKIP_TPU_CI=1
   buildkite-agent annotate --style info --context skip-tpu-ci \
     "TPU steps not run (\`skip-tpu-ci\` label); the CPU steps still run."
-else
-  export SKIP_TPU_CI=0
-fi
-lanes="${CI_LANES:-${default_lanes}}"
-for lane in ${lanes}; do
-  if [[ " ${ALL_LANES} " != *" ${lane} "* ]]; then
-    echo "ERROR: CI_LANES names '${lane}'; lanes are: ${ALL_LANES}" >&2
-    exit 1
-  fi
-done
-missing=()
-for lane in ${ALL_LANES}; do
-  if [[ " ${lanes} " != *" ${lane} "* ]]; then
-    continue
-  fi
-  file=".buildkite/pipeline_${lane}.yml"
-  if [[ ! -f "${file}" ]]; then
-    missing+=("${file}")
-    continue
-  fi
-  echo "Uploading ${file}"
-  upload_with_priority "${file}" "$JOB_PRIORITY"
-done
-if [[ ${#missing[@]} -gt 0 ]]; then
-  # A lane asked for by name has to exist; the whole suite runs the lanes it
-  # has and says what it left out.
-  if [[ -n "${CI_LANES:-}" ]]; then
-    echo "ERROR: CI_LANES asks for ${missing[*]}, which does not exist" >&2
-    exit 1
-  fi
-  buildkite-agent annotate --style warning --context lane-gaps \
-    "Not run: no ${missing[*]} yet."
 fi
 
-# pipeline_build.yml skips the -omni image build when this is non-empty.
-# Buildkite rejects the upload if a skip reason is over 70 characters.
-OMNI_IMAGE_SKIP=""
-if [[ " ${lanes} " != *" tests "* ]]; then
-  OMNI_IMAGE_SKIP="Only the tests lane uses the -omni image; this build has none."
-elif [[ "${SKIP_TPU_CI}" == "1" ]]; then
-  OMNI_IMAGE_SKIP="Only TPU steps use the -omni image; skip-tpu-ci skips them."
-fi
-export OMNI_IMAGE_SKIP
-
-echo "Uploading Build Pipeline"
-upload_with_priority .buildkite/pipeline_build.yml "$JOB_PRIORITY"
+echo "--- :pipeline: Rendering and uploading pipeline with priority ${JOB_PRIORITY}"
+rendered_pipeline="$(python3 "${SCRIPT_DIR}/render_pipeline.py")"
+buildkite-agent pipeline upload <<< "${rendered_pipeline}"
 
 echo "--- Buildkite Bootstrap Finished"
