@@ -60,6 +60,7 @@ from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
 from vllm_omni.platforms import current_omni_platform
 
 from tests_omni.omni_test_utils import assert_all_loaded, assert_parity
+from vllm_torchtpu.omni.rope import split_rope_natural_tables
 
 pytestmark = [pytest.mark.omni]
 
@@ -140,7 +141,8 @@ def _ref_rope_tables(
     # diffusers' first CPU call in a process can return a cos table up to
     # 1.5e-4 off from later calls with the same input; use a later one.
     ref_rope(coords)
-    return ref_rope(coords)
+    # The TPU patch returns the tables in the q/k layout (B, 1, T, H * D).
+    return split_rope_natural_tables(*ref_rope(coords))
 
 
 def _assert_rope_parity(
@@ -213,7 +215,7 @@ def test_ltx2_video_rope_on_tpu_matches_diffusers() -> None:
         kind="video",
         tpu_out=tpu_out,
         ref_out=ref_out,
-        expected_shape=(1, 32, 1536, 64),
+        expected_shape=(1, 1, 1536, 4096),
     )
 
 
@@ -249,7 +251,7 @@ def test_ltx2_audio_rope_on_tpu_matches_diffusers() -> None:
         kind="audio",
         tpu_out=tpu_out,
         ref_out=ref_out,
-        expected_shape=(1, 32, 26, 32),
+        expected_shape=(1, 1, 26, 2048),
     )
 
 
