@@ -592,3 +592,40 @@ def test_prefill_sc_bounded_copy_flag_selects_the_backend(monkeypatch, bounded):
             block_topk=BLOCK_TOPK,
         )
     assert seen == [SparseCoreTopK(bounded_copy=True) if bounded else None]
+
+
+@pytest.mark.parametrize("slot", [0, 1, 7])
+@pytest.mark.parametrize(
+    "q_lens,context,tokens",
+    [
+        # One prefill request with history, an idle slot.
+        ([24, 0], [600, 0], 24),
+        # Decode prefix + two prefill pieces + an idle slot, padded bucket.
+        ([1, 1, 20, 9, 0], [900, 33, 1203, 0, 0], 40),
+        # A long history spanning many pool pages.
+        ([32, 0, 0], [3000, 0, 0], 32),
+    ],
+)
+def test_prefill_pool_page_table_keeps_the_selection(
+    monkeypatch, interpret, q_lens, context, tokens, slot
+):
+    """Past PREFILL_PAGE_TABLE_SMEM_BYTES (96 request slots at max_model_len)
+    the ragged prefill indexer hands StreamIndex the pool-page table; its KV
+    reader expands the entries to the same kernel pages, so the selection is
+    the expanded table's."""
+    args = inputs(len(q_lens) + slot, q_lens, context, tokens, "integer")
+    assert tokens > len(context)  # the ragged prefill path
+    monkeypatch.setattr(
+        pooled_qsa,
+        "streamindex_topk",
+        functools.partial(streamindex.streamindex_topk, topk_backend=ReferenceTopK()),
+    )
+
+    def run():
+        return np.asarray(
+            pooled_qsa.select_blocks(**args, ratio=RATIO, block_topk=BLOCK_TOPK, slot=slot)
+        )
+
+    expected = run()
+    monkeypatch.setattr(pooled_qsa, "PREFILL_PAGE_TABLE_SMEM_BYTES", 0)
+    np.testing.assert_array_equal(run(), expected)
