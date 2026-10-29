@@ -263,6 +263,7 @@ if TYPE_CHECKING:
     VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE: bool = False
     VLLM_TPU_BLOCK_TABLE_PACK_DELTA: bool = False
     VLLM_TPU_TOKEN_PADDING_REUSE: bool = False
+    VLLM_TPU_FAST_METADATA_BUILD: bool = False
     VLLM_TPU_PLE_HOST_PRELOOKUP: bool = False
     VLLM_TPU_PLE_HOST_PRELOOKUP_CHECK: str = ""
     VLLM_TPU_STAGE_TIMING_ONLY_WITH_SINK: bool = False
@@ -1601,6 +1602,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Skip the token-padding mask's synchronous H2D when its rows are the same
     # as the last write (layers/adapter/token_padding.py).
     "VLLM_TPU_TOKEN_PADDING_REUSE": env_bool("VLLM_TPU_TOKEN_PADDING_REUSE"),
+    # Staged metadata walk: build every group's AttentionMetadata inline instead
+    # of one builder call per group (tpu_runner._build_attention_metadata_staged).
+    "VLLM_TPU_FAST_METADATA_BUILD": env_bool("VLLM_TPU_FAST_METADATA_BUILD"),
     # Qwen4Exp host PLE: look the rows up before the backbone call and pass them
     # in, so the TP graph has no host boundary (models/vllm/qwen4_exp).
     "VLLM_TPU_PLE_HOST_PRELOOKUP": env_bool("VLLM_TPU_PLE_HOST_PRELOOKUP"),
