@@ -19,6 +19,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.deepseek_v4.collective_ids import O_FETCH_COLLECTIVE_ID
 from vllm_torchtpu.kernels.deepseek_v4.rope import (
     LANE,
     CosSinRef,
@@ -430,10 +431,6 @@ def fused_reverse_rope_wo_a_projection(
 # The fused o-fetch kernel covers one token tile of the fused op, up to the
 # largest tested size: 2T <= 512.
 O_FETCH_MAX_TOKENS = 512
-# Barrier group of the chip-pair kernels; each call signals and waits once, so
-# calls in program order keep the count balanced. Distinct from the fused MoE
-# kernel's (0).
-O_FETCH_COLLECTIVE_ID = 3
 
 
 def _o_fetch_kernel(
