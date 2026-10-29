@@ -225,6 +225,7 @@ def _kernel(
     bf16_mxu: bool = False,
     query_tile: int = 256,
     lean: bool = False,
+    mask_lanes: bool = False,
 ):
     block = pl.program_id(0)
     # The model produces BF16 queries.  A BF16 call boundary can avoid a large
@@ -324,7 +325,22 @@ def _kernel(
         pieces = []
         for part in range(parts):
             tile_words = kv_tile // (ratio * 32)
-            if tile_words > 1:
+            if mask_lanes and tile_words > 1 and (ratio * 32) % 128 == 0:
+                # Each word covers whole 128-lane columns of the tile: test
+                # word k against a per-lane bit only on its own columns, then
+                # join the columns, instead of selecting words per element.
+                bit = jnp.int32(1) << ((row[: ratio * 32] // ratio) % 32)
+                columns = [
+                    bitset_ref[part, tile_words * tile + index, :live][:, None]
+                    & bit[None, :]
+                    for index in range(tile_words)
+                ]
+                pieces.append(jnp.concatenate(columns, axis=1) != 0)
+            elif mask_lanes:
+                word = bitset_ref[part, tile, :live]
+                bit = jnp.int32(1) << (row // ratio)
+                pieces.append((word[:, None] & bit[None, :]) != 0)
+            elif tile_words > 1:
                 # Select integer words before extracting bits. A select between
                 # two bool matrices forces an unsupported Mosaic i1->i8 layout.
                 word = bitset_ref[part, tile_words * tile, :live][:, None]
@@ -677,6 +693,7 @@ def block_sparse_gqa_prefill(
             **({"bf16_mxu": True} if bf16_mxu else {}),
             query_tile=query_tile,
             **({"lean": True} if envs.VLLM_TPU_QSA_PREFILL_LEAN else {}),
+            **({"mask_lanes": True} if envs.VLLM_TPU_QSA_PREFILL_MASK_LANES else {}),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
