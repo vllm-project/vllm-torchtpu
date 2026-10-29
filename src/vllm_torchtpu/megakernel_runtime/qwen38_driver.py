@@ -874,8 +874,12 @@ class Qwen38SegmentDriver:
                 head=bool(self.segments.head_groups),
             )
             shadow_seg.bind_pool()
+            from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpSegmentShadowModel
+
+            # Own compiled class: a second Qwen4ExpSegmentModel instance would share the served
+            # segment program's compiled graph (see `_attach_whole_shadow`).
             with self._contexts(runner, "model_mk_segments_shadow"):
-                self.shadow = Qwen4ExpSegmentModel(
+                self.shadow = Qwen4ExpSegmentShadowModel(
                     vllm_config=self.cfg,
                     prefix="model_mk_segments_shadow",
                     backbone=runner.model.model,
