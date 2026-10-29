@@ -1140,6 +1140,22 @@ class TPUModelRunner(GPUModelRunner):
             runner_utils.PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
             runner_utils.PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD,
         )
+        only_phases = runner_utils.config_list(
+            additional_config.get(runner_utils.PHASED_PROFILER_ONLY_PHASES_KEY)
+        )
+        target_concurrencies = [
+            int(c)
+            for c in runner_utils.config_list(
+                additional_config.get(
+                    runner_utils.PHASED_PROFILER_TARGET_CONCURRENCY_KEY
+                )
+            )
+        ]
+        track_concurrency = bool(
+            additional_config.get(
+                runner_utils.PHASED_PROFILER_TRACK_CONCURRENCY_KEY, False
+            )
+        )
         # Same scoping as the standard profiler: the prefix names the run, and
         # the per-phase subdirectories sit beneath it.
 
@@ -1167,6 +1183,9 @@ class TPUModelRunner(GPUModelRunner):
             prefill_kv_len_threshold=prefill_kv_len_threshold,
             standard_opts=standard_opts,
             advanced_opts=advanced_opts,
+            only_phases=only_phases,
+            target_concurrencies=target_concurrencies,
+            track_concurrency=track_concurrency,
         )
 
     def stop_phased_profiling(self) -> None:

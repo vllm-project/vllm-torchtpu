@@ -1141,6 +1141,8 @@ class TestStartStopPhasedProfiling:
             additional_config={
                 "phased_profiler_decode_only_kv_len_threshold": 128,
                 "phased_profiler_prefill_only_kv_len_threshold": 4096,
+                "phased_profiler_only_phases": "decode_only, prefill_heavy",
+                "phased_profiler_target_concurrency": [93],
             },
             max_iterations=20,
             delay_iterations=3,
@@ -1168,6 +1170,9 @@ class TestStartStopPhasedProfiling:
                 "tpu_num_sparse_cores_to_trace": 1,
                 "tpu_num_sparse_core_tiles_to_trace": 1,
             },
+            only_phases=["decode_only", "prefill_heavy"],
+            target_concurrencies=[93],
+            track_concurrency=False,
         )
         assert runner.phase_based_profiler is mock_profiler_cls.return_value
 

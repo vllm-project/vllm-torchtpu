@@ -20,6 +20,7 @@ from vllm_torchtpu.runner.utils import (
     PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR,
     InferencePhase,
     PhaseBasedProfiler,
+    config_list,
     determine_phase_from_batch_composition_stats,
 )
 
@@ -440,6 +441,108 @@ def test_phased_profiler_prefill_threshold_does_not_gate_prefill_heavy(
     profiler.step(stats)
     mock_profile.assert_called_once()
     assert profiler.inference_phase_seen[InferencePhase.PREFILL_HEAVY]
+
+
+def _run_steps(profiler, num_reqs, steps):
+    for _ in range(steps):
+        profiler.step({"num_reqs": num_reqs, "total_num_scheduled_tokens": num_reqs})
+
+
+def test_phased_profiler_target_concurrencies(profiler_fixture):
+    """A target concurrency list: one capture per listed num_reqs, named
+    <phase>_concur_<num_reqs>; other request counts are skipped."""
+    profiler = profiler_fixture["profiler"]
+    mock_profile = profiler_fixture["mock_profile"]
+    mock_determine_phase = profiler_fixture["mock_determine_phase"]
+    profiler.only_phases = frozenset({"decode_only"})
+    profiler.target_concurrencies = frozenset({93, 47})
+    profiler.track_concurrency = True
+    mock_determine_phase.return_value = InferencePhase.DECODE_ONLY
+
+    _run_steps(profiler, 90, 1)  # not a target
+    mock_profile.assert_not_called()
+    _run_steps(profiler, 93, PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR + 1)
+    assert mock_profile.call_count == 1
+    _run_steps(profiler, 93, 2)  # already captured
+    assert mock_profile.call_count == 1
+    _run_steps(profiler, 47, 1)
+    assert mock_profile.call_count == 2
+    assert profiler.current_phase == "decode_only_concur_47"
+
+
+def test_phased_profiler_only_phases_skips_other_phases(profiler_fixture):
+    """Only the listed phases are captured; once they all are, steps stop
+    looking for new captures."""
+    profiler = profiler_fixture["profiler"]
+    mock_profile = profiler_fixture["mock_profile"]
+    mock_determine_phase = profiler_fixture["mock_determine_phase"]
+    profiler.only_phases = frozenset({"prefill_heavy"})
+
+    mock_determine_phase.return_value = InferencePhase.DECODE_ONLY
+    _run_steps(profiler, 4, 1)
+    mock_profile.assert_not_called()
+    assert not profiler.inference_phase_seen[InferencePhase.DECODE_ONLY]
+
+    mock_determine_phase.return_value = InferencePhase.PREFILL_HEAVY
+    _run_steps(profiler, 4, PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR + 1)
+    assert mock_profile.call_count == 1
+    assert profiler.current_phase == ""
+    assert profiler._all_captures_done()
+
+
+def test_phased_profiler_filter_does_not_consume_the_step(profiler_fixture):
+    """A step at a non-target num_reqs leaves the decode KV-len gate and the
+    phase untouched for a later matching step."""
+    profiler = profiler_fixture["profiler"]
+    mock_profile = profiler_fixture["mock_profile"]
+    mock_determine_phase = profiler_fixture["mock_determine_phase"]
+    profiler.target_concurrencies = frozenset({8})
+    profiler.track_concurrency = True
+    profiler.decode_kv_len_threshold = 100
+    mock_determine_phase.return_value = InferencePhase.DECODE_ONLY
+
+    profiler.step({"num_reqs": 7, "total_num_scheduled_tokens": 7, "min_kv_len": 500})
+    profiler.step({"num_reqs": 8, "total_num_scheduled_tokens": 8, "min_kv_len": 50})
+    mock_profile.assert_not_called()
+    profiler.step({"num_reqs": 8, "total_num_scheduled_tokens": 8, "min_kv_len": 500})
+    mock_profile.assert_called_once()
+    assert profiler.current_phase == "decode_only_concur_8"
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"only_phases": ["decode"]}, "unknown phases"),
+        ({"target_concurrencies": [0]}, "positive"),
+    ],
+)
+def test_phased_profiler_rejects_bad_filters(tmp_path, kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        PhaseBasedProfiler(profile_dir=str(tmp_path), **kwargs)
+
+
+def test_phased_profiler_target_implies_tracking(tmp_path):
+    profiler = PhaseBasedProfiler(
+        profile_dir=str(tmp_path),
+        only_phases=["Decode_Only ", "prefill_heavy"],
+        target_concurrencies=[93],
+    )
+    assert profiler.track_concurrency
+    assert profiler.only_phases == {"decode_only", "prefill_heavy"}
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        (None, []),
+        ("", []),
+        ("decode_only, prefill_heavy", ["decode_only", "prefill_heavy"]),
+        (["decode_only"], ["decode_only"]),
+        ([93, 47], ["93", "47"]),
+    ],
+)
+def test_config_list(value, expected):
+    assert config_list(value) == expected
 
 
 def _stage_rank_capture(rank_dir, ts_name, filename, content):
