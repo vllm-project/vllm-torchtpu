@@ -263,11 +263,7 @@ steps:
       # 2x2x2 profile, which has held zero chip-hours since the fleet was built.
       - label: "Multihost TorchTPU Presubmit (v7x 16-chip)"
         key: "vllm_torchtpu_multihost_presubmit"
-        depends_on:
-          - "build_docker"
-        timeout_in_minutes: 1440
-        agents:
-          queue: "kube"
+        <<: *integration_step
         plugins:
           - *kube_plugin
         # 35 short prompts with a 256-token budget: decode steps carry at most
@@ -298,11 +294,7 @@ steps:
       # logs are the record - as for the multihost step above.
       - label: "Integration: qwen35-pcp8-2tp4dp-disagg-correctness"
         key: "integration_qwen35_pcp8_2tp4dp_disagg_correctness"
-        depends_on:
-          - "build_docker"
-        timeout_in_minutes: 1440
-        agents:
-          queue: "kube"
+        <<: *integration_step
         plugins:
           - *kube_plugin
         commands:
@@ -310,11 +302,7 @@ steps:
 
       - label: "Integration: qwen35-gpc-correctness"
         key: "integration_qwen35_gpc_correctness"
-        depends_on:
-          - "build_docker"
-        timeout_in_minutes: 1440
-        agents:
-          queue: "kube"
+        <<: *integration_step
         plugins:
           - *kube_plugin
         commands:
@@ -325,11 +313,7 @@ steps:
       - label: "Integration: Nightly dsv4-pd-disagg-correctness"
         key: "integration_nightly_dsv4_pd_disagg_correctness"
         if: 'build.env("NIGHTLY") == "1"'
-        depends_on:
-          - "build_docker"
-        timeout_in_minutes: 1440
-        agents:
-          queue: "kube"
+        <<: *integration_step
         plugins:
           - *kube_plugin
         commands:
