@@ -378,12 +378,14 @@ def fresh_buffer(t: torch.Tensor) -> torch.Tensor:
     plain contiguous clone (CPU has no `add` kernel for float8 dtypes).
 
     torch_tpu has no `add` for float8 dtypes either (NotImplementedError as of
-    0.2.1.dev20261028), so 1-byte floats take the `+ 0` on their bytes.
+    0.2.1.dev20261028), so 1-byte floats round-trip through bfloat16 instead,
+    which is exact (bfloat16 holds every float8 value). Not a dtype view of a
+    uint8 result: that is again a view, re-materialized every step.
     """
     out = torch.clone(t, memory_format=torch.contiguous_format)
     if out.device.type == "tpu":
         if out.dtype.is_floating_point and out.dtype.itemsize == 1:
-            out = (out.view(torch.uint8) + 0).view(out.dtype)
+            out = out.to(torch.bfloat16).to(out.dtype)
         else:
             out = out + 0
     return out
