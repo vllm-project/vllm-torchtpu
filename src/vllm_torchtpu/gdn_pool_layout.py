@@ -190,6 +190,10 @@ def derive_pooled_gdn_state_layout(
 
 def prefill_checkpoint_enabled(vllm_config: VllmConfig) -> bool:
     """Enables checkpoints for pooled GDN with block-aligned prefix hits."""
+    from vllm_torchtpu import envs as tpu_envs
+
+    if not tpu_envs.TPU_GDN_PREFILL_CHECKPOINT:
+        return False
     cache = vllm_config.cache_config
     parallel = vllm_config.parallel_config
     if (

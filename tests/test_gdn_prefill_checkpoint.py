@@ -113,6 +113,7 @@ def _vllm_config(
 def default_pool(monkeypatch):
     """Leaves the unified-pool choice to the architecture."""
     monkeypatch.delenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", raising=False)
+    monkeypatch.delenv("TPU_GDN_PREFILL_CHECKPOINT", raising=False)
     return monkeypatch
 
 
@@ -159,6 +160,13 @@ def test_checkpoints_need_a_hash_block_covering_the_mamba_block(
 def test_checkpoints_follow_the_unified_pool_override(default_pool):
     default_pool.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "0")
     assert not prefill_checkpoint_enabled(_vllm_config())
+
+
+def test_checkpoints_follow_the_env_switch(default_pool):
+    default_pool.setenv("TPU_GDN_PREFILL_CHECKPOINT", "0")
+    assert not prefill_checkpoint_enabled(_vllm_config())
+    default_pool.setenv("TPU_GDN_PREFILL_CHECKPOINT", "1")
+    assert prefill_checkpoint_enabled(_vllm_config())
 
 
 # Lockstep tests: the patched scheduler split selects each chunk, KVCacheManager
