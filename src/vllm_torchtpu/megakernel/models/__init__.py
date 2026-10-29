@@ -18,11 +18,24 @@ from . import (
     qwen35_candidate30,
     qwen35_pool,
     qwen35_profile,
+    qwen38_moe,
+    qwen38_moe_profile,
 )
+from .qwen35 import MKConfig, Qwen35, Qwen35Geometry, qwen35_spec
+from .qwen38_moe import Qwen38Moe, Qwen38MoeGeometry, qwen38_moe_spec
 
 __all__ = [
+    "MKConfig",
+    "Qwen35",
+    "Qwen35Geometry",
+    "Qwen38Moe",
+    "Qwen38MoeGeometry",
     "qwen35",
     "qwen35_candidate30",
     "qwen35_pool",
     "qwen35_profile",
+    "qwen35_spec",
+    "qwen38_moe",
+    "qwen38_moe_profile",
+    "qwen38_moe_spec",
 ]

@@ -180,14 +180,8 @@ class ModelDef:
         R: int = 8,
     ) -> ModelSpec:
         """Derive `ModelSpec` (`LayerType` + `SwitchSlot`s, deduping shared modules)."""
-        return derive_model_spec(
-            cls,
-            hf_config_or_geom,
-            gdn_module=gdn_module,
-            moe_tp=moe_tp,
-            e_slots=e_slots,
-            R=R,
-        )
+        kw = dict(gdn_module=gdn_module, moe_tp=moe_tp, e_slots=e_slots, R=R)
+        return derive_model_spec(cls, hf_config_or_geom, **kw)
 
     @classmethod
     def shrink_hf_config(
@@ -199,7 +193,8 @@ class ModelDef:
         ex: ExecSpec | None = None,
     ) -> dict[str, Any]:
         """Return a shrunk HF config dict (`periods` cycles, legal heads/experts)."""
-        return shrink_model_hf_config(cls, hf_config, periods=periods, R=R, ex=ex)
+        out = shrink_model_hf_config(cls, hf_config, periods=periods, R=R, ex=ex)
+        return {**out, "_model_def": cls.name} if cls.name else out
 
     @classmethod
     def shrink(
@@ -270,6 +265,13 @@ _ARCH_REGISTRY: dict[str, type[ModelDef]] = {}
 _MODEL_TYPE_REGISTRY: dict[str, type[ModelDef]] = {}
 
 
+def _hf_geom_sig(cfg: Any) -> tuple[Any, Any] | None:
+    """Return `(num_hidden_layers, hidden_size)` for HF architecture disambiguation."""
+    r = _sub_cfg(cfg, "text_config") or cfg
+    sig = (_sub_cfg(r, "num_hidden_layers"), _sub_cfg(r, "hidden_size"))
+    return None if sig == (None, None) else sig
+
+
 def register_model(
     *,
     name: str,
@@ -279,12 +281,11 @@ def register_model(
 ) -> Callable[[type[ModelDef]], type[ModelDef]]:
     """Class decorator registering a declarative `ModelDef` subclass."""
     archs = tuple(hf_architectures)
-    if hf_model_type is None:
-        mtypes: tuple[str, ...] = ()
-    elif isinstance(hf_model_type, str):
-        mtypes = (hf_model_type,)
-    else:
-        mtypes = tuple(hf_model_type)
+    mtypes: tuple[str, ...] = (
+        (hf_model_type,)
+        if isinstance(hf_model_type, str)
+        else tuple(hf_model_type or ())
+    )
 
     def _decorator(cls: type[ModelDef]) -> type[ModelDef]:
         if name in _MODEL_REGISTRY and not replace:
@@ -294,21 +295,19 @@ def register_model(
             raise MegakernelConfigError(
                 f"Model {name!r} is already registered by {prev_cls}"
             )
-        for kind, reg, keys in (
-            ("HF architecture", _ARCH_REGISTRY, archs),
-            ("HF model_type", _MODEL_TYPE_REGISTRY, mtypes),
+        for kind, attr, keys in (
+            ("HF architecture", "hf_architectures", archs),
+            ("HF model_type", "hf_model_type", mtypes),
         ):
             for k in keys:
-                prev = reg.get(k)
-                if (
-                    prev is not None
-                    and prev is not cls
-                    and prev.name != name
-                    and not replace
-                ):
-                    raise MegakernelConfigError(
-                        f"{kind} {k!r} is already registered to {prev.name!r}"
-                    )
+                for prev in _MODEL_REGISTRY.values():
+                    if prev is cls or prev.name == name or k not in getattr(prev, attr):
+                        continue
+                    sigs = {_hf_geom_sig(m.default_hf_config) for m in (cls, prev)}
+                    if not replace and (None in sigs or len(sigs) == 1):
+                        raise MegakernelConfigError(
+                            f"{kind} {k!r} is already registered to {prev.name!r}"
+                        )
         validate_model_def(cls, name, archs, mtypes, ModelDef)
         if replace:
             old_cls = _MODEL_REGISTRY.get(name)
@@ -323,9 +322,9 @@ def register_model(
             register_profile(prof, replace=replace)
         _MODEL_REGISTRY[name] = cls
         for a in archs:
-            _ARCH_REGISTRY[a] = cls
+            _ARCH_REGISTRY.setdefault(a, cls)
         for mt in mtypes:
-            _MODEL_TYPE_REGISTRY[mt] = cls
+            _MODEL_TYPE_REGISTRY.setdefault(mt, cls)
         return cls
 
     return _decorator
@@ -336,6 +335,11 @@ def list_models() -> tuple[str, ...]:
     return tuple(sorted(_MODEL_REGISTRY))
 
 
+def _he_sig(cfg: Any) -> tuple[Any, Any]:
+    r = _sub_cfg(cfg, "text_config") or cfg
+    return _sub_cfg(r, "hidden_size"), _sub_cfg(r, "num_experts")
+
+
 def find_model(target: Any) -> type[ModelDef] | None:
     """Look up a `ModelDef` by name, HF architecture, `model_type`, or `hf_config`."""
     if isinstance(target, type) and issubclass(target, ModelDef):
@@ -343,33 +347,39 @@ def find_model(target: Any) -> type[ModelDef] | None:
     if (mdef := getattr(target, "_model_def", None)) is not None:
         return mdef
     if isinstance(target, str):
-        key = target.strip()
-        return (
-            _MODEL_REGISTRY.get(key)
-            or _ARCH_REGISTRY.get(key)
-            or _MODEL_TYPE_REGISTRY.get(key)
-        )
-    if target is not None:
-        cands: list[str] = []
-        archs = _sub_cfg(target, "architectures") or ()
-        if isinstance(archs, Sequence) and not isinstance(archs, (str, bytes)):
-            cands.extend(str(a) for a in archs if a)
-        for root in (target, _sub_cfg(target, "text_config")):
-            if root is not None and (mt := _sub_cfg(root, "model_type")):
-                cands.append(str(mt))
-        for cand in cands:
-            if (found := find_model(cand)) is not None:
-                return found
-    return None
+        regs = (_MODEL_REGISTRY, _ARCH_REGISTRY, _MODEL_TYPE_REGISTRY)
+        return next((m for r in regs if (m := r.get(target.strip()))), None)
+    if target is None:
+        return None
+    tc = _sub_cfg(target, "text_config")
+    md = _sub_cfg(target, "_model_def") or _sub_cfg(tc, "_model_def")
+    if isinstance(md, str) and (found := _MODEL_REGISTRY.get(md)) is not None:
+        return found
+    archs = _sub_cfg(target, "architectures") or ()
+    is_seq = isinstance(archs, Sequence) and not isinstance(archs, (str, bytes))
+    cands = [str(a) for a in archs if a] if is_seq else []
+    mts = (_sub_cfg(r, "model_type") for r in (target, tc) if r is not None)
+    cands.extend(str(mt) for mt in mts if mt)
+    sig = _hf_geom_sig(target)
+    ms: list[type[ModelDef]] = []
+    for m in _MODEL_REGISTRY.values():
+        if {*m.hf_architectures, *m.hf_model_type}.intersection(cands):
+            if sig is not None and _hf_geom_sig(m.default_hf_config) == sig:
+                return m
+            ms.append(m)
+    th, te = _he_sig(target)
+    for n in (2, 1) if th is not None else ():
+        hits = [m for m in ms if _he_sig(m.default_hf_config)[:n] == (th, te)[:n]]
+        if len(hits) == 1:
+            return hits[0]
+    return next((f for c in cands if (f := find_model(c)) is not None), None)
 
 
 def get_model(target: Any) -> type[ModelDef]:
     """Resolve a `ModelDef` by name, HF architecture, `model_type`, or `hf_config`."""
-    found = find_model(target)
-    if found is None:
-        raise KeyError(
-            f"Unknown megakernel model {target!r}; available: {list(list_models())}"
-        )
+    if (found := find_model(target)) is None:
+        avail = list(list_models())
+        raise KeyError(f"Unknown megakernel model {target!r}; available: {avail}")
     return found
 
 

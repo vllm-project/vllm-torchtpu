@@ -205,7 +205,7 @@ class PoolLayout:
 
     # ---------------------------------------------------------------- per rank
     def kh_per_rank(self, R: int) -> int:
-        return self.kh // R
+        return max(1, self.kh // R) if self.kh > 0 else 0
 
     def vh_per_rank(self, R: int) -> int:
         return self.vh // R
@@ -294,8 +294,10 @@ class PoolLayout:
             return
         R = ex.R
         _need(
-            self.kh % R == 0 and self.vh % R == 0,
-            f"recurrent heads (kh={self.kh}, vh={self.vh}) must be divisible by R={R}",
+            (self.kh % R == 0 or (self.kh > 0 and R % self.kh == 0))
+            and self.vh % R == 0,
+            f"recurrent heads (kh={self.kh}, vh={self.vh}) must be divisible by "
+            f"R={R} (key heads may instead divide R)",
         )
         _need(
             self.qkv_per_rank(R) % LANES == 0,

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ...comm.replication import derive_kh_rep
 from ...decls import (
     REQUIRED,
     HFParamDecl,
@@ -82,6 +83,7 @@ GDN_FIELD_ALIASES: dict[str, str] = {
 }
 
 GDN_GEOMETRY_METHODS: dict[str, Any] = {
+    "kh_rep": lambda g, R: derive_kh_rep(R, int(g.KH)),
     "kh": lambda g, R: gdn_lin_in_layout(g, R).kh,
     "vh": lambda g, R: gdn_lin_in_layout(g, R).vh,
     "QKV": lambda g, R: gdn_lin_in_layout(g, R).QKV,
@@ -148,6 +150,7 @@ def gdn_hf_params(prefix: str, geom: Any) -> list[HFParamDecl]:
         out_dim: int,
         sl: tuple[int, int],
         aliases: tuple[VLLMAlias, ...] = (),
+        groups: int | None = None,
     ) -> list[HFParamDecl]:
         w_n, s_n = _n(canon), _n(f"{canon}_s")
         return [
@@ -166,6 +169,7 @@ def gdn_hf_params(prefix: str, geom: Any) -> list[HFParamDecl]:
                     transpose=(1, 0),
                     quantize="fp8",
                     shard_axis=-1,
+                    shard_groups=groups,
                 ),
                 vllm_aliases=aliases,
             ),
@@ -183,6 +187,7 @@ def gdn_hf_params(prefix: str, geom: Any) -> list[HFParamDecl]:
                     split_slice=sl,
                     scale_for=w_n,
                     shard_axis=-1,
+                    shard_groups=groups,
                     small_field="in_s",
                 ),
             ),
@@ -288,8 +293,9 @@ def gdn_hf_params(prefix: str, geom: Any) -> list[HFParamDecl]:
         )
 
     decls = [
-        *_qkv_slice("lin_q", 0, kq_dim, (0, kq_dim), qkvz_alias),
-        *_qkv_slice("lin_k", 1, kq_dim, (kq_dim, 2 * kq_dim)),
+        # Key heads are replicated across ranks when KH < R (`kh_rep`).
+        *_qkv_slice("lin_q", 0, kq_dim, (0, kq_dim), qkvz_alias, groups=KH),
+        *_qkv_slice("lin_k", 1, kq_dim, (kq_dim, 2 * kq_dim), groups=KH),
         *_qkv_slice("lin_v", 2, v_dim, (2 * kq_dim, qkv_full)),
         HFParamDecl(
             name=_n("lin_z"),
@@ -365,6 +371,7 @@ def gdn_hf_params(prefix: str, geom: Any) -> list[HFParamDecl]:
             transform=ParamTransform(
                 shard_axis=-1,
                 channel_splits=(kq_dim, kq_dim, v_dim),
+                split_groups=(KH, KH, None),
                 flatten_tail=True,
                 small_field="conv",
             ),

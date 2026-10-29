@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from ...comm.replication import derive_sh_rep
 from ...exec_spec import ExecSpec
 from ...ops import BF16, F32, rnd
 
@@ -44,7 +45,8 @@ def moe_reference(
     IS = int(g.IS)
     I = int(g.I)  # noqa: E741
     is_tp = bool(getattr(g, "moe_tp", True)) if moe_tp is None else bool(moe_tp)
-    ISR = IS // R
+    sh_rep = derive_sh_rep(R, IS)
+    ISR = IS // max(1, R // sh_rep)
     IR = I // R if is_tp else I
     ER = E // R
 
@@ -101,13 +103,13 @@ def moe_reference(
             .astype(F32)
         )
         w_sh2 = sh2_l[r].astype(F32)
-        sh2_s = sh2_s_l[r]
+        sh2_s = sh2_s_l[r] * (1.0 / sh_rep) if sh_rep > 1 else sh2_s_l[r]
         part_r = (mid_sh @ w_sh2) * sh2_s * sg
 
         e13_l = e13_l_all[r]
         e13_s_l = e13_s_l_all[r]
         e2_l = e2_l_all[r]
-        e2_s_l = e2_s_l_all[r]
+        e2_s_r = e2_s_l_all[r]
 
         for b in range(B):
             for k in range(TOPK):
@@ -118,7 +120,7 @@ def moe_reference(
                 w13_e = e13_l[w_slot].astype(F32)
                 w2_e = e2_l[w_slot].astype(F32)
                 s13 = e13_s_l[w_slot]
-                s2 = e2_s_l[w_slot]
+                s2 = e2_s_r[w_slot]
                 h_e = (xb_moe[b : b + 1] @ w13_e) * s13
                 mid_e = (
                     rnd(rnd(jax.nn.silu(rnd(h_e[:, :IR]))) * rnd(h_e[:, IR:]))

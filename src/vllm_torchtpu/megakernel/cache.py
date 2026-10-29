@@ -130,7 +130,7 @@ class DirectHBM(CachePipe):
         donate_states: bool | None = None,
     ) -> Any:
         use_donate = donate if donate_states is None else bool(donate_states)
-        ms = resolve_model_spec(g_or_spec)
+        ms = resolve_model_spec(g_or_spec, R=ex.R)
         ex_direct = with_cache(ex, paged_kv=False, fused_pool_io=False)
         return kernel.make_step(mesh, ms, ex_direct, donate_states=use_donate)
 
@@ -155,7 +155,7 @@ class PallasWriter(CachePipe):
     ) -> Any:
         use_donate = donate if donate_pools is None else bool(donate_pools)
         f_mode = self.fused_pool_io if fused_pool_io is None else fused_pool_io
-        ms = resolve_model_spec(g_or_spec)
+        ms = resolve_model_spec(g_or_spec, R=ex.R)
         return make_pooled_step(
             mesh,
             ms,

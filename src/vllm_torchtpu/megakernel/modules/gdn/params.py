@@ -115,7 +115,7 @@ class GDNTunables:
 def gdn_lin_in_layout(g: Any, ex_or_r: ExecSpec | int) -> GDNLinInLayout:
     """Return shared column offsets for `lin_in` (`[qkv | z | b | a]`)."""
     R = ex_or_r.R if isinstance(ex_or_r, ExecSpec) else int(ex_or_r)
-    kh = g.KH // R
+    kh = max(1, g.KH // R) if g.KH > 0 else 0
     vh = g.VH // R
     KD, VD = g.KD, g.VD
     qkv = 2 * kh * KD + vh * VD
@@ -145,7 +145,11 @@ def derive_params(
     assert not (ex.VER and tiles.inplace), (
         "verify returns per-token checkpoints: no aliasing"
     )
-    assert g.KH % R == 0 and g.VH % R == 0, (g.KH, g.VH, R)
+    assert (g.KH % R == 0 or (g.KH > 0 and R % g.KH == 0)) and g.VH % R == 0, (
+        g.KH,
+        g.VH,
+        R,
+    )
     assert g.VH % g.KH == 0, (g.VH, g.KH)
     lay = gdn_lin_in_layout(g, ex)
     assert lay.vh <= 64, ("b|a gate lanes require vh <= 64", lay.vh)
