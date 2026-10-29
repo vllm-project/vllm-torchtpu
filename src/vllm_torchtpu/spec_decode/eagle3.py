@@ -172,11 +172,14 @@ def _async_seed_inputs_impl(
     num_reqs: torch.Tensor,
     input_ids: torch.Tensor,
     p: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_rows: int = 0,
+):
     """`_async_draft_seed_impl`, the eagle3 input shift + seed scatter
     (`Eagle3Proposer._draft_seed_input_ids`) and the loop-bucket pad of the
     gather index as one program (VLLM_TPU_DRAFT_SEED_FUSED). Returns
-    `(draft_input_ids, gather_indices [p], num_rejected)`."""
+    `(draft_input_ids, gather_indices [p], num_rejected)`; with `num_rows`
+    (the chunk's request capacity) also step 0's `draft_rows` and the
+    loop's padded rejected counts, so neither is padded eagerly."""
     last_token_indices, next_token_ids, num_rejected = _async_draft_seed_impl(
         next_tokens, num_draft, query_start_loc, num_reqs
     )
@@ -187,7 +190,14 @@ def _async_seed_inputs_impl(
         (last_token_indices,), next_token_ids.to(input_ids.dtype)
     )
     gather_indices = _maybe_pad_dim0(last_token_indices[:p], p)
-    return draft_input_ids, gather_indices, num_rejected
+    if not num_rows:
+        return draft_input_ids, gather_indices, num_rejected
+    # Eagle3Proposer._padded_draft_rows and the loop's rejected-count pad.
+    rows = gather_indices[:num_rows]
+    if rows.shape[0] < num_rows:
+        rows = torch.nn.functional.pad(rows, (0, num_rows - rows.shape[0]), value=-1)
+    rejected = _maybe_pad_dim0(num_rejected[:num_rows], num_rows)
+    return draft_input_ids, gather_indices, num_rejected, rows, rejected
 
 
 # The chunk's input_ids carry the draft forward's dynamic-dim marks; see
@@ -352,6 +362,7 @@ class Eagle3Proposer:
         # recomputing it or paying the full upstream builder walk.
         self._draft_md_cache: dict[int, tuple[dict, torch.Tensor, int]] = {}
         self._seed_checks_done = 0
+        self._seed_extras: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self._carry_checks_done = 0
         self._carry_mismatches: torch.Tensor | None = None
         self._seed_mismatches: torch.Tensor | None = None
@@ -1448,6 +1459,7 @@ class Eagle3Proposer:
         """
         runner = self.runner
         self._draft_md_cache.clear()
+        self._seed_extras.clear()
         num_reqs = runner.input_batch.num_reqs
         if num_reqs == 0:
             return []
@@ -1534,8 +1546,12 @@ class Eagle3Proposer:
                 num_rejected_np=rejected_np_per_chunk[ci],
                 num_tokens_padded=input_ids.shape[0],
                 draft_rows=(
-                    self._padded_draft_rows(
-                        last_token_indices, self._draft_rows_len(chunk)
+                    (
+                        self._seed_extras[id(chunk)][0]
+                        if id(chunk) in self._seed_extras
+                        else self._padded_draft_rows(
+                            last_token_indices, self._draft_rows_len(chunk)
+                        )
                     )
                     if self._draft_rows
                     else None
@@ -1653,7 +1669,10 @@ class Eagle3Proposer:
                     else runner.num_reqs_most_model_len
                 )
                 assert knr is not None
-                if is_async:
+                if is_async and id(c) in self._seed_extras:
+                    # Padded to knr inside the fused seed program.
+                    rejected_dev_per_chunk.append(self._seed_extras[id(c)][1])
+                elif is_async:
                     # nr is at the sampler's request-padding width, which can
                     # sit above a chunk's kernel_num_reqs; the rows past the
                     # chunk's requests are zeros either way.
@@ -1895,19 +1914,27 @@ class Eagle3Proposer:
                 and nt.device.type == "tpu"
             ):
                 # Seed, input shift/scatter and gather pad in one program.
-                draft_input_ids, gather_indices, num_rejected_out = (
-                    _async_seed_inputs_compiled(
-                        nt,
-                        num_draft_full,
-                        chunk.attn_ctx.query_start_loc,
-                        self._device_constant(
-                            ("num_reqs", num_reqs),
-                            lambda: torch.tensor(num_reqs, dtype=torch.int64),
-                        ),
-                        chunk.input_ids,
-                        self._loop_bucket(num_reqs),
-                    )
+                extras = (
+                    self._draft_rows
+                    and envs.VLLM_TPU_DRAFT_SEED_EXTRAS
+                    and chunk.sequence_layout_plan.descriptor
+                    == DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
                 )
+                seed_out = _async_seed_inputs_compiled(
+                    nt,
+                    num_draft_full,
+                    chunk.attn_ctx.query_start_loc,
+                    self._device_constant(
+                        ("num_reqs", num_reqs),
+                        lambda: torch.tensor(num_reqs, dtype=torch.int64),
+                    ),
+                    chunk.input_ids,
+                    self._loop_bucket(num_reqs),
+                    self._draft_rows_len(chunk) if extras else 0,
+                )
+                draft_input_ids, gather_indices, num_rejected_out = seed_out[:3]
+                if extras:
+                    self._seed_extras[id(chunk)] = (seed_out[3], seed_out[4])
                 if self._seed_checks_done < envs.VLLM_TPU_VERIFY_FUSED_CHECK:
                     self._check_seed_fused(
                         nt,
@@ -1917,6 +1944,7 @@ class Eagle3Proposer:
                         draft_input_ids,
                         gather_indices,
                         num_rejected_out,
+                        self._seed_extras.get(id(chunk)),
                     )
                 draft_input_ids, gather_indices = (
                     chunk.sequence_layout_plan.localize_token_tensor_and_gather_indices(
@@ -2094,6 +2122,7 @@ class Eagle3Proposer:
         draft_input_ids: torch.Tensor,
         gather_indices: torch.Tensor,
         num_rejected: torch.Tensor,
+        extras: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> None:
         """VLLM_TPU_VERIFY_FUSED_CHECK for the fused draft seed: rerun the
         separate seed, scatter and pad on the same inputs and count mismatching
@@ -2118,6 +2147,13 @@ class Eagle3Proposer:
             + (gather_indices != ref_g).sum()
             + (num_rejected != nrej).sum()
         ).to(torch.int64)
+        if extras is not None:
+            num_rows = self._draft_rows_len(chunk)
+            ref_rows = self._padded_draft_rows(ref_g, num_rows)
+            ref_rej = _maybe_pad_dim0(nrej[:num_rows], num_rows)
+            mism = mism + (
+                (extras[0] != ref_rows).sum() + (extras[1] != ref_rej).sum()
+            ).to(torch.int64)
         delta = torch.stack(
             [mism * (0 if faulted else 1), (mism > 0).to(torch.int64) * (1 if faulted else 0)]
         )
@@ -2794,7 +2830,14 @@ class Eagle3Proposer:
                             qsl = torch.zeros(q, dtype=torch.int32).to(runner.device)
                             n_dev = torch.tensor(1, dtype=torch.int64).to(runner.device)
                             ids = torch.zeros(T, dtype=torch.int32).to(runner.device)
-                            out = _async_seed_inputs_compiled(nt, nd, qsl, n_dev, ids, p)
+                            num_rows = (
+                                q - 1
+                                if self._draft_rows and envs.VLLM_TPU_DRAFT_SEED_EXTRAS
+                                else 0
+                            )
+                            out = _async_seed_inputs_compiled(
+                                nt, nd, qsl, n_dev, ids, p, num_rows
+                            )
                             synchronize_tensors(out)
 
     def _precompile_draft_rows_carry_and_token(self) -> None:
