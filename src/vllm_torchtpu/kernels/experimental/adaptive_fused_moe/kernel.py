@@ -28,6 +28,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 # The layout constants this kernel is built against, and the host module
 # whose accounting decides what it may declare.
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import host
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.host import (
     FP4,
@@ -60,6 +61,9 @@ QCHUNK = 512
 # which is why this is a handful of heights and not one per ROWBLK -- and the
 # top rung is always tile_m, so a full tile is unchanged.
 HEIGHT_RUNGS = 4
+# Blocks of ROWBLK rows whose row numbers the hoisted gather issue
+# (MOE_ADAPTIVE_ISSUE_HOIST) loads before starting their DMAs.
+ISSUE_GROUP = 4
 # DMA priority the weight refills take, so that they stay off the in-order
 # queue the token gather issues on.
 WEIGHT_DMA_PRIORITY = 1
@@ -665,6 +669,10 @@ def _build_fused_ep_moe_kernel(
     # This subsumes the deferred commit drain the same bound used to select:
     # deferring a wait one visit is worth nothing once the wait is gone.
     push_from_vmem = ragged_rows_alloc <= ep * g_local * tile_m
+    # MOE_ADAPTIVE_EARLY_PRIME / MOE_ADAPTIVE_ISSUE_HOIST (default off): see
+    # read_down_weights and issue_from. Both change only when DMAs are issued.
+    early_prime = envs.MOE_ADAPTIVE_EARLY_PRIME
+    issue_hoist = envs.MOE_ADAPTIVE_ISSUE_HOIST
     ls_window_rows = host.act_scale_window_rows(tile_m)
     gather_tiles = host.TOKEN_GATHER_TILES_PER_WINDOW
     gather_payload_rows = gather_tiles * tile_m
@@ -971,7 +979,32 @@ def _build_fused_ep_moe_kernel(
                         ).start()
                     return _
 
-                lax.fori_loop(0, live_blocks, issue_block, jnp.int32(0))
+                if not issue_hoist:
+                    lax.fori_loop(0, live_blocks, issue_block, jnp.int32(0))
+                    return
+
+                def issue_group(j, _):
+                    """ISSUE_GROUP blocks at once, every row number loaded
+                    before the first DMA starts, so each start does not wait
+                    on its own scalar load and address arithmetic."""
+                    base = j * (ISSUE_GROUP * ROWBLK)
+                    tokens = [
+                        gather_smem[gather_offset + base + r]
+                        for r in range(ISSUE_GROUP * ROWBLK)
+                    ]
+                    for r, token in enumerate(tokens):
+                        pltpu.make_async_copy(
+                            lhs_hbm.at[token],
+                            lhs_vm.at[slot, base + r],
+                            lhs_sems.at[slot],
+                        ).start()
+                    return _
+
+                n_groups = live_blocks // ISSUE_GROUP
+                lax.fori_loop(0, n_groups, issue_group, jnp.int32(0))
+                lax.fori_loop(
+                    n_groups * ISSUE_GROUP, live_blocks, issue_block, jnp.int32(0)
+                )
 
             @pl.when(gather_slot == 0)
             def _():
@@ -1385,6 +1418,22 @@ def _build_fused_ep_moe_kernel(
 
                     def read_down_weights():
                         wait_down_weights()
+                        if early_prime:
+                            # The next expert's first tile, issued between
+                            # this tile's two matmuls rather than after its
+                            # commit and push, so its rows land under mm2,
+                            # the epilogue and the drain.
+                            @pl.when(
+                                jnp.logical_and(t + 1 == n_tiles, visit_i + 1 < n_visit)
+                            )
+                            def _():
+                                prime_expert(
+                                    visit_sm[visit_i + 1],
+                                    other_parity,
+                                    next_wslot,
+                                    jnp.bool_(True),
+                                )
+
                         return w2_vm[w2_slot]
 
                     if rhs_packed4:
@@ -1535,15 +1584,17 @@ def _build_fused_ep_moe_kernel(
             # not the round trip. Empty experts are absent from the visit list.
             tiles_done = carry[0]
 
-            @pl.when(visit_i + 1 < n_visit)
-            def _():
-                nxt = visit_sm[visit_i + 1]
-                prime_expert(
-                    nxt,
-                    lax.rem(tiles_done, jnp.int32(OUT_PARITIES)),
-                    next_wslot,
-                    jnp.bool_(True),
-                )
+            if not early_prime:
+
+                @pl.when(visit_i + 1 < n_visit)
+                def _():
+                    nxt = visit_sm[visit_i + 1]
+                    prime_expert(
+                        nxt,
+                        lax.rem(tiles_done, jnp.int32(OUT_PARITIES)),
+                        next_wslot,
+                        jnp.bool_(True),
+                    )
 
             return carry[:-1] + (next_wslot,)
 
