@@ -23,6 +23,7 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `DP_SCHED_ENABLED` | `False` | Enables TPU data-parallel request scheduling optimizations. |
+| `TPU_DP_SCHED_PREFILL_WAVE` | `False` | Holds completed prefills in `TpuDpScheduler` until the KV-bounded prefill wave fills so chunked prefill steps stay pure prefill and all requests in the wave decode together without preemption. |
 | `VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS` | `8` | Consecutive `schedule()` steps a running prefill chunk may go without getting at least one KV block of tokens in `SrptPrefillScheduler` (held back or crowded out by shorter prefills) before it moves ahead of the other prefill chunks and is no longer held until it gets a block (`0` disables hold-back). |
 | `TPU_PP_DYNAMIC_CHUNKS` | `True` | Dynamically sizes microbatch chunks in Pipeline Parallelism (`--pipeline-parallel-size`). |
 | `TPU_PP_CHUNK_SLACK` | `0.1` | Slack ratio for dynamic pipeline-parallel chunk sizing. |

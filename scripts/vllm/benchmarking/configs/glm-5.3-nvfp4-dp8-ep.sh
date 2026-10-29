@@ -53,15 +53,16 @@ RANDOM_RANGE_RATIO="0.0"
 # the GLM-5.2 NVFP4 recipe.
 export MOE_REQUANTIZE_BLOCK_SIZE="${MOE_REQUANTIZE_BLOCK_SIZE:-512}"
 
-# Optimized GLM-5.3-NVFP4 v7x-8 serving stack (+127.97% output tok/s/device:
-# 139.72 -> 318.52 tok/s/device at ISL=8192, OSL=1024, c=512; mmlu_pro=0.7643):
+# Optimized GLM-5.3-NVFP4 v7x-8 serving stack (+129.78% output tok/s/device:
+# 139.72 -> 321.05 tok/s/device at ISL=8192, OSL=1024, c=512; mmlu_pro=0.7643):
 # 1. Fused EP MoE v2 with W4A8 MXU matmuls + sharded schedule plan + padded-row skip
 export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-1}"
 export MOE_FUSED_EP_ENABLE_W4A8="${MOE_FUSED_EP_ENABLE_W4A8:-1}"
 export MOE_FUSED_EP_V2_SHARDED_PLAN="${MOE_FUSED_EP_V2_SHARDED_PLAN:-1}"
 export TPU_MOE_SKIP_PADDED_TOKENS="${TPU_MOE_SKIP_PADDED_TOKENS:-1}"
-# 2. TpuDpScheduler for wave-aligned prefill/decode scheduling across DP=8 ranks
+# 2. TpuDpScheduler with KV-bounded prefill-then-decode wave shaping across DP=8 ranks
 export DP_SCHED_ENABLED="${DP_SCHED_ENABLED:-1}"
+export TPU_DP_SCHED_PREFILL_WAVE="${TPU_DP_SCHED_PREFILL_WAVE:-1}"
 # 3. Split-Q in-VMEM join for non-DCP sparse MLA attention + 64B packed fp8 RoPE cache + 128-token chunked gather/attention & pipelined DSA top-k
 export TPU_MLA_SPARSE_SPLIT_Q="${TPU_MLA_SPARSE_SPLIT_Q:-1}"
 export TPU_SPARSE_MLA_PACKED_ROPE="${TPU_SPARSE_MLA_PACKED_ROPE:-1}"

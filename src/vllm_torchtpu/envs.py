@@ -80,6 +80,7 @@ if TYPE_CHECKING:
     TPU_KERNEL_RELOAD_MODULES: str = ""
     TPU_GREEDY_TOP_TOKENS: bool = False
     DP_SCHED_ENABLED: bool = False
+    TPU_DP_SCHED_PREFILL_WAVE: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
@@ -708,6 +709,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS"),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
+    # Hold completed prefills in TpuDpScheduler until the KV-bounded prefill
+    # wave finishes so chunked prefill steps stay pure prefill and all requests
+    # in the wave enter full-concurrency decode together.
+    "TPU_DP_SCHED_PREFILL_WAVE": env_bool("TPU_DP_SCHED_PREFILL_WAVE"),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE": lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
     "MIXED_Q_SPLIT": env_optional_int("MIXED_Q_SPLIT"),
