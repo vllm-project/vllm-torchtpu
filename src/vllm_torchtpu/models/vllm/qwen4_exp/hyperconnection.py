@@ -110,11 +110,12 @@ class GatedResidual(common_hc.GatedResidual):
                 self.hc_count, self.hidden_size, prefill_up_tile
             )
 
-    def _normalize(self, hyper_input):
+    def _normalize(self, hyper_input, small_rows=False):
         if not self.config.hc_per_branch_norm:
             return super()._normalize(hyper_input)
         if (
             self._prefill_norm_op is not None
+            and not small_rows
             and hyper_input.shape[0] >= self.prefill_norm_tile
             and hyper_input.shape[0] % self.prefill_norm_tile == 0
             and hyper_input.dtype == torch.bfloat16
@@ -182,11 +183,16 @@ class GatedResidual(common_hc.GatedResidual):
         injection = F.linear(norm, self.block_inject_weight.weight)
         return hyper_input, 2.0 * torch.sigmoid(injection.float() / self.hc_count)
 
-    def mix(self, hyper_input):
+    def mix(self, hyper_input, small_rows=False):
         """Returns ``mixed, (hyper_input, injection)``: the combine's [T, hc] FP32
         injection gate, computed from the normalized input (``normed`` in its
         place for a hyper-connection without a combine); ``combine`` accepts
-        either form."""
+        either form.
+
+        ``small_rows``: the rows are megakernel verify tokens (the segment and whole-step
+        programs' stock mixes), so the prefill-tile Pallas ops are skipped even when the row
+        count matches a tile (128 = 32 requests x 4 verify rows); the result is the small-row
+        path the kernel itself computes."""
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if not hasattr(self, "input_mix_weight_down"):
             raise RuntimeError("mix was disabled for this hyper-connection")
@@ -198,6 +204,7 @@ class GatedResidual(common_hc.GatedResidual):
             return out, (hyper_input, None)
         if (
             self._prefill_full_op is not None
+            and not small_rows
             and hyper_input.shape[0] >= 2 * self.prefill_full_tile
             and hyper_input.shape[0] % (2 * self.prefill_full_tile) == 0
             and hyper_input.dtype == torch.bfloat16
@@ -212,7 +219,7 @@ class GatedResidual(common_hc.GatedResidual):
                 self.input_mix_weight_up.weight,
             )
             return mixed, self._residual(hyper_input, norm)
-        norm = self._normalize(hyper_input)
+        norm = self._normalize(hyper_input, small_rows)
         gate = F.linear(norm, self.input_mix_weight_down.weight) / self.hc_count
         # TorchTPU can lower BF16 SiLU through BF16 logistic/tanh, rounding
         # negative tails to zero. Compute the activation in FP32 and round
@@ -220,6 +227,7 @@ class GatedResidual(common_hc.GatedResidual):
         gate = F.silu(gate.float()).to(gate.dtype)
         if (
             self._prefill_up_op is not None
+            and not small_rows
             and gate.shape[0] >= self.prefill_up_tile
             and gate.shape[0] % self.prefill_up_tile == 0
             and gate.dtype == torch.bfloat16
