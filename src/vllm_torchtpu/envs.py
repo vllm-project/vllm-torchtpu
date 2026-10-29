@@ -198,7 +198,7 @@ if TYPE_CHECKING:
     VLLM_TPU_STAGE_ENTRIES_CACHE: bool = False
     VLLM_TPU_VERIFY_FUSED: bool = False
     VLLM_TPU_VERIFY_FUSED_CHECK: int = 0
-    VLLM_TPU_VERIFY_FUSED_CHECK_FAULT: bool = False
+    VLLM_TPU_VERIFY_FUSED_CHECK_FAULT: int = 0
     VLLM_TPU_DRAFT_SEED_FUSED: bool = False
     VLLM_TPU_CPU_PIN_RESERVE: int = 2
     VLLM_TPU_CPU_PROBE_S: float = 0.0
@@ -1160,10 +1160,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_STAGE_ENTRIES_CACHE": env_bool("VLLM_TPU_STAGE_ENTRIES_CACHE"),
     # Non-greedy spec verify as one program (tpu_runner._verify_fused_impl).
     "VLLM_TPU_VERIFY_FUSED": env_bool("VLLM_TPU_VERIFY_FUSED"),
-    # Compare the fused verify with the separate programs for the first N
-    # verify chunks; _FAULT perturbs the compared copy (positive control).
+    # Compare the fused verify and draft seed with the separate programs for
+    # the first N chunks; the first _FAULT checks perturb the compared copy
+    # (a positive control that must be caught).
     "VLLM_TPU_VERIFY_FUSED_CHECK": env_nonnegative_int("VLLM_TPU_VERIFY_FUSED_CHECK", 0),
-    "VLLM_TPU_VERIFY_FUSED_CHECK_FAULT": env_bool("VLLM_TPU_VERIFY_FUSED_CHECK_FAULT"),
+    "VLLM_TPU_VERIFY_FUSED_CHECK_FAULT": env_nonnegative_int(
+        "VLLM_TPU_VERIFY_FUSED_CHECK_FAULT", 0
+    ),
     # Async draft seed + input shift/scatter + gather pad as one program
     # (eagle3._async_seed_inputs_impl).
     "VLLM_TPU_DRAFT_SEED_FUSED": env_bool("VLLM_TPU_DRAFT_SEED_FUSED"),
