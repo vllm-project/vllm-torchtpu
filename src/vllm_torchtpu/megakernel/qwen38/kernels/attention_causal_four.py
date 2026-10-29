@@ -20,12 +20,15 @@ per request. All append DMA completes before tile reuse. No production runtime
 selects this prototype.
 """
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu
 
 from .attention_append import fold_scores, packet_rows, tile_scores
+from .paged_kv import PoolPages, bank_shape, set_column, transposed
 
 F32 = jnp.float32
 BF16 = jnp.bfloat16
@@ -49,7 +52,9 @@ def attend_paged_causal_four(
     """Attend four consecutive positions of each request, reading each KV tile once.
 
     Query is [requests * 4, local_heads, D], request-major, for one, two or four
-    requests; caches are [requests, pages, 128, D]. Each request's positions
+    requests; caches are [requests, pages, 128, D], or ``key_cache`` is a
+    ``paged_kv.PoolPages`` (any row; FP8, no ``value_cache``, the pools only
+    read: the caller commits the new rows) whose row selects each request. Each request's positions
     must be p..p+3, constructed by the block-verifier wrapper. Each row retains
     its own causal mask, 1024-token softmax arithmetic and ascending CP merge.
     A request's four rows' gathered heads share one contraction per tile; a
@@ -75,23 +80,38 @@ def attend_paged_causal_four(
     group = packet_rows(width)
     packet = packet_rows(rows * local_heads)
     joined_rows = cp * group
-    dtype = key_cache.dtype
-    # Transfer neighboring *local* pages together. Eight pages bound scratch
-    # at 1024 tokens; the physical pages are contiguous even though global
-    # positions are striped. Choose a divisor of capacity so the last tile is
-    # always in bounds, then mask its future tokens.
-    capacity_pages = key_cache.shape[1]
-    block_pages = 1
-    while block_pages < 8 and capacity_pages % (2 * block_pages) == 0:
-        block_pages *= 2
+    paged = isinstance(key_cache, PoolPages)
+    if paged:
+        pages_of = key_cache
+        # A bank is one vLLM block of pool pages.
+        dtype = jnp.float8_e4m3fn
+        block_pages = pages_of.pages_per_block
+        block_shape = bank_shape(block_pages, hd, page)
+    else:
+        dtype = key_cache.dtype
+        # Transfer neighboring *local* pages together. Eight pages bound scratch
+        # at 1024 tokens; the physical pages are contiguous even though global
+        # positions are striped. Choose a divisor of capacity so the last tile is
+        # always in bounds, then mask its future tokens.
+        capacity_pages = key_cache.shape[1]
+        block_pages = 1
+        while block_pages < 8 and capacity_pages % (2 * block_pages) == 0:
+            block_pages *= 2
+        block_shape = (block_pages * page, hd) if cp == 1 else (block_pages, page, hd)
     block_tokens = block_pages * page
-    block_shape = (block_tokens, hd) if cp == 1 else (block_pages, page, hd)
     cp_rank = rank % cp
     pipelined = buffers > 2
-    key_scale, value_scale = scales if layout.fast else (1.0, 1.0)
+    # The KV is FP8 in the fast profile and in vLLM's pools (any profile).
+    fp8 = layout.fast or paged
+    key_scale, value_scale = scales if fp8 else (1.0, 1.0)
 
     def peer_id(peer):
         return peer if id_type == pl.DeviceIdType.LOGICAL else (peer,)
+
+    def live(index, j, position):
+        # Tokens of local page index * block_pages + j at or before ``position``.
+        start = ((index * block_pages + j) * cp + cp_rank) * page
+        return jnp.clip(position - start + 1, 0, page)
 
     def body(
         keys,
@@ -141,6 +161,12 @@ def attend_paged_causal_four(
             has_writes.append(has_write)
 
         def transfers(r, index, slot):
+            if paged:
+                request = dataclasses.replace(pages_of, row=r)
+                return (
+                    request.block_copy(index, 0, keys.at[slot], page_sem.at[2 * slot]),
+                    request.block_copy(index, 1, values.at[slot], page_sem.at[2 * slot + 1]),
+                )
             start = pl.ds(index * block_pages, block_pages)
             return (
                 tpu.make_async_copy(
@@ -230,6 +256,8 @@ def attend_paged_causal_four(
 
             def append_transfers(slot):
                 local_page = write_page % block_pages
+                if paged:
+                    return ()
                 return (
                     tpu.make_async_copy(
                         keys.at[slot, local_page, :, :],
@@ -262,10 +290,13 @@ def attend_paged_causal_four(
                             (values, row_values[j], scales[1]),
                         ):
                             encoded = row
-                            if layout.fast:
+                            if fp8:
                                 encoded = jnp.clip(row.astype(F32) / scale, -448, 448).astype(dtype)
-                            tile = bank[slot, local_page]
-                            bank[slot, local_page] = jnp.where(mask, encoded[None, :], tile)
+                            if paged:
+                                set_column(bank.at[slot, local_page], row_positions[j] % page, encoded)
+                            else:
+                                tile = bank[slot, local_page]
+                                bank[slot, local_page] = jnp.where(mask, encoded[None, :], tile)
 
                 for slot_row in range(4):
                     append_position(slot_row)
@@ -275,9 +306,17 @@ def attend_paged_causal_four(
                     for dma in append_transfers(slot):
                         dma.start()
 
+            last = select(last_positions)
+
             # These immutable tiles serve all four causal rows.
-            def operand(bank, index):
-                return bank[(base + index) % buffers, ...].reshape(block_tokens, hd)
+            def operand(bank, index, mask=False):
+                slot = (base + index) % buffers
+                if paged:
+                    return tuple(
+                        transposed(bank.at[slot, j], live(index, j, last) if mask else None)
+                        for j in range(block_pages)
+                    )
+                return bank[slot, ...].reshape(block_tokens, hd)
 
             # Joining query rows changes no row's K/V contraction. Each row
             # keeps its own causal mask, and rows whose position ends before
@@ -310,7 +349,7 @@ def attend_paged_causal_four(
                     mass[r, :, :1],
                     numerator[r, ...],
                     scores,
-                    operand(values, index),
+                    operand(values, index, mask=True),
                     value_scale,
                 )
                 # A row whose position ends before this block sees only -inf scores,

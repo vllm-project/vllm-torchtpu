@@ -90,8 +90,6 @@ def attend_paged_batched_append(
     all_rows = max(8, (total_heads + 7) // 8 * 8)
     paged = isinstance(key_cache, PoolPages)
     if paged:
-        if not layout.fast:
-            raise ValueError("Pool pages serve FP8 decode")
         pages = key_cache
         # A bank is one vLLM block of pool pages; a traced request selects its row.
         stacked = None
@@ -119,7 +117,9 @@ def attend_paged_batched_append(
     traced_rows = paged or stacked is not None
     cp_rank = rank % cp
     pipelined = buffers > 2
-    key_scale, value_scale = scales if layout.fast else (1.0, 1.0)
+    # The KV is FP8 in the fast profile and in vLLM's pools (any profile).
+    fp8 = layout.fast or paged
+    key_scale, value_scale = scales if fp8 else (1.0, 1.0)
 
     def peer_id(peer):
         return peer if id_type == pl.DeviceIdType.LOGICAL else (peer,)
@@ -282,7 +282,7 @@ def attend_paged_batched_append(
                         (values, value[b], scales[1]),
                     ):
                         encoded = row
-                        if layout.fast:
+                        if fp8:
                             encoded = jnp.clip(row.astype(F32) / scale, -448, 448).astype(dtype)
                         if paged:
                             set_column(bank.at[slot, local_page], pos % page, encoded)

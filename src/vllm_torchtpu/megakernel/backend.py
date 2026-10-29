@@ -118,6 +118,14 @@ def presharded(vllm_config: Any) -> Path | None:
     return Path(path) if path else None
 
 
+def loader_option(vllm_config: Any, key: str) -> Any:
+    """``key`` of the selected role's loader config (None if unset)."""
+    selected = role(vllm_config)
+    if selected is None:
+        return None
+    return _loader_config(vllm_config, selected).get(key)
+
+
 def synthetic_seed(vllm_config: Any) -> int | None:
     """The seed of random weights in place of a pre-shard (``synthetic_seed``
     in the loader config of a program that takes it), for timing runs."""

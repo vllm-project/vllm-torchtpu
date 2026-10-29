@@ -303,9 +303,12 @@ def _stack(
     separate_cuts = _mtp_separate_cuts or cut_count == 1
     cut_outputs = 2 * (cut_count if separate_cuts else 1) if causal_pair else 0
     if paged is not None and (
-        causal_pair or _mtp_state_owner_axis or trace or return_hidden or layout.context_parallel != 8
+        (causal_pair and batch_size != 4 * _mtp_requests)
+        or _mtp_state_owner_axis
+        or trace
+        or layout.context_parallel != 8
     ):
-        raise ValueError("Pool pages serve plain CP8 decode")
+        raise ValueError("Pool pages serve CP8 decode and four-row verification")
     state_names = ("conv", "rec") if paged is not None else STATE_NAMES
     pool_count = len(paged["pools"]) if paged is not None else 0
     scalar_count = 2 + int(_mtp_active is not None) + int(paged is not None)
@@ -1537,12 +1540,14 @@ def _stack(
                         _row_update=_mtp_causal_row_update,
                     )
                 elif causal_pair:
+                    if paged is not None:
+                        publish_columns(ordinal, scale_pair, batch_keys, batch_values)
                     attended = attend_paged_causal_four(
                         jnp.stack(batch_queries),
                         jnp.stack(batch_keys),
                         jnp.stack(batch_values),
-                        state_out["kcache"].at[ordinal, :, 0],
-                        state_out["vcache"].at[ordinal, :, 0],
+                        pool_pages(ordinal, 0) if paged is not None else state_out["kcache"].at[ordinal, :, 0],
+                        None if paged is not None else state_out["vcache"].at[ordinal, :, 0],
                         tuple(position_ref[b] for b in range(batch_size)),
                         rank,
                         layout,
@@ -2199,7 +2204,20 @@ def _stack(
     if paged is not None:
         ns = len(state_names)
         updated = dict(zip(state_names, result[2 : 2 + ns], strict=True))
-        return result[1], result[0], {**updated, "columns": result[2 + ns]}
+        base = (result[1], result[0], {**updated, "columns": result[2 + ns]})
+        if not return_hidden:
+            return base
+        extra = (result[3 + ns][:batch_size],)
+        if causal_pair:
+            begin = 4 + ns
+            if separate_cuts and cut_count > 1:
+                extra += ({
+                    name: tuple(result[begin + 2 * slot + offset] for slot in range(cut_count))
+                    for offset, name in enumerate(("conv", "rec"))
+                },)
+            else:
+                extra += (dict(zip(("conv", "rec"), result[begin:begin + 2], strict=True)),)
+        return (*base, *extra)
     base = (result[1], result[0], dict(zip(STATE_NAMES, result[2:6], strict=True)))
     if return_hidden:
         extra = ((result[6],) if trace else ()) + (result[6 + int(trace)][:batch_size],)

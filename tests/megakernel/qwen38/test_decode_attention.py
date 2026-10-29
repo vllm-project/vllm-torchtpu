@@ -41,6 +41,9 @@ from vllm_torchtpu.megakernel.qwen38.kernels.attention_append import (  # noqa: 
 from vllm_torchtpu.megakernel.qwen38.kernels.attention_batched_append import (  # noqa: E402
     attend_paged_batched_append,
 )
+from vllm_torchtpu.megakernel.qwen38.kernels.attention_causal_four import (  # noqa: E402
+    attend_paged_causal_four,
+)
 from vllm_torchtpu.megakernel.qwen38.kernels.paged_kv import (  # noqa: E402
     PoolPages,
     commit_columns,
@@ -113,7 +116,9 @@ def _token(pools, tables, b, position):
     ]
 
 
-def _attend(mesh, query, key, value, pools, tables, positions):
+def _attend(mesh, query, key, value, pools, tables, positions, causal=False):
+    """Every rank's attention of ``positions`` (one per request, or with
+    ``causal`` four consecutive rows per request, request-major)."""
     batch = positions.shape[0]
     inbox_names = tuple(exchange_scratch(LAYOUT, batch))
 
@@ -140,7 +145,22 @@ def _attend(mesh, query, key, value, pools, tables, positions):
             pl.semaphore_wait(barrier, CP - 1)
             inbox = dict(zip(inbox_names, inbox_refs, strict=True))
             pages = PoolPages((pool_ref,), jnp.int32(0), tables_ref, 0, PAGES_PER_BLOCK)
-            if batch > 1:
+            if causal:
+                out_ref[...] = attend_paged_causal_four(
+                    query_ref[...],
+                    key_ref[...],
+                    value_ref[...],
+                    pages,
+                    None,
+                    tuple(position_ref[b] for b in range(batch)),
+                    rank,
+                    LAYOUT,
+                    (1.0, 1.0),
+                    pl.DeviceIdType.MESH,
+                    inbox,
+                    buffers=3,
+                )
+            elif batch > 1:
                 out_ref[...] = attend_paged_batched_append(
                     query_ref[...],
                     key_ref[...],
@@ -289,3 +309,45 @@ def test_commit_columns_writes_each_request_on_its_owner():
             view[:, :, column] = np.asarray(columns[o, b], np.float32)
             expected[rank, target] = view.reshape(expected.shape[2:])
         np.testing.assert_array_equal(np.asarray(updated[o], np.float32), expected)
+
+
+def _fp8(x):
+    return np.asarray(jnp.asarray(np.asarray(x, np.float32), FP8), np.float32)
+
+
+# Four rows of a request may cross a page (and so a CP owner) boundary.
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("starts", [[5], [254], [12284], [254, 6000]])
+def test_paged_causal_four_attention_matches_dense_causal_attention(starts):
+    mesh = _mesh("tpu")
+    starts = np.asarray(starts, np.int32)
+    requests = starts.shape[0]
+    positions = (starts[:, None] + np.arange(4)[None, :]).reshape(-1).astype(np.int32)
+    rng = np.random.default_rng(int(starts.sum()))
+    pools, tables = _pools(rng, requests, starts)  # one table row per request
+    rows = positions.shape[0]
+    query = rng.standard_normal((CP, rows, LOCAL_HEADS, DIM)).astype(BF16)
+    key = rng.standard_normal((rows, DIM)).astype(BF16)
+    value = rng.standard_normal((rows, DIM)).astype(BF16)
+    out = _attend(mesh, query, key, value, pools, tables, positions, causal=True)
+
+    for r, start in enumerate(starts):
+        history = np.stack(
+            [_token(pools, tables, r, p) for p in range(start)] or [np.zeros((2, DIM))]
+        )
+        current = np.stack(
+            [np.stack([_fp8(key[4 * r + j]), _fp8(value[4 * r + j])]) for j in range(4)]
+        )
+        tokens = np.concatenate([history[:start], current])
+        for j in range(4):
+            visible = tokens[: start + j + 1]
+            for rank in range(CP):
+                heads = np.asarray(query[rank, 4 * r + j], np.float32)
+                scores = heads @ visible[:, 0].T / np.sqrt(DIM)
+                weights = np.exp(scores - scores.max(axis=1, keepdims=True))
+                expected = (weights / weights.sum(axis=1, keepdims=True)) @ visible[
+                    :, 1
+                ]
+                np.testing.assert_allclose(
+                    out[rank, 4 * r + j], expected, rtol=2e-2, atol=2e-2
+                )

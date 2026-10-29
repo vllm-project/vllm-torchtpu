@@ -23,6 +23,19 @@ temperature / top-p / top-k / seed on the sharded logits). Every request's GDN
 state lives in a private slot, imported from the pool's state blocks on the
 request's first step, and its next input token in a device-side bank: under
 async scheduling nothing is uploaded per step but the small plan.
+
+With MTP (the checkpoint's draft layer, ``mtp``), every step verifies: each
+request's pending token and the three drafts the previous step proposed
+(none for a request's first step: its count is forced to zero) run as four
+causal rows of the target, the accepted prefix is chosen in the op (greedy,
+or exact rejection sampling of the deterministic drafts), only the accepted
+rows' KV is committed and the GDN state taken after the last of them, the
+accepted drafts' MTP KV rows are recomputed from the target's hidden states
+(repair), and three draft calls propose the next step's drafts. A request's
+next position, like its next token, is kept on the device: async scheduling
+plans a step before the previous one's count is known. The MTP layer's
+KV lives in its own pool (``program.MTP_LAYER``), written by the prefill for
+the prompt.
 """
 
 from __future__ import annotations
@@ -53,11 +66,16 @@ from vllm_torchtpu.megakernel.program import (
 )
 from vllm_torchtpu.megakernel.qwen38 import decode_weights
 from vllm_torchtpu.megakernel.qwen38.kernels import decode_megakernel, pool_state
+from vllm_torchtpu.megakernel.qwen38.program import (
+    MAX_DECODE_REQUESTS,
+    MTP_DRAFTS,
+    MTP_LAYER,
+)
 
 logger = init_logger(__name__)
 
 TP_SIZE = 32
-BATCHES = (1, 2, 4, 8, 16)
+BATCHES = (1, 2, 4, 8, MAX_DECODE_REQUESTS)
 IMPORT_ROWS = 4  # requests per state import op
 _LAYER = re.compile(r"\.layers\.(\d+)\.")
 
@@ -87,10 +105,17 @@ class QwenDecoder:
     """See the module docstring."""
 
     def __init__(
-        self, config: MegakernelEngineConfig, presharded: Path, *, tp_rank: int
+        self,
+        config: MegakernelEngineConfig,
+        presharded: Path,
+        *,
+        tp_rank: int,
+        mtp_checkpoint: Path | None = None,
     ) -> None:
         self.config = config
         self.presharded = Path(presharded)
+        # The checkpoint of the MTP draft layer (None: no speculation).
+        self.mtp_checkpoint = mtp_checkpoint
         # The KV transfer lands TP rank q's heads and pages on its device: the
         # kernel mesh follows the TP ranks.
         self.mesh, self.rank = bridge.kernel_mesh("tp", TP_SIZE, rank=tp_rank)
@@ -109,6 +134,12 @@ class QwenDecoder:
         self.weights: dict[str, torch.Tensor] = {}
         self.conv = self.rec = self.tokens = None
         self.raws: list[torch.Tensor] = []
+        self.mtp_weights: dict[str, torch.Tensor] = {}
+        self.mtp_raw: torch.Tensor | None = None
+        # By slot: the drafts the next step verifies, and the position of the
+        # next input plus one (0: no step yet). Under async scheduling the host
+        # position counts the previous step's drafts as accepted.
+        self.drafts = self.resume = None
         self.gdn_pools: tuple[int, ...] = ()
         self._attention_group = 0
         self._gdn_groups: list[tuple[int, int]] = []
@@ -129,11 +160,24 @@ class QwenDecoder:
             (1, layers, self.num_slots, *specs["rec"].shape[2:]), dtype=torch.bfloat16
         ).to("tpu")
         self.tokens = torch.zeros((1, self.num_slots), dtype=torch.int32).to("tpu")
+        if self.mtp_checkpoint is not None:
+            self.mtp_weights, stats = decode_weights.load_mtp(
+                self.presharded, self.rank
+            )
+            bridge.report_load_stats("Qwen3.8 MTP", self.rank, stats)
+            self.drafts = torch.zeros(
+                (1, self.num_slots, MTP_DRAFTS), dtype=torch.int32
+            ).to("tpu")
+            self.resume = torch.zeros((1, self.num_slots), dtype=torch.int32).to("tpu")
 
     def bind_kv_caches(
         self, caches: Mapping[str, torch.Tensor], groups: Sequence[KVGroup]
     ) -> None:
         by_layer = {_layer(name): (name, _raw(cache)) for name, cache in caches.items()}
+        if self.mtp_checkpoint is not None:
+            if MTP_LAYER not in by_layer:
+                raise RuntimeError("Qwen3.8 decode: no KV cache for the MTP layer")
+            self.mtp_raw = by_layer[MTP_LAYER][1]
         missing = [
             i for i in (*self.attention_layers, *self.gdn_layers) if i not in by_layer
         ]
@@ -191,7 +235,10 @@ class QwenDecoder:
         started = time.perf_counter()
         self._import([(0, np.zeros(len(self.gdn_layers), np.int32))])
         for batch in self.batches:
-            self._run(batch, self._plan(batch, [], {}))
+            if self.mtp_checkpoint is not None:
+                self._run_mtp(batch, self._plan(batch, [], {}))
+            else:
+                self._run(batch, self._plan(batch, [], {}))
         bridge.materialize(self.tokens)
         if self.rank == 0:
             logger.info(
@@ -205,6 +252,7 @@ class QwenDecoder:
             positions=(batch,),
             reset=(batch,),
             host_tokens=(batch,),
+            scheduled=(batch,),
             row_of=(batch,),
             tables=(batch, self._width),
             temperature=(batch,),
@@ -223,19 +271,11 @@ class QwenDecoder:
         rows, shard = self.config.max_num_seqs, layout.vocab_shard
         nw, npools = len(names), len(self.raws)
 
-        def unpack(vector):
-            out, offset = {}, 0
-            for name, shape in fields.items():
-                size = int(np.prod(shape))
-                out[name] = vector[offset : offset + size].reshape(shape)
-                offset += size
-            return out
-
         def body(*args):
             w = {name: a[0] for name, a in zip(names, args[:nw], strict=True)}
             conv, rec, bank = args[nw][0], args[nw + 1][0], args[nw + 2][0]
             raws = tuple(args[nw + 3 : nw + 3 + npools])
-            plan = unpack(args[-1])
+            plan = _unpack(fields, args[-1])
             slots, positions = plan["slots"], plan["positions"]
             tokens = jnp.where(plan["reset"] != 0, plan["host_tokens"], bank[slots])
             states = {"conv": conv[:, slots], "rec": rec[:, slots]}
@@ -289,25 +329,311 @@ class QwenDecoder:
 
     def _run(self, batch: int, plan: dict[str, np.ndarray]) -> torch.Tensor:
         op, fields = self._step_op(batch)
-        vector = np.concatenate(
-            [
-                np.asarray(plan[name]).view(np.int32)
-                if np.asarray(plan[name]).dtype == np.float32
-                else np.asarray(plan[name], np.int32).reshape(-1)
-                for name in fields
-            ]
-        ).astype(np.int32)
         out, conv, rec, bank, *raws = op(
             *self.weights.values(),
             self.conv,
             self.rec,
             self.tokens,
             *self.raws,
-            torch.from_numpy(vector).to("tpu"),
+            torch.from_numpy(_pack(fields, plan)).to("tpu"),
         )
         self.conv, self.rec = _adopt(self.conv, conv), _adopt(self.rec, rec)
         self.tokens = _adopt(self.tokens, bank)
         self.raws = [_adopt(old, new) for old, new in zip(self.raws, raws, strict=True)]
+        return out
+
+    def _verify_op(self, batch: int):
+        """The MTP step's first op (Torch ops take at most 64 operands): verify
+        every request's pending token and drafts, decide the accepted prefix,
+        commit its KV and GDN state. Returns the emitted tokens, and each rank's
+        copy of the target's hidden states and the decisions for
+        :meth:`_draft_op`."""
+        key = ("verify", batch)
+        op = self._ops.get(key)
+        if op is not None:
+            return op
+        from vllm_torchtpu.megakernel.qwen38.kernels.paged_kv import commit_columns
+
+        layout, config = self.layout, self.layout.config
+        names = tuple(self.weights)
+        fields = self._fields(batch)
+        rows, shard = self.config.max_num_seqs, layout.vocab_shard
+        nw, npools = len(names), len(self.raws)
+        scales = ((1.0, 1.0),) * len(self.attention_layers)
+        width = 1 + MTP_DRAFTS
+
+        def body(*args):
+            w = {n: a[0] for n, a in zip(names, args[:nw], strict=True)}
+            conv, rec, bank, drafts, resume = (args[nw + i][0] for i in range(5))
+            raws = tuple(args[nw + 5 : nw + 5 + npools])
+            plan = _unpack(fields, args[-1])
+            slots, tables = plan["slots"], plan["tables"]
+            live = plan["positions"] >= 0
+            fresh = plan["reset"] != 0
+            pending = jnp.where(fresh, plan["host_tokens"], bank[slots])
+            resumed = ~fresh & (resume[slots] > 0)
+            positions = jnp.where(
+                live, jnp.where(resumed, resume[slots] - 1, plan["positions"]), -1
+            )
+            # Drafts are verified only on a request's later steps whose four
+            # rows the scheduler scheduled; otherwise the count is forced to zero.
+            speculating = live & resumed & (plan["scheduled"] == width)
+            proposals = drafts[slots]  # [batch, drafts]
+            slot = jnp.arange(width)
+            inputs = jnp.concatenate(
+                [pending[:, None], jnp.where(speculating[:, None], proposals, 0)],
+                axis=1,
+            )
+            rows_at = jnp.where(live[:, None], positions[:, None] + slot[None], -1)
+            active = live[:, None] & ((slot[None] == 0) | speculating[:, None])
+            _, logits, states, hidden, cuts = decode_megakernel._stack(
+                config,
+                layout,
+                0,
+                width * batch,
+                w,
+                {"conv": conv[:, slots], "rec": rec[:, slots]},
+                inputs.reshape(-1),
+                rows_at.reshape(-1),
+                False,
+                kv_scales=scales,
+                return_hidden=True,
+                causal_pair=True,
+                _mtp_requests=batch,
+                _mtp_active=active.reshape(-1),
+                _mtp_separate_cuts=True,
+                paged={"pools": raws, "tables": tables, "pages_per_block": 1},
+            )
+            columns = states.pop("columns")
+            decision = sampling.verify_acceptance(
+                logits[:, :shard],
+                inputs,
+                jnp.maximum(positions, 0),
+                speculating.astype(jnp.int32),
+                (
+                    lax.bitcast_convert_type(plan["temperature"], jnp.float32),
+                    lax.bitcast_convert_type(plan["top_p"], jnp.float32),
+                    plan["top_k"],
+                    plan["seed"],
+                ),
+            )
+            count, bonus = decision[:, 0], decision[:, 1]
+            committed = count + 1  # inputs whose KV and GDN updates stand
+            emitted = jnp.where(
+                slot[None] < count[:, None],
+                jnp.concatenate([proposals, jnp.zeros((batch, 1), jnp.int32)], axis=1),
+                jnp.where(slot[None] == count[:, None], bonus[:, None], -1),
+            )
+            emitted = jnp.where(live[:, None], emitted, -1)
+            kept = jnp.where(slot[None] < committed[:, None], rows_at, -1)
+            raws = commit_columns(
+                raws,
+                columns,
+                kept.reshape(-1),
+                jnp.repeat(tables, width, axis=0),
+                pages_per_block=1,
+            )
+            last = committed - 1
+
+            def after(name):
+                # The GDN state after the last committed row: a cut, or the
+                # state after all four.
+                chosen = states[name]
+                for index, cut in enumerate(cuts[name]):
+                    shape = (1, batch) + (1,) * (chosen.ndim - 2)
+                    chosen = jnp.where((last == index).reshape(shape), cut, chosen)
+                return chosen
+
+            conv = conv.at[:, slots].set(after("conv"))
+            rec = rec.at[:, slots].set(after("rec"))
+            bank = bank.at[slots].set(bonus)
+            dropped = jnp.where(live, slots, resume.shape[0])
+            resume = resume.at[dropped].set(positions + committed + 1, mode="drop")
+            row_of = plan["row_of"]
+            out = (
+                jnp.full((rows, width), -1, jnp.int32)
+                .at[jnp.where(row_of >= 0, row_of, rows)]
+                .set(emitted, mode="drop")
+            )
+            return (
+                out,
+                conv[None],
+                rec[None],
+                bank[None],
+                resume[None],
+                hidden.reshape(batch, width, -1)[None],
+                jnp.stack([jnp.where(live, count, -1), positions])[None],
+                *raws,
+            )
+
+        t = P("tp")
+        op = bridge.register_op(
+            f"pallas::qwen38_decode_verify_b{batch}",
+            self.mesh,
+            body,
+            in_specs=(t,) * (nw + 5 + npools) + (P(),),
+            out_specs=(P(),) + (t,) * (6 + npools),
+            donate_argnums=tuple(range(nw, nw + 5 + npools)),
+        )
+        self._ops[key] = (op, fields)
+        return self._ops[key]
+
+    def _draft_op(self, batch: int):
+        """The MTP step's second op: per request, repair the accepted drafts'
+        MTP KV rows from the target's hidden states, then propose the next
+        step's three drafts."""
+        key = ("draft", batch)
+        op = self._ops.get(key)
+        if op is not None:
+            return op
+        from vllm_torchtpu.megakernel.qwen38.kernels import mtp_cache_batch, mtp_decode
+        from vllm_torchtpu.megakernel.qwen38.kernels.mtp_config import MTPConfig
+        from vllm_torchtpu.megakernel.qwen38.kernels.paged_kv import commit_columns
+
+        assert self.mtp_checkpoint is not None
+        layout = self.layout
+        mtp_config = MTPConfig.from_checkpoint(self.mtp_checkpoint)
+        names = tuple(self.mtp_weights)
+        fields = self._fields(batch)
+        nm = len(names)
+
+        def body(embedding, head, *args):
+            embedding, head = embedding[0], head[0]
+            mw = {n: a[0] for n, a in zip(names, args[:nm], strict=True)}
+            bank, drafts, hidden, decisions = (args[nm + i][0] for i in range(4))
+            mtp_pool = args[nm + 4]
+            plan = _unpack(fields, args[-1])
+            slots, tables = plan["slots"], plan["tables"]
+            counts, positions = decisions[0], decisions[1]
+            target = {"emb": embedding, "lmw": head}
+            repair = {f: mw[f] for f in mtp_cache_batch.FAMILIES}
+
+            def draft_request(b, carry):
+                mtp_pool, new_drafts = carry
+                table = lax.dynamic_slice_in_dim(tables, b, 1)
+                states = lax.dynamic_index_in_dim(hidden, b, keepdims=False)
+                position = jnp.maximum(
+                    lax.dynamic_index_in_dim(positions, b, keepdims=False), 0
+                )
+                accepted = lax.dynamic_index_in_dim(counts, b, keepdims=False)
+                alive = accepted >= 0
+                accepted = jnp.maximum(accepted, 0)
+                proposals = lax.dynamic_index_in_dim(drafts[slots], b, keepdims=False)
+                # Repair: accepted draft j (1..count) at row p + j - 1, from the
+                # target's hidden after the row before it.
+                repaired = (jnp.arange(MTP_DRAFTS) < accepted) & alive
+                repaired_rows = position + jnp.arange(MTP_DRAFTS)
+                kv = mtp_cache_batch._cache_batch_stack(
+                    mtp_config,
+                    layout,
+                    0,
+                    embedding,
+                    repair,
+                    None,
+                    proposals,
+                    repaired_rows,
+                    states[:MTP_DRAFTS],
+                    repaired,
+                    False,
+                    paged=True,
+                )["columns"]
+                (mtp_pool,) = commit_columns(
+                    (mtp_pool,),
+                    kv,
+                    jnp.where(repaired, repaired_rows, -1),
+                    jnp.repeat(table, MTP_DRAFTS, axis=0),
+                    pages_per_block=1,
+                )
+                # Drafts: from the target's hidden after the last accepted row
+                # and the pending token, at the rows after the repaired ones.
+                token = lax.dynamic_slice_in_dim(bank[slots], b, 1)
+                row = (position + accepted)[None]
+                state = lax.dynamic_index_in_dim(states, accepted, keepdims=True)
+                proposed = []
+                for _ in range(MTP_DRAFTS):
+                    token, _, written, state = mtp_decode._native_stack(
+                        mtp_config,
+                        layout,
+                        0,
+                        target,
+                        mw,
+                        None,
+                        token,
+                        row,
+                        state,
+                        False,
+                        paged={"pool": mtp_pool, "tables": table, "pages_per_block": 1},
+                    )
+                    (mtp_pool,) = commit_columns(
+                        (mtp_pool,),
+                        written["columns"],
+                        jnp.where(alive, row, -1),
+                        table,
+                        pages_per_block=1,
+                    )
+                    proposed.append(token)
+                    row = row + 1
+                new_drafts = lax.dynamic_update_slice_in_dim(
+                    new_drafts, jnp.concatenate(proposed)[None], b, axis=0
+                )
+                return mtp_pool, new_drafts
+
+            mtp_pool, new_drafts = lax.fori_loop(
+                0,
+                batch,
+                draft_request,
+                (mtp_pool, jnp.zeros((batch, MTP_DRAFTS), jnp.int32)),
+            )
+            live = positions >= 0
+            drafts = drafts.at[jnp.where(live, slots, drafts.shape[0])].set(
+                new_drafts, mode="drop"
+            )
+            return drafts[None], mtp_pool
+
+        t = P("tp")
+        op = bridge.register_op(
+            f"pallas::qwen38_decode_draft_b{batch}",
+            self.mesh,
+            body,
+            in_specs=(t,) * (2 + nm + 5) + (P(),),
+            out_specs=(t, t),
+            donate_argnums=(2 + nm + 1, 2 + nm + 4),
+        )
+        self._ops[key] = (op, fields)
+        return self._ops[key]
+
+    def _run_mtp(self, batch: int, plan: dict[str, np.ndarray]) -> torch.Tensor:
+        assert self.mtp_raw is not None
+        verify, fields = self._verify_op(batch)
+        draft, _ = self._draft_op(batch)
+        vector = torch.from_numpy(_pack(fields, plan)).to("tpu")
+        out, conv, rec, bank, resume, hidden, decisions, *raws = verify(
+            *self.weights.values(),
+            self.conv,
+            self.rec,
+            self.tokens,
+            self.drafts,
+            self.resume,
+            *self.raws,
+            vector,
+        )
+        self.conv, self.rec = _adopt(self.conv, conv), _adopt(self.rec, rec)
+        self.tokens = _adopt(self.tokens, bank)
+        self.resume = _adopt(self.resume, resume)
+        self.raws = [_adopt(old, new) for old, new in zip(self.raws, raws, strict=True)]
+        drafts, mtp_raw = draft(
+            self.weights["emb"],
+            self.weights["lmw"],
+            *self.mtp_weights.values(),
+            self.tokens,
+            self.drafts,
+            hidden,
+            decisions,
+            self.mtp_raw,
+            vector,
+        )
+        self.drafts = _adopt(self.drafts, drafts)
+        self.mtp_raw = _adopt(self.mtp_raw, mtp_raw)
         return out
 
     def _import(self, imports: Sequence[tuple[int, np.ndarray]]) -> None:
@@ -378,7 +704,9 @@ class QwenDecoder:
         for i, row in enumerate(rows):
             if row.scheduled <= 0:
                 continue
-            if row.scheduled != 1:
+            if row.scheduled != 1 and not (
+                self.mtp_checkpoint is not None and row.scheduled == 1 + MTP_DRAFTS
+            ):
                 raise NotImplementedError(
                     f"Qwen3.8 decode: {row.scheduled} tokens in one step"
                 )
@@ -393,11 +721,12 @@ class QwenDecoder:
                 # decoded token by token); otherwise it is the previous step's
                 # output, which under async scheduling the host row may not hold.
                 reset_tokens[i] = int(row.token_ids[row.computed])
-            if request.position != row.computed:
+            if request.position != row.computed and self.mtp_checkpoint is None:
                 raise RuntimeError(
                     f"Qwen3.8 decode: request {row.req_id} resumes at "
                     f"{row.computed}, not {request.position}"
                 )
+            # (With MTP vLLM advances a request by what the op emitted.)
             request.position = row.computed + 1
             live.append((i, row))
         if imports:
@@ -406,13 +735,18 @@ class QwenDecoder:
         for start in range(0, len(live), self.batches[-1]):
             group = live[start : start + self.batches[-1]]
             batch = next(b for b in self.batches if b >= len(group))
-            chosen = self._run(batch, self._plan(batch, group, reset_tokens))
+            plan = self._plan(batch, group, reset_tokens)
+            if self.mtp_checkpoint is not None:
+                chosen = self._run_mtp(batch, plan)
+            else:
+                chosen = self._run(batch, plan).reshape(-1, 1)
             out = chosen if out is None else torch.maximum(out, chosen)
         if out is None:
-            out = torch.full((self.config.max_num_seqs,), -1, dtype=torch.int32).to(
-                "tpu"
-            )
-        return StepOutput(out[: max(1, len(rows))].reshape(-1, 1))
+            width = 1 + (MTP_DRAFTS if self.mtp_checkpoint is not None else 0)
+            out = torch.full(
+                (self.config.max_num_seqs, width), -1, dtype=torch.int32
+            ).to("tpu")
+        return StepOutput(out[: max(1, len(rows))])
 
     def _state_blocks(self, row: RequestInput) -> np.ndarray:
         """Each GDN layer's state block after the request's computed tokens: the
@@ -449,6 +783,7 @@ class QwenDecoder:
             plan["slots"][b] = request.slot
             plan["positions"][b] = row.computed
             plan["row_of"][b] = i
+            plan["scheduled"][b] = row.scheduled
             if i in reset_tokens:
                 plan["reset"][b], plan["host_tokens"][b] = 1, reset_tokens[i]
             table = np.asarray(row.block_tables[self._attention_group], np.int32)[
@@ -465,3 +800,27 @@ class QwenDecoder:
 def _adopt(old: torch.Tensor, fresh: torch.Tensor) -> torch.Tensor:
     old.set_(fresh)
     return old
+
+
+def _pack(
+    fields: Mapping[str, tuple[int, ...]], plan: Mapping[str, np.ndarray]
+) -> np.ndarray:
+    """A step's plan as one int32 vector (float fields by their bits)."""
+    return np.concatenate(
+        [
+            np.asarray(plan[name]).view(np.int32)
+            if np.asarray(plan[name]).dtype == np.float32
+            else np.asarray(plan[name], np.int32).reshape(-1)
+            for name in fields
+        ]
+    ).astype(np.int32)
+
+
+def _unpack(fields: Mapping[str, tuple[int, ...]], vector):
+    """:func:`_pack`'s vector as the plan's fields (inside an op)."""
+    out, offset = {}, 0
+    for name, shape in fields.items():
+        size = int(np.prod(shape))
+        out[name] = vector[offset : offset + size].reshape(shape)
+        offset += size
+    return out

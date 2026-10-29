@@ -178,6 +178,10 @@ class MegakernelModelRunner(TPUModelRunner):
 
             # Held only to keep the registered layer modules alive.
             self._draft_layers = register_draft_layers(self.vllm_config, draft)
+        # A program's own KV cache layers (of a pipeline's last stage too).
+        kv_layers = getattr(backend.program(self.vllm_config), "kv_layers", None)
+        if kv_layers is not None and get_pp_group().is_last_rank:
+            self._program_layers = kv_layers(self.vllm_config)
         tp_rank = get_tensor_model_parallel_rank()
         self._is_output_rank = tp_rank == 0
         self.program = build_program(self.vllm_config, tp_rank)

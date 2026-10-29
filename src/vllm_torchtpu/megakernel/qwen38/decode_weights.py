@@ -16,7 +16,8 @@
 ``presharded`` is a rank cache: ``rankNN/<family>.bin`` raw arrays in the decode
 fast profile's per-rank layout (``kernels.layout.Layout.weight_specs``: TP32,
 expert TP4 block64 W4A8 experts, packed shared expert) with ``rankNN/index.json``
-(shape and dtype per family) and the checkpoint's ``source-config.json``. Each
+(shape and dtype per family), with MTP the draft layer's in ``rankNN/mtp/``, and
+the checkpoint's ``source-config.json``. Each
 worker reads its kernel rank's files; every tensor is created once on the
 device in its final dtype (FP8 as FP8).
 """
@@ -81,5 +82,33 @@ def load(
     stats = bridge.stream_to_device(
         _iter_rank(presharded, rank, layout.weight_names), store
     )
+    stats["wall"] = time.perf_counter() - started
+    return weights, stats
+
+
+def load_mtp(
+    presharded: Path, rank: int
+) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
+    """The MTP layer's native BF16 weights of kernel rank ``rank``
+    (``rankNN/mtp/<family>.bin``, ``kernels.mtp_config`` ownership: TP
+    projections, EP x expert-TP experts). It shares the target's embedding
+    and LM head."""
+    directory = Path(presharded) / f"rank{rank:02d}" / "mtp"
+    index = json.loads((directory / "index.json").read_text())
+
+    def arrays():
+        for name, entry in index.items():
+            array = np.fromfile(
+                directory / f"{name}.bin", dtype=np.dtype(entry["dtype"])
+            )
+            yield None, name, array.reshape(entry["shape"])
+
+    weights: dict[str, torch.Tensor] = {}
+
+    def store(_, name, tensor):
+        weights[name] = tensor
+
+    started = time.perf_counter()
+    stats = bridge.stream_to_device(arrays(), store)
     stats["wall"] = time.perf_counter() - started
     return weights, stats

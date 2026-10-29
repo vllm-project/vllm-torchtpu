@@ -276,6 +276,66 @@ def attention_plan(g: Geometry, mesh: Mesh, cache_shape, meta: Mapping[str, jax.
     )
 
 
+def mtp_draft_rows(
+    g: Geometry,
+    mesh: Mesh,
+    h,
+    w: Weights,
+    pool,
+    meta: Mapping[str, jax.Array],
+    plan,
+    tokens,
+    slots,
+    first,
+):
+    """The MTP layer's pool with the KV of the step's rows: row ``j`` of a
+    request fuses the target's final-normed hidden at ``j`` with the
+    embedding of the token after it (``tokens``, or the request's first token
+    ``first[slots]`` where ``slots >= 0``), the draft's KV at position ``j``.
+    Only the layer's KV path runs (``fc``, its input norm, the key and value
+    projections); its attention and MoE are the decoder's. ``w``: the BF16
+    MTP weights, the embedding and the final norm (replicated)."""
+    d = g.dims
+
+    def project(h, tokens, slots, first, positions):
+        following = jnp.where(slots >= 0, first[jnp.maximum(slots, 0)], tokens)
+        embedded = jnp.take(w["embedding"], following, axis=0)
+        hidden = rms(h, w["final_norm"], d.eps)
+        fused = jnp.concatenate(
+            [
+                rms(embedded, w["mtp_embedding_norm"], d.eps),
+                rms(hidden, w["mtp_hidden_norm"], d.eps),
+            ],
+            axis=-1,
+        )
+        x = rms(_bf16_dot(fused, w["mtp_fc"]).astype(BF16), w["mtp_input_norm"], d.eps)
+        key = (
+            _bf16_dot(x, w["mtp_k"])
+            .astype(BF16)
+            .reshape(g.rows, d.kv_heads, d.head_dim)
+        )
+        value = (
+            _bf16_dot(x, w["mtp_v"])
+            .astype(BF16)
+            .reshape(g.rows, d.kv_heads, d.head_dim)
+        )
+        key = rope(
+            rms(key, w["mtp_k_norm"], d.eps), positions, d.rotary_dim, d.rope_theta
+        )
+        return key, value
+
+    key, value = jax.shard_map(
+        project,
+        mesh=mesh,
+        in_specs=(P(PCP), P(PCP), P(PCP), P(), P(PCP)),
+        out_specs=(P(PCP), P(PCP)),
+        check_vma=False,
+    )(h, tokens, slots, first, meta["positions"])
+    return attention.write_kv(
+        mesh, g.ring, PCP, key, value, pool, plan, kv_layout=_kv_layout(g)
+    )
+
+
 def attention_mixer(
     g: Geometry, mesh: Mesh, h, w: Weights, pool, meta: Mapping[str, jax.Array], plan
 ):

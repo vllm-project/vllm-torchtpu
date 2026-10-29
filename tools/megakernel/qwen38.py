@@ -16,6 +16,7 @@
     python -m tools.megakernel qwen38 bench --prompts 8192x1,2048x4,8192x1@32768
     python -m tools.megakernel qwen38 probe --prompt "The capital of France is"
     python -m tools.megakernel qwen38 decode --presharded DIR --batches 1,4,16
+    python -m tools.megakernel qwen38 preshard --checkpoint DIR --output DIR
 
 ``probe`` loads the checkpoint (``--layers N``: each stage's first N layers)
 and runs one prompt, printing every layer's output range on each stage's
@@ -26,7 +27,8 @@ mixer and MoE updates with ``qwen38_check``'s NumPy layer on the same input.
 
 Each host runs its pipeline stage (vLLM's PP4 partition, its 8 cores one PCP
 group) over pools shaped as vLLM allocates them for PP4 x PCP8 (the unified
-HND pools, ``--block-size 768``, 256-token kernel pages), with synthetic
+HND pools, ``--block-size 640``, 128-token kernel pages, the decoder's TP32
+fan-out of GDN state needing whole 512-byte page rows), with synthetic
 weights (``--seed``; ``--checkpoint`` loads real ones). Stages after the first
 take random rows as their hand-off (``--chain``: the previous stage's output
 rows, through files), so every stage times its own step: ``LENxN`` is ``N``
@@ -37,6 +39,15 @@ fresh pages); the median of ``--repeats`` steps after a warm-up, per stage.
 ``--presharded`` over pools shaped as vLLM allocates them for it, each batch's
 requests decoding ``--steps`` tokens from position ``--context`` (zero KV and
 states before it), and reports the median step time per batch.
+
+``preshard`` writes the decoder's rank cache from the checkpoint: every worker
+converts its rank's weights on its device (``kernels.load``: block64 W4A8
+experts, the packed shared expert) and writes them as ``rankNN/<family>.bin``
+with ``rankNN/index.json``; one worker per host writes its ranks' MTP layer
+(``rankNN/mtp/``, native BF16, each checkpoint tensor read once per host); the
+first writes ``manifest.json``, ``source-config.json`` and a ``config.json``
+without the checkpoint's quantization (the decoder's speculative config reads
+it). The output directory must not exist.
 """
 
 from __future__ import annotations
@@ -52,9 +63,10 @@ from tools.megakernel.bench import trace
 
 STAGES = 4
 CORES = 8
-INTERLEAVE = 256
-MANAGER_BLOCK = 768  # --block-size 768: three 256-token kernel pages
-PAGE = 256
+INTERLEAVE = 128
+MANAGER_BLOCK = 640  # --block-size 640: five 128-token kernel pages
+PAGE = 128
+PER_BLOCK = MANAGER_BLOCK // PAGE
 POOL_PAGE = (8, 64, 4, PAGE)  # [2 * kv heads, head_dim / 4, 4 FP8 per word, page]
 
 
@@ -86,6 +98,9 @@ def add_arguments(parser) -> None:
         default="",
         help="prompt tokens (.npy, tiled to each length) instead of random ids",
     )
+    bench.add_argument(
+        "--mtp", action="store_true", help="the last stage writes the MTP layer's KV"
+    )
 
     decode = sub.add_parser("decode", help="the decoder's step time")
     decode.add_argument("--presharded", required=True, help="the decoder's rank cache")
@@ -93,6 +108,20 @@ def add_arguments(parser) -> None:
     decode.add_argument("--context", type=int, default=8192)
     decode.add_argument("--steps", type=int, default=32)
     decode.add_argument("--max-model-len", type=int, default=139264)
+    decode.add_argument(
+        "--mtp",
+        default="",
+        help="speculate with this checkpoint's MTP layer (three drafts per step)",
+    )
+
+    preshard = sub.add_parser("preshard", help="write the decoder's rank cache")
+    preshard.add_argument("--checkpoint", required=True)
+    preshard.add_argument("--output", default="")
+    preshard.add_argument(
+        "--against",
+        default="",
+        help="compare every rank with this existing rank cache instead of writing",
+    )
 
     probe = sub.add_parser("probe", help="each layer's output range, real weights")
     probe.add_argument("--checkpoint", required=True)
@@ -125,20 +154,30 @@ class Pools:
     ``i``-th layer of every KV cache group (three GDN groups, one attention
     group), as vLLM's hybrid allocator lays them out."""
 
-    def __init__(self, layers: range, blocks: int, max_model_len: int) -> None:
+    def __init__(
+        self, layers: range, blocks: int, max_model_len: int, mtp: bool = False
+    ) -> None:
         import torch
 
         from vllm_torchtpu.megakernel.program import KVGroup
-        from vllm_torchtpu.megakernel.qwen38.program import is_full_attention
+        from vllm_torchtpu.megakernel.qwen38.program import (
+            MTP_LAYER,
+            NUM_LAYERS,
+            is_full_attention,
+        )
 
         attention = [i for i in layers if is_full_attention(i)]
+        if mtp and layers.stop == NUM_LAYERS:
+            attention.append(MTP_LAYER)  # the MTP layer's KV, after the target's
         gdn = [
             [i for i in layers if not is_full_attention(i) and i % 4 == g]
             for g in range(3)
         ]
         count = max(len(attention), *(len(group) for group in gdn))
         self.raw = [
-            torch.zeros((blocks * 3, *POOL_PAGE), dtype=torch.float8_e4m3fn).to("tpu")
+            torch.zeros((blocks * PER_BLOCK, *POOL_PAGE), dtype=torch.float8_e4m3fn).to(
+                "tpu"
+            )
             for _ in range(count)
         ]
         self.caches = {}
@@ -172,16 +211,16 @@ class Pools:
 
     def tables(self, tokens: int) -> tuple[np.ndarray, ...]:
         """A request's block-table rows: one state block per GDN group and
-        the attention group's kernel pages (three per manager block)."""
+        the attention group's kernel pages (``PER_BLOCK`` per manager block)."""
         widths = [g.table_width for g in self.groups]
         rows = [np.zeros(w, np.int32) for w in widths]
         for g in range(3):
             rows[g][0] = self.fresh(1)[0]
         pages = -(-tokens // (PAGE * CORES))
-        for k, block in enumerate(self.fresh(-(-pages // 3))):
-            for j in range(3):
-                if 3 * k + j < widths[3]:
-                    rows[3][3 * k + j] = 3 * block + j
+        for k, block in enumerate(self.fresh(-(-pages // PER_BLOCK))):
+            for j in range(PER_BLOCK):
+                if PER_BLOCK * k + j < widths[3]:
+                    rows[3][PER_BLOCK * k + j] = PER_BLOCK * block + j
         return tuple(rows)
 
 
@@ -257,7 +296,7 @@ def probe(args) -> None:
     )
     # The null block, a state block per GDN group, the prompt's attention blocks.
     pages = -(-len(tokens) // (PAGE * CORES))
-    pools = Pools(layers, 4 + -(-pages // 3), args.max_model_len)
+    pools = Pools(layers, 4 + -(-pages // PER_BLOCK), args.max_model_len)
     stage.bind_kv_caches(pools.caches, pools.groups)
     request = RequestInput(
         req_id="probe",
@@ -470,7 +509,12 @@ def decode(args) -> None:
     from vllm_torchtpu.megakernel.config import MegakernelEngineConfig
     from vllm_torchtpu.megakernel.program import KVGroup, RequestInput, StepInput
     from vllm_torchtpu.megakernel.qwen38.decode import QwenDecoder
-    from vllm_torchtpu.megakernel.qwen38.program import NUM_LAYERS, is_full_attention
+    from vllm_torchtpu.megakernel.qwen38.program import (
+        MTP_DRAFTS,
+        MTP_LAYER,
+        NUM_LAYERS,
+        is_full_attention,
+    )
 
     batches = [int(b) for b in args.batches.split(",")]
     config = MegakernelEngineConfig(
@@ -484,27 +528,35 @@ def decode(args) -> None:
         kv_cache_dtype="fp8",
         mamba_ssm_cache_dtype="float32",
         cp_kv_cache_interleave_size=PAGE,
+        num_speculative_tokens=MTP_DRAFTS if args.mtp else 0,
     )
-    decoder = QwenDecoder(config, Path(args.presharded), tp_rank=harness.rank())
+    decoder = QwenDecoder(
+        config,
+        Path(args.presharded),
+        tp_rank=harness.rank(),
+        mtp_checkpoint=Path(args.mtp) if args.mtp else None,
+    )
     started = time.perf_counter()
     decoder.load_weights()
     harness.log(
         f"rank cache weights in {time.perf_counter() - started:.1f} s; {_hbm()}"
     )
     # vLLM's pools for the decoder: raw pool i holds attention layer i and the
-    # i-th layer of each GDN group; state blocks are manager blocks of three
-    # kernel pages, attention tables list kernel pages.
+    # i-th layer of each GDN group; state blocks are manager blocks of
+    # PER_BLOCK kernel pages, attention tables list kernel pages.
     attention = [i for i in range(NUM_LAYERS) if is_full_attention(i)]
+    if args.mtp:
+        attention.append(MTP_LAYER)  # the MTP layer's KV, after the target's
     gdn = [
         [i for i in range(NUM_LAYERS) if not is_full_attention(i) and i % 4 == g]
         for g in range(3)
     ]
     requests = max(batches)
-    pages = -(-(args.context + args.steps + 1) // (PAGE * CORES))
+    spec = MTP_DRAFTS if args.mtp else 0
+    pages = -(-(args.context + (1 + spec) * args.steps + 1) // (PAGE * CORES))
     width = -(-args.max_model_len // (PAGE * CORES))
-    state_pages = 3 * (1 + 3 * requests)
-    per_block = MANAGER_BLOCK // PAGE
-    kernel_pages = -(-(state_pages + requests * pages) // per_block) * per_block
+    state_pages = PER_BLOCK * (1 + 3 * requests)
+    kernel_pages = -(-(state_pages + requests * pages) // PER_BLOCK) * PER_BLOCK
     page_shape = (2, decoder.layout.config.head_dim // 4, 4, PAGE)
     raw = [
         torch.zeros((kernel_pages, *page_shape), dtype=torch.float8_e4m3fn).to("tpu")
@@ -539,19 +591,19 @@ def decode(args) -> None:
         return (*(np.asarray([1 + 3 * r + g], np.int32) for g in range(3)), kv)
 
     for batch in batches:
-        tokens = rng.integers(0, 200000, (batch, args.context + args.steps + 1)).astype(
-            np.int32
-        )
+        length = args.context + (1 + spec) * args.steps + 1
+        tokens = rng.integers(0, 200000, (batch, length)).astype(np.int32)
         times, finished = [], ()
+        computed = [args.context] * batch
+        emitted_total = 0
         for step in range(args.steps):
-            position = args.context + step
             rows = [
                 RequestInput(
                     req_id=f"b{batch}-{r}",
-                    computed=position,
-                    scheduled=1,
+                    computed=computed[r],
+                    scheduled=1 + (spec if step else 0),
                     token_ids=tokens[r],
-                    num_tokens=position + 1,
+                    num_tokens=computed[r] + 1,
                     num_prompt_tokens=args.context,
                     block_tables=tables(r),
                 )
@@ -565,21 +617,179 @@ def decode(args) -> None:
             finished = ()
             if step:  # the first imports the requests' states
                 times.append((time.perf_counter() - begin) * 1e3)
+            emitted = output.tokens[:batch].cpu().numpy()
+            for r in range(batch):
+                count = int((emitted[r] >= 0).sum())
+                computed[r] += count
+                if step:
+                    emitted_total += count
         decoder.step(
             StepInput(requests=[], finished=[f"b{batch}-{r}" for r in range(batch)])
         )
         median = statistics.median(times)
+        per_step = emitted_total / (batch * max(1, args.steps - 1))
         last = output.tokens[:batch, 0].tolist()
         harness.log(
-            f"decode b{batch} @{args.context}: step {median:.2f} ms = "
-            f"{batch * 1e3 / median:.0f} tok/s; last tokens {last}"
+            f"decode b{batch} @{args.context}: step {median:.2f} ms, "
+            f"{per_step:.2f} tokens per request and step = "
+            f"{batch * per_step * 1e3 / median:.0f} tok/s; last tokens {last}"
         )
     harness.log(_hbm())
+
+
+def preshard(args) -> None:
+    import hashlib
+    import json
+    import shutil
+    import socket
+
+    import jax
+    import ml_dtypes
+    import torch
+    from safetensors import safe_open
+
+    from vllm_torchtpu.megakernel.bridge import kernel_mesh
+    from vllm_torchtpu.megakernel.qwen38.decode_weights import FORMAT
+    from vllm_torchtpu.megakernel.qwen38.kernels import Config, load
+    from vllm_torchtpu.megakernel.qwen38.kernels.layout import Layout
+    from vllm_torchtpu.megakernel.qwen38.kernels.mtp_config import (
+        MTPConfig,
+        owned_tensors,
+        weight_shapes,
+    )
+
+    if bool(args.output) == bool(args.against):
+        raise SystemExit("preshard takes one of --output and --against")
+    checkpoint = Path(args.checkpoint)
+    output = Path(args.output or args.against)
+    rank = harness.rank()
+    if rank == 0 and args.output and output.exists():
+        raise SystemExit(f"{output} exists")
+    harness.sync()
+    mesh, _ = kernel_mesh("tp", 32, rank=rank)
+    config = Config.from_checkpoint(checkpoint)
+    layout = Layout.for_config(
+        config,
+        tp=32,
+        expert_tp=4,
+        context_parallel=8,
+        precision="torchtpu_w4a8_b64",
+        expert_reduction="residual",
+        dense_output_tile=8192,
+    )
+
+    def write(directory: Path, arrays) -> None:
+        index = {}
+        for name, value in arrays:
+            data = np.ascontiguousarray(value).reshape(-1).view(np.uint8)
+            if args.output:
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / f"{name}.bin").write_bytes(data.tobytes())
+            index[name] = {
+                "shape": list(value.shape),
+                "dtype": str(value.dtype),
+                "bytes": int(data.size),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+        if args.output:
+            (directory / "index.json").write_text(json.dumps(index, indent=1))
+            return
+        existing = json.loads((directory / "index.json").read_text())
+        differ = sorted(
+            n for n in index.keys() | existing.keys() if index.get(n) != existing.get(n)
+        )
+        harness.log_host(
+            f"{directory.relative_to(output)}: {len(index)} families, "
+            + (f"DIFFER {differ}" if differ else "identical")
+        )
+
+    started = time.perf_counter()
+    weights = load.load(checkpoint, mesh, layout)
+    write(
+        output / f"rank{rank:02d}",
+        (
+            (name, np.asarray(jax.device_get(value.addressable_shards[0].data))[0])
+            for name, value in weights.items()
+        ),
+    )
+    del weights
+    harness.log(f"decode weights written in {time.perf_counter() - started:.0f} s")
+    # The MTP layer: one worker per host, for the host's ranks.
+    here = socket.gethostname()
+    ranks = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(ranks, (rank, here))
+    if rank == min(r for r, host in ranks if host == here):
+        local = [r for r, host in ranks if host == here]
+        mtp = MTPConfig.from_checkpoint(checkpoint)
+        shapes = weight_shapes(mtp, layout)
+        arrays = {
+            r: {n: np.zeros(shape, ml_dtypes.bfloat16) for n, shape in shapes.items()}
+            for r in local
+        }
+        uses: dict[str, list] = {}
+        for r in local:
+            for owned in owned_tensors(mtp, layout, r):
+                uses.setdefault(owned.source, []).append((r, owned))
+        files = json.loads((checkpoint / "model.safetensors.index.json").read_text())[
+            "weight_map"
+        ]
+        for source, owners in uses.items():
+            with safe_open(checkpoint / files[source], framework="numpy") as f:
+                whole = f.get_slice(source)[:]
+            whole = whole.view(np.uint16).view(ml_dtypes.bfloat16)
+            for r, owned in owners:
+                value = whole[
+                    tuple(
+                        slice(s, s + n)
+                        for s, n in zip(owned.starts, owned.sizes, strict=True)
+                    )
+                ]
+                if owned.transpose:
+                    value = value.T
+                target = arrays[r][owned.destination]
+                if owned.expert_slot is not None:
+                    target[owned.expert_slot] = value
+                else:
+                    target[...] = value
+        for r in local:
+            write(output / f"rank{r:02d}" / "mtp", arrays[r].items())
+        harness.log_host(f"MTP layer of ranks {local} written")
+    harness.sync()
+    if rank == 0 and args.output:
+        source = json.loads((checkpoint / "config.json").read_text())
+        (output / "source-config.json").write_text(json.dumps(source, indent=1))
+        served = {k: v for k, v in source.items() if k != "quantization_config"}
+        (output / "config.json").write_text(json.dumps(served, indent=1))
+        for name in (
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "chat_template.jinja",
+            "generation_config.json",
+        ):
+            if (checkpoint / name).exists():
+                shutil.copy(checkpoint / name, output / name)
+        manifest = {
+            "format": FORMAT,
+            "source": str(checkpoint),
+            "layout": {
+                "tp": layout.tp,
+                "expert_tp": layout.expert_tp,
+                "router_tp": layout.router_tp,
+                "precision": layout.precision,
+                "expert_reduction": layout.expert_reduction,
+            },
+            "ranks": layout.tp,
+            "families": sorted(layout.weight_names),
+        }
+        (output / "manifest.json").write_text(json.dumps(manifest, indent=1))
+        harness.log(f"rank cache {output} done")
 
 
 def run(args) -> None:
     if args.qwen_command == "probe":
         return probe(args)
+    if args.qwen_command == "preshard":
+        return preshard(args)
     if args.qwen_command == "decode":
         return decode(args)
     import torch
@@ -607,6 +817,7 @@ def run(args) -> None:
         mesh=mesh,
         core=core,
         synthetic_seed=None if args.checkpoint else args.seed,
+        mtp=args.mtp,
     )
     started = time.perf_counter()
     stage.load_weights()
@@ -617,12 +828,12 @@ def run(args) -> None:
 
     def blocks_per_request(tokens: int) -> int:  # three GDN states + KV blocks
         pages = -(-tokens // (PAGE * CORES))
-        return 3 + -(-pages // 3)
+        return 3 + -(-pages // PER_BLOCK)
 
     blocks = 2 + (args.repeats + 1) * sum(
         count * blocks_per_request(length + prefix) for length, count, prefix in cases
     )
-    pools = Pools(layers, blocks, args.max_model_len)
+    pools = Pools(layers, blocks, args.max_model_len, args.mtp)
     stage.bind_kv_caches(pools.caches, pools.groups)
     stage.warmup()
     harness.sync()

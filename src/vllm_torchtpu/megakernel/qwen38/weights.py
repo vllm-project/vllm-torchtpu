@@ -23,7 +23,9 @@ the stage, the GDN input projections sent to the heads' cores fused into one
 ``w2`` ``[groups, I, H]`` E2M1 with per-channel scales ``[groups, 1, N]`` and
 per-block ratios ``[groups, K / 64, N]``); the BF16 router, shared expert and
 norms (``[out, in]``). Stage 0 adds the embedding, the last stage the final
-norm and this core's vocabulary shard of the LM head.
+norm and this core's vocabulary shard of the LM head, and for a decoder that
+speculates with the MTP layer, the embedding and that layer's BF16 KV path
+(:data:`MTP_TENSORS`).
 
 Every tensor is created once in its final dtype on the device, FP8 as FP8:
 no step converts a weight.
@@ -50,6 +52,20 @@ class StageWeights:
     embedding: torch.Tensor | None  # [vocab, H] BF16 (stage 0)
     final_norm: torch.Tensor | None  # [H] (last stage)
     lm_head: torch.Tensor | None  # [vocab / cores, H] BF16 (last stage)
+    # The MTP layer's KV path by MTP_TENSORS name (last stage, with MTP).
+    mtp: dict[str, torch.Tensor] | None = None
+
+
+# The MTP layer's tensors the prefill reads to write its KV.
+MTP_TENSORS = {
+    "mtp_fc": "mtp.fc.weight",  # [H, 2 H]: [embedding | hidden] -> H
+    "mtp_embedding_norm": "mtp.pre_fc_norm_embedding.weight",
+    "mtp_hidden_norm": "mtp.pre_fc_norm_hidden.weight",
+    "mtp_input_norm": "mtp.layers.0.input_layernorm.weight",
+    "mtp_k": "mtp.layers.0.self_attn.k_proj.weight",
+    "mtp_v": "mtp.layers.0.self_attn.v_proj.weight",
+    "mtp_k_norm": "mtp.layers.0.self_attn.k_norm.weight",
+}
 
 
 GDN_FP8 = ("qkv", "z", "b", "a", "out")
@@ -140,6 +156,7 @@ def synthetic(
     first_stage: bool,
     last_stage: bool,
     seed: int,
+    mtp: bool = False,
     device: str = "tpu",
 ) -> StageWeights:
     """Random weights of the stage's shapes and dtypes (timing and
@@ -224,12 +241,25 @@ def synthetic(
         w["w2"], w["w2_channel"], w["w2_ratio"] = experts(d.hidden, d.expert_inter)
         out[layer] = w
     torch.manual_seed(seed)
+    drafts = mtp and last_stage
+    kv = d.kv_heads * d.head_dim
     return StageWeights(
         layers=out,
-        embedding=normal(vocab, d.hidden) if first_stage else None,
+        embedding=normal(vocab, d.hidden) if first_stage or drafts else None,
         final_norm=normal(d.hidden, scale=0.0) if last_stage else None,
         lm_head=normal(vocab // cores, d.hidden, scale=d.hidden**-0.5)
         if last_stage
+        else None,
+        mtp={
+            "mtp_fc": normal(d.hidden, 2 * d.hidden, scale=(2 * d.hidden) ** -0.5),
+            "mtp_embedding_norm": normal(d.hidden, scale=0.0),
+            "mtp_hidden_norm": normal(d.hidden, scale=0.0),
+            "mtp_input_norm": normal(d.hidden, scale=0.0),
+            "mtp_k": normal(kv, d.hidden, scale=d.hidden**-0.5),
+            "mtp_v": normal(kv, d.hidden, scale=d.hidden**-0.5),
+            "mtp_k_norm": normal(d.head_dim, scale=0.0),
+        }
+        if drafts
         else None,
     )
 
@@ -303,6 +333,7 @@ def load(
     *,
     first_stage: bool,
     last_stage: bool,
+    mtp: bool = False,
     device: str = "tpu",
 ) -> StageWeights:
     """The stage's weights from the Hugging Face NVFP4 checkpoint: this
@@ -436,11 +467,17 @@ def load(
             )
         out[layer] = w
     shard = slice(core * vocab // cores, (core + 1) * vocab // cores)
+    drafts = mtp and last_stage
     weights = StageWeights(
         layers=out,
-        embedding=put(ckpt.get("model.embed_tokens.weight")) if first_stage else None,
+        embedding=put(ckpt.get("model.embed_tokens.weight"))
+        if first_stage or drafts
+        else None,
         final_norm=put(ckpt.get("model.norm.weight")) if last_stage else None,
         lm_head=put(ckpt.get("lm_head.weight")[shard]) if last_stage else None,
+        mtp={name: put(ckpt.get(source)) for name, source in MTP_TENSORS.items()}
+        if drafts
+        else None,
     )
     ckpt.close()
     return weights

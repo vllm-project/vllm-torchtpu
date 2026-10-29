@@ -891,26 +891,6 @@
       "concise_description": "`owner_kernel` may be uninitialized"
     },
     {
-      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/decode_megakernel.py",
-      "name": "bad-index",
-      "concise_description": "Index 3 out of range for tuple with 3 elements"
-    },
-    {
-      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/decode_megakernel.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `dict[str, Unknown]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/decode_megakernel.py",
-      "name": "bad-index",
-      "concise_description": "Index 3 out of range for tuple with 3 elements"
-    },
-    {
-      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/decode_megakernel.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `dict[str, Unknown]`"
-    },
-    {
       "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/dense.py",
       "name": "unsupported-operation",
       "concise_description": "`*` is not supported between `None` and `None`"
@@ -1019,6 +999,91 @@
       "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/load_preshard.py",
       "name": "bad-argument-count",
       "concise_description": "Expected 10 positional arguments, got 16 in function `concurrent.futures._base.Executor.submit`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/mtp_cache_batch.py",
+      "name": "unbound-name",
+      "concise_description": "`columns_out` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/mtp_cache_batch.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `FunctionType` has no attribute `executable_arguments`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/mtp_cache_batch.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `FunctionType` has no attribute `validate_entry`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/mtp_cache_batch.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `FunctionType` has no attribute `lower`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/mtp_cache_batch.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `FunctionType` has no attribute `mtp_cache_batch_shape`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/mtp_decode.py",
+      "name": "unbound-name",
+      "concise_description": "`columns_out` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/mtp_decode.py",
+      "name": "unbound-name",
+      "concise_description": "`pool_ref` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/mtp_decode.py",
+      "name": "unbound-name",
+      "concise_description": "`key_out` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/mtp_decode.py",
+      "name": "unbound-name",
+      "concise_description": "`value_out` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/mtp_decode.py",
+      "name": "unbound-name",
+      "concise_description": "`owner_kernel` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/mtp_decode.py",
+      "name": "unbound-name",
+      "concise_description": "`owner_requests_kernel` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/mtp_decode.py",
+      "name": "unbound-name",
+      "concise_description": "`requests_kernel` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/mtp_decode.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `FunctionType` has no attribute `lower`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/mtp_decode.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `FunctionType` has no attribute `validate_entry`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/mtp_decode_c2_fused.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `astype`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/mtp_decode_c2_fused.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `astype`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/mtp_decode_c2_fused.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `astype`"
     },
     {
       "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/preshard.py",

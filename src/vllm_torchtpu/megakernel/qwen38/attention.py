@@ -479,8 +479,6 @@ def stage_attention(
     of the cache pages it owns, as the streaming kernel captures them."""
     from jax.sharding import PartitionSpec as P
 
-    from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import kernel as pcp
-    from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import wrapper
     from vllm_torchtpu.megakernel.qwen38.prologue import all_gather
 
     cores = mesh.shape[axis]
@@ -505,17 +503,8 @@ def stage_attention(
             rotary_dim=rotary_dim,
             eps=eps,
         )
-        tokens = gathered.shape[0]
-        packed = gathered.astype(BF16).reshape(tokens, 2, kv_heads, dim)
-        packed = wrapper._prepare_packed_kv_for_cache(
-            packed[:, 0], packed[:, 1], kv_cache, kv_layout=kv_layout
-        )
-        kv_cache = pcp.write_captured_kv_to_local_cache(
-            wrapper._reshape_packed_kv_cache_for_attention(kv_cache, kv_layout),
-            packed,
-            segments[0],
-            num_segments[0],
-            kv_layout=kv_layout,
+        kv_cache = _write_gathered(
+            gathered, kv_heads, kv_cache, segments, num_segments, kv_layout
         )
         return out, kv_cache
 
@@ -526,6 +515,54 @@ def stage_attention(
         out_specs=(P(axis), P(axis)),
         check_vma=False,
     )(q, k, v, kv_cache, *plan[:-1])
+
+
+def write_kv(mesh, ring, axis, k, v, kv_cache, plan, *, kv_layout):
+    """The KV cache with a step's new key and value rows only (``k`` / ``v``
+    ``[tokens, heads, D]`` BF16, the stage's rank-major rows along ``axis``),
+    each core writing the rows of the pages it owns as :func:`stage_attention`
+    does (unit KV scales; ``plan``: the step's :func:`attention_plan`)."""
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.megakernel.qwen38.prologue import all_gather
+
+    def local(k, v, kv_cache, segments, num_segments):
+        rows, kv_heads, dim = k.shape
+        width = kv_heads * dim
+        fresh = jnp.concatenate([k.reshape(rows, width), v.reshape(rows, width)], 1)
+        gathered = all_gather(fresh.astype(jnp.float8_e4m3fn), ring, axis)
+        return _write_gathered(
+            gathered, kv_heads, kv_cache, segments, num_segments, kv_layout
+        )
+
+    return jax.shard_map(
+        local,
+        mesh=mesh,
+        in_specs=(P(axis),) * 5,
+        out_specs=P(axis),
+        check_vma=False,
+    )(k, v, kv_cache, plan[2], plan[3])
+
+
+def _write_gathered(gathered, kv_heads, kv_cache, segments, num_segments, kv_layout):
+    """``kv_cache`` with this core's pages' rows of the step's gathered FP8
+    ``[tokens, 2 * heads * D]`` keys and values."""
+    from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import kernel as pcp
+    from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import wrapper
+
+    tokens = gathered.shape[0]
+    dim = gathered.shape[1] // (2 * kv_heads)
+    packed = gathered.astype(BF16).reshape(tokens, 2, kv_heads, dim)
+    packed = wrapper._prepare_packed_kv_for_cache(
+        packed[:, 0], packed[:, 1], kv_cache, kv_layout=kv_layout
+    )
+    return pcp.write_captured_kv_to_local_cache(
+        wrapper._reshape_packed_kv_cache_for_attention(kv_cache, kv_layout),
+        packed,
+        segments[0],
+        num_segments[0],
+        kv_layout=kv_layout,
+    )
 
 
 def has_history(kv_lens, cu_q_lens, distribution):

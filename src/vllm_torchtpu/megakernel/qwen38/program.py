@@ -33,25 +33,27 @@ from vllm_torchtpu.megakernel.config import MegakernelEngineConfig
 from vllm_torchtpu.megakernel.program import Capabilities
 
 NUM_LAYERS = 92
+MAX_DECODE_REQUESTS = 16  # the decode megakernel's largest batch
 HIDDEN_SIZE = 8192
 VOCAB = 248320
 PCP_SIZE = 8  # the cores of a stage (one host)
+MTP_LAYER = 92  # the MTP layer's attention: a KV cache layer after the target's
+MTP_DRAFTS = 3  # proposals per speculative round
 TP_SIZE = 32  # the decoder's ranks
 DCP_SIZE = 8  # the decoder's attention context parallel group
 FULL_ATTENTION_INTERVAL = 4  # layers 3, 7, ..., 91 are full attention, the rest GDN
-# Sampling parameters the ops implement (beyond greedy), by role: the
-# prefill's first tokens are not served.
-SAMPLING = {
-    "prefill": frozenset(),
-    "decode": frozenset({"temperature", "top_p", "top_k", "seed"}),
-}
+# Sampling parameters the decoder's ops implement (beyond greedy); the prefill
+# accepts them too (its first tokens are not served).
+SAMPLING = frozenset({"temperature", "top_p", "top_k", "seed"})
 # --model-loader-extra-config keys, by role: the prefill reads the model's
-# checkpoint itself (``synthetic_seed``: random weights instead, for timing);
+# checkpoint itself (``synthetic_seed``: random weights instead, for timing;
+# ``mtp``: write the MTP layer's KV for a decoder that speculates with it);
 # the decoder reads its rank cache (``decode_weights``).
 LOADER_KEYS = {
-    "prefill": frozenset({"synthetic_seed"}),
+    "prefill": frozenset({"synthetic_seed", "mtp"}),
     "decode": frozenset({"presharded"}),
 }
+MTP_METHODS = frozenset({"mtp", "qwen3_5_mtp", "qwen3_next_mtp"})
 
 
 def is_full_attention(layer: int) -> bool:
@@ -85,6 +87,11 @@ def check(config: MegakernelEngineConfig) -> None:
                 "the Qwen3.8 decode megakernel needs --cp-kv-cache-interleave-size "
                 f"128 or 256 (its KV page), not {interleave}"
             )
+        if config.max_num_seqs > MAX_DECODE_REQUESTS:
+            raise NotImplementedError(
+                f"the Qwen3.8 decode megakernel steps at most {MAX_DECODE_REQUESTS} "
+                f"requests: --max-num-seqs <= {MAX_DECODE_REQUESTS}"
+            )
         return
     if config.role != "prefill":
         raise NotImplementedError(f"the Qwen3.8 megakernel has no {config.role} role")
@@ -105,21 +112,73 @@ def check(config: MegakernelEngineConfig) -> None:
         )
 
 
+def mtp(vllm_config: Any) -> bool:
+    """Whether the pair speculates with the checkpoint's MTP layer: the
+    prefill's loader config ``mtp``, the decoder's speculative config."""
+    from vllm_torchtpu.megakernel import backend
+
+    if backend.role(vllm_config) == "prefill":
+        return bool(backend.loader_option(vllm_config, "mtp"))
+    spec = vllm_config.speculative_config
+    if spec is None:
+        return False
+    if spec.method not in MTP_METHODS or spec.num_speculative_tokens != MTP_DRAFTS:
+        raise NotImplementedError(
+            f"the Qwen3.8 decoder speculates with the MTP layer, {MTP_DRAFTS} tokens"
+        )
+    if not vllm_config.scheduler_config.async_scheduling:
+        # Synchronous scheduling never schedules the drafts, which stay on the device.
+        raise NotImplementedError("the Qwen3.8 MTP decoder needs async scheduling")
+    return True
+
+
+def kv_layers(vllm_config: Any) -> list[Any]:
+    """KV cache layers the programs keep beyond the model's: the MTP layer's
+    attention (``model.layers.92``, as the target's attention layers, so vLLM
+    groups it with them: the same block tables and pages, and the KV transfer
+    moves it with the target's). Keep the returned modules alive."""
+    if not mtp(vllm_config):
+        return []
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.attention.attention import Attention
+
+    context = vllm_config.compilation_config.static_forward_context
+    # Any of this worker's target attention layers (a stage holds only its own).
+    target = next(
+        context[f"model.layers.{layer}.self_attn.attn"]
+        for layer in range(NUM_LAYERS)
+        if is_full_attention(layer)
+        and f"model.layers.{layer}.self_attn.attn" in context
+    )
+    with set_current_vllm_config(vllm_config):
+        return [
+            Attention(
+                target.num_heads,
+                target.head_size,
+                target.impl.scale,
+                num_kv_heads=target.num_kv_heads,
+                cache_config=vllm_config.cache_config,
+                prefix=f"model.layers.{MTP_LAYER}.self_attn.attn",
+            )
+        ]
+
+
 def capabilities(config: MegakernelEngineConfig) -> Capabilities:
     check(config)
     if config.role == "decode":
+        speculating = config.num_speculative_tokens > 0
         return Capabilities(
             roles=frozenset({"decode"}),
-            sampling=SAMPLING["decode"],
-            speculation=None,
-            num_speculative_tokens=0,
+            sampling=SAMPLING,
+            speculation="mtp" if speculating else None,
+            num_speculative_tokens=MTP_DRAFTS if speculating else 0,
             max_step_tokens=config.max_num_batched_tokens,
             page_aligned_chunks=False,
             block_copies=False,
         )
     return Capabilities(
         roles=frozenset({"prefill"}),
-        sampling=SAMPLING["prefill"],
+        sampling=SAMPLING,
         speculation=None,
         num_speculative_tokens=0,
         max_step_tokens=config.max_num_batched_tokens,
@@ -158,7 +217,14 @@ def from_vllm(vllm_config: Any, tp_rank: int):
         presharded = backend.presharded(vllm_config)
         if presharded is None:
             raise ValueError("the Qwen3.8 decoder loads its rank cache: set presharded")
-        return QwenDecoder(config, presharded, tp_rank=tp_rank)
+        return QwenDecoder(
+            config,
+            presharded,
+            tp_rank=tp_rank,
+            mtp_checkpoint=Path(vllm_config.model_config.model)
+            if mtp(vllm_config)
+            else None,
+        )
     pp = get_pp_group()
     first, last = get_pp_indices(NUM_LAYERS, pp.rank_in_group, pp.world_size)
     return QwenPrefillStage(
@@ -170,4 +236,5 @@ def from_vllm(vllm_config: Any, tp_rank: int):
         mesh=get_or_create_pcp_mesh(AXIS),
         core=get_pcp_group().rank_in_group,
         synthetic_seed=backend.synthetic_seed(vllm_config),
+        mtp=mtp(vllm_config),
     )

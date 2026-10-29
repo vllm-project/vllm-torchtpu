@@ -177,8 +177,8 @@ def attend_paged_append(
     its PV, one iteration after its QK, and blocks are read ``buffers - 2`` ahead.
     """
     paged = isinstance(key_cache, PoolPages)
-    if paged and (layout.context_parallel != 8 or not layout.fast):
-        raise ValueError("Pool pages serve CP8 FP8 decode")
+    if paged and layout.context_parallel != 8:
+        raise ValueError("Pool pages serve CP8 decode")
     if layout.context_parallel != 8:
         if inbox is not None:
             raise ValueError("Persistent CP inboxes require CP8")
@@ -224,7 +224,9 @@ def attend_paged_append(
     block_tokens = block_pages * page
     cp_rank = rank % cp
     pipelined = buffers > 2
-    key_scale, value_scale = scales if layout.fast else (1.0, 1.0)
+    # The KV is FP8 in the fast profile and in vLLM's pools (any profile).
+    fp8 = layout.fast or paged
+    key_scale, value_scale = scales if fp8 else (1.0, 1.0)
 
     def peer_id(peer):
         return peer if id_type == pl.DeviceIdType.LOGICAL else (peer,)
@@ -364,7 +366,7 @@ def attend_paged_append(
                 mask = jnp.arange(page)[:, None] == position % page
                 for bank, row, scale in ((keys, key, scales[0]), (values, value, scales[1])):
                     encoded = row
-                    if layout.fast:
+                    if fp8:
                         encoded = jnp.clip(row.astype(F32) / scale, -448, 448).astype(dtype)
                     if paged:
                         set_column(bank.at[slot, local_page], position % page, encoded)

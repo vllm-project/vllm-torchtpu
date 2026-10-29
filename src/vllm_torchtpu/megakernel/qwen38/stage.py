@@ -57,6 +57,7 @@ from vllm_torchtpu.megakernel.program import (
 from vllm_torchtpu.megakernel.qwen38 import layers as qlayers
 from vllm_torchtpu.megakernel.qwen38.program import (
     HIDDEN_SIZE,
+    MTP_LAYER,
     PCP_SIZE,
     VOCAB,
     check,
@@ -91,11 +92,14 @@ class QwenPrefillStage:
         mesh: Any,
         core: int,
         synthetic_seed: int | None = None,
+        mtp: bool = False,
     ) -> None:
         check(config)
         self.config = config
         self.checkpoint = checkpoint
         self.synthetic_seed = synthetic_seed
+        # The last stage writes the MTP layer's KV (the decoder's draft rows).
+        self.drafts = mtp and last_stage
         self.dims = Dims()
         self.layers = layers
         self.first_stage, self.last_stage = first_stage, last_stage
@@ -216,6 +220,7 @@ class QwenPrefillStage:
                 VOCAB,
                 first_stage=self.first_stage,
                 last_stage=self.last_stage,
+                mtp=self.drafts,
             )
         else:
             self.weights = synthetic(
@@ -226,6 +231,7 @@ class QwenPrefillStage:
                 first_stage=self.first_stage,
                 last_stage=self.last_stage,
                 seed=self.synthetic_seed,
+                mtp=self.drafts,
             )
 
     def bind_kv_caches(
@@ -241,19 +247,25 @@ class QwenPrefillStage:
         attention_groups = set()
         for name, cache in caches.items():
             match = _LAYER.search(name)
-            if match is None or int(match.group(1)) not in self.layers:
+            if match is None:
                 continue
             layer = int(match.group(1))
+            if layer not in self.layers and not (self.drafts and layer == MTP_LAYER):
+                continue
             # A GDN layer's cache is its one state tensor in a list: the pool.
             tensor = cache[0] if isinstance(cache, (list, tuple)) else cache
             pool = by_ptr.setdefault(int(tensor.data_ptr()), tensor)
             self._pools[layer] = pool
             g = group_of[name]
-            if is_full_attention(layer):
+            if is_full_attention(layer) or layer == MTP_LAYER:
                 attention_groups.add(g)
             else:
                 self._gdn_groups[layer] = (g, int(groups[g].block_size))
-        missing = [layer for layer in self.layers if layer not in self._pools]
+        missing = [
+            layer
+            for layer in (*self.layers, *((MTP_LAYER,) if self.drafts else ()))
+            if layer not in self._pools
+        ]
         if missing or len(attention_groups) > 1:
             raise RuntimeError(
                 f"Qwen3.8 stage: layers {missing} have no KV cache, or the "
@@ -303,7 +315,10 @@ class QwenPrefillStage:
             h = self._run_layer(layer, rows, h, meta)
         if not self.last_stage:
             return StepOutput(tokens=None, hidden={HIDDEN_STATES: h})
-        return StepOutput(self._first_tokens(step_input.requests, requests, plan, h))
+        tokens, first = self._first_tokens(step_input.requests, requests, plan, h)
+        if self.drafts:
+            self._draft_rows(step_input.requests, requests, plan, meta, h, first)
+        return StepOutput(tokens)
 
     def _run_layer(self, layer: int, rows: int, h, meta):
         assert self.weights is not None
@@ -594,9 +609,12 @@ class QwenPrefillStage:
         (h,) = self._ops[key](hidden)
         return h
 
-    def _first_tokens(self, batch, requests, plan, h) -> torch.Tensor:
+    def _first_tokens(
+        self, batch, requests, plan, h
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Greedy first tokens (``[batch, 1]``; -1 for requests that did not
-        finish their prompt this step) from the vocabulary-sharded LM head."""
+        finish their prompt this step) from the vocabulary-sharded LM head,
+        and every batch row's ``[max_num_seqs]`` before that mask."""
         count = self.config.max_num_seqs
         # Row ``b``: the local row of request ``b``'s last token on this core
         # (-1 where another core holds it, or no prompt finished).
@@ -655,9 +673,71 @@ class QwenPrefillStage:
             torch.from_numpy(owner).to("tpu"),
         )
         keep = torch.from_numpy(finished).to("tpu")
-        return torch.where(keep, tokens, torch.full_like(tokens, -1))[
-            : max(len(batch), 1), None
-        ]
+        chosen = torch.where(keep, tokens, torch.full_like(tokens, -1))
+        return chosen[: max(len(batch), 1), None], tokens
+
+    def _draft_rows(self, batch, requests, plan, meta, h, first) -> None:
+        """Write the MTP layer's KV of the step's rows (``layers.mtp_draft_rows``):
+        each row's next token is the prompt's, or for the last row of a prompt
+        finished this step its first token (``first``, by batch row)."""
+        tokens = np.zeros(plan.rows, np.int32)
+        slots = np.full(plan.rows, -1, np.int32)
+        row = {id(r): b for b, r in enumerate(batch)}
+        for local, f in enumerate(plan.core_rows(self.core)):
+            i = plan.request[f]
+            if i < 0:
+                continue
+            r, following = requests[i], plan.position[f] + 1
+            if following < r.num_tokens:
+                tokens[local] = r.token_ids[following]
+            else:
+                slots[local] = row[id(r)]
+        rows = plan.rows
+        key = ("mtp", rows)
+        assert self.weights is not None and self.weights.mtp is not None
+        names = tuple(sorted(self.weights.mtp))
+        if key not in self._ops:
+            g, mesh = self._geometry(rows), self.mesh
+
+            def run(h, pool, embedding, final_norm, *args):
+                w = dict(zip(names, args[: len(names)], strict=True))
+                w.update(embedding=embedding, final_norm=final_norm)
+                tokens, slots, first, positions = args[len(names) : len(names) + 4]
+                attention_plan = args[len(names) + 4 :]
+                meta = {"positions": positions}
+                return (
+                    qlayers.mtp_draft_rows(
+                        g, mesh, h, w, pool, meta, attention_plan, tokens, slots, first
+                    ),
+                )
+
+            self._ops[key] = register_global_op(
+                f"pallas::qwen38_prefill_mtp_r{rows}",
+                mesh,
+                run,
+                (P(AXIS), P(AXIS), P(), P())
+                + (P(),) * len(names)
+                + (P(AXIS), P(AXIS), P(), P(AXIS))
+                + PLAN_SPECS,
+                (P(AXIS),),
+                donate_argnums=(1,),
+            )
+        pool = self._pools[MTP_LAYER]
+        attention_layer = next(i for i in self.layers if is_full_attention(i))
+        (new_pool,) = self._ops[key](
+            h,
+            pool,
+            self.weights.embedding,
+            self.weights.final_norm,
+            *(self.weights.mtp[n] for n in names),
+            torch.from_numpy(tokens).to("tpu"),
+            torch.from_numpy(slots).to("tpu"),
+            first,
+            meta["positions"],
+            *self.layer_plan(attention_layer, rows, meta),
+        )
+        if new_pool is not pool:
+            pool.set_(new_pool)
 
 
 def copy_state_blocks(pool, src, dst, block_tokens: int):
