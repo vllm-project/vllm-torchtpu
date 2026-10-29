@@ -1092,6 +1092,54 @@ class Qwen4ExpWholeStepShadowModel(nn.Module):
         "valid_tokens": 0,
     }
 )
+class Qwen4ExpSegmentShadowModel(nn.Module):
+    """`check=N`: the segment program over write-free kernels. Its own class and forward: a
+    second ``Qwen4ExpSegmentModel`` instance would share the served program's compiled graph."""
+
+    def __init__(self, *, vllm_config, prefix: str = "", backbone, segments) -> None:
+        super().__init__()
+        self.prefix = prefix
+        self.backbone = backbone
+        self.segments = segments
+
+    def forward(
+        self,
+        input_ids,
+        positions,
+        inputs_embeds=None,
+        *,
+        query_start_loc,
+        ngram_context,
+        state_slots,
+        context_lens,
+        valid_tokens,
+        main_block_table,
+        compressed_block_table,
+    ):
+        shadow_backbone = self.backbone
+        return type(shadow_backbone).forward_segments(
+            shadow_backbone,
+            input_ids,
+            positions,
+            self.segments,
+            query_start_loc=query_start_loc,
+            ngram_context=ngram_context,
+            state_slots=state_slots,
+            context_lens=context_lens,
+            valid_tokens=valid_tokens,
+            main_block_table=main_block_table,
+            compressed_block_table=compressed_block_table,
+        )
+
+
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "inputs_embeds": 0,
+        "valid_tokens": 0,
+    }
+)
 class Qwen4ExpSegmentCutModel(nn.Module):
     """`wholecheck` reference: the segment program over write-free kernels, stopped at the
     residual entering the last QSA layer (``segments.stop_before_last``)."""
