@@ -518,6 +518,29 @@ def _substitute_placeholder_token(
 _substitute_placeholder_token_static = _static_shape_args(_substitute_placeholder_token)
 
 
+def _subtract_num_rejected_tokens_compiled(*args):
+    """VLLM_TPU_SUBTRACT_REJECTED_COMPILED: the async-spec rejected-count
+    correction as one program instead of ~10 eager dispatches per step."""
+    global _subtract_num_rejected_tokens_fn
+    if _subtract_num_rejected_tokens_fn is None:
+        from vllm_torchtpu.runner.tpu_runner_async_output import (
+            subtract_num_rejected_tokens,
+        )
+
+        _subtract_num_rejected_tokens_fn = _static_shape_args(
+            torch.compile(
+                subtract_num_rejected_tokens,
+                backend="tpu",
+                fullgraph=True,
+                dynamic=False,
+            )
+        )
+    return _subtract_num_rejected_tokens_fn(*args)
+
+
+_subtract_num_rejected_tokens_fn = None
+
+
 logger = init_logger(__name__)
 
 
@@ -3299,7 +3322,12 @@ class TPUModelRunner(GPUModelRunner):
                     seq_idx_np[i] = pos
                     pos_idx_np[acc : acc + n_sched] = pos
                 acc += n_sched
-            seq_lens, self.position_ids = subtract_num_rejected_tokens(
+            subtract = (
+                _subtract_num_rejected_tokens_compiled
+                if envs.VLLM_TPU_SUBTRACT_REJECTED_COMPILED
+                else subtract_num_rejected_tokens
+            )
+            seq_lens, self.position_ids = subtract(
                 seq_lens,
                 self.position_ids,
                 self._pre_async_results.spec_decode_num_rejected_tokens,
@@ -6967,6 +6995,7 @@ class TPUModelRunner(GPUModelRunner):
             self._precompile_sampling_subgraphs()
             self._precompile_pooler_subgraphs()
             self._precompile_mamba_rollback_helpers()
+            self._precompile_subtract_rejected()
             precompile_inputs = getattr(
                 self.model_adapter, "precompile_fused_inputs", None
             )
@@ -7288,6 +7317,53 @@ class TPUModelRunner(GPUModelRunner):
                 n *= 4
             for raws in raw_sets.values():
                 synchronize_tensors(raws)
+
+    def _precompile_subtract_rejected(self) -> None:
+        """VLLM_TPU_SUBTRACT_REJECTED_COMPILED: compile the rejected-count
+        correction for steady spec decode at every request bucket: the previous
+        step's padded rows, this step's request slots, and the token bucket
+        that holds `rows * (1 + K)` verify tokens. Other combinations (e.g. a
+        prefill joining) compile on first use."""
+        if not (
+            envs.VLLM_TPU_SUBTRACT_REJECTED_COMPILED
+            and self.speculative_config
+            and self.scheduler_config.async_scheduling
+        ):
+            return
+        width = 1 + self.speculative_config.num_speculative_tokens
+        targets = {
+            n
+            for n in (self.num_reqs_max_model_len, self.num_reqs_most_model_len)
+            if n
+        }
+        with self._precompile_timed("async-spec rejected-count correction"):
+            rows = MIN_NUM_SEQS
+            while True:
+                rows = min(rows, self.max_num_reqs)
+                if rows * width <= self.num_tokens_paddings[-1]:
+                    tokens = _get_padded_token_len(
+                        self.num_tokens_paddings, rows * width
+                    )
+                    num_rejected = torch.zeros(rows, dtype=torch.int32).to(self.device)
+                    positions = torch.zeros(tokens, dtype=torch.int32).to(self.device)
+                    pos_idx = torch.full((tokens,), -1, dtype=torch.int32).to(
+                        self.device
+                    )
+                    for target in targets:
+                        seq_lens = torch.zeros(target, dtype=torch.int32).to(
+                            self.device
+                        )
+                        seq_idx = torch.full((target,), -1, dtype=torch.int32).to(
+                            self.device
+                        )
+                        synchronize_tensors(
+                            _subtract_num_rejected_tokens_compiled(
+                                seq_lens, positions, num_rejected, seq_idx, pos_idx
+                            )
+                        )
+                if rows >= self.max_num_reqs:
+                    break
+                rows *= 2
 
     def _precompile_mamba_rollback_helpers(self) -> None:
         """Warm the compiled rollback scatters at every bucket length.
