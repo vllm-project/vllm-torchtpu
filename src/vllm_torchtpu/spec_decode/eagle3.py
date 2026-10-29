@@ -116,6 +116,28 @@ def _maybe_pad_dim1(t: torch.Tensor, target_len: int) -> torch.Tensor:
     return torch.nn.functional.pad(t, (0, target_len - n))
 
 
+def _repeat_last_rows(num_rows: int, p: int) -> np.ndarray:
+    """`[max(p, num_rows)]` row ids `0..num_rows-1`, then `num_rows-1` repeated."""
+    return np.minimum(np.arange(max(p, num_rows), dtype=np.int64), num_rows - 1)
+
+
+def _padded_device_seed(
+    last_token_indices_np: np.ndarray,
+    device_seed: torch.Tensor,
+    start: int,
+    rows: np.ndarray,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Bootstrap seed position and token per row of `rows` (see
+    `_repeat_last_rows`): the index pad is built on the host, the token pad
+    is one gather keyed on `len(rows)` instead of a per-num_reqs slice."""
+    last_token_indices = torch.from_numpy(last_token_indices_np[rows]).to(device)
+    next_token_ids = device_seed.index_select(
+        0, torch.from_numpy(start + rows).to(device)
+    ).to(torch.int32)
+    return last_token_indices, next_token_ids
+
+
 def _async_draft_seed_impl(
     next_tokens: torch.Tensor,
     num_draft: torch.Tensor,
@@ -1811,7 +1833,9 @@ class Eagle3Proposer:
         )
         # The async (next_tokens_device) path recomputes last_token_indices
         # fully on-device below, only the sync / device_seed paths consume this H2D.
-        if next_tokens_device is None:
+        # Under VLLM_TPU_PAD_EAGER_GLUE the device_seed path uploads a padded copy.
+        pad_seed = envs.VLLM_TPU_PAD_EAGER_GLUE and device_seed is not None
+        if next_tokens_device is None and not pad_seed:
             last_token_indices = torch.from_numpy(last_token_indices_np).to(
                 runner.device
             )
@@ -1956,10 +1980,37 @@ class Eagle3Proposer:
             # num_rejected_np is zeros) and last_token_indices = qsl_end-1 (set
             # above) is the last prompt position -- the correct prefill seed.
             num_rejected_out = num_rejected_np
-            next_token_ids = device_seed[start : start + num_reqs].to(torch.int32)
+            if pad_seed:
+                # Pad the seed scatter to the loop bucket p (a precompiled
+                # (T, p) key) by repeating the last real request, as the sync
+                # path does: the padded rows re-write its seed to its own slot.
+                rows = _repeat_last_rows(num_reqs, self._loop_bucket(num_reqs))
+                last_token_indices, next_token_ids = _padded_device_seed(
+                    last_token_indices_np, device_seed, start, rows, runner.device
+                )
+            else:
+                next_token_ids = device_seed[start : start + num_reqs].to(torch.int32)
             # Partial-prefill (discard) reqs: override seed from host req_state.
             ov_i = [i for i in range(num_reqs) if (start + i) in discard_set]
-            if ov_i:
+            if ov_i and pad_seed:
+                # Override every padded row that repeats an overridden request.
+                ov_tok = {
+                    i: runner.requests[req_ids[i]].get_token_id(
+                        runner.requests[req_ids[i]].num_computed_tokens
+                        + scheduler_output.num_scheduled_tokens[req_ids[i]]
+                    )
+                    for i in ov_i
+                }
+                ov_rows = [j for j, i in enumerate(rows.tolist()) if i in ov_tok]
+                next_token_ids = next_token_ids.clone()
+                next_token_ids[
+                    torch.tensor(ov_rows, dtype=torch.long, device=runner.device)
+                ] = torch.tensor(
+                    [ov_tok[int(rows[j])] for j in ov_rows],
+                    dtype=next_token_ids.dtype,
+                    device=runner.device,
+                )
+            elif ov_i:
                 next_token_ids = next_token_ids.clone()
                 ov_v = [
                     runner.requests[req_ids[i]].get_token_id(
@@ -2018,7 +2069,8 @@ class Eagle3Proposer:
         else:
             # Async: the seed scatter runs at the sampler's padded request
             # width (bucket-shaped, see above). Bootstrap: it stays real
-            # [num_reqs]. Pad just the returned gather index.
+            # [num_reqs] (padded to p above under VLLM_TPU_PAD_EAGER_GLUE).
+            # Pad just the returned gather index.
             draft_input_ids = self._draft_seed_input_ids(
                 chunk.input_ids, last_token_indices, next_token_ids
             )
@@ -2665,6 +2717,12 @@ class Eagle3Proposer:
                     nti = torch.zeros(p, dtype=torch.int32).to(runner.device)
                     out = self._draft_seed_input_ids(ids, lti, nti)
                     synchronize_tensors(out)
+                    if envs.VLLM_TPU_PAD_EAGER_GLUE and self._draft_rows:
+                        # The row-selected step 0's position carry, at the
+                        # same (T, p) keys.
+                        pos = torch.zeros(T, dtype=torch.int32).to(runner.device)
+                        out = self._draft_gather_positions(pos, lti)
+                        synchronize_tensors(out)
 
     def _precompile_compute_logits(self) -> None:
         from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len

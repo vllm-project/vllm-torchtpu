@@ -2947,3 +2947,184 @@ def test_mtp_draft_borrows_target_head_before_loading_weights(
     assert seen["names"] == expected
     assert processed == [proposer.draft_model]
     assert "load_weights" not in proposer.draft_model.__dict__
+
+
+# VLLM_TPU_PAD_EAGER_GLUE: the device_seed bootstrap pads its seed scatter to
+# the loop bucket, and _precompile_draft_seed warms _draft_gather_positions.
+
+_GLUE_TOKEN_PADDINGS = [8, 16, 32, 64, 128]
+
+
+_CPU = torch.device("cpu")
+
+
+def _eager(proposer, name):
+    """`proposer.<name>` without its tpu-backend torch.compile wrapper, which
+    cannot run on CPU tensors."""
+    import inspect
+    import types
+
+    return types.MethodType(inspect.unwrap(getattr(Eagle3Proposer, name)), proposer)
+
+
+def _bootstrap_case(rng, num_reqs, start, discard, device):
+    """A prefill chunk of `num_reqs` requests (random prompt lengths) at batch
+    offset `start`, a flat device seed covering more requests than the chunk,
+    and a runner whose requests answer the partial-prefill override."""
+    lens = rng.integers(1, 6, num_reqs)
+    qsl = np.concatenate([[0], np.cumsum(lens)]).astype(np.int32)
+    num_tokens = next(t for t in _GLUE_TOKEN_PADDINGS if t >= qsl[-1])
+    req_ids = [f"r{i}" for i in range(start + num_reqs)]
+    requests = {
+        rid: SimpleNamespace(
+            num_computed_tokens=int(i),
+            get_token_id=lambda n, i=i: 5000 + 10 * i + n,
+        )
+        for i, rid in enumerate(req_ids)
+    }
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(req_ids=req_ids),
+        device=device,
+        requests=requests,
+        num_tokens_paddings=_GLUE_TOKEN_PADDINGS,
+        _dp_lockstep_enabled=lambda: False,
+    )
+    if device.type == "cpu":
+        proposer._draft_seed_input_ids = _eager(proposer, "_draft_seed_input_ids")
+    chunk = _make_chunk(
+        input_ids=torch.from_numpy(
+            rng.integers(1, 1000, num_tokens, dtype=np.int32)
+        ).to(device),
+        position_ids=torch.arange(num_tokens, dtype=torch.int32, device=device),
+        query_start_loc_np=qsl,
+        start_index=start,
+        num_reqs=num_reqs,
+        device=device,
+    )
+    device_seed = torch.from_numpy(
+        rng.integers(1, 1000, start + num_reqs + 3, dtype=np.int32)
+    ).to(device)
+    discard_idx = (
+        sorted({start + num_reqs - 1, start + int(rng.integers(num_reqs))})
+        if discard
+        else []
+    )
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={rid: 2 for rid in req_ids},
+        scheduled_spec_decode_tokens={},
+    )
+    return proposer, chunk, device_seed, discard_idx, scheduler_output
+
+
+def _run_bootstrap(monkeypatch, case, flag: bool):
+    monkeypatch.setenv("VLLM_TPU_PAD_EAGER_GLUE", "1" if flag else "0")
+    proposer, chunk, device_seed, discard_idx, scheduler_output = case
+    return proposer._prepare_draft_inputs(
+        chunk,
+        sampled_token_ids=[],
+        discard_sampled_tokens_req_indices=discard_idx,
+        num_rejected_tokens_np=None,
+        scheduler_output=scheduler_output,
+        device_seed=device_seed,
+    )
+
+
+def _bootstrap_outputs_equal(monkeypatch, num_reqs, start, discard, seed, device):
+    rng = np.random.default_rng(seed)
+    case = _bootstrap_case(rng, num_reqs, start, discard, device)
+    ref = _run_bootstrap(monkeypatch, case, flag=False)
+    out = _run_bootstrap(monkeypatch, case, flag=True)
+    assert out[1] is ref[1]
+    assert np.array_equal(out[3], ref[3])
+    return all(
+        a.dtype == b.dtype and torch.equal(a.cpu(), b.cpu())
+        for a, b in ((out[0], ref[0]), (out[2], ref[2]))
+    )
+
+
+@pytest.mark.parametrize("discard", [False, True])
+@pytest.mark.parametrize("start", [0, 3])
+@pytest.mark.parametrize("num_reqs", [1, 2, 5, 8, 9, 13, 17])
+def test_device_seed_bootstrap_padded_matches_unpadded(
+    monkeypatch, device, num_reqs, start, discard
+):
+    for seed in range(3):
+        assert _bootstrap_outputs_equal(
+            monkeypatch, num_reqs, start, discard, seed, device
+        )
+
+
+def test_device_seed_bootstrap_padded_seed_scatter_keys(monkeypatch):
+    """Flag off, the seed scatter's (T, len(index)) key follows num_reqs; flag
+    on, the index length is always a loop bucket."""
+    keys = {False: set(), True: set()}
+    for flag in (False, True):
+        for num_reqs in range(1, 25):
+            case = _bootstrap_case(
+                np.random.default_rng(num_reqs), num_reqs, 0, False, _CPU
+            )
+            proposer = case[0]
+            seed_input_ids = proposer._draft_seed_input_ids
+
+            def recorded(ids, lti, nti, flag=flag, fn=seed_input_ids):
+                assert lti.shape == nti.shape
+                keys[flag].add((ids.shape[0], lti.shape[0]))
+                return fn(ids, lti, nti)
+
+            proposer._draft_seed_input_ids = recorded
+            _run_bootstrap(monkeypatch, case, flag)
+    assert {p for _, p in keys[False]} == set(range(1, 25))
+    assert {p for _, p in keys[True]} <= set(_GLUE_TOKEN_PADDINGS)
+    assert len(keys[True]) < len(keys[False])
+
+
+def test_device_seed_bootstrap_padded_fault_control(monkeypatch):
+    """A seed pad that does not repeat the last request's token makes the
+    padded scatter write a different value to that slot, and the equality
+    check above catches it."""
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+
+    padded_device_seed = e3._padded_device_seed
+
+    def wrong_pad(lti_np, device_seed, start, rows, device):
+        lti, nti = padded_device_seed(lti_np, device_seed, start, rows, device)
+        n = int(rows.max()) + 1
+        return lti, torch.cat([nti[:n], nti[n:] + 1])
+
+    monkeypatch.setattr(e3, "_padded_device_seed", wrong_pad)
+    results = [
+        _bootstrap_outputs_equal(monkeypatch, num_reqs, 0, False, 0, _CPU)
+        for num_reqs in (5, 9, 13)
+    ]
+    assert not any(results)
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_precompile_draft_seed_warms_gather_positions(monkeypatch, flag):
+    monkeypatch.setenv("VLLM_TPU_PAD_EAGER_GLUE", "1" if flag else "0")
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer.runner = SimpleNamespace(
+        device="cpu",
+        max_num_reqs=24,
+        num_reqs_paddings=[8, 16, 32],
+        num_tokens_paddings=_GLUE_TOKEN_PADDINGS,
+        _precompile_timed=lambda _name: contextlib.nullcontext(),
+    )
+    proposer._draft_rows = True
+    seed_keys, gather_keys = set(), set()
+
+    def seed(ids, lti, nti):
+        seed_keys.add((ids.shape[0], lti.shape[0]))
+        return ids
+
+    def gather(positions, indices):
+        assert positions.dtype == torch.int32 and indices.dtype == torch.int64
+        gather_keys.add((positions.shape[0], indices.shape[0]))
+        return positions
+
+    proposer._draft_seed_input_ids = seed
+    proposer._draft_gather_positions = gather
+    proposer._precompile_draft_seed()
+    assert seed_keys
+    assert gather_keys == (seed_keys if flag else set())

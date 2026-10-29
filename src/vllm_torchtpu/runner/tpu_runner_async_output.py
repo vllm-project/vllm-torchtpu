@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import functools
 import threading
 from dataclasses import dataclass, field
 from typing import Any
@@ -340,6 +341,92 @@ def subtract_num_rejected_tokens(
         pos_subtract = pos_subtract.unsqueeze(0)
     positions = positions - pos_subtract
     return seq_lens, positions
+
+
+def _pad_num_rejected_impl(num_rejected: torch.Tensor, pad_len: int) -> torch.Tensor:
+    return torch.nn.functional.pad(num_rejected, (0, pad_len - num_rejected.shape[0]))
+
+
+def _subtract_seq_lens_impl(
+    seq_lens: torch.Tensor,
+    num_rejected: torch.Tensor,
+    seq_lens_subtract_indices: torch.Tensor,
+) -> torch.Tensor:
+    zero = num_rejected.new_zeros(())
+    seq_subtract = torch.where(
+        seq_lens_subtract_indices >= 0,
+        num_rejected[seq_lens_subtract_indices.clamp(min=0)],
+        zero,
+    )
+    return seq_lens - seq_subtract
+
+
+def _subtract_positions_impl(
+    positions: torch.Tensor,
+    num_rejected: torch.Tensor,
+    positions_subtract_indices: torch.Tensor,
+) -> torch.Tensor:
+    zero = num_rejected.new_zeros(())
+    pos_subtract = torch.where(
+        positions_subtract_indices >= 0,
+        num_rejected[positions_subtract_indices.clamp(min=0)],
+        zero,
+    )
+    if positions.ndim == 2:  # mrope
+        pos_subtract = pos_subtract.unsqueeze(0)
+    return positions - pos_subtract
+
+
+@functools.cache
+def _padded_subtract_programs():
+    # Built on first TPU use: eagle3 (for _static_shape_args) imports the
+    # model stack, which this module must not pull in at import time.
+    from vllm_torchtpu.spec_decode.eagle3 import _static_shape_args
+
+    compile_static = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    return tuple(
+        _static_shape_args(compile_static(fn))
+        for fn in (
+            _pad_num_rejected_impl,
+            _subtract_seq_lens_impl,
+            _subtract_positions_impl,
+        )
+    )
+
+
+def subtract_num_rejected_tokens_padded(
+    seq_lens: torch.Tensor,
+    positions: torch.Tensor,
+    num_rejected: torch.Tensor,
+    seq_lens_subtract_indices: torch.Tensor,
+    positions_subtract_indices: torch.Tensor,
+    pad_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`subtract_num_rejected_tokens` as three static-shape programs
+    (VLLM_TPU_PAD_EAGER_GLUE).
+
+    The fused eager version is keyed on (len(seq_lens), len(positions),
+    len(num_rejected)) -- the request bucket times the token bucket times the
+    previous step's unpadded request count -- so serving keeps reaching new
+    keys. Here `num_rejected` is zero-padded to `pad_len` (keyed on its own
+    length only), then the seq_lens half is keyed on the request bucket and
+    the positions half on the token bucket. Every index is below the unpadded
+    length, so the padding is never read and the result is unchanged.
+    """
+    if num_rejected.device.type == "tpu":
+        pad, sub_seq, sub_pos = _padded_subtract_programs()
+    else:  # the tpu backend cannot trace CPU tensors (unit tests)
+        pad, sub_seq, sub_pos = (
+            _pad_num_rejected_impl,
+            _subtract_seq_lens_impl,
+            _subtract_positions_impl,
+        )
+    if num_rejected.shape[0] < pad_len:
+        num_rejected = pad(num_rejected, pad_len)
+    return (
+        sub_seq(seq_lens, num_rejected, seq_lens_subtract_indices),
+        sub_pos(positions, num_rejected, positions_subtract_indices),
+    )
 
 
 def extract_draft_token_ids(
