@@ -14,6 +14,7 @@
 
 import math
 from collections.abc import Sequence
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Protocol, TypedDict, cast
 
 import torch
@@ -28,6 +29,7 @@ from vllm_torchtpu.gdn_pool_layout import (
 )
 from vllm_torchtpu.kernels.gdn.head_geometry import derive_gdn_head_geometry
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.megakernel_runtime import _is_megakernel_requested
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -389,6 +391,9 @@ def _derive_tpu_block_slot_config(
     block_size_source = "input_block_size"
     if mamba_layout is not None:
         mamba_fit_block_size = mamba_layout.required_tokens * fa_pool_row_tokens
+        if _is_megakernel_requested(SimpleNamespace(vllm_config=vllm_config)):
+            # PoolLayout reserves 5 pages of 128 tokens (640 tokens) per Mamba slot.
+            mamba_fit_block_size = max(mamba_fit_block_size, 640)
         if vllm_config.cache_config.user_specified_block_size:
             user_block_size_floor = input_block_size
         block_size_floor = max(

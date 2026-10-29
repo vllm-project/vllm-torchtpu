@@ -63,12 +63,12 @@ def qwen38_baseline_tiles(B: int, *, moe_tp: bool = False, R: int = 32) -> Tiles
 
 
 def tp32_dcp8_tiles(B: int, *, moe_tp: bool = False, R: int = 32) -> Tiles:
-    """Qwen3.8 TP32xDCP8 tiles with recursive-doubling (`hier=3`) all-reduce
+    """Qwen3.8 TP32xDCP8 tiles with two-level (`hier=4, hier_group=8`) all-reduce
     at `R=32`.
     """
     t = qwen38_baseline_tiles(B, moe_tp=moe_tp, R=R)
-    if R == 32 and B <= 16:
-        return dataclasses.replace(t, hier=3, rsag=False)
+    if R == 32 and B <= 32:
+        return dataclasses.replace(t, hier=4, hier_group=8, rsag=False)
     return t
 
 
