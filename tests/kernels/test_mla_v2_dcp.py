@@ -345,3 +345,144 @@ def test_decode_merge_matches_reference_tpu(d, b):
     ref = reference(case)
     assert np.abs(got - ref).max() < 2e-2, np.abs(got - ref).max()
     check_caches(case, caches, d=d, interleave=PAGE)
+
+
+def make_prefill_case(ctx, q_lens, *, d, heads, max_model_len, seed=0):
+    """A mixed step: `q_lens` new tokens after `ctx` cached ones per sequence,
+    1-token sequences first, as the runner orders them."""
+    ctx, q_lens = np.asarray(ctx), np.asarray(q_lens)
+    seq_lens = ctx + q_lens
+    case = make_case(
+        seq_lens,
+        d=d,
+        interleave=PAGE,
+        heads=heads,
+        pages_per_seq=-(-max_model_len // (PAGE * d)),
+        seed=seed,
+    )
+    # Keep only the context in the caches: overwrite the new tokens' slots.
+    rng = np.random.default_rng(seed + 1)
+    for s, (c, n) in enumerate(zip(ctx, seq_lens)):
+        ranks, pages, slots = locate(np.arange(c, n), case["table"][s], d, PAGE)
+        for r, page, slot in zip(ranks, pages, slots):
+            case["caches"][r][page, slot // PACK, slot % PACK] = _stale(rng, LANES)
+    rows = np.concatenate([kv[c:] for kv, c in zip(case["kv"], ctx)])
+    tokens = len(rows)
+    cu = np.concatenate([[0], np.cumsum(q_lens)]).astype(np.int32)
+    num_decode = int(np.sum(q_lens == 1))
+    assert np.all(q_lens[:num_decode] == 1) and np.all(q_lens[num_decode:] > 1)
+    case.update(
+        ql=_q(rng, (heads, tokens, LKV)),
+        qpe=_q(rng, (tokens, heads, R)),
+        new_kv_c=jnp.asarray(rows[:, :LKV]),
+        new_k_pe=jnp.asarray(rows[:, LKV : LKV + R]),
+        cu=jnp.asarray(cu),
+        distribution=jnp.asarray([num_decode, num_decode, len(ctx)], jnp.int32),
+        ctx=ctx,
+    )
+    return case
+
+
+def prefill_reference(case, chunk=512):
+    """Exact f32 causal attention of every new token: `[H, T, LKV]`."""
+    cu = np.asarray(case["cu"])
+    ql = case["ql"].astype(jnp.float32)
+    qpe = case["qpe"].astype(jnp.float32).transpose(1, 0, 2)
+    q = jnp.concatenate([ql, qpe], -1)  # [H, T, LKV + R]
+    out = np.zeros(ql.shape, np.float32)
+    for s, (kv, c) in enumerate(zip(case["kv"], case["ctx"])):
+        k = jnp.asarray(kv.astype(np.float32))
+        for t0 in range(cu[s], cu[s + 1], chunk):
+            t1 = min(t0 + chunk, cu[s + 1])
+            sc = jnp.einsum(
+                "htd,kd->htk", q[:, t0:t1], k[:, : LKV + R], precision="highest"
+            )
+            pos = c + (t0 - cu[s]) + jnp.arange(t1 - t0)
+            visible = jnp.arange(k.shape[0])[None, :] <= pos[:, None]
+            p = jax.nn.softmax(jnp.where(visible, sc * SM_SCALE, -jnp.inf), axis=-1)
+            o = jnp.einsum("htk,kd->htd", p, k[:, :LKV], precision="highest")
+            out[:, t0:t1] = np.asarray(o)
+    return out
+
+
+def run_prefill_ranks(case, *, d, max_model_len, kernel, **kernel_kwargs):
+    """`mla_prefill_dcp_local` with the all-gather done by concatenation."""
+    args = (case["seq_lens"], case["page_indices"], case["cu"], case["distribution"])
+    pool = jnp.concatenate(
+        [
+            dcp.prefill_pool_pages(
+                jnp.asarray(c), *args, dcp_size=d, max_model_len=max_model_len
+            )
+            for c in case["caches"]
+        ]
+    )
+    table, kv_lens = dcp.prefill_pool_table(
+        case["seq_lens"],
+        case["cu"],
+        case["distribution"],
+        page_size=PAGE,
+        dcp_size=d,
+        max_model_len=max_model_len,
+    )
+    out = kernel(
+        case["ql"],
+        case["qpe"],
+        case["new_kv_c"],
+        case["new_k_pe"],
+        pool,
+        kv_lens,
+        table,
+        case["cu"],
+        case["distribution"],
+        sm_scale=SM_SCALE,
+        **kernel_kwargs,
+    )[0]
+    first_prefill = int(np.asarray(case["cu"])[int(case["distribution"][0])])
+    return np.asarray(out.astype(jnp.float32))[:, first_prefill:], first_prefill
+
+
+@pytest.mark.parametrize("d", [1, 2, 4])
+def test_prefill_pool_matches_reference_with_kernel_model(d):
+    max_model_len = 4096
+    g = -(-max_model_len // (PAGE * d))
+    # Two decodes, a first chunk, and continuations whose contexts fill the
+    # pool's g rows: 1 + (g - 1).
+    big = (g - 2) * PAGE * d + 5
+    case = make_prefill_case(
+        [700, 40, 0, 200, big],
+        [1, 1, 200, 77, 31],
+        d=d,
+        heads=4,
+        max_model_len=max_model_len,
+    )
+    model = functools.partial(_kernel_model, return_lse=True)
+    got, start = run_prefill_ranks(case, d=d, max_model_len=max_model_len, kernel=model)
+    want = prefill_reference(case)[:, start:]
+    np.testing.assert_allclose(got, want, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("d", [8, 32])
+def test_prefill_pool_matches_reference_tpu(d):
+    from vllm_torchtpu.kernels.mla.v2.kernel import mla_ragged_paged_attention
+
+    max_model_len = 82432
+    case = make_prefill_case(
+        [5000, 70000, 40960, 0],
+        [1, 1, 2048, 2048],
+        d=d,
+        heads=3,
+        max_model_len=max_model_len,
+    )
+    kernel = functools.partial(
+        mla_ragged_paged_attention,
+        num_kv_pages_per_block=(3, 1, 4),  # the K3 TP32 serving tiles
+        num_queries_per_block=(1, 16, 512),
+        mixed_q_split=2,
+        vmem_limit_bytes=60 * 1024 * 1024,
+    )
+    got, start = run_prefill_ranks(
+        case, d=d, max_model_len=max_model_len, kernel=kernel
+    )
+    err = np.abs(got - prefill_reference(case)[:, start:]).max()
+    assert err < 2e-2, err
