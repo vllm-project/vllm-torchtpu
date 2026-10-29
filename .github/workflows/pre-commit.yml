@@ -5,9 +5,7 @@ on:
   push:
     branches:
       - main
-      - 'partner/**'
-      - 'release/**'
-      - 'releases/**'
+      - partner/release-0.0.1
 
 jobs:
   pre-commit:
