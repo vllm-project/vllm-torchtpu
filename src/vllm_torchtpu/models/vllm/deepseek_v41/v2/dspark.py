@@ -42,6 +42,7 @@ from .attention import (
     _cache_slots,
     _insert,
     _token_requests,
+    _uses_qa_rope,
     stage_attention_cache_scope,
 )
 from .attention_kernels import initialize_indexer, initialize_paged_attention
@@ -93,12 +94,16 @@ def _insert_context_kv(
     kv: torch.Tensor,
     positions: torch.Tensor,
     metadata,
+    *,
+    rotated: bool = False,
 ) -> None:
-    """Rotate and write normalized context KV rows into one draft layer's SWA cache."""
+    """Rotate (unless ``rotated``) and write normalized context KV rows into
+    one draft layer's SWA cache."""
     swa_cache = attn.swa_cache_layer.kv_cache
     if metadata is None or not swa_cache.numel():
         return
-    kv = attn._rotate(kv, positions)
+    if not rotated:
+        kv = attn._rotate(kv, positions)
     if isinstance(metadata, torch.Tensor):
         swa_slots = metadata
         swa_valid = swa_slots >= 0
@@ -266,10 +271,15 @@ class DSparkDeepseekV41Model(nn.Module):
             main_x = target_hidden_states
         for i, layer in enumerate(cast(Iterable[DeepseekV41DecoderLayer], self.layers)):
             attn = layer.attn
-            qr_kv = attn._fused_wqa_wkv_gemm(main_x)
-            _, _, kv = attn._split_qkv_and_norm(qr_kv)
+            rotated = False
+            if _uses_qa_rope(attn, main_x):
+                # kv-only: skips the qr columns, norm and projection.
+                _, kv, rotated = attn._qa_kv_norm_rope(main_x, positions, emit_qr=False)
+            else:
+                qr_kv = attn._fused_wqa_wkv_gemm(main_x)
+                _, _, kv = attn._split_qkv_and_norm(qr_kv)
             layer_md = None if metadata is None else metadata[i]
-            _insert_context_kv(attn, kv, positions, layer_md)
+            _insert_context_kv(attn, kv, positions, layer_md, rotated=rotated)
         return main_x
 
     def forward(
