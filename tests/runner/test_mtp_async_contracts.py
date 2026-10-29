@@ -382,3 +382,46 @@ def test_proposed_drafts_reach_next_inputs(device, k, mode):
     assert actual == expected, (
         "a non-verify chunk must carry its real proposals into the next step"
     )
+
+
+@pytest.mark.parametrize("bucketed", [False, True])
+def test_spec_tail_matches_per_chunk_assembly(monkeypatch, bucketed):
+    """VLLM_TPU_SPEC_TAIL_COMPILED: the one-chunk fused tail returns the same
+    source (padded to the bound), rejected counts, indices and draft counts as
+    the per-chunk assembly plus the pad in sample_tokens."""
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.runner import tpu_runner as runner_mod
+
+    k, num_reqs, rows, max_reqs = 3, 3, 4, 8
+    runner = object.__new__(TPUModelRunner)
+    runner.device = "cpu"
+    runner.max_num_reqs = max_reqs
+    runner.speculative_config = SimpleNamespace(num_speculative_tokens=k)
+    runner.drafter = SimpleNamespace(bucketed_drafts=bucketed)
+    next_tokens = torch.tensor(
+        [[11, 12, -1, -1], [21, -1, -1, -1], [31, 32, 33, 34], [-1, -1, -1, -1]],
+        dtype=torch.int32,
+    )
+    drafts = torch.arange(100, 100 + (rows if bucketed else num_reqs) * k).reshape(
+        -1, k
+    ).to(torch.int32)
+    state = SimpleNamespace(
+        num_reqs_list=[num_reqs],
+        spec_decode_metadata_list=[
+            SimpleNamespace(
+                draft_lengths=torch.tensor([3, 3, 3, 0], dtype=torch.int32),
+                draft_lengths_cpu=np.array([3, 3, 3, 0]),
+            )
+        ],
+    )
+    drafts_in = [drafts] if bucketed else drafts
+    monkeypatch.setattr(envs, "VLLM_TPU_SPEC_TAIL_COMPILED", False, raising=False)
+    ref = runner._assemble_async_spec_substitution(drafts_in, [next_tokens], state)
+    monkeypatch.setattr(envs, "VLLM_TPU_SPEC_TAIL_COMPILED", True, raising=False)
+    monkeypatch.setattr(runner_mod, "_spec_tail_compiled", runner_mod._spec_tail)
+    got = runner._assemble_async_spec_substitution(drafts_in, [next_tokens], state)
+    bound = max_reqs * (1 + k)
+    ref_src = torch.nn.functional.pad(ref[0][0], (0, bound - ref[0][0].shape[0]))
+    assert torch.equal(got[0][0], ref_src)
+    assert torch.equal(got[2], ref[2])
+    assert got[1] == ref[1] and got[3] == ref[3]
