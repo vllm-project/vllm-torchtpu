@@ -1111,11 +1111,27 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         assert ple is not None
         fn = self.__dict__.get("_ple_ids_fn")
         if fn is None:
-            fn = self._ple_ids_fn = _static_shape_args(
-                torch.compile(
-                    ple._lookup_ids, backend="tpu", fullgraph=True, dynamic=False
+            # Tensors as top-level arguments, so `_static_shape_args` strips the
+            # dynamic-dim stamps a backbone call may have left on them (inside
+            # a PLEInputs they would make dynamo trace a dynamic graph).
+            def lookup_ids(input_ids, query_start_loc, ngram_context, valid_tokens):
+                return ple._lookup_ids(
+                    PLEInputs(input_ids, query_start_loc, ngram_context), valid_tokens
                 )
+
+            compiled = _static_shape_args(
+                torch.compile(lookup_ids, backend="tpu", fullgraph=True, dynamic=False)
             )
+
+            def fn(inputs, valid_tokens):
+                return compiled(
+                    inputs.input_ids,
+                    inputs.query_start_loc,
+                    inputs.ngram_context,
+                    valid_tokens,
+                )
+
+            self._ple_ids_fn = fn
         starts = kwargs["query_start_loc"]
         return prelookup_rows(
             ple,
