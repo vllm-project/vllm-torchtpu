@@ -19,7 +19,13 @@ import pathlib
 
 import pytest
 
-from tests.megakernel.perf import ablate, compiler_stats, report, sweep
+from tests.megakernel.perf import (
+    ablate,
+    compiler_stats,
+    report,
+    sweep,
+    tpu_profile_interleaved_bench,
+)
 
 
 def test_toolchain_mismatch_returns_invalid_toolchain() -> None:
@@ -94,20 +100,25 @@ def test_plan_bucket_stats_exact_and_approx() -> None:
     assert 0 < st_exact["vmem_mib"] <= 62.0
     assert st_exact["smem_kib"] > 0
 
-    st_split = compiler_stats.plan_bucket_stats("qwen35-candidate30-fused", 4, 32)
-    assert st_split["numerics"] == "approx"
-    assert st_split["fits_vmem"] is True
-    assert st_split["FUSED"] is False
-    assert st_split["GPR"] is True
-
-    st_fused = compiler_stats.plan_bucket_stats(
-        "qwen35-candidate30-fused", 4, 32, fused_pool_io_max_b=64
-    )
+    st_fused = compiler_stats.plan_bucket_stats("qwen35-candidate30-fused", 4, 32)
+    assert st_fused["numerics"] == "approx"
     assert st_fused["fits_vmem"] is True
     assert st_fused["FUSED"] is True
     assert st_fused["GPR"] is False
     assert st_fused["GCH"] is True
+
+    st_split = compiler_stats.plan_bucket_stats(
+        "qwen35-candidate30-fused", 4, 32, fused_pool_io_max_b=24
+    )
+    assert st_split["fits_vmem"] is True
+    assert st_split["FUSED"] is False
+    assert st_split["GPR"] is True
     assert st_fused["vmem_mib"] < st_split["vmem_mib"]
+
+    st_b48 = compiler_stats.plan_bucket_stats("qwen35-candidate30-fused", 4, 48)
+    assert st_b48["fits_vmem"] is True
+    assert st_b48["FUSED"] is True
+    assert (st_b48["tiles"]["nbe"], st_b48["tiles"]["nkv"]) == (16, 4)
 
 
 def test_parse_and_diff_llo_dump_dir(tmp_path: pathlib.Path) -> None:
@@ -304,3 +315,24 @@ def test_no_frozen_references_in_owned_files() -> None:
         txt = p.read_text(encoding="utf-8")
         for token in forbidden:
             assert token not in txt, f"Forbidden reference {token!r} found in {p}"
+
+
+def test_profile_interleaved_bench_variants_and_pair_summary() -> None:
+    """Verify interleaved profile variant builder and paired statistics helper."""
+    import dataclasses
+
+    import vllm_torchtpu.megakernel as mk
+    from vllm_torchtpu.megakernel.exec_spec import ExecSpec
+    from vllm_torchtpu.megakernel.models import qwen35
+
+    tpu_profile_interleaved_bench.test_profile_interleaved_helper_unit()
+
+    g = dataclasses.replace(qwen35.FULL_EP, L=4, att_every=4)
+    spec = qwen35.qwen35_spec(g)
+    base = ExecSpec(
+        R=8, ctx=4096, stack_e=True, cache=mk.CacheExec(paged_kv=True, num_pages=4096)
+    )
+    v_t4_b12 = tpu_profile_interleaved_bench.build_bucket_variants(
+        spec, base, T=4, B=12
+    )
+    assert all(num == "approx" for _, _, _, num in v_t4_b12)

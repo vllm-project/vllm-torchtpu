@@ -20,8 +20,10 @@ Enables the Qwen3.5 performance flags (`pipe_ep`, `gdn_head_major`, `gqa_qv`,
 `moe_unroll`, `rel_fetch`, `kv_sub=1024`, `route_vec`, `dense_acc_pair`,
 `pair_kv`, `kv_ering`, `gq_pack`, `topk_lanes`, `dmm_unroll=8`, `ecopy_opt=1`,
 `r2_direct_store`), deeper EP expert rings, and `pool_gather="auto"`.
-Fused pool I/O stays off here (experimental); `qwen35-candidate30-fused` is
-the same tuning with `fused_pool_io="auto"`.
+Fused pool I/O stays off here (experimental); `qwen35-candidate30-fused` builds
+on this tuning with 1-launch fused pool I/O across `B <= 48` and `B >= 56`
+(`fused_pool_io="auto", fused_pool_io_max_b=48`), `nbe=16, nkv=4` at
+`32 < B <= 48` (EP), and `pool_gather=True` fallback.
 """
 
 from __future__ import annotations
@@ -87,6 +89,14 @@ def candidate30_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
     return t
 
 
+def candidate30_fused_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
+    """Tiles for `qwen35-candidate30-fused` (`nbe=16, nkv=4` at `32 < B <= 48` EP)."""
+    t = candidate30_tiles(B, moe_tp=moe_tp, R=R)
+    if 32 < B <= 48 and not moe_tp:
+        t = dataclasses.replace(t, nbe=16).with_modules({_GQA: {"nkv": 4}})
+    return t
+
+
 _DESCRIPTION = (
     "Tuned Qwen3.5 schedule: kv_sub=1024, route_vec, "
     "dense_acc_pair, pair_kv, KVE, QV/GQ, Batcher top-k, unrolled experts "
@@ -106,15 +116,23 @@ PROFILE = register_profile(
     )
 )
 
-# The same tiles plus selective 1-launch fused pool I/O (`auto`: B <= 24 or
-# B >= 56). Fused pool I/O stays experimental: it requires pool
-# donation (enforced) and the driver IR-checks every fused bucket.
+# Selective 1-launch fused pool I/O profile (`auto` with `fused_pool_io_max_b=48`,
+# covering `B <= 48` and `B >= 56`), deeper expert/KV staging (`nbe=16, nkv=4`) on
+# `32 < B <= 48` (EP), and `pool_gather=True` fallback when fused pool I/O is
+# disabled. Requires pool donation (enforced) and driver IR verification on every
+# fused bucket.
 FUSED_PROFILE = register_profile(
     dataclasses.replace(
         PROFILE,
         name="qwen35-candidate30-fused",
+        tiles=candidate30_fused_tiles,
         fused_pool_io="auto",
-        description=_DESCRIPTION + " Plus experimental fused pool I/O (auto).",
+        fused_pool_io_max_b=48,
+        pool_gather=True,
+        description=(
+            _DESCRIPTION + " Plus experimental fused pool I/O (auto, max_b=48), "
+            "nbe=16/nkv=4 at 32<B<=48 EP, and GPR where eligible."
+        ),
     )
 )
 
@@ -122,5 +140,6 @@ __all__ = [
     "CONV_STAGE_MIN_B",
     "FUSED_PROFILE",
     "PROFILE",
+    "candidate30_fused_tiles",
     "candidate30_tiles",
 ]

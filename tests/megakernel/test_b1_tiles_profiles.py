@@ -107,7 +107,21 @@ def test_profile_numerics_are_derived_and_enforced():
     }
     fused = mk.get_profile("qwen35-candidate30-fused")
     assert fused.numerics == "approx" and fused.fused_pool_io == "auto"
-    assert set(profile_mod.approx_features(fused)) == feats | {"fused_pool_io"}
+    assert fused.fused_pool_io_max_b == 48 and fused.pool_gather is True
+    assert set(profile_mod.approx_features(fused)) == feats | {
+        "fused_pool_io",
+        "pool_gather_eligible",
+    }
+    for b in (40, 48):
+        tf = fused.tiles_for(b, R=8, moe_tp=False)
+        assert (tf.nbe, tf.module("gqa").nkv) == (16, 4)
+        assert fused.tiles_for(b, R=8, moe_tp=True) == c30.tiles_for(
+            b, R=8, moe_tp=True
+        )
+    for b in (4, 8, 12, 16, 20, 24, 32, 56, 64):
+        assert fused.tiles_for(b, R=8, moe_tp=False) == c30.tiles_for(
+            b, R=8, moe_tp=False
+        )
 
     # A profile declared exact that turns on an approx feature is rejected.
     def _kv_sub_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> mk.Tiles:
@@ -575,3 +589,122 @@ def test_gq_pack_without_gqa_qv_is_config_error():
     )
     with pytest.raises(mk.MegakernelConfigError, match="gq_pack requires gqa_qv"):
         mk.planner.plan(qwen35.qwen35_spec(_geom()), ex)
+
+
+@pytest.mark.parametrize(
+    "B,seed,exp_nbe,exp_nkv",
+    [
+        (32, 1, 12, 3),
+        (40, 0, 16, 4),
+    ],
+)
+def test_candidate30_fused_mid_buckets_vs_split(
+    B: int, seed: int, exp_nbe: int, exp_nkv: int
+):
+    """Fused vs split CPU parity for `qwen35-candidate30-fused` at `T=4, B in {32, 40}`.
+
+    Exercises `fused_pool_io_max_b=48` (`B=32` with `nbe=12, nkv=3`; `B=40` with
+    `nbe=16, nkv=4` under EP) without clamping `nbe`, using the same tolerance
+    and bounded-XFAIL policy as `test_candidate30_fused_profile_vs_split`.
+    """
+    from tests.megakernel.test_m3_cache_eplb import (
+        WIDE_FUSED_REC_ULP_BOUND,
+        _pool_page_kinds,
+        _rec_pool_max_ulp,
+        _xfail_on_cpu_fused_artifact,
+    )
+
+    T = 4
+    mesh = _cpu_mesh(2)
+    tp = NamedSharding(mesh, P("tp"))
+    g = _geom(moe_tp=False)
+    spec = qwen35.qwen35_spec(g)
+    prof = mk.get_profile("qwen35-candidate30-fused")
+    base = mk.ExecSpec(
+        R=2,
+        B=B,
+        T=T,
+        ctx=256,
+        interpret=True,
+        cache=mk.CacheExec(paged_kv=True, num_pages=2048),
+    )
+    ex = prof.exec_for(base, B=B, T=T, g=g)
+    t = ex.resolved_tiles
+    assert (t.nbe, t.module("gqa").nkv) == (exp_nbe, exp_nkv)
+    t = dataclasses.replace(
+        t,
+        bank=512 << 10,
+        nbd=10,
+        ebank=256 << 10,
+        vmem_mib=48,
+    ).with_modules(
+        {"gqa": {"kv_blk": 256, "kv_sub": 128 if t.module("gqa").kv_sub else 0}}
+    )
+    ex = mk.with_cache(dataclasses.replace(ex, tiles=t), pool_gather=False)
+    assert (
+        ex.resolved_tiles.nbe == exp_nbe
+        and ex.resolved_tiles.module("gqa").nkv == exp_nkv
+    )
+    assert mk.should_fuse_pool_io(
+        spec,
+        ex,
+        fused_pool_io=prof.fused_pool_io,
+        max_b_low=prof.fused_pool_io_max_b,
+    )
+    assert t.module("gdn").conv_stage and t.module("gdn").gdn_head_major
+
+    pos, hid_l, w_l, st_l = mk.random_logical_inputs(
+        jax.random.key(810 + B + 1000 * seed), g, ex
+    )
+    pos_list = []
+    for s_i in range(ex.NS):
+        base_p = 126 if s_i == 0 else (20 + 10 * s_i)
+        pos_list.extend(base_p + t_i for t_i in range(T))
+    pos = jnp.asarray(pos_list, dtype=jnp.int32)
+    st_l = dict(st_l, conv=st_l["conv"].astype(jnp.bfloat16).astype(jnp.float32))
+    _, hid_mk, w_mk, _ = mk.pack_inputs(
+        pos, hid_l, w_l, st_l, g, ex, mesh=mesh, build_default_pool=True
+    )
+    pt, ckpt, roff, _ = mk.default_pool_layout(g, ex)
+
+    def _fresh_pools():
+        return tuple(
+            jax.device_put(np.asarray(r).copy(), tp)
+            for r in mk.states_to_pool(g, ex, st_l, pt, ckpt, roff)
+        )
+
+    step_s, _ = mk.PallasWriter(fused_pool_io=False).make_step(
+        mesh, spec, ex, donate=False
+    )
+    step_f, info_f = mk.PallasWriter(
+        fused_pool_io=prof.fused_pool_io, max_b_low=prof.fused_pool_io_max_b
+    ).make_step(mesh, spec, ex, donate=True)
+    assert int(info_f["plan"].module_params["moe"].NBE) == exp_nbe
+    assert int(info_f["plan"].module_params["gqa"].NKVR) == exp_nbe
+
+    pools_f = _fresh_pools()
+    hlo_f = step_f.lower(pos, hid_mk, w_mk, pools_f, pt, ckpt, roff).as_text("hlo")
+    ok_f, msg_f = mk.check_pooled_step_hlo(
+        hlo_f, page_size=mk.cache_exec(ex).page_size, kvh=1, hd=g.HD, fused_pool_io=True
+    )
+    assert ok_f, msg_f
+
+    out_s, raw_s = step_s(pos, hid_mk, w_mk, _fresh_pools(), pt, ckpt, roff)
+    out_f, raw_f = step_f(pos, hid_mk, w_mk, pools_f, pt, ckpt, roff)
+    kinds = _pool_page_kinds(pt, ckpt, g_per_att=g.att_every - 1)
+    _xfail_on_cpu_fused_artifact(
+        out_f,
+        out_s,
+        ex.R,
+        (raw_f, raw_s, mk.cache_exec(ex).num_pages, kinds),
+        case=("c30f", B, seed),
+    )
+    worst = max(
+        _rec_pool_max_ulp(r_f, r_s, mk.cache_exec(ex).num_pages, kinds)
+        for r_f, r_s in zip(raw_f, raw_s)
+    )
+    if ex.WIDE:
+        assert worst <= WIDE_FUSED_REC_ULP_BOUND, (worst, WIDE_FUSED_REC_ULP_BOUND)
+        if worst:
+            pytest.xfail(f"fused WIDE rec-state deviation vs split: {worst} bf16 ULP")
+    assert worst <= T - 1, (worst, T - 1)
