@@ -1035,7 +1035,7 @@ def test_qwen38_default_spec_and_tp32_dcp8_profile_buckets():
         ex_h3 = ExecSpec(B=b, T=1, R=R, ctx=CTX, tiles=tiles_h3, cache=cache_cfg)
         g_def.check(ex_h3)
         cp_h3, _ = vmem.build_scratch(ms, ex_h3)
-        assert (3 if b <= 16 else 0) == cp_h3.comm.HIER
+        assert (4 if b <= 32 else 0) == cp_h3.comm.HIER
         assert cp_h3.plan.module_params["gdn"].kh == 1
         assert cp_h3.plan.module_params["moe"].sh_rep == 2
         assert cp_h3.vmem_bytes <= tiles_h3.vmem_mib * 1024 * 1024

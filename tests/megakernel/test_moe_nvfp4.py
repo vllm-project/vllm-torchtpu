@@ -27,6 +27,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+from jax import lax
 from jax.sharding import Mesh
 
 import vllm_torchtpu
@@ -38,7 +39,11 @@ from vllm_torchtpu.megakernel.models import qwen38_moe
 from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES
 from vllm_torchtpu.megakernel.modules.moe import MoEModule
 from vllm_torchtpu.megakernel.modules.moe import experts as moe_experts
-from vllm_torchtpu.megakernel.modules.moe.experts import _mm_etake_w, unpack_nvfp4_tile
+from vllm_torchtpu.megakernel.modules.moe.experts import (
+    _mm_etake_w,
+    unpack_nvfp4_tile,
+    unpack_nvfp4_tile_fp8,
+)
 from vllm_torchtpu.megakernel.modules.moe.reference import dequant_nvfp4_weight
 from vllm_torchtpu.megakernel.ops import BF16, F32, I32
 from vllm_torchtpu.megakernel_runtime.weight_collector import pack_expert_views_layer
@@ -415,3 +420,36 @@ def test_pack_nvfp4_rejects_stock_prepared_layout():
         match="stock process_weights_after_loading already requantized; see unit B",
     ):
         pack_expert_views_layer(mlp_no_gscale, g_nv, ex8, tk_e13=128, tk_e2=128)
+
+
+def test_unpack_nvfp4_tile_fp8_matches_bf16():
+    """Normalized FP8 tile unpack avoids saturation on large e4m3 scales."""
+    rng = np.random.default_rng(123)
+    k_logical, n_logical = 128, 64
+    k_half = k_logical // 2
+    w_u8 = jnp.asarray(rng.integers(0, 256, size=(k_half, n_logical), dtype=np.uint8))
+    # Include large e4m3 block scales where unnormalized w4 * bscale > 448 saturates.
+    s_f32 = jnp.asarray(
+        rng.uniform(0.5, 240.0, size=(k_logical // 16, n_logical)), dtype=jnp.float32
+    )
+    s_u8 = lax.bitcast_convert_type(s_f32.astype(jnp.float8_e4m3fn), jnp.uint8).reshape(
+        k_half, n_logical // 8
+    )
+    packed_tile = jnp.concatenate([w_u8, s_u8], axis=-1)
+
+    w_bf16 = unpack_nvfp4_tile(packed_tile, n_logical, interpret=True).astype(
+        jnp.float32
+    )
+    w_fp8, w_s = unpack_nvfp4_tile_fp8(packed_tile, n_logical, interpret=True)
+    assert w_fp8.dtype == jnp.float8_e4m3fn
+    w_recon = w_fp8.astype(jnp.float32) * w_s
+
+    # One e4m3 rounding step (2^-3 = 0.125 relative spacing) on w_bf16 * bscale_norm.
+    assert not bool(jnp.any(jnp.isnan(w_recon)))
+    rel_err = float(jnp.max(jnp.abs(w_recon - w_bf16)) / jnp.max(jnp.abs(w_bf16)))
+    assert rel_err <= 0.125
+    # Negative control: unnormalized cast to FP8 overflows/saturates above 448.0.
+    w_unnorm = w_bf16.astype(jnp.float8_e4m3fn).astype(jnp.float32)
+    w_unnorm_sat = jnp.where(jnp.isnan(w_unnorm), jnp.sign(w_bf16) * 448.0, w_unnorm)
+    sat_err = float(jnp.max(jnp.abs(w_unnorm_sat - w_bf16)) / jnp.max(jnp.abs(w_bf16)))
+    assert sat_err > 0.125

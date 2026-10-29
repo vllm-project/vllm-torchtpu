@@ -373,6 +373,7 @@ def verify_sentinel_step(
     tokens_per_seq: int,
     bucket_t: int,
     variant_key: tuple[int, bool, bool],
+    kv_owner: bool = True,
 ) -> None:
     """Verify that a sentinel warmup step wrote finite outputs and updated pools."""
     out_arr = np.asarray(out_b, dtype=np.float32)
@@ -384,7 +385,8 @@ def verify_sentinel_step(
     for idx in range(len(kv_before)):
         k0, k1 = np.asarray(kv_before[idx]), np.asarray(kv_after[idx])
         g0, g1 = np.asarray(gdn_before[idx]), np.asarray(gdn_after[idx])
-        kv_ok, gdn_ok = not np.array_equal(k1, k0), not np.array_equal(g1, g0)
+        kv_ok = not np.array_equal(k1, k0) or not kv_owner
+        gdn_ok = not np.array_equal(g1, g0)
         if not (kv_ok and gdn_ok and out_fin_ok):
             out_nz, out_fin = _nz(out_arr), int(np.isfinite(out_arr).sum())
             n_diag = min(4, len(kv_after))

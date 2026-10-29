@@ -23,9 +23,11 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ...ops import BF16, F32, rnd
+from ...ops import BF16, F32, FP8, rnd
 from .context import MoEEmit
 from .ring import egive, egive_group, es_wait, etake
+
+_FP8_MAX = 448.0
 
 
 def unpack_nvfp4_tile(
@@ -56,6 +58,36 @@ def unpack_nvfp4_tile(
     return (w_bf16 * bscale).reshape(2 * tk_raw, n_logical)
 
 
+def unpack_nvfp4_tile_fp8(
+    w_u8: jax.Array, n_logical: int, *, interpret: bool = False
+) -> tuple[jax.Array, jax.Array]:
+    """Unpack `[tk_raw, n_raw] uint8` into `(w_fp8, w_s)`."""
+    tk_raw = w_u8.shape[0]
+    if tk_raw % 8 != 0 or n_logical % 8 != 0:
+        raise ValueError(
+            f"unpack_nvfp4_tile_fp8 requires tk_raw % 8 == 0 and n_logical % 8 == 0, "
+            f"got tk_raw={tk_raw}, n_logical={n_logical}"
+        )
+    packed = w_u8[:, :n_logical]
+    scale_cols = n_logical // 8
+    bscale_u8 = w_u8[:, n_logical : n_logical + scale_cols]
+    bscale = (
+        lax.bitcast_convert_type(bscale_u8, jnp.float8_e4m3fn)
+        .astype(BF16)
+        .reshape(tk_raw // 8, 1, n_logical)
+    )
+    s_max = jnp.max(jnp.abs(bscale), axis=0, keepdims=True)
+    bscale_norm = jnp.where(s_max > 0, bscale / s_max, jnp.zeros_like(bscale))
+    w4 = (
+        lax.bitcast_convert_type(packed, jnp.float4_e2m1fn).transpose(0, 2, 1)
+        if interpret
+        else pltpu.bitcast(packed, jnp.float4_e2m1fn)
+    )
+    w_bf16 = w4.astype(BF16).reshape(tk_raw // 8, 16, n_logical)
+    w_fp8 = (w_bf16 * bscale_norm).reshape(2 * tk_raw, n_logical).astype(FP8)
+    return w_fp8, s_max.reshape(1, n_logical).astype(F32)
+
+
 def _etake_w(m: MoEEmit, kind: str, u, n_logical: int) -> jax.Array:
     w_ref = etake(m, kind, u)
     if m.mp.expert_quant == "nvfp4":
@@ -82,17 +114,27 @@ def _mm_etake_w(
         return
     tk_raw = tk_logical // 2
     if tk_raw > 64 and tk_raw % 64 == 0:
-
-        def _sub(s, cc):
+        is_interp = bool(m.ex.interpret)
+        use_fp8_dot = (m.ex.MR <= 32) and (not is_interp)
+        for s in range(tk_raw // 64):
             r0 = pl.multiple_of(s * 64, 64)
             k_sub = pl.multiple_of(k0_logical + s * 128, 128)
-            w_sub = unpack_nvfp4_tile(
-                w_ref[pl.ds(r0, 64), :], n_logical, interpret=bool(m.ex.interpret)
-            )
-            acc_ref[:, :n_logical] += m.stream.mm(x_ref[:, pl.ds(k_sub, 128)], w_sub)
-            return cc
-
-        lax.fori_loop(0, tk_raw // 64, _sub, 0)
+            x_sub = x_ref[:, pl.ds(k_sub, 128)]
+            if use_fp8_dot:
+                w_fp8, w_s = unpack_nvfp4_tile_fp8(
+                    w_ref[pl.ds(r0, 64), :], n_logical, interpret=is_interp
+                )
+                x_max = jnp.max(jnp.abs(x_sub), axis=-1, keepdims=True)
+                x_s = jnp.where(x_max > 0, x_max / _FP8_MAX, jnp.ones_like(x_max))
+                x_fp8 = (x_sub / x_s).astype(FP8)
+                acc_ref[:, :n_logical] += m.stream.mm(x_fp8, w_fp8) * (
+                    x_s.astype(F32) * w_s
+                )
+            else:
+                w_sub = unpack_nvfp4_tile(
+                    w_ref[pl.ds(r0, 64), :], n_logical, interpret=is_interp
+                )
+                acc_ref[:, :n_logical] += m.stream.mm(x_sub, w_sub)
     else:
         w = unpack_nvfp4_tile(w_ref[...], n_logical, interpret=bool(m.ex.interpret))
         acc_ref[:, :n_logical] += m.stream.mm(

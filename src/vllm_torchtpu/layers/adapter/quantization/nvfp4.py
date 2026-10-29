@@ -41,11 +41,15 @@ Requires torch_tpu's native `torch.float4_e2m1fn_x2` dtype
 
 from __future__ import annotations
 
+import math
+import zlib
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import vllm.model_executor.kernels.linear as linear_kernels
 import vllm.model_executor.layers.quantization.modelopt as modelopt_module
+from vllm.config import get_current_vllm_config_or_none
 from vllm.config.quantization import QuantSpec
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, RoutedExperts
@@ -101,6 +105,7 @@ from vllm_torchtpu.layers.core.quantization import (
     unpack_uint8_to_fp4,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.megakernel_runtime import _is_megakernel_requested
 from vllm_torchtpu.utils import align_to, fresh_buffer, synchronize_tensors
 
 if TYPE_CHECKING:
@@ -385,6 +390,42 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             )
         return activation_str
 
+    def _initialize_dummy_quantized_weights(self, layer: RoutedExperts) -> None:
+        """Initialize ModelOpt NVFP4 weights under --load-format dummy."""
+        config = get_current_vllm_config_or_none()
+        if config is None:
+            return
+        load_format = config.load_config.load_format
+        if getattr(load_format, "value", load_format) != "dummy":
+            return
+        seed = zlib.crc32(str(layer.layer_name).encode())
+        seed += (
+            config.model_config.seed
+            + int(self.moe.ep_rank) * 104729
+            + int(self.moe.tp_rank)
+        )
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+        for name, fan_in_multiplier in (("w13", 1), ("w2", self.moe.tp_size)):
+            packed = getattr(layer, f"{name}_weight").data
+            values = torch.randint(
+                0,
+                256,
+                packed.shape,
+                dtype=torch.uint8,
+                device="cpu",
+                generator=generator,
+            )
+            # Signed +/-0.5 FP4 nibbles (0x1 / 0x9) in both halves of each byte.
+            values.bitwise_and_(0x88).bitwise_or_(0x11)
+            packed.copy_(values)
+            block_scale = getattr(layer, f"{name}_weight_scale").data
+            global_scale = getattr(layer, f"{name}_weight_scale_2").data
+            block_scale.fill_(1.0)
+            fan_in = packed.shape[-1] * 2 * int(fan_in_multiplier)
+            global_scale.fill_(2.0 / math.sqrt(fan_in))
+            if packed.device.type == "tpu":
+                synchronize_tensors([packed, block_scale, global_scale])
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         assert isinstance(layer, RoutedExperts)
         layer = cast("TpuRoutedExperts", layer)
@@ -395,6 +436,21 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         )
         self._use_adaptive_fused_moe = envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
         activation_str = self._set_tpu_activation(layer)
+
+        self._initialize_dummy_quantized_weights(layer)
+        if _is_megakernel_requested(
+            SimpleNamespace(vllm_config=get_current_vllm_config_or_none())
+        ):
+            # Megakernel packs ModelOpt block-16 tensors; keep a CPU copy until
+            # pack_expert_views_layer pops it.
+            layer._mk_nvfp4_raw = (
+                layer.w13_weight.data.detach().cpu().clone(),
+                layer.w13_weight_scale.data.detach().view(torch.uint8).cpu().clone(),
+                layer.w13_weight_scale_2.data.detach().to(torch.float32).cpu().clone(),
+                layer.w2_weight.data.detach().cpu().clone(),
+                layer.w2_weight_scale.data.detach().view(torch.uint8).cpu().clone(),
+                layer.w2_weight_scale_2.data.detach().to(torch.float32).cpu().clone(),
+            )
 
         # --- fuse E4M3 block scale * FP32 per-tensor global -> FP32 block scale.
         # w13: global is [E, 2] (separate w1/w3 per-tensor scales); apply to the

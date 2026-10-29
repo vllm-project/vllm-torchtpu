@@ -215,11 +215,14 @@ def resolve_expert_quant(
     qcfg = merged.get("quantization_config")
     if not isinstance(qcfg, Mapping) and isinstance(hf_config, Mapping):
         qcfg = hf_config.get("quantization_config")
-    algo = (
-        str(qcfg.get("quant_algo", "")).strip().upper()
-        if isinstance(qcfg, Mapping)
-        else ""
-    )
+    algo = ""
+    if isinstance(qcfg, Mapping):
+        # ModelOpt nests the algorithm under quantization; others keep it flat.
+        nq = qcfg.get("quantization")
+        qa = qcfg.get("quant_algo") or (
+            nq.get("quant_algo") if isinstance(nq, Mapping) else None
+        )
+        algo = str(qa or "").strip().upper()
     if explicit is not None:
         return str(explicit)
     return "nvfp4" if algo == "NVFP4" else str(default)

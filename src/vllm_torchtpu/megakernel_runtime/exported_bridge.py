@@ -31,8 +31,9 @@ Provides:
 from __future__ import annotations
 
 import inspect
+import re
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import jax
@@ -52,6 +53,319 @@ from vllm_torchtpu.megakernel.spec import ModelSpec
 def _leaf_output_specs(output_partition_specs: Any) -> list[P]:
     """Flatten `output_partition_specs` to one `PartitionSpec` per output leaf."""
     return jax.tree.leaves(output_partition_specs, is_leaf=lambda s: isinstance(s, P))
+
+
+def _find_matching_delim(s: str, open_idx: int, open_ch: str, close_ch: str) -> int:
+    """Return matching `close_ch` index for `s[open_idx]`, skipping strings."""
+    depth = 0
+    in_str = False
+    i = open_idx
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if in_str:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == open_ch:
+                depth += 1
+            elif ch == close_ch:
+                depth -= 1
+                if depth == 0:
+                    return i
+        i += 1
+    raise ValueError(f"Unmatched {open_ch!r} at index {open_idx}")
+
+
+def _find_func_body_open(s: str, after_params_idx: int) -> int:
+    """Return index of `{` opening a `func.func` body after its parameter list `)`."""
+    in_str = False
+    i = after_params_idx
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if in_str:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == "(":
+            i = _find_matching_delim(s, i, "(", ")")
+        elif ch == "{":
+            prefix = s[after_params_idx:i].rstrip()
+            if prefix.endswith("attributes"):
+                i = _find_matching_delim(s, i, "{", "}")
+            else:
+                return i
+        i += 1
+    raise ValueError(f"Missing func.func body '{{' after index {after_params_idx}")
+
+
+def _rewrite_calls_to_callees(
+    body: str,
+    *,
+    callees: set[str],
+    fn_rank_ssa: str,
+    global_rank_ty: str,
+) -> str:
+    """Append `fn_rank_ssa` (`global_rank_ty`) to calls targeting `callees`."""
+    if not callees:
+        return body
+    callee_alt = "|".join(re.escape(c) for c in sorted(callees))
+    pat = re.compile(rf"\b(?:func\.)?call\s+@({callee_alt})\s*\(")
+    cursor = 0
+    while True:
+        m = pat.search(body, cursor)
+        if m is None:
+            break
+        args_open = m.end() - 1
+        args_close = _find_matching_delim(body, args_open, "(", ")")
+        colon_idx = body.index(":", args_close)
+        ty_open = body.index("(", colon_idx)
+        ty_close = _find_matching_delim(body, ty_open, "(", ")")
+        ty_sep = ", " if body[ty_open + 1 : ty_close].strip() else ""
+        arg_sep = ", " if body[args_open + 1 : args_close].strip() else ""
+        ty_ins = f"{ty_sep}{global_rank_ty}"
+        arg_ins = f"{arg_sep}{fn_rank_ssa}"
+        body = body[:ty_close] + ty_ins + body[ty_close:]
+        body = body[:args_close] + arg_ins + body[args_close:]
+        cursor = ty_close + len(ty_ins) + len(arg_ins) + 1
+    return body
+
+
+def _rewrite_sdy_manual_blocks(
+    body: str,
+    *,
+    fn_rank_ssa: str,
+    global_rank_ty: str,
+    mesh_sym: str,
+) -> str:
+    """Thread `fn_rank_ssa` into every `sdy.manual_computation` using `partition_id`."""
+    needle = "sdy.manual_computation"
+    cursor = 0
+    uid = 0
+    while True:
+        idx = body.find(needle, cursor)
+        if idx < 0:
+            break
+        op_open = body.index("(", idx + len(needle))
+        op_close = _find_matching_delim(body, op_open, "(", ")")
+        in_sh_key = body.index("in_shardings=", op_close)
+        in_sh_open = body.index("[", in_sh_key)
+        in_sh_close = _find_matching_delim(body, in_sh_open, "[", "]")
+        man_key = body.index("manual_axes=", in_sh_close)
+        man_open = body.index("{", man_key)
+        man_close = _find_matching_delim(body, man_open, "{", "}")
+        blk_open = body.index("(", man_close)
+        blk_close = _find_matching_delim(body, blk_open, "(", ")")
+        reg_open = body.index("{", blk_close)
+        reg_close = _find_matching_delim(body, reg_open, "{", "}")
+
+        reg_text = body[reg_open : reg_close + 1]
+        if "stablehlo.partition_id" not in reg_text:
+            cursor = idx + len(needle)
+            continue
+
+        k = reg_close + 1
+        while k < len(body) and body[k].isspace():
+            k += 1
+        if k >= len(body) or body[k] != ":":
+            raise ValueError(
+                "Expected functional type ':' after sdy.manual_computation body"
+            )
+        ty_open = body.index("(", k)
+        ty_close = _find_matching_delim(body, ty_open, "(", ")")
+
+        axes = re.findall(r'"([^"]+)"', body[man_open : man_close + 1])
+        if not axes:
+            axes = ["tp"]
+        axes_inner = ", ".join(f'"{a}"' for a in axes)
+        rank_sharding = f"<@{mesh_sym}, [{{{axes_inner}}}]>"
+        local_arg = f"%arg_tp_rank_local_{uid}"
+
+        def _sub_pid(m: re.Match[str], arg_name: str = local_arg) -> str:
+            nonlocal uid
+            uid += 1
+            indent, lhs = m.group(1), m.group(2)
+            tmp = f"%tp_rank_i32_{uid}"
+            return (
+                f"{indent}{tmp} = stablehlo.reshape {arg_name} : "
+                f"(tensor<1xi32>) -> tensor<i32>\n"
+                f"{indent}{lhs} = stablehlo.convert {tmp} : "
+                f"(tensor<i32>) -> tensor<ui32>"
+            )
+
+        new_reg_text = re.sub(
+            r"([ \t]*)(%[\w\d_.$]+)\s*=\s*stablehlo\.partition_id\s*:\s*tensor<ui32>"
+            r"(?:\s*loc\([^\n]*\))?",
+            _sub_pid,
+            reg_text,
+        )
+
+        ty_ins = (
+            f", {global_rank_ty}"
+            if body[ty_open + 1 : ty_close].strip()
+            else global_rank_ty
+        )
+        blk_ins = (
+            f", {local_arg}: tensor<1xi32>"
+            if body[blk_open + 1 : blk_close].strip()
+            else f"{local_arg}: tensor<1xi32>"
+        )
+        sh_ins = (
+            f", {rank_sharding}"
+            if body[in_sh_open + 1 : in_sh_close].strip()
+            else rank_sharding
+        )
+        op_ins = (
+            f", {fn_rank_ssa}" if body[op_open + 1 : op_close].strip() else fn_rank_ssa
+        )
+
+        end_after_splice = (
+            ty_close
+            + len(ty_ins)
+            + (len(new_reg_text) - len(reg_text))
+            + len(blk_ins)
+            + len(sh_ins)
+            + len(op_ins)
+        )
+        body = body[:ty_close] + ty_ins + body[ty_close:]
+        body = body[:reg_open] + new_reg_text + body[reg_close + 1 :]
+        body = body[:blk_close] + blk_ins + body[blk_close:]
+        body = body[:in_sh_close] + sh_ins + body[in_sh_close:]
+        body = body[:op_close] + op_ins + body[op_close:]
+        cursor = end_after_splice
+    return body
+
+
+def _rewrite_partition_id_with_rank_arg(mlir_text: str) -> str:
+    """Replace `stablehlo.partition_id` using `@main`'s trailing `tensor<Rxi32>` arg.
+
+    `torch_tpu` lowers `JaxCallable` modules via `PartitionGlobalToLocal`, which
+    runs XLA `SpmdPartitioner` over the exported StableHLO and rejects
+    `stablehlo.partition_id`. When `mesh.devices.size > 1`, `@main` is traced
+    with a trailing `P("tp")`-sharded `int32[R]` rank vector (`[r]` per device),
+    and this pass threads that argument into `sdy.manual_computation` blocks in
+    place of `stablehlo.partition_id`.
+    """
+    if "stablehlo.partition_id" not in mlir_text:
+        return mlir_text
+
+    mesh_m = re.search(r"sdy\.mesh\s+@([\w\d_.$]+)\s*=", mlir_text)
+    mesh_sym = mesh_m.group(1) if mesh_m is not None else "mesh"
+
+    fn_pat = re.compile(
+        r"(?m)^[ \t]*func\.func\s+(?:(?:public|private)\s+)?@([\w\d_.$]+)\s*\("
+    )
+    funcs: list[tuple[str, int, int, int, int]] = []
+    prev_end = 0
+    for m in fn_pat.finditer(mlir_text):
+        if m.start() < prev_end:
+            continue
+        fn_name = m.group(1)
+        p_open = m.end() - 1
+        p_close = _find_matching_delim(mlir_text, p_open, "(", ")")
+        b_open = _find_func_body_open(mlir_text, p_close + 1)
+        b_close = _find_matching_delim(mlir_text, b_open, "{", "}")
+        funcs.append((fn_name, p_open, p_close, b_open, b_close))
+        prev_end = b_close + 1
+
+    main_entry = next((f for f in funcs if f[0] == "main"), None)
+    if main_entry is None:
+        raise ValueError("Missing @main in exported StableHLO module")
+    main_params = mlir_text[main_entry[1] + 1 : main_entry[2]]
+    param_matches = list(re.finditer(r"(%arg\d+)\s*:\s*(tensor<[^>]+>)", main_params))
+    if not param_matches or not re.fullmatch(
+        r"tensor<\d+xi32>", param_matches[-1].group(2)
+    ):
+        raise ValueError("Expected trailing tensor<Rxi32> rank parameter on @main")
+    main_rank_ssa = param_matches[-1].group(1)
+    global_rank_ty = param_matches[-1].group(2)
+
+    bodies = {
+        name: mlir_text[b_open : b_close + 1] for name, _, _, b_open, b_close in funcs
+    }
+    direct_pid_fns = {
+        name for name, b_txt in bodies.items() if "stablehlo.partition_id" in b_txt
+    }
+    needs_rank = set(direct_pid_fns)
+    changed = True
+    while changed:
+        changed = False
+        for name, b_txt in bodies.items():
+            if name in needs_rank:
+                continue
+            for target in list(needs_rank):
+                if re.search(rf"\b(?:func\.)?call\s+@{re.escape(target)}\s*\(", b_txt):
+                    needs_rank.add(name)
+                    changed = True
+                    break
+
+    callees = needs_rank - {"main"}
+    for name, p_open, p_close, b_open, b_close in reversed(funcs):
+        if name not in needs_rank:
+            continue
+        fn_rank_ssa = main_rank_ssa if name == "main" else "%arg_tp_rank"
+        new_body = bodies[name]
+        if callees:
+            new_body = _rewrite_calls_to_callees(
+                new_body,
+                callees=callees,
+                fn_rank_ssa=fn_rank_ssa,
+                global_rank_ty=global_rank_ty,
+            )
+        if name in direct_pid_fns:
+            new_body = _rewrite_sdy_manual_blocks(
+                new_body,
+                fn_rank_ssa=fn_rank_ssa,
+                global_rank_ty=global_rank_ty,
+                mesh_sym=mesh_sym,
+            )
+        mlir_text = mlir_text[:b_open] + new_body + mlir_text[b_close + 1 :]
+        if name != "main":
+            p_ins = (
+                f", %arg_tp_rank: {global_rank_ty}"
+                if mlir_text[p_open + 1 : p_close].strip()
+                else f"%arg_tp_rank: {global_rank_ty}"
+            )
+            mlir_text = mlir_text[:p_close] + p_ins + mlir_text[p_close:]
+
+    if "stablehlo.partition_id" in mlir_text:
+        raise RuntimeError(
+            "Failed to eliminate all stablehlo.partition_id ops from StableHLO"
+        )
+    return mlir_text
+
+
+def _sanitize_exported_partition_id(exported: Any) -> Any:
+    """Rewrite `stablehlo.partition_id` in `jax.export.Exported` and re-serialize."""
+    mlir_text = exported.mlir_module()
+    if "stablehlo.partition_id" not in mlir_text:
+        return exported
+    from jax._src.export import _export as jax_export_internal
+    from jax._src.interpreters import mlir as jax_mlir
+
+    rewritten = _rewrite_partition_id_with_rank_arg(mlir_text)
+    with jax_mlir.make_ir_context():
+        ir_mod = jax_mlir.ir.Module.parse(rewritten)
+        ir_mod.operation.verify()
+        new_bytes = jax_export_internal._module_to_bytecode(ir_mod)
+    return replace(exported, mlir_module_serialized=new_bytes)
+
+
+def _rank_partition_spec(mesh: jax.sharding.Mesh) -> P:
+    """Return 1D `PartitionSpec` sharding a length-`R` rank vector 1-per-device."""
+    if len(mesh.axis_names) == 1:
+        return P(mesh.axis_names[0])
+    return P(tuple(mesh.axis_names))
 
 
 def sharded_jax_callable(
@@ -106,7 +420,7 @@ def sharded_jax_callable(
             "output_partition_specs": str(output_partition_specs),
         },
     )
-    return pallas_impl.JaxCallable(
+    callable_obj = pallas_impl.JaxCallable(
         name=name,
         jit_fn=jit_fn,
         trace_key=trace_key,
@@ -116,6 +430,14 @@ def sharded_jax_callable(
         static_argnums=static_argnums,
         donate_argnums=donate_argnums,
     )
+    if int(mesh.devices.size) > 1:
+        orig_exported = callable_obj.exported
+
+        def _sanitized_exported(*a: Any, **kw: Any) -> Any:
+            return _sanitize_exported_partition_id(orig_exported(*a, **kw))
+
+        callable_obj.exported = _sanitized_exported
+    return callable_obj
 
 
 @dataclass(frozen=True)
@@ -132,6 +454,22 @@ class PooledStepExport:
 
 
 _OP_COUNTER = 0
+
+
+def _torch_dtype_to_jax(dt: torch.dtype) -> Any:
+    if dt == torch.float8_e4m3fn:
+        return jnp.float8_e4m3fn
+    if dt == torch.bfloat16:
+        return jnp.bfloat16
+    if dt == torch.float32:
+        return jnp.float32
+    if dt == torch.int32:
+        return jnp.int32
+    if dt == torch.int64:
+        return jnp.int64
+    if dt == torch.uint8:
+        return jnp.uint8
+    raise TypeError(f"Unsupported torch.dtype for megakernel bridge: {dt}")
 
 
 def _torch_cpu_to_jax(
@@ -216,9 +554,25 @@ def export_pooled_step(
         max_pages_per_seq=max_pages_per_seq,
         ckpt_cols=ckpt_cols,
     )
+    has_multi_rank = int(mesh.devices.size) > 1
+    if has_multi_rank:
+
+        def _step_for_export(*args: Any) -> Any:
+            return step_fn(*args[:-1])
+
+        export_fn: Callable[..., Any] = _step_for_export
+        export_in_sh = (*in_sh, NamedSharding(mesh, _rank_partition_spec(mesh)))
+        export_avals = [
+            *avals,
+            jax.ShapeDtypeStruct((int(mesh.devices.size),), jnp.int32),
+        ]
+    else:
+        export_fn = step_fn
+        export_in_sh = in_sh
+        export_avals = avals
     j_fn = jax.jit(
-        step_fn,
-        in_shardings=in_sh,
+        export_fn,
+        in_shardings=export_in_sh,
         out_shardings=out_sh,
         donate_argnums=donate_argnums,
         keep_unused=True,
@@ -229,14 +583,19 @@ def export_pooled_step(
                 j_fn,
                 platforms=list(platforms),
                 disabled_checks=[jax.export.DisabledSafetyCheck.custom_call("ALL")],
-            )(*avals)
+            )(*export_avals)
+        if has_multi_rank:
+            exported = _sanitize_exported_partition_id(exported)
         mlir_bytes = exported.mlir_module_serialized
     except NotImplementedError:
         if not ex.interpret:
             raise
-        lowered = j_fn.lower(*avals)
+        lowered = j_fn.lower(*export_avals)
+        mlir_str = lowered.as_text("stablehlo")
+        if has_multi_rank:
+            mlir_str = _rewrite_partition_id_with_rank_arg(mlir_str)
         exported = lowered
-        mlir_bytes = lowered.as_text("stablehlo").encode("utf-8")
+        mlir_bytes = mlir_str.encode("utf-8")
     n_w = len(w_flat)
     n_p = len(raw_pools)
     aliases = {2 + n_w + i: 1 + i for i in range(n_p)}
@@ -258,11 +617,14 @@ def build_pooled_step_op(
     *,
     op_name: str | None = None,
     donate_pools: bool = True,
+    tp_rank: int = 0,
 ) -> tuple[Any, tuple[P, ...], tuple[P, ...], tuple[int, ...]]:
     """Build a PyTorch custom op wrapping `cache.make_flat_pooled_step`.
 
     Returns `(op, in_specs, out_specs, donate_argnums)` where `op` takes
-    `(pos, hidden, page_table, ckpt_indices, read_offsets, weights, pools)`.
+    `(pos, hidden, page_table, ckpt_indices, read_offsets, weights, pools)`
+    plus an optional `tp_rank_1d` 1-element `int32` device tensor when
+    `mesh.devices.size > 1`.
     """
     global _OP_COUNTER
     step_fn, in_specs, out_specs, donate_argnums = cache.make_flat_pooled_step(
@@ -275,16 +637,31 @@ def build_pooled_step_op(
     elif "::" not in op_name:
         op_name = f"megakernel_runtime::{op_name}"
 
+    has_multi_rank = int(mesh.devices.size) > 1
+    if has_multi_rank:
+
+        def _step_for_tpu(*args: Any) -> Any:
+            return step_fn(*args[:-1])
+
+        tpu_step_fn: Callable[..., Any] = _step_for_tpu
+        tpu_in_specs: tuple[P, ...] = (*in_specs, _rank_partition_spec(mesh))
+    else:
+        tpu_step_fn = step_fn
+        tpu_in_specs = in_specs
+
     fn_name = op_name.replace("::", "_")
     typed_fn = make_typed_step_wrapper(
-        fn_name, step_fn, num_inputs=len(in_specs), num_outputs=len(out_specs)
+        fn_name,
+        tpu_step_fn,
+        num_inputs=len(tpu_in_specs),
+        num_outputs=len(out_specs),
     )
     try:
         flat_callable: Any = sharded_jax_callable(
             op_name,
             typed_fn,
             mesh=mesh,
-            input_partition_specs=in_specs,
+            input_partition_specs=tpu_in_specs,
             output_partition_specs=out_specs,
             donate_argnums=donate_argnums,
         )
@@ -313,6 +690,7 @@ def build_pooled_step_op(
         read_offsets: torch.Tensor,
         weights: list[torch.Tensor],
         pools: list[torch.Tensor],
+        tp_rank_1d: torch.Tensor | None = None,
     ) -> list[torch.Tensor]:
         all_tensors = [
             pos,
@@ -339,6 +717,13 @@ def build_pooled_step_op(
             raise RuntimeError(
                 "torch_tpu is required to execute build_pooled_step_op on TPU"
             )
+        if has_multi_rank:
+            rank_arg = (
+                tp_rank_1d
+                if tp_rank_1d is not None
+                else torch.tensor([int(tp_rank)], dtype=torch.int32, device=pos.device)
+            )
+            return list(flat_callable(*all_tensors, rank_arg))
         return list(flat_callable(*all_tensors))
 
     @op.register_fake
@@ -350,6 +735,7 @@ def build_pooled_step_op(
         read_offsets: torch.Tensor,
         weights: list[torch.Tensor],
         pools: list[torch.Tensor],
+        tp_rank_1d: torch.Tensor | None = None,
     ) -> list[torch.Tensor]:
         return [torch.empty_like(hidden)] + [torch.empty_like(p) for p in pools]
 
@@ -365,21 +751,34 @@ def execute_pooled_step_inplace(
     read_offsets: torch.Tensor,
     weights: Sequence[torch.Tensor],
     pools: Sequence[torch.Tensor],
+    tp_rank_1d: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Execute `op`, copy donated outputs into `pools` in-place, and return `hid_out`.
 
     Preserves `pool.data_ptr()` and `pool.storage().data_ptr()` on every pool
     tensor so `raiden`-pinned buffers remain valid without re-registration.
     """
-    outs = op(
-        pos,
-        hidden,
-        page_table,
-        ckpt_indices,
-        read_offsets,
-        list(weights),
-        list(pools),
-    )
+    if tp_rank_1d is None:
+        outs = op(
+            pos,
+            hidden,
+            page_table,
+            ckpt_indices,
+            read_offsets,
+            list(weights),
+            list(pools),
+        )
+    else:
+        outs = op(
+            pos,
+            hidden,
+            page_table,
+            ckpt_indices,
+            read_offsets,
+            list(weights),
+            list(pools),
+            tp_rank_1d,
+        )
     n_p = len(pools)
     for dst, src in zip(pools, outs[1 : 1 + n_p]):
         dst.copy_(src)

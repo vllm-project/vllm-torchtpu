@@ -30,8 +30,9 @@ via `vllm_torchtpu.megakernel.weights.load_weights`:
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
+from types import SimpleNamespace
 from typing import Any
 
 import jax.numpy as jnp
@@ -315,10 +316,321 @@ def _walk_attr(root: Any, dotted: str) -> tuple[Any, str, Any] | None:
     return cur, actual_leaf, val
 
 
+def extract_kn_fp8_weight(
+    proj: Any, hidden_dim: int, out_dim: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return `(w_kn [hidden_dim, out_dim] fp8, s_n [out_dim] f32)` from `proj`."""
+    w = proj.weight.data
+    flipped = getattr(proj, WEIGHT_FLIPPED_ATTR, None)
+    if flipped is True and tuple(w.shape) == (hidden_dim, out_dim):
+        w_kn = w
+    elif flipped is False and tuple(w.shape) == (out_dim, hidden_dim):
+        w_kn = w.transpose(0, 1)
+    elif tuple(w.shape) == (hidden_dim, out_dim) and hidden_dim != out_dim:
+        w_kn = w
+    elif tuple(w.shape) == (out_dim, hidden_dim):
+        w_kn = w.transpose(0, 1)
+    else:
+        raise ValueError(
+            f"Unexpected weight shape {tuple(w.shape)}; expected "
+            f"({hidden_dim}, {out_dim}) or ({out_dim}, {hidden_dim})"
+        )
+
+    s = getattr(proj, "weight_scale", None)
+    if s is None:
+        s = getattr(proj, "weight_scale_inv", None)
+
+    if w_kn.dtype == torch.float8_e4m3fn:
+        _need(s is not None, "FP8 linear projection is missing weight_scale")
+        assert s is not None
+        s_1d = s.data.float().reshape(-1).contiguous()
+        _need(
+            s_1d.shape == (out_dim,),
+            f"FP8 weight_scale shape {tuple(s_1d.shape)} != ({out_dim},)",
+        )
+        return w_kn.contiguous(), s_1d
+
+    w_nk_f32 = w_kn.transpose(0, 1).float()
+    amax = w_nk_f32.abs().amax(dim=-1, keepdim=True)
+    scale = torch.where(amax == 0.0, torch.ones_like(amax), amax * (1.0 / 448.0))
+    w_fp8_kn = (
+        (w_nk_f32 / scale)
+        .clamp(-448.0, 448.0)
+        .to(torch.float8_e4m3fn)
+        .transpose(0, 1)
+        .contiguous()
+    )
+    return w_fp8_kn, scale.squeeze(-1).float().contiguous()
+
+
+def _gather_replicated_sh13(
+    w_gu_local: torch.Tensor,
+    s_gu_local: torch.Tensor,
+    *,
+    g: Any,
+    ex: Any,
+    sh_rank: int,
+    tp_all_gather_fn: Callable[[torch.Tensor], torch.Tensor] | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather partner TP shards of `shared_expert.gate_up_proj` when `sh_rep > 1`."""
+    sh_rep = g.sh_rep(ex.R)
+    local_isr = g.IS // ex.R
+    isr = g.ISR(ex.R)
+    _need(
+        tp_all_gather_fn is not None,
+        f"tp_all_gather_fn is required when shared_expert is TP-{ex.R} sharded "
+        f"(local_isr={local_isr}) but megakernel uses isr={isr} (sh_rep={sh_rep})",
+    )
+    assert tp_all_gather_fn is not None
+    w_gu_all = tp_all_gather_fn(w_gu_local)
+    s_gu_all = tp_all_gather_fn(s_gu_local)
+    _need(
+        tuple(w_gu_all.shape) == (ex.R, g.H, 2 * local_isr),
+        f"tp_all_gather_fn(gate_up) shape {tuple(w_gu_all.shape)} != "
+        f"({ex.R}, {g.H}, {2 * local_isr})",
+    )
+    _need(
+        tuple(s_gu_all.shape) == (ex.R, 2 * local_isr),
+        f"tp_all_gather_fn(gate_up_scale) shape {tuple(s_gu_all.shape)} != "
+        f"({ex.R}, {2 * local_isr})",
+    )
+    p0 = sh_rank * sh_rep
+    p1 = p0 + sh_rep
+    w_gate = w_gu_all[p0:p1, :, :local_isr].permute(1, 0, 2).reshape(g.H, isr)
+    w_up = w_gu_all[p0:p1, :, local_isr:].permute(1, 0, 2).reshape(g.H, isr)
+    s_gate = s_gu_all[p0:p1, :local_isr].reshape(isr)
+    s_up = s_gu_all[p0:p1, local_isr:].reshape(isr)
+    return (
+        torch.cat([w_gate, w_up], dim=1).contiguous(),
+        torch.cat([s_gate, s_up], dim=0).contiguous(),
+    )
+
+
+def _gather_replicated_sh2(
+    w_down_local: torch.Tensor,
+    s_down_local: torch.Tensor,
+    *,
+    g: Any,
+    ex: Any,
+    sh_rank: int,
+    tp_all_gather_fn: Callable[[torch.Tensor], torch.Tensor] | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather partner TP shards of `shared_expert.down_proj` when `sh_rep > 1`."""
+    sh_rep = g.sh_rep(ex.R)
+    local_isr = g.IS // ex.R
+    isr = g.ISR(ex.R)
+    _need(
+        tp_all_gather_fn is not None,
+        f"tp_all_gather_fn is required when shared_expert.down_proj is TP-{ex.R} "
+        f"sharded (rows={local_isr}) but megakernel uses isr={isr}",
+    )
+    assert tp_all_gather_fn is not None
+    w_down_all = tp_all_gather_fn(w_down_local)
+    s_down_all = tp_all_gather_fn(s_down_local)
+    _need(
+        tuple(w_down_all.shape) == (ex.R, local_isr, g.H),
+        f"tp_all_gather_fn(down) shape {tuple(w_down_all.shape)} != "
+        f"({ex.R}, {local_isr}, {g.H})",
+    )
+    _need(
+        tuple(s_down_all.shape) == (ex.R, g.H),
+        f"tp_all_gather_fn(down_scale) shape {tuple(s_down_all.shape)} != "
+        f"({ex.R}, {g.H})",
+    )
+    p0 = sh_rank * sh_rep
+    p1 = p0 + sh_rep
+    w_grp_f32 = (w_down_all[p0:p1].float() * s_down_all[p0:p1].unsqueeze(1)).reshape(
+        isr, g.H
+    )
+    amax = w_grp_f32.abs().amax(dim=0, keepdim=True)
+    scale = torch.where(amax == 0.0, torch.ones_like(amax), amax * (1.0 / 448.0))
+    w_sh2 = (
+        (w_grp_f32 / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
+    )
+    return w_sh2, scale.squeeze(0).float().contiguous()
+
+
+def pack_router_and_shared_layer(
+    mlp: Any,
+    g: Any,
+    ex: ExecSpec,
+    *,
+    tp_rank: int = 0,
+    tk_router: int,
+    tk_sh13: int,
+    tk_sh2: int,
+    tp_all_gather_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> dict[str, torch.Tensor]:
+    """Extract router (`bf16`), shared expert `sh13`/`sh2` (`fp8`), and scales."""
+    isr = g.ISR(ex.R)
+    sh_rep = g.sh_rep(ex.R)
+    local_isr = g.IS // ex.R
+    sh_rank = tp_rank // sh_rep
+    w_gu = getattr(mlp, "_fused_gate_gu_fp8_weight", None)
+    if w_gu is not None:
+        s_gu = mlp._fused_gate_gu_fp8_scale.data.float().reshape(-1)
+        if hasattr(mlp, "_fused_se_down_fp8_weight"):
+            w_down = mlp._fused_se_down_fp8_weight.data
+            s_down = mlp._fused_se_down_fp8_scale.data.float().reshape(g.H).contiguous()
+        else:
+            down_proj = mlp.shared_expert.down_proj
+            down_rows = int(
+                down_proj.weight.shape[0]
+                if getattr(down_proj, WEIGHT_FLIPPED_ATTR, False)
+                or down_proj.weight.shape[1] == g.H
+                else down_proj.weight.shape[1]
+            )
+            w_down, s_down = extract_kn_fp8_weight(down_proj, down_rows, g.H)
+        if hasattr(mlp, "_fused_se_gate_weight"):
+            sh_gate = mlp._fused_se_gate_weight.data.float().reshape(g.H).contiguous()
+        else:
+            sh_gate = (
+                mlp.shared_expert_gate.weight.data.float().reshape(g.H).contiguous()
+            )
+
+        w_router_fp8 = w_gu.data[:, : g.E]
+        s_router = s_gu[: g.E]
+        w_router_bf16 = (
+            (w_router_fp8.float() * s_router.unsqueeze(0))
+            .to(torch.bfloat16)
+            .contiguous()
+            .view(g.H // tk_router, tk_router, g.E)
+        )
+
+        n_cols = int(w_gu.shape[1])
+        if n_cols == g.E + 2 * g.IS:
+            g0 = g.E + sh_rank * isr
+            u0 = g.E + g.IS + sh_rank * isr
+            w_sh13 = torch.cat(
+                [w_gu.data[:, g0 : g0 + isr], w_gu.data[:, u0 : u0 + isr]], dim=1
+            ).contiguous()
+            s_sh13 = torch.cat(
+                [s_gu[g0 : g0 + isr], s_gu[u0 : u0 + isr]], dim=0
+            ).contiguous()
+        elif n_cols == g.E + 2 * isr:
+            w_sh13 = w_gu.data[:, g.E : g.E + 2 * isr].contiguous()
+            s_sh13 = s_gu[g.E : g.E + 2 * isr].contiguous()
+        elif sh_rep > 1 and n_cols == g.E + 2 * local_isr:
+            w_sh13, s_sh13 = _gather_replicated_sh13(
+                w_gu.data[:, g.E : g.E + 2 * local_isr].contiguous(),
+                s_gu[g.E : g.E + 2 * local_isr].contiguous(),
+                g=g,
+                ex=ex,
+                sh_rank=sh_rank,
+                tp_all_gather_fn=tp_all_gather_fn,
+            )
+        else:
+            raise ValueError(
+                f"Unexpected _fused_gate_gu_fp8_weight shape {tuple(w_gu.shape)}"
+            )
+
+        if int(w_down.shape[0]) == g.IS:
+            r0 = sh_rank * isr
+            w_sh2 = w_down[r0 : r0 + isr, :].contiguous()
+        elif int(w_down.shape[0]) == isr:
+            w_sh2 = w_down.contiguous()
+        elif sh_rep > 1 and int(w_down.shape[0]) == local_isr:
+            w_sh2, s_down = _gather_replicated_sh2(
+                w_down.contiguous(),
+                s_down,
+                g=g,
+                ex=ex,
+                sh_rank=sh_rank,
+                tp_all_gather_fn=tp_all_gather_fn,
+            )
+        else:
+            raise ValueError(
+                f"Unexpected _fused_se_down_fp8_weight shape {tuple(w_down.shape)}"
+            )
+    else:
+        gate_w = mlp.gate.weight.data
+        if tuple(gate_w.shape) == (g.E, g.H):
+            gate_w = gate_w.transpose(0, 1)
+        w_router_bf16 = (
+            gate_w.to(torch.bfloat16)
+            .contiguous()
+            .view(g.H // tk_router, tk_router, g.E)
+        )
+
+        gu_proj = mlp.shared_expert.gate_up_proj
+        down_proj = mlp.shared_expert.down_proj
+        gu_cols = int(
+            gu_proj.weight.shape[1]
+            if getattr(gu_proj, WEIGHT_FLIPPED_ATTR, False)
+            or gu_proj.weight.shape[0] == g.H
+            else gu_proj.weight.shape[0]
+        )
+        w_gu_only, s_gu_only = extract_kn_fp8_weight(gu_proj, g.H, gu_cols)
+        if gu_cols == 2 * g.IS:
+            g0 = sh_rank * isr
+            u0 = g.IS + sh_rank * isr
+            w_sh13 = torch.cat(
+                [w_gu_only[:, g0 : g0 + isr], w_gu_only[:, u0 : u0 + isr]], dim=1
+            ).contiguous()
+            s_sh13 = torch.cat(
+                [s_gu_only[g0 : g0 + isr], s_gu_only[u0 : u0 + isr]], dim=0
+            ).contiguous()
+        elif gu_cols == 2 * isr:
+            w_sh13 = w_gu_only.contiguous()
+            s_sh13 = s_gu_only.contiguous()
+        elif sh_rep > 1 and gu_cols == 2 * local_isr:
+            w_sh13, s_sh13 = _gather_replicated_sh13(
+                w_gu_only,
+                s_gu_only,
+                g=g,
+                ex=ex,
+                sh_rank=sh_rank,
+                tp_all_gather_fn=tp_all_gather_fn,
+            )
+        else:
+            raise ValueError(f"Unexpected shared_expert.gate_up_proj cols {gu_cols}")
+
+        down_rows = int(
+            down_proj.weight.shape[0]
+            if getattr(down_proj, WEIGHT_FLIPPED_ATTR, False)
+            or down_proj.weight.shape[1] == g.H
+            else down_proj.weight.shape[1]
+        )
+        w_down_only, s_down = extract_kn_fp8_weight(down_proj, down_rows, g.H)
+        if down_rows == g.IS:
+            r0 = sh_rank * isr
+            w_sh2 = w_down_only[r0 : r0 + isr, :].contiguous()
+        elif down_rows == isr:
+            w_sh2 = w_down_only.contiguous()
+        elif sh_rep > 1 and down_rows == local_isr:
+            w_sh2, s_down = _gather_replicated_sh2(
+                w_down_only,
+                s_down,
+                g=g,
+                ex=ex,
+                sh_rank=sh_rank,
+                tp_all_gather_fn=tp_all_gather_fn,
+            )
+        else:
+            raise ValueError(f"Unexpected shared_expert.down_proj rows {down_rows}")
+
+        sh_gate = mlp.shared_expert_gate.weight.data.float().reshape(g.H).contiguous()
+
+    return {
+        "router": w_router_bf16,
+        "sh13": w_sh13.view(g.H // tk_sh13, tk_sh13, 2 * isr),
+        "sh2": w_sh2.view(isr // tk_sh2, tk_sh2, g.H),
+        "sh13_s": s_sh13,
+        "sh2_s": s_down,
+        "sh_gate": sh_gate,
+    }
+
+
 class VLLMWeightSource:
     """`WeightSource` backed by a live vLLM decoder `backbone` (`layers` + `norm`)."""
 
-    def __init__(self, backbone: Any, g: Any) -> None:
+    def __init__(
+        self,
+        backbone: Any,
+        g: Any,
+        *,
+        tp_all_gather_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    ) -> None:
         _need(
             len(backbone.layers) == int(g.L),
             f"expected {g.L} layers, got {len(backbone.layers)}",
@@ -326,6 +638,8 @@ class VLLMWeightSource:
         self._backbone = backbone
         self._dev = backbone.norm.weight.device
         self._ops = TorchArrayOps(device=self._dev)
+        self._tp_all_gather_fn = tp_all_gather_fn
+        self._g = g
 
     @property
     def ops(self) -> ArrayOps:
@@ -389,11 +703,28 @@ class VLLMWeightSource:
                 w.is_contiguous(),
                 "expert weights must be contiguous for zero-copy views",
             )
-            s_raw = self._read_scale(layer, proj_obj, alias)
             leaf_name = alias.source.rsplit(".", 1)[-1]
+            raw_stash = getattr(proj_obj, "_mk_nvfp4_raw", None)
+            gscale_override = None
+            if raw_stash is not None:
+                w13_src, bs13_src, g13_src, w2_src, bs2_src, g2_src = raw_stash
+                if leaf_name == "w13_weight":
+                    w = w13_src
+                    s_raw = bs13_src
+                    gscale_override = g13_src
+                elif leaf_name == "w2_weight":
+                    w = w2_src
+                    s_raw = bs2_src
+                    gscale_override = g2_src
+                else:
+                    s_raw = self._read_scale(layer, proj_obj, alias)
+            else:
+                s_raw = self._read_scale(layer, proj_obj, alias)
+
             is_nvfp4 = (
                 jnp.dtype(d0.dtype) == jnp.dtype(U8)
                 or getattr(proj_obj, f"{leaf_name}_scale_2", None) is not None
+                or gscale_override is not None
             )
             if is_nvfp4:
                 ew = int(w.shape[0])
@@ -403,14 +734,56 @@ class VLLMWeightSource:
                 w_buf, pre_fused = _pack_nvfp4_w(
                     w, s_raw, ew, k_dim, n_dim, name=leaf_name
                 )
-                s_buf = _extract_nvfp4_global_scale(
-                    proj_obj,
-                    s_raw,
-                    ew=ew,
-                    n_dim=n_dim,
-                    pre_fused=pre_fused,
-                    name=leaf_name,
-                )
+                if gscale_override is not None:
+                    gscale = gscale_override
+                    if not gscale.is_floating_point() or gscale.numel() not in (
+                        ew,
+                        2 * ew,
+                        ew * n_dim,
+                    ):
+                        raise MegakernelConfigError(
+                            f"{leaf_name}_scale_2: expected float tensor of {ew} or "
+                            f"{2 * ew} elements, got shape {tuple(gscale.shape)} and "
+                            f"dtype {gscale.dtype} {_NVFP4_STOCK_MSG}"
+                        )
+                    if gscale.numel() == 2 * ew:
+                        ir = n_dim // 2
+                        s_buf = (
+                            gscale.data.float()
+                            .reshape(ew, 2, 1)
+                            .expand(ew, 2, ir)
+                            .reshape(ew, 2 * ir)
+                            .contiguous()
+                        )
+                    else:
+                        s_buf = (
+                            gscale.data.float()
+                            .reshape(ew, -1)
+                            .expand(ew, n_dim)
+                            .contiguous()
+                        )
+                else:
+                    s_buf = _extract_nvfp4_global_scale(
+                        proj_obj,
+                        s_raw,
+                        ew=ew,
+                        n_dim=n_dim,
+                        pre_fused=pre_fused,
+                        name=leaf_name,
+                    )
+                target_dev = getattr(proj_obj, "w13_weight", w).device
+                if w_buf.device != target_dev:
+                    w_buf = _own(w_buf.to(target_dev))
+                if s_buf.device != target_dev:
+                    s_buf = s_buf.to(target_dev)
+
+                resolved = getattr(proj_obj, "_mk_nvfp4_resolved", set())
+                resolved.add(leaf_name)
+                proj_obj._mk_nvfp4_resolved = resolved
+                if {"w13_weight", "w2_weight"}.issubset(resolved):
+                    if hasattr(proj_obj, "_mk_nvfp4_raw"):
+                        delattr(proj_obj, "_mk_nvfp4_raw")
+                    delattr(proj_obj, "_mk_nvfp4_resolved")
             else:
                 _need(
                     s_raw is not None, f"Expert weight {alias.source!r} missing scale"
@@ -427,6 +800,68 @@ class VLLMWeightSource:
         elif len(target_decls) == 1 and len(d0.shape) == 1:
             w_buf = w.reshape(-1)
         elif w.ndim == 2 and not d0.transform.flatten_tail:
+            sh_rep = getattr(self._g, "sh_rep", lambda r: 1)(R)
+            if self._tp_all_gather_fn is not None and sh_rep > 1:
+                local_isr = self._g.IS // R
+                sh_rank = tp_rank // sh_rep
+                if "shared_expert.gate_up_proj" in alias.source:
+                    gu_cols = int(
+                        w.shape[1]
+                        if getattr(proj_obj, WEIGHT_FLIPPED_ATTR, False)
+                        or w.shape[0] == self._g.H
+                        else w.shape[0]
+                    )
+                    w_gu, s_gu = extract_kn_fp8_weight(proj_obj, self._g.H, gu_cols)
+                    if gu_cols == 2 * local_isr:
+                        w_sh13, s_sh13 = _gather_replicated_sh13(
+                            w_gu,
+                            s_gu,
+                            g=self._g,
+                            ex=SimpleNamespace(R=R),
+                            sh_rank=sh_rank,
+                            tp_all_gather_fn=self._tp_all_gather_fn,
+                        )
+                        return slice_alias_targets(
+                            self._ops,
+                            alias,
+                            w_sh13.contiguous(),
+                            s_sh13.contiguous(),
+                            target_decls,
+                            scale_decls,
+                            R=R,
+                            tp_rank=tp_rank,
+                            fuse_groups=fuse_groups,
+                        )
+                elif "shared_expert.down_proj" in alias.source:
+                    down_rows = int(
+                        w.shape[0]
+                        if getattr(proj_obj, WEIGHT_FLIPPED_ATTR, False)
+                        or w.shape[1] == self._g.H
+                        else w.shape[1]
+                    )
+                    w_down, s_down = extract_kn_fp8_weight(
+                        proj_obj, down_rows, self._g.H
+                    )
+                    if down_rows == local_isr:
+                        w_sh2, s_down_g = _gather_replicated_sh2(
+                            w_down,
+                            s_down,
+                            g=self._g,
+                            ex=SimpleNamespace(R=R),
+                            sh_rank=sh_rank,
+                            tp_all_gather_fn=self._tp_all_gather_fn,
+                        )
+                        return slice_alias_targets(
+                            self._ops,
+                            alias,
+                            w_sh2.contiguous(),
+                            s_down_g.contiguous(),
+                            target_decls,
+                            scale_decls,
+                            R=R,
+                            tp_rank=tp_rank,
+                            fuse_groups=fuse_groups,
+                        )
             k_full, k_shard = target_axis_widths(d0, R, 0)
             valid_k = {k_full, k_shard}
             n_widths = [target_axis_widths(d, R, -1) for d in target_decls]
@@ -523,10 +958,11 @@ def load_vllm_weights(
     g: Any = None,
     tp_rank: int = 0,
     expert_placement: Any = None,
+    tp_all_gather_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> dict[str, Any]:
     """Extract and pack all layers of `backbone` via `load_weights`."""
     _, geom, _, _, _ = resolve_spec_and_norms(model_def, ex, g=g)
-    source = VLLMWeightSource(backbone, geom)
+    source = VLLMWeightSource(backbone, geom, tp_all_gather_fn=tp_all_gather_fn)
     return load_weights(
         model_def,
         ex,
@@ -624,11 +1060,24 @@ def _extract_nvfp4_global_scale(
             f"NVFP4 packing {_NVFP4_STOCK_MSG}"
         )
     if gscale is not None:
-        if not gscale.is_floating_point() or gscale.numel() not in (ew, ew * n_dim):
+        if not gscale.is_floating_point() or gscale.numel() not in (
+            ew,
+            2 * ew,
+            ew * n_dim,
+        ):
             raise MegakernelConfigError(
-                f"{name}_scale_2: expected float tensor of {ew} elements, "
+                f"{name}_scale_2: expected float tensor of {ew} or {2 * ew} elements, "
                 f"got shape {tuple(gscale.shape)} and dtype {gscale.dtype} "
                 f"{_NVFP4_STOCK_MSG}"
+            )
+        if gscale.numel() == 2 * ew:
+            ir = n_dim // 2
+            return (
+                gscale.data.float()
+                .reshape(ew, 2, 1)
+                .expand(ew, 2, ir)
+                .reshape(ew, 2 * ir)
+                .contiguous()
             )
         return gscale.data.float().reshape(ew, -1).expand(ew, n_dim).contiguous()
     _need(bscale_raw is not None, f"Expert weight {name!r} missing scale")
@@ -661,14 +1110,26 @@ def pack_expert_views_layer(
     is_nvfp4 = (
         str(getattr(g, "expert_quant", "fp8")) == "nvfp4"
         or getattr(experts, "w13_weight_scale_2", None) is not None
+        or getattr(experts, "_mk_nvfp4_raw", None) is not None
     )
     if is_nvfp4:
-        b13_raw = getattr(experts, "w13_weight_scale", None)
-        b2_raw = getattr(experts, "w2_weight_scale", None)
+        target_dev = w13.device
+        raw_stash = getattr(experts, "_mk_nvfp4_raw", None)
+        if raw_stash is not None:
+            delattr(experts, "_mk_nvfp4_raw")
+            w13_src, bs13_src, g13, w2_src, bs2_src, g2 = raw_stash
+        else:
+            w13_src = w13
+            bs13_src = getattr(experts, "w13_weight_scale", None)
+            g13 = getattr(experts, "w13_weight_scale_2", None)
+            w2_src = w2
+            bs2_src = getattr(experts, "w2_weight_scale", None)
+            g2 = getattr(experts, "w2_weight_scale_2", None)
+
         e13_fused, pre13 = _pack_nvfp4_w(
-            w13, b13_raw, ew, g.H, 2 * ir, name="w13_weight"
+            w13_src, bs13_src, ew, g.H, 2 * ir, name="w13_weight"
         )
-        e2_fused, pre2 = _pack_nvfp4_w(w2, b2_raw, ew, ir, g.H, name="w2_weight")
+        e2_fused, pre2 = _pack_nvfp4_w(w2_src, bs2_src, ew, ir, g.H, name="w2_weight")
         if not ex.stack_e:
             e13_view, e2_view = e13_fused, e2_fused
         else:
@@ -676,22 +1137,53 @@ def pack_expert_views_layer(
             k2_half, n2_raw = int(e2_fused.shape[1]), int(e2_fused.shape[2])
             e13_view = e13_fused.view(ew, k13_half // tk_e13, tk_e13, n13_raw)
             e2_view = e2_fused.view(ew, k2_half // tk_e2, tk_e2, n2_raw)
-        s13 = _extract_nvfp4_global_scale(
-            experts,
-            b13_raw,
-            ew=ew,
-            n_dim=2 * ir,
-            pre_fused=pre13 and pre2,
-            name="w13_weight",
+
+        if not (pre13 and pre2) and (g13 is None or g2 is None):
+            raise MegakernelConfigError(
+                "w13_weight_scale_2 and w2_weight_scale_2 must be present for raw "
+                f"NVFP4 packing {_NVFP4_STOCK_MSG}"
+            )
+        if g13 is not None and (
+            not g13.is_floating_point() or g13.numel() not in (ew, 2 * ew, ew * 2 * ir)
+        ):
+            raise MegakernelConfigError(
+                f"w13_weight_scale_2: expected float tensor of {ew} or "
+                f"{2 * ew} elements, got shape {tuple(g13.shape)} and "
+                f"dtype {g13.dtype} {_NVFP4_STOCK_MSG}"
+            )
+        if g2 is not None and (
+            not g2.is_floating_point() or g2.numel() not in (ew, ew * g.H)
+        ):
+            raise MegakernelConfigError(
+                f"w2_weight_scale_2: expected float tensor of {ew} elements, "
+                f"got shape {tuple(g2.shape)} and dtype {g2.dtype} {_NVFP4_STOCK_MSG}"
+            )
+        if g13 is None:
+            s13 = experts.w13_weight_scale.data.float().reshape(ew, 2 * ir)
+        elif g13.numel() == 2 * ew:
+            s13 = (
+                g13.data.float()
+                .reshape(ew, 2, 1)
+                .expand(ew, 2, ir)
+                .reshape(ew, 2 * ir)
+                .contiguous()
+            )
+        else:
+            s13 = g13.data.float().reshape(ew, -1).expand(ew, 2 * ir).contiguous()
+
+        s2 = (
+            g2.data.float().reshape(ew, -1).expand(ew, g.H).contiguous()
+            if g2 is not None
+            else experts.w2_weight_scale.data.float().reshape(ew, g.H)
         )
-        s2 = _extract_nvfp4_global_scale(
-            experts,
-            b2_raw,
-            ew=ew,
-            n_dim=g.H,
-            pre_fused=pre13 and pre2,
-            name="w2_weight",
-        )
+        if e13_view.device != target_dev:
+            e13_view = _own(e13_view.to(target_dev))
+        if e2_view.device != target_dev:
+            e2_view = _own(e2_view.to(target_dev))
+        if s13.device != target_dev:
+            s13 = s13.to(target_dev)
+        if s2.device != target_dev:
+            s2 = s2.to(target_dev)
     else:
         if not ex.stack_e:
             e13_view = w13
@@ -874,7 +1366,37 @@ def reshard_layer_experts_ep_to_tp(
     apply_tp_moe_flags(mlp.experts, prebuild_moe_fn=prebuild_moe_fn)
 
 
+def pack_weights(
+    backbone: Any,
+    g: Any,
+    ex: ExecSpec,
+    *,
+    tp_rank: int = 0,
+    expert_placement: Any = None,
+    tp_all_gather_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> dict[str, Any]:
+    """Pack all layers of `backbone` into the megakernel's weight dictionary."""
+    mdef = getattr(g, "_model_def", None)
+    if mdef is None:
+        from vllm_torchtpu.megakernel.models.qwen35 import Qwen35
+
+        mdef = Qwen35
+    return load_vllm_weights(
+        mdef,
+        backbone,
+        ex,
+        g=g,
+        tp_rank=tp_rank,
+        expert_placement=expert_placement,
+        tp_all_gather_fn=tp_all_gather_fn,
+    )
+
+
 __all__ = [
+    "pack_weights",
+    "pack_router_and_shared_layer",
+    "_gather_replicated_sh13",
+    "_gather_replicated_sh2",
     "TorchArrayOps",
     "VLLMWeightSource",
     "WEIGHT_FLIPPED_ATTR",

@@ -138,7 +138,7 @@ def _fake_runner(
 
 
 def test_baseline_tiles_r32_selects_hypercube_hier3():
-    """At R=32, baseline_tiles and tp32_dcp8_tiles use hier=3 (rsag=False)."""
+    """At R=32, baseline_tiles uses hier=3 and tp32_dcp8_tiles uses hier=4."""
     for b in (1, 4, 8, 16, 24, 32):
         t8 = baseline_tiles(b, R=8)
         t32 = baseline_tiles(b, R=32)
@@ -148,8 +148,8 @@ def test_baseline_tiles_r32_selects_hypercube_hier3():
         else:
             assert t32.hier == 0
         t_dcp = tp32_dcp8_tiles(b, R=32)
-        if b <= 16:
-            assert t_dcp.hier == 3
+        if b <= 32:
+            assert (t_dcp.hier, t_dcp.hier_group) == (4, 8)
             assert not t_dcp.rsag
     for b in (1, 8, 16):
         t4 = baseline_tiles(b, R=4)
