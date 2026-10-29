@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import functools
 from dataclasses import dataclass
 from typing import Any
 
@@ -328,3 +329,106 @@ def compute_num_rejected(
     num_reqs = num_draft.shape[0]
     num_valid = (next_tokens[:num_reqs] != INVALID_TOKEN_ID).sum(dim=1)
     return (num_draft - num_valid + 1).clamp(min=0).to(torch.int32)
+
+
+def _unmark_dynamic_arg(arg: Any) -> Any:
+    """Return a shallow slice view when arg carries Dynamo dynamic-dim marks."""
+    if isinstance(arg, torch.Tensor) and getattr(arg, "_dynamo_dynamic_indices", None):
+        return arg[:]
+    return arg
+
+
+def static_shape_args(fn: Any) -> Any:
+    """Strip dynamo dynamic-dim marks from a compiled region's tensor args."""
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        clean_args = [_unmark_dynamic_arg(arg) for arg in args]
+        clean_kwargs = {key: _unmark_dynamic_arg(val) for key, val in kwargs.items()}
+        return fn(*clean_args, **clean_kwargs)
+
+    return wrapper
+
+
+def draft_seed_input_ids(
+    input_ids: torch.Tensor,
+    last_token_indices: torch.Tensor,
+    next_token_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Shift input_ids by 1 and scatter seed next_token_ids at last_token_indices."""
+    shifted = input_ids
+    if input_ids.shape[0] > 1:
+        shifted = torch.cat((input_ids[1:], input_ids[-1:]), dim=0)
+    return shifted.index_put((last_token_indices,), next_token_ids.to(input_ids.dtype))
+
+
+def compute_async_draft_seeds_and_indices(
+    next_tokens: torch.Tensor,
+    draft_lengths: torch.Tensor,
+    query_start_loc: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Derive seed tokens, seed positions, and rejection counts on device.
+
+    Args:
+        next_tokens: [batch_size, K+1] rejection-sampler output padded with
+            INVALID_TOKEN_ID.
+        draft_lengths: [batch_size] scheduled draft count per request.
+        query_start_loc: [batch_size + 1] start offsets of requests.
+
+    Returns:
+        (next_token_ids, last_token_indices, num_rejected)
+    """
+    width = next_tokens.shape[0]
+    num_valid = (next_tokens != INVALID_TOKEN_ID).sum(dim=1).clamp(min=1)
+    last_valid_col = num_valid - 1
+    next_token_ids = (
+        next_tokens.gather(1, last_valid_col.unsqueeze(1)).squeeze(1).to(torch.int32)
+    )
+    num_draft_dev = draft_lengths[:width].to(torch.int64)
+    accepted_drafts = torch.minimum((num_valid - 1).clamp(min=0), num_draft_dev)
+    num_rejected = (num_draft_dev - accepted_drafts).to(torch.int32)
+    qsl_end = query_start_loc[1 : width + 1].to(torch.int64)
+    if qsl_end.shape[0] < width:
+        qsl_end = torch.cat([qsl_end, qsl_end[-1:].expand(width - qsl_end.shape[0])])
+    last_token_indices = qsl_end - 1 - num_rejected.to(torch.int64)
+    return next_token_ids, last_token_indices, num_rejected
+
+
+def update_mamba_slot_read_offsets(
+    read_offsets: torch.Tensor,
+    groups: torch.Tensor | list[torch.Tensor],
+    next_tokens: torch.Tensor | None,
+    num_reqs: int,
+) -> torch.Tensor:
+    """Scatter mamba read offsets into the slot-indexed buffer.
+
+    For rows 0 <= i < num_reqs, the offset is (num_valid - 1).clamp(min=0).
+    For rows >= num_reqs, the offset is 0. Writes to slot 0 (null block) are
+    masked to 0.
+    """
+    if isinstance(groups, list):
+        groups_2d = (
+            torch.stack(groups, dim=0) if len(groups) > 1 else groups[0].unsqueeze(0)
+        )
+    else:
+        groups_2d = groups if groups.ndim == 2 else groups.unsqueeze(0)
+    width = groups_2d.shape[1]
+    offsets = torch.zeros(width, dtype=read_offsets.dtype, device=read_offsets.device)
+    if next_tokens is not None:
+        eff_reqs = min(num_reqs, next_tokens.shape[0], width)
+        if eff_reqs > 0:
+            num_valid = (
+                (next_tokens[:eff_reqs] != INVALID_TOKEN_ID)
+                .sum(dim=1)
+                .to(read_offsets.dtype)
+            )
+            offsets[:eff_reqs] = (num_valid - 1).clamp(min=0)
+    all_indices = groups_2d.reshape(-1).long()
+    zero_val = torch.zeros((), dtype=read_offsets.dtype, device=read_offsets.device)
+    all_offsets = torch.where(
+        all_indices != 0,
+        offsets.unsqueeze(0).expand_as(groups_2d).reshape(-1),
+        zero_val,
+    )
+    read_offsets.index_put_((all_indices,), all_offsets)
+    return read_offsets

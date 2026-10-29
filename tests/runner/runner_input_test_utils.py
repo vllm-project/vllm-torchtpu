@@ -139,6 +139,9 @@ def _make_runner(
     runner._static_decode_tracker = None
     runner._pending_static_verify = None
     runner._last_step_used_static_decode = False
+    runner._fused_async_subst_done = False
+    runner._folded_steady_state_prep = None
+    runner._fold_epilogue_mask_cache = {}
     runner._num_static_verify_reqs = 0
     runner._pre_async_results = None
     runner.requests = {}

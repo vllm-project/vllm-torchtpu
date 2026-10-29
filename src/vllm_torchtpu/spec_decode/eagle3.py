@@ -16,7 +16,6 @@ from __future__ import annotations
 import contextlib
 import copy
 import dataclasses
-import functools
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any, cast
 
@@ -43,6 +42,11 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
+from vllm_torchtpu.runner.tpu_runner_async_output import (
+    compute_async_draft_seeds_and_indices,
+    draft_seed_input_ids,
+    static_shape_args,
+)
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _force_draft_tp1,
@@ -52,51 +56,8 @@ from vllm_torchtpu.spec_decode.utils import (
 )
 from vllm_torchtpu.utils import synchronize_tensors
 
-# Sentinel for rejected / padding slots in the rejection-sampler output (and the
-# async substitution tensors). Matches RejectionSampler.PLACEHOLDER_TOKEN_ID and
-# the async runner's INVALID_TOKEN_ID.
-INVALID_TOKEN_ID = -1
-
-
-def _static_shape_args(fn):
-    """Strip dynamo dynamic-dim marks from a compiled region's tensor args.
-
-    vLLM's `@support_torch_compile` marks the model's `input_ids`/`positions`
-    dynamic on every forward (`vllm/compilation/decorators.py:585`), and
-    `torch._dynamo.mark_dynamic` records that by stamping a
-    `_dynamo_dynamic_indices` attribute onto the tensor *object*. The stamp
-    outlives the forward that applied it, and it has strictly higher precedence
-    than `dynamic=False` -- `mark_static` is documented as the lower-precedence
-    of the pair, so it cannot undo it. Hand such a tensor to one of the draft's
-    static regions and dynamo lifts a SymInt into the graph, which torch-tpu
-    rejects outright (`torch_tpu/_internal/compile/_backend.py:_raise_on_symint`
-    -> "TPU backend: does not support dynamic shape").
-
-    That is how `propose` used to die on its first draft step: `_forward_draft`
-    runs the draft model on `positions`, marking it, and the very next line
-    passed the same object to `_draft_gather_carries`. It presented as flaky and
-    rank-dependent only because a warm compile cache short-circuits the backend
-    call, so whether it fired depended on cache state rather than on shapes.
-
-    A view is a distinct Python object and carries no stamp, so aliasing is
-    enough; it copies nothing. Tensors that were never marked are passed through
-    untouched.
-    """
-
-    @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
-        def unmark(a):
-            if isinstance(a, torch.Tensor) and getattr(
-                a, "_dynamo_dynamic_indices", None
-            ):
-                return a[:]
-            return a
-
-        return fn(
-            *[unmark(a) for a in args], **{k: unmark(v) for k, v in kwargs.items()}
-        )
-
-    return wrapper
+# Alias static_shape_args for backwards compatibility.
+_static_shape_args = static_shape_args
 
 
 def _maybe_pad_dim0(t: torch.Tensor, target_len: int) -> torch.Tensor:
@@ -287,6 +248,7 @@ class Eagle3Proposer:
         self._loop_qsl_reqdist_cache: dict[
             tuple[int, int, str], tuple[torch.Tensor, torch.Tensor]
         ] = {}
+        self._async_pad_req_idx_cache: dict[tuple[int, int, str], torch.Tensor] = {}
 
     @property
     def advance_draft_positions(self) -> bool:
@@ -780,7 +742,75 @@ class Eagle3Proposer:
                 self._mtp_fused_loop(input_ids, positions, hidden_states, seq_lens)
                 seq_lens.copy_(seq_lens_step1)
                 self._mtp_fused_loop_warm = True
-            return self._mtp_fused_loop(input_ids, positions, hidden_states, seq_lens)
+            loop_out = self._mtp_fused_loop(
+                input_ids, positions, hidden_states, seq_lens
+            )
+            if envs.TPU_FOLD_SPEC_BOOKKEEPING:
+                chunk._last_fused_loop_pos_sl = (positions, seq_lens)
+            return loop_out
+
+    def _unpack_fold_epilogue_output(
+        self,
+        chunk: DraftChunkInputs,
+        epilogue_out: tuple[torch.Tensor, ...],
+    ) -> torch.Tensor:
+        prep = chunk._precomputed_draft_prep
+        if prep is not None and len(epilogue_out) >= 2:
+            prep.src_padded = epilogue_out[1]
+            if len(epilogue_out) >= 6:
+                prep.next_seq_lens = epilogue_out[2]
+                prep.next_positions = epilogue_out[3]
+                prep.next_input_ids = epilogue_out[4]
+                prep.next_draft_token_ids = epilogue_out[5]
+        return epilogue_out[0]
+
+    def _apply_fold_epilogue(
+        self,
+        chunk: DraftChunkInputs,
+        loop_out: torch.Tensor,
+        pos_step1: torch.Tensor | None,
+        seq_lens_end: torch.Tensor,
+        *,
+        seq_lens_is_step1: bool = False,
+    ) -> torch.Tensor:
+        if not envs.TPU_FOLD_SPEC_BOOKKEEPING:
+            return loop_out
+        prep = chunk._precomputed_draft_prep
+        if prep is None or prep.bonus_full is None:
+            return loop_out
+        eff_pos_step1 = prep.pos_step1 if prep.pos_step1 is not None else pos_step1
+        if eff_pos_step1 is None:
+            return loop_out
+        spec_k = int(self.speculative_config.num_speculative_tokens)
+        max_reqs = int(self.runner.max_num_reqs or 0)
+        assemble_bound = max_reqs * (1 + spec_k)
+        if assemble_bound <= 0:
+            return loop_out
+        from vllm_torchtpu.runner.static_decode_buffers import (
+            _compiled_fold_draft_loop_spec_bookkeeping,
+            fold_draft_loop_spec_bookkeeping,
+        )
+
+        epilogue_fn = (
+            _compiled_fold_draft_loop_spec_bookkeeping
+            if loop_out.device.type == "tpu"
+            else fold_draft_loop_spec_bookkeeping
+        )
+        epilogue_out = epilogue_fn(
+            loop_out,
+            eff_pos_step1,
+            seq_lens_end,
+            prep.bonus_full,
+            assemble_bound,
+            spec_k - 1,
+            prep.pos_req_expand_idx,
+            prep.pos_step1_offsets,
+            prep.valid_token_mask,
+            prep.valid_req_mask,
+            prep.valid_draft_mask,
+            seq_lens_is_step1,
+        )
+        return self._unpack_fold_epilogue_output(chunk, epilogue_out)
 
     def _run_mtp_full_draft_loop(
         self,
@@ -879,7 +909,7 @@ class Eagle3Proposer:
                     loop_request_distribution,
                 )
                 self._mtp_full_draft_loop_warm = True
-            return program(
+            loop_out = program(
                 step0_input_ids,
                 step0_positions,
                 target_hidden_states,
@@ -890,6 +920,26 @@ class Eagle3Proposer:
                 num_rejected_dev,
                 loop_query_start_loc,
                 loop_request_distribution,
+            )
+            if not envs.TPU_FOLD_SPEC_BOOKKEEPING:
+                return loop_out
+            prep = chunk._precomputed_draft_prep
+            eff_pos1 = (
+                prep.pos_step1
+                if prep is not None and prep.pos_step1 is not None
+                else None
+            )
+            eff_sl1 = (
+                prep.seq_lens_step1
+                if prep is not None and prep.seq_lens_step1 is not None
+                else step0_seq_lens
+            )
+            return self._apply_fold_epilogue(
+                chunk,
+                loop_out,
+                eff_pos1,
+                eff_sl1,
+                seq_lens_is_step1=True,
             )
 
     def _draft_model_for_step(self, step_idx: int) -> torch.nn.Module:
@@ -1395,21 +1445,7 @@ class Eagle3Proposer:
         last_token_indices: torch.Tensor,
         next_token_ids: torch.Tensor,
     ) -> torch.Tensor:
-        # Functional (no in-place) eagle3 first-pass input prep so fullgraph
-        # holds: (1) left-shift by one (mirrors set_inputs_first_pass), (2)
-        # scatter the per-request seed token at last_token_indices. Run raw, the
-        # clone+shift and the index assignment are eager ops the DEFER_AND_FUSE
-        # path fuses with the combine mm / metadata per context. Wrapping in one
-        # compiled region keyed on [len(input_ids), len(indices)] removes them
-        # from the per-context re-fusion. torch.cat((ids[1:], ids[-1:])) is
-        # value-identical to clone()+[:-1]=ids[1:] (last slot keeps its own
-        # value), and index_put is the functional twin of ids[idx] = val.
-        shifted = input_ids
-        if input_ids.shape[0] > 1:
-            shifted = torch.cat((input_ids[1:], input_ids[-1:]), dim=0)
-        return shifted.index_put(
-            (last_token_indices,), next_token_ids.to(input_ids.dtype)
-        )
+        return draft_seed_input_ids(input_ids, last_token_indices, next_token_ids)
 
     def propose(
         self,
@@ -1805,17 +1841,37 @@ class Eagle3Proposer:
         # to the real num_reqs at the end. Sync slices on the host (the [p, K] D2H
         # is constant-shape, so no recompile); async keeps the device slice
         # (matches prior behaviour for the substitution source).
-        per_chunk_stacked = [
-            toks[0] if used_full else torch.stack(toks, dim=1)
-            for toks, used_full in zip(draft_tokens_per_chunk, chunk_used_full_loop)
-        ]
+        per_chunk_stacked: list[torch.Tensor] = []
+        for chunk_obj, token_list, used_full in zip(
+            chunks, draft_tokens_per_chunk, chunk_used_full_loop
+        ):
+            if used_full:
+                per_chunk_stacked.append(token_list[0])
+            else:
+                stacked_chunk = torch.stack(token_list, dim=1)
+                if envs.TPU_FOLD_SPEC_BOOKKEEPING:
+                    last_pos_sl = chunk_obj._last_fused_loop_pos_sl
+                    if last_pos_sl is not None:
+                        chunk_obj._last_fused_loop_pos_sl = None
+                        stacked_chunk = self._apply_fold_epilogue(
+                            chunk_obj,
+                            stacked_chunk,
+                            last_pos_sl[0],
+                            last_pos_sl[1],
+                            seq_lens_is_step1=False,
+                        )
+                per_chunk_stacked.append(stacked_chunk)
         if return_device:
             return torch.cat(
-                [s[: c.num_reqs] for s, c in zip(per_chunk_stacked, chunks)], dim=0
+                [
+                    stacked[: chunk_item.num_reqs]
+                    for stacked, chunk_item in zip(per_chunk_stacked, chunks)
+                ],
+                dim=0,
             )
         result = []
-        for s, c in zip(per_chunk_stacked, chunks):
-            result.extend(s.cpu().tolist()[: c.num_reqs])
+        for stacked, chunk_item in zip(per_chunk_stacked, chunks):
+            result.extend(stacked.cpu().tolist()[: chunk_item.num_reqs])
         return result
 
     def _prepare_draft_inputs(
@@ -1906,6 +1962,32 @@ class Eagle3Proposer:
         discard_set = set(discard_sampled_tokens_req_indices)
         req_ids = runner.input_batch.req_ids[start : start + num_reqs]
         if next_tokens_device is not None:
+            precomputed_prep = (
+                chunk._precomputed_draft_prep
+                if envs.TPU_FOLD_SPEC_BOOKKEEPING
+                else None
+            )
+            if (
+                precomputed_prep is not None
+                and not discard_set
+                and precomputed_prep.draft_input_ids is not None
+            ):
+                draft_input_ids = precomputed_prep.draft_input_ids
+                gather_indices = precomputed_prep.gather_indices
+                num_rejected_out = precomputed_prep.num_rejected_knr
+                draft_input_ids, gather_indices = (
+                    chunk.sequence_layout_plan.localize_token_tensor_and_gather_indices(
+                        draft_input_ids,
+                        gather_indices,
+                        num_valid_gathers=num_reqs,
+                    )
+                )
+                return (
+                    draft_input_ids,
+                    chunk.position_ids,
+                    gather_indices,
+                    num_rejected_out,
+                )
             # Async path: derive the seed token, the seed *position*
             # (last_token_indices) and the rejected count from the on-device
             # rejection-sampler output instead of the host num_rejected /
@@ -1914,16 +1996,6 @@ class Eagle3Proposer:
             # fused programs are keyed on the request-padding bucket and not
             # on num_reqs; the rows past num_reqs are masked below.
             width = next_tokens_device.shape[0]
-            nt = next_tokens_device
-            num_valid = (nt != INVALID_TOKEN_ID).sum(dim=1).clamp(min=1)
-            last_valid_col = num_valid - 1
-            next_token_ids = (
-                nt.gather(1, last_valid_col.unsqueeze(1)).squeeze(1).to(torch.int32)
-            )
-            # Anchor the seed position at qsl_end-1 (like the sync path) using
-            # the REAL per-request draft count.
-            # num_draft is read on-device from the chunk's draft_lengths snapshot
-            # draft_lengths is None for a chunk with no spec metadata.
             if chunk.draft_lengths is not None:
                 num_draft_dev = chunk.draft_lengths[:width].to(torch.int64)
             else:
@@ -1933,19 +2005,13 @@ class Eagle3Proposer:
                     for rid in req_ids
                 ]
                 num_draft_dev = torch.from_numpy(num_draft_np).to(runner.device)
-            accepted_drafts = torch.minimum((num_valid - 1).clamp(min=0), num_draft_dev)
-            num_rejected_out = (num_draft_dev - accepted_drafts).to(torch.int32)
-            # qsl_end already lives on-device in the chunk's attn context (the
-            # same tensor _build_draft_attn_metadata reads at step_idx=0); slice
-            # it instead of a fresh H2D of query_start_loc_np. The upload is
-            # sized by the chunk's request cap, which can sit below the
-            # request-padding bucket; the rows past it take the last end.
-            qsl_end = chunk.attn_ctx.query_start_loc[1 : width + 1].to(torch.int64)
-            if qsl_end.shape[0] < width:
-                qsl_end = torch.cat(
-                    [qsl_end, qsl_end[-1:].expand(width - qsl_end.shape[0])]
+            next_token_ids, last_token_indices, num_rejected_out = (
+                compute_async_draft_seeds_and_indices(
+                    next_tokens_device,
+                    num_draft_dev,
+                    chunk.attn_ctx.query_start_loc,
                 )
-            last_token_indices = qsl_end - 1 - num_rejected_out.to(torch.int64)
+            )
             # Partial-prefill (discard) requests have no sampled token; seed
             # them from the host request state (same value as the sync path).
             ov_i = [i for i in range(num_reqs) if start + i in discard_set]
