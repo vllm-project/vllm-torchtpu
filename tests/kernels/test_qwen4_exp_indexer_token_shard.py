@@ -130,3 +130,85 @@ def test_mode_is_decided_once_for_the_smallest_sp_bucket(
     assert Qwen4ExpQSA._token_shard_mode(8, False, max_num_seqs) is False
     monkeypatch.setattr(envs, "QWEN4_EXP_PREFILL_SP", False, raising=False)
     assert Qwen4ExpQSA._token_shard_mode(8, True, max_num_seqs) is False
+
+
+VERIFY_STARTS, VERIFY_CONTEXT = [0, 4, 8, 8], [1661, 1663, 0]
+
+
+@pytest.mark.parametrize(
+    "starts,context",
+    [
+        # Two verify requests of four rows and an idle slot.
+        (VERIFY_STARTS, VERIFY_CONTEXT),
+        # A short verify request and a decode: windows hold partial requests.
+        ([0, 3, 4, 4], [1661, 1663, 0]),
+    ],
+)
+@pytest.mark.parametrize("size", [2, 4, 8])
+def test_request_window_shards_compose_to_the_pooled_step(
+    rowwise_attention, starts, context, size
+):
+    """VLLM_TPU_QSA_INDEXER_REQ_SHARD: on a verify-sized step each rank
+    indexes a request window (``request_window_step``); gathering the windows
+    and mapping them back to rows (``request_window_merge``) equals the
+    replicated step bit for bit."""
+    head, pool, tail = mtp_rows._inputs(False, starts, context)
+    options = dict(mtp_rows.OPTIONS, token_topk=256, max_query_len=4)
+    tokens, slots = len(head[0]), len(context)
+    assert pooled_qsa.request_window_shard(tokens, slots, size, 4)
+    want_pool, want_out, want_selected = jax.jit(
+        lambda *args: pooled_qsa.pooled_qsa_step(*args, **options)
+    )(*head, pool, *tail)
+
+    results = [
+        jax.jit(
+            lambda *args: pooled_qsa.pooled_qsa_token_select_step(
+                *args, shard_size=size, **options
+            )
+        )(*head, pool, *tail, jnp.asarray([s], jnp.int32))
+        for s in range(size)
+    ]
+    new_pool, q, gate, lengths, req, starts_out, _ = results[0]
+    np.testing.assert_array_equal(
+        np.asarray(new_pool).view(np.uint8), np.asarray(want_pool).view(np.uint8)
+    )
+    window = pooled_qsa.request_window_shape(slots, size, 4)
+    assert results[0][-1].shape[0] == window[1]
+    gathered = jnp.concatenate([result[-1] for result in results])
+    _, out, selected = jax.jit(
+        lambda *args: pooled_qsa.pooled_qsa_shard_attend_step(
+            *args,
+            kv_heads=2,
+            compress_ratio=4,
+            token_topk=256,
+            max_query_len=4,
+            merged=True,
+            request_window=window,
+        )
+    )(q, gate, lengths, req, starts_out, tail[3], tail[1], new_pool, gathered)
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(want_out))
+    np.testing.assert_array_equal(np.asarray(selected), np.asarray(want_selected))
+
+
+def test_request_window_layout():
+    starts = jnp.asarray([0, 4, 8, 12, 13, 13], jnp.int32)
+    context = jnp.asarray([10, 20, 30, 40, 0], jnp.int32)
+    table = jnp.arange(10, dtype=jnp.int32).reshape(5, 2)
+    first, sub, ctx, rows, own = pooled_qsa.request_window_step(
+        starts, context, table, jnp.asarray([1], jnp.int32), 2, 8
+    )
+    assert int(first) == 2
+    np.testing.assert_array_equal(np.asarray(sub), [0, 4, 5])
+    np.testing.assert_array_equal(np.asarray(ctx), [30, 40])
+    np.testing.assert_array_equal(np.asarray(rows), [[4, 5], [6, 7]])
+    np.testing.assert_array_equal(np.asarray(own(jnp.arange(16))), np.arange(8, 16))
+    # The last window pads past the step's slots with empty requests.
+    first, sub, ctx, rows, own = pooled_qsa.request_window_step(
+        starts, context, table, jnp.asarray([2], jnp.int32), 2, 8
+    )
+    np.testing.assert_array_equal(np.asarray(sub), [0, 0, 0])
+    np.testing.assert_array_equal(np.asarray(ctx), [0, 0])
+    gathered = jnp.arange(24)[:, None] * jnp.ones((1, 3), jnp.int32)
+    req = jnp.asarray([0] * 4 + [1] * 4 + [2] * 4 + [3], jnp.int32)
+    merged = pooled_qsa.request_window_merge(gathered, req, starts, 2, 8)
+    np.testing.assert_array_equal(np.asarray(merged[:, 0]), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])

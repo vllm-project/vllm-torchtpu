@@ -346,7 +346,12 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             persistent=False,
         )
         self.token_shard = self._token_shard_mode(tp_size, pooled, max_num_seqs)
-        if self.token_shard:
+        # VLLM_TPU_QSA_INDEXER_REQ_SHARD: the decode/verify (non-SP) graph
+        # shards the indexer by request windows over the same op.
+        self.req_shard = bool(
+            envs.VLLM_TPU_QSA_INDEXER_REQ_SHARD and pooled and tp_size > 1
+        )
+        if self.token_shard or self.req_shard:
             # The rank as an operand of the token-sharded indexer, so every
             # rank traces the same program.
             self.register_buffer(
@@ -461,7 +466,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         self._shard_op = None
         self._shard_select_op = None
         self._token_shard_op = None
-        if getattr(self, "token_shard", False):
+        if getattr(self, "token_shard", False) or getattr(self, "req_shard", False):
             from vllm.distributed import get_tp_group
 
             from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
@@ -722,7 +727,12 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             # The TP-sharded indexer; it also takes an optional rows operand.
             op = self._shard_op
         token_shard_op = getattr(self, "_token_shard_op", None)
-        if token_shard and rows is None and token_shard_op is not None:
+        if (
+            token_shard
+            and rows is None
+            and token_shard_op is not None
+            and not self.single_graph
+        ):
             # Takes precedence over the key-sharded indexer in this graph.
             op = partial(token_shard_op, shard_index=self.token_shard_index)
         shared_ops = getattr(self, "_shared_ops", None)
