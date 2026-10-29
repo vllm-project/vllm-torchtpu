@@ -899,7 +899,7 @@ def _dcp_ops():
         pooled_qsa_shard_attend_dcp_step,
         pooled_qsa_token_select_dcp_step,
     )
-    from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import dcp_combine
+    from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import dcp_combine_step
 
     step = pallas.jax_op("qwen4_exp::pooled_qsa_dcp", pooled_qsa_dcp_step, donate_argnums=(10,))
 
@@ -962,10 +962,10 @@ def _dcp_ops():
             lengths.new_empty((tokens, token_topk + compress_ratio - 1), dtype=torch.int32),
         )
 
-    combine = pallas.jax_op("qwen4_exp::qsa_dcp_combine", dcp_combine)
+    combine = pallas.jax_op("qwen4_exp::qsa_dcp_combine", dcp_combine_step)
 
     @combine.register_fake
-    def combine_fake(out_pair, lse_pair, gate, rank, out_dtype=None):
+    def combine_fake(out_pair, lse_pair, gate, rank):
         return gate.new_empty(gate.shape, dtype=torch.bfloat16)
 
     return step, select, attend, combine
