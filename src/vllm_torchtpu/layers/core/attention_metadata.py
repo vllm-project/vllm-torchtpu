@@ -504,7 +504,6 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         runner = self.runner
         ctx = runner._attn_metadata_builder_ctx
         target_num_reqs = common_attn_metadata.num_reqs
-        block_table_obj, target_num_blocks = self._block_table_geometry(ctx)
 
         # `position_ids` is only used for the dummy run in dummy runs, where we
         # want to use fixed position IDs instead of copying from the CPU tensor
@@ -514,6 +513,9 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             if ctx.staged_block_tables is not None
             else None
         )
+        # The table geometry (~59 groups' width arithmetic per step for
+        # Qwen4Exp) is derived only on the paths below that slice or reshape
+        # a table; the staged path hands out the walk's outputs as they are.
         if staged is not None:
             # The walk pre-uploaded every group's table in one batched
             # transfer; see `stage_block_table_uploads`.
@@ -524,11 +526,13 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                 else runner.position_ids
             )
         elif ctx.position_ids_override is not None:
+            _, target_num_blocks = self._block_table_geometry(ctx)
             block_tables_dev = torch.zeros(
                 (target_num_reqs * target_num_blocks,), dtype=torch.int32
             ).to(runner.device)
             input_positions = ctx.position_ids_override
         else:
+            block_table_obj, target_num_blocks = self._block_table_geometry(ctx)
             # Per-call buffer: a later chunk or draft walk must not overwrite a
             # table whose upload is still in flight (see `stage_h2d_upload`).
             flat = zeros_h2d_source(runner, target_num_reqs * target_num_blocks)
@@ -567,6 +571,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                 # program alongside the staged tables.
                 mamba_state_indices, mamba_ckpt_indices = staged_products
             else:
+                _, target_num_blocks = self._block_table_geometry(ctx)
                 block_tables_2d = block_tables_dev.reshape(
                     target_num_reqs, target_num_blocks
                 )
