@@ -63,6 +63,8 @@ def inner_kernel(
     records_t_ref=None,
     staged_slots_ref=None,
     num_staged_ref=None,
+    pending_records_ref=None,
+    pending_lanes_ref=None,
     *,
     cfgs: config.Configs,
 ):
@@ -178,25 +180,26 @@ def inner_kernel(
             # Stage the records of the tokens with a kv slot as consecutive
             # lanes of a cache-shaped VMEM array, and their slots alongside;
             # the cache is written from them once the pipeline is done
-            # (kernel_fn).
+            # (kernel_fn). A step stages the previous step's records, so their
+            # staging matmuls overlap this step's compute.
+            stage_pending_records(records_t_ref, pending_records_ref, pending_lanes_ref)
             first_lane = num_staged_ref[0]
             num_staged = first_lane
-            lane_offsets = []
             for i in range(tile_n):
                 slot = kv_slot_mapping_ref[global_idx + i]
                 staged = slot >= 0
                 # Branch-free: an unstaged slot is overwritten or left past
                 # the end.
                 staged_slots_ref[num_staged] = slot
-                lane_offsets.append(jnp.where(staged, num_staged - first_lane, -1))
+                pending_lanes_ref[2 + i] = jnp.where(
+                    staged, num_staged - first_lane, -1
+                )
                 num_staged = num_staged + staged.astype(jnp.int32)
             num_staged_ref[0] = num_staged
-            compute.stage_sal_columns(
-                records_t_ref,
-                jnp.stack([nope_val_padded[n].flatten() for n in range(tile_n)]),
-                first_lane,
-                lane_offsets,
-                num_staged - first_lane,
+            pending_lanes_ref[0] = first_lane
+            pending_lanes_ref[1] = num_staged - first_lane
+            pending_records_ref[...] = jnp.stack(
+                [nope_val_padded[n].flatten() for n in range(tile_n)]
             )
         elif cfgs.dims.mode == config.Mode.CSA_INDEXER:
             kv_slots = []
@@ -244,6 +247,20 @@ def inner_kernel(
         ).reshape(tile_n, cfgs.record_rows, cfgs.hbm_pack, 128)
 
 
+def stage_pending_records(records_t_ref, pending_records_ref, pending_lanes_ref):
+    """`compute.stage_sal_columns` for the records a grid step left pending.
+
+    `pending_lanes` is `[first_lane, num_staged, lane offset of each record]`.
+    """
+    compute.stage_sal_columns(
+        records_t_ref,
+        pending_records_ref[...],
+        pending_lanes_ref[0],
+        [pending_lanes_ref[2 + i] for i in range(pending_records_ref.shape[0])],
+        pending_lanes_ref[1],
+    )
+
+
 def kernel_fn(
     # prefetched inputs (scalar)
     window_rows_ref,
@@ -267,12 +284,13 @@ def kernel_fn(
     """Pallas kernel entry point.
 
     `sal_scratch` is only used when the indexer cache is SEQ_ALONG_LANE. It is
-    then `(records_t, staged_slots, num_staged, run_src, run_dst, rmw, sems)`,
-    and the cache is written in two phases:
+    then `(records_t, staged_slots, num_staged, pending_records, pending_lanes,
+    run_src, run_dst, rmw, sems)`, and the cache is written in two phases:
 
-    1. During the pipeline, each grid step copies the records of its tokens
-       that have a kv slot into the next lanes of `records_t`, a VMEM buffer
-       laid out like the cache, and their slots into `staged_slots`.
+    1. During the pipeline, the records of the tokens that have a kv slot are
+       copied into the next lanes of `records_t`, a VMEM buffer laid out like
+       the cache, and their slots into `staged_slots`. Each step leaves its
+       records pending and copies the previous step's.
     2. After the pipeline, one pass copies `records_t` into the cache, one
        128-lane tile at a time. With no slot-less tokens between staged
        records, it moves none of them.
@@ -297,9 +315,14 @@ def kernel_fn(
     )
     sal_staging = ()
     if cfgs.dims.seq_along_lane:
-        records_t_ref, staged_slots_ref, num_staged_ref = sal_scratch[:3]
+        sal_staging = sal_scratch[:5]
+        _, _, num_staged_ref, _, pending_lanes_ref = sal_staging
         num_staged_ref[0] = 0
-        sal_staging = (records_t_ref, staged_slots_ref, num_staged_ref)
+        # Nothing is pending before the first step.
+        pending_lanes_ref[0] = 0
+        pending_lanes_ref[1] = 0
+        for i in range(cfgs.tile_sizes.tile_n):
+            pending_lanes_ref[2 + i] = -1
 
     pipeline_func = pltpu.emit_pipeline(
         body=functools.partial(inner_kernel, cfgs=cfgs),
@@ -326,6 +349,8 @@ def kernel_fn(
     _run()
 
     if cfgs.dims.seq_along_lane:
+        records_t_ref, staged_slots_ref, num_staged_ref = sal_staging[:3]
+        stage_pending_records(records_t_ref, *sal_staging[3:])
         *_, run_src_ref, run_dst_ref, rmw_ref, sems = sal_scratch
         ops = kv_cache_append._SalTiles(
             records_t_ref, _out_cache_ref, rmw_ref, config.SAL_PAGE_SIZE
@@ -577,13 +602,16 @@ def compress_norm_rope_store(
     scratch_shapes = []
     if seq_along_lane:
         # See kernel_fn: staged records, their slots (one per token + one an
-        # unstaged token may write) and count, the run tables of the final
-        # store (one slot per token + a sentinel), its read-modify-write tiles.
+        # unstaged token may write) and count, the pending records and their
+        # lanes, the run tables of the final store (one slot per token + a
+        # sentinel), its read-modify-write tiles.
         wave = max(1, min(num_tokens, _SAL_MAX_WAVE))
         scratch_shapes += [
             pltpu.VMEM(cfgs.records_t_shape(), jnp.uint8),
             pltpu.SMEM((num_tokens + 1,), jnp.int32),
             pltpu.SMEM((1,), jnp.int32),
+            pltpu.VMEM((tile_n, cfgs.record_bytes), jnp.uint8),
+            pltpu.SMEM((tile_n + 2,), jnp.int32),
             pltpu.SMEM((num_tokens + 1,), jnp.int32),
             pltpu.SMEM((num_tokens + 1,), jnp.int32),
             pltpu.VMEM(
