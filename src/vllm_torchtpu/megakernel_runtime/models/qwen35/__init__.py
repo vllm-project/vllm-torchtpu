@@ -28,5 +28,17 @@ PLUGIN = MegakernelPlugin(
     version="1",
     create=".adapter:create",
     capabilities=frozenset({"spec_decode", "mrope", "prefix_caching", "kv_offload"}),
-    decline_codes=("unaligned_cache_layout",),
+    # Every decline `create` / `bind` can return beyond the runtime's own codes,
+    # so peers log `peer_declined:<code>` rather than `other`.
+    decline_codes=(
+        "non_moe_checkpoint",
+        "invalid_geometry",
+        "geometry_mismatch",
+        "backbone_not_found",
+        "layer_count_mismatch",
+        "unaligned_cache_layout",
+        "unsupported_tp_size",
+        "unsupported_tpu_chip",
+        "empty_buckets",
+    ),
 )

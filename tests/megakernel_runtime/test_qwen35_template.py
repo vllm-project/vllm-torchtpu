@@ -384,3 +384,99 @@ def test_template_default_profile_and_baseline_option() -> None:
     assert adapter.create(view, {}).profile.name == "qwen35-candidate30-fused"
     base = adapter.create(view, {"profile": "qwen35-baseline"})
     assert base.profile.name == "qwen35-baseline"
+
+
+# Every decline the template's `create` / `bind` can return.
+_QWEN_DECLINES = frozenset(
+    {
+        # create: checkpoint (`validate_model_hf_config`) and backbone
+        "non_moe_checkpoint",
+        "invalid_geometry",
+        "geometry_mismatch",
+        "backbone_not_found",
+        # create: `check_startup_eligibility` with the arguments it passes
+        "layer_count_mismatch",
+        "unaligned_cache_layout",
+        "unsupported_tp_size",
+        # create: `check_post_mesh_eligibility` (no mesh_size)
+        "unsupported_tpu_chip",
+        "empty_buckets",
+        # bind: slot layout (`compare_layout_facts`) and generic layout errors
+        "pool_layout_unknown",
+        "pool_layout_mismatch",
+        "conv_state_dtype_unsupported",
+        "cache_layout_incompatible",
+    }
+)
+
+
+def _false_result_codes(path: Path, *func_names: str) -> set[str]:
+    """Literal codes of `EligibilityResult(False, <code>, ...)` / `Decline(<code>,
+    ...)` in the named functions of `path` (all functions if none); a `code`
+    variable assigned string literals (or a conditional of them) counts too."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    funcs = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and (not func_names or n.name in func_names)
+    ]
+    assert not func_names or len(funcs) == len(func_names), func_names
+
+    def literals(expr: ast.AST) -> set[str]:
+        if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+            return {expr.value}
+        if isinstance(expr, ast.IfExp):
+            return literals(expr.body) | literals(expr.orelse)
+        return set()
+
+    codes: set[str] = set()
+    for fn in funcs:
+        code_vars: set[str] = set()
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "code" for t in node.targets
+            ):
+                code_vars |= literals(node.value)
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Call):
+                continue
+            name = ast.unparse(node.func).rsplit(".", 1)[-1]
+            args = node.args
+            if name == "Decline" and args:
+                codes |= literals(args[0])
+            if (
+                name == "EligibilityResult"
+                and len(args) >= 2
+                and isinstance(args[0], ast.Constant)
+                and args[0].value is False
+            ):
+                codes |= literals(args[1])
+                if isinstance(args[1], ast.Name) and args[1].id == "code":
+                    codes |= code_vars
+    return codes
+
+
+def test_every_template_decline_is_in_the_vote_table() -> None:
+    import vllm_torchtpu.megakernel as mk_lib
+
+    codes = driver_mod.vote_codes(qwen_plugin.PLUGIN.decline_codes)
+    assert codes[-1] == "other" and len(set(codes)) == len(codes)
+    missing = sorted(c for c in _QWEN_DECLINES if c not in codes[:-1])
+    assert missing == [], missing
+    # The template lists only codes the runtime doesn't already have.
+    assert not set(qwen_plugin.PLUGIN.decline_codes) & set(
+        driver_mod.DECLINE_VOTE_CODES
+    )
+
+    # Static scan: the adapter and the library checks it calls emit nothing else.
+    lib = Path(mk_lib.__file__).resolve().parent
+    scanned = _false_result_codes(_RT / "models" / "qwen35" / "adapter.py")
+    scanned |= _false_result_codes(lib / "validate.py", "validate_model_hf_config")
+    scanned |= _false_result_codes(lib / "runtime" / "layout_facts.py")
+    elig = lib / "runtime" / "eligibility.py"
+    post = _false_result_codes(elig, "check_post_mesh_eligibility")
+    scanned |= post - {"mesh_size_mismatch"}  # create passes no mesh_size
+    assert {"pool_layout_mismatch", "conv_state_dtype_unsupported"} <= scanned
+    assert {"non_moe_checkpoint", "invalid_geometry", "geometry_mismatch"} <= scanned
+    assert scanned <= _QWEN_DECLINES, sorted(scanned - _QWEN_DECLINES)
+    assert {"unsupported_tpu_chip", "empty_buckets"} <= post
