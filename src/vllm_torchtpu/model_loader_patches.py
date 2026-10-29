@@ -174,6 +174,11 @@ def _sharded_runai_weights_iterator(
     from tqdm.auto import tqdm
     from vllm.model_executor.model_loader.weight_utils import enable_tqdm
 
+    if not hasattr(FileChunks, "__len__"):
+        FileChunks.__len__ = lambda self: len(
+            getattr(self, "chunks", getattr(self, "ranges", []))
+        )
+
     with SafetensorsStreamer() as streamer:
         fs = streamer.file_streamer
         metas = sp.SafetensorsMetadata.from_files(fs, hf_weights_files, None)
@@ -198,7 +203,11 @@ def _sharded_runai_weights_iterator(
         def _flush(path: str) -> None:
             nonlocal run_start, run_sizes, run_tensors
             if run_sizes:
-                requests.append(getattr(FileChunks, "contiguous", FileChunks)(len(requests), path, run_start, run_sizes))
+                requests.append(
+                    getattr(FileChunks, "contiguous", FileChunks)(
+                        len(requests), path, run_start, run_sizes
+                    )
+                )
                 tensors_by_request.append(run_tensors)
             run_start, run_sizes, run_tensors = None, [], []
 
