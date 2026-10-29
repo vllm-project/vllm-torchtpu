@@ -690,6 +690,66 @@ class TestTpuCompilerCache:
         assert compiled == [1]
         assert replayed == []
 
+    def test_a_rank_stops_waiting_when_the_owner_cannot_save(
+        self, tmp_path, monkeypatch
+    ):
+        """An owner with nothing to save leaves a marker; its waiter compiles
+        the bucket at once instead of waiting out the full timeout."""
+        import time
+
+        from vllm_torchtpu.compilation import tpu_compiler
+        from vllm_torchtpu.compilation.tpu_compiler import wait_for_peer_artifact
+
+        (a, b), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+        backend = tpu_compiler._tpu_backend
+        # No serialize(): nothing the owner can hand over.
+        monkeypatch.setattr(
+            tpu_compiler,
+            "_tpu_backend",
+            lambda graph, inputs: (lambda *args: backend(graph, inputs)(*args)),
+        )
+        compile(a)
+        assert os.path.exists(os.path.join(a.cache_dir, "artifact_bucket.failed"))
+        start = time.monotonic()
+        with wait_for_peer_artifact(30.0):
+            compile(b)
+        assert time.monotonic() - start < 10.0
+        assert replayed == []
+
+    def test_a_marker_from_an_earlier_run_is_ignored(self, tmp_path, monkeypatch):
+        """A marker older than this process does not cut the wait short."""
+        import time
+
+        from vllm_torchtpu.compilation import tpu_compiler
+        from vllm_torchtpu.compilation.tpu_compiler import wait_for_peer_artifact
+
+        (a, b), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+        os.makedirs(a.cache_dir)
+        marker = os.path.join(a.cache_dir, "artifact_bucket.failed")
+        open(marker, "w").close()
+        old = tpu_compiler._PROCESS_START - 3600
+        os.utime(marker, (old, old))
+        start = time.monotonic()
+        with wait_for_peer_artifact(0.3):
+            compile(b)
+        assert time.monotonic() - start >= 0.3
+        assert compiled == [1]
+
+    def test_a_saved_artifact_clears_an_old_marker(self, tmp_path, monkeypatch):
+        (a, _), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+        os.makedirs(a.cache_dir)
+        marker = os.path.join(a.cache_dir, "artifact_bucket.failed")
+        open(marker, "w").close()
+        compile(a)
+        assert not os.path.exists(marker)
+        assert os.path.exists(os.path.join(a.cache_dir, "artifact_bucket"))
+
     def test_no_peer_replay_outside_a_rank_cache_dir(self, tmp_path, monkeypatch):
         (a, b), compile, compiled, replayed = self._peer_compilers(
             tmp_path, monkeypatch
