@@ -828,3 +828,55 @@ class TestPooledCallerV3:
         np.testing.assert_allclose(
             np.asarray(pooled_out2), np.asarray(dense_out2), rtol=1e-3, atol=1e-3
         )
+
+
+@pytest.mark.tpu_test
+class TestSkipEmptyPerSeqIsExact:
+    """`skip_empty_per_seq` gates the per-sequence pass on the distribution;
+    both branches must reproduce the unconditional path byte for byte."""
+
+    def _run(self, pool, idx, kwargs, skip):
+        return wrapper.fused_conv1d_gdn(
+            conv_state=None,
+            recurrent_state=None,
+            state_indices=idx,
+            state_source=pool,
+            state_plan=_plan(pool),
+            skip_empty_per_seq=skip,
+            **kwargs,
+        )
+
+    @pytest.mark.parametrize(
+        "query_start_loc,distribution",
+        [
+            ([0, 1, 2, 3, 4], [4, 4, 4]),  # decode only: the pass is skipped
+            ([0, 1, 2, 3, 4], [2, 4, 4]),  # 1-token prefills: the pass runs
+        ],
+    )
+    def test_matches_unconditional(self, query_start_loc, distribution):
+        idx = jnp.array([1, 2, 3, 4], dtype=jnp.int32)
+        keys = iter(jax.random.split(jax.random.key(21), 2))
+        pool = _write_states(
+            _garbage_pool(22),
+            jax.random.normal(next(keys), (4, N_V, D_K, D_V)),
+            jax.random.normal(next(keys), (4, KERNEL_SIZE - 1, DIM)).astype(
+                jnp.bfloat16
+            ),
+            idx,
+        )
+        kwargs = _rand_inputs(23, 4) | dict(
+            query_start_loc=jnp.array(query_start_loc),
+            distribution=jnp.array(distribution, dtype=jnp.int32),
+            seq_lens=jnp.array([7, 9, 5, 6], dtype=jnp.int32),
+        )
+        pool_ref, out_ref = self._run(jnp.copy(pool), idx, kwargs, False)
+        pool_new, out_new = self._run(jnp.copy(pool), idx, kwargs, True)
+        assert jnp.array_equal(
+            out_new.view(jnp.uint16)
+            if out_new.dtype == jnp.bfloat16
+            else out_new.view(jnp.uint32),
+            out_ref.view(jnp.uint16)
+            if out_ref.dtype == jnp.bfloat16
+            else out_ref.view(jnp.uint32),
+        )
+        assert jnp.array_equal(pool_new.view(jnp.int16), pool_ref.view(jnp.int16))

@@ -85,6 +85,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR: bool = False
+    VLLM_TPU_GDN_SKIP_EMPTY_PER_SEQ_MAX_ROWS: int = 0
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     VLLM_TPU_QSA_DECODE_QUERY_BLOCK: int = 0
     VLLM_TPU_QSA_TOPK_STATS: int = 0
@@ -520,6 +521,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # in its `[kernel_size, 1, dim]` order. Otherwise every GDN layer swaps
     # and casts the bf16 `[dim, 1, kernel_size]` weight on every forward.
     "VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR": env_bool("VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR"),
+    # Pooled GDN, decode buckets of at most this many rows (0 = off): run the
+    # per-sequence (prefill/mixed) kernel pass under a `lax.cond` on the
+    # request distribution, so decode/verify-only steps skip its fixed launch,
+    # weight and metadata cost. Outputs and pool are unchanged: the skipped
+    # pass has no tiles and writes nothing. Pays off at 16 rows only (see
+    # `skip_empty_per_seq` in kernels/gdn/v3/wrapper.py).
+    "VLLM_TPU_GDN_SKIP_EMPTY_PER_SEQ_MAX_ROWS": env_int(
+        "VLLM_TPU_GDN_SKIP_EMPTY_PER_SEQ_MAX_ROWS", 0
+    ),
     # Size GDN v3 decode tiles and prefill chunks from per-rank heads, active
     # sequences and the VMEM estimate (kernels/gdn/v3/tiling.py) instead of
     # the fixed defaults.

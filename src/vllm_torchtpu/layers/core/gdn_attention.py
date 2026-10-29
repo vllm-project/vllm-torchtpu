@@ -930,6 +930,9 @@ def run_jax_gdn_attention_pooled_local(
         state_plan=plan,
         num_spec_tokens=num_spec_tokens,
         conv_weight_kmajor=conv_weight_kmajor,
+        skip_empty_per_seq=(
+            b.shape[0] <= tpu_envs.VLLM_TPU_GDN_SKIP_EMPTY_PER_SEQ_MAX_ROWS
+        ),
     )
     return recurrent_state, output
 

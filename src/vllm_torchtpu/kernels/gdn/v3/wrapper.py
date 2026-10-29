@@ -362,6 +362,7 @@ def outer_kernel(
         "batched_only",
         "prefill_only",
         "zero_initialize_out",
+        "skip_empty_per_seq",
         "compute_precision",
         "state_plan",
         "attention_mode",
@@ -398,6 +399,7 @@ def fused_conv1d_gdn(
     conv_weight_kmajor: bool = False,
     batched_only: bool = False,
     prefill_only: bool = False,
+    skip_empty_per_seq: bool = False,
     zero_initialize_out: bool = True,
     compute_precision: jnp.dtype = jnp.float32.dtype,
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
@@ -471,6 +473,15 @@ def fused_conv1d_gdn(
             untouched. Mutually exclusive with batched_only.
         zero_initialize_out: Whether to zero-initialize the output buffer before
             executing non-batched sequences.
+        skip_empty_per_seq: Pooled path, decode-sized buckets only
+            (`batch_size <= num_seqs * (num_spec_tokens + 1)`). Run the
+            per-sequence pass under a `lax.cond` that skips it when the step
+            has no prefill/mixed sequences (`distribution[-1] ==
+            distribution[0]`). Exact: that pass has no tiles then. Measured
+            (Qwen3.8-Flash per-rank dims, 36 chained layers): -2.4 us/layer
+            device at 16 rows, but +1.8 us at 32 rows (XLA moves the windowed
+            output to VMEM behind the conditional) and +8 us on steps that
+            do run the pass. Callers gate it by row count.
         compute_precision: Computation precision dtype.
         decode_tile_size: Tile size along sequence dimension for decode sequences.
             Ignored when TPU_ENABLE_GDN_DYNAMIC_TILING is set.
@@ -797,9 +808,30 @@ def fused_conv1d_gdn(
                 state_source, None, None, config.GDNMode.BATCHED
             )
         if not batched_only:
-            out_act, out_source, _ = call_kernel(
-                out_source, None, out_act, config.GDNMode.PER_SEQ
-            )
+            # Only decode-sized buckets (at most one window per request
+            # slot) are worth the branch; larger buckets carry prefill work.
+            decode_bucket = batch_size <= num_seqs * (num_spec_tokens + 1)
+            if skip_empty_per_seq and decode_bucket and out_act is not None:
+                # The per-sequence pass covers sequences
+                # [distribution[0], distribution[-1]); with none it has no
+                # tiles and writes nothing, so skipping it is exact.
+                def _per_seq(operands):
+                    act, source = operands
+                    act, source, _ = call_kernel(
+                        source, None, act, config.GDNMode.PER_SEQ
+                    )
+                    return act, source
+
+                out_act, out_source = jax.lax.cond(
+                    distribution[-1] > distribution[0],
+                    _per_seq,
+                    lambda operands: operands,
+                    (out_act, out_source),
+                )
+            else:
+                out_act, out_source, _ = call_kernel(
+                    out_source, None, out_act, config.GDNMode.PER_SEQ
+                )
         out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
         return out_source, out_act
 
