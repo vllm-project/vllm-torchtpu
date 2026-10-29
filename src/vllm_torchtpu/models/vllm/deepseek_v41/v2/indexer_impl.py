@@ -44,6 +44,7 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.dense_logits import 
     fp8_paged_mqa_logits,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.sparse_logits import (
+    candidate_windows,
     fp8_gathered_mqa_logits,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.tuned import (
@@ -1465,10 +1466,10 @@ def paged_fp8_indexer(
             score_width,
             cache.layout,
         )
-        prepared = stage_cache.get(key)
-        if prepared is None:
+        gathered_candidates = stage_cache.get(key)
+        if gathered_candidates is None:
             assert _prepare_op is not None
-            prepared = _prepare_op(
+            gathered_candidates = _prepare_op(
                 cache.banks,
                 page_table.int(),
                 candidates.int(),
@@ -1477,13 +1478,13 @@ def paged_fp8_indexer(
                 block_size,
                 score_width,
             )
-            stage_cache[key] = prepared
+            stage_cache[key] = gathered_candidates
         assert _prepared_select_op is not None
         selected = _prepared_select_op(
             q,
             weights,
             lengths.flatten().int(),
-            prepared,
+            gathered_candidates,
             topk,
             block_size,
             unordered,
@@ -1551,27 +1552,27 @@ def initialize_fp8_indexer() -> None:
     def fake_prepare(banks, page_table, candidates, requests, layout, block, width):
         tokens, count = candidates.shape
         groups = tokens
-        count *= min(tokens, 2)
+        count *= 2
         key_pages = (count * block + PAGE_RECORDS - 1) // PAGE_RECORDS
         return (
             banks[0].new_empty((groups * key_pages * PAGE_ROWS, 128)),
-            candidates.new_empty((tokens, count)),
+            candidates.new_empty(candidates.shape),
             requests.new_empty((groups + 1,)),
             requests.new_empty((tokens,), dtype=torch.bool),
-            requests.new_empty((groups, count), dtype=torch.int32),
+            requests.new_empty((tokens, 2), dtype=torch.int32),
         )
 
     def fake_prepared(
         q,
         weights,
         lengths,
-        prepared,
+        gathered_candidates,
         topk,
-        block,
+        candidate_block_size,
         unordered,
-        width,
+        context_width,
     ):
-        return q.new_empty((q.shape[0], min(topk, width)), dtype=torch.int32)
+        return q.new_empty((q.shape[0], min(topk, context_width)), dtype=torch.int32)
 
     _query_op = _register(
         "pallas::dsv41_packed_fp8_quantize_query", _quantize_query, fake_query, 4, 0
@@ -1588,7 +1589,7 @@ def initialize_fp8_indexer() -> None:
     )
     _prepared_select_op = _register(
         "pallas::dsv41_packed_fp8_select_prepared",
-        _select_prepared,
+        _select_from_prepared_candidates,
         fake_prepared,
         4,
         4,
@@ -1636,7 +1637,7 @@ def _select_candidate_tokens(
     valid_lengths: jax.Array | None = None,
     scheduling_group_id: int | None = None,
 ) -> jax.Array:
-    """Select compact scores and map winners to sorted logical token IDs."""
+    """Select compact scores and map winners to logical token IDs."""
     if k == 0:
         return jnp.empty((scores.shape[0], 0), jnp.int32)
     if (
@@ -1654,55 +1655,84 @@ def _select_candidate_tokens(
             logical_blocks=candidates,
             k=k,
             exclude_neg_inf=True,
+            unordered=True,
             reconstruct_threshold=PACKED_FP8_CANDIDATE_TOPK_CONFIG.get(
                 (*scores.shape, k), 8192
             ),
             scheduling_group_id=scheduling_group_id,
         )
-    values, slots = jax.lax.top_k(scores, k)
+    if unordered:
+        values, slots = jax.lax.top_k(scores, k)
+        logical = (
+            jnp.take_along_axis(candidates, slots // block_size, axis=1) * block_size
+            + slots % block_size
+        )
+        return jnp.where(jnp.isfinite(values), logical, -1)
+    slots = jnp.broadcast_to(jnp.arange(scores.shape[1]), scores.shape)
     logical = (
         jnp.take_along_axis(candidates, slots // block_size, axis=1) * block_size
         + slots % block_size
     )
+    _, logical, slots = jax.lax.sort(
+        (~streaming_topk._ordered_bits(scores), logical, slots), dimension=1, num_keys=2
+    )
+    logical, slots = logical[:, :k], slots[:, :k]
+    values = jnp.take_along_axis(scores, slots, axis=1)
     valid = jnp.isfinite(values) if unordered else values > -jnp.inf
     sentinel = jnp.iinfo(jnp.int32).max
     logical = jnp.sort(jnp.where(valid, logical, sentinel))
     return jnp.where(logical < sentinel, logical, -1)
 
 
-def _score_prepared(q, weights, lengths, prepared, topk, block, unordered, width):
-    keys, canonical, offsets, valid_queries, block_owners = prepared
-    k = min(topk, width, canonical.shape[1] * block)
-    lengths = jnp.where(valid_queries, jnp.clip(lengths, 0, width), 0)
-    compact_lengths = jnp.sum(
-        jnp.where(
-            canonical >= 0,
-            jnp.clip(lengths[:, None] - canonical * block, 0, block),
-            0,
-        ),
-        axis=1,
+def _score_and_select_candidates(
+    q,
+    weights,
+    lengths,
+    gathered_candidates,
+    topk,
+    candidate_block_size,
+    unordered,
+    context_width,
+):
+    (
+        candidate_keys,
+        candidate_block_ids,
+        query_group_offsets,
+        valid_queries,
+        block_spans,
+    ) = gathered_candidates
+    k = min(topk, context_width, candidate_block_ids.shape[1] * candidate_block_size)
+    lengths = jnp.where(valid_queries, jnp.clip(lengths, 0, context_width), 0)
+    windows = candidate_windows(
+        candidate_block_ids, block_spans, lengths, candidate_block_size
     )
-    rows = q.shape[0]
-    capacity = canonical.shape[1] * block
-    chunk = PACKED_FP8_PREPARED_QUERY_ROWS.get((rows, capacity, topk), rows)
-    chunk = chunk if unordered and rows % chunk == 0 else rows
+    candidate_token_counts = jnp.maximum(windows[:, 2], windows[:, 3]) - windows[:, 0]
+    num_queries = q.shape[0]
+    candidate_token_capacity = candidate_block_ids.shape[1] * candidate_block_size
+    query_chunk_size = PACKED_FP8_PREPARED_QUERY_ROWS.get(
+        (num_queries, candidate_token_capacity, topk), num_queries
+    )
+    query_chunk_size = (
+        query_chunk_size
+        if unordered and num_queries % query_chunk_size == 0
+        else num_queries
+    )
 
     def score(start, group):
         scorer = (
             fp8_gathered_mqa_logits.__wrapped__
-            if chunk < rows
+            if query_chunk_size < num_queries
             else fp8_gathered_mqa_logits
         )
         scores = scorer(
             q,
-            keys,
+            candidate_keys,
             weights.astype(jnp.float32),
-            compact_lengths,
-            block_owners,
-            query_start_loc=offsets,
-            membership_block_size=block,
+            windows,
+            query_start_loc=query_group_offsets,
+            output_width=candidate_token_capacity,
             query_start=start,
-            query_count=chunk,
+            query_count=query_chunk_size,
         )
         return (
             scores
@@ -1715,34 +1745,40 @@ def _score_prepared(q, weights, lengths, prepared, topk, block, unordered, width
         def select(tile, scores, group):
             return _select_candidate_tokens(
                 scores,
-                jax.lax.dynamic_slice_in_dim(canonical, tile * chunk, chunk),
+                jax.lax.dynamic_slice_in_dim(
+                    candidate_block_ids, tile * query_chunk_size, query_chunk_size
+                ),
                 k=k,
-                block_size=block,
+                block_size=candidate_block_size,
                 unordered=True,
                 valid_lengths=jax.lax.dynamic_slice_in_dim(
-                    compact_lengths, tile * chunk, chunk
+                    candidate_token_counts, tile * query_chunk_size, query_chunk_size
                 ),
                 scheduling_group_id=group,
             )
 
         selected = indexer.pipeline_score_topk_unrolled(
-            rows // chunk,
-            lambda tile: tile * chunk,
+            num_queries // query_chunk_size,
+            lambda tile: tile * query_chunk_size,
             score,
             select,
             lambda tile, src, dst: jax.lax.dynamic_update_slice_in_dim(
-                dst, src, tile * chunk, axis=0
+                dst, src, tile * query_chunk_size, axis=0
             ),
-            jnp.full((rows, k), -1, jnp.int32),
+            jnp.full((num_queries, k), -1, jnp.int32),
         )
     else:
         scores = score(jnp.int32(0), None)
         selected = _select_candidate_tokens(
-            scores, canonical, k=k, block_size=block, unordered=False
+            scores,
+            candidate_block_ids,
+            k=k,
+            block_size=candidate_block_size,
+            unordered=False,
         )
     return jnp.pad(
         selected,
-        ((0, 0), (0, min(topk, width) - k)),
+        ((0, 0), (0, min(topk, context_width) - k)),
         constant_values=-1,
     )
 
@@ -1787,11 +1823,18 @@ def _select_fp8_indexer_jax(
                 return jnp.full(
                     (q.shape[0], min(topk, width)), -1, jnp.int32
                 ), candidates
-            prepared = prepare_candidates(
+            gathered_candidates = prepare_candidates(
                 banks, page_table, candidates, requests, layout, block_size, width
             )
-            return _score_prepared(
-                q, weights, lengths, prepared, topk, block_size, unordered, width
+            return _score_and_select_candidates(
+                q,
+                weights,
+                lengths,
+                gathered_candidates,
+                topk,
+                block_size,
+                unordered,
+                width,
             ), candidates
 
         return jax.lax.cond(
@@ -2129,30 +2172,37 @@ def _prepare(
     )
 
 
-def _select_prepared(
+def _select_from_prepared_candidates(
     q: jax.Array,
     weights: jax.Array,
     lengths: jax.Array,
-    prepared: tuple[jax.Array, ...],
+    gathered_candidates: tuple[jax.Array, ...],
     topk: int,
-    block: int,
+    candidate_block_size: int,
     unordered: bool,
-    width: int,
+    context_width: int,
 ) -> jax.Array:
-    candidates = PreparedCandidates(*prepared)
-    lengths = jnp.where(candidates.valid_queries, lengths, 0)
+    gathered_candidates = PreparedCandidates(*gathered_candidates)
+    lengths = jnp.where(gathered_candidates.valid_queries, lengths, 0)
 
     def short():
         ids = jnp.broadcast_to(
-            jnp.arange(min(topk, width), dtype=jnp.int32),
-            (q.shape[0], min(topk, width)),
+            jnp.arange(min(topk, context_width), dtype=jnp.int32),
+            (q.shape[0], min(topk, context_width)),
         )
         return jnp.where(ids < lengths[:, None], ids, -1)
 
     return jax.lax.cond(
         jnp.max(lengths) <= topk,
         short,
-        lambda: _score_prepared(
-            q, weights, lengths, candidates, topk, block, unordered, width
+        lambda: _score_and_select_candidates(
+            q,
+            weights,
+            lengths,
+            gathered_candidates,
+            topk,
+            candidate_block_size,
+            unordered,
+            context_width,
         ),
     )

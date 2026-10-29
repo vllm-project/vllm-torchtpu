@@ -26,11 +26,11 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2 import indexer_impl
 pytestmark = pytest.mark.cpu_test
 
 
-def _cpu_gather(banks, physical, offsets, *, block, layout):
+def _cpu_gather(banks, physical_block_ids, offsets, *, block, layout):
     del offsets
     per_page = PAGE_RECORDS // block
     source_per_page = layout.page_size // block
-    safe = jnp.maximum(physical, 0)
+    safe = jnp.maximum(physical_block_ids, 0)
     addresses = (
         (layout.page_offset + safe // source_per_page * layout.page_stride)[..., None]
         * per_page
@@ -38,9 +38,9 @@ def _cpu_gather(banks, physical, offsets, *, block, layout):
         + (safe % source_per_page)[..., None]
     )
     source = jnp.concatenate(banks).reshape(-1, block)
-    words = jnp.where((physical >= 0)[..., None, None], source[addresses], 0)
+    words = jnp.where((physical_block_ids >= 0)[..., None, None], source[addresses], 0)
     return (
-        words.reshape(physical.shape[0], -1, per_page, PAGE_ROWS, block)
+        words.reshape(physical_block_ids.shape[0], -1, per_page, PAGE_ROWS, block)
         .transpose(0, 1, 3, 2, 4)
         .reshape(-1, PAGE_RECORDS)
     )
@@ -67,25 +67,34 @@ def _cpu_logits(q, keys, weights, lengths, pages, **kwargs):
     return jnp.where(allowed, scores, -jnp.inf)
 
 
-def _cpu_gathered_logits(q, keys, weights, lengths, block_owners, **kwargs):
+def _cpu_gathered_logits(q, keys, weights, windows, **kwargs):
     offsets = kwargs["query_start_loc"]
     groups = offsets.shape[0] - 1
     pages_per_group = keys.shape[0] // groups // PAGE_ROWS
     pages = jnp.arange(groups * pages_per_group).reshape(groups, pages_per_group)
-    # Expand packed per-group ownership to each row: bit (row - group start).
-    rows = jnp.arange(q.shape[0])
-    group = jnp.clip(jnp.searchsorted(offsets[1:], rows, side="right"), 0, groups - 1)
-    membership = (block_owners[group] >> (rows - offsets[group])[:, None] & 1) != 0
-    return _cpu_logits(
+    capacity = pages_per_group * PAGE_RECORDS
+    dense = _cpu_logits(
         q,
         keys,
         weights,
-        lengths,
+        jnp.full((q.shape[0],), capacity),
         pages,
         cache_layout=PackedFP8Layout(groups * pages_per_group),
-        block_membership=membership,
-        max_model_len=block_owners.shape[1] * kwargs["membership_block_size"],
+        max_model_len=capacity,
         **kwargs,
+    )
+    rows = kwargs.get("query_start", 0) + jnp.arange(
+        kwargs.get("query_count", q.shape[0])
+    )
+    start, split, end1, end2 = windows[rows].T
+    columns = start[:, None] + jnp.arange(kwargs["output_width"])
+    allowed = (columns < end1[:, None]) | (
+        (columns >= split[:, None]) & (columns < end2[:, None])
+    )
+    return jnp.where(
+        allowed,
+        jnp.take_along_axis(dense, jnp.minimum(columns, capacity - 1), axis=1),
+        -jnp.inf,
     )
 
 
@@ -128,15 +137,27 @@ def _inputs(requests, page_size, two_banks, width=64):
 )
 @pytest.mark.parametrize("page_size,two_banks", [(8, True), (128, False)])
 @pytest.mark.parametrize("unordered", [False, True])
+@pytest.mark.parametrize("equal_scores", [False, True])
 def test_paired_gather_preserves_each_query(
-    cpu_kernels, requests, sizes, page_size, two_banks, unordered, monkeypatch
+    cpu_kernels,
+    requests,
+    sizes,
+    page_size,
+    two_banks,
+    unordered,
+    equal_scores,
+    monkeypatch,
 ):
     banks, pages, layout, q, weights, lengths, requests = _inputs(
         requests, page_size, two_banks
     )
     block, width, topk = 16, 64, 5
     # Disjoint candidates, overlap, duplicates, invalid IDs and empty rows.
-    patterns = [[0, 2, 2], [1, 3, -1], [2, 0, 99], [-1, -1, -1]]
+    patterns = [[3, 1, 1], [1, 0, -1], [2, 0, 99], [-1, -1, -1]]
+    # The A-only block is invisible while the later shared segment is visible.
+    lengths = lengths.at[0].set(24)
+    if equal_scores:
+        q = jnp.zeros_like(q)
     candidates = jnp.asarray([patterns[i % 4] for i in range(q.shape[0])], jnp.int32)
     prepare = jax.jit(
         functools.partial(
@@ -146,35 +167,35 @@ def test_paired_gather_preserves_each_query(
             width=width,
         )
     )
-    prepared = prepare(banks, pages, candidates, requests)
-    np.testing.assert_array_equal(np.diff(prepared.offsets)[: len(sizes)], sizes)
-    assert np.all(np.diff(prepared.offsets)[len(sizes) :] == 0)
-    offsets = np.asarray(prepared.offsets)
+    gathered_candidates = prepare(banks, pages, candidates, requests)
+    query_group_offsets = np.asarray(gathered_candidates.offsets)
+    np.testing.assert_array_equal(np.diff(query_group_offsets)[: len(sizes)], sizes)
+    assert np.all(np.diff(query_group_offsets)[len(sizes) :] == 0)
     for row, owner in enumerate(np.asarray(requests)):
         expected = set(np.asarray(candidates[row]).tolist()) & set(
             range(width // block)
         )
         if owner < 0:
             expected = set()
-        # block_owners is per-group; bit (row - group start) selects this query.
-        group = np.searchsorted(offsets[1:], row, side="right")
-        query = row - int(offsets[group])
-        member = (np.asarray(prepared.block_owners[group]) >> query & 1).astype(bool)
-        block_ids = np.asarray(prepared.block_ids[row])
-        actual = block_ids[member & (block_ids >= 0)]
+        candidate_block_ids = np.asarray(gathered_candidates.candidate_block_ids[row])
+        actual = candidate_block_ids[candidate_block_ids >= 0]
         assert set(actual.tolist()) == expected
 
     if unordered:
         monkeypatch.setitem(
             indexer_impl.PACKED_FP8_PREPARED_QUERY_ROWS,
-            (q.shape[0], prepared.block_ids.shape[1] * block, topk),
+            (
+                q.shape[0],
+                gathered_candidates.candidate_block_ids.shape[1] * block,
+                topk,
+            ),
             1,
         )
         monkeypatch.setattr(
             _cpu_gathered_logits, "__wrapped__", _cpu_gathered_logits, raising=False
         )
-    actual = indexer_impl._score_prepared(
-        q, weights, lengths, prepared, topk, block, unordered, width
+    actual = indexer_impl._score_and_select_candidates(
+        q, weights, lengths, gathered_candidates, topk, block, unordered, width
     )
     # Independent dense reference: score the original paged K and filter by
     # each original query's candidates, as NVIDIA's dense fallback does.
@@ -194,7 +215,19 @@ def test_paired_gather_preserves_each_query(
         indices = logical[allowed]
         winners = indices[np.argsort(-scores[allowed], kind="stable")[:topk]]
         expected.append(sorted(winners.tolist()) + [-1] * (topk - len(winners)))
-    np.testing.assert_array_equal(actual, expected)
+        if unordered:
+            chosen = np.asarray(actual[row])
+            chosen = chosen[chosen >= 0]
+            assert len(chosen) == len(winners)
+            assert len(np.unique(chosen)) == len(chosen)
+            assert np.all(allowed[chosen])
+            np.testing.assert_allclose(
+                np.sort(scores[chosen]), np.sort(scores[winners]), rtol=1e-5, atol=1e-5
+            )
+    if unordered:
+        assert np.all(np.asarray(actual)[np.asarray(requests) < 0] == -1)
+    else:
+        np.testing.assert_array_equal(actual, expected)
 
 
 @pytest.mark.parametrize("streaming", [False, True])

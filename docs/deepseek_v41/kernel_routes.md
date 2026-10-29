@@ -27,6 +27,24 @@ requests per score buffer, further bounded by the measured score-buffer volume.
   The explicit `prefill_mode` kernel argument remains for standalone comparisons;
   serving uses the streaming default.
 
+Packed FP8 candidate preparation gathers K and logical block mappings into
+`PreparedCandidates`, with query-group offsets, query validity and per-query
+window start/split offsets. Each pair uses A-only/shared/B-only block order;
+2048 candidate blocks produce a `[T, 2048]` logical block table and `[T, 16384]`
+logits (eight tokens per block), with invalid slots masked. In `v2/indexer_impl.py`,
+`_select_from_prepared_candidates` handles the short-context all-indices path;
+otherwise `_score_and_select_candidates` scores the gathered K and returns
+top-k logical token IDs, padded with `-1`. The FP8 unordered route permits
+arbitrary equal-score winners and skips ID sorting; only selected slots are
+mapped to logical IDs. Gathered candidates do not contain precomputed scores.
+
+`candidate_block_ids` identify candidate blocks within each request's token
+sequence. `CandidateMetadata.physical_block_ids` identify their storage blocks
+in the FP8 cache after page-table lookup, not byte addresses. Each physical
+block contains `min(candidate_block_size, page_size)` tokens; a candidate block
+spanning cache pages expands into multiple physical block IDs. Both ID arrays
+use `-1` for invalid entries or padding.
+
 The measured C384 entries (48 requests × 6 queries on each logical device) are
 unchanged, including packed halfplane candidate keys. This change does not
 alter runner compilation buckets. In particular, it does not pad 24 target

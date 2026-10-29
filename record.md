@@ -2,6 +2,138 @@
 
 保存日期：2026-10-29。本文件记录本次提交保留的实现、测量口径、实验结论与未完成项。
 
+## 流水线开销去除（最新保留版本）
+
+针对上一轮的准备 15.2 µs、块间间隙 6.9 µs、输出/结束 9.2 µs，继续在
+Falcon `exp-mj4tmkos8z` / `art-yz8s2t5ir2` 做同机 A/B。形状、seed、P7、
+依赖版本及计时口径与下节一致；本轮 baseline 是已有三段 16K/无序 Top-K
+版本，不是原始 32K 版本。
+
+保留 `overhead-v1`：16K 按 8K 扫描只有两个块，静态使用 `[0, 1]`，删除
+HBM 遍历表、VMEM scratch 和 DMA；默认请求偏移零不再传输；长度保持一维，
+由 SparseCore 读取对应 lane，删除 TC 的 `[rows, 16]` 广播。较长输入保留
+原来的固定 shuffle；非零动态请求偏移保留并增加回归覆盖。
+
+| 阶段 | 本轮 baseline µs | 保留版本 µs |
+| --- | ---: | ---: |
+| logits | 156.955 | 156.506 |
+| Top-K | 106.246 | 101.408 |
+| logits + Top-K | 237.783 | 228.374 |
+| gather + logits + Top-K | 719.492 | 711.471 |
+| metadata + gather + logits + Top-K | 783.849 | 767.010 |
+
+组合计时减少 9.409 µs（3.96%）。完整合成层相对本轮 16K 前版减少 2.15%，
+但这不证明超过原始 32K 版本，也不是完整 serving/model 吞吐收益。
+
+同一次中位样本的 TC/SC 时间线分解：
+
+| 区间 | baseline µs | 保留版本 µs | 含义 |
+| --- | ---: | ---: | --- |
+| 首块 logits 前 | 15.209 | 15.482 | 入口、候选窗口计算、切片和布局转换 |
+| TC logits 合计 | 171.606 | 171.171 | 三个 96-query chunk 的实际计算 |
+| TC 块间间隙 | 7.021 | 2.333 | 元数据准备、复制、异步调用衔接 |
+| 末块 TC 结束至最后 SC TEC 结束 | 34.737 | 30.473 | 剩余 Top-K 执行与依赖等待 |
+| 最后 SC TEC 至模块结束 | 9.210 | 8.915 | 输出拼接及 trace 未细分的结束时间 |
+
+三个 order-table copy 和长度广播已从 trace 消失。长度对齐 pad 与布局复制
+仍需约 2 µs，不能称为已零开销。准备阶段首个可见 XLA op 之前约 7.4 µs；
+最后输出 fusion 约 1.67 µs，之后约 7.1 µs 未被逐算子事件细分。因此不能
+将准备和结束区间全部解释成可删除的计算，也不能假定都属于 host 开销。
+
+`overhead-v2` 将逐块更新输出改成静态 list/一次 concatenate，组合为
+229.566 µs，结束区间 9.258 µs，未改善，已撤回；最终保留原输出流水线。
+
+验证：保留 kernel 的 84 项 Top-K 回归通过；拼接实验的 69 项 metadata、
+logits 和 CPU reference 回归通过；同一保留 kernel 的 8 项无序/动态偏移
+回归通过（其中 4 项为新增非零偏移）。共覆盖 157 个不同用例，三个变体
+的完整合成层数值检查均通过。最终源码与 `overhead-v1` 的可执行 AST 一致；
+并发 docstring 修改保留。未运行完整模型评测；全环境类型检查仍受私有
+Artifact Registry 镜像认证阻塞，相关文件的 pre-commit 检查通过。
+
+归档包括三个变体的五次设备样本、XPlane、HLO、源码快照、测试日志和
+`trace-timeline.json`。实验已成功结束，TPU 已释放。
+分析 `an-ee71o1z08k`（24 行算子指标）与 `an-1t7x3t9gg7`（A/B、数值验证和
+实际 TC/SC 时间线）均成功，已读取声明的报告。标准算子插件仍报告 traces=0；
+本节的时间线结论来自自定义分析的 `summary.json`，不能把标准插件的扫描
+计数当作未捕获 profile。下节保留上一轮数据，避免混用不同实验的 baseline。
+
+## 三段 union 与固定 16K 输出（本轮更新）
+
+本轮代码将每对候选排成 `[A-only | shared | B-only]`，每段内部按逻辑 ID
+升序。输出 logits 从 `[T, 32768]` 缩为 `[T, 16384]`，逻辑 block 表从
+`[T, 4096]` 缩为 `[T, 2048]`，另带 `[T, 2]` 的窗口起点和段分界。
+不足容量的列置 `-inf`。A 直接发布 union 前缀；B 在 MXU 静态展开结束后，
+连续读取窗口并进行 128 列内旋转与相邻页拼接，不逐 block gather logits。
+K 的物理 fragment gather 保留原流水线，输入物理表按新 union 顺序排列。
+
+每个 member 的两个有序段分别计算因果前缀，避免前段不可见而后段可见时
+错误截断。按用户确认的契约，候选 Top-K 同分可任取、输出无序；不执行 ID
+同分 radix 和最终 ID 排序，仅在选出最多 512 个槽位后映射 record ID。
+16K 使用已测静态展开配置。
+
+同机 v7x、P-state 7、单逻辑设备，48×6 queries、context 98816、2048×8
+候选、物理页 128、overlap 0.7、topk 512；输入 seed 826/827。
+每项预热后 50 次 host 测量，并取 5 次 XPlane `XLA Modules` 设备耗时中位数：
+
+| 阶段 | 基线 µs | 三段布局、无序 Top-K µs | 变化 |
+| --- | ---: | ---: | ---: |
+| prepare_metadata | 71.917 | 93.695 | +30.28% |
+| gather | 478.445 | 501.917 | +4.91% |
+| metadata_gather | 528.441 | 573.727 | +8.57% |
+| logits | 165.702 | 156.254 | -5.70% |
+| topk | 145.474 | 105.747 | -27.31% |
+| logits_topk | 256.842 | 236.561 | -7.90% |
+| gather_logits_topk | 710.096 | 722.507 | +1.75% |
+| metadata_gather_logits_topk | 759.142 | 786.370 | +3.59% |
+
+结论：logits 约快 5.7%，Top-K 约快 27.3%，logits+Top-K 约快 7.9%，
+但包含 metadata/gather 的完整单层约慢 3.6%。固定 16K 达成，不能宣称整层
+加速。Top-K 的 105.747 µs 是整个 288×16K batch，并非单行。
+block 表重排与 gather 局部性有实测代价；跨层复用阶段的收益不可外推成完整模型吞吐收益。
+
+失败/中间原型已移出工作区实现：逐页移位/carry 的 logits 为 527.763 µs；
+整段旋转为 265.369 µs；128 列旋转/拼接为 266.306 µs；K 提前预取两组后
+降到 157.056 µs。保留严格 ID 同分/排序时，Top-K 为 135.092 µs，整层
+791.668 µs；按用户确认去掉两个约束后，最终 Top-K 为 105.747 µs，整层
+786.370 µs。独立映射 buffer 的中间版为 99.693 µs，但复用原 ID scratch 后
+代码更短、少一个独立 VMEM buffer，组合 logits+Top-K 分别为 236.190/236.561 µs。
+动态旋转使用非负量，避免负值在非二次幂窗口上产生错误偏移。
+
+无序路径的中位 trace 说明 TC/SC 已实际重叠：三个 logits chunk 分别占
+15.222–70.564、76.147–133.669、135.027–193.263 µs；前两个 SparseCore
+Top-K 执行约 79.745–115.120、138.817–173.889 µs，全部被下一块 logits
+覆盖。末块约 198.413–227.392 µs。236.561 µs 的分解为准备 15.222、
+logits 合计 171.100、块间 6.941、末块收尾 34.129、输出/结束 9.169 µs。
+不能用两个独立 kernel 的耗时之和减组合耗时，直接解释成实际重叠长度。
+原始跨 TC/SC 时间线见 `trace-timeline.json`，SC offload 包含等待，以上使用
+真实 TEC 执行区间。压缩阈值 512/1024/2048/4096/8192 的 Top-K 分别为
+113.106/106.475/106.040/105.986/105.805 µs；后四档接近，保留已验 2048。
+显式 scheduling group 的组合为 238.146 µs，未优于自由调度的 236.561 µs，
+48-query 分块为 260.902 µs，亦未改善，因此保留原 96-query 静态展开流水线。
+
+LLO 证据：编译输出 HBM shape 为 `288x16384`，保留静态 MXU 前缀分支；
+两组预取实验的计算指令主体与一组预取一致。三段布局去掉原 ownership
+查询所需的大量 vector permute。原始 LLO 含互斥分支，静态指令数不能相加
+当作实际执行周期；本轮不声称测得 register spill 的改善。
+
+Falcon 实验 `exp-a4kg1c0vs9`，artifact `art-q4x201l93r`；同一 artifact 的
+`baseline/` 与 `unordered-final/` 是最终 A/B；`candidate/`、`candidate-v5/`、
+`candidate-v6/`、`candidate-v7/`、`unordered/` 保留中间实验。
+前轮 `exp-1e5xq5er8x` 保存了首版回退数据。
+归档包含源码 patch/快照、harness、全部设备样本、XPlane、HLO、Mosaic LLO。
+Falcon 已成功结束并释放 TPU。分析：`an-1p9nbnl6le`（算子指标）、
+`an-z888g8aj3x`（LLO）、`an-wu3m8i8cbr`（A/B 与实际时间线）均成功。
+工作区同步的 `candidate_block_ids` / `physical_block_ids` 命名整理已保留；
+与实测版相比，相关 producer/consumer/test 的 AST 除标识符和文档外一致，
+旧字段引用已清空。
+
+验证：metadata/scorer/模型参考组合 67 项通过；最终实际 TPU scorer 5 项
+通过，包含 singleton 和单 token；最终无序 Top-K、原有严格 Top-K 和模型
+参考 110 项通过。合计覆盖 153 个不同用例，详见归档测试日志。
+测试 harness 跳过 vLLM serving 初始化及 cache allocator import，使用真实数值函数；没有执行完整模型端到端。
+changed-files pre-commit（含固定版本 Ruff/Pyrefly）通过。完整依赖类型检查
+因 CI 镜像 Artifact Registry 下载鉴权失败而未完成，本机 Docker 可用。
+
 ## Candidate 实现清理
 
 `fp8/candidates.py` 从 1382 行缩至 908 行，减少 474 行：删除 8-token 整页的

@@ -33,7 +33,9 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.candidates import (
     prepare_candidates,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import indexer_impl
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl import _score_prepared
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_impl import (
+    _score_and_select_candidates,
+)
 
 
 def pack_fixture(keys, layout):
@@ -188,19 +190,13 @@ def main():
         dimensions,
     )
     host_candidates = np.asarray(candidates)
-    host_ids = np.asarray(metadata.block_ids)
-    host_physical = np.asarray(metadata.physical)
-    flags = np.asarray(metadata.block_owners)
-    for group in range(tokens // 2):
-        first = group * 2
-        union = np.unique(host_candidates[first : first + 2])
-        np.testing.assert_array_equal(host_ids[first][host_ids[first] >= 0], union)
-        for query in range(2):
-            actual = (flags[group] & (1 << query)) != 0
-            expected = np.isin(host_ids[first], host_candidates[first + query]) & (
-                host_ids[first] >= 0
-            )
-            np.testing.assert_array_equal(actual, expected)
+    host_ids = np.asarray(metadata.candidate_block_ids)
+    host_physical_block_ids = np.asarray(metadata.physical_block_ids)
+    for row in range(tokens):
+        expected = np.unique(host_candidates[row])
+        np.testing.assert_array_equal(
+            np.sort(host_ids[row][host_ids[row] >= 0]), expected
+        )
     keys = jax.random.normal(
         jax.random.key(826), (layout.pages * layout.page_size, 128), jnp.bfloat16
     )
@@ -221,15 +217,18 @@ def main():
     run = functools.partial(
         measure, root=root, repeats=args.repeats, dimensions=dimensions
     )
-    gathered = run("gather", gather, (banks, metadata.physical, metadata.offsets))
+    gathered = run(
+        "gather", gather, (banks, metadata.physical_block_ids, metadata.offsets)
+    )
     prepare = functools.partial(
         prepare_candidates, layout=layout, block=args.block, width=args.width
     )
     run("metadata_gather", prepare, (banks, pages, candidates, owners))
-    slots = np.flatnonzero(host_physical.reshape(-1) >= 0)[::97]
+    slots = np.flatnonzero(host_physical_block_ids.reshape(-1) >= 0)[::97]
     target = (slots[:, None] * args.block + np.arange(args.block)).reshape(-1)
     source = (
-        host_physical.reshape(-1)[slots, None] * args.block + np.arange(args.block)
+        host_physical_block_ids.reshape(-1)[slots, None] * args.block
+        + np.arange(args.block)
     ).reshape(-1)
     np.testing.assert_array_equal(
         np.asarray(
@@ -241,38 +240,26 @@ def main():
         ),
         np.asarray(read_fp8_records(banks, jnp.asarray(source), layout)),
     )
-    prepared = PreparedCandidates(gathered, *metadata[1:])
-    compact_lengths = jnp.sum(
-        jnp.where(
-            prepared.block_ids >= 0,
-            jnp.clip(lengths[:, None] - prepared.block_ids * args.block, 0, args.block),
-            0,
-        ),
-        axis=1,
+    gathered_candidates = PreparedCandidates(gathered, *metadata[1:])
+    windows = indexer_impl.candidate_windows(
+        gathered_candidates.candidate_block_ids,
+        gathered_candidates.block_spans,
+        lengths,
+        args.block,
     )
 
-    def logits(q, weights, keys, compact_lengths, block_owners, offsets):
+    def logits(q, weights, keys, windows, offsets):
         return indexer_impl.fp8_gathered_mqa_logits(
             q,
             keys,
             weights,
-            compact_lengths,
-            block_owners,
+            windows,
             query_start_loc=offsets,
-            membership_block_size=args.block,
+            output_width=args.candidates * args.block,
         )
 
     raw_scores = run(
-        "logits",
-        logits,
-        (
-            q,
-            weights,
-            gathered,
-            compact_lengths,
-            prepared.block_owners,
-            prepared.offsets,
-        ),
+        "logits", logits, (q, weights, gathered, windows, gathered_candidates.offsets)
     )
     topk = functools.partial(
         indexer_impl._select_candidate_tokens,
@@ -280,59 +267,56 @@ def main():
         block_size=args.block,
         unordered=True,
     )
-    split = run("topk", topk, (raw_scores, prepared.block_ids))
-    score = functools.partial(
-        _score_prepared,
+    split = run("topk", topk, (raw_scores, gathered_candidates.candidate_block_ids))
+    score_and_select = functools.partial(
+        _score_and_select_candidates,
         topk=args.topk,
-        block=args.block,
+        candidate_block_size=args.block,
         unordered=True,
-        width=args.width,
+        context_width=args.width,
     )
-    selected = run("logits_topk", score, (q, weights, lengths, prepared))
+    selected = run(
+        "logits_topk", score_and_select, (q, weights, lengths, gathered_candidates)
+    )
 
     def gather_score(q, weights, lengths, banks, metadata):
-        keys = gather(banks, metadata.physical, metadata.offsets)
-        return score(q, weights, lengths, PreparedCandidates(keys, *metadata[1:]))
+        candidate_keys = gather(banks, metadata.physical_block_ids, metadata.offsets)
+        return score_and_select(
+            q, weights, lengths, PreparedCandidates(candidate_keys, *metadata[1:])
+        )
 
     combined = run(
         "gather_logits_topk", gather_score, (q, weights, lengths, banks, metadata)
     )
 
     def layer(q, weights, lengths, banks, pages, candidates, owners):
-        prepared = prepare_candidates(
+        gathered_candidates = prepare_candidates(
             banks, pages, candidates, owners, layout, args.block, args.width
         )
-        return score(q, weights, lengths, prepared)
+        return score_and_select(q, weights, lengths, gathered_candidates)
 
     full = run(
         "metadata_gather_logits_topk",
         layer,
         (q, weights, lengths, banks, pages, candidates, owners),
     )
-    for result in (split, combined, full):
-        np.testing.assert_array_equal(
-            np.sort(np.asarray(selected), axis=1), np.sort(np.asarray(result), axis=1)
-        )
     scores_host = np.asarray(raw_scores)
-    ids_host = np.asarray(selected)
-    for row in range(tokens):
-        chosen = ids_host[row]
-        assert len(np.unique(chosen)) == args.topk
-        assert np.all(chosen >= 0) and np.all(chosen < int(lengths[row]))
-        assert np.all(np.isin(chosen // args.block, host_candidates[row]))
-        slots = (
-            np.searchsorted(host_ids[row][host_ids[row] >= 0], chosen // args.block)
-            * args.block
-            + chosen % args.block
-        )
-        threshold = np.partition(scores_host[row], -args.topk)[-args.topk]
-        assert np.min(scores_host[row, slots]) >= threshold
+    for result in (split, selected, combined, full):
+        for row, chosen in enumerate(np.asarray(result)):
+            assert len(np.unique(chosen)) == args.topk
+            assert np.all(chosen >= 0) and np.all(chosen < int(lengths[row]))
+            assert np.all(np.isin(chosen // args.block, host_candidates[row]))
+            slot_by_id = {int(block): slot for slot, block in enumerate(host_ids[row])}
+            slots = np.array([slot_by_id[int(block)] for block in chosen // args.block])
+            slots = slots * args.block + chosen % args.block
+            threshold = np.partition(scores_host[row], -args.topk)[-args.topk]
+            assert np.min(scores_host[row, slots]) >= threshold
     (root / "correctness.json").write_text(
         json.dumps(
             {
                 "packed_ownership_numpy": "passed",
                 "sampled_gather_readback": "passed",
-                "split_vs_combined_topk": "passed",
+                "split_and_combined_topk_scores": "passed",
                 "topk_numpy_threshold_and_candidate_membership": "passed",
             },
             indent=2,

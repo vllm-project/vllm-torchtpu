@@ -66,6 +66,7 @@ def _ordered_bits(keys: jax.Array) -> jax.Array:
         "block_size",
         "reconstruct_threshold",
         "exclude_neg_inf",
+        "unordered",
         "scheduling_group_id",
     ),
 )
@@ -77,24 +78,32 @@ def streaming_topk(
     block_size: int = 8192,
     reconstruct_threshold: int = 8192,
     exclude_neg_inf: bool = False,
+    unordered: bool = False,
     logical_blocks: jax.Array | None = None,
     start_request: jax.Array | None = None,
     scheduling_group_id: int | None = None,
 ) -> jax.Array:
-    """Return Top-K IDs for 2-D score rows, ascending then -1 padded.
+    """Return exact Top-K token IDs for each score row.
 
-    Scores follow exact FP32 radix order (+0 above -0); equal bit patterns
-    prefer smaller logical indices regardless of block visitation order.
-    The reproducible block shuffle is input-independent, not a fresh random
-    permutation per invocation. NaNs are unsupported. Negative infinity is
-    eligible unless exclude_neg_inf is set. Lengths are clipped to [0, N].
-    Scores have shape [rows, N] in request-major order.
+    Args:
+        scores: Float32 [rows, N], request-major; NaNs are unsupported.
+        valid_lengths: Optional int32 [rows], clipped to [0, N]; None uses N.
+            With logical_blocks, use [requests, queries], whose product is rows.
+        k: Number of selected tokens per row.
+        block_size: Scores per streaming scan block, not candidate block size.
+        reconstruct_threshold: Candidate count beyond k that triggers compaction.
+        exclude_neg_inf: Exclude negative infinity from selection.
+        unordered: Allow arbitrary output order and equal-score winners.
+            Otherwise, IDs are ascending and ties prefer smaller logical IDs.
+        logical_blocks: Optional int32 [all_requests, blocks] mapping compact
+            blocks to logical blocks; blocks must divide N. IDs must increase
+            unless unordered=True; padded blocks must have ineligible scores.
+        start_request: Optional scalar request offset in logical_blocks; default 0.
+        scheduling_group_id: Optional XLA scheduling-group ID.
 
-    Optional int32 logical_blocks [all_requests, blocks] maps compact slots
-    to token IDs. It requires request/query valid_lengths and a block count dividing N.
-    Valid blocks must be increasing, padded blocks must have ineligible scores,
-    and mapped IDs must fit int32. start_request addresses a valid request
-    window in that metadata (default zero). Only final winners are mapped.
+    Returns:
+        Int32 [rows, k] token IDs, padded with -1. IDs are score-column indices
+        unless logical_blocks supplies a logical token mapping.
     """
     if scores.ndim != 2 or scores.dtype != jnp.float32:
         raise ValueError("scores must be a rank-2 float32 array")
@@ -157,14 +166,19 @@ def streaming_topk(
         if valid_lengths is None
         else jnp.clip(valid_lengths.reshape(-1), 0, valid_width)
     )
-    lengths = jnp.broadcast_to(lengths[:, None], (batch_size, lanes))
+    lengths = jnp.pad(lengths, (0, -batch_size % hbm_alignment))
     num_blocks = pl.cdiv(width, block_size)
-    order_width = pl.cdiv(num_blocks, hbm_alignment) * hbm_alignment
-    order = list(range(1, num_blocks))
-    random.Random(0).shuffle(order)
-    order.insert(0, 0)
-    order.extend([0] * (order_width - num_blocks))
-    block_order = jnp.asarray(order, jnp.int32)
+    # One or two blocks have fixed order; no visit table or DMA is needed.
+    order_width = (
+        pl.cdiv(num_blocks, hbm_alignment) * hbm_alignment if num_blocks > 2 else 0
+    )
+    block_order = ()
+    if order_width:
+        order = list(range(1, num_blocks))
+        random.Random(0).shuffle(order)
+        order.insert(0, 0)
+        order.extend([0] * (order_width - num_blocks))
+        block_order = (jnp.asarray(order, jnp.int32),)
     output_width = pl.cdiv(k, hbm_alignment) * hbm_alignment
     # Bootstrap winners remain resident throughout the pass, so the initial
     # scan size changes work distribution without approximating the cutoff.
@@ -214,15 +228,22 @@ def streaming_topk(
             pltpu.VMEM((k,), jnp.int32),
             pltpu.VMEM((histogram_size,), jnp.int32),
             pltpu.VMEM((lanes,), jnp.int32),
-            pltpu.VMEM((order_width,), jnp.int32),
+            (pltpu.VMEM((order_width,), jnp.int32),) if order_width else (),
             pltpu.SemaphoreType.DMA((buffers,)),
             pltpu.SemaphoreType.DMA,
         ),
         compiler_params=pltpu.CompilerParams(needs_layout_passes=False),
         name="streaming_topk",
     )
-    def kernel(scores_ref, lengths_ref, order_ref, *refs):
-        out_indices_ref, *scratch = refs[2:] if mapped else refs
+    def kernel(
+        scores_ref,
+        lengths_ref,
+        order_refs,
+        mapping_refs,
+        start_refs,
+        out_indices_ref,
+        *scratch,
+    ):
         (
             blocks,
             candidate_banks,
@@ -231,18 +252,22 @@ def streaming_topk(
             selected_ids,
             histogram,
             row_length,
-            visit_order,
+            order_scratch,
             block_sems,
             sem,
         ) = scratch
         candidates = candidate_banks.at[pl.ds(0, capacity)]
         candidate_ids = id_banks.at[pl.ds(0, id_capacity)]
         lane_ids = jnp.arange(lanes, dtype=jnp.int32)
-        pltpu.async_copy(order_ref, visit_order, sem).wait()
+        if order_width:
+            visit_order = order_scratch[0]
+            pltpu.async_copy(order_refs[0], visit_order, sem).wait()
+        request_start = 0
         if mapped:
-            logical_blocks_ref, start_ref = refs[:2]
-            pltpu.async_copy(start_ref, row_length, sem).wait()
-            request_start = row_length[...][0]
+            logical_blocks_ref = mapping_refs[0]
+            if start_request is not None:
+                pltpu.async_copy(start_refs[0], row_length, sem).wait()
+                request_start = row_length[...][0]
 
         def store_candidates(count, keys, ids, mask):
             plsc.store_compressed(candidates.at[pl.ds(count, lanes)], keys, mask=mask)
@@ -342,7 +367,7 @@ def streaming_topk(
                     candidate_ids[pl.ds(group * lanes, lanes)] = ordered.view(jnp.int32)
 
         def compact(num_candidates):
-            """Radix-select the lexicographic (score, -logical ID) winners."""
+            """Select by exact score bits, optionally breaking ties by index."""
 
             @plsc.parallel_loop(0, k, lanes, unroll=loop_unroll)
             def clear_selected(i):
@@ -451,11 +476,12 @@ def streaming_topk(
                 ),
             )
             score_ties = remaining > k - found
-            _, remaining, found, bank = jax.lax.while_loop(
-                cond,
-                functools.partial(radix_pass, by_id=True),
-                (jnp.int32(id_digits - 1), remaining, found, bank),
-            )
+            if not unordered:
+                _, remaining, found, bank = jax.lax.while_loop(
+                    cond,
+                    functools.partial(radix_pass, by_id=True),
+                    (jnp.int32(id_digits - 1), remaining, found, bank),
+                )
             needed = jnp.minimum(remaining, k - found)
 
             @plsc.parallel_loop(
@@ -488,24 +514,28 @@ def streaming_topk(
                 candidates[pl.ds(i, lanes)] = keys
                 candidate_ids[pl.ds(i, lanes)] = ids
                 bits = jnp.where(ids >= 0, _ordered_bits(keys), jnp.uint32(UINT32_MAX))
-                last_id = jnp.where(
-                    bits < minimum,
-                    ids,
-                    jnp.where(bits == minimum, jnp.maximum(last_id, ids), last_id),
-                )
-                multiplicity = jnp.where(
-                    bits < minimum,
-                    1,
-                    multiplicity + (bits == minimum).astype(jnp.int32),
-                )
+                if not unordered:
+                    last_id = jnp.where(
+                        bits < minimum,
+                        ids,
+                        jnp.where(bits == minimum, jnp.maximum(last_id, ids), last_id),
+                    )
+                    multiplicity = jnp.where(
+                        bits < minimum,
+                        1,
+                        multiplicity + (bits == minimum).astype(jnp.int32),
+                    )
                 return (jnp.minimum(minimum, bits), last_id, multiplicity)
 
             minimum, last_id, multiplicity = retain_topk
             threshold = jnp.min(minimum)
-            threshold_id = jnp.max(jnp.where(minimum == threshold, last_id, -1))
-            boundary_ties = score_ties | (
-                jnp.sum(jnp.where(minimum == threshold, multiplicity, 0)) > 1
-            )
+            threshold_id = jnp.int32(-1)
+            boundary_ties = score_ties
+            if not unordered:
+                threshold_id = jnp.max(jnp.where(minimum == threshold, last_id, -1))
+                boundary_ties |= (
+                    jnp.sum(jnp.where(minimum == threshold, multiplicity, 0)) > 1
+                )
             return _Selection(
                 jnp.minimum(num_candidates, k),
                 threshold,
@@ -519,6 +549,9 @@ def streaming_topk(
             return plsc.load_gather(visit_order, [indices])[0]
 
         def next_valid(position, length):
+            if not order_width:
+                return position, jnp.minimum(position, num_blocks - 1)
+
             def cond(state):
                 step, block_id = state
                 return (step < num_blocks) & (block_id * block_size >= length)
@@ -566,8 +599,10 @@ def streaming_topk(
 
         @pl.loop(first_row, batch_size, step=row_stride)
         def process_row(row):
-            pltpu.async_copy(lengths_ref.at[row], row_length, sem).wait()
-            length = jnp.min(row_length[:])
+            pltpu.async_copy(
+                lengths_ref.at[pl.ds(row // lanes * lanes, lanes)], row_length, sem
+            ).wait()
+            length = plsc.load_gather(row_length, [jnp.full((lanes,), row % lanes)])[0]
             row_blocks = pl.cdiv(length, block_size)
 
             def prime():
@@ -713,14 +748,18 @@ def streaming_topk(
                                     cutoff = jnp.full(
                                         lanes, cutoff_raw, jnp.uint32
                                     ).view(jnp.float32)
-                                    accept = (keys > cutoff) | (keys == cutoff) & (
-                                        ids < threshold_id
-                                    )
+                                    accept = keys > cutoff
+                                    if not unordered:
+                                        accept |= (keys == cutoff) & (
+                                            ids < threshold_id
+                                        )
                                 else:
                                     bits = _ordered_bits(keys)
-                                    accept = (bits > threshold) | (
-                                        bits == threshold
-                                    ) & (ids < threshold_id)
+                                    accept = bits > threshold
+                                    if not unordered:
+                                        accept |= (bits == threshold) & (
+                                            ids < threshold_id
+                                        )
                                 if not full_block:
                                     accept = accept & (ids < length)
                                 store_candidates(count, keys, ids, accept)
@@ -826,40 +865,38 @@ def streaming_topk(
             if bootstrap_width < valid_width:
                 jax.lax.fori_loop(0, row_blocks, scan_block, (seed, position, block_id))
             if mapped:
-                # Selection is finished: reuse the ID tail for metadata.
-                # Sorting touches only the first k entries and overlaps this DMA.
-                mapping_copy = pltpu.make_async_copy(
-                    logical_blocks_ref.at[request_start + row // queries],
-                    candidate_ids.at[pl.ds(output_width, mapping_width)],
-                    sem,
+                mapping = candidate_ids.at[pl.ds(output_width, mapping_width)]
+                copy = pltpu.make_async_copy(
+                    logical_blocks_ref.at[request_start + row // queries], mapping, sem
                 )
-                mapping_copy.start()
-                sort_selected()
-                mapping_copy.wait()
+                copy.start()
+                if not unordered:
+                    sort_selected()
+                copy.wait()
 
                 @plsc.parallel_loop(0, k, lanes, unroll=loop_unroll)
-                def map_selected(i):
+                def map_winners(i):
                     slots = candidate_ids[pl.ds(i, lanes)]
                     blocks = plsc.load_gather(
-                        candidate_ids,
-                        [output_width + jnp.maximum(slots, 0) // records_per_block],
+                        mapping,
+                        [jnp.clip(slots, 0, valid_width - 1) // records_per_block],
                     )
                     logical = blocks * records_per_block + slots % records_per_block
                     candidate_ids[pl.ds(i, lanes)] = jnp.where(slots >= 0, logical, -1)
-            else:
+            elif not unordered:
                 sort_selected()
             pltpu.async_copy(
                 candidate_ids.at[:output_width], out_indices_ref.at[row], sem
             ).wait()
 
-    if logical_blocks is not None:
-        start = jnp.broadcast_to(
-            jnp.asarray(0 if start_request is None else start_request, jnp.int32),
-            (lanes,),
-        )
-        result = kernel(scores, lengths, block_order, logical_blocks, start)
-    else:
-        result = kernel(scores, lengths, block_order)
+    start = (
+        (jnp.broadcast_to(jnp.asarray(start_request, jnp.int32), (lanes,)),)
+        if mapped and start_request is not None
+        else ()
+    )
+    result = kernel(
+        scores, lengths, block_order, (logical_blocks,) if mapped else (), start
+    )
     if output_width != k:
         result = result[:, :k]
     if scheduling_group_id is not None:

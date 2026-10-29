@@ -75,3 +75,61 @@ def test_streaming_topk_contract(block, threshold, width, distribution):
         order = np.lexsort((eligible, ~keys))[:512]
         np.testing.assert_array_equal(np.sort(ids), np.sort(eligible[order]))
         assert np.unique(ids).size == ids.size
+
+
+@pytest.mark.parametrize("distribution", ["random", "ties", "signed_zero", "subnormal"])
+@pytest.mark.parametrize("start_request", [None, 2])
+def test_unordered_topk_with_unsorted_block_mapping(distribution, start_request):
+    if jax.default_backend() != "tpu":
+        pytest.skip("SparseCore selection requires TPU")
+    rng = np.random.default_rng(821)
+    rows, width, block, k = 4, 16384, 8, 512
+    mapping = np.stack([rng.permutation(width // block) for _ in range(rows)]).astype(
+        np.int32
+    ) + (1 << 25)
+    logical = (mapping[..., None] * block + np.arange(block)).reshape(rows, width)
+    scores = rng.normal(size=(rows, width)).astype(np.float32)
+    if distribution == "ties":
+        scores = np.round(scores)
+    elif distribution == "signed_zero":
+        scores[:] = 0
+        scores[:, ::2] = -0.0
+    elif distribution == "subnormal":
+        scores[:] = np.resize(
+            np.array([0, 1, 0x80000000, 0x80000001, 0x007FFFFF, 0x807FFFFF], np.uint32),
+            width,
+        ).view(np.float32)
+    scores[:, ::5] = -np.inf
+    lengths = np.array([[0], [511], [8193], [width]], np.int32)
+    actual = np.asarray(
+        streaming_topk(
+            jnp.asarray(scores),
+            logical_blocks=jnp.pad(
+                jnp.asarray(mapping),
+                ((start_request or 0, 0), (0, 0)),
+                constant_values=-1,
+            ),
+            start_request=None if start_request is None else jnp.int32(start_request),
+            valid_lengths=jnp.asarray(lengths),
+            exclude_neg_inf=True,
+            unordered=True,
+            k=k,
+        )
+    )
+    for row in range(rows):
+        eligible = np.flatnonzero(
+            (np.arange(width) < lengths[row, 0]) & (scores[row] > -np.inf)
+        )
+        bits = scores[row, eligible].view(np.uint32)
+        keys = bits ^ np.where(bits >> 31, np.uint32(0xFFFFFFFF), np.uint32(0x80000000))
+        chosen = actual[row][actual[row] >= 0]
+        assert len(chosen) == min(k, len(eligible))
+        assert len(np.unique(chosen)) == len(chosen)
+        slots_by_id = {int(record): slot for slot, record in enumerate(logical[row])}
+        slots = np.array([slots_by_id[int(record)] for record in chosen], np.int32)
+        assert np.all(np.isin(slots, eligible))
+        selected_bits = scores[row, slots].view(np.uint32)
+        selected_keys = selected_bits ^ np.where(
+            selected_bits >> 31, np.uint32(0xFFFFFFFF), np.uint32(0x80000000)
+        )
+        np.testing.assert_array_equal(np.sort(selected_keys), np.sort(keys)[-k:])
