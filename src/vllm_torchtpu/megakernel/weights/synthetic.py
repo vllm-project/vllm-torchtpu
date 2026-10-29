@@ -36,6 +36,11 @@ from .logical import (
     resolve_spec_and_norms,
     switch_branch_for_layer,
 )
+from .spec_inputs import (
+    pack_spec_inputs,
+    random_spec_inputs,
+    random_spec_logical_weights,
+)
 
 
 def _resolve_model_and_geom(
@@ -243,4 +248,12 @@ def random_inputs(
     )
 
 
-__all__ = ["pack_inputs", "random_hf_weights", "random_inputs", "random_logical_inputs"]
+__all__ = [
+    "pack_inputs",
+    "pack_spec_inputs",
+    "random_hf_weights",
+    "random_inputs",
+    "random_logical_inputs",
+    "random_spec_inputs",
+    "random_spec_logical_weights",
+]

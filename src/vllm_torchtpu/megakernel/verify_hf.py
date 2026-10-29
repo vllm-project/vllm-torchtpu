@@ -25,19 +25,32 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.experimental import mesh_utils
+from jax.sharding import Mesh
 
+from . import kernel
+from . import weights as w_mod
 from .exec_spec import ExecSpec
 from .geometry import ModelGeometry
 from .model_def import ModelDef
 from .ops import BF16, I32
+from .pool.config import with_cache
+from .profile import Profile
 from .spec import SwitchSlot
-from .verify import CheckResult, ToleranceSpec
-from .verify_checks import err_metrics
+from .verify_checks import (
+    VerifyCtx,
+    _allclose,
+    _compare_state_dict,
+    _spec_state_decls,
+    err_metrics,
+    prof_exec,
+)
+from .verify_metrics import CheckResult, ToleranceSpec
 from .weights.logical import (
     resolve_spec_and_norms,
     switch_branch_for_layer,
@@ -269,4 +282,119 @@ def verify_reference_vs_hf(
     )
 
 
-__all__ = ["OracleCallable", "OracleInputs", "verify_reference_vs_hf"]
+def run_kernel_vs_oracle(
+    vc: VerifyCtx,
+    prof: Profile,
+    w_hf_q: Mapping[str, Any] | None,
+    oracle: Callable[..., tuple[Any, Any]],
+    res_cls: type[CheckResult],
+) -> CheckResult:
+    """Compare `make_step` against `oracle(weights, inputs)` across `T_values`
+    using decode-step inputs (`pos`, `hidden`, and random non-zero `states`).
+    """
+    m_def, g, R, tol = vc.m_def, vc.g, vc.R, vc.tol
+    is_approx = prof.numerics == "approx"
+    h_atol = tol.approx_hidden_atol if is_approx else tol.hidden_atol
+    h_rtol = tol.approx_hidden_rtol if is_approx else tol.hidden_rtol
+    h_cos = tol.approx_hidden_min_cos if is_approx else tol.hidden_min_cos
+    devs = jax.devices()
+    if len(devs) < R:
+        raise RuntimeError(
+            f"verify_model requires >= {R} JAX devices, found {len(devs)}"
+        )
+    spec = m_def.to_model_spec(g, R=R)
+    all_have_hf = all(m.has_hf_params for m in spec.all_modules())
+    _, _, pre_n, post_n, final_n = resolve_spec_and_norms(m_def, None, g=g)
+    mesh = Mesh(mesh_utils.create_device_mesh((R,), devices=devs[:R]), ("tp",))
+    stats, per_mode_t, failed = [0.0, 0.0, 0, 1.0], {}, []
+    ora_weights: Mapping[str, Any] = (
+        w_hf_q if (all_have_hf and w_hf_q is not None) else {}
+    )
+
+    for T in vc.t_vals:
+        B = max(1, vc.B_per_T * int(T))
+        ex_b = prof_exec(prof, g, R=R, B=B, T=int(T), ctx=vc.ctx, interp=True)
+        ex_d = with_cache(ex_b, paged_kv=False, fused_pool_io=False, pool_gather=False)
+        pos, hid, w_l, st_l = vc.inputs_by_t[int(T)]
+        ora_in = OracleInputs(
+            pos=pos, hidden=hid, states=st_l, g=g, ex=ex_d, w_logical=w_l
+        )
+        try:
+            ref_h, ref_st_raw = oracle(ora_weights, ora_in)
+        except ImportError as exc:
+            return res_cls(
+                "kernel_vs_oracle",
+                "skipped",
+                reason=f"oracle dependency unavailable: {exc}",
+            )
+        ref_st = dict(ref_st_raw) if isinstance(ref_st_raw, Mapping) else {}
+        ref_st = {k: v for k, v in ref_st.items() if not str(k).startswith("_")}
+        if all_have_hf:
+            pos_m, hid_m, w_m, st_m = w_mod.pack_inputs(
+                pos, hid, w_l, st_l, g, ex_d, mesh=mesh, model_def=m_def
+            )
+        else:
+            pos_m, hid_m, w_m, st_m = w_mod.pack_spec_inputs(
+                pos,
+                hid,
+                w_l,
+                st_l,
+                spec,
+                ex_d,
+                mesh=mesh,
+                pre_norm=pre_n,
+                post_norm=post_n,
+                final_norm=final_n,
+            )
+        step_d, _ = kernel.make_step(mesh, spec, ex_d)
+        out_h, out_st = step_d(pos_m, hid_m, w_m, st_m)
+        tag = f"DirectHBM_T{T}"
+        ref_h_arr = jnp.asarray(ref_h)
+        ref_b = (
+            ref_h_arr[:, :B]
+            if ref_h_arr.ndim == 3
+            else jnp.broadcast_to(ref_h_arr[:B][None, ...], (R, B, int(g.H)))
+        )
+        u_h = kernel.unfold(out_h, R)[:, :B]
+        ab, rl, ul, cs = err_metrics(u_h, ref_b)
+        stats[0], stats[1] = max(stats[0], ab), max(stats[1], rl)
+        stats[2], stats[3] = max(stats[2], ul), min(stats[3], cs)
+        if not _allclose(u_h, ref_b, atol=h_atol, rtol=h_rtol):
+            failed.append(f"{tag} hidden abs={ab:.4g} cos={cs:.6f}")
+        elif cs < h_cos:
+            failed.append(f"{tag} hidden cos={cs:.6f} < {h_cos}")
+        m_dir: dict[str, Any] = {
+            "hidden_max_abs": ab,
+            "hidden_max_ulp": ul,
+            "hidden_min_cos": cs,
+        }
+        per_mode_t[tag] = m_dir
+        u_st: dict[str, Any] = {}
+        for mod in spec.all_modules():
+            u_st.update(mod.unpack_kernel_states(out_st, g, ex_d))
+        for k, v in out_st.items():
+            if k not in u_st:
+                u_st[k] = kernel.unfold(v, R)
+        _compare_state_dict(
+            u_st,
+            ref_st,
+            tol=tol,
+            is_approx=is_approx,
+            tag=tag,
+            m_out=m_dir,
+            failed=failed,
+            state_decls=_spec_state_decls(spec, g, ex_d),
+        )
+
+    st: Literal["passed", "failed"] = "passed" if not failed else "failed"
+    tols = {"hidden_atol": h_atol, "hidden_min_cos": h_cos}
+    det, rsn = {"profile": prof.name, "metrics": per_mode_t}, "; ".join(failed)
+    return res_cls("kernel_vs_oracle", st, *stats, tols, rsn, det)
+
+
+__all__ = [
+    "OracleCallable",
+    "OracleInputs",
+    "run_kernel_vs_oracle",
+    "verify_reference_vs_hf",
+]

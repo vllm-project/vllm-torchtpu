@@ -137,6 +137,7 @@ from .profile import (
 )
 from .spec import (
     REQUIRED,
+    CompareMode,
     ExtraInput,
     FrozenDict,
     HFParamDecl,
@@ -145,6 +146,7 @@ from .spec import (
     ModelSpec,
     Module,
     ModuleBinding,
+    OutputRole,
     ParamInit,
     ParamTransform,
     RecurrentCacheDecl,
@@ -159,10 +161,12 @@ from .spec import (
 )
 from .stream import TwoRing
 from .verify import (
+    ModuleOracle,
     ToleranceSpec,
     VerificationReport,
     auto_model,
     verify_model,
+    verify_module,
 )
 from .vmem import fit_default_tiles, fitted_plan
 from .weights import (
@@ -179,9 +183,13 @@ from .weights import (
     normalize_hf_for_vllm,
     pack_inputs,
     pack_logical_weights,
+    pack_spec_inputs,
+    pack_spec_logical_weights,
     random_hf_weights,
     random_inputs,
     random_logical_inputs,
+    random_spec_inputs,
+    random_spec_logical_weights,
 )
 
 __all__ = [
@@ -193,6 +201,7 @@ __all__ = [
     "Baseline",
     "CacheExec",
     "CachePipe",
+    "CompareMode",
     "DebugOptions",
     "DirectHBM",
     "EligibilityResult",
@@ -229,8 +238,10 @@ __all__ = [
     "ModelSpec",
     "Module",
     "ModuleBinding",
+    "ModuleOracle",
     "Norm",
     "NormModule",
+    "OutputRole",
     "PallasWriter",
     "ParamInit",
     "ParamTransform",
@@ -309,6 +320,8 @@ __all__ = [
     "ops",
     "pack_inputs",
     "pack_logical_weights",
+    "pack_spec_inputs",
+    "pack_spec_logical_weights",
     "planner",
     "pool",
     "pool_alias",
@@ -318,6 +331,8 @@ __all__ = [
     "random_hf_weights",
     "random_inputs",
     "random_logical_inputs",
+    "random_spec_inputs",
+    "random_spec_logical_weights",
     "raw_page_to_conv",
     "raw_page_to_kv",
     "raw_pages_to_ssm",
@@ -337,6 +352,7 @@ __all__ = [
     "validate",
     "verify",
     "verify_model",
+    "verify_module",
     "vmem",
     "weights",
     "with_cache",

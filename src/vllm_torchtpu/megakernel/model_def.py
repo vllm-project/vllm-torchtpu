@@ -40,7 +40,7 @@ from .geometry import FromHF, LMHead, ModelGeometry, _BoundFromHF
 from .modules.gdn import GDNModule
 from .pool import PoolBackend, PoolLayout
 from .profile import Profile, get_profile, model_default_profile, register_profile
-from .reference import composed_reference_step
+from .reference import composed_reference_step, spec_reference_step
 from .schedule import (
     Every,
     FromHFLayerTypes,
@@ -249,20 +249,13 @@ class ModelDef:
         pool_io: bool = False,
     ) -> tuple[jax.Array, dict[str, Any]]:
         """Composed pure-JAX multi-rank reference along `schedule`."""
+        args = (g, ex, pos, hidden, logical_weights, logical_states)
+        kw = dict(paged_kv=paged_kv, pool_io=pool_io)
+        if not cls.schedule:
+            return spec_reference_step(cls.to_model_spec(g, R=ex.R), *args, **kw)
         sched = cls.resolve_schedule(g)
         validate_norms(cls, sched, None, g.eps, expected_zc=g.zero_centered_norm)
-        return composed_reference_step(
-            sched,
-            cls.final_norm,
-            g,
-            ex,
-            pos,
-            hidden,
-            logical_weights,
-            logical_states,
-            paged_kv=paged_kv,
-            pool_io=pool_io,
-        )
+        return composed_reference_step(sched, cls.final_norm, *args, **kw)
 
 
 _MODEL_REGISTRY: dict[str, type[ModelDef]] = {}

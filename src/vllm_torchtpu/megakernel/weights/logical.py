@@ -22,16 +22,16 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
-from .. import planner
 from ..decls import HFParamDecl, ModuleBinding, ResolvedModuleGeometry
 from ..exec_spec import ExecSpec
 from ..model_def import ModelDef
 from ..module import Module
 from ..modules.norm import NormModule
 from ..modules.transforms import _validate_decl_and_array, apply_hf_transforms
-from ..ops import F32, I32
-from ..spec import ModelSpec, SwitchSlot
-from .eplb import default_eplb_cores, encode_eplb_ecopy, resolve_mapping_ecopy
+from ..ops import I32
+from ..spec import ModelSpec
+from .eplb import default_eplb_cores, encode_eplb_ecopy
+from .spec_pack import pack_spec_logical_weights, switch_branch_for_layer
 
 
 def _resolve_norm_mod(
@@ -78,23 +78,19 @@ def resolve_spec_and_norms(
         raise TypeError(f"Expected a ModelDef subclass, got {model_def!r}")
     geom = model_def.geometry() if g is None else g
     ms = model_def.to_model_spec(geom, R=None if ex is None else ex.R)
-    assert model_def.schedule is not None
     sched = model_def.schedule
-    pre_n = _resolve_norm_mod(sched.pre_norm, geom, default_small_field="in_norm")
-    post_n = _resolve_norm_mod(sched.post_norm, geom, default_small_field="post_norm")
+    pre_n = (
+        _resolve_norm_mod(sched.pre_norm, geom, default_small_field="in_norm")
+        if sched is not None
+        else None
+    )
+    post_n = (
+        _resolve_norm_mod(sched.post_norm, geom, default_small_field="post_norm")
+        if sched is not None
+        else None
+    )
     final_n = _resolve_norm_mod(model_def.final_norm, geom, default_small_field=None)
     return ms, geom, pre_n, post_n, final_n
-
-
-def switch_branch_for_layer(slot: SwitchSlot, lyr: int) -> tuple[Module, int]:
-    """Return `(active_branch_module, ordinal_layer_index)` for `slot` at `lyr`."""
-    cyc_idx, rem = divmod(lyr, slot.period)
-    acc = 0
-    for branch, count in slot.active_pairs:
-        if rem < acc + count:
-            return branch, cyc_idx * count + (rem - acc)
-        acc += count
-    raise AssertionError(f"Unreachable SwitchSlot index for layer {lyr}")
 
 
 def _transpose_with_lead(
@@ -265,128 +261,16 @@ def pack_logical_weights(
     merged_tiles: bool = False,
 ) -> dict[str, Any]:
     """Pack all-ranks `logical_weights` into tiled megakernel weights (`weights_mk`)."""
-    ms, geom, pre_n, post_n, final_n = resolve_spec_and_norms(model_def, ex, g=g)
-    p = planner.plan(ms, ex)
-    R, L = ex.R, int(geom.L)
-    lay = p.smalls_layout
-    sm = jnp.zeros((R, L, 1, p.smalls_width), dtype=F32)
-
-    def set_sm(name: str, val: jax.Array, lyr: int | None = None) -> None:
-        nonlocal sm
-        o, w = lay[name]
-        vw = min(w, val.shape[-1])
-        assert val.shape[-1] <= w, (name, val.shape[-1], w)
-        if lyr is None:
-            sh = (R, L, val.shape[-1])
-            v = jnp.broadcast_to(val[None], sh) if val.ndim == 2 else val
-            sm = sm.at[:, :, 0, o : o + vw].set(v[:, :, :vw].astype(F32))
-        else:
-            sh = (R, val.shape[-1])
-            v = jnp.broadcast_to(val[None], sh) if val.ndim == 1 else val
-            sm = sm.at[:, lyr, 0, o : o + vw].set(v[:, :vw].astype(F32))
-
-    def small_pairs(mod: Module) -> list[tuple[str, str]]:
-        seen: set[tuple[str, str]] = set()
-        out: list[tuple[str, str]] = []
-        for d in mod.hf_params(g=geom):
-            sf_name = d.transform.small_field
-            if sf_name is not None:
-                if sf_name not in lay:
-                    raise ValueError(
-                        f"{mod.name!r} {d.name!r} small_field={sf_name!r} not in lay"
-                    )
-                pair = (sf_name, d.transform.fuse_into or d.name)
-                if pair not in seen:
-                    seen.add(pair)
-                    out.append(pair)
-        return out
-
-    populated_sm: set[str] = set()
-    mods_l = [m for m in (pre_n, post_n) if m is not None]
-    mods_l.extend(s for s in ms.layer_type.slots if isinstance(s, Module))
-    for mod in mods_l:
-        for sm_field, l_key in small_pairs(mod):
-            if l_key not in logical_weights:
-                raise ValueError(f"Missing logical weight {l_key!r} for {sm_field!r}")
-            set_sm(sm_field, logical_weights[l_key])
-            populated_sm.add(sm_field)
-
-    if (
-        "ecopy" in lay
-        and (ec := resolve_mapping_ecopy(logical_weights, None, geom, R)) is not None
-    ):
-        set_sm("ecopy", ec)
-
-    for slot in ms.layer_type.slots:
-        if isinstance(slot, SwitchSlot):
-            b_pairs = {b.name: small_pairs(b) for b in slot.active_branches}
-            for lyr in range(L):
-                b_mod, ord_idx = switch_branch_for_layer(slot, lyr)
-                for sm_field, l_key in b_pairs[b_mod.name]:
-                    if l_key not in logical_weights:
-                        raise ValueError(f"Missing {l_key!r} for {sm_field!r}")
-                    arr = logical_weights[l_key]
-                    set_sm(
-                        sm_field,
-                        arr[:, lyr] if arr.shape[1] == L else arr[:, ord_idx],
-                        lyr=lyr,
-                    )
-                    populated_sm.add(sm_field)
-
-    for mod in ms.all_modules():
-        if p.module_layer_counts.get(mod.name, 0) > 0:
-            for sf in mod.smalls(geom, ex):
-                if sf.name != "ecopy" and sf.name not in populated_sm:
-                    raise ValueError(f"{mod.name!r} smalls() {sf.name!r} unmapped")
-
-    def tile_w(arr: jax.Array, kind: str) -> jax.Array:
-        *lead, k_in, n_in = arr.shape
-        nt_, tk_, exp_n = p.nt[kind], p.tk[kind], p.kinds[kind][1]
-        assert nt_ * tk_ == k_in and n_in == exp_n, (kind, k_in, nt_, tk_, n_in, exp_n)
-        return arr if merged_tiles else arr.reshape((*lead, nt_, tk_, n_in))
-
-    weights_mk: dict[str, Any] = {}
-    for mod in ms.all_modules():
-        if (n_layers := p.module_layer_counts.get(mod.name, 0)) == 0:
-            continue
-        for wd in mod.weights(geom, ex):
-            raw = (
-                jnp.concatenate([logical_weights[s] for s in wd.fuse_from], axis=-1)
-                if wd.fuse_from
-                else logical_weights[wd.name]
-            )
-            if wd.stream_ring in ("static", "dynamic"):
-                if wd.layout == "stacked":
-                    if isinstance(raw, (tuple, list)):
-                        raw = jnp.stack(raw, axis=1)
-                    if raw.ndim == 1 + len(wd.lead_dims) + 2:
-                        sh = (R, *raw.shape)
-                        raw = jnp.broadcast_to(raw[None, ...], sh).astype(wd.dtype)
-                    weights_mk[wd.name] = tile_w(raw, wd.name)
-                else:
-                    is_seq = isinstance(raw, (tuple, list))
-                    src = raw if is_seq else [raw[:, i] for i in range(n_layers)]
-                    weights_mk[wd.name] = tuple(tile_w(x, wd.name) for x in src)
-            else:
-                sh = (
-                    (R, n_layers, *wd.lead_dims, wd.K * wd.N)
-                    if (merged_tiles and wd.K == 1 and len(wd.lead_dims) >= 1)
-                    else (R, n_layers, *wd.lead_dims, wd.K, wd.N)
-                )
-                weights_mk[wd.name] = raw.reshape(sh).astype(wd.dtype)
-
-    if "smalls" in p.w_names:
-        weights_mk["smalls"] = sm
-    if final_n is not None and "final_norm" in p.w_names:
-        fn_decl = final_n.hf_params(g=geom)[0]
-        if (
-            fn_key := fn_decl.name if fn_decl.name in logical_weights else "final_norm"
-        ) in logical_weights:
-            fn_raw = logical_weights[fn_key]
-            weights_mk["final_norm"] = jnp.broadcast_to(
-                fn_raw[None, None, :] if fn_raw.ndim == 1 else fn_raw, (R, 1, geom.H)
-            ).astype(fn_decl.dtype)
-    return weights_mk
+    ms, _, pre_n, post_n, final_n = resolve_spec_and_norms(model_def, ex, g=g)
+    return pack_spec_logical_weights(
+        ms,
+        ex,
+        logical_weights,
+        pre_norm=pre_n,
+        post_norm=post_n,
+        final_norm=final_n,
+        merged_tiles=merged_tiles,
+    )
 
 
 def load_hf(
@@ -396,3 +280,13 @@ def load_hf(
     mt = bool(kw.pop("merged_tiles", False))
     logical = load_logical_weights(model_def, ex, hf, g=g, **kw)
     return pack_logical_weights(model_def, ex, logical, g=g, merged_tiles=mt)
+
+
+__all__ = [
+    "load_hf",
+    "load_logical_weights",
+    "pack_logical_weights",
+    "pack_spec_logical_weights",
+    "resolve_spec_and_norms",
+    "switch_branch_for_layer",
+]

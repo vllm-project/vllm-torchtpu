@@ -164,7 +164,12 @@ class Module:
         raw_outputs: dict[str, Any],
     ) -> dict[str, Any]:
         """Host-side state update inside `shard_map` after `pallas_call` returns."""
-        return {}
+        del pos, states
+        return {
+            od.name: raw_outputs[od.name]
+            for od in self.outputs(g, ex)
+            if od.name in raw_outputs
+        }
 
     @classmethod
     def _validate_options(cls, options: Mapping[str, Any]) -> None:
@@ -296,6 +301,16 @@ class Module:
 
     def reference(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError(f"{type(self).__name__}.reference is not implemented")
+
+    @property
+    def has_reference(self) -> bool:
+        """Return True if this module overrides `Module.reference`."""
+        return type(self).reference is not Module.reference
+
+    @property
+    def has_hf_params(self) -> bool:
+        """Return True if this module overrides `Module.hf_params`."""
+        return type(self).hf_params is not Module.hf_params
 
 
 __all__ = ["Module"]

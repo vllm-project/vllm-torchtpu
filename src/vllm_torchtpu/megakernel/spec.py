@@ -73,6 +73,10 @@ class WeightDecl:
     ] = ()  # Optional logical buffers concatenated along axis=-1 into this weight
 
 
+OutputRole = Literal["state", "tap", "token", "residual"]
+CompareMode = Literal["close", "exact", "cos", "none"]
+
+
 @dataclass(frozen=True)
 class StateDecl:
     """Declarative specification for a state, cache, or per-layer output tensor.
@@ -88,6 +92,34 @@ class StateDecl:
     per_layer: bool = True
     memory_space: Literal["hbm", "smem", "vmem"] = "hbm"
     tupled: bool = False
+    role: OutputRole = "state"
+    compare: CompareMode | None = None
+    atol: float | None = None
+    rtol: float | None = None
+    min_cos: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.role not in ("state", "tap", "token", "residual"):
+            raise ValueError(
+                f"StateDecl {self.name!r} got invalid role={self.role!r}; "
+                "expected one of ('state', 'tap', 'token', 'residual')"
+            )
+        eff_cmp: CompareMode = (
+            ("exact" if self.role == "token" else "close")
+            if self.compare is None
+            else self.compare
+        )
+        if eff_cmp not in ("close", "exact", "cos", "none"):
+            raise ValueError(
+                f"StateDecl {self.name!r} got invalid compare={eff_cmp!r}; "
+                "expected one of ('close', 'exact', 'cos', 'none')"
+            )
+        if self.role == "token" and eff_cmp not in ("exact", "none"):
+            raise ValueError(
+                f"StateDecl {self.name!r} with role='token' requires "
+                f"compare in ('exact', 'none'), got {eff_cmp!r}"
+            )
+        object.__setattr__(self, "compare", eff_cmp)
 
 
 @dataclass(frozen=True)
@@ -245,6 +277,7 @@ class ModelSpec:
 
 __all__ = [
     "REQUIRED",
+    "CompareMode",
     "ExtraInput",
     "FrozenDict",
     "HFParamDecl",
@@ -253,6 +286,7 @@ __all__ = [
     "ModelSpec",
     "Module",
     "ModuleBinding",
+    "OutputRole",
     "ParamInit",
     "ParamTransform",
     "RecurrentCacheDecl",

@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -38,94 +38,14 @@ from .verify_checks import (
     prof_exec,
     run_kernel_vs_ref,
 )
-
-
-@dataclass(frozen=True)
-class ToleranceSpec:
-    """Numerical tolerance specification for `verify_model`.
-
-    Per-field comparison vs `tests/megakernel/test_model_def.py:979-998` and
-    `tests/megakernel/test_m3_cache_eplb.py`:
-    - `hidden`: `atol=4e-2, rtol=2e-2, min_cos=0.9999` (`atol=4e-2` tightens
-      `test_model_def.py`'s `5e-2`; `rtol=2e-2` is looser than `1e-2` for
-      near-zero elements; seed-0 measured `max_abs`: primary hybrid model
-      `0.039` at `T=4` / `0.019` at `T=1`, `SynthHybrid` `0.0156`).
-    - `kv`: `atol=3.5e-2, rtol=1.5e-2` (looser than `test_model_def.py`'s
-      `2e-2/1e-2` at `T=1` because `DirectHBM` at `T=4` has `kc` `max_abs =
-      0.03125 = 1` bf16 ULP).
-    - `paged_kv`: `atol=2.5e-1, rtol=1.5e-1` (matches `test_m3_cache_eplb.py`
-      for FP8 `PallasWriter`, 1 FP8 ULP).
-    - `conv`: `atol=1e-2, rtol=1e-2` (matches `test_model_def.py`).
-    - `rec`: `atol=5e-2, rtol=2e-2` (matches `test_model_def.py`).
-    - `approx_*`: governs `approx_profiles`; `hf_hidden_*`: `atol=4e-2,
-      rtol=2e-2, min_cos=0.9999` (measured `max_abs ~0.0156`, `min_cos
-      ~0.999998`); `max_ulp_diff` is in relative bf16 steps
-      (`ldexp(1.0, floor(log2(max(|got|, |ref|, 1.0))) - 7)`).
-    """
-
-    hidden_atol: float = 4e-2
-    hidden_rtol: float = 2e-2
-    hidden_min_cos: float = 0.9999
-    kv_atol: float = 3.5e-2
-    kv_rtol: float = 1.5e-2
-    paged_kv_atol: float = 2.5e-1
-    paged_kv_rtol: float = 1.5e-1
-    conv_atol: float = 1e-2
-    conv_rtol: float = 1e-2
-    rec_atol: float = 5e-2
-    rec_rtol: float = 2e-2
-    approx_hidden_atol: float = 4e-2
-    approx_hidden_rtol: float = 2e-2
-    approx_hidden_min_cos: float = 0.9999
-    approx_kv_atol: float = 3.5e-2
-    approx_kv_rtol: float = 1.5e-2
-    approx_paged_kv_atol: float = 2.5e-1
-    approx_paged_kv_rtol: float = 1.5e-1
-    approx_conv_atol: float = 1e-2
-    approx_conv_rtol: float = 1e-2
-    approx_rec_atol: float = 5e-2
-    approx_rec_rtol: float = 2e-2
-    hf_hidden_atol: float = 4e-2
-    hf_hidden_rtol: float = 2e-2
-    hf_hidden_min_cos: float = 0.9999
-
-
-DEFAULT_TOLERANCES = ToleranceSpec()
-
-
-@dataclass(frozen=True)
-class CheckResult:
-    """Outcome and measured error metrics for a single verification check."""
-
-    name: str
-    status: Literal["passed", "failed", "skipped"]
-    max_abs_err: float = 0.0
-    max_rel_err: float = 0.0
-    max_ulp_diff: int = 0
-    min_cos: float = 1.0
-    tolerance: Mapping[str, float | int] = dataclasses.field(default_factory=dict)
-    reason: str = ""
-    details: Mapping[str, Any] = dataclasses.field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class VerificationReport:
-    """Structured report returned by `verify_model`."""
-
-    model_name: str
-    geometry: ModelGeometry
-    checks: tuple[CheckResult, ...]
-
-    @property
-    def passed(self) -> bool:
-        return all(c.status in ("passed", "skipped") for c in self.checks)
-
-    def assert_passed(self, *, allow_skipped: bool = True) -> None:
-        ok_st = ("passed", "skipped") if allow_skipped else ("passed",)
-        bad = [c for c in self.checks if c.status not in ok_st]
-        if bad:
-            pts = [f"{c.name}({c.status}: {c.reason!r})" for c in bad]
-            raise AssertionError(f"verify_model({self.model_name!r}): {pts}")
+from .verify_hf import run_kernel_vs_oracle, verify_reference_vs_hf
+from .verify_metrics import (
+    DEFAULT_TOLERANCES,
+    CheckResult,
+    ToleranceSpec,
+    VerificationReport,
+)
+from .verify_module import ModuleOracle, verify_module
 
 
 @dataclass(frozen=True)
@@ -227,63 +147,115 @@ def verify_model(
     `reference_vs_hf` (when `hf=True` or `oracle is not None`).
     """
     m_name = str(getattr(target, "name", target))
-    m_def: Any = None
-    g: Any = None
-    prof: Any = None
-    vc: Any = None
-    ex_t1: Any = None
-    w_hf_q: Any = None
-    w_log: Any = None
+    m_def = g = prof = spec = vc = ex_t1 = w_hf_q = w_log = None
+    all_have_hf = all_have_ref = True
 
     def _run_setup() -> CheckResult:
-        nonlocal m_name, m_def, g, prof, vc, ex_t1, w_hf_q, w_log
+        nonlocal m_name, m_def, g, prof, spec, vc, ex_t1, w_hf_q, w_log
+        nonlocal all_have_hf, all_have_ref
         m_def = get_model(target)
         m_name = m_def.name
         eff_mtp = True if moe_tp is None else bool(moe_tp)
         g = dataclasses.replace(m_def.shrink(periods=periods, R=R), moe_tp=eff_mtp)
+        spec = m_def.to_model_spec(g, moe_tp=eff_mtp, R=R)
+        all_have_hf = all(m.has_hf_params for m in spec.all_modules())
+        all_have_ref = all(m.has_reference for m in spec.all_modules())
         is_str = isinstance(profile, str) or profile is None
         prof = m_def.get_profile(profile) if is_str else profile
         pol = BucketPolicy.resolve(prof)
         v_b = tuple(sorted({1, *(int(t) for t, _ in pol.iter_buckets())}))
         t_v = (v_b if len(v_b) > 1 else (1, 2)) if T_values is None else tuple(T_values)
-        in_by_t: dict[int, tuple[Any, Any, Any, Any]] = {}
-        for i, T in enumerate(t_v):
-            ex_i = prof_exec(
-                prof, g, R=R, B=max(1, B_per_T * int(T)), T=int(T), ctx=ctx, interp=True
-            )
-            in_by_t[int(T)] = w_mod.random_logical_inputs(
-                jax.random.key(seed + 100 + i), g, ex_i, model_def=m_def
-            )
-        vc = VerifyCtx(m_def, g, R, B_per_T, t_v, ctx, seed, tolerances, in_by_t)
         ex_t1 = prof_exec(prof, g, R=R, B=max(1, B_per_T), T=1, ctx=ctx, interp=True)
-        w_hf = w_mod.random_hf_weights(jax.random.key(seed), g, model_def=m_def)
-        w_hf_q = w_mod.normalize_hf_for_vllm(m_def, ex_t1, w_hf, g=g)
-        w_log = w_mod.load_logical_weights(m_def, ex_t1, w_hf_q, g=g)
+        in_by_t: dict[int, tuple[Any, Any, Any, Any]] = {}
+        if all_have_hf:
+            for i, T in enumerate(t_v):
+                b_i = max(1, B_per_T * int(T))
+                ex_i = prof_exec(prof, g, R=R, B=b_i, T=int(T), ctx=ctx, interp=True)
+                in_by_t[int(T)] = w_mod.random_logical_inputs(
+                    jax.random.key(seed + 100 + i), g, ex_i, model_def=m_def
+                )
+            w_hf = w_mod.random_hf_weights(jax.random.key(seed), g, model_def=m_def)
+            w_hf_q = w_mod.normalize_hf_for_vllm(m_def, ex_t1, w_hf, g=g)
+            w_log = w_mod.load_logical_weights(m_def, ex_t1, w_hf_q, g=g)
+        else:
+            w_hf_q = None
+            w_log = w_mod.random_spec_logical_weights(jax.random.key(seed), spec, ex_t1)
+            for i, T in enumerate(t_v):
+                b_i = max(1, B_per_T * int(T))
+                ex_i = prof_exec(prof, g, R=R, B=b_i, T=int(T), ctx=ctx, interp=True)
+                in_by_t[int(T)] = w_mod.random_spec_inputs(
+                    jax.random.key(seed + 100 + i), spec, ex_i, logical_weights=w_log
+                )
+        vc = VerifyCtx(m_def, g, R, B_per_T, t_v, ctx, seed, tolerances, in_by_t)
         return CheckResult("setup", "passed", details={"T_values": t_v, "R": R})
 
     setup_res = _safe_run("setup", _run_setup)
     if setup_res.status != "passed":
         return VerificationReport(model_name=m_name, geometry=g, checks=(setup_res,))
+    no_hf_mod = next((m for m in spec.all_modules() if not m.has_hf_params), None)
+    no_ref_mod = next((m for m in spec.all_modules() if not m.has_reference), None)
     checks = [
         setup_res,
         _safe_run(
             "derived_artifacts", lambda: check_derived_artifacts(vc, prof, CheckResult)
         ),
-        _safe_run(
-            "loader_parity",
-            lambda: check_loader_parity(vc, ex_t1, w_hf_q, w_log, CheckResult),
-        ),
-        _safe_run(
-            "kernel_vs_reference",
-            lambda: run_kernel_vs_ref(
-                vc, prof, "kernel_vs_reference", CheckResult, include_direct=True
-            ),
+        (
+            _safe_run(
+                "loader_parity",
+                lambda: check_loader_parity(vc, ex_t1, w_hf_q, w_log, CheckResult),
+            )
+            if all_have_hf
+            else CheckResult(
+                "loader_parity",
+                "skipped",
+                reason=f"Module {no_hf_mod.name!r} does not declare hf_params",
+            )
         ),
     ]
+    if all_have_ref:
+        checks.append(
+            _safe_run(
+                "kernel_vs_reference",
+                lambda: run_kernel_vs_ref(
+                    vc, prof, "kernel_vs_reference", CheckResult, include_direct=True
+                ),
+            )
+        )
+    else:
+        eff_ora = (
+            oracle
+            if oracle is not None
+            else (getattr(m_def, "hf_oracle", None) if (hf and all_have_hf) else None)
+        )
+        if eff_ora is not None and callable(eff_ora):
+            rsn_no_ref = (
+                f"Module {no_ref_mod.name!r} has no reference; "
+                "verified via kernel_vs_oracle"
+            )
+            checks.append(
+                CheckResult("kernel_vs_reference", "skipped", reason=rsn_no_ref)
+            )
+            checks.append(
+                _safe_run(
+                    "kernel_vs_oracle",
+                    lambda: run_kernel_vs_oracle(
+                        vc, prof, w_hf_q, eff_ora, CheckResult
+                    ),
+                )
+            )
+        else:
+            rsn_fail = (
+                f"Module {no_ref_mod.name!r} implements no reference() "
+                "and no usable oracle was provided"
+            )
+            checks.append(CheckResult("kernel_vs_reference", "failed", reason=rsn_fail))
     if approx_profiles:
         ap_all = [m_def.get_profile(nm) for nm in list_profiles()]
         ap_l = [p for p in ap_all if p.model == m_def.name and p.numerics == "approx"]
-        if ap_l:
+        if not all_have_ref:
+            rsn_ap = f"Module {no_ref_mod.name!r} has no reference"
+            checks.append(CheckResult("approx_profiles", "skipped", reason=rsn_ap))
+        elif ap_l:
 
             def _run_approx() -> CheckResult:
                 sub = [
@@ -297,48 +269,49 @@ def verify_model(
                 st_s: Literal["passed", "failed"] = "passed" if not bad else "failed"
                 rsn = "; ".join(r.reason for r in bad if r.reason)
                 tols = {"approx_hidden_atol": tolerances.approx_hidden_atol}
+                det_s = {r.name: r.details for r in sub}
                 return CheckResult(
-                    "approx_profiles",
-                    st_s,
-                    am,
-                    rm,
-                    um,
-                    cm,
-                    tols,
-                    rsn,
-                    {r.name: r.details for r in sub},
+                    "approx_profiles", st_s, am, rm, um, cm, tols, rsn, det_s
                 )
 
             checks.append(_safe_run("approx_profiles", _run_approx))
         else:
             checks.append(CheckResult("approx_profiles", "skipped", reason="none"))
     if hf or oracle is not None:
-        from .verify_hf import verify_reference_vs_hf
-
-        checks.append(
-            _safe_run(
-                "reference_vs_hf",
-                lambda: verify_reference_vs_hf(
-                    m_def,
-                    g,
-                    ex_t1,
-                    w_hf_q,
-                    w_log,
-                    oracle=oracle,
-                    tolerances=tolerances,
-                    seed=seed,
-                ),
+        if not all_have_ref:
+            rsn_skip = (
+                f"Module {no_ref_mod.name!r} has no reference; "
+                "verified via kernel_vs_oracle"
             )
-        )
+            checks.append(CheckResult("reference_vs_hf", "skipped", reason=rsn_skip))
+        elif not all_have_hf and oracle is None:
+            rsn_no_hf = (
+                f"Module {no_hf_mod.name!r} does not declare hf_params; "
+                "HF oracle skipped"
+            )
+            checks.append(CheckResult("reference_vs_hf", "skipped", reason=rsn_no_hf))
+        else:
+            hf_q = w_hf_q if w_hf_q is not None else {}
+            hf_kw = dict(oracle=oracle, tolerances=tolerances, seed=seed)
+            checks.append(
+                _safe_run(
+                    "reference_vs_hf",
+                    lambda: verify_reference_vs_hf(
+                        m_def, g, ex_t1, hf_q, w_log, **hf_kw
+                    ),
+                )
+            )
     return VerificationReport(model_name=m_def.name, geometry=g, checks=tuple(checks))
 
 
 __all__ = [
     "CheckResult",
     "DEFAULT_TOLERANCES",
+    "ModuleOracle",
     "ResolvedModel",
     "ToleranceSpec",
     "VerificationReport",
     "auto_model",
     "verify_model",
+    "verify_module",
 ]

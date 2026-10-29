@@ -21,6 +21,7 @@ from .logical import (
     load_hf,
     load_logical_weights,
     pack_logical_weights,
+    pack_spec_logical_weights,
     resolve_spec_and_norms,
     switch_branch_for_layer,
 )
@@ -34,9 +35,12 @@ from .ops import (
 )
 from .synthetic import (
     pack_inputs,
+    pack_spec_inputs,
     random_hf_weights,
     random_inputs,
     random_logical_inputs,
+    random_spec_inputs,
+    random_spec_logical_weights,
 )
 from .vllm_synth import SyntheticVLLMWeightSource, normalize_hf_for_vllm
 
@@ -55,9 +59,13 @@ __all__ = [
     "normalize_hf_for_vllm",
     "pack_inputs",
     "pack_logical_weights",
+    "pack_spec_inputs",
+    "pack_spec_logical_weights",
     "random_hf_weights",
     "random_inputs",
     "random_logical_inputs",
+    "random_spec_inputs",
+    "random_spec_logical_weights",
     "resolve_mapping_ecopy",
     "resolve_spec_and_norms",
     "slice_alias_targets",

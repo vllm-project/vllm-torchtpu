@@ -398,7 +398,9 @@ class MoEModule(Module):
         g: Any = None,
         ex: ExecSpec,
         layer_idx: int = 0,
+        **kw: Any,
     ) -> tuple[jax.Array, Any]:
+        del kw
         geom = self._require_geometry(g)
         moe_tp, _ = self._check_option_consistency(geom)
         return moe_reference(
