@@ -84,9 +84,10 @@ OPTION_KEYS = frozenset(
         "compile_hlo_check",
     }
 )
-# The profile `create` serves when `options` names none (`None`: the library's
-# model default).
-DEFAULT_PROFILE: str | None = None
+# The profile `create` serves when `options` names none: the candidate30 goal
+# configuration (approximate numerics). `qwen35-baseline` (exact numerics) is
+# one option away: `{"options": {"profile": "qwen35-baseline"}}`.
+DEFAULT_PROFILE: str | None = "qwen35-candidate30-fused"
 UNALIGNED_LAYOUT_MESSAGE = (
     "Megakernel requires unified KV+GDN cache layout "
     "(_unified_kv_layout=True); skipping."

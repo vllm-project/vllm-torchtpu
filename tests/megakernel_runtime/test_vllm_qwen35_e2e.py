@@ -2006,6 +2006,10 @@ def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
         )
     monkeypatch.setattr(logging.getLogger("vllm"), "propagate", True)
     monkeypatch.setattr(driver_mod, "_build_tp_rank_mesh", lambda *_a, **_k: mesh8)
+    # The template serves its own default profile unless told otherwise; this
+    # test covers the library model-default fallback.
+    assert qwen_adapter.DEFAULT_PROFILE == "qwen35-candidate30-fused"
+    monkeypatch.setattr(qwen_adapter, "DEFAULT_PROFILE", None)
     monkeypatch.setattr(
         Qwen35Program,
         "_prepare_and_pack_weights",

@@ -374,3 +374,13 @@ def test_shorthand_and_plugin_key_serve_identical_steps(
         outs.append(out.view(torch.uint16).clone())
     assert keys[0] == keys[1] == [(1, 2)]
     assert torch.equal(outs[0], outs[1])
+
+
+def test_template_default_profile_and_baseline_option() -> None:
+    """Without a profile the template serves `qwen35-candidate30-fused`;
+    exact numerics (`qwen35-baseline`) are one option away."""
+    view = RunnerView(_full_size_runner(), tp_rank=0)
+    assert adapter.DEFAULT_PROFILE == "qwen35-candidate30-fused"
+    assert adapter.create(view, {}).profile.name == "qwen35-candidate30-fused"
+    base = adapter.create(view, {"profile": "qwen35-baseline"})
+    assert base.profile.name == "qwen35-baseline"
