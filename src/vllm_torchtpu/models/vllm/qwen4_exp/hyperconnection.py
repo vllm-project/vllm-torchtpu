@@ -227,11 +227,16 @@ class GatedResidual(common_hc.GatedResidual):
             and self.input_mix_weight_down.weight.dtype == torch.bfloat16
             and self.input_mix_weight_up.weight.dtype == torch.bfloat16
         ):
+            weight = self.hc_norm.weight
+            down = self.input_mix_weight_down.weight
+            if getattr(self, "_up_t", None) is not None:
+                # _up_weight() adds a transpose ahead of the op: touch the norm
+                # and down weights first so _up_t keeps its third place in
+                # every bucket's inputs (down and _up_t share a shape, so a
+                # swap would hand over a bucket with the two exchanged).
+                weight, down = weight.view(weight.shape), down.view(down.shape)
             mixed, norm = self._prefill_full_op(
-                hyper_input,
-                self.hc_norm.weight,
-                self.input_mix_weight_down.weight,
-                self._up_weight(),
+                hyper_input, weight, down, self._up_weight()
             )
             return mixed, self._residual(hyper_input, norm)
         norm = self._normalize(hyper_input)

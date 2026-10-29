@@ -438,3 +438,37 @@ def test_kept_up_transpose_keeps_one_input_order(monkeypatch):
         torch.manual_seed(0)
         kept = layer(False, True)(*args)
     torch.testing.assert_close(kept, ref, rtol=0, atol=0)
+
+
+def test_kept_up_transpose_prefill_op_keeps_the_order(monkeypatch):
+    """The prefill full-mix op path takes ``_up_t`` through a transpose ahead
+    of the op; its inputs must still come in the unfused order (t128
+    j-b1074681: _up_t first, ahead of the norm weight, refused the bucket;
+    down and _up_t share a shape, so a swap of those two would be accepted
+    with the weights exchanged)."""
+    hidden, lowrank, tokens = 128, 32, 8
+    args = (torch.randn(tokens, BRANCHES * hidden).to(torch.bfloat16),)
+
+    def stub_full(module):
+        def full_op(h, weight, down, up):
+            norm = (h.float() * (1.0 + weight.float())).to(h.dtype)
+            mixed = F.linear(F.silu(F.linear(norm, down)), up)[:, : module.hidden_size]
+            return mixed, norm
+
+        module._prefill_full_op = full_op
+        module.prefill_full_tile = tokens // 2
+        return module
+
+    def layer(prefill_op):
+        modules = [_module(seed, hidden=hidden, lowrank=lowrank) for seed in (1, 2)]
+        monkeypatch.setenv("TPU_QWEN4_HC_DECODE_FUSED", "1")
+        for m in modules:
+            m.prepare_decode_weights()
+        monkeypatch.delenv("TPU_QWEN4_HC_DECODE_FUSED")
+        if prefill_op:
+            modules = [stub_full(m) for m in modules]
+        return _Layer(*modules)
+
+    assert _inputs_by_first_use(layer(True), *args) == _inputs_by_first_use(
+        layer(False), *args
+    )
