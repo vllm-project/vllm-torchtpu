@@ -4035,6 +4035,7 @@ class TPUModelRunner(GPUModelRunner):
                     spec_decode_metadata.upload_deferred_draft_token_ids(self.device)
                 )
             draft_input_ids_src = input_ids
+            host_phases.mark("extract_drafts")
 
             # Slice the per-chunk multimodal mask/embeddings (the chunk
             # covers requests [start_index, end_index) in req order). Offsets
@@ -4058,6 +4059,7 @@ class TPUModelRunner(GPUModelRunner):
                     chunk_embeds = []
                 chunk_mm_inputs = (chunk_embeds, is_mm_chunk)
 
+            host_phases.mark("mm_slice")
             self._record_input_staging_fence()
             if self._pp_is_first:
                 input_ids, inputs_embeds = self._get_model_inputs(
@@ -4081,6 +4083,7 @@ class TPUModelRunner(GPUModelRunner):
                 intermediate_tensors = self._pp_wave.start_forward(num_tokens_padded)
                 self._pp_take_topk_indices(intermediate_tensors, num_tokens_padded)
 
+            host_phases.mark("model_inputs_padding")
             trace_kwargs: dict[str, Any] = {}
             if TraceAnnotation.is_enabled():
                 trace_kwargs.update(
@@ -4094,6 +4097,7 @@ class TPUModelRunner(GPUModelRunner):
                     )
                 )
 
+            host_phases.mark("trace_kwargs")
             if self.phase_based_profiler and batch_composition_stats is not None:
                 stats_map = {
                     "num_prefill_tokens": "num_prefill_tokens",
