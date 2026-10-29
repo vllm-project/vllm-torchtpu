@@ -214,7 +214,15 @@ def _heap_dump() -> None:
         return
     process.HeapProfilerDump(b"warm")
     prefix = os.environ["HEAPPROFILE"]
-    files = sorted(glob.glob(f"{prefix}.{os.getpid()}.*.heap"), key=os.path.getmtime)
+    pid = os.getpid()
+    files = sorted(
+        (
+            f
+            for f in glob.glob(f"{prefix}*.heap")
+            if f"_{pid}." in f or f".{pid}." in f
+        ),
+        key=os.path.getmtime,
+    )
     out = os.path.join(os.environ.get("CDK_OUTPUT_DIR", "/tmp/cdk_output"), "hprof")
     os.makedirs(out, exist_ok=True)
     if files:
