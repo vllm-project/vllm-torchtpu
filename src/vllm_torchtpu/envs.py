@@ -199,6 +199,9 @@ if TYPE_CHECKING:
     TPU_FUSED_ADD_RMSNORM_MIN_TOKENS: int = 512
     TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN: int = 4096
     TPU_FUSED_ADD_RMSNORM_QUANT: bool = True
+    TPU_STAGE_TIMING_ONLY_WITH_CONSUMER: bool = True
+    TPU_AOT_SKIP_GUARD_CHECK: bool = True
+    TPU_FOREACH_MUTATION_EPILOGUE: bool = True
 
 
 def env_with_choices(
@@ -1175,6 +1178,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # same Pallas pass for paired per-channel FP8 linears so the consumer matmul
     # skips its own amax + convert passes.
     "TPU_FUSED_ADD_RMSNORM_QUANT": env_bool("TPU_FUSED_ADD_RMSNORM_QUANT", True),
+    # Record runner stage timings (TpuEvent pairs) only when a KV connector can
+    # consume them; without a KV transfer config the samples are dropped every
+    # step, so the stages become no-ops.
+    "TPU_STAGE_TIMING_ONLY_WITH_CONSUMER": env_bool(
+        "TPU_STAGE_TIMING_ONLY_WITH_CONSUMER", True
+    ),
+    # After warmup, skip the per-call Dynamo guard check of AOT-compiled model
+    # forwards when vLLM compiled them without guards.
+    "TPU_AOT_SKIP_GUARD_CHECK": env_bool("TPU_AOT_SKIP_GUARD_CHECK", True),
+    # Write the inputs a compiled graph mutates (the KV caches) back with one
+    # torch._foreach_copy_ instead of one copy_ per input in AOTAutograd's
+    # epilogue (compilation/foreach_epilogue.py).
+    "TPU_FOREACH_MUTATION_EPILOGUE": env_bool("TPU_FOREACH_MUTATION_EPILOGUE", True),
 }
 
 

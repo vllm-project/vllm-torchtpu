@@ -261,6 +261,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     # backbone graph, and the KV cap reaches the hash through num_gpu_blocks.
     "VLLM_TPU_STATIC_POOLER",
     "VLLM_TPU_POOLING_KV_CACHE_TOKENS",
+    # Host-only serving-thread controls; neither alters compiled graphs.
+    "TPU_STAGE_TIMING_ONLY_WITH_CONSUMER",
+    "TPU_AOT_SKIP_GUARD_CHECK",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
@@ -274,6 +277,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # Pallas implementations execute behind torch custom-op boundaries, so
     # Dynamo's traced-file validation cannot see their source changes.
     "vllm_torchtpu/kernels",
+    "vllm_torchtpu/compilation/foreach_epilogue.py",
     "vllm_torchtpu/layers/core",
     "vllm_torchtpu/layers/adapter/attention.py",
     "vllm_torchtpu/layers/adapter/cp_attention.py",

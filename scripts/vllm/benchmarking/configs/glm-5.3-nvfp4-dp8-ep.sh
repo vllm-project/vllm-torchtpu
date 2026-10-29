@@ -53,8 +53,8 @@ RANDOM_RANGE_RATIO="0.0"
 # the GLM-5.2 NVFP4 recipe.
 export MOE_REQUANTIZE_BLOCK_SIZE="${MOE_REQUANTIZE_BLOCK_SIZE:-512}"
 
-# Optimized GLM-5.3-NVFP4 v7x-8 serving stack (+126.28% output tok/s/device:
-# 139.72 -> 316.16 tok/s/device at ISL=8192, OSL=1024, c=512; mmlu_pro=0.7643):
+# Optimized GLM-5.3-NVFP4 v7x-8 serving stack (+127.97% output tok/s/device:
+# 139.72 -> 318.52 tok/s/device at ISL=8192, OSL=1024, c=512; mmlu_pro=0.7643):
 # 1. Fused EP MoE v2 with W4A8 MXU matmuls + sharded schedule plan + padded-row skip
 export USE_MOE_FUSED_EP_KERNEL="${USE_MOE_FUSED_EP_KERNEL:-1}"
 export MOE_FUSED_EP_ENABLE_W4A8="${MOE_FUSED_EP_ENABLE_W4A8:-1}"
@@ -81,6 +81,10 @@ export TPU_FP8_LINEAR_W8A16_MAX_ROWS="${TPU_FP8_LINEAR_W8A16_MAX_ROWS:-32}"
 export TPU_FUSED_ADD_RMSNORM="${TPU_FUSED_ADD_RMSNORM:-1}"
 export TPU_FUSED_ADD_RMSNORM_QUANT="${TPU_FUSED_ADD_RMSNORM_QUANT:-1}"
 export TPU_FUSED_ADD_RMSNORM_MIN_TOKENS="${TPU_FUSED_ADD_RMSNORM_MIN_TOKENS:-1024}"
+# 8. Serving-thread host overhead elimination: gate StageTiming perf_counter_ns + fuse 78-buffer AOT KV copy_ epilogue into _foreach_copy_ + bypass stable AOT guard_fn
+export TPU_STAGE_TIMING_ONLY_WITH_CONSUMER="${TPU_STAGE_TIMING_ONLY_WITH_CONSUMER:-1}"
+export TPU_AOT_SKIP_GUARD_CHECK="${TPU_AOT_SKIP_GUARD_CHECK:-1}"
+export TPU_FOREACH_MUTATION_EPILOGUE="${TPU_FOREACH_MUTATION_EPILOGUE:-1}"
 
 # Server configuration:
 # - max-model-len=9216: exact nominal length for 8192 input + 1024 output.

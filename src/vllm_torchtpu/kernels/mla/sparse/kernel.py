@@ -483,6 +483,7 @@ def _attention_kernel(
     capped_windows: int | None = None,
     split_q: bool = False,
     lse_lane_dense: bool = False,
+    row_widths: tuple[int, ...] = (),
 ):
     # Split-q mode (`split_q`): `q_hbm_ref` holds q_nope only and the rope
     # part arrives as a separate input `q_pe_hbm_ref` (first of `refs`), with
@@ -563,6 +564,12 @@ def _attention_kernel(
     assert head_dim % 128 == 0
     assert num_q_heads % q_packing == 0
 
+    use_opt_sc = sparsecore_layout and capped_windows is None
+    use_tr = use_opt_sc and (bkv_sz % 4 == 0)
+    use_pv512 = use_opt_sc and (o_dim == nope_dim)
+    use_zu = use_pv512
+    use_noinf = use_opt_sc
+
     start_seq_idx = start_end_seq_idx_ref[0]
     end_seq_idx = start_end_seq_idx_ref[1]
     if preserve_suffix:
@@ -580,7 +587,7 @@ def _attention_kernel(
         assert len(kv.shape) == 2
         assert q.shape[0] % num_q_heads == 0
         assert q.shape[1] == head_dim
-        assert kv.shape == (bkv_sz, head_dim)
+        assert kv.shape[1] == head_dim and kv.shape[0] <= bkv_sz
 
         # Single-block softmax: each query attends exactly one gathered kv
         # block, so no FlashAttention running-max/rescale state (GLM-5.2 DSA
@@ -633,7 +640,7 @@ def _attention_kernel(
         else:
             cp.start()
 
-    def _fetch_bkv_batch(seq_idx_start, bkv_sem_idx, *, wait=False):
+    def _fetch_bkv_batch(seq_idx_start, bkv_sem_idx, *, wait=False, rows=None):
         sem_nope = sems.at[0, bkv_sem_idx]
         sem_rope = sems.at[3, bkv_sem_idx]
 
@@ -643,6 +650,31 @@ def _attention_kernel(
         # The index into cache_kv_hbm_ref should be relative to the current
         # chunk.
         page_idx_start = seq_idx_start - start_seq_idx
+        if rows is not None:
+            rope_rows = rows * cache_kv_rope_hbm_ref.shape[1] // bkv_sz
+            nope_dst = bkv_nope_vmem_ref.at[:, pl.ds(0, rows)]
+            rope_dst = bkv_rope_vmem_ref.at[:, pl.ds(0, rope_rows)]
+            if not wait:
+                _async_copy(
+                    cache_kv_nope_hbm_ref.at[
+                        pl.ds(page_idx_start, batch_size), pl.ds(0, rows)
+                    ],
+                    nope_dst,
+                    sem_nope,
+                    False,
+                )
+                _async_copy(
+                    cache_kv_rope_hbm_ref.at[
+                        pl.ds(page_idx_start, batch_size), pl.ds(0, rope_rows)
+                    ],
+                    rope_dst,
+                    sem_rope,
+                    False,
+                )
+            else:
+                _async_copy(src=nope_dst, dst=nope_dst, sem=sem_nope, wait=True)
+                _async_copy(src=rope_dst, dst=rope_dst, sem=sem_rope, wait=True)
+            return
         if not wait:
             _async_copy(
                 cache_kv_nope_hbm_ref.at[pl.ds(page_idx_start, batch_size)],
@@ -661,6 +693,24 @@ def _attention_kernel(
             _async_copy(src=dst_nope, dst=dst_nope, sem=sem_nope, wait=True)
             dst_rope = bkv_rope_vmem_ref
             _async_copy(src=dst_rope, dst=dst_rope, sem=sem_rope, wait=True)
+
+    def with_row_width(seq_idx_start, fn):
+        if not row_widths:
+            fn(None)
+            return
+        need = kv_lens_ref[seq_idx_start]
+        for b in range(1, batch_size):
+            need = jnp.maximum(need, kv_lens_ref[seq_idx_start + b])
+        lower = None
+        for upper, width in zip((*row_widths, None), (*row_widths, None)):
+            if lower is None:
+                fits = need <= upper
+            elif upper is None:
+                fits = need > lower
+            else:
+                fits = (need > lower) & (need <= upper)
+            pl.when(fits)(functools.partial(fn, width))
+            lower = upper
 
     def _fetch_bq_batch(seq_idx_start, bq_sem_idx, *, wait=False):
         sem = sems.at[1, bq_sem_idx]
@@ -729,11 +779,11 @@ def _attention_kernel(
         else:
             _async_copy(src=vmem_ref, dst=vmem_ref, sem=sem, wait=True)
 
-    def start_fetch_bkv_batch(seq_idx_start, bkv_sem_idx):
-        return _fetch_bkv_batch(seq_idx_start, bkv_sem_idx)
+    def start_fetch_bkv_batch(seq_idx_start, bkv_sem_idx, rows=None):
+        return _fetch_bkv_batch(seq_idx_start, bkv_sem_idx, rows=rows)
 
-    def wait_fetch_bkv_batch(seq_idx_start, bkv_sem_idx):
-        return _fetch_bkv_batch(seq_idx_start, bkv_sem_idx, wait=True)
+    def wait_fetch_bkv_batch(seq_idx_start, bkv_sem_idx, rows=None):
+        return _fetch_bkv_batch(seq_idx_start, bkv_sem_idx, wait=True, rows=rows)
 
     def start_fetch_bq_batch(seq_idx_start, bq_sem_idx):
         return _fetch_bq_batch(seq_idx_start, bq_sem_idx)
@@ -780,12 +830,67 @@ def _attention_kernel(
             pick = lax.broadcasted_iota(jnp.int32, tile_ref.shape, 0) == batch_idx
             tile_ref[...] = jnp.where(pick, row, tile_ref[...])
 
-    def load_bkv(bkv_sem_idx, batch_idx):
-        return unpack_bkv(
-            bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx],
-            bkv_rope_x2_ref.at[bkv_sem_idx, batch_idx],
-            lambda: kv_lens_ref[batch_start_seq_idx + batch_idx],
+    def load_bkv(bkv_sem_idx, batch_idx, rows=None):
+        if not use_opt_sc:
+            bkv = unpack_bkv(
+                bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx],
+                bkv_rope_x2_ref.at[bkv_sem_idx, batch_idx],
+                lambda: kv_lens_ref[batch_start_seq_idx + batch_idx],
+            )
+            return bkv, bkv
+
+        kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
+        slice_sz = bkv_sz if rows is None else rows
+        nope_ref = bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx]
+        rope_ref = bkv_rope_x2_ref.at[bkv_sem_idx, batch_idx]
+        rope_rows = slice_sz * rope_ref.shape[0] // bkv_sz
+        if use_tr:
+            quarter = slice_sz // 4
+            xs = [nope_ref[pl.ds(j, quarter, stride=4), :] for j in range(4)]
+            if use_zu:
+                key4 = lax.broadcasted_iota(jnp.int32, xs[0].shape, 0) * 4
+                xs = [
+                    jnp.where(key4 < kv_len - j, x, jnp.uint32(0))
+                    for j, x in enumerate(xs)
+                ]
+            lo16, hi16 = jnp.uint32(0x0000FFFF), jnp.uint32(0xFFFF0000)
+            ev8, od8 = jnp.uint32(0x00FF00FF), jnp.uint32(0xFF00FF00)
+            a0 = (xs[0] & lo16) | (xs[2] << 16)
+            a2 = (xs[0] >> 16) | (xs[2] & hi16)
+            a1 = (xs[1] & lo16) | (xs[3] << 16)
+            a3 = (xs[1] >> 16) | (xs[3] & hi16)
+            cols = [
+                (a0 & ev8) | ((a1 & ev8) << 8),
+                ((a0 >> 8) & ev8) | (a1 & od8),
+                (a2 & ev8) | ((a3 & ev8) << 8),
+                ((a2 >> 8) & ev8) | (a3 & od8),
+            ]
+            bkv_nope = jnp.concatenate(
+                [pltpu.bitcast(c, jnp.float8_e4m3fn) for c in cols], axis=-1
+            )
+        else:
+            words = nope_ref[pl.ds(0, slice_sz)] if rows is not None else nope_ref[...]
+            if use_zu:
+                key = lax.broadcasted_iota(jnp.int32, words.shape, 0)
+                words = jnp.where(key < kv_len, words, jnp.uint32(0))
+            bkv_nope = pltpu.bitcast(words, jnp.uint8).reshape(slice_sz, nope_dim)
+            bkv_nope = pltpu.bitcast(bkv_nope, jnp.float8_e4m3fn)
+
+        rope_words = (
+            rope_ref[pl.ds(0, rope_rows)] if rows is not None else rope_ref[...]
         )
+        bkv_rope = pltpu.bitcast(rope_words, jnp.uint8).reshape(slice_sz, 128)
+        bkv_rope = pltpu.bitcast(bkv_rope, jnp.float8_e4m3fn)
+        bkv = jnp.concatenate([bkv_nope, bkv_rope], axis=-1)
+        if bkv.shape[-1] < head_dim:
+            bkv = jnp.pad(bkv, ((0, 0), (0, head_dim - bkv.shape[-1])))
+        if not use_zu:
+            k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
+            bkv = jnp.where(k_span < kv_len, bkv, 0)
+            bkv_v = bkv[:, :nope_dim] if use_pv512 else bkv
+        else:
+            bkv_v = bkv_nope
+        return bkv, bkv_v
 
     def unpack_bkv(bkv_nope_ref, bkv_rope_ref, get_kv_len):
         bkv_nope = bkv_nope_ref[...]
@@ -945,16 +1050,13 @@ def _attention_kernel(
         def prefetch_next_seq():
             sem_ids_ref[0] = next_bi_sem_idx
             start_fetch_bq_batch(next_seq_idx, next_bi_sem_idx)
-            start_fetch_bkv_batch(next_seq_idx, next_bi_sem_idx)
+            with_row_width(
+                next_seq_idx,
+                functools.partial(start_fetch_bkv_batch, next_seq_idx, next_bi_sem_idx),
+            )
 
         bo_sem_idx = sem_ids_ref[1]
         sem_ids_ref[1] = lax.select(bo_sem_idx == 0, 1, 0)
-
-        prev_p = None
-        prev_bkv = None
-        prev_l_sum = None
-        prev_m = None
-        prev_out = None
 
         def write_blse(batch_idx, m, l_sum):
             # log-sum-exp in the *unshifted* frame, so a peer holding a
@@ -966,7 +1068,6 @@ def _attention_kernel(
 
         # Wait for cur blocks if not ready yet
         wait_fetch_bq_batch(batch_start_seq_idx, bi_sem_idx)
-        wait_fetch_bkv_batch(batch_start_seq_idx, bi_sem_idx)
 
         @pl.when(pl.program_id(0) >= 2)
         def _wait_send():
@@ -980,39 +1081,60 @@ def _attention_kernel(
             if return_lse:
                 _send_blse_batch(batch_start_seq_idx, bo_sem_idx, wait=True)
 
-        for batch_idx in range(batch_size):
-            kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
-            bkv = load_bkv(bi_sem_idx, batch_idx)
-            bq = load_bq(bi_sem_idx, batch_idx)
+        def run_steps(rows=None):
+            prev_p = None
+            prev_bkv_v = None
+            prev_l_sum = None
+            prev_m = None
+            prev_out = None
+            for batch_idx in range(batch_size):
+                kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
+                bkv, bkv_v = load_bkv(bi_sem_idx, batch_idx, rows=rows)
+                bq = load_bq(bi_sem_idx, batch_idx)
 
-            if prev_out is not None:
-                # Artificial dependency to force MXU/VPU interleaving by limiting
-                # LLO's QK runahead
-                # We use jnp.where to prevent XLA from optimizing the dependency away.
-                # prev_out won't be inf in practice.
-                bq = jnp.where(prev_out == jnp.inf, prev_out, bq)
+                if not use_noinf and prev_out is not None:
+                    # Artificial dependency to force MXU/VPU interleaving by
+                    # limiting LLO's QK runahead; jnp.where keeps XLA from
+                    # optimizing it away (prev_out won't be inf in practice).
+                    bq = jnp.where(prev_out == jnp.inf, prev_out, bq)
 
-            p, l_sum, m = attention_step1_qk_softmax(bq, bkv, kv_len)
+                p, l_sum, m = attention_step1_qk_softmax(bq, bkv, kv_len)
 
-            if prev_p is not None:
-                assert prev_bkv is not None
-                assert prev_l_sum is not None
-                out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
+                if prev_p is not None:
+                    assert prev_bkv_v is not None
+                    assert prev_l_sum is not None
+                    out = attention_step2_pv(prev_p, prev_bkv_v, prev_l_sum)
 
-                # Store output from acc to bo.
-                bo_x2_ref.at[bo_sem_idx, batch_idx - 1][...] = out[:, :o_dim]
-                write_blse(batch_idx - 1, prev_m, prev_l_sum)
-                prev_out = out
+                    # Store output from acc to bo.
+                    bo_x2_ref.at[bo_sem_idx, batch_idx - 1][...] = (
+                        out if use_pv512 else out[:, :o_dim]
+                    )
+                    write_blse(batch_idx - 1, prev_m, prev_l_sum)
+                    prev_out = out
 
-            prev_p = p
-            prev_bkv = bkv
-            prev_l_sum = l_sum
-            prev_m = m
+                prev_p = p
+                prev_bkv_v = bkv_v
+                prev_l_sum = l_sum
+                prev_m = m
 
-        # end of pipelining loop
-        out = attention_step2_pv(prev_p, prev_bkv, prev_l_sum)
-        bo_x2_ref.at[bo_sem_idx, batch_size - 1][...] = out[:, :o_dim]
-        write_blse(batch_size - 1, prev_m, prev_l_sum)
+            # end of pipelining loop
+            out = attention_step2_pv(prev_p, prev_bkv_v, prev_l_sum)
+            bo_x2_ref.at[bo_sem_idx, batch_size - 1][...] = (
+                out if use_pv512 else out[:, :o_dim]
+            )
+            write_blse(batch_size - 1, prev_m, prev_l_sum)
+
+        if row_widths:
+
+            def wait_and_run(rows):
+                wait_fetch_bkv_batch(batch_start_seq_idx, bi_sem_idx, rows=rows)
+                run_steps(rows)
+
+            with_row_width(batch_start_seq_idx, wait_and_run)
+        else:
+            wait_fetch_bkv_batch(batch_start_seq_idx, bi_sem_idx)
+            run_steps(None)
+
         if capped_windows is not None:
             fixup_capped_overflow(bi_sem_idx, bo_sem_idx)
         start_send_bo_batch(batch_start_seq_idx, bo_sem_idx)
@@ -1024,7 +1146,10 @@ def _attention_kernel(
     @pl.when(batch_start_seq_idx == start_seq_idx)
     def prologue():
         start_fetch_bq_batch(batch_start_seq_idx, 0)
-        start_fetch_bkv_batch(batch_start_seq_idx, 0)
+        with_row_width(
+            batch_start_seq_idx,
+            functools.partial(start_fetch_bkv_batch, batch_start_seq_idx, 0),
+        )
 
     process()
 
@@ -1140,8 +1265,8 @@ def sparse_ragged_paged_attention(
     sparsecore_atoms_per_batch: int = 16,
     sparsecore_gather_wait_mode: str = "overlap_rope",
     sparsecore_gather_pipelined: bool = True,
-    small_chunk_tokens: int = 32,
-    small_chunk_batch_size: int | None = 2,
+    small_chunk_tokens: int = 64,
+    small_chunk_batch_size: int | None = 4,
     small_chunk_live_gather: bool = True,
     small_chunk_gather_atoms: int = 8,
     live_gather_all_chunks: bool = True,
@@ -1321,6 +1446,13 @@ def sparse_ragged_paged_attention(
         )
 
     num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
+    # Full `gather_and_attention_chunk_size` prefill chunks stay on the main
+    # batch size even when a caller/test passes a chunk size <= small_chunk_tokens.
+    effective_small_chunk_tokens = (
+        min(small_chunk_tokens, gather_and_attention_chunk_size - 1)
+        if small_chunk_tokens > 0
+        else 0
+    )
     # With the cap, translate the top-k once per call straight into the capped
     # window-major layout, live windows only (`prepare_capped_window_indices`),
     # whenever every chunk has one static size; otherwise the full-width
@@ -1341,7 +1473,7 @@ def sparse_ragged_paged_attention(
         _, prep_batch = _chunk_kernel_batch_size(
             uniform_chunk,
             attention_kernel_batch_size,
-            small_chunk_tokens,
+            effective_small_chunk_tokens,
             small_chunk_batch_size,
         )
         live_windows = capped_live_windows(
@@ -1407,7 +1539,7 @@ def sparse_ragged_paged_attention(
             sparsecore_atoms_per_batch=sparsecore_atoms_per_batch,
             sparsecore_gather_wait_mode=sparsecore_gather_wait_mode,
             sparsecore_gather_pipelined=sparsecore_gather_pipelined,
-            small_chunk_tokens=small_chunk_tokens,
+            small_chunk_tokens=effective_small_chunk_tokens,
             small_chunk_batch_size=small_chunk_batch_size,
             small_chunk_live_gather=small_chunk_live_gather,
             small_chunk_gather_atoms=small_chunk_gather_atoms,
@@ -1702,6 +1834,16 @@ def sparse_attention_chunk(
             # (bi_sem_idx, bo_sem_idx)
             jnp.zeros((2,), jnp.int32),
         )
+        row_widths: tuple[int, ...] = ()
+        if sparsecore_layout and capped_windows is None:
+            bkv_sz_host = nope_tile[0]
+            row_widths = tuple(
+                w
+                for w in (256, 512, 1024)
+                if w < bkv_sz_host
+                and w % 32 == 0
+                and (w * rope_tile[0]) % (bkv_sz_host * 8) == 0
+            )
         kernel_body = functools.partial(
             _attention_kernel,
             sm_scale=sm_scale,
@@ -1713,6 +1855,7 @@ def sparse_attention_chunk(
             capped_windows=capped_windows,
             split_q=split_q,
             lse_lane_dense=lse_lane_dense,
+            row_widths=row_widths,
         )
 
         scope_name = (

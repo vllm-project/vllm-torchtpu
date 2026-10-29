@@ -1082,7 +1082,76 @@ class TPUModelRunner(GPUModelRunner):
         self._greedy_head_owner: torch.nn.Module | None = None
 
         self._init_phased_profiling()
-        self._stage_timing = RunnerStageTiming(profiler_rank)
+        self._stage_timing = RunnerStageTiming(
+            profiler_rank, enabled=self._stage_timing_has_consumer()
+        )
+        if envs.TPU_FOREACH_MUTATION_EPILOGUE:
+            from vllm_torchtpu.compilation import foreach_epilogue
+
+            foreach_epilogue.install()
+        if envs.TPU_AOT_SKIP_GUARD_CHECK:
+            from vllm_torchtpu.compilation import aot_guard_skip
+
+            aot_guard_skip.install()
+        self._host_levers_pending = bool(
+            envs.TPU_AOT_SKIP_GUARD_CHECK or envs.TPU_FOREACH_MUTATION_EPILOGUE
+        )
+
+    def _host_levers_first_step(self) -> None:
+        """One-time host-lever setup on the first execute_model (after warmup
+        has compiled every forward): guard-check skip, epilogue rewrite count."""
+        self._host_levers_pending = False
+        if envs.TPU_AOT_SKIP_GUARD_CHECK:
+            self._skip_aot_guard_checks()
+        if envs.TPU_FOREACH_MUTATION_EPILOGUE:
+            from vllm_torchtpu.compilation import foreach_epilogue
+
+            logger.info(
+                "TPU_FOREACH_MUTATION_EPILOGUE: %s", dict(foreach_epilogue.STATS)
+            )
+
+    def _skip_aot_guard_checks(self) -> int:
+        """Disable the guard check of every AOT-compiled forward already
+        compiled under the target model and the drafter when vLLM dropped every
+        guard (see aot_guard_skip.guards_dropped)."""
+        from vllm_torchtpu.compilation import aot_guard_skip
+
+        if not aot_guard_skip.guards_dropped(self.vllm_config.compilation_config):
+            logger.info("TPU_AOT_SKIP_GUARD_CHECK: guards are evaluated; kept")
+            return 0
+        roots = [getattr(self, "model", None)]
+        if self.drafter is not None:
+            roots += [
+                v for v in vars(self.drafter).values() if isinstance(v, torch.nn.Module)
+            ]
+        seen: set[int] = set()
+        n = 0
+        for root in roots:
+            if root is None or not isinstance(root, torch.nn.Module):
+                continue
+            for m in root.modules():
+                fn = m.__dict__.get("aot_compiled_fn")
+                if fn is None or id(fn) in seen:
+                    continue
+                seen.add(id(fn))
+                n += aot_guard_skip.disable(fn)
+        logger.info(
+            "TPU_AOT_SKIP_GUARD_CHECK: walk disabled %d, %d off in total",
+            n,
+            len(aot_guard_skip.FNS),
+        )
+        return n
+
+    def _stage_timing_has_consumer(self) -> bool:
+        """Whether runner stage timings can reach a sink.
+
+        The samples are only handed to a TPU KV connector's stats
+        (get_finished_kv_transfers); without a KV transfer config they are
+        taken and dropped every step.
+        """
+        if not envs.TPU_STAGE_TIMING_ONLY_WITH_CONSUMER:
+            return True
+        return self.vllm_config.kv_transfer_config is not None
 
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
@@ -3734,6 +3803,8 @@ class TPUModelRunner(GPUModelRunner):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        if getattr(self, "_host_levers_pending", False):
+            self._host_levers_first_step()
         # Update cached state
         self._update_states(scheduler_output)
         if self.scheduler_config.async_scheduling:

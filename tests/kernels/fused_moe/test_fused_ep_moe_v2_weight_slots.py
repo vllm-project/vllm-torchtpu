@@ -180,3 +180,13 @@ def test_the_height_ladder_override(monkeypatch, override, want):
     # never the short one.
     assert rungs[-1] == TILE_M
     assert all(step % host.ROWBLK == 0 for step in rungs)
+
+
+def test_the_height_ladder_multi_tile_bound(monkeypatch):
+    monkeypatch.delenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", raising=False)
+    single_tile_cap = 8 * 8 * TILE_M
+    max_cap = kernel.MAX_LADDER_TILES_PER_EXPERT * single_tile_cap
+    assert kernel.tile_height_rungs(TILE_M, max_cap, 8, 8) == tuple(
+        range(128, 513, 128)
+    )
+    assert kernel.tile_height_rungs(TILE_M, max_cap + TILE_M, 8, 8) == (TILE_M,)

@@ -139,3 +139,45 @@ def test_completed_stages_are_drained_in_record_order(events):
         [],
         [("0", "main_forward", 0.001), ("0", "sample", 0.002)],
     )
+
+
+def test_disabled_records_nothing(events):
+    timing = stage_timing.RunnerStageTiming(0, enabled=False)
+    assert not timing.enabled
+    ran = []
+    with timing.stage("main_forward"):
+        ran.append("stage")
+    with timing.host_stage("output_assembly"):
+        ran.append("host")
+    assert ran == ["stage", "host"]
+    events.assert_not_called()
+    assert timing.take_samples() == ([], [])
+
+
+def test_disabled_stage_propagates_exceptions(events):
+    timing = stage_timing.RunnerStageTiming(0, enabled=False)
+    with pytest.raises(ValueError, match="boom"), timing.stage("sample"):
+        raise ValueError("boom")
+    events.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "flag, kv_transfer_config, expected",
+    [
+        (None, None, False),
+        ("0", None, True),
+        ("1", None, False),
+        ("1", object(), True),
+    ],
+)
+def test_runner_consumer_gate(monkeypatch, flag, kv_transfer_config, expected):
+    from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    if flag is None:
+        monkeypatch.delenv("TPU_STAGE_TIMING_ONLY_WITH_CONSUMER", raising=False)
+    else:
+        monkeypatch.setenv("TPU_STAGE_TIMING_ONLY_WITH_CONSUMER", flag)
+    runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(kv_transfer_config=kv_transfer_config)
+    )
+    assert TPUModelRunner._stage_timing_has_consumer(runner) is expected

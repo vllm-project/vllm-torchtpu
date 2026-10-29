@@ -684,6 +684,89 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
             np.asarray(lse).view(np.uint32), np.asarray(ref_lse).view(np.uint32)
         )
 
+    def test_uncapped_split_q_packed_rope_row_widths_and_nan_pages(self):
+        """Uncapped SparseCore split-q + packed_rope across all row_widths rungs
+        and with fp8 NaNs (0x7f7f7f7f) in unallocated cache pages."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("Sparse MLA attention requires a TPU")
+        rng = np.random.default_rng(20261029)
+        query_tokens, topk = 64, 2048
+        problem = _build_problem(
+            rng, k_scale=0.75, query_tokens=query_tokens, topk=topk, num_heads=64
+        )
+        # Reserve the last 4 physical pages as unallocated fp8-NaN pages so `-1`
+        # padding scatter hits NaN bytes while valid logical tokens stay finite.
+        live_pages = 28
+        page_size = 256
+        page_table = jnp.asarray(
+            rng.permutation(live_pages).astype(np.int32), dtype=jnp.int32
+        )
+        counts = np.resize(
+            np.array([1, 64, 256, 257, 512, 513, 1024, 1025, 1600, 2048]),
+            query_tokens,
+        )
+        topk_np = np.full((query_tokens, topk), -1, dtype=np.int32)
+        for r in range(query_tokens):
+            klen = int(counts[r])
+            topk_np[r, :klen] = rng.choice(
+                live_pages * page_size, size=klen, replace=False
+            ).astype(np.int32)
+        topk_idx = jnp.asarray(topk_np)
+
+        tc_nope = problem["tensorcore_nope"]
+        tc_rope = problem["tensorcore_rope"]
+        sc_nope = problem["sparsecore_nope"].at[live_pages:].set(jnp.uint32(0x7F7F7F7F))
+        sc_rope_packed = (
+            jnp.asarray(
+                native_sc_cache_layout.pack_rope_packed(
+                    np.asarray(tc_rope).reshape(32, page_size, 128)[:, :, :ROPE_DIM]
+                )
+            )
+            .at[live_pages:]
+            .set(jnp.uint32(0x7F7F7F7F))
+        )
+        q_nope = problem["q"][..., :NOPE_DIM]
+        q_pe = problem["q"][..., NOPE_DIM:]
+        cu_q_lens = jnp.array([0, query_tokens], jnp.int32)
+        distribution = jnp.array([0, 1, 1], jnp.int32)
+
+        tc_out = sparse_mla.sparse_ragged_paged_attention(
+            problem["q"],
+            tc_nope,
+            tc_rope,
+            topk_idx,
+            page_table,
+            cu_q_lens,
+            distribution,
+            sm_scale=0.125,
+            k_scale=0.75,
+            gather_and_attention_chunk_size=128,
+        )
+        sc_out = sparse_mla.sparse_ragged_paged_attention(
+            q_nope,
+            sc_nope,
+            sc_rope_packed,
+            topk_idx,
+            page_table,
+            cu_q_lens,
+            distribution,
+            sm_scale=0.125,
+            k_scale=0.75,
+            cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+            gather_and_attention_chunk_size=128,
+            q_pe=q_pe,
+            packed_rope=True,
+        )
+        tc_out, sc_out = jax.block_until_ready((tc_out, sc_out))
+        sc_f32 = np.asarray(sc_out, dtype=np.float32)
+        self.assertFalse(bool(np.isnan(sc_f32).any()))
+        np.testing.assert_allclose(
+            sc_f32,
+            np.asarray(tc_out[..., :NOPE_DIM], dtype=np.float32),
+            rtol=2e-2,
+            atol=2e-2,
+        )
+
     def test_topk_cap_validation(self):
         q = jnp.zeros((16, 8, HEAD_DIM), jnp.bfloat16)
         nope = jnp.zeros((16, 256, 128), jnp.uint32)

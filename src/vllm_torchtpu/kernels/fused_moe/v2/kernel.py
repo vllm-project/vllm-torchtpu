@@ -65,6 +65,12 @@ FP4_OUTPUT_CHUNK = 256
 # top rung is always tile_m, so a full tile is unchanged. Overridable per
 # process by MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE, read at BUILD time.
 HEIGHT_RUNGS = 4
+# Maximum expected tiles per routed expert on which the height ladder is still
+# emitted: at <= 3 tiles per expert (e.g. T=512/1024 prefill at EP=8, G=256,
+# k=8), at least a third of all expert tiles are short tails, so the four-rung
+# FFN body saves tail MXU work while keeping `push_from_vmem` on the single-tile
+# bound.
+MAX_LADDER_TILES_PER_EXPERT = 3
 # DMA priority the weight refills take, so that they stay off the in-order
 # queue the token gather issues on.
 WEIGHT_DMA_PRIORITY = 1
@@ -162,7 +168,7 @@ def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
         rungs < 2
         or step % ROWBLK
         or step * rungs != tile_m
-        or rows_alloc > ep * g_local * tile_m
+        or rows_alloc > MAX_LADDER_TILES_PER_EXPERT * ep * g_local * tile_m
     ):
         return (tile_m,)
     return tuple(range(step, tile_m + 1, step))
