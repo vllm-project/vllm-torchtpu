@@ -257,6 +257,20 @@ def test_comm_package_is_framework_free():
     _assert_package_is_framework_free("comm")
 
 
+def _assignment_lines(path: Path, name: str) -> set[int]:
+    """The source lines of the module-level assignment to `name` in `path`."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in tree.body:
+        targets = (
+            [node.target]
+            if isinstance(node, ast.AnnAssign)
+            else getattr(node, "targets", [])
+        )
+        if any(isinstance(t, ast.Name) and t.id == name for t in targets):
+            return set(range(node.lineno, (node.end_lineno or node.lineno) + 1))
+    raise AssertionError(f"{path.name} has no module-level {name!r}")
+
+
 def test_no_model_names_in_core_and_runtime():
     """Forbid model-family substrings in `megakernel/` (outside `models/` & `profiles/`)
     and in `megakernel_runtime/`.
@@ -265,18 +279,27 @@ def test_no_model_names_in_core_and_runtime():
     rt_root = pkg_root.parent / "megakernel_runtime"
     forbidden_tokens = ("qwen", "llama", "deepseek", "mistral", "gemma")
 
+    # Templates under `megakernel_runtime/models/` are plugins, and the
+    # runtime's shorthand table names them by string (one assignment).
+    shorthand_lines = _assignment_lines(rt_root / "plugin.py", "SHORTHANDS")
     checked = 0
     for root in (pkg_root, rt_root):
         for path in sorted(root.rglob("*.py")):
             rel = path.relative_to(pkg_root.parent).as_posix()
-            if rel.startswith("megakernel/models/") or rel.startswith(
-                "megakernel/profiles/"
+            if rel.startswith(
+                (
+                    "megakernel/models/",
+                    "megakernel/profiles/",
+                    "megakernel_runtime/models/",
+                )
             ):
                 continue
             checked += 1
             for lineno, line in enumerate(
                 path.read_text(encoding="utf-8").splitlines(), 1
             ):
+                if rel == "megakernel_runtime/plugin.py" and lineno in shorthand_lines:
+                    continue
                 low = line.lower()
                 for tok in forbidden_tokens:
                     assert tok not in low, (
