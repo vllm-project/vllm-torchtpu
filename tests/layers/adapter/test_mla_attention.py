@@ -37,7 +37,8 @@ from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 
-def test_mla_attention_interface_mixed_q_split(monkeypatch):
+@pytest.mark.parametrize("skip_update", [False, True])
+def test_mla_attention_interface_mixed_q_split(monkeypatch, skip_update):
     """Verify mla_attention passes MIXED_Q_SPLIT and MIXED_NUM_QUERIES_PER_BLOCK to
     mla_ragged_paged_attention."""
     import jax
@@ -100,6 +101,7 @@ def test_mla_attention_interface_mixed_q_split(monkeypatch):
         num_attention_heads=num_heads,
         qk_nope_head_dim=lkv_dim,
         sm_scale=0.1,
+        skip_kv_update=skip_update,
     )
     mock_mla_kernel.assert_called_once()
     args, kwargs = mock_mla_kernel.call_args
@@ -107,6 +109,7 @@ def test_mla_attention_interface_mixed_q_split(monkeypatch):
     assert out.shape == (num_tokens, num_heads, lkv_dim)
     assert kwargs["num_kv_pages_per_block"][1:] == (1, 1)
     assert kwargs["num_queries_per_block"][1:] == (16, 16)
+    assert kwargs["skip_kv_update"] is skip_update
     assert kwargs["mixed_q_split"] == 1
     assert kwargs["sm_scale"] == 0.1
 
@@ -127,6 +130,7 @@ def test_mla_attention_interface_mixed_q_split(monkeypatch):
         num_attention_heads=num_heads,
         qk_nope_head_dim=lkv_dim,
         sm_scale=0.1,
+        skip_kv_update=skip_update,
     )
     mock_mla_kernel.assert_called_once()
     _, kwargs = mock_mla_kernel.call_args
@@ -244,7 +248,8 @@ def test_vllm_fp8_linear_method_tpu():
     assert hasattr(layer, "weight_block_size")
 
 
-def test_vllm_mla_attention_init():
+@pytest.mark.parametrize("target", [None, "model.layers.0.attn"])
+def test_vllm_mla_attention_init(target):
     kv_b_proj = MagicMock()
 
     def mock_mla_init(self, *args, **kwargs):
@@ -264,8 +269,9 @@ def test_vllm_mla_attention_init():
             q_lora_rank=None,
             kv_lora_rank=512,
             kv_b_proj=kv_b_proj,
+            kv_sharing_target_layer_name=target,
         )
-        assert attn.kv_sharing_target_layer_name is None
+        assert attn.kv_sharing_target_layer_name == target
         assert attn.sliding_window is None
         assert attn.kv_cache_quantized_dtype is not None
 
@@ -436,6 +442,7 @@ def _make_impl_and_layer(k_scale=2.0, num_tokens=4):
     op_out = torch.randn(num_tokens, 16, 512)
     layer = SimpleNamespace(
         num_heads=16,
+        kv_sharing_target_layer_name=None,
         kv_lora_rank=512,
         qk_rope_head_dim=64,
         v_head_dim=128,
@@ -639,11 +646,13 @@ def test_mla_wrapper_forwards_the_shared_topk_buffer():
 
 
 @pytest.mark.parametrize("allowed", [None, False, True])
-def test_sparse_mla_op_reads_admission_when_traced(allowed):
+@pytest.mark.parametrize("target", [None, "model.layers.0.attn"])
+def test_sparse_mla_op_reads_admission_when_traced(allowed, target):
     """The op is built before the KV cache is allocated, so it reads the
     layer's admission when traced; an unadmitted layer passes False."""
     impl, layer, _, _ = _make_impl_and_layer()
-    layer.layer_name = "model.layers.0.self_attn.attn"
+    layer.layer_name = "model.layers.1.self_attn.attn"
+    layer.kv_sharing_target_layer_name = target
     layer.scale = 0.125
     layer.kv_cache_quantized_dtype = None
     captured = {}
@@ -669,6 +678,7 @@ def test_sparse_mla_op_reads_admission_when_traced(allowed):
             layer.allow_masked_dense = allowed
         captured["core"](*range(11))
     assert core.call_args.kwargs["allow_masked_dense"] is bool(allowed)
+    assert core.call_args.kwargs["skip_kv_update"] is (target is not None)
 
 
 @pytest.mark.parametrize(
@@ -1630,3 +1640,44 @@ def test_indexer_kv_layout_and_op_resolution_raiden_glm_admission(monkeypatch, c
     )
     with pytest.raises(ValueError, match="Raiden GLM admission"):
         mla_attention_op._resolve_indexer_kv_cache_mode(cache_has, k_packed, mode="sal")
+
+
+@pytest.mark.parametrize("target", [None, "model.layers.0.attn"])
+@pytest.mark.parametrize("dcp", [False, True])
+def test_mla_builders_pass_read_only_cache_flag(target, dcp):
+    impl, layer, _, _ = _make_impl_and_layer()
+    layer.layer_name = "model.layers.1.self_attn.attn"
+    layer.kv_sharing_target_layer_name = target
+    layer.kv_cache_quantized_dtype = None
+    layer.qk_nope_head_dim = 128
+    layer.scale = 0.125
+    layer.mla_kv_spec = ("nope_spec", "rope_spec")
+    impl._dcp_mesh = "dcp_mesh"
+    captured = {}
+
+    def jax_op(name, fn, **kwargs):
+        captured["core"] = fn
+        return MagicMock()
+
+    core_name = "sparse_mla_attention_dcp" if dcp else "mla_attention"
+    core_module = (
+        "vllm_torchtpu.layers.core.attention_interface"
+        if dcp
+        else "vllm_torchtpu.layers.adapter.attention"
+    )
+    with (
+        patch.object(attention_adapter.pallas, "jax_op", side_effect=jax_op),
+        patch.object(attention_adapter, "pcp_streaming_jax_op", side_effect=jax_op),
+        patch.object(
+            attention_adapter,
+            "get_vllm_model_wrapper_context",
+            return_value=SimpleNamespace(mesh="mesh"),
+        ),
+        patch(f"{core_module}.{core_name}") as core,
+    ):
+        if dcp:
+            impl._build_sparse_mla_dcp_op(layer, dcp_size=2, interleave_size=1)
+        else:
+            impl._build_mla_op(layer)
+        captured["core"](*range(11 if dcp else 9))
+    assert core.call_args.kwargs["skip_kv_update"] is (target is not None)

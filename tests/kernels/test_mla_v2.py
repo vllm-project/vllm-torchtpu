@@ -567,3 +567,73 @@ def test_return_lse_on_other_kernel_paths(kwargs, distribution) -> None:
     np.testing.assert_array_equal(np.asarray(out_lse), np.asarray(out))
     np.testing.assert_array_equal(np.asarray(updated_lse), np.asarray(updated))
     np.testing.assert_allclose(np.asarray(lse), reference, atol=1e-4, rtol=0)
+
+
+@pytest.mark.parametrize("case", ["decode", "prefill", "mixed"])
+@pytest.mark.parametrize("transpose", [False, True])
+@pytest.mark.parametrize("cache_dtype", [jnp.bfloat16, jnp.float8_e4m3fn])
+def test_shared_cache_reads_current_tokens_without_inserting(
+    case, transpose, cache_dtype
+):
+    """A reader must use the owner's full cache, including this step's tokens."""
+    if jax.devices()[0].platform != "tpu":
+        pytest.skip("MLA Pallas kernel requires TPU")
+    rng = np.random.default_rng(47)
+    heads, latent_dim, rope_dim, page_size = 4, 128, 128, 128
+    tokens = 1 if case == "decode" else 4
+    kv_len = 9  # Includes an unaligned history/current-token boundary.
+    packing = 4 if cache_dtype == jnp.float8_e4m3fn else 2
+    q = rng.normal(0, 0.1, (heads, tokens, latent_dim)).astype(np.float32)
+    qr = rng.normal(0, 0.1, (tokens, heads, rope_dim)).astype(np.float32)
+    source = jnp.asarray(
+        rng.normal(0, 0.2, (page_size, latent_dim + rope_dim)), cache_dtype
+    )
+    cached = (
+        source.T[None]
+        if transpose
+        else source.reshape(1, page_size // packing, packing, -1)
+    )
+    snapshot = np.asarray(cached).copy()
+    scale = (latent_dim + rope_dim) ** -0.5
+    output, new_cache = mla_ragged_paged_attention(
+        jnp.asarray(q, jnp.bfloat16),
+        jnp.asarray(qr, jnp.bfloat16),
+        jnp.full((tokens, latent_dim), 9, cache_dtype),
+        jnp.full((tokens, rope_dim), 11, cache_dtype),
+        cached,
+        jnp.array([kv_len], jnp.int32),
+        jnp.array([0], jnp.int32),
+        jnp.array([0, tokens], jnp.int32),
+        jnp.array(
+            {"decode": [1, 1, 1], "prefill": [0, 1, 1], "mixed": [0, 0, 1]}[case],
+            jnp.int32,
+        ),
+        num_kv_pages_per_block=1,
+        num_queries_per_block=1 if case == "decode" else 16,
+        transpose_kv_cache=transpose,
+        chunk_prefill_size=tokens if case == "prefill" else None,
+        skip_kv_update=True,
+        sm_scale=scale,
+        k_scale=1.5,
+        v_scale=1.5,
+    )
+    output.block_until_ready()
+    # Build the reference from exactly the BF16 queries and rounded cached KV.
+    query = np.concatenate(
+        (
+            np.asarray(jnp.asarray(q, jnp.bfloat16), np.float32).transpose(1, 0, 2),
+            np.asarray(jnp.asarray(qr, jnp.bfloat16), np.float32),
+        ),
+        -1,
+    )
+    kv = np.asarray(source, np.float32)[:kv_len] * 1.5
+    logits = np.einsum("thd,sd->ths", query, kv) * scale
+    mask = np.arange(kv_len)[None, :] <= (kv_len - tokens + np.arange(tokens))[:, None]
+    logits = np.where(mask[:, None, :], logits, -np.inf)
+    probs = np.exp(logits - logits.max(-1, keepdims=True))
+    probs /= probs.sum(-1, keepdims=True)
+    expected = np.einsum("ths,sd->thd", probs, kv[:, :latent_dim]).transpose(1, 0, 2)
+    np.testing.assert_allclose(
+        np.asarray(output, np.float32), expected, atol=0.01, rtol=0.03
+    )
+    np.testing.assert_array_equal(np.asarray(new_cache), snapshot)
