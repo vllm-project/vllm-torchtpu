@@ -807,6 +807,16 @@ class TestPrecompileProgress:
         assert skipped.owner_status(0, 512, since) == "skipped"
         lagging = PrecompileProgress(str(tmp_path / "hash" / "rank_1_0" / "mtp"), 0)
         assert lagging.owner_status(0, 512, since) == "pending"  # other module
+        # Records from another pod (a cache synced in from shared storage) are
+        # ignored.
+        import json
+        import os
+
+        with open(os.path.join(os.path.dirname(peer), ".precompile_progress"), "a") as f:
+            f.write(json.dumps(dict(event="start", prefix="backbone", subgraph=9,
+                                    t=time.time(), host="another-pod")) + "\n")
+        fresh = PrecompileProgress(own, subgraph=5)
+        assert fresh.owner_status(0, 512, time.time() - 0.5) == "pending"
 
     def test_wait_fails_fast_on_a_skipped_subgraph_and_at_the_backstop(
         self, tmp_path, monkeypatch
