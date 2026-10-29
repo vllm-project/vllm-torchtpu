@@ -747,7 +747,7 @@ def _token_select_op():
         slots = context.shape[0]
         rows = -(-tokens // shard_size)
         if request_window_shard(tokens, slots, shard_size, max_query_len):
-            rows = request_window_shape(slots, shard_size, max_query_len)[1]
+            rows = request_window_shape(tokens, shard_size)[1]
         return (
             torch.empty_like(pool),
             qgate.new_empty((tokens, heads, head_dim)),
@@ -788,7 +788,7 @@ def build_pooled_qsa_token_shard_op(tp_group):
         # Verify-sized steps shard request windows (VLLM_TPU_QSA_INDEXER_REQ_SHARD).
         window = None
         if request_window_shard(tokens, slots, world, query_len):
-            window = request_window_shape(slots, world, query_len)
+            window = request_window_shape(tokens, world)
         # Buckets that fit neither layout gather the replicated selection's
         # slices (same collective in every bucket of the graph).
 
