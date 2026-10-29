@@ -11,19 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Scheduling rules the dense MLA DCP path needs from the runner.
+"""What the dense MLA DCP path needs the runner to check.
 
-The dense MLA layers attend 1-token sequences with a decode path that every
-token bucket compiles, and prefill tokens with a gathered-context path that
-only buckets wider than the request count compile (see
-`PallasMLAttentionBackendImpl._forward_dense_mla_dcp`). The runner keeps the
-two consistent: a step with any multi-token request is padded past the request
-count, and a step's prefill contexts must fit the gathered pool.
+Prefill tokens attend a context gathered from the DCP group into a static pool
+that holds one sequence's whole context (see
+`PallasMLAttentionBackendImpl._forward_dense_mla_dcp`), so a step's prefill
+contexts must fit it.
 """
 
 from __future__ import annotations
 
-import bisect
 import dataclasses
 from collections.abc import Sequence
 
@@ -54,26 +51,6 @@ def enable(dcp_size: int, page_size: int, max_model_len: int) -> None:
 
 def active() -> DenseMlaDcp | None:
     return _ACTIVE
-
-
-def padded_num_tokens(
-    paddings: Sequence[int],
-    padded: int,
-    num_scheduled_tokens: Sequence[int],
-    num_kernel_seqs: int,
-) -> int:
-    """`padded`, raised past `num_kernel_seqs` if any request has >1 token."""
-    if _ACTIVE is None or max(num_scheduled_tokens, default=0) <= 1:
-        return padded
-    if padded > num_kernel_seqs:
-        return padded
-    index = bisect.bisect_right(paddings, num_kernel_seqs)
-    if index >= len(paddings):
-        raise ValueError(
-            f"Dense MLA DCP needs a token bucket above {num_kernel_seqs} for "
-            f"prefill steps; buckets are {list(paddings)}."
-        )
-    return int(paddings[index])
 
 
 def check_prefill_pool(

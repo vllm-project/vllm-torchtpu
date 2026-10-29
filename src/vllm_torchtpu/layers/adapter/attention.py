@@ -2508,10 +2508,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         """Dense MLA under DCP, `[T, local_heads, kv_lora_rank]`.
 
         The leading `min(T, num_seqs)` tokens go through the decode op, which
-        is exact for the 1-token sequences the runner puts first. Buckets
-        wider than the sequence count also run the prefill op; the runner pads
-        every step with a multi-token request into such a bucket
-        (`dcp_dense_mla.padded_num_tokens`).
+        is exact for the 1-token sequences the runner puts first; the prefill
+        op covers the rest (it skips its work in steps without a prefill).
         """
         ops = getattr(layer, "mla_dcp_ops", None)
         assert ops is not None, (
@@ -2540,8 +2538,6 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             lse,
             is_backbone=vllm_compilation_backends.model_tag == "backbone",
         )
-        if num_tokens <= num_seqs:
-            return decoded
         prefilled = prefill_op(kv_cache, ql_nope, q_pe, kv_c_normed, k_pe, *metadata)
         # Indexed on device: a tensor-valued Python index is a data-dependent
         # int, which the fullgraph backbone trace cannot hold.

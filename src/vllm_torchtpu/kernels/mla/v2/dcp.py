@@ -336,38 +336,48 @@ def mla_prefill_dcp_local(
     """This rank's own heads for the step's prefill tokens, `[H, T, lkv]`.
 
     Call inside a `shard_map` over `axis_name`, with
-    `interleave_size == page_size`. Rows of non-prefill tokens are garbage.
-    The cache is only read; `update_kv_cache_dcp` stores the new tokens.
+    `interleave_size == page_size`. Rows of non-prefill tokens are garbage,
+    and all rows are zero when the step has no prefill sequence: the gather
+    and the kernel only run when it does, so every token bucket can carry this
+    call at no cost to decode-only steps. The cache is only read;
+    `update_kv_cache_dcp` stores the new tokens.
     """
     page_size = cache_kv.shape[1] * cache_kv.shape[2]
-    local = prefill_pool_pages(
-        cache_kv,
-        seq_lens,
-        page_indices,
-        cu_q_lens,
-        distribution,
-        dcp_size=dcp_size,
-        max_model_len=max_model_len,
-    )
-    pool = jax.lax.all_gather(local, axis_name, tiled=True)
-    table, kv_lens = prefill_pool_table(
-        seq_lens,
-        cu_q_lens,
-        distribution,
-        page_size=page_size,
-        dcp_size=dcp_size,
-        max_model_len=max_model_len,
-    )
-    out, _ = mla_ragged_paged_attention(
-        ql_nope,
-        q_pe,
-        new_kv_c,
-        new_k_pe,
-        pool,
-        kv_lens,
-        table,
-        cu_q_lens,
-        distribution,
-        **kernel_kwargs,
-    )
-    return out
+
+    def attend():
+        local = prefill_pool_pages(
+            cache_kv,
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            dcp_size=dcp_size,
+            max_model_len=max_model_len,
+        )
+        pool = jax.lax.all_gather(local, axis_name, tiled=True)
+        table, kv_lens = prefill_pool_table(
+            seq_lens,
+            cu_q_lens,
+            distribution,
+            page_size=page_size,
+            dcp_size=dcp_size,
+            max_model_len=max_model_len,
+        )
+        out, _ = mla_ragged_paged_attention(
+            ql_nope,
+            q_pe,
+            new_kv_c,
+            new_k_pe,
+            pool,
+            kv_lens,
+            table,
+            cu_q_lens,
+            distribution,
+            **kernel_kwargs,
+        )
+        return out.astype(ql_nope.dtype)
+
+    # The metadata is replicated, so every rank of the group takes the same
+    # branch and the all-gather inside it stays matched.
+    has_prefill = distribution[0] < distribution[2]
+    return jax.lax.cond(has_prefill, attend, lambda: jnp.zeros_like(ql_nope))

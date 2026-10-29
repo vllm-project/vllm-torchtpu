@@ -323,6 +323,7 @@ class AllSequenceLayoutPlanner:
         del (
             scheduler_output,
             use_max_model_len,
+            target_num_reqs,
             padded_num_reqs,
         )
         padded_num_tokens = _first_ge(
@@ -332,18 +333,11 @@ class AllSequenceLayoutPlanner:
         if dp_target_bucket is not None and dp_target_bucket > padded_num_tokens:
             padded_num_tokens = int(dp_target_bucket)
         if dcp_dense_mla.active() is not None:
-            scheduled = [int(n) for n in num_scheduled_tokens_per_req[:num_reqs]]
             dcp_dense_mla.check_prefill_pool(
                 runner.input_batch.num_computed_tokens_cpu[
                     start_index : start_index + num_reqs
                 ],
-                scheduled,
-            )
-            padded_num_tokens = dcp_dense_mla.padded_num_tokens(
-                runner.num_tokens_paddings,
-                padded_num_tokens,
-                scheduled,
-                target_num_reqs,
+                [int(n) for n in num_scheduled_tokens_per_req[:num_reqs]],
             )
 
         return SequenceLayoutPlan(

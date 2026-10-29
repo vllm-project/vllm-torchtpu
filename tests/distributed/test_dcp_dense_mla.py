@@ -16,8 +16,6 @@ import pytest
 
 from vllm_torchtpu.distributed import dcp_dense_mla
 
-PADDINGS = [1, 2, 4, 8, 16, 32, 64, 128, 1024, 2048, 8192]
-
 
 @pytest.fixture
 def active(monkeypatch):
@@ -27,17 +25,7 @@ def active(monkeypatch):
 
 def test_inactive_changes_nothing(monkeypatch):
     monkeypatch.setattr(dcp_dense_mla, "_ACTIVE", None)
-    assert dcp_dense_mla.padded_num_tokens(PADDINGS, 64, [40, 1], 128) == 64
     dcp_dense_mla.check_prefill_pool([10**6, 10**6], [5, 5])
-
-
-def test_prefill_steps_pad_past_the_request_count(active):
-    assert dcp_dense_mla.padded_num_tokens(PADDINGS, 64, [1] * 64, 128) == 64
-    assert dcp_dense_mla.padded_num_tokens(PADDINGS, 64, [1, 63], 128) == 1024
-    assert dcp_dense_mla.padded_num_tokens(PADDINGS, 128, [2] * 64, 128) == 1024
-    assert dcp_dense_mla.padded_num_tokens(PADDINGS, 2048, [2000], 128) == 2048
-    with pytest.raises(ValueError):
-        dcp_dense_mla.padded_num_tokens([1, 8, 128], 8, [8], 128)
 
 
 def test_prefill_pool_holds_one_whole_context(active):

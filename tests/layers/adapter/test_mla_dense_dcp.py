@@ -87,16 +87,24 @@ def _step(num_tokens, num_seqs, num_decode):
     return layer, (ql, q_pe, kv_c, k_pe, cache, md)
 
 
-def test_decode_bucket_runs_only_the_decode_op(collectives):
+def test_decode_step_takes_every_row_from_the_merge(collectives):
     layer, (ql, q_pe, kv_c, k_pe, cache, md) = _step(4, 8, 4)
     out = _impl()._forward_dense_mla_dcp(layer, ql, q_pe, kv_c, k_pe, cache, md)
     decode_op, prefill_op = layer.mla_dcp_ops
-    prefill_op.assert_not_called()
+    prefill_op.assert_called_once()  # no-op on device when nothing prefills
     assert collectives == [4]
     args = decode_op.call_args.args
     assert args[3].shape[0] == 4  # the store sees every token
     assert torch.equal(out, torch.ones(4, LOCAL_HEADS, LKV))
     assert torch.equal(cache, torch.ones_like(cache))  # the stored cache is kept
+
+
+def test_small_bucket_prefill_combines_by_token(collectives):
+    layer, (ql, q_pe, kv_c, k_pe, cache, md) = _step(6, 8, 2)
+    out = _impl()._forward_dense_mla_dcp(layer, ql, q_pe, kv_c, k_pe, cache, md)
+    assert collectives == [6]
+    assert torch.equal(out[:2], torch.ones(2, LOCAL_HEADS, LKV))
+    assert torch.equal(out[2:], torch.full((4, LOCAL_HEADS, LKV), 2.0))
 
 
 def test_prefill_bucket_combines_by_token(collectives):
@@ -117,7 +125,7 @@ def test_forward_requires_built_ops():
         _impl()._forward_dense_mla_dcp(layer, *args)
 
 
-@pytest.mark.parametrize("num_tokens,num_decode", [(4, 4), (12, 3)])
+@pytest.mark.parametrize("num_tokens,num_decode", [(4, 4), (6, 2), (12, 3)])
 def test_dispatch_traces_whole_graph_with_dynamic_tokens(
     collectives, num_tokens, num_decode
 ):
