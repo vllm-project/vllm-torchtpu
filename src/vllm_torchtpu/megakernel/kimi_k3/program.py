@@ -165,11 +165,15 @@ def check(config: MegakernelEngineConfig) -> None:
         raise NotImplementedError(
             f"the K3 megakernel needs --tensor-parallel-size {TP_SIZE}"
         )
-    if config.attention_dp not in (1, 2) or (
+    if config.attention_dp not in (1, 2, 4) or (
         config.attention_dp > 1 and config.role != "decode"
     ):
         raise NotImplementedError(
-            "the K3 decoder runs attention_dp 1 or 2; the prefill runs 1"
+            "the K3 decoder runs attention_dp 1, 2 or 4; the prefill runs 1"
+        )
+    if config.attention_dp == 4 and config.num_speculative_tokens:
+        raise NotImplementedError(
+            "the K3 decoder speculates under attention_dp 1 or 2 only"
         )
     dcp = DCP_SIZE // config.attention_dp
     if config.decode_context_parallel_size != dcp:
