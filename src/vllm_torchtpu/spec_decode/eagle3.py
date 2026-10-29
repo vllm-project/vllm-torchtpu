@@ -2778,14 +2778,14 @@ class Eagle3Proposer:
         with runner._precompile_timed("drafter fused async seed"):
             for T in runner.num_tokens_paddings:
                 for width in reqs:
-                    if not runner._spec_verify_bucket_reachable(T, width):
-                        continue
+                    # Mixed chunks carry prefill tokens too, so T is not
+                    # bounded by the verify width: warm every token bucket.
                     prev = reqs[bisect.bisect_left(reqs, width) - 1] if width != reqs[0] else 0
                     ps = {
                         _get_padded_token_len(runner.num_tokens_paddings, n)
                         for n in range(prev + 1, width + 1)
                     }
-                    for p in sorted(ps):
+                    for p in sorted(x for x in ps if x <= T):
                         for q in sorted(qsl_widths):
                             nt = torch.zeros((width, k + 1), dtype=torch.int32).to(
                                 runner.device
