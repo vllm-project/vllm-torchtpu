@@ -104,7 +104,7 @@ def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.A
             maybe_quantize_lhs=True,
             zero_initialize=True,
         )
-    return xla_quantized_matmul(x, w_q, w_s)
+    return xla_quantized_matmul(x, w_q, w_s, quantize_in_one_pass=True)
 
 
 def _quantized_matmul_f32_jax(
@@ -113,7 +113,9 @@ def _quantized_matmul_f32_jax(
     """The per-channel FP8 matmul with its f32 product left unrounded."""
     if w_s.ndim != 1:
         raise ValueError(f"needs a per-channel weight scale, got {w_s.shape=}")
-    return xla_quantized_matmul(x, w_q, w_s, out_dtype=jnp.float32)
+    return xla_quantized_matmul(
+        x, w_q, w_s, out_dtype=jnp.float32, quantize_in_one_pass=True
+    )
 
 
 _quantized_matmul_kernel_op: Callable | None = None
