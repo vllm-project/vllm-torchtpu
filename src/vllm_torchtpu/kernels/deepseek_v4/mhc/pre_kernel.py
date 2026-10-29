@@ -23,6 +23,10 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.deepseek_v4.mhc import gates_kernel, utils
 from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
 
+# Tokens per grid step of the single-stream pre: its (tb, hidden) block and
+# K=hidden GEMM are a quarter of the full pre's, so it takes larger blocks.
+SINGLE_STREAM_TOKEN_BLOCK = 256
+
 
 def _dot3(x, fn_hi_ref, fn_mid_ref, fn_lo_ref):
     """3-pass exact GEMM: x is bf16 (its low chunks are zero), so three
@@ -361,7 +365,7 @@ def mhc_pre_single_stream(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     *,
-    token_block_size: int = 64,
+    token_block_size: int = SINGLE_STREAM_TOKEN_BLOCK,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """``mhc_pre`` of hc_mult identical streams, given the one stream.
