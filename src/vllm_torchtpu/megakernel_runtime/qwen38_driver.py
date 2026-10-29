@@ -561,6 +561,8 @@ class Qwen38SegmentDriver:
         self.segments = Qwen38Segments(runner.model, self.g, self.mesh, buckets, head=head)
         self.program = None
         self.check_left = 0
+        self.check_rows: frozenset[int] = frozenset()
+        self.check_warm: set[int] = set()
         self.shadow = None
         self.h0check_left = 0
         self.h0kind = None
@@ -642,6 +644,12 @@ class Qwen38SegmentDriver:
                 qwen38_segment_call.DEFAULT_RINGS = (int(e), int(d))
         drv = cls(runner, _parse_buckets(raw), head=_parse_flag(raw, "head", True))
         drv.check_left = _parse_check(raw)
+        # `checkrows=16:24`: check=N compares only these buckets. Checks count real steps
+        # only (after warmup, real context); warmup runs each bucket's shadow once to
+        # compile it (j-ef8effe9: all 300 checks went to warmup dummies, rel 0).
+        for part in raw.split(","):
+            if part.startswith("checkrows="):
+                drv.check_rows = frozenset(int(x) for x in part[len("checkrows=") :].split(":"))
         # `h0check=N`: every eligible step runs stock; the first N real ones also
         # compare the head-0 (layer 0) kernel against stock layer 0 on the same
         # input, the kernel reading a private copy of layer 0's state blocks.
@@ -1516,11 +1524,14 @@ class Qwen38SegmentDriver:
         draft.model.mk_tail = tail
         logger.info("Qwen3.8 MTP draft tail kernel attached, rows buckets %s", self.buckets)
 
-    def _shadow_step(self, runner: Any, input_ids: Any, positions: Any, kw: dict) -> Any:
+    def _shadow_step(self, runner: Any, input_ids: Any, positions: Any, kw: dict,
+                     real: bool = True) -> Any:
         """Run the kernel program (no GDN writes) then the stock model; log, return stock."""
         with self._contexts(runner, "model_mk_segments_shadow"):
             mk = self.shadow(input_ids=input_ids, positions=positions, **kw)
         stock = runner.model(input_ids=input_ids, positions=positions, **kw)
+        if not real:  # warmup: compile this bucket's shadow program, compare nothing
+            return stock
         mk_h = mk[0] if isinstance(mk, (tuple, list)) else mk
         st_h = stock[0] if isinstance(stock, (tuple, list)) else stock
         d = (mk_h.float() - st_h.float()).abs()
@@ -1727,8 +1738,16 @@ class Qwen38SegmentDriver:
         if first_warm:
             self._tp_barrier("before the first (compiling) call")
         try:
-            if self.check_left > 0 and self.shadow is not None:
-                out = self._shadow_step(runner, input_ids, positions, kw)
+            check_real = bool(getattr(runner, "warmup_done", False)) and _real_traffic(kw)
+            if (
+                self.check_left > 0
+                and self.shadow is not None
+                and (not self.check_rows or rows in self.check_rows)
+                and (rows not in self.check_warm or check_real)
+            ):
+                self.check_warm.add(rows)
+                self._note(f"check_b{rows}" if check_real else f"check_warm_b{rows}")
+                out = self._shadow_step(runner, input_ids, positions, kw, check_real)
             elif (
                 self.wholecheck_left > 0
                 and self.whole_shadow is not None
