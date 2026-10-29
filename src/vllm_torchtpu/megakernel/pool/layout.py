@@ -27,7 +27,9 @@ Each of the `num_pools` pools (one per attention layer) has shape
    - Pages `[0, rec_pages_per_slot)`: recurrent state `(vh, KD, VD)` bf16,
      packed as u32 pairs (`rec_u32_rows` rows of `LANES` lanes).
    - Page `rec_pages_per_slot` (`conv_page`): the causal-conv window
-     `(conv_taps, QKV)` bf16, as `conv_page_rows` rows of `LANES` lanes.
+     `(conv_taps, QKV)` in `conv_dtype` (bf16 or f32), tap-major, as rows of
+     `LANES` lanes (`conv_page_rows` rows per page: bf16 rows pack in pairs
+     per u32 row, f32 rows are one u32 row each).
 
 Checkpoint index conventions (`page_base`): a 3D `ckpt_indices`
 `[slots_per_pool, NS, K]` maps slot `c` to pages `[c * pps, (c + 1) * pps)`; a
@@ -52,7 +54,7 @@ import jax.numpy as jnp
 
 from ..decls import KVCacheDecl, RecurrentCacheDecl
 from ..errors import MegakernelConfigError
-from ..ops import BF16, FP8, rup
+from ..ops import BF16, F32, FP8, rup
 from .config import cache_exec
 
 if TYPE_CHECKING:
@@ -78,6 +80,8 @@ VALIDATED_KVH = 1
 VALIDATED_REC_PAGES_PER_SLOT = 4
 VALIDATED_CONV_PAGES_PER_SLOT = 1
 VALIDATED_CONV_TAPS = 3
+# Conv window storage dtypes the split pool I/O path implements.
+VALIDATED_CONV_DTYPES = (BF16, F32)
 
 
 @dataclass(frozen=True)
@@ -182,9 +186,13 @@ class PoolLayout:
         return self.rec_pages_per_slot * self.page_bytes // (4 * LANES)
 
     @property
+    def conv_itemsize(self) -> int:
+        return jnp.dtype(self.conv_dtype).itemsize
+
+    @property
     def conv_page_rows(self) -> int:
-        """bf16 rows of `LANES` lanes in one conv page (`page_bytes // 256`)."""
-        return self.page_bytes // (LANES * 2)
+        """`conv_dtype` rows of `LANES` lanes in one conv page (256 bf16 / 128 f32)."""
+        return self.page_bytes // (LANES * self.conv_itemsize)
 
     def gpr_conv_rows(self, T: int, R: int) -> int | None:
         """`(rows, 4, page_size)` fp8 page rows of the in-kernel gather (GPR)
@@ -219,8 +227,16 @@ class PoolLayout:
         return (self.vh_per_rank(R) * self.KD) // 2
 
     def conv_rows(self, R: int) -> int:
-        """bf16 rows of `LANES` lanes of one sequence's per-rank conv window."""
+        """`conv_dtype` rows of `LANES` lanes of one sequence's per-rank conv window."""
         return (self.conv_taps * self.qkv_per_rank(R)) // LANES
+
+    def conv_rows_pad(self, R: int) -> int:
+        """`conv_rows` rounded to the dtype's sublane tile (16 bf16 / 8 f32)."""
+        return rup(self.conv_rows(R), 32 // self.conv_itemsize)
+
+    def conv_bytes(self, R: int) -> int:
+        """Bytes of one sequence's per-rank conv window."""
+        return self.conv_taps * self.qkv_per_rank(R) * self.conv_itemsize
 
     # -------------------------------------------------------------- validation
     def validate(self, ex: ExecSpec | None = None) -> None:
@@ -282,9 +298,15 @@ class PoolLayout:
             f"conv window must have {VALIDATED_CONV_TAPS} taps",
         )
         _need(
-            jnp.dtype(self.rec_dtype) == jnp.dtype(BF16)
-            and jnp.dtype(self.conv_dtype) == jnp.dtype(BF16),
-            "recurrent and conv checkpoints are stored as bf16",
+            jnp.dtype(self.rec_dtype) == jnp.dtype(BF16),
+            "recurrent checkpoints are stored as bf16",
+        )
+        _need(
+            any(
+                jnp.dtype(self.conv_dtype) == jnp.dtype(d)
+                for d in VALIDATED_CONV_DTYPES
+            ),
+            "conv checkpoints are stored as bf16 or f32",
         )
         _need(
             self.kh > 0 and self.vh > 0 and self.vh % self.kh == 0,
@@ -307,7 +329,7 @@ class PoolLayout:
             f"exceeds {self.rec_pages_per_slot} recurrent pages "
             f"({self.rec_u32_rows} rows)",
         )
-        conv_rows_pad = ((self.conv_rows(R) + 15) // 16) * 16
+        conv_rows_pad = self.conv_rows_pad(R)
         _need(
             conv_rows_pad <= self.conv_page_rows,
             f"per-rank conv window ({conv_rows_pad} rows) exceeds one conv "
@@ -342,6 +364,7 @@ class PoolLayout:
         num_pools: int | None = None,
         slots_per_pool: int | None = None,
         R: int | None = None,
+        conv_dtype: Any = None,
     ) -> PoolLayout:
         """Construct a `PoolLayout` from per-layer `cache_decl()` descriptors."""
         from .derive import derive_pool_layout
@@ -352,11 +375,13 @@ class PoolLayout:
             num_pools=num_pools,
             slots_per_pool=slots_per_pool,
             R=R,
+            conv_dtype=conv_dtype,
         )
 
 
 __all__ = [
     "LANES",
+    "VALIDATED_CONV_DTYPES",
     "VALIDATED_CONV_PAGES_PER_SLOT",
     "VALIDATED_CONV_TAPS",
     "VALIDATED_HD",

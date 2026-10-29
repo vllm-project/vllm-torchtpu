@@ -180,3 +180,16 @@ def test_derive_rejects_invalid_declarations():
     for bad_r in (None, 0, -2):
         with pytest.raises(MegakernelConfigError, match="requires explicit R > 0"):
             PoolLayout.from_cache_decls([rec, kv], R=bad_r)
+
+
+def test_derive_conv_dtype_override():
+    """`conv_dtype` overrides the declared conv storage dtype; nothing else moves."""
+    kv = KVCacheDecl(hd=256, kvh=1, page_size=128)
+    rec = RecurrentCacheDecl(kh=16, vh=64, KD=128, VD=128, conv_taps=3, conv_dtype=BF16)
+    seq = [rec, rec, rec, kv] * 2
+    base = derive_pool_layout(seq, R=8)
+    f32 = derive_pool_layout(seq, R=8, conv_dtype=F32)
+    assert base.conv_dtype == BF16 and f32.conv_dtype == F32
+    assert PoolLayout.from_cache_decls(seq, R=8, conv_dtype=F32) == f32
+    assert f32 == PoolLayout(**{**base.__dict__, "conv_dtype": F32})
+    f32.validate()

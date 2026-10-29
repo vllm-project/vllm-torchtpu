@@ -174,3 +174,20 @@ def test_framework_as_checked_out_matches_or_declines_by_conv_dtype() -> None:
     else:
         assert fw.conv_dtype == "float32"
         assert not res.eligible and res.code == "conv_state_dtype_unsupported"
+
+
+def test_f32_conv_pool_layout_matches_an_fp32_conv_framework(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A `PoolLayout` with an f32 conv window describes exactly the slot a
+    framework storing fp32 conv lays out, so the bind check passes."""
+    import jax.numpy as jnp
+
+    monkeypatch.setattr(gpl, "DEFAULT_POOLED_GDN_CONV_STATE_DTYPE", "torch.float32")
+    lay = dataclasses.replace(Qwen35.pool_layout(R=TP), conv_dtype=jnp.float32)
+    mk = facts_from_pool_layout(lay, TP)
+    fw = _fw_facts()
+    assert mk.conv_dtype == fw.conv_dtype == "float32"
+    assert mk.conv_bytes == fw.conv_bytes == 18432
+    assert compare_layout_facts(mk, fw).eligible
+    assert mk.fingerprint() != _mk_facts().fingerprint()

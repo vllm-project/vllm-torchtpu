@@ -123,3 +123,30 @@ def test_layout_validate_checks_in_kernel_conv_windows():
         lay.validate(
             with_cache(replace(split, B=1, T=1), fused_pool_io=True)
         )  # 16 * 24 rows
+
+
+def test_layout_f32_conv_geometry_and_in_kernel_windows():
+    """An f32 conv window (the serving framework's pooled conv dtype) keeps the
+    slot geometry; its rows are one u32 row each, so a conv page holds 128.
+    Split pool I/O fits; the GPR / fused staging windows don't (fail closed)."""
+    import jax.numpy as jnp
+
+    bf16 = replace(_layout(3), kh=16, vh=64)  # Qwen3.5: 12 conv rows per rank at R=8
+    f32 = replace(bf16, conv_dtype=jnp.float32)
+    assert (bf16.conv_itemsize, f32.conv_itemsize) == (2, 4)
+    assert (bf16.conv_page_rows, f32.conv_page_rows) == (256, 128)
+    assert bf16.conv_rows(8) == f32.conv_rows(8) == 36
+    assert (bf16.conv_rows_pad(8), f32.conv_rows_pad(8)) == (48, 40)
+    assert (bf16.conv_bytes(8), f32.conv_bytes(8)) == (9216, 18432)
+    assert f32.pages_per_slot == bf16.pages_per_slot == 5 and f32.conv_page == 4
+    split = with_cache(_exec(R=8, B=8, T=4), paged_kv=True)
+    f32.validate(split)
+    assert f32.gpr_conv_rows(4, R=8) == 96 and not f32.gpr_conv_fits(4, R=8)
+    with pytest.raises(MegakernelConfigError, match="in-kernel gather"):
+        f32.validate(with_cache(split, pool_gather=True))
+    with pytest.raises(MegakernelConfigError, match="fused pool I/O"):
+        f32.validate(with_cache(split, fused_pool_io=True))  # 16 * 12 > 128
+    with pytest.raises(MegakernelConfigError, match="bf16 or f32"):
+        replace(bf16, conv_dtype=jnp.float16).validate()
+    with pytest.raises(MegakernelConfigError, match="recurrent checkpoints"):
+        replace(bf16, rec_dtype=jnp.float32).validate()
