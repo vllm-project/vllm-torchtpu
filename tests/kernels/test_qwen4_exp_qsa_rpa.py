@@ -21,6 +21,7 @@ import numpy as np
 import pytest
 import qwen4_exp_qsa_reference as qsa
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.qwen4_exp import qsa_rpa
 
@@ -254,7 +255,15 @@ def _check_lifecycle(
         flat_trig = jnp.pad(flat_trig, ((0, 0), (0, (-flat_trig.shape[1]) % 128)))
         native_producer = (*producer[:9], flat_trig)
         actual = native_fn(
-            *native_producer, *(jnp.array(x, copy=True) for x in state), *metadata
+            *native_producer,
+            *(jnp.array(x, copy=True) for x in state),
+            *metadata,
+            request_distribution=jnp.array(
+                [0, 0, 2]
+                if phase == "prefill"
+                else ([0, 0, 0] if phase == "idle" else [2, 2, 2]),
+                jnp.int32,
+            ),
         )
         jax.block_until_ready(actual)
         a, e = np.asarray(actual[-2], np.float32), np.asarray(expected[-2], np.float32)
@@ -291,10 +300,19 @@ def test_one_kv_head_rpa_lifecycle(fp8):
 
 
 @pytest.mark.parametrize("budget", [16, 512, 2048, 4096])
-def test_query_batch_bounds_scalar_page_metadata(budget):
-    batch = qsa_rpa.rpa_query_batch_size(budget + 1)
+def test_query_batch_bounds_scalar_page_metadata(budget, monkeypatch):
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    batch = qsa_rpa.rpa_query_batch_size(
+        budget + 1,
+        query=jax.ShapeDtypeStruct((1, 24, 256), jnp.bfloat16),
+        cache=jax.ShapeDtypeStruct((1, 128, 1, 2, 256), jnp.bfloat16),
+        kv_heads=2,
+        ratio=4,
+    )
     assert 0 < batch <= 64
-    assert batch * (budget + 1) * 4 <= 160 * 1024
+    schedule = (128 * (8 * (5 + 2 + 3 * 64 + 4) + 5) + 1) * 4
+    assert schedule + (batch * (budget + 1 + 4) + 1) * 4 <= info.smem_capacity_bytes
     if budget == 512:
         assert batch == 64
 
@@ -318,9 +336,18 @@ def test_empty_step_preserves_native_owners(fp8):
         jnp.zeros((2, 8, 128), jnp.bfloat16),
         jnp.zeros((2, 8, 2), jnp.int32),
     )
-    args = [jnp.zeros((0, n), jnp.bfloat16) for n in (1536, 256, 256, 640)]
-    args += [jnp.zeros(n, jnp.bfloat16) for n in (256, 256, 128, 128)]
-    args += [jnp.zeros(0, jnp.int32), jnp.zeros((128, 128), jnp.bfloat16)]
+    args = (
+        jnp.zeros((0, 1536), jnp.bfloat16),
+        jnp.zeros((0, 256), jnp.bfloat16),
+        jnp.zeros((0, 256), jnp.bfloat16),
+        jnp.zeros((0, 640), jnp.bfloat16),
+        jnp.zeros(256, jnp.bfloat16),
+        jnp.zeros(256, jnp.bfloat16),
+        jnp.zeros(128, jnp.bfloat16),
+        jnp.zeros(128, jnp.bfloat16),
+        jnp.zeros(0, jnp.int32),
+        jnp.zeros((128, 128), jnp.bfloat16),
+    )
     result = qsa_rpa.qsa_step(
         *args,
         *state,
@@ -329,6 +356,7 @@ def test_empty_step_preserves_native_owners(fp8):
         jnp.zeros(0, jnp.int32),
         jnp.zeros((0, 1), jnp.int32),
         jnp.zeros((0, 1), jnp.int32),
+        request_distribution=jnp.zeros(3, jnp.int32),
         compress_ratio=4,
         token_topk=2048,
         norm_eps=1e-6,
