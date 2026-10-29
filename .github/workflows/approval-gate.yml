@@ -49,7 +49,7 @@ env:
   # opening it and being reviewed, and a red X for that whole window trains
   # people to ignore the check. `failure` is the setting to switch to when
   # branch rulesets arrive and the gate is meant to block.
-  MISSING_APPROVAL_CONCLUSION: neutral
+  MISSING_APPROVAL_CONCLUSION: failure
   # When true, request review from the minimal set of owners covering the PR
   # -- the same set `scripts/find_owners.py --request` would ask for. Only on
   # `opened` and `ready_for_review`: re-requesting someone whose review is
