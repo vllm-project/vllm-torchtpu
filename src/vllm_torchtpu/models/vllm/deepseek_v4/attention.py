@@ -568,10 +568,23 @@ class VllmDeepseekV4MLAAttention(
                 "indexer_rotary_emb",
                 getattr(self.mla_attn, "rotary_emb", None),
             )
-            topk_indices = self.indexer(
-                hidden_states, qr, indexer_weights, positions, indexer_emb
-            )
-        if compressor is not None:
+            if compressor is not None:
+                # Both compressors project the same hidden states: one op.
+                compressor.forward_with_indexer(
+                    self.indexer.compressor,
+                    hidden_states,
+                    positions,
+                    self.mla_attn.rotary_emb,
+                    indexer_emb,
+                )
+                topk_indices = self.indexer.topk_indices(
+                    qr, indexer_weights, positions, indexer_emb
+                )
+            else:
+                topk_indices = self.indexer(
+                    hidden_states, qr, indexer_weights, positions, indexer_emb
+                )
+        elif compressor is not None:
             compressor(hidden_states, positions, self.mla_attn.rotary_emb)
 
         res = self.forward_mqa(

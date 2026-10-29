@@ -280,10 +280,20 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         rotary_emb: nn.Module,
         slot_mapping: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        self.compressor(hidden_states, positions, rotary_emb)
+        return self.topk_indices(query, indexer_weights, positions, rotary_emb)
+
+    def topk_indices(
+        self,
+        query: torch.Tensor,
+        indexer_weights: torch.Tensor,
+        positions: torch.Tensor,
+        rotary_emb: nn.Module,
+    ) -> torch.Tensor:
+        """`forward` once the indexer compressor has stored this step's
+        compressed keys."""
         q, _ = self.wq_b(query)
         q = q.view(-1, self.n_head, self.head_dim)
-
-        self.compressor(hidden_states, positions, rotary_emb)
 
         # No KV cache is bound during the profiling forward; the values are
         # unused, so return correctly-shaped dummies. vLLM binds a numel==0
