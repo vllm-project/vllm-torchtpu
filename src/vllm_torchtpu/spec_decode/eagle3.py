@@ -352,6 +352,8 @@ class Eagle3Proposer:
         # recomputing it or paying the full upstream builder walk.
         self._draft_md_cache: dict[int, tuple[dict, torch.Tensor, int]] = {}
         self._seed_checks_done = 0
+        self._carry_checks_done = 0
+        self._carry_mismatches: torch.Tensor | None = None
         self._seed_mismatches: torch.Tensor | None = None
         # DSA MTP IndexShare (GLM-5.2 / DeepSeek-V3.2). Resolved in load_model.
         self._share_mtp_indices = False
@@ -1347,6 +1349,29 @@ class Eagle3Proposer:
 
     @_static_shape_args
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _draft_rows_carry_and_token(
+        self, positions: torch.Tensor, indices: torch.Tensor, last_hidden: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # `_draft_gather_positions` + `_draft_propose_token` as one program for
+        # a row-selected step 0 (VLLM_TPU_DRAFT_CARRY_FUSED): the position
+        # carry and the first draft token, the same ops in one dispatch.
+        assert self.draft_model is not None
+        indices = indices.clamp_min(0)
+        positions_carry = torch.index_select(positions, positions.ndim - 1, indices)
+        d2t = getattr(self.draft_model, "draft_id_to_target_id", None)
+        if d2t is None:
+            token = (
+                self.draft_model.compute_logits(last_hidden).argmax(dim=-1).to(torch.int32)
+            )
+        else:
+            draft_id = self.draft_model.logits_processor(
+                self.draft_model.lm_head, last_hidden
+            ).argmax(dim=-1)
+            token = (draft_id + d2t[draft_id]).to(torch.int32)
+        return positions_carry, token
+
+    @_static_shape_args
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _draft_combine_hidden_states(
         self, aux0: torch.Tensor, aux1: torch.Tensor, aux2: torch.Tensor
     ) -> torch.Tensor:
@@ -1533,7 +1558,25 @@ class Eagle3Proposer:
                 saved_topk_per_chunk.append(
                     self._mtp_compact_and_save(last_token_indices.clamp_min(0))
                 )
-            if self._draft_rows:
+            fused_token0 = None
+            if (
+                self._draft_rows
+                and envs.VLLM_TPU_DRAFT_CARRY_FUSED
+                and chunk.sequence_layout_plan.descriptor
+                == DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
+            ):
+                # Position carry + first draft token in one program.
+                hidden_carry, last_hidden_carry = hidden, last_hidden
+                with set_model_tag("eagle_head"):
+                    positions_carry, fused_token0 = self._draft_rows_carry_and_token(
+                        positions, last_token_indices, last_hidden
+                    )
+                if self._carry_checks_done < envs.VLLM_TPU_VERIFY_FUSED_CHECK:
+                    self._check_carry_fused(
+                        positions, last_token_indices, last_hidden,
+                        positions_carry, fused_token0,
+                    )
+            elif self._draft_rows:
                 # The draft already returned one row per last token.
                 hidden_carry, last_hidden_carry = hidden, last_hidden
                 positions_carry = self._draft_gather_positions(
@@ -1557,10 +1600,13 @@ class Eagle3Proposer:
             host_phases.mark("dp_carries")
             hidden_carry_per_chunk.append(hidden_carry)
             positions_carry_per_chunk.append(positions_carry)
-            with set_model_tag("eagle_head"):
-                draft_tokens_per_chunk.append(
-                    [self._draft_propose_token(last_hidden_carry)]
-                )
+            if fused_token0 is not None:
+                draft_tokens_per_chunk.append([fused_token0])
+            else:
+                with set_model_tag("eagle_head"):
+                    draft_tokens_per_chunk.append(
+                        [self._draft_propose_token(last_hidden_carry)]
+                    )
 
         host_phases.mark("dp_token0")
         # EP-DP lockstep: a rank with fewer chunks than the step's coordinated
@@ -2093,6 +2139,50 @@ class Eagle3Proposer:
                 caught,
             )
 
+    def _check_carry_fused(
+        self,
+        positions: torch.Tensor,
+        indices: torch.Tensor,
+        last_hidden: torch.Tensor,
+        positions_carry: torch.Tensor,
+        token0: torch.Tensor,
+    ) -> None:
+        """VLLM_TPU_VERIFY_FUSED_CHECK for the fused carry + first token:
+        rerun the separate programs and count mismatches on device (first
+        VLLM_TPU_VERIFY_FUSED_CHECK_FAULT checks perturbed as a positive
+        control)."""
+        ref_pos = self._draft_gather_positions(positions, indices)
+        with set_model_tag("eagle_head"):
+            ref_tok = self._draft_propose_token(last_hidden)
+        faulted = self._carry_checks_done < envs.VLLM_TPU_VERIFY_FUSED_CHECK_FAULT
+        cmp_tok = token0
+        if faulted:
+            cmp_tok = token0.clone()
+            cmp_tok[0] = cmp_tok[0] + 1
+        mism = ((positions_carry != ref_pos).sum() + (cmp_tok != ref_tok).sum()).to(
+            torch.int64
+        )
+        delta = torch.stack(
+            [mism * (0 if faulted else 1), (mism > 0).to(torch.int64) * (1 if faulted else 0)]
+        )
+        self._carry_mismatches = (
+            delta if self._carry_mismatches is None else self._carry_mismatches + delta
+        )
+        self._carry_checks_done += 1
+        if (
+            self._carry_checks_done % 500 == 0
+            or self._carry_checks_done == envs.VLLM_TPU_VERIFY_FUSED_CHECK
+        ):
+            clean, caught = self._carry_mismatches.tolist()
+            logger.info(
+                "DRAFT_CARRY_FUSED_CHECK checks=%d clean_mismatched=%d "
+                "faulted_checks=%d faulted_caught=%d",
+                self._carry_checks_done,
+                clean,
+                min(self._carry_checks_done, envs.VLLM_TPU_VERIFY_FUSED_CHECK_FAULT),
+                caught,
+            )
+
     def _target_draft_attn_metadata(
         self, chunk: DraftChunkInputs
     ) -> dict[str, AttentionMetadata] | None:
@@ -2502,6 +2592,8 @@ class Eagle3Proposer:
         self._precompile_combine_hidden_states()
         self._precompile_draft_seed()
         self._precompile_compute_logits()
+        if envs.VLLM_TPU_DRAFT_CARRY_FUSED and self._draft_rows:
+            self._precompile_draft_rows_carry_and_token()
 
     def _draft_hidden_size(self) -> int:
         """Width of the hidden state the draft's lm_head consumes.
@@ -2664,6 +2756,36 @@ class Eagle3Proposer:
                     lti = torch.zeros(p, dtype=torch.int64).to(runner.device)
                     nti = torch.zeros(p, dtype=torch.int32).to(runner.device)
                     out = self._draft_seed_input_ids(ids, lti, nti)
+                    synchronize_tensors(out)
+
+    def _precompile_draft_rows_carry_and_token(self) -> None:
+        """`_draft_rows_carry_and_token` at every (token bucket T, loop bucket
+        p) pair step 0 can produce, mirroring `_precompile_draft_seed`."""
+        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
+
+        runner = self.runner
+        max_loop_bucket = _get_padded_token_len(
+            runner.num_tokens_paddings, runner.max_num_reqs
+        )
+        idx_sizes = sorted(
+            set(runner.num_reqs_paddings)
+            | {t for t in runner.num_tokens_paddings if t <= max_loop_bucket}
+        )
+        hidden_size = self._draft_hidden_size()
+        with (
+            set_model_tag("eagle_head"),
+            runner._precompile_timed("drafter rows carry + token"),
+        ):
+            for T in runner.num_tokens_paddings:
+                for p in idx_sizes:
+                    if p > T:
+                        continue
+                    positions = torch.zeros(T, dtype=torch.int32).to(runner.device)
+                    idx = torch.zeros(p, dtype=torch.int64).to(runner.device)
+                    hid = torch.zeros(
+                        (p, hidden_size), dtype=runner._hidden_states_dtype
+                    ).to(runner.device)
+                    out = self._draft_rows_carry_and_token(positions, idx, hid)
                     synchronize_tensors(out)
 
     def _precompile_compute_logits(self) -> None:
