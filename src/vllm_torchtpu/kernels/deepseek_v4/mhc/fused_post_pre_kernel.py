@@ -93,15 +93,18 @@ def _fused_kernel(
 
     g_bf = jnp.concatenate(streams_bf, axis=1)  # (tb, hc_mult * hidden_size)
     dn = (((1,), (1,)), ((), ()))
-    acc = jax.lax.dot_general(
-        g_bf, fn_hi_ref[...], dn, preferred_element_type=jnp.float32
-    )
     if gemm_precision == "highest":
-        acc = acc + jax.lax.dot_general(
-            g_bf, fn_mid_ref[...], dn, preferred_element_type=jnp.float32
-        )
-        acc = acc + jax.lax.dot_general(
-            g_bf, fn_lo_ref[...], dn, preferred_element_type=jnp.float32
+        # One GEMM over the stacked (hi, mid, lo) chunks: g streams through
+        # the MXU once instead of three times (N=72 still fits one weight
+        # tile). Each chunk's product is summed over K on its own, then the
+        # three are added in f32.
+        fn_all = jnp.concatenate([fn_hi_ref[...], fn_mid_ref[...], fn_lo_ref[...]])
+        acc3 = jax.lax.dot_general(g_bf, fn_all, dn, preferred_element_type=jnp.float32)
+        n = mixes_ref.shape[1]
+        acc = (acc3[:, :n] + acc3[:, n : 2 * n]) + acc3[:, 2 * n :]
+    else:
+        acc = jax.lax.dot_general(
+            g_bf, fn_hi_ref[...], dn, preferred_element_type=jnp.float32
         )
     mixes_ref[...] = acc
     gf = g_bf.astype(jnp.float32)  # f32 for the squared sum + collapse
