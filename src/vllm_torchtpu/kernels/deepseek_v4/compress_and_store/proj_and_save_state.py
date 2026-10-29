@@ -556,3 +556,287 @@ def proj_and_save_state(
         name="proj_and_save_state",
     )(slot_mapping, positions, hidden_states, wkv_wgate, ape, cache)
 
+
+# The pair kernel's narrow projection (the indexer's) has 256-wide m tiles, and
+# the standalone kernel runs one 2048-deep K tile of it per grid step. The
+# compiler splits that dot over the two matrix units, each summing its 256-deep
+# chunks before one f32 add of the two sums (tpu7x AOT LLO at 256 to 1024
+# tokens): chunks 0-3 and 4-7, or, in a step that also runs the APE product on
+# one unit, chunk 0 and chunks 1-7. The pair kernel computes those partial
+# sums as dots of their own, so its states are bit-identical while that split
+# holds.
+NARROW_TILE_M = 256
+MXU_K_CHUNK = 256
+NARROW_TILE_CHUNK_GROUPS = ((0, 4), (4, 8))
+NARROW_TILE_APE_CHUNK_GROUPS = ((0, 1), (1, 8))
+# Scoped VMEM of the pair kernel: 34 MiB at CSA + indexer and 1024 tokens (two
+# buffers of both weight blocks and of the token tile, and the accumulators),
+# above the 32 MiB default.
+PAIR_VMEM_LIMIT_BYTES = 40 * 1024 * 1024
+
+
+def pair_kernel(
+    # scalar prefetch
+    wide_slot_mapping,
+    narrow_slot_mapping,
+    # input
+    positions,  # [num_tokens]
+    hidden_states,  # [num_tokens, hidden_size]
+    wide_wkv_wgate,  # [hidden_size, 2 * wide state_width]
+    narrow_wkv_wgate,  # [hidden_size, 2 * NARROW_TILE_M]
+    wide_ape,  # [compress_ratio, wide state_width]
+    narrow_ape,  # [compress_ratio, NARROW_TILE_M]
+    wide_cache,  # aliased to the first output
+    narrow_cache,  # aliased to the second output
+    # output
+    _wide_out,
+    _narrow_out,
+    # scratch_memory
+    wide_acc,  # (2, tiles_per_block, tile_n, slots_per_m_tile, 1, last_dim)
+    narrow_acc,  # (2, tiles_per_block, tile_n, slots_per_m_tile, 1, last_dim)
+    sem_ref,  # [2, tiles_per_block]: wide, narrow
+    counts_ref,  # [2, tiles_per_block]: wide, narrow
+    partial_ref,  # (tile_n, slots_per_m_tile, 1, last_dim) of the narrow one
+    *,
+    tile_k: int,
+    tile_n: int,
+    num_token_blocks: int,
+    tiles_per_block: int,
+    compress_ratio: int,
+):
+    """Two projections of the same token tiles, as ``kernel`` runs each.
+
+    The grid is (token block, m tile, token tile) and a step runs both
+    projections' m tile over the whole hidden dim: the wide one as ``kernel``'s
+    fused-K steps do, the narrow one with ``kernel``'s per-K-tile sums.
+    """
+    num_m = 2  # the kv and the score halves of the state
+    num_n = num_token_blocks * tiles_per_block
+    k_tiles = hidden_states.shape[1] // tile_k
+    writers = (
+        _StateWriter(
+            wide_slot_mapping,
+            wide_cache,
+            wide_acc,
+            sem_ref.at[0],
+            counts_ref.at[0],
+            num_m,
+        ),
+        _StateWriter(
+            narrow_slot_mapping,
+            narrow_cache,
+            narrow_acc,
+            sem_ref.at[1],
+            counts_ref.at[1],
+            num_m,
+        ),
+    )
+    for writer in writers:
+        writer.reset(tiles_per_block)
+
+    def inner_kernel(wide_w_ref, narrow_w_ref, hidden_ref, positions_ref):
+        b_idx = pl.program_id(0)
+        m_idx = pl.program_id(1)
+        j_idx = pl.program_id(2)
+        n_idx = b_idx * tiles_per_block + j_idx
+        is_score = m_idx == num_m - 1
+
+        @pl.when(m_idx == 0)
+        def _wait_for_buffer():
+            for writer in writers:
+                writer.wait_slot(j_idx)
+
+        # The previous step ran the last m tile of the previous token tile.
+        copy_dma = (is_score & (j_idx > 0)) | (
+            (b_idx > 0) & (m_idx == 0) & (j_idx == 0)
+        )
+
+        @pl.when(copy_dma)
+        def _write_out_previous_tile():
+            prev_buf_idx = jnp.where(j_idx == 0, tiles_per_block - 1, j_idx - 1)
+            for writer in writers:
+                writer.copy_out(n_idx - 1, prev_buf_idx, tile_n)
+
+        def _dot(w_ref, k_start, k_size):
+            return lax.dot_general(
+                hidden_ref[:, pl.ds(k_start, k_size)],
+                w_ref[pl.ds(k_start, k_size), :],
+                (((1,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+
+        def _accumulate(acc_ref, kk, prod):
+            # As in `kernel`: the first K tile's sum is added to zero, and
+            # later ones to the accumulator read back after their dot.
+            acc = acc_ref.at[m_idx, j_idx]
+            if kk == 0:
+                old_acc = jnp.zeros_like(prod)
+            else:
+                old_acc = load_from_acc_ref(acc, dtype=jnp.float32)
+            store_to_acc_ref(acc, old_acc + prod)
+
+        def _grouped_dot(kk, groups):
+            (a_start, a_end), (b_start, b_end) = groups
+            k0 = kk * tile_k
+            c = MXU_K_CHUNK
+            # Parked in VMEM and read back after the second dot, as the
+            # accumulator is, the first sum is added on the VPU rather than
+            # seeding the second dot's accumulation.
+            first = _dot(narrow_w_ref, k0 + a_start * c, (a_end - a_start) * c)
+            store_to_acc_ref(partial_ref, first)
+            second = _dot(narrow_w_ref, k0 + b_start * c, (b_end - b_start) * c)
+            return load_from_acc_ref(partial_ref, dtype=jnp.float32) + second
+
+        def _add_ape(acc_ref, ape_ref):
+            ape_rows = positions_ref[...] % compress_ratio
+            one_hot = (
+                ape_rows[:, None] == jnp.arange(compress_ratio)[None, :]
+            ).astype(jnp.float32)
+            ape_selected = jnp.matmul(
+                one_hot,
+                ape_ref[...].astype(jnp.float32),
+                precision=lax.Precision.HIGHEST,
+            )
+            acc = acc_ref.at[m_idx, j_idx]
+            new_acc = load_from_acc_ref(acc, dtype=jnp.float32) + ape_selected
+            store_to_acc_ref(acc, new_acc)
+
+        for kk in range(k_tiles):
+            _accumulate(wide_acc, kk, _dot(wide_w_ref, kk * tile_k, tile_k))
+
+        @pl.when(is_score)
+        def _wide_ape():
+            _add_ape(wide_acc, wide_ape)
+
+        def _narrow(with_ape):
+            for kk in range(k_tiles):
+                groups = NARROW_TILE_CHUNK_GROUPS
+                if with_ape and kk == k_tiles - 1:
+                    groups = NARROW_TILE_APE_CHUNK_GROUPS
+                _accumulate(narrow_acc, kk, _grouped_dot(kk, groups))
+            if with_ape:
+                _add_ape(narrow_acc, narrow_ape)
+
+        pl.when(is_score)(lambda: _narrow(True))
+        pl.when(jnp.logical_not(is_score))(lambda: _narrow(False))
+
+    def weight_spec(tile_m):
+        return pl.BlockSpec(
+            (hidden_states.shape[1], tile_m),
+            lambda b, m, j: (0, m),
+            memory_space=pltpu.VMEM,
+        )
+
+    hidden_states_spec = pl.BlockSpec(
+        (tile_n, hidden_states.shape[1]),
+        lambda b, m, j: (b * tiles_per_block + j, 0),
+        memory_space=pltpu.VMEM,
+    )
+    positions_spec = pl.BlockSpec(
+        (tile_n,),
+        lambda b, m, j: (b * tiles_per_block + j,),
+        memory_space=pltpu.VMEM,
+    )
+    pltpu.emit_pipeline(
+        inner_kernel,
+        grid=(num_token_blocks, num_m, tiles_per_block),
+        in_specs=(
+            weight_spec(wide_wkv_wgate.shape[1] // num_m),
+            weight_spec(NARROW_TILE_M),
+            hidden_states_spec,
+            positions_spec,
+        ),
+    )(wide_wkv_wgate, narrow_wkv_wgate, hidden_states, positions)
+
+    # Epilogue: write the last tile and wait for every outstanding write.
+    for writer in writers:
+        writer.copy_out(num_n - 1, tiles_per_block - 1, tile_n)
+    for writer in writers:
+        for b in range(tiles_per_block):
+            writer.wait_slot(b)
+
+
+def pair_fuses(num_tokens: int, wide: jax.Array, narrow: jax.Array) -> bool:
+    """Whether ``proj_and_save_state_pair`` takes these projection weights:
+    the wide one fuses K in ``proj_and_save_state`` and the narrow one has the
+    m tile and K tiles NARROW_TILE_* describe."""
+    hidden_size = wide.shape[0]
+    narrow_k_tile = NARROW_TILE_CHUNK_GROUPS[-1][1] * MXU_K_CHUNK
+    return (
+        _fuses_k(num_tokens, wide)
+        and narrow.shape == (hidden_size, 2 * NARROW_TILE_M)
+        and _select_tile_k(hidden_size) == narrow_k_tile
+    )
+
+
+@functools.partial(jax.jit, static_argnames=["compress_ratio", "interpret"])
+def proj_and_save_state_pair(
+    hidden_states: jax.Array,  # [num_tokens, hidden_size]
+    positions: jax.Array,  # [num_tokens]
+    wkv_wgates: tuple[jax.Array, jax.Array],  # wide, narrow
+    apes: tuple[jax.Array, jax.Array],  # [compress_ratio, state_width]
+    slot_mappings: tuple[jax.Array, jax.Array],  # [num_tokens]
+    caches: tuple[jax.Array, jax.Array],
+    compress_ratio: int,
+    interpret: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    """``proj_and_save_state`` of two projections of the same hidden states and
+    positions, in one call: a grid step fetches its token tile once for both.
+
+    The states are bit-identical to what ``proj_and_save_state`` writes for
+    each projection as long as the compiler splits the standalone kernel's
+    narrow dots as NARROW_TILE_* record (tpu7x, at the time of writing);
+    otherwise they differ in summation order only. Only for weights
+    ``pair_fuses`` takes.
+    """
+    num_tokens, hidden_size = hidden_states.shape
+    assert pair_fuses(num_tokens, *wkv_wgates)
+    tile_n, num_token_blocks, tiles_per_block = _token_tiling(num_tokens, True)
+    padded_num_tokens = num_token_blocks * tiles_per_block * tile_n
+    if padded_num_tokens != num_tokens:
+        pad = padded_num_tokens - num_tokens
+        hidden_states = jnp.pad(hidden_states, ((0, pad), (0, 0)))
+        positions = jnp.pad(positions, (0, pad))
+        slot_mappings = tuple(
+            jnp.pad(s, (0, pad), constant_values=-1) for s in slot_mappings
+        )
+
+    def acc_tile(wkv_wgate, cache):
+        last_dim = cache.shape[-1]
+        return (tile_n, wkv_wgate.shape[1] // 2 // last_dim, 1, last_dim)
+
+    wide_tile, narrow_tile = map(acc_tile, wkv_wgates, caches)
+    scratch_shapes = [
+        pltpu.VMEM((2, tiles_per_block, *wide_tile), jnp.float32),
+        pltpu.VMEM((2, tiles_per_block, *narrow_tile), jnp.float32),
+        pltpu.SemaphoreType.DMA((2, tiles_per_block)),
+        pltpu.SMEM((2, tiles_per_block), jnp.int32),
+        pltpu.VMEM(narrow_tile, jnp.float32),
+    ]
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)  # the APE rows
+    return pl.pallas_call(
+        functools.partial(
+            pair_kernel,
+            tile_k=_select_tile_k(hidden_size),
+            tile_n=tile_n,
+            num_token_blocks=num_token_blocks,
+            tiles_per_block=tiles_per_block,
+            compress_ratio=compress_ratio,
+        ),
+        out_shape=tuple(jax.ShapeDtypeStruct(c.shape, c.dtype) for c in caches),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            grid=(),
+            in_specs=[hbm, hbm, hbm, hbm, vmem, vmem, hbm, hbm],
+            out_specs=(hbm, hbm),
+            scratch_shapes=scratch_shapes,
+        ),
+        input_output_aliases={8: 0, 9: 1},  # the caches
+        compiler_params=pltpu.CompilerParams(
+            disable_bounds_checks=True,
+            vmem_limit_bytes=PAIR_VMEM_LIMIT_BYTES,
+        ),
+        interpret=interpret,
+        name="proj_and_save_state_pair",
+    )(*slot_mappings, positions, hidden_states, *wkv_wgates, *apes, *caches)
