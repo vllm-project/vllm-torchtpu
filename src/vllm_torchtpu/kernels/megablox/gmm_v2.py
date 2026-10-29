@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any
@@ -157,8 +158,24 @@ class RhsRef(ABC):
     def get_weight(self) -> jax.Array: ...
 
     @abstractmethod
+    def get_weight_slice(
+        self, start_k: int, k_size: int, start_n: int, col_size: int
+    ) -> jax.Array: ...
+
+    @abstractmethod
     def get_scale(self, replicate_size: int | None = None) -> jax.Array:
         """Returns scale array, optionally replicated across sublanes."""
+        ...
+
+    @abstractmethod
+    def get_scale_slice(
+        self,
+        start_n: int,
+        col_size: int,
+        replicate_size: int | None = None,
+        dtype: jnp.dtype | None = None,
+    ) -> jax.Array:
+        """Returns column slice of scale array, cast to dtype before replication."""
         ...
 
     @abstractmethod
@@ -177,6 +194,21 @@ class WeightsRef(RhsRef):
     def get_weight(self) -> jax.Array:
         return self.weight[...]
 
+    def get_weight_slice(
+        self, start_k: int, k_size: int, start_n: int, col_size: int
+    ) -> jax.Array:
+        k_slice = (
+            slice(None)
+            if start_k == 0 and k_size == self.weight.shape[0]
+            else pl.ds(start_k, k_size)
+        )
+        n_slice = (
+            slice(None)
+            if start_n == 0 and col_size == self.weight.shape[1]
+            else pl.ds(start_n, col_size)
+        )
+        return self.weight[k_slice, n_slice]
+
     def get_scale(self, replicate_size: int | None = None) -> jax.Array:
         assert self.scale is not None
         if len(self.scale.shape) == 2:
@@ -194,6 +226,40 @@ class WeightsRef(RhsRef):
             return self.scale[:, pl.ds(0, replicate_size, 0), :]
         return self.scale[...]
 
+    def get_scale_slice(
+        self,
+        start_n: int,
+        col_size: int,
+        replicate_size: int | None = None,
+        dtype: jnp.dtype | None = None,
+    ) -> jax.Array:
+        assert self.scale is not None
+        n_slice = (
+            slice(None)
+            if start_n == 0 and col_size == self.scale.shape[-1]
+            else pl.ds(start_n, col_size)
+        )
+        if len(self.scale.shape) == 2:
+            s = self.scale[:, n_slice]
+            if s.dtype != jnp.float32:
+                s = s.astype(jnp.float32)
+            if dtype is not None and s.dtype != dtype:
+                s = s.astype(dtype)
+            if replicate_size is None:
+                return s
+            return jnp.broadcast_to(
+                s[:, None, :], (s.shape[0], replicate_size, s.shape[1])
+            )
+        if replicate_size is not None:
+            s = self.scale[:, pl.ds(0, replicate_size, 0), n_slice]
+        else:
+            s = self.scale[:, :, n_slice]
+        if dtype is not None and s.dtype != dtype:
+            if jax.dtypes.itemsize_bits(s.dtype) <= 8 and dtype != jnp.float32:
+                s = s.astype(jnp.float32)
+            s = s.astype(dtype)
+        return s
+
     def get_bias(self) -> jax.Array:
         assert self.bias is not None
         return self.bias[...]
@@ -207,15 +273,59 @@ class FusedWeightsRef(RhsRef):
     gate: WeightsRef
     up: WeightsRef
 
+    def _slice_interleaved_cols(
+        self,
+        start_n: int,
+        col_size: int,
+        gate_fn: Callable[[int, int], jax.Array],
+        up_fn: Callable[[int, int], jax.Array],
+    ) -> jax.Array:
+        num_lanes = pltpu.get_tpu_info().num_lanes
+        chunks = []
+        for col in range(start_n, start_n + col_size, num_lanes):
+            chunk_idx = col // num_lanes
+            src_col = (chunk_idx // 2) * num_lanes
+            fn = gate_fn if chunk_idx % 2 == 0 else up_fn
+            chunks.append(fn(src_col, num_lanes))
+        return chunks[0] if len(chunks) == 1 else jnp.concat(chunks, axis=-1)
+
     def get_weight(self) -> jax.Array:
         w_gate = self.gate.get_weight()
         w_up = self.up.get_weight()
         return interleave_lane(w_gate, w_up)
 
+    def get_weight_slice(
+        self, start_k: int, k_size: int, start_n: int, col_size: int
+    ) -> jax.Array:
+        return self._slice_interleaved_cols(
+            start_n,
+            col_size,
+            lambda sc, cl: self.gate.get_weight_slice(start_k, k_size, sc, cl),
+            lambda sc, cl: self.up.get_weight_slice(start_k, k_size, sc, cl),
+        )
+
     def get_scale(self, replicate_size: int | None = None) -> jax.Array:
         s_gate = self.gate.get_scale(replicate_size)
         s_up = self.up.get_scale(replicate_size)
         return interleave_lane(s_gate, s_up)
+
+    def get_scale_slice(
+        self,
+        start_n: int,
+        col_size: int,
+        replicate_size: int | None = None,
+        dtype: jnp.dtype | None = None,
+    ) -> jax.Array:
+        return self._slice_interleaved_cols(
+            start_n,
+            col_size,
+            lambda sc, cl: self.gate.get_scale_slice(
+                sc, cl, replicate_size=replicate_size, dtype=dtype
+            ),
+            lambda sc, cl: self.up.get_scale_slice(
+                sc, cl, replicate_size=replicate_size, dtype=dtype
+            ),
+        )
 
     def get_bias(self) -> jax.Array:
         b_gate = self.gate.get_bias()
@@ -461,45 +571,101 @@ def inner_kernel(
 
         # Step 1: Input pre-processing.
         tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[:bucket_m]
-        tiled_rhs = tiled_rhs_ref.get_weight()
-
-        # This should only be taken in the case where we don't requantize
-        # the scales and thus we need to dequantize inside VMEM to avoid small
-        # contracting dimmensions
-        rhs_tile_n = tiled_rhs.shape[1]
+        rhs_tile_n = (
+            2 * cfgs.tiles.tile_n if cfgs.fuse_act is not None else cfgs.tiles.tile_n
+        )
         rhs_qbs = cfgs.rhs_cfgs.quant_block_size
-        if cfgs.rhs_cfgs.should_dequantize_before_matmul:
-            tiled_rhs_scale = tiled_rhs_ref.get_scale(replicate_size=rhs_qbs).astype(
-                cfgs.lhs_cfgs.dtype
-            )
-            num_blocks = cfgs.num_quant_blocks_per_tile_k
-            tiled_rhs_dequant = tiled_rhs.astype(cfgs.lhs_cfgs.dtype).reshape(
-                num_blocks, rhs_qbs, rhs_tile_n
-            )
-            tiled_rhs_dequant = tiled_rhs_dequant * tiled_rhs_scale
-            tiled_rhs = tiled_rhs_dequant.reshape(cfgs.tiles.tile_k, rhs_tile_n)
-            rhs_qbs = cfgs.tiles.tile_k
-
         valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
-        if is_last_k_step and valid_k != 0:
-            mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 0) < valid_k
-            tiled_rhs = jnp.where(mask_rhs, tiled_rhs, 0)
+
+        # When dequantizing before matmul (subchannel block size < mxu_size, e.g.
+        # MXFP4 block=32), materializing [tile_k, rhs_tile_n] fp32+bf16 up front
+        # creates up to ~88 MB of live VREG temporaries and spills to VMEM/HBM.
+        # Instead, stream [dequant_k, mxu_size] tiles directly from VMEM per
+        # (start_n, start_k) step (~0.5 MB live VREGs).
+        dequant_before = cfgs.rhs_cfgs.should_dequantize_before_matmul
+        scale_dtype = cfgs.lhs_cfgs.dtype
+        dequant_k = rhs_qbs
+        tiled_rhs = None
+        if not dequant_before:
+            tiled_rhs = tiled_rhs_ref.get_weight()
+            if is_last_k_step and valid_k != 0:
+                mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 0) < valid_k
+                tiled_rhs = jnp.where(mask_rhs, tiled_rhs, 0)
+        else:
+            assert rhs_qbs is not None
+            rhs_dtype = cfgs.rhs_cfgs.quant_dtype or cfgs.rhs_cfgs.dtype
+            rhs_sublane = tpu_info.get_sublane_tiling(rhs_dtype)
+            scale_sublane = tpu_info.get_sublane_tiling(scale_dtype)
+            dequant_k = math.lcm(
+                mxu_size,
+                rhs_sublane,
+                rhs_qbs * scale_sublane,
+            )
+            if cfgs.tiles.tile_k % dequant_k != 0:
+                dequant_k = cfgs.tiles.tile_k
 
         # Step 2: Matmul.
         acc_list = []
         if not cfgs.lhs_cfgs.should_quantize:
             # Unquantized matmul path.
+            k_step = dequant_k if dequant_before else rhs_qbs
+            assert k_step is not None
             for start_n in range(0, rhs_tile_n, mxu_size):
                 end_n = min(rhs_tile_n, start_n + mxu_size)
                 col_size = end_n - start_n
 
+                s_strip = None
+                if dequant_before:
+                    s_strip = tiled_rhs_ref.get_scale_slice(
+                        start_n,
+                        col_size,
+                        replicate_size=(
+                            None if cfgs.rhs_cfgs.scale_is_compact else rhs_qbs
+                        ),
+                        dtype=scale_dtype,
+                    )
+
                 acc_n = jnp.zeros((bucket_m, col_size), dtype=acc_ref.dtype)
-                for start_k in range(0, cfgs.tiles.tile_k, rhs_qbs):
-                    end_k = min(cfgs.tiles.tile_k, start_k + rhs_qbs)
+                for start_k in range(0, cfgs.tiles.tile_k, k_step):
+                    end_k = min(cfgs.tiles.tile_k, start_k + k_step)
+                    k_len = end_k - start_k
+
+                    if dequant_before:
+                        assert s_strip is not None and rhs_qbs is not None
+                        if is_last_k_step and valid_k != 0 and start_k >= valid_k:
+                            break
+                        rhs_chunk = tiled_rhs_ref.get_weight_slice(
+                            start_k, k_len, start_n, col_size
+                        )
+                        b_start = start_k // rhs_qbs
+                        b_end = end_k // rhs_qbs
+                        b_len = b_end - b_start
+                        if cfgs.rhs_cfgs.scale_is_compact:
+                            scale_chunk = jnp.broadcast_to(
+                                s_strip[b_start:b_end, None, :],
+                                (b_len, rhs_qbs, col_size),
+                            )
+                        else:
+                            scale_chunk = s_strip[b_start:b_end, :, :]
+                        rhs_chunk = (
+                            rhs_chunk.astype(scale_dtype).reshape(
+                                b_len, rhs_qbs, col_size
+                            )
+                            * scale_chunk
+                        ).reshape(k_len, col_size)
+                        if is_last_k_step and valid_k != 0 and valid_k < end_k:
+                            mask_rhs = (
+                                lax.broadcasted_iota(jnp.int32, rhs_chunk.shape, 0)
+                                + start_k
+                            ) < valid_k
+                            rhs_chunk = jnp.where(mask_rhs, rhs_chunk, 0)
+                    else:
+                        assert tiled_rhs is not None
+                        rhs_chunk = tiled_rhs[start_k:end_k, start_n:end_n]
 
                     block_acc = jnp.matmul(
                         tiled_lhs[:, start_k:end_k],
-                        tiled_rhs[start_k:end_k, start_n:end_n],
+                        rhs_chunk,
                         preferred_element_type=jnp.float32,
                     ).astype(acc_ref.dtype)
 
@@ -538,6 +704,7 @@ def inner_kernel(
                 for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
                     end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
 
+                    assert tiled_rhs is not None
                     block_lhs = tiled_lhs[:, start_k:end_k]
                     block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
 
@@ -962,7 +1129,17 @@ def calculate_tiling(
     tile_m = bf16_bf16_tile_m // rhs_mod
     if lhs_cfgs.should_quantize:
         tile_m *= 2
-    tile_m = min(tile_m, dims.size_m)
+    # Scale bucket granularity with average tokens per group so sparse MoE
+    # decode batches (e.g. m=1024 across g=56 local experts -> ~18 rows/group)
+    # use {16, 32, 48, 64} buckets instead of padding 1-token groups to 64 rows,
+    # while still keeping max tile_m = 4 * bucket_base wide enough to avoid
+    # splitting skewed hot experts across multiple weight-loading gm tiles.
+    mean_group_m = dims.size_m // max(1, dims.size_group)
+    target_bucket_m = align_to(
+        max(16, mean_group_m // 2),
+        dims.size_lhs_sublane,
+    )
+    tile_m = min(tile_m, max(target_bucket_m, dims.size_lhs_sublane), dims.size_m)
 
     # To avoid stalling MXU, we add some buffer room where tile_n cannot go
     # smaller than 2x of mxu_column_size.

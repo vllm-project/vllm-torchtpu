@@ -27,8 +27,11 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    Dimensions,
+    InputConfigs,
     TileSizes,
     apply_act_fn,
+    calculate_tiling,
     gmm_v2,
     interleave_lane,
     situ_and_mul,
@@ -456,3 +459,86 @@ def test_gmm_v2_int4_packed_matches_reference():
 
     assert actual.shape == (batch_size, out_size)
     _assert_allclose(actual, expected, atol=3e-1, rtol=3e-1)
+
+
+def test_gmm_v2_mxfp4_compact_e8m0_fused_situ_matches_reference():
+    _require_tpu()
+
+    batch_size = 128
+    in_size = 1536
+    out_size = 1024
+    num_groups = 16
+    block_size = 32
+    num_blocks = in_size // block_size
+    fuse_act = "situ:4.0:25.0"
+    key = jax.random.key(7)
+    k_lhs, k_rhs, k_exp = jax.random.split(key, 3)
+
+    lhs = jax.random.uniform(k_lhs, (batch_size, in_size), jnp.bfloat16, -1.0, 1.0)
+    rhs_fp4 = jax.random.uniform(
+        k_rhs, (num_groups, in_size, out_size), jnp.float32, -3.0, 3.0
+    ).astype(jnp.float4_e2m1fn)
+    exp_int = jax.random.randint(
+        k_exp, (num_groups, num_blocks, out_size), minval=-3, maxval=2, dtype=jnp.int32
+    )
+    rhs_scale_e8m0 = jnp.exp2(exp_int.astype(jnp.float32)).astype(jnp.float8_e8m0fnu)
+    group_sizes = get_group_sizes(batch_size, num_groups)
+
+    scale_expanded = jnp.repeat(rhs_scale_e8m0.astype(jnp.bfloat16), block_size, axis=1)
+    rhs_dequant = rhs_fp4.astype(jnp.bfloat16) * scale_expanded
+    raw_expected = reference_gmm(lhs, rhs_dequant, group_sizes)
+    raw_gate, raw_up = jnp.split(raw_expected, 2, axis=-1)
+    expected = apply_act_fn(
+        interleave_lane(raw_gate, raw_up).astype(jnp.float32), fuse_act
+    ).astype(lhs.dtype)
+
+    actual = gmm_v2(
+        lhs,
+        rhs_fp4,
+        group_sizes,
+        rhs_scale=rhs_scale_e8m0,
+        maybe_quantize_lhs=False,
+        fuse_act=fuse_act,
+    )
+
+    assert actual.shape == (batch_size, out_size // 2)
+    _assert_allclose(actual, expected, atol=6e-2, rtol=6e-2)
+
+
+def test_calculate_tiling_scales_bucket_base_with_group_density(monkeypatch):
+    monkeypatch.setattr(
+        "vllm_torchtpu.kernels.megablox.gmm_v2.pltpu.get_tpu_info",
+        lambda: SimpleNamespace(
+            mxu_column_size=256,
+            num_lanes=128,
+        ),
+    )
+    lhs_cfgs = InputConfigs(quant_dtype=None, quant_block_size=512, dtype=jnp.bfloat16)
+    rhs_cfgs = InputConfigs(
+        quant_dtype=jnp.float4_e2m1fn,
+        quant_block_size=32,
+        dtype=jnp.float4_e2m1fn,
+        has_scale=True,
+        scale_is_compact=True,
+    )
+    vmem_limit = 64 * 1024 * 1024
+
+    def _tiles_for(size_m: int) -> TileSizes:
+        dims = Dimensions(
+            size_m=size_m,
+            size_k=3584,
+            size_n=3072,
+            size_group=56,
+            size_lhs_group=56,
+            size_lhs_sublane=16,
+        )
+        return calculate_tiling(dims, lhs_cfgs, rhs_cfgs, vmem_limit, fuse_act="silu")
+
+    t_c64 = _tiles_for(1024)
+    assert (t_c64.bucket_base, t_c64.tile_m) == (16, 64)
+
+    t_c128 = _tiles_for(2048)
+    assert (t_c128.bucket_base, t_c128.tile_m) == (32, 128)
+
+    t_prefill = _tiles_for(16384)
+    assert (t_prefill.bucket_base, t_prefill.tile_m) == (64, 256)

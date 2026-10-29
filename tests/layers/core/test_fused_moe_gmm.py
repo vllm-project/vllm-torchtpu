@@ -1175,3 +1175,41 @@ def test_moe_gmm_onehot_combine_zeroes_uncomputed_rows(monkeypatch):
     )
 
     assert bool(jnp.all(jnp.isfinite(out.astype(jnp.float32))))
+
+
+def test_prepare_routed_counting_sort_medium_batch_matches_argsort(monkeypatch):
+    num_tokens, topk, hidden, local_num_experts = 64, 16, 16, 56
+    k_h, k_idx, k_mask = jax.random.split(jax.random.key(42), 3)
+    hidden_states = jax.random.normal(k_h, (num_tokens, hidden), dtype=jnp.bfloat16)
+    raw_idx = jax.random.randint(
+        k_idx, (num_tokens, topk), minval=0, maxval=local_num_experts, dtype=jnp.int32
+    )
+    is_local = jax.random.bernoulli(k_mask, p=0.25, shape=(num_tokens, topk))
+    topk_indices = jnp.where(is_local, raw_idx, -1)
+    topk_weights = jnp.full((num_tokens, topk), 1.0 / topk, dtype=jnp.float32)
+
+    common = dict(
+        local_num_experts=local_num_experts,
+        topk=topk,
+        use_ep=False,
+        use_sparse_core=False,
+        onehot_moe_permute_threshold=0,
+    )
+    monkeypatch.setattr(envs, "TPU_MOE_COUNTING_SORT", False, raising=False)
+    ref_out = prepare_routed_gmm_inputs(
+        hidden_states, topk_indices, topk_weights, **common
+    )
+
+    monkeypatch.setattr(envs, "TPU_MOE_COUNTING_SORT", True, raising=False)
+    cs_out = prepare_routed_gmm_inputs(
+        hidden_states, topk_indices, topk_weights, **common
+    )
+
+    for got, want in zip(cs_out, ref_out):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+    jaxpr = jax.make_jaxpr(
+        lambda h, idx, w: prepare_routed_gmm_inputs(h, idx, w, **common)
+    )(hidden_states, topk_indices, topk_weights)
+    sort_eqns = [eqn for eqn in jaxpr.jaxpr.eqns if eqn.primitive.name == "sort"]
+    assert not sort_eqns, f"Expected zero comparison sort ops, got {sort_eqns}"

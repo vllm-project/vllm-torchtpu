@@ -306,6 +306,23 @@ def prepare_routed_gmm_inputs(
         sorted_indices = counting_sort.invert_permutation(argsort_revert_indices)
         group_sizes_local = key_onehot[:, :local_num_experts].sum(axis=0)
         token_indices_sorted = token_indices_flat[sorted_indices]
+    elif (
+        envs.TPU_MOE_COUNTING_SORT
+        and sort_keys.shape[0] <= 2048
+        and (_cs := _counting_sort_positions(sort_keys, local_num_experts + 1))[0]
+        is not None
+    ):
+        argsort_revert_indices, bucket_counts = _cs
+        group_sizes_local = bucket_counts[:local_num_experts]
+        # `_counting_sort_positions` returns a stable bijection from input route
+        # index -> sorted position. Scattering `token_indices_flat` by that exact
+        # permutation avoids O(N^2) inversion and keeps forward permute and
+        # reverse combine on the identical permutation (preserving MTP ties).
+        token_indices_sorted = (
+            jnp.zeros_like(token_indices_flat)
+            .at[argsort_revert_indices]
+            .set(token_indices_flat)
+        )
     else:
         # The keys take only `local_num_experts + 1` values, so a counting sort
         # gives the positions and `group_sizes` without a second comparison sort.

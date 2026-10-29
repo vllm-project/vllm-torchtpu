@@ -50,7 +50,7 @@ if TYPE_CHECKING:
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
-    TPU_MOE_OWNER_OUTPUT_MIN_ROUTES: int = 1024
+    TPU_MOE_OWNER_OUTPUT_MIN_ROUTES: int = 4096
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
@@ -557,7 +557,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # only pays off once that dense one-hot gets large (prefill). 0 applies
     # the kernel to every supported shape.
     "TPU_MOE_OWNER_OUTPUT_MIN_ROUTES": env_nonnegative_int(
-        "TPU_MOE_OWNER_OUTPUT_MIN_ROUTES", 1024
+        "TPU_MOE_OWNER_OUTPUT_MIN_ROUTES", 4096
     ),
     # Maximum hidden-state row count (after any EP all-gather) for dense
     # expert MoE. 0 disables it; larger shapes and unsupported layouts use
