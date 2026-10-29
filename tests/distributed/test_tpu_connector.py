@@ -6448,6 +6448,37 @@ def test_glm_admission_topology_rejects_unsupported_shapes(
         worker._raiden_glm_admission_topology()
 
 
+@pytest.mark.parametrize(
+    ("rope_layout", "good_interleave", "bad_interleave", "expected_min"),
+    [
+        ("sparsecore", 8, 4, 8),
+        ("tensorcore", 4, 2, 4),
+    ],
+)
+def test_glm_pp_to_dcp_destination_interleave_tracks_rope_layout(
+    monkeypatch, rope_layout, good_interleave, bad_interleave, expected_min
+):
+    """PP -> DCP GLM transfers copy whole packed rows: SparseCore RoPE packs
+    8 tokens/row (min interleave 8), while TensorCore packs 4 tokens/row."""
+    monkeypatch.setenv("TPU_SPARSE_MLA_ROPE_LAYOUT", rope_layout)
+    worker = _make_raiden_worker(
+        tp_rank=0, tp_size=1, pp_size=4, is_producer=True, block_size=256
+    )
+    extra = {
+        "destination_decode_context_parallel_size": 8,
+        "destination_cp_kv_cache_interleave_size": good_interleave,
+    }
+    worker.vllm_config.kv_transfer_config.kv_connector_extra_config = extra
+    with patch(f"{_MOD}._raiden_dst_shards", return_value=8):
+        assert worker._raiden_glm_admission_topology() == "tp1_prefill"
+        extra["destination_cp_kv_cache_interleave_size"] = bad_interleave
+        with pytest.raises(
+            ValueError,
+            match=f"multiple of {expected_min} that divides the page",
+        ):
+            worker._raiden_glm_admission_topology()
+
+
 # ---------------------------------------------------------------------------
 # GLM-5.2 DCP producer -> DCP decode: each rank ships its own pages whole.
 # ---------------------------------------------------------------------------

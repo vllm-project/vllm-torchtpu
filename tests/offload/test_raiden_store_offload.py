@@ -1233,7 +1233,26 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         store.complete_load(sub_hashes(_key(0)))
         meta2 = self._build_meta(sched, self._stock_meta())
         self.assertEqual(meta2.finished_load_jobs, {3: "r1"})
-        self.assertEqual(meta2.failed_load_device_block_ids, [])
+        self.assertEqual(meta2.failed_load_req_ids, set())
+
+    def test_failed_load_is_reported_by_request(self):
+        # Block ids are only unique within a KV cache group, so a failed load
+        # must reach the scheduler as its request id; the request still
+        # finishes so it leaves WAITING_FOR_REMOTE_KVS, then recomputes or
+        # fails per kv_load_failure_policy.
+        store = FakeKVCacheStore()
+        manager = make_manager(store)
+        seed_host_entries(store, _key(0))
+        manager.prepare_load([_key(0)], _ctx("r1"))
+        sched = self._make_scheduler(manager)
+        self._build_meta(
+            sched, self._stock_meta(load_jobs={3: self._load_job([_key(0)], [10])})
+        )
+
+        store.complete_load(sub_hashes(_key(0)), success=False)
+        meta = self._build_meta(sched, self._stock_meta())
+        self.assertEqual(meta.finished_load_jobs, {3: "r1"})
+        self.assertEqual(meta.failed_load_req_ids, {"r1"})
 
     def test_flush_cancels_fence_pending_store(self):
         store = FakeKVCacheStore()
@@ -1474,7 +1493,6 @@ class TestWorkerSideConnector(unittest.TestCase):
         conn.connector_worker = MagicMock()
         conn._fenced_jobs = {}
         conn._completed_jobs = {}
-        conn._load_error_block_ids = set()
         conn._pool_sync_tensors = []
         conn._pending_fences = []
         return conn
@@ -1583,24 +1601,39 @@ class TestWorkerSideConnector(unittest.TestCase):
         conn._connector_metadata = self._meta(
             finished_store_job_ids=[1, 2],
             finished_load_jobs={3: "req-a"},
-            failed_load_device_block_ids=[10, 11],
         )
         sending, recving = conn.get_finished(set())
         self.assertEqual(sending, set())
         self.assertEqual(recving, {"req-a"})
         self.assertEqual(conn._completed_jobs, {1: 1, 2: 1, 3: 1})
-        self.assertEqual(conn.get_block_ids_with_load_errors(), {10, 11})
-        self.assertEqual(conn.get_block_ids_with_load_errors(), set())
 
-    def test_load_errors_group_index_is_unscoped(self):
-        # The runner calls this whenever failed block ids are reported.
+    def test_failed_load_reported_as_failed_recving(self):
+        # vLLM rejects block-level load failures on multi-group KV layouts
+        # (DeepSeek-V4, hybrid Mamba), so failures travel by request id.
         conn = self._make_worker_connector()
         conn._connector_metadata = self._meta(
-            failed_load_device_block_ids=[10, 11],
+            finished_load_jobs={3: "req-a", 4: "req-b"},
+            failed_load_req_ids={"req-b"},
         )
-        conn.get_finished(set())
-        self.assertEqual(conn.get_block_ids_with_load_errors(), {10, 11})
-        self.assertIsNone(conn.get_block_ids_with_load_errors_group_index())
+        results = conn.get_transfer_results(set())
+        self.assertEqual(results.finished_sending, set())
+        # The failed request still finishes, which releases it from
+        # WAITING_FOR_REMOTE_KVS.
+        self.assertEqual(results.finished_recving, {"req-a", "req-b"})
+        self.assertEqual(results.failed_recving, {"req-b"})
+        self.assertEqual(conn._completed_jobs, {3: 1, 4: 1})
+        self.assertEqual(conn.get_block_ids_with_load_errors(), set())
+
+    def test_get_finished_refuses_to_report_a_failed_load(self):
+        # get_finished() has no failure channel: returning req-b as finished
+        # would pass its failed load as a good one.
+        conn = self._make_worker_connector()
+        conn._connector_metadata = self._meta(
+            finished_load_jobs={3: "req-a", 4: "req-b"},
+            failed_load_req_ids={"req-b"},
+        )
+        with self.assertRaisesRegex(RuntimeError, "get_transfer_results"):
+            conn.get_finished(set())
 
     def test_build_connector_worker_meta_drains_state(self):
         conn = self._make_worker_connector()
