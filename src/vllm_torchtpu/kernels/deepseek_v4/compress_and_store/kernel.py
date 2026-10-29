@@ -77,25 +77,42 @@ def inner_kernel(
         idx = global_idx + i
         safe_idx = jax.lax.select(idx < cfgs.dims.size_n, idx, 0)
         start_list.append(positions_ref[safe_idx] - window + 1)
-    # The window packs window_tokens_per_vreg tokens per vreg (see
-    # `config.Configs.window_shape`); give each row its token's start.
-    tokens_per_vreg = cfgs.window_tokens_per_vreg
-    group_rows = tokens_per_vreg * head_tiles
-    row_start = jnp.stack(
-        [start_list[r // head_tiles] for r in range(tile_n * head_tiles)]
-    ).reshape(tile_n // tokens_per_vreg, 1, group_rows, 1)
-
-    kv_val = window_vmem[:, :, 0]  # (groups, window, group_rows, 128)
-    scores_val = window_vmem[:, :, 1]  # (groups, window, group_rows, 128)
     rms_weight_tiled = rms_weight_vmem_ref[...].astype(jnp.float32)  # (head_tiles, 128)
 
     # --- windowed softmax ---
-    curr_pos = row_start + jax.lax.broadcasted_iota(jnp.int32, (1, window, 1, 1), 1)
-    mask = curr_pos >= 0  # (groups, window, group_rows, 1)
-    neg_inf = jnp.array(-jnp.inf, dtype=scores_val.dtype)
-    masked_scores = jnp.where(mask, scores_val, neg_inf)
-    weights = jax.nn.softmax(masked_scores, axis=1)
-    kv_val = jnp.where(mask, kv_val, 0.0)
+    # Window positions before 0 hold no state: give them a -inf score and a
+    # zero kv. Only a token with a kv slot is ever stored, so the window is
+    # masked only when one of those has such positions (a sequence's first
+    # compressed tokens), and left as fetched otherwise. A slotless token's
+    # window may then hold any bytes (NaN, Inf); this is safe only while every
+    # step after the softmax stays per token.
+    needs_mask = functools.reduce(
+        jnp.logical_or,
+        [
+            (start < 0) & (kv_slot_mapping_ref[global_idx + i] >= 0)
+            for i, start in enumerate(start_list)
+        ],
+    )
+
+    @pl.when(needs_mask)
+    def _mask_window():
+        # The window packs window_tokens_per_vreg tokens per vreg (see
+        # `config.Configs.window_shape`); give each row its token's start.
+        group_rows = cfgs.window_tokens_per_vreg * head_tiles
+        row_start = jnp.stack(
+            [start_list[r // head_tiles] for r in range(tile_n * head_tiles)]
+        ).reshape(-1, 1, group_rows, 1)
+        curr_pos = row_start + jax.lax.broadcasted_iota(
+            jnp.int32, (1, window, 1, 1), 1
+        )
+        mask = curr_pos >= 0  # (groups, window, group_rows, 1)
+        neg_inf = jnp.array(-jnp.inf, dtype=window_vmem.dtype)
+        window_vmem[:, :, 1] = jnp.where(mask, window_vmem[:, :, 1], neg_inf)
+        window_vmem[:, :, 0] = jnp.where(mask, window_vmem[:, :, 0], 0.0)
+
+    kv_val = window_vmem[:, :, 0]  # (groups, window, group_rows, 128)
+    scores_val = window_vmem[:, :, 1]  # (groups, window, group_rows, 128)
+    weights = jax.nn.softmax(scores_val, axis=1)
     compressed = jnp.sum(weights * kv_val, axis=1)  # (groups, group_rows, 128)
     compressed = compressed.reshape(tile_n, head_tiles, 128)
 
