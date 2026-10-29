@@ -12,14 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Qwen3.8 as a megakernel program: the prefill role's pipeline stage
-(:class:`QwenPrefillStage`), and what it supports.
+(:class:`QwenPrefillStage`), the decode role's program (:class:`QwenDecoder`),
+and what they support.
 
 The prefill runs as one stage of vLLM's PP x PCP engine layout: a stage is
 one host's ``PCP_SIZE`` cores (vLLM's prefill context parallel group), which
 holds a contiguous run of the 92 layers (vLLM's pipeline partition) and
 computes every scheduled token of a step, sequence parallel over its cores.
-:func:`from_vllm` builds it from vLLM's configuration; the standalone tools
-build it directly.
+The decoder runs TP32 with DCP8 attention over the pools the KV transfer
+reshards the prefill's into. :func:`from_vllm` builds either from vLLM's
+configuration; the standalone tools build the stage directly.
 """
 
 from __future__ import annotations
@@ -34,12 +36,22 @@ NUM_LAYERS = 92
 HIDDEN_SIZE = 8192
 VOCAB = 248320
 PCP_SIZE = 8  # the cores of a stage (one host)
+TP_SIZE = 32  # the decoder's ranks
+DCP_SIZE = 8  # the decoder's attention context parallel group
 FULL_ATTENTION_INTERVAL = 4  # layers 3, 7, ..., 91 are full attention, the rest GDN
-# Sampling parameters the first-token op implements (beyond greedy).
-SAMPLING: frozenset[str] = frozenset()
+# Sampling parameters the ops implement (beyond greedy), by role: the
+# prefill's first tokens are not served.
+SAMPLING = {
+    "prefill": frozenset(),
+    "decode": frozenset({"temperature", "top_p", "top_k", "seed"}),
+}
 # --model-loader-extra-config keys, by role: the prefill reads the model's
-# checkpoint itself (``synthetic_seed``: random weights instead, for timing).
-LOADER_KEYS = {"prefill": frozenset({"synthetic_seed"}), "decode": frozenset()}
+# checkpoint itself (``synthetic_seed``: random weights instead, for timing);
+# the decoder reads its rank cache (``decode_weights``).
+LOADER_KEYS = {
+    "prefill": frozenset({"synthetic_seed"}),
+    "decode": frozenset({"presharded"}),
+}
 
 
 def is_full_attention(layer: int) -> bool:
@@ -49,10 +61,33 @@ def is_full_attention(layer: int) -> bool:
 def check(config: MegakernelEngineConfig) -> None:
     """Raise ``NotImplementedError`` for a configuration the Qwen3.8
     programs do not implement."""
-    if config.role != "prefill":
+    if not config.kv_cache_dtype.startswith("fp8"):
         raise NotImplementedError(
-            "the Qwen3.8 megakernel serves the prefill role of a P/D pair"
+            "the Qwen3.8 megakernel keeps an FP8 KV cache: --kv-cache-dtype fp8"
         )
+    if config.mamba_ssm_cache_dtype != "float32":
+        raise NotImplementedError(
+            "the Qwen3.8 megakernel keeps FP32 GDN states in the pools: "
+            "--mamba-ssm-cache-dtype float32 (the checkpoint's mamba_ssm_dtype)"
+        )
+    interleave = config.cp_kv_cache_interleave_size
+    if config.role == "decode":
+        if (
+            config.tensor_parallel_size != TP_SIZE
+            or config.decode_context_parallel_size != DCP_SIZE
+        ):
+            raise NotImplementedError(
+                f"the Qwen3.8 decode megakernel runs --tensor-parallel-size {TP_SIZE} "
+                f"--decode-context-parallel-size {DCP_SIZE}"
+            )
+        if interleave not in (128, 256):
+            raise NotImplementedError(
+                "the Qwen3.8 decode megakernel needs --cp-kv-cache-interleave-size "
+                f"128 or 256 (its KV page), not {interleave}"
+            )
+        return
+    if config.role != "prefill":
+        raise NotImplementedError(f"the Qwen3.8 megakernel has no {config.role} role")
     if config.prefill_context_parallel_size != PCP_SIZE:
         raise NotImplementedError(
             "the Qwen3.8 prefill megakernel runs a stage on one host's cores: "
@@ -63,17 +98,6 @@ def check(config: MegakernelEngineConfig) -> None:
             "the Qwen3.8 prefill megakernel runs --tensor-parallel-size 1 and "
             "--decode-context-parallel-size 1"
         )
-    if not config.kv_cache_dtype.startswith("fp8"):
-        raise NotImplementedError(
-            "the Qwen3.8 prefill megakernel writes an FP8 KV cache: "
-            "--kv-cache-dtype fp8"
-        )
-    if config.mamba_ssm_cache_dtype != "float32":
-        raise NotImplementedError(
-            "the Qwen3.8 prefill megakernel keeps FP32 GDN states: "
-            "--mamba-ssm-cache-dtype float32 (the checkpoint's mamba_ssm_dtype)"
-        )
-    interleave = config.cp_kv_cache_interleave_size
     if interleave is None or interleave % 128:
         raise NotImplementedError(
             "the Qwen3.8 prefill megakernel needs --cp-kv-cache-interleave-size "
@@ -83,9 +107,19 @@ def check(config: MegakernelEngineConfig) -> None:
 
 def capabilities(config: MegakernelEngineConfig) -> Capabilities:
     check(config)
+    if config.role == "decode":
+        return Capabilities(
+            roles=frozenset({"decode"}),
+            sampling=SAMPLING["decode"],
+            speculation=None,
+            num_speculative_tokens=0,
+            max_step_tokens=config.max_num_batched_tokens,
+            page_aligned_chunks=False,
+            block_copies=False,
+        )
     return Capabilities(
         roles=frozenset({"prefill"}),
-        sampling=SAMPLING,
+        sampling=SAMPLING["prefill"],
         speculation=None,
         num_speculative_tokens=0,
         max_step_tokens=config.max_num_batched_tokens,
@@ -99,7 +133,8 @@ def capabilities(config: MegakernelEngineConfig) -> Capabilities:
 
 
 def from_vllm(vllm_config: Any, tp_rank: int):
-    """This worker's stage of the prefill (``tp_rank`` is 0: TP 1)."""
+    """This worker's stage of the prefill (``tp_rank`` is 0: TP 1), or its
+    rank of the decoder."""
     from vllm.distributed import get_pp_group
     from vllm.distributed.parallel_state import get_pcp_group
     from vllm.distributed.utils import get_pp_indices
@@ -117,6 +152,13 @@ def from_vllm(vllm_config: Any, tp_rank: int):
         raise NotImplementedError("the Qwen3.8 megakernel implements full Qwen3.8 only")
     config = MegakernelEngineConfig.from_vllm_config(vllm_config)
     check(config)
+    if config.role == "decode":
+        from vllm_torchtpu.megakernel.qwen38.decode import QwenDecoder
+
+        presharded = backend.presharded(vllm_config)
+        if presharded is None:
+            raise ValueError("the Qwen3.8 decoder loads its rank cache: set presharded")
+        return QwenDecoder(config, presharded, tp_rank=tp_rank)
     pp = get_pp_group()
     first, last = get_pp_indices(NUM_LAYERS, pp.rank_in_group, pp.world_size)
     return QwenPrefillStage(

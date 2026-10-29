@@ -15,6 +15,7 @@
 
     python -m tools.megakernel qwen38 bench --prompts 8192x1,2048x4,8192x1@32768
     python -m tools.megakernel qwen38 probe --prompt "The capital of France is"
+    python -m tools.megakernel qwen38 decode --presharded DIR --batches 1,4,16
 
 ``probe`` loads the checkpoint (``--layers N``: each stage's first N layers)
 and runs one prompt, printing every layer's output range on each stage's
@@ -31,6 +32,11 @@ take random rows as their hand-off (``--chain``: the previous stage's output
 rows, through files), so every stage times its own step: ``LENxN`` is ``N``
 prompts of ``LEN`` new tokens, ``@PREFIX`` after that many cached tokens (on
 fresh pages); the median of ``--repeats`` steps after a warm-up, per stage.
+
+``decode`` runs the decoder (TP32, DCP8 attention) on the rank cache
+``--presharded`` over pools shaped as vLLM allocates them for it, each batch's
+requests decoding ``--steps`` tokens from position ``--context`` (zero KV and
+states before it), and reports the median step time per batch.
 """
 
 from __future__ import annotations
@@ -80,6 +86,13 @@ def add_arguments(parser) -> None:
         default="",
         help="prompt tokens (.npy, tiled to each length) instead of random ids",
     )
+
+    decode = sub.add_parser("decode", help="the decoder's step time")
+    decode.add_argument("--presharded", required=True, help="the decoder's rank cache")
+    decode.add_argument("--batches", default="1,2,4,8,16")
+    decode.add_argument("--context", type=int, default=8192)
+    decode.add_argument("--steps", type=int, default=32)
+    decode.add_argument("--max-model-len", type=int, default=139264)
 
     probe = sub.add_parser("probe", help="each layer's output range, real weights")
     probe.add_argument("--checkpoint", required=True)
@@ -450,9 +463,125 @@ def _split_layer(stage, layer, rows, h, meta):
     return h, out
 
 
+def decode(args) -> None:
+    import torch
+
+    from vllm_torchtpu.megakernel.bridge import materialize
+    from vllm_torchtpu.megakernel.config import MegakernelEngineConfig
+    from vllm_torchtpu.megakernel.program import KVGroup, RequestInput, StepInput
+    from vllm_torchtpu.megakernel.qwen38.decode import QwenDecoder
+    from vllm_torchtpu.megakernel.qwen38.program import NUM_LAYERS, is_full_attention
+
+    batches = [int(b) for b in args.batches.split(",")]
+    config = MegakernelEngineConfig(
+        role="decode",
+        tensor_parallel_size=32,
+        decode_context_parallel_size=CORES,
+        block_size=MANAGER_BLOCK,
+        max_num_seqs=max(batches),
+        max_model_len=args.max_model_len,
+        max_num_batched_tokens=max(batches),
+        kv_cache_dtype="fp8",
+        mamba_ssm_cache_dtype="float32",
+        cp_kv_cache_interleave_size=PAGE,
+    )
+    decoder = QwenDecoder(config, Path(args.presharded), tp_rank=harness.rank())
+    started = time.perf_counter()
+    decoder.load_weights()
+    harness.log(
+        f"rank cache weights in {time.perf_counter() - started:.1f} s; {_hbm()}"
+    )
+    # vLLM's pools for the decoder: raw pool i holds attention layer i and the
+    # i-th layer of each GDN group; state blocks are manager blocks of three
+    # kernel pages, attention tables list kernel pages.
+    attention = [i for i in range(NUM_LAYERS) if is_full_attention(i)]
+    gdn = [
+        [i for i in range(NUM_LAYERS) if not is_full_attention(i) and i % 4 == g]
+        for g in range(3)
+    ]
+    requests = max(batches)
+    pages = -(-(args.context + args.steps + 1) // (PAGE * CORES))
+    width = -(-args.max_model_len // (PAGE * CORES))
+    state_pages = 3 * (1 + 3 * requests)
+    per_block = MANAGER_BLOCK // PAGE
+    kernel_pages = -(-(state_pages + requests * pages) // per_block) * per_block
+    page_shape = (2, decoder.layout.config.head_dim // 4, 4, PAGE)
+    raw = [
+        torch.zeros((kernel_pages, *page_shape), dtype=torch.float8_e4m3fn).to("tpu")
+        for _ in attention
+    ]
+    caches = {
+        f"model.layers.{i}.self_attn.attn": raw[o] for o, i in enumerate(attention)
+    }
+    for group in gdn:
+        for o, i in enumerate(group):
+            caches[f"model.layers.{i}.linear_attn"] = [raw[o]]
+    groups = [
+        KVGroup(
+            tuple(f"model.layers.{i}.linear_attn" for i in group),
+            args.max_model_len * CORES,
+            1,
+        )
+        for group in gdn
+    ] + [
+        KVGroup(
+            tuple(f"model.layers.{i}.self_attn.attn" for i in attention), PAGE, width
+        )
+    ]
+    decoder.bind_kv_caches(caches, groups)
+    decoder.warmup()
+    harness.sync()
+    rng = np.random.default_rng(0)
+
+    def tables(r: int) -> tuple[np.ndarray, ...]:
+        kv = np.zeros(width, np.int32)
+        kv[:pages] = state_pages + r * pages + np.arange(pages)
+        return (*(np.asarray([1 + 3 * r + g], np.int32) for g in range(3)), kv)
+
+    for batch in batches:
+        tokens = rng.integers(0, 200000, (batch, args.context + args.steps + 1)).astype(
+            np.int32
+        )
+        times, finished = [], ()
+        for step in range(args.steps):
+            position = args.context + step
+            rows = [
+                RequestInput(
+                    req_id=f"b{batch}-{r}",
+                    computed=position,
+                    scheduled=1,
+                    token_ids=tokens[r],
+                    num_tokens=position + 1,
+                    num_prompt_tokens=args.context,
+                    block_tables=tables(r),
+                )
+                for r in range(batch)
+            ]
+            harness.sync()
+            begin = time.perf_counter()
+            output = decoder.step(StepInput(requests=rows, finished=finished))
+            assert output.tokens is not None
+            materialize(output.tokens)
+            finished = ()
+            if step:  # the first imports the requests' states
+                times.append((time.perf_counter() - begin) * 1e3)
+        decoder.step(
+            StepInput(requests=[], finished=[f"b{batch}-{r}" for r in range(batch)])
+        )
+        median = statistics.median(times)
+        last = output.tokens[:batch, 0].tolist()
+        harness.log(
+            f"decode b{batch} @{args.context}: step {median:.2f} ms = "
+            f"{batch * 1e3 / median:.0f} tok/s; last tokens {last}"
+        )
+    harness.log(_hbm())
+
+
 def run(args) -> None:
     if args.qwen_command == "probe":
         return probe(args)
+    if args.qwen_command == "decode":
+        return decode(args)
     import torch
 
     from vllm_torchtpu.distributed.pp_wave import HIDDEN_STATES

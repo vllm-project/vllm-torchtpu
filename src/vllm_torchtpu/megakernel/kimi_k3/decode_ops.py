@@ -240,7 +240,7 @@ class DecodeOps:
                 presharded,
                 hbm(self.rank),
             )
-        report_load_stats("decode", self.rank, stats)
+        report_load_stats("K3 decode", self.rank, stats)
         return stats["wall"]
 
     def use_unified_pools(

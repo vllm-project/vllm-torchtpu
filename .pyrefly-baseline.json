@@ -706,6 +706,326 @@
       "concise_description": "Object of class `NoneType` has no attribute `write_packed`"
     },
     {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/__init__.py",
+      "name": "bad-assignment",
+      "concise_description": "`Literal[16]` is not assignable to dict value type `str`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/attention.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/attention.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/attention_append.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/attention_append.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/attention_append.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/attention_append.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/attention_append.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/attention_append.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/attention_append.py",
+      "name": "bad-unpacking",
+      "concise_description": "Expected argument after ** to be a mapping, got: dict[Unknown, Unknown] | Unknown | None in function `body`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/attention_batched_append.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/attention_batched_append.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/attention_batched_append.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/attention_batched_append.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/attention_batched_append.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/attention_batched_append.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/attention_causal_four.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/attention_causal_four.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/attention_causal_four.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/attention_causal_four.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/attention_causal_pair.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/attention_causal_pair.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `astype`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `astype`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/decode_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`shared_probability` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/decode_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`hidden_out` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/decode_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`owner_kernel` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Index 3 out of range for tuple with 3 elements"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `dict[str, Unknown]`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Index 3 out of range for tuple with 3 elements"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/decode_megakernel.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `dict[str, Unknown]`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/dense.py",
+      "name": "unsupported-operation",
+      "concise_description": "`*` is not supported between `None` and `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/expert_w4a8.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/expert_w4a8.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/expert_w4a8.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/expert_w4a8.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/expert_w4a8.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/expert_w4a8.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/expert_w4a8.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/expert_w4a8.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/expert_w4a8.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/expert_w4a8.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/expert_w4a8.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/expert_w4a8.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/expert_w4a8.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/expert_w4a8.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/expert_w4a8.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/expert_w4a8.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/load.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Unknown | None` is not assignable to parameter `obj` with type `Buffer` in function `memoryview.__new__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/load_preshard.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `config`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/load_preshard.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `iter_cell`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/load_preshard.py",
+      "name": "not-iterable",
+      "concise_description": "Type `object` is not iterable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/load_preshard.py",
+      "name": "bad-argument-count",
+      "concise_description": "Expected 10 positional arguments, got 16 in function `concurrent.futures._base.Executor.submit`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/qwen38/kernels/preshard.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `Unknown | None` is not assignable to parameter `key` with type `str` in function `dict.get`"
+    },
+    {
       "path": "src/vllm_torchtpu/megakernel/runner.py",
       "name": "bad-override",
       "concise_description": "Class member `MegakernelModelRunner.capture_model` overrides parent class `TPUModelRunner` in an inconsistent manner"

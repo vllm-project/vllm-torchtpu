@@ -222,7 +222,9 @@ ignore = [
     "TID251",
 ]
 "src/vllm_torchtpu/megakernel/kimi_k3/*.py" = ["TID251"]
-"src/vllm_torchtpu/megakernel/qwen38/{program,stage,weights}.py" = ["TID251"]
+"src/vllm_torchtpu/megakernel/qwen38/{decode,decode_weights,program,stage,weights}.py" = [
+    "TID251",
+]
 
 # Pallas runs a kernel closure the moment it is defined: `pl.when` and
 # `pl.loop` trace the body during the decorator call, inside the iteration
@@ -242,6 +244,9 @@ ignore = [
 "src/vllm_torchtpu/megakernel/kimi_k3/kernels/**" = [
     "B023", "E501", "E701", "E702", "E741",
 ]
+"src/vllm_torchtpu/megakernel/qwen38/kernels/**" = [
+    "B023", "E501", "E701", "E702", "E741",
+]
 
 # Library code logs through vllm_torchtpu.logger. Tests, scripts and
 # command-line tools print to the terminal on purpose.
@@ -255,6 +260,7 @@ docstring-code-format = true
 exclude = [
     "src/vllm_torchtpu/megakernel/common/**",
     "src/vllm_torchtpu/megakernel/kimi_k3/kernels/**",
+    "src/vllm_torchtpu/megakernel/qwen38/kernels/**",
 ]
 
 [tool.pymarkdown]

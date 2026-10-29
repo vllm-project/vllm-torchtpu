@@ -30,7 +30,8 @@ directly to see the sites:
 
     ruff check --select B023 --config 'lint.per-file-ignores={}' \\
         src/vllm_torchtpu/kernels src/vllm_torchtpu/megakernel/common \\
-        src/vllm_torchtpu/megakernel/kimi_k3/kernels
+        src/vllm_torchtpu/megakernel/kimi_k3/kernels \\
+        src/vllm_torchtpu/megakernel/qwen38/kernels
 
 Run directly to see the current state:
 
@@ -56,6 +57,7 @@ KERNELS = (
     "src/vllm_torchtpu/kernels",
     "src/vllm_torchtpu/megakernel/common",
     "src/vllm_torchtpu/megakernel/kimi_k3/kernels",
+    "src/vllm_torchtpu/megakernel/qwen38/kernels",
 )
 
 

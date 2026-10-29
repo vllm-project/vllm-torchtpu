@@ -62,11 +62,15 @@ _AXIS_INDEX_LOCK = threading.Lock()
 _AXIS_INDEX_DEPTH = 0
 
 
-def kernel_mesh(axis: str, world_size: int | None = None) -> tuple[Mesh, int]:
+def kernel_mesh(
+    axis: str, world_size: int | None = None, *, rank: int | None = None
+) -> tuple[Mesh, int]:
     """The mesh the ops run on (all devices in ascending id, on one axis
     named ``axis``) and this worker's position in it: its kernel rank, which
     need not be its vLLM TP rank. ``world_size``: the device count the
-    program needs."""
+    program needs. ``rank``: order the devices by every worker's ``rank``
+    instead (gathered over the default process group), so that position is
+    ``rank``."""
     if axis in _MESH:
         return _MESH[axis]
     devices = sorted(jax.devices(), key=lambda d: int(d.id))
@@ -84,6 +88,16 @@ def kernel_mesh(axis: str, world_size: int | None = None) -> tuple[Mesh, int]:
             f"worker device {device_id} is not among the JAX devices {ids}"
         )
     position = ids.index(device_id)
+    if rank is not None:
+        gathered: list[Any] = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(gathered, (int(rank), device_id))
+        by_id = dict(zip(ids, devices, strict=True))
+        if sorted(r for r, _ in gathered) != list(range(len(devices))):
+            raise RuntimeError(
+                f"megakernel: worker ranks {sorted(gathered)} do not cover the mesh"
+            )
+        devices = [by_id[i] for _, i in sorted(gathered)]
+        ids, position = [int(d.id) for d in devices], int(rank)
     _MESH[axis] = (Mesh(np.asarray(devices), axis_names=(axis,)), position)
     if position == 0:
         logger.info("megakernel: kernel mesh '%s' over devices %s", axis, ids)
@@ -233,10 +247,13 @@ def register_global_op(
 
 
 def upload(value: np.ndarray) -> torch.Tensor:
-    """Host array -> ``[1, ...]`` device tensor (bf16 via its uint16 view)."""
+    """Host array -> ``[1, ...]`` device tensor (bf16 / fp8 via their integer
+    views, retyped on the host so the device tensor is not a view)."""
     value = np.ascontiguousarray(value)
     if value.dtype.name == "bfloat16":
         tensor = torch.from_numpy(value.view(np.uint16)).view(torch.bfloat16)
+    elif value.dtype.name == "float8_e4m3fn":
+        tensor = torch.from_numpy(value.view(np.uint8)).view(torch.float8_e4m3fn)
     else:
         tensor = torch.from_numpy(value)
     return tensor.unsqueeze(0).to("tpu")
@@ -344,7 +361,7 @@ def report_load_stats(label: str, position: int, stats: dict[str, float]) -> Non
         return f"{values[0]:.1f}/{values[len(values) // 2]:.1f}/{values[-1]:.1f}"
 
     logger.info(
-        "K3 %s weights on %d ranks, min/median/max s: wall %s, "
+        "%s weights on %d ranks, min/median/max s: wall %s, "
         "read-wait %s, upload-wait %s; "
         "slowest rank at mesh position %d (%.1f GiB)",
         label,

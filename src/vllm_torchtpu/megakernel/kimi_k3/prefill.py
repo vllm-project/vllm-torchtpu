@@ -353,7 +353,7 @@ class PrefillProgram:
                 presharded,
                 hbm(self.rank),
             )
-        report_load_stats("prefill", self.rank, stats)
+        report_load_stats("K3 prefill", self.rank, stats)
 
     def _flat(self, *groups: str, expert_bank: int = 0) -> list[torch.Tensor]:
         experts = self._expert_banks[expert_bank] if self._expert_banks else {}
