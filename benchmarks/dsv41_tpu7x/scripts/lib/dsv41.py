@@ -293,17 +293,26 @@ echo INSTALL_OK
 
 # Range-GET downloader (same algorithm as the handoff scripts). NEEDED=None -> all shards.
 DOWNLOAD_PY = r"""
-import os, sys, json, time, urllib.request, urllib.parse, concurrent.futures
+import os, sys, json, time, glob, urllib.request, urllib.parse, urllib.error, concurrent.futures
 BUCKET, PREFIX = os.environ['DSV41_GCS_BUCKET'], os.environ['DSV41_GCS_PREFIX']
+HF_REPO = os.environ.get('DSV41_HF_REPO', '').strip()
 DST = '/dev/shm/DeepSeek-V4.1-Flash'
 SUBSET = os.environ.get('DSV41_SHARDS', 'all')   # 'prefill' or 'all'
 CHUNK, BUF = 2 << 30, 16 << 20
 NEEDED = None
 if SUBSET == 'prefill':
     NEEDED = {f"model-{i:05d}-of-00048.safetensors" for i in list(range(2, 24)) + [47, 48]}
+os.makedirs(DST, exist_ok=True)
+repo_marker = f'{DST}/.hf_repo'
+prev_repo = open(repo_marker).read().strip() if os.path.exists(repo_marker) else ''
+if prev_repo != HF_REPO:
+    print(f'Checkpoint source changed ({prev_repo!r} -> {HF_REPO!r}); clearing stale safetensors & markers', flush=True)
+    for p in glob.glob(f'{DST}/.done_*') + glob.glob(f'{DST}/*.safetensors'):
+        try: os.remove(p)
+        except OSError: pass
 marker = f'{DST}/.done_{SUBSET}'
 if os.path.exists(marker):
-    print('CKPT_ALREADY_READY', flush=True); sys.exit(0)
+    print(f'CKPT_ALREADY_READY (hf_repo={HF_REPO or "gcs-default"})', flush=True); sys.exit(0)
 token = os.environ.get('GCS_TOKEN', '')
 def _vm_token():
     req = urllib.request.Request('http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token',
@@ -316,11 +325,54 @@ def _probe(tok):
         return True
     except Exception as e:
         print(f'token probe failed: {e}', flush=True); return False
-if not (token and _probe(token)):
-    print('falling back to node service-account token', flush=True)
-    token = _vm_token()
-    assert _probe(token), 'no working GCS credential in pod'
+if not HF_REPO:
+    if not (token and _probe(token)):
+        print('falling back to node service-account token', flush=True)
+        token = _vm_token()
+        assert _probe(token), 'no working GCS credential in pod'
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+_no_redir_opener = urllib.request.build_opener(_NoRedirect)
+def _resolve_hf_url(rel):
+    base_url = f'https://huggingface.co/{HF_REPO}/resolve/main/{urllib.parse.quote(rel, safe="/")}'
+    if not rel.endswith('.safetensors'):
+        return base_url
+    for r in range(5):
+        try:
+            with _no_redir_opener.open(urllib.request.Request(base_url, method='HEAD', headers={'User-Agent': 'vllm-bench/1.0'}), timeout=20):
+                return base_url
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 303, 307, 308):
+                loc = e.headers.get('Location')
+                if loc:
+                    return ('https://huggingface.co' + loc) if loc.startswith('/') else loc
+            if r == 4:
+                return base_url
+            time.sleep(1 + r)
+        except Exception:
+            if r == 4:
+                return base_url
+            time.sleep(1 + r)
+    return base_url
 def list_blobs():
+    if HF_REPO:
+        api_url = f'https://huggingface.co/api/models/{HF_REPO}?blobs=true'
+        for r in range(5):
+            try:
+                d = json.loads(urllib.request.urlopen(urllib.request.Request(api_url, headers={'User-Agent': 'vllm-bench/1.0'}), timeout=30).read())
+                break
+            except Exception:
+                if r == 4: raise
+                time.sleep(2)
+        out = []
+        for it in d.get('siblings', []):
+            rel = it['rfilename']
+            if rel.endswith(('.pdf', '.png', '.jpeg', '.patch', '.md', '/', '.tail', '.gitattributes')) or '/eval_cache/' in rel or '/perf_cache/' in rel:
+                continue
+            sz = int((it.get('lfs') or {}).get('size', it.get('size', 0)))
+            out.append((rel, sz))
+        return out
     items, pt = [], None
     while True:
         url = f'https://storage.googleapis.com/storage/v1/b/{BUCKET}/o?prefix=' + urllib.parse.quote(PREFIX)
@@ -328,19 +380,21 @@ def list_blobs():
         d = json.loads(urllib.request.urlopen(urllib.request.Request(url, headers={'Authorization': f'Bearer {token}'}), timeout=30).read())
         items += d.get('items', []); pt = d.get('nextPageToken')
         if not pt: break
-    return [(it['name'], int(it['size'])) for it in items
+    return [(it['name'][len(PREFIX):], int(it['size'])) for it in items
             if not it['name'].endswith(('.pdf', '.png', '.jpeg', '.patch', '.md', '/', '.tail'))
             and '/eval_cache/' not in it['name'] and '/perf_cache/' not in it['name']]
 def dl(a):
-    name, dst, s, e = a
-    url = f'https://storage.googleapis.com/storage/v1/b/{BUCKET}/o/{urllib.parse.quote(name, safe="")}?alt=media'
-    for r in range(5):
+    url, dst, s, e, is_hf = a
+    for r in range(6):
         try:
-            req = urllib.request.Request(url, headers={'Authorization': f'Bearer {token}', 'Range': f'bytes={s}-{e-1}'})
+            hdrs = {'User-Agent': 'vllm-bench/1.0', 'Range': f'bytes={s}-{e-1}'}
+            if not is_hf:
+                hdrs['Authorization'] = f'Bearer {token}'
+            req = urllib.request.Request(url, headers=hdrs)
             fd = os.open(dst, os.O_WRONLY)
             try:
                 pos = s
-                with urllib.request.urlopen(req, timeout=120) as resp:
+                with urllib.request.urlopen(req, timeout=180) as resp:
                     while pos < e:
                         b = resp.read(min(BUF, e - pos))
                         if not b: break
@@ -349,32 +403,42 @@ def dl(a):
                 os.close(fd)
             return e - s
         except Exception:
-            if r == 4: raise
-            time.sleep(2)
+            if r == 5: raise
+            time.sleep(2 * (r + 1))
 t0 = time.time(); tasks = []; total = 0
-for name, sz in list_blobs():
-    rel = name[len(PREFIX):]
+blobs = list_blobs()
+to_dl = []
+for rel, sz in blobs:
     if NEEDED is not None and rel.endswith('.safetensors') and rel not in NEEDED: continue
     dst = os.path.join(DST, rel); os.makedirs(os.path.dirname(dst), exist_ok=True)
     if os.path.exists(dst) and os.path.getsize(dst) == sz: continue
+    to_dl.append((rel, dst, sz))
+if HF_REPO and to_dl:
+    print(f'Resolving {len(to_dl)} files from HuggingFace {HF_REPO} ...', flush=True)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as tex:
+        urls = list(tex.map(lambda x: _resolve_hf_url(x[0]), to_dl))
+else:
+    urls = [f'https://storage.googleapis.com/storage/v1/b/{BUCKET}/o/{urllib.parse.quote(PREFIX + rel, safe="")}?alt=media' for rel, _, _ in to_dl]
+for (rel, dst, sz), url in zip(to_dl, urls):
     fd = os.open(dst, os.O_CREAT | os.O_WRONLY, 0o644); os.ftruncate(fd, sz); os.close(fd)
     total += sz
-    for s in range(0, max(1, sz), CHUNK): tasks.append((name, dst, s, min(s + CHUNK, sz)))
-print(f'Downloading {total/1e9:.1f} GB in {len(tasks)} chunks', flush=True)
+    for s in range(0, max(1, sz), CHUNK): tasks.append((url, dst, s, min(s + CHUNK, sz), bool(HF_REPO)))
+print(f'Downloading {total/1e9:.1f} GB in {len(tasks)} chunks (source={HF_REPO or (BUCKET + "/" + PREFIX)})', flush=True)
 with concurrent.futures.ProcessPoolExecutor(max_workers=32) as ex: list(ex.map(dl, tasks))
 if NEEDED is not None:
     ip = f'{DST}/model.safetensors.index.json'; io_ = json.load(open(ip))
     io_['weight_map'] = {k: v for k, v in io_['weight_map'].items() if v in NEEDED}
     json.dump(io_, open(ip, 'w'), indent=2)
+with open(repo_marker, 'w') as rf: rf.write(HF_REPO)
 open(marker, 'w').close()
-print(f'CKPT_READY in {time.time()-t0:.1f}s', flush=True)
+print(f'CKPT_READY in {time.time()-t0:.1f}s (source={HF_REPO or "gcs-default"})', flush=True)
 """
 
 
-def download_ckpt_sh(subset: str, token: str) -> str:
+def download_ckpt_sh(subset: str, token: str, hf_repo: str = "") -> str:
     return (
         "set -e\nmkdir -p /dev/shm/DeepSeek-V4.1-Flash\n"
-        f"export GCS_TOKEN='{token}' DSV41_GCS_BUCKET='{GCS_BUCKET}' DSV41_GCS_PREFIX='{GCS_PREFIX}' DSV41_SHARDS='{subset}'\n"
+        f"export GCS_TOKEN='{token}' DSV41_GCS_BUCKET='{GCS_BUCKET}' DSV41_GCS_PREFIX='{GCS_PREFIX}' DSV41_SHARDS='{subset}' DSV41_HF_REPO='{hf_repo}'\n"
         "cat > /tmp/dsv41_dl.py <<'PYEOF'\n" + DOWNLOAD_PY + "\nPYEOF\npython3 -u /tmp/dsv41_dl.py\n"
     )
 

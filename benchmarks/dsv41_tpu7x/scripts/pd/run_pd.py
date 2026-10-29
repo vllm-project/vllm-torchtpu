@@ -166,6 +166,8 @@ def main() -> None:
     ap.add_argument("--boot-timeout", type=int, default=5400)
     ap.add_argument("--pending-timeout", type=int, default=7200,
                     help="how long a pod may wait for a free node")
+    ap.add_argument("--hf-repo", default="",
+                    help="optional HuggingFace repo id (e.g. deepseek-ai/DeepSeek-V4.1-Flash-1017) to pull instead of GCS default")
     a = ap.parse_args()
     L.install_signal_handlers()
     L.preflight(a.ctx)
@@ -236,11 +238,11 @@ def main() -> None:
 
         if relaunch:
             tok = L.get_token()
-            dl = L.download_ckpt_sh("all", tok).replace("python3 -u /tmp/dsv41_dl.py\n", "")
+            dl = L.download_ckpt_sh("all", tok, a.hf_repo).replace("python3 -u /tmp/dsv41_dl.py\n", "")
             # The token stays inside the pods (never in logs or the run dir).
             dl += (f"cat > /tmp/dsv41_env.sh <<'EOF'\nexport GCS_TOKEN='{tok}' "
                    f"DSV41_GCS_BUCKET='{L.GCS_BUCKET}' DSV41_GCS_PREFIX='{L.GCS_PREFIX}' "
-                   "DSV41_SHARDS=all\nEOF\n")
+                   f"DSV41_SHARDS=all DSV41_HF_REPO='{a.hf_repo}'\nEOF\n")
             L.upload_stack(stack)  # once, before the two pods fetch it in parallel
 
             def recreate_role(r: str) -> None:
