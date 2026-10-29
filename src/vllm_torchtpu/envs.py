@@ -233,6 +233,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     VLLM_TPU_RAIDEN_STORE_ON_EVICT: bool = False
     VLLM_TPU_RAIDEN_COLD_FRONTIER_BLOCKS: int = 2048
+    VLLM_TPU_RAIDEN_PARKED_LOOKUP_MISS: bool = True
     VLLM_TPU_WARM_SPEC_LOGITS_LENGTHS: bool = True
     VLLM_TPU_PLE_HOST_FAST_LOOKUP: bool = False
     VLLM_TPU_PLE_HOST_TIMING: bool = False
@@ -1504,6 +1505,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_RAIDEN_STORE_ON_EVICT": env_bool("VLLM_TPU_RAIDEN_STORE_ON_EVICT"),
     "VLLM_TPU_RAIDEN_COLD_FRONTIER_BLOCKS": env_nonnegative_int(
         "VLLM_TPU_RAIDEN_COLD_FRONTIER_BLOCKS", 2048
+    ),
+    # Store-on-evict: a lookup on a key whose store job is still parked
+    # answers MISS (recompute) instead of HIT_PENDING (defer the request).
+    "VLLM_TPU_RAIDEN_PARKED_LOOKUP_MISS": env_bool(
+        "VLLM_TPU_RAIDEN_PARKED_LOOKUP_MISS", default=True
     ),
     # Precompile compute_selected_logits under no_grad (as served) and at the
     # spec-verify logits lengths (num_tokens_paddings up to

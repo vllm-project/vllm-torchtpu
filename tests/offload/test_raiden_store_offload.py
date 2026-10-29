@@ -697,6 +697,27 @@ class TestLookup(unittest.TestCase):
         del self.store.entries[sub_hashes(_key(0))[2]]
         self.assertEqual(self.manager.lookup(_key(0), _ctx()), LookupResult.MISS)
 
+    def test_parked_store_key_is_a_miss_not_pending(self):
+        # Store-on-evict: an in-flight key whose job is still parked answers
+        # MISS (the request recomputes) and is counted; once promoted it is a
+        # pending save again. VLLM_TPU_RAIDEN_PARKED_LOOKUP_MISS=0 restores
+        # HIT_PENDING.
+        key = _key(0)
+        self.manager._inflight_store_keys.add(key)
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT_PENDING)
+        self.manager.mark_parked([key])
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.MISS)
+        self.assertEqual(self.manager.parked_lookup_misses, 1)
+        with patch.dict(os.environ, {"VLLM_TPU_RAIDEN_PARKED_LOOKUP_MISS": "0"}):
+            self.assertEqual(
+                self.manager.lookup(key, _ctx()), LookupResult.HIT_PENDING
+            )
+        self.manager.unmark_parked([key])
+        self.assertEqual(self.manager.lookup(key, _ctx()), LookupResult.HIT_PENDING)
+        self.manager.mark_parked([key])
+        self.manager.on_store_job_cancelled([key])
+        self.assertNotIn(key, self.manager._parked_store_keys)
+
     def test_hbm_status_with_live_job_is_hit_pending(self):
         # A save really is in flight for these sub-hashes: come back later.
         for h in sub_hashes(_key(0)):
@@ -2820,6 +2841,9 @@ class TestStoreOnEvict(unittest.TestCase):
         self.assertEqual(meta.fence_job_ids, {7})
         self.assertNotIn(7, sched._cold_pending)
         self.assertEqual(sched._fence_pending[7].device_block_ids, ids)
+        keys = [f"k{n}" for n in ids]
+        manager.mark_parked.assert_called_once_with(keys)
+        manager.unmark_parked.assert_called_once_with(keys)
 
     def test_a_held_block_is_never_stored(self):
         manager = MagicMock()

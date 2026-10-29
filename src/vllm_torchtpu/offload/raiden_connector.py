@@ -277,6 +277,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 cancelled.append(job_id)
                 self._cold_stats["stale"] += 1
                 continue
+            self._raiden_manager.unmark_parked(parked.keys)
             self._fence_pending[job_id] = parked
             new_fence_ids.add(job_id)
             self._cold_stats["promoted"] += 1
@@ -318,6 +319,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                     (bid, _BLOCK_POOL.blocks[bid].block_hash) for bid in device_block_ids
                 ]
                 self._cold_stats["parked"] += 1
+                manager.mark_parked(dst_spec.keys)
                 continue
             self._fence_pending[job_id] = parked
             new_fence_ids.add(job_id)
@@ -391,10 +393,11 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         if stats["steps"] % _STATS_EVERY == 0:
             logger.info(
                 "TPURaidenOffloadingConnector stats (blocks): %s | store-on-evict "
-                "jobs: %s parked_now=%d",
+                "jobs: %s parked_now=%d parked_lookup_misses=%d",
                 " ".join(f"{k}={v}" for k, v in stats.items()),
                 " ".join(f"{k}={v}" for k, v in self._cold_stats.items()),
                 len(self._cold_pending),
+                getattr(manager, "parked_lookup_misses", 0),
             )
 
         # Return empty load_jobs/store_jobs: workers act as passive DMA endpoints.
