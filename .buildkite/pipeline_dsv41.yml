@@ -123,6 +123,7 @@ steps:
         tests/models/vllm/test_dsv41_v2_local_q.py
         tests/models/vllm/test_dsv41_v2_prefix_replay.py
         tests/layers/adapter/test_fused_moe_ep.py
+        tests/kernels/fused_moe/test_fused_ep_moe_v2_input_prefetch.py
         tests/kernels/test_dsv41_decode_tuning.py
         tests/kernels/test_dsv41_decode_index_scores.py
         tests/models/vllm/test_dsv41_decode_indexer_route.py
