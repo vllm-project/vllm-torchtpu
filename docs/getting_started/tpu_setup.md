@@ -25,17 +25,23 @@ The following TPU versions are compatible with `vllm-torchtpu`. Selecting a topo
 
 </div>
 
-### Experimental
+### Supported
 
 <div class="grid cards" markdown>
 
 - __TPU v6e (Trillium)__
 
-    <span class="cg-badge cg-badge-experimental">Experimental</span>
+    <span class="cg-badge cg-badge-supported">Supported</span>
 
-    Optimal performance for mainstream AI workloads with balanced memory and compute.
+    Optimal performance for mainstream AI workloads with balanced memory and compute. Not covered by CI.
 
     [View Topology Guidelines &rarr;](https://cloud.google.com/tpu/docs/v6e#configurations)
+
+</div>
+
+### Experimental
+
+<div class="grid cards" markdown>
 
 - __TPU v5e__
 

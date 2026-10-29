@@ -24,9 +24,6 @@ export PRIORITY_DEFAULT=2
 export PRIORITY_NIGHTLY=1
 export PRIORITY_KERNEL_TUNING=-9
 
-# Release branches, exactly releases/vX.Y.Z
-export RELEASE_BRANCH_REGEX='^releases/v[0-9]+\.[0-9]+\.[0-9]+$'
-
 # How many TPU jobs on the kube fleet one author's pull-request builds may have
 # in flight at once, waiting in Kueue or running. The rest wait in Buildkite as
 # `limited`, holding no agent pod and no place in Kueue's queue, so one author's
@@ -41,7 +38,14 @@ upload_with_priority() {
   local yaml_file=$1
   local JOB_PRIORITY=$2
   local capped
+  local filter=(cat)
   echo "--- :pipeline: Uploading $yaml_file with priority ${JOB_PRIORITY:-$PRIORITY_DEFAULT}"
+  # build.env("NIGHTLY") is evaluated by Buildkite against the build's initial
+  # environment, so a NIGHTLY=1 set by bootstrap.sh (for the run-full-ci label)
+  # never reaches it unless substituted before upload.
+  if [[ "${NIGHTLY:-0}" == "1" ]]; then
+    filter=(sed 's/build\.env("NIGHTLY")/"1"/g')
+  fi
   # A pull-request build's TPU steps go in its author's concurrency group (set
   # by bootstrap.sh). The file is read once by the agent, so that the group is
   # added to the steps it would upload, anchors and interpolation resolved,
@@ -50,7 +54,7 @@ upload_with_priority() {
   if [[ -n "${PR_TPU_CONCURRENCY_GROUP:-}" ]]; then
     if capped=$({
         echo "priority: ${JOB_PRIORITY:-$PRIORITY_DEFAULT}";
-        cat "$yaml_file";
+        "${filter[@]}" "$yaml_file";
       } | buildkite-agent pipeline upload --dry-run --format json \
         | python3 "$(dirname "${BASH_SOURCE[0]}")/../cap_pr_tpu_concurrency.py" \
             "$PR_TPU_CONCURRENCY_GROUP" "$PR_TPU_JOBS_PER_AUTHOR"); then
@@ -61,7 +65,7 @@ upload_with_priority() {
   fi
   {
     echo "priority: ${JOB_PRIORITY:-$PRIORITY_DEFAULT}";
-    cat "$yaml_file";
+    "${filter[@]}" "$yaml_file";
   } | buildkite-agent pipeline upload
 }
 

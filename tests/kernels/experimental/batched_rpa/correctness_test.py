@@ -221,6 +221,8 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         decode_query_size: int = 1,
         distribution: jax.Array | None = None,
         nan_kv_seq_idx: int | None = None,
+        nan_new_seq_idx: int | None = None,
+        mask_invalid_v: bool | None = None,
     ):
         if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
             # Tokens live on the lane dim, so page_size must be a multiple of 128.
@@ -311,6 +313,9 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             first, last = seq_page_ranges[nan_kv_seq_idx]
             kv_cache = kv_cache.at[first:last].set(jnp.nan)
             nan_rows = slice(cu_q_lens[nan_kv_seq_idx], cu_q_lens[nan_kv_seq_idx + 1])
+        if nan_new_seq_idx is not None:
+            nan_rows = slice(cu_q_lens[nan_new_seq_idx], cu_q_lens[nan_new_seq_idx + 1])
+            v = v.at[nan_rows].set(jnp.nan)
         page_indices = jnp.stack(page_indices_list, axis=0)
         page_indices = jnp.pad(
             page_indices,
@@ -410,6 +415,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             vmem_limit_bytes=vmem_limit_bytes,
             kv_layout=kv_layout,
             decode_query_size=decode_query_size,
+            mask_invalid_v=mask_invalid_v,
         )
         output = output[: cu_q_lens[distribution[-1]]]
 
@@ -438,6 +444,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         tol = tols[dtype_bits]
         if nan_rows is not None:
             # Every other sequence must stay finite and match the reference.
+            self.assertTrue(jnp.isnan(output[nan_rows]).all().item())
             keep = np.ones(output.shape[0], dtype=bool)
             keep[nan_rows] = False
             output, expected = output[keep], expected[keep]
@@ -719,6 +726,64 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             distribution=jnp.array([len(seq_lens)] * 3, dtype=jnp.int32),
             decode_query_size=q_len,
             nan_kv_seq_idx=1,
+        )
+
+    @parameterized.product(
+        kv_dtype=[jnp.bfloat16, jnp.float8_e4m3fn],
+        kv_layout=[
+            configs.KVLayout.HEAD_ALONG_SUBLANE,
+            configs.KVLayout.SEQ_ALONG_LANE,
+        ],
+        q_len=[1, 4],
+    )
+    def test_nan_cached_kv_does_not_poison_partial_tiles(
+        self, kv_dtype, kv_layout, q_len
+    ):
+        seq_lens = [(q_len, length) for length in (129, 2048, 8, 7, 257, 259, 8, 511)]
+        self._test_ragged_paged_attention(
+            seq_lens,
+            (8, 2),
+            128,
+            256,
+            jnp.bfloat16,
+            kv_dtype,
+            64,
+            bq_sz=q_len,
+            bq_csz=q_len,
+            bkv_sz=1024,
+            kv_layout=kv_layout,
+            distribution=jnp.array([len(seq_lens)] * 3, dtype=jnp.int32),
+            decode_query_size=q_len,
+            nan_kv_seq_idx=1,
+            mask_invalid_v=True,
+        )
+
+    @parameterized.product(
+        kv_dtype=[jnp.bfloat16, jnp.float8_e4m3fn],
+        q_len=[1, 4],
+        head_dim=[128, 256],
+    )
+    def test_nan_new_kv_page_does_not_poison_other_sequences(
+        self, kv_dtype, q_len, head_dim
+    ):
+        # Source token 128 shares a DMA page with the first request's new KV,
+        # but lies beyond the decode stitch's boundary registers.
+        bad_sequence = 128 // q_len
+        seq_lens = [(q_len, 4 + q_len)] * (bad_sequence + 3)
+        self._test_ragged_paged_attention(
+            seq_lens,
+            (8, 2),
+            head_dim,
+            256,
+            jnp.bfloat16,
+            kv_dtype,
+            256,
+            bq_sz=q_len,
+            bq_csz=q_len,
+            bkv_sz=1024,
+            distribution=jnp.array([len(seq_lens)] * 3, dtype=jnp.int32),
+            decode_query_size=q_len,
+            nan_new_seq_idx=bad_sequence,
         )
 
     @parameterized.product(

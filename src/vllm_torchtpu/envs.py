@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     ENABLE_QUANTIZED_MATMUL_KERNEL: bool = False
     REQUANTIZE_BLOCK_SIZE: int | None = None
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
+    TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
@@ -432,15 +433,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # lane-padded tiles cost a broadcast init, a relayout copy and padded
     # copies through the LSE merge. Bit-identical outputs.
     "TPU_MLA_SPARSE_SPLIT_Q": env_bool("TPU_MLA_SPARSE_SPLIT_Q", default=False),
-    # QK pair-blocked pooled GDN conv layout: full-width states interleave
-    # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
-    # to one whole destination pool token (2 contiguous transfer spans per
-    # rank per state group).  Identity for head-shard states.  Must match
-    # across a disagg pair; the value rides the raiden layout fingerprint.
-    # Resolution is layered (see env_override.py): an explicitly set
-    # value always wins; otherwise raiden runs derive it from
-    # TPU_RAIDEN_TRANSFER_PARALLELISM (enabled iff >= 8, and 8 is that
-    # variable's default — so it is on by default under raiden).
+    # QK pair-blocked GDN conv layout for Raiden transfers.  Not supported
+    # with the unified GDN state pool: its kernel reads segment-major
+    # [Q | K | V] conv rows, so the pool manifest rejects this flag.  Must
+    # match across a disagg pair; the value rides the raiden layout
+    # fingerprint.
     "TPU_GDN_CONV_QK_PAIR_LAYOUT": env_bool(
         "TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False
     ),
@@ -512,6 +509,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Runtime dtype for dense linear weight requantization.
     "REQUANTIZE_WEIGHT_DTYPE": lambda: os.getenv(
         "REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"
+    ),
+    # Opt-in W8A16 for small FP8 dense-linear steps. A step whose padded token
+    # bucket (from compile_sizes, not the number of live requests) has at most
+    # this many rows keeps bf16 activations against the FP8 weights instead of
+    # quantizing them per call: small decode steps are weight-bandwidth bound,
+    # so the per-call quantization (an abs-max reduction and a cast) costs
+    # more than FP8 activations save. Measured on v7x only. Applies only to
+    # the per-channel path with FP8 weights; the blockwise kernel path
+    # (ENABLE_QUANTIZED_MATMUL_KERNEL=1) and int8 weights always quantize.
+    # With compile_sizes [256] and a threshold below 256, no bucket qualifies.
+    # 0 (default) keeps W8A8 everywhere.
+    "TPU_FP8_LINEAR_W8A16_MAX_ROWS": env_nonnegative_int(
+        "TPU_FP8_LINEAR_W8A16_MAX_ROWS", 0
     ),
     # Specify dtype for quantized MoE weights
     "MOE_REQUANTIZE_WEIGHT_DTYPE": lambda: os.getenv(

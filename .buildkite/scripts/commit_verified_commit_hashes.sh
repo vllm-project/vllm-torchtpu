@@ -17,6 +17,7 @@ set -e
 
 # --- Configuration ---
 TARGET_BRANCH="main"
+CSV_FILE="support_matrices/verified_commit_hashes.csv"
 
 # The commit only appends a row to a CSV; without [skip ci] it starts a full
 # post-merge build of main.
@@ -43,12 +44,13 @@ if [ -z "${BUILDKITE_COMMIT:-}" ]; then
     exit 1
 fi
 
-if [ ! -f verified_commit_hashes.csv ]; then
-    echo "timestamp,vllm_commit_hash,vllm_torchtpu_commit_hash" > verified_commit_hashes.csv
+mkdir -p "$(dirname "${CSV_FILE}")"
+if [ ! -f "${CSV_FILE}" ]; then
+    echo "timestamp,vllm_commit_hash,vllm_torchtpu_commit_hash" > "${CSV_FILE}"
 fi
-echo "$(date '+%Y-%m-%d %H:%M:%S'),${VLLM_COMMIT_HASH},${BUILDKITE_COMMIT}" >> verified_commit_hashes.csv
+echo "$(date '+%Y-%m-%d %H:%M:%S'),${VLLM_COMMIT_HASH},${BUILDKITE_COMMIT}" >> "${CSV_FILE}"
 
-git add verified_commit_hashes.csv
+git add "${CSV_FILE}"
 
 # --- Check for changes before committing ---
 if git diff --quiet --cached; then

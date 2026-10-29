@@ -1873,6 +1873,12 @@ def _patch_vllm_block_pool_lifo_free() -> None:
     logger.info("Applied LIFO free-block patch (pre-vllm#48017 order) to BlockPool")
 
 
+def _patch_vllm_abort_on_preemption() -> None:
+    from vllm_torchtpu.core.abort_on_preemption import patch_scheduler_init
+
+    patch_scheduler_init()
+
+
 def _patch_vllm_same_step_prefix_hits() -> None:
     """Keep prefix-cache hits off blocks the current step has not written.
 

@@ -50,6 +50,9 @@ from vllm_torchtpu.layers.adapter.attention import (
     PallasBatchedRPAAttentionBackend,
     PallasMLAttentionBackend,
 )
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
+    RunLocalStateSpec,
+)
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilder
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner.kv_cache_dsv4 import DsV4KVCacheAllocator
@@ -270,6 +273,34 @@ class TestKVCacheManager:
         mock_mem_info.assert_called_once()
         assert self.runner._mamba_num_blocks == 17
         assert self.runner.cache_config.num_gpu_blocks_override == 2358467
+
+    @patch(
+        "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",
+        return_value=67584,
+    )
+    @patch(
+        "vllm_torchtpu.utils.torch.accelerator.get_memory_info",
+        return_value=(10 * 1024 * 1024 * 1024, 10 * 1024 * 1024 * 1024),
+    )
+    def test_update_mamba_page_size_padded_uses_updated_cache_config_block_size(
+        self, mock_mem_info, mock_get_page_size
+    ):
+        # Simulate update_block_size_for_backend raising cache_config.block_size
+        # after TPUModelRunner.__init__ captured self.runner.block_size = 16.
+        self.runner.block_size = 16
+        self.runner.vllm_config.cache_config.block_size = 264
+
+        layers = {}
+        mock_attn = _attention_layer_mock()
+        mock_attn.num_kv_heads = 2
+        mock_attn.head_size = 128
+        layers["attn_0"] = mock_attn
+        for i in range(3):
+            layers[f"mamba_{i}"] = DummyMamba()
+
+        self.runner.kv_cache_manager._update_mamba_page_size_padded(layers)
+
+        mock_get_page_size.assert_called_once_with(264, 2, 128, torch.bfloat16)
 
     def test_available_kv_cache_hbm_is_min_across_ep_dp(self, monkeypatch):
         """Pinned block counts must be sized from the DP-wide minimum budget."""
@@ -1624,6 +1655,65 @@ def test_dsv4_layer_classification():
             SimpleNamespace(kv_cache_groups=groups + [stray]),
             {**specs, "m.layers.0.mystery": swa()}.__getitem__,
         )
+
+
+def test_dsv4_classification_refuses_a_group_mixing_run_local_state():
+    """vLLM can group the run-local HCA state with a cacheable SWA cache of the
+    same window and block size; the group would then be cached wrongly."""
+    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+
+    def window(cls):
+        return cls(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=640,
+            dtype=torch.uint8,
+            sliding_window=128,
+            alignment=None,
+        )
+
+    specs = {
+        "m.layers.0.attn": MLAAttentionSpec(
+            block_size=1024,
+            num_kv_heads=1,
+            head_size=640,
+            dtype=torch.uint8,
+            tokens_per_state=4,
+            alignment=None,
+        ),
+        "m.layers.1.attn.compressor.state_cache": window(RunLocalStateSpec),
+        "m.layers.0.attn.swa_cache": window(SlidingWindowMLASpec),
+    }
+    runner = MagicMock()
+    runner.shared_kv_cache_layers = {}
+    mla = SimpleNamespace(layer_names=["m.layers.0.attn"])
+    mixed = SimpleNamespace(
+        layer_names=[
+            "m.layers.0.attn.swa_cache",
+            "m.layers.1.attn.compressor.state_cache",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="mixes RunLocalStateSpec layers"):
+        DsV4KVCacheAllocator(runner)._classify_ds_v4_layers(
+            SimpleNamespace(kv_cache_groups=[mla, mixed]), specs.__getitem__
+        )
+
+    separate = [mla] + [SimpleNamespace(layer_names=[n]) for n in mixed.layer_names]
+    _, swa_groups, state_names = DsV4KVCacheAllocator(runner)._classify_ds_v4_layers(
+        SimpleNamespace(kv_cache_groups=separate), specs.__getitem__
+    )
+    assert swa_groups == [["m.layers.0.attn.swa_cache"]]
+    assert state_names == ["m.layers.1.attn.compressor.state_cache"]
+
+    # A shared layer has no spec of its own, so the check must skip it too.
+    shared = "m.layers.2.attn.compressor.state_cache"
+    runner.shared_kv_cache_layers = {shared: "m.layers.1.attn.compressor.state_cache"}
+    separate[-1].layer_names.append(shared)
+    _, _, state_names = DsV4KVCacheAllocator(runner)._classify_ds_v4_layers(
+        SimpleNamespace(kv_cache_groups=separate), specs.__getitem__
+    )
+    assert state_names == ["m.layers.1.attn.compressor.state_cache"]
 
 
 def test_dsv4_swa_overlay_shares_hosts_across_groups():

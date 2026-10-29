@@ -114,6 +114,8 @@ def _make_self(
         device="cpu",
         mamba_slot_read_offsets=read_offsets,
         _pending_mamba_state_copies=[],
+        _unfenced_h2d_sources=[],
+        _registered_h2d_sources=set(),
         input_batch=input_batch,
     )
     # Padding/expansion/source-selection helpers the collector calls on

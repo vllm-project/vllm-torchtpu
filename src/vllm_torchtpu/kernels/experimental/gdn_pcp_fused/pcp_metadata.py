@@ -11,6 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# Forked from vllm_torchtpu/kernels/gdn/v3/pcp_metadata.py.
+# Upstream V3 changes ported by hand through #1422.
+# This copy is owned by the PCP workstream and must not import from
+# kernels/gdn/v3. Upstream V3 changes are not picked up automatically;
+# see README.md in this directory.
 """Runtime metadata for ragged PCP GDN communication stages.
 
 The arrays returned here have compile-time capacities, but their active
@@ -26,7 +32,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from vllm_torchtpu.kernels.gdn.v3 import config, memory_ref
+from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import config, memory_ref
 
 
 @jax.tree_util.register_dataclass
