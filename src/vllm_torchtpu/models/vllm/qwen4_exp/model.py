@@ -83,6 +83,25 @@ def moe_weights_mapper():
     )
 
 
+def verify_shared_expert_replica(mlp, tp, label):
+    """The replicated shared expert holds exactly this rank's TP slices at their offsets
+    (QWEN4_EXP_PREFILL_SP_SHARED_LOCAL): both load the same checkpoint tensors."""
+    rank, size = tp.rank_in_group, tp.world_size
+    sliced, full = mlp.shared_expert, mlp.shared_expert_local
+    gate_up, full_gate_up = sliced.gate_up_proj.weight, full.gate_up_proj.weight
+    half, full_half = gate_up.shape[0] // 2, full_gate_up.shape[0] // 2
+    pieces = [
+        (gate_up[:half], full_gate_up[:full_half].narrow(0, rank * half, half)),
+        (gate_up[half:], full_gate_up[full_half:].narrow(0, rank * half, half)),
+    ]
+    down, full_down = sliced.down_proj.weight, full.down_proj.weight
+    pieces.append((down, full_down.narrow(1, rank * down.shape[1], down.shape[1])))
+    if full_half != half * size or full_down.shape[1] != down.shape[1] * size:
+        raise ValueError(f"{label}: shared-expert replica is not the unsliced shape")
+    if not all(bool(torch.equal(a, b)) for a, b in pieces):
+        raise ValueError(f"{label}: shared-expert replica differs from its TP slices")
+
+
 def verify_moe_checkpoint(mlp, prefix, source, moe_mapper, label):
     """Every locally owned routed expert and each shared-expert shard loaded.
 
@@ -1198,6 +1217,8 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             verify_moe_checkpoint(
                 layer.mlp, f"model.layers.{i}.mlp.", source, moe_mapper, f"layer{i}"
             )
+            if hasattr(layer.mlp, "shared_expert_local"):
+                verify_shared_expert_replica(layer.mlp, get_tp_group(), f"layer{i}")
             if layer.ple is not None:
                 layer.ple.finalize_weights()
             if layer.layer_type == "full_attention":
