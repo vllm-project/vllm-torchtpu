@@ -476,6 +476,24 @@ def _qnorm_rope_body(
     out_ref[...] = jnp.concatenate([y[..., :-LANE], roped], axis=-1).astype(out_dtype)
 
 
+def cos_sin_lanes(
+    cos_sin: jax.Array, *, inverse: bool = False
+) -> tuple[jax.Array, jax.Array]:
+    """`_cos_sin_lanes` of ``[cos | sin]`` rows as wide as the rotary dim."""
+    return _cos_sin_lanes(cos_sin, rotary_dim=cos_sin.shape[-1], inverse=inverse)
+
+
+def qnorm_rope_head(
+    x: jax.Array, cos: jax.Array, sin: jax.Array, *, eps: float
+) -> jax.Array:
+    """`_qnorm_rope_body`'s f32 math on ``(tokens, head_dim)`` rows of one head."""
+    rms = jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + eps)
+    y = x * rms
+    tail = y[..., -LANE:]
+    roped = tail * cos + _rotate_gptj(tail) * sin
+    return jnp.concatenate([y[..., :-LANE], roped], axis=-1)
+
+
 def _qnorm_rope_kernel(
     # scalar prefetch
     positions_ref: jax.Ref,
