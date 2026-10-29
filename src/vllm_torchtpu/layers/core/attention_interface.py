@@ -31,6 +31,7 @@ from jax.sharding import PartitionSpec as P
 
 import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched
 import vllm_torchtpu.kernels.mla.sparse.kernel as sparse_mla_kernel
+import vllm_torchtpu.kernels.mla.v2.dcp as mla_v2_dcp
 import vllm_torchtpu.kernels.mla.v2.kernel as mla_v2_kernel
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel as rpa_default
 import vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
@@ -675,6 +676,70 @@ def attention(
     return kv_cache, output
 
 
+def _mla_v2_tiles(
+    q: jax.Array,
+    q_rope: jax.Array,
+    cache: jax.Array,
+    *,
+    max_num_seqs: int,
+    pages_per_seq: int,
+    decode_heads: int,
+    decode_lkv_dim: int,
+) -> dict[str, Any]:
+    """Tuned MLA v2 kernel tiles for a `(T, N, *)` query over `cache`."""
+    max_num_tokens = q.shape[0]
+    actual_r_dim = q_rope.shape[2]
+    kv_dtype_str = (
+        "float8_e4m3fn"
+        if any(x in str(cache.dtype).lower() for x in ("fp8", "e4m3"))
+        else "bfloat16"
+    )
+    decode_tuned = get_tuned_params(
+        TuningKey(
+            case="batched_decode",
+            max_num_tokens=max_num_tokens,
+            actual_num_q_heads=decode_heads,
+            actual_lkv_dim=decode_lkv_dim,
+            actual_r_dim=actual_r_dim,
+            kv_dtype=kv_dtype_str,
+        )
+    )
+    _, page_size_per_kv_packing, kv_packing, _ = cache.shape
+    mixed_tuned = get_tuned_params(
+        TuningKey(
+            case="mixed",
+            max_num_tokens=max_num_tokens,
+            actual_num_q_heads=q.shape[1],
+            actual_lkv_dim=q.shape[-1],
+            actual_r_dim=actual_r_dim,
+            q_dtype=jnp.dtype(q.dtype).name,
+            kv_dtype=kv_dtype_str,
+            page_size_per_kv_packing=page_size_per_kv_packing,
+            kv_packing=kv_packing,
+            max_num_seqs=max_num_seqs,
+            pages_per_seq=pages_per_seq,
+        )
+    )
+    # Explicit (decode, prefill, mixed) tuples.
+    return dict(
+        num_kv_pages_per_block=(
+            decode_tuned.num_kv_pages_per_block,
+            1,
+            envs.MIXED_NUM_KV_PAGES_PER_BLOCK or mixed_tuned.num_kv_pages_per_block,
+        ),
+        num_queries_per_block=(
+            decode_tuned.num_queries_per_block,
+            16,
+            envs.MIXED_NUM_QUERIES_PER_BLOCK or mixed_tuned.num_queries_per_block,
+        ),
+        vmem_limit_bytes=min(
+            decode_tuned.vmem_limit_bytes, mixed_tuned.vmem_limit_bytes
+        ),
+        decode_batch_size=decode_tuned.decode_batch_size,
+        mixed_q_split=envs.MIXED_Q_SPLIT or mixed_tuned.q_split,
+    )
+
+
 def mla_attention(
     q_TNA: jax.Array,
     q_rope_TNH: jax.Array,
@@ -754,51 +819,14 @@ def mla_attention(
         query_start_loc,
         request_distribution,
     ):
-        max_num_tokens = q.shape[0]  # q is in token-major sequence format (T, N, A)
-        actual_r_dim = q_rope.shape[2]
-        kv_dtype_str = (
-            "float8_e4m3fn"
-            if any(x in str(cache.dtype).lower() for x in ("fp8", "e4m3"))
-            else "bfloat16"
-        )
-
-        decode_key = TuningKey(
-            case="batched_decode",
-            max_num_tokens=max_num_tokens,
-            actual_num_q_heads=num_attention_heads,
-            actual_lkv_dim=qk_nope_head_dim,
-            actual_r_dim=actual_r_dim,
-            kv_dtype=kv_dtype_str,
-        )
-        decode_tuned = get_tuned_params(decode_key)
-
-        _, page_size_per_kv_packing, kv_packing, _ = cache.shape
-        max_num_seqs = seq_lens.shape[0]
-        mixed_key = TuningKey(
-            case="mixed",
-            max_num_tokens=max_num_tokens,
-            actual_num_q_heads=q.shape[1],
-            actual_lkv_dim=q.shape[-1],
-            actual_r_dim=actual_r_dim,
-            q_dtype=jnp.dtype(q.dtype).name,
-            kv_dtype=kv_dtype_str,
-            page_size_per_kv_packing=page_size_per_kv_packing,
-            kv_packing=kv_packing,
-            max_num_seqs=max_num_seqs,
-            pages_per_seq=block_tables.shape[0] // max_num_seqs,
-        )
-        mixed_tuned = get_tuned_params(mixed_key)
-
-        # Pass explicit block ratio tuples for (decode, prefill, mixed) stages
-        num_kv_pages_per_blocks = (
-            decode_tuned.num_kv_pages_per_block,
-            1,
-            envs.MIXED_NUM_KV_PAGES_PER_BLOCK or mixed_tuned.num_kv_pages_per_block,
-        )
-        num_queries_per_blocks = (
-            decode_tuned.num_queries_per_block,
-            16,
-            envs.MIXED_NUM_QUERIES_PER_BLOCK or mixed_tuned.num_queries_per_block,
+        tiles = _mla_v2_tiles(
+            q,
+            q_rope,
+            cache,
+            max_num_seqs=seq_lens.shape[0],
+            pages_per_seq=block_tables.shape[0] // seq_lens.shape[0],
+            decode_heads=num_attention_heads,
+            decode_lkv_dim=qk_nope_head_dim,
         )
 
         # tpu-inference MLA kernel expects ql_nope directly in head-major
@@ -816,13 +844,7 @@ def mla_attention(
             query_start_loc,
             request_distribution,
             sm_scale=sm_scale or 1.0,
-            num_kv_pages_per_block=num_kv_pages_per_blocks,
-            num_queries_per_block=num_queries_per_blocks,
-            vmem_limit_bytes=min(
-                decode_tuned.vmem_limit_bytes, mixed_tuned.vmem_limit_bytes
-            ),
-            decode_batch_size=decode_tuned.decode_batch_size,
-            mixed_q_split=envs.MIXED_Q_SPLIT or mixed_tuned.q_split,
+            **tiles,
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
@@ -862,6 +884,216 @@ def mla_attention(
     if return_lse:
         return kv_cache, output_TNA, results[2]
     return kv_cache, output_TNA
+
+
+def mla_attention_dcp_decode(
+    q_TNA: jax.Array,
+    q_rope_TNH: jax.Array,
+    k_SA: jax.Array,
+    k_rope_SH: jax.Array,
+    kv_cache: jax.Array,
+    md: AttentionMetadata,
+    mesh: Mesh,
+    *,
+    dcp_size: int,
+    interleave_size: int,
+    sm_scale: float | None = None,
+    q_scale: float | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+    dcp_axis_name: str = streamindex_topk.DCP_AXIS_NAME,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Dense MLA over a DCP position-sharded latent cache: store and decode.
+
+    Every rank stores the step's tokens it owns, then attends the DCP group's
+    heads of the leading `D = q_TNA.shape[0]` tokens over its own shard (see
+    `kernels/mla/v2/dcp.py`). Only the 1-token sequences, which the runner
+    puts first, are attended; rows of other tokens are garbage.
+
+    Args:
+      q_TNA, q_rope_TNH: `[D, group_heads, *]`, identical on the group's ranks.
+      k_SA, k_rope_SH: `[T, *]` latents of every token of the step.
+      kv_cache: this rank's shard, sharded over `dcp_axis_name`.
+      md: global sequence metadata, replicated.
+
+    Returns:
+      `(kv_cache, out, lse)`: `out` `[dcp_size * D, group_heads, lkv]` and
+      `lse` `[dcp_size * D, group_heads]` are per-rank partials sharded over
+      `dcp_axis_name`, `(0, -inf)` where a rank holds nothing of a sequence;
+      merge them by log-sum-exp.
+    """
+    in_specs = (
+        P(),  # q_TNA
+        P(),  # q_rope_TNH
+        P(),  # k_SA
+        P(),  # k_rope_SH
+        P(dcp_axis_name),  # kv_cache
+        P(),  # seq_lens
+        P(),  # block_tables
+        P(),  # query_start_loc
+        P(),  # request_distribution
+    )
+    out_specs = (P(dcp_axis_name), P(dcp_axis_name), P(dcp_axis_name))
+
+    def _local(q, q_rope, k, k_rope, cache, seq_lens, block_tables, qsl, dist):
+        rank = streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size)
+        block_tables = jnp.mod(block_tables, jnp.int32(cache.shape[0]))
+        cache = mla_v2_dcp.update_kv_cache_dcp(
+            cache,
+            k,
+            k_rope,
+            seq_lens,
+            block_tables,
+            qsl,
+            rank,
+            dcp_size=dcp_size,
+            interleave_size=interleave_size,
+        )
+        tiles = _mla_v2_tiles(
+            q,
+            q_rope,
+            cache,
+            max_num_seqs=seq_lens.shape[0],
+            pages_per_seq=block_tables.shape[0] // seq_lens.shape[0],
+            decode_heads=q.shape[1],
+            decode_lkv_dim=q.shape[-1],
+        )
+        num_tokens = q.shape[0]
+        out, cache, lse = mla_v2_dcp.mla_decode_dcp_local(
+            q.transpose((1, 0, 2)),
+            q_rope,
+            k[:num_tokens],
+            k_rope[:num_tokens],
+            cache,
+            seq_lens,
+            block_tables,
+            qsl,
+            jnp.stack([dist[0]] * 3),
+            rank,
+            dcp_size=dcp_size,
+            interleave_size=interleave_size,
+            sm_scale=sm_scale or 1.0,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            **tiles,
+        )
+        return cache, out.transpose((1, 0, 2)), lse
+
+    return jax.jit(
+        shard_map.shard_map(
+            _local, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_rep=False
+        )
+    )(
+        q_TNA,
+        q_rope_TNH,
+        k_SA,
+        k_rope_SH,
+        kv_cache,
+        md.seq_lens,
+        md.block_tables,
+        md.query_start_loc,
+        md.request_distribution,
+    )
+
+
+def mla_attention_dcp_prefill(
+    q_TNA: jax.Array,
+    q_rope_TNH: jax.Array,
+    k_SA: jax.Array,
+    k_rope_SH: jax.Array,
+    kv_cache: jax.Array,
+    md: AttentionMetadata,
+    mesh: Mesh,
+    *,
+    dcp_size: int,
+    max_model_len: int,
+    sm_scale: float | None = None,
+    q_scale: float | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+    dcp_axis_name: str = streamindex_topk.DCP_AXIS_NAME,
+) -> jax.Array:
+    """Dense MLA of the step's prefill tokens over a DCP-sharded latent cache.
+
+    Each rank attends its own heads over the whole context, all-gathered from
+    the group (see `mla_v2_dcp.mla_prefill_dcp_local`); needs
+    `interleave_size == page_size`. The cache is only read: store the step's
+    tokens with `mla_attention_dcp_decode` first.
+
+    Args:
+      q_TNA, q_rope_TNH: `[T, heads, *]` this rank's own heads, sharded over
+        `dcp_axis_name` (global leading dimension `dcp_size * T`).
+      k_SA, k_rope_SH: `[T, *]` latents, replicated.
+
+    Returns:
+      `[dcp_size * T, heads, lkv]` sharded like `q_TNA`; rows of 1-token
+      sequences are garbage.
+    """
+    in_specs = (
+        P(dcp_axis_name),  # q_TNA, own heads
+        P(dcp_axis_name),  # q_rope_TNH
+        P(),  # k_SA
+        P(),  # k_rope_SH
+        P(dcp_axis_name),  # kv_cache
+        P(),  # seq_lens
+        P(),  # block_tables
+        P(),  # query_start_loc
+        P(),  # request_distribution
+    )
+
+    def _local(q, q_rope, k, k_rope, cache, seq_lens, block_tables, qsl, dist):
+        block_tables = jnp.mod(block_tables, jnp.int32(cache.shape[0]))
+        page_size = cache.shape[1] * cache.shape[2]
+        tiles = _mla_v2_tiles(
+            q,
+            q_rope,
+            cache,
+            max_num_seqs=seq_lens.shape[0],
+            pages_per_seq=-(-max_model_len // page_size),
+            decode_heads=q.shape[1],
+            decode_lkv_dim=q.shape[-1],
+        )
+        out = mla_v2_dcp.mla_prefill_dcp_local(
+            q.transpose((1, 0, 2)),
+            q_rope,
+            k,
+            k_rope,
+            cache,
+            seq_lens,
+            block_tables,
+            qsl,
+            dist,
+            dcp_size=dcp_size,
+            axis_name=dcp_axis_name,
+            max_model_len=max_model_len,
+            sm_scale=sm_scale or 1.0,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            **tiles,
+        )
+        return out.transpose((1, 0, 2))
+
+    return jax.jit(
+        shard_map.shard_map(
+            _local,
+            mesh=mesh,
+            in_specs=in_specs,
+            out_specs=P(dcp_axis_name),
+            check_rep=False,
+        )
+    )(
+        q_TNA,
+        q_rope_TNH,
+        k_SA,
+        k_rope_SH,
+        kv_cache,
+        md.seq_lens,
+        md.block_tables,
+        md.query_start_loc,
+        md.request_distribution,
+    )
 
 
 def sparse_mla_attention(
