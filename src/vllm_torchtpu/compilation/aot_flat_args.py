@@ -105,23 +105,41 @@ def _context_paths() -> dict[int, list[tuple]]:
 
 
 def _module_tensor_names(module: Any) -> dict[int, list[str]]:
-    """Every tensor attribute under a module tree (buffers, plain tensor
-    attributes, tensors in list/tuple/dict attributes), by id."""
+    """Every non-parameter tensor reachable from a module's attributes, by id:
+    buffers, plain tensor attributes, tensors in list/tuple/dict attributes,
+    and through unregistered module or plain-object attributes (e.g. a
+    wrapper holding its backbone with object.__setattr__)."""
     names: dict[int, list[str]] = {}
     if not isinstance(module, torch.nn.Module):
         return names
-    for prefix, mod in module.named_modules(remove_duplicate=False):
-        for key, val in vars(mod).items():
-            if key in ("_parameters", "_modules"):
-                continue
-            items = val.items() if isinstance(val, dict) else (
-                enumerate(val) if isinstance(val, (list, tuple)) else [(None, val)])
-            for sub, t in items:
-                if isinstance(t, torch.Tensor) and not isinstance(t, torch.nn.Parameter):
-                    name = f"{prefix}.{key}" if prefix else key
-                    if key == "_buffers" or sub is not None:
-                        name = f"{name}[{sub}]"
-                    names.setdefault(id(t), []).append(name)
+    stack: list[tuple[Any, str, int]] = [(module, "", 0)]
+    visited: set[int] = set()
+    while stack and len(visited) < _CTX_WALK_NODES:
+        obj, name, depth = stack.pop()
+        if isinstance(obj, torch.Tensor):
+            if not isinstance(obj, torch.nn.Parameter):
+                names.setdefault(id(obj), []).append(name)
+            continue
+        if id(obj) in visited or depth > 12:
+            continue
+        visited.add(id(obj))
+        join = (lambda k: f"{name}.{k}" if name else str(k))
+        if isinstance(obj, dict):
+            stack.extend((v, f"{name}[{k}]", depth + 1) for k, v in obj.items())
+        elif isinstance(obj, (list, tuple)):
+            stack.extend((v, f"{name}[{i}]", depth + 1) for i, v in enumerate(obj))
+        elif isinstance(obj, torch.nn.Module):
+            for k, v in vars(obj).items():
+                if k == "_parameters":
+                    continue
+                if k in ("_buffers", "_modules"):
+                    stack.extend((b, join(bk), depth + 1) for bk, b in v.items())
+                else:
+                    stack.append((v, join(k), depth + 1))
+        elif hasattr(obj, "__dict__") and not callable(obj) and not isinstance(
+            obj, type
+        ):
+            stack.extend((v, join(k), depth + 1) for k, v in vars(obj).items())
     return names
 
 
@@ -138,6 +156,8 @@ def _log_constants(label: str, module: Any, template: list[Any]) -> None:
         found = names.get(id(t))
         if not found:
             unnamed += 1
+            key = f"<unnamed> {list(t.shape)} {str(t.dtype).replace('torch.', '')}"
+            groups[key] = groups.get(key, 0) + 1
             continue
         pattern = re.sub(r"\.\d+\.", ".*.", found[0])
         pattern = re.sub(r"\[\d+\]", "[*]", pattern)
