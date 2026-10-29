@@ -137,6 +137,8 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_ADAPTIVE_2D_CHANNEL_SCALES: bool = False
     MOE_ADAPTIVE_AG_LEAD_AXIS: bool = False
+    MOE_ADAPTIVE_EARLY_PRIME: bool = False
+    MOE_ADAPTIVE_ISSUE_HOIST: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -1110,6 +1112,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of gathering in {2,0,1} and relayouting the whole [T, H/128,
     # 128] block (~140 us per layer at 8K tokens on tpu7x).
     "MOE_ADAPTIVE_AG_LEAD_AXIS": env_bool("MOE_ADAPTIVE_AG_LEAD_AXIS"),
+    # Adaptive fused MoE kernel: issue the next visited expert's first tile of
+    # token rows between the last tile's two matmuls instead of after its
+    # commit and push, so the rows land under mm2 and the epilogue (measured:
+    # that first-tile wait was ~29 us per call at 8K tokens). Exact.
+    "MOE_ADAPTIVE_EARLY_PRIME": env_bool("MOE_ADAPTIVE_EARLY_PRIME"),
+    # Adaptive fused MoE kernel: load a group of token-row numbers before
+    # starting their DMAs, instead of one scalar load + address chain per DMA
+    # start (measured ~25 us/call of scalar dependency stalls at 8K). Exact.
+    "MOE_ADAPTIVE_ISSUE_HOIST": env_bool("MOE_ADAPTIVE_ISSUE_HOIST"),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its
     # live rows, so one is the ladder off. Zero leaves the choice to the
