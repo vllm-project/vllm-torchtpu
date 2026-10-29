@@ -147,11 +147,32 @@ class GatedResidual(common_hc.GatedResidual):
         self._decode_mix_op = None
         self._decode_combine_mix_op = None
 
+    def prepare_decode_weights(self):
+        """After weight loading: with the fused decode HC, keep ``up``
+        transposed ([r, hc*H], lane-dense for the kernel's weight fetch).
+
+        Every path then reads this one buffer where it read ``up`` (the
+        unfused and prefill paths through its transpose), so all token
+        buckets take the same inputs in the same order (the shape-variant
+        hand-over refuses a bucket whose inputs moved). The checkpoint
+        parameter stays as loaded for other readers (the megakernel).
+        """
+        if not (envs.TPU_QWEN4_HC_DECODE_FUSED and hasattr(self, "input_mix_weight_up")):
+            return
+        up = self.input_mix_weight_up.weight.detach()
+        self.register_buffer("_up_t", up.t().contiguous(), persistent=False)
+
+    def _up_weight(self):
+        """``up`` as [hc*H, r] (a transposed view of ``_up_t`` when kept)."""
+        up_t = getattr(self, "_up_t", None)
+        return self.input_mix_weight_up.weight if up_t is None else up_t.t()
+
     def _decode_weights(self):
+        up_t = getattr(self, "_up_t", None)
         weights = (
             self.hc_norm.weight,
             self.input_mix_weight_down.weight,
-            self.input_mix_weight_up.weight,
+            self.input_mix_weight_up.weight if up_t is None else up_t,
         )
         if hasattr(self, "block_inject_weight"):
             weights += (self.block_inject_weight.weight,)
@@ -162,6 +183,7 @@ class GatedResidual(common_hc.GatedResidual):
         return (
             self._decode_mix_op is not None
             and hyper_input.dim() == 2
+            and hyper_input.shape[0] >= envs.TPU_QWEN4_HC_DECODE_MIN_ROWS
             and decode_token_tile(hyper_input.shape[0]) is not None
             and hyper_input.dtype == torch.bfloat16
             and all(w.dtype == torch.bfloat16 for w in self._decode_weights())
@@ -209,7 +231,7 @@ class GatedResidual(common_hc.GatedResidual):
                 hyper_input,
                 self.hc_norm.weight,
                 self.input_mix_weight_down.weight,
-                self.input_mix_weight_up.weight,
+                self._up_weight(),
             )
             return mixed, self._residual(hyper_input, norm)
         norm = self._normalize(hyper_input)
@@ -226,9 +248,9 @@ class GatedResidual(common_hc.GatedResidual):
             and norm.dtype == torch.bfloat16
             and self.input_mix_weight_up.weight.dtype == torch.bfloat16
         ):
-            mixed = self._prefill_up_op(gate, norm, self.input_mix_weight_up.weight)
+            mixed = self._prefill_up_op(gate, norm, self._up_weight())
             return mixed, self._residual(hyper_input, norm)
-        gate = F.linear(gate, self.input_mix_weight_up.weight)
+        gate = F.linear(gate, self._up_weight())
         gate = torch.sigmoid(gate.float()).unflatten(
             -1, (self.hc_count, self.hidden_size)
         )

@@ -21,6 +21,13 @@ from vllm_torchtpu.models.vllm.qwen4_exp.hyperconnection import (
 BRANCHES, HIDDEN, LOWRANK, EPS = 4, 2560, 320, 1e-6
 
 
+@pytest.fixture(autouse=True)
+def _any_row_count(monkeypatch):
+    """These tests take the fused path at small row counts; the served
+    threshold (TPU_QWEN4_HC_DECODE_MIN_ROWS) has its own test."""
+    monkeypatch.setenv("TPU_QWEN4_HC_DECODE_MIN_ROWS", "1")
+
+
 def _module(seed, hidden=HIDDEN, lowrank=LOWRANK):
     torch.manual_seed(seed)
     module = GatedResidual(
@@ -274,6 +281,50 @@ def _stub_ops(module):
     return module
 
 
+def _stub_ops_up_t(module):
+    """``_stub_ops`` taking ``up`` as the kept [r, hc*H] transpose."""
+
+    def mix_op_t(x, norm, down, up_t, inject):
+        normed = x * (1.0 + norm)
+        mixed = (F.silu(F.linear(normed, down)) @ up_t)[:, : module.hidden_size]
+        return mixed, F.linear(normed, inject).float()
+
+    def combine_mix_op(residual, block, gate, *weights):
+        combined = residual + block.repeat(1, BRANCHES) * gate.repeat_interleave(
+            module.hidden_size, dim=-1
+        ).to(block.dtype)
+        mixed, injection = mix_op_t(combined, *weights)
+        return mixed, injection, combined
+
+    module._decode_mix_op = mix_op_t
+    module._decode_combine_mix_op = combine_mix_op
+    return module
+
+
+def _inputs_by_first_use(module, *args):
+    """``parameters_by_first_use`` counting buffers too (the kept ``_up_t``)."""
+    names = []
+
+    def backend(gm, example_inputs):
+        position = {node: index for index, node in enumerate(gm.graph.nodes)}
+        inputs = [
+            node
+            for node in gm.graph.nodes
+            if node.op == "placeholder"
+            and ("_parameters_" in node.name or "_buffers_" in node.name)
+            and node.users
+        ]
+        inputs.sort(key=lambda node: min(position[user] for user in node.users))
+        names.extend(node.name for node in inputs)
+        return gm
+
+    torch._dynamo.reset()
+    with torch.no_grad():
+        torch.compile(module, backend=backend, fullgraph=True, dynamic=False)(*args)
+    torch._dynamo.reset()
+    return names
+
+
 class _Layer(torch.nn.Module):
     """attn mix -> attention -> combine_mix -> mlp -> combine, as
     Qwen4ExpDecoderLayer runs; the blocks own weights, as attention and MoE do."""
@@ -325,3 +376,65 @@ def test_disable_decode_fused_keeps_the_unfused_mix():
     with torch.no_grad():
         mixed, (residual, injection) = module.mix(hyper)
     assert mixed.shape == (8, 128) and injection.shape == (8, BRANCHES)
+
+
+@pytest.mark.parametrize("tokens", [8, 96])
+def test_decode_mix_transposed_up_matches_torch_path(tokens):
+    """``up`` passed as the kept [r, hc*H] transpose (lane-dense fetch)."""
+    module = _module(300 + tokens)
+    torch.manual_seed(400 + tokens)
+    hyper = torch.randn(tokens, BRANCHES * HIDDEN).to(torch.bfloat16)
+    with torch.no_grad():
+        expected_mixed, residual = module.mix(hyper)
+    weight, down, up, inject = _weights(module)
+    mixed, inj = hc_decode_mix(
+        _jax(hyper),
+        weight,
+        down,
+        up.T,
+        inject,
+        branches=BRANCHES,
+        hidden=HIDDEN,
+        eps=EPS,
+        interpret=pltpu.InterpretParams(),
+    )
+    _check_bf16(mixed, expected_mixed, "mixed")
+    np.testing.assert_allclose(np.asarray(inj), residual[1].numpy(), rtol=2e-2, atol=1e-6)
+
+
+def test_min_rows_gate(monkeypatch):
+    monkeypatch.setenv("TPU_QWEN4_HC_DECODE_MIN_ROWS", "48")
+    module = _stub_ops(_module(5, hidden=128, lowrank=32))
+    assert not module._decode_fused(torch.zeros(8, BRANCHES * 128, dtype=torch.bfloat16))
+    assert module._decode_fused(torch.zeros(48, BRANCHES * 128, dtype=torch.bfloat16))
+
+
+def test_kept_up_transpose_keeps_one_input_order(monkeypatch):
+    """With the kept ``_up_t``, fused and unfused buckets take the same inputs
+    (``_up_t``, never the checkpoint ``up``) in one order, and the unfused
+    path's output does not change."""
+    hidden, lowrank, tokens = 128, 32, 8
+    args = (torch.randn(tokens, BRANCHES * hidden).to(torch.bfloat16),)
+
+    def layer(fused, keep):
+        modules = [_module(seed, hidden=hidden, lowrank=lowrank) for seed in (1, 2)]
+        if keep:
+            monkeypatch.setenv("TPU_QWEN4_HC_DECODE_FUSED", "1")
+            for m in modules:
+                m.prepare_decode_weights()
+            monkeypatch.delenv("TPU_QWEN4_HC_DECODE_FUSED")
+        if fused:
+            modules = [_stub_ops_up_t(m) if keep else _stub_ops(m) for m in modules]
+        return _Layer(*modules)
+
+    fused = _inputs_by_first_use(layer(True, True), *args)
+    unfused = _inputs_by_first_use(layer(False, True), *args)
+    assert fused == unfused
+    assert sum("_up_t" in name for name in fused) == 2
+    assert not any("input_mix_weight_up" in name for name in fused)
+    torch.manual_seed(0)
+    with torch.no_grad():
+        ref = layer(False, False)(*args)
+        torch.manual_seed(0)
+        kept = layer(False, True)(*args)
+    torch.testing.assert_close(kept, ref, rtol=0, atol=0)

@@ -19,6 +19,10 @@ It reproduces the TorchTPU eager path's rounding boundaries (see
 so it only differs from XLA by the matmul accumulation order and the
 transcendental implementations (ulp level).
 
+``up`` may be passed as [hc*H, r] (the checkpoint layout) or transposed as
+[r, hc*H]: the transposed copy streams in lane-dense rows (r = 320 is not a
+multiple of 128 lanes), which shortens the weight fetch.
+
 With ``prologue=True`` the kernel first applies the previous HC's combine,
 h = bf16(f32(residual) + f32(block) * injection[:, b]), writes h (the next
 residual) and mixes it; this fuses attn-combine with mlp-mix.
@@ -55,6 +59,7 @@ def _kernel(
     eps: float,
     prologue: bool,
     inject: bool,
+    up_t: bool,
 ):
     refs = list(refs)
     if prologue:
@@ -77,11 +82,15 @@ def _kernel(
     first = pl.program_id(0) == 0
     w_copy = pltpu.make_async_copy(w_hbm, w_vm, sems.at[0])
     down_copy = pltpu.make_async_copy(down_hbm, down_vm, sems.at[1])
+    def branch_rows(ref, b):
+        # Branch b's slice of up: columns of the transposed copy, else rows.
+        if up_t:
+            return ref.at[:, pl.ds(b * hidden, hidden)]
+        return ref.at[pl.ds(b * hidden, hidden)]
+
     up_copies = [
         pltpu.make_async_copy(
-            up_hbm.at[pl.ds(b * hidden, hidden)],
-            up_vm.at[pl.ds(b * hidden, hidden)],
-            sems.at[2 + b],
+            branch_rows(up_hbm, b), branch_rows(up_vm, b), sems.at[2 + b]
         )
         for b in range(branches)
     ]
@@ -118,12 +127,11 @@ def _kernel(
         wait_first(inj_copy)
 
     def normalize_rows(offset, rows):
-        """Norm (and combine prologue, injection gate) for ``rows`` rows."""
+        """Norm (and the combine prologue) for ``rows`` rows."""
         weight = w_vm[...].astype(jnp.float32)
         if prologue:
             block = block_ref[pl.ds(offset, rows), :].astype(jnp.float32)
             prev_inj = prev_inj_ref[pl.ds(offset, rows), :]
-        inj_terms = [None] * branches
         for b in range(branches):
             start = b * hidden
             if prologue:
@@ -144,24 +152,6 @@ def _kernel(
             norm = normalized * (1.0 + weight[None, start : start + hidden])
             norm = norm.astype(jnp.bfloat16)
             norm_vm[pl.ds(offset, rows), pl.ds(start, hidden)] = norm
-            if inject:
-                # The [T, hc] injection logits on the VPU: BF16 x BF16
-                # products are exact in FP32; only the summation order
-                # differs from the MXU.
-                norm32 = norm.astype(jnp.float32)
-                for j in range(branches):
-                    row = injw_vm[pl.ds(j, 1), pl.ds(start, hidden)]
-                    term = norm32 * row.astype(jnp.float32)
-                    inj_terms[j] = term if inj_terms[j] is None else inj_terms[j] + term
-        if inject:
-            shape = (rows, branches)
-            lanes = jax.lax.broadcasted_iota(jnp.int32, shape, 1)
-            logits = jnp.zeros(shape, jnp.float32)
-            for j in range(branches):
-                column = jnp.sum(inj_terms[j], axis=1, keepdims=True)
-                logits = jnp.where(lanes == j, column, logits)
-            logits = logits.astype(jnp.bfloat16).astype(jnp.float32)
-            inj_ref[pl.ds(offset, rows), :] = 2.0 * jax.nn.sigmoid(logits / branches)
 
     tile = norm_vm.shape[0]
     if tile >= 2 * _ROW_CHUNK and tile % _ROW_CHUNK == 0:
@@ -173,6 +163,18 @@ def _kernel(
         jax.lax.fori_loop(0, tile // _ROW_CHUNK, chunk, jnp.int32(0))
     else:
         normalize_rows(0, tile)
+
+    if inject:
+        # The [T, hc] injection logits on the MXU (BF16 products are exact in
+        # FP32; only the summation order differs from XLA).
+        logits = jax.lax.dot_general(
+            norm_vm[...],
+            injw_vm[...],
+            dimension_numbers=nt,
+            preferred_element_type=jnp.float32,
+        )
+        logits = logits.astype(jnp.bfloat16).astype(jnp.float32)
+        inj_ref[...] = 2.0 * jax.nn.sigmoid(logits / branches)
 
     wait_first(down_copy)
     down_acc = jax.lax.dot_general(
@@ -188,13 +190,21 @@ def _kernel(
     for b in range(branches):
         start = b * hidden
         wait_first(up_copies[b])
-        logits = (
-            jax.lax.dot_general(
+        if up_t:
+            up_logits = jnp.dot(
+                gate,
+                up_vm[:, pl.ds(start, hidden)],
+                preferred_element_type=jnp.float32,
+            )
+        else:
+            up_logits = jax.lax.dot_general(
                 gate,
                 up_vm[pl.ds(start, hidden), :],
                 dimension_numbers=nt,
                 preferred_element_type=jnp.float32,
             )
+        logits = (
+            up_logits
             .astype(jnp.bfloat16)
             .astype(jnp.float32)
         )
@@ -258,6 +268,7 @@ def _hc_decode_mix(
 ):
     tokens, width = x.shape
     lowrank = down.shape[0]
+    up_t = up.shape == (lowrank, width) and lowrank != width
     prologue = block is not None
     inject = inject_weight is not None
     tile = decode_token_tile(tokens)
@@ -267,7 +278,7 @@ def _hc_decode_mix(
         or hidden % 128
         or weight.shape != (width,)
         or down.shape != (lowrank, width)
-        or up.shape != (width, lowrank)
+        or up.shape not in ((width, lowrank), (lowrank, width))
         or (inject and inject_weight.shape != (branches, width))
         or (prologue and block.shape != (tokens, hidden))
         or (prologue and prev_injection.shape != (tokens, branches))
@@ -300,7 +311,7 @@ def _hc_decode_mix(
     scratch = [
         pltpu.VMEM((width,), jnp.bfloat16),
         pltpu.VMEM((lowrank, width), jnp.bfloat16),
-        pltpu.VMEM((width, lowrank), jnp.bfloat16),
+        pltpu.VMEM(up.shape, jnp.bfloat16),
     ]
     if inject:
         scratch.append(pltpu.VMEM((branches, width), jnp.bfloat16))
@@ -318,6 +329,7 @@ def _hc_decode_mix(
             eps=eps,
             prologue=prologue,
             inject=inject,
+            up_t=up_t,
         ),
         grid=(tokens // tile,),
         in_specs=in_specs,

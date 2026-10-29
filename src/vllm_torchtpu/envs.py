@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_QWEN4_HC_DECODE_FUSED: bool = False
+    TPU_QWEN4_HC_DECODE_MIN_ROWS: int = 48
     QWEN4_EXP_PREFILL_SP: bool = False
     QWEN4_EXP_PREFILL_SP_MIN_TOKENS: int = 1024
     QWEN4_EXP_PREFILL_SP_MOE: bool = False
@@ -953,6 +954,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gate, branch mean and the combine's injection gate) at <= 512 tokens as
     # one Pallas call, with the attn combine fused ahead of the mlp mix.
     "TPU_QWEN4_HC_DECODE_FUSED": env_bool("TPU_QWEN4_HC_DECODE_FUSED"),
+    # The fused decode HC call for buckets of at least this many rows (below
+    # it the weight fetch dominates and XLA's chain is as fast: 24 rows 11.0
+    # vs 9.1 us, 48 rows 11.6 vs 13.1, 96 rows 12.8 vs 22.7 per call site).
+    "TPU_QWEN4_HC_DECODE_MIN_ROWS": lambda: int(
+        os.getenv("TPU_QWEN4_HC_DECODE_MIN_ROWS", "48")
+    ),
     # qwen4_exp: shard prefill-sized steps across TP ranks between attention
     # blocks (reduce-scatter instead of all-reduce), so the hyper-connection
     # streams, PLE gate and residual math run on 1/TP of the tokens. Steps
