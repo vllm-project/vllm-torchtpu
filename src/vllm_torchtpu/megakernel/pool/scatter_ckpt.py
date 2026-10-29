@@ -22,7 +22,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ..ops import BF16, FP8, U32
+from ..ops import BF16, F32, FP8, U32
 from .backend import kernel_debug_check
 from .checks import safe_page_base
 from .config import cache_exec
@@ -134,7 +134,7 @@ def prepare_ckpt(
         qkv_128=qkv_128,
         direct_conv=direct_conv,
         conv_tail_row=direct_conv and tail_row,
-        conv_store_dt=layout.conv_dtype,
+        conv_store_dt=F32 if layout.conv_itemsize == 4 else BF16,
         ckpt_is_3d=ckpt_is_3d,
         ckpt_t_off=ckpt_t_off,
         ckpt_ndim=ckpt_indices.ndim if has_gdn else 0,
@@ -214,8 +214,6 @@ def start_scatter_seq(
     direct_conv, conv_tail_row = sg.direct_conv, sg.conv_tail_row
     store_dt = BF16 if sg.conv_store_dt is None else sg.conv_store_dt
     store_isz = jnp.dtype(store_dt).itemsize
-    # `jnp.bfloat16(0.0)` for bf16 (the scalar type is callable).
-    store_zero = store_dt(0.0) if callable(store_dt) else jnp.dtype(store_dt).type(0.0)
 
     @pl.when(is_active(kc, s))
     def _():
@@ -249,7 +247,7 @@ def start_scatter_seq(
                     w4 = jnp.where(
                         w4_row_iota < taps,
                         conv_bf16[1 + t : 2 + taps + t, :],
-                        store_zero,
+                        store_dt(0.0),  # built here: bf16 traces as before
                     )
                     conv_taps = w4.reshape(conv_rows_pad, LANES)
                 else:

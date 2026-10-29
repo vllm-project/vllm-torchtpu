@@ -128,7 +128,9 @@ def test_layout_validate_checks_in_kernel_conv_windows():
 def test_layout_f32_conv_geometry_and_in_kernel_windows():
     """An f32 conv window (the serving framework's pooled conv dtype) keeps the
     slot geometry; its rows are one u32 row each, so a conv page holds 128.
-    Split pool I/O fits; the GPR / fused staging windows don't (fail closed)."""
+    GPR copies the whole conv page for f32 conv (128 page rows) and fused pool
+    I/O stages `rup(taps + T, 8)` f32 rows, so at Qwen3.5 TP8 both fit up to
+    T=5 and fail closed past it."""
     import jax.numpy as jnp
 
     bf16 = replace(_layout(3), kh=16, vh=64)  # Qwen3.5: 12 conv rows per rank at R=8
@@ -141,11 +143,18 @@ def test_layout_f32_conv_geometry_and_in_kernel_windows():
     assert f32.pages_per_slot == bf16.pages_per_slot == 5 and f32.conv_page == 4
     split = with_cache(_exec(R=8, B=8, T=4), paged_kv=True)
     f32.validate(split)
-    assert f32.gpr_conv_rows(4, R=8) == 96 and not f32.gpr_conv_fits(4, R=8)
+    assert (bf16.gpr_conv_row_limit, f32.gpr_conv_row_limit) == (64, 128)
+    assert f32.gpr_conv_rows(4, R=8) == 96 and f32.gpr_conv_fits(4, R=8)
+    assert bf16.gpr_conv_rows(4, R=8) == 48 and bf16.gpr_conv_fits(4, R=8)
+    f32.validate(with_cache(split, pool_gather=True))
+    assert (bf16.fused_conv_rows(4, 8), f32.fused_conv_rows(4, 8)) == (192, 96)
+    f32.validate(with_cache(split, fused_pool_io=True))  # 8 * 12 <= 128
+    wide = with_cache(_exec(R=8, B=8, T=6), paged_kv=True)  # rup(3 + 6, 8) = 16
+    assert f32.gpr_conv_rows(6, R=8) == 192 and not f32.gpr_conv_fits(6, R=8)
     with pytest.raises(MegakernelConfigError, match="in-kernel gather"):
-        f32.validate(with_cache(split, pool_gather=True))
+        f32.validate(with_cache(wide, pool_gather=True))
     with pytest.raises(MegakernelConfigError, match="fused pool I/O"):
-        f32.validate(with_cache(split, fused_pool_io=True))  # 16 * 12 > 128
+        f32.validate(with_cache(wide, fused_pool_io=True))  # 16 * 12 > 128
     with pytest.raises(MegakernelConfigError, match="bf16 or f32"):
         replace(bf16, conv_dtype=jnp.float16).validate()
     with pytest.raises(MegakernelConfigError, match="recurrent checkpoints"):
