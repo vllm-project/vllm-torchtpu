@@ -36,8 +36,11 @@ def gdn_rec(ctx: Any, gp: GDNParams, u: Any, ybuf: Any, slot: Any) -> None:
     QKV, Z, BA, A_OFF = gp.QKV, gp.Z, gp.BA, gp.A_OFF
     l2_eps = gp.l2_eps
     recb, sb = scr["recb"], scr["sbuf"]
+    is_key_decay = gp.decay_type == "key"
+    a_dim = vh * KD if is_key_decay else vh
     alog = ctx.sm(slot, "alog")[0, :vh]
-    dtb = ctx.sm(slot, "dtb")[0, :vh]
+    exp_alog = jnp.exp(alog)[:, None] if is_key_decay else jnp.exp(alog)
+    dtb = ctx.sm(slot, "dtb")[0, :a_dim]
     gnw = ctx.sm(slot, "gnorm")[0, :].astype(BF16)
     expand = vh // kh
 
@@ -63,11 +66,18 @@ def gdn_rec(ctx: Any, gp: GDNParams, u: Any, ybuf: Any, slot: Any) -> None:
         k = k * lax.rsqrt(jnp.sum(k * k, axis=-1, keepdims=True) + l2_eps)
         qc, kc_ = cols(q), cols(k)
         beta = rnd(jax.nn.sigmoid(ybuf[b, BA : BA + vh]))
-        a = ybuf[b, A_OFF : A_OFF + vh]
-        decay = -jnp.exp(alog) * jax.nn.softplus(a + dtb)
-        sb[...] = (
-            recb[src * vh : (src + 1) * vh].astype(F32) * jnp.exp(decay)[:, None, None]
+        a = ybuf[b, A_OFF : A_OFF + a_dim]
+        a_shifted = (a + dtb).reshape(vh, KD) if is_key_decay else (a + dtb)
+        if gp.decay_law == "bounded_sigmoid":
+            decay = -F32(gp.decay_bound) * jax.nn.sigmoid(exp_alog * a_shifted)
+        else:
+            decay = -exp_alog * jax.nn.softplus(a_shifted)
+        eg = (
+            jnp.exp(decay)[:, :, None]
+            if is_key_decay
+            else jnp.exp(decay)[:, None, None]
         )
+        sb[...] = recb[src * vh : (src + 1) * vh].astype(F32) * eg
         pred = jnp.sum(sb[...] * kc_, axis=1)
         delta = (v - pred) * beta[:, None]
         sb[...] = sb[...] + kc_ * delta[:, None, :]
@@ -76,7 +86,8 @@ def gdn_rec(ctx: Any, gp: GDNParams, u: Any, ybuf: Any, slot: Any) -> None:
         val = out * lax.rsqrt(jnp.mean(out * out, axis=-1, keepdims=True) + gp.eps)
         val = (gnw[None, :] * val.astype(BF16)).astype(F32)
         zz = ybuf[b, QKV : QKV + Z].reshape(vh, VD)
-        scr["mix"][b, :Z] = rnd(val * jax.nn.silu(zz)).reshape(Z)
+        gate_val = jax.nn.sigmoid(zz) if gp.gate_type == "sigmoid" else jax.nn.silu(zz)
+        scr["mix"][b, :Z] = rnd(val * gate_val).reshape(Z)
 
 
 def gdn_rec_chunked(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> None:
@@ -95,8 +106,11 @@ def gdn_rec_chunked(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> None:
     l2_eps = gp.l2_eps
     CB, NF, TR, NCH, NRB = gp.CB, gp.NF, gp.TR, gp.NCH, gp.NRB
     recb, sb, ybuf = scr["recb"], scr["sbuf"], scr["ybuf"]
+    is_key_decay = gp.decay_type == "key"
+    a_dim = vh * KD if is_key_decay else vh
     alog = ctx.sm(slot, "alog")[0, :vh]
-    dtb = ctx.sm(slot, "dtb")[0, :vh]
+    exp_alog = jnp.exp(alog)[:, None] if is_key_decay else jnp.exp(alog)
+    dtb = ctx.sm(slot, "dtb")[0, :a_dim]
     gnw = ctx.sm(slot, "gnorm")[0, :].astype(BF16)
     expand = vh // kh
 
@@ -130,15 +144,24 @@ def gdn_rec_chunked(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> None:
             q = q * KD**-0.5
             k = k * lax.rsqrt(jnp.sum(k * k, axis=-1, keepdims=True) + l2_eps)
             beta = rnd(jax.nn.sigmoid(bac[bb, 0:vh]))
-            a = bac[bb, A_REL : A_REL + vh]
-            decay = -jnp.exp(alog) * jax.nn.softplus(a + dtb)
+            a = bac[bb, A_REL : A_REL + a_dim]
+            a_shifted = (a + dtb).reshape(vh, KD) if is_key_decay else (a + dtb)
+            if gp.decay_law == "bounded_sigmoid":
+                decay = -F32(gp.decay_bound) * jax.nn.sigmoid(exp_alog * a_shifted)
+            else:
+                decay = -exp_alog * jax.nn.softplus(a_shifted)
+            eg = (
+                jnp.exp(decay)[:, :, None]
+                if is_key_decay
+                else jnp.exp(decay)[:, None, None]
+            )
             src = (
                 ((n - n // T + bb // T) if bb % T == 0 else bb - 1) * vh if VER else h0
             )
             if not HEAD_MAJOR:
                 # Default recurrence: whole-state update staged in `sb`.
                 qc, kc_ = cols(q), cols(k)
-                sb[...] = st[src : src + vh].astype(F32) * jnp.exp(decay)[:, None, None]
+                sb[...] = st[src : src + vh].astype(F32) * eg
                 pred = jnp.sum(sb[...] * kc_, axis=1)
                 delta = (v - pred) * beta[:, None]
                 sb[...] = sb[...] + kc_ * delta[:, None, :]
@@ -150,7 +173,6 @@ def gdn_rec_chunked(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> None:
                 cb = (bb % NCB) * 2 * kh
                 sb[cb : cb + kh] = colsk(k)
                 sb[cb + kh : cb + 2 * kh] = colsk(q)
-                eg = jnp.exp(decay)[:, None, None]
                 beta2 = beta[:, None]
                 out_acc = jnp.zeros((vh, VD), F32)
                 for h in range(vh):
@@ -167,7 +189,10 @@ def gdn_rec_chunked(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> None:
             val = out * lax.rsqrt(jnp.mean(out * out, axis=-1, keepdims=True) + gp.eps)
             val = (gnw[None, :] * val.astype(BF16)).astype(F32)
             zz = zc[bb].reshape(vh, VD)
-            row = rnd(val * jax.nn.silu(zz)).reshape(1, Z)
+            gate_val = (
+                jax.nn.sigmoid(zz) if gp.gate_type == "sigmoid" else jax.nn.silu(zz)
+            )
+            row = rnd(val * gate_val).reshape(1, Z)
             blk = jnp.where(row_i == bb, row, blk)
         scr["mix"][pl.ds(r0, n_pad), 0:Z] = blk
 
