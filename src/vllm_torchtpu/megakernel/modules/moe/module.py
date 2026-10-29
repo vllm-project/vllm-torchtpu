@@ -35,7 +35,7 @@ from ...decls import (
 from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec
 from ...module import Module
-from ...ops import BF16, F32, FP8, I32, rnd, rup
+from ...ops import BF16, F32, FP8, I32, U8, rnd, rup
 from ...spec import ExtraInput, SmallField, WeightDecl
 from .context import MoEEmit
 from .decls import (
@@ -45,6 +45,7 @@ from .decls import (
     MOE_OPTIONS,
     MOE_PARAM_NAMES,
     moe_hf_params,
+    nvfp4_raw_n,
     resolve_moe_binding,
     validate_moe_options,
 )
@@ -81,12 +82,16 @@ class MoEModule(Module):
         shared_gate: bool = True,
         moe_tp: bool | None = None,
         e_slots: int | None = None,
+        expert_quant: str | None = None,
     ) -> None:
         self.geometry = geometry
         self.prefix = prefix
         self.shared_gate = bool(shared_gate)
         self._explicit_moe_tp = None if moe_tp is None else bool(moe_tp)
         self._explicit_e_slots = None if e_slots is None else int(e_slots)
+        self._explicit_expert_quant = (
+            None if expert_quant is None else str(expert_quant)
+        )
         self.moe_tp = (
             self._explicit_moe_tp
             if self._explicit_moe_tp is not None
@@ -97,14 +102,27 @@ class MoEModule(Module):
             if self._explicit_e_slots is not None
             else int(getattr(geometry, "e_slots", 0))
         )
-        self._validate_options({"shared_gate": self.shared_gate})
+        self.expert_quant = (
+            self._explicit_expert_quant
+            if self._explicit_expert_quant is not None
+            else str(getattr(geometry, "expert_quant", "fp8"))
+        )
+        self._validate_options(
+            {
+                "shared_gate": self.shared_gate,
+                "expert_quant": self.expert_quant,
+            }
+        )
         if geometry is not None:
             self._check_option_consistency(geometry)
-        opts: dict[str, Any] = {"shared_gate": self.shared_gate}
-        if self._explicit_moe_tp is not None or geometry is not None:
-            opts["moe_tp"] = self.moe_tp
-        if self._explicit_e_slots is not None or geometry is not None:
-            opts["e_slots"] = self.e_slots
+        opts: dict[str, Any] = {
+            "shared_gate": self.shared_gate,
+            "moe_tp": self._explicit_moe_tp if geometry is None else self.moe_tp,
+            "e_slots": self._explicit_e_slots if geometry is None else self.e_slots,
+            "expert_quant": (
+                self._explicit_expert_quant if geometry is None else self.expert_quant
+            ),
+        }
         self.options = FrozenDict(opts)
 
     def _check_option_consistency(self, g: Any) -> tuple[bool, int]:
@@ -170,24 +188,30 @@ class MoEModule(Module):
         ir = g.I // ex.R if moe_tp else g.I
         ew = e_slots if e_slots > 0 else (g.E if moe_tp else er)
         layout_e = "stacked" if ex.stack_e else "per_layer"
+        eq = str(
+            self._explicit_expert_quant
+            if self._explicit_expert_quant is not None
+            else getattr(g, "expert_quant", self.expert_quant)
+        )
+        is_nvfp4 = eq == "nvfp4"
         return [
             WeightDecl("router", K=g.H, N=g.E, dtype=BF16, stream_ring="static"),
             WeightDecl("sh13", K=g.H, N=2 * isr, dtype=FP8, stream_ring="static"),
             WeightDecl("sh2", K=isr, N=g.H, dtype=FP8, stream_ring="static"),
             WeightDecl(
                 "e13",
-                K=g.H,
-                N=2 * ir,
-                dtype=FP8,
+                K=(g.H // 2) if is_nvfp4 else g.H,
+                N=nvfp4_raw_n(2 * ir) if is_nvfp4 else 2 * ir,
+                dtype=U8 if is_nvfp4 else FP8,
                 stream_ring="dynamic",
                 layout=layout_e,
                 lead_dims=(ew,),
             ),
             WeightDecl(
                 "e2",
-                K=ir,
-                N=g.H,
-                dtype=FP8,
+                K=(ir // 2) if is_nvfp4 else ir,
+                N=nvfp4_raw_n(g.H) if is_nvfp4 else g.H,
+                dtype=U8 if is_nvfp4 else FP8,
                 stream_ring="dynamic",
                 layout=layout_e,
                 lead_dims=(ew,),
@@ -225,6 +249,11 @@ class MoEModule(Module):
 
     def plan_params(self, g: Any, ex: ExecSpec, plan: Any) -> MoEParams:
         moe_tp, e_slots = self._check_option_consistency(g)
+        eq = str(
+            self._explicit_expert_quant
+            if self._explicit_expert_quant is not None
+            else getattr(g, "expert_quant", self.expert_quant)
+        )
         return derive_moe_params(
             g,
             ex,
@@ -234,6 +263,7 @@ class MoEModule(Module):
             moe_tp=moe_tp,
             e_slots=e_slots,
             module_name=self.name,
+            expert_quant=eq,
         )
 
     def scratch(self, g: Any, ex: ExecSpec, plan: Any) -> dict[str, Any]:

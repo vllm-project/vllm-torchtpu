@@ -43,12 +43,7 @@ from typing import Any, Protocol
 import jax
 import jax.numpy as jnp
 
-from ..comm.replication import (
-    shard_count,
-    slice_rank_ranges,
-    split_sharded_width,
-    unsharded_target_ranges,
-)
+from ..comm import replication as _rep
 from ..decls import HFParamDecl, VLLMAlias
 from ..exec_spec import ExecSpec
 from ..ops import F32, FP8
@@ -217,9 +212,9 @@ def target_axis_widths(decl: HFParamDecl, R: int, split_axis: int) -> tuple[int,
     full_w = int(decl.shape[dim_ax])
     tf = decl.transform
     if tf.channel_splits is not None and dim_ax == len(decl.shape) - 1:
-        return full_w, split_sharded_width(R, tf.channel_splits, tf.split_groups)
+        return full_w, _rep.split_sharded_width(R, tf.channel_splits, tf.split_groups)
     if tf.shard_axis is not None and (tf.shard_axis % len(decl.shape)) == dim_ax:
-        return full_w, full_w // shard_count(R, tf.shard_groups)
+        return full_w, full_w // _rep.shard_count(R, tf.shard_groups)
     return full_w, full_w
 
 
@@ -283,7 +278,16 @@ def slice_alias_targets(
             f"(sharded={total_sharded}, unsharded={total_full})"
         )
 
-    expected_s_w = expected_w if split_axis == -1 else int(d0.shape[-1])
+    if len(target_decls) == 1 and len(alias.scale_targets) == 1:
+        sd0 = scale_decls[alias.scale_targets[0]]
+        s_full, s_sharded = target_axis_widths(sd0, R, -1)
+        expected_s_w = (
+            (s_sharded if alias.already_sharded else s_full)
+            if split_axis == -1
+            else int(sd0.shape[-1])
+        )
+    else:
+        expected_s_w = expected_w if split_axis == -1 else int(d0.shape[-1])
     if s_buf is not None:
         s_len = int(s_buf.shape[-1])
         if s_len != expected_s_w:
@@ -338,18 +342,20 @@ def slice_alias_targets(
             rngs = [(off, off + sharded_w)]
             off += sharded_w
         else:
-            rngs = unsharded_target_ranges(
+            rngs = _rep.unsharded_target_ranges(
                 d, off, full_w, sharded_w, split_axis, R, tp_rank
             )
             off += full_w
 
-        w_t = slice_rank_ranges(
+        w_t = _rep.slice_rank_ranges(
             ops, w_buf, split_axis, rngs, actual_w if single else -1
         )
         s_t = (
             s_buf
-            if s_buf is None or split_axis != -1
-            else slice_rank_ranges(ops, s_buf, -1, rngs, expected_s_w if single else -1)
+            if s_buf is None or split_axis != -1 or (single and alias.already_sharded)
+            else _rep.slice_rank_ranges(
+                ops, s_buf, -1, rngs, expected_s_w if single else -1
+            )
         )
 
         want_fp8 = jnp.dtype(d.dtype) == jnp.dtype(FP8)

@@ -27,7 +27,8 @@ from ..decls import HFParamDecl
 from ..errors import MegakernelConfigError
 from ..exec_spec import ExecSpec
 from ..model_def import ModelDef
-from ..ops import BF16, F32, FP8, I32
+from ..modules.moe.reference import random_nvfp4_weight
+from ..ops import BF16, F32, FP8, I32, U8
 from ..pool.config import POOL_STATE_NAME, cache_exec, resolved_max_pages_per_seq
 from ..spec import SwitchSlot
 from .logical import (
@@ -91,6 +92,10 @@ def random_hf_weights(
         sh = (*lead, *hf_sh)
         if d.transform.scale_for is not None:
             return jnp.abs(jax.random.normal(next(it), sh, dtype=F32)) * 0.02 + 0.01
+        if jnp.dtype(d.dtype) == jnp.dtype(U8):
+            k_dim = int(hf_sh[-2]) * 2
+            n_dim = 2 * int(geom.I) if d.name.endswith("e13") else int(geom.H)
+            return random_nvfp4_weight(next(it), (*lead, *hf_sh[:-2]), k_dim, n_dim)
         if d.transform.quantize is not None or jnp.dtype(d.dtype) == jnp.dtype(FP8):
             return (jax.random.normal(next(it), sh, dtype=F32) * 0.25).astype(FP8)
         mean = 0.0 if d.init is None else float(d.init.mean)

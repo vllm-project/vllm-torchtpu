@@ -25,6 +25,7 @@ from .geometry import ModelGeometry
 from .modules.gdn import GDNModule
 from .modules.gqa import GQAModule
 from .modules.moe import MoEModule
+from .modules.moe.params import resolve_expert_quant
 from .pool import PoolLayout
 from .schedule import (
     FromHFLayerTypes,
@@ -159,6 +160,9 @@ def derive_model_geometry(
     moe_g = moe_b.resolve(merged)
     eff_tp = bool(moe_g.moe_tp) if moe_tp is None else bool(moe_tp)
     eff_slots = int(moe_g.e_slots) if e_slots is None else int(e_slots)
+    eff_quant = resolve_expert_quant(
+        hf_config, merged, moe_b.options.get("expert_quant"), moe_g.expert_quant
+    )
     zc = validate_norms(cls, sched, merged, eps, model_name=mname)
     g = cls.geometry_cls(
         L=L,
@@ -178,6 +182,7 @@ def derive_model_geometry(
         IS=int(moe_g.IS),
         moe_tp=eff_tp,
         e_slots=eff_slots,
+        expert_quant=eff_quant,
         eps=eps,
         gdn_l2_eps=gdn_l2_eps,
         theta=theta,
