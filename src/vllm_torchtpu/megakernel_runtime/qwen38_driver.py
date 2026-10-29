@@ -605,7 +605,10 @@ class Qwen38SegmentDriver:
         for field, want in (("hidden_size", 2560), ("num_hidden_layers", 48), ("hc_count", 4)):
             if getattr(t, field, None) != want:
                 reasons.append(f"{field}={getattr(t, field, None)} != {want}")
-        if getattr(getattr(runner.model, "model", None), "host_ple_index", None) is not None:
+        if (
+            getattr(getattr(runner.model, "model", None), "host_ple_index", None) is not None
+            and not envs.VLLM_TPU_MK_HOST_PLE
+        ):
             # PLE CPU offload (PLE_CPU_OFFLOAD, auto-on at max concurrency >= 32): the MK programs need
             # the PLE table on HBM, so no driver at all - building one would still pack the segment
             # operands into HBM before KV-cache sizing and shrink the pool of an all-stock run
@@ -824,7 +827,7 @@ class Qwen38SegmentDriver:
     def bind_and_warmup(self, runner: Any) -> None:
         from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpSegmentModel
 
-        if getattr(runner.model.model, "host_ple_index", None) is not None:
+        if getattr(runner.model.model, "host_ple_index", None) is not None and not envs.VLLM_TPU_MK_HOST_PLE:
             # forward_segments needs the PLE table on HBM; with PLE CPU offload
             # (PLE_CPU_OFFLOAD, auto-on at max concurrency >= 32) the first MK
             # call would fail to trace and fail closed. Say so once, up front.

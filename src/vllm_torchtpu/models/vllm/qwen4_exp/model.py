@@ -689,6 +689,21 @@ class Qwen4ExpBackbone(nn.Module):
             return mixed, hidden
         return mixed
 
+    def _megakernel_host_ple(self, input_ids, query_start_loc, ngram_context):
+        """With PLE CPU offload, the per-layer embedding rows of the megakernel programs'
+        PLE layer, looked up on the host as ``_forward_impl`` does (None with the table
+        on HBM). The kernels never read the PLE table: apply_ple runs before the head
+        group that starts at the PLE layer, so the host rows go in there."""
+        if self.host_ple_index is None:
+            return None
+        if not envs.VLLM_TPU_MK_HOST_PLE:
+            raise AssertionError("segments need the PLE table on HBM (or VLLM_TPU_MK_HOST_PLE=1)")
+        ple = cast(Qwen4ExpDecoderLayer, self.layers[self.host_ple_index]).ple
+        assert ple is not None
+        return ple.lookup_for_model(
+            PLEInputs(input_ids, query_start_loc, ngram_context), query_start_loc[-1:]
+        )
+
     def forward_segments(
         self,
         input_ids,
@@ -713,7 +728,7 @@ class Qwen4ExpBackbone(nn.Module):
         projection and MoE, then the linear-attention layers until the next QSA
         layer (the last segment ends after ``l``'s MoE).
         """
-        assert self.host_ple_index is None, "segments need the PLE table on HBM"
+        ple_raw = self._megakernel_host_ple(input_ids, query_start_loc, ngram_context)
         positions64 = positions.to(torch.int64)
         ids64 = input_ids.to(torch.int64)
         hidden = self.embed_tokens(input_ids).repeat(1, self.hc_count)
@@ -741,7 +756,8 @@ class Qwen4ExpBackbone(nn.Module):
                         )
                     continue
                 hidden = layers[group[0]].apply_ple(
-                    hidden, ids64, query_start_loc, ngram_context, state_slots, context_lens
+                    hidden, ids64, query_start_loc, ngram_context, state_slots, context_lens,
+                    ple_raw if group[0] == self.host_ple_index else None,
                 )
                 hidden = segment_call.head(h, hidden)
         else:
@@ -827,14 +843,15 @@ class Qwen4ExpBackbone(nn.Module):
         Head groups as in ``forward_segments``; then ``whole`` (layers 3..46); the last QSA
         layer keeps its stock attention core and the segment kernel for the rest.
         """
-        assert self.host_ple_index is None, "segments need the PLE table on HBM"
+        ple_raw = self._megakernel_host_ple(input_ids, query_start_loc, ngram_context)
         ids64 = input_ids.to(torch.int64)
         positions64 = positions.to(torch.int64)
         hidden = self.embed_tokens(input_ids).repeat(1, self.hc_count)
         layers = cast(Sequence[Qwen4ExpDecoderLayer], self.layers)
         for h, group in enumerate(segment_call.head_groups):
             hidden = layers[group[0]].apply_ple(
-                hidden, ids64, query_start_loc, ngram_context, state_slots, context_lens
+                hidden, ids64, query_start_loc, ngram_context, state_slots, context_lens,
+                ple_raw if group[0] == self.host_ple_index else None,
             )
             hidden = segment_call.head(h, hidden)
         hidden = whole(hidden, positions, query_start_loc, context_lens)
