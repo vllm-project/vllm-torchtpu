@@ -31,13 +31,16 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.intra_chip import get_intra_chip_group
 from vllm_torchtpu.layers.adapter import moe_routing
-from vllm_torchtpu.layers.adapter.latent_proj_intra_chip import make_latent_projection
+from vllm_torchtpu.layers.adapter.latent_proj_intra_chip import (
+    IntraChipColumnParallelLinear,
+    make_latent_projection,
+)
 from vllm_torchtpu.layers.adapter.moe_hierarchical import (
     hierarchical_moe_parallel_config,
     hierarchical_split_or_none,
 )
 
-from .collective_ops import FusedPrefillCollectives
+from .collective_ops import FusedPrefillCollectives, TokenShardCollectives
 from .layers import KimiMLP
 
 if TYPE_CHECKING:
@@ -144,11 +147,13 @@ class KimiMoE(nn.Module):
 
         self.prefill_group = None
         self.shared_group = None
+        self.chip_token_group = None
         if envs.TPU_K3_SP_PREFILL:
             self.prefill_group = FusedPrefillCollectives(prefix)
             self.shared_group = get_intra_chip_group()
             if self.shared_group is None or self.shared_group.world_size != 2:
                 raise ValueError("K3 SP prefill needs a physical two-core chip group")
+            self.chip_token_group = TokenShardCollectives(self.shared_group)
 
         self.shared_experts = (
             KimiMLP(
@@ -272,6 +277,30 @@ class KimiMoE(nn.Module):
         output = self.experts(hidden_states=hidden_states, router_logits=router_logits)
         return output.view(num_tokens, hidden_size)
 
+    def _latent_project(
+        self, proj: nn.Module, x: torch.Tensor, sequence_parallel: bool
+    ) -> torch.Tensor:
+        """Apply a latent projection, to this rank's token shard under SP.
+
+        An intra-chip projection holds one core's share of the output
+        columns. Under SP the chip pair gathers its token shards, each core
+        projects them onto its columns, and a reduce-scatter of the
+        zero-padded column blocks hands each core its own tokens with every
+        column. Each output element has one nonzero term, so the sum is
+        exact. The generic feature all-gather would allocate a symbolic-size
+        buffer, which the SP trace cannot.
+        """
+        if not (sequence_parallel and isinstance(proj, IntraChipColumnParallelLinear)):
+            return proj(x)[0]
+        assert self.chip_token_group is not None
+        gathered = self.chip_token_group.all_gather(x, dim=0)
+        part = proj.quant_method.apply(proj, gathered, None)
+        width = part.shape[-1]
+        padded = torch.nn.functional.pad(
+            part, (proj.tp_rank * width, (proj.tp_size - 1 - proj.tp_rank) * width)
+        )
+        return self.chip_token_group.reduce_scatter(padded, dim=0)
+
     def _forward_expert_parallel(
         self, hidden_states: torch.Tensor, sequence_parallel: bool
     ) -> torch.Tensor:
@@ -281,7 +310,9 @@ class KimiMoE(nn.Module):
         router_logits, _ = self.gate(hidden_states)
         latent = hidden_states
         if self.routed_expert_down_proj is not None:
-            latent, _ = self.routed_expert_down_proj(latent)
+            latent = self._latent_project(
+                self.routed_expert_down_proj, latent, sequence_parallel
+            )
         routed = self.experts.routed_experts
         if sequence_parallel:
             weights, ids = moe_routing.route(routed, latent, router_logits)
@@ -301,7 +332,9 @@ class KimiMoE(nn.Module):
         if self.routed_expert_norm is not None:
             output = self.routed_expert_norm(output)
         if self.routed_expert_up_proj is not None:
-            output, _ = self.routed_expert_up_proj(output)
+            output = self._latent_project(
+                self.routed_expert_up_proj, output, sequence_parallel
+            )
         if self.shared_experts is not None:
             output = output + self.shared_experts(
                 hidden_states, sequence_parallel=sequence_parallel
