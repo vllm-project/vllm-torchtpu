@@ -29,6 +29,7 @@ import os
 import pickle
 import re
 import shutil
+import socket
 import threading
 import time
 from collections.abc import Callable
@@ -187,7 +188,12 @@ class PrecompileProgress:
         if not self.cache_dir:
             return
         record = dict(
-            event=event, prefix=self.prefix, subgraph=self.subgraph, t=time.time(), **fields
+            event=event,
+            prefix=self.prefix,
+            subgraph=self.subgraph,
+            t=time.time(),
+            host=socket.gethostname(),
+            **fields,
         )
         path = os.path.join(self._rank_dir(self.cache_dir), self.FILE)
         try:
@@ -221,7 +227,10 @@ class PrecompileProgress:
                     records.extend(json.loads(line) for line in f if line.strip())
             except (OSError, ValueError):
                 continue
-        return records
+        # Only this pod's: a cache synced in from shared storage (or another
+        # job's) carries other boots' records.
+        host = socket.gethostname()
+        return [r for r in records if r.get("host") == host]
 
     def owner_status(self, owner_global_rank: int, size: int, since: float) -> str:
         """`pending`, `failed: <reason>`, or `skipped` for the owner's bucket
