@@ -33,6 +33,7 @@ without using the fast path.
 from __future__ import annotations
 
 import dis
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -101,6 +102,52 @@ def _context_paths() -> dict[int, list[tuple]]:
                 if hasattr(obj, k):
                     stack.append((getattr(obj, k), path + (("a", k),)))
     return found
+
+
+def _module_tensor_names(module: Any) -> dict[int, list[str]]:
+    """Every tensor attribute under a module tree (buffers, plain tensor
+    attributes, tensors in list/tuple/dict attributes), by id."""
+    names: dict[int, list[str]] = {}
+    if not isinstance(module, torch.nn.Module):
+        return names
+    for prefix, mod in module.named_modules(remove_duplicate=False):
+        for key, val in vars(mod).items():
+            if key in ("_parameters", "_modules"):
+                continue
+            items = val.items() if isinstance(val, dict) else (
+                enumerate(val) if isinstance(val, (list, tuple)) else [(None, val)])
+            for sub, t in items:
+                if isinstance(t, torch.Tensor) and not isinstance(t, torch.nn.Parameter):
+                    name = f"{prefix}.{key}" if prefix else key
+                    if key == "_buffers" or sub is not None:
+                        name = f"{name}[{sub}]"
+                    names.setdefault(id(t), []).append(name)
+    return names
+
+
+def _log_constants(label: str, module: Any, template: list[Any]) -> None:
+    """Name the lifted constants that are neither parameters nor read through
+    the forward context: the ones a reassignment (not an in-place update)
+    would leave stale until the next canary."""
+    names = _module_tensor_names(module)
+    consts = [t for t in template
+              if isinstance(t, torch.Tensor) and not isinstance(t, torch.nn.Parameter)]
+    groups: dict[str, int] = {}
+    unnamed = 0
+    for t in consts:
+        found = names.get(id(t))
+        if not found:
+            unnamed += 1
+            continue
+        pattern = re.sub(r"\.\d+\.", ".*.", found[0])
+        pattern = re.sub(r"\[\d+\]", "[*]", pattern)
+        key = f"{pattern} {list(t.shape)} {str(t.dtype).replace('torch.', '')}"
+        groups[key] = groups.get(key, 0) + 1
+    logger.info(
+        "AOT_FLAT_ARGS %s: %d non-parameter constants (%d unnamed): %s",
+        label, len(consts), unnamed,
+        "; ".join(f"{n}x {k}" for k, n in sorted(groups.items(), key=lambda kv: -kv[1])),
+    )
 
 
 def _int_source(src: tuple, args: tuple) -> Any:
@@ -396,6 +443,8 @@ class FlatArgsForward:
                     logger.info("AOT_FLAT_ARGS %s: layout %s not cacheable: %s",
                                 self.label, key[:2], reason)
                 elif layout.ready:
+                    _log_constants(self.label, args[0] if args else None,
+                                   layout.template)
                     logger.info(
                         "AOT_FLAT_ARGS %s: caching %d flat args (%d args, %d sizes, "
                         "%d forward-context fields)",
