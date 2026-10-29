@@ -209,20 +209,20 @@ def _heap_dump() -> None:
     import shutil
 
     process = ctypes.CDLL(None)
-    if not hasattr(process, "HeapProfilerDump") or not os.environ.get("HEAPPROFILE"):
+    # gperftools rewrites HEAPPROFILE in place at startup, so the prefix comes
+    # from a separate variable set to the same value.
+    prefix = os.environ.get("VLLM_TPU_HEAPDUMP_PREFIX", "")
+    if not hasattr(process, "HeapProfilerDump") or not prefix:
         logger.info("[hostmem] heap profiler not running; no heap dump")
         return
-    process.HeapProfilerDump(b"warm")
-    prefix = os.environ["HEAPPROFILE"]
     pid = os.getpid()
-    files = sorted(
-        (
-            f
-            for f in glob.glob(f"{prefix}*.heap")
-            if f"_{pid}." in f or f".{pid}." in f
-        ),
-        key=os.path.getmtime,
-    )
+    before = set(glob.glob(f"{prefix}*.heap"))
+    process.HeapProfilerDump(b"warm")
+    new = [f for f in glob.glob(f"{prefix}*.heap") if f not in before]
+    # Child processes write <prefix>_<pid>.NNNN.heap, the parent <prefix>.NNNN.heap.
+    files = [f for f in new if f"_{pid}." in f] or [
+        f for f in new if f.startswith(prefix + ".")
+    ]
     out = os.path.join(os.environ.get("CDK_OUTPUT_DIR", "/tmp/cdk_output"), "hprof")
     os.makedirs(out, exist_ok=True)
     if files:
@@ -231,6 +231,8 @@ def _heap_dump() -> None:
         with open(f"/proc/{os.getpid()}/maps") as f, open(dst + ".maps", "w") as g:
             g.write(f.read())
         logger.info("[hostmem] heap dump %s -> %s", files[-1], dst)
+    else:
+        logger.info("[hostmem] heap dump: no new file for pid %d among %s", pid, new)
 
 
 def _report_and_maybe_drop(mode: str) -> None:
