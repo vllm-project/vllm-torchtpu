@@ -135,6 +135,21 @@ def test_source_hash_fails_closed_for_zip_imports(
     sys.modules.pop("zipped_mod", None)
 
 
+def test_source_hash_accepts_pyc_beside_its_source(mod_dir: Path) -> None:
+    """`compileall -b` puts `m.pyc` next to `m.py`: hashed as the sources only."""
+    src = _write(mod_dir / "pkg_b" / "m.py", "A = 1\n")
+    _write(mod_dir / "pkg_b" / "__init__.py", "")
+    pkg = _import("pkg_b")
+    h = fp.source_hash(pkg)
+    py_compile.compile(str(src), cfile=str(src.with_suffix(".pyc")))
+    fp.clear_caches()
+    assert fp.source_hash(pkg) == h
+    src.unlink()  # now the .pyc has no source: sourceless
+    fp.clear_caches()
+    with pytest.raises(MegakernelPluginError, match="unhashable:sourceless"):
+        fp.source_hash(pkg)
+
+
 def test_source_hash_is_bounded(mod_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     for i in range(4):
         _write(mod_dir / "big_pkg" / f"m{i}.py", "A = 1\n")

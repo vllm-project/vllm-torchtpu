@@ -50,8 +50,11 @@ def _walk_py(root: Path, name: str) -> list[tuple[str, Path]]:
         dirnames[:] = [
             d for d in dirnames if not d.startswith(".") and d != "__pycache__"
         ]
+        names = set(filenames)
         for fn in filenames:
-            if fn.endswith(".pyc"):
+            # A `.pyc` beside its `.py` (e.g. `compileall -b`) is fine: only the
+            # source is hashed. A `.pyc` without one is a sourceless install.
+            if fn.endswith(".pyc") and fn[: -len("c")] not in names:
                 raise _unhashable("sourceless", name)
             if fn.endswith(".py") and not fn.startswith("."):
                 p = Path(dirpath) / fn
