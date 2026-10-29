@@ -240,6 +240,7 @@ def adaptive_fused_moe(
     rank=None,
     mesh_ep_ranks=None,
     token_replica_groups=None,
+    expert_phys=None,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -285,6 +286,12 @@ def adaptive_fused_moe(
     mesh_ep_ranks names the EP rank at every device-mesh index. A non-identity
     order relabels only the selected expert ids after top-k, keeping the full
     router-logit tensor in its original order.
+
+    expert_phys [experts] int32, replicated, maps each logical expert id to the
+    physical slot holding it under a static expert placement
+    (layers/adapter/moe_placement.py). It is applied to the selected ids right
+    after top-k, so the selection itself -- including its tie-break -- is the
+    unplaced one. None: identity.
     """
     if weight_format is None:
         weight_format = weight_format_of_dtype(w1.dtype)
@@ -427,8 +434,12 @@ def adaptive_fused_moe(
         has_w2_bias=has_w2_bias,
     )
 
+    placed = expert_phys is not None
+
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
         """One shard's half of the layer: route, dispatch, kernel, combine."""
+        if placed:
+            *scales_gating_biases, phys_l = scales_gating_biases
         # The scales come before the gating logits and the biases after
         # them, which is the operand order the scaled formats have always
         # had: a format that supplies no scales drops them out of the middle
@@ -467,6 +478,8 @@ def adaptive_fused_moe(
         topk_weights, topk_idx = pallas_select(
             scores, topk=topk, block_rows=select_rows
         )
+        if placed:
+            topk_idx = jnp.take(phys_l, topk_idx, mode="clip").astype(topk_idx.dtype)
         topk_idx = _relabel_expert_ids_to_mesh_order(
             topk_idx, g_local=g_local, mesh_ep_ranks=mesh_ep_ranks
         )
@@ -657,6 +670,9 @@ def adaptive_fused_moe(
         rank = jnp.arange(ep, dtype=jnp.int32).reshape(ep, 1)
     in_specs = (P(ax),) * (5 + len(scale_args) + len(bias_args))
     args = (x, rank, w1, w2) + scale_args + (gating,) + bias_args
+    if placed:
+        in_specs += (P(),)
+        args += (expert_phys,)
     NS = jax.sharding.NamedSharding
     args = tuple(jax.device_put(a, NS(mesh, sp)) for a, sp in zip(args, in_specs))
     # local_fn closes over config-static values only -- the per-call data
@@ -684,6 +700,7 @@ def adaptive_fused_moe(
         gating.dtype,
         has_w1_bias and w1_bias.dtype,
         has_w2_bias and w2_bias.dtype,
+        placed,
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

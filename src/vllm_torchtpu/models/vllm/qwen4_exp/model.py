@@ -436,6 +436,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
             w2_scale,
             router_logits,
             attr="_adaptive_fused_moe_op_sp",
+            expert_phys=getattr(routed, "_expert_phys", None),
         )
         shared = sp.reduce(mlp.shared_expert(sp.gather(block, num_tokens)), True)
         return shared + output
@@ -1211,8 +1212,6 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             verify_moe_checkpoint(
                 layer.mlp, f"model.layers.{i}.mlp.", source, moe_mapper, f"layer{i}"
             )
-            # Static expert placement: the router emits physical expert ids.
-            moe_placement.permute_router_rows(layer.mlp.gate.weight, i)
             if layer.ple is not None:
                 layer.ple.finalize_weights()
             if layer.layer_type == "full_attention":

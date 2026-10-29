@@ -1176,6 +1176,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 w1_scale,
                 w2_scale,
                 router_logits,
+                expert_phys=getattr(layer, "_expert_phys", None),
             )
 
         # `score_bias_operand` is not optional, and omitting it is silent on

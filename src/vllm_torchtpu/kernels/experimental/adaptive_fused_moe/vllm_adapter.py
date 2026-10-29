@@ -184,6 +184,7 @@ def prebuild_adaptive_fused_moe(
         weight_format,
         rhs_qb,
         token_replica_groups=groups,
+        placed=getattr(layer, "_expert_phys", None) is not None,
     )
     logger.info_once(
         "Experimental adaptive fused MoE armed | format=%s W1=%d W2=%d "
@@ -463,9 +464,13 @@ def _build_op(
     rhs_qb: int | None = None,
     *,
     token_replica_groups: tuple[tuple[int, ...], ...] | None = None,
+    placed: bool = False,
 ) -> torch.library.CustomOpDef:
-    """The op for this closure, built once per distinct closure and reused."""
+    """The op for this closure, built once per distinct closure and reused.
+    ``placed`` adds an eighth operand, the layer's logical-to-physical expert
+    table (static expert placement), replicated."""
     key = (
+        placed,
         mesh,
         topk,
         renormalize,
@@ -484,9 +489,7 @@ def _build_op(
     # dispatch entry, and the second closure would then serve the first.
     name = FUSED_MOE_EP_OP_NAME if not _OPS else f"{FUSED_MOE_EP_OP_NAME}_{len(_OPS)}"
 
-    # Every operand is annotated jax.Array: torch_tpu infers static argnums
-    # from the signature and refuses an unannotated one.
-    def moe(
+    def _call(
         x: jax.Array,
         w1: jax.Array,
         w2: jax.Array,
@@ -494,6 +497,7 @@ def _build_op(
         w2_scale: jax.Array,
         gating: jax.Array,
         rank: jax.Array,
+        expert_phys: jax.Array | None = None,
     ) -> jax.Array:
         # The router's top-k selector writes into an f32 accumulator ref, so a
         # bf16 gate output -- which is what the model's gate matmul produces --
@@ -522,7 +526,37 @@ def _build_op(
             act_fn=activation,
             mesh_ep_ranks=mesh_expert_order,
             token_replica_groups=token_replica_groups,
+            expert_phys=expert_phys,
         )
+
+    def moe_plain(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+    ) -> jax.Array:
+        return _call(x, w1, w2, w1_scale, w2_scale, gating, rank)
+
+    # Every operand is annotated jax.Array: torch_tpu infers static argnums
+    # from the signature and refuses an unannotated one, so each variant
+    # spells its operands out.
+    moe = moe_plain
+    if placed:
+
+        def moe(  # noqa: F811
+            x: jax.Array,
+            w1: jax.Array,
+            w2: jax.Array,
+            w1_scale: jax.Array,
+            w2_scale: jax.Array,
+            gating: jax.Array,
+            rank: jax.Array,
+            expert_phys: jax.Array,
+        ) -> jax.Array:
+            return _call(x, w1, w2, w1_scale, w2_scale, gating, rank, expert_phys)
 
     spec = PartitionSpec(EP_AXIS_NAME)
     # Stock jax_op. It used to size its outputs from the export's avals, where
@@ -538,7 +572,7 @@ def _build_op(
         mesh=mesh,
         # x, w1, w2, w1_scale, w2_scale, gating, rank -- every operand is
         # sharded on axis 0 over the EP axis, and so is the single output.
-        input_partition_specs=(spec,) * 7,
+        input_partition_specs=(spec,) * 7 + ((PartitionSpec(),) if placed else ()),
         output_partition_specs=spec,
     )
 
@@ -562,13 +596,17 @@ def run_adaptive_fused_moe(
     w2_scale: torch.Tensor,
     router_logits: torch.Tensor,
     attr: str = FUSED_MOE_EP_OP_ATTR,
+    expert_phys: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Execute a successfully prebuilt experimental op, or raise.
 
-    ``attr`` names the op on ``owner``; the default is the layer's own."""
+    ``attr`` names the op on ``owner``; the default is the layer's own.
+    ``expert_phys`` is the layer's static-placement table, passed exactly when
+    the op was built for one."""
     op = getattr(owner, attr, None)
     if op is None:
         raise RuntimeError("adaptive fused MoE was not prebuilt for this layer")
+    extra = () if expert_phys is None else (expert_phys,)
     if w1.dtype == torch.float4_e2m1fn_x2:
         # FP4 scales are already [E, K/block, N]. Even a single block must
         # retain its axis; the per-channel helper would incorrectly drop it.
@@ -587,6 +625,7 @@ def run_adaptive_fused_moe(
             block_scale(w2_scale),
             router_logits,
             _RANK_BUFFER,
+            *extra,
         )
     return op(
         hidden_states,
@@ -596,4 +635,5 @@ def run_adaptive_fused_moe(
         _squeeze_channel_scale_checked(w2_scale),
         router_logits,
         _RANK_BUFFER,
+        *extra,
     )

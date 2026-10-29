@@ -9,20 +9,18 @@ of a fixed calibration set (so the heavily routed experts of a layer spread
 over the ranks) and is read once at load; nothing about it depends on the
 traffic being served.
 
-Two things make the placement transparent to every MoE kernel:
-
-- each rank loads the logical experts of its physical slots (the layer's expert
-  map, and the per-layer checkpoint fetch filter), and
-- the layer's router weight rows are permuted to physical order, so the router
-  itself produces physical expert ids.
-
-Every consumer of routed ids -- the adaptive fused EP kernel, the fused MoE
-decode kernel, GMM, the megakernels' in-kernel routers -- then sees physical
-ids with the usual linear meaning (rank = id // G) and needs no change. Each
-token is routed to the same experts with the same weights (top-k is taken by
-value), so the layer output is the same; only which rank computes which expert
-changes. Layers absent from the table (e.g. the MTP drafter's) keep linear
-placement.
+Each rank loads the logical experts of its physical slots (the layer's expert
+map, and the per-layer checkpoint fetch filter). The router is untouched and
+selects logical experts exactly as without placement (same top-k, same
+tie-break); the selected ids are then mapped to physical slots by the layer's
+table ``_expert_phys`` [experts] int32 -- in ``moe_routing.route`` for the
+paths that route in torch (fused MoE decode, GMM) and inside the adaptive fused
+EP op right after its top-k. Downstream every kernel reads physical ids with
+the usual linear meaning (rank = id // G). Routing is unchanged; the output
+differs only by reassociation (experts sum into different per-rank partials
+before the all-reduce). The megakernels route in-kernel and do not take the
+table yet, so placement refuses to start with VLLM_TPU_MEGAKERNEL set. Layers
+absent from the table (the MTP drafter's) keep linear placement.
 """
 
 from __future__ import annotations
@@ -58,6 +56,11 @@ def placement_table() -> dict[int, tuple[int, ...]] | None:
         if sorted(perm) != list(range(len(perm))):
             raise ValueError(f"placement for layer {key} is not a permutation")
         table[int(m.group(1))] = perm
+    if envs.VLLM_TPU_MEGAKERNEL not in ("", "0", "off"):
+        raise ValueError(
+            "VLLM_TPU_MOE_EXPERT_PLACEMENT does not support the megakernels yet "
+            f"(VLLM_TPU_MEGAKERNEL={envs.VLLM_TPU_MEGAKERNEL!r}); unset one of them"
+        )
     logger.info("MoE expert placement: %d layers from %s", len(table), path)
     return table
 
@@ -92,20 +95,22 @@ def apply_expert_map(routed_experts, layer_index: int) -> None:
         host[expert] = slot
     manager._expert_map = torch.tensor(host, dtype=current.dtype, device=current.device)
     routed_experts.update_expert_map_info()
+    phys = [0] * len(perm)
+    for slot, expert in enumerate(perm):
+        phys[expert] = slot
+    routed_experts.register_buffer(
+        "_expert_phys",
+        torch.tensor(phys, dtype=torch.int32, device=current.device),
+        persistent=False,
+    )
 
 
-def permute_router_rows(gate_weight: torch.Tensor, layer_index: int) -> None:
-    """Router weight [experts, hidden] rows to physical order (row p <- perm[p])."""
-    perm = layer_placement(layer_index)
-    if perm is None:
-        return
-    if gate_weight.shape[0] != len(perm):
-        raise ValueError(
-            f"layer {layer_index}: router weight {tuple(gate_weight.shape)} vs "
-            f"placement of {len(perm)} experts"
-        )
-    index = torch.tensor(perm, dtype=torch.long, device=gate_weight.device)
-    gate_weight.data.copy_(gate_weight.data.index_select(0, index))
+def map_to_physical(layer, topk_ids: torch.Tensor) -> torch.Tensor:
+    """Selected logical expert ids -> physical slots (identity without a table)."""
+    phys = getattr(layer, "_expert_phys", None)
+    if phys is None:
+        return topk_ids
+    return phys[topk_ids.long()].to(topk_ids.dtype)
 
 
 class PerLayerExpertIds(set):

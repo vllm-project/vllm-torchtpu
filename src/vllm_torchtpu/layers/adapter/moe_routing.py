@@ -163,9 +163,12 @@ def route(
     duplicated in each quant method; centralizing it here means the simulation
     hook -- and any future routing-path change -- lives in exactly one place.
     """
-    routed = _route(layer, hidden_states, router_logits, input_ids)
-    count_expert_hist(layer, "expert_hist", routed[1], router_logits)
-    return routed
+    topk_weights, topk_ids = _route(layer, hidden_states, router_logits, input_ids)
+    count_expert_hist(layer, "expert_hist", topk_ids, router_logits)
+    # Static expert placement: the logical selection -> physical slots.
+    from vllm_torchtpu.layers.adapter.moe_placement import map_to_physical
+
+    return topk_weights, map_to_physical(layer, topk_ids)
 
 
 def count_expert_hist(layer, buffer: str, topk_ids, router_logits) -> None:
