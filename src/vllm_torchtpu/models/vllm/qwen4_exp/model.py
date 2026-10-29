@@ -1113,7 +1113,11 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             and self.model.host_ple_index is not None
             and inputs_embeds is None
             and kwargs.get("ple_raw_embeddings") is None
+            and input_ids.shape[0] <= envs.VLLM_TPU_PLE_HOST_PRELOOKUP_MAX_TOKENS
         ):
+            # Larger (prefill/mixed) buckets keep the in-graph boundary: their
+            # host gather is long enough that overlapping it with the layers
+            # before the PLE layer beats saving the second program launch.
             # A megakernel driver that looked the rows up for this step and
             # then fell back to stock left them in kwargs: reuse them.
             kwargs["ple_raw_embeddings"] = self._ple_prelookup(input_ids, kwargs)

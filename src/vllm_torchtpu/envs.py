@@ -270,6 +270,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_METADATA_BUILD: bool = False
     VLLM_TPU_PLE_HOST_PRELOOKUP: bool = False
     VLLM_TPU_PLE_HOST_PRELOOKUP_CHECK: str = ""
+    VLLM_TPU_PLE_HOST_PRELOOKUP_MAX_TOKENS: int = 128
     VLLM_TPU_STAGE_TIMING_ONLY_WITH_SINK: bool = False
     VLLM_TPU_STAGED_WALK_CLASS_GATHER: bool = False
     VLLM_TPU_WARMED_SUBSTITUTE_SOURCE: bool = False
@@ -1627,6 +1628,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "fault:N": its positive control (reference tokens shifted by one).
     "VLLM_TPU_PLE_HOST_PRELOOKUP_CHECK": lambda: os.getenv(
         "VLLM_TPU_PLE_HOST_PRELOOKUP_CHECK", ""
+    ),
+    # Token buckets above this keep the in-graph host boundary (with
+    # PLE_HOST_OVERLAP); prelookup only for decode-sized buckets.
+    "VLLM_TPU_PLE_HOST_PRELOOKUP_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_TPU_PLE_HOST_PRELOOKUP_MAX_TOKENS", "128")
     ),
     # Host-path pieces (q38f-int: default off, toggled per arm).
     # Record stage-timing device events only when a KV connector consumes them.
