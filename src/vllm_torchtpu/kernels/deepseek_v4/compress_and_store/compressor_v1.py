@@ -145,15 +145,23 @@ def derive_metadata(
     return token_to_req_indices, slot_mapping_slots, kv_slot_mapping
 
 
-def _get_packing_indices(keep, size):
-    order = jnp.nonzero(keep, size=size, fill_value=-1)[0]
-    valid = order >= 0
-    safe = jnp.where(valid, order, 0)
-    return safe, valid
+def _carry_forward(mask: jax.Array, values: jax.Array, fill: int) -> jax.Array:
+    """`values` at the last position at or before each one where `mask` holds,
+    `fill` before the first: a running max of the masked positions that carries
+    their value along, so it lowers to a prefix reduce-window, not a gather."""
+    n = mask.shape[0]
+    index = jnp.where(mask, jnp.arange(n), -1)
+    values = jnp.where(mask, values, fill)
 
+    def latest(a, b):
+        take_b = b[0] > a[0]
+        return jnp.where(take_b, b[0], a[0]), jnp.where(take_b, b[1], a[1])
 
-def _pack_array(x, safe, valid, default_value):
-    return jnp.where(valid, x[safe], default_value)
+    init = (jnp.array(-1, index.dtype), jnp.array(fill, values.dtype))
+    _, carried = jax.lax.reduce_window(
+        (index, values), init, latest, (n,), (1,), [(n - 1, 0)]
+    )
+    return carried
 
 
 def prepare_boundary_batch(
@@ -170,59 +178,46 @@ def prepare_boundary_batch(
 
     Layout: [ decode_packed (0..K-1) | pad (K..K_aligned-1) |
     prefill_row_tiled (K_aligned..) | pad ]
+
+    The boundary tokens, in token order, are the packed list the layout is
+    defined on: a token's packed index is its rank among them. Every quantity is
+    evaluated at the token itself, so the only data movement is one scatter of
+    the tokens to their slots.
     """
     num_tokens = positions.shape[0]
     max_prefill_boundary = num_tokens // compress_ratio + 1 + num_reqs
-    packed_size = num_tokens + max_prefill_boundary
+    output_size = num_tokens + rope_pack * max_prefill_boundary
 
-    # 1. Get packing indices for all boundary tokens
-    safe, valid = _get_packing_indices(is_boundary, packed_size)
+    packed_index = jnp.cumsum(is_boundary.astype(jnp.int32)) - 1
+    is_decode = is_boundary & is_decode_token
+    valid_token = is_boundary & (kv_slot_mapping >= 0)
+    is_prefill = valid_token & ~is_decode_token
 
-    # 2. Pack inputs and the decode mask
-    pos = _pack_array(positions, safe, valid, 0)
-    req = _pack_array(token_to_req_indices, safe, valid, 0)
-    kv = _pack_array(kv_slot_mapping, safe, valid, -1)
-    is_decode = _pack_array(is_decode_token, safe, valid, False)
-
-    valid_token = kv >= 0
-    is_prefill = valid_token & ~is_decode
-
-    # 3. Calculate row-tiling ONLY for prefill tokens
-    row = jnp.where(is_prefill, kv // rope_pack, -1)
-    row_shifted = jnp.roll(row, 1)
-    starts_row = (row != row_shifted) & is_prefill
-    starts_row = starts_row.at[0].set(is_prefill[0])
+    # Row-tiling of the prefill tokens: a tile starts wherever a token's row
+    # differs from the previous boundary token's (-1 for a decode token).
+    row = jnp.where(is_prefill, kv_slot_mapping // rope_pack, -1)
+    carried_row = _carry_forward(is_boundary, row, fill=-1)
+    prev_row = jnp.concatenate([jnp.full((1,), -1, row.dtype), carried_row[:-1]])
+    starts_row = is_prefill & (row != prev_row)
 
     tile_index = jnp.cumsum(starts_row.astype(jnp.int32)) - 1
+    run_start = jax.lax.cummax(jnp.where(starts_row, packed_index, 0))
+    pos_within_tile = packed_index - run_start
 
-    index = jnp.arange(packed_size)
-    run_start = jax.lax.cummax(jnp.where(starts_row, index, 0))
-    pos_within_tile = index - run_start
-
-    # 4. Calculate alignment offset for prefill block
     K = jnp.sum(is_decode)
     K_aligned = ((K + 3) // 4) * 4
 
-    # 5. Combine destination indices
-    prefill_size = rope_pack * max_prefill_boundary
-    output_size = num_tokens + prefill_size
-
     dest_prefill = K_aligned + tile_index * rope_pack + pos_within_tile
-    dest = jnp.where(is_decode, index, dest_prefill)
+    dest = jnp.where(is_decode, packed_index, dest_prefill)
     dest = jnp.where(valid_token, dest, output_size)
 
-    # 6. Scatter to output once
-    def scatter(default_val, src):
-        return (
-            jnp.full((output_size,), default_val, dtype=src.dtype)
-            .at[dest]
-            .set(src, mode="drop")
-        )
-
+    src = jnp.stack([positions, token_to_req_indices, kv_slot_mapping])
+    default = jnp.array([0, 0, -1], dtype=src.dtype)[:, None]
+    out = jnp.broadcast_to(default, (3, output_size)).at[:, dest].set(src, mode="drop")
     return (
-        scatter(0, pos),
-        scatter(0, req),
-        scatter(-1, kv),
+        out[0].astype(positions.dtype),
+        out[1].astype(token_to_req_indices.dtype),
+        out[2].astype(kv_slot_mapping.dtype),
     )
 
 
