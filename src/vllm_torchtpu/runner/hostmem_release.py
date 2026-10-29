@@ -86,7 +86,8 @@ def _census() -> tuple[str, list[Any]]:
     for batch in (objs, untracked):
         for i in range(0, len(batch), 4096):
             for r in gc.get_referents(*batch[i : i + 4096]):
-                # A dead weakref.proxy raises ReferenceError on isinstance().
+                # A dead weakref.proxy raises ReferenceError on isinstance(); a
+                # released memoryview raises ValueError on .nbytes.
                 try:
                     if isinstance(r, (bytes, bytearray, memoryview, str)):
                         n = r.nbytes if isinstance(r, memoryview) else len(r)
@@ -101,7 +102,7 @@ def _census() -> tuple[str, list[Any]]:
                     elif batch is objs and isinstance(r, (dict, tuple, list)):
                         if not gc.is_tracked(r):
                             untracked.append(r)
-                except ReferenceError:
+                except (ReferenceError, ValueError):
                     continue
     exe_size = ""
     if executables:
