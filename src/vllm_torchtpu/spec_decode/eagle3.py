@@ -1677,7 +1677,7 @@ class Eagle3Proposer:
             # seq_lens subtraction is full-length (constant) — no per-num_reqs
             # recompile. Sync pads on the host (free, reused across the K-1 loop
             # steps); async pads the device tensor.
-            rejected_dev_per_chunk = []
+            rejected_dev_per_chunk: list[torch.Tensor | None] = []
             for c, nr in zip(chunks, rejected_per_chunk):
                 knr = (
                     runner.num_reqs_max_model_len
@@ -2117,9 +2117,33 @@ class Eagle3Proposer:
             # Async: the seed scatter runs at the sampler's padded request
             # width (bucket-shaped, see above). Bootstrap: it stays real
             # [num_reqs]. Pad just the returned gather index.
+            bootstrap_ref = None
+            if (
+                envs.VLLM_TPU_DRAFT_SEED_BOOTSTRAP_PAD
+                and next_tokens_device is None
+                and num_reqs < p <= chunk.input_ids.shape[0]
+            ):
+                if envs.VLLM_TPU_VERIFY_FUSED_CHECK:
+                    bootstrap_ref = (last_token_indices, next_token_ids)
+                # Bootstrap at the loop bucket p instead, so the scatter hits a
+                # precompiled (T, p) key (a real [num_reqs] width compiles mid-
+                # serve). The pad repeats the last real (index, token) pair, so
+                # the duplicate writes are value-identical.
+                lti_p_np = np.full(p, last_token_indices_np[-1], dtype=np.int64)
+                lti_p_np[:num_reqs] = last_token_indices_np
+                last_token_indices = torch.from_numpy(lti_p_np).to(runner.device)
+                next_token_ids = next_token_ids.index_select(
+                    0,
+                    self._device_constant(
+                        ("seed_pad", num_reqs, p),
+                        lambda: torch.arange(p).clamp(max=num_reqs - 1),
+                    ),
+                )
             draft_input_ids = self._draft_seed_input_ids(
                 chunk.input_ids, last_token_indices, next_token_ids
             )
+            if bootstrap_ref is not None:
+                self._check_bootstrap_pad(chunk, draft_input_ids, *bootstrap_ref)
             if next_tokens_device is not None:
                 gather_indices = _maybe_pad_dim0(last_token_indices[:p], p)
             else:
@@ -2199,6 +2223,49 @@ class Eagle3Proposer:
                 self._seed_checks_done,
                 clean,
                 min(self._seed_checks_done, envs.VLLM_TPU_VERIFY_FUSED_CHECK_FAULT),
+                caught,
+            )
+
+    def _check_bootstrap_pad(
+        self,
+        chunk,
+        draft_input_ids: torch.Tensor,
+        last_token_indices: torch.Tensor,
+        next_token_ids: torch.Tensor,
+    ) -> None:
+        """VLLM_TPU_VERIFY_FUSED_CHECK for VLLM_TPU_DRAFT_SEED_BOOTSTRAP_PAD:
+        rerun the bootstrap seed scatter at the real request width and count
+        mismatching entries on device (first VLLM_TPU_VERIFY_FUSED_CHECK_FAULT
+        checks perturbed, as a positive control)."""
+        ref_ids = self._draft_seed_input_ids(
+            chunk.input_ids, last_token_indices, next_token_ids
+        )
+        done = self.__dict__.get("_bootstrap_checks_done", 0)
+        faulted = done < envs.VLLM_TPU_VERIFY_FUSED_CHECK_FAULT
+        cmp_ids = draft_input_ids
+        if faulted:
+            cmp_ids = draft_input_ids.clone()
+            cmp_ids[0] = cmp_ids[0] + 1
+        mism = (cmp_ids != ref_ids).sum().to(torch.int64)
+        delta = torch.stack(
+            [
+                mism * (0 if faulted else 1),
+                (mism > 0).to(torch.int64) * (1 if faulted else 0),
+            ]
+        )
+        prev = self.__dict__.get("_bootstrap_mismatches")
+        self._bootstrap_mismatches = delta if prev is None else prev + delta
+        self._bootstrap_checks_done = done + 1
+        if self._bootstrap_checks_done % 100 == 0:
+            clean, caught = self._bootstrap_mismatches.tolist()
+            logger.info(
+                "DRAFT_SEED_BOOTSTRAP_PAD_CHECK checks=%d clean_mismatched=%d "
+                "faulted_checks=%d faulted_caught=%d",
+                self._bootstrap_checks_done,
+                clean,
+                min(
+                    self._bootstrap_checks_done, envs.VLLM_TPU_VERIFY_FUSED_CHECK_FAULT
+                ),
                 caught,
             )
 
