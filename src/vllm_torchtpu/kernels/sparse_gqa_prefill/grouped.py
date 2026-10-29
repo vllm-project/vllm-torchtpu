@@ -149,6 +149,18 @@ def gather_interleaved(
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel")
         ),
+        cost_estimate=pl.CostEstimate(
+            flops=batch
+            * capacity
+            * head_axes
+            * (20 + 4 * (padded_budget // 128 + padded_table // 128)),
+            transcendentals=0,
+            bytes_accessed=4
+            * batch
+            * (capacity // tile_k)
+            * (1 + padded_budget + padded_table)
+            + 4 * batch * capacity * head_axes,
+        ),
         name="sc_prefill_prepare_interleaved_indices",
     )(
         lengths,
@@ -194,6 +206,14 @@ def gather_interleaved(
                 disable_bounds_checks=True,
             ),
             mesh=mesh,
+            cost_estimate=pl.CostEstimate(
+                flops=0,
+                transcendentals=0,
+                bytes_accessed=padded
+                * (
+                    4 + 2 * packing * dim * (jax.dtypes.itemsize_bits(cache.dtype) // 8)
+                ),
+            ),
             name="sc_prefill_interleaved_gather",
         ),
     )
@@ -397,6 +417,7 @@ def sc_grouped_attention(
         (None, kv_heads, head_group * query_group, dim), lambda b, *_: (b, 0, 0, 0)
     )
     state = (kv_heads, head_group * query_group, 128)
+    packed_elements = batch * kv_heads * head_group * dim
     y = pl.pallas_call(
         functools.partial(
             _attention,
@@ -429,6 +450,17 @@ def sc_grouped_attention(
             jnp.bfloat16,
         ),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        cost_estimate=pl.CostEstimate(
+            flops=batch
+            * kv_heads
+            * head_group
+            * query_group
+            * capacity
+            * (4 * dim + 10),
+            transcendentals=2 * batch * kv_heads * head_group * query_group * capacity
+            + packed_elements,
+            bytes_accessed=6 * packed_elements + compact.nbytes + lengths.nbytes,
+        ),
         name="sc_compact_grouped_prefill",
     )(lengths, pack(q), pack(gate), compact)
     y = y.reshape(

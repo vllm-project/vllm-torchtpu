@@ -16,6 +16,7 @@
 import functools
 import math
 import re
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -68,7 +69,7 @@ def _abstract_args(dtype=jnp.bfloat16):
 )
 def test_adaptive_envelope_preserves_existing_fallbacks(monkeypatch, fp8, case):
     info = pltpu.get_tpu_info_for_chip(
-        pltpu.ChipVersion.TPU_V5P if case == "hardware" else pltpu.ChipVersion.TPU_7X,
+        pltpu.ChipVersion.TPU_V5E if case == "hardware" else pltpu.ChipVersion.TPU_7X,
         1,
     )
     monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
@@ -92,9 +93,9 @@ def test_adaptive_envelope_preserves_existing_fallbacks(monkeypatch, fp8, case):
     if case == "scale":
         kwargs["v_scale"] = 2.0
     if case == "dynamic_scale":
-        kwargs["k_scale"] = jax.ShapeDtypeStruct((), jnp.float32)
+        kwargs["k_scale"] = cast(float, jax.ShapeDtypeStruct((), jnp.float32))
     assert is_supported_by_adaptive_prefill(*args, **kwargs) == (
-        case in ("supported", "ragged")
+        case in ("supported", "ragged", "page", "context", "budget")
     )
 
 
@@ -164,11 +165,14 @@ def test_adaptive_prefill_preserves_mixed_outputs_with_bounded_memory(
     cache = np.asarray(args[5]).copy()
     compiled = jax.jit(adaptive_prefill).lower(*args).compile()
     hlo = compiled.as_text()
+    assert hlo is not None
     assert ("sc_compact_grouped_prefill" in hlo) == (context > 8192)
     # Empirical compiler-plan regression budget, not a device capacity or
     # measured runtime peak. Keep the original mixed-output budget; unused
     # physical capacity is checked separately with fixed logical inputs.
-    temporary = compiled.memory_analysis().temp_size_in_bytes
+    memory = compiled.memory_analysis()
+    assert memory is not None
+    temporary = memory.temp_size_in_bytes
     record_property("compiler_temporary_bytes", temporary)
     assert temporary < 400 * 1024**2
     output, returned = compiled(*args)
@@ -237,7 +241,7 @@ def test_adaptive_prefill_preserves_mixed_outputs_with_bounded_memory(
         (262144, True),
         (128, True),
         (257, True),
-        (262400, False),
+        (262400, True),
     ],
 )
 def test_query_bucket_envelope(monkeypatch, tokens, supported):
@@ -270,7 +274,9 @@ def test_full_256k_compiler_workspace_growth_is_bounded_by_metadata(
         for i in range(5):
             args[i] = jax.ShapeDtypeStruct((tokens, *args[i].shape[1:]), args[i].dtype)
         compiled = jax.jit(adaptive_prefill, donate_argnums=(5,)).lower(*args).compile()
-        temporary.append(compiled.memory_analysis().temp_size_in_bytes)
+        memory = compiled.memory_analysis()
+        assert memory is not None
+        temporary.append(memory.temp_size_in_bytes)
         metadata.append(sum(x.size * np.dtype(x.dtype).itemsize for x in args[2:5]))
         record_property(f"compiler_temporary_bytes_{tokens}", temporary[-1])
     # Query/selected-KV workspaces stay chunk-local. Increasing the token
@@ -293,15 +299,18 @@ def test_output_only_attention_does_not_copy_unused_physical_cache(
     for capacity in (79, 463):
         args[5] = jax.ShapeDtypeStruct((capacity, *args[5].shape[1:]), args[5].dtype)
         compiled = jax.jit(lambda *xs: adaptive_prefill(*xs)[0]).lower(*args).compile()
+        memory = compiled.memory_analysis()
+        assert memory is not None
         record_property(
-            f"compiler_temporary_bytes_{capacity}_pages",
-            compiled.memory_analysis().temp_size_in_bytes,
+            f"compiler_temporary_bytes_{capacity}_pages", memory.temp_size_in_bytes
         )
         # Allocation/layout choices can change a little with physical capacity.
         # Test the unwanted whole-cache copy itself, not exact scratch bytes.
         # Synchronized capacity sweeps and device traces validate execution.
         dtype = "f8e4m3fn" if fp8 else "bf16"
-        for line in compiled.as_text().splitlines():
+        hlo = compiled.as_text()
+        assert hlo is not None
+        for line in hlo.splitlines():
             if not re.search(r"\bcopy(?:-start|-done)?\(", line):
                 continue
             result = line.split("=", 1)[1].split(" copy", 1)[0]

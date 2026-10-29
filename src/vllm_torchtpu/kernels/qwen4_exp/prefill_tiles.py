@@ -17,9 +17,16 @@ import jax
 import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
-# Scoped compiler budgets, below TPU7x's 64 MiB per core. The reference
-# Q256/H24/D256 paired kernel compiles to 61.13 MiB with FP8 KV.
-PAIRED_PAGE_VMEM_MIB = {128: 61, 256: 62}
+# Manual soft logical-array targets, independent of VMEM and compiler peaks.
+TC_SELECTION_TARGET_BYTES = 256 * 1024**2
+TC_PACKING_TARGET_BYTES = 256 * 1024**2
+TC_METADATA_BITSET_TARGET_BYTES = 16 * 1024**2
+TC_METADATA_MAX_BATCH_BLOCKS = 8
+
+
+def prefill_vmem_limit() -> int:
+    """Reserve one thirty-second of physical VMEM for compiler overhead."""
+    return pltpu.get_tpu_info().vmem_capacity_bytes * 31 // 32
 
 
 def _paired_working_set(
@@ -29,26 +36,25 @@ def _paired_working_set(
     packing: int,
     item_bytes: int,
     query_block: int,
+    kv_tile: int = 256,
 ) -> int:
-    # FP32 Q/accumulator, softmax scores/probabilities and max/mass, BF16 Q,
-    # and two native KV DMA buffers. This is a relative resource bound, not
-    # an exact compiler VMEM prediction (layouts/temporaries add overhead).
+    # FP32 Q/accumulator, scores/probabilities, max/mass and BF16 I/O.
     rows = query_block * query_heads
-    query_state = rows * ((2 * head_dim + 2 * 256 + 2) * 4 + head_dim * 2)
+    query_state = rows * ((2 * head_dim + 2 * kv_tile + 2) * 4 + head_dim * 4)
     native_heads = (2 * kv_heads + packing - 1) // packing * packing
-    return query_state + 2 * 256 * native_heads * head_dim * item_bytes
+    # Allow another copy of query state for layout conversions/temporaries.
+    return 2 * query_state + 2 * kv_tile * native_heads * head_dim * item_bytes
 
 
 def supports_paired_prefill(
-    query: jax.Array, cache: jax.Array, *, kv_heads: int, ratio: int, query_block: int
+    query: jax.Array | jax.ShapeDtypeStruct,
+    cache: jax.Array | jax.ShapeDtypeStruct,
+    *,
+    kv_heads: int,
+    ratio: int,
+    query_block: int,
 ) -> bool:
-    """Check segment addressing, packing and the validated VMEM footprint.
-
-    Token count is not a tile resource. Head counts are local geometry, with
-    no assumption about tensor-parallel degree or the GQA ratio. Other shapes
-    retain the general one-selection-word TC kernel. SparseCore's calibrated
-    costs are deliberately separate from this TC layout/resource policy.
-    """
+    """Check paired mask geometry, native packing and VMEM working set."""
     if query.ndim != 3 or cache.ndim != 5 or kv_heads <= 0:
         return False
     _, heads, dim = query.shape
@@ -60,33 +66,78 @@ def supports_paired_prefill(
         or query.dtype != jnp.bfloat16
         or cache.dtype not in (jnp.bfloat16, jnp.float8_e4m3fn)
         or ratio != 4
-        or query_block not in PAIRED_PAGE_VMEM_MIB
+        or query_block <= 0
+        or query_block > 256
+        or query_block % 8
         or cache.shape[1] <= 0
         or cache.shape[1] % 128
-        or pltpu.get_tpu_info().chip_version != pltpu.ChipVersion.TPU_7X
     ):
         return False
     item_bytes = jax.dtypes.itemsize_bits(cache.dtype) // 8
     packing = 4 // item_bytes
     if cache.shape[2:] != ((2 * kv_heads + packing - 1) // packing, packing, dim):
         return False
-    reference = _paired_working_set(24, 2, 256, 2, 2, 256)
     return (
         _paired_working_set(heads, kv_heads, dim, packing, item_bytes, query_block)
-        <= reference
+        <= prefill_vmem_limit()
     )
 
 
 def get_sparse_prefill_tiles(
-    query: jax.Array, cache: jax.Array, *, kv_heads: int, ratio: int
+    query: jax.Array | jax.ShapeDtypeStruct,
+    cache: jax.Array | jax.ShapeDtypeStruct,
+    *,
+    kv_heads: int,
+    ratio: int,
 ) -> tuple[int, int]:
-    """Use paired tiles within their footprint, independent of token bucket."""
-    for query_block in (256, 128):
-        if supports_paired_prefill(
-            query, cache, kv_heads=kv_heads, ratio=ratio, query_block=query_block
-        ):
-            return query_block, 256
-    # Bound query/state windows by the Q24/D256 footprint for other layouts.
-    rows = max(8, 256 * 24 * 256 // (query.shape[1] * cache.shape[-1]))
-    query_block = min(256, 1 << (rows.bit_length() - 1))
-    return query_block, ratio * 32
+    """Choose power-of-two query tiles from the affine VMEM forecast."""
+    if (
+        query.ndim != 3
+        or cache.ndim != 5
+        or kv_heads <= 0
+        or ratio <= 0
+        or min(query.shape[1:]) <= 0
+        or min(cache.shape[1:]) <= 0
+    ):
+        raise ValueError(
+            "Sparse prefill requires positive head, page, packing and ratio dimensions"
+        )
+    item_bytes = jax.dtypes.itemsize_bits(cache.dtype) // 8
+    limit = prefill_vmem_limit()
+
+    def capacity(kv_tile: int) -> int:
+        fixed = _paired_working_set(
+            query.shape[1],
+            kv_heads,
+            cache.shape[-1],
+            cache.shape[3],
+            item_bytes,
+            0,
+            kv_tile,
+        )
+        per_row = (
+            _paired_working_set(
+                query.shape[1],
+                kv_heads,
+                cache.shape[-1],
+                cache.shape[3],
+                item_bytes,
+                1,
+                kv_tile,
+            )
+            - fixed
+        )
+        # Automatic query tiles use powers of two, capped at one 256-row subtile.
+        affordable = min(256, (limit - fixed) // per_row)
+        # The caller and kernel require positive query tiles divisible by eight.
+        return 1 << (affordable.bit_length() - 1) if affordable >= 8 else 0
+
+    query_block = capacity(ratio * 32)
+    paired_query_block = capacity(256)
+    if paired_query_block >= query_block and supports_paired_prefill(
+        query, cache, kv_heads=kv_heads, ratio=ratio, query_block=paired_query_block
+    ):
+        return paired_query_block, 256
+    if query_block:
+        return query_block, ratio * 32
+    raise ValueError("Sparse prefill's smallest query tile exceeds available VMEM")

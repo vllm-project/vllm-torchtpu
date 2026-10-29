@@ -135,22 +135,22 @@ def test_measured_prefill_tiles_include_bf16_cache(tpu_info, page_size, dtype, p
         (8192, 128, pltpu.ChipVersion.TPU_V6E),
     ],
 )
-def test_bf16_prefill_unmeasured_shapes_keep_single_word_tiles(
-    monkeypatch, tokens, page_size, chip
-):
+def test_bf16_prefill_tiles_follow_page_alignment(monkeypatch, tokens, page_size, chip):
     monkeypatch.setattr(
         pltpu, "get_tpu_info", lambda: pltpu.get_tpu_info_for_chip(chip, 1)
     )
     shape = jax.ShapeDtypeStruct
     query = shape((tokens, 24, 256), jnp.bfloat16)
     cache = shape((3, page_size, 2, 2, 256), jnp.bfloat16)
-    assert get_sparse_prefill_tiles(query, cache, kv_heads=2, ratio=4) == (256, 128)
+    assert get_sparse_prefill_tiles(query, cache, kv_heads=2, ratio=4) == (
+        256,
+        256 if page_size % 128 == 0 else 128,
+    )
 
 
 @pytest.mark.parametrize(
     "query_block,page_size,head_axis,packing,dim,dtype",
     [
-        (64, 128, 2, 2, 256, jnp.bfloat16),
         (256, 129, 2, 2, 256, jnp.bfloat16),
         (256, 128, 3, 2, 256, jnp.bfloat16),
         (256, 128, 2, 2, 384, jnp.bfloat16),
@@ -210,7 +210,9 @@ def test_selected_bf16_prefill_tiles_run_paired_kernel(page_size):
         .lower(*args)
         .compile()
     )
-    assert "prefill_paired_pages" in compiled.as_text()
+    hlo = compiled.as_text()
+    assert hlo is not None
+    assert "prefill_paired_pages" in hlo
     actual, returned = compiled(*args)
     expected = jnp.broadcast_to(
         jnp.repeat(jnp.array([0.5, 1], jnp.bfloat16), 12)[None, :, None],
