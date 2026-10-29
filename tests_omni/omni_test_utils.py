@@ -16,11 +16,6 @@
 import numpy as np
 import torch
 
-# Failure messages of assert_parity for a numeric mismatch. Must-fail controls
-# match on it, so other AssertionErrors, such as a shape mismatch, do not
-# satisfy them.
-NUMERIC_MISMATCH_PATTERN = r"cosine similarity|relative L2 error|max absolute error"
-
 
 def compute_ssim(img1: np.ndarray, img2: np.ndarray) -> float:
     """Global (single-window) SSIM, mean over RGB channels."""
