@@ -1419,6 +1419,7 @@ class TPUModelRunner(GPUModelRunner):
         self._verify_fused_checks_left = envs.VLLM_TPU_VERIFY_FUSED_CHECK
         self._verify_fused_checks_done = 0
         self._verify_fused_mismatches: torch.Tensor | None = None
+        self._verify_fused_ro_mismatches: torch.Tensor | None = None
         self._num_reqs_device: dict[int, torch.Tensor] = {}
         self._fused_read_offsets: tuple = (None, 0)
         self._fused_read_offsets_applied = False
@@ -4835,8 +4836,24 @@ class TPUModelRunner(GPUModelRunner):
                 vals = vals.repeat(len(groups))
             else:
                 idx = groups[0].long()
+            ref_buf = (
+                self.mamba_slot_read_offsets.clone()
+                if self._verify_fused_checks_left > 0
+                else None
+            )
             self.mamba_slot_read_offsets.index_put_((idx,), vals)
             self._fused_read_offsets_applied = True
+            if ref_buf is not None:
+                # Check: the separate program's scatter on a copy must match.
+                _update_read_offsets_impl(
+                    ref_buf, groups, out, self._num_reqs_tensor(ro_num_reqs)
+                )
+                ro_mism = (ref_buf != self.mamba_slot_read_offsets).sum()
+                self._verify_fused_ro_mismatches = (
+                    ro_mism
+                    if self._verify_fused_ro_mismatches is None
+                    else self._verify_fused_ro_mismatches + ro_mism
+                )
         else:
             out = _verify_fused_compiled(*args)
         if self._verify_fused_checks_left > 0:
@@ -4920,13 +4937,19 @@ class TPUModelRunner(GPUModelRunner):
             or self._verify_fused_checks_left == 0
         ):
             clean, caught = self._verify_fused_mismatches.tolist()
+            ro = (
+                -1
+                if self._verify_fused_ro_mismatches is None
+                else int(self._verify_fused_ro_mismatches.item())
+            )
             logger.info(
                 "VERIFY_FUSED_CHECK checks=%d clean_mismatched_positions=%d "
-                "faulted_checks=%d faulted_caught=%d",
+                "faulted_checks=%d faulted_caught=%d read_offset_mismatches=%d",
                 self._verify_fused_checks_done,
                 clean,
                 min(self._verify_fused_checks_done, envs.VLLM_TPU_VERIFY_FUSED_CHECK_FAULT),
                 caught,
+                ro,
             )
 
     @_pp_step
