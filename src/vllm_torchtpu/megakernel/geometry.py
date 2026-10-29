@@ -20,6 +20,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from .comm.replication import derive_kh_rep, derive_sh_rep
 from .decls import (
     REQUIRED,
     FrozenDict,
@@ -35,15 +36,7 @@ if TYPE_CHECKING:
     from .model_def import ModelDef
 
 _KNOWN_FROM_HF_KEYS = frozenset(
-    {
-        "hidden",
-        "layers",
-        "vocab",
-        "eps",
-        "gdn_l2_eps",
-        "rope_theta",
-        "rope_partial",
-    }
+    ["hidden", "layers", "vocab", "eps", "gdn_l2_eps", "rope_theta", "rope_partial"]
 )
 
 
@@ -208,6 +201,9 @@ class ModelGeometry:
     def G(self, R: int) -> int:
         return R // self.NKV
 
+    def kh_rep(self, R: int) -> int:
+        return derive_kh_rep(R, self.KH)
+
     def kh(self, R: int) -> int:
         return GDNModule.lin_in_layout(self, R).kh
 
@@ -232,18 +228,17 @@ class ModelGeometry:
     def ER(self, R: int) -> int:
         return self.E // R
 
+    def sh_rep(self, R: int) -> int:
+        return derive_sh_rep(R, self.IS)
+
     def ISR(self, R: int) -> int:
-        return self.IS // R
+        return self.IS // max(1, R // self.sh_rep(R))
 
     def IR(self, R: int) -> int:
         return self.I // R if self.moe_tp else self.I
 
     def EW(self, R: int) -> int:
-        return (
-            self.e_slots
-            if self.e_slots > 0
-            else (self.E if self.moe_tp else self.ER(R))
-        )
+        return self.e_slots or (self.E if self.moe_tp else self.ER(R))
 
     @property
     def NGDN(self) -> int:
@@ -257,6 +252,7 @@ class ModelGeometry:
         R, B, T, M = ex.R, ex.B, ex.T, ex.M
         pc = min(1024, self.H)
         min_slots = self.E if self.moe_tp else self.ER(R)
+        sh_r = max(1, R // self.sh_rep(R))
         for cond, msg in (
             (
                 self.L % self.att_every == 0,
@@ -279,6 +275,10 @@ class ModelGeometry:
                 and self.H % pc == 0
                 and self.nh(R) <= 8,
                 f"Invalid E={self.E}, H={self.H}, nh={self.nh(R)}",
+            ),
+            (
+                R % self.sh_rep(R) == 0 and self.IS % sh_r == 0,
+                f"Invalid IS={self.IS}, R={R}, sh_rep={self.sh_rep(R)}",
             ),
             (
                 self.ROT % 2 == 0 and (R & (R - 1) == 0),
@@ -307,7 +307,8 @@ class ModelGeometry:
             if n % 128 != 0:
                 raise MegakernelConfigError(f"Dimension {n} must be a multiple of 128")
         if self.NGDN > 0:
-            if not (self.KH % R == 0 and self.VH % R == 0 and self.VH % self.KH == 0):
+            kh_ok = self.KH % R == 0 or (self.KH > 0 and R % self.KH == 0)
+            if not (kh_ok and self.VH % R == 0 and self.VH % self.KH == 0):
                 raise MegakernelConfigError(
                     f"Invalid GDN heads KH={self.KH}, VH={self.VH}, R={R}"
                 )
@@ -381,19 +382,14 @@ class ModelGeometry:
             object.__setattr__(shrunk, "_model_def", mdef)
         return shrunk
 
-    def to_model_spec(self) -> ModelSpec:
+    def to_model_spec(self, R: int = 8) -> ModelSpec:
         """Convert this geometry into its declarative `ModelSpec`."""
         mdef = getattr(self, "_model_def", None)
         if mdef is not None:
-            return mdef.to_model_spec(self)
+            return mdef.to_model_spec(self, R=R)
         raise MegakernelConfigError(
             "ModelGeometry is not bound to a ModelDef; call ModelDef.to_model_spec(g)"
         )
 
 
-__all__ = [
-    "FromHF",
-    "LMHead",
-    "ModelGeometry",
-    "_BoundFromHF",
-]
+__all__ = ["FromHF", "LMHead", "ModelGeometry", "_BoundFromHF"]

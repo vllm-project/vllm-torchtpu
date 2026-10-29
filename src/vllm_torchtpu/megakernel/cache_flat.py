@@ -56,7 +56,7 @@ def make_flat_pooled_step(
     Flat output signature:
       `(out_hidden, *raw_pools_out)`
     """
-    ms = resolve_model_spec(model_spec)
+    ms = resolve_model_spec(model_spec, R=ex.R)
     pb = require_pool_backend(ms)
     pb.layout.validate(ex)
     use_fused = should_fuse_pool_io(

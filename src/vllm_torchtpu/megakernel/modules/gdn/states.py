@@ -24,6 +24,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from ...comm.replication import replicate_groups
 from ...ops import BF16, F32, I32, U32, bswitch, rup
 from ...pool.backend import kernel_debug_check
 from ...pool.config import cache_exec
@@ -316,13 +317,18 @@ def gdn_init_logical_states(
     """Initialize unfolded `[R, n_layers, ...]` GDN `conv` and `rec` states."""
     lay = gdn_lin_in_layout(g, ex)
     k_conv, k_rec = jax.random.split(key)
+    conv = (
+        jax.random.normal(
+            k_conv, (ex.R, n_layers, ex.NS, conv_taps, lay.QKV), dtype=F32
+        )
+        * 0.05
+    )
+    kh_rep = max(1, int(ex.R) // int(g.KH))
+    if kh_rep > 1:
+        qk = 2 * lay.kh * lay.KD
+        conv = conv.at[..., :qk].set(replicate_groups(conv[..., :qk], kh_rep))
     return {
-        "conv": (
-            jax.random.normal(
-                k_conv, (ex.R, n_layers, ex.NS, conv_taps, lay.QKV), dtype=F32
-            )
-            * 0.05
-        ),
+        "conv": conv,
         "rec": (
             jax.random.normal(
                 k_rec, (ex.R, n_layers, ex.NS, lay.vh, lay.KD, lay.VD), dtype=BF16

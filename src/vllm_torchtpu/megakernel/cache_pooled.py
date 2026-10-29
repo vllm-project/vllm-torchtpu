@@ -98,7 +98,7 @@ def make_pooled_step(
          `hid, raw_pools = step(pos, hidden, weights, raw_pools, page_table,
                                 [*extra_inputs], [active_seqs])`
     """
-    ms = resolve_model_spec(model_spec)
+    ms = resolve_model_spec(model_spec, R=ex.R)
     pb = require_pool_backend(ms)
     pb.layout.validate(ex)
     use_fused = should_fuse_pool_io(

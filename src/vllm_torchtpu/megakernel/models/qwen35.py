@@ -21,7 +21,7 @@ from typing import Any
 
 from .. import cache, kernel
 from ..exec_spec import ExecSpec
-from ..geometry import _GEOM_FIELD_NAMES, FromHF, ModelGeometry
+from ..geometry import FromHF, ModelGeometry
 from ..model_def import LMHead, ModelDef, register_model
 from ..modules import GDN, GQA, Embedding, GDNModule, GQAModule, MoE, MoEModule, Norm
 from ..schedule import FromHFLayerTypes, Schedule
@@ -49,13 +49,12 @@ class Qwen35Geometry(ModelGeometry):
     """Architecture geometry for Qwen3.5-397B-A17B."""
 
     def __init__(self, **overrides: Any) -> None:
-        if not set(_GEOM_FIELD_NAMES).issubset(overrides):
-            overrides = dataclasses.asdict(Qwen35.derive_geometry()) | overrides
-        super().__init__(**overrides)
+        base: dict[str, Any] = dataclasses.asdict(FULL) if "FULL" in globals() else {}
+        super().__init__(**(base | overrides))
 
-    def to_model_spec(self) -> ModelSpec:
+    def to_model_spec(self, R: int = 8) -> ModelSpec:
         """Convert this geometry into its declarative `ModelSpec`."""
-        return qwen35_spec(self)
+        return qwen35_spec(self, R=R)
 
 
 @register_model(
@@ -137,15 +136,18 @@ reference_step = Qwen35.reference_step
 
 
 def qwen35_spec(
-    g: Qwen35Geometry = FULL, gdn_module: Module | None = None
+    g: ModelGeometry = FULL,
+    gdn_module: Module | None = None,
+    *,
+    R: int = 8,
 ) -> ModelSpec:
     """Construct the declarative `ModelSpec` for Qwen3.5."""
-    return Qwen35.to_model_spec(g, gdn_module=gdn_module)
+    return Qwen35.to_model_spec(g, gdn_module=gdn_module, R=R)
 
 
 def build(g: Qwen35Geometry, ex: ExecSpec, *, gdn_module: Module | None = None):
     """Build Qwen3.5 megakernel `(call, info)` via the generic `kernel.build` engine."""
-    return kernel.build(qwen35_spec(g, gdn_module=gdn_module), ex)
+    return kernel.build(qwen35_spec(g, gdn_module=gdn_module, R=ex.R), ex)
 
 
 def make_step(
@@ -157,7 +159,7 @@ def make_step(
     donate_states: bool = False,
 ):
     """Build Qwen3.5 `jax.jit` + `shard_map` step `(step, info)`."""
-    spec = qwen35_spec(g, gdn_module=gdn_module)
+    spec = qwen35_spec(g, gdn_module=gdn_module, R=ex.R)
     return kernel.make_step(mesh, spec, ex, donate_states=donate_states)
 
 
@@ -173,7 +175,7 @@ def make_pooled_step(
     min_b_hi: int = 56,
 ):
     """Build Qwen3.5 paged-pool `shard_map` step (`PallasWriter`)."""
-    spec = qwen35_spec(g, gdn_module=gdn_module)
+    spec = qwen35_spec(g, gdn_module=gdn_module, R=ex.R)
     return cache.make_pooled_step(
         mesh,
         spec,

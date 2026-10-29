@@ -18,6 +18,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from ...comm.replication import SHARED_EXPERT_TILE, derive_sh_rep
 from ...decls import (
     REQUIRED,
     HFParamDecl,
@@ -84,9 +85,14 @@ def _moe_ew(g: Any, R: int) -> int:
     return int(g.E) if moe_tp else int(g.E) // R
 
 
+def _moe_sh_rep(g: Any, R: int) -> int:
+    return derive_sh_rep(R, int(g.IS))
+
+
 MOE_GEOMETRY_METHODS: dict[str, Any] = {
     "ER": lambda g, R: int(g.E) // R,
-    "ISR": lambda g, R: int(g.IS) // R,
+    "sh_rep": _moe_sh_rep,
+    "ISR": lambda g, R: int(g.IS) // max(1, R // _moe_sh_rep(g, R)),
     "IR": lambda g, R: (
         int(g.I) // R
         if bool(g.options.get("moe_tp", g.values.get("moe_tp", True)))
@@ -142,6 +148,9 @@ def moe_hf_params(
     def _n(canon: str) -> str:
         return rename.get(canon, canon)
 
+    # Shared-expert column slices narrower than one lane tile are replicated.
+    sh_groups = max(1, IS // SHARED_EXPERT_TILE)
+
     def _sh_gu_pair(
         canon: str, hf_stem: str, order: int, aliases: tuple[VLLMAlias, ...] = ()
     ) -> list[HFParamDecl]:
@@ -160,6 +169,7 @@ def moe_hf_params(
                     transpose=(1, 0),
                     quantize="fp8",
                     shard_axis=-1,
+                    shard_groups=sh_groups,
                 ),
                 vllm_aliases=aliases,
             ),
@@ -175,6 +185,7 @@ def moe_hf_params(
                     fuse_axis=-1,
                     scale_for=w_n,
                     shard_axis=-1,
+                    shard_groups=sh_groups,
                     small_field="sh13_s",
                 ),
             ),
@@ -314,7 +325,10 @@ def moe_hf_params(
                 hf_shape=(H, IS),
                 dtype=FP8,
                 transform=ParamTransform(
-                    transpose=(1, 0), quantize="fp8", shard_axis=0
+                    transpose=(1, 0),
+                    quantize="fp8",
+                    shard_axis=0,
+                    shard_groups=sh_groups,
                 ),
                 vllm_aliases=(
                     VLLMAlias(

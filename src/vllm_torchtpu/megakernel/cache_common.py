@@ -77,11 +77,14 @@ def resolve_active_seqs_mode(
     return "ref", jnp.asarray(active_seqs, dtype=jnp.int32)
 
 
-def resolve_model_spec(g_or_spec: Any) -> ModelSpec:
+def resolve_model_spec(g_or_spec: Any, *, R: int = 8) -> ModelSpec:
     if isinstance(g_or_spec, ModelSpec):
         return g_or_spec
     if hasattr(g_or_spec, "to_model_spec"):
-        return g_or_spec.to_model_spec()
+        try:
+            return g_or_spec.to_model_spec(R=R)
+        except TypeError:
+            return g_or_spec.to_model_spec()
     raise TypeError(
         "Expected a ModelSpec or a geometry config implementing .to_model_spec(), "
         f"got {type(g_or_spec).__name__}"
