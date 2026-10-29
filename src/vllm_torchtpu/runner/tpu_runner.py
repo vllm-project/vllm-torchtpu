@@ -4799,8 +4799,10 @@ class TPUModelRunner(GPUModelRunner):
     def _check_verify_fused(self, fused: torch.Tensor, args: tuple) -> None:
         """VLLM_TPU_VERIFY_FUSED_CHECK: rerun the separate programs on the
         same inputs and uniforms, count mismatching positions on device, and
-        log the running count every 500 checks (FAULT perturbs the compared
-        copy only, as a positive control)."""
+        log the running counts every 500 checks. The first
+        VLLM_TPU_VERIFY_FUSED_CHECK_FAULT checks perturb the compared copy
+        only (a positive control that must be caught); the rest must be
+        clean."""
         (
             logits,
             bonus_idx,
@@ -4849,15 +4851,20 @@ class TPUModelRunner(GPUModelRunner):
             do_sampling=True,
             topk_candidates=topk_candidates,
         )
+        faulted = self._verify_fused_checks_done < envs.VLLM_TPU_VERIFY_FUSED_CHECK_FAULT
         compared = fused
-        if envs.VLLM_TPU_VERIFY_FUSED_CHECK_FAULT:
+        if faulted:
             compared = fused.clone()
             compared[0, 0] = compared[0, 0] + 1
         mismatches = (compared != ref).sum().to(torch.int64)
+        # [clean mismatched positions, faulted checks that were caught]
+        delta = torch.stack(
+            [mismatches * (0 if faulted else 1), (mismatches > 0).to(torch.int64) * (1 if faulted else 0)]
+        )
         self._verify_fused_mismatches = (
-            mismatches
+            delta
             if self._verify_fused_mismatches is None
-            else self._verify_fused_mismatches + mismatches
+            else self._verify_fused_mismatches + delta
         )
         self._verify_fused_checks_left -= 1
         self._verify_fused_checks_done += 1
@@ -4865,11 +4872,14 @@ class TPUModelRunner(GPUModelRunner):
             self._verify_fused_checks_done % 500 == 0
             or self._verify_fused_checks_left == 0
         ):
+            clean, caught = self._verify_fused_mismatches.tolist()
             logger.info(
-                "VERIFY_FUSED_CHECK checks=%d mismatched_positions=%d fault=%s",
+                "VERIFY_FUSED_CHECK checks=%d clean_mismatched_positions=%d "
+                "faulted_checks=%d faulted_caught=%d",
                 self._verify_fused_checks_done,
-                int(self._verify_fused_mismatches.item()),
-                bool(envs.VLLM_TPU_VERIFY_FUSED_CHECK_FAULT),
+                clean,
+                min(self._verify_fused_checks_done, envs.VLLM_TPU_VERIFY_FUSED_CHECK_FAULT),
+                caught,
             )
 
     @_pp_step
