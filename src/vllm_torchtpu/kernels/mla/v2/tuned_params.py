@@ -1401,6 +1401,25 @@ def _k3_tp32_fp8_page256_entries() -> dict[TuningKey, TunableParams]:
             num_queries_per_block=1,
             vmem_limit_bytes=62914560,
         )
+    # DCP32 decode: the group's 96 heads over a 1/32 shard (2560 tokens of an
+    # 80K context): 0.274 ms at 16 sequences with (8 pages, batch 2), 0.477 ms
+    # at 64 with (8, 8), against 0.298 / 0.483 ms with the default.
+    for tokens in [2**i for i in range(15)]:
+        key = TuningKey(
+            case="batched_decode",
+            max_num_tokens=tokens,
+            actual_num_q_heads=96,
+            actual_lkv_dim=512,
+            actual_r_dim=64,
+            max_num_seqs=ANY_SIZE,
+            pages_per_seq=ANY_SIZE,
+        )
+        entries[key] = TunableParams(
+            decode_batch_size=2 if tokens <= 16 else 8,
+            num_kv_pages_per_block=8,
+            num_queries_per_block=1,
+            vmem_limit_bytes=62914560,
+        )
     return entries
 
 
