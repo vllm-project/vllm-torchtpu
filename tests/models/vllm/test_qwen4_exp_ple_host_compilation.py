@@ -256,3 +256,43 @@ def test_prelookup_rows_match_host_boundary(monkeypatch, fp8, check):
         bad = ple_offload._prelookup_check["bad"]
         assert ple_offload._prelookup_check["checked"] == 2
         assert (bad == 0) if check == "4" else (bad == 2), bad
+
+
+def test_prelookup_ids_fn_sees_no_dynamic_stamps(monkeypatch):
+    """The prelookup's compiled id lookup must not receive tensors still
+    stamped dynamic by an earlier compiled forward (dynamo would trace a
+    dynamic graph the TPU backend cannot lower): its tensors are top-level
+    arguments of the `_static_shape_args` wrapper."""
+    from vllm_torchtpu.models.vllm.qwen4_exp import model as model_mod
+    from vllm_torchtpu.models.vllm.qwen4_exp import ple_offload
+
+    seen = []
+
+    from vllm_torchtpu.spec_decode import eagle3  # noqa: F401  (import before patching)
+
+    def fake_compile(fn, **kwargs):
+        return fn
+
+    def lookup_ids(inputs, valid):
+        # What the compiled region would trace: every tensor it reads.
+        seen.extend(
+            bool(getattr(t, "_dynamo_dynamic_indices", None))
+            for t in (inputs.input_ids, inputs.query_start_loc, valid)
+        )
+        return inputs.input_ids + valid
+
+    monkeypatch.setattr(model_mod.torch, "compile", fake_compile)
+    monkeypatch.setattr(
+        ple_offload, "prelookup_rows", lambda ple, inputs, valid, fn: fn(inputs, valid)
+    )
+    ple = NS(_lookup_ids=lookup_ids)
+    owner = type("Owner", (), {})()
+    owner.model = NS(layers=[NS(ple=ple)], host_ple_index=0)
+    ids = torch.arange(8, dtype=torch.int32)
+    starts = torch.tensor([0, 8], dtype=torch.int32)
+    for t in (ids, starts):
+        torch._dynamo.mark_dynamic(t, 0)
+    kwargs = dict(query_start_loc=starts, ngram_context=torch.zeros(1, 2))
+    out = model_mod.Qwen4ExpForCausalLM._ple_prelookup(owner, ids, kwargs)
+    assert torch.equal(out, ids + 8)
+    assert seen and not any(seen), seen
