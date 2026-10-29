@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     QWEN4_EXP_PREFILL_SP_MIN_TOKENS: int = 1024
     QWEN4_EXP_PREFILL_SP_MOE: bool = False
     QWEN4_EXP_PREFILL_SP_SHARED_LOCAL: bool = False
+    QWEN4_EXP_PREFILL_SP_SHARED_LOCAL_MIN_PIECE: int = 4096
     QWEN4_EXP_PREFILL_SP_PAD_HC: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
@@ -979,6 +980,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # which decode keeps), so it needs no all-gather or reduce-scatter. Costs one full shared
     # expert of HBM per rank.
     "QWEN4_EXP_PREFILL_SP_SHARED_LOCAL": env_bool("QWEN4_EXP_PREFILL_SP_SHARED_LOCAL"),
+    # The shared-expert replica's graph serves only steps whose prefill pieces (requests with
+    # more than a verify window of tokens) are all at least this many tokens; other steps keep
+    # the TP shared expert (short and batched prompts keep its numerics).
+    "QWEN4_EXP_PREFILL_SP_SHARED_LOCAL_MIN_PIECE": env_int(
+        "QWEN4_EXP_PREFILL_SP_SHARED_LOCAL_MIN_PIECE", 4096
+    ),
     # With QWEN4_EXP_PREFILL_SP=1: the sequence-parallel graph pads each
     # rank's shard to the HC kernels' row tile, so buckets whose shard does
     # not divide it (1024 and 3072 at TP8) take sequence parallelism too.

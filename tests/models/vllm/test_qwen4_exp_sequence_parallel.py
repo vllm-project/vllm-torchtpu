@@ -254,6 +254,7 @@ def test_decoder_layer_sequence_parallel_matches_tp(
             None,
             sequence_parallel=sequence_parallel,
             sp_pad=pad,
+            shared_local=shared_local and sequence_parallel,
         )
         if pad:
             # 16 real rows per rank, padded to 24: the tail stays zero.
@@ -382,3 +383,59 @@ def test_padded_shards_only_with_the_sequence_parallel_moe(
     monkeypatch.setattr(sp.envs, "QWEN4_EXP_PREFILL_SP_PAD_HC", pad, raising=False)
     monkeypatch.setattr(sp.envs, "QWEN4_EXP_PREFILL_SP_MOE", moe, raising=False)
     assert sp.pad_hc_enabled() is expected
+
+
+def test_shared_local_graph_is_static_per_call(tp2, monkeypatch):
+    """Without shared_local=True (the plain SP graph) a layer that has the replica still
+    takes the TP shared expert: the replica is used only by the SP-local graph."""
+    from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
+        vllm_adapter as adaptive_moe,
+    )
+
+    monkeypatch.setattr(sp.envs, "QWEN4_EXP_PREFILL_SP_MOE", True, raising=False)
+    torch.random.default_generator.manual_seed(1)
+    moe_w = torch.randn(HIDDEN, HIDDEN) / HIDDEN**0.5
+    used = []
+
+    def run(rank):
+        mlp = SplitMoE(tp2, moe_w)
+        mlp.shared_expert_local = lambda b: used.append(rank) or torch.zeros_like(b)
+        monkeypatch.setattr(
+            adaptive_moe, "run_adaptive_fused_moe",
+            lambda method, block, *a, attr: mlp.routed(block, mlp.gate(block)[0]),
+        )
+        layer = make_layer(tp2, "linear_attention", hc_module(), hc_module(), moe_w, moe_w)
+        layer.mlp = mlp
+        block = tp2.shard(torch.randn(TOKENS, HIDDEN).bfloat16())
+        return layer._sequence_parallel_moe(block, TOKENS)
+
+    tp2.run(run)
+    assert used == []
+
+
+@pytest.mark.parametrize(
+    "lengths,expected",
+    [
+        ([7680], True),  # one full chunk
+        ([4096, 4, 4, 4], True),  # long piece + verify windows
+        ([4096, 3000], False),  # a short prefill piece
+        ([4, 4, 4], False),  # decode only
+        ([300] * 20, False),  # batched short prompts (GSM8K-like)
+    ],
+)
+def test_shared_local_route_needs_every_prefill_piece_long(monkeypatch, lengths, expected):
+    import numpy as np
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.inputs import Qwen4ExpAdapter
+
+    monkeypatch.setattr(sp.envs, "QWEN4_EXP_PREFILL_SP_SHARED_LOCAL_MIN_PIECE", 4096, raising=False)
+    model = SimpleNamespace(model_sp_local=object(), sp_shared_local_step=None)
+    qsl = np.concatenate([[0], np.cumsum(lengths)]).astype(np.int32)
+    adapter = SimpleNamespace(
+        runner=SimpleNamespace(model=model, query_start_loc_np=qsl), spec_window=4
+    )
+    Qwen4ExpAdapter._route_shared_local(
+        adapter, SimpleNamespace(row_start=0, num_requests=len(lengths))
+    )
+    assert model.sp_shared_local_step is expected
