@@ -251,7 +251,7 @@ class _LazyOffload:
 
 # TODO(vllm-project/vllm#52735): Remove TPU_OFFLOAD_KEEP_EAGLE_TAIL and
 # keep_unannotated_eagle_tail once the pinned vLLM includes
-# vllm-project/vllm#52735.
+# vllm-project/vllm#52771.
 def keep_unannotated_eagle_tail(
     config: SchedulerOffloadConfig,
     kv_cache_groups: Sequence[KVCacheGroupSpec],
@@ -265,7 +265,7 @@ def keep_unannotated_eagle_tail(
     group's hit as a "volatile draft tail", and drops a one-chunk hit
     entirely. GLM-5.2's MTP layer shares the target's single group, so every
     tier hit recomputes one whole chunk (4096 tokens under DCP16). vLLM main
-    treats an unannotated group as a regular group (vllm-project/vllm#52735):
+    treats an unannotated group as a regular group (vllm-project/vllm#52771):
     drafter KV served one chunk stale can only lower speculative acceptance,
     because the target verifies every draft. On a P/D prefill leg the chunk is
     not even stale: lazy offload stores only whole blocks written by prefills,

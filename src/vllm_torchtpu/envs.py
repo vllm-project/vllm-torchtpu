@@ -1732,11 +1732,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Offload tier: serve the whole tier hit when no KV cache group is
     # annotated as an MTP/EAGLE drafter group. The pinned vLLM then flags every
     # group as a drafter group and pops the last chunk of every tier hit (vLLM
-    # main stopped doing so, vllm-project/vllm#52735). The offload-tier
+    # main stopped doing so, vllm-project/vllm#52771). The offload-tier
     # counterpart of VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP
     # (offload/raiden_connector.py).
     # TODO(vllm-project/vllm#52735): Remove once the pinned vLLM includes
-    # vllm-project/vllm#52735.
+    # vllm-project/vllm#52771.
     "TPU_OFFLOAD_KEEP_EAGLE_TAIL": env_bool(
         "TPU_OFFLOAD_KEEP_EAGLE_TAIL", default=False
     ),

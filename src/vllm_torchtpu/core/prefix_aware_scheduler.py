@@ -28,8 +28,8 @@ With a CPU offload tier behind the HBM prefix cache (an offloading KV
 connector), a session the HBM cache evicted is still cached: its prompt loads
 from the tier asynchronously and needs little prefill compute. Ranked on HBM
 residency alone it looks fully cold, so under a deep queue it waits behind
-every warm request (an AgentX GLM-5.2 P/D replay measured ~34 s mean, ~75 s at
->= 15 queued, versus ~5 s for warm requests). TPU_PREFIX_AWARE_TIER_WARMTH=1
+every warm request (an AgentX GLM-5.2 P/D replay measured ~33 s mean, ~75 s at
+>= 15 queued, versus 1.8-5.8 s for warm requests). TPU_PREFIX_AWARE_TIER_WARMTH=1
 also counts the whole chunks the tier holds right past the HBM hit as warm, so
 such a request is ranked by the compute it actually needs.
 
