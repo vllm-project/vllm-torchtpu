@@ -280,3 +280,50 @@ def test_device_dequant_matches_cpu_reference_bit_for_bit():
         actual = _dequantize_mxfp4_packed_on_device(packed, scale, -1, out_dtype)
         assert actual.dtype == expected.dtype
         assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "hidden_blocks,inter_blocks,second_minor",
+    [
+        (14, 6, True),  # DeepSeek-V4: 7168 / 512 and 3072 / 512
+        (16, 8, False),
+        (14, 8, False),
+    ],
+)
+def test_w4a8_prebuild_reads_scales_block_major_off_the_sublane_tile(
+    hidden_blocks, inter_blocks, second_minor
+):
+    # torch_tpu stores an [E, blocks, N] scale table expert-second-minor only
+    # when `blocks` is not a whole number of sublane tiles, so the flag must
+    # follow both block counts.
+    from unittest.mock import patch
+
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.adapter import fused_moe_ep
+    from vllm_torchtpu.layers.adapter.quantization.mxfp4 import (
+        REQUANTIZED_BLOCK_SIZE as block,
+    )
+
+    experts, hidden, inter = 8, hidden_blocks * block, inter_blocks * block
+    layer = SimpleNamespace(
+        renormalize=True,
+        moe_config=SimpleNamespace(
+            experts_per_token=2,
+            moe_parallel_config=SimpleNamespace(use_ep=True),
+        ),
+    )
+    with (
+        patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", True),
+        patch.object(envs, "MOE_FUSED_EP_ENABLE_W4A8", True),
+        patch.object(fused_moe_ep, "prebuild_fused_moe_ep", return_value="op") as pre,
+    ):
+        op = VllmDeepseekV4Mxfp4MoEMethod._prebuild_w4a8(
+            object.__new__(VllmDeepseekV4Mxfp4MoEMethod),
+            layer,
+            "silu",
+            torch.empty((experts, hidden, 2 * inter), device="meta"),
+            torch.empty((experts, inter, hidden), device="meta"),
+            inter,
+        )
+    assert op == "op"
+    assert pre.call_args.kwargs["scales_expert_second_minor"] is second_minor

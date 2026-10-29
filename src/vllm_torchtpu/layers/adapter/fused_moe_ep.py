@@ -181,6 +181,7 @@ def _build_op(
     *,
     token_replica_groups=None,
     sorted_gather=None,
+    scales_expert_second_minor=False,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
@@ -203,6 +204,7 @@ def _build_op(
         has_hash_ids,
         token_replica_groups,
         None if sorted_gather is None else sorted_gather[1],
+        scales_expert_second_minor,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -244,6 +246,7 @@ def _build_op(
             mesh_ep_ranks=mesh_expert_order,
             sharded_plan=sharded_plan,
             token_replica_groups=token_replica_groups,
+            scales_expert_second_minor=scales_expert_second_minor,
             **bias_kw,
             **routing_kw,
         )
@@ -766,6 +769,7 @@ def prebuild_fused_moe_ep(
     rhs_qb=None,
     weights=None,
     supplies_hash_ids=False,
+    scales_expert_second_minor=False,
 ) -> Any | None:
     """Resolve the mesh and build the fused-EP op for one layer.
 
@@ -784,6 +788,9 @@ def prebuild_fused_moe_ep(
     layer under a method that is not would route every token by top-k instead,
     silently. So the layer's table alone does not admit it; the caller's
     promise does.
+
+    `scales_expert_second_minor` is passed through to `fused_ep_moe_v2`: the
+    caller knows the device layout its scale tables are staged in.
 
     `weights` optionally supplies (w1, w2, w1_scale, w2_scale) before they are
     installed on the layer. NVFP4 uses meta tensors describing the proposed
@@ -946,6 +953,7 @@ def prebuild_fused_moe_ep(
         has_hash_ids,
         token_replica_groups=token_replica_groups,
         sorted_gather=sorted_gather,
+        scales_expert_second_minor=scales_expert_second_minor,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "

@@ -1362,6 +1362,7 @@ def vmem_scratch_arrays(
     rhs_qb=QB4,
     has_w1_bias=False,
     has_w2_bias=False,
+    scale_slots=None,
 ):
     """The kernel's VMEM scratch buffers, as (name, shape, dtype).
 
@@ -1395,8 +1396,8 @@ def vmem_scratch_arrays(
         weights = [
             ("w1_vm", (nbuf, hidden // PACK4, 2 * inter), jnp.uint32),
             ("w2_vm", (nbuf, inter // PACK4, hidden), jnp.uint32),
-            ("w1s_vm", (nbuf, hidden // rhs_qb, 2 * inter), jnp.float32),
-            ("w2s_vm", (nbuf, inter // rhs_qb, hidden), jnp.float32),
+            ("w1s_vm", (scale_slots or nbuf, hidden // rhs_qb, 2 * inter), jnp.float32),
+            ("w2s_vm", (scale_slots or nbuf, inter // rhs_qb, hidden), jnp.float32),
         ]
     else:
         weights = [
@@ -1532,6 +1533,7 @@ def vmem_estimate_bytes(
     has_w1_bias=False,
     has_w2_bias=False,
     info=None,
+    scale_slots=None,
 ):
     """VMEM one built kernel occupies, from the arrays it declares.
 
@@ -1557,6 +1559,7 @@ def vmem_estimate_bytes(
         rhs_qb=rhs_qb,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        scale_slots=scale_slots,
     )
     arrays += vmem_tile_body_arrays(
         capacity, hidden, inter, weight_format=weight_format, rhs_qb=rhs_qb

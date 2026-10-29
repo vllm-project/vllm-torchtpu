@@ -401,6 +401,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         Shapes are read off those tensors rather than recomputed so the two
         cannot drift apart. Returns the op, or None to leave this layer on GMM.
         """
+        from vllm_torchtpu.kernels.fused_moe.v2.host import U32_SUBLANE_TILE
         from vllm_torchtpu.layers.adapter.fused_moe_ep import prebuild_fused_moe_ep
 
         if not (
@@ -455,6 +456,15 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             rhs_qb=block,
             weights=weights,
             supplies_hash_ids=True,
+            # torch_tpu lays out an [E, blocks, N] f32 table whose block count
+            # is not a whole number of sublane tiles with the expert axis
+            # second-minor ({2,0,1}). At block 512 DeepSeek-V4's 14 and 6
+            # blocks are not whole tiles, and the served step's HLO shows that
+            # layout relayouted on every call.
+            scales_expert_second_minor=(
+                (hidden // block) % U32_SUBLANE_TILE != 0
+                and (inter // block) % U32_SUBLANE_TILE != 0
+            ),
         )
 
     def _resolve_tpu_activation(self, layer) -> str:
