@@ -23,6 +23,13 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 
+# Tokens whose f32 accumulators stay resident in VMEM while one weight block is
+# reused across them; each weight block is read from HBM once per this many.
+# Costs 2 * tokens * state_width * 4 bytes of VMEM (8 MiB at state_width 1024),
+# next to two (tile_k, state_width) bf16 weight buffers (8 MiB at tile_k 2048);
+# 1024 is the largest serving token padding, so every call is a single block.
+MAX_RESIDENT_TOKENS = 1024
+
 
 @dataclasses.dataclass(frozen=True)
 class TileSizes:
@@ -31,6 +38,7 @@ class TileSizes:
     tile_m: int  # output dimension
     tile_k: int  # hidden dimension
     tile_n: int  # sequence length
+    tiles_per_block: int  # token tiles sharing one fetch of a weight block
 
 
 @dataclasses.dataclass(frozen=True)
@@ -64,6 +72,14 @@ class Configs:
     @property
     def num_n(self) -> int:
         return pl.cdiv(self.dims.size_n, self.tile_sizes.tile_n)
+
+    @property
+    def num_token_blocks(self) -> int:
+        return self.num_n // self.tile_sizes.tiles_per_block
+
+    @property
+    def num_acc_slots(self) -> int:
+        return self.num_m * self.tile_sizes.tiles_per_block
 
 
 def load_from_acc_ref(ref, dtype=None):
@@ -113,28 +129,29 @@ def kernel(
     # output
     _,  # unused output ref (aliased to cache)
     # scratch_memory
-    acc_ref,  # (2, tile_n, slots_per_m_tile, 1, 128)
-    sem_ref,
-    write_counts_ref,  # [2]
+    acc_ref,  # (num_acc_slots, tile_n, slots_per_m_tile, 1, 128)
+    sem_ref,  # [num_acc_slots]
+    write_counts_ref,  # [num_acc_slots]
     *,
     cfgs: Configs,
 ):
     """Inner kernel executing matmul, APE addition, and paged writes."""
     tile_m = cfgs.tile_sizes.tile_m
     tile_n = cfgs.tile_sizes.tile_n
+    tiles_per_block = cfgs.tile_sizes.tiles_per_block
     last_dim = acc_ref.shape[-1]
     slots_per_m_tile = tile_m // last_dim
     acc_ref_u8 = acc_ref.bitcast(jnp.uint8)
     # A CSA int32 NoPE array hosts the state too; write it as uint8 slabs.
     cache = csa_cache_layout.as_u8_slabs(cache)
-    write_counts_ref[0] = 0
-    write_counts_ref[1] = 0
+    for slot in range(cfgs.num_acc_slots):
+        write_counts_ref[slot] = 0
 
     def _dma_copy_out(n_idx_val, m_idx_val, buf_idx_val):
         """Copys one tile from accumulator to the KV cache.
 
-        We run the dma one tile after the previous tile is done computing, using a
-        double buffer on the k dimension.
+        We run the dma one grid step after the tile is done computing; each
+        token tile of a token block has its own accumulator slot per m tile.
 
         The reason we do this in the following tile is that we hope to pipeline the
         DMA with the matmuls.
@@ -168,13 +185,11 @@ def kernel(
         tiled_hidden_states_ref,  # (tile_n, tile_k)
         tiled_positions_ref,  # (tile_n,)
     ):
-        n_idx = pl.program_id(0)
+        b_idx = pl.program_id(0)
         m_idx = pl.program_id(1)
         k_idx = pl.program_id(2)
-        tile_idx = (
-            n_idx * cfgs.num_m + m_idx
-        )  # omit k_idx because we write to the same buffer, double buffer on k
-        buf_idx = tile_idx % 2
+        j_idx = pl.program_id(3)
+        buf_idx = m_idx * tiles_per_block + j_idx
 
         state_width = cfgs.dims.size_m // 2
 
@@ -221,13 +236,19 @@ def kernel(
                 def _do_wait():
                     pl.semaphore_wait(sem_ref.at[buf_idx], count)
 
-            # 2. Launch DMA for the PREVIOUS tile
+            # 2. Launch DMA for the PREVIOUS tile, in (b, m, j) order
             if copy_dma:
-                prev_tile_idx = tile_idx - 1
-                prev_n_idx = prev_tile_idx >> 1
-                prev_m_idx = prev_tile_idx & 1
-                prev_buf_idx = 1 - buf_idx
-                _dma_copy_out(prev_n_idx, prev_m_idx, prev_buf_idx)
+                first_j = j_idx == 0
+                prev_j = jnp.where(first_j, tiles_per_block - 1, j_idx - 1)
+                prev_m = jnp.where(
+                    first_j, jnp.where(m_idx > 0, m_idx - 1, cfgs.num_m - 1), m_idx
+                )
+                prev_b = jnp.where(first_j & (m_idx == 0), b_idx - 1, b_idx)
+                _dma_copy_out(
+                    prev_b * tiles_per_block + prev_j,
+                    prev_m,
+                    prev_m * tiles_per_block + prev_j,
+                )
 
             # 3. Matmul
             prod = _matmul()
@@ -251,7 +272,10 @@ def kernel(
         is_last_k = k_idx == (num_k - 1)
         is_score = m_idx * tile_m >= state_width
 
-        copy_dma = (k_idx == 0) & (tile_idx > 0)
+        # True when the previous grid step was the last k step of a tile.
+        copy_dma = (is_last_k & (j_idx > 0)) | (
+            (k_idx == 0) & (j_idx == 0) & ((m_idx > 0) | (b_idx > 0))
+        )
         add_ape = is_last_k & is_score
 
         @pl.when(jnp.logical_not(copy_dma) & jnp.logical_not(add_ape))
@@ -276,23 +300,23 @@ def kernel(
 
     wkv_spec = pl.BlockSpec(
         (cfgs.tile_sizes.tile_k, cfgs.tile_sizes.tile_m),
-        lambda n, m, k: (k, m),
+        lambda b, m, k, j: (k, m),
         memory_space=pltpu.VMEM,
     )
     hidden_states_spec = pl.BlockSpec(
         (cfgs.tile_sizes.tile_n, cfgs.tile_sizes.tile_k),
-        lambda n, m, k: (n, k),
+        lambda b, m, k, j: (b * tiles_per_block + j, k),
         memory_space=pltpu.VMEM,
     )
     positions_spec = pl.BlockSpec(
         (cfgs.tile_sizes.tile_n,),
-        lambda n, m, k: (n,),
+        lambda b, m, k, j: (b * tiles_per_block + j,),
         memory_space=pltpu.VMEM,
     )
 
     pipeline_fn = pltpu.emit_pipeline(
         inner_kernel,
-        grid=(cfgs.num_n, cfgs.num_m, cfgs.num_k),
+        grid=(cfgs.num_token_blocks, cfgs.num_m, cfgs.num_k, tiles_per_block),
         in_specs=(
             wkv_spec,
             hidden_states_spec,
@@ -307,15 +331,10 @@ def kernel(
     )
 
     # Epilogue: launch DMA for the last tile and wait for all outstanding DMAs
-    last_tile_idx = cfgs.num_n * cfgs.num_m - 1
-    last_n_idx = last_tile_idx // cfgs.num_m
-    last_m_idx = last_tile_idx % cfgs.num_m
-    last_buf_idx = last_tile_idx % 2
+    if cfgs.num_n > 0:
+        _dma_copy_out(cfgs.num_n - 1, cfgs.num_m - 1, cfgs.num_acc_slots - 1)
 
-    if last_tile_idx >= 0:
-        _dma_copy_out(last_n_idx, last_m_idx, last_buf_idx)
-
-    for b in range(2):
+    for b in range(cfgs.num_acc_slots):
         count = write_counts_ref[b][...]
 
         @pl.when(count > 0)
@@ -375,7 +394,10 @@ def proj_and_save_state(
     # The token dimension must be an exact multiple of `tile_n`.
     sublane_tile = 8
     tile_n = min(128, pl.cdiv(num_tokens, sublane_tile) * sublane_tile)
-    padded_num_tokens = pl.cdiv(num_tokens, tile_n) * tile_n
+    num_n = pl.cdiv(num_tokens, tile_n)
+    num_token_blocks = pl.cdiv(num_n, max(1, MAX_RESIDENT_TOKENS // tile_n))
+    tiles_per_block = pl.cdiv(num_n, num_token_blocks)
+    padded_num_tokens = num_token_blocks * tiles_per_block * tile_n
     if padded_num_tokens != num_tokens:
         pad = padded_num_tokens - num_tokens
         hidden_states = jnp.pad(hidden_states, ((0, pad), (0, 0)))
@@ -390,7 +412,9 @@ def proj_and_save_state(
         compress_ratio=compress_ratio,
     )
 
-    tile_sizes = TileSizes(tile_m=tile_m, tile_k=tile_k, tile_n=tile_n)
+    tile_sizes = TileSizes(
+        tile_m=tile_m, tile_k=tile_k, tile_n=tile_n, tiles_per_block=tiles_per_block
+    )
 
     cfgs = Configs(
         tile_sizes=tile_sizes,
@@ -401,9 +425,11 @@ def proj_and_save_state(
     last_dim = cache.shape[-1]
     slots_per_m_tile = tile_m // last_dim
     scratch_shapes = [
-        pltpu.VMEM((2, tile_n, slots_per_m_tile, 1, last_dim), jnp.float32),
-        pltpu.SemaphoreType.REGULAR((2,)),
-        pltpu.SMEM((2,), jnp.int32),
+        pltpu.VMEM(
+            (cfgs.num_acc_slots, tile_n, slots_per_m_tile, 1, last_dim), jnp.float32
+        ),
+        pltpu.SemaphoreType.REGULAR((cfgs.num_acc_slots,)),
+        pltpu.SMEM((cfgs.num_acc_slots,), jnp.int32),
     ]
 
     out_shape = jax.ShapeDtypeStruct(cache.shape, cache.dtype)
