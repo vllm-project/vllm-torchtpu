@@ -794,13 +794,13 @@ class Qwen4ExpBackbone(nn.Module):
                         compressed_block_table,
                     )
                 continue
-            block, _ = layer.attn_hyper_connection.mix(hidden)
+            block, _ = layer.attn_hyper_connection.mix(hidden, small_rows=True)
             if in_kernel:
                 attention = layer.self_attn.select_for_kernel(block, positions64, metadata)
             else:
                 attention = layer.self_attn.attend(block, positions64, metadata)
             hidden = segment_call(s, hidden, attention)
-        mixed = self.hyper_connection_mixer.mix(hidden)[0]
+        mixed = self.hyper_connection_mixer.mix(hidden, small_rows=True)[0]
         if self.emit_mtp_hidden:
             return mixed, hidden
         return mixed
@@ -844,13 +844,13 @@ class Qwen4ExpBackbone(nn.Module):
         )
         cap = getattr(segment_call, "attention_rows", 0)  # as forward_segments
         in_kernel = bool(cap) and int(hidden.shape[0]) <= cap
-        block, _ = last.attn_hyper_connection.mix(hidden)
+        block, _ = last.attn_hyper_connection.mix(hidden, small_rows=True)
         if in_kernel:
             attention = last.self_attn.select_for_kernel(block, positions64, metadata)
         else:
             attention = last.self_attn.attend(block, positions64, metadata)
         hidden = segment_call(len(qsa_layers) - 1, hidden, attention)
-        mixed = self.hyper_connection_mixer.mix(hidden)[0]
+        mixed = self.hyper_connection_mixer.mix(hidden, small_rows=True)[0]
         if self.emit_mtp_hidden:
             return mixed, hidden
         return mixed
