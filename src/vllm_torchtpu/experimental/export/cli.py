@@ -272,52 +272,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return args
 
 
-# Speculative methods the artifact can declare: ngram drafts on the host from the
-# sequence itself, so it needs no exported draft graphs.
-SPECULATIVE_METHODS = ("ngram",)
-_SPECULATIVE_FIELDS = frozenset(
-    {"method", "num_speculative_tokens", "prompt_lookup_max", "prompt_lookup_min"}
-)
-
-
 def export_speculative_config(raw: Any) -> dict[str, Any] | None:
     """The `serving_config.speculative_config` for `--speculative-config`.
 
-    Keeps vLLM's field names. Rejects methods that would need exported draft
-    graphs (MTP, EAGLE, a draft model) and fields the runtime would not honor.
+    The exporter declares no speculative method yet. The serving runtime no
+    longer drafts with ngram, and MTP needs exported `mtp_draft` executables,
+    which the exporter does not produce yet. Any method fails here, before the
+    export starts.
     """
     if raw is None:
         return None
     cfg = json.loads(raw) if isinstance(raw, str) else dict(raw)
     method = cfg.get("method")
-    if method not in SPECULATIVE_METHODS:
+    if method == "ngram":
         raise ValueError(
-            f"--speculative-config method {method!r} is not supported by the "
-            f"exporter; supported: {', '.join(SPECULATIVE_METHODS)}"
+            "--speculative-config: the serving runtime no longer drafts with ngram"
         )
-    unknown = sorted(set(cfg) - _SPECULATIVE_FIELDS)
-    if unknown:
-        raise ValueError(
-            f"--speculative-config fields {unknown} are not supported for method "
-            f"{method!r}; supported: {sorted(_SPECULATIVE_FIELDS)}"
-        )
-
-    def positive(name: str) -> int:
-        value = cfg.get(name)
-        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-            raise ValueError(
-                f"--speculative-config {name} must be a positive integer, got {value!r}"
-            )
-        return value
-
-    lookup_max = positive("prompt_lookup_max")
-    cfg.setdefault("prompt_lookup_min", lookup_max)
-    return {
-        "method": method,
-        "num_speculative_tokens": positive("num_speculative_tokens"),
-        "prompt_lookup_max": lookup_max,
-        "prompt_lookup_min": positive("prompt_lookup_min"),
-    }
+    raise ValueError(
+        f"--speculative-config method {method!r} is not supported yet: the "
+        "exporter does not produce draft executables (MTP's mtp_draft is planned)"
+    )
 
 
 def create_vllm_config_from_args(args: argparse.Namespace) -> Any:
