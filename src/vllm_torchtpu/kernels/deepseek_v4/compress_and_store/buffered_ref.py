@@ -115,6 +115,30 @@ def _divmod_static(x, d: int):
     return x // d, x % d
 
 
+def _count_tokens(tile_n, global_idx, kv_slot_mapping_ref, is_first_mask_ref=None):
+    """Tokens of a tile with a kv slot (and, given the mask, marked first)."""
+    count = 0
+    for n in range(tile_n):
+        taken = kv_slot_mapping_ref[global_idx + n] >= 0
+        if is_first_mask_ref is not None:
+            taken = taken & is_first_mask_ref[global_idx + n]
+        count = count + taken.astype(jnp.int32)
+    return count
+
+
+def _wait_leading(vmem_ref, sem, count):
+    """Waits once for DMAs that moved `count` leading entries of `vmem_ref`.
+
+    A DMA signals its semaphore by the bytes it moved, so one descriptor of
+    their total size waits for all of them, whichever entries they filled.
+    """
+
+    @pl.when(count > 0)
+    def _wait():
+        rows = vmem_ref.at[pl.ds(0, count)]
+        pltpu.make_async_copy(rows, rows, sem).wait()
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class WindowRef(_BufferedRef):
@@ -268,20 +292,8 @@ class OutputRef(_BufferedRef):
         tile_n = self.cfgs.tile_sizes.tile_n
         global_idx = pid * tile_n
         _, kv_slot_mapping_ref, _ = src_ref
-
-        @pl.loop(0, tile_n, unroll=True)
-        def loop_body(n):
-            idx_n = global_idx + n
-            kv_slot = kv_slot_mapping_ref[idx_n]
-            valid = kv_slot >= 0
-
-            @pl.when(valid)
-            def _wait_nope():
-                pltpu.make_async_copy(
-                    vmem_ref.at[n, 0, :, :],
-                    vmem_ref.at[n, 0, :, :],
-                    sem,
-                ).wait()
+        count = _count_tokens(tile_n, global_idx, kv_slot_mapping_ref)
+        _wait_leading(vmem_ref, sem, count)
 
     def copy_out(self, dest_ref, grid_indices):
         assert self.sem_sends is not None
@@ -348,40 +360,16 @@ class OutputRef(_BufferedRef):
 
         if self.cfgs.dims.seq_along_lane:
             return
+        # copy_out wrote all record_rows rows of each counted token.
         if is_indexer:
             _, kv_slot_mapping_ref, is_first_mask_ref = dest_ref
-
-            @pl.loop(0, tile_n, unroll=True)
-            def loop_body(n):
-                idx_n = global_idx + n
-                kv_slot = kv_slot_mapping_ref[idx_n]
-                is_first = is_first_mask_ref[idx_n]
-                valid = (kv_slot >= 0) & is_first
-
-                @pl.when(valid)
-                def _wait_nope():
-                    pltpu.make_async_copy(
-                        vmem_ref.at[n, 0, :, :],
-                        vmem_ref.at[n, 0, :, :],
-                        sem,
-                    ).wait()
+            count = _count_tokens(
+                tile_n, global_idx, kv_slot_mapping_ref, is_first_mask_ref
+            )
         else:
             _, kv_slot_mapping_ref = dest_ref
-
-            @pl.loop(0, tile_n, unroll=True)
-            def loop_body(n):
-                idx_n = global_idx + n
-                kv_slot = kv_slot_mapping_ref[idx_n]
-
-                @pl.when(kv_slot >= 0)
-                def _wait_nope():
-                    @pl.loop(0, self.cfgs.record_rows, unroll=True)
-                    def wait_loop(o):
-                        pltpu.make_async_copy(
-                            vmem_ref.at[n, o, :, :],
-                            vmem_ref.at[n, o, :, :],
-                            sem,
-                        ).wait()
+            count = _count_tokens(tile_n, global_idx, kv_slot_mapping_ref)
+        _wait_leading(vmem_ref, sem, count)
 
 
 @jax.tree_util.register_dataclass
@@ -432,20 +420,10 @@ class RoPEOutputRef(_BufferedRef):
         global_idx = pid * tile_n
         _, kv_slot_mapping_ref, is_first_mask_ref = src_ref
 
-        @pl.loop(0, tile_n, unroll=True)
-        def loop_body(n):
-            idx_n = global_idx + n
-            kv_slot = kv_slot_mapping_ref[idx_n]
-            is_first = is_first_mask_ref[idx_n]
-            valid = kv_slot >= 0
-
-            @pl.when(valid & is_first)
-            def _wait_rope():
-                pltpu.make_async_copy(
-                    vmem_ref.at[n, :, :],
-                    vmem_ref.at[n, :, :],
-                    sem,
-                ).wait()
+        count = _count_tokens(
+            tile_n, global_idx, kv_slot_mapping_ref, is_first_mask_ref
+        )
+        _wait_leading(vmem_ref, sem, count)
 
     def copy_out(self, dest_ref, grid_indices):
         assert self.sem_sends is not None
@@ -488,20 +466,10 @@ class RoPEOutputRef(_BufferedRef):
 
         _, kv_slot_mapping_ref, is_first_mask_ref = dest_ref
 
-        @pl.loop(0, tile_n, unroll=True)
-        def loop_body(n):
-            idx_n = global_idx + n
-            kv_slot = kv_slot_mapping_ref[idx_n]
-            is_first = is_first_mask_ref[idx_n]
-            valid = kv_slot >= 0
-
-            @pl.when(valid & is_first)
-            def _wait_rope():
-                pltpu.make_async_copy(
-                    vmem_ref.at[n, :, :],
-                    vmem_ref.at[n, :, :],
-                    sem,
-                ).wait()
+        count = _count_tokens(
+            tile_n, global_idx, kv_slot_mapping_ref, is_first_mask_ref
+        )
+        _wait_leading(vmem_ref, sem, count)
 
 
 def create_allocs_and_specs(
