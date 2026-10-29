@@ -198,6 +198,9 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
     TPU_STATIC_DECODE_INPUTS: bool = False
     TPU_STATIC_DECODE_INPUTS_VERIFY: bool = False
+    # Fuse MTP draft step 0 into compiled draft loop; requires
+    # VLLM_TPU_FUSED_DRAFT_LOOP.
+    TPU_DRAFT_STEP0_IN_LOOP: bool = False
 
 
 def env_with_choices(
@@ -1170,6 +1173,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_STATIC_DECODE_INPUTS_VERIFY": env_bool(
         "TPU_STATIC_DECODE_INPUTS_VERIFY", default=False
     ),
+    # Fuse MTP draft step 0, inter-step gather, and token proposal into the
+    # compiled draft loop program (_MtpFullDraftLoop). Requires
+    # VLLM_TPU_FUSED_DRAFT_LOOP=1.
+    "TPU_DRAFT_STEP0_IN_LOOP": env_bool("TPU_DRAFT_STEP0_IN_LOOP", default=False),
 }
 
 
