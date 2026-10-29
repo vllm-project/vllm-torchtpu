@@ -89,8 +89,18 @@ With flat expert parallelism, rank `r` holds experts `r * S .. (r + 1) * S - 1` 
 routed layer's experts to ranks instead, for example to spread the most-used experts:
 
 ```bash
-TPU_EXPERT_PLACEMENT=examples/expert_placement/glm52_ep16_c32_4k.json \
+TPU_EXPERT_PLACEMENT=glm52_ep16_c32_4k \
   vllm serve zai-org/GLM-5.2-FP8 --tensor-parallel-size 16 --enable-expert-parallel ...
+```
+
+The table lists, per routed layer, the global expert ids each rank holds in slot order:
+`experts / shards` ids per rank and every expert exactly once; other keys, such as `meta`,
+are ignored. `TPU_EXPERT_PLACEMENT` takes a path, a `gs://` URI or the name of a table
+shipped in `src/vllm_torchtpu/expert_placements/`.
+
+```json
+{"experts": 256, "shards": 16,
+ "layers": {"3": [[27, 225, "...16 ids"], "...16 ranks"], "...": []}}
 ```
 
 - **What changes:** each placed layer's expert map, EP weight filter and router rows
@@ -98,14 +108,21 @@ TPU_EXPERT_PLACEMENT=examples/expert_placement/glm52_ep16_c32_4k.json \
   the same experts with the same weights (an exact tie of biased scores may break the other
   way); only the order of its top-k sum can change. No kernel changes and nothing runs per
   token.
-- **Table:** `layers["<n>"].cores[r]` lists the global expert ids of rank `r` in slot
-  order; every layer must be a permutation (no copies). Format and examples:
-  `examples/expert_placement/README.md`.
+- **Shipped tables:** `glm52_ep16_c32_4k` and `glm52_ep16_c32_8k` place
+  `zai-org/GLM-5.2-FP8` on flat EP16 (layers 3-77) for 4,096- and 8,192-token prefill
+  chunks. Both were solved from one routing profile, the per-layer expert hit counts of an
+  AgentX trace-replay serving run at concurrency 32 (MTP 3, 4,096-token prefill chunks,
+  2,508 s window, 1,836 requests, decode and prefill steps), for the time-weighted
+  busiest-rank MoE cost of decode steps and prefill chunks; each file's `meta` records the
+  weights and cost model. A table helps only when the busiest rank's expert load sets the
+  MoE time; at low token counts per rank every rank streams most of its experts and a
+  permutation changes little.
 - **Refused at load:** layers outside the routed decoder layers (dense or MTP layers),
   listed layers without expert parallelism, `TPU_MOE_EP_TP_SIZE > 1`,
   `TPU_MOE_HIERARCHICAL_EP`, an `--expert-placement-strategy` other than `linear`, grouped
-  top-k, hash-routed layers, a table that places no layer, and a model whose router weight
-  is not named `.mlp.gate.weight` (the stream would not reorder it).
+  top-k, hash-routed layers, a table that places no layer, a `--load-format` that the
+  default and Run:AI loaders do not serve, and a model whose router weight is not named
+  `.mlp.gate.weight` (the stream would not reorder it).
 - **Check delivery:** with a table, every expert-parallel worker logs one line,
   `[eplb] placement installed ep_rank=<r> layers=<n> table_sha256=<16 hex>`.
 

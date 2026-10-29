@@ -21,7 +21,6 @@ import hashlib
 import json
 import logging
 import subprocess
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -41,12 +40,7 @@ DRAFT = "mtp.layers.0.mlp.experts"
 
 def _plain_table():
     cores = [[3, 0], [2, 1]]
-    return {
-        "shards": 2,
-        "experts": 4,
-        "slots_per_core": 2,
-        "layers": {"0": {"cores": cores}, "1": {"cores": cores}},
-    }
+    return {"shards": 2, "experts": 4, "layers": {"0": cores, "1": cores}}
 
 
 @pytest.fixture
@@ -122,7 +116,7 @@ def test_gs_uri_is_read_with_gcloud(monkeypatch):
 @pytest.mark.parametrize(
     ("case", "match"),
     [
-        ("copies", "copies are not supported"),
+        ("copies", "must list 2 ranks of 2 experts each"),
         ("listed_twice", "layer 0 is listed twice"),
     ],
 )
@@ -130,8 +124,7 @@ def test_invalid_tables_are_refused(use_table, case, match):
     table = _plain_table()
     if case == "copies":
         # Rank 0 also holds a copy of expert 2, rank 1 one of expert 3.
-        table.update(slots_per_core=3, owned_per_core=2, copies=True)
-        table["layers"] = {"0": {"cores": [[3, 0, 2], [2, 1, 3]]}}
+        table["layers"] = {"0": [[3, 0, 2], [2, 1, 3]]}
     else:
         table["layers"]["00"] = table["layers"]["0"]
     use_table(table)
@@ -272,14 +265,8 @@ def _glm_table(layers, seed=0):
     for layer in layers:
         perm = torch.randperm(GLM_EXPERTS, generator=generator).tolist()
         cores = [perm[r * GLM_OWNED : (r + 1) * GLM_OWNED] for r in range(GLM_RANKS)]
-        entries[str(layer)] = {"cores": cores}
-    return {
-        "shards": GLM_RANKS,
-        "experts": GLM_EXPERTS,
-        "slots_per_core": GLM_OWNED,
-        "owned_per_core": GLM_OWNED,
-        "layers": entries,
-    }
+        entries[str(layer)] = cores
+    return {"shards": GLM_RANKS, "experts": GLM_EXPERTS, "layers": entries}
 
 
 def test_glm52_weight_streams_place_the_router(use_table, installed, monkeypatch):
@@ -523,18 +510,18 @@ def test_glm52_round_robin_placement_strategy_is_refused(
         ("out_of_range", "exactly once"),
         ("15_ranks", "must list 16 ranks"),
         ("uneven_slots", "must list 16 ranks"),
-        ("255_experts", "must equal"),
+        ("255_experts", "do not divide over 16 ranks"),
     ],
 )
 def test_glm52_bad_tables_are_refused(use_table, mutate, match):
     table = _glm_table(GLM_PLACED)
-    cores = table["layers"]["40"]["cores"]
+    cores = table["layers"]["40"]
     if mutate == "duplicate":
         cores[1][0] = cores[0][0]
     elif mutate == "out_of_range":
         cores[1][0] = GLM_EXPERTS
     elif mutate == "15_ranks":
-        table["layers"]["40"]["cores"] = cores[:15]
+        table["layers"]["40"] = cores[:15]
     elif mutate == "uneven_slots":
         cores[0].append(cores[1].pop())
     else:
@@ -599,13 +586,40 @@ def test_id_dependent_routing_is_refused(
         )
 
 
-@pytest.mark.parametrize("name", ["glm52_ep16_c32_4k.json", "glm52_ep16_c32_8k.json"])
-def test_glm52_example_tables_validate(name):
-    path = Path(__file__).parents[2] / "examples" / "expert_placement" / name
-    table = ep.parse(json.loads(path.read_bytes()), name)
+# sha256 of "<layer>:<ids>;..." over the sorted layers (each layer's ids rank by
+# rank) of the shipped tables, taken from their earlier {"cores": ...} files.
+SHIPPED_SLOT_ORDERS = {
+    "glm52_ep16_c32_4k": (
+        "3e7c020ba503b7a77dd9cbd6b101b353cc77c2b8b2a264e83e9966d9ee3e5d82"
+    ),
+    "glm52_ep16_c32_8k": (
+        "320cdc18136f6c80ec6bb7cdc8fae040ef4f604e00024e63e64ea96d29d341e1"
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(SHIPPED_SLOT_ORDERS))
+def test_glm52_shipped_tables_load_by_name(monkeypatch, name):
+    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", name)
+    ep._load.cache_clear()
+    try:
+        table = ep.placement()
+    finally:
+        ep._load.cache_clear()
     assert (table.experts, table.ranks) == (GLM_EXPERTS, GLM_RANKS)
     ep.check_layers(table, 3, 78, name)
     assert sorted(table.cores) == list(range(3, 78))
+    orders = ";".join(
+        f"{n}:" + ",".join(map(str, ep.virtual_order(table, n)))
+        for n in sorted(table.cores)
+    )
+    assert hashlib.sha256(orders.encode()).hexdigest() == SHIPPED_SLOT_ORDERS[name]
+
+
+def test_unknown_table_name_is_refused(monkeypatch):
+    monkeypatch.setenv("TPU_EXPERT_PLACEMENT", "glm52_no_such_table")
+    with pytest.raises(FileNotFoundError, match="glm52_ep16_c32_4k"):
+        ep.placement()
 
 
 def test_glm52_ep_off_with_a_table_is_refused(

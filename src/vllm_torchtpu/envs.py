@@ -1196,8 +1196,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     )
     .strip()
     .lower(),
-    # Path or gs:// URI of a per-layer expert placement JSON applied at load
-    # (expert_placement.py). Empty keeps vLLM's linear placement.
+    # Path, gs:// URI or shipped name (vllm_torchtpu/expert_placements/<name>.json)
+    # of a per-layer expert placement JSON applied at load (expert_placement.py).
+    # Empty keeps vLLM's linear placement.
     "TPU_EXPERT_PLACEMENT": env_str("TPU_EXPERT_PLACEMENT", ""),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and

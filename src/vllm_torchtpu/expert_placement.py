@@ -13,12 +13,13 @@
 # limitations under the License.
 """Static per-layer expert placement for expert parallelism.
 
-``TPU_EXPERT_PLACEMENT`` names a JSON table (a path or a ``gs://`` URI) that
-lists, per MoE layer, the global experts each EP rank holds in slot order:
-``layers[<n>].cores[r]`` holds ``slots_per_core`` expert ids, and every expert
-appears exactly once across the ranks. A table is a permutation of vLLM's
-linear placement: every rank keeps the same number of experts and no expert is
-copied.
+``TPU_EXPERT_PLACEMENT`` names a JSON table (a path, a ``gs://`` URI or the name
+of a table shipped in ``expert_placements/``) that lists, per MoE layer, the
+global experts each EP rank holds in slot order:
+``{"experts": E, "shards": S, "layers": {"<n>": [[ids...], ...S ranks...]}}``,
+``E / S`` ids per rank and every expert exactly once across the ranks; other
+keys (such as ``meta``) are ignored. A table is a permutation of vLLM's linear
+placement: every rank keeps the same number of experts and no expert is copied.
 
 A placed layer's expert map, the EP weight filter and the router's rows follow
 the table. The router rows are reordered so that rank r's experts become
@@ -40,6 +41,7 @@ import dataclasses
 import functools
 import hashlib
 import json
+import os
 import re
 import subprocess
 
@@ -86,37 +88,33 @@ class Placement:
 
 
 def parse(table: dict, source: str) -> Placement:
-    """Validate a placement table: each layer a permutation of the experts."""
+    """Validate a placement table: each layer a permutation of the experts,
+    experts / shards to a rank."""
     experts = int(table["experts"])
     ranks = int(table["shards"])
-    slots = int(table["slots_per_core"])
-    if table.get("copies", False):
+    if experts % ranks:
         raise ValueError(
-            f"expert placement {source}: tables with expert copies are not "
-            "supported; give every slot a distinct expert"
+            f"expert placement {source}: {experts} experts do not divide over "
+            f"{ranks} ranks"
         )
-    if ranks * slots != experts:
-        raise ValueError(
-            f"expert placement {source}: {ranks} ranks x {slots} slots must "
-            f"equal {experts} experts"
-        )
+    slots = experts // ranks
     cores = {}
-    for key, entry in table["layers"].items():
+    for key, held in table["layers"].items():
         layer = int(key)
         if layer in cores:
             raise ValueError(
                 f"expert placement {source}: layer {layer} is listed twice"
             )
-        rows = tuple(tuple(int(e) for e in c) for c in entry["cores"])
+        rows = tuple(tuple(int(e) for e in c) for c in held)
         if len(rows) != ranks or any(len(c) != slots for c in rows):
             raise ValueError(
                 f"expert placement {source}: layer {layer} must list {ranks} "
-                f"ranks x {slots} slots"
+                f"ranks of {slots} experts each"
             )
         if sorted(e for c in rows for e in c) != list(range(experts)):
             raise ValueError(
-                f"expert placement {source}: layer {layer} must hold every "
-                "expert exactly once"
+                f"expert placement {source}: layer {layer} must hold each of the "
+                f"{experts} experts exactly once"
             )
         cores[layer] = rows
     return Placement(experts, ranks, slots, cores)
@@ -195,9 +193,27 @@ def _load(uri: str) -> Placement:
     return table
 
 
+# Tables shipped with the package, by name (a file stem in this directory).
+PLACEMENT_DIR = os.path.join(os.path.dirname(__file__), "expert_placements")
+
+
+def resolve(value: str) -> str:
+    """A path or gs:// URI as given, or a shipped table's name -> its file."""
+    if value.startswith("gs://") or os.sep in value or value.endswith(".json"):
+        return value
+    path = os.path.join(PLACEMENT_DIR, f"{value}.json")
+    if not os.path.exists(path):
+        shipped = sorted(f[:-5] for f in os.listdir(PLACEMENT_DIR))
+        raise FileNotFoundError(
+            f"TPU_EXPERT_PLACEMENT={value!r} is neither a path nor a shipped "
+            f"placement {shipped}"
+        )
+    return path
+
+
 def placement() -> Placement | None:
-    uri = envs.TPU_EXPERT_PLACEMENT
-    return _load(uri) if uri else None
+    value = envs.TPU_EXPERT_PLACEMENT
+    return _load(resolve(value)) if value else None
 
 
 def _placed_layer(table: Placement | None, name: str) -> int | None:

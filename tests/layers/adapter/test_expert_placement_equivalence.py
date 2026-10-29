@@ -99,15 +99,11 @@ def table(tmp_path, monkeypatch):
     layers = {}
     for layer in (LAYER, OTHER_LAYER):
         perm = rng.permutation(E)
-        layers[str(layer)] = {
-            "cores": [perm[r * SLOTS : (r + 1) * SLOTS].tolist() for r in range(RANKS)]
-        }
+        layers[str(layer)] = [
+            perm[r * SLOTS : (r + 1) * SLOTS].tolist() for r in range(RANKS)
+        ]
     path = tmp_path / "placement.json"
-    path.write_text(
-        json.dumps(
-            {"shards": RANKS, "experts": E, "slots_per_core": SLOTS, "layers": layers}
-        )
-    )
+    path.write_text(json.dumps({"shards": RANKS, "experts": E, "layers": layers}))
     monkeypatch.setenv("TPU_EXPERT_PLACEMENT", str(path))
     ep._load.cache_clear()
     table = ep.placement()
