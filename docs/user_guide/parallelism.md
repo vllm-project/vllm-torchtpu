@@ -106,9 +106,8 @@ TPU_EXPERT_PLACEMENT=examples/expert_placement/glm52_ep16_c32_4k.json \
   `TPU_MOE_HIERARCHICAL_EP`, an `--expert-placement-strategy` other than `linear`, grouped
   top-k, hash-routed layers, a table that places no layer, and a model whose router weight
   is not named `.mlp.gate.weight` (the stream would not reorder it).
-- **Check delivery:** every expert-parallel worker logs one line,
-  `[eplb] placement installed ep_rank=<r> layers=<n> table_sha256=<16 hex>`, or
-  `[eplb] placement none ep_rank=<r>` without a table.
+- **Check delivery:** with a table, every expert-parallel worker logs one line,
+  `[eplb] placement installed ep_rank=<r> layers=<n> table_sha256=<16 hex>`.
 
 ---
 

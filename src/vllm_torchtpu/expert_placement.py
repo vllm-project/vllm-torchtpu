@@ -344,28 +344,6 @@ def _announce(table: Placement | None) -> None:
         )
 
 
-def _install_none_marker() -> None:
-    """Without a table: log "[eplb] placement none ep_rank=<r>" once per worker
-    at its first expert-parallel MoE layer. Nothing else changes."""
-    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
-
-    if getattr(RoutedExperts, "_tpu_expert_placement_none_marker", False):
-        return
-    update_info = RoutedExperts.update_expert_map_info
-
-    def update_expert_map_info(self) -> None:
-        if not _STATE.get("announced") and self.moe_config.moe_parallel_config.use_ep:
-            _STATE["announced"] = True
-            logger.info(
-                "[eplb] placement none ep_rank=%d",
-                self.expert_map_manager.ep_rank,
-            )
-        update_info(self)
-
-    RoutedExperts.update_expert_map_info = update_expert_map_info
-    RoutedExperts._tpu_expert_placement_none_marker = True
-
-
 def install_expert_placement() -> None:
     """Apply TPU_EXPERT_PLACEMENT to MoE layers as vLLM builds them.
 
@@ -375,7 +353,6 @@ def install_expert_placement() -> None:
     created. Both loaders' weight streams reorder the router rows.
     """
     if not envs.TPU_EXPERT_PLACEMENT:
-        _install_none_marker()
         return
     from vllm.model_executor.layers.fused_moe import expert_map_manager
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts

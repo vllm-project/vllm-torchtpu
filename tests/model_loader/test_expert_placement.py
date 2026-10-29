@@ -471,29 +471,6 @@ def test_glm52_installed_line_once_per_worker_on_16_ranks(
     ]
 
 
-def test_glm52_none_line_once_per_worker_without_a_table(
-    installed, worker, monkeypatch, eplb_lines
-):
-    monkeypatch.delenv("TPU_EXPERT_PLACEMENT", raising=False)
-    ep._load.cache_clear()
-    monkeypatch.setattr(
-        RoutedExperts, "_tpu_expert_placement_none_marker", False, raising=False
-    )
-    _glm_config(monkeypatch)
-    installed()
-    for rank in range(GLM_RANKS):
-        worker()
-        for experts in _build_glm_worker(rank).values():
-            local = experts._expert_map.tolist()
-            assert [e for e in range(GLM_EXPERTS) if local[e] >= 0] == list(
-                range(GLM_OWNED * rank, GLM_OWNED * (rank + 1))
-            )
-    assert [m for m in eplb_lines if m.startswith("[eplb]")] == [
-        f"[eplb] placement none ep_rank={r}" for r in range(GLM_RANKS)
-    ]
-    assert not ep._LOCAL_IDS
-
-
 @pytest.mark.parametrize(
     ("layers", "match"),
     [
