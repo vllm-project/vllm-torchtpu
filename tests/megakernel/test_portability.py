@@ -165,10 +165,10 @@ def _assert_package_is_framework_free(pkg: str) -> None:
 
 
 def test_comm_package_is_framework_free():
-    """`megakernel/comm/` imports only stdlib, jax, numpy and core spec modules.
-
-    Collectives stay model-free and below the kernel builder: no `models/`,
-    `modules/`, `vmem`, `kernel` or cache imports, so any model or runtime can
-    reuse them.
-    """
+    """`megakernel/comm/` imports only stdlib, jax, numpy and core spec modules."""
     _assert_package_is_framework_free("comm")
+
+
+def test_ops_package_is_framework_free():
+    """`megakernel/ops/` imports only stdlib, jax, numpy and core spec modules."""
+    _assert_package_is_framework_free("ops")
