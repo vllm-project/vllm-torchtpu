@@ -617,24 +617,40 @@ run_spec_benchmarks() {
     # Resolve Spec-Bench dataset
     if [ "$DRY_RUN" = "1" ]; then
         SPEC_BENCH_DATASET="${SPEC_BENCH_DATASET:-/workspace/datasets/spec_bench_question.jsonl}"
-    elif [ -z "$SPEC_BENCH_DATASET" ] || [ ! -f "$SPEC_BENCH_DATASET" ]; then
+    elif [ -z "$SPEC_BENCH_DATASET" ] || [ ! -s "$SPEC_BENCH_DATASET" ]; then
         local default_dataset_path="/tmp/spec_bench_question.jsonl"
-        if [ ! -f "$default_dataset_path" ]; then
+        local dataset_url="https://raw.githubusercontent.com/hemingkx/Spec-Bench/main/data/spec_bench/question.jsonl"
+        if [ ! -s "$default_dataset_path" ]; then
             echo "Downloading spec_bench_question.jsonl to $default_dataset_path..."
+            local tmp_download="${default_dataset_path}.partial"
             if command -v curl &>/dev/null; then
-                curl -sSL --connect-timeout 5 "https://raw.githubusercontent.com/hemingkx/Spec-Bench/main/data/spec_bench/question.jsonl" -o "$default_dataset_path" || true
+                curl -fsSL --connect-timeout 5 "$dataset_url" -o "$tmp_download" || rm -f "$tmp_download"
             elif command -v wget &>/dev/null; then
-                wget -q --timeout=5 -O "$default_dataset_path" "https://raw.githubusercontent.com/hemingkx/Spec-Bench/main/data/spec_bench/question.jsonl" || true
+                wget -q --timeout=5 -O "$tmp_download" "$dataset_url" || rm -f "$tmp_download"
+            fi
+            if [ -s "$tmp_download" ]; then
+                mv "$tmp_download" "$default_dataset_path"
             fi
         fi
-        if [ -f "$default_dataset_path" ]; then
-            SPEC_BENCH_DATASET="$default_dataset_path"
-        else
-            echo "WARNING: Could not download Spec-Bench dataset. Using fallback path: $default_dataset_path"
-            SPEC_BENCH_DATASET="$default_dataset_path"
+        if [ ! -s "$default_dataset_path" ]; then
+            echo "ERROR: Spec-Bench dataset not found and download from $dataset_url failed."
+            echo "Set SPEC_BENCH_DATASET to a local copy of question.jsonl."
+            exit 1
         fi
+        SPEC_BENCH_DATASET="$default_dataset_path"
     fi
     echo "Using Spec-Bench dataset: $SPEC_BENCH_DATASET (category: $SPEC_BENCH_CATEGORY)"
+
+    # Every K > 0 needs a drafting method; fail before starting any server.
+    if [ -z "$SPEC_METHOD" ]; then
+        for k in $SPEC_K_LIST; do
+            if [ "$k" -gt 0 ]; then
+                echo "ERROR: SPEC_K_LIST contains K=$k but SPEC_METHOD is empty."
+                echo "Set SPEC_METHOD (e.g. ngram, eagle3, mtp) or use SPEC_K_LIST=0."
+                exit 1
+            fi
+        done
+    fi
 
     local exit_code=0
     for bs in $SPEC_BS_LIST; do
