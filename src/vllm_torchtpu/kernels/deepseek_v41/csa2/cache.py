@@ -316,6 +316,117 @@ def publish_csa2_kv(
     return (out_words, out_scales) if banked else (out_words[0], out_scales[0])
 
 
+@functools.partial(jax.jit, donate_argnums=(0, 1))
+def publish_csa2_encoded(
+    words: jax.Array | tuple[jax.Array, jax.Array],
+    scales: jax.Array | tuple[jax.Array, jax.Array],
+    records: jax.Array,
+    encoded_words: jax.Array,
+    encoded_scales: jax.Array,
+) -> tuple[
+    jax.Array | tuple[jax.Array, jax.Array], jax.Array | tuple[jax.Array, jax.Array]
+]:
+    """Publish pre-encoded CSA2 words and scales without re-encoding latent rows."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+    from jax.experimental.pallas import tpu_sc as plsc
+
+    banked = isinstance(words, tuple)
+    banks = words if banked else (words,)
+    scale_banks = scales if isinstance(scales, tuple) else (scales,)
+    if len(banks) not in (1, 2) or len(banks) != len(scale_banks):
+        raise ValueError("Publication requires matching one or two banks")
+    for bank, scale_bank in zip(banks, scale_banks, strict=True):
+        if bank.ndim != 2 or bank.shape[1] != 128 or bank.dtype != jnp.int32:
+            raise ValueError("Publication words must be INT32 [records,128]")
+        if scale_bank.shape != bank.shape[:1] or scale_bank.dtype != jnp.float32:
+            raise ValueError("Publication scales must be FP32 [records]")
+    if (
+        records.dtype != jnp.int32
+        or encoded_words.ndim != 2
+        or encoded_words.shape != (records.shape[0], 128)
+        or encoded_words.dtype != jnp.int32
+        or encoded_scales.shape not in ((records.shape[0],), (records.shape[0], 1))
+        or encoded_scales.dtype != jnp.float32
+    ):
+        raise ValueError("Encoded publication has incompatible shapes")
+    if not records.size:
+        return words, scales
+    info = pltpu.get_tpu_info().sparse_core
+    assert info is not None
+    lanes, cores = info.num_lanes, info.num_cores * info.num_subcores
+    padding = -records.size % (lanes * cores)
+    ids = jnp.pad(records, (0, padding), constant_values=-1)
+    values = jnp.pad(encoded_words, ((0, padding), (0, 0)))
+    value_scales = jnp.pad(encoded_scales.reshape(-1), (0, padding))
+    mesh = plsc.VectorSubcoreMesh(
+        num_cores=info.num_cores,
+        num_subcores=info.num_subcores,
+        core_axis_name="core",
+        subcore_axis_name="subcore",
+    )
+    word_refs = tuple(jax.new_ref(b) for b in banks)
+    scale_refs = tuple(jax.new_ref(b) for b in scale_banks)
+
+    def kernel(ids_ref, values_ref, scales_ref, out_words, out_scales, sem):
+        core = jax.lax.axis_index((mesh.core_axis_name, mesh.subcore_axis_name))
+
+        def store(selected, word, scale):
+            copies = []
+            base = 0
+            for bank in range(len(banks)):
+                valid = (selected[...] >= base) & (
+                    selected[...] < base + banks[bank].shape[0]
+                )
+                indices = plsc.Indices(
+                    jnp.where(valid, selected[...] - base, -1), ignored_value=-1
+                )
+                for kind, (src, dst) in enumerate(
+                    ((word, out_words[bank]), (scale, out_scales[bank]))
+                ):
+                    copy = pltpu.make_async_copy(
+                        src, dst.at[indices], sem.at[bank, kind]
+                    )
+                    copy.start()
+                    copies.append(copy)
+                base += banks[bank].shape[0]
+            for copy in copies:
+                copy.wait()
+
+        pltpu.emit_pipeline(
+            store,
+            grid=(ids.size // (lanes * cores),),
+            in_specs=(
+                pl.BlockSpec((lanes,), lambda b: (b * cores + core,)),
+                pl.BlockSpec((lanes, 128), lambda b: (b * cores + core, 0)),
+                pl.BlockSpec((lanes,), lambda b: (b * cores + core,)),
+            ),
+        )(ids_ref, values_ref, scales_ref)
+
+    pl.kernel(
+        kernel,
+        mesh=mesh,
+        scratch_types=(pltpu.SemaphoreType.DMA((len(banks), 2)),),
+        compiler_params=pltpu.CompilerParams(
+            use_tc_tiling_on_sc=False,
+            needs_layout_passes=True,
+            disable_bounds_checks=True,
+        ),
+        name="csa2_publish_encoded_words_scales",
+    )(
+        ids,
+        values,
+        value_scales,
+        word_refs,
+        scale_refs,
+    )
+    out_words, out_scales = (
+        tuple(r[...] for r in word_refs),
+        tuple(r[...] for r in scale_refs),
+    )
+    return (out_words, out_scales) if banked else (out_words[0], out_scales[0])
+
+
 def _requests(starts: jax.Array, tokens: int) -> jax.Array:
     return jnp.repeat(
         jnp.arange(starts.shape[0] - 1, dtype=jnp.int32),
