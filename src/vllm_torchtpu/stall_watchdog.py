@@ -27,6 +27,9 @@ logger = init_logger(__name__)
 
 _last_step = 0.0
 _live_reqs = 0
+# Set once warmup is over: warmup's real-path requests legitimately pause on
+# compiles for tens of seconds.
+_armed = False
 
 
 def _seconds() -> float:
@@ -49,7 +52,15 @@ def install_signal_dump() -> None:
         faulthandler.register(signal.SIGUSR2, file=sys.stderr, all_threads=True)
     except (AttributeError, ValueError, RuntimeError):
         return
-    logger.info("Stall watchdog: SIGUSR2 dumps the stacks of pid %d", os.getpid())
+    # Plugins load before vLLM configures logging; print so the line shows.
+    print(f"Stall watchdog: SIGUSR2 dumps the stacks of pid {os.getpid()}",
+          file=sys.stderr, flush=True)
+
+
+def arm() -> None:
+    """Start watching (the worker calls this when warmup completes)."""
+    global _armed
+    _armed = True
 
 
 def note_step(live_reqs: int) -> None:
@@ -84,7 +95,7 @@ def _watch(limit: float, rank: int) -> None:
     dumped = False
     while True:
         time.sleep(min(5.0, limit / 4))
-        if not _last_step:
+        if not _armed or not _last_step:
             continue
         idle = time.monotonic() - _last_step
         if idle < limit or _live_reqs == 0:
