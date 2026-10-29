@@ -193,7 +193,7 @@ def report_and_maybe_drop() -> None:
     Diagnostic only: a failure is logged and never takes the worker down.
     """
     mode = envs.VLLM_TPU_POST_WARMUP_HOSTMEM
-    if mode not in ("report", "drop"):
+    if mode not in ("report", "drop", "clearjax"):
         return
     try:
         _report_and_maybe_drop(mode)
@@ -258,6 +258,21 @@ def _report_and_maybe_drop(mode: str) -> None:
     before = _status()
     summary, runnables = _census()
     logger.info("[hostmem] after warmup: %s | %s", before, summary)
+    if mode == "clearjax":
+        # Diagnostic: how much of the warmed heap JAX's tracing/lowering caches
+        # (Pallas kernels trace through jax) keep alive.
+        import jax
+
+        jax.clear_caches()
+        collected = gc.collect()
+        _release_heap()
+        logger.info(
+            "[hostmem] jax.clear_caches + gc (%d) + release, %.1f s: %s",
+            collected,
+            time.perf_counter() - start,
+            _status(),
+        )
+        return
     if mode != "drop":
         return
     for fn in runnables:
