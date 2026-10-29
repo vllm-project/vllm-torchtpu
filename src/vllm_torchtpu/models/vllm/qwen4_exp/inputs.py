@@ -356,13 +356,14 @@ class Qwen4ExpAdapter:
         return history
 
     def prepare_inputs(self, snapshot):
+        # Before either path: the fused and the eager input prep both feed this step's route.
+        self._route_shared_local(snapshot)
         if envs.VLLM_TPU_QWEN4_FUSED_PREP and envs.VLLM_TPU_QWEN4_NGRAM_WINDOW != "check":
             return self._prepare_inputs_fused(snapshot)
         return self._prepare_inputs_eager(snapshot)
 
     def _prepare_inputs_eager(self, snapshot, current_override=None):
         runner = self.runner
-        self._route_shared_local(snapshot)
         ctx = runner._attn_metadata_builder_ctx
         starts = ctx.query_start_loc
         rows = starts.shape[0] - 1
