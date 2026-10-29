@@ -23,21 +23,6 @@ time-weighted busiest-rank MoE cost of decode steps and prefill chunks; each fil
 }
 ```
 
-`layers["<n>"].cores[r]` lists the global expert ids rank `r` holds, in slot order;
-every layer is a permutation of `0..experts-1`. Only routed decoder layers may be
-listed (GLM-5.2: 3-77). The loader logs the table's sha256 on every worker:
-`[eplb] placement installed ep_rank=<r> layers=<n> table_sha256=<first 16 hex>`.
-
-## Use
-
-```bash
-TPU_EXPERT_PLACEMENT=/workspace/vllm-torchtpu/examples/expert_placement/glm52_ep16_c32_4k.json \
-  vllm serve zai-org/GLM-5.2-FP8 --tensor-parallel-size 16 --enable-expert-parallel ...
-```
-
-The table needs `--enable-expert-parallel` with flat expert parallelism
-(`TPU_MOE_EP_TP_SIZE=1`, no `TPU_MOE_HIERARCHICAL_EP`) and
-`--expert-placement-strategy linear` (the default); otherwise loading stops with an error.
 A table helps only when the busiest rank's expert load sets the MoE time; at low
 token counts per rank every rank streams most of its experts and a permutation
 changes little.

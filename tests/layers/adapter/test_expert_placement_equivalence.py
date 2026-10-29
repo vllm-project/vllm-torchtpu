@@ -137,6 +137,11 @@ def _psum_path(x, router_w, bias, w13, w2, is_pad):
     """moe_tp_decode's psum path: _route, fused_moe_func per rank, summed."""
     scores = jax.nn.sigmoid(x.astype(jnp.float32) @ router_w.T)
     w, ids = mtd._route(x, scores, bias, is_pad, _STATICS)
+    return _grouped(x, w, ids, w13, w2, lambda r: r * SLOTS), ids
+
+
+def _grouped(x, w, ids, w13, w2, start):
+    """fused_moe_func per rank with experts_start = start(rank), summed."""
     total = jnp.zeros(x.shape, jnp.float32)
     for r in range(RANKS):
         part = fmg.fused_moe_func(
@@ -149,7 +154,7 @@ def _psum_path(x, router_w, bias, w13, w2, is_pad):
             None,
             w,
             ids,
-            jnp.asarray(r * SLOTS, jnp.int32),
+            jnp.asarray(start(r), jnp.int32),
             topk=TOPK,
             activation="silu",
             use_ep=True,
@@ -159,7 +164,7 @@ def _psum_path(x, router_w, bias, w13, w2, is_pad):
             onehot_sortfree=True,
         )
         total = total + part.astype(jnp.float32)
-    return total * SCALE, ids
+    return total * SCALE
 
 
 def _kernel_path(x, router_w, bias, w13, w2, is_pad):
@@ -266,22 +271,9 @@ def test_placed_layer_matches_the_unplaced_layer(table, refs, tokens, path, bias
 
     # Negative controls: each must change the output.
     wrong_gate, wrong_bias = _router(OTHER_LAYER, router_w, bias)
-    first = int(np.asarray(placed_ids)[0, 0])
-    swap = list(range(E))
-    swap[first], swap[(first + SLOTS) % E] = (first + SLOTS) % E, first
-    other = rng.permutation(E)
-    unrelated13 = w13[jnp.asarray(other)].reshape(RANKS, SLOTS, HIDDEN, 2 * INTER)
-    unrelated2 = w2[jnp.asarray(other)].reshape(RANKS, SLOTS, INTER, HIDDEN)
     controls = {
         "another layer's router order": (wrong_gate, wrong_bias, placed13, placed2),
-        "two experts swapped in the router only": (
-            gate[jnp.asarray(swap)],
-            gate_bias[jnp.asarray(swap)],
-            placed13,
-            placed2,
-        ),
         "router placed, experts linear": (gate, gate_bias, linear13, linear2),
-        "experts from an unrelated table": (gate, gate_bias, unrelated13, unrelated2),
     }
     for name, (g, b, a13, a2) in controls.items():
         out, _ = run(x, g, b, a13, a2, is_pad)

@@ -32,15 +32,8 @@ linear placement. Only the router rows of layers whose expert map this process
 placed are reordered, and a weight stream that ends without the router weight
 (``.mlp.gate.weight``) of every placed layer is refused.
 
-A table may list only the model's routed decoder layers: a layer below
-``first_k_dense_replace`` (dense) or at or above ``num_hidden_layers`` (an MTP
-layer stored after the decoder, e.g. GLM-5.2's layer 78) is refused when the
-first MoE layer is built, and so are EP x TP expert splitting
-(``TPU_MOE_EP_TP_SIZE`` > 1), an ``--expert-placement-strategy`` other than
-``linear``, grouped top-k, hash-routed layers, MoE layers without expert
-parallelism, and a table that places no layer of the model. Each
-expert-parallel worker logs one ``[eplb] placement`` line with its EP rank
-(``installed`` with the table's sha256, or ``none``).
+Tables and deployments that cannot be placed safely are refused at load (list:
+the "Static Expert Placement" section of ``docs/user_guide/parallelism.md``).
 """
 
 import dataclasses
@@ -110,6 +103,10 @@ def parse(table: dict, source: str) -> Placement:
     cores = {}
     for key, entry in table["layers"].items():
         layer = int(key)
+        if layer in cores:
+            raise ValueError(
+                f"expert placement {source}: layer {layer} is listed twice"
+            )
         rows = tuple(tuple(int(e) for e in c) for c in entry["cores"])
         if len(rows) != ranks or any(len(c) != slots for c in rows):
             raise ValueError(
@@ -169,29 +166,6 @@ def check_routing(table: Placement, hf: object, source: str) -> None:
                 f"expert placement {source}: lists hash-routed layers {bad} "
                 f"(layers below {hashed} pick experts by token id)"
             )
-
-
-def validate(
-    raw: bytes,
-    source: str,
-    *,
-    experts: int,
-    ranks: int,
-    slots: int,
-    first_moe_layer: int,
-    num_layers: int,
-) -> Placement:
-    """The loader's checks for one deployment, without a model: parse, the
-    shape the deployment needs, and the routed layer range."""
-    table = parse(json.loads(raw), source)
-    if (table.experts, table.ranks, table.slots) != (experts, ranks, slots):
-        raise ValueError(
-            f"expert placement {source}: the table is {table.ranks} ranks x "
-            f"{table.slots} slots over {table.experts} experts; this deployment "
-            f"needs {ranks} x {slots} over {experts}"
-        )
-    check_layers(table, first_moe_layer, num_layers, source)
-    return dataclasses.replace(table, sha256=hashlib.sha256(raw).hexdigest())
 
 
 def _read(uri: str) -> bytes:
