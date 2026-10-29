@@ -109,6 +109,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
     VLLM_TPU_QSA_PREFILL_LEAN: bool = False
+    VLLM_TPU_QSA_MAIN_KV_DCP: int = 0
     VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE: bool = False
     VLLM_TPU_QSA_DECODE_LEAN_FETCH: bool = False
     VLLM_TPU_QSA_DECODE_SLOT_READ: bool = False
@@ -717,6 +718,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # qwen4_exp QSA sparse prefill: skip the FP8 key finite/written guard,
     # which the score mask select already covers (bit-identical output).
     "VLLM_TPU_QSA_PREFILL_LEAN": env_bool("VLLM_TPU_QSA_PREFILL_LEAN"),
+    # Main KV of the target QSA layers split over TP rank pairs that share a
+    # KV head (2; 0/1 = off): each rank stores and attends half the tokens,
+    # the pair's partial attention is LSE-combined.
+    "VLLM_TPU_QSA_MAIN_KV_DCP": env_nonnegative_int("VLLM_TPU_QSA_MAIN_KV_DCP", 0),
     # Qwen4-exp pooled QSA decode/verify steps: write main KV, compressed
     # indexer keys and the raw ring/tags of a layer with one Pallas kernel
     # whose row DMAs are all in flight together, and read the ring with every
