@@ -221,10 +221,45 @@ def _render_worker_init(path: str) -> None:
     from tokenizers import Tokenizer
 
     _LOCAL_TOKENIZER = Tokenizer.from_file(os.path.join(path, "tokenizer.json"))
+    if int(os.environ.get("PROXY_RENDER_CACHE_MB", "0")) > 0:
+        global _RENDER_CACHE
+        _RENDER_CACHE = {}
+
+
+# Optional per-worker cache of chunk -> ids (PROXY_RENDER_CACHE_MB of chunk
+# text per worker, 0 = off). Chunk boundaries depend only on the text before
+# them, so prompts sharing a long prefix (multi-turn, shared documents) split
+# that prefix into the same chunks and only the tail is encoded again.
+_RENDER_CACHE: "dict[str, bytes] | None" = None
+_RENDER_CACHE_CHARS = 0
 
 
 def _render_ids_json(text: str) -> bytes:
-    return orjson.dumps(_local_token_ids(text))
+    if _RENDER_CACHE is None:
+        return orjson.dumps(_local_token_ids(text))
+    global _RENDER_CACHE_CHARS
+    pieces = _split_for_render(text)
+    parts: list = [_RENDER_CACHE.get(p) for p in pieces]
+    missing = {i for i, part in enumerate(parts) if part is None}
+    for i, piece in enumerate(pieces):
+        if i not in missing:  # refresh recency of hits before any eviction
+            _RENDER_CACHE[piece] = _RENDER_CACHE.pop(piece)
+    if missing:
+        encs = _LOCAL_TOKENIZER.encode_batch(
+            [pieces[i] for i in missing], add_special_tokens=False
+        )
+        limit = int(os.environ.get("PROXY_RENDER_CACHE_MB", "0")) << 20
+        for i, enc in zip(missing, encs):
+            parts[i] = orjson.dumps(enc.ids)[1:-1]
+            if pieces[i] in _RENDER_CACHE or len(pieces[i]) * 2 > limit:
+                continue
+            while _RENDER_CACHE and _RENDER_CACHE_CHARS + len(pieces[i]) > limit:
+                evicted = next(iter(_RENDER_CACHE))  # oldest insertion
+                _RENDER_CACHE_CHARS -= len(evicted)
+                del _RENDER_CACHE[evicted]
+            _RENDER_CACHE[pieces[i]] = parts[i]
+            _RENDER_CACHE_CHARS += len(pieces[i])
+    return b"[" + b",".join(part for part in parts if part) + b"]"
 
 
 def _load_local_tokenizer():
@@ -261,7 +296,16 @@ def _load_local_tokenizer():
         print(f"PROXY render pool ready: {procs} processes", flush=True)
 
 
-def _local_token_ids(text: str, chunk_chars: int = 65536) -> list[int]:
+def _local_token_ids(text: str) -> list[int]:
+    ids: list[int] = []
+    for enc in _LOCAL_TOKENIZER.encode_batch(
+        _split_for_render(text), add_special_tokens=False
+    ):
+        ids.extend(enc.ids)
+    return ids
+
+
+def _split_for_render(text: str, chunk_chars: int = 65536) -> list[str]:
     cuts, pos = [0], 0
     while pos + chunk_chars < len(text):
         m = _SAFE_SPLIT.search(text, pos + chunk_chars)
@@ -270,11 +314,7 @@ def _local_token_ids(text: str, chunk_chars: int = 65536) -> list[int]:
         cuts.append(m.start())
         pos = m.start()
     cuts.append(len(text))
-    pieces = [text[a:b] for a, b in zip(cuts, cuts[1:])]
-    ids: list[int] = []
-    for enc in _LOCAL_TOKENIZER.encode_batch(pieces, add_special_tokens=False):
-        ids.extend(enc.ids)
-    return ids
+    return [text[a:b] for a, b in zip(cuts, cuts[1:])]
 
 
 def _token_ids_from_completion_render(rendered: Any) -> list[int] | list[list[int]]:
@@ -594,7 +634,49 @@ async def stream_from_decode(
             raise
 
 
+# Send alignment (PROXY_ALIGN_MS, 0 = off). Under EP the prefill DP ranks step
+# in lockstep, so requests that arrive together must reach the engines within
+# the same wave-start window (VLLM_DP_WAVE_START_DELAY_MS) or the late one
+# waits a whole step. Rendering times differ by tens of ms between concurrent
+# long prompts; requests arriving within PROXY_ALIGN_MS of the first one of a
+# group are therefore sent to prefill together, once all of them are rendered.
+_ALIGN_S = _env_float("PROXY_ALIGN_MS", 0.0) / 1000.0
+
+
+class _AlignGroup:
+    def __init__(self):
+        self.pending = 0
+        self.open = True
+        self.released = asyncio.Event()
+
+    def close(self) -> None:
+        self.open = False
+        self._maybe_release()
+
+    def leave(self) -> None:
+        self.pending -= 1
+        self._maybe_release()
+
+    def _maybe_release(self) -> None:
+        if not self.open and self.pending == 0:
+            self.released.set()
+
+
+_ALIGN_GROUP: _AlignGroup | None = None
+
+
+def _align_join() -> _AlignGroup:
+    global _ALIGN_GROUP
+    group = _ALIGN_GROUP
+    if group is None or not group.open:
+        group = _ALIGN_GROUP = _AlignGroup()
+        asyncio.get_running_loop().call_later(_ALIGN_S, group.close)
+    group.pending += 1
+    return group
+
+
 async def _handle_completions(api: str, request: Request):
+    align = _align_join() if _ALIGN_S > 0 else None
     try:
         t_request_recv_perf = time.perf_counter()
         req_data = await request.json()
@@ -648,6 +730,17 @@ async def _handle_completions(api: str, request: Request):
                 req_data.pop("prompt_embeds", None)
             else:
                 req_data = _replace_prompt_with_rendered_token_ids(req_data, rendered)
+
+        if align is not None:
+            t_align = time.perf_counter()
+            align.leave()
+            group, align = align, None
+            await group.released.wait()
+            print(
+                f"PERF PROXY align req_id={request_id} "
+                f"wait_ms={(time.perf_counter() - t_align) * 1000:.2f}",
+                flush=True,
+            )
 
         # Send request to prefill service
         t_prefill_send = time.time()
@@ -719,6 +812,8 @@ async def _handle_completions(api: str, request: Request):
         return StreamingResponse(generate_stream(), media_type="application/json")
 
     except Exception as e:
+        if align is not None:
+            align.leave()
         import sys
         import traceback
 
