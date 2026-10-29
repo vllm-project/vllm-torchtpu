@@ -262,6 +262,8 @@ if TYPE_CHECKING:
     VLLM_TPU_VERIFY_FUSED_READ_OFFSETS: bool = False
     VLLM_TPU_DRAFT_SEED_EXTRAS: bool = False
     VLLM_TPU_DRAFT_SEED_BOOTSTRAP_PAD: bool = False
+    VLLM_TPU_SPEC_VERIFY_DRAFT_PAD: bool = False
+    VLLM_TPU_SPEC_VERIFY_DRAFT_PAD_CHECK: int = 0
     VLLM_TPU_GC_STATS_S: float = 0.0
     VLLM_TPU_GC_DISABLE_AFTER_S: float = -1.0
     VLLM_TPU_MTP_LOOP_REBIND_SEQ_LENS: bool = False
@@ -1598,6 +1600,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Prefill-bootstrap draft seed scatter at the loop bucket width (a
     # precompiled key) instead of the real request count (mid-serve compiles).
     "VLLM_TPU_DRAFT_SEED_BOOTSTRAP_PAD": env_bool("VLLM_TPU_DRAFT_SEED_BOOTSTRAP_PAD"),
+    # Fused spec verify: pad the draft-side arrays to K x num_reqs_paddings
+    # buckets instead of the pow2 logits length; uniforms are still drawn at
+    # the old width and sliced (same stream). CHECK=N compares N steps with
+    # the old layout on the same uniforms.
+    "VLLM_TPU_SPEC_VERIFY_DRAFT_PAD": env_bool("VLLM_TPU_SPEC_VERIFY_DRAFT_PAD"),
+    "VLLM_TPU_SPEC_VERIFY_DRAFT_PAD_CHECK": env_nonnegative_int(
+        "VLLM_TPU_SPEC_VERIFY_DRAFT_PAD_CHECK", 0
+    ),
     # Worker GC: log collections per generation and their pause every N
     # seconds (0 = off); disable the collector T seconds after warm-up
     # (-1 = never). See runner/gc_watch.py.

@@ -365,7 +365,11 @@ def _verify_fused_impl(
     sample, the per-position sampling-parameter gathers and the rejection
     sampler, op for op the same as `_sample_spec_verify_chunk`'s separate
     programs. The uniforms come from the caller's eager draws, in the same
-    order and shapes, so the random stream is unchanged."""
+    order and shapes, so the random stream is unchanged. Under
+    VLLM_TPU_SPEC_VERIFY_DRAFT_PAD they are drawn at the old (wider) row count
+    and sliced here to the draft rows."""
+    accept_u = accept_u[: draft_token_ids.shape[0]]
+    recover_u = recover_u[: target_logits_indices.shape[0]]
     bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
     target_logits = torch.index_select(logits, 0, target_logits_indices)
     bonus_token_ids = _sample_from_logits_impl(
@@ -4646,6 +4650,52 @@ class TPUModelRunner(GPUModelRunner):
             all_offsets = offsets.repeat(len(indices_per_group))
             self.mamba_slot_read_offsets.index_put_((all_indices,), all_offsets)
 
+    def _spec_uniform(
+        self,
+        md: SpecDecodeMetadata,
+        rows: int,
+        cols: tuple[int, ...],
+        device: torch.device,
+        generator: torch.Generator | None,
+    ) -> torch.Tensor:
+        """A [rows, *cols] verify uniform draw. Under
+        VLLM_TPU_SPEC_VERIFY_DRAFT_PAD it is drawn at md.verify_rng_rows (the
+        old padded_logits_length) and sliced, so the random stream and each
+        row's values match the unpadded layout."""
+        n = md.verify_rng_rows or rows
+        u = torch.rand((n, *cols), dtype=torch.float32, device=device, generator=generator)
+        return u[:rows] if n != rows else u
+
+    def _verify_draft_rows(
+        self, num_drafts: int, padded_logits_length: int, padded_num_reqs: int
+    ) -> int:
+        """Row count of the verify's draft-side arrays. padded_logits_length
+        (pow2 over drafts + bonus rows), or under
+        VLLM_TPU_SPEC_VERIFY_DRAFT_PAD the smallest K x num_reqs_paddings
+        bucket holding the drafts, when that (draft rows, logits rows,
+        padded requests) key was precompiled and the batch takes the fused
+        sampling verify."""
+        if not (
+            envs.VLLM_TPU_SPEC_VERIFY_DRAFT_PAD
+            and envs.VLLM_TPU_VERIFY_FUSED
+            and not self.input_batch.all_greedy
+        ):
+            return padded_logits_length
+        keys = getattr(self, "_verify_pad_keys", ())
+        for rows in self._verify_draft_ladder():
+            if rows >= num_drafts:
+                if rows < padded_logits_length and (
+                    rows, padded_logits_length, padded_num_reqs
+                ) in keys:
+                    return rows
+                break
+        return padded_logits_length
+
+    def _verify_draft_ladder(self) -> list[int]:
+        assert self.speculative_config is not None
+        k = self.speculative_config.num_speculative_tokens
+        return sorted({k * p for p in self.num_reqs_paddings})
+
     def _num_reqs_tensor(self, num_reqs: int) -> torch.Tensor:
         """A cached 0-d int64 device tensor holding `num_reqs` (read-only), so
         the per-step read-offset update does not upload a fresh scalar."""
@@ -4813,11 +4863,9 @@ class TPUModelRunner(GPUModelRunner):
                 group_indices=md.group_indices,
                 max_draft_tokens=self.speculative_config.num_speculative_tokens,
                 accept_u=(
-                    torch.rand(
-                        md.draft_token_ids.shape,
-                        dtype=torch.float32,
-                        device=logits.device,
-                        generator=sampling_generator,
+                    self._spec_uniform(
+                        md, md.draft_token_ids.shape[0], (), logits.device,
+                        sampling_generator,
                     )
                     if self.rejection_sampler.synthetic_mode
                     else None
@@ -4886,11 +4934,9 @@ class TPUModelRunner(GPUModelRunner):
         assert self.rejection_sampler is not None
         assert self.speculative_config is not None
         if self.rejection_sampler.synthetic_mode or not all_greedy:
-            accept_u = torch.rand(
-                md.draft_token_ids.shape,
-                dtype=torch.float32,
-                device=target_logits.device,
-                generator=sampling_generator,
+            accept_u = self._spec_uniform(
+                md, md.draft_token_ids.shape[0], (), target_logits.device,
+                sampling_generator,
             )
         if all_greedy:
             return self.rejection_sampler(
@@ -4907,8 +4953,9 @@ class TPUModelRunner(GPUModelRunner):
         assert req_temperatures is not None
         assert req_top_k is not None
         assert req_top_p is not None
-        recover_u = torch.rand_like(
-            target_logits, dtype=torch.float32, generator=sampling_generator
+        recover_u = self._spec_uniform(
+            md, target_logits.shape[0], (target_logits.shape[1],),
+            target_logits.device, sampling_generator,
         )
         host_phases.mark("vfy_rand")
         return self.rejection_sampler(
@@ -4956,14 +5003,17 @@ class TPUModelRunner(GPUModelRunner):
             device=logits.device,
             generator=sampling_generator,
         )
+        # VLLM_TPU_SPEC_VERIFY_DRAFT_PAD: draw at the old row count; the
+        # program slices to the draft rows (same stream, same per-row values).
+        rng_rows = md.verify_rng_rows or md.target_logits_indices.shape[0]
         accept_u = torch.rand(
-            md.draft_token_ids.shape,
+            (rng_rows,),
             dtype=torch.float32,
             device=logits.device,
             generator=sampling_generator,
         )
         recover_u = torch.rand(
-            (md.target_logits_indices.shape[0], vocab),
+            (rng_rows, vocab),
             dtype=torch.float32,
             device=logits.device,
             generator=sampling_generator,
@@ -5038,7 +5088,59 @@ class TPUModelRunner(GPUModelRunner):
             out = _verify_fused_compiled(*args)
         if self._verify_fused_checks_left > 0:
             self._check_verify_fused(out, args)
+        if md.verify_rng_rows and envs.VLLM_TPU_SPEC_VERIFY_DRAFT_PAD_CHECK > getattr(
+            self, "_draft_pad_checks", 0
+        ):
+            self._check_verify_draft_pad(out, args, md)
         return out
+
+    def _check_verify_draft_pad(
+        self, out: torch.Tensor, args: tuple, md: SpecDecodeMetadata
+    ) -> None:
+        """VLLM_TPU_SPEC_VERIFY_DRAFT_PAD_CHECK: rerun the fused verify with
+        the draft-side arrays padded back to padded_logits_length (the old
+        layout) on the same uniforms and count differing tokens on device.
+        The first VLLM_TPU_VERIFY_FUSED_CHECK_FAULT checks perturb the
+        compared copy (a positive control that must be caught)."""
+        rows = md.verify_rng_rows
+        draft_rows = md.target_logits_indices.shape[0]
+        extra = rows - draft_rows
+        dev = out.device
+        n_real = int(md.draft_lengths_cpu.shape[0])
+
+        def pad(t: torch.Tensor, value: int) -> torch.Tensor:
+            return torch.cat((t, torch.full((extra,), value, dtype=t.dtype, device=dev)))
+
+        a = list(args)
+        a[2] = pad(md.target_logits_indices, 0)
+        a[9] = pad(md.draft_token_ids, 0)
+        a[11] = pad(md.segment_ids, n_real)
+        a[12] = pad(md.group_indices, 0)
+        ref = _verify_fused_compiled(*a)
+        done = getattr(self, "_draft_pad_checks", 0)
+        faulted = done < envs.VLLM_TPU_VERIFY_FUSED_CHECK_FAULT
+        cmp = out
+        if faulted:
+            cmp = out.clone()
+            cmp.view(-1)[0] = cmp.view(-1)[0] + 1
+        mism = (cmp != ref).sum().to(torch.int64)
+        delta = torch.stack(
+            [mism * (0 if faulted else 1), (mism > 0).to(torch.int64) * (1 if faulted else 0)]
+        )
+        prev = getattr(self, "_draft_pad_mismatches", None)
+        self._draft_pad_mismatches = delta if prev is None else prev + delta
+        self._draft_pad_checks = done + 1
+        if self._draft_pad_checks % 500 == 0 or (
+            self._draft_pad_checks == envs.VLLM_TPU_SPEC_VERIFY_DRAFT_PAD_CHECK
+        ):
+            clean, caught = self._draft_pad_mismatches.tolist()
+            logger.info(
+                "SPEC_VERIFY_DRAFT_PAD_CHECK checks=%d clean_mismatched_tokens=%d "
+                "faulted_checks=%d faulted_caught=%d",
+                self._draft_pad_checks, clean,
+                min(self._draft_pad_checks, envs.VLLM_TPU_VERIFY_FUSED_CHECK_FAULT),
+                caught,
+            )
 
     def _check_verify_fused(self, fused: torch.Tensor, args: tuple) -> None:
         """VLLM_TPU_VERIFY_FUSED_CHECK: rerun the separate programs on the
@@ -5066,6 +5168,9 @@ class TPUModelRunner(GPUModelRunner):
             _synthetic,
             topk_candidates,
         ) = args
+        # Uniforms drawn at the old row count (VLLM_TPU_SPEC_VERIFY_DRAFT_PAD).
+        accept_u = accept_u[: draft_token_ids.shape[0]]
+        recover_u = recover_u[: target_idx.shape[0]]
         assert self.rejection_sampler is not None
         bonus_logits, target_logits = self.spec_gather_bonus_and_target_logits(
             logits, bonus_idx, target_idx
@@ -7008,6 +7113,42 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
                         break
+            if envs.VLLM_TPU_SPEC_VERIFY_DRAFT_PAD and envs.VLLM_TPU_VERIFY_FUSED:
+                self._precompile_verify_draft_pad()
+
+    def _precompile_verify_draft_pad(self) -> None:
+        """VLLM_TPU_SPEC_VERIFY_DRAFT_PAD: the fused verify at every
+        (draft rows, logits rows, padded requests) key a full-draft decode
+        batch produces (every request carries K drafts), recorded in
+        `_verify_pad_keys`; other keys keep the padded_logits_length layout."""
+        assert self.speculative_config is not None
+        k = self.speculative_config.num_speculative_tokens
+        ladder = self._verify_draft_ladder()
+        keys: set[tuple[int, int, int]] = set()
+        for n in range(1, self.max_num_reqs + 1):
+            drafts = n * k
+            logits_rows = _get_padded_token_len(self.num_tokens_paddings, n + drafts)
+            npad = next((p for p in self.num_reqs_paddings if p >= n), None)
+            rows = next((r for r in ladder if r >= drafts), None)
+            if npad is None or rows is None or rows >= logits_rows:
+                continue
+            keys.add((rows, logits_rows, npad))
+        for rows, logits_rows, npad in sorted(keys):
+            dev = self.device
+            self._precompile_verify_fused(
+                torch.zeros((logits_rows, self.vocab_size), dtype=self._hidden_states_dtype).to(dev),
+                torch.zeros(npad, dtype=torch.int32).to(dev),
+                torch.zeros(rows, dtype=torch.int32).to(dev),
+                torch.zeros(rows, dtype=torch.int32).to(dev),
+                torch.zeros(npad, dtype=torch.int32).to(dev),
+                torch.zeros(rows, dtype=torch.int64).to(dev),
+                torch.zeros(rows, dtype=torch.int32).to(dev),
+                torch.zeros(logits_rows, dtype=torch.float32).to(dev),
+                torch.zeros((logits_rows, self.vocab_size), dtype=torch.float32).to(dev),
+            )
+            logger.info("  -- verify draft pad: draft_rows %d, logits_rows %d, num_seqs %d",
+                        rows, logits_rows, npad)
+        self._verify_pad_keys = keys
 
     def _precompile_verify_fused(
         self,

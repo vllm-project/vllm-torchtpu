@@ -148,11 +148,76 @@ def check_seed(device, seeds: int) -> int:
     return fail
 
 
+def check_draft_pad(device, vocab: int, seeds: int) -> int:
+    """VLLM_TPU_SPEC_VERIFY_DRAFT_PAD: the fused verify with the draft-side
+    arrays at a K x num_reqs bucket and the uniforms drawn at the pow2 logits
+    length (sliced in-graph) vs the same verify at the pow2 layout."""
+    k = 3
+    rates = torch.tensor([0.9, 0.7, 0.5], dtype=torch.float32).to(device)
+    req_pads = (4, 8, 16, 24)
+    fail = checked = 0
+    for n in range(1, 25):
+        npad = next(p for p in req_pads if p >= n)
+        drafts = n * k
+        P = max(16, 1 << (n + drafts - 1).bit_length())
+        T = next(k * p for p in req_pads if k * p >= drafts)
+        if T >= P:
+            continue
+        for seed in range(seeds):
+            g = torch.Generator().manual_seed(seed)
+            logits = (torch.randn(P, vocab, generator=g) * 4).to(torch.bfloat16)
+            draft = torch.zeros(P, dtype=torch.int32)
+            tidx = torch.zeros(P, dtype=torch.int32)
+            seg = torch.full((P,), n, dtype=torch.int64)
+            grp = torch.zeros(P, dtype=torch.int32)
+            for i in range(drafts):
+                r, j = divmod(i, k)
+                tidx[i] = r * (k + 1) + j
+                seg[i] = r
+                grp[i] = j
+                draft[i] = (int(logits[tidx[i]].float().argmax())
+                            if torch.rand(1, generator=g).item() < 0.6
+                            else int(torch.randint(0, vocab, (1,), generator=g)))
+            bidx = torch.tensor([r * (k + 1) + k for r in range(n)] + [0] * (npad - n),
+                                dtype=torch.int32)
+            dl = torch.zeros(npad, dtype=torch.int32)
+            dl[:n] = k
+            temps = torch.ones(npad, 1, dtype=torch.bfloat16)
+            top_k = torch.full((npad, 1), 20, dtype=torch.int32)
+            top_p = torch.full((npad, 1), 0.95, dtype=torch.float32)
+            dv = lambda x: x.to(device)  # noqa: E731
+            gu = torch.Generator(device=device)
+            gu.manual_seed(seed)
+            bu = torch.rand((npad, vocab), dtype=torch.float32, device=device, generator=gu)
+            au = torch.rand((P,), dtype=torch.float32, device=device, generator=gu)
+            ru = torch.rand((P, vocab), dtype=torch.float32, device=device, generator=gu)
+            for synthetic, cand in ((False, 64), (True, 64), (False, 0)):
+                common = (dv(temps), dv(top_k), dv(top_p), bu, au, ru)
+                old = _verify_fused_compiled(
+                    dv(logits), dv(bidx), dv(tidx), *common, dv(draft), dv(dl), dv(seg),
+                    dv(grp), rates if synthetic else None, k, synthetic, cand)
+                new = _verify_fused_compiled(
+                    dv(logits), dv(bidx), dv(tidx[:T]), *common, dv(draft[:T]), dv(dl),
+                    dv(seg[:T]), dv(grp[:T]), rates if synthetic else None, k, synthetic, cand)
+                checked += 1
+                if not torch.equal(old.cpu(), new.cpu()):
+                    fail += 1
+                    if fail <= 10:
+                        print(f"DRAFT_PAD MISMATCH n={n} P={P} T={T} seed={seed} "
+                              f"synthetic={synthetic} cand={cand}")
+        print(f"draft pad n={n} P={P} T={T} checked={checked} failures={fail}", flush=True)
+    print(f"SPEC_VERIFY_DRAFT_PAD_TPU_CHECK checked={checked} failures={fail}", flush=True)
+    return fail
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--seeds", type=int, default=1000)
     ap.add_argument("--vocab", type=int, default=248320)
+    ap.add_argument("--draft-pad-only", action="store_true")
     a = ap.parse_args()
+    if a.draft_pad_only:
+        return 1 if check_draft_pad(torch.device("tpu"), a.vocab, max(a.seeds, 1)) else 0
     device = torch.device("tpu")
     k = 3
     rates = torch.tensor([0.9, 0.7, 0.5], dtype=torch.float32).to(device)
