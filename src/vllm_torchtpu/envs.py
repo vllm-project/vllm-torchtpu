@@ -246,6 +246,9 @@ if TYPE_CHECKING:
     VLLM_TPU_PY_SAMPLER_S: float = 0.0
     VLLM_TPU_STAGE_ENTRIES_CACHE: bool = False
     VLLM_TPU_STALL_WATCHDOG_S: float = 0.0
+    VLLM_TPU_VERIFY_FUSED: bool = False
+    VLLM_TPU_VERIFY_FUSED_CHECK: int = 0
+    VLLM_TPU_VERIFY_FUSED_CHECK_FAULT: bool = False
     VLLM_TPU_CPU_PIN_RESERVE: int = 2
     VLLM_TPU_CPU_PROBE_S: float = 0.0
     VLLM_TPU_FUSED_READ_OFFSET_UPDATE: bool = True
@@ -1516,6 +1519,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Dump all processes' stacks when no step starts for N s with live
     # requests (stall_watchdog.py; read directly there, registered here).
     "VLLM_TPU_STALL_WATCHDOG_S": env_float("VLLM_TPU_STALL_WATCHDOG_S", 0.0),
+    # Non-greedy spec verify as one program (tpu_runner._verify_fused_impl).
+    "VLLM_TPU_VERIFY_FUSED": env_bool("VLLM_TPU_VERIFY_FUSED"),
+    # Compare the fused verify with the separate programs for the first N
+    # verify chunks; _FAULT perturbs the compared copy (positive control).
+    "VLLM_TPU_VERIFY_FUSED_CHECK": env_nonnegative_int("VLLM_TPU_VERIFY_FUSED_CHECK", 0),
+    "VLLM_TPU_VERIFY_FUSED_CHECK_FAULT": env_bool("VLLM_TPU_VERIFY_FUSED_CHECK_FAULT"),
     "VLLM_TPU_CPU_PIN_RESERVE": env_nonnegative_int("VLLM_TPU_CPU_PIN_RESERVE", 2),
     # Log each worker's thread CPU placement every N seconds (0 = off).
     "VLLM_TPU_CPU_PROBE_S": env_float("VLLM_TPU_CPU_PROBE_S", 0.0),
