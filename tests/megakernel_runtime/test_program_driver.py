@@ -17,6 +17,7 @@ capability guards, warmup shapes, routing, and a 2-rank gloo run."""
 from __future__ import annotations
 
 import ast
+import dataclasses
 import importlib
 import json
 import logging
@@ -261,6 +262,70 @@ def test_agreement_one_peer_decline_and_plugin_mismatch(
     _vote_group(monkeypatch, [0], 12345)
     drv = driver_mod.ProgramDriver.maybe_create(_runner())
     assert drv.decline.code == "plugin_mismatch"
+
+
+def test_pre_agreement_failures_vote_before_raising(
+    toy: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every rank-local failure from the plugin import to the mesh joins
+    agreement #1 as create_error (token 0 before the fingerprint exists), so
+    the peers decline instead of waiting."""
+    from vllm_torchtpu.megakernel_runtime.errors import MegakernelPluginError
+
+    codes = driver_mod.vote_codes(("toy_declined",))
+    vote = codes.index("create_error") + 1
+
+    def unhashable(*_a: Any, **_k: Any) -> Any:
+        raise MegakernelPluginError("plugin_source_unhashable:zip: nope")
+
+    g = _vote_group(monkeypatch, [0])
+    with monkeypatch.context() as m:
+        m.setattr(driver_mod, "source_hash", unhashable)
+        with pytest.raises(MegakernelPluginError, match="unhashable"):
+            driver_mod.ProgramDriver.maybe_create(_runner())
+    assert g.seen == [(vote, 0)]
+
+    def mesh_boom(*_a: Any, **_k: Any) -> Any:
+        raise RuntimeError("device enumeration failed")
+
+    g = _vote_group(monkeypatch, [0])
+    with monkeypatch.context() as m:
+        m.setattr(driver_mod, "_build_tp_rank_mesh", mesh_boom)
+        with pytest.raises(RuntimeError, match="device enumeration"):
+            driver_mod.ProgramDriver.maybe_create(_runner())
+    assert len(g.seen) == 1 and g.seen[0][0] == vote and g.seen[0][1] > 0
+
+    g = _vote_group(monkeypatch, [0])
+    with pytest.raises(Exception, match="failed to import"):
+        driver_mod.ProgramDriver.maybe_create(
+            testing.fake_runner(megakernel={"plugin": "no_such_mk_plugin_xyz"})
+        )
+    base_vote = driver_mod.vote_codes().index("create_error") + 1
+    assert g.seen == [(base_vote, 0)] and base_vote == vote
+
+    # A peer that failed before its fingerprint: plugin_mismatch here.
+    _vote_group(monkeypatch, [vote], 0)
+    drv = driver_mod.ProgramDriver.maybe_create(_runner())
+    assert drv.decline.code == "plugin_mismatch"
+
+
+def test_create_result_must_be_a_program_or_decline(
+    toy: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vllm_torchtpu.megakernel_runtime.errors import MegakernelPluginError
+
+    toy_mod = importlib.import_module("toy_mk_plugin")
+    monkeypatch.setattr(toy_mod, "create", lambda view, options: object())
+    monkeypatch.setattr(
+        toy_mod,
+        "PLUGIN",
+        dataclasses.replace(toy_mod.PLUGIN, create=toy_mod.create),
+    )
+    g = _vote_group(monkeypatch, [0])
+    with pytest.raises(MegakernelPluginError, match="neither a Decline nor"):
+        driver_mod.ProgramDriver.maybe_create(_runner())
+    codes = driver_mod.vote_codes(("toy_declined",))
+    assert [v for v, _ in g.seen] == [codes.index("create_error") + 1]
 
 
 def test_driver_and_salt_resolve_the_same_plugin(
@@ -581,7 +646,9 @@ def _run_two_ranks(
     return [json.loads(o.read_text(encoding="utf-8")) for o in outs]
 
 
-@pytest.mark.parametrize("scenario", ["serve", "decline", "mismatch", "create_error"])
+@pytest.mark.parametrize(
+    "scenario", ["serve", "decline", "mismatch", "create_error", "import_error"]
+)
 def test_two_rank_gloo_agreement(tmp_path: Path, scenario: str) -> None:
     """Real 2-process gloo agreement: never hangs, always rank-uniform."""
     src = (TOY_PLUGIN, TOY_PLUGIN)
@@ -592,6 +659,8 @@ def test_two_rank_gloo_agreement(tmp_path: Path, scenario: str) -> None:
         src = (TOY_PLUGIN, TOY_PLUGIN + "\n# skewed on rank 1\n")
     elif scenario == "create_error":
         options = {"raise_rank": 1}
+    elif scenario == "import_error":
+        src = (TOY_PLUGIN, 'raise ImportError("plugin missing on this host")\n')
     r0, r1 = _run_two_ranks(tmp_path, options, src)
     if scenario == "serve":
         assert r0 == r1 == {"type": "ProgramDriver", "code": None, "warmed": 2}
@@ -600,9 +669,14 @@ def test_two_rank_gloo_agreement(tmp_path: Path, scenario: str) -> None:
         assert r1 == {"type": "DeclinedDriver", "code": "toy_declined"}
     elif scenario == "mismatch":
         assert r0 == r1 == {"type": "DeclinedDriver", "code": "plugin_mismatch"}
-    else:
+    elif scenario == "create_error":
         assert r0 == {"type": "DeclinedDriver", "code": "peer_declined:create_error"}
         assert r1 == {"raised": "RuntimeError: toy create bug"}
+    else:
+        # Rank 1 votes before raising (token 0): rank 0 declines, no hang.
+        assert r0 == {"type": "DeclinedDriver", "code": "plugin_mismatch"}
+        assert r1["raised"].startswith("MegakernelConfigError")
+        assert "plugin missing on this host" in r1["raised"]
 
 
 def test_toy_plugin_source_is_valid_python() -> None:

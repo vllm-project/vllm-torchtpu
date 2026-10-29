@@ -47,6 +47,7 @@ from vllm_torchtpu.megakernel_runtime.config import (
     resolve_callable,
     select_plugin,
 )
+from vllm_torchtpu.megakernel_runtime.errors import MegakernelPluginError
 from vllm_torchtpu.megakernel_runtime.fingerprint import (
     agreement_token,
     plugin_fingerprint,
@@ -733,6 +734,44 @@ def _log_step_mix(name: str, summary: Any) -> None:
     )
 
 
+_PROGRAM_METHODS = (
+    "buckets",
+    "load",
+    "bind",
+    "build",
+    "warmup_inputs",
+    "decide",
+    "forward",
+)
+
+
+def _check_create_result(out: Any, ref: Any) -> _rt.EligibilityResult | None:
+    """`create`'s decline, or `None` for a program; anything else raises."""
+    if isinstance(out, Decline):
+        return out.result
+    missing = [m for m in _PROGRAM_METHODS if not callable(getattr(out, m, None))]
+    if missing:
+        raise MegakernelPluginError(
+            f"megakernel plugin {ref.module}:{ref.attr} create() returned "
+            f"{type(out).__name__}, which is neither a Decline nor a "
+            f"MegakernelProgram (missing {missing})"
+        )
+    return None
+
+
+def _vote_startup_failure(token: int, codes: Sequence[str]) -> None:
+    """Join agreement #1 as `create_error` from a rank that is about to raise."""
+    try:
+        agree_on_decline(
+            _rt.EligibilityResult(False, "create_error", "startup failed"),
+            token=token,
+            mismatch_code="plugin_mismatch",
+            codes=codes,
+        )
+    except Exception:  # the original error is the one to report
+        logger.exception("Megakernel: voting create_error failed")
+
+
 class ProgramDriver:
     """Serves one plugin's `MegakernelProgram` on this TP rank.
 
@@ -784,7 +823,10 @@ class ProgramDriver:
         `None` when the megakernel is off, no plugin serves the checkpoint's
         arch, or a generic startup check fails (identical on every rank, so
         no collective); a `DeclinedDriver` when `create`, the mesh or the
-        plugin fingerprint agreement declines on any rank.
+        plugin fingerprint agreement declines on any rank. Any rank-local
+        failure from the plugin import to the mesh votes `create_error` in
+        agreement #1 before it propagates, so the other ranks decline
+        instead of waiting for it.
         """
         add_cfg = getattr(
             getattr(runner, "vllm_config", None), "additional_config", None
@@ -794,60 +836,59 @@ class ProgramDriver:
         if not cfg.enabled or resolved is None:
             return None
         ref, options = resolved
-        plugin, module = import_plugin(ref)
-        src = source_hash(module, source_root=plugin.source_root)
-        fprint = plugin_fingerprint(
-            module=ref.module,
-            attr=ref.attr,
-            plugin=plugin,
-            source_hash=src,
-            config={**cfg.runtime_keys(), "options": options},
-            raw_env=cfg.raw_env,
-        )
-        token = agreement_token(fprint, runtime_src_hash())
-        logger.info(
-            "Megakernel plugin %s %s loaded from %s (fingerprint %s)",
-            plugin.name,
-            plugin.version,
-            ref.module,
-            fprint[:16],
-        )
-        tp_size = view.tp_size
-        el = check_runner_capabilities(runner, plugin.capabilities, tp_size=tp_size)
-        if el is not None:
-            cls._log_startup_ineligible(el)
-            return None
-        create = resolve_callable(plugin.create, module, what="create")
-        tp_rank = _local_tp_rank()
-        view = RunnerView(runner, tp_rank=tp_rank)
-        codes = vote_codes(plugin.decline_codes)
-        agree = functools.partial(
-            agree_on_decline, token=token, mismatch_code="plugin_mismatch", codes=codes
-        )
-        decline: _rt.EligibilityResult | None = None
+        # Until the fingerprint exists, a failing rank votes with token 0: it
+        # can't match the peers' token, so they decline with plugin_mismatch.
+        token, codes = 0, vote_codes()
+        mesh: Any = None
         try:
+            plugin, module = import_plugin(ref)
+            codes = vote_codes(plugin.decline_codes)
+            src = source_hash(module, source_root=plugin.source_root)
+            fprint = plugin_fingerprint(
+                module=ref.module,
+                attr=ref.attr,
+                plugin=plugin,
+                source_hash=src,
+                config={**cfg.runtime_keys(), "options": options},
+                raw_env=cfg.raw_env,
+            )
+            token = agreement_token(fprint, runtime_src_hash())
+            logger.info(
+                "Megakernel plugin %s %s loaded from %s (fingerprint %s)",
+                plugin.name,
+                plugin.version,
+                ref.module,
+                fprint[:16],
+            )
+            tp_size = view.tp_size
+            el = check_runner_capabilities(runner, plugin.capabilities, tp_size=tp_size)
+            if el is not None:
+                cls._log_startup_ineligible(el)
+                return None
+            create = resolve_callable(plugin.create, module, what="create")
+            tp_rank = _local_tp_rank()
+            view = RunnerView(runner, tp_rank=tp_rank)
             out = create(view, dict(options))
+            decline = _check_create_result(out, ref)
+            if decline is None:
+                try:
+                    mesh = _build_tp_rank_mesh(
+                        tp_size, fallback_mesh=getattr(runner, "mesh", None)
+                    )
+                except MeshDecline as exc:
+                    decline = exc.result
+                else:
+                    el_mesh = _rt.check_post_mesh_eligibility(
+                        tp_size=tp_size, mesh_size=int(mesh.devices.size)
+                    )
+                    decline = None if el_mesh.eligible else el_mesh
         except BaseException:
-            # Still vote, so the other ranks decline instead of waiting.
-            agree(_rt.EligibilityResult(False, "create_error", "create failed"))
+            _vote_startup_failure(token, codes)
             raise
-        if isinstance(out, Decline):
-            decline = out.result
-        mesh = None
-        if decline is None:
-            try:
-                mesh = _build_tp_rank_mesh(
-                    tp_size, fallback_mesh=getattr(runner, "mesh", None)
-                )
-            except MeshDecline as exc:
-                decline = exc.result
-            else:
-                el_mesh = _rt.check_post_mesh_eligibility(
-                    tp_size=tp_size, mesh_size=int(mesh.devices.size)
-                )
-                decline = None if el_mesh.eligible else el_mesh
         # Agreement #1: the first collective; it also compares fingerprints.
-        decline = agree(decline)
+        decline = agree_on_decline(
+            decline, token=token, mismatch_code="plugin_mismatch", codes=codes
+        )
         name = str(getattr(out, "display_name", "") or plugin.name)
         if decline is not None:
             cls._log_startup_ineligible(decline)
