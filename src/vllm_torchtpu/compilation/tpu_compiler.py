@@ -28,6 +28,7 @@ import json
 import os
 import pickle
 import re
+import secrets
 import shutil
 import threading
 import time
@@ -623,11 +624,18 @@ class TpuCompilerAdaptor(CompilerInterface):
             )
             # Write-then-rename: a crash or a full disk partway through
             # pickling a 400 MB entry would otherwise leave a truncated file
-            # that the next run reads back as a corrupt artifact.
-            tmp_path = f"{path}.tmp"
-            with open(tmp_path, "wb") as f:
-                pickle.dump(payload, f)
-            os.replace(tmp_path, path)
+            # that the next run reads back as a corrupt artifact. The temp
+            # name is unique and created exclusively, so two deployments
+            # sharing a cache root never write into the same file.
+            tmp_path = f"{path}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+            try:
+                with open(tmp_path, "xb") as f:
+                    pickle.dump(payload, f)
+                os.replace(tmp_path, path)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_path)
+                raise
             logger.info("[TpuCompilerAdaptor] Saved compiled artifact to %s", path)
             return True
         except Exception as e:
