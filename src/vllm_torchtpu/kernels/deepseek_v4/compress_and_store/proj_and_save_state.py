@@ -140,6 +140,80 @@ def store_to_acc_ref(ref, val, dtype=None):
         ref_flat[pl.ds(i, tile_n, num_chunks)] = val_slice
 
 
+class _StateWriter:
+    """Writes one projection's finished token tiles to its cache.
+
+    A token tile's states are written one grid step after its last m tile is
+    computed, so the DMAs overlap the next step's matmuls. Each token tile of a
+    token block has its own accumulator slot per m tile, one strided DMA per
+    token writes all of them, and a slot is reused only after a wait for every
+    byte its previous tile's writes moved.
+    """
+
+    def __init__(self, slot_mapping, cache, acc_ref, sem_ref, counts_ref, num_m):
+        self.slot_mapping = slot_mapping
+        self.acc_u8 = acc_ref.bitcast(jnp.uint8)
+        self.sem_ref = sem_ref
+        self.counts_ref = counts_ref
+        # A CSA int32 NoPE array hosts the state too; write it as uint8 slabs.
+        cache = csa_cache_layout.as_u8_slabs(cache)
+        self.row_shape = cache.shape[2:]
+        self.num_m = num_m
+        self.slots_per_m_tile = acc_ref.shape[3]
+        # A slot is page * page_size + row, i.e. the row of the flattened cache.
+        self.cache_rows = cache.reshape(-1, *self.row_shape)
+        self.acc_rows = self.acc_u8.reshape(-1, *self.row_shape)
+
+    def reset(self, num_slots):
+        for slot in range(num_slots):
+            self.counts_ref[slot] = 0
+
+    def wait(self, buf_idx, num_tokens):
+        """Waits for all bytes of ``num_tokens`` state writes from a slot.
+
+        A DMA signals its semaphore by the amount it moved, so the wait is a
+        descriptor of the same total size; only its size is used.
+        """
+        rows = num_tokens * self.num_m * self.slots_per_m_tile
+        pltpu.make_async_copy(
+            self.acc_rows.at[pl.ds(0, rows)],
+            self.cache_rows.at[pl.ds(0, rows)],
+            self.sem_ref.at[buf_idx],
+        ).wait()
+
+    def wait_slot(self, buf_idx):
+        """Waits for the writes last started from a slot, if any."""
+        count = self.counts_ref[buf_idx][...]
+
+        @pl.when(count > 0)
+        def _do_wait():
+            self.wait(buf_idx, count)
+
+    def copy_out(self, n_idx, buf_idx, tile_n):
+        """Starts the state writes of token tile ``n_idx`` from slot ``buf_idx``."""
+        num_valid_writes = 0
+        for i in range(tile_n):
+            if i % SLOT_LOAD_GROUP == 0:
+                group_slots = [
+                    self.slot_mapping[n_idx * tile_n + t]
+                    for t in range(i, min(i + SLOT_LOAD_GROUP, tile_n))
+                ]
+            global_slot_idx = group_slots[i % SLOT_LOAD_GROUP]
+            valid = global_slot_idx >= 0
+            num_valid_writes = num_valid_writes + lax.select(valid, 1, 0)
+
+            @pl.when(valid)
+            def _start(global_slot_idx=global_slot_idx, i=i):
+                # The m tiles of a token are consecutive slots in the cache.
+                dest = self.cache_rows.at[
+                    pl.ds(global_slot_idx, self.num_m * self.slots_per_m_tile)
+                ].reshape(self.num_m, self.slots_per_m_tile, *self.row_shape)
+                src = self.acc_u8.at[:, buf_idx, i]
+                pltpu.make_async_copy(src, dest, self.sem_ref.at[buf_idx]).start()
+
+        self.counts_ref[buf_idx] = num_valid_writes
+
+
 def kernel(
     # scalar prefetch
     slot_mapping,
@@ -162,65 +236,11 @@ def kernel(
     tile_m = cfgs.tile_sizes.tile_m
     tile_n = cfgs.tile_sizes.tile_n
     tiles_per_block = cfgs.tile_sizes.tiles_per_block
-    last_dim = acc_ref.shape[-1]
-    slots_per_m_tile = tile_m // last_dim
-    acc_ref_u8 = acc_ref.bitcast(jnp.uint8)
-    # A CSA int32 NoPE array hosts the state too; write it as uint8 slabs.
-    cache = csa_cache_layout.as_u8_slabs(cache)
     num_m = cfgs.num_m
-    rows_per_token = num_m * slots_per_m_tile
-    # A slot is page * page_size + row, i.e. the row of the flattened cache.
-    cache_rows = cache.reshape(-1, *cache.shape[2:])
-    acc_rows = acc_ref_u8.reshape(-1, *cache.shape[2:])
-    for slot in range(tiles_per_block):
-        write_counts_ref[slot] = 0
-
-    def _wait_for_writes(buf_idx_val, num_tokens):
-        """Waits for all bytes of ``num_tokens`` state writes from a slot.
-
-        A DMA signals its semaphore by the amount it moved, so the wait is a
-        descriptor of the same total size; only its size is used.
-        """
-        rows = num_tokens * rows_per_token
-        pltpu.make_async_copy(
-            acc_rows.at[pl.ds(0, rows)],
-            cache_rows.at[pl.ds(0, rows)],
-            sem_ref.at[buf_idx_val],
-        ).wait()
-
-    def _dma_copy_out(n_idx_val, buf_idx_val):
-        """Copys one token tile, every m tile, from accumulator to the KV cache.
-
-        We run the dma one grid step after the last m tile is done computing;
-        each token tile of a token block has its own accumulator slot per m
-        tile, and one strided DMA per token writes all of them.
-
-        The reason we do this in the following tile is that we hope to pipeline the
-        DMA with the matmuls.
-
-        (however, this is awaiting RAW no-hazard flag to land)
-        """
-        num_valid_writes = 0
-        for i in range(tile_n):
-            if i % SLOT_LOAD_GROUP == 0:
-                group_slots = [
-                    slot_mapping[n_idx_val * tile_n + t]
-                    for t in range(i, min(i + SLOT_LOAD_GROUP, tile_n))
-                ]
-            global_slot_idx = group_slots[i % SLOT_LOAD_GROUP]
-            valid = global_slot_idx >= 0
-            num_valid_writes = num_valid_writes + lax.select(valid, 1, 0)
-
-            @pl.when(valid)
-            def _start(global_slot_idx=global_slot_idx, i=i):
-                # The m tiles of a token are consecutive slots in the cache.
-                dest = cache_rows.at[
-                    pl.ds(global_slot_idx, num_m * slots_per_m_tile)
-                ].reshape(num_m, slots_per_m_tile, *cache.shape[2:])
-                src = acc_ref_u8.at[:, buf_idx_val, i]
-                pltpu.make_async_copy(src, dest, sem_ref.at[buf_idx_val]).start()
-
-        write_counts_ref[buf_idx_val] = num_valid_writes
+    writer = _StateWriter(
+        slot_mapping, cache, acc_ref, sem_ref, write_counts_ref, num_m
+    )
+    writer.reset(tiles_per_block)
 
     def inner_kernel(
         tiled_wgate_ref,  # (k_tiles_per_step * tile_k, tile_m)
@@ -282,17 +302,13 @@ def kernel(
 
         def _write_out_previous_tile():
             prev_buf_idx = jnp.where(j_idx == 0, tiles_per_block - 1, j_idx - 1)
-            _dma_copy_out(n_idx - 1, prev_buf_idx)
+            writer.copy_out(n_idx - 1, prev_buf_idx, tile_n)
 
         def process(copy_dma, add_ape):
             # 1. Semaphore wait (only on the slot's first step)
             @pl.when((m_idx == 0) & (k_idx == 0))
             def _wait_for_buffer():
-                count = write_counts_ref[buf_idx][...]
-
-                @pl.when(count > 0)
-                def _do_wait():
-                    _wait_for_writes(buf_idx, count)
+                writer.wait_slot(buf_idx)
 
             # 2. Launch DMA for the PREVIOUS token tile
             _run_if(copy_dma, _write_out_previous_tile)
@@ -391,14 +407,38 @@ def kernel(
 
     # Epilogue: launch DMA for the last tile and wait for all outstanding DMAs
     if cfgs.num_n > 0:
-        _dma_copy_out(cfgs.num_n - 1, tiles_per_block - 1)
+        writer.copy_out(cfgs.num_n - 1, tiles_per_block - 1, tile_n)
 
     for b in range(tiles_per_block):
-        count = write_counts_ref[b][...]
+        writer.wait_slot(b)
 
-        @pl.when(count > 0)
-        def _wait_epilogue(b=b, count=count):
-            _wait_for_writes(b, count)
+
+def _fuses_k(num_tokens: int, wkv_wgate: jax.Array) -> bool:
+    """Whether one grid step covers the whole hidden dim (FUSE_K_*)."""
+    hidden_size, state_dim = wkv_wgate.shape
+    tile_m = state_dim // 2
+    fused_weight_bytes = 2 * hidden_size * tile_m * wkv_wgate.dtype.itemsize
+    return (
+        num_tokens >= FUSE_K_MIN_TOKENS
+        and tile_m >= FUSE_K_MIN_TILE_M
+        and fused_weight_bytes <= FUSE_K_MAX_WEIGHT_BYTES
+    )
+
+
+def _token_tiling(num_tokens: int, fuse_k: bool) -> tuple[int, int, int]:
+    """The token tile, the number of token blocks and the tiles per block."""
+    # The token dimension must be an exact multiple of `tile_n`.
+    sublane_tile = 8
+    max_tile_n = 128
+    if fuse_k and num_tokens >= 2 * FUSED_K_TILE_N:
+        max_tile_n = FUSED_K_TILE_N
+    tile_n = min(max_tile_n, pl.cdiv(num_tokens, sublane_tile) * sublane_tile)
+    num_n = pl.cdiv(num_tokens, tile_n)
+    # At least 2 tiles per block: the last tile of a block is written out one
+    # step into the next block, after that step's wait on its slot.
+    num_token_blocks = pl.cdiv(num_n, max(2, MAX_RESIDENT_TOKENS // tile_n))
+    tiles_per_block = pl.cdiv(num_n, num_token_blocks)
+    return tile_n, num_token_blocks, tiles_per_block
 
 
 def _select_tile_k(size_k: int, cap: int = 3584, align: int = 128) -> int:
@@ -447,25 +487,10 @@ def proj_and_save_state(
     state_width = state_dim // 2
     tile_m = state_width
     tile_k = _select_tile_k(hidden_size)
-    fused_weight_bytes = 2 * hidden_size * tile_m * wkv_wgate.dtype.itemsize
-    fuse_k = (
-        num_tokens >= FUSE_K_MIN_TOKENS
-        and tile_m >= FUSE_K_MIN_TILE_M
-        and fused_weight_bytes <= FUSE_K_MAX_WEIGHT_BYTES
-    )
+    fuse_k = _fuses_k(num_tokens, wkv_wgate)
     k_tiles_per_step = hidden_size // tile_k if fuse_k else 1
 
-    # The token dimension must be an exact multiple of `tile_n`.
-    sublane_tile = 8
-    max_tile_n = 128
-    if fuse_k and num_tokens >= 2 * FUSED_K_TILE_N:
-        max_tile_n = FUSED_K_TILE_N
-    tile_n = min(max_tile_n, pl.cdiv(num_tokens, sublane_tile) * sublane_tile)
-    num_n = pl.cdiv(num_tokens, tile_n)
-    # At least 2 tiles per block: the last tile of a block is written out one
-    # step into the next block, after that step's wait on its slot.
-    num_token_blocks = pl.cdiv(num_n, max(2, MAX_RESIDENT_TOKENS // tile_n))
-    tiles_per_block = pl.cdiv(num_n, num_token_blocks)
+    tile_n, num_token_blocks, tiles_per_block = _token_tiling(num_tokens, fuse_k)
     padded_num_tokens = num_token_blocks * tiles_per_block * tile_n
     if padded_num_tokens != num_tokens:
         pad = padded_num_tokens - num_tokens
@@ -530,3 +555,4 @@ def proj_and_save_state(
         interpret=interpret,
         name="proj_and_save_state",
     )(slot_mapping, positions, hidden_states, wkv_wgate, ape, cache)
+
