@@ -33,40 +33,13 @@ export PRIORITY_KERNEL_TUNING=-9
 # cap.
 export PR_TPU_JOBS_PER_AUTHOR=40
 
-# Implemented dynamic job prioritization by injecting integers during upload
+# Implemented dynamic job prioritization by injecting integers during upload.
+# Delegates to bootstrap.py so priority injection, NIGHTLY substitution, and
+# PR TPU concurrency capping have a single implementation.
 upload_with_priority() {
   local yaml_file=$1
-  local JOB_PRIORITY=$2
-  local capped
-  local filter=(cat)
-  echo "--- :pipeline: Uploading $yaml_file with priority ${JOB_PRIORITY:-$PRIORITY_DEFAULT}"
-  # build.env("NIGHTLY") is evaluated by Buildkite against the build's initial
-  # environment, so a NIGHTLY=1 set by bootstrap.sh (for the run-full-ci label)
-  # never reaches it unless substituted before upload.
-  if [[ "${NIGHTLY:-0}" == "1" ]]; then
-    filter=(sed 's/build\.env("NIGHTLY")/"1"/g')
-  fi
-  # A pull-request build's TPU steps go in its author's concurrency group (set
-  # by bootstrap.sh). The file is read once by the agent, so that the group is
-  # added to the steps it would upload, anchors and interpolation resolved,
-  # then uploaded as is. If any of that fails the file goes up uncapped rather
-  # than failing the build.
-  if [[ -n "${PR_TPU_CONCURRENCY_GROUP:-}" ]]; then
-    if capped=$({
-        echo "priority: ${JOB_PRIORITY:-$PRIORITY_DEFAULT}";
-        "${filter[@]}" "$yaml_file";
-      } | buildkite-agent pipeline upload --dry-run --format json \
-        | python3 "$(dirname "${BASH_SOURCE[0]}")/../cap_pr_tpu_concurrency.py" \
-            "$PR_TPU_CONCURRENCY_GROUP" "$PR_TPU_JOBS_PER_AUTHOR"); then
-      buildkite-agent pipeline upload --no-interpolation <<< "$capped"
-      return
-    fi
-    echo "WARNING: could not put $yaml_file in ${PR_TPU_CONCURRENCY_GROUP}; uploading it uncapped" >&2
-  fi
-  {
-    echo "priority: ${JOB_PRIORITY:-$PRIORITY_DEFAULT}";
-    "${filter[@]}" "$yaml_file";
-  } | buildkite-agent pipeline upload
+  local job_priority=${2:-$PRIORITY_DEFAULT}
+  python3 -u "$(dirname "${BASH_SOURCE[0]}")/../bootstrap.py" upload "$yaml_file" "$job_priority"
 }
 
 get_vllm_commit_hash() {
