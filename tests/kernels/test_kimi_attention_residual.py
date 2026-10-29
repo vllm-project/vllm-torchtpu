@@ -18,7 +18,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.kimi_k3.attention_residual import attention_residual
+from vllm_torchtpu.kernels.kimi_k3.attention_residual import (
+    attention_residual,
+    attention_residual_streamed,
+)
 
 
 @pytest.mark.parametrize("blocks", [0, 1, 2, 4, 8])
@@ -42,4 +45,24 @@ def test_fused_mix_matches_float64(blocks):
     expected = (values * probabilities[..., None]).sum(axis=1)
     np.testing.assert_allclose(
         np.asarray(actual, np.float32), expected, rtol=0.005, atol=0.005
+    )
+
+
+@pytest.mark.parametrize("blocks", [1, 2, 8])
+@pytest.mark.parametrize("tile,chunk", [(16, 128), (32, 256), (64, 512)])
+def test_streamed_mix_matches_fused(blocks, tile, chunk):
+    rng = np.random.default_rng(7)
+    prefix = jnp.asarray(rng.normal(size=(64, 1024)), jnp.bfloat16)
+    history = jnp.asarray(rng.normal(size=(64, blocks, 1024)), jnp.bfloat16)
+    weight = jnp.asarray(rng.normal(0, 0.02, size=1024), jnp.float32)
+    fused = attention_residual(prefix, history, weight, interpret=True)
+    streamed = attention_residual_streamed(
+        prefix, history, weight, tile=tile, chunk=chunk, interpret=True
+    )
+    # Only the f32 summation order differs: at most one bf16 ulp.
+    np.testing.assert_allclose(
+        np.asarray(streamed, np.float32),
+        np.asarray(fused, np.float32),
+        rtol=1e-2,
+        atol=1e-2,
     )
