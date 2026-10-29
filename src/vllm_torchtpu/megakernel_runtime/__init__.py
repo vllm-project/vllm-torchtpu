@@ -17,11 +17,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from .errors import MegakernelUnsupported
 from .hooks import StepContext, is_suppressed, suppressed
 
 _DRIVER_EXPORTS = frozenset(
     {
         "MegakernelDriver",
+        "ProgramDriver",
         "TorchStepMetaOps",
         "prepare_step_inputs_eager",
     }
@@ -57,38 +59,18 @@ _COLLECTOR_EXPORTS = frozenset(
 def _is_megakernel_requested(runner: Any = None) -> bool:
     import vllm_torchtpu.envs as envs
 
-    raw_env = str(envs.VLLM_TPU_MEGAKERNEL or "").strip().lower()
-    if raw_env and raw_env not in ("0", "false", "no", "off", "none"):
-        return True
-    if runner is not None:
-        vllm_cfg = getattr(runner, "vllm_config", None)
-        add_cfg = getattr(vllm_cfg, "additional_config", None)
-        if isinstance(add_cfg, dict):
-            mk_cfg = add_cfg.get("megakernel")
-            if isinstance(mk_cfg, dict):
-                en = mk_cfg.get("enabled", True)
-                if isinstance(en, str):
-                    return en.strip().lower() not in (
-                        "",
-                        "0",
-                        "false",
-                        "no",
-                        "off",
-                        "none",
-                    )
-                return bool(en)
-            if isinstance(mk_cfg, str):
-                return mk_cfg.strip().lower() not in (
-                    "",
-                    "0",
-                    "false",
-                    "no",
-                    "off",
-                    "none",
-                )
-            if mk_cfg:
-                return True
-    return False
+    from .config import collect_config
+
+    v_cfg = getattr(runner, "vllm_config", None) if runner is not None else None
+    add_cfg = getattr(v_cfg, "additional_config", None)
+    return collect_config(envs.VLLM_TPU_MEGAKERNEL, add_cfg).enabled
+
+
+def guard_weight_update(runner: Any) -> None:
+    """Raise `MegakernelUnsupported("weight_update")` while a megakernel serves
+    `runner`: its packed weights would go stale."""
+    if getattr(getattr(runner, "_megakernel", None), "serving", False) is True:
+        raise MegakernelUnsupported("weight_update")
 
 
 def maybe_create(runner: Any) -> Any:
@@ -118,7 +100,9 @@ def __getattr__(name: str) -> Any:
 
 __all__ = [
     "MegakernelDriver",
+    "MegakernelUnsupported",
     "PooledStepExport",
+    "ProgramDriver",
     "StepContext",
     "TorchArrayOps",
     "TorchStepMetaOps",
@@ -131,6 +115,7 @@ __all__ = [
     "extract_ecopy_layer",
     "find_backbone",
     "get_routed_experts",
+    "guard_weight_update",
     "is_suppressed",
     "load_vllm_weights",
     "make_typed_step_wrapper",

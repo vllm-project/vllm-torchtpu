@@ -46,7 +46,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_torchtpu.distributed.utils as dist_utils
-from vllm_torchtpu import envs, profiler_trace, utils
+from vllm_torchtpu import envs, megakernel_runtime, profiler_trace, utils
 from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
@@ -862,6 +862,7 @@ class TPUWorker(WorkerBase):
         transpose_keys: dict[str, tuple[int]],
         reshard_fn=None,
     ) -> None:
+        megakernel_runtime.guard_weight_update(self.model_runner)
         return self.model_runner._sync_weights(
             updated_weights=updated_weights,
             mappings=mappings,
