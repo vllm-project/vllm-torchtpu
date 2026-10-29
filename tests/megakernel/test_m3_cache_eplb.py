@@ -1602,11 +1602,22 @@ def test_m3_bit_exact_vs_frozen_pool_io_and_eplb(T: int, B: int):
         jax.random.key(404 + T), g_eplb, ex_eplb
     )
     assert "ecopy" in w_le and jnp.any(w_le["ecopy"] > 0)
-    # Bias router strongly toward experts 0 and 1 (replicated on rank 1 slots 64..65)
-    # so Po2C deterministically routes tokens to secondary replicas.
+    # Bias router strongly toward experts 0..3 (replicated on rank 1 slots 64..67)
+    # with alternating signs so both positive and negative hidden sums route
+    # into secondary replicas under Po2C.
     w_le = dict(
         w_le,
-        router=w_le["router"].at[:, :, :2].add(jnp.bfloat16(100.0)),
+        router=(
+            w_le["router"]
+            .at[:, :, 0]
+            .add(jnp.bfloat16(100.0))
+            .at[:, :, 1]
+            .add(jnp.bfloat16(-100.0))
+            .at[:, :, 2]
+            .add(jnp.bfloat16(100.0))
+            .at[:, :, 3]
+            .add(jnp.bfloat16(-100.0))
+        ),
     )
     _, hid_mke, w_libe, st_mke = mk.pack_inputs(
         pos_e, hid_le, w_le, st_le, g_eplb, ex_eplb, mesh=mesh2
