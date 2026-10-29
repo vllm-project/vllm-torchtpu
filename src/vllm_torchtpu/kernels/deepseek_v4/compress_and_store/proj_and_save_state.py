@@ -268,7 +268,19 @@ def kernel(
             new_acc = existing_acc + ape_selected  # (tile_n, state_width)
             store_to_acc_ref(acc_ref.at[m_idx, buf_idx], new_acc)
 
-        def process(copy_dma: bool, add_ape: bool):
+        def _run_if(cond, fn):
+            """Runs ``fn`` where ``cond`` holds, at trace time for a bool."""
+            if isinstance(cond, bool):
+                if cond:
+                    fn()
+            else:
+                pl.when(cond)(fn)
+
+        def _write_out_previous_tile():
+            prev_buf_idx = jnp.where(j_idx == 0, tiles_per_block - 1, j_idx - 1)
+            _dma_copy_out(n_idx - 1, prev_buf_idx)
+
+        def process(copy_dma, add_ape):
             # 1. Semaphore wait (only on the slot's first step)
             @pl.when((m_idx == 0) & (k_idx == 0))
             def _wait_for_buffer():
@@ -279,9 +291,7 @@ def kernel(
                     _wait_for_writes(buf_idx, count)
 
             # 2. Launch DMA for the PREVIOUS token tile
-            if copy_dma:
-                prev_buf_idx = jnp.where(j_idx == 0, tiles_per_block - 1, j_idx - 1)
-                _dma_copy_out(n_idx - 1, prev_buf_idx)
+            _run_if(copy_dma, _write_out_previous_tile)
 
             for kk in range(k_tiles_per_step):
                 # 3. Matmul
@@ -302,8 +312,7 @@ def kernel(
                 store_to_acc_ref(acc_ref.at[m_idx, buf_idx], new_acc)
 
             # 5. APE addition if last
-            if add_ape:
-                _add_ape()
+            _run_if(add_ape, _add_ape)
 
         # Select and execute
         num_k = cfgs.num_k
@@ -315,6 +324,13 @@ def kernel(
             (b_idx > 0) & (m_idx == 0) & (k_idx == 0) & (j_idx == 0)
         )
         add_ape = is_last_k & is_score
+
+        if k_tiles_per_step > 1:
+            # The fused-K step body is large: one copy of it, with the
+            # write-out and the APE add as branches inside, keeps the kernel's
+            # code small.
+            process(copy_dma, add_ape)
+            return
 
         @pl.when(jnp.logical_not(copy_dma) & jnp.logical_not(add_ape))
         @jax.named_scope("matmul")
