@@ -168,7 +168,11 @@ def test_toy_plugin_serves_through_try_forward(
     assert prog.events == ["load"] and prog.mesh is not None
     runner._megakernel = drv
     drv.bind_and_warmup(runner)
-    assert prog.events == ["load", "bind", ("buckets", (16, 32, 64)), "warm"]
+    assert prog.events == ["load", "bind", ("buckets", (16, 32, 64))]
+    # H2: the program hook runs from the worker's on_warmup_done, once per bind.
+    drv.on_warmup_done(runner)
+    drv.on_warmup_done(runner)
+    assert prog.events[-1] == "warm" and prog.events.count("warm") == 1
     # Runtime-enumerated runner shapes: first padding >= B, x every
     # (req, blk) pair; ckpt_cols = max(T, ckpt_window).
     assert [(k, s) for k, s, _ in prog.warmed] == [

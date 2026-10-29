@@ -420,6 +420,9 @@ class DeclinedDriver:
     def reset_stats(self) -> None:
         self.step_mix_tracker.reset()
 
+    def on_warmup_done(self, runner: Any) -> None:
+        del runner
+
     def try_forward(self, runner: Any, ctx: StepContext) -> tuple[bool, Any]:
         del ctx
         if is_suppressed(runner):
@@ -805,6 +808,7 @@ class ProgramDriver:
         self._buckets: list[Bucket] = []
         self._steps: dict[tuple[int, int], StepFn] = {}
         self._bound = False
+        self._warmup_done = False
         self._pending: tuple[Any, ForwardView, StepContext] | None = None
         self._inspect: Any = None
         self._inspect_runner: Any = None
@@ -964,6 +968,7 @@ class ProgramDriver:
             self._steps[b.key] = self._compile(self.program.build(b), b)
         self._buckets = buckets
         self._bound = True
+        self._warmup_done = False
 
     def bind_and_warmup(self, runner: Any) -> None:
         """Bind the program to the runner's caches, agree, and warm up.
@@ -1021,9 +1026,16 @@ class ProgramDriver:
                     )
                 return
             self.warmup(runner)
-            done = getattr(self.program, "on_warmup_done", None)
-            if callable(done):
-                done()
+
+    def on_warmup_done(self, runner: Any) -> None:
+        """H2: the worker's warmup is over (after `capture_model`, i.e. after
+        the stock precompile too); calls the program's optional
+        `on_warmup_done()` once per bind."""
+        del runner
+        done = getattr(self.program, "on_warmup_done", None)
+        if self._bound and not self._warmup_done and callable(done):
+            done()
+        self._warmup_done = self._bound
 
     @torch.no_grad()
     def warmup(self, runner: Any = None) -> None:

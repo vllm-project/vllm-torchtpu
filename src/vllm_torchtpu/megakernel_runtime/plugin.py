@@ -378,7 +378,9 @@ class MegakernelProgram(Protocol):
 
     Optional methods (looked up with `getattr`): `warmup_session()` (a
     context manager around warmup), `check_compiled_ir(debug, bucket)`,
-    `attach_draft(drafter)` / `detach_draft()`, `on_warmup_done()`.
+    `attach_draft(drafter)` / `detach_draft()`, `on_warmup_done()` (called
+    once per bind from the runtime's H2 `on_warmup_done(runner)`, after the
+    worker's whole warmup).
     """
 
     display_name: str
