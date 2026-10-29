@@ -59,7 +59,6 @@ class Configs:
 
     tile_sizes: TileSizes
     dims: Dimensions
-    token_page_size: int
 
     @property
     def num_m(self) -> int:
@@ -157,6 +156,8 @@ def kernel(
         (however, this is awaiting RAW no-hazard flag to land)
         """
         num_valid_writes = 0
+        # A slot is page * page_size + row, i.e. the row of the flattened cache.
+        cache_rows = cache.reshape(-1, *cache.shape[2:])
         for i in range(tile_n):
             global_token_idx = n_idx_val * tile_n + i
             global_slot_idx = slot_mapping[global_token_idx]
@@ -165,12 +166,9 @@ def kernel(
 
             @pl.when(valid)
             def _start(global_slot_idx=global_slot_idx, i=i):
-                page_size_tokens = cfgs.token_page_size
-                p = global_slot_idx // page_size_tokens
-                start_slot_token = global_slot_idx % page_size_tokens
                 # The m tiles of a token are consecutive slots in the cache.
-                dest = cache.at[
-                    p, pl.ds(start_slot_token, num_m * slots_per_m_tile)
+                dest = cache_rows.at[
+                    pl.ds(global_slot_idx, num_m * slots_per_m_tile)
                 ].reshape(num_m, slots_per_m_tile, *cache.shape[2:])
                 src = acc_ref_u8.at[:, buf_idx_val, i]
                 pltpu.make_async_copy(src, dest, sem_ref.at[buf_idx_val]).start()
@@ -374,8 +372,6 @@ def proj_and_save_state(
     num_tokens, hidden_size = hidden_states.shape
     _, state_dim = wkv_wgate.shape
 
-    token_page_size = cache.shape[1]
-
     state_width = state_dim // 2
     tile_m = state_width
     tile_k = _select_tile_k(hidden_size)
@@ -410,7 +406,6 @@ def proj_and_save_state(
     cfgs = Configs(
         tile_sizes=tile_sizes,
         dims=dims,
-        token_page_size=token_page_size,
     )
 
     last_dim = cache.shape[-1]
