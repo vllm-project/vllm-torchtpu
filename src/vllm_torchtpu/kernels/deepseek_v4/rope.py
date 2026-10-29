@@ -311,20 +311,51 @@ def _qnorm_rope_body(
     Per-head RMSNorm (no weight) over the whole ``head_dim``, then the same
     rotation ``_rope_body`` applies.
     """
-    x = x_ref[...].astype(jnp.float32)
+    out_ref[...] = _qnorm_rope_values(
+        x_ref[...], cos_sin_ref[...], rotary_dim=rotary_dim, eps=eps, inverse=inverse
+    ).astype(out_dtype)
+
+
+def _qnorm_rope_values(x, cos_sin, *, rotary_dim: int, eps: float, inverse: bool):
+    """Per-head RMSNorm, then RoPE on the last lane block; heads independent."""
+    x = x.astype(jnp.float32)
     rms = jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + eps)
     y = x * rms
 
     # Only the last lane block holds roped channels; the rest of the row passes
     # through with nothing but the norm applied.
     tail = y[..., -LANE:]
-    cos, sin = _cos_sin_lanes(cos_sin_ref[...], rotary_dim=rotary_dim, inverse=inverse)
+    cos, sin = _cos_sin_lanes(cos_sin, rotary_dim=rotary_dim, inverse=inverse)
     assert tail.ndim == 3
     cos = cos[:, None, :]
     sin = sin[:, None, :]
     roped = tail * cos + _rotate_gptj(tail) * sin
+    return jnp.concatenate([y[..., :-LANE], roped], axis=-1)
 
-    out_ref[...] = jnp.concatenate([y[..., :-LANE], roped], axis=-1).astype(out_dtype)
+
+def _qnorm_rope_pair_body(
+    current_heads_ref: jax.Ref,
+    neighbor_heads_ref: jax.Ref,
+    cos_sin_ref: jax.Ref,
+    out_ref: jax.Ref,
+    *,
+    current_head_start: int,
+    neighbor_head_start: int,
+    rotary_dim: int,
+    eps: float,
+    out_dtype: jnp.dtype,
+) -> None:
+    """One ``(tile_n, num_heads, head_dim)`` output chunk from the two half-head
+    inputs: the same per-head values ``_qnorm_rope_body`` computes."""
+    cos_sin = cos_sin_ref[...]
+    kw = dict(rotary_dim=rotary_dim, eps=eps, inverse=False)
+    half = current_heads_ref.shape[1]
+    out_ref[:, pl.ds(current_head_start, half), :] = _qnorm_rope_values(
+        current_heads_ref[...], cos_sin, **kw
+    ).astype(out_dtype)
+    out_ref[:, pl.ds(neighbor_head_start, half), :] = _qnorm_rope_values(
+        neighbor_heads_ref[...], cos_sin, **kw
+    ).astype(out_dtype)
 
 
 def _qnorm_rope_kernel(
@@ -576,6 +607,149 @@ def qnorm_rope(
         ),
         name=name,
     )(positions, x, cos_sin_cache)
+
+
+def _qnorm_rope_pair_kernel(
+    positions_ref: jax.Ref,
+    current_heads_hbm_ref: jax.Ref,
+    neighbor_heads_hbm_ref: jax.Ref,
+    cos_sin_cache_hbm_ref: jax.Ref,
+    out_hbm_ref: jax.Ref,
+    *,
+    num_tiles: int,
+    tile_n: int,
+    half: int,
+    head_dim: int,
+    current_first_tile: int,
+    current_head_start: int,
+    neighbor_head_start: int,
+    rotary_dim: int,
+    eps: float,
+    in_dtype: jnp.dtype,
+    cos_sin_dtype: jnp.dtype,
+) -> None:
+    current_heads_spec = pl.BlockSpec(
+        block_shape=(tile_n, half, head_dim),
+        memory_space=pltpu.VMEM,
+        index_map=lambda i: (current_first_tile + i, 0, 0),
+    )
+    neighbor_heads_spec = pl.BlockSpec(
+        block_shape=(tile_n, half, head_dim),
+        memory_space=pltpu.VMEM,
+        index_map=lambda i: (i, 0, 0),
+    )
+    out_spec = pl.BlockSpec(
+        block_shape=(tile_n, 2 * half, head_dim),
+        memory_space=pltpu.VMEM,
+        index_map=lambda i: (i, 0, 0),
+    )
+    cos_sin_spec = pl.BlockSpec(
+        block_shape=(tile_n, rotary_dim),
+        memory_space=pltpu.VMEM,
+        index_map=lambda i: (i, 0),
+    )
+    pipeline = pltpu.emit_pipeline(
+        functools.partial(
+            _qnorm_rope_pair_body,
+            current_head_start=current_head_start,
+            neighbor_head_start=neighbor_head_start,
+            rotary_dim=rotary_dim,
+            eps=eps,
+            out_dtype=in_dtype,
+        ),
+        grid=(num_tiles,),
+        in_specs=[current_heads_spec, neighbor_heads_spec, cos_sin_spec],
+        out_specs=[out_spec],
+    )
+    allocations = (
+        pltpu.BufferedRef.input(current_heads_spec, in_dtype, buffer_count=2),
+        pltpu.BufferedRef.input(neighbor_heads_spec, in_dtype, buffer_count=2),
+        CosSinRef.create(
+            spec=cos_sin_spec, dtype=cos_sin_dtype, buffer_count=2, tile_n=tile_n
+        ),
+        pltpu.BufferedRef.output(out_spec, in_dtype, buffer_count=2),
+    )
+
+    @pl.with_scoped(allocations=allocations)
+    def _run(allocations):
+        pipeline(
+            current_heads_hbm_ref,
+            neighbor_heads_hbm_ref,
+            (cos_sin_cache_hbm_ref, positions_ref),
+            out_hbm_ref,
+            allocations=allocations,
+        )
+
+    _run()
+
+
+@functools.partial(jax.jit, static_argnames=("chiplet_index", "eps", "name"))
+def qnorm_rope_pair(
+    current_heads: jax.Array,  # [2T, half, head_dim]: both chiplets' tokens
+    neighbor_heads: jax.Array,  # [T, half, head_dim]: the current chiplet's tokens
+    positions: jax.Array,  # [T] int: the current chiplet's tokens
+    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+    *,
+    chiplet_index: int,
+    eps: float = 1e-6,
+    name: str = "qnorm_rope_pair",
+) -> jax.Array:
+    """``qnorm_rope`` of the current chiplet's tokens over all heads, read from
+    the two half-head blocks in place.
+
+    ``current_heads`` holds the current chiplet's half of the heads for both
+    chiplets' tokens (chiplet 0's rows, then chiplet 1's); ``neighbor_heads``
+    holds the neighboring chiplet's half for the current chiplet's tokens.
+    Returns ``[T, 2 * half, head_dim]``, bit-identical to ``qnorm_rope`` of the
+    concatenated q, without building it.
+    """
+    num_tokens = positions.shape[0]
+    _, half, head_dim = current_heads.shape
+    assert current_heads.shape == (2 * num_tokens, half, head_dim)
+    assert neighbor_heads.shape == (num_tokens, half, head_dim)
+    assert chiplet_index in (0, 1)
+    assert head_dim % LANE == 0
+    rotary_dim = cos_sin_cache.shape[1]
+    assert rotary_dim % 2 == 0 and rotary_dim <= LANE
+    tile_n = largest_divisor(num_tokens, cap=64)
+    num_tiles = num_tokens // tile_n
+    kernel = functools.partial(
+        _qnorm_rope_pair_kernel,
+        num_tiles=num_tiles,
+        tile_n=tile_n,
+        half=half,
+        head_dim=head_dim,
+        current_first_tile=chiplet_index * num_tiles,  # the current chiplet's rows
+        current_head_start=chiplet_index * half,
+        neighbor_head_start=(1 - chiplet_index) * half,
+        rotary_dim=rotary_dim,
+        eps=eps,
+        in_dtype=current_heads.dtype,
+        cos_sin_dtype=cos_sin_cache.dtype,
+    )
+    grid_spec = pltpu.PrefetchScalarGridSpec(
+        num_scalar_prefetch=1,
+        # The kernel DMAs its tiles itself, so the inputs may stay wherever XLA
+        # placed them.
+        in_specs=(
+            pl.BlockSpec(memory_space=pl.ANY),  # current_heads
+            pl.BlockSpec(memory_space=pl.ANY),  # neighbor_heads
+            pl.BlockSpec(memory_space=pl.ANY),  # cos_sin_cache
+        ),
+        out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+    )
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct(
+            (num_tokens, 2 * half, head_dim), current_heads.dtype
+        ),
+        grid_spec=grid_spec,
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+            disable_bounds_checks=True,
+        ),
+        name=name,
+    )(positions, current_heads, neighbor_heads, cos_sin_cache)
 
 
 @functools.partial(jax.jit, static_argnames=("inverse", "quant_dtype", "name"))
