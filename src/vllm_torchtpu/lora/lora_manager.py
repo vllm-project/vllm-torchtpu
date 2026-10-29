@@ -119,6 +119,11 @@ class _AdapterSlotWriter:
             _warn_fallback(f"LoRA layers {sorted(unsupported)} are not supported")
             return None
         stacked_weights = _stacked_weights(modules)
+        # _host_slot_weights holds one slot of every tensor in one buffer, so
+        # they all need one dtype. vLLM creates every lora_a_stacked and
+        # lora_b_stacked in lora_config.lora_dtype, so this does not happen
+        # today. Revisit this if vLLM gives LoRA A and B, or some layers,
+        # different dtypes.
         if len({weights.dtype for weights in stacked_weights}) > 1:
             _warn_fallback("the stacked LoRA tensors mix dtypes")
             return None
@@ -280,10 +285,12 @@ class TPULoRAModelManager(LRUCacheLoRAModelManager):
         is done.
 
         Without the slot writer, vLLM's writes copy each whole stacked tensor
-        instead of updating it in place, and the old and new buffers exist at
-        the same time while the write runs. E.g. stacked tensors of 384 MiB
-        with a 128 MiB slot peaked at 2 x 384 + 128 = 896 MiB: up to two new
-        copies of the tensors, plus the adapter's slot.
+        instead of updating it in place: reset_lora and set_lora each make a
+        new copy while the old one still exists, and set_lora also uploads the
+        adapter's weights. The writes run asynchronously, so the copies of
+        earlier tensors can still exist while later tensors are written. How
+        many of them exist at the same time depends on timing, so this counts
+        all of them.
         """
         if self._slot_writer is not None:
             return self._slot_writer.slot_bytes
@@ -303,16 +310,26 @@ class TPUWorkerLoRAManager(LRUCacheWorkerLoRAManager):
     _manager_cls = TPULoRAModelManager
 
     def _load_adapter(self, lora_request: LoRARequest) -> LoRAModel:
+        """Loads the adapter and rejects it if any LoRA weight is NaN or Inf.
+
+        Without this check, NaN or Inf in one adapter's LoRA B breaks every
+        request, not only the requests that use the adapter and not only the
+        requests in the same batch. The expand in lora_ops multiplies every
+        slot's LoRA B and adds the results, with 0 for the slots a token does
+        not use, and 0 * NaN is NaN. So while the adapter sits in a slot, every
+        step returns NaN for every token, even for requests without LoRA, until
+        the adapter is evicted.
+
+        NaN or Inf in LoRA A breaks only the adapter's own requests, but it is
+        checked too, so such an adapter fails at load with a clear error. vLLM
+        calls this before it evicts an old adapter to make room, or removes the
+        adapter that a reload replaces, so after a rejection the adapters that
+        were loaded stay loaded.
+        """
         lora = super()._load_adapter(lora_request)
-        # Without this, NaN or Inf in one adapter's LoRA B reaches every
-        # request: the expand in lora_ops sums over every slot. LoRA A is
-        # checked too, so a broken adapter fails at load, which vLLM runs
-        # before it evicts or replaces an adapter.
         for module_name, weights in lora.loras.items():
             for tensor in (weights.lora_a, weights.lora_b):
-                # amax carries NaN and Inf through, so one reduction checks
-                # the whole tensor.
-                if not tensor.abs().amax().isfinite():
+                if not torch.isfinite(tensor).all():
                     raise ValueError(
                         f"LoRA adapter {lora_request.lora_name!r} has NaN or Inf "
                         f"weights in {module_name}. TPU rejects such adapters, "
