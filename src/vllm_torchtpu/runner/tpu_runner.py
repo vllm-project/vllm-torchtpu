@@ -456,22 +456,24 @@ def _build_kv_connector_output(
     *,
     finished_sending: set[str] | None,
     finished_recving: set[str] | None,
+    failed_recving: set[str],
     kv_connector_worker_meta: Any | None,
     invalid_block_ids: set[int],
     invalid_block_group_index: int | None,
     kv_connector_stats: Any | None = None,
 ) -> KVConnectorOutput:
-    """Build a connector output across the vLLM 0.23 API boundary.
+    """Build the runner's KVConnectorOutput.
 
-    vLLM 0.23 supports invalid block IDs only for a single KV cache group and
-    does not expose ``invalid_block_group_index``. Newer vLLM versions support
-    group-scoped recovery for hybrid caches. Do not pass the newer keyword to
-    0.23, but fail closed if a hybrid load actually fails: silently dropping
-    the group would make overlapping block IDs ambiguous to its scheduler.
+    ``failed_recving`` needs vLLM >= 0.31 (the pin is v0.32.0).
+    ``invalid_block_group_index`` is passed only when ``KVConnectorOutput``
+    has it. v0.32.0 does not, so it rejects block-level load failures on
+    multi-group KV layouts; connectors for those layouts must report failed
+    requests through ``failed_recving``.
     """
     kwargs: dict[str, Any] = {
         "finished_sending": finished_sending,
         "finished_recving": finished_recving,
+        "failed_recving": failed_recving,
         "kv_connector_worker_meta": kv_connector_worker_meta,
         "invalid_block_ids": invalid_block_ids,
         "kv_connector_stats": kv_connector_stats,
@@ -1222,11 +1224,17 @@ class TPUModelRunner(GPUModelRunner):
     def get_finished_kv_transfers(self, scheduler_output):
         if not has_kv_transfer_group():
             self._stage_timing.take_samples()
-            return None, None, None, set(), None, None
+            return None, None, set(), None, set(), None, None
         kv_connector = get_kv_transfer_group()
-        finished_sending, finished_recving = kv_connector.get_finished(
+        # get_transfer_results, not get_finished: only it carries
+        # failed_recving, the per-request failure channel that multi-group
+        # KV layouts require (vLLM rejects invalid_block_ids for them).
+        transfer_results = kv_connector.get_transfer_results(
             scheduler_output.finished_req_ids
         )
+        finished_sending = transfer_results.finished_sending or None
+        finished_recving = transfer_results.finished_recving or None
+        failed_recving = transfer_results.failed_recving
         invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
         invalid_block_group_index = (
             kv_connector.get_block_ids_with_load_errors_group_index()
@@ -1259,6 +1267,7 @@ class TPUModelRunner(GPUModelRunner):
         return (
             finished_sending,
             finished_recving,
+            failed_recving,
             worker_meta,
             invalid_block_ids,
             invalid_block_group_index,
@@ -1277,6 +1286,7 @@ class TPUModelRunner(GPUModelRunner):
         (
             finished_sending,
             finished_recving,
+            failed_recving,
             worker_meta,
             invalid_block_ids,
             invalid_block_group_index,
@@ -1285,6 +1295,7 @@ class TPUModelRunner(GPUModelRunner):
         kv_connector_output = _build_kv_connector_output(
             finished_sending=finished_sending,
             finished_recving=finished_recving,
+            failed_recving=failed_recving,
             kv_connector_worker_meta=worker_meta,
             invalid_block_ids=invalid_block_ids,
             invalid_block_group_index=invalid_block_group_index,
@@ -5046,10 +5057,10 @@ class TPUModelRunner(GPUModelRunner):
         # Save, poll and clear the KV connector only after the drafter. Its
         # forward above writes the draft layers' KV into the blocks the target
         # just filled; a save taken before it, or the save fence
-        # TPURaidenOffloadingConnector records in get_finished, would miss
-        # those writes. (vLLM likewise defers wait_for_save and the metadata
-        # clear past its drafter.) ngram drafts below from host tokens and
-        # writes no KV. The wait above also proves the previous forward
+        # TPURaidenOffloadingConnector records in get_transfer_results, would
+        # miss those writes. (vLLM likewise defers wait_for_save and the
+        # metadata clear past its drafter.) ngram drafts below from host tokens
+        # and writes no KV. The wait above also proves the previous forward
         # finished, so a store deferred behind it can be handed to raiden in
         # this step rather than the next. Note that state.kv_save_nan_check
         # snapshots only the target forward chunks from execute_model(), not
@@ -5058,6 +5069,7 @@ class TPUModelRunner(GPUModelRunner):
         (
             finished_sending,
             finished_recving,
+            failed_recving,
             kv_worker_meta,
             invalid_block_ids,
             invalid_block_group_index,
@@ -5069,6 +5081,7 @@ class TPUModelRunner(GPUModelRunner):
             if (
                 finished_sending is None
                 and finished_recving is None
+                and not failed_recving
                 and kv_worker_meta is None
                 and not invalid_block_ids
                 and kv_connector_stats is None
@@ -5076,6 +5089,7 @@ class TPUModelRunner(GPUModelRunner):
             else _build_kv_connector_output(
                 finished_sending=finished_sending,
                 finished_recving=finished_recving,
+                failed_recving=failed_recving,
                 kv_connector_worker_meta=kv_worker_meta,
                 invalid_block_ids=invalid_block_ids,
                 invalid_block_group_index=invalid_block_group_index,
@@ -7821,6 +7835,7 @@ class TPUModelRunner(GPUModelRunner):
         (
             finished_sending,
             finished_recving,
+            failed_recving,
             kv_worker_meta,
             invalid_block_ids,
             invalid_block_group_index,
@@ -7829,6 +7844,7 @@ class TPUModelRunner(GPUModelRunner):
         if (
             finished_sending is None
             and finished_recving is None
+            and not failed_recving
             and kv_worker_meta is None
             and not invalid_block_ids
             and kv_connector_stats is None
@@ -7838,6 +7854,7 @@ class TPUModelRunner(GPUModelRunner):
         output.kv_connector_output = _build_kv_connector_output(
             finished_sending=finished_sending,
             finished_recving=finished_recving,
+            failed_recving=failed_recving,
             kv_connector_worker_meta=kv_worker_meta,
             invalid_block_ids=invalid_block_ids,
             invalid_block_group_index=invalid_block_group_index,
