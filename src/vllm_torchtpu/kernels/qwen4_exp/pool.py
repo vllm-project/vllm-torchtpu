@@ -19,15 +19,15 @@ take place inside Pallas; the persistent pool never gets a typed XLA view.
 
 import jax
 import jax.numpy as jnp
-from jax.experimental import pallas as pl
-from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels import pool_adapters, typed_ldst
+from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.qwen4_exp.cache_regions import region_rows
 from vllm_torchtpu.kernels.qwen4_exp.ple import short_conv
 
 
 def read_region(pool, ids, *, elements, dtype, tok0=0):
+    if len(ids) == 0 or elements == 0:
+        return jnp.zeros((len(ids), elements), dtype)
     ntok, rows = region_rows(pool, elements, dtype)
     values = pool_adapters.gather_region(
         pool,
@@ -42,43 +42,16 @@ def read_region(pool, ids, *, elements, dtype, tok0=0):
 def write_region(pool, values, ids, *, tok0=0):
     """Write unique positive manager IDs; idle/null IDs leave all bytes intact."""
     count, elements = values.shape
+    if count == 0 or elements == 0:
+        return pool
     ntok, rows = region_rows(pool, elements, values.dtype)
-    assert tok0 + ntok <= pool.shape[1], "state region exceeds its manager page"
     lanes = pool.shape[-1]
     values = jnp.pad(values, ((0, 0), (0, rows * lanes - elements))).reshape(
         count, rows, lanes
     )
-    payload = tuple(pool.shape[2:])
-
-    def kernel(indices, source, old, target):
-        @pl.when(indices[pl.program_id(0)] > 0)
-        def store():
-            def copy(encoded, semaphore):
-                typed_ldst.store_typed(encoded, source[0])
-                pltpu.async_copy(
-                    encoded,
-                    target.at[indices[pl.program_id(0)], pl.ds(tok0, ntok)],
-                    semaphore,
-                ).wait()
-
-            pl.run_scoped(
-                copy, pltpu.VMEM((ntok,) + payload, pool.dtype), pltpu.SemaphoreType.DMA
-            )
-
-    return pl.pallas_call(
-        kernel,
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
-            grid=(count,),
-            in_specs=[
-                pl.BlockSpec((1, rows, lanes), lambda i, indices: (i, 0, 0)),
-                pl.BlockSpec(memory_space=pltpu.HBM),
-            ],
-            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
-        ),
-        out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
-        input_output_aliases={2: 0},
-    )(ids, values, pool)
+    return pool_adapters.scatter_region(
+        pool, values, ids, tok0=tok0, ntok=ntok, skip_null=True
+    )
 
 
 def pooled_short_conv(
@@ -92,6 +65,8 @@ def pooled_short_conv(
     dilation: int,
     state_len: int,
 ) -> tuple[jax.Array, jax.Array]:
+    if x.shape[0] == 0 or len(ids) == 0:
+        return pool, jnp.zeros_like(x)
     channels = x.shape[-1]
     history = (
         read_region(
@@ -110,7 +85,6 @@ def pooled_short_conv(
         slots,
         initial,
         dilation=dilation,
-        request_owned_history=True,
     )
     if state_len:
         pool = write_region(

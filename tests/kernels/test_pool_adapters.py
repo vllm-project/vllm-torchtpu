@@ -552,3 +552,41 @@ class TestGatherScatterBlocksFp8:
         # pure roundtrip: bytes unchanged everywhere (incl. the
         # copied-through third kernel block of each manager block)
         assert jnp.array_equal(new_pool.view(jnp.uint8), pool.view(jnp.uint8))
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "split,tok0,ntok", [(1, 4, 8), (2, 16, 16), (2, 4, 8), (2, 12, 8)]
+)
+def test_positive_scatter_preserves_null_and_split_complement(split, tok0, ntok):
+    import jax
+
+    shape = (8, 16, 1, 2, 128)
+    host = (
+        np.arange(np.prod(shape), dtype=np.int32)
+        .astype(np.uint16)
+        .view(np.dtype(jnp.bfloat16))
+        .reshape(shape)
+    )
+    ids = jnp.asarray([2, 0, -1, 1], jnp.int32)
+    values = (
+        jnp.arange(4 * ntok * 2 * 128, dtype=jnp.float32)
+        .astype(jnp.bfloat16)
+        .reshape(4, ntok * 2, 128)
+    )
+    expected = host.copy().reshape(8 // split, split * 16, 1, 2, 128)
+    for row, owner in ((0, 2), (3, 1)):
+        expected[owner, tok0 : tok0 + ntok] = np.asarray(values[row]).reshape(
+            ntok, 1, 2, 128
+        )
+    run = jax.jit(
+        lambda p: pool_adapters.scatter_region(
+            p, values, ids, tok0=tok0, ntok=ntok, split=split, skip_null=True
+        ),
+        donate_argnums=(0,),
+    )
+    actual = run(jax.device_put(host))
+    np.testing.assert_array_equal(
+        np.asarray(actual).view(np.uint8), expected.reshape(shape).view(np.uint8)
+    )
+

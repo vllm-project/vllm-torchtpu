@@ -14,6 +14,7 @@
 """Pooled state contracts: exact continuation and preservation of other owners."""
 
 import functools
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -92,7 +93,7 @@ def test_qsa_ring_tag_dma_preserves_exact_bytes_and_inactive_owners(fp8, batch):
 @pytest.mark.parametrize("channels", [128, 10240])
 def test_pooled_ple_matches_private_state_and_preserves_other_pages(dtype, channels):
     rng = np.random.default_rng(48)
-    carrier = getattr(jnp, dtype)
+    carrier = jnp.float8_e4m3fn if dtype == "float8_e4m3fn" else jnp.bfloat16
     packing = 4 if dtype == "float8_e4m3fn" else 2
     pool = jnp.zeros((7, 1664, 1, packing, 256), carrier)
     ids = jnp.array([3, 0, 5], jnp.int32)
@@ -314,132 +315,6 @@ def test_pooled_qsa_continuation_across_manager_page_and_partial_pairs(fp8):
         context = context + jnp.array([3, 4, 0], jnp.int32)
 
 
-@pytest.mark.tpu_test
-@pytest.mark.parametrize("fp8", [False, True])
-@pytest.mark.parametrize("starts", [[0, 128, 256], [0, 96, 256]])
-def test_qsa_main_cache_universal_tiled_writer_matches_scatter(fp8, starts):
-    from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import write_main_cache
-    from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import pack_rows
-
-    rng = np.random.default_rng(88421)
-    tokens, page_size = 256, 256
-    dtype = jnp.float32 if fp8 else jnp.bfloat16
-    key = jnp.asarray(
-        rng.standard_normal((tokens, 2, 256), dtype=np.float32) * 0.1, dtype
-    )
-    value = jnp.asarray(
-        rng.standard_normal((tokens, 2, 256), dtype=np.float32) * 0.1, dtype
-    )
-    rows = pack_rows(key, value, fp8=fp8)
-    pool = jnp.zeros((5, page_size, *rows.shape[1:]), rows.dtype)
-    starts = jnp.asarray(starts, jnp.int32)
-    request = jnp.searchsorted(starts[1:], jnp.arange(tokens), side="right")
-    logical = jnp.arange(tokens) - starts[request]
-    page = 1 + request
-    valid = jnp.ones((tokens,), bool)
-    expected = pool.at[page, logical].set(rows)
-    actual = jax.jit(write_main_cache)(pool, rows, page, logical, valid)
-    np.testing.assert_array_equal(
-        np.asarray(actual).view(np.uint8), np.asarray(expected).view(np.uint8)
-    )
-
-
-@pytest.mark.tpu_test
-@pytest.mark.parametrize("fp8", [False, True])
-@pytest.mark.parametrize("query_block", [32, 64, 128, 256])
-def test_qsa_block_sparse_matches_exact_mask_with_partial_tail_and_nan(
-    fp8, query_block
-):
-    from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
-        block_sparse_gqa_attention,
-        block_sparse_gqa_prefill,
-    )
-    from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import pack_rows
-
-    rng = np.random.default_rng(731904)
-    tokens, context, page_size = query_block, 2304, 128
-    query = jnp.asarray(
-        rng.standard_normal((tokens, 24, 256), dtype=np.float32) * 0.1,
-        dtype=jnp.bfloat16,
-    )
-    keys = rng.standard_normal((context, 2, 256), dtype=np.float32) * 0.1
-    values = rng.standard_normal((context, 2, 256), dtype=np.float32) * 0.1
-    keys[2052:] = np.nan if fp8 else 0
-    values[2052:] = np.nan if fp8 else 0
-    cache_dtype = jnp.float32 if fp8 else jnp.bfloat16
-    cache = pack_rows(
-        jnp.asarray(keys, cache_dtype), jnp.asarray(values, cache_dtype), fp8=fp8
-    ).reshape(
-        context // page_size, page_size, 2 if not fp8 else 1, 2 if not fp8 else 4, 256
-    )
-    probe = np.array([0, 1, 3, 4, 2047, 2048, 2049, 2051, 2052], np.int32)
-    lengths = jnp.asarray(np.resize(probe, tokens))
-    complete = np.minimum(np.asarray(lengths) // 4, 512)
-    groups = np.arange(512, dtype=np.int32)[None, :]
-    blocks = jnp.asarray(np.where(groups < complete[:, None], groups, -1))
-    table = jnp.broadcast_to(
-        jnp.arange(context // page_size, dtype=jnp.int32),
-        (tokens, context // page_size),
-    )
-    native = np.asarray(cache, np.float32).reshape(context, 4, 256)
-    native = np.where(np.isfinite(native), native, 0)
-    expected = np.zeros(query.shape, np.float32)
-    for row, length in enumerate(np.asarray(lengths)):
-        completed = min(length // 4, 512)
-        ids = np.concatenate(
-            (np.arange(completed * 4), np.arange(length // 4 * 4, length))
-        )
-        if not len(ids):
-            continue
-        for head in range(24):
-            kv_head = head // 12
-            scores = (
-                native[ids, 2 * kv_head] @ np.asarray(query[row, head], np.float32) / 16
-            )
-            probs = np.exp(scores - scores.max())
-            expected[row, head] = (probs / probs.sum()) @ native[ids, 2 * kv_head + 1]
-    actual = block_sparse_gqa_prefill(
-        query,
-        blocks,
-        lengths,
-        table,
-        cache,
-        ratio=4,
-        kv_heads=2,
-        query_block=query_block,
-        bf16_io=query_block > 128,
-    )
-    actual = np.asarray(actual, np.float32)
-    assert np.isfinite(actual).all()
-    np.testing.assert_allclose(
-        actual,
-        np.asarray(expected, np.float32),
-        rtol=0.05,
-        atol=0.03,
-    )
-    wrapped, _ = block_sparse_gqa_attention(
-        query,
-        jnp.zeros((tokens, 24, 1), jnp.float32),
-        blocks,
-        lengths,
-        table,
-        cache,
-        jnp.asarray([0, tokens], jnp.int32),
-        ratio=4,
-        kv_heads=2,
-        query_block=query_block,
-    )
-    gated_expected = (
-        jnp.asarray(expected, jnp.bfloat16).astype(jnp.float32) * 0.5
-    ).astype(jnp.bfloat16)
-    np.testing.assert_allclose(
-        np.asarray(wrapped, np.float32),
-        np.asarray(gated_expected, np.float32),
-        rtol=0.05,
-        atol=0.03,
-    )
-
-
 @pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize("dilation", [1, 3])
 def test_pooled_ple_zero_history_traces_without_pool_access(fp8, dilation):
@@ -609,43 +484,30 @@ def _history_inputs(tokens, kernel_size, initial):
     )
 
 
-@pytest.mark.parametrize("request_owned", [False, True])
 @pytest.mark.parametrize("initial", [False, True])
 @pytest.mark.parametrize("tokens,kernel_size", [(128, 4), (8, 4), (128, 1), (0, 4)])
-def test_history_gather_matches_dense_causal_reference(
-    request_owned, initial, tokens, kernel_size
-):
+def test_history_gather_matches_dense_causal_reference(initial, tokens, kernel_size):
     x, weight, history, starts, slots, initial, dilation = _history_inputs(
         tokens, kernel_size, initial
     )
-    if not request_owned:
-        slots = np.asarray([4, 1, -1, 0, 5, -1], np.int32)
     expected, expected_history = _history_reference(
         x, weight, history, starts, slots, initial, dilation
     )
-    run = jax.jit(
-        functools.partial(
-            short_conv, dilation=dilation, request_owned_history=request_owned
-        )
-    )
+    run = jax.jit(functools.partial(short_conv, dilation=dilation))
     output, updated = run(
         *(jnp.asarray(a) for a in (x, weight, history, starts, slots, initial))
     )
     np.testing.assert_array_equal(np.asarray(output), expected)
-    if request_owned:
-        active = (slots >= 0) & (np.diff(starts) > 0)
-        np.testing.assert_array_equal(
-            np.asarray(updated)[active], expected_history[slots[active]]
-        )
-    else:
-        np.testing.assert_array_equal(np.asarray(updated), expected_history)
+    active = (slots >= 0) & (np.diff(starts) > 0)
+    np.testing.assert_array_equal(
+        np.asarray(updated)[active], expected_history[slots[active]]
+    )
     np.testing.assert_array_equal(
         history, _history_inputs(tokens, kernel_size, bool(initial[0]))[2]
     )
 
 
-@pytest.mark.parametrize("request_owned", [False, True])
-def test_history_with_no_requests_leaves_history_unchanged(request_owned):
+def test_history_with_no_requests_leaves_history_unchanged():
     x = jnp.ones((8, 4), jnp.bfloat16)
     history = jnp.ones((0, 9, 4), jnp.bfloat16)
     output, updated = short_conv(
@@ -656,30 +518,25 @@ def test_history_with_no_requests_leaves_history_unchanged(request_owned):
         jnp.empty((0,), jnp.int32),
         jnp.empty((0,), bool),
         dilation=3,
-        request_owned_history=request_owned,
     )
     np.testing.assert_array_equal(output, np.zeros((8, 4)))
     assert updated is history
 
 
-@pytest.mark.parametrize("request_owned", [False, True])
-def test_request_owned_history_gathers_scale_with_request_boundary(request_owned):
+def test_request_owned_history_gathers_scale_with_request_boundary():
     """Assert per-request and per-token history gather shapes."""
     args = _history_inputs(128, 4, True)
-    graph = jax.make_jaxpr(
-        functools.partial(short_conv, dilation=3, request_owned_history=request_owned)
-    )(*(jax.ShapeDtypeStruct(a.shape, a.dtype) for a in args[:-1])).jaxpr
+    graph = jax.make_jaxpr(functools.partial(short_conv, dilation=3))(
+        *(jax.ShapeDtypeStruct(a.shape, a.dtype) for a in args[:-1])
+    ).jaxpr
     history = graph.invars[2]
     gathered_shapes = [
-        eq.outvars[0].aval.shape
+        cast(jax.core.ShapedArray, eq.outvars[0].aval).shape
         for eq in graph.eqns
         if eq.primitive.name == "gather" and eq.invars[0] is history
     ]
-    if request_owned:
-        assert gathered_shapes == [(6, 9, 8), (6, 6, 8), (6, 3, 8), (6, 9, 8)]
-        assert (128, 8) not in gathered_shapes
-    else:
-        assert gathered_shapes == [(128, 8)] * 4 + [(6, 9, 8)]
+    assert gathered_shapes == [(6, 9, 8), (6, 6, 8), (6, 3, 8), (6, 9, 8)]
+    assert (128, 8) not in gathered_shapes
 
 
 @pytest.mark.parametrize("fp8", [False, True])
@@ -760,3 +617,97 @@ def test_optimized_history_preserves_complete_pool(
     )
     np.testing.assert_array_equal(np.asarray(actual), expected_output)
     np.testing.assert_array_equal(np.asarray(actual_pool).view(np.uint8), expected_pool)
+
+
+@pytest.mark.parametrize(
+    "operation,requests,tokens,elements",
+    [
+        ("read", 0, 0, 9 * 128),
+        ("read", 3, 0, 0),
+        ("write", 0, 0, 9 * 128),
+        ("write", 3, 0, 0),
+        ("conv", 0, 8, 9 * 128),
+        ("conv", 3, 0, 9 * 128),
+        ("conv", 0, 0, 9 * 128),
+    ],
+)
+def test_empty_pool_operations_do_not_dispatch(
+    monkeypatch, operation, requests, tokens, elements
+):
+    from jax.experimental import pallas as pl
+
+    from vllm_torchtpu.kernels import pool_adapters
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("empty operation dispatched pool IO")
+
+    monkeypatch.setattr(pl, "pallas_call", forbidden)
+    monkeypatch.setattr(pool_adapters, "gather_region", forbidden)
+    monkeypatch.setattr(pool_adapters, "scatter_region", forbidden)
+    pool = jnp.ones((5, 16, 1, 2, 128), jnp.bfloat16)
+    before = np.asarray(pool).view(np.uint8).copy()
+    ids = jnp.ones((requests,), jnp.int32)
+    if operation == "read":
+        result = read_region(pool, ids, elements=elements, dtype=jnp.bfloat16)
+        assert result.shape == (requests, elements) and result.dtype == jnp.bfloat16
+    elif operation == "write":
+        values = jnp.empty((requests, elements), jnp.bfloat16)
+        assert write_region(pool, values, ids) is pool
+    else:
+        owner, output = pooled_short_conv(
+            jnp.ones((tokens, 128), jnp.bfloat16),
+            jnp.ones((128, 4), jnp.bfloat16),
+            pool,
+            jnp.zeros((requests + 1,), jnp.int32),
+            ids,
+            jnp.ones((requests,), bool),
+            dilation=3,
+            state_len=9,
+        )
+        assert owner is pool and output.shape == (tokens, 128)
+        assert output.dtype == jnp.bfloat16
+        np.testing.assert_array_equal(output, np.zeros((tokens, 128)))
+    np.testing.assert_array_equal(np.asarray(pool).view(np.uint8), before)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "shape,dtype,tok0,elements",
+    [
+        ((6, 16, 128), jnp.bfloat16, 8, 8 * 128),
+        ((6, 16, 1, 2, 128), jnp.bfloat16, 1, 9 * 128),
+        ((6, 16, 1, 4, 128), jnp.float8_e4m3fn, 1, 9 * 128),
+    ],
+)
+def test_typed_writer_skips_null_idle_and_preserves_all_other_bytes(
+    shape, dtype, tok0, elements
+):
+    rng = np.random.default_rng(1966)
+    host = (
+        rng.integers(
+            0, 256, size=np.prod(shape) * np.dtype(dtype).itemsize, dtype=np.uint8
+        )
+        .view(np.dtype(dtype))
+        .reshape(shape)
+    )
+    values = jnp.asarray(rng.normal(size=(4, elements)), jnp.bfloat16)
+    ids = jnp.asarray([3, 0, -1, 1], jnp.int32)
+    expected = host.view(np.uint8).copy().reshape(shape[0], -1)
+    token_bytes = np.prod(shape[2:]) * np.dtype(dtype).itemsize
+    used = ((values.shape[1] * 2 + token_bytes - 1) // token_bytes) * token_bytes
+    for row, owner in ((0, 3), (3, 1)):
+        expected[owner, tok0 * token_bytes : tok0 * token_bytes + used] = 0
+        value = np.ascontiguousarray(values[row])
+        if np.dtype(dtype).itemsize < value.dtype.itemsize:
+            # ref.bitcast splits the packed axis before the lane axis.
+            bits = value.view(np.uint8).reshape(-1, shape[-1], value.dtype.itemsize)
+            bits = bits.transpose(0, 2, 1).reshape(-1)
+        else:
+            bits = value.view(np.uint8).reshape(-1)
+        expected[owner, tok0 * token_bytes : tok0 * token_bytes + bits.size] = bits
+    owner = jax.device_put(host)
+    run = jax.jit(functools.partial(write_region, tok0=tok0), donate_argnums=(0,))
+    result = run(owner, values, ids)
+    np.testing.assert_array_equal(
+        np.asarray(result).view(np.uint8).reshape(shape[0], -1), expected
+    )

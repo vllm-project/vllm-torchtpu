@@ -18,6 +18,8 @@ import math
 import jax
 import jax.numpy as jnp
 
+from vllm_torchtpu.kernels.qwen4_exp.rounding import bf16
+
 
 def compact_rows(table, ids, *, head_dim: int):
     """Gather rows from 128-element storage segments without row padding.
@@ -37,9 +39,10 @@ def compact_rows(table, ids, *, head_dim: int):
         ids // rows_per_group
     ) * segments_per_group + element_offset // segment_width
     segment_count = math.ceil((head_dim + segment_width - alignment) / segment_width)
-    parts = table[segment[..., None] + jnp.arange(segment_count)].reshape(
-        ids.shape + (segment_count * segment_width,)
+    segments = jnp.minimum(
+        segment[..., None] + jnp.arange(segment_count), table.shape[0] - 1
     )
+    parts = table[segments].reshape(ids.shape + (segment_count * segment_width,))
     offset = element_offset % segment_width
     rows = parts[..., :head_dim]
     for start in range(alignment, segment_width, alignment):
@@ -47,11 +50,6 @@ def compact_rows(table, ids, *, head_dim: int):
             (offset == start)[..., None], parts[..., start : start + head_dim], rows
         )
     return rows
-
-
-def _bf16(x):
-    # Keep source BF16 rounding boundaries even when XLA can fuse neighbors.
-    return jax.lax.optimization_barrier(x.astype(jnp.bfloat16))
 
 
 def resident_lookup_raw(
@@ -77,7 +75,7 @@ def decode_embeddings(raw_embeddings, scale):
     if raw_embeddings.dtype == jnp.int16:
         return jax.lax.bitcast_convert_type(raw_embeddings, jnp.bfloat16)
     values = jax.lax.bitcast_convert_type(raw_embeddings, jnp.float8_e4m3fn)
-    return _bf16(_bf16(values) * scale.astype(jnp.bfloat16))
+    return bf16(bf16(values) * scale.astype(jnp.bfloat16))
 
 
 def resident_lookup(
@@ -105,18 +103,13 @@ def short_conv(
     has_initial_states,
     *,
     dilation: int,
-    request_owned_history: bool = False,
 ):
-    """Configured dilated convolution with BF16 history [slots,state_len,C].
+    """Dilated convolution with BF16 history [requests,state_len,C].
 
-    Starts and slot indices are int32. The step metadata builder owns
-    monotone starts beginning at zero in [0,T] and unique in-range slots;
-    -1 denotes padded requests. Empty requests leave their slots untouched.
-    History stores normalized gated values, not convolution results. Output is
-    already SiLU-activated and rounded to BF16.
-
-    Request-owned history uses identity slots for active requests. Its caller
-    masks idle writes, so updated rows can be returned without a slot scatter.
+    Starts and state indices are int32. Starts are monotone in [0,T], beginning
+    at zero. Active requests use identity row indices; -1 marks padding.
+    History stores normalized gated values. Output is SiLU-activated BF16.
+    The caller masks idle writes when storing the returned request-owned rows.
     """
     token_count, channels = x.shape
     requests = state_indices.shape[0]
@@ -136,15 +129,10 @@ def short_conv(
         position = relative - distance
         # A one-tap convolution has no historical state and only distance 0.
         current = x[jnp.clip(t - distance, 0, token_count - 1)]
-        if request_owned_history and distance == 0:
+        if distance == 0:
             # Packed positions are nonnegative, so distance 0 reads no history.
             value = current
-        elif (
-            request_owned_history
-            and state_len
-            and distance > 0
-            and requests * distance < token_count
-        ):
+        elif state_len and distance > 0 and requests * distance < token_count:
             # History supplies rows with relative < distance; this gather has
             # O(R*distance*C) elements. Inactive scatter destinations are out of
             # bounds and are dropped.
@@ -170,8 +158,8 @@ def short_conv(
             past = jnp.where(has_initial_states[req, None], past, 0)
             value = jnp.where((position >= 0)[:, None], current, past)
         accum = accum + value.astype(jnp.float32) * weight[:, tap].astype(jnp.float32)
-    pre = _bf16(accum)
-    output = _bf16(jax.nn.silu(pre.astype(jnp.float32)))
+    pre = bf16(accum)
+    output = bf16(jax.nn.silu(pre.astype(jnp.float32)))
     output = jnp.where(valid[:, None], output, 0)
 
     if state_len == 0:
@@ -185,10 +173,4 @@ def short_conv(
     past = jnp.where(has_initial_states[:, None, None], past, 0)
     current = x[jnp.clip(starts[:-1, None] + positions, 0, token_count - 1)]
     updated = jnp.where((positions >= 0)[..., None], current, past)
-    if request_owned_history:
-        return output, updated
-    # Scatter padding out of bounds with drop, so it cannot alias an active
-    # slot (including when starts has repeated trailing entries).
-    destinations = jnp.where((lengths > 0) & (slots >= 0), slots, history.shape[0])
-    history = history.at[destinations].set(updated, mode="drop")
-    return output, history
+    return output, updated
