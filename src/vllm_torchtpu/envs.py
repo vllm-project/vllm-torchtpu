@@ -250,6 +250,7 @@ if TYPE_CHECKING:
     VLLM_TPU_PY_SAMPLER_S: float = 0.0
     VLLM_TPU_STAGE_ENTRIES_CACHE: bool = False
     VLLM_TPU_SUBST_STATIC_ARGS: bool = False
+    VLLM_TPU_SUBTRACT_REJECTED_COMPILED: bool = False
     VLLM_TPU_STALL_WATCHDOG_S: float = 0.0
     VLLM_TPU_VERIFY_FUSED: bool = False
     VLLM_TPU_VERIFY_FUSED_CHECK: int = 0
@@ -1541,6 +1542,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Strip dynamic-dim stamps from the async token substitution's inputs so it
     # does not recompile mid-run (tpu_runner._apply_async_token_substitution).
     "VLLM_TPU_SUBST_STATIC_ARGS": env_bool("VLLM_TPU_SUBST_STATIC_ARGS"),
+    # Async spec decode: the per-step rejected-count correction of seq_lens and
+    # positions as one compiled program (precompiled per request bucket).
+    "VLLM_TPU_SUBTRACT_REJECTED_COMPILED": env_bool(
+        "VLLM_TPU_SUBTRACT_REJECTED_COMPILED"
+    ),
     # Dump all processes' stacks when no step starts for N s with live
     # requests (stall_watchdog.py; read directly there, registered here).
     "VLLM_TPU_STALL_WATCHDOG_S": env_float("VLLM_TPU_STALL_WATCHDOG_S", 0.0),
