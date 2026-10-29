@@ -541,6 +541,28 @@ def _subtract_num_rejected_tokens_compiled(*args):
 _subtract_num_rejected_tokens_fn = None
 
 
+def _spec_tail(next_tokens, drafts, draft_lengths, rows, num_reqs, bound):
+    """One async-spec step's substitution source, padded to `bound`, and its
+    per-request rejected count: `assemble_spec_next_tokens`,
+    `compute_num_rejected`, the row fits and the source pad in one function."""
+    from vllm_torchtpu.runner.tpu_runner_async_output import (
+        assemble_spec_next_tokens,
+        compute_num_rejected,
+    )
+    from vllm_torchtpu.spec_decode.utils import fit_rows
+
+    src = assemble_spec_next_tokens(next_tokens, fit_rows(drafts, rows), num_reqs)
+    num_rejected = compute_num_rejected(next_tokens, fit_rows(draft_lengths, rows))
+    if src.shape[0] < bound:
+        src = torch.nn.functional.pad(src, (0, bound - src.shape[0]))
+    return src, num_rejected
+
+
+_spec_tail_compiled = _static_shape_args(
+    torch.compile(_spec_tail, backend="tpu", fullgraph=True, dynamic=False)
+)
+
+
 logger = init_logger(__name__)
 
 
@@ -2955,6 +2977,32 @@ class TPUModelRunner(GPUModelRunner):
         # Bucketed drafters keep the sampler's padded rows (an exact-count slice
         # would compile a program per request count); others keep exact rows.
         bucketed = getattr(getattr(self, "drafter", None), "bucketed_drafts", False)
+        if (
+            envs.VLLM_TPU_SPEC_TAIL_COMPILED
+            and len(next_tokens_per_chunk) == 1
+            and state.spec_decode_metadata_list[0] is not None
+        ):
+            # Steady decode (one chunk, drafts verified): the source and the
+            # rejected count from one program, the source already padded to
+            # the bound `sample_tokens` would pad it to.
+            nt_chunk = next_tokens_per_chunk[0]
+            num_reqs = state.num_reqs_list[0]
+            md = state.spec_decode_metadata_list[0]
+            assert self.speculative_config is not None
+            src, num_rejected = _spec_tail_compiled(
+                nt_chunk,
+                drafts_per_chunk[0],
+                md.draft_lengths,
+                nt_chunk.shape[0] if bucketed else num_reqs,
+                None if bucketed else num_reqs,
+                self.max_num_reqs * (1 + self.speculative_config.num_speculative_tokens),
+            )
+            return (
+                [src],
+                {r: r for r in range(num_reqs)},
+                num_rejected,
+                {r: int(md.draft_lengths_cpu[r]) for r in range(num_reqs)},
+            )
         next_tokens_tpu_chunks: list[torch.Tensor] = []
         next_token_indices: dict[int, int] = {}
         num_rejected_chunks: list[torch.Tensor] = []
