@@ -781,6 +781,9 @@ class TPUWorker(WorkerBase):
         # Warmup (dummy runs, spec-decode warmup requests) is over: steps from here
         # on serve real requests (read by the megakernel check mode).
         self.model_runner.warmup_done = True
+        from vllm_torchtpu import stall_watchdog
+
+        stall_watchdog.arm()
         if os.environ.get("VLLM_TPU_PY_SAMPLER_S"):
             from vllm_torchtpu.runner import py_sampler
 
