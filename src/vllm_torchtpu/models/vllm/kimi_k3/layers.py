@@ -53,9 +53,7 @@ def _build_attention_residual_with_inv_rms_op(eps: float):
         weight: jax.Array,
         block_inv_rms: jax.Array,
     ) -> jax.Array:
-        return attention_residual(
-            prefix, history, weight, block_inv_rms, eps=eps
-        )
+        return attention_residual(prefix, history, weight, block_inv_rms, eps=eps)
 
     suffix = float(eps).hex().replace(".", "_").replace("-", "m").replace("+", "p")
     op = pallas.jax_op(f"pallas::kimi_attention_residual_inv_{suffix}", core)
@@ -224,7 +222,7 @@ class AttentionResidual(nn.Module):
             return prefix_sum
         if (
             self._prefill_op is not None
-            and prefix_sum.shape[0] >= 128
+            and prefix_sum.shape[0] >= 512
             and prefix_sum.shape[0] % 8 == 0
         ):
             prefill_inv_op = getattr(self, "_prefill_inv_rms_op", None)
@@ -246,12 +244,8 @@ class AttentionResidual(nn.Module):
                 dim=0,
             ).float()  # [K, hidden]
             if block_inv_rms is not None:
-                inv_prefix = torch.rsqrt(
-                    prefix_sum.float().pow(2).mean(-1) + self.eps
-                )
-                inv = torch.cat(
-                    (block_inv_rms.float().reshape(-1), inv_prefix), dim=0
-                )
+                inv_prefix = torch.rsqrt(prefix_sum.float().pow(2).mean(-1) + self.eps)
+                inv = torch.cat((block_inv_rms.float().reshape(-1), inv_prefix), dim=0)
             else:
                 inv = torch.rsqrt(values.pow(2).mean(-1) + self.eps)
             probabilities = ((values * w).sum(-1) * inv).softmax(dim=0)
@@ -259,9 +253,7 @@ class AttentionResidual(nn.Module):
             return out.to(block_residuals.dtype)
         if block_residuals.ndim == 2:
             tokens, hidden = prefix_sum.shape
-            v_blocks = (
-                block_residuals.view(-1, tokens, hidden).transpose(0, 1).float()
-            )
+            v_blocks = block_residuals.view(-1, tokens, hidden).transpose(0, 1).float()
         else:
             v_blocks = block_residuals.float()
         v_prefix = prefix_sum.float()

@@ -538,7 +538,10 @@ def test_calculate_tiling_scales_bucket_base_with_group_density(monkeypatch):
     assert (t_c64.bucket_base, t_c64.tile_m) == (16, 64)
 
     t_c128 = _tiles_for(2048)
-    assert (t_c128.bucket_base, t_c128.tile_m) == (32, 128)
+    assert (t_c128.bucket_base, t_c128.tile_m) == (16, 64)
+
+    t_c192 = _tiles_for(3072)
+    assert (t_c192.bucket_base, t_c192.tile_m) == (32, 128)
 
     t_prefill = _tiles_for(16384)
     assert (t_prefill.bucket_base, t_prefill.tile_m) == (64, 256)

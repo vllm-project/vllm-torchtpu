@@ -1130,13 +1130,13 @@ def calculate_tiling(
     if lhs_cfgs.should_quantize:
         tile_m *= 2
     # Scale bucket granularity with average tokens per group so sparse MoE
-    # decode batches (e.g. m=1024 across g=56 local experts -> ~18 rows/group)
-    # use {16, 32, 48, 64} buckets instead of padding 1-token groups to 64 rows,
-    # while still keeping max tile_m = 4 * bucket_base wide enough to avoid
-    # splitting skewed hot experts across multiple weight-loading gm tiles.
+    # decode batches (e.g. m=1024..2048 across g=56 local experts -> 18..36
+    # rows/group) use {16, 32, 48, 64} buckets instead of padding groups to
+    # 32..64-row multiples, while stepping up once mean_group_m exceeds ~48 so
+    # max tile_m = 4 * bucket_base covers skewed hot experts without splitting.
     mean_group_m = dims.size_m // max(1, dims.size_group)
     target_bucket_m = align_to(
-        max(16, mean_group_m // 2),
+        max(16, mean_group_m // 3),
         dims.size_lhs_sublane,
     )
     tile_m = min(tile_m, max(target_bucket_m, dims.size_lhs_sublane), dims.size_m)

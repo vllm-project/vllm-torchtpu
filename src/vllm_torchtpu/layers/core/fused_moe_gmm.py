@@ -308,7 +308,7 @@ def prepare_routed_gmm_inputs(
         token_indices_sorted = token_indices_flat[sorted_indices]
     elif (
         envs.TPU_MOE_COUNTING_SORT
-        and sort_keys.shape[0] <= 2048
+        and sort_keys.shape[0] <= 3072
         and (_cs := _counting_sort_positions(sort_keys, local_num_experts + 1))[0]
         is not None
     ):
