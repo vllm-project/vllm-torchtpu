@@ -22,6 +22,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.quantized_matmul.util import (
+    DENSE_PROJ_MIN_TOKENS,
     DENSE_PROJ_SUB_M,
     DENSE_PROJ_SUB_N,
     DenseProjEpilogue,
@@ -41,6 +42,14 @@ DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 # Tokens per RMSNorm + RoPE step in project_qnorm_rope's matmul epilogue, and
 # per cos/sin lane expansion on its first grid step.
 QNORM_EPILOGUE_ROWS = 32
+
+# project_rope_quant's kernel: tokens per dot, and token pairs per matmul that
+# swaps the RoPE lane pairs.
+ROPE_QUANT_PROJ_ROWS = 256
+ROPE_QUANT_PROJ_PAIRS = 8
+ROPE_QUANT_PROJ_VMEM_LIMIT_BYTES = 20 * 1024 * 1024
+# Most tokens per call: the activation and the cos/sin rows stay whole in VMEM.
+ROPE_QUANT_PROJ_MAX_TOKENS = 1024
 
 
 @jax.tree_util.register_dataclass
@@ -713,3 +722,251 @@ def rope_quant(
             name=name,
         ),
     )
+
+
+def _project_rope_quant_kernel(
+    x_scale_ref,  # (1, m) f32, lane-dense
+    w_scale_ref,  # (1, n) f32
+    x_ref,  # (m, k) fp8, whole in VMEM
+    cos_sin_ref,  # (m, rotary_dim) f32, this call's cos_sin_cache rows
+    w_hbm_ref,  # (k, n) fp8 in HBM
+    q_hbm_ref,  # (m, n // LANE, LANE) quant_dtype in HBM
+    scale_ref,  # (heads, m) f32, streamed
+    x_scale_lanes_ref,  # (m, LANE) f32 scratch
+    cos_ref,  # (m, LANE) f32 scratch
+    sin_ref,  # (m, LANE) f32 scratch, with the GPT-J sign folded in
+    stage_ref,  # (rows // 2 * heads, LANE) int32 scratch
+    w_buf,  # (2, k, tile_n) fp8 scratch
+    q_buf,  # (2, LANE, heads, LANE) quant_dtype scratch
+    sems,  # (2, 2) DMA semaphores: weight tiles, q blocks
+    *,
+    rotary_dim: int,
+    quant_dtype: jnp.dtype,
+):
+    """One weight tile of q heads: the wq_b product, rounded to bf16 as
+    xla_quantized_matmul rounds it, then rope_quant on every token.
+
+    The MXU leaves tokens in rows, while rope_quant's per-row scale and the q
+    layout want each token's heads in rows. So each block of ``rows`` tokens
+    is staged as bf16 token pairs, turned over with in-register sublane
+    transposes, and read back one token pair at a time.
+    """
+    m, tile_n = x_ref.shape[0], w_buf.shape[2]
+    heads = tile_n // LANE
+    rows = ROPE_QUANT_PROJ_ROWS
+    pairs = ROPE_QUANT_PROJ_PAIRS
+    step = pl.program_id(0)
+    num_steps = pl.num_programs(0)
+    blocks_per_step = m // LANE
+
+    # Weight tiles are fetched by hand one step ahead, so XLA leaves the
+    # weight in HBM rather than staging it through VMEM.
+    def w_copy(tile):
+        return pltpu.make_async_copy(
+            w_hbm_ref.at[:, pl.ds(pl.multiple_of(tile * tile_n, tile_n), tile_n)],
+            w_buf.at[tile % 2],
+            sems.at[0, tile % 2],
+        )
+
+    # q leaves a block of LANE tokens at a time, so only the last block's copy
+    # is exposed at the end.
+    def q_copy(block):
+        t0 = pl.multiple_of(block % blocks_per_step * LANE, LANE)
+        head0 = pl.multiple_of(block // blocks_per_step * heads, heads)
+        return pltpu.make_async_copy(
+            q_buf.at[block % 2],
+            q_hbm_ref.at[pl.ds(t0, LANE), pl.ds(head0, heads)],
+            sems.at[1, block % 2],
+        )
+
+    @pl.when(step == 0)
+    def _():
+        w_copy(0).start()
+
+    @pl.when(step + 1 < num_steps)
+    def _():
+        w_copy(step + 1).start()
+
+    w_copy(step).wait()
+    w_ref = w_buf.at[step % 2]
+    qmax = dtype_max(quant_dtype)
+    # Heads per sublane transpose: an int32 vreg holds 8 token pairs of a head.
+    group = 8
+    high_mask = jnp.int32(-(1 << 16))
+    # _swap_pairs as a matmul: x @ swap reads lane i ^ 1, exact for bf16 x.
+    swap = (
+        jax.lax.broadcasted_iota(jnp.int32, (LANE, LANE), 0)
+        == jax.lax.broadcasted_iota(jnp.int32, (LANE, LANE), 1) ^ 1
+    ).astype(jnp.bfloat16)
+
+    @pl.when(step == 0)
+    def _():
+        x_scale_lanes_ref[...] = jnp.broadcast_to(
+            jnp.transpose(x_scale_ref[...]), x_scale_lanes_ref.shape
+        )
+        r = QNORM_EPILOGUE_ROWS
+        for r0 in range(0, m, r):
+            cos, sin = _cos_sin_lanes(
+                cos_sin_ref[pl.ds(r0, r), :], rotary_dim=rotary_dim, inverse=False
+            )
+            cos_ref[pl.ds(r0, r), :] = cos
+            sin_ref[pl.ds(r0, r), :] = sin * _gptj_sign()
+
+    def project(r0):
+        """Stage word row ``p * heads + h``: head h of tokens r0 + 2p (low
+        half) and r0 + 2p + 1 (high half)."""
+        x_scale = x_scale_lanes_ref[pl.ds(r0, rows), :]
+        for c in range(heads // group):
+            # K stays whole in one dot, as in XLA's fusion, so the f32 sums match.
+            acc = jax.lax.dot_general(
+                x_ref[pl.ds(r0, rows), :],
+                w_ref[:, pl.ds(c * group * LANE, group * LANE)],
+                dimension_numbers=(((1,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+            words = []
+            for j in range(group):
+                n0 = pl.multiple_of(step * tile_n + (c * group + j) * LANE, LANE)
+                # xla_quantized_matmul's epilogue order: x scale, then w scale.
+                y = acc[:, j * LANE : (j + 1) * LANE] * x_scale
+                y = y * w_scale_ref[:, pl.ds(n0, LANE)]
+                words.append(pltpu.bitcast(y.astype(jnp.bfloat16), jnp.int32))
+            for p0 in range(0, rows // 2, group):
+                # [head, pair] -> [pair, head]
+                block = jnp.stack([w[p0 : p0 + group] for w in words])
+                block = jnp.swapaxes(block, 0, 1)
+                for i in range(group):
+                    row = (p0 + i) * heads + c * group
+                    stage_ref[pl.ds(row, group), :] = block[i]
+
+    def rope_quantize(t0):
+        """rope_quant on tokens t0 ... t0 + LANE, staged from row ``s0``."""
+        s0 = t0 % rows
+        scale_block_ref = scale_ref.at[:, pl.ds(pl.multiple_of(t0, LANE), LANE)]
+        block = step * blocks_per_step + t0 // LANE
+        q_block_ref = q_buf.at[block % 2]
+
+        @pl.when(block >= 2)
+        def _():
+            q_copy(block - 2).wait()
+
+        for g in range(LANE // 2 // pairs):
+            row = pl.multiple_of((s0 // 2 + g * pairs) * heads, heads)
+            words = stage_ref[pl.ds(row, pairs * heads), :]
+            # The low halves' tokens, then the high halves', each heads x LANE.
+            x = jnp.concatenate(
+                [
+                    pltpu.bitcast(jax.lax.shift_left(words, 16), jnp.float32),
+                    pltpu.bitcast(words & high_mask, jnp.float32),
+                ]
+            )
+            x_swap = jax.lax.dot_general(
+                x.astype(jnp.bfloat16),
+                swap,
+                dimension_numbers=(((1,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+            for half in range(2):
+                for i in range(pairs):
+                    lane = 2 * (g * pairs + i) + half
+                    t = t0 + lane
+                    r = (half * pairs + i) * heads
+                    # rope_quant's arithmetic, with the GPT-J sign folded into sin.
+                    y = x[r : r + heads] * cos_ref[pl.ds(t, 1), :]
+                    y = y + x_swap[r : r + heads] * sin_ref[pl.ds(t, 1), :]
+                    abs_max = jnp.max(jnp.abs(y), axis=-1, keepdims=True)
+                    scale = abs_max / qmax
+                    scale_inv = jnp.where(abs_max == 0.0, 0.0, 1.0 / scale)
+                    q_block_ref[lane] = (y * scale_inv).astype(quant_dtype)
+                    scale_block_ref[:, pl.ds(lane, 1)] = scale
+        q_copy(block).start()
+
+    @pl.loop(0, m, step=rows)
+    def _(r0):
+        project(r0)
+        pl.loop(r0, r0 + rows, step=LANE)(rope_quantize)
+
+    @pl.when(step == num_steps - 1)
+    def _():
+        last = num_steps * blocks_per_step - 1
+        q_copy(last - 1).wait()
+        q_copy(last).wait()
+
+
+def project_rope_quant(
+    x: jax.Array,  # [num_tokens, q_lora_rank] bf16
+    w_q: jax.Array,  # [q_lora_rank, num_heads * head_dim] fp8
+    w_scale: jax.Array,  # [num_heads * head_dim]
+    positions: jax.Array,  # [num_tokens] int
+    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+    *,
+    head_dim: int,
+    quant_dtype: jnp.dtype = jnp.float8_e4m3fn,
+) -> tuple[jax.Array, jax.Array]:
+    """The per-channel fp8 wq_b projection followed by ``rope_quant``.
+
+    For prefill-sized batches one kernel does both, so the bf16 q never
+    reaches HBM. Otherwise this is the two ops back to back. Returns q
+    ``[num_tokens, num_heads, head_dim]`` in ``quant_dtype`` and its per-row
+    scales ``[num_tokens, num_heads]``, bit for bit as the two ops compute them.
+    """
+    num_tokens, k = x.shape
+    num_heads = w_q.shape[1] // head_dim
+    # A grid step's weight tile holds one sublane tile of q heads.
+    heads_per_tile = 8 * (4 // jnp.dtype(quant_dtype).itemsize)
+    if not (
+        x.dtype == jnp.bfloat16
+        and w_q.dtype == quant_dtype
+        and w_scale.ndim == 1
+        and head_dim == LANE
+        and cos_sin_cache.shape[1] <= LANE
+        and num_heads % heads_per_tile == 0
+        and DENSE_PROJ_MIN_TOKENS <= num_tokens <= ROPE_QUANT_PROJ_MAX_TOKENS
+        and num_tokens % ROPE_QUANT_PROJ_ROWS == 0
+    ):
+        q = xla_quantized_matmul(x, w_q, w_scale).reshape(num_tokens, num_heads, -1)
+        return cast(
+            tuple[jax.Array, jax.Array],
+            rope_quant(q, positions, cos_sin_cache, quant_dtype=quant_dtype),
+        )
+    x_q, x_scale = quantize_tensor(x, w_q.dtype)
+    m, n = num_tokens, w_q.shape[1]
+    tile_n = heads_per_tile * LANE
+    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    q, scales = pl.pallas_call(
+        functools.partial(
+            _project_rope_quant_kernel,
+            rotary_dim=cos_sin_cache.shape[1],
+            quant_dtype=quant_dtype,
+        ),
+        grid=(n // tile_n,),
+        in_specs=[vmem, vmem, vmem, vmem, hbm],
+        out_specs=[hbm, pl.BlockSpec((heads_per_tile, m), lambda j: (j, 0))],
+        out_shape=[
+            jax.ShapeDtypeStruct((m, num_heads, LANE), quant_dtype),
+            jax.ShapeDtypeStruct((num_heads, m), jnp.float32),
+        ],
+        scratch_shapes=[
+            pltpu.VMEM((m, LANE), jnp.float32),
+            pltpu.VMEM((m, LANE), jnp.float32),
+            pltpu.VMEM((m, LANE), jnp.float32),
+            pltpu.VMEM((ROPE_QUANT_PROJ_ROWS // 2 * heads_per_tile, LANE), jnp.int32),
+            pltpu.VMEM((2, k, tile_n), w_q.dtype),
+            pltpu.VMEM((2, LANE, heads_per_tile, LANE), quant_dtype),
+            pltpu.SemaphoreType.DMA((2, 2)),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            vmem_limit_bytes=ROPE_QUANT_PROJ_VMEM_LIMIT_BYTES,
+            disable_bounds_checks=True,
+        ),
+        name="project_rope_quant",
+    )(
+        x_scale.reshape(1, m),
+        w_scale.astype(jnp.float32).reshape(1, n),
+        x_q,
+        cos_sin_cache[positions],
+        w_q,
+    )
+    return q, scales.T
