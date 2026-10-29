@@ -570,6 +570,15 @@ def stage_block_table_uploads(
         )
     verify = staged_dev is not None and envs.TPU_VERIFY_INCREMENTAL_BLOCK_TABLE
 
+    if staged_dev is None and is_dummy and not verify:
+        # An idle EP-DP rank runs a dummy forward every step its peers decode;
+        # its packed block table is all null blocks and its shape is fixed per
+        # bucket, so upload it once and reuse it instead of zeroing and
+        # re-uploading tens of MB on the critical path of every step.
+        dummy_cache = getattr(runner, "_dummy_block_table_dev", None)
+        if dummy_cache is None:
+            dummy_cache = runner._dummy_block_table_dev = {}
+        staged_dev = dummy_cache.get(offset)
     if staged_dev is None or verify:
         total = offset
         scratch = runner._block_table_stage_cpu
@@ -602,6 +611,8 @@ def stage_block_table_uploads(
             stager.verify(delta_key, flat)
         else:
             staged_dev = flat.to(runner.device, non_blocking=True)
+            if is_dummy:
+                runner._dummy_block_table_dev[offset] = staged_dev
             if stager is not None and is_dummy:
                 stager.warm(staged_dev)
             elif stager is not None and delta_key is not None:

@@ -570,9 +570,14 @@ class TPUWorker(WorkerBase):
     def execute_dummy_batch(self) -> None:
         """Run an idle DP step with the same collective pattern as active DP."""
         runner = self.model_runner
+        timing = os.environ.get("TPU_DUMMY_STEP_TIMING") == "1"
+        t0 = time.perf_counter() if timing else 0.0
         bucket, target_num_chunks = runner._dp_coordinated_step(
             0, 0, needs_draft_proposals=False
         )
+        if timing:
+            t1 = time.perf_counter()
+            self._dummy_timing = getattr(self, "_dummy_timing", [])
         if bucket is None:
             # TPU compiles exact token buckets, so the idle-engine dummy must
             # use one of the precompiled model-forward shapes.
@@ -587,6 +592,20 @@ class TPUWorker(WorkerBase):
         # Single DP-EP pairing entry: all target dummy forwards, then all draft
         # dummy forwards, in the runner that owns the state.
         runner._run_dp_idle_pairing(bucket, target_num_chunks)
+        if timing:
+            t2 = time.perf_counter()
+            self._dummy_timing.append((t1 - t0, t2 - t1, bucket, target_num_chunks))
+            if len(self._dummy_timing) >= 200:
+                xs = self._dummy_timing
+                self._dummy_timing = []
+                wait = sorted(x[0] for x in xs)[len(xs) // 2] * 1000
+                pair = sorted(x[1] for x in xs)[len(xs) // 2] * 1000
+                logger.info(
+                    "[dummy-step timing] n=%d median coordination wait %.2f ms, "
+                    "idle pairing issue %.2f ms, buckets=%s chunks=%s",
+                    len(xs), wait, pair,
+                    sorted({x[2] for x in xs}), sorted({x[3] for x in xs}),
+                )
 
     def profile(
         self,
