@@ -62,8 +62,10 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
 )
 from vllm_torchtpu.kernels.fused_moe.v2.preprocessing import PreprocessTopology
 from vllm_torchtpu.kernels.fused_moe.v2.router_ops import (
+    finalize_normalized_router,
     normalized_router_block_rows,
     pallas_select,
+    select_finalize_normalized_router,
 )
 from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import (
     TokenReplicaLayout,
@@ -610,53 +612,73 @@ def fused_ep_moe_v2(
         )
         if normalized_rows is not None:
             select_rows = normalized_rows
-        if hash_l is not None:
-            # The selection was made by the caller's table, so the selector
-            # does not run at all; the weights are still the scores at the
-            # selected ids, which is the only thing the selector would have
-            # contributed here.
-            topk_idx = hash_l.astype(jnp.int32)
-            topk_weights = jnp.take_along_axis(scores, topk_idx, axis=-1)
-        elif score_bias_l is None:
-            topk_weights, topk_idx = pallas_select(
-                scores, topk=topk, block_rows=select_rows
-            )
-        else:
-            # Selection is based on (scores + score_bias_l); the weights come
-            # from the scores.
-            topk_weights, topk_idx = pallas_select(
-                scores + score_bias_l.astype(jnp.float32)[None, :],
-                topk=topk,
-                block_rows=select_rows,
-                weight_scores=scores,
-                normalize=normalized_rows is not None,
-            )
-        topk_idx = _relabel_expert_ids_to_mesh_order(
-            topk_idx, g_local=g_local, mesh_ep_ranks=mesh_ep_ranks
+        fused_finalize = normalized_rows is not None and (
+            mesh_ep_ranks is None
+            or tuple(mesh_ep_ranks) == tuple(range(len(mesh_ep_ranks)))
         )
-        # A row of scores carrying no real value routes nowhere. It was
-        # dropped by arithmetic accident: the selector gives every slot of
-        # such a row a large negative sentinel, and the renormalization below
-        # divided by their sum, which OVERFLOWED float32 to -inf and so
-        # returned exactly zero. That outcome is a property of the
-        # accumulation dtype and the association order, not of the design --
-        # a wider accumulator, a reassociating compiler pass, or a different
-        # renormalization would silently turn such a row from dropped into
-        # routed at full weight to expert zero. Mask it explicitly instead.
-        # gate_l is checked too: under sigmoid/sqrtsoftplus a -inf logit scores
-        # a finite 0, so replica padding would otherwise pass the score check.
-        if normalized_rows is not None:
-            # Every finite FP32/BF16 logit has a finite sqrtsoftplus score.
-            row_routes = jnp.any(jnp.isfinite(gate_l), axis=-1, keepdims=True)
+        # Mask invalid IDs only after remapping: the sentinel is not an expert.
+        if fused_finalize:
+            assert score_bias_l is not None
+            topk_weights, topk_idx, row_routes = select_finalize_normalized_router(
+                scores + score_bias_l.astype(jnp.float32)[None, :],
+                scores,
+                gate_l,
+                scale=routed_scaling_factor,
+                invalid_id=e_total,
+            )
         else:
-            row_routes = _row_routes(scores, gate_l)
-        if renormalize and normalized_rows is None:
-            denom = jnp.maximum(topk_weights.sum(axis=-1, keepdims=True), 1e-20)
-            topk_weights = topk_weights / jnp.where(row_routes, denom, 1.0)
-        if routed_scaling_factor != 1.0:
-            topk_weights = topk_weights * jnp.float32(routed_scaling_factor)
-        topk_weights = jnp.where(row_routes, topk_weights, 0.0)
-        topk_idx = jnp.where(row_routes, topk_idx, jnp.int32(e_total))
+            if hash_l is not None:
+                # The selection was made by the caller's table, so the selector
+                # does not run at all; the weights are still the scores at the
+                # selected ids, which is the only thing the selector would have
+                # contributed here.
+                topk_idx = hash_l.astype(jnp.int32)
+                topk_weights = jnp.take_along_axis(scores, topk_idx, axis=-1)
+            elif score_bias_l is None:
+                topk_weights, topk_idx = pallas_select(
+                    scores, topk=topk, block_rows=select_rows
+                )
+            else:
+                # Selection is based on (scores + score_bias_l); the weights come
+                # from the scores.
+                topk_weights, topk_idx = pallas_select(
+                    scores + score_bias_l.astype(jnp.float32)[None, :],
+                    topk=topk,
+                    block_rows=select_rows,
+                    weight_scores=scores,
+                    normalize=normalized_rows is not None,
+                )
+            topk_idx = _relabel_expert_ids_to_mesh_order(
+                topk_idx, g_local=g_local, mesh_ep_ranks=mesh_ep_ranks
+            )
+            # A row of scores carrying no real value routes nowhere. It was
+            # dropped by arithmetic accident: the selector gives every slot of
+            # such a row a large negative sentinel, and the renormalization below
+            # divided by their sum, which OVERFLOWED float32 to -inf and so
+            # returned exactly zero. That outcome is a property of the
+            # accumulation dtype and the association order, not of the design --
+            # a wider accumulator, a reassociating compiler pass, or a different
+            # renormalization would silently turn such a row from dropped into
+            # routed at full weight to expert zero. Mask it explicitly instead.
+            # gate_l is checked too: under sigmoid/sqrtsoftplus a -inf logit scores
+            # a finite 0, so replica padding would otherwise pass the score check.
+            if normalized_rows is not None:
+                topk_weights, topk_idx, row_routes = finalize_normalized_router(
+                    gate_l,
+                    topk_weights,
+                    topk_idx,
+                    scale=routed_scaling_factor,
+                    invalid_id=e_total,
+                )
+            else:
+                row_routes = _row_routes(scores, gate_l)
+                if renormalize:
+                    denom = jnp.maximum(topk_weights.sum(axis=-1, keepdims=True), 1e-20)
+                    topk_weights = topk_weights / jnp.where(row_routes, denom, 1.0)
+                if routed_scaling_factor != 1.0:
+                    topk_weights = topk_weights * jnp.float32(routed_scaling_factor)
+                topk_weights = jnp.where(row_routes, topk_weights, 0.0)
+                topk_idx = jnp.where(row_routes, topk_idx, jnp.int32(e_total))
         # A count of the masked rows would be the other half of this: an
         # incident today is degraded output against a completely clean log.
         # It is not added here because the only in-trace channel for it,
