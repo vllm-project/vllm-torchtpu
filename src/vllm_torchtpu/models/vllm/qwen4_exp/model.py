@@ -688,13 +688,17 @@ class Qwen4ExpBackbone(nn.Module):
             return mixed, hidden
         return mixed
 
-    def _megakernel_host_ple(self, input_ids, query_start_loc, ngram_context):
+    def _megakernel_host_ple(self, input_ids, query_start_loc, ngram_context, given=None):
         """With PLE CPU offload, the per-layer embedding rows of the megakernel programs'
         PLE layer, looked up on the host as ``_forward_impl`` does (None with the table
         on HBM). The kernels never read the PLE table: apply_ple runs before the head
         group that starts at the PLE layer, so the host rows go in there."""
         if self.host_ple_index is None:
             return None
+        if given is not None:
+            # VLLM_TPU_PLE_HOST_PRELOOKUP: the driver looked the rows up before the call,
+            # so the program has no host boundary (and no in-graph lookup to trace).
+            return given
         if not envs.VLLM_TPU_MK_HOST_PLE:
             raise AssertionError("segments need the PLE table on HBM (or VLLM_TPU_MK_HOST_PLE=1)")
         ple = cast(Qwen4ExpDecoderLayer, self.layers[self.host_ple_index]).ple
@@ -716,6 +720,7 @@ class Qwen4ExpBackbone(nn.Module):
         valid_tokens,
         main_block_table,
         compressed_block_table,
+        ple_raw_embeddings=None,
     ):
         """``forward`` with the layers between QSA attention cores in megakernels.
 
@@ -727,7 +732,9 @@ class Qwen4ExpBackbone(nn.Module):
         projection and MoE, then the linear-attention layers until the next QSA
         layer (the last segment ends after ``l``'s MoE).
         """
-        ple_raw = self._megakernel_host_ple(input_ids, query_start_loc, ngram_context)
+        ple_raw = self._megakernel_host_ple(
+            input_ids, query_start_loc, ngram_context, ple_raw_embeddings
+        )
         positions64 = positions.to(torch.int64)
         ids64 = input_ids.to(torch.int64)
         hidden = self.embed_tokens(input_ids).repeat(1, self.hc_count)
@@ -835,6 +842,7 @@ class Qwen4ExpBackbone(nn.Module):
         valid_tokens,
         main_block_table,
         compressed_block_table,
+        ple_raw_embeddings=None,
     ):
         """``forward_segments`` with layers ``whole``'s first .. last-1 in ONE whole-step
         megakernel call (attention, indexer and cache writes in-kernel / in-call).
@@ -842,7 +850,9 @@ class Qwen4ExpBackbone(nn.Module):
         Head groups as in ``forward_segments``; then ``whole`` (layers 3..46); the last QSA
         layer keeps its stock attention core and the segment kernel for the rest.
         """
-        ple_raw = self._megakernel_host_ple(input_ids, query_start_loc, ngram_context)
+        ple_raw = self._megakernel_host_ple(
+            input_ids, query_start_loc, ngram_context, ple_raw_embeddings
+        )
         ids64 = input_ids.to(torch.int64)
         positions64 = positions.to(torch.int64)
         hidden = self.embed_tokens(input_ids).repeat(1, self.hc_count)
@@ -879,6 +889,7 @@ class Qwen4ExpBackbone(nn.Module):
         "positions": 0,
         "inputs_embeds": 0,
         "valid_tokens": 0,
+        "ple_raw_embeddings": 1,
     }
 )
 class Qwen4ExpSegmentModel(nn.Module):
@@ -908,12 +919,14 @@ class Qwen4ExpSegmentModel(nn.Module):
         valid_tokens,
         main_block_table,
         compressed_block_table,
+        ple_raw_embeddings=None,
     ):
         return type(self.backbone).forward_segments(
             self.backbone,
             input_ids,
             positions,
             self.segments,
+            ple_raw_embeddings=ple_raw_embeddings,
             query_start_loc=query_start_loc,
             ngram_context=ngram_context,
             state_slots=state_slots,
@@ -984,6 +997,7 @@ class Qwen4ExpBackboneSP(nn.Module):
         "positions": 0,
         "inputs_embeds": 0,
         "valid_tokens": 0,
+        "ple_raw_embeddings": 1,
     }
 )
 class Qwen4ExpWholeStepModel(nn.Module):
@@ -1013,6 +1027,7 @@ class Qwen4ExpWholeStepModel(nn.Module):
         valid_tokens,
         main_block_table,
         compressed_block_table,
+        ple_raw_embeddings=None,
     ):
         return type(self.backbone).forward_wholestep(
             self.backbone,
@@ -1020,6 +1035,7 @@ class Qwen4ExpWholeStepModel(nn.Module):
             positions,
             self.segments,
             self.whole,
+            ple_raw_embeddings=ple_raw_embeddings,
             query_start_loc=query_start_loc,
             ngram_context=ngram_context,
             state_slots=state_slots,
