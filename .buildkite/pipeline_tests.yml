@@ -194,6 +194,25 @@ steps:
         env:
           SHAPE: *shape_single
           DOCKER_IMAGE_SUFFIX: "-omni"
+          # Diffusion and multimodal Omni suites compile FLUX, Qwen-Image, Wan,
+          # and LTX-2 sequentially in one pod; without redirecting compilation
+          # caches and inductor scratch off container overlayfs, accumulated
+          # artifacts trigger kubelet DiskPressure (evicted_storage) evictions.
+          VLLM_CACHE_ROOT: "/cache/jax/vllm"
+          VLLM_XLA_CACHE_PATH: "/cache/jax/xla"
+          TMPDIR: "/dev/shm"
+          RAY_TMPDIR: "/tmp"
+        # Retry only infrastructure failures: lost Buildkite agents (exit -1) and
+        # Kubernetes launcher temporary infra failures (exit 75 EX_TEMPFAIL on
+        # Kueue preemption, node eviction, or unscheduled pod timeout), never
+        # pytest failures (exit 1). Remove once agent/node preemptions are
+        # absorbed upstream without surfacing to Buildkite.
+        retry:
+          automatic:
+            - exit_status: -1
+              limit: 2
+            - exit_status: 75
+              limit: 2
         commands:
           - &omni_test |
             .buildkite/kubernetes/run.sh bash -c '
@@ -282,6 +301,22 @@ steps:
         env:
           SHAPE: *shape_single
           DOCKER_IMAGE_SUFFIX: "-omni"
+          # Redirect compilation caches and inductor scratch off container
+          # overlayfs to avoid kubelet DiskPressure (evicted_storage) evictions
+          # across the full nightly diffusion/multimodal model sweep.
+          VLLM_CACHE_ROOT: "/cache/jax/vllm"
+          VLLM_XLA_CACHE_PATH: "/cache/jax/xla"
+          TMPDIR: "/dev/shm"
+          RAY_TMPDIR: "/tmp"
+        # Retry only infrastructure failures: lost Buildkite agents (exit -1) and
+        # Kubernetes launcher temporary infra failures (exit 75 EX_TEMPFAIL).
+        # Remove once agent/node preemptions are absorbed upstream.
+        retry:
+          automatic:
+            - exit_status: -1
+              limit: 2
+            - exit_status: 75
+              limit: 2
         commands:
           - *omni_test
         plugins:
@@ -300,6 +335,19 @@ steps:
         env:
           SHAPE: *shape_multi
           DOCKER_IMAGE_SUFFIX: "-omni"
+          VLLM_CACHE_ROOT: "/cache/jax/vllm"
+          VLLM_XLA_CACHE_PATH: "/cache/jax/xla"
+          TMPDIR: "/dev/shm"
+          RAY_TMPDIR: "/tmp"
+        # Retry only infrastructure failures: lost Buildkite agents (exit -1) and
+        # Kubernetes launcher temporary infra failures (exit 75 EX_TEMPFAIL).
+        # Remove once agent/node preemptions are absorbed upstream.
+        retry:
+          automatic:
+            - exit_status: -1
+              limit: 2
+            - exit_status: 75
+              limit: 2
         commands:
           - *omni_test
         plugins:
