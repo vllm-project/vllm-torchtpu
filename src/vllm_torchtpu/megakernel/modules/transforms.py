@@ -28,6 +28,7 @@ from collections.abc import Mapping, Sequence
 import jax
 import jax.numpy as jnp
 
+from ..comm.replication import shard_count
 from ..decls import HFParamDecl
 
 
@@ -88,14 +89,15 @@ def _shard_and_transform_single(
     if tf.channel_splits is not None:
         parts = []
         off = 0
-        for width in tf.channel_splits:
+        groups = tf.split_groups or (None,) * len(tf.channel_splits)
+        for width, grp in zip(tf.channel_splits, groups, strict=True):
             sl = arr[..., off : off + width]
             off += width
-            w_r = width // R
+            n = shard_count(R, grp)
             lead = sl.shape[:-1]
-            reshaped = sl.reshape((*lead, R, w_r))
+            reshaped = sl.reshape((*lead, n, width // n))
             perm = (len(lead), *range(len(lead)), len(lead) + 1)
-            parts.append(jnp.transpose(reshaped, perm))
+            parts.append(jnp.repeat(jnp.transpose(reshaped, perm), R // n, axis=0))
         cat = jnp.concatenate(parts, axis=-1)
         if tf.flatten_tail:
             return cat.reshape((*cat.shape[:-2], cat.shape[-2] * cat.shape[-1]))
@@ -119,11 +121,12 @@ def _shard_and_transform_single(
         moved = jnp.transpose(arr, perm)
         out = jnp.repeat(moved, G, axis=0)
     else:
+        n = shard_count(R, tf.shard_groups)
         dim_size = arr.shape[full_axis]
-        local_size = dim_size // R
+        local_size = dim_size // n
         new_shape = (
             *arr.shape[:full_axis],
-            R,
+            n,
             local_size,
             *arr.shape[full_axis + 1 :],
         )
@@ -132,7 +135,7 @@ def _shard_and_transform_single(
             full_axis,
             *(i for i in range(reshaped.ndim) if i != full_axis),
         )
-        out = jnp.transpose(reshaped, perm)
+        out = jnp.repeat(jnp.transpose(reshaped, perm), R // n, axis=0)
         if tf.head_reduce == "mean":
             out = out.mean(axis=full_axis + 1)
 
