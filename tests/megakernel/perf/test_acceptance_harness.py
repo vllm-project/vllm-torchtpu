@@ -379,6 +379,81 @@ def test_prometheus_metrics_parser():
     assert deltas["prefix_cache_hit_rate"] == pytest.approx(0.80)
 
 
+def test_gsm8k_separate_pass_real_rejection_sampling_and_spread(capsys):
+    mod = _load_harness()
+
+    cmd_a_gsm = mod.build_gsm8k_server_command(
+        "reference",
+        mod.CONCURRENCY_SPECS["c32"],
+        reference_mode="image",
+        reference_image="registry.example/vllm-tpu:candidate30",
+    )
+    spec_a = json.loads(cmd_a_gsm[cmd_a_gsm.index("--speculative-config") + 1])
+    assert spec_a == {"method": "mtp", "num_speculative_tokens": 3}
+    assert "rejection_sample_method" not in spec_a
+    assert "synthetic_acceptance_length" not in spec_a
+
+    cmd_b_gsm = mod.build_gsm8k_server_command(
+        "candidate",
+        mod.CONCURRENCY_SPECS["c32"],
+    )
+    spec_b = json.loads(cmd_b_gsm[cmd_b_gsm.index("--speculative-config") + 1])
+    assert spec_b == {"method": "mtp", "num_speculative_tokens": 3}
+    add_b = json.loads(cmd_b_gsm[cmd_b_gsm.index("--additional-config") + 1])
+    assert add_b["megakernel"]["options"] == {
+        "mode": "ep",
+        "profile": "qwen35-candidate30-fused",
+    }
+
+    # print-commands --pass-mode gsm8k emits real rejection sampling + greedy params.
+    rc = mod.main(
+        [
+            "print-commands",
+            "--pass-mode",
+            "gsm8k",
+            "--reference-mode",
+            "stock",
+        ]
+    )
+    assert rc == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["pass_mode"] == "gsm8k"
+    assert printed["rejection_sample_mode"] == "real"
+    assert printed["client_sampling_params"] == {"temperature": 0.0}
+    for arm_key in ("reference", "candidate"):
+        arm_cmd = printed[arm_key]["cmd"]
+        arm_spec = json.loads(arm_cmd[arm_cmd.index("--speculative-config") + 1])
+        assert arm_spec == {"method": "mtp", "num_speculative_tokens": 3}
+
+    # Synthetic rejection sampling or non-greedy temperature must be rejected.
+    with pytest.raises(ValueError, match="rejection_sample_mode='real'"):
+        mod.evaluate_gsm8k_gate(0.9242, 0.9242, rejection_sample_mode="synthetic")
+    with pytest.raises(ValueError, match="temperature=0.0"):
+        mod.evaluate_gsm8k_gate(0.9242, 0.9242, temperature=0.6)
+
+    gsm = mod.evaluate_gsm8k_gate(
+        0.9234,
+        0.9242,
+        n_questions=1319,
+        ref_only_correct=14,
+        cand_only_correct=13,
+        reference_acceptance_lengths=[3.182, 3.190],
+        candidate_acceptance_lengths=[3.176, 3.188],
+    )
+    assert gsm["passed"] is True
+    assert gsm["rejection_sample_mode"] == "real"
+    assert gsm["temperature"] == 0.0
+    assert gsm["acceptance_length_spread"] == pytest.approx(0.014)
+    assert gsm["arm_acceptance_delta"] == pytest.approx(0.004)
+
+    suite = mod.evaluate_acceptance_suite(
+        [], required_concurrencies=(), gsm8k_result=gsm
+    )
+    md = mod.format_acceptance_markdown(suite)
+    assert "Separate Real Rejection Sampling Pass, Greedy" in md
+    assert "spread across runs: `0.0140`" in md
+
+
 def test_acceptance_script_stdlib_and_template_hygiene():
     assert HARNESS_PATH.is_file()
     # Ensure no unintended __init__.py was added before template package creation.

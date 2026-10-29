@@ -21,7 +21,16 @@ on the same `v7x-8` TPU allocation across `c8`, `c16`, and `c32` (`900 s` per sw
 Running separate `vllm serve` processes on one allocation exercises both the
 megakernel and surrounding stock serving paths (prefill, `fp32` conv state in the
 `640`-token unified slot with `--mamba-ssm-cache-dtype bfloat16`, rejection
-sampling, prefix caching, async scheduling, and KV cache offloading).
+sampling, prefix caching, async scheduling, and KV cache offloading). Arm B passes
+template-specific settings (`profile`, `mode`) under `megakernel.options` alongside
+top-level runtime keys (`plugin`, `stats_period_s`).
+
+Accuracy (`GSM8K`, `n=1319`) MUST run as a **separate pass** (`run-gsm8k` or
+`rejection_sample_mode="real"`) on **both** Arm A and Arm B with **real rejection
+sampling** (`MTP=3` enabled, synthetic acceptance OFF, greedy `temperature=0.0`).
+Synthetic acceptance (`rejection_sample_method="synthetic"`) fixes draft acceptance
+rates for deterministic latency/throughput benchmarking and does NOT produce the
+model's real token outputs.
 
 This module uses only the Python standard library so importing the template
 package never loads `torch`, `jax`, or `vllm`.
@@ -56,6 +65,7 @@ DEFAULT_SYNTHETIC_ACCEPTANCE_LEN = 3.39
 DEFAULT_ACCEPTANCE_LEN_TOL = 0.04
 DEFAULT_C16_BUNCHED_THRESHOLD_PCT = 6.0
 REF_IMAGE_ENV = "MK_ACCEPTANCE_REFERENCE_IMAGE"
+GSM8K_GREEDY_SAMPLING_PARAMS: dict[str, Any] = {"temperature": 0.0}
 
 _GIB = 1024**3
 
@@ -186,15 +196,25 @@ def _common_vllm_serve_args(
     model: str = DEFAULT_MODEL,
     host: str = "127.0.0.1",
     port: int = 8000,
+    rejection_sample_mode: str = "synthetic",
     synthetic_acceptance_length: float = DEFAULT_SYNTHETIC_ACCEPTANCE_LEN,
 ) -> list[str]:
+    if rejection_sample_mode not in ("synthetic", "real"):
+        raise ValueError(
+            f"Unknown rejection_sample_mode {rejection_sample_mode!r}; "
+            "expected 'synthetic' (perf sweeps) or 'real' (GSM8K accuracy pass)."
+        )
+    spec_dict: dict[str, Any] = {
+        "method": "mtp",
+        "num_speculative_tokens": 3,
+    }
+    if rejection_sample_mode == "synthetic":
+        spec_dict["rejection_sample_method"] = "synthetic"
+        spec_dict["synthetic_acceptance_length"] = round(
+            float(synthetic_acceptance_length), 4
+        )
     spec_cfg = json.dumps(
-        {
-            "method": "mtp",
-            "num_speculative_tokens": 3,
-            "rejection_sample_method": "synthetic",
-            "synthetic_acceptance_length": round(float(synthetic_acceptance_length), 4),
-        },
+        spec_dict,
         separators=(",", ":"),
         sort_keys=True,
     )
@@ -290,6 +310,7 @@ def build_arm_server_command(
     profile: str = DEFAULT_PROFILE,
     mode: str = "ep",
     stats_period_s: int = 60,
+    rejection_sample_mode: str = "synthetic",
     synthetic_acceptance_length: float = DEFAULT_SYNTHETIC_ACCEPTANCE_LEN,
     hf_cache_dir: str | None = None,
 ) -> list[str]:
@@ -297,14 +318,16 @@ def build_arm_server_command(
 
     - Arm A (`reference`, `reference_mode='image'`): runs `vllm serve` inside
       `reference_image` (or `MK_ACCEPTANCE_REFERENCE_IMAGE`) with `candidate30`'s
-      exact flags (`--block-size 256`, `MTP=3` synthetic `3.39`, prefix caching,
-      async scheduling, KV offload).
+      exact flags (`--block-size 256`, `MTP=3`, prefix caching, async scheduling,
+      KV offload).
     - Arm A (`reference`, `reference_mode='stock'`): runs stock `vllm serve` on the
       current environment with `megakernel.enabled = False` and
       `--mamba-ssm-cache-dtype bfloat16`.
     - Arm B (`candidate`): runs `vllm serve` with `--mamba-ssm-cache-dtype bfloat16`
       (alongside `main`'s forced `fp32` conv state) and `--additional-config`
-      pointing at the Qwen3.5 template plugin.
+      pointing at the Qwen3.5 template plugin (`options.profile`, `options.mode`).
+    - Pass `rejection_sample_mode='real'` for the separate GSM8K accuracy pass
+      (`MTP=3` enabled, synthetic acceptance OFF; pair with greedy `temperature=0`).
     """
     if arm not in ("reference", "candidate"):
         raise ValueError(f"Unknown arm {arm!r}; expected 'reference' or 'candidate'.")
@@ -318,6 +341,7 @@ def build_arm_server_command(
         model=model,
         host=host,
         port=port,
+        rejection_sample_mode=rejection_sample_mode,
         synthetic_acceptance_length=synthetic_acceptance_length,
     )
 
@@ -890,6 +914,42 @@ def evaluate_concurrency(
     }
 
 
+def build_gsm8k_server_command(
+    arm: str,
+    spec: ConcurrencySpec | None = None,
+    *,
+    model: str = DEFAULT_MODEL,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    reference_mode: str = "image",
+    reference_image: str | None = None,
+    plugin_module: str | None = None,
+    profile: str = DEFAULT_PROFILE,
+    mode: str = "ep",
+    stats_period_s: int = 60,
+    hf_cache_dir: str | None = None,
+) -> list[str]:
+    """Build server command for the separate GSM8K accuracy pass (`MTP=3`, real
+    rejection sampling, synthetic acceptance OFF) on Arm A or Arm B.
+    """
+    eff_spec = spec if spec is not None else CONCURRENCY_SPECS["c32"]
+    return build_arm_server_command(
+        arm,
+        eff_spec,
+        model=model,
+        host=host,
+        port=port,
+        reference_mode=reference_mode,
+        reference_image=reference_image,
+        plugin_module=plugin_module,
+        profile=profile,
+        mode=mode,
+        stats_period_s=stats_period_s,
+        rejection_sample_mode="real",
+        hf_cache_dir=hf_cache_dir,
+    )
+
+
 def evaluate_gsm8k_gate(
     score_candidate: float,
     score_reference: float = 0.9242,
@@ -897,8 +957,25 @@ def evaluate_gsm8k_gate(
     n_questions: int = 1319,
     ref_only_correct: int | None = None,
     cand_only_correct: int | None = None,
+    rejection_sample_mode: str = "real",
+    temperature: float = 0.0,
+    reference_acceptance_lengths: Sequence[float] | None = None,
+    candidate_acceptance_lengths: Sequence[float] | None = None,
 ) -> dict[str, Any]:
-    """Evaluate GSM8K accuracy parity using `2 * SE` or paired McNemar test."""
+    """Evaluate GSM8K accuracy parity (`2 * SE` or paired McNemar) and acceptance
+    length spread from a separate real-rejection-sampling greedy pass on both arms.
+    """
+    if rejection_sample_mode != "real":
+        raise ValueError(
+            "GSM8K accuracy must be measured with rejection_sample_mode='real' "
+            "(MTP on, synthetic acceptance off); synthetic acceptance does not "
+            "produce the model's tokens."
+        )
+    if float(temperature) != 0.0:
+        raise ValueError(
+            f"GSM8K accuracy pass requires greedy decoding (temperature=0.0); "
+            f"got temperature={temperature!r}."
+        )
     se = math.sqrt(score_reference * (1.0 - score_reference) / max(1, n_questions))
     band_2se = 2.0 * se
     delta = score_candidate - score_reference
@@ -913,13 +990,35 @@ def evaluate_gsm8k_gate(
         passed = mcnemar_z <= 1.96
     else:
         passed = delta >= -band_2se
+
+    ref_acc = [float(x) for x in (reference_acceptance_lengths or ())]
+    cand_acc = [float(x) for x in (candidate_acceptance_lengths or ())]
+    all_acc = ref_acc + cand_acc
+    ref_acc_mean = round(statistics.fmean(ref_acc), 4) if ref_acc else None
+    cand_acc_mean = round(statistics.fmean(cand_acc), 4) if cand_acc else None
+    arm_acc_delta = (
+        round(abs(cand_acc_mean - ref_acc_mean), 4)
+        if ref_acc_mean is not None and cand_acc_mean is not None
+        else None
+    )
+    acc_spread = (
+        round(max(all_acc) - min(all_acc), 4)
+        if len(all_acc) >= 2
+        else (0.0 if len(all_acc) == 1 else None)
+    )
     return {
         "n_questions": n_questions,
+        "rejection_sample_mode": rejection_sample_mode,
+        "temperature": 0.0,
         "score_reference": round(score_reference, 4),
         "score_candidate": round(score_candidate, 4),
         "delta": round(delta, 4),
         "band_2se": round(band_2se, 4),
         "mcnemar_z": round(mcnemar_z, 3) if mcnemar_z is not None else None,
+        "reference_mean_acceptance_length": ref_acc_mean,
+        "candidate_mean_acceptance_length": cand_acc_mean,
+        "arm_acceptance_delta": arm_acc_delta,
+        "acceptance_length_spread": acc_spread,
         "passed": bool(passed),
     }
 
@@ -1030,17 +1129,36 @@ def format_acceptance_markdown(suite: Mapping[str, Any]) -> str:
 
     gsm8k = suite.get("gsm8k")
     if gsm8k:
+        mcnemar_part = (
+            f", McNemar $z = {gsm8k['mcnemar_z']:.3f}$"
+            if gsm8k.get("mcnemar_z") is not None
+            else ""
+        )
+        rej_mode = gsm8k.get("rejection_sample_mode", "real")
+        temp_val = gsm8k.get("temperature", 0.0)
         lines.extend(
             [
                 "",
-                "## Accuracy Gate (GSM8K)",
+                (
+                    "## Accuracy Gate (GSM8K — Separate Real Rejection "
+                    "Sampling Pass, Greedy)"
+                ),
+                f"- Mode: `rejection_sample_mode={rej_mode}`, "
+                f"`temperature={temp_val:.1f}`",
                 f"- Reference: `{gsm8k['score_reference']:.4f}`, "
                 f"Candidate: `{gsm8k['score_candidate']:.4f}`, "
                 f"$\\Delta = {gsm8k['delta']:+.4f}$ "
-                f"(`2*SE = ±{gsm8k['band_2se']:.4f}`), "
+                f"(`2*SE = ±{gsm8k['band_2se']:.4f}`{mcnemar_part}), "
                 f"Passed: **`{gsm8k['passed']}`**",
             ]
         )
+        if gsm8k.get("acceptance_length_spread") is not None:
+            lines.append(
+                f"- Real MTP acceptance length (`A` / `B`): "
+                f"`{gsm8k.get('reference_mean_acceptance_length')} / "
+                f"{gsm8k.get('candidate_mean_acceptance_length')}` "
+                f"(spread across runs: `{gsm8k['acceptance_length_spread']:.4f}`)"
+            )
     return "\n".join(lines) + "\n"
 
 
@@ -1369,11 +1487,178 @@ def _record_from_dict(data: Mapping[str, Any]) -> SweepRecord:
     return validate_sweep_record(rec, target_duration_s=target_dur)
 
 
+def run_gsm8k_pass(
+    *,
+    out_dir: pathlib.Path,
+    eval_cmd_template: str,
+    concurrency_name: str = "c32",
+    repeats: int = 1,
+    model: str = DEFAULT_MODEL,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    reference_mode: str = "image",
+    reference_image: str | None = None,
+    arm_a_cmd_override: str | None = None,
+    arm_b_cmd_override: str | None = None,
+    plugin_module: str | None = None,
+    profile: str = DEFAULT_PROFILE,
+    startup_timeout_s: float = 1800.0,
+) -> dict[str, Any]:
+    """Run a separate GSM8K accuracy pass on both arms with REAL rejection sampling
+    (`MTP=3` enabled, synthetic acceptance OFF, greedy `temperature=0.0`).
+    """
+    if concurrency_name not in CONCURRENCY_SPECS:
+        valid_concs = sorted(CONCURRENCY_SPECS)
+        raise ValueError(
+            f"Unknown concurrency {concurrency_name!r}; expected one of {valid_concs}"
+        )
+    spec = CONCURRENCY_SPECS[concurrency_name]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    health_url = f"http://{host}:{port}/health"
+    metrics_url = f"http://{host}:{port}/metrics"
+
+    scores: dict[str, list[float]] = {"reference": [], "candidate": []}
+    acc_lens: dict[str, list[float]] = {"reference": [], "candidate": []}
+    n_questions = 1319
+    ref_only_correct: int | None = None
+    cand_only_correct: int | None = None
+    arm_runs: list[dict[str, Any]] = []
+
+    for rep_idx in range(1, max(1, int(repeats)) + 1):
+        pair_correct: dict[str, list[bool]] = {}
+        for arm in ("reference", "candidate"):
+            run_id = f"gsm8k_r{rep_idx}_{arm}"
+            server_log = out_dir / f"{run_id}.server.log"
+            eval_json = out_dir / f"{run_id}.eval.json"
+
+            if arm == "reference" and arm_a_cmd_override:
+                srv_cmd = shlex.split(arm_a_cmd_override)
+            elif arm == "candidate" and arm_b_cmd_override:
+                srv_cmd = shlex.split(arm_b_cmd_override)
+            else:
+                srv_cmd = build_gsm8k_server_command(
+                    arm,
+                    spec,
+                    model=model,
+                    host=host,
+                    port=port,
+                    reference_mode=reference_mode,
+                    reference_image=reference_image,
+                    plugin_module=plugin_module,
+                    profile=profile,
+                )
+            srv_str = " ".join(srv_cmd)
+            if '"rejection_sample_method":"synthetic"' in srv_str.replace(" ", ""):
+                raise ValueError(
+                    f"GSM8K server command for {arm} has synthetic acceptance enabled; "
+                    "real rejection sampling is required."
+                )
+
+            srv_env = os.environ.copy()
+            srv_env.update(build_arm_env(arm, spec, reference_mode=reference_mode))
+            expect_mk = not (arm == "reference" and reference_mode == "stock")
+
+            with server_log.open("w", encoding="utf-8") as log_fp:
+                proc = subprocess.Popen(
+                    srv_cmd,
+                    stdout=log_fp,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    env=srv_env,
+                    start_new_session=True,
+                )
+                try:
+                    _wait_for_server_ready(
+                        proc,
+                        server_log,
+                        health_url=health_url,
+                        expect_megakernel=expect_mk,
+                        startup_timeout_s=startup_timeout_s,
+                    )
+                    _, prom_before_txt = _http_get_text(metrics_url, timeout_s=10.0)
+                    prom_before = parse_prometheus_metrics(prom_before_txt)
+
+                    eval_cmd_str = eval_cmd_template.format(
+                        host=host,
+                        port=port,
+                        model=model,
+                        output_json=str(eval_json),
+                        run_id=run_id,
+                        arm=arm,
+                        temperature=0.0,
+                    )
+                    subprocess.run(shlex.split(eval_cmd_str), check=True)
+
+                    _, prom_after_txt = _http_get_text(metrics_url, timeout_s=10.0)
+                    prom_after = parse_prometheus_metrics(prom_after_txt)
+                finally:
+                    _terminate_process_group(proc)
+
+            log_text = server_log.read_text(encoding="utf-8", errors="replace")
+            step_mix = parse_mk_stats_log(log_text)
+            if expect_mk and (step_mix.decline_codes or step_mix.mk_steps <= 0):
+                raise RuntimeError(
+                    f"GSM8K {run_id} failed megakernel execution check: "
+                    f"mk_steps={step_mix.mk_steps}, declines={step_mix.decline_codes}"
+                )
+            prom_deltas = compute_prometheus_deltas(prom_before, prom_after)
+            payload = json.loads(eval_json.read_text(encoding="utf-8"))
+            score = float(
+                payload.get("exact_match")
+                if payload.get("exact_match") is not None
+                else payload["accuracy"]
+            )
+            n_questions = int(payload.get("n_questions", n_questions))
+            scores[arm].append(score)
+            real_acc_len = prom_deltas.get("spec_mean_acceptance_length")
+            if real_acc_len is not None:
+                acc_lens[arm].append(float(real_acc_len))
+            if isinstance(payload.get("per_question_correct"), list):
+                pair_correct[arm] = [bool(x) for x in payload["per_question_correct"]]
+            arm_runs.append(
+                {
+                    "run_id": run_id,
+                    "arm": arm,
+                    "score": round(score, 4),
+                    "spec_mean_acceptance_length": real_acc_len,
+                    "mk_pct": step_mix.mk_pct,
+                }
+            )
+
+        if "reference" in pair_correct and "candidate" in pair_correct:
+            rc_list = pair_correct["reference"]
+            cc_list = pair_correct["candidate"]
+            if len(rc_list) == len(cc_list):
+                ro = sum(1 for r_ok, c_ok in zip(rc_list, cc_list) if r_ok and not c_ok)
+                co = sum(1 for r_ok, c_ok in zip(rc_list, cc_list) if c_ok and not r_ok)
+                ref_only_correct = (ref_only_correct or 0) + ro
+                cand_only_correct = (cand_only_correct or 0) + co
+
+    gate = evaluate_gsm8k_gate(
+        statistics.fmean(scores["candidate"]),
+        statistics.fmean(scores["reference"]),
+        n_questions=n_questions,
+        ref_only_correct=ref_only_correct,
+        cand_only_correct=cand_only_correct,
+        rejection_sample_mode="real",
+        temperature=0.0,
+        reference_acceptance_lengths=acc_lens["reference"],
+        candidate_acceptance_lengths=acc_lens["candidate"],
+    )
+    gate["runs"] = arm_runs
+    (out_dir / "gsm8k_summary.json").write_text(
+        json.dumps(gate, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return gate
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Single-allocation separate-process A/B/A/B serving acceptance "
-            "benchmark for the Qwen3.5 megakernel template."
+            "benchmark for the Qwen3.5 megakernel template (plus separate "
+            "real-rejection-sampling greedy GSM8K accuracy pass)."
         )
     )
     sub = parser.add_subparsers(dest="subcommand", required=True)
@@ -1381,6 +1666,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_cmd = sub.add_parser(
         "print-commands",
         help="Print exact Arm A and Arm B server commands and environment variables.",
+    )
+    p_cmd.add_argument(
+        "--pass-mode",
+        choices=("perf", "gsm8k"),
+        default="perf",
+        help=(
+            "'perf' prints synthetic-acceptance c8/c16/c32 sweep commands; "
+            "'gsm8k' prints separate real-rejection-sampling (synthetic off, "
+            "greedy temperature=0) commands for both arms."
+        ),
     )
     p_cmd.add_argument(
         "--concurrencies",
@@ -1435,11 +1730,41 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--startup-timeout-s", type=float, default=1800.0)
     p_run.add_argument("--duration-s", type=int, default=None)
 
+    p_gsm = sub.add_parser(
+        "run-gsm8k",
+        help=(
+            "Execute separate GSM8K accuracy pass on both arms with REAL rejection "
+            "sampling (MTP on, synthetic acceptance off, greedy temperature=0)."
+        ),
+    )
+    p_gsm.add_argument("--out-dir", type=pathlib.Path, required=True)
+    p_gsm.add_argument(
+        "--eval-cmd-template",
+        required=True,
+        help=(
+            "GSM8K client template supporting {host}, {port}, {model}, "
+            "{output_json}, {run_id}, {arm}, {temperature}."
+        ),
+    )
+    p_gsm.add_argument("--concurrency", default="c32")
+    p_gsm.add_argument("--repeats", type=int, default=1)
+    p_gsm.add_argument("--model", default=DEFAULT_MODEL)
+    p_gsm.add_argument("--host", default="127.0.0.1")
+    p_gsm.add_argument("--port", type=int, default=8000)
+    p_gsm.add_argument("--reference-mode", choices=("image", "stock"), default="image")
+    p_gsm.add_argument("--reference-image", default=None)
+    p_gsm.add_argument("--arm-a-cmd-override", default=None)
+    p_gsm.add_argument("--arm-b-cmd-override", default=None)
+    p_gsm.add_argument("--plugin", default=None)
+    p_gsm.add_argument("--profile", default=DEFAULT_PROFILE)
+    p_gsm.add_argument("--startup-timeout-s", type=float, default=1800.0)
+
     p_ana = sub.add_parser(
         "analyze",
         help="Evaluate saved sweep JSON records and emit Markdown + JSON verdict.",
     )
     p_ana.add_argument("--sweeps-json", type=pathlib.Path, required=True)
+    p_ana.add_argument("--gsm8k-json", type=pathlib.Path, default=None)
     p_ana.add_argument("--concurrencies", default="c8,c16,c32")
     p_ana.add_argument("--out-json", type=pathlib.Path, default=None)
     p_ana.add_argument("--out-md", type=pathlib.Path, default=None)
@@ -1452,6 +1777,47 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.subcommand == "print-commands":
+        if args.pass_mode == "gsm8k":
+            concs = [c.strip() for c in args.concurrencies.split(",") if c.strip()]
+            c_name = concs[0] if len(concs) == 1 else "c32"
+            spec = CONCURRENCY_SPECS[c_name]
+            out_gsm = {
+                "pass_mode": "gsm8k",
+                "rejection_sample_mode": "real",
+                "client_sampling_params": dict(GSM8K_GREEDY_SAMPLING_PARAMS),
+                "concurrency_spec": c_name,
+                "reference": {
+                    "env": build_arm_env(
+                        "reference", spec, reference_mode=args.reference_mode
+                    ),
+                    "cmd": build_gsm8k_server_command(
+                        "reference",
+                        spec,
+                        model=args.model,
+                        reference_mode=args.reference_mode,
+                        reference_image=args.reference_image,
+                        plugin_module=args.plugin,
+                        profile=args.profile,
+                    ),
+                },
+                "candidate": {
+                    "env": build_arm_env(
+                        "candidate", spec, reference_mode=args.reference_mode
+                    ),
+                    "cmd": build_gsm8k_server_command(
+                        "candidate",
+                        spec,
+                        model=args.model,
+                        reference_mode=args.reference_mode,
+                        reference_image=args.reference_image,
+                        plugin_module=args.plugin,
+                        profile=args.profile,
+                    ),
+                },
+            }
+            sys.stdout.write(json.dumps(out_gsm, indent=2, sort_keys=True) + "\n")
+            return 0
+
         concs = [c.strip() for c in args.concurrencies.split(",") if c.strip()]
         out: dict[str, Any] = {}
         for c_name in concs:
@@ -1511,12 +1877,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stdout.write(format_acceptance_markdown(res["suite"]))
         return 0 if res["suite"]["overall_verdict"] == "PASS" else 1
 
+    if args.subcommand == "run-gsm8k":
+        gsm = run_gsm8k_pass(
+            out_dir=args.out_dir,
+            eval_cmd_template=args.eval_cmd_template,
+            concurrency_name=args.concurrency,
+            repeats=args.repeats,
+            model=args.model,
+            host=args.host,
+            port=args.port,
+            reference_mode=args.reference_mode,
+            reference_image=args.reference_image,
+            arm_a_cmd_override=args.arm_a_cmd_override,
+            arm_b_cmd_override=args.arm_b_cmd_override,
+            plugin_module=args.plugin,
+            profile=args.profile,
+            startup_timeout_s=args.startup_timeout_s,
+        )
+        sys.stdout.write(json.dumps(gsm, indent=2, sort_keys=True) + "\n")
+        return 0 if gsm["passed"] else 1
+
     if args.subcommand == "analyze":
         raw = json.loads(args.sweeps_json.read_text(encoding="utf-8"))
         items = raw["sweeps"] if isinstance(raw, dict) and "sweeps" in raw else raw
         recs = [_record_from_dict(item) for item in items]
         concs = [c.strip() for c in args.concurrencies.split(",") if c.strip()]
-        suite = evaluate_acceptance_suite(recs, required_concurrencies=concs)
+        gsm_res = (
+            json.loads(args.gsm8k_json.read_text(encoding="utf-8"))
+            if args.gsm8k_json is not None
+            else None
+        )
+        suite = evaluate_acceptance_suite(
+            recs, required_concurrencies=concs, gsm8k_result=gsm_res
+        )
         md = format_acceptance_markdown(suite)
         if args.out_json is not None:
             args.out_json.write_text(
