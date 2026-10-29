@@ -25,7 +25,10 @@ import torch
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.forward_context import get_forward_context
 from vllm.sequence import IntermediateTensors
+
+from vllm_torchtpu import envs
 
 
 class MtpDraftModel(Protocol):
@@ -51,6 +54,11 @@ class _MtpFusedLoop(nn.Module):
         self.prefix = prefix
         self.mtp = mtp
         self.num_steps = num_steps
+        # VLLM_TPU_MTP_LOOP_REBIND_SEQ_LENS: advance seq_lens by rebinding the
+        # draft metadata's field to `seq_lens + i` in the graph instead of
+        # `seq_lens.add_(1)`, so the program mutates no input and AOT emits no
+        # copy-back epilogue for it.
+        self.rebind_seq_lens = envs.VLLM_TPU_MTP_LOOP_REBIND_SEQ_LENS
 
     def forward(
         self,
@@ -67,7 +75,12 @@ class _MtpFusedLoop(nn.Module):
         for i in range(self.num_steps):
             if i > 0:
                 positions = positions + 1
-                seq_lens.add_(1)
+                if self.rebind_seq_lens:
+                    stepped = seq_lens + i
+                    for md in get_forward_context().attn_metadata.values():
+                        md.seq_lens = stepped
+                else:
+                    seq_lens.add_(1)
             out = type(self.mtp).forward(
                 self.mtp,
                 input_ids,
