@@ -1573,8 +1573,10 @@ class KVCacheManager:
                     f"budget: region={region}, allocated={allocated_bytes}, "
                     f"required={required_bytes}, budget={budget}"
                 )
+            # Allocate on the device: a host tensor staged through `.to()` costs
+            # about twice the cache size in host RAM per worker.
             caches = tuple(
-                torch.zeros(shape, dtype=dtype).to(self.runner.device)
+                torch.zeros(shape, dtype=dtype, device=self.runner.device)
                 for shape, dtype in geometry
             )
             if native_caches is not None:
@@ -1646,7 +1648,9 @@ class KVCacheManager:
                     ):
                         cache_shape = (mamba_num_blocks, *shape)
                         mamba_states.append(
-                            torch.zeros(cache_shape, dtype=dtype).to(self.runner.device)
+                            torch.zeros(
+                                cache_shape, dtype=dtype, device=self.runner.device
+                            )
                         )
                     kv_caches[layer_name] = tuple(mamba_states)
                 elif isinstance(kv_cache_spec, MLAAttentionSpec):
