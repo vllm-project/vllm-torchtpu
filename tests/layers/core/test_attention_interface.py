@@ -247,6 +247,52 @@ class ShardedRaggedPagedAttentionValidationTest(parameterized.TestCase):
                 sm_scale=1.0,
             )
 
+    @parameterized.parameters(
+        (
+            attention_interface.batched_rpa_configs.KVLayout.SEQ_ALONG_LANE,
+            True,
+        ),
+        (
+            attention_interface.batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
+            False,
+        ),
+        (None, None),
+    )
+    def test_mask_invalid_v_enabled_only_for_seq_along_lane(
+        self, kv_layout, expected_mask_invalid_v
+    ):
+        captured: dict[str, object] = {}
+
+        def fake_rpa(*args, **kwargs):
+            captured.update(kwargs)
+            return args[0], args[3]
+
+        q = jnp.zeros((4, 2, 128))
+        kv_cache = jnp.zeros((1, 4, 2, 2, 128))
+        kv_lens = jnp.zeros((1,), jnp.int32)
+        page_indices = jnp.zeros((1,), jnp.int32)
+        cu_q_lens = jnp.zeros((2,), jnp.int32)
+        distribution = jnp.zeros((3,), jnp.int32)
+
+        attention_interface.sharded_ragged_paged_attention(
+            None,
+            q,
+            q,
+            q,
+            kv_cache,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            None,
+            sm_scale=1.0,
+            rpa_func=fake_rpa,
+            shard=False,
+            kv_layout=kv_layout,
+        )
+
+        self.assertEqual(captured.get("mask_invalid_v"), expected_mask_invalid_v)
+
 
 class SparseMlaAttentionLayoutValidationTest(parameterized.TestCase):
     """Argument checks in `sparse_mla_attention` that fail fast, before the
