@@ -313,15 +313,32 @@ def _scatter_window(pool, vals, mgr_indices, *, split: int, kb0: int, nblocks: i
     )(mgr_indices, vals, pool)
 
 
-def scatter_region(pool, vals, state_indices, *, tok0: int, ntok: int, split: int = 1):
+def scatter_region(
+    pool,
+    vals,
+    state_indices,
+    *,
+    tok0: int,
+    ntok: int,
+    split: int = 1,
+    skip_null: bool = False,
+):
     """Per-request typed write of a pool token-range (in place); mirrors
     ``gather_region`` including the ``split`` manager-range routing.
 
     pool: (num_blocks, block_size, heads2, lanes) KV dtype (aliased;
     unwritten bytes preserved).
     vals: (num_reqs, rows, lanes) — the gather_region shape.
+    ``skip_null`` writes only unique positive manager IDs, without reading
+    source rows for null or idle requests.
     returns: the updated pool.
     """
+    if state_indices.shape[0] == 0 or ntok == 0:
+        return pool
+    if skip_null:
+        return _scatter_positive_region(
+            pool, vals, state_indices, tok0=tok0, ntok=ntok, split=split
+        )
     if split > 1:
         kernel_bs = pool.shape[1]
         if tok0 % kernel_bs == 0 and ntok % kernel_bs == 0:
@@ -395,6 +412,67 @@ def scatter_region(pool, vals, state_indices, *, tok0: int, ntok: int, split: in
         out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
         input_output_aliases={2: 0},
     )(state_indices, vals.reshape(na * chunks, v_rows, v_lanes), pool)
+
+
+def _scatter_positive_region(pool, vals, indices, *, tok0, ntok, split):
+    block_size, payload, lanes = _pool_geometry(pool)
+    assert tok0 >= 0 and tok0 + ntok <= split * block_size
+    local0 = tok0 % block_size
+    g = ntok if local0 % ntok == 0 else math.gcd(local0, ntok)
+    if local0 + ntok > block_size:
+        g = math.gcd(block_size, g)
+    chunks = ntok // g
+    same_dtype = jnp.dtype(pool.dtype) == jnp.dtype(vals.dtype)
+    val_payload = (
+        payload if same_dtype else _bitcast_payload(payload, pool.dtype, vals.dtype)
+    )
+    rows = _out_rows(val_payload, g)
+    if not payload and not same_dtype:
+        rows = _rescale_rows(g, pool.dtype, vals.dtype)
+    assert lanes % vals.shape[-1] == 0
+    lane_split = lanes // vals.shape[-1]
+    rows *= lane_split
+    assert vals.shape == (len(indices), chunks * rows, vals.shape[-1])
+    pad = (0,) * (len(payload) + 1)
+
+    def kernel(ids, source, old, target):
+        request = pl.program_id(0)
+
+        @pl.when(ids[request] > 0)
+        def store():
+            def body(value, region):
+                typed_ldst.store_typed(region.at[0], value[0], lane_split=lane_split)
+
+            pltpu.emit_pipeline(
+                body,
+                grid=(chunks,),
+                in_specs=[
+                    pl.BlockSpec(
+                        (1, rows, vals.shape[-1]),
+                        lambda c: (request * chunks + c, 0, 0),
+                    )
+                ],
+                out_specs=pl.BlockSpec(
+                    (1, g) + payload + (lanes,),
+                    lambda c: (
+                        ids[request] * split + (tok0 + c * g) // block_size,
+                        ((tok0 + c * g) % block_size) // g,
+                    )
+                    + pad,
+                ),
+            )(source, target)
+
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(len(indices),),
+            in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 2,
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+        ),
+        out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
+        input_output_aliases={2: 0},
+    )(indices, vals.reshape(len(indices) * chunks, rows, vals.shape[-1]), pool)
 
 
 def copy_blocks(pool, src_indices, dst_indices):
