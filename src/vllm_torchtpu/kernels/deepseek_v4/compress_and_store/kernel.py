@@ -39,12 +39,13 @@ _SAL_MAX_WAVE = 128
 # of 4: `prepare_boundary_batch` aligns each prefill 4-token cache row to 4, so
 # a row is never split across steps. The indexer's step is one latency chain
 # (softmax, norm, quantize, the two staging matmuls of
-# `compute.stage_sal_columns`) that 16 tokens fill no longer than 8. CSA's RoPE
-# row merge grows with the square of its tile, so it keeps 16. HCA has one
-# boundary token per 128 and a 512 KiB window per token, so it keeps 4 and two
-# steps to overlap the window fetch with compute.
-CSA_TILE_N = 16
-INDEXER_TILE_N = 16
+# `compute.stage_sal_columns`); 32 tokens take less than two 16-token steps.
+# CSA's RoPE row merge grows with the square of its tile; at 32 it still costs
+# less than the steps it saves. HCA has one boundary token per 128 and a
+# 512 KiB window per token, so it keeps 4 and two steps to overlap the window
+# fetch with compute.
+CSA_TILE_N = 32
+INDEXER_TILE_N = 32
 HCA_TILE_N = 4
 # Per-token inputs whose length is a multiple of this need no padding.
 TOKEN_ALIGN = math.lcm(CSA_TILE_N, INDEXER_TILE_N, HCA_TILE_N)
