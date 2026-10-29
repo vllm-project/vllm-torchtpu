@@ -347,10 +347,10 @@ def test_export_adds_one_dma_per_state_region(states):
     plain = trace()
     with_ckpt = trace(**_ckpt_kwargs())
 
-    # One conv and one recurrent copy, each waited inline; the pipelined
-    # state copies are untouched.
+    # One conv and one recurrent copy, started by the pipelined state
+    # copy-out and covered by its existing waits.
     assert with_ckpt.count("dma_start") == plain.count("dma_start") + 2
-    assert with_ckpt.count("dma_wait") == plain.count("dma_wait") + 2
+    assert with_ckpt.count("dma_wait") == plain.count("dma_wait")
 
 
 def test_offsets_need_indices():
