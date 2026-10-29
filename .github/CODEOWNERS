@@ -40,6 +40,8 @@
 # Megakernel library (framework-free JAX/Pallas)
 /src/vllm_torchtpu/megakernel/ @caojx-google @weinan1997 @hhb
 /tests/megakernel/ @caojx-google @weinan1997 @hhb
+/src/vllm_torchtpu/megakernel/comm/ @brianseung-google @weinan1997 @hhb
+/tests/megakernel/test_comm.py @brianseung-google @weinan1997 @hhb
 
 # Model layers
 /src/vllm_torchtpu/layers/ @kyuyeunk @qizzzh @Nanfang-Li
