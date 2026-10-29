@@ -30,7 +30,7 @@ from ...decls import (
     apply_decl_overrides,
 )
 from ...errors import MegakernelConfigError
-from ...ops import BF16, F32, FP8
+from ...ops import BF16, F32, FP8, U8, rup
 
 MOE_PARAM_NAMES: frozenset[str] = frozenset(
     {
@@ -42,6 +42,8 @@ MOE_PARAM_NAMES: frozenset[str] = frozenset(
         "sh_up_proj_s",
         "sh2",
         "sh2_s",
+        "e13",
+        "e13_s",
         "e_gate_proj",
         "e_gate_proj_s",
         "e_up_proj",
@@ -74,7 +76,17 @@ MOE_FIELD_ALIASES: dict[str, str] = {
     "rms_norm_eps": "eps",
 }
 
-MOE_OPTIONS: dict[str, Any] = {"shared_gate": True, "moe_tp": None, "e_slots": None}
+MOE_OPTIONS: dict[str, Any] = {
+    "shared_gate": True,
+    "moe_tp": None,
+    "e_slots": None,
+    "expert_quant": None,
+}
+
+
+def nvfp4_raw_n(n_logical: int) -> int:
+    """Physical uint8 columns for `n_logical` NVFP4 channels: `n + rup(n // 8, 128)`."""
+    return int(n_logical) + rup(int(n_logical) // 8, 128)
 
 
 def _moe_ew(g: Any, R: int) -> int:
@@ -108,6 +120,11 @@ def validate_moe_options(options: Mapping[str, Any]) -> None:
             "MoEModule requires shared_gate=True (the kernel always gates the "
             "shared expert with sh_gate)"
         )
+    eq = options.get("expert_quant")
+    if eq is not None and str(eq) not in ("fp8", "nvfp4"):
+        raise MegakernelConfigError(
+            f"MoEModule requires expert_quant in ('fp8', 'nvfp4'), got {eq!r}"
+        )
 
 
 def resolve_moe_binding(
@@ -125,6 +142,7 @@ def resolve_moe_binding(
             "eps": float(vals["eps"]),
             "moe_tp": bool(opts.get("moe_tp", True)),
             "e_slots": int(opts.get("e_slots", 0)),
+            "expert_quant": str(opts.get("expert_quant", "fp8")),
         }
     )
     return ResolvedModuleGeometry(
@@ -314,6 +332,104 @@ def moe_hf_params(
             flipped=True,
         ),
     )
+    is_nvfp4 = str(getattr(geom, "expert_quant", "fp8")) == "nvfp4"
+    e13_raw_n = nvfp4_raw_n(2 * inter_dim)
+    e2_raw_n = nvfp4_raw_n(H)
+    e13_decls = (
+        [
+            HFParamDecl(
+                name=_n("e13"),
+                hf_name=f"{p}experts.w13_weight",
+                shape=(E, H // 2, e13_raw_n),
+                hf_shape=(E, H // 2, e13_raw_n),
+                dtype=U8,
+                transform=ParamTransform(
+                    shard_axis=shard_e13,
+                    expert_axis=0,
+                ),
+                vllm_aliases=(
+                    VLLMAlias(
+                        source=f"{p}experts.w13_weight",
+                        targets=(_n("e13"),),
+                        scale_targets=(_n("e13_s"),),
+                        scale_source=f"{p}experts.w13_weight_scale",
+                        shard_axis=shard_e13,
+                        already_sharded=True,
+                        already_fp8=False,
+                        flipped=True,
+                    ),
+                ),
+            ),
+            HFParamDecl(
+                name=_n("e13_s"),
+                hf_name=f"{p}experts.w13_weight_scale_inv",
+                shape=(E, 2 * inter_dim),
+                hf_shape=(E, 2 * inter_dim),
+                dtype=F32,
+                transform=ParamTransform(
+                    scale_for=_n("e13"),
+                    shard_axis=shard_e13,
+                    expert_axis=0,
+                ),
+            ),
+        ]
+        if is_nvfp4
+        else [
+            *_exp_gu_pair("e_gate_proj", "gate_proj", 0, e13_alias),
+            *_exp_gu_pair("e_up_proj", "up_proj", 1),
+        ]
+    )
+    e2_decl = (
+        HFParamDecl(
+            name=_n("e2"),
+            hf_name=f"{p}experts.down_proj.weight",
+            shape=(E, inter_dim // 2, e2_raw_n),
+            hf_shape=(E, inter_dim // 2, e2_raw_n),
+            dtype=U8,
+            transform=ParamTransform(
+                shard_axis=shard_e2,
+                expert_axis=0,
+            ),
+            vllm_aliases=(
+                VLLMAlias(
+                    source=f"{p}experts.w2_weight",
+                    targets=(_n("e2"),),
+                    scale_targets=(_n("e2_s"),),
+                    scale_source=f"{p}experts.w2_weight_scale",
+                    shard_axis=shard_e2,
+                    already_sharded=True,
+                    already_fp8=False,
+                    flipped=True,
+                ),
+            ),
+        )
+        if is_nvfp4
+        else HFParamDecl(
+            name=_n("e2"),
+            hf_name=f"{p}experts.down_proj.weight",
+            shape=(E, inter_dim, H),
+            hf_shape=(E, H, inter_dim),
+            dtype=FP8,
+            transform=ParamTransform(
+                transpose=(0, 2, 1),
+                quantize="fp8",
+                shard_axis=shard_e2,
+                expert_axis=0,
+            ),
+            vllm_aliases=(
+                VLLMAlias(
+                    source=f"{p}experts.w2_weight",
+                    targets=(_n("e2"),),
+                    scale_targets=(_n("e2_s"),),
+                    scale_source=f"{p}experts.w2_weight_scale",
+                    shard_axis=1,
+                    already_sharded=True,
+                    already_fp8=True,
+                    flipped=True,
+                ),
+            ),
+        )
+    )
     decls.extend(
         [
             *_sh_gu_pair("sh_gate_proj", "gate_proj", 0, sh_gu_alias),
@@ -366,33 +482,8 @@ def moe_hf_params(
                     small_field="sh2_s",
                 ),
             ),
-            *_exp_gu_pair("e_gate_proj", "gate_proj", 0, e13_alias),
-            *_exp_gu_pair("e_up_proj", "up_proj", 1),
-            HFParamDecl(
-                name=_n("e2"),
-                hf_name=f"{p}experts.down_proj.weight",
-                shape=(E, inter_dim, H),
-                hf_shape=(E, H, inter_dim),
-                dtype=FP8,
-                transform=ParamTransform(
-                    transpose=(0, 2, 1),
-                    quantize="fp8",
-                    shard_axis=shard_e2,
-                    expert_axis=0,
-                ),
-                vllm_aliases=(
-                    VLLMAlias(
-                        source=f"{p}experts.w2_weight",
-                        targets=(_n("e2"),),
-                        scale_targets=(_n("e2_s"),),
-                        scale_source=f"{p}experts.w2_weight_scale",
-                        shard_axis=1,
-                        already_sharded=True,
-                        already_fp8=True,
-                        flipped=True,
-                    ),
-                ),
-            ),
+            *e13_decls,
+            e2_decl,
             HFParamDecl(
                 name=_n("e2_s"),
                 hf_name=f"{p}experts.down_proj.weight_scale_inv",

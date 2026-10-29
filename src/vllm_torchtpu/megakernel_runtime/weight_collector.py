@@ -40,8 +40,9 @@ import torch.nn.functional as F
 
 from vllm_torchtpu.megakernel import planner
 from vllm_torchtpu.megakernel.decls import HFParamDecl, VLLMAlias
+from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
-from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, I32
+from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, I32, U8, rup
 from vllm_torchtpu.megakernel.weights import (
     ArrayOps,
     load_weights,
@@ -57,6 +58,7 @@ _TORCH_DTYPE_MAP: dict[Any, torch.dtype] = {
     jnp.dtype(BF16): torch.bfloat16,
     jnp.dtype(F32): torch.float32,
     jnp.dtype(I32): torch.int32,
+    jnp.dtype(U8): torch.uint8,
 }
 
 
@@ -388,16 +390,40 @@ class VLLMWeightSource:
                 "expert weights must be contiguous for zero-copy views",
             )
             s_raw = self._read_scale(layer, proj_obj, alias)
-            _need(s_raw is not None, f"Expert weight {alias.source!r} missing scale")
-            assert s_raw is not None
-            exp_e, exp_n = int(w.shape[0]), int(w.shape[-1])
-            _need(
-                s_raw.numel() == exp_e * exp_n,
-                f"Expert scale for {alias.source!r} has shape {tuple(s_raw.shape)} "
-                f"({s_raw.numel()} elems), expected ({exp_e}, {exp_n})",
+            leaf_name = alias.source.rsplit(".", 1)[-1]
+            is_nvfp4 = (
+                jnp.dtype(d0.dtype) == jnp.dtype(U8)
+                or getattr(proj_obj, f"{leaf_name}_scale_2", None) is not None
             )
-            s_buf = s_raw.float().reshape(exp_e, exp_n).contiguous()
-            w_buf = w
+            if is_nvfp4:
+                ew = int(w.shape[0])
+                k_dim = int(d0.shape[1]) * 2
+                s_decl = scale_decls[alias.scale_targets[0]]
+                _, n_dim = target_axis_widths(s_decl, R, -1)
+                w_buf, pre_fused = _pack_nvfp4_w(
+                    w, s_raw, ew, k_dim, n_dim, name=leaf_name
+                )
+                s_buf = _extract_nvfp4_global_scale(
+                    proj_obj,
+                    s_raw,
+                    ew=ew,
+                    n_dim=n_dim,
+                    pre_fused=pre_fused,
+                    name=leaf_name,
+                )
+            else:
+                _need(
+                    s_raw is not None, f"Expert weight {alias.source!r} missing scale"
+                )
+                assert s_raw is not None
+                exp_e, exp_n = int(w.shape[0]), int(w.shape[-1])
+                _need(
+                    s_raw.numel() == exp_e * exp_n,
+                    f"Expert scale for {alias.source!r} has shape {tuple(s_raw.shape)} "
+                    f"({s_raw.numel()} elems), expected ({exp_e}, {exp_n})",
+                )
+                s_buf = s_raw.float().reshape(exp_e, exp_n).contiguous()
+                w_buf = w
         elif len(target_decls) == 1 and len(d0.shape) == 1:
             w_buf = w.reshape(-1)
         elif w.ndim == 2 and not d0.transform.flatten_tail:
@@ -509,6 +535,188 @@ def load_vllm_weights(
         tp_rank=tp_rank,
         expert_placement=expert_placement,
     )
+
+
+_NVFP4_STOCK_MSG = (
+    "(stock process_weights_after_loading already requantized; see unit B)"
+)
+
+
+def _pack_nvfp4_w(
+    w_raw: torch.Tensor | None,
+    bscale_raw: torch.Tensor | None,
+    ew: int,
+    k_dim: int,
+    n_dim: int,
+    *,
+    name: str,
+) -> tuple[torch.Tensor, bool]:
+    """Pack raw uint8 NVFP4 weights and block scales into `[ew, K // 2, n_raw]`."""
+    k_half = k_dim // 2
+    n_raw = n_dim + rup(n_dim // 8, 128)
+    if w_raw is None or w_raw.dtype != torch.uint8:
+        got_w = None if w_raw is None else (tuple(w_raw.shape), w_raw.dtype)
+        raise MegakernelConfigError(
+            f"{name}: expected raw torch.uint8 weight tensor, "
+            f"got {got_w} {_NVFP4_STOCK_MSG}"
+        )
+    w_u8 = w_raw.data
+    if tuple(w_u8.shape) == (ew, k_half, n_raw):
+        return w_u8.contiguous(), True
+    if tuple(w_u8.shape) == (ew, n_dim, k_half):
+        w_kn = w_u8.transpose(1, 2).contiguous()
+    elif tuple(w_u8.shape) == (ew, k_half, n_dim):
+        w_kn = w_u8.contiguous()
+    else:
+        raise MegakernelConfigError(
+            f"{name}: expected raw uint8 shape {(ew, n_dim, k_half)} or "
+            f"{(ew, k_half, n_dim)}, got {tuple(w_u8.shape)} {_NVFP4_STOCK_MSG}"
+        )
+    if bscale_raw is None or bscale_raw.dtype not in (
+        torch.uint8,
+        torch.float8_e4m3fn,
+    ):
+        got_bs = (
+            None if bscale_raw is None else (tuple(bscale_raw.shape), bscale_raw.dtype)
+        )
+        raise MegakernelConfigError(
+            f"{name}_scale: expected raw uint8 or float8_e4m3fn "
+            f"block scale, got {got_bs} {_NVFP4_STOCK_MSG}"
+        )
+    bs_u8 = bscale_raw.data.view(torch.uint8)
+    if tuple(bs_u8.shape) == (ew, n_dim, k_dim // 16):
+        bs_kn = bs_u8.transpose(1, 2).contiguous()
+    elif tuple(bs_u8.shape) == (ew, k_dim // 16, n_dim):
+        bs_kn = bs_u8.contiguous()
+    else:
+        raise MegakernelConfigError(
+            f"{name}_scale: expected raw block scale shape "
+            f"{(ew, n_dim, k_dim // 16)} or {(ew, k_dim // 16, n_dim)}, "
+            f"got {tuple(bs_u8.shape)} {_NVFP4_STOCK_MSG}"
+        )
+    bs_cols = bs_kn.reshape(ew, k_half, n_dim // 8)
+    pad_cols = n_raw - n_dim - (n_dim // 8)
+    parts = [w_kn, bs_cols]
+    if pad_cols > 0:
+        parts.append(
+            torch.zeros(
+                (ew, k_half, pad_cols),
+                dtype=torch.uint8,
+                device=w_u8.device,
+            )
+        )
+    return _own(torch.cat(parts, dim=-1)), False
+
+
+def _extract_nvfp4_global_scale(
+    proj_obj: Any,
+    bscale_raw: torch.Tensor | None,
+    *,
+    ew: int,
+    n_dim: int,
+    pre_fused: bool,
+    name: str,
+) -> torch.Tensor:
+    gscale = getattr(proj_obj, f"{name}_scale_2", None)
+    if not pre_fused and gscale is None:
+        raise MegakernelConfigError(
+            "w13_weight_scale_2 and w2_weight_scale_2 must be present for raw "
+            f"NVFP4 packing {_NVFP4_STOCK_MSG}"
+        )
+    if gscale is not None:
+        if not gscale.is_floating_point() or gscale.numel() not in (ew, ew * n_dim):
+            raise MegakernelConfigError(
+                f"{name}_scale_2: expected float tensor of {ew} elements, "
+                f"got shape {tuple(gscale.shape)} and dtype {gscale.dtype} "
+                f"{_NVFP4_STOCK_MSG}"
+            )
+        return gscale.data.float().reshape(ew, -1).expand(ew, n_dim).contiguous()
+    _need(bscale_raw is not None, f"Expert weight {name!r} missing scale")
+    assert bscale_raw is not None
+    return bscale_raw.data.float().reshape(ew, n_dim).contiguous()
+
+
+def pack_expert_views_layer(
+    mlp: Any,
+    g: Any,
+    ex: ExecSpec,
+    tk_e13: int,
+    tk_e2: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Extract per-layer routed expert weights (`e13`, `e2`) and scales (`es_mk`)."""
+    experts = get_routed_experts(mlp)
+    w13 = experts.w13_weight
+    w2 = experts.w2_weight
+    ew = g.EW(ex.R)
+    ir = g.IR(ex.R)
+    _need(
+        int(w13.shape[0]) == ew,
+        f"experts.w13_weight.shape[0]={w13.shape[0]} != EW={ew}",
+    )
+    _need(
+        w13.is_contiguous() and w2.is_contiguous(),
+        "expert weights must be contiguous for zero-copy views",
+    )
+
+    is_nvfp4 = (
+        str(getattr(g, "expert_quant", "fp8")) == "nvfp4"
+        or getattr(experts, "w13_weight_scale_2", None) is not None
+    )
+    if is_nvfp4:
+        b13_raw = getattr(experts, "w13_weight_scale", None)
+        b2_raw = getattr(experts, "w2_weight_scale", None)
+        e13_fused, pre13 = _pack_nvfp4_w(
+            w13, b13_raw, ew, g.H, 2 * ir, name="w13_weight"
+        )
+        e2_fused, pre2 = _pack_nvfp4_w(w2, b2_raw, ew, ir, g.H, name="w2_weight")
+        if not ex.stack_e:
+            e13_view, e2_view = e13_fused, e2_fused
+        else:
+            k13_half, n13_raw = int(e13_fused.shape[1]), int(e13_fused.shape[2])
+            k2_half, n2_raw = int(e2_fused.shape[1]), int(e2_fused.shape[2])
+            e13_view = e13_fused.view(ew, k13_half // tk_e13, tk_e13, n13_raw)
+            e2_view = e2_fused.view(ew, k2_half // tk_e2, tk_e2, n2_raw)
+        s13 = _extract_nvfp4_global_scale(
+            experts,
+            b13_raw,
+            ew=ew,
+            n_dim=2 * ir,
+            pre_fused=pre13 and pre2,
+            name="w13_weight",
+        )
+        s2 = _extract_nvfp4_global_scale(
+            experts,
+            b2_raw,
+            ew=ew,
+            n_dim=g.H,
+            pre_fused=pre13 and pre2,
+            name="w2_weight",
+        )
+    else:
+        if not ex.stack_e:
+            e13_view = w13
+            e2_view = w2
+        else:
+            t13 = g.H // tk_e13
+            t2 = ir // tk_e2
+            e13_view = w13.view(ew, t13, tk_e13, 2 * ir)
+            e2_view = w2.view(ew, t2, tk_e2, g.H)
+        _need(
+            e13_view.data_ptr() == w13.data_ptr()
+            and e2_view.data_ptr() == w2.data_ptr(),
+            "expert views must share storage with w13_weight / w2_weight",
+        )
+        s13_raw = getattr(experts, "w13_weight_scale_inv", None)
+        if s13_raw is None:
+            s13_raw = experts.w13_weight_scale
+        s2_raw = getattr(experts, "w2_weight_scale_inv", None)
+        if s2_raw is None:
+            s2_raw = experts.w2_weight_scale
+        s13 = s13_raw.data.float().reshape(ew, 2 * ir)
+        s2 = s2_raw.data.float().reshape(ew, g.H)
+    es_cat = torch.cat([s13, s2], dim=-1).contiguous()
+    es_mk = es_cat.unsqueeze(1).contiguous()
+    return e13_view, e2_view, es_mk
 
 
 def reshard_experts_ep_to_tp_local(

@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -63,6 +64,7 @@ class MoEParams:
     eps: float
     zero_centered_norm: bool
     sh_rep: int = 1
+    expert_quant: str = "fp8"
 
 
 @dataclass(frozen=True)
@@ -126,6 +128,7 @@ def derive_moe_params(
     moe_tp: bool,
     e_slots: int,
     module_name: str = "moe",
+    expert_quant: str = "fp8",
 ) -> MoEParams:
     """Resolve `MoEParams` from model geometry, `ExecSpec`, and `StreamPlan`."""
     tiles = ex.resolve_tiles(g)
@@ -201,4 +204,22 @@ def derive_moe_params(
         eps=g.eps,
         zero_centered_norm=bool(getattr(g, "zero_centered_norm", True)),
         sh_rep=sh_rep,
+        expert_quant=str(expert_quant),
     )
+
+
+def resolve_expert_quant(
+    hf_config: Any, merged: Mapping[str, Any], explicit: Any, default: str
+) -> str:
+    """Routed-expert quant: explicit option, or `nvfp4` for HF `NVFP4`."""
+    qcfg = merged.get("quantization_config")
+    if not isinstance(qcfg, Mapping) and isinstance(hf_config, Mapping):
+        qcfg = hf_config.get("quantization_config")
+    algo = (
+        str(qcfg.get("quant_algo", "")).strip().upper()
+        if isinstance(qcfg, Mapping)
+        else ""
+    )
+    if explicit is not None:
+        return str(explicit)
+    return "nvfp4" if algo == "NVFP4" else str(default)
