@@ -65,13 +65,21 @@ def shifted_post_pre_rms(
     constrain_activations_to_hbm: bool = True,
     norm_weight: jax.Array | None = None,
     norm_eps: float = 1e-06,
+    fused_gates: bool = True,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Update residuals and collapse with incoming pre; predict gates separately.
+    """Update residuals and collapse with incoming pre; predict next gates.
 
     TPU7x: M=4, D=5120, positive local T divisible by 32.
     Activations are BF16; gates are FP32. Weight is packed BF16 [20480,128].
     Three-component mixing and BF16 residual/collapse rounding are retained;
     streamed square sums change the reference reduction order.
+
+    With ``fused_gates`` the gate tensors are token-major (``[T,M]`` /
+    ``[T,M,M]``) at both ends: the previous seam's output feeds this seam's
+    input unchanged, the gate math runs on the tile kernel's tail, and the seam
+    costs one Pallas launch and no layout hop.  ``fused_gates=False`` keeps the
+    two-launch path for A/B and as an escape hatch; both paths are bitwise
+    identical.
 
     Returns:
         (residual [T,M*D], next_post [T,M,1], next_comb [T,M,M],
@@ -384,6 +392,32 @@ def shifted_post_pre_rms(
                 copy.wait()
         store_projection(projection_buf[...], num_tiles - 1)
 
+    if fused_gates:
+        return _fused_gates_call(
+            x,
+            flat,
+            post.reshape(t, m),
+            comb,
+            weight,
+            pre,
+            scale,
+            base,
+            tuple(norm_args),
+            norm_weight,
+            t=t,
+            d=d,
+            m=m,
+            width=width,
+            tuning=tuning,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_pre_eps,
+            hc_sinkhorn_eps=hc_sinkhorn_eps,
+            hc_post_mult_value=hc_post_mult_value,
+            sinkhorn_repeat=sinkhorn_repeat,
+            norm_eps=norm_eps,
+            constrain_activations_to_hbm=constrain_activations_to_hbm,
+        )
+
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     gate_args = (post.reshape(t, m).T, comb.transpose(1, 2, 0), pre.T)
     if gate_input_mode == GateInputMode.HBM:
@@ -541,3 +575,413 @@ def _pre_gates(
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
     )(mix, square, scale, base)
     return (pre.T, post.T, comb.transpose(2, 0, 1))
+
+
+def _fused_gates_call(
+    x: jax.Array,
+    flat: jax.Array,
+    post: jax.Array,
+    comb: jax.Array,
+    weight: jax.Array,
+    pre: jax.Array,
+    scale: jax.Array,
+    base: jax.Array,
+    norm_args: tuple[jax.Array, ...],
+    norm_weight: jax.Array | None,
+    *,
+    t: int,
+    d: int,
+    m: int,
+    width: int,
+    tuning: PostPreTuning,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    norm_eps: float,
+    constrain_activations_to_hbm: bool,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """One Pallas launch: activation tile loop plus the gate epilogue.
+
+    The gate tensors stay token-major (``[T,M]`` / ``[T,M,M]``) from the
+    producing seam's store to the consuming seam's load, so the seam needs no
+    boundary transpose and no second kernel launch.  Arithmetic is unchanged:
+    the epilogue evaluates the same expression as ``_pre_gates`` on 128-column
+    slices of the fully materialized ``[mixes, gate_tokens]`` logits.  Every
+    reduction there is over ``M`` or per column, so splitting the column axis
+    cannot reorder a sum.
+    """
+    tile, group, columns = (
+        tuning.token_tile,
+        tuning.mix_group,
+        tuning.collapse_columns,
+    )
+    num_tiles = t // tile
+    input_buffers = min(3, num_tiles)
+    output_buffers = min(2, num_tiles)
+    early_output = num_tiles <= input_buffers
+    parts = 3
+    mixes = m * (m + 2)
+    gate_tokens = (t + 127) // 128 * 128
+    gate_block = 128
+    assert gate_tokens % gate_block == 0 and gate_tokens >= gate_block
+
+    def kernel(
+        xh,
+        rh,
+        poh,
+        ch,
+        ph,
+        wh,
+        scr,
+        br,
+        norm_refs,
+        gpre,
+        gpost,
+        gcomb,
+        yh,
+        vh,
+        output_y,
+        output_v,
+        output_sems,
+        input_x,
+        input_residual,
+        input_sems,
+        gate_scratch,
+        norm_weight_scratch,
+        wr,
+        coeff,
+        acts,
+        sbuf,
+        norm_square,
+        sems,
+        mh,
+        sh,
+        projection_buf,
+    ):
+        por, cr, pr = gate_scratch
+        copy_pairs = [(poh, por), (ch, cr), (ph, pr), (wh, wr)]
+        norm_work_refs = norm_refs
+        if norm_weight is not None:
+            copy_pairs.insert(-1, (norm_refs[0], norm_weight_scratch[0]))
+            norm_work_refs = norm_weight_scratch
+        copies = [
+            pltpu.make_async_copy(src, dst, sems.at[i])
+            for i, (src, dst) in enumerate(copy_pairs)
+        ]
+        for copy in copies[:-1]:
+            copy.start()
+
+        # Token-major gate windows are plain row slices: no lane rotation.
+        def load_post(ref, tile_index):
+            return ref[pl.ds(tile_index * tile, tile), :]
+
+        def load_comb(ref, tile_index):
+            return ref[pl.ds(tile_index * tile, tile), :, :]
+
+        def prepare(tile_index, slot):
+            # Map tokens to block diagonals; accumulate BF16 parts low to high.
+            post_tile = load_post(por, tile_index)
+            comb_tile = load_comb(cr, tile_index)
+            for ri in range(tile // group):
+                diagonal = jnp.eye(group, dtype=jnp.float32)
+
+                p = post_tile[ri * group : (ri + 1) * group, :]
+                c = comb_tile[ri * group : (ri + 1) * group, :, :]
+                cf = jnp.concatenate(
+                    [
+                        jnp.concatenate(
+                            [p[:, j : j + 1] * diagonal]
+                            + [c[:, i, j : j + 1] * diagonal for i in range(m)],
+                            axis=1,
+                        )
+                        for j in range(m)
+                    ],
+                    axis=0,
+                )
+                pieces = []
+                for part in range(parts):
+                    bf = cf.astype(jnp.bfloat16)
+                    pieces.append(bf)
+                    cf = cf - bf.astype(jnp.float32)
+                coeff[slot, ri, :, :] = jnp.concatenate(pieces[::-1], axis=1)
+
+        def finish_projection(projected):
+            pt = projected.T
+            return pt[:mixes] + pt[mixes : 2 * mixes] + pt[2 * mixes : 3 * mixes]
+
+        def store_vector(values, output, start):
+            if tile % 128 == 0:
+                output[:, pl.ds(start, tile)] = values
+                return
+            # Preserve adjacent tiles when this write crosses a lane window.
+            block = start // 128 * 128
+            offset = start % 128
+            pair = jnp.pad(values, ((0, 0), (0, 256 - tile)))
+            positioned = pltpu.roll(pair, offset, axis=1)
+            lane = jnp.arange(128)
+            mask = (lane >= offset) & (lane < offset + tile)
+            output[:, pl.ds(block, 128)] = jnp.where(
+                mask[None, :], positioned[:, :128], output[:, pl.ds(block, 128)]
+            )
+
+            @pl.when(offset + tile > 128)
+            def second():
+                mask = lane + 128 < offset + tile
+                output[:, pl.ds(block + 128, 128)] = jnp.where(
+                    mask[None, :],
+                    positioned[:, 128:],
+                    output[:, pl.ds(block + 128, 128)],
+                )
+
+        def store_projection(projected, tile_index):
+            store_vector(finish_projection(projected), mh, tile_index * tile)
+
+        if tile % 128 != 0:
+            mh[...] = jnp.zeros((mixes, gate_tokens), jnp.float32)
+            sh[...] = jnp.zeros((1, gate_tokens), jnp.float32)
+        projection_buf[...] = jnp.zeros((tile, 128), dtype=jnp.float32)
+
+        def input_copies(tile_index):
+            slot = tile_index % input_buffers
+            rows = pl.ds(tile_index * tile, tile)
+            return (
+                pltpu.make_async_copy(
+                    xh.at[rows, :], input_x.at[slot], input_sems.at[slot, 0]
+                ),
+                pltpu.make_async_copy(
+                    rh.at[rows, :], input_residual.at[slot], input_sems.at[slot, 1]
+                ),
+            )
+
+        def output_copy(tile_index, component):
+            slot = tile_index % output_buffers
+            rows = pl.ds(tile_index * tile, tile)
+            source = (output_y, output_v)[component]
+            target = (yh, vh)[component]
+            return pltpu.make_async_copy(
+                source.at[slot], target.at[rows, :], output_sems.at[slot, component]
+            )
+
+        def output_copies(tile_index):
+            return tuple(output_copy(tile_index, component) for component in range(2))
+
+        def run_tile(tile_index, xr, rr, yr, vr):
+            previous_projected = projection_buf[...]
+
+            @pl.when(tile_index == 0)
+            def wait_gates():
+                for copy in copies[:-1]:
+                    copy.wait()
+                prepare(0, 0)
+
+            pre_tile = load_post(pr, tile_index)
+            slot = tile_index % 2
+            for ri in range(tile // group):
+                r = pl.ds(ri * group, group)
+                acts[:group, :] = xr[r, :]
+                for i in range(m):
+                    acts[pl.ds((i + 1) * group, group), :] = rr[r, pl.ds(i * d, d)]
+                # Accumulate squares from the rounded residual in column order.
+                residual_squares = jnp.zeros((group, 128), jnp.float32)
+                c = jnp.pad(
+                    coeff[slot, ri, :, :], ((0, 0), (0, -parts * (m + 1) * group % 256))
+                )
+                value_squares = jnp.zeros((group, 128), jnp.float32)
+                for ec in range(d // columns):
+                    cs = pl.ds(ec * columns, columns)
+                    a = acts[:, cs]
+                    rhs = jnp.pad(
+                        jnp.concatenate([a] * parts, axis=0),
+                        ((0, -parts * (m + 1) * group % 256), (0, 0)),
+                    )
+                    result = jax.lax.dot(
+                        c, rhs, preferred_element_type=jnp.float32
+                    ).astype(jnp.bfloat16)
+                    for j in range(m):
+                        yr[r, pl.ds(j * d + ec * columns, columns)] = result[
+                            j * group : (j + 1) * group, :
+                        ]
+                    terms = []
+                    for j in range(m):
+                        bf = result[j * group : (j + 1) * group, :]
+                        for k in range(columns // 128):
+                            q = bf[:, k * 128 : (k + 1) * 128].astype(jnp.float32)
+                            residual_squares = residual_squares + q * q
+                        terms.append(
+                            pre_tile[ri * group : (ri + 1) * group, j : j + 1]
+                            * bf.astype(jnp.float32)
+                        )
+                    value_bf16 = functools.reduce(jnp.add, terms).astype(jnp.bfloat16)
+                    vr[r, pl.ds(ec * columns, columns)] = value_bf16
+                    if norm_weight is not None:
+                        value_f32 = value_bf16.astype(jnp.float32)
+                        for lane_group in range(columns // 128):
+                            chunk = value_f32[
+                                :, lane_group * 128 : (lane_group + 1) * 128
+                            ]
+                            value_squares = value_squares + chunk * chunk
+                if norm_weight is not None:
+                    norm_square[0][r, :] = jnp.sum(value_squares, axis=1, keepdims=True)
+                sbuf[r, :] = jnp.sum(residual_squares, axis=1, keepdims=True)
+                if norm_weight is not None:
+                    _rms_norm_inplace(
+                        vr.at[pl.ds(ri * group, group), :],
+                        norm_work_refs[0],
+                        norm_square[0][pl.ds(ri * group, group), :],
+                        columns=columns,
+                        eps=norm_eps,
+                    )
+            if early_output:
+                output_copy(tile_index, 0).start()
+                output_copy(tile_index, 1).start()
+            prepare(
+                jnp.minimum(tile_index + 1, num_tiles - 1),
+                (tile_index + 1) % 2,
+            )
+
+            @pl.when(tile_index == 0)
+            def wait_weight():
+                copies[-1].wait()
+
+            projection_buf[...] = jax.lax.dot(
+                yr[...], wr[...], preferred_element_type=jnp.float32
+            )
+            store_projection(previous_projected, jnp.maximum(tile_index - 1, 0))
+            store_vector(sbuf[...].T, sh, tile_index * tile)
+
+        for index in range(input_buffers):
+            for copy in input_copies(index):
+                copy.start()
+            if index == 0:
+                copies[-1].start()
+
+        def body(tile_index, unused):
+            for copy in input_copies(tile_index):
+                copy.wait()
+            if num_tiles > output_buffers:
+
+                @pl.when(tile_index >= output_buffers)
+                def wait_output_slot():
+                    for copy in output_copies(tile_index - output_buffers):
+                        copy.wait()
+
+            slot = tile_index % input_buffers
+            output_slot = tile_index % output_buffers
+            run_tile(
+                tile_index,
+                input_x.at[slot],
+                input_residual.at[slot],
+                output_y.at[output_slot],
+                output_v.at[output_slot],
+            )
+            if not early_output:
+                for copy in output_copies(tile_index):
+                    copy.start()
+            if num_tiles > input_buffers:
+
+                @pl.when(tile_index + input_buffers < num_tiles)
+                def prefetch():
+                    for copy in input_copies(tile_index + input_buffers):
+                        copy.start()
+
+            return unused
+
+        jax.lax.fori_loop(0, num_tiles, body, None)
+        for index in range(num_tiles - output_buffers, num_tiles):
+            for copy in output_copies(index):
+                copy.wait()
+        store_projection(projection_buf[...], num_tiles - 1)
+
+        # Gate epilogue: same expression as `_pre_gates`, on column slices.
+        for gc in range(gate_tokens // gate_block):
+            block_start = gc * gate_block
+            rows = min(gate_block, t - block_start)
+            cs = pl.ds(block_start, gate_block)
+            mixed = mh[:, cs] * jax.lax.rsqrt(sh[:, cs] / (m * d) + rms_eps)
+            scales = scr[...][:, None]
+            bias = br[...][:, None]
+            pre_logits = mixed[:m, :] * scales[:1, :] + bias[:m, :]
+            pre_mix = jax.nn.sigmoid(pre_logits) + hc_pre_eps
+            post_logits = mixed[m : 2 * m, :] * scales[1:2, :] + bias[m : 2 * m, :]
+            post_mix = jax.nn.sigmoid(post_logits) * hc_post_mult_value
+            comb_logits = (
+                mixed[2 * m :, :] * scales[2:3, :] + bias[2 * m :, :]
+            ).reshape(m, m, gate_block)
+            comb_mix = jax.nn.softmax(comb_logits, axis=1) + hc_sinkhorn_eps
+            comb_mix = comb_mix / (
+                jnp.sum(comb_mix, axis=0, keepdims=True) + hc_sinkhorn_eps
+            )
+            for _ in range(sinkhorn_repeat - 1):
+                comb_mix = comb_mix / (
+                    jnp.sum(comb_mix, axis=1, keepdims=True) + hc_sinkhorn_eps
+                )
+                comb_mix = comb_mix / (
+                    jnp.sum(comb_mix, axis=0, keepdims=True) + hc_sinkhorn_eps
+                )
+            gpre[pl.ds(block_start, rows), :] = jnp.transpose(pre_mix[:, :rows])
+            gpost[pl.ds(block_start, rows), :] = jnp.transpose(post_mix[:, :rows])
+            gcomb[pl.ds(block_start, rows), :, :] = jnp.transpose(
+                comb_mix[:, :, :rows], (2, 0, 1)
+            )
+
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+
+    def hbm_arg(arg):
+        return (
+            pltpu.with_memory_space_constraint(arg, pltpu.HBM)
+            if constrain_activations_to_hbm
+            else arg
+        )
+
+    gpre, gpost, gcomb, residual, value = pl.pallas_call(
+        kernel,
+        in_specs=[hbm] * 6
+        + [pl.BlockSpec(memory_space=pltpu.VMEM)] * 2
+        + [tuple(pl.BlockSpec(memory_space=pltpu.HBM) for _ in norm_args)],
+        out_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * 3 + [hbm] * 2,
+        out_shape=[
+            jax.ShapeDtypeStruct((t, m), jnp.float32),
+            jax.ShapeDtypeStruct((t, m), jnp.float32),
+            jax.ShapeDtypeStruct((t, m, m), jnp.float32),
+            jax.ShapeDtypeStruct((t, width), flat.dtype),
+            jax.ShapeDtypeStruct((t, d), flat.dtype),
+        ],
+        scratch_shapes=[
+            pltpu.VMEM((output_buffers, tile, width), jnp.bfloat16),
+            pltpu.VMEM((output_buffers, tile, d), jnp.bfloat16),
+            pltpu.SemaphoreType.DMA((output_buffers, 2)),
+            pltpu.VMEM((input_buffers, tile, d), jnp.bfloat16),
+            pltpu.VMEM((input_buffers, tile, width), jnp.bfloat16),
+            pltpu.SemaphoreType.DMA((input_buffers, 2)),
+            tuple(pltpu.VMEM(arg.shape, arg.dtype) for arg in (post, comb, pre)),
+            tuple(pltpu.VMEM(arg.shape, arg.dtype) for arg in norm_args),
+            pltpu.VMEM(weight.shape, weight.dtype),
+            pltpu.VMEM(
+                (2, tile // group, m * group, parts * (m + 1) * group), jnp.bfloat16
+            ),
+            pltpu.VMEM(((m + 1) * group, d), jnp.bfloat16),
+            pltpu.VMEM((tile, 1), jnp.float32),
+            (pltpu.VMEM((tile, 1), jnp.float32),) if norm_weight is not None else (),
+            pltpu.SemaphoreType.DMA((4 + int(norm_weight is not None),)),
+            pltpu.VMEM((mixes, gate_tokens), jnp.float32),
+            pltpu.VMEM((1, gate_tokens), jnp.float32),
+            pltpu.VMEM((tile, 128), jnp.float32),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=tuning.vmem_limit_bytes,
+            allow_input_fusion=(False,) * (8 + len(norm_args)),
+        ),
+    )(
+        hbm_arg(x),
+        hbm_arg(flat),
+        hbm_arg(post),
+        hbm_arg(comb),
+        hbm_arg(pre),
+        hbm_arg(weight),
+        scale,
+        base,
+        tuple(pltpu.with_memory_space_constraint(arg, pltpu.HBM) for arg in norm_args),
+    )
+    return (residual, gpost[:, :, None], gcomb, value, gpre)
