@@ -144,12 +144,7 @@ def test_f32_conv_pooled_step_matches_reference_and_keeps_conv_exact(T: int, B: 
 
 def _with_f32_in_kernel_backend(spec):
     lay = replace(spec.cache_backend.layout, conv_dtype=jnp.float32)
-    pb = spec.cache_backend.with_layout(lay)
-    pb = replace(
-        pb,
-        supports_fused_io=True,
-        can_pool_gather=lambda ex_p: ex_p.T > 1,
-    )
+    pb = replace(spec.cache_backend.with_layout(lay), supports_fused_io=True)
     return replace(spec, cache_backend=pb), lay
 
 
@@ -229,9 +224,7 @@ def test_f32_conv_fused_matches_split_bitwise(T: int, wide_qkv: bool):
         mesh, spec_f32, ex_fused, donate=True, fused_pool_io=True
     )
     assert info_fused["use_fused"]
-    hid_fused, raw_fused = step_fused(
-        pos, hid_mk, w_mk, raw_fused_in, pt, ckpt, roff
-    )
+    hid_fused, raw_fused = step_fused(pos, hid_mk, w_mk, raw_fused_in, pt, ckpt, roff)
     st_fused = pool.pool_to_states(lay, ex_split, raw_fused, pt, ckpt)
 
     raw_cs_in = tuple(jax.device_put(np.asarray(r).copy(), tp) for r in raw_init)
@@ -327,6 +320,8 @@ def test_f32_conv_gpr_matches_split_bitwise(wide_qkv: bool):
         mesh, spec_f32, ex_gpr, donate=False, fused_pool_io=False
     )
     assert info_gpr["use_gpr"]
+    assert info_gpr["oshape"]["conv_ckpt"][1] == jnp.float32
+    assert info_gpr["plan"].output_decls["conv_ckpt"].dtype == jnp.float32
     gdn_rows = info_gpr["plan"].module_params["gdn"].GCONV_ROWS
     assert gdn_rows == (96 if wide_qkv else 32)
     hid_gpr, raw_gpr = step_gpr(pos, hid_mk, w_mk, raw_init, pt, ckpt, roff)
@@ -341,6 +336,147 @@ def test_f32_conv_gpr_matches_split_bitwise(wide_qkv: bool):
     assert not np.array_equal(
         conv_out, np.asarray(st_gpr["conv"].astype(jnp.bfloat16), np.float32)
     )
+
+
+def _poison_stale_conv_rows(
+    raw_pools: list[jax.Array] | tuple[jax.Array, ...],
+    lay: pool.PoolLayout,
+    ckpt: jax.Array,
+    tp: NamedSharding,
+    *,
+    live_rows: int = 36,
+) -> tuple[jax.Array, ...]:
+    """Fill u32 rows `live_rows..127` of each conv page with `0xFF` (`f32` NaN)."""
+    ckpt_np = np.asarray(ckpt)
+    if ckpt_np.ndim == 4:
+        ckpt_np = ckpt_np[0]
+    ndim = ckpt_np.ndim
+    conv_pages: set[int] = set()
+    if ndim == 3:
+        for sub in range(ckpt_np.shape[0]):
+            for slot in np.unique(ckpt_np[sub]):
+                if int(slot) >= 0:
+                    conv_pages.add(
+                        int(lay.page_base(int(slot), sub, 3)) + lay.conv_page
+                    )
+    else:
+        for slot in np.unique(ckpt_np):
+            if int(slot) >= 0:
+                for sub in range(lay.slots_per_pool):
+                    conv_pages.add(
+                        int(lay.page_base(int(slot), sub, 2)) + lay.conv_page
+                    )
+    assert conv_pages
+    r_cnt = len(tp.device_set)
+    out = []
+    for r in raw_pools:
+        np_pages = r.shape[0] // r_cnt
+        arr_u8 = (
+            np.asarray(r).view(np.uint8).copy().reshape(r_cnt, np_pages, *r.shape[1:])
+        )
+        for pb in conv_pages:
+            # Rows live_rows..63 live in the K half (0); rows 64..127 in V half (1).
+            arr_u8[:, pb, 0, live_rows:64, :, :] = 0xFF
+            arr_u8[:, pb, 1, 0:64, :, :] = 0xFF
+            assert np.isnan(arr_u8[:, pb, 0, live_rows:64].view(np.float32)).all()
+            assert np.isnan(arr_u8[:, pb, 1, 0:64].view(np.float32)).all()
+        out.append(jax.device_put(arr_u8.reshape(r.shape).view(r.dtype), tp))
+    return tuple(out)
+
+
+@pytest.mark.parametrize("T", [1, 4])
+def test_f32_conv_ignores_poisoned_stale_rows_36_to_127(T: int):
+    """Main's stock GDN kernel writes only u32 rows `0..35` (`3 * 1536 / 128 = 36`
+    granules) of the conv page; rows `36..127` may contain stale KV bytes including
+    `f32` NaN (`0xFFFFFFFF`). Verify split, fused (`conv_stage` False/True), and
+    GPR (`T=4`) produce finite outputs bit-identical to a clean zero-padded pool."""
+    mesh = _cpu_mesh(2)
+    tp = NamedSharding(mesh, P("tp"))
+    g = _wide_conv_geom()
+    B = 2 * T
+    tiles = replace(TINY_TILES, bank=512 << 10).with_modules(
+        {"gdn": {"conv_stage": False, "gdn_head_major": True}}
+    )
+    ex_split = mk.ExecSpec(
+        R=2,
+        B=B,
+        T=T,
+        ctx=256,
+        stack_e=False,
+        interpret=True,
+        tiles=tiles,
+        cache=mk.CacheExec(
+            paged_kv=True,
+            num_pages=512,
+            fused_pool_io=False,
+            pool_gather=False,
+        ),
+    )
+    pos, hid_l, w_l, st_l = mk.random_logical_inputs(
+        jax.random.key(910 + T), g, ex_split
+    )
+    _, hid_mk, w_mk, _ = mk.pack_inputs(
+        pos, hid_l, w_l, st_l, g, ex_split, mesh=mesh, build_default_pool=True
+    )
+    spec_f32, lay = _with_f32_in_kernel_backend(qwen35.qwen35_spec(g))
+    assert lay.conv_rows(ex_split.R) == 36
+    pt, ckpt, roff, _ = pool.allocate_test_layout(lay, ex_split)
+    raw_clean = tuple(
+        jax.device_put(r, tp)
+        for r in pool.states_to_pool(lay, ex_split, st_l, pt, ckpt, roff)
+    )
+    raw_poison = _poison_stale_conv_rows(raw_clean, lay, ckpt, tp, live_rows=36)
+
+    modes: list[tuple[str, mk.ExecSpec, bool]] = [
+        ("split", ex_split, False),
+        (
+            "fused",
+            mk.with_cache(ex_split, fused_pool_io=True, pool_gather=False),
+            True,
+        ),
+        (
+            "fused_conv_stage",
+            replace(
+                mk.with_cache(ex_split, fused_pool_io=True, pool_gather=False),
+                tiles=tiles.with_modules(
+                    {"gdn": {"conv_stage": True, "gdn_head_major": True}}
+                ),
+            ),
+            True,
+        ),
+    ]
+    if T > 1:
+        modes.append(
+            (
+                "gpr",
+                mk.with_cache(ex_split, fused_pool_io=False, pool_gather=True),
+                False,
+            )
+        )
+
+    for label, ex_m, use_fused in modes:
+        step, _ = mk.PallasWriter().make_step(
+            mesh, spec_f32, ex_m, donate=use_fused, fused_pool_io=use_fused
+        )
+        c_in = tuple(jax.device_put(np.asarray(r).copy(), tp) for r in raw_clean)
+        p_in = tuple(jax.device_put(np.asarray(r).copy(), tp) for r in raw_poison)
+        hid_c, out_c = step(pos, hid_mk, w_mk, c_in, pt, ckpt, roff)
+        hid_p, out_p = step(pos, hid_mk, w_mk, p_in, pt, ckpt, roff)
+        assert np.isfinite(np.asarray(hid_p, np.float32)).all(), label
+        np.testing.assert_array_equal(
+            np.asarray(hid_p).view(np.uint8),
+            np.asarray(hid_c).view(np.uint8),
+            err_msg=f"{label}: hidden mismatch with poisoned stale conv rows",
+        )
+        st_c = pool.pool_to_states(lay, ex_split, out_c, pt, ckpt)
+        st_p = pool.pool_to_states(lay, ex_split, out_p, pt, ckpt)
+        for k in ("kc", "vc", "conv", "rec"):
+            assert np.isfinite(np.asarray(st_p[k], np.float32)).all(), f"{label}:{k}"
+            np.testing.assert_array_equal(
+                np.asarray(st_p[k]).view(np.uint8),
+                np.asarray(st_c[k]).view(np.uint8),
+                err_msg=f"{label}:{k} mismatch with poisoned stale conv rows",
+            )
 
 
 @pytest.mark.parametrize(
@@ -403,4 +539,3 @@ def test_f32_conv_non_interpret_lowers_cleanly(T: int, fused: bool, gpr: bool):
     jaxpr_str = str(jaxpr)
     assert "decode_megakernel" in jaxpr_str
     assert "gather_gdn_states" not in jaxpr_str
-

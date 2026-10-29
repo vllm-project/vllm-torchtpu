@@ -2404,7 +2404,6 @@ def test_fused_vs_split_t4_tpu_bitwise_f32_conv(tiles: str, B: int, seed: int):
     pb = dataclasses.replace(
         spec0.cache_backend.with_layout(lay),
         supports_fused_io=True,
-        can_pool_gather=lambda ex_p: ex_p.T > 1,
     )
     spec = dataclasses.replace(spec0, cache_backend=pb)
     num_pages = 512 if B <= 8 else 2048
@@ -2489,6 +2488,81 @@ def test_fused_vs_split_t4_tpu_bitwise_f32_conv(tiles: str, B: int, seed: int):
         flush=True,
     )
     np.testing.assert_array_equal(hf, hs)
+    assert not summary, summary
+
+
+@pytest.mark.parametrize("B,seed", [(8, 0), (24, 0)])
+def test_gpr_vs_split_t4_tpu_bitwise_f32_conv(B: int, seed: int):
+    """In-kernel gather (`GPR`, `T=4`) with `PoolLayout.conv_dtype == f32`
+    (`GCONV_ROWS=96`, 2-DMA K+V halves) is bitwise equal to split on TPU."""
+    if not _has_tpu_v7x8():
+        pytest.skip("Requires 8 TPU TensorCores (v7x-8)")
+    from test_m3_cache_eplb import (
+        _pool_diff_summary,
+        _pool_page_kinds,
+        _tiny_exec,
+        _tiny_geom,
+    )
+
+    T = 4
+    mesh = Mesh(np.array(jax.devices()[:2]), ("tp",))
+    tp = NamedSharding(mesh, P("tp"))
+    g = dataclasses.replace(_tiny_geom(L=4, att_every=4), KH=4, VH=16)
+    spec0 = qwen35.qwen35_spec(g)
+    lay = dataclasses.replace(spec0.cache_backend.layout, conv_dtype=jnp.float32)
+    spec = dataclasses.replace(
+        spec0, cache_backend=spec0.cache_backend.with_layout(lay)
+    )
+    num_pages = 512 if B <= 8 else 2048
+    ex0 = _tiny_exec(
+        R=2, B=B, T=T, ctx=256, paged_kv=True, num_pages=num_pages, stack_e=False
+    )
+    ex_split = mk.with_cache(
+        dataclasses.replace(ex0, interpret=False),
+        fused_pool_io=False,
+        pool_gather=False,
+    )
+    ex_gpr = mk.with_cache(ex_split, pool_gather=True)
+    key = 760 + T * 10 + B + 1000 * seed
+    pos, hid_l, w_l, st_l = mk.random_logical_inputs(jax.random.key(key), g, ex_split)
+    pos_list = []
+    for s_i in range(ex_split.NS):
+        base_p = 126 if s_i == 0 else (20 + 10 * s_i)
+        pos_list.extend(base_p + t_i for t_i in range(T))
+    pos = jnp.asarray(pos_list, dtype=jnp.int32)
+    _, hid_mk, w_mk, _ = mk.pack_inputs(
+        pos, hid_l, w_l, st_l, g, ex_split, mesh=mesh, build_default_pool=True
+    )
+    pt, ckpt, roff, _ = mk.pool.allocate_test_layout(lay, ex_split)
+
+    def _fresh_pools():
+        return tuple(
+            jax.device_put(np.asarray(r).copy(), tp)
+            for r in mk.pool.states_to_pool(lay, ex_split, st_l, pt, ckpt, roff)
+        )
+
+    step_s, info_s = mk.PallasWriter(fused_pool_io=False).make_step(
+        mesh, spec, ex_split, donate=False
+    )
+    step_g, info_g = mk.PallasWriter(fused_pool_io=False).make_step(
+        mesh, spec, ex_gpr, donate=False
+    )
+    assert not info_s["use_gpr"] and info_g["use_gpr"]
+    assert info_g["plan"].module_params["gdn"].GCONV_ROWS == 96
+    assert info_g["oshape"]["conv_ckpt"][1] == jnp.float32
+    out_s, raw_s = step_s(pos, hid_mk, w_mk, _fresh_pools(), pt, ckpt, roff)
+    out_g, raw_g = step_g(pos, hid_mk, w_mk, _fresh_pools(), pt, ckpt, roff)
+    hs = np.asarray(out_s).view(np.uint8)
+    hg = np.asarray(out_g).view(np.uint8)
+    assert np.isfinite(np.asarray(out_s, dtype=np.float32)).all()
+    kinds = _pool_page_kinds(pt, ckpt, g_per_att=g.att_every - 1)
+    summary = _pool_diff_summary(raw_g, raw_s, mk.cache_exec(ex_split).num_pages, kinds)
+    print(
+        f"[GPR_T4_TPU_F32_CONV B={B} seed={seed}] "
+        f"hidden_equal={bool((hs == hg).all())} pool_diff={summary}",
+        flush=True,
+    )
+    np.testing.assert_array_equal(hg, hs)
     assert not summary, summary
 
 

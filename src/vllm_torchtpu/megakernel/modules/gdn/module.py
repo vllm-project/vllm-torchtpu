@@ -89,12 +89,14 @@ class GDNModule(Module):
 
     def __init__(
         self,
+        pool_layout: Any = None,
         *,
         geometry: Any = None,
         prefix: str = "linear_attn",
         gate: str | None = None,
         weight_dtypes: Mapping[str, str] | None = None,
     ) -> None:
+        self.pool_layout = pool_layout
         self.geometry = geometry
         self.prefix = prefix
         self._explicit_gate = None if gate is None else validate_gdn_gate(gate)
@@ -138,6 +140,12 @@ class GDNModule(Module):
         geom = g if g is not None else self.geometry
         g_gate = getattr(geom, "gdn_gate", getattr(geom, "gate", None))
         return validate_gdn_gate(g_gate) if g_gate is not None else self.gate
+
+    def conv_dtype(self, g: Any) -> Any:
+        """Pooled conv window dtype (`pool_layout.conv_dtype` when bound)."""
+        if self.pool_layout is not None:
+            return self.pool_layout.conv_dtype
+        return self.cache_decl(g).conv_dtype
 
     @classmethod
     def _resolve_binding(
@@ -247,7 +255,7 @@ class GDNModule(Module):
         lay = self.lin_in_layout(g, ex)
         taps = self.cache_decl(g).conv_taps
         if ex.VER:
-            conv_is_f32 = jnp.dtype(self.cache_decl(g).conv_dtype) == jnp.dtype(F32)
+            conv_is_f32 = jnp.dtype(self.conv_dtype(g)) == jnp.dtype(F32)
             return [
                 StateDecl(
                     "conv_ckpt",

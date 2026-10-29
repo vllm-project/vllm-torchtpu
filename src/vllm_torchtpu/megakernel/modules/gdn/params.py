@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import jax.numpy as jnp
@@ -23,7 +23,7 @@ import jax.numpy as jnp
 from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec, NumericsClass
 from ...ops import F32, rup, validate_gdn_gate
-from ...pool.config import cache_exec, with_cache
+from ...pool.config import cache_exec
 
 
 @dataclass(frozen=True)
@@ -240,28 +240,17 @@ def derive_params(
         HR,
         lay.QKV,
     )
-    assert not GPR or gconv_rows <= (128 if conv_is_f32 else 64), gconv_rows
+    assert not GPR or gconv_rows <= (
+        pool_layout.gpr_conv_row_limit if pool_layout is not None else 64
+    ), gconv_rows
 
     qkv_128 = lay.QKV // 128
     A_conv = rup(3 + T, 8) if conv_is_f32 else max(16, rup(3 + T, 8))
     conv8_rows = A_conv * qkv_128
-    if (
-        cache_exec(ex).FUSED
-        and pool_layout is not None
-        and conv8_rows > pool_layout.conv_page_rows
-    ):
-        raise MegakernelConfigError(
-            f"PoolLayout: fused pool I/O conv window ({conv8_rows} rows at "
-            f"T={T}) exceeds one conv page ({pool_layout.conv_page_rows} rows)"
-        )
     NGI = min(ex.NS, 8) if cache_exec(ex).FUSED else 0
     NGO = min(ex.NS, 2) if cache_exec(ex).FUSED else 0
     K_ckpt = cache_exec(ex).ckpt_k if cache_exec(ex).ckpt_k > 0 else T
     ckpt_t_off = K_ckpt - T if K_ckpt > T else 0
-    if GPR and conv_is_f32 and "conv_ckpt" in getattr(plan, "output_decls", {}):
-        plan.output_decls["conv_ckpt"] = replace(
-            plan.output_decls["conv_ckpt"], dtype=F32
-        )
 
     return GDNParams(
         kh=lay.kh,
@@ -330,20 +319,7 @@ def checked_pool_layout(
             f"ModelSpec {plan.model_spec.name!r}"
         )
     layout = pb.layout
-    conv_is_f32 = jnp.dtype(layout.conv_dtype) == jnp.dtype(F32)
-    layout.validate(
-        with_cache(ex, pool_gather=False, fused_pool_io=False)
-        if conv_is_f32
-        else ex
-    )
-    if conv_is_f32 and cache_exec(ex).GPR:
-        rows = layout.gpr_conv_rows(ex.T, ex.R)
-        if rows is None or rows > layout.page_rows:
-            raise MegakernelConfigError(
-                f"PoolLayout: in-kernel gather (GPR) conv window ({rows} fp8 "
-                f"rows at T={ex.T}) exceeds one conv page ({layout.page_rows} "
-                f"rows) ({layout})"
-            )
+    layout.validate(ex)
     if g_per_att <= 0 or layout.slots_per_pool != g_per_att:
         raise MegakernelConfigError(
             f"GDN in-kernel pool I/O: {g_per_att} recurrent layer(s) per "

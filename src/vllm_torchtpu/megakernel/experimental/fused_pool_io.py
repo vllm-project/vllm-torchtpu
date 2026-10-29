@@ -940,6 +940,11 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
                         scr["mix"][b, :Z] = rnd(val * g_act(zz)).reshape(Z)
 
                         if interpret:
+                            # Convert bf16 row-pairs directly to fp8 bytes without an
+                            # intermediate u32 bitcast: when ssm_u32_rows == SSM_U32_CAP
+                            # (no pad op between the two bitcasts), XLA CPU folds
+                            # bitcast_convert(bitcast_convert(bf16->u32)->fp8) into an
+                            # invalid bf16[..., 2] -> fp8[..., 4] HLO instruction.
                             bf16_pairs = s_bf16.reshape(ssm_u32_rows, 2, VD).swapaxes(
                                 1, 2
                             )

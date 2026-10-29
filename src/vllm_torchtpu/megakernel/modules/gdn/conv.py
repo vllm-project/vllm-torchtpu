@@ -129,9 +129,7 @@ def conv_step(ctx: Any, gp: GDNParams, o: Any, slot: Any, ybuf: Any) -> Any:
                                 .bitcast(BF16)
                                 .reshape(2 * gp.GCONV_ROWS, 128)
                             )
-                        raw_hr = (
-                            raw_hr[:hr_rows_128, :].reshape(gp.HR, QKV).astype(F32)
-                        )
+                        raw_hr = raw_hr[:hr_rows_128, :].reshape(gp.HR, QKV).astype(F32)
                     keep = jnp.logical_and(
                         has_gpr_input(ctx, gp, o, s_), conv_row_iota < 3
                     )
