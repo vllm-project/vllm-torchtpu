@@ -11,6 +11,7 @@ the right shape holding permuted numbers.
 from __future__ import annotations
 
 import collections
+import threading
 
 import pytest
 import torch
@@ -90,6 +91,113 @@ def test_swapped_gather_order_is_not_caught_by_shape():
 
     assert swapped.shape == reference.shape  # shape check would pass
     assert not torch.allclose(swapped, reference)  # numbers would not
+
+
+class _ThreadedTokenGroup:
+    """Dim-0 token gather across simulated cores running in lockstep threads."""
+
+    def __init__(self, world_size: int) -> None:
+        self.world_size = world_size
+        self._slots: list[torch.Tensor | None] = [None] * world_size
+        self._barrier = threading.Barrier(world_size)
+
+    def for_rank(self, rank: int):
+        group = self
+
+        class _RankView:
+            world_size = group.world_size
+            rank_in_group = rank
+
+            def all_gather(self, x: torch.Tensor, dim: int) -> torch.Tensor:
+                assert dim == 0
+                group._slots[rank] = x
+                group._barrier.wait()
+                out = torch.cat(list(group._slots), dim=0)
+                group._barrier.wait()
+                return out
+
+        return _RankView()
+
+
+@pytest.mark.parametrize("bias", [False, True])
+def test_sequence_parallel_forward_matches_replicated_on_each_token_shard(bias):
+    """SP prefill: each core holds a token shard and a column shard.
+
+    The output must be exactly the replicated projection's rows for that
+    core's tokens. A wrong gather order or a wrong row/column pick still
+    returns the right shape, so compare numbers.
+    """
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.layers.adapter.latent_proj_intra_chip import (
+        IntraChipColumnParallelLinear,
+    )
+
+    torch.manual_seed(0)
+    cores, tokens_per_core, in_features, out_features = 2, 3, 16, 8
+    weight = torch.randn(out_features, in_features)
+    full_bias = torch.randn(out_features) if bias else None
+    x = torch.randn(cores * tokens_per_core, in_features)
+    reference = torch.nn.functional.linear(x, weight, full_bias)
+
+    group = _ThreadedTokenGroup(cores)
+    shard = out_features // cores
+    results: list[torch.Tensor | None] = [None] * cores
+
+    def run(rank: int) -> None:
+        local_bias = full_bias.narrow(0, rank * shard, shard) if bias else None
+        fake_layer = SimpleNamespace(
+            bias=local_bias,
+            skip_bias_add=False,
+            _chip_group=None,  # the SP path must not touch the eager group
+            quant_method=SimpleNamespace(
+                apply=lambda layer, inp, b: torch.nn.functional.linear(
+                    inp, weight.narrow(0, rank * shard, shard), b
+                )
+            ),
+        )
+        local_x = x.narrow(0, rank * tokens_per_core, tokens_per_core)
+        out, out_bias = IntraChipColumnParallelLinear.forward(
+            fake_layer, local_x, sp_group=group.for_rank(rank)
+        )
+        assert out_bias is None
+        results[rank] = out
+
+    threads = [threading.Thread(target=run, args=(r,)) for r in range(cores)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    for rank in range(cores):
+        expected = reference.narrow(0, rank * tokens_per_core, tokens_per_core)
+        torch.testing.assert_close(results[rank], expected)
+
+
+def test_token_shard_of_column_gather_picks_rows_then_concatenates_columns():
+    from vllm_torchtpu.layers.adapter.latent_proj_intra_chip import (
+        token_shard_of_column_gather,
+    )
+
+    cores, n, cols = 2, 2, 3
+    # Core c's column shard over all chip tokens t: value 100 * c + 10 * t + j.
+    shards = [
+        torch.tensor(
+            [[100 * c + 10 * t + j for j in range(cols)] for t in range(cores * n)]
+        )
+        for c in range(cores)
+    ]
+    gathered = torch.cat(shards, dim=0)
+    for rank in range(cores):
+        out = token_shard_of_column_gather(gathered, cores, rank)
+        rows = range(rank * n, (rank + 1) * n)
+        expected = torch.tensor(
+            [
+                [100 * c + 10 * t + j for c in range(cores) for j in range(cols)]
+                for t in rows
+            ]
+        )
+        torch.testing.assert_close(out, expected)
 
 
 def test_column_parallel_is_exact_where_row_parallel_would_resplit_the_sum():

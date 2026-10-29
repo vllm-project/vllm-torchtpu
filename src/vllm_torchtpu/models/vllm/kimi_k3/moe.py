@@ -29,7 +29,7 @@ from vllm_torchtpu.layers.adapter.moe_hierarchical import (
     hierarchical_split_or_none,
 )
 
-from .collective_ops import FusedPrefillCollectives
+from .collective_ops import FusedPrefillCollectives, TokenShardCollectives
 from .layers import KimiMLP
 
 
@@ -131,12 +131,16 @@ class KimiMoE(nn.Module):
 
         self.prefill_group = None
         self.shared_group = None
+        self.latent_sp_group = None
         self.pipe_chunks = int(os.environ.get("TPU_K3_MOE_PIPE_CHUNKS", "1"))
         if envs.TPU_K3_SP_PREFILL:
             self.prefill_group = FusedPrefillCollectives(prefix)
             self.shared_group = get_intra_chip_group()
             if self.shared_group is None or self.shared_group.world_size != 2:
                 raise ValueError("K3 SP prefill needs a physical two-core chip group")
+            # The intra-chip latent projections see token-sharded inputs here;
+            # gather tokens through the custom op, which lowers symbolically.
+            self.latent_sp_group = TokenShardCollectives(self.shared_group)
         elif (
             self.use_ep
             and self.tp_size >= 8
@@ -328,7 +332,7 @@ class KimiMoE(nn.Module):
                 self.routed_expert_down_proj, IntraChipColumnParallelLinear
             ):
                 latent, _ = self.routed_expert_down_proj(
-                    latent, sequence_parallel=True
+                    latent, sp_group=self.latent_sp_group
                 )
             else:
                 latent, _ = self.routed_expert_down_proj(latent)
@@ -365,7 +369,7 @@ class KimiMoE(nn.Module):
                 self.routed_expert_up_proj, IntraChipColumnParallelLinear
             ):
                 output, _ = self.routed_expert_up_proj(
-                    output, sequence_parallel=True
+                    output, sp_group=self.latent_sp_group
                 )
             else:
                 output, _ = self.routed_expert_up_proj(output)

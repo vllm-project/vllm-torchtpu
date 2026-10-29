@@ -81,18 +81,36 @@ class IntraChipColumnParallelLinear(ColumnParallelLinear):
         self,
         input_: torch.Tensor,
         *,
-        sequence_parallel: bool = False,
+        sp_group=None,
     ) -> tuple[torch.Tensor, torch.nn.Parameter | None]:
-        if sequence_parallel:
-            input_ = self._chip_group.all_gather(input_, dim=0)
+        """Apply the projection.
+
+        Args:
+            input_: ``[tokens, in]`` activations. Under sequence parallelism
+                these are only this core's token shard.
+            sp_group: Token-shard collectives over this chip's cores (an
+                object with ``all_gather(x, dim=0)``, ``world_size`` and
+                ``rank_in_group``, e.g. K3's ``TokenShardCollectives``),
+                passed only when the tokens are sequence-parallel. Its gathers
+                must lower with symbolic token counts, which vLLM's eager
+                ``GroupCoordinator.all_gather`` does not under torch_tpu.
+
+        Returns:
+            ``(output, bias)`` as ``ReplicatedLinear`` would return them.
+        """
         bias = self.bias if not self.skip_bias_add else None
-        output_parallel = self.quant_method.apply(self, input_, bias)
-        output = self._chip_group.all_gather(output_parallel, dim=-1)
-        if sequence_parallel:
-            output = output.chunk(self._chip_group.world_size, dim=0)[
-                self._chip_group.rank_in_group
-            ].contiguous()
         output_bias = self.bias if self.skip_bias_add else None
+        if sp_group is None:
+            output_parallel = self.quant_method.apply(self, input_, bias)
+            output = self._chip_group.all_gather(output_parallel, dim=-1)
+            return output, output_bias
+        # Both cores need every chip token for their column shard.
+        input_ = sp_group.all_gather(input_, dim=0)
+        output_parallel = self.quant_method.apply(self, input_, bias)
+        gathered = sp_group.all_gather(output_parallel, dim=0)
+        output = token_shard_of_column_gather(
+            gathered, sp_group.world_size, sp_group.rank_in_group
+        )
         return output, output_bias
 
     def extra_repr(self) -> str:
@@ -102,6 +120,21 @@ class IntraChipColumnParallelLinear(ColumnParallelLinear):
             f"out_per_chip_core={self.output_size_per_partition}, "
             f"chip_tp_size={self.tp_size}"
         )
+
+
+def token_shard_of_column_gather(
+    gathered: torch.Tensor, world_size: int, rank: int
+) -> torch.Tensor:
+    """This rank's token rows, with every core's columns, from a dim-0 gather.
+
+    ``gathered`` stacks each core's ``[world_size * n, out / world_size]``
+    column shard (all of the chip's tokens) in group-rank order. Rank ``r``
+    owns token rows ``[r * n, (r + 1) * n)``; its output concatenates those
+    rows from every core's shard in rank order, which is the column order of
+    the sharded weight.
+    """
+    shards = gathered.chunk(world_size, dim=0)
+    return torch.cat([shard.chunk(world_size, dim=0)[rank] for shard in shards], -1)
 
 
 def shard_group_or_none(output_size: int):
@@ -145,7 +178,6 @@ def _blockwise_fp8_config():
     from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config
 
     class _BlockwiseFp8Config(VllmFp8Config):
-
         def get_linear_config(self, layer):
             config = super().get_linear_config(layer)
             config.enable_quantized_matmul_kernel = True
