@@ -70,8 +70,10 @@ def _decode_inputs(batch, heads, page_size):
 
 
 @pytest.mark.cpu_test
-def test_decode_traces_on_pinned_jax():
+@pytest.mark.parametrize("bq", [1, 6])
+def test_decode_traces_on_pinned_jax(bq):
     args, kwargs = _decode_inputs(2, 8, 64)
+    kwargs["bq"] = bq
     mesh = jax.sharding.AbstractMesh(
         (1,),
         ("core",),
@@ -220,3 +222,37 @@ def test_csa2_accumulator_pipeline_matches_reference(heads: int) -> None:
         rtol=2e-2,
     )
     np.testing.assert_array_equal(actual[21:], 0)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("valid_tokens", [0, 1])
+def test_single_tile_attention_traces_through_final_drain(valid_tokens):
+    args, kwargs = _decode_inputs(1, 8, 64)
+    q, words, scales, swa, _, positions, sink, rope = args
+    args = (
+        q[:1],
+        words[:1],
+        scales[:1],
+        swa,
+        jnp.array([0, valid_tokens], jnp.int32),
+        positions[:1],
+        sink,
+        rope[:1],
+    )
+    kwargs["main_lengths"] = kwargs["main_lengths"][:1]
+    mesh = jax.sharding.AbstractMesh(
+        (1,), ("core",), abstract_device=jax.sharding.AbstractDevice("TPU7x", 1, "tpu")
+    )
+    with jax.sharding.use_abstract_mesh(mesh):
+        traced = jax.make_jaxpr(lambda *x: csa2(*x, **kwargs))(*args)
+    assert traced.out_avals[0].shape == (1, 8, 512)
+    assert traced.out_avals[0].dtype == jnp.bfloat16
+    if jax.default_backend() == "tpu":
+        expected = prefill_reference(
+            *args,
+            swa_metadata=kwargs["swa_metadata"],
+            main_lengths=kwargs["main_lengths"],
+        )
+        np.testing.assert_allclose(
+            csa2(*args, **kwargs), expected, atol=3e-3, rtol=3e-2
+        )
