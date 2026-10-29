@@ -205,9 +205,12 @@ def build_trunk_chat_payload(
     sampling_spec: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
   """Builds a structured multi-turn + tools payload for `trunk_id` with shared prefix."""
-  total_chars = max(1024, int(target_isl_tokens * CHARS_PER_TOKEN))
+  eff_target_tok = 7040 if (cache_hit_ratio >= 0.90 and bucket_idx == 0) else target_isl_tokens
+  total_chars = max(1024, int(eff_target_tok * CHARS_PER_TOKEN))
   # Center 1024-token block quantization (`floor(prefix_tok / 1024) * 1024`) around `cache_hit_ratio`
-  eff_ratio = min(0.92, (target_isl_tokens * cache_hit_ratio + 512.0) / max(1, target_isl_tokens))
+  quant_offset = 550.0 if cache_hit_ratio >= 0.90 else 512.0
+  max_eff = 0.985 if cache_hit_ratio >= 0.90 else 0.92
+  eff_ratio = min(max_eff, (eff_target_tok * cache_hit_ratio + quant_offset) / max(1, eff_target_tok))
   prefix_budget = int(total_chars * eff_ratio)
   suffix_budget = max(256, total_chars - prefix_budget)
 

@@ -327,19 +327,31 @@ def main() -> None:
                         continue
                     if ready[r]:
                         continue
-                    lines = grep_log(k, f"/dev/shm/pd_{r}.log", PROGRESS_PAT).splitlines()
-                    for ln in lines[seen[r]:]:
-                        print(f"  [{r}] {ln}", flush=True)
-                    seen[r] = len(lines)
-                    fails = grep_log(k, f"/dev/shm/pd_{r}.log", "|".join(
-                        p.replace("[", r"\[").replace("]", r"\]") for p in FAIL_PAT))
-                    if fails.strip():
-                        tail = k.exec_sh(f"tail -n 80 /dev/shm/pd_{r}.log", capture=True)
-                        (out / f"{r}_boot_failure_tail.txt").write_text(tail)
-                        raise RuntimeError(f"[{r}] server failed during boot:\n{fails[-2000:]}\n--- tail ---\n{tail[-6000:]}")
-                    if healthy(k, PORTS[r]):
-                        ready[r] = True
-                        L.log(f"[{r}] HEALTHY after {time.time() - t0:.0f}s")
+                    try:
+                        lines = grep_log(k, f"/dev/shm/pd_{r}.log", PROGRESS_PAT).splitlines()
+                        for ln in lines[seen[r]:]:
+                            print(f"  [{r}] {ln}", flush=True)
+                        seen[r] = len(lines)
+                        fails = grep_log(k, f"/dev/shm/pd_{r}.log", "|".join(
+                            p.replace("[", r"\[").replace("]", r"\]") for p in FAIL_PAT))
+                        if fails.strip():
+                            tail = k.exec_sh(f"tail -n 80 /dev/shm/pd_{r}.log", capture=True)
+                            (out / f"{r}_boot_failure_tail.txt").write_text(tail)
+                            raise RuntimeError(f"[{r}] server failed during boot:\n{fails[-2000:]}\n--- tail ---\n{tail[-6000:]}")
+                        if healthy(k, PORTS[r]):
+                            ready[r] = True
+                            L.log(f"[{r}] HEALTHY after {time.time() - t0:.0f}s")
+                    except subprocess.CalledProcessError as e:
+                        phase = pod_phase(k)
+                        if phase != "Running":
+                            L.log(f"[{r}] pod phase={phase} mid-poll (spot preemption: {e}); recreating + re-staging {r} ...")
+                            ready[r] = False
+                            seen[r] = 0
+                            recreate_role(r)
+                            stage(r)
+                            L.start_detached(k, f"exec bash /tmp/in_pod_serve.sh {r}", "in_pod_serve.sh")
+                            continue
+                        raise
             summary["boot_s"] = round(time.time() - t0, 1)
 
         # Proxy on the prefill pod.
