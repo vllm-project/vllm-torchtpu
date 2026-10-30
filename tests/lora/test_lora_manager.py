@@ -628,7 +628,7 @@ def _slot_write_compiles_once_for_every_slot():
     layers = tpu_manager.modules
     tpu_manager.precompile_activation()
     torch.accelerator.synchronize()
-    graphs, programs = _dynamo_graphs(), torch.tpu._get_cache_requests()
+    graphs, programs = _dynamo_graphs(), torch.tpu._get_cache_stats().num_cache_reqs
     # 1, 2 and 3 use each slot for the first time and 4 overwrites slot 0.
     # Grad mode alternates, since the add_lora RPC runs with grad enabled.
     for lora_id in range(1, NUM_SLOTS + 2):
@@ -636,7 +636,7 @@ def _slot_write_compiles_once_for_every_slot():
             _activate((tpu_manager,), _adapter(lora_id, layers))
     torch.accelerator.synchronize()
     assert _dynamo_graphs() == graphs
-    assert torch.tpu._get_cache_requests() == programs
+    assert torch.tpu._get_cache_stats().num_cache_reqs == programs
 
 
 @pytest.mark.tpu_test
@@ -685,9 +685,9 @@ def _compiled_reader_runs_no_fixups_after_activation():
     for lora_id in range(1, NUM_SLOTS + 2):
         _activate((tpu_manager,), _adapter(lora_id, tpu_manager.modules))
     torch.accelerator.synchronize()
-    programs = torch.tpu._get_cache_requests()
+    programs = torch.tpu._get_cache_stats().num_cache_reqs
     read(stacked).cpu()
-    assert torch.tpu._get_cache_requests() == programs
+    assert torch.tpu._get_cache_stats().num_cache_reqs == programs
 
 
 @pytest.mark.tpu_test
