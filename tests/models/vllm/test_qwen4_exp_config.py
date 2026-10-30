@@ -34,17 +34,26 @@ def test_admission_rejects_non_cuda_qsa_kv(dtype):
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("linear_key_head_dim", 64),
-        ("linear_key_head_dim", 192),
-        ("linear_value_head_dim", 64),
+        ("linear_key_head_dim", 65),
+        ("linear_value_head_dim", 65),
         ("linear_conv_kernel_dim", 1),
     ],
 )
-def test_admission_rejects_unrepresentable_gdn_head_tiles(field, value):
+def test_admission_rejects_incomplete_gdn_state_granules(field, value):
     cfg = config()
     setattr(cfg.model_config.hf_text_config, field, value)
     with pytest.raises(ValueError, match="GDN"):
         validate_config(cfg)
+
+
+@pytest.mark.parametrize("key_dim,value_dim", [(128, 128), (256, 128), (128, 256)])
+@pytest.mark.parametrize("ssm_dtype", ["bfloat16", "float32"])
+def test_gdn_cache_shapes_follow_state_granules(key_dim, value_dim, ssm_dtype):
+    cfg = config()
+    cfg.model_config.hf_text_config.linear_key_head_dim = key_dim
+    cfg.model_config.hf_text_config.linear_value_head_dim = value_dim
+    cfg.cache_config.mamba_ssm_cache_dtype = ssm_dtype
+    validate_config(cfg)
 
 
 def test_admission_accepts_upstream_optional_ple_shard_default():
@@ -92,8 +101,8 @@ def test_ssm_dtype_uses_checkpoint_default_and_preserves_explicit_override(
     model_config.TPUQwen4ExpConfig.verify_and_update_config(cfg)
     assert cfg.cache_config.mamba_ssm_cache_dtype == resolved
     expected = torch.float32 if resolved == "float32" else torch.bfloat16
-    # Projected convolution history stays BF16 independently of the SSM override.
-    assert model_config.gdn_cache_spec(cfg).dtypes == (torch.bfloat16, expected)
+    # Conv history follows the unified GDN FP32 state ABI.
+    assert model_config.gdn_cache_spec(cfg).dtypes == (torch.float32, expected)
 
 
 @pytest.mark.parametrize(
@@ -328,7 +337,7 @@ def test_hc_env_override_preserves_s1_admission(monkeypatch, value):
     model_config.TPUQwen4ExpConfig.verify_and_update_config(cfg)
     assert cfg.cache_config.kv_cache_layout == "BLHNC"
     assert cfg.cache_config.num_gpu_blocks_override is None
-    cfg.model_config.hf_text_config.linear_key_head_dim = 64
+    cfg.model_config.hf_text_config.linear_key_head_dim = 65
     with pytest.raises(ValueError, match="GDN"):
         model_config.TPUQwen4ExpConfig.verify_and_update_config(cfg)
 

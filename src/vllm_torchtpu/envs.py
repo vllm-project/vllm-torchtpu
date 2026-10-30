@@ -91,8 +91,8 @@ if TYPE_CHECKING:
     TPU_MLA_MASKED_DENSE_ANALYTIC_MAX_KV_LEN: int | None = None
     TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
-    TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
+    TPU_GDN_COMPACT_INPUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -444,20 +444,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # lane-padded tiles cost a broadcast init, a relayout copy and padded
     # copies through the LSE merge. Bit-identical outputs.
     "TPU_MLA_SPARSE_SPLIT_Q": env_bool("TPU_MLA_SPARSE_SPLIT_Q", default=False),
-    # QK pair-blocked GDN conv layout for Raiden transfers.  Not supported
-    # with the unified GDN state pool: its kernel reads segment-major
-    # [Q | K | V] conv rows, so the pool manifest rejects this flag.  Must
-    # match across a disagg pair; the value rides the raiden layout
-    # fingerprint.
-    "TPU_GDN_CONV_QK_PAIR_LAYOUT": env_bool(
-        "TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False
-    ),
     # Size GDN v3 decode tiles and prefill chunks from per-rank heads, active
     # sequences and the VMEM estimate (kernels/gdn/v3/tiling.py) instead of
     # the fixed defaults.
     "TPU_ENABLE_GDN_DYNAMIC_TILING": env_bool(
         "TPU_ENABLE_GDN_DYNAMIC_TILING", default=False
     ),
+    # Opt in to a separate Pallas projection-to-FP32 conversion kernel.
+    "TPU_GDN_COMPACT_INPUT": env_bool("TPU_GDN_COMPACT_INPUT", default=False),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4
     # eval config turns it on, since a prefilled assistant turn needs it.

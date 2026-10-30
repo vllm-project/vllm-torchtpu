@@ -49,6 +49,10 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
     _Stage3LoadMeta,
     _Stage3TransferGroup,
 )
+from vllm_torchtpu.gdn_pool_layout import (
+    DEFAULT_POOLED_GDN_CONV_STATE_DTYPE,
+    GRANULE_BYTES,
+)
 
 from .pd import TransferExtent, TransferGroup, build_transfer_groups, handoff_block_ids
 from .pd_identity import canonical_rank_identity
@@ -184,8 +188,6 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
 
     def _collect_pd_semantics(self, runner) -> dict[str, Any]:
         model = runner.model_adapter.cache.model
-        if model.pd_gdn_qk_pair_layout != envs.TPU_GDN_CONV_QK_PAIR_LAYOUT:
-            raise ValueError("Qwen PD GDN layout changed since model construction")
         scales = []
         for index, layer in enumerate(model.model.layers):
             if layer.layer_type == "indexed_attention":
@@ -218,7 +220,8 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             config=config,
             kv_scales=scales,
             state_flags=dict(
-                gdn_qk_pair=model.pd_gdn_qk_pair_layout,
+                gdn_conv_dtype=DEFAULT_POOLED_GDN_CONV_STATE_DTYPE,
+                gdn_granule_bytes=GRANULE_BYTES,
                 expert_parallel=parallel.enable_expert_parallel,
                 ssm_dtype=str(self.vllm_config.cache_config.mamba_ssm_cache_dtype),
                 cp=1,

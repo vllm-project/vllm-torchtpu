@@ -35,6 +35,11 @@ def load_strided_heads(
         [num_heads, chunk_size, head_dim]
     """
     num_lanes = pltpu.get_tpu_info().num_lanes
+    if head_dim < num_lanes or head_dim % num_lanes:
+        raise ValueError(
+            f"Strided GDN head width {head_dim} must be a positive multiple "
+            f"of the loader lane count {num_lanes}"
+        )
     lanes_per_col = vmem_ref.shape[-1] // num_lanes
     lanes_per_head = head_dim // num_lanes
 

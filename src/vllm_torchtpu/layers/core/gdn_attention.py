@@ -910,7 +910,7 @@ def run_jax_gdn_attention_pooled(
         recurrent_state: The attention-shaped pool
           `(num_blocks, block_size, num_kv_heads * 2, head_size)` in the KV
           dtype, carrying the SSM region in ``recurrent_state_dtype`` and the
-          fixed-BF16 Conv region as token-ranges of each state block. Block 0
+          FP32 Conv region as granules of each state block. Block 0
           is the null block, only used for padded / invalid tokens.
         j_conv_weight: Convolutional weight tensor of shape `(dim, 1,
           kernel_size)`.

@@ -52,7 +52,6 @@ import math
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, NamedTuple
 
-from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.gdn_pool_layout import (
     derive_pooled_gdn_state_layout,
     pooled_gdn_conv_state_bytes,
@@ -401,15 +400,6 @@ def _gdn_conv_regions(
     row_stride = local_dim * itemsize
     key_bytes = geometry.key_head_dim * itemsize
     value_bytes = geometry.value_head_dim * itemsize
-    if tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT:
-        # The pooled GDN kernel reads conv rows in [Q | K | V] order with
-        # no row permutation, so a pair-blocked transfer would mix up Q and
-        # K channels. With fp32 conv, each rank's Q and K slices are whole
-        # 1,024-B tiles up to an 8-way head split.
-        raise ManifestError(
-            "TPU_GDN_CONV_QK_PAIR_LAYOUT is not readable by the pooled GDN "
-            "kernel; unset it to use the per-segment conv layout"
-        )
     q_offset = 0
     k_offset = geometry.local_key_heads * key_bytes
     v_offset = 2 * geometry.local_key_heads * key_bytes

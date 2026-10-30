@@ -46,7 +46,6 @@ import json
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import (
     PoolByteSpan,
     PoolSpanRegistration,
@@ -67,6 +66,10 @@ from vllm_torchtpu.distributed.kv_transfer.raiden.tags import (
     TAG_GDN_CONV,
     TAG_GDN_SSM,
     class_tag,
+)
+from vllm_torchtpu.gdn_pool_layout import (
+    DEFAULT_POOLED_GDN_CONV_STATE_DTYPE,
+    GRANULE_BYTES,
 )
 from vllm_torchtpu.kernels.gdn.head_geometry import derive_gdn_head_geometry
 
@@ -955,7 +958,6 @@ def measured_sol_layout_fingerprint(
             f"gate: measured={element_bits} expected=8"
         )
     version = package_version or importlib.metadata.version
-    qk_pair = tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT
     payload: dict[str, Any] = {
         "schema": SOL_FINGERPRINT_SCHEMA,
         "torch_tpu": version("torch_tpu"),
@@ -967,12 +969,12 @@ def measured_sol_layout_fingerprint(
         "fa_kernel_page_tokens": geometry.page_tokens,
         "fa_packing": geometry.packing,
         "pool_lane_width": LANE_WIDTH,
-        "gdn_conv_layout": "qk-pair-v1" if qk_pair else "legacy-split-qk",
     }
-    # See measured_fa_layout_fingerprint: pins the GDN state dtypes.
     unit_bytes = gdn_state_unit_bytes(manifest)
     if unit_bytes:
         payload["gdn_state_unit_bytes"] = unit_bytes
+        payload["gdn_state_granule_bytes"] = GRANULE_BYTES
+        payload["gdn_conv_state_dtype"] = DEFAULT_POOLED_GDN_CONV_STATE_DTYPE
     return canonical_fingerprint(payload), payload
 
 

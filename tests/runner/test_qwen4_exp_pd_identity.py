@@ -66,7 +66,7 @@ def ranks() -> list[dict]:
             ple_checkpoint="a" * 64,
             config={"hidden_size": 16},
             kv_scales=[(0, 0.5, 0.25)],
-            state_flags={"gdn_qk_pair": True},
+            state_flags={"gdn_conv_dtype": "torch.float32", "gdn_granule_bytes": 512},
         )
         for i in range(2)
     ]
@@ -126,3 +126,13 @@ def test_rank_identity_allows_owned_ple_shards_but_keeps_them_in_peer_signature(
     changed = canonical_rank_identity(rows, world_size=2)
     assert changed != first
     assert changed["ranks"][1]["ple_checkpoint"] == "c" * 64
+
+
+@pytest.mark.parametrize(
+    "field,value", [("gdn_conv_dtype", "torch.bfloat16"), ("gdn_granule_bytes", 1024)]
+)
+def test_rank_identity_binds_actual_state_abi(field, value):
+    rows = ranks()
+    rows[1]["state_flags"][field] = value
+    with pytest.raises(ValueError):
+        canonical_rank_identity(rows, world_size=2)

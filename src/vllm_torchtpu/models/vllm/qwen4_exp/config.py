@@ -13,6 +13,7 @@
 # limitations under the License.
 """Single admission boundary for the FP8, text-only TPU S1 implementation."""
 
+import math
 from collections.abc import Mapping
 
 import torch
@@ -27,6 +28,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm_torchtpu import envs
 from vllm_torchtpu.gdn_pool_layout import (
     DEFAULT_POOLED_GDN_CONV_STATE_DTYPE,
+    GRANULE_BYTES,
     unified_kv_layout_enabled_for_architecture,
 )
 from vllm_torchtpu.kernels.qwen4_exp.hc_prefill_policy import validate_hc_prefill_mode
@@ -81,8 +83,7 @@ def gdn_cache_spec(cfg):
         block_size=cfg.model_config.max_model_len,
         # The TPU adapter inserts a singleton axis before conv channels.
         shapes=(conv_shape[:-1] + (1, conv_shape[-1]), ssm_shape),
-        # The Qwen4 pool stores BF16 projected-input history; SSM storage
-        # follows the resolved upstream cache configuration.
+        # Conv storage follows the unified GDN ABI; SSM follows the cache dtype.
         dtypes=(
             torch_dtype_from_name(DEFAULT_POOLED_GDN_CONV_STATE_DTYPE),
             ssm_dtype,
@@ -207,8 +208,6 @@ def validate_config(cfg):
     quant = m.hf_config.to_dict().get("quantization_config")
     if not isinstance(quant, Mapping):
         raise ValueError("Qwen4Exp requires a quantization_config mapping")
-    # Model dimensions are input data. Only actual implementation contracts
-    # belong here; do not admit a single checkpoint by matching its literals.
     positive = (
         t.hidden_size,
         t.num_hidden_layers,
@@ -287,15 +286,16 @@ def validate_config(cfg):
         raise ValueError(
             "Qwen4Exp GDN requires integral TP heads and value/key head groups"
         )
-    # The selected GDN prefill loader slices whole 128-lane head tiles.
-    # The private-state wrapper also requires non-empty convolution history.
-    if (
-        t.linear_key_head_dim % 128
-        or t.linear_value_head_dim % 128
-        or t.linear_conv_kernel_dim <= 1
+    if t.linear_conv_kernel_dim <= 1:
+        raise ValueError("Qwen4Exp GDN requires nonempty convolution history")
+    gdn_spec = gdn_cache_spec(cfg)
+    # BF16 recurrent rows share a uint32 word in the unified state layout.
+    if (gdn_spec.dtypes[1] == torch.bfloat16 and t.linear_key_head_dim % 2) or any(
+        math.prod(shape) * dtype.itemsize % GRANULE_BYTES
+        for shape, dtype in zip(gdn_spec.shapes, gdn_spec.dtypes)
     ):
         raise ValueError(
-            "Qwen4Exp GDN requires head dimensions divisible by 128 and conv kernel > 1"
+            "Qwen4Exp GDN requires whole state granules and paired BF16 key rows"
         )
     validate_qsa_geometry(t, tp_size=tp, cache_dtype=c.cache_dtype)
     if c.block_size % t.indexer_compress_ratio:
@@ -321,7 +321,7 @@ def validate_config(cfg):
         or quant["weight_block_size"] != [128, 128]
         or quant["activation_scheme"] != "dynamic"
     ):
-        raise ValueError("Qwen4Exp TPU S1 requires the block128 FP8 checkpoint")
+        raise ValueError("Qwen4Exp projections require dynamic block128 FP8 weights")
     # use_sequence_parallel_moe is derived by upstream before this model
     # hook. TPU's existing platform_activation patch disables it afterward;
     # rejecting that intermediate property would block every mixed TP/DP.
@@ -347,9 +347,7 @@ def validate_config(cfg):
         raise ValueError(
             "Qwen4Exp StreamIndex top-k must be aligned to 16 in [16,4096]"
         )
-    # Request slots are sized from max_num_seqs and checked against HBM in
-    # Qwen4ExpPooledCache.allocate. Active work remains bounded by the token budget;
-    # the initial 64-slot bring-up was a test configuration, not a kernel cap.
+    # Request slots and active work follow scheduler capacities.
     if (
         m.dtype != torch.bfloat16
         or c.block_size <= 0

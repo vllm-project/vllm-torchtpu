@@ -16,7 +16,6 @@ import gc
 import re
 import weakref
 from types import SimpleNamespace
-from typing import Any
 from unittest.mock import MagicMock, call, patch
 
 import jax.numpy as jnp
@@ -1637,8 +1636,7 @@ def test_pooled_input_preparation_separates_cached_ops(
         preparation = dispatch.call_args.kwargs["prepare_input"]
         actual = projection if preparation is None else preparation(projection)
         torch.testing.assert_close(actual, projection + index)
-        expected_conv = jnp.bfloat16
-        assert dispatch.call_args.kwargs["conv_state_dtype"] == jnp.dtype(expected_conv)
+        assert attn.get_state_dtype()[0] == torch.float32
         assert dispatch.call_args.kwargs["recurrent_state_dtype"] == jnp.dtype(
             ssm_dtype
         )
@@ -1677,8 +1675,7 @@ def test_pooled_pcp_wrapper_forwards_state_formats(
         return_value=(operands[4], operands[0], operands[0]),
     ) as dispatch:
         function(*operands)
-    expected_conv = jnp.bfloat16
-    assert dispatch.call_args.kwargs["conv_state_dtype"] == jnp.dtype(expected_conv)
+    assert attn.get_state_dtype()[0] == torch.float32
     assert dispatch.call_args.kwargs["recurrent_state_dtype"] == jnp.dtype(ssm_dtype)
 
 

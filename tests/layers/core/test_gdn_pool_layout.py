@@ -71,25 +71,22 @@ def test_pooled_prepares_inside_real_shard_map(
         return Conv1DInput(values.astype(jnp.float32)[:, None, :], values.dtype)
 
     pool = jnp.zeros((3, 256, 1, 4, 256), jnp.int8)
-    specs, plans = [], []
+    specs, state_inputs = [], []
     shard_map = jax.shard_map
 
     def record_map(*args, **kwargs):
         specs.append(kwargs["in_specs"][0])
         return shard_map(*args, **kwargs)
 
-    def fused(inputs, b, a, conv, recurrent, *args, **kwargs):
-        assert conv is None and recurrent is None
-        assert kwargs["state_source"].shape == pool.shape
-        plan = kwargs["state_plan"]
-        plans.append(plan)
-        assert plan.stride == 1
-        assert plan.recurrent.nrows == 128
-        assert plan.conv.row0 == 128 and plan.conv.nrows == 4
-        assert plan.conv.view_dtype == jnp.bfloat16
+    def fused(inputs, b, a, states, *args, **kwargs):
+        assert states.shape == pool.shape
+        assert states.dtype == pool.dtype
+        assert kwargs["conv_dtype"] == jnp.dtype(jnp.float32)
+        assert kwargs["recurrent_dtype"] == jnp.dtype(jnp.float32)
+        state_inputs.append(states.shape)
         values = inputs.values[:, 0] if isinstance(inputs, Conv1DInput) else inputs
         dtype = inputs.output_dtype if isinstance(inputs, Conv1DInput) else inputs.dtype
-        return kwargs["state_source"], values[:, :256].astype(dtype)
+        return states, values[:, :256].astype(dtype)
 
     monkeypatch.setattr(jax, "shard_map", record_map)
     monkeypatch.setattr(gdn_attention.gdn_v3_wrapper, "fused_conv1d_gdn", fused)
@@ -121,7 +118,7 @@ def test_pooled_prepares_inside_real_shard_map(
         prepare_input=prepare_local if prepared else None,
         recurrent_state_dtype=jnp.float32,
     )
-    assert plans and len(specs) == 1
+    assert state_inputs and len(specs) == 1
     assert specs[0] == P(None, "model")
     assert prepared_shapes == ([(4, 512)] if prepared else [])
     assert output.dtype == projection.dtype

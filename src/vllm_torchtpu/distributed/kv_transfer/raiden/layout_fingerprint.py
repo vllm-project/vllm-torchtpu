@@ -27,7 +27,10 @@ import json
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu.gdn_pool_layout import (
+    DEFAULT_POOLED_GDN_CONV_STATE_DTYPE,
+    GRANULE_BYTES,
+)
 
 from .pool_manifest import (
     TAG_DSA_IDX,
@@ -188,21 +191,12 @@ def measured_fa_layout_fingerprint(
         "tiles": [list(tile) for tile in tiles],
         "element_size_in_bits": element_bits,
         "kv_layout": kv_layout,
-        # GDN conv state layout version.  Both sides of a disagg pair must
-        # agree: the byte-span convention (segment-major Q/K, or the QK
-        # pair-blocked spans an older build may still emit) is baked into
-        # the transfer plan, and the geometries are size-identical, so a
-        # mixed pair would not otherwise fail closed.  The controller
-        # compares fingerprints before emitting a plan.
-        "gdn_conv_layout": (
-            "qk-pair-v1" if tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT else "legacy-split-qk"
-        ),
     }
-    # The conv and SSM state dtypes are not visible in the layout version or
-    # the FA geometry, so a peer on another state dtype would otherwise pair.
     unit_bytes = gdn_state_unit_bytes(manifest)
     if unit_bytes:
         payload["gdn_state_unit_bytes"] = unit_bytes
+        payload["gdn_state_granule_bytes"] = GRANULE_BYTES
+        payload["gdn_conv_state_dtype"] = DEFAULT_POOLED_GDN_CONV_STATE_DTYPE
     return canonical_layout_fingerprint(payload), payload
 
 

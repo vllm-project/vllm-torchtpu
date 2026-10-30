@@ -371,15 +371,11 @@ def fused_conv1d_gdn(
             Conv1DInput with FP32 values and the original output dtype.
         b: b tensor (for beta) of shape [batch_size, n_v].
         a: a tensor (for g) of shape [batch_size, n_v].
-        conv_state: Convolution state cache tensor of shape [num_seqs + 1,
-            kernel_size - 1, dim_size] containing the last (kernel_size - 1) tokens
-            from the last sequence invocation. The first slot is a null block used for
-            padded or invalid tokens. It may contain garbage data if it is a first
-            invocation of a sequence. None when `state_source` carries the states.
-        recurrent_state: Recurrent state cache tensor of shape [num_seqs + 1, n_v,
-            d_k, d_v]. The first slot is a null block used for padded or invalid
-            tokens. It may contain garbage data if it is a first invocation of a
-            sequence. None when `state_source` carries the states.
+        states: FP32 convolution and BF16/FP32 recurrent state tensors as
+            `(conv, ssm)`, or one shared attention-shaped state pool. A shared
+            pool addresses the recurrent region followed by convolution in
+            granules; its dtypes are supplied explicitly. Slot 0 is reserved
+            for padded or invalid requests.
         conv_weight: Convolution weight tensor of shape [kernel_size - 1, dim_size].
         conv_bias: Optional convolution bias tensor of shape [dim_size].
         a_log: a_log tensor of shape [n_v].

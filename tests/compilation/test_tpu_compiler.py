@@ -80,16 +80,23 @@ class TestTpuCompilerCache:
         assert base != different_prefix
         assert base != different_mamba
 
-    def test_tpu_hash_covers_plugin_compile_env(self):
+    @pytest.mark.parametrize(
+        "name,first,second",
+        [
+            ("ONEHOT_MOE_PERMUTE_THRESHOLD", "0", "4096"),
+            ("TPU_GDN_COMPACT_INPUT", "0", "1"),
+        ],
+    )
+    def test_tpu_hash_covers_plugin_compile_env(self, name, first, second):
         from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
 
         with patch(
             "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
             return_value=[],
         ):
-            with patch.dict(os.environ, {"ONEHOT_MOE_PERMUTE_THRESHOLD": "0"}):
+            with patch.dict(os.environ, {name: first}):
                 disabled = compute_tpu_compilation_hash(self._config())
-            with patch.dict(os.environ, {"ONEHOT_MOE_PERMUTE_THRESHOLD": "4096"}):
+            with patch.dict(os.environ, {name: second}):
                 enabled = compute_tpu_compilation_hash(self._config())
 
         assert disabled != enabled

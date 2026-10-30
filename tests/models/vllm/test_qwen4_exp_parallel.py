@@ -61,6 +61,8 @@ def config(tp=1, dp=8):
         ),
         cache_config=NS(
             cache_dtype="auto",
+            mamba_cache_dtype="auto",
+            mamba_ssm_cache_dtype="float32",
             block_size=128,
             enable_prefix_caching=False,
             kv_cache_memory_bytes=None,

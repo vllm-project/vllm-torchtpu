@@ -178,7 +178,9 @@ def test_native_groups_last_blocks_and_real_capacity(
                 assert table[0] == gid + 1
             if name.endswith((".linear_attn", ".ple")):
                 assert metadata[name].mamba_state_indices[0] == gid + 1
-                expected_dtype = torch.bfloat16
+                expected_dtype = (
+                    torch.float32 if name.endswith(".linear_attn") else torch.bfloat16
+                )
                 assert specs[name].dtypes[0] == expected_dtype
 
 

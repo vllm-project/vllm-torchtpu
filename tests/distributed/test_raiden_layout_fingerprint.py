@@ -70,10 +70,9 @@ def test_measured_fa_layout_fingerprint_golden(monkeypatch):
         "tiles": [[4, 128], [4, 1]],
         "element_size_in_bits": 8,
         "kv_layout": "layer-major",
-        "gdn_conv_layout": "legacy-split-qk",
     }
     assert fingerprint == (
-        "491e9b375a38f65d175e6e38919d29af59bf5149a2c617d0bea69872e3431b77"
+        "57027b152e89a3a569fc8494c815e65d67d23dfe0ca0013ff7a62509046a70a7"
     )
     assert (
         rlf.canonical_layout_fingerprint(dict(reversed(list(payload.items()))))
@@ -119,26 +118,26 @@ def test_block_major_fingerprint_names_the_layout(monkeypatch):
         )
 
 
-def test_fingerprint_diverges_across_gdn_conv_layouts(monkeypatch):
-    """A mixed-layout disagg pair must not share a fingerprint: the conv
-    geometries are size-identical, so the layout version in the payload is
-    the only thing that fails such a pair closed."""
+@pytest.mark.parametrize("with_gdn", [False, True])
+def test_retired_qk_flag_does_not_change_actual_state_identity(monkeypatch, with_gdn):
+    manifest = _gdn_manifest() if with_gdn else _manifest()
 
     def measure():
         return rlf.measured_fa_layout_fingerprint(
-            _manifest(),
+            manifest,
             layout_getter=lambda tensor: ([4, 3, 2, 1, 0], [[4, 128], [4, 1]], 0),
             package_version=lambda package: "unused",
         )
 
     monkeypatch.setenv("TPU_GDN_CONV_QK_PAIR_LAYOUT", "1")
-    pair_fingerprint, pair_payload = measure()
+    first, payload = measure()
     monkeypatch.setenv("TPU_GDN_CONV_QK_PAIR_LAYOUT", "0")
-    legacy_fingerprint, legacy_payload = measure()
-
-    assert pair_payload["gdn_conv_layout"] == "qk-pair-v1"
-    assert legacy_payload["gdn_conv_layout"] == "legacy-split-qk"
-    assert pair_fingerprint != legacy_fingerprint
+    assert measure() == (first, payload)
+    if with_gdn:
+        assert payload["gdn_state_granule_bytes"] == 512
+        assert payload["gdn_conv_state_dtype"] == "torch.float32"
+    else:
+        assert "gdn_state_granule_bytes" not in payload
 
 
 def _gdn_manifest(*, key_heads=2, value_heads=8, conv_itemsize=4, ssm_itemsize=4):
