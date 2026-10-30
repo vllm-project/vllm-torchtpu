@@ -18,6 +18,7 @@ import functools
 from collections.abc import Callable
 from typing import Any
 
+import jax
 import torch
 from torch_tpu._internal import pallas
 
@@ -176,18 +177,18 @@ def _build_fused_moe_custom_op(
     # rank compiles an identical program.
     # See fa8faaf5 for background on rank-uniform sharding in compiled Pallas graphs.
     def wrapped_fn(
-        hidden_states,
-        w1,
-        w2,
-        w1_scale,
-        w2_scale,
-        w1_bias,
-        w2_bias,
-        topk_weights,
-        topk_ids,
-        experts_start,
-        hidden_scale,
-    ):
+        hidden_states: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array | None,
+        w2_scale: jax.Array | None,
+        w1_bias: jax.Array | None,
+        w2_bias: jax.Array | None,
+        topk_weights: jax.Array,
+        topk_ids: jax.Array,
+        experts_start: jax.Array | None,
+        hidden_scale: jax.Array | None,
+    ) -> jax.Array:
         return fused_moe_func(
             hidden_states,
             w1,
@@ -343,7 +344,7 @@ def build_moe_input_quantizer(
     if op is not None:
         return op
 
-    def quantize(hidden_states):
+    def quantize(hidden_states: jax.Array) -> tuple[jax.Array, jax.Array]:
         return quantize_moe_input(
             hidden_states,
             q_dtype=q_dtype,
