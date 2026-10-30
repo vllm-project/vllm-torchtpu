@@ -125,13 +125,24 @@ class TextOnlyLLMExportConfig(ModelExportConfig):
         return self.max_num_seqs + 1
 
     @property
+    def recurrent_window(self) -> int:
+        """Consecutive recurrent state slots a sequence holds: its state slot,
+        then under speculative decoding one checkpoint per draft token, so a
+        verify step that rejects drafts resumes from the accepted token's state.
+        """
+        if not self.speculative_config:
+            return 1
+        return int(self.speculative_config["num_speculative_tokens"]) + 1
+
+    @property
     def num_state_slots(self) -> int:
-        """Slots of each recurrent state pool: one per sequence plus null slot 0.
+        """Slots of each recurrent state pool: `recurrent_window` per sequence
+        plus null slot 0.
 
         A recurrent layer's state is fixed-size per sequence, so its pool is sized
         by `max_num_seqs`, not by the paged KV `num_blocks`.
         """
-        return self.max_num_seqs + 1
+        return self.max_num_seqs * self.recurrent_window + 1
 
 
 @runtime_checkable

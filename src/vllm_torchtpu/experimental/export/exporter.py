@@ -256,8 +256,16 @@ def _io_entry(
     return entry
 
 
+def _req_dist_len(model: api.ExportableTextOnlyLLM) -> int:
+    """Elements of `req_dist`: 3 for the attention kernel, and 3 more for the
+    recurrent kernels of a speculating recurrent model, whose windowed segment
+    also takes the verify windows that attention runs as mixed sequences."""
+    recurrent = any(n == "mamba_state_indices" for n, _ in _extra_user_inputs(model))
+    return 6 if recurrent and model.export_config.recurrent_window > 1 else 3
+
+
 def _user_inputs(
-    cfg: api.TextOnlyLLMExportConfig, bucket_size: int
+    cfg: api.TextOnlyLLMExportConfig, bucket_size: int, req_dist_len: int = 3
 ) -> list[tuple[str, tuple[int, ...]]]:
     """Returns `(name, shape)` of the int32 user inputs of `forward_bucket{B}`."""
     pos_shape = (
@@ -269,7 +277,7 @@ def _user_inputs(
         (cfg.max_num_seqs,),
         (cfg.max_num_pages,),
         (cfg.max_cu_seqs,),
-        (3,),
+        (req_dist_len,),
     )
     return list(zip(_USER_INPUT_NAMES, shapes, strict=True))
 
@@ -440,7 +448,8 @@ def _recurrent_serving_config(model: api.ExportableTextOnlyLLM) -> dict[str, int
     cfg = model.export_config
     if cfg.num_state_slots == cfg.num_blocks:
         raise ValueError(
-            f"num_blocks ({cfg.num_blocks}) equals num_state_slots (max_num_seqs + 1), "
+            f"num_blocks ({cfg.num_blocks}) equals num_state_slots "
+            f"(max_num_seqs x {cfg.recurrent_window} + 1), "
             "so the runtime could not tell KV pools from recurrent state pools; pass "
             "another --num-blocks"
         )
@@ -477,7 +486,7 @@ def _params_read_by_forward(
     bucket = min(cfg.token_buckets)
     mlir_text = tpu_lowering.lower_torch_forward_to_mlir(
         model,
-        user_inputs=_user_inputs(cfg, bucket),
+        user_inputs=_user_inputs(cfg, bucket, _req_dist_len(model)),
         forward_names=names,
         params_map=_norm_params(params_map),
         state_specs=_state_specs(model),
@@ -502,11 +511,12 @@ _MTP_PARAM_PREFIX = "mtp."
 
 
 def _mtp_user_inputs(
-    cfg: api.TextOnlyLLMExportConfig, bucket_size: int
+    model: api.ExportableTextOnlyLLM, bucket_size: int
 ) -> list[tuple[str, tuple[int, ...]]]:
     """`(name, shape)` of the int32 user inputs of `mtp_draft_bucket{B}`."""
+    cfg = model.export_config
     return [
-        *_user_inputs(cfg, bucket_size),
+        *_user_inputs(cfg, bucket_size, _req_dist_len(model)),
         (_MTP_LAST_TOKEN_INDICES, (cfg.max_num_seqs,)),
     ]
 
@@ -536,7 +546,7 @@ def _mtp_params(
         )
     cfg = model.export_config
     bucket = min(cfg.token_buckets)
-    user_inputs = _mtp_user_inputs(cfg, bucket)
+    user_inputs = _mtp_user_inputs(model, bucket)
     names = [n for n in params if n not in own] + list(own)
     mlir_text = tpu_lowering.lower_torch_mtp_draft_to_mlir(
         model,
@@ -608,7 +618,7 @@ def _export_text_only_llm_functions(
 
     forward_variants: dict[str, Any] = {}
     for b_idx, bucket_size in enumerate(cfg.token_buckets):
-        user_inputs = _user_inputs(cfg, bucket_size)
+        user_inputs = _user_inputs(cfg, bucket_size, _req_dist_len(model))
         fwd_mlir = tpu_lowering.lower_torch_forward_to_mlir(
             model,
             user_inputs=user_inputs,
@@ -839,7 +849,7 @@ def _export_mtp_draft(
 
     variants: dict[str, Any] = {}
     for b_idx, bucket_size in enumerate(cfg.token_buckets):
-        user_inputs = _mtp_user_inputs(cfg, bucket_size)
+        user_inputs = _mtp_user_inputs(model, bucket_size)
         hidden = api.ShapeDtypeStruct((bucket_size, cfg.hidden_size), act_dtype_str)
         mlir = tpu_lowering.lower_torch_mtp_draft_to_mlir(
             model,
