@@ -1590,15 +1590,16 @@ class Qwen38SegmentDriver:
         logger.info("Qwen3.8 MTP draft tail kernel attached, rows buckets %s", self.buckets)
 
     def _shadow_step(self, runner: Any, input_ids: Any, positions: Any, kw: dict,
-                     real: bool = True) -> Any:
+                     real: bool = True, n_req: int = 0) -> Any:
         """Run the kernel program (no GDN writes) then the stock model; log, return stock."""
         with self._contexts(runner, "model_mk_segments_shadow"):
             mk = self.shadow(input_ids=input_ids, positions=positions, **kw)
         stock = runner.model(input_ids=input_ids, positions=positions, **kw)
         if not real:  # warmup: compile this bucket's shadow program, compare nothing
             return stock
+        # n_req, not rows // T: a padded request slot (stale context_lens) is no request.
         self._log_per_request(runner, mk, stock, None, None, kw, positions,
-                              int(input_ids.shape[0]), 0)
+                              int(input_ids.shape[0]), n_req)
         mk_h = mk[0] if isinstance(mk, (tuple, list)) else mk
         st_h = stock[0] if isinstance(stock, (tuple, list)) else stock
         d = (mk_h.float() - st_h.float()).abs()
@@ -1809,7 +1810,7 @@ class Qwen38SegmentDriver:
             ):
                 self.check_warm.add(rows)
                 self._note(f"check_b{rows}" if check_real else f"check_warm_b{rows}")
-                out = self._shadow_step(runner, input_ids, positions, kw, check_real)
+                out = self._shadow_step(runner, input_ids, positions, kw, check_real, n_req)
             elif (
                 self.wholecheck_left > 0
                 and self.whole_shadow is not None
