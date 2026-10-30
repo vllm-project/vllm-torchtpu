@@ -141,14 +141,29 @@ class SmemWrapper:
 
     data: Any
     shape: tuple[int, ...] = dataclasses.field(metadata=dict(static=True))
+    # When set, the leading (step) index wraps modulo this power of two, so the
+    # `shape[0] == ring_steps` steps held are a sliding window of a longer schedule.
+    ring_steps: int | None = dataclasses.field(
+        default=None, kw_only=True, metadata=dict(static=True)
+    )
 
     @classmethod
-    def create_shape_dtype(cls, shape):
-        return cls(data=jax.ShapeDtypeStruct((np.prod(shape),), jnp.int32), shape=shape)
+    def create_shape_dtype(cls, shape, ring_steps=None):
+        return cls(
+            data=jax.ShapeDtypeStruct((np.prod(shape),), jnp.int32),
+            shape=shape,
+            ring_steps=ring_steps,
+        )
 
-    def _get_pos(self, indices):
+    def _wrap_step(self, indices):
         if not isinstance(indices, tuple):
             indices = (indices,)
+        if self.ring_steps is None:
+            return indices
+        return (indices[0] & (self.ring_steps - 1), *indices[1:])
+
+    def _get_pos(self, indices):
+        indices = self._wrap_step(indices)
         strides = pl.strides_from_shape(self.shape)
         assert len(strides) == len(indices)
         pos = 0
@@ -173,7 +188,7 @@ class SmemArrayOfStructs(SmemWrapper):
 
     @classmethod
     def create_shape_dtype(
-        cls, shape, struct_cls, struct_size
+        cls, shape, struct_cls, struct_size, ring_steps=None
     ):  # pytype: disable=bad-override
         assert struct_size == struct_cls.num_fields()
         return cls(
@@ -181,9 +196,11 @@ class SmemArrayOfStructs(SmemWrapper):
             shape=shape,
             struct_cls=struct_cls,
             struct_size=struct_size,
+            ring_steps=ring_steps,
         )
 
     def _get_pos(self, indices):
+        indices = self._wrap_step(indices)
         strides = pl.strides_from_shape(self.shape)
         assert len(strides) == len(indices)
 
@@ -275,14 +292,15 @@ class RpaSchedule:
         dma_kv_new_struct_cls: type[DmaNew] = SeqAlongLaneDmaNew,
         multiplier: int = 1,
         per_page_kv_cache_dma: bool = False,
+        ring_steps: int | None = None,
     ):
-        effective_max_steps = cfgs.max_steps_ub * multiplier
+        """`ring_steps` sizes an SMEM window of that many steps instead."""
+        effective_max_steps = ring_steps or cfgs.max_steps_ub * multiplier
+        ring = functools.partial(SmemWrapper.create_shape_dtype, ring_steps=ring_steps)
 
-        idx_wrapper = SmemWrapper.create_shape_dtype(
-            (effective_max_steps, cfgs.batch_size)
-        )
+        idx_wrapper = ring((effective_max_steps, cfgs.batch_size))
 
-        steps_wrapper = SmemWrapper.create_shape_dtype((effective_max_steps,))
+        steps_wrapper = ring((effective_max_steps,))
 
         return cls(
             s_idx=idx_wrapper,
@@ -290,13 +308,9 @@ class RpaSchedule:
             k_idx=idx_wrapper,
             is_last_k=idx_wrapper,
             do_writeback=idx_wrapper,
-            dma_q=SmemWrapper.create_shape_dtype(
-                (effective_max_steps, cfgs.batch_size, 2)
-            ),
+            dma_q=ring((effective_max_steps, cfgs.batch_size, 2)),
             dma_kv_cache=(
-                SmemWrapper.create_shape_dtype(
-                    (effective_max_steps, cfgs.batch_size, cfgs.bkv_p_cache, 3)
-                )
+                ring((effective_max_steps, cfgs.batch_size, cfgs.bkv_p_cache, 3))
                 if per_page_kv_cache_dma
                 else None
             ),
@@ -309,6 +323,7 @@ class RpaSchedule:
                 ),
                 struct_cls=dma_kv_new_struct_cls,
                 struct_size=cfgs.dma_kv_new_size,
+                ring_steps=ring_steps,
             ),
             total_wait_kv_in=steps_wrapper,
             total_wait_kv_out=steps_wrapper,
@@ -606,7 +621,10 @@ class BaseMetadataComputer:
 
     @classmethod
     def get_rpa_schedule(
-        cls, cfgs: configs.RpaConfigs, multiplier: int = 1
+        cls,
+        cfgs: configs.RpaConfigs,
+        multiplier: int = 1,
+        ring_steps: int | None = None,
     ) -> RpaSchedule:
         """Returns the RpaSchedule shape/dtype struct for this metadata computer."""
         dma_kv_new_struct_cls = (
@@ -618,6 +636,7 @@ class BaseMetadataComputer:
             cfgs,
             dma_kv_new_struct_cls=dma_kv_new_struct_cls,
             multiplier=multiplier,
+            ring_steps=ring_steps,
         )
 
     def __init__(
@@ -917,6 +936,241 @@ class BaseMetadataComputer:
         )  # pytype: disable=bad-argument-type
         init_carry = LoopCarry(0, 0)
         return jax.lax.fori_loop(start_seq_idx, end_seq_idx, seq_loop_fn, init_carry)
+
+
+# RPAd can generate its decode schedule itself (`DecodeScheduleStream`): step
+# t writes step t + STREAM_LOOKAHEAD, after step t's copy_in has read step t + 2,
+# and the pipeline reads steps t - 2 .. t + 2, so the SMEM ring holds at least
+# STREAM_LOOKAHEAD + 3 steps.
+STREAM_LOOKAHEAD = 3
+STREAM_RING_STEPS = 8
+assert STREAM_LOOKAHEAD >= 3
+assert STREAM_RING_STEPS >= STREAM_LOOKAHEAD + 3
+assert STREAM_RING_STEPS & (STREAM_RING_STEPS - 1) == 0
+
+
+def streams_decode_schedule(
+    cfgs: configs.RpaConfigs, computer_cls: type[BaseMetadataComputer]
+) -> bool:
+    """Whether the RPA kernel generates this call's schedule itself."""
+    return (
+        cfgs.mode == configs.RpaCase.DECODE
+        and computer_cls is BaseMetadataComputer
+        # One q block per decode sequence.
+        and cfgs.bq_sz >= cfgs.serve.decode_query_size
+    )
+
+
+class DecodeScheduleStream:
+    """Decode schedule entries generated in-kernel, equal to the schedule kernel's.
+
+    A decode sequence has one q block, so the schedule kernel's work items are
+    the KV blocks start_k..end_k - 1 of each sequence in turn, item i landing on
+    (step i // batch_size, lane i % batch_size). `init` tabulates the sequences
+    that have items, with their per-sequence schedule values; `generate_step`
+    then walks a cursor over that table, one item per lane, with no branches,
+    so a step's generation interleaves with the RPA step's vector work.
+    """
+
+    # Columns of the per-sequence table.
+    _S_IDX, _ITEM_END, _K_OFFSET, _Q_END, _Q_SRC, _Q_SZ, _KV_CACHE, _KV_NEW, _END_K = (
+        range(9)
+    )
+    _NUM_COLS = 9
+
+    @classmethod
+    def scratch_shapes(cls, cfgs: configs.RpaConfigs):
+        # One row per sequence with items, then a sentinel row that ends the walk.
+        return (
+            pltpu.SMEM(((cfgs.serve.num_seqs + 1) * cls._NUM_COLS,), jnp.int32),
+            pltpu.SMEM((2,), jnp.int32),  # cursor row, total items
+        )
+
+    def __init__(
+        self,
+        schedule: RpaSchedule,
+        scratch: tuple[jax.Ref, jax.Ref],
+        *,
+        cu_q_lens_ref: jax.Ref,
+        q_offsets_ref: jax.Ref,
+        kv_cache_lens_ref: jax.Ref,
+        kv_new_lens_ref: jax.Ref,
+        distribution_ref: jax.Ref,
+        cfgs: configs.RpaConfigs,
+    ):
+        self.schedule = schedule
+        self.table_ref, self.state_ref = scratch
+        self.cu_q_lens_ref = cu_q_lens_ref
+        self.q_offsets_ref = q_offsets_ref
+        self.kv_cache_lens_ref = kv_cache_lens_ref
+        self.kv_new_lens_ref = kv_new_lens_ref
+        self.distribution_ref = distribution_ref
+        self.cfgs = cfgs
+
+    def _cell(self, row, col):
+        return self.table_ref.at[row * self._NUM_COLS + col]
+
+    def init(self) -> jax.Array:
+        """Tabulates the sequences with items and returns the number of steps."""
+        cfgs = self.cfgs
+        computer = BaseMetadataComputer(self.schedule, None, None, cfgs=cfgs)
+        start_seq, end_seq = cfgs.seq_range(self.distribution_ref)
+        assert isinstance(start_seq, int) and start_seq == 0
+
+        def body(s_idx, carry):
+            row, total = carry
+            q_start = self.cu_q_lens_ref[s_idx]
+            q_end = self.cu_q_lens_ref[s_idx + 1]
+            kv_cache_len = self.kv_cache_lens_ref[s_idx]
+            kv_new_len = self.kv_new_lens_ref[s_idx]
+            q_src, q_sz_task, start_k, end_k = computer.q_block(
+                0,
+                q_start=q_start,
+                q_end=q_end,
+                q_offset=self.q_offsets_ref[s_idx],
+                kv_cache_len=kv_cache_len,
+                num_k=pl.cdiv(kv_cache_len + kv_new_len, cfgs.bkv_sz),
+            )
+            has_items = (s_idx < end_seq) & (q_end > q_start) & (end_k > start_k)
+            num_items = jnp.where(has_items, end_k - start_k, 0)
+            # Written unconditionally: a sequence without items leaves `row` where
+            # it is, and the next sequence (or the sentinel) overwrites it.
+            values = {
+                self._S_IDX: s_idx,
+                self._ITEM_END: total + num_items,
+                self._K_OFFSET: start_k - total,
+                self._Q_END: q_end,
+                self._Q_SRC: q_src,
+                self._Q_SZ: q_sz_task,
+                self._KV_CACHE: kv_cache_len,
+                self._KV_NEW: kv_new_len,
+                self._END_K: end_k,
+            }
+            for col, value in values.items():
+                self._cell(row, col)[...] = value
+            return row + has_items.astype(jnp.int32), total + num_items
+
+        num_rows, total = jax.lax.fori_loop(
+            0, cfgs.serve.num_seqs, body, (jnp.int32(0), jnp.int32(0))
+        )
+        # Sentinel: the cursor never passes it, and its zeros give the schedule
+        # kernel's masked entry.
+        for col in range(self._NUM_COLS):
+            self._cell(num_rows, col)[...] = 0
+        self._cell(num_rows, self._ITEM_END)[...] = jnp.iinfo(jnp.int32).max
+        self.state_ref[0] = 0
+        self.state_ref[1] = total
+        return pl.cdiv(total, cfgs.batch_size)
+
+    @jax.named_scope("stream_decode_schedule")
+    def generate_step(self, step: jax.typing.ArrayLike) -> None:
+        """Writes every lane's entry of `step` and the step's wait counts.
+
+        Steps must be generated in order. Each lane's entry is built in
+        registers, and the wait counts are summed from those values rather than
+        read back from SMEM.
+        """
+        cfgs = self.cfgs
+        recorder = _StepRecorder(cfgs)
+        computer = BaseMetadataComputer(recorder.schedule, None, None, cfgs=cfgs)
+        row = self.state_ref[0]
+        total = self.state_ref[1]
+        tokens = (0, 0, 0, 0)
+        for lane in range(cfgs.batch_size):
+            item = step * cfgs.batch_size + lane
+            # Every tabulated sequence has an item, so one item moves at most a row.
+            row = row + (item >= self._cell(row, self._ITEM_END)[...]).astype(jnp.int32)
+
+            def col(c, row=row):
+                return self._cell(row, c)[...]
+
+            valid = item < total
+            s_idx = col(self._S_IDX)
+            computer.write_entry(
+                0,
+                lane,
+                jnp.where(valid, item + col(self._K_OFFSET), 0),
+                s_idx=s_idx,
+                q_idx=0,
+                q_end=col(self._Q_END),
+                q_src=col(self._Q_SRC),
+                q_sz_task=col(self._Q_SZ),
+                kv_cache_len=col(self._KV_CACHE),
+                kv_new_len=col(self._KV_NEW),
+                end_k_idx=col(self._END_K),
+            )
+            recorder.schedule.s_idx[0, lane] = jnp.where(valid, s_idx, -1)
+            lane_tokens = _lane_wait_tokens(recorder.schedule, 0, lane, cfgs=cfgs)
+            tokens = tuple(t + n for t, n in zip(tokens, lane_tokens))
+            recorder.store(self.schedule, step)
+        self.state_ref[0] = row
+        _store_step_waits(self.schedule, step, tokens, cfgs=cfgs)
+
+
+class _RecordedRef:
+    """Stands in for one schedule field's SMEM ref, keeping stores as values."""
+
+    def __init__(self):
+        self.values = {}
+
+    def __setitem__(self, pos, value):
+        self.values[pos] = value
+
+    def __getitem__(self, pos):
+        return self.values[pos]
+
+    @property
+    def at(self):
+        return _RecordedAt(self)
+
+
+@dataclasses.dataclass(frozen=True)
+class _RecordedAt:
+    ref: _RecordedRef
+
+    def __getitem__(self, pos):
+        return _RecordedCell(self.ref, pos)
+
+
+@dataclasses.dataclass(frozen=True)
+class _RecordedCell:
+    ref: _RecordedRef
+    pos: int
+
+    def __setitem__(self, idx, value):
+        assert idx is Ellipsis
+        self.ref[self.pos] = value
+
+    def __getitem__(self, idx):
+        assert idx is Ellipsis
+        return self.ref[self.pos]
+
+
+class _StepRecorder:
+    """A one-step RpaSchedule whose fields hold traced values, not SMEM.
+
+    Indexing it at step 0 with static lanes gives static positions, which double
+    as the field offsets within one step of the real schedule.
+    """
+
+    def __init__(self, cfgs: configs.RpaConfigs):
+        shapes = BaseMetadataComputer.get_rpa_schedule(cfgs, ring_steps=1)
+        self.step_sizes = [x.shape[0] for x in jax.tree_util.tree_leaves(shapes)]
+        self.schedule = jax.tree.map(lambda _: _RecordedRef(), shapes)
+
+    def store(self, schedule: RpaSchedule, step: jax.typing.ArrayLike) -> None:
+        """Stores the values recorded since the last call into `step` of `schedule`."""
+        ring_steps = schedule.s_idx.ring_steps
+        slot = step if ring_steps is None else step & (ring_steps - 1)
+        recorded = jax.tree_util.tree_leaves(
+            self.schedule, is_leaf=lambda x: isinstance(x, _RecordedRef)
+        )
+        refs = jax.tree_util.tree_leaves(schedule)
+        assert len(recorded) == len(refs) == len(self.step_sizes)
+        for rec, ref, size in zip(recorded, refs, self.step_sizes):
+            for pos, value in rec.values.items():
+                ref[slot * size + pos] = value
+            rec.values.clear()
 
 
 def rpa_metadata_schedule_kernel(

@@ -800,16 +800,19 @@ def ragged_paged_attention(
             computer_cls = schedule.BaseMetadataComputer
             extra_scalars = ()
 
-        schedule_hbm = schedule.generate_rpa_metadata(
-            cu_q_lens,
-            q_offsets,
-            kv_cache_lens,
-            kv_new_lens,
-            distribution,
-            cfgs=cfgs,
-            computer_cls=computer_cls,
-            extra_scalars=extra_scalars,
-        )
+        streaming = schedule.streams_decode_schedule(cfgs, computer_cls)
+        schedule_hbm = None
+        if not streaming:
+            schedule_hbm = schedule.generate_rpa_metadata(
+                cu_q_lens,
+                q_offsets,
+                kv_cache_lens,
+                kv_new_lens,
+                distribution,
+                cfgs=cfgs,
+                computer_cls=computer_cls,
+                extra_scalars=extra_scalars,
+            )
         result = kernel.rpa_kernel(
             cu_q_lens,
             q_offsets,
@@ -823,6 +826,7 @@ def ragged_paged_attention(
             lse_hbm_in,
             cfgs=cfgs,
             computer_cls=computer_cls,
+            distribution=distribution if streaming else None,
         )
         if return_lse:
             o_out, kv_out, lse_out = result

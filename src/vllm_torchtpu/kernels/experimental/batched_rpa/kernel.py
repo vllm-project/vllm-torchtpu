@@ -466,6 +466,9 @@ def rpa_body(
     # `pipeline.py`
     start_next_fetch: Callable[[], None],
     start_kv_writeback: Callable[[], None],
+    # Scalar work for a later step, issued where the scheduler can overlap it
+    # with this step's vector work.
+    prepare_ahead: Callable[[], None] | None = None,
 ):
     del slot
 
@@ -518,6 +521,8 @@ def rpa_body(
         start_kv_writeback()
 
     start_next_fetch()
+    if prepare_ahead is not None:
+        prepare_ahead()
 
     # Step 2a: Fetch mask metadata after the fence to overlap with compute and
     # in-flight writeback.
@@ -901,7 +906,7 @@ def rpa_kernel(
     kv_cache_lens: jax.Array,
     kv_new_lens: jax.Array,
     page_indices: jax.Array,
-    schedule_hbm: schedule.RpaSchedule,
+    schedule_hbm: schedule.RpaSchedule | None,
     q_hbm: jax.Array,
     new_kv_hbm: jax.Array,
     kv_cache_hbm: jax.Array,
@@ -909,6 +914,7 @@ def rpa_kernel(
     *,
     cfgs: configs.RpaConfigs,
     computer_cls: type[schedule.BaseMetadataComputer] = schedule.BaseMetadataComputer,
+    distribution: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
     """Perform batched ragged paged attention with scheduler data.
 
@@ -922,7 +928,9 @@ def rpa_kernel(
         page_indices: [max_num_seqs * pages_per_seqs]. kv cache page table of each
             sequence.
         schedule_hbm: Output of scheduler kernel. It informs which: 1. seqs 2. q
-            block 3. kv block that should be processed at a given step.
+            block 3. kv block that should be processed at a given step. None when
+            `schedule.streams_decode_schedule`: the kernel then generates the
+            schedule itself, a few steps ahead of its pipeline.
         q_hbm: [max_num_tokens, num_q_heads_per_kv_heads, cdiv(num_kv_heads,
             q_packing), q_packing, head_dim]. Output of q projection that has been
             pre-processed to align with existing kv cache data layout.
@@ -934,6 +942,8 @@ def rpa_kernel(
             concatenated along num kv heads dim.
         lse_hbm: pre-allocated buffer for LSE output. None when return_lse=False.
         cfgs: Configuration of the kernel.
+        distribution: [3]. Sequence-kind boundaries; only read, and only
+            required, when schedule_hbm is None.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -942,6 +952,9 @@ def rpa_kernel(
         lse_out: [max_num_tokens, num_q_heads] LSE values, or None.
     """
     return_lse = cfgs.serve.return_lse
+    streaming = schedule_hbm is None
+    assert streaming == schedule.streams_decode_schedule(cfgs, computer_cls)
+    assert streaming == (distribution is not None)
 
     def ragged_paged_attention_pipeline(
         # Scalar prefetch.
@@ -960,6 +973,8 @@ def rpa_kernel(
         o_hbm_ref: jax.Ref,
         o_kv_cache_hbm_ref: jax.Ref,
         o_lse_hbm_ref: jax.Ref | None = None,
+        *,
+        distribution_ref: jax.Ref | None = None,
     ):
         del o_kv_cache_hbm_ref
         if o_lse_hbm_ref is not None:
@@ -969,12 +984,16 @@ def rpa_kernel(
             kv_cache_hbm_ref, q_hbm_ref, lse_hbm_ref, cfgs
         )
 
-        actual_steps = schedule_hbm_ref.actual_steps[0]
-        num_safe_step_iterations = pl.cdiv(actual_steps, cfgs.max_steps_ub)
-
         @pl.with_scoped(
             final_allocs=(q_alloc, kv_cache_alloc, o_alloc, lse_alloc),
-            schedule_ref=computer_cls.get_rpa_schedule(cfgs).scratch_shapes(),
+            schedule_ref=computer_cls.get_rpa_schedule(
+                cfgs, ring_steps=schedule.STREAM_RING_STEPS if streaming else None
+            ).scratch_shapes(),
+            stream_scratch=(
+                schedule.DecodeScheduleStream.scratch_shapes(cfgs)
+                if streaming
+                else None
+            ),
             dma_sem=pltpu.SemaphoreType.DMA((1,)),
             scratches=(
                 pltpu.VMEM(
@@ -991,7 +1010,7 @@ def rpa_kernel(
                 ),  # acc
             ),
         )
-        def _run(final_allocs, schedule_ref, dma_sem, scratches):
+        def _run(final_allocs, schedule_ref, stream_scratch, dma_sem, scratches):
             # Initialize Q to zeros to prevent NaN pollution.
             #
             # When a query block is partially filled, tail slots in uninitialized VMEM
@@ -1052,7 +1071,9 @@ def rpa_kernel(
                         dma_list.append(copy)
                 jax.tree.map(lambda x: x.wait(), dma_list)
 
-                total_steps = num_steps + prefix_steps
+                run_pipeline(num_steps + prefix_steps)
+
+            def run_pipeline(total_steps, prepare_ahead=None):
                 kv_bound = kv_cache_alloc.bind(
                     src_ref=(
                         kv_cache_hbm_ref,
@@ -1102,6 +1123,11 @@ def rpa_kernel(
                         cfgs=cfgs,
                         start_next_fetch=start_next_fetch,
                         start_kv_writeback=start_kv_writeback,
+                        prepare_ahead=(
+                            None
+                            if prepare_ahead is None
+                            else functools.partial(prepare_ahead, step)
+                        ),
                     )
 
                 pipeline.run_manual_triple_buffer(
@@ -1112,6 +1138,35 @@ def rpa_kernel(
                     kv_bound,
                     lse_bref=lse_bound,
                 )
+
+            if streaming:
+                stream = schedule.DecodeScheduleStream(
+                    schedule_ref,
+                    stream_scratch,
+                    cu_q_lens_ref=cu_q_lens_ref,
+                    q_offsets_ref=q_offsets_ref,
+                    kv_cache_lens_ref=kv_cache_lens_ref,
+                    kv_new_lens_ref=kv_new_lens_ref,
+                    distribution_ref=distribution_ref,
+                    cfgs=cfgs,
+                )
+                stream_steps = stream.init()
+
+                @pl.when(stream_steps > 0)
+                def _stream():
+                    for step in range(schedule.STREAM_LOOKAHEAD):
+                        stream.generate_step(step)
+                    run_pipeline(
+                        stream_steps,
+                        prepare_ahead=lambda step: stream.generate_step(
+                            step + schedule.STREAM_LOOKAHEAD
+                        ),
+                    )
+
+                return
+
+            actual_steps = schedule_hbm_ref.actual_steps[0]
+            num_safe_step_iterations = pl.cdiv(actual_steps, cfgs.max_steps_ub)
 
             @pl.loop(0, num_safe_step_iterations)
             def loop_body(step_idx):
@@ -1132,6 +1187,15 @@ def rpa_kernel(
         kv_new_lens,
         page_indices,
     )
+    kernel_fn = ragged_paged_attention_pipeline
+    if streaming:
+        scalar_prefetches += (distribution,)
+
+        def kernel_fn(*refs):
+            return ragged_paged_attention_pipeline(
+                *refs[:5], *refs[6:], distribution_ref=refs[5]
+            )
+
     num_scalar_prefetch = len(scalar_prefetches)
     num_active_scalers = len(scalar_prefetches)
 
@@ -1148,12 +1212,12 @@ def rpa_kernel(
         )
 
     return pl.pallas_call(
-        ragged_paged_attention_pipeline,
+        kernel_fn,
         out_shape=out_shape,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=num_scalar_prefetch,
             in_specs=[
-                schedule_hbm.in_specs(),
+                schedule_hbm.in_specs() if schedule_hbm is not None else None,
                 pl.BlockSpec(memory_space=pltpu.HBM),  # q_hbm_ref
                 pl.BlockSpec(memory_space=pltpu.HBM),  # new_kv_hbm_ref
                 pl.BlockSpec(memory_space=pltpu.HBM),  # kv_cache_hbm_ref
@@ -1176,11 +1240,7 @@ def rpa_kernel(
         name=get_kernel_name(cfgs),
         metadata=get_kernel_metadata(cfgs),
     )(
-        cu_q_lens,
-        q_offsets,
-        kv_cache_lens,
-        kv_new_lens,
-        page_indices,
+        *scalar_prefetches,
         schedule_hbm,
         q_hbm,
         new_kv_hbm,
