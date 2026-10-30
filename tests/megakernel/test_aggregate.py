@@ -284,6 +284,33 @@ def test_aggregate_hands_the_decoders_tensors_to_the_prefill():
     assert len(calls) == 2
 
 
+def test_aggregate_aligns_prefiller_pool_order_to_decoder_mesh_rank(
+    monkeypatch, tmp_path
+):
+    from vllm_torchtpu.megakernel.kimi_k3 import aggregate as agg_mod
+    from vllm_torchtpu.megakernel.kimi_k3 import prefill as prefill_mod
+    from vllm_torchtpu.megakernel.kimi_k3 import program as prog_mod
+
+    seen = {}
+
+    def fake_build_decoder(cfg, presharded, draft, *, tp_rank):
+        seen["decoder_tp_rank"] = tp_rank
+        return types.SimpleNamespace(rank=8)
+
+    def fake_prefiller(cfg, presharded, draft, *, tp_rank):
+        seen["prefiller_tp_rank"] = tp_rank
+        return types.SimpleNamespace(rank=8)
+
+    monkeypatch.setattr(
+        agg_mod, "active", lambda: KernelConfig(prefill_expert_parallel=8)
+    )
+    monkeypatch.setattr(prog_mod, "build_decoder", fake_build_decoder)
+    monkeypatch.setattr(prefill_mod, "KimiPrefiller", fake_prefiller)
+    engine = KimiAggregate(_engine_config(), tmp_path, tp_rank=0)
+    assert engine.rank == 8
+    assert seen == {"decoder_tp_rank": 0, "prefiller_tp_rank": 8}
+
+
 def test_aggregate_caches_prompt_tokens_only():
     from vllm_torchtpu import _cache_only_prefill_tokens
 

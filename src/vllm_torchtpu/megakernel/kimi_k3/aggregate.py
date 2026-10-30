@@ -131,13 +131,18 @@ class KimiAggregate:
         self.decoder = build_decoder(
             role_config(config, "decode"), presharded, draft_checkpoint, tp_rank=tp_rank
         )
+        # In the aggregate engine, the prefill and decoder share the unified
+        # pools on each device without a KV connector transfer; the decoder
+        # indexes the pools by its kernel mesh position (self.decoder.rank), so
+        # the prefill writes pages and KDA states in that same order.
         self.prefiller = KimiPrefiller(
             role_config(config, "prefill"),
             presharded,
             draft_checkpoint,
-            tp_rank=tp_rank,
+            tp_rank=self.decoder.rank,
         )
         self.rank = self.decoder.rank
+        self._prefill_ep = kernel.prefill_expert_parallel
         self._loaded = False
 
     def load_weights(self) -> None:
@@ -153,7 +158,7 @@ class KimiAggregate:
         weights = self.decoder.ops.weights
         kernel = active()
         shared_names = list(PREFILL_SHARED)
-        if kernel.prefill_expert_parallel != 8:
+        if getattr(self, "_prefill_ep", 8) != 8:
             excluded = set(EXPERT_FAMILIES)
             if kernel.prefill_expert_plan:
                 excluded.update(("router", "router_bias"))
