@@ -164,8 +164,8 @@ def _fused_rope_quant(x, w_q, w_s, positions, cos_sin_cache, interpret=False):
         w_q,
         w_s,
         rope.LANE,
-        rope.rope_lanes,
-        rope.cos_sin_lanes,
+        rope.rope_lanes_signed_partner,
+        rope.cos_signed_sin_lanes,
         positions,
         cos_sin_cache,
         quant_dtype=FP8,
@@ -173,19 +173,17 @@ def _fused_rope_quant(x, w_q, w_s, positions, cos_sin_cache, interpret=False):
     )
 
 
-# Several row blocks, weight tiles, row sub-blocks and epilogue passes, and one
-# of each.
+# Several row blocks, weight tiles and epilogue passes, and one of each.
 @pytest.mark.parametrize(
-    "m,k,n,block_rows,pass_rows,sub_rows",
-    [(256, 256, 8192, 128, 32, 64), (64, 128, 4096, 64, 64, 128)],
+    "m,k,n,block_rows,quant_rows",
+    [(256, 256, 8192, 128, 32), (64, 128, 4096, 64, 64)],
 )
 def test_quantized_matmul_heads_rope_quant_matches_unfused(
-    monkeypatch, m, k, n, block_rows, pass_rows, sub_rows
+    monkeypatch, m, k, n, block_rows, quant_rows
 ):
     monkeypatch.setattr(rope, "HEADS_BLOCK_ROWS", block_rows)
     monkeypatch.setattr(rope, "HEADS_MIN_ROWS", 32)
-    monkeypatch.setattr(rope, "HEADS_QUANT_PASS_ROWS", pass_rows)
-    monkeypatch.setattr(rope, "HEADS_QUANT_SUB_ROWS", sub_rows)
+    monkeypatch.setattr(rope, "HEADS_QUANT_ROWS", quant_rows)
     x, w_q, w_s, positions, cos_sin_cache = _operands(m, k, n)
     got_q, got_s = _fused_rope_quant(
         x, w_q, w_s, positions, cos_sin_cache, interpret=True

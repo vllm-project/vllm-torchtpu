@@ -35,7 +35,7 @@ from vllm_torchtpu.kernels.deepseek_v4.rope import (
     cos_signed_sin_lanes,
     quantized_matmul_heads,
     quantized_matmul_heads_supported,
-    rope_lanes_signed,
+    rope_lanes_signed_partner,
     rope_quant_flat,
 )
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
@@ -185,7 +185,7 @@ def _wq_b_indexer_jax(
         w_q,
         w_s,
         head_dim,
-        rope_lanes_signed,
+        rope_lanes_signed_partner,
         cos_signed_sin_lanes,
         positions,
         cos_sin_cache,

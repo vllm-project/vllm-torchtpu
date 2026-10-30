@@ -234,6 +234,33 @@ def _quantize_lanes(
     return (y * scale_inv).astype(quant_dtype), scale
 
 
+def _low_bf16(words: jax.Array) -> jax.Array:
+    """The low bf16 halves of uint32 ``words``, exactly, as f32."""
+    return pltpu.bitcast(words << 16, jnp.float32)
+
+
+def _high_bf16(words: jax.Array) -> jax.Array:
+    """The high bf16 halves of uint32 ``words``, exactly, as f32."""
+    return pltpu.bitcast(words & jnp.uint32(0xFFFF0000), jnp.float32)
+
+
+def _transpose_bytes(words: list[jax.Array]) -> list[jax.Array]:
+    """Byte ``j`` of ``out[k]`` is byte ``k`` of ``words[j]``, for four uint32
+    arrays: 2x2 transposes of their 16-bit halves, then of the bytes in those."""
+    w0, w1, w2, w3 = words
+    lo, hi = jnp.uint32(0x0000FFFF), jnp.uint32(0xFFFF0000)
+    even, odd = jnp.uint32(0x00FF00FF), jnp.uint32(0xFF00FF00)
+    halves = [
+        ((w0 & lo) | (w2 << 16), (w1 & lo) | (w3 << 16)),
+        ((w0 >> 16) | (w2 & hi), (w1 >> 16) | (w3 & hi)),
+    ]
+    out = []
+    for a, b in halves:
+        out.append((a & even) | ((b & even) << 8))
+        out.append(((a >> 8) & even) | (b & odd))
+    return out
+
+
 def _kernel(
     # scalar prefetch
     positions_ref: jax.Ref,
@@ -520,6 +547,13 @@ def cos_signed_sin_lanes(cos_sin: jax.Array) -> tuple[jax.Array, jax.Array]:
     """`cos_sin_lanes` with `_rotate_gptj`'s sign folded into ``sin``."""
     cos, sin = cos_sin_lanes(cos_sin)
     return cos, sin * _rotation_sign()
+
+
+def rope_lanes_signed_partner(
+    x: jax.Array, partner: jax.Array, cos: jax.Array, signed_sin: jax.Array
+) -> jax.Array:
+    """`rope_lanes_signed` given ``partner``, ``x``'s lanes ``i ^ 1``."""
+    return x * cos + partner * signed_sin
 
 
 def rope_lanes_signed(x: jax.Array, cos: jax.Array, signed_sin: jax.Array) -> jax.Array:
@@ -1130,11 +1164,9 @@ HEADS_GATHER_UNROLL = 8
 # Heads per output tile of a quantizing `quantized_matmul_heads`: one 32-row
 # tile of its 8-bit [tokens, heads, head_dim] output per token.
 HEADS_QUANT_PER_TILE = 32
-# Rows per pass of a quantizing `quantized_matmul_heads`' epilogue.
-HEADS_QUANT_PASS_ROWS = 64
-# Rows per sub-block of a quantizing `quantized_matmul_heads` step, whose rope
-# + quantize passes overlap the next sub-block's dots.
-HEADS_QUANT_SUB_ROWS = 128
+# Rows per pass of a quantizing `quantized_matmul_heads`' per-head epilogue, a
+# multiple of the 32-row tile of its 8-bit words.
+HEADS_QUANT_ROWS = 32
 
 
 def _quantized_matmul_heads_kernel(
@@ -1160,16 +1192,18 @@ def _quantized_matmul_heads_kernel(
     With ``kv_fn``, the same visit also rewrites row block i of kv's last lane
     block in place with ``kv_fn`` of those row values.
 
-    With ``quant_dtype``, the product's heads are first laid out as bf16
-    ``[rows, heads, head_dim]`` in VMEM, where ``head_fn`` and the per-row
-    quantize run on whole tokens, as `rope_quant` runs on that layout.
+    With ``quant_dtype``, the dots first leave each head pair's product as
+    packed bf16 words, and the same words with their lanes ``i ^ 1`` gathered,
+    in VMEM. ``head_fn`` and the per-row quantize then run on each head's
+    columns, and the heads' 8-bit words are byte-transposed into o_buf, which
+    holds the block's rows ``t, t + pack, ...`` as its slab ``t``.
     """
     if kv_fn is not None:  # the kv input is aliased to kv_hbm, its output
         _, o_hbm, kv_hbm, *refs = refs
         *refs, kv_buf, kv_sems = refs
     elif quant_dtype is not None:
         o_hbm, s_hbm, *refs = refs
-        *refs, stage_buf, s_buf = refs
+        *refs, s_buf, pair_buf = refs
     else:
         o_hbm, *refs = refs
     xq_ref, xs_ref, w_buf, ws_buf, o_buf, table_buf, *refs = refs
@@ -1185,6 +1219,8 @@ def _quantized_matmul_heads_kernel(
     lane_blocks = head_dim // LANE
     block_cols = heads * head_dim
     rows = pl.ds(pl.multiple_of(i * block_rows, block_rows), block_rows)
+    # Bytes of a quantized head row per uint32 word.
+    pack = None if quant_dtype is None else 32 // dtypes.itemsize_bits(quant_dtype)
 
     def weight_copies(t, sl):
         cols = pl.ds(pl.multiple_of(t * block_cols, block_cols), block_cols)
@@ -1196,8 +1232,18 @@ def _quantized_matmul_heads_kernel(
     def out_copies(sl):
         dst = o_hbm.at[rows, pl.ds(pl.multiple_of(j * heads, heads), heads)]
         if quant_dtype is not None:
+            slab_rows = block_rows // pack
+            slabs = o_hbm.reshape(o_hbm.shape[0] // pack, pack, *o_hbm.shape[1:])
+            slabs = slabs.at[pl.ds(pl.multiple_of(i * slab_rows, slab_rows), slab_rows)]
             return [
-                pltpu.make_async_copy(o_buf.at[sl], dst, o_sems.at[sl]),
+                *(
+                    pltpu.make_async_copy(
+                        o_buf.at[sl, t],
+                        slabs.at[:, t, pl.ds(pl.multiple_of(j * heads, heads), heads)],
+                        o_sems.at[sl],
+                    )
+                    for t in range(pack)
+                ),
                 pltpu.make_async_copy(s_buf.at[sl], s_hbm.at[j, rows], o_sems.at[sl]),
             ]
         # o_buf holds each 128-lane block of the tile's heads on its own.
@@ -1294,16 +1340,16 @@ def _quantized_matmul_heads_kernel(
     # A bf16 tile packs heads 2p (low half) and 2p + 1 of a token in word p;
     # strided stores need a 128-lane buffer, hence o_buf's lane blocks.
     words_per_row = heads // 2
+    words_ref = o_buf.bitcast(jnp.uint32).at[o_slot]
     if quant_dtype is None:
-        words_ref = o_buf.bitcast(jnp.uint32).at[o_slot]
+        words_ref = words_ref.reshape(lane_blocks, block_rows * words_per_row, LANE)
     else:
-        words_ref = stage_buf.bitcast(jnp.uint32)
-    words_ref = words_ref.reshape(lane_blocks, block_rows * words_per_row, LANE)
+        words_ref = words_ref.reshape(block_rows * heads // pack, head_dim)
     chunk_rows = math.gcd(HEADS_EPILOGUE_ROWS, block_rows)
 
     def pair_products(r_lo, r_hi):
         """Every head pair's product for rows [r_lo, r_hi) of the block, put
-        through ``head_fn`` (unless quantizing) and stored as packed words."""
+        through ``head_fn`` and stored as packed words."""
         span = pl.ds(pl.multiple_of(i * block_rows + r_lo, r_hi - r_lo), r_hi - r_lo)
         x_scale = xs_ref[span, 0:1]
         for p in range(words_per_row):
@@ -1316,8 +1362,7 @@ def _quantized_matmul_heads_kernel(
             )
             acc = acc * x_scale
             acc = acc * ws_buf[w_slot, :, cols]
-            if quant_dtype is None:
-                acc = acc.astype(jnp.bfloat16).astype(jnp.float32)
+            acc = acc.astype(jnp.bfloat16).astype(jnp.float32)
             # The epilogue goes over row chunks, so each chunk's norm, RoPE and
             # stores need only its own rows of the product.
             for c0 in range(0, r_hi - r_lo, chunk_rows):
@@ -1326,44 +1371,67 @@ def _quantized_matmul_heads_kernel(
                     acc[c0 : c0 + chunk_rows, h * head_dim : (h + 1) * head_dim]
                     for h in range(2)
                 ]
-                if quant_dtype is None:
-                    row0 = pl.multiple_of(i * block_rows + r0, chunk_rows)
-                    chunk = pl.ds(row0, chunk_rows)
-                    row_values = [ref[chunk, :] for ref in row_refs]
-                    pair = [head_fn(head, *row_values) for head in heads_of_pair]
-                else:  # rounded to bf16 by the pack
-                    pair = heads_of_pair
+                row0 = pl.multiple_of(i * block_rows + r0, chunk_rows)
+                chunk = pl.ds(row0, chunk_rows)
+                row_values = [ref[chunk, :] for ref in row_refs]
+                pair = [head_fn(head, *row_values) for head in heads_of_pair]
                 words = pltpu.pack_elementwise(pair, packed_dtype=jnp.bfloat16)
                 dst = pl.ds(r0 * words_per_row + p, chunk_rows, stride=words_per_row)
                 for c in range(lane_blocks):
                     words_ref.at[c][dst, :] = words[:, c * LANE : (c + 1) * LANE]
 
-    def rope_quant_passes(r_lo, r_hi):
-        """``head_fn`` and the per-row quantize on staged rows [r_lo, r_hi)."""
-        for r in range(r_lo, r_hi, pass_rows):
-            tokens = pl.ds(r, pass_rows)
-            row = pl.multiple_of(i * block_rows + r, pass_rows)
-            values = [ref[pl.ds(row, pass_rows), :][:, None, :] for ref in row_refs]
-            y = head_fn(stage_buf[tokens].astype(jnp.float32), *values)
-            q, scale = _quantize_lanes(y, quant_dtype)
-            o_buf[o_slot, tokens] = q
-            s_buf[o_slot, tokens] = scale.reshape(pass_rows, heads)
+    def pair_words():
+        """Every head pair's product, rounded to bf16 and packed as words
+        (head 2p low), into pair_buf[0, p], and its lanes ``i ^ 1`` into
+        pair_buf[1, p]: the gather moves both heads' partners at once."""
+        x_scale = xs_ref[rows, 0:1]
+        for p in range(heads // 2):
+            cols = slice(2 * p * head_dim, (2 * p + 2) * head_dim)
+            acc = jnp.dot(
+                xq_ref[rows, :],
+                w_buf[w_slot, :, cols],
+                preferred_element_type=jnp.float32,
+            )
+            acc = acc * x_scale
+            acc = acc * ws_buf[w_slot, :, cols]
+            pair = [acc[:, h * head_dim : (h + 1) * head_dim] for h in range(2)]
+            words = pltpu.pack_elementwise(pair, packed_dtype=jnp.bfloat16)
+            pair_buf[0, p] = words
+            pair_buf[1, p] = _lane_gather(words, _partner_lanes())
+
+    def quantized_heads():
+        """``head_fn`` and the per-row quantize on each head's columns; each
+        group of ``pack`` heads' 8-bit words is transposed so that one word
+        holds the group's bytes of one row, as o_buf's tiles hold them."""
+        quant_rows = math.gcd(HEADS_QUANT_ROWS, block_rows)
+        slab_rows = block_rows // pack
+        # Group by group, so each group's quantize needs only its own dots.
+        for g in range(heads // pack):
+            for r0 in range(0, block_rows, quant_rows):
+                chunk = pl.ds(r0, quant_rows)
+                row = pl.ds(pl.multiple_of(i * block_rows + r0, quant_rows), quant_rows)
+                row_values = [ref[row, :] for ref in row_refs]
+                words = []
+                for p in range(g * pack // 2, (g + 1) * pack // 2):
+                    pair, partner = pair_buf[0, p, chunk], pair_buf[1, p, chunk]
+                    for half in (_low_bf16, _high_bf16):
+                        y = head_fn(half(pair), half(partner), *row_values)
+                        q, scale = _quantize_lanes(y, quant_dtype)
+                        head = pl.ds(g * pack + len(words), 1)
+                        s_buf[o_slot, chunk, head] = scale
+                        words.append(pltpu.bitcast(q, jnp.uint32))
+                # Word s of words[k] holds rows pack * s + t, so out[t] holds
+                # rows t, t + pack, ...: rows of o_buf's slab t.
+                for t, w in enumerate(_transpose_bytes(words)):
+                    first = (t * slab_rows + r0 // pack) * (heads // pack) + g
+                    dst = pl.ds(first, quant_rows // pack, stride=heads // pack)
+                    words_ref[dst, :] = w
 
     if quant_dtype is None:
         pair_products(0, block_rows)
     else:
-        # Rows go in sub-blocks, and each sub-block's rope + quantize passes
-        # sit in one basic block with the next sub-block's dots, so the
-        # scheduler can overlap them: they touch disjoint rows of stage_buf.
-        pass_rows = min(HEADS_QUANT_PASS_ROWS, block_rows)
-        sub_rows = math.gcd(math.lcm(HEADS_QUANT_SUB_ROWS, pass_rows), block_rows)
-        chunk_rows = math.gcd(chunk_rows, sub_rows)
-        subs = [(r, r + sub_rows) for r in range(0, block_rows, sub_rows)]
-        pair_products(*subs[0])
-        for prev, sub in zip(subs, subs[1:]):
-            pair_products(*sub)
-            rope_quant_passes(*prev)
-        rope_quant_passes(*subs[-1])
+        pair_words()
+        quantized_heads()
 
     for copy in out_copies(o_slot):
         copy.start()
@@ -1426,10 +1494,10 @@ def quantized_matmul_heads(
     rounded back; ``kv`` is donated.
 
     With ``quant_dtype`` (and ``head_dim == LANE``, no ``kv``), ``head_fn``
-    instead sees ``[rows, heads, head_dim]`` blocks of the bf16 product, with
-    each row value as ``[rows, 1, width]``, and its result is quantized like
-    `rope_quant`'s. Returns ``(q, scales)``: ``q`` ``[m, n // head_dim,
-    head_dim]`` in ``quant_dtype`` and ``scales`` ``[m, n // head_dim]`` f32.
+    is ``head_fn(head, partner, *row_fn(table[indices]))``, ``partner`` the
+    head's lanes ``i ^ 1``, and its result is quantized like `rope_quant`'s.
+    Returns ``(q, scales)``: ``q`` ``[m, n // head_dim, head_dim]`` in
+    ``quant_dtype`` and ``scales`` ``[m, n // head_dim]`` f32.
     """
     m, k = x.shape
     n = w_q.shape[1]
@@ -1475,10 +1543,14 @@ def quantized_matmul_heads(
             pltpu.HBM((num_col_blocks, m, heads_per_tile), jnp.float32),
         )
         out_specs = (hbm, hbm)
-        o_buf = pltpu.VMEM((2, block_rows, heads_per_tile, head_dim), quant_dtype)
+        # Slab t holds rows t, t + pack, ... of the block (see the kernel).
+        pack = 32 // dtypes.itemsize_bits(quant_dtype)
+        o_buf = pltpu.VMEM(
+            (2, pack, block_rows // pack, heads_per_tile, head_dim), quant_dtype
+        )
         quant_scratch = [
-            pltpu.VMEM((block_rows, heads_per_tile, head_dim), out_dtype),
             pltpu.VMEM((2, block_rows, heads_per_tile), jnp.float32),
+            pltpu.VMEM((2, heads_per_tile // 2, block_rows, LANE), jnp.uint32),
         ]
     if kv is not None:
         assert kv_fn is not None
@@ -1544,7 +1616,8 @@ def _heads_vmem_bytes(
     m, k, rows, cols, x_dtype, w_dtype, row_shapes, quantize=False
 ) -> int:
     """Double-buffered blocks, the resident x_q, scales and row values, the
-    quantizing epilogue's bf16 staging and scale blocks, and headroom."""
+    quantizing epilogue's packed products, their partner lanes and scale
+    blocks, and headroom."""
 
     def nbytes(elems, dtype):
         return elems * dtypes.itemsize_bits(dtype) // 8
@@ -1562,5 +1635,5 @@ def _heads_vmem_bytes(
         + sum(m * max(r.shape[1], LANE) * 4 for r in row_shapes)
     )
     if quantize:
-        scratch += nbytes(rows * cols, jnp.bfloat16) + 2 * rows * LANE * 4
+        scratch += 2 * nbytes(rows * cols, jnp.bfloat16) + 2 * rows * LANE * 4
     return 2 * blocks + scratch + (4 << 20)
