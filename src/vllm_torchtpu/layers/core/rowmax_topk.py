@@ -13,7 +13,7 @@
 # limitations under the License.
 """Sort-free top-k for MoE routing, in plain torch ops.
 
-The same algorithm as the Pallas kernel in ``kernels/router_topk.py``: ``k``
+The same algorithm as the Pallas kernel in ``kernels/router_topk/kernel.py``: ``k``
 passes of (row max -> lowest matching column -> mask that column out). Used
 off-TPU, and as the numerics oracle the kernel tests compare against.
 """
@@ -21,7 +21,7 @@ off-TPU, and as the numerics oracle the kernel tests compare against.
 import torch
 
 # Clamp floor. Below any real routing score, and strictly above the dtype
-# minimum used to mask a selected column -- see ``kernels/router_topk.py``.
+# minimum used to mask a selected column -- see ``kernels/router_topk/kernel.py``.
 NEG = -3.0e38
 
 

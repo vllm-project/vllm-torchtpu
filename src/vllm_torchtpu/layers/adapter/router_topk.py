@@ -13,7 +13,7 @@
 # limitations under the License.
 """Torch bridge for the sort-free MoE router top-k.
 
-On TPU the selection runs as the Pallas kernel in ``kernels/router_topk.py``,
+On TPU the selection runs as the Pallas kernel in ``kernels/router_topk/kernel.py``,
 elsewhere as the identical plain-torch algorithm in
 ``layers/core/rowmax_topk.py``.
 """
