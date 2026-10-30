@@ -21,7 +21,11 @@ from vllm_torchtpu.runner.utils import (
     InferencePhase,
     PhaseBasedProfiler,
     config_list,
+    decode_dp_profile_stats,
+    determine_dp_phase,
     determine_phase_from_batch_composition_stats,
+    encode_dp_profile_stats,
+    merge_dp_profile_stats,
 )
 
 
@@ -694,3 +698,103 @@ def test_merge_profile_directories_multiworker(tmp_path):
         ).read_text() == f"rank_{rank}_xplane"
         rank_dir = phase_dir / f"rank_{rank}"
         assert not (rank_dir / "plugins").exists()
+
+
+def _local(num_reqs, prefill, total, min_kv):
+    return {
+        "num_reqs": num_reqs,
+        "num_prefill_tokens": prefill,
+        "total_num_scheduled_tokens": total,
+        "min_kv_len": min_kv,
+    }
+
+
+def _dp_reduce(*per_rank):
+    """What the runner's MAX all-reduce makes of each rank's encoding."""
+    stats = decode_dp_profile_stats([max(col) for col in zip(*per_rank)])
+    stats["dp_num_tokens_max"] = 93
+    stats["dp_padded_num_tokens"] = 128
+    return stats
+
+
+def test_dp_profile_stats_decode_only_at_the_fullest_engine():
+    """Decode-only on every busy rank: the step is decode_only, keyed on the
+    largest engine's num_reqs; an idle rank changes neither phase nor KV."""
+    dp = _dp_reduce(
+        encode_dp_profile_stats(_local(93, 0, 93, 8300), armed=True),
+        encode_dp_profile_stats(_local(92, 0, 92, 8260), armed=True),
+        encode_dp_profile_stats(None, armed=True),
+    )
+    assert not dp["dp_trigger_blocked"]
+    assert dp["dp_num_reqs_max"] == 93 and dp["dp_num_reqs_min"] == 0
+    assert dp["dp_min_kv_len"] == 8260
+    stats = merge_dp_profile_stats({"batch_id": 7, "num_reqs": 92}, dp)
+    assert stats["phase"] == "DECODE_ONLY"
+    assert stats["num_reqs"] == 93 and stats["min_kv_len"] == 8260
+    assert stats["padded_total_num_scheduled_tokens"] == 128
+    assert stats["local"] == {"batch_id": 7, "num_reqs": 92}
+
+
+def test_dp_profile_stats_another_ranks_prefill_spoils_decode_only():
+    """A rank decoding 93 requests is not in a decode_only step when another
+    rank prefills in it: every rank runs that rank's padded step."""
+    dp = _dp_reduce(
+        encode_dp_profile_stats(_local(93, 0, 93, 8300), armed=True),
+        encode_dp_profile_stats(_local(93, 931, 1023, 0), armed=True),
+    )
+    assert (
+        determine_dp_phase(dp["dp_prefill_permille_min"], dp["dp_prefill_permille_max"])
+        is InferencePhase.AMBIGUOUS
+    )
+
+
+@pytest.mark.parametrize(
+    "ranks, phase",
+    [
+        ([(93, 931, 1024), (93, 960, 1024)], InferencePhase.PREFILL_HEAVY),
+        ([(93, 931, 1024), (93, 0, 93)], InferencePhase.AMBIGUOUS),
+        ([(8, 1024, 1024), (8, 1024, 1024)], InferencePhase.PREFILL_ONLY),
+        ([(93, 10, 103), (93, 0, 93)], InferencePhase.DECODE_HEAVY),
+        ([(50, 500, 1000), (50, 450, 1000)], InferencePhase.BALANCED),
+    ],
+)
+def test_dp_phase_holds_only_on_every_busy_rank(ranks, phase):
+    dp = _dp_reduce(
+        *(encode_dp_profile_stats(_local(n, p, t, 0), armed=True) for n, p, t in ranks)
+    )
+    assert determine_phase_from_batch_composition_stats(dp) is phase
+
+
+def test_dp_profile_stats_unarmed_rank_blocks_the_start(profiler_fixture):
+    """Arming reaches ranks at different steps; until every rank is armed no
+    capture may start, or the ranks would capture on different steps."""
+    profiler = profiler_fixture["profiler"]
+    mock_profile = profiler_fixture["mock_profile"]
+    profiler_fixture["mock_determine_phase"].return_value = InferencePhase.DECODE_ONLY
+    dp = _dp_reduce(
+        encode_dp_profile_stats(_local(93, 0, 93, 8300), armed=True),
+        encode_dp_profile_stats(_local(93, 0, 93, 8300), armed=False),
+    )
+    assert dp["dp_trigger_blocked"]
+    profiler.step(merge_dp_profile_stats({"batch_id": 1}, dp))
+    mock_profile.assert_not_called()
+    assert not profiler.inference_phase_seen[InferencePhase.DECODE_ONLY]
+
+
+@pytest.mark.parametrize("rank, captures", [(0, True), (8, False)])
+def test_phased_profiler_capture_ranks(profiler_fixture, rank, captures):
+    """Every rank decides and records the phase as seen; only the listed ranks
+    start the profiler."""
+    profiler = profiler_fixture["profiler"]
+    mock_profile = profiler_fixture["mock_profile"]
+    profiler_fixture["mock_determine_phase"].return_value = InferencePhase.DECODE_ONLY
+    profiler.worker_rank = rank
+    profiler.capture_ranks = frozenset({0})
+    profiler.captures_here = rank in profiler.capture_ranks
+
+    profiler.step({"num_reqs": 93, "total_num_scheduled_tokens": 93})
+    assert profiler.inference_phase_seen[InferencePhase.DECODE_ONLY]
+    assert mock_profile.called is captures
+    assert (profiler.current_phase == "decode_only") is captures
+    profiler.step({"num_reqs": 93, "total_num_scheduled_tokens": 93})
+    assert mock_profile.call_count == int(captures)
