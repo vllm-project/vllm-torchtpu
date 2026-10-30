@@ -377,10 +377,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._create_conv1d()
-        # `_require_pcp_projection_parameters` hands this weight straight to
-        # `fused_qkvz_projection_pcp_gdn`, which validates it as [n_out, n_in].
-        if hasattr(self, "in_proj_qkvz"):
-            setattr(self.in_proj_qkvz, KEEP_VLLM_LAYOUT_ATTR, True)
         # Bound by the runner during KV-cache initialization; None until then
         # (warmup/profiling runs check this).
         # vLLM's MambaBase types kv_cache as tuple[Tensor, ...].
@@ -397,6 +393,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         self.gdn_pooled_op = self._build_pooled_gdn_op(block_major=self._bm_kernel)
         pcp_enabled = self._pcp_streaming_enabled()
         self._pcp_streaming_configured = pcp_enabled
+        self._keep_qkvz_layout_for_pcp(pcp_enabled)
         self.gdn_pcp_op = (
             self._build_gdn_op(pcp_streaming=True) if pcp_enabled else None
         )
@@ -405,6 +402,19 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             if pcp_enabled
             else None
         )
+
+    def _keep_qkvz_layout_for_pcp(self, pcp_enabled: bool) -> None:
+        """Keep `in_proj_qkvz` in vLLM's [n_out, n_in] layout only for PCP.
+
+        The pooled PCP op hands this weight straight to
+        `fused_qkvz_projection_pcp_gdn` (`_require_pcp_projection_parameters`),
+        which validates it as [n_out, n_in]. Without PCP nothing reads it raw,
+        so it takes the (k, n) layout like every other linear: a kept layout
+        costs the per-block FP8 path (gmm_v2) a full weight transpose per step,
+        11 ms of every decode step on Qwen3.8-2.4T's 69 GDN layers.
+        """
+        if pcp_enabled and hasattr(self, "in_proj_qkvz"):
+            setattr(self.in_proj_qkvz, KEEP_VLLM_LAYOUT_ATTR, True)
 
     def set_block_major_pool(
         self, pool_index: int, layout: BlockMajorPoolLayout

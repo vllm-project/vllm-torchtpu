@@ -1587,3 +1587,17 @@ def test_pooled_op_block_major_folds_the_pool_and_restores_its_shape(
     assert re.fullmatch(rf"pallas::gdn_attention_pooled{suffix}_\d+", captured["name"])
     assert captured["kernel_pool_shape"] == kernel_pool_shape
     assert tuple(new_pool.shape) == tuple(pool.shape)
+
+
+@pytest.mark.parametrize("pcp_enabled", [False, True])
+def test_qkvz_keeps_vllm_layout_only_for_pcp(pcp_enabled):
+    """Only the pooled PCP op reads in_proj_qkvz raw as [n_out, n_in]; without
+    PCP it flips to (k, n) like every other linear, so the per-block FP8 matmul
+    needs no per-step transpose."""
+    from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
+
+    attn = object.__new__(VllmGatedDeltaNetAttention)
+    torch.nn.Module.__init__(attn)
+    attn.in_proj_qkvz = torch.nn.Linear(4, 8)
+    VllmGatedDeltaNetAttention._keep_qkvz_layout_for_pcp(attn, pcp_enabled)
+    assert getattr(attn.in_proj_qkvz, KEEP_VLLM_LAYOUT_ATTR, False) == pcp_enabled
