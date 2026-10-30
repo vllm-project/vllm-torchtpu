@@ -51,7 +51,7 @@ import jax
 import jax.numpy as jnp
 import torch
 from torch_tpu._internal import pallas
-from vllm.distributed.parallel_state import get_dp_group
+from vllm.distributed.parallel_state import get_dp_group, get_ep_group
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, RoutedExperts
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
@@ -233,7 +233,21 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
     def supports_internal_mk(self) -> bool:
         # We need to take control of collective communication (AllGather/ReduceScatter)
         # to pipeline them with MoE computation when chunking is enabled.
-        return enable_pipelined_collective_and_compute()
+        return enable_pipelined_collective_and_compute() or self._routes_before_dispatch
+
+    @property
+    def _routes_before_dispatch(self) -> bool:
+        """Whether this method routes its own rows before the EP dispatch.
+
+        Where vLLM would gather the router logits of every rank's rows
+        (`MoERunner.do_naive_dispatch_combine`), the method instead selects the
+        experts of this rank's rows and gathers only their top-k weights and
+        ids. Routing is per row, so the experts see the same routing; it is
+        not claimed under PCP, whose gather the runner issues on its own.
+        """
+        return (
+            self.moe.dp_size > 1 or self.moe.is_sequence_parallel
+        ) and self.moe.pcp_size == 1
 
     def __init__(self, moe: FusedMoEConfig):
         # Skip Mxfp4MoEMethod.__init__ (GPU backend assertion)
@@ -365,6 +379,16 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
         }
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)
+        if self._routes_before_dispatch:
+            # MoERunner._maybe_dispatch/_maybe_combine's pair, routed first.
+            ep_group = get_ep_group()
+            x, topk_weights, topk_ids = ep_group.dispatch(
+                x, topk_weights, topk_ids, self.moe.is_sequence_parallel
+            )
+            kwargs.update(hidden_states=x, topk_weights=topk_weights, topk_ids=topk_ids)
+            return ep_group.combine(
+                fused_moe_gmm(**kwargs), self.moe.is_sequence_parallel
+            )
 
         return fused_moe_gmm(**kwargs)
 
@@ -394,6 +418,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             enable_pipelined_collective_and_compute()
             or fused_moe_ep_supported(self)
             or self._dispatch_quantizer is not None
+            or self._routes_before_dispatch
         )
 
     def _select_dispatch_quant_dtype(
