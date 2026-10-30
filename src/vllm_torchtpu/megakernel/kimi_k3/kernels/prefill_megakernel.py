@@ -4787,11 +4787,98 @@ _PROJECTION_NAMES = (
 ProjectionWeights = namedtuple("ProjectionWeights", _PROJECTION_NAMES)  # pyrefly: ignore[bad-class-definition]
 
 
+def _mla_latent_all_gather(latent, tables, *, collective_id=45):
+    """Gather BF16 SP MLA low-rank latents (striped) into window order."""
+    rows, width = latent.shape
+    regions = _regions(rows, width)
+    streams, buffers = len(regions), 2
+    return pl.pallas_call(
+        functools.partial(_all_gather_kernel, regions=regions, buffers=buffers, striped=True),
+        out_shape=jax.ShapeDtypeStruct((32 * rows, width), latent.dtype),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(1, 32),
+            in_specs=(pl.BlockSpec(memory_space=pltpu.HBM),),
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            scratch_shapes=(
+                pltpu.SemaphoreType.DMA((streams,)),
+                pltpu.SemaphoreType.DMA((streams,)),
+                pltpu.SemaphoreType.DMA((buffers, streams)),
+                pltpu.SemaphoreType.REGULAR((streams,)),
+                pltpu.SemaphoreType.DMA((streams,)),
+                pltpu.VMEM((rows, width), latent.dtype),
+                pltpu.VMEM((buffers, rows, width), latent.dtype),
+            ),
+        ),
+        compiler_params=pltpu.CompilerParams(
+            collective_id=collective_id,
+            vmem_limit_bytes=3 * rows * width * 2 + 8 * 1024**2,
+        ),
+        name="kimi_prefill_mla_latent_ag",
+    )(jnp.asarray(tables, jnp.int32), latent)
+
+
+def _mla_projections_sp(local_hidden, full_hidden, weights, tables, *, epsilon=1e-5, query_scale=1.0):
+    """Compute replicated m_qa/m_ka on SP-local rows, ring-gather 2176 cols, then run per-head m_qb/m_kb/m_gate."""
+    local_tokens = local_hidden.shape[0]
+    tokens = full_hidden.shape[0]
+    query_latent_local = _dot(local_hidden, weights.query_down_projection)
+    query_latent_local = (
+        query_latent_local
+        * jax.lax.rsqrt(
+            jnp.mean(query_latent_local * query_latent_local, axis=1, keepdims=True) + epsilon
+        )
+        * weights.query_normalization
+    ).astype(jnp.bfloat16)
+
+    compressed_local = _dot(local_hidden, weights.key_value_down_projection).astype(jnp.bfloat16)
+    kv_latent_local = compressed_local[:, :512].astype(jnp.float32)
+    kv_latent_local = (
+        kv_latent_local
+        * jax.lax.rsqrt(
+            jnp.mean(kv_latent_local * kv_latent_local, axis=1, keepdims=True) + epsilon
+        )
+        * weights.key_value_normalization
+    ).astype(jnp.bfloat16)
+
+    packed_local = jnp.concatenate(
+        (
+            query_latent_local,
+            kv_latent_local,
+            compressed_local[:, 512:576],
+            jnp.zeros((local_tokens, 64), jnp.bfloat16),
+        ),
+        axis=1,
+    )
+    gathered_latents = _mla_latent_all_gather(packed_local, tables)
+    query_latent = gathered_latents[:, :1536]
+    latent = gathered_latents[:, 1536:2112]
+    kv_latent = latent[:, :512]
+    rope = latent[:, 512:576]
+
+    query = (_dot(query_latent, weights.query_up_projection) * query_scale).astype(jnp.bfloat16)
+    query = query.reshape(tokens, _HEADS, 256)
+
+    expanded = _dot(kv_latent, weights.key_value_up_projection).astype(jnp.bfloat16)
+    expanded = expanded.reshape(tokens, _HEADS, 256)
+    new_key = jnp.concatenate(
+        (
+            expanded[:, :, :128],
+            jnp.broadcast_to(rope[:, None, :], (tokens, _HEADS, 64)),
+            jnp.zeros((tokens, _HEADS, 64), jnp.bfloat16),
+        ),
+        axis=2,
+    )
+    new_value = expanded[:, :, 128:]
+    output_gate = _dot(full_hidden, weights.output_gate_projection).astype(jnp.bfloat16)
+    return query, new_key, new_value, output_gate, latent
+
+
 def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity, token_ranks=None,
                                      collective_id=31, flash_tile=128):
     """One MLA layer over a packed window of ``segments`` sequences.
 
-    ``run(hidden, prefix, weights, segment_desc, length, arena)``:
+    ``run(hidden, prefix, weights, segment_desc, length, arena, local_hidden=None)``:
     ``hidden`` is the gathered window ([T, 7168] on every rank), ``prefix``
     the rank's residual rows, ``segment_desc`` the ``[5 * segments]``
     descriptor (see ``_flash_kernel_packed``) and ``arena`` the layer's
@@ -4810,15 +4897,19 @@ def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity
     tables = ring_tables(list(mesh.devices.flat), token_ranks)
     local_tokens = seq_len // 32
 
-    def local_packed_cp(full_hidden, weights, segment_desc, length, pool, ids, local):
+    def local_packed_cp(full_hidden, weights, segment_desc, length, pool, ids, local, local_hidden=None):
         """One rank's view: this rank's 3 heads over every rank's prefix
         pages and the window."""
         local_weights = jax.tree.map(lambda value: value[0], weights)
         projections = ProjectionWeights(
             *(local_weights[name] for name in _PROJECTION_NAMES)
         )
-        query, new_key, new_value, output_gate, latent = mla_projections(
-            full_hidden, projections, return_latent=True, query_scale=SCALE_LOG2)
+        if local_hidden is not None:
+            query, new_key, new_value, output_gate, latent = _mla_projections_sp(
+                local_hidden[0], full_hidden, projections, tables, query_scale=SCALE_LOG2)
+        else:
+            query, new_key, new_value, output_gate, latent = mla_projections(
+                full_hidden, projections, return_latent=True, query_scale=SCALE_LOG2)
         tokens = query.shape[0]
         real = (jnp.arange(tokens) < length.reshape(()))[None, :, None]
         new_key = jnp.where(real, new_key.transpose(1, 0, 2), 0)
@@ -4834,14 +4925,22 @@ def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity
         gate = jax.nn.sigmoid(output_gate.astype(jnp.float32)).astype(jnp.bfloat16)
         return (attended * gate).astype(jnp.bfloat16)[None], latent[None]
 
-    def run(hidden, prefix, weights, segment_desc, length, arena):
+    def run(hidden, prefix, weights, segment_desc, length, arena, local_hidden=None):
         (pool, ) = arena.pools
-        gated, latent = jax.shard_map(
-            local_packed_cp, mesh=mesh,
-            in_specs=(P(), P("k3_sp"), P(), P(), P("k3_sp"), P("k3_sp"), P("k3_sp")),
-            out_specs=(P("k3_sp"), P("k3_sp")),
-            check_vma=False,
-        )(hidden, weights, segment_desc, length, pool, arena.ids, arena.local)
+        if local_hidden is not None:
+            gated, latent = jax.shard_map(
+                local_packed_cp, mesh=mesh,
+                in_specs=(P(), P("k3_sp"), P(), P(), P("k3_sp"), P("k3_sp"), P("k3_sp"), P("k3_sp")),
+                out_specs=(P("k3_sp"), P("k3_sp")),
+                check_vma=False,
+            )(hidden, weights, segment_desc, length, pool, arena.ids, arena.local, local_hidden)
+        else:
+            gated, latent = jax.shard_map(
+                local_packed_cp, mesh=mesh,
+                in_specs=(P(), P("k3_sp"), P(), P(), P("k3_sp"), P("k3_sp"), P("k3_sp")),
+                out_specs=(P("k3_sp"), P("k3_sp")),
+                check_vma=False,
+            )(hidden, weights, segment_desc, length, pool, arena.ids, arena.local)
         projected = project_reduce_scatter(
             gated, weights["output_projection_repacked"], mesh, tables,
             collective_id=collective_id,
@@ -5326,8 +5425,8 @@ def make_indexed_mla_layer_sp_ring(mesh, *, seq_len=8192, segments, prefix_capac
             for name, field in zip(MLA_FAMILIES, MLA_FIELD_NAMES)
         }
 
-    def run(hidden, prefix, families, segment_desc, length, slot, arena):
-        return base(hidden, prefix, select(families, slot), segment_desc, length, arena)
+    def run(hidden, prefix, families, segment_desc, length, slot, arena, local_hidden=None):
+        return base(hidden, prefix, select(families, slot), segment_desc, length, arena, local_hidden=local_hidden)
 
     return jax.jit(run)
 
@@ -5823,11 +5922,12 @@ def make_regular_group4_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capac
                                    for family, i in zip(kda_states, kda_outputs, strict=True))
             else:
                 slot = group[0]
-                _, gathered = norm_gather(
+                normalized, gathered = norm_gather(
                     prefix, blocks, attn_res, attn_norm, attn_active,
                 )
                 after_attention, *updates = mla(
                     gathered, prefix, mla_families, segment_desc, length, scalar(slot), arena,
+                    local_hidden=normalized,
                 )
                 mla_cache = tuple(
                     put_state(family, update, slot)
@@ -5905,12 +6005,12 @@ def make_final_mla_sp_indexed(mesh, *, seq_len=8192, segments, prefix_capacity, 
         attn_res = common["attn_res"][:, 92]
         attn_norm = common["attn_norm"][:, 92]
         active = jnp.asarray([8], jnp.int32)
-        _, gathered = norm_gather(
+        normalized, gathered = norm_gather(
             prefix, blocks, attn_res, attn_norm, active,
         )
         after_attention, *updates = mla(
             gathered, prefix, mla_families, segment_desc, length,
-            jnp.asarray([23], jnp.int32), arena,
+            jnp.asarray([23], jnp.int32), arena, local_hidden=normalized,
         )
         mla_cache = tuple(
             jax.lax.dynamic_update_slice(
@@ -6048,11 +6148,12 @@ def make_prefill_stack_sp_indexed(mesh, *, seq_len=8192, depth=93, segments, pre
             def mla_branch(state):
                 kda_states, mla_cache = state
                 slot = index // 4
-                _, gathered = norm_gather(
+                normalized, gathered = norm_gather(
                     prefix, blocks, attn_res, attn_norm, attn_active,
                 )
                 after, *updates = mla(
                     gathered, prefix, mla_families, segment_desc, length, active(slot), arena,
+                    local_hidden=normalized,
                 )
                 return (
                     after, kda_states,
