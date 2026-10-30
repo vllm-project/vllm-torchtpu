@@ -290,7 +290,7 @@ class KimiModel(nn.Module):
         sequence_parallel = (
             self.sp_prefill
             and num_tokens >= 1024
-            and (num_tokens == 1024 or num_tokens % 2048 == 0)
+            and num_tokens % 1024 == 0
             and num_tokens <= 8192
             and num_tokens % self.sp_group.world_size == 0
         )

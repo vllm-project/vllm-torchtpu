@@ -233,6 +233,28 @@ def _symint_at(expr: Any, size: int) -> int | None:
 
 def _output_spec(graph: fx.GraphModule) -> tuple:
     """Input-spec-style description of what the graph returns."""
+    shape_env = trace_shape_env(graph)
+    replaced = (
+        {
+            int(v)
+            for v in getattr(shape_env, "replacements", {}).values()
+            if isinstance(v, (int, sympy.Integer))
+        }
+        if shape_env is not None
+        else set()
+    )
+
+    def spec(value: Any) -> Any:
+        if value is None:
+            return None
+        if not isinstance(value, torch.Tensor):
+            return type(value).__name__
+        dims = tuple(
+            "?" if isinstance(d, torch.SymInt) or int(d) in replaced else int(d)
+            for d in value.shape
+        )
+        return (str(value.dtype), dims)
+
     for node in graph.graph.nodes:
         if node.op != "output":
             continue
@@ -240,7 +262,7 @@ def _output_spec(graph: fx.GraphModule) -> tuple:
         if not isinstance(outputs, (tuple, list)):
             outputs = (outputs,)
         return tuple(
-            _input_spec(item.meta.get("example_value", item.meta.get("val")))
+            spec(item.meta.get("example_value", item.meta.get("val")))
             if isinstance(item, fx.Node)
             else type(item).__name__
             for item in outputs
