@@ -46,10 +46,11 @@ def _last_rows(starts, tokens):
     return jnp.asarray(rows)
 
 
-def check_draft(variant, query_lens, contexts, *, max_query_len=1, seed=0):
+def check_draft(variant, query_lens, contexts, *, main_slot=-1, max_query_len=1, seed=0):
     layout, full, keep, qgate, s, m, seq, starts = make_step(seed, query_lens, contexts)
     opts = dict(compress_ratio=RATIO, token_topk=TOPK, norm_eps=1e-6, rotary_dim=ROTARY,
-                k_scale=K_SCALE, v_scale=V_SCALE, max_query_len=max_query_len)
+                k_scale=K_SCALE, v_scale=V_SCALE, main_slot=main_slot,
+                max_query_len=max_query_len)
     tokens = len(qgate[0])
     rows = _last_rows(starts, tokens)
     # The target's selection the draft reuses: a replicated step's `selected`.
@@ -107,9 +108,12 @@ DRAFT_CASES = {
 }
 
 
+@pytest.mark.parametrize("main_slot", [-1, 0])
 @pytest.mark.parametrize("variant", ["rows", "shared", "shared_rows"])
 @pytest.mark.parametrize("case", sorted(DRAFT_CASES))
 def test_dcp_draft_matches_replicated_draft(interpret, rpa_stand_in, monkeypatch,
-                                            partial_kernels, case, variant):
+                                            partial_kernels, case, variant, main_slot):
+    """``main_slot`` -1: the draft's own whole-row pages (as served); 0: a
+    paired page's first slot (the target layers' layout)."""
     monkeypatch.setattr(pooled_qsa, "select_blocks", stub_select)
-    print(case, variant, check_draft(variant, **DRAFT_CASES[case]))
+    print(case, variant, check_draft(variant, **DRAFT_CASES[case], main_slot=main_slot))
