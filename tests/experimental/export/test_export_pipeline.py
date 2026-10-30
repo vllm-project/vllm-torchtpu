@@ -592,7 +592,8 @@ def test_metadata_declares_the_speculative_config_it_was_exported_with(
         max_num_seqs=8,
         max_model_len=64,
         token_buckets=(8,),
-        req_buckets=(4, 8),
+        # 8 requests verifying 4 drafts each: 40 LM-head rows.
+        req_buckets=(8, 40),
         emit_byte_tokenizer=True,
         speculative_config=speculative,
     )
@@ -925,6 +926,41 @@ def test_build_export_config_raises_block_size_to_fit_smem(tmp_path: Path) -> No
     assert build(cfg(8, 128, block_size=8)).block_size == 8
     big = build(cfg(128, 40960))
     assert big.max_num_pages * 4 <= 1024 * 1024 // 2
+
+
+def test_build_export_config_req_buckets_cover_speculative_verify_rows(
+    tmp_path: Path,
+) -> None:
+    def cfg(max_num_seqs: int, num_speculative_tokens: int | None) -> Any:
+        spec = (
+            None
+            if num_speculative_tokens is None
+            else SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
+        )
+        return SimpleNamespace(
+            model_config=SimpleNamespace(
+                model=str(tmp_path), dtype="bfloat16", max_model_len=128
+            ),
+            cache_config=SimpleNamespace(block_size=16),
+            scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+            speculative_config=spec,
+        )
+
+    build = universal_adapter.build_export_config_from_vllm
+    tokens = (16, 256)
+    # 8 requests verifying 2 drafts each run the LM head on 24 rows.
+    assert build(cfg(8, 2), token_buckets=tokens).req_buckets == (8, 16, 24)
+    assert build(cfg(8, None), token_buckets=tokens).req_buckets == (8,)
+    # A step's LM-head rows are some of its tokens, so they stop at the largest
+    # token bucket: 64 requests x 5 rows would be 320.
+    assert build(cfg(64, 4), token_buckets=tokens).req_buckets == (
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+    )
 
 
 def _adapter_without_model(cfg: api.TextOnlyLLMExportConfig) -> Any:
@@ -2090,8 +2126,8 @@ def _mock_lower_reading_used_args(
     )
 
 
-def _export_mtp(tmp_path: Path, model_cls: type = _TinyMtpExportableLLM) -> str:
-    cfg = api.TextOnlyLLMExportConfig(
+def _mtp_config() -> api.TextOnlyLLMExportConfig:
+    return api.TextOnlyLLMExportConfig(
         model_name="tiny-torch",
         vocab_size=32,
         hidden_size=16,
@@ -2104,10 +2140,14 @@ def _export_mtp(tmp_path: Path, model_cls: type = _TinyMtpExportableLLM) -> str:
         max_num_seqs=8,
         max_model_len=64,
         token_buckets=(8, 16),
-        req_buckets=(4, 8),
+        req_buckets=(4, 8, 16),
         emit_byte_tokenizer=True,
         speculative_config={"method": "mtp", "num_speculative_tokens": 1},
     )
+
+
+def _export_mtp(tmp_path: Path, model_cls: type = _TinyMtpExportableLLM) -> str:
+    cfg = _mtp_config()
     out_dir = str(tmp_path / "exported")
     with mock.patch.object(
         tpu_lowering,
@@ -2174,6 +2214,33 @@ def test_mtp_draft_follows_the_contract(tmp_path) -> None:
     assert mtp_state["index"] == len(target_states)
     draft = [o for o in variant["outputs"] if o["name"] == "draft_tokens"]
     assert draft[0]["shape"] == [8, 1] and draft[0]["dtype"] == "i32"
+
+
+def test_a_speculative_export_needs_request_buckets_for_every_verify_row(
+    tmp_path,
+) -> None:
+    # 8 requests verifying 1 draft each run the LM head on 16 rows.
+    model = _TinyMtpExportableLLM(
+        dataclasses.replace(
+            _TinyMtpExportableLLM(_mtp_config()).export_config, req_buckets=(4, 8)
+        )
+    )
+    with pytest.raises(ValueError, match="16 LM-head rows"):
+        exporter.export(model, str(tmp_path / "out"))
+
+
+def test_a_speculative_export_needs_no_request_bucket_above_the_largest_step(
+    tmp_path,
+) -> None:
+    # 8 requests verifying 1 draft each would be 16 rows, but a step takes at most
+    # 8 tokens, so request buckets up to 8 suffice.
+    cfg = dataclasses.replace(_mtp_config(), token_buckets=(8,), req_buckets=(4, 8))
+    with mock.patch.object(
+        tpu_lowering,
+        "lower_torch_callable_to_mlir",
+        side_effect=_mock_lower_reading_used_args,
+    ):
+        exporter.export(_TinyMtpExportableLLM(cfg), str(tmp_path / "out"))
 
 
 def test_mtp_needs_a_model_that_drafts(tmp_path) -> None:
