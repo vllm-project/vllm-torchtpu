@@ -475,6 +475,80 @@ def _write_schedule_to_hbm(
     jax.tree.map(lambda x: x.wait(), dma_list)
 
 
+def _lane_wait_tokens(
+    schedule: RpaSchedule,
+    step: jax.typing.ArrayLike,
+    b: int,
+    *,
+    cfgs: configs.RpaConfigs,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Tokens lane b of `step` moves: (kv in, kv out, q in, o out)."""
+    kv_in = schedule.kv_cache_tokens_in(step, b)
+    for i in range(cfgs.bkv_p_new):
+        kv_in += schedule.dma_kv_new[step, b, i].fetch_val
+
+    kv_out = 0
+    do_writeback = schedule.do_writeback[step, b] == 1
+    for i in range(cfgs.bkv_p_new):
+        dma_entry = schedule.dma_kv_new[step, b, i]
+        kv_out += jnp.where(do_writeback, dma_entry.wb_val, 0)
+
+    _, q_sz = schedule.get_dma_q(step, b)
+    is_last_k = schedule.is_last_k[step, b] == 1
+    return kv_in, kv_out, q_sz, jnp.where(is_last_k, q_sz, 0)
+
+
+def _store_step_waits(
+    schedule: RpaSchedule,
+    step: jax.typing.ArrayLike,
+    tokens: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+    *,
+    cfgs: configs.RpaConfigs,
+):
+    """Stores the wait row/lane counts of `step` from its summed lane tokens."""
+    kv_in_tokens, kv_out_tokens, q_in_tokens, o_out_tokens = tokens
+    # Waits count contiguous 512-byte rows: 128 u32 lanes.
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    dma_chunk_size = num_lanes * 4
+
+    schedule.total_wait_kv_in[step] = (
+        kv_in_tokens * cfgs.kv_bytes_per_token
+    ) // dma_chunk_size
+    schedule.total_wait_kv_out[step] = (
+        kv_out_tokens * cfgs.kv_bytes_per_token
+    ) // dma_chunk_size
+    schedule.total_wait_q_in[step] = (
+        q_in_tokens * cfgs.q_bytes_per_token
+    ) // dma_chunk_size
+    schedule.total_wait_o_out[step] = (
+        o_out_tokens * cfgs.o_bytes_per_token
+    ) // dma_chunk_size
+    lse_bytes_per_token = (
+        cfgs.model.num_kv_heads
+        * cfgs.aligned_num_q_heads_per_kv_head
+        * 128
+        * jnp.dtype(cfgs.serve.dtype_out).itemsize
+    )
+    schedule.total_wait_lse_out[step] = (
+        o_out_tokens * lse_bytes_per_token
+    ) // dma_chunk_size
+
+
+@jax.named_scope("compute_waits")
+def _compute_step_waits(
+    schedule: RpaSchedule,
+    step: jax.typing.ArrayLike,
+    *,
+    cfgs: configs.RpaConfigs,
+):
+    """Computes the total wait row/lane counts of one step from its entries."""
+    lanes = [
+        _lane_wait_tokens(schedule, step, b, cfgs=cfgs) for b in range(cfgs.batch_size)
+    ]
+    tokens = tuple(sum(lane[i] for lane in lanes) for i in range(4))
+    _store_step_waits(schedule, step, tokens, cfgs=cfgs)
+
+
 def _compute_waits(
     schedule: RpaSchedule,
     start_step: jax.typing.ArrayLike,
@@ -484,69 +558,8 @@ def _compute_waits(
 ):
     """Computes total wait row/lane counts for a range of steps."""
 
-    kv_bytes_per_token = cfgs.kv_bytes_per_token
-    q_bytes_per_token = cfgs.q_bytes_per_token
-    o_bytes_per_token = cfgs.o_bytes_per_token
-
-    # Reshape buffers to (-1, 128) in u32 to perform contiguous 512-byte lane
-    # waits (1 row of 128 u32 words = 512 bytes).
-    num_lanes = pltpu.get_tpu_info().num_lanes
-    dma_chunk_size = num_lanes * 4
-
-    @jax.named_scope("compute_waits")
     def body(step, _):
-        # KV IN
-        kv_in_tokens = 0
-        for b in range(cfgs.batch_size):
-            kv_in_tokens += schedule.kv_cache_tokens_in(step, b)
-            for i in range(cfgs.bkv_p_new):
-                kv_in_tokens += schedule.dma_kv_new[step, b, i].fetch_val
-
-        schedule.total_wait_kv_in[step] = (
-            kv_in_tokens * kv_bytes_per_token
-        ) // dma_chunk_size
-
-        # KV OUT
-        kv_out_tokens = 0
-        for b in range(cfgs.batch_size):
-            do_writeback = schedule.do_writeback[step, b] == 1
-            for i in range(cfgs.bkv_p_new):
-                dma_entry = schedule.dma_kv_new[step, b, i]
-                kv_out_tokens += jnp.where(do_writeback, dma_entry.wb_val, 0)
-
-        schedule.total_wait_kv_out[step] = (
-            kv_out_tokens * kv_bytes_per_token
-        ) // dma_chunk_size
-
-        # Q IN
-        q_in_tokens = 0
-        for b in range(cfgs.batch_size):
-            _, q_sz = schedule.get_dma_q(step, b)
-            q_in_tokens += q_sz
-        schedule.total_wait_q_in[step] = (
-            q_in_tokens * q_bytes_per_token
-        ) // dma_chunk_size
-
-        # O OUT
-        o_out_tokens = 0
-        for b in range(cfgs.batch_size):
-            is_last_k = schedule.is_last_k[step, b] == 1
-            _, q_sz = schedule.get_dma_q(step, b)
-            o_out_tokens += jnp.where(is_last_k, q_sz, 0)
-        schedule.total_wait_o_out[step] = (
-            o_out_tokens * o_bytes_per_token
-        ) // dma_chunk_size
-
-        # LSE OUT
-        lse_bytes_per_token = (
-            cfgs.model.num_kv_heads
-            * cfgs.aligned_num_q_heads_per_kv_head
-            * 128
-            * jnp.dtype(cfgs.serve.dtype_out).itemsize
-        )
-        schedule.total_wait_lse_out[step] = (
-            o_out_tokens * lse_bytes_per_token
-        ) // dma_chunk_size
+        _compute_step_waits(schedule, step, cfgs=cfgs)
 
     jax.lax.fori_loop(start_step, end_step, body, None)
 
@@ -638,10 +651,40 @@ class BaseMetadataComputer:
         kv_new_len,
         end_k_idx,
     ) -> LoopCarry:
+        step, target_lane = divmod(carry.count, self.cfgs.batch_size)
+        self.write_entry(
+            step,
+            target_lane,
+            k_idx,
+            s_idx=s_idx,
+            q_idx=q_idx,
+            q_end=q_end,
+            q_src=q_src,
+            q_sz_task=q_sz_task,
+            kv_cache_len=kv_cache_len,
+            kv_new_len=kv_new_len,
+            end_k_idx=end_k_idx,
+        )
+        return self.advance_carry(carry)
+
+    def write_entry(
+        self,
+        step,
+        target_lane,
+        k_idx,
+        *,
+        s_idx,
+        q_idx,
+        q_end,
+        q_src,
+        q_sz_task,
+        kv_cache_len,
+        kv_new_len,
+        end_k_idx,
+    ) -> None:
+        """Writes the schedule entry of KV block `k_idx` at (step, target_lane)."""
         cfgs = self.cfgs
         schedule = self.schedule
-        count = carry.count
-        step, target_lane = divmod(count, cfgs.batch_size)
 
         schedule.s_idx[step, target_lane] = s_idx
         schedule.q_idx[step, target_lane] = q_idx
@@ -745,7 +788,6 @@ class BaseMetadataComputer:
                 dma_sz = jnp.maximum(0, end_in_slot - dst_vmem)
 
                 fill_dma_kv_new(i, dst_vmem, dma_sz)
-        return self.advance_carry(carry)
 
     def advance_carry(self, carry: LoopCarry) -> LoopCarry:
         new_count = carry.count + 1
@@ -767,20 +809,8 @@ class BaseMetadataComputer:
         )
         return LoopCarry(new_hbm_offset, 0)
 
-    @jax.named_scope("q_loop")
-    def q_loop(
-        self,
-        q_idx,
-        carry: LoopCarry,
-        *,
-        s_idx,
-        q_start,
-        q_end,
-        q_offset,
-        kv_cache_len,
-        kv_new_len,
-        num_k,
-    ) -> LoopCarry:
+    def q_block(self, q_idx, *, q_start, q_end, q_offset, kv_cache_len, num_k):
+        """(q_src, q_sz_task, start_k_idx, end_k_idx) of q block `q_idx`."""
         cfgs = self.cfgs
         q_src = q_start + q_idx * cfgs.bq_sz
         q_sz_task = jnp.clip(q_end - q_src, 0, cfgs.bq_sz)
@@ -796,6 +826,30 @@ class BaseMetadataComputer:
         end_k_idx = jnp.minimum(num_k, end_k_idx_causal)
         if cfgs.serve.attention_scope == configs.AttentionScope.NEW_TOKENS_ONLY:
             start_k_idx = jnp.maximum(start_k_idx, kv_cache_len // cfgs.bkv_sz)
+        return q_src, q_sz_task, start_k_idx, end_k_idx
+
+    @jax.named_scope("q_loop")
+    def q_loop(
+        self,
+        q_idx,
+        carry: LoopCarry,
+        *,
+        s_idx,
+        q_start,
+        q_end,
+        q_offset,
+        kv_cache_len,
+        kv_new_len,
+        num_k,
+    ) -> LoopCarry:
+        q_src, q_sz_task, start_k_idx, end_k_idx = self.q_block(
+            q_idx,
+            q_start=q_start,
+            q_end=q_end,
+            q_offset=q_offset,
+            kv_cache_len=kv_cache_len,
+            num_k=num_k,
+        )
         k_loop_fn = functools.partial(
             self.k_loop,
             s_idx=s_idx,
