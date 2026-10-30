@@ -18,6 +18,7 @@ from __future__ import annotations
 import math
 from functools import partial
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 import torch
@@ -29,6 +30,7 @@ from vllm.config import (
     VllmConfig,
     set_current_vllm_config,
 )
+from vllm.distributed import GroupCoordinator
 from vllm.model_executor import parameter as vllm_parameter
 from vllm.model_executor.layers import linear as vllm_linear
 from vllm.model_executor.layers import vocab_parallel_embedding as vpe
@@ -331,13 +333,15 @@ def _ref_ple(
         _PLE["eos_token_id"],
         _PLE["heads_per_ngram"],
     )
-    embeddings = embedding.ngram_embedding.weight[ids].flatten(-2)
-    key = _ref_rms_norm(embeddings @ ple.key_proj.weight.T, ple.norm_key.weight)
+    embeddings = cast(torch.Tensor, embedding.ngram_embedding.weight)[ids].flatten(-2)
+    key = _ref_rms_norm(
+        embeddings @ cast(torch.Tensor, ple.key_proj.weight).T, ple.norm_key.weight
+    )
     query = _ref_rms_norm(hidden_states, ple.norm_query.weight)
     gate = (key * query).unflatten(-1, (HC, HIDDEN)).sum(-1, keepdim=True)
     gate = gate / math.sqrt(HIDDEN)
     gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
-    value = embeddings @ ple.value_proj.weight.T
+    value = embeddings @ cast(torch.Tensor, ple.value_proj.weight).T
     gated = (torch.sigmoid(gate) * value.unsqueeze(-2)).flatten(-2)
     dilation = _PLE["ngram_size"]
     history = (_PLE["ple_conv_kernel_size"] - 1) * dilation
@@ -526,11 +530,13 @@ def test_ple_table_shards_load_across_tp_ranks(monkeypatch, fp8: bool) -> None:
             prefix="model.layers.0.ple.ple_embedding",
         )
         assert embedding.load_weights(iter(weights.items())) == expected_loaded
-        rank_table = embedding.ngram_embedding
+        rank_table = cast(Qwen4ExpPLETable, embedding.ngram_embedding)
         assert rank_table.weight.shape == (_TABLE_ROWS // 2, _HEAD_DIM)
         assert rank_table.weight.dtype == table.dtype
         # Raises if an FP8 table's scale was never loaded.
-        rank_table.embedding_method.process_weights_after_loading(rank_table)
+        cast(
+            Qwen4ExpPLEEmbeddingMethod, rank_table.embedding_method
+        ).process_weights_after_loading(rank_table)
         rows += rank_table.local_rows(ids)
     expected = table.float() * 0.25 if fp8 else table
     torch.testing.assert_close(rows, expected[ids])
@@ -609,9 +615,9 @@ def test_ple_storage_factory_allocates_once_and_reuses_shard_loader(monkeypatch)
     allocations = []
 
     class RecordingTable(Qwen4ExpPLETable):
-        def allocate_embedding_weight(self, rows, width, dtype):
-            allocations.append((rows, width, dtype))
-            return torch.zeros(rows, width, dtype=dtype)
+        def allocate_embedding_weight(self, num_embeddings, embedding_dim, dtype):
+            allocations.append((num_embeddings, embedding_dim, dtype))
+            return torch.zeros(num_embeddings, embedding_dim, dtype=dtype)
 
     ple = Qwen4ExpPLELayer(
         _text_config(**_PLE),
@@ -650,10 +656,10 @@ def test_ple_explicit_group_controls_sharding_and_reduction(monkeypatch):
         embedding_method=Qwen4ExpPLEEmbeddingMethod.from_quant_config(None, "ple"),
         padding_size=16,
         prefix="ple",
-        parallel_group=group,
+        parallel_group=cast(GroupCoordinator, group),
     )
     rows = torch.arange(_TABLE_ROWS * _HEAD_DIM).reshape(_TABLE_ROWS, _HEAD_DIM).float()
-    table.weight_loader(table.weight, rows, checkpoint_start=0)
+    table.weight_loader(cast(torch.Tensor, table.weight), rows, checkpoint_start=0)
     assert table.weight.shape == (32, _HEAD_DIM)
     ids = torch.tensor([[0, 31, 32, 63]])
     expected = rows[ids].masked_fill((ids < 32).unsqueeze(-1), 0)
@@ -690,7 +696,7 @@ def test_ple_storage_reuses_common_checkpoint_loader(
         embedding = Qwen4ExpNGramEmbedding(
             config, _PLE["ple_embed_dim"], 0, None, "ple", table_factory=factory
         )
-    table = embedding.ngram_embedding
+    table = cast(ResidentPLETable | HostPLETable, embedding.ngram_embedding)
     checkpoint = (
         (torch.arange(_TABLE_ROWS * _HEAD_DIM).float() % 8)
         .reshape(_TABLE_ROWS, _HEAD_DIM)
@@ -725,12 +731,14 @@ def test_ple_storage_reuses_common_checkpoint_loader(
         table.finalize_weights()
         table.finalize_weights()
         if storage == "resident":
+            assert isinstance(table, ResidentPLETable)
             assert table.weight.numel() == 0
             assert torch.equal(
                 table.table.reshape(_TABLE_ROWS, _HEAD_DIM).view(dtype).float(),
                 checkpoint.float(),
             )
         else:
+            assert isinstance(table, HostPLETable)
             ids = torch.tensor([[0, 22, 63, -1], [64, 31, 32, 1]])
             raw = table.lookup_host(ids).reshape(*ids.shape, _HEAD_DIM)
             expected = checkpoint[ids.clamp(0, 63)].float()
@@ -764,7 +772,9 @@ def test_resident_ple_owns_runtime_shard_offset(monkeypatch, fp8):
                 ),
                 padding_size=16,
                 prefix="ple",
-                parallel_group=SimpleNamespace(rank_in_group=rank, world_size=2),
+                parallel_group=cast(
+                    GroupCoordinator, SimpleNamespace(rank_in_group=rank, world_size=2)
+                ),
             )
         keys = set(table.state_dict())
         assert "_vocab_start" not in keys
@@ -810,7 +820,9 @@ def test_resident_ple_owns_runtime_shard_offset(monkeypatch, fp8):
             embedding_method=Qwen4ExpPLEEmbeddingMethod.from_quant_config(None, "ple"),
             padding_size=16,
             prefix="ple",
-            parallel_group=SimpleNamespace(rank_in_group=0, world_size=2),
+            parallel_group=cast(
+                GroupCoordinator, SimpleNamespace(rank_in_group=0, world_size=2)
+            ),
         )
     other.table = torch.empty(0, dtype=torch.uint8, device="meta")
     other.weight_loader(other.weight, checkpoint.to(torch.bfloat16), 0)
@@ -876,7 +888,7 @@ def test_ple_storage_rejects_missing_and_duplicate_rows(monkeypatch):
     with pytest.raises(ValueError, match="Duplicate"):
         embedding.load_weights([shard])
     with pytest.raises(ValueError, match="Missing"):
-        embedding.ngram_embedding.finalize_weights()
+        cast(ResidentPLETable, embedding.ngram_embedding).finalize_weights()
 
 
 @pytest.mark.parametrize("storage", ["resident", "host", "shared"])
@@ -951,7 +963,7 @@ def test_ple_native_adapter_reuses_common_math_and_checkpoint(
             None,
             "ple",
             parallel=parallel,
-            table_group=group,
+            table_group=cast(GroupCoordinator, group),
             cpu_offload=storage != "resident",
             shared=shared,
         )
@@ -969,10 +981,9 @@ def test_ple_native_adapter_reuses_common_math_and_checkpoint(
 
     monkeypatch.setattr(pooled_ple, "AutoWeightsLoader", loader)
     keys = set(adapted.state_dict())
-    assert adapted._checkpoint_loader is None
-    for name, value in weights.items():
+    for count, (name, value) in enumerate(weights.items(), 1):
         adapted.load_checkpoint(iter([(name, value)]))
-        assert len(constructions) == 1
+        assert len(constructions) == count
         assert constructions[0].ignore_unexpected_suffixes == [".bias"]
     assert set(adapted.state_dict()) == keys
     assert adapted._loaded == set(dict(adapted.named_parameters())) | {
@@ -981,7 +992,6 @@ def test_ple_native_adapter_reuses_common_math_and_checkpoint(
         "ple_embedding.ngram_heads_vocab_sizes",
     }
     adapted.finalize_weights()
-    assert adapted._checkpoint_loader is None
     monkeypatch.setattr(
         ple_offload,
         "get_forward_context",
@@ -1004,6 +1014,7 @@ def test_ple_native_adapter_reuses_common_math_and_checkpoint(
         for ids, starts, slots, initial in (
             ([3, 4, 5, 6, 7, 0], [0, 3, 5, 5], [1, 2, -1], [False, False, False]),
             ([8, 9, 0], [0, 1, 2, 2], [2, 1, -1], [True, True, False]),
+            ([11, 12, 13, 14, 0], [0, 2, 3, 3], [0, 2, -1], [False, True, False]),
         ):
             ids, starts, slots = map(torch.tensor, (ids, starts, slots))
             initial = torch.tensor(initial)
@@ -1015,6 +1026,9 @@ def test_ple_native_adapter_reuses_common_math_and_checkpoint(
                 initial[:, None, None], expected_history[slots.clamp_min(0)], 0
             )
             expected, next_windows = reference(hidden, inputs, windows)
+            for i, slot in enumerate(slots.tolist()):
+                if slot <= 0:
+                    expected[starts[i] : starts[i + 1]] = 0
             valid = starts[-1]
             raw = (
                 adapted.lookup_for_model(inputs, valid) if adapted.cpu_offload else None
@@ -1040,6 +1054,7 @@ def test_decoder_consumes_typed_shared_options(monkeypatch, tmp_path):
 
     from vllm_torchtpu.models.vllm.qwen4_exp import model as qwen4_model
     from vllm_torchtpu.models.vllm.qwen4_exp import ple_host
+    from vllm_torchtpu.models.vllm.qwen4_exp.config import Qwen4ExpEngramConfig
     from vllm_torchtpu.models.vllm.qwen4_exp.ple_storage import HostPLETable
 
     _set_tp(monkeypatch, 0, 1)
@@ -1065,7 +1080,13 @@ def test_decoder_consumes_typed_shared_options(monkeypatch, tmp_path):
     cfg = SimpleNamespace(
         model_config=SimpleNamespace(
             hf_text_config=_text_config(**dict(_PLE, ple_layer_ids=[1])),
-            _qwen4_exp_ple_host_launch=dict(instance="typed-fixture", participants=1),
+            model="fixture",
+            revision=None,
+        ),
+        engram_config=Qwen4ExpEngramConfig(
+            cpu_offload=True,
+            dp_shared_memory=True,
+            host_launch=ple_host.PLEHostLaunch("typed-fixture", 1, "fixture", None),
         ),
         quant_config=None,
         compilation_config=SimpleNamespace(static_forward_context={}),
@@ -1080,8 +1101,10 @@ def test_decoder_consumes_typed_shared_options(monkeypatch, tmp_path):
     )
     with set_default_torch_dtype(torch.bfloat16):
         layer = qwen4_model.Qwen4ExpDecoderLayer(cfg, 0, "model.layers.0")
+    ple = layer.ple
+    assert ple is not None
     try:
-        table = layer.ple.storage
+        table = ple.storage
         assert isinstance(table, HostPLETable)
         assert isinstance(options[0], ple_host.SharedPLEOptions)
         assert table._shared_options is options[0]
@@ -1092,7 +1115,7 @@ def test_decoder_consumes_typed_shared_options(monkeypatch, tmp_path):
             is layer.ple
         )
     finally:
-        layer.ple.storage.close()
+        cast(HostPLETable, ple.storage).close()
 
 
 @pytest.mark.parametrize("host", [False, True], ids=["resident", "host"])
@@ -1141,7 +1164,7 @@ def test_ple_zero_requests_keep_owner_collectives(
             None,
             "ple",
             parallel=parallel,
-            table_group=Group("table", parallel.world_size),
+            table_group=cast(GroupCoordinator, Group("table", parallel.world_size)),
             cpu_offload=host,
         )
     # No weights are read on the empty branch except peer raw rows. Check that
@@ -1185,6 +1208,7 @@ def test_ple_zero_requests_keep_owner_collectives(
     hidden = torch.full((num_tokens, HC * HIDDEN), 3, dtype=torch.bfloat16)
     raw = layer.lookup_for_model(inputs, torch.tensor(0)) if host else None
     if host:
+        assert raw is not None
         assert raw.shape == (dp.world_size, num_tokens, width) and raw.dtype == carrier
     result = layer.forward_with_history(
         hidden,

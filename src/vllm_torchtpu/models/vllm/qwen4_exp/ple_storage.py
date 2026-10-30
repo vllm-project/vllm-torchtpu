@@ -333,28 +333,37 @@ class HostPLETable(_LoadedPLETable):
         end = self.shard_indices.org_vocab_end_index
         owned = (indices >= start) & (indices < end)
         dtype = np.int16 if self.storage_dtype == torch.bfloat16 else np.uint8
-        output = np.empty((indices.size, self.embedding_dim), dtype=dtype)
-        if self._shared_table is None:
-            table = (
-                self.weight.detach()
-                .view(torch.int16 if dtype == np.int16 else torch.uint8)
-                .numpy()
+        output = np.zeros((indices.size, self.embedding_dim), dtype=dtype)
+        selected = np.flatnonzero(owned)
+        if selected.size:
+            rows = indices[selected] - start
+            gathered = (
+                output
+                if selected.size == indices.size
+                else np.empty((selected.size, self.embedding_dim), dtype=dtype)
             )
-            self._take_rows(table, indices - start, output)
-        else:
-            with self._shared_table.buffer() as buffer:
-                table = np.frombuffer(buffer, dtype=dtype).reshape(
-                    -1, self.embedding_dim
+            if self._shared_table is None:
+                table = (
+                    self.weight.detach()
+                    .view(torch.int16 if dtype == np.int16 else torch.uint8)
+                    .numpy()
                 )
-                try:
-                    self._take_rows(table, indices - start, output)
-                except BaseException as error:
-                    # A retained traceback must not pin a borrowed NumPy view.
-                    traceback.clear_frames(error.__traceback__)
-                    raise
-                finally:
-                    del table
-        output[~owned] = 0
+                self._take_rows(table, rows, gathered)
+            else:
+                with self._shared_table.buffer() as buffer:
+                    table = np.frombuffer(buffer, dtype=dtype).reshape(
+                        -1, self.embedding_dim
+                    )
+                    try:
+                        self._take_rows(table, rows, gathered)
+                    except BaseException as error:
+                        # Retained tracebacks must not pin a borrowed mmap view.
+                        traceback.clear_frames(error.__traceback__)
+                        raise
+                    finally:
+                        del table
+            if selected.size != indices.size:
+                output[selected] = gathered
         raw = torch.from_numpy(output)
         if self.storage_dtype != torch.bfloat16:
             raw = raw.view(torch.int8)

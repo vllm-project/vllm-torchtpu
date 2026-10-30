@@ -70,7 +70,6 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
         self.cpu_offload = cpu_offload
         self.prefix = prefix
         self.cache_owners: tuple[torch.Tensor, ...] = ()
-        self._checkpoint_loader: AutoWeightsLoader | None = None
         self._loaded: set[str] = set()
         self._finalized = False
         self._conv: Callable[..., torch.Tensor] | None = None
@@ -88,14 +87,7 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
     def load_checkpoint(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         if self._finalized:
             raise ValueError("PLE weights are already finalized")
-        if self._checkpoint_loader is None:
-            self._checkpoint_loader = AutoWeightsLoader(self)
-        loader = self._checkpoint_loader
-        # Upstream retains per-call diagnostics and appends suffix filters.
-        loader.ignore_unexpected_suffixes.clear()
-        loader._skipped_aliases.clear()
-        loader._loaded_params_are_complete = True
-        loaded = loader.load_weights(weights)
+        loaded = AutoWeightsLoader(self).load_weights(weights)
         self._loaded.update(loaded)
         return loaded
 
@@ -111,7 +103,6 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
         if missing:
             raise ValueError(f"Missing PLE checkpoint tensors: {sorted(missing)}")
         self.storage.finalize_weights()
-        self._checkpoint_loader = None
         self._finalized = True
 
     def bind_pool(self, pool: torch.Tensor) -> None:
@@ -217,5 +208,5 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
         valid = (
             torch.arange(hidden_states.shape[0], device=hidden_states.device)
             < valid_tokens
-        ) & (state_indices[request] >= 0)
+        ) & (state_indices[request] > 0)
         return torch.where(valid[:, None], gated + conv, 0)

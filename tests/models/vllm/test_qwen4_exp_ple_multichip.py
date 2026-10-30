@@ -36,7 +36,7 @@ pytestmark = [
 ]
 
 
-@pytest.mark.parametrize("tp", [2, 4])
+@pytest.mark.parametrize("tp", [1, 2, 4, 8])
 def test_compiled_ple_transport_preserves_raw_bits(tp, tmp_path):
     command = [
         sys.executable,
@@ -163,7 +163,7 @@ def _worker(tp, out):
                 )
                 for slots in (7, 8, 64):
                     counts = (
-                        [3, 0, 7, 1][:dp],
+                        [min((3, 0, 7, 1)[rank % 4], slots) for rank in range(dp)],
                         [slots] + [0] * (dp - 1),
                         [0] * dp,
                         [slots] * dp,
@@ -207,7 +207,7 @@ def _worker(tp, out):
 
 def _main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tp", type=int, choices=(2, 4), required=True)
+    parser.add_argument("--tp", type=int, choices=(1, 2, 4, 8), required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--worker", action="store_true")
     args = parser.parse_args()

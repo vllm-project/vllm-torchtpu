@@ -11,7 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Host PLE lookup boundary for vLLM piecewise compilation."""
+"""Synchronous host PLE lookup boundary for vLLM piecewise compilation.
+
+Each call copies IDs to CPU, gathers owned rows, then transfers raw rows back
+before returning. Shared storage does not remove these per-layer transfers.
+"""
 
 import torch
 from vllm.forward_context import get_forward_context

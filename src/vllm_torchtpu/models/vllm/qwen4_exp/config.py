@@ -14,6 +14,8 @@
 """Single admission boundary for the FP8, text-only TPU S1 implementation."""
 
 import torch
+from vllm.config.engram import EngramConfig
+from vllm.config.utils import config, get_hash_factors, hash_factors
 from vllm.model_executor.models.config import (
     Qwen4ExpForCausalLMConfig,
     VerifyAndUpdateConfig,
@@ -28,8 +30,16 @@ from vllm_torchtpu.gdn_pool_layout import (
 from vllm_torchtpu.kernels.qwen4_exp.hc_prefill_policy import validate_hc_prefill_mode
 from vllm_torchtpu.utils import torch_dtype_from_name
 
-from .ple_host import host_available_memory
+from .ple_host import PLEHostLaunch, host_available_memory
 from .qsa_geometry import validate_qsa_geometry
+
+
+@config
+class Qwen4ExpEngramConfig(EngramConfig):
+    host_launch: PLEHostLaunch | None = None
+
+    def compute_hash(self) -> str:
+        return hash_factors(get_hash_factors(self, {"host_launch"}))
 
 
 def require_unified_pool() -> None:
@@ -145,17 +155,31 @@ class TPUQwen4ExpConfig(VerifyAndUpdateConfig):
                 compilation.splitting_ops = []
             if "qwen4_exp::host_lookup" not in compilation.splitting_ops:
                 compilation.splitting_ops.append("qwen4_exp::host_lookup")
-        if qwen.get("engram_config", {}).get("dp_shared_memory", False):
-            # This hook runs before engine copies / TPU worker DP collapse.
-            # Runtime-only ModelConfig attributes survive deepcopy/pickling
-            # but are outside its dataclass hash factors. A launch identity
-            # in additional_config would invalidate compilation caches.
-            vllm_config.model_config._qwen4_exp_ple_host_launch = dict(
-                instance=vllm_config.instance_id,
-                participants=vllm_config.parallel_config.data_parallel_size,
-                checkpoint=vllm_config.model_config.model,
-                revision=vllm_config.model_config.revision,
-            )
+        options = qwen.get("engram_config", {})
+        if options.get("dp_shared_memory", False):
+            current = vllm_config.engram_config
+            if (
+                not isinstance(current, Qwen4ExpEngramConfig)
+                or current.host_launch is None
+            ):
+                if current is None:
+                    current = EngramConfig(
+                        cpu_offload=options.get("cpu_offload", False),
+                        embedding_across_dp=options.get("embedding_across_dp", False),
+                        dp_shared_memory=options.get("dp_shared_memory", False),
+                    )
+                vllm_config.engram_config = Qwen4ExpEngramConfig(
+                    cpu_offload=current.cpu_offload,
+                    embedding_across_dp=current.embedding_across_dp,
+                    dp_shared_memory=current.dp_shared_memory,
+                    use_thp=current.use_thp,
+                    host_launch=PLEHostLaunch(
+                        instance=vllm_config.instance_id,
+                        participants=vllm_config.parallel_config.data_parallel_size,
+                        checkpoint=vllm_config.model_config.model,
+                        revision=vllm_config.model_config.revision,
+                    ),
+                )
         vllm_config.cache_config.kv_cache_layout = "BLHNC"
         from .pool_layout import pooled_cache_specs
 

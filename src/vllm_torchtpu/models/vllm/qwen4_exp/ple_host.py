@@ -27,6 +27,14 @@ from typing import Any
 
 
 @dataclass(frozen=True)
+class PLEHostLaunch:
+    instance: str
+    participants: int
+    checkpoint: str
+    revision: str | None
+
+
+@dataclass(frozen=True)
 class SharedPLEOptions:
     directory: Path
     key: str
@@ -42,15 +50,22 @@ def host_available_memory():
 
 
 def shared_ple_options(
-    model_config, prefix: str, tp_rank: int, tp_size: int
+    launch: PLEHostLaunch, prefix: str, tp_rank: int, tp_size: int
 ) -> SharedPLEOptions:
     """Use the pre-worker descriptor, never the worker's collapsed DP size."""
-    launch = model_config._qwen4_exp_ple_host_launch
     return SharedPLEOptions(
         directory=Path(tempfile.gettempdir()) / f"vllm-qwen-ple-{os.getuid()}",
-        key=f"{launch['instance']}/{prefix}/tp{tp_rank}",
-        identity=dict(launch, prefix=prefix, tp_rank=tp_rank, tp_size=tp_size),
-        participants=launch["participants"],
+        key=f"{launch.instance}/{prefix}/tp{tp_rank}",
+        identity=dict(
+            instance=launch.instance,
+            participants=launch.participants,
+            checkpoint=launch.checkpoint,
+            revision=launch.revision,
+            prefix=prefix,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+        ),
+        participants=launch.participants,
     )
 
 
