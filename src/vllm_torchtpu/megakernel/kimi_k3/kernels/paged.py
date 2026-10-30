@@ -154,10 +154,12 @@ def commit_latent_rows(pools, rows, block_tables, positions, pool_map, *, group=
     return tuple(pools)
 
 
-def _commit_kda_states(conv_slots, recurrent_slots, conv, recurrent, slots, source_rows=None):
+def _commit_kda_states(conv_slots, recurrent_slots, conv, recurrent, slots, source_rows=None,
+                       null_period=None):
     """Copy complete KDA rows back without XLA's per-row scatter loop.
 
-    Row writes finish in input order, including repeated null-slot indices.
+    Row writes finish in input order. With ``null_period``, rows whose
+    target is a null slot (index % null_period == 0: padding rows) are skipped.
     The banks alias their outputs so untouched slots retain their bytes.
     With ``source_rows``, DMA only the selected verifier post-states directly
     from their HBM buffer; do not gather a second intermediate with XLA.
@@ -170,8 +172,7 @@ def _commit_kda_states(conv_slots, recurrent_slots, conv, recurrent, slots, sour
         sources, args = (args[0], args[1:]) if selected else (None, args)
         (old_conv, old_state, new_conv, new_state, out_conv, out_state,
          conv_buffer, state_buffer, semaphores) = args
-        @pl.loop(0, batch)
-        def row(i):
+        def copy_row(i):
             source = sources[i] if sources is not None else i
             reads = (
                 tpu.make_async_copy(new_conv.at[pl.ds(source, 1)], conv_buffer, semaphores.at[0]),
@@ -190,6 +191,13 @@ def _commit_kda_states(conv_slots, recurrent_slots, conv, recurrent, slots, sour
                 item.start()
             for item in writes:
                 item.wait()
+
+        @pl.loop(0, batch)
+        def row(i):
+            if null_period is None:
+                copy_row(i)
+            else:
+                pl.when(indices[i] % null_period != 0)(lambda: copy_row(i))
 
     return pl.pallas_call(
         body,
@@ -277,7 +285,8 @@ def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, 
         conv_slots, recurrent_slots = conv, recurrent
     elif batch_size > 16 and dp in (1, 2):
         conv_slots, recurrent_slots = _commit_kda_states(
-            conv_slots, recurrent_slots, conv, recurrent, state_index)
+            conv_slots, recurrent_slots, conv, recurrent, state_index,
+            null_period=conv_slots.shape[0] // dp)
     else:
         conv_slots = conv_slots.at[state_index].set(conv)
         recurrent_slots = recurrent_slots.at[state_index].set(recurrent)
