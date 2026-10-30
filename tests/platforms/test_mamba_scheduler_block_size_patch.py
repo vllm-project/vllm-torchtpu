@@ -116,3 +116,55 @@ def test_sub_block_chunk_ends_stay_on_pages_for_programs_that_need_it(
     )
 
     assert split == (768 if pages else 942)
+
+
+def test_page_alignment_without_mamba_align_mode(monkeypatch):
+    # Prefix caching off: vLLM sets mamba_cache_mode "none", so only the page
+    # clip runs. 512-token pages, 16384-token scheduler blocks (DCP 32): a
+    # 9000-token prompt that gets 7192 tokens of a shared 8192 budget is cut
+    # back to 7168, so its next chunk starts on a page.
+    def upstream_split(self, *args, **kwargs):
+        raise AssertionError("the upstream split runs only in align mode")
+
+    monkeypatch.setattr(Scheduler, "_mamba_block_aligned_split", upstream_split)
+    monkeypatch.setattr(
+        vllm_torchtpu, "_model_needs_page_aligned_chunks", lambda vllm_config: True
+    )
+    _patch_vllm_mamba_split_scheduler_block_size()
+    for page, block in ((512, 16384), (512, 512)):
+        scheduler, _ = _scheduler(page=page, block=block, budget=8192)
+        scheduler._tpu_mamba_split = False
+
+        split = Scheduler._mamba_block_aligned_split(
+            scheduler,
+            _request(prompt_len=9000),
+            num_new_tokens=7192,
+        )
+
+        assert split == 7168
+
+
+@pytest.mark.parametrize(
+    ("pages", "align"), [(True, False), (False, False), (True, True)]
+)
+def test_scheduler_init_enables_the_split_for_page_aligned_programs(
+    monkeypatch, pages, align
+):
+    def init(self, *args, **kwargs):
+        self.vllm_config = SimpleNamespace()
+        self.need_mamba_block_aligned_split = align
+
+    monkeypatch.setattr(Scheduler, "__init__", init)
+    monkeypatch.setattr(
+        vllm_torchtpu, "_model_needs_page_aligned_chunks", lambda vllm_config: pages
+    )
+    monkeypatch.setattr(
+        vllm_torchtpu, "_disable_partial_hits_without_block_copies", lambda s: False
+    )
+    vllm_torchtpu._patch_vllm_megakernel_prefix_hits()
+
+    scheduler = Scheduler.__new__(Scheduler)
+    Scheduler.__init__(scheduler)
+
+    assert scheduler._tpu_mamba_split is align
+    assert scheduler.need_mamba_block_aligned_split is (pages or align)

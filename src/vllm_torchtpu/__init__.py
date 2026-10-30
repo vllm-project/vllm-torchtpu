@@ -130,6 +130,14 @@ def _patch_vllm_megakernel_prefix_hits() -> None:
     @wraps(original_init)
     def init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
+        # vLLM calls _mamba_block_aligned_split only in mamba_cache_mode
+        # "align", which it turns off without prefix caching. A program that
+        # needs page-aligned chunks still needs the split.
+        self._tpu_mamba_split = self.need_mamba_block_aligned_split
+        if not self.need_mamba_block_aligned_split and _model_needs_page_aligned_chunks(
+            self.vllm_config
+        ):
+            self.need_mamba_block_aligned_split = True
         if _disable_partial_hits_without_block_copies(self):
             logger.info(
                 "Prefix hits round down to %d-token blocks: the megakernel "
@@ -176,18 +184,21 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
             num_external_computed_tokens,
         )
         physical_cache_config = self.cache_config
-        if physical_cache_config.block_size == self.block_size:
-            return original_split(self, *args)
+        # False: only page alignment is needed (no Mamba cache mode "align").
+        if getattr(self, "_tpu_mamba_split", True):
+            if physical_cache_config.block_size == self.block_size:
+                return original_split(self, *args)
 
-        scheduler_cache_config = copy.copy(physical_cache_config)
-        scheduler_cache_config.block_size = self.block_size
-        # schedule() calls this method synchronously on the EngineCore thread,
-        # and the upstream implementation contains no callback or await point.
-        self.cache_config = scheduler_cache_config
-        try:
-            num_new_tokens = original_split(self, *args)
-        finally:
-            self.cache_config = physical_cache_config
+            scheduler_cache_config = copy.copy(physical_cache_config)
+            scheduler_cache_config.block_size = self.block_size
+            # schedule() calls this method synchronously on the EngineCore
+            # thread, and the upstream implementation contains no callback or
+            # await point.
+            self.cache_config = scheduler_cache_config
+            try:
+                num_new_tokens = original_split(self, *args)
+            finally:
+                self.cache_config = physical_cache_config
         # A scheduler block wider than the prefill budget (DCP/PCP: 256 x
         # ranks tokens) leaves chunks inside it wherever the shared token
         # budget cuts them. A program that declares ``page_aligned_chunks``
