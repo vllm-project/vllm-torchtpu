@@ -16,6 +16,20 @@ for path in (HERE, KERNEL_TESTS):
 ON_TPU = os.environ.get("DCP2_HARNESS_DEVICE", "cpu").lower() == "tpu"
 
 
+@pytest.fixture(autouse=True)
+def cpu_device():
+    """CPU mode runs on the CPU backend even on a TPU host (the pod pytest
+    recipe sets JAX_PLATFORMS=tpu,cpu): default-precision TPU matmuls round
+    through bf16, far outside the 2-ulp bar the CPU oracles are held to."""
+    if ON_TPU:
+        yield
+        return
+    import jax
+
+    with jax.default_device(jax.devices("cpu")[0]):
+        yield
+
+
 @pytest.fixture
 def interpret(monkeypatch):
     """Pallas kernels in the legacy interpret evaluator on CPU (TPU7x info);
