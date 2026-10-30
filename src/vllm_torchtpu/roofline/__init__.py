@@ -23,6 +23,7 @@ from .collectives import (
     torus_collective_s,
 )
 from .emit import SOLVE_SCHEMA, build_solve_payload, emit_ceiling_rows, emit_launch_args, point_launch_args, pool_cli_args, top_layouts
+from .report import MAX_EMBEDDED_CANDIDATES, render_html, write_html
 from .geometry import LAYER_FAMILIES, ModelGeometry, from_hf_config
 from .hf_loader import dtypes_from_hf_config, load_hf_config
 from .modules import (
@@ -83,9 +84,12 @@ __all__ = [
     "build_solve_payload",
     "emit_ceiling_rows",
     "emit_launch_args",
+    "MAX_EMBEDDED_CANDIDATES",
     "point_launch_args",
     "pool_cli_args",
+    "render_html",
     "top_layouts",
+    "write_html",
     "build_example_scenario",
     "dtypes_from_hf_config",
     "ep_busiest_experts",
