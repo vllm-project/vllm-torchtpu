@@ -47,18 +47,21 @@ does not wait for the data on the host: the forward reads the tensor, and
 the runtime runs the forward once the data has landed.
 
 A device has 8 receive flags, and a receive posted beyond them stalls its
-sender without an error. The posting thread keeps at most 7 receive calls
-posted ahead of the forwards that take them, so a step of many forwards
-waits in that thread for its earlier forwards rather than stalling the
-sender. A receive a forward has taken stays outstanding until its data
-lands, on a stage that sends for at most ``depth`` unsent forwards besides
-the one it runs; ``check_ring_receives`` refuses a depth that could take
-more than 7 flags with one forward per step.
+sender without an error. A receive holds its flag until its data has
+landed, which the host sees once the forward that read it has completed:
+end_forward records a fence after every forward, on the last stage too,
+and the send thread advances ``landed_through`` once that fence completes.
+The posting thread posts a transfer only while at most 7 receive calls are
+posted whose forwards have not completed, so a step of many forwards, or a
+deep ring, waits in that thread rather than stalling the sender.
+``check_ring_receives`` refuses a depth that, with one forward per step,
+could hold more than 7 at once.
 
 The sender hands its output on from a helper thread. end_forward submits the
 ops that produce the outgoing tensors, records a device fence and queues the
 transfer; the helper waits on the fence, calls ``isend`` for each tensor and
-waits until the copies are done, keeping the tensors alive until then.
+waits until the copies are done, keeping the tensors alive until then. The
+last stage queues the fence alone, which the helper only waits on.
 ``isend`` returns only once the receiver has posted the matching receive:
 that is the credit, a stage cannot send a forward before the next stage has
 taken up its step. At most ``depth`` forwards wait in a stage's queue, the
@@ -101,10 +104,10 @@ _LIBTPU_REQUIREMENT = (
     "and later; TPU_PP_HANDOFF=wave does not"
 )
 
-# Receive calls a device may have posted whose data has not landed. A device
-# has 8 receive flags, and a receive posted beyond them stalls its sender
-# without an error; the ring keeps one spare. The posting thread holds the
-# calls posted ahead of their forwards to this many.
+# Receive calls a device may have posted whose data has not landed, each
+# counted until the forward that read it has completed. A device has 8
+# receive flags, and a receive posted beyond them stalls its sender without
+# an error; the ring keeps one spare.
 _MAX_RECEIVES = 7
 
 
@@ -121,8 +124,8 @@ def ring_receives_posted(stages: int, depth: int, carried: int = 1) -> int:
     received. No stage holds more than the ``stages`` steps the engine keeps
     in flight.
 
-    The posting thread holds back a step of more forwards; the receives
-    that forwards have already taken are what it cannot hold back.
+    At run time the posting thread holds every device to _MAX_RECEIVES, so
+    a step of more forwards, or a deeper ring, waits there instead.
     """
     if stages < 2:
         return 0
@@ -204,9 +207,9 @@ class PPRing:
         self.transfers = 0
         # The last transfer whose receives this stage has posted.
         self.posted_through = 0
-        # The last transfer whose receives a forward, or the warmup's check,
-        # has taken.
-        self.consumed_through = 0
+        # The last transfer whose forward, or the warmup's check, has
+        # completed on the device, so the receives it read have landed.
+        self.landed_through = 0
         self.forwards = 0
         self.sent = 0
         # Receives queued ahead of their forwards: (transfer, rows, the
@@ -215,7 +218,7 @@ class PPRing:
         # The transfer of the forward between start_forward and end_forward.
         self._current = 0
         # Sends queued for the helper thread, the one in progress first:
-        # (transfer, tensors, fence).
+        # (transfer, tensors, fence); the last stage queues no tensors.
         self._cv = threading.Condition()
         self._sends: deque[tuple[int, tuple[torch.Tensor, ...], TpuEvent]] = deque()
         self._closing = False
@@ -325,7 +328,6 @@ class PPRing:
             # the next stage's post.
             if self.prev is not None:
                 received = self._post(self.transfers, rows)
-                self.consumed_through = self.transfers
             if self.next is not None:
                 sent = tuple(
                     torch.full(
@@ -351,6 +353,8 @@ class PPRing:
             ) from exc
         if self.prev is None:
             return
+        # Reading the received tensors waited for their data to land.
+        self.landed_through = self.transfers
         for key, values in zip(self.carried, got):
             dtype = self.template[key][1]
             want = float(torch.tensor(self.prev + 1).to(dtype).item())
@@ -393,20 +397,27 @@ class PPRing:
 
     def _has_room(self) -> bool:
         """Whether posting the next queued transfer keeps at most
-        _MAX_RECEIVES receive calls posted ahead of the forwards that take
-        them; called with the lock held."""
+        _MAX_RECEIVES receive calls posted whose forwards have not
+        completed; called with the lock held."""
         transfer = self._to_post[0][0]
-        posted_ahead = (transfer - self.consumed_through) * len(self.carried)
-        return posted_ahead <= _MAX_RECEIVES
+        outstanding = (transfer - self.landed_through) * len(self.carried)
+        return outstanding <= _MAX_RECEIVES
+
+    def _post_stops(self) -> bool:
+        """Whether the posting thread stops: the ring closes, or its send
+        thread failed, which also fails what is queued for posting."""
+        return self._closing or self._error is not None
 
     def _post_loop(self) -> None:
         while True:
             with self._cv:
-                self._cv.wait_for(lambda: bool(self._to_post) or self._closing)
-                if not self._closing and not self._has_room():
+                self._cv.wait_for(lambda: bool(self._to_post) or self._post_stops())
+                if not self._post_stops() and not self._has_room():
                     with TraceAnnotation("PP:PostThrottled"):
-                        self._cv.wait_for(lambda: self._closing or self._has_room())
-                if self._closing:
+                        self._cv.wait_for(
+                            lambda: self._post_stops() or self._has_room()
+                        )
+                if self._post_stops():
                     # The forwards these were queued for will not run.
                     for *_, landing in self._to_post:
                         landing.cancel()
@@ -437,6 +448,7 @@ class PPRing:
         and returns the tensors they land in."""
         with TraceAnnotation("PP:WaitPosted"):
             error = landing.exception()
+        self._raise_send_failure()
         if error is not None:
             raise RuntimeError(
                 f"PP ring rank {self.rank}: the posting thread failed"
@@ -465,10 +477,6 @@ class PPRing:
                 f"rows found the receive of transfer {transfer} posted for "
                 f"{posted_rows} rows"
             )
-        with self._cv:
-            # Taken by this forward, which makes room for the posting thread.
-            self.consumed_through = transfer
-            self._cv.notify_all()
         tensors = dict(zip(self.carried, received))
         # The residual is zero: the sum arrived as the hidden states.
         zero = self._zero_residuals.get(rows)
@@ -476,6 +484,8 @@ class PPRing:
             shape, dtype = self.template[RESIDUAL]
             zero = torch.zeros((rows, *shape), dtype=dtype, device=self.device)
             self._zero_residuals[rows] = zero
+        # The compiled forward reads it and returns new tensors, and the cache
+        # keeps a reference, so it is never written to or donated.
         tensors[RESIDUAL] = zero
         return IntermediateTensors(tensors)
 
@@ -484,6 +494,9 @@ class PPRing:
         the last stage); queues them for the next stage."""
         self._raise_send_failure()
         if self.rank == self.last:
+            # The send thread only waits for the forward to complete, which
+            # frees the receives it read.
+            self._queue_send(self._current, (), _fence())
             return
         assert tensors is not None
         missing = [key for key in self.carried if key not in tensors]
@@ -520,7 +533,8 @@ class PPRing:
             )
             self._thread.start()
         with self._cv:
-            if len(self._sends) >= self.depth and self._error is None:
+            # A fence alone holds no outputs and waits for no room.
+            if outgoing and len(self._sends) >= self.depth and self._error is None:
                 with TraceAnnotation("PP:RingFull"):
                     self._cv.wait_for(
                         lambda: len(self._sends) < self.depth or self._error is not None
@@ -533,11 +547,15 @@ class PPRing:
         self, transfer: int, outgoing: tuple[torch.Tensor, ...], fence: "TpuEvent"
     ) -> None:
         """Sends one transfer once its tensors are computed and returns when
-        the copies are done; runs on the send thread."""
+        the copies are done; runs on the send thread. Once the fence shows
+        the transfer's forward completed, its receives count as landed."""
         import torch.distributed as dist
 
         with TraceAnnotation("PP:Send"):
             fence.synchronize()
+            with self._cv:
+                self.landed_through = transfer
+                self._cv.notify_all()
             works = [
                 dist.isend(x, dst=self.next, tag=self._tag(transfer, i))
                 for i, x in enumerate(outgoing)
@@ -565,11 +583,17 @@ class PPRing:
                 if error is not None:
                     self._error = error
                     self._sends.clear()
+                    # The posting thread stops, so the forwards waiting for
+                    # receives it has not posted fail with this error.
+                    for *_, landing in self._to_post:
+                        landing.set_exception(error)
+                    self._to_post.clear()
                     self._cv.notify_all()
                     return
                 # Releases the tensors: the copies are done.
-                self._sends.popleft()
-                self.sent += 1
+                _, outgoing, _ = self._sends.popleft()
+                if outgoing:
+                    self.sent += 1
                 self._cv.notify_all()
 
     def push(self) -> None:
@@ -582,7 +606,8 @@ class PPRing:
     def close(self) -> None:
         """Drops the receives still queued, whose forwards will not run,
         waits until every queued send is done, stops the helper threads, and
-        raises a failure of either."""
+        raises a failure of either. The helper threads are daemon threads, so
+        close is for tests and explicit shutdown."""
         threads = [t for t in (self._post_thread, self._thread) if t is not None]
         if threads:
             with self._cv:
