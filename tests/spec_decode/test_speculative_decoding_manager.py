@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import types
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -23,6 +24,7 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
 )
+from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 
 
@@ -264,6 +266,9 @@ def _fresh_metadata_manager(device, input_ids):
     mock_runner.arange_np = np.arange(100, dtype=np.int32)
     mock_runner.num_tokens_paddings = [8, 16, 32, 64]
     mock_runner.input_ids_cpu = input_ids
+    mock_runner._verify_draft_rows = types.MethodType(
+        TPUModelRunner._verify_draft_rows, mock_runner
+    )
     return SpeculativeDecodingManager(mock_runner)
 
 

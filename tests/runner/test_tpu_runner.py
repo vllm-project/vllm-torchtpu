@@ -15,6 +15,7 @@
 import contextlib
 import copy
 import inspect
+import types
 import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -3057,6 +3058,9 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         sample_from_logits_func=fake_sample_from_logits,
         speculative_config=SimpleNamespace(num_speculative_tokens=1),
     )
+    spec_runner._spec_uniform = types.MethodType(
+        TPUModelRunner._spec_uniform, spec_runner
+    )
     spec_runner.rejection_sampler = MagicMock(side_effect=fake_rejection_sampler)
     spec_runner.rejection_sampler.synthetic_mode = False
     md = SimpleNamespace(
@@ -3066,6 +3070,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         draft_lengths=torch.ones((2,), dtype=torch.int32),
         segment_ids=torch.tensor([0, 1], dtype=torch.int32),
         group_indices=torch.tensor([[0], [1]], dtype=torch.int32),
+        verify_rng_rows=0,
     )
     TPUModelRunner._sample_spec_verify_chunk(
         spec_runner,

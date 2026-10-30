@@ -122,6 +122,9 @@ def _make_runner(
     runner._upload_unless_unchanged = types.MethodType(
         TPUModelRunner._upload_unless_unchanged, runner
     )
+    runner._verify_draft_rows = types.MethodType(
+        TPUModelRunner._verify_draft_rows, runner
+    )
     runner._dp_target_bucket = None
     runner._has_mamba_state = False
     # One pipeline stage: the runner embeds its own inputs.
