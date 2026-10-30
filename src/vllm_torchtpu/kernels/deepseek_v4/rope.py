@@ -542,6 +542,17 @@ def qnorm_rope_head(
     return jnp.concatenate([y[..., :-LANE], roped], axis=-1)
 
 
+def qnorm_rope_head_signed(
+    x: jax.Array, cos: jax.Array, signed_sin: jax.Array, *, eps: float
+) -> jax.Array:
+    """`qnorm_rope_head` given `cos_signed_sin_lanes`, bit-identically
+    (see `rope_lanes_signed`)."""
+    rms = jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + eps)
+    y = x * rms
+    roped = rope_lanes_signed(y[..., -LANE:], cos, signed_sin)
+    return jnp.concatenate([y[..., :-LANE], roped], axis=-1)
+
+
 def _qnorm_rope_kernel(
     # scalar prefetch
     positions_ref: jax.Ref,

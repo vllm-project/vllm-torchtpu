@@ -236,3 +236,18 @@ def test_signed_sin_rotation_is_bit_identical():
     np.testing.assert_array_equal(
         np.asarray(got).view(np.uint32), np.asarray(want).view(np.uint32)
     )
+
+
+def test_signed_sin_qnorm_rope_is_bit_identical():
+    keys = jax.random.split(jax.random.key(5), 3)
+    x = jax.random.normal(keys[0], (64, 512), jnp.float32)
+    x = x * jnp.exp(jax.random.uniform(keys[1], (64, 1), minval=-30, maxval=30))
+    x = x.astype(jnp.bfloat16).astype(jnp.float32)
+    cos_sin = jax.random.uniform(keys[2], (64, 64), jnp.float32, -1, 1)
+    cos, sin = rope.cos_sin_lanes(cos_sin)
+    cos_s, signed_sin = rope.cos_signed_sin_lanes(cos_sin)
+    want = rope.qnorm_rope_head(x, cos, sin, eps=EPS)
+    got = rope.qnorm_rope_head_signed(x, cos_s, signed_sin, eps=EPS)
+    np.testing.assert_array_equal(
+        np.asarray(got).view(np.uint32), np.asarray(want).view(np.uint32)
+    )

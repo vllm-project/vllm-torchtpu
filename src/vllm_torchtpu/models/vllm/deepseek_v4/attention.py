@@ -115,12 +115,12 @@ def _wq_b_qnorm_rope_jax(
             w_q,
             w_s,
             head_dim,
-            functools.partial(rope_kernel.qnorm_rope_head, eps=eps),
-            rope_kernel.cos_sin_lanes,
+            functools.partial(rope_kernel.qnorm_rope_head_signed, eps=eps),
+            rope_kernel.cos_signed_sin_lanes,
             positions,
             cos_sin_cache,
             kv=kv,
-            kv_fn=rope_kernel.rope_lanes,
+            kv_fn=rope_kernel.rope_lanes_signed,
         ),
     )
 
