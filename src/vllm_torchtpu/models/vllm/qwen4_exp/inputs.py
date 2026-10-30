@@ -44,10 +44,14 @@ def ngram_context_from_store(
     return torch.where(columns >= 0, gathered.to(torch.int64), eos_token_id)
 
 
-def dummy_query_lengths(num_tokens, num_reqs, max_active):
+def dummy_query_lengths(num_tokens, num_reqs, max_active, capacities):
     active = min(num_tokens, num_reqs, max_active)
-    lengths = [1] * active + [0] * (num_reqs - active)
-    lengths[active - 1] += num_tokens - active
+    lengths = [int(i < active and capacities[i] > 0) for i in range(num_reqs)]
+    remaining = num_tokens - sum(lengths)
+    for i in reversed(range(active)):
+        count = min(remaining, max(0, capacities[i] - lengths[i]))
+        lengths[i] += count
+        remaining -= count
     return lengths
 
 
@@ -57,9 +61,6 @@ class Qwen4ExpAdapter:
         require_unified_pool()
         self.config = runner.model_config.hf_text_config
         self.block_size = runner.cache_config.block_size
-        self.attention_prefix = (
-            f"model.layers.{self.config.layer_types.index('indexed_attention')}"
-        )
         self.cache: Qwen4ExpPooledCache | None = None
         self.ngram_context = None
 
@@ -103,8 +104,6 @@ class Qwen4ExpAdapter:
         rows = starts.shape[0] - 1
         context = (ctx.seq_lens - (starts[1:] - starts[:-1])).to(torch.int64)
         valid_rows = torch.arange(rows, device=runner.device) < snapshot.num_requests
-        state_indices = torch.arange(rows, dtype=torch.int32, device=runner.device)
-        slots = torch.where(valid_rows, state_indices, -1).to(torch.int32)
         ngram_context = snapshot.step_context
         if ngram_context.shape[0]:
             row_ids = (
@@ -122,17 +121,12 @@ class Qwen4ExpAdapter:
                 dtype=torch.int64,
                 device=runner.device,
             )
-        main_name = f"{self.attention_prefix}.self_attn"
-        table = snapshot.attention_metadata[main_name].block_tables.reshape(rows, -1)
         kwargs = dict(
             query_start_loc=starts,
             ngram_context=history,
-            state_slots=slots,
             context_lens=context,
             valid_tokens=torch.arange(snapshot.num_tokens, device=runner.device)
             < starts[-1],
-            main_block_table=table,
-            compressed_block_table=table,
         )
         return kwargs
 
@@ -169,20 +163,20 @@ class Qwen4ExpAdapter:
         )
         assert self.cache is not None
         self.cache.allocate()
+        context_cpu = torch.zeros(num_reqs, dtype=torch.int64, device="cpu")
+        if profile_prefix is not None:
+            if not 0 <= profile_prefix < context_limit:
+                raise ValueError("Profiling prefix must leave room for query tokens")
+            context_cpu[0] = profile_prefix
         lengths = dummy_query_lengths(
-            num_tokens, num_reqs, runner.scheduler_config.max_num_seqs
+            num_tokens,
+            num_reqs,
+            runner.scheduler_config.max_num_seqs,
+            (context_limit - context_cpu).tolist(),
         )
         starts_cpu = torch.tensor(
             [0] + lengths, dtype=torch.int32, device="cpu"
         ).cumsum(0, dtype=torch.int32)
-        context_cpu = torch.zeros(num_reqs, dtype=torch.int64, device="cpu")
-        if profile_prefix is not None:
-            context_cpu[0] = profile_prefix
-        if (
-            max(context_cpu.tolist()[i] + q for i, q in enumerate(lengths))
-            > context_limit
-        ):
-            raise ValueError("Dummy context exceeds admitted Qwen4Exp context")
         active = sum(q > 0 for q in lengths)
         slots_cpu = torch.tensor(
             list(range(1, active + 1)) + [-1] * (num_reqs - active),
@@ -199,6 +193,9 @@ class Qwen4ExpAdapter:
                 )
                 for i, q in enumerate(lengths)
             ]
+        )
+        positions_cpu = torch.nn.functional.pad(
+            positions_cpu, (0, num_tokens - sum(lengths))
         )
         tables_cpu = torch.zeros((num_reqs, columns), dtype=torch.int32, device="cpu")
         next_page = 1
@@ -237,11 +234,8 @@ class Qwen4ExpAdapter:
         kwargs = dict(
             query_start_loc=starts,
             ngram_context=history,
-            state_slots=slots,
             context_lens=context,
-            valid_tokens=torch.ones(num_tokens, dtype=torch.bool, device=runner.device),
-            main_block_table=table,
-            compressed_block_table=table,
+            valid_tokens=torch.arange(num_tokens, device=runner.device) < starts[-1],
         )
         ids = (
             torch.arange(num_tokens, dtype=torch.int32, device=runner.device) * 37 + 17
@@ -288,11 +282,8 @@ class Qwen4ExpAdapter:
                 dtype=torch.int64,
                 device=device,
             ),
-            state_slots=slots,
             context_lens=context,
             valid_tokens=torch.zeros(num_tokens, dtype=torch.bool, device=device),
-            main_block_table=table,
-            compressed_block_table=table,
         )
         return self._dummy_forward(
             torch.zeros_like(positions),
@@ -382,7 +373,9 @@ class Qwen4ExpAdapter:
                 # has a TP collective even when this DP has no live tokens;
                 # omitting it leaves busy DP engines waiting on their logits.
                 indices = torch.zeros(
-                    kwargs["state_slots"].shape[0], dtype=torch.int32, device=out.device
+                    metadata.query_start_loc.shape[0] - 1,
+                    dtype=torch.int32,
+                    device=out.device,
                 )
                 runner.compute_selected_logits(out, indices)
             else:

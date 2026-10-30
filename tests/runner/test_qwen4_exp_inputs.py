@@ -104,9 +104,12 @@ def test_reordered_history_slots_and_group_tables_are_independent(
         [248044, 20],
         [248044, 248044],
     ]
-    assert actual["state_slots"].tolist() == [0, 1, -1]
-    assert actual["main_block_table"].tolist()[0] == [11, 12]
-    assert actual["compressed_block_table"].tolist()[0] == [11, 12]
+    assert {"state_slots", "main_block_table", "compressed_block_table"}.isdisjoint(
+        actual
+    )
+    assert metadata[f"model.layers.{qsa_index}.self_attn"].block_tables.tolist()[
+        :2
+    ] == [11, 12]
     assert actual["valid_tokens"].tolist() == [True] * 4 + [False] * 4
     assert actual["query_start_loc"] is ctx.query_start_loc
     assert "ple_raw_embeddings" not in actual
@@ -153,7 +156,7 @@ def test_reordered_history_slots_and_group_tables_are_independent(
     ],
 )
 def test_dummy_geometry_exercises_every_token(tokens, rows, limit):
-    lengths = dummy_query_lengths(tokens, rows, limit)
+    lengths = dummy_query_lengths(tokens, rows, limit, [tokens] * rows)
     assert len(lengths) == rows
     assert sum(lengths) == tokens
     assert sum(x > 0 for x in lengths) <= limit
@@ -241,7 +244,7 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(monkeypatch, 
     runner.most_model_len = 384
     adapter.dummy_run(128, 8, num_blocks=3, use_max_model_len=False)
     kwargs = captured["model_kwargs"]
-    assert kwargs["main_block_table"].shape == (8, 3)
+    assert captured["metadata"]["gdn"].block_tables.shape == (24,)
     assert allocations == [True]
     assert captured["positions"].dtype == torch.int32
     assert captured["input_ids"].dtype == torch.int32
@@ -249,8 +252,8 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(monkeypatch, 
     assert kwargs["query_start_loc"].tolist() == [0] + [128] * 8
     assert captured["metadata"]["gdn"].query_start_loc is kwargs["query_start_loc"]
     assert captured["metadata"]["ple"].seq_lens.tolist() == [128] + [0] * 7
-    assert kwargs["state_slots"].tolist() == [1] + [-1] * 7
-    assert kwargs["main_block_table"].max().item() == 1
+    assert captured["metadata"]["gdn"].mamba_state_indices.tolist() == [1] + [0] * 7
+    assert captured["metadata"]["gdn"].block_tables.max().item() == 1
     assert adapter.ngram_context.shape == (8, 2)
     assert kwargs["ngram_context"].tolist() == [[248044, 248044]] * 8
     assert "ple_raw_embeddings" not in kwargs
@@ -280,14 +283,13 @@ def test_profile_binds_state_and_uses_serving_dtypes_and_full_work(monkeypatch, 
     kwargs = captured["model_kwargs"]
     md = captured["metadata"]["gdn"]
     assert not kwargs["valid_tokens"].any()
-    assert kwargs["state_slots"].tolist() == [-1] * 8
+    assert not md.mamba_state_indices.any()
     assert kwargs["ngram_context"].tolist() == [[248044, 248044]] * 8
     assert "ple_raw_embeddings" not in kwargs
     for value in (
         kwargs["query_start_loc"],
         kwargs["context_lens"],
-        kwargs["main_block_table"],
-        kwargs["compressed_block_table"],
+        md.block_tables,
         md.seq_lens,
         md.request_distribution,
         md.mamba_state_indices,
@@ -324,7 +326,7 @@ def test_native_kwargs_match_warmup_profile_and_idle(monkeypatch, tokens, live_c
     runner, real, _ = prepare_native_pool_inputs(
         cfg, plan, rows, list(range(2, 2 + live_count)), scheduled, tokens
     )
-    padded_rows = real["state_slots"].shape[0]
+    padded_rows = real["query_start_loc"].shape[0] - 1
     captured = []
 
     def forward(**kwargs):
@@ -368,16 +370,12 @@ def test_native_kwargs_match_warmup_profile_and_idle(monkeypatch, tokens, live_c
     keys = {
         "query_start_loc",
         "ngram_context",
-        "state_slots",
         "context_lens",
         "valid_tokens",
-        "main_block_table",
-        "compressed_block_table",
     }
     reference_leaves, reference_tree = tree_flatten(real)
     for kwargs in (real, warm, profile, idle):
         assert set(kwargs) == keys
-        assert kwargs["main_block_table"] is kwargs["compressed_block_table"]
         leaves, tree = tree_flatten(kwargs)
         assert tree == reference_tree
         for expected, actual in zip(reference_leaves, leaves):
@@ -451,8 +449,7 @@ def test_empty_request_snapshot_preserves_padded_input_contract(
     adapter = Qwen4ExpAdapter(runner)
     snapshot = adapter.begin_step()
     assert snapshot.shape == (0, ngram_size - 1)
-    main = adapter.attention_prefix + ".self_attn"
-    metadata = {main: NS(block_tables=torch.zeros(3, 2, dtype=torch.int32))}
+    metadata = {}
     kwargs = adapter.prepare_inputs(
         ModelInputSnapshot(
             snapshot,
@@ -467,10 +464,10 @@ def test_empty_request_snapshot_preserves_padded_input_contract(
         kwargs["ngram_context"].tolist()
         == [[adapter.config.eos_token_id] * (ngram_size - 1)] * 3
     )
-    assert kwargs["state_slots"].tolist() == [-1, -1, -1]
     assert not kwargs["valid_tokens"].any()
-    assert kwargs["main_block_table"].shape == (3, 2)
-    assert torch.equal(kwargs["main_block_table"], kwargs["compressed_block_table"])
+    assert {"state_slots", "main_block_table", "compressed_block_table"}.isdisjoint(
+        kwargs
+    )
 
 
 def test_ngram_history_uses_configured_width_and_eos():
@@ -511,7 +508,9 @@ def test_native_pool_metadata_consumes_bounded_history(kv):
         ]
         for row, context in enumerate(contexts)
     ]
-    expected += [[config.eos_token_id] * width] * (len(kwargs["state_slots"]) - 2)
+    expected += [[config.eos_token_id] * width] * (
+        kwargs["query_start_loc"].shape[0] - 3
+    )
     assert kwargs["ngram_context"].tolist() == expected
 
 
@@ -557,7 +556,8 @@ def test_step_snapshot_is_bounded_and_shared_across_chunks(ngram_size, has_ple):
             mamba_state_indices=torch.arange(3),
         )
         metadata = {
-            adapter.attention_prefix + "." + role: NS(block_tables=torch.zeros(3, 2))
+            f"model.layers.{adapter.config.layer_types.index('indexed_attention')}."
+            + role: NS(block_tables=torch.zeros(3, 2))
             for role in ("self_attn", "self_attn.compressed_k")
         }
         kwargs = adapter.prepare_inputs(
@@ -668,9 +668,8 @@ def test_real_runner_chunks_and_async_input_hash(monkeypatch, ngram_size):
         )
         rows = len(ctx.seq_lens)
         metadata = {
-            adapter.attention_prefix + "." + role: NS(
-                block_tables=torch.zeros(rows, 2, dtype=torch.int32)
-            )
+            f"model.layers.{adapter.config.layer_types.index('indexed_attention')}."
+            + role: NS(block_tables=torch.zeros(rows, 2, dtype=torch.int32))
             for role in ("self_attn", "self_attn.compressed_k")
         }
         kwargs = adapter.prepare_inputs(

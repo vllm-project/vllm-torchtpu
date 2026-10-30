@@ -13,6 +13,8 @@
 # limitations under the License.
 """Single admission boundary for the FP8, text-only TPU S1 implementation."""
 
+from collections.abc import Mapping
+
 import torch
 from vllm.config.engram import EngramConfig
 from vllm.config.utils import config, get_hash_factors, hash_factors
@@ -28,6 +30,7 @@ from vllm_torchtpu.gdn_pool_layout import (
     unified_kv_layout_enabled_for_architecture,
 )
 from vllm_torchtpu.kernels.qwen4_exp.hc_prefill_policy import validate_hc_prefill_mode
+from vllm_torchtpu.models.model_hooks import qwen4_options
 from vllm_torchtpu.utils import torch_dtype_from_name
 
 from .ple_host import PLEHostLaunch, host_available_memory
@@ -146,7 +149,7 @@ class TPUQwen4ExpConfig(VerifyAndUpdateConfig):
         tile = envs.VLLM_TPU_HC_PREFILL_TILE
         validate_hc_prefill_mode("auto" if tile is None else tile, full_mix=True)
         validate_config(vllm_config)
-        qwen = vllm_config.additional_config.get("qwen4_exp", {})
+        qwen = qwen4_options(vllm_config)
         if qwen.get("engram_config", {}).get("cpu_offload", False):
             # Host PLE lookup stays eager; its device producer and decoder
             # consumers use the existing piecewise compilation backend.
@@ -207,7 +210,7 @@ def validate_config(cfg):
         cfg.scheduler_config,
     )
     retired = sorted(
-        cfg.additional_config.get("qwen4_exp", {}).keys()
+        qwen4_options(cfg).keys()
         & {"qsa_prefill_backend", "qsa_sparse_backend", "qsa_dense_threshold"}
     )
     if retired:
@@ -217,39 +220,41 @@ def validate_config(cfg):
         )
     t = m.hf_text_config
     require_unified_pool()
-    quant = m.hf_config.quantization_config
+    quant = m.hf_config.to_dict().get("quantization_config")
+    if not isinstance(quant, Mapping):
+        raise ValueError("Qwen4Exp requires a quantization_config mapping")
     # Model dimensions are input data. Only actual implementation contracts
     # belong here; do not admit a single checkpoint by matching its literals.
     positive = (
-        "hidden_size",
-        "num_hidden_layers",
-        "hc_count",
-        "hc_lowrank",
-        "vocab_size",
-        "num_attention_heads",
-        "num_key_value_heads",
-        "head_dim",
-        "num_experts",
-        "num_experts_per_tok",
-        "moe_intermediate_size",
-        "shared_expert_intermediate_size",
-        "linear_num_key_heads",
-        "linear_num_value_heads",
-        "linear_key_head_dim",
-        "linear_value_head_dim",
-        "linear_conv_kernel_dim",
-        "indexer_n_heads",
-        "indexer_head_dim",
-        "indexer_budget",
-        "indexer_compress_ratio",
-        "ple_embed_dim",
-        "ple_conv_kernel_size",
-        "heads_per_ngram",
-        "ngram_vocab_size_base",
-        "make_ngram_vocab_size_divisible_by",
-        "max_position_embeddings",
+        t.hidden_size,
+        t.num_hidden_layers,
+        t.hc_count,
+        t.hc_lowrank,
+        t.vocab_size,
+        t.num_attention_heads,
+        t.num_key_value_heads,
+        t.head_dim,
+        t.num_experts,
+        t.num_experts_per_tok,
+        t.moe_intermediate_size,
+        t.shared_expert_intermediate_size,
+        t.linear_num_key_heads,
+        t.linear_num_value_heads,
+        t.linear_key_head_dim,
+        t.linear_value_head_dim,
+        t.linear_conv_kernel_dim,
+        t.indexer_n_heads,
+        t.indexer_head_dim,
+        t.indexer_budget,
+        t.indexer_compress_ratio,
+        t.ple_embed_dim,
+        t.ple_conv_kernel_size,
+        t.heads_per_ngram,
+        t.ngram_vocab_size_base,
+        t.make_ngram_vocab_size_divisible_by,
+        t.max_position_embeddings,
     )
-    if any(getattr(t, field) <= 0 for field in positive):
+    if any(value <= 0 for value in positive):
         raise ValueError("Qwen4Exp model geometry dimensions must be positive")
     if (
         len(t.layer_types) != t.num_hidden_layers
@@ -363,17 +368,16 @@ def validate_config(cfg):
     # the initial 64-slot bring-up was a test configuration, not a kernel cap.
     if (
         m.dtype != torch.bfloat16
-        or c.block_size != 128
-        or not 1 <= s.max_num_batched_tokens <= 8192
+        or c.block_size <= 0
+        or s.max_num_batched_tokens <= 0
         or s.max_num_seqs < 1
     ):
         raise ValueError(
-            "Qwen4Exp TPU S1 requires BF16/P128, step<=8192 and positive max_num_seqs"
+            "Qwen4Exp requires BF16 activations and positive page, token "
+            "and request capacities"
         )
-    if m.max_model_len < 128:
-        raise ValueError(
-            "Qwen4Exp TPU S1 requires context>=128 for full activation profiling"
-        )
+    if m.max_model_len <= 0:
+        raise ValueError("Qwen4Exp context capacity must be positive")
     if (
         s.disable_hybrid_kv_cache_manager
         or cfg.speculative_config is not None
@@ -414,7 +418,7 @@ def validate_config(cfg):
         raise ValueError("Qwen4Exp requires its native HEAD_ALONG_SUBLANE cache layout")
     if c.enable_prefix_caching and c.mamba_cache_mode != "align":
         raise ValueError("Qwen4Exp unified pool requires mamba_cache_mode='align'")
-    engram = cfg.additional_config.get("qwen4_exp", {}).get("engram_config", {})
+    engram = qwen4_options(cfg).get("engram_config", {})
     for flag in ("cpu_offload", "embedding_across_dp", "dp_shared_memory"):
         if type(engram.get(flag, False)) is not bool:
             raise ValueError(f"Qwen4Exp engram_config.{flag} must be bool")

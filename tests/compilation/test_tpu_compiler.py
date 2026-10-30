@@ -199,14 +199,22 @@ class TestTpuCompilerCache:
             "vllm_torchtpu/kernels/quantized_matmul/blockwise_kernel.py",
             "vllm_torchtpu/kernels/pool_adapters.py",
             "vllm_torchtpu/kernels/qwen4_exp/gdn_input.py",
+            "vllm_torchtpu/models/vllm/qwen4_exp/ple_offload.py",
             "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
             "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
         } <= hashed
 
-    def test_runtime_hash_tracks_pooled_input_preparer_source(self, tmp_path):
+    @pytest.mark.parametrize(
+        "relative",
+        [
+            "vllm_torchtpu/kernels/qwen4_exp/gdn_input.py",
+            "vllm_torchtpu/models/vllm/qwen4_exp/ple_offload.py",
+        ],
+    )
+    def test_runtime_hash_tracks_pooled_input_preparer_source(self, tmp_path, relative):
         from vllm_torchtpu.compilation import tpu_compiler
 
-        relative = Path("vllm_torchtpu/kernels/qwen4_exp/gdn_input.py")
+        relative = Path(relative)
         source_root = Path(tpu_compiler.__file__).resolve().parents[2]
         source = tmp_path / relative
         source.parent.mkdir(parents=True)

@@ -14,13 +14,23 @@
 """Model-owned runner factories and communication requirements."""
 
 from collections.abc import Callable, Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
     from vllm_torchtpu.runner.model_adapters import ModelAdapter
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+
+def qwen4_options(config: "VllmConfig") -> Mapping[str, Any]:
+    options = config.additional_config
+    if not isinstance(options, Mapping):
+        return {}
+    qwen = options.get("qwen4_exp", {})
+    if not isinstance(qwen, Mapping):
+        raise ValueError("qwen4_exp options must be a mapping")
+    return qwen
 
 
 def _qwen4_adapter(runner: "TPUModelRunner") -> "ModelAdapter":
@@ -30,10 +40,7 @@ def _qwen4_adapter(runner: "TPUModelRunner") -> "ModelAdapter":
 
 
 def _qwen4_dp_collectives(config: "VllmConfig") -> bool:
-    options = config.additional_config
-    if not isinstance(options, Mapping):
-        return False
-    qwen = options.get("qwen4_exp", {})
+    qwen = qwen4_options(config)
     engram = qwen.get("engram_config", {})
     return bool(engram.get("embedding_across_dp", False))
 

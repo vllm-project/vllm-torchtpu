@@ -279,6 +279,8 @@ def get_packed_mla_head_size(hf_config) -> int:
 class VllmDeepseekSparseSWABackend(DeepseekSparseSWABackend):
     """TPU attention backend for DeepSeek-V4 SWA cache."""
 
+    kv_cache_layout_is_final: bool = False
+
     @classmethod
     def get_min_page_size(cls, vllm_config: VllmConfig) -> int:
         return 1

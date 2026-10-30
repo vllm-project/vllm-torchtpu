@@ -156,17 +156,15 @@ def test_alternative_config_drives_checkpoint_cache_and_custom_op(
         assert owners[0].shape[1] == layout.block_size
         model.bind_pool(*owners)
         metadata = QSAMetadata(
-            torch.empty(3, dtype=torch.int32),
-            torch.empty(2, dtype=torch.int32),
-            torch.empty(2, dtype=torch.int32),
-            torch.empty(2, 2, dtype=torch.int32),
-            torch.empty(2, 2, dtype=torch.int32),
+            torch.empty(3, dtype=torch.int32), torch.empty(2, dtype=torch.int32)
         )
         qsa_forward_context(
             monkeypatch,
             model,
             metadata,
             request_distribution=torch.tensor([0, 0, 2], dtype=torch.int32),
+            main_block_table=torch.empty(2, 2, dtype=torch.int32),
+            state_slots=torch.empty(2, dtype=torch.int32),
         )
         output, selected = model.forward_with_indices(
             torch.empty(7, 128, dtype=torch.bfloat16),
@@ -286,17 +284,15 @@ def test_model_cache_binding_reaches_real_custom_op_schema(dtype, monkeypatch):
         owners, layout = qsa_test_pools(model, 4)
         model.bind_pool(*owners)
         metadata = QSAMetadata(
-            torch.empty(3, dtype=torch.int32),
-            torch.empty(2, dtype=torch.int32),
-            torch.empty(2, dtype=torch.int32),
-            torch.empty(2, 2, dtype=torch.int32),
-            torch.empty(2, 2, dtype=torch.int32),
+            torch.empty(3, dtype=torch.int32), torch.empty(2, dtype=torch.int32)
         )
         qsa_forward_context(
             monkeypatch,
             model,
             metadata,
             request_distribution=torch.tensor([0, 0, 2], dtype=torch.int32),
+            main_block_table=torch.empty(2, 2, dtype=torch.int32),
+            state_slots=torch.empty(2, dtype=torch.int32),
         )
         output, selected = model.forward_with_indices(
             torch.empty(7, 2560, dtype=torch.bfloat16),

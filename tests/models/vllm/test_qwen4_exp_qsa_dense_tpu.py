@@ -172,26 +172,21 @@ def test_complete_layer_dense_context_against_plain_torch(fp8, tmp_path):
                 slots = torch.tensor([0] + [-1] * 7, dtype=torch.int32)
                 pages = torch.zeros((8, 16), dtype=torch.int32)
                 pages[0] = torch.arange(1, 17)
-                metadata = QSAMetadata(
-                    *(
-                        x.to("tpu")
-                        for x in (starts, lengths, slots, pages, pages.clone())
-                    )
-                )
+                metadata = QSAMetadata(starts.to("tpu"), lengths.to("tpu"))
+                main_table = pages.to("tpu")
+                ring_ids = slots.to("tpu")
                 # The compact layer reads scheduler-owned tables from the
                 # production forward context, not the legacy metadata fields.
                 per_layer = {
                     model.prefix: SimpleNamespace(
-                        block_tables=metadata.main_block_table,
+                        block_tables=main_table,
                         request_distribution=torch.tensor(
                             [1, 1, 1] if count == 1 else [0, 0, 1],
                             dtype=torch.int32,
                             device="tpu",
                         ),
                     ),
-                    model.prefix + ".raw_ring": SimpleNamespace(
-                        block_tables=metadata.state_slots
-                    ),
+                    model.prefix + ".raw_ring": SimpleNamespace(block_tables=ring_ids),
                 }
                 with set_forward_context(per_layer, config, num_tokens=bucket):
                     output, selected = compiled(

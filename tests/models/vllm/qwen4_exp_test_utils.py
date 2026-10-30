@@ -163,14 +163,16 @@ def qsa_test_pools(model, pages):
     return (main, index), layout
 
 
-def qsa_forward_context(monkeypatch, model, metadata, *, request_distribution):
+def qsa_forward_context(
+    monkeypatch, model, metadata, *, request_distribution, main_block_table, state_slots
+):
     from vllm_torchtpu.models.vllm.qwen4_exp import qsa
 
     main = SimpleNamespace(
-        block_tables=metadata.main_block_table,
+        block_tables=main_block_table,
         request_distribution=request_distribution,
     )
-    ring = SimpleNamespace(block_tables=metadata.state_slots)
+    ring = SimpleNamespace(block_tables=state_slots)
     monkeypatch.setattr(
         qsa,
         "get_forward_context",

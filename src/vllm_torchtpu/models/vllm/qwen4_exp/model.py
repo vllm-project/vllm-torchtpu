@@ -46,6 +46,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
     VllmGatedDeltaNetAttention,
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.models.model_hooks import qwen4_options
 
 from .config import Qwen4ExpEngramConfig, gdn_cache_spec, require_unified_pool
 from .hyperconnection import GatedResidual, HyperConnectionConfig
@@ -84,7 +85,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         require_unified_pool()
         t = cfg.model_config.hf_text_config
         tp = get_tp_group()
-        engram = cfg.additional_config.get("qwen4_exp", {}).get("engram_config", {})
+        engram = qwen4_options(cfg).get("engram_config", {})
         shared = None
         if index + 1 in t.ple_layer_ids and engram.get("dp_shared_memory", False):
             assert isinstance(cfg.engram_config, Qwen4ExpEngramConfig)
@@ -151,11 +152,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
         input_ids,
         query_start_loc,
         ngram_context,
-        state_slots,
         context_lens,
         valid_tokens,
-        main_block_table,
-        compressed_block_table,
         ple_raw_embeddings=None,
     ):
         if self.ple is not None:
@@ -182,9 +180,6 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 QSAMetadata(
                     query_start_loc,
                     context_lens,
-                    state_slots,
-                    main_block_table,
-                    compressed_block_table,
                 ),
             )
         hidden = self.attn_hyper_connection.combine(block, residual)
@@ -245,11 +240,8 @@ class Qwen4ExpBackbone(nn.Module):
         *,
         query_start_loc,
         ngram_context,
-        state_slots,
         context_lens,
         valid_tokens,
-        main_block_table,
-        compressed_block_table,
     ):
         # Resolve host lookup before any decoder work so shape arithmetic
         # stays in the main graph and model preparation precedes the D2H wait.
@@ -272,11 +264,8 @@ class Qwen4ExpBackbone(nn.Module):
                 input_ids.to(torch.int64),
                 query_start_loc,
                 ngram_context,
-                state_slots,
                 context_lens,
                 valid_tokens,
-                main_block_table,
-                compressed_block_table,
                 ple_raw_embeddings,
             )
         return self.hyper_connection_mixer.mix(hidden)[0]

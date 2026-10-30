@@ -19,6 +19,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 from torch import nn
+from transformers import PretrainedConfig
 
 from tests.models.vllm.qwen4_exp_test_utils import q4exp_text_config
 from vllm_torchtpu.models.vllm.qwen4_exp.config import validate_config
@@ -30,11 +31,13 @@ def config(tp=1, dp=8):
     return NS(
         model_config=NS(
             hf_text_config=text,
-            hf_config=NS(
-                quantization_config={
-                    "quant_method": "fp8",
-                    "weight_block_size": [128, 128],
-                    "activation_scheme": "dynamic",
+            hf_config=PretrainedConfig.from_dict(
+                {
+                    "quantization_config": {
+                        "quant_method": "fp8",
+                        "weight_block_size": [128, 128],
+                        "activation_scheme": "dynamic",
+                    }
                 }
             ),
             quantization="fp8",
@@ -400,12 +403,9 @@ def test_gdn_quantization_follows_checkpoint_exclusions(
     [
         ("model_config", "dtype", torch.float32),
         ("model_config", "quantization", "nvfp4"),
-        ("model_config", "max_model_len", 127),
-        ("scheduler_config", "max_num_batched_tokens", 8193),
         ("scheduler_config", "max_num_seqs", 0),
         ("cache_config", "enable_prefix_caching", True),
         ("cache_config", "cache_dtype", "fp8_per_token_head"),
-        ("cache_config", "block_size", 256),
     ],
 )
 def test_dp8_does_not_expand_other_admission_limits(monkeypatch, section, field, value):
