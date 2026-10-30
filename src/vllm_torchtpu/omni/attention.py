@@ -51,8 +51,6 @@ class TpuSDPAImpl(SDPAImpl):
 class TpuSDPABackend(SDPABackend):
     """TPU attention backend for diffusion models using PyTorch SDPA."""
 
-    kv_cache_layout_is_final: bool = False
-
     @staticmethod
     def get_name() -> str:
         return "TPU_SDPA"
@@ -128,8 +126,6 @@ class TpuFlashAttentionImpl(TpuSDPAImpl):
 
 class TpuFlashAttentionBackend(SDPABackend):
     """TPU diffusion attention backend using a Pallas flash kernel."""
-
-    kv_cache_layout_is_final: bool = False
 
     @staticmethod
     def get_name() -> str:

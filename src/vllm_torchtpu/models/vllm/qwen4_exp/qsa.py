@@ -126,8 +126,6 @@ def get_qsa_cache_specs(config, tp_size, cache_dtype):
 class Qwen4ExpPooledQSABackend(PallasAttentionBackend):
     """Native pool geometry with compression groups as virtual RPA pages."""
 
-    kv_cache_layout_is_final: bool = True
-
     @staticmethod
     def get_kv_cache_shape(
         num_blocks: int,

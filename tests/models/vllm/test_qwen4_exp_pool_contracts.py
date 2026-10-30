@@ -112,24 +112,6 @@ def test_valid_geometry_has_no_checkpoint_page_or_token_bucket_gate():
     validate_config(cfg)
 
 
-def test_final_backend_preserves_the_complete_native_page(monkeypatch):
-    from vllm_torchtpu.platforms import tpu_platform
-
-    cache = CacheConfig(block_size=256)
-    cache.mamba_page_size_padded = 4096
-    cfg = SimpleNamespace(cache_config=cache)
-    monkeypatch.setattr(
-        tpu_platform.TpuPlatform,
-        "_find_non_ssm_backend",
-        lambda cfg: Qwen4ExpPooledQSABackend,
-    )
-    update = Mock()
-    monkeypatch.setattr(tpu_platform, "update_tpu_block_size_and_slot_config", update)
-    tpu_platform.TpuPlatform.update_block_size_for_backend(cast(VllmConfig, cfg))
-    assert cache.block_size == 256 and cache.mamba_page_size_padded == 4096
-    update.assert_not_called()
-
-
 @pytest.mark.parametrize(
     "tokens,capacities,expected",
     [(8192, [2048] * 4, [2048] * 4), (8, [3, 4], [3, 4]), (8, [1, 8], [1, 7])],

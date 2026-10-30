@@ -207,8 +207,14 @@ def test_pool_warmup_tables_match_native_ring_padding():
     cfg = pool_config()
     layout, specs = pooled_cache_specs(cfg)
     cfg.cache_config.block_size = cfg.cache_config.mamba_block_size = layout.block_size
-    runner = NS(vllm_config=cfg, max_model_len=9216, device=torch.device("cpu"))
+    runner = NS(
+        vllm_config=cfg,
+        cache_config=cfg.cache_config,
+        max_model_len=9216,
+        device=torch.device("cpu"),
+    )
     cache = Qwen4ExpPooledCache(runner, model=None)
+    cache.get_specs()
     specs = [g.kv_cache_spec for g in cache.groups]
     native = MultiGroupBlockTable(
         max_num_reqs=8,

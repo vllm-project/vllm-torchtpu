@@ -89,7 +89,6 @@ def test_ssm_dtype_uses_checkpoint_default_and_preserves_explicit_override(
     )
     # Exercise the real upstream normalization and model hook. Capacity
     # planning has separate native-cache tests and does not choose a dtype.
-    monkeypatch.setattr(model_config, "native_cache_capacity", lambda cfg, specs: 32)
     model_config.TPUQwen4ExpConfig.verify_and_update_config(cfg)
     assert cfg.cache_config.mamba_ssm_cache_dtype == resolved
     expected = torch.float32 if resolved == "float32" else torch.bfloat16
@@ -173,7 +172,7 @@ def test_prefix_reuse_requires_scheduler_owned_aligned_state(
 
 
 @pytest.mark.parametrize("prefix", [False, True])
-def test_pool_page_override_respects_upstream_prefix_validation(monkeypatch, prefix):
+def test_config_validation_defers_native_page_planning(monkeypatch, prefix):
     from vllm.config import CacheConfig, VllmConfig
 
     from vllm_torchtpu.models.vllm.qwen4_exp.config import (
@@ -183,8 +182,7 @@ def test_pool_page_override_respects_upstream_prefix_validation(monkeypatch, pre
     from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import pooled_cache_specs
 
     monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")
-    # The fixture already contains normalized text-only HF fields. Exercise
-    # our page override and the actual upstream validator, without a loader.
+    # The fixture already contains normalized text-only HF fields.
     monkeypatch.setattr(
         Qwen4ExpForCausalLMConfig,
         "verify_and_update_config",
@@ -199,10 +197,11 @@ def test_pool_page_override_respects_upstream_prefix_validation(monkeypatch, pre
         mamba_ssm_cache_dtype="bfloat16",
     )
     TPUQwen4ExpConfig.verify_and_update_config(cfg)
+    assert cfg.cache_config.block_size == 128
+    assert cfg.cache_config.num_gpu_blocks_override is None
     VllmConfig.validate_mamba_block_size(cfg)
     layout, specs = pooled_cache_specs(cfg)
-    assert cfg.cache_config.block_size == layout.block_size
-    assert cfg.cache_config.mamba_block_size == (layout.block_size if prefix else None)
+    assert layout.block_size >= cfg.cache_config.block_size
     assert {spec.page_size_bytes for spec in specs.values()} == {layout.page_bytes}
 
 
@@ -231,12 +230,15 @@ def test_qwen4_pool_opt_out_fails_before_adapter_construction(monkeypatch):
 
 @pytest.mark.parametrize("role", ["kv_producer", "kv_consumer"])
 @pytest.mark.parametrize("ssm_dtype", ["bfloat16", "float32"])
-def test_pd_admits_only_model_owned_fp8_dp8(monkeypatch, role, ssm_dtype):
+@pytest.mark.parametrize("tp,dp", [(1, 8), (2, 4), (4, 2), (8, 1)])
+def test_pd_requires_model_owned_fp8_and_geometric_parallelism(
+    monkeypatch, role, ssm_dtype, tp, dp
+):
     from types import SimpleNamespace
 
     # Override even a materialized lazy env attribute, then restore its absence.
     monkeypatch.setitem(vars(envs), "TPU_KV_RESHARD_TRANSPORT", "raiden")
-    cfg = config()
+    cfg = config(tp, dp)
     cfg.cache_config.cache_dtype = "fp8"
     cfg.cache_config.mamba_ssm_cache_dtype = ssm_dtype
     cfg.kv_transfer_config = SimpleNamespace(
@@ -256,8 +258,8 @@ def test_pd_admits_only_model_owned_fp8_dp8(monkeypatch, role, ssm_dtype):
             with pytest.raises(ValueError, match="model-owned Raiden connector"):
                 validate_config(cfg)
     for section, field, value in [
-        ("parallel_config", "tensor_parallel_size", 2),
-        ("parallel_config", "data_parallel_size", 4),
+        ("parallel_config", "tensor_parallel_size", 0),
+        ("parallel_config", "data_parallel_size", 0),
         ("parallel_config", "pipeline_parallel_size", 2),
         ("parallel_config", "prefill_context_parallel_size", 2),
         ("parallel_config", "decode_context_parallel_size", 2),
@@ -294,7 +296,11 @@ def test_pd_admits_only_model_owned_fp8_dp8(monkeypatch, role, ssm_dtype):
                 }
             }
         }
-        validate_config(cfg)
+        if shared and dp == 1:
+            with pytest.raises(ValueError, match="shared PLE requires local DP>1"):
+                validate_config(cfg)
+        else:
+            validate_config(cfg)
 
     cfg.speculative_config = SimpleNamespace()
     with pytest.raises(ValueError, match="MTP"):
@@ -323,10 +329,9 @@ def test_hc_env_override_preserves_s1_admission(monkeypatch, value):
         enable_prefix_caching=False,
         mamba_ssm_cache_dtype="bfloat16",
     )
-    monkeypatch.setattr(model_config, "native_cache_capacity", lambda cfg, specs: 32)
     model_config.TPUQwen4ExpConfig.verify_and_update_config(cfg)
     assert cfg.cache_config.kv_cache_layout == "BLHNC"
-    assert cfg.cache_config.num_gpu_blocks_override == 32
+    assert cfg.cache_config.num_gpu_blocks_override is None
     cfg.model_config.hf_text_config.linear_key_head_dim = 64
     with pytest.raises(ValueError, match="GDN"):
         model_config.TPUQwen4ExpConfig.verify_and_update_config(cfg)

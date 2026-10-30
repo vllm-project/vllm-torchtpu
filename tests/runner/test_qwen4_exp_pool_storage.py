@@ -80,6 +80,7 @@ def test_actual_pool_backing_does_not_allocate_main_sized_compressed_pages(
         lambda *a, **kw: NS(available=1 << 40),
     )
     cache = Qwen4ExpPooledCache(runner, model)
+    cache.get_specs()
     cfg.cache_config.block_size = cache.layout.block_size
     cfg.cache_config.mamba_block_size = cache.layout.block_size
     cfg.cache_config.num_gpu_blocks_override = cache.pages
@@ -171,6 +172,7 @@ def _startup_cache(
         lambda *a, **kw: NS(available=1 << 40),
     )
     cache = Qwen4ExpPooledCache(runner, NS(model=NS(layers=layers)))
+    cache.get_specs()
     cfg.cache_config.block_size = cache.layout.block_size
     cfg.cache_config.mamba_block_size = cache.layout.block_size if prefix else None
     cfg.cache_config.num_gpu_blocks_override = cache.pages

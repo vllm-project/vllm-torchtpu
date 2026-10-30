@@ -560,8 +560,6 @@ def _pallas_rpa_kernel_batched(
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN)
 class PallasAttentionBackend(AttentionBackend):
-    kv_cache_layout_is_final: bool = False
-
     supported_kv_cache_dtypes = [
         "auto",
         "bfloat16",
@@ -1671,8 +1669,6 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
 class PallasMLAttentionBackend(AttentionBackend):
     """TPU attention backend utilizing customized Pallas kernels for DeepSeek MLA."""
 
-    kv_cache_layout_is_final: bool = False
-
     supported_kv_cache_dtypes = [
         "auto",
         "bfloat16",
@@ -1887,8 +1883,6 @@ class VllmTPUDeepseekV32IndexerBackend(DeepseekV32IndexerBackend):
     hardcoding a second copy of the constant would let the two drift, and the
     effective value would silently depend on layer registration order.
     """
-
-    kv_cache_layout_is_final: bool = False
 
     @staticmethod
     def get_kv_cache_shape(

@@ -184,22 +184,6 @@ class TPUQwen4ExpConfig(VerifyAndUpdateConfig):
                     ),
                 )
         vllm_config.cache_config.kv_cache_layout = "BLHNC"
-        from .pool_layout import pooled_cache_specs
-
-        layout, specs = pooled_cache_specs(vllm_config)
-        vllm_config.cache_config.block_size = layout.block_size
-        # Upstream reserves this override for prefix caching. The model's
-        # native pool specs carry the physical state-page span themselves.
-        vllm_config.cache_config.mamba_block_size = (
-            layout.block_size
-            if vllm_config.cache_config.enable_prefix_caching
-            else None
-        )
-        vllm_config.cache_config.mamba_page_size_padded = layout.page_bytes
-        pages = native_cache_capacity(vllm_config, specs)
-        if vllm_config.cache_config.num_gpu_blocks_override not in (None, pages):
-            raise ValueError(f"Qwen4Exp S1 fixes native capacity to {pages} blocks")
-        vllm_config.cache_config.num_gpu_blocks_override = pages
 
 
 def validate_config(cfg):

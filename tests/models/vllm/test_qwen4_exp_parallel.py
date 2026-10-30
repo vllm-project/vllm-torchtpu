@@ -980,7 +980,7 @@ def test_decoder_zeroes_unwritten_padding_before_standard_moe():
         [[1.0, -2.0], [float("nan"), float("nan")]], dtype=torch.bfloat16
     )
     valid = torch.tensor([True, False])
-    output = layer(hidden, None, None, None, None, None, None, valid, None, None)
+    output = layer(hidden, None, None, None, None, None, valid)
     expected = torch.tensor([[1.0, -2.0], [0.0, 0.0]], dtype=torch.bfloat16)
     torch.testing.assert_close(observed[0], expected, rtol=0, atol=0)
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
