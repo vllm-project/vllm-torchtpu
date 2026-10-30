@@ -178,11 +178,11 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         vmem_dst_lane = cast(jax.Ref, self.window_ref.at[slot])
         num_lanes = pltpu.get_tpu_info().num_lanes
         for b in range(self.cfgs.batch_size):
-            for i in range(self.cfgs.bkv_p_cache):
-                p_idx, dst_off, sz = schedule_ref.get_dma_kv_cache(block_idx, b, i)
+            for p_idx, dst_off, sz in schedule_ref.kv_cache_page_dmas(block_idx, b):
                 hbm_p_idx = page_indices_ref[p_idx]
                 sz = jnp.where(is_no_op, 0, sz)
-                dst_off = pl.multiple_of(dst_off, num_lanes)
+                if not isinstance(dst_off, int):
+                    dst_off = pl.multiple_of(dst_off, num_lanes)
                 sz = pl.multiple_of(sz, num_lanes)
                 # kv_cache_hbm: (num_pages, num_kv_heads * 2, kv_head_dim // packing,
                 #     packing, page_size)
@@ -341,8 +341,7 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         kv_cache_hbm_flat = kv_cache_hbm.reshape(-1, *kv_cache_hbm.shape[2:])
 
         for b in range(self.cfgs.batch_size):
-            for i in range(self.cfgs.bkv_p_cache):
-                p_idx, dst_off, sz = schedule_ref.get_dma_kv_cache(block_idx, b, i)
+            for p_idx, dst_off, sz in schedule_ref.kv_cache_page_dmas(block_idx, b):
                 sz = jnp.where(is_no_op, 0, sz)
                 src_off = page_indices_ref[p_idx] * self.cfgs.serve.page_size
                 pltpu.make_async_copy(

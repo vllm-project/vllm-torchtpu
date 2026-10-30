@@ -72,6 +72,7 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
             cfgs,
             dma_kv_new_struct_cls=dma_kv_new_struct_cls,
             multiplier=multiplier,
+            per_page_kv_cache_dma=True,
         )
 
     def __init__(

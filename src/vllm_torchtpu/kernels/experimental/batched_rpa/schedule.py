@@ -197,6 +197,50 @@ class SmemArrayOfStructs(SmemWrapper):
         return self.struct_cls(self.data, pos_start)
 
 
+def _aligned_kv_cache_tokens(
+    kv_left_frm_cache: jax.Array, *, cfgs: configs.RpaConfigs
+) -> jax.Array:
+    """Cached tokens a KV block fetches: its pages' aligned DMA sizes, summed."""
+    align = cfgs.kv_token_align
+    return jnp.minimum(
+        utils.align_to(jnp.maximum(kv_left_frm_cache, 0), align),
+        cfgs.bkv_p_cache * cfgs.serve.page_size,
+    )
+
+
+def _kv_cache_page_dmas(
+    p_offset: jax.Array,
+    kv_cache_tokens: jax.Array,
+    *,
+    cfgs: configs.RpaConfigs,
+) -> list[tuple[jax.Array, jax.Array]]:
+    """(page-table index, token count) of each cached page of a KV block.
+
+    For `kv_cache_tokens = _aligned_kv_cache_tokens(kv_left_frm_cache)` these are
+    `min(p_offset + i, num_page_indices - 1)` and
+    `align_to(clip(kv_left_frm_cache - i * page_size, 0, page_size), align)`:
+    `align` divides `page_size`, so page i holds the part of the aligned count
+    that falls in `[i * page_size, (i + 1) * page_size)`. Both operands are
+    non-negative, so the mins run unsigned, one scalar op each.
+    """
+    page_size = cfgs.serve.page_size
+    assert page_size % cfgs.kv_token_align == 0
+    u32 = jnp.uint32
+    p_offset = p_offset.astype(u32)
+    tokens = kv_cache_tokens.astype(u32)
+    last_page = u32(cfgs.serve.num_page_indices - 1)
+    dmas = []
+    covered = u32(0)
+    for i in range(cfgs.bkv_p_cache):
+        src_hbm = jnp.minimum(p_offset + u32(i), last_page)
+        covered_next = jnp.minimum(tokens, u32((i + 1) * page_size))
+        dmas.append(
+            (src_hbm.astype(jnp.int32), (covered_next - covered).astype(jnp.int32))
+        )
+        covered = covered_next
+    return dmas
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class RpaSchedule:
@@ -208,7 +252,12 @@ class RpaSchedule:
     is_last_k: SmemWrapper  # [steps, batch]
     do_writeback: SmemWrapper  # [steps, batch]
     dma_q: SmemWrapper  # [steps, batch, 2]
-    dma_kv_cache: SmemWrapper  # [steps, batch, bkv_p_cache, 3]
+    # Cached-KV page DMAs. Either the per-page table [steps, batch, bkv_p_cache, 3]
+    # (dma_kv_cache), or only the block's aligned cached-token count
+    # [steps, batch] (kv_cache_tokens), from which `kv_cache_page_dmas` derives
+    # every page's DMA; the other field is None.
+    dma_kv_cache: SmemWrapper | None
+    kv_cache_tokens: SmemWrapper | None
     dma_kv_new: SmemArrayOfStructs  # [steps, batch, bkv_p_new]
     total_wait_kv_in: SmemWrapper  # [steps]
     total_wait_kv_out: SmemWrapper  # [steps]
@@ -225,6 +274,7 @@ class RpaSchedule:
         cfgs: configs.RpaConfigs,
         dma_kv_new_struct_cls: type[DmaNew] = SeqAlongLaneDmaNew,
         multiplier: int = 1,
+        per_page_kv_cache_dma: bool = False,
     ):
         effective_max_steps = cfgs.max_steps_ub * multiplier
 
@@ -243,9 +293,14 @@ class RpaSchedule:
             dma_q=SmemWrapper.create_shape_dtype(
                 (effective_max_steps, cfgs.batch_size, 2)
             ),
-            dma_kv_cache=SmemWrapper.create_shape_dtype(
-                (effective_max_steps, cfgs.batch_size, cfgs.bkv_p_cache, 3)
+            dma_kv_cache=(
+                SmemWrapper.create_shape_dtype(
+                    (effective_max_steps, cfgs.batch_size, cfgs.bkv_p_cache, 3)
+                )
+                if per_page_kv_cache_dma
+                else None
             ),
+            kv_cache_tokens=None if per_page_kv_cache_dma else idx_wrapper,
             dma_kv_new=SmemArrayOfStructs.create_shape_dtype(
                 (
                     effective_max_steps,
@@ -264,17 +319,45 @@ class RpaSchedule:
             cfgs=cfgs,
         )
 
-    def get_dma_kv_cache(
+    def kv_cache_page_dmas(
         self,
         step: jax.typing.ArrayLike,
         batch_idx: jax.typing.ArrayLike,
-        page_idx: jax.typing.ArrayLike,
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        # 0: src_hbm, 1: dst_vmem, 2: size
-        src_off = self.dma_kv_cache[step, batch_idx, page_idx, 0]
-        dst_off = self.dma_kv_cache[step, batch_idx, page_idx, 1]
-        sz = self.dma_kv_cache[step, batch_idx, page_idx, 2]
-        return src_off, dst_off, sz
+    ) -> list[tuple[jax.Array, jax.Array | int, jax.Array]]:
+        """(page-table index, VMEM token offset, token count) of each cached page."""
+        cfgs = self.cfgs
+        if self.dma_kv_cache is not None:
+            return [
+                (
+                    self.dma_kv_cache[step, batch_idx, i, 0],
+                    self.dma_kv_cache[step, batch_idx, i, 1],
+                    self.dma_kv_cache[step, batch_idx, i, 2],
+                )
+                for i in range(cfgs.bkv_p_cache)
+            ]
+        assert self.kv_cache_tokens is not None
+        p_offset = (
+            self.s_idx[step, batch_idx] * cfgs.serve.pages_per_seq
+            + self.k_idx[step, batch_idx] * cfgs.bkv_p
+        )
+        # Masked lanes (s_idx == -1) fetch nothing; keep their index in range.
+        p_offset = jnp.maximum(p_offset, 0)
+        return [
+            (src_hbm, i << cfgs.serve.page_size_log2, sz)
+            for i, (src_hbm, sz) in enumerate(
+                _kv_cache_page_dmas(
+                    p_offset, self.kv_cache_tokens[step, batch_idx], cfgs=cfgs
+                )
+            )
+        ]
+
+    def kv_cache_tokens_in(
+        self, step: jax.typing.ArrayLike, batch_idx: jax.typing.ArrayLike
+    ) -> jax.Array:
+        """Cached tokens fetched for (step, batch_idx), summed over its pages."""
+        if self.kv_cache_tokens is not None:
+            return self.kv_cache_tokens[step, batch_idx]
+        return sum(sz for _, _, sz in self.kv_cache_page_dmas(step, batch_idx))
 
     def get_dma_q(
         self, step: jax.typing.ArrayLike, batch_idx: jax.typing.ArrayLike
@@ -331,10 +414,13 @@ def _mask_out_steps(
     schedule_smem.dma_q[step, b_idx, 0] = 0
     schedule_smem.dma_q[step, b_idx, 1] = 0
 
-    for i in range(schedule_smem.cfgs.bkv_p_cache):
-        schedule_smem.dma_kv_cache[step, b_idx, i, 0] = 0
-        schedule_smem.dma_kv_cache[step, b_idx, i, 1] = 0
-        schedule_smem.dma_kv_cache[step, b_idx, i, 2] = 0
+    if schedule_smem.dma_kv_cache is not None:
+        for i in range(schedule_smem.cfgs.bkv_p_cache):
+            schedule_smem.dma_kv_cache[step, b_idx, i, 0] = 0
+            schedule_smem.dma_kv_cache[step, b_idx, i, 1] = 0
+            schedule_smem.dma_kv_cache[step, b_idx, i, 2] = 0
+    else:
+        schedule_smem.kv_cache_tokens[step, b_idx] = 0
 
     for i in range(schedule_smem.cfgs.bkv_p_new):
         dma_entry = schedule_smem.dma_kv_new[step, b_idx, i]
@@ -412,9 +498,7 @@ def _compute_waits(
         # KV IN
         kv_in_tokens = 0
         for b in range(cfgs.batch_size):
-            for i in range(cfgs.bkv_p_cache):
-                _, _, sz = schedule.get_dma_kv_cache(step, b, i)
-                kv_in_tokens += sz
+            kv_in_tokens += schedule.kv_cache_tokens_in(step, b)
             for i in range(cfgs.bkv_p_new):
                 kv_in_tokens += schedule.dma_kv_new[step, b, i].fetch_val
 
@@ -570,26 +654,17 @@ class BaseMetadataComputer:
         schedule.dma_q[step, target_lane, 1] = q_sz_task
 
         kv_len_start = k_idx * cfgs.bkv_sz
-        kv_p_start = k_idx * cfgs.bkv_p
         k_len = kv_cache_len + kv_new_len
         kv_left = k_len - kv_len_start
         if cfgs.serve.skip_kv_update:
             kv_left_frm_cache = kv_left
         else:
             kv_left_frm_cache = jnp.maximum(kv_cache_len - kv_len_start, 0)
-        p_offset = s_idx * cfgs.serve.pages_per_seq + kv_p_start
-        for i in range(cfgs.bkv_p_cache):
-            dst_vmem = i << cfgs.serve.page_size_log2
-            dma_sz = kv_left_frm_cache - dst_vmem
-            dma_sz = jnp.clip(dma_sz, 0, cfgs.serve.page_size)
-
-            src_hbm = jnp.minimum(p_offset + i, cfgs.serve.num_page_indices - 1)
-
-            schedule.dma_kv_cache[step, target_lane, i, 0] = src_hbm
-            schedule.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
-            schedule.dma_kv_cache[step, target_lane, i, 2] = utils.align_to(
-                dma_sz, cfgs.kv_token_align
-            )
+        # The pages' DMAs follow from this count and (s_idx, k_idx); the kernel
+        # derives them per step rather than reading a per-page table.
+        schedule.kv_cache_tokens[step, target_lane] = _aligned_kv_cache_tokens(
+            kv_left_frm_cache, cfgs=cfgs
+        )
 
         kv_left_frm_new = kv_left - kv_left_frm_cache
         bkv_sz_cache = jnp.minimum(kv_left_frm_cache, cfgs.bkv_sz)
