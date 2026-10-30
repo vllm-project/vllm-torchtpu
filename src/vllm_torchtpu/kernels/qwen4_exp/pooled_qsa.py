@@ -342,6 +342,7 @@ def write_compressed(
     expected = jnp.zeros((tile,), jnp.bool_).at[jnp.asarray(pair_lanes)].set(True)
 
     def update(owner, indices, active, masks, rows):
+        mask_width = masks.shape[-1]
         tiled_pair = indices.reshape(-1, tile)
         tiled_mask = masks.reshape(-1, tile, 2)
         first_pair = tiled_pair[:, pair_lanes[0]]
@@ -404,9 +405,9 @@ def write_compressed(
                                 if pool.dtype != jnp.bfloat16
                                 else packed
                             )
-                            full_pair = (masks_ref[row, 0] != 0) & (
-                                masks_ref[row, 1] != 0
-                            )
+                            first_mask = masks_ref[row * mask_width]
+                            second_mask = masks_ref[row * mask_width + 1]
+                            full_pair = (first_mask != 0) & (second_mask != 0)
 
                             @pl.when(full_pair)
                             def initialize_pair():
@@ -419,10 +420,7 @@ def write_compressed(
                                     jnp.arange(2)[:, None], (2, width)
                                 )
                                 row_mask = (
-                                    jnp.where(
-                                        half == 0, masks_ref[row, 0], masks_ref[row, 1]
-                                    )
-                                    != 0
+                                    jnp.where(half == 0, first_mask, second_mask) != 0
                                 )
                                 bf[...] = jnp.where(
                                     row_mask, values_ref[pl.ds(lane * 2, 2), :], bf[...]
@@ -455,7 +453,7 @@ def write_compressed(
             bulk.astype(jnp.int32),
             indices,
             active,
-            masks,
+            masks.reshape(-1),
             rows.reshape(len(indices) * 2, width),
             owner,
         )
