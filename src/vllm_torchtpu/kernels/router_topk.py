@@ -20,10 +20,18 @@ passes over one VMEM-resident block: ``O(k*N)`` instead of ``O(N*log^2 N)``.
 """
 
 import functools
+import logging
+import traceback
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
+
+# A stdlib logger under vLLM's handlers, so the kernel still imports and runs
+# where vLLM is not installed.
+logger = logging.getLogger(f"vllm.{__name__}")
+_traced_shapes: set[tuple[int, int, int]] = set()
 
 # Clamp floor. Below any real routing score (softmax, sigmoid and sqrtsoftplus
 # are all >= 0) and strictly above the dtype minimum used to mask a selected
@@ -63,6 +71,17 @@ def _select_kernel(x_ref, w_ref, i_ref, *, topk: int, n: int):
     w_ref[...] = jnp.where(w_ref[:, :1] <= NEG, jnp.nan, w_ref[...])
 
 
+def _traced_from() -> str:
+    """The vllm_torchtpu frames that are tracing this kernel, innermost first."""
+    here = Path(__file__).resolve()
+    frames = [
+        f
+        for f in traceback.extract_stack()
+        if "vllm_torchtpu" in f.filename and Path(f.filename).resolve() != here
+    ]
+    return " <- ".join(f"{Path(f.filename).stem}.{f.name}" for f in reversed(frames))
+
+
 def select(
     scores: jax.Array, topk: int, interpret: bool = False
 ) -> tuple[jax.Array, jax.Array]:
@@ -79,6 +98,15 @@ def select(
     """
     rows, n = scores.shape
     block = min(MAX_BLOCK_ROWS, rows)
+    if (rows, n, topk) not in _traced_shapes:
+        _traced_shapes.add((rows, n, topk))
+        logger.info(
+            "router_topk: Pallas top-%d over [%d, %d] scores, traced from %s",
+            topk,
+            rows,
+            n,
+            _traced_from(),
+        )
     return pl.pallas_call(
         functools.partial(_select_kernel, topk=topk, n=n),
         grid=(pl.cdiv(rows, block),),
