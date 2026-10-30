@@ -1091,6 +1091,11 @@ HEADS_BLOCK_ROWS = 512
 HEADS_MIN_ROWS = 128
 # Table-row copies issued per iteration of the gather loop.
 HEADS_GATHER_UNROLL = 8
+# Heads per output tile of a quantizing `quantized_matmul_heads`: one 32-row
+# tile of its 8-bit [tokens, heads, head_dim] output per token.
+HEADS_QUANT_PER_TILE = 32
+# Rows per pass of a quantizing `quantized_matmul_heads`' epilogue.
+HEADS_QUANT_PASS_ROWS = 64
 
 
 def _quantized_matmul_heads_kernel(
@@ -1105,6 +1110,7 @@ def _quantized_matmul_heads_kernel(
     head_fn: Callable[..., jax.Array],
     row_fn: Callable[[jax.Array], tuple[jax.Array, ...]],
     kv_fn: Callable[..., jax.Array] | None,
+    quant_dtype: jnp.dtype | None,
 ):
     """One (weight tile j, row block i) step of `quantized_matmul_heads`.
 
@@ -1114,12 +1120,19 @@ def _quantized_matmul_heads_kernel(
     during the step before, go through ``row_fn`` into resident row values.
     With ``kv_fn``, the same visit also rewrites row block i of kv's last lane
     block in place with ``kv_fn`` of those row values.
+
+    With ``quant_dtype``, the product's heads are first laid out as bf16
+    ``[rows, heads, head_dim]`` in VMEM, where ``head_fn`` and the per-row
+    quantize run on whole tokens, as `rope_quant` runs on that layout.
     """
-    if kv_fn is None:
-        o_hbm, *refs = refs
-    else:  # the kv input is aliased to kv_hbm, its output
+    if kv_fn is not None:  # the kv input is aliased to kv_hbm, its output
         _, o_hbm, kv_hbm, *refs = refs
         *refs, kv_buf, kv_sems = refs
+    elif quant_dtype is not None:
+        o_hbm, s_hbm, *refs = refs
+        *refs, stage_buf, s_buf = refs
+    else:
+        o_hbm, *refs = refs
     xq_ref, xs_ref, w_buf, ws_buf, o_buf, table_buf, *refs = refs
     *row_refs, w_sems, o_sems, table_sems = refs
     s = pl.program_id(0)
@@ -1142,8 +1155,13 @@ def _quantized_matmul_heads_kernel(
         )
 
     def out_copies(sl):
-        # o_buf holds each 128-lane block of the tile's heads on its own.
         dst = o_hbm.at[rows, pl.ds(pl.multiple_of(j * heads, heads), heads)]
+        if quant_dtype is not None:
+            return [
+                pltpu.make_async_copy(o_buf.at[sl], dst, o_sems.at[sl]),
+                pltpu.make_async_copy(s_buf.at[sl], s_hbm.at[j, rows], o_sems.at[sl]),
+            ]
+        # o_buf holds each 128-lane block of the tile's heads on its own.
         return [
             pltpu.make_async_copy(
                 o_buf.at[sl, c],
@@ -1237,10 +1255,13 @@ def _quantized_matmul_heads_kernel(
     # A bf16 tile packs heads 2p (low half) and 2p + 1 of a token in word p;
     # strided stores need a 128-lane buffer, hence o_buf's lane blocks.
     words_per_row = heads // 2
-    words_ref = o_buf.bitcast(jnp.uint32).at[o_slot]
+    if quant_dtype is None:
+        words_ref = o_buf.bitcast(jnp.uint32).at[o_slot]
+        row_values = [ref[rows, :] for ref in row_refs]
+    else:
+        words_ref = stage_buf.bitcast(jnp.uint32)
     words_ref = words_ref.reshape(lane_blocks, block_rows * words_per_row, LANE)
     x_scale = xs_ref[rows, 0:1]
-    row_values = [ref[rows, :] for ref in row_refs]
     for p in range(words_per_row):
         cols = slice(2 * p * head_dim, (2 * p + 2) * head_dim)
         # xla_quantized_matmul's dot and epilogue, rounded to its output.
@@ -1249,16 +1270,33 @@ def _quantized_matmul_heads_kernel(
         )
         acc = acc * x_scale
         acc = acc * ws_buf[w_slot, :, cols]
-        acc = acc.astype(jnp.bfloat16).astype(jnp.float32)
-        pair = [
-            head_fn(acc[:, h * head_dim : (h + 1) * head_dim], *row_values)
-            for h in range(2)
-        ]
+        if quant_dtype is None:
+            acc = acc.astype(jnp.bfloat16).astype(jnp.float32)
+            pair = [
+                head_fn(acc[:, h * head_dim : (h + 1) * head_dim], *row_values)
+                for h in range(2)
+            ]
+        else:  # rounded to bf16 by the pack
+            pair = [acc[:, h * head_dim : (h + 1) * head_dim] for h in range(2)]
         words = pltpu.pack_elementwise(pair, packed_dtype=jnp.bfloat16)
         for c in range(lane_blocks):
             words_ref.at[c][pl.ds(p, block_rows, stride=words_per_row), :] = words[
                 :, c * LANE : (c + 1) * LANE
             ]
+
+    if quant_dtype is not None:
+        pass_rows = min(HEADS_QUANT_PASS_ROWS, block_rows)
+
+        @pl.loop(0, block_rows, step=pass_rows)
+        def _(r):
+            r = pl.multiple_of(r, pass_rows)
+            tokens = pl.ds(r, pass_rows)
+            row = pl.multiple_of(i * block_rows + r, pass_rows)
+            values = [ref[pl.ds(row, pass_rows), :][:, None, :] for ref in row_refs]
+            y = head_fn(stage_buf[tokens].astype(jnp.float32), *values)
+            q, scale = _quantize_lanes(y, quant_dtype)
+            o_buf[o_slot, tokens] = q
+            s_buf[o_slot, tokens] = scale.reshape(pass_rows, heads)
 
     for copy in out_copies(o_slot):
         copy.start()
@@ -1274,9 +1312,12 @@ def _quantized_matmul_heads_kernel(
                 kv_copy(block, block % 2, write=True).wait()
 
 
-def quantized_matmul_heads_supported(m: int, k: int, n: int, head_dim: int) -> bool:
+def quantized_matmul_heads_supported(
+    m: int, k: int, n: int, head_dim: int, quantize: bool = False
+) -> bool:
     """Whether `quantized_matmul_heads` takes an (m, k) @ (k, n) problem."""
     block_rows = min(HEADS_BLOCK_ROWS, m)
+    heads_per_tile = HEADS_QUANT_PER_TILE if quantize else HEADS_PER_TILE
     return (
         m >= HEADS_MIN_ROWS
         and m % block_rows == 0
@@ -1285,7 +1326,8 @@ def quantized_matmul_heads_supported(m: int, k: int, n: int, head_dim: int) -> b
         and block_rows % min(QUANTIZE_GROUP_ROWS, block_rows) == 0
         and k % LANE == 0
         and head_dim % LANE == 0
-        and n % (HEADS_PER_TILE * head_dim) == 0
+        and n % (heads_per_tile * head_dim) == 0
+        and (not quantize or head_dim == LANE)
     )
 
 
@@ -1300,6 +1342,7 @@ def quantized_matmul_heads(
     table: jax.Array,
     kv: jax.Array | None = None,
     kv_fn: Callable[..., jax.Array] | None = None,
+    quant_dtype: jnp.dtype | None = None,
     interpret: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """``head_fn`` on each head of ``xla_quantized_matmul(x, w_q, w_scale)``.
@@ -1314,13 +1357,22 @@ def quantized_matmul_heads(
     With ``kv`` (``[m, c * LANE]``), also returns ``kv`` with its last lane
     block replaced by ``kv_fn(block, *row_fn(table[indices]))`` in f32,
     rounded back; ``kv`` is donated.
+
+    With ``quant_dtype`` (and ``head_dim == LANE``, no ``kv``), ``head_fn``
+    instead sees ``[rows, heads, head_dim]`` blocks of the bf16 product, with
+    each row value as ``[rows, 1, width]``, and its result is quantized like
+    `rope_quant`'s. Returns ``(q, scales)``: ``q`` ``[m, n // head_dim,
+    head_dim]`` in ``quant_dtype`` and ``scales`` ``[m, n // head_dim]`` f32.
     """
     m, k = x.shape
     n = w_q.shape[1]
-    if not quantized_matmul_heads_supported(m, k, n, head_dim):
+    quantize = quant_dtype is not None
+    if not quantized_matmul_heads_supported(m, k, n, head_dim, quantize):
         raise ValueError(f"unsupported shape {(m, k, n, head_dim)}")
+    assert not (quantize and kv is not None)
+    heads_per_tile = HEADS_QUANT_PER_TILE if quantize else HEADS_PER_TILE
     block_rows = min(HEADS_BLOCK_ROWS, m)
-    block_cols = HEADS_PER_TILE * head_dim
+    block_cols = heads_per_tile * head_dim
     num_row_blocks = m // block_rows
     num_col_blocks = n // block_cols
     table_rows = jax.ShapeDtypeStruct((block_rows, table.shape[1]), table.dtype)
@@ -1344,6 +1396,23 @@ def quantized_matmul_heads(
     out_specs = hbm
     kv_scratch = []
     input_output_aliases = {}
+    o_buf = pltpu.VMEM(
+        (2, head_dim // LANE, block_rows, heads_per_tile, LANE), out_dtype
+    )
+    quant_scratch = []
+    if quantize:
+        num_heads = n // head_dim
+        # Scales per weight tile, as [tile, m, heads of the tile].
+        out_shape = (
+            pltpu.HBM((m, num_heads, head_dim), quant_dtype),
+            pltpu.HBM((num_col_blocks, m, heads_per_tile), jnp.float32),
+        )
+        out_specs = (hbm, hbm)
+        o_buf = pltpu.VMEM((2, block_rows, heads_per_tile, head_dim), quant_dtype)
+        quant_scratch = [
+            pltpu.VMEM((block_rows, heads_per_tile, head_dim), out_dtype),
+            pltpu.VMEM((2, block_rows, heads_per_tile), jnp.float32),
+        ]
     if kv is not None:
         assert kv_fn is not None
         assert kv.shape[0] == m and kv.ndim == 2 and kv.shape[1] % LANE == 0
@@ -1356,7 +1425,7 @@ def quantized_matmul_heads(
             pltpu.VMEM((2, block_rows, LANE), kv.dtype),
             pltpu.SemaphoreType.DMA((2, 2)),
         ]
-    return pl.pallas_call(
+    out = pl.pallas_call(
         functools.partial(
             _quantized_matmul_heads_kernel,
             num_row_blocks=num_row_blocks,
@@ -1364,6 +1433,7 @@ def quantized_matmul_heads(
             head_fn=head_fn,
             row_fn=row_fn,
             kv_fn=None if kv is None else kv_fn,
+            quant_dtype=quant_dtype,
         ),
         out_shape=out_shape,
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -1376,16 +1446,14 @@ def quantized_matmul_heads(
                 pltpu.VMEM((m, _SCALE_LANES), jnp.float32),
                 pltpu.VMEM((2, k, block_cols), w_q.dtype),
                 pltpu.VMEM((2, 1, block_cols), jnp.float32),
-                pltpu.VMEM(
-                    (2, head_dim // LANE, block_rows, HEADS_PER_TILE, LANE),
-                    out_dtype,
-                ),
+                o_buf,
                 pltpu.VMEM((2, *table_rows.shape), table.dtype),
                 *(pltpu.VMEM((m, r.shape[1]), r.dtype) for r in row_shapes),
                 pltpu.SemaphoreType.DMA((2, 2)),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((2,)),
                 *kv_scratch,
+                *quant_scratch,
             ],
         ),
         input_output_aliases=input_output_aliases,
@@ -1393,17 +1461,23 @@ def quantized_matmul_heads(
             dimension_semantics=("arbitrary",),
             disable_bounds_checks=True,
             vmem_limit_bytes=_heads_vmem_bytes(
-                m, k, block_rows, block_cols, x.dtype, w_q.dtype, row_shapes
+                m, k, block_rows, block_cols, x.dtype, w_q.dtype, row_shapes, quantize
             ),
         ),
         name="quantized_matmul_heads",
         interpret=interpret,
     )(*operands)
+    if not quantize:
+        return out
+    q, scales = out
+    return q, scales.transpose(1, 0, 2).reshape(m, n // head_dim)
 
 
-def _heads_vmem_bytes(m, k, rows, cols, x_dtype, w_dtype, row_shapes) -> int:
-    """Double-buffered blocks, the resident x_q, scales and row values, and
-    headroom."""
+def _heads_vmem_bytes(
+    m, k, rows, cols, x_dtype, w_dtype, row_shapes, quantize=False
+) -> int:
+    """Double-buffered blocks, the resident x_q, scales and row values, the
+    quantizing epilogue's bf16 staging and scale blocks, and headroom."""
 
     def nbytes(elems, dtype):
         return elems * dtypes.itemsize_bits(dtype) // 8
@@ -1420,4 +1494,6 @@ def _heads_vmem_bytes(m, k, rows, cols, x_dtype, w_dtype, row_shapes) -> int:
         + m * _SCALE_LANES * 4
         + sum(m * max(r.shape[1], LANE) * 4 for r in row_shapes)
     )
+    if quantize:
+        scratch += nbytes(rows * cols, jnp.bfloat16) + 2 * rows * LANE * 4
     return 2 * blocks + scratch + (4 << 20)

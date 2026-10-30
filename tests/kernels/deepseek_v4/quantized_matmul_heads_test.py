@@ -155,3 +155,69 @@ def test_quantized_matmul_heads_is_bit_identical_on_tpu(m):
     )
     want = unfused(x, w_q, w_s, positions, cos_sin_cache)
     np.testing.assert_array_equal(_as_bits(got), _as_bits(want))
+
+
+def _fused_rope_quant(x, w_q, w_s, positions, cos_sin_cache, interpret=False):
+    return quantized_matmul_heads(
+        x,
+        w_q,
+        w_s,
+        rope.LANE,
+        rope.rope_lanes,
+        rope.cos_sin_lanes,
+        positions,
+        cos_sin_cache,
+        quant_dtype=FP8,
+        interpret=interpret,
+    )
+
+
+# Several row blocks, weight tiles and epilogue passes, and one of each.
+@pytest.mark.parametrize(
+    "m,k,n,block_rows,pass_rows",
+    [(256, 256, 8192, 128, 32), (64, 128, 4096, 64, 64)],
+)
+def test_quantized_matmul_heads_rope_quant_matches_unfused(
+    monkeypatch, m, k, n, block_rows, pass_rows
+):
+    monkeypatch.setattr(rope, "HEADS_BLOCK_ROWS", block_rows)
+    monkeypatch.setattr(rope, "HEADS_MIN_ROWS", 32)
+    monkeypatch.setattr(rope, "HEADS_QUANT_PASS_ROWS", pass_rows)
+    x, w_q, w_s, positions, cos_sin_cache = _operands(m, k, n)
+    got_q, got_s = _fused_rope_quant(
+        x, w_q, w_s, positions, cos_sin_cache, interpret=True
+    )
+    q = xla_quantized_matmul(x, w_q, w_s).reshape(m, n // rope.LANE, rope.LANE)
+    cos, sin = rope.cos_sin_lanes(cos_sin_cache[positions])
+    y = rope.rope_lanes(q.astype(jnp.float32), cos[:, None], sin[:, None])
+    want_q, want_s = rope._quantize_lanes(y, FP8)
+    assert got_q.shape == want_q.shape and got_q.dtype == want_q.dtype
+    assert got_s.shape == want_s.shape[:-1]
+    np.testing.assert_array_equal(
+        np.asarray(got_q).view(np.uint8), np.asarray(want_q).view(np.uint8)
+    )
+    # XLA:CPU may divide by the constant dtype max another way than the kernel.
+    np.testing.assert_allclose(got_s, want_s[..., 0], rtol=1e-6)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("m", [128, 1024])
+def test_quantized_matmul_heads_rope_quant_is_bit_identical_on_tpu(m):
+    if jax.default_backend() != "tpu":
+        pytest.fail(f"needs the TPU backend, got {jax.default_backend()}")
+    k, n = 1024, 8192
+    x, w_q, w_s, positions, cos_sin_cache = _operands(m, k, n)
+
+    @jax.jit
+    def unfused(x, w_q, w_s, positions, cos_sin_cache):
+        q = xla_quantized_matmul(x, w_q, w_s, quantize_in_one_pass=True)
+        return rope.rope_quant_flat(
+            q, positions, cos_sin_cache, num_heads=n // rope.LANE, quant_dtype=FP8
+        )
+
+    got = jax.jit(_fused_rope_quant)(x, w_q, w_s, positions, cos_sin_cache)
+    want = unfused(x, w_q, w_s, positions, cos_sin_cache)
+    for g, w, bits in zip(got, want, (np.uint8, np.uint32), strict=True):
+        np.testing.assert_array_equal(
+            np.asarray(g).view(bits), np.asarray(w).view(bits)
+        )
