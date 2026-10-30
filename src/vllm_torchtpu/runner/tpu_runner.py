@@ -754,9 +754,9 @@ class TPUModelRunner(GPUModelRunner):
         # the full attention `num_blocks`, and the per-request slot id is
         # carried in `AttentionMetadata.mamba_state_indices` instead of being
         # derived from the attention `block_tables[:, 0]`. None until the
-        # override runs (and stays None if it is skipped, e.g. CPU-only tests
-        # or a user-pinned num_gpu_blocks_override) — in which case mamba and
-        # attention share the uniform `num_blocks` as before.
+        # override runs (and stays None if it is skipped, e.g. CPU-only tests)
+        # — in which case mamba and attention share the uniform `num_blocks`
+        # as before.
         self._mamba_num_blocks: int | None = None
         # The compact sizing's inputs, kept so it can be redone against the
         # post-profile HBM budget (KVCacheManager.resize_compact_mamba_after_profile).

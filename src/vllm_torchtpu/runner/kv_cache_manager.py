@@ -840,15 +840,15 @@ class KVCacheManager:
             group_size,
         )
 
-        # Fallback (compact sizing skipped, e.g. CPU-only tests or a
-        # user-pinned num_gpu_blocks_override): pin vLLM's num_blocks via the two-step
-        # flooring that keeps peak HBM within `gpu_memory_utilization ×
-        # total_hbm` at high utilization. See `_maybe_set_num_blocks_override`
-        # for the formula and rationale; the short version is that vLLM's
-        # single-step `floor(avail / (uniform × group_size))` can land one
-        # block higher than the two-step value, and that extra block ×
-        # group_size × uniform bytes is enough to push past the budget against
-        # imprecision in vLLM's `avail` estimate.
+        # Fallback (compact sizing skipped, e.g. CPU-only tests): pin vLLM's
+        # num_blocks via the two-step flooring that keeps peak HBM within
+        # `gpu_memory_utilization × total_hbm` at high utilization. See
+        # `_maybe_set_num_blocks_override` for the formula and rationale; the
+        # short version is that vLLM's single-step
+        # `floor(avail / (uniform × group_size))` can land one block higher than
+        # the two-step value, and that extra block × group_size × uniform bytes
+        # is enough to push past the budget against imprecision in vLLM's
+        # `avail` estimate.
         if self.runner._mamba_num_blocks is None:
             self._maybe_set_num_blocks_override(
                 attn_page_size_bytes, int(uniform_page_size_bytes), group_size
@@ -928,22 +928,31 @@ class KVCacheManager:
                 kv-cache group); the same value passed to
                 `_maybe_set_num_blocks_override`.
 
+        A `num_gpu_blocks_override` already set (`--num-gpu-blocks-override`)
+        pins the attention pool to that count instead of the budget's: the
+        mamba slots stay compact, and HBM the pin leaves unused stays free.
+        That is how a deployment allocates only the KV its traffic needs
+        (tpu-inference's NUM_GPU_BLOCKS_OVERRIDE) rather than everything up to
+        `gpu_memory_utilization`. Skipping compact sizing for a pinned count,
+        as before, sent it to the uniform layout, which pads every attention
+        block to the mamba page.
+
         On success: sets `cache_config.num_gpu_blocks_override` (attention
         block count) and `_mamba_num_blocks`. Raises when the KV budget cannot
-        hold the mamba slots; the remaining precondition-fail paths leave both
-        unset so the caller falls back to uniform sizing.
+        hold the mamba slots (unless the count is pinned); the remaining
+        precondition-fail paths leave both unset so the caller falls back to
+        uniform sizing.
         """
         if self.runner._uniform_mamba_layout:
             logger.info("Compact mamba sizing skipped.")
             return
         cache_config = self.runner.cache_config
-        if cache_config.num_gpu_blocks_override is not None:
-            return
+        pinned_blocks = cache_config.num_gpu_blocks_override
         if group_size <= 0:
             return
 
         avail = self._available_kv_cache_hbm()
-        if avail <= 0:
+        if avail <= 0 and pinned_blocks is None:
             return
 
         # +1 reserves slot 0 as the null/sentinel block (never handed to a
@@ -959,10 +968,36 @@ class KVCacheManager:
         mamba_per_tensor = (
             num_mamba_groups * mamba_num_blocks * unpadded_mamba_page_size_bytes
         )
+        attn_per_tensor_avail = avail_per_tensor - mamba_per_tensor
+        if pinned_blocks is not None:
+            budget_blocks = max(attn_per_tensor_avail, 0) // (
+                num_attn_groups * attn_page_size_bytes
+            )
+            if pinned_blocks > budget_blocks:
+                logger.warning(
+                    "num_gpu_blocks_override=%d attention blocks exceed the %d "
+                    "the measured KV budget holds next to %d compact mamba "
+                    "slots; the allocation may not fit in HBM.",
+                    pinned_blocks,
+                    budget_blocks,
+                    mamba_num_blocks,
+                )
+            self.runner._mamba_num_blocks = int(mamba_num_blocks)
+            self._log_compact_mamba_split(
+                int(pinned_blocks),
+                mamba_num_blocks,
+                attn_page_size_bytes,
+                unpadded_mamba_page_size_bytes,
+                num_attn_groups,
+                num_mamba_groups,
+                group_size,
+                avail,
+                pinned=True,
+            )
+            return
         # Falling back to the uniform layout here would pad every block to the
         # mamba page and silently shrink the pool by ~50x, which surfaces as a
         # throughput collapse rather than a misconfiguration. Fail loudly.
-        attn_per_tensor_avail = avail_per_tensor - mamba_per_tensor
         if attn_per_tensor_avail <= 0:
             raise ValueError(
                 f"Compact-mamba KV sizing does not fit: mamba slots alone need "
@@ -995,6 +1030,29 @@ class KVCacheManager:
             group_size,
         )
 
+        self._log_compact_mamba_split(
+            int(attn_num_blocks),
+            mamba_num_blocks,
+            attn_page_size_bytes,
+            unpadded_mamba_page_size_bytes,
+            num_attn_groups,
+            num_mamba_groups,
+            group_size,
+            avail,
+        )
+
+    @staticmethod
+    def _log_compact_mamba_split(
+        attn_num_blocks: int,
+        mamba_num_blocks: int,
+        attn_page_size_bytes: int,
+        unpadded_mamba_page_size_bytes: int,
+        num_attn_groups: int,
+        num_mamba_groups: int,
+        group_size: int,
+        avail: int,
+        pinned: bool = False,
+    ) -> None:
         # Total HBM = group_size regions, each holding num_attn_groups
         # attention blocks + num_mamba_groups mamba slots.
         attn_bytes = (
@@ -1009,13 +1067,14 @@ class KVCacheManager:
         logger.info(
             "Compact-mamba KV cache: num_gpu_blocks_override=%d (attn), "
             "_mamba_num_blocks=%d. HBM split: attn=%.2f GiB; "
-            "mamba=%.2f GiB; total=%.2f GiB / avail=%.2f GiB.",
+            "mamba=%.2f GiB; total=%.2f GiB / avail=%.2f GiB.%s",
             attn_num_blocks,
             mamba_num_blocks,
             attn_bytes / (2**30),
             mamba_bytes / (2**30),
             (attn_bytes + mamba_bytes) / (2**30),
             avail / (2**30),
+            " Attention blocks pinned by num_gpu_blocks_override." if pinned else "",
         )
 
     def resize_compact_mamba_after_profile(self) -> None:

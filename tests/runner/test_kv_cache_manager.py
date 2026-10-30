@@ -364,6 +364,38 @@ class TestKVCacheManager:
         assert after == (int(0.9 * 10 * gib) - gib // 2 - mamba) // 4096
         assert self.runner._mamba_num_blocks == 17
 
+    @pytest.mark.parametrize(
+        "free_gib, warns", [(10, False), (0.25, True)], ids=["fits", "over_budget"]
+    )
+    @patch(
+        "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_page_size_bytes",
+        return_value=4096,
+    )
+    def test_pinned_block_count_keeps_compact_mamba_slots(
+        self, mock_get_page_size, free_gib, warns
+    ):
+        """--num-gpu-blocks-override pins the attention pool; the mamba slots
+        stay compact instead of falling back to the uniform layout (every block
+        padded to the mamba page), and there is nothing to resize after the
+        profile run. A pin above the measured budget warns."""
+        gib = 1024**3
+        layers = {"attn_0": _attention_layer_mock()}
+        layers["attn_0"].num_kv_heads = 2
+        layers["attn_0"].head_size = 128
+        layers.update({f"mamba_{i}": DummyMamba() for i in range(3)})
+        self.runner.cache_config.num_gpu_blocks_override = 100_000
+        mem = "vllm_torchtpu.utils.torch.accelerator.get_memory_info"
+        with (
+            patch(mem, return_value=(int(free_gib * gib), 10 * gib)),
+            patch("vllm_torchtpu.runner.kv_cache_manager.logger") as log,
+        ):
+            self.runner.kv_cache_manager._update_mamba_page_size_padded(layers)
+            self.runner.kv_cache_manager.resize_compact_mamba_after_profile()
+
+        assert self.runner.cache_config.num_gpu_blocks_override == 100_000
+        assert self.runner._mamba_num_blocks == 17
+        assert log.warning.called == warns
+
     def test_resize_is_a_no_op_without_compact_sizing(self):
         """A user-pinned or uniform layout has no compact sizing to redo."""
         self.runner.cache_config.num_gpu_blocks_override = 1234
