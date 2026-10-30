@@ -13,6 +13,18 @@
 # limitations under the License.
 """DeepSeek-V4.1 model modules for TPU."""
 
+from .attention import (
+    AttentionBackend,
+    CompressorStateCache,
+    DeepseekCompressor,
+    DeepseekV41Attention,
+    DeepseekV41Indexer,
+    IndexerCache,
+    SWACache,
+    TpuSparseAttnIndexer,
+    publish_candidate_blocks,
+    save_compress_norm,
+)
 from .cache import NativeCacheView, PagedCacheRows
 from .ced import DecoderReplayPlan, build_decoder_inverse_rows
 from .engram import (
@@ -25,14 +37,24 @@ from .engram import (
 from .moe import DeepseekV41MoE
 
 __all__ = [
+    "AttentionBackend",
+    "CompressorStateCache",
     "DecoderReplayPlan",
+    "DeepseekCompressor",
+    "DeepseekV41Attention",
+    "DeepseekV41Indexer",
     "DeepseekV41MoE",
     "Engram",
+    "IndexerCache",
     "NativeCacheView",
     "NgramHashState",
     "PagedCacheRows",
     "ParallelEngramEmbedding",
+    "SWACache",
     "TpuDPSharedEngramStorage",
+    "TpuSparseAttnIndexer",
     "build_decoder_inverse_rows",
     "dequant_fp8_rows",
+    "publish_candidate_blocks",
+    "save_compress_norm",
 ]
