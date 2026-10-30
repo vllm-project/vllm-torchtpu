@@ -126,3 +126,63 @@ def select(
 def router_topk(scores: jax.Array, topk: int) -> tuple[jax.Array, jax.Array]:
     """``select`` with a jax_op-compatible signature (arrays, then statics)."""
     return select(scores, topk)
+
+
+def _renormalized_softmax(w: jax.Array) -> jax.Array:
+    """Softmax over the selected logits of each row, ``w`` descending.
+
+    Equals softmax over all experts renormalized over the selection: the
+    full-row denominator cancels. A row with no logit above ``NEG`` stays NaN.
+    """
+    e = jnp.exp(w - w[:, :1])
+    p = e / jnp.sum(e, axis=1, keepdims=True)
+    return jnp.where(w[:, :1] <= NEG, jnp.nan, p)
+
+
+def _softmax_select_kernel(x_ref, w_ref, i_ref, *, topk: int, n: int):
+    """``_select_kernel`` over logits, writing renormalized softmax weights."""
+    x = x_ref[...].astype(jnp.float32)
+    x = jnp.where(x > NEG, x, NEG)
+    masked = jnp.finfo(x.dtype).min
+    iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
+    for j in range(topk):
+        m = jnp.max(x, axis=1, keepdims=True)
+        idx = jnp.min(jnp.where(x == m, iota, n - 1), axis=1)
+        w_ref[:, j] = m[:, 0]
+        i_ref[:, j] = idx.astype(jnp.int32)
+        x = jnp.where(iota == idx[:, None], masked, x)
+    w_ref[...] = _renormalized_softmax(w_ref[...])
+
+
+def select_softmax(
+    logits: jax.Array, topk: int, interpret: bool = False
+) -> tuple[jax.Array, jax.Array]:
+    """Top-k experts of softmax(``logits``), weights renormalized over the k.
+
+    Softmax is monotonic, so the experts are selected on the ``[rows,
+    experts]`` logits (any float dtype) and only the k selected are
+    exponentiated: the full-width softmax and its f32 copy of the scores are
+    never materialized. Returns ``(weights f32, indices int32)`` of shape
+    ``[rows, topk]``, weights descending and summing to 1.
+    """
+    rows, n = logits.shape
+    block = min(MAX_BLOCK_ROWS, rows)
+    return pl.pallas_call(
+        functools.partial(_softmax_select_kernel, topk=topk, n=n),
+        grid=(pl.cdiv(rows, block),),
+        in_specs=[pl.BlockSpec((block, n), lambda i: (i, 0))],
+        out_specs=[
+            pl.BlockSpec((block, topk), lambda i: (i, 0)),
+            pl.BlockSpec((block, topk), lambda i: (i, 0)),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((rows, topk), jnp.float32),
+            jax.ShapeDtypeStruct((rows, topk), jnp.int32),
+        ],
+        interpret=interpret,
+    )(logits)
+
+
+def router_topk_softmax(logits: jax.Array, topk: int) -> tuple[jax.Array, jax.Array]:
+    """``select_softmax`` with a jax_op-compatible signature."""
+    return select_softmax(logits, topk)

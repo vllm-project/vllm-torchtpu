@@ -21,7 +21,7 @@ elsewhere as the identical plain-torch algorithm in
 import torch
 from torch_tpu._internal import pallas
 
-from vllm_torchtpu.kernels.router_topk import router_topk
+from vllm_torchtpu.kernels.router_topk import router_topk, router_topk_softmax
 from vllm_torchtpu.layers.core.rowmax_topk import rowmax_topk
 
 
@@ -37,6 +37,8 @@ def _fake_router_topk(scores: torch.Tensor, topk: int):
 # forward, and Dynamo cannot trace a lock-guarded registration there.
 _op = pallas.jax_op("pallas::moe_router_topk", router_topk)
 _op.register_fake(_fake_router_topk)
+_softmax_op = pallas.jax_op("pallas::moe_router_topk_softmax", router_topk_softmax)
+_softmax_op.register_fake(_fake_router_topk)
 
 
 def rowmax_select(scores: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -48,3 +50,17 @@ def rowmax_select(scores: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.
             f"router top-k kernel expects [rows, experts], got {scores.shape}"
         )
     return _op(scores.float(), topk)
+
+
+def rowmax_select_softmax(
+    logits: torch.Tensor, topk: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Top-k of softmax(``logits``), f32 weights renormalized over the k."""
+    if logits.device.type != "tpu":
+        weights, ids = rowmax_topk(logits.float().softmax(dim=-1), topk)
+        return weights / torch.clamp(weights.sum(dim=-1, keepdim=True), min=1e-20), ids
+    if logits.dim() != 2:
+        raise ValueError(
+            f"router top-k kernel expects [rows, experts], got {logits.shape}"
+        )
+    return _softmax_op(logits, topk)

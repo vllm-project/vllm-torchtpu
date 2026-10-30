@@ -17,7 +17,16 @@ from vllm_torchtpu.kernels.router_topk.kernel import (
     MAX_BLOCK_ROWS,
     NEG,
     router_topk,
+    router_topk_softmax,
     select,
+    select_softmax,
 )
 
-__all__ = ["MAX_BLOCK_ROWS", "NEG", "router_topk", "select"]
+__all__ = [
+    "MAX_BLOCK_ROWS",
+    "NEG",
+    "router_topk",
+    "router_topk_softmax",
+    "select",
+    "select_softmax",
+]
