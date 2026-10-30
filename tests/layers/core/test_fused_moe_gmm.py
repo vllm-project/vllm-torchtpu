@@ -947,6 +947,63 @@ def test_fused_moe_func_int4_packed_matches_reference():
     )
 
 
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("num_tokens", [16, 256])  # one-hot, SparseCore permute
+def test_fused_moe_quantized_rows_match_unquantized(num_tokens):
+    """Rows from quantize_moe_input give fused_moe_func's output bit for bit."""
+    _require_tpu()
+    num_experts, hidden_size, intermediate_size, topk = 8, 1024, 512, 4
+    hk, w1k, w2k, idk, wk = jax.random.split(jax.random.key(0), 5)
+    hidden_states = jax.random.normal(hk, (num_tokens, hidden_size), jnp.bfloat16)
+    w1, w1_scale = fused_moe_gmm.quantize_to_native_fp4_kmajor(
+        jax.random.normal(w1k, (num_experts, hidden_size, 2 * intermediate_size)) / 10,
+        block=512,
+    )
+    w2, w2_scale = fused_moe_gmm.quantize_to_native_fp4_kmajor(
+        jax.random.normal(w2k, (num_experts, intermediate_size, hidden_size)) / 10,
+        block=512,
+    )
+    q_dtype = fused_moe_gmm.dispatch_quant_dtype(
+        hidden_size, w1, w1_scale, jnp.float4_e2m1fn
+    )
+    if q_dtype is None:
+        pytest.skip("this TPU's GMM does not quantize rows against fp4 weights")
+    threshold = fused_moe_gmm.resolve_onehot_permute_threshold()
+    kwargs = dict(
+        w1=w1,
+        w2=w2,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        w1_bias=None,
+        w2_bias=None,
+        topk_weights=jax.random.uniform(wk, (num_tokens, topk)),
+        topk_ids=jnp.argsort(
+            jax.random.uniform(idk, (num_tokens, num_experts)), axis=-1
+        )[:, :topk].astype(jnp.int32),
+        experts_start=jnp.array(0, dtype=jnp.int32),
+        topk=topk,
+        activation="silu",
+        use_ep=True,
+        onehot_moe_permute_threshold=threshold,
+        rhs_quant_dtype=jnp.float4_e2m1fn,
+    )
+
+    expected = fused_moe_func(hidden_states=hidden_states, **kwargs)
+    rows, rows_scale = fused_moe_gmm.quantize_moe_input(
+        hidden_states,
+        q_dtype=q_dtype,
+        num_dispatched_tokens=num_tokens,
+        topk=topk,
+        use_ep=True,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=threshold,
+    )
+    actual = fused_moe_func(hidden_states=rows, hidden_scale=rows_scale, **kwargs)
+
+    assert actual.dtype == expected.dtype
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+
 def _fake_tpu_info(sparse_core):
     return types.SimpleNamespace(sparse_core=sparse_core)
 
