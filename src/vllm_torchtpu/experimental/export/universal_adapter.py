@@ -282,7 +282,15 @@ def build_export_config_from_vllm(
         token_buckets = tuple(int(b) for b in token_buckets)
 
     if req_buckets is None:
-        req_buckets = default_req_buckets(max_num_seqs)
+        # A speculative step runs the LM head on every request's verify rows, its
+        # drafts and the token after them, as vLLM's sampler does; they are some of
+        # the step's tokens, so no more than its largest token bucket.
+        spec = getattr(vllm_config, "speculative_config", None)
+        rows = max_num_seqs
+        if spec is not None:
+            verify_rows = max_num_seqs * (spec.num_speculative_tokens + 1)
+            rows = max(rows, min(verify_rows, max(token_buckets)))
+        req_buckets = default_req_buckets(rows)
     else:
         req_buckets = tuple(int(r) for r in req_buckets)
 
