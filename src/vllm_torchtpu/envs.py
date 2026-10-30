@@ -108,6 +108,8 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_INDEXER_UPDATE_SHIFT: bool = False
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
+    VLLM_TPU_QSA_DCP_FINE_PREFIX: bool = False
+    VLLM_TPU_QSA_DCP_FINE_PREFIX_SEQ_TAIL: bool = False
     VLLM_TPU_QSA_PREFILL_LEAN: bool = False
     VLLM_TPU_QSA_MAIN_KV_DCP: int = 0
     VLLM_TPU_QSA_DCP_PREFILL_QUERY_BLOCK: int = 1024
@@ -740,6 +742,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # FP32 operands, which Mosaic multiplies at full FP32 precision.
     "VLLM_TPU_QSA_PREFILL_BF16_MXU": env_bool(
         "VLLM_TPU_QSA_PREFILL_BF16_MXU", default=False
+    ),
+    # Under VLLM_TPU_QSA_MAIN_KV_DCP > 1: prefix-cache hits at the hash unit
+    # (B) instead of the D*B scheduler block, with copy-on-write of a partially
+    # hit block (vllm_torchtpu/__init__.py _patch_vllm_qsa_dcp_fine_prefix_hits).
+    "VLLM_TPU_QSA_DCP_FINE_PREFIX": env_bool("VLLM_TPU_QSA_DCP_FINE_PREFIX"),
+    # With it: at request free, also register partial entries at the hash
+    # boundaries inside the request's last block (next turns resuming past the
+    # previous output), not only at the prompt's last boundary.
+    "VLLM_TPU_QSA_DCP_FINE_PREFIX_SEQ_TAIL": env_bool(
+        "VLLM_TPU_QSA_DCP_FINE_PREFIX_SEQ_TAIL"
     ),
     # qwen4_exp QSA sparse prefill: skip the FP8 key finite/written guard,
     # which the score mask select already covers (bit-identical output).
