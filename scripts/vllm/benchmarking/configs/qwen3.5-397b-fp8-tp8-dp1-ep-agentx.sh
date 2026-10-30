@@ -19,8 +19,9 @@
 # window, a 16384-token step budget, 64 sequences, prefix caching with the
 # unified block pool, a fixed 40.4 GB fp8 KV pool and the prefix-aware
 # scheduler. The trace replay itself runs outside this repository; the sweep
-# below is a random-prompt stand-in at the replay's concurrency (64) and
-# roughly its mean request (about 71k tokens in, 584 out).
+# below is a random-prompt stand-in at the replay's concurrency (64), with
+# every prompt 65536 tokens long (the replay's mean is about 71k in, 584 out)
+# so that each of its 64 decodes passes 65536 tokens of context.
 MODEL="Qwen/Qwen3.5-397B-A17B-FP8"
 TENSOR_PARALLELISM=8
 DATA_PARALLELISM=1
@@ -29,7 +30,7 @@ QUANTIZATION="fp8"
 ISL_OSL_CONFIGS="65536:512"
 CONCURRENCY_OPTIONS="64"
 NUM_PROMPTS=128
-RANDOM_RANGE_RATIO="0.8"
+RANDOM_RANGE_RATIO="1.0"
 RANGE_RATIO_STYLE="min"
 MAX_MODEL_LEN=262144
 MAX_NUM_BATCHED_TOKENS=16384

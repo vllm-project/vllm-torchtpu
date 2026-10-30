@@ -1,33 +1,62 @@
 # Serve configs for scorers/serve_e2e.py (perfkit/scorer_configs.py). The campaign freezes
-# `qwen3.5-397b-fp8-tp8-dp1-ep-agentx@layers`, the variant the scorer derives from this one:
-# the model cut to 4 of its 60 layers (3 Gated DeltaNet + 1 full-attention layer, every
-# expert kept), served on one tpu7x 2x2x1 node through Cloud DevKit, and scored on the
-# step-weighted device op time of the AgentX replay's own step shapes (the cells below).
+# `qwen3.5-397b-fp8-tp8-dp1-ep-agentx@layers`: the model cut to its leading 4 of 60 layers
+# (3 Gated DeltaNet layers and 1 full-attention layer, every expert kept), served on one
+# tpu7x 2x2x1 node through Cloud DevKit with the AgentX deployment's server flags, and
+# scored on the device's op time per step: decode-only steps and steps that carry a
+# 16k-token prefill chunk, weighed by the AgentX replay's own step mix (decode_share).
 [configs."qwen3.5-397b-fp8-tp8-dp1-ep-agentx"]
 config = "qwen3.5-397b-fp8-tp8-dp1-ep-agentx"
 target = "vllm-torchtpu-qwen35-agentx"
 cell = "7f7b02900fa6"
 remote = "cdk"
-# Where a layer arm reads the model's config.json to plan its cut; the pods serve the
-# same copy (the target's MODEL_URI).
+# Where a layer arm reads the model's config.json to plan its cut.
 weights = "gs://cloud-devkit/ckpt/hf/Qwen/Qwen3.5-397B-A17B-FP8"
-# The step mix of golden's AgentX job (infx-qwen35-agentx, CLIENT_CONCURRENCIES=64,
-# 3600 s), from `perfkit mix --job j-094ffbf0-e12d-4011-b1dc --concurrency 64 --toml`
-# with the server's literal --max-num-batched-tokens=16384 (the recipe passes it as a
-# shell variable the mix cannot read).
-cells_source = "j-094ffbf0-e12d-4011-b1dc at concurrency 64"
-cells = [
-  {name = "dec-k1-b64-l74k", kind = "decode", engines = 1, batch = 64, context = 76037, steps = 6783.7},
-  {name = "dec-k1-b16-l85k", kind = "decode", engines = 1, batch = 16, context = 86552, steps = 4413.7},
-  {name = "dec-k1-b12-l76k", kind = "decode", engines = 1, batch = 12, context = 77739, steps = 4410.2},
-  {name = "dec-k1-b48-l92k", kind = "decode", engines = 1, batch = 48, context = 94593, steps = 2963.7},
-  {name = "dec-k1-b8-l77k", kind = "decode", engines = 1, batch = 8, context = 78876, steps = 1866.4},
-  {name = "dec-k1-b4-l53k", kind = "decode", engines = 1, batch = 4, context = 54625, steps = 1708.0},
-  {name = "dec-k1-b12-l100k", kind = "decode", engines = 1, batch = 12, context = 102127, steps = 1595.5},
-  {name = "dec-k1-b48-l89k", kind = "decode", engines = 1, batch = 48, context = 91509, steps = 770.5},
-  {name = "mix-k1-b64-l78k-p64k", kind = "mixed", engines = 1, batch = 64, context = 79799, steps = 1715.7, prefix = 65328, chunk = 16332},
-  {name = "mix-k1-b64-l78k-p32k", kind = "mixed", engines = 1, batch = 64, context = 79799, steps = 1023.0, prefix = 32664, chunk = 16332},
-  {name = "mix-k1-b64-l78k-p0", kind = "mixed", engines = 1, batch = 64, context = 79799, steps = 1022.2, prefix = 0, chunk = 16332},
-  {name = "mix-k1-b64-l78k-p16k", kind = "mixed", engines = 1, batch = 64, context = 79799, steps = 953.0, prefix = 16332, chunk = 16332},
-  {name = "mix-k1-b64-l78k-p112k", kind = "mixed", engines = 1, batch = 64, context = 79799, steps = 604.6, prefix = 114324, chunk = 16332},
-]
+# The replay's step mix: 24511.6 of its 29830 lockstep steps were decode-only and 5318.4
+# carried a 16332-token chunk (`perfkit mix --job j-094ffbf0-e12d-4011-b1dc --concurrency 64`,
+# infx-qwen35-agentx at CLIENT_CONCURRENCIES=64, 3600 s, with the server's literal
+# --max-num-batched-tokens=16384).
+decode_share = 0.8217
+
+# The two layer runs, declared rather than derived so each can carry `cut_env`.
+#
+# A layer arm on Cloud DevKit cuts the model with --hf-overrides and counts on forge's
+# loader filter to skip the dropped layers' tensors. That filter reads `num_hidden_layers`
+# at the top of the overrides, and Qwen3.5 keeps it under `text_config`, so the full
+# checkpoint's later layers reached the cut model and its loader refused them ("There is no
+# module or parameter named 'layers.43' in Qwen3_5Model", cdk jobs j-de9ff089-3214-4bfb-bb1c
+# and j-1da15794-c022-4b31-b561). Each cut therefore streams a checkpoint already cut to its
+# layers, built with perfkit.layers.build from the full gs:// copy (embeddings, LM head and
+# MTP head kept).
+#
+# They are not scored on the replay's cells (`perfkit mix --toml`): a mixed cell's prefill is
+# 64 chunks of the cell's chunk (perfkit/buildkite_arm/cells.py, PREFILL_CHUNKS), which at
+# this server's 16384-token budget is a 1M-token prompt, four times its --max-model-len, so
+# no mixed cell can be served (cdk job j-561d54ea-7649-4abc-883a: every decode cell captured,
+# every mixed cell "finished before the profiler was armed"). They serve the config's sweep
+# instead, 64 prompts of 65536 tokens at once, whose chunk steps and 64-decode steps stand
+# for the replay's, weighed by its decode_share.
+[configs."qwen3.5-397b-fp8-tp8-dp1-ep-agentx@layers"]
+config = "qwen3.5-397b-fp8-tp8-dp1-ep-agentx"
+target = "vllm-torchtpu-qwen35-agentx"
+cell = "7f7b02900fa6"
+remote = "cdk"
+layers = "auto"
+repeats = 1
+warmup = 0
+weights = "gs://cloud-devkit/ckpt/hf/Qwen/Qwen3.5-397B-A17B-FP8"
+decode_share = 0.8217
+cut_env = {MODEL_URI = "gs://forge-gcs-tpu/forge/perfkit-cluster/checkpoints/Qwen3.5-397B-A17B-FP8-L4"}
+
+# One period longer, for `perfkit layers budget` only.
+[configs."qwen3.5-397b-fp8-tp8-dp1-ep-agentx@layers2"]
+config = "qwen3.5-397b-fp8-tp8-dp1-ep-agentx"
+target = "vllm-torchtpu-qwen35-agentx"
+cell = "7f7b02900fa6"
+remote = "cdk"
+layers = "auto"
+periods = 2
+repeats = 1
+warmup = 0
+weights = "gs://cloud-devkit/ckpt/hf/Qwen/Qwen3.5-397B-A17B-FP8"
+decode_share = 0.8217
+cut_env = {MODEL_URI = "gs://forge-gcs-tpu/forge/perfkit-cluster/checkpoints/Qwen3.5-397B-A17B-FP8-L8"}
