@@ -355,6 +355,83 @@ class CorrectnessTest(parameterized.TestCase):
         print(f"Max Diff Out: {np.max(diff_out)}")
         np.testing.assert_allclose(out_base, out_agent, rtol=0.1, atol=0.1)
 
+    def test_dense_single_request_chunks(self):
+        """Chunks of one request take the dense path; a mixed chunk does not."""
+        topk = 512
+        rng = np.random.default_rng(0)
+        num_heads = 64
+        head_dim = 512
+        page_size = 256
+        pages_per_seq = 3
+        batch_size = 2
+        chunk_size = 128
+
+        # Chunk 0 mixes both requests (gather path). Chunk 1 holds only
+        # request 1 plus padding, chunk 2 only padding (dense path, grids 0).
+        q_lens = jnp.array([120, 108], dtype=jnp.int32)
+        cu_q_lens = jnp.concatenate(
+            [jnp.array([0]), jnp.cumulative_sum(q_lens, dtype=jnp.int32)]
+        )
+        kv_lens = jnp.array([300, 700], dtype=jnp.int32)
+        num_tokens = 3 * chunk_size
+
+        topk_indices = np.full((num_tokens, topk), -1, np.int32)
+        for i in range(batch_size):
+            for t in range(int(cu_q_lens[i]), int(cu_q_lens[i + 1])):
+                causal = int(kv_lens[i]) - int(cu_q_lens[i + 1]) + t + 1
+                n = min(topk, causal)
+                topk_indices[t, :n] = rng.permutation(causal)[:n]
+        topk_indices = jnp.array(topk_indices)
+
+        page_indices = jnp.array(
+            rng.permutation(batch_size * pages_per_seq), dtype=jnp.int32
+        )
+        total_pages = batch_size * pages_per_seq
+        cache_kv_base, cache_kv_nope, cache_kv_rope = create_cache(
+            rng, total_pages, page_size, head_dim, jnp.bfloat16
+        )
+        distribution = jnp.array([0, 0, batch_size], dtype=jnp.int32)
+        attention_sinks = generate_attention_sinks(rng, num_heads)
+        q = gen_random(rng, (num_tokens, num_heads, head_dim), jnp.bfloat16)
+        swa_accumution = gen_random(
+            rng, (num_tokens, num_heads, head_dim), jnp.bfloat16
+        )
+        swa_l = gen_random(rng, (num_tokens, num_heads), dtype=jnp.float32)
+        swa_m = gen_random(rng, (num_tokens, num_heads), dtype=jnp.float32)
+
+        out_base = ref_implementation(
+            q,
+            cache_kv_base,
+            kv_lens,
+            topk_indices,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            attention_sinks,
+            swa_accumution,
+            swa_l,
+            swa_m,
+        )
+        out_agent = sparse_mla.sparse_ragged_paged_attention(
+            q,
+            cache_kv_nope,
+            cache_kv_rope,
+            topk_indices,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            attention_sinks,
+            swa_accumution,
+            swa_l,
+            swa_m,
+            attention_kernel_batch_size=16,
+            gather_and_attention_chunk_size=chunk_size,
+        )
+        num_valid = int(cu_q_lens[-1])
+        np.testing.assert_allclose(out_base, out_agent[:num_valid], rtol=0.1, atol=0.1)
+        # Padding rows are left as q, as the gather path leaves them.
+        np.testing.assert_array_equal(out_agent[num_valid:], q[num_valid:])
+
 
 if __name__ == "__main__":
     absltest.main()
