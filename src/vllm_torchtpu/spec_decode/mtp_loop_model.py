@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""A second compiled program for an MTP draft's IndexShare loop steps.
+"""A second compiled program for an MTP draft's loop steps 1+.
 
 vLLM compiles a model once and then drops the guards that would recompile it
 (``TorchCompileWithNoGuardsWrapper``), so anything the forward decides from a
@@ -21,6 +21,12 @@ and IndexShare needs both: the indexer at draft step 0, the table at steps 1+.
 One compiled program cannot do both, so steps 1+ run this one: the same draft
 forward over the same weights, KV caches and top-k table, first traced while
 ``skip_topk`` is True.
+
+The MTP step-0 post-attention gather (``TPU_MTP_STEP0_POST_ATTN_GATHER``) has
+the same shape of problem: step 0 traces with the gather, steps 1+ without.
+``build_mtp_loop_step_model`` compiles this program with the draft's own
+dynamic dims (Qwen3.5 marks ``positions`` -1 for MRoPE), which the fixed
+``MTP_DYNAMIC_ARG_DIMS`` of the IndexShare program do not cover.
 
 This lives outside eagle3.py because that module uses postponed annotations,
 which ``support_torch_compile`` cannot read. The dims are spelled out below
@@ -83,3 +89,24 @@ class MtpLoopStepModel(nn.Module):
             inputs_embeds,
             spec_step_idx,
         )
+
+
+def build_mtp_loop_step_model(
+    *,
+    vllm_config: VllmConfig,
+    prefix: str,
+    mtp: nn.Module,
+    dynamic_arg_dims: dict,
+) -> nn.Module:
+    """Compile a separate loop-step program with the draft's own dynamic dims
+    (e.g. Qwen3.5 marks `positions` dim -1 for MRoPE, DeepSeek marks dim 0).
+    """
+    base = MtpLoopStepModel
+    cls = support_torch_compile(dynamic_arg_dims=dict(dynamic_arg_dims))(
+        type("MtpLoopStepModel", (base,), {})
+    )
+    return cls(
+        vllm_config=vllm_config,
+        prefix=prefix,
+        mtp=mtp,
+    )
