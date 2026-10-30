@@ -13,14 +13,98 @@
 # limitations under the License.
 """Compact GDN inputs preserve the existing cast and reshape contract."""
 
+from dataclasses import replace
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.gdn.v3 import wrapper
 from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput
+from vllm_torchtpu.kernels.qwen4_exp import gdn_input
 from vllm_torchtpu.kernels.qwen4_exp.gdn_input import compact_qkv_input
+
+
+@pytest.fixture(autouse=True)
+def explicit_cpu_hardware(request, monkeypatch):
+    if request.node.get_closest_marker("tpu_test") is None:
+        info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_V4I, 1)
+        monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+
+
+@pytest.mark.parametrize(
+    "lanes,capacity,width,expected",
+    [
+        (64, 393216, 256, True),
+        (64, 393215, 256, False),
+        (64, 1024 * 1024, 192, True),
+        (128, 1024 * 1024, 192, False),
+        (128, 16 * 1024**2, 16384, False),
+        (128, 128 * 1024**2, 32768, True),
+    ],
+)
+def test_compact_support_uses_actual_lanes_and_capacity(
+    monkeypatch, lanes, capacity, width, expected
+):
+    info = replace(pltpu.get_tpu_info(), num_lanes=lanes, vmem_capacity_bytes=capacity)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    assert (
+        gdn_input.supports_compact_qkv((128, width), jnp.dtype(jnp.bfloat16))
+        is expected
+    )
+
+
+@pytest.mark.parametrize("buffer_count", [1, 2, 3])
+def test_compact_storage_estimate_matches_explicit_pipeline(monkeypatch, buffer_count):
+    info = replace(pltpu.get_tpu_info(), vmem_capacity_bytes=196608 * buffer_count)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    calls = []
+
+    def pallas_call(kernel, **kwargs):
+        calls.append(kwargs)
+        return lambda qkv: qkv.astype(jnp.float32)[:, None, :]
+
+    monkeypatch.setattr(gdn_input.pl, "pallas_call", pallas_call)
+    qkv = jnp.arange(128 * 256, dtype=jnp.bfloat16).reshape(128, 256)
+    pipeline = gdn_input.pl.Buffered(buffer_count=buffer_count)
+    actual = compact_qkv_input(qkv, pipeline_mode=pipeline)
+    call = calls[0]
+    source = call["in_specs"][0]
+    destination = call["out_specs"]
+    input_bytes = (
+        source.pipeline_mode.buffer_count
+        * np.prod(source.block_shape)
+        * qkv.dtype.itemsize
+    )
+    output_bytes = (
+        destination.pipeline_mode.buffer_count
+        * np.prod(destination.block_shape)
+        * call["out_shape"].dtype.itemsize
+    )
+    assert input_bytes + output_bytes == info.vmem_capacity_bytes
+    assert source.pipeline_mode is destination.pipeline_mode is pipeline
+    assert call["compiler_params"].vmem_limit_bytes is None
+    assert call["compiler_params"].dimension_semantics == ("parallel",)
+    np.testing.assert_array_equal(actual, qkv.astype(jnp.float32)[:, None, :])
+
+
+@pytest.mark.parametrize(
+    "shape,dtype",
+    [
+        ((0, 256), jnp.bfloat16),
+        ((128, 0), jnp.bfloat16),
+        ((127, 256), jnp.bfloat16),
+        ((128, 256), jnp.float32),
+    ],
+)
+def test_unsupported_conversion_does_not_query_device(monkeypatch, shape, dtype):
+    def forbidden():
+        raise AssertionError("unsupported conversion queried TPU hardware")
+
+    monkeypatch.setattr(pltpu, "get_tpu_info", forbidden)
+    assert not gdn_input.supports_compact_qkv(shape, jnp.dtype(dtype))
 
 
 @pytest.mark.parametrize(

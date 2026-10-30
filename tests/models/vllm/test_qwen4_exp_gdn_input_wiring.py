@@ -15,35 +15,38 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput
 from vllm_torchtpu.models.vllm.qwen4_exp import gdn
 
 
+@pytest.fixture(autouse=True)
+def explicit_cpu_hardware(request, monkeypatch):
+    if request.node.get_closest_marker("tpu_test") is None:
+        info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_V4I, 1)
+        monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+
+
 @pytest.mark.parametrize("tokens", [1, 8, 127, 257])
 def test_small_or_unaligned_qwen_input_is_unchanged(tokens):
-    mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("model",))
     qkv = jnp.zeros((tokens, 384), jnp.bfloat16)
-    assert gdn.prepare_gdn_input(qkv, 1, mesh) is qkv
+    assert gdn.prepare_gdn_input(qkv) is qkv
 
 
-@pytest.mark.parametrize(
-    "tokens,capacity", [(128, 128), (256, 256), (128, 1), (2048, 9), (128, 2)]
-)
-def test_shape_policy_prepares_chunked_buckets_only(monkeypatch, tokens, capacity):
-    mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("model",))
+@pytest.mark.parametrize("tokens", [128, 256, 2048])
+def test_aligned_local_projection_preparation_has_no_request_capacity_gate(
+    monkeypatch, tokens
+):
     qkv = jnp.ones((tokens, 384), jnp.bfloat16)
     monkeypatch.setattr(
         gdn, "compact_qkv_input", lambda x: x.astype(jnp.float32)[:, None, :]
     )
-    prepared = gdn.prepare_gdn_input(qkv, capacity, mesh)
-    if tokens <= capacity:
-        assert prepared is qkv
-    else:
-        assert isinstance(prepared, Conv1DInput)
-        assert prepared.output_dtype == qkv.dtype
-        assert prepared.values.shape == (tokens, 1, 384)
-        np.testing.assert_array_equal(prepared.values, 1)
+    prepared = gdn.prepare_gdn_input(qkv)
+    assert isinstance(prepared, Conv1DInput)
+    assert prepared.output_dtype == qkv.dtype
+    assert prepared.values.shape == (tokens, 1, 384)
+    np.testing.assert_array_equal(prepared.values, 1)
 
 
 @pytest.mark.tpu_test

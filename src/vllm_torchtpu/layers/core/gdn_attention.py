@@ -17,6 +17,7 @@ Bridge the torch gdn_attention_core op for gated deltanet attention TPU impl
 """
 
 import functools
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -812,7 +813,7 @@ def _as_logical_block_pool(
 
 
 def run_jax_gdn_attention_pooled_local(
-    mixed_qkv: jnp.ndarray | Conv1DInput,
+    mixed_qkv: jnp.ndarray,
     b: jnp.ndarray,
     a: jnp.ndarray,
     recurrent_state: jnp.ndarray,
@@ -835,21 +836,19 @@ def run_jax_gdn_attention_pooled_local(
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
+    prepare_input: Callable[[jax.Array], jax.Array | Conv1DInput] | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """GDN attention over the unified block pool.
+    """Run GDN on a logical-block view of the unified pool.
 
-    ``recurrent_state`` is the attention-shaped pool holding the SSM region
-    in ``recurrent_state_dtype`` at token offset 0 and the fixed-BF16 Conv
-    region in the following tokens. All pool knowledge lives here: this
-    function builds the copy-plan that maps those two regions onto the V3
-    kernel's state operands, so the kernel itself never sees the pool layout.
+    The V3 kernel addresses FP32 Conv and configured SSM granules within
+    each logical block. Input preparation runs on the rank-local projection.
     """
 
     pool_shape = recurrent_state.shape
     pool = _as_logical_block_pool(recurrent_state, pool_block_tokens)
-
+    prepared_qkv = mixed_qkv if prepare_input is None else prepare_input(mixed_qkv)
     pool, output = gdn_v3_wrapper.fused_conv1d_gdn(
-        mixed_qkv,
+        prepared_qkv,
         b,
         a,
         pool,
@@ -876,7 +875,7 @@ def run_jax_gdn_attention_pooled_local(
 
 
 def run_jax_gdn_attention_pooled(
-    j_mixed_qkv: jnp.ndarray | Conv1DInput,
+    j_mixed_qkv: jnp.ndarray,
     j_b: jnp.ndarray,
     j_a: jnp.ndarray,
     recurrent_state: jnp.ndarray,
@@ -900,6 +899,7 @@ def run_jax_gdn_attention_pooled(
     mesh: jax.sharding.Mesh,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
+    prepare_input: Callable[[jax.Array], jax.Array | Conv1DInput] | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
 
@@ -940,11 +940,7 @@ def run_jax_gdn_attention_pooled(
     """
     pool_spec = P(*([None] * recurrent_state.ndim))  # attention-shaped pool
     in_specs = (
-        (
-            jax.tree.map(lambda _: P(None, None, _GDN_MODEL_AXIS_NAME), j_mixed_qkv)
-            if isinstance(j_mixed_qkv, Conv1DInput)
-            else P(None, _GDN_MODEL_AXIS_NAME)
-        ),  # j_mixed_qkv
+        P(None, _GDN_MODEL_AXIS_NAME),  # j_mixed_qkv
         P(None, _GDN_MODEL_AXIS_NAME),  # j_b
         P(None, _GDN_MODEL_AXIS_NAME),  # j_a
         pool_spec,  # recurrent_state (attention-shaped pool)
@@ -987,6 +983,7 @@ def run_jax_gdn_attention_pooled(
         pool_block_tokens=pool_block_tokens,
         num_spec_tokens=num_spec_tokens,
         recurrent_state_dtype=recurrent_state_dtype,
+        prepare_input=prepare_input,
     )
     mapped_fn = jax.shard_map(
         p_run_jax_gdn_attention_pooled_local,

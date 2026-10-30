@@ -134,12 +134,14 @@ def test_prepared_pooled_prefill_then_decode(ssm_dtype, monkeypatch):
     dt_bias = normal((n_v,), jnp.float32) - 2
     mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("model",))
 
+    def prepare_input(qkv):
+        return Conv1DInput(compact_qkv_input(qkv), qkv.dtype)
+
     @functools.partial(jax.jit, static_argnames=("prepared",), donate_argnums=(0,))
     def run(pool, qkv, b, a, context, *, prepared):
         count = qkv.shape[0]
-        inputs = Conv1DInput(compact_qkv_input(qkv), qkv.dtype) if prepared else qkv
         return gdn_attention.run_jax_gdn_attention_pooled(
-            inputs,
+            qkv,
             b,
             a,
             pool,
@@ -159,6 +161,7 @@ def test_prepared_pooled_prefill_then_decode(ssm_dtype, monkeypatch):
             pool_block_tokens=manager_tokens,
             mesh=mesh,
             recurrent_state_dtype=ssm_dtype,
+            prepare_input=prepare_input if prepared else None,
         )
 
     def typed_rows(region, dtype):
