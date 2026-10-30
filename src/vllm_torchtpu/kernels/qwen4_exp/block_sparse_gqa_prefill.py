@@ -195,11 +195,6 @@ def _kernel(
     table_ref,
     active_tiles_ref,
     active_counts_ref,
-    query_ref,
-    bitset_ref,
-    lengths_ref,
-    cache_ref,
-    output_ref,
     *refs,
     ratio: int,
     kv_tile: int,
@@ -221,6 +216,12 @@ def _kernel(
     return_lse: bool = False,
     dcp_world: int = 1,
 ):
+    # DCP: a fourth scalar operand holds this rank; its KV tiles are its owned
+    # page-sized blocks only (local tile t is global block t * dcp_world + rank).
+    rank_ref = refs[0] if dcp_world > 1 else None
+    refs = refs[1:] if dcp_world > 1 else refs
+    query_ref, bitset_ref, lengths_ref, cache_ref, output_ref = refs[:5]
+    refs = refs[5:]
     lse_ref = refs[0] if return_lse else None
     kv0_ref, kv1_ref, sem0_ref, sem1_ref, max_ref, mass_ref, accumulator_ref = refs[
         1 if return_lse else 0 :
@@ -257,11 +258,9 @@ def _kernel(
         # shared pool page may contain an odd number of these segments.
         copy_rows = min(kv_tile, physical_page_size, ratio * 32)
         for offset in range(0, kv_tile, copy_rows):
+            # Local rows: under DCP the tiles walk this rank's own pages.
             logical = tile * kv_tile + offset
-            # DCP: a table entry covers dcp_world pages' worth of tokens and
-            # this rank's rows sit in that entry's page at t % page size (the
-            # other ranks' rows of the tile are masked out of the bitset).
-            page = logical // (physical_page_size * dcp_world)
+            page = logical // physical_page_size
             in_page = logical % physical_page_size
             # An odd final logical page has no second half. Its selection
             # word is zero; repeat a valid DMA address without exposing it.
@@ -318,6 +317,9 @@ def _kernel(
 
     def compute_tile(tile, kv_ref):
         logical = tile * kv_tile
+        if dcp_world > 1:
+            # Global token position of this owned block (masks, causality).
+            logical = (tile * dcp_world + rank_ref[0]) * kv_tile
         # Dynamic scalar indexing must address a native 128-wide row.  Keep
         # query bits on that row and slice the statically known live prefix.
         # Query blocks longer than 256 rows store one bitset per 256 rows.
@@ -542,8 +544,9 @@ def block_sparse_gqa_prefill(
     ``dcp_rank`` (int32[1]) / ``dcp_world``: main-KV decode context parallel.
     A table entry covers ``dcp_world * page`` tokens; this rank attends the
     tokens with ``(t // page) % dcp_world == dcp_rank``, held in the entry's
-    page at row ``t % page``. Needs paired pages with ``kv_tile`` equal to
-    one entry.
+    page at row ``t % page``. The KV tiles walk only those owned pages (one
+    page per tile: ``kv_tile`` equal to the page), so no other rank's rows are
+    fetched and the tile size does not grow with ``dcp_world``.
 
     ``kv_head_offset`` skips that many KV heads of each cache row: a paired
     main KV page stores a second layer's head after the first layer's.
@@ -588,11 +591,21 @@ def block_sparse_gqa_prefill(
         raise ValueError("Cache packing does not match its dtype")
 
     dcp = dcp_rank is not None
-    if dcp and not (paired_pages and kv_tile == dcp_world * physical_page_size):
-        raise ValueError("DCP prefill needs paired pages, one table entry per KV tile")
+    if dcp and not (paired_pages and kv_tile == physical_page_size):
+        raise ValueError("DCP prefill needs paired pages, one owned page per KV tile")
+    # Selection groups / words over the request's global token range; under
+    # DCP the kernel walks only this rank's pages (one per table entry), so
+    # its tiles and bitset words are the owned ones (`owned_word_ids`).
     groups = page_table.shape[1] * physical_page_size * dcp_world // ratio
-    num_kv_tiles = (groups * ratio + kv_tile - 1) // kv_tile
     words_per_tile = kv_tile // (ratio * 32)
+    global_words = (
+        (((groups * ratio + kv_tile - 1) // kv_tile) * words_per_tile + 127) // 128
+    ) * 128
+    num_kv_tiles = (
+        page_table.shape[1]
+        if dcp
+        else (groups * ratio + kv_tile - 1) // kv_tile
+    )
     words = ((num_kv_tiles * words_per_tile + 127) // 128) * 128
     nblocks = tokens // query_block
     native_query_width = ((query_block + 127) // 128) * 128
@@ -603,24 +616,36 @@ def block_sparse_gqa_prefill(
     parts = max(1, query_block // 256)
     part_width = native_query_width // parts
     if dcp:
-        # One selection word covers ratio * 32 tokens, within one page's rows.
-        word_tokens = jnp.arange(words, dtype=jnp.int32) * (ratio * 32)
-        owned_words = (
-            (word_tokens // physical_page_size) % dcp_world
-            == jnp.asarray(dcp_rank, jnp.int32).reshape(-1)[0]
-        ).astype(jnp.int32)
+        # Local word w (tile w // words_per_tile of this rank's pages) is
+        # global word (tile * dcp_world + rank) * words_per_tile + w % ...
+        rank = jnp.asarray(dcp_rank, jnp.int32).reshape(-1)[0]
+        local = jnp.arange(words, dtype=jnp.int32)
+        owned_word_ids = (
+            (local // words_per_tile) * dcp_world + rank
+        ) * words_per_tile + local % words_per_tile
+        owned_word_live = (local < num_kv_tiles * words_per_tile) & (
+            owned_word_ids < global_words
+        )
+        owned_word_ids = jnp.minimum(owned_word_ids, global_words - 1)
+
+        def own_words(bits, axis):
+            taken = jnp.take(bits, owned_word_ids, axis=axis)
+            shape = [1] * bits.ndim
+            shape[axis] = words
+            return jnp.where(owned_word_live.reshape(shape), taken, 0)
+
     if envs.VLLM_TPU_QSA_PREFILL_BITSET_KERNEL:
         block_bits_native = _selection_bitset(
             blocks,
             lengths,
             ratio=ratio,
             groups=groups,
-            words=words,
+            words=global_words if dcp else words,
             query_block=query_block // parts,
             width=part_width,
         )
         if dcp:
-            block_bits_native = block_bits_native * owned_words[None, :, None]
+            block_bits_native = own_words(block_bits_native, 1)
         part_bits = block_bits_native.reshape(nblocks, parts, words, part_width)
         if paired_pages:
             active = jnp.any(
@@ -658,10 +683,11 @@ def block_sparse_gqa_prefill(
         )
     else:
         bitset = _scatter_bitset(
-            blocks, lengths, ratio=ratio, groups=groups, words=words
+            blocks, lengths, ratio=ratio, groups=groups,
+            words=global_words if dcp else words,
         )
         if dcp:
-            bitset = bitset * owned_words[None, :]
+            bitset = own_words(bitset, 1)
 
         nblocks = tokens // query_block
         block_bits = bitset.reshape(nblocks, query_block, words)
@@ -733,7 +759,7 @@ def block_sparse_gqa_prefill(
             **({"dcp_world": dcp_world} if dcp else {}),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=3,
+            num_scalar_prefetch=4 if dcp else 3,
             grid=(nblocks,),
             in_specs=[
                 pl.BlockSpec(
@@ -803,6 +829,7 @@ def block_sparse_gqa_prefill(
         table.reshape(-1),
         active_tiles.reshape(-1),
         active_counts,
+        *([jnp.asarray(dcp_rank, jnp.int32).reshape(1)] if dcp else []),
         query.astype(jnp.bfloat16 if bf16_io else jnp.float32),
         block_bits_native,
         lengths[:, None],
@@ -966,10 +993,7 @@ def _prepare_metadata_bounded(
 ):
     tokens = blocks.shape[0]
     assert tokens % query_block == 0
-    dcp = dcp_rank is not None
-    if dcp and not (paired_pages and kv_tile == dcp_world * physical_page_size):
-        raise ValueError("DCP prefill needs paired pages, one table entry per KV tile")
-    groups = page_table.shape[1] * physical_page_size * dcp_world // ratio
+    groups = page_table.shape[1] * physical_page_size // ratio
     num_kv_tiles = (groups * ratio + kv_tile - 1) // kv_tile
     words_per_tile = kv_tile // (ratio * 32)
     words = ((num_kv_tiles * words_per_tile + 127) // 128) * 128
