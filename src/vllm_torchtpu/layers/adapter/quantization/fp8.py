@@ -75,7 +75,7 @@ from vllm.model_executor.parameter import (
 )
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import envs, expert_placement
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
@@ -94,6 +94,7 @@ from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
     pipelined_fused_moe_gmm,
 )
+from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores
 from vllm_torchtpu.layers.adapter.quantization.configs import (
     VllmQuantConfig,
     VllmQuantLinearConfig,
@@ -760,7 +761,9 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
                 )
 
                 return VllmUnquantizedLinearMethod()
-            return VllmFp8LinearMethodTPU(self, self.get_linear_config(layer))
+            return VllmFp8LinearMethodTPU(
+                self, self.get_linear_config(layer), prefix=prefix
+            )
 
         if isinstance(layer, Attention):
             return None
@@ -782,6 +785,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
 
     _use_adaptive_fused_moe: bool = False
     _adaptive_fused_moe_op: torch.library.CustomOpDef | None = None
+    _moe_lowtok_scores_op: torch.library.CustomOpDef | None = None
 
     def __init__(self, quant_config: Fp8Config, moe_config):
         FusedMoEMethodBase.__init__(self, moe_config)
@@ -823,11 +827,19 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         refuses -- TP, over the SMEM bound, under the token threshold, or
         a weight or routing layout the kernel cannot serve.
         """
-        from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+            fused_moe_ep_supported as fused_moe_ep_v2_supported,
+        )
+        from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+            fused_moe_ep_supported as fused_moe_ep_v3_supported,
+        )
 
         return (
             enable_pipelined_collective_and_compute()
-            or fused_moe_ep_supported(self)
+            or (
+                envs.USE_MOE_FUSED_EP_KERNEL
+                and (fused_moe_ep_v3_supported(self) or fused_moe_ep_v2_supported(self))
+            )
             or adaptive_moe.adaptive_fused_moe_supported(self)
             or envs.TPU_MOE_FP8_ALL_GATHER
         )
@@ -1060,7 +1072,13 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         )
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
+            from vllm_torchtpu.layers.adapter import small_all_reduce_op
+
+            small_all_reduce_op.prebuild()
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
+        self._moe_lowtok_scores_op = moe_lowtok_scores.prebuild(
+            self, layer, activation_str
+        )
         if self._use_adaptive_fused_moe:
             self._adaptive_fused_moe_op = adaptive_moe.prebuild_adaptive_fused_moe(
                 layer,
@@ -1069,10 +1087,20 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 activation=activation_str,
             )
             return
+        layer._gmm_primary_experts = (
+            (
+                int(expert_placement.owned())
+                if expert_placement.placed(getattr(layer, "layer_name", ""))
+                else int(layer.w13_weight.shape[0])
+            )
+            if expert_placement.has_copies()
+            else None
+        )
         prebuild_fused_moe_kernel(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
+            num_primary_experts=layer._gmm_primary_experts,
         )
         # Resolve the EP mesh here, not on the first forward: it maps ranks to
         # TPU device ids with an all_gather_object, and Dynamo cannot trace a
@@ -1084,26 +1112,39 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             prebuild_fused_moe_ep,
             register_score_bias_buffer,
         )
-
-        _ep_op = prebuild_fused_moe_ep(
-            layer,
-            topk=layer.moe_config.experts_per_token,
-            renormalize=layer.renormalize,
-            activation=activation_str,
+        from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+            prebuild_fused_moe_ep as prebuild_fused_moe_ep_v3,
         )
-        setattr(self, FUSED_MOE_EP_OP_ATTR, _ep_op)
-        if _ep_op is not None:
-            # Stage the bias, exactly as the nvfp4 and mxfp4 methods do. This
-            # is the other half of the arity contract: `_routing_config`
-            # decides the op's operand count from
-            # `layer.e_score_correction_bias`, while the call site reads the
-            # STAGED buffer via `score_bias_operand`. Register nothing and the
-            # two disagree -- the op is built with eight operands and
-            # `fused_moe_ep` takes its `score_bias is None` branch and passes
-            # seven, which Dynamo rejects with `missing value for argument
-            # 'score_bias'`. Passing the operand at the call site is not
-            # sufficient on its own; it has to exist.
-            register_score_bias_buffer(layer)
+
+        if envs.MOE_FUSED_EP_KERNEL_IMPL == "v3":
+            if (
+                envs.USE_MOE_FUSED_EP_KERNEL
+                and enable_pipelined_collective_and_compute()
+            ):
+                raise ValueError(
+                    "USE_MOE_FUSED_EP_KERNEL and MoE chunk pipelining both claim "
+                    "the expert-parallel exchange; enable one of them."
+                )
+            prebuild_fused_moe_ep_v3(
+                layer,
+                topk=layer.moe_config.experts_per_token,
+                renormalize=layer.renormalize,
+                activation=activation_str,
+            )
+            self._tpu_fused_ep_eligible = bool(
+                getattr(layer, "_tpu_fused_ep_eligible", False)
+            )
+            setattr(self, FUSED_MOE_EP_OP_ATTR, None)
+        else:
+            _ep_op = prebuild_fused_moe_ep(
+                layer,
+                topk=layer.moe_config.experts_per_token,
+                renormalize=layer.renormalize,
+                activation=activation_str,
+            )
+            setattr(self, FUSED_MOE_EP_OP_ATTR, _ep_op)
+            if _ep_op is not None:
+                register_score_bias_buffer(layer)
 
     def apply_monolithic(
         self,
@@ -1133,21 +1174,13 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 router_logits,
             )
 
-        # `score_bias_operand` is not optional, and omitting it is silent on
-        # every model that does not have one. `prebuild_fused_moe_ep` builds
-        # the op with an eighth operand exactly when the layer carries an
-        # `e_score_correction_bias`, so a layer that has one and a call site
-        # that does not pass it disagree on the op's arity and Dynamo refuses
-        # the trace with `pallas::fused_moe_ep() is missing value for argument
-        # 'score_bias'`. A biasless router -- plain softmax or sigmoid top-k --
-        # takes the seven-argument call and matches, which is why the omission
-        # survived here for as long as this path served only such models; a
-        # `noaux_tc` router carries the bias and does not. The nvfp4 and mxfp4
-        # methods already pass it.
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
             fused_moe_ep,
             fused_moe_ep_supported,
             score_bias_operand,
+        )
+        from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+            fused_moe_ep_supported as fused_moe_ep_v3_supported,
         )
 
         if fused_moe_ep_supported(self):
@@ -1161,6 +1194,18 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 router_logits,
                 score_bias_operand(layer),
             )
+        if envs.USE_MOE_FUSED_EP_KERNEL and (
+            fused_moe_ep_v3_supported(self) or fused_moe_ep_v3_supported(layer)
+        ):
+            return self._apply_owning_dispatch_v3(
+                layer,
+                x,
+                router_logits,
+                activation_str,
+                use_fused_kernel=_fused_kernel_takes(
+                    x.shape[0], envs.TPU_MOE_FUSED_EP_STEP_MIN_TOKENS
+                ),
+            )
         from vllm_torchtpu.layers.adapter.moe_tp_decode import (
             moe_tp_decode_forward,
             moe_tp_decode_supported,
@@ -1170,10 +1215,10 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             # Armed layer: the runner no longer runs the shared expert or the
             # all-reduce, so this returns the reduced shared + routed sum.
             return moe_tp_decode_forward(self, layer, x, router_logits)
+        if moe_lowtok_scores.serves(self._moe_lowtok_scores_op, x):
+            op = self._moe_lowtok_scores_op
+            return moe_lowtok_scores.apply(op, layer, x, router_logits)
         # Step 1: Routing
-        # Quantization-independent routing decision (simulation override ->
-        # custom_routing_function -> select_experts); shared across all TPU MoE
-        # methods so the routing-simulation hook lives in exactly one place.
         topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
 
         # Either reason to take the collectives from vLLM leaves the routing
@@ -1205,6 +1250,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             "experts_start": layer._experts_start,
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
+            "num_primary_experts": getattr(layer, "_gmm_primary_experts", None),
         }
         if owns_collectives:
             return pipelined_fused_moe_gmm(**kwargs)
@@ -1220,6 +1266,117 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             return fused_moe_decode(self, layer, x, topk_weights, topk_ids)
 
         return fused_moe_gmm(**kwargs)
+
+    def _apply_owning_dispatch_v3(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        activation_str: str,
+        *,
+        use_fused_kernel: bool = True,
+    ) -> torch.Tensor:
+        from vllm.distributed.parallel_state import get_ep_group
+
+        from vllm_torchtpu.layers.adapter import small_all_reduce_op
+        from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+            fused_moe_ep,
+            fused_moe_ep_supported,
+            retain_fused_ep_graph_inputs,
+        )
+
+        del activation_str
+        if use_fused_kernel and (
+            fused_moe_ep_supported(self) or fused_moe_ep_supported(layer)
+        ):
+            w13, w2, s13, s2 = (
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale_inv,
+                layer.w2_weight_scale_inv,
+            )
+            if (
+                getattr(layer, "_lowtok_has_copies", False)
+                and getattr(layer, "_lowtok_tables", None) is not None
+            ):
+                zero = (
+                    layer._lowtok_tables[:1]
+                    + layer._lowtok_prim[:1]
+                    + layer._lowtok_copy[:1]
+                    + layer._lowtok_hot1h[0, :1].to(torch.int32)
+                ) * 0
+                router_logits = router_logits + zero.to(router_logits.dtype)
+            out = fused_moe_ep(x, w13, w2, s13, s2, router_logits)
+            experts_start = layer._experts_start
+            if experts_start is not None:
+                value = experts_start.to(out.dtype)
+                out = out + (value - value)
+            out = small_all_reduce_op.retain(out)
+            return token_padding.retain_padding_graph_input(out)
+
+        ep = get_ep_group()
+        sequence_parallel_flag = getattr(
+            layer.moe_config, "is_sequence_parallel", False
+        )
+        dispatched = ep.dispatch_router_logits(
+            x, router_logits, sequence_parallel_flag
+        )
+        assert len(dispatched) == 2
+        gathered_x, gathered_logits = dispatched
+        out = self.apply_monolithic_external_dispatch(
+            layer, gathered_x, gathered_logits
+        )
+        return retain_fused_ep_graph_inputs(ep.combine(out, sequence_parallel_flag))
+
+    def apply_monolithic_external_dispatch(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del input_ids
+        from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+            retain_fused_ep_graph_inputs,
+        )
+
+        if moe_lowtok_scores.serves(self._moe_lowtok_scores_op, x):
+            op = self._moe_lowtok_scores_op
+            out = moe_lowtok_scores.apply(op, layer, x, router_logits)
+            return retain_fused_ep_graph_inputs(out)
+        topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+        if (
+            getattr(layer, "_lowtok_has_copies", False)
+            and getattr(layer, "_lowtok_tables", None) is not None
+        ):
+            zero = (
+                layer._lowtok_tables[:1]
+                + layer._lowtok_prim[:1]
+                + layer._lowtok_copy[:1]
+                + layer._lowtok_hot1h[0, :1].to(torch.int32)
+            ) * 0
+            topk_ids = topk_ids + zero
+        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+            topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
+                topk_ids, topk_weights
+            )
+        kwargs = {
+            "hidden_states": x,
+            "w1": layer.w13_weight,
+            "w2": layer.w2_weight,
+            "w1_scale": layer.w13_weight_scale_inv,
+            "w2_scale": layer.w2_weight_scale_inv,
+            "w1_bias": getattr(layer, "w13_bias", None),
+            "w2_bias": getattr(layer, "w2_bias", None),
+            "topk_weights": topk_weights,
+            "topk_ids": topk_ids,
+            "experts_start": layer._experts_start,
+            "num_primary_experts": getattr(layer, "_gmm_primary_experts", None),
+            "topk": layer.moe_config.experts_per_token,
+            "activation": self._tpu_activation_str,
+        }
+        out = fused_moe_gmm(**kwargs)
+        return retain_fused_ep_graph_inputs(out)
 
 
 class ChannelQuantScaleParameterTPU(ChannelQuantScaleParameter):
@@ -1703,6 +1860,28 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         setattr(layer, KEEP_VLLM_LAYOUT_ATTR, True)
         return layer
 
+    def apply_prequant(
+        self,
+        layer: torch.nn.Module,
+        x_q: torch.Tensor,
+        x_s: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """apply with the activation already quantised per row: the
+        sequence-parallel fp8 all-gather hands the projections fp8 rows
+        and their scales (layers/adapter/sequence_parallel)."""
+        from vllm_torchtpu.layers.adapter.linear_common import (
+            quantized_matmul_prequant,
+        )
+
+        weight = layer.weight
+        if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
+            weight = weight.transpose(0, 1)
+        out = quantized_matmul_prequant(x_q, x_s, weight, layer.weight_scale)
+        if bias is not None:
+            out = out + bias
+        return out
+
 
 def resolve_online_fp8(
     config: VllmFp8Config | VllmNvfp4Config,
@@ -1732,4 +1911,14 @@ def resolve_online_fp8(
     method.online_fp8 = True
     method.online_fp8_policy = policy
     policy.selected[prefix] = aliases
-    return method
+
+
+def _fused_kernel_takes(rows: int, gate: int) -> bool:
+    from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import tensor_parallel_size
+
+    if tensor_parallel_size() > 1:
+        from vllm_torchtpu.layers.adapter import sequence_parallel as _sp
+
+        if not _sp.is_active():
+            return False
+    return rows >= gate

@@ -74,6 +74,7 @@ if TYPE_CHECKING:
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
+    TPU_MOE_LOWTOK: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -103,6 +104,9 @@ if TYPE_CHECKING:
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
+    TPU_TOKEN_BUCKET_HALF_STEPS: bool = False
+    TPU_OFFLOAD_MIN_HBM_USAGE: float = 0.0
+    TPU_EXPERT_PLACEMENT_MTP: bool = True
     TPU_TOKEN_BUCKET_LINEAR: bool = False
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
@@ -110,6 +114,13 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
+    TPU_GDN_FUSED_NORM_QUANT: bool = False
+    TPU_FUSE_PRE_ATTN_NORM_QUANT: bool = True
+    TPU_FUSE_POST_ATTN_NORM_MOE: bool = True
+    TPU_GDN_FUSED_NORM_QUANT_MIN_ROWS: int = 16
+    TPU_FUSED_QK_NORM_ROPE: bool = False
+    TPU_FUSED_QK_NORM_ROPE_MIN_ROWS: int = 0
+    TPU_RPA_DECODE_BATCHED: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
@@ -125,6 +136,7 @@ if TYPE_CHECKING:
     TPU_SPARSE_MLA_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_FP8_ALL_GATHER: bool = False
+    TPU_EXPERT_PLACEMENT: str = ""
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
     USE_PIPELINED_DMA_STAGING: bool = False
@@ -178,6 +190,12 @@ if TYPE_CHECKING:
     VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S: float = 30.0
     VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
+    TPU_HYBRID_RETENTION_MAX_CONVS: int = 96
+    TPU_HYBRID_RETENTION_MAX_PINNED_BLOCKS: int = 360
+    TPU_HYBRID_RETENTION_KEEP_PRIOR_TURNS: int = 1
+    TPU_HYBRID_RETENTION_SMART_FORK: bool = True
+    TPU_HYBRID_RETENTION_SAFE_TAIL_OFFSET: int = 4
+    TPU_RAIDEN_INLINE_LOAD_MAX_CHUNKS: int = 2
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
     VLLM_TPU_MXFP4_DEVICE_DEQUANT: bool = True
@@ -198,6 +216,8 @@ if TYPE_CHECKING:
     VLLM_TPU_MEGAKERNEL: str = ""
     TPU_SP_MIN_ROWS: int = 512
     TPU_SP_FP8_GATHER: bool = True
+    TPU_SMALL_ALL_REDUCE: bool = False
+    TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 128
 
 
 def env_with_choices(
@@ -669,6 +689,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # once the path is the default for these layers or is replaced by another
     # fused TP MoE path.
     "USE_MOE_TP_DECODE_KERNEL": env_bool("USE_MOE_TP_DECODE_KERNEL"),
+    # Experimental small-batch MoE (kernels/experimental/moe_lowtok) for EP
+    # calls of at most TPU_MOE_LOWTOK_MAX_TOKENS rows; the FP8 method also moves
+    # a plain softmax top-k router into it. Can be tiered with dense expert MoE
+    # when TPU_MOE_DENSE_EXPERT_THRESHOLD > TPU_MOE_LOWTOK_MAX_TOKENS.
+    "TPU_MOE_LOWTOK": env_bool("TPU_MOE_LOWTOK", default=True),
+    "TPU_MOE_LOWTOK_FROM_SCORES": env_bool("TPU_MOE_LOWTOK_FROM_SCORES", default=True),
+    "TPU_MOE_LOWTOK_IDS": env_bool("TPU_MOE_LOWTOK_IDS", default=True),
+    "TPU_MOE_LOWTOK_MAX_TOKENS": env_nonnegative_int("TPU_MOE_LOWTOK_MAX_TOKENS", 256),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
@@ -750,8 +778,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Explicit implementation selection also enables fused EP. When unset,
     # preserve the legacy enable flag and v2 behavior. Adaptive owns its
     # admission, automatically supports FP4 and never falls back to GMM.
+    # "v3" selects the fused expert-parallel kernel v3; with
+    # TPU_MOE_LOWTOK_MAX_TOKENS=256 and TPU_SP_MIN_ROWS=512, steps <= 256 run
+    # moe_lowtok and steps >= 512 run SP + fused EP v3.
     "MOE_FUSED_EP_KERNEL_IMPL": env_with_choices(
-        "MOE_FUSED_EP_KERNEL_IMPL", None, ["v2", "adaptive"]
+        "MOE_FUSED_EP_KERNEL_IMPL", None, ["v2", "adaptive", "v3"]
     ),
     # Opt in to NVFP4 W4A8 in fused EP MoE v2. Requires the fused EP switch
     # above; defaults off so enabling fused EP alone preserves NVFP4 W4A16.
@@ -797,10 +828,39 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_HASH_TABLE_ROW_MAJOR": env_bool(
         "TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False
     ),
+    # Small fused kernels (kernels/experimental), each off by default.
+    # Run a GDN layer's output gated RMS norm and its out_proj's per-token fp8
+    # quantization as one kernel. Needs per-channel fp8 out_proj weights.
+    "TPU_GDN_FUSED_NORM_QUANT": env_bool("TPU_GDN_FUSED_NORM_QUANT", default=True),
+    # Qwen3.5: compute the decoder input RMSNorm and the per-row FP8
+    # quantization feeding attention as one op (needs TPU_SP_FP8_GATHER; see
+    # models/vllm/qwen3_next_patch.py).
+    "TPU_FUSE_PRE_ATTN_NORM_QUANT": env_bool(
+        "TPU_FUSE_PRE_ATTN_NORM_QUANT", default=True
+    ),
+    # Qwen3.5: compute the post-attention RMSNorm, the FP8 router gate and the
+    # shared expert as one op ahead of the routed experts.
+    "TPU_FUSE_POST_ATTN_NORM_MOE": env_bool(
+        "TPU_FUSE_POST_ATTN_NORM_MOE", default=True
+    ),
+    "TPU_GDN_FUSED_NORM_QUANT_MIN_ROWS": env_nonnegative_int(
+        "TPU_GDN_FUSED_NORM_QUANT_MIN_ROWS", 16
+    ),
+    # Run the gated q split, q/k RMS norms and NeoX rope of Qwen3NextAttention
+    # as one kernel on token buckets of up to 64 rows.
+    "TPU_FUSED_QK_NORM_ROPE": env_bool("TPU_FUSED_QK_NORM_ROPE", default=True),
+    "TPU_FUSED_QK_NORM_ROPE_MIN_ROWS": env_nonnegative_int(
+        "TPU_FUSED_QK_NORM_ROPE_MIN_ROWS", 0
+    ),
+    # Run batched RPA in token buckets of up to 64 rows with half the chip's
+    # VMEM and a decode batch of min(8, max_num_seqs), at max_model_len <= 16k.
+    "TPU_RPA_DECODE_BATCHED": env_bool("TPU_RPA_DECODE_BATCHED"),
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",") if v.strip()
     ],
+    # Generate {2^k, 3 * 2^k} half-step token buckets from 8 up to budget.
+    "TPU_TOKEN_BUCKET_HALF_STEPS": env_bool("TPU_TOKEN_BUCKET_HALF_STEPS"),
     # Add linear token buckets above a quarter of the token budget, for
     # prompt-sized steps (platforms/tpu_platform.py _get_linear_token_paddings).
     "TPU_TOKEN_BUCKET_LINEAR": env_bool("TPU_TOKEN_BUCKET_LINEAR"),
@@ -908,6 +968,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # only takes effect on the grouped-matmul MoE path (the fused EP kernel
     # already carries fp8 on its own wire).
     "TPU_MOE_FP8_ALL_GATHER": env_bool("TPU_MOE_FP8_ALL_GATHER"),
+    # A JSON table giving, per backbone MoE layer, the global experts each
+    # expert-parallel rank holds (expert_placement.py); empty keeps the
+    # checkpoint's contiguous placement.
+    "TPU_EXPERT_PLACEMENT": lambda: os.getenv(
+        "TPU_EXPERT_PLACEMENT",
+        next(
+            (
+                cand
+                for rel in ("../..", "..")
+                for cand in (
+                    os.path.abspath(
+                        os.path.join(
+                            os.path.dirname(__file__),
+                            rel,
+                            "scripts",
+                            "vllm",
+                            "benchmark",
+                            "inferencex",
+                            "qwen3.5",
+                            "expert_placement_dp8_ep8_opt_copies128.json",
+                        )
+                    ),
+                )
+                if os.path.exists(cand)
+            ),
+            "",
+        ),
+    ),
     # 0 = the arithmetic device-order layout (the one every disaggregated
     # Raiden pair was verified with before #587; also the only option on a
     # torch_tpu older than 2026-08-13, which lacks the API).
@@ -1160,6 +1248,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_MEGAKERNEL": env_str("VLLM_TPU_MEGAKERNEL", ""),
     "TPU_SP_MIN_ROWS": lambda: int(os.getenv("TPU_SP_MIN_ROWS", "512")),
     "TPU_SP_FP8_GATHER": env_bool("TPU_SP_FP8_GATHER", default=True),
+    "TPU_SMALL_ALL_REDUCE": env_bool("TPU_SMALL_ALL_REDUCE", default=True),
+    "TPU_EXPERT_PLACEMENT_MTP": env_bool("TPU_EXPERT_PLACEMENT_MTP", default=True),
+    "TPU_SMALL_ALL_REDUCE_MAX_ROWS": env_nonnegative_int(
+        "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 128
+    ),
+    "TPU_ATTN_MOE_OVERLAP": env_bool("TPU_ATTN_MOE_OVERLAP", default=False),
+    "TPU_ATTN_MOE_OVERLAP_MIN_TOKENS": env_nonnegative_int(
+        "TPU_ATTN_MOE_OVERLAP_MIN_TOKENS", 64
+    ),
+    "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS": env_int("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", 64),
 }
 
 

@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Utility functions for quantized matmul kernel."""
+"""Weight quantization packing, padding, and scale reshape utilities for
+quantized matmul."""
 
 from collections.abc import Callable
 from typing import Any
@@ -310,9 +311,10 @@ def quantize_block(data, axis, target_dtype):
     dtype_max, dtype_min = get_max_min(target_dtype)
     scale = abs_max / dtype_max
     scale = jnp.where(scale == 0, 1.0, scale)
+    inv_scale = jnp.float32(1.0) / scale
 
     if jnp.issubdtype(target_dtype, jnp.floating):
-        data_q = (data / scale).clip(dtype_min, dtype_max).astype(target_dtype)
+        data_q = jnp.clip(data * inv_scale, dtype_min, dtype_max).astype(target_dtype)
     else:
-        data_q = jnp.round(data / scale).astype(target_dtype)
+        data_q = jnp.round(data * inv_scale).astype(target_dtype)
     return data_q, scale

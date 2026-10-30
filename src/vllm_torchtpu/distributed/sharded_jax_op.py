@@ -132,6 +132,29 @@ def _build_sharded_callable_cls():
 _SHARDED_CALLABLE_CLS = None
 
 
+def _stock_takes_output_specs() -> bool:
+    """Whether the installed ``JaxCallable`` no longer builds placeholders the
+    way the derivation patches, but sizes them from its own
+    ``output_partition_specs`` instead."""
+    src = inspect.getsource(pallas_impl.JaxCallable.__call__)
+    params = inspect.signature(pallas_impl.JaxCallable.__init__).parameters
+    return _STOCK_PLACEHOLDER_LINE not in src and "output_partition_specs" in params
+
+
+def _callable_cls_and_kwargs(output_partition_specs) -> tuple[type, dict]:
+    """The ``JaxCallable`` class to build and its extra constructor kwargs."""
+    global _SHARDED_CALLABLE_CLS
+    if _stock_takes_output_specs():
+        # One spec per output leaf: stock zips them with the out avals.
+        specs = jax.tree.leaves(
+            output_partition_specs, is_leaf=lambda s: isinstance(s, PartitionSpec)
+        )
+        return pallas_impl.JaxCallable, {"output_partition_specs": specs}
+    if _SHARDED_CALLABLE_CLS is None:
+        _SHARDED_CALLABLE_CLS = _build_sharded_callable_cls()
+    return _SHARDED_CALLABLE_CLS, {}
+
+
 def sharded_jax_op(
     name: str,
     fn: Callable[..., object],
@@ -140,6 +163,7 @@ def sharded_jax_op(
     input_partition_specs: Sequence[PartitionSpec],
     output_partition_specs: Any,
     donate_argnums: Sequence[int] | None = None,
+    fake: Callable[..., object] | None = None,
 ):
     """A torch custom op for ``fn`` run as an SPMD program over ``mesh``.
 
@@ -154,10 +178,50 @@ def sharded_jax_op(
     here, but a one-tuple gives the op the schema ``-> ((Tensor))``, and torch
     ``guard_int``s every symbolic input dimension of an op with that schema, so
     a caller under ``torch.compile`` loses its dynamic batch dimension.
+
+    ``fake`` replaces the default fake implementation, which exports ``fn`` at
+    the operands' concrete shapes and so specializes a dynamic dimension of the
+    caller's trace. An op whose output shape follows a dynamic input dimension
+    passes one written in terms of the torch operands' shapes.
     """
-    global _SHARDED_CALLABLE_CLS
-    if _SHARDED_CALLABLE_CLS is None:
-        _SHARDED_CALLABLE_CLS = _build_sharded_callable_cls()
+    wrapped_fn = sharded_jax_callable(
+        name,
+        fn,
+        mesh=mesh,
+        input_partition_specs=input_partition_specs,
+        output_partition_specs=output_partition_specs,
+        donate_argnums=donate_argnums,
+    )
+    input_partition_specs = tuple(input_partition_specs)
+    op = torch.library.custom_op(name, wrapped_fn, mutates_args=())
+
+    def fake_fn(*args, **kwargs):
+        jax_args = pallas_impl.jax_placeholders(
+            args, mesh=mesh, partition_specs=input_partition_specs
+        )
+        with jax._src.config.export_ignore_forward_compatibility(True):
+            lowered = wrapped_fn.exported(*jax_args, **kwargs)
+        return lowered.out_tree.unflatten(_sharded_output_placeholders(lowered, mesh))
+
+    op.register_fake(fake if fake is not None else fake_fn)
+    return op
+
+
+def sharded_jax_callable(
+    name: str,
+    fn: Callable[..., object],
+    *,
+    mesh: jax.sharding.Mesh,
+    input_partition_specs: Sequence[PartitionSpec],
+    output_partition_specs: Any,
+    donate_argnums: Sequence[int] | None = None,
+):
+    """The callable behind ``sharded_jax_op``, not registered as a torch op.
+
+    Call it with this rank's torch tensors, positionally. For a caller whose
+    operand count exceeds the dispatcher's 64-argument schema limit, which
+    wraps it in its own custom op taking ``list[Tensor]`` arguments.
+    """
     if "::" not in name or len(name.split("::")) != 2:
         raise ValueError(f"Op name {name} must be 'namespace::op', with one '::'.")
 
@@ -191,7 +255,8 @@ def sharded_jax_op(
             "output_partition_specs": str(output_partition_specs),
         },
     )
-    wrapped_fn = _SHARDED_CALLABLE_CLS(
+    callable_cls, callable_kwargs = _callable_cls_and_kwargs(output_partition_specs)
+    wrapped_fn = callable_cls(
         name=name,
         jit_fn=jit_fn,
         trace_key=trace_key,
@@ -199,17 +264,6 @@ def sharded_jax_op(
         input_partition_specs=input_partition_specs,
         static_argnums=static_argnums,
         donate_argnums=donate_argnums,
+        **callable_kwargs,
     )
-
-    op = torch.library.custom_op(name, wrapped_fn, mutates_args=())
-
-    def fake_fn(*args, **kwargs):
-        jax_args = pallas_impl.jax_placeholders(
-            args, mesh=mesh, partition_specs=input_partition_specs
-        )
-        with jax._src.config.export_ignore_forward_compatibility(True):
-            lowered = wrapped_fn.exported(*jax_args, **kwargs)
-        return lowered.out_tree.unflatten(_sharded_output_placeholders(lowered, mesh))
-
-    op.register_fake(fake_fn)
-    return op
+    return wrapped_fn

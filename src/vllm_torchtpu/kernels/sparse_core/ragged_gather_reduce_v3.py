@@ -11,14 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Experimental destination-major SparseCore gather-reduce.
-
-The v2 kernel streams valid routes and scatters FP32 partial rows.  This
-prototype instead assigns each core a contiguous block of destination tokens.
-Valid routes are compacted across each block, gathered exactly once, scattered
-into FP32 VMEM with SparseCore vector scatter-add, and emitted as full 16-row
-BF16 tiles.
-"""
+"""Ragged token gather and weighted reduction kernels for MoE dispatch and combine."""
 
 import functools
 
@@ -398,28 +391,37 @@ def ragged_gather_reduce(
     )
     destination_blocks = jnp.broadcast_to(destination_template, indices_blocks.shape)
 
-    # A stable boolean partition keeps routes for each destination adjacent
-    # while placing the exact valid prefix first in every destination block.
-    route_order = jnp.argsort(~valid_blocks, axis=1, stable=True)
-    compact_valid = jnp.take_along_axis(valid_blocks, route_order, axis=1)
-    route_indices = jnp.take_along_axis(indices_blocks, route_order, axis=1)
-    route_destinations = jnp.take_along_axis(destination_blocks, route_order, axis=1)
-    weights_blocks = weights_2d.reshape(num_blocks, metadata_block_size)
-    route_weights = jnp.take_along_axis(weights_blocks, route_order, axis=1)
-    route_indices = jnp.where(compact_valid, route_indices, 0).astype(jnp.int32)
-    route_destinations = jnp.where(compact_valid, route_destinations, 0).astype(
-        jnp.int32
+    # Pre-pack `route_metadata` and `route_weights` before sorting and compact
+    # both in a single variadic `jax.lax.sort` with unique integer keys,
+    # eliminating all four dynamic 2D `jnp.take_along_axis` gathers.
+    raw_meta = jnp.where(
+        valid_blocks,
+        jnp.bitwise_or(
+            indices_blocks.astype(jnp.int32),
+            jnp.left_shift(destination_blocks, _ROUTE_INDEX_BITS),
+        ),
+        0,
     )
-    route_metadata = jnp.bitwise_or(
-        route_indices,
-        jnp.left_shift(route_destinations, _ROUTE_INDEX_BITS),
-    ).reshape(-1)
-    route_weights = jnp.where(compact_valid, route_weights, 0).reshape(-1)
-    route_weights = route_weights.astype(jnp.float32)
+    raw_weights = jnp.where(
+        valid_blocks,
+        weights_2d.reshape(num_blocks, metadata_block_size).astype(jnp.float32),
+        0.0,
+    )
+    iota_col = jax.lax.broadcasted_iota(jnp.int32, valid_blocks.shape, 1)
+    sort_key = jnp.where(valid_blocks, iota_col, iota_col + metadata_block_size)
+    _, meta_sorted, weights_sorted = jax.lax.sort(
+        [sort_key, raw_meta, raw_weights],
+        dimension=1,
+        num_keys=1,
+        is_stable=False,
+    )
+    route_metadata = meta_sorted.reshape(-1)
+    route_weights = weights_sorted.reshape(-1)
     route_counts = jnp.sum(valid_blocks, axis=1, dtype=jnp.int32)
-    paired_destinations = route_destinations[:, : 2 * _TOKEN_BLOCK].reshape(
-        num_blocks, _TOKEN_BLOCK, 2
-    )
+    paired_destinations = jnp.bitwise_right_shift(
+        meta_sorted[:, : 2 * _TOKEN_BLOCK],
+        _ROUTE_INDEX_BITS,
+    ).reshape(num_blocks, _TOKEN_BLOCK, 2)
     fixed_two_route_blocks = jnp.logical_and(
         route_counts == 2 * _TOKEN_BLOCK,
         jnp.all(paired_destinations[:, :, 0] == paired_destinations[:, :, 1], axis=1),

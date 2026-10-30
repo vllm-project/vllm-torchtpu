@@ -79,7 +79,8 @@ def _predictor_forward(
     return hidden_states
 
 
-cast(Any, upstream.Qwen3_5MultiTokenPredictor).forward = _predictor_forward
+if upstream.Qwen3_5MultiTokenPredictor.forward is UPSTREAM_PREDICTOR_FORWARD:
+    cast(Any, upstream.Qwen3_5MultiTokenPredictor).forward = _predictor_forward
 
 
 class Qwen3_5MTP(upstream.Qwen3_5MTP):

@@ -116,7 +116,9 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_config
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.layers.adapter import (
+    gated_norm_quant_op,
     sequence_parallel,
+    small_all_reduce_op,
     token_padding,
 )
 from vllm_torchtpu.layers.adapter.attention import (
@@ -6802,6 +6804,8 @@ class TPUModelRunner(GPUModelRunner):
         self.model = model
         if self.is_pooling_model:
             self._resolve_static_pooler()
+        if envs.TPU_GDN_FUSED_NORM_QUANT:
+            gated_norm_quant_op.install(model)
         if self.parallel_config.pipeline_parallel_size > 1:
             # A sparse model's layers share one top-k index table, and under a
             # pipeline the layer that writes it and the layers that reuse it
@@ -6848,15 +6852,61 @@ class TPUModelRunner(GPUModelRunner):
                 # precompiling the draft buckets.
                 self._relayout_tables(draft_model, skip_modules=target_modules)
 
+        from vllm_torchtpu.layers.adapter.quantization import moe_lowtok_scores
+
+        moe_lowtok_scores.log_summary()
+        logger.info(
+            "[TPU Model Runner Opt Config] "
+            "TPU_MOE_LOWTOK=%s (IDS=%s, MAX_TOKENS=%d) | "
+            "TPU_MOE_DENSE_EXPERT_THRESHOLD=%d | "
+            "TPU_MOE_ROUTER_TOPK=%s | TPU_MOE_SKIP_PADDED_TOKENS=%s | "
+            "TPU_SMALL_ALL_REDUCE=%s (MAX_ROWS=%d) | "
+            "TPU_GDN_FUSED_NORM_QUANT=%s (MIN_ROWS=%d) | "
+            "TPU_FUSED_QK_NORM_ROPE=%s (MIN_ROWS=%d) | "
+            "TPU_ROPE_CACHE_TRUNCATE=%s (ROW_MAJOR=%s) | "
+            "TPU_GREEDY_TOP_TOKENS=%s | TPU_SAMPLER_TOPK_CANDIDATES=%d | "
+            "VLLM_TPU_FUSED_DRAFT_LOOP=%s | "
+            "TPU_ATTN_MOE_OVERLAP=%s (MIN_TOKENS=%d) | "
+            "TPU_EXPERT_PLACEMENT=%r",
+            envs.TPU_MOE_LOWTOK,
+            envs.TPU_MOE_LOWTOK_IDS,
+            envs.TPU_MOE_LOWTOK_MAX_TOKENS,
+            envs.TPU_MOE_DENSE_EXPERT_THRESHOLD,
+            envs.TPU_MOE_ROUTER_TOPK,
+            envs.TPU_MOE_SKIP_PADDED_TOKENS,
+            envs.TPU_SMALL_ALL_REDUCE,
+            envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS,
+            envs.TPU_GDN_FUSED_NORM_QUANT,
+            envs.TPU_GDN_FUSED_NORM_QUANT_MIN_ROWS,
+            envs.TPU_FUSED_QK_NORM_ROPE,
+            envs.TPU_FUSED_QK_NORM_ROPE_MIN_ROWS,
+            envs.TPU_ROPE_CACHE_TRUNCATE,
+            envs.TPU_ROPE_CACHE_ROW_MAJOR,
+            envs.TPU_GREEDY_TOP_TOKENS,
+            envs.TPU_SAMPLER_TOPK_CANDIDATES,
+            envs.VLLM_TPU_FUSED_DRAFT_LOOP,
+            envs.TPU_ATTN_MOE_OVERLAP,
+            envs.TPU_ATTN_MOE_OVERLAP_MIN_TOKENS,
+            envs.TPU_EXPERT_PLACEMENT,
+        )
+
         # After the drafter, so its MTP layer is armed too.
         if envs.FUSED_MOE_DECODE_KERNEL:
             from vllm_torchtpu.layers.adapter.fused_moe_decode import arm_runner_models
 
             arm_runner_models(self)
 
+        # After the drafter: an MTP draft re-reads the target checkpoint.
+        from vllm_torchtpu.model_loader_patches import evict_loaded_weights_page_cache
+
+        evict_loaded_weights_page_cache()
+
         # Ensure attention custom ops exist before any compile/inference path,
         self._initialize_pallas_kernels()
         self._megakernel = megakernel_runtime.maybe_create(self)
+        from vllm_torchtpu.models.vllm.qwen3_next_patch import setup_model_fused_gate_se
+
+        setup_model_fused_gate_se(self.model)
 
         from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
             VllmCompressedTensorsW4ANMxfp4MoEMethod,
@@ -6893,6 +6943,7 @@ class TPUModelRunner(GPUModelRunner):
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()
         self._initialize_quantization_kernels()
+        small_all_reduce_op.prebuild()
 
     def _initialize_quantization_kernels(self):
         from vllm_torchtpu.layers.adapter.linear_common import (

@@ -145,6 +145,28 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
         x_2d = x.reshape(-1, x.shape[-1])
         return torch.addmm(bias, x_2d, weight).reshape(orig_out_shape)
 
+    def apply_prequant(
+        self,
+        layer: torch.nn.Module,
+        x_q: torch.Tensor,
+        x_s: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply unquantized linear to pre-quantized FP8 rows `(x_q, x_s)` by
+        contracting `x_q.to(weight.dtype) @ weight` first and scaling the
+        `[m, n_out]` result by `x_s`, avoiding materializing a full `[m, k]`
+        float32/bfloat16 dequantized activation buffer."""
+        weight = layer.weight
+        x_cast = x_q.to(weight.dtype)
+        if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
+            out = torch.nn.functional.linear(x_cast, weight)
+        else:
+            out = torch.matmul(x_cast, weight)
+        out_f32 = out.to(torch.float32) * x_s
+        if bias is not None:
+            out_f32 = out_f32 + bias.to(torch.float32)
+        return out_f32.to(weight.dtype)
+
 
 @register_quantization_config(get_tpu_quant_method(UNQUANTIZED))
 class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):

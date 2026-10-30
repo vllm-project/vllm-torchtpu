@@ -379,26 +379,28 @@ def test_sequence_parallel_moe_admission(monkeypatch):
         del ParallelConfig._tpu_no_sp_moe_patch
     _patch_sequence_parallel_moe_admission()
 
+    # A Mock answers every attribute, so the drafter opt-out is set explicitly.
+    def sp_cfg(ep, tp, dp, disable_sp_moe=False):
+        return Mock(
+            enable_expert_parallel=ep,
+            tensor_parallel_size=tp,
+            data_parallel_size=dp,
+            _tpu_disable_sp_moe=disable_sp_moe,
+        )
+
     # EP=False, TP=8, DP=1 -> False
-    cfg_no_ep = Mock(
-        enable_expert_parallel=False, tensor_parallel_size=8, data_parallel_size=1
-    )
-    assert not ParallelConfig.use_sequence_parallel_moe.fget(cfg_no_ep)
+    assert not ParallelConfig.use_sequence_parallel_moe.fget(sp_cfg(False, 8, 1))
 
     # EP=True, TP=1, DP=1 -> False
-    cfg_tp1 = Mock(
-        enable_expert_parallel=True, tensor_parallel_size=1, data_parallel_size=1
-    )
-    assert not ParallelConfig.use_sequence_parallel_moe.fget(cfg_tp1)
+    assert not ParallelConfig.use_sequence_parallel_moe.fget(sp_cfg(True, 1, 1))
 
     # EP=True, TP=8, DP=2 -> False
-    cfg_dp2 = Mock(
-        enable_expert_parallel=True, tensor_parallel_size=8, data_parallel_size=2
-    )
-    assert not ParallelConfig.use_sequence_parallel_moe.fget(cfg_dp2)
+    assert not ParallelConfig.use_sequence_parallel_moe.fget(sp_cfg(True, 8, 2))
 
     # EP=True, TP=8, DP=1 -> True
-    cfg_sp = Mock(
-        enable_expert_parallel=True, tensor_parallel_size=8, data_parallel_size=1
+    assert ParallelConfig.use_sequence_parallel_moe.fget(sp_cfg(True, 8, 1))
+
+    # The MTP drafter's ParallelConfig copy opts out -> False
+    assert not ParallelConfig.use_sequence_parallel_moe.fget(
+        sp_cfg(True, 8, 1, disable_sp_moe=True)
     )
-    assert ParallelConfig.use_sequence_parallel_moe.fget(cfg_sp)

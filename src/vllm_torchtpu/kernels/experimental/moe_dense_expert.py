@@ -11,12 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Experimental small-batch FP8 MoE without token permutation.
+"""Fused dense/shared expert MLP Pallas kernel for MoE layers on TPU.
 
-Each nonempty local expert is visited once. Its two weights are DMA'd once,
-all tokens are evaluated in their original order, and weighted outputs are
-accumulated in FP32 VMEM. Neither intermediate activations nor per-expert
-outputs are written to HBM. The caller still owns top-k and EP collectives.
+Computes gate/up projections, SiLU gating, and down projection for the shared
+expert branch with VMEM-streamed weight tiles.
 """
 
 import functools
@@ -68,7 +66,7 @@ def can_use_dense_expert(
     e, i, out = w2.shape
     if min(m, h, i, e) <= 0:
         return False
-    if m % 16 or h % 512 or i % 128:
+    if m % 8 or h % 512 or i % 128:
         return False
     if out != h or w1.shape != (e, h, 2 * i):
         return False
@@ -243,16 +241,34 @@ def _kernel(
     out_ref[...] = owner_ref[...].astype(jnp.bfloat16)
 
 
-@jax.jit
-def dense_expert_moe(hidden, w1, w2, s1, s2, topk_weights, local_ids):
+@functools.partial(jax.jit, static_argnames=("num_primary_experts",))
+def dense_expert_moe(
+    hidden,
+    w1,
+    w2,
+    s1,
+    s2,
+    topk_weights,
+    local_ids,
+    *,
+    num_primary_experts: int | None = None,
+):
     """Local routed contribution, same [tokens, hidden]/BF16 output as GMM.
 
     IDs outside this rank must be -1. Scales use [E,1,1,N]. Callers must
     first check can_use_dense_expert. Shared experts and collectives stay
     outside this kernel, exactly as for fused_moe_func's standard path.
     """
-    m, h = hidden.shape
+    m_orig, h = hidden.shape
+    pad_m = (-m_orig) % 16
+    if pad_m:
+        hidden = jnp.pad(hidden, ((0, pad_m), (0, 0)))
+        topk_weights = jnp.pad(topk_weights, ((0, pad_m), (0, 0)))
+        local_ids = jnp.pad(local_ids, ((0, pad_m), (0, 0)), constant_values=-1)
+    m = m_orig + pad_m
     experts, i, _ = w2.shape
+    if num_primary_experts is not None:
+        experts = min(experts, num_primary_experts)
     vmem_capacity_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
     num_buffers = _select_expert_buffers(m, h, i, experts, vmem_capacity_bytes)
     # Dense route coefficients are only [tokens, local experts], not expert
@@ -267,7 +283,7 @@ def dense_expert_moe(hidden, w1, w2, s1, s2, topk_weights, local_ids):
         coeff = coeff + selected.astype(jnp.float32) * weights[:, route : route + 1]
     active = jnp.any(coeff != 0, axis=0).astype(jnp.int32)
     coeff = jnp.pad(coeff, ((0, 0), (0, (-experts) % 128)))
-    return pl.pallas_call(
+    out = pl.pallas_call(
         functools.partial(
             _kernel, m=m, h=h, i=i, experts=experts, num_buffers=num_buffers
         ),
@@ -298,3 +314,4 @@ def dense_expert_moe(hidden, w1, w2, s1, s2, topk_weights, local_ids):
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=vmem_capacity_bytes),
         name=(f"dense_expert_moe-e_{experts}-m_{m}-h_{h}-i_{i}-buffers_{num_buffers}"),
     )(active, hidden, coeff, w1, w2, s1, s2)
+    return out[:m_orig]

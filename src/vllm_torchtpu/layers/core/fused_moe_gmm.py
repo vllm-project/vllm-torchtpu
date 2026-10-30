@@ -23,6 +23,13 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     can_use_dense_expert,
     dense_expert_moe,
 )
+from vllm_torchtpu.kernels.experimental.moe_lowtok import (
+    can_use_moe_lowtok,
+    moe_lowtok,
+)
+from vllm_torchtpu.kernels.experimental.moe_lowtok import (
+    routing_table as moe_lowtok_routing_table,
+)
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
@@ -68,6 +75,9 @@ _SINGLE_SORT = envs.TPU_MOE_SINGLE_SORT
 # Above 2,048 routed rows, the inverse-permutation scatter costs more than
 # the two sorts it replaces when `ragged_permute` is off (e.g. non-EP prefill).
 _SINGLE_SORT_MAX_ROWS = 2048
+_MOE_LOWTOK = envs.TPU_MOE_LOWTOK
+_MOE_LOWTOK_IDS = envs.TPU_MOE_LOWTOK_IDS
+_MOE_LOWTOK_MAX_TOKENS = envs.TPU_MOE_LOWTOK_MAX_TOKENS
 
 
 def resolve_onehot_permute_threshold() -> int:
@@ -251,21 +261,17 @@ def _counting_sort_positions(
     onehot = jax.nn.one_hot(
         sort_keys.reshape(-1, block), num_buckets, dtype=jnp.bfloat16
     )
-    # The histogram rides along as one more row of the contraction the rank
-    # matmul already performs. Exact: 0/1 summands, at most `block` of them.
-    lower = jnp.concatenate(
-        [
-            jnp.ones((1, block), jnp.bfloat16),
-            jnp.tril(jnp.ones((block, block), jnp.bfloat16), -1),
-        ],
-        axis=0,
-    )
-    both = jnp.einsum("ij,bje->bie", lower, onehot, preferred_element_type=jnp.float32)
-    hist = both[:, 0, :]
-    rank = both[:, 1:, :]
+    # An inclusive lower-triangular (block, block) contraction avoids padding
+    # `lower` to (block + 1, block) (which spills an extra MXU sublane tile) and
+    # avoids the unaligned `[:, 1:, :]` slice; the block histogram is simply the
+    # last row `cum[:, -1, :]`, and subtracting 1.0 in `base` converts inclusive
+    # 1-based intra-block counts into 0-based ranks.
+    lower = jnp.tril(jnp.ones((block, block), jnp.bfloat16), 0)
+    cum = jnp.einsum("ij,bje->bie", lower, onehot, preferred_element_type=jnp.float32)
+    hist = cum[:, -1, :]
     counts = hist.sum(axis=0)
-    base = (jnp.cumsum(hist, axis=0) - hist) + (jnp.cumsum(counts) - counts)
-    pos = ((base[:, None, :] + rank) * onehot).sum(axis=2)
+    base = (jnp.cumsum(hist, axis=0) - hist) + (jnp.cumsum(counts) - counts) - 1.0
+    pos = ((base[:, None, :] + cum) * onehot).sum(axis=2)
     return pos.reshape(-1)[:m].astype(jnp.int32), counts.astype(jnp.int32)
 
 
@@ -348,7 +354,7 @@ def prepare_routed_gmm_inputs(
     )
     token_indices_sorted: jax.Array | None = None
 
-    if argsort_revert_indices is not None:
+    if ragged_permute:
         group_sizes_local = bucket_counts[:local_num_experts]
     else:
         if single_sort:
@@ -587,6 +593,7 @@ def moe_gmm(
         "onehot_moe_permute_threshold",
         "rhs_quant_dtype",
         "skip_padded_tokens",
+        "num_primary_experts",
     ),
 )
 def fused_moe_func(
@@ -607,6 +614,7 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    num_primary_experts: int | None = None,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -626,6 +634,13 @@ def fused_moe_func(
     weights. Currently, only INT4 logical weights packed inside INT32 or UINT32 carrier
     containers are supported. Weights must be packed along the contracting dimension
     (K-axis) in LSB-first order.
+
+    ``num_primary_experts`` bounds the shard's local interval when the weight
+    tensors hold more slots than the shard owns (an expert placement with copy
+    slots after the primaries, ``expert_placement``): without it the interval
+    is every local slot, and the next shard's first ids would be taken as
+    local and summed a second time. ``None`` (the default) is the full slot
+    count, the behaviour without a placement.
     """
 
     # Convert 3D scale [experts, blocks, N] to 4D [experts, blocks, 1, N]
@@ -660,11 +675,40 @@ def fused_moe_func(
         hidden_states = jnp.where(jnp.isfinite(hidden_states), hidden_states, 0)
         topk_weights = jnp.where(jnp.isfinite(topk_weights), topk_weights, 0)
 
+    owned = w1.shape[0]
     if use_ep and experts_start is not None:
+        owned = w1.shape[0] if num_primary_experts is None else num_primary_experts
+        if not 0 < owned <= w1.shape[0]:
+            raise ValueError("num_primary_experts must fit the local weight slots")
         local_ids = topk_ids - experts_start
-        valid = (local_ids >= 0) & (local_ids < w1.shape[0])
+        valid = (local_ids >= 0) & (local_ids < owned)
         topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
+
+    if (
+        _MOE_LOWTOK
+        and _MOE_LOWTOK_IDS
+        and use_ep
+        and experts_start is not None
+        and 0 < num_tokens <= _MOE_LOWTOK_MAX_TOKENS
+        and can_use_moe_lowtok(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            w1_bias,
+            w2_bias,
+            activation=activation,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
+    ):
+        logger.info_once(
+            "Selected experimental small-batch MoE (max tokens %d)",
+            _MOE_LOWTOK_MAX_TOKENS,
+        )
+        route = moe_lowtok_routing_table(topk_ids, topk_weights, owned)
+        return moe_lowtok(hidden_states, route, w1, w1_scale, w2, w2_scale)
 
     # Decode services also compile large prefill buckets. Apply the token
     # threshold before kernel admission so those buckets retain routed GMM.
@@ -682,7 +726,14 @@ def fused_moe_func(
     ):
         logger.info_once("Selected experimental dense-expert decode MoE")
         return dense_expert_moe(
-            hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            topk_weights,
+            topk_ids,
+            num_primary_experts=owned,
         )
 
     (
@@ -696,7 +747,7 @@ def fused_moe_func(
         hidden_states,
         topk_ids,
         topk_weights,
-        local_num_experts=w1.shape[0],
+        local_num_experts=owned,
         topk=topk,
         use_ep=use_ep,
         use_sparse_core=use_sparse_core,

@@ -127,6 +127,7 @@ PATCHES = (
         _ACTIVE,
     ),
     Patch("vllm_torchtpu.model_loader_patches:patch_moe_expert_write_staging", _ACTIVE),
+    Patch("vllm_torchtpu.expert_placement:install_model_patches", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_vocab_parallel_embedding", _ACTIVE),
     Patch(
         "vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings",
@@ -137,6 +138,11 @@ PATCHES = (
     # Out-of-tree FP32 rotary embedding (CUDA numerics). Must be registered
     # before any RotaryEmbedding is constructed at model load.
     Patch("vllm_torchtpu.layers.adapter.rotary_embedding", _ACTIVE),
+    # Attention layers.
+    Patch(
+        "vllm_torchtpu.layers.adapter.fused_qk_norm_rope:install_qk_norm_rope_patch",
+        _ACTIVE,
+    ),
     # Platform runtime configuration.
     Patch(
         "vllm_torchtpu.platforms.tpu_platform:_configure_torchtpu_eager_mode", _ACTIVE
@@ -158,6 +164,7 @@ PATCHES = (
     Patch(
         "vllm_torchtpu.models.vllm.qwen3_next_patch:maybe_patch_qwen3_next",
         ("platform_activation", "model_load"),
+        refresh="vllm_torchtpu.models.vllm.qwen3_next_patch:maybe_patch_qwen3_next",
     ),
     Patch(
         "vllm_torchtpu.models.vllm.qwen2_patch:maybe_patch_qwen2",
