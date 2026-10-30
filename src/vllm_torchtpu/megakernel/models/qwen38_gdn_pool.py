@@ -23,6 +23,11 @@ the kernel block size `kb` (128 or 512 in served configs).
 whether it has a prior state (0 = start from zero). Bytes are reinterpreted
 with the same typed view as the model's own GDN kernel (`ref.bitcast` to f32,
 row-major). Checkpoints are still returned as `conv_ckpt` / `rec_ckpt`.
+
+With an f32 recurrent state (`VLLM_TPU_MK_GDN_REC_F32=1`) on the whole-state path
+the gather writes each request's state straight into the block's `recb` instead
+of through `pg_rec`: an f32 `pg_rec` (NS * 384 KiB) does not fit beside the f32
+`recb` at b32.
 """
 
 from __future__ import annotations
@@ -35,7 +40,9 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from ..exec_spec import ExecSpec
+from ..blocks.gdn.params import GDNParams
 from ..ops import BF16, F32, I32, REC, rup
+from ..pool.config import cache_exec
 from ..spec import ExtraInput, ScratchReq, StateDecl
 from .qwen38 import Qwen38GDN
 
@@ -46,6 +53,11 @@ MANAGER_ROWS = 512  # pool rows (tokens) per manager block
 SSM_ROWS = 128  # pool rows per staged recurrent-state chunk
 SSM_BLOCKS = 3  # chunks holding the recurrent state (rows 0 .. 383)
 CONV_ROWS = 16  # pool rows holding the conv history (rounded to a power of two)
+
+
+def _gather_into_recb(gp: GDNParams, ex: ExecSpec) -> bool:
+    """Gather pool states straight into `recb` (f32 state, whole-state path)."""
+    return REC == F32 and not gp.GCH and not cache_exec(ex).FUSED
 
 
 def pool_rows(pool: Any, m: Any, row: int, n: int) -> Any:
@@ -109,9 +121,10 @@ class Qwen38PoolGDN(Qwen38GDN):
             scr[f"pg_craw{b}"] = pltpu.VMEM((CONV_ROWS, 1, 4, 256), f8)
         scr.update(
             pg_sem=pltpu.SemaphoreType.DMA((2, SSM_BLOCKS + 1)),
-            pg_rec=pltpu.VMEM((ex.NS * lay.vh, lay.KD, lay.VD), REC),
             pg_conv=pltpu.VMEM((ex.NS, rup(3 + ex.T, 8), lay.QKV), F32),
         )
+        if not _gather_into_recb(plan.block_params[self.name], ex):
+            scr["pg_rec"] = pltpu.VMEM((ex.NS * lay.vh, lay.KD, lay.VD), REC)
         return scr
 
     def _copies(self, ctx: Any, o: Any, s: int, buf: int) -> list[Any]:
@@ -134,13 +147,31 @@ class Qwen38PoolGDN(Qwen38GDN):
         )
         return cps
 
-    def _gather(self, ctx: Any, o: Any) -> None:
-        """Layer `o`'s pool states -> `pg_rec` (`REC`) / `pg_conv` (f32 history rows)."""
+    def _gather(self, ctx: Any, o: Any, direct: bool = False) -> None:
+        """Layer `o`'s pool states -> `pg_rec` (`REC`) / `pg_conv` (f32 history rows).
+
+        `direct`: the states go to each request's first `recb` row group instead
+        (the slot `rec_in` would copy them to), once the previous GDN layer's
+        `recb` write-back has drained; `gdn_in` then skips both."""
         ex, scr = ctx.ex, ctx.scr
         lay = self.lin_in_layout(ctx.g, ex)
         vh, KD, VD, QKV = lay.vh, lay.KD, lay.VD, lay.QKV
         NS = ex.NS
         interp = bool(ex.interpret)
+        if direct:
+            rec_dst, rec_stride = scr["recb"], (ex.T if ex.VER else 1) * vh
+            if "gdn_state" not in ctx.skip:
+
+                @pl.when(o > 0)
+                def _():
+                    pltpu.make_async_copy(
+                        rec_dst,
+                        ctx.O["rec_ckpt" if ex.VER else "rec"].at[0],
+                        scr["st_sem"].at[3],
+                    ).wait()
+
+        else:
+            rec_dst, rec_stride = scr["pg_rec"], vh
         scr["pg_conv"][...] = jnp.zeros(scr["pg_conv"].shape, F32)
         pending = self._copies(ctx, o, 0, 0)
         for c in pending:
@@ -160,7 +191,7 @@ class Qwen38PoolGDN(Qwen38GDN):
                 [_typed_f32(scr[f"pg_raw{buf}{j}"], interp, VD) for j in range(SSM_BLOCKS)],
                 axis=0,
             )[: vh * KD].reshape(vh, KD, VD)
-            scr["pg_rec"][s * vh : (s + 1) * vh] = jnp.where(keep, ssm, 0.0).astype(REC)
+            rec_dst[s * rec_stride : s * rec_stride + vh] = jnp.where(keep, ssm, 0.0).astype(REC)
             crow = _typed_f32(scr[f"pg_craw{buf}"], interp, 256)  # [16, 256]
             per = QKV // 256
             for r in range(3):
@@ -173,9 +204,14 @@ class Qwen38PoolGDN(Qwen38GDN):
 
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
         o = ctx.stream.sp.block_ord(l, self.name)
+        direct = _gather_into_recb(ctx.block_params(self.name), ctx.ex)
         with ctx.sc("gdn_pool_gather"):
-            self._gather(ctx, o)
-        st = {**ctx.ST, "conv": _LayerView(ctx.scr["pg_conv"]), "rec": _LayerView(ctx.scr["pg_rec"])}
+            self._gather(ctx, o, direct)
+        st = {**ctx.ST, "conv": _LayerView(ctx.scr["pg_conv"])}
+        if direct:
+            st["rec_in_recb"] = True
+        else:
+            st["rec"] = _LayerView(ctx.scr["pg_rec"])
         return super().emit(dataclasses.replace(ctx, ST=st), l, slot)
 
     def host_update_states(self, g, ex, pos, states, raw_outputs):
