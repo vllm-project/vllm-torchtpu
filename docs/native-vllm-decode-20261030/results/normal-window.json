@@ -1,0 +1,57 @@
+{
+  "workload": {
+    "input_tokens": 131072,
+    "generation_cap": 8192,
+    "measurement_min_output_tokens_per_request": 1024,
+    "global_concurrency": 96,
+    "per_dp_concurrency": 12,
+    "mtp_k": 3,
+    "temperature": 0,
+    "load_format": "dummy",
+    "moe": "native",
+    "entrypoint": "vllm serve"
+  },
+  "steady": {
+    "seconds": 114.06441378593445,
+    "tokens": 100129,
+    "tokens_per_second": 877.8285591149652,
+    "mean_request_tpot_ms": 109.36076288698845,
+    "amortized_tpot_ms": 109.36076185170836,
+    "min_request_tokens": 1043,
+    "max_request_tokens": 1044
+  },
+  "context_at_window_start": {
+    "min": 131128,
+    "max": 132079
+  },
+  "intentional_stop_after_window": true,
+  "coordinator_audit": {
+    "all8_dp_running12_waiting0": true,
+    "samples": 23,
+    "first_time": 1793354177.2200193,
+    "last_time": 1793354287.3301375,
+    "running_counts": {
+      "[12, 12, 12, 12, 12, 12, 12, 12]": 23
+    },
+    "waiting_counts": {
+      "[0, 0, 0, 0, 0, 0, 0, 0]": 23
+    },
+    "kv_usage_min": 0.7162162162162162,
+    "kv_usage_max": 0.7234927234927235
+  },
+  "request_audit": {
+    "requests": 96,
+    "dp_counts": {
+      "0": 12,
+      "1": 12,
+      "2": 12,
+      "3": 12,
+      "4": 12,
+      "5": 12,
+      "6": 12,
+      "7": 12
+    },
+    "all_intentionally_stopped": true,
+    "errors": []
+  }
+}

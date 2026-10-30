@@ -1,0 +1,51 @@
+{
+  "parameters": {
+    "stage": "synthetic-c12-r1",
+    "per_dp": 12,
+    "slot": 0,
+    "input": 131072,
+    "output": 1024,
+    "arrival_interval": 0.25
+  },
+  "elapsed_seconds": 120.10353966196999,
+  "all_exact_output": true,
+  "full_request_mean_tpot_ms": 109.77519104733157,
+  "steady": {
+    "seconds": 104.30623072711751,
+    "tokens": 91778,
+    "tokens_per_second": 879.8899103171176,
+    "amortized_tpot_ms": 109.10455827979779,
+    "mean_request_tpot_ms": 109.10456071249719,
+    "p95_request_tpot_ms": 109.10693590702668,
+    "all_requests_progressed": true,
+    "min_request_tokens": 956,
+    "max_request_tokens": 957
+  },
+  "coordinator_audit": {
+    "samples": 22,
+    "all_dp12_waiting0": true,
+    "running_hist": {
+      "[12, 12, 12, 12, 12, 12, 12, 12]": 22
+    }
+  },
+  "request_audit": {
+    "dp_counts": {
+      "0": 12,
+      "1": 12,
+      "2": 12,
+      "3": 12,
+      "4": 12,
+      "5": 12,
+      "6": 12,
+      "7": 12
+    },
+    "output_hist": {
+      "1024": 96
+    },
+    "cached_token_hist": {
+      "131071": 96
+    },
+    "ttft_min_s": 0.3450270670000464,
+    "ttft_max_s": 1.8589603770524263
+  }
+}
