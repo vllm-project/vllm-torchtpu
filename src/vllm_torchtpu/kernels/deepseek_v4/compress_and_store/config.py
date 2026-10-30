@@ -45,6 +45,7 @@ Modes:
 
 import dataclasses
 import enum
+import math
 from typing import Any
 
 import jax
@@ -55,6 +56,7 @@ from jax.experimental import pallas as pl
 LANE = 128  # bytes per sub-slot / TPU lane width
 SLOT_PACK = 4  # sub-slots packed into one physical HBM slot row
 N_FIELDS = 2  # values stored per token: kv + score
+F32_SUBLANES = 8  # rows of one f32 vector register
 FP32_BYTES = 4
 CSA_COMPRESS_RATIO = 4  # the compress ratio that selects Mode.CSA
 # SEQ_ALONG_LANE indexer cache: tokens per page (one per lane of the 256-byte
@@ -483,64 +485,76 @@ class Configs:
         return self.physical_page_size // self.hbm_pack
 
     @property
-    def pages_to_buffer_per_token(self) -> int:
-        """Pages that must be resident to cover one token's window (+1 guard)."""
-        return pl.cdiv(self.window, self.state_block_size) + 1
+    def window_chunk(self) -> int:
+        """Window positions fetched from the state array by one DMA.
+
+        A compressed token's window starts on a multiple of compress_ratio, so
+        a run of gcd(compress_ratio, state_block_size) positions starting there
+        stays in one state page and one prev/curr half. The DMA addressing
+        (`buffered_ref.WindowRef`) needs a power-of-two state block size.
+        """
+        bs = self.state_block_size
+        assert bs > 0 and bs & (bs - 1) == 0, f"state_block_size {bs}"
+        return math.gcd(self.dims.compress_ratio, self.state_block_size)
 
     # --- shapes (single source of truth for every reshape / BlockSpec) ---------
     @property
     def _tile_n(self) -> int:
         return self.tile_sizes.tile_n
 
+    @property
+    def window_tokens_per_vreg(self) -> int:
+        """Tokens whose head_tiles rows share one f32 vreg of the window.
+
+        A token's field is head_tiles rows; packing several tokens into the
+        sublanes of one vreg keeps the windowed softmax on full vregs.
+        """
+        tokens = max(1, min(self._tile_n, F32_SUBLANES // self.head_tiles))
+        assert self._tile_n % tokens == 0, (self._tile_n, tokens)
+        return tokens
+
     def window_shape(self) -> tuple[int, ...]:
-        """f32 window scratch: (fields, tile, window, head_tiles, lane)."""
-        return (N_FIELDS, self._tile_n, self.window, self.head_tiles, LANE)
+        """f32 window block: (tile / P, window, fields, P x head_tiles, lane).
+
+        P = `window_tokens_per_vreg`: token p * P + q of a tile owns rows
+        [q * head_tiles, (q + 1) * head_tiles) of window group p.
+        """
+        tokens = self.window_tokens_per_vreg
+        return (
+            self._tile_n // tokens,
+            self.window,
+            N_FIELDS,
+            tokens * self.head_tiles,
+            LANE,
+        )
 
     def window_bytes_shape(self) -> tuple[int, ...]:
-        """uint8 view of the window scratch; each f32 lane -> FP32_BYTES rows.
+        """uint8 view of the window block; each f32 lane -> FP32_BYTES rows.
 
         Note: that trailing FP32_BYTES (4) is bytes-per-f32, NOT the HBM SLOT_PACK
         (also 4) -- they're numerically equal but mean different things.
 
         Returns:
-          The shape of the window bytes scratch.
+          The shape of the window bytes view.
         """
-        return (
-            N_FIELDS,
-            self._tile_n,
-            self.window,
-            self.head_tiles,
-            FP32_BYTES,
-            LANE,
-        )
+        return self.window_shape()[:-1] + (FP32_BYTES, LANE)
 
     def output_shape(self) -> tuple[int, ...]:
         """Packed output tile / VMEM block: (tile, record_rows) + cache_last_dims."""
         return (self._tile_n, self.record_rows) + self.cache_last_dims
 
     def records_t_shape(self) -> tuple[int, ...]:
-        """SEQ_ALONG_LANE: VMEM staging of every token's record, as cache lanes.
+        """SEQ_ALONG_LANE: VMEM staging of the slotted tokens' records, as lanes.
 
         `(SAL_SUBLANE_GROUPS, SLOT_PACK, padded_tokens)` = `(33, 4, padded_tokens)`
-        uint8 (32 fp8 sublane groups of 4 bytes + 1 scale group): token `t` is
-        lane `t`, laid out like a cache page (see `compute.stage_sal_columns`),
-        so the final store is a lane-tile copy.
+        uint8 (32 fp8 sublane groups of 4 bytes + 1 scale group): lane `i` holds
+        the i-th token with a kv slot, laid out like a cache page (see
+        `compute.stage_sal_columns` and `kernel.kernel_fn`), so the final store
+        is a lane-tile copy.
         """
         assert self.dims.seq_along_lane
         padded = pl.cdiv(max(self.dims.size_n, 1), LANE) * LANE
         return (SAL_SUBLANE_GROUPS, SLOT_PACK, padded)
-
-    def page_buffer_shape(self) -> tuple[int, ...]:
-        """Page-buffer VMEM block: (tile, pages, state page rows) + cache_last_dims.
-
-        Pages are DMA'd whole out of the *state* array, so this is sized by
-        `state_physical_page_size`, not by the compressed-KV page.
-        """
-        return (
-            self._tile_n,
-            self.pages_to_buffer_per_token,
-            self.state_physical_page_size,
-        ) + self.cache_last_dims
 
     def rope_output_shape(self) -> tuple[int, ...]:
         """RoPE output VMEM block: (tile, 4, lane)."""

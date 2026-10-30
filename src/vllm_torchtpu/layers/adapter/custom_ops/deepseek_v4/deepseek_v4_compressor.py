@@ -31,7 +31,9 @@ from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
     config as compressor_config,
 )
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store.compressor_v1 import (
+    CompressorInputs,
     compressor_forward,
+    compressor_pair_forward,
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
@@ -248,6 +250,99 @@ def _compressor_jax_indexer(
         seq_along_lane=True,
     )
     return new_cache
+
+
+def _compressor_jax_csa_indexer(
+    hidden_states: jax.Array,
+    wkv_wgate: jax.Array,
+    ape: jax.Array,
+    norm_weight: jax.Array,
+    cos_sin_cache: jax.Array,
+    positions: jax.Array,
+    state_block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    k_block_tables: jax.Array,
+    request_distribution: jax.Array,
+    cache: jax.Array,
+    rope_cache: jax.Array,
+    indexer_wkv_wgate: jax.Array,
+    indexer_ape: jax.Array,
+    indexer_norm_weight: jax.Array,
+    indexer_state_block_tables: jax.Array,
+    indexer_query_start_loc: jax.Array,
+    indexer_k_block_tables: jax.Array,
+    indexer_request_distribution: jax.Array,
+    indexer_cache: jax.Array,
+    *,
+    state_block_size: int,
+    head_dim: int,
+    compress_ratio: int,
+    overlap: bool,
+    rms_eps: float,
+    quant_block: int,
+    indexer_state_block_size: int,
+    indexer_head_dim: int,
+    indexer_rms_eps: float,
+    indexer_quant_block: int,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """A CSA layer's attention and indexer compressors, which share the hidden
+    states, positions and RoPE table: what `_compressor_jax_csa` and
+    `_compressor_jax_indexer` return, from one `compressor_pair_forward`."""
+    csa = CompressorInputs(
+        wkv_wgate=wkv_wgate,
+        ape=ape,
+        norm_weight=norm_weight,
+        cos_sin_cache=cos_sin_cache,
+        block_table=state_block_tables,
+        query_start_loc=query_start_loc,
+        kv_block_table=k_block_tables,
+        cache=cache,
+        rope_cache=rope_cache,
+        distribution=request_distribution,
+        state_block_size=state_block_size,
+        head_dim=head_dim,
+        compress_ratio=compress_ratio,
+        overlap=overlap,
+        rms_eps=rms_eps,
+        quant_block=quant_block,
+    )
+    indexer = CompressorInputs(
+        wkv_wgate=indexer_wkv_wgate,
+        ape=indexer_ape,
+        norm_weight=indexer_norm_weight,
+        cos_sin_cache=cos_sin_cache,
+        block_table=indexer_state_block_tables,
+        query_start_loc=indexer_query_start_loc,
+        kv_block_table=indexer_k_block_tables,
+        cache=indexer_cache,
+        rope_cache=None,
+        distribution=indexer_request_distribution,
+        state_block_size=indexer_state_block_size,
+        head_dim=indexer_head_dim,
+        compress_ratio=compress_ratio,
+        overlap=overlap,
+        rms_eps=indexer_rms_eps,
+        quant_block=indexer_quant_block,
+        seq_along_lane=True,
+    )
+    if cache.shape[0] == 0 or indexer_cache.shape[0] == 0:
+        # Profiling-shape trace: as the single ops, skip what has no cache.
+        if cache.shape[0] != 0:
+            new_cache, new_rope_cache, _ = compressor_forward(
+                hidden_states, positions=positions, **csa._asdict()
+            )
+            return new_cache, new_rope_cache, indexer_cache
+        if indexer_cache.shape[0] != 0:
+            new_indexer_cache, _, _ = compressor_forward(
+                hidden_states, positions=positions, **indexer._asdict()
+            )
+            return cache, rope_cache, new_indexer_cache
+        return cache, rope_cache, indexer_cache
+    (new_cache, new_rope_cache, _), (new_indexer_cache, _, _) = (
+        compressor_pair_forward(hidden_states, positions, csa, indexer)
+    )
+    assert new_rope_cache is not None
+    return new_cache, new_rope_cache, new_indexer_cache
 
 
 class VllmCompressorStateCache(CompressorStateCache):
@@ -514,6 +609,84 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         _compressor_op_cache[op_name] = compressor_jax_op
         return compressor_jax_op
 
+    def _pair_op(self, indexer_compressor: "VllmDeepseekCompressor"):
+        """The op of `forward_with_indexer`. The runner prebuilds it through
+        the attention layer's `compressor_pair_op`, once before KV cache init
+        and again after it, so it is cached per state block sizes: the first
+        build bakes in the base class's sizes, not this host's."""
+        block_sizes = (
+            self.state_cache.block_size,
+            indexer_compressor.state_cache.block_size,
+        )
+        cached = self.__dict__.get("_pair_op_instance")
+        if cached is not None and cached[0] == block_sizes:
+            return cached[1]
+        wrapped_fn = functools.partial(
+            _compressor_jax_csa_indexer,
+            state_block_size=self.state_cache.block_size,
+            head_dim=self.head_dim,
+            compress_ratio=self.compress_ratio,
+            overlap=self.overlap,
+            rms_eps=self.rms_norm_eps,
+            quant_block=self._quant_block,
+            indexer_state_block_size=indexer_compressor.state_cache.block_size,
+            indexer_head_dim=indexer_compressor.head_dim,
+            indexer_rms_eps=indexer_compressor.rms_norm_eps,
+            indexer_quant_block=indexer_compressor._quant_block,
+        )
+        assert indexer_compressor.compress_ratio == self.compress_ratio
+        assert indexer_compressor.overlap == self.overlap
+        op_name = (
+            f"pallas::deepseek_v4_compressor_csa_indexer"
+            f"_{self.head_dim}_{self.compress_ratio}"
+            f"_{self.state_cache.block_size}"
+            f"_{indexer_compressor.head_dim}"
+            f"_{indexer_compressor.state_cache.block_size}"
+        )
+        op = _compressor_op_cache.get(op_name)
+        if op is None:
+            batch_axis = BATCH_AXIS
+            metadata = (
+                P(batch_axis),  # state_block_tables
+                P(),  # query_start_loc
+                P(batch_axis),  # k_block_tables
+                P(),  # request_distribution
+                P(),  # cache
+            )
+            input_partition_specs = (
+                P(None, None),  # hidden_states
+                P(),  # wkv_wgate
+                P(),  # ape
+                P(),  # norm_weight
+                P(),  # cos_sin_cache
+                P(None),  # positions
+                *metadata,
+                P(),  # rope_cache
+                P(),  # indexer wkv_wgate
+                P(),  # indexer ape
+                P(),  # indexer norm_weight
+                *metadata,
+            )
+            op = pallas.jax_op(
+                op_name,
+                wrapped_fn,
+                mesh=get_pallas_op_mesh(),
+                donate_argnums=(10, 11, 19),  # cache, rope_cache, indexer_cache
+                input_partition_specs=input_partition_specs,
+            )
+
+            def _fake_pair(*args, **kwargs):
+                return (
+                    torch.empty_like(args[10]),
+                    torch.empty_like(args[11]),
+                    torch.empty_like(args[19]),
+                )
+
+            op.register_fake(_fake_pair)
+            _compressor_op_cache[op_name] = op
+        object.__setattr__(self, "_pair_op_instance", (block_sizes, op))
+        return op
+
     @staticmethod
     def _as_kernel_cache_view(cache: torch.Tensor | None) -> torch.Tensor | None:
         """The kernels require uint8; vLLM allocates as `kv_cache_dtype`.
@@ -535,11 +708,76 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         positions: torch.Tensor,
         rotary_emb: nn.Module,
     ) -> None:
+        bound = self._bind_operands(hidden_states, positions, rotary_emb)
+        if bound is None:
+            return
+        operands, rope_cache, state_cache = bound
+        cache = operands[-1]
+        if rope_cache is not None:
+            new_cache, new_rope_cache = self.compressor_op(*operands, rope_cache)
+            cache.copy_(new_cache)
+            rope_cache.copy_(new_rope_cache)
+        elif state_cache is not None:
+            new_cache, new_state_cache = self.compressor_op(*operands, state_cache)
+            cache.copy_(new_cache)
+            state_cache.copy_(new_state_cache)
+        else:
+            cache.copy_(self.compressor_op(*operands))
+
+    def forward_with_indexer(
+        self,
+        indexer_compressor: "VllmDeepseekCompressor",
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        rotary_emb: nn.Module,
+        indexer_rotary_emb: nn.Module,
+    ) -> None:
+        """This CSA compressor's and its layer's indexer compressor's forward,
+        as one op: both project the same hidden states, which
+        `compressor_pair_forward` does in one kernel call."""
+        assert self._has_rope_cache and not indexer_compressor._has_rope_cache
+        # The pair op takes one RoPE table for both compressors.
+        assert indexer_rotary_emb is rotary_emb
+        mine = self._bind_operands(hidden_states, positions, rotary_emb)
+        theirs = indexer_compressor._bind_operands(
+            hidden_states, positions, indexer_rotary_emb
+        )
+        if mine is None or theirs is None:
+            # Nothing bound for one of them (e.g. the profiling forward).
+            indexer_compressor(hidden_states, positions, indexer_rotary_emb)
+            self(hidden_states, positions, rotary_emb)
+            return
+        operands, rope_cache, _ = mine
+        indexer_operands = theirs[0]
+        cache, indexer_cache = operands[-1], indexer_operands[-1]
+        new_cache, new_rope_cache, new_indexer_cache = self._pair_op(
+            indexer_compressor
+        )(
+            *operands,
+            rope_cache,
+            *indexer_operands[1:4],  # wkv_wgate, ape, norm_weight
+            *indexer_operands[6:],  # block tables, query_start_loc, ..., cache
+        )
+        indexer_cache.copy_(new_indexer_cache)
+        cache.copy_(new_cache)
+        rope_cache.copy_(new_rope_cache)
+
+    def _bind_operands(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        rotary_emb: nn.Module,
+    ) -> (
+        tuple[tuple[torch.Tensor, ...], torch.Tensor | None, torch.Tensor | None]
+        | None
+    ):
+        """The compressor op's operands, then its RoPE and state caches, or
+        None when there is nothing to compress."""
         attn_ctx = get_forward_context().attn_metadata
         if not isinstance(attn_ctx, dict):
             # As in the base class: without per-layer metadata there is
             # nothing to compress.
-            return
+            return None
 
         # Each cache must use its own layer's metadata: they are separate
         # groups with separate block tables, so borrowing another layer's
@@ -560,14 +798,14 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         state_metadata = cast("AttentionMetadata | None", attn_ctx[state_prefix])
         k_cache_metadata = cast("AttentionMetadata | None", attn_ctx[k_cache_prefix])
         if state_metadata is None or k_cache_metadata is None:
-            return
+            return None
 
         # For CSA the k_cache layer binds a `(nope, rope)` pair.
         entry = getattr(self.k_cache, "kv_cache", None)
         main, rope = entry if isinstance(entry, tuple) else (entry, None)
         cache = self._as_kernel_cache_view(main)
         if cache is None:
-            return
+            return None
 
         state_block_tables = state_metadata.block_tables
         k_block_tables = k_cache_metadata.block_tables
@@ -619,13 +857,4 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             state_metadata.request_distribution,
             cache,
         )
-        if rope_cache is not None:
-            new_cache, new_rope_cache = self.compressor_op(*operands, rope_cache)
-            cache.copy_(new_cache)
-            rope_cache.copy_(new_rope_cache)
-        elif state_cache is not None:
-            new_cache, new_state_cache = self.compressor_op(*operands, state_cache)
-            cache.copy_(new_cache)
-            state_cache.copy_(new_state_cache)
-        else:
-            cache.copy_(self.compressor_op(*operands))
+        return operands, rope_cache, state_cache
