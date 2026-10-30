@@ -26,7 +26,7 @@ import hashlib
 import os
 from typing import Any
 
-from .config import import_plugin, resolve_callable, select_plugin
+from .config import import_plugin, missing_template, resolve_callable, select_plugin
 from .fingerprint import canonical_json
 
 
@@ -41,6 +41,8 @@ def compile_cache_salt(vllm_config: Any) -> str | None:
     if not cfg.enabled or resolved is None:
         return None
     ref, options = resolved
+    if missing_template(ref) is not None:
+        return None
     plugin, module = import_plugin(ref)
     if plugin.layout_request is None:
         return None

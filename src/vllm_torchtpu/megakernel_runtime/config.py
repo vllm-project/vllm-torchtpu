@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
+import importlib.util
 import json
 from collections.abc import Callable, Mapping
 from types import ModuleType
@@ -272,6 +273,25 @@ def select_plugin(
     return cfg, (resolve_plugin_ref(cfg, hf_config) if cfg.enabled else None)
 
 
+def missing_template(ref: PluginRef, hf_config: Any = None) -> str | None:
+    """The log line when `ref` is a shorthand template whose module isn't
+    installed (`None` otherwise). Shorthands are imported by string, so the
+    runtime works without the model folders; then the megakernel stays off.
+    An explicit plugin reference that doesn't import is an error instead."""
+    if ref.shorthand is None:
+        return None
+    try:
+        if importlib.util.find_spec(ref.module) is not None:
+            return None
+    except ModuleNotFoundError:
+        pass
+    archs = ", ".join(_hf_arch_candidates(hf_config)[:1]) or ref.shorthand
+    return (
+        f"Megakernel: no megakernel template for arch {archs} "
+        f"({ref.module} is not installed); skipping."
+    )
+
+
 def import_plugin(ref: PluginRef) -> tuple[TpuMonoSpec, ModuleType]:
     """Import `ref` and check it is a `TpuMonoSpec` of a supported API."""
     try:
@@ -331,6 +351,7 @@ __all__ = [
     "PluginRef",
     "collect_config",
     "import_plugin",
+    "missing_template",
     "parse_bool",
     "parse_config",
     "resolve_callable",

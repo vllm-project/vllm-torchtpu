@@ -53,6 +53,7 @@ from vllm_torchtpu.megakernel.runtime.contract import (
 )
 from vllm_torchtpu.megakernel_runtime.config import (
     import_plugin,
+    missing_template,
     resolve_callable,
     select_plugin,
 )
@@ -950,9 +951,10 @@ class ProgramDriver:
         """Create the configured plugin's driver for `runner`.
 
         `None` when the megakernel is off, no plugin serves the checkpoint's
-        arch, or a generic startup check fails (identical on every rank, so
-        no collective); a `DeclinedDriver` when `create`, the mesh or the
-        plugin fingerprint agreement declines on any rank. Any rank-local
+        arch (or its shorthand template isn't installed), or a generic startup
+        check fails (identical on every rank, so no collective); a
+        `DeclinedDriver` when `create`, the mesh or the plugin fingerprint
+        agreement declines on any rank. Any rank-local
         failure from the plugin import to the mesh votes `create_error` in
         agreement #1 before it propagates, so the other ranks decline
         instead of waiting for it.
@@ -965,6 +967,9 @@ class ProgramDriver:
         if not cfg.enabled or resolved is None:
             return None
         ref, options = resolved
+        if (msg := missing_template(ref, view.hf_config)) is not None:
+            logger.warning("%s", msg)
+            return None
         # Until the fingerprint exists, a failing rank votes with token 0: it
         # can't match the peers' token, so they decline with plugin_mismatch.
         token, codes, domain = 0, vote_codes(), DOMAIN_TP

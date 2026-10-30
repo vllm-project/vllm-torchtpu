@@ -429,3 +429,47 @@ def test_import_plugin_errors(mod_dir: Path) -> None:
     with pytest.raises(MegakernelConfigError, match="'module:attr'"):
         cfg_mod.resolve_callable("noattr", pkg, what="create")
 
+
+def test_missing_shorthand_template_leaves_the_megakernel_off(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Shorthands are imported by string: without the model folder installed,
+    the runtime logs it and stays off (no error, no collective); an explicit
+    plugin reference that doesn't import is still an error."""
+    import logging
+
+    import vllm_torchtpu.megakernel_runtime.driver as driver_mod
+    from vllm_torchtpu.megakernel_runtime import testing
+    from vllm_torchtpu.megakernel_runtime.salt import compile_cache_salt
+
+    gone = plugin_mod.SHORTHANDS["qwen35"]._replace(
+        module="no_such_mk_folder.megakernel"
+    )
+    monkeypatch.setitem(plugin_mod.SHORTHANDS, "qwen35", gone)
+    hf = SimpleNamespace(architectures=["Qwen3_5MoeForCausalLM"])
+    ref, _ = cfg_mod.resolve_plugin_ref(cfg_mod.parse_config("1"), hf)
+    msg = cfg_mod.missing_template(ref, hf)
+    assert msg == (
+        "Megakernel: no megakernel template for arch Qwen3_5MoeForCausalLM "
+        "(no_such_mk_folder.megakernel is not installed); skipping."
+    )
+    explicit = cfg_mod.PluginRef("no_such_mk_folder.megakernel")
+    assert cfg_mod.missing_template(explicit, hf) is None
+    with pytest.raises(MegakernelConfigError, match="failed to import"):
+        cfg_mod.import_plugin(explicit)
+    assert cfg_mod.missing_template(cfg_mod.PluginRef("json", shorthand="x")) is None
+
+    def no_collective(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("must stay off before any collective")
+
+    monkeypatch.setattr(driver_mod, "agree_on_decline", no_collective)
+    monkeypatch.setattr(logging.getLogger("vllm"), "propagate", True)
+    runner = testing.fake_runner(hf_config=hf, megakernel=True)
+    with caplog.at_level(logging.WARNING):
+        assert driver_mod.ProgramDriver.maybe_create(runner) is None
+    assert msg in caplog.text
+    vcfg = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=hf),
+        additional_config={"megakernel": True},
+    )
+    assert compile_cache_salt(vcfg) is None
