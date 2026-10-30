@@ -12,10 +12,18 @@ the logs. With N > 0:
   batch but no step with scheduled tokens has started for N seconds (empty
   schedules do not count), it dumps its stacks once per
   stall, and rank 0 also signals its parent (engine core) and grandparent
-  (API server) so their stacks land in the same log.
+  (API server) so their stacks land in the same log;
+- the API server watches its asyncio event loop: a task re-arms
+  ``faulthandler.dump_traceback_later`` every second, so a loop blocked for
+  VLLM_TPU_LOOP_LAG_WATCHDOG_S (default 30) dumps its stacks once per stall,
+  even when the blocking code holds the GIL. The block length is logged when
+  the loop resumes. The engine can be idle during such a stall (outputs pile
+  up unread), so the step watch above cannot see it.
 """
 
+import asyncio
 import faulthandler
+import multiprocessing
 import os
 import signal
 import sys
@@ -56,6 +64,12 @@ def install_signal_dump() -> None:
     # Plugins load before vLLM configures logging; print so the line shows.
     print(f"Stall watchdog: SIGUSR2 dumps the stacks of pid {os.getpid()}",
           file=sys.stderr, flush=True)
+    # Engine core and workers are multiprocessing children; the API server
+    # is the process `vllm serve` started.
+    if _loop_lag_seconds() > 0 and multiprocessing.parent_process() is None:
+        threading.Thread(
+            target=_hook_api_server_loop, name="loop-lag-hook", daemon=True
+        ).start()
 
 
 def arm() -> None:
@@ -144,3 +158,76 @@ def start(rank: int) -> None:
     logger.info(
         "Stall watchdog on: rank %d dumps stacks after %.0f s without a step", rank, limit
     )
+
+
+def _loop_lag_seconds() -> float:
+    try:
+        return float(os.environ.get("VLLM_TPU_LOOP_LAG_WATCHDOG_S", "30") or 0)
+    except ValueError:
+        return 0.0
+
+
+_loop_watch_started = False
+
+
+def _hook_api_server_loop() -> None:
+    """Wrap AsyncLLM._run_output_handler once vLLM has imported it (importing
+    it from the plugin itself would be circular). The handler is (re)entered
+    on every generate() call, on the server's event loop, so the first request
+    after the wrap starts the loop watch."""
+    for _ in range(3600):
+        mod = sys.modules.get("vllm.v1.engine.async_llm")
+        cls = getattr(mod, "AsyncLLM", None)
+        if cls is not None:
+            break
+        time.sleep(1.0)
+    else:
+        return
+    original = cls._run_output_handler
+
+    def _run_output_handler(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        if not _loop_watch_started:
+            try:
+                start_loop_watch(asyncio.get_running_loop(), _loop_lag_seconds())
+            except RuntimeError:  # not on a running loop yet
+                pass
+        return result
+
+    cls._run_output_handler = _run_output_handler
+
+
+def start_loop_watch(loop: asyncio.AbstractEventLoop, limit: float) -> None:
+    """Watch ``loop`` (call on it): dump all stacks if it is blocked for
+    ``limit`` seconds, log the block length when it resumes."""
+    global _loop_watch_started
+    if _loop_watch_started or limit <= 0:
+        return
+    _loop_watch_started = True
+    loop.create_task(_loop_watch(limit))
+    logger.info(
+        "Loop-lag watchdog on: pid %d dumps stacks when its event loop blocks for %.0f s",
+        os.getpid(),
+        limit,
+    )
+
+
+async def _loop_watch(limit: float) -> None:
+    # faulthandler's timer thread runs without the GIL, so the dump fires
+    # even while the loop is stuck in C code that holds it.
+    period = min(1.0, limit / 4)
+    try:
+        while True:
+            faulthandler.dump_traceback_later(limit, repeat=False, file=sys.stderr)
+            start = time.monotonic()
+            await asyncio.sleep(period)
+            lag = time.monotonic() - start - period
+            if lag >= limit:
+                logger.warning(
+                    "LOOP STALL pid=%d: event loop was blocked for %.1f s (stacks dumped above)",
+                    os.getpid(),
+                    lag,
+                )
+    finally:
+        # Loop shutdown: a slow teardown is not a stall.
+        faulthandler.cancel_dump_traceback_later()
