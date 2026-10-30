@@ -73,7 +73,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
 )
 from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
 from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny
-from vllm_torchtpu.layers.adapter import small_all_reduce_op
+from vllm_torchtpu.layers.adapter import dcp_token_parallel_op, small_all_reduce_op
 from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
     PallasMLAttentionBackendImpl,
@@ -541,9 +541,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # cannot trace if the op is first built inside a compiled forward.
         self.topk_op = self._build_streamidx_op()
 
-        parallel_config = getattr(
-            get_current_vllm_config_or_none(), "parallel_config", None
-        )
+        vllm_config = get_current_vllm_config_or_none()
+        parallel_config = getattr(vllm_config, "parallel_config", None)
         pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
         pcp_size = pcp_size if isinstance(pcp_size, int) else 1
         dcp_size = getattr(parallel_config, "decode_context_parallel_size", 1)
@@ -562,6 +561,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             self.topk_op_dcp = self._build_streamidx_dcp_op(
                 dcp_size, parallel_config.cp_kv_cache_interleave_size
             )
+            self.topk_op_tp = None
+            if envs.TPU_DCP_PREFILL_TOKEN_PARALLEL:
+                self.topk_op_tp = dcp_token_parallel_op.build_indexer_op(
+                    self, dcp_token_parallel_op.layout_for(vllm_config)
+                )
             # TPU_INDEXER_QB_OVERLAP: the same op, also running the MLA q_b
             # projection under the SparseCore top-k (see `forward_oot`).
             self.topk_op_dcp_qb = None
@@ -1163,6 +1167,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         distribution = torch.stack([rd[0], rd[0], rd[2]])
 
         q_b_out = None
+        num_rows = hidden_states.shape[0]
         topk_op_dcp_qb = getattr(self, "topk_op_dcp_qb", None)
         if qb_overlap is not None and topk_op_dcp_qb is not None:
             # Same op plus the MLA q_b projection, run under the top-k.
@@ -1177,6 +1182,21 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 distribution,
                 *qb_overlap,
             )
+        elif getattr(
+            self, "topk_op_tp", None
+        ) is not None and dcp_token_parallel_op.applies(hidden_states.shape[0]):
+            topk_indices = dcp_token_parallel_op.indexer_rows(
+                self,
+                q_values.view(torch.uint8),
+                weights,
+                kv_cache,
+                k_quant_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+            )
+            num_rows = topk_indices.shape[0]
         elif self.topk_op_dcp is not None:
             # DCP replicates the queries, so the token
             # inputs are already the whole batch in request-major order. What
@@ -1208,7 +1228,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # The top-k ops return a (topk, q) pair only with a q_b layer, which
         # this path never passes.
         rows = self._write_topk_rows(
-            hidden_states.shape[0],
+            num_rows,
             topk_indices,  # pyrefly: ignore[bad-argument-type]
         )
         if envs.TPU_INDEXER_TOPK_SHARED_READ:
@@ -1732,6 +1752,20 @@ class VllmTPUMLAAttention(MLAAttention):
         # The shared top-k table. A layer that reuses an earlier layer's
         # indices has no indexer, so this is where its top-k width is stated.
         self.topk_indices_buffer = topk_indices_buffer
+        # TPU_DCP_PREFILL_TOKEN_PARALLEL: the split's shape, read from the
+        # config here (model build); the op itself is built after loading.
+        self.token_parallel_layout = None
+        vllm_config = get_current_vllm_config_or_none()
+        if (
+            envs.TPU_DCP_PREFILL_TOKEN_PARALLEL
+            and use_sparse
+            and vllm_config is not None
+            and vllm_config.parallel_config.decode_context_parallel_size > 1
+        ):
+            dcp_token_parallel_op.check_config(
+                vllm_config, q_replicate=bool(dcp_q_replicate)
+            )
+            self.token_parallel_layout = dcp_token_parallel_op.layout_for(vllm_config)
 
         # For compatibility reasons.
         self.prefix = prefix
@@ -1885,10 +1919,15 @@ class VllmTPUMLAAttention(MLAAttention):
         self.sparse_mla_dcp_rope_op = None
         self.sparse_mla_dcp_send_op = None
         self.sparse_mla_dcp_fused_op = None
+        self.sparse_mla_tp_op = None
         if dcp_size > 1:
             self.sparse_mla_dcp_op = impl._build_sparse_mla_dcp_op(
                 self, dcp_size, impl.dcp_interleave_size
             )
+            if self.token_parallel_layout is not None:
+                self.sparse_mla_tp_op = dcp_token_parallel_op.build_attention_op(
+                    self, impl, self.token_parallel_layout
+                )
             # TPU_MLA_DECODE_PROLOGUE: the variant that takes the raw q head
             # and ropes q_pe in the attention kernel (query replication only).
             if envs.TPU_MLA_DECODE_PROLOGUE and self.dcp_q_replicate:

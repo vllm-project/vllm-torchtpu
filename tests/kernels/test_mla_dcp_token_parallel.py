@@ -107,7 +107,9 @@ class Step:
             for s in self.seq_lens
         ]
         nope_c = np.zeros((dcp, num_pages, ps, DN), np.float32)
-        rope_c = np.zeros((dcp, num_pages, ps // ROPE_PER_ROW, ROPE_PER_ROW, DR), np.float32)
+        rope_c = np.zeros(
+            (dcp, num_pages, ps // ROPE_PER_ROW, ROPE_PER_ROW, DR), np.float32
+        )
         idx_c = np.zeros((dcp, num_pages, IDX_ROWS, IDX_SUB, ps), np.float32)
         for i, r in enumerate(reqs):
             for p in range(r.prefix + r.chunk):
@@ -128,11 +130,15 @@ class Step:
         self.rope_cache = rope_c.reshape(dcp * num_pages, ps // ROPE_PER_ROW, -1)
         self.idx_cache = idx_c.reshape(dcp * num_pages, IDX_ROWS, IDX_SUB, ps)
         rows = np.arange(num_tokens)
-        seq_id = np.minimum(np.searchsorted(self.qsl[1:], rows, side="right"), max_reqs - 1)
+        seq_id = np.minimum(
+            np.searchsorted(self.qsl[1:], rows, side="right"), max_reqs - 1
+        )
         self.row_req = seq_id
         self.row_pos = (
-            self.seq_lens[seq_id] - (self.qsl[seq_id + 1] - self.qsl[seq_id])
-            + rows - self.qsl[seq_id]
+            self.seq_lens[seq_id]
+            - (self.qsl[seq_id + 1] - self.qsl[seq_id])
+            + rows
+            - self.qsl[seq_id]
         )
         self.kv_c = np.zeros((num_tokens, DN), np.float32)
         self.k_pe = np.zeros((num_tokens, DR), np.float32)
@@ -159,16 +165,22 @@ def _write_kv_ref(layout, num_pages):
 
     def write(nope, rope, kv_c, k_pe, seq_lens, bt, qsl, rank):
         t = jnp.arange(kv_c.shape[0])
-        seq = jnp.minimum(jnp.searchsorted(qsl[1:], t, side="right"), seq_lens.shape[0] - 1)
+        seq = jnp.minimum(
+            jnp.searchsorted(qsl[1:], t, side="right"), seq_lens.shape[0] - 1
+        )
         pos = seq_lens[seq] - (qsl[seq + 1] - qsl[seq]) + t - qsl[seq]
         owner, slot = tp.owner_and_slot(layout, pos)
         table = bt.reshape(seq_lens.shape[0], -1)
-        page = table[seq, jnp.clip(pos // layout.virtual_page_size, 0, table.shape[1] - 1)]
+        page = table[
+            seq, jnp.clip(pos // layout.virtual_page_size, 0, table.shape[1] - 1)
+        ]
         ok = (t < qsl[-1]) & (owner == rank)
         page = jnp.where(ok, page % num_pages, 2**30)
         nope = nope.at[page, slot].set(kv_c, mode="drop")
         r4 = rope.reshape(*rope.shape[:2], ROPE_PER_ROW, DR)
-        r4 = r4.at[page, slot // ROPE_PER_ROW, slot % ROPE_PER_ROW].set(k_pe, mode="drop")
+        r4 = r4.at[page, slot // ROPE_PER_ROW, slot % ROPE_PER_ROW].set(
+            k_pe, mode="drop"
+        )
         return nope, r4.reshape(rope.shape)
 
     return write
@@ -214,7 +226,9 @@ def test_sparse_mla_attention_matches_natural_reference(dcp):
 
     pages, offsets = (
         np.asarray(a)
-        for a in tp.step_pages(lay, *[jnp.asarray(x) for x in (st.seq_lens, st.qsl)], st.num_seqs)
+        for a in tp.step_pages(
+            lay, *[jnp.asarray(x) for x in (st.seq_lens, st.qsl)], st.num_seqs
+        )
     )
     assert pages.sum() <= lay.max_pages
     topk_pos = np.full((dcp, per, TOPK), -1, np.int32)
@@ -297,7 +311,9 @@ def _select_topk_ref(layout):
         num_reqs = rr.seq_lens.shape[0]
         tbl = table.reshape(num_reqs, -1)
         i = jnp.arange(rows)
-        k = jnp.minimum(jnp.searchsorted(rr.cu_q_lens[1:], i, side="right"), num_reqs - 1)
+        k = jnp.minimum(
+            jnp.searchsorted(rr.cu_q_lens[1:], i, side="right"), num_reqs - 1
+        )
         q_len = rr.cu_q_lens[k + 1] - rr.cu_q_lens[k]
         visible = rr.seq_lens[k] - q_len + (i - rr.cu_q_lens[k]) + 1
         visible = jnp.where(i < rr.num_rows, visible, 0)
@@ -334,7 +350,9 @@ def test_indexer_topk_matches_natural_reference(dcp):
 
     _, offsets = (
         np.asarray(a)
-        for a in tp.step_pages(lay, *[jnp.asarray(x) for x in (st.seq_lens, st.qsl)], st.num_seqs)
+        for a in tp.step_pages(
+            lay, *[jnp.asarray(x) for x in (st.seq_lens, st.qsl)], st.num_seqs
+        )
     )
     seen = np.zeros((dcp, per), bool)
     for (rank, i), t in st.tp_rows():
@@ -365,14 +383,17 @@ def test_gather_page_ids_and_capacity(dcp):
         assert pages[i] == (-(-int(s) // vps) if listed else 0), i
     ids = np.asarray(
         tp.gather_page_ids(
-            lay, jnp.asarray(st.block_tables.reshape(-1)), jnp.asarray(pages),
-            jnp.asarray(offsets), st.num_pages,
+            lay,
+            jnp.asarray(st.block_tables.reshape(-1)),
+            jnp.asarray(pages),
+            jnp.asarray(offsets),
+            st.num_pages,
         )
     )
     for i in range(st.num_seqs):
         for v in range(pages[i]):
             assert ids[offsets[i] + v] == st.block_tables[i, v] % st.num_pages
-    assert (ids[pages.sum():] == 0).all()
+    assert (ids[pages.sum() :] == 0).all()
     assert int(tp.total_step_pages(lay, seq_lens, qsl, st.num_seqs)) == pages.sum()
 
 

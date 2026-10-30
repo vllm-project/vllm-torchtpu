@@ -451,5 +451,13 @@ def indexer_topk(
         in_specs=(sharded, rep, rep, rep, rep, rep, rep) + (sharded,) * len(extra),
         out_specs=sharded,
         check_vma=False,
-    )(index_cache, q, weights, seq_lens, block_tables, query_start_loc,
-      request_distribution, *extra)
+    )(
+        index_cache,
+        q,
+        weights,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+        *extra,
+    )

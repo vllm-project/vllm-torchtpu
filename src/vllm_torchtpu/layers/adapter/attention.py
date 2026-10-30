@@ -74,6 +74,7 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
 )
 from vllm_torchtpu.kernels.mla.v2 import kernel as mla_v2_kernel
 from vllm_torchtpu.layers.adapter import cp_mla_attention as _cp_mla_attention
+from vllm_torchtpu.layers.adapter import dcp_token_parallel_op
 from vllm_torchtpu.layers.adapter.cp_attention import (
     build_dcp_kernels as _build_dcp_kernels,
 )
@@ -2923,7 +2924,22 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 "sparse MLA layers use a native (nope, rope) split "
                 f"cache; got {type(kv_cache)}"
             )
-            if self.dcp_size > 1:
+            if getattr(
+                layer, "sparse_mla_tp_op", None
+            ) is not None and dcp_token_parallel_op.applies(ql_nope_flat.shape[0]):
+                # TPU_DCP_PREFILL_TOKEN_PARALLEL: the DCP path on the leading
+                # rows, the token-parallel split on the rest; merged outputs.
+                outputs = dcp_token_parallel_op.attention(
+                    layer,
+                    kv_cache,
+                    ql_nope_flat,
+                    q_pe_flat,
+                    kv_c_normed_flat,
+                    k_pe_flat,
+                    topk_indices,
+                    attn_metadata,
+                )
+            elif self.dcp_size > 1:
                 assert getattr(layer, "sparse_mla_dcp_op", None) is not None, (
                     "DCP sparse MLA op was never built; "
                     "`process_weights_after_loading` must run first."

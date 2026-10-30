@@ -88,7 +88,11 @@ from vllm_torchtpu.distributed.pp_wave import PPWave, pp_rank_flags
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
-from vllm_torchtpu.layers.adapter import small_all_reduce_op, token_padding
+from vllm_torchtpu.layers.adapter import (
+    dcp_token_parallel_op,
+    small_all_reduce_op,
+    token_padding,
+)
 from vllm_torchtpu.layers.adapter.attention import (
     KV_LAYOUT_BY_VLLM_LAYOUT,
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
@@ -3078,6 +3082,13 @@ class TPUModelRunner(GPUModelRunner):
         )
         self._last_sequence_layout_plan = layout_plan
         padded_total_num_scheduled_tokens = layout_plan.global_padded_num_tokens
+        dcp_token_parallel_op.check_step_capacity(
+            self.vllm_config,
+            padded_total_num_scheduled_tokens,
+            self.query_start_loc_np,
+            self.seq_lens_np,
+            num_reqs,
+        )
         request_major_input_ids = None
         if self._pcp_enabled and self._mtp_enabled:
             assert request_major_input_ids_cpu is not None

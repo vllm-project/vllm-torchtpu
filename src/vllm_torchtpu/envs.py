@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     TPU_DCP_MERGE_VSPACE_FUSED: bool = False
     TPU_DCP_MLA_OPROJ_ALL_REDUCE: bool = False
     TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS: int = 512
+    TPU_DCP_PREFILL_TOKEN_PARALLEL: bool = False
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
     TPU_DCP_LSE_MERGE_A2A_PACK: bool = False
     TPU_DCP_LSE_MERGE_A2A_REAL_ROWS: bool = False
@@ -817,6 +818,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 512 beat 256, 768 and 1024 below 4096 tokens and tied at 4096.
     "TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS": env_int(
         "TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS", 512
+    ),
+    # Sparse MLA under DCP, backbone buckets of at least
+    # `dcp_token_parallel_op.MIN_TOKENS` tokens: the first max-num-seqs rows
+    # keep the DCP path, the rest are split over the DCP ranks by token, each
+    # rank attending its rows with every head over the gathered pages of their
+    # requests (`kernels/mla/dcp_token_parallel.py`). Replaces the per-layer
+    # head all-gather of q and the reduce-scatter merge of the partials with
+    # two all-to-alls and a gather of the latent and index-K pages; exact
+    # top-k and softmax on one rank, so not bit-identical to the merge. A step
+    # whose requests need more pages than the gather buffer holds raises.
+    "TPU_DCP_PREFILL_TOKEN_PARALLEL": env_bool(
+        "TPU_DCP_PREFILL_TOKEN_PARALLEL", default=False
     ),
     # Sparse MLA split q (`sparse_ragged_paged_attention(q_pe=...)`): hand
     # q_nope and q_pe to the kernel as separate operands. The kernel joins
