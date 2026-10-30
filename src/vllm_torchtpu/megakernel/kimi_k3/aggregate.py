@@ -112,12 +112,13 @@ class KimiAggregate:
         from vllm_torchtpu.megakernel.kimi_k3.program import build_decoder
 
         kernel = active()
-        if kernel.prefill_expert_parallel != 8:
+        if kernel.prefill_expert_parallel not in (8, 16):
             raise NotImplementedError(
-                "the K3 aggregate engine shares the decode's EP8 experts: "
-                "it needs prefill_expert_parallel 8"
+                "the K3 aggregate engine requires prefill_expert_parallel 8 or 16"
             )
-        if kernel.kd_hot_plan or kernel.kd_replica_plan:
+        if kernel.prefill_expert_parallel == 8 and (
+            kernel.kd_hot_plan or kernel.kd_replica_plan
+        ):
             raise NotImplementedError(
                 "the K3 aggregate engine does not run hot-expert plans "
                 "(K3_HOT_PLAN, K3_REPLICA_PLAN): they change the shared experts"
@@ -142,15 +143,25 @@ class KimiAggregate:
     def load_weights(self) -> None:
         if self._loaded:
             return
-        from vllm_torchtpu.megakernel.kimi_k3.kernels.rank_loader import PREFILL_SHARED
+        from vllm_torchtpu.megakernel.kimi_k3.kernels.rank_loader import (
+            EXPERT_FAMILIES,
+            PREFILL_SHARED,
+        )
 
         started = time.perf_counter()
         self.decoder.load_weights()
         weights = self.decoder.ops.weights
-        missing = [n for n in PREFILL_SHARED if n not in weights]
+        kernel = active()
+        shared_names = list(PREFILL_SHARED)
+        if kernel.prefill_expert_parallel != 8:
+            excluded = set(EXPERT_FAMILIES)
+            if kernel.prefill_expert_plan:
+                excluded.update(("router", "router_bias"))
+            shared_names = [n for n in shared_names if n not in excluded]
+        missing = [n for n in shared_names if n not in weights]
         if missing:
             raise RuntimeError(f"K3 aggregate: the decoder holds no {missing}")
-        self.prefiller.load_weights({n: weights[n] for n in PREFILL_SHARED})
+        self.prefiller.load_weights({n: weights[n] for n in shared_names})
         self._loaded = True
         if self.rank == 0:
             logger.info(

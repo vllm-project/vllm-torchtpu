@@ -3172,15 +3172,6 @@ def mla_projections(hidden, weights, *, epsilon=1e-5, return_latent=False, query
     compressed = _dot(local, weights.key_value_down_projection).astype(
         jnp.bfloat16
     )
-    if sp_axis is not None:
-        width = query_latent.shape[1]
-        both = jax.lax.all_gather(
-            jnp.concatenate((query_latent, compressed), axis=1), sp_axis, tiled=True
-        )
-        query_latent, compressed = both[:, :width], both[:, width:]
-    query = (_dot(query_latent, weights.query_up_projection) * query_scale).astype(jnp.bfloat16)
-    query = query.reshape(tokens, _HEADS, 256)
-
     kv_latent = compressed[:, :512].astype(jnp.float32)
     kv_latent = (
         kv_latent
@@ -3189,12 +3180,24 @@ def mla_projections(hidden, weights, *, epsilon=1e-5, return_latent=False, query
         )
         * weights.key_value_normalization
     ).astype(jnp.bfloat16)
+    rope = compressed[:, 512:576]
+    if sp_axis is not None:
+        width = query_latent.shape[1]
+        both = jax.lax.all_gather(
+            jnp.concatenate((query_latent, kv_latent, rope), axis=1), sp_axis, tiled=True
+        )
+        query_latent = both[:, :width]
+        kv_latent = both[:, width : width + 512]
+        rope = both[:, width + 512 :]
+    query = (_dot(query_latent, weights.query_up_projection) * query_scale).astype(jnp.bfloat16)
+    query = query.reshape(tokens, _HEADS, 256)
+
     expanded = _dot(kv_latent, weights.key_value_up_projection).astype(jnp.bfloat16)
     expanded = expanded.reshape(tokens, _HEADS, 256)
     new_key = jnp.concatenate(
         (
             expanded[:, :, :128],
-            jnp.broadcast_to(compressed[:, None, 512:576], (tokens, _HEADS, 64)),
+            jnp.broadcast_to(rope[:, None, :], (tokens, _HEADS, 64)),
             jnp.zeros((tokens, _HEADS, 64), jnp.bfloat16),
         ),
         axis=2,
@@ -3202,7 +3205,7 @@ def mla_projections(hidden, weights, *, epsilon=1e-5, return_latent=False, query
     new_value = expanded[:, :, 128:]
     output_gate = _dot(hidden, weights.output_gate_projection).astype(jnp.bfloat16)
     if return_latent:
-        latent = jnp.concatenate((kv_latent, compressed[:, 512:576]), axis=1)
+        latent = jnp.concatenate((kv_latent, rope), axis=1)
         return query, new_key, new_value, output_gate, latent
     return query, new_key, new_value, output_gate
 

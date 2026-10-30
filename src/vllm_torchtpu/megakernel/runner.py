@@ -124,16 +124,24 @@ def build_program(vllm_config: Any, tp_rank: int) -> MegakernelProgram:
         k3.check(config)
     aggregate = config.role == "aggregate"
     if config.attention_dp > 1 or aggregate:
+        import os
+
         from vllm_torchtpu.megakernel.kimi_k3 import config as kernel_config
 
         # Kernel modules read the config at import: install it before the
         # program imports them.
+        prefill_ep = (
+            16
+            if (not aggregate or os.environ.get("K3_AGGREGATE_EP16") == "1")
+            else 8
+        )
         kernel_config.install(
             kernel_config.KernelConfig(
                 attention_dp=config.attention_dp,
                 dcp_group=config.decode_context_parallel_size,
-                # The aggregate prefill shares the decode's EP8 experts.
-                prefill_expert_parallel=8 if aggregate else 16,
+                # The aggregate prefill shares the decode's EP8 experts unless
+                # K3_AGGREGATE_EP16=1 requests banked EP16 experts.
+                prefill_expert_parallel=prefill_ep,
             )
         )
     # The prefill computes the rings of its loader config's draft; the

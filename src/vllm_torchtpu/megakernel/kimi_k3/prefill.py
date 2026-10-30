@@ -938,23 +938,38 @@ class PoolWriter:
                         jax.lax.ppermute(x, AXIS, perm)
                         for x in (recurrent, conv, recurrent_at, conv_at)
                     )
+                # This rank owns at most ceil(pages / DCP) pages of each live
+                # sequence (global page k lives on rank k % DCP); the rest of its
+                # table is the null block. Write only those pages: owned ones
+                # first, any spare entries again aim at the null block.
+                writes = min(pages, count * -(-pages // DCP_SIZE))
+                if writes < pages:
+                    order = jnp.argsort((table == 0).astype(jnp.int32), stable=True)[
+                        :writes
+                    ]
+                    targets = table[order]
+                else:
+                    order, targets = None, table
                 for m in range(MLA_LAYERS):
                     index = mla_raw[m]
+                    page_rows = latents[m].reshape(pages, -1, latents.shape[-1])
+                    if order is not None:
+                        page_rows = jnp.take(page_rows, order, axis=0)
                     rows = (
-                        jnp.pad(latents[m], ((0, 0), (0, 64)))
+                        jnp.pad(page_rows, ((0, 0), (0, 0), (0, 64)))
                         .astype(raws[index].dtype)
-                        .reshape(pages, *self.layout.block_shape)
+                        .reshape(writes, *self.layout.block_shape)
                     )
 
                     def write_page(p, pool, rows=rows):
                         return jax.lax.dynamic_update_index_in_dim(
                             pool,
                             jax.lax.dynamic_index_in_dim(rows, p, keepdims=False),
-                            table[p],
+                            targets[p],
                             axis=0,
                         )
 
-                    raws[index] = jax.lax.fori_loop(0, pages, write_page, raws[index])
+                    raws[index] = jax.lax.fori_loop(0, writes, write_page, raws[index])
                 # Checkpoints first (a sequence without one aims it at the null block).
                 raws = self._write_kda(raws, recurrent_at, conv_at, blocks_at, count)
                 raws = self._write_kda(raws, recurrent, conv, kda_blocks, count)
@@ -969,7 +984,7 @@ class PoolWriter:
                 donate_argnums=tuple(range(5, 5 + num_raw)),
                 export_key=repr(
                     (
-                        "write_pool_packed",
+                        "write_pool_packed_owned",
                         self.layout,
                         window,
                         slots,

@@ -1008,7 +1008,8 @@ def build_kimi_k3_pool_manifest(
             )
         declared_block_size = getattr(spec, "block_size", None)
         if (
-            declared_block_size is not None
+            not is_state
+            and declared_block_size is not None
             and int(declared_block_size) != rows * packing
         ):
             raise ManifestError(
