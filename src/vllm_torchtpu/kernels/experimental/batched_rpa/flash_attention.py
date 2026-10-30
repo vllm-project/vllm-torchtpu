@@ -12,12 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import jax
 import jax.numpy as jnp
 from jax import lax
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, utils
 from vllm_torchtpu.kernels.experimental.batched_rpa.schedule import SmemWrapper
+
+
+def sm_scale_folds_into_q(cfgs: configs.RpaConfigs) -> bool:
+    """Whether sm_scale can scale q instead of every score, bit-exactly.
+
+    A power-of-two scale only shifts the exponent, so (s * q) @ k == s * (q @ k)
+    exactly for a q dtype with f32's exponent range.
+    """
+    return (
+        cfgs.serve.scale_q is None
+        and cfgs.serve.dtype_q in (jnp.bfloat16, jnp.float32)
+        and math.frexp(cfgs.model.sm_scale)[0] == 0.5
+    )
 
 
 def flash_attention_qk_softmax(
@@ -45,6 +60,10 @@ def flash_attention_qk_softmax(
             q = jnp.clip(q, min=minval, max=maxval)
         q = q.astype(k.dtype)
 
+    fold_sm_scale = sm_scale_folds_into_q(cfgs)
+    if fold_sm_scale and cfgs.model.sm_scale != 1.0:
+        q = q * jnp.asarray(cfgs.model.sm_scale, q.dtype)
+
     if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         s = k.shape[-1]
         qk = lax.dot(
@@ -63,7 +82,8 @@ def flash_attention_qk_softmax(
         )
     qk = qk.reshape(b, k_heads, tq, s)
 
-    qk *= cfgs.model.sm_scale
+    if not fold_sm_scale:
+        qk *= cfgs.model.sm_scale
     if cfgs.serve.scale_q is not None:
         qk *= cfgs.serve.scale_q
     if k_scale is not None:
