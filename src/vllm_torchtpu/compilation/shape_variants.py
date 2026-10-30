@@ -384,9 +384,9 @@ class DeferredTraces:
 
     def __init__(self) -> None:
         self.backends: list[Any] = []
-        # Buckets some trace already accepted: a later trace that refuses one
-        # does not call for another trace.
-        self.accepted: set[int] = set()
+        # (subgraph index, bucket) pairs some trace already accepted: a later
+        # trace that refuses one does not call for another trace.
+        self.accepted: set[tuple[int, int]] = set()
 
     def compile(self) -> None:
         """Compile every deferred bucket (see ``_patch_vllm_compile_all_ranges``)."""
@@ -444,17 +444,19 @@ def defer(backend: Any) -> None:
         size = (
             entry.compile_range.start if entry.compile_range.is_single_size() else None
         )
-        if size is not None and size in _deferred.accepted:
+        subgraph_bucket = (
+            (backend.piecewise_compile_index, size) if size is not None else None
+        )
+        if subgraph_bucket is not None and subgraph_bucket in _deferred.accepted:
             # An earlier trace builds it; hand it over, as runnable_for does.
             entry._tpu_deferred = "hand_over"
         elif size is None or unsupported_reason(shape_env, size) is None:
             entry._tpu_deferred = "compile"
-            if size is not None:
-                _deferred.accepted.add(size)
+            if subgraph_bucket is not None:
+                _deferred.accepted.add(subgraph_bucket)
         else:
             entry._tpu_deferred = "hand_over"
-            if size not in _deferred.accepted:
-                _session.refused.add(size)
+            _session.refused.add(size)
         entry.runnable = placeholder(size)
         entry.compiled = True
     backend._tpu_trace = _session.traces

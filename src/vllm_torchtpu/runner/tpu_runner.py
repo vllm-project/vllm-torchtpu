@@ -7032,6 +7032,13 @@ class TPUModelRunner(GPUModelRunner):
             raise ValueError(
                 "TPU_PRECOMPILE_TRACE_FIRST=1 needs TPU_PARALLEL_PRECOMPILE=1"
             )
+        if trace_first and vllm_envs.VLLM_USE_MEGA_AOT_ARTIFACT:
+            raise ValueError(
+                "TPU_PRECOMPILE_TRACE_FIRST=1 is incompatible with "
+                "VLLM_USE_MEGA_AOT_ARTIFACT=1: save_aot_compiled_function runs "
+                "before deferred compiles finish, writing an empty artifact. "
+                "Set VLLM_USE_MEGA_AOT_ARTIFACT=0 (the TPU default)."
+            )
         with shape_variants.warmup() as buckets:
             with (
                 shape_variants.trace_only() if trace_first else contextlib.nullcontext()

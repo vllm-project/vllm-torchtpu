@@ -618,9 +618,10 @@ def _patch_vllm_compile_all_ranges() -> None:
                     to_compile.append((backend, range_entry))
                 else:
                     to_hand_over.append((backend, range_entry))
+        num_traces = len({getattr(b, "_tpu_trace", i) for i, b in enumerate(backends)})
         logger.info(
             "Deferred precompile: %d traces, %d buckets to compile, %d to hand over",
-            len(backends),
+            num_traces,
             len(to_compile),
             len(to_hand_over),
         )
