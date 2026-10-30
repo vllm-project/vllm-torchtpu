@@ -232,6 +232,8 @@ if TYPE_CHECKING:
     TPU_RAIDEN_POOL_STAGING_LEASES: int = 8
     TPU_SCHED_KV_PREFETCH_WAITING: int = 0
     TPU_SCHED_KV_PREFETCH_RESERVE_BLOCKS: int = 64
+    TPU_PREFIX_AWARE_TIER_WARMTH: bool = False
+    TPU_OFFLOAD_KEEP_EAGLE_TAIL: bool = False
     TPU_RAIDEN_INLINE_LOAD: bool = False
     QUANTIZE_ON_LOAD_PREFIXES: list[str] = []
     KDA_MANUAL_STATE_DMA: bool | None = None
@@ -1720,6 +1722,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # beyond the in-flight loads' reservation.
     "TPU_SCHED_KV_PREFETCH_RESERVE_BLOCKS": env_nonnegative_int(
         "TPU_SCHED_KV_PREFETCH_RESERVE_BLOCKS", 64
+    ),
+    # PrefixAwareScheduler: also count the whole chunks the offload tier holds
+    # right past a request's HBM hit as warm (core/prefix_aware_scheduler.py),
+    # so a session HBM evicted but the tier kept is not ranked fully cold.
+    "TPU_PREFIX_AWARE_TIER_WARMTH": env_bool(
+        "TPU_PREFIX_AWARE_TIER_WARMTH", default=False
+    ),
+    # Offload tier: serve the whole tier hit when no KV cache group is
+    # annotated as an MTP/EAGLE drafter group. The pinned vLLM then flags every
+    # group as a drafter group and pops the last chunk of every tier hit (vLLM
+    # main stopped doing so, vllm-project/vllm#52771). The offload-tier
+    # counterpart of VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP
+    # (offload/raiden_connector.py).
+    # TODO(vllm-project/vllm#52735): Remove once the pinned vLLM includes
+    # vllm-project/vllm#52771.
+    "TPU_OFFLOAD_KEEP_EAGLE_TAIL": env_bool(
+        "TPU_OFFLOAD_KEEP_EAGLE_TAIL", default=False
     ),
     # Load remote KV before the first forward, not in a no-forward step.
     "TPU_RAIDEN_INLINE_LOAD": env_bool("TPU_RAIDEN_INLINE_LOAD", default=False),
