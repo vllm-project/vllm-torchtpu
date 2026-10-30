@@ -45,6 +45,9 @@
 #   K3_PD_NUM_PREFILL, K3_PD_NUM_DECODE  engines per role (xPyD); default 1.
 #                   Replica 0's head is <name>-<role>-0-0.<name>, replica r's
 #                   <name>-<role><r>-0-0.<name> (one replicated job per engine)
+#   K3_PD_AGGREGATE=1  one aggregate engine (kimi-k3-agentx-agg.yaml), head
+#                   <name>-aggregate-0-0.<name>: no prefill/decode proxy; the
+#                   clients reach the engine through a loopback TCP forwarder
 #   K3_PD_ROUTER_EXTRA  extra vllm-router flags (word-split)
 #   K3_PD_PREFILL_POLICY, K3_PD_DECODE_POLICY  router policy per role; default
 #                   consistent_hash for both
@@ -90,6 +93,12 @@ for ((_i = 0; _i < NUM_DECODE; _i++)); do DECODE_HOSTS+=("$(role_head decode "$_
 PREFILL_HOST="${PREFILL_HOSTS[0]}"
 DECODE_HOST="${DECODE_HOSTS[0]}"
 ALL_HOSTS=("${PREFILL_HOSTS[@]}" "${DECODE_HOSTS[@]}")
+AGGREGATE="${K3_PD_AGGREGATE:-0}"
+if [ "$AGGREGATE" = 1 ]; then
+    # One engine: it is both heads.
+    PREFILL_HOST="$(role_head aggregate 0)" DECODE_HOST="$(role_head aggregate 0)"
+    PREFILL_HOSTS=("$PREFILL_HOST") DECODE_HOSTS=() ALL_HOSTS=("$PREFILL_HOST")
+fi
 
 # For ix_export_topology; the pod keeps its own log tag.
 # shellcheck source=scripts/vllm/benchmark/inferencex/sweep_lib.sh
@@ -100,10 +109,12 @@ cd "$REPO_DIR" || { log "FATAL: no repo at $REPO_DIR"; exit 1; }
 ARTIFACTS_DIR="${ARTIFACTS_DIR:-perf_eval_results}"
 EVAL_ONLY="${AGENTX_EVAL_JOB:-0}"
 case "$EVAL_ONLY" in 0|1) ;; *) log "FATAL: AGENTX_EVAL_JOB must be 0 or 1, not '$EVAL_ONLY'"; exit 2 ;; esac
+_shape=1p1d
+[ "$AGGREGATE" != 1 ] || _shape=agg
 if [ "$EVAL_ONLY" = 1 ]; then
-    RESULTS_DIR="$ARTIFACTS_DIR/k3-agentx-evals-1p1d"
+    RESULTS_DIR="$ARTIFACTS_DIR/k3-agentx-evals-$_shape"
 else
-    RESULTS_DIR="$ARTIFACTS_DIR/k3-agentx-1p1d"
+    RESULTS_DIR="$ARTIFACTS_DIR/k3-agentx-$_shape"
 fi
 mkdir -p "$RESULTS_DIR"
 
@@ -182,6 +193,7 @@ fi
 case "$AGENTX_CHIPS" in ''|*[!0-9]*|0) log "FATAL: bad AGENTX_CHIPS '$AGENTX_CHIPS'"; exit 2 ;; esac
 CHIPS="$AGENTX_CHIPS"
 RANKS=$(( CFG_TP * CFG_DP * (NUM_PREFILL + NUM_DECODE) ))
+[ "$AGGREGATE" != 1 ] || RANKS=$(( CFG_TP * CFG_DP ))
 if [ "$RANKS" -ne $(( CHIPS * 2 )) ]; then
     log "WARNING: the pair runs $RANKS ranks on $CHIPS chips, which is not the" \
         "two-per-chip v7x shape; check AGENTX_CHIPS is chips and not ranks"
@@ -190,7 +202,11 @@ fi
 # both clients: each role TP x DP with EP across both when the config enables
 # it, disaggregated. Not the chip count, which is --chips.
 EP=1; [ "$CFG_ENABLE_EP" != true ] || EP=$(( CFG_TP * CFG_DP ))
-ix_export_topology "$CFG_TP" "$CFG_DP" "$EP" 1
+if [ "$AGGREGATE" = 1 ]; then
+    ix_export_topology "$CFG_TP" "$CFG_DP" "$EP" 0
+else
+    ix_export_topology "$CFG_TP" "$CFG_DP" "$EP" 1
+fi
 # What plain TP x DP does not say, from a config that states it - DCP, and
 # decode's attention DP - so the row tells such points apart.
 [ -z "$CFG_PREFILL_DCP_SIZE" ] || export PREFILL_DCP_SIZE="$CFG_PREFILL_DCP_SIZE"
@@ -274,8 +290,39 @@ done
 AIPERF_SERVER_METRICS_URLS=$(IFS=,; echo "${_metrics[*]}")
 export AIPERF_SERVER_METRICS_URLS
 
-log "starting the $CFG_PROXY proxy on port $PROXY_PORT"
-if [ "$CFG_PROXY" = router ]; then
+if [ "$AGGREGATE" = 1 ]; then
+    # The engine is its own OpenAI server, as InferenceX's direct vllm frontend;
+    # a byte-level loopback forwarder gives the clients the 127.0.0.1 port they need.
+    log "starting a loopback forwarder 127.0.0.1:$PROXY_PORT -> $DECODE_HOST:$PORT"
+    python3 - "$PROXY_PORT" "$DECODE_HOST" "$PORT" >"$RESULTS_DIR/proxy.log" 2>&1 <<'PY' &
+import asyncio, sys
+
+listen, host, port = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+
+async def pipe(reader, writer):
+    try:
+        while data := await reader.read(65536):
+            writer.write(data)
+            await writer.drain()
+    finally:
+        writer.close()
+
+async def handle(client_reader, client_writer):
+    server_reader, server_writer = await asyncio.open_connection(host, port)
+    await asyncio.gather(pipe(client_reader, server_writer), pipe(server_reader, client_writer),
+                         return_exceptions=True)
+
+async def main():
+    server = await asyncio.start_server(handle, "127.0.0.1", listen)
+    async with server:
+        await server.serve_forever()
+
+asyncio.run(main())
+PY
+    proxy_pid=$!
+    proxy_health="health"
+elif [ "$CFG_PROXY" = router ]; then
+    log "starting the router proxy on port $PROXY_PORT"
     # The request timeout covers a full decode; retries off so a failed hop
     # fails the request instead of prefilling it twice.
     # consistent_hash keys on aiperf's x-correlation-id, so a conversation's
@@ -317,6 +364,7 @@ if [ "$CFG_PROXY" = router ]; then
     proxy_pid=$!
     proxy_health="health"
 else
+    log "starting the toy proxy on port $PROXY_PORT"
     python3 examples/disagg/toy_proxy_server.py \
         --host 0.0.0.0 --port "$PROXY_PORT" \
         --prefiller-hosts "$PREFILL_HOST" --prefiller-ports "$PORT" \

@@ -18,6 +18,7 @@
 # replica per host.
 #
 #   k3_1p1d.sh prefill|decode          every pod of the role's slice
+#   k3_1p1d.sh aggregate               every pod of an aggregate engine's slice
 #
 # The launch is mp_multihost_entry.sh's, which serves a config under
 # run_eval_flow.sh and so cannot front a pair: index 0 serves the API at the
@@ -53,8 +54,9 @@ DP_LOCAL=1
 
 role="${1:-}"
 case "$role" in
-  prefill|decode) ;;
-  *) echo "usage: $0 prefill|decode" >&2; exit 2 ;;
+  # aggregate: one engine serving both roles (kimi-k3-agentx-agg.yaml).
+  prefill|decode|aggregate) ;;
+  *) echo "usage: $0 prefill|decode|aggregate" >&2; exit 2 ;;
 esac
 : "${POD_IP:?}" "${ROLE_HOST_PREFIX:?}" "${ROLE_HOST_DOMAIN:?}" "${DECODE_HOST:?}"
 : "${NUM_HOSTS:?}"

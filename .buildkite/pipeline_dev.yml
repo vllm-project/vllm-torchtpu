@@ -202,7 +202,7 @@ steps:
 
   - label: ":tpu: Perf: Kimi-K3 AgentX 1P1D ${K3_PD_CONFIG} (TPU v7x 2x2x4 x2)"
     key: k3_mk_agentx_1p1d
-    if: 'build.env("K3_PD_CONFIG") != null'
+    if: 'build.env("K3_PD_CONFIG") != null && build.env("K3_PD_CONFIG") !~ /^kimi-k3-megakernel-agg\//'
     depends_on:
       - build_docker
       - k3_engine_image
@@ -236,3 +236,26 @@ steps:
         test -f "scripts/vllm/benchmarking/configs/$${K3_PD_CONFIG}.sh" \
           || { echo "no such config: $${K3_PD_CONFIG}" >&2; exit 2; }
       - .buildkite/kubernetes/run_multihost.sh --manifest kimi-k3-agentx-1p1d.yaml
+
+  # One aggregate engine (prefill and decode programs) on one 2x2x4 slice, for a
+  # kimi-k3-megakernel-agg/ point; the engine image comes from K3_ENGINE_REF.
+  - label: ":tpu: Perf: Kimi-K3 AgentX aggregate ${K3_PD_CONFIG} (TPU v7x 2x2x4)"
+    key: k3_mk_agentx_agg
+    if: 'build.env("K3_PD_CONFIG") =~ /^kimi-k3-megakernel-agg\//'
+    depends_on:
+      - build_docker
+      - k3_engine_image
+    timeout_in_minutes: 1440
+    env:
+      ARTIFACTS_DIR: "perf_eval_results"
+      WORKLOAD_PRIORITY: "post-merge"
+    agents:
+      queue: "kube"
+    plugins:
+      - kubernetes:
+          podTemplate: tpu-launcher
+    commands:
+      - |
+        test -f "scripts/vllm/benchmarking/configs/$${K3_PD_CONFIG}.sh" \
+          || { echo "no such config: $${K3_PD_CONFIG}" >&2; exit 2; }
+      - .buildkite/kubernetes/run_multihost.sh --manifest kimi-k3-agentx-agg.yaml
