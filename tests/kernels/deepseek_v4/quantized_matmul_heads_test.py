@@ -221,3 +221,17 @@ def test_quantized_matmul_heads_rope_quant_is_bit_identical_on_tpu(m):
         np.testing.assert_array_equal(
             np.asarray(g).view(bits), np.asarray(w).view(bits)
         )
+
+
+def test_signed_sin_rotation_is_bit_identical():
+    keys = jax.random.split(jax.random.key(3), 3)
+    x = jax.random.normal(keys[0], (64, 4, 128), jnp.float32)
+    x = x * jnp.exp(jax.random.uniform(keys[1], (64, 4, 1), minval=-30, maxval=30))
+    cos_sin = jax.random.uniform(keys[2], (64, 64), jnp.float32, -1, 1)
+    cos, sin = rope.cos_sin_lanes(cos_sin)
+    cos_s, signed_sin = rope.cos_signed_sin_lanes(cos_sin)
+    want = rope.rope_lanes(x, cos[:, None], sin[:, None])
+    got = rope.rope_lanes_signed(x, cos_s[:, None], signed_sin[:, None])
+    np.testing.assert_array_equal(
+        np.asarray(got).view(np.uint32), np.asarray(want).view(np.uint32)
+    )

@@ -32,10 +32,10 @@ from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
     config as compressor_config,
 )
 from vllm_torchtpu.kernels.deepseek_v4.rope import (
-    cos_sin_lanes,
+    cos_signed_sin_lanes,
     quantized_matmul_heads,
     quantized_matmul_heads_supported,
-    rope_lanes,
+    rope_lanes_signed,
     rope_quant_flat,
 )
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
@@ -185,8 +185,8 @@ def _wq_b_indexer_jax(
         w_q,
         w_s,
         head_dim,
-        rope_lanes,
-        cos_sin_lanes,
+        rope_lanes_signed,
+        cos_signed_sin_lanes,
         positions,
         cos_sin_cache,
         quant_dtype=jnp.float8_e4m3fn,

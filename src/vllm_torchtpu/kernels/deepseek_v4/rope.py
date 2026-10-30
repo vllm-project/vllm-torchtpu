@@ -175,9 +175,16 @@ def _rotate_gptj(x: jax.Array) -> jax.Array:
     constant-index lane shuffle and a sign, no reshape. Lane parity may be read
     for channel parity because ``LANE - rotary_dim`` is even.
     """
-    lane = jnp.arange(LANE)
-    sign = jnp.where(lane % 2 == 0, -1.0, 1.0).astype(jnp.float32)
-    return _lane_gather(x, lane ^ 1) * sign
+    return _lane_gather(x, _partner_lanes()) * _rotation_sign()
+
+
+def _partner_lanes() -> jax.Array:
+    return jnp.arange(LANE) ^ 1
+
+
+def _rotation_sign() -> jax.Array:
+    """`_rotate_gptj`'s sign: negate the partner on even lanes."""
+    return jnp.where(jnp.arange(LANE) % 2 == 0, -1.0, 1.0).astype(jnp.float32)
 
 
 def _rope_body(
@@ -506,6 +513,21 @@ def cos_sin_lanes(
 def rope_lanes(x: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
     """`_rope_body`'s f32 rotation of ``(tokens, LANE)`` rows."""
     return x * cos + _rotate_gptj(x) * sin
+
+
+def cos_signed_sin_lanes(cos_sin: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """`cos_sin_lanes` with `_rotate_gptj`'s sign folded into ``sin``."""
+    cos, sin = cos_sin_lanes(cos_sin)
+    return cos, sin * _rotation_sign()
+
+
+def rope_lanes_signed(x: jax.Array, cos: jax.Array, signed_sin: jax.Array) -> jax.Array:
+    """`rope_lanes` given `cos_signed_sin_lanes`, one multiply fewer per value.
+
+    Bit-identical: ``(g * s) * sin`` and ``g * (s * sin)`` round the same
+    product when ``s`` is +-1.
+    """
+    return x * cos + _lane_gather(x, _partner_lanes()) * signed_sin
 
 
 def qnorm_rope_head(
