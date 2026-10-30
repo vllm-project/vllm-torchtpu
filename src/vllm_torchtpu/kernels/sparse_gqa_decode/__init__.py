@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""TPU7x sparse decode.
+"""Sparse decode with the shared RPA row and resource contracts.
 
 JAX-facing API with per-query physical page lookup.
 Callers guarantee valid group/page IDs and lengths, and thread returned cache
@@ -57,7 +57,7 @@ def qsa_decode_attention(
     )
     if launch is None:
         raise NotImplementedError(
-            "Fused decode requires TPU7x, divisible Q/KV heads, "
+            "Fused decode requires divisible Q/KV heads, "
             "lane-aligned dimensions, "
             "a ratio dividing the KV tile, a launch fitting SMEM/VMEM, "
             "BF16 query/gate, native BF16/FP8 cache, positive ratio-aligned "

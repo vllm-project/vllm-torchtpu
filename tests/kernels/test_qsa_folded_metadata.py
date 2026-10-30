@@ -74,7 +74,7 @@ def test_folded_verify_routes_rows_and_owners(monkeypatch):
     monkeypatch.setattr(
         qsa_rpa, "_rpa_attention_batch", lambda *a, **kw: attend("decode", *a, **kw)
     )
-    monkeypatch.setattr(qsa_rpa, "rpa_query_batch_size", lambda *a, **kw: 64)
+    monkeypatch.setattr(qsa_rpa.batching, "rpa_query_batch_size", lambda *a, **kw: 64)
     with jax.disable_jit():
         output, owner = qsa_rpa.qsa_attention(
             q,

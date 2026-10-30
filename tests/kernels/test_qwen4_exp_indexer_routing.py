@@ -25,6 +25,7 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
     SparseCoreTopK,
 )
 from vllm_torchtpu.kernels.qwen4_exp import decode_indexer, pooled_qsa
+from vllm_torchtpu.kernels.qwen4_exp.indexer_components import qsa_indexing
 from vllm_torchtpu.kernels.qwen4_exp.qsa import _token_metadata
 
 
@@ -97,7 +98,7 @@ def test_shared_schedule_forwards_backend_and_causal_metadata(
                 (lengths[rq] - (cu[rq + 1] - jnp.arange(len(q))) + 1) // 4, 0
             )
             visible = jnp.where(jnp.arange(len(q)) < cu[-1], visible, 0)
-            assert kwargs["components"].schedule.causal_position_offset == 3
+            assert kwargs["components"] == qsa_indexing()
         return jnp.where(
             jnp.arange(16)[None] < visible[:, None], jnp.arange(16)[None], -1
         )
@@ -241,11 +242,12 @@ def test_native_schedule_matches_independent_visibility(tokens, requests, altern
 def test_native_factories_accept_default_and_bound_backend_without_backend_init():
     import functools
 
-    import torch
     from jax._src import xla_bridge
     from torch_tpu._internal import pallas
+    from torch_tpu._internal.device._device_module import (
+        TpuDeviceModule as device_module,
+    )
 
-    device_module = torch.get_device_module("tpu")
     initialized = device_module.is_initialized()
     clients = tuple(xla_bridge._backends)
     for name, fn in [

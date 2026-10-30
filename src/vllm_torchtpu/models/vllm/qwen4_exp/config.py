@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Single admission boundary for the FP8, text-only TPU S1 implementation."""
+"""Qwen configuration and native pooled-state contracts."""
 
 import math
 from collections.abc import Mapping

@@ -26,8 +26,7 @@ PREFILL_DISPATCH_CHUNK_QUERIES = 8192
 SC_CHUNK_SIZE = {jnp.dtype(jnp.bfloat16): 32, jnp.dtype(jnp.float8_e4m3fn): 64}
 SC_COMPACT_TARGET_BYTES = 144 * 1024**2
 
-# TPU7x: 16 words per reduction batch minimizes measured exact-union latency.
-# At 8192 queries / 256K context, scratch stays below 65 MiB.
+# Bound the word-axis batch used by the exact-union reduction.
 UNION_WORD_BATCH_SIZE = 16
 
 

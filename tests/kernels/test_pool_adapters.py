@@ -589,4 +589,3 @@ def test_positive_scatter_preserves_null_and_split_complement(split, tok0, ntok)
     np.testing.assert_array_equal(
         np.asarray(actual).view(np.uint8), expected.reshape(shape).view(np.uint8)
     )
-

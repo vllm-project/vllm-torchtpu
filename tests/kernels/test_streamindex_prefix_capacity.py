@@ -190,7 +190,7 @@ def test_real_pipeline_selects_same_ids_and_keeps_branch_groups_disjoint(
         scheduling_group_namespace=5,
         prefix_capacity=256 if opt_in is True else None,
     )
-    visible = np.arange(1, T + 1) // 4
+    visible = np.maximum((np.arange(1, T + 1) - 3) // 4, 0)
     expected = np.where(
         np.arange(128)[None, :] < np.minimum(visible, 128)[:, None],
         np.maximum(visible - 128, 0)[:, None] + np.arange(128)[None, :],

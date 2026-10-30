@@ -56,8 +56,7 @@ def schedule_copy_size(prefix_words, capacity_words: int, alignment_words: int):
     Every schedule leaf has max_steps (a vector-row multiple) times words per
     step. These alignments preserve complete HBM layout rows. Pinned Pallas
     forwards the same slices to enqueue_dma/wait_dma2; 1024 is not its minimum.
-    The smallest supported row-preserving policy is 128 words on TPU7x; this
-    does not claim a silicon minimum for arbitrary DMA.
+    The minimum preserves one row of the shared uint32 wait ABI.
     """
     if alignment_words <= 0 or alignment_words % RPA_WAIT_ROW_WORDS:
         raise ValueError("Schedule DMA policy must preserve whole uint32 rows")

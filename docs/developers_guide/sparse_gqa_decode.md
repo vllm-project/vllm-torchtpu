@@ -1,7 +1,7 @@
 # Fused sparse GQA decode
 
-QSA uses fused decode on supported TPU7x inputs and bounded batched RPA
-otherwise. Prefill layouts without aligned TC DMA segments also use bounded RPA.
+QSA uses fused decode when the shared row ABI and resource budgets fit,
+and bounded batched RPA otherwise. Prefill layouts without aligned TC DMA segments also use bounded RPA.
 [Eligibility][eligibility] requires BF16
 Q/gate, divisible positive Q/KV heads, lane-aligned dimensions, native
 `HEAD_ALONG_SUBLANE` BF16/FP8 cache, nonempty metadata and int32-bounded

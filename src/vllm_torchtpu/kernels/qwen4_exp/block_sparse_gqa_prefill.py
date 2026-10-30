@@ -995,7 +995,7 @@ def _prepare_metadata_bounded(
     ratio=4,
     query_block=256,
     kv_tile=256,
-    physical_page_size=1664,
+    physical_page_size: int,
     batch_size=1,
 ):
     tokens = blocks.shape[0]

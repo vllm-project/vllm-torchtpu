@@ -335,6 +335,9 @@ def test_execute_step_snapshots_after_reorder_and_forwards_substituted_ids(
         forward_model=forward,
         model_adapter=NS(begin_step=begin, prepare_inputs=prepare) if enabled else None,
     )
+    runner._any_decode = lambda scheduled: tpu_runner.TPUModelRunner._any_decode(
+        cast(tpu_runner.TPUModelRunner, runner), scheduled
+    )
     scheduler = NS(total_num_scheduled_tokens=4, scheduled_encoder_inputs={})
     with pytest.raises(ForwardReached):
         tpu_runner.TPUModelRunner.execute_model(runner, scheduler)

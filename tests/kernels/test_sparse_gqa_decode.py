@@ -260,13 +260,15 @@ def _specs(fp8=False):
     ],
 )
 def test_decode_eligibility_rejects_invalid_contracts(monkeypatch, fp8, case):
-    chip = pltpu.ChipVersion.TPU_V5P if case == "hardware" else pltpu.ChipVersion.TPU_7X
-    monkeypatch.setattr(
-        pltpu, "get_tpu_info", lambda: pltpu.get_tpu_info_for_chip(chip, 1)
-    )
+    import dataclasses
+
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    if case == "hardware":
+        info = dataclasses.replace(info, vmem_capacity_bytes=1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
     args = _specs(fp8)
     changes = {
-        "heads": (0, (8, 12, 256)),
+        "heads": (0, (8, 3, 256)),
         "page": (5, (158, 130, *args[5].shape[2:])),
         "budget": (2, (8, 0)),
         "batch": (0, (257, 24, 256)),
@@ -275,6 +277,8 @@ def test_decode_eligibility_rejects_invalid_contracts(monkeypatch, fp8, case):
     if case in changes:
         i, shape = changes[case]
         args[i] = jax.ShapeDtypeStruct(shape, args[i].dtype)
+        if i == 0:
+            args[1] = jax.ShapeDtypeStruct(shape, args[1].dtype)
     if case == "dtype":
         args[0] = jax.ShapeDtypeStruct(args[0].shape, jnp.float32)
     scale = jax.ShapeDtypeStruct((), jnp.float32) if case == "scale" else 1.0
@@ -282,12 +286,12 @@ def test_decode_eligibility_rejects_invalid_contracts(monkeypatch, fp8, case):
         *args, kv_heads=2, ratio=4, k_scale=scale, v_scale=1.0
     ) == (case == "supported")
     if case != "supported":
-        with pytest.raises(NotImplementedError, match="requires TPU7x"):
-            qsa_decode_attention(*args, kv_heads=2, k_scale=scale)
+        with pytest.raises(NotImplementedError, match="requires divisible"):
+            qsa_decode_attention(*args, kv_heads=2, ratio=4, k_scale=scale)
 
 
 @pytest.mark.parametrize("supported", [False, True])
-def test_qsa_decode_dispatch_preserves_rpa_fallback(monkeypatch, supported):
+def test_decode_dispatch_preserves_rpa_fallback(monkeypatch, supported):
     from vllm_torchtpu.kernels.qwen4_exp import qsa_rpa
 
     monkeypatch.setattr(
@@ -312,10 +316,8 @@ def test_qsa_decode_dispatch_preserves_rpa_fallback(monkeypatch, supported):
     from vllm_torchtpu.kernels.sparse_gqa_decode import decode
 
     monkeypatch.setattr(decode, "execute_decode", fused)
-    monkeypatch.setattr(qsa_rpa, "rpa_attention", baseline)
-    out, cache = qsa_rpa.qsa_attention(
-        *args, jax.ShapeDtypeStruct((9,), jnp.int32), kv_heads=2, ratio=4
-    )
+    monkeypatch.setattr(qsa_rpa, "_rpa_attention_in_chunks", baseline)
+    out, cache = qsa_rpa.rpa_attention(*args, kv_heads=2, ratio=4)
     assert used == (["fused"] if supported else ["rpa"])
     assert out is args[0]
     assert cache is args[5]

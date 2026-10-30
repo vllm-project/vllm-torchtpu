@@ -254,9 +254,9 @@ def test_component_row_lengths_are_bounded(
 @pytest.mark.parametrize(
     "cp_size,cp_rank,expected",
     [
-        (1, 0, [2, 2, 2, 1, 0, 0]),
+        (1, 0, [1, 2, 2, 1, 0, 0]),
         (2, 0, [1, 1, 1, 1, 0, 0]),
-        (2, 1, [1, 1, 1, 0, 0, 0]),
+        (2, 1, [0, 1, 1, 0, 0, 0]),
     ],
 )
 def test_default_row_lengths_keep_causal_and_padding_behavior(

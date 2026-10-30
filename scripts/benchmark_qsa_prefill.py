@@ -14,11 +14,12 @@
 """Compare paired-page QSA prefill with RPA or single-page prefill.
 
 Run on an allocated TPU with the repository's pinned dependencies:
-  PYTHONPATH=src python scripts/benchmark_qsa_prefill.py --output /tmp/qsa-prefill
+  PYTHONPATH=src python scripts/benchmark_qsa_prefill.py \
+      --output /tmp/qsa-prefill --page-size <physical-page-tokens>
 
 For BF16 paired-page A/B, add --cache-dtype bfloat16 --baseline kv128.
 For adaptive vs paired prefill, add --candidate adaptive --baseline paired.
-Adaptive requires page1664 and its documented calibration/metadata envelope.
+Adaptive uses actual query/cache shapes and the hardware work model.
 
 Includes selection metadata, attention and output gating; excludes the indexer,
 cache writes, compilation and warmup. Does not benchmark decode or a model.
@@ -45,7 +46,7 @@ from vllm_torchtpu.kernels.qwen4_exp.rounding import bf16
 # Benchmark-only baseline extracted from qsa_rpa.py at f7bd08a6e. It builds
 # virtual pages and calls the existing batched RPA API without modifying it.
 # Keeping the adapter here makes this kernel PR independent of model integration.
-def virtual_page_metadata(blocks, lengths, table, *, ratio=4, page_size=128):
+def virtual_page_metadata(blocks, lengths, table, *, ratio=4, page_size: int):
     """Map selected logical groups to physical micro-pages; no KV gathering."""
     batch, budget = blocks.shape
     complete = lengths // ratio
@@ -184,7 +185,7 @@ def case(
     context: int,
     pattern: str,
     *,
-    page_size: int = 1664,
+    page_size: int,
     cache_dtype: str = "float8_e4m3fn",
 ) -> tuple[jax.Array, ...]:
     rng = np.random.default_rng(1964)
@@ -240,7 +241,7 @@ def main() -> None:
     parser.add_argument(
         "--cache-dtype", choices=["float8_e4m3fn", "bfloat16"], default="float8_e4m3fn"
     )
-    parser.add_argument("--page-size", type=int, choices=[128, 1664], default=1664)
+    parser.add_argument("--page-size", type=int, required=True)
     parser.add_argument("--baseline", choices=["rpa", "kv128", "paired"], default="rpa")
     parser.add_argument("--candidate", choices=["paired", "adaptive"], default="paired")
     args = parser.parse_args()
