@@ -543,6 +543,14 @@ def prepare_routed_gmm_inputs(
             # expert prefix through SparseCore ragged_gather. Invalid
             # non-local rows are sorted after the valid prefix.
             valid_count = group_sizes_local.sum(dtype=jnp.int32)
+            if x_scale is not None:
+                # Unpacking the sorted scale words reads no row, so fence it
+                # ahead of the rows' gather: it then runs while an async EP
+                # dispatch all-gather of the rows is still in flight, not
+                # after it, where it holds up the GMM.
+                token_indices_sorted, x_scale = jax.lax.optimization_barrier(
+                    (token_indices_sorted, x_scale)
+                )
             x = ragged_gather_v2(
                 hidden_states_local,
                 token_indices_sorted,
