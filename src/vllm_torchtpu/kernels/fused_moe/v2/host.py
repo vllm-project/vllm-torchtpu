@@ -344,15 +344,27 @@ WEIGHT_FORMS = {
 WEIGHT_FORMAT_NAMES = tuple(WEIGHT_FORMS)
 
 
-def weight_form(weight_format):
-    """The record for a format; raises naming the accepted set."""
+def weight_form(weight_format, wire_dtype=None):
+    """The record for a format; raises naming the accepted set.
+
+    `wire_dtype` overrides the format's result wire. Only a bf16 wire is
+    accepted, for every format: the combine reads a bf16 arrival against its
+    unit scale mirror whatever the weights were, so it only widens the wire.
+    """
     try:
-        return WEIGHT_FORMS[WeightFormat(weight_format)]
+        form = WEIGHT_FORMS[WeightFormat(weight_format)]
     except ValueError:
         raise NotImplementedError(
             f"the fused EP MoE kernel takes weight formats "
             f"{WEIGHT_FORMAT_NAMES}; got {weight_format!r}"
         ) from None
+    if wire_dtype is None:
+        return form
+    if jnp.dtype(wire_dtype) != jnp.dtype(BF16):
+        raise NotImplementedError(
+            f"the fused EP MoE wire override takes bfloat16; got {wire_dtype!r}"
+        )
+    return form._replace(wire_dtype=BF16)
 
 
 def weight_format_of_dtype(dtype):
@@ -1361,6 +1373,7 @@ def vmem_scratch_arrays(
     rhs_qb=QB4,
     has_w1_bias=False,
     has_w2_bias=False,
+    wire_dtype=None,
 ):
     """The kernel's VMEM scratch buffers, as (name, shape, dtype).
 
@@ -1381,7 +1394,7 @@ def vmem_scratch_arrays(
     offset legal. It does that for every element type, which is why a
     sixteen-bit wire takes the same geometry at twice the bytes.
     """
-    form = weight_form(weight_format)
+    form = weight_form(weight_format, wire_dtype)
     lane_blocks = row_lane_blocks(hidden)
     # The tile height IS the capacity, and the out pair is in tile units.
     tile_m = capacity
@@ -1455,7 +1468,13 @@ def vmem_scratch_arrays(
 
 
 def vmem_tile_body_arrays(
-    capacity, hidden, inter, *, weight_format=WeightFormat.FP8, rhs_qb=QB4
+    capacity,
+    hidden,
+    inter,
+    *,
+    weight_format=WeightFormat.FP8,
+    rhs_qb=QB4,
+    wire_dtype=None,
 ):
     """What one tile body keeps live, as (name, shape, dtype).
 
@@ -1476,7 +1495,7 @@ def vmem_tile_body_arrays(
     The row staging a tile reads is a view of lhs_vm, not a second array,
     so it is not counted again here.
     """
-    form = weight_form(weight_format)
+    form = weight_form(weight_format, wire_dtype)
     tile_m = capacity
     arrays = [
         ("acc1", (tile_m, 2 * inter), jnp.float32),
@@ -1531,6 +1550,7 @@ def vmem_estimate_bytes(
     has_w1_bias=False,
     has_w2_bias=False,
     info=None,
+    wire_dtype=None,
 ):
     """VMEM one built kernel occupies, from the arrays it declares.
 
@@ -1556,9 +1576,15 @@ def vmem_estimate_bytes(
         rhs_qb=rhs_qb,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        wire_dtype=wire_dtype,
     )
     arrays += vmem_tile_body_arrays(
-        capacity, hidden, inter, weight_format=weight_format, rhs_qb=rhs_qb
+        capacity,
+        hidden,
+        inter,
+        weight_format=weight_format,
+        rhs_qb=rhs_qb,
+        wire_dtype=wire_dtype,
     )
     return sum(array_vmem_bytes(shape, dtype, info) for _, shape, dtype in arrays)
 
@@ -1595,6 +1621,7 @@ def fit_weight_slots(
     has_w2_bias=False,
     info=None,
     limit=None,
+    wire_dtype=None,
 ):
     """The deepest prefetch schedule this shape's VMEM leaves room for.
 
@@ -1637,6 +1664,7 @@ def fit_weight_slots(
                 has_w1_bias=has_w1_bias,
                 has_w2_bias=has_w2_bias,
                 info=info,
+                wire_dtype=wire_dtype,
             ),
             limit,
         )

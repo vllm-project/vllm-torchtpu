@@ -271,6 +271,7 @@ def fused_ep_moe_v2(
     hash_topk_ids=None,
     routed_scaling_factor=1.0,
     token_replica_groups=None,
+    wire_dtype=None,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -314,6 +315,10 @@ def fused_ep_moe_v2(
     routes and computes a disjoint slice, then gathers the combined outputs
     within its group to restore the input row order. Expert sharding stays
     unchanged. None means singleton groups with no token replication.
+
+    wire_dtype=jnp.bfloat16 carries the computed rows back to their token
+    owners in bf16 instead of the format's wire (row-quantized fp8 for fp8
+    weights); None keeps the format's. See `host.weight_form`.
 
     mesh_ep_ranks names the EP rank at every device-mesh index. A non-identity
     order relabels only the selected expert ids after top-k, keeping the full
@@ -453,6 +458,7 @@ def fused_ep_moe_v2(
         act_fn=act_fn,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        **({} if wire_dtype is None else {"wire_dtype": jnp.dtype(wire_dtype)}),
     )
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
@@ -782,6 +788,7 @@ def fused_ep_moe_v2(
         has_score_bias and score_bias.dtype,
         has_hash_ids and hash_topk_ids.dtype,
         float(routed_scaling_factor),
+        None if wire_dtype is None else jnp.dtype(wire_dtype),
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

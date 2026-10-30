@@ -533,8 +533,11 @@ def _build_fused_ep_moe_kernel(
     act_fn="silu",
     has_w1_bias=False,
     has_w2_bias=False,
+    wire_dtype=None,
 ):
-    """Build the pallas_call and the function that invokes it."""
+    """Build the pallas_call and the function that invokes it.
+
+    `wire_dtype` overrides the format's result wire (`host.weight_form`)."""
     if act_fn not in ACT_FNS:
         raise NotImplementedError(
             f"the fused EP MoE kernel fuses {ACT_FNS}; got {act_fn!r}"
@@ -544,7 +547,7 @@ def _build_fused_ep_moe_kernel(
     # results over an all-to-all carrying unweighted rows; it returns
     # (arrival rows, arrival scales f32). The element type of the staging and
     # of the wire is the weight format's, not a literal here.
-    form = host.weight_form(weight_format)
+    form = host.weight_form(weight_format, wire_dtype)
     rhs_packed4 = weight_format == host.WeightFormat.FP4
     # The weight prefetch distance and the slot count it needs are chosen
     # below, once the shapes they are sized against have been checked: they
@@ -642,6 +645,7 @@ def _build_fused_ep_moe_kernel(
         rhs_qb=rhs_qb,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        wire_dtype=wire_dtype,
     )
     prefetch_distance = slots.distance
     nbuf = slots.nbuf
@@ -1885,6 +1889,7 @@ def _build_fused_ep_moe_kernel(
                 rhs_qb=rhs_qb,
                 has_w1_bias=has_w1_bias,
                 has_w2_bias=has_w2_bias,
+                wire_dtype=wire_dtype,
             )
         ]
         + [
@@ -1981,6 +1986,8 @@ def _build_fused_ep_moe_kernel(
         bias_tag = ("_w13bias" if has_w1_bias else "") + (
             "_w2bias" if has_w2_bias else ""
         )
+        if wire_dtype is not None:
+            bias_tag += "_bf16wire"
         name = (
             f"fused_ep_moe_v2"
             f"{format_tag}"
