@@ -67,6 +67,7 @@ def test_native_groups_last_blocks_and_real_capacity(
     )
     runner = NS(vllm_config=cfg, cache_config=cc)
     cache = Qwen4ExpPooledCache(runner, model=None)
+    cache.get_specs()
     cc.block_size = cache.layout.block_size
     specs = cache.get_specs()
     groups = get_kv_cache_groups(cfg, specs)
@@ -167,9 +168,14 @@ def test_native_groups_last_blocks_and_real_capacity(
         )
     ]
     _, kwargs, metadata = prepare_native_pool_inputs(cfg, native, rows, [0], [1], 8)
-    assert kwargs["main_block_table"] is kwargs["compressed_block_table"]
+    assert kwargs["valid_tokens"].sum() == 1
+    assert kwargs["context_lens"][0] == 0
     for gid, group in enumerate(groups):
         for name in group.layer_names:
+            if name.endswith(".self_attn"):
+                table = metadata[name].block_tables
+                assert isinstance(table, torch.Tensor)
+                assert table[0] == gid + 1
             if name.endswith((".linear_attn", ".ple")):
                 assert metadata[name].mamba_state_indices[0] == gid + 1
                 expected_dtype = torch.bfloat16

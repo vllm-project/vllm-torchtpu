@@ -60,9 +60,12 @@ class Qwen4ExpAdapter:
         self.runner = runner
         require_unified_pool()
         self.config = runner.model_config.hf_text_config
-        self.block_size = runner.cache_config.block_size
         self.cache: Qwen4ExpPooledCache | None = None
         self.ngram_context = None
+
+    @property
+    def block_size(self) -> int:
+        return self.runner.cache_config.block_size
 
     def bind_model(self, model):
         from .pooled_cache import Qwen4ExpPooledCache

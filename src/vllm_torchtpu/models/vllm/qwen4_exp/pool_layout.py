@@ -89,7 +89,9 @@ def pooled_cache_specs(cfg):
         default=0,
     )
     required_rows = max(
-        QSA_BLOCK_SIZE, math.ceil(max(gdn_bytes, ple_bytes) / token_bytes)
+        QSA_BLOCK_SIZE,
+        cfg.cache_config.block_size or 0,
+        math.ceil(max(gdn_bytes, ple_bytes) / token_bytes),
     )
     block_size = math.ceil(required_rows / QSA_BLOCK_SIZE) * QSA_BLOCK_SIZE
     main_bytes = block_size * token_bytes

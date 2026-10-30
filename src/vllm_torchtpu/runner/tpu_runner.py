@@ -1776,9 +1776,10 @@ class TPUModelRunner(GPUModelRunner):
     # KV-cache spec derivation, sizing and allocation live on
     # `self.kv_cache_manager` now; these forward the runner's existing callers.
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
-        self._refresh_smem_request_caps()
         with set_current_vllm_config(self.vllm_config):
-            return self.kv_cache_manager.get_kv_cache_spec()
+            specs = self.kv_cache_manager.get_kv_cache_spec()
+        self._refresh_smem_request_caps()
+        return specs
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         with set_current_vllm_config(self.vllm_config):

@@ -45,12 +45,29 @@ class Qwen4ExpPooledCache:
     def __init__(self, runner, model):
         require_unified_pool()
         self.runner, self.model = runner, model
-        self.layout, self.specs = pooled_cache_specs(runner.vllm_config)
-        self.pages = native_cache_capacity(runner.vllm_config, self.specs)
-        self.groups = get_kv_cache_groups(runner.vllm_config, self.specs)
+        self.requested_blocks = runner.cache_config.num_gpu_blocks_override
         self.materialized = None
 
     def get_specs(self):
+        cfg = self.runner.vllm_config
+        layout, specs = pooled_cache_specs(cfg)
+        pages = native_cache_capacity(cfg, specs)
+        if self.materialized is not None and (
+            layout != self.layout or specs != self.specs or pages != self.pages
+        ):
+            raise ValueError("Qwen native cache geometry changed after allocation")
+        self.layout, self.specs = layout, specs
+        cache = cfg.cache_config
+        cache.block_size = self.layout.block_size
+        cache.mamba_block_size = (
+            self.layout.block_size if cache.enable_prefix_caching else None
+        )
+        cache.mamba_page_size_padded = self.layout.page_bytes
+        self.pages = pages
+        if self.requested_blocks not in (None, self.pages):
+            raise ValueError(f"Qwen4Exp native capacity requires {self.pages} blocks")
+        cache.num_gpu_blocks_override = self.pages
+        self.groups = get_kv_cache_groups(cfg, self.specs)
         return self.specs
 
     def get_transfer_groups(self) -> tuple[TransferGroup, ...]:
@@ -63,6 +80,7 @@ class Qwen4ExpPooledCache:
         if self.materialized is not None:
             return
         runner = self.runner
+        self.get_specs()
         config = get_kv_cache_config_from_groups(
             runner.vllm_config,
             self.groups,
