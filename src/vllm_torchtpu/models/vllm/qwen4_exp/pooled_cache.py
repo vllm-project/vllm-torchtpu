@@ -199,13 +199,18 @@ class Qwen4ExpPooledCache:
             runner._precompile_substitute_placeholder_token()
         return materialized.kv_caches
 
-    def dummy_metadata(self, metadata, active_rows):
+    def dummy_metadata(self, metadata, active_rows, *, use_max_model_len=True):
         """Disjoint owner pages even before runner cache initialization.
 
         Every group gets its own IDs. Reusing one dummy block across QSA,
         GDN and PLE would turn profiling into destructive cross-owner writes.
         """
         rows = metadata.seq_lens.shape[0]
+        context_limit = (
+            self.runner.max_model_len
+            if use_max_model_len
+            else self.runner.most_model_len
+        )
         result = {}
         next_page = 1
         for group in self.groups:
@@ -216,9 +221,7 @@ class Qwen4ExpPooledCache:
                 1
                 if state
                 else get_block_table_width(
-                    spec.max_num_blocks_per_req(
-                        self.runner.vllm_config, self.runner.max_model_len
-                    ),
+                    spec.max_num_blocks_per_req(self.runner.vllm_config, context_limit),
                     spec.block_size,
                 )
             )

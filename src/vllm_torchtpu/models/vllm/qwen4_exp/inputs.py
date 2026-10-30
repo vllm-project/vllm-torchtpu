@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from vllm.forward_context import set_forward_context
+from vllm.sequence import IntermediateTensors
 
 from vllm_torchtpu.kv_cache_materializer import LayerKVCache
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
@@ -136,11 +137,33 @@ class Qwen4ExpAdapter:
         return kwargs
 
     def dummy_run(
-        self, num_tokens, num_reqs, profile_prefix=None, *, dp_lockstep=False
+        self,
+        num_tokens,
+        num_reqs,
+        profile_prefix=None,
+        *,
+        num_blocks=None,
+        use_max_model_len=True,
+        dp_lockstep=False,
+        through_handoff=False,
     ):
         runner = self.runner
+        context_limit = (
+            runner.max_model_len if use_max_model_len else runner.most_model_len
+        )
+        columns = (
+            math.ceil(context_limit / self.block_size)
+            if num_blocks is None
+            else num_blocks
+        )
         if dp_lockstep:
-            return self._idle_run(num_tokens, num_reqs)
+            return self._idle_run(
+                num_tokens,
+                num_reqs,
+                columns,
+                use_max_model_len=use_max_model_len,
+                through_handoff=through_handoff,
+            )
         assert runner.input_batch.num_reqs == 0, (
             "S1 dummy calls require no live requests"
         )
@@ -157,7 +180,7 @@ class Qwen4ExpAdapter:
             context_cpu[0] = profile_prefix
         if (
             max(context_cpu.tolist()[i] + q for i, q in enumerate(lengths))
-            > runner.max_model_len
+            > context_limit
         ):
             raise ValueError("Dummy context exceeds admitted Qwen4Exp context")
         active = sum(q > 0 for q in lengths)
@@ -177,10 +200,7 @@ class Qwen4ExpAdapter:
                 for i, q in enumerate(lengths)
             ]
         )
-        pages_per_req = math.ceil(runner.max_model_len / self.block_size)
-        tables_cpu = torch.zeros(
-            (num_reqs, pages_per_req), dtype=torch.int32, device="cpu"
-        )
+        tables_cpu = torch.zeros((num_reqs, columns), dtype=torch.int32, device="cpu")
         next_page = 1
         for i, q in enumerate(lengths):
             count = math.ceil((int(context_cpu[i]) + q) / self.block_size)
@@ -234,9 +254,13 @@ class Qwen4ExpAdapter:
             num_tokens,
             profile_prefix,
             active_rows=active,
+            use_max_model_len=use_max_model_len,
+            through_handoff=through_handoff,
         )
 
-    def _idle_run(self, num_tokens, num_reqs):
+    def _idle_run(
+        self, num_tokens, num_reqs, columns, *, use_max_model_len, through_handoff
+    ):
         """Participate in remote work without touching local live owners."""
         device = self.runner.device
         starts = torch.zeros(num_reqs + 1, dtype=torch.int32, device=device)
@@ -244,7 +268,7 @@ class Qwen4ExpAdapter:
         slots = torch.full((num_reqs,), -1, dtype=torch.int32, device=device)
         positions = torch.zeros(num_tokens, dtype=torch.int32, device=device)
         table = torch.zeros(
-            (num_reqs, math.ceil(self.runner.max_model_len / self.block_size)),
+            (num_reqs, columns),
             dtype=torch.int32,
             device=device,
         )
@@ -278,6 +302,8 @@ class Qwen4ExpAdapter:
             num_tokens,
             None,
             dp_lockstep=True,
+            use_max_model_len=use_max_model_len,
+            through_handoff=through_handoff,
         )
 
     def _dummy_forward(
@@ -291,10 +317,30 @@ class Qwen4ExpAdapter:
         *,
         dp_lockstep=False,
         active_rows=0,
+        use_max_model_len=True,
+        through_handoff=False,
     ):
         runner = self.runner
         assert self.cache is not None
-        per_layer = self.cache.dummy_metadata(metadata, active_rows)
+        per_layer = self.cache.dummy_metadata(
+            metadata, active_rows, use_max_model_len=use_max_model_len
+        )
+        intermediate_tensors = None
+        if through_handoff:
+            assert runner._pp_wave is not None and profile_prefix is None
+            intermediate_tensors = runner._pp_wave.start_forward(num_tokens)
+            runner._pp_take_topk_indices(intermediate_tensors, num_tokens)
+        elif not runner._pp_is_first:
+            intermediate_tensors = runner._pp_intermediate_tensors(
+                num_tokens,
+                zeros=profile_prefix is None,
+                random=profile_prefix is not None,
+            )
+            runner._pp_take_topk_indices(intermediate_tensors, num_tokens)
+        inputs_embeds = None
+        if runner.supports_mm_inputs and runner._pp_is_first:
+            ids, inputs_embeds = runner._get_model_inputs(ids, None)
+        runner._record_input_staging_fence()
         with (
             set_forward_context(
                 per_layer,
@@ -308,8 +354,29 @@ class Qwen4ExpAdapter:
         ):
             started = time.perf_counter()
             out, _ = runner.forward_model(
-                input_ids=ids, positions=positions, model_kwargs=kwargs
+                input_ids=ids,
+                positions=positions,
+                inputs_embeds=inputs_embeds,
+                intermediate_tensors=intermediate_tensors,
+                model_kwargs=kwargs,
             )
+            if isinstance(out, IntermediateTensors):
+                if through_handoff:
+                    assert runner._pp_wave is not None
+                    runner._pp_wave.end_forward(
+                        runner._pp_outgoing_tensors(out.tensors, num_tokens), num_tokens
+                    )
+                    synchronize_tensors(None, wait=False)
+                    return None
+                synchronize_tensors(list(out.tensors.values()))
+                return (
+                    (time.perf_counter() - started) * 1000
+                    if profile_prefix is not None
+                    else None
+                )
+            if through_handoff:
+                assert runner._pp_wave is not None
+                runner._pp_wave.end_forward(None, num_tokens)
             if dp_lockstep and runner.parallel_config.tensor_parallel_size > 1:
                 # Match the generic runner's idle-DP protocol. The LM head
                 # has a TP collective even when this DP has no live tokens;

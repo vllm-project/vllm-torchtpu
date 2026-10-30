@@ -13,13 +13,19 @@
 # limitations under the License.
 """CPU contracts for the optional runner extension; no model or device loading."""
 
+import os
+import subprocess
+import sys
 from contextlib import nullcontext
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 from types import SimpleNamespace as NS
+from typing import cast
 from unittest.mock import Mock
 
 import pytest
 import torch
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
 
 from vllm_torchtpu.runner import kv_cache_manager, model_adapters, tpu_runner
 from vllm_torchtpu.runner.model_adapters import ModelInputSnapshot
@@ -78,7 +84,16 @@ def test_forward_preserves_kwargs_and_existing_outputs(kwargs, with_intermediate
 
 def test_cache_hooks_bypass_generic_spec_and_allocation(monkeypatch):
     manager = object.__new__(kv_cache_manager.KVCacheManager)
-    specs, config = {"owner": object()}, object()
+    specs = {"owner": object()}
+    config = KVCacheConfig(
+        num_blocks=3,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names=[name], kv_cache_spec=Mock())
+            for name in ("first", "second")
+        ],
+    )
+    manager.runner = cast(tpu_runner.TPUModelRunner, NS(device="cpu"))
     adapter = NS(
         get_kv_cache_spec=Mock(return_value=specs),
         initialize_kv_cache=Mock(),
@@ -90,10 +105,19 @@ def test_cache_hooks_bypass_generic_spec_and_allocation(monkeypatch):
         Mock(side_effect=AssertionError("generic spec path")),
     )
     assert manager.get_kv_cache_spec() is specs
-    # This object has no num_blocks: the adapter must run before generic validation.
+
+    def allocate(actual):
+        assert manager.runner.kv_cache_config is actual
+        assert actual is not config and actual.num_blocks == 3
+        assert set(manager.runner.empty_slot_mappings) == {0, 1}
+        assert all(
+            value.numel() == 0 for value in manager.runner.empty_slot_mappings.values()
+        )
+
+    adapter.initialize_kv_cache.side_effect = allocate
     manager.initialize_kv_cache(config)
     adapter.get_kv_cache_spec.assert_called_once_with()
-    adapter.initialize_kv_cache.assert_called_once_with(config)
+    adapter.initialize_kv_cache.assert_called_once_with(manager.runner.kv_cache_config)
 
 
 def test_no_adapter_uses_generic_spec_and_unified_initialization(monkeypatch):
@@ -141,10 +165,20 @@ def test_dummy_run_delegates_before_generic_device_work():
             num_blocks=3,
             dp_lockstep=True,
             profile_prefix=5,
+            use_max_model_len=False,
+            through_handoff=True,
         )
         == 1.25
     )
-    adapter.dummy_run.assert_called_once_with(16, 2, 5, dp_lockstep=True)
+    adapter.dummy_run.assert_called_once_with(
+        16,
+        2,
+        5,
+        num_blocks=3,
+        use_max_model_len=False,
+        dp_lockstep=True,
+        through_handoff=True,
+    )
     assert events == ["fence", "adapter"]
 
 
@@ -225,8 +259,9 @@ def test_load_selects_adapter_after_device_setup_before_weights(monkeypatch, ena
 
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("payload", ["tensor", "mapping", "none"])
+@pytest.mark.parametrize("multimodal", [False, True])
 def test_execute_step_snapshots_after_reorder_and_forwards_substituted_ids(
-    monkeypatch, enabled, payload
+    monkeypatch, enabled, payload, multimodal
 ):
     class ForwardReached(Exception):
         pass
@@ -245,12 +280,20 @@ def test_execute_step_snapshots_after_reorder_and_forwards_substituted_ids(
         return context
 
     def prepare(snapshot):
+        events.append("adapter_copy")
         snapshots.append(snapshot)
         return kwargs
 
     def forward(**kw):
+        events.append("forward")
         forwards.append(kw)
         raise ForwardReached
+
+    embeds = torch.zeros(4, 8) if multimodal else None
+
+    def model_inputs(ids, mm):
+        events.append("model_copy")
+        return (None, embeds) if multimodal else (ids, None)
 
     trace = Mock(return_value=nullcontext())
     trace.is_enabled.return_value = False
@@ -280,9 +323,9 @@ def test_execute_step_snapshots_after_reorder_and_forwards_substituted_ids(
         _reset_read_offsets_for_new_requests=lambda *a: None,
         _apply_async_token_substitution=lambda *a: substituted,
         input_ids=input_ids,
-        _record_input_staging_fence=lambda: None,
+        _record_input_staging_fence=lambda: events.append("fence"),
         _pp_is_first=True,
-        _get_model_inputs=lambda ids, mm: (ids, None),
+        _get_model_inputs=model_inputs,
         _token_padding_update=lambda n: None,
         _dp_num_tokens_across_dp=lambda n: None,
         mesh=None,
@@ -296,14 +339,18 @@ def test_execute_step_snapshots_after_reorder_and_forwards_substituted_ids(
     with pytest.raises(ForwardReached):
         tpu_runner.TPUModelRunner.execute_model(runner, scheduler)
     assert events == (
-        ["update", "reorder", "begin"] if enabled else ["update", "reorder"]
+        ["update", "reorder", "begin", "model_copy", "adapter_copy", "fence", "forward"]
+        if enabled
+        else ["update", "reorder", "model_copy", "fence", "forward"]
     )
     assert len(forwards) == 1
-    assert forwards[0]["input_ids"] is substituted
+    assert forwards[0]["input_ids"] is (None if multimodal else substituted)
+    assert forwards[0]["inputs_embeds"] is embeds
     assert forwards[0]["model_kwargs"] is (kwargs if enabled else None)
     if enabled:
         (snapshot,) = snapshots
-        assert snapshot.step_context is context and snapshot.input_ids is substituted
+        assert snapshot.step_context is context
+        assert snapshot.input_ids is (None if multimodal else substituted)
         assert snapshot.attention_metadata is metadata
         assert (snapshot.row_start, snapshot.num_requests, snapshot.num_tokens) == (
             0,
@@ -312,3 +359,122 @@ def test_execute_step_snapshots_after_reorder_and_forwards_substituted_ids(
         )
     else:
         assert not snapshots
+
+
+def test_uninitialized_runner_has_no_adapter():
+    runner = object.__new__(tpu_runner.TPUModelRunner)
+    assert runner.model_adapter is None
+
+
+@pytest.mark.parametrize(
+    "key", ["input_ids", "positions", "inputs_embeds", "intermediate_tensors"]
+)
+def test_forward_rejects_explicit_input_key_overlap(key):
+    model = Mock()
+    runner = cast(tpu_runner.TPUModelRunner, NS(model=model))
+    extra = {key: object()}
+    with pytest.raises(AssertionError, match="overlap"):
+        tpu_runner.TPUModelRunner.forward_model(
+            runner,
+            torch.zeros(1),
+            torch.zeros(1),
+            intermediate_tensors=object(),
+            model_kwargs=extra,
+        )
+    model.assert_not_called()
+
+
+def test_adapter_factory_is_model_registered(monkeypatch):
+    from vllm_torchtpu.models.model_hooks import MODEL_ADAPTERS
+
+    runner = NS(model_config=NS(architecture="TestAdapterArchitecture"))
+    adapter = object()
+    factory = Mock(return_value=adapter)
+    monkeypatch.setitem(MODEL_ADAPTERS, runner.model_config.architecture, factory)
+    assert model_adapters.select_model_adapter(runner) is adapter
+    factory.assert_called_once_with(runner)
+
+
+def test_model_hook_registry_does_not_import_accelerator_runtime():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import vllm_torchtpu.models; before=set(sys.modules); "
+                "from vllm_torchtpu.models.model_hooks import MODEL_ADAPTERS; "
+                "added=set(sys.modules)-before; assert MODEL_ADAPTERS; "
+                "assert not any(name.split('.')[0] in {'torch','torch_tpu','jax'} "
+                "for name in added), sorted(added)"
+            ),
+        ],
+        env=dict(os.environ, PYTHONPATH=str(Path(__file__).parents[2] / "src")),
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("intermediate_output", [False, True])
+def test_adapter_dummy_handoff_and_multimodal_staging(monkeypatch, intermediate_output):
+    from vllm.sequence import IntermediateTensors
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import inputs
+
+    incoming = IntermediateTensors({"hidden_states": torch.zeros(4, 8)})
+    outgoing = IntermediateTensors({"hidden_states": torch.ones(4, 8)})
+    output = outgoing if intermediate_output else torch.ones(4, 8)
+    embeds = torch.zeros(4, 8)
+    events = []
+    wave = NS(start_forward=Mock(return_value=incoming), end_forward=Mock())
+    runner = NS(
+        _pp_wave=wave,
+        _pp_is_first=True,
+        supports_mm_inputs=True,
+        _pp_take_topk_indices=Mock(),
+        _pp_outgoing_tensors=Mock(return_value=outgoing.tensors),
+        _get_model_inputs=lambda ids, mm: (events.append("copy") or None, embeds),
+        _record_input_staging_fence=lambda: events.append("fence"),
+        _dp_num_tokens_across_dp=lambda n: None,
+        vllm_config=NS(),
+        mesh=None,
+        forward_model=Mock(
+            side_effect=lambda **kw: (events.append("forward") or output, None)
+        ),
+    )
+    adapter = object.__new__(inputs.Qwen4ExpAdapter)
+    adapter.runner = runner
+    from vllm_torchtpu.models.vllm.qwen4_exp.pooled_cache import Qwen4ExpPooledCache
+
+    metadata_builder = Mock(return_value={})
+    adapter.cache = cast(Qwen4ExpPooledCache, NS(dummy_metadata=metadata_builder))
+    metadata = object()
+    monkeypatch.setattr(inputs, "set_forward_context", lambda *a, **kw: nullcontext())
+    monkeypatch.setattr(
+        inputs, "set_vllm_model_wrapper_context", lambda **kw: nullcontext()
+    )
+    monkeypatch.setattr(inputs, "synchronize_tensors", Mock())
+    assert (
+        adapter._dummy_forward(
+            torch.arange(4),
+            torch.arange(4),
+            {},
+            metadata,
+            4,
+            None,
+            use_max_model_len=False,
+            through_handoff=True,
+        )
+        is None
+    )
+    assert events == ["copy", "fence", "forward"]
+    metadata_builder.assert_called_once_with(metadata, 0, use_max_model_len=False)
+    wave.start_forward.assert_called_once_with(4)
+    runner._pp_take_topk_indices.assert_called_once_with(incoming, 4)
+    assert runner.forward_model.call_args.kwargs["intermediate_tensors"] is incoming
+    assert runner.forward_model.call_args.kwargs["input_ids"] is None
+    assert runner.forward_model.call_args.kwargs["inputs_embeds"] is embeds
+    wave.end_forward.assert_called_once_with(
+        outgoing.tensors if intermediate_output else None, 4
+    )
