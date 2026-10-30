@@ -1,0 +1,8 @@
+{
+  "gsm8k": {
+    "exact_match,flexible-extract": 0.98,
+    "exact_match_stderr,flexible-extract": 0.0141,
+    "limit": 100,
+    "num_fewshot": 5
+  }
+}
