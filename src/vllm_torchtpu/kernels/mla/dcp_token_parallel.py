@@ -75,6 +75,10 @@ class TokenParallelLayout:
     split_rows: int
     # Virtual pages the gather buffer holds per rank, over all requests.
     max_pages: int
+    # Page counts a step's gather may be sized to (ascending, ending at
+    # max_pages): it moves the smallest that holds the step's pages, so the
+    # collective scales with the context rather than the buffer.
+    gather_caps: tuple[int, ...] = ()
 
     def __post_init__(self):
         if self.dcp_size < 2:
@@ -86,6 +90,10 @@ class TokenParallelLayout:
             )
         if self.split_rows < 0 or self.max_pages < 1:
             raise ValueError(f"bad split_rows / max_pages: {self}")
+        caps = self.gather_caps or (self.max_pages,)
+        if list(caps) != sorted(set(caps)) or caps[-1] != self.max_pages or caps[0] < 1:
+            raise ValueError(f"gather_caps must ascend to max_pages: {self}")
+        object.__setattr__(self, "gather_caps", tuple(caps))
 
     @property
     def virtual_page_size(self) -> int:
@@ -256,17 +264,59 @@ def natural_page_table(
     return pages.reshape(-1).astype(jnp.int32)
 
 
+def _sized_gather(
+    layout: TokenParallelLayout,
+    total_pages: jax.Array,
+    gather: Callable[[int], jax.Array],
+) -> jax.Array:
+    """`gather(cap)` for the smallest cap in `gather_caps` holding
+    `total_pages`. Every rank takes the same branch (the metadata is
+    replicated); each returns `[dcp, max_pages, ...]`, pages past the cap
+    zero (no flat row reaches them)."""
+
+    def branch(cap: int) -> Callable[[], jax.Array]:
+        def run() -> jax.Array:
+            g = gather(cap)
+            pad = [(0, 0)] * g.ndim
+            pad[1] = (0, layout.max_pages - cap)
+            return jnp.pad(g, pad)
+
+        return run
+
+    caps = layout.gather_caps
+    if len(caps) == 1:
+        return branch(caps[0])()
+    idx = jnp.searchsorted(jnp.asarray(caps, jnp.int32), total_pages, side="left")
+    return lax.switch(jnp.minimum(idx, len(caps) - 1), [branch(c) for c in caps])
+
+
 def gather_latent(
-    nope_cache: jax.Array, rope_cache: jax.Array, page_ids: jax.Array, axis_name: str
+    layout: TokenParallelLayout,
+    nope_cache: jax.Array,
+    rope_cache: jax.Array,
+    page_ids: jax.Array,
+    total_pages: jax.Array,
+    axis_name: str,
 ) -> tuple[jax.Array, jax.Array]:
     """Every rank's `page_ids` pages, rank-major: `[dcp * max_pages, ...]`."""
-    nope = lax.all_gather(nope_cache[page_ids], axis_name, axis=0, tiled=True)
-    rope = lax.all_gather(rope_cache[page_ids], axis_name, axis=0, tiled=True)
-    return nope, rope
+
+    def gather(cache: jax.Array) -> jax.Array:
+        g = _sized_gather(
+            layout,
+            total_pages,
+            lambda cap: lax.all_gather(cache[page_ids[:cap]], axis_name, axis=0),
+        )
+        return g.reshape(-1, *g.shape[2:])
+
+    return gather(nope_cache), gather(rope_cache)
 
 
 def gather_index_k(
-    layout: TokenParallelLayout, cache: jax.Array, page_ids: jax.Array, axis_name: str
+    layout: TokenParallelLayout,
+    cache: jax.Array,
+    page_ids: jax.Array,
+    total_pages: jax.Array,
+    axis_name: str,
 ) -> jax.Array:
     """Every rank's `page_ids` pages of a token-along-lane index-K cache
     (`[pages, rows, 4, page_size]`, slot on the last axis), reordered into
@@ -283,11 +333,20 @@ def gather_index_k(
             f"index-K cache {cache.shape} is not token-along-lane with page {ps}"
         )
     cpp = ps // (dcp * il)
-    g = lax.all_gather(cache[page_ids], axis_name, axis=0, tiled=False)
-    n, rows, sub = g.shape[1:4]
-    g = g.reshape(dcp, n, rows, sub, dcp, cpp, il)
-    g = g.transpose(1, 4, 2, 3, 5, 0, 6)
-    return g.reshape(n * dcp, rows, sub, ps)
+
+    def gather(cap: int) -> jax.Array:
+        g = lax.all_gather(cache[page_ids[:cap]], axis_name, axis=0)
+        rows, sub = g.shape[2:4]
+        g = g.reshape(dcp, cap, rows, sub, dcp, cpp, il)
+        # -> [cap, dcp (natural page q), ...]; returned as [cap, dcp, ...] so
+        # the padding below extends the virtual-page axis.
+        return g.transpose(1, 4, 2, 3, 5, 0, 6).reshape(cap, dcp, rows, sub, ps)
+
+    def gather_t(cap: int) -> jax.Array:
+        return gather(cap).swapaxes(0, 1)  # pad axis 1 = virtual pages
+
+    g = _sized_gather(layout, total_pages, gather_t).swapaxes(0, 1)
+    return g.reshape(layout.max_pages * dcp, *g.shape[2:])
 
 
 def heads_to_tokens(
@@ -366,7 +425,9 @@ def sparse_mla_attention(
         nope, rope = write_kv(nope, rope, kv_c, k_pe, seq_lens, bt, qsl, rank)
         pages, offsets = step_pages(layout, seq_lens, qsl, dist[2])
         page_ids = gather_page_ids(layout, bt, pages, offsets, nope.shape[0])
-        g_nope, g_rope = gather_latent(nope, rope, page_ids, axis_name)
+        g_nope, g_rope = gather_latent(
+            layout, nope, rope, page_ids, jnp.sum(pages), axis_name
+        )
         q_tok = heads_to_tokens(layout, q, axis_name)
         rr = rank_rows(layout, rank, q.shape[0], seq_lens, qsl, dist[2])
         out = attend(q_tok, g_nope, g_rope, topk, rr.num_rows)
@@ -427,7 +488,7 @@ def indexer_topk(
         rows = layout.rows_per_rank(num_tokens)
         pages, offsets = step_pages(layout, seq_lens, qsl, dist[2])
         page_ids = gather_page_ids(layout, bt, pages, offsets, cache.shape[0])
-        natural = gather_index_k(layout, cache, page_ids, axis_name)
+        natural = gather_index_k(layout, cache, page_ids, jnp.sum(pages), axis_name)
         rr = rank_rows(layout, rank, num_tokens, seq_lens, qsl, dist[2])
         start = layout.split_rows + rank * rows
         pad = layout.split_rows

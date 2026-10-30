@@ -84,6 +84,7 @@ def main():
     ap.add_argument("--tokens", type=int, default=4096)
     ap.add_argument("--split-rows", type=int, default=64)
     ap.add_argument("--max-pages", type=int, default=44)
+    ap.add_argument("--static-gather", action="store_true")
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--check-rows", type=int, default=256)
     ap.add_argument("--out", default="")
@@ -95,7 +96,10 @@ def main():
     shd = NamedSharding(mesh, P(AXIS))
     T, S, prefix = a.tokens, a.split_rows, a.prefix
     total = prefix + T
-    lay = tp.TokenParallelLayout(dcp, IL, PAGE, S, a.max_pages)
+    caps = tuple(c for c in tp_op.GATHER_CAPS if c < a.max_pages) + (a.max_pages,)
+    if a.static_gather:
+        caps = (a.max_pages,)
+    lay = tp.TokenParallelLayout(dcp, IL, PAGE, S, a.max_pages, gather_caps=caps)
     rows = lay.rows_per_rank(T)
     vps = lay.virtual_page_size
     n_vp = -(-total // vps)
@@ -510,7 +514,7 @@ def main():
         def _l(n, r, sl, bt_, q_, d_):
             pages, offs = tp.step_pages(lay, sl, q_, d_[2])
             ids = tp.gather_page_ids(lay, bt_, pages, offs, n.shape[0])
-            return tp.gather_latent(n, r, ids, AXIS)
+            return tp.gather_latent(lay, n, r, ids, jnp.sum(pages), AXIS)
 
         return jax.shard_map(
             _l,

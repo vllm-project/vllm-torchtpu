@@ -61,6 +61,8 @@ MIN_TOKENS = 1024
 EXTRA_PAGES = 4
 # Rows [0, split_rows) stay on the DCP path; a multiple of this.
 SPLIT_ROWS_ALIGN = 16
+# Gather sizes (virtual pages) below the buffer's capacity a step may take.
+GATHER_CAPS = (2, 4, 8, 12, 16, 24, 32)
 
 
 def applies(num_tokens: int) -> bool:
@@ -81,12 +83,14 @@ def layout_for(vllm_config: Any) -> dcp_token_parallel.TokenParallelLayout:
     max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
     vps = page_size * dcp
     max_model_len = int(vllm_config.model_config.max_model_len)
+    max_pages = -(-max_model_len // vps) + EXTRA_PAGES
     return dcp_token_parallel.TokenParallelLayout(
         dcp_size=dcp,
         interleave_size=int(parallel.cp_kv_cache_interleave_size),
         page_size=page_size,
         split_rows=-(-max_num_seqs // SPLIT_ROWS_ALIGN) * SPLIT_ROWS_ALIGN,
-        max_pages=-(-max_model_len // vps) + EXTRA_PAGES,
+        max_pages=max_pages,
+        gather_caps=tuple(c for c in GATHER_CAPS if c < max_pages) + (max_pages,),
     )
 
 

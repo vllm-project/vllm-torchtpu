@@ -51,7 +51,9 @@ CASES = {
     # 3 decode rows, a chunk straddling the split and a rank boundary, then a
     # new request whose rows share the last busy rank with the first's tail.
     4: dict(
-        layout=tp.TokenParallelLayout(4, 4, 32, split_rows=16, max_pages=6),
+        layout=tp.TokenParallelLayout(
+            4, 4, 32, split_rows=16, max_pages=8, gather_caps=(2, 4, 6, 8)
+        ),
         num_tokens=256,
         reqs=[Req(700, 1), Req(90, 1), Req(260, 1), Req(300, 150), Req(0, 40)],
     ),
@@ -405,3 +407,5 @@ def test_layout_rejects_unservable_buckets():
         lay.rows_per_rank(258)
     with pytest.raises(ValueError):
         tp.TokenParallelLayout(16, 4, 32, split_rows=16, max_pages=4)
+    with pytest.raises(ValueError):
+        tp.TokenParallelLayout(4, 4, 32, split_rows=16, max_pages=8, gather_caps=(4,))
