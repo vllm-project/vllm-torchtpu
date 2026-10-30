@@ -77,18 +77,21 @@ def _inputs(device, starts, context, tokens=8, seed=0):
     tail = (jnp.asarray(starts_np), jnp.asarray(context, jnp.int32),
             jnp.pad(ring_ids[:, None], ((0, 0), (0, 31))).reshape(-1),
             jnp.asarray(pages[0]), jnp.asarray(pages[1]))
-    return [_torch(x, device) for x in head], _torch(pool, device), [_torch(x, device) for x in tail]
+    # The pool stays on the host: step and select donate it (argument 10), so
+    # every call gets its own device copy.
+    return [_torch(x, device) for x in head], _torch(pool, "cpu"), [_torch(x, device) for x in tail]
 
 
 def _run(step, select, attend, combine, head, pool, tail, rank):
-    """Every DCP op once, chained the way qsa_op wires them; returns outputs."""
+    """Every DCP op once, chained the way qsa_op wires them; returns outputs.
+    ``pool()`` returns a fresh pool for each donating call."""
     tokens = head[0].shape[0]
     head_dim = head[4].shape[0]
     rank = rank.to(torch.int32)
     out = {}
-    out["step"] = step(*head, pool.clone(), *tail, rank, dcp_size=2, **OPTIONS)
+    out["step"] = step(*head, pool(), *tail, rank, dcp_size=2, **OPTIONS)
     shards = [
-        select(*head, pool.clone(), *tail, torch.tensor([s], dtype=torch.int32, device=rank.device),
+        select(*head, pool(), *tail, torch.tensor([s], dtype=torch.int32, device=rank.device),
                rank, shard_size=SHARDS, dcp_size=2, **OPTIONS)
         for s in range(SHARDS)
     ]
@@ -134,7 +137,7 @@ def test_dcp_ops_build_and_run_on_tpu(starts, context):
     ops = qsa_op._dcp_ops()
     head, pool, tail = _inputs(device, starts, context)
     for r in (0, 1):
-        real = _run(*ops, head, pool, tail, torch.tensor([r], device=device))
+        real = _run(*ops, head, lambda: pool.to(device), tail, torch.tensor([r], device=device))
         for name, value in real.items():
             for t in value if isinstance(value, (tuple, list)) else (value,):
                 assert t.device.type == device.type, name
@@ -144,7 +147,8 @@ def test_dcp_ops_build_and_run_on_tpu(starts, context):
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         with FakeTensorMode(allow_non_fake_inputs=True) as mode:
-            fake = _run(*ops, *[[mode.from_tensor(t) for t in x] if isinstance(x, list)
-                                else mode.from_tensor(x) for x in (head, pool, tail)],
+            fake_pool = mode.from_tensor(pool.to(device))
+            fake = _run(*ops, [mode.from_tensor(t) for t in head], lambda: fake_pool,
+                        [mode.from_tensor(t) for t in tail],
                         mode.from_tensor(torch.tensor([r], device=device)))
         assert _shapes(fake) == _shapes(real)
