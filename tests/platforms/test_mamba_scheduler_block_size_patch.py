@@ -175,6 +175,11 @@ def _patched_init(monkeypatch, *, pages, align, budget=8192, threshold=0):
         self.scheduler_config = SimpleNamespace(long_prefill_token_threshold=threshold)
 
     monkeypatch.setattr(Scheduler, "__init__", init)
+    # An unpatched split, so the patch installs its init wrapper even when the
+    # registry already patched the scheduler in this process.
+    monkeypatch.setattr(
+        Scheduler, "_mamba_block_aligned_split", lambda self, *args: args[0]
+    )
     monkeypatch.setattr(
         vllm_torchtpu, "_model_needs_page_aligned_chunks", lambda vllm_config: pages
     )
