@@ -23,8 +23,9 @@ from typing import Any
 
 import numpy as np
 
-from ..errors import EligibilityResult, MegakernelConfigError
+from ..errors import MegakernelConfigError
 from ..profiles.default import chip_budget
+from .contract import EligibilityResult, StepDecision
 from .policy import BucketPolicy
 
 
@@ -36,17 +37,6 @@ class BatchShape:
     num_reqs: int = 0
     tokens_per_seq: int = 0
     reason: str = "stock_early"
-
-
-@dataclass(frozen=True)
-class StepDecision:
-    """Per-step routing decision produced by `check_step_eligibility`."""
-
-    eligible: bool
-    reason: str
-    num_reqs: int = 0
-    tokens_per_seq: int = 0
-    bucket_t: int = 0
 
 
 def check_qsl_uniform(qsl: Any, num_reqs: int) -> BatchShape:

@@ -34,8 +34,9 @@ from collections.abc import Callable, Mapping
 from types import ModuleType
 from typing import Any
 
-from .errors import MegakernelConfigError
-from .plugin import API_VERSION, SHORTHANDS, MegakernelPlugin
+from vllm_torchtpu.megakernel.errors import MegakernelConfigError
+
+from .plugin import API_VERSION, SHORTHANDS, TpuMonoSpec
 
 RUNTIME_KEYS = frozenset({"plugin", "options", "enabled", "ab", "stats_period_s"})
 _LEGACY_KEYS = frozenset().union(*(s.legacy_keys for s in SHORTHANDS.values()))
@@ -202,7 +203,7 @@ class PluginRef:
     """Where a plugin comes from: `module:attr`, and its shorthand name if any."""
 
     module: str
-    attr: str = "PLUGIN"
+    attr: str = "SPEC"
     shorthand: str | None = None
 
 
@@ -244,7 +245,7 @@ def resolve_plugin_ref(
         ref = PluginRef(SHORTHANDS[name].module, shorthand=name)
     elif cfg.plugin is not None:
         mod, _, attr = cfg.plugin.partition(":")
-        ref = PluginRef(mod.strip(), attr.strip() or "PLUGIN")
+        ref = PluginRef(mod.strip(), attr.strip() or "SPEC")
     else:
         name = shorthand_for_arch(hf_config)
         if name is None:
@@ -271,8 +272,8 @@ def select_plugin(
     return cfg, (resolve_plugin_ref(cfg, hf_config) if cfg.enabled else None)
 
 
-def import_plugin(ref: PluginRef) -> tuple[MegakernelPlugin, ModuleType]:
-    """Import `ref` and check it is a `MegakernelPlugin` of a supported API."""
+def import_plugin(ref: PluginRef) -> tuple[TpuMonoSpec, ModuleType]:
+    """Import `ref` and check it is a `TpuMonoSpec` of a supported API."""
     try:
         module = importlib.import_module(ref.module)
     except Exception as exc:
@@ -281,9 +282,9 @@ def import_plugin(ref: PluginRef) -> tuple[MegakernelPlugin, ModuleType]:
             f"{type(exc).__name__}: {exc}"
         ) from exc
     plugin = getattr(module, ref.attr, None)
-    if not isinstance(plugin, MegakernelPlugin):
+    if not isinstance(plugin, TpuMonoSpec):
         raise MegakernelConfigError(
-            f"megakernel plugin {ref.module}:{ref.attr} is not a MegakernelPlugin "
+            f"megakernel plugin {ref.module}:{ref.attr} is not a TpuMonoSpec "
             f"(got {type(plugin).__name__})"
         )
     if int(plugin.api_version) != API_VERSION:

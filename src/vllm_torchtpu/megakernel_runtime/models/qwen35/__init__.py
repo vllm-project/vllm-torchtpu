@@ -21,13 +21,13 @@ Importing this module loads no torch / jax / vLLM: `create` is imported lazily.
 
 from __future__ import annotations
 
-from vllm_torchtpu.megakernel_runtime.plugin import MegakernelPlugin
+from vllm_torchtpu.megakernel.runtime.contract import TpuMonoSpec
 
-PLUGIN = MegakernelPlugin(
+SPEC = TpuMonoSpec(
     name="qwen35",
     version="1",
     create=".adapter:create",
-    capabilities=frozenset({"spec_decode", "mrope", "prefix_caching", "kv_offload"}),
+    features=frozenset({"spec_decode", "mrope", "prefix_caching", "kv_offload"}),
     # Every decline `create` / `bind` can return beyond the runtime's own codes,
     # so peers log `peer_declined:<code>` rather than `other`.
     decline_codes=(

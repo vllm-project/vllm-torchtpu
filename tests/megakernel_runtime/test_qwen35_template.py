@@ -65,12 +65,12 @@ def test_shorthand_table_matches_the_template() -> None:
     assert sh.architectures == qwen35.Qwen35.hf_architectures
     assert sh.model_types == qwen35.Qwen35.hf_model_type
     assert sh.legacy_keys == adapter.OPTION_KEYS
-    assert qwen_plugin.PLUGIN.name == "qwen35"
-    assert qwen_plugin.PLUGIN.create == ".adapter:create"
-    assert qwen_plugin.PLUGIN.capabilities == frozenset(
+    assert qwen_plugin.SPEC.name == "qwen35"
+    assert qwen_plugin.SPEC.create == ".adapter:create"
+    assert qwen_plugin.SPEC.features == frozenset(
         {"spec_decode", "mrope", "prefix_caching", "kv_offload"}
     )
-    assert qwen_plugin.PLUGIN.layout_request is None
+    assert qwen_plugin.SPEC.layout_request is None
 
 
 _FRESH = """
@@ -79,7 +79,7 @@ for name in ("torch", "jax", "jaxlib", "vllm", "numpy"):
     sys.modules[name] = None
 import vllm_torchtpu.megakernel_runtime.models.qwen35 as t
 from vllm_torchtpu.megakernel_runtime.salt import compile_cache_salt
-assert t.PLUGIN.name == "qwen35"
+assert t.SPEC.name == "qwen35"
 cfg = type("C", (), {"additional_config": {"megakernel": {"plugin": "qwen35"}}})()
 assert compile_cache_salt(cfg) is None
 print("OK")
@@ -316,7 +316,7 @@ _SAME_PROGRAM = [
     (None, "qwen35"),
     (None, {"plugin": "qwen35"}),
     (None, {"plugin": _MODULE}),
-    (None, {"plugin": f"{_MODULE}:PLUGIN", "options": {}}),
+    (None, {"plugin": f"{_MODULE}:SPEC", "options": {}}),
 ]
 _SAME_EP = [("ep", None), (None, {"plugin": "qwen35", "options": {"mode": "ep"}})]
 
@@ -459,14 +459,12 @@ def _false_result_codes(path: Path, *func_names: str) -> set[str]:
 def test_every_template_decline_is_in_the_vote_table() -> None:
     import vllm_torchtpu.megakernel as mk_lib
 
-    codes = driver_mod.vote_codes(qwen_plugin.PLUGIN.decline_codes)
+    codes = driver_mod.vote_codes(qwen_plugin.SPEC.decline_codes)
     assert codes[-1] == "other" and len(set(codes)) == len(codes)
     missing = sorted(c for c in _QWEN_DECLINES if c not in codes[:-1])
     assert missing == [], missing
     # The template lists only codes the runtime doesn't already have.
-    assert not set(qwen_plugin.PLUGIN.decline_codes) & set(
-        driver_mod.DECLINE_VOTE_CODES
-    )
+    assert not set(qwen_plugin.SPEC.decline_codes) & set(driver_mod.DECLINE_VOTE_CODES)
 
     # Static scan: the adapter and the library checks it calls emit nothing else.
     lib = Path(mk_lib.__file__).resolve().parent

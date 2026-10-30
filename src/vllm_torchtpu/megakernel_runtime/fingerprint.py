@@ -34,7 +34,7 @@ from .errors import MegakernelPluginError
 
 MAX_SOURCE_FILES = 2000
 MAX_SOURCE_BYTES = 64 << 20
-_FIX_HINT = "install the plugin from source or set MegakernelPlugin.source_root"
+_FIX_HINT = "install the plugin from source or set TpuMonoSpec.source_root"
 
 
 def _unhashable(why: str, name: str) -> MegakernelPluginError:
@@ -178,7 +178,12 @@ def plugin_fingerprint(
         "name": plugin.name,
         "version": str(plugin.version),
         "source_hash": source_hash,
-        "capabilities": sorted(plugin.capabilities),
+        "chips": list(plugin.chips),
+        "tp_sizes": list(plugin.tp_sizes),
+        "parallelism": sorted(plugin.parallelism),
+        "features": sorted(plugin.features),
+        "requires": dict(sorted(plugin.requires.items())),
+        "numerics": plugin.numerics,
         "decline_codes": list(plugin.decline_codes),
         "config": dict(config),
         "raw_env": raw_env,

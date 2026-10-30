@@ -19,8 +19,7 @@ import importlib
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # eager imports for type checkers and IDEs
-    from ..errors import EligibilityResult
-    from . import checks, eligibility, layout_facts, policy, step_meta
+    from . import checks, contract, eligibility, layout_facts, policy, step_meta
     from .checks import (
         PoolScheduleInfo,
         SentinelVariantPlan,
@@ -35,10 +34,20 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         verify_pooled_step_hlo,
         verify_sentinel_step,
     )
+    from .contract import (
+        Bucket,
+        Decline,
+        EligibilityResult,
+        LayoutDecline,
+        MonoProgram,
+        RunnerShape,
+        StepDecision,
+        TpuMonoSpec,
+        WarmupCase,
+    )
     from .eligibility import (
         BatchShape,
         MKABCalibrator,
-        StepDecision,
         StepMixTracker,
         check_mrope_uniform,
         check_post_mesh_eligibility,
@@ -83,6 +92,7 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
 _SUBMODULES = frozenset(
     {
         "checks",
+        "contract",
         "eligibility",
         "layout_facts",
         "policy",
@@ -90,7 +100,15 @@ _SUBMODULES = frozenset(
     }
 )
 _LAZY: dict[str, str] = {
-    "EligibilityResult": "..errors",
+    "Bucket": ".contract",
+    "Decline": ".contract",
+    "EligibilityResult": ".contract",
+    "LayoutDecline": ".contract",
+    "MonoProgram": ".contract",
+    "RunnerShape": ".contract",
+    "StepDecision": ".contract",
+    "TpuMonoSpec": ".contract",
+    "WarmupCase": ".contract",
     "PoolScheduleInfo": ".checks",
     "SentinelVariantPlan": ".checks",
     "WarmupStepPlan": ".checks",
@@ -105,7 +123,6 @@ _LAZY: dict[str, str] = {
     "verify_sentinel_step": ".checks",
     "BatchShape": ".eligibility",
     "MKABCalibrator": ".eligibility",
-    "StepDecision": ".eligibility",
     "StepMixTracker": ".eligibility",
     "check_mrope_uniform": ".eligibility",
     "check_post_mesh_eligibility": ".eligibility",
@@ -147,17 +164,24 @@ __all__ = [
     "MTP_SPECULATIVE_TOKENS",
     "MTP_VERIFY_TOKENS",
     "BatchShape",
+    "Bucket",
     "BucketPolicy",
+    "Decline",
     "EligibilityResult",
     "JaxStepMetaOps",
+    "LayoutDecline",
     "MKABCalibrator",
+    "MonoProgram",
     "PoolLayoutFacts",
     "PoolScheduleInfo",
+    "RunnerShape",
     "SentinelVariantPlan",
     "StepDecision",
     "StepMeta",
     "StepMetaOps",
     "StepMixTracker",
+    "TpuMonoSpec",
+    "WarmupCase",
     "WarmupStepPlan",
     "align_cache_exec",
     "bucket_exec_spec",
@@ -171,6 +195,7 @@ __all__ = [
     "check_startup_eligibility",
     "check_step_eligibility",
     "checks",
+    "contract",
     "compare_layout_facts",
     "eligibility",
     "explicit_profile_settings",

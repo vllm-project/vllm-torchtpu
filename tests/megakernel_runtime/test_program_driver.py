@@ -44,7 +44,7 @@ _SRC = Path(driver_mod.__file__).resolve().parents[2]
 TOY_PLUGIN = '''
 """A toy megakernel plugin: y = x * scale + B, in pure torch."""
 from vllm_torchtpu.megakernel_runtime.plugin import (
-    Bucket, Decline, MegakernelPlugin, WarmupCase,
+    Bucket, Decline, TpuMonoSpec, WarmupCase,
 )
 
 
@@ -111,7 +111,7 @@ def create(view, options):
     return ToyProgram(view, options)
 
 
-PLUGIN = MegakernelPlugin(
+SPEC = TpuMonoSpec(
     "toy", "1", create=create, decline_codes=("toy_declined",)
 )
 '''
@@ -322,8 +322,8 @@ def test_create_result_must_be_a_program_or_decline(
     monkeypatch.setattr(toy_mod, "create", lambda view, options: object())
     monkeypatch.setattr(
         toy_mod,
-        "PLUGIN",
-        dataclasses.replace(toy_mod.PLUGIN, create=toy_mod.create),
+        "SPEC",
+        dataclasses.replace(toy_mod.SPEC, create=toy_mod.create),
     )
     g = _vote_group(monkeypatch, [0])
     with pytest.raises(MegakernelPluginError, match="neither a Decline nor"):
@@ -369,7 +369,7 @@ def test_driver_and_salt_resolve_the_same_plugin(
         driver_mod.ProgramDriver.maybe_create(runner)
         salt_mod.compile_cache_salt(runner.vllm_config)
         assert seen["driver"] == seen["salt"], (hf, mk, seen)
-    assert seen["driver"] == [("toy_mk_plugin", "PLUGIN")]
+    assert seen["driver"] == [("toy_mk_plugin", "SPEC")]
 
 
 def test_create_runs_no_collective(toy: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -388,7 +388,7 @@ def test_create_runs_no_collective(toy: Path, monkeypatch: pytest.MonkeyPatch) -
         monkeypatch.setattr(torch.distributed, name, boom)
     toy_mod = importlib.import_module("toy_mk_plugin")
     view = RunnerView(_runner(), tp_rank=0)
-    prog = toy_mod.PLUGIN.create(view, {"scale": 1.0})
+    prog = toy_mod.SPEC.create(view, {"scale": 1.0})
     assert prog.mesh == "unloaded"
 
 

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""`Qwen35Program`: the Qwen3.5 megakernel as a `MegakernelProgram`.
+"""`Qwen35Program`: the Qwen3.5 megakernel as a `MonoProgram`.
 
 `create` checks the checkpoint and config without loading anything; `load`
 packs the weights (EP->TP reshard first when needed); `bind` aliases the

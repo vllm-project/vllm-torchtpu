@@ -11,65 +11,41 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The megakernel plugin interface: what a megakernel folder implements.
+"""Runtime-facing views for megakernel model folders.
 
-A folder exports `PLUGIN = MegakernelPlugin(...)`; its `create` builds one
-`MegakernelProgram` per TP rank, and the runtime (`ProgramDriver`) does the
-rest: startup checks, rank agreement, compilation, warmup and step routing.
+The model contract itself (`TpuMonoSpec`, the `MonoProgram` protocol,
+`Bucket`, `RunnerShape`, `WarmupCase`, `Decline`, `LayoutDecline`,
+`StepDecision`, `EligibilityResult`, the feature / parallelism / `requires`
+vocabularies) lives in the framework-free `megakernel.runtime.contract` and is
+re-exported here. What stays here are the runtime's own facts about the
+runner: `RunnerView` (startup / bind) and `ForwardView` (per step), and the
+shorthand table of built-in templates.
 
-Stdlib only at import (no torch / jax / vLLM), so the plugin, the config
-parser and the compile-cache salt can import it anywhere. The library types
-`EligibilityResult`, `StepDecision` and `LayoutDecline` are exported lazily
-(module `__getattr__`), since importing `megakernel.*` imports jax.
+Stdlib only at import (no torch / jax / vLLM).
 """
 
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+from collections.abc import Callable, Iterator, Mapping
+from typing import Any, NamedTuple
 
-from .errors import MegakernelConfigError
-
-if TYPE_CHECKING:  # exported lazily, see `__getattr__`
-    from vllm_torchtpu.megakernel.errors import EligibilityResult
-    from vllm_torchtpu.megakernel.runtime.eligibility import StepDecision
-    from vllm_torchtpu.megakernel_runtime.declines import LayoutDecline
-
-API_VERSION = 1
-
-# --- Capabilities: framework features a plugin declares it can serve under.
-# A feature that is on but undeclared declines the megakernel at startup with
-# a named code (see `ProgramDriver`).
-CAP_PIPELINE_PARALLEL = "pipeline_parallel"
-CAP_LORA = "lora"
-CAP_MULTIMODAL = "multimodal"
-CAP_DCP = "dcp"
-CAP_PCP = "pcp"
-CAP_AUX_HIDDEN_STATES = "aux_hidden_states"
-CAP_SPEC_DECODE = "spec_decode"
-CAP_MROPE = "mrope"
-CAP_PREFIX_CACHING = "prefix_caching"
-CAP_KV_OFFLOAD = "kv_offload"
-CAP_KV_TRANSFER = "kv_transfer"
-CAP_EPLB_DYNAMIC = "eplb_dynamic"
-CAP_SLEEP_MODE = "sleep_mode"
-CAPABILITIES: frozenset[str] = frozenset(
-    {
-        CAP_PIPELINE_PARALLEL,
-        CAP_LORA,
-        CAP_MULTIMODAL,
-        CAP_DCP,
-        CAP_PCP,
-        CAP_AUX_HIDDEN_STATES,
-        CAP_SPEC_DECODE,
-        CAP_MROPE,
-        CAP_PREFIX_CACHING,
-        CAP_KV_OFFLOAD,
-        CAP_KV_TRANSFER,
-        CAP_EPLB_DYNAMIC,
-        CAP_SLEEP_MODE,
-    }
+from vllm_torchtpu.megakernel.runtime.contract import (
+    API_VERSION,
+    FEATURES,
+    NUMERICS,
+    PARALLELISM,
+    REQUIRES_KEYS,
+    Bucket,
+    Decline,
+    EligibilityResult,
+    LayoutDecline,
+    MonoProgram,
+    RunnerShape,
+    StepDecision,
+    StepFn,
+    TpuMonoSpec,
+    WarmupCase,
 )
 
 
@@ -109,91 +85,6 @@ SHORTHANDS: Mapping[str, Shorthand] = {
         ),
     ),
 }
-
-
-@dataclasses.dataclass(frozen=True)
-class MegakernelPlugin:
-    """What a megakernel folder exports as `PLUGIN`.
-
-    `create` is a callable or a `"module:attr"` string (`".adapter:create"` is
-    relative to the plugin package), imported lazily, so importing the plugin
-    imports nothing heavy. `create(view, options)` returns a program or a
-    `Decline`; it runs no collective and loads no weights.
-    """
-
-    name: str
-    version: str
-    create: str | Callable[..., Any]
-    capabilities: frozenset[str] = frozenset()
-    layout_request: str | Callable[..., Any] | None = None
-    decline_codes: tuple[str, ...] = ()
-    source_root: str | None = None
-    api_version: int = API_VERSION
-
-    def __post_init__(self) -> None:
-        caps = frozenset(str(c) for c in self.capabilities)
-        object.__setattr__(self, "capabilities", caps)
-        object.__setattr__(self, "decline_codes", tuple(self.decline_codes))
-        if not isinstance(self.name, str) or not self.name:
-            raise MegakernelConfigError("MegakernelPlugin.name must be non-empty")
-        if unknown := sorted(caps - CAPABILITIES):
-            raise MegakernelConfigError(
-                f"MegakernelPlugin {self.name!r}: unknown capabilities {unknown}; "
-                f"known: {sorted(CAPABILITIES)}"
-            )
-
-
-@dataclasses.dataclass(frozen=True)
-class Bucket:
-    """One compiled step shape: `T` tokens per sequence, `B` rows.
-
-    `out_rows=None` lets the runtime pick the runner's padded token count.
-    """
-
-    T: int
-    B: int
-    out_rows: int | None = None
-
-    @property
-    def key(self) -> tuple[int, int]:
-        return (int(self.T), int(self.B))
-
-
-@dataclasses.dataclass(frozen=True)
-class RunnerShape:
-    """One runner input shape a bucket is warmed up with."""
-
-    tok_pad: int
-    req_pad: int
-    blk_pad: int
-    ckpt_cols: int
-
-
-@dataclasses.dataclass(frozen=True)
-class WarmupCase:
-    """Positional args for a bucket's `StepFn`, and an optional post-call check."""
-
-    args: tuple[Any, ...]
-    check: Callable[[Any], None] | None = None
-
-
-StepFn = Callable[..., Any]
-
-
-@dataclasses.dataclass(frozen=True)
-class Decline:
-    """A named, expected reason not to serve (`create`'s other result)."""
-
-    code: str
-    message: str = ""
-    level: str = "warning"
-
-    @property
-    def result(self) -> Any:
-        """This decline as a library `EligibilityResult`."""
-        from vllm_torchtpu.megakernel.errors import EligibilityResult
-
-        return EligibilityResult(False, self.code, self.message, self.level)
 
 
 def _int_or_none(x: Any) -> int | None:
@@ -373,80 +264,24 @@ class ForwardView:
         return self.inspect(attn_md, m0)
 
 
-class MegakernelProgram(Protocol):
-    """One megakernel instance on one TP rank (returned by `create`).
-
-    Optional methods (looked up with `getattr`): `warmup_session()` (a
-    context manager around warmup), `check_compiled_ir(debug, bucket)`,
-    `attach_draft(drafter)` / `detach_draft()`, `on_warmup_done()` (called
-    once per bind from the runtime's H2 `on_warmup_done(runner)`, after the
-    worker's whole warmup).
-    """
-
-    display_name: str
-
-    def buckets(self, token_paddings: tuple[int, ...]) -> Sequence[Bucket]: ...
-
-    def load(self, mesh: Any) -> None: ...
-
-    def bind(self, view: RunnerView) -> Any: ...
-
-    def build(self, bucket: Bucket) -> StepFn: ...
-
-    def warmup_inputs(
-        self, bucket: Bucket, shape: RunnerShape
-    ) -> WarmupCase | None: ...
-
-    def decide(self, ctx: Any, fwd: ForwardView) -> Any: ...
-
-    def forward(self, decision: Any, ctx: Any, fwd: ForwardView) -> Any: ...
-
-
-_LAZY_LIBRARY_EXPORTS = {
-    "EligibilityResult": ("vllm_torchtpu.megakernel.errors", "EligibilityResult"),
-    "StepDecision": ("vllm_torchtpu.megakernel.runtime.eligibility", "StepDecision"),
-    "LayoutDecline": ("vllm_torchtpu.megakernel_runtime.declines", "LayoutDecline"),
-}
-
-
-def __getattr__(name: str) -> Any:
-    if name in _LAZY_LIBRARY_EXPORTS:
-        import importlib
-
-        mod_name, attr = _LAZY_LIBRARY_EXPORTS[name]
-        return getattr(importlib.import_module(mod_name), attr)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
 __all__ = [
     "API_VERSION",
-    "CAPABILITIES",
-    "CAP_AUX_HIDDEN_STATES",
-    "CAP_DCP",
-    "CAP_EPLB_DYNAMIC",
-    "CAP_KV_OFFLOAD",
-    "CAP_KV_TRANSFER",
-    "CAP_LORA",
-    "CAP_MROPE",
-    "CAP_MULTIMODAL",
-    "CAP_PCP",
-    "CAP_PIPELINE_PARALLEL",
-    "CAP_PREFIX_CACHING",
-    "CAP_SLEEP_MODE",
-    "CAP_SPEC_DECODE",
+    "FEATURES",
+    "NUMERICS",
+    "PARALLELISM",
+    "REQUIRES_KEYS",
     "SHORTHANDS",
     "Bucket",
     "Decline",
     "EligibilityResult",
     "ForwardView",
     "LayoutDecline",
-    "MegakernelConfigError",
-    "MegakernelPlugin",
-    "MegakernelProgram",
+    "MonoProgram",
     "RunnerShape",
     "RunnerView",
     "Shorthand",
     "StepDecision",
     "StepFn",
+    "TpuMonoSpec",
     "WarmupCase",
 ]

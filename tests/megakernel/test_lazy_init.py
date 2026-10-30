@@ -71,7 +71,10 @@ for name in ("jax", "jaxlib", "torch", "vllm"):
 import vllm_torchtpu.megakernel as mk
 import vllm_torchtpu.megakernel.errors as errors
 import vllm_torchtpu.megakernel.runtime as rt
+import vllm_torchtpu.megakernel.runtime.contract as contract
 assert errors.MegakernelLayoutError and errors.MegakernelConfigError
+assert errors.EligibilityResult is contract.EligibilityResult is rt.EligibilityResult
+assert contract.TpuMonoSpec("toy", "1", create="m:create").parallelism == {{"tp"}}
 heavy = [m for m in {heavy!r} if m in sys.modules]
 assert not heavy, heavy
 print("OK")
@@ -89,7 +92,7 @@ import sys
 root_jax = "jax" in sys.modules
 import vllm_torchtpu
 root_jax = "jax" in sys.modules
-import vllm_torchtpu.megakernel.runtime as rt
+import vllm_torchtpu.megakernel.runtime.contract
 import vllm_torchtpu.megakernel.errors
 heavy = [m for m in {heavy!r} if m in sys.modules]
 assert not heavy, heavy

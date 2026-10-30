@@ -11,18 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Errors of the megakernel plugin runtime (stdlib only)."""
+"""Errors of the megakernel runtime (stdlib only). Config errors are the
+library's `megakernel.errors.MegakernelConfigError`."""
 
 from __future__ import annotations
-
-
-class MegakernelConfigError(ValueError):
-    """The megakernel runtime config or a plugin reference is invalid.
-
-    Raised at startup and never silently ignored: an unknown key, a bad
-    `plugin` string, a plugin that fails to import, or an `api_version` the
-    runtime doesn't support.
-    """
 
 
 class MegakernelPluginError(RuntimeError):
@@ -34,4 +26,4 @@ class MegakernelUnsupported(RuntimeError):
     (e.g. `weight_update`: the packed weights would go stale)."""
 
 
-__all__ = ["MegakernelConfigError", "MegakernelPluginError", "MegakernelUnsupported"]
+__all__ = ["MegakernelPluginError", "MegakernelUnsupported"]

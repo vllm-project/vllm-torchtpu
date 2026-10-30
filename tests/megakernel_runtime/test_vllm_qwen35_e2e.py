@@ -62,7 +62,6 @@ from vllm_torchtpu.megakernel_runtime.config import (  # noqa: E402
     collect_config,
     resolve_plugin_ref,
 )
-from vllm_torchtpu.megakernel_runtime.declines import LayoutDecline  # noqa: E402
 from vllm_torchtpu.megakernel_runtime.driver import TorchStepMetaOps  # noqa: E402
 from vllm_torchtpu.megakernel_runtime.hooks import StepContext  # noqa: E402
 from vllm_torchtpu.megakernel_runtime.models import (  # noqa: E402
@@ -75,7 +74,11 @@ from vllm_torchtpu.megakernel_runtime.models.qwen35.adapter import (  # noqa: E4
     Qwen35Program,
     prepare_step_inputs_eager,
 )
-from vllm_torchtpu.megakernel_runtime.plugin import Bucket, RunnerView  # noqa: E402
+from vllm_torchtpu.megakernel_runtime.plugin import (  # noqa: E402
+    Bucket,
+    LayoutDecline,  # noqa: E402
+    RunnerView,
+)
 from vllm_torchtpu.megakernel_runtime.weight_collector import (  # noqa: E402
     WEIGHT_FLIPPED_ATTR,
 )
@@ -2429,7 +2432,7 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
     ):
         old = getattr(runner, attr)
         setattr(runner, attr, val)
-        caps = qwen_plugin.PLUGIN.capabilities
+        caps = qwen_plugin.SPEC.features
         assert driver_mod.check_runner_capabilities(runner, caps, tp_size=1)
         setattr(runner, attr, old)
 

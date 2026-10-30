@@ -28,13 +28,11 @@ from typing import Any
 
 import pytest
 
+from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel_runtime import config as cfg_mod
 from vllm_torchtpu.megakernel_runtime import fingerprint as fp
 from vllm_torchtpu.megakernel_runtime import plugin as plugin_mod
-from vllm_torchtpu.megakernel_runtime.errors import (
-    MegakernelConfigError,
-    MegakernelPluginError,
-)
+from vllm_torchtpu.megakernel_runtime.errors import MegakernelPluginError
 
 _SRC = Path(plugin_mod.__file__).resolve().parents[2]
 _QWEN_HF = SimpleNamespace(architectures=["Qwen3_5MoeForCausalLM"])
@@ -174,8 +172,8 @@ def test_runtime_src_hash_excludes_templates() -> None:
 
 
 def test_fingerprint_and_tokens() -> None:
-    plug = plugin_mod.MegakernelPlugin("toy", "1", create=lambda v, o: None)
-    kw = dict(module="m", attr="PLUGIN", plugin=plug, source_hash="s", raw_env="")
+    plug = plugin_mod.TpuMonoSpec("toy", "1", create=lambda v, o: None)
+    kw = dict(module="m", attr="SPEC", plugin=plug, source_hash="s", raw_env="")
     f1 = fp.plugin_fingerprint(config={"options": {"a": 1}}, **kw)
     assert f1 == fp.plugin_fingerprint(config={"options": {"a": 1}}, **kw)
     assert f1 != fp.plugin_fingerprint(config={"options": {"a": 2}}, **kw)
@@ -191,15 +189,15 @@ def test_fingerprint_and_tokens() -> None:
 # --- Plugin interface --------------------------------------------------------------
 
 
-def test_plugin_validates_capabilities_and_normalizes() -> None:
-    plug = plugin_mod.MegakernelPlugin(
-        "toy", "1", create="x:y", capabilities={"spec_decode", "mrope"}
+def test_spec_validates_and_normalizes() -> None:
+    plug = plugin_mod.TpuMonoSpec(
+        "toy", "1", create="x:y", features={"spec_decode", "mrope"}
     )
-    assert plug.capabilities == frozenset({"spec_decode", "mrope"})
-    with pytest.raises(MegakernelConfigError, match="unknown capabilities"):
-        plugin_mod.MegakernelPlugin("toy", "1", create="x:y", capabilities={"warp"})
+    assert plug.features == frozenset({"spec_decode", "mrope"})
+    with pytest.raises(MegakernelConfigError, match="unknown features"):
+        plugin_mod.TpuMonoSpec("toy", "1", create="x:y", features={"warp"})
     with pytest.raises(MegakernelConfigError):
-        plugin_mod.MegakernelPlugin("", "1", create="x:y")
+        plugin_mod.TpuMonoSpec("", "1", create="x:y")
 
 
 def test_lazy_library_exports() -> None:
@@ -227,18 +225,17 @@ _FRESH_IMPORT = """
 import sys
 for name in ("torch", "jax", "jaxlib", "vllm", "numpy"):
     sys.modules[name] = None
+import vllm_torchtpu.megakernel.runtime.contract as contract
+import vllm_torchtpu.megakernel.errors as errors
 import vllm_torchtpu.megakernel_runtime.plugin as p
 import vllm_torchtpu.megakernel_runtime.config as c
 import vllm_torchtpu.megakernel_runtime.fingerprint as f
 import vllm_torchtpu.megakernel_runtime.salt as s
-assert p.MegakernelPlugin and c.parse_config and f.source_hash
+assert p.TpuMonoSpec and c.parse_config and f.source_hash
 assert s.compile_cache_salt
-try:
-    p.LayoutDecline
-except ImportError:
-    pass
-else:
-    raise AssertionError("LayoutDecline needs the library (jax)")
+assert p.TpuMonoSpec is contract.TpuMonoSpec
+assert issubclass(p.LayoutDecline, errors.MegakernelLayoutError)
+assert errors.EligibilityResult is contract.EligibilityResult
 print("OK")
 """
 
@@ -354,7 +351,7 @@ def test_plugin_key_and_arch_resolution() -> None:
     ref, _ = cfg_mod.resolve_plugin_ref(cfg)
     assert (ref.module, ref.attr, ref.shorthand) == ("my.pkg", "THING", None)
     ref, _ = cfg_mod.resolve_plugin_ref(cfg_mod.parse_config("plugin=a.b"))
-    assert (ref.module, ref.attr) == ("a.b", "PLUGIN")
+    assert (ref.module, ref.attr) == ("a.b", "SPEC")
     on = cfg_mod.parse_config("1")
     assert cfg_mod.resolve_plugin_ref(on, SimpleNamespace(architectures=["X"])) is None
     by_type = SimpleNamespace(architectures=None, model_type="qwen3_5_moe")
@@ -394,14 +391,14 @@ def test_import_plugin_errors(mod_dir: Path) -> None:
     ref = cfg_mod.PluginRef("no_such_plugin_mod")
     with pytest.raises(MegakernelConfigError, match="no_such_plugin_mod"):
         cfg_mod.import_plugin(ref)
-    _write(mod_dir / "not_a_plugin.py", "PLUGIN = 3\n")
-    with pytest.raises(MegakernelConfigError, match="not a MegakernelPlugin"):
+    _write(mod_dir / "not_a_plugin.py", "SPEC = 3\n")
+    with pytest.raises(MegakernelConfigError, match="not a TpuMonoSpec"):
         cfg_mod.import_plugin(cfg_mod.PluginRef("not_a_plugin"))
     _write(
         mod_dir / "future_plugin.py",
         """
-        from vllm_torchtpu.megakernel_runtime.plugin import MegakernelPlugin
-        PLUGIN = MegakernelPlugin("f", "1", create=".x:y", api_version=99)
+        from vllm_torchtpu.megakernel_runtime.plugin import TpuMonoSpec
+        SPEC = TpuMonoSpec("f", "1", create=".x:y", api_version=99)
         """,
     )
     with pytest.raises(MegakernelConfigError, match="api_version 99"):

@@ -609,6 +609,13 @@ def _multimodal_inputs_possible(runner: Any) -> bool:
     return True
 
 
+def _legacy_caps(spec: Any) -> frozenset[str]:
+    par = spec.parallelism
+    extra = {"pipeline_parallel"} if "pp" in par else set()
+    extra |= {k for k in ("dcp", "pcp") if k in par}
+    return frozenset(spec.features) | extra
+
+
 def check_runner_capabilities(
     runner: Any, capabilities: frozenset[str], *, tp_size: int
 ) -> _rt.EligibilityResult | None:
@@ -796,7 +803,7 @@ def _check_create_result(out: Any, ref: Any) -> _rt.EligibilityResult | None:
         raise MegakernelPluginError(
             f"megakernel plugin {ref.module}:{ref.attr} create() returned "
             f"{type(out).__name__}, which is neither a Decline nor a "
-            f"MegakernelProgram (missing {missing})"
+            f"MonoProgram (missing {missing})"
         )
     return None
 
@@ -815,7 +822,7 @@ def _vote_startup_failure(token: int, codes: Sequence[str]) -> None:
 
 
 class ProgramDriver:
-    """Serves one plugin's `MegakernelProgram` on this TP rank.
+    """Serves one model folder's `MonoProgram` on this TP rank.
 
     Generic: startup checks against the plugin's capabilities, the two TP
     agreements (plugin fingerprint before any collective work, compiled
@@ -910,7 +917,9 @@ class ProgramDriver:
                 fprint[:16],
             )
             tp_size = view.tp_size
-            el = check_runner_capabilities(runner, plugin.capabilities, tp_size=tp_size)
+            el = check_runner_capabilities(
+                runner, _legacy_caps(plugin), tp_size=tp_size
+            )
             if el is not None:
                 cls._log_startup_ineligible(el)
                 return None

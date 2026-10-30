@@ -15,7 +15,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # defined in the runtime contract; see `__getattr__`
+    from .runtime.contract import EligibilityResult
 
 
 class MegakernelConfigError(RuntimeError):
@@ -30,18 +33,14 @@ class MegakernelLayoutError(ValueError):
     """
 
 
-@dataclass(frozen=True)
-class EligibilityResult:
-    """Structured eligibility result returned by startup and config gates."""
+def __getattr__(name: str) -> Any:
+    # `EligibilityResult` is part of the runtime contract (one definition);
+    # resolved lazily since the contract imports this module.
+    if name == "EligibilityResult":
+        from .runtime.contract import EligibilityResult
 
-    eligible: bool
-    reason: str = "ok"
-    message: str = ""
-    level: str = "warning"
-
-    @property
-    def code(self) -> str:
-        return self.reason
+        return EligibilityResult
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = ["EligibilityResult", "MegakernelConfigError", "MegakernelLayoutError"]
