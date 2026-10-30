@@ -639,8 +639,8 @@ class TPUWorker(WorkerBase):
         wave = self.model_runner._pp_wave
         return bool(getattr(wave, "drain_before_handoff", False))
 
-    def profile_pipeline_chunks(self) -> dict:
-        return self.model_runner.profile_pipeline_chunks()
+    def pipeline_chunk_limits(self) -> dict:
+        return self.model_runner.pipeline_chunk_limits()
 
     def take_draft_token_ids(self):
         return self.model_runner.take_draft_token_ids()
