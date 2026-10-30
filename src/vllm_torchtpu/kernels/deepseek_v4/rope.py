@@ -14,13 +14,20 @@
 
 import dataclasses
 import functools
+from collections.abc import Callable
 from typing import cast
 
 import jax
 import jax.numpy as jnp
+from jax._src import dtypes
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.quantized_matmul.util import (
+    _SCALE_LANES,
+    QUANTIZE_GROUP_ROWS,
+    _quantize_row_group,
+)
 from vllm_torchtpu.layers.core.quantization import dtype_max
 from vllm_torchtpu.utils import largest_divisor
 
@@ -937,3 +944,288 @@ def rope_quant_flat(
         ),
         name=name,
     )(positions, token_tiles(x, num_heads), cos_sin_cache)
+
+
+# Heads per output tile of `quantized_matmul_heads`, an even multiple of the
+# 8-row tiling of its bf16 [tokens, heads, head_dim] output.
+HEADS_PER_TILE = 16
+# Rows of x per grid step of `quantized_matmul_heads`.
+HEADS_BLOCK_ROWS = 256
+# Fewest rows routed to `quantized_matmul_heads`.
+HEADS_MIN_ROWS = 128
+# Table-row copies issued per iteration of the gather loop.
+HEADS_GATHER_UNROLL = 8
+
+
+def _quantized_matmul_heads_kernel(
+    indices_ref,
+    x_ref,
+    table_hbm,
+    w_hbm,
+    ws_hbm,
+    o_hbm,
+    xq_ref,
+    xs_ref,
+    w_buf,
+    ws_buf,
+    o_buf,
+    table_buf,
+    *refs,
+    num_row_blocks: int,
+    num_col_blocks: int,
+    head_fn: Callable[..., jax.Array],
+    row_fn: Callable[[jax.Array], tuple[jax.Array, ...]],
+):
+    """One (weight tile j, row block i) step of `quantized_matmul_heads`.
+
+    Steps run i fastest, so a weight tile is fetched once and reused for every
+    row block while the next tile streams in. On its first visit (j == 0) row
+    block i is quantized into the resident x_q, and its table rows, gathered
+    during the step before, go through ``row_fn`` into resident row values.
+    """
+    *row_refs, w_sems, o_sems, table_sems = refs
+    s = pl.program_id(0)
+    j = s // num_row_blocks
+    i = s % num_row_blocks
+    w_slot = j % 2
+    o_slot = s % 2
+    block_rows = x_ref.shape[0]
+    heads = o_hbm.shape[1] // num_col_blocks
+    head_dim = o_hbm.shape[2]
+    lane_blocks = head_dim // LANE
+    block_cols = heads * head_dim
+    rows = pl.ds(pl.multiple_of(i * block_rows, block_rows), block_rows)
+
+    def weight_copies(t, sl):
+        cols = pl.ds(pl.multiple_of(t * block_cols, block_cols), block_cols)
+        return (
+            pltpu.make_async_copy(w_hbm.at[:, cols], w_buf.at[sl], w_sems.at[0, sl]),
+            pltpu.make_async_copy(ws_hbm.at[:, cols], ws_buf.at[sl], w_sems.at[1, sl]),
+        )
+
+    def out_copies(sl):
+        # o_buf holds each 128-lane block of the tile's heads on its own.
+        dst = o_hbm.at[rows, pl.ds(pl.multiple_of(j * heads, heads), heads)]
+        return [
+            pltpu.make_async_copy(
+                o_buf.at[sl, c],
+                dst.at[:, :, pl.ds(c * LANE, LANE)],
+                o_sems.at[sl],
+            )
+            for c in range(lane_blocks)
+        ]
+
+    def gather_table_rows(block, sl):
+        @pl.loop(0, block_rows, unroll=HEADS_GATHER_UNROLL)
+        def _(r):
+            row = indices_ref[block * block_rows + r]
+            pltpu.make_async_copy(
+                table_hbm.at[pl.ds(row, 1)],
+                table_buf.at[sl, pl.ds(r, 1)],
+                table_sems.at[sl],
+            ).start()
+
+    def wait_table_rows(sl):
+        # One wait for the bytes of every row copy into the slot.
+        whole = table_buf.at[sl]
+        pltpu.make_async_copy(whole, whole, table_sems.at[sl]).wait()
+
+    @pl.when(s == 0)
+    def _():
+        for copy in weight_copies(0, 0):
+            copy.start()
+        gather_table_rows(0, 0)
+
+    @pl.when(i == 0)
+    def _():
+        for copy in weight_copies(j, w_slot):
+            copy.wait()
+
+        @pl.when(j + 1 < num_col_blocks)
+        def _():
+            for copy in weight_copies(j + 1, 1 - w_slot):
+                copy.start()
+
+    @pl.when(j == 0)
+    def _():
+        row0 = pl.multiple_of(i * block_rows, block_rows)
+        group_rows = min(QUANTIZE_GROUP_ROWS, block_rows)
+        for start in range(0, block_rows, group_rows):
+            _quantize_row_group(
+                x_ref,
+                pl.ds(start, group_rows),
+                xq_ref,
+                pl.ds(row0 + start, group_rows),
+                xs_ref,
+            )
+        wait_table_rows(i % 2)
+
+        @pl.when(i + 1 < num_row_blocks)
+        def _():
+            gather_table_rows(i + 1, (i + 1) % 2)
+
+        for ref, value in zip(row_refs, row_fn(table_buf[i % 2])):
+            ref[rows, :] = value
+
+    # The output buffer this step fills left for HBM two steps ago.
+    @pl.when(s >= 2)
+    def _():
+        for copy in out_copies(o_slot):
+            copy.wait()
+
+    # A bf16 tile packs heads 2p (low half) and 2p + 1 of a token in word p;
+    # strided stores need a 128-lane buffer, hence o_buf's lane blocks.
+    words_per_row = heads // 2
+    words_ref = o_buf.bitcast(jnp.uint32).at[o_slot]
+    words_ref = words_ref.reshape(lane_blocks, block_rows * words_per_row, LANE)
+    x_scale = xs_ref[rows, 0:1]
+    row_values = [ref[rows, :] for ref in row_refs]
+    for p in range(words_per_row):
+        cols = slice(2 * p * head_dim, (2 * p + 2) * head_dim)
+        # xla_quantized_matmul's dot and epilogue, rounded to its output.
+        acc = jnp.dot(
+            xq_ref[rows, :], w_buf[w_slot, :, cols], preferred_element_type=jnp.float32
+        )
+        acc = acc * x_scale
+        acc = acc * ws_buf[w_slot, :, cols]
+        acc = acc.astype(jnp.bfloat16).astype(jnp.float32)
+        pair = [
+            head_fn(acc[:, h * head_dim : (h + 1) * head_dim], *row_values)
+            for h in range(2)
+        ]
+        words = pltpu.pack_elementwise(pair, packed_dtype=jnp.bfloat16)
+        for c in range(lane_blocks):
+            words_ref.at[c][pl.ds(p, block_rows, stride=words_per_row), :] = words[
+                :, c * LANE : (c + 1) * LANE
+            ]
+
+    for copy in out_copies(o_slot):
+        copy.start()
+
+    @pl.when(s == num_row_blocks * num_col_blocks - 1)
+    def _():
+        steps = num_row_blocks * num_col_blocks
+        for sl in (1 - o_slot, o_slot) if steps > 1 else (o_slot,):
+            for copy in out_copies(sl):
+                copy.wait()
+
+
+def quantized_matmul_heads_supported(m: int, k: int, n: int, head_dim: int) -> bool:
+    """Whether `quantized_matmul_heads` takes an (m, k) @ (k, n) problem."""
+    block_rows = min(HEADS_BLOCK_ROWS, m)
+    return (
+        m >= HEADS_MIN_ROWS
+        and m % block_rows == 0
+        # The 8-bit x_q tile is 32 rows tall.
+        and block_rows % 32 == 0
+        and block_rows % min(QUANTIZE_GROUP_ROWS, block_rows) == 0
+        and k % LANE == 0
+        and head_dim % LANE == 0
+        and n % (HEADS_PER_TILE * head_dim) == 0
+    )
+
+
+def quantized_matmul_heads(
+    x: jax.Array,
+    w_q: jax.Array,
+    w_scale: jax.Array,
+    head_dim: int,
+    head_fn: Callable[..., jax.Array],
+    row_fn: Callable[[jax.Array], tuple[jax.Array, ...]],
+    indices: jax.Array,
+    table: jax.Array,
+    interpret: bool = False,
+) -> jax.Array:
+    """``head_fn`` on each head of ``xla_quantized_matmul(x, w_q, w_scale)``.
+
+    The bf16 product of an 8-bit float ``w_q`` is split into heads of
+    ``head_dim`` columns; each head, upcast to f32, goes through
+    ``head_fn(head, *row_fn(table[indices]))`` for its rows and is rounded
+    back to bf16. Returns ``[m, n // head_dim, head_dim]`` bf16, written
+    straight from VMEM, so the product never round-trips through HBM before
+    ``head_fn`` reads it.
+    """
+    m, k = x.shape
+    n = w_q.shape[1]
+    if not quantized_matmul_heads_supported(m, k, n, head_dim):
+        raise ValueError(f"unsupported shape {(m, k, n, head_dim)}")
+    block_rows = min(HEADS_BLOCK_ROWS, m)
+    block_cols = HEADS_PER_TILE * head_dim
+    num_row_blocks = m // block_rows
+    num_col_blocks = n // block_cols
+    table_rows = jax.ShapeDtypeStruct((block_rows, table.shape[1]), table.dtype)
+    row_shapes = jax.eval_shape(row_fn, table_rows)
+
+    def x_block(s, indices_ref):
+        return (jnp.minimum(s, num_row_blocks - 1), 0)
+
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    out_dtype = jnp.bfloat16
+    return pl.pallas_call(
+        functools.partial(
+            _quantized_matmul_heads_kernel,
+            num_row_blocks=num_row_blocks,
+            num_col_blocks=num_col_blocks,
+            head_fn=head_fn,
+            row_fn=row_fn,
+        ),
+        # Pinned to HBM, so XLA neither prefetches them nor evicts the output.
+        out_shape=pltpu.HBM((m, n // head_dim, head_dim), out_dtype),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(num_row_blocks * num_col_blocks,),
+            in_specs=[pl.BlockSpec((block_rows, k), x_block), hbm, hbm, hbm],
+            out_specs=hbm,
+            scratch_shapes=[
+                pltpu.VMEM((m, k), w_q.dtype),
+                pltpu.VMEM((m, _SCALE_LANES), jnp.float32),
+                pltpu.VMEM((2, k, block_cols), w_q.dtype),
+                pltpu.VMEM((2, 1, block_cols), jnp.float32),
+                pltpu.VMEM(
+                    (2, head_dim // LANE, block_rows, HEADS_PER_TILE, LANE),
+                    out_dtype,
+                ),
+                pltpu.VMEM((2, *table_rows.shape), table.dtype),
+                *(pltpu.VMEM((m, r.shape[1]), r.dtype) for r in row_shapes),
+                pltpu.SemaphoreType.DMA((2, 2)),
+                pltpu.SemaphoreType.DMA((2,)),
+                pltpu.SemaphoreType.DMA((2,)),
+            ],
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            vmem_limit_bytes=_heads_vmem_bytes(
+                m, k, block_rows, block_cols, x.dtype, w_q.dtype, row_shapes
+            ),
+        ),
+        name="quantized_matmul_heads",
+        interpret=interpret,
+    )(
+        indices.astype(jnp.int32),
+        x,
+        pltpu.with_memory_space_constraint(table, pltpu.HBM),
+        pltpu.with_memory_space_constraint(w_q, pltpu.HBM),
+        pltpu.with_memory_space_constraint(w_scale.reshape(1, n), pltpu.HBM),
+    )
+
+
+def _heads_vmem_bytes(m, k, rows, cols, x_dtype, w_dtype, row_shapes) -> int:
+    """Double-buffered blocks, the resident x_q, scales and row values, and
+    headroom."""
+
+    def nbytes(elems, dtype):
+        return elems * dtypes.itemsize_bits(dtype) // 8
+
+    blocks = (
+        nbytes(rows * k, x_dtype)
+        + nbytes(k * cols, w_dtype)
+        + nbytes(rows * cols, jnp.bfloat16)
+        + 8 * cols * 4
+        + rows * LANE * 4
+    )
+    scratch = (
+        nbytes(m * k, w_dtype)
+        + m * _SCALE_LANES * 4
+        + sum(m * max(r.shape[1], LANE) * 4 for r in row_shapes)
+    )
+    return 2 * blocks + scratch + (4 << 20)
