@@ -101,6 +101,13 @@ def add_arguments(parser) -> None:
     bench.add_argument(
         "--mtp", action="store_true", help="the last stage writes the MTP layer's KV"
     )
+    bench.add_argument(
+        "--step-sizes",
+        choices=("scheduler", "pow2"),
+        default="scheduler",
+        help="pad steps to the pipeline chunk scheduler's buckets, as serving "
+        "does (prefix caching off), or to powers of two",
+    )
 
     decode = sub.add_parser("decode", help="the decoder's step time")
     decode.add_argument("--presharded", required=True, help="the decoder's rank cache")
@@ -841,6 +848,12 @@ def run(args) -> None:
     )
     pools = Pools(layers, blocks, args.max_model_len, args.mtp)
     stage.bind_kv_caches(pools.caches, pools.groups)
+    if args.step_sizes == "scheduler":
+        from vllm_torchtpu.core.pp_chunks import chunk_buckets, chunk_granularity
+
+        tokens = args.max_num_batched_tokens
+        granule = chunk_granularity(MANAGER_BLOCK, tokens, True)
+        stage.size_steps([*chunk_buckets(tokens, granule), tokens])
     stage.warmup()
     harness.sync()
     rng = np.random.default_rng(0)

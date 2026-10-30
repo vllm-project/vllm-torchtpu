@@ -63,6 +63,7 @@ from vllm_torchtpu.megakernel.qwen38.program import (
     check,
     is_full_attention,
 )
+from vllm_torchtpu.megakernel.qwen38.prologue import CHUNK as RING_CHUNK
 from vllm_torchtpu.megakernel.qwen38.reference import BF16, F32, Dims, rms
 from vllm_torchtpu.megakernel.qwen38.ring import ring_order
 from vllm_torchtpu.megakernel.qwen38.rows import Span, plan_rows, rows_per_core
@@ -108,6 +109,9 @@ class QwenPrefillStage:
         self.ring = _ring(mesh)
         self.chunk = int(config.cp_kv_cache_interleave_size or 0)
         self.granule = math.lcm(self.chunk, Q_BLOCK)
+        # Rows-per-core sizes a step pads to (:meth:`size_steps`; None: the
+        # power-of-two multiples of the granule).
+        self._sizes: list[int] | None = None
         self.weights: StageWeights | None = None
         self._pools: dict[int, torch.Tensor] = {}  # layer -> its pool tensor
         self._raw: list[torch.Tensor] = []  # the distinct pool tensors
@@ -120,22 +124,40 @@ class QwenPrefillStage:
 
     # ------------------------------------------------------------ geometry
     def _rows_for(self, tokens: int) -> int:
-        """Rows per core of a step of ``tokens`` tokens: the smallest
-        power-of-two multiple of the granule holding them (one compiled set
-        of ops per size), at most :meth:`max_rows`."""
+        """Rows per core of a step of ``tokens`` tokens: the smallest of
+        :meth:`buckets` holding them (one compiled set of ops per size)."""
         needed = rows_per_core(tokens, self.cores, self.chunk)
-        rows = self.granule
-        while rows < needed:
-            rows *= 2
-        return min(rows, self.max_rows()) if needed <= self.max_rows() else rows
+        for rows in self.buckets():
+            if rows >= needed:
+                return rows
+        return -(-needed // self.granule) * self.granule
+
+    def _sized_rows(self, tokens: int) -> int:
+        """Rows per core of a scheduler step size: whole rounds of the MoE
+        prologue's ring (two streams of ``prologue.CHUNK``-row pushes)."""
+        size = math.lcm(self.granule, 2 * RING_CHUNK)
+        needed = rows_per_core(tokens, self.cores, self.chunk)
+        return -(-needed // size) * size
 
     def buckets(self) -> list[int]:
-        """Every rows-per-core size a step can take."""
-        sizes, rows = [], self.granule
-        while rows < self.max_rows():
-            sizes.append(rows)
+        """Every rows-per-core size a step can take: the power-of-two
+        multiples of the granule below the first of the scheduler's step
+        sizes (:meth:`size_steps`), then each of those sizes; without them,
+        power-of-two multiples up to :meth:`max_rows`."""
+        top = self.max_rows()
+        sizes = sorted(set(self._sizes or ())) or [top]
+        small, rows = [], self.granule
+        while rows < sizes[0]:
+            small.append(rows)
             rows *= 2
-        return [*sizes, self.max_rows()]
+        return [*small, *sizes] if self._sizes else [*small, top]
+
+    def size_steps(self, tokens: Sequence[int]) -> None:
+        """Pad steps to the token counts the scheduler cuts them at (its step
+        cost model's buckets, :meth:`_sized_rows`), rather than to powers of
+        two: a step just past a power of two would otherwise cost the next
+        one. Before :meth:`warmup`."""
+        self._sizes = [min(self._sized_rows(t), self.max_rows()) for t in tokens]
 
     def _geometry(self, rows: int) -> qlayers.Geometry:
         return qlayers.Geometry(

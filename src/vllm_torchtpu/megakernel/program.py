@@ -207,6 +207,11 @@ class PipelineStage(MegakernelProgram, Protocol):
         """The hand-off rows this device holds for ``step_input``."""
         ...
 
+    def size_steps(self, tokens: Sequence[int]) -> None:
+        """The token counts the pipeline chunk scheduler cuts steps at, given
+        before :meth:`warmup`: a stage may compile its step shapes to them."""
+        ...
+
     def time_steps(self, points: Sequence[tuple[int, int]]) -> list[float]:
         """Milliseconds this stage takes for a step of ``tokens`` new tokens
         after ``prefix`` cached ones, for each ``(tokens, prefix)``: the

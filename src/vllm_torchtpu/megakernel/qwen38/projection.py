@@ -18,6 +18,8 @@ output tile."""
 
 from __future__ import annotations
 
+import math
+
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
@@ -36,8 +38,9 @@ def fp8_projection(x, weight, scale, residual, *, interpret=False):
     projection rounded to BF16, then summed in F32."""
     rows, contraction = x.shape
     out = weight.shape[0]
-    row_tile, column_tile = min(ROW_TILE, rows), min(COLUMN_TILE, out)
-    assert rows % row_tile == 0 and out % column_tile == 0
+    # The largest row tile up to ROW_TILE that divides the rows.
+    row_tile, column_tile = math.gcd(ROW_TILE, rows), min(COLUMN_TILE, out)
+    assert out % column_tile == 0
 
     def kernel(scale_ref, x_ref, w_ref, residual_ref, out_ref):
         product = jax.lax.dot_general(

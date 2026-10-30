@@ -257,8 +257,12 @@ class MegakernelModelRunner(TPUModelRunner):
         )
 
     def capture_model(self) -> int:
-        """Build the pipeline wave on a stage, then compile the program's ops
-        (it warms every shape it will run)."""
+        """Build the pipeline wave on a stage and give the stage the step
+        sizes the chunk scheduler cuts at, then compile the program's ops (it
+        warms every shape it will run)."""
+        from vllm_torchtpu.core.pp_chunk_scheduler import uses_dynamic_chunks
+        from vllm_torchtpu.core.pp_chunks import chunk_buckets
+
         assert self.program is not None
         if self.parallel_config.pipeline_parallel_size > 1 and self._pp_wave is None:
             stage = self._stage()
@@ -266,6 +270,11 @@ class MegakernelModelRunner(TPUModelRunner):
                 self.device, stage.max_rows(), dict(stage.handoff_template())
             )
             self._pp_wave.warmup()
+            if uses_dynamic_chunks(self.vllm_config):
+                tokens = self.scheduler_config.max_num_batched_tokens
+                stage.size_steps(
+                    [*chunk_buckets(tokens, _chunk_granularity(self)), tokens]
+                )
         self.program.warmup()
         return 0
 
@@ -276,32 +285,10 @@ class MegakernelModelRunner(TPUModelRunner):
     def profile_pipeline_chunks(self) -> dict[str, Any]:
         """The chunk granularity and this stage's step times for the pipeline
         chunk scheduler's cost model (see ``TPUModelRunner``)."""
-        from vllm_torchtpu.core.pp_chunks import (
-            chunk_buckets,
-            chunk_granularity,
-            profile_points,
-        )
+        from vllm_torchtpu.core.pp_chunks import chunk_buckets, profile_points
 
-        capabilities = backend.capabilities(self.vllm_config)
-        assert capabilities is not None
         tokens = self.scheduler_config.max_num_batched_tokens
-        granularity = chunk_granularity(
-            self.cache_config.block_size, tokens, capabilities.page_aligned_chunks
-        )
-        # In mamba "align" mode the scheduler clips every chunk end to its own
-        # blocks, which span all PCP ranks: a granule of fewer tokens would
-        # clip a chunk that only fits a granule to nothing.
-        if (
-            self.kv_cache_config is not None
-            and self.kv_cache_config.has_mamba_layers
-            and self.cache_config.mamba_cache_mode == "align"
-        ):
-            scheduler_block = (
-                self.cache_config.block_size
-                * self.parallel_config.prefill_context_parallel_size
-            )
-            if scheduler_block <= tokens:
-                granularity = -(-granularity // scheduler_block) * scheduler_block
+        granularity = _chunk_granularity(self)
         points = profile_points(
             [*chunk_buckets(tokens, granularity), tokens], tokens, self.max_model_len
         )
@@ -551,3 +538,31 @@ class MegakernelModelRunner(TPUModelRunner):
             self.input_batch.num_tokens_no_spec[index] = start + len(tokens)
             req_state.output_token_ids.extend(tokens)
         return final_output
+
+
+def _chunk_granularity(runner: Any) -> int:
+    """The token multiple the pipeline chunk scheduler cuts this engine's
+    prefill chunks at."""
+    from vllm_torchtpu.core.pp_chunks import chunk_granularity
+
+    capabilities = backend.capabilities(runner.vllm_config)
+    assert capabilities is not None
+    tokens = runner.scheduler_config.max_num_batched_tokens
+    granularity = chunk_granularity(
+        runner.cache_config.block_size, tokens, capabilities.page_aligned_chunks
+    )
+    # In mamba "align" mode the scheduler clips every chunk end to its own
+    # blocks, which span all PCP ranks: a granule of fewer tokens would
+    # clip a chunk that only fits a granule to nothing.
+    if (
+        runner.kv_cache_config is not None
+        and runner.kv_cache_config.has_mamba_layers
+        and runner.cache_config.mamba_cache_mode == "align"
+    ):
+        scheduler_block = (
+            runner.cache_config.block_size
+            * runner.parallel_config.prefill_context_parallel_size
+        )
+        if scheduler_block <= tokens:
+            granularity = -(-granularity // scheduler_block) * scheduler_block
+    return granularity

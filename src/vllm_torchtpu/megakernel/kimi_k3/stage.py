@@ -564,6 +564,9 @@ class KimiPrefillStage:
     def rows(self, step_input: StepInput) -> int:
         return sum(window for window, _ in self._plan(step_input.requests)) // CORES
 
+    def size_steps(self, tokens: Sequence[int]) -> None:
+        """The stage's windows are fixed (``self.windows``)."""
+
     def time_steps(self, points: Sequence[tuple[int, int]]) -> list[float]:
         """Each point's step time on this stage: the median of three null
         steps after a compiling one."""

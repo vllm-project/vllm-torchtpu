@@ -201,6 +201,7 @@ def test_capture_model_builds_the_wave_from_the_program(monkeypatch):
         _stage=lambda: program,
         _pp_wave=None,
         device="tpu:0",
+        vllm_config=None,
         parallel_config=SimpleNamespace(pipeline_parallel_size=4),
     )
     assert MegakernelModelRunner.capture_model(instance) == 0
@@ -210,6 +211,43 @@ def test_capture_model_builds_the_wave_from_the_program(monkeypatch):
         "program warmup",
     ]
     assert isinstance(instance._pp_wave, Wave)
+
+
+def test_capture_model_gives_the_stage_the_scheduler_step_sizes(monkeypatch):
+    from vllm_torchtpu.core import pp_chunk_scheduler
+    from vllm_torchtpu.megakernel import backend, runner
+
+    monkeypatch.setattr(
+        runner, "PPWave", lambda *args: SimpleNamespace(warmup=lambda: None)
+    )
+    monkeypatch.setattr(pp_chunk_scheduler, "uses_dynamic_chunks", lambda config: True)
+    monkeypatch.setattr(
+        backend,
+        "capabilities",
+        lambda config: SimpleNamespace(page_aligned_chunks=True),
+    )
+    order = []
+    program = SimpleNamespace(
+        max_rows=lambda: 4096,
+        handoff_template=lambda: {},
+        size_steps=lambda tokens: order.append(("sizes", list(tokens))),
+        warmup=lambda: order.append("warmup"),
+    )
+    instance = SimpleNamespace(
+        program=program,
+        _stage=lambda: program,
+        _pp_wave=None,
+        device="tpu:0",
+        vllm_config=None,
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
+        cache_config=SimpleNamespace(block_size=2048),
+        kv_cache_config=None,
+        parallel_config=SimpleNamespace(pipeline_parallel_size=4),
+    )
+    MegakernelModelRunner.capture_model(instance)
+    # The scheduler's buckets (an eighth of a step in whole blocks), sized
+    # before the program compiles them.
+    assert order == [("sizes", [2048, 4096, 6144, 8192]), "warmup"]
 
 
 def test_the_chunk_profile_times_the_program(monkeypatch):
