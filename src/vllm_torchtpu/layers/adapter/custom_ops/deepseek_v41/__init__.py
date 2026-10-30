@@ -13,14 +13,24 @@
 # limitations under the License.
 """DeepSeek-V4.1 Pallas custom-op bridges."""
 
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.attention_op import (
+    dsv41_gather_sparse_fp8_kv,
+    dsv41_sparse_mla_swa_attention,
+)
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.cache_op import (
     dsv41_gather_cache_rows,
     dsv41_pack_fp8_kv_rows,
     dsv41_write_sub_rows,
 )
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.indexer_op import (
+    dsv41_paged_indexer_topk,
+)
 
 __all__ = [
     "dsv41_gather_cache_rows",
+    "dsv41_gather_sparse_fp8_kv",
     "dsv41_pack_fp8_kv_rows",
+    "dsv41_paged_indexer_topk",
+    "dsv41_sparse_mla_swa_attention",
     "dsv41_write_sub_rows",
 ]
