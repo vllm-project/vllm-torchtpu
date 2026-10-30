@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import time
 from typing import TYPE_CHECKING, cast
 
 import numpy as np
@@ -188,6 +189,12 @@ class DFlashProposer:
         layout overrides this to K (the anchor is the first prediction)."""
         return K + 1
 
+    def _observe_draft_aux(
+        self, aux_per_chunk: list[torch.Tensor], chunks: list[DraftChunkInputs]
+    ) -> None:
+        """Receives the second output of each chunk's
+        `_dflash_forward_and_sample` once per `propose`."""
+
     def load_model(self, target_model) -> None:
         """Load the draft model, share embeddings, and tag target layers."""
         # Tag the target model to extract aux hidden states
@@ -308,6 +315,17 @@ class DFlashProposer:
         while paddings[-1] < max_draft_tokens:
             paddings.append(min(paddings[-1] * 2, max_draft_tokens))
         return paddings
+
+    def draft_forward_buckets(self) -> list[int]:
+        """Buckets a draft forward runs at: a full block up to a full chunk."""
+        max_draft_tokens = self._get_padded_len(
+            self._max_chunk_reqs() * self.block_size
+        )
+        return [
+            b
+            for b in self._draft_token_paddings()
+            if self.block_size <= b <= max_draft_tokens
+        ]
 
     def _get_padded_len(self, target_len: int) -> int:
         paddings = self._draft_token_paddings()
@@ -636,6 +654,7 @@ class DFlashProposer:
 
         # 2. Process each chunk
         draft_logits_per_chunk = []
+        draft_aux_per_chunk = []
         for i, chunk in enumerate(chunks):
             next_tokens_device = (
                 next_tokens_per_chunk[i] if next_tokens_per_chunk else None
@@ -666,11 +685,13 @@ class DFlashProposer:
                     mesh=self.runner.mesh, vllm_config=self.vllm_config
                 ),
             ):
-                draft_tokens_chunk, _ = self._dflash_forward_and_sample(
+                draft_tokens_chunk, draft_aux = self._dflash_forward_and_sample(
                     input_ids, positions, block_size
                 )
 
             draft_logits_per_chunk.append(draft_tokens_chunk)
+            draft_aux_per_chunk.append(draft_aux)
+        self._observe_draft_aux(draft_aux_per_chunk, chunks)
         for _ in range(extra_chunks):
             self._dp_dummy_forward()
 
@@ -892,6 +913,18 @@ class DFlashProposer:
                 input_ids, positions, block_size
             )
             synchronize_tensors(draft_tokens_chunk, wait=sync)
+
+    def profile_draft_ms(self, num_tokens: int) -> float:
+        """Wall time in ms of one draft forward at this draft-token bucket.
+
+        Every collective-emitting rank must call this with the same buckets in
+        the same order (the dummy forward pairs collectives like a warmup)."""
+        timings = []
+        for _ in range(2):
+            started = time.perf_counter()
+            self._dummy_draft_forward(num_tokens, use_max_model_len=True, sync=True)
+            timings.append((time.perf_counter() - started) * 1e3)
+        return min(timings)
 
     def _dp_draft_bucket(self) -> int:
         """Draft-forward token bucket every lockstep rank runs this step."""
