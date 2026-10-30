@@ -143,6 +143,7 @@ if TYPE_CHECKING:
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
     VLLM_TPU_MXFP4_DEVICE_DEQUANT: bool = True
     VLLM_TPU_DEBUG_PCP_LAYOUT: bool = False
+    VLLM_TPU_DEBUG_COMPILE_THREAD_GC: str = "off"
     TPU_LOCAL_RANK_OFFSET: int = 0
     DEBUG_TPU_LOCAL_RANK_OFFSET: int = 0
     TORCH_TPU_BASE_PORT: int = 8070
@@ -872,6 +873,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_MXFP4_DEVICE_DEQUANT": env_bool("VLLM_TPU_MXFP4_DEVICE_DEQUANT", True),
     # Log the PCP sequence layout window on every step.
     "VLLM_TPU_DEBUG_PCP_LAYOUT": env_bool("VLLM_TPU_DEBUG_PCP_LAYOUT"),
+    # Debug TPU tensors freed on torch_tpu compile threads by the MoE schedule
+    # HLO pass (compilation/compile_thread_gc_diag.py). "observe" keeps the GC
+    # guard and logs pass threads, non-main collections and the TPU tensors
+    # held in cycles after each precompile phase. "collect_in_pass" drops the
+    # guard and forces a full collection inside the pass, to reproduce the
+    # allow_context_state_access abort.
+    "VLLM_TPU_DEBUG_COMPILE_THREAD_GC": env_with_choices(
+        "VLLM_TPU_DEBUG_COMPILE_THREAD_GC", "off", ["off", "observe", "collect_in_pass"]
+    ),
     # Added to every worker's local rank when it binds to a physical chip.
     # worker/tpu_rank_binding.py reads it from the env mapping it is given.
     "TPU_LOCAL_RANK_OFFSET": env_int("TPU_LOCAL_RANK_OFFSET", 0),

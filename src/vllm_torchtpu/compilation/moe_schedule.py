@@ -330,13 +330,33 @@ _install_lock = threading.Lock()
 _installed = False
 
 
+def _pass_callback():
+    from vllm_torchtpu import envs
+
+    mode = envs.VLLM_TPU_DEBUG_COMPILE_THREAD_GC
+    if mode == "off":
+        return rewrite_moe_schedule_without_gc
+    from vllm_torchtpu.compilation import compile_thread_gc_diag as diag
+
+    diag.install_gc_watch()
+
+    def observed(blob: bytes) -> bytes | None:
+        diag.note_pass_thread()
+        if mode == "collect_in_pass":
+            diag.collect_in_pass()
+            return rewrite_moe_schedule(blob)
+        return rewrite_moe_schedule_without_gc(blob)
+
+    return observed
+
+
 def install_moe_schedule() -> None:
     """Register once per process; unrelated compilations are unchanged."""
     global _installed
     with _install_lock:
         if not _installed:
             xla.register_hlo_module_transformation(
-                rewrite_moe_schedule_without_gc,
+                _pass_callback(),
                 name="split_sc_moe_schedule",
                 platforms="tpu",
                 stage=xla.PipelineStage.PRE_SCHEDULER,

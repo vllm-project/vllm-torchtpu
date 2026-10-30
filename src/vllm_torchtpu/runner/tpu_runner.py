@@ -5770,6 +5770,12 @@ class TPUModelRunner(GPUModelRunner):
         yield
         logger.info("Compilation finished in %.2f [secs].", time.perf_counter() - start)
         self._update_num_xla_graphs(name)
+        if envs.VLLM_TPU_DEBUG_COMPILE_THREAD_GC == "observe":
+            from vllm_torchtpu.compilation.compile_thread_gc_diag import (
+                dump_tpu_garbage,
+            )
+
+            dump_tpu_garbage(name)
 
     def _dummy_logits(self, num_reqs: int) -> torch.Tensor:
         return torch.zeros(
