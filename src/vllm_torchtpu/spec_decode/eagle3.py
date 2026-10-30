@@ -174,6 +174,38 @@ _async_draft_seed_compiled = _static_shape_args(
 )
 
 
+def _async_seed_inputs_impl(
+    next_tokens: torch.Tensor,
+    num_draft: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_reqs: torch.Tensor,
+    input_ids: torch.Tensor,
+    p: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`_async_draft_seed_impl`, the eagle3 input shift + seed scatter
+    (`Eagle3Proposer._draft_seed_input_ids`) and the loop-bucket pad of the
+    gather index as one program (VLLM_TPU_DRAFT_SEED_FUSED). Returns
+    `(draft_input_ids, gather_indices [p], num_rejected)`."""
+    last_token_indices, next_token_ids, num_rejected = _async_draft_seed_impl(
+        next_tokens, num_draft, query_start_loc, num_reqs
+    )
+    shifted = input_ids
+    if input_ids.shape[0] > 1:
+        shifted = torch.cat((input_ids[1:], input_ids[-1:]), dim=0)
+    draft_input_ids = shifted.index_put(
+        (last_token_indices,), next_token_ids.to(input_ids.dtype)
+    )
+    gather_indices = _maybe_pad_dim0(last_token_indices[:p], p)
+    return draft_input_ids, gather_indices, num_rejected
+
+
+# The chunk's input_ids carry the draft forward's dynamic-dim marks; see
+# _static_shape_args.
+_async_seed_inputs_compiled = _static_shape_args(
+    torch.compile(backend="tpu", fullgraph=True, dynamic=False)(_async_seed_inputs_impl)
+)
+
+
 def _async_draft_seed(
     next_tokens: torch.Tensor,
     num_draft: torch.Tensor,
@@ -331,6 +363,8 @@ class Eagle3Proposer:
         # >= 2 swap the seq_lens field on the cached objects instead of
         # recomputing it or paying the full upstream builder walk.
         self._draft_md_cache: dict[int, tuple[dict, torch.Tensor, int]] = {}
+        self._seed_checks_done = 0
+        self._seed_mismatches: torch.Tensor | None = None
         # DSA MTP IndexShare (GLM-5.2 / DeepSeek-V3.2). Resolved in load_model.
         self._share_mtp_indices = False
         # The distinct topk_indices_buffer tensors of the draft's MTP layers.
@@ -1701,6 +1735,49 @@ class Eagle3Proposer:
                     for rid in req_ids
                 ]
                 num_draft_full = torch.from_numpy(num_draft_np).to(runner.device)
+            if (
+                not ov_i
+                and envs.VLLM_TPU_FUSED_ASYNC_DRAFT_SEED
+                and envs.VLLM_TPU_DRAFT_SEED_FUSED
+                and nt.device.type == "tpu"
+            ):
+                # Seed, input shift/scatter and gather pad in one program.
+                draft_input_ids, gather_indices, num_rejected_out = (
+                    _async_seed_inputs_compiled(
+                        nt,
+                        num_draft_full,
+                        chunk.attn_ctx.query_start_loc,
+                        self._device_constant(
+                            ("num_reqs", num_reqs),
+                            lambda: torch.tensor(num_reqs, dtype=torch.int64),
+                        ),
+                        chunk.input_ids,
+                        self._loop_bucket(num_reqs),
+                    )
+                )
+                if self._seed_checks_done < envs.VLLM_TPU_VERIFY_FUSED_CHECK:
+                    self._check_seed_fused(
+                        nt,
+                        num_draft_full,
+                        chunk,
+                        num_reqs,
+                        draft_input_ids,
+                        gather_indices,
+                        num_rejected_out,
+                    )
+                draft_input_ids, gather_indices = (
+                    chunk.sequence_layout_plan.localize_token_tensor_and_gather_indices(
+                        draft_input_ids,
+                        gather_indices,
+                        num_valid_gathers=num_reqs,
+                    )
+                )
+                return (
+                    draft_input_ids,
+                    chunk.position_ids,
+                    gather_indices,
+                    num_rejected_out,
+                )
             if not ov_i and envs.VLLM_TPU_FUSED_ASYNC_DRAFT_SEED:
                 # Unsliced inputs: slicing inside the program keeps the views
                 # from materializing as their own eager programs.
@@ -1862,6 +1939,63 @@ class Eagle3Proposer:
         )
 
         return (draft_input_ids, chunk.position_ids, gather_indices, num_rejected_out)
+
+    def _check_seed_fused(
+        self,
+        nt: torch.Tensor,
+        num_draft: torch.Tensor,
+        chunk: DraftChunkInputs,
+        num_reqs: int,
+        draft_input_ids: torch.Tensor,
+        gather_indices: torch.Tensor,
+        num_rejected: torch.Tensor,
+    ) -> None:
+        """VLLM_TPU_VERIFY_FUSED_CHECK for the fused draft seed: rerun the
+        separate seed, scatter and pad on the same inputs and count mismatching
+        entries on device (first VLLM_TPU_VERIFY_FUSED_CHECK_FAULT checks
+        perturbed, as a positive control)."""
+        n_dev = self._device_constant(
+            ("num_reqs", num_reqs), lambda: torch.tensor(num_reqs, dtype=torch.int64)
+        )
+        lti, nti, nrej = _async_draft_seed(
+            nt, num_draft, chunk.attn_ctx.query_start_loc, n_dev
+        )
+        ref_ids = self._draft_seed_input_ids(chunk.input_ids, lti, nti)
+        p = self._loop_bucket(num_reqs)
+        ref_g = _maybe_pad_dim0(lti[:p], p)
+        faulted = self._seed_checks_done < envs.VLLM_TPU_VERIFY_FUSED_CHECK_FAULT
+        cmp_ids = draft_input_ids
+        if faulted:
+            cmp_ids = draft_input_ids.clone()
+            cmp_ids[0] = cmp_ids[0] + 1
+        mism = (
+            (cmp_ids != ref_ids).sum()
+            + (gather_indices != ref_g).sum()
+            + (num_rejected != nrej).sum()
+        ).to(torch.int64)
+        delta = torch.stack(
+            [
+                mism * (0 if faulted else 1),
+                (mism > 0).to(torch.int64) * (1 if faulted else 0),
+            ]
+        )
+        self._seed_mismatches = (
+            delta if self._seed_mismatches is None else self._seed_mismatches + delta
+        )
+        self._seed_checks_done += 1
+        if (
+            self._seed_checks_done % 500 == 0
+            or self._seed_checks_done == envs.VLLM_TPU_VERIFY_FUSED_CHECK
+        ):
+            clean, caught = self._seed_mismatches.tolist()
+            logger.info(
+                "DRAFT_SEED_FUSED_CHECK checks=%d clean_mismatched=%d "
+                "faulted_checks=%d faulted_caught=%d",
+                self._seed_checks_done,
+                clean,
+                min(self._seed_checks_done, envs.VLLM_TPU_VERIFY_FUSED_CHECK_FAULT),
+                caught,
+            )
 
     def _target_draft_attn_metadata(
         self, chunk: DraftChunkInputs

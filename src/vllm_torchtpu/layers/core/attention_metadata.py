@@ -678,20 +678,40 @@ def stage_block_table_uploads(
         # groups exist; each build() synthesizes its own table there.
         return
 
-    # Walk in the same order the builds will, deduping shared group ids.
-    entries: list[tuple[int, Any, int]] = []
-    entry_builders: list[Any] = []
-    seen: set[int] = set()
-    for group_list in runner.attn_groups:
-        for group in group_list:
-            builder = group.metadata_builders[0]
-            gid = builder.kv_cache_group_id
-            if gid in seen or (gids is not None and gid not in gids):
-                continue
-            seen.add(gid)
-            block_table_obj, target_num_blocks = builder._block_table_geometry(ctx)
-            entries.append((gid, block_table_obj, target_num_blocks))
-            entry_builders.append(builder)
+    # Walk in the same order the builds will, deduping shared group ids. The
+    # result depends only on the groups and the walk's geometry inputs, so
+    # VLLM_TPU_STAGE_ENTRIES_CACHE keeps it instead of re-walking all groups
+    # (59 for Qwen4Exp) every step.
+    entries_key = (
+        id(runner.attn_groups),
+        id(runner.input_batch),
+        ctx.use_max_model_len,
+        ctx.mamba_ckpt_window,
+        None if gids is None else frozenset(gids),
+    )
+    cached_entries = (
+        runner.__dict__.get("_stage_entries_cache")
+        if envs.VLLM_TPU_STAGE_ENTRIES_CACHE
+        else None
+    )
+    if cached_entries is not None and cached_entries[0] == entries_key:
+        entries, entry_builders = cached_entries[1], cached_entries[2]
+    else:
+        entries = []
+        entry_builders = []
+        seen: set[int] = set()
+        for group_list in runner.attn_groups:
+            for group in group_list:
+                builder = group.metadata_builders[0]
+                gid = builder.kv_cache_group_id
+                if gid in seen or (gids is not None and gid not in gids):
+                    continue
+                seen.add(gid)
+                block_table_obj, target_num_blocks = builder._block_table_geometry(ctx)
+                entries.append((gid, block_table_obj, target_num_blocks))
+                entry_builders.append(builder)
+        if envs.VLLM_TPU_STAGE_ENTRIES_CACHE:
+            runner._stage_entries_cache = (entries_key, entries, entry_builders)
     if not entries:
         return
 
