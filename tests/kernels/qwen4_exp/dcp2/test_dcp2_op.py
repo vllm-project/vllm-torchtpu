@@ -184,3 +184,69 @@ def test_dcp_op_matches_replicated_op(interpret, rpa_stand_in, monkeypatch, part
                                       case):
     monkeypatch.setattr(pooled_qsa, "select_blocks", stub_select)
     print(case, check_op(**OP_CASES[case]))
+
+
+def check_sp_op(query_lens, contexts, *, main_slot=0, max_query_len=1, seed=0, size=D):
+    """SP token-shard pair: token_select on each of ``size`` token shards ->
+    gather blocks -> shard_attend, DCP (per pair rank, poisoned pools) vs
+    replicated. The pair ranks double as the token shards (shard = rank)."""
+    layout, full, keep, qgate, s, m, seq, starts = make_step(seed, query_lens, contexts)
+    sel = dict(compress_ratio=RATIO, token_topk=TOPK, norm_eps=1e-6, rotary_dim=ROTARY,
+               k_scale=K_SCALE, v_scale=V_SCALE, main_slot=main_slot,
+               max_query_len=max_query_len)
+    att = dict(kv_heads=1, compress_ratio=RATIO, token_topk=TOPK, k_scale=K_SCALE,
+               v_scale=V_SCALE, main_slot=main_slot, max_query_len=max_query_len,
+               merged=True)
+    # Replicated: every TP rank selects its shard, then attends its H heads.
+    rep = []
+    for r in range(D):
+        shards = [pooled_qsa.pooled_qsa_token_select_step(
+            *_args(qgate[r], s, full, m, layout.full_table), rank_operand(sh),
+            shard_size=size, **sel) for sh in range(size)]
+        pool, q, gate, lengths, req, st, _ = shards[0]
+        gathered = jnp.concatenate([x[-1] for x in shards])
+        rep.append(pooled_qsa.pooled_qsa_shard_attend_step(
+            q, gate, lengths, req, st, jnp.asarray(layout.full_table), m["context"], pool,
+            gathered, **att))
+    full_after = raw(shards[0][0])
+    pair_qgate = jnp.concatenate(qgate, axis=1)
+    pools = [from_raw(poison_tail_rows(project_rank_pool(raw(full), layout, r, keep_pages=keep),
+                                       layout, r, seq)) for r in range(D)]
+    dcp = []
+    for r in range(D):
+        shards = [pooled_qsa.pooled_qsa_token_select_dcp_step(
+            *_args(pair_qgate, s, pools[r], m, layout.dcp_table), rank_operand(sh),
+            rank_operand(r), shard_size=size, **sel) for sh in range(size)]
+        pool, q, gate, lengths, req, st, _ = shards[0]
+        want = poison_tail_rows(project_rank_pool(full_after, layout, r, keep_pages=keep),
+                                layout, r, seq)
+        assert np.array_equal(raw(pool), want), f"rank {r} pool differs after SP select"
+        gathered = jnp.concatenate([x[-1] for x in shards])
+        dcp.append(pooled_qsa.pooled_qsa_shard_attend_dcp_step(
+            q, gate, lengths, req, st, jnp.asarray(layout.dcp_table), m["context"], pool,
+            gathered, rank_operand(r), **att))
+    out_pair = jnp.stack([jnp.asarray(d[1], jnp.float32) for d in dcp])
+    lse_pair = jnp.stack([jnp.asarray(d[2], jnp.float32) for d in dcp])
+    live = np.zeros((out_pair.shape[1], H), bool)
+    live[: int(starts[-1])] = True
+    reports = {}
+    for r in range(D):
+        np.testing.assert_array_equal(np.asarray(dcp[r][3]), np.asarray(rep[r][2]))
+        gate = qgate[r].reshape(len(qgate[r]), H, 2 * DH)[..., DH:]
+        got = qsa_rpa.dcp_combine(out_pair, lse_pair, gate, rank_operand(r))
+        want = np.asarray(rep[r][1], np.float32).reshape(-1, H, DH)
+        reports[r] = check_gated(got, want, live, what=f"SP op rank {r}")
+    return reports
+
+
+SP_CASES = {
+    # A prefill-sized SP step: two unaligned pieces crossing B / 2B.
+    "prefill_pieces": dict(query_lens=[200, 120], contexts=[1301, 700]),
+}
+
+
+@pytest.mark.parametrize("case", sorted(SP_CASES))
+def test_dcp_sp_token_shard_matches_replicated(interpret, rpa_stand_in, monkeypatch,
+                                               partial_kernels, case):
+    monkeypatch.setattr(pooled_qsa, "select_blocks", stub_select)
+    print(case, check_sp_op(**SP_CASES[case]))
