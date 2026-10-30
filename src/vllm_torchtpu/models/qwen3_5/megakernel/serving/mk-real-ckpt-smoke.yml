@@ -1,0 +1,116 @@
+# Real-checkpoint smoke of the Qwen3.5 megakernel template (decode + MTP) on
+# one TPU v7x 2x2x1 host, with the read-only shared checkpoint cache mounted
+# at /vllm-cache. It runs `python3 -u ${TEST_PATH}`, a run_real_ckpt_smoke*.py
+# script by repo-relative path, from the vllm-torchtpu checkout mounted at
+# /root/cloud-devkit/vllm-torchtpu (NFS_SRC_PATH); see ../README.md. A
+# template copy of the cloud-devkit recipe `nanwei-mk-real-ckpt-smoke`.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: nanwei-mk-real-ckpt-smoke
+spec:
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+      - test
+  replicatedJobs:
+  - name: test
+    replicas: 1
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        backoffLimit: 0
+        template:
+          metadata:
+            annotations:
+              gke-gcsfuse/volumes: "true"
+          spec:
+            containers:
+            - name: torchtpu-test
+              image: '{{ .IMAGE | default "us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu:0055e09cf3e2dad7f4bcc34004be60540aaf0fbb-v0.32.0" }}'
+              imagePullPolicy: Always
+              env:
+              - name: TEST_PATH
+                value: '{{ .TEST_PATH | default "src/vllm_torchtpu/models/qwen3_5/megakernel/serving/run_real_ckpt_smoke.py" }}'
+              - name: PJRT_DEVICE
+                value: "TPU"
+              - name: JAX_PLATFORMS
+                value: "tpu,cpu"
+              - name: TPU_TOPOLOGY
+                value: "2x2x1"
+              - name: TPU_HOST_BOUNDS
+                value: "1,1,1"
+              - name: TPU_STDERR_LOG_LEVEL
+                value: "0"
+              - name: MEGASCALE_NUM_SLICES
+                value: ""
+              - name: MEGASCALE_SLICE_ID
+                value: ""
+              - name: MEGASCALE_PORT
+                value: ""
+              - name: MEGASCALE_COORDINATOR_ADDRESS
+                value: ""
+              - name: TPU_PROCESS_ADDRESSES
+                value: ""
+              - name: TPU_WORKER_HOSTNAMES
+                value: ""
+              - name: TPU_PROCESS_PORT
+                value: ""
+              - name: GET_HOST_METRICS
+                value: "0"
+              - name: VLLM_NO_USAGE_STATS
+                value: "1"
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -o pipefail
+                  cd /root/cloud-devkit/vllm-torchtpu
+                  if [[ "$(basename "${TEST_PATH}")" != run_real_ckpt_smoke*.py ]]; then
+                    echo "TEST_PATH must match run_real_ckpt_smoke*.py, got ${TEST_PATH}"
+                    exit 2
+                  fi
+                  sysctl -w vm.max_map_count=8388608 2>/dev/null || true
+                  if [ -f /sys/module/vfio_iommu_type1/parameters/dma_entry_limit ]; then
+                    echo 2000000 > /sys/module/vfio_iommu_type1/parameters/dma_entry_limit 2>/dev/null || true
+                  fi
+                  python3 -u "${TEST_PATH}"
+                  rc=$?
+                  echo "==> smoke exit code ${rc}"
+                  exit ${rc}
+              securityContext:
+                privileged: true
+              volumeMounts:
+              - name: torchtpu-src
+                mountPath: /root/cloud-devkit/vllm-torchtpu
+              - name: dshm
+                mountPath: /dev/shm
+              - name: vllm-cache
+                mountPath: /vllm-cache
+                readOnly: true
+              resources:
+                limits:
+                  google.com/tpu: "4"
+                  memory: '{{ .MEMORY | default "850Gi" }}'
+                  cpu: '{{ .CPU | default "160" }}'
+                requests:
+                  google.com/tpu: "4"
+                  memory: '{{ .MEMORY | default "850Gi" }}'
+                  cpu: '{{ .CPU | default "160" }}'
+            volumes:
+            - name: torchtpu-src
+              nfs:
+                server: '{{ .NFS_SERVER_IP | default "10.116.227.226" }}'
+                path: '{{ .NFS_SRC_PATH }}'
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: '{{ .DSHM_SIZE | default "128Gi" }}'
+            - name: vllm-cache
+              persistentVolumeClaim:
+                claimName: vllm-shared-cache-rox-pvc
+                readOnly: true
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/gke-tpu-topology: "2x2x1"
+              cloud.google.com/gke-tpu-accelerator: tpu7x
