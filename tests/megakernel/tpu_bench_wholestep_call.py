@@ -84,6 +84,7 @@ def main():
     pps = a.max_groups * 4 // 128
     for B in [int(b) for b in a.buckets.split(",")]:
         nreq = B // 4
+        NR = max(16, nreq)  # runner request rows (max_num_reqs)
         n_cols = pps  # table width (static); only the pages the contexts reach are allocated
         n_used = -(-(a.ctx + 4 + nreq) // 128)
         # Blocks: GDN 33 layers x 4 ckpts per request, QSA main + compressed per request & layer.
@@ -125,25 +126,25 @@ def main():
         NG = 1 + nreq * n_gdn * 4
         free_gdn = iter(rng.permutation(np.arange(1, NG)))
         free = iter(rng.permutation(np.arange(4 * NG, 4 * NB)))
-        ctx = np.array([a.ctx + q for q in range(nreq)] + [0] * (16 - nreq), np.int32)
-        qsl = np.array([min(q, nreq) * 4 for q in range(17)], np.int32)
-        seq = ctx + np.where(np.arange(16) < nreq, 4, 0)
+        ctx = np.array([a.ctx + q for q in range(nreq)] + [0] * (NR - nreq), np.int32)
+        qsl = np.array([min(q, nreq) * 4 for q in range(NR + 1)], np.int32)
+        seq = ctx + np.where(np.arange(NR) < nreq, 4, 0)
         meta = []
         for _ in range(n_gdn):
-            st = np.zeros(16, np.int32)
-            ck = np.zeros((16, 4), np.int32)
+            st = np.zeros(NR, np.int32)
+            ck = np.zeros((NR, 4), np.int32)
             for q in range(nreq):
                 ck[q] = [next(free_gdn) for _ in range(4)]
                 st[q] = ck[q, 0]
             meta += [st, np.zeros(NB * 4, np.int32), ck, qsl, seq]
         tabs = []
-        main = np.zeros((16, n_cols), np.int32)
-        comp = np.zeros((16, n_cols), np.int32)
+        main = np.zeros((NR, n_cols), np.int32)
+        comp = np.zeros((NR, n_cols), np.int32)
         for q in range(nreq):
             main[q, :n_used] = [next(free) for _ in range(n_used)]
             comp[q, :n_used] = [next(free) for _ in range(n_used)]
         for _ in range(n_att):
-            ring = np.zeros((16, 8), np.int32)
+            ring = np.zeros((NR, 8), np.int32)
             for q in range(nreq):
                 ring[q, 0] = next(free)
             tabs += [ring.reshape(-1), main.reshape(-1), comp.reshape(-1)]
