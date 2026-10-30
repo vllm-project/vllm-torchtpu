@@ -63,13 +63,6 @@ class DSparkProposer(DFlashProposer):
 
         super().__init__(runner, vllm_config)
 
-        if not self.dflash_config.get("target_layer_ids"):
-            raise ValueError(
-                "DSpark requires target layer ids in the draft config (one of "
-                "eagle_aux_hidden_state_layer_ids, dspark_target_layer_ids, "
-                "target_layer_ids, or dflash_config.target_layer_ids)."
-            )
-
         # Same key/default as upstream DSparkSpeculator: dense checkpoints
         # omit it (-> True); the speculators converter writes it explicitly.
         self.sample_from_anchor = bool(hf_dict.get("sample_from_anchor", True))

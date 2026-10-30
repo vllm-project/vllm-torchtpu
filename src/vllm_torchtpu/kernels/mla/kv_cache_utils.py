@@ -30,6 +30,8 @@ from torch_tpu._internal.pallas import pallas
 # `ref.bitcast(jnp.int32)` folds into one word row inside the kernel.
 WORD_BYTES = 4
 TILE_LANE_BYTES = 128  # lane width of a TensorCore tile, in bytes
+# Minimum SparseCore indirect-gather width: 16 vector lanes of uint32 words.
+SC_ROPE_ALIGN_BYTES = 16 * WORD_BYTES
 
 # Sentinels for tokens that must not be written. JAX drops out-of-bounds
 # scatters; the Pallas writers predicate on the sign instead.
@@ -65,6 +67,11 @@ _LAYOUT_DTYPES = {
 
 def align_to(x: int, a: int) -> int:
     return (x + a - 1) // a * a
+
+
+def _xla_unpadded_word_rows(rows: int) -> bool:
+    """Whether `rows` 128-word rows per page avoid XLA `(8, 128)` tile padding."""
+    return rows > 0 and (rows % 8 == 0 or (rows < 8 and (rows & (rows - 1)) == 0))
 
 
 def get_dtype_bitwidth(dtype: jnp.dtype) -> int:
@@ -116,19 +123,43 @@ class SparseMLAKVCacheSpec:
         kv_packing: int = 4,
     ) -> "SparseMLAKVCacheSpec":
         """Builds a spec with the kernel's page/head-dim padding applied."""
+        unpadded_head_dim = head_dim
         num_pages, packed_page_size, kv_packing, head_dim = get_kv_cache_shape(
             num_pages, page_size, head_dim, None, kv_packing
         )
         page_size = packed_page_size * kv_packing
+
+        if cache_type is KVCacheType.ROPE and layout is KVCacheLayout.SPARSECORE:
+            # Native SparseCore ROPE packs whole tokens into 128-word (512B)
+            # rows at the 16-lane vector granularity (64B) rather than padding
+            # each token to a 128B TensorCore lane row, whenever the resulting
+            # per-page row count stays unpadded under XLA's (8, 128) HBM tile.
+            row_bytes = WORD_BYTES * TILE_LANE_BYTES
+            sc_head_dim = align_to(unpadded_head_dim, SC_ROPE_ALIGN_BYTES)
+            if (
+                0 < sc_head_dim <= TILE_LANE_BYTES
+                and row_bytes % sc_head_dim == 0
+                and page_size % (row_bytes // sc_head_dim) == 0
+                and _xla_unpadded_word_rows(page_size // (row_bytes // sc_head_dim))
+            ):
+                head_dim = sc_head_dim
 
         if layout is KVCacheLayout.SPARSECORE:
             assert head_dim % WORD_BYTES == 0, (
                 f"head_dim {head_dim} must be a multiple of {WORD_BYTES}"
             )
             if cache_type is KVCacheType.ROPE:
-                assert page_size % WORD_BYTES == 0, (
-                    f"page_size {page_size} must be a multiple of {WORD_BYTES}"
-                )
+                row_bytes = WORD_BYTES * TILE_LANE_BYTES
+                if (
+                    head_dim > TILE_LANE_BYTES
+                    or row_bytes % head_dim
+                    or page_size % (row_bytes // head_dim)
+                ):
+                    raise ValueError(
+                        f"SparseCore ROPE head_dim {head_dim} must not exceed "
+                        f"{TILE_LANE_BYTES} or fail to divide {row_bytes}, and "
+                        f"page_size {page_size} must hold whole {row_bytes}-byte rows"
+                    )
         elif layout is KVCacheLayout.TENSORCORE:
             if cache_type is KVCacheType.NOPE:
                 assert head_dim == WORD_BYTES * TILE_LANE_BYTES, (
@@ -160,6 +191,11 @@ class SparseMLAKVCacheSpec:
         return self.head_dim
 
     @property
+    def tokens_per_row(self) -> int:
+        """Tokens sharing one `TILE_LANE_BYTES`-word row of a ROPE/SC cache."""
+        return WORD_BYTES * TILE_LANE_BYTES // self.token_bytes
+
+    @property
     def shape(self) -> tuple[int, ...]:
         if self.cache_type is KVCacheType.NOPE:
             if self.layout is KVCacheLayout.TENSORCORE:
@@ -178,7 +214,14 @@ class SparseMLAKVCacheSpec:
                     self.kv_packing,
                     self.head_dim,
                 )
-            return (self.num_pages, self.page_size // WORD_BYTES, self.head_dim)
+            # `tokens_per_row` tokens of `head_dim // WORD_BYTES` words each
+            # fill one 128-lane row, so the tiled HBM allocation carries no
+            # per-token padding.
+            return (
+                self.num_pages,
+                self.page_size // self.tokens_per_row,
+                TILE_LANE_BYTES,
+            )
         raise ValueError(f"unsupported cache type {self.cache_type}")
 
 

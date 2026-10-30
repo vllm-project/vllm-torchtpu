@@ -35,30 +35,30 @@ pytestmark = pytest.mark.tpu_test
 
 
 class NativeScCacheUpdateTest(parameterized.TestCase):
-    @parameterized.parameters((13, 5, 3), (64, 5, 3), (1024, 513, 257), (64, 0, 0))
-    def test_retained_caches_match_byte_oracle(self, bucket, q0, q1):
+    @parameterized.product(
+        case=((13, 5, 3), (64, 5, 3), (1024, 513, 257), (64, 0, 0)),
+        rope_dim=(64, 128),
+    )
+    def test_retained_caches_match_byte_oracle(self, case, rope_dim):
         if jax.devices()[0].platform != "tpu":
             self.skipTest("Native cache DMA requires TPU SparseCore")
+        bucket, q0, q1 = case
         pages, page_size = 16, 256
         specs = tuple(
             SparseMLAKVCacheSpec.create(
                 kind, KVCacheLayout.SPARSECORE, pages, page_size, dim, 4
             )
-            for kind, dim in ((KVCacheType.NOPE, 512), (KVCacheType.ROPE, 64))
+            for kind, dim in ((KVCacheType.NOPE, 512), (KVCacheType.ROPE, rope_dim))
         )
         rng = np.random.default_rng(44)
-        # Nonzero sentinels expose destruction of untouched RoPE quarters.
+        # Nonzero sentinels expose destruction of untouched RoPE slots.
         expected_nope = rng.integers(0, 256, (pages, page_size, 512), np.uint8)
-        expected_rope = rng.integers(0, 256, (pages, page_size, 128), np.uint8)
+        expected_rope = rng.integers(0, 256, (pages, page_size, rope_dim), np.uint8)
         caches = (
             jnp.asarray(
                 layout.pack_nope(expected_nope.reshape(pages, page_size, 4, 128))
             ),
-            jnp.asarray(
-                layout.pack_rope_banded(
-                    expected_rope.reshape(pages, page_size // 4, 4, 128)
-                )
-            ),
+            jnp.asarray(layout.pack_rope_packed(expected_rope)),
         )
         tables = rng.permutation(pages).astype(np.int32).reshape(4, 4)
         # Empty sequences before and between live ones exercise searchsorted.
@@ -87,8 +87,8 @@ class NativeScCacheUpdateTest(parameterized.TestCase):
             )
 
         for step in range(3):
-            # Begin at quarter 3 and cross a page edge; successive steps retain
-            # and overwrite some prior writes with fresh data.
+            # Begin at slot 3 (and 253) and cross a page edge; successive steps
+            # retain and overwrite some prior writes with fresh data.
             starts = (253 + step, 3 + step)
             lengths = np.array([0, starts[0] + q0, 0, starts[1] + q1], np.int32)
             kv = jnp.asarray(rng.normal(size=(bucket, 512)), jnp.float8_e4m3fn)
@@ -119,7 +119,5 @@ class NativeScCacheUpdateTest(parameterized.TestCase):
             )
             np.testing.assert_array_equal(
                 np.asarray(caches[1]),
-                layout.pack_rope_banded(
-                    expected_rope.reshape(pages, page_size // 4, 4, 128)
-                ),
+                layout.pack_rope_packed(expected_rope),
             )
