@@ -43,6 +43,13 @@ from vllm_torchtpu import _OFFLOADING_CONNECTORS
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.megakernel import MegakernelLayoutError
 from vllm_torchtpu.megakernel import runtime as _rt
+from vllm_torchtpu.megakernel.runtime.contract import (
+    PARALLELISM_UNSUPPORTED,
+    REQUIRES_KEYS,
+    REQUIRES_UNMET,
+    UNSUPPORTED_TP_SIZE,
+    UNSUPPORTED_TPU_CHIP,
+)
 from vllm_torchtpu.megakernel_runtime.config import (
     import_plugin,
     resolve_callable,
@@ -76,14 +83,6 @@ _VLLM_STARTUP_MESSAGES: dict[str, str] = {
         "serving; skipping."
     ),
     "lora_enabled": "Megakernel does not support LoRA adapters; skipping.",
-    "pipeline_parallel": (
-        "Megakernel requires single-stage pipeline (PP=1); skipping."
-    ),
-    "context_parallel": (
-        "Megakernel does not support prefill/decode context "
-        "parallelism (PCP/DCP); skipping."
-    ),
-    "dp_lockstep": "Megakernel does not support EP-DP lockstep; skipping.",
     "aux_hidden_states": (
         "Megakernel does not support aux_hidden_state_layers "
         "(EAGLE-3 target capture); skipping."
@@ -251,17 +250,6 @@ class TorchStepMetaOps:
         if torch.compiler.is_compiling() or ckpt_g.device.type != "cpu":
             return
         _rt.check_ckpt_write_cols_distinct(ckpt_g, T)
-
-
-def _data_parallel_enabled(runner: Any, tp_size: int) -> bool:
-    """Whether the runner is one of several data-parallel engines, or its EP
-    group spans more ranks than its TP group (the megakernel agrees on the TP
-    group only). Reads config and group sizes only: no collective."""
-    p_cfg = getattr(runner, "parallel_config", None)
-    dp = int(os.environ.get("TORCH_TPU_DP_SIZE", "0") or 0) or int(
-        getattr(p_cfg, "data_parallel_size", 1) or 1
-    )
-    return dp > 1 or _ep_group_size() > int(tp_size)
 
 
 def _ep_group_size() -> int:
@@ -517,7 +505,7 @@ def _inspect_step_detail(attn_md: Any, m0: Any, runner: Any = None) -> _rt.Batch
     )
 
 
-# --- Generic startup checks against a plugin's declared capabilities --------
+# --- Generic startup checks against a spec's declared fields ----------------
 
 # The offloading connectors (`OffloadingConnector`, `TPURaidenOffloadingConnector`).
 _OFFLOAD_CONNECTORS = _OFFLOADING_CONNECTORS
@@ -609,33 +597,112 @@ def _multimodal_inputs_possible(runner: Any) -> bool:
     return True
 
 
-def _legacy_caps(spec: Any) -> frozenset[str]:
-    par = spec.parallelism
-    extra = {"pipeline_parallel"} if "pp" in par else set()
-    extra |= {k for k in ("dcp", "pcp") if k in par}
-    return frozenset(spec.features) | extra
+_PARALLELISM_DETAIL = {
+    "dp": "agrees across the TP group only: data_parallel_size > 1 is unsupported",
+    "ep_wider_than_tp": (
+        "agrees across the TP group only: an EP group wider than TP is unsupported"
+    ),
+    "dp_lockstep": "does not support EP-DP lockstep",
+    "pp": "requires a single-stage pipeline (PP=1)",
+    "dcp": "does not support decode context parallelism (DCP)",
+    "pcp": "does not support prefill context parallelism (PCP)",
+    "ep_in_tp": "does not support expert parallelism inside the TP group",
+}
 
 
-def check_runner_capabilities(
-    runner: Any, capabilities: frozenset[str], *, tp_size: int
-) -> _rt.EligibilityResult | None:
-    """The first framework feature that is on but not declared, as a named
-    decline (`None` if all are covered). Reads config and group sizes only,
-    identical on every rank: no collective."""
-    caps = frozenset(capabilities)
+def detect_parallelism(runner: Any, tp_size: int) -> list[str]:
+    """The parallelism kinds (beyond "tp") the runner uses, in check order.
+    Reads config and group sizes only: no collective."""
+    p_cfg = _runner_cfg(runner, "parallel_config")
+    dp = int(os.environ.get("TORCH_TPU_DP_SIZE", "0") or 0) or int(
+        getattr(p_cfg, "data_parallel_size", 1) or 1
+    )
+    ep_wide = _ep_group_size() > max(1, int(tp_size))
+    dp_fn = getattr(runner, "_dp_lockstep_enabled", None)
     pp_multi = not (
         getattr(runner, "_pp_is_first", True) and getattr(runner, "_pp_is_last", True)
-    )
-    p_cfg = getattr(runner, "parallel_config", None)
-    pcp = (
-        bool(getattr(runner, "_pcp_enabled", False))
-        or int(getattr(p_cfg, "prefill_context_parallel_size", 1) or 1) > 1
     )
     dcp = (
         bool(getattr(runner, "_dcp_enabled", False))
         or int(getattr(p_cfg, "decode_context_parallel_size", 1) or 1) > 1
     )
-    dp_fn = getattr(runner, "_dp_lockstep_enabled", None)
+    pcp = (
+        bool(getattr(runner, "_pcp_enabled", False))
+        or int(getattr(p_cfg, "prefill_context_parallel_size", 1) or 1) > 1
+    )
+    ep_in_tp = bool(getattr(p_cfg, "enable_expert_parallel", False)) and not ep_wide
+    flags = (
+        ("dp", dp > 1),
+        ("ep_wider_than_tp", ep_wide),
+        ("dp_lockstep", bool(callable(dp_fn) and dp_fn())),
+        ("pp", pp_multi),
+        ("dcp", dcp),
+        ("pcp", pcp),
+        ("ep_in_tp", ep_in_tp),
+    )
+    return [kind for kind, on in flags if on]
+
+
+def _requires_value(runner: Any, key: str) -> str:
+    """The server's value for a `requires` key, as a lowercase string."""
+    section, _, attr = REQUIRES_KEYS[key].partition(".")
+    value = getattr(_runner_cfg(runner, section), attr, None)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value).lower().removeprefix("torch.")
+
+
+def check_spec(
+    runner: Any, spec: Any, *, view: RunnerView
+) -> _rt.EligibilityResult | None:
+    """Enforce a spec's declarative fields before `create`: `chips`,
+    `tp_sizes`, `parallelism`, `features`, then `requires`. Returns the first
+    named decline (`None` if all pass). Reads config and local device facts
+    only, identical on every rank: no collective."""
+    tp_size = view.tp_size
+    if spec.chips:
+        kind = view.device_kind
+        # Only TPU chips are checked; a CPU (interpret mode) device isn't.
+        if kind.upper().startswith("TPU") and not any(
+            kind.lower().startswith(c.lower()) for c in spec.chips
+        ):
+            msg = (
+                f"Megakernel model folder supports chips {spec.chips}, not "
+                f"{kind!r}; skipping."
+            )
+            return _rt.EligibilityResult(False, UNSUPPORTED_TPU_CHIP, msg)
+    if spec.tp_sizes and tp_size not in spec.tp_sizes:
+        msg = (
+            f"Megakernel model folder supports TP sizes {spec.tp_sizes}, not "
+            f"{tp_size}; skipping."
+        )
+        return _rt.EligibilityResult(False, UNSUPPORTED_TP_SIZE, msg)
+    for kind in detect_parallelism(runner, tp_size):
+        if kind not in spec.parallelism:
+            return _decline(
+                f"{PARALLELISM_UNSUPPORTED}:{kind}",
+                f"{_PARALLELISM_DETAIL[kind]} (parallelism {kind!r} undeclared)",
+            )
+    el = check_runner_features(runner, spec.features)
+    if el is not None:
+        return el
+    for key, want in sorted(spec.requires.items()):
+        got = _requires_value(runner, key)
+        if got != want.lower():
+            msg = (
+                f"Megakernel model folder requires {key}={want} (this server: "
+                f"{got}); pass --{key.replace('_', '-')} {want}; skipping."
+            )
+            return _rt.EligibilityResult(False, f"{REQUIRES_UNMET}:{key}", msg)
+    return None
+
+
+def check_runner_features(
+    runner: Any, features: frozenset[str]
+) -> _rt.EligibilityResult | None:
+    """The first framework feature that is on but not declared, as a named
+    decline (`None` if all are covered). Config only: no collective."""
+    caps = frozenset(features)
     rules: list[tuple[bool, str, str]] = [
         (
             _multimodal_inputs_possible(runner) and "multimodal" not in caps,
@@ -648,21 +715,6 @@ def check_runner_capabilities(
             "does not support LoRA adapters",
         ),
         (
-            pp_multi and "pipeline_parallel" not in caps,
-            "pipeline_parallel",
-            "requires a single-stage pipeline (PP=1)",
-        ),
-        (
-            (pcp and "pcp" not in caps) or (dcp and "dcp" not in caps),
-            "context_parallel",
-            "does not support prefill/decode context parallelism (PCP/DCP)",
-        ),
-        (
-            bool(callable(dp_fn) and dp_fn()),
-            "dp_lockstep",
-            "does not support EP-DP lockstep",
-        ),
-        (
             bool(_aux_hidden_layers(_runner_backbone(runner)))
             and "aux_hidden_states" not in caps,
             "aux_hidden_states",
@@ -672,12 +724,6 @@ def check_runner_capabilities(
     for bad, code, detail in rules:
         if bad:
             return _decline(code, detail)
-    if _data_parallel_enabled(runner, max(1, int(tp_size))):
-        msg = (
-            "Megakernel agrees across the TP group only: data_parallel_size "
-            "> 1 or an EP group wider than TP is unsupported; skipping."
-        )
-        return _rt.EligibilityResult(False, "dp_unsupported", msg)
     spec_cfg = getattr(runner, "speculative_config", None)
     c_cfg = _runner_cfg(runner, "cache_config")
     kv_cfg = _runner_cfg(runner, "kv_transfer_config")
@@ -824,7 +870,7 @@ def _vote_startup_failure(token: int, codes: Sequence[str]) -> None:
 class ProgramDriver:
     """Serves one model folder's `MonoProgram` on this TP rank.
 
-    Generic: startup checks against the plugin's capabilities, the two TP
+    Generic: startup checks against the spec's declared fields, the two TP
     agreements (plugin fingerprint before any collective work, compiled
     bucket set before warmup), one `torch.compile`d step per bucket, warmup
     over the runner's input shapes, per-step routing, step-mix stats and the
@@ -910,16 +956,17 @@ class ProgramDriver:
             )
             token = agreement_token(fprint, runtime_src_hash())
             logger.info(
-                "Megakernel plugin %s %s loaded from %s (fingerprint %s)",
+                "Megakernel plugin %s %s loaded from %s (numerics=%s%s, "
+                "fingerprint %s)",
                 plugin.name,
                 plugin.version,
                 ref.module,
+                plugin.numerics,
+                f", profile={options['profile']}" if options.get("profile") else "",
                 fprint[:16],
             )
             tp_size = view.tp_size
-            el = check_runner_capabilities(
-                runner, _legacy_caps(plugin), tp_size=tp_size
-            )
+            el = check_spec(runner, plugin, view=view)
             if el is not None:
                 cls._log_startup_ineligible(el)
                 return None

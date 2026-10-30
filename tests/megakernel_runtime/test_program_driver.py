@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """`ProgramDriver` with a toy plugin that serves: startup order, agreements,
-capability guards, warmup shapes, routing, and a 2-rank gloo run."""
+spec field guards, warmup shapes, routing, and a 2-rank gloo run."""
 
 from __future__ import annotations
 
@@ -34,10 +34,16 @@ import torch
 
 import vllm_torchtpu.megakernel_runtime.driver as driver_mod
 from vllm_torchtpu import megakernel_runtime as mkr
+from vllm_torchtpu.megakernel import errors as mk_errors
 from vllm_torchtpu.megakernel_runtime import fingerprint as fp
 from vllm_torchtpu.megakernel_runtime import testing
 from vllm_torchtpu.megakernel_runtime.hooks import StepContext
-from vllm_torchtpu.megakernel_runtime.plugin import Bucket, RunnerShape, RunnerView
+from vllm_torchtpu.megakernel_runtime.plugin import (
+    Bucket,
+    RunnerShape,
+    RunnerView,
+    TpuMonoSpec,
+)
 
 _SRC = Path(driver_mod.__file__).resolve().parents[2]
 
@@ -410,9 +416,19 @@ def test_bind_agreement_bucket_mismatch_installs_declined_driver(
     assert g.seen[0][1] != driver_mod.buckets_token(keys)
 
 
-# --- Capability guards --------------------------------------------------------
+# --- Spec field guards ------------------------------------------------------
 
 _QWEN_CAPS = frozenset({"spec_decode", "mrope", "prefix_caching", "kv_offload"})
+
+
+def _spec(**kw: Any) -> TpuMonoSpec:
+    return TpuMonoSpec("t", "1", create="m:c", **kw)
+
+
+def _check(runner: Any, **kw: Any) -> Any:
+    return driver_mod.check_spec(
+        runner, _spec(**kw), view=RunnerView(runner, tp_rank=0)
+    )
 
 
 def _kv(name: str, members: list[str] | None = None) -> Any:
@@ -444,14 +460,14 @@ def _kv(name: str, members: list[str] | None = None) -> Any:
 )
 def test_kv_connector_guard(kv: Any, code: str | None) -> None:
     runner = testing.fake_runner(kv_transfer_config=kv)
-    res = driver_mod.check_runner_capabilities(runner, _QWEN_CAPS, tp_size=1)
+    res = driver_mod.check_runner_features(runner, _QWEN_CAPS)
     assert (res.code if res else None) == code
     if code is None and kv is not None:
-        res = driver_mod.check_runner_capabilities(runner, frozenset(), tp_size=1)
+        res = driver_mod.check_runner_features(runner, frozenset())
         assert res is not None and res.code == "kv_offload_unsupported"
     if code is not None:
         caps = _QWEN_CAPS | {"kv_transfer"}
-        assert driver_mod.check_runner_capabilities(runner, caps, tp_size=1) is None
+        assert driver_mod.check_runner_features(runner, caps) is None
 
 
 def _mm_cfg(lm_only: bool = False, limits: dict[str, Any] | None = None) -> Any:
@@ -489,13 +505,13 @@ def test_kv_offload_on_a_text_only_server_is_not_a_multimodal_decline() -> None:
     runner = testing.fake_runner(
         kv_transfer_config=offload, supports_mm_inputs=True, multimodal_config=text_only
     )
-    assert driver_mod.check_runner_capabilities(runner, _QWEN_CAPS, tp_size=1) is None
+    assert driver_mod.check_runner_features(runner, _QWEN_CAPS) is None
     runner = testing.fake_runner(
         kv_transfer_config=offload,
         supports_mm_inputs=True,
         multimodal_config=_mm_cfg(limits={"image": 1, "video": 0}),
     )
-    res = driver_mod.check_runner_capabilities(runner, _QWEN_CAPS, tp_size=1)
+    res = driver_mod.check_runner_features(runner, _QWEN_CAPS)
     assert res is not None and res.code == "multimodal_inputs"
 
 
@@ -543,47 +559,200 @@ def test_text_only_server_serves_from_token_ids(
         ({"enable_eplb": True}, "eplb_dynamic_unsupported", "eplb_dynamic"),
         ({"supports_mm_inputs": True}, "multimodal_inputs", "multimodal"),
         ({"lora_config": object()}, "lora_enabled", "lora"),
-        ({"_pp_is_last": False}, "pipeline_parallel", "pipeline_parallel"),
-        ({"_dcp_enabled": True}, "context_parallel", "dcp"),
-        ({"_pcp_enabled": True}, "context_parallel", "pcp"),
     ],
 )
-def test_undeclared_capability_is_a_named_decline(
+def test_undeclared_feature_is_a_named_decline(
     kw: dict[str, Any], code: str, cap: str
 ) -> None:
     runner = testing.fake_runner(**kw)
-    res = driver_mod.check_runner_capabilities(runner, frozenset(), tp_size=1)
+    res = _check(runner)
     assert res is not None and res.code == code and res.message
-    caps = frozenset({cap})
-    assert driver_mod.check_runner_capabilities(runner, caps, tp_size=1) is None
+    assert _check(runner, features={cap}) is None
+
+
+@pytest.mark.parametrize(
+    "kw, kind",
+    [
+        ({"_pp_is_last": False}, "pp"),
+        ({"_dcp_enabled": True}, "dcp"),
+        ({"_pcp_enabled": True}, "pcp"),
+        ({"_dp_lockstep_enabled": lambda: True}, "dp_lockstep"),
+        ({"enable_expert_parallel": True}, "ep_in_tp"),
+    ],
+)
+def test_undeclared_parallelism_is_a_named_decline(
+    kw: dict[str, Any], kind: str
+) -> None:
+    runner = testing.fake_runner(**kw)
+    assert driver_mod.detect_parallelism(runner, 1) == [kind]
+    res = _check(runner)
+    assert res is not None and res.code == f"parallelism_unsupported:{kind}"
+    assert res.message.startswith("Megakernel ") and kind in res.message
+    assert _check(runner, parallelism={"tp", kind}) is None
+
+
+def test_dp_and_wide_ep_parallelism(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = testing.fake_runner()
+    runner.parallel_config.data_parallel_size = 2
+    res = _check(runner, features=_QWEN_CAPS)
+    assert res is not None and res.code == "parallelism_unsupported:dp"
+    assert "data_parallel_size" in res.message
+    # An EP group wider than TP is its own kind (EP inside TP is not).
+    runner = testing.fake_runner(enable_expert_parallel=True)
+    monkeypatch.setattr(driver_mod, "_ep_group_size", lambda: 2)
+    assert driver_mod.detect_parallelism(runner, 1) == ["ep_wider_than_tp"]
+    assert driver_mod.detect_parallelism(runner, 2) == ["ep_in_tp"]
+    res = _check(runner, parallelism={"tp", "ep_in_tp"})
+    assert res is not None and res.code == "parallelism_unsupported:ep_wider_than_tp"
 
 
 def test_static_expert_placement_and_sleep_mode() -> None:
     # A static placement table is not dynamic EPLB.
     runner = testing.fake_runner(TPU_EXPERT_PLACEMENT="table")
-    assert driver_mod.check_runner_capabilities(runner, _QWEN_CAPS, tp_size=1) is None
+    assert _check(runner, features=_QWEN_CAPS) is None
     runner.vllm_config.model_config.enable_sleep_mode = True
-    res = driver_mod.check_runner_capabilities(runner, _QWEN_CAPS, tp_size=1)
+    res = _check(runner, features=_QWEN_CAPS)
     assert res is not None and res.code == "sleep_mode_unsupported"
-    # Never-declarable ones: DP lockstep and DP > 1.
-    runner = testing.fake_runner(_dp_lockstep_enabled=lambda: True)
-    res = driver_mod.check_runner_capabilities(runner, _QWEN_CAPS, tp_size=1)
-    assert res is not None and res.code == "dp_lockstep"
+
+
+def test_chip_and_tp_size_guards(monkeypatch: pytest.MonkeyPatch) -> None:
     runner = testing.fake_runner()
+    # A CPU (interpret mode) device isn't chip-checked.
+    assert _check(runner, chips=("TPU7x",)) is None
+    monkeypatch.setattr(RunnerView, "device_kind", property(lambda _s: "TPU v5 lite"))
+    res = _check(runner, chips=("TPU7x",))
+    assert res is not None and res.code == "unsupported_tpu_chip"
+    assert "TPU v5 lite" in res.message
+    assert _check(runner, chips=("TPU v5",)) is None
+    assert _check(runner, chips=("tpu V5 LITE",)) is None
+    assert _check(runner) is None
+    res = _check(runner, tp_sizes=(8,))
+    assert res is not None and res.code == "unsupported_tp_size"
+    assert "(8,)" in res.message
+    assert _check(runner, tp_sizes=(1, 8)) is None
+    # Chip before TP size before parallelism.
     runner.parallel_config.data_parallel_size = 2
-    res = driver_mod.check_runner_capabilities(runner, _QWEN_CAPS, tp_size=1)
-    assert res is not None and res.code == "dp_unsupported"
+    assert _check(runner, chips=("TPU7x",), tp_sizes=(8,)).code == (
+        "unsupported_tpu_chip"
+    )
+    assert _check(runner, tp_sizes=(8,)).code == "unsupported_tp_size"
 
 
-def test_undeclared_capability_declines_before_create(
+@pytest.mark.parametrize(
+    "requires, kw, code",
+    [
+        ({"mamba_ssm_cache_dtype": "bfloat16"}, {}, "mamba_ssm_cache_dtype"),
+        (
+            {"mamba_ssm_cache_dtype": "bfloat16"},
+            {"mamba_ssm_cache_dtype": "bfloat16"},
+            None,
+        ),
+        (
+            {"mamba_ssm_cache_dtype": "bfloat16"},
+            {"mamba_ssm_cache_dtype": torch.bfloat16},
+            None,
+        ),
+        ({"kv_cache_dtype": "auto"}, {}, None),
+        ({"kv_cache_dtype": "fp8"}, {}, "kv_cache_dtype"),
+        ({"mamba_cache_mode": "none"}, {}, None),
+        ({"mamba_cache_mode": "align"}, {}, "mamba_cache_mode"),
+        ({"enable_prefix_caching": "False"}, {}, None),
+        ({"enable_prefix_caching": "true"}, {}, "enable_prefix_caching"),
+    ],
+)
+def test_requires(requires: dict[str, str], kw: dict[str, Any], code: Any) -> None:
+    runner = testing.fake_runner(**kw)
+    res = _check(runner, requires=requires)
+    if code is None:
+        assert res is None
+    else:
+        assert res is not None and res.code == f"requires_unmet:{code}"
+        assert f"--{code.replace('_', '-')}" in res.message
+
+
+def test_features_before_requires() -> None:
+    runner = testing.fake_runner(speculative_tokens=3)
+    res = _check(runner, requires={"kv_cache_dtype": "fp8"})
+    assert res is not None and res.code == "spec_decode_unsupported"
+
+
+@pytest.mark.parametrize(
+    "kw, match",
+    [
+        ({"requires": {"no_such_key": "1"}}, "unknown requires key 'no_such_key'"),
+        ({"numerics": "bitwise"}, "numerics='bitwise'"),
+        ({"parallelism": {"tp", "sp"}}, "unknown parallelism"),
+        ({"parallelism": {"ep_in_tp"}}, "must include 'tp'"),
+        ({"features": {"telepathy"}}, "unknown features"),
+    ],
+)
+def test_invalid_spec_fields_raise(kw: dict[str, Any], match: str) -> None:
+    with pytest.raises(mk_errors.MegakernelConfigError, match=match):
+        _spec(**kw)
+
+
+def test_unknown_requires_key_fails_at_spec_load(
     toy: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    src = toy.read_text("utf-8").replace(
+        'decline_codes=("toy_declined",)',
+        'decline_codes=("toy_declined",), requires={"no_such_key": "1"}',
+    )
+    toy.write_text(src, encoding="utf-8")
+    _no_group(monkeypatch)
+    with pytest.raises(mk_errors.MegakernelConfigError, match="no_such_key"):
+        driver_mod.ProgramDriver.maybe_create(_runner())
+
+
+def _forbid_create_and_collectives(monkeypatch: pytest.MonkeyPatch) -> None:
     def no_collective(*_a: Any, **_k: Any) -> Any:
         raise AssertionError("must decline before create / any collective")
 
     monkeypatch.setattr(driver_mod, "agree_on_decline", no_collective)
     monkeypatch.setattr(driver_mod, "_build_tp_rank_mesh", no_collective)
+    monkeypatch.setattr(driver_mod, "resolve_callable", no_collective)
+    monkeypatch.setattr(torch.distributed, "all_reduce", no_collective)
+
+
+def test_undeclared_feature_declines_before_create(
+    toy: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _forbid_create_and_collectives(monkeypatch)
     assert driver_mod.ProgramDriver.maybe_create(_runner(speculative_tokens=3)) is None
+
+
+def test_requires_unmet_declines_before_create(
+    toy: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    src = toy.read_text("utf-8").replace(
+        'decline_codes=("toy_declined",)',
+        'decline_codes=("toy_declined",), '
+        'requires={"mamba_ssm_cache_dtype": "bfloat16"}',
+    )
+    toy.write_text(src, encoding="utf-8")
+    _no_group(monkeypatch)
+    with monkeypatch.context() as m:
+        _forbid_create_and_collectives(m)
+        with caplog.at_level(logging.WARNING):
+            assert driver_mod.ProgramDriver.maybe_create(_runner()) is None
+    assert "--mamba-ssm-cache-dtype bfloat16" in caplog.text
+    drv = driver_mod.ProgramDriver.maybe_create(
+        _runner(mamba_ssm_cache_dtype="bfloat16")
+    )
+    assert isinstance(drv, driver_mod.ProgramDriver)
+
+
+def test_numerics_is_logged_and_fingerprinted(
+    toy: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _no_group(monkeypatch)
+    with caplog.at_level(logging.INFO):
+        assert driver_mod.ProgramDriver.maybe_create(_runner()) is not None
+    assert "numerics=exact" in caplog.text
+    doc = {"module": "m", "attr": "SPEC", "source_hash": "s", "config": {}}
+    exact = fp.plugin_fingerprint(plugin=_spec(), raw_env="", **doc)
+    approx = fp.plugin_fingerprint(plugin=_spec(numerics="approx"), raw_env="", **doc)
+    assert exact != approx
 
 
 def test_weight_update_guard() -> None:

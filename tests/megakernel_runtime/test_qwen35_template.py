@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 import hashlib
 import subprocess
 import sys
@@ -71,6 +72,12 @@ def test_shorthand_table_matches_the_template() -> None:
         {"spec_decode", "mrope", "prefix_caching", "kv_offload"}
     )
     assert qwen_plugin.SPEC.layout_request is None
+    # The runtime enforces these before `create`.
+    assert qwen_plugin.SPEC.chips == ("TPU7x",)
+    assert qwen_plugin.SPEC.tp_sizes == (8,)
+    assert qwen_plugin.SPEC.parallelism == frozenset({"tp", "ep_in_tp"})
+    assert qwen_plugin.SPEC.requires == {"mamba_ssm_cache_dtype": "bfloat16"}
+    assert qwen_plugin.SPEC.numerics == "approx"
 
 
 _FRESH = """
@@ -228,7 +235,9 @@ def tiny_template(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr(
         qwen35.Qwen35, "derive_geometry", classmethod(lambda cls, *a, **k: g)
     )
-    monkeypatch.setattr(qwen35.Qwen35, "supported_tp_sizes", (1,))
+    monkeypatch.setattr(
+        qwen_plugin, "SPEC", dataclasses.replace(qwen_plugin.SPEC, tp_sizes=(1,))
+    )
     monkeypatch.setattr(
         adapter, "validate_hf_config", lambda *_a, **_k: EligibilityResult(True)
     )
@@ -273,6 +282,7 @@ def tiny_template(monkeypatch: pytest.MonkeyPatch) -> Any:
             hf_config=_QWEN_HF,
             megakernel=megakernel,
             mesh=_cpu_mesh(1),
+            mamba_ssm_cache_dtype="bfloat16",
             token_paddings=(2, 4, 8),
             req_block_pairs=((4, 2),),
             max_pages_per_seq=2,
@@ -395,11 +405,11 @@ _QWEN_DECLINES = frozenset(
         "geometry_mismatch",
         "backbone_not_found",
         # create: `check_startup_eligibility` with the arguments it passes
+        # (no TP size: the runtime checks `SPEC.tp_sizes`)
         "layer_count_mismatch",
         "unaligned_cache_layout",
-        "unsupported_tp_size",
-        # create: `check_post_mesh_eligibility` (no mesh_size)
-        "unsupported_tpu_chip",
+        # create: `check_post_mesh_eligibility` (no mesh_size, no device_kind:
+        # the runtime checks `SPEC.chips`)
         "empty_buckets",
         # bind: slot layout (`compare_layout_facts`) and generic layout errors
         "pool_layout_unknown",
@@ -473,8 +483,12 @@ def test_every_template_decline_is_in_the_vote_table() -> None:
     scanned |= _false_result_codes(lib / "runtime" / "layout_facts.py")
     elig = lib / "runtime" / "eligibility.py"
     post = _false_result_codes(elig, "check_post_mesh_eligibility")
-    scanned |= post - {"mesh_size_mismatch"}  # create passes no mesh_size
+    # create passes no mesh_size and no device_kind
+    scanned |= post - {"mesh_size_mismatch", "unsupported_tpu_chip"}
     assert {"pool_layout_mismatch", "conv_state_dtype_unsupported"} <= scanned
     assert {"non_moe_checkpoint", "invalid_geometry", "geometry_mismatch"} <= scanned
     assert scanned <= _QWEN_DECLINES, sorted(scanned - _QWEN_DECLINES)
     assert {"unsupported_tpu_chip", "empty_buckets"} <= post
+    # The runtime's chip / TP-size declines come before any vote (`check_spec`,
+    # identical on every rank), so they aren't in the vote table.
+    assert not {"unsupported_tpu_chip", "unsupported_tp_size"} & set(codes)

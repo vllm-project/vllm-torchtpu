@@ -1260,9 +1260,14 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
     def _make_runner(hf_cfg: Any) -> Any:
         mc = types.SimpleNamespace(hf_config=hf_cfg)
         vc = types.SimpleNamespace(
-            model_config=mc, additional_config={"megakernel": {"enabled": True}}
+            model_config=mc,
+            parallel_config=types.SimpleNamespace(tensor_parallel_size=8),
+            cache_config=types.SimpleNamespace(mamba_ssm_cache_dtype="bfloat16"),
+            additional_config={"megakernel": {"enabled": True}},
         )
-        return types.SimpleNamespace(model_config=mc, vllm_config=vc)
+        return types.SimpleNamespace(
+            model_config=mc, parallel_config=vc.parallel_config, vllm_config=vc
+        )
 
     # 1) Realistic nested VLM config with nested rope_parameters succeeds (both dict
     #    and PretrainedConfig-like attribute-style SimpleNamespace)

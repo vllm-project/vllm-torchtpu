@@ -44,6 +44,10 @@ def fake_runner(
     enable_prefix_caching: bool = False,
     kv_transfer_config: Any = None,
     enable_eplb: bool = False,
+    enable_expert_parallel: bool = False,
+    kv_cache_dtype: str = "auto",
+    mamba_ssm_cache_dtype: Any = "auto",
+    mamba_cache_mode: str = "none",
     supports_mm_inputs: bool = False,
     multimodal_config: Any = None,
     mesh: Any = None,
@@ -75,9 +79,14 @@ def fake_runner(
         prefill_context_parallel_size=1,
         decode_context_parallel_size=1,
         enable_eplb=bool(enable_eplb),
+        enable_expert_parallel=bool(enable_expert_parallel),
     )
     cache_cfg = SimpleNamespace(
-        block_size=int(block_size), enable_prefix_caching=bool(enable_prefix_caching)
+        block_size=int(block_size),
+        enable_prefix_caching=bool(enable_prefix_caching),
+        cache_dtype=kv_cache_dtype,
+        mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
+        mamba_cache_mode=mamba_cache_mode,
     )
     add_cfg = {} if megakernel is None else {"megakernel": megakernel}
     vllm_cfg = SimpleNamespace(

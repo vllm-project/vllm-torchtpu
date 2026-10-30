@@ -177,7 +177,9 @@ def validate_hf_config(
 def create(view: RunnerView, options: Mapping[str, Any]) -> Qwen35Program | Decline:
     """Check the checkpoint and config; build an unloaded program, or decline.
 
-    Runs no collective and loads no weights (the mesh doesn't exist yet).
+    Runs no collective and loads no weights (the mesh doesn't exist yet). The
+    chip, TP size, parallelism, features and required server settings are the
+    runtime's checks (`SPEC`), done before this runs.
     """
     cfg = parse_options(options)
     if cfg["profile"] is None:
@@ -193,19 +195,11 @@ def create(view: RunnerView, options: Mapping[str, Any]) -> Qwen35Program | Decl
         return Decline("backbone_not_found", f"Megakernel: {exc}; skipping.")
     d_geom = mdef.derive_geometry()
     exp_l, tot_e = int(d_geom.L), int(getattr(d_geom, "E", 0))
-    r_cnt = view.tp_size
     prof = mk_rt.resolve_driver_profile(cfg["profile"], model_name=mdef.name)
-    tp_sup = (
-        prof.supported_tp_sizes
-        if prof.supported_tp_sizes is not None
-        else mdef.supported_tp_sizes
-    )
     el = mk_rt.check_startup_eligibility(
         num_layers=len(getattr(backbone, "layers", ())),
         expected_num_layers=exp_l,
         unified_cache_layout=view.unified_kv_layout,
-        tp_size=r_cnt,
-        supported_tp_sizes=tp_sup,
     )
     if el.code == "unaligned_cache_layout":
         el = dataclasses.replace(el, message=UNALIGNED_LAYOUT_MESSAGE)
@@ -225,7 +219,7 @@ def create(view: RunnerView, options: Mapping[str, Any]) -> Qwen35Program | Decl
         verify_buckets_explicit=bool(cfg.get("verify_buckets_explicit", False)),
     )
     el_post = mk_rt.check_post_mesh_eligibility(
-        tp_size=r_cnt, device_kind=view.device_kind, bucket_policy=b_policy
+        tp_size=view.tp_size, bucket_policy=b_policy
     )
     if not el_post.eligible:
         return Decline(el_post.code, el_post.message, el_post.level)
@@ -247,7 +241,7 @@ def create(view: RunnerView, options: Mapping[str, Any]) -> Qwen35Program | Decl
 
 
 class Qwen35Program:
-    """The Qwen3.5 megakernel on one TP rank (a `MegakernelProgram`).
+    """The Qwen3.5 megakernel on one TP rank (a `MonoProgram`).
 
     Passing `mesh` loads immediately (direct use and tests); `create` leaves
     it to `load(mesh)`, after the runtime's first agreement.
@@ -738,13 +732,14 @@ class Qwen35Program:
         fused_bkts = [k for k, v in sorted(self._bucket_fused_io.items()) if v]
         gpr_bkts = [k for k, v in sorted(self._bucket_gpr.items()) if v]
         logger.info(
-            "%s megakernel bound to %d unified pools (profile=%s, "
+            "%s megakernel bound to %d unified pools (profile=%s, numerics=%s, "
             "num_pages=%d, page_size=%d, max_pages_per_seq=%d, decode_buckets=%s, "
             "verify_buckets=%s, conv_dtype=%s, fused_pool_io=%s, fused_buckets=%s, "
             "pool_gather=%s, gpr_buckets=%s)",
             self._display_name,
             len(self.raw_pools),
             self.profile.name,
+            self.profile.numerics,
             self.num_pages,
             self.page_size,
             self.max_pages_per_seq,

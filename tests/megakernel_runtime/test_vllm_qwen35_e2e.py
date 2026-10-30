@@ -1762,7 +1762,8 @@ def test_maybe_create_disables_on_unsupported_tpu_chip(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """`maybe_create` catches `MegakernelConfigError` on unsupported TPU chips."""
+    """An unsupported TPU chip (`SPEC.chips`) turns the megakernel off at
+    startup, before `create` or any collective."""
     import logging
     import sys
 
@@ -1825,10 +1826,9 @@ def test_maybe_create_disables_on_unsupported_tpu_chip(
     monkeypatch.setattr(logging.getLogger("vllm"), "propagate", True)
     with caplog.at_level(logging.WARNING):
         drv = driver_mod.ProgramDriver.maybe_create(runner)
-    # `create` declines (before the mesh); every rank gets a DeclinedDriver.
-    assert isinstance(drv, driver_mod.DeclinedDriver)
-    assert drv.decline.code == "unsupported_tpu_chip"
-    assert "Megakernel disabled: Unsupported TPU" in caplog.text
+    # The runtime's spec check declines identically on every rank: no driver.
+    assert drv is None
+    assert "supports chips ('TPU7x',), not 'TPU v5 lite'" in caplog.text
 
     # No template serves an unresolvable arch: maybe_create returns None.
     unresolvable_runner = SimpleNamespace(
@@ -1890,6 +1890,7 @@ def test_maybe_create_declines_without_usable_pallas_mesh(
             prefill_context_parallel_size=1,
             decode_context_parallel_size=1,
         ),
+        cache_config=SimpleNamespace(mamba_ssm_cache_dtype="bfloat16"),
         _dp_lockstep_enabled=lambda: False,
         vllm_config=SimpleNamespace(
             model_config=model_cfg,
@@ -1962,6 +1963,7 @@ def test_maybe_create_declines_data_parallel_before_any_collective(
             prefill_context_parallel_size=1,
             decode_context_parallel_size=1,
         ),
+        cache_config=SimpleNamespace(mamba_ssm_cache_dtype="bfloat16"),
         _dp_lockstep_enabled=lambda: False,
         vllm_config=SimpleNamespace(
             model_config=model_cfg, additional_config={"megakernel": True}
@@ -1988,7 +1990,10 @@ def test_maybe_create_declines_data_parallel_before_any_collective(
     monkeypatch.setattr(logging.getLogger("vllm"), "propagate", True)
     with caplog.at_level(logging.INFO):
         assert driver_mod.ProgramDriver.maybe_create(runner) is None
-    assert "data_parallel_size" in caplog.text
+    if why == "ep_wider_than_tp":
+        assert "parallelism 'ep_wider_than_tp' undeclared" in caplog.text
+    else:
+        assert "data_parallel_size" in caplog.text
 
 
 def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
@@ -2060,6 +2065,7 @@ def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
         mesh=mesh8,
         _unified_kv_layout=True,
         speculative_config=None,
+        cache_config=SimpleNamespace(mamba_ssm_cache_dtype="bfloat16"),
         vllm_config=SimpleNamespace(
             model_config=model_cfg,
             additional_config={"megakernel": {"enabled": True}},
@@ -2081,6 +2087,7 @@ def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
         mesh=mesh8,
         _unified_kv_layout=True,
         speculative_config=None,
+        cache_config=SimpleNamespace(mamba_ssm_cache_dtype="bfloat16"),
         vllm_config=SimpleNamespace(
             model_config=model_cfg,
             additional_config={"megakernel": {"enabled": True, "buckets": []}},
@@ -2107,34 +2114,21 @@ def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
     assert isinstance(empty, driver_mod.DeclinedDriver)
     assert empty.decline.code == "empty_buckets"
 
-    # 4. Supported TP sizes: default Qwen35.supported_tp_sizes == (8,) rejects tp=4;
-    #    declaring (4, 8) on the model OR (4,) on the profile accepts tp=4.
+    # 4. Supported TP sizes: `SPEC.tp_sizes == (8,)` turns tp=4 off at startup
+    #    (no driver, no collective); declaring (4, 8) accepts tp=4.
     register_profile(custom_default, replace=True)
     mesh4 = _cpu_mesh(4)
     runner.mesh = mesh4
     monkeypatch.setattr(driver_mod, "_build_tp_rank_mesh", lambda *_a, **_k: mesh4)
     caplog.clear()
     with caplog.at_level(logging.WARNING):
-        tp4 = driver_mod.ProgramDriver.maybe_create(runner)
-    assert isinstance(tp4, driver_mod.DeclinedDriver)
-    assert tp4.decline.code == "unsupported_tp_size"
-    assert "Megakernel requires 8 TPU devices in mesh, got 4" in caplog.text
+        assert driver_mod.ProgramDriver.maybe_create(runner) is None
+    assert "supports TP sizes (8,), not 4" in caplog.text
 
-    tp4_profile = Profile(
-        name="qwen35-test-tp4",
-        model="qwen3_5",
-        buckets=(4,),
-        supported_tp_sizes=(4,),
-        model_default=True,
-    )
-    register_profile(tp4_profile, replace=True)
-    drv_tp4_prof = driver_mod.ProgramDriver.maybe_create(runner)
-    assert drv_tp4_prof.program.profile.name == "qwen35-test-tp4"
-
-    register_profile(custom_default, replace=True)
-    monkeypatch.setattr(qwen35.Qwen35, "supported_tp_sizes", (4, 8))
-    drv_tp4_model = driver_mod.ProgramDriver.maybe_create(runner)
-    assert drv_tp4_model.program.decode_buckets == (4, 16)
+    spec_tp4 = replace(qwen_plugin.SPEC, tp_sizes=(4, 8))
+    monkeypatch.setattr(qwen_plugin, "SPEC", spec_tp4)
+    drv_tp4 = driver_mod.ProgramDriver.maybe_create(runner)
+    assert drv_tp4.program.decode_buckets == (4, 16)
 
     # 5. Table-driven check that every startup code in `check_startup_eligibility`
     #    and `check_post_mesh_eligibility` maps through `_VLLM_STARTUP_MESSAGES`.
@@ -2158,8 +2152,8 @@ def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
         ({"multimodal_inputs": True}, "multimodal_inputs", "--language-model-only"),
         ({"lora_enabled": True}, "lora_enabled", "LoRA adapters"),
         ({"pipeline_parallel": True}, "pipeline_parallel", "single-stage pipeline"),
-        ({"context_parallel": True}, "context_parallel", "PCP/DCP"),
-        ({"dp_lockstep": True}, "dp_lockstep", "EP-DP lockstep"),
+        ({"context_parallel": True}, "context_parallel", "context parallelism"),
+        ({"dp_lockstep": True}, "dp_lockstep", "data-parallel lockstep"),
         ({"aux_hidden_states": True}, "aux_hidden_states", "aux_hidden_state_layers"),
         (
             {"tp_size": 4},
@@ -2421,19 +2415,22 @@ def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> No
     assert driver.can_run(ids_2, pos_mrope_eq, runner=runner)
 
     # 8. Static runner configurations (unified layout, MM, LoRA, PP, PCP/DCP,
-    #    DP lockstep) are startup declines (`check_runner_capabilities`, the
-    #    template's `create`); aux hidden-state capture also gates every step.
-    for attr, val in (
-        ("supports_mm_inputs", True),
-        ("lora_config", object()),
-        ("_pp_is_last", False),
-        ("_pcp_enabled", True),
-        ("_dp_lockstep_enabled", lambda: True),
+    #    DP lockstep) are startup declines (`check_spec`, the template's
+    #    `create`); aux hidden-state capture also gates every step.
+    spec = replace(qwen_plugin.SPEC, chips=(), tp_sizes=(), requires={})
+    view = RunnerView(runner, tp_rank=0)
+    assert driver_mod.check_spec(runner, spec, view=view) is None
+    for attr, val, code in (
+        ("supports_mm_inputs", True, "multimodal_inputs"),
+        ("lora_config", object(), "lora_enabled"),
+        ("_pp_is_last", False, "parallelism_unsupported:pp"),
+        ("_pcp_enabled", True, "parallelism_unsupported:pcp"),
+        ("_dp_lockstep_enabled", lambda: True, "parallelism_unsupported:dp_lockstep"),
     ):
         old = getattr(runner, attr)
         setattr(runner, attr, val)
-        caps = qwen_plugin.SPEC.features
-        assert driver_mod.check_runner_capabilities(runner, caps, tp_size=1)
+        res = driver_mod.check_spec(runner, spec, view=view)
+        assert res is not None and res.code == code, (attr, res)
         setattr(runner, attr, old)
 
     backbone.aux_hidden_state_layers = (1,)

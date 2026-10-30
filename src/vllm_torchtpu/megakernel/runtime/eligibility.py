@@ -169,13 +169,17 @@ def check_startup_eligibility(
     context_parallel: bool = False,
     dp_lockstep: bool = False,
     aux_hidden_states: bool = False,
-    tp_size: int,
-    supported_tp_sizes: Sequence[int],
+    tp_size: int | None = None,
+    supported_tp_sizes: Sequence[int] = (),
     mesh_size: int | None = None,
     device_kind: str | None = None,
     bucket_policy: BucketPolicy | None = None,
 ) -> EligibilityResult:
-    """Validate framework-neutral startup compatibility for the megakernel runtime."""
+    """Validate framework-neutral startup compatibility for the megakernel runtime.
+
+    `tp_size=None` skips the TP-size check (a runtime that enforces the TP
+    sizes itself, e.g. from a spec's `tp_sizes`).
+    """
     if not enabled:
         return EligibilityResult(False, "disabled", "", "debug")
     if hf_config_result is not None and not hf_config_result.eligible:
@@ -194,6 +198,10 @@ def check_startup_eligibility(
     for is_bad, (code, detail) in zip(bad_flags, _STARTUP_FLAG_RULES, strict=True):
         if bool(is_bad):
             return EligibilityResult(False, code, f"Megakernel {detail}; skipping.")
+    if tp_size is None:
+        return check_post_mesh_eligibility(
+            tp_size=0, device_kind=device_kind, bucket_policy=bucket_policy
+        )
     allowed_tp = tuple(int(x) for x in supported_tp_sizes)
     if not allowed_tp:
         msg = (

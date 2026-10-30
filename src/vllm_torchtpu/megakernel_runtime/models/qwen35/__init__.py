@@ -27,7 +27,14 @@ SPEC = TpuMonoSpec(
     name="qwen35",
     version="1",
     create=".adapter:create",
+    chips=("TPU7x",),
+    tp_sizes=(8,),
+    parallelism=frozenset({"tp", "ep_in_tp"}),
     features=frozenset({"spec_decode", "mrope", "prefix_caching", "kv_offload"}),
+    requires={"mamba_ssm_cache_dtype": "bfloat16"},
+    # Of the default profile (qwen35-candidate30-fused); qwen35-baseline is
+    # exact. The program logs the resolved profile's numerics at bind.
+    numerics="approx",
     # Every decline `create` / `bind` can return beyond the runtime's own codes,
     # so peers log `peer_declined:<code>` rather than `other`.
     decline_codes=(
@@ -37,8 +44,6 @@ SPEC = TpuMonoSpec(
         "backbone_not_found",
         "layer_count_mismatch",
         "unaligned_cache_layout",
-        "unsupported_tp_size",
-        "unsupported_tpu_chip",
         "empty_buckets",
     ),
 )
