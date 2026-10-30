@@ -288,6 +288,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         _kv_cache_bundle=None,
         _stage_timing=MagicMock(),
         is_pooling_model=False,
+        pcp_manager=None,
         sequence_layout_planner=SimpleNamespace(
             maybe_select_logits_hidden_states=lambda hs, _plan, _idx: hs[:1]
         ),
@@ -334,6 +335,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         "_sample_tokens_pp_intermediate_stage",
         "sample_tokens",
         "execute_model",
+        "_maybe_select_logits_hidden_states",
     ):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
 

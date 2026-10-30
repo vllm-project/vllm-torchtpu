@@ -2896,6 +2896,7 @@ class TestInputStagingFence:
             _free_h2d_sources={},
             _registered_h2d_sources=set(),
             _token_padding_state=None,
+            pcp_manager=None,
             sequence_layout_planner=SimpleNamespace(
                 prepare_dummy=lambda **kw: SimpleNamespace(
                     descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
