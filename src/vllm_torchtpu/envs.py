@@ -1219,8 +1219,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE": env_bool(
         "VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE", default=False
     ),
-    # With UPLOAD_REUSE: re-pack only the block tables that changed since the
-    # previous pack of the same layout (per-table versions).
+    # Requires VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE=1 (raises ValueError otherwise):
+    # re-pack only the block tables that changed since the previous pack of the
+    # same layout (per-table versions).
     "VLLM_TPU_BLOCK_TABLE_PACK_DELTA": env_bool("VLLM_TPU_BLOCK_TABLE_PACK_DELTA"),
     # Host-path pieces (q38f-int: default off, toggled per arm).
     # Record stage-timing device events only when a KV connector consumes them.
