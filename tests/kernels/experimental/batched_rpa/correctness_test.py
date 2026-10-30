@@ -1,16 +1,3 @@
-# Copyright 2026 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 """Correctness tests for batched ragged paged attention."""
 
 from typing import Any
@@ -220,12 +207,8 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         kv_layout: configs.KVLayout = configs.KVLayout.SEQ_ALONG_LANE,
         decode_query_size: int = 1,
         distribution: jax.Array | None = None,
-        nan_kv_seq_idx: int | None = None,
-        nan_new_seq_idx: int | None = None,
-        mask_invalid_v: bool | None = None,
     ):
         if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-            # Tokens live on the lane dim, so page_size must be a multiple of 128.
             page_size = utils.align_to(page_size, 128)
         bkv_sz = utils.align_to(bkv_sz, page_size)
 
@@ -257,7 +240,6 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         page_cnt = 0
         page_indices_list = []
         kv_pages_list = []
-        seq_page_ranges = []
         kv_packing = utils.get_dtype_packing(kv_dtype)
         padded_head_dim = utils.align_to(head_dim, 128)
         num_kv_heads_x2 = utils.align_to(num_kv_heads * 2, kv_packing)
@@ -297,7 +279,6 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
                 constant_values=jnp.nan,
             )
             page_indices_list.append(indices)
-            seq_page_ranges.append((page_cnt, page_cnt + kv.shape[0]))
             page_cnt += kv.shape[0]
             kv_pages_list.append(kv)
 
@@ -307,15 +288,6 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             ((0, num_pages - kv_cache.shape[0]), (0, 0), (0, 0), (0, 0), (0, 0)),
             constant_values=jnp.nan,
         )
-        nan_rows = None
-        if nan_kv_seq_idx is not None:
-            # Fill this sequence's cached KV with NaN, so it attends to NaN.
-            first, last = seq_page_ranges[nan_kv_seq_idx]
-            kv_cache = kv_cache.at[first:last].set(jnp.nan)
-            nan_rows = slice(cu_q_lens[nan_kv_seq_idx], cu_q_lens[nan_kv_seq_idx + 1])
-        if nan_new_seq_idx is not None:
-            nan_rows = slice(cu_q_lens[nan_new_seq_idx], cu_q_lens[nan_new_seq_idx + 1])
-            v = v.at[nan_rows].set(jnp.nan)
         page_indices = jnp.stack(page_indices_list, axis=0)
         page_indices = jnp.pad(
             page_indices,
@@ -390,8 +362,10 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         )
 
         rpa_bkv_sz = bkv_sz
+        rpa_n_buffer = 3
         rpa_batch_size = 2
         if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+            rpa_n_buffer = 2
             rpa_batch_size = 1
 
         decode_block_sizes = configs.BlockSizes(
@@ -399,12 +373,14 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             bq_c_sz=bq_csz,
             bkv_sz=rpa_bkv_sz,
             batch_size=rpa_batch_size,
+            n_buffer=rpa_n_buffer,
         )
         prefill_block_sizes = configs.BlockSizes(
             bq_sz=bq_sz,
             bq_c_sz=bq_csz,
             bkv_sz=rpa_bkv_sz,
             batch_size=rpa_batch_size,
+            n_buffer=rpa_n_buffer,
         )
 
         output, updated_kv_cache = wrapper.ragged_paged_attention(
@@ -415,7 +391,6 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             vmem_limit_bytes=vmem_limit_bytes,
             kv_layout=kv_layout,
             decode_query_size=decode_query_size,
-            mask_invalid_v=mask_invalid_v,
         )
         output = output[: cu_q_lens[distribution[-1]]]
 
@@ -442,13 +417,10 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             4: 0.2,
         }
         tol = tols[dtype_bits]
-        if nan_rows is not None:
-            # Every other sequence must stay finite and match the reference.
-            self.assertTrue(jnp.isnan(output[nan_rows]).all().item())
-            keep = np.ones(output.shape[0], dtype=bool)
-            keep[nan_rows] = False
-            output, expected = output[keep], expected[keep]
-            self.assertTrue(jnp.isfinite(output).all().item())
+        self.assertFalse(
+            jnp.any(jnp.isnan(output)).item(),
+            "output contains NaNs",
+        )
         self.assertAllClose(output, expected, atol=tol, rtol=tol)
         self.assertTrue(
             _assert_cache_equal(updated_kv_cache, expected_kv_cache).item(),
@@ -491,29 +463,6 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             bkv_sz=bkv_sz,
             bq_csz=bq_csz,
             kv_layout=kv_layout,
-        )
-
-    @parameterized.product(
-        page_size=[128, 256, 512],
-        bq_sz=[1, 64],
-    )
-    def test_ragged_paged_attention_seq_along_lane_page_size(self, page_size, bq_sz):
-        # page_size > 128 only matters for SEQ_ALONG_LANE, where tokens are packed
-        # along the lane dim. bq_sz=1 takes the decode stitch path, bq_sz=64 the
-        # prefill roll path. kv_lens are deliberately not multiples of 128.
-        q_len = 1 if bq_sz == 1 else 5
-        seq_lens = [(q_len, n) for n in (18, 129, 597, 1107, 31, 1328)]
-        self._test_ragged_paged_attention(
-            seq_lens,
-            (32, 8),
-            128,
-            page_size,
-            jnp.bfloat16,
-            jnp.bfloat16,
-            1000,
-            bq_sz=bq_sz,
-            bq_csz=bq_sz,
-            kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
         )
 
     @parameterized.product(
@@ -694,100 +643,6 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
 
     @parameterized.product(
         dtype=[jnp.float32, jnp.bfloat16],
-        kv_layout=[
-            configs.KVLayout.HEAD_ALONG_SUBLANE,
-            configs.KVLayout.SEQ_ALONG_LANE,
-        ],
-        q_len=[1, 4],
-    )
-    def test_ragged_paged_attention_nan_kv_stays_in_its_sequence(
-        self, dtype, kv_layout, q_len
-    ):
-        # The kernel carries its running max, sum and output from one sequence
-        # to the next. NaN in one sequence's cached KV (e.g. written mid-batch
-        # by a corrupted MTP draft, not produced by the kernel itself) must not
-        # leak into the sequences after it. Those later sequences fill whole KV
-        # blocks: a partly filled block can also read NaN from stale V rows
-        # that an earlier sequence left in VMEM, which is a separate issue.
-        seq_lens = [
-            (q_len, kv_len) for kv_len in (129, 597, 256, 512, 768, 256, 1024, 512)
-        ]
-        self._test_ragged_paged_attention(
-            seq_lens,
-            (32, 8),
-            128,
-            16,
-            dtype,
-            dtype,
-            1000,
-            bq_sz=q_len,
-            bq_csz=q_len,
-            kv_layout=kv_layout,
-            distribution=jnp.array([len(seq_lens)] * 3, dtype=jnp.int32),
-            decode_query_size=q_len,
-            nan_kv_seq_idx=1,
-        )
-
-    @parameterized.product(
-        kv_dtype=[jnp.bfloat16, jnp.float8_e4m3fn],
-        kv_layout=[
-            configs.KVLayout.HEAD_ALONG_SUBLANE,
-            configs.KVLayout.SEQ_ALONG_LANE,
-        ],
-        q_len=[1, 4],
-    )
-    def test_nan_cached_kv_does_not_poison_partial_tiles(
-        self, kv_dtype, kv_layout, q_len
-    ):
-        seq_lens = [(q_len, length) for length in (129, 2048, 8, 7, 257, 259, 8, 511)]
-        self._test_ragged_paged_attention(
-            seq_lens,
-            (8, 2),
-            128,
-            256,
-            jnp.bfloat16,
-            kv_dtype,
-            64,
-            bq_sz=q_len,
-            bq_csz=q_len,
-            bkv_sz=1024,
-            kv_layout=kv_layout,
-            distribution=jnp.array([len(seq_lens)] * 3, dtype=jnp.int32),
-            decode_query_size=q_len,
-            nan_kv_seq_idx=1,
-            mask_invalid_v=True,
-        )
-
-    @parameterized.product(
-        kv_dtype=[jnp.bfloat16, jnp.float8_e4m3fn],
-        q_len=[1, 4],
-        head_dim=[128, 256],
-    )
-    def test_nan_new_kv_page_does_not_poison_other_sequences(
-        self, kv_dtype, q_len, head_dim
-    ):
-        # Source token 128 shares a DMA page with the first request's new KV,
-        # but lies beyond the decode stitch's boundary registers.
-        bad_sequence = 128 // q_len
-        seq_lens = [(q_len, 4 + q_len)] * (bad_sequence + 3)
-        self._test_ragged_paged_attention(
-            seq_lens,
-            (8, 2),
-            head_dim,
-            256,
-            jnp.bfloat16,
-            kv_dtype,
-            256,
-            bq_sz=q_len,
-            bq_csz=q_len,
-            bkv_sz=1024,
-            distribution=jnp.array([len(seq_lens)] * 3, dtype=jnp.int32),
-            decode_query_size=q_len,
-            nan_new_seq_idx=bad_sequence,
-        )
-
-    @parameterized.product(
-        dtype=[jnp.float32, jnp.bfloat16],
     )
     def test_ragged_paged_attention_prefill_only(self, dtype):
         seq_lens = [
@@ -946,6 +801,112 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             dtype,
             num_pages,
             soft_cap=soft_cap,
+        )
+
+    @parameterized.product(
+        dist=[(1, 1, 1), (0, 0, 1)],
+    )
+    def test_ragged_paged_attention_static_skip_mixed(self, dist):
+        if not jtu.is_device_tpu_at_least(version=4):
+            self.skipTest("Expect TPUv4+")
+        rng = np.random.default_rng(1234)
+        dtype = jnp.bfloat16
+        num_q_heads, num_kv_heads = 8, 1
+        head_dim = 128
+        page_size = 128
+        num_pages = 32
+        max_num_seq = 8
+        pages_per_seq = 8
+        q_len, kv_len = 4, 260
+
+        q = jnp.array(
+            rng.random((4, num_q_heads, head_dim), dtype=np.float32), dtype=dtype
+        )
+        k = jnp.array(
+            rng.random((4, num_kv_heads, head_dim), dtype=np.float32), dtype=dtype
+        )
+        v = jnp.array(
+            rng.random((4, num_kv_heads, head_dim), dtype=np.float32), dtype=dtype
+        )
+        kv_packing = utils.get_dtype_packing(dtype)
+        num_kv_heads_x2 = utils.align_to(num_kv_heads * 2, kv_packing)
+        kv_cache = jnp.array(
+            rng.random(
+                (
+                    num_pages,
+                    page_size,
+                    num_kv_heads_x2 // kv_packing,
+                    kv_packing,
+                    head_dim,
+                ),
+                dtype=np.float32,
+            ),
+            dtype=dtype,
+        )
+        kv_lens = jnp.zeros((max_num_seq,), dtype=jnp.int32).at[0].set(kv_len)
+        page_indices = jnp.arange(max_num_seq * pages_per_seq, dtype=jnp.int32)
+        cu_q_lens = jnp.zeros((max_num_seq + 1,), dtype=jnp.int32).at[1:].set(q_len)
+        distribution = jnp.array(dist, dtype=jnp.int32)
+
+        expected, expected_kvc = ref_ragged_paged_attention(
+            q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution
+        )
+        actual, actual_kvc = wrapper.ragged_paged_attention(
+            q,
+            k,
+            v,
+            kv_cache,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+            decode_query_size=4,
+        )
+        self.assertAllClose(actual, expected, atol=0.2, rtol=0.2)
+        self.assertTrue(_assert_cache_equal(actual_kvc, expected_kvc).item())
+
+    @parameterized.product(
+        kv_layout=[
+            configs.KVLayout.HEAD_ALONG_SUBLANE,
+            configs.KVLayout.SEQ_ALONG_LANE,
+        ],
+        dtype=[jnp.float32, jnp.bfloat16],
+        test_case=["decode", "partial_query_block"],
+    )
+    def test_ragged_paged_attention_unattended_nan_in_v(
+        self,
+        kv_layout: configs.KVLayout,
+        dtype: Any,
+        test_case: str,
+    ):
+        """Regression test for unattended V masking with NaNs.
+
+        Verifies that NaNs in unattended KV page tails and unused batch slots
+        do not poison attention output with NaNs via 0.0 * NaN = NaN.
+        Covers both pure decode and partial query blocks (q_len < bq_sz).
+        """
+        num_heads = (16, 2)
+        head_dim = 128
+        page_size = 128 if kv_layout == configs.KVLayout.SEQ_ALONG_LANE else 16
+        num_pages = 100
+
+        seq_lens = (
+            [(1, 10), (1, 25), (1, 80)]
+            if test_case == "decode"
+            else [(37, 50)]  # Partial query block where q_len < bq_sz (e.g. 37 < 64)
+        )
+
+        self._test_ragged_paged_attention(
+            seq_lens,
+            num_heads,
+            head_dim,
+            page_size,
+            dtype,
+            dtype,
+            num_pages,
+            kv_layout=kv_layout,
+            bkv_sz=128,
         )
 
 

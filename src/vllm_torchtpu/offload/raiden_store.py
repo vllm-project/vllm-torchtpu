@@ -223,6 +223,35 @@ def has_multi_shapes_kv_caches(vllm_config: VllmConfig) -> bool:
     )
 
 
+def _default_worker_registration_timeout() -> int:
+    """Give workers as long to register with the Raiden controller as vLLM
+    gives the engine to come up.
+
+    Workers register only after their model load and graph precompile, which
+    takes far longer than Raiden's 120 s default on a cold or partially warm
+    compile cache (new offload graph variants): the controller then fails with
+    "timed out waiting for workers: expected 8 within 120s". An explicit
+    RAIDEN_EXPECTED_WORKERS_TIMEOUT_S is kept; otherwise it is set to
+    VLLM_ENGINE_READY_TIMEOUT_S (recipes set 7200), else 3600 s. The C++
+    controller reads it with getenv at Init, after this runs.
+    """
+    current = os.environ.get("RAIDEN_EXPECTED_WORKERS_TIMEOUT_S", "").strip()
+    if current:
+        return int(float(current))
+    ready = os.environ.get("VLLM_ENGINE_READY_TIMEOUT_S", "").strip()
+    try:
+        timeout = max(int(float(ready)), 3600) if ready else 3600
+    except ValueError:
+        timeout = 3600
+    os.environ["RAIDEN_EXPECTED_WORKERS_TIMEOUT_S"] = str(timeout)
+    logger.info(
+        "TPURaidenOffloadingConnector: RAIDEN_EXPECTED_WORKERS_TIMEOUT_S=%d "
+        "(workers register after model load and precompile).",
+        timeout,
+    )
+    return timeout
+
+
 class RaidenLoadStoreSpec(LoadStoreSpec):
     """Offload-side specification describing the ordered keys for a job.
 
@@ -368,6 +397,7 @@ class RaidenOffloadingManager(OffloadingManager):
         if store is None:
             from tpu_sync.api.torch.kv_cache_manager import _torch_impl
 
+            _default_worker_registration_timeout()
             store_types = _torch_impl()
             logger.info(
                 "TPURaidenOffloadingConnector: blocking KVCacheStore construction "
@@ -389,7 +419,8 @@ class RaidenOffloadingManager(OffloadingManager):
                 kv_pool_group=kv_pool_group,
                 # Construction blocks in RaidenController::Init() until every
                 # rank registers, and raises on timeout
-                # (RAIDEN_EXPECTED_WORKERS_TIMEOUT_S, default 120s).
+                # (RAIDEN_EXPECTED_WORKERS_TIMEOUT_S; raised from Raiden's 120 s
+                # by _default_worker_registration_timeout).
                 expected_worker_count=world_size,
                 # Passed only when set, so a DRAM-only store is constructed
                 # exactly as before the storage tier existed.

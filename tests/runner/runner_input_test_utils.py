@@ -161,6 +161,12 @@ def _make_runner(
     runner._collect_mamba_state_seed_copies = (
         TPUModelRunner._collect_mamba_state_seed_copies.__get__(runner)
     )
+    # The real single-step prefill helpers: off without the unified pool, and
+    # a scheduler output without cuts uploads no seg tensor.
+    runner._mamba_seg_enabled = TPUModelRunner._mamba_seg_enabled.__get__(runner)
+    runner._build_mamba_seg_arrays = TPUModelRunner._build_mamba_seg_arrays.__get__(
+        runner
+    )
     runner._prepare_async_token_substitution_indices = lambda *_args, **_kwargs: (
         np.array([], dtype=np.int32),
         np.array([], dtype=np.int32),

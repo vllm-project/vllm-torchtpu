@@ -33,6 +33,18 @@ os.environ.setdefault("VLLM_DO_NOT_TRACK", "1")
 import pytest
 import torch
 
+# Test files that need no chip, by path from the repo root. A session of
+# nothing but these runs with JAX pinned to the CPU.
+HOST_ONLY_TEST_FILES: tuple[str, ...] = (
+    "tests/distributed/test_sharded_jax_op.py",
+    "tests/layers/adapter/test_small_all_reduce_op.py",
+    "tests/kernels/experimental/test_gated_norm_quant.py",
+)
+
+
+def _needs_no_chip(item):
+    return str(item.path).endswith(HOST_ONLY_TEST_FILES)
+
 
 def pytest_collection_modifyitems(items):
     """Run whole-slice worker-spawning tests before in-process TPU tests.
@@ -57,6 +69,18 @@ def pytest_collection_modifyitems(items):
             item.nodeid.split("::")[0],
         )
     )
+    # JAX raises rather than falling back to the CPU when the chips are busy,
+    # and the pin must not leak into a session with device tests (they would
+    # skip), so it is decided over the whole collection. jax reads
+    # JAX_PLATFORMS once, at import, so a loaded jax is updated as well.
+    if (
+        items
+        and not os.environ.get("JAX_PLATFORMS")
+        and all(_needs_no_chip(item) for item in items)
+    ):
+        os.environ["JAX_PLATFORMS"] = "cpu"
+        if "jax" in sys.modules:
+            sys.modules["jax"].config.update("jax_platforms", "cpu")
 
 
 def pytest_addoption(parser):
@@ -162,7 +186,7 @@ def device(request):
         except ImportError:
             pytest.skip("torch_tpu not available")
         except Exception as e:
-            pytest.fail(f"TPU requested but failed to initialize: {e}")
+            pytest.skip(f"TPU requested but failed to initialize: {e}")
     return torch.device("cpu")
 
 

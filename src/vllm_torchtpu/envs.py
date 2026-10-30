@@ -124,6 +124,7 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
+    TPU_WORKER_NUMA_BIND: bool = True
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_SPEC_STATIC_VERIFY: bool = True
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
@@ -218,6 +219,16 @@ if TYPE_CHECKING:
     TPU_SP_FP8_GATHER: bool = True
     TPU_SMALL_ALL_REDUCE: bool = False
     TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 128
+    TPU_SCHED_SRPF_RUNNING: bool = True
+    TPU_SCHED_COLD_CHUNK_CAP: int = 2048
+    TPU_SCHED_COLD_THRESHOLD: int = 8192
+    TPU_SCHED_COLD_MIN_DECODERS: int = 12
+    TPU_SCHED_STEP_TOTAL_CAP: int = 4096
+    TPU_SCHED_WARM_STREAK: int = 0
+    TPU_SCHED_WARM_MIN_DECODERS: int = 24
+    TPU_SCHED_MK_MAX_RUNNING: int = 0
+    TPU_SCHED_SKIP_MIDBLOCK_ALIGN_STOP: bool = False
+    TPU_SCHED_SINGLE_STEP_PREFILL: bool = True
 
 
 def env_with_choices(
@@ -886,6 +897,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per host and the others wait for its artifact. Off compiles every bucket
     # on every rank, sharing only through the Tier-2 cache.
     "TPU_PRECOMPILE_PEER_REPLAY": env_bool("TPU_PRECOMPILE_PEER_REPLAY", default=False),
+    # Bind each worker to its TPU chip's NUMA node (CPU set and preferred
+    # memory) before the runtime starts; see worker/numa_bind.py. On by
+    # default (qx-ovl-s2 shipped it off but every measured run set it:
+    # c16 int90 99.6 vs 96.6). It only narrows the inherited CPU set and is a
+    # logged no-op when ranks do not map onto chips or sysfs has no node.
+    "TPU_WORKER_NUMA_BIND": env_bool("TPU_WORKER_NUMA_BIND", default=True),
     # Token-axis chunk size for the GLM-5.2 / DSv4 StreamIndex top-k kernel.
     # Cutting the flat token axis into `chunk_tokens`-sized pieces lets each
     # chunk's SparseCore top-k overlap the next chunk's TensorCore scoring.
@@ -1248,8 +1265,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_MEGAKERNEL": env_str("VLLM_TPU_MEGAKERNEL", ""),
     "TPU_SP_MIN_ROWS": lambda: int(os.getenv("TPU_SP_MIN_ROWS", "512")),
     "TPU_SP_FP8_GATHER": env_bool("TPU_SP_FP8_GATHER", default=True),
+    # --- Small collectives ---
+    # Run small decode-step TP all-reduces and DP MoE combines as Pallas
+    # kernels (kernels/experimental/small_collectives) instead of XLA's.
     "TPU_SMALL_ALL_REDUCE": env_bool("TPU_SMALL_ALL_REDUCE", default=True),
     "TPU_EXPERT_PLACEMENT_MTP": env_bool("TPU_EXPERT_PLACEMENT_MTP", default=True),
+    "TPU_OFFLOAD_MIN_HBM_USAGE": env_float("TPU_OFFLOAD_MIN_HBM_USAGE", 0.0),
     "TPU_SMALL_ALL_REDUCE_MAX_ROWS": env_nonnegative_int(
         "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 128
     ),
@@ -1258,6 +1279,63 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_ATTN_MOE_OVERLAP_MIN_TOKENS", 64
     ),
     "TPU_MOE_FUSED_EP_STEP_MIN_TOKENS": env_int("TPU_MOE_FUSED_EP_STEP_MIN_TOKENS", 64),
+    # --- PrefixAwareScheduler SRPF & cold-prefill chunk capping ---
+    # Sort prefilling requests in `running` by fewest remaining prompt tokens.
+    "TPU_SCHED_SRPF_RUNNING": env_bool("TPU_SCHED_SRPF_RUNNING", default=True),
+    # Max prefill tokens per step for a cold prefill (remaining > threshold)
+    # when num_decoding >= TPU_SCHED_COLD_MIN_DECODERS or (in `running`) when
+    # `waiting` is non-empty. 0 disables capping.
+    "TPU_SCHED_COLD_CHUNK_CAP": env_nonnegative_int("TPU_SCHED_COLD_CHUNK_CAP", 2048),
+    # Remaining uncached prompt tokens threshold defining a cold prefill.
+    "TPU_SCHED_COLD_THRESHOLD": env_nonnegative_int("TPU_SCHED_COLD_THRESHOLD", 8192),
+    # Minimum active decoding requests before cold-prefill chunk capping
+    # activates when `waiting` is empty.
+    "TPU_SCHED_COLD_MIN_DECODERS": env_nonnegative_int(
+        "TPU_SCHED_COLD_MIN_DECODERS", 12
+    ),
+    "TPU_SCHED_STEP_TOTAL_CAP": env_nonnegative_int("TPU_SCHED_STEP_TOTAL_CAP", 4096),
+    "TPU_SCHED_WARM_STREAK": env_nonnegative_int("TPU_SCHED_WARM_STREAK", 0),
+    "TPU_SCHED_WARM_MIN_DECODERS": env_nonnegative_int(
+        "TPU_SCHED_WARM_MIN_DECODERS", 24
+    ),
+    # Cap active running sequences in PrefixAwareScheduler to the megakernel's
+    # verify capacity: 0 = disabled (default); -1 = auto, 64 //
+    # (1 + num_spec_tokens) when VLLM_TPU_QWEN35_MEGAKERNEL=1 and dcp == 1
+    # (16 at MTP=3, so requests beyond 16 queue); >0 = explicit cap.
+    "TPU_SCHED_MK_MAX_RUNNING": env_int("TPU_SCHED_MK_MAX_RUNNING", 0),
+    # Mamba "align" prefill split: let a chunk that starts mid-block (a
+    # 128-token partial-tail prefix hit) run past the next block boundary.
+    # Under sparse retention (prefix_cache_retention_interval=0) the state at
+    # that boundary is never hashed, so the stop only costs a step.
+    "TPU_SCHED_SKIP_MIDBLOCK_ALIGN_STOP": env_bool(
+        "TPU_SCHED_SKIP_MIDBLOCK_ALIGN_STOP", default=False
+    ),
+    # Single-step warm prefill (core/single_step_prefill.py): one prefill
+    # step writes the last-full-block and partial-tail GDN checkpoints inside
+    # the chunk instead of ending a chunk at each. Changes the stock GDN
+    # program signature, so it is part of the compile hash. Must be set for
+    # the engine core and every worker alike.
+    "TPU_SCHED_SINGLE_STEP_PREFILL": env_bool(
+        "TPU_SCHED_SINGLE_STEP_PREFILL", default=True
+    ),
+    "TPU_HYBRID_RETENTION_MAX_CONVS": env_nonnegative_int(
+        "TPU_HYBRID_RETENTION_MAX_CONVS", 96
+    ),
+    "TPU_HYBRID_RETENTION_MAX_PINNED_BLOCKS": env_nonnegative_int(
+        "TPU_HYBRID_RETENTION_MAX_PINNED_BLOCKS", 360
+    ),
+    "TPU_HYBRID_RETENTION_KEEP_PRIOR_TURNS": env_nonnegative_int(
+        "TPU_HYBRID_RETENTION_KEEP_PRIOR_TURNS", 1
+    ),
+    "TPU_HYBRID_RETENTION_SMART_FORK": env_bool(
+        "TPU_HYBRID_RETENTION_SMART_FORK", default=True
+    ),
+    "TPU_HYBRID_RETENTION_SAFE_TAIL_OFFSET": env_nonnegative_int(
+        "TPU_HYBRID_RETENTION_SAFE_TAIL_OFFSET", 4
+    ),
+    "TPU_RAIDEN_INLINE_LOAD_MAX_CHUNKS": env_nonnegative_int(
+        "TPU_RAIDEN_INLINE_LOAD_MAX_CHUNKS", 2
+    ),
 }
 
 

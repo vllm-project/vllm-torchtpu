@@ -51,7 +51,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.config import VllmConfig
@@ -87,6 +87,7 @@ from vllm.v1.kv_offload.base import (
     OffloadKey,
 )
 from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.request import Request
 
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.logger import init_logger
@@ -320,9 +321,111 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                     )
         super().update_connector_output(connector_output)
 
+    def _quiet_lookup(self, req_status: Any, base_tokens: int) -> int | None:
+        """Probe ``self._lookup(req_status)`` starting from ``base_tokens``
+        without emitting duplicate lookup events."""
+        req_status.num_locally_computed_tokens = base_tokens
+        tracker = getattr(self, "_events_tracker", None)
+        orig_record = getattr(tracker, "record_lookup", None) if tracker else None
+        orig_partial = (
+            getattr(tracker, "record_partial_lookup", None) if tracker else None
+        )
+        try:
+            if tracker is not None:
+                tracker.record_lookup = lambda *a, **kw: None
+                tracker.record_partial_lookup = lambda *a, **kw: None
+            return self._lookup(req_status)
+        finally:
+            if tracker is not None:
+                if orig_record is not None:
+                    tracker.record_lookup = orig_record
+                if orig_partial is not None:
+                    tracker.record_partial_lookup = orig_partial
+
+    def resolve_divergent_local_hit_tokens(
+        self,
+        request: Request,
+        num_local: int,
+        num_reconciled: int,
+        block_size: int,
+    ) -> int | None:
+        """Return the block-aligned local FullAttention prefix length to retain
+        in HBM when HBM has a divergent hybrid hit (FullAttention > Mamba), or
+        None if Raiden CPU cannot advance past ``num_reconciled``."""
+        if getattr(request, "skip_reading_prefix_cache", False):
+            return None
+        req_status = self._req_status.get(request.request_id)
+        if req_status is None:
+            self.on_new_request(request)
+            req_status = self._req_status.get(request.request_id)
+        if req_status is None:
+            return None
+        if req_status.transfer_jobs:
+            return (num_local // block_size) * block_size
+
+        req_status.update_offload_keys()
+        fa_aligned = (num_local // block_size) * block_size
+        reconciled_aligned = (num_reconciled // block_size) * block_size
+
+        # 1. Check if Raiden CPU has tokens strictly above fa_aligned
+        #    (e.g. a partial tail at fa_aligned + 128 or additional chunks).
+        ext_above = self._quiet_lookup(req_status, fa_aligned)
+        if ext_above is None:
+            return fa_aligned
+        if ext_above > 0 and fa_aligned + ext_above > num_reconciled:
+            return fa_aligned
+
+        # 2. Common case: FullAttention in HBM covers all full blocks of the
+        #    previous turn (or its partial tail), and Raiden CPU holds the
+        #    Mamba boundary in that final block [fa_aligned - block_size, fa_aligned].
+        #    Back off by 1 block so get_num_new_matched_tokens loads only the
+        #    final block (1 FA block + 1 Mamba block) while keeping the other
+        #    (fa_aligned // block_size - 1) FA blocks in HBM.
+        one_back = fa_aligned - block_size
+        if one_back >= reconciled_aligned and one_back >= 0:
+            ext_last = self._quiet_lookup(req_status, one_back)
+            if ext_last is None:
+                return one_back
+            if ext_last > 0 and one_back + ext_last > num_reconciled:
+                ext_end = one_back + ext_last
+                return min(fa_aligned, ((ext_end - 1) // block_size) * block_size)
+
+        # 3. General case: FullAttention in HBM extends past the latest Mamba
+        #    boundary stored in Raiden CPU (e.g. shared prefix from a longer
+        #    request). Scan downward from one_back - block_size to
+        #    reconciled_aligned to find the highest chunk where Raiden CPU can
+        #    supply both the Mamba boundary and its corresponding FA chunk.
+        min_chunk = max(0, reconciled_aligned // block_size)
+        max_chunk = (one_back // block_size) - 1
+        for chunk_idx in range(max_chunk, min_chunk - 1, -1):
+            base = chunk_idx * block_size
+            ext_hit = self._quiet_lookup(req_status, base)
+            if ext_hit is None:
+                return base
+            if ext_hit > 0 and base + ext_hit > num_reconciled:
+                ext_end = base + ext_hit
+                return min(fa_aligned, ((ext_end - 1) // block_size) * block_size)
+
+        return None
+
 
 class TPURaidenOffloadingConnector(OffloadingConnector):
     """Top-level facade connector for the store-backed (V2) raiden KV offload path."""
+
+    supports_divergent_local_hybrid_hits: bool = True
+
+    def resolve_divergent_local_hit_tokens(
+        self,
+        request: Request,
+        num_local: int,
+        num_reconciled: int,
+        block_size: int,
+    ) -> int | None:
+        if self.connector_scheduler is None:
+            return None
+        return self.connector_scheduler.resolve_divergent_local_hit_tokens(
+            request, num_local, num_reconciled, block_size
+        )
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: VllmConfig) -> str | None:
@@ -340,25 +443,6 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         # enabled. Satisfies `KVConnectorModelRunnerMixin.use_uniform_kv_cache()`
         # preconditions to enable bundled tensor allocation in the TPU model runner.
         return bool(tpu_envs.VLLM_TPU_BLOCK_MAJOR_KV)
-
-    @property
-    def supports_divergent_local_hybrid_hits(self) -> bool:
-        """Complete a deeper full-attention local hit, behind the Stage-3 flag.
-
-        Upstream offload lookup treats a Mamba group as a one-chunk window, so
-        a hit from this store ends where it holds the recurrent state for its
-        last chunk: a load restores the state the local hit lacks, and a miss
-        lets the scheduler reconcile to the common boundary. Decode composes
-        this connector with TPURaidenConnector in TPUMultiConnector, which
-        needs every child to agree before Stage-3 suffix loads can run. Gated
-        on the prefix-aware flag so standalone offload keeps today's lookup.
-        """
-        # Deferred: tpu_connector is heavy and only this property needs it.
-        from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
-            _prefix_aware_load_enabled,
-        )
-
-        return _prefix_aware_load_enabled()
 
     def __init__(
         self,
@@ -413,6 +497,22 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             # In-flight fence events awaiting device retirement before acknowledging
             # store jobs, recorded as pairs of (fence_job_ids, event).
             self._pending_fences: list[tuple[set[int], torch.Event]] = []
+            # QX_OFFLOAD_FENCE_AFTER_DRAFT=1: the runner calls get_finished()
+            # after the target forward but BEFORE the speculative (MTP/eagle)
+            # draft propose, which writes the draft layer's KV into the same
+            # pool blocks. Deferring the fence for a step's store jobs to the
+            # next get_finished() call orders it after every KV write of that
+            # step, draft included.
+            self._fence_after_draft: bool = (
+                os.environ.get("QX_OFFLOAD_FENCE_AFTER_DRAFT", "0") == "1"
+            )
+            self._deferred_fence_ids: set[int] = set()
+            if self._fence_after_draft:
+                logger.info(
+                    "TPURaidenOffloadingConnector: QX_OFFLOAD_FENCE_AFTER_DRAFT=1: "
+                    "store fences are recorded one get_finished() call later so "
+                    "they order after the step's draft (MTP) KV writes"
+                )
 
     # -- scheduler-side hooks ----------------------------------------------
     def reset_cache(self) -> bool | None:
@@ -515,7 +615,14 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         meta = self._get_connector_metadata()
         assert isinstance(meta, RaidenOffloadingConnectorMetadata)
 
-        if meta.fence_job_ids:
+        fence_job_ids = set(meta.fence_job_ids)
+        if getattr(self, "_fence_after_draft", False):
+            fence_job_ids, self._deferred_fence_ids = (
+                self._deferred_fence_ids,
+                fence_job_ids,
+            )
+
+        if fence_job_ids:
             # Establish an asynchronous device fence before acknowledging store jobs:
             # 1. Dispatch any deferred pool writes so they precede the fence event.
             # 2. Record a stream event to track completion without host-side blocking.
@@ -523,9 +630,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                 "KV pool tensors must be registered before the save fence"
             )
             _enqueue_pool_writes(self._pool_sync_tensors)
-            self._pending_fences.append(
-                (set(meta.fence_job_ids), _record_fence_event())
-            )
+            self._pending_fences.append((fence_job_ids, _record_fence_event()))
 
         if self._pending_fences:
             # Non-blockingly drain retired events and acknowledge completed fences.

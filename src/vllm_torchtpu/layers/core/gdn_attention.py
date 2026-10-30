@@ -833,6 +833,8 @@ def run_jax_gdn_attention_pooled_local(
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
+    seg_bounds: jnp.ndarray | None = None,
+    seg_state_indices: jnp.ndarray | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """GDN attention over the unified block pool.
 
@@ -869,6 +871,8 @@ def run_jax_gdn_attention_pooled_local(
         recurrent_dtype=jnp.dtype(recurrent_state_dtype),
         conv_dtype=jnp.dtype(jnp.float32),
         num_spec_tokens=num_spec_tokens,
+        seg_bounds=seg_bounds,
+        seg_state_indices=seg_state_indices,
     )
     return pool.reshape(pool_shape), output
 
@@ -898,6 +902,8 @@ def run_jax_gdn_attention_pooled(
     mesh: jax.sharding.Mesh,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
+    seg_bounds: jnp.ndarray | None = None,
+    seg_state_indices: jnp.ndarray | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
 
@@ -963,6 +969,10 @@ def run_jax_gdn_attention_pooled(
             "slot_read_offsets to say which one"
         )
         in_specs = in_specs + (P(None, None),)
+    if seg_bounds is not None:
+        # In-chunk state checkpoints `(num_seqs, 2)` each, replicated.
+        assert seg_state_indices is not None
+        in_specs = in_specs + (P(None, None), P(None, None))
 
     out_specs = (
         pool_spec,  # new_recurrent_state (attention-shaped pool)
@@ -982,6 +992,25 @@ def run_jax_gdn_attention_pooled(
         num_spec_tokens=num_spec_tokens,
         recurrent_state_dtype=recurrent_state_dtype,
     )
+    if seg_bounds is not None:
+        has_read_offsets = slot_read_offsets is not None
+        has_ckpt = ckpt_indices is not None
+        p_local_no_seg = p_run_jax_gdn_attention_pooled_local
+
+        def p_run_jax_gdn_attention_pooled_local(*args):
+            # shard_map passes operands positionally; the optional ones are
+            # present by the flags above, segments always last.
+            base, rest = args[:12], list(args[12:])
+            read_offsets = rest.pop(0) if has_read_offsets else None
+            ckpt = rest.pop(0) if has_ckpt else None
+            return p_local_no_seg(
+                *base,
+                read_offsets,
+                ckpt,
+                seg_bounds=rest[0],
+                seg_state_indices=rest[1],
+            )
+
     mapped_fn = jax.shard_map(
         p_run_jax_gdn_attention_pooled_local,
         mesh=mesh,
@@ -1006,6 +1035,8 @@ def run_jax_gdn_attention_pooled(
         # Already per-sequence (row s names sequence s's checkpoint blocks),
         # so it needs no gather by state_indices.
         extra_args = extra_args + (ckpt_indices,)
+    if seg_bounds is not None:
+        extra_args = extra_args + (seg_bounds, seg_state_indices)
     outputs = mapped_fn(
         j_mixed_qkv,
         j_b,

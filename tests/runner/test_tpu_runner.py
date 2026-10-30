@@ -2211,6 +2211,20 @@ class TestMambaSlotReadOffsets:
         runner._update_mamba_slot_read_offsets([], torch.tensor([[1, 2]]), 1)
         assert int(runner.mamba_slot_read_offsets.sum()) == 0
 
+    def test_bucketed_next_tokens_shorter_than_state_indices_padded_in_graph(self):
+        """When next_tokens has shape [padded_num_reqs, K+1] while state_indices
+        has shape [target_num_reqs] (B < width), _update_read_offsets_verify_impl
+        pads offsets in-graph and leaves null-tail slots at 0."""
+        runner = self._make_runner(num_blocks=16)
+        state_indices = torch.tensor([1, 4, 0, 0], dtype=torch.int32)
+        next_tokens = torch.tensor(
+            [[10, 11, 12], [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID]]
+        )
+        runner._update_mamba_slot_read_offsets([state_indices], next_tokens, 2)
+        assert int(runner.mamba_slot_read_offsets[1]) == 2
+        assert int(runner.mamba_slot_read_offsets[4]) == 0
+        assert int(runner.mamba_slot_read_offsets[0]) == 0
+
 
 class TestReadOffsetsClearedOnReallocation:
     """A recycled slot/block must not carry a read offset into its next owner.
@@ -2330,6 +2344,82 @@ class TestReadOffsetsClearedOnReallocation:
         runner._reset_read_offsets_for_new_requests(0, 2)
         assert len(calls) == (5 if lockstep else 3)
         assert int(runner.mamba_slot_read_offsets[5]) == 0
+
+    def test_continuing_batch_uses_keep_zero_dev_without_mutating_keep_dev(self):
+        """Under EP-DP lockstep a batch with no new request still launches the
+        reset, through the persistent all-False keep_zero_dev mask, without
+        copying keep_cpu into keep_dev. (Without lockstep it is skipped.)"""
+        runner = self._make_runner(lockstep=True)
+        self._set_batch(runner, ["a", "b"], [5, 6])
+        runner._reset_read_offsets_for_new_requests(0, 2)
+        _, keep_dev, keep_zero_dev, _ = runner._read_offset_reset_scratch(
+            2, torch.device("cpu")
+        )
+        assert list(keep_dev) == [True, True]
+        assert list(keep_zero_dev) == [False, False]
+        runner.mamba_slot_read_offsets[5] = 2
+        runner.mamba_slot_read_offsets[6] = 1
+        # Next step with the same requests: keep_dev is not overwritten because
+        # keep_zero_dev is passed directly, and live offsets remain intact.
+        runner._reset_read_offsets_for_new_requests(0, 2)
+        assert list(keep_dev) == [True, True]
+        assert list(keep_zero_dev) == [False, False]
+        assert int(runner.mamba_slot_read_offsets[5]) == 2
+        assert int(runner.mamba_slot_read_offsets[6]) == 1
+
+    def test_continuing_batch_skips_reset_kernel_when_not_lockstep(self, monkeypatch):
+        import vllm_torchtpu.runner.tpu_runner as tr_mod
+
+        calls = []
+        orig_reset = tr_mod._reset_read_offsets
+        monkeypatch.setattr(
+            tr_mod,
+            "_reset_read_offsets",
+            lambda *a, **k: (calls.append(a), orig_reset(*a, **k))[1],
+        )
+        runner = self._make_runner()
+        runner._dp_lockstep_enabled = lambda: False
+        self._set_batch(runner, ["a", "b"], [5, 6])
+        runner._reset_read_offsets_for_new_requests(0, 2)
+        assert len(calls) == 1
+
+        # Second step with the same requests: no new requests and not in
+        # lockstep, so _reset_read_offsets is skipped completely while
+        # ctx._stacked_mamba_groups is still populated for post-verify reuse.
+        runner._reset_read_offsets_for_new_requests(0, 2)
+        assert len(calls) == 1
+        assert isinstance(
+            runner._attn_metadata_builder_ctx._stacked_mamba_groups, torch.Tensor
+        )
+
+    def test_reuses_pre_stacked_mamba_groups_from_ctx(self, monkeypatch):
+        import vllm_torchtpu.runner.tpu_runner as tr_mod
+
+        stack_calls = []
+        monkeypatch.setattr(
+            tr_mod,
+            "_stack_or_single_mamba_groups",
+            lambda groups: (
+                stack_calls.append(groups),
+                torch.stack(groups, dim=0),
+            )[1],
+        )
+        runner = self._make_runner()
+        g0 = torch.tensor([5, 6], dtype=torch.int32)
+        g1 = torch.tensor([1, 2], dtype=torch.int32)
+        pre_stacked = torch.stack([g0, g1], dim=0)
+        runner.input_batch.req_ids = ["a", "b"]
+        runner.input_batch.req_id_to_index = {"a": 0, "b": 1}
+        runner.requests = {"a": None, "b": None}
+        ctx = SimpleNamespace(
+            mamba_state_indices=None,
+            unified_mamba_state_indices=[g0, g1],
+            _stacked_mamba_groups=pre_stacked,
+            _stacked_mamba_groups_ids=(id(g0), id(g1)),
+        )
+        runner._attn_metadata_builder_ctx = ctx
+        runner._reset_read_offsets_for_new_requests(0, 2)
+        assert stack_calls == []
 
 
 class TestUnifiedReadOffsetMigration:
@@ -3277,6 +3367,28 @@ class TestAsyncSpecDecodeTokenAccounting:
         )
         assert runner.input_batch.num_tokens_no_spec[1] == 15
 
+    def test_compiled_assemble_prefill_bootstrap_matches_reference(self):
+        """Compiled prefill bootstrap assembly packs
+        [selected_token, draft_0..draft_{K-1}] for active rows and zero-pads to
+        bound."""
+        from vllm_torchtpu.runner.tpu_runner_async_output import (
+            _compiled_assemble_prefill_bootstrap,
+        )
+
+        selected = torch.tensor([[10], [20]], dtype=torch.int32)
+        drafts = torch.tensor(
+            [[1, 2, 3], [4, 5, 6], [7, 8, 9], [11, 12, 13]], dtype=torch.int32
+        )
+        bound = 12
+        out = _compiled_assemble_prefill_bootstrap.__wrapped__.__wrapped__(
+            selected, drafts, bound
+        )
+        expected = torch.tensor(
+            [10, 1, 2, 3, 20, 4, 5, 6, 0, 0, 0, 0],
+            dtype=torch.int32,
+        )
+        assert torch.equal(out, expected)
+
 
 @pytest.mark.tpu_test
 def test_upload_unless_unchanged_reuses_only_identical_values(device):
@@ -3317,7 +3429,7 @@ def test_relayout_tables_reaches_the_draft_model(monkeypatch):
     monkeypatch.setattr(
         runner_utils_module,
         "relayout_rope_caches",
-        lambda model: seen.append(("rope", model)),
+        lambda model, skip_modules=frozenset(): seen.append(("rope", model)),
     )
     monkeypatch.setattr(
         runner_utils_module,

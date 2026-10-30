@@ -573,6 +573,30 @@ def test_spec_crossing_offset_past_the_row_falls_back_to_the_state_block():
     assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(10, 11)]
 
 
+def test_spec_crossing_uniform_candidates_skips_device_gather_and_resets_offset():
+    # Prefix-cache resume (no prior state_pos) with ckpt_window=3 builds
+    # uniform candidate rows [src, src, src]; the CPU fast path must skip
+    # _spec_seed_sources while still resetting the destination read offset.
+    read_offsets = torch.zeros(NUM_BLOCKS, dtype=torch.int32)
+    read_offsets[11] = 2
+    fake, _ = _make_self(
+        ["a"],
+        [2 * BLOCK_SIZE],
+        [[[9, 10, 11, 12]]],
+        state_pos={},
+        ckpt_window=3,
+        read_offsets=read_offsets,
+    )
+    # A prefix-cache resume is a new owner: its offsets are not seeded yet.
+    fake._mamba_offset_seeded.clear()
+    called = []
+    fake._spec_seed_sources = lambda *a, **k: called.append(a)
+    _collect(fake, _sched({"a": BLOCK_SIZE}))
+    assert called == []
+    assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(10, 11)]
+    assert int(fake.mamba_slot_read_offsets[11]) == 0
+
+
 @pytest.mark.skipif(
     not _HAS_SPLIT, reason="split expansion only exists on the batched-RPA PR"
 )

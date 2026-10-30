@@ -191,6 +191,8 @@ def gdn_attention_pooled_core_tpu(
     seq_lens: jax.Array,
     slot_read_offsets: jax.Array | None = None,
     ckpt_indices: jax.Array | None = None,
+    seg_bounds: jax.Array | None = None,
+    seg_state_indices: jax.Array | None = None,
     *,
     mesh: jax.sharding.Mesh,
     n_kq: int,
@@ -202,6 +204,9 @@ def gdn_attention_pooled_core_tpu(
     recurrent_state_dtype: jnp.dtype,
     num_spec_tokens: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
+    seg_kwargs = {}
+    if seg_bounds is not None:
+        seg_kwargs = dict(seg_bounds=seg_bounds, seg_state_indices=seg_state_indices)
     return run_jax_gdn_attention_pooled(
         mixed_qkv,
         b,
@@ -226,6 +231,7 @@ def gdn_attention_pooled_core_tpu(
         recurrent_state_dtype=recurrent_state_dtype,
         mesh=mesh,
         num_spec_tokens=num_spec_tokens,
+        **seg_kwargs,
     )
 
 
@@ -736,6 +742,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             seq_lens: jax.Array,
             slot_read_offsets: jax.Array | None = None,
             ckpt_indices: jax.Array | None = None,
+            seg_bounds: jax.Array | None = None,
+            seg_state_indices: jax.Array | None = None,
         ) -> tuple[jax.Array, jax.Array]:
             # Fold the `(num_blocks, rows_per_block, *page)` block-major pool so
             # pool adapters index flat kernel blocks along dim 0; both reshapes
@@ -756,6 +764,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 seq_lens,
                 slot_read_offsets,
                 ckpt_indices,
+                seg_bounds,
+                seg_state_indices,
                 mesh=mesh,
                 n_kq=n_kq,
                 n_v=local_num_v_heads,
@@ -824,7 +834,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             seq_lens: torch.Tensor,
             slot_read_offsets: torch.Tensor | None = None,
             ckpt_indices: torch.Tensor | None = None,
+            seg_bounds: torch.Tensor | None = None,
+            seg_state_indices: torch.Tensor | None = None,
         ) -> torch.Tensor:
+            seg_args = ()
+            if seg_bounds is not None:
+                seg_args = (seg_bounds, seg_state_indices)
             new_rec, outputs = gdn_jax_op(
                 mixed_qkv,
                 b,
@@ -840,6 +855,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 seq_lens,
                 slot_read_offsets,
                 ckpt_indices,
+                *seg_args,
             )
 
             # Plain donation + copy_ writeback (aliased in-place by XLA).
@@ -1230,6 +1246,16 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         "mamba_slot_read_offsets in the attention metadata."
                     )
                 ckpt_indices = getattr(attn_metadata, "mamba_ckpt_indices", None)
+                # Single-step warm prefill (TPU_SCHED_SINGLE_STEP_PREFILL):
+                # in-chunk state checkpoints, present on every stock step
+                # when enabled so the program signature never varies.
+                seg_args = ()
+                seg_bounds = getattr(attn_metadata, "mamba_seg_bounds", None)
+                if seg_bounds is not None:
+                    seg_args = (
+                        seg_bounds,
+                        attn_metadata.mamba_seg_state_indices,
+                    )
                 core_attn_out = self.gdn_pooled_op(
                     mixed_qkv,
                     b,
@@ -1245,6 +1271,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     attn_metadata.seq_lens,
                     slot_read_offsets,
                     ckpt_indices,
+                    *seg_args,
                 )
                 if core_attn_out.shape[0] != num_tokens:
                     raise RuntimeError("GDN op returned an incompatible output shape.")

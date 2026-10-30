@@ -12,24 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Partial attention output stitching utilities for split-KV Batched RPA.
+
+Combines partial log-sum-exp (`m`, `l`) and unnormalized output accumulators
+across split KV page ranges.
+"""
+
 import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.experimental.batched_rpa import configs, utils
+from vllm_torchtpu.kernels.experimental.batched_rpa import configs
 
 
 def _stitch_decode_lane(
     vmem_u32_ref: jax.Array,
     bkv_sz_cache: jax.Array,
-    cache_end: jax.Array,
+    cache_pages: jax.Array,
     new_tok_offset: jax.Array,
     bkv_sz_new: jax.Array,
     v_len: int,
     *,
     cfgs: configs.RpaConfigs,
+    local_k_end: jax.Array | None = None,
 ):
     """O(1) Decode Path: Target only the VREGs containing the stitch boundary.
 
@@ -49,7 +56,7 @@ def _stitch_decode_lane(
     dst_rel = bkv_sz_cache % num_lanes
 
     # Source: first fetched new token in VMEM.
-    src_tok_idx = cache_end + new_tok_offset
+    src_tok_idx = cache_pages * cfgs.serve.page_size + new_tok_offset
 
     lane_idx = lax.broadcasted_iota(jnp.int32, (outer_dim, num_lanes), 1)
 
@@ -98,13 +105,25 @@ def _stitch_decode_lane(
 def _stitch_prefill_lane(
     vmem_u32_ref: jax.Array,
     bkv_sz_cache: jax.Array,
-    cache_end: jax.Array,
+    cache_pages: jax.Array,
     new_tok_offset: jax.Array,
+    bkv_sz_new: jax.Array,
     v_len: int,
     *,
     cfgs: configs.RpaConfigs,
+    local_k_end: jax.Array | None = None,
 ):
-    """O(N) Prefill Path: Roll the entire new tokens buffer into place."""
+    """O(N) Prefill Path: Roll the entire new tokens buffer into place.
+
+    Lanes past the last valid token (``bkv_sz_cache + bkv_sz_new``) are zeroed,
+    as in `_stitch_decode_lane`. Otherwise they would take whatever the roll
+    brings in from unfetched VMEM, which can be a raw page tail from an earlier
+    step: page bytes past a sequence's length are undefined (in the unified
+    hybrid pool they are recycled Mamba state, often an fp8 NaN pattern), and
+    score masking cannot neutralize them because 0 * NaN = NaN in the P @ V
+    matmul. The CACHE_ONLY pass hits this on every step, since it fetches no
+    new tokens and so every lane past the cache is rolled-in garbage.
+    """
     total_head_words = (
         cfgs.model.num_kv_heads * 2 * cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
     )
@@ -112,16 +131,22 @@ def _stitch_prefill_lane(
     words_per_sublane = total_head_words // num_sublanes
     vmem_u32_reshaped = vmem_u32_ref.reshape(words_per_sublane, num_sublanes, v_len)
 
-    roll_shift = (bkv_sz_cache - (cache_end + new_tok_offset)) % v_len
+    roll_shift = (
+        bkv_sz_cache - (cache_pages * cfgs.serve.page_size + new_tok_offset)
+    ) % v_len
     rolled_u32 = pltpu.roll(vmem_u32_reshaped[...], roll_shift, axis=2)
 
     lane_idx = jax.lax.broadcasted_iota(
         jnp.int32, rolled_u32[..., : cfgs.bkv_sz].shape, 2
     )
+    valid_end = bkv_sz_cache + bkv_sz_new
+    if local_k_end is not None:
+        valid_end = jnp.minimum(valid_end, local_k_end.astype(jnp.int32))
+    cache_end = jnp.minimum(bkv_sz_cache, valid_end)
     merged_cache_u32 = jax.lax.select(
-        lane_idx >= bkv_sz_cache,
-        rolled_u32[..., : cfgs.bkv_sz],
+        lane_idx < cache_end,
         vmem_u32_reshaped[..., : cfgs.bkv_sz],
+        jnp.where(lane_idx < valid_end, rolled_u32[..., : cfgs.bkv_sz], 0),
     )
 
     return merged_cache_u32
@@ -135,7 +160,7 @@ def store_new_kv_lane(
     cfgs: configs.RpaConfigs,
 ):
     """Stores the result of stitch_new_kv_lane back into memory."""
-    v_len = cfgs.kv_vmem_lanes
+    v_len = cfgs.bkv_sz + 2 * cfgs.serve.page_size
     vmem_u32_ref = vmem_ref.at[b_idx].bitcast(jnp.uint32)
 
     if cfgs.block.bq_sz <= pltpu.get_tpu_info().num_lanes:
@@ -143,8 +168,16 @@ def store_new_kv_lane(
         num_lanes = pltpu.get_tpu_info().num_lanes
         strided_vmem_ref = vmem_u32_ref.reshape(-1, num_lanes)
 
-        for col, merged_vreg in zip(cols, merged):
-            strided_vmem_ref[pl.ds(col, outer_dim, lanes_per_col)] = merged_vreg
+        k_rows = cfgs.serve.page_size // num_lanes
+        dst_page_start = (cols[0] // k_rows) * k_rows
+        # Overwrite all rows of the target page with clean tokens so trailing HBM NaN
+        # padding cannot poison systolic dot products.
+        for r_offset in range(k_rows + len(cols) - 1):
+            r = dst_page_start + r_offset
+            new_row = strided_vmem_ref[pl.ds(r, outer_dim, lanes_per_col)]
+            for col, merged_vreg in zip(cols, merged):
+                new_row = jax.lax.select(r < col, new_row, merged_vreg)
+            strided_vmem_ref[pl.ds(r, outer_dim, lanes_per_col)] = new_row
 
     else:
         merged_cache_u32 = stitch_result
@@ -170,16 +203,18 @@ def stitch_new_kv_lane(
     bkv_sz_frm_new: jax.Array,
     *,
     cfgs: configs.RpaConfigs,
+    local_k_end: jax.Array | None = None,
 ):
     """Fetches and computes stitched KV tokens (separated to avoid RAW hazards).
 
-    Expects vmem_ref shape: [batch, 2*kv, head_dim / packing, packing,
-    cfgs.kv_vmem_lanes]
+    Expects vmem_ref shape: [batch, 2*kv, head_dim / packing, packing, bkv_sz + 2
+    * page_size]
     """
     bkv_sz_cache = bkv_sz_frm_cache.astype(jnp.int32)
-    new_tok_offset = new_kv_len_start.astype(jnp.int32) % cfgs.kv_token_align
-    cache_end = utils.align_to(bkv_sz_cache, cfgs.kv_token_align)
+    new_tok_offset = new_kv_len_start.astype(jnp.int32) % cfgs.serve.page_size
+    cache_pages = pl.cdiv(bkv_sz_cache, cfgs.serve.page_size)
 
+    v_len = cfgs.bkv_sz + 2 * cfgs.serve.page_size
     vmem_u32_ref = vmem_ref.at[b_idx].bitcast(jnp.uint32)
 
     # Up to num_lanes new kv tokens span at most two 128-lane registers, so they
@@ -188,18 +223,20 @@ def stitch_new_kv_lane(
         return _stitch_decode_lane(
             vmem_u32_ref,
             bkv_sz_cache,
-            cache_end,
+            cache_pages,
             new_tok_offset,
             bkv_sz_frm_new.astype(jnp.int32),
-            cfgs.kv_vmem_lanes,
+            v_len,
             cfgs=cfgs,
         )
     else:
         return _stitch_prefill_lane(
             vmem_u32_ref,
             bkv_sz_cache,
-            cache_end,
+            cache_pages,
             new_tok_offset,
-            cfgs.kv_vmem_lanes,
+            bkv_sz_frm_new.astype(jnp.int32),
+            v_len,
             cfgs=cfgs,
+            local_k_end=local_k_end,
         )

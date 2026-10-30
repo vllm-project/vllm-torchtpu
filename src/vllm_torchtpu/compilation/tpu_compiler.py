@@ -230,6 +230,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     # Engine-side timing of the pipeline pushes; the workers' programs are
     # the same either way.
     "TPU_PP_LAZY_PUSH",
+    "TPU_TOKEN_BUCKET_HALF_STEPS",
     # Startup and host-side knobs: ports, an IPC secret, two raiden startup
     # checks, the raiden offload storage tier, offload retry and drain
     # limits, a weight-load sync cadence, a debug log switch, and the
@@ -249,12 +250,18 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TORCH_TPU_MP_RENDEZVOUS_PORT",
     "TPU_LOCAL_RANK_OFFSET",
     "TPU_SHARDED_LOAD_SYNC_EVERY",
+    "TPU_WORKER_NUMA_BIND",
     "VLLM_TORCHTPU_IPC_KEY",
     "VLLM_TPU_DEBUG_PCP_LAYOUT",
     "VLLM_TPU_OFFLOAD_SAVE_RETRIES",
     "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S",
-    # Scheduler prefix-cache hit length only.
+    # Scheduler prefix-cache hit length / retention only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP",
+    "TPU_HYBRID_RETENTION_MAX_CONVS",
+    "TPU_HYBRID_RETENTION_MAX_PINNED_BLOCKS",
+    "TPU_HYBRID_RETENTION_SMART_FORK",
+    "TPU_HYBRID_RETENTION_SAFE_TAIL_OFFSET",
+    "TPU_RAIDEN_INLINE_LOAD_MAX_CHUNKS",
     "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
     # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
@@ -262,6 +269,20 @@ _TPU_COMPILE_ENV_IGNORED = {
     # backbone graph, and the KV cap reaches the hash through num_gpu_blocks.
     "VLLM_TPU_STATIC_POOLER",
     "VLLM_TPU_POOLING_KV_CACHE_TOKENS",
+    # Host-side PrefixAwareScheduler SRPF and cold-prefill chunk capping knobs.
+    "TPU_SCHED_COLD_CHUNK_CAP",
+    "TPU_SCHED_COLD_MIN_DECODERS",
+    "TPU_SCHED_COLD_THRESHOLD",
+    "TPU_SCHED_SRPF_RUNNING",
+    "TPU_SCHED_STEP_TOTAL_CAP",
+    "TPU_SCHED_WARM_STREAK",
+    "TPU_SCHED_WARM_MIN_DECODERS",
+    "TPU_SCHED_MK_MAX_RUNNING",
+    "TPU_SCHED_SKIP_MIDBLOCK_ALIGN_STOP",
+    "TPU_EVICT_WEIGHTS_PAGE_CACHE",
+    "TPU_OFFLOAD_MIN_HBM_USAGE",
+    "TPU_HYBRID_RETENTION_KEEP_PRIOR_TURNS",
+    "TPU_MTP_STEP0_POST_ATTN_GATHER",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
@@ -280,6 +301,12 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/adapter/cp_attention.py",
     "vllm_torchtpu/layers/adapter/custom_ops",
     "vllm_torchtpu/layers/adapter/fused_moe.py",
+    # Small fused-kernel bridges and the batched RPA decode settings, behind
+    # torch custom-op boundaries.
+    "vllm_torchtpu/layers/adapter/batched_rpa_decode.py",
+    "vllm_torchtpu/layers/adapter/fused_qk_norm_rope.py",
+    "vllm_torchtpu/layers/adapter/gated_norm_quant_op.py",
+    "vllm_torchtpu/layers/adapter/small_all_reduce_op.py",
     # The fused EP MoE op and the helper that registers it. Both sit behind a
     # torch custom-op boundary Dynamo cannot see through, and the kernel they
     # export is chosen from their source, so an edit here has to invalidate
@@ -308,6 +335,11 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # K3 custom-op registration, sharding, and Attention Residual bridges.
     "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
+    "vllm_torchtpu/models/vllm/qwen3_next_patch.py",
+    # Registers the pallas::*_fused_max jax ops (behind a torch custom-op
+    # boundary) that get_top_tokens runs inside the AOT-cached fused MTP
+    # draft loop (spec_decode/mtp_fused_loop.py).
+    "vllm_torchtpu/runner/greedy_top_tokens.py",
 )
 
 # vLLM-Omni diffusion code, dropped from the hashed set above. Diffusion
@@ -505,6 +537,24 @@ def _single_size(compile_range: Range) -> int | None:
     return compile_range.start if compile_range.is_single_size() else None
 
 
+def _inline_int_placeholders(graph: fx.GraphModule, example_inputs: list[Any]) -> None:
+    """Bake a single-size compile's concrete ints into `graph` in place.
+
+    aot_autograd turns every int input back into a SymInt while a ShapeEnv is
+    live, so size arithmetic on the token count (`s // tp * tp` from the
+    sequence-parallel chunk and all-gather) reaches `torch.empty` symbolic and
+    fx_to_mlir rejects it. The placeholders stay, so the calling convention
+    and graph_signature are unchanged; only their uses see the constant.
+    """
+    inlined = False
+    for node, value in zip(shape_variants._placeholder_nodes(graph), example_inputs):
+        if type(value) is int and node.users:
+            node.replace_all_uses_with(value)
+            inlined = True
+    if inlined:
+        graph.recompile()
+
+
 class TpuCompilerAdaptor(CompilerInterface):
     """CompilerInterface implementation for TPU.
 
@@ -518,6 +568,15 @@ class TpuCompilerAdaptor(CompilerInterface):
     def __init__(self):
         self.cache_dir: str | None = None
         self._disable_cache = False
+        if envs.VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP:
+            try:
+                from vllm_torchtpu.core.eagle_block_drop import (
+                    patch_offload_without_eagle_groups,
+                )
+
+                patch_offload_without_eagle_groups()
+            except Exception:  # noqa: S110
+                pass
 
     def initialize_cache(
         self, cache_dir: str, disable_cache: bool = False, prefix: str = ""
@@ -812,6 +871,8 @@ class TpuCompilerAdaptor(CompilerInterface):
         # and vLLM keeps its own reference to `graph`. Only the output node
         # moves, so the placeholder signature is unaffected.
         graph = copy.deepcopy(graph)
+        if size is not None:
+            _inline_int_placeholders(graph, example_inputs)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
         caching = (
@@ -929,9 +990,12 @@ class TpuCompilerAdaptor(CompilerInterface):
 
         logger.info("[TpuCompilerAdaptor] Loading compiled artifact from %s", path)
 
-        # Same deepcopy + output-tuple rewrite as `compile`, so the graph the
-        # artifact is checked against is shaped the way it was when saved.
+        # Same deepcopy, int inlining and output-tuple rewrite as `compile`, so
+        # the graph the artifact is checked against is shaped the way it was
+        # when saved, and the fallback compile below sees static sizes too.
         graph = copy.deepcopy(graph)
+        if size is not None:
+            _inline_int_placeholders(graph, example_inputs)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
         compiled_fn = self._replay(path, graph, was_wrapped)

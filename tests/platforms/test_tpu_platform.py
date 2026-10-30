@@ -1448,3 +1448,61 @@ def test_tpu_platform_accelerator_methods(monkeypatch):
 
     TpuPlatform.set_stream(fake_stream)
     assert calls[-1] == ("set_stream", fake_stream)
+
+
+def test_check_and_update_config_auto_stream_interval(monkeypatch):
+    """Default stream_interval=1 upgrades to TPU_STREAM_INTERVAL (default 50)
+    while preserving explicit CLI overrides."""
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    def _make_cfg(stream_interval: int):
+        vllm_config = MagicMock()
+        vllm_config.additional_config = {}
+        vllm_config.model_config = MagicMock()
+        vllm_config.model_config.dtype = torch.bfloat16
+        vllm_config.model_config.architectures = []
+        vllm_config.model_config.is_hybrid = False
+        vllm_config.model_config.max_model_len = 4096
+        vllm_config.cache_config = SimpleNamespace(
+            enable_prefix_caching=False,
+            mamba_cache_mode="none",
+            kv_cache_memory_bytes=None,
+        )
+        vllm_config.compilation_config = MagicMock()
+        vllm_config.compilation_config.compile_sizes = [16, 32]
+        vllm_config.scheduler_config = SimpleNamespace(
+            max_num_batched_tokens=2048,
+            max_num_seqs=32,
+            async_scheduling=False,
+            scheduler_cls=None,
+            stream_interval=stream_interval,
+        )
+        vllm_config.speculative_config = None
+        vllm_config.kv_transfer_config = None
+        vllm_config.parallel_config = SimpleNamespace(
+            nnodes=1,
+            node_rank=0,
+            world_size=1,
+            world_size_across_dp=1,
+            data_parallel_size=1,
+            pipeline_parallel_size=1,
+            tensor_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            use_sequence_parallel_moe=False,
+        )
+        return vllm_config
+
+    monkeypatch.delenv("TPU_STREAM_INTERVAL", raising=False)
+    cfg_default = _make_cfg(1)
+    TpuPlatform.check_and_update_config(cfg_default)
+    assert cfg_default.scheduler_config.stream_interval == 1
+
+    monkeypatch.setenv("TPU_STREAM_INTERVAL", "25")
+    cfg_env = _make_cfg(1)
+    TpuPlatform.check_and_update_config(cfg_env)
+    assert cfg_env.scheduler_config.stream_interval == 25
+
+    cfg_explicit = _make_cfg(10)
+    TpuPlatform.check_and_update_config(cfg_explicit)
+    assert cfg_explicit.scheduler_config.stream_interval == 10

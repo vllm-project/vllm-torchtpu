@@ -76,6 +76,8 @@ def attention_block_table_width(
         "mamba_slot_read_offsets",
         "mamba_ckpt_indices",
         "mamba_request_distribution",
+        "mamba_seg_bounds",
+        "mamba_seg_state_indices",
     ],
     meta_fields=[
         "sequence_layout_kind",
@@ -127,6 +129,12 @@ class AttentionMetadata:
     # the first two groups. None unless the model has mamba layers and spec
     # decoding is enabled.
     mamba_request_distribution: jax.Array | torch.Tensor | None = None
+    # Single-step warm prefill (TPU_SCHED_SINGLE_STEP_PREFILL) only, else
+    # None: `(num_reqs, 2)` int32 in-chunk state checkpoint offsets (query
+    # offsets, 0 = none) and this group's `(num_reqs, 2)` destination blocks.
+    # See `fused_conv1d_gdn(seg_bounds=..., seg_state_indices=...)`.
+    mamba_seg_bounds: jax.Array | torch.Tensor | None = None
+    mamba_seg_state_indices: jax.Array | torch.Tensor | None = None
     sequence_layout_kind: str = SequenceLayoutKind.ALL.value
     sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
     sequence_layout_version: int = 1
@@ -198,6 +206,15 @@ class AttentionMetadataBuilderContext:
     # every active request's state block column `(seq_len - 1) // block_size` is
     # invariant across `[seq_lens_hi - max_rejected, seq_lens_hi]`.
     mamba_seq_lens_bounds: tuple[Any, int] | None = None
+    # Single-step warm prefill: emit `mamba_seg_*` on the mamba groups. Set
+    # only by the target-model paths (real and dummy runs), so drafter
+    # metadata keeps its signature. `mamba_seg_packed` is the chunk's one
+    # `(1 + num_mamba_groups, num_reqs, 2)` int32 device tensor: row 0 the
+    # shared `seg_bounds`, row `1 + slot` each mamba group's
+    # `seg_state_indices` (see `TPUModelRunner._mamba_seg_slot`); None ->
+    # the builder uses a cached all-zero tensor of the same layout (no cuts).
+    mamba_seg_enabled: bool = False
+    mamba_seg_packed: torch.Tensor | None = None
 
 
 def _staged_walk_products(
@@ -559,6 +576,16 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             mamba_slot_read_offsets = None
             mamba_request_distribution = None
 
+        mamba_seg_bounds = mamba_seg_state_indices = None
+        if (
+            self.is_mamba_group
+            and getattr(ctx, "mamba_seg_enabled", False)
+            and mamba_state_indices is not None
+        ):
+            mamba_seg_bounds, mamba_seg_state_indices = _seg_fields(
+                runner, ctx, self.kv_cache_group_id, mamba_state_indices.shape[0]
+            )
+
         return AttentionMetadata(
             input_positions=input_positions,
             block_tables=block_tables_dev,
@@ -569,10 +596,49 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             mamba_slot_read_offsets=mamba_slot_read_offsets,
             mamba_ckpt_indices=mamba_ckpt_indices,
             mamba_request_distribution=mamba_request_distribution,
+            mamba_seg_bounds=mamba_seg_bounds,
+            mamba_seg_state_indices=mamba_seg_state_indices,
             sequence_layout_kind=ctx.sequence_layout_descriptor.kind.value,
             sequence_layout_protocol=(ctx.sequence_layout_descriptor.protocol),
             sequence_layout_version=ctx.sequence_layout_descriptor.version,
         )
+
+
+def _seg_fields(
+    runner: Any, ctx: AttentionMetadataBuilderContext, gid: int, num_reqs: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(`mamba_seg_bounds`, `mamba_seg_state_indices`) for mamba group `gid`.
+
+    Both are fixed slices of ONE packed device tensor, on cut-free steps as
+    on steps with cuts, never separate (possibly equal-valued) tensors:
+    torch-tpu's lazy tracing CSEs equal device tensors and dynamo then folds
+    them into a single graph input (see
+    TPUModelRunner._combined_request_distribution_cpu). A program traced on
+    a cut-free step, where every seg tensor is zeros, would then feed the
+    seg_bounds query offsets to the GDN kernel as checkpoint block ids on
+    steps with cuts, overwriting other requests' blocks.
+    """
+    packed = ctx.mamba_seg_packed
+    if packed is None:
+        packed = _seg_zeros(runner, num_reqs)
+    assert tuple(packed.shape) == (1 + len(runner._mamba_seg_gids()), num_reqs, 2), (
+        tuple(packed.shape),
+        num_reqs,
+    )
+    return packed[0], packed[1 + runner._mamba_seg_slot(gid)]
+
+
+def _seg_zeros(runner: Any, num_reqs: int) -> torch.Tensor:
+    """Cached device all-zero `mamba_seg_packed` (no in-chunk checkpoints):
+    `(1 + num_mamba_groups, num_reqs, 2)` int32, the same layout real cuts
+    use so both trace the same program."""
+    cache = runner.__dict__.setdefault("_mamba_seg_zeros", {})
+    zeros = cache.get(num_reqs)
+    if zeros is None:
+        rows = 1 + len(runner._mamba_seg_gids())
+        zeros = torch.zeros((rows, num_reqs, 2), dtype=torch.int32).to(runner.device)
+        cache[num_reqs] = zeros
+    return zeros
 
 
 def stage_block_table_uploads(

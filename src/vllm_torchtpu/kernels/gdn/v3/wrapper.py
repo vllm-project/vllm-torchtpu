@@ -361,6 +361,8 @@ def fused_conv1d_gdn(
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
     mixed_tile_size: int = 64,
+    seg_bounds: jax.Array | None = None,  # [num_seqs, 2]
+    seg_state_indices: jax.Array | None = None,  # [num_seqs, 2]
 ) -> tuple[jax.Array | tuple[jax.Array, jax.Array], jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
@@ -504,6 +506,11 @@ def fused_conv1d_gdn(
         # Iniitalize the ckpt_indices to default value.
         spec_offset = jnp.arange(num_spec_tokens + 1).reshape(1, -1)
         ckpt_indices = state_indices.reshape(-1, 1) + spec_offset
+    ckpt_indices = ckpt_indices.astype(jnp.int32)
+    if seg_bounds is not None:
+        assert seg_state_indices is not None
+        assert seg_bounds.shape == (num_seqs, 2), seg_bounds.shape
+        assert seg_state_indices.shape == (num_seqs, 2), seg_state_indices.shape
 
     act_in_dtype = qkv.dtype
     assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
@@ -664,16 +671,30 @@ def fused_conv1d_gdn(
                 ckpt_indices=ckpt_indices,
             )
         else:
-            metadata_obj = metadata.compute_per_seq_metadata(
-                cfg=cfg,
-                seq_lens=seq_lens,
-                query_start_loc=query_start_loc,
-                state_indices=state_indices,
-                read_offsets=read_offsets,
-                start_seq=distribution[0],
-                end_seq=distribution[-1],
-                ckpt_indices=ckpt_indices,
-            )
+            if seg_bounds is not None:
+                metadata_obj = metadata.compute_per_seq_segment_metadata(
+                    cfg=cfg,
+                    seq_lens=seq_lens,
+                    query_start_loc=query_start_loc,
+                    state_indices=state_indices,
+                    read_offsets=read_offsets,
+                    start_seq=distribution[0],
+                    end_seq=distribution[-1],
+                    seg_bounds=seg_bounds,
+                    seg_state_indices=seg_state_indices,
+                    ckpt_indices=ckpt_indices,
+                )
+            else:
+                metadata_obj = metadata.compute_per_seq_metadata(
+                    cfg=cfg,
+                    seq_lens=seq_lens,
+                    query_start_loc=query_start_loc,
+                    state_indices=state_indices,
+                    read_offsets=read_offsets,
+                    start_seq=distribution[0],
+                    end_seq=distribution[-1],
+                    ckpt_indices=ckpt_indices,
+                )
 
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
         state_spec = jax.tree.map(lambda _: hbm_spec, in_states)
