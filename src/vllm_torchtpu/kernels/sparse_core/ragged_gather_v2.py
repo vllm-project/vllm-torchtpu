@@ -388,6 +388,16 @@ def quantize_token_quads(x: jax.Array, interpret: bool = False) -> jax.Array:
     )(x)
 
 
+def _balanced_range(n, part, num_parts):
+    """Part ``part``'s [begin, begin + count) of ``n`` items split evenly over
+    ``num_parts`` parts (counts differ by at most one)."""
+    base = n // num_parts
+    extra = n - base * num_parts
+    count = base + (part < extra).astype(jnp.int32)
+    begin = part * base + jnp.minimum(part, extra)
+    return begin, count
+
+
 def token_quads_kernel(
     start_ref: jax.Ref,
     end_ref: jax.Ref,
@@ -404,24 +414,24 @@ def token_quads_kernel(
     *,
     core_axis_name: str,
     subcore_axis_name: str,
-    num_row_subchunks: int,
     token_cols: int,
 ):
     """Gathers token-quad rows into row quads, the rows `main_kernel_v2` would.
 
-    Each 16-row subchunk DMAs every row's own token span and its quad's
-    trailer; two slots overlap the next subchunk's DMAs and the last one's
-    write with this one's byte transposes.
+    The 16-row chunks covering [start, end) are split evenly over the
+    subcores, and each subcore runs its chunks as one flat pipeline: a chunk
+    DMAs every row's own token span and its quad's trailer, and two slots
+    overlap the next chunk's DMAs and the last one's write with this one's
+    byte transposes.
     """
     sc_info = pltpu.get_tpu_info().sparse_core
     assert sc_info is not None
     lanes = sc_info.num_lanes
-    num_cores = jax.lax.axis_size((core_axis_name, subcore_axis_name))
-    row_chunk_size = lanes * num_row_subchunks
-    block_size = row_chunk_size * num_cores
     token_words = token_cols // 4
     trailer_cols = in_hbm_ref.shape[-1] - token_cols
     out_rows = lanes // 4
+    # The first chunk's indices get their own semaphore: a wait on one shared
+    # with the rest could be satisfied by the rest's bytes.
     idx_sem, in_sem, out_sem = (sem_ref.at[pl.ds(2 * i, 2)] for i in range(3))
 
     copy_start = pltpu.make_async_copy(start_ref, start_vmem_ref.at[:1], in_sem.at[0])
@@ -433,28 +443,32 @@ def token_quads_kernel(
     start = start_vmem_ref[...][0]
     end = end_vmem_ref[...][0]
 
-    block_start = start // block_size
-    num_blocks = jnp.where(end <= start, 0, pl.cdiv(end, block_size) - block_start)
-    num_subchunks = num_blocks * num_row_subchunks
-    core_index = lax.axis_index((core_axis_name, subcore_axis_name))
+    first_chunk = start // lanes
+    num_chunks = jnp.where(end > start, pl.cdiv(end, lanes) - first_chunk, 0)
+    # Order the parts so the chunks left over alternate between SparseCores.
+    num_cores = jax.lax.axis_size(core_axis_name)
+    part = lax.axis_index(subcore_axis_name) * num_cores + lax.axis_index(
+        core_axis_name
+    )
+    part_begin, my_chunks = _balanced_range(
+        num_chunks, part, jax.lax.axis_size((core_axis_name, subcore_axis_name))
+    )
+    chunk0 = first_chunk + part_begin
 
-    def first_row(g):
-        block = block_start + g // num_row_subchunks
-        subchunk = g % num_row_subchunks
-        return (block * num_cores + core_index) * row_chunk_size + subchunk * lanes
-
-    def idx_copy(g, slot):
+    def idx_copy(first, count):
         return pltpu.make_async_copy(
-            indices_hbm_ref.at[pl.ds(first_row(g), lanes)],
-            idx_vmem_ref.at[pl.ds(slot * lanes, lanes)],
-            idx_sem.at[slot],
+            indices_hbm_ref.at[
+                pl.ds(pl.multiple_of((chunk0 + first) * lanes, lanes), count * lanes)
+            ],
+            idx_vmem_ref.at[pl.ds(first * lanes, count * lanes)],
+            idx_sem.at[min(first, 1)],
         )
 
-    def slot_indices(slot: int):
-        return idx_vmem_ref[pl.ds(slot * lanes, lanes)]
+    def chunk_indices(g):
+        return idx_vmem_ref[pl.ds(pl.multiple_of(g * lanes, lanes), lanes)]
 
-    def start_gathers(slot: int):
-        idx = slot_indices(slot)
+    def start_gathers(g, slot: int):
+        idx = chunk_indices(g)
         for r in range(lanes):
             row = idx[r]
             col = jnp.bitwise_and(row, 3) * token_words
@@ -487,12 +501,12 @@ def token_quads_kernel(
         return pltpu.make_async_copy(
             out_vmem_ref.at[pl.ds(slot * out_rows, out_rows)],
             out_hbm_ref.at[
-                pl.ds(pl.multiple_of(first_row(g) // 4, out_rows), out_rows)
+                pl.ds(pl.multiple_of((chunk0 + g) * out_rows, out_rows), out_rows)
             ],
             out_sem.at[slot],
         )
 
-    def transpose(slot: int):
+    def transpose(g, slot: int):
         in_row = slot * lanes
         out_row = slot * out_rows
 
@@ -517,7 +531,7 @@ def token_quads_kernel(
                         out_vmem_ref[out_row + m, pl.ds(col, lanes)] = word
 
         # The trailer is row quads: pick each row's byte.
-        shifts = jnp.left_shift(jnp.bitwise_and(slot_indices(slot), 3), 3)
+        shifts = jnp.left_shift(jnp.bitwise_and(chunk_indices(g), 3), 3)
 
         @plsc.parallel_loop(0, trailer_cols, step=lanes)
         def _(c):
@@ -533,10 +547,9 @@ def token_quads_kernel(
                 out_vmem_ref[out_row + m, pl.ds(token_cols + c, lanes)] = packed
 
     def step(g, slot):
-        @pl.when(g + 1 < num_subchunks)
+        @pl.when(g + 1 < my_chunks)
         def _():
-            idx_copy(g + 1, 1 - slot).wait()
-            start_gathers(1 - slot)
+            start_gathers(g + 1, 1 - slot)
 
         wait_gathers(slot)
 
@@ -544,37 +557,36 @@ def token_quads_kernel(
         def _():
             out_copy(g - 2, slot).wait()
 
-        transpose(slot)
+        transpose(g, slot)
         out_copy(g, slot).start()
 
-        # The slot's indices are read for the last time above.
-        @pl.when(g + 2 < num_subchunks)
-        def _():
-            idx_copy(g + 2, slot).start()
-
-    @pl.when(num_subchunks > 0)
+    @pl.when(my_chunks > 0)
     def _():
-        idx_copy(0, 0).start()
-        idx_copy(0, 0).wait()
-        start_gathers(0)
+        # The first chunk's indices alone gate the first gathers.
+        idx_copy(0, 1).start()
+        # A static single-chunk index buffer has no rest to load.
+        has_rest = idx_vmem_ref.shape[0] > lanes
+        rest = functools.partial(idx_copy, 1, my_chunks - 1)
+        if has_rest:
+            pl.when(my_chunks > 1)(lambda: rest().start())
+        idx_copy(0, 1).wait()
+        start_gathers(0, 0)
+        if has_rest:
+            pl.when(my_chunks > 1)(lambda: rest().wait())
 
-        @pl.when(num_subchunks > 1)
-        def _():
-            idx_copy(1, 1).start()
-
-        # Subchunk g runs in slot g % 2, unrolled so that every slot offset is
+        # Chunk g runs in slot g % 2, unrolled so that every slot offset is
         # static.
-        @pl.loop(0, pl.cdiv(num_subchunks, 2))
+        @pl.loop(0, pl.cdiv(my_chunks, 2))
         def _(i):
             step(2 * i, 0)
 
-            @pl.when(2 * i + 1 < num_subchunks)
+            @pl.when(2 * i + 1 < my_chunks)
             def _():
                 step(2 * i + 1, 1)
 
         out_copy(0, 0).wait()
 
-        @pl.when(num_subchunks > 1)
+        @pl.when(my_chunks > 1)
         def _():
             out_copy(0, 1).wait()
 
@@ -663,7 +675,6 @@ def ragged_gather_v2(
 
     out_pad_size = ((out_size + block_size - 1) // block_size) * block_size - out_size
     out_packing = packing if packed_out else 1
-    indices = jnp.pad(indices, ((0, out_pad_size)))
 
     vector_mesh = plsc.VectorSubcoreMesh(
         num_cores=sc_info.num_cores,
@@ -678,22 +689,24 @@ def ragged_gather_v2(
     )
     if token_cols is not None:
         slot_rows = 2 * num_simd_lanes
+        # Whole 16-row chunks; a subcore's chunk range is at most this many.
+        chunk_pad_size = -out_size % num_simd_lanes
+        max_chunks = pl.cdiv((out_size + chunk_pad_size) // num_simd_lanes, num_cores)
         return core_map_helper.kernel(
             functools.partial(
                 token_quads_kernel,
                 core_axis_name=vector_mesh.core_axis_name,
                 subcore_axis_name=vector_mesh.subcore_axis_name,
-                num_row_subchunks=num_row_subchunks,
                 token_cols=token_cols,
             ),
             out_type=jax.ShapeDtypeStruct(
-                ((out_size + out_pad_size) // 4, hidden_size), jnp.int32
+                ((out_size + chunk_pad_size) // 4, hidden_size), jnp.int32
             ),
             compiler_params=compiler_params,
             scratch_types=[
                 pltpu.VMEM((16,), jnp.int32),
                 pltpu.VMEM((16,), jnp.int32),
-                pltpu.VMEM((slot_rows,), jnp.int32),
+                pltpu.VMEM((max_chunks * num_simd_lanes,), jnp.int32),
                 pltpu.VMEM((slot_rows, token_cols // 4), jnp.int32),
                 pltpu.VMEM((slot_rows, hidden_size - token_cols), jnp.int32),
                 pltpu.VMEM((slot_rows // 4, hidden_size), jnp.int32),
@@ -701,7 +714,8 @@ def ragged_gather_v2(
             ],
             mesh=vector_mesh,
             name="sc_ragged_gather_v2",
-        )(start, end, x, indices)[: out_size // 4]
+        )(start, end, x, jnp.pad(indices, (0, chunk_pad_size)))[: out_size // 4]
+    indices = jnp.pad(indices, ((0, out_pad_size)))
     return core_map_helper.kernel(
         functools.partial(
             main_kernel_v2,
