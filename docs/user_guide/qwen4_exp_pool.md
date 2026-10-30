@@ -13,7 +13,3 @@ reserve, not a measured bound on compiler or device peak memory.
 Physical page extents come from the complete main/index/state layout. They are
 not a model-wide fixed page size, and revalidating the same configuration must
 preserve the derived geometry. BF16 and FP8 carriers use their dtype packing.
-
-Host PLE capacity checks cap Linux `MemAvailable` by remaining cgroup-v2 memory
-when a finite limit is exposed. The estimate includes a loader allowance;
-it is not a guarantee against every concurrent host allocation.

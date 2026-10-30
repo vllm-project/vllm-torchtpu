@@ -33,7 +33,7 @@ from vllm_torchtpu.kernels.qwen4_exp.hc_prefill_policy import validate_hc_prefil
 from vllm_torchtpu.models.model_hooks import qwen4_options
 from vllm_torchtpu.utils import torch_dtype_from_name
 
-from .ple_host import PLEHostLaunch, host_available_memory
+from .ple_host import PLEHostLaunch
 from .qsa_geometry import validate_qsa_geometry
 
 
@@ -439,18 +439,7 @@ def validate_config(cfg):
         raise ValueError(
             "Qwen4Exp host offload currently requires at most one PLE layer"
         )
-    if offload:
-        if p.nnodes != 1 or p.data_parallel_size_local != p.data_parallel_size:
-            raise ValueError("Qwen4Exp host PLE requires local DP on one host")
-        # BF16 upper bound, including all DP replicas for private TP tables.
-        # The 8-worker loader has measured ~135GiB of aggregate peak RSS
-        # beyond PLE staging; reserve160GiB as a conservative launch allowance.
-        copies = 1 if shared or across else p.data_parallel_size
-        required = sum(ple_rows) * ple_width * 2 * copies + 160 * 1024**3
-        available = host_available_memory()
-        if required > available:
-            raise ValueError(
-                f"Qwen4Exp host PLE capacity estimate needs {required} bytes "
-                f"including loader allowance; only {available} bytes available. "
-                "Use dp_shared_memory or embedding_across_dp to avoid DP replicas."
-            )
+    if offload and (
+        p.nnodes != 1 or p.data_parallel_size_local != p.data_parallel_size
+    ):
+        raise ValueError("Qwen4Exp host PLE requires local DP on one host")

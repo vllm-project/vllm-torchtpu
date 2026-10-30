@@ -278,10 +278,6 @@ def test_pd_requires_model_owned_fp8_and_geometric_parallelism(
             validate_config(cfg)
         setattr(target, field, original)
 
-    monkeypatch.setattr(
-        "vllm_torchtpu.models.vllm.qwen4_exp.config.host_available_memory",
-        lambda: 1 << 60,
-    )
     for offload, shared, across in [
         (False, False, True),
         (True, False, True),
