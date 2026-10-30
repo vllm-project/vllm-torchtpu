@@ -1,0 +1,37 @@
+{
+  "cells": {
+    "7f7b02900fa6": {
+      "fields": {
+        "async-scheduling": "true",
+        "attention-backend": "CUSTOM",
+        "block-size": "256",
+        "concurrency": "64",
+        "dp": "1",
+        "enable-expert-parallel": "true",
+        "ep": "true",
+        "gpu-memory-utilization": "0.92",
+        "isl_osl": "65536:512",
+        "kv-cache-dtype": "fp8",
+        "max-model-len": "262144",
+        "max-num-batched-tokens": "16384",
+        "max-num-seqs": "64",
+        "model": "Qwen/Qwen3.5-397B-A17B-FP8",
+        "num_prompts": "128",
+        "prefill-schedule-interval": "1",
+        "quantization": "fp8",
+        "tp": "8"
+      },
+      "members": [
+        {
+          "config": "qwen3.5-397b-fp8-tp8-dp1-ep-agentx",
+          "entries": 1,
+          "serve_cmd": "vllm serve Qwen/Qwen3.5-397B-A17B-FP8 --tensor-parallel-size=8 --data-parallel-size=1 --max-model-len=262144 --max-num-batched-tokens=16384 --max-num-seqs=64 --port 8000 --async-scheduling --enable-prefix-caching --gpu-memory-utilization=0.92 --kv-cache-dtype=fp8 --enable-expert-parallel --quantization fp8 --attention-backend CUSTOM --prefill-schedule-interval=1 --language-model-only --block-size 256 --limit-mm-per-prompt {\"image\":0,\"video\":0} --default-chat-template-kwargs {\"enable_thinking\":false} --tool-call-parser=qwen3_coder --reasoning-parser=qwen3 --mamba-cache-mode align --trust-remote-code --enable-prompt-tokens-details --kv-cache-memory-bytes 40400000000 --scheduler-cls vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler",
+          "serve_fingerprint": "011293b70f7c",
+          "target": "vllm-torchtpu-qwen35-agentx"
+        }
+      ]
+    }
+  },
+  "note": "Derived, MOSTLY regenerable, and NOT authoritative over experiments.jsonl. The ledger is append-only: back-filling a cell key by rewriting 200 recorded lines would destroy the property that makes the record worth having. This map is the side table instead \u2014 review it in a diff, regenerate it with `perfkit results backfill-cells`, and read `unmapped` as data rather than as an error. A member marked `carried_from_map` is the part that is NOT regenerable: its target no longer resolves, so the row is the only surviving statement of which cell those entries belong to and the regeneration keeps it rather than recomputing it away.",
+  "schema": 1
+}
