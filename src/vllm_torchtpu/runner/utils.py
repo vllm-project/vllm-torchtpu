@@ -53,12 +53,19 @@ PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY = (
 # A list of phase names (e.g. ["decode_only", "prefill_heavy"]): only these.
 PHASED_PROFILER_ONLY_PHASES_KEY = "phased_profiler_only_phases"
 # A list of request counts: one capture per phase at each, keyed by the
-# engine's own num_reqs (per DP engine, not the global concurrency).
+# engine's own num_reqs (per DP engine, not the global concurrency). Under DP +
+# EP lockstep, by the largest num_reqs of any engine in the step (see
+# encode_dp_profile_stats).
 PHASED_PROFILER_TARGET_CONCURRENCY_KEY = "phased_profiler_target_concurrency"
 # Key captures on (phase, num_reqs) and name them <phase>_concur_<num_reqs>.
 # Implied by a target concurrency. On its own it is unbounded: every request
 # count a ramp passes through gets its own capture.
 PHASED_PROFILER_TRACK_CONCURRENCY_KEY = "phased_profiler_track_concurrency"
+# A list of slice-global worker ranks that take the captures; default every
+# rank. Under DP + EP every rank runs each step in lockstep, so one rank's
+# trace shows the whole step, and sparing the others spares the slice their
+# capture start/stop pauses, which every rank waits out in the next collective.
+PHASED_PROFILER_RANKS_KEY = "phased_profiler_ranks"
 
 # Diagnostics-only knobs: they steer profiling and never change the compiled
 # graph, so `_patch_vllm_config_hash_ignore_diagnostics` keeps them out of the
@@ -70,6 +77,7 @@ HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset(
         PHASED_PROFILER_ONLY_PHASES_KEY,
         PHASED_PROFILER_TARGET_CONCURRENCY_KEY,
         PHASED_PROFILER_TRACK_CONCURRENCY_KEY,
+        PHASED_PROFILER_RANKS_KEY,
     }
 )
 
@@ -93,10 +101,35 @@ class InferencePhase(Enum):
     DECODE_ONLY = 5
 
 
+def determine_dp_phase(
+    prefill_permille_min: int, prefill_permille_max: int
+) -> InferencePhase:
+    """The phase of a DP-lockstep step from the busy ranks' prefill shares (in
+    1/1000): a phase holds only if it holds on every busy rank."""
+    if prefill_permille_max == 0:
+        return InferencePhase.DECODE_ONLY
+    if prefill_permille_min == 1000:
+        return InferencePhase.PREFILL_ONLY
+    if prefill_permille_min >= round(PREFILL_HEAVY_RATIO_THRESHOLD * 1000):
+        return InferencePhase.PREFILL_HEAVY
+    if prefill_permille_max <= round(DECODE_HEAVY_RATIO_THRESHOLD * 1000):
+        return InferencePhase.DECODE_HEAVY
+    if prefill_permille_min >= round(
+        BALANCED_RATIO_THRESHOLD[0] * 1000
+    ) and prefill_permille_max <= round(BALANCED_RATIO_THRESHOLD[1] * 1000):
+        return InferencePhase.BALANCED
+    return InferencePhase.AMBIGUOUS
+
+
 def determine_phase_from_batch_composition_stats(
     batch_composition_stats: dict[str, Any],
 ) -> InferencePhase:
     """Determines the inference phase based on the batch composition stats."""
+    if "dp_prefill_permille_min" in batch_composition_stats:
+        return determine_dp_phase(
+            batch_composition_stats["dp_prefill_permille_min"],
+            batch_composition_stats["dp_prefill_permille_max"],
+        )
     num_prefill_tokens = batch_composition_stats["num_prefill_tokens"]
     total_num_scheduled_tokens = batch_composition_stats["total_num_scheduled_tokens"]
     prefill_ratio_for_batch = num_prefill_tokens / total_num_scheduled_tokens
@@ -181,6 +214,90 @@ def get_batch_composition_stats(
     return stats
 
 
+# Under DP + EP lockstep every rank runs each step padded to the DP-wide token
+# bucket, and its MoE layers carry every rank's tokens; a rank's own batch says
+# little about the step it runs. TPUModelRunner._dp_coordinated_step therefore
+# all-reduces these fields with the step's token count, and the phased profiler
+# classifies the step from the result, identically on every rank. All fields
+# reduce with MAX; minima travel negated.
+DP_PROFILE_STATS_LEN = 7
+_DP_IDLE_MIN_KV_LEN = 1 << 62
+
+
+def _prefill_permille(num_prefill_tokens: int, total_num_tokens: int) -> int:
+    """A batch's prefill share in 1/1000, exact at 0 and 1."""
+    if num_prefill_tokens <= 0:
+        return 0
+    if num_prefill_tokens >= total_num_tokens:
+        return 1000
+    return min(999, max(1, num_prefill_tokens * 1000 // total_num_tokens))
+
+
+def encode_dp_profile_stats(local_stats: dict | None, armed: bool) -> list[int]:
+    """This rank's part of the DP-wide batch stats.
+
+    `local_stats` is get_batch_composition_stats' result, or None on a rank
+    with no scheduled work, which contributes no tokens, no prefill and no KV
+    length. A rank whose profiler is not armed blocks every capture start for
+    the step: arming reaches the ranks at slightly different steps, and a
+    capture must start on the same step everywhere.
+    """
+    blocked = int(not armed)
+    if local_stats is None or local_stats["total_num_scheduled_tokens"] <= 0:
+        return [blocked, 0, 0, -1000, 0, 0, -_DP_IDLE_MIN_KV_LEN]
+    permille = _prefill_permille(
+        int(local_stats["num_prefill_tokens"]),
+        int(local_stats["total_num_scheduled_tokens"]),
+    )
+    num_reqs = int(local_stats["num_reqs"])
+    return [
+        blocked,
+        int(local_stats["num_prefill_tokens"]),
+        permille,
+        -permille,
+        num_reqs,
+        -num_reqs,
+        -int(local_stats["min_kv_len"]),
+    ]
+
+
+def decode_dp_profile_stats(values: Iterable[int]) -> dict[str, Any]:
+    """The element-wise MAX of every rank's encode_dp_profile_stats."""
+    blocked, prefill_max, permille_max, permille_min, reqs_max, reqs_min, kv_min = (
+        int(v) for v in values
+    )
+    kv_min = -kv_min
+    return {
+        "dp_trigger_blocked": bool(blocked),
+        "dp_num_prefill_tokens_max": prefill_max,
+        "dp_prefill_permille_max": permille_max,
+        "dp_prefill_permille_min": -permille_min,
+        "dp_num_reqs_max": reqs_max,
+        "dp_num_reqs_min": -reqs_min,
+        "dp_min_kv_len": 0 if kv_min >= _DP_IDLE_MIN_KV_LEN else kv_min,
+    }
+
+
+def merge_dp_profile_stats(local_stats: dict, dp_stats: dict) -> dict:
+    """The stats the profiler steps on under DP lockstep: the fields it
+    triggers on (phase, num_reqs, min_kv_len, token counts) are the slice's,
+    and the rank's own batch is kept under "local". Each captured step's stats
+    file records both."""
+    stats = {"batch_id": local_stats.get("batch_id"), **dp_stats}
+    stats.update(
+        {
+            "num_reqs": dp_stats["dp_num_reqs_max"],
+            "min_kv_len": dp_stats["dp_min_kv_len"],
+            "num_prefill_tokens": dp_stats["dp_num_prefill_tokens_max"],
+            "total_num_scheduled_tokens": dp_stats["dp_num_tokens_max"],
+            "padded_total_num_scheduled_tokens": dp_stats["dp_padded_num_tokens"],
+            "local": local_stats,
+        }
+    )
+    stats["phase"] = determine_phase_from_batch_composition_stats(stats).name
+    return stats
+
+
 class PhaseBasedProfiler:
     """Implements a phase-based profiler for PyTorch/XLA, profiling different
     inference phases.
@@ -200,6 +317,7 @@ class PhaseBasedProfiler:
         only_phases: Iterable[str] = (),
         target_concurrencies: Iterable[int] = (),
         track_concurrency: bool = False,
+        capture_ranks: Iterable[int] = (),
     ):
         self.profiling_n_steps_left: int = 0
         self.profile_dir_with_phase_suffix: str | None = None
@@ -251,6 +369,12 @@ class PhaseBasedProfiler:
         self.current_phase: str = ""
         self.worker_rank = worker_rank
         self.world_size = world_size
+        # Every rank still decides (and records what it has seen), so the ranks
+        # stay in agreement; only these ranks start the profiler.
+        self.capture_ranks: frozenset[int] = frozenset(int(r) for r in capture_ranks)
+        self.captures_here: bool = (
+            not self.capture_ranks or worker_rank in self.capture_ranks
+        )
         self.profile_context: Any | None = None
         self._canonical_dst_ts: str | None = None
 
@@ -282,6 +406,12 @@ class PhaseBasedProfiler:
                 "Will only profile at num_reqs %s.",
                 ", ".join(map(str, sorted(self.target_concurrencies))),
             )
+        if self.capture_ranks:
+            logger.info(
+                "Captures are taken on rank(s) %s%s.",
+                ", ".join(map(str, sorted(self.capture_ranks))),
+                "" if self.captures_here else f", not on this rank ({worker_rank})",
+            )
 
     def _write_batch_composition_stats_to_file_helper(
         self, batch_composition_stats: dict
@@ -308,6 +438,8 @@ class PhaseBasedProfiler:
 
     def _start_profiling(self, batch_composition_stats: dict) -> None:
         """Starts profiling if the current phase is unseen."""
+        if batch_composition_stats.get("dp_trigger_blocked"):
+            return
         current_determined_phase = determine_phase_from_batch_composition_stats(
             batch_composition_stats
         )
@@ -369,6 +501,15 @@ class PhaseBasedProfiler:
             if self.track_concurrency:
                 self.profiled_concurrencies.add((phase, concurrency))
                 self.current_phase += f"_concur_{concurrency}"
+            if not self.captures_here:
+                logger.info(
+                    "Phase %s reached; captured on rank(s) %s, not here.",
+                    self.current_phase,
+                    ", ".join(map(str, sorted(self.capture_ranks))),
+                )
+                self.current_phase = ""
+                self.profiling_n_steps_left = 0
+                break
 
             logger.info("Starting profiling for %s phase", self.current_phase)
             logger.info("Batch composition stats: %s", batch_composition_stats)

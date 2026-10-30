@@ -1143,6 +1143,7 @@ class TestStartStopPhasedProfiling:
                 "phased_profiler_prefill_only_kv_len_threshold": 4096,
                 "phased_profiler_only_phases": "decode_only, prefill_heavy",
                 "phased_profiler_target_concurrency": [93],
+                "phased_profiler_ranks": [0],
             },
             max_iterations=20,
             delay_iterations=3,
@@ -1173,6 +1174,7 @@ class TestStartStopPhasedProfiling:
             only_phases=["decode_only", "prefill_heavy"],
             target_concurrencies=[93],
             track_concurrency=False,
+            capture_ranks=[0],
         )
         assert runner.phase_based_profiler is mock_profiler_cls.return_value
 
@@ -3712,3 +3714,88 @@ class TestLogitsAtDpVocabRows:
             TPUModelRunner._logits_at_dp_vocab_rows(
                 runner, MagicMock(), torch.zeros(9, 2), torch.arange(5)
             )
+
+
+class TestDpCoordinatedStepProfileStats:
+    """Phased profiling under DP lockstep: the per-step DP all-reduce carries
+    each rank's batch composition, so every rank classifies the step from the
+    whole slice."""
+
+    @staticmethod
+    def _runner(profiling_dir, armed):
+        return SimpleNamespace(
+            _dp_lockstep_enabled=lambda: True,
+            phased_profiling_dir=profiling_dir,
+            phase_based_profiler=MagicMock() if armed else None,
+            num_tokens_paddings=[16, 32, 64, 128, 256, 512, 1024],
+        )
+
+    @staticmethod
+    def _step(runner, other_rank, *args, **kwargs):
+        """Run _dp_coordinated_step against one other rank's tensor."""
+        sent = []
+
+        def all_reduce(t, op=None, group=None):
+            sent.append(t.numel())
+            t.copy_(torch.maximum(t, torch.tensor(other_rank, dtype=torch.int64)))
+
+        with (
+            patch("torch.distributed.all_reduce", side_effect=all_reduce),
+            patch(
+                "vllm.distributed.parallel_state.get_dp_group",
+                return_value=SimpleNamespace(cpu_group=None),
+            ),
+        ):
+            bucket, _ = TPUModelRunner._dp_coordinated_step(runner, *args, **kwargs)
+        return bucket, sent[0]
+
+    def test_another_ranks_prefill_spoils_a_local_decode_only_step(self):
+        decode = {
+            "num_reqs": 93,
+            "num_prefill_tokens": 0,
+            "total_num_scheduled_tokens": 93,
+            "min_kv_len": 8300,
+        }
+        prefill = {
+            "num_reqs": 93,
+            "num_prefill_tokens": 931,
+            "total_num_scheduled_tokens": 1023,
+            "min_kv_len": 0,
+        }
+        other = [1023, 1, 93, 0] + runner_utils_module.encode_dp_profile_stats(
+            prefill, True
+        )
+        runner = self._runner("/tmp/prof", armed=True)
+        bucket, _ = self._step(runner, other, 93, 1, 93, profile_stats=decode)
+        assert bucket == 1024
+        stats = runner_utils_module.merge_dp_profile_stats(
+            decode, runner._dp_step_profile_stats
+        )
+        assert stats["phase"] != "DECODE_ONLY"
+        assert stats["padded_total_num_scheduled_tokens"] == 1024
+        assert stats["min_kv_len"] == 0
+
+    def test_every_rank_sends_the_same_length(self):
+        """Armed, unarmed and idle (execute_dummy_batch) ranks must all send
+        one length, or the CPU all-reduce mismatches across the slice."""
+        n = 4 + runner_utils_module.DP_PROFILE_STATS_LEN
+        idle = [0, 0, 0, 0] + runner_utils_module.encode_dp_profile_stats(None, True)
+        stats = {
+            "num_reqs": 4,
+            "num_prefill_tokens": 0,
+            "total_num_scheduled_tokens": 4,
+            "min_kv_len": 10,
+        }
+        for runner, kwargs in (
+            (self._runner("/tmp/prof", armed=True), {"profile_stats": stats}),
+            (self._runner("/tmp/prof", armed=False), {}),
+            (self._runner("/tmp/prof", armed=True), {}),
+        ):
+            _, sent = self._step(runner, idle, 4, 1, 4, **kwargs)
+            assert sent == n
+
+    def test_no_phased_profiling_keeps_the_four_field_all_reduce(self):
+        runner = self._runner("", armed=False)
+        _, sent = self._step(runner, [16, 1, 8, 0], 4, 1, 4)
+        assert sent == 4
+        assert runner._dp_step_profile_stats is None
