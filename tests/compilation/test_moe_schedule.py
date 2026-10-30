@@ -1,11 +1,85 @@
 # SPDX-License-Identifier: Apache-2.0
 """Resource ordering for split-SparseCore MoE communication."""
 
+import gc
 import json
+import threading
 
 import pytest
 
+from vllm_torchtpu.compilation import moe_schedule
 from vllm_torchtpu.compilation.moe_schedule import Module, rewrite_moe_schedule
+
+
+@pytest.fixture
+def gc_enabled():
+    was_enabled = gc.isenabled()
+    gc.enable()
+    yield
+    if was_enabled:
+        gc.enable()
+    else:
+        gc.disable()
+
+
+@pytest.mark.cpu_test
+def test_compile_thread_rewrite_runs_without_automatic_gc(gc_enabled, monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        moe_schedule, "rewrite_moe_schedule", lambda blob: seen.append(gc.isenabled())
+    )
+    moe_schedule.rewrite_moe_schedule_without_gc(b"")
+    assert seen == [False]
+    assert gc.isenabled()
+
+    gc.disable()
+    moe_schedule.rewrite_moe_schedule_without_gc(b"")
+    assert not gc.isenabled()
+
+
+@pytest.mark.cpu_test
+def test_compile_thread_rewrite_restores_gc_on_error(gc_enabled, monkeypatch):
+    def fail(blob):
+        raise ValueError("bad module")
+
+    monkeypatch.setattr(moe_schedule, "rewrite_moe_schedule", fail)
+    with pytest.raises(ValueError):
+        moe_schedule.rewrite_moe_schedule_without_gc(b"")
+    assert gc.isenabled()
+
+
+@pytest.mark.cpu_test
+def test_overlapping_compile_threads_keep_gc_off_until_last_exits(
+    gc_enabled, monkeypatch
+):
+    entered = threading.Barrier(2)
+    first_done = threading.Event()
+    states = {}
+
+    def rewrite(blob):
+        entered.wait()
+        if blob == b"second":
+            assert first_done.wait(timeout=10)
+            # The first thread has left the wrapper; GC must stay deferred.
+            states["after_first_exit"] = gc.isenabled()
+
+    def first():
+        moe_schedule.rewrite_moe_schedule_without_gc(b"first")
+        first_done.set()
+
+    monkeypatch.setattr(moe_schedule, "rewrite_moe_schedule", rewrite)
+    threads = [
+        threading.Thread(target=first),
+        threading.Thread(
+            target=moe_schedule.rewrite_moe_schedule_without_gc, args=(b"second",)
+        ),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    assert states == {"after_first_exit": False}
+    assert gc.isenabled()
 
 
 @pytest.mark.cpu_test
