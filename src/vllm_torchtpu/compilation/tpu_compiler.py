@@ -299,6 +299,9 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # Same reason: dcp.py owns the DCP kernels' mesh shape and device order.
     "vllm_torchtpu/distributed/dcp.py",
     "vllm_torchtpu/distributed/pallas_shapes.py",
+    # `prefill_checkpoint_enabled` decides whether the GDN op traces with
+    # prefill checkpoint operands or with constant None inputs.
+    "vllm_torchtpu/gdn_pool_layout.py",
     "vllm_torchtpu/layers/adapter/linear_common.py",
     "vllm_torchtpu/layers/adapter/router_topk.py",
     "vllm_torchtpu/layers/adapter/quantization",
@@ -430,6 +433,10 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         "kv_cache": {
             "gpu_memory_utilization": cache_config.gpu_memory_utilization,
             "num_gpu_blocks": cache_config.num_gpu_blocks,
+            # Upstream CacheConfig.compute_hash ignores it, but it gates GDN
+            # prefill checkpoints (gdn_pool_layout.prefill_checkpoint_enabled),
+            # which changes the traced GDN op inputs.
+            "prefix_match_unit": cache_config.prefix_match_unit,
         },
         "scheduler": {
             "max_model_len": vllm_config.model_config.max_model_len,
