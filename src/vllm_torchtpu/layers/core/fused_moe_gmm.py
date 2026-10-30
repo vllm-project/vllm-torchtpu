@@ -379,6 +379,33 @@ def _sortfree_onehot_routing(
     return pos, token_indices_sorted
 
 
+def onehot_combine_from_sorted(
+    gmm2_res: jax.Array,
+    token_indices_sorted: jax.Array,
+    topk_weights_sorted: jax.Array,
+    valid_count: jax.Array,
+    *,
+    num_tokens: int,
+) -> jax.Array:
+    """`out[t] = sum_p combine[t, p] * gmm2_res[p]` for the one-hot combine.
+
+    Route `p` of the sorted order belongs to token `token_indices_sorted[p]`
+    and carries `topk_weights_sorted[p]`; the rows past `valid_count` are the
+    invalid routes (non-local experts, skipped padded tokens), which the sort
+    puts after every valid one. So `combine[t, p]` is that weight when the
+    token matches and `p < valid_count`, else 0 -- the same entries as the
+    one-hot over `[tokens, topk, routes]` summed over topk, with one entry per
+    route instead of `topk`. Contracting the routes axis of the transposed
+    one-hot lets XLA build it inside the matmul, as for the permute.
+    """
+    routes = jnp.arange(token_indices_sorted.shape[0], dtype=jnp.int32)
+    weights = jnp.where(
+        routes < valid_count.reshape(()), topk_weights_sorted, 0
+    ).astype(topk_weights_sorted.dtype)
+    onehot = jax.nn.one_hot(token_indices_sorted, num_tokens, dtype=gmm2_res.dtype)
+    return jnp.einsum("pt,pd->td", onehot * weights[:, None], gmm2_res)
+
+
 def prepare_routed_gmm_inputs(
     hidden_states_local: jax.Array,
     topk_indices_local: jax.Array,
@@ -686,6 +713,14 @@ def moe_gmm(
                 dtype=jnp.int32
             )
             gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
+            if envs.TPU_MOE_ONEHOT_COMBINE_SORTED:
+                return onehot_combine_from_sorted(
+                    gmm2_res,
+                    token_indices_sorted,
+                    topk_weights_sorted,
+                    valid_count,
+                    num_tokens=num_tokens,
+                ).astype(x.dtype)
             revert_indices = argsort_revert_indices.reshape(num_tokens, topk)
             onehot = jax.nn.one_hot(
                 revert_indices, argsort_revert_indices.size, dtype=gmm2_res.dtype
