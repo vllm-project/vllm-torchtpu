@@ -30,6 +30,7 @@ from vllm_torchtpu.megakernel.kimi_k3.kernels import mla_dcp
 from vllm_torchtpu.megakernel.kimi_k3.kernels.decode_megakernel import (
     MLA_LAYERS,
     decode_local,
+    kda_inplace_writes,
 )
 
 
@@ -270,8 +271,16 @@ def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, 
     else:
         logits, (conv, recurrent, new_keys, new_values) = result
     # DP2 returns shard-major rows; commit each to its shard-bank index,
-    # preserving untouched slots and ordered null-slot writes.
-    if defer_kda_commit:
+    # preserving untouched slots and ordered null-slot writes, unless the
+    # stack already wrote them in place.
+    inplace = kda_inplace_writes(batch_size=batch_size, attention_dp=dp,
+                                 sequence_rows=decode_options.get("sequence_rows", 1),
+                                 slot_reads=in_place, state_row=state_row)
+    if inplace and defer_kda_commit:
+        raise ValueError("in-place KDA writes cannot defer the commit")
+    if inplace:
+        pass  # the stack wrote every live row's post-states into its slot
+    elif defer_kda_commit:
         # Keep the input banks alive until acceptance. Return the native
         # post-states without touching persistent slots or gathering rows.
         conv_slots, recurrent_slots = conv, recurrent
