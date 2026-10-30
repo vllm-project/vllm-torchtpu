@@ -47,8 +47,11 @@ scaling.
 
 from typing import TYPE_CHECKING, Any, cast
 
+import jax
 import jax.numpy as jnp
 import torch
+from torch_tpu._internal import pallas
+from vllm.distributed.parallel_state import get_dp_group
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, RoutedExperts
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
@@ -70,6 +73,8 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     fused_moe_gmm,
     prebuild_fused_moe_kernel,
+    prebuild_moe_input_quantizer,
+    quantize_moe_input_rows,
     quantize_native_fp4_kmajor,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
@@ -77,6 +82,7 @@ from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     pipelined_fused_moe_gmm,
 )
 from vllm_torchtpu.layers.adapter.quantization.configs import VllmQuantConfig
+from vllm_torchtpu.layers.core.fused_moe_gmm import dispatch_quant_dtype
 from vllm_torchtpu.layers.core.quant_methods import MXFP4, get_tpu_quant_method
 from vllm_torchtpu.layers.core.quantization import (
     dequantize_mxfp4_packed,
@@ -375,6 +381,9 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
     """DeepSeek-V4 MXFP4 MoE quantization and weight loading method."""
 
     rhs_quant_dtype = jnp.float4_e2m1fn
+    # What the GMM path quantizes the dispatched rows to when this layer
+    # quantizes them before its own DP gather instead; set at weight load.
+    _dispatch_quant_dtype: jnp.dtype | None = None
 
     @property
     def supports_internal_mk(self) -> bool:
@@ -382,7 +391,45 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         # bracket it with an all-gather/reduce-scatter of its own.
         from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 
-        return enable_pipelined_collective_and_compute() or fused_moe_ep_supported(self)
+        return (
+            enable_pipelined_collective_and_compute()
+            or fused_moe_ep_supported(self)
+            or self._dispatch_quant_dtype is not None
+        )
+
+    def _select_dispatch_quant_dtype(
+        self, layer: RoutedExperts, fused_ep_op: Any | None
+    ) -> jnp.dtype | None:
+        """The dtype to gather the GMM path's rows in, or None for vLLM's gather.
+
+        The GMM quantizes every dispatched row on its own scales, so the row
+        can be quantized on the rank that owns it, before vLLM's naive DP
+        gather would move it, for the same output and half the gathered bytes.
+        """
+        moe = layer.moe_config
+        if (
+            fused_ep_op is not None
+            or enable_pipelined_collective_and_compute()
+            or not moe.moe_parallel_config.use_ep
+            or moe.dp_size == 1
+            or moe.is_sequence_parallel
+            or moe.pcp_size > 1
+            # Routing below sees only the gathered rows' count and dtype.
+            or layer.custom_routing_function is not None
+        ):
+            return None
+
+        def sds(t: torch.Tensor) -> jax.ShapeDtypeStruct:
+            return jax.ShapeDtypeStruct(
+                tuple(t.shape), pallas.pallas.TORCH_TO_JAX_DTYPE_MAP[t.dtype]
+            )
+
+        return dispatch_quant_dtype(
+            moe.hidden_dim,
+            sds(layer.w13_weight),
+            sds(layer.w13_weight_scale),
+            self.rhs_quant_dtype,
+        )
 
     def _prebuild_w4a8(
         self,
@@ -729,6 +776,19 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 REQUANTIZED_BLOCK_SIZE,
             )
 
+        self._dispatch_quant_dtype = self._select_dispatch_quant_dtype(layer, op)
+        if self._dispatch_quant_dtype is not None:
+            prebuild_moe_input_quantizer(
+                q_dtype=self._dispatch_quant_dtype,
+                dispatch_size=get_dp_group().world_size,
+                topk=layer.moe_config.experts_per_token,
+                use_ep=True,
+            )
+            logger.info_once(
+                "DeepSeek-V4 MXFP4 MoE gathers its rows in %s.",
+                self._dispatch_quant_dtype,
+            )
+
     def _forward_monolithic_tpu(
         self,
         layer: RoutedExperts,
@@ -760,4 +820,56 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 score_bias_operand(layer),
                 hash_topk_ids_operand(layer, input_ids),
             )
+        if self._dispatch_quant_dtype is not None:
+            return self._forward_quantized_dispatch(layer, x, router_logits, input_ids)
         return super()._forward_monolithic_tpu(layer, x, router_logits, input_ids)
+
+    def _forward_quantized_dispatch(
+        self,
+        layer: "TpuRoutedExperts",
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """vLLM's naive DP dispatch and combine around the GMM path, with this
+        rank's rows quantized before the gather instead of inside the GMM."""
+        dp_group = get_dp_group()
+        rows, rows_scale = quantize_moe_input_rows(
+            x,
+            q_dtype=self._dispatch_quant_dtype,
+            dispatch_size=dp_group.world_size,
+            topk=layer.moe_config.experts_per_token,
+            use_ep=True,
+        )
+        rows = dp_group.all_gather(rows, dim=0)
+        rows_scale = dp_group.all_gather(rows_scale, dim=0)
+        router_logits = dp_group.all_gather(router_logits, dim=0)
+        # The model hands an owning layer its own rows' ids; hash routing
+        # reads the gathered rows'.
+        if (
+            input_ids is not None
+            and getattr(layer, "hash_indices_table", None) is not None
+        ):
+            input_ids = dp_group.all_gather(input_ids, dim=0)
+        # Routing reads its hidden states only for their row count and dtype.
+        gathered_x = x.new_empty((rows.shape[0], 0))
+        topk_weights, topk_ids = moe_routing.route(
+            layer, gathered_x, router_logits, input_ids=input_ids
+        )
+        out = fused_moe_gmm(
+            hidden_states=rows,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            w1_bias=getattr(layer, "w13_bias", None),
+            w2_bias=getattr(layer, "w2_bias", None),
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            experts_start=layer._experts_start,
+            topk=layer.moe_config.experts_per_token,
+            activation=self._tpu_activation_str,
+            rhs_quant_dtype=self.rhs_quant_dtype,
+            hidden_scale=rows_scale,
+        )
+        return dp_group.reduce_scatter(out, dim=0)
