@@ -82,15 +82,16 @@ class DeepseekV4TPUAttentionBackend(PallasAttentionBackend):
 # Module-level so `pallas.jax_op` can trace and register them as torch ops.
 def _qnorm_rope_jax(
     x: jax.Array,
+    kv: jax.Array,
     positions: jax.Array,
     cos_sin_cache: jax.Array,
     *,
     eps: float,
     head_dim: int,
-) -> jax.Array:
-    """Per-head RMSNorm (no weight) fused with RoPE on the flat q projection."""
-    return rope_kernel.qnorm_rope_flat(
-        x, positions, cos_sin_cache, num_heads=x.shape[1] // head_dim, eps=eps
+) -> tuple[jax.Array, jax.Array]:
+    """Per-head RMSNorm (no weight) + RoPE on the flat q, and RoPE on kv."""
+    return rope_kernel.qnorm_kv_rope_flat(
+        x, kv, positions, cos_sin_cache, num_heads=x.shape[1] // head_dim, eps=eps
     )
 
 
@@ -155,10 +156,11 @@ def _fake_rope(x, positions, cos_sin_cache, *args, **kwargs):
 
 
 def _make_fake_qnorm_rope(head_dim: int):
-    """Abstract implementation: ``[tokens, heads * head_dim]`` -> 3-D."""
+    """Abstract implementation: ``[tokens, heads * head_dim]`` -> 3-D, and kv."""
 
-    def _fake(x, positions, cos_sin_cache):
-        return x.new_empty((x.shape[0], x.shape[1] // head_dim, head_dim))
+    def _fake(x, kv, positions, cos_sin_cache):
+        q = x.new_empty((x.shape[0], x.shape[1] // head_dim, head_dim))
+        return q, torch.empty_like(kv)
 
     return _fake
 
@@ -524,14 +526,16 @@ class VllmDeepseekV4MLAAttention(
 
     @property
     def qnorm_rope_op(self):
-        """The fused q-RMSNorm + RoPE op, built lazily on first forward."""
+        """The fused q-RMSNorm + RoPE and kv RoPE op, built lazily."""
         op = self.__dict__.get("_qnorm_rope_op_instance")
         if op is not None:
             return op
 
         eps = float(self.mla_attn.eps)
         head_dim = int(self.mla_attn.head_dim)
-        op_name = f"pallas::deepseek_v4_qnorm_rope_flat_e{_name_float(eps)}_d{head_dim}"
+        op_name = (
+            f"pallas::deepseek_v4_qnorm_kv_rope_flat_e{_name_float(eps)}_d{head_dim}"
+        )
         op = _pallas_op_cache.get(op_name)
         if op is None:
             op = pallas.jax_op(
@@ -540,10 +544,11 @@ class VllmDeepseekV4MLAAttention(
                 mesh=get_pallas_op_mesh(),
                 input_partition_specs=(
                     P(None, "model"),  # q, flat: heads side by side
+                    P(),  # kv
                     P(),  # positions
                     P(),  # cos_sin_cache
                 ),
-                output_partition_specs=(P(None, "model", None),),
+                output_partition_specs=(P(None, "model", None), P()),
             )
             op.register_fake(_make_fake_qnorm_rope(head_dim))
             _pallas_op_cache[op_name] = op
@@ -578,10 +583,16 @@ class VllmDeepseekV4MLAAttention(
     def qnorm_rope(
         self,
         q: torch.Tensor,
+        kv: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
-        """RMSNorm + scaling RoPE on the flat q projection -> [tokens, heads, dim]."""
-        return self.qnorm_rope_op(q, positions, self.mla_attn.rotary_emb.cos_sin_cache)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """RMSNorm + scaling RoPE on the flat q -> [tokens, heads, dim], RoPE on kv.
+
+        One kernel: kv rides along in q's pipeline and shares its cos/sin rows.
+        """
+        return self.qnorm_rope_op(
+            q, kv, positions, self.mla_attn.rotary_emb.cos_sin_cache
+        )
 
     def kv_rope(
         self,
@@ -651,7 +662,7 @@ class VllmDeepseekV4MLAAttention(
         if fused_op is None or not rope_kernel.quantized_matmul_heads_supported(
             *qr.shape, self.wq_b.weight.shape[1], int(self.mla_attn.head_dim)
         ):
-            q = self.qnorm_rope(self._project_q(qr), positions)
+            q, kv = self.qnorm_rope(self._project_q(qr), kv, positions)
         else:
             q = fused_op(
                 qr,
@@ -660,7 +671,7 @@ class VllmDeepseekV4MLAAttention(
                 positions,
                 self.mla_attn.rotary_emb.cos_sin_cache,
             )
-        kv = self.kv_rope(kv, positions)
+            kv = self.kv_rope(kv, positions)
 
         topk_indices = None
         compressor = getattr(self.mla_attn, "compressor", None)
