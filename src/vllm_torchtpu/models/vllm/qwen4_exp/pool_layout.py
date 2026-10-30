@@ -52,6 +52,27 @@ def pack_main_kv_enabled() -> bool:
     return value in ("1", "true", "yes", "on")
 
 
+MAIN_KV_DCP_ENV = "VLLM_TPU_QSA_MAIN_KV_DCP"
+
+
+def main_kv_dcp() -> int:
+    """Decode-context-parallel size of the QSA main KV (1 when off).
+
+    ``VLLM_TPU_QSA_MAIN_KV_DCP=2``: the two TP ranks sharing a KV head
+    (``tp_rank // 2``) split each request's main KV by token. One main-KV
+    block-table entry then covers ``2 * B`` tokens; token ``t`` lives on pair
+    rank ``(t // B) % 2`` at row ``t % B`` of that entry's page, so each rank
+    stores half of the span in an unchanged page. 0 and 1 mean off. This is
+    not vLLM's ``decode_context_parallel_size``, which stays 1.
+    """
+    from vllm_torchtpu import envs
+
+    value = envs.VLLM_TPU_QSA_MAIN_KV_DCP
+    if value not in (0, 1, 2):
+        raise ValueError(f"{MAIN_KV_DCP_ENV} must be 0, 1 or 2, got {value}")
+    return max(value, 1)
+
+
 @dataclass(frozen=True)
 class Qwen4ExpPoolLayout:
     block_size: int
@@ -71,6 +92,14 @@ class Qwen4ExpPoolLayout:
     # (QSA attention prefix, main KV cache owner name, head-pair slot) of
     # layers sharing main KV pages; empty when every layer owns its pages.
     main_owners: tuple[tuple[str, str, int], ...] = field(default=())
+    # `main_kv_dcp()`: tokens per target main-KV block-table entry are
+    # ``main_dcp * block_size``; each pair rank stores ``block_size`` rows of
+    # them per page. MTP draft main KV keeps ``block_size`` unless
+    # VLLM_TPU_QSA_MTP_KV_DCP splits it too.
+    main_dcp: int = 1
+    # Main KV owner groups whose block size is scaled (the draft's with
+    # VLLM_TPU_QSA_MTP_KV_DCP).
+    main_dcp_owners: tuple[str, ...] = field(default=())
 
     def compressed_owner(self, attention_prefix: str) -> tuple[str, int]:
         """Cache owner name and in-page slot of a QSA layer's compressed keys."""
@@ -92,6 +121,11 @@ class Qwen4ExpPoolLayout:
     @property
     def main_kernel_pages(self):
         return self.block_size // self.kernel_block_size
+
+    @property
+    def main_block_size(self):
+        """Logical tokens per target main-KV block-table entry."""
+        return self.main_dcp * self.block_size
 
     @property
     def compressed_physical_pages(self):
@@ -120,6 +154,14 @@ def pooled_cache_specs(cfg):
     first, member ``s`` stores K and V at head slots ``2s`` and ``2s + 1``.
     MTP draft layers keep pages of their own (the proposer addresses its
     layer's group by name), as does an odd last target layer.
+
+    ``VLLM_TPU_QSA_MAIN_KV_DCP=2`` (``main_kv_dcp``) gives the target main KV
+    groups, paired or not, ``block_size = 2 * B`` with unchanged page bytes:
+    the two ranks of a KV-head pair each store ``B`` of the entry's ``2 * B``
+    tokens. vLLM then schedules in LCM blocks (``2 * B``) and hashes in GCD
+    blocks (``B``); compressed keys, rings, GDN, PLE and the MTP draft's main
+    KV keep ``B``, so prefix hashing and the draft are unchanged.
+    ``VLLM_TPU_QSA_MTP_KV_DCP`` gives the draft's main KV groups ``2 * B`` too.
     """
     specs = native_cache_specs(cfg)
     text = cfg.model_config.hf_text_config
@@ -190,6 +232,59 @@ def pooled_cache_specs(cfg):
                 (name, owner, slot)
                 for slot, name in enumerate(targets[start : start + 2])
             )
+    dcp = main_kv_dcp()
+    draft_attention = {prefix + ".self_attn" for prefix in mtp_layer_prefixes(cfg)}
+    paired_away = {name for name, owner, _ in main_owners if name != owner}
+    dcp_owners: tuple[str, ...] = ()
+    if dcp > 1:
+        p = cfg.parallel_config
+        if p.tensor_parallel_size < 2 or p.tensor_parallel_size % dcp:
+            raise ValueError(
+                f"{MAIN_KV_DCP_ENV}={dcp} splits a KV head's main KV over TP rank "
+                f"pairs; needs an even tensor_parallel_size >= 2, got "
+                f"{p.tensor_parallel_size}"
+            )
+        if p.decode_context_parallel_size != 1:
+            raise ValueError(
+                f"{MAIN_KV_DCP_ENV} replaces vLLM's decode context parallelism; "
+                "keep decode_context_parallel_size=1"
+            )
+        from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
+            PAIRED_KV_TILES,
+        )
+
+        # DCP prefill attends one table entry (dcp pages) per KV tile through
+        # the paired-page kernel; fail here, not in the first prefill.
+        if dcp * block_size not in PAIRED_KV_TILES or main.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                f"{MAIN_KV_DCP_ENV}={dcp} needs a prefill KV tile of {dcp} x "
+                f"{block_size}-row pages = {dcp * block_size} in the paired-page "
+                f"kernel's {PAIRED_KV_TILES} and an FP8 main KV cache; got "
+                f"{main.dtype}"
+            )
+        from vllm_torchtpu import envs
+
+        # VLLM_TPU_QSA_MTP_KV_DCP: the draft's main KV splits like the target's.
+        split_draft = bool(envs.VLLM_TPU_QSA_MTP_KV_DCP)
+        # VLLM_TPU_QSA_COMPRESSED_DCP: compressed keys too. Their groups hold
+        # the draft's keys as well (packed), so the draft must be split.
+        split_compressed = bool(envs.VLLM_TPU_QSA_COMPRESSED_DCP)
+        if split_compressed and not split_draft:
+            raise ValueError(
+                "VLLM_TPU_QSA_COMPRESSED_DCP needs VLLM_TPU_QSA_MTP_KV_DCP: the "
+                "MTP draft writes compressed keys into the split groups"
+            )
+        dcp_owners = tuple(
+            name
+            for name in specs
+            if name.endswith(".self_attn")
+            and (split_draft or name not in draft_attention)
+            and name not in paired_away
+        )
+        if split_compressed:
+            dcp_owners += tuple(
+                name for name in specs if name.endswith(".compressed_k")
+            )
     layout = Qwen4ExpPoolLayout(
         block_size=block_size,
         page_bytes=page_bytes,
@@ -203,6 +298,8 @@ def pooled_cache_specs(cfg):
         compressed_slots=packed_slots,
         compressed_owners=tuple(owners),
         main_owners=tuple(main_owners),
+        main_dcp=dcp,
+        main_dcp_owners=dcp_owners,
     )
     # Members other than their group's owner get no scheduler group.
     packed_away = {prefix + ".compressed_k" for prefix, owner, _ in owners} - {
@@ -238,6 +335,16 @@ def pooled_cache_specs(cfg):
             if name.endswith(".compressed_k"):
                 assert isinstance(spec, MLAAttentionSpec)
                 spec = replace(spec, state_content_bytes=compressed_width * 2)
+            if name in dcp_owners:
+                # 2B tokens per entry, B stored rows per rank: one state per
+                # `dcp` tokens keeps the unpadded page at B rows (= page_bytes).
+                pooled[name] = replace(
+                    spec,
+                    block_size=dcp * block_size,
+                    tokens_per_state=dcp,
+                    page_size_padded=page_bytes,
+                )
+                continue
             pooled[name] = replace(
                 spec,
                 block_size=spec.block_size
