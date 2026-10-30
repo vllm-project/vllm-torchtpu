@@ -1768,6 +1768,9 @@ def _run_routed_expert_stream(
             active_rows = jnp.any(selected_slot_mask, axis=1)
             return (expert, active_rows, selected_slot_mask, selected_slot_mask, has_expert)
 
+        initial_first: Any = None
+        initial_second: Any = None
+        initial_remaining: Any = None
         if plan_routes:
             # The carry holds only the next two expert ids and the plan; their
             # route masks are rebuilt when they run (no [B, 16] carries).
@@ -1798,6 +1801,9 @@ def _run_routed_expert_stream(
                 second_consumed,
                 has_second,
             ) = plan_choice(carry[1]) if plan_routes else unpack(carry[1]) if carry_routes else next_expert(processed | first_consumed)
+            third_lowest: Any = None
+            fourth_lowest: Any = None
+            remaining: Any = None
             if plan_routes:
                 third_lowest, remaining = plan_lowest(carry[2] != 0)
                 fourth_lowest, remaining = plan_lowest(remaining)

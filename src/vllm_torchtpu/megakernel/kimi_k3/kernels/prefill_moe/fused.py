@@ -2223,6 +2223,7 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
             w["latent_up"],
             prefix[0],
         )
+        routes = None
         if counting:
             *outputs, routes = outputs
             routes = routes[None]

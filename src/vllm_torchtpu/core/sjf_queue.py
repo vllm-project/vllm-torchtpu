@@ -13,10 +13,11 @@ preemption) go ahead of everything.
 
 from __future__ import annotations
 
-import os
 import time
 from collections.abc import Callable, Iterable, Iterator
 from typing import TYPE_CHECKING
+
+from vllm_torchtpu import envs
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.request_queue import RequestQueue
@@ -26,11 +27,11 @@ DEFAULT_AGING = 16384.0  # tokens of credit per second waited
 
 
 def enabled() -> bool:
-    return os.environ.get("K3_PREFILL_SJF", "") == "1"
+    return envs.K3_PREFILL_SJF
 
 
 def aging() -> float:
-    return float(os.environ.get("K3_PREFILL_SJF_AGING", DEFAULT_AGING))
+    return envs.K3_PREFILL_SJF_AGING
 
 
 class SJFRequestQueue:

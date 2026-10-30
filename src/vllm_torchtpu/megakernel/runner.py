@@ -39,6 +39,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 
 import vllm_torchtpu.distributed.utils as dist_utils
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.megakernel import (
     backend,
@@ -124,17 +125,11 @@ def build_program(vllm_config: Any, tp_rank: int) -> MegakernelProgram:
         k3.check(config)
     aggregate = config.role == "aggregate"
     if config.attention_dp > 1 or aggregate:
-        import os
-
         from vllm_torchtpu.megakernel.kimi_k3 import config as kernel_config
 
         # Kernel modules read the config at import: install it before the
         # program imports them.
-        prefill_ep = (
-            16
-            if (not aggregate or os.environ.get("K3_AGGREGATE_EP16") == "1")
-            else 8
-        )
+        prefill_ep = 16 if (not aggregate or envs.K3_AGGREGATE_EP16) else 8
         kernel_config.install(
             kernel_config.KernelConfig(
                 attention_dp=config.attention_dp,

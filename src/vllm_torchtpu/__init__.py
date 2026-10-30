@@ -218,7 +218,7 @@ def _patch_vllm_prefill_sjf_queue() -> None:
             sjf_queue.aging(),
         )
 
-    init._tpu_prefill_sjf_patch = True
+    init.__dict__["_tpu_prefill_sjf_patch"] = True
     Scheduler.__init__ = init
 
 
@@ -234,7 +234,6 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
     scheduling algorithm into this plugin.
     """
     import copy
-    import os
     from functools import wraps
 
     from vllm.v1.core.sched.scheduler import Scheduler
@@ -262,12 +261,12 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
         )
         prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
         if needs_pages and start < prefill_end:
-            if os.environ.get("K3_SERIAL_PREFILL") == "1":
+            if envs.K3_SERIAL_PREFILL:
                 active_id = getattr(self, "_tpu_step_prefill_req_id", None)
                 req_id = getattr(request, "request_id", None)
                 if active_id is not None and active_id != req_id:
                     return 0
-            max_step = int(os.environ.get("K3_MAX_PREFILL_STEP_TOKENS", "8192"))
+            max_step = envs.K3_MAX_PREFILL_STEP_TOKENS
             if max_step > 0:
                 num_new_tokens = min(num_new_tokens, max_step)
         args = (
@@ -306,11 +305,7 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
                 num_new_tokens = aligned - start
             elif start % page == 0:
                 num_new_tokens = 0  # less than a page of budget left: next step
-        if (
-            num_new_tokens > 0
-            and start < prefill_end
-            and os.environ.get("K3_SERIAL_PREFILL") == "1"
-        ):
+        if num_new_tokens > 0 and start < prefill_end and envs.K3_SERIAL_PREFILL:
             req_id = getattr(request, "request_id", None)
             if req_id is not None:
                 self._tpu_step_prefill_req_id = req_id

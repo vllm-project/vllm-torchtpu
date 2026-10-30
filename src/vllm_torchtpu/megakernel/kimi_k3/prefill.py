@@ -37,6 +37,7 @@ import numpy as np
 import torch
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.megakernel.bridge import (
     hbm,
@@ -1709,8 +1710,8 @@ class KimiPrefiller:
             or self.rank % ep_tp
         ):
             return
-        directory = os.environ.get("K3_PREFILL_ROUTE_COUNTS_DIR") or os.path.join(
-            os.environ.get("CDK_OUTPUT_DIR", "/tmp"), "prefill_route_counts"
+        directory = envs.K3_PREFILL_ROUTE_COUNTS_DIR or os.path.join(
+            envs.CDK_OUTPUT_DIR, "prefill_route_counts"
         )
         os.makedirs(directory, exist_ok=True)
         counts = np.asarray(self._route_total.cpu()).reshape(

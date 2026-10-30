@@ -11,9 +11,9 @@ the standalone tools install overrides before building the program.
 import dataclasses
 import hashlib
 import json
-import os
 from typing import Any
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.megakernel.config import set_active_kernel_config
 
 
@@ -70,12 +70,12 @@ class KernelConfig:
     # queries, probabilities x16 in E4M3FN, FP32 statistics); the window's own
     # keys stay BF16. K3_PREFILL_PREFIX_FP8=1 turns it on.
     prefill_prefix_fp8: bool = dataclasses.field(
-        default_factory=lambda: os.environ.get("K3_PREFILL_PREFIX_FP8", "") == "1"
+        default_factory=lambda: envs.K3_PREFILL_PREFIX_FP8
     )
     # Prefill MoE route counts (diagnostic): each fused MoE call also returns its
     # chip's 56 local expert counts; the prefiller saves cumulative snapshots.
     prefill_route_counts: bool = dataclasses.field(
-        default_factory=lambda: os.environ.get("K3_PREFILL_ROUTE_COUNTS", "") == "1"
+        default_factory=lambda: envs.K3_PREFILL_ROUTE_COUNTS
     )
     prefill_route_counts_every: int = 200
     # Prefill EP16 expert placement (empty: the pre-shard's): an npz whose
@@ -83,7 +83,7 @@ class KernelConfig:
     # slots 56c..56c+55); the router columns and expert weights are loaded in
     # that order. A bare name loads from kimi_k3/data.
     prefill_expert_plan: str = dataclasses.field(
-        default_factory=lambda: os.environ.get("K3_PREFILL_EXPERT_PLAN", "")
+        default_factory=lambda: envs.K3_PREFILL_EXPERT_PLAN
     )
     # Prefill MoE expert parallelism: 8 (EP8/TP4, the pre-shard layout), 16
     # (EP16/TP2: 56 experts, TP2 within the chip) or 32 (28 whole experts);
@@ -105,9 +105,7 @@ class KernelConfig:
     # Hot-expert fp8 copies (off when empty): an npz whose ``experts``
     # [92, 8, S] holds the global expert id in copy slot j of EP group g
     # per MoE layer (-1: empty). A bare name loads from kimi_k3/data.
-    kd_hot_plan: str = dataclasses.field(
-        default_factory=lambda: os.environ.get("K3_HOT_PLAN", "")
-    )
+    kd_hot_plan: str = dataclasses.field(default_factory=lambda: envs.K3_HOT_PLAN)
     # A hot expert's routes use its fp8 copy from this many rows.
     hot_min_rows: int = 9
     # Hot-expert MXFP4 replicas on other EP groups (off when empty; exclusive
@@ -118,15 +116,13 @@ class KernelConfig:
     # whichever gives the lowest modeled slowest-group expert time. A bare
     # name loads from kimi_k3/data.
     kd_replica_plan: str = dataclasses.field(
-        default_factory=lambda: os.environ.get("K3_REPLICA_PLAN", "")
+        default_factory=lambda: envs.K3_REPLICA_PLAN
     )
     # FP8 wires for attention DP's hidden-row gathers (off when empty): "t0"
     # the attention input, "t10" the MoE input. Rows travel as e4m3 with one
     # FP32 scale each; every rank uses the dequantized rows.
     fp8_wires: tuple[str, ...] = dataclasses.field(
-        default_factory=lambda: tuple(
-            filter(None, os.environ.get("K3_FP8_WIRES", "").split(","))
-        )
+        default_factory=lambda: tuple(filter(None, envs.K3_FP8_WIRES.split(",")))
     )
     pool_report: bool = False
     vmem_report: bool = False

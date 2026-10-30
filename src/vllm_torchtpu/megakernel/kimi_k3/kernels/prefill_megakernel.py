@@ -3925,6 +3925,7 @@ def _flash_kernel_packed(length_ref, segment_ref, *refs, tile, q_tile, count, pr
          pk_buf, pv_buf, psems) = refs
     else:
         q_ref, k_hbm, v_hbm, out_ref, k_buf, v_buf, sems = refs
+        prefix_k_hbm = prefix_v_hbm = pk_buf = pv_buf = psems = None
     head, query_block = pl.program_id(0), pl.program_id(1)
     length = length_ref[0]
     offsets = [segment_ref[s] for s in range(count)]
@@ -3965,7 +3966,7 @@ def _flash_kernel_packed(length_ref, segment_ref, *refs, tile, q_tile, count, pr
         jnp.full((1, q_tile), -jnp.inf, jnp.float32),
         jnp.zeros((128 + _ONES, q_tile), jnp.float32),
     )
-    fp8 = prefixed and pk_buf.dtype == jnp.float8_e4m3fn
+    fp8 = prefixed and pk_buf is not None and pk_buf.dtype == jnp.float8_e4m3fn
     # FP8 prefix: every probability is 2**PROB_SHIFT larger (exact for BF16 and
     # FP32; the ratio to the ones-row denominator is unchanged).
     pshift = PROB_SHIFT if fp8 else 0.0
