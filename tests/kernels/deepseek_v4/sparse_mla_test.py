@@ -355,6 +355,126 @@ class CorrectnessTest(parameterized.TestCase):
         print(f"Max Diff Out: {np.max(diff_out)}")
         np.testing.assert_allclose(out_base, out_agent, rtol=0.1, atol=0.1)
 
+    # Chunk 0 holds both requests. With [120, 108] its last block is mixed,
+    # so the gather path takes all of it; with [40, 188] it takes blocks 0
+    # and 1 and blocks 2 and 3 are dense. Chunk 1 holds only request 1 plus
+    # padding (dense), chunk 2 only padding.
+    @parameterized.parameters(([120, 108],), ([40, 188],))
+    def test_dense_blocks(self, q_lens):
+        """Blocks of one request take the dense path; a mixed block does not."""
+        topk = 512
+        rng = np.random.default_rng(0)
+        num_heads = 64
+        head_dim = 512
+        page_size = 256
+        pages_per_seq = 3
+        batch_size = 2
+        chunk_size = 128
+
+        q_lens = jnp.array(q_lens, dtype=jnp.int32)
+        cu_q_lens = jnp.concatenate(
+            [jnp.array([0]), jnp.cumulative_sum(q_lens, dtype=jnp.int32)]
+        )
+        kv_lens = jnp.array([300, 700], dtype=jnp.int32)
+        num_tokens = 3 * chunk_size
+
+        topk_indices = np.full((num_tokens, topk), -1, np.int32)
+        for i in range(batch_size):
+            for t in range(int(cu_q_lens[i]), int(cu_q_lens[i + 1])):
+                causal = int(kv_lens[i]) - int(cu_q_lens[i + 1]) + t + 1
+                n = min(topk, causal)
+                topk_indices[t, :n] = rng.permutation(causal)[:n]
+        topk_indices = jnp.array(topk_indices)
+
+        page_indices = jnp.array(
+            rng.permutation(batch_size * pages_per_seq), dtype=jnp.int32
+        )
+        total_pages = batch_size * pages_per_seq
+        cache_kv_base, cache_kv_nope, cache_kv_rope = create_cache(
+            rng, total_pages, page_size, head_dim, jnp.bfloat16
+        )
+        distribution = jnp.array([0, 0, batch_size], dtype=jnp.int32)
+        attention_sinks = generate_attention_sinks(rng, num_heads)
+        q = gen_random(rng, (num_tokens, num_heads, head_dim), jnp.bfloat16)
+        swa_accumution = gen_random(
+            rng, (num_tokens, num_heads, head_dim), jnp.bfloat16
+        )
+        swa_l = gen_random(rng, (num_tokens, num_heads), dtype=jnp.float32)
+        swa_m = gen_random(rng, (num_tokens, num_heads), dtype=jnp.float32)
+
+        out_base = ref_implementation(
+            q,
+            cache_kv_base,
+            kv_lens,
+            topk_indices,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            attention_sinks,
+            swa_accumution,
+            swa_l,
+            swa_m,
+        )
+        out_agent = sparse_mla.sparse_ragged_paged_attention(
+            q,
+            cache_kv_nope,
+            cache_kv_rope,
+            topk_indices,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            attention_sinks,
+            swa_accumution,
+            swa_l,
+            swa_m,
+            attention_kernel_batch_size=16,
+            gather_and_attention_chunk_size=chunk_size,
+        )
+        num_valid = int(cu_q_lens[-1])
+        np.testing.assert_allclose(out_base, out_agent[:num_valid], rtol=0.1, atol=0.1)
+        # Padding rows are left as q, as the gather path leaves them.
+        np.testing.assert_array_equal(out_agent[num_valid:], q[num_valid:])
+
+    # Chunk 0's range ends mid-block, chunk 1's is empty, chunk 2's is whole;
+    # then every range is empty.
+    @parameterized.parameters(([20, 128, 384],), ([0, 128, 256],))
+    def test_gather_row_indices(self, range_ends):
+        """Rows of the tokens in the ranges match the page-table lookup."""
+        num_tokens, topk, chunk_size = 384, 512, 128
+        page_size, pages_per_seq, max_num_seqs, total_pages = 256, 9, 8, 1000
+        rng = np.random.default_rng(0)
+        topk_indices = rng.integers(0, pages_per_seq * page_size, (num_tokens, topk))
+        topk_indices[rng.random((num_tokens, topk)) < 0.3] = -1
+        page_indices = rng.integers(0, total_pages, max_num_seqs * pages_per_seq)
+        seq_ids = np.sort(rng.integers(0, max_num_seqs, num_tokens))
+
+        rows = sparse_mla.gather_row_indices(
+            jnp.asarray(topk_indices, jnp.int32),
+            jnp.asarray(page_indices, jnp.int32),
+            jnp.asarray(seq_ids, jnp.int32),
+            jnp.asarray(range_ends, jnp.int32),
+            max_num_seqs=max_num_seqs,
+            page_size=page_size,
+            total_num_pages=total_pages,
+            range_size=chunk_size,
+        )
+        rows = np.asarray(rows).reshape(num_tokens, topk)
+
+        page_table = page_indices.reshape(max_num_seqs, pages_per_seq)
+        expected = (
+            page_table[seq_ids[:, None], topk_indices // page_size] * page_size
+            + topk_indices % page_size
+        )
+        # -1 entries point anywhere in the cache.
+        valid = topk_indices != -1
+        for c, end in enumerate(range_ends):
+            tokens = slice(c * chunk_size, end)
+            np.testing.assert_array_equal(
+                rows[tokens][valid[tokens]], expected[tokens][valid[tokens]]
+            )
+            self.assertTrue(np.all(rows[tokens] >= 0))
+            self.assertTrue(np.all(rows[tokens] < total_pages * page_size))
+
 
 if __name__ == "__main__":
     absltest.main()

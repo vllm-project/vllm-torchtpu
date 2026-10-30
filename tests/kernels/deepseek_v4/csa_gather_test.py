@@ -121,6 +121,29 @@ class GatherTest(parameterized.TestCase):
         np.testing.assert_array_equal(nope_ref, nope_sc[:num_valid])
         np.testing.assert_array_equal(rope_ref, rope_sc[: num_valid // 4])
 
+    @parameterized.parameters(
+        (128 * 1024, 64 * 1024, 64 * 1024),
+        # The window's last index block runs past the array: padded.
+        (16 * 512, 8 * 512, 8 * 512),
+        (64 * 1024, 16 * 1024, 32 * 1024),
+    )
+    def test_offset(self, n, offset, size):
+        nope_cache, perm_key = create_nope_cache()
+        rope_cache, _ = create_rope_cache()
+
+        max_index = nope_cache.shape[0] * nope_cache.shape[1]
+        indices = jax.random.randint(perm_key, (n,), 0, max_index, dtype=jnp.int32)
+
+        nope_ref, rope_ref = gather_ref_impl(
+            nope_cache, rope_cache, indices[offset : offset + size], top_k=512
+        )
+        nope_sc, rope_sc = csa_gather(
+            nope_cache, rope_cache, indices, top_k=512, offset=offset, size=size
+        )
+
+        np.testing.assert_array_equal(nope_ref, nope_sc)
+        np.testing.assert_array_equal(rope_ref, rope_sc)
+
 
 if __name__ == "__main__":
     absltest.main()
