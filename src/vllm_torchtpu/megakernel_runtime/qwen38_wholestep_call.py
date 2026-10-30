@@ -207,8 +207,10 @@ def build_wholestep_call(
         check_vma=False,
     )
 
+    dcp_size = main_kv_dcp()
+
     def per_rank_writes(pool, conv_ck, rec_ck, wb, kv, kr, ir, tables_flat, positions, starts,
-                        context, trig, norms_flat):
+                        context, trig, norms_flat, *rank):
         pool = scatter_gdn_ckpts_fast(pool, conv_ck, rec_ck, wb, layout=layout, interpret=interpret)
         if not write:
             return pool
@@ -216,10 +218,9 @@ def build_wholestep_call(
         rows = [(kr[o, :Bq], kv[o, :Bq, kv.shape[-1] // 2 :], ir[o, :Bq]) for o in range(n_att)]
         norms = [tuple(norms_flat[2 * o : 2 * o + 2]) for o in range(n_att)]
         tables = [tuple(tables_flat[i : i + QSA_TABLES]) for i in range(0, n_tab, QSA_TABLES)]
-        dcp = None
-        if main_kv_dcp() > 1:  # pair rank = tp rank % 2 (the mesh is in TP order)
-            size = main_kv_dcp()
-            dcp = ((jax.lax.axis_index("tp") % size).astype(jnp.int32).reshape(1), size)
+        # Main-KV DCP: this rank's pair rank, the QSA layers' `dcp_rank` buffer (int32 [1] per
+        # rank; `axis_index` lowers to a partition id, which the served SPMD compile refuses).
+        dcp = (rank[0].reshape(1), dcp_size) if dcp_size > 1 else None
         return wholestep_qsa_writes(
             pool, rows, norms, tables, qsa_layers, positions, trig, starts, context,
             compress_ratio=4, norm_eps=norm_eps, rotary_dim=rotary_dim, max_query_len=T,
@@ -229,7 +230,8 @@ def build_wholestep_call(
     writes = jax.shard_map(
         per_rank_writes,
         mesh=mesh,
-        in_specs=(tp, tp, tp, rep, tp, tp, tp, rep, rep, rep, rep, rep, rep),
+        in_specs=(tp, tp, tp, rep, tp, tp, tp, rep, rep, rep, rep, rep, rep)
+        + ((tp,) if dcp_size > 1 else ()),
         out_specs=tp,
         check_vma=False,
     )
@@ -247,7 +249,8 @@ def build_wholestep_call(
         tables = args[i : i + n_tab]
         i += n_tab
         positions, starts, context, trig = args[i : i + 4]
-        norms = args[i + 4 :]  # per QSA layer: k_norm, index k_norm (cache writer)
+        norms = args[i + 4 : i + 4 + 2 * n_att]  # per QSA layer: k_norm, index k_norm (cache writer)
+        rank = args[i + 4 + 2 * n_att :]  # main-KV DCP: the pair rank, int32 [1] per rank
         x = pad(hidden)
         rb, wb, hi = gdn_blocks(meta, NS, write)
         xs = dict(zip(names, inputs(pool, tables, positions, starts, context, trig)))
@@ -255,12 +258,12 @@ def build_wholestep_call(
         outs = fn(pos0, x, *(xs[k] for k in fn.extra_names), *w)
         res, conv_ck, rec_ck, kv, kr, ir = outs[:6]
         pool = writes(pool, conv_ck, rec_ck, wb, kv, kr, ir, tables, positions, starts, context,
-                      trig, norms)
+                      trig, norms, *rank)
         return (unpad(res), pool, outs[6]) if stats else (unpad(res), pool)
 
     in_specs = (
         (tp,) + (tp,) * n_w + (tp,) + (rep,) * n_meta + (rep,) * n_tab + (rep,) * 4
-        + (rep,) * (2 * n_att)
+        + (rep,) * (2 * n_att) + ((tp,) if dcp_size > 1 else ())
     )
     return call, in_specs, (tp, tp, tp) if stats else (tp, tp), (1 + n_w,)
 

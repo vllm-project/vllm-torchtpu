@@ -204,6 +204,8 @@ class Qwen38WholeStep(nn.Module):
         w = self._ops if self.hold == "list" else [getattr(self, f"w_{i}") for i in range(self.n_w)]
         args = [*w, self.pool, *meta, *tables, positions.to(torch.int32),
                 query_start_loc.to(torch.int32), context_lens.to(torch.int32), rope, *norms]
+        if getattr(self.layers[self.qsa_ids[0]].self_attn, "main_kv_dcp", 1) > 1:
+            args.append(self.layers[self.qsa_ids[0]].self_attn.dcp_rank)  # main-KV DCP pair rank
         outs = self.kind.op(hidden, args)
         res, pool = outs[0], outs[1]
         self.pool.copy_(pool)
