@@ -294,6 +294,25 @@ def ragged_gather_v2(
 ROW_TILE_LANES = 128
 
 
+def _transpose_bytes(
+    a0: jax.Array, a1: jax.Array, a2: jax.Array, a3: jax.Array
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """4x4 byte transpose of 32-bit words: byte j of output k is byte k of a_j."""
+    srl = lax.shift_right_logical
+    lo16, hi16 = 0x0000FFFF, jnp.int32(-0x10000)
+    b0 = (a0 & lo16) | (a2 << 16)
+    b1 = (a1 & lo16) | (a3 << 16)
+    b2 = (a2 & hi16) | srl(a0, 16)
+    b3 = (a3 & hi16) | srl(a1, 16)
+    even, odd = 0x00FF00FF, jnp.int32(-0xFF0100)
+    return (
+        (b0 & even) | ((b1 & even) << 8),
+        (srl(b0, 8) & even) | (b1 & odd),
+        (b2 & even) | ((b3 & even) << 8),
+        (srl(b2, 8) & even) | (b3 & odd),
+    )
+
+
 def _rows_kernel(
     start_ref: jax.Ref,
     end_ref: jax.Ref,
@@ -369,26 +388,21 @@ def _rows_kernel(
         return idx_vmem_ref[pl.ds(offset, row_subchunk_size)]
 
     def gather_step(gather_ref, out_ref):
-        def col_loop(lane_block):
-            col_slice = pl.ds(
-                pl.multiple_of(lane_block * ROW_TILE_LANES, ROW_TILE_LANES),
-                ROW_TILE_LANES,
-            )
-            word = jnp.right_shift(lane_block, 2)
-            shift = jnp.left_shift(jnp.bitwise_and(lane_block, packing - 1), 3)
+        def word_loop(word):
             for i in range(row_subchunk_size // packing):
-                packed_row = jnp.zeros((1, ROW_TILE_LANES), dtype=jnp.int32)
-                for j in range(packing):
-                    val = jnp.bitwise_right_shift(
-                        gather_ref[i * packing + j, pl.ds(word, 1), :], shift
+                rows = [
+                    gather_ref[i * packing + j, pl.ds(word, 1), :]
+                    for j in range(packing)
+                ]
+                for b, packed_row in enumerate(_transpose_bytes(*rows)):
+                    lane_block = word * packing + b
+                    col_slice = pl.ds(
+                        pl.multiple_of(lane_block * ROW_TILE_LANES, ROW_TILE_LANES),
+                        ROW_TILE_LANES,
                     )
-                    val = jnp.bitwise_and(val, 0xFF)
-                    packed_row = jnp.bitwise_or(packed_row, jnp.left_shift(val, j * 8))
-                out_ref[pl.ds(i, 1), col_slice] = packed_row
+                    out_ref[pl.ds(i, 1), col_slice] = packed_row
 
-        plsc.parallel_loop(0, col_size // ROW_TILE_LANES, unroll=REPACK_UNROLL)(
-            col_loop
-        )
+        plsc.parallel_loop(0, words_per_block, unroll=REPACK_UNROLL)(word_loop)
 
     pltpu.emit_pipeline(
         gather_step,
