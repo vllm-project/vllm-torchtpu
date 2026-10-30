@@ -1669,6 +1669,8 @@ def test_bind_caches_adopts_an_fp32_conv_framework_pool(
         qwen35.qwen35_spec(g).cache_backend.layout, conv_dtype=jnp.float32
     )
     assert driver.spec.cache_backend.supports_fused_io
+    gdn = [m for m in driver.spec.all_modules() if hasattr(m, "with_cache_layout")]
+    assert gdn and all(m.pool_layout == lay for m in gdn)  # modules rebound too
     assert (driver.fused_pool_io, driver.profile.pool_gather) == options
     planned = _planned()
     assert (4, 4) in planned and planned == planned_bf16, (planned, planned_bf16)

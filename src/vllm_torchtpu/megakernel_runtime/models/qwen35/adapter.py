@@ -562,9 +562,8 @@ class Qwen35Program:
         ):
             return
         f32_layout = dataclasses.replace(layout, conv_dtype=jax.numpy.float32)
-        self.spec = dataclasses.replace(
-            self.spec, cache_backend=self.spec.cache_backend.with_layout(f32_layout)
-        )
+        # `ModelSpec.with_layout` also rebinds the modules (GDN) to the layout.
+        self.spec = self.spec.with_layout(f32_layout)
         logger.info(
             "%s megakernel: the framework stores the pooled conv state as fp32; "
             "using an f32 conv window (fused_pool_io=%s, pool_gather=%s)",
