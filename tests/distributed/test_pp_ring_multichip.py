@@ -18,9 +18,16 @@ two-stage ring on two TPU devices with `torch.distributed` isend/irecv, the
 way a pipeline does: serving steps that post their receives ahead, warmup
 forwards that post their own, forwards of every bucket size, and the sum of
 hidden states and residual arriving as the next stage's hidden states.
+
+A launcher child prepares the two-device TPU environment and runs torchrun,
+so that the pytest process keeps no memory of a two-device topology: the
+runtime's launch-env helper reuses the first value it generated for a
+variable in a process, which would otherwise hand later full-host tests two
+devices.
 """
 
 import argparse
+import importlib.util
 import json
 import os
 import signal
@@ -40,11 +47,21 @@ BUCKETS = (8, 16, 32, 64)
 LAUNCH_TIMEOUT_SECONDS = 900
 
 
-def _worker_command(result_dir: Path) -> list[str]:
+SKIP_EXIT_CODE = 75
+
+
+def _launch_command(result_dir: Path) -> list[str]:
     return [
         sys.executable,
-        "-m",
-        "torch.distributed.run",
+        str(Path(__file__).resolve()),
+        "--launch",
+        "--result-dir",
+        str(result_dir),
+    ]
+
+
+def _torchrun_args(result_dir: Path) -> list[str]:
+    return [
         "--standalone",
         "--nnodes=1",
         f"--nproc-per-node={WORLD_SIZE}",
@@ -55,33 +72,31 @@ def _worker_command(result_dir: Path) -> list[str]:
     ]
 
 
-def _prepare_worker_env() -> dict[str, str]:
-    try:
-        from tests.distributed.tpu_test_utils import prepare_tpu_environment
-    except ImportError as exc:
-        pytest.skip(f"TorchTPU is unavailable: {exc}")
-    keys = (
+def _require_torchtpu() -> None:
+    if importlib.util.find_spec("torch_tpu") is None:
+        pytest.skip("TorchTPU is unavailable")
+
+
+def _launch_torchrun(result_dir: Path) -> None:
+    """Runs in the launcher child: a fresh two-device environment, then torchrun."""
+    for key in (
         "TORCH_TPU_XPROF_SESSION_ID",
         "TORCH_TPU_SLICEBUILDER_ADDRESSES",
         "TORCH_TPU_TOPOLOGY",
-    )
-    saved = {k: os.environ.get(k) for k in keys}
+    ):
+        os.environ.pop(key, None)
     try:
-        for k in keys:
-            os.environ.pop(k, None)
+        from tests.distributed.tpu_test_utils import prepare_tpu_environment
+
         prepare_tpu_environment(world_size=WORLD_SIZE)
-        env = os.environ.copy()
-    except ValueError as exc:
-        pytest.skip(f"Two TPU devices are unavailable: {exc}")
-    finally:
-        for k, v in saved.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
-    env["TPU_PP_HANDOFF"] = "ring"
-    env.setdefault("VLLM_USE_AOT_COMPILE", "0")
-    return env
+    except (ImportError, ValueError) as exc:
+        print(f"Two TPU devices are unavailable: {exc}", flush=True)
+        sys.exit(SKIP_EXIT_CODE)
+    os.environ["TPU_PP_HANDOFF"] = "ring"
+    os.environ.setdefault("VLLM_USE_AOT_COMPILE", "0")
+    from torch.distributed.run import main as torchrun_main
+
+    torchrun_main(_torchrun_args(result_dir))
 
 
 # --------------------------------------------------------------------- worker
@@ -188,10 +203,11 @@ def _run_worker(result_dir: Path) -> None:
 
 # --------------------------------------------------------------------- parent
 def _launch(result_dir: Path) -> subprocess.CompletedProcess[str]:
+    _require_torchtpu()
     process = subprocess.Popen(
-        _worker_command(result_dir),
+        _launch_command(result_dir),
         cwd=Path(__file__).resolve().parents[2],
-        env=_prepare_worker_env(),
+        env=os.environ.copy(),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -241,6 +257,8 @@ def test_two_stages_hand_off_on_real_devices(tmp_path):
     result_dir = tmp_path / "pp_ring"
     result_dir.mkdir()
     completed = _launch(result_dir)
+    if completed.returncode == SKIP_EXIT_CODE:
+        pytest.skip(completed.stdout.strip().splitlines()[-1])
     results = _results(result_dir)
     assert completed.returncode == 0 or any("error" in r for r in results), (
         completed.stdout[-12000:]
@@ -250,13 +268,17 @@ def test_two_stages_hand_off_on_real_devices(tmp_path):
 
 def _main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--launch", action="store_true")
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--result-dir", type=Path, required=True)
     args = parser.parse_args()
-    if not args.worker:
-        raise ValueError("expected --worker")
+    if args.launch == args.worker:
+        raise ValueError("expected exactly one of --launch and --worker")
     args.result_dir.mkdir(parents=True, exist_ok=True)
-    _run_worker(args.result_dir)
+    if args.launch:
+        _launch_torchrun(args.result_dir)
+    else:
+        _run_worker(args.result_dir)
 
 
 if __name__ == "__main__":
