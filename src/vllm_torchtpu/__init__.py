@@ -417,7 +417,10 @@ def _patch_vllm_compile_all_ranges() -> None:
     the host, its owner; every other rank replays the artifact the owner saves
     to vLLM's compile cache instead of tracing and compiling the range again
     (see TpuCompilerAdaptor.compile). Startup then takes about as long as the
-    slowest single range instead of the sum over ranges.
+    slowest single range instead of the sum over ranges. Peer replay needs
+    vLLM's compile cache: VLLM_DISABLE_COMPILE_CACHE=1 with the flag on fails
+    at startup (TpuPlatform.check_and_update_config), and a cache disabled any
+    other way makes the flag fall back here with a warning.
 
     Off, the default, each rank compiles every range itself, starting on a
     different one, and the ranks share only through the Tier-2 cache.
@@ -431,8 +434,19 @@ def _patch_vllm_compile_all_ranges() -> None:
         get_fake_args_from_graph,
     )
 
-    def ranks_per_host() -> int | None:
-        """How many ranks share this host, or None if that is unknown."""
+    def host_slot() -> tuple[int, int] | None:
+        """(ranks splitting the ranges on this host, this rank's slot among
+        them), or None to opt out: compile every range here, waiting on no one.
+
+        With DP > 1 (or several nodes) vLLM's world group spans every DP rank
+        (world_size_across_dp), so world_size // nodes counts all the ranks of
+        the host, whatever the TP size; dense DP replicas and elastic EP keep a
+        world group per engine and so split only within it. The slot is the
+        host-local rank, LOCAL_RANK less the TPU_LOCAL_RANK_OFFSET the worker
+        binding adds to it. Owners are dealt to slots 0..count-1 and a rank
+        waits for every owner, so a slot outside that range opts out rather
+        than leave a range owned by a slot no process holds.
+        """
         try:
             from vllm.distributed.parallel_state import (
                 get_node_count,
@@ -441,11 +455,15 @@ def _patch_vllm_compile_all_ranges() -> None:
 
             world_size = get_world_group().world_size
             nodes = get_node_count()
+            slot = int(os.environ["LOCAL_RANK"]) - envs.TPU_LOCAL_RANK_OFFSET
         except Exception:
             return None
         if nodes <= 0 or world_size % nodes:
             return None
-        return world_size // nodes
+        count = world_size // nodes
+        if count <= 1 or not 0 <= slot < count:
+            return None
+        return count, slot
 
     def compile_entry(self, range_entry) -> None:
         self._log_compile_start(range_entry.compile_range)
@@ -509,17 +527,35 @@ def _patch_vllm_compile_all_ranges() -> None:
         if not envs.TPU_PRECOMPILE_PEER_REPLAY:
             compile_rotated(self, local_rank)
             return
+        # Peers hand a compiled range over through vLLM's compile cache
+        # (TpuCompilerAdaptor saves and replays the cache artifact), so with
+        # the cache disabled there is nothing to replay: an owner/waiter split
+        # would only order the work. VLLM_DISABLE_COMPILE_CACHE=1 is already
+        # rejected at startup; this covers the cache being off for any other
+        # reason (e.g. vLLM disabling it for a feature it cannot cache).
+        if getattr(self.vllm_backend.compiler_manager, "disable_cache", False):
+            logger.warning_once(
+                "TPU_PRECOMPILE_PEER_REPLAY=1 has no effect while vLLM's "
+                "compile cache is disabled (e.g. VLLM_DISABLE_COMPILE_CACHE=1): "
+                "ranks share compiled ranges through that cache. Every rank "
+                "compiles every range itself; enable the compile cache to "
+                "use peer replay."
+            )
+            compile_rotated(self, local_rank)
+            return
 
         from vllm_torchtpu.compilation.tpu_compiler import (
             PEER_WAIT_S,
             wait_for_peer_artifact,
         )
 
-        ranks = ranks_per_host()
-        # Unknown: assume a full host, but do not wait on owners that may not
-        # exist; a range nobody saved yet is then compiled here.
-        wait_s = PEER_WAIT_S if ranks is not None and local_rank < ranks else 0.0
-        ranks = ranks or 8
+        host = host_slot()
+        if host is None:
+            # Layout not recognized: never wait on an owner that may not
+            # exist; every range is compiled here, ranks still staggered.
+            compile_rotated(self, local_rank)
+            return
+        ranks, slot = host
 
         # Biggest first, dealt out in a snake: local rank 0 starts on the
         # biggest range, which takes far longer than the others and so bounds
@@ -530,9 +566,9 @@ def _patch_vllm_compile_all_ranges() -> None:
             entries.sort(key=lambda e: e.compile_range.end, reverse=True)
         mine, others = [], []
         for i, range_entry in enumerate(entries):
-            turn, slot = divmod(i, ranks)
-            owner = slot if turn % 2 == 0 else ranks - 1 - slot
-            if owner == local_rank:
+            turn, position = divmod(i, ranks)
+            owner = position if turn % 2 == 0 else ranks - 1 - position
+            if owner == slot:
                 mine.append(range_entry)
             else:
                 # In the order the owners finish them: by turn, small first.
@@ -540,7 +576,7 @@ def _patch_vllm_compile_all_ranges() -> None:
 
         for range_entry in mine:
             compile_entry(self, range_entry)
-        with wait_for_peer_artifact(wait_s):
+        with wait_for_peer_artifact(PEER_WAIT_S):
             for _, _, range_entry in sorted(others, key=lambda o: o[:2]):
                 compile_entry(self, range_entry)
 

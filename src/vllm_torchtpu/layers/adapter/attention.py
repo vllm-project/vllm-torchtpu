@@ -1794,6 +1794,18 @@ class PallasMLAttentionBackend(AttentionBackend):
         )
 
     @staticmethod
+    def get_sparse_kv_cache_page_size_bytes(
+        block_size: int,
+        head_size: int,
+        cache_dtype_str: str | torch.dtype = "auto",
+    ) -> int:
+        """Bytes per block of one sparse-MLA layer's (nope, rope) caches."""
+        specs = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            1, block_size, head_size, cache_dtype_str
+        )
+        return sum(math.prod(spec.shape) * spec.torch_dtype.itemsize for spec in specs)
+
+    @staticmethod
     def get_kv_cache_page_size_bytes(
         block_size: int,
         num_kv_heads: int,
