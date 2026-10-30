@@ -14,6 +14,7 @@
 """TPU platform plugin for vllm-omni."""
 
 import os
+from typing import TYPE_CHECKING
 
 import torch
 from torch_tpu._internal.utils import hardware
@@ -24,7 +25,75 @@ from vllm_torchtpu.env_override import set_libtpu_flag_default
 from vllm_torchtpu.omni.patches import apply_omni_tpu_patches
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+
 logger = init_logger(__name__)
+
+_OMNI_CONFIG_CHECK_INSTALLED = False
+_BASE_TPU_RUNTIME_METRICS_PORT = 8431
+
+
+def _parse_visible_chip_ids(devices: str | int | None) -> list[int]:
+    """Parse comma-separated non-negative TPU chip IDs for stage pinning."""
+    if isinstance(devices, bool):
+        raise ValueError(
+            f"Invalid TPU visible devices specification: {devices!r}. "
+            "Expected comma-separated non-negative integer chip IDs."
+        )
+    if devices is None:
+        return []
+    raw = str(devices).strip()
+    if not raw:
+        return []
+    chip_ids: list[int] = []
+    seen: set[int] = set()
+    for part in raw.split(","):
+        token = part.strip()
+        if not token:
+            raise ValueError(
+                f"Invalid TPU visible devices specification: {devices!r}. "
+                "Empty chip ID entry is not allowed."
+            )
+        try:
+            chip_id = int(token)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid TPU visible devices specification: {devices!r}. "
+                f"Chip ID {token!r} is not an integer."
+            ) from exc
+        if chip_id < 0:
+            raise ValueError(
+                f"Invalid TPU visible devices specification: {devices!r}. "
+                f"Chip ID {chip_id} must be non-negative."
+            )
+        if chip_id in seen:
+            raise ValueError(
+                f"Invalid TPU visible devices specification: {devices!r}. "
+                f"Duplicate chip ID {chip_id} is not allowed."
+            )
+        seen.add(chip_id)
+        chip_ids.append(chip_id)
+    return chip_ids
+
+
+def _install_tpu_platform_omni_config_check() -> None:
+    """Validate OmniModelConfig when vLLM invokes TpuPlatform config checks."""
+    global _OMNI_CONFIG_CHECK_INSTALLED
+    if _OMNI_CONFIG_CHECK_INSTALLED:
+        return
+    orig_check_func = TpuPlatform.__dict__["check_and_update_config"].__func__
+
+    def _checked_check_and_update_config(
+        cls: type[TpuPlatform], vllm_config: "VllmConfig"
+    ) -> None:
+        OmniTpuPlatform._validate_omni_model_runner_config(vllm_config)
+        orig_check_func(cls, vllm_config)
+
+    TpuPlatform.check_and_update_config = classmethod(  # type: ignore[method-assign]
+        _checked_check_and_update_config
+    )
+    _OMNI_CONFIG_CHECK_INSTALLED = True
 
 
 class OmniTpuPlatform(OmniPlatform, TpuPlatform):
@@ -38,6 +107,7 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     # Diffusion worker world size recorded by set_device (see dist_backend).
     _worker_world_size: int = 1
+    _saved_spawn_env: dict[str, str | None] | None = None
 
     @property
     def dist_backend(self) -> str:
@@ -48,6 +118,7 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
     def __init__(self) -> None:
         super().__init__()
         apply_omni_tpu_patches()
+        _install_tpu_platform_omni_config_check()
 
     @classmethod
     def get_diffusion_attn_backend_cls(
@@ -93,6 +164,113 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
     @classmethod
     def supports_cpu_offload(cls) -> bool:
         return False
+
+    @classmethod
+    def supports_talker_mtp_graph_capture(cls) -> bool:
+        return False
+
+    @staticmethod
+    def _validate_omni_model_runner_config(vllm_config: "VllmConfig") -> None:
+        from vllm_omni.config.model import OmniModelConfig
+
+        model_config = vllm_config.model_config
+        if (
+            isinstance(model_config, OmniModelConfig)
+            and model_config.use_v2_model_runner
+        ):
+            raise ValueError(
+                "vLLM-Omni model_runner='v2' is not supported on TPU because "
+                "TPUModelRunner implements the vLLM V1 runner contract. Set "
+                "model_runner='v1' in the stage config (for example under "
+                "platforms.tpu.model_runner or via --deploy-config)."
+            )
+
+    @classmethod
+    def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
+        cls._validate_omni_model_runner_config(vllm_config)
+        super().check_and_update_config(vllm_config)
+
+    @classmethod
+    def set_device_control_env_var(cls, devices: str | int | None) -> None:
+        """Configure TPU device-isolation env vars before spawning a stage."""
+        chip_ids = _parse_visible_chip_ids(devices)
+        if cls._saved_spawn_env is None:
+            cls._saved_spawn_env = {
+                "ALLOW_MULTIPLE_LIBTPU_LOAD": os.environ.get(
+                    "ALLOW_MULTIPLE_LIBTPU_LOAD"
+                ),
+                "DEBUG_TPU_LOCAL_RANK_OFFSET": os.environ.get(
+                    "DEBUG_TPU_LOCAL_RANK_OFFSET"
+                ),
+                "MASTER_PORT": os.environ.get("MASTER_PORT"),
+                "TORCH_TPU_SLICEBUILDER_ADDRESSES": os.environ.get(
+                    "TORCH_TPU_SLICEBUILDER_ADDRESSES"
+                ),
+                "TORCH_TPU_TOPOLOGY": os.environ.get("TORCH_TPU_TOPOLOGY"),
+                "TPU_RUNTIME_METRICS_PORTS": os.environ.get(
+                    "TPU_RUNTIME_METRICS_PORTS"
+                ),
+                "TPU_VISIBLE_DEVICES": os.environ.get("TPU_VISIBLE_DEVICES"),
+                "VLLM_TPU_DEVICE_ORDER": os.environ.get("VLLM_TPU_DEVICE_ORDER"),
+                "WORLD_SIZE": os.environ.get("WORLD_SIZE"),
+            }
+        if not chip_ids:
+            os.environ[cls.device_control_env_var] = ""
+            os.environ["TPU_VISIBLE_DEVICES"] = ""
+            os.environ["TPU_RUNTIME_METRICS_PORTS"] = ""
+            os.environ.pop("DEBUG_TPU_LOCAL_RANK_OFFSET", None)
+            os.environ.pop("VLLM_TPU_DEVICE_ORDER", None)
+            return
+
+        normalized = ",".join(str(chip_id) for chip_id in chip_ids)
+        os.environ[cls.device_control_env_var] = normalized
+        os.environ["ALLOW_MULTIPLE_LIBTPU_LOAD"] = "1"
+        # Isolate each stage's libtpu Runtime Metric Service port(s) by physical
+        # chip ID; when unset, GCE TPU VM metadata supplies 8431,8432,... and
+        # every stage's local rank 0 collides on port 8431.
+        os.environ["TPU_RUNTIME_METRICS_PORTS"] = ",".join(
+            str(_BASE_TPU_RUNTIME_METRICS_PORT + chip_id) for chip_id in chip_ids
+        )
+        os.environ.pop("WORLD_SIZE", None)
+        os.environ.pop("MASTER_PORT", None)
+        os.environ.pop("TORCH_TPU_SLICEBUILDER_ADDRESSES", None)
+        os.environ.pop("TORCH_TPU_TOPOLOGY", None)
+
+        if len(chip_ids) == 1:
+            os.environ["TPU_VISIBLE_DEVICES"] = str(chip_ids[0])
+            os.environ.pop("DEBUG_TPU_LOCAL_RANK_OFFSET", None)
+            os.environ.pop("VLLM_TPU_DEVICE_ORDER", None)
+            return
+
+        # Never set TPU_VISIBLE_DEVICES to a multi-chip list: torch_tpu falls
+        # back to LOCAL_RANK when TPU_VISIBLE_DEVICES is not a single integer.
+        os.environ.pop("TPU_VISIBLE_DEVICES", None)
+        is_contiguous = chip_ids == list(
+            range(chip_ids[0], chip_ids[0] + len(chip_ids))
+        )
+        if is_contiguous:
+            os.environ["DEBUG_TPU_LOCAL_RANK_OFFSET"] = str(chip_ids[0])
+            os.environ.pop("VLLM_TPU_DEVICE_ORDER", None)
+        else:
+            os.environ["VLLM_TPU_DEVICE_ORDER"] = normalized
+            os.environ.pop("DEBUG_TPU_LOCAL_RANK_OFFSET", None)
+
+        if cls.device_count() > 0:
+            cls._prepare_singlehost_tpu_env(len(chip_ids))
+
+    @classmethod
+    def unset_device_control_env_var(cls) -> None:
+        """Restore parent TPU env vars after spawning a stage subprocess."""
+        os.environ.pop(cls.device_control_env_var, None)
+        saved = cls._saved_spawn_env
+        cls._saved_spawn_env = None
+        if saved is None:
+            return
+        for key, previous in saved.items():
+            if previous is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous
 
     @classmethod
     def set_device(cls, device: torch.device | int) -> None:

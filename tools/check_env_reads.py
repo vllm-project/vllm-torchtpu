@@ -68,7 +68,10 @@ EXEMPT_PATHS = {
 #   raiden_store.py         checks whether PYTHONHASHSEED is set, not its
 #                           value, and it is a CPython knob, not one of ours.
 #   omni/platform.py        os.environ["MASTER_PORT"] (exported per worker by
-#                           vLLM-Omni's DiffusionWorker) must raise when unset.
+#                           vLLM-Omni's DiffusionWorker) must raise when unset;
+#                           set_device_control_env_var snapshots raw os.environ
+#                           presence across stage spawns so unset vars can be
+#                           restored to unset rather than typed defaults.
 #   model_loader_patches.py RUNAI_STREAMER_PROCESS_GROUP_SIZE is exported by
 #                           the Run:AI streamer's first host-rank discovery in
 #                           the process; unset means that has not run yet.
@@ -82,6 +85,8 @@ EXEMPT_PATHS = {
 # read fails this hook with a message pointing here, which is the moment to
 # decide whether it belongs in envs.py instead.
 BOOTSTRAP_VARS = {
+    "ALLOW_MULTIPLE_LIBTPU_LOAD",
+    "DEBUG_TPU_LOCAL_RANK_OFFSET",
     "LOCAL_RANK",
     "LOCAL_WORLD_SIZE",
     "MASTER_PORT",
@@ -95,7 +100,10 @@ BOOTSTRAP_VARS = {
     "TORCH_TPU_TOPOLOGY",
     "TORCH_TPU_XPROF_SESSION_ID",
     "TPU_NUM_HOSTS",
+    "TPU_RUNTIME_METRICS_PORTS",
     "TPU_VISIBLE_CHIPS",
+    "TPU_VISIBLE_DEVICES",
+    "VLLM_TPU_DEVICE_ORDER",
     "WORLD_SIZE",
 }
 
