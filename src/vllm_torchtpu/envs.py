@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     TPU_MOE_COUNTING_SORT: bool = False
+    TPU_MOE_FUSED_MLP: bool = True
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
@@ -650,6 +651,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Order the routed rows by expert id with a counting sort instead of two
     # `jnp.argsort` calls.
     "TPU_MOE_COUNTING_SORT": env_bool("TPU_MOE_COUNTING_SORT"),
+    # Run moe_gmm's gate/up and down gmm_v2 calls as one kernel
+    # (gmm_v2_fused_mlp) when can_fuse_mlp holds, keeping the intermediate in
+    # VMEM. Set to 0 to force the two-call path.
+    "TPU_MOE_FUSED_MLP": env_bool("TPU_MOE_FUSED_MLP", True),
     # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
     # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
     # program, instead of bracketing the per-rank compute with vLLM's

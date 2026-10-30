@@ -32,7 +32,9 @@ from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     TileSizes,
     apply_act_fn,
     calculate_tiling,
+    can_fuse_mlp,
     gmm_v2,
+    gmm_v2_fused_mlp,
     interleave_lane,
     situ_and_mul,
 )
@@ -545,3 +547,207 @@ def test_calculate_tiling_scales_bucket_base_with_group_density(monkeypatch):
 
     t_prefill = _tiles_for(16384)
     assert (t_prefill.bucket_base, t_prefill.tile_m) == (64, 256)
+
+
+def test_can_fuse_mlp_refuses_mismatched_widths():
+    lhs = jax.ShapeDtypeStruct((64, 512), jnp.bfloat16)
+    rhs1 = jax.ShapeDtypeStruct((4, 512, 1024), jnp.bfloat16)
+    rhs2 = jax.ShapeDtypeStruct((4, 256, 512), jnp.bfloat16)
+    group_sizes = jax.ShapeDtypeStruct((4,), jnp.int32)
+
+    assert not can_fuse_mlp(lhs, rhs1, rhs2, group_sizes, fuse_act="silu")
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "group_sizes",
+    [
+        [40, 0, 3, 197, 1, 300, 59],
+        [600],
+        [0, 0, 17, 0, 0, 0, 0, 1],
+    ],
+    ids=["mixed", "one-group-many-tiles", "sparse"],
+)
+def test_gmm_v2_fused_mlp_matches_two_calls(group_sizes):
+    """W4A8 gate/up -> down, as DeepSeek-V4-Flash runs it, is bit-exact."""
+    _require_tpu()
+
+    num_groups = 8
+    in_size, inter_size, out_size = 1024, 512, 1024
+    quant_block = 512
+    fuse_act = "silu_and_mul_with_clamp"
+    group_sizes = jnp.asarray(
+        group_sizes + [0] * (num_groups - len(group_sizes)), jnp.int32
+    )
+    batch_size = int(group_sizes.sum()) + 16
+    keys = jax.random.split(jax.random.key(0), 5)
+
+    lhs = jax.random.normal(keys[0], (batch_size, in_size), jnp.bfloat16)
+    # Packed fp4 e2m1, two per byte along k: every byte is a valid pair.
+    w1 = jax.random.randint(
+        keys[1], (num_groups, in_size // 2, 2 * inter_size), 0, 256
+    ).astype(jnp.uint8)
+    w2 = jax.random.randint(
+        keys[2], (num_groups, inter_size // 2, out_size), 0, 256
+    ).astype(jnp.uint8)
+    w1_scale = jax.random.uniform(
+        keys[3], (num_groups, in_size // quant_block, 1, 2 * inter_size)
+    )
+    w2_scale = jax.random.uniform(
+        keys[4], (num_groups, inter_size // quant_block, 1, out_size)
+    )
+    group_offset = jnp.array(0, dtype=jnp.int32)
+    common = dict(maybe_quantize_lhs=True, rhs_quant_dtype=jnp.float4_e2m1fn)
+
+    inter = gmm_v2(
+        lhs,
+        w1,
+        group_sizes,
+        rhs_scale=w1_scale,
+        group_offset=group_offset,
+        zero_initialize=False,
+        fuse_act=fuse_act,
+        **common,
+    )
+    expected = gmm_v2(
+        inter,
+        w2,
+        group_sizes,
+        rhs_scale=w2_scale,
+        group_offset=group_offset,
+        zero_initialize=False,
+        preferred_element_type=jnp.bfloat16,
+        **common,
+    )
+
+    assert can_fuse_mlp(
+        lhs,
+        w1,
+        w2,
+        group_sizes,
+        rhs1_scale=w1_scale,
+        rhs2_scale=w2_scale,
+        fuse_act=fuse_act,
+        preferred_element_type=jnp.bfloat16,
+        **common,
+    )
+    actual = gmm_v2_fused_mlp(
+        lhs,
+        w1,
+        w2,
+        group_sizes,
+        rhs1_scale=w1_scale,
+        rhs2_scale=w2_scale,
+        group_offset=group_offset,
+        fuse_act=fuse_act,
+        preferred_element_type=jnp.bfloat16,
+        **common,
+    )
+
+    # Rows past the last group are left unwritten by both paths.
+    num_rows = int(group_sizes.sum())
+    assert actual.shape == (batch_size, out_size)
+    np.testing.assert_array_equal(
+        np.asarray(actual[:num_rows]), np.asarray(expected[:num_rows])
+    )
+
+
+def test_can_fuse_mlp_kimi_k3_decode_shapes(monkeypatch):
+    """Kimi-K3 routed MoE (56 local experts, MXFP4 + compact e8m0) fuses."""
+    monkeypatch.setattr(
+        "vllm_torchtpu.kernels.megablox.gmm_v2.pltpu.get_tpu_info",
+        lambda: SimpleNamespace(
+            mxu_column_size=256,
+            num_lanes=128,
+            vmem_capacity_bytes=64 * 1024 * 1024,
+            get_sublane_tiling=lambda dtype: 16,
+        ),
+    )
+    num_groups = 56
+    w1 = jax.ShapeDtypeStruct((num_groups, 3584, 3072), jnp.float4_e2m1fn)
+    w2 = jax.ShapeDtypeStruct((num_groups, 1536, 3584), jnp.float4_e2m1fn)
+    s1 = jax.ShapeDtypeStruct((num_groups, 112, 3072), jnp.float8_e8m0fnu)
+    s2 = jax.ShapeDtypeStruct((num_groups, 48, 3584), jnp.float8_e8m0fnu)
+    group_sizes = jax.ShapeDtypeStruct((num_groups,), jnp.int32)
+    for size_m in (1024, 2048, 3072, 16384):
+        lhs = jax.ShapeDtypeStruct((size_m, 3584), jnp.bfloat16)
+        assert can_fuse_mlp(
+            lhs,
+            w1,
+            w2,
+            group_sizes,
+            rhs1_scale=s1,
+            rhs2_scale=s2,
+            fuse_act="situ:4.0:25.0",
+            preferred_element_type=jnp.bfloat16,
+            maybe_quantize_lhs=False,
+        )
+
+
+@pytest.mark.tpu_test
+def test_gmm_v2_fused_mlp_mxfp4_compact_e8m0_matches_two_calls():
+    """Kimi-K3-style MXFP4 (block 32, compact e8m0, bf16 lhs) is bit-exact."""
+    _require_tpu()
+
+    num_groups = 8
+    in_size, inter_size, out_size = 1024, 512, 1024
+    block_size = 32
+    fuse_act = "situ:4.0:25.0"
+    group_sizes = jnp.asarray([40, 0, 3, 197, 1, 300, 59, 0], jnp.int32)
+    batch_size = int(group_sizes.sum()) + 16
+    keys = jax.random.split(jax.random.key(1), 5)
+
+    lhs = jax.random.normal(keys[0], (batch_size, in_size), jnp.bfloat16)
+    w1 = jax.random.uniform(
+        keys[1], (num_groups, in_size, 2 * inter_size), jnp.float32, -3.0, 3.0
+    ).astype(jnp.float4_e2m1fn)
+    w2 = jax.random.uniform(
+        keys[2], (num_groups, inter_size, out_size), jnp.float32, -3.0, 3.0
+    ).astype(jnp.float4_e2m1fn)
+
+    def _scale(key, k, n):
+        e = jax.random.randint(key, (num_groups, k // block_size, n), -3, 2)
+        return jnp.exp2(e.astype(jnp.float32)).astype(jnp.float8_e8m0fnu)
+
+    w1_scale = _scale(keys[3], in_size, 2 * inter_size)
+    w2_scale = _scale(keys[4], inter_size, out_size)
+    group_offset = jnp.array(0, dtype=jnp.int32)
+
+    inter = gmm_v2(
+        lhs,
+        w1,
+        group_sizes,
+        rhs_scale=w1_scale,
+        group_offset=group_offset,
+        zero_initialize=False,
+        fuse_act=fuse_act,
+        maybe_quantize_lhs=False,
+    )
+    expected = gmm_v2(
+        inter,
+        w2,
+        group_sizes,
+        rhs_scale=w2_scale,
+        group_offset=group_offset,
+        zero_initialize=False,
+        preferred_element_type=jnp.bfloat16,
+        maybe_quantize_lhs=False,
+    )
+    actual = gmm_v2_fused_mlp(
+        lhs,
+        w1,
+        w2,
+        group_sizes,
+        rhs1_scale=w1_scale,
+        rhs2_scale=w2_scale,
+        group_offset=group_offset,
+        fuse_act=fuse_act,
+        preferred_element_type=jnp.bfloat16,
+        maybe_quantize_lhs=False,
+    )
+
+    valid = int(group_sizes.sum())
+    np.testing.assert_array_equal(
+        np.asarray(actual[:valid].astype(jnp.float32)),
+        np.asarray(expected[:valid].astype(jnp.float32)),
+    )
