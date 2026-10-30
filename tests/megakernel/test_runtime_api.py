@@ -42,8 +42,6 @@ from vllm_torchtpu.megakernel.model_def import (
     find_model,
     register_model,
 )
-from vllm_torchtpu.megakernel.models import qwen35
-from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES
 from vllm_torchtpu.megakernel.modules import GDN, GQA, Embedding, MoE, Norm
 from vllm_torchtpu.megakernel.pool.config import CacheExec, with_cache
 from vllm_torchtpu.megakernel.profile import DEFAULT_PROFILE, Profile
@@ -78,6 +76,11 @@ from vllm_torchtpu.megakernel.runtime import (
     verify_pooled_step_hlo,
     verify_sentinel_step,
 )
+from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
+from vllm_torchtpu.models.qwen3_5.megakernel.profiles.baseline import TINY_TILES
+
+# For the library's by-name lookups (the model, its profiles, its default).
+qwen35.register()
 
 
 @pytest.fixture()

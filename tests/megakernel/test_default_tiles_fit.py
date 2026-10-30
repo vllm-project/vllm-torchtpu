@@ -22,8 +22,8 @@ import pytest
 from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel import exec_spec as exec_spec_mod
 from vllm_torchtpu.megakernel import vmem
-from vllm_torchtpu.megakernel.models import qwen35
 from vllm_torchtpu.megakernel.profiles import default as default_chip
+from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
 
 # Every model in `models/`, tiny and full configs.
 MODEL_CONFIGS = {

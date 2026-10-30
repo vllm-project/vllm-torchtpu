@@ -702,9 +702,14 @@ def _simulate_expert_ring_no_collision(mp, n_hit: int = 8) -> None:
 
 def test_moe_deployment_ring_invariants():
     """Verify MoE ring schedules and PIPE / PIPE_EP / LAZY_MOE across real profiles."""
-    from vllm_torchtpu.megakernel.models.qwen35 import Qwen35Geometry, qwen35_spec
-    from vllm_torchtpu.megakernel.models.qwen35_candidate30 import candidate30_tiles
-    from vllm_torchtpu.megakernel.models.qwen35_profile import baseline_tiles
+    from vllm_torchtpu.models.qwen3_5.megakernel.model import (
+        Qwen35Geometry,
+        qwen35_spec,
+    )
+    from vllm_torchtpu.models.qwen3_5.megakernel.profiles.baseline import baseline_tiles
+    from vllm_torchtpu.models.qwen3_5.megakernel.profiles.candidate30 import (
+        candidate30_tiles,
+    )
 
     seen_pipe = False
     seen_pipe_ep = False

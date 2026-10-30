@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The runtime is model-independent: no runtime module and no runtime test
-imports a model folder (`megakernel_runtime.models.*`). A model folder is
-named by string only (a shorthand or a `module:attr` plugin reference); the
-toy plugin in `test_program_driver.py` covers load, create, decline, serving
-and the fingerprint without one."""
+imports a model folder (`vllm_torchtpu.models.<model>.megakernel`) or a model
+folder's tests (`tests/models/`). A model folder is named by string only (a
+shorthand or a `module:attr` plugin reference); the toy plugin in
+`test_program_driver.py` covers load, create, decline, serving and the
+fingerprint without one."""
 
 from __future__ import annotations
 
@@ -27,13 +28,12 @@ import vllm_torchtpu.megakernel_runtime as mkr
 _RT = Path(mkr.__file__).resolve().parent
 _SRC = _RT.parents[1]
 _TESTS = Path(__file__).resolve().parent
-_MODELS = "vllm_torchtpu.megakernel_runtime.models"
-# The Qwen3.5 template's own tests; they move out with the template.
-_TEMPLATE_TESTS = frozenset(
-    {
-        "test_qwen35_template.py",
-        "test_vllm_qwen35_e2e.py",
-    }
+# Model folders, and where they lived before moving to `vllm_torchtpu.models`.
+_FORBIDDEN = (
+    "vllm_torchtpu.models",
+    "vllm_torchtpu.megakernel_runtime.models",
+    "vllm_torchtpu.megakernel.models",
+    "tests.models",
 )
 
 
@@ -55,21 +55,16 @@ def _imported(path: Path, package: str) -> list[tuple[int, str]]:
 
 
 def _violations(paths: list[Path], package_of: dict[Path, str]) -> list[str]:
-    template_tests = {f"tests.megakernel_runtime.{n[:-3]}" for n in _TEMPLATE_TESTS}
     bad = []
     for path in paths:
         for line, name in _imported(path, package_of[path]):
-            if name == _MODELS or name.startswith(_MODELS + "."):
+            if any(name == f or name.startswith(f + ".") for f in _FORBIDDEN):
                 bad.append(f"{path.name}:{line}: {name}")
-            elif name in template_tests:
-                bad.append(f"{path.name}:{line}: {name} (a template test)")
     return bad
 
 
 def test_runtime_modules_import_no_model_folder() -> None:
-    paths = [
-        p for p in sorted(_RT.rglob("*.py")) if "models" not in p.relative_to(_RT).parts
-    ]
+    paths = sorted(_RT.rglob("*.py"))
     assert len(paths) > 5
     package_of = {
         p: ".".join(p.relative_to(_SRC).with_suffix("").parts[:-1]) for p in paths
@@ -78,7 +73,7 @@ def test_runtime_modules_import_no_model_folder() -> None:
 
 
 def test_runtime_tests_import_no_model_folder() -> None:
-    paths = [p for p in sorted(_TESTS.glob("*.py")) if p.name not in _TEMPLATE_TESTS]
+    paths = sorted(_TESTS.glob("*.py"))
     assert Path(__file__).resolve() in paths
     package_of = dict.fromkeys(paths, "tests.megakernel_runtime")
     assert _violations(paths, package_of) == []
@@ -87,16 +82,16 @@ def test_runtime_tests_import_no_model_folder() -> None:
 def test_the_guard_sees_model_folder_imports(tmp_path: Path) -> None:
     src = tmp_path / "x.py"
     src.write_text(
-        "import vllm_torchtpu.megakernel_runtime.models.qwen35\n"
-        "from vllm_torchtpu.megakernel_runtime import models\n"
-        "from .models.qwen35 import adapter\n"
-        "from ..models import qwen35\n"
-        "from tests.megakernel_runtime.test_vllm_qwen35_e2e import _cpu_mesh\n"
-        'SHORTHAND = "vllm_torchtpu.megakernel_runtime.models.qwen35"\n',
+        "import vllm_torchtpu.models.qwen3_5.megakernel\n"
+        "from vllm_torchtpu.models.qwen3_5 import megakernel\n"
+        "from ..models.qwen3_5.megakernel import adapter\n"
+        "from .models import qwen35\n"
+        "from tests.models.qwen3_5.megakernel.test_vllm_qwen35_e2e import _cpu_mesh\n"
+        'SHORTHAND = "vllm_torchtpu.models.qwen3_5.megakernel"\n',
         encoding="utf-8",
     )
     pkg = {src: "vllm_torchtpu.megakernel_runtime"}
     lines = {int(v.split(":")[1]) for v in _violations([src], pkg)}
-    assert lines == {1, 2, 3, 5}
-    pkg = {src: "vllm_torchtpu.megakernel_runtime.sub"}
-    assert 4 in {int(v.split(":")[1]) for v in _violations([src], pkg)}
+    assert lines == {1, 2, 3, 4, 5}
+    pkg = {src: "vllm_torchtpu.other"}
+    assert 4 not in {int(v.split(":")[1]) for v in _violations([src], pkg)}

@@ -52,16 +52,6 @@ from vllm_torchtpu.megakernel.model_def import (
     list_models,
     register_model,
 )
-from vllm_torchtpu.megakernel.models import (
-    qwen35,
-    qwen35_pool,
-)
-from vllm_torchtpu.megakernel.models.qwen35 import DEFAULT_HF_CONFIG, Qwen35
-from vllm_torchtpu.megakernel.models.qwen35_profile import (
-    PROFILE,
-    QWEN35_MODEL_NAME,
-    TINY_TILES,
-)
 from vllm_torchtpu.megakernel.modules import (
     GDN,
     GQA,
@@ -74,6 +64,14 @@ from vllm_torchtpu.megakernel.modules import (
 )
 from vllm_torchtpu.megakernel.ops import BF16, F32, rnd
 from vllm_torchtpu.megakernel.profile import DEFAULT_PROFILE, Profile
+from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
+from vllm_torchtpu.models.qwen3_5.megakernel import pool as qwen35_pool
+from vllm_torchtpu.models.qwen3_5.megakernel.model import DEFAULT_HF_CONFIG, Qwen35
+from vllm_torchtpu.models.qwen3_5.megakernel.profiles.baseline import (
+    PROFILE,
+    QWEN35_MODEL_NAME,
+    TINY_TILES,
+)
 
 
 @pytest.fixture()
@@ -1144,13 +1142,16 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """`models/qwen35.py` has no fmt: skip / noqa, keeps docstrings, tests driver."""
+    """The Qwen3.5 model folder's `model.py` has no fmt: skip / noqa, keeps
+    docstrings, tests driver."""
     import logging
     import types
 
-    from vllm_torchtpu.megakernel.models import qwen35_profile
     from vllm_torchtpu.megakernel_runtime import driver as driver_mod
-    from vllm_torchtpu.megakernel_runtime.models.qwen35 import adapter as qwen_adapter
+    from vllm_torchtpu.models.qwen3_5.megakernel import adapter as qwen_adapter
+    from vllm_torchtpu.models.qwen3_5.megakernel.profiles import (
+        baseline as qwen35_profile,
+    )
 
     def _declined(drv: Any) -> bool:
         # A checkpoint the template doesn't serve: `create` declines, so every
@@ -1165,7 +1166,8 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
 
     qwen_text = Path(qwen35.__file__).read_text(encoding="utf-8")
     qwen_lines = qwen_text.splitlines()
-    assert len(qwen_lines) <= 200, f"qwen35.py has {len(qwen_lines)} lines (> 200)"
+    # 200 lines plus the explicit `register()` (no import-time registration).
+    assert len(qwen_lines) <= 230, f"model.py has {len(qwen_lines)} lines (> 230)"
     assert "fmt: skip" not in qwen_text, "qwen35.py contains fmt: skip"
     assert "noqa" not in qwen_text, "qwen35.py contains noqa"
     for mod in (qwen35_pool, qwen35_profile):
@@ -1191,7 +1193,8 @@ def test_qwen35_model_def_line_budget_docstrings_and_runtime_registry(
     for kw_name in ("donate_pools", "fused_pool_io", "max_b_low", "min_b_hi"):
         assert kw_name in pooled_params
 
-    # Model registry and profile lookups
+    # Model registry and profile lookups (after the explicit registration)
+    assert qwen35.register() is Qwen35
     assert get_model(QWEN35_MODEL_NAME) is Qwen35
     assert get_model("Qwen3_5MoeForConditionalGeneration") is Qwen35
     assert get_model("Qwen3_5ForConditionalGeneration") is Qwen35
@@ -1402,7 +1405,7 @@ def test_validate_runner_hf_config_frozen_qwen35_config_json(
 
     import frozen_utils
 
-    from vllm_torchtpu.megakernel_runtime.models.qwen35 import adapter as qwen_adapter
+    from vllm_torchtpu.models.qwen3_5.megakernel import adapter as qwen_adapter
 
     frozen_cfg = frozen_utils.load_frozen_qwen35_config_json()
     for valid_cfg in (frozen_cfg, frozen_utils.dict_to_namespace(frozen_cfg)):

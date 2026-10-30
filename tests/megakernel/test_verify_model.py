@@ -28,7 +28,10 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu import megakernel as mk
-from vllm_torchtpu.megakernel.models import qwen35
+from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
+
+# For the library's by-name lookups (the model, its profiles, its default).
+qwen35.register()
 
 
 @pytest.fixture(autouse=True)

@@ -27,8 +27,8 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu import megakernel as mk
-from vllm_torchtpu.megakernel.models import qwen35
-from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES
+from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
+from vllm_torchtpu.models.qwen3_5.megakernel.profiles.baseline import TINY_TILES
 
 NUM_PAGES = 128
 
@@ -104,14 +104,14 @@ def test_gdn_in_kernel_pool_io_rejects_mismatched_layout():
 
 def test_qwen35_pool_layout_matches_geometry():
     g = qwen35.Qwen35Geometry()
-    lay = qwen35.qwen35_pool.qwen35_pool_layout(g)
+    lay = qwen35.pool.qwen35_pool_layout(g)
     assert (lay.num_pools, lay.slots_per_pool) == (g.NATT, g.att_every - 1)
     assert lay.num_recurrent_layers == g.NGDN
     for R in (1, 2, 8):
         gdn = mk.GDNModule.lin_in_layout(g, R)
         assert (lay.kh_per_rank(R), lay.vh_per_rank(R)) == (gdn.kh, gdn.vh)
         assert lay.qkv_per_rank(R) == gdn.QKV
-    assert qwen35.qwen35_pool.qwen35_pool_backend(g).layout == lay
+    assert qwen35.pool.qwen35_pool_backend(g).layout == lay
 
 
 def test_check_pooled_step_hlo_uses_layout_page_shape():
@@ -152,7 +152,7 @@ def test_full_pooled_step_att_every_2():
         att_every=2,
     )
     ex = mk.with_cache(_exec(R=2, B=2, T=1), num_pages=96)
-    lay = qwen35.qwen35_pool.qwen35_pool_layout(g)
+    lay = qwen35.pool.qwen35_pool_layout(g)
     assert (lay.num_pools, lay.slots_per_pool) == (2, 1)
     pos, hid_l, w_l, st_l = mk.random_logical_inputs(jax.random.key(5), g, ex)
     st_l = dict(st_l, conv=st_l["conv"].astype(jnp.bfloat16).astype(jnp.float32))
@@ -202,15 +202,20 @@ def test_full_pooled_step_att_every_2():
 # AST guards: the pool state name and the slot stride live in one place.
 # ---------------------------------------------------------------------------
 _MK_ROOT = Path(mk.__file__).resolve().parent
+# Paths below are relative to the `vllm_torchtpu` package (library and folder).
+_PKG = _MK_ROOT.parent
+_FOLDER = _PKG / "models" / "qwen3_5" / "megakernel"
 
 
 def _guarded_files() -> list[Path]:
     files = [_MK_ROOT / "kernel.py", *sorted(_MK_ROOT.glob("cache*.py"))]
     files += sorted((_MK_ROOT / "modules").rglob("*.py"))
     files += sorted((_MK_ROOT / "experimental").glob("*.py"))
-    files += sorted((_MK_ROOT / "models").glob("*.py"))
+    files += [_FOLDER / "model.py", _FOLDER / "pool.py"]
     files += sorted((_MK_ROOT / "pool").glob("*.py"))
-    rel_paths = {p.relative_to(_MK_ROOT).as_posix() for p in files}
+    rel_paths = {
+        p.relative_to(_MK_ROOT).as_posix() for p in files if _MK_ROOT in p.parents
+    }
     expected_files = {
         "kernel.py",
         "cache.py",
@@ -225,14 +230,13 @@ def _guarded_files() -> list[Path]:
         "modules/gdn/states.py",
         "modules/moe/module.py",
         "experimental/fused_pool_io.py",
-        "models/qwen35.py",
-        "models/qwen35_pool.py",
         "pool/gather.py",
         "pool/scatter.py",
         "pool/scatter_ckpt.py",
         "pool/scatter_kv.py",
     }
     assert expected_files <= rel_paths, expected_files - rel_paths
+    assert all(p.is_file() for p in files)
     return files
 
 
@@ -240,13 +244,13 @@ def test_no_raw_pool_state_literal_in_core():
     """`"raw"` is defined once (`POOL_STATE_NAME`), never repeated elsewhere."""
     assert mk.POOL_STATE_NAME == "raw"
     for path in _guarded_files():
-        if path.relative_to(_MK_ROOT).as_posix() == "pool/config.py":
+        if path.relative_to(_PKG).as_posix() == "megakernel/pool/config.py":
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, ast.Constant) and node.value == "raw":
                 raise AssertionError(
-                    f"{path.relative_to(_MK_ROOT)}:{node.lineno} uses the pool "
+                    f"{path.relative_to(_PKG)}:{node.lineno} uses the pool "
                     "state literal 'raw'; use POOL_STATE_NAME or "
                     "KernelContext.raw_refs"
                 )
@@ -262,6 +266,6 @@ def test_no_slot_stride_literal_in_core():
             for side in (node.left, node.right):
                 if isinstance(side, ast.Constant) and side.value == 5:
                     raise AssertionError(
-                        f"{path.relative_to(_MK_ROOT)}:{node.lineno} multiplies "
+                        f"{path.relative_to(_PKG)}:{node.lineno} multiplies "
                         "by the literal 5; use PoolLayout.pages_per_slot"
                     )

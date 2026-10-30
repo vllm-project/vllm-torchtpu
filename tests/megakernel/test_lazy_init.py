@@ -57,7 +57,6 @@ def _run(code: str) -> str:
 _HEAVY = (
     "vllm_torchtpu.megakernel.kernel",
     "vllm_torchtpu.megakernel.cache",
-    "vllm_torchtpu.megakernel.models",
     "vllm_torchtpu.megakernel.modules",
     "vllm_torchtpu.megakernel.planner",
     "vllm_torchtpu.megakernel.runtime.checks",
@@ -112,13 +111,13 @@ def test_package_import_loads_no_megakernel_submodule() -> None:
 
 _REGISTRIES = """
 import vllm_torchtpu.megakernel as mk
-# Registry lookups before anything touches mk.modules / mk.models.
+# Registry lookups before anything touches mk.modules.
 assert mk.Tiles().module("gqa") is not None
 assert mk.Tiles().with_modules({"gqa": {"kv_sub": 2}}).module("gqa").kv_sub == 2
 from vllm_torchtpu.megakernel import module_options
 assert {"gqa", "gdn", "moe"} <= set(module_options.registered_tunables())
-assert mk.find_model("qwen3_5") is not None
-assert "qwen35-baseline" in mk.list_profiles()
+# Models and their profiles live in model folders, which register explicitly.
+assert mk.list_models() == () and mk.list_profiles() == ("default",)
 # The fused pool I/O implementation registers on the first lookup.
 from vllm_torchtpu.megakernel.fused_io_hook import fused_io, fused_io_available
 assert fused_io_available() and fused_io() is not None
@@ -134,6 +133,9 @@ _FIRST_LOOKUP = """
 from vllm_torchtpu import megakernel as mk
 # The first lookup can be a profile one: `profile` builds DEFAULT_PROFILE
 # (a module-tunables lookup) while it is itself being imported.
+assert mk.get_profile("default").numerics == "exact"
+from vllm_torchtpu.models.qwen3_5.megakernel import model
+model.register()
 assert mk.get_profile("qwen35-candidate30-fused").numerics == "approx"
 print("OK")
 """

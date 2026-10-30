@@ -32,8 +32,8 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel import pool
-from vllm_torchtpu.megakernel.models import qwen35
-from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES
+from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
+from vllm_torchtpu.models.qwen3_5.megakernel.profiles.baseline import TINY_TILES
 
 
 @pytest.fixture(autouse=True)

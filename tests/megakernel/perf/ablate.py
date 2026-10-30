@@ -189,7 +189,9 @@ def make_ablated_profile(
 ) -> Any:
     """Construct a synthetic `Profile` with one flag toggled according to `mode`."""
     from vllm_torchtpu.megakernel.profile import Profile, get_profile
+    from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
 
+    qwen35.register()  # resolve the Qwen3.5 profiles by name
     base_prof = get_profile(base_profile_name)
     target_val = flag_spec["off"] if mode == "leave-one-out" else flag_spec["on"]
     scope = flag_spec["scope"]

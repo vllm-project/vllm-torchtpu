@@ -32,8 +32,16 @@ from tests.megakernel.megakernel_fakes import EXACT_FLIPS, tile_field, with_tile
 from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel import profile as profile_mod
 from vllm_torchtpu.megakernel.cache import should_use_pool_gather
-from vllm_torchtpu.megakernel.models import qwen35
-from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES, baseline_tiles
+from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
+from vllm_torchtpu.models.qwen3_5.megakernel.profiles import PROFILES
+from vllm_torchtpu.models.qwen3_5.megakernel.profiles.baseline import (
+    TINY_TILES,
+    baseline_tiles,
+)
+
+# For the library's by-name lookups: Qwen3.5's default profile is the
+# reference of its profiles' numerics.
+qwen35.register()
 
 
 @pytest.fixture(autouse=True)
@@ -80,12 +88,12 @@ def test_per_bucket_thresholds_come_from_tiles():
 
 
 def test_profile_numerics_are_derived_and_enforced():
-    base = mk.get_profile("qwen35-baseline")
+    base = PROFILES["qwen35-baseline"]
     assert base.tiles_for(20, R=8) == baseline_tiles(20, R=8)
     assert profile_mod.approx_features(mk.DEFAULT_PROFILE) == ()
     assert profile_mod.approx_features(base) == ()  # the Qwen3.5 reference
     # Qwen3.5 profiles are measured against `qwen35-baseline`, not `default`.
-    c30 = mk.get_profile("qwen35-candidate30")
+    c30 = PROFILES["qwen35-candidate30"]
     feats = set(profile_mod.approx_features(c30))
     # Exactly its approx-class knobs; exact-class flags it turns on
     # (`pair_kv`, `kv_ering`, `gqa_qv`, `rel_fetch`, `nkv`, ...) are not listed.
@@ -105,7 +113,7 @@ def test_profile_numerics_are_derived_and_enforced():
         "tiles.moe.topk_lanes",
         "tiles.nbe",
     }
-    fused = mk.get_profile("qwen35-candidate30-fused")
+    fused = PROFILES["qwen35-candidate30-fused"]
     assert fused.numerics == "approx" and fused.fused_pool_io == "auto"
     assert fused.fused_pool_io_max_b == 48 and fused.pool_gather is True
     assert set(profile_mod.approx_features(fused)) == feats | {
@@ -191,13 +199,13 @@ def test_overrides_relabel_and_never_silently_stay_exact():
     e = d.with_overrides(pool_gather=True)  # GPR on every eligible bucket: approx
     assert (e.name, e.numerics) == ("default+overrides", "approx")
     assert profile_mod.approx_features(e) == ("pool_gather_eligible",)
-    c = mk.get_profile("qwen35-candidate30").with_overrides(fused_pool_io="auto")
+    c = PROFILES["qwen35-candidate30"].with_overrides(fused_pool_io="auto")
     assert (c.name, c.numerics) == ("qwen35-candidate30+overrides", "approx")
     assert c.with_overrides(fused_pool_io=True).name == "qwen35-candidate30+overrides"
 
 
 def test_candidate30_profiles_omit_internal_baseline_provenance():
-    assert not hasattr(qwen35.qwen35_candidate30, "CANDIDATE30_BASELINE")
+    assert not hasattr(qwen35.candidate30, "CANDIDATE30_BASELINE")
     for name in ("qwen35-baseline", "qwen35-candidate30", "qwen35-candidate30-fused"):
         p = mk.get_profile(name)
         assert p.baseline is None
@@ -530,13 +538,16 @@ def test_scratch_budget_overflow_is_config_error(field: str, match: str):
     assert not issubclass(mk.MegakernelConfigError, ValueError)
 
 
-def test_builtin_profiles_resolve_in_a_fresh_interpreter():
-    """`get_profile` works before any profile module was imported directly."""
+def test_template_profiles_resolve_by_name_once_registered():
+    """Importing the Qwen3.5 template registers nothing; `register()` makes
+    its profiles resolvable by name, in a fresh interpreter."""
     code = (
         "from vllm_torchtpu import megakernel as mk; "
+        "from vllm_torchtpu.models.qwen3_5.megakernel import model, profiles; "
+        "assert mk.list_profiles() == ('default',), mk.list_profiles(); "
+        "model.register(); "
         "print(mk.get_profile('qwen35-candidate30-fused').name); "
-        "from vllm_torchtpu.megakernel import models; "
-        "print(models.qwen35_candidate30.PROFILE.name)"
+        "print(profiles.candidate30.PROFILE.name)"
     )
     env = dict(os.environ, JAX_PLATFORMS="cpu")
     out = subprocess.run(
@@ -547,7 +558,7 @@ def test_builtin_profiles_resolve_in_a_fresh_interpreter():
 
 
 def test_builtin_profile_registration_is_idempotent():
-    c30 = mk.get_profile("qwen35-candidate30")
+    c30 = PROFILES["qwen35-candidate30"]
     assert mk.register_profile(c30) is c30
     assert mk.register_profile(dataclasses.replace(c30)) is c30  # equal: no-op
     with pytest.raises(ValueError, match="already registered"):
@@ -619,7 +630,7 @@ def test_candidate30_fused_mid_buckets_vs_split(
     tp = NamedSharding(mesh, P("tp"))
     g = _geom(moe_tp=False)
     spec = qwen35.qwen35_spec(g)
-    prof = mk.get_profile("qwen35-candidate30-fused")
+    prof = PROFILES["qwen35-candidate30-fused"]
     base = mk.ExecSpec(
         R=2,
         B=B,

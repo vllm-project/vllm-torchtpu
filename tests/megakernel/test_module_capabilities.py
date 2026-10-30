@@ -28,8 +28,8 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh
 
 from vllm_torchtpu import megakernel as mk
-from vllm_torchtpu.megakernel.models import qwen35
 from vllm_torchtpu.megakernel.ops import BF16, F32, rmsnorm, rnd
+from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
 
 
 @pytest.fixture(autouse=True)

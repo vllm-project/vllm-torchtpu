@@ -45,8 +45,8 @@ import vllm_torchtpu.megakernel as mk
 from vllm_torchtpu.megakernel import cache, kernel
 from vllm_torchtpu.megakernel.cache import should_fuse_pool_io
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
-from vllm_torchtpu.megakernel.models import qwen35
-from vllm_torchtpu.megakernel.profile import get_profile
+from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
+from vllm_torchtpu.models.qwen3_5.megakernel.profiles import PROFILES
 
 BF16 = jnp.bfloat16
 FP8 = jnp.float8_e4m3fn
@@ -78,7 +78,7 @@ def build_bucket_variants(
 ) -> list[tuple[str, ExecSpec, bool, str]]:
     """Return `(name, ex, fused_pool_io, numerics)` variants for bucket `(T, B)`."""
     g = spec.config
-    p_c30 = get_profile("qwen35-candidate30")
+    p_c30 = PROFILES["qwen35-candidate30"]
 
     ex_c30 = p_c30.exec_for(base, B=B, T=T, g=g)
     ex_c30_base_fused = mk.with_cache(ex_c30, pool_gather=False)
@@ -223,7 +223,7 @@ def test_tpu_v7x8_profile_interleaved_candidates():
     del w_f
     gc.collect()
 
-    p_def = get_profile("qwen35-baseline")
+    p_def = PROFILES["qwen35-baseline"]
     base = ExecSpec(
         R=8, ctx=4096, stack_e=True, cache=mk.CacheExec(paged_kv=True, num_pages=4096)
     )

@@ -45,7 +45,6 @@ from vllm_torchtpu.megakernel import (
 )
 from vllm_torchtpu.megakernel import pool as pool_pkg
 from vllm_torchtpu.megakernel import runtime as mk_rt
-from vllm_torchtpu.megakernel.models.qwen35 import Qwen35
 from vllm_torchtpu.megakernel_runtime import (
     TorchStepMetaOps,
     build_pooled_step_op,
@@ -69,6 +68,9 @@ from vllm_torchtpu.megakernel_runtime.pool_facts import (
     framework_pool_layout_facts,
 )
 
+from . import profiles
+from .model import Qwen35, register
+
 logger = init_logger(__name__)
 
 OPTION_KEYS = frozenset(
@@ -87,7 +89,7 @@ OPTION_KEYS = frozenset(
 # The profile `create` serves when `options` names none: the candidate30 goal
 # configuration (approximate numerics). `qwen35-baseline` (exact numerics) is
 # one option away: `{"options": {"profile": "qwen35-baseline"}}`.
-DEFAULT_PROFILE: str | None = "qwen35-candidate30-fused"
+DEFAULT_PROFILE: str | None = profiles.DEFAULT_PROFILE.name
 UNALIGNED_LAYOUT_MESSAGE = (
     "Megakernel requires unified KV+GDN cache layout "
     "(_unified_kv_layout=True); skipping."
@@ -116,6 +118,7 @@ def parse_options(options: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError(
             f"Qwen35Program: unknown option {bad[0]!r}; known: {sorted(OPTION_KEYS)}"
         )
+    register()  # profile names resolve through the library registry
     return mk_rt.parse_runtime_config(dict(options))
 
 
@@ -270,6 +273,7 @@ class Qwen35Program:
         pool_gather: bool | str | None = None,
         compile_hlo_check: bool | None = None,
     ) -> None:
+        register()
         _need(mode in ("ep", "tp"), f"invalid mode={mode!r}; expected 'ep' or 'tp'")
         self.model_def: type[ModelDef] = model_def
         self.model, self.backbone = model, find_backbone(model)

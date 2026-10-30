@@ -180,6 +180,10 @@ def _coerce_canonical_hf_entry(
     )
 
 
+# Public name for model folders' HF oracles (`hf_oracle.py`).
+coerce_canonical_hf_entry = _coerce_canonical_hf_entry
+
+
 def load_logical_weights(
     model_def: Any,
     ex: ExecSpec,
@@ -283,6 +287,7 @@ def load_hf(
 
 
 __all__ = [
+    "coerce_canonical_hf_entry",
     "load_hf",
     "load_logical_weights",
     "pack_logical_weights",

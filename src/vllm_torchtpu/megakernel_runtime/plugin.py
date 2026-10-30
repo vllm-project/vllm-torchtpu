@@ -62,7 +62,7 @@ class Shorthand(NamedTuple):
 # runtime never imports a template at module load.
 SHORTHANDS: Mapping[str, Shorthand] = {
     "qwen35": Shorthand(
-        module="vllm_torchtpu.megakernel_runtime.models.qwen35",
+        module="vllm_torchtpu.models.qwen3_5.megakernel",
         architectures=(
             "Qwen3_5MoeForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",

@@ -26,10 +26,10 @@ from __future__ import annotations
 import dataclasses
 from typing import Any
 
-from ..exec_spec import Tiles
-from ..modules.gqa import GQAModule, GQATunables
-from ..modules.moe import MoEModule
-from ..profile import Profile, register_profile
+from vllm_torchtpu.megakernel.exec_spec import Tiles
+from vllm_torchtpu.megakernel.modules.gqa import GQAModule, GQATunables
+from vllm_torchtpu.megakernel.modules.moe import MoEModule
+from vllm_torchtpu.megakernel.profile import Profile
 
 # `ModelSpec.name` and default HuggingFace config of the Qwen3.5-397B-A17B model.
 QWEN35_MODEL_NAME = "qwen3_5"
@@ -103,18 +103,16 @@ def baseline_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
     return t
 
 
-PROFILE = register_profile(
-    Profile(
-        name="qwen35-baseline",
-        model=QWEN35_MODEL_NAME,
-        numerics="exact",
-        model_default=True,
-        tiles=baseline_tiles,
-        description=(
-            "Qwen3.5 default reference profile: conservative per-bucket tiles, "
-            "split pool I/O, no in-kernel gather, all opt-in performance flags off."
-        ),
-    )
+PROFILE = Profile(
+    name="qwen35-baseline",
+    model=QWEN35_MODEL_NAME,
+    numerics="exact",
+    model_default=True,
+    tiles=baseline_tiles,
+    description=(
+        "Qwen3.5 default reference profile: conservative per-bucket tiles, "
+        "split pool I/O, no in-kernel gather, all opt-in performance flags off."
+    ),
 )
 
 __all__ = [

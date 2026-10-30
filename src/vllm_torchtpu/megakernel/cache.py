@@ -58,7 +58,7 @@ from .cache_flat import make_flat_pooled_step
 from .cache_hlo import check_pooled_step_hlo
 from .cache_pooled import make_pooled_step
 from .exec_spec import ExecSpec
-from .model_def import get_model
+from .model_def import find_model, get_model
 from .pool.config import with_cache
 
 
@@ -66,7 +66,10 @@ def _resolve_pool_layout(g_or_lay: Any, ex: ExecSpec) -> pool.PoolLayout:
     if isinstance(g_or_lay, pool.PoolLayout):
         return g_or_lay
     ms = resolve_model_spec(g_or_lay)
-    return get_model(ms.name).pool_layout(ms.config, R=ex.R)
+    # A geometry derived from a `ModelDef` names it (`_model_def`), so an
+    # unregistered model folder's geometry resolves too.
+    m_def = find_model(g_or_lay) or get_model(ms.name)
+    return m_def.pool_layout(ms.config, R=ex.R)
 
 
 def default_pool_layout(g: Any, ex: ExecSpec) -> tuple[Any, ...]:

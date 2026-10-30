@@ -11,18 +11,4 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Model specifications and reference oracles built on the TPU megakernel library."""
-
-from . import (
-    qwen35,
-    qwen35_candidate30,
-    qwen35_pool,
-    qwen35_profile,
-)
-
-__all__ = [
-    "qwen35",
-    "qwen35_candidate30",
-    "qwen35_pool",
-    "qwen35_profile",
-]
+"""Qwen3.5: the megakernel model folder (`megakernel/`)."""

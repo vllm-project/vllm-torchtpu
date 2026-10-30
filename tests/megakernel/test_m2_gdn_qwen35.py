@@ -31,11 +31,14 @@ from jax.sharding import PartitionSpec as P
 import vllm_torchtpu.megakernel as mk
 from vllm_torchtpu.megakernel import kernel, planner
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
-from vllm_torchtpu.megakernel.models import qwen35
-from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES, baseline_tiles
 from vllm_torchtpu.megakernel.modules.gdn import GDNModule
 from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, I32, rmsnorm, rnd, rup
 from vllm_torchtpu.megakernel.spec import LayerType, ModelSpec
+from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
+from vllm_torchtpu.models.qwen3_5.megakernel.profiles.baseline import (
+    TINY_TILES,
+    baseline_tiles,
+)
 
 
 def _can_compile_tpu7x() -> bool:

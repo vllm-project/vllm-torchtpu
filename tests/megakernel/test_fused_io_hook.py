@@ -19,7 +19,7 @@ import pytest
 
 from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel import fused_io_hook
-from vllm_torchtpu.megakernel.models import qwen35
+from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
 
 
 def _spec_and_exec() -> tuple[mk.ModelSpec, mk.ExecSpec]:

@@ -11,4 +11,4 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Megakernel templates: each subpackage is a model folder (`SPEC`)."""
+"""CPU tests of the Qwen3.5 megakernel folder (no TPU), and their tiny geometry."""

@@ -18,7 +18,7 @@ from __future__ import annotations
 import pytest
 
 from vllm_torchtpu.megakernel.exec_spec import Tiles
-from vllm_torchtpu.megakernel.models.qwen35_profile import (
+from vllm_torchtpu.models.qwen3_5.megakernel.profiles.baseline import (
     DECODE_TILES,
     baseline_tiles,
 )

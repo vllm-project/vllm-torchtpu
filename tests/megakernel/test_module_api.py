@@ -52,16 +52,16 @@ from vllm_torchtpu.megakernel import (
     kernel,
     planner,
 )
-from vllm_torchtpu.megakernel.models import qwen35
-from vllm_torchtpu.megakernel.models.qwen35_pool import (
-    qwen35_layer_cache_decls,
-    qwen35_pool_layout,
-)
 from vllm_torchtpu.megakernel.modules.gqa import GQATunables
 from vllm_torchtpu.megakernel.modules.transforms import apply_hf_transforms
 from vllm_torchtpu.megakernel.ops import BF16, F32, I32, rmsnorm, rnd, rup
 from vllm_torchtpu.megakernel.pool.config import resolved_max_pages_per_seq
 from vllm_torchtpu.megakernel.spec import combined_hf_param_shapes
+from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
+from vllm_torchtpu.models.qwen3_5.megakernel.pool import (
+    qwen35_layer_cache_decls,
+    qwen35_pool_layout,
+)
 
 
 def _make_mock_hf_config(g: qwen35.Qwen35Geometry) -> SimpleNamespace:
@@ -604,8 +604,8 @@ def _pack_single_module_step_inputs(
         if s_name in ("kc", "vc"):
             states_mk[s_name] = kernel.fold(logical_states[s_name])
         elif s_name == POOL_STATE_NAME:
-            pt, ckpt, roff, _ = qwen35.qwen35_pool.default_pool_layout(g, ex)
-            raw_pools = qwen35.qwen35_pool.states_to_pool(
+            pt, ckpt, roff, _ = qwen35.pool.default_pool_layout(g, ex)
+            raw_pools = qwen35.pool.states_to_pool(
                 g, ex, logical_states, pt, ckpt, roff
             )
             states_mk[POOL_STATE_NAME] = raw_pools
@@ -720,7 +720,7 @@ def test_gqa_module_reference_matches_kernel_make_step_cpu(T: int, paged_kv: boo
         name="gqa_single",
         config=g,
         layer_type=LayerType(name="gqa_only", slots=(gqa_mod,)),
-        cache_backend=qwen35.qwen35_pool.qwen35_pool_backend(g) if paged_kv else None,
+        cache_backend=qwen35.pool.qwen35_pool_backend(g) if paged_kv else None,
     )
     pos_mk, hid_mk, w_mk, st_mk = _pack_single_module_step_inputs(
         spec, g, ex, pos, hid_l, w_l, st_l, mesh

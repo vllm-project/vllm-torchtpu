@@ -26,19 +26,17 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
-from jax.sharding import Mesh, NamedSharding
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 import vllm_torchtpu.megakernel as mk
 import vllm_torchtpu.megakernel_runtime.driver as driver_mod
-from tests.megakernel_runtime.test_weight_collector import (
+from tests.models.qwen3_5.megakernel.test_weight_collector import (
     _jax_to_torch,
     make_synthetic_qwen35_backbone,
 )
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
-from vllm_torchtpu.megakernel.models import qwen35, qwen35_pool
-from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES
-from vllm_torchtpu.megakernel.pool.config import CacheExec, with_cache
+from vllm_torchtpu.megakernel.pool.config import with_cache
 from vllm_torchtpu.megakernel.runtime import (
     DEFAULT_BUCKETS,
     DEFAULT_VERIFY_BUCKETS,
@@ -64,16 +62,6 @@ from vllm_torchtpu.megakernel_runtime.config import (  # noqa: E402
 )
 from vllm_torchtpu.megakernel_runtime.driver import TorchStepMetaOps  # noqa: E402
 from vllm_torchtpu.megakernel_runtime.hooks import StepContext  # noqa: E402
-from vllm_torchtpu.megakernel_runtime.models import (  # noqa: E402
-    qwen35 as qwen_plugin,
-)
-from vllm_torchtpu.megakernel_runtime.models.qwen35 import (  # noqa: E402
-    adapter as qwen_adapter,
-)
-from vllm_torchtpu.megakernel_runtime.models.qwen35.adapter import (  # noqa: E402
-    Qwen35Program,
-    prepare_step_inputs_eager,
-)
 from vllm_torchtpu.megakernel_runtime.plugin import (  # noqa: E402
     Bucket,
     LayoutDecline,  # noqa: E402
@@ -81,6 +69,30 @@ from vllm_torchtpu.megakernel_runtime.plugin import (  # noqa: E402
 )
 from vllm_torchtpu.megakernel_runtime.weight_collector import (  # noqa: E402
     WEIGHT_FLIPPED_ATTR,
+)
+from vllm_torchtpu.models.qwen3_5 import (  # noqa: E402
+    megakernel as qwen_plugin,
+)
+from vllm_torchtpu.models.qwen3_5.megakernel import (  # noqa: E402
+    adapter as qwen_adapter,
+)
+from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
+from vllm_torchtpu.models.qwen3_5.megakernel import pool as qwen35_pool
+from vllm_torchtpu.models.qwen3_5.megakernel.adapter import (  # noqa: E402
+    Qwen35Program,
+    prepare_step_inputs_eager,
+)
+from vllm_torchtpu.models.qwen3_5.megakernel.tests.tiny import (
+    allocate_aliased_pools as _allocate_aliased_pools,
+)
+from vllm_torchtpu.models.qwen3_5.megakernel.tests.tiny import (
+    cpu_mesh as _cpu_mesh,
+)
+from vllm_torchtpu.models.qwen3_5.megakernel.tests.tiny import (
+    tiny_exec as _tiny_exec,
+)
+from vllm_torchtpu.models.qwen3_5.megakernel.tests.tiny import (
+    tiny_geom as _tiny_geom,
 )
 
 _REAL_FRAMEWORK_SLOT_FACTS = Qwen35Program._framework_slot_facts
@@ -223,54 +235,6 @@ def prepare_step_metadata(
     return pos_b, pt_b, ckpt_b, roff_b
 
 
-def _cpu_mesh(r: int = 1) -> Mesh:
-    return Mesh(np.array(jax.devices("cpu")[:r]), ("tp",))
-
-
-def _tiny_geom(L: int = 4, att_every: int = 4) -> qwen35.Qwen35Geometry:
-    return qwen35.Qwen35Geometry(
-        L=L,
-        att_every=att_every,
-        H=256,
-        NH=4,
-        NKV=1,
-        HD=256,
-        ROT=64,
-        KH=2,
-        VH=4,
-        KD=128,
-        VD=128,
-        E=128,
-        TOPK=2,
-        I=256,
-        IS=256,
-        moe_tp=False,
-        e_slots=0,
-    )
-
-
-def _tiny_exec(
-    R: int = 1,
-    B: int = 2,
-    T: int = 1,
-    ctx: int = 256,
-    num_pages: int = 96,
-) -> ExecSpec:
-    tiles = replace(TINY_TILES, bank=512 << 10).with_modules(
-        {"gqa": {"kv_blk": min(TINY_TILES.module("gqa").kv_blk, ctx)}}
-    )
-    return ExecSpec(
-        R=R,
-        B=B,
-        T=T,
-        ctx=ctx,
-        stack_e=False,
-        tiles=tiles,
-        interpret=True,
-        cache=CacheExec(paged_kv=True, num_pages=num_pages, max_pages_per_seq=2),
-    )
-
-
 def _torch_to_jax(t: torch.Tensor, sharding: NamedSharding) -> jax.Array:
     if t.dtype == torch.float8_e4m3fn:
         arr = jnp.asarray(t.view(torch.uint8).numpy()).view(jnp.float8_e4m3fn)
@@ -279,22 +243,6 @@ def _torch_to_jax(t: torch.Tensor, sharding: NamedSharding) -> jax.Array:
     else:
         arr = jnp.asarray(t.numpy())
     return jax.device_put(arr, sharding)
-
-
-def _allocate_aliased_pools(
-    backbone: Any, g: qwen35.Qwen35Geometry, num_pages: int
-) -> list[torch.Tensor]:
-    raw_pools_t: list[torch.Tensor] = []
-    for r in range(g.NATT):
-        pool_u8 = torch.zeros((num_pages, 2, 64, 4, 128), dtype=torch.uint8)
-        pool = pool_u8.view(torch.float8_e4m3fn)
-        att_layer = backbone.layers[g.att_every * r + 3]
-        att_layer.self_attn.attn.kv_cache = [pool]
-        for g_idx in range(3):
-            la_layer = backbone.layers[g.att_every * r + g_idx]
-            la_layer.linear_attn.kv_cache = [pool]
-        raw_pools_t.append(pool)
-    return raw_pools_t
 
 
 def _make_backbone_from_logical_weights(

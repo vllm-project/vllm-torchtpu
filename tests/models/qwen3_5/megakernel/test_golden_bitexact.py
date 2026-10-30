@@ -62,8 +62,8 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu import megakernel as mk
-from vllm_torchtpu.megakernel.models import qwen35
 from vllm_torchtpu.megakernel.modules.gqa import GQATunables
+from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
 
 GOLDEN = pathlib.Path(__file__).parent / "golden" / "b1_bitexact.json"
 _META_KEY = "_meta"

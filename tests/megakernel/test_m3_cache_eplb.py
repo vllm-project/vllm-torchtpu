@@ -27,8 +27,12 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu import megakernel as mk
-from vllm_torchtpu.megakernel.models import qwen35
-from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES, baseline_tiles
+from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
+from vllm_torchtpu.models.qwen3_5.megakernel.profiles import PROFILES
+from vllm_torchtpu.models.qwen3_5.megakernel.profiles.baseline import (
+    TINY_TILES,
+    baseline_tiles,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -2421,7 +2425,7 @@ def test_candidate30_fused_profile_vs_split(B: int, seed: int):
     tp = NamedSharding(mesh, P("tp"))
     g = _tiny_geom(L=4, att_every=4)
     spec = qwen35.qwen35_spec(g)
-    prof = mk.get_profile("qwen35-candidate30-fused")
+    prof = PROFILES["qwen35-candidate30-fused"]
     base = mk.ExecSpec(
         R=2,
         B=B,

@@ -30,12 +30,13 @@ from __future__ import annotations
 
 import dataclasses
 
-from ..exec_spec import Tiles
-from ..modules.gdn import GDNModule
-from ..modules.gqa import GQAModule
-from ..modules.moe import MoEModule
-from ..profile import Profile, register_profile
-from .qwen35_profile import QWEN35_MODEL_NAME
+from vllm_torchtpu.megakernel.exec_spec import Tiles
+from vllm_torchtpu.megakernel.modules.gdn import GDNModule
+from vllm_torchtpu.megakernel.modules.gqa import GQAModule
+from vllm_torchtpu.megakernel.modules.moe import MoEModule
+from vllm_torchtpu.megakernel.profile import Profile
+
+from .baseline import QWEN35_MODEL_NAME
 
 _GQA, _GDN, _MOE = GQAModule.name, GDNModule.name, MoEModule.name
 # Opt-in performance flags enabled by this profile (core, then per module).
@@ -104,16 +105,14 @@ _DESCRIPTION = (
     "conv staging from B>=8, GPR auto. Numerics: approx."
 )
 
-PROFILE = register_profile(
-    Profile(
-        name="qwen35-candidate30",
-        model=QWEN35_MODEL_NAME,
-        numerics="approx",
-        tiles=candidate30_tiles,
-        fused_pool_io=False,
-        pool_gather=None,
-        description=_DESCRIPTION,
-    )
+PROFILE = Profile(
+    name="qwen35-candidate30",
+    model=QWEN35_MODEL_NAME,
+    numerics="approx",
+    tiles=candidate30_tiles,
+    fused_pool_io=False,
+    pool_gather=None,
+    description=_DESCRIPTION,
 )
 
 # Selective 1-launch fused pool I/O profile (`auto` with `fused_pool_io_max_b=48`,
@@ -121,19 +120,17 @@ PROFILE = register_profile(
 # `32 < B <= 48` (EP), and `pool_gather=True` fallback when fused pool I/O is
 # disabled. Requires pool donation (enforced) and driver IR verification on every
 # fused bucket.
-FUSED_PROFILE = register_profile(
-    dataclasses.replace(
-        PROFILE,
-        name="qwen35-candidate30-fused",
-        tiles=candidate30_fused_tiles,
-        fused_pool_io="auto",
-        fused_pool_io_max_b=48,
-        pool_gather=True,
-        description=(
-            _DESCRIPTION + " Plus experimental fused pool I/O (auto, max_b=48), "
-            "nbe=16/nkv=4 at 32<B<=48 EP, and GPR where eligible."
-        ),
-    )
+FUSED_PROFILE = dataclasses.replace(
+    PROFILE,
+    name="qwen35-candidate30-fused",
+    tiles=candidate30_fused_tiles,
+    fused_pool_io="auto",
+    fused_pool_io_max_b=48,
+    pool_gather=True,
+    description=(
+        _DESCRIPTION + " Plus experimental fused pool I/O (auto, max_b=48), "
+        "nbe=16/nkv=4 at 32<B<=48 EP, and GPR where eligible."
+    ),
 )
 
 __all__ = [

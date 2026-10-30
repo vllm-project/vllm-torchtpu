@@ -46,7 +46,9 @@ def make_candidate_profile(
 ) -> Any:
     """Create a candidate `Profile` overriding `(nbd, nbe, nkv, gdn_rows, hier)`."""
     from vllm_torchtpu.megakernel.profile import Profile, get_profile
+    from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
 
+    qwen35.register()  # resolve the Qwen3.5 profiles by name
     base_prof = get_profile(base_profile_name)
     base_rule = base_prof.tiles
 

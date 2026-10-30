@@ -26,11 +26,18 @@ from jax.sharding import Mesh
 
 import vllm_torchtpu.megakernel as mk
 from tests.megakernel.frozen_utils import load_frozen_qwen35
-from vllm_torchtpu.megakernel.models import qwen35
-from vllm_torchtpu.megakernel.models.qwen35_candidate30 import (
+from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
+from vllm_torchtpu.models.qwen3_5.megakernel.profiles import PROFILES
+from vllm_torchtpu.models.qwen3_5.megakernel.profiles.baseline import (
+    TINY_TILES,
+    baseline_tiles,
+)
+from vllm_torchtpu.models.qwen3_5.megakernel.profiles.candidate30 import (
     candidate30_tiles,
 )
-from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES, baseline_tiles
+
+# For the library's by-name lookups (the model, its profiles, its default).
+qwen35.register()
 
 
 def _tile_value(t: mk.Tiles, name: str) -> object:
@@ -59,14 +66,14 @@ def test_qwen35_baseline_tiles_match_frozen_kernel_schedule():
         tf = frozen_mk.default_tiles(c)
         if B > 48:
             tf = dataclasses.replace(tf, nbe=6)
-        tl = mk.get_profile("qwen35-baseline").tiles_for(B, R=8)
+        tl = PROFILES["qwen35-baseline"].tiles_for(B, R=8)
         for name in frozen_fields:
             assert _tile_value(tl, name) == getattr(tf, name), (B, name)
 
 
 def test_qwen35_baseline_tiles_schedule_invariants():
     """Verify `qwen35-baseline` `tiles_for(B, R=8)` invariants across `B=1..64`."""
-    prof = mk.get_profile("qwen35-baseline")
+    prof = PROFILES["qwen35-baseline"]
     for B in range(1, 65):
         tl = prof.tiles_for(B, R=8)
         assert tl == baseline_tiles(B, R=8)
@@ -103,7 +110,7 @@ def test_profile_registry_and_default_profile():
 def test_qwen35_declares_baseline_as_its_default_profile():
     name = qwen35.qwen35_spec(qwen35.FULL).name
     b = mk.model_default_profile(name)
-    assert b is mk.get_profile("qwen35-baseline")
+    assert b is PROFILES["qwen35-baseline"]
     assert b.model == name and b.model_default and b.numerics == "exact"
     assert b.fused_pool_io is False and b.pool_gather is False
     assert b.tiles is baseline_tiles
@@ -116,7 +123,7 @@ def test_qwen35_declares_baseline_as_its_default_profile():
 
 
 def test_candidate30_profile_carries_m5_tuning():
-    p = mk.get_profile("qwen35-candidate30")
+    p = PROFILES["qwen35-candidate30"]
     assert p.model == qwen35.qwen35_spec(qwen35.FULL).name
     assert p.numerics == "approx"
     assert p.pool_gather is None  # GPR auto
@@ -167,7 +174,7 @@ def test_candidate30_conv_stage_only_from_b8(R: int, moe_tp: bool):
 
 
 def test_profile_exec_for_respects_explicit_tiles():
-    p = mk.get_profile("qwen35-candidate30")
+    p = PROFILES["qwen35-candidate30"]
     base = mk.ExecSpec(R=8, cache=mk.CacheExec(paged_kv=True))
     ex = p.exec_for(base, B=16, T=4, g=qwen35.FULL_EP)
     assert (ex.B, ex.T) == (16, 4)
@@ -179,7 +186,7 @@ def test_profile_exec_for_respects_explicit_tiles():
     d = mk.get_profile("default").exec_for(base, B=8, T=1)
     assert d.tiles is None and d.resolved_tiles == mk.default_tiles(8)
     assert mk.cache_exec(d).pool_gather is False
-    q = mk.get_profile("qwen35-baseline").exec_for(base, B=8, T=1)
+    q = PROFILES["qwen35-baseline"].exec_for(base, B=8, T=1)
     assert q.tiles == baseline_tiles(8, R=8)
 
 

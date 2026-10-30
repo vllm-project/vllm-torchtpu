@@ -289,7 +289,6 @@ def plan_bucket_stats(
     """
     from vllm_torchtpu.megakernel import vmem
     from vllm_torchtpu.megakernel.exec_spec import ExecSpec
-    from vllm_torchtpu.megakernel.models import qwen35
     from vllm_torchtpu.megakernel.modules.gdn import GDNModule, GDNTunables
     from vllm_torchtpu.megakernel.modules.gqa import GQAModule, GQATunables
     from vllm_torchtpu.megakernel.modules.moe import MoEModule, MoETunables
@@ -298,7 +297,9 @@ def plan_bucket_stats(
         align_cache_exec,
         bucket_exec_spec,
     )
+    from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
 
+    qwen35.register()  # resolve the Qwen3.5 profiles by name
     prof = (
         profile_or_name
         if isinstance(profile_or_name, Profile)
@@ -694,12 +695,12 @@ def compile_bucket_in_process(
     import vllm_torchtpu.megakernel as mk
     from vllm_torchtpu.megakernel import cache
     from vllm_torchtpu.megakernel.exec_spec import ExecSpec
-    from vllm_torchtpu.megakernel.models import qwen35
     from vllm_torchtpu.megakernel.profile import Profile, get_profile
     from vllm_torchtpu.megakernel.runtime.policy import (
         align_cache_exec,
         bucket_exec_spec,
     )
+    from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
 
     static_stats = plan_bucket_stats(
         profile_or_name,

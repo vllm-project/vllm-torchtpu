@@ -296,8 +296,11 @@ def test_no_frozen_references_in_owned_files() -> None:
     """
     repo_root = pathlib.Path(__file__).resolve().parents[3]
     owned_paths = [
-        repo_root / "src/vllm_torchtpu/megakernel/models/qwen35_profile.py",
-        repo_root / "src/vllm_torchtpu/megakernel/models/qwen35_candidate30.py",
+        *sorted(
+            (repo_root / "src/vllm_torchtpu/models/qwen3_5/megakernel/profiles").glob(
+                "*.py"
+            )
+        ),
         *sorted((repo_root / "src/vllm_torchtpu/megakernel/profiles").glob("*.py")),
         *sorted((repo_root / "tests/megakernel/perf").glob("*.py")),
         *sorted((repo_root / "tests/megakernel/perf").glob("*.sh")),
@@ -323,7 +326,7 @@ def test_profile_interleaved_bench_variants_and_pair_summary() -> None:
 
     import vllm_torchtpu.megakernel as mk
     from vllm_torchtpu.megakernel.exec_spec import ExecSpec
-    from vllm_torchtpu.megakernel.models import qwen35
+    from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
 
     tpu_profile_interleaved_bench.test_profile_interleaved_helper_unit()
 

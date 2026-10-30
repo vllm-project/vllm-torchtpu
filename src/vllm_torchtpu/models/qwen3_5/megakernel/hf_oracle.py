@@ -26,19 +26,17 @@ from typing import Any
 
 import numpy as np
 
-from ..decls import HFParamDecl
-from ..derive import hf_config_for_geometry
-from ..exec_spec import ExecSpec
-from ..geometry import ModelGeometry
-from ..model_def import get_model
-from ..ops import F32
-from ..spec import SwitchSlot
-from ..weights.logical import (
-    _coerce_canonical_hf_entry,
+from vllm_torchtpu.megakernel.decls import HFParamDecl
+from vllm_torchtpu.megakernel.derive import hf_config_for_geometry
+from vllm_torchtpu.megakernel.exec_spec import ExecSpec
+from vllm_torchtpu.megakernel.geometry import ModelGeometry
+from vllm_torchtpu.megakernel.ops import F32
+from vllm_torchtpu.megakernel.spec import SwitchSlot
+from vllm_torchtpu.megakernel.weights.logical import (
+    coerce_canonical_hf_entry,
     resolve_spec_and_norms,
     switch_branch_for_layer,
 )
-from .qwen35_profile import QWEN35_MODEL_NAME
 
 QWEN35_HF_TEXT_MODEL_TYPE = "qwen3_5_moe_text"
 QWEN35_HF_LAYER_PREFIX = "model.layers.{l}."
@@ -53,13 +51,13 @@ def _dequantize_decl_to_torch(
     ord_idx: int | None = None,
 ) -> Any:
     has_l = ord_idx is not None
-    arr_c = _coerce_canonical_hf_entry(d, w_hf_q, {}, has_layer_dim=has_l)
+    arr_c = coerce_canonical_hf_entry(d, w_hf_q, {}, has_layer_dim=has_l)
     arr_f32 = np.asarray((arr_c[ord_idx] if has_l else arr_c).astype(F32))
     s_decl = next(
         (sd for sd in by_name.values() if sd.transform.scale_for == d.name), None
     )
     if s_decl is not None and s_decl.name in w_hf_q:
-        s_c = _coerce_canonical_hf_entry(s_decl, w_hf_q, {}, has_layer_dim=has_l)
+        s_c = coerce_canonical_hf_entry(s_decl, w_hf_q, {}, has_layer_dim=has_l)
         s_f32 = np.asarray((s_c[ord_idx] if has_l else s_c).astype(F32))
         if s_f32.shape != arr_f32.shape:
             s_f32 = np.expand_dims(s_f32, axis=-2)
@@ -264,7 +262,9 @@ def qwen35_hf_oracle(
 
     backbone = states.get("_hf_backbone")
     if backbone is None:
-        m_def = getattr(g, "_model_def", None) or get_model(QWEN35_MODEL_NAME)
+        from .model import Qwen35
+
+        m_def = getattr(g, "_model_def", None) or Qwen35
         hf_model = _instantiate_qwen35_hf_model(m_def, g, torch, transformers)
         _populate_qwen35_hf_state_dict(m_def, g, ex, weights, hf_model, torch)
         backbone = getattr(hf_model, "model", hf_model)

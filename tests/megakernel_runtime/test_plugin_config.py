@@ -303,6 +303,22 @@ _LEGACY_ADD = (
 )
 
 
+@pytest.fixture
+def _template_profile_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The legacy inputs name the Qwen3.5 template's profiles; register
+    stand-ins under those names (the runtime's tests import no model folder)."""
+    from vllm_torchtpu.megakernel import Profile, register_profile
+    from vllm_torchtpu.megakernel import profile as profile_mod
+
+    monkeypatch.setattr(profile_mod, "_REGISTRY", dict(profile_mod._REGISTRY))
+    for name in ("qwen35-baseline", "qwen35-candidate30", "qwen35-candidate30-fused"):
+        if name not in profile_mod._REGISTRY:
+            register_profile(
+                Profile(name=name, numerics="approx", fused_pool_io="auto")
+            )
+
+
+@pytest.mark.usefixtures("_template_profile_names")
 @pytest.mark.parametrize("env", _LEGACY_ENV)
 @pytest.mark.parametrize("add", _LEGACY_ADD)
 def test_legacy_inputs_match_parse_runtime_config(env: Any, add: Any) -> None:
@@ -412,3 +428,4 @@ def test_import_plugin_errors(mod_dir: Path) -> None:
         cfg_mod.resolve_callable(".impl:missing", pkg, what="create")
     with pytest.raises(MegakernelConfigError, match="'module:attr'"):
         cfg_mod.resolve_callable("noattr", pkg, what="create")
+

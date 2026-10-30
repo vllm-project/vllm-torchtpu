@@ -23,15 +23,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..cache import (
+from vllm_torchtpu.megakernel.cache import (
     default_pool_layout,
     gather_gdn_states,
     pool_to_states,
     scatter_pool_states,
     states_to_pool,
 )
-from ..decls import KVCacheDecl, RecurrentCacheDecl
-from ..pool import (
+from vllm_torchtpu.megakernel.decls import KVCacheDecl, RecurrentCacheDecl
+from vllm_torchtpu.megakernel.pool import (
     PoolLayout,
     conv_to_raw_page,
     kv_to_raw_page,
@@ -40,28 +40,28 @@ from ..pool import (
     raw_pages_to_ssm,
     ssm_to_raw_pages,
 )
-from ..pool.config import PoolBackend
+from vllm_torchtpu.megakernel.pool.config import PoolBackend
 
 
 def qwen35_layer_cache_decls(
     g: Any,
 ) -> list[KVCacheDecl | RecurrentCacheDecl]:
     """Build the per-layer cache declaration sequence for `Qwen35`."""
-    from .qwen35 import Qwen35
+    from .model import Qwen35
 
     return Qwen35.layer_cache_decls(g)
 
 
 def qwen35_pool_layout(g: Any, *, R: int = 8) -> PoolLayout:
     """`PoolLayout` of `Qwen35Geometry`, derived from `Qwen35` schedule cache decls."""
-    from .qwen35 import Qwen35
+    from .model import Qwen35
 
     return Qwen35.pool_layout(g, R=R)
 
 
 def qwen35_pool_backend(g: Any, *, R: int = 8) -> PoolBackend:
     """Create the model-injected `PoolBackend` for `Qwen35Geometry`."""
-    from .qwen35 import Qwen35
+    from .model import Qwen35
 
     return Qwen35.pool_backend(g, R=R)
 

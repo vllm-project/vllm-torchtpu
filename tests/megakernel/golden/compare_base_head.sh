@@ -20,6 +20,11 @@
 # Usage:
 #   tests/megakernel/golden/compare_base_head.sh <base-ref> [-n N] [pytest-args...]
 #
+# The golden cases live with the model folder's tests: GOLDEN_TEST (default
+# tests/models/qwen3_5/megakernel/test_golden_bitexact.py, relative to the repo
+# root) on the current tree; on <base-ref>, the same path, or
+# tests/megakernel/test_golden_bitexact.py where the base predates the move.
+#
 # Note: <base-ref> must already include MK_GOLDEN_JSON support in
 # tests/megakernel/test_golden_bitexact.py. When <base-ref> predates the
 # `ref_tiny_*` reference_step cases, this script runs HEAD's `ref_tiny_*`
@@ -81,9 +86,14 @@ BASE_SHA="$(git -C "$REPO_ROOT" rev-parse --verify "$BASE_REF")"
 echo "=== [1/2] Generating base golden at $BASE_REF ($BASE_SHA) ==="
 git -C "$REPO_ROOT" worktree add --detach "$WT_DIR" "$BASE_SHA" >/dev/null
 
-BASE_TEST="$WT_DIR/tests/megakernel/test_golden_bitexact.py"
+GOLDEN_REL="${GOLDEN_TEST:-tests/models/qwen3_5/megakernel/test_golden_bitexact.py}"
+HEAD_TEST="$REPO_ROOT/$GOLDEN_REL"
+BASE_TEST="$WT_DIR/$GOLDEN_REL"
+if [[ ! -f "$BASE_TEST" ]]; then
+  BASE_TEST="$WT_DIR/tests/megakernel/test_golden_bitexact.py"
+fi
 if [[ ! -f "$BASE_TEST" ]] || ! grep -q "MK_GOLDEN_JSON" "$BASE_TEST"; then
-  echo "Error: <base-ref> ($BASE_REF) does not support MK_GOLDEN_JSON in tests/megakernel/test_golden_bitexact.py." >&2
+  echo "Error: <base-ref> ($BASE_REF) does not support MK_GOLDEN_JSON in $BASE_TEST." >&2
   exit 2
 fi
 
@@ -94,7 +104,7 @@ fi
     MK_REGEN_GOLDEN=1 \
     MK_GOLDEN_JSON="$BASE_JSON" \
     "$PYTEST_BIN" "$BASE_TEST" "$@" || [[ $? -eq 5 ]]
-  if grep -q "ref_tiny_" "$REPO_ROOT/tests/megakernel/test_golden_bitexact.py" && ! grep -q "ref_tiny_" "$BASE_TEST"; then
+  if grep -q "ref_tiny_" "$HEAD_TEST" && ! grep -q "ref_tiny_" "$BASE_TEST"; then
     HAS_K=0
     for arg in "$@"; do
       if [[ "$arg" == "-k" || "$arg" == -k* ]]; then
@@ -111,7 +121,7 @@ fi
         PYTHONPATH="$WT_DIR/src${PYTHONPATH:+:$PYTHONPATH}" \
         MK_REGEN_GOLDEN=1 \
         MK_GOLDEN_JSON="$BASE_JSON" \
-        "$PYTEST_BIN" "$REPO_ROOT/tests/megakernel/test_golden_bitexact.py" "${REF_ARGS[@]}" || [[ $? -eq 5 ]]
+        "$PYTEST_BIN" "$HEAD_TEST" "${REF_ARGS[@]}" || [[ $? -eq 5 ]]
     fi
   fi
 )
@@ -123,12 +133,13 @@ CMP_RC=0
   JAX_PLATFORMS="${JAX_PLATFORMS:-cpu}" \
     PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
     MK_GOLDEN_JSON="$BASE_JSON" \
-    "$PYTEST_BIN" "$REPO_ROOT/tests/megakernel/test_golden_bitexact.py" \
+    "$PYTEST_BIN" "$HEAD_TEST" \
     -v --junitxml="$HEAD_XML" "$@"
 ) || CMP_RC=$?
 
 PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
-  "$PYTHON_BIN" - "$BASE_JSON" "$HEAD_XML" "$REPO_ROOT" <<'PY'
+  "$PYTHON_BIN" - "$BASE_JSON" "$HEAD_XML" "$REPO_ROOT" "$GOLDEN_REL" <<'PY'
+import importlib
 import json
 import pathlib
 import sys
@@ -139,7 +150,8 @@ head_xml = pathlib.Path(sys.argv[2])
 repo_root = pathlib.Path(sys.argv[3])
 sys.path.insert(0, str(repo_root))
 
-from tests.megakernel import test_golden_bitexact as tgb  # noqa: E402
+golden_mod = ".".join(pathlib.Path(sys.argv[4]).with_suffix("").parts)
+tgb = importlib.import_module(golden_mod)
 
 base_data = json.loads(base_json.read_text())
 base_cases = set(base_data) - {tgb._META_KEY}

@@ -29,8 +29,6 @@ from jax.sharding import PartitionSpec as P
 import vllm_torchtpu.megakernel as mk
 from vllm_torchtpu.megakernel import planner
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
-from vllm_torchtpu.megakernel.models import qwen35
-from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES
 from vllm_torchtpu.megakernel.runtime import (
     verify_compiled_step_ir,
     verify_pooled_step_hlo,
@@ -40,6 +38,8 @@ from vllm_torchtpu.megakernel_runtime.exported_bridge import (
     execute_pooled_step_inplace,
     export_pooled_step,
 )
+from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
+from vllm_torchtpu.models.qwen3_5.megakernel.profiles.baseline import TINY_TILES
 
 
 def _cpu_mesh(r: int) -> Mesh:

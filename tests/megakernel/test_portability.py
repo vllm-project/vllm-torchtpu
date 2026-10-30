@@ -96,8 +96,6 @@ def test_megakernel_portability_ast_guard():
                     if isinstance(func, ast.Name)
                     else (func.attr if isinstance(func, ast.Attribute) else None)
                 )
-                if rel == "models/qwen35_hf.py" and func_name == "import_module":
-                    continue
                 # The lazy (PEP 562) package namespaces and the built-in
                 # registrations import their own submodules by name.
                 if rel in _LAZY_IMPORTERS and func_name == "import_module":
@@ -279,16 +277,16 @@ def _assignment_lines(path: Path, name: str) -> set[int]:
 
 
 def test_no_model_names_in_core_and_runtime():
-    """Forbid model-family substrings in `megakernel/` (outside `models/` & `profiles/`)
-    and in `megakernel_runtime/`.
+    """Forbid model-family substrings in `megakernel/` (outside `profiles/`) and
+    in `megakernel_runtime/`; models live in model folders
+    (`vllm_torchtpu.models.<model>.megakernel`).
     """
     pkg_root = Path(megakernel.__file__).resolve().parent
     rt_root = pkg_root.parent / "megakernel_runtime"
     forbidden_tokens = ("qwen", "llama", "deepseek", "mistral", "gemma")
 
-    # Templates under `megakernel_runtime/models/` are plugins; the runtime
-    # names them by string in two tables: the shorthand templates and the
-    # replacements of removed exports.
+    # Model folders are plugins; the runtime names them by string in two
+    # tables: the shorthand templates and the replacements of removed exports.
     allowed = {
         "megakernel_runtime/plugin.py": _assignment_lines(
             rt_root / "plugin.py", "SHORTHANDS"
@@ -301,13 +299,7 @@ def test_no_model_names_in_core_and_runtime():
     for root in (pkg_root, rt_root):
         for path in sorted(root.rglob("*.py")):
             rel = path.relative_to(pkg_root.parent).as_posix()
-            if rel.startswith(
-                (
-                    "megakernel/models/",
-                    "megakernel/profiles/",
-                    "megakernel_runtime/models/",
-                )
-            ):
+            if rel.startswith("megakernel/profiles/"):
                 continue
             checked += 1
             for lineno, line in enumerate(
@@ -342,13 +334,10 @@ def test_no_model_names_in_core_and_runtime():
 
 
 def test_b7_file_line_and_noqa_caps():
-    """Enforce `<= 400` lines (`<= 200` for `models/qwen35.py`) and 0 `# noqa` /
-    `# fmt: skip` on B5-B7 modules.
+    """Enforce `<= 400` lines and 0 `# noqa` / `# fmt: skip` on B5-B7 modules
+    (the Qwen3.5 model folder's `model.py` budget is in `test_model_def.py`).
     """
     pkg_root = Path(megakernel.__file__).resolve().parent
-    qwen_path = pkg_root / "models" / "qwen35.py"
-    qwen_lines = qwen_path.read_text(encoding="utf-8").splitlines()
-    assert len(qwen_lines) <= 200, f"models/qwen35.py has {len(qwen_lines)} > 200 lines"
 
     capped_globs = (
         "__init__.py",
@@ -359,7 +348,6 @@ def test_b7_file_line_and_noqa_caps():
         "schedule.py",
         "validate.py",
         "verify*.py",
-        "models/*.py",
         "profiles/*.py",
         "runtime/*.py",
         "weights/*.py",

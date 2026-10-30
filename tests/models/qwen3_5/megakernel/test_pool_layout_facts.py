@@ -23,7 +23,6 @@ import pytest
 import torch
 
 from vllm_torchtpu import gdn_pool_layout as gpl
-from vllm_torchtpu.megakernel.models.qwen35 import Qwen35
 from vllm_torchtpu.megakernel.runtime import (
     PoolLayoutFacts,
     compare_layout_facts,
@@ -33,6 +32,7 @@ from vllm_torchtpu.megakernel_runtime.pool_facts import (
     framework_pool_layout_facts,
     runner_block_size,
 )
+from vllm_torchtpu.models.qwen3_5.megakernel.model import Qwen35
 
 TP = 8
 

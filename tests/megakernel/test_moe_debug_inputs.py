@@ -32,10 +32,10 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel import cache, kernel, planner, vmem
-from vllm_torchtpu.megakernel.models import qwen35
-from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES
 from vllm_torchtpu.megakernel.modules import MoEDebug, MoEModule
 from vllm_torchtpu.megakernel.modules.moe import MoETunables
+from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
+from vllm_torchtpu.models.qwen3_5.megakernel.profiles.baseline import TINY_TILES
 
 R = 2
 _BOTH = MoEDebug(forced_routing=True, row_mask=True)

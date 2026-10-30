@@ -31,9 +31,12 @@ from tests.megakernel.megakernel_fakes import with_tile_fields
 from vllm_torchtpu.megakernel import kernel
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
-from vllm_torchtpu.megakernel.models import qwen35
-from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES, baseline_tiles
 from vllm_torchtpu.megakernel.ops import F32
+from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
+from vllm_torchtpu.models.qwen3_5.megakernel.profiles.baseline import (
+    TINY_TILES,
+    baseline_tiles,
+)
 
 
 def _can_compile_tpu7x() -> bool:

@@ -15,21 +15,21 @@
 
 The package `__init__` resolves names lazily, so importing `megakernel` no
 longer imports `megakernel.modules` (module tunables / debug options,
-registered by `Module.__init_subclass__`), `megakernel.models` or
-`megakernel.profiles` (built-in models and profiles), or
-`megakernel.experimental` (the fused pool I/O implementation). Registry
-lookups call `ensure_builtins(...)` first, for the packages their registry
-needs. A missing package (a partial tree, or one that moved out) is skipped.
+registered by `Module.__init_subclass__`) or `megakernel.experimental` (the
+fused pool I/O implementation). Registry lookups call `ensure_builtins(...)`
+first, for the packages their registry needs. A missing package (a partial
+tree, or one that moved out) is skipped. Models and their profiles live in
+model folders (`vllm_torchtpu.models.<model>.megakernel`), which register
+them explicitly.
 """
 
 from __future__ import annotations
 
 import importlib
 
-BUILTINS = ("modules", "models", "profiles", "experimental")
+BUILTINS = ("modules", "experimental")
 # The packages a registry's lookups need.
 TUNABLES = ("modules",)
-MODELS_AND_PROFILES = ("modules", "models", "profiles")
 FUSED_IO = ("experimental",)
 
 _LOADED: set[str] = set()
@@ -40,7 +40,7 @@ def ensure_builtins(*names: str) -> None:
 
     A lookup only loads what its registry needs: a module-tunables lookup
     runs while `profile` itself is being imported (building
-    `DEFAULT_PROFILE`), when `models` / `profiles` can't be imported yet.
+    `DEFAULT_PROFILE`).
     """
     for name in names or BUILTINS:
         if name in _LOADED:

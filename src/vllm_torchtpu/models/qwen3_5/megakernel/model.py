@@ -19,15 +19,33 @@ import dataclasses
 from dataclasses import dataclass
 from typing import Any
 
-from .. import cache, kernel
-from ..exec_spec import ExecSpec
-from ..geometry import _GEOM_FIELD_NAMES, FromHF, ModelGeometry
-from ..model_def import LMHead, ModelDef, register_model
-from ..modules import GDN, GQA, Embedding, GDNModule, GQAModule, MoE, MoEModule, Norm
-from ..schedule import FromHFLayerTypes, Schedule
-from ..spec import ModelSpec, Module
-from . import qwen35_candidate30, qwen35_hf, qwen35_pool
-from .qwen35_profile import DEFAULT_HF_CONFIG, PROFILE, QWEN35_MODEL_NAME
+from vllm_torchtpu.megakernel import cache, kernel
+from vllm_torchtpu.megakernel.exec_spec import ExecSpec
+from vllm_torchtpu.megakernel.geometry import FromHF, ModelGeometry
+from vllm_torchtpu.megakernel.model_def import (
+    LMHead,
+    ModelDef,
+    find_model,
+    register_model,
+)
+from vllm_torchtpu.megakernel.modules import (
+    GDN,
+    GQA,
+    Embedding,
+    GDNModule,
+    GQAModule,
+    MoE,
+    MoEModule,
+    Norm,
+)
+from vllm_torchtpu.megakernel.schedule import FromHFLayerTypes, Schedule
+from vllm_torchtpu.megakernel.spec import ModelSpec, Module
+
+from . import hf_oracle, pool
+from .profiles import baseline, candidate30
+from .profiles.baseline import DEFAULT_HF_CONFIG, QWEN35_MODEL_NAME
+
+_GEOM_FIELDS = tuple(f.name for f in dataclasses.fields(ModelGeometry))
 
 
 def accept_states(g: Any, ex: ExecSpec, st: dict[str, Any], acc: Any) -> dict[str, Any]:
@@ -40,7 +58,7 @@ _REEXPORTS = (
     GDNModule,
     GQAModule,
     MoEModule,
-    qwen35_pool,
+    pool,
     accept_states,
 )
 
@@ -50,7 +68,7 @@ class Qwen35Geometry(ModelGeometry):
     """Architecture geometry for Qwen3.5-397B-A17B."""
 
     def __init__(self, **overrides: Any) -> None:
-        if not set(_GEOM_FIELD_NAMES).issubset(overrides):
+        if not set(_GEOM_FIELDS).issubset(overrides):
             overrides = dataclasses.asdict(Qwen35.derive_geometry()) | overrides
         super().__init__(**overrides)
 
@@ -59,25 +77,27 @@ class Qwen35Geometry(ModelGeometry):
         return qwen35_spec(self)
 
 
-@register_model(
-    name=QWEN35_MODEL_NAME,
-    hf_architectures=(
+class Qwen35(ModelDef):
+    """Declarative model definition for Qwen3.5-397B-A17B.
+
+    Importing this module registers nothing: `register()` adds the model and
+    its profiles to the library registries (the template's `create` calls it).
+    """
+
+    name = QWEN35_MODEL_NAME
+    hf_architectures = (
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForCausalLM",
         "Qwen3_5ForCausalLM",
-    ),
-    hf_model_type=("qwen3_5_moe", "qwen3_5", "qwen3_5_moe_text"),
-)
-class Qwen35(ModelDef):
-    """Declarative model definition for Qwen3.5-397B-A17B."""
-
+    )
+    hf_model_type = ("qwen3_5_moe", "qwen3_5", "qwen3_5_moe_text")
     display_name = "Qwen3.5"
     supported_tp_sizes = (8,)
     geometry_cls = Qwen35Geometry
     layer_type_name = "qwen35_layer"
     default_hf_config = DEFAULT_HF_CONFIG
-    hf_oracle = staticmethod(qwen35_hf.qwen35_hf_oracle)
+    hf_oracle = staticmethod(hf_oracle.qwen35_hf_oracle)
     geometry = FromHF(
         hidden="hidden_size",
         layers="num_hidden_layers",
@@ -122,13 +142,28 @@ class Qwen35(ModelDef):
     final_norm = Norm.bind("model.norm", zero_centered=True)
     lm_head = LMHead("lm_head", tied_to=None)
     profiles = {
-        "default": PROFILE,
-        "candidate30": qwen35_candidate30.PROFILE,
-        "candidate30-fused": qwen35_candidate30.FUSED_PROFILE,
+        "default": baseline.PROFILE,
+        "candidate30": candidate30.PROFILE,
+        "candidate30-fused": candidate30.FUSED_PROFILE,
     }
 
 
 Qwen35Geometry._model_def = Qwen35
+
+
+def register() -> type[Qwen35]:
+    """Register `Qwen35` and its profiles with the library registries, for
+    the library's by-name lookups. Idempotent: once registered, the registries
+    are left as they are (a profile may have been replaced since)."""
+    if find_model(Qwen35.name) is Qwen35:
+        return Qwen35
+    return register_model(
+        name=Qwen35.name,
+        hf_architectures=Qwen35.hf_architectures,
+        hf_model_type=Qwen35.hf_model_type,
+    )(Qwen35)
+
+
 MKConfig = Qwen35Geometry
 FULL = Qwen35.derive_geometry(DEFAULT_HF_CONFIG, moe_tp=True)
 FULL_EP = dataclasses.replace(FULL, moe_tp=False)

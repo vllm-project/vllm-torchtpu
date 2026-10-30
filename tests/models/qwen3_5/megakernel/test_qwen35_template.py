@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The Qwen3.5 template as a plugin: shorthand equivalence, a collective-free
-`create`, the public-surface guard and the stdlib-only plugin module."""
+`create` and the stdlib-only plugin module (the public-surface guard over
+every model folder is `tests/megakernel_runtime/test_template_surface.py`)."""
 
 from __future__ import annotations
 
@@ -30,24 +31,24 @@ import pytest
 import torch
 
 import vllm_torchtpu.megakernel_runtime.driver as driver_mod
-from tests.megakernel_runtime.test_vllm_qwen35_e2e import (
+from tests.models.qwen3_5.megakernel.test_vllm_qwen35_e2e import (
     _allocate_aliased_pools,
     _cpu_mesh,
     _tiny_exec,
     _tiny_geom,
 )
-from tests.megakernel_runtime.test_weight_collector import (
+from tests.models.qwen3_5.megakernel.test_weight_collector import (
     make_synthetic_qwen35_backbone,
 )
 from vllm_torchtpu.megakernel import Profile, register_profile
 from vllm_torchtpu.megakernel import profile as profile_mod
-from vllm_torchtpu.megakernel.models import qwen35
 from vllm_torchtpu.megakernel.runtime import EligibilityResult, facts_from_pool_layout
 from vllm_torchtpu.megakernel_runtime import testing
 from vllm_torchtpu.megakernel_runtime.hooks import StepContext
-from vllm_torchtpu.megakernel_runtime.models import qwen35 as qwen_plugin
-from vllm_torchtpu.megakernel_runtime.models.qwen35 import adapter
 from vllm_torchtpu.megakernel_runtime.plugin import SHORTHANDS, RunnerView
+from vllm_torchtpu.models.qwen3_5 import megakernel as qwen_plugin
+from vllm_torchtpu.models.qwen3_5.megakernel import adapter
+from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35
 
 _RT = Path(driver_mod.__file__).resolve().parent
 _SRC = _RT.parents[1]
@@ -84,7 +85,7 @@ _FRESH = """
 import sys
 for name in ("torch", "jax", "jaxlib", "vllm", "numpy"):
     sys.modules[name] = None
-import vllm_torchtpu.megakernel_runtime.models.qwen35 as t
+import vllm_torchtpu.models.qwen3_5.megakernel as t
 from vllm_torchtpu.megakernel_runtime.salt import compile_cache_salt
 assert t.SPEC.name == "qwen35"
 cfg = type("C", (), {"additional_config": {"megakernel": {"plugin": "qwen35"}}})()
@@ -102,80 +103,6 @@ def test_template_plugin_imports_without_torch_jax_or_vllm() -> None:
         timeout=120,
     )
     assert out.returncode == 0 and out.stdout.strip() == "OK", out.stderr
-
-
-# --- Public-surface guard on templates ------------------------------------------
-
-_FORBIDDEN_MODULES = (
-    "vllm_torchtpu.megakernel_runtime.driver",
-    "vllm_torchtpu.megakernel_runtime.config",
-    "vllm_torchtpu.megakernel_runtime.fingerprint",
-    "vllm_torchtpu.megakernel_runtime.salt",
-    "vllm_torchtpu.runner",
-)
-
-
-def _surface_violations(path: Path, package: str) -> list[str]:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    bad: list[str] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
-            mod = node.module or ""
-            if node.level == 0:
-                if mod == package or mod.startswith(package + "."):
-                    bad.append(f"absolute sibling import {mod}")
-                if any(mod == f or mod.startswith(f + ".") for f in _FORBIDDEN_MODULES):
-                    bad.append(f"runtime internal import {mod}")
-            for alias in node.names:
-                if alias.name.startswith("_") and alias.name != "__future__":
-                    bad.append(f"private name {alias.name} from {mod}")
-        elif isinstance(node, ast.Import):
-            for alias in node.names:
-                if any(
-                    alias.name == f or alias.name.startswith(f + ".")
-                    for f in _FORBIDDEN_MODULES
-                ):
-                    bad.append(f"runtime internal import {alias.name}")
-    for node in tree.body:
-        call = node.value if isinstance(node, (ast.Expr, ast.Assign)) else None
-        if isinstance(call, ast.Call):
-            name = ast.unparse(call.func).rsplit(".", 1)[-1]
-            if name.startswith("register"):
-                bad.append(f"module-level {name}() call")
-        for deco in getattr(node, "decorator_list", ()):
-            target = deco.func if isinstance(deco, ast.Call) else deco
-            if ast.unparse(target).rsplit(".", 1)[-1].startswith("register"):
-                bad.append(f"module-level @{ast.unparse(target)}")
-    return bad
-
-
-def test_templates_use_only_the_public_surface() -> None:
-    models = _RT / "models"
-    checked = 0
-    for path in sorted(models.rglob("*.py")):
-        rel = path.relative_to(models)
-        if len(rel.parts) < 2:
-            continue
-        package = f"vllm_torchtpu.megakernel_runtime.models.{rel.parts[0]}"
-        assert _surface_violations(path, package) == [], rel
-        checked += 1
-    assert checked >= 2
-    assert (models / "__init__.py").read_text(encoding="utf-8").count("import") == 0
-
-
-def test_public_surface_guard_catches_violations(tmp_path: Path) -> None:
-    src = """
-from vllm_torchtpu.megakernel_runtime.driver import ProgramDriver
-from vllm_torchtpu.megakernel_runtime.models.mine.model import Mine
-from vllm_torchtpu.megakernel import _private_helper
-import vllm_torchtpu.runner.tpu_runner
-from vllm_torchtpu.megakernel import register_model
-register_model(Mine)
-"""
-    path = tmp_path / "bad.py"
-    path.write_text(src, encoding="utf-8")
-    bad = _surface_violations(path, "vllm_torchtpu.megakernel_runtime.models.mine")
-    assert len(bad) == 5, bad
 
 
 # --- create: no collective, no weights ------------------------------------------
@@ -523,7 +450,7 @@ def test_every_template_decline_is_in_the_vote_table() -> None:
 
     # Static scan: the adapter and the library checks it calls emit nothing else.
     lib = Path(mk_lib.__file__).resolve().parent
-    scanned = _false_result_codes(_RT / "models" / "qwen35" / "adapter.py")
+    scanned = _false_result_codes(Path(adapter.__file__))
     scanned |= _false_result_codes(lib / "validate.py", "validate_model_hf_config")
     scanned |= _false_result_codes(lib / "runtime" / "layout_facts.py")
     elig = lib / "runtime" / "eligibility.py"

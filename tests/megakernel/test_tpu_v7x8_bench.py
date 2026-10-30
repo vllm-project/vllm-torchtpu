@@ -52,10 +52,6 @@ from vllm_torchtpu.megakernel import (  # noqa: E402
 )
 from vllm_torchtpu.megakernel.cache import should_fuse_pool_io  # noqa: E402
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec  # noqa: E402
-from vllm_torchtpu.megakernel.models import qwen35  # noqa: E402
-from vllm_torchtpu.megakernel.models.qwen35_profile import (  # noqa: E402
-    baseline_tiles,
-)
 from vllm_torchtpu.megakernel.modules.gdn import GDNModule  # noqa: E402
 from vllm_torchtpu.megakernel.ops import (  # noqa: E402
     BF16,
@@ -64,7 +60,11 @@ from vllm_torchtpu.megakernel.ops import (  # noqa: E402
     I32,
     rup,
 )
-from vllm_torchtpu.megakernel.profile import get_profile  # noqa: E402
+from vllm_torchtpu.models.qwen3_5.megakernel import model as qwen35  # noqa: E402
+from vllm_torchtpu.models.qwen3_5.megakernel.profiles import PROFILES  # noqa: E402
+from vllm_torchtpu.models.qwen3_5.megakernel.profiles.baseline import (  # noqa: E402
+    baseline_tiles,
+)
 
 # Qwen3.5 baseline tile rule (bit-exact with the frozen kernel); the bisect
 # bench below swaps this module global for a flagged variant.
@@ -1092,7 +1092,7 @@ def _assert_driver_created_from_real_qwen35_config(mesh: Mesh, g: Any) -> None:
     import unittest.mock as mock
 
     from vllm_torchtpu.megakernel_runtime import driver as driver_mod
-    from vllm_torchtpu.megakernel_runtime.models.qwen35.adapter import Qwen35Program
+    from vllm_torchtpu.models.qwen3_5.megakernel.adapter import Qwen35Program
 
     frozen_cfg = load_frozen_qwen35_config_json()
     fake_mlp = types.SimpleNamespace(
@@ -2167,8 +2167,8 @@ def test_m5_tpu_v7x8_profile_ablation_bench():
     del w_f
     gc.collect()
 
-    p_def = get_profile("qwen35-baseline")
-    p_c30 = get_profile("qwen35-candidate30")
+    p_def = PROFILES["qwen35-baseline"]
+    p_c30 = PROFILES["qwen35-candidate30"]
     base = ExecSpec(
         R=8, ctx=4096, stack_e=True, cache=mk.CacheExec(paged_kv=True, num_pages=4096)
     )
@@ -2312,7 +2312,7 @@ def test_fused_vs_split_t4_tpu_bitwise(tiles: str, B: int, seed: int):
         )
         key = 710 + T * 10 + B + 1000 * seed
     else:
-        prof = get_profile("qwen35-candidate30-fused")
+        prof = PROFILES["qwen35-candidate30-fused"]
         base = ExecSpec(
             R=2,
             B=B,
@@ -2423,7 +2423,7 @@ def test_fused_vs_split_t4_tpu_bitwise_f32_conv(tiles: str, B: int, seed: int):
         )
         key = 710 + T * 10 + B + 1000 * seed
     else:
-        prof = get_profile("qwen35-candidate30-fused")
+        prof = PROFILES["qwen35-candidate30-fused"]
         base = ExecSpec(
             R=2,
             B=B,
@@ -2578,7 +2578,7 @@ def test_tpu_v7x8_repeatability_fused_and_seq_split(T: int, B: int):
     tp = NamedSharding(mesh, P("tp"))
     g = dataclasses.replace(qwen35.Qwen35.shrink(periods=1, R=R), NH=32, moe_tp=False)
     spec = qwen35.qwen35_spec(g)
-    prof = get_profile("qwen35-candidate30-fused")
+    prof = PROFILES["qwen35-candidate30-fused"]
     base = ExecSpec(
         R=R,
         B=B,

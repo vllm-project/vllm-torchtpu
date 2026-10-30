@@ -26,10 +26,10 @@ _DRIVER_EXPORTS = frozenset({"ProgramDriver", "TorchStepMetaOps"})
 _MOVED = {
     "MegakernelDriver": (
         "megakernel_runtime.ProgramDriver with "
-        "megakernel_runtime.models.qwen35.adapter.Qwen35Program"
+        "vllm_torchtpu.models.qwen3_5.megakernel.adapter.Qwen35Program"
     ),
     "prepare_step_inputs_eager": (
-        "megakernel_runtime.models.qwen35.adapter.prepare_step_inputs_eager"
+        "vllm_torchtpu.models.qwen3_5.megakernel.adapter.prepare_step_inputs_eager"
     ),
 }
 
