@@ -183,9 +183,9 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
         if self.max_num_scheduled_tokens < page or 0 < threshold < page:
             raise ValueError(
                 f"The megakernel prefill schedules whole {page}-token pages: "
-                "max_num_batched_tokens and long_prefill_token_threshold must "
-                f"be at least {page} (got {self.max_num_scheduled_tokens} and "
-                f"{threshold})."
+                "the per-step token budget and long_prefill_token_threshold "
+                f"must be at least {page} (got {self.max_num_scheduled_tokens} "
+                f"and {threshold})."
             )
 
     @wraps(original_split)
