@@ -14,6 +14,9 @@ call `apply(stage, model_config=...)` to apply them.
 | `engine_core` | `_run_engine_core_with_tpu_patches` | Scheduler, KV-cache, offloading, and multimodal patches before the original engine-core entry point. |
 | `worker_init` | `TPUWorker.__init__`, before `WorkerBase.__init__` | Shared patches in each worker, including spawned workers. |
 | `model_load` | `TPUWorker.load_model`, before the model runner loads the model | Model-specific patches with `self.model_config`. |
+| `omni_platform` | `OmniTpuPlatform.__init__` | vLLM-Omni patches needed in every process that resolves the Omni platform. |
+| `diffusion_worker` | `OmniTpuPlatform.init_diffusion_worker_vllm_config` | Shared patches in each diffusion worker. |
+| `diffusion_model_load` | `OmniTpuPlatform.init_diffusion_model_runner_runtime`, before the diffusion pipeline is built | Model-specific diffusion patches with `od_config`. |
 
 Choose stages according to where the patched code runs and when its dependencies
 are available. `_ACTIVE` means `platform_activation` and `worker_init`; `_ENGINE`
@@ -51,6 +54,7 @@ Patch(
 | `target` | `module:callable` imports the module and invokes the named callable. A bare module path imports it for its side effects. The exact target string is the completion key. |
 | `stages` | Tuple of supported stage names at which the entry is eligible. |
 | `model_config` | Defaults to `False`. When `True`, the callback receives `model_config` as a keyword argument, possibly `None`. |
+| `od_config` | Defaults to `False`. When `True`, the callback receives the vLLM-Omni `od_config` as a keyword argument, possibly `None`. |
 | `refresh` | Optional lazy target invoked on subsequent eligible calls after the primary target completes. It receives no arguments. |
 
 Prefer an explicit callback for additions. The existing bare-module entry for
@@ -80,6 +84,46 @@ Patch(
     model_config=True,
 ),
 ```
+
+### Diffusion processes
+
+vLLM-Omni diffusion workers do not run `TPUWorker`, so they never enter
+`worker_init` or `model_load`. `OmniTpuPlatform` enters the diffusion stages
+instead. A diffusion worker runs `diffusion_worker` and then
+`diffusion_model_load` for each pipeline it loads. Its `VllmConfig` also runs
+`platform_activation`. Entries that a diffusion worker depends on, such as
+`_configure_torchtpu_eager_mode`, list `diffusion_worker` to make that
+dependency explicit.
+
+Diffusion patches live in `src/vllm_torchtpu/omni/patches.py`. Register a
+patch to a shared layer module, such as `_patch_wan_pair_swap_rope`, at
+`diffusion_worker` for every model when it is safe for every user of the
+patched class. A model-specific callback accepts `od_config` and returns
+`False` unless `od_config.model_class_name` is one of the vLLM-Omni pipelines
+that build the patched classes (keys of `vllm_omni/diffusion/registry.py`).
+Import the patched module after that check, so that only the served model's
+module is imported. Add a new pipeline set to `_PATCHED_PIPELINES` and to
+`tests_omni/test_patch_pipelines.py`, which compares the sets with the real
+registry. Register the callback under the model-specific diffusion section:
+
+```python
+Patch(
+    "vllm_torchtpu.omni.patches:_patch_<model>_<fix>",
+    ("diffusion_model_load",),
+    od_config=True,
+),
+```
+
+After the `diffusion_model_load` pass, `OmniTpuPlatform` logs
+`No model-specific TPU diffusion patch applies to pipeline <name>.` at INFO
+when the served pipeline is in no set. When a `TPUWorker` process (which
+entered `worker_init`, not `diffusion_model_load`) builds diffusion attention,
+`OmniTpuPlatform.get_diffusion_attn_backend_cls` applies `diffusion_worker` so
+the shared diffusion patches still cover that stage. When neither
+`diffusion_model_load` nor `worker_init` ran, `get_diffusion_attn_backend_cls`
+logs a warning because vLLM-Omni built the pipeline without calling
+`init_diffusion_model_runner_runtime`. `patch_registry.entered(stage)` reports
+whether a stage was applied in the process.
 
 ## Completion, retries, and model selection
 
