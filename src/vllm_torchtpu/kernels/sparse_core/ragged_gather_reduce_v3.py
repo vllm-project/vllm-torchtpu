@@ -37,6 +37,10 @@ _TOKEN_BLOCK = _TOKEN_SUBCHUNK * _NUM_TOKEN_SUBCHUNKS
 TOKEN_BLOCK = _TOKEN_BLOCK
 _ROUTE_INDEX_BITS = 20
 _ROUTE_INDEX_MASK = (1 << _ROUTE_INDEX_BITS) - 1
+# Packed route sort key, low to high: source row, slot, destination, invalid.
+_SLOT_BITS = 4
+_DESTINATION_SHIFT = _ROUTE_INDEX_BITS + _SLOT_BITS
+_INVALID_SHIFT = _DESTINATION_SHIFT + (_TOKEN_BLOCK - 1).bit_length()
 
 
 def _align_to(value: int, alignment: int) -> int:
@@ -384,12 +388,16 @@ def ragged_gather_reduce(
     destination_template = jnp.repeat(
         jnp.arange(_TOKEN_BLOCK, dtype=jnp.int32), reduce_group_size
     )
+    slot_template = jnp.tile(
+        jnp.arange(reduce_group_size, dtype=jnp.int32), _TOKEN_BLOCK
+    )
     return _combine_token_blocks(
         x,
         indices_2d.reshape(num_blocks, metadata_block_size),
         weights_2d.reshape(num_blocks, metadata_block_size),
         valid_2d.reshape(num_blocks, metadata_block_size),
         destination_template,
+        slot_template,
         num_tokens=num_tokens,
         topk=reduce_group_size,
     )
@@ -439,12 +447,14 @@ def ragged_gather_reduce_token_blocks(
             for a in (indices, topk_weights, valid_rows_mask)
         )
     destination_template = jnp.tile(jnp.arange(_TOKEN_BLOCK, dtype=jnp.int32), topk)
+    slot_template = jnp.repeat(jnp.arange(topk, dtype=jnp.int32), _TOKEN_BLOCK)
     return _combine_token_blocks(
         x,
         indices,
         topk_weights,
         valid_rows_mask,
         destination_template,
+        slot_template,
         num_tokens=num_tokens,
         topk=topk,
     )
@@ -456,14 +466,16 @@ def _combine_token_blocks(
     weights_blocks: jax.Array,
     valid_blocks: jax.Array,
     destination_template: jax.Array,
+    slot_template: jax.Array,
     *,
     num_tokens: int,
     topk: int,
 ) -> jax.Array:
     """Run the kernel on routes grouped by destination block.
 
-    ``destination_template`` is each row entry's token within its block. The
-    number of blocks is a multiple of the kernel's row partitions.
+    ``destination_template`` and ``slot_template`` are each row entry's token
+    within its block and slot within its token. The number of blocks is a
+    multiple of the kernel's row partitions.
     """
     sc_info = pltpu.get_tpu_info().sparse_core
     # SparseCore row-packing views BF16 as pairs of rows.
@@ -481,13 +493,35 @@ def _combine_token_blocks(
     num_blocks = indices_blocks.shape[0]
     padded_num_tokens = num_blocks * _TOKEN_BLOCK
     destination_blocks = jnp.broadcast_to(destination_template, indices_blocks.shape)
-    # A stable boolean partition keeps each destination's routes in row order
-    # while placing the exact valid prefix first in every destination block.
-    route_order = jnp.argsort(~valid_blocks, axis=1, stable=True)
-    compact_valid = jnp.take_along_axis(valid_blocks, route_order, axis=1)
-    route_indices = jnp.take_along_axis(indices_blocks, route_order, axis=1)
-    route_destinations = jnp.take_along_axis(destination_blocks, route_order, axis=1)
-    route_weights = jnp.take_along_axis(weights_blocks, route_order, axis=1)
+    if topk <= 1 << _SLOT_BITS:
+        # One sort of unique packed keys places each block's valid routes
+        # first, by (destination, slot): the stable partition of token-major
+        # rows. The weights ride along, so nothing is gathered.
+        slot_blocks = jnp.broadcast_to(slot_template, indices_blocks.shape)
+        route_keys = (
+            jnp.left_shift((~valid_blocks).astype(jnp.int32), _INVALID_SHIFT)
+            | jnp.left_shift(destination_blocks, _DESTINATION_SHIFT)
+            | jnp.left_shift(slot_blocks, _ROUTE_INDEX_BITS)
+            | jnp.bitwise_and(indices_blocks, _ROUTE_INDEX_MASK)
+        )
+        route_keys, route_weights = jax.lax.sort(
+            (route_keys, weights_blocks), dimension=1, is_stable=False, num_keys=1
+        )
+        compact_valid = route_keys < (1 << _INVALID_SHIFT)
+        route_indices = jnp.bitwise_and(route_keys, _ROUTE_INDEX_MASK)
+        route_destinations = jnp.bitwise_and(
+            jnp.right_shift(route_keys, _DESTINATION_SHIFT), _TOKEN_BLOCK - 1
+        )
+    else:
+        # A stable boolean partition keeps each destination's routes in row
+        # order while placing the exact valid prefix first in every block.
+        route_order = jnp.argsort(~valid_blocks, axis=1, stable=True)
+        compact_valid = jnp.take_along_axis(valid_blocks, route_order, axis=1)
+        route_indices = jnp.take_along_axis(indices_blocks, route_order, axis=1)
+        route_destinations = jnp.take_along_axis(
+            destination_blocks, route_order, axis=1
+        )
+        route_weights = jnp.take_along_axis(weights_blocks, route_order, axis=1)
     route_indices = jnp.where(compact_valid, route_indices, 0).astype(jnp.int32)
     route_destinations = jnp.where(compact_valid, route_destinations, 0).astype(
         jnp.int32
