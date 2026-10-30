@@ -26,12 +26,12 @@ RATIO, TOPK, KV_HEADS, SHARDS = 4, 256, 2, 2
 def _torch(x, device):
     """jax array -> torch tensor (bf16 / fp8 through same-width int views)."""
     views = {
-        jnp.bfloat16: (np.uint16, torch.int16, torch.bfloat16),
-        jnp.float8_e4m3fn: (np.uint8, torch.uint8, torch.float8_e4m3fn),
+        "bfloat16": (np.uint16, torch.int16, torch.bfloat16),
+        "float8_e4m3fn": (np.uint8, torch.uint8, torch.float8_e4m3fn),
     }
     host = np.asarray(x)
-    if x.dtype in views:
-        raw, carrier, dtype = views[x.dtype]
+    if x.dtype.name in views:
+        raw, carrier, dtype = views[x.dtype.name]
         return torch.from_numpy(host.view(raw)).view(carrier).view(dtype).to(device)
     return torch.from_numpy(host.copy()).to(device)
 
