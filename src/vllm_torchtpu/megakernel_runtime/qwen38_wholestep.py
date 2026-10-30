@@ -63,6 +63,7 @@ class _WholeKind:
         self.kw = dict(budget=budget, max_groups=max_groups, norm_eps=norm_eps,
                        rotary_dim=rotary_dim, write=write)
         self._calls: dict[int, Any] = {}
+        self.tag = tag
         name = f"qwen38_mk::{tag}"
 
         @torch.library.custom_op(name, mutates_args=())
@@ -91,9 +92,11 @@ class _WholeKind:
                 self.mesh, self.g, B, self.layout, self.qsa, L=L_WHOLE,
                 tiles=wholestep_tiles(B, self.kw["max_groups"]), **self.kw,
             )
-            typed = make_typed_step_wrapper(f"qwen38_mk_whole_b{B}", full, len(in_specs), len(outs))
+            # Program names carry the tag: the write-free shadow and the served program
+            # of one bucket are different programs and must never share a name.
+            typed = make_typed_step_wrapper(f"qwen38_mk_{self.tag}_b{B}", full, len(in_specs), len(outs))
             self._calls[B] = sharded_jax_callable(
-                f"qwen38_mk::whole_b{B}", typed, mesh=self.mesh,
+                f"qwen38_mk::{self.tag}_b{B}", typed, mesh=self.mesh,
                 input_partition_specs=in_specs, output_partition_specs=outs,
                 donate_argnums=donate,
             )
