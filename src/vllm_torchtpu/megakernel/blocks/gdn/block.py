@@ -310,7 +310,7 @@ class GDNBlock(Block):
                 with sc("gdn_rec"):
                     gdn_rec_chunked(ctx, gp, o, slot)
             else:
-                if "gdn_state" not in skip:
+                if "gdn_state" not in skip and not ctx.ST.get("rec_in_recb", False):
                     with sc("gdn_rec_wait"):
                         for d in rec_in(ctx, gp, o):
                             d.wait()

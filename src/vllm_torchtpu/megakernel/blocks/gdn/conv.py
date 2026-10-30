@@ -45,6 +45,8 @@ def gdn_in(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> Any:
     conv_out_key = "conv_ckpt" if VER else "conv"
     rec_out_key = "rec_ckpt" if VER else "rec"
     convb, recb, sem = scr["convb"], scr["recb"], scr["st_sem"]
+    # The pool reader already gathered the states into `recb` (after the drain).
+    rec_in_recb = bool(ST.get("rec_in_recb", False))
     with sc("gdn_in"):
         if "gdn_state" not in skip:
             if GPR:
@@ -61,7 +63,7 @@ def gdn_in(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> Any:
                 ).wait()
                 if GCH:
                     rec_drain(ctx, gp, 0)
-                else:
+                elif not rec_in_recb:
                     pltpu.make_async_copy(recb, O[rec_out_key].at[0], sem.at[3]).wait()
 
             if not GPR:
@@ -69,7 +71,7 @@ def gdn_in(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> Any:
                 if GCH:
                     for s_ in range(NRB):
                         rec_chunk(ctx, gp, o, s_, s_, False).start()
-                else:
+                elif not rec_in_recb:
                     for d in rec_in(ctx, gp, o):
                         d.start()
 
