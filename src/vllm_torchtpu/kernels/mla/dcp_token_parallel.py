@@ -63,6 +63,12 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 
+def _search(keys: jax.Array, values: jax.Array, side: str) -> jax.Array:
+    """`searchsorted` over a few keys (requests, caps): one broadcast compare,
+    not the default binary-search while loop."""
+    return jnp.searchsorted(keys, values, side=side, method="compare_all")
+
+
 @dataclasses.dataclass(frozen=True)
 class TokenParallelLayout:
     """Static shape of the token-parallel split, one per compiled program."""
@@ -171,7 +177,7 @@ def gather_page_ids(
     table = block_tables.reshape(num_reqs, -1)
     k = jnp.arange(layout.max_pages, dtype=jnp.int32)
     ends = offsets + pages
-    req = jnp.minimum(jnp.searchsorted(ends, k, side="right"), num_reqs - 1)
+    req = jnp.minimum(_search(ends, k, "right"), num_reqs - 1)
     vpage = jnp.clip(k - offsets[req], 0, table.shape[1] - 1)
     page = jnp.mod(table[req, vpage], jnp.int32(num_local_pages))
     return jnp.where(k < ends[-1], page, 0).astype(jnp.int32)
@@ -225,7 +231,7 @@ def rank_rows(
     req = jnp.arange(num_reqs, dtype=jnp.int32)
     active = req < num_seqs
     a, b = jnp.clip(q_start, lo, hi), jnp.clip(q_end, lo, hi)
-    first = jnp.searchsorted(q_end, lo, side="right").astype(jnp.int32)
+    first = _search(q_end, lo, "right").astype(jnp.int32)
     n_local = jnp.sum(active & (req >= first) & (q_start < hi)).astype(jnp.int32)
     k = jnp.arange(num_reqs, dtype=jnp.int32)
     idx = jnp.minimum(first + k, num_reqs - 1)
@@ -245,7 +251,7 @@ def rank_rows(
 def row_requests(rr: RankRows, num_rows: int) -> jax.Array:
     """Global request of each local row (clamped for padding rows)."""
     i = jnp.arange(num_rows, dtype=jnp.int32)
-    local = jnp.searchsorted(rr.cu_q_lens[1:], i, side="right").astype(jnp.int32)
+    local = _search(rr.cu_q_lens[1:], i, "right").astype(jnp.int32)
     local = jnp.minimum(local, jnp.maximum(rr.num_seqs - 1, 0))
     return jnp.minimum(rr.first_req + local, rr.seq_lens.shape[0] - 1)
 
@@ -287,7 +293,7 @@ def _sized_gather(
     caps = layout.gather_caps
     if len(caps) == 1:
         return branch(caps[0])()
-    idx = jnp.searchsorted(jnp.asarray(caps, jnp.int32), total_pages, side="left")
+    idx = _search(jnp.asarray(caps, jnp.int32), total_pages, "left")
     return lax.switch(jnp.minimum(idx, len(caps) - 1), [branch(c) for c in caps])
 
 
