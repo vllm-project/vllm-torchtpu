@@ -245,6 +245,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "maybe_patch_qwen3_vl",
         "maybe_patch_qwen3_next",
         "maybe_patch_qwen2",
+        "maybe_patch_qwen3_5_attn_moe_overlap",
     ]
     assert "patch_moe_expert_write_staging" in stages["worker_init"]
     for names in (stages["platform_activation"], stages["worker_init"]):
