@@ -297,7 +297,7 @@ def lower_gdn_state_shard_spans(
     else:
         raise ValueError(
             "GDN conv regions must be {gdn_conv_qk, gdn_conv_v} "
-            "(QK pair-blocked layout, TPU_GDN_CONV_QK_PAIR_LAYOUT) or "
+            "(paired Q/K channels) or "
             "{gdn_conv_q, gdn_conv_k, gdn_conv_v}: got "
             f"{sorted(names)}"
         )

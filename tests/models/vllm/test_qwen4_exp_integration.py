@@ -155,11 +155,8 @@ def _metadata(tokens):
     return dict(
         query_start_loc=torch.tensor([0, tokens]),
         ngram_context=torch.zeros((1, 2), dtype=torch.int64),
-        state_slots=torch.tensor([1]),
         context_lens=torch.tensor([0]),
         valid_tokens=torch.ones(tokens, dtype=torch.bool),
-        main_block_table=torch.tensor([[1]]),
-        compressed_block_table=torch.tensor([[2]]),
     )
 
 

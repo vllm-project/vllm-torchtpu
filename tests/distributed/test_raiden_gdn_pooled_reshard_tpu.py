@@ -21,6 +21,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from tests.kernels.gdn.v3.gdn_pool_state_utils import (
+    read_states,
+    write_states,
+)
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 from vllm_torchtpu.distributed.kv_transfer.raiden import seq_on_lane as sol
 from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import RegionSpec
@@ -31,24 +35,12 @@ from vllm_torchtpu.layers.core import gdn_attention
 from .test_raiden_fa_layout_calibration_tpu import _apply_xla_tiled_layout
 from .tpu_test_utils import run_in_isolated_process
 
-try:
-    from kernels.gdn.v3.gdn_pool_state_utils import (
-        read_states,
-        write_states,
-    )
-except ImportError:
-    from tests.kernels.gdn.v3.gdn_pool_state_utils import (
-        read_states,
-        write_states,
-    )
-
 pytestmark = pytest.mark.tpu_test
 
 TOL = dict(rtol=1e-3, atol=1e-3)
 
 
-def test_qk_pair_layout_rejected_for_pooled_gdn(monkeypatch):
-    monkeypatch.setenv("TPU_GDN_CONV_QK_PAIR_LAYOUT", "1")
+def test_retired_qk_pair_option_preserves_segmented_conv_regions(monkeypatch):
     geometry = rpm.GdnHeadGeometry(
         local_key_heads=2,
         local_value_heads=8,
@@ -56,14 +48,25 @@ def test_qk_pair_layout_rejected_for_pooled_gdn(monkeypatch):
         value_head_dim=128,
         conv_kernel_size=4,
     )
-    with pytest.raises(
-        rpm.ManifestError, match="TPU_GDN_CONV_QK_PAIR_LAYOUT is not readable"
-    ):
-        rpm._gdn_conv_regions(
-            conv_shape=(1, 3, 1536),
-            itemsize=4,
-            geometry=geometry,
-        )
+    monkeypatch.setenv("TPU_GDN_CONV_QK_PAIR_LAYOUT", "0")
+    baseline = rpm._gdn_conv_regions(
+        conv_shape=(1, 3, 1536), itemsize=4, geometry=geometry
+    )
+    monkeypatch.setenv("TPU_GDN_CONV_QK_PAIR_LAYOUT", "1")
+    regions = rpm._gdn_conv_regions(
+        conv_shape=(1, 3, 1536), itemsize=4, geometry=geometry
+    )
+    assert regions == baseline
+    assert tuple(region.name for region in regions) == (
+        "gdn_conv_q",
+        "gdn_conv_k",
+        "gdn_conv_v",
+    )
+    assert tuple(region.offset_bytes for region in regions) == (
+        0,
+        2 * 128 * 4,
+        4 * 128 * 4,
+    )
 
 
 # The solver block size follows the local value-head count, so a head shard

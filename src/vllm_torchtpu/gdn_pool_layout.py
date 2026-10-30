@@ -49,7 +49,7 @@ POOLED_GDN_ARCHITECTURES = QWEN_GDN_ARCHITECTURES | frozenset(
 
 # The pooled GDN kernel's state dtypes inside the unified pool are fixed for
 # Conv, while SSM follows the layer's declared MambaSpec dtype. Everything
-# that describes pool bytes — the kernel's state plan and the Raiden reshard
+# that describes pool bytes — the kernel's granule offsets and the Raiden reshard
 # manifest — must take its dtypes and sizes from here, so no two consumers can
 # disagree about the physical layout.
 #
@@ -97,7 +97,7 @@ def unified_kv_layout_enabled_for_architecture(architecture: str | None) -> bool
 
 
 def pooled_gdn_conv_state_bytes(*, kernel_size: int, conv_dim: int) -> int:
-    """Live bytes of one slot's conv region: (kernel_size - 1) dense bf16
+    """Live bytes of one slot's conv region: (kernel_size - 1) dense Conv-state
     rows of conv_dim channels. The kernel keeps no spec-decode widening in
     the pool (verify windows roll back via per-slot checkpoints instead)."""
     return (

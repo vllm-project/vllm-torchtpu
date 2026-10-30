@@ -182,9 +182,7 @@ def test_prepared_pooled_prefill_then_decode(ssm_dtype, monkeypatch):
             recurrent = typed_rows(ssm_bytes, np.float32).reshape(n_v, dim, dim)
         begin = layout.ssm_tokens * token_bytes
         conv_bytes = bits[1, begin : begin + layout.conv_tokens * token_bytes]
-        conv = typed_rows(conv_bytes, np.float32)[: 3 * width // 256].reshape(
-            3, width
-        )
+        conv = typed_rows(conv_bytes, np.float32)[: 3 * width // 256].reshape(3, width)
         return conv, recurrent
 
     ordinary, prepared = make_pool(), make_pool()
@@ -224,9 +222,7 @@ def test_prepared_prefill_restores_lazy_environment(monkeypatch, cached, materia
     from vllm.v1.kv_cache_layout import KVCacheLayout
 
     missing = object()
-    settings = (
-        (vllm_envs, "VLLM_KV_CACHE_LAYOUT", "HND", "HND"),
-    )
+    settings = ((vllm_envs, "VLLM_KV_CACHE_LAYOUT", "HND", "HND"),)
     with monkeypatch.context() as state:
         for module, key, text, value in settings:
             state.setattr(module, "__getattr__", inspect.unwrap(module.__getattr__))

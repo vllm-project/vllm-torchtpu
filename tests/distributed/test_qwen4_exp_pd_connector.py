@@ -15,6 +15,7 @@
 
 import threading
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
@@ -476,7 +477,7 @@ def test_qwen_loaded_requires_controller_and_native_completion(
 
 
 @pytest.mark.parametrize(
-    "fault", [None, "checkpoint", "scale", "layout_flag", "binding"]
+    "fault", [None, "checkpoint", "scale", "legacy_env", "layout_dtype", "binding"]
 )
 @pytest.mark.parametrize("ssm_dtype", ["bfloat16", "float32"])
 def test_qwen_register_runner_admits_actual_materialized_owners(
@@ -509,7 +510,6 @@ def test_qwen_register_runner_admits_actual_materialized_owners(
     cache.model = SimpleNamespace(
         pd_loaded_weight_identity=None if fault == "checkpoint" else "a" * 64,
         pd_loaded_ple_identity="b" * 64,
-        pd_gdn_qk_pair_layout=fault != "layout_flag",
         config=SimpleNamespace(to_dict=lambda: {"hidden_size": 16}),
         model=SimpleNamespace(
             layers=[
@@ -530,6 +530,41 @@ def test_qwen_register_runner_admits_actual_materialized_owners(
         kv_cache_raw_tensors=materialized.raw_tensors,
     )
     worker.named_kv_caches = dict(materialized.kv_caches)
+    if fault == "legacy_env":
+        monkeypatch.setenv("TPU_GDN_CONV_QK_PAIR_LAYOUT", "0")
+    if fault == "layout_dtype":
+        original = materialized.raw_tensors[0]
+        changed_dtype = (
+            torch.bfloat16
+            if original.dtype == torch.float8_e4m3fn
+            else torch.float8_e4m3fn
+        )
+        changed = original.view(changed_dtype)
+        assert changed.dtype != original.dtype
+        assert changed.data_ptr() == original.data_ptr()
+        caches = {
+            name: [changed if tensor is original else tensor for tensor in value]
+            if isinstance(value, list)
+            else changed
+            if value is original
+            else value
+            for name, value in materialized.kv_caches.items()
+        }
+        materialized = replace(
+            materialized,
+            raw_tensors=[
+                changed if tensor is original else tensor
+                for tensor in materialized.raw_tensors
+            ],
+            kv_caches=caches,
+            layer_to_raw={
+                name: changed if tensor is original else tensor
+                for name, tensor in materialized.layer_to_raw.items()
+            },
+        )
+        cache.materialized = materialized
+        runner.kv_cache_raw_tensors = materialized.raw_tensors
+        worker.named_kv_caches = dict(materialized.kv_caches)
     if fault == "binding":
         worker.named_kv_caches.pop(next(iter(worker.named_kv_caches)))
     monkeypatch.setattr(
@@ -574,7 +609,7 @@ def test_qwen_register_runner_admits_actual_materialized_owners(
         return engine
 
     monkeypatch.setattr(worker, "_construct_raiden_transfer_engine", construct)
-    if fault:
+    if fault not in (None, "legacy_env"):
         with pytest.raises((ValueError, RuntimeError)):
             worker.register_runner(runner)
         assert not builds and not facade.register_work_unit_calls

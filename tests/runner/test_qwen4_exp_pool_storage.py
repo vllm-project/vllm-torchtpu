@@ -296,8 +296,10 @@ def test_initialize_rejects_changed_pool_contract(monkeypatch, mutation):
         )
         group = changed.kv_cache_groups[gid]
         spec = group.kv_cache_spec
+        assert isinstance(spec, MambaSpec)
         if mutation == "dtype":
-            spec = replace(spec, dtypes=(torch.float32, *spec.dtypes[1:]))
+            assert spec.dtypes[0] == torch.float32
+            spec = replace(spec, dtypes=(torch.bfloat16, *spec.dtypes[1:]))
         elif mutation == "shape":
             spec = replace(spec, shapes=((1,), *spec.shapes[1:]))
         else:

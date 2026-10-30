@@ -128,7 +128,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 vllm_config=cfg,
                 prefix=prefix + ".linear_attn",
                 gqa_interleaved_layout=False,
-                pooled_input_preparer=prepare_gdn_input,
+                pooled_input_preparer=(
+                    prepare_gdn_input if envs.TPU_GDN_COMPACT_INPUT else None
+                ),
             )
         else:
             self.self_attn = Qwen4ExpQSA(
@@ -289,7 +291,6 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         self._pd_weight_identity_enabled = vllm_config.kv_transfer_config is not None
         self.pd_loaded_weight_identity: str | None = None
         self.pd_loaded_ple_identity: str | None = None
-        self.pd_gdn_qk_pair_layout = envs.TPU_GDN_CONV_QK_PAIR_LAYOUT
         self.config = vllm_config.model_config.hf_text_config
         self.model = Qwen4ExpBackbone(vllm_config)
         self.lm_head = ParallelLMHead(

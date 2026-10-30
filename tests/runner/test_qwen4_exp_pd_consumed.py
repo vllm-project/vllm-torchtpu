@@ -172,6 +172,11 @@ def test_actual_model_normalized_layers_bind_loaded_scale_identity(
     else:
         assert layer.layer_type == "indexed_attention"
         actual = worker._collect_pd_semantics(runner)
+        flags = actual["ranks"][0]["state_flags"]
+        assert flags["gdn_conv_dtype"] == "torch.float32"
+        assert flags["gdn_granule_bytes"] == 512
+        monkeypatch.setenv("TPU_GDN_CONV_QK_PAIR_LAYOUT", "0")
+        assert worker._collect_pd_semantics(runner) == actual
         attention = layer.self_attn
         assert actual["ranks"][0]["kv_scales"] == [(0, 0.5, 0.25)]
         attention._v_scale_float = 0.75
