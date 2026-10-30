@@ -1391,6 +1391,7 @@ def quantized_matmul_heads(
         input_output_aliases=input_output_aliases,
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
+            disable_bounds_checks=True,
             vmem_limit_bytes=_heads_vmem_bytes(
                 m, k, block_rows, block_cols, x.dtype, w_q.dtype, row_shapes
             ),
