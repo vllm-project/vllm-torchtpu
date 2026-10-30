@@ -564,6 +564,11 @@ DENSE_MAX_KV_PAGES = 8
 DENSE_KV_PAGES_PER_STEP = 2
 # Unroll of the per-token mask build, whose iterations are independent.
 DENSE_MASK_UNROLL = 32
+# Query tokens per softmax group in a KV step. The step's score tile does not
+# fit in vector registers either way; groups let the MXU run one group's QK
+# while the VPU runs another's softmax, at the cost of pushing the KV tile to
+# the MXU once per group.
+DENSE_GROUP_TOKENS = 4
 # Smaller chunks are the op's decode-bucket tiling and keep the gather path.
 DENSE_MIN_CHUNK_TOKENS = 128
 # The membership mask holds KV position x at row x >> 7, lane x & 127.
@@ -699,27 +704,44 @@ def _dense_attention_kernel(
         bkv = jnp.concatenate([load_page(j) for j in range(kv_group)], axis=0)
         kv_len = kv_group * page_size
 
-        q = q_ref[...].reshape(num_rows, head_dim)
-        s = jnp.einsum("nd,md->nm", q, bkv, preferred_element_type=jnp.float32)
-        s *= sm_scale
         selected = jnp.concatenate(
             [mask_ref[first_page * halves + h] for h in range(kv_group * halves)],
             axis=-1,
         )  # [bq_sz, kv_len]
-        s = jnp.where(
-            selected[:, None, :] > 0,
-            s.reshape(bq_sz, num_q_heads, kv_len),
-            jnp.finfo(s.dtype).min,
-        ).reshape(num_rows, kv_len)
+        group_rows = DENSE_GROUP_TOKENS * num_q_heads
 
-        m_prev = m_ref[...]
-        m_curr = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
-        p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
-        exp_m_diff = jnp.exp(m_prev - m_curr)
-        l_ref[...] = exp_m_diff * l_ref[...] + jnp.sum(p, axis=1, keepdims=True)
-        m_ref[...] = m_curr
-        pv = jnp.einsum("nm,md->nd", p, bkv, preferred_element_type=jnp.float32)
-        acc_ref[...] = broadcast_minor(exp_m_diff, acc_ref.shape) * acc_ref[...] + pv
+        def scores(g):
+            tokens = pl.ds(g * DENSE_GROUP_TOKENS, DENSE_GROUP_TOKENS)
+            q = q_ref[tokens].reshape(group_rows, head_dim)
+            s = jnp.einsum("nd,md->nm", q, bkv, preferred_element_type=jnp.float32)
+            s *= sm_scale
+            sel = selected[g * DENSE_GROUP_TOKENS : (g + 1) * DENSE_GROUP_TOKENS]
+            return jnp.where(
+                sel[:, None, :] > 0,
+                s.reshape(DENSE_GROUP_TOKENS, num_q_heads, kv_len),
+                jnp.finfo(s.dtype).min,
+            ).reshape(group_rows, kv_len)
+
+        # Group g + 1's QK is issued before group g's PV, so the MXU works on
+        # one group while the VPU and EUP run the other's softmax.
+        assert bq_sz % DENSE_GROUP_TOKENS == 0
+        num_groups = bq_sz // DENSE_GROUP_TOKENS
+        s_next = scores(0)
+        for g in range(num_groups):
+            s = s_next
+            if g + 1 < num_groups:
+                s_next = scores(g + 1)
+            rows = pl.ds(g * group_rows, group_rows)
+            m_prev = m_ref[rows, :]
+            m_curr = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
+            p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
+            exp_m_diff = jnp.exp(m_prev - m_curr)
+            l_sum = jnp.sum(p, axis=1, keepdims=True)
+            l_ref[rows, :] = exp_m_diff * l_ref[rows, :] + l_sum
+            m_ref[rows, :] = m_curr
+            pv = jnp.einsum("nm,md->nd", p, bkv, preferred_element_type=jnp.float32)
+            exp_m_diff = broadcast_minor(exp_m_diff, pv.shape)
+            acc_ref[rows, :] = exp_m_diff * acc_ref[rows, :] + pv
 
     @pl.when(kv_step == pl.num_programs(1) - 1)
     def finalize():
