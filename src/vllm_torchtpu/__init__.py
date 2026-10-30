@@ -151,6 +151,11 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
     scheduler-local cache-config view backports the corresponding one-line fix
     without mutating the shared ``VllmConfig.cache_config`` or copying the
     scheduling algorithm into this plugin.
+
+    vLLM calls the split only in Mamba cache mode "align", which it turns off
+    without prefix caching. A program that declares ``page_aligned_chunks``
+    still needs page-aligned chunks, so the scheduler always calls the split
+    for it and, outside align mode, skips the upstream part.
     """
     import copy
     from functools import wraps
@@ -160,6 +165,28 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
     original_split = Scheduler._mamba_block_aligned_split
     if getattr(original_split, "_tpu_scheduler_block_size_patch", False):
         return
+    original_init = Scheduler.__init__
+
+    @wraps(original_init)
+    def init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self._tpu_mamba_align_split = self.need_mamba_block_aligned_split
+        self._tpu_page_aligned_chunks = _model_needs_page_aligned_chunks(
+            self.vllm_config
+        )
+        if not self._tpu_page_aligned_chunks:
+            return
+        self.need_mamba_block_aligned_split = True
+        # A chunk limit under one page would never schedule a non-final chunk.
+        page = self.cache_config.block_size
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        if self.max_num_scheduled_tokens < page or 0 < threshold < page:
+            raise ValueError(
+                f"The megakernel prefill schedules whole {page}-token pages: "
+                "the per-step token budget and long_prefill_token_threshold "
+                f"must be at least {page} (got {self.max_num_scheduled_tokens} "
+                f"and {threshold})."
+            )
 
     @wraps(original_split)
     def split_with_scheduler_block_size(
@@ -176,18 +203,21 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
             num_external_computed_tokens,
         )
         physical_cache_config = self.cache_config
-        if physical_cache_config.block_size == self.block_size:
-            return original_split(self, *args)
+        # Run the upstream split only in Mamba cache mode "align".
+        if getattr(self, "_tpu_mamba_align_split", True):
+            if physical_cache_config.block_size == self.block_size:
+                return original_split(self, *args)
 
-        scheduler_cache_config = copy.copy(physical_cache_config)
-        scheduler_cache_config.block_size = self.block_size
-        # schedule() calls this method synchronously on the EngineCore thread,
-        # and the upstream implementation contains no callback or await point.
-        self.cache_config = scheduler_cache_config
-        try:
-            num_new_tokens = original_split(self, *args)
-        finally:
-            self.cache_config = physical_cache_config
+            scheduler_cache_config = copy.copy(physical_cache_config)
+            scheduler_cache_config.block_size = self.block_size
+            # schedule() calls this method synchronously on the EngineCore
+            # thread, and the upstream implementation contains no callback or
+            # await point.
+            self.cache_config = scheduler_cache_config
+            try:
+                num_new_tokens = original_split(self, *args)
+            finally:
+                self.cache_config = physical_cache_config
         # A scheduler block wider than the prefill budget (DCP/PCP: 256 x
         # ranks tokens) leaves chunks inside it wherever the shared token
         # budget cuts them. A program that declares ``page_aligned_chunks``
@@ -217,6 +247,7 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
 
     split_with_scheduler_block_size._tpu_scheduler_block_size_patch = True
     Scheduler._mamba_block_aligned_split = split_with_scheduler_block_size
+    Scheduler.__init__ = init
     logger.info("Applied TPU patch: align Mamba prefill splits to scheduler blocks.")
 
 
