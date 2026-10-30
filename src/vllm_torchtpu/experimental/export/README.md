@@ -81,7 +81,12 @@ per request, so these pools hold one slot per request plus null slot 0
 (`num_state_slots = max_num_seqs + 1`, recorded in `serving_config`) rather
 than one per KV block. The forward graphs take one more `user_io` input after
 the states, `mamba_state_indices[max_num_seqs]`: the slot holding each
-request's recurrent state. These layers keep this per-layer layout rather than
+request's recurrent state. With `--speculative-config` each request holds
+`K + 1` consecutive slots, its state slot then one checkpoint per draft token
+(`num_state_slots = max_num_seqs * (K + 1) + 1`), and the forward also takes
+`mamba_slot_read_offsets[num_state_slots]`, the checkpoint each request resumes
+from after a verify step, and `mamba_ckpt_indices[max_num_seqs, K + 1]`, its
+`K + 1` slots. These layers keep this per-layer layout rather than
 vLLM's unified KV block pool, and the export runs with prefix caching off. The
 recurrent state bytes come off the KV budget before it is divided among KV
 blocks.
@@ -89,13 +94,21 @@ blocks.
 ### MTP drafting
 
 With `--speculative-config '{"method": "mtp", "num_speculative_tokens": K}'`
-the export adds `mtp_draft_bucket{B}` for every forward bucket. The model lists
-its MTP layer's weights among `abstract_params()` under their checkpoint names
-(`mtp.`), and implements `mtp_abstract_states()`, the MTP layer's paged KV, and
-`mtp_draft()`. The export finds the target weights the draft shares, such as the
-embedding and the LM head, by lowering it once, as for the forward. They bind
-the target's slots, so the artifact stores them once. The MTP KV states are
-numbered after the target's.
+the export loads the model together with the MTP draft vLLM builds for it (for
+Qwen3.5, `Qwen3_5MTP` from the checkpoint's `mtp.*` weights) and adds
+`mtp_draft_bucket{B}` for every forward bucket. The draft projects with the
+target's embedding and LM head, which keep their slots, so the artifact stores
+them once; its own weights are exported under their checkpoint names (`mtp.`).
+Its paged KV is a state numbered after the target's and counts against the KV
+budget like the target's. `mtp_draft` runs the draft over every row of the step
+and drafts the first token at each request's `last_token_indices` row; each
+further token comes from one more pass over one row per request, as vLLM's MTP
+proposer chains them.
+
+A model outside vLLM lists its MTP layer's weights among `abstract_params()`
+under `mtp.` names and implements `mtp_abstract_states()` and `mtp_draft()`.
+The export finds the target weights the draft shares by lowering it once, as
+for the forward.
 
 ### Example: match a `vllm serve` run
 

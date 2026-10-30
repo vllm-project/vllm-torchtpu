@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 from collections.abc import Mapping, Sequence
@@ -720,12 +721,20 @@ def test_export_speculative_config_keeps_vllm_field_names() -> None:
         "prompt_lookup_max": 3,
         "prompt_lookup_min": 3,
     }
+    assert cli.export_speculative_config(
+        {"method": "mtp", "num_speculative_tokens": 2}
+    ) == {"method": "mtp", "num_speculative_tokens": 2}
 
 
 @pytest.mark.parametrize(
     "raw, error",
     [
-        ({"method": "mtp", "num_speculative_tokens": 1}, "not supported"),
+        ({"method": "eagle3", "num_speculative_tokens": 1}, "not supported"),
+        ({"method": "mtp", "num_speculative_tokens": 0}, "num_speculative_tokens"),
+        (
+            {"method": "mtp", "num_speculative_tokens": 1, "prompt_lookup_max": 3},
+            "fields",
+        ),
         ({"method": "ngram", "prompt_lookup_max": 3}, "num_speculative_tokens"),
         ({"method": "ngram", "num_speculative_tokens": 2}, "prompt_lookup_max"),
         (
@@ -987,6 +996,87 @@ def test_fit_num_blocks_to_hbm_takes_recurrent_state_off_the_budget_first() -> N
     fixed = cfg.num_state_slots * state_bytes
     assert adapter.fit_num_blocks_to_hbm(0.9, fixed + 33 * kv_block_bytes + 1) == 33
     assert adapter.abstract_states()[1].shape[0] == cfg.num_state_slots
+
+
+def test_fit_num_blocks_to_hbm_counts_the_mtp_draft_kv() -> None:
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny",
+        num_layers=1,
+        speculative_config={"method": "mtp", "num_speculative_tokens": 1},
+    )
+    adapter = _adapter_without_model(cfg)
+    adapter._mtp_draft = nn.Module()
+
+    def kv() -> list[api.ShapeDtypeStruct]:
+        return [api.ShapeDtypeStruct((adapter.export_config.num_blocks, 1024), "bf16")]
+
+    adapter.abstract_states = kv
+    adapter.mtp_abstract_states = kv
+    # Each block is a target KV block and an MTP KV block: 2 x 2048 bytes.
+    assert adapter.fit_num_blocks_to_hbm(0.9, 10 * 4096 + 1) == 10
+
+
+def test_a_speculating_recurrent_model_keeps_a_checkpoint_per_draft_token() -> None:
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny",
+        num_layers=1,
+        max_num_seqs=8,
+        speculative_config={"method": "mtp", "num_speculative_tokens": 2},
+    )
+    assert (cfg.recurrent_window, cfg.num_state_slots) == (3, 8 * 3 + 1)
+    adapter = _adapter_without_model(cfg)
+    adapter._has_recurrent_layers = lambda: True
+    assert adapter.extra_user_inputs() == [
+        ("mamba_state_indices", (8,)),
+        ("mamba_slot_read_offsets", (25,)),
+        ("mamba_ckpt_indices", (8, 3)),
+    ]
+    # Attention runs verify windows as mixed sequences, the recurrent kernels in
+    # their windowed segment: each gets its own request distribution.
+    assert exporter._req_dist_len(adapter) == 6
+    plain = _adapter_without_model(dataclasses.replace(cfg, speculative_config=None))
+    plain._has_recurrent_layers = lambda: True
+    assert plain.export_config.num_state_slots == 9
+    assert plain.extra_user_inputs() == [("mamba_state_indices", (8,))]
+    assert exporter._req_dist_len(plain) == 3
+
+
+def _target_with_mtp_draft() -> nn.Module:
+    """A target with a tied LM head, and an MTP draft sharing its embedding and
+    LM head, with its own `fc` and a buffer."""
+    target = nn.Module()
+    target.model = nn.Module()
+    target.model.embed_tokens = nn.Embedding(8, 4)
+    target.lm_head = nn.Linear(4, 8, bias=False)
+    target.lm_head.weight = target.model.embed_tokens.weight
+    draft = nn.Module()
+    draft.model = nn.Module()
+    draft.model.embed_tokens = target.model.embed_tokens
+    draft.model.fc = nn.Linear(8, 4, bias=False)
+    draft.model.register_buffer("scale", torch.ones(2))
+    draft.lm_head = target.lm_head
+    object.__setattr__(target, universal_adapter.MTP_DRAFT_ATTR, draft)
+    return target
+
+
+def test_mtp_draft_weights_keep_the_target_names_they_share() -> None:
+    target = _target_with_mtp_draft()
+    assert universal_adapter.mtp_draft_names(target) == {
+        "model.embed_tokens.weight": "model.embed_tokens.weight",
+        "model.fc.weight": "mtp.fc.weight",
+        "lm_head.weight": "model.embed_tokens.weight",
+        "model.scale": "mtp.scale",
+    }
+    # The draft is not part of the target's module tree.
+    assert not any("fc" in n for n, _ in target.named_parameters())
+    tensors = checkpoint.local_tensors(target)
+    assert tensors["mtp.fc.weight"] is target._export_mtp_draft.model.fc.weight
+    assert set(tensors) == {
+        "model.embed_tokens.weight",
+        "lm_head.weight",
+        "mtp.fc.weight",
+        "mtp.scale",
+    }
 
 
 def test_fit_num_blocks_to_hbm_rejects_a_budget_without_room_for_a_block() -> None:
