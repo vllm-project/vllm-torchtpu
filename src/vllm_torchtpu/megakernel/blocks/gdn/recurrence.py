@@ -22,7 +22,7 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 
-from ...ops import BF16, F32, I32, rnd, rup
+from ...ops import BF16, F32, I32, REC, rnd, rup
 from .params import GDNParams
 from .states import rec_chunk
 
@@ -77,7 +77,7 @@ def gdn_rec(ctx: Any, gp: GDNParams, u: Any, ybuf: Any, slot: Any) -> None:
         delta = (v - pred) * beta[:, None]
         sb[...] = sb[...] + kc_ * delta[:, None, :]
         out = rnd(jnp.sum(sb[...] * qc, axis=1))
-        recb[b * vh : (b + 1) * vh] = sb[...].astype(BF16)
+        recb[b * vh : (b + 1) * vh] = sb[...].astype(REC)
         val = out * lax.rsqrt(jnp.mean(out * out, axis=-1, keepdims=True) + gp.eps)
         val = (gnw[None, :] * val.astype(BF16)).astype(F32)
         zz = ybuf[b, QKV : QKV + Z].reshape(vh, VD)
@@ -148,7 +148,7 @@ def gdn_rec_chunked(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> None:
                 delta = (v - pred) * beta[:, None]
                 sb[...] = sb[...] + kc_ * delta[:, None, :]
                 out = rnd(jnp.sum(sb[...] * qc, axis=1))
-                st[h0 : h0 + vh] = sb[...].astype(BF16)
+                st[h0 : h0 + vh] = sb[...].astype(REC)
             else:
                 # Head-major recurrence (opt-in `GDNTunables.gdn_head_major`):
                 # per-head update with `colsk` K/Q double-buffered in `sb`.
@@ -167,7 +167,7 @@ def gdn_rec_chunked(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> None:
                     s_h = s_h + kc_h * delta_h[:, None, :]
                     qc_h = sb[cb + kh + j : cb + kh + j + 1]
                     out_acc = jnp.where(hrow == h, jnp.sum(s_h * qc_h, axis=1), out_acc)
-                    st[h0 + h : h0 + h + 1] = s_h.astype(BF16)
+                    st[h0 + h : h0 + h + 1] = s_h.astype(REC)
                 out = rnd(out_acc)
             val = out * lax.rsqrt(jnp.mean(out * out, axis=-1, keepdims=True) + gp.eps)
             val = (gnw[None, :] * val.astype(BF16)).astype(F32)

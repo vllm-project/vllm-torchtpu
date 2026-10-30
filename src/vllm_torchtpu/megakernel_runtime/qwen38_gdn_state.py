@@ -84,8 +84,8 @@ rows are oldest-first in both: v3's checkpoint ``w`` is ``lhs[w+1 : w+4]`` of
 
 Caveats
 -------
-* ``rec_ckpt`` is bf16: scatter upcasts it, so the f32 pool state is
-  bf16-rounded every step (integration-design §3.1 risk; not fixed here).
+* ``rec_ckpt`` is ``REC`` (bf16 unless ``VLLM_TPU_MK_GDN_REC_F32=1``): with bf16 the
+  scatter upcasts it, so the f32 pool state is bf16-rounded every step.
 * All ``NL`` layers must live in one pool tensor (one raw tensor shared by
   all single-layer GDN groups). Block-major pools need the caller to fold the
   pool with ``block_major_pool.kernel_view`` and remap ids with
@@ -105,6 +105,7 @@ import jax
 import jax.numpy as jnp
 
 from vllm_torchtpu.kernels import pool_adapters
+from vllm_torchtpu.megakernel.ops import REC
 
 F32 = jnp.float32
 BF16 = jnp.bfloat16
@@ -293,10 +294,10 @@ def read_blocks_from_metadata(
 
 
 def _ssm_rows_to_rec(ssm, layout: Qwen38GdnPoolLayout, NL: int, NS: int):
-    """[NL*NS, ssm_rows, 128] f32 -> rec [NL, NS*vh, KD, VD] bf16 (no transpose)."""
+    """[NL*NS, ssm_rows, 128] f32 -> rec [NL, NS*vh, KD, VD] `REC` (no transpose)."""
     used = layout.ssm_elems // layout.ssm_lanes
     ssm = ssm[:, :used] if used != ssm.shape[1] else ssm
-    return ssm.reshape(NL, NS * layout.n_v, layout.d_k, layout.d_v).astype(BF16)
+    return ssm.reshape(NL, NS * layout.n_v, layout.d_k, layout.d_v).astype(REC)
 
 
 def _conv_windows(conv_ckpt, T: int):
@@ -359,7 +360,7 @@ def gather_gdn_states(
         rec = jnp.where(
             jnp.repeat(m, layout.n_v, axis=1)[:, :, None, None],
             rec,
-            jnp.zeros((), BF16),
+            jnp.zeros((), REC),
         )
     return conv_out, rec
 

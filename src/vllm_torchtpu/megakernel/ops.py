@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 
 import jax
 import jax.numpy as jnp
@@ -23,6 +24,10 @@ from jax import lax
 
 BF16 = jnp.bfloat16
 F32 = jnp.float32
+# GDN recurrent state (S) dtype inside the kernel: VMEM copies, the verify-window
+# scratch and the checkpoints written back. bf16 by default; VLLM_TPU_MK_GDN_REC_F32=1 keeps
+# S in f32 end to end like the stock GDN kernel (bf16 rounding of S grows with |S|).
+REC = F32 if os.environ.get("VLLM_TPU_MK_GDN_REC_F32", "0") == "1" else BF16
 I32 = jnp.int32
 U32 = jnp.uint32
 FP8 = jnp.float8_e4m3fn
