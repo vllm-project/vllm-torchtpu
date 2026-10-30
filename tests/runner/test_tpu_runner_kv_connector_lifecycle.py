@@ -115,6 +115,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
         _get_sampling_generator=lambda: None,
         _greedy_sample=lambda _logits: torch.tensor([7]),
         _min_tokens_batch_state=lambda: {},
+        _repetition_penalty_batch_state=lambda: {},
         _sample_spec_verify_chunk=lambda *_args: torch.tensor([[7, -1]]),
         _update_mamba_slot_read_offsets=lambda *_args: None,
         _update_num_xla_graphs=lambda *_args: None,
@@ -127,7 +128,11 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
     )
     runner._stage_timing.take_samples.return_value = ([], [])
     runner._async_drafter = runner.drafter
-    for name in ("maybe_wait_for_kv_save", "get_finished_kv_transfers"):
+    for name in (
+        "_make_model_runner_output",
+        "maybe_wait_for_kv_save",
+        "get_finished_kv_transfers",
+    ):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
     return runner
 

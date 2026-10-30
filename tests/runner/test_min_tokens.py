@@ -177,6 +177,31 @@ class TestStopTable:
         )
         assert restore.tolist() == [True, False]
 
+    def test_out_of_vocab_stop_ids_are_dropped_when_vocab_size_given(self):
+        """Codec talker heads (e.g. 3072 logits) inherit the wider text
+        tokenizer EOS (e.g. 151645) in all_stop_token_ids; out-of-range stop
+        ids must be dropped instead of clamping onto the last column."""
+        state = {
+            0: (5, 0, (-1, 3, 151645), False),
+            1: (5, 0, (151645,), False),
+        }
+        table = min_tokens.build_stop_table(
+            state, min_tokens.plain_rows(state, 0, 2), num_rows=2, vocab_size=8
+        )
+        assert table is not None
+        stop_ids, _ = table
+        assert stop_ids[0].tolist() == [3] * min_tokens.STOP_IDS_WIDTH
+        assert (stop_ids[1] == -1).all()
+        assert (
+            min_tokens.build_stop_table(
+                {0: (5, 0, (151645,), False)},
+                {0: (0, 0, 1)},
+                num_rows=1,
+                vocab_size=8,
+            )
+            is None
+        )
+
 
 @pytest.fixture
 def eager():
@@ -606,6 +631,7 @@ def _plain_step_runner(num_output, logits, req_id="r0"):
         _pp_wave=None,
         _dp_step_other_decode=False,
         _min_tokens=min_tokens.MinTokensTracker(),
+        _repetition_penalty_batch_state=lambda: {},
         speculative_config=None,
         scheduler_config=SimpleNamespace(async_scheduling=False),
         _is_async_drafter=False,
@@ -626,6 +652,7 @@ def _plain_step_runner(num_output, logits, req_id="r0"):
             num_computed_tokens=0, num_tokens=1, output_token_ids=[0] * num_output
         )
     for name in (
+        "_make_model_runner_output",
         "_mask_min_tokens",
         "_min_tokens_batch_state",
         "_settle_draft_placeholders_for_min_tokens",
