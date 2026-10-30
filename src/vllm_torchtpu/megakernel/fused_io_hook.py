@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Protocol
 
-from ._builtins import ensure_builtins
+from ._builtins import FUSED_IO, ensure_builtins
 from .errors import MegakernelConfigError
 
 if TYPE_CHECKING:
@@ -74,13 +74,13 @@ def register_fused_io(impl: FusedPoolIO) -> None:
 
 def fused_io_available() -> bool:
     """Whether a fused pool I/O implementation is registered."""
-    ensure_builtins()
+    ensure_builtins(*FUSED_IO)
     return _KEY in _REGISTRY
 
 
 def fused_io() -> FusedPoolIO:
     """Return the registered fused pool I/O helpers (used under `CacheExec.FUSED`)."""
-    ensure_builtins()
+    ensure_builtins(*FUSED_IO)
     impl = _REGISTRY.get(_KEY)
     if impl is None:
         raise MegakernelConfigError(

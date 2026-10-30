@@ -476,20 +476,20 @@ def register_profile(profile: Profile, *, replace: bool = False) -> Profile:
 
 def model_default_profile(model: str | None) -> Profile:
     """The default profile of `model`, else `default`."""
-    _builtins.ensure_builtins()
+    _builtins.ensure_builtins(*_builtins.MODELS_AND_PROFILES)
     name = _MODEL_DEFAULTS.get(model) if model is not None else None
     return _REGISTRY[name] if name is not None else DEFAULT_PROFILE
 
 
 def list_profiles() -> tuple[str, ...]:
     """Return the names of all registered profiles."""
-    _builtins.ensure_builtins()
+    _builtins.ensure_builtins(*_builtins.MODELS_AND_PROFILES)
     return tuple(sorted(_REGISTRY))
 
 
 def get_profile(name: str | Profile | None) -> Profile:
     """Resolve a profile by name (`None` / `""` -> `default`)."""
-    _builtins.ensure_builtins()
+    _builtins.ensure_builtins(*_builtins.MODELS_AND_PROFILES)
     if isinstance(name, Profile):
         _check_exact(name)
         return name

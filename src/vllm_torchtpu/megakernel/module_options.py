@@ -60,7 +60,7 @@ def register_tunables(name: str, cls: type) -> None:
 
 def tunables_class(name: str) -> type:
     """The registered `Tunables` class of modules named `name`."""
-    _builtins.ensure_builtins()
+    _builtins.ensure_builtins(*_builtins.TUNABLES)
     try:
         return _TUNABLES[name]
     except KeyError:
@@ -71,7 +71,7 @@ def tunables_class(name: str) -> type:
 
 def registered_tunables() -> dict[str, type]:
     """All registered `{module name: Tunables class}` (a copy)."""
-    _builtins.ensure_builtins()
+    _builtins.ensure_builtins(*_builtins.TUNABLES)
     return dict(_TUNABLES)
 
 
@@ -94,7 +94,7 @@ def register_debug(name: str, cls: type) -> None:
 
 def debug_class(name: str) -> type:
     """The registered `Debug` class of modules named `name`."""
-    _builtins.ensure_builtins()
+    _builtins.ensure_builtins(*_builtins.TUNABLES)
     try:
         return _DEBUG[name]
     except KeyError:
@@ -105,7 +105,7 @@ def debug_class(name: str) -> type:
 
 def registered_debug() -> dict[str, type]:
     """All registered `{module name: Debug class}` (a copy)."""
-    _builtins.ensure_builtins()
+    _builtins.ensure_builtins(*_builtins.TUNABLES)
     return dict(_DEBUG)
 
 

@@ -18,24 +18,41 @@ longer imports `megakernel.modules` (module tunables / debug options,
 registered by `Module.__init_subclass__`), `megakernel.models` or
 `megakernel.profiles` (built-in models and profiles), or
 `megakernel.experimental` (the fused pool I/O implementation). Registry
-lookups call `ensure_builtins()` first. A missing package (a partial tree, or one that
-moved out) is skipped.
+lookups call `ensure_builtins(...)` first, for the packages their registry
+needs. A missing package (a partial tree, or one that moved out) is skipped.
 """
 
 from __future__ import annotations
 
-import contextlib
 import importlib
 
-_LOADED = False
+BUILTINS = ("modules", "models", "profiles", "experimental")
+# The packages a registry's lookups need.
+TUNABLES = ("modules",)
+MODELS_AND_PROFILES = ("modules", "models", "profiles")
+FUSED_IO = ("experimental",)
+
+_LOADED: set[str] = set()
 
 
-def ensure_builtins() -> None:
-    """Import the built-in modules, models, profiles and fused pool I/O once."""
-    global _LOADED
-    if _LOADED:
-        return
-    _LOADED = True
-    for name in ("modules", "models", "profiles", "experimental"):
-        with contextlib.suppress(ImportError):
-            importlib.import_module(f"{__package__}.{name}")
+def ensure_builtins(*names: str) -> None:
+    """Import the named built-in packages (all of `BUILTINS` by default) once.
+
+    A lookup only loads what its registry needs: a module-tunables lookup
+    runs while `profile` itself is being imported (building
+    `DEFAULT_PROFILE`), when `models` / `profiles` can't be imported yet.
+    """
+    for name in names or BUILTINS:
+        if name in _LOADED:
+            continue
+        _LOADED.add(name)
+        full = f"{__package__}.{name}"
+        try:
+            importlib.import_module(full)
+        except ModuleNotFoundError as exc:
+            if exc.name != full:
+                _LOADED.discard(name)
+                raise
+        except BaseException:
+            _LOADED.discard(name)
+            raise

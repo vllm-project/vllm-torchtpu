@@ -16,6 +16,8 @@
 from __future__ import annotations
 
 import importlib
+import sys
+import types
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # eager imports for type checkers and IDEs
@@ -552,3 +554,21 @@ def __getattr__(name: str) -> Any:
 
 def __dir__() -> list[str]:
     return sorted(set(globals()) | set(__all__) | _SUBMODULES)
+
+
+# `verify_module` names both a submodule and the function `verify` exports.
+# The import system binds a loaded submodule on its package, which would
+# shadow the lazily resolved function; the name stays the function, as with
+# the eager `from .verify import verify_module` (the submodule stays importable
+# through `sys.modules`).
+_FUNCTION_NAMED_SUBMODULES = frozenset({"verify_module"})
+
+
+class _Package(types.ModuleType):
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in _FUNCTION_NAMED_SUBMODULES and isinstance(value, types.ModuleType):
+            return
+        super().__setattr__(name, value)
+
+
+sys.modules[__name__].__class__ = _Package

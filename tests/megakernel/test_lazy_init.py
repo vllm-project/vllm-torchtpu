@@ -125,3 +125,33 @@ print("OK")
 
 def test_registry_lookups_load_the_builtins_first() -> None:
     assert _run(_REGISTRIES) == "OK"
+
+
+_FIRST_LOOKUP = """
+from vllm_torchtpu import megakernel as mk
+# The first lookup can be a profile one: `profile` builds DEFAULT_PROFILE
+# (a module-tunables lookup) while it is itself being imported.
+assert mk.get_profile("qwen35-candidate30-fused").numerics == "approx"
+print("OK")
+"""
+
+
+def test_first_lookup_is_a_profile_lookup() -> None:
+    assert _run(_FIRST_LOOKUP) == "OK"
+
+
+_FUNCTION_NAMED_SUBMODULE = """
+import sys
+import types
+from vllm_torchtpu import megakernel as mk
+import vllm_torchtpu.megakernel.verify_module
+assert "vllm_torchtpu.megakernel.verify_module" in sys.modules
+assert isinstance(mk.verify_module, types.FunctionType), mk.verify_module
+from vllm_torchtpu.megakernel import verify_module
+assert verify_module is mk.verify_module
+print("OK")
+"""
+
+
+def test_verify_module_stays_the_function_after_its_submodule_loads() -> None:
+    assert _run(_FUNCTION_NAMED_SUBMODULE) == "OK"

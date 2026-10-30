@@ -60,7 +60,8 @@ def _isolated_profile_state(monkeypatch: pytest.MonkeyPatch):
 
 
 def test_profile_imports_only_exec_spec_pool_and_profiles():
-    """`profile.py` imports only stdlib, `exec_spec`, `pool`, and `profiles`."""
+    """`profile.py` imports only stdlib, `exec_spec`, `pool`, `profiles` and
+    the stdlib-only `_builtins` loader."""
     path = Path(profile.__file__)
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     for node in ast.walk(tree):
@@ -74,7 +75,8 @@ def test_profile_imports_only_exec_spec_pool_and_profiles():
             else:
                 assert node.level == 1
                 roots = [mod.split(".")[0]] if mod else [a.name for a in node.names]
-                assert set(roots) <= {"exec_spec", "pool", "profiles"}, roots
+                allowed = {"_builtins", "exec_spec", "pool", "profiles"}
+                assert set(roots) <= allowed, roots
 
 
 def test_default_profile_and_baseline_metadata():
