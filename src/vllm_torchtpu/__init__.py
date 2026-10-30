@@ -524,6 +524,27 @@ def _patch_vllm_compile_all_ranges() -> None:
             "compile_all_ranges should not be called."
         )
         local_rank = int(os.environ["LOCAL_RANK"])
+        from vllm_torchtpu.compilation.tpu_compiler import (
+            agree_all_ranks,
+            graph_is_rank_dependent,
+        )
+
+        if graph_is_rank_dependent(self.graph):
+            # No peer replays a rank-salted artifact: compile every range here
+            # without waiting for an owner (an owner that failed left its peers
+            # waiting PEER_WAIT_S), then fail together before any rank runs the
+            # program its peers may not have.
+            failure: Exception | None = None
+            try:
+                compile_rotated(self, local_rank)
+            except Exception as e:  # noqa: BLE001 - re-raised below on every rank
+                failure = e
+            if not agree_all_ranks(failure is None):
+                raise failure or RuntimeError(
+                    "rank-dependent compile failed on another rank; "
+                    "failing on all ranks"
+                )
+            return
         if not envs.TPU_PRECOMPILE_PEER_REPLAY:
             compile_rotated(self, local_rank)
             return
@@ -545,7 +566,9 @@ def _patch_vllm_compile_all_ranges() -> None:
             return
 
         from vllm_torchtpu.compilation.tpu_compiler import (
-            PEER_WAIT_S,
+            PrecompileProgress,
+            peer_owner_cache_id,
+            set_peer_owner,
             wait_for_peer_artifact,
         )
 
@@ -572,12 +595,50 @@ def _patch_vllm_compile_all_ranges() -> None:
                 mine.append(range_entry)
             else:
                 # In the order the owners finish them: by turn, small first.
-                others.append((turn, range_entry.compile_range.end, range_entry))
+                others.append((turn, range_entry.compile_range.end, owner, range_entry))
 
-        for range_entry in mine:
-            compile_entry(self, range_entry)
-        with wait_for_peer_artifact(PEER_WAIT_S):
-            for _, _, range_entry in sorted(others, key=lambda o: o[:2]):
+        # What this rank built is reported to the peers waiting on it, so a
+        # waiter can tell a slow owner from one that failed a bucket or skipped
+        # this subgraph (see PrecompileProgress).
+        adaptor = getattr(self.vllm_backend.compiler_manager, "compiler", None)
+        cache_dir = getattr(adaptor, "cache_dir", None)
+        progress = PrecompileProgress(cache_dir, self.piecewise_compile_index)
+        progress.started()
+        try:
+            for range_entry in mine:
+                end = range_entry.compile_range.end
+                try:
+                    compile_entry(self, range_entry)
+                except Exception as e:
+                    progress.failed[end] = repr(e)[:300]
+                    raise
+                start = range_entry.compile_range.start
+                artifact = (
+                    f"artifact_compile_range_{start}_{end}"
+                    f"_subgraph_{self.piecewise_compile_index}"
+                )
+                if cache_dir is None or os.path.exists(
+                    os.path.join(cache_dir, artifact)
+                ):
+                    progress.saved.append(end)
+                else:
+                    progress.failed[end] = "no artifact saved (not serializable)"
+        finally:
+            progress.finished()
+        vllm_cfg = getattr(self, "vllm_config", None) or getattr(
+            self.vllm_backend, "vllm_config", None
+        )
+        parallel_cfg = getattr(vllm_cfg, "parallel_config", None)
+        with wait_for_peer_artifact(envs.TPU_PRECOMPILE_PEER_WAIT_S, progress):
+            for _, end, owner, range_entry in sorted(others, key=lambda o: o[:2]):
+                owner_id = peer_owner_cache_id(
+                    slot,
+                    owner,
+                    local_rank=local_rank,
+                    cache_dir=cache_dir,
+                    parallel_config=parallel_cfg,
+                )
+                set_peer_owner(owner_id, end)
                 compile_entry(self, range_entry)
 
     if envs.TPU_PARALLEL_PRECOMPILE:
