@@ -49,6 +49,7 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
     token_block_alignment,
 )
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import (
+    ROW_TILE_LANES,
     ragged_gather_rows,
     ragged_gather_v2,
 )
@@ -292,6 +293,22 @@ def uses_ragged_permute(
     return use_ep and use_sparse_core and num_routed_rows > onehot_moe_permute_threshold
 
 
+def quantized_rows_shape(
+    num_tokens: int, hidden_size: int, *, use_ep: bool, use_sparse_core: bool
+) -> tuple[int, ...]:
+    """The shape `quantize_moe_input` returns `num_tokens` quantized rows in.
+
+    Where the SparseCore ragged permute may move them, they come as
+    [T, H // 128, 128] row tiles: `ragged_gather_rows` then reads each routed
+    row as one contiguous 4 KiB tile, where [T, H] int8 interleaves four rows
+    per 32-bit word.
+    """
+    # `ragged_gather_rows` reads a tile as 32-bit words of four lane blocks.
+    if use_ep and use_sparse_core and hidden_size % (4 * ROW_TILE_LANES) == 0:
+        return (num_tokens, hidden_size // ROW_TILE_LANES, ROW_TILE_LANES)
+    return (num_tokens, hidden_size)
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -319,6 +336,7 @@ def quantize_moe_input(
     permute moves as they are, and their scales, for
     `fused_moe_func(hidden_scale=...)` over the `num_dispatched_tokens` rows
     that the dispatch gathers; see `dispatch_quant_dtype` for when it applies.
+    The rows come in `quantized_rows_shape`.
     """
     if uses_onehot_permute(
         num_dispatched_tokens,
@@ -329,7 +347,11 @@ def quantize_moe_input(
     ):
         # What `fused_moe_func` does to the rows before a one-hot permute.
         hidden_states = jnp.where(jnp.isfinite(hidden_states), hidden_states, 0)
-    return quantize_lhs(hidden_states, q_dtype, storage_dtype=jnp.int8)
+    q, scale = quantize_lhs(hidden_states, q_dtype, storage_dtype=jnp.int8)
+    shape = quantized_rows_shape(
+        *q.shape, use_ep=use_ep, use_sparse_core=use_sparse_core
+    )
+    return q.reshape(shape), scale
 
 
 # Rows per block of the rank contraction: the triangular matmul is B x B, so this

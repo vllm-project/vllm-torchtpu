@@ -28,6 +28,7 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     quantize_moe_input,
     quantize_to_native_fp4_kmajor,
+    quantized_rows_shape,
     requant_unpack_kmajor,
     resolve_onehot_permute_threshold,
     unpack_fp4_to_e2m1,
@@ -347,6 +348,8 @@ def build_moe_input_quantizer(
     if op is not None:
         return op
 
+    use_sparse_core = envs.USE_MOE_SPARSE_CORE
+
     def quantize(hidden_states: jax.Array) -> tuple[jax.Array, jax.Array]:
         return quantize_moe_input(
             hidden_states,
@@ -354,7 +357,7 @@ def build_moe_input_quantizer(
             num_dispatched_tokens=hidden_states.shape[0] * dispatch_size,
             topk=topk,
             use_ep=use_ep,
-            use_sparse_core=envs.USE_MOE_SPARSE_CORE,
+            use_sparse_core=use_sparse_core,
             onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
         )
 
@@ -364,8 +367,11 @@ def build_moe_input_quantizer(
 
     def _fake_quantize(hidden_states):
         num_tokens, hidden_size = hidden_states.shape
+        rows_shape = quantized_rows_shape(
+            num_tokens, hidden_size, use_ep=use_ep, use_sparse_core=use_sparse_core
+        )
         return (
-            hidden_states.new_empty((num_tokens, hidden_size), dtype=torch.int8),
+            hidden_states.new_empty(rows_shape, dtype=torch.int8),
             hidden_states.new_empty((num_tokens, hidden_size // LHS_QUANT_BLOCK_SIZE)),
         )
 

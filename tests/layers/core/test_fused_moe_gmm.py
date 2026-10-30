@@ -1031,6 +1031,7 @@ def test_fused_moe_quantized_rows_match_unquantized(num_tokens):
         use_sparse_core=True,
         onehot_moe_permute_threshold=threshold,
     )
+    assert rows.shape == (num_tokens, hidden_size // 128, 128)
     actual = fused_moe_func(hidden_states=rows, hidden_scale=rows_scale, **kwargs)
 
     assert actual.dtype == expected.dtype
