@@ -292,6 +292,9 @@ def ragged_gather_v2(
 
 # Lanes of one row tile: `ragged_gather_rows` takes rows as [N, H // 128, 128].
 ROW_TILE_LANES = 128
+# Unroll factor of `ragged_gather_rows`' repack loop. At 2 the loop spills
+# vector registers to TileSPMEM on tpu7x; at 1 it holds every value in registers.
+ROWS_REPACK_UNROLL = 1
 
 
 def _transpose_bytes(
@@ -402,7 +405,7 @@ def _rows_kernel(
                     )
                     out_ref[pl.ds(i, 1), col_slice] = packed_row
 
-        plsc.parallel_loop(0, words_per_block, unroll=REPACK_UNROLL)(word_loop)
+        plsc.parallel_loop(0, words_per_block, unroll=ROWS_REPACK_UNROLL)(word_loop)
 
     pltpu.emit_pipeline(
         gather_step,
