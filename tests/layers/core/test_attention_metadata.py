@@ -654,8 +654,18 @@ class TestAttentionMetadataBuilderPlumbing:
                 assert torch.equal(c.staged_block_tables[gid], want.reshape(-1))
             return c
 
-        walk()
+        c0 = walk()
         reads = [bt.get_numpy_array.call_count for bt in tables]
+        # Global version bumps (e.g. another table outside this walk), while
+        # neither participating table's _tpu_version changed: _pack_delta runs
+        # and reuses state[2] with zero table reads.
+        am._BLOCK_TABLE_VERSION[0] += 1
+        c_unchanged = walk()
+        assert [bt.get_numpy_array.call_count for bt in tables] == reads
+        assert torch.equal(
+            c_unchanged.staged_block_tables[0], c0.staged_block_tables[0]
+        )
+
         am._BLOCK_TABLE_VERSION[0] += 1
         tables[1]._tpu_version = am._BLOCK_TABLE_VERSION[0]
         tables[1].get_cpu_tensor.return_value[1, 2] = 999
@@ -732,7 +742,30 @@ class TestAttentionMetadataBuilderPlumbing:
             ):
                 assert torch.equal(x, y)
 
-    def test_block_table_mutations_bump_the_version(self):
+    def test_pack_delta_requires_upload_reuse(self, monkeypatch):
+        from vllm_torchtpu.layers.core import attention_metadata as am
+
+        monkeypatch.setenv("VLLM_TPU_BLOCK_TABLE_PACK_DELTA", "1")
+        monkeypatch.setenv("VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE", "0")
+        with pytest.raises(ValueError, match="VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE"):
+            am._install_block_table_version()
+
+        runner = self._make_runner_mock(num_groups=1)
+        runner._block_table_stage_cpu = None
+        builders = [self._make_builder(runner, kv_cache_group_id=0)]
+        self._make_attn_groups(runner, builders)
+        ctx = AttentionMetadataBuilderContext(
+            num_reqs=2,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.ones((4,), dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+        )
+        with pytest.raises(ValueError, match="VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE"):
+            stage_block_table_uploads(runner, ctx, 4)
+
+    def test_block_table_mutations_bump_the_version(self, monkeypatch):
         import numpy as np
         from types import SimpleNamespace
 
@@ -748,14 +781,18 @@ class TestAttentionMetadataBuilderPlumbing:
         v = am._BLOCK_TABLE_VERSION[0]
         BlockTable.append_row(bt, [], 0)  # no blocks: contents unchanged
         assert am._BLOCK_TABLE_VERSION[0] == v
+        assert not hasattr(bt, "_tpu_version")
         BlockTable.append_row(bt, [7], 1)
         assert am._BLOCK_TABLE_VERSION[0] > v
+        assert bt._tpu_version == am._BLOCK_TABLE_VERSION[0]
         v = am._BLOCK_TABLE_VERSION[0]
         BlockTable.move_row(bt, 1, 0)
         assert am._BLOCK_TABLE_VERSION[0] > v
+        assert bt._tpu_version == am._BLOCK_TABLE_VERSION[0]
         v = am._BLOCK_TABLE_VERSION[0]
         BlockTable.clear_row(bt, 0)
         assert am._BLOCK_TABLE_VERSION[0] > v
+        assert bt._tpu_version == am._BLOCK_TABLE_VERSION[0]
 
     def test_staging_respects_gid_subset_and_dummy_override(self):
         runner = self._make_runner_mock(num_groups=2)

@@ -554,6 +554,14 @@ _BLOCK_TABLE_VERSION = [0]
 
 
 def _install_block_table_version() -> None:
+    if (
+        envs.VLLM_TPU_BLOCK_TABLE_PACK_DELTA
+        and not envs.VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE
+    ):
+        raise ValueError(
+            "VLLM_TPU_BLOCK_TABLE_PACK_DELTA=1 requires "
+            "VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE=1."
+        )
     from vllm.v1.worker.block_table import BlockTable
 
     if getattr(BlockTable, "_tpu_version_patch", False):
@@ -699,14 +707,18 @@ def _pack_and_upload(runner, ctx, entries, num_reqs_padded, table_geom, stage_ke
         )
         runner._block_table_stage_cpu = scratch
     flat = scratch[:total]
-    if (
-        envs.VLLM_TPU_BLOCK_TABLE_PACK_DELTA
-        and ctx.position_ids_override is None
-        and envs.VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE
-    ):
-        staged_dev = _pack_delta(runner, ctx, entries, num_reqs_padded, table_geom, flat)
-        runner._block_table_stage_prev = (table_geom, None, staged_dev, stage_key)
-        return staged_dev
+    if envs.VLLM_TPU_BLOCK_TABLE_PACK_DELTA:
+        if not envs.VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE:
+            raise ValueError(
+                "VLLM_TPU_BLOCK_TABLE_PACK_DELTA=1 requires "
+                "VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE=1."
+            )
+        if ctx.position_ids_override is None:
+            staged_dev = _pack_delta(
+                runner, ctx, entries, num_reqs_padded, table_geom, flat
+            )
+            runner._block_table_stage_prev = (table_geom, None, staged_dev, stage_key)
+            return staged_dev
     runner.__dict__.pop("_block_table_pack_delta", None)
     flat.zero_()
 
@@ -760,6 +772,7 @@ def _pack_delta(runner, ctx, entries, num_reqs_padded, table_geom, flat):
     )
     state = runner.__dict__.get("_block_table_pack_delta")
     full = state is None or state[0] != layout
+    versions: list[int | None]
     if full:
         flat.zero_()
         versions = [None] * len(entries)
