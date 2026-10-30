@@ -456,6 +456,7 @@ def _qnorm_rope_body(
     x_ref: jax.Ref,
     cos_sin_ref: jax.Ref,
     out_ref: jax.Ref,
+    kv_ref: jax.Ref | None = None,
     *,
     rotary_dim: int,
     eps: float,
@@ -465,7 +466,8 @@ def _qnorm_rope_body(
     """Process one ``(tile_n, num_heads, head_dim)`` chunk.
 
     Per-head RMSNorm (no weight) over the whole ``head_dim``, then the same
-    rotation ``_rope_body`` applies.
+    rotation ``_rope_body`` applies. ``kv_ref``, the same tokens' roped lane
+    block of the decoupled key, is rotated in place with ``_rope_body``'s ops.
     """
     x = x_ref[...].astype(jnp.float32)
     rms = jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + eps)
@@ -475,6 +477,9 @@ def _qnorm_rope_body(
     # through with nothing but the norm applied.
     tail = y[..., -LANE:]
     cos, sin = _cos_sin_lanes(cos_sin_ref[...], rotary_dim=rotary_dim, inverse=inverse)
+    if kv_ref is not None:
+        kv = kv_ref[...].astype(jnp.float32)
+        kv_ref[...] = (kv * cos + _rotate_gptj(kv) * sin).astype(kv_ref.dtype)
     assert tail.ndim == 3
     cos = cos[:, None, :]
     sin = sin[:, None, :]
@@ -507,13 +512,14 @@ def _qnorm_rope_kernel(
     # HBM inputs
     x_hbm_ref: jax.Ref,
     cos_sin_cache_hbm_ref: jax.Ref,
-    # HBM output, aliased onto x_hbm_ref unless the input is tiled
-    out_hbm_ref: jax.Ref,
-    *,
+    # [kv input,] q output (aliased onto x_hbm_ref unless the input is tiled),
+    # [kv output, aliased onto the kv input]
+    *refs: jax.Ref,
     num_tiles: int,
     tile_n: int,
     x_block_shape: tuple[int, ...],
     out_block_shape: tuple[int, ...],
+    kv_lane_block: int | None,
     rotary_dim: int,
     eps: float,
     inverse: bool,
@@ -539,8 +545,32 @@ def _qnorm_rope_kernel(
     cos_sin_alloc = CosSinRef.create(
         spec=cos_sin_spec, dtype=cos_sin_dtype, buffer_count=2, tile_n=tile_n
     )
+    in_specs = [x_spec, cos_sin_spec]
+    in_allocs = [
+        pltpu.BufferedRef.input(x_spec, in_dtype, buffer_count=2),
+        cos_sin_alloc,
+    ]
+    in_refs = [x_hbm_ref, (cos_sin_cache_hbm_ref, positions_ref)]
+    if kv_lane_block is None:
+        (out_hbm_ref,) = refs
+    else:
+        # The kv input is aliased to its output; read/written through the latter.
+        _, out_hbm_ref, kv_out_hbm_ref = refs
+        kv_spec = pl.BlockSpec(
+            block_shape=(tile_n, LANE),
+            memory_space=pltpu.VMEM,
+            index_map=lambda i: (i, kv_lane_block),
+        )
+        in_specs.append(kv_spec)
+        in_allocs.append(
+            pltpu.BufferedRef.input_output(
+                kv_spec, kv_out_hbm_ref.dtype, buffer_count=2
+            )
+        )
+        in_refs.append(kv_out_hbm_ref)
 
-    def body(x_ref, cos_sin_ref, out_ref):
+    def body(x_ref, cos_sin_ref, *refs):
+        *kv_refs, out_ref = refs
         if tiled:  # transpose into the output block, then work there in place
             _untile_heads(x_ref.bitcast(jnp.uint32), out_ref)
             x_ref = out_ref
@@ -548,6 +578,7 @@ def _qnorm_rope_kernel(
             x_ref,
             cos_sin_ref,
             out_ref,
+            *kv_refs,
             rotary_dim=rotary_dim,
             eps=eps,
             inverse=inverse,
@@ -557,23 +588,17 @@ def _qnorm_rope_kernel(
     pipeline = pltpu.emit_pipeline(
         body,
         grid=(num_tiles,),
-        in_specs=[x_spec, cos_sin_spec],
+        in_specs=in_specs,
         out_specs=[out_spec],
     )
     allocations = (
-        pltpu.BufferedRef.input(x_spec, in_dtype, buffer_count=2),
-        cos_sin_alloc,
+        *in_allocs,
         pltpu.BufferedRef.output(out_spec, in_dtype, buffer_count=2),
     )
 
     @pl.with_scoped(allocations=allocations)
     def _run(allocations):
-        pipeline(
-            x_hbm_ref,
-            (cos_sin_cache_hbm_ref, positions_ref),
-            out_hbm_ref,
-            allocations=allocations,
-        )
+        pipeline(*in_refs, out_hbm_ref, allocations=allocations)
 
     _run()
 
@@ -739,6 +764,7 @@ def qnorm_rope(
         tile_n=tile_n,
         x_block_shape=x_block_shape,
         out_block_shape=x_block_shape,
+        kv_lane_block=None,
         rotary_dim=rotary_dim,
         eps=eps,
         inverse=inverse,
@@ -794,6 +820,79 @@ def qnorm_rope_flat(
         return qnorm_rope(
             q, positions, cos_sin_cache, eps=eps, inverse=inverse, name=name
         )
+    return cast(
+        jax.Array,
+        _qnorm_rope_flat_call(
+            x,
+            None,
+            positions,
+            cos_sin_cache,
+            num_heads=num_heads,
+            eps=eps,
+            inverse=inverse,
+            name=name,
+        ),
+    )
+
+
+@functools.partial(jax.jit, static_argnames=("num_heads", "eps", "inverse", "name"))
+def qnorm_kv_rope_flat(
+    x: jax.Array,  # [num_tokens, num_heads * head_dim]
+    kv: jax.Array,  # [num_tokens, kv_dim]
+    positions: jax.Array,  # [num_tokens] int
+    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+    *,
+    num_heads: int,
+    eps: float = 1e-6,
+    inverse: bool = False,
+    name: str = "qnorm_rope",
+) -> tuple[jax.Array, jax.Array]:
+    """`qnorm_rope_flat` of ``x`` and `rope` of ``kv`` in one kernel.
+
+    Both rotate the same tokens by the same ``cos_sin_cache`` rows, so the
+    key's roped lane block rides along in qnorm_rope's pipeline and reuses its
+    cos/sin gather instead of launching a second kernel that gathers them
+    again. Returns ``(q, kv)``, each bit-identical to the separate kernels.
+    """
+    num_tokens, width = x.shape
+    head_dim = width // num_heads
+    if x.dtype != jnp.bfloat16 or not can_untile_heads(num_tokens, num_heads, head_dim):
+        q = x.reshape(num_tokens, num_heads, head_dim)
+        return (
+            qnorm_rope(
+                q, positions, cos_sin_cache, eps=eps, inverse=inverse, name=name
+            ),
+            rope(kv, positions, cos_sin_cache, inverse=inverse),
+        )
+    return cast(
+        tuple[jax.Array, jax.Array],
+        _qnorm_rope_flat_call(
+            x,
+            kv,
+            positions,
+            cos_sin_cache,
+            num_heads=num_heads,
+            eps=eps,
+            inverse=inverse,
+            name=name,
+        ),
+    )
+
+
+def _qnorm_rope_flat_call(
+    x: jax.Array,
+    kv: jax.Array | None,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    *,
+    num_heads: int,
+    eps: float,
+    inverse: bool,
+    name: str,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+    """Builds the tiled-input ``pallas_call``; see the public wrappers."""
+    num_tokens, width = x.shape
+    head_dim = width // num_heads
     assert positions.ndim == 1 and positions.shape[0] == num_tokens
     rotary_dim = cos_sin_cache.shape[1]
     assert rotary_dim % 2 == 0 and rotary_dim <= LANE
@@ -809,12 +908,18 @@ def qnorm_rope_flat(
         TOKEN_TILE,
         LANE,
     )
+    kv_lane_block = None
+    if kv is not None:
+        assert kv.ndim == 2 and kv.shape[0] == num_tokens, (kv.shape, x.shape)
+        assert kv.shape[1] % LANE == 0
+        kv_lane_block = kv.shape[1] // LANE - 1  # its roped channels
     kernel = functools.partial(
         _qnorm_rope_kernel,
         num_tiles=num_tokens // tile_n,
         tile_n=tile_n,
         x_block_shape=x_block_shape,
         out_block_shape=(tile_n, num_heads, head_dim),
+        kv_lane_block=kv_lane_block,
         rotary_dim=rotary_dim,
         eps=eps,
         inverse=inverse,
@@ -822,25 +927,43 @@ def qnorm_rope_flat(
         cos_sin_dtype=cos_sin_cache.dtype,
     )
 
+    q_shape = jax.ShapeDtypeStruct((num_tokens, num_heads, head_dim), x.dtype)
+    in_specs = [
+        pl.BlockSpec(memory_space=pltpu.HBM),  # x tiles
+        pl.BlockSpec(memory_space=pltpu.HBM),  # cos_sin_cache
+    ]
+    operands = [positions, token_tiles(x, num_heads), cos_sin_cache]
+    if kv is None:
+        out_shape = q_shape
+        out_specs = pl.BlockSpec(memory_space=pltpu.HBM)
+        input_output_aliases = {}
+    else:
+        in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # kv
+        operands.append(kv)
+        out_shape = (q_shape, jax.ShapeDtypeStruct(kv.shape, kv.dtype))
+        out_specs = (
+            pl.BlockSpec(memory_space=pltpu.HBM),
+            pl.BlockSpec(memory_space=pltpu.HBM),
+        )
+        input_output_aliases = {3: 1}  # kv (after the scalar prefetch) -> kv out
+
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=1,
-        in_specs=(
-            pl.BlockSpec(memory_space=pltpu.HBM),  # x tiles
-            pl.BlockSpec(memory_space=pltpu.HBM),  # cos_sin_cache
-        ),
-        out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+        in_specs=in_specs,
+        out_specs=out_specs,
     )
 
     return pl.pallas_call(
         kernel,
-        out_shape=jax.ShapeDtypeStruct((num_tokens, num_heads, head_dim), x.dtype),
+        out_shape=out_shape,
         grid_spec=grid_spec,
+        input_output_aliases=input_output_aliases,
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
             disable_bounds_checks=True,
         ),
         name=name,
-    )(positions, token_tiles(x, num_heads), cos_sin_cache)
+    )(*operands)
 
 
 @functools.partial(jax.jit, static_argnames=("inverse", "quant_dtype", "name"))
