@@ -13,9 +13,15 @@ for path in (HERE, KERNEL_TESTS):
         sys.path.insert(0, path)
 
 
+ON_TPU = os.environ.get("DCP2_HARNESS_DEVICE", "cpu").lower() == "tpu"
+
+
 @pytest.fixture
 def interpret(monkeypatch):
-    """Pallas kernels in the legacy interpret evaluator on CPU (TPU7x info)."""
+    """Pallas kernels in the legacy interpret evaluator on CPU (TPU7x info);
+    a no-op under DCP2_HARNESS_DEVICE=tpu (real Mosaic kernels)."""
+    if ON_TPU:
+        return
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
 
@@ -73,6 +79,8 @@ def rpa_stand_in(monkeypatch):
     """Batched RPA cannot run in interpret mode: the decode-only reference the
     existing QSA tests use, extended with ``return_lse`` (set6's contract:
     ``wrapper.ragged_paged_attention(..., return_lse=True)`` -> out, cache, lse)."""
+    if ON_TPU:
+        return
     from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper
 
     monkeypatch.setattr(wrapper, "ragged_paged_attention", reference_rpa_lse)

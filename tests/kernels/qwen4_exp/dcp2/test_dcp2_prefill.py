@@ -18,6 +18,8 @@ import pytest
 from dcp2_harness import (
     D,
     check_gated,
+    check_pregate,
+    merge_pair,
     combine_plain_average,
     combine_rank0_only,
     fault_attend,
@@ -89,17 +91,52 @@ def test_prefill_fault_controls_are_detected(fault):
 SMALL = [(613, 96), (1500, 40)]  # two requests, unaligned prefixes and tails
 
 
-def production_replicated(case):
+def production_replicated(case, *, pregate=False):
+    """Replicated served prefill route per TP rank: gated BF16, or with
+    ``pregate`` its f32 (out, lse) from ``return_lse=True``."""
     h = case.heads
     out = []
     for r in range(D):
-        o, _ = qsa_rpa._prefill_attention(
+        res = qsa_rpa._prefill_attention(
             case.q[:, r * h : (r + 1) * h], case.gate[:, r * h : (r + 1) * h],
             jnp.asarray(case.blocks), jnp.asarray(case.lengths),
             jnp.asarray(case.full_rows), case.full_pool, jnp.asarray(case.starts),
-            kv_heads=1, ratio=case.ratio, k_scale=case.k_scale, v_scale=case.v_scale)
-        out.append(o)
+            **case.opts, **({"return_lse": True} if pregate else {}))
+        out.append(res[:2] if pregate else res[0])
     return out
+
+
+def production_prefill_attend(case):
+    """set6's DCP prefill: _prefill_attention(dcp, return_lse) (served tiles:
+    kv_tile = 2B, paired pages) -> (out, lse)."""
+
+    def attend(q, gate, blocks, lengths, table, cache, **kw):
+        return qsa_rpa._prefill_attention(
+            q, gate, jnp.asarray(blocks), jnp.asarray(lengths), jnp.asarray(table),
+            cache, jnp.asarray(case.starts), return_lse=True, **kw)[:2]
+
+    return attend
+
+
+def check_production_prefill(case, tol=None):
+    """Production DCP prefill vs the production replicated prefill, gated and
+    pre-gate; per-rank partials vs the f32 reference."""
+    kw = {} if tol is None else {"tol": tol}
+    result, _ = run_dcp_attention(case, production_prefill_attend(case), **kw)
+    live = np.broadcast_to((case.lengths > 0)[:, None], (len(case.lengths), case.heads))
+    gated = production_replicated(case)
+    pre = production_replicated(case, pregate=True)
+    out_pair = jnp.stack([p[0] for p in result.partial])
+    lse_pair = jnp.stack([p[1] for p in result.partial])
+    reports = dict(result.reports)
+    for r in range(D):
+        reports[f"pregate{r}"] = check_pregate(*merge_pair(out_pair, lse_pair, r, case.heads),
+                                               *pre[r], live, *([] if tol is None else [tol]),
+                                               what=f"prefill pre-gate rank {r}")
+        reports[f"gated{r}"] = check_gated(result.gated[r], gated[r], live,
+                                           *([] if tol is None else [tol]),
+                                           what=f"prefill production DCP rank {r}")
+    return reports
 
 
 def test_reference_matches_production_prefill(interpret):
@@ -121,14 +158,4 @@ def _prefill_lse_implemented():
                     reason="block_sparse_gqa_attention(dcp, return_lse) not landed (set6)")
 def test_production_prefill_dcp_matches_production_replicated(interpret):
     case = prefill_case(np.random.default_rng(4), SMALL, budget=64)
-
-    def attend(q, gate, blocks, lengths, table, cache, **kw):
-        return qsa_rpa._prefill_attention(
-            q, gate, jnp.asarray(blocks), jnp.asarray(lengths), jnp.asarray(table),
-            cache, jnp.asarray(case.starts), return_lse=True, **kw)[:2]
-
-    result, _ = run_dcp_attention(case, attend)
-    live = np.broadcast_to((case.lengths > 0)[:, None], (len(case.lengths), case.heads))
-    prod = production_replicated(case)
-    for r in range(D):
-        print(check_gated(result.gated[r], prod[r], live, what=f"production DCP {r}"))
+    print(check_production_prefill(case))
