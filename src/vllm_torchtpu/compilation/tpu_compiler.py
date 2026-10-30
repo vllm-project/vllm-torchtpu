@@ -90,7 +90,7 @@ _tpu_backend = TpuBackend()
 # owner failed a bucket (it compiles it itself) or skipped the whole subgraph
 # (the ranks diverged: the boot fails). The timeout is only the backstop for
 # an owner that reports nothing at all; the boot then fails too, naming it.
-PEER_WAIT_S = float(os.environ.get("TPU_PRECOMPILE_PEER_WAIT_S", "900"))
+PEER_WAIT_S = 900.0
 _PEER_POLL_S = 5.0
 _PEER_WAIT_LOG_S = 60.0
 # get_attr tensors up to this size are hashed by value; bigger ones, which are
@@ -98,6 +98,8 @@ _PEER_WAIT_LOG_S = 60.0
 _FINGERPRINT_MAX_NUMEL = 1 << 16
 
 _peer_wait = threading.local()
+
+PeerOwnerId = int | tuple[int, int]
 
 # Op-name fragments whose lowering depends on the calling rank although the
 # traced graph does not (e.g. a JAX callable over the TP mesh whose program is
@@ -123,8 +125,9 @@ def _rank_salt(code: str) -> str:
 
 
 def graph_is_rank_dependent(graph: fx.GraphModule) -> bool:
-    """Whether `graph` (or a submodule) calls a rank-dependent op: its artifacts are salted
-    with the rank, so no peer ever replays them and waiting for a peer's is pointless."""
+    """Whether `graph` (or a submodule) calls a rank-dependent op: its artifacts
+    are salted with the rank, so no peer ever replays them and waiting for a
+    peer's is pointless."""
     try:
         return any(
             _rank_salt(module.code)
@@ -136,26 +139,98 @@ def graph_is_rank_dependent(graph: fx.GraphModule) -> bool:
 
 
 def agree_all_ranks(ok: bool) -> bool:
-    """True only if every rank passes `ok` (a MIN all-reduce on the world CPU group).
+    """True only if every rank passes `ok` (a MIN all-reduce on the world CPU
+    group).
 
-    Lets the ranks fail a rank-dependent compile together: a rank that failed alone would leave
-    its peers running an SPMD program it never joins, or waiting on an artifact it never saves
-    (w04 j-05391f11: one rank's VMEM OOM left the other seven idle ~62 min).
+    Lets the ranks fail a rank-dependent compile together: a rank that failed
+    alone (for example, on a single-rank VMEM OOM) would otherwise leave its
+    peers running an SPMD program it never joins, or waiting until timeout on
+    an artifact it never saves.
     """
     import torch.distributed as dist
 
-    if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() == 1:
+    if (
+        not (dist.is_available() and dist.is_initialized())
+        or dist.get_world_size() == 1
+    ):
         return ok
     group = None
-    try:
+    with contextlib.suppress(Exception):
         from vllm.distributed.parallel_state import get_world_group
 
         group = get_world_group().cpu_group
-    except Exception:
-        pass
     flag = torch.tensor([1 if ok else 0], dtype=torch.int32)
     dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group)
     return bool(flag.item())
+
+
+def _format_owner(owner: PeerOwnerId | None) -> str:
+    if isinstance(owner, tuple):
+        rank, dp_rank = owner
+        return f"rank {rank}" if dp_rank == 0 else f"rank {rank} (dp {dp_rank})"
+    return f"rank {owner}"
+
+
+def peer_owner_cache_id(
+    slot: int,
+    owner_slot: int,
+    *,
+    local_rank: int,
+    cache_dir: str | None = None,
+    parallel_config: Any = None,
+) -> tuple[int, int]:
+    """Map `owner_slot` on this host to its `(rank, dp_rank)` cache dir pair.
+
+    vLLM names per-rank compile cache directories `rank_<rank>_<dp_rank>`, where
+    `rank` is the rank within the DP replica (`0 .. replica_world_size - 1`) and
+    `dp_rank` is `data_parallel_rank`. Across DP replicas `linear = dp_rank *
+    replica_world_size + rank` advances by 1 per host slot, so `(my_linear -
+    slot) + owner_slot` recovers the owner's exact `(rank, dp_rank)` dir.
+    """
+    my_rank: int | None = None
+    my_dp: int | None = None
+    if cache_dir:
+        m = re.fullmatch(
+            r"rank_(\d+)_(\d+)",
+            os.path.basename(PrecompileProgress._rank_dir(cache_dir)),
+        )
+        if m is not None:
+            my_rank, my_dp = int(m.group(1)), int(m.group(2))
+    if my_rank is None:
+        cfg_rank = getattr(parallel_config, "rank", None)
+        my_rank = (
+            int(cfg_rank)
+            if isinstance(cfg_rank, int)
+            else int(os.environ.get("RANK", local_rank))
+        )
+    if my_dp is None:
+        cfg_dp = getattr(parallel_config, "data_parallel_rank", None)
+        my_dp = int(cfg_dp) if isinstance(cfg_dp, int) else 0
+
+    replica_world = getattr(parallel_config, "world_size", None)
+    if not isinstance(replica_world, int) or replica_world <= 0:
+        dp_size = getattr(parallel_config, "data_parallel_size", None)
+        total_world = 0
+        with contextlib.suppress(Exception):
+            from vllm.distributed.parallel_state import get_world_group
+
+            total_world = get_world_group().world_size
+        if isinstance(dp_size, int) and dp_size > 1 and total_world >= dp_size:
+            replica_world = max(1, total_world // dp_size)
+        elif my_dp > 0:
+            env_rank = os.environ.get("RANK")
+            if env_rank is not None and int(env_rank) >= my_rank:
+                inferred = (int(env_rank) - my_rank) // my_dp
+                replica_world = inferred if inferred > 0 else max(1, my_rank + 1)
+            else:
+                replica_world = max(1, my_rank + 1)
+        else:
+            replica_world = max(1, total_world, my_rank + 1)
+
+    my_linear = my_dp * replica_world + my_rank
+    owner_linear = (my_linear - slot) + owner_slot
+    owner_dp, owner_rank = divmod(owner_linear, replica_world)
+    return (owner_rank, owner_dp)
 
 
 class PeerDivergedError(RuntimeError):
@@ -213,15 +288,20 @@ class PrecompileProgress:
             failed={str(k): v for k, v in sorted(self.failed.items())},
         )
 
-    def owner_records(self, owner_global_rank: int) -> list[dict]:
-        """The owner's progress records (every DP rank dir of that rank)."""
+    def owner_records(self, owner: PeerOwnerId) -> list[dict]:
+        """The owner's progress records from its `rank_<r>_<dp>` directory."""
         if not self.cache_dir:
             return []
         root = os.path.dirname(self._rank_dir(self.cache_dir))
+        if isinstance(owner, tuple):
+            rank, dp_rank = owner
+            paths = [os.path.join(root, f"rank_{rank}_{dp_rank}", self.FILE)]
+        else:
+            paths = glob.glob(
+                os.path.join(glob.escape(root), f"rank_{owner}_*", self.FILE)
+            )
         records: list[dict] = []
-        for path in glob.glob(
-            os.path.join(glob.escape(root), f"rank_{owner_global_rank}_*", self.FILE)
-        ):
+        for path in paths:
             try:
                 with open(path) as f:
                     records.extend(json.loads(line) for line in f if line.strip())
@@ -232,13 +312,13 @@ class PrecompileProgress:
         host = socket.gethostname()
         return [r for r in records if r.get("host") == host]
 
-    def owner_status(self, owner_global_rank: int, size: int, since: float) -> str:
+    def owner_status(self, owner: PeerOwnerId, size: int, since: float) -> str:
         """`pending`, `failed: <reason>`, or `skipped` for the owner's bucket
         `size` of this subgraph. Skipped: the owner has moved past this
         subgraph -- started a later one of this module, or recorded something
         since we began waiting -- without ever starting it."""
         records = [
-            r for r in self.owner_records(owner_global_rank) if r.get("prefix") == self.prefix
+            r for r in self.owner_records(owner) if r.get("prefix") == self.prefix
         ]
         mine = [r for r in records if r.get("subgraph") == self.subgraph]
         for r in mine:
@@ -276,10 +356,10 @@ def wait_for_peer_artifact(
         _peer_wait.owner = None
 
 
-def set_peer_owner(owner_global_rank: int | None, size: int | None) -> None:
-    """The rank that owns the bucket about to be compiled (inside
-    `wait_for_peer_artifact`)."""
-    _peer_wait.owner = owner_global_rank
+def set_peer_owner(owner: PeerOwnerId | None, size: int | None) -> None:
+    """The rank (or `(rank, dp_rank)`) that owns the bucket about to be
+    compiled (inside `wait_for_peer_artifact`)."""
+    _peer_wait.owner = owner
     _peer_wait.size = size
 
 
@@ -367,6 +447,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_PARALLEL_PRECOMPILE",
     "TPU_PRECOMPILE_BIGGEST_FIRST",
     "TPU_PRECOMPILE_PEER_REPLAY",
+    "TPU_PRECOMPILE_PEER_WAIT_S",
     # KV-transfer wiring: ports, socket paths, staging pool, pool sizes,
     # timeouts. Same reasoning as the Raiden group above. Every registry
     # entry not named here joins the cache key, so omitting these would
@@ -585,6 +666,9 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
     scheduler_config = vllm_config.scheduler_config
     spec = vllm_config.speculative_config
     factors = {
+        # Bumped when handle invariants change (v2: rank-dependent ops salted so
+        # pre-fix cross-rank SP hard-links in persistent caches are not loaded).
+        "cache_format": 2,
         "torch": torch.__version__,
         "torch_tpu": importlib_metadata.version("torch-tpu"),
         "jax": importlib_metadata.version("jax"),
@@ -931,21 +1015,22 @@ class TpuCompilerAdaptor(CompilerInterface):
         while not paths and time.monotonic() < deadline:
             if progress is not None and owner is not None and size is not None:
                 status = progress.owner_status(owner, size, started_wall)
+                owner_label = _format_owner(owner)
                 if status.startswith("failed"):
                     logger.warning(
-                        "[TpuCompilerAdaptor] rank %d did not build %s (%s); "
+                        "[TpuCompilerAdaptor] %s did not build %s (%s); "
                         "compiling it here",
-                        owner,
+                        owner_label,
                         key,
                         status,
                     )
                     return None
                 if status == "skipped":
                     message = (
-                        f"rank {owner} skipped subgraph {progress.subgraph} of "
+                        f"{owner_label} skipped subgraph {progress.subgraph} of "
                         f"{progress.prefix} (it never started compiling {key}) while "
                         f"this rank was waiting for it: the ranks are not building "
-                        f"the same program (check rank {owner} for a fallback)"
+                        f"the same program (check {owner_label} for a fallback)"
                     )
                     logger.error("[TpuCompilerAdaptor] %s", message)
                     raise PeerDivergedError(message)
@@ -953,9 +1038,9 @@ class TpuCompilerAdaptor(CompilerInterface):
             if now >= next_log:
                 next_log = now + _PEER_WAIT_LOG_S
                 logger.warning(
-                    "[TpuCompilerAdaptor] waited %.0f s for rank %s's artifact %s",
+                    "[TpuCompilerAdaptor] waited %.0f s for %s's artifact %s",
                     now - start,
-                    owner,
+                    _format_owner(owner),
                     key,
                 )
             time.sleep(_PEER_POLL_S)
@@ -963,9 +1048,9 @@ class TpuCompilerAdaptor(CompilerInterface):
         if not paths:
             if timeout_s > 0 and owner is not None:
                 message = (
-                    f"rank {owner} reported nothing for {key} in {timeout_s:.0f} s "
-                    "(TPU_PRECOMPILE_PEER_WAIT_S); failing the boot rather than "
-                    "serving a program it may not have built"
+                    f"{_format_owner(owner)} reported nothing for {key} in "
+                    f"{timeout_s:.0f} s (TPU_PRECOMPILE_PEER_WAIT_S); failing "
+                    "the boot rather than serving a program it may not have built"
                 )
                 logger.error("[TpuCompilerAdaptor] %s", message)
                 raise PeerDivergedError(message)
@@ -1046,13 +1131,14 @@ class TpuCompilerAdaptor(CompilerInterface):
         # With peer replay off, nothing replays another rank's artifact, so
         # none records a fingerprint either: `load` replays a rank's own
         # artifact without one, and a peer with replay on refuses it.
+        rank_dep = graph_is_rank_dependent(graph)
         peer = None
         fingerprint = (
             _graph_fingerprint(graph)
-            if caching and envs.TPU_PRECOMPILE_PEER_REPLAY
+            if caching and (envs.TPU_PRECOMPILE_PEER_REPLAY or rank_dep)
             else None
         )
-        if fingerprint is not None:
+        if fingerprint is not None and envs.TPU_PRECOMPILE_PEER_REPLAY and not rank_dep:
             assert key is not None
             peer = self._replay_from_peer(key, graph, was_wrapped, fingerprint)
         if peer is not None:
@@ -1155,10 +1241,22 @@ class TpuCompilerAdaptor(CompilerInterface):
         graph = copy.deepcopy(graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
-        compiled_fn = self._replay(path, graph, was_wrapped)
+        rank_dep = graph_is_rank_dependent(graph)
+        expected_fp = _graph_fingerprint(graph) if rank_dep else None
+        compiled_fn = (
+            None
+            if (rank_dep and expected_fp is None)
+            else self._replay(path, graph, was_wrapped, expected_fp)
+        )
         if compiled_fn is None:
             fingerprint = (
-                _graph_fingerprint(graph) if envs.TPU_PRECOMPILE_PEER_REPLAY else None
+                expected_fp
+                if rank_dep
+                else (
+                    _graph_fingerprint(graph)
+                    if envs.TPU_PRECOMPILE_PEER_REPLAY
+                    else None
+                )
             )
             compiled_fn, entry = self._run_backend(graph, example_inputs)
             # Self-heal: overwrite the artifact vLLM will hand us again next
