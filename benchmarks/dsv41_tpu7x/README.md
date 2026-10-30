@@ -248,28 +248,28 @@ python3 -u scripts/pd/run_pd.py \
 
 ## 5. Run Logs, GCS Archive & Verification Details (Per-Run Breakdown)
 
-All reproduction artifacts, git bundles (`.bundle`), clean source tarballs (`.tar.gz`), wheels, prebuilt stack tarballs, and complete per-run logs are archived at **`gs://chaitanyapk-data/temu/dsv4.1/`**.
+All reproduction artifacts, git bundles (`.bundle`), clean source tarballs (`.tar.gz`), wheels, prebuilt stack tarballs, and complete per-run logs are archived at **`gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/`**.
 
-### 5.1 Top-Level GCS Archive Index (`gs://chaitanyapk-data/temu/dsv4.1/`)
+### 5.1 Top-Level GCS Archive Index (`gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/`)
 
 | GCS Path | Contents |
 | :--- | :--- |
-| `gs://chaitanyapk-data/temu/dsv4.1/README.md`, `MERGE_NOTES.md`, `PD_DESIGN.md`, `COORDINATION.md`, `PHASE2_PLAN.md` | Documentation, 42-file P+D merge manifest, 1P1D Raiden Stage-3 design, and experiment ledger |
-| `gs://chaitanyapk-data/temu/dsv4.1/repos/vllm-torchtpu-combined-{13e0b9cd0,249d66e02}.{bundle,tar.gz}` | Unified `vllm-torchtpu` repository (`cpk/dsv41-combined` @ `13e0b9cd0` & `249d66e02`, full git history + clean tree) |
-| `gs://chaitanyapk-data/temu/dsv4.1/repos/vllm-decode-{afbcce3152,758179797}.{bundle,tar.gz}` | Patched `vllm` runtime (`cpk/dsv41-vllm-decode` @ `afbcce3152`: `f9ad9dd6b4` + `0001` + `0002` + `0003`) |
-| `gs://chaitanyapk-data/temu/dsv4.1/repos/vllm-prefill-a8cb9ec41.{bundle,tar.gz}` | Patched `vllm` prefill runtime (`dsv41-vllm-prefill` @ `a8cb9ec41`: `f9ad9dd6b4` + `0001`) |
-| `gs://chaitanyapk-data/temu/dsv4.1/repos/dsv41-harness.{bundle,tar.gz}` | `dsv41` reproduction harness, scripts, patches, and support files |
-| `gs://chaitanyapk-data/temu/dsv4.1/stacks/stack_{329ed6bdfa396b11,f2128e6ebbf4d1e1,26d14abf13e4d410,27074ff8b209e63b}.tar` | Content-addressed `/workspace` tarballs staged onto 1P1D, Decode, and Prefill pods |
-| `gs://chaitanyapk-data/temu/dsv4.1/{scripts,patches,support,whls,reference}/` | Direct copies of all runner scripts, patches, metadata shims, wheels, and reference docs |
+| `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/README.md`, `MERGE_NOTES.md`, `PD_DESIGN.md`, `COORDINATION.md`, `PHASE2_PLAN.md` | Documentation, 42-file P+D merge manifest, 1P1D Raiden Stage-3 design, and experiment ledger |
+| `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/repos/vllm-torchtpu-combined-{13e0b9cd0,249d66e02}.{bundle,tar.gz}` | Unified `vllm-torchtpu` repository (`cpk/dsv41-combined` @ `13e0b9cd0` & `249d66e02`, full git history + clean tree) |
+| `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/repos/vllm-decode-{afbcce3152,758179797}.{bundle,tar.gz}` | Patched `vllm` runtime (`cpk/dsv41-vllm-decode` @ `afbcce3152`: `f9ad9dd6b4` + `0001` + `0002` + `0003`) |
+| `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/repos/vllm-prefill-a8cb9ec41.{bundle,tar.gz}` | Patched `vllm` prefill runtime (`dsv41-vllm-prefill` @ `a8cb9ec41`: `f9ad9dd6b4` + `0001`) |
+| `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/repos/dsv41-harness.{bundle,tar.gz}` | `dsv41` reproduction harness, scripts, patches, and support files |
+| `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/stacks/stack_{329ed6bdfa396b11,f2128e6ebbf4d1e1,26d14abf13e4d410,27074ff8b209e63b}.tar` | Content-addressed `/workspace` tarballs staged onto 1P1D, Decode, and Prefill pods |
+| `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/{scripts,patches,support,whls,reference}/` | Direct copies of all runner scripts, patches, metadata shims, wheels, and reference docs |
 
 ---
 
 ### 5.2 Run 1: Standalone Prefill (`4 × (TP=2, EP=2)`, 20-Layer CED Prefill)
 
 * **Archived Runs (`cpk/dsv41-combined` @ `249d66e02`, `vllm` @ `a8cb9ec41`, Stack `27074ff8b209e63b`)**:
-  1. **Peak Validation Run**: `gs://chaitanyapk-data/temu/dsv4.1/20261021-191514_prefill_xprof3/` (Local: `runs/combined/20261021-191514_prefill_xprof3/`, Node: `gke-tpu-e785c3d8-0d34` on `amylin-v7x-perf-2x2x1`)
-  2. **Repro Run #1 (`amylin`)**: `gs://chaitanyapk-data/temu/dsv4.1/20261022-065005_prefill_repro/` (Local: `runs/combined/20261022-065005_prefill_repro/`, Node: `gke-tpu-e785c3d8-0d34` on `amylin-v7x-perf-2x2x1`)
-  3. **Repro Run #2 (`bodaborg`)**: `gs://chaitanyapk-data/temu/dsv4.1/20261022-094757_prefill_repro2/` (Local: `runs/combined/20261022-094757_prefill_repro2/`, Node: `gke-tpu-8a56d114-2mrv` on `bodaborg-tpu7x-spot-sps`)
+  1. **Peak Validation Run**: `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/20261021-191514_prefill_xprof3/` (Local: `runs/combined/20261021-191514_prefill_xprof3/`, Node: `gke-tpu-e785c3d8-0d34` on `amylin-v7x-perf-2x2x1`)
+  2. **Repro Run #1 (`amylin`)**: `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/20261022-065005_prefill_repro/` (Local: `runs/combined/20261022-065005_prefill_repro/`, Node: `gke-tpu-e785c3d8-0d34` on `amylin-v7x-perf-2x2x1`)
+  3. **Repro Run #2 (`bodaborg`)**: `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/20261022-094757_prefill_repro2/` (Local: `runs/combined/20261022-094757_prefill_repro2/`, Node: `gke-tpu-8a56d114-2mrv` on `bodaborg-tpu7x-spot-sps`)
 
 * **Log & Artifact Inventory (inside each `<prefill_run>/` directory)**:
 
@@ -303,8 +303,8 @@ ALL_BENCHMARKS_COMPLETE_OK!
 ### 5.3 Run 2: Standalone Decode (`DP=8, TP=1, EP=8`, DSpark $K=5$, 100K Context)
 
 * **Archived Runs (`cpk/dsv41-combined` @ `249d66e02`, `vllm` @ `758179797`, Stack `26d14abf13e4d410`, `libtpu==0.0.48`, `compile_sizes=[48, 96, 192, 384]`, `dp_rr=1`)**:
-  1. **Peak + XProf Round-2 Run (`amylin`)**: `gs://chaitanyapk-data/temu/dsv4.1/20261021-190440_decode_dp8_c64_xprof3/` (Local: `runs/perf/20261021-190440_decode_dp8_c64_xprof3/`, Node: `gke-tpu-e785c3d8-gzmi`, XProf session: `chaitanyapk-13959792908329192688`)
-  2. **Full `dp8_all` Repro Run (`bodaborg`)**: `gs://chaitanyapk-data/temu/dsv4.1/20261022-093105_decode_dp8_all_repro/` (Local: `runs/perf/20261022-093105_decode_dp8_all_repro/`, Node: `gke-tpu-b10c48a3-x8s4`)
+  1. **Peak + XProf Round-2 Run (`amylin`)**: `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/20261021-190440_decode_dp8_c64_xprof3/` (Local: `runs/perf/20261021-190440_decode_dp8_c64_xprof3/`, Node: `gke-tpu-e785c3d8-gzmi`, XProf session: `chaitanyapk-13959792908329192688`)
+  2. **Full `dp8_all` Repro Run (`bodaborg`)**: `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/20261022-093105_decode_dp8_all_repro/` (Local: `runs/perf/20261022-093105_decode_dp8_all_repro/`, Node: `gke-tpu-b10c48a3-x8s4`)
 
 * **Log & Artifact Inventory (inside each `<decode_run>/` directory)**:
 
@@ -339,12 +339,12 @@ ALL_BENCHMARKS_COMPLETE_OK!
 ### 5.4 Run 3: 1P1D Disaggregated Prefill + Decode (`TPURaidenConnector` Stage 3 + DSpark $K=5$ over DCN)
 
 * **Archived Runs (`cpk/dsv41-combined` @ `13e0b9cd0` / `249d66e02`, `vllm` @ `afbcce3152` / `758179797`, `libtpu==0.0.48`, `tpu_sync_torch==0.0.1.dev20260923040928`)**:
-  1. **1P1D + DSpark $K=5$ Warm Full Pass (`bodaborg`, `13e0b9cd0`, Stack `329ed6bdfa396b11`)**: `gs://chaitanyapk-data/temu/dsv4.1/20261026-161733_dspark_opt_warm_opt/` (Local: `runs/pd/20261026-161733_dspark_opt_warm_opt/`, Prefill node: `gke-tpu-b10c48a3-x8s4` `10.11.0.102`, Decode node: `gke-tpu-284c5a3a-djxv` `10.11.0.72`)
-  2. **1P1D + DSpark $K=5$ Cold-to-Ready Full Boot + Gates (`bodaborg`, `13e0b9cd0`, Stack `329ed6bdfa396b11`)**: `gs://chaitanyapk-data/temu/dsv4.1/20261026-154717_dspark_opt_full_opt/` (Local: `runs/pd/20261026-154717_dspark_opt_full_opt/`)
-  3. **1P1D + DSpark $K=5$ Peak `c=64` Steady-State Run (`bodaborg`)**: `gs://chaitanyapk-data/temu/dsv4.1/20261026-141011_dspark_opt_opt/` (Local: `runs/pd/20261026-141011_dspark_opt_opt/`)
-  4. **Baseline 1P1D `CED=1` (`DSpark=0`) Repro (`bodaborg`, `249d66e02`, Stack `f2128e6ebbf4d1e1`)**: `gs://chaitanyapk-data/temu/dsv4.1/20261022-093059_1p1d_ced1_repro/` (Local: `runs/pd/20261022-093059_1p1d_ced1_repro/`)
-  5. **1P1D `CED=1` Validation (`amylin`)**: `gs://chaitanyapk-data/temu/dsv4.1/20261020-165851_1p1d_ced1_final_pass_a/` (Local: `runs/pd/20261020-165851_1p1d_ced1_final_pass_a/`)
-  6. **1P1D `CED=0` Validation (`bodaborg`)**: `gs://chaitanyapk-data/temu/dsv4.1/20261020-165853_1p1d_ced0_final_pass_b/` (Local: `runs/pd/20261020-165853_1p1d_ced0_final_pass_b/`)
+  1. **1P1D + DSpark $K=5$ Warm Full Pass (`bodaborg`, `13e0b9cd0`, Stack `329ed6bdfa396b11`)**: `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/20261026-161733_dspark_opt_warm_opt/` (Local: `runs/pd/20261026-161733_dspark_opt_warm_opt/`, Prefill node: `gke-tpu-b10c48a3-x8s4` `10.11.0.102`, Decode node: `gke-tpu-284c5a3a-djxv` `10.11.0.72`)
+  2. **1P1D + DSpark $K=5$ Cold-to-Ready Full Boot + Gates (`bodaborg`, `13e0b9cd0`, Stack `329ed6bdfa396b11`)**: `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/20261026-154717_dspark_opt_full_opt/` (Local: `runs/pd/20261026-154717_dspark_opt_full_opt/`)
+  3. **1P1D + DSpark $K=5$ Peak `c=64` Steady-State Run (`bodaborg`)**: `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/20261026-141011_dspark_opt_opt/` (Local: `runs/pd/20261026-141011_dspark_opt_opt/`)
+  4. **Baseline 1P1D `CED=1` (`DSpark=0`) Repro (`bodaborg`, `249d66e02`, Stack `f2128e6ebbf4d1e1`)**: `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/20261022-093059_1p1d_ced1_repro/` (Local: `runs/pd/20261022-093059_1p1d_ced1_repro/`)
+  5. **1P1D `CED=1` Validation (`amylin`)**: `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/20261020-165851_1p1d_ced1_final_pass_a/` (Local: `runs/pd/20261020-165851_1p1d_ced1_final_pass_a/`)
+  6. **1P1D `CED=0` Validation (`bodaborg`)**: `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/20261020-165853_1p1d_ced0_final_pass_b/` (Local: `runs/pd/20261020-165853_1p1d_ced0_final_pass_b/`)
 
 * **Log & Artifact Inventory (inside each `<1p1d_run>/` directory)**:
 

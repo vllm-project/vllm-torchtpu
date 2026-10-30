@@ -6,8 +6,8 @@ Self-contained runbook to reproduce the **Prefill-Only**, **Decode-Only**, and *
   * **GitHub Branch**: https://github.com/vllm-project/vllm-torchtpu/tree/cpk/dsv41-combined
   * **Bundled Harness Path in Repo**: [`benchmarks/dsv41_tpu7x/`](https://github.com/vllm-project/vllm-torchtpu/tree/cpk/dsv41-combined/benchmarks/dsv41_tpu7x)
 * **GCS Archive (Bundles, Tarballs, Wheels, Patches & Verified Run Logs)**:
-  * **Browser URL**: https://console.cloud.google.com/storage/browser/chaitanyapk-data/temu/dsv4.1
-  * **GCS URI**: `gs://chaitanyapk-data/temu/dsv4.1/`
+  * **Browser URL**: https://console.cloud.google.com/storage/browser/chaitanyapk-data/dsv4.1_opt/dsv4.1
+  * **GCS URI**: `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/`
 * **Model Checkpoint (`48` shards, `~476 GiB`)**: `gs://rsinghc-storage/DeepSeek-V4.1-Flash/`
 
 ---
@@ -24,25 +24,25 @@ export CTX="gke_cloud-tpu-multipod-dev_us-central1_bodaborg-tpu7x-spot-sps"
 
 ### 1.2 Option A — Fast Setup from GCS Archive (Recommended, 100% Offline-Reproducible)
 
-Restores the exact workspace (`scripts/`, `support/`, `patches/`, `whls/`, and the `repos/vtt-combined`, `repos/vllm-prefill`, and `repos/vllm-decode` git trees) directly from `gs://chaitanyapk-data/temu/dsv4.1/`:
+Restores the exact workspace (`scripts/`, `support/`, `patches/`, `whls/`, and the `repos/vtt-combined`, `repos/vllm-prefill`, and `repos/vllm-decode` git trees) directly from `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/`:
 
 ```bash
 mkdir -p ~/dsv41_repro && cd ~/dsv41_repro
 
 # 1. Pull the harness, patches, and support files
-gcloud storage cp gs://chaitanyapk-data/temu/dsv4.1/repos/dsv41-harness.tar.gz .
+gcloud storage cp gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/repos/dsv41-harness.tar.gz .
 tar -xzf dsv41-harness.tar.gz && rm -f dsv41-harness.tar.gz
 
 # 2. Pull the 14 pinned TPU wheels (torch_tpu, tpu_sync_torch, etc.) and verify checksums
 mkdir -p whls
-gcloud storage cp "gs://chaitanyapk-data/temu/dsv4.1/whls/*.whl" whls/
+gcloud storage cp "gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/whls/*.whl" whls/
 (cd whls && sha256sum -c SHA256SUMS.txt)
 
 # 3. Restore the unified vllm-torchtpu and vllm worktrees from GCS git bundles
 mkdir -p repos
-gcloud storage cp gs://chaitanyapk-data/temu/dsv4.1/repos/vllm-torchtpu-combined-ea0984d1f.bundle repos/
-gcloud storage cp gs://chaitanyapk-data/temu/dsv4.1/repos/vllm-prefill-a8cb9ec41.bundle repos/
-gcloud storage cp gs://chaitanyapk-data/temu/dsv4.1/repos/vllm-decode-afbcce3152.bundle repos/
+gcloud storage cp gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/repos/vllm-torchtpu-combined-ea0984d1f.bundle repos/
+gcloud storage cp gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/repos/vllm-prefill-a8cb9ec41.bundle repos/
+gcloud storage cp gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/repos/vllm-decode-afbcce3152.bundle repos/
 
 git clone -b cpk/dsv41-combined repos/vllm-torchtpu-combined-ea0984d1f.bundle repos/vtt-combined
 git clone -b dsv41-vllm-prefill repos/vllm-prefill-a8cb9ec41.bundle repos/vllm-prefill
@@ -67,7 +67,7 @@ git -C repos/vllm-decode apply ../../patches/0002-vllm-decode-runtime-v2.patch &
 git -C repos/vllm-decode apply ../../patches/0003-vllm-tpu-spec-chunk-align.patch && git -C repos/vllm-decode commit -qam spec-chunk-align
 
 # Fetch the 14 TPU wheels from GCS
-gcloud storage cp "gs://chaitanyapk-data/temu/dsv4.1/whls/*.whl" whls/
+gcloud storage cp "gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/whls/*.whl" whls/
 (cd whls && sha256sum -c SHA256SUMS.txt)
 ```
 
@@ -99,12 +99,12 @@ Results are saved to `runs/combined/<timestamp>_prefill_pf1/summary.json` (and p
 
 | Workload (`output_len = 1`) | Expected Node Input Throughput (`4 Chips`) | Per-Chip Throughput | Mean TTFT | Reference Archive Run |
 | :--- | ---: | ---: | ---: | :--- |
-| **`128K` Input (`c=8`, `n=32`)** | **`~198,541 tok/s/node`** (`82.7%` GB200) | **`~49,635 tok/s/chip`** | `~4,947 ms` | `gs://chaitanyapk-data/temu/dsv4.1/runs/combined/20261021-200912_prefill_opt2/` |
-| **`128K` Input (`c=16`, `n=32`)** | **`~197,891 tok/s/node`** | **`~49,473 tok/s/chip`** | `~8,610 ms` | `gs://chaitanyapk-data/temu/dsv4.1/runs/combined/20261021-200912_prefill_opt2/` |
-| **`100K` Input (`c=8`, `n=32`)** | **`~196,644 tok/s/node`** (`81.9%` GB200) | **`~49,161 tok/s/chip`** | `~3,810 ms` | `gs://chaitanyapk-data/temu/dsv4.1/runs/combined/20261021-200912_prefill_opt2/` |
-| **`100K` Input (`c=16`, `n=32`)** | **`~195,840 tok/s/node`** | **`~48,960 tok/s/chip`** | `~6,649 ms` | `gs://chaitanyapk-data/temu/dsv4.1/runs/combined/20261021-200912_prefill_opt2/` |
-| **`128K` Input (`c=4`, `n=16`)** | **`~186,703 tok/s/node`** | **`~46,676 tok/s/chip`** | `~2,795 ms` | `gs://chaitanyapk-data/temu/dsv4.1/runs/combined/20261021-200912_prefill_opt2/` |
-| **`32K` Input (`c=8`, `n=64`)** | **`~189,563 tok/s/node`** | **`~47,391 tok/s/chip`** | `~1,335 ms` | `gs://chaitanyapk-data/temu/dsv4.1/runs/combined/20261021-200912_prefill_opt2/` |
+| **`128K` Input (`c=8`, `n=32`)** | **`~198,541 tok/s/node`** (`82.7%` GB200) | **`~49,635 tok/s/chip`** | `~4,947 ms` | `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/runs/combined/20261021-200912_prefill_opt2/` |
+| **`128K` Input (`c=16`, `n=32`)** | **`~197,891 tok/s/node`** | **`~49,473 tok/s/chip`** | `~8,610 ms` | `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/runs/combined/20261021-200912_prefill_opt2/` |
+| **`100K` Input (`c=8`, `n=32`)** | **`~196,644 tok/s/node`** (`81.9%` GB200) | **`~49,161 tok/s/chip`** | `~3,810 ms` | `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/runs/combined/20261021-200912_prefill_opt2/` |
+| **`100K` Input (`c=16`, `n=32`)** | **`~195,840 tok/s/node`** | **`~48,960 tok/s/chip`** | `~6,649 ms` | `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/runs/combined/20261021-200912_prefill_opt2/` |
+| **`128K` Input (`c=4`, `n=16`)** | **`~186,703 tok/s/node`** | **`~46,676 tok/s/chip`** | `~2,795 ms` | `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/runs/combined/20261021-200912_prefill_opt2/` |
+| **`32K` Input (`c=8`, `n=64`)** | **`~189,563 tok/s/node`** | **`~47,391 tok/s/chip`** | `~1,335 ms` | `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/runs/combined/20261021-200912_prefill_opt2/` |
 
 ---
 
@@ -137,10 +137,10 @@ Results are saved to `runs/combined/<timestamp>_decode_dp8_all_dc1/`:
 
 | Gate / Benchmark (`100K` Context, `1,024` Out) | Expected Step Time (`TPOT`) | Expected Node Throughput @ $\tau=3.5$ | Expected Natural Throughput ($\tau$) | Reference Archive Run |
 | :--- | ---: | ---: | ---: | :--- |
-| **Accuracy Gates (`gate_meta.json`)** | — | `2+2`: **`8/8` (`all_passed=true`)** | `USA`: **`50/50` states**, **$\tau \approx 4.49$** | `gs://chaitanyapk-data/temu/dsv4.1/runs/combined/20261021-200912_decode_dp8_all_opt2/` |
-| **`1x_c64` (`c=64`, `8` reqs/rank, `T=48`)** | **`~28.23 ms/step`** (`6.82 ms` TPOT) | **`~8,037.6 tok/s/node`** (`2,009/chip`) | **`~9,502.5 tok/s/node`** ($\tau \approx 4.14$) | `gs://chaitanyapk-data/temu/dsv4.1/runs/combined/20261021-155644_decode_dp8_c64_xprof3/` |
-| **`4x_c256` (`c=256`, `32` reqs/rank, `T=192`)** | **`~52.81 ms/step`** (`14.85 ms` TPOT) | **`~16,966.0 tok/s/node`** (`4,242/chip`) | **`~23,316.9 tok/s/node`** ($\tau \approx 4.81$) | `gs://chaitanyapk-data/temu/dsv4.1/runs/combined/20261021-200912_decode_dp8_all_opt2/` |
-| **`8x_c512` (`c=512`, `64` reqs/rank, 2-wave)** | `20.77 ms` Mean TPOT | `~8,542–9,023 tok/s/node` E2E wall | **`~24,648.5 tok/s/node` implied** (`6,162/chip`) | `gs://chaitanyapk-data/temu/dsv4.1/runs/combined/20261021-200912_decode_dp8_all_opt2/` |
+| **Accuracy Gates (`gate_meta.json`)** | — | `2+2`: **`8/8` (`all_passed=true`)** | `USA`: **`50/50` states**, **$\tau \approx 4.49$** | `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/runs/combined/20261021-200912_decode_dp8_all_opt2/` |
+| **`1x_c64` (`c=64`, `8` reqs/rank, `T=48`)** | **`~28.23 ms/step`** (`6.82 ms` TPOT) | **`~8,037.6 tok/s/node`** (`2,009/chip`) | **`~9,502.5 tok/s/node`** ($\tau \approx 4.14$) | `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/runs/combined/20261021-155644_decode_dp8_c64_xprof3/` |
+| **`4x_c256` (`c=256`, `32` reqs/rank, `T=192`)** | **`~52.81 ms/step`** (`14.85 ms` TPOT) | **`~16,966.0 tok/s/node`** (`4,242/chip`) | **`~23,316.9 tok/s/node`** ($\tau \approx 4.81$) | `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/runs/combined/20261021-200912_decode_dp8_all_opt2/` |
+| **`8x_c512` (`c=512`, `64` reqs/rank, 2-wave)** | `20.77 ms` Mean TPOT | `~8,542–9,023 tok/s/node` E2E wall | **`~24,648.5 tok/s/node` implied** (`6,162/chip`) | `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/runs/combined/20261021-200912_decode_dp8_all_opt2/` |
 
 ---
 
@@ -181,11 +181,11 @@ Results are saved to `runs/pd/<timestamp>_dspark_opt_opt1/summary.json` and `pd_
 
 | Gate / Benchmark | Expected Result | Reference Archive Run |
 | :--- | :--- | :--- |
-| **`[GATE-2+2]` & `[GATE-USA]`** | `pd=16/16`, `local=16/16`; `USA`: **`pd=50/50`, `local=50/50`, `pd==local=True`** ($\tau \approx 3.95$) | `gs://chaitanyapk-data/temu/dsv4.1/runs/pd/20261026-154717_dspark_opt_full_opt/` |
-| **`[GATE-EQ]` (`64, 700, 1.5K, 5K, 20K`)** | **5/5 `equal=True` (`first_div=None`)**, **5/5 NIAH needle `739204` recovered** | `gs://chaitanyapk-data/temu/dsv4.1/runs/pd/20261026-154717_dspark_opt_full_opt/` |
-| **Raiden Stage-3 Audit (`stage3_check.txt`)** | `STAGE3_REGISTERED_SENDS 204`, `STAGE3_COMPLETED_SENDS 204`, `STAGE3_SKIPPED_SENDS 0`, **`STAGE3_CHECK_OK 1`** | `gs://chaitanyapk-data/temu/dsv4.1/runs/pd/20261026-154717_dspark_opt_full_opt/` |
-| **`[BENCH-PD]` (`8K` in / `128` out, `c=8`)** | **TTFT**: `~1.12 s` (`p50 ~1.21 s`, **`3.0×` faster** vs. `BENCH-LOCAL` `3.36 s`)<br>**TPOT**: **`~11.40–11.48 ms`** (**`2.24×` faster** vs. `DSpark=0` `25.74 ms`)<br>**Output Throughput**: **`~355.5 tok/s`** (`+81.3%` vs. `DSpark=0`, `2.57×` vs. `BENCH-LOCAL`)<br>**Active Input Rate**: `~30,467 tok/s` (`~58,629 tok/s` E2E Wave-1 rate) | `gs://chaitanyapk-data/temu/dsv4.1/runs/pd/20261026-161733_dspark_opt_warm_opt/` |
-| **`[BENCH-PD-C64]` (`1K` in / `512` out, `c=64`)** | **Step Time**: **`~15.03–31.34 ms/step`** (`8.21–13.62 ms` TPOT)<br>**Decode Throughput @ $\tau=3.5$**: **`~7,148–14,905 tok/s/D-node`** (`3,574–7,453 tok/s/node` across `1P+1D`)<br>**Natural Interior / E2E Wall**: **`~5,026–9,916 tok/s/D-node`** / **`~3,076 tok/s/D-node` wall** | `gs://chaitanyapk-data/temu/dsv4.1/runs/pd/20261026-141011_dspark_opt_opt/` & `20261026-161733_dspark_opt_warm_opt/` |
+| **`[GATE-2+2]` & `[GATE-USA]`** | `pd=16/16`, `local=16/16`; `USA`: **`pd=50/50`, `local=50/50`, `pd==local=True`** ($\tau \approx 3.95$) | `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/runs/pd/20261026-154717_dspark_opt_full_opt/` |
+| **`[GATE-EQ]` (`64, 700, 1.5K, 5K, 20K`)** | **5/5 `equal=True` (`first_div=None`)**, **5/5 NIAH needle `739204` recovered** | `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/runs/pd/20261026-154717_dspark_opt_full_opt/` |
+| **Raiden Stage-3 Audit (`stage3_check.txt`)** | `STAGE3_REGISTERED_SENDS 204`, `STAGE3_COMPLETED_SENDS 204`, `STAGE3_SKIPPED_SENDS 0`, **`STAGE3_CHECK_OK 1`** | `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/runs/pd/20261026-154717_dspark_opt_full_opt/` |
+| **`[BENCH-PD]` (`8K` in / `128` out, `c=8`)** | **TTFT**: `~1.12 s` (`p50 ~1.21 s`, **`3.0×` faster** vs. `BENCH-LOCAL` `3.36 s`)<br>**TPOT**: **`~11.40–11.48 ms`** (**`2.24×` faster** vs. `DSpark=0` `25.74 ms`)<br>**Output Throughput**: **`~355.5 tok/s`** (`+81.3%` vs. `DSpark=0`, `2.57×` vs. `BENCH-LOCAL`)<br>**Active Input Rate**: `~30,467 tok/s` (`~58,629 tok/s` E2E Wave-1 rate) | `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/runs/pd/20261026-161733_dspark_opt_warm_opt/` |
+| **`[BENCH-PD-C64]` (`1K` in / `512` out, `c=64`)** | **Step Time**: **`~15.03–31.34 ms/step`** (`8.21–13.62 ms` TPOT)<br>**Decode Throughput @ $\tau=3.5$**: **`~7,148–14,905 tok/s/D-node`** (`3,574–7,453 tok/s/node` across `1P+1D`)<br>**Natural Interior / E2E Wall**: **`~5,026–9,916 tok/s/D-node`** / **`~3,076 tok/s/D-node` wall** | `gs://chaitanyapk-data/dsv4.1_opt/dsv4.1/runs/pd/20261026-141011_dspark_opt_opt/` & `20261026-161733_dspark_opt_warm_opt/` |
 
 ---
 
