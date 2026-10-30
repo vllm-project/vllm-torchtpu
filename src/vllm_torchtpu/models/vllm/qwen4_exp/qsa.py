@@ -229,6 +229,37 @@ _KV_SCALE_NAMES = {
 }
 
 
+_MAIN_KV_DCP_GROUPS: dict[int, object] = {}
+
+
+def main_kv_dcp_group(size: int):
+    """The TP rank groups (0, 1), (2, 3), ... that share a KV head, for the
+    main-KV DCP pair combine (VLLM_TPU_QSA_MAIN_KV_DCP). Built once, by every
+    rank, the first time a layer binds the pool."""
+    if size not in _MAIN_KV_DCP_GROUPS:
+        import torch.distributed as dist
+        from vllm.distributed import get_tp_group
+        from vllm.distributed.parallel_state import (
+            get_world_group,
+            init_model_parallel_group,
+        )
+
+        tp = get_tp_group()
+        ranks = list(tp.ranks)
+        groups = [ranks[i : i + size] for i in range(0, len(ranks), size)]
+        world = int(dist.get_world_size())
+        if world > len(ranks):
+            # Every TP group of the world creates its pairs (collective call).
+            groups = [list(range(i, i + size)) for i in range(0, world, size)]
+        _MAIN_KV_DCP_GROUPS[size] = init_model_parallel_group(
+            groups,
+            get_world_group().local_rank,
+            dist.get_backend(tp.device_group),
+            group_name=f"qsa_main_kv_dcp{size}",
+        )
+    return _MAIN_KV_DCP_GROUPS[size]
+
+
 class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
     """Config-derived gated attention with a replicated MQA indexer.
 
@@ -346,6 +377,18 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             persistent=False,
         )
         self.token_shard = self._token_shard_mode(tp_size, pooled, max_num_seqs)
+        # VLLM_TPU_QSA_MAIN_KV_DCP: target layers split their main KV over TP
+        # rank pairs sharing a KV head; the MTP draft keeps whole pages.
+        self.main_kv_dcp = 1
+        dcp = int(envs.VLLM_TPU_QSA_MAIN_KV_DCP or 0)
+        if dcp > 1 and pooled and "mtp" not in prefix:
+            assert dcp == 2 and tp_size % dcp == 0, "main-KV DCP supports pairs only"
+            self.main_kv_dcp = dcp
+            self.register_buffer(
+                "dcp_rank",
+                torch.full((1,), tp_rank % dcp, dtype=torch.int32, device=device),
+                persistent=False,
+            )
         if self.token_shard:
             # The rank as an operand of the token-sharded indexer, so every
             # rank traces the same program.
@@ -476,6 +519,28 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 kv_heads=self.num_kv_heads,
                 **keywords,
             )
+        self._dcp_op = None
+        self._token_shard_dcp_op = None
+        if self.main_kv_dcp > 1:
+            from vllm.distributed import get_tp_group
+
+            from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
+                build_pooled_qsa_dcp_op,
+                build_pooled_qsa_token_shard_dcp_op,
+            )
+
+            pair = main_kv_dcp_group(self.main_kv_dcp)
+            self._dcp_op = partial(
+                build_pooled_qsa_dcp_op(pair, self.main_kv_dcp), **keywords
+            )
+            if getattr(self, "token_shard", False):
+                self._token_shard_dcp_op = partial(
+                    build_pooled_qsa_token_shard_dcp_op(
+                        get_tp_group(), pair, self.main_kv_dcp
+                    ),
+                    kv_heads=self.num_kv_heads,
+                    **keywords,
+                )
         # With VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP a single-graph module (the
         # MTP draft, traced once for every bucket including prefill chunks)
         # keeps the replicated indexer: it cannot pick per bucket.
@@ -725,6 +790,16 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         if token_shard and rows is None and token_shard_op is not None:
             # Takes precedence over the key-sharded indexer in this graph.
             op = partial(token_shard_op, shard_index=self.token_shard_index)
+        if getattr(self, "_dcp_op", None) is not None and rows is None and not self.single_graph:
+            # VLLM_TPU_QSA_MAIN_KV_DCP: this rank's main-KV rows, pair-combined.
+            if token_shard and self._token_shard_dcp_op is not None:
+                op = partial(
+                    self._token_shard_dcp_op,
+                    shard_index=self.token_shard_index,
+                    dcp_rank=self.dcp_rank,
+                )
+            else:
+                op = partial(self._dcp_op, dcp_rank=self.dcp_rank)
         shared_ops = getattr(self, "_shared_ops", None)
         source = getattr(self, "_selection_source", None)
         if shared is None and source is not None and shared_ops is not None:

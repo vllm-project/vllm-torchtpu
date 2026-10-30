@@ -569,3 +569,185 @@ def test_qsa_bind_pool_threads_main_owner_table_and_slot():
     assert attention._op.keywords == dict(compress_ratio=4)
     attention.bind_pool(pool, main_owner=("model.layers.7.self_attn", 0))
     assert attention._op.keywords == dict(compress_ratio=4, main_slot=0)
+
+
+# --------------------------------------------------- VLLM_TPU_QSA_MAIN_KV_DCP=2
+def dcp_config(monkeypatch, *, pair=False, compressed=False, dcp="2", tp=8):
+    if pair:
+        cfg = paired_config(monkeypatch, compressed=compressed, tp=tp)
+    else:
+        cfg = packed_config(monkeypatch, compressed, tp=tp)
+        monkeypatch.setenv("QWEN4_EXP_PACK_MAIN_KV", "0")
+    monkeypatch.setenv("VLLM_TPU_QSA_MAIN_KV_DCP", dcp)
+    return cfg
+
+
+@pytest.mark.parametrize(
+    "raw,want", [(None, 1), ("0", 1), ("1", 1), ("2", 2), ("3", None)]
+)
+def test_main_kv_dcp_reads_the_flag(monkeypatch, raw, want):
+    from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import main_kv_dcp
+
+    if raw is None:
+        monkeypatch.delenv("VLLM_TPU_QSA_MAIN_KV_DCP", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_TPU_QSA_MAIN_KV_DCP", raw)
+    if want is None:
+        with pytest.raises(ValueError, match="VLLM_TPU_QSA_MAIN_KV_DCP"):
+            main_kv_dcp()
+    else:
+        assert main_kv_dcp() == want
+
+
+@pytest.mark.parametrize("dcp", ["0", "1"])
+def test_main_kv_dcp_off_leaves_specs_unchanged(monkeypatch, dcp):
+    monkeypatch.delenv("VLLM_TPU_QSA_MAIN_KV_DCP", raising=False)
+    default = pooled_cache_specs(packed_config(monkeypatch, True))
+    assert pooled_cache_specs(dcp_config(monkeypatch, compressed=True, dcp=dcp)) == default
+
+
+@pytest.mark.parametrize("pair", [False, True])
+@pytest.mark.parametrize("compressed", [False, True])
+def test_main_kv_dcp_doubles_only_target_main_kv_spans(monkeypatch, pair, compressed):
+    """Target main KV (paired or not): 2B tokens per entry, B stored rows per rank
+    in an unchanged page. Compressed keys, rings, GDN, PLE and the MTP draft's
+    main KV keep B."""
+    monkeypatch.setenv("VLLM_TPU_QSA_MAIN_KV_DCP", "1")
+    off_layout, off = pooled_cache_specs(dcp_config(monkeypatch, pair=pair, compressed=compressed, dcp="1"))
+    layout, specs = pooled_cache_specs(dcp_config(monkeypatch, pair=pair, compressed=compressed))
+    B = layout.block_size
+    assert layout.main_dcp == 2 and layout.main_block_size == 2 * B
+    assert replace(layout, main_dcp=1, main_dcp_owners=()) == off_layout
+    assert set(specs) == set(off)
+    draft = "mtp.layers.48.self_attn"
+    targets = [n for n in specs if n.endswith(".self_attn") and n != draft]
+    assert set(layout.main_dcp_owners) == set(targets) and targets
+    for name, spec in specs.items():
+        assert spec.page_size_bytes == layout.page_bytes, name
+        if name in targets:
+            assert (spec.block_size, spec.tokens_per_state) == (2 * B, 2), name
+            assert replace(spec, block_size=B, tokens_per_state=1) == off[name], name
+        else:
+            assert spec == off[name], name
+    assert specs[draft].block_size == B
+
+
+def test_main_kv_dcp_schedules_lcm_and_hashes_gcd_blocks(monkeypatch):
+    cfg = dcp_config(monkeypatch, compressed=True)
+    layout, specs = pooled_cache_specs(cfg)
+    B = layout.block_size
+    cfg.cache_config.block_size = B
+    cfg.cache_config.mamba_block_size = B
+    groups = get_kv_cache_groups(cfg, specs)
+    native = get_kv_cache_config_from_groups(cfg, groups, 1024**3)
+    placements = layer_to_pool_index(native)
+    scheduler = generate_scheduler_kv_cache_config([native])
+    assert resolve_kv_cache_block_sizes(scheduler, cfg) == (2 * B, B)
+    # A layer and its compressed keys and ring still share one pool region.
+    for name in layout.main_dcp_owners:
+        owner, _ = layout.compressed_owner(name)
+        assert placements[name] == placements[owner] == placements[name + ".raw_ring"]
+    main = {g.layer_names[0] for g in groups if g.kv_cache_spec.block_size == 2 * B}
+    assert main and main <= set(layout.main_dcp_owners)
+
+
+@pytest.mark.parametrize("tp", [1])
+def test_main_kv_dcp_needs_tp_pairs(monkeypatch, tp):
+    cfg = dcp_config(monkeypatch, tp=8)
+    cfg.parallel_config.tensor_parallel_size = tp
+    with pytest.raises(ValueError, match="even tensor_parallel_size"):
+        pooled_cache_specs(cfg)
+
+
+def test_main_kv_dcp_rejects_an_unsupported_prefill_tile_at_init(monkeypatch):
+    """DCP prefill needs dcp x page rows in the paired-page kernel's tiles; the
+    spec build fails with the reason instead of the first prefill crashing."""
+    from vllm_torchtpu.kernels.qwen4_exp import block_sparse_gqa_prefill
+
+    pooled_cache_specs(dcp_config(monkeypatch, compressed=True))
+    monkeypatch.setattr(block_sparse_gqa_prefill, "PAIRED_KV_TILES", ())
+    with pytest.raises(ValueError, match="paired-page kernel"):
+        pooled_cache_specs(dcp_config(monkeypatch, compressed=True))
+
+
+def test_main_kv_dcp_pool_geometry_keeps_the_page(monkeypatch):
+    """The unified pool's page shape comes from a one-row-per-token attention
+    spec, or from the split spec's B stored rows: never 2B rows."""
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    from vllm_torchtpu.kv_cache_materializer import _pool_attention_geometry
+
+    layout, specs = pooled_cache_specs(dcp_config(monkeypatch, compressed=True))
+    B = layout.block_size
+    target, draft = layout.main_dcp_owners[0], "mtp.layers.48.self_attn"
+    mamba = next(s for s in specs.values() if isinstance(s, MambaSpec))
+    config = NS(kv_cache_groups=[NS(kv_cache_spec=mamba)])
+
+    def group(gid, name):
+        return NS(kv_cache_spec=specs[name], kv_cache_group_id=gid, backend="pallas")
+
+    spec, _, kernel = _pool_attention_geometry(
+        config, [[group(0, target)], [group(1, draft)]], {0: 2 * B, 1: B}
+    )
+    assert spec is specs[draft] and kernel == B
+    spec, _, kernel = _pool_attention_geometry(config, [[group(0, target)]], {0: 2 * B})
+    assert (spec.block_size, spec.tokens_per_state, kernel) == (B, 1, B)
+    assert spec.page_size_bytes == layout.page_bytes
+    assert replace(spec, block_size=2 * B, tokens_per_state=2) == specs[target]
+
+
+@pytest.mark.parametrize("dcp", ["1", "2"])
+def test_main_kv_dcp_allocation_and_prefix_hits_align_to_scheduler_blocks(
+    monkeypatch, dcp
+):
+    """Main KV takes one page per 2B tokens, every other group one per B; a
+    repeated prompt hits at a scheduler-block (2B) multiple."""
+    from vllm import SamplingParams
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+    from vllm.v1.kv_cache_interface import MambaSpec
+    from vllm.v1.request import Request
+
+    cfg = dcp_config(monkeypatch, compressed=True, dcp=dcp)
+    layout, specs = pooled_cache_specs(cfg)
+    B, D = layout.block_size, layout.main_dcp
+    cfg.cache_config.block_size = B
+    cfg.cache_config.mamba_block_size = B
+    groups = get_kv_cache_groups(cfg, specs)
+    native = get_kv_cache_config_from_groups(cfg, groups, 1024**3)
+    scheduler = generate_scheduler_kv_cache_config([native])
+    scheduler_block, hash_block = resolve_kv_cache_block_sizes(scheduler, cfg)
+    assert (scheduler_block, hash_block) == (D * B, B)
+    context = cfg.model_config.max_model_len
+    manager = KVCacheManager(
+        scheduler,
+        max_model_len=context,
+        scheduler_block_size=scheduler_block,
+        hash_block_size=hash_block,
+        max_in_flight_tokens=context,
+        enable_caching=True,
+    )
+    init_none_hash(sha256)
+    hasher = get_request_block_hasher(hash_block, sha256)
+    prompt = list(range(5 * B + 7))
+
+    def request(rid):
+        return Request(rid, prompt, SamplingParams(max_tokens=1), None, block_hasher=hasher)
+
+    first = request("a")
+    for offset in range(0, len(prompt), scheduler_block):
+        chunk = min(scheduler_block, len(prompt) - offset)
+        assert manager.allocate_slots(first, chunk) is not None
+        first.num_computed_tokens += chunk
+    for g, m in zip(scheduler.kv_cache_groups, manager.coordinator.single_type_managers):
+        spec = g.kv_cache_spec
+        if isinstance(spec, MambaSpec) or g.layer_names[0].endswith(".raw_ring"):
+            continue
+        blocks = len(m.req_to_blocks["a"])
+        assert blocks == -(-len(prompt) // spec.block_size), g.layer_names
+    manager.free(first)
+    second = request("b")
+    _, hit, *_ = manager.get_computed_blocks(second)
+    assert hit > 0 and hit % scheduler_block == 0, (hit, scheduler_block)
+    assert hit <= len(prompt) - 1
