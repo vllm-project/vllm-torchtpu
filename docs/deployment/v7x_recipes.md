@@ -162,6 +162,7 @@ Defaults that apply to every recipe below:
 
 - **Attention**: the Pallas flash-attention backend (`TPU_FLASH_ATTN`) is the default ([#1432](https://github.com/vllm-project/vllm-torchtpu/pull/1432)); `--diffusion-attention-backend TORCH_SDPA` selects the SDPA fallback (`SDPA` and `TPU_SDPA` are accepted aliases).
 - **Multi-device runs**: dense all-to-all collectives are offloaded to SparseCore automatically ([#1450](https://github.com/vllm-project/vllm-torchtpu/pull/1450)); setting `--xla_tpu_enable_sparse_core_collective_offload_dense_all_to_all` yourself in `LIBTPU_INIT_ARGS` takes precedence.
+- **TPU clock**: we recommend `export LIBTPU_INIT_ARGS="$LIBTPU_INIT_ARGS --xla_tpu_dvfs_p_state=7"` to pin the TPU v7x DVFS p-state to 7; the benchmark numbers for these recipes were measured with it.
 - **Warm-up**: the first request at a new resolution, frame count, or step count JIT-compiles on TPU, so send one warm-up request before measuring latency.
 - **Init timeouts**: each recipe passes `--stage-init-timeout 600 --init-timeout 1800` (vLLM-Omni defaults: `300` and `600` seconds), the values the `OmniRunner` test fixture uses ([#1356](https://github.com/vllm-project/vllm-torchtpu/pull/1356)).
 
