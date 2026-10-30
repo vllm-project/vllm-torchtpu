@@ -18,8 +18,11 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any
 
+from .chips import ChipSpec
 from .modules import Dtypes
-from .solver import PoolMeshPlan, ServingPlan
+from .solver import ParetoPoint, PoolMeshPlan, ServingPlan
+
+SOLVE_SCHEMA: str = "vllm_torchtpu.roofline.solve/v1"
 
 
 def pool_cli_args(
@@ -56,6 +59,84 @@ def _format_server_cmd(cli_args: list[str], model: str | None) -> str:
     return f"{prefix} {joined}".strip()
 
 
+def _pool_key(pool: PoolMeshPlan | None) -> tuple | None:
+    if pool is None:
+        return None
+    return (
+        pool.topology,
+        pool.instances,
+        pool.tp,
+        pool.dp,
+        pool.ep,
+        pool.pp,
+        pool.pcp,
+        pool.kv_split,
+        pool.moe_dispatch,
+    )
+
+
+def top_layouts(plan: ServingPlan, k: int = 3) -> tuple[ParetoPoint, ...]:
+    """Best SLO-met point per distinct layout, ranked by token throughput per chip."""
+    best: dict[tuple, ParetoPoint] = {}
+    for pt in plan.candidates:
+        if not pt.slo_met:
+            continue
+        key = (pt.mode, _pool_key(pt.prefill_pool), _pool_key(pt.decode_pool))
+        cur = best.get(key)
+        if cur is None or (
+            pt.token_throughput_per_chip,
+            pt.p90_interactivity_tok_s,
+        ) > (
+            cur.token_throughput_per_chip,
+            cur.p90_interactivity_tok_s,
+        ):
+            best[key] = pt
+    ranked = sorted(best.values(), key=lambda p: -p.token_throughput_per_chip)
+    return tuple(ranked[:k])
+
+
+def point_launch_args(
+    pt: ParetoPoint,
+    *,
+    kv_dtype: str = "auto",
+    gpu_memory_utilization: float | None = None,
+    model: str | None = None,
+) -> dict[str, Any]:
+    """Emit ``vllm serve`` CLI flags and commands for a single ParetoPoint."""
+    decode_args = pool_cli_args(
+        pt.decode_pool,
+        kv_dtype=kv_dtype,
+        gpu_memory_utilization=gpu_memory_utilization,
+    )
+    prefill_args = (
+        pool_cli_args(
+            pt.prefill_pool,
+            kv_dtype=kv_dtype,
+            gpu_memory_utilization=gpu_memory_utilization,
+        )
+        if pt.prefill_pool is not None
+        else []
+    )
+    decode_cmd = _format_server_cmd(decode_args, model)
+    if pt.prefill_pool is not None:
+        p_pool = pt.prefill_pool
+        d_pool = pt.decode_pool
+        prefill_cmd = _format_server_cmd(prefill_args, model)
+        commands = [
+            f"# prefill ({p_pool.instances}x {p_pool.topology}): {prefill_cmd}",
+            f"# decode ({d_pool.instances}x {d_pool.topology}): {decode_cmd}",
+        ]
+    else:
+        commands = [decode_cmd]
+
+    return {
+        "mode": pt.mode,
+        "cli_args": decode_args,
+        "prefill_cli_args": prefill_args,
+        "commands": commands,
+    }
+
+
 def emit_launch_args(
     plan: ServingPlan,
     *,
@@ -78,40 +159,50 @@ def emit_launch_args(
             "serving_plan": asdict(plan),
         }
 
-    decode_args = pool_cli_args(
-        rec.decode_pool,
+    launch = point_launch_args(
+        rec,
         kv_dtype=kv_str,
         gpu_memory_utilization=plan.gpu_memory_utilization,
+        model=model,
     )
-    prefill_args = (
-        pool_cli_args(
-            rec.prefill_pool,
-            kv_dtype=kv_str,
-            gpu_memory_utilization=plan.gpu_memory_utilization,
-        )
-        if rec.prefill_pool is not None
-        else []
-    )
-    decode_cmd = _format_server_cmd(decode_args, model)
-    if rec.prefill_pool is not None:
-        p_pool = rec.prefill_pool
-        d_pool = rec.decode_pool
-        prefill_cmd = _format_server_cmd(prefill_args, model)
-        commands = [
-            f"# prefill ({p_pool.instances}x {p_pool.topology}): {prefill_cmd}",
-            f"# decode ({d_pool.instances}x {d_pool.topology}): {decode_cmd}",
-        ]
-    else:
-        commands = [decode_cmd]
-
     return {
-        "mode": rec.mode,
-        "cli_args": decode_args,
-        "prefill_cli_args": prefill_args,
-        "commands": commands,
+        **launch,
         "warnings": warnings,
         "serving_plan": asdict(plan),
     }
+
+
+def build_solve_payload(
+    plan: ServingPlan,
+    *,
+    chip: ChipSpec,
+    dtypes: Dtypes | None = None,
+    model: str | None = None,
+    top_k: int = 3,
+) -> dict[str, Any]:
+    """`solve/v1` JSON: every ServingPlan key plus schema, provenance, chip, and Top-K."""
+    kv_str = "fp8" if (dtypes is not None and dtypes.kv <= 1.0) else "auto"
+    payload = asdict(plan)
+    payload["schema"] = SOLVE_SCHEMA
+    payload["provenance"] = {
+        "calibrated": False,
+        "basis": "analytical roofline floors; p90 values are modeled, not measured",
+    }
+    payload["chip_spec"] = asdict(chip)
+    payload["model"] = model
+    payload["top_k"] = [
+        {
+            "point": asdict(pt),
+            "launch": point_launch_args(
+                pt,
+                kv_dtype=kv_str,
+                gpu_memory_utilization=plan.gpu_memory_utilization,
+                model=model,
+            ),
+        }
+        for pt in top_layouts(plan, top_k)
+    ]
+    return payload
 
 
 def emit_ceiling_rows(plan: ServingPlan) -> list[dict[str, Any]]:

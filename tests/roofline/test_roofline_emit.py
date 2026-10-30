@@ -21,11 +21,13 @@ from typing import Literal
 
 import pytest
 
+from dataclasses import replace as dc_replace
 from vllm_torchtpu.roofline import (
     CHIPS,
     Dtypes,
     ParetoPoint,
     PoolMeshPlan,
+    SOLVE_SCHEMA,
     ServingPlan,
     TrafficScenario,
     cli,
@@ -34,7 +36,9 @@ from vllm_torchtpu.roofline import (
     from_hf_config,
     pool_cli_args,
     solve_serving_plan,
+    top_layouts,
 )
+from vllm_torchtpu.roofline.emit import _pool_key
 
 
 def _toy_moe_config_dict() -> dict:
@@ -348,3 +352,140 @@ def test_emit_ceiling_rows_and_cli_subcommands(
     assert rc_ceil == 0
     assert len(out_ceil) >= 1
     assert "p90_interactivity_tok_s" in out_ceil[0]
+
+
+def test_top_layouts_distinct_and_led_by_recommended():
+    """Top-K layouts are distinct, SLO-met, sorted by throughput, led by recommended."""
+    chip = CHIPS["tpu7x"]
+    gqa_cfg = {
+        "hidden_size": 2048,
+        "num_hidden_layers": 16,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "vocab_size": 32000,
+    }
+    geom = from_hf_config(gqa_cfg)
+    dt = Dtypes(kv=1.0)
+    scenario = dc_replace(
+        TrafficScenario(
+            name="chat-8k1k",
+            isl=8192,
+            osl=1024,
+            prefix_hit_rate=0.0,
+            accept_len=1.0,
+            think_time_s=0.0,
+            concurrencies=(1, 2, 4),
+            kv_working_set_turns=1.0,
+        ),
+    )
+    plan = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scenario,
+        max_chips=4,
+        mode="mixed",
+    )
+    top = top_layouts(plan, k=3)
+    assert 1 <= len(top) <= 3
+    assert plan.recommended is not None
+    assert top[0] == plan.recommended
+
+    keys = set()
+    for pt in top:
+        assert pt.slo_met
+        key = (
+            pt.mode,
+            _pool_key(pt.prefill_pool),
+            _pool_key(pt.decode_pool),
+        )
+        assert key not in keys
+        keys.add(key)
+
+    tputs = [pt.token_throughput_per_chip for pt in top]
+    assert tputs == sorted(tputs, reverse=True)
+
+
+def test_top_layouts_empty_without_slo_met():
+    """Top-K layouts return empty tuple if no candidate meets SLOs."""
+    chip = CHIPS["tpu7x"]
+    gqa_cfg = {
+        "hidden_size": 2048,
+        "num_hidden_layers": 16,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "vocab_size": 32000,
+    }
+    geom = from_hf_config(gqa_cfg)
+    dt = Dtypes(kv=1.0)
+    scenario = TrafficScenario(
+        name="custom",
+        isl=8192,
+        osl=1024,
+        concurrencies=(1,),
+        tpot_slo_ms=0.0001,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        kv_working_set_turns=1.0,
+    )
+    plan = solve_serving_plan(
+        geom,
+        dt,
+        chip,
+        scenario,
+        max_chips=4,
+        mode="mixed",
+    )
+    top = top_layouts(plan, k=3)
+    assert top == ()
+
+
+def test_solve_json_v1_envelope(tmp_path, monkeypatch, capsys):
+    """solve --json outputs schema v1 with provenance, search stats, and top_k launch."""
+    cfg = {
+        "model_type": "llama",
+        "torch_dtype": "bfloat16",
+        "num_hidden_layers": 8,
+        "hidden_size": 1024,
+        "intermediate_size": 2048,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "vocab_size": 32000,
+    }
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps(cfg))
+
+    rc = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--example-scenario",
+            "chat-8k1k",
+            "--chip",
+            "tpu7x",
+            "--mode",
+            "mixed",
+            "--max-chips",
+            "4",
+            "--concurrency",
+            "1,2",
+            "--json",
+        ]
+    )
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["schema"] == SOLVE_SCHEMA
+    assert out["provenance"]["calibrated"] is False
+    assert "search" in out
+    assert out["search"]["enumerated"] >= 1
+    assert "top_k" in out
+    assert len(out["top_k"]) >= 1
+    assert "launch" in out["top_k"][0]
+    assert out["top_k"][0]["launch"]["commands"][0].startswith("vllm serve")
+    assert "recommended" in out
+    assert "frontier" in out
+    assert "candidates" in out
