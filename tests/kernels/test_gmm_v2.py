@@ -27,10 +27,13 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    InputConfigs,
     TileSizes,
     apply_act_fn,
     gmm_v2,
     interleave_lane,
+    quantize_lhs,
+    select_lhs_quant_dtype,
     situ_and_mul,
 )
 
@@ -253,6 +256,52 @@ def test_gmm_weight_quantized_matches_reference(weight_dtype, block_size):
     ).astype(lhs.dtype)
 
     _assert_allclose(actual, expected, atol=3e-1, rtol=3e-1)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("batch_size", [100, 256])
+@pytest.mark.parametrize("fuse_act", [None, "silu"])
+@pytest.mark.parametrize("storage_dtype", [None, jnp.int8])
+def test_gmm_pre_quantized_lhs_matches_in_kernel_quantization(
+    batch_size, fuse_act, storage_dtype
+):
+    """quantize_lhs ahead of the kernel reproduces its in-kernel quantization."""
+    _require_tpu()
+
+    in_size, out_size, num_groups = 1024, 512, 8
+    lhs_key, rhs_key = jax.random.split(jax.random.key(0))
+    lhs = jax.random.normal(lhs_key, (batch_size, in_size), jnp.bfloat16)
+    rhs = jax.random.uniform(
+        rhs_key, (num_groups, in_size, out_size), jnp.bfloat16, -1, 1
+    )
+    rhs_q, rhs_scale = quantize_tensor(rhs, jnp.float8_e4m3fn, axis=1, block_size=512)
+    rhs_scale = jnp.expand_dims(rhs_scale, axis=2)
+    q_dtype = select_lhs_quant_dtype(
+        InputConfigs(
+            quant_dtype=rhs_q.dtype,
+            quant_block_size=512,
+            dtype=rhs_q.dtype,
+            has_scale=True,
+        )
+    )
+    if q_dtype is None:
+        pytest.skip("this TPU's gmm_v2 does not quantize lhs against fp8 weights")
+    group_sizes = get_group_sizes(batch_size, num_groups)
+    kwargs = dict(rhs_scale=rhs_scale, fuse_act=fuse_act)
+
+    expected = gmm_v2(lhs, rhs_q, group_sizes, **kwargs)
+    lhs_q, lhs_scale = quantize_lhs(lhs, q_dtype, storage_dtype=storage_dtype)
+    actual = gmm_v2(
+        lhs_q,
+        rhs_q,
+        group_sizes,
+        lhs_scale=lhs_scale,
+        lhs_quant_dtype=q_dtype,
+        **kwargs,
+    )
+
+    assert actual.dtype == expected.dtype
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
 
 @pytest.mark.tpu_test
