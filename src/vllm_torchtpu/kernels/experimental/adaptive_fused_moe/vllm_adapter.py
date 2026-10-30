@@ -176,6 +176,7 @@ def prebuild_adaptive_fused_moe(
         weight_format,
         rhs_qb,
         token_replica_groups=groups,
+        ag_lead_axis=envs.MOE_ADAPTIVE_AG_LEAD_AXIS,
     )
     logger.info_once(
         "Experimental adaptive fused MoE armed | format=%s W1=%d W2=%d "
@@ -420,6 +421,7 @@ def _build_op(
     rhs_qb: int | None = None,
     *,
     token_replica_groups: tuple[tuple[int, ...], ...] | None = None,
+    ag_lead_axis: bool = False,
 ) -> torch.library.CustomOpDef:
     """The op for this closure, built once per distinct closure and reused."""
     key = (
@@ -431,6 +433,7 @@ def _build_op(
         weight_format,
         rhs_qb,
         token_replica_groups,
+        bool(ag_lead_axis),
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -479,6 +482,7 @@ def _build_op(
             act_fn=activation,
             mesh_ep_ranks=mesh_expert_order,
             token_replica_groups=token_replica_groups,
+            ag_lead_axis=ag_lead_axis,
         )
 
     spec = PartitionSpec(EP_AXIS_NAME)

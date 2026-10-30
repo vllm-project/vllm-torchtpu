@@ -249,3 +249,37 @@ def test_op_cache_separates_replica_groups_and_passes_them_to_kernel(monkeypatch
     gate = SimpleNamespace(astype=lambda _: "gate")
     functions[-1](1, 2, 3, 4, 5, gate, 6)
     assert kernel.call_args.kwargs["token_replica_groups"] == groups
+    assert kernel.call_args.kwargs["ag_lead_axis"] is False
+
+
+@pytest.mark.parametrize("ag_lead_axis", [False, True])
+def test_prebuild_passes_ag_lead_axis(context, monkeypatch, ag_lead_axis):
+    monkeypatch.setattr(bridge.envs, "MOE_ADAPTIVE_AG_LEAD_AXIS", ag_lead_axis)
+    prebuild(layer())
+    assert context[1].call_args.kwargs["ag_lead_axis"] is ag_lead_axis
+
+
+def test_op_cache_separates_ag_lead_axis_and_passes_it_to_kernel(monkeypatch):
+    import importlib
+
+    package = importlib.import_module(
+        "vllm_torchtpu.kernels.experimental.adaptive_fused_moe"
+    )
+    kernel = Mock(return_value="output")
+    monkeypatch.setattr(package, "adaptive_fused_moe", kernel)
+    monkeypatch.setattr(bridge, "_OPS", {})
+    functions = []
+
+    def create(name, fn, **kwargs):
+        functions.append(fn)
+        return Mock()
+
+    monkeypatch.setattr(bridge, "jax_op", create)
+    mesh = object()
+    default_op = bridge._build_op(mesh, 2, True, "silu", None, ag_lead_axis=False)
+    lead_op = bridge._build_op(mesh, 2, True, "silu", None, ag_lead_axis=True)
+    assert default_op is not lead_op
+    assert lead_op is bridge._build_op(mesh, 2, True, "silu", None, ag_lead_axis=True)
+    gate = SimpleNamespace(astype=lambda _: "gate")
+    functions[-1](1, 2, 3, 4, 5, gate, 6)
+    assert kernel.call_args.kwargs["ag_lead_axis"] is True
