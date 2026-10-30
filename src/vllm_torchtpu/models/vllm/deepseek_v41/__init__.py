@@ -15,12 +15,24 @@
 
 from .cache import NativeCacheView, PagedCacheRows
 from .ced import DecoderReplayPlan, build_decoder_inverse_rows
+from .engram import (
+    Engram,
+    NgramHashState,
+    ParallelEngramEmbedding,
+    TpuDPSharedEngramStorage,
+    dequant_fp8_rows,
+)
 from .moe import DeepseekV41MoE
 
 __all__ = [
     "DecoderReplayPlan",
     "DeepseekV41MoE",
+    "Engram",
     "NativeCacheView",
+    "NgramHashState",
     "PagedCacheRows",
+    "ParallelEngramEmbedding",
+    "TpuDPSharedEngramStorage",
     "build_decoder_inverse_rows",
+    "dequant_fp8_rows",
 ]
