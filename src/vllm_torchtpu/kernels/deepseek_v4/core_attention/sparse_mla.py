@@ -579,7 +579,10 @@ _MASK_LANES = 1 << _MASK_LANE_BITS
 def _dense_attention_kernel(
     # Prefetch
     page_indices_ref,  # [max_num_seqs * pages_per_seq]
-    chunk_ref,  # [3] (seq_idx, num_valid_tokens, num_kv_pages) of the chunk
+    num_valid_ref,  # [1] valid tokens of the step
+    block_ids_ref,  # [num_blocks] the dense blocks, then unused entries
+    block_seqs_ref,  # [num_blocks] request of each block
+    block_pages_ref,  # [num_blocks] KV pages each block reads
     kv_bounds_ref,  # [num_blocks] 1 + largest selected KV position per block
     # Input
     attention_sinks_ref,  # float32[num_q_heads]
@@ -588,7 +591,7 @@ def _dense_attention_kernel(
     *refs,
     sm_scale: float,
 ):
-    """Grid (query block, KV step): FlashAttention over one request's pages.
+    """Grid (dense block, KV step): FlashAttention over one request's pages.
 
     `refs` holds the step's DENSE_KV_PAGES_PER_STEP NoPE pages
     (int32[page_size, 128]), then their RoPE pages (int32[page_size // 4,
@@ -624,7 +627,7 @@ def _dense_attention_kernel(
     rope_tokens_per_row = csa_cache_layout.ROPE_TOKENS_PER_ROW
     halves = page_size // _MASK_LANES
 
-    bq_idx = pl.program_id(0)
+    bq_idx = block_ids_ref[pl.program_id(0)]
     kv_step = pl.program_id(1)
     kv_bound = kv_bounds_ref[bq_idx]
     first_page = kv_step * kv_group
@@ -760,8 +763,8 @@ def _dense_attention_kernel(
             o_ref[t] = out
 
         # Padding rows keep q, as the gather kernel leaves them. Only the
-        # chunk's last block can hold any.
-        num_valid = chunk_ref[1] - bq_idx * bq_sz
+        # last valid block can hold any.
+        num_valid = num_valid_ref[0] - bq_idx * bq_sz
 
         @pl.when(num_valid < bq_sz)
         def keep_padding_rows():
@@ -769,7 +772,7 @@ def _dense_attention_kernel(
                 o_ref[t] = jnp.where(t < num_valid, o_ref[t], q_ref[t])
 
 
-def _dense_chunk_attention(
+def _dense_attention(
     q: jax.Array,  # [max_num_tokens, num_q_heads, head_dim]
     cache_kv_nope: jax.Array,  # int32[total_num_pages, page_size, 128]
     cache_kv_rope: jax.Array,  # int32[total_num_pages, page_size // 4, 128]
@@ -782,21 +785,22 @@ def _dense_chunk_attention(
     swa_m: jax.Array,  # float32[max_num_tokens, num_l_heads]
     num_valid_tokens: jax.Array,  # i32
     *,
-    start_pos: int,
-    end_pos: int,
+    chunk_size: int,
     max_num_seqs: int,
     sm_scale: float,
     vmem_limit_bytes: int,
 ) -> tuple[jax.Array, jax.Array]:
-    """Runs chunk [start_pos, end_pos) on the dense path when it applies.
+    """Runs every dense chunk of the step in one call.
 
-    Returns q with the chunk's rows attended, and whether the dense path ran;
-    when it did not, its grid is empty and q comes back unchanged.
+    A chunk of `chunk_size` tokens is dense when its valid tokens all belong
+    to one request and read at most DENSE_MAX_KV_PAGES pages. The grid walks
+    the dense chunks' valid 32-token blocks only. Returns q with those rows
+    attended, and per chunk the token where its gather-path range ends: the
+    chunk's start for a dense chunk, its end otherwise.
     """
     bq_sz = DENSE_BLOCK_TOKENS
     kv_group = DENSE_KV_PAGES_PER_STEP
-    chunk_size = end_pos - start_pos
-    _, num_q_heads, head_dim = q.shape
+    num_tokens, num_q_heads, head_dim = q.shape
     _, page_size, lanes = cache_kv_nope.shape
     _, rope_rows, _ = cache_kv_rope.shape
     topk = topk_indices.shape[1]
@@ -805,32 +809,57 @@ def _dense_chunk_attention(
     max_kv_pages = min(DENSE_MAX_KV_PAGES, pages_per_seq)
     # Every KV step reads mask rows of whole pages, up to the last step's.
     mask_rows = align_to(align_to(max_kv_pages, kv_group) * page_size // _MASK_LANES, 8)
+    num_chunks = num_tokens // chunk_size
+    chunk_blocks = chunk_size // bq_sz
+    num_blocks = num_tokens // bq_sz
 
-    valid_end = jnp.clip(num_valid_tokens, start_pos, end_pos)
-    chunk_valid = valid_end - start_pos
-    seq_idx = seq_ids_segment[start_pos]
-    one_seq = seq_ids_segment[jnp.maximum(valid_end - 1, start_pos)] == seq_idx
-    token_valid = jnp.arange(chunk_size) < chunk_valid
-    topk_chunk = topk_indices[start_pos:end_pos]
-    token_bound = jnp.where(token_valid, jnp.max(topk_chunk, axis=-1) + 1, 0)
-    kv_bounds = jnp.max(token_bound.reshape(chunk_size // bq_sz, bq_sz), axis=1)
-    num_kv_pages = jnp.maximum(1, cdiv(jnp.max(kv_bounds), page_size))
-    use_dense = (chunk_valid > 0) & one_seq & (num_kv_pages <= max_kv_pages)
-    num_blocks = jnp.where(use_dense, cdiv(chunk_valid, bq_sz), 0)
+    num_valid_tokens = jnp.clip(num_valid_tokens, 0, num_tokens)
+    token_valid = jnp.arange(num_tokens) < num_valid_tokens
+    token_bound = jnp.where(token_valid, jnp.max(topk_indices, axis=-1) + 1, 0)
+    kv_bounds = jnp.max(token_bound.reshape(num_blocks, bq_sz), axis=1)
+    block_pages = jnp.maximum(1, cdiv(kv_bounds, page_size))
 
-    block_offset = start_pos // bq_sz
+    chunk_start = jnp.arange(num_chunks) * chunk_size
+    chunk_valid = jnp.clip(num_valid_tokens - chunk_start, 0, chunk_size)
+    chunk_last = chunk_start + jnp.maximum(chunk_valid - 1, 0)
+    one_seq = seq_ids_segment[chunk_start] == seq_ids_segment[chunk_last]
+    chunk_pages = jnp.max(block_pages.reshape(num_chunks, chunk_blocks), axis=1)
+    use_dense = (chunk_valid > 0) & one_seq & (chunk_pages <= max_kv_pages)
 
-    def q_map(i, s, *_):
-        return (block_offset + i, 0, 0)
+    block_valid = jnp.arange(num_blocks) * bq_sz < num_valid_tokens
+    is_dense = jnp.repeat(use_dense, chunk_blocks) & block_valid
+    # The dense blocks' ids, in order, at the front.
+    slot = jnp.where(is_dense, jnp.cumsum(is_dense) - 1, num_blocks)
+    block_ids = (
+        jnp.zeros(num_blocks, jnp.int32)
+        .at[slot]
+        .set(jnp.arange(num_blocks, dtype=jnp.int32), mode="drop")
+    )
+    num_dense = jnp.sum(is_dense)
+    num_kv_steps = jnp.max(jnp.where(is_dense, cdiv(block_pages, kv_group), 1))
 
-    def row_map(i, s, *_):
-        return (block_offset + i, 0)
+    def q_map(i, s, page_indices_ref, num_valid_ref, block_ids_ref, *_):
+        return (block_ids_ref[i], 0, 0)
+
+    def row_map(i, s, page_indices_ref, num_valid_ref, block_ids_ref, *_):
+        return (block_ids_ref[i], 0)
 
     def kv_map(j):
-        def index_map(i, s, page_indices_ref, chunk_ref, kv_bounds_ref):
-            # A step past the chunk's last page repeats it; see `load_page`.
-            page = jnp.minimum(s * kv_group + j, chunk_ref[2] - 1)
-            return (page_indices_ref[chunk_ref[0] * pages_per_seq + page], 0, 0)
+        def index_map(
+            i,
+            s,
+            page_indices_ref,
+            num_valid_ref,
+            block_ids_ref,
+            block_seqs_ref,
+            block_pages_ref,
+            kv_bounds_ref,
+        ):
+            block = block_ids_ref[i]
+            # A step past the block's last page repeats it; see `load_page`.
+            page = jnp.minimum(s * kv_group + j, block_pages_ref[block] - 1)
+            seq = block_seqs_ref[block]
+            return (page_indices_ref[seq * pages_per_seq + page], 0, 0)
 
         return index_map
 
@@ -854,10 +883,13 @@ def _dense_chunk_attention(
     ]
     scalar_prefetches = (
         page_indices,
-        jnp.stack([seq_idx, chunk_valid, num_kv_pages]).astype(jnp.int32),
+        num_valid_tokens.reshape(1).astype(jnp.int32),
+        block_ids,
+        seq_ids_segment[::bq_sz].astype(jnp.int32),
+        block_pages.astype(jnp.int32),
         kv_bounds.astype(jnp.int32),
     )
-    scope_name = f"SparseMLA-dense-bq_{bq_sz}-kvp_{kv_group}-gcz_{chunk_size}"
+    scope_name = f"SparseMLA-dense-bq_{bq_sz}-kvp_{kv_group}"
     kernel = jax.named_scope(scope_name)(
         pl.pallas_call(
             functools.partial(_dense_attention_kernel, sm_scale=sm_scale),
@@ -865,7 +897,7 @@ def _dense_chunk_attention(
                 num_scalar_prefetch=len(scalar_prefetches),
                 in_specs=in_specs,
                 out_specs=pl.BlockSpec((bq_sz, num_q_heads, head_dim), q_map),
-                grid=(num_blocks, cdiv(num_kv_pages, kv_group)),
+                grid=(num_dense, num_kv_steps),
                 scratch_shapes=scratch_shapes,
             ),
             compiler_params=pltpu.CompilerParams(
@@ -889,7 +921,8 @@ def _dense_chunk_attention(
         swa_l,
         swa_m,
     )
-    return q, use_dense
+    gather_end = jnp.where(use_dense, chunk_start, chunk_start + chunk_size)
+    return q, gather_end
 
 
 def prepare_q_inputs(
@@ -1195,8 +1228,28 @@ def sparse_ragged_paged_attention(
     num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
     dense_path = (
         gather_and_attention_chunk_size >= DENSE_MIN_CHUNK_TOKENS
+        and gather_and_attention_chunk_size % DENSE_BLOCK_TOKENS == 0
+        and q.shape[0] % gather_and_attention_chunk_size == 0
         and page_size % _MASK_LANES == 0
     )
+    if dense_path:
+        q, gather_ends = _dense_attention(
+            q,
+            cache_kv_nope,
+            cache_kv_rope,
+            topk_indices,
+            page_indices,
+            seq_ids_segment,
+            attention_sinks,
+            swa_accumution,
+            swa_l,
+            swa_m,
+            cu_q_lens[distribution[2]],
+            chunk_size=gather_and_attention_chunk_size,
+            max_num_seqs=max_num_seqs,
+            sm_scale=sm_scale,
+            vmem_limit_bytes=vmem_limit_bytes,
+        )
 
     for i in range(num_chunks):
         start_pos = i * gather_and_attention_chunk_size
@@ -1224,27 +1277,9 @@ def sparse_ragged_paged_attention(
             )
             * kernel_batch_size
         )
-        if dense_path and chunk_size % DENSE_BLOCK_TOKENS == 0:
-            q, use_dense = _dense_chunk_attention(
-                q,
-                cache_kv_nope,
-                cache_kv_rope,
-                topk_indices,
-                page_indices,
-                seq_ids_segment,
-                attention_sinks,
-                swa_accumution,
-                swa_l,
-                swa_m,
-                cu_q_lens[distribution[2]],
-                start_pos=start_pos,
-                end_pos=end_pos,
-                max_num_seqs=max_num_seqs,
-                sm_scale=sm_scale,
-                vmem_limit_bytes=vmem_limit_bytes,
-            )
+        if dense_path:
             # The gather path's grid and gather are empty for a dense chunk.
-            batch_end = jnp.where(use_dense, start_pos, batch_end)
+            batch_end = jnp.minimum(batch_end, gather_ends[i])
         num_valid_indices = jnp.maximum(0, batch_end - start_pos) * topk
 
         # For prefilling of short sequences (or early in the sequence), there are
@@ -1253,7 +1288,7 @@ def sparse_ragged_paged_attention(
         # 30%+ performance degradation compared to the no-duplicate-indices case.
         #
         # Chunks of a single request with few KV pages take the dense path
-        # above (`_dense_chunk_attention`) and skip this gather.
+        # above (`_dense_attention`) and skip this gather.
         gathered_nope_buffer, gathered_rope_buffer = csa_gather.csa_gather(
             cache_kv_nope,
             cache_kv_rope,
