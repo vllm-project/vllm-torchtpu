@@ -171,13 +171,18 @@ def _pool_attention_geometry(
     first = candidates[0]
     if token_split(first.kv_cache_spec):
         # Describe the page by a one-row-per-token spec if there is one (the
-        # MTP draft's main KV), else by the split spec's stored rows.
+        # MTP draft's main KV), else by the split spec's stored rows; main KV
+        # before compressed keys (VLLM_TPU_QSA_COMPRESSED_DCP splits both).
         for group in candidates:
             spec = group.kv_cache_spec
             if isinstance(spec, FullAttentionSpec) and spec.tokens_per_state == 1:
                 first = group
                 break
         else:
+            first = next(
+                (g for g in candidates if not isinstance(g.kv_cache_spec, MLAAttentionSpec)),
+                first,
+            )
             spec = first.kv_cache_spec
             rows = spec.block_size // spec.tokens_per_state
             return replace(spec, block_size=rows, tokens_per_state=1), first.backend, rows
