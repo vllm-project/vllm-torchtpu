@@ -94,9 +94,11 @@ class Qwen4ExpPoolLayout:
     main_owners: tuple[tuple[str, str, int], ...] = field(default=())
     # `main_kv_dcp()`: tokens per target main-KV block-table entry are
     # ``main_dcp * block_size``; each pair rank stores ``block_size`` rows of
-    # them per page. MTP draft main KV keeps ``block_size``.
+    # them per page. MTP draft main KV keeps ``block_size`` unless
+    # VLLM_TPU_QSA_MTP_KV_DCP splits it too.
     main_dcp: int = 1
-    # Target (non-draft) main KV owner groups, whose block size is scaled.
+    # Main KV owner groups whose block size is scaled (the draft's with
+    # VLLM_TPU_QSA_MTP_KV_DCP).
     main_dcp_owners: tuple[str, ...] = field(default=())
 
     def compressed_owner(self, attention_prefix: str) -> tuple[str, int]:
@@ -159,6 +161,7 @@ def pooled_cache_specs(cfg):
     tokens. vLLM then schedules in LCM blocks (``2 * B``) and hashes in GCD
     blocks (``B``); compressed keys, rings, GDN, PLE and the MTP draft's main
     KV keep ``B``, so prefix hashing and the draft are unchanged.
+    ``VLLM_TPU_QSA_MTP_KV_DCP`` gives the draft's main KV groups ``2 * B`` too.
     """
     specs = native_cache_specs(cfg)
     text = cfg.model_config.hf_text_config
@@ -259,11 +262,15 @@ def pooled_cache_specs(cfg):
                 f"kernel's {PAIRED_KV_TILES} and an FP8 main KV cache; got "
                 f"{main.dtype}"
             )
+        from vllm_torchtpu import envs
+
+        # VLLM_TPU_QSA_MTP_KV_DCP: the draft's main KV splits like the target's.
+        split_draft = bool(envs.VLLM_TPU_QSA_MTP_KV_DCP)
         dcp_owners = tuple(
             name
             for name in specs
             if name.endswith(".self_attn")
-            and name not in draft_attention
+            and (split_draft or name not in draft_attention)
             and name not in paired_away
         )
     layout = Qwen4ExpPoolLayout(

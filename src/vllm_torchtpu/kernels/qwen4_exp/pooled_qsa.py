@@ -1573,8 +1573,13 @@ def _attend(
     )
     selected = selected_tokens(blocks, lengths, token_topk, compress_ratio)
     if dcp is not None:
-        assert picked is None, "DCP covers the all-token paths"
         output, lse, pool = result
+        if picked is not None:
+            # More rows than the decode path holds: attend every token, then
+            # pick; an unpicked row has no key on either rank.
+            output = jnp.where(keep[:, None, None], output[picked], 0)
+            lse = jnp.where(keep[:, None], lse[picked], -jnp.inf)
+            selected = jnp.where(keep[:, None], selected[picked], -1)
         return pool, output, lse, selected
     output, pool = result
     output = output.reshape(len(q), -1)
@@ -2326,6 +2331,198 @@ def pooled_qsa_shared_rows_step(
         max_query_len=max_query_len,
         rows=rows,
         shared=shared,
+    )
+
+
+def pooled_qsa_rows_dcp_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    rows: jax.Array,
+    dcp_rank: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    dcp_size: int = 2,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_rows_step`` over this rank's DCP main-KV rows (the MTP
+    draft under VLLM_TPU_QSA_MTP_KV_DCP): returns ``(pool, out, lse,
+    selected)`` for ``qsa_rpa.dcp_combine``, one row per entry of ``rows``."""
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        rows=rows,
+        dcp=(dcp_rank, dcp_size),
+    )
+
+
+def pooled_qsa_shared_dcp_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    shared: jax.Array,
+    dcp_rank: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    dcp_size: int = 2,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_shared_step`` over this rank's DCP main-KV rows; returns
+    ``(pool, out, lse, selected)`` for ``qsa_rpa.dcp_combine``."""
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        shared=shared,
+        dcp=(dcp_rank, dcp_size),
+    )
+
+
+def pooled_qsa_shared_rows_dcp_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    rows: jax.Array,
+    shared: jax.Array,
+    dcp_rank: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    dcp_size: int = 2,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_shared_rows_step`` over this rank's DCP main-KV rows;
+    returns ``(pool, out, lse, selected)`` for ``qsa_rpa.dcp_combine``."""
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        rows=rows,
+        shared=shared,
+        dcp=(dcp_rank, dcp_size),
     )
 
 
