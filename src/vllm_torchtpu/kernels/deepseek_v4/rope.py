@@ -209,13 +209,21 @@ def _rope_body(
         return
 
     q_ref, scale_ref = out_refs
+    q, scale = _quantize_lanes(y, quant_dtype)
+    q_ref[...] = q
+    scale_ref[...] = scale.reshape(scale_ref.shape)
+
+
+def _quantize_lanes(
+    y: jax.Array, quant_dtype: jnp.dtype
+) -> tuple[jax.Array, jax.Array]:
+    """``y`` quantized with one scale per row of its last axis, and the scales."""
     qmax = dtype_max(quant_dtype)
     # One scale per row, i.e. over the whole ``LANE``-wide channel axis.
     abs_max = jnp.max(jnp.abs(y), axis=-1, keepdims=True)
     scale = abs_max / qmax
     scale_inv = jnp.where(abs_max == 0.0, 0.0, 1.0 / scale)
-    q_ref[...] = (y * scale_inv).astype(quant_dtype)
-    scale_ref[...] = scale.reshape(scale_ref.shape)
+    return (y * scale_inv).astype(quant_dtype), scale
 
 
 def _kernel(
