@@ -224,6 +224,51 @@ def test_qwen_create_declines_are_named() -> None:
     assert adapter.create(view, {}).code == "backbone_not_found"
 
 
+# --- pool slot check ---------------------------------------------------------
+
+
+def _slot_check_driver(layers: list[Any]) -> Any:
+    drv = object.__new__(adapter.Qwen35Program)
+    drv.backbone = SimpleNamespace(layers=layers)
+    drv.spec = SimpleNamespace(
+        cache_backend=SimpleNamespace(layout=qwen35.Qwen35.pool_layout(R=8))
+    )
+    drv.base_exec = SimpleNamespace(R=8)
+    drv._display_name = "test"
+    drv.seen = []
+    return drv
+
+
+def test_pool_slot_check_uses_first_recurrent_layer_and_skips_without_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    la = object()
+    layers = [
+        SimpleNamespace(linear_attn=None),
+        SimpleNamespace(),
+        SimpleNamespace(linear_attn=la),
+    ]
+    drv = _slot_check_driver(layers)
+
+    def facts(runner: Any, linear_attn: Any, pool: Any) -> Any:
+        drv.seen.append(linear_attn)
+        return facts_from_pool_layout(drv.spec.cache_backend.layout, 8)
+
+    monkeypatch.setattr(drv, "_framework_slot_facts", facts, raising=False)
+    drv._check_pool_layout_facts(SimpleNamespace(), object())
+    assert drv.seen == [la] and drv.pool_layout_facts is not None
+
+    # No recurrent layers: no slot to check, and no pool_layout_unknown decline.
+    drv = _slot_check_driver([SimpleNamespace(linear_attn=None), SimpleNamespace()])
+
+    def never(*_a: Any) -> Any:
+        raise AssertionError("no framework slot facts without recurrent layers")
+
+    monkeypatch.setattr(drv, "_framework_slot_facts", never, raising=False)
+    drv._check_pool_layout_facts(SimpleNamespace(), object())
+    assert drv.pool_layout_facts is None
+
+
 # --- shorthand vs plugin key: identical programs ----------------------------------
 
 
