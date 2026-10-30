@@ -137,7 +137,28 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             ScratchReq("qc_kvq", pltpu.VMEM((nreq, ex.T, 2 * g.HD), F32)),
         ] if self.loop_requests else []) + (self._shard_scratch(ex) if self.shard_index else []) + (
             self._union_scratch(ex) if self.union_attn else []
-        )
+        ) + (self._dcp_scratch(g, ex) if self.dcp > 1 else [])
+
+    def _dcp_scratch(self, g: Any, ex: ExecSpec) -> list[ScratchReq]:
+        """Main-KV DCP: the pair rank's q (`qd_q`), this rank's partial over its own heads
+        (`qd_o` / `qd_l`) and the partial over the pair rank's heads sent to it (`qd_os` /
+        `qd_ls`, received into `qd_or` / `qd_lr`); lse rows lane-broadcast `[nh, 128]`."""
+        nh = self.nh(g, ex)
+        o, lse = pltpu.VMEM((ex.MB, nh, g.HD), F32), pltpu.VMEM((ex.MB, nh, 128), F32)
+        return [
+            ScratchReq("qd_q", pltpu.VMEM((ex.MB, nh, g.HD), F32)),
+            ScratchReq("qd_o", o), ScratchReq("qd_l", lse),
+            ScratchReq("qd_os", o), ScratchReq("qd_ls", lse),
+            ScratchReq("qd_or", o), ScratchReq("qd_lr", lse),
+        ] + [
+            ScratchReq(f"qd_{k}sem{i}", pltpu.SemaphoreType.DMA((1,)))
+            for i in range(3) for k in "sr"
+        ]
+
+    def _dcp_owned(self, ctx: Any, pos: Any) -> Any:
+        """Whether this rank owns token positions `pos` (main-KV DCP: `(pos // B) % 2`)."""
+        B = ctx.extra[POOL].shape[1]
+        return jax.lax.rem(pos // B, self.dcp) == jax.lax.rem(ctx.me, self.dcp)
 
     def _union_width(self, ex: ExecSpec) -> int:
         """Union slots per request: every row's whole selection, 128-lane aligned."""
@@ -237,8 +258,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         ga = c0 // 4
         per_page = ctx.extra[POOL].shape[1] // MICRO
         shift = per_page.bit_length() - 1
+        cshift = shift + self.dcp.bit_length() - 1  # DCP: a column covers `dcp * B` tokens
         qb = self.tab_base(ctx, l) + q
-        micro = self.tables(ctx)[1][qb, ga >> shift] * per_page + (ga & (per_page - 1))
+        micro = self.tables(ctx)[1][qb, ga >> cshift] * per_page + (ga & (per_page - 1))
         cp = pltpu.make_async_copy(
             ctx.extra[POOL].at[micro >> shift, pl.ds((micro & (per_page - 1)) * MICRO, MICRO)],
             scr["qc_old"],
@@ -262,6 +284,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         for t in range(T):
             k_t = jnp.where(pos == c0 + t, k_cur[t : t + 1], k_t)
             v_t = jnp.where(pos == c0 + t, v_cur[t : t + 1], v_t)
+        if self.dcp > 1:  # the pair rank's slots: its pool rows / tokens, scored there
+            own = self._dcp_owned(ctx, pos)
+            k_t, v_t = jnp.where(own, k_t, 0.0), jnp.where(own, v_t, 0.0)
         scr["qc_rk"][q] = k_t
         scr["qc_rv"][q] = v_t
 
@@ -554,7 +579,8 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         grp = pos // 4
         part = (grp == n_r) & (tail > 0)
         full = (grp == ga) & (ga < n_r) & (scr["qc_sga"][r] > 0)
-        return (r < ex.B) & (pos <= p_r) & (part | full)
+        ok = (r < ex.B) & (pos <= p_r) & (part | full)
+        return ok & self._dcp_owned(ctx, pos) if self.dcp > 1 else ok
 
     def _attend_unions(self, ctx: Any, l: Any, zeros: tuple) -> list[jax.Array]:
         """Every request's rows over the union of their selections (`union_attn`)."""
@@ -566,6 +592,11 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
 
         def req(q: Any, outs: Any) -> Any:
             src = scr["qu_id"].at[q]
+            if self.dcp > 1:  # drop the groups the pair rank owns (their rows live there)
+                gid = scr["qu_id"][q]
+                scr["qu_cd"][q] = jnp.where(
+                    self._dcp_owned(ctx, gid * ua.MICRO), scr["qu_cd"][q], 0
+                )
             if self.union_phys:
                 # The request's main-table row, then its union ids -> physical micro-page ids for
                 # every slot a tile reads (< ceil(n / 64) * 64 <= ceil(n / 128) * 128).
@@ -581,7 +612,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 def chunk(c: Any, carry: Any) -> Any:
                     lo = pl.multiple_of(c * 128, 128)
                     scr["qu_pv"][:, pl.ds(lo, 128)] = ua.physical_ids(
-                        src[:, pl.ds(lo, 128)], tab, per_page
+                        src[:, pl.ds(lo, 128)], tab, per_page, self.dcp
                     )
                     return carry
 
@@ -605,17 +636,29 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             ok_any = self._recent_ok(ctx, rs[0], scol)
             for r in rs[1:]:
                 ok_any = ok_any | self._recent_ok(ctx, r, scol)
+            if self.dcp > 1:  # both pair ranks' heads, this rank's first
+                qs = [jnp.concatenate([scr["qf_q"][r], scr["qd_q"][r]], axis=0) for r in rs]
+            else:
+                qs = [scr["qf_q"][r] for r in rs]
             res = ua.attend_request(
-                T=T, nh=nh, pool=ctx.extra[POOL], ring=scr["qf_ring"], sems=scr["qf_ring_sem"],
+                T=T, nh=nh * self.dcp, pool=ctx.extra[POOL], ring=scr["qf_ring"],
+                sems=scr["qf_ring_sem"],
                 ids=scr["qu_row"], codes=scr["qu_cd"].at[q], n_union=scr["qu_n"][q],
                 table=self.tables(ctx)[1], table_row=self.tab_base(ctx, l) + q,
-                qs=[scr["qf_q"][r] for r in rs],
+                qs=qs,
                 gates=[scr["qf_g"][r] for r in rs],
                 has=[scr["qi_kvl"][r] > 0 for r in rs],
                 off=self.offset(ctx, l), scale_k=ctx.extra[SCALES][0],
                 scale_v=ctx.extra[SCALES][1], sm_scale=g.HD**-0.5, interpret=ex.interpret,
                 recent=(scr["qc_rk"][q], scr["qc_rv"][q], ok, ok_any), phys=self.union_phys,
+                dcp=self.dcp,
             )
+            if self.dcp > 1:
+                for r, (att, lse) in zip(rs, res):
+                    lse = jnp.broadcast_to(lse, (2 * nh, 128))
+                    scr["qd_o"][r], scr["qd_os"][r] = att[:nh], att[nh:]
+                    scr["qd_l"][r], scr["qd_ls"][r] = lse[:nh], lse[nh:]
+                return outs
             if self.union_stats:
                 assert nreq <= UNION_STATS_REQS, (nreq, UNION_STATS_REQS)
                 kept = [scr["qi_kvl"][r] // 4 for r in rs]
@@ -641,6 +684,48 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             return tuple(outs)
 
         return list(jax.lax.fori_loop(0, nreq, req, zeros))
+
+    def _dcp_pair(self, ctx: Any, src: Any, dst: Any, i: int) -> None:
+        """`src` -> the pair rank's `dst` (and its `src` -> ours), waited on both sides."""
+        scr = ctx.scr
+        ctx.comm.exchange(ctx.comm.group_copies(
+            lambda off: src, dst, scr[f"qd_ssem{i}"], scr[f"qd_rsem{i}"], 2,
+        ))
+
+    def _dcp_attend(self, ctx: Any, l: Any, zeros: tuple) -> None:
+        """Pair q exchange, then the union attention over this rank's groups for both ranks'
+        heads (partials into `qd_o` / `qd_l` and, for the pair rank, `qd_os` / `qd_ls`)."""
+        scr = ctx.scr
+        self._dcp_pair(ctx, scr["qf_q"], scr["qd_q"], 0)
+        self._attend_unions(ctx, l, zeros)
+        self._dcp_pair(ctx, scr["qd_os"], scr["qd_or"], 1)
+        self._dcp_pair(ctx, scr["qd_ls"], scr["qd_lr"], 2)
+
+    def _dcp_combine(self, ctx: Any) -> list[jax.Array]:
+        """This rank's heads: the pair's partials merged by LSE, then gated (`dcp_combine`'s
+        math and rounding; rows no rank owns a token of stay 0). `nh` `[MB, HD]` F32."""
+        ex, scr, g = ctx.ex, ctx.scr, ctx.g
+        nh = self.nh(g, ex)
+        rows = jax.lax.broadcasted_iota(I32, (ex.MB, 1), 0)
+
+        def row(r: Any, outs: Any) -> Any:
+            l0, l1 = scr["qd_l"][r][:, 0:1], scr["qd_lr"][r][:, 0:1]
+            top = jnp.maximum(l0, l1)
+            fin = top > -jnp.inf
+            safe = jnp.where(fin, top, 0.0)
+            w0 = jnp.where(fin, jnp.exp(l0 - safe), 0.0)
+            w1 = jnp.where(fin, jnp.exp(l1 - safe), 0.0)
+            tot = w0 + w1
+            o = (w0 * scr["qd_o"][r] + w1 * scr["qd_or"][r]) / jnp.where(tot > 0, tot, 1.0)
+            gated = (
+                o.astype(BF16).astype(F32)
+                * jax.nn.sigmoid(scr["qf_g"][r].astype(F32)).astype(BF16).astype(F32)
+            ).astype(BF16).astype(F32)
+            res = jnp.where(fin, gated, 0.0)
+            return tuple(jnp.where(rows == r, res[h : h + 1], o_) for h, o_ in enumerate(outs))
+
+        zeros = tuple(jnp.zeros((ex.MB, g.HD), F32) for _ in range(nh))
+        return list(jax.lax.fori_loop(0, ex.MB, row, zeros))
 
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
         ex, scr, g = ctx.ex, ctx.scr, ctx.g
@@ -683,7 +768,10 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             )
 
         zeros = tuple(jnp.zeros((ex.MB, g.HD), F32) for _ in range(nh))
-        if self.union_attn:
+        if self.dcp > 1:
+            self._dcp_attend(ctx, l, zeros)
+            outs = self._dcp_combine(ctx)
+        elif self.union_attn:
             outs = self._attend_unions(ctx, l, zeros)
         else:
             *outs, _, _ = jax.lax.fori_loop(0, ex.MB, row, (*zeros, jnp.int32(0), jnp.int32(0)))
