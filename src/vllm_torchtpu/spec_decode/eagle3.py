@@ -950,6 +950,7 @@ class Eagle3Proposer:
                 key for key in before if after.get(key) is not before[key]
             )
             model_load_weights = cast(Callable[..., Any], model.load_weights)
+            model_is_unused = getattr(model, "is_unused_checkpoint_weight", None)
 
             def load_weights(weights: Iterable[tuple[str, torch.Tensor]]) -> Any:
                 return model_load_weights(
@@ -959,10 +960,14 @@ class Eagle3Proposer:
                 )
 
             cast(Any, model).load_weights = load_weights
+            cast(Any, model).is_unused_checkpoint_weight = lambda name: (
+                model_is_unused is not None and model_is_unused(name)
+            ) or any(key in name for key in shared_keys)
             try:
                 model_loader.load_weights(model, draft_model_config)
             finally:
                 del cast(Any, model).load_weights
+                del cast(Any, model).is_unused_checkpoint_weight
             if base_loader._has_online_quant(model):
                 base_loader.finalize_layerwise_processing(model, draft_model_config)
             base_loader.process_weights_after_loading(

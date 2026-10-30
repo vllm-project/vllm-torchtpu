@@ -658,7 +658,19 @@ class TpuPlatform(Platform):
         # backend for KV offloading without instantiating model layers.
         import vllm_torchtpu.layers.adapter.attention  # noqa: F401
 
+        # Lazy: importing vllm_torchtpu.layers loads the model layers, which need
+        # vllm.platforms while it is still loading (a cycle).
+        from vllm_torchtpu.layers.adapter.attention_backend import (
+            is_registered_attention_backend,
+        )
+
+        registered = is_registered_attention_backend(selected_backend)
         if attn_selector_config.use_mla:
+            if registered:
+                raise ValueError(
+                    f"--attention-backend {selected_backend.name.lower()} does not "
+                    "support MLA models; leave --attention-backend unset."
+                )
             selected_backend = AttentionBackendEnum.FLASH_ATTN_MLA
 
         supported_backends = [
@@ -666,10 +678,12 @@ class TpuPlatform(Platform):
             AttentionBackendEnum.CUSTOM,
             AttentionBackendEnum.FLASH_ATTN_MLA,
         ]
-        if selected_backend not in supported_backends:
-            logger.info(
-                "Cannot use %s backend on TPU. Setting to FLASH_ATTN.", selected_backend
-            )
+        if not registered and selected_backend not in supported_backends:
+            if selected_backend is not None:
+                logger.warning_once(
+                    "Cannot use %s backend on TPU. Setting to FLASH_ATTN.",
+                    selected_backend,
+                )
             selected_backend = AttentionBackendEnum.FLASH_ATTN
         logger.info("Using %s backend.", selected_backend.name)
         return selected_backend.get_path()
@@ -782,11 +796,25 @@ class TpuPlatform(Platform):
             PallasBatchedRPAAttentionBackend,
         )
 
-        backend = (
-            PallasBatchedRPAAttentionBackend
-            if vllm_config.attention_config.backend == AttentionBackendEnum.CUSTOM
-            else PallasAttentionBackend
+        # Lazy: importing vllm_torchtpu.layers loads the model layers, which need
+        # vllm.platforms while it is still loading (a cycle).
+        from vllm_torchtpu.layers.adapter.attention_backend import (
+            is_registered_attention_backend,
         )
+
+        selected_backend = vllm_config.attention_config.backend
+        if is_registered_attention_backend(selected_backend):
+            assert selected_backend is not None
+            backend = selected_backend.get_class()
+            if not issubclass(backend, PallasAttentionBackend):
+                raise TypeError(
+                    f"--attention-backend {selected_backend.name.lower()} resolves "
+                    f"to {backend.__qualname__}, not a PallasAttentionBackend."
+                )
+        elif selected_backend == AttentionBackendEnum.CUSTOM:
+            backend = PallasBatchedRPAAttentionBackend
+        else:
+            backend = PallasAttentionBackend
         supported = [layout.name for layout in backend.supported_kv_cache_layouts()]
         if (
             vllm_config.model_config is not None
@@ -1126,6 +1154,16 @@ class TpuPlatform(Platform):
                 multihost_backend,
             )
             parallel_config.distributed_executor_backend = "uni"
+
+        # After the executor is chosen: whether it starts processes decides
+        # whether a registered backend's name reaches them.
+        # Lazy: importing vllm_torchtpu.layers loads the model layers, which need
+        # vllm.platforms while it is still loading (a cycle).
+        from vllm_torchtpu.layers.adapter.attention_backend import (
+            check_attention_backend_config,
+        )
+
+        check_attention_backend_config(vllm_config)
 
         if envs.DP_SCHED_ENABLED and parallel_config.data_parallel_size > 1:
             dp_sched_cls = "vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"
