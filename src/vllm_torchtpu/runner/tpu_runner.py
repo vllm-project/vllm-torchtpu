@@ -130,6 +130,7 @@ from vllm_torchtpu.models.parallel_requirements import requires_dp_collectives
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
+from vllm_torchtpu.platforms.bucket_drop import drop_buckets
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
 from vllm_torchtpu.runner import greedy_top_tokens
@@ -1088,8 +1089,10 @@ class TPUModelRunner(GPUModelRunner):
                 pin_memory=PIN_MEMORY,
             )
         self.arange_np = np.arange(self.max_num_tokens, dtype=np.int64)
-        self.num_reqs_paddings = _get_req_paddings(
-            min_req_size=MIN_NUM_SEQS, max_req_size=self.max_num_reqs
+        self.num_reqs_paddings = drop_buckets(
+            _get_req_paddings(min_req_size=MIN_NUM_SEQS, max_req_size=self.max_num_reqs),
+            envs.TPU_REQ_BUCKET_DROP,
+            "num_reqs",
         )
 
         # Pallas SMEM-aware num_reqs caps.

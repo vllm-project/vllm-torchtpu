@@ -141,6 +141,8 @@ if TYPE_CHECKING:
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_TOKEN_BUCKET_LINEAR: bool = False
+    TPU_TOKEN_BUCKET_DROP: list[int] = []
+    TPU_REQ_BUCKET_DROP: list[int] = []
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
     TPU_PP_LAZY_PUSH: bool = False
@@ -1147,6 +1149,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Add linear token buckets above a quarter of the token budget, for
     # prompt-sized steps (platforms/tpu_platform.py _get_linear_token_paddings).
     "TPU_TOKEN_BUCKET_LINEAR": env_bool("TPU_TOKEN_BUCKET_LINEAR"),
+    # Token / num_reqs padding buckets to leave out (never the largest). Every
+    # loaded bucket holds host memory for the life of the worker; a step that
+    # would have used a dropped bucket pads up to the next kept one, which
+    # every warmup loop compiles from the same lists.
+    "TPU_TOKEN_BUCKET_DROP": lambda: [
+        int(v) for v in os.getenv("TPU_TOKEN_BUCKET_DROP", "").split(",") if v.strip()
+    ],
+    "TPU_REQ_BUCKET_DROP": lambda: [
+        int(v) for v in os.getenv("TPU_REQ_BUCKET_DROP", "").split(",") if v.strip()
+    ],
     # Pipeline parallelism: size prefill chunks by a per-step time budget
     # instead of a token budget (core/pp_chunks.py). 0 keeps token budgets.
     "TPU_PP_DYNAMIC_CHUNKS": env_bool("TPU_PP_DYNAMIC_CHUNKS", default=True),

@@ -21,6 +21,7 @@ from vllm.platforms.interface import Platform, PlatformEnum
 from vllm_torchtpu import envs, patch_registry
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.parallel_requirements import requires_dp_collectives
+from vllm_torchtpu.platforms.bucket_drop import drop_buckets
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.pp_validation import validate_pipeline_parallel_config
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
@@ -802,6 +803,14 @@ class TpuPlatform(Platform):
             )
         else:
             compilation_config.compile_sizes = sorted(compilation_config.compile_sizes)
+        compilation_config.compile_sizes = cast(
+            list[int | str],
+            drop_buckets(
+                [int(x) for x in compilation_config.compile_sizes],
+                envs.TPU_TOKEN_BUCKET_DROP,
+                "token",
+            ),
+        )
 
         if envs.TPU_MOE_SEQUENCE_PARALLEL:
             _configure_sequence_parallel_moe(vllm_config)
