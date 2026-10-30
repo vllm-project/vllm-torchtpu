@@ -18,6 +18,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.gdn.v3.config import GDNConfig
+from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput
 
 _COMPACT_TILE_TOKENS = 128
 
@@ -84,3 +85,11 @@ def compact_qkv_input(
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
         name="gdn_compact_qkv_input",
     )(qkv)
+
+
+def prepare_gdn_input(qkv: jax.Array) -> jax.Array | Conv1DInput:
+    """Prepare a shard-local projection when its conversion tiles fit."""
+    tokens, width = qkv.shape
+    if not supports_compact_qkv((tokens, width), qkv.dtype):
+        return qkv
+    return Conv1DInput(compact_qkv_input(qkv), qkv.dtype)

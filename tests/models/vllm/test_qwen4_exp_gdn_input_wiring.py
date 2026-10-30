@@ -18,7 +18,7 @@ import pytest
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput
-from vllm_torchtpu.models.vllm.qwen4_exp import gdn
+from vllm_torchtpu.kernels.qwen4_exp import gdn_input as gdn
 
 
 @pytest.fixture(autouse=True)
@@ -68,9 +68,10 @@ def test_qwen_prepared_input_uses_real_torch_bridge_and_preserves_state():
     config = NS(cache_config=NS(block_size=1664))
     operators = []
     with set_vllm_model_wrapper_context(mesh=mesh, vllm_config=config):
-        for cls in (VllmGatedDeltaNetAttention, gdn.Qwen4ExpGatedDeltaNetAttention):
+        for preparation in (None, gdn.prepare_gdn_input):
             # The constructor and checkpoint loader are outside this bridge test.
-            attn = cls.__new__(cls)
+            attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
+            attn._pooled_input_preparer = preparation
             attn.num_k_heads, attn.num_v_heads, attn.tp_size = 16, 48, 1
             attn.gqa_interleaved_layout = False
             attn.head_k_dim = attn.head_v_dim = 128

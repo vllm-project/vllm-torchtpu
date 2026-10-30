@@ -1062,7 +1062,7 @@ def test_decoder_consumes_typed_shared_options(monkeypatch, tmp_path):
     for name in ("get_tp_group", "get_dp_group"):
         monkeypatch.setattr(qwen4_model, name, lambda: group)
     monkeypatch.setattr(
-        qwen4_model, "Qwen4ExpGatedDeltaNetAttention", lambda *a, **kw: nn.Identity()
+        qwen4_model, "QwenGatedDeltaNetAttention", lambda *a, **kw: nn.Identity()
     )
     monkeypatch.setattr(
         qwen4_model, "Qwen3NextSparseMoeBlock", lambda **kw: nn.Identity()

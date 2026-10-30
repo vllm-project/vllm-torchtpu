@@ -327,7 +327,7 @@ def test_model_uses_true_tp_ep_and_embedding_geometry(
     monkeypatch.setattr(model, "Qwen4ExpPooledPLE", ple)
     monkeypatch.setattr(model, "Qwen3NextSparseMoeBlock", moe)
     gdn = Mock(side_effect=lambda *a, **kw: nn.Identity())
-    monkeypatch.setattr(model, "Qwen4ExpGatedDeltaNetAttention", gdn)
+    monkeypatch.setattr(model, "QwenGatedDeltaNetAttention", gdn)
     monkeypatch.setattr(model, "GatedResidual", lambda *a, **kw: nn.Identity())
     model.Qwen4ExpDecoderLayer(cfg, 3, "model.layers.3")
     assert qsa.call_args.kwargs["tp_size"] == tp
@@ -953,7 +953,7 @@ def test_decoder_zeroes_unwritten_padding_before_standard_moe():
     nn.Module.__init__(layer)
     layer.ple = None
     layer.layer_type = "linear_attention"
-    layer.linear_attn = nn.Identity()
+    layer.add_module("linear_attn", nn.Identity())
     layer.attn_hyper_connection = Residual()
     layer.mlp_hyper_connection = Residual()
     layer.mlp = nn.Identity()
