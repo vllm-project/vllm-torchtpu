@@ -39,6 +39,7 @@ def main_kernel(
     num_row_subchunks: int,
     num_streams: int,
     top_k: int,
+    offset: int,
 ):
     tpu_info = pltpu.get_tpu_info()
     sc_info = tpu_info.sparse_core
@@ -48,7 +49,9 @@ def main_kernel(
     row_subchunk_size = num_simd_lanes
     row_chunk_size = row_subchunk_size * num_row_subchunks
     block_size = row_chunk_size * num_cores
-    num_blocks = pl.cdiv(indices_hbm_ref.shape[0], block_size)
+    num_blocks = pl.cdiv(nope_out_hbm_ref.shape[0], block_size)
+    # Index blocks are `row_chunk_size` entries, one top-k period each.
+    offset_blocks = offset // row_chunk_size
 
     core_index = lax.axis_index((core_axis_name, subcore_axis_name))
 
@@ -188,7 +191,7 @@ def main_kernel(
         in_specs=(
             pl.BlockSpec(
                 (row_chunk_size,),
-                lambda b: (b * num_cores + core_index,),
+                lambda b: (b * num_cores + core_index + offset_blocks,),
             ),
             pl.BlockSpec(
                 (row_subchunk_size,),
@@ -198,7 +201,7 @@ def main_kernel(
     )(indices_hbm_ref, valid_indices_ref)
 
 
-@functools.partial(jax.jit, static_argnames=("top_k",))
+@functools.partial(jax.jit, static_argnames=("top_k", "offset", "size"))
 def csa_gather(
     nope_cache: jax.Array,
     rope_cache: jax.Array,
@@ -206,6 +209,8 @@ def csa_gather(
     num_valid_indices: jax.Array | None = None,
     *,
     top_k: int = 1024,
+    offset: int = 0,
+    size: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Fused SparseCore gather of the nope and rope caches.
 
@@ -214,14 +219,18 @@ def csa_gather(
         (4, 128) uint8 nope slab (see `csa_cache_layout`).
       rope_cache: (total_pages, page_size // 4, 128) int32, 32 words per token
         (see `csa_cache_layout`).
-      indices: (N,) int32. Token indices into the caches; N a multiple of
-        top_k.
+      indices: (M,) int32. Token indices into the caches; entries
+        [offset, offset + N) are gathered.
       num_valid_indices: Optional (1,) or scalar int32. Number of valid indices to
         gather, a multiple of top_k. A subcore skips every top_k period that
         starts at or past this count, leaving those output rows unwritten.
       top_k: the consumer's row block (the attention kernel's top-k), a
         multiple of 128. `rope_out` pairs entry i of a period with entry
         i + top_k // 2.
+      offset: the first entry of `indices` to gather, a multiple of top_k.
+        Reading the indices in place spares XLA a copy of the slice.
+      size: N, the number of entries to gather, a multiple of top_k; all of
+        `indices` past `offset` if None.
 
     Returns:
       Both outputs are int32 with 128 lanes, which XLA lays out byte-for-byte
@@ -250,7 +259,7 @@ def csa_gather(
     rope_cache = rope_cache.reshape(-1, csa_cache_layout.ROPE_WORDS)
     sc_info = pltpu.get_tpu_info().sparse_core
     assert sc_info is not None, "SparseCore info is missing."
-    out_size = indices.size
+    out_size = indices.size - offset if size is None else size
     num_simd_lanes = sc_info.num_lanes
     num_cores = sc_info.num_cores * sc_info.num_subcores
     row_subchunk_size = num_simd_lanes
@@ -266,16 +275,21 @@ def csa_gather(
     # pipeline step to keep multiple gather DMAs in flight.
     # See `outer_pipeline` for details.
     num_streams = 4
-    assert out_size % top_k == 0
+    assert out_size % top_k == 0 and offset % top_k == 0
     num_row_subchunks = top_k // row_subchunk_size
     row_chunk_size = row_subchunk_size * num_row_subchunks
     block_size = row_chunk_size * num_cores
     out_pad_size = ((out_size + block_size - 1) // block_size) * block_size - out_size
-    if out_pad_size:
+    # The kernel reads whole index blocks, so the indices must reach the end
+    # of the last one.
+    index_pad_size = offset + out_size + out_pad_size - indices.size
+    if index_pad_size > 0:
         # spread the padding to avoid hotspots
         num_tokens = nope_cache.shape[0]
-        pad = (jnp.arange(out_pad_size, dtype=indices.dtype) * 104729) % num_tokens
-        indices = jnp.concatenate([indices, pad])
+        pad = (jnp.arange(index_pad_size, dtype=indices.dtype) * 104729) % num_tokens
+        # Copy only the window, not the indices before it.
+        indices = jnp.concatenate([indices[offset:], pad])
+        offset = 0
     vector_mesh = plsc.VectorSubcoreMesh(
         num_cores=sc_info.num_cores,
         num_subcores=sc_info.num_subcores,
@@ -292,6 +306,7 @@ def csa_gather(
                 num_row_subchunks=num_row_subchunks,
                 num_streams=num_streams,
                 top_k=top_k,
+                offset=offset,
             ),
             out_type=(
                 jax.ShapeDtypeStruct(

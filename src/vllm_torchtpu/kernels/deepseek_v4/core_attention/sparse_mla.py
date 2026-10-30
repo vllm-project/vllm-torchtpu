@@ -1484,9 +1484,11 @@ def sparse_ragged_paged_attention(
         gathered_nope_buffer, gathered_rope_buffer = csa_gather.csa_gather(
             cache_kv_nope,
             cache_kv_rope,
-            gather_indices[start_pos * topk : (start_pos + chunk_size) * topk],
+            gather_indices,
             num_valid_indices=num_valid_indices,
             top_k=topk,
+            offset=start_pos * topk,
+            size=chunk_size * topk,
         )
         gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, topk, -1)
         gathered_rope_buffer = gathered_rope_buffer.reshape(chunk_size, topk // 4, -1)
