@@ -1071,6 +1071,16 @@ def export(
     dp_size = int(getattr(cfg, "data_parallel_size", 1) or 1)
     pp_size = int(getattr(cfg, "pipeline_parallel_size", 1) or 1)
     all_params = model.abstract_params()
+    if cfg.speculative_config:
+        rows = cfg.max_num_seqs * (
+            int(cfg.speculative_config["num_speculative_tokens"]) + 1
+        )
+        if max(cfg.req_buckets) < rows:
+            raise ValueError(
+                f"the largest request bucket ({max(cfg.req_buckets)}) is below the "
+                f"{rows} LM-head rows a speculative step can take (max_num_seqs x "
+                "(num_speculative_tokens + 1)); pass larger --req-buckets"
+            )
     mtp_requested = _mtp_requested(cfg)
     params_map = _params_read_by_forward(
         model,

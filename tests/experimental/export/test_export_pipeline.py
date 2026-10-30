@@ -592,7 +592,8 @@ def test_metadata_declares_the_speculative_config_it_was_exported_with(
         max_num_seqs=8,
         max_model_len=64,
         token_buckets=(8,),
-        req_buckets=(4, 8),
+        # 8 requests verifying 4 drafts each: 40 LM-head rows.
+        req_buckets=(8, 40),
         emit_byte_tokenizer=True,
         speculative_config=speculative,
     )
@@ -2090,8 +2091,8 @@ def _mock_lower_reading_used_args(
     )
 
 
-def _export_mtp(tmp_path: Path, model_cls: type = _TinyMtpExportableLLM) -> str:
-    cfg = api.TextOnlyLLMExportConfig(
+def _mtp_config() -> api.TextOnlyLLMExportConfig:
+    return api.TextOnlyLLMExportConfig(
         model_name="tiny-torch",
         vocab_size=32,
         hidden_size=16,
@@ -2104,10 +2105,14 @@ def _export_mtp(tmp_path: Path, model_cls: type = _TinyMtpExportableLLM) -> str:
         max_num_seqs=8,
         max_model_len=64,
         token_buckets=(8, 16),
-        req_buckets=(4, 8),
+        req_buckets=(4, 8, 16),
         emit_byte_tokenizer=True,
         speculative_config={"method": "mtp", "num_speculative_tokens": 1},
     )
+
+
+def _export_mtp(tmp_path: Path, model_cls: type = _TinyMtpExportableLLM) -> str:
+    cfg = _mtp_config()
     out_dir = str(tmp_path / "exported")
     with mock.patch.object(
         tpu_lowering,
@@ -2174,6 +2179,19 @@ def test_mtp_draft_follows_the_contract(tmp_path) -> None:
     assert mtp_state["index"] == len(target_states)
     draft = [o for o in variant["outputs"] if o["name"] == "draft_tokens"]
     assert draft[0]["shape"] == [8, 1] and draft[0]["dtype"] == "i32"
+
+
+def test_a_speculative_export_needs_request_buckets_for_every_verify_row(
+    tmp_path,
+) -> None:
+    # 8 requests verifying 1 draft each run the LM head on 16 rows.
+    model = _TinyMtpExportableLLM(
+        dataclasses.replace(
+            _TinyMtpExportableLLM(_mtp_config()).export_config, req_buckets=(4, 8)
+        )
+    )
+    with pytest.raises(ValueError, match="16 LM-head rows"):
+        exporter.export(model, str(tmp_path / "out"))
 
 
 def test_mtp_needs_a_model_that_drafts(tmp_path) -> None:
