@@ -269,6 +269,73 @@ def test_moe_gmm_uses_selected_ragged_gather_reduce(
         np.testing.assert_array_equal(args[3], valid)
 
 
+@pytest.mark.parametrize(
+    "configured_version,min_tokens,num_tokens,expected_path",
+    [
+        ("v2", 2048, 2048, "tensorcore"),
+        ("v2", 2048, 1024, "ep"),
+        ("v2", 0, 2048, "ep"),
+        ("v3", 2048, 2048, "ep"),
+    ],
+    ids=["v2-prefill", "v2-decode", "v2-disabled", "v3-kept"],
+)
+def test_moe_gmm_runs_large_v2_combine_on_tensorcore(
+    monkeypatch, configured_version, min_tokens, num_tokens, expected_path
+):
+    topk, hidden = 6, 256
+    routes = num_tokens * topk
+    calls = []
+
+    def fake_combine(path):
+        def combine(*args, **kwargs):
+            calls.append(path)
+            return jnp.zeros((num_tokens, hidden), jnp.bfloat16)
+
+        return combine
+
+    monkeypatch.setattr(fused_moe_gmm, "TC_COMBINE_MIN_TOKENS", min_tokens)
+    monkeypatch.setattr(
+        fused_moe_gmm, f"ragged_gather_reduce_{configured_version}", fake_combine("ep")
+    )
+    monkeypatch.setattr(
+        fused_moe_gmm,
+        "ragged_gather_reduce",
+        fused_moe_gmm._select_ragged_gather_reduce(configured_version),
+    )
+    monkeypatch.setattr(fused_moe_gmm, "gather_unpermute", fake_combine("tensorcore"))
+    monkeypatch.setattr(fused_moe_gmm, "get_packing_factor", lambda *a, **k: 1)
+
+    def run(source):
+        gmm_outputs = iter([jnp.ones((routes, 4), jnp.bfloat16), source])
+        monkeypatch.setattr(
+            fused_moe_gmm, "gmm_wrapper", lambda *args, **kwargs: next(gmm_outputs)
+        )
+        indices = jnp.arange(routes, dtype=jnp.int32)
+        return fused_moe_gmm.moe_gmm(
+            x=jnp.ones((routes, 4), jnp.bfloat16),
+            w1=jnp.ones((1, 4, 4), jnp.bfloat16),
+            w1_scale=None,
+            w1_bias=None,
+            w2=jnp.ones((1, 4, hidden), jnp.bfloat16),
+            w2_scale=None,
+            w2_bias=None,
+            group_sizes=jnp.array([routes], dtype=jnp.int32),
+            argsort_revert_indices=indices,
+            topk_weights_flat=jnp.ones((routes,), jnp.bfloat16),
+            valid_mask_flat=jnp.ones((routes,), jnp.bool_),
+            token_indices_sorted=indices // topk,
+            activation="silu",
+            num_tokens=num_tokens,
+            topk=topk,
+            use_ep=True,
+            use_sparse_core=True,
+            onehot_moe_permute_threshold=0,
+        )
+
+    jax.eval_shape(run, jax.ShapeDtypeStruct((routes, hidden), jnp.bfloat16))
+    assert calls == [expected_path]
+
+
 def _require_tpu() -> None:
     try:
         backend = jax.default_backend()

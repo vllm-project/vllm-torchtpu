@@ -29,6 +29,10 @@ from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     gmm_v2,
     gmm_v2_fused_mlp,
 )
+from vllm_torchtpu.kernels.megablox.moe_gather_unpermute import (
+    can_use_gather_unpermute,
+    gather_unpermute,
+)
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
@@ -60,7 +64,8 @@ def _select_ragged_gather_reduce(version: str):
 
 
 # The server sets its environment before importing model code, so the selected
-# EP combine remains fixed for the process lifetime. The default is v2; set
+# EP combine remains fixed for the process lifetime. The default is v2 (run on
+# the TensorCore at TC_COMBINE_MIN_TOKENS tokens and above); set
 # RAGGED_GATHER_REDUCE_VERSION=v3 to select the destination-major kernel for EP.
 # The non-EP combine in moe_gmm selects that kernel directly.
 ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VERSION)
@@ -68,6 +73,11 @@ ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VE
 _ONEHOT_AUTO_CAP = 512
 # Fixed at import, like the other MoE algorithm selectors.
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
+# Smallest EP token count whose v2 combine runs on the TensorCore (0: never).
+# On DSv4-Flash DP8 the static estimate at 2048 tokens is ~45 us (kernel plus
+# routing tables) against ~90 us of SparseCore v2 plus convert; decode at the
+# 1024-token bucket keeps v2. A decode step of 2048 tokens takes it too.
+TC_COMBINE_MIN_TOKENS = envs.TPU_MOE_TC_COMBINE_MIN_TOKENS
 # Fixed at import: build the MoE permutation from one packed sort.
 _SINGLE_SORT = envs.TPU_MOE_SINGLE_SORT
 # Above 2,048 routed rows, the inverse-permutation scatter costs more than
@@ -594,6 +604,22 @@ def moe_gmm(
                 axis=1
             )
             return (combine @ gmm2_res).astype(x.dtype)
+        if (
+            ragged_gather_reduce is ragged_gather_reduce_v2
+            and 0 < TC_COMBINE_MIN_TOKENS <= num_tokens
+            and can_use_gather_unpermute(gmm2_res, num_tokens, topk)
+        ):
+            # Same result as v2's SparseCore kernel (v2 falls back to XLA only
+            # for inputs far smaller than this). The TensorCore would otherwise
+            # idle while the SparseCore runs v2, and it sums the rows sooner.
+            return gather_unpermute(
+                gmm2_res,
+                argsort_revert_indices,
+                topk_weights_flat,
+                valid_mask_flat,
+                num_tokens=num_tokens,
+                topk=topk,
+            ).astype(x.dtype)
         return ragged_gather_reduce(
             gmm2_res,
             argsort_revert_indices,
