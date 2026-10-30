@@ -88,9 +88,7 @@ def routed_experts(
         global_keys = jnp.where(topk_probabilities != 0, topk_ids, 896).reshape(-1)
         _, global_counts = counting_positions(global_keys, 897)
         counts = jax.lax.dynamic_slice(global_counts, (first_expert,), (local_experts,))
-        global_route_max = (
-            global_counts[:896].reshape(896 // local_experts, local_experts).sum(axis=1).max()
-        )
+        global_route_max = global_counts[:896].reshape(16, 56).sum(axis=1).max()
     else:
         _, all_counts = counting_positions(keys, local_experts + 1)
         counts = all_counts[:local_experts]
@@ -188,8 +186,8 @@ def moe_local_routed(
     if weights["latent_down"].shape[-2:] != (7168, 4096):
         raise ValueError("latent projection weights must use replicated SP layout")
     local_experts = weights["expert_gu"].shape[-3]
-    if local_experts not in (56, 112):
-        raise ValueError("Packed prefill MoE requires EP16/TP2 or EP8/TP4 expert weights")
+    if local_experts != 56:
+        raise ValueError("Packed prefill MoE requires EP16/TP2 expert weights")
     expert_tp = 32 * local_experts // 896
     tokens = local_tokens * 32
     logits = jax.lax.dot_general(
