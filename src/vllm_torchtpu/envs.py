@@ -112,6 +112,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_LEAN: bool = False
     VLLM_TPU_QSA_INDEXER_REQ_SHARD: bool = False
     VLLM_TPU_QSA_MAIN_KV_DCP: int = 0
+    VLLM_TPU_QSA_MTP_KV_DCP: bool = False
     VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE: bool = False
     VLLM_TPU_QSA_DECODE_LEAN_FETCH: bool = False
     VLLM_TPU_QSA_DECODE_SLOT_READ: bool = False
@@ -759,6 +760,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # KV head (2; 0/1 = off): each rank stores and attends half the tokens,
     # the pair's partial attention is LSE-combined.
     "VLLM_TPU_QSA_MAIN_KV_DCP": env_nonnegative_int("VLLM_TPU_QSA_MAIN_KV_DCP", 0),
+    # With VLLM_TPU_QSA_MAIN_KV_DCP: the MTP draft layers' main KV split the
+    # same way (otherwise the draft keeps whole pages).
+    "VLLM_TPU_QSA_MTP_KV_DCP": env_bool("VLLM_TPU_QSA_MTP_KV_DCP"),
     # Qwen4-exp pooled QSA decode/verify steps: write main KV, compressed
     # indexer keys and the raw ring/tags of a layer with one Pallas kernel
     # whose row DMAs are all in flight together, and read the ring with every
