@@ -30,6 +30,11 @@ Environment: `MK_SMOKE_MODE` (`decode`, `mtp` or `both`, default `both`),
 from the local Hugging Face cache, `HF_HUB_CACHE`), `MK_SMOKE_MEGAKERNEL`
 (extra `VLLM_TPU_MEGAKERNEL` settings, e.g. `profile=qwen35-baseline`),
 `MK_SMOKE_PORT` (default 8123).
+
+Run it from a checkout of the repository (e.g. the recipe's NFS checkout, any
+working directory): it serves that checkout's `src/` (first on `PYTHONPATH`),
+checks first that `vllm_torchtpu` resolves there and not to the image's
+installed package, and writes nothing outside `/tmp`.
 """
 
 from __future__ import annotations
@@ -39,6 +44,7 @@ import glob
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -131,17 +137,46 @@ def _stop(proc: subprocess.Popen[str]) -> None:
             proc.wait(timeout=60)
 
 
+def tree_env() -> dict[str, str]:
+    """The environment that serves this tree's `vllm_torchtpu`: its `src/`
+    first on `PYTHONPATH` (ahead of the image's installed package)."""
+    py_path = os.pathsep.join(p for p in (SRC_ROOT, os.environ.get("PYTHONPATH")) if p)
+    return dict(os.environ, PYTHONPATH=py_path)
+
+
+def check_tree_is_served() -> str:
+    """Fail unless `vllm_torchtpu` resolves under this tree for the interpreter
+    `vllm serve` runs (the image's installed package must not shadow it)."""
+    python = sys.executable
+    vllm = shutil.which("vllm")
+    if vllm is not None:
+        with open(vllm, encoding="utf-8", errors="replace") as f:
+            first = f.readline().strip()
+        if first.startswith("#!") and os.path.isfile(first[2:].split()[0]):
+            python = first[2:].split()[0]
+    out = subprocess.run(
+        [python, "-c", "import vllm_torchtpu; print(vllm_torchtpu.__file__)"],
+        env=tree_env(),
+        cwd="/tmp",
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    if not Path(out).resolve().is_relative_to(Path(SRC_ROOT).resolve()):
+        raise RuntimeError(
+            f"{python} imports vllm_torchtpu from {out}, not from this tree "
+            f"({SRC_ROOT}): the image's installed package shadows it"
+        )
+    return out
+
+
 def run_mode(mode: str, ckpt: str, port: int) -> dict[str, Any]:
     """Serve `ckpt` in `mode` and check the megakernel's log lines."""
     mk_cfg = f"stats_period_s={STATS_PERIOD_S}"
     if extra := os.environ.get("MK_SMOKE_MEGAKERNEL"):
         mk_cfg = f"{extra},{mk_cfg}"
-    # Serve this tree's `vllm_torchtpu` (a source checkout mounted into the
-    # image shadows the installed package).
-    py_path = os.pathsep.join(p for p in (SRC_ROOT, os.environ.get("PYTHONPATH")) if p)
     env = dict(
-        os.environ,
-        PYTHONPATH=py_path,
+        tree_env(),
         MODEL=ckpt,
         MODE=mode,
         PORT=str(port),
@@ -221,9 +256,10 @@ def main() -> int:
     modes = ["decode", "mtp"] if mode == "both" else [mode]
     if any(m not in ("decode", "mtp") for m in modes):
         raise SystemExit(f"MK_SMOKE_MODE must be decode, mtp or both, got {mode!r}")
+    served = check_tree_is_served()
     ckpt = _checkpoint()
     port = int(os.environ.get("MK_SMOKE_PORT", "8123"))
-    _log(f"[MK_SMOKE] modes={modes} ckpt={ckpt}")
+    _log(f"[MK_SMOKE] modes={modes} ckpt={ckpt} vllm_torchtpu={served}")
     results = [run_mode(m, ckpt, port) for m in modes]
     _log("=== MK_REAL_CKPT_SMOKE_SUMMARY_BEGIN ===")
     _log(json.dumps(results, indent=1, sort_keys=True))

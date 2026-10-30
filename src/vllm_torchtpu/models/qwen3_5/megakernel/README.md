@@ -84,12 +84,30 @@ python3 src/vllm_torchtpu/models/qwen3_5/megakernel/serving/run_real_ckpt_smoke.
 
 It starts `serve.sh` in each mode, sends greedy completions, and checks the
 server's megakernel log lines (plugin loaded, program bound, megakernel steps
-in the step mix, no decline). On the cloud-devkit cluster, submit the recipe
-`nanwei-mk-real-ckpt-smoke` (a copy is `serving/mk-real-ckpt-smoke.yml`): it
-runs the script on a v7x 2x2x1 host with the shared checkpoint cache, from the
-checkout `NFS_SRC_PATH` names, with
-`TEST_PATH=src/vllm_torchtpu/models/qwen3_5/megakernel/serving/run_real_ckpt_smoke.py`
-(the default).
+in the step mix, no decline). It serves the checkout it runs from (its `src/`
+first on `PYTHONPATH`), fails up front if the image's installed
+`vllm_torchtpu` would shadow it, and writes nothing outside `/tmp`.
+
+On the cloud-devkit cluster, the recipe `nanwei-mk-real-ckpt-smoke` runs it on
+a v7x 2x2x1 host with the shared checkpoint cache: it runs
+`cd /root/cloud-devkit/vllm-torchtpu && python3 -u ${TEST_PATH}`, where that
+directory is an NFS export of a checkout of this repository and `TEST_PATH` is
+any repo-relative path whose basename matches `run_real_ckpt_smoke*.py`:
+
+```bash
+# Stage a checkout on the shared NFS (example).
+git -C /mnt/nfs_test/agentx-cache/<you>_mk_smoke checkout <sha>
+cdk job create nanwei-mk-real-ckpt-smoke \
+  NFS_SRC_PATH=/share/agentx-cache/<you>_mk_smoke \
+  TEST_PATH=src/vllm_torchtpu/models/qwen3_5/megakernel/serving/run_real_ckpt_smoke.py \
+  -t mk-smoke
+cdk job log <job-id>
+```
+
+The recipe name comes from the cloud-devkit change under review;
+`serving/mk-real-ckpt-smoke.yml` is the same JobSet, for a cloud-devkit
+checkout that registers it locally. Optional recipe variables: `IMAGE`, `CPU`,
+`MEMORY`, `DSHM_SIZE`, `NFS_SERVER_IP`.
 
 `MK_SMOKE_MODE=decode|mtp|both`, `MK_SMOKE_CKPT`, and `MK_SMOKE_MEGAKERNEL`
 (e.g. `profile=qwen35-baseline`) adjust a run.
