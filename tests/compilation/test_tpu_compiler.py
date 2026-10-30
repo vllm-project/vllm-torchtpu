@@ -836,9 +836,21 @@ class TestPrecompileProgress:
         import json
         import os
 
-        with open(os.path.join(os.path.dirname(peer), ".precompile_progress"), "a") as f:
-            f.write(json.dumps(dict(event="start", prefix="backbone", subgraph=9,
-                                    t=time.time(), host="another-pod")) + "\n")
+        with open(
+            os.path.join(os.path.dirname(peer), ".precompile_progress"), "a"
+        ) as f:
+            f.write(
+                json.dumps(
+                    dict(
+                        event="start",
+                        prefix="backbone",
+                        subgraph=9,
+                        t=time.time(),
+                        host="another-pod",
+                    )
+                )
+                + "\n"
+            )
         fresh = PrecompileProgress(own, subgraph=5)
         assert fresh.owner_status(0, 512, time.time() - 0.5) == "pending"
 
@@ -856,6 +868,7 @@ class TestPrecompileProgress:
         adaptor = tc.TpuCompilerAdaptor.__new__(tc.TpuCompilerAdaptor)
         adaptor.cache_dir = own
         waiter = tc.PrecompileProgress(own, subgraph=1)
+
         # Owner moved on to subgraph 2 after we started waiting: diverged.
         def owner_skips():
             time.sleep(0.05)
@@ -881,3 +894,125 @@ class TestPrecompileProgress:
             tc.set_peer_owner(0, 512)
             with pytest.raises(tc.PeerDivergedError, match="rank 0 reported nothing"):
                 adaptor._replay_from_peer("artifact_z", None, False, "fp")
+
+    def test_owner_records_isolates_dp_ranks_with_tuple_owner(
+        self, tmp_path, monkeypatch
+    ):
+        import threading
+        import time
+
+        from vllm_torchtpu.compilation import tpu_compiler as tc
+
+        root = tmp_path / "hash"
+        dp1 = str(root / "rank_0_1" / "backbone")
+        dp2 = str(root / "rank_0_2" / "backbone")
+        dp3 = str(root / "rank_0_3" / "backbone")
+        for d in (dp1, dp2, dp3):
+            os.makedirs(d, exist_ok=True)
+        monkeypatch.setattr(tc, "_PEER_POLL_S", 0.01)
+
+        since = time.time() - 0.1
+        # DP rank 1 already moved on to subgraph 2 without starting subgraph 1,
+        # while DP rank 3 is actively compiling subgraph 1.
+        tc.PrecompileProgress(dp1, subgraph=2).started()
+        tc.PrecompileProgress(dp3, subgraph=1).started()
+
+        waiter = tc.PrecompileProgress(dp2, subgraph=1)
+        assert waiter.owner_status((0, 3), 512, since) == "pending"
+        assert waiter.owner_status((0, 1), 512, since) == "skipped"
+
+        def dp1_moves_ahead():
+            time.sleep(0.05)
+            tc.PrecompileProgress(dp1, subgraph=3).started()
+
+        threading.Thread(target=dp1_moves_ahead).start()
+        adaptor = tc.TpuCompilerAdaptor.__new__(tc.TpuCompilerAdaptor)
+        adaptor.cache_dir = dp2
+        with tc.wait_for_peer_artifact(2.0, waiter):
+            tc.set_peer_owner((0, 1), 512)
+            with pytest.raises(
+                tc.PeerDivergedError, match=r"rank 0 \(dp 1\) skipped subgraph 1"
+            ):
+                adaptor._replay_from_peer("artifact_dp", None, False, "fp")
+
+
+def test_load_refuses_cross_rank_or_unsalted_artifact_for_rank_dependent_graph(
+    tmp_path, monkeypatch
+):
+    """Warm-start `load()` must reject a rank-dependent handle saved by another
+    rank (or saved unsalted before rank salting existed), recompile for this
+    rank, and overwrite the poisoned cache file so later boots replay cleanly."""
+    import pickle
+    import shutil
+
+    import torch
+    import torch.distributed as dist
+    import vllm.model_executor.models.utils  # noqa: F401  registers the op
+    from vllm.config.utils import Range
+
+    from vllm_torchtpu.compilation import tpu_compiler
+
+    (a, b), _, compiled, replayed = TestTpuCompilerCache._peer_compilers(
+        tmp_path, monkeypatch, peer_replay="0"
+    )
+    active_rank = {"r": 0}
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_rank", lambda *args, **kwargs: active_rank["r"])
+
+    class RankCompiled:
+        def __init__(self, r):
+            self.r = r
+
+        def __call__(self, *args):
+            return (self.r,)
+
+        def serialize(self):
+            return f"entry-from-rank-{self.r}"
+
+    def active_backend(graph, example_inputs):
+        compiled.append(active_rank["r"])
+        return RankCompiled(active_rank["r"])
+
+    monkeypatch.setattr(tpu_compiler, "_tpu_backend", active_backend)
+
+    def sharded(x):
+        return torch.ops.vllm.sequence_parallel_chunk_impl(x) * 2
+
+    compile_range = Range(start=1, end=4096)
+
+    # Rank 0 compiles and saves its rank-0-salted artifact.
+    active_rank["r"] = 0
+    graph_r0 = torch.fx.symbolic_trace(sharded)
+    _, handle_r0 = a.compile(graph_r0, [], {}, compile_range, key="artifact_sp")
+    assert compiled == [0]
+    key, path_r0, was_wrapped = handle_r0
+
+    # Poison rank 1's cache dir with rank 0's saved artifact (simulating a
+    # pre-existing cross-rank hard-link in a persistent cache).
+    os.makedirs(b.cache_dir, exist_ok=True)
+    path_r1 = os.path.join(b.cache_dir, key)
+    shutil.copyfile(path_r0, path_r1)
+
+    active_rank["r"] = 1
+    graph_r1 = torch.fx.symbolic_trace(sharded)
+    fn_r1 = b.load((key, path_r1, was_wrapped), graph_r1, [], 0, compile_range)
+    assert replayed == []
+    assert compiled == [0, 1]
+    assert fn_r1() == 1
+
+    # Self-healed: a second warm start on rank 1 now replays rank 1's own handle.
+    fn_r1_warm = b.load((key, path_r1, was_wrapped), graph_r1, [], 0, compile_range)
+    assert compiled == [0, 1]
+    assert replayed == ["entry-from-rank-1"]
+    assert fn_r1_warm() == "entry-from-rank-1"
+
+    # Also reject an older unsalted handle (`fingerprint=None`) on warm start.
+    with open(path_r1, "rb") as f:
+        unsalted = pickle.load(f)
+    unsalted.fingerprint = None
+    with open(path_r1, "wb") as f:
+        pickle.dump(unsalted, f)
+
+    b.load((key, path_r1, was_wrapped), graph_r1, [], 0, compile_range)
+    assert compiled == [0, 1, 1]
+    assert replayed == ["entry-from-rank-1"]
