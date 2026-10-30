@@ -37,6 +37,7 @@ def adversarial_topk(bits, k):
 def reference_kernel(monkeypatch, interpret):  # noqa: F811
     def scored(*args, return_scores=False, **kwargs):
         kwargs.update(enable_early_exit=False)
+        kwargs.pop("topk_backend", None)  # the reference selector stands in
         return streamindex.streamindex_topk(
             *args, topk_backend=ReferenceTopK(), return_scores=return_scores, **kwargs
         )
