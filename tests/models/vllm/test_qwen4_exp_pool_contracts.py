@@ -13,7 +13,6 @@
 # limitations under the License.
 
 from contextlib import nullcontext
-from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import Mock
@@ -30,7 +29,6 @@ from vllm_torchtpu.models.vllm.qwen4_exp.config import (
     validate_config,
 )
 from vllm_torchtpu.models.vllm.qwen4_exp.inputs import dummy_query_lengths
-from vllm_torchtpu.models.vllm.qwen4_exp.ple_host import host_available_memory
 from vllm_torchtpu.models.vllm.qwen4_exp.qsa import Qwen4ExpPooledQSABackend
 
 
@@ -119,39 +117,6 @@ def test_valid_geometry_has_no_checkpoint_page_or_token_bucket_gate():
 def test_dummy_lengths_respect_each_context_capacity(tokens, capacities, expected):
     actual = dummy_query_lengths(tokens, len(capacities), len(capacities), capacities)
     assert actual == expected
-
-
-@pytest.mark.parametrize("namespace", [False, True])
-def test_host_headroom_checks_nested_cgroup_and_ancestors(
-    monkeypatch, tmp_path, namespace
-):
-    mount = tmp_path / "cgroup"
-    member = mount / "team" / "job"
-    member.mkdir(parents=True)
-    (mount / "memory.max").write_text("max")
-    (mount / "team" / "memory.max").write_text("10000")
-    (mount / "team" / "memory.current").write_text("3000")
-    (member / "memory.max").write_text("20000")
-    (member / "memory.current").write_text("11000")
-    mount_root = "/container" if namespace else "/"
-    proc = {
-        "/proc/meminfo": "MemAvailable: 10000 kB\n",
-        "/proc/self/cgroup": "0::/team/job\n",
-        "/proc/self/mountinfo": (
-            f"42 1 0:1 {mount_root} {mount} rw - cgroup2 cgroup rw\n"
-        ),
-    }
-    read_text = Path.read_text
-
-    def read(path: Path, *args, **kwargs) -> str:
-        if str(path) in proc:
-            return proc[str(path)]
-        return read_text(path, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "read_text", read)
-    assert host_available_memory() == 7000
-    (mount / "team" / "memory.current").write_text("10001")
-    assert host_available_memory() == 0
 
 
 @pytest.mark.parametrize(

@@ -42,40 +42,6 @@ class SharedPLEOptions:
     participants: int
 
 
-def host_available_memory():
-    for line in Path("/proc/meminfo").read_text().splitlines():
-        if line.startswith("MemAvailable:"):
-            available = int(line.split()[1]) * 1024
-            for line in Path("/proc/self/cgroup").read_text().splitlines():
-                hierarchy, _, membership = line.split(":", 2)
-                if hierarchy != "0":
-                    continue
-                member = Path(membership)
-                for mount in Path("/proc/self/mountinfo").read_text().splitlines():
-                    description, _, filesystem = mount.partition(" - ")
-                    if filesystem.split()[0] != "cgroup2":
-                        continue
-                    fields = description.split()
-                    root = Path(fields[3])
-                    mountpoint = Path(fields[4].replace("\\040", " "))
-                    relative = member.relative_to(
-                        root if member.is_relative_to(root) else Path("/")
-                    )
-                    current = mountpoint / relative
-                    for directory in (current, *current.parents):
-                        if not directory.is_relative_to(mountpoint):
-                            break
-                        maximum = directory / "memory.max"
-                        if not maximum.exists():
-                            continue
-                        limit = maximum.read_text().strip()
-                        if limit != "max":
-                            used = int((directory / "memory.current").read_text())
-                            available = min(available, max(0, int(limit) - used))
-            return available
-    raise RuntimeError("PLE host capacity requires Linux MemAvailable")
-
-
 def shared_ple_options(
     launch: PLEHostLaunch, prefix: str, tp_rank: int, tp_size: int
 ) -> SharedPLEOptions:
