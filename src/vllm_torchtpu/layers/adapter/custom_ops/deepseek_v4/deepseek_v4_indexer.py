@@ -419,8 +419,6 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             *query.shape, self.wq_b.weight.shape[1], self.head_dim, quantize=True
         ):
             fused_op = None
-        if fused_op is None:
-            q, _ = self.wq_b(query)
 
         self.compressor(hidden_states, positions, rotary_emb)
 
@@ -470,6 +468,9 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
                 idx_q_start_loc,
                 idx_req_dist,
             )
+        # Projected at the fused op's place, so both paths lift the graph's
+        # inputs in one order and token buckets can share one trace.
+        q, _ = self.wq_b(query)
         return self.indexer_op(
             q,
             positions,
