@@ -89,7 +89,7 @@ def cp_lse_ag_out_rs(
         return (output, lse) if return_lse else output
 
     # TODO(weiyulin): Evaluate if we need LSE and reduce to be fp32.
-    with transforms.microbatching.pipeline_stage():
+    with transforms.resource("TC"):
         lse = lse.to(torch.float32)
         lses = group.all_gather(lse.unsqueeze(0).contiguous(), dim=0)
         merged_lse = torch.logsumexp(lses, dim=0)
@@ -111,7 +111,7 @@ def cp_lse_ag_out_rs(
             if rs_dtype is not None:
                 weighted = weighted.to(rs_dtype)
 
-    with transforms.microbatching.pipeline_stage():
+    with transforms.resource("SC"):
         if output.device.type == "tpu":
             merged = (
                 group.reduce_scatter(weighted, dim=0)

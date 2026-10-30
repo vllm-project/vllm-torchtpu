@@ -50,7 +50,7 @@ class TpuRowParallelLinear(RowParallelLinear):
         if not defer_bias and not transforms.is_microbatch_active():
             return super().forward(input_)
 
-        with transforms.microbatching.pipeline_stage():
+        with transforms.resource("TC"):
             if self.input_is_parallel:
                 input_parallel = input_
             else:
@@ -69,7 +69,7 @@ class TpuRowParallelLinear(RowParallelLinear):
             )
 
         if self.reduce_results and self.tp_size > 1:
-            with transforms.microbatching.pipeline_stage():
+            with transforms.resource("SC"):
                 output = tensor_model_parallel_all_reduce(output_parallel)
                 if defer_bias:
                     output = output + self.bias

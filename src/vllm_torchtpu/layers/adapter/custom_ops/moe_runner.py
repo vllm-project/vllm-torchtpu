@@ -152,13 +152,28 @@ class VllmMoERunner(MoERunner):
             return hidden_states
         return super()._maybe_combine(shared_output, hidden_states)
 
+    def _forward_impl(
+        self,
+        hidden_states,
+        router_logits,
+        shared_experts_input,
+        input_ids=None,
+    ):
+        with transforms.resource("TC"):
+            return super()._forward_impl(
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+            )
+
     def _maybe_reduce_final_output(
         self,
         shared_and_routed_output,
         og_hidden_dim_post_xform: int | None,
         fused_output_is_reduced: bool,
     ):
-        with transforms.microbatching.pipeline_stage():
+        with transforms.resource("SC"):
             return super()._maybe_reduce_final_output(
                 shared_and_routed_output,
                 og_hidden_dim_post_xform,

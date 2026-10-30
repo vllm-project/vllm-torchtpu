@@ -99,9 +99,9 @@ class _MockRowParallelOProj(nn.Module):
     def forward(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        with transforms.microbatching.pipeline_stage():
+        with transforms.resource("TC"):
             partial = torch.nn.functional.linear(x, self.weight)
-        with transforms.microbatching.pipeline_stage():
+        with transforms.resource("SC"):
             out = tensor_model_parallel_all_reduce(partial)
         return out, None
 
@@ -177,9 +177,9 @@ def test_collective_to_compute_all_gather_gate_up_proj() -> None:
 
         def forward(self, x_shard: torch.Tensor) -> torch.Tensor:
             with transforms.microbatch(min_len=1024, groups=2):
-                with transforms.microbatching.pipeline_stage():
+                with transforms.resource("SC"):
                     x_full = tensor_model_parallel_all_gather(x_shard, dim=0)
-                with transforms.microbatching.pipeline_stage():
+                with transforms.resource("TC"):
                     gate_up, _ = self.gate_up_proj(x_full)
             return gate_up + 1.0
 
@@ -565,7 +565,7 @@ def test_qwen35_gdn_and_moe_layer_microbatch_pipeline(monkeypatch) -> None:
             already_sequence_parallel: bool = False,
         ) -> torch.Tensor:
             del already_sequence_parallel
-            with transforms.microbatching.pipeline_stage():
+            with transforms.resource("TC"):
                 mask = self.local_padding_mask[: hidden_states.shape[0]]
                 router_logits = self.gate(hidden_states) * mask
                 shared_out = self.shared_expert(hidden_states) * mask
@@ -573,7 +573,7 @@ def test_qwen35_gdn_and_moe_layer_microbatch_pipeline(monkeypatch) -> None:
                     hidden_states, router_logits
                 )
                 combined = shared_out + routed_out
-            with transforms.microbatching.pipeline_stage():
+            with transforms.resource("SC"):
                 return tensor_model_parallel_all_reduce(combined)
 
     class _MockDecoderLayer(nn.Module):
@@ -718,14 +718,14 @@ def test_qwen35_sequence_parallel_moe_microbatch(monkeypatch) -> None:
             already_sequence_parallel: bool = False,
         ) -> torch.Tensor:
             assert already_sequence_parallel
-            with transforms.microbatching.pipeline_stage():
+            with transforms.resource("TC"):
                 router_logits = self.gate(hidden_states)
                 shared_out = self.shared_expert(hidden_states)
                 routed_out = torch.ops.tpu_transforms_test.fused_moe(
                     hidden_states, router_logits
                 )
                 combined = shared_out + routed_out
-            with transforms.microbatching.pipeline_stage():
+            with transforms.resource("SC"):
                 return tensor_model_parallel_all_reduce(combined)
 
     class _MockSPLayer(nn.Module):
@@ -788,24 +788,24 @@ def _(x: torch.Tensor) -> torch.Tensor:
     return torch.empty_like(x)
 
 
-def test_explicit_pipeline_stage_without_op_name_heuristics() -> None:
-    """Verify that `transforms.microbatching.pipeline_stage` partitions arbitrary
-    operations into Stage 1 and Stage 2 purely from explicit stage scopes, with
-    zero reliance on collective or compute op-name heuristics."""
+def test_explicit_resource_without_op_name_heuristics() -> None:
+    """Verify that `transforms.resource` partitions arbitrary operations into
+    Stage 1 and Stage 2 at the `TC -> SC` resource transition with zero reliance
+    on collective or compute op-name heuristics."""
 
     def _fn(x: torch.Tensor) -> torch.Tensor:
         with transforms.microbatch(min_len=1024, groups=2):
-            with transforms.microbatching.pipeline_stage():
+            with transforms.resource("TC"):
                 y = torch.ops.tpu_transforms_test.arbitrary_op_alpha(x)
-            with transforms.microbatching.pipeline_stage():
+            with transforms.resource("SC"):
                 z = torch.ops.tpu_transforms_test.arbitrary_op_beta(y)
         return z
 
     gm, inputs = _capture_dynamic_fx_graph(_fn, torch.randn(1024, 16))
     rewritten = transforms.apply_microbatch_pass(gm, inputs, size=1024)
     assert rewritten == 1
-    assert _count_targets(gm, "microbatch_stage_enter") == 0
-    assert _count_targets(gm, "microbatch_stage_exit") == 0
+    assert _count_targets(gm, "microbatch_resource_enter") == 0
+    assert _count_targets(gm, "microbatch_resource_exit") == 0
 
     op_sequence = [
         getattr(n.target, "__name__", str(n.target)).lower()
@@ -843,6 +843,86 @@ def test_explicit_pipeline_stage_without_op_name_heuristics() -> None:
     if isinstance(out, tuple):
         out = out[0]
     torch.testing.assert_close(out, ref)
+
+
+def test_compile_time_resource_shifts_stage_boundary() -> None:
+    """Verify that when `op3` can run on either `SC` or `TC` via a compile-time
+    option, `transforms.resource` automatically coalesces same-resource ops and
+    shifts the pipeline stage boundary between `(op2, op3)` and `(op3, op4)`
+    without changing the caller."""
+
+    def _run_pipeline(op3_on_sc: bool) -> list[str]:
+        def op1(t: torch.Tensor) -> torch.Tensor:
+            with transforms.resource("TC"):
+                return torch.ops.tpu_transforms_test.arbitrary_op_alpha(t)
+
+        def op2(t: torch.Tensor) -> torch.Tensor:
+            with transforms.resource("TC"):
+                return torch.ops.tpu_transforms_test.arbitrary_op_alpha(t)
+
+        def op3(t: torch.Tensor) -> torch.Tensor:
+            with transforms.resource("SC" if op3_on_sc else "TC"):
+                return torch.ops.tpu_transforms_test.arbitrary_op_beta(t)
+
+        def op4(t: torch.Tensor) -> torch.Tensor:
+            with transforms.resource("SC"):
+                return torch.ops.tpu_transforms_test.arbitrary_op_beta(t)
+
+        def forward(x: torch.Tensor) -> torch.Tensor:
+            with transforms.microbatch(min_len=1024, groups=2):
+                x = op1(x)
+                x = op2(x)
+                x = op3(x)
+                x = op4(x)
+            return x
+
+        gm, inputs = _capture_dynamic_fx_graph(forward, torch.randn(1024, 16))
+        rewritten = transforms.apply_microbatch_pass(gm, inputs, size=1024)
+        assert rewritten == 1
+        return [
+            getattr(n.target, "__name__", str(n.target)).lower()
+            for n in gm.graph.nodes
+            if n.op == "call_function"
+            and any(
+                k in getattr(n.target, "__name__", str(n.target)).lower()
+                for k in (
+                    "arbitrary_op_alpha",
+                    "arbitrary_op_beta",
+                    "microbatch_barrier_2",
+                    "cat",
+                )
+            )
+        ]
+
+    # Case 1: op3 on SC -> Stage 1 = [op1, op2], Stage 2 = [op3, op4]
+    seq_sc = _run_pipeline(op3_on_sc=True)
+    assert len(seq_sc) == 11
+    assert "arbitrary_op_alpha" in seq_sc[0]  # op1(0)
+    assert "arbitrary_op_alpha" in seq_sc[1]  # op2(0)
+    assert "microbatch_barrier_2" in seq_sc[2]  # Barrier 1 after op2(0)
+    assert "arbitrary_op_beta" in seq_sc[3]   # op3(0)
+    assert "arbitrary_op_beta" in seq_sc[4]   # op4(0)
+    assert "arbitrary_op_alpha" in seq_sc[5]  # op1(1)
+    assert "arbitrary_op_alpha" in seq_sc[6]  # op2(1)
+    assert "microbatch_barrier_2" in seq_sc[7]  # Barrier 2
+    assert "arbitrary_op_beta" in seq_sc[8]   # op3(1)
+    assert "arbitrary_op_beta" in seq_sc[9]   # op4(1)
+    assert "cat" in seq_sc[10]
+
+    # Case 2: op3 on TC -> Stage 1 = [op1, op2, op3], Stage 2 = [op4]
+    seq_tc = _run_pipeline(op3_on_sc=False)
+    assert len(seq_tc) == 11
+    assert "arbitrary_op_alpha" in seq_tc[0]  # op1(0)
+    assert "arbitrary_op_alpha" in seq_tc[1]  # op2(0)
+    assert "arbitrary_op_beta" in seq_tc[2]   # op3(0) coalesced into Stage 1!
+    assert "microbatch_barrier_2" in seq_tc[3]  # Barrier 1 shifted after op3(0)!
+    assert "arbitrary_op_beta" in seq_tc[4]   # op4(0)
+    assert "arbitrary_op_alpha" in seq_tc[5]  # op1(1)
+    assert "arbitrary_op_alpha" in seq_tc[6]  # op2(1)
+    assert "arbitrary_op_beta" in seq_tc[7]   # op3(1) coalesced into Stage 1!
+    assert "microbatch_barrier_2" in seq_tc[8]  # Barrier 2
+    assert "arbitrary_op_beta" in seq_tc[9]   # op4(1)
+    assert "cat" in seq_tc[10]
 
 
 

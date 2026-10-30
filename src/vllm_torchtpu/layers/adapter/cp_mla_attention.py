@@ -400,11 +400,11 @@ def _weighted_reduce_scatter(
             output, lse_f32, merged_lse, group, rs_dtype
         )
     # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
-    with transforms.microbatching.pipeline_stage():
+    with transforms.resource("TC"):
         weight = torch.exp(lse_f32 - merged_lse).unsqueeze(-1)
         weighted = output.to(torch.float32) * weight
         weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
-    with transforms.microbatching.pipeline_stage():
+    with transforms.resource("SC"):
         return _scatter_sum(weighted, group, rs_dtype).to(output.dtype)
 
 
@@ -450,7 +450,7 @@ def _weighted_reduce_scatter_vspace(
     `where(w > 0, (o_h @ W_UV_h) * w, 0)`, reduce-scattered over heads, with
     the operand built heads-major in one computation (TPU_DCP_MERGE_VSPACE_FUSED).
     Wire dtype as `_weighted_reduce_scatter_heads_major`'s."""
-    with transforms.microbatching.pipeline_stage():
+    with transforms.resource("TC"):
         w_uv, w_uv_scale = vspace
         wire = torch.bfloat16 if envs.TPU_DCP_MERGE_RS_BF16 == 1 else rs_dtype
         wire = wire or torch.float32
@@ -475,7 +475,7 @@ def _weighted_reduce_scatter_vspace(
                 )
             w = weight.to(torch.float32).transpose(0, 1).unsqueeze(-1)
             x = torch.where(w > 0, v * w, torch.zeros_like(v)).to(wire)
-    with transforms.microbatching.pipeline_stage():
+    with transforms.resource("SC"):
         return (
             group.reduce_scatter(x.contiguous(), dim=0)
             .transpose(0, 1)
@@ -501,7 +501,7 @@ def _weighted_reduce_scatter_heads_major(
     bf16 (each f32 product rounded once, as `_scatter_sum`'s
     `.to(bfloat16)`), the RS_BF16 merge, heads-major.
     """
-    with transforms.microbatching.pipeline_stage():
+    with transforms.resource("TC"):
         wire = torch.bfloat16 if envs.TPU_DCP_MERGE_RS_BF16 == 1 else rs_dtype
         if output.device.type == "tpu":
             from vllm_torchtpu.distributed.dcp_comm import (
@@ -516,7 +516,7 @@ def _weighted_reduce_scatter_heads_major(
             x = torch.where(w > 0, x, torch.zeros_like(x))
             if wire is not None:
                 x = x.to(wire)
-    with transforms.microbatching.pipeline_stage():
+    with transforms.resource("SC"):
         return (
             group.reduce_scatter(x.contiguous(), dim=0)
             .transpose(0, 1)
