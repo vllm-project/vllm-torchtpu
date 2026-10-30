@@ -31,6 +31,7 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
+from vllm_torchtpu.megakernel.ops import F32, REC
 from vllm_torchtpu.megakernel.models.qwen38_step import make_flat_segment_step
 from vllm_torchtpu.megakernel.wholestep.qsa_full_c import IR_NEW, KR_NEW, UNION_STATS
 from vllm_torchtpu.megakernel.wholestep.qsa_full import KV_NEW
@@ -80,9 +81,15 @@ def wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
     (6, 10) rings leave the whole-step kernel 0.65 MiB over the 62 MiB VMEM limit (w01
     j-508c1d10: CompileTimeScopedVmemOom 62.63M at qwen38_mk_whole_b48). Past 32768 groups
     (262K contexts) the 16-row kernel's selection temporaries double and miss by 0.13 MiB
-    (j-38d236d7: 62.23M at 65536 groups), so up to 16 rows the expert ring drops one 2 MiB slot."""
+    (j-38d236d7: 62.23M at 65536 groups), so up to 16 rows the expert ring drops one 2 MiB slot.
+    An f32 GDN state (`VLLM_TPU_MK_GDN_REC_F32=1`) on the WIDE rows (17..47) misses by 0.43 MiB
+    (j-f4f467fc: 64.37M at qwen38_mk_whole_b32; 2.16 MiB in tpu_bench_wholestep_call j-5ae41ffb,
+    where one expert slot fell 8 KiB short): the chunked GDN state ring (f32 chunk 3 MiB) drops
+    from 3 to 2 buffers there; scheduling only."""
     if B >= 48:
         return segment_tiles(B, rings=(6, 4))
+    if REC == F32 and B > 16:
+        return segment_tiles(B).with_blocks({"gdn": {"gdn_bufs": 2}})
     if B <= 16 and max_groups > 32768:
         nbe, nbd = ring_depths(B)
         return segment_tiles(B, rings=(nbe - 1, nbd))
