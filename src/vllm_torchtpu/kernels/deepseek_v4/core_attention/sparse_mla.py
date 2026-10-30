@@ -585,6 +585,7 @@ def _dense_attention_kernel(
     block_pages_ref,  # [num_blocks] KV pages each block reads
     kv_bounds_ref,  # [num_blocks] 1 + largest selected KV position per block
     prefix_ref,  # [num_blocks] 1 if every token selected all of [0, its bound)
+    seq_bounds_ref,  # [num_blocks] largest kv_bounds of the block's request
     # Input
     attention_sinks_ref,  # float32[num_q_heads]
     q_ref,  # [bq_sz, num_q_heads, head_dim]
@@ -601,6 +602,9 @@ def _dense_attention_kernel(
     kernel's do, and a KV position contributes to a token only if the token's
     top-k selected it. Same keys as the gather path, so the output differs
     from it only by the order of the softmax reductions.
+
+    A request's pages are decoded once, into `kv_cache_ref`, and reused by
+    its other blocks; the grid runs sequentially, so the cache persists.
     """
     kv_group = DENSE_KV_PAGES_PER_STEP
     nope_refs = refs[:kv_group]
@@ -615,6 +619,8 @@ def _dense_attention_kernel(
         m_ref,  # float32[bq_sz * num_q_heads, 128]
         l_ref,  # float32[bq_sz * num_q_heads, 128]
         acc_ref,  # float32[bq_sz * num_q_heads, head_dim]
+        kv_cache_ref,  # [cache_pages * page_size, head_dim] decoded KV pages
+        cache_seqs_ref,  # i32[cache_pages] request decoded in each cache page
     ) = refs[2 * kv_group :]
 
     bq_sz, num_q_heads, head_dim = q_ref.shape
@@ -632,6 +638,8 @@ def _dense_attention_kernel(
     kv_step = pl.program_id(1)
     kv_bound = kv_bounds_ref[bq_idx]
     first_page = kv_step * kv_group
+    seq = block_seqs_ref[bq_idx]
+    seq_bound = seq_bounds_ref[bq_idx]
 
     def broadcast_minor(src, shape):
         # src is lane-replicated [rows, 128]; tile it to `shape`'s minor dim.
@@ -682,6 +690,14 @@ def _dense_attention_kernel(
         for h in range(mask_rows):
             mask_ref[h] = (lane < bound - h * _MASK_LANES).astype(jnp.float32)
 
+    # Every cache page holds zeros or a decoded page, both finite: a step reads
+    # pages past its block's last, which no token selected.
+    @pl.when((pl.program_id(0) == 0) & (kv_step == 0))
+    def init_cache():
+        kv_cache_ref[...] = jnp.zeros_like(kv_cache_ref)
+        for p in range(cache_seqs_ref.shape[0]):
+            cache_seqs_ref[p] = -1
+
     def load_page(j):
         nope_ref, rope_ref = nope_refs[j], rope_refs[j]
         bkv_nope = _dequant_dsv4_fp8(
@@ -711,18 +727,28 @@ def _dense_attention_kernel(
         bkv_rope = rope_kv_ref[:, : 2 * rope_words].astype(jnp.bfloat16)
         bkv = jnp.concatenate([bkv_nope, bkv_rope], axis=-1)
 
-        # Rows past every selected position may hold another cache's bytes,
-        # which can decode to NaN (see the gather kernel's `load_bkv`). The
-        # step's pages past the chunk's last repeat it, and are zeroed here.
+        # Rows past every position the request selected may hold another
+        # cache's bytes, which can decode to NaN (see the gather kernel's
+        # `load_bkv`). Rows below are the request's own; a block masks those
+        # it did not select.
         k_pos = (first_page + j) * page_size + lax.broadcasted_iota(
             jnp.int32, (page_size, 1), 0
         )
-        return jnp.where(k_pos < kv_bound, bkv, 0)
+        return jnp.where(k_pos < seq_bound, bkv, 0)
 
     @pl.when(first_page * page_size < kv_bound)
     def compute():
-        bkv = jnp.concatenate([load_page(j) for j in range(kv_group)], axis=0)
         kv_len = kv_group * page_size
+        for j in range(kv_group):
+            page = first_page + j
+
+            @pl.when((page < block_pages_ref[bq_idx]) & (cache_seqs_ref[page] != seq))
+            def decode():
+                rows = pl.ds(pl.multiple_of(page * page_size, page_size), page_size)
+                kv_cache_ref[rows, :] = load_page(j)
+                cache_seqs_ref[page] = seq
+
+        bkv = kv_cache_ref[pl.ds(pl.multiple_of(first_page * page_size, kv_len), kv_len), :]
 
         selected = jnp.concatenate(
             [mask_ref[first_page * halves + h] for h in range(kv_group * halves)],
@@ -825,7 +851,8 @@ def _dense_attention(
     pages_per_seq = page_indices.shape[0] // max_num_seqs
     max_kv_pages = min(DENSE_MAX_KV_PAGES, pages_per_seq)
     # Every KV step reads mask rows of whole pages, up to the last step's.
-    mask_rows = align_to(align_to(max_kv_pages, kv_group) * page_size // _MASK_LANES, 8)
+    cache_pages = align_to(max_kv_pages, kv_group)
+    mask_rows = align_to(cache_pages * page_size // _MASK_LANES, 8)
     num_chunks = num_tokens // chunk_size
     chunk_blocks = chunk_size // bq_sz
     num_blocks = num_tokens // bq_sz
@@ -866,6 +893,10 @@ def _dense_attention(
         .set(jnp.arange(num_blocks, dtype=jnp.int32), mode="drop")
     )
     num_dense = jnp.sum(is_dense)
+    block_seqs = seq_ids_segment[::bq_sz].astype(jnp.int32)
+    seq_bounds = jax.ops.segment_max(
+        jnp.where(is_dense, kv_bounds, 0), block_seqs, num_segments=max_num_seqs
+    )
     num_kv_steps = jnp.max(jnp.where(is_dense, cdiv(block_pages, kv_group), 1))
 
     def q_map(i, s, page_indices_ref, num_valid_ref, block_ids_ref, *_):
@@ -886,7 +917,8 @@ def _dense_attention(
             *_,
         ):
             block = block_ids_ref[i]
-            # A step past the block's last page repeats it; see `load_page`.
+            # A step past the block's last page repeats it; `compute` does not
+            # decode it.
             page = jnp.minimum(s * kv_group + j, block_pages_ref[block] - 1)
             seq = block_seqs_ref[block]
             return (page_indices_ref[seq * pages_per_seq + page], 0, 0)
@@ -910,15 +942,18 @@ def _dense_attention(
         pltpu.VMEM((num_rows, 128), jnp.float32),
         pltpu.VMEM((num_rows, 128), jnp.float32),
         pltpu.VMEM((num_rows, head_dim), jnp.float32),
+        pltpu.VMEM((cache_pages * page_size, head_dim), jnp.bfloat16),
+        pltpu.SMEM((cache_pages,), jnp.int32),
     ]
     scalar_prefetches = (
         page_indices,
         num_valid_tokens.reshape(1).astype(jnp.int32),
         block_ids,
-        seq_ids_segment[::bq_sz].astype(jnp.int32),
+        block_seqs,
         block_pages.astype(jnp.int32),
         kv_bounds.astype(jnp.int32),
         block_prefix.astype(jnp.int32),
+        seq_bounds[block_seqs].astype(jnp.int32),
     )
     scope_name = f"SparseMLA-dense-bq_{bq_sz}-kvp_{kv_group}"
     kernel = jax.named_scope(scope_name)(
@@ -932,6 +967,7 @@ def _dense_attention(
                 scratch_shapes=scratch_shapes,
             ),
             compiler_params=pltpu.CompilerParams(
+                # Sequential on one core: blocks reuse the decoded-page cache.
                 dimension_semantics=("arbitrary", "arbitrary"),
                 vmem_limit_bytes=vmem_limit_bytes,
                 disable_bounds_checks=True,
