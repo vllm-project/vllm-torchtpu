@@ -320,6 +320,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
     # Model-owned pooled cache geometry changes graph argument extents.
     "vllm_torchtpu/models/vllm/qwen4_exp/pool_layout.py",
+    "vllm_torchtpu/models/vllm/qwen4_exp/ple_offload.py",
 )
 
 # vLLM-Omni diffusion code, dropped from the hashed set above. Diffusion

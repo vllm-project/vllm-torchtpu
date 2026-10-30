@@ -14,6 +14,7 @@
 """Native planner, real storage and block-lifecycle compact pool regressions."""
 
 from types import SimpleNamespace as NS
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -203,18 +204,19 @@ def test_real_block_pool_reuse_preserves_both_prefix_planes(prefix):
     pool.free_blocks(replacements)
 
 
-def test_copy_plan_uses_actual_main_row_not_paired_budget(monkeypatch):
+@pytest.mark.parametrize("prefix", [False, True])
+def test_copy_plan_uses_actual_main_row_not_paired_budget(monkeypatch, prefix):
     from vllm_torchtpu.models.vllm.qwen4_exp.pooled_cache import Qwen4ExpPooledCache
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
-    cfg = compact_config(layers=1)
+    cfg = compact_config(layers=1, prefix=prefix)
     layout, specs, plan, actual = native_allocation(cfg)
     runner = NS(
         device=torch.device("cpu"),
         cache_config=cfg.cache_config,
         enforce_eager=True,
         may_reinitialize_input_batch=lambda *args: None,
-        _precompile_mamba_state_seed_copies=lambda: None,
+        _precompile_mamba_state_seed_copies=Mock(),
         _pool_block_split=1,
     )
     runner._build_mamba_copy_plan = TPUModelRunner._build_mamba_copy_plan.__get__(
@@ -244,6 +246,11 @@ def test_copy_plan_uses_actual_main_row_not_paired_budget(monkeypatch):
         lambda *a, **kw: None,
     )
     cache.initialize(plan)
+    if not prefix:
+        assert not runner._mamba_copy_plan
+        runner._precompile_mamba_state_seed_copies.assert_not_called()
+        return
+    runner._precompile_mamba_state_seed_copies.assert_called_once_with()
     assert runner._pool_block_split == 1
     copied = [t for _, tensors in runner._mamba_copy_plan for t in tensors]
     assert copied and all(t.shape[1] == layout.block_size for t in copied)
@@ -417,7 +424,19 @@ def test_native_tables_real_runner_metadata_use_one_prefix_owner(monkeypatch, gd
     runner, kwargs, metadata = prepare_native_pool_inputs(
         cfg, plan, per_req, [128, 37], [3, 5], 16
     )
-    assert torch.equal(kwargs["main_block_table"], kwargs["compressed_block_table"])
+    assert {"state_slots", "main_block_table", "compressed_block_table"}.isdisjoint(
+        kwargs
+    )
+    attention = next(name for name in metadata if name.endswith(".self_attn"))
+    group_id = next(
+        gid
+        for gid, group in enumerate(plan.kv_cache_groups)
+        if attention in group.layer_names
+    )
+    blocks = metadata[attention].block_tables
+    assert isinstance(blocks, torch.Tensor)
+    table = blocks.reshape(8, -1)
+    assert table[:2, 0].tolist() == [per_req[row][group_id][0] for row in range(2)]
     assert kwargs["query_start_loc"].tolist() == [0, 3, 8, 8, 8, 8, 8, 8, 8]
     assert kwargs["context_lens"].tolist() == [128, 37, 0, 0, 0, 0, 0, 0]
     assert kwargs["valid_tokens"].tolist() == [True] * 8 + [False] * 8

@@ -106,12 +106,7 @@ class Qwen4ExpPooledCache:
         if runner.device.type == "tpu":
             from jax.experimental.pallas import tpu as pltpu
 
-            try:
-                hardware = pltpu.get_tpu_info()
-            except ValueError as error:
-                if not str(error).startswith("Unsupported TPU device kind: "):
-                    raise
-                hardware = None
+            hardware = pltpu.get_tpu_info()
             validate_pool_tiling(self.layout, hardware)
         self.materialized = materialize_pool(
             runner.vllm_config, config, self.layout, runner.device
@@ -194,7 +189,8 @@ class Qwen4ExpPooledCache:
             runner._mamba_copy_plan = []
             runner._mamba_state_block_size = None
             runner._pool_block_split = 1
-        runner._precompile_mamba_state_seed_copies()
+        if runner._mamba_copy_plan:
+            runner._precompile_mamba_state_seed_copies()
         if not runner.enforce_eager:
             runner._precompile_substitute_placeholder_token()
         return materialized.kv_caches

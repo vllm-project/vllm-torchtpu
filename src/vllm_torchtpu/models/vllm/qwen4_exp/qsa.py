@@ -40,7 +40,10 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import TopKBackend
-from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+from vllm_torchtpu.layers.adapter.attention import (
+    TPU_HEAD_SIZE_ALIGNMENT,
+    PallasAttentionBackend,
+)
 from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import build_compact_pooled_qsa_op
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
@@ -50,23 +53,10 @@ from .qsa_geometry import validate_qsa_geometry
 
 @dataclass(frozen=True)
 class QSAMetadata:
-    """The model adapter supplies one shared ragged geometry and group-native pages.
-
-    ``context_lens`` is the logical length BEFORE this chunk, independent of
-    the RoPE ``positions`` argument.
-    Padded requests use state_slots=-1 and repeated query offsets. Forward
-    binds native ring IDs from per-layer metadata; both stores use the main
-    logical block table.
-    Admission establishes <=8192 tokens/step and context within the model
-    position capacity. RoPE covers [0, max_model_len). All real/scratch cache
-    owners must be bound before forward.
-    """
+    """Logical query geometry; cache owners and page tables are per-layer metadata."""
 
     query_start_loc: torch.Tensor
     context_lens: torch.Tensor
-    state_slots: torch.Tensor
-    main_block_table: torch.Tensor
-    compressed_block_table: torch.Tensor
 
 
 def make_rope_cache(max_positions: int, *, rotary_dim: int, theta: float):
@@ -134,7 +124,37 @@ def get_qsa_cache_specs(config, tp_size, cache_dtype):
 
 
 class Qwen4ExpPooledQSABackend(PallasAttentionBackend):
-    """Native pool geometry; QSA maps manager pages to 4-token RPA pages."""
+    """Native pool geometry with compression groups as virtual RPA pages."""
+
+    kv_cache_layout_is_final: bool = True
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str | torch.dtype = "auto",
+    ) -> tuple[int, ...]:
+        if isinstance(cache_dtype_str, torch.dtype):
+            dtype = cache_dtype_str
+        elif cache_dtype_str in ("auto", "bfloat16"):
+            dtype = torch.bfloat16
+        elif cache_dtype_str in ("fp8", "fp8_e4m3"):
+            dtype = torch.float8_e4m3fn
+        else:
+            raise ValueError("QSA pool requires BF16 or FP8 E4M3 cache storage")
+        packing = torch.int32.itemsize // dtype.itemsize
+        dimension = (
+            math.ceil(head_size / TPU_HEAD_SIZE_ALIGNMENT) * TPU_HEAD_SIZE_ALIGNMENT
+        )
+        return (
+            num_blocks,
+            block_size,
+            math.ceil(2 * num_kv_heads / packing),
+            packing,
+            dimension,
+        )
 
     @staticmethod
     def get_name():
@@ -401,17 +421,6 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         per_layer = cast(
             dict[str, AttentionMetadata], get_forward_context().attn_metadata
         )
-        metadata = replace(
-            metadata,
-            state_slots=cast(
-                torch.Tensor, per_layer[self.prefix + ".raw_ring"].block_tables
-            ),
-            main_block_table=cast(torch.Tensor, per_layer[self.prefix].block_tables),
-            compressed_block_table=cast(
-                torch.Tensor,
-                per_layer[self.prefix].block_tables,
-            ),
-        )
         output, selected = self._op(
             self.q_proj(hidden),
             self.k_proj(hidden),
@@ -426,9 +435,9 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             *self.cache_owners,
             metadata.query_start_loc,
             metadata.context_lens,
-            metadata.state_slots,
-            metadata.main_block_table,
-            metadata.compressed_block_table,
+            cast(torch.Tensor, per_layer[self.prefix + ".raw_ring"].block_tables),
+            cast(torch.Tensor, per_layer[self.prefix].block_tables),
+            cast(torch.Tensor, per_layer[self.prefix].block_tables),
             cast(torch.Tensor, per_layer[self.prefix].request_distribution),
             k_scale=cast(float, self._k_scale_float) if self.fp8_kv else 1.0,
             v_scale=cast(float, self._v_scale_float) if self.fp8_kv else 1.0,

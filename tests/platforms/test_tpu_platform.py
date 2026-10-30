@@ -270,6 +270,7 @@ def set_mock_attn_to_vllm_config(vllm_config, page_size, min_page_size):
     new_vllm_config = copy.copy(vllm_config)
 
     mock_impl = MagicMock()
+    mock_impl.kv_cache_layout_is_final = False
     mock_impl.get_page_size.return_value = page_size
     mock_impl.get_min_page_size.return_value = min_page_size
     mock_impl.is_ssm.return_value = False

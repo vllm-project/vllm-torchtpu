@@ -68,8 +68,8 @@ def test_qsa_block_sparse_matches_exact_mask_with_partial_tail_and_nan(
     )
     keys = rng.standard_normal((context, 2, 256), dtype=np.float32) * 0.1
     values = rng.standard_normal((context, 2, 256), dtype=np.float32) * 0.1
-    keys[2052:] = np.nan if fp8 else 0
-    values[2052:] = np.nan if fp8 else 0
+    keys[2052:] = np.nan
+    values[2052:] = np.nan
     cache_dtype = jnp.float32 if fp8 else jnp.bfloat16
     cache = pack_rows(
         jnp.asarray(keys, cache_dtype), jnp.asarray(values, cache_dtype), fp8=fp8

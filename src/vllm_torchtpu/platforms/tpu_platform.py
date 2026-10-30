@@ -53,6 +53,8 @@ if TYPE_CHECKING:
     class _TpuAttentionBackend(Protocol):
         """Typing-only view of the TPU classmethods on our attention backends."""
 
+        kv_cache_layout_is_final: bool
+
         @staticmethod
         def get_page_size(vllm_config: VllmConfig) -> int: ...
 
@@ -1256,7 +1258,7 @@ class TpuPlatform(Platform):
             "type[_TpuAttentionBackend] | None", cls._find_non_ssm_backend(vllm_config)
         )
 
-        if backend_cls is None:
+        if backend_cls is None or backend_cls.kv_cache_layout_is_final:
             return
 
         # `get_supported_kernel_block_sizes` and

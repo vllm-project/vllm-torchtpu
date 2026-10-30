@@ -299,6 +299,7 @@ def test_pooled_ops_register_and_dispatch_without_allocating_a_device(symbolic):
             ids(2),
             ids(2, 6),
             ids(2, 6),
+            ids(3),
             compress_ratio=4,
             token_topk=2048,
             norm_eps=1e-6,
