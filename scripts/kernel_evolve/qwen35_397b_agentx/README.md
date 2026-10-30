@@ -38,3 +38,18 @@ corpus. They are here, so a run on any host reads them from its clone of this tr
   from, run on a host without vLLM installed.
 - `validity.py`: the campaign's validity check. The arm's benchmark config is the one
   it is served with, so this fails a tree whose config launches another cell.
+
+## Segment 2: the router top-k kernel
+
+The segment on `src/vllm_torchtpu/kernels/router_topk` scores
+`qwen3.5-397b-fp8-tp8-dp1-ep-agentx-prefill@layers`: the same cut, serve command and cell,
+scored on the steps that carry a 16k-token prefill chunk alone (`score_phase = "prefill"`).
+`corpus/scorers/serve_e2e.toml` says why the decode-only steps are left out.
+`qwen3.5-397b-fp8-tp8-dp1-ep-agentx-profiled` is the full model with the phased profiler
+armed, for a scoping job of golden alone.
+
+`validity.py` adds two checks on the router kernel, run in a child under `--python`
+(default `$PERFKIT_PYTHON`, which then needs jax 0.11.2 and libtpu 0.0.50 as well as
+numpy; `pip install jax==0.11.2 libtpu==0.0.50 numpy`): an ahead-of-time compile for tpu7x
+at every token bucket the server pads to, and an exact comparison with the documented
+algorithm in TPU interpret mode at each of them.
