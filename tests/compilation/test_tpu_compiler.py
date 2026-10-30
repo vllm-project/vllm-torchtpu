@@ -90,6 +90,26 @@ class TestTpuCompilerCache:
 
         assert unprofiled == phased
 
+    def test_tpu_hash_keys_the_count_tap_on_whether_it_runs(self):
+        """The tap changes every MoE forward, so turning it on must recompile;
+        where its snapshots go and how often must not."""
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+
+        def tap(directory, every):
+            env = {"MOE_EXPERT_COUNT_TAP_DIR": directory}
+            env["MOE_EXPERT_COUNT_TAP_EVERY"] = every
+            with patch.dict(os.environ, env):
+                return compute_tpu_compilation_hash(self._config())
+
+        with patch(
+            "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+            return_value=[],
+        ):
+            off = tap("", "1000")
+            on = tap("/tmp/run_a", "1000")
+            assert on == tap("/tmp/run_b", "50")
+        assert off != on
+
     def test_tpu_hash_covers_native_compile_env(self):
         from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
 
