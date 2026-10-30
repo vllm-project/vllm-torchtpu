@@ -678,14 +678,14 @@ def _dense_attention_kernel(
         cache_state_ref[1] = 0
         start_fetch(seq, 0, block_pages_ref[bq_idx])
 
-    def init_state():
+    # The accumulator starts from swa_acc in the first KV step (`compute`).
+    def init_max_sum():
         for t in range(bq_sz):
             rows = pl.ds(t * num_q_heads, num_q_heads)
             swa_m = swa_m_ref[t, :num_q_heads][:, None]
             swa_l = swa_l_ref[t, :num_q_heads][:, None]
             m_ref[rows, :] = jnp.broadcast_to(swa_m, (num_q_heads, 128))
             l_ref[rows, :] = jnp.broadcast_to(swa_l, (num_q_heads, 128))
-        acc_ref[...] = swa_acc_ref[...].reshape(num_rows, head_dim).astype(jnp.float32)
 
     # counts[x >> 7, x & 127] = how often the token selected position x,
     # as a one-hot product on the MXU; -1 entries match no row.
@@ -704,20 +704,20 @@ def _dense_attention_kernel(
         mask_ref[:, pl.ds(t, 1), :] = counts[:, None, :]
         return carry
 
-    # Each branch initializes the running state itself, so that it overlaps
-    # with the mask build in one basic block.
+    # Each branch initializes the running max and sum itself, so that it
+    # overlaps with the mask build in one basic block.
     is_prefix = prefix_ref[bq_idx] != 0
 
     @pl.when(jnp.logical_not(is_prefix))
     def init_topk_mask():
-        init_state()
+        init_max_sum()
         lax.fori_loop(0, bq_sz, build_mask, None, unroll=DENSE_MASK_UNROLL)
 
     # Where each token's selection is a whole prefix of the KV positions (the
     # request is no longer than top-k), its mask is just its bound.
     @pl.when(is_prefix)
     def init_prefix_mask():
-        init_state()
+        init_max_sum()
         bound = jnp.max(topk_ref[...], axis=1, keepdims=True) + 1
         lane = lax.broadcasted_iota(jnp.int32, (bq_sz, _MASK_LANES), 1)
         for h in range(mask_rows):
@@ -782,7 +782,7 @@ def _dense_attention_kernel(
         have = jnp.where(next_seq == seq, decoded_pages, 0)
         start_fetch(next_seq, have, jnp.maximum(have, block_pages_ref[next_idx]))
 
-    def compute(kv_step):
+    def compute(kv_step, from_swa=False):
         first_page = kv_step * kv_group
         bkv = kv_cache_ref[pl.ds(pl.multiple_of(first_page * page_size, kv_len), kv_len), :]
 
@@ -814,18 +814,35 @@ def _dense_attention_kernel(
             if g + 1 < num_groups:
                 s_next = scores(g + 1)
             rows = pl.ds(g * group_rows, group_rows)
-            m_prev = m_ref[rows, :]
+            m_prev, l_prev = m_ref[rows, :], l_ref[rows, :]
             m_curr = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
             p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
             exp_m_diff = jnp.exp(m_prev - m_curr)
             l_sum = jnp.sum(p, axis=1, keepdims=True)
-            l_ref[rows, :] = exp_m_diff * l_ref[rows, :] + l_sum
+            l_ref[rows, :] = exp_m_diff * l_prev + l_sum
             m_ref[rows, :] = m_curr
             pv = jnp.einsum("nm,md->nd", p, bkv, preferred_element_type=jnp.float32)
             exp_m_diff = broadcast_minor(exp_m_diff, pv.shape)
-            acc_ref[rows, :] = exp_m_diff * acc_ref[rows, :] + pv
+            if from_swa:
+                tokens = pl.ds(g * DENSE_GROUP_TOKENS, DENSE_GROUP_TOKENS)
+                acc_prev = swa_acc_ref[tokens].reshape(group_rows, head_dim)
+                acc_prev = acc_prev.astype(jnp.float32)
+            else:
+                acc_prev = acc_ref[rows, :]
+            acc_ref[rows, :] = exp_m_diff * acc_prev + pv
 
-    @pl.loop(0, cdiv(kv_bound, kv_len))
+    num_kv_steps = cdiv(kv_bound, kv_len)
+
+    # No token of the block selected any key.
+    @pl.when(num_kv_steps == 0)
+    def keep_swa_acc():
+        acc_ref[...] = swa_acc_ref[...].reshape(num_rows, head_dim).astype(jnp.float32)
+
+    @pl.when(num_kv_steps > 0)
+    def first_kv_step():
+        compute(0, from_swa=True)
+
+    @pl.loop(1, num_kv_steps)
     def _(kv_step):
         compute(kv_step)
 
