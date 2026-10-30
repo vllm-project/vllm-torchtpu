@@ -269,9 +269,13 @@ def test_other_compression_ratio_uses_general_tc():
 
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("fp8", [False, True])
-def test_aligned_requests_keep_sc_gathers_local_with_padded_slots(fp8):
+def test_aligned_requests_keep_sc_gathers_local_with_padded_slots(fp8, record_property):
     from tests.kernels.test_sparse_gqa_adaptive_prefill import _make_inputs
-    from vllm_torchtpu.kernels.sparse_gqa_prefill.selector import select_sc
+    from vllm_torchtpu.kernels.sparse_gqa_prefill.adaptive import (
+        _sc_prefill,
+        _select_sc_for_chunk,
+        _tc_plan,
+    )
 
     args = list(_make_inputs(512, 131072, fp8, True))
     # Distinct request page permutations in one shared pool. An unused NaN
@@ -283,32 +287,61 @@ def test_aligned_requests_keep_sc_gathers_local_with_padded_slots(fp8):
         (jnp.nan_to_num(args[5]), jnp.full_like(args[5][:1], jnp.nan))
     )
     args[6] = jnp.array([0, 256, 512, 512, 512], jnp.int32)
+    model = prefill_cost_model(
+        args[0], args[2], args[4], args[5], kv_heads=2, ratio=4, kv_tile=256
+    )
     choose = jax.jit(
         functools.partial(
-            select_sc,
-            num_tiles=math.ceil(args[4].shape[1] * 1664 / 256),
-            model=prefill_cost_model(
-                args[0], args[2], args[4], args[5], kv_heads=2, ratio=4, kv_tile=256
+            _select_sc_for_chunk,
+            offset=0,
+            size=len(args[0]),
+            num_tiles=math.ceil(args[4].shape[1] * args[5].shape[1] / 256),
+            dtype=args[5].dtype,
+            plan=_tc_plan(
+                args[0],
+                args[2],
+                args[4],
+                args[5],
+                len(args[0]),
+                kv_heads=2,
+                ratio=4,
+                kv_tile=256,
+                request_capacity=len(args[6]) - 1,
             ),
+            model=model,
         )
     )
-    assert bool(choose(args[2], args[3]))
+    record_property("adaptive_select_sc", bool(choose(args[2], args[3], args[6])))
     compiled = (
         jax.jit(functools.partial(adaptive_prefill, kv_heads=2, ratio=4))
         .lower(*args)
         .compile()
     )
-    before = [np.asarray(x).copy() for x in args]
-    output, returned = compiled(*args)
-    check_reference(args, output, kv_heads=2, rows=[1, 255, 256, 510])
-    np.testing.assert_array_equal(compiled(*args)[0], output)
-    for x, old in zip(args, before):
-        np.testing.assert_array_equal(
-            np.asarray(x).copy().view(np.uint8), old.view(np.uint8)
+    sc_compiled = (
+        jax.jit(
+            functools.partial(
+                _sc_prefill,
+                chunk_size=model.sc_chunk,
+                kv_heads=2,
+                ratio=4,
+                kv_tile=256,
+            )
         )
-    np.testing.assert_array_equal(
-        np.asarray(returned).copy().view(np.uint8), before[5].view(np.uint8)
+        .lower(*args[:6])
+        .compile()
     )
+    before = [np.asarray(x).copy() for x in args]
+    for function, inputs in ((compiled, args), (sc_compiled, args[:6])):
+        output, returned = function(*inputs)
+        check_reference(args, output, kv_heads=2, rows=[1, 255, 256, 510])
+        np.testing.assert_array_equal(function(*inputs)[0], output)
+        for x, old in zip(args, before):
+            np.testing.assert_array_equal(
+                np.asarray(x).copy().view(np.uint8), old.view(np.uint8)
+            )
+        np.testing.assert_array_equal(
+            np.asarray(returned).copy().view(np.uint8), before[5].view(np.uint8)
+        )
 
 
 @pytest.mark.tpu_test
