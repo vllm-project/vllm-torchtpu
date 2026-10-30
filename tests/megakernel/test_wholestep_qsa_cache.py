@@ -11,14 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Whole-step post-kernel QSA cache writes vs the stock QSA layers (CPU, Pallas interpret).
+"""Whole-step post-kernel QSA cache writes vs the stock QSA layers (CPU, Pallas
+interpret).
 
 Two QSA layers share one unified pool the way the served Qwen3.8 packs it (main KV pages
 paired: slots 0 / 1; compressed keys packed: slots 0 / 1). Stock: `pooled_qsa_step` per
 layer, in layer order (selection and attention stubbed: they only read the pool). Whole
 step: `wholestep_qsa_writes` from the same projections. The pool must be byte-identical
 after each of two consecutive verify steps, the second advancing every request by its
-accepted count only, so the first step's rejected drafts are overwritten exactly as stock
+accepted count only, so the first step's rejected drafts are overwritten exactly as
+stock
 overwrites them.
 """
 
@@ -30,7 +32,9 @@ import types
 
 try:
     import vllm.logger  # noqa: F401
-except ImportError:  # CPU venv without vllm: the kernels only need a logger and the KV layout.
+except (
+    ImportError
+):  # CPU venv without vllm: the kernels only need a logger and the KV layout.
     _vllm = types.ModuleType("vllm")
     _envs = types.ModuleType("vllm.envs")
     _envs.VLLM_KV_CACHE_LAYOUT = "NHD"
@@ -79,7 +83,9 @@ def interpret(monkeypatch):
     monkeypatch.setattr(
         pooled_qsa,
         "select_blocks",
-        lambda query, *a, block_topk, **k: jnp.zeros((len(query), block_topk), jnp.int32),
+        lambda query, *a, block_topk, **k: jnp.zeros(
+            (len(query), block_topk), jnp.int32
+        ),
     )
     monkeypatch.setattr(
         pooled_qsa,
@@ -96,7 +102,9 @@ def raw(x):
 
 
 def tables(rng, contexts, active):
-    """Per-request pages shared by both layers (paired / packed), distinct per request."""
+    """Per-request pages shared by both layers (paired / packed), distinct per
+    request.
+    """
     n, columns = len(contexts), 4
     free = iter(rng.permutation(np.arange(1, PAGES)))
     main = np.zeros((n, columns), np.int32)
@@ -141,34 +149,96 @@ def step_inputs(rng, contexts, active):
 def stock(pool, per_layer, positions, trig, starts, context, main, comp, rings):
     step = jax.jit(
         pooled_qsa.pooled_qsa_step,
-        static_argnames=("compress_ratio", "token_topk", "norm_eps", "rotary_dim", "k_scale",
-                         "v_scale", "compressed_slot", "main_slot", "max_query_len"),
+        static_argnames=(
+            "compress_ratio",
+            "token_topk",
+            "norm_eps",
+            "rotary_dim",
+            "k_scale",
+            "v_scale",
+            "compressed_slot",
+            "main_slot",
+            "max_query_len",
+        ),
     )
     for p, lay, ring in zip(per_layer, LAYERS, rings):
         pool, _, _ = step(
-            p["qgate"], p["key"], p["value"], p["index_qk"], p["nq"], p["nk"], p["niq"],
-            p["nik"], positions, trig, pool, starts, context, jnp.asarray(ring.reshape(-1)),
-            jnp.asarray(main.reshape(-1)), jnp.asarray(comp.reshape(-1)),
-            compress_ratio=RATIO, token_topk=TOPK, norm_eps=1e-6, rotary_dim=ROTARY,
-            k_scale=lay.k_scale, v_scale=lay.v_scale, compressed_slot=lay.compressed_slot,
-            main_slot=lay.main_slot, max_query_len=T,
+            p["qgate"],
+            p["key"],
+            p["value"],
+            p["index_qk"],
+            p["nq"],
+            p["nk"],
+            p["niq"],
+            p["nik"],
+            positions,
+            trig,
+            pool,
+            starts,
+            context,
+            jnp.asarray(ring.reshape(-1)),
+            jnp.asarray(main.reshape(-1)),
+            jnp.asarray(comp.reshape(-1)),
+            compress_ratio=RATIO,
+            token_topk=TOPK,
+            norm_eps=1e-6,
+            rotary_dim=ROTARY,
+            k_scale=lay.k_scale,
+            v_scale=lay.v_scale,
+            compressed_slot=lay.compressed_slot,
+            main_slot=lay.main_slot,
+            max_query_len=T,
         )
     return pool
 
 
-def whole(pool, per_layer, positions, trig, starts, context, main, comp, rings, num_requests=None,
-          batched=True):
+def whole(
+    pool,
+    per_layer,
+    positions,
+    trig,
+    starts,
+    context,
+    main,
+    comp,
+    rings,
+    num_requests=None,
+    batched=True,
+):
     fn = jax.jit(
-        lambda pool, rows, norms, tabs, positions, trig, starts, context: wholestep_qsa_writes(
-            pool, rows, norms, tabs, LAYERS, positions, trig, starts, context,
-            compress_ratio=RATIO, norm_eps=1e-6, rotary_dim=ROTARY, max_query_len=T,
-            num_requests=num_requests, batched=batched,
+        lambda pool,
+        rows,
+        norms,
+        tabs,
+        positions,
+        trig,
+        starts,
+        context: wholestep_qsa_writes(
+            pool,
+            rows,
+            norms,
+            tabs,
+            LAYERS,
+            positions,
+            trig,
+            starts,
+            context,
+            compress_ratio=RATIO,
+            norm_eps=1e-6,
+            rotary_dim=ROTARY,
+            max_query_len=T,
+            num_requests=num_requests,
+            batched=batched,
         )
     )
     rows = [(p["key"], p["value"], p["index_qk"][:, -INDEX_DIM:]) for p in per_layer]
     norms = [(p["nk"], p["nik"]) for p in per_layer]
     tabs = [
-        (jnp.asarray(ring.reshape(-1)), jnp.asarray(main.reshape(-1)), jnp.asarray(comp.reshape(-1)))
+        (
+            jnp.asarray(ring.reshape(-1)),
+            jnp.asarray(main.reshape(-1)),
+            jnp.asarray(comp.reshape(-1)),
+        )
         for ring in rings
     ]
     return fn(pool, rows, norms, tabs, positions, trig, starts, context)
@@ -184,56 +254,94 @@ ACCEPTED = [1, 4, 2, 0, 3, 1, 0, 4]
     "fused,batched", [(False, False), (False, True), (True, False)]
 )  # the fused writer keeps the per-layer sequence (batched is ignored there)
 @pytest.mark.parametrize("pad", [0, 4])
-def test_wholestep_qsa_writes_match_stock_over_two_steps(interpret, monkeypatch, fused, batched,
-                                                          pad):
-    """`pad` idle requests past the kernel's request count (the runner's max_num_seqs rows):
+def test_wholestep_qsa_writes_match_stock_over_two_steps(
+    interpret, monkeypatch, fused, batched, pad
+):
+    """`pad` idle requests past the kernel's request count (the runner's max_num_seqs
+    rows):
     the whole-step writer crops them (`num_requests`) and must still match stock."""
     monkeypatch.setattr(envs, "VLLM_TPU_QSA_FUSED_KV_WRITE", fused)
     rng = np.random.default_rng(7 + fused)
     contexts, active = CONTEXTS + [0] * pad, ACTIVE + [False] * pad
     main, comp, rings = tables(rng, contexts, active)
-    pool0 = jnp.asarray(rng.normal(0, 1, (PAGES, PAGE_ROWS, 1, 4, WIDTH)), jnp.float8_e4m3fn)
-    trig = jnp.pad(jnp.asarray(rng.normal(0, 1, (4096, ROTARY)), jnp.bfloat16),
-                   ((0, 0), (0, 128 - ROTARY)))
+    pool0 = jnp.asarray(
+        rng.normal(0, 1, (PAGES, PAGE_ROWS, 1, 4, WIDTH)), jnp.float8_e4m3fn
+    )
+    trig = jnp.pad(
+        jnp.asarray(rng.normal(0, 1, (4096, ROTARY)), jnp.bfloat16),
+        ((0, 0), (0, 128 - ROTARY)),
+    )
     ctx = np.array(contexts, np.int32)
     p_stock = p_whole = pool0
     for _ in range(2):
         positions, starts, per_layer = step_inputs(rng, ctx, active)
         context = jnp.asarray(ctx)
-        p_stock = stock(p_stock, per_layer, positions, trig, starts, context, main, comp, rings)
-        p_whole = whole(p_whole, per_layer, positions, trig, starts, context, main, comp, rings,
-                        num_requests=len(CONTEXTS) if pad else None, batched=batched)
+        p_stock = stock(
+            p_stock, per_layer, positions, trig, starts, context, main, comp, rings
+        )
+        p_whole = whole(
+            p_whole,
+            per_layer,
+            positions,
+            trig,
+            starts,
+            context,
+            main,
+            comp,
+            rings,
+            num_requests=len(CONTEXTS) if pad else None,
+            batched=batched,
+        )
         assert not np.array_equal(raw(p_stock), raw(pool0)), "nothing written"
         np.testing.assert_array_equal(raw(p_whole), raw(p_stock))
         ctx = ctx + np.where(active, ACCEPTED + [0] * pad, 0).astype(np.int32)
 
 
 def test_check_catches_a_swapped_main_slot(interpret, monkeypatch):
-    """Positive control: the two layers' main head slots swapped must change the pool."""
+    """Positive control: the two layers' main head slots swapped must change the
+    pool.
+    """
     monkeypatch.setattr(envs, "VLLM_TPU_QSA_FUSED_KV_WRITE", False)
     rng = np.random.default_rng(3)
     main, comp, rings = tables(rng, CONTEXTS, ACTIVE)
-    pool0 = jnp.asarray(rng.normal(0, 1, (PAGES, PAGE_ROWS, 1, 4, WIDTH)), jnp.float8_e4m3fn)
-    trig = jnp.pad(jnp.asarray(rng.normal(0, 1, (4096, ROTARY)), jnp.bfloat16),
-                   ((0, 0), (0, 128 - ROTARY)))
-    positions, starts, per_layer = step_inputs(rng, np.array(CONTEXTS, np.int32), ACTIVE)
+    pool0 = jnp.asarray(
+        rng.normal(0, 1, (PAGES, PAGE_ROWS, 1, 4, WIDTH)), jnp.float8_e4m3fn
+    )
+    trig = jnp.pad(
+        jnp.asarray(rng.normal(0, 1, (4096, ROTARY)), jnp.bfloat16),
+        ((0, 0), (0, 128 - ROTARY)),
+    )
+    positions, starts, per_layer = step_inputs(
+        rng, np.array(CONTEXTS, np.int32), ACTIVE
+    )
     context = jnp.asarray(CONTEXTS, jnp.int32)
     want = stock(pool0, per_layer, positions, trig, starts, context, main, comp, rings)
-    got = whole(pool0, per_layer[::-1], positions, trig, starts, context, main, comp, rings)
+    got = whole(
+        pool0, per_layer[::-1], positions, trig, starts, context, main, comp, rings
+    )
     assert not np.array_equal(raw(got), raw(want))
 
 
 def test_check_catches_swapped_ring_pages_in_the_batched_writer(interpret, monkeypatch):
     """Positive control for the stacked ring read/write: layers' ring pages swapped must
-    change the pool (a layer-major / request-major mix-up in the batch looks like this)."""
+    change the pool (a layer-major / request-major mix-up in the batch looks like this).
+    """
     monkeypatch.setattr(envs, "VLLM_TPU_QSA_FUSED_KV_WRITE", False)
     rng = np.random.default_rng(5)
     main, comp, rings = tables(rng, CONTEXTS, ACTIVE)
-    pool0 = jnp.asarray(rng.normal(0, 1, (PAGES, PAGE_ROWS, 1, 4, WIDTH)), jnp.float8_e4m3fn)
-    trig = jnp.pad(jnp.asarray(rng.normal(0, 1, (4096, ROTARY)), jnp.bfloat16),
-                   ((0, 0), (0, 128 - ROTARY)))
-    positions, starts, per_layer = step_inputs(rng, np.array(CONTEXTS, np.int32), ACTIVE)
+    pool0 = jnp.asarray(
+        rng.normal(0, 1, (PAGES, PAGE_ROWS, 1, 4, WIDTH)), jnp.float8_e4m3fn
+    )
+    trig = jnp.pad(
+        jnp.asarray(rng.normal(0, 1, (4096, ROTARY)), jnp.bfloat16),
+        ((0, 0), (0, 128 - ROTARY)),
+    )
+    positions, starts, per_layer = step_inputs(
+        rng, np.array(CONTEXTS, np.int32), ACTIVE
+    )
     context = jnp.asarray(CONTEXTS, jnp.int32)
     want = stock(pool0, per_layer, positions, trig, starts, context, main, comp, rings)
-    got = whole(pool0, per_layer, positions, trig, starts, context, main, comp, rings[::-1])
+    got = whole(
+        pool0, per_layer, positions, trig, starts, context, main, comp, rings[::-1]
+    )
     assert not np.array_equal(raw(got), raw(want))

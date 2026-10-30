@@ -216,9 +216,7 @@ def _staged_walk_products(
                 torch.int64
             )
             gathered = torch.gather(tbl, 1, state_offsets.unsqueeze(1)).squeeze(1)
-            states_g.append(
-                torch.where(active, gathered, torch.zeros_like(gathered))
-            )
+            states_g.append(torch.where(active, gathered, torch.zeros_like(gathered)))
             if ckpt_window > 1:
                 ckpt_offsets = state_offsets.unsqueeze(1) + torch.arange(
                     ckpt_window, device=seq_lens.device, dtype=torch.int64
@@ -255,6 +253,7 @@ def _staged_walk_products(
             gathered = torch.where(
                 active.unsqueeze(0), gathered, torch.zeros_like(gathered)
             )
+            ck = None
             if ckpt_window > 1:
                 ckpt_offsets = state_offsets.unsqueeze(1) + torch.arange(
                     ckpt_window, device=device, dtype=torch.int64
@@ -269,6 +268,7 @@ def _staged_walk_products(
             for k, j in enumerate(members):
                 states[j] = gathered[k].clone()
                 if ckpt_window > 1:
+                    assert ck is not None
                     ckpts[j] = ck[k].clone()
     if ckpt_window <= 1:
         ckpts = []
@@ -629,9 +629,7 @@ def stage_block_table_uploads(
                 if gid in seen or (gids is not None and gid not in gids):
                     continue
                 seen.add(gid)
-                block_table_obj, target_num_blocks = builder._block_table_geometry(
-                    ctx
-                )
+                block_table_obj, target_num_blocks = builder._block_table_geometry(ctx)
                 entries.append((gid, block_table_obj, target_num_blocks))
                 entry_builders.append(builder)
         if envs.VLLM_TPU_STAGE_ENTRIES_CACHE:

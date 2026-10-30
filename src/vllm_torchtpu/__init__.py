@@ -512,9 +512,10 @@ def _patch_vllm_compile_all_ranges() -> None:
         )
 
         if graph_is_rank_dependent(self.graph):
-            # No peer replays a rank-salted artifact: compile every range here without waiting
-            # for an owner (an owner that failed left its peers waiting PEER_WAIT_S), then fail
-            # together, before any rank runs the program its peers may not have.
+            # No peer replays a rank-salted artifact: compile every range here
+            # without waiting for an owner (an owner that failed left its peers
+            # waiting PEER_WAIT_S), then fail together, before any rank runs
+            # the program its peers may not have.
             failure: Exception | None = None
             try:
                 compile_rotated(self, local_rank)
@@ -522,7 +523,8 @@ def _patch_vllm_compile_all_ranges() -> None:
                 failure = e
             if not agree_all_ranks(failure is None):
                 raise failure or RuntimeError(
-                    "rank-dependent compile failed on another rank; failing on all ranks"
+                    "rank-dependent compile failed on another rank; "
+                    "failing on all ranks"
                 )
             return
         if not envs.TPU_PRECOMPILE_PEER_REPLAY:

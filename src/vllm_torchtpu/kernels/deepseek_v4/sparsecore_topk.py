@@ -571,6 +571,8 @@ def _topk_body(
         # The row stays in HBM; each wave copies only the chunks below the
         # row's length into one resident buffer. Every scores_vmem read in
         # _run_step is below walk_chunks * LANES <= the copied extent.
+        assert bounded_vmem is not None
+        bounded_vmem_ = bounded_vmem
         chunk = math.gcd(slice_len, BOUNDED_CHUNK_WORDS)
 
         def copy_live(len_slice_vmem):
@@ -585,7 +587,7 @@ def _topk_body(
                 dst = pl.multiple_of(c * chunk, chunk)
                 return pltpu.make_async_copy(
                     scores_hbm.at[pl.ds(src, chunk)],
-                    bounded_vmem.at[pl.ds(dst, chunk)],
+                    bounded_vmem_.at[pl.ds(dst, chunk)],
                     bounded_sem,
                 )
 

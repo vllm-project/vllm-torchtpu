@@ -1384,8 +1384,10 @@ def streamindex_topk(
         page_size = page_size_per_kv_packing * (
             kv_packing if components is None else components.keys.packing
         )
-    pages_per_seq = page_indices.shape[0] // max_num_seqs * (
-        1 if components is None else components.table_expansion[0]
+    pages_per_seq = (
+        page_indices.shape[0]
+        // max_num_seqs
+        * (1 if components is None else components.table_expansion[0])
     )
 
     for bkv_p in num_kv_pages_per_blocks:

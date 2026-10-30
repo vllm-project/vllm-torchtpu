@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -34,7 +35,7 @@ _armed = False
 
 def _seconds() -> float:
     try:
-        return float(os.environ.get("VLLM_TPU_STALL_WATCHDOG_S", "0") or 0)
+        return envs.VLLM_TPU_STALL_WATCHDOG_S
     except ValueError:
         return 0.0
 
@@ -52,9 +53,9 @@ def install_signal_dump() -> None:
         faulthandler.register(signal.SIGUSR2, file=sys.stderr, all_threads=True)
     except (AttributeError, ValueError, RuntimeError):
         return
-    # Plugins load before vLLM configures logging; print so the line shows.
-    print(f"Stall watchdog: SIGUSR2 dumps the stacks of pid {os.getpid()}",
-          file=sys.stderr, flush=True)
+    # Plugins load before vLLM configures logging; write directly to stderr.
+    sys.stderr.write(f"Stall watchdog: SIGUSR2 dumps the stacks of pid {os.getpid()}\n")
+    sys.stderr.flush()
 
 
 def arm() -> None:
@@ -134,5 +135,7 @@ def start(rank: int) -> None:
         target=_watch, args=(limit, rank), name="stall-watchdog", daemon=True
     ).start()
     logger.info(
-        "Stall watchdog on: rank %d dumps stacks after %.0f s without a step", rank, limit
+        "Stall watchdog on: rank %d dumps stacks after %.0f s without a step",
+        rank,
+        limit,
     )

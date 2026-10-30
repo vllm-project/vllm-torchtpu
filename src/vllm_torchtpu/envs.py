@@ -244,6 +244,8 @@ if TYPE_CHECKING:
     VLLM_TPU_PINNED_TOKEN_COPY: bool = False
     VLLM_TPU_SAMPLING_PARAMS_REUSE: bool = False
     VLLM_TPU_PY_SAMPLER_S: float = 0.0
+    VLLM_TPU_PY_SAMPLER_INTERVAL_MS: float = 1.0
+    VLLM_TPU_PY_SAMPLER_DELAY_S: float = 600.0
     VLLM_TPU_STAGE_ENTRIES_CACHE: bool = False
     VLLM_TPU_STALL_WATCHDOG_S: float = 0.0
     VLLM_TPU_VERIFY_FUSED: bool = False
@@ -266,6 +268,15 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_MEGAKERNEL: str = ""
     VLLM_TPU_MK_OWN_OPERANDS: bool = True
+    VLLM_TPU_MK_OPERAND_DUMP: bool = False
+    VLLM_TPU_MK_STEP_MIX_INTERVAL_S: float = 10.0
+    CDK_OUTPUT_DIR: str = "/tmp/cdk_output"
+    QWEN4_EXP_MAX_POOL_BYTES: int | None = None
+    QWEN4_EXP_POOL_SIZING: str = "hbm"
+    QWEN4_EXP_POOL_GRAPH_COPIES: int = 0
+    QWEN4_EXP_POOL_HEADROOM_BYTES: int = 6 * 1024**3
+    QWEN4_EXP_PACK_COMPRESSED_K: bool = False
+    QWEN4_EXP_PACK_MAIN_KV: bool = False
 
 
 def env_with_choices(
@@ -590,11 +601,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Qwen4-exp MTP: the draft's QSA layer attends the target's last QSA layer
     # selection (the request's last verified row) instead of scoring its own
     # indexer: a selection-sharing approximation, gated on real AL.
-    # Qwen4Exp n-gram context: "1" = H2D only each row's window of the host token store that the
-    # device context can address ([host_ctx - K - ngram + 1, host_ctx), K = spec tokens) instead of
-    # the whole [max_num_seqs, max_model_len] table every step (16 MiB at c1, ~2 ms of transfer);
-    # "check" = both paths and log mismatches for the first 200 steps, then as "1"
-    # (models/vllm/qwen4_exp/inputs.py).
+    # Qwen4Exp n-gram context: "1" = H2D only each row's window of the host
+    # token store that the device context can address
+    # ([host_ctx - K - ngram + 1, host_ctx), K = spec tokens) instead of the
+    # whole [max_num_seqs, max_model_len] table every step (16 MiB at c1, ~2 ms
+    # of transfer); "check" = both paths and log mismatches for the first 200
+    # steps, then as "1" (models/vllm/qwen4_exp/inputs.py).
     "VLLM_TPU_QWEN4_NGRAM_WINDOW": lambda: os.getenv("VLLM_TPU_QWEN4_NGRAM_WINDOW", ""),
     # Qwen4Exp: run the adapter's per-step input preparation (n-gram context,
     # speculative record, slots) as one compiled program instead of ~20 eager
@@ -618,12 +630,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_FUSED_SPARSE_DECODE": env_bool(
         "VLLM_TPU_QSA_FUSED_SPARSE_DECODE", default=False
     ),
-    # Mixed QSA steps: move the decode prefix off the prefill rows with contiguous dynamic
-    # slices instead of row gathers (same values; prefill chunks spent ~3 ms/8K on the gathers).
+    # Mixed QSA steps: move the decode prefix off the prefill rows with
+    # contiguous dynamic slices instead of row gathers (same values; prefill
+    # chunks spent ~3 ms/8K on the gathers).
     "VLLM_TPU_QSA_PREFIX_SLICE": env_bool("VLLM_TPU_QSA_PREFIX_SLICE", default=False),
-    # QSA indexer cache updates: build each token's compression-group members from static
-    # shifts and the ring / tag rows from a one-hot product instead of per-token row gathers
-    # (same values; ~3 ms of gathers per 8K prefill chunk).
+    # QSA indexer cache updates: build each token's compression-group members
+    # from static shifts and the ring / tag rows from a one-hot product instead
+    # of per-token row gathers (same values; ~3 ms of gathers per 8K prefill).
     "VLLM_TPU_QSA_INDEXER_UPDATE_SHIFT": env_bool(
         "VLLM_TPU_QSA_INDEXER_UPDATE_SHIFT", default=False
     ),
@@ -936,17 +949,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # streams, PLE gate and residual math run on 1/TP of the tokens. Steps
     # below QWEN4_EXP_PREFILL_SP_MIN_TOKENS keep the replicated TP path.
     "QWEN4_EXP_PREFILL_SP": env_bool("QWEN4_EXP_PREFILL_SP"),
-    "QWEN4_EXP_PREFILL_SP_MIN_TOKENS": env_int(
-        "QWEN4_EXP_PREFILL_SP_MIN_TOKENS", 1024
-    ),
+    "QWEN4_EXP_PREFILL_SP_MIN_TOKENS": env_int("QWEN4_EXP_PREFILL_SP_MIN_TOKENS", 1024),
     # With QWEN4_EXP_PREFILL_SP=1: the adaptive fused EP MoE takes each
     # rank's own rows on sequence-parallel steps (no replica split/restore)
     # and the shared expert's TP sum is reduce-scattered, not all-reduced.
     "QWEN4_EXP_PREFILL_SP_MOE": env_bool("QWEN4_EXP_PREFILL_SP_MOE"),
-    # With QWEN4_EXP_PREFILL_SP_MOE=1: the shared expert of sequence-parallel steps runs on
-    # this rank's own rows with a replicated copy of its weights (loaded next to the TP slices,
-    # which decode keeps), so it needs no all-gather or reduce-scatter. Costs one full shared
-    # expert of HBM per rank.
+    # With QWEN4_EXP_PREFILL_SP_MOE=1: the shared expert of sequence-parallel
+    # steps runs on this rank's own rows with a replicated copy of its weights
+    # (loaded next to the TP slices, which decode keeps), so it needs no
+    # all-gather or reduce-scatter. Costs one full shared expert of HBM per rank.
     "QWEN4_EXP_PREFILL_SP_SHARED_LOCAL": env_bool("QWEN4_EXP_PREFILL_SP_SHARED_LOCAL"),
     # With QWEN4_EXP_PREFILL_SP=1: the sequence-parallel graph pads each
     # rank's shard to the HC kernels' row tile, so buckets whose shard does
@@ -1514,6 +1525,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SAMPLING_PARAMS_REUSE": env_bool("VLLM_TPU_SAMPLING_PARAMS_REUSE"),
     # Sample the step thread's Python stack for N s (runner/py_sampler.py).
     "VLLM_TPU_PY_SAMPLER_S": env_float("VLLM_TPU_PY_SAMPLER_S", 0.0),
+    "VLLM_TPU_PY_SAMPLER_INTERVAL_MS": env_float(
+        "VLLM_TPU_PY_SAMPLER_INTERVAL_MS", 1.0
+    ),
+    "VLLM_TPU_PY_SAMPLER_DELAY_S": env_float("VLLM_TPU_PY_SAMPLER_DELAY_S", 600.0),
     # Keep the per-group (block table, width) list the staged metadata walk
     # builds, instead of re-walking every KV cache group each step.
     "VLLM_TPU_STAGE_ENTRIES_CACHE": env_bool("VLLM_TPU_STAGE_ENTRIES_CACHE"),
@@ -1525,7 +1540,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Compare the fused verify and draft seed with the separate programs for
     # the first N chunks; the first _FAULT checks perturb the compared copy
     # (a positive control that must be caught).
-    "VLLM_TPU_VERIFY_FUSED_CHECK": env_nonnegative_int("VLLM_TPU_VERIFY_FUSED_CHECK", 0),
+    "VLLM_TPU_VERIFY_FUSED_CHECK": env_nonnegative_int(
+        "VLLM_TPU_VERIFY_FUSED_CHECK", 0
+    ),
     "VLLM_TPU_VERIFY_FUSED_CHECK_FAULT": env_nonnegative_int(
         "VLLM_TPU_VERIFY_FUSED_CHECK_FAULT", 0
     ),
@@ -1619,6 +1636,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # re-materializes a buffer with an in-place slice write or a dtype view on
     # every call (~22 as_strided/step, ~1 ms); exact, so on by default.
     "VLLM_TPU_MK_OWN_OPERANDS": env_bool("VLLM_TPU_MK_OWN_OPERANDS", True),
+    "VLLM_TPU_MK_OPERAND_DUMP": env_bool("VLLM_TPU_MK_OPERAND_DUMP", False),
+    "VLLM_TPU_MK_STEP_MIX_INTERVAL_S": env_float(
+        "VLLM_TPU_MK_STEP_MIX_INTERVAL_S", 10.0
+    ),
+    "CDK_OUTPUT_DIR": env_str("CDK_OUTPUT_DIR", "/tmp/cdk_output"),
+    "QWEN4_EXP_MAX_POOL_BYTES": env_optional_int("QWEN4_EXP_MAX_POOL_BYTES"),
+    "QWEN4_EXP_POOL_SIZING": env_str("QWEN4_EXP_POOL_SIZING", "hbm"),
+    "QWEN4_EXP_POOL_GRAPH_COPIES": env_int("QWEN4_EXP_POOL_GRAPH_COPIES", 0),
+    "QWEN4_EXP_POOL_HEADROOM_BYTES": env_int(
+        "QWEN4_EXP_POOL_HEADROOM_BYTES", 6 * 1024**3
+    ),
+    "QWEN4_EXP_PACK_COMPRESSED_K": env_bool(
+        "QWEN4_EXP_PACK_COMPRESSED_K", default=False
+    ),
+    "QWEN4_EXP_PACK_MAIN_KV": env_bool("QWEN4_EXP_PACK_MAIN_KV", default=False),
 }
 
 

@@ -59,9 +59,7 @@ def test_topk_rows_update_matches_fill_then_write(rows, width, topk, num_tokens)
     want = _reference(stale.clone(), topk, num_tokens, topk_indices)
 
     got_rows = _topk_rows(stale, topk, num_tokens, topk_indices)
-    got = rows_update_jax(
-        jnp.asarray(stale.numpy()), jnp.asarray(got_rows.numpy())
-    )
+    got = rows_update_jax(jnp.asarray(stale.numpy()), jnp.asarray(got_rows.numpy()))
 
     torch.testing.assert_close(torch.tensor(np.asarray(got)), want, rtol=0, atol=0)
     # What attention slices with `[:num_tokens]`.

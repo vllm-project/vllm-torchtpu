@@ -7,8 +7,8 @@ No allocation or device initialization takes place here.
 """
 
 import math
-import os
 from dataclasses import dataclass, field, replace
+from typing import Any
 
 import torch
 from vllm.v1.kv_cache_interface import (
@@ -18,6 +18,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 
 from .config import mtp_layer_prefixes, native_cache_specs
@@ -35,8 +36,7 @@ def pack_compressed_k_enabled() -> bool:
     Off by default. ``QWEN4_EXP_PACK_COMPRESSED_K=1`` packs; see
     ``pooled_cache_specs``.
     """
-    value = os.environ.get(PACK_COMPRESSED_K_ENV, "0").strip().lower()
-    return value in ("1", "true", "yes", "on")
+    return envs.QWEN4_EXP_PACK_COMPRESSED_K
 
 
 PACK_MAIN_KV_ENV = "QWEN4_EXP_PACK_MAIN_KV"
@@ -48,8 +48,7 @@ def pack_main_kv_enabled() -> bool:
     Off by default. ``QWEN4_EXP_PACK_MAIN_KV=1`` pairs; see
     ``pooled_cache_specs``.
     """
-    value = os.environ.get(PACK_MAIN_KV_ENV, "0").strip().lower()
-    return value in ("1", "true", "yes", "on")
+    return envs.QWEN4_EXP_PACK_MAIN_KV
 
 
 @dataclass(frozen=True)
@@ -123,7 +122,9 @@ def pooled_cache_specs(cfg):
     """
     specs = native_cache_specs(cfg)
     text = cfg.model_config.hf_text_config
-    main = specs[f"model.layers.{text.layer_types.index('full_attention')}.self_attn"]
+    main: Any = specs[
+        f"model.layers.{text.layer_types.index('full_attention')}.self_attn"
+    ]
     token_bytes = main.page_size_bytes // main.block_size
     gdn = specs[
         f"model.layers.{text.layer_types.index('linear_attention')}.linear_attn"

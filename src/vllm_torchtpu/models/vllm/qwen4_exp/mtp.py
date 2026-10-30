@@ -23,7 +23,7 @@ forward-context metadata, which the runner's MTP proposer builds for step 0
 import copy
 import re
 from collections.abc import Iterable
-from typing import cast
+from typing import Any, cast
 
 import torch
 from torch import nn
@@ -52,7 +52,6 @@ from .model import (
     moe_weights_mapper,
     verify_moe_checkpoint,
 )
-
 from .qsa import QSAMetadata
 
 _CHECKPOINT_LAYER = re.compile(r"^mtp\.layers\.(\d+)\.")
@@ -117,6 +116,9 @@ def mtp_checkpoint_name(name):
 
 
 class Qwen4ExpMultiTokenPredictor(nn.Module):
+    fc_embedding: ReplicatedLinear
+    fc_hidden: ReplicatedLinear
+
     def __init__(self, cfg, prefixes):
         super().__init__()
         t = cfg.model_config.hf_text_config
@@ -166,7 +168,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         # decode mix (TPU_QWEN4_HC_DECODE_FUSED picks the fused path by the
         # token count while tracing).
         for layer in self.layers:
-            layer.self_attn.single_graph = True
+            cast(Any, layer.self_attn).single_graph = True
         for module in self.modules():
             if isinstance(module, GatedResidual):
                 module.disable_decode_fused()
@@ -261,7 +263,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
 # dynamic draft_rows dim was compiled at the bucket size (s64[256] at bucket
 # 256) and failed against the request-sized rows a step passes. The proposer
 # always passes it at the chunk's fixed request capacity instead.
-QWEN4_EXP_MTP_DYNAMIC_ARG_DIMS = {
+QWEN4_EXP_MTP_DYNAMIC_ARG_DIMS: dict[str, Any] = {
     "input_ids": 0,
     "positions": 0,
     "hidden_states": 0,
@@ -370,7 +372,9 @@ class Qwen4ExpMTP(nn.Module):
         parameters = dict(self.named_parameters())
         moe_mapper = moe_weights_mapper()
         layers = cast(nn.ModuleList, self.model.layers)
-        moe_loaders = [AutoWeightsLoader(layer.mlp) for layer in layers]
+        moe_loaders = [
+            AutoWeightsLoader(cast(nn.Module, layer.mlp)) for layer in layers
+        ]
         loaded: set[str] = set()
         source: set[str] = set()
         for original, weight in weights:
@@ -409,7 +413,7 @@ class Qwen4ExpMTP(nn.Module):
                 moe_mapper,
                 f"MTP layer{i}",
             )
-            layer.self_attn.finalize_weights()
+            cast(Any, layer.self_attn).finalize_weights()
         ordinary = {
             name
             for name in parameters

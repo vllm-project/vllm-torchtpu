@@ -11,11 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU: compile and time the served whole-step call (`build_wholestep_call`, L=44) per bucket.
+"""TPU: compile and time the served whole-step call (`build_wholestep_call`, L=44) per
+bucket.
 
-Random weights from the kernel plan's shapes, a served-geometry unified pool (small block
-count), runner-shaped metadata: `nreq` requests with contexts near `--ctx`, distinct blocks per
-request and layer, uniform T=4 verify windows. Prints compile seconds and the median call
+Random weights from the kernel plan's shapes, a served-geometry unified pool (small
+block
+count), runner-shaped metadata: `nreq` requests with contexts near `--ctx`, distinct
+blocks per
+request and layer, uniform T=4 verify windows. Prints compile seconds and the median
+call
 time per bucket. Usage (8 cores, one process):
   python tests/megakernel/tpu_bench_wholestep_call.py --buckets 4,8,16 --ctx 3000
 """
@@ -35,11 +39,14 @@ from vllm_torchtpu.megakernel import kernel
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.models import qwen38
 from vllm_torchtpu.megakernel.wholestep.spec import wholestep_spec
+from vllm_torchtpu.megakernel_runtime import qwen38_wholestep_call as wsc
 from vllm_torchtpu.megakernel_runtime.qwen38_gdn_state import Qwen38GdnPoolLayout
 from vllm_torchtpu.megakernel_runtime.qwen38_segment_call import segment_tiles
 from vllm_torchtpu.megakernel_runtime.qwen38_wholestep_cache import QSALayerCache
-from vllm_torchtpu.megakernel_runtime import qwen38_wholestep_call as wsc
-from vllm_torchtpu.megakernel_runtime.qwen38_wholestep_call import build_wholestep_call, indexed_options
+from vllm_torchtpu.megakernel_runtime.qwen38_wholestep_call import (
+    build_wholestep_call,
+    indexed_options,
+)
 
 
 def main():
@@ -51,18 +58,38 @@ def main():
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--wstd", type=float, default=0.02)
     ap.add_argument("--L", type=int, default=44)
-    ap.add_argument("--remove", default="",
-                    help="timing-only removal arms (wrong results): comma list of "
-                         "attn_dma, attn_matmul, keys, select, uattn")
-    ap.add_argument("--shard", action="store_true",
-                    help="request-sharded indexer (VLLM_TPU_MEGAKERNEL wholeshard=1)")
-    ap.add_argument("--union", action="store_true",
-                    help="per-request union attention (VLLM_TPU_MEGAKERNEL wholeunion=1)")
-    ap.add_argument("--loop", action="store_true",
-                    help="per-request work in a fori_loop (VLLM_TPU_MEGAKERNEL wholeloop=1)")
-    ap.add_argument("--phys", action="store_true",
-                    help="union ids -> physical page ids per request (VLLM_TPU_MEGAKERNEL wholephys=1)")
-    ap.add_argument("--slots", type=int, default=0, help="union attention ring slots (0: default)")
+    ap.add_argument(
+        "--remove",
+        default="",
+        help="timing-only removal arms (wrong results): comma list of "
+        "attn_dma, attn_matmul, keys, select, uattn",
+    )
+    ap.add_argument(
+        "--shard",
+        action="store_true",
+        help="request-sharded indexer (VLLM_TPU_MEGAKERNEL wholeshard=1)",
+    )
+    ap.add_argument(
+        "--union",
+        action="store_true",
+        help="per-request union attention (VLLM_TPU_MEGAKERNEL wholeunion=1)",
+    )
+    ap.add_argument(
+        "--loop",
+        action="store_true",
+        help="per-request work in a fori_loop (VLLM_TPU_MEGAKERNEL wholeloop=1)",
+    )
+    ap.add_argument(
+        "--phys",
+        action="store_true",
+        help=(
+            "union ids -> physical page ids per request "
+            "(VLLM_TPU_MEGAKERNEL wholephys=1)"
+        ),
+    )
+    ap.add_argument(
+        "--slots", type=int, default=0, help="union attention ring slots (0: default)"
+    )
     a = ap.parse_args()
     _apply_removals(a.remove)
     wsc.SHARD_INDEX, wsc.UNION_ATTN, wsc.LOOP_REQUESTS = a.shard, a.union, a.loop
@@ -71,34 +98,65 @@ def main():
         from vllm_torchtpu.megakernel.wholestep import qsa_full_b
 
         qsa_full_b.UNION_SLOTS = a.slots
-    # The served Pallas mesh order (get_pallas_mesh in the server: [0, 1, 4, 5, 6, 7, 2, 3]).
+    # The served Pallas mesh order (get_pallas_mesh in the server: [0, 1, 4, 5, 6, 7, 2,
+    # 3]).
     by_id = {d.id: d for d in jax.devices()}
-    mesh = jax.sharding.Mesh(np.array([by_id[i] for i in (0, 1, 4, 5, 6, 7, 2, 3)]), ("tp",))
+    mesh = jax.sharding.Mesh(
+        np.array([by_id[i] for i in (0, 1, 4, 5, 6, 7, 2, 3)]), ("tp",)
+    )
     R = mesh.size
     g = qwen38.FULL
     tp, rep = NamedSharding(mesh, P("tp")), NamedSharding(mesh, P())
     L = a.L
     n_att = max(1, L // 4)
     n_gdn = L - n_att
-    layers = [QSALayerCache(compressed_slot=o % 2, main_slot=(o + 1) % 2) for o in range(n_att)]
+    layers = [
+        QSALayerCache(compressed_slot=o % 2, main_slot=(o + 1) % 2)
+        for o in range(n_att)
+    ]
     pps = a.max_groups * 4 // 128
     for B in [int(b) for b in a.buckets.split(",")]:
         nreq = B // 4
-        n_cols = pps  # table width (static); only the pages the contexts reach are allocated
+        n_cols = (
+            pps  # table width (static); only the pages the contexts reach are allocated
+        )
         n_used = -(-(a.ctx + 4 + nreq) // 128)
-        # Blocks: GDN 33 layers x 4 ckpts per request, QSA main + compressed per request & layer.
-        # Timing only: every QSA layer reads the same main / compressed pages of a request
+        # Blocks: GDN 33 layers x 4 ckpts per request, QSA main + compressed per request
+        # & layer.
+        # Timing only: every QSA layer reads the same main / compressed pages of a
+        # request
         # (a 90K-token context would otherwise need 11 x 1.4K blocks per request).
         NB = 1 + nreq * (n_gdn * 4 + n_att + 2 * n_used) + 8
-        layout = Qwen38GdnPoolLayout(pool_shape=(NB * 4, 128, 1, 4, 256), pool_dtype="float8_e4m3fn")
+        layout = Qwen38GdnPoolLayout(
+            pool_shape=(NB * 4, 128, 1, 4, 256), pool_dtype="float8_e4m3fn"
+        )
         call, in_specs, out_specs, donate = build_wholestep_call(
-            mesh, g, B, layout, layers, L=L, budget=a.budget, max_groups=a.max_groups,
-            norm_eps=1e-6, rotary_dim=64,
+            mesh,
+            g,
+            B,
+            layout,
+            layers,
+            L=L,
+            budget=a.budget,
+            max_groups=a.max_groups,
+            norm_eps=1e-6,
+            rotary_dim=64,
         )
         spec = wholestep_spec(
-            g, R, L=L, first="qsa", pool_gdn=True, qsa=dict(budget=a.budget), step=True,
-            indexed=dict(max_groups=a.max_groups, pages_per_seq=pps, carrier="fp8", n_layers=n_att,
-                         **indexed_options()),
+            g,
+            R,
+            L=L,
+            first="qsa",
+            pool_gdn=True,
+            qsa=dict(budget=a.budget),
+            step=True,
+            indexed=dict(
+                max_groups=a.max_groups,
+                pages_per_seq=pps,
+                carrier="fp8",
+                n_layers=n_att,
+                **indexed_options(),
+            ),
         )
         ex = ExecSpec(R=R, B=B, T=4, ctx=128, tiles=segment_tiles(B))
         _, info = kernel.make_step(mesh, spec, ex)
@@ -109,7 +167,10 @@ def main():
             nonlocal key
             key, k = jax.random.split(key)
             if jnp.issubdtype(dtype, jnp.floating):
-                return jax.device_put((jax.random.normal(k, shape, jnp.float32) * a.wstd).astype(dtype), tp)
+                return jax.device_put(
+                    (jax.random.normal(k, shape, jnp.float32) * a.wstd).astype(dtype),
+                    tp,
+                )
             return jax.device_put(jnp.zeros(shape, dtype), tp)
 
         ws = []
@@ -147,24 +208,47 @@ def main():
             for q in range(nreq):
                 ring[q, 0] = next(free)
             tabs += [ring.reshape(-1), main.reshape(-1), comp.reshape(-1)]
-        positions = np.concatenate([ctx[q] + np.arange(4) for q in range(nreq)]).astype(np.int32)
+        positions = np.concatenate([ctx[q] + np.arange(4) for q in range(nreq)]).astype(
+            np.int32
+        )
         inv = 1.0 / (1e7 ** (np.arange(0, 64, 2) / 64))
         ang = np.arange(a.ctx + 4096)[:, None] * inv[None]
-        trig = jnp.asarray(np.concatenate([np.cos(ang), np.sin(ang), np.zeros((len(ang), 64))], 1), jnp.bfloat16)
-        norms = [jnp.zeros((256,), jnp.bfloat16), jnp.zeros((128,), jnp.bfloat16)] * n_att
+        trig = jnp.asarray(
+            np.concatenate([np.cos(ang), np.sin(ang), np.zeros((len(ang), 64))], 1),
+            jnp.bfloat16,
+        )
+        norms = [
+            jnp.zeros((256,), jnp.bfloat16),
+            jnp.zeros((128,), jnp.bfloat16),
+        ] * n_att
         hidden = rnd((R * B, g.NHC * g.H), jnp.bfloat16)
-        pool = jax.jit(  # allocated sharded: a host-side zeros of the global pool does not fit
-            lambda: jnp.zeros((R * NB * 4, 128, 1, 4, 256), jnp.float8_e4m3fn), out_shardings=tp
+        # Allocated sharded: a host-side zeros of the global pool does not fit.
+        pool = jax.jit(
+            lambda nb=NB: jnp.zeros((R * nb * 4, 128, 1, 4, 256), jnp.float8_e4m3fn),
+            out_shardings=tp,
         )()
         put = lambda x: jax.device_put(jnp.asarray(x), rep)  # noqa: E731
-        args = [hidden, *ws, pool, *map(put, meta), *map(put, tabs), put(positions), put(qsl),
-                put(ctx), put(trig), *map(put, norms)]
+        args = [
+            hidden,
+            *ws,
+            pool,
+            *map(put, meta),
+            *map(put, tabs),
+            put(positions),
+            put(qsl),
+            put(ctx),
+            put(trig),
+            *map(put, norms),
+        ]
         f = jax.jit(call, donate_argnums=donate)
         t0 = time.time()
         res, pool = f(*args)
         jax.block_until_ready(res)
-        print(f"B={B} first call (compile+run) {time.time() - t0:.1f} s, finite "
-              f"{float(jnp.isfinite(res.astype(jnp.float32)).mean()):.4f}", flush=True)
+        print(
+            f"B={B} first call (compile+run) {time.time() - t0:.1f} s, finite "
+            f"{float(jnp.isfinite(res.astype(jnp.float32)).mean()):.4f}",
+            flush=True,
+        )
         ts = []
         for _ in range(a.iters):
             args[1 + len(ws)] = pool
@@ -174,16 +258,26 @@ def main():
             ts.append(time.perf_counter() - t0)
         r32 = res.astype(jnp.float32)
         fin_rows = np.asarray(jnp.isfinite(r32).all(axis=1)).reshape(R, B)
-        print(f"B={B} L={L} finite rows per rank:", fin_rows.astype(int).tolist(), flush=True)
-        print(f"B={B} pool finite {float(jnp.isfinite(pool.astype(jnp.float32)).mean()):.4f}", flush=True)
-        print(f"B={B} call median {1e3 * np.median(ts):.3f} ms p10 {1e3 * np.percentile(ts, 10):.3f} "
-              f"finite {float(jnp.isfinite(r32).mean()):.4f} absmean "
-              f"{float(jnp.nanmean(jnp.abs(r32))):.4g} (input {float(jnp.abs(hidden.astype(jnp.float32)).mean()):.4g})",
-              flush=True)
+        print(
+            f"B={B} L={L} finite rows per rank:",
+            fin_rows.astype(int).tolist(),
+            flush=True,
+        )
+        pool_fin = float(jnp.isfinite(pool.astype(jnp.float32)).mean())
+        print(f"B={B} pool finite {pool_fin:.4f}", flush=True)
+        in_mean = float(jnp.abs(hidden.astype(jnp.float32)).mean())
+        print(
+            f"B={B} call median {1e3 * np.median(ts):.3f} ms "
+            f"p10 {1e3 * np.percentile(ts, 10):.3f} "
+            f"finite {float(jnp.isfinite(r32).mean()):.4f} absmean "
+            f"{float(jnp.nanmean(jnp.abs(r32))):.4g} (input {in_mean:.4g})",
+            flush=True,
+        )
 
 
 def _apply_removals(spec: str) -> None:
-    """Timing-only removal arms: patch pieces of the QSA step out of the kernel (wrong results)."""
+    """Timing-only removal arms: patch pieces of the QSA step out of the kernel (wrong
+    results)."""
     import functools
 
     from vllm_torchtpu.megakernel.wholestep import indexer as ix
@@ -206,7 +300,9 @@ def _apply_removals(spec: str) -> None:
                 jnp.zeros(bits.shape[:1] + (1, 1), jnp.int32),
                 jnp.zeros(bits.shape[:1] + (1, 1), jnp.int32),
             )
-            ix.compact_row = lambda b, th, tm, nv, K, consts: jnp.zeros((1, K), jnp.int32)
+            ix.compact_row = lambda b, th, tm, nv, K, consts: jnp.zeros(
+                (1, K), jnp.int32
+            )
         else:
             raise ValueError(arm)
     if arms:

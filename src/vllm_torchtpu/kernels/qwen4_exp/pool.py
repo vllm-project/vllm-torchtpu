@@ -205,7 +205,8 @@ def request_checkpoints(x, history, final, starts, initial, active, ckpt_ids, wi
 
 
 def token_checkpoints(x, history, starts, initial, active, ckpt_ids, windowed):
-    """The same written (target, value) pairs as `request_checkpoints`, one row per token.
+    """The same written (target, value) pairs as `request_checkpoints`, one row per
+    token.
 
     A checkpoint is the window ending at one chunk token, so decode and verify
     buckets (T <= count * window) build T rows instead of count * window.
@@ -219,7 +220,9 @@ def token_checkpoints(x, history, starts, initial, active, ckpt_ids, windowed):
     t = jnp.arange(token_count, dtype=jnp.int32)
     req = jnp.minimum(jnp.sum(t[:, None] >= starts[None, 1:], axis=1), count - 1)
     rel = t - starts[req]
-    positions = rel[:, None] + 1 - state_len + jnp.arange(state_len, dtype=jnp.int32)[None]
+    positions = (
+        rel[:, None] + 1 - state_len + jnp.arange(state_len, dtype=jnp.int32)[None]
+    )
     past = history[req[:, None], jnp.clip(positions + state_len, 0, state_len - 1)]
     past = jnp.where(initial[req][:, None, None], past, 0)
     current = x[jnp.clip(starts[req][:, None] + positions, 0, max(token_count - 1, 0))]

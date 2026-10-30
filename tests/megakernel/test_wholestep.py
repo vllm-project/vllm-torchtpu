@@ -20,14 +20,11 @@ references with `project_reference` + `reference_rows` for the QSA layers.
 
 from __future__ import annotations
 
-from typing import Any
-
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import Mesh, NamedSharding
-from jax.sharding import PartitionSpec as P
+from jax.sharding import Mesh
 
 from vllm_torchtpu.megakernel import kernel
 from vllm_torchtpu.megakernel.blocks.hc import RESIDUAL_OUT
@@ -46,46 +43,71 @@ KV_LEN = [0, 1, 9, 100, 255, 257, 130, 64]  # empty row, single token, tile edge
 
 
 def _run(
-    key: int = 11, T: int = 4, zero: tuple[str, ...] = (), identical_experts: bool = False
+    key: int = 11,
+    T: int = 4,
+    zero: tuple[str, ...] = (),
+    identical_experts: bool = False,
 ):
     R = 2
     ex = ExecSpec(R=R, B=2 * T, T=T, ctx=128, interpret=True, tiles=_TILES)
     # Router gain: eight chained layers drift enough for a near-tied top-k router logit
-    # to flip one row's expert set; the library tests use the same knob for the same reason.
+    # to flip one row's expert set; the library tests use the same knob for the same
+    # reason.
     d = wi.random_wholestep_inputs(
-        key, G, ex, L, budget=BUDGET, n_pages=PAGES, kv_len=KV_LEN, zero=zero,
+        key,
+        G,
+        ex,
+        L,
+        budget=BUDGET,
+        n_pages=PAGES,
+        kv_len=KV_LEN,
+        zero=zero,
         identical_experts=identical_experts,
     )
     ref, kv_ref = wi.wholestep_reference(G, ex, d, L)
     spec = wholestep_spec(G, R, L=L, qsa=dict(budget=BUDGET))
     w_mk, states = wi.pack_wholestep(spec, G, ex, d, L)
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
-    pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(mesh, ex, d["inp"].pos, d["inp"].x, w_mk, states)
+    pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(
+        mesh, ex, d["inp"].pos, d["inp"].x, w_mk, states
+    )
     assert [x.name for x in kernel.extra_inputs(spec, ex)] == wi.EXTRA_NAMES
     step, _ = kernel.make_step(mesh, spec, ex)
     _, outs = step(pos_mk, hid_mk, w_mk, st_mk, *wi.extras(d, mesh, R))
     B = ex.B
     res = np.asarray(outs[RESIDUAL_OUT].reshape(R, ex.M, -1)[:, :B], np.float32)
-    kv = np.asarray(outs[KV_NEW], np.float32).reshape(R, L // G.att_every, ex.M, -1)[:, :, :B]
+    kv = np.asarray(outs[KV_NEW], np.float32).reshape(R, L // G.att_every, ex.M, -1)[
+        :, :, :B
+    ]
     x = np.asarray(d["inp"].x[:B], np.float32)
     return res, np.asarray(ref, np.float32), x, kv, np.asarray(kv_ref, np.float32)
 
 
 def _assert_within_budget(res: np.ndarray, ref: np.ndarray, layers: int = L) -> None:
     """The segment test's budget (mean 1e-2, q999 5e-2, max 1e-1 of mean |ref|, set for
-    L = 4: eight BF16-rounded sublayers), scaled by sqrt(sublayers / 8): BF16 rounding of the
-    residual stream accumulates as a random walk over the sublayers. Measured with identical
-    experts (no router flips, no outlier rows): L = 4 mean 0.0046 / q999 0.0475 / max 0.098;
-    L = 8 mean 0.0084 / q999 0.0590 / max 0.0755 (library segment L = 4: 0.0047 / 0.0446 /
+    L = 4: eight BF16-rounded sublayers), scaled by sqrt(sublayers / 8): BF16 rounding
+    of the
+    residual stream accumulates as a random walk over the sublayers. Measured with
+    identical
+    experts (no router flips, no outlier rows): L = 4 mean 0.0046 / q999 0.0475 / max
+    0.098;
+    L = 8 mean 0.0084 / q999 0.0590 / max 0.0755 (library segment L = 4: 0.0047 / 0.0446
+    /
     0.047)."""
     k = np.sqrt(2 * layers / 8)
     scale = float(np.abs(ref).mean())
     for r in range(res.shape[0]):
         d = np.abs(res[r] - ref)
         assert d.mean() < 1e-2 * k * scale, (r, d.mean(), scale)
-        # q999 6e-2 (was 5e-2): the sigmoid(z) GDN gate passes more BF16 rounding (first QSA
-        # layer's K/V rows: 0.0313 vs 0.0281); the segment parity tests moved 5e-2 -> 6e-2.
-        assert np.quantile(d, 0.999) < 6e-2 * k * scale, (r, np.quantile(d, 0.999), scale)
+        # q999 6e-2 (was 5e-2): the sigmoid(z) GDN gate passes more BF16 rounding (first
+        # QSA
+        # layer's K/V rows: 0.0313 vs 0.0281); the segment parity tests moved 5e-2 ->
+        # 6e-2.
+        assert np.quantile(d, 0.999) < 6e-2 * k * scale, (
+            r,
+            np.quantile(d, 0.999),
+            scale,
+        )
         assert d.max() < 1e-1 * k * scale, (r, d.max(), scale)
 
 
@@ -94,9 +116,12 @@ def test_two_groups_identical_experts_match_reference():
     res, ref, x, kv, kv_ref = _run(identical_experts=True)
     assert float(np.std(ref - x)) > 0.05
     _assert_within_budget(res, ref)
-    # The step's K/V rows (cache-write payload): the first QSA layer's input has seen three
-    # layers of drift, the second's seven; both inside the residual's depth-scaled budget.
-    # atol 4e-2: Qwen3.8's sigmoid(z) GDN gate passes more of the BF16-rounded GDN output
+    # The step's K/V rows (cache-write payload): the first QSA layer's input has seen
+    # three
+    # layers of drift, the second's seven; both inside the residual's depth-scaled
+    # budget.
+    # atol 4e-2: Qwen3.8's sigmoid(z) GDN gate passes more of the BF16-rounded GDN
+    # output
     # than silu did (5 of 8192 elements at 0.035; the segment tests widened likewise).
     np.testing.assert_allclose(kv[:, 0], kv_ref[:, 0], rtol=2e-2, atol=4e-2)
     for o in range(kv.shape[1]):
@@ -113,15 +138,24 @@ def test_two_groups_random_experts_statistical():
     for r in range(res.shape[0]):
         d = np.abs(res[r] - ref)
         assert d.mean() < 1e-2 * k * scale, (r, d.mean(), scale)
-        assert int((d.max(axis=1) > 1e-1 * k * scale).sum()) <= 2, (r, d.max(axis=1), scale)
+        assert int((d.max(axis=1) > 1e-1 * k * scale).sum()) <= 2, (
+            r,
+            d.max(axis=1),
+            scale,
+        )
 
 
 def test_two_groups_budget_catches_a_dropped_qsa_layer(monkeypatch):
-    """Positive control: the strict budget rejects a kernel whose QSA layers add nothing."""
+    """Positive control: the strict budget rejects a kernel whose QSA layers add
+    nothing."""
     from vllm_torchtpu.megakernel.wholestep.qsa_full import QSAFullBlock
 
     orig = QSAFullBlock.emit
-    monkeypatch.setattr(QSAFullBlock, "emit", lambda self, ctx, l, slot: 0.0 * orig(self, ctx, l, slot))
+    monkeypatch.setattr(
+        QSAFullBlock,
+        "emit",
+        lambda self, ctx, ln, slot: 0.0 * orig(self, ctx, ln, slot),
+    )
     res, ref, _, _, _ = _run(identical_experts=True)
     with pytest.raises(AssertionError):
         _assert_within_budget(res, ref)
@@ -129,7 +163,10 @@ def test_two_groups_budget_catches_a_dropped_qsa_layer(monkeypatch):
 
 # --------------------------------------------------------------------- stage B
 MAX_GROUPS = 1024
-CTX = [3000, 100]  # request 0: n_vis 750 > K (top-K path); request 1: n_vis 25 <= K (select all)
+CTX = [
+    3000,
+    100,
+]  # request 0: n_vis 750 > K (top-K path); request 1: n_vis 25 <= K (select all)
 
 
 def _run_b(key: int = 13, T: int = 4, identical_experts: bool = True):
@@ -144,12 +181,17 @@ def _run_b(key: int = 13, T: int = 4, identical_experts: bool = True):
     ref, _ = wi.wholestep_reference(G, ex, d, L)
     pps = d["mtab"].shape[1]
     spec = wholestep_spec(
-        G, R, L=L, qsa=dict(budget=BUDGET),
+        G,
+        R,
+        L=L,
+        qsa=dict(budget=BUDGET),
         indexed=dict(max_groups=MAX_GROUPS, pages_per_seq=pps, debug=True),
     )
     w_mk, states = wi.pack_wholestep(spec, G, ex, d, L)
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
-    pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(mesh, ex, d["inp"].pos, d["inp"].x, w_mk, states)
+    pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(
+        mesh, ex, d["inp"].pos, d["inp"].x, w_mk, states
+    )
     assert [x.name for x in kernel.extra_inputs(spec, ex)] == wi.EXTRA_NAMES_B
     step, _ = kernel.make_step(mesh, spec, ex)
     _, outs = step(pos_mk, hid_mk, w_mk, st_mk, *wi.extras_b(d, mesh, R))
@@ -157,12 +199,22 @@ def _run_b(key: int = 13, T: int = 4, identical_experts: bool = True):
     res = np.asarray(outs[RESIDUAL_OUT].reshape(R, ex.M, -1)[:, :B], np.float32)
     iq = np.asarray(outs[DBG_IQ], np.float32).reshape(R, n_att, ex.M, -1)[0, :, :B]
     ids = np.asarray(outs[DBG_IDS]).reshape(R, n_att, ex.M, -1)[0, :, :B]
-    return res, np.asarray(ref, np.float32), np.asarray(d["inp"].x[:B], np.float32), iq, ids, d, ex
+    return (
+        res,
+        np.asarray(ref, np.float32),
+        np.asarray(d["inp"].x[:B], np.float32),
+        iq,
+        ids,
+        d,
+        ex,
+    )
 
 
 def test_in_kernel_selection_exact_on_its_own_queries():
-    """Strict: the kernel's selected group ids equal the stock rule (top-K, ties -> lower id;
-    all visible groups when n_vis <= K) applied to the kernel's own index queries, every row
+    """Strict: the kernel's selected group ids equal the stock rule (top-K, ties ->
+    lower id;
+    all visible groups when n_vis <= K) applied to the kernel's own index queries, every
+    row
     and QSA layer. Separates selection logic (must be exact) from upstream rounding."""
     from vllm_torchtpu.megakernel.wholestep.indexer import score_rows, topk_reference
 
@@ -180,7 +232,8 @@ def test_in_kernel_selection_exact_on_its_own_queries():
 
 def test_two_groups_in_kernel_indexer_match_reference():
     """End to end: select-all rows (request 1) strictly inside the depth-scaled budget;
-    top-K rows (request 0) may see a boundary flip from 1-ulp drift upstream of the indexer
+    top-K rows (request 0) may see a boundary flip from 1-ulp drift upstream of the
+    indexer
     (as MoE routing does), so they are bounded statistically."""
     res, ref, x, _, _, _, ex = _run_b()
     assert float(np.std(ref - x)) > 0.05
@@ -189,11 +242,16 @@ def test_two_groups_in_kernel_indexer_match_reference():
     scale, k = float(np.abs(ref).mean()), np.sqrt(2 * L / 8)
     for r in range(res.shape[0]):
         d = np.abs(res[r, :T] - ref[:T])
-        assert int((d.max(axis=1) > 1e-1 * k * scale).sum()) <= 2, (r, d.max(axis=1), scale)
+        assert int((d.max(axis=1) > 1e-1 * k * scale).sum()) <= 2, (
+            r,
+            d.max(axis=1),
+            scale,
+        )
 
 
 def test_selection_check_catches_an_off_by_one_id(monkeypatch):
-    """Positive control for the strict selection check: ids shifted by one group fail it."""
+    """Positive control for the strict selection check: ids shifted by one group fail
+    it."""
     from vllm_torchtpu.megakernel.wholestep import indexer as ix
 
     orig = ix.compact_row
@@ -203,38 +261,77 @@ def test_selection_check_catches_an_off_by_one_id(monkeypatch):
 
 
 # --------------------------------------------------------------------- stage C
-CTX_C = [3001, 100]  # request 0: g_a holds one old token; request 1: g_a starts at the step
+CTX_C = [
+    3001,
+    100,
+]  # request 0: g_a holds one old token; request 1: g_a starts at the step
 
 
-def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, rank_ids: bool = False,
-           union: bool = False, stats: bool = False, loop: bool = False, ctx: list | None = None,
-           max_groups: int | None = None, phys: bool = False):
+def _run_c(
+    key: int = 17,
+    T: int = 4,
+    long: bool = False,
+    shard: bool = False,
+    rank_ids: bool = False,
+    union: bool = False,
+    stats: bool = False,
+    loop: bool = False,
+    ctx: list | None = None,
+    max_groups: int | None = None,
+    phys: bool = False,
+):
     from vllm_torchtpu.megakernel.wholestep.qsa_full_b import DBG_IDS, DBG_IQ
-    from vllm_torchtpu.megakernel.wholestep.qsa_full_c import CK_NEW, IR_NEW, KR_NEW, RING_NEW
+    from vllm_torchtpu.megakernel.wholestep.qsa_full_c import (
+        CK_NEW,
+        IR_NEW,
+        KR_NEW,
+        RING_NEW,
+    )
 
     CTX = CTX_C if ctx is None else ctx
     MG = MAX_GROUPS if max_groups is None else max_groups
     R = 2
     ex = ExecSpec(R=R, B=2 * T, T=T, ctx=128, interpret=True, tiles=_TILES)
-    d = wi.random_wholestep_inputs(key, G, ex, L, budget=BUDGET, n_pages=PAGES, identical_experts=True)
+    d = wi.random_wholestep_inputs(
+        key, G, ex, L, budget=BUDGET, n_pages=PAGES, identical_experts=True
+    )
     d = wi.add_indexer_inputs(key, G, ex, d, L, max_groups=MG, ctx=CTX)
     d = wi.add_step_inputs(key, G, ex, d, L, ctx=CTX)
-    if long:  # served long-context mode: HBM page tables, one request's scores at a time
+    if (
+        long
+    ):  # served long-context mode: HBM page tables, one request's scores at a time
         d = wi.add_carrier(key, d)
         d["hbm_tables"] = True
     ref, _ = wi.wholestep_reference(G, ex, d, L)
     steps = d.pop("_step_out")
     pps = d["mtab"].shape[1]
-    long_kw = dict(carrier="bf16", chunk_pages=8, hbm_tables=True, per_request_scores=True,
-                   bounded_chunks=True, shard_index=shard, union_attn=union,
-                   union_stats=stats, union_phys=phys, loop_requests=loop)
+    long_kw = dict(
+        carrier="bf16",
+        chunk_pages=8,
+        hbm_tables=True,
+        per_request_scores=True,
+        bounded_chunks=True,
+        shard_index=shard,
+        union_attn=union,
+        union_stats=stats,
+        union_phys=phys,
+        loop_requests=loop,
+    )
     spec = wholestep_spec(
-        G, R, L=L, qsa=dict(budget=BUDGET), step=True,
-        indexed=dict(max_groups=MG, pages_per_seq=pps, debug=True, **(long_kw if long else {})),
+        G,
+        R,
+        L=L,
+        qsa=dict(budget=BUDGET),
+        step=True,
+        indexed=dict(
+            max_groups=MG, pages_per_seq=pps, debug=True, **(long_kw if long else {})
+        ),
     )
     w_mk, states = wi.pack_wholestep(spec, G, ex, d, L)
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
-    pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(mesh, ex, d["inp"].pos, d["inp"].x, w_mk, states)
+    pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(
+        mesh, ex, d["inp"].pos, d["inp"].x, w_mk, states
+    )
     names = list(wi.EXTRA_NAMES_C)
     if long:
         names.insert(names.index("qsa_ck") + 1, "qsa_cktab")
@@ -249,20 +346,32 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
     ids = np.asarray(outs[DBG_IDS]).reshape(R, n_att, ex.M, -1)[:, :, :B]
     ids = ids if rank_ids else ids[0]
     x0 = np.asarray(d["inp"].x[:B], np.float32)
-    d["_kr_new"] = np.asarray(outs[KR_NEW], np.float32).reshape(R, n_att, ex.M, -1)[:, :, :B]
-    d["_ir_new"] = np.asarray(outs[IR_NEW], np.float32).reshape(R, n_att, ex.M, -1)[:, :, :B]
+    d["_kr_new"] = np.asarray(outs[KR_NEW], np.float32).reshape(R, n_att, ex.M, -1)[
+        :, :, :B
+    ]
+    d["_ir_new"] = np.asarray(outs[IR_NEW], np.float32).reshape(R, n_att, ex.M, -1)[
+        :, :, :B
+    ]
     if stats:
-        from vllm_torchtpu.megakernel.wholestep.qsa_full_c import UNION_STATS, UNION_STATS_REQS
+        from vllm_torchtpu.megakernel.wholestep.qsa_full_c import (
+            UNION_STATS,
+            UNION_STATS_REQS,
+        )
 
-        d["_stats"] = np.asarray(outs[UNION_STATS]).reshape(R, n_att, UNION_STATS_REQS, -1)[:, :, :nreq]
+        d["_stats"] = np.asarray(outs[UNION_STATS]).reshape(
+            R, n_att, UNION_STATS_REQS, -1
+        )[:, :, :nreq]
     return res, np.asarray(ref, np.float32), x0, ck, ring, steps, iq, ids, d
 
 
 @pytest.mark.parametrize("long", [False, True])
 def test_step_selection_exact_on_its_own_queries(long):
-    """Strict: the pool-path ids are the stock selection (from the kernel's own queries and
-    its own completed-group key) restricted to groups older than the step, every row/layer.
-    `long`: HBM page tables with per-layer SMEM windows and per-request score buffers."""
+    """Strict: the pool-path ids are the stock selection (from the kernel's own queries
+    and
+    its own completed-group key) restricted to groups older than the step, every
+    row/layer.
+    `long`: HBM page tables with per-layer SMEM windows and per-request score buffers.
+    """
     from vllm_torchtpu.megakernel.wholestep.indexer import score_rows, topk_reference
 
     _, _, _, ck, _, _, iq, ids, d = _run_c(long=long)
@@ -275,7 +384,9 @@ def test_step_selection_exact_on_its_own_queries(long):
             qr = jnp.asarray(iq[o, r].reshape(4, -1), BF16)
             st = np.array(score_rows(qr, d["ck"][q]))[0]
             st[p3 // 4] = np.asarray(
-                score_rows(qr, jnp.broadcast_to(jnp.asarray(ck[o, q], BF16), (8, ck.shape[-1])))
+                score_rows(
+                    qr, jnp.broadcast_to(jnp.asarray(ck[o, q], BF16), (8, ck.shape[-1]))
+                )
             )[0, 0]
             n = int(d["nvis"][r])
             want = {i for i in topk_reference(st, n, BUDGET) if i < c0 // 4}
@@ -284,23 +395,32 @@ def test_step_selection_exact_on_its_own_queries(long):
 
 
 def test_sharded_indexer_matches_unsharded():
-    """`shard_index`: each rank scores and selects its own request (R = 2, two requests), then
-    the ranks exchange ids, lengths and `g_a` flags. Every rank ends with the unsharded kernel's
-    pool-path ids, and the step's outputs are bit-identical (same ids, same attention order)."""
+    """`shard_index`: each rank scores and selects its own request (R = 2, two
+    requests), then
+    the ranks exchange ids, lengths and `g_a` flags. Every rank ends with the unsharded
+    kernel's
+    pool-path ids, and the step's outputs are bit-identical (same ids, same attention
+    order)."""
     base = _run_c(long=True, rank_ids=True)
     shard = _run_c(long=True, shard=True, rank_ids=True)
     ids_b, ids_s = base[7], shard[7]
-    for r in range(ids_s.shape[0]):  # every rank holds every row's ids after the exchange
+    for r in range(
+        ids_s.shape[0]
+    ):  # every rank holds every row's ids after the exchange
         np.testing.assert_array_equal(ids_s[r], ids_b[0])
     for i, name in ((0, "residual"), (3, "ck_new"), (4, "ring_new")):
         np.testing.assert_array_equal(shard[i], base[i], err_msg=name)
 
 
 def test_union_attention_matches_per_row(monkeypatch):
-    """`union_attn`: each request's rows attend one union of their selections (here 229 of a
-    possible 256 groups for request 0: four ring tiles instead of one per row). Every row attends
-    the same tokens in the same order, so only the online softmax's tile partition differs: the
-    outputs agree to BF16 rounding (on these inputs, exactly), alone and with `shard_index`. A
+    """`union_attn`: each request's rows attend one union of their selections (here 229
+    of a
+    possible 256 groups for request 0: four ring tiles instead of one per row). Every
+    row attends
+    the same tokens in the same order, so only the online softmax's tile partition
+    differs: the
+    outputs agree to BF16 rounding (on these inputs, exactly), alone and with
+    `shard_index`. A
     corrupted row code (row 0 attending the whole union) is caught."""
     from vllm_torchtpu.megakernel.wholestep import union_attn as ua
 
@@ -309,8 +429,13 @@ def test_union_attention_matches_per_row(monkeypatch):
 
     def close(run: tuple) -> float:
         d = np.abs(run[0] - base[0])
-        assert d.max() < 1e-2 * scale and (d == 0).mean() > 0.99, (d.max() / scale, (d == 0).mean())
-        np.testing.assert_array_equal(run[7], base[7])  # the selection itself is untouched
+        assert d.max() < 1e-2 * scale and (d == 0).mean() > 0.99, (
+            d.max() / scale,
+            (d == 0).mean(),
+        )
+        np.testing.assert_array_equal(
+            run[7], base[7]
+        )  # the selection itself is untouched
         return float(d.max())
 
     close(_run_c(long=True, rank_ids=True, union=True))
@@ -328,7 +453,8 @@ def test_union_attention_matches_per_row(monkeypatch):
 
 def test_physical_ids_match_the_copy_address_math():
     """`union_attn.physical_ids` (vector lookup) equals the per-copy scalar address
-    `tab[v >> shift] * per_page + (v & (per_page - 1))` for every id of every table column,
+    `tab[v >> shift] * per_page + (v & (per_page - 1))` for every id of every table
+    column,
     including id 0 (the zero-padded slots); a wrong shift is caught."""
     from vllm_torchtpu.megakernel.wholestep import union_attn as ua
 
@@ -337,18 +463,33 @@ def test_physical_ids_match_the_copy_address_math():
         tab = rng.integers(0, 200_000, (1, pps)).astype(np.int32)
         ids = np.arange(per_page * pps, dtype=np.int32)
         ids = np.concatenate([ids, np.zeros((-len(ids)) % 128, np.int32)])
-        want = tab[0, ids >> (per_page.bit_length() - 1)] * per_page + (ids & (per_page - 1))
-        got = np.concatenate([
-            np.asarray(ua.physical_ids(jnp.asarray(ids[None, i : i + 128]), jnp.asarray(tab), per_page))[0]
-            for i in range(0, len(ids), 128)
-        ])
+        want = tab[0, ids >> (per_page.bit_length() - 1)] * per_page + (
+            ids & (per_page - 1)
+        )
+        got = np.concatenate(
+            [
+                np.asarray(
+                    ua.physical_ids(
+                        jnp.asarray(ids[None, i : i + 128]), jnp.asarray(tab), per_page
+                    )
+                )[0]
+                for i in range(0, len(ids), 128)
+            ]
+        )
         np.testing.assert_array_equal(got, want)
-        bad = np.asarray(ua.physical_ids(jnp.asarray(ids[None, :128] + 128 * per_page), jnp.asarray(tab), 2 * per_page))[0]
+        bad = np.asarray(
+            ua.physical_ids(
+                jnp.asarray(ids[None, :128] + 128 * per_page),
+                jnp.asarray(tab),
+                2 * per_page,
+            )
+        )[0]
         assert not np.array_equal(bad, want[:128])
 
 
 def test_union_physical_ids_bit_identical():
-    """`union_phys`: the copies read the same addresses, so the step is bit-identical to the
+    """`union_phys`: the copies read the same addresses, so the step is bit-identical to
+    the
     union kernel (alone and with `shard_index` + `loop_requests`)."""
     for kw in (dict(), dict(shard=True, loop=True)):
         base = _run_c(long=True, rank_ids=True, union=True, **kw)
@@ -358,8 +499,10 @@ def test_union_physical_ids_bit_identical():
 
 
 def test_union_stats_count_the_rows_selections():
-    """`union_stats`: per QSA layer and request, `[union size, sum of the rows' pool-path
-    groups, max row, rows with groups]`, equal on every rank to the counts from the ids."""
+    """`union_stats`: per QSA layer and request, `[union size, sum of the rows'
+    pool-path
+    groups, max row, rows with groups]`, equal on every rank to the counts from the ids.
+    """
     run = _run_c(long=True, rank_ids=True, union=True, shard=True, stats=True)
     ids, d = run[7][0], run[8]
     st = d["_stats"]
@@ -371,15 +514,26 @@ def test_union_stats_count_the_rows_selections():
                 r = q * 4 + t
                 n = min(int(d["nvis"][r]), BUDGET)
                 sets.append({int(x) for x in ids[o, r, :n] if x < ga})
-            want = [len(set().union(*sets)), sum(map(len, sets)), max(map(len, sets)),
-                    sum(1 for x in sets if x)]
+            want = [
+                len(set().union(*sets)),
+                sum(map(len, sets)),
+                max(map(len, sets)),
+                sum(1 for x in sets if x),
+            ]
             for r in range(st.shape[0]):
-                assert st[r, o, q, :4].tolist() == want, (r, o, q, st[r, o, q, :4], want)
+                assert st[r, o, q, :4].tolist() == want, (
+                    r,
+                    o,
+                    q,
+                    st[r, o, q, :4],
+                    want,
+                )
 
 
 def test_request_loop_matches_unrolled():
     """`loop_requests`: the per-request work in a `fori_loop` (traced request index, the
-    carrier prefetch chain on traced first/last flags) gives bit-identical outputs, alone and with
+    carrier prefetch chain on traced first/last flags) gives bit-identical outputs,
+    alone and with
     the sharded indexer and union attention."""
     for kw in (dict(), dict(shard=True, union=True)):
         base = _run_c(long=True, rank_ids=True, **kw)
@@ -389,73 +543,124 @@ def test_request_loop_matches_unrolled():
 
 
 def test_step_tokens_match_stock_semantics():
-    """Stage C: the completed group's key and the new ring rows equal the stock write for
-    every request and QSA layer (bf16-close: their inputs carry the residual's drift); the
-    residual, with every row's own tokens attended from VMEM, is inside the depth-scaled budget
-    on select-all rows (request 1). Top-K rows (request 0, 750 groups -> 64) are not held to
-    the per-row budget: a 1-ulp drift of the index query flips boundary groups there (the
-    selection itself is exact on the kernel's own queries, the strict test above); only their
+    """Stage C: the completed group's key and the new ring rows equal the stock write
+    for
+    every request and QSA layer (bf16-close: their inputs carry the residual's drift);
+    the
+    residual, with every row's own tokens attended from VMEM, is inside the depth-scaled
+    budget
+    on select-all rows (request 1). Top-K rows (request 0, 750 groups -> 64) are not
+    held to
+    the per-row budget: a 1-ulp drift of the index query flips boundary groups there
+    (the
+    selection itself is exact on the kernel's own queries, the strict test above); only
+    their
     mean error is bounded, at 3x the depth-scaled mean budget."""
     res, ref, x, ck, ring, steps, _, _, d = _run_c()
     assert float(np.std(ref - x)) > 0.05
     for o, s in enumerate(steps):
         # Cache-writer inputs: raw index key (replicated) and each rank's un-normed key.
         for r in range(d["_kr_new"].shape[0]):
-            np.testing.assert_allclose(d["_ir_new"][r, o], np.asarray(s["raw"], np.float32), atol=0.1, rtol=0.05)
-            np.testing.assert_allclose(d["_kr_new"][r, o], np.asarray(s["kr"][r], np.float32), atol=0.1, rtol=0.05)
+            np.testing.assert_allclose(
+                d["_ir_new"][r, o],
+                np.asarray(s["raw"], np.float32),
+                atol=0.1,
+                rtol=0.05,
+            )
+            np.testing.assert_allclose(
+                d["_kr_new"][r, o],
+                np.asarray(s["kr"][r], np.float32),
+                atol=0.1,
+                rtol=0.05,
+            )
         for q in range(len(CTX_C)):
-            np.testing.assert_allclose(ck[o, q], np.asarray(s["ck"][q], np.float32)[0], atol=0.1, rtol=0.05)
-            np.testing.assert_allclose(ring[o, q], np.asarray(s["ring"][q], np.float32), atol=0.1, rtol=0.05)
+            np.testing.assert_allclose(
+                ck[o, q], np.asarray(s["ck"][q], np.float32)[0], atol=0.1, rtol=0.05
+            )
+            np.testing.assert_allclose(
+                ring[o, q], np.asarray(s["ring"][q], np.float32), atol=0.1, rtol=0.05
+            )
     T = 4
     _assert_within_budget(res[:, T : 2 * T], ref[T : 2 * T])
     scale, k = float(np.abs(ref).mean()), np.sqrt(2 * L / 8)
     for r in range(res.shape[0]):
         dd = np.abs(res[r, :T] - ref[:T])
-        assert dd.mean() < 3e-2 * k * scale, (r, dd.mean() / scale, dd.max(axis=1) / scale)
+        assert dd.mean() < 3e-2 * k * scale, (
+            r,
+            dd.mean() / scale,
+            dd.max(axis=1) / scale,
+        )
 
 
 def test_step_with_served_key_layout_matches_contiguous():
-    """Stage C reading the served compressed-key layout (32-group kernel pages, two BF16 keys per
-    carrier row, 256 lanes, shuffled pages, streamed 32 pages per chunk; the BF16 view here, the
-    FP8 carrier on TPU) gives the same residual as the contiguous-key kernel, bit for bit."""
+    """Stage C reading the served compressed-key layout (32-group kernel pages, two BF16
+    keys per
+    carrier row, 256 lanes, shuffled pages, streamed 32 pages per chunk; the BF16 view
+    here, the
+    FP8 carrier on TPU) gives the same residual as the contiguous-key kernel, bit for
+    bit."""
     from vllm_torchtpu.megakernel.wholestep.qsa_full_c import CK_NEW
 
     T, R = 4, 2
     ex = ExecSpec(R=R, B=2 * T, T=T, ctx=128, interpret=True, tiles=_TILES)
-    d = wi.random_wholestep_inputs(17, G, ex, L, budget=BUDGET, n_pages=PAGES, identical_experts=True)
-    maxg = 2 * MAX_GROUPS  # two 32-page chunks per request: exercises the double-buffered ring
+    d = wi.random_wholestep_inputs(
+        17, G, ex, L, budget=BUDGET, n_pages=PAGES, identical_experts=True
+    )
+    maxg = (
+        2 * MAX_GROUPS
+    )  # two 32-page chunks per request: exercises the double-buffered ring
     d = wi.add_indexer_inputs(17, G, ex, d, L, max_groups=maxg, ctx=CTX_C)
     d = wi.add_step_inputs(17, G, ex, d, L, ctx=CTX_C)
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
     pps = d["mtab"].shape[1]
     outs = []
-    # contiguous keys; served layout per kernel page; per manager page (4 kernel pages here,
+    # contiguous keys; served layout per kernel page; per manager page (4 kernel pages
+    # here,
     # 13 served) reading only the 128 real lanes.
     arms = (("", 0, 0), ("bf16", 0, 0), ("bf16", 4, 128))
     for carrier, mp, lanes in arms:
         dd = wi.add_carrier(17, d, mp=mp) if carrier else d
-        idx = dict(max_groups=maxg, pages_per_seq=pps, carrier=carrier, chunk_pages=32,
-                   manager_pages=mp, ck_lanes=lanes)
-        spec = wholestep_spec(G, R, L=L, qsa=dict(budget=BUDGET), step=True, indexed=idx)
+        idx = dict(
+            max_groups=maxg,
+            pages_per_seq=pps,
+            carrier=carrier,
+            chunk_pages=32,
+            manager_pages=mp,
+            ck_lanes=lanes,
+        )
+        spec = wholestep_spec(
+            G, R, L=L, qsa=dict(budget=BUDGET), step=True, indexed=idx
+        )
         w_mk, states = wi.pack_wholestep(spec, G, ex, dd, L)
         pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(
             mesh, ex, dd["inp"].pos, dd["inp"].x, w_mk, states
         )
         step, _ = kernel.make_step(mesh, spec, ex)
         _, o = step(pos_mk, hid_mk, w_mk, st_mk, *wi.extras_c(dd, mesh, R))
-        outs.append((np.asarray(o[RESIDUAL_OUT], np.float32), np.asarray(o[CK_NEW], np.float32)))
+        outs.append(
+            (np.asarray(o[RESIDUAL_OUT], np.float32), np.asarray(o[CK_NEW], np.float32))
+        )
     for o in outs[1:]:
         np.testing.assert_array_equal(outs[0][0], o[0])
         np.testing.assert_array_equal(outs[0][1], o[1])
 
 
 def test_qsa_first_layout_matches_reference():
-    """Model layers 3..10 (cycle QSA, GDN, GDN, GDN): the layout that lets the head (layers 0-2,
-    PLE before layer 1) stay a separate call while every QSA layer is in the whole-step kernel."""
+    """Model layers 3..10 (cycle QSA, GDN, GDN, GDN): the layout that lets the head
+    (layers 0-2,
+    PLE before layer 1) stay a separate call while every QSA layer is in the whole-step
+    kernel."""
     R, T = 2, 4
     ex = ExecSpec(R=R, B=2 * T, T=T, ctx=128, interpret=True, tiles=_TILES)
     d = wi.random_wholestep_inputs(
-        11, G, ex, L, budget=BUDGET, n_pages=PAGES, kv_len=KV_LEN, identical_experts=True
+        11,
+        G,
+        ex,
+        L,
+        budget=BUDGET,
+        n_pages=PAGES,
+        kv_len=KV_LEN,
+        identical_experts=True,
     )
     d["first"] = "qsa"
     ref, _ = wi.wholestep_reference(G, ex, d, L)
@@ -463,20 +668,32 @@ def test_qsa_first_layout_matches_reference():
     spec = wholestep_spec(G, R, L=L, qsa=dict(budget=BUDGET), first="qsa")
     w_mk, states = wi.pack_wholestep(spec, G, ex, d, L)
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
-    pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(mesh, ex, d["inp"].pos, d["inp"].x, w_mk, states)
+    pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(
+        mesh, ex, d["inp"].pos, d["inp"].x, w_mk, states
+    )
     step, _ = kernel.make_step(mesh, spec, ex)
     _, outs = step(pos_mk, hid_mk, w_mk, st_mk, *wi.extras(d, mesh, R))
     res = np.asarray(outs[RESIDUAL_OUT].reshape(R, ex.M, -1)[:, : ex.B], np.float32)
-    assert float(np.std(np.asarray(ref) - np.asarray(d["inp"].x[: ex.B], np.float32))) > 0.05
+    assert (
+        float(np.std(np.asarray(ref) - np.asarray(d["inp"].x[: ex.B], np.float32)))
+        > 0.05
+    )
     _assert_within_budget(res, np.asarray(ref, np.float32))
 
 
 def test_tail_greedy_tokens_match_reference():
-    """Final HC mixer + lm_head + per-rank top token + argmax over ranks = the stock greedy
+    """Final HC mixer + lm_head + per-rank top token + argmax over ranks = the stock
+    greedy
     verify (argmax of the full logits, ties to the lower index)."""
-    from vllm_torchtpu.megakernel.models.qwen38_inputs import _hc_params, hc_weight_arrays
+    from vllm_torchtpu.megakernel.models.qwen38_inputs import (
+        _hc_params,
+        hc_weight_arrays,
+    )
     from vllm_torchtpu.megakernel.wholestep.tail import (
-        TOP, greedy_tokens, tail_reference, tail_spec,
+        TOP,
+        greedy_tokens,
+        tail_reference,
+        tail_spec,
     )
 
     R, T, V = 2, 4, 384
@@ -485,7 +702,9 @@ def test_tail_greedy_tokens_match_reference():
     hc = _hc_params(k[0], G, 1)
     lm = (jax.random.normal(k[1], (R, G.H, V), F32) * 0.05).astype(BF16)
     x = jax.random.normal(k[2], (ex.B, G.NHC * G.H), F32).astype(BF16)
-    want, logits = tail_reference(x, {n: v[0] for n, v in hc.items()}, lm, nhc=G.NHC, eps=G.eps)
+    want, logits = tail_reference(
+        x, {n: v[0] for n, v in hc.items()}, lm, nhc=G.NHC, eps=G.eps
+    )
     spec = tail_spec(G, R, vocab_shard=V)
     from vllm_torchtpu.megakernel.models.qwen38_pack import pack_weights
 
@@ -498,7 +717,8 @@ def test_tail_greedy_tokens_match_reference():
     step, _ = kernel.make_step(mesh, spec, ex)
     _, outs = step(pos_mk, hid_mk, w_mk, st_mk)
     got = np.asarray(greedy_tokens(outs[TOP], R, ex.M))[: ex.B]
-    # Exact unless the reference's own top-2 gap is within rounding of the kernel's logits.
+    # Exact unless the reference's own top-2 gap is within rounding of the kernel's
+    # logits.
     top2 = np.sort(np.asarray(logits), axis=-1)[:, -2:]
     clear = (top2[:, 1] - top2[:, 0]) > 1e-2
     assert clear.sum() >= ex.B - 1
@@ -506,26 +726,50 @@ def test_tail_greedy_tokens_match_reference():
 
 
 def test_last_layer_with_tail_in_one_call():
-    """Model layer 47 (QSA + MoE) and the decode tail (final HC mixer, lm_head, per-rank top
-    token) in one kernel call: tokens equal the stock greedy pick on the reference residual."""
-    from vllm_torchtpu.megakernel.wholestep.tail import TOP, greedy_tokens, tail_reference
+    """Model layer 47 (QSA + MoE) and the decode tail (final HC mixer, lm_head, per-rank
+    top
+    token) in one kernel call: tokens equal the stock greedy pick on the reference
+    residual."""
+    from vllm_torchtpu.megakernel.wholestep.tail import (
+        TOP,
+        greedy_tokens,
+        tail_reference,
+    )
 
     R, T, V = 2, 4, 384
     ex = ExecSpec(R=R, B=2 * T, T=T, ctx=128, interpret=True, tiles=_TILES)
     d = wi.random_wholestep_inputs(
-        19, G, ex, 1, budget=BUDGET, n_pages=PAGES, kv_len=KV_LEN, identical_experts=True,
-        first="qsa", vocab_shard=V,
+        19,
+        G,
+        ex,
+        1,
+        budget=BUDGET,
+        n_pages=PAGES,
+        kv_len=KV_LEN,
+        identical_experts=True,
+        first="qsa",
+        vocab_shard=V,
     )
-    d["lm_head"] = (d["lm_head"].astype(F32) * 10).astype(BF16)  # spread the top-2 logit gaps
+    d["lm_head"] = (d["lm_head"].astype(F32) * 10).astype(
+        BF16
+    )  # spread the top-2 logit gaps
     ref, _ = wi.wholestep_reference(G, ex, d, 1)
     d.pop("_step_out", None)
     want, logits = tail_reference(
-        ref, {n: v[0] for n, v in d["hc"]["tail"].items()}, d["lm_head"], nhc=G.NHC, eps=G.eps
+        ref,
+        {n: v[0] for n, v in d["hc"]["tail"].items()},
+        d["lm_head"],
+        nhc=G.NHC,
+        eps=G.eps,
     )
-    spec = wholestep_spec(G, R, L=1, qsa=dict(budget=BUDGET), first="qsa", tail=dict(vocab_shard=V))
+    spec = wholestep_spec(
+        G, R, L=1, qsa=dict(budget=BUDGET), first="qsa", tail=dict(vocab_shard=V)
+    )
     w_mk, states = wi.pack_wholestep(spec, G, ex, d, 1)
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
-    pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(mesh, ex, d["inp"].pos, d["inp"].x, w_mk, states)
+    pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(
+        mesh, ex, d["inp"].pos, d["inp"].x, w_mk, states
+    )
     step, _ = kernel.make_step(mesh, spec, ex)
     _, outs = step(pos_mk, hid_mk, w_mk, st_mk, *wi.extras(d, mesh, R))
     got = np.asarray(greedy_tokens(outs[TOP], R, ex.M))[: ex.B]
@@ -536,11 +780,15 @@ def test_last_layer_with_tail_in_one_call():
 
 
 def test_step_with_per_layer_metadata_matches_reference():
-    """Served packing: every QSA layer has its own compressed keys, main page table, raw ring and
-    head-pair offset (pages disjoint in one pool); the kernel indexes them by layer ordinal."""
+    """Served packing: every QSA layer has its own compressed keys, main page table, raw
+    ring and
+    head-pair offset (pages disjoint in one pool); the kernel indexes them by layer
+    ordinal."""
     R, T = 2, 4
     ex = ExecSpec(R=R, B=2 * T, T=T, ctx=128, interpret=True, tiles=_TILES)
-    d = wi.random_wholestep_inputs(23, G, ex, L, budget=BUDGET, n_pages=PAGES, identical_experts=True)
+    d = wi.random_wholestep_inputs(
+        23, G, ex, L, budget=BUDGET, n_pages=PAGES, identical_experts=True
+    )
     d = wi.add_indexer_inputs(23, G, ex, d, L, max_groups=MAX_GROUPS, ctx=CTX_C)
     d = wi.add_step_inputs(23, G, ex, d, L, ctx=CTX_C)
     d = wi.add_per_layer(23, G, ex, d, L)
@@ -548,12 +796,19 @@ def test_step_with_per_layer_metadata_matches_reference():
     ref, _ = wi.wholestep_reference(G, ex, d, L)
     d.pop("_step_out")
     pps = d["mtab"].shape[-1]
-    idx = dict(max_groups=MAX_GROUPS, pages_per_seq=pps, carrier="bf16", chunk_pages=32,
-               n_layers=L // G.att_every)
+    idx = dict(
+        max_groups=MAX_GROUPS,
+        pages_per_seq=pps,
+        carrier="bf16",
+        chunk_pages=32,
+        n_layers=L // G.att_every,
+    )
     spec = wholestep_spec(G, R, L=L, qsa=dict(budget=BUDGET), step=True, indexed=idx)
     w_mk, states = wi.pack_wholestep(spec, G, ex, d, L)
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
-    pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(mesh, ex, d["inp"].pos, d["inp"].x, w_mk, states)
+    pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(
+        mesh, ex, d["inp"].pos, d["inp"].x, w_mk, states
+    )
     step, _ = kernel.make_step(mesh, spec, ex)
     _, outs = step(pos_mk, hid_mk, w_mk, st_mk, *wi.extras_c(d, mesh, R))
     res = np.asarray(outs[RESIDUAL_OUT].reshape(R, ex.M, -1)[:, : ex.B], np.float32)
@@ -568,9 +823,12 @@ def test_step_with_per_layer_metadata_matches_reference():
 
 @pytest.mark.parametrize("S", [8, 256, 512])
 def test_compaction_exclusive_prefix_matches_reference(S):
-    """`indexer.exclusive_prefix` (128-lane chunks + running total for S % 128 == 0, else one
-    `[S, S]` matmul): `compact_row` returns the stock top-K ids ascending and `compact_union` the
-    ascending union with its codes, at the 131K / 262K score widths (S = 256 / 512); a prefix
+    """`indexer.exclusive_prefix` (128-lane chunks + running total for S % 128 == 0,
+    else one
+    `[S, S]` matmul): `compact_row` returns the stock top-K ids ascending and
+    `compact_union` the
+    ascending union with its codes, at the 131K / 262K score widths (S = 256 / 512); a
+    prefix
     shifted by one chunk is caught."""
     from vllm_torchtpu.megakernel.wholestep import indexer as ix
     from vllm_torchtpu.megakernel.wholestep import union_attn as ua
@@ -580,11 +838,19 @@ def test_compaction_exclusive_prefix_matches_reference(S):
     sc = rng.standard_normal(G).astype(np.float32)
     sc[rng.integers(0, G, 40)] = sc[5]  # ties across chunks
     nv = G - 37
-    bits = np.where(np.arange(G) < nv, np.asarray(sc).view(np.int32), -1).reshape(1, S, 128)
+    bits = np.where(np.arange(G) < nv, np.asarray(sc).view(np.int32), -1).reshape(
+        1, S, 128
+    )
     ids = np.arange(G, dtype=np.int32).reshape(1, S, 128)
-    thr, tmax = ix.thresholds(jnp.asarray(bits), jnp.asarray(ids), jnp.full((1, 1, 1), nv), K, G)
+    thr, tmax = ix.thresholds(
+        jnp.asarray(bits), jnp.asarray(ids), jnp.full((1, 1, 1), nv), K, G
+    )
     consts = ix.compact_consts(S, K)
-    got = np.asarray(ix.compact_row(jnp.asarray(bits[0]), thr[0], tmax[0], jnp.full((1, 1), nv), K, consts))[0]
+    got = np.asarray(
+        ix.compact_row(
+            jnp.asarray(bits[0]), thr[0], tmax[0], jnp.full((1, 1), nv), K, consts
+        )
+    )[0]
     assert got.tolist() == sorted(ix.topk_reference(sc, nv, K))
     code = np.zeros((S, 128), np.int32)
     pick = rng.choice(G, 300, replace=False)
@@ -597,8 +863,19 @@ def test_compaction_exclusive_prefix_matches_reference(S):
     np.testing.assert_array_equal(np.asarray(u_codes)[0, :300], code.reshape(-1)[want])
     c = jnp.asarray(rng.integers(0, 129, (1, S)).astype(np.float32))
     want_p = np.concatenate([[0], np.cumsum(np.asarray(c)[0])[:-1]])
-    np.testing.assert_array_equal(np.asarray(ix.exclusive_prefix(c, consts[1]))[0], want_p)
+    np.testing.assert_array_equal(
+        np.asarray(ix.exclusive_prefix(c, consts[1]))[0], want_p
+    )
     if S % 128 == 0 and S > 128:  # positive control: drop the running total
-        bad = jnp.concatenate([jnp.dot(c[:, i:i + 128].astype(jnp.bfloat16), consts[1],
-                                       preferred_element_type=jnp.float32) for i in range(0, S, 128)], axis=1)
+        bad = jnp.concatenate(
+            [
+                jnp.dot(
+                    c[:, i : i + 128].astype(jnp.bfloat16),
+                    consts[1],
+                    preferred_element_type=jnp.float32,
+                )
+                for i in range(0, S, 128)
+            ],
+            axis=1,
+        )
         assert not np.array_equal(np.asarray(bad)[0], want_p)

@@ -82,12 +82,18 @@ def random_segment_inputs(
     pos, _, w_l, st_l = qwen35.random_logical_inputs(keys[0], g.inner(R, L, head), ex)
     gains = {"e2_s": 2000.0 * gain, "sh2_s": 400.0 * gain, "lin_out_s": 50.0 * gain}
     # `zero` silences a sublayer kind ("gdn", "moe") to isolate the others.
-    for k in {"gdn": ("lin_out_s",), "moe": ("e2_s", "sh2_s")}.get(zero[0], ()) if zero else ():
+    for k in (
+        {"gdn": ("lin_out_s",), "moe": ("e2_s", "sh2_s")}.get(zero[0], ())
+        if zero
+        else ()
+    ):
         gains[k] = 0.0
     w_l = {k: v * gains[k] if k in gains else v for k, v in w_l.items()}
     # A larger router spreads the top-k logits so rounding drift upstream of the
     # router cannot flip a selection (`router_gain`); the library default is 1.
-    w_l["router"] = (w_l["router"].astype(F32) * router_gain).astype(w_l["router"].dtype)
+    w_l["router"] = (w_l["router"].astype(F32) * router_gain).astype(
+        w_l["router"].dtype
+    )
     hc = {
         "qsa_out": _hc_params(keys[1], g, 1),
         "gdn": _hc_params(keys[2], g, L if head else L - 1),
@@ -129,7 +135,11 @@ def _rows(arr: jax.Array, rows: tuple[int, ...], L: int) -> jax.Array:
 
 
 def pack_segment(
-    spec: ModelSpec, g: Qwen38Geometry, ex: ExecSpec, inp: SegmentInputs, head: bool = False
+    spec: ModelSpec,
+    g: Qwen38Geometry,
+    ex: ExecSpec,
+    inp: SegmentInputs,
+    head: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], Any]:
     """`(weights, states, attn)` per-rank operands (leading `R`, not yet folded)."""
     R, B, T, L = ex.R, ex.B, ex.T, spec.config.L
@@ -146,7 +156,11 @@ def pack_segment(
     }
     smalls: dict[str, Any] = {
         "moe_hcn": hc["moe"]["norm"],
-        **{k: w_l[k] for k in ("post_norm", "sh_gate", "sh13_s", "sh2_s", "ecopy") if k in w_l},
+        **{
+            k: w_l[k]
+            for k in ("post_norm", "sh_gate", "sh13_s", "sh2_s", "ecopy")
+            if k in w_l
+        },
     }
     if not head:
         weights["o_proj"] = inp.o_proj[:, None]

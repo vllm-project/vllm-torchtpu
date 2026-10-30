@@ -141,7 +141,9 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
             self.prefix,
         )
 
-    def lookup_start(self, inputs: PLEInputs, valid_tokens: torch.Tensor) -> torch.Tensor:
+    def lookup_start(
+        self, inputs: PLEInputs, valid_tokens: torch.Tensor
+    ) -> torch.Tensor:
         """Device ids, then start their copy to the host (see ple_offload)."""
         assert self.cpu_offload
         return host_lookup_start(self._lookup_ids(inputs, valid_tokens), self.prefix)

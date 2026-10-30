@@ -752,19 +752,27 @@ def test_draft_rows_static_across_token_buckets():
 
 
 def test_megakernel_paths_keep_the_sink_layer_on_attend():
-    """VLLM_TPU_QSA_DRAFT_SHARED_SELECTION: the draft reads the selection the target's last QSA layer
-    writes in `attend`. `select_for_kernel` returns no selection, so it refuses the sink layer, and
+    """VLLM_TPU_QSA_DRAFT_SHARED_SELECTION: the draft reads the selection the target's
+    last QSA layer
+    writes in `attend`. `select_for_kernel` returns no selection, so it refuses the sink
+    layer, and
     the served megakernel paths never take it: in-kernel attention is gated on
-    `segment_call.attention_rows`, which neither MK segment object defines (default 0 -> attend)."""
+    `segment_call.attention_rows`, which neither MK segment object defines (default 0 ->
+    attend)."""
     from vllm_torchtpu.models.vllm.qwen4_exp.qsa import Qwen4ExpQSA
 
     with pytest.raises(NotImplementedError, match="shared-selection"):
-        Qwen4ExpQSA.select_for_kernel(NS(_selection_sink=torch.zeros(1, 1)), None, None, None)
+        Qwen4ExpQSA.select_for_kernel(
+            NS(_selection_sink=torch.zeros(1, 1)), None, None, None
+        )
     import inspect
 
     try:
         from vllm_torchtpu.megakernel_runtime import qwen38_driver, qwen38_wholestep
     except (ImportError, ModuleNotFoundError):
         pytest.skip("megakernel runtime unavailable")
-    for module in (qwen38_driver, qwen38_wholestep):  # no setter, on the class or in __init__
+    for module in (
+        qwen38_driver,
+        qwen38_wholestep,
+    ):  # no setter, on the class or in __init__
         assert "attention_rows" not in inspect.getsource(module), module.__name__

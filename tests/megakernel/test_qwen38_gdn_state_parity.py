@@ -64,7 +64,9 @@ from vllm_torchtpu.megakernel_runtime.qwen38_segment_call import T_VERIFY, gdn_b
 T = T_VERIFY
 NB = 24  # manager blocks
 VH, KD, VD, QKV = 6, 128, 128, 1280
-LAY = Qwen38GdnPoolLayout(pool_shape=(NB * 4, 128, 1, 4, 256), pool_dtype="float8_e4m3fn")
+LAY = Qwen38GdnPoolLayout(
+    pool_shape=(NB * 4, 128, 1, 4, 256), pool_dtype="float8_e4m3fn"
+)
 
 # Runner metadata for one verify step of NS_LIVE requests (+ padded rows).
 # Request: (state block, ckpt blocks [K+1], read offset, seq_len); q_len = T.
@@ -105,23 +107,47 @@ def _conv_rows(conv):
 
 def stock_write(pool, ids, ssm, conv):
     pool = pool_adapters.scatter_region(
-        pool, _ssm_rows(ssm), ids, tok0=0, ntok=LAY.ssm_tokens, split=LAY.split, interpret=True
+        pool,
+        _ssm_rows(ssm),
+        ids,
+        tok0=0,
+        ntok=LAY.ssm_tokens,
+        split=LAY.split,
+        interpret=True,
     )
     return pool_adapters.scatter_region(
-        pool, _conv_rows(conv), ids, tok0=LAY.conv_tok0, ntok=LAY.conv_tokens,
-        split=LAY.split, interpret=True,
+        pool,
+        _conv_rows(conv),
+        ids,
+        tok0=LAY.conv_tok0,
+        ntok=LAY.conv_tokens,
+        split=LAY.split,
+        interpret=True,
     )
 
 
 def stock_read(pool, ids):
-    """The stock kernel's typed view: ssm in d_v-wide f32 rows, conv in 256-lane rows."""
+    """The stock kernel's typed view: ssm in d_v-wide f32 rows, conv in 256-lane
+    rows.
+    """
     ssm = pool_adapters.gather_region(
-        pool, ids, tok0=0, ntok=LAY.ssm_tokens, out_dtype=jnp.float32, out_lanes=VD,
-        split=LAY.split, interpret=True,
+        pool,
+        ids,
+        tok0=0,
+        ntok=LAY.ssm_tokens,
+        out_dtype=jnp.float32,
+        out_lanes=VD,
+        split=LAY.split,
+        interpret=True,
     )
     conv = pool_adapters.gather_region(
-        pool, ids, tok0=LAY.conv_tok0, ntok=LAY.conv_tokens, out_dtype=jnp.float32,
-        split=LAY.split, interpret=True,
+        pool,
+        ids,
+        tok0=LAY.conv_tok0,
+        ntok=LAY.conv_tokens,
+        out_dtype=jnp.float32,
+        split=LAY.split,
+        interpret=True,
     )
     n = ids.shape[0]
     return ssm[:, : VH * KD].reshape(n, VH, KD, VD), conv[:, :15].reshape(n, 3, QKV)
@@ -144,13 +170,19 @@ def stock_addressing(meta):
 def mk_gather(pool, rb, hi):
     """`Qwen38PoolGDN._gather` for one layer, in a grid-less interpret pallas_call."""
     blk = Qwen38PoolGDN.__new__(Qwen38PoolGDN)
-    blk.lin_in_layout = lambda g, ex: types.SimpleNamespace(vh=VH, KD=KD, VD=VD, QKV=QKV)
+    blk.lin_in_layout = lambda g, ex: types.SimpleNamespace(
+        vh=VH, KD=KD, VD=VD, QKV=QKV
+    )
     f8 = jnp.float8_e4m3fn
     hr = 8
 
     def kernel(rb_ref, hi_ref, pool_ref, rec_out, conv_out, *scr_refs):
         names = [f"pg_raw{b}{j}" for b in range(2) for j in range(3)] + [
-            "pg_craw0", "pg_craw1", "pg_sem", "pg_rec", "pg_conv",
+            "pg_craw0",
+            "pg_craw1",
+            "pg_sem",
+            "pg_rec",
+            "pg_conv",
         ]
         scr = dict(zip(names, scr_refs))
         ctx = types.SimpleNamespace(
@@ -261,7 +293,8 @@ def test_mk_state_write_matches_stock(pool_and_states):
 
 
 def test_shadow_call_leaves_the_pool_untouched(pool_and_states):
-    """`write=False` (shadow check) sends every checkpoint to block 0: nothing is written."""
+    """`write=False` (shadow check) sends every checkpoint to block 0: nothing is
+    written."""
     pool, _, _ = pool_and_states
     _, wb, _ = gdn_blocks(_metadata(), NS, False)
     assert not np.asarray(wb).any()
@@ -276,12 +309,16 @@ def test_shadow_call_leaves_the_pool_untouched(pool_and_states):
 
 
 def test_read_check_catches_a_misaddressed_block(pool_and_states):
-    """Positive control: reading each request's neighbouring block must fail the check."""
+    """Positive control: reading each request's neighbouring block must fail the
+    check.
+    """
     pool, _, _ = pool_and_states
     meta = _metadata()
     rb, _, hi = gdn_blocks(meta, NS, True)
     rec, _ = mk_gather(pool, jnp.where(hi[0], rb[0] + 1, 0), hi[0])
     srb, shi, _ = stock_addressing(meta)
     s_ssm, _ = stock_read(pool, jnp.asarray(srb, jnp.int32))
-    want = jnp.where(jnp.asarray(shi)[:, None, None, None], s_ssm, 0.0).astype(jnp.bfloat16)
+    want = jnp.where(jnp.asarray(shi)[:, None, None, None], s_ssm, 0.0).astype(
+        jnp.bfloat16
+    )
     assert not np.array_equal(np.asarray(rec.reshape(NS, VH, KD, VD)), np.asarray(want))

@@ -25,7 +25,8 @@ The model's residual is `NHC` streams of width `h`; the core residual buffer
 
 `down` and `inj` share one streamed weight (`<name>_hdn`, columns
 `[down | inj | pad]`); `up` is one weight per stream (`<name>_hup<b>`) so a
-128-row tile fits the weight bank. With `mix=False` the sublayer input comes from the inner
+128-row tile fits the weight bank. With `mix=False` the sublayer input comes from the
+inner
 block alone and `xn` is recomputed for the injection (`<name>_hinj`).
 
 The inner block sees a context whose geometry is `inner_geometry` (width `h`)
@@ -110,7 +111,7 @@ class HCSublayer(Block):
         return rup(self.lowrank, 128)
 
     def _check(self, g: Any) -> None:
-        assert g.H == self.width, (g.H, self.nhc, self.h)
+        assert self.width == g.H, (g.H, self.nhc, self.h)
 
     # ------------------------------------------------------- declarations
     def weights(self, g: Any, ex: ExecSpec) -> list[WeightDecl]:
@@ -209,12 +210,13 @@ class HCSublayer(Block):
             gate = rnd(jax.nn.silu(rnd(rnd(y[:, :lr]) / nhc)))
             scr["hc_g"][:, :lr] = gate.astype(BF16)
             self._set_injection(ctx, y[:, lr : lr + nhc])
-            mixed = None
+            mixed: Any = None
             for b in range(nhc):
                 u = s.dmatmul(f"{n}_hup{b}", scr["hc_g"], h)
                 xn_b = scr["xb"][:, b * h : (b + 1) * h].astype(F32)
                 term = jax.nn.sigmoid(rnd(u)) * xn_b
                 mixed = term if mixed is None else mixed + term
+            assert mixed is not None
             mixed = rnd(mixed / nhc)
             scr["hc_xb"][...] = mixed.astype(BF16)
         return mixed

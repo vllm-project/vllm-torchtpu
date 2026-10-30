@@ -270,9 +270,10 @@ class BucketExecutables:
         new_sources = _symint_sources(graph)
         perm = symint_permutation((signature, sources), (new_signature, new_sources))
         if perm is not None:
+            perm_ = perm
             moved = [
                 (o, n, sources[o]) if sources[o] is not None else (o, n)
-                for o, n in enumerate(perm)
+                for o, n in enumerate(perm_)
                 if o != n
             ]
             logger.info(
@@ -284,7 +285,7 @@ class BucketExecutables:
             )
 
             def adopted(*args: Any, **kwargs: Any) -> Any:
-                return runnable(*[args[n] for n in perm], **kwargs)
+                return runnable(*[args[n] for n in perm_], **kwargs)
 
             return adopted
         raise ShapeSpecializationError(

@@ -617,6 +617,8 @@ class Qwen4ExpPLELayer(nn.Module):
         # activation dtype and then summed in fp32.
         dot = (key * query).float().sum(dim=-1, keepdim=True).to(key.dtype)
         if sequence_parallel_tokens is not None:
+            from . import sequence_parallel as sp
+
             dot = sp.gather(dot.flatten(-2), sequence_parallel_tokens).unsqueeze(-1)
         gate = dot / math.sqrt(self.hidden_size)
         gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()

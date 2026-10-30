@@ -56,23 +56,23 @@ def _kernel(
     prologue: bool,
     inject: bool,
 ):
-    refs = list(refs)
+    refs_list: list = list(refs)
+    prev_ref = block_ref = prev_inj_ref = x_ref = None
     if prologue:
-        prev_ref, block_ref, prev_inj_ref = refs[:3]
-        refs = refs[3:]
-        x_ref = None
+        prev_ref, block_ref, prev_inj_ref = refs_list[:3]
+        refs_list = refs_list[3:]
     else:
-        x_ref = refs.pop(0)
-    w_hbm, down_hbm, up_hbm = refs[:3]
-    refs = refs[3:]
-    injw_hbm = refs.pop(0) if inject else None
-    mixed_ref = refs.pop(0)
-    inj_ref = refs.pop(0) if inject else None
-    h_ref = refs.pop(0) if prologue else None
-    w_vm, down_vm, up_vm = refs[:3]
-    refs = refs[3:]
-    injw_vm = refs.pop(0) if inject else None
-    norm_vm, sems = refs
+        x_ref = refs_list.pop(0)
+    w_hbm, down_hbm, up_hbm = refs_list[:3]
+    refs_list = refs_list[3:]
+    injw_hbm = refs_list.pop(0) if inject else None
+    mixed_ref = refs_list.pop(0)
+    inj_ref = refs_list.pop(0) if inject else None
+    h_ref = refs_list.pop(0) if prologue else None
+    w_vm, down_vm, up_vm = refs_list[:3]
+    refs_list = refs_list[3:]
+    injw_vm = refs_list.pop(0) if inject else None
+    norm_vm, sems = refs_list
 
     first = pl.program_id(0) == 0
     w_copy = pltpu.make_async_copy(w_hbm, w_vm, sems.at[0])
@@ -95,7 +95,7 @@ def _kernel(
     @pl.when(first)
     def _start_weights():
         w_copy.start()
-        if inject:
+        if inj_copy is not None:
             inj_copy.start()
         down_copy.start()
         for copy in up_copies:
@@ -114,19 +114,27 @@ def _kernel(
 
     nt = (((1,), (1,)), ((), ()))
     wait_first(w_copy)
-    if inject:
+    if inj_copy is not None:
         wait_first(inj_copy)
 
     def normalize_rows(offset, rows):
         """Norm (and combine prologue, injection gate) for ``rows`` rows."""
         weight = w_vm[...].astype(jnp.float32)
+        block = prev_inj = None
         if prologue:
+            assert block_ref is not None and prev_inj_ref is not None
             block = block_ref[pl.ds(offset, rows), :].astype(jnp.float32)
             prev_inj = prev_inj_ref[pl.ds(offset, rows), :]
-        inj_terms = [None] * branches
+        inj_terms: list[jax.Array | None] = [None] * branches
         for b in range(branches):
             start = b * hidden
             if prologue:
+                assert (
+                    prev_ref is not None
+                    and h_ref is not None
+                    and block is not None
+                    and prev_inj is not None
+                )
                 h = (
                     prev_ref[pl.ds(offset, rows), pl.ds(start, hidden)].astype(
                         jnp.float32
@@ -136,6 +144,7 @@ def _kernel(
                 h_ref[pl.ds(offset, rows), pl.ds(start, hidden)] = h
                 values = h.astype(jnp.float32)
             else:
+                assert x_ref is not None
                 values = x_ref[pl.ds(offset, rows), pl.ds(start, hidden)].astype(
                     jnp.float32
                 )
@@ -148,17 +157,22 @@ def _kernel(
                 # The [T, hc] injection logits on the VPU: BF16 x BF16
                 # products are exact in FP32; only the summation order
                 # differs from the MXU.
+                assert injw_vm is not None
                 norm32 = norm.astype(jnp.float32)
                 for j in range(branches):
                     row = injw_vm[pl.ds(j, 1), pl.ds(start, hidden)]
                     term = norm32 * row.astype(jnp.float32)
-                    inj_terms[j] = term if inj_terms[j] is None else inj_terms[j] + term
+                    prev_term = inj_terms[j]
+                    inj_terms[j] = term if prev_term is None else prev_term + term
         if inject:
+            assert inj_ref is not None
             shape = (rows, branches)
             lanes = jax.lax.broadcasted_iota(jnp.int32, shape, 1)
             logits = jnp.zeros(shape, jnp.float32)
             for j in range(branches):
-                column = jnp.sum(inj_terms[j], axis=1, keepdims=True)
+                term_j = inj_terms[j]
+                assert term_j is not None
+                column = jnp.sum(term_j, axis=1, keepdims=True)
                 logits = jnp.where(lanes == j, column, logits)
             logits = logits.astype(jnp.bfloat16).astype(jnp.float32)
             inj_ref[pl.ds(offset, rows), :] = 2.0 * jax.nn.sigmoid(logits / branches)
@@ -184,7 +198,7 @@ def _kernel(
 
     gate = (down_acc.astype(jnp.bfloat16) / branches).astype(jnp.bfloat16)
     gate = jax.nn.silu(gate.astype(jnp.float32)).astype(jnp.bfloat16)
-    mixed = None
+    mixed: jax.Array | None = None
     for b in range(branches):
         start = b * hidden
         wait_first(up_copies[b])
@@ -202,6 +216,7 @@ def _kernel(
             jnp.float32
         )
         mixed = weighted if mixed is None else mixed + weighted
+    assert mixed is not None
     mixed_ref[...] = (mixed / branches).astype(jnp.bfloat16)
 
 
@@ -275,8 +290,8 @@ def _hc_decode_mix(
         or any(
             a.dtype != jnp.bfloat16
             for a in (x, weight, down, up)
-            + ((inject_weight,) if inject else ())
-            + ((block,) if prologue else ())
+            + (() if inject_weight is None else (inject_weight,))
+            + (() if block is None else (block,))
         )
     ):
         raise ValueError("HC decode mix requires BF16 decode-sized token tiles")

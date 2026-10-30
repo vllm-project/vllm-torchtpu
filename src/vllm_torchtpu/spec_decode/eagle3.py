@@ -159,9 +159,7 @@ def _async_draft_seed_impl(
 
 
 _async_draft_seed_compiled = _static_shape_args(
-    torch.compile(backend="tpu", fullgraph=True, dynamic=False)(
-        _async_draft_seed_impl
-    )
+    torch.compile(backend="tpu", fullgraph=True, dynamic=False)(_async_draft_seed_impl)
 )
 
 
@@ -193,9 +191,7 @@ def _async_seed_inputs_impl(
 # The chunk's input_ids carry the draft forward's dynamic-dim marks; see
 # _static_shape_args.
 _async_seed_inputs_compiled = _static_shape_args(
-    torch.compile(backend="tpu", fullgraph=True, dynamic=False)(
-        _async_seed_inputs_impl
-    )
+    torch.compile(backend="tpu", fullgraph=True, dynamic=False)(_async_seed_inputs_impl)
 )
 
 
@@ -1642,7 +1638,7 @@ class Eagle3Proposer:
                 loop_qsl_per_chunk.append(
                     self._device_constant(
                         ("loop_qsl", knr, n),
-                        lambda: torch.from_numpy(
+                        lambda knr=knr, n=n: torch.from_numpy(
                             np.minimum(np.arange(knr + 1, dtype=np.int32), n)
                         ),
                     )
@@ -1650,7 +1646,7 @@ class Eagle3Proposer:
                 loop_reqdist_per_chunk.append(
                     self._device_constant(
                         ("loop_reqdist", n),
-                        lambda: torch.tensor([n] * 3, dtype=torch.int32),
+                        lambda n=n: torch.tensor([n] * 3, dtype=torch.int32),
                     )
                 )
 
@@ -1908,7 +1904,9 @@ class Eagle3Proposer:
                 )
                 # Anchor the seed position at qsl_end-1 (like the sync path) using
                 # the REAL per-request draft count (num_draft_dev above).
-                accepted_drafts = torch.minimum((num_valid - 1).clamp(min=0), num_draft_dev)
+                accepted_drafts = torch.minimum(
+                    (num_valid - 1).clamp(min=0), num_draft_dev
+                )
                 num_rejected_out = (num_draft_dev - accepted_drafts).to(torch.int32)
                 # qsl_end already lives on-device in the chunk's attn context (the
                 # same tensor _build_draft_attn_metadata reads at step_idx=0); slice
@@ -1932,17 +1930,23 @@ class Eagle3Proposer:
                         ov_v.append(req_state.get_token_id(seq_len))
                     next_token_ids[
                         torch.tensor(ov_i, dtype=torch.long, device=runner.device)
-                    ] = torch.tensor(ov_v, dtype=next_token_ids.dtype, device=runner.device)
+                    ] = torch.tensor(
+                        ov_v, dtype=next_token_ids.dtype, device=runner.device
+                    )
                 if width > num_reqs:
                     # Padding rows repeat the last real request's seed position and
                     # token (after its partial-prefill override, so the duplicate
                     # scatter writes the same value), and report no rejections.
                     # num_reqs enters as a value, not a shape.
-                    n_dev = torch.tensor(num_reqs, dtype=torch.int64, device=runner.device)
+                    n_dev = torch.tensor(
+                        num_reqs, dtype=torch.int64, device=runner.device
+                    )
                     valid = torch.arange(width, device=runner.device) < n_dev
                     last = (n_dev - 1).view(1)
                     last_token_indices = torch.where(
-                        valid, last_token_indices, last_token_indices.index_select(0, last)
+                        valid,
+                        last_token_indices,
+                        last_token_indices.index_select(0, last),
                     )
                     next_token_ids = torch.where(
                         valid, next_token_ids, next_token_ids.index_select(0, last)
@@ -2073,7 +2077,10 @@ class Eagle3Proposer:
             + (num_rejected != nrej).sum()
         ).to(torch.int64)
         delta = torch.stack(
-            [mism * (0 if faulted else 1), (mism > 0).to(torch.int64) * (1 if faulted else 0)]
+            [
+                mism * (0 if faulted else 1),
+                (mism > 0).to(torch.int64) * (1 if faulted else 0),
+            ]
         )
         self._seed_mismatches = (
             delta if self._seed_mismatches is None else self._seed_mismatches + delta
@@ -2534,6 +2541,7 @@ class Eagle3Proposer:
         `forward_model` captured as the chunk's aux hidden state.
         """
         if not getattr(self.draft_model, "uses_target_aux_hidden_states", False):
+            assert chunk.hidden_states is not None
             return chunk.hidden_states
         aux = chunk.aux_hidden_states
         if not isinstance(aux, torch.Tensor):

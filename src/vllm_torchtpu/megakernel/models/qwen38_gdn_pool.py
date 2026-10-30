@@ -36,7 +36,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from ..exec_spec import ExecSpec
 from ..ops import BF16, F32, I32, rup
-from ..spec import ExtraInput, ScratchReq, StateDecl
+from ..spec import ExtraInput, StateDecl
 from .qwen38 import Qwen38GDN
 
 POOL = "gdn_pool"
@@ -145,6 +145,7 @@ class Qwen38PoolGDN(Qwen38GDN):
         pending = self._copies(ctx, o, 0, 0)
         for c in pending:
             c.start()
+        nxt = pending
         for s in range(NS):
             buf = s % 2
             if s + 1 < NS:
@@ -157,10 +158,15 @@ class Qwen38PoolGDN(Qwen38GDN):
             # 128-lane rows: the state's row-major order, so only the leading
             # dimension is split (lane-changing reshapes do not lower).
             ssm = jnp.concatenate(
-                [_typed_f32(scr[f"pg_raw{buf}{j}"], interp, VD) for j in range(SSM_BLOCKS)],
+                [
+                    _typed_f32(scr[f"pg_raw{buf}{j}"], interp, VD)
+                    for j in range(SSM_BLOCKS)
+                ],
                 axis=0,
             )[: vh * KD].reshape(vh, KD, VD)
-            scr["pg_rec"][s * vh : (s + 1) * vh] = jnp.where(keep, ssm, 0.0).astype(BF16)
+            scr["pg_rec"][s * vh : (s + 1) * vh] = jnp.where(keep, ssm, 0.0).astype(
+                BF16
+            )
             crow = _typed_f32(scr[f"pg_craw{buf}"], interp, 256)  # [16, 256]
             per = QKV // 256
             for r in range(3):
@@ -175,8 +181,15 @@ class Qwen38PoolGDN(Qwen38GDN):
         o = ctx.stream.sp.block_ord(l, self.name)
         with ctx.sc("gdn_pool_gather"):
             self._gather(ctx, o)
-        st = {**ctx.ST, "conv": _LayerView(ctx.scr["pg_conv"]), "rec": _LayerView(ctx.scr["pg_rec"])}
+        st = {
+            **ctx.ST,
+            "conv": _LayerView(ctx.scr["pg_conv"]),
+            "rec": _LayerView(ctx.scr["pg_rec"]),
+        }
         return super().emit(dataclasses.replace(ctx, ST=st), l, slot)
 
     def host_update_states(self, g, ex, pos, states, raw_outputs):
-        return {"conv_ckpt": raw_outputs["conv_ckpt"], "rec_ckpt": raw_outputs["rec_ckpt"]}
+        return {
+            "conv_ckpt": raw_outputs["conv_ckpt"],
+            "rec_ckpt": raw_outputs["rec_ckpt"],
+        }

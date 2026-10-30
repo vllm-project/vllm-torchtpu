@@ -42,12 +42,13 @@ T_VERIFY = 4
 
 # All-reduce mode and (expert, dense) ring slots when the caller passes none
 # (`VLLM_TPU_MEGAKERNEL=...,hier=N,rings=E:D` sets them; rings for every bucket).
-DEFAULT_HIER = 2
+DEFAULT_HIER: int = 2
 DEFAULT_RINGS: tuple[int, int] | None = None
 # `pipeep=0`: the MoE experts on the non-pipelined EP path (A/B of a served factor).
-PIPE_EP = True
-# `VLLM_TPU_MEGAKERNEL=...,gdnclamp=1`: block ids outside the pool go to the null block 0.
-CLAMP_BLOCKS = False
+PIPE_EP: bool = True
+# `VLLM_TPU_MEGAKERNEL=...,gdnclamp=1`: block ids outside the pool go to the null block
+# 0.
+CLAMP_BLOCKS: bool = False
 
 
 def ring_depths(B: int) -> tuple[int, int]:
@@ -81,12 +82,12 @@ def segment_tiles(
     )
 
 
-GDN_META = 5  # per GDN layer: state ids, slot read offsets, ckpt ids, query start loc, seq lens
+# Per GDN layer: state ids, slot read offsets, ckpt ids, query start loc, seq lens
+GDN_META = 5
 
 
 def _fit(x: Any, n: int) -> Any:
     """First `n` rows of `x`, zero-padded when the runner's array is shorter."""
-
 
     x = x[:n]
     if x.shape[0] < n:
@@ -105,7 +106,6 @@ def gdn_blocks(
 
     def inside(x):
         return x if n_blocks is None else jnp.where((x >= 0) & (x < n_blocks), x, 0)
-
 
     rbs, wbs, his = [], [], []
     for i in range(0, len(meta), GDN_META):
@@ -178,14 +178,21 @@ def build_segment_call(
         out_specs=tp,
         check_vma=False,
     )
-    unpad = jax.shard_map(lambda r: r[:B], mesh=mesh, in_specs=tp, out_specs=tp, check_vma=False)
+    unpad = jax.shard_map(
+        lambda r: r[:B], mesh=mesh, in_specs=tp, out_specs=tp, check_vma=False
+    )
     pos = jnp.zeros((B,), jnp.int32)
     n_lead = 1 if head else 2
     n_meta = GDN_META * (L if head else L - 1) if has_gdn else 0
 
     gather = jax.shard_map(
         lambda pool, rb, hi: gather_gdn_states(
-            pool, rb, layout=layout, T=T_VERIFY, has_initial_state=hi, interpret=interpret
+            pool,
+            rb,
+            layout=layout,
+            T=T_VERIFY,
+            has_initial_state=hi,
+            interpret=interpret,
         ),
         mesh=mesh,
         in_specs=(tp, rep, rep),
@@ -194,7 +201,9 @@ def build_segment_call(
     )
     scatter_fn = scatter_gdn_ckpts_fast if fast_scatter else scatter_gdn_ckpts
     scatter = jax.shard_map(
-        lambda pool, c, r, wb: scatter_fn(pool, c, r, wb, layout=layout, interpret=interpret),
+        lambda pool, c, r, wb: scatter_fn(
+            pool, c, r, wb, layout=layout, interpret=interpret
+        ),
         mesh=mesh,
         in_specs=(tp, tp, tp, rep),
         out_specs=tp,
@@ -212,10 +221,15 @@ def build_segment_call(
         x = pad(hidden)
         named = {} if head else {"qsa_attn": pad(attn)}
         states: tuple = ()
+        pool: Any = None
+        wb: Any = None
         if has_gdn:
             pool, meta = args[n_lead + n_w], args[n_lead + n_w + 1 :]
             rb, wb, hi = gdn_blocks(
-                meta, NS, write, layout.pool_shape[0] // layout.split if CLAMP_BLOCKS else None
+                meta,
+                NS,
+                write,
+                layout.pool_shape[0] // layout.split if CLAMP_BLOCKS else None,
             )
             if pool_gdn:
                 named.update(gdn_pool=pool, gdn_rb=rb, gdn_hi=hi.astype(jnp.int32))

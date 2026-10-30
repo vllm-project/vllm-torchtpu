@@ -372,6 +372,7 @@ def _kernel(
                 acc = accumulator_ref[query_tile_index, head, :, :]
                 rows = query_tile * q_heads_per_kv
                 if bf16_mxu:
+                    assert q16 is not None
                     query = q16[head, :, start : start + query_tile].reshape(
                         rows, head_dim
                     )

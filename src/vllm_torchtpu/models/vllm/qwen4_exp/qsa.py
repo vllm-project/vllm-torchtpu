@@ -732,7 +732,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             # attends each request's last verified row, which is that row of
             # the target's step; later steps (one row per request, in the same
             # order) reuse what step 0 took.
-            carried = cast(torch.Tensor, getattr(self, "_selection_rows"))
+            carried = cast(torch.Tensor, self._selection_rows)
             if rows is not None:
                 shared = source[rows.clamp_min(0)]
                 update_rows_(carried, shared)
@@ -741,6 +741,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         use_shared = shared is not None and shared_ops is not None and not pick_rows
         if use_shared:
             op = shared_ops[rows is not None]
+        assert op is not None
         output, selected = op(
             self.q_proj(hidden),
             self.k_proj(hidden),
@@ -785,19 +786,28 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         ``[pool, q, gate, pages, kv_lens, head-pair offset, (k, v) scales]``."""
         if getattr(self, "_selection_sink", None) is not None:
             # The select op returns no `selected`, so the MTP draft's shared selection
-            # (bind_shared_selection) would go stale on in-kernel steps. The served MK paths
+            # (bind_shared_selection) would go stale on in-kernel steps. The served MK
+            # paths
             # keep this layer on `attend` (segment_call.attention_rows unset); enabling
-            # in-kernel attention on the sink layer needs the select op to return `selected`.
+            # in-kernel attention on the sink layer needs the select op to return
+            # `selected`.
             raise NotImplementedError(
-                "select_for_kernel on the shared-selection sink layer: the draft's selection "
+                "select_for_kernel on the shared-selection sink layer: the draft's "
+                "selection "
                 "would not be written (VLLM_TPU_QSA_DRAFT_SHARED_SELECTION)"
             )
         assert self.pooled, "in-kernel QSA attention reads the unified pool"
-        per_layer = cast(dict[str, AttentionMetadata], get_forward_context().attn_metadata)
+        per_layer = cast(
+            dict[str, AttentionMetadata], get_forward_context().attn_metadata
+        )
         metadata = replace(
             metadata,
-            state_slots=cast(torch.Tensor, per_layer[self.prefix + ".raw_ring"].block_tables),
-            main_block_table=cast(torch.Tensor, per_layer[self.main_cache_name].block_tables),
+            state_slots=cast(
+                torch.Tensor, per_layer[self.prefix + ".raw_ring"].block_tables
+            ),
+            main_block_table=cast(
+                torch.Tensor, per_layer[self.main_cache_name].block_tables
+            ),
             compressed_block_table=cast(
                 torch.Tensor, per_layer[self.compressed_cache_name].block_tables
             ),
@@ -815,6 +825,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         select = self._select_op
         if getattr(self, "_shard_select_op", None) is not None:
             select = self._shard_select_op
+        assert select is not None
         q, gate, pages, kv_lens = select(
             self.q_proj(hidden),
             self.k_proj(hidden),

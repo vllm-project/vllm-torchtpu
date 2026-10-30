@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Which torch inputs of a compiled program does torch_tpu re-materialize per call?
 
 The served MK program runs ~23 eager `tt_jit_execute_as_strided` programs before
@@ -17,9 +30,13 @@ import sys
 
 ARMS = {
     "none": dict(),
-    "slice_clone": dict(dtype="float32", shape=(4, 1, 51456), build="slice", post="clone"),
+    "slice_clone": dict(
+        dtype="float32", shape=(4, 1, 51456), build="slice", post="clone"
+    ),
     "slice_cpu": dict(dtype="float32", shape=(4, 1, 51456), build="slice", post="cpu"),
-    "slice_contig_view": dict(dtype="float32", shape=(4, 1, 51456), build="slice", post="reshape"),
+    "slice_contig_view": dict(
+        dtype="float32", shape=(4, 1, 51456), build="slice", post="reshape"
+    ),
     "i32_clone": dict(dtype="float32", shape=(1608, 128), build="i32", post="clone"),
     "i32_cpu": dict(dtype="float32", shape=(1608, 128), build="i32", post="cpu"),
     "cat_fresh": dict(dtype="float32", shape=(64, 3840), build="cat"),
@@ -114,8 +131,11 @@ class M(torch.nn.Module):
             else:
                 self.register_buffer("w", t, persistent=False)
         if mut:
-            self.register_buffer("pool", torch.zeros((256, 128), dtype=torch.float32, device=dev),
-                                 persistent=False)
+            self.register_buffer(
+                "pool",
+                torch.zeros((256, 128), dtype=torch.float32, device=dev),
+                persistent=False,
+            )
 
     def forward(self, x):
         ws = ([self.w] if has_w else []) + ([self.pool] if mut else [])
@@ -148,21 +168,43 @@ def test_operand_copies():
         env["TPU_VMODULE"] = "tpu_pjrt_client=1"
         env["TPU_STDERR_LOG_LEVEL"] = "0"
         env["TPU_MIN_LOG_LEVEL"] = "0"
-        r = subprocess.run([sys.executable, "-c", CHILD, json.dumps(cfg)], env=env,
-                           capture_output=True, text=True, timeout=900)
+        r = subprocess.run(
+            [sys.executable, "-c", CHILD, json.dumps(cfg)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
         err = r.stderr
-        seg = err.split("MARK_BEGIN", 1)[-1].split("MARK_END", 1)[0] if "MARK_BEGIN" in err else ""
+        seg = (
+            err.split("MARK_BEGIN", 1)[-1].split("MARK_END", 1)[0]
+            if "MARK_BEGIN" in err
+            else ""
+        )
         n_as = seg.count("Start scheduling program tt_jit_execute_as_strided")
         n_prog = seg.count("Start scheduling program")
         import collections
         import re
 
         progs = collections.Counter(re.findall(r"Start scheduling program (\S+)", seg))
-        row = dict(arm=name, as_strided_per_call=n_as / 20, programs_per_call=n_prog / 20,
-                   rc=r.returncode, top=progs.most_common(5))
+        row = dict(
+            arm=name,
+            as_strided_per_call=n_as / 20,
+            programs_per_call=n_prog / 20,
+            rc=r.returncode,
+            top=progs.most_common(5),
+        )
         if r.returncode or not seg:
-            tail = [l for l in err.splitlines() if not l[:1] in ("I", "W") and "worker hostname" not in l]
-            tb = [l for l in tail if "Error" in l or "error" in l or "File " in l]
+            tail = [
+                line
+                for line in err.splitlines()
+                if line[:1] not in ("I", "W") and "worker hostname" not in line
+            ]
+            tb = [
+                line
+                for line in tail
+                if "Error" in line or "error" in line or "File " in line
+            ]
             row["error"] = " | ".join((tb or tail)[-10:])[-1200:]
         print("OPC " + json.dumps(row), flush=True)
 

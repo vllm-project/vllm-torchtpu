@@ -353,8 +353,10 @@ def decode_attention(
     if shared and cache.ndim == 5:
         trailing = cache.shape[2] * cache.shape[3] // 2 - kv_head_offset - kv_heads
     use_fused = envs.VLLM_TPU_QSA_FUSED_SPARSE_DECODE if fused is None else fused
-    if envs.VLLM_TPU_QSA_DECODE_SLOT_READ and not use_fused and slot_readable(
-        cache, kv_heads, kv_head_offset
+    if (
+        envs.VLLM_TPU_QSA_DECODE_SLOT_READ
+        and not use_fused
+        and slot_readable(cache, kv_heads, kv_head_offset)
     ):
         # Every layer already launches one KV head (slot reads); no padding.
         trailing = 0
@@ -518,7 +520,8 @@ def qsa_attention(
     # Keep bucket shapes fixed while removing the decode prefix on device.
     rows = jnp.arange(len(query))
     if envs.VLLM_TPU_QSA_PREFIX_SLICE:
-        # Contiguous dynamic slices instead of row gathers: the same rows (clamped at the
+        # Contiguous dynamic slices instead of row gathers: the same rows (clamped at
+        # the
         # last one), read at HBM rate rather than per-row index rate.
         def shift(x):
             return _shift_rows_up(x, prefix, capacity)
@@ -561,15 +564,20 @@ def qsa_attention(
 
 
 def _pad_rows(x: jax.Array, n: int) -> jax.Array:
-    """``x[min(r, len(x) - 1)]`` for ``r < n``: the last row repeated, a static concat."""
+    """``x[min(r, len(x) - 1)]`` for ``r < n``: the last row repeated, a static
+    concat.
+    """
     if len(x) >= n:
         return x[:n]
     return jnp.concatenate([x, jnp.broadcast_to(x[-1:], (n - len(x),) + x.shape[1:])])
 
 
 def _shift_rows_up(x: jax.Array, shift: jax.Array, max_shift: int) -> jax.Array:
-    """``x[min(r + shift, len(x) - 1)]`` for ``0 <= shift <= max_shift``, one dynamic slice."""
-    return jax.lax.dynamic_slice_in_dim(_pad_rows(x, len(x) + max_shift), shift, len(x), 0)
+    """``x[min(r + shift, len(x) - 1)]`` for ``0 <= shift <= max_shift``, one dynamic
+    slice."""
+    return jax.lax.dynamic_slice_in_dim(
+        _pad_rows(x, len(x) + max_shift), shift, len(x), 0
+    )
 
 
 def _shift_rows_down(x: jax.Array, shift: jax.Array, max_shift: int) -> jax.Array:

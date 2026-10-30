@@ -191,6 +191,7 @@ class GatedResidual(common_hc.GatedResidual):
         if not hasattr(self, "input_mix_weight_down"):
             raise RuntimeError("mix was disabled for this hyper-connection")
         if self._decode_fused(hyper_input):
+            assert self._decode_mix_op is not None
             out = self._decode_mix_op(hyper_input, *self._decode_weights())
             if hasattr(self, "block_inject_weight"):
                 mixed, injection = out

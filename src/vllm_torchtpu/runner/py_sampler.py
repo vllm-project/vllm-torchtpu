@@ -11,11 +11,11 @@ frame) and by inclusive samples (anywhere on the stack). Cost: one
 """
 
 import collections
-import os
 import sys
 import threading
 import time
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -53,25 +53,28 @@ def _run(target_ident: int, seconds: float, interval: float, rank: int) -> None:
             frame = frame.f_back
     if not samples:
         return
+
     def top(counter, n):
         return " | ".join(
             f"{100 * c / samples:.1f}% {name}" for name, c in counter.most_common(n)
         )
+
     logger.info(
         "PYSAMPLER rank=%d samples=%d interval=%.1fms SELF: %s",
-        rank, samples, interval * 1e3, top(self_counts, 30),
+        rank,
+        samples,
+        interval * 1e3,
+        top(self_counts, 30),
     )
-    logger.info(
-        "PYSAMPLER rank=%d INCLUSIVE: %s", rank, top(incl_counts, 50)
-    )
+    logger.info("PYSAMPLER rank=%d INCLUSIVE: %s", rank, top(incl_counts, 50))
 
 
 def start(rank: int) -> None:
     """Sample the calling (step) thread; call once after warmup."""
     try:
-        seconds = float(os.environ.get("VLLM_TPU_PY_SAMPLER_S", "0") or 0)
-        interval = float(os.environ.get("VLLM_TPU_PY_SAMPLER_INTERVAL_MS", "1")) / 1e3
-        delay = float(os.environ.get("VLLM_TPU_PY_SAMPLER_DELAY_S", "600"))
+        seconds = envs.VLLM_TPU_PY_SAMPLER_S
+        interval = envs.VLLM_TPU_PY_SAMPLER_INTERVAL_MS / 1e3
+        delay = envs.VLLM_TPU_PY_SAMPLER_DELAY_S
     except ValueError:
         return
     if seconds <= 0:
@@ -86,5 +89,8 @@ def start(rank: int) -> None:
     threading.Thread(target=delayed, name="py-sampler", daemon=True).start()
     logger.info(
         "Python sampler armed: rank %d, %.0f s after a %.0f s delay, every %.1f ms",
-        rank, seconds, delay, interval * 1e3,
+        rank,
+        seconds,
+        delay,
+        interval * 1e3,
     )

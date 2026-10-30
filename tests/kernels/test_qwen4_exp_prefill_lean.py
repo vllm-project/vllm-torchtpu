@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""VLLM_TPU_QSA_PREFILL_LEAN: dropping the FP8 key guard keeps sparse prefill bit-identical.
+"""VLLM_TPU_QSA_PREFILL_LEAN: dropping the FP8 key guard keeps sparse prefill
+bit-identical.
 
 TPU only: the Pallas interpreter cannot run the kernel's bitcast FP8 cache loads.
 """
@@ -82,11 +83,16 @@ def test_lean_differs_when_a_visible_key_is_poisoned(monkeypatch):
     base = _run(monkeypatch, False, poisoned)
     lean = _run(monkeypatch, True, poisoned)
     print(
-        "LEANCTRL base_eq_zeroed", np.array_equal(base, zeroed),
-        "base_finite", bool(np.isfinite(base).all()),
-        "lean_nan", int(np.isnan(lean).sum()),
-        "lean_eq_base", np.array_equal(lean, base),
-        "lean_max_abs_diff", float(np.nanmax(np.abs(lean - base))),
+        "LEANCTRL base_eq_zeroed",
+        np.array_equal(base, zeroed),
+        "base_finite",
+        bool(np.isfinite(base).all()),
+        "lean_nan",
+        int(np.isnan(lean).sum()),
+        "lean_eq_base",
+        np.array_equal(lean, base),
+        "lean_max_abs_diff",
+        float(np.nanmax(np.abs(lean - base))),
     )
     np.testing.assert_array_equal(base, zeroed)
     assert np.isnan(lean).any()

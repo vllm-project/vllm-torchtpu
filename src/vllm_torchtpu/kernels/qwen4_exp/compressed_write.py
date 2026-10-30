@@ -81,7 +81,9 @@ def write_runs(view, pair, write, mask, values, requests, ratio):
         size_sems,
         sent,
     ):
-        staged_bf = staged.bitcast(jnp.bfloat16) if view.dtype != jnp.bfloat16 else staged
+        staged_bf = (
+            staged.bitcast(jnp.bfloat16) if view.dtype != jnp.bfloat16 else staged
+        )
         staged_bf[...] = rows_ref[...]
 
         # Partial pairs (request edges): merge the new half into the old row.

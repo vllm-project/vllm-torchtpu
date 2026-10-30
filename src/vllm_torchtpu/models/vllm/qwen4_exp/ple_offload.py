@@ -2,6 +2,7 @@
 """Host PLE lookup boundary for vLLM piecewise compilation."""
 
 import time
+from typing import Any
 
 import torch
 from vllm.forward_context import get_forward_context
@@ -80,7 +81,7 @@ def _host_lookup_fake(ids, local_tokens, embedding_dim, dp_size, fp8, prefix):
 # PLE layer are dispatched next; `finish` then waits only for that copy, so the
 # host gather and the upload overlap those layers on the device instead of
 # draining it. Both are graph splitting ops, run eagerly in order.
-_pending: dict[str, tuple[torch.Tensor, object, torch.Tensor]] = {}
+_pending: dict[str, tuple[torch.Tensor, Any, torch.Tensor]] = {}
 _check = {"left": envs.VLLM_TPU_PLE_HOST_OVERLAP_CHECK, "bad": 0}
 
 

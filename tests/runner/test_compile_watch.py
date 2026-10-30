@@ -20,7 +20,11 @@ def test_post_warmup_compile_logs_one_warning(caplog, monkeypatch):
         f(torch.ones(3))
         f(torch.ones(3))  # cached: no second compile
         f(torch.ones(5))  # new shape: a recompile
-    lines = [r.getMessage() for r in caplog.records if "Post-warmup compile" in r.getMessage()]
+    lines = [
+        r.getMessage()
+        for r in caplog.records
+        if "Post-warmup compile" in r.getMessage()
+    ]
     assert len(lines) == 2, lines
     assert "#1" in lines[0] and "#2" in lines[1]
 

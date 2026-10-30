@@ -16,7 +16,7 @@
 from collections.abc import Iterable, Sequence
 from functools import partial
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import torch
 from torch import nn
@@ -267,21 +267,23 @@ class Qwen4ExpDecoderLayer(nn.Module):
         self.mlp = Qwen3NextSparseMoeBlock(vllm_config=cfg, prefix=prefix + ".mlp")
         if (
             envs.QWEN4_EXP_PREFILL_SP_SHARED_LOCAL
-            and index < t.num_hidden_layers  # backbone only: the MTP draft never takes SP
+            and index
+            < t.num_hidden_layers  # backbone only: the MTP draft never takes SP
             and envs.QWEN4_EXP_PREFILL_SP_MOE
             and sp.enabled(tp.world_size)
             and getattr(self.mlp, "shared_expert", None) is not None
             and not getattr(self.mlp, "replicate_shared_expert", True)
         ):
             # Replicated copy of the TP-sliced shared expert for sequence-parallel steps
-            # (`_sequence_parallel_moe`); same prefix, so it takes the same quantization.
+            # (`_sequence_parallel_moe`); same prefix, so it takes the same
+            # quantization.
             self.mlp.shared_expert_local = Qwen3NextMLP(
                 hidden_size=t.hidden_size,
                 intermediate_size=t.shared_expert_intermediate_size,
                 hidden_act=t.hidden_act,
                 quant_config=cfg.quant_config,
                 reduce_results=False,
-                expert_gate=self.mlp.shared_expert_gate,
+                expert_gate=cast(Any, self.mlp.shared_expert_gate),
                 disable_tp=True,
                 prefix=prefix + ".mlp.shared_expert",
             )
@@ -328,7 +330,11 @@ class Qwen4ExpDecoderLayer(nn.Module):
         ``sp_pad``: the shard's HC streams are padded to a multiple of this many
         rows; only the real rows enter collectives, attention and the MoE."""
         num_tokens = input_ids.shape[0] if sequence_parallel else None
-        rows = num_tokens // sp.tp_world_size() if sp_pad else None
+        rows = (
+            num_tokens // sp.tp_world_size()
+            if sp_pad and num_tokens is not None
+            else None
+        )
         hidden = self.apply_ple(
             hidden,
             input_ids,
@@ -439,10 +445,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
         mlp = self.mlp
         routed = getattr(getattr(mlp, "experts", None), "routed_experts", None)
         method = getattr(routed, "quant_method", None)
+        shared_expert = getattr(mlp, "shared_expert", None)
         if (
             not envs.QWEN4_EXP_PREFILL_SP_MOE
+            or routed is None
             or getattr(method, "_adaptive_fused_moe_op_sp", None) is None
-            or getattr(mlp, "shared_expert", None) is None
+            or shared_expert is None
             or getattr(mlp, "replicate_shared_expert", True)
         ):
             return sp.shard(mlp(sp.gather(block, num_tokens)))
@@ -466,9 +474,10 @@ class Qwen4ExpDecoderLayer(nn.Module):
         )
         local = getattr(mlp, "shared_expert_local", None)
         if local is not None:
-            # This rank's rows through the replicated shared expert: no gather, no reduce.
+            # This rank's rows through the replicated shared expert: no gather, no
+            # reduce.
             return local(block) + output
-        shared = sp.reduce(mlp.shared_expert(sp.gather(block, num_tokens)), True)
+        shared = sp.reduce(shared_expert(sp.gather(block, num_tokens)), True)
         return shared + output
 
     def forward_rows(
@@ -625,6 +634,8 @@ class Qwen4ExpBackbone(nn.Module):
         # stays in the main graph and model preparation precedes the D2H wait.
         ple_raw_embeddings = None
         ple_token = None
+        ple: Any = None
+        ple_inputs: Any = None
         if self.host_ple_index is not None:
             ple = cast(Qwen4ExpDecoderLayer, self.layers[self.host_ple_index]).ple
             assert ple is not None
@@ -713,7 +724,9 @@ class Qwen4ExpBackbone(nn.Module):
         ids64 = input_ids.to(torch.int64)
         hidden = self.embed_tokens(input_ids).repeat(1, self.hc_count)
         layers = cast(Sequence[Qwen4ExpDecoderLayer], self.layers)
-        qsa_layers = [i for i, layer in enumerate(layers) if layer.layer_type == "full_attention"]
+        qsa_layers = [
+            i for i, layer in enumerate(layers) if layer.layer_type == "full_attention"
+        ]
         head_groups = getattr(segment_call, "head_groups", None)
         if head_groups:
             # Layers before the first QSA layer: one kernel call per group, the
@@ -736,7 +749,12 @@ class Qwen4ExpBackbone(nn.Module):
                         )
                     continue
                 hidden = layers[group[0]].apply_ple(
-                    hidden, ids64, query_start_loc, ngram_context, state_slots, context_lens
+                    hidden,
+                    ids64,
+                    query_start_loc,
+                    ngram_context,
+                    state_slots,
+                    context_lens,
                 )
                 hidden = segment_call.head(h, hidden)
         else:
@@ -792,7 +810,9 @@ class Qwen4ExpBackbone(nn.Module):
                 continue
             block, _ = layer.attn_hyper_connection.mix(hidden)
             if in_kernel:
-                attention = layer.self_attn.select_for_kernel(block, positions64, metadata)
+                attention = layer.self_attn.select_for_kernel(
+                    block, positions64, metadata
+                )
             else:
                 attention = layer.self_attn.attend(block, positions64, metadata)
             hidden = segment_call(s, hidden, attention)
@@ -816,10 +836,12 @@ class Qwen4ExpBackbone(nn.Module):
         main_block_table,
         compressed_block_table,
     ):
-        """``forward_segments`` with layers ``whole``'s first .. last-1 in ONE whole-step
+        """``forward_segments`` with layers ``whole``'s first .. last-1 in ONE
+        whole-step
         megakernel call (attention, indexer and cache writes in-kernel / in-call).
 
-        Head groups as in ``forward_segments``; then ``whole`` (layers 3..46); the last QSA
+        Head groups as in ``forward_segments``; then ``whole`` (layers 3..46); the last
+        QSA
         layer keeps its stock attention core and the segment kernel for the rest.
         """
         assert self.host_ple_index is None, "segments need the PLE table on HBM"
@@ -833,10 +855,16 @@ class Qwen4ExpBackbone(nn.Module):
             )
             hidden = segment_call.head(h, hidden)
         hidden = whole(hidden, positions, query_start_loc, context_lens)
-        qsa_layers = [i for i, layer in enumerate(layers) if layer.layer_type == "full_attention"]
+        qsa_layers = [
+            i for i, layer in enumerate(layers) if layer.layer_type == "full_attention"
+        ]
         last = layers[qsa_layers[-1]]
         metadata = QSAMetadata(
-            query_start_loc, context_lens, state_slots, main_block_table, compressed_block_table
+            query_start_loc,
+            context_lens,
+            state_slots,
+            main_block_table,
+            compressed_block_table,
         )
         cap = getattr(segment_call, "attention_rows", 0)  # as forward_segments
         in_kernel = bool(cap) and int(hidden.shape[0]) <= cap
@@ -921,7 +949,9 @@ class Qwen4ExpBackboneSP(nn.Module):
     (compilation/bucket_filter), so neither graph branches on the token count.
     """
 
-    def __init__(self, *, backbone):
+    _backbone: Any
+
+    def __init__(self, *, vllm_config: Any = None, backbone):
         super().__init__()
         object.__setattr__(self, "_backbone", backbone)
 
@@ -969,7 +999,9 @@ class Qwen4ExpWholeStepModel(nn.Module):
     ``support_torch_compile`` class over the same backbone share one compiled graph.
     """
 
-    def __init__(self, *, vllm_config, prefix: str = "", backbone, segments, whole) -> None:
+    def __init__(
+        self, *, vllm_config, prefix: str = "", backbone, segments, whole
+    ) -> None:
         super().__init__()
         self.prefix = prefix
         self.backbone = backbone
@@ -1064,10 +1096,13 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         if self.model_sp is None:
             return self.model(input_ids, positions, inputs_embeds, **kwargs)
         serves_sp = bucket_filter.assigned(self.model_sp)
+        assert serves_sp is not None
         if serves_sp(input_ids.shape[0]):
             with bucket_filter.serving(serves_sp), set_model_tag("backbone_sp"):
                 return self.model_sp(input_ids, positions, inputs_embeds, **kwargs)
-        with bucket_filter.serving(bucket_filter.assigned(self.model)):
+        serves_main = bucket_filter.assigned(self.model)
+        assert serves_main is not None
+        with bucket_filter.serving(serves_main):
             return self.model(input_ids, positions, inputs_embeds, **kwargs)
 
     def embed_input_ids(self, input_ids):
@@ -1150,7 +1185,10 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         moe_mapper = moe_weights_mapper()
         local_mapper = WeightsMapper(
             orig_to_new_stacked={
-                "shared_expert_local.gate_proj": ("shared_expert_local.gate_up_proj", 0),
+                "shared_expert_local.gate_proj": (
+                    "shared_expert_local.gate_up_proj",
+                    0,
+                ),
                 "shared_expert_local.up_proj": ("shared_expert_local.gate_up_proj", 1),
             }
         )
