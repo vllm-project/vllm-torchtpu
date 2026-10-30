@@ -144,7 +144,8 @@ def test_f32_conv_pooled_step_matches_reference_and_keeps_conv_exact(T: int, B: 
 
 def _with_f32_in_kernel_backend(spec):
     lay = replace(spec.cache_backend.layout, conv_dtype=jnp.float32)
-    pb = replace(spec.cache_backend.with_layout(lay), supports_fused_io=True)
+    pb = spec.cache_backend.with_layout(lay)
+    assert pb.supports_fused_io  # f32 conv keeps fused pool I/O
     return replace(spec, cache_backend=pb), lay
 
 

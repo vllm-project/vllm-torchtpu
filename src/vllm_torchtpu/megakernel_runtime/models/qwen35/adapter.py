@@ -543,16 +543,17 @@ class Qwen35Program:
     def _adopt_framework_conv_dtype(self, conv_dtype: str) -> None:
         """Store the conv window in the dtype the framework's pool uses.
 
-        An f32 conv window is served on the split pool I/O path: fused pool
-        I/O and in-kernel gather (GPR) implement f32 conv too but are not
-        validated on TPU yet, so this turns both off, including an explicit
-        `fused_pool_io` / `pool_gather` option (logged). Other dtypes are left
-        to the layout comparison, which declines them.
+        The split pool I/O path, fused pool I/O and in-kernel gather (GPR) all
+        implement an f32 conv window, so only the pool layout changes: the
+        `fused_pool_io` / `pool_gather` options (the profile's, or explicit
+        ones) apply as for bf16 conv, and each bucket still resolves them
+        against the layout's limits. Other dtypes are left to the layout
+        comparison, which declines them.
 
-        This replaces `self.spec` / `self.profile` before the comparison; on a
-        decline the runtime replaces the whole driver, so nothing else sees
-        them. `PoolBackend.with_layout` raises `ValueError` (voted
-        `bind_error`) for a backend not built by `make_pool_backend`.
+        This replaces `self.spec` before the comparison; on a decline the
+        runtime replaces the whole driver, so nothing else sees it.
+        `PoolBackend.with_layout` raises `ValueError` (voted `bind_error`) for
+        a backend not built by `make_pool_backend`.
         """
         layout = self.spec.cache_backend.layout
         if (
@@ -564,23 +565,12 @@ class Qwen35Program:
         self.spec = dataclasses.replace(
             self.spec, cache_backend=self.spec.cache_backend.with_layout(f32_layout)
         )
-        cleared = [
-            f"{name}={val!r}"
-            for name, val in (
-                ("fused_pool_io", self.fused_pool_io),
-                ("pool_gather", self.profile.pool_gather),
-            )
-            if val is True
-        ]
-        self.fused_pool_io = False
-        self.pool_gather = False
-        self.profile = dataclasses.replace(self.profile, pool_gather=False)
         logger.info(
             "%s megakernel: the framework stores the pooled conv state as fp32; "
-            "using split pool I/O with an f32 conv window (fused pool I/O and "
-            "in-kernel gather are off for f32 conv until validated on TPU%s)",
+            "using an f32 conv window (fused_pool_io=%s, pool_gather=%s)",
             self._display_name,
-            f"; cleared {', '.join(cleared)}" if cleared else "",
+            self.fused_pool_io,
+            self.profile.pool_gather,
         )
 
     def _check_pool_layout_facts(self, view: RunnerView, pool: torch.Tensor) -> None:

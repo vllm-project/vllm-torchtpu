@@ -338,8 +338,7 @@ def make_pool_backend(
         scatter_states=_scatter,
         can_pool_gather=_can_pool_gather,
         page_table_state_name="page_table",
-        # Fused pool I/O stages the conv window as bf16 rows.
-        supports_fused_io=supports_fused_io and layout.conv_itemsize == 2,
+        supports_fused_io=supports_fused_io,
         supports_pool_gather=supports_pool_gather,
         rebuild=_rebuild,
     )

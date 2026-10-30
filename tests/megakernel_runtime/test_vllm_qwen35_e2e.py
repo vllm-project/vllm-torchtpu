@@ -1604,16 +1604,21 @@ def test_bind_caches_fails_closed_on_pool_slot_layout_mismatch(
     assert driver.pool_layout_facts == mk
 
 
-@pytest.mark.parametrize("fused, gather", [("auto", None), (True, True)])
+@pytest.mark.parametrize(
+    "fused, gather", [("auto", None), (True, True), (False, True), (False, False)]
+)
 def test_bind_caches_adopts_an_fp32_conv_framework_pool(
     monkeypatch: pytest.MonkeyPatch, fused: Any, gather: Any
 ) -> None:
     """A framework that stores the pooled conv state as fp32 is served: the
-    megakernel switches its layout to an f32 conv window (split pool I/O),
-    and fused pool I/O / in-kernel gather are off, explicit options too."""
+    megakernel switches its layout to an f32 conv window, and the fused pool
+    I/O / in-kernel gather options (explicit ones included) plan every bucket
+    exactly as they do for a bf16 conv window."""
     import dataclasses
 
     import jax.numpy as jnp
+
+    from vllm_torchtpu.megakernel import runtime as _rt
 
     mesh = _cpu_mesh(1)
     g = _tiny_geom(L=4, att_every=4)
@@ -1634,6 +1639,24 @@ def test_bind_caches_adopts_an_fp32_conv_framework_pool(
         pool_gather=gather,
     )
     driver = drv.program
+
+    def _planned() -> dict[tuple[int, int], tuple[bool, bool]]:
+        return {
+            (T, b): _rt.bucket_exec_spec(
+                driver.spec,
+                driver.base_exec,
+                driver.profile,
+                bucket_t=b,
+                tokens_per_seq=T,
+                fused_pool_io=driver.fused_pool_io,
+                fused_pool_io_max_b=driver.fused_pool_io_max_b,
+                fused_pool_io_min_b_hi=driver.fused_pool_io_min_b_hi,
+            )[1:]
+            for T, b in driver.bucket_policy.iter_buckets()
+        }
+
+    planned_bf16 = _planned()
+    options = (driver.fused_pool_io, driver.profile.pool_gather)
     bf16 = facts_from_pool_layout(driver.spec.cache_backend.layout, 1)
     assert bf16.conv_dtype == "bfloat16"
     fw = dataclasses.replace(bf16, conv_dtype="float32", conv_bytes=2 * bf16.conv_bytes)
@@ -1642,33 +1665,19 @@ def test_bind_caches_adopts_an_fp32_conv_framework_pool(
     drv.bind(SimpleNamespace(model=model, _unified_kv_layout=True))
     assert drv._bound and drv.pool_layout_facts == fw
     lay = driver.spec.cache_backend.layout
-    assert lay.conv_dtype == jnp.float32
-    assert driver.pool_layout_facts == fw
-    assert not driver.spec.cache_backend.supports_fused_io
-    assert not driver.fused_pool_io
-    assert driver.pool_gather is False and driver.profile.pool_gather is False
-    from vllm_torchtpu.megakernel import runtime as _rt
-
-    # Every bucket, the T=4 verify bucket included, is planned on the split
-    # pool I/O path: neither fused pool I/O nor in-kernel gather (GPR).
-    planned = {
-        (T, b): _rt.bucket_exec_spec(
-            driver.spec,
-            driver.base_exec,
-            driver.profile,
-            bucket_t=b,
-            tokens_per_seq=T,
-            fused_pool_io=driver.fused_pool_io,
-            fused_pool_io_max_b=driver.fused_pool_io_max_b,
-            fused_pool_io_min_b_hi=driver.fused_pool_io_min_b_hi,
-        )[1:]
-        for T, b in driver.bucket_policy.iter_buckets()
-    }
-    assert (4, 4) in planned
-    assert all(not fused and not gpr for fused, gpr in planned.values()), planned
     assert lay == dataclasses.replace(
         qwen35.qwen35_spec(g).cache_backend.layout, conv_dtype=jnp.float32
     )
+    assert driver.spec.cache_backend.supports_fused_io
+    assert (driver.fused_pool_io, driver.profile.pool_gather) == options
+    planned = _planned()
+    assert (4, 4) in planned and planned == planned_bf16, (planned, planned_bf16)
+    if fused is True:
+        assert planned[(4, 4)][0], planned  # fused pool I/O on f32 conv
+    elif gather is True:
+        assert planned[(4, 4)] == (False, True), planned  # GPR on f32 conv
+    elif fused is False and gather is False:
+        assert not any(f or r for f, r in planned.values()), planned
 
 
 def test_bind_caches_budget_overflow_is_config_error() -> None:
