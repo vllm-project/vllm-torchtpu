@@ -3911,11 +3911,13 @@ class TPUModelRunner(GPUModelRunner):
         # the slice's, since every rank runs the DP-wide padded step.
         batch_composition_stats = local_profile_stats
         if self.phase_based_profiler and local_profile_stats is not None:
+            step_stats = local_profile_stats
             if self._dp_step_profile_stats is not None:
-                batch_composition_stats = runner_utils.merge_dp_profile_stats(
+                step_stats = runner_utils.merge_dp_profile_stats(
                     local_profile_stats, self._dp_step_profile_stats
                 )
-            self.phase_based_profiler.step(batch_composition_stats)
+            batch_composition_stats = step_stats
+            self.phase_based_profiler.step(step_stats)
 
         # Gather mm embeddings AFTER reordering so the mask order matches the
         # request order used by the chunk loop below. is_mm_embed_full spans
