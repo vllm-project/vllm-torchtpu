@@ -1503,7 +1503,7 @@ class Eagle3Proposer:
                 loop_qsl_per_chunk.append(
                     self._device_constant(
                         ("loop_qsl", knr, n),
-                        lambda: torch.from_numpy(
+                        lambda knr=knr, n=n: torch.from_numpy(
                             np.minimum(np.arange(knr + 1, dtype=np.int32), n)
                         ),
                     )
@@ -1511,7 +1511,7 @@ class Eagle3Proposer:
                 loop_reqdist_per_chunk.append(
                     self._device_constant(
                         ("loop_reqdist", n),
-                        lambda: torch.tensor([n] * 3, dtype=torch.int32),
+                        lambda n=n: torch.tensor([n] * 3, dtype=torch.int32),
                     )
                 )
 

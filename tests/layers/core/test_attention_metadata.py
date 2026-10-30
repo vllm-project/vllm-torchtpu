@@ -83,9 +83,9 @@ class TestAttentionMetadataBuilderPlumbing:
             kv_cache_group_id=kv_cache_group_id,
         )
 
-    def _make_mamba_builder(self, runner, kv_cache_group_id=0):
+    def _make_mamba_builder(self, runner, kv_cache_group_id=0, block_size=16):
         spec = MambaSpec(
-            block_size=16,
+            block_size=block_size,
             shapes=[(4, 128), (8, 64, 32)],
             dtypes=[torch.bfloat16, torch.float32],
             page_size_padded=16384,
@@ -663,9 +663,7 @@ class TestAttentionMetadataBuilderPlumbing:
         stage_block_table_uploads(runner, c2, 4)
         assert source.call_count == calls  # reused, not re-packed
         for gid in (0, 1):
-            assert torch.equal(
-                c1.staged_block_tables[gid], c2.staged_block_tables[gid]
-            )
+            assert torch.equal(c1.staged_block_tables[gid], c2.staged_block_tables[gid])
 
         am._BLOCK_TABLE_VERSION[0] += 1  # any BlockTable mutation
         stage_block_table_uploads(runner, ctx(), 4)
@@ -674,17 +672,32 @@ class TestAttentionMetadataBuilderPlumbing:
         stage_block_table_uploads(runner, ctx(num_reqs=1), 4)  # new window
         assert source.call_count == calls + 2
 
-    @patch.dict(os.environ, {"VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE": "1"})
-    def test_reused_upload_reuses_tables_and_rederives_mamba_indices(self):
-        """A reused upload keeps the previous walk's table outputs but must
-        re-derive the mamba indices from the new seq_lens."""
+    @pytest.mark.parametrize("class_gather", ["0", "1"])
+    def test_reused_upload_reuses_tables_and_rederives_mamba_indices(
+        self, monkeypatch, class_gather
+    ):
+        """A reused upload keeps the previous walk's table outputs and
+        re-derives mamba state and checkpoint indices across both per-group
+        and class-batched gathers."""
+        monkeypatch.setenv("VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE", "1")
+        monkeypatch.setenv("VLLM_TPU_STAGED_WALK_CLASS_GATHER", class_gather)
         window = 3
-        runner = self._make_runner_mock(num_groups=3, max_num_blocks_per_req=6)
+        runner = self._make_runner_mock(num_groups=4, max_num_blocks_per_req=6)
+        # Group 3 uses a distinct (num_blocks, block_size) class from groups 1 & 2.
+        runner.input_batch.block_table[3].max_num_blocks_per_req = 4
+        runner.input_batch.block_table[3].get_cpu_tensor.return_value = (
+            torch.arange(runner.max_num_reqs * 4, dtype=torch.int32).reshape(
+                runner.max_num_reqs, 4
+            )
+            + 300
+        )
         runner._unified_kv_layout = True
         runner._block_table_stage_cpu = None
         attn = self._make_builder(runner, kv_cache_group_id=0)
         mambas = [
-            self._make_mamba_builder(runner, kv_cache_group_id=gid) for gid in (1, 2)
+            self._make_mamba_builder(runner, kv_cache_group_id=1, block_size=16),
+            self._make_mamba_builder(runner, kv_cache_group_id=2, block_size=16),
+            self._make_mamba_builder(runner, kv_cache_group_id=3, block_size=32),
         ]
         self._make_attn_groups(runner, [attn] + mambas)
 
@@ -708,23 +721,50 @@ class TestAttentionMetadataBuilderPlumbing:
             ]
             return ctx, metas
 
-        ctx1, _ = walk([0, 17, 33, 33], staged=True)
-        ctx2, metas2 = walk([0, 18, 49, 33], staged=True)  # 49 crosses a block
-        assert ctx2.staged_block_tables is ctx1.staged_block_tables
-        _, plain = walk([0, 18, 49, 33], staged=False)
-        for a, b in zip(metas2, plain):
+        ctx1, metas1 = walk([0, 17, 33, 65], staged=True)
+        _, plain1 = walk([0, 17, 33, 65], staged=False)
+        for a, b in zip(metas1, plain1):
             assert torch.equal(a.block_tables, b.block_tables)
             if b.mamba_state_indices is not None:
                 assert torch.equal(a.mamba_state_indices, b.mamba_state_indices)
                 assert torch.equal(a.mamba_ckpt_indices, b.mamba_ckpt_indices)
 
-    def test_block_table_mutations_bump_the_version(self):
-        import numpy as np
+        ctx2, metas2 = walk([0, 18, 49, 97], staged=True)  # crosses blocks
+        assert ctx2.staged_block_tables is ctx1.staged_block_tables
+        _, plain2 = walk([0, 18, 49, 97], staged=False)
+        for a, b in zip(metas2, plain2):
+            assert torch.equal(a.block_tables, b.block_tables)
+            if b.mamba_state_indices is not None:
+                assert torch.equal(a.mamba_state_indices, b.mamba_state_indices)
+                assert torch.equal(a.mamba_ckpt_indices, b.mamba_ckpt_indices)
+
+    def test_block_table_mutations_bump_the_version(self, monkeypatch):
         from types import SimpleNamespace
 
+        import numpy as np
         from vllm.v1.worker.block_table import BlockTable
 
         from vllm_torchtpu.layers.core import attention_metadata as am
+
+        for name in (
+            "append_row",
+            "add_row",
+            "clear_row",
+            "move_row",
+            "swap_row",
+            "clear",
+        ):
+            monkeypatch.setattr(BlockTable, name, getattr(BlockTable, name))
+        monkeypatch.setattr(
+            BlockTable,
+            "_tpu_version_patch",
+            getattr(BlockTable, "_tpu_version_patch", False),
+            raising=False,
+        )
+        if hasattr(BlockTable, "_tpu_version_patch"):
+            delattr(BlockTable, "_tpu_version_patch")
+        monkeypatch.setenv("VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE", "1")
+        am._install_block_table_version()
 
         bt = SimpleNamespace(
             num_blocks_per_row=np.array([2, 0], dtype=np.int32),

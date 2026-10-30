@@ -216,9 +216,7 @@ def _staged_walk_products(
                 torch.int64
             )
             gathered = torch.gather(tbl, 1, state_offsets.unsqueeze(1)).squeeze(1)
-            states_g.append(
-                torch.where(active, gathered, torch.zeros_like(gathered))
-            )
+            states_g.append(torch.where(active, gathered, torch.zeros_like(gathered)))
             if ckpt_window > 1:
                 ckpt_offsets = state_offsets.unsqueeze(1) + torch.arange(
                     ckpt_window, device=seq_lens.device, dtype=torch.int64
@@ -255,6 +253,7 @@ def _staged_walk_products(
             gathered = torch.where(
                 active.unsqueeze(0), gathered, torch.zeros_like(gathered)
             )
+            ck: torch.Tensor | None = None
             if ckpt_window > 1:
                 ckpt_offsets = state_offsets.unsqueeze(1) + torch.arange(
                     ckpt_window, device=device, dtype=torch.int64
@@ -268,7 +267,7 @@ def _staged_walk_products(
             # (RuntimeProgramInputMismatch).
             for k, j in enumerate(members):
                 states[j] = gathered[k].clone()
-                if ckpt_window > 1:
+                if ck is not None:
                     ckpts[j] = ck[k].clone()
     if ckpt_window <= 1:
         ckpts = []
@@ -629,6 +628,8 @@ _BLOCK_TABLE_VERSION = [0]
 
 
 def _install_block_table_version() -> None:
+    if not envs.VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE:
+        return
     from vllm.v1.worker.block_table import BlockTable
 
     if getattr(BlockTable, "_tpu_version_patch", False):
@@ -655,9 +656,6 @@ def _install_block_table_version() -> None:
     for name in ("add_row", "clear_row", "move_row", "swap_row", "clear"):
         setattr(BlockTable, name, bump(getattr(BlockTable, name)))
     BlockTable._tpu_version_patch = True
-
-
-_install_block_table_version()
 
 
 def stage_block_table_uploads(

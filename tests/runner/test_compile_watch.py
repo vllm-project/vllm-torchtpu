@@ -1,14 +1,33 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import logging
 from types import SimpleNamespace
 
 import torch
+from torch._dynamo.callback import callback_handler
 
 from vllm_torchtpu.runner import compile_watch
 
 
-def test_post_warmup_compile_logs_one_warning(caplog, monkeypatch):
+def test_post_warmup_compile_logs_one_warning(monkeypatch):
     monkeypatch.setattr(compile_watch, "_installed", False)
+    monkeypatch.setattr(
+        callback_handler, "start_callbacks", list(callback_handler.start_callbacks)
+    )
+    monkeypatch.setattr(
+        callback_handler, "end_callbacks", list(callback_handler.end_callbacks)
+    )
     monkeypatch.setenv("VLLM_TPU_LOG_POST_WARMUP_COMPILES", "1")
     compile_watch.install_post_warmup_compile_log()
 
@@ -16,11 +35,24 @@ def test_post_warmup_compile_logs_one_warning(caplog, monkeypatch):
     def f(x):
         return x + 1
 
-    with caplog.at_level(logging.WARNING):
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler(logging.WARNING)
+    handler.emit = records.append
+    old_level = compile_watch.logger.level
+    old_disable = logging.root.manager.disable
+    compile_watch.logger.addHandler(handler)
+    compile_watch.logger.setLevel(logging.WARNING)
+    logging.disable(logging.NOTSET)
+    try:
         f(torch.ones(3))
         f(torch.ones(3))  # cached: no second compile
         f(torch.ones(5))  # new shape: a recompile
-    lines = [r.getMessage() for r in caplog.records if "Post-warmup compile" in r.getMessage()]
+    finally:
+        compile_watch.logger.removeHandler(handler)
+        compile_watch.logger.setLevel(old_level)
+        logging.disable(old_disable)
+
+    lines = [r.getMessage() for r in records if "Post-warmup compile" in r.getMessage()]
     assert len(lines) == 2, lines
     assert "#1" in lines[0] and "#2" in lines[1]
 

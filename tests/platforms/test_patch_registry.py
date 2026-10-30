@@ -248,6 +248,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "maybe_patch_qwen3_5_attn_moe_overlap",
     ]
     assert "patch_moe_expert_write_staging" in stages["worker_init"]
+    assert "_install_block_table_version" in stages["worker_init"]
     for names in (stages["platform_activation"], stages["worker_init"]):
         assert names.index("_patch_vllm_force_v1_runner_tpu") < names.index(
             "_patch_vllm_config_triton_tpu"
@@ -403,3 +404,38 @@ def test_sequence_parallel_moe_admission(monkeypatch):
         enable_expert_parallel=True, tensor_parallel_size=8, data_parallel_size=1
     )
     assert ParallelConfig.use_sequence_parallel_moe.fget(cfg_sp)
+
+
+def test_block_table_version_patch_respects_flag(monkeypatch):
+    from vllm.v1.worker.block_table import BlockTable
+
+    from vllm_torchtpu.layers.core import attention_metadata as am
+
+    for name in (
+        "append_row",
+        "add_row",
+        "clear_row",
+        "move_row",
+        "swap_row",
+        "clear",
+    ):
+        monkeypatch.setattr(BlockTable, name, getattr(BlockTable, name))
+    monkeypatch.setattr(
+        BlockTable,
+        "_tpu_version_patch",
+        getattr(BlockTable, "_tpu_version_patch", False),
+        raising=False,
+    )
+    if hasattr(BlockTable, "_tpu_version_patch"):
+        delattr(BlockTable, "_tpu_version_patch")
+
+    orig_add_row = BlockTable.add_row
+    monkeypatch.setenv("VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE", "0")
+    am._install_block_table_version()
+    assert not getattr(BlockTable, "_tpu_version_patch", False)
+    assert BlockTable.add_row is orig_add_row
+
+    monkeypatch.setenv("VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE", "1")
+    am._install_block_table_version()
+    assert BlockTable._tpu_version_patch is True
+    assert BlockTable.add_row is not orig_add_row

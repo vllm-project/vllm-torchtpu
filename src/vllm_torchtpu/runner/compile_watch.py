@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Report torch.compile (dynamo) compiles that happen after warmup.
 
 Every graph the server runs is meant to be compiled by the warmup; a compile
@@ -7,7 +19,7 @@ waits out. Server logs say nothing about them by default, so once warmup is
 done each later compile logs one WARNING line naming its count, duration
 and the vllm_torchtpu frame that triggered it:
 
-    Post-warmup compile #3 (12/76, 219 ms) from tpu_runner.py:2746 _apply_async_token_substitution
+    Post-warmup compile #3 (12/76, 219 ms) from tpu_runner.py:2746 _apply...
 
 Off by default; ``VLLM_TPU_LOG_POST_WARMUP_COMPILES=1`` turns it on.
 """
