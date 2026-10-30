@@ -405,6 +405,8 @@ common_env_exports=(
   "export TPU_KV_SHM_POOL_GB=${TPU_KV_SHM_POOL_GB}"
   "export TPU_SIDE_CHANNEL_PORT=${TPU_SIDE_CHANNEL_PORT}"
   "export LIBTPU_INIT_ARGS=\"\${LIBTPU_INIT_ARGS:-} --xla_tpu_scoped_vmem_limit_kib=65536\""
+  # Avoid the Shardy compilation crash in the PCP8/DP8 workload.
+  "export XLA_FLAGS=\"\${XLA_FLAGS:+\${XLA_FLAGS} }--xla_enable_hlo_sharding_v3=false\""
   "export ONEHOT_MOE_PERMUTE_THRESHOLD=${ONEHOT_MOE_PERMUTE_THRESHOLD:-32768}"
   "export TPU_RAGGED_GATHER_REDUCE_IMPL=fallback"
   "export TPU_RAGGED_GATHER_IMPL=fallback"
