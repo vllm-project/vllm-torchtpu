@@ -20,7 +20,11 @@ pytest.importorskip("torch_tpu")
 from vllm_torchtpu.layers.adapter.custom_ops import qsa_op  # noqa: E402
 
 OPTIONS = dict(mtp_rows.OPTIONS, token_topk=256)
-RATIO, TOPK, KV_HEADS, SHARDS = 4, 256, 2, 2
+RATIO, TOPK, SHARDS = 4, 256, 2
+# Served TP8 rank: 3 query heads (the pair's qgate holds 6) and one KV head.
+# The full-model 24 heads would pick Q256 default prefill tiles whose f32
+# windows exceed v7 VMEM; serving never builds that shape.
+PAIR_HEADS, KV_HEADS = 6, 1
 
 
 def _torch(x, device):
@@ -66,7 +70,8 @@ def _inputs(device, starts, context, tokens=8, seed=0):
                          np.asarray(context)[req] + np.arange(tokens) - starts_np[req], 0)
     angle = jnp.arange(4096)[:, None] * jnp.arange(32)[None, :] / 8192
     trig = jnp.pad(jnp.concatenate([jnp.cos(angle), jnp.sin(angle)], 1), ((0, 0), (0, 64))).astype(jnp.bfloat16)
-    head = (rand((tokens, 24 * 256 * 2)), rand((tokens, 2 * 256)), rand((tokens, 2 * 256)),
+    head = (rand((tokens, PAIR_HEADS * 256 * 2)), rand((tokens, KV_HEADS * 256)),
+            rand((tokens, KV_HEADS * 256)),
             rand((tokens, 5 * 128)), rand((256,)), rand((256,)), rand((128,)), rand((128,)),
             jnp.asarray(positions, jnp.int32), trig)
     tail = (jnp.asarray(starts_np), jnp.asarray(context, jnp.int32),
