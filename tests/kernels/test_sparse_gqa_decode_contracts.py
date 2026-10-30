@@ -16,6 +16,7 @@
 import dataclasses
 import functools
 import hashlib
+import importlib.util
 import math
 import runpy
 import sys
@@ -53,6 +54,7 @@ def test_benchmark_provenance_records_late_loaded_sources(monkeypatch, tmp_path)
     name = "vllm_torchtpu.kernels.sparse_gqa_decode._late_probe"
     module = types.ModuleType(name)
     module.__file__ = str(source)
+    module.__spec__ = importlib.util.spec_from_file_location(name, source)
     monkeypatch.setitem(sys.modules, name, module)
     after = provenance([])
     assert name not in before["loaded_sources"]
@@ -138,9 +140,7 @@ def test_planned_routing_reuses_plan_and_actual_small_chunk(monkeypatch):
 
     monkeypatch.setattr(public, "plan_decode", counted)
     monkeypatch.setattr(decode, "execute_decode", execute)
-    qsa_rpa.qsa_attention(
-        *args, jax.ShapeDtypeStruct((9,), jnp.int32), kv_heads=2, ratio=4
-    )
+    qsa_rpa.rpa_attention(*args, kv_heads=2, ratio=4)
     assert len(calls) == 1
 
 
@@ -187,20 +187,30 @@ def test_policy_static_identity_and_layout_constraints(monkeypatch):
     assert abi.output_aliases((None,) * 4, (None,)) == {4: 0, 6: 1}
 
 
-def test_module_entry_signature_remains_compatible(monkeypatch):
+def test_public_decode_entry_forwards_geometry_plan_and_scales(monkeypatch):
     import vllm_torchtpu.kernels.sparse_gqa_decode as public
-    from vllm_torchtpu.kernels.sparse_gqa_decode import decode
 
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
     args = _specs()
+    calls = []
 
-    def checked(*inputs, kv_heads, ratio, k_scale, v_scale):
-        assert (kv_heads, ratio, k_scale, v_scale) == (2, 4, 0.375, 2.5)
+    def checked(*inputs, launch, k_scale, v_scale):
+        assert launch.config_for_batch(8).model.num_kv_heads == 2
+        assert launch.config_for_batch(8).serve.page_size == 4
+        assert (k_scale, v_scale) == (0.375, 2.5)
+        calls.append(launch)
         return inputs[0], inputs[5]
 
-    monkeypatch.setattr(public, "qsa_decode_attention", checked)
-    assert decode.qsa_decode_attention(
-        *args, kv_heads=2, ratio=4, k_scale=0.375, v_scale=2.5
-    ) == (args[0], args[5])
+    monkeypatch.setattr(public, "_decode", checked)
+    result = jax.eval_shape(
+        functools.partial(
+            public.qsa_decode_attention, kv_heads=2, ratio=4, k_scale=0.375, v_scale=2.5
+        ),
+        *args,
+    )
+    assert result == (args[0], args[5])
+    assert len(calls) == 1
 
 
 @pytest.mark.tpu_test

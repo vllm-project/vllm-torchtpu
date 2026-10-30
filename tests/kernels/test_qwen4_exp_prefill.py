@@ -41,13 +41,13 @@ def tpu_info(monkeypatch):
     return info
 
 
-def test_shared_causal_default_keeps_current_group_visible():
+def test_shared_causal_default_counts_only_complete_groups():
     args = (jnp.array([8]), jnp.array([0, 8]), jnp.array([0, 0, 1]), 8, 512, 4)
     np.testing.assert_array_equal(
-        streamindex._effective_row_lengths(*args), [1, 1, 1, 1, 2, 2, 2, 2]
+        streamindex._effective_row_lengths(*args), [0, 0, 0, 1, 1, 1, 1, 2]
     )
     np.testing.assert_array_equal(
-        streamindex._effective_row_lengths(*args, components=qsa_indexing(3)),
+        streamindex._effective_row_lengths(*args, components=qsa_indexing()),
         [0, 0, 0, 1, 1, 1, 1, 2],
     )
 
@@ -90,7 +90,7 @@ def test_blocked_prefill_traces_native_and_pooled_bf16(tokens, dtype, packing, v
                 num_kv_pages_per_block=(8, 8, 8),
                 num_queries_per_block=(1, 128, 128),
                 chunk_tokens=512,
-                components=qsa_indexing(3),
+                components=qsa_indexing(),
                 return_scores=True,
             ),
             shape((tokens, 4, 256), jnp.bfloat16),
@@ -119,7 +119,7 @@ def test_completed_groups_for_full_prefill_with_idle_request(context):
         num_tokens=8192,
         num_positions=65536,
         compression_ratio=4,
-        components=qsa_indexing(3),
+        components=qsa_indexing(),
     )
     np.testing.assert_array_equal(actual, expected)
 
@@ -171,11 +171,10 @@ def test_nonpooled_prefill_bounds_expansion_and_preserves_request_ownership(
     assert chunk_shapes and all(q <= limit and n == q * pages for q, n in chunk_shapes)
 
 
-def test_pooled_prefill_keeps_live_requests_after_empty_rows(monkeypatch):
+def test_pooled_prefill_keeps_live_requests_after_empty_rows(monkeypatch, tpu_info):
     def transport(q, weights, cache, lengths, table, starts, distribution, **kwargs):
-        assert kwargs["components"].schedule.causal_position_offset == 3
-        np.testing.assert_array_equal(distribution, [0, 0, 3])
-        return streamindex._effective_row_lengths(
+        assert kwargs["components"] == qsa_indexing()
+        visible = streamindex._effective_row_lengths(
             lengths,
             starts,
             distribution,
@@ -184,6 +183,7 @@ def test_pooled_prefill_keeps_live_requests_after_empty_rows(monkeypatch):
             4,
             components=kwargs["components"],
         )
+        return jnp.broadcast_to(visible[:, None], (len(q), kwargs["k"]))
 
     monkeypatch.setattr(decode_indexer, "streamindex_topk", transport)
     actual = pooled_qsa.select_blocks(
@@ -196,8 +196,12 @@ def test_pooled_prefill_keeps_live_requests_after_empty_rows(monkeypatch):
         jnp.array([0, 0, 2048]),
         ratio=4,
         block_topk=512,
+        request_distribution=jnp.array([0, 0, 3], jnp.int32),
     )
-    np.testing.assert_array_equal(actual, [0, 0, 0, 512, 512, 512, 513, 513])
+    expected = np.array([0, 0, 0, 512, 512, 512, 513, 513])
+    np.testing.assert_array_equal(
+        actual, np.broadcast_to(expected[:, None], actual.shape)
+    )
 
 
 @pytest.mark.parametrize("heads,dim,ratio", [(1, 256, 4), (4, 64, 8), (8, 256, 4)])
@@ -271,7 +275,7 @@ def test_blocked_prefill_bf16_pool_view_matches_native_cache(tokens, carrier):
             num_kv_pages_per_block=(8, 8, 8),
             num_queries_per_block=(1, 128, 128),
             chunk_tokens=512,
-            components=qsa_indexing(3),
+            components=qsa_indexing(),
             return_scores=True,
             **kwargs,
         )

@@ -98,7 +98,11 @@ def runner_inputs(
     )
     assert kwargs["query_start_loc"].tolist() == [0] + [tokens - 3] * 8
     assert kwargs["context_lens"].tolist() == [context] + [0] * 7
-    assert kwargs["state_slots"].tolist() == [0] + [-1] * 7
+    ring_tables = prepared[0][names[1]].block_tables
+    assert isinstance(ring_tables, torch.Tensor)
+    ring_tables = ring_tables.reshape(8, -1)
+    torch.testing.assert_close(ring_tables[0], tables[1][0])
+    assert torch.count_nonzero(ring_tables[1:]) == 0
     assert kwargs["valid_tokens"].tolist() == [True] * (tokens - 3) + [False] * 3
     return runner, kwargs, layout, columns
 

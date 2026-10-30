@@ -23,9 +23,7 @@ from jax.typing import DTypeLike
 
 from vllm_torchtpu.kernels.qwen4_exp.cache_regions import region_rows
 
-# Conservative TPU7x performance default, not a hardware concurrency limit.
-# Matched1/2/4/8/16 wall measurements do not establish a material gain at16.
-# Unmeasured chips stay serial; resource admission remains mandatory.
+# Maximum concurrent row transfers; padded buffers must fit SMEM and VMEM.
 DEFAULT_DMA_CONCURRENCY = 8
 _DMA_BATCHES = tuple(
     1 << power for power in reversed(range(DEFAULT_DMA_CONCURRENCY.bit_length()))
@@ -39,7 +37,6 @@ _DmaArray = jax.Array | jax.ShapeDtypeStruct
 class DmaHardware:
     """Immutable per-TensorCore capacity and pinned compiler tile facts."""
 
-    chip_version: pltpu.ChipVersion | None
     vmem_bytes: int
     smem_bytes: int
     lanes: int
@@ -50,9 +47,6 @@ class DmaHardware:
     @classmethod
     def from_tpu_info(cls, info: pltpu.TpuInfo) -> "DmaHardware":
         return cls(
-            info.chip_version
-            if isinstance(info.chip_version, pltpu.ChipVersion)
-            else None,
             info.vmem_capacity_bytes,
             info.smem_capacity_bytes,
             info.num_lanes,
@@ -62,20 +56,8 @@ class DmaHardware:
         )
 
 
-def _hardware() -> DmaHardware | None:
-    # Called at kernel lowering, never at module import or pure CPU planning.
-    try:
-        info = pltpu.get_tpu_info()
-    except ValueError as error:
-        if str(error).startswith(
-            ("Unsupported TPU device kind:", "Unsupported TPU chip version:")
-        ):
-            return None
-        raise
-    if info.generation not in range(2, 9):
-        # The pinned get_sublane_tiling API has no layout for later generations.
-        return None
-    return DmaHardware.from_tpu_info(info)
+def _hardware() -> DmaHardware:
+    return DmaHardware.from_tpu_info(pltpu.get_tpu_info())
 
 
 def _align(value: int, tile: int) -> int:
@@ -194,10 +176,7 @@ def ring_tag_dma_batch(
     tt, _ = region_rows(pool, tag_elements, jnp.int32)
     if rt + tt > pool.shape[1]:
         return 1
-    batches = (
-        _DMA_BATCHES if hardware.chip_version == pltpu.ChipVersion.TPU_7X else (1,)
-    )
-    for batch in batches:
+    for batch in _DMA_BATCHES:
         if requests % batch:
             continue
         memory = ring_tag_dma_memory(
@@ -225,10 +204,7 @@ def main_kv_dma_batch(
     ):
         return 1
     assert hardware is not None
-    batches = (
-        _DMA_BATCHES if hardware.chip_version == pltpu.ChipVersion.TPU_7X else (1,)
-    )
-    for batch in batches:
+    for batch in _DMA_BATCHES:
         memory = main_kv_dma_memory(pool, rows, batch, hardware)
         if (
             memory.vmem_bytes <= hardware.vmem_bytes

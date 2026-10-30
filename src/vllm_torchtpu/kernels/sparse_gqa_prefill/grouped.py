@@ -13,7 +13,6 @@
 # limitations under the License.
 """SC-interleaved selected KV and grouped-query prefill MXU tiles.
 
-Ported from standalone qsa_prefill v0.4 grouped.py; imports only changed.
 Transport uses the native packed SparseCore gather. Unlike block-union
 prefill, the gathered rows are owned by individual queries. A diagonal mask
 keeps their softmaxes independent while a small query group fills MXU rows.
@@ -110,8 +109,12 @@ def gather_interleaved(
     batch, budget = blocks.shape
     head_axes, packing, dim = cache.shape[2:]
     capacity = pl.cdiv(budget * ratio + ratio - 1, tile_k) * tile_k
-    if batch % query_group or cache.nbytes > 16 * 2**30:
-        raise ValueError("Aligned query groups and cache <=16 GiB are required")
+    if batch % query_group:
+        raise ValueError("Aligned query groups are required")
+    # Indirect gather addresses packed rows with signed int32 indices.
+    source_rows = cache.shape[0] * cache.shape[1] * head_axes
+    if source_rows > jnp.iinfo(jnp.int32).max:
+        raise ValueError("Packed cache row indices must fit int32")
     padded_budget = pl.cdiv(budget, 128) * 128
     padded_table = pl.cdiv(table.shape[1], 128) * 128
     indices = pl.pallas_call(
@@ -124,7 +127,7 @@ def gather_interleaved(
             tile_k=tile_k,
             head_axes=head_axes,
             capacity=capacity,
-            source_rows=cache.shape[0] * cache.shape[1] * head_axes,
+            source_rows=source_rows,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
@@ -163,7 +166,6 @@ def gather_interleaved(
         info.num_lanes * info.num_cores * info.num_subcores * streams, head_axes
     )
     padded = pl.cdiv(indices.size, granularity) * granularity
-    source_rows = cache.shape[0] * cache.shape[1] * head_axes
     indices = jnp.concatenate(
         (
             indices,

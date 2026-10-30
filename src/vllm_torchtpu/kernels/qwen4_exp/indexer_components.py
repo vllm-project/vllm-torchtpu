@@ -63,18 +63,16 @@ class BF16KeyReader:
 class QSAIndexSchedule:
     """Prefill excludes incomplete groups; expanded decode already bounds lengths."""
 
-    causal_position_offset: int = 0
-
     @property
     def preserves_kv_extent(self) -> bool:
         return True
 
     def validate(self, compression_ratio: int) -> None:
-        if not 0 <= self.causal_position_offset < compression_ratio:
-            raise ValueError("causal position offset must be in [0, compression_ratio)")
+        if compression_ratio <= 0:
+            raise ValueError("compression_ratio must be positive")
 
     def positions(self, positions: jax.Array) -> jax.Array:
-        return positions - self.causal_position_offset
+        return positions
 
     def visible_lengths(self, lengths: jax.Array) -> jax.Array:
         return jnp.maximum(lengths, 0)
@@ -93,7 +91,5 @@ class QSAIndexSchedule:
         )
 
 
-def qsa_indexing(causal_position_offset: int = 0) -> StreamIndexComponents:
-    return StreamIndexComponents(
-        BF16KeyReader(), QSAIndexSchedule(causal_position_offset)
-    )
+def qsa_indexing() -> StreamIndexComponents:
+    return StreamIndexComponents(BF16KeyReader(), QSAIndexSchedule())

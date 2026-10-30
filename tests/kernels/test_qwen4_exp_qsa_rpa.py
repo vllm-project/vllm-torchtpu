@@ -41,7 +41,9 @@ def test_virtual_pages_preserve_sparse_order_and_tail(page_metadata_backend):
     blocks = blocks[:, :2]
     lengths = jnp.array([133, 0], jnp.int32)
     table = jnp.array([[7, 2], [0, 1]], jnp.int32)
-    pages, lens, starts, _ = qsa_rpa.virtual_page_metadata(blocks, lengths, table)
+    pages, lens, starts, _ = qsa_rpa.virtual_page_metadata(
+        blocks, lengths, table, ratio=4, page_size=128
+    )
     np.testing.assert_array_equal(pages, [[64, 224, 65], [0, 0, 0]])
     np.testing.assert_array_equal(lens, [9, 0])
     np.testing.assert_array_equal(starts, [0, 1, 1])
@@ -75,7 +77,11 @@ def test_virtual_pages_match_scalar_addressing(
             )
         expected_lengths.append(count * ratio + tail)
     pages, lens, starts, _ = qsa_rpa.virtual_page_metadata(
-        jnp.asarray(blocks), jnp.asarray(lengths), jnp.asarray(table), ratio=ratio
+        jnp.asarray(blocks),
+        jnp.asarray(lengths),
+        jnp.asarray(table),
+        ratio=ratio,
+        page_size=128,
     )
     np.testing.assert_array_equal(pages, expected)
     np.testing.assert_array_equal(lens, expected_lengths)
@@ -323,7 +329,7 @@ def test_one_kv_head_rpa_lifecycle(fp8):
 def test_query_batch_bounds_scalar_page_metadata(budget, monkeypatch):
     info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
     monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
-    batch = qsa_rpa.rpa_query_batch_size(
+    batch = qsa_rpa.batching.rpa_query_batch_size(
         budget + 1,
         query=jax.ShapeDtypeStruct((1, 24, 256), jnp.bfloat16),
         cache=jax.ShapeDtypeStruct((1, 128, 1, 2, 256), jnp.bfloat16),

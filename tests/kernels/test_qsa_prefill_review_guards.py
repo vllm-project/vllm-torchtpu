@@ -226,8 +226,9 @@ def test_ragged_general_tc_uses_bounded_pack_and_each_requests_table(
     )
     actual, _ = run(*args, padded)
     expected, _ = run(*args, short)
-    plan = tc._ragged_plan(17, 4, 128, 128, 32, 1, 4, 128, request_capacity=17)
-    assert sizes and set(sizes) == {plan[0] * 128}
+    # Each nonempty request may add one partial tile; empty capacity is capped
+    # by the number of query rows, not the padded starts array.
+    assert sizes == [len(query) * 128, (len(short) - 1) * 128]
     np.testing.assert_array_equal(actual, expected)
     np.testing.assert_array_equal(np.asarray(actual[:, 0, 0]), [1] * 3 + [3.5] * 14)
 
@@ -479,10 +480,11 @@ def test_zero_visit_tc_cost_bounds_all_nonnegative_visit_counts(dtype):
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float8_e4m3fn])
 @pytest.mark.parametrize(
-    "requests,expected_sc,expected_fine_calls", [(2, False, 2), (256, True, 0)]
+    "requests,columns,expected_sc,expected_fine_calls",
+    [(2, 1, False, 0), (2, 16, False, 2), (256, 16, True, 0)],
 )
 def test_ragged_lower_bound_skips_only_resolved_sc_work(
-    monkeypatch, dtype, requests, expected_sc, expected_fine_calls
+    monkeypatch, dtype, requests, columns, expected_sc, expected_fine_calls
 ):
     calls = []
     original = adaptive.active_counts
@@ -499,8 +501,12 @@ def test_ragged_lower_bound_skips_only_resolved_sc_work(
         if requests == 2
         else jnp.arange(257, dtype=jnp.int32)
     )
-    model = work_model(dtype)
-    plan = tc._ragged_plan(256, 24, 256, 128, 416, 1, 512, 256, request_capacity=256)
+    model = work_model(dtype, columns=columns)
+    num_tiles = (896 * columns + 255) // 256
+    words = ((num_tiles * 2 + 127) // 128) * 128
+    plan = tc._ragged_plan(
+        256, 24, 256, words, 896 * columns // 4, columns, 512, 256, request_capacity=256
+    )
     tile_count = jnp.sum((jnp.diff(starts) + 255) // 256, dtype=jnp.int32)
     launches = (tile_count + plan[0] - 1) // plan[0]
     live_prefix = jnp.concatenate((jnp.zeros(1, jnp.int32), jnp.cumsum(lengths > 0)))
@@ -509,7 +515,7 @@ def test_ragged_lower_bound_skips_only_resolved_sc_work(
     lower = tc_cost(
         model,
         queries=256 * plan[0] * launches,
-        num_tiles=7,
+        num_tiles=num_tiles,
         tile_visits=minimum_visits,
         launches=launches,
     )
@@ -523,10 +529,47 @@ def test_ragged_lower_bound_skips_only_resolved_sc_work(
             starts,
             0,
             256,
-            7,
+            num_tiles,
             dtype,
-            tc._ragged_plan(256, 24, 256, 128, 416, 1, 512, 256, request_capacity=256),
-            work_model(dtype),
+            plan,
+            model,
         )
     assert bool(actual) == expected_sc
     assert len(calls) == expected_fine_calls
+
+
+@pytest.mark.parametrize("pages,expected", [(200000, True), (2**24, False)])
+def test_sparse_gather_admission_uses_packed_row_address_range(
+    tpu_info, pages, expected
+):
+    shape = jax.ShapeDtypeStruct
+    q = shape((8, 4, 256), jnp.bfloat16)
+    cache = shape((pages, 128, 1, 4, 256), jnp.float8_e4m3fn)
+    assert cache.size * cache.dtype.itemsize > 16 * 1024**3
+    assert (
+        adaptive.is_supported_by_adaptive_prefill(
+            q,
+            q,
+            shape((8, 512), jnp.int32),
+            shape((8,), jnp.int32),
+            shape((8, 1), jnp.int32),
+            cache,
+            shape((9,), jnp.int32),
+            kv_heads=2,
+            ratio=4,
+            k_scale=1.0,
+            v_scale=1.0,
+        )
+        is expected
+    )
+    if not expected:
+        with pytest.raises(ValueError, match="row indices must fit int32"):
+            jax.eval_shape(
+                functools.partial(
+                    grouped.gather_interleaved, query_group=8, tile_k=256, ratio=4
+                ),
+                shape((8, 512), jnp.int32),
+                shape((8,), jnp.int32),
+                shape((8, 1), jnp.int32),
+                cache,
+            )

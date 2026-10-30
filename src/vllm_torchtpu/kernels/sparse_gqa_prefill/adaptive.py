@@ -850,7 +850,7 @@ def _has_supported_cache_and_index_metadata(
         or cache.shape[1] <= 0
         or cache.shape[1] % 128
         or cache.dtype not in (jnp.bfloat16, jnp.float8_e4m3fn)
-        or cache.size * jax.dtypes.itemsize_bits(cache.dtype) // 8 > 16 * 2**30
+        or cache.shape[0] * cache.shape[1] * cache.shape[2] > jnp.iinfo(jnp.int32).max
         or blocks.ndim != 2
         or blocks.shape[0] != len(query)
         or blocks.shape[1] <= 0

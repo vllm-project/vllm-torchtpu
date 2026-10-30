@@ -20,10 +20,10 @@ from typing import Any, NamedTuple, cast
 
 import jax
 import torch
-from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from jax._src import dtypes
 from jax.sharding import Mesh
 from vllm import utils
+from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger

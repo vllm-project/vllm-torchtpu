@@ -81,8 +81,7 @@ def plan_decode(
         return None
     info = pltpu.get_tpu_info()
     if (
-        info.chip_version != pltpu.ChipVersion.TPU_7X
-        or info.num_lanes != RPA_WAIT_ROW_WORDS
+        info.num_lanes != RPA_WAIT_ROW_WORDS
         or policy.bkv_tokens % info.num_lanes
         or not 0 < policy.pipeline_lanes <= info.num_lanes
         or policy.schedule_copy_words <= 0

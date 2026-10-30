@@ -83,4 +83,3 @@ def _bind_scheduling_group_namespaces(graph: fx.GraphModule) -> None:
             module.recompile()
 
     bind(graph)
-

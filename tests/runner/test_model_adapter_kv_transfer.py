@@ -14,11 +14,15 @@
 """Model-owned caches must register the same live buffers after binding."""
 
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 import torch
+from vllm.v1.kv_cache_interface import KVCacheConfig
 
+from vllm_torchtpu.distributed.kv_transfer.tpu_connector import TPUConnector
 from vllm_torchtpu.runner import kv_cache_manager
+from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
 @pytest.mark.parametrize("transfer_enabled", [False, True])
@@ -29,29 +33,41 @@ def test_adapter_cache_registration_order_and_identity(
     events = []
     raw = torch.zeros(2, 4)
     caches = {"attention": raw, "ring": raw, "state": [raw]}
-    config = object()
-    runner = SimpleNamespace()
+    config = KVCacheConfig(num_blocks=1, kv_cache_tensors=[], kv_cache_groups=[])
+    runner = SimpleNamespace(device=torch.device("cpu"))
 
     class Adapter:
         def initialize_kv_cache(self, actual_config):
-            assert actual_config is config
+            assert actual_config == config and actual_config is not config
+            assert actual_config is runner.kv_cache_config
             runner.kv_caches = [raw]
             events.append("bound")
             return caches
 
     class Connector:
+        def set_host_xfer_buffer_ops(self, copy_operation):
+            pass
+
         def register_kv_caches(self, actual_caches):
             assert actual_caches is caches
             assert runner.kv_caches[0] is actual_caches["ring"]
             events.append("registered")
 
-    class ConnectorWithHooks(Connector):
-        def set_host_xfer_buffer_ops(self, copy_op):
-            assert copy_op is kv_cache_manager.copy_kv_blocks
+    class ConnectorWithHooks(TPUConnector):
+        def __init__(self):
+            pass
+
+        def register_kv_caches(self, kv_caches):
+            assert kv_caches is caches
+            assert runner.kv_caches[0] is kv_caches["ring"]
+            events.append("registered")
+
+        def set_host_xfer_buffer_ops(self, copy_operation):
+            assert copy_operation is kv_cache_manager.copy_kv_blocks
             events.append("copy")
 
-        def register_runner(self, actual_runner):
-            assert actual_runner is runner
+        def register_runner(self, runner):
+            assert runner is manager.runner
             events.append("runner")
 
     connector = ConnectorWithHooks() if runner_hooks else Connector()
@@ -65,7 +81,7 @@ def test_adapter_cache_registration_order_and_identity(
     )
     monkeypatch.setattr(kv_cache_manager, "get_kv_transfer_group", get_connector)
     manager = object.__new__(kv_cache_manager.KVCacheManager)
-    manager.runner = runner
+    manager.runner = cast(TPUModelRunner, runner)
     manager.model_adapter = Adapter()
     manager.initialize_kv_cache(config)
     expected = ["bound"]
@@ -84,13 +100,14 @@ def test_missing_live_cache_mapping_is_rejected_only_for_transfer(
         kv_cache_manager, "has_kv_transfer_group", lambda: transfer_enabled
     )
     manager = object.__new__(kv_cache_manager.KVCacheManager)
-    manager.runner = SimpleNamespace()
+    manager.runner = SimpleNamespace(device=torch.device("cpu"))
     manager.model_adapter = SimpleNamespace(initialize_kv_cache=lambda config: None)
+    config = KVCacheConfig(num_blocks=1, kv_cache_tensors=[], kv_cache_groups=[])
     if transfer_enabled:
         with pytest.raises(NotImplementedError, match="live named buffers"):
-            manager.initialize_kv_cache(object())
+            manager.initialize_kv_cache(config)
     else:
-        manager.initialize_kv_cache(object())
+        manager.initialize_kv_cache(config)
 
 
 @pytest.mark.parametrize("ssm_dtype", ["bfloat16", "float32"])
@@ -141,16 +158,26 @@ def test_qwen_pool_adapter_registers_materialized_carriers(monkeypatch, ssm_dtyp
     adapter = Qwen4ExpAdapter(runner)
     adapter.bind_model(SimpleNamespace(model=SimpleNamespace(layers=layers)))
     cache = adapter.cache
+    assert cache is not None
+    cache.get_specs()
     cfg.cache_config.num_gpu_blocks_override = cache.pages
     cfg.cache_config.mamba_block_size = cfg.model_config.max_model_len
     cache.allocate()
     materialized = cache.materialized
+    assert materialized is not None
     bound["ple"].fill_(7)
     history = bound["ple"].clone()
     events = []
 
-    class Connector:
-        def register_kv_caches(self, caches):
+    class Connector(TPUConnector):
+        def __init__(self):
+            pass
+
+        def set_host_xfer_buffer_ops(self, copy_operation):
+            pass
+
+        def register_kv_caches(self, kv_caches):
+            caches = kv_caches
             assert caches is materialized.kv_caches
             assert caches["model.layers.1.self_attn"] is bound["main"]
             assert caches["model.layers.1.self_attn.compressed_k"] is bound["index"]
@@ -164,8 +191,8 @@ def test_qwen_pool_adapter_registers_materialized_carriers(monkeypatch, ssm_dtyp
             assert {p.layer_name for p in manifest.pools} == set(caches)
             events.append("caches")
 
-        def register_runner(self, actual_runner):
-            assert actual_runner is runner
+        def register_runner(self, runner):
+            assert runner is manager.runner
             assert events == ["caches"]
             events.append("runner")
 

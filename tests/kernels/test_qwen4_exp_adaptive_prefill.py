@@ -14,6 +14,7 @@
 """Qwen dispatch preserves fallback paths outside adaptive prefill's envelope."""
 
 import functools
+from dataclasses import replace
 
 import jax
 import jax.numpy as jnp
@@ -60,11 +61,18 @@ def test_qwen_dispatch_preserves_existing_paths(monkeypatch, fp8, case):
         ((pages, page, 4 // packing, packing, 256), dtype),
         (((9,) if case == "padded" else (3,) if case == "slots" else (2,)), jnp.int32),
     ]
-    args = tuple(jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in shapes)
+    args: list[jax.Array | jax.ShapeDtypeStruct] = [
+        jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in shapes
+    ]
+    args[3] = jnp.ones(tokens, jnp.int32)
+    args[6] = jnp.array([0] + [tokens] * (shapes[6][0][0] - 1), jnp.int32)
+    inputs = tuple(args)
     info = pltpu.get_tpu_info_for_chip(
-        pltpu.ChipVersion.TPU_V5P if case == "hardware" else pltpu.ChipVersion.TPU_7X,
+        pltpu.ChipVersion.TPU_7X,
         1,
     )
+    if case == "hardware":
+        info = replace(info, sparse_core=None)
     monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
     monkeypatch.setattr(
         prefill_tiles, "get_sparse_prefill_tiles", lambda *a, **k: (256, 256)
@@ -90,18 +98,28 @@ def test_qwen_dispatch_preserves_existing_paths(monkeypatch, fp8, case):
         functools.partial(capture, "fused_decode"),
     )
     scale = 2.0 if case == "scale" else 1.0
-    output, cache = qsa_rpa.qsa_attention(*args, kv_heads=2, ratio=4, v_scale=scale)
+    distribution = jnp.array([1, 1, 1] if case == "decode" else [0, 0, 1], jnp.int32)
+    with jax.disable_jit():
+        output, cache = qsa_rpa.qsa_attention(
+            *args, request_distribution=distribution, kv_heads=2, ratio=4, v_scale=scale
+        )
     expected = (
         "adaptive"
-        if case in ("supported", "slots", "tail", "padded")
-        else "fused_decode"
+        if case in ("supported", "slots", "tail", "padded", "page", "cache")
+        else "decode"
         if case == "decode"
         else "prefill"
     )
     assert len(calls) == 1 and calls[0][0] == expected
-    forwarded = args[:-1] if case == "decode" else args
-    assert all(a is b for a, b in zip(calls[0][1], forwarded, strict=True))
-    assert output is args[0] and cache is args[5]
+    forwarded = inputs[:-1] if case == "decode" else inputs
+    for index, (actual, expected_input) in enumerate(
+        zip(calls[0][1], forwarded, strict=True)
+    ):
+        if index in (3, 6):
+            np.testing.assert_array_equal(actual, expected_input)
+        else:
+            assert actual is expected_input
+    assert output is inputs[0] and cache is inputs[5]
     if expected != "adaptive":
         assert calls[0][2]["v_scale"] == scale
 

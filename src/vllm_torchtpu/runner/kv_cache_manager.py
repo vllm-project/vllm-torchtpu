@@ -1366,9 +1366,13 @@ class KVCacheManager:
             )
         kv_connector = get_kv_transfer_group()
         kv_connector.register_kv_caches(kv_caches)
-        if hasattr(kv_connector, "set_host_xfer_buffer_ops"):
-            kv_connector.set_host_xfer_buffer_ops(copy_kv_blocks)
-        if hasattr(kv_connector, "register_runner"):
+        kv_connector.set_host_xfer_buffer_ops(copy_kv_blocks)
+        from vllm_torchtpu.distributed.kv_transfer.tpu_connector import TPUConnector
+        from vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector import (
+            TPUMultiConnector,
+        )
+
+        if isinstance(kv_connector, (TPUConnector, TPUMultiConnector)):
             kv_connector.register_runner(self.runner)
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:

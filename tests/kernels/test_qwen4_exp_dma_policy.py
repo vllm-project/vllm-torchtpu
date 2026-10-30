@@ -137,26 +137,21 @@ def test_insufficient_region_capacity_and_main_partial_tiles():
     )
 
 
-def test_unknown_hardware_falls_back_but_unrelated_errors_propagate(monkeypatch):
-    def unsupported():
-        raise ValueError(
-            "Unsupported TPU device kind: TPU-future. If you are not running a TPU"
-        )
-
-    monkeypatch.setattr(policy.pltpu, "get_tpu_info", unsupported)
-    assert (
-        policy.get_ring_tag_dma_batch(carrier(), 8, ring_elements=1024, tag_elements=16)
-        == 1
-    )
-    rows = jax.ShapeDtypeStruct((128, *carrier().shape[2:]), carrier().dtype)
-    assert policy.get_main_kv_dma_batch(carrier(), rows) == 1
-
+@pytest.mark.parametrize(
+    "error", [ValueError("unsupported device"), RuntimeError("backend failed")]
+)
+def test_public_hardware_errors_propagate(monkeypatch, error):
     def broken():
-        raise RuntimeError("backend session failed")
+        raise error
 
     monkeypatch.setattr(policy.pltpu, "get_tpu_info", broken)
-    with pytest.raises(RuntimeError, match="backend session failed"):
+    rows = jax.ShapeDtypeStruct((128, *carrier().shape[2:]), carrier().dtype)
+    with pytest.raises(type(error)) as caught:
         policy.get_main_kv_dma_batch(carrier(), rows)
+    assert caught.value is error
+    with pytest.raises(type(error)) as caught:
+        policy.get_ring_tag_dma_batch(carrier(), 8, ring_elements=1024, tag_elements=16)
+    assert caught.value is error
 
 
 def test_pure_planning_never_queries_backend(monkeypatch):
@@ -177,32 +172,26 @@ def test_pure_planning_never_queries_backend(monkeypatch):
         assert policy.main_kv_dma_batch(pool, rows, hardware=hw) == 8
 
 
-def test_unmeasured_chip_keeps_serial_policy_with_known_resource_facts():
-    hw = policy.DmaHardware.from_tpu_info(
-        pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_V6E, 1)
-    )
+@pytest.mark.parametrize(
+    "chip",
+    [pltpu.ChipVersion.TPU_V5P, pltpu.ChipVersion.TPU_V6E, pltpu.ChipVersion.TPU_7X],
+)
+def test_public_capacities_and_layout_determine_concurrency(chip):
+    hw = policy.DmaHardware.from_tpu_info(pltpu.get_tpu_info_for_chip(chip, 1))
     pool = carrier()
     rows = jax.ShapeDtypeStruct((128, *pool.shape[2:]), pool.dtype)
     assert (
         policy.ring_tag_dma_batch(
             pool, 16, ring_elements=1024, tag_elements=16, hardware=hw
         )
-        == 1
+        == 8
     )
-    assert policy.main_kv_dma_batch(pool, rows, hardware=hw) == 1
-
-
-def test_registered_unknown_chip_variant_does_not_acquire_measured_policy():
-    from jax._src.tpu_info import ChipVersionBase
-
-    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
-    facts = policy.DmaHardware.from_tpu_info(
-        dataclasses.replace(info, chip_version=ChipVersionBase())
-    )
-    assert facts.chip_version is None
+    assert policy.main_kv_dma_batch(pool, rows, hardware=hw) == 8
+    constrained = dataclasses.replace(hw, vmem_bytes=1)
     assert (
         policy.ring_tag_dma_batch(
-            carrier(), 16, ring_elements=1024, tag_elements=16, hardware=facts
+            pool, 16, ring_elements=1024, tag_elements=16, hardware=constrained
         )
         == 1
     )
+    assert policy.main_kv_dma_batch(pool, rows, hardware=constrained) == 1

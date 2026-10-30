@@ -250,7 +250,7 @@ def select_index_blocks(
             decode_req_batch_size=8,
             enable_early_exit=True,
             chunk_tokens=512 if len(q) % 512 == 0 else None,
-            components=qsa_indexing(ratio - 1),
+            components=qsa_indexing(),
             prefix_capacity=prefix_capacity,
             topk_backend=topk_backend,
             scheduling_group_namespace=scheduling_group_namespace,
