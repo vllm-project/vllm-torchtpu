@@ -586,6 +586,7 @@ def _plain_step_runner(num_output, logits, req_id="r0"):
             mamba_state_indices_list=None,
             pooler_output_list=[],
             top_tokens=False,
+            kv_save_nan_check=None,
         ),
         input_batch=SimpleNamespace(
             max_num_logprobs=None,
@@ -603,6 +604,7 @@ def _plain_step_runner(num_output, logits, req_id="r0"):
         },
         _pre_async_results=None,
         _pp_wave=None,
+        _dp_step_other_decode=False,
         _min_tokens=min_tokens.MinTokensTracker(),
         speculative_config=None,
         scheduler_config=SimpleNamespace(async_scheduling=False),
