@@ -266,6 +266,14 @@ def pooled_cache_specs(cfg):
 
         # VLLM_TPU_QSA_MTP_KV_DCP: the draft's main KV splits like the target's.
         split_draft = bool(envs.VLLM_TPU_QSA_MTP_KV_DCP)
+        # VLLM_TPU_QSA_COMPRESSED_DCP: compressed keys too. Their groups hold
+        # the draft's keys as well (packed), so the draft must be split.
+        split_compressed = bool(envs.VLLM_TPU_QSA_COMPRESSED_DCP)
+        if split_compressed and not split_draft:
+            raise ValueError(
+                "VLLM_TPU_QSA_COMPRESSED_DCP needs VLLM_TPU_QSA_MTP_KV_DCP: the "
+                "MTP draft writes compressed keys into the split groups"
+            )
         dcp_owners = tuple(
             name
             for name in specs
@@ -273,6 +281,10 @@ def pooled_cache_specs(cfg):
             and (split_draft or name not in draft_attention)
             and name not in paired_away
         )
+        if split_compressed:
+            dcp_owners += tuple(
+                name for name in specs if name.endswith(".compressed_k")
+            )
     layout = Qwen4ExpPoolLayout(
         block_size=block_size,
         page_bytes=page_bytes,

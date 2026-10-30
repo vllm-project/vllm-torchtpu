@@ -534,6 +534,22 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             self._dcp_op = partial(
                 build_pooled_qsa_dcp_op(pair, self.main_kv_dcp), **keywords
             )
+            compressed = bool(envs.VLLM_TPU_QSA_COMPRESSED_DCP)
+            if compressed:
+                from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
+                    build_pooled_qsa_compressed_dcp_op,
+                )
+
+                # VLLM_TPU_QSA_COMPRESSED_DCP: owned-group scoring, pair merge.
+                # The megakernel's whole-step writer still writes whole rows.
+                assert self._select_op is None, (
+                    "VLLM_TPU_QSA_COMPRESSED_DCP and VLLM_TPU_MEGAKERNEL are exclusive"
+                )
+                self._dcp_op = partial(
+                    build_pooled_qsa_compressed_dcp_op(pair, self.main_kv_dcp),
+                    kv_heads=self.num_kv_heads,
+                    **keywords,
+                )
             if "mtp" in self.prefix:
                 from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
                     build_pooled_qsa_draft_dcp_op,
@@ -547,17 +563,26 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                             pair, self.main_kv_dcp, shared=shared, with_rows=with_rows
                         ),
                         dcp_rank=self.dcp_rank,
+                        **({"compressed_dcp": True} if compressed and shared else {}),
                         **keywords,
                     )
 
+                # Under compressed DCP the draft attends the target's selection
+                # only: its own rows indexer would need the pair merge.
+                assert not compressed or self._shared_ops is not None, (
+                    "VLLM_TPU_QSA_COMPRESSED_DCP needs VLLM_TPU_QSA_DRAFT_SHARED_SELECTION"
+                )
                 self._rows_op = draft(False, True)
                 if self._shared_ops is not None:
                     self._shared_ops = (draft(True, False), draft(True, True))
             if getattr(self, "token_shard", False):
+                build = build_pooled_qsa_token_shard_dcp_op
+                if compressed:
+                    from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
+                        build_pooled_qsa_token_shard_compressed_dcp_op as build,
+                    )
                 self._token_shard_dcp_op = partial(
-                    build_pooled_qsa_token_shard_dcp_op(
-                        get_tp_group(), pair, self.main_kv_dcp
-                    ),
+                    build(get_tp_group(), pair, self.main_kv_dcp),
                     kv_heads=self.num_kv_heads,
                     **keywords,
                 )
