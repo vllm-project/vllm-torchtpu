@@ -2,14 +2,16 @@
 
 ## Topology & Base Container
 - **Hardware**: `1x tpu7x 2x2x4` (`4` hosts × `4` chips = `16` chips / `32` TensorCores, `TP=32, EP=32`).
-- **Base image**: `gcr.io/cloud-tpu-shared-capacity/jianpingsyu/vllm-torchtpu:k3engine-v0.29.0` with `PYTHONPATH` pointing to `src/` from this branch (`rishabhmanoj/k3-track1-v5d5`).
+- **Base image**: `gcr.io/cloud-tpu-shared-capacity/jianpingsyu/vllm-torchtpu:k3engine-v0.29.0` with this branch (`rishabhmanoj/k3-track1-v5d5`) installed via `pip install --no-deps --no-build-isolation -e .` (or preserving `/workspace/vllm-torchtpu/src/*.egg-info` alongside `PYTHONPATH=/workspace/vllm-torchtpu/src`; `cd /` first if replacing `/workspace/vllm-torchtpu`).
 
 ## Environment Variables (All 4 Hosts)
 
 ```bash
 export VLLM_TARGET_DEVICE=tpu
+export VLLM_HOST_IP="${POD_IP}"
 export VLLM_SERVER_DEV_MODE=1
 export VLLM_NO_USAGE_STATS=1
+export GOOGLE_CLOUD_PROJECT="${GOOGLE_CLOUD_PROJECT:-cloud-tpu-shared-capacity}"
 export TPU_SKIP_MDS_QUERY=1
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export TCMALLOC_AGGRESSIVE_DECOMMIT=true
