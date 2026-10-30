@@ -4572,19 +4572,21 @@ def mla_flash_prefill_packed(query, key, value, length, segments, *, count, tile
         raise ValueError(f"segments must be [{fields} * count]")
     length = jnp.asarray(length, jnp.int32).reshape((1,))
     q_tile, k_tile = _tiles(tokens, tokens, tile)
-    # Prefix keys stream in their own tiles (the arena capacity, not the
-    # window, bounds them); a window under 1024 rows is one query tile.
-    if _config().mla_flash_prefix_tiles and tokens < _config().mla_flash_qtile and tokens % 256 == 0:
+    # A window under mla_flash_qtile rows is one query tile when the fragment
+    # loop covers it (at most FRAGMENT rows, or a multiple of it).
+    if (_config().mla_flash_prefix_tiles and tokens < _config().mla_flash_qtile and tokens % 256 == 0
+            and (tokens <= FRAGMENT or tokens % FRAGMENT == 0)):
         q_tile = tokens
-    p_tile = k_tile
-    if arena is not None and _config().mla_flash_prefix_tiles:
-        p_tile = _config().mla_flash_ktile
-        if arena[0].shape[2] % p_tile:
-            p_tile = k_tile
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     scalars = (length, segments.astype(jnp.int32))
     operands = (query, key[None], jnp.swapaxes(value, 1, 2)[None])  # the window as a one-layer arena
     in_specs = (pl.BlockSpec((1, q_tile, 256), lambda h, i, *_: (h, i, 0)), hbm, hbm)
+    # Prefix keys stream in mla_flash_ktile tiles (the arena capacity, not
+    # the window, bounds them) when the capacity divides into them.
+    p_tile = k_tile
+    if (arena is not None and _config().mla_flash_prefix_tiles and arena[0].ndim == 4
+            and arena[0].shape[2] % _config().mla_flash_ktile == 0):
+        p_tile = _config().mla_flash_ktile
     if arena is not None:
         arena_keys, arena_values = arena
         if (arena_keys.ndim != 4 or arena_keys.shape[1:] != (heads, arena_keys.shape[2], 256)

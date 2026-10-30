@@ -64,7 +64,7 @@ class KernelConfig:
     mla_flash_qtile: int = 1024
     mla_flash_ktile: int = 2048
     # Prefix keys in mla_flash_ktile tiles and a whole-window query tile under
-    # mla_flash_qtile rows (False: the window's key tile, as before).
+    # mla_flash_qtile rows. False: prefix keys use the window's key tile.
     mla_flash_prefix_tiles: bool = True
     # Cached-prefix attention in FP8 (E4M3FN keys/values from the expansion, FP8
     # queries, probabilities x16 in E4M3FN, FP32 statistics); the window's own
