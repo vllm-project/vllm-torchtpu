@@ -86,6 +86,17 @@ vLLM's unified KV block pool, and the export runs with prefix caching off. The
 recurrent state bytes come off the KV budget before it is divided among KV
 blocks.
 
+### MTP drafting
+
+With `--speculative-config '{"method": "mtp", "num_speculative_tokens": K}'`
+the export adds `mtp_draft_bucket{B}` for every forward bucket. The model lists
+its MTP layer's weights among `abstract_params()` under their checkpoint names
+(`mtp.`), and implements `mtp_abstract_states()`, the MTP layer's paged KV, and
+`mtp_draft()`. The export finds the target weights the draft shares, such as the
+embedding and the LM head, by lowering it once, as for the forward. They bind
+the target's slots, so the artifact stores them once. The MTP KV states are
+numbered after the target's.
+
 ### Example: match a `vllm serve` run
 
 A `vllm serve` run of Qwen3-Coder-480B FP8 on a 2x2x1 v7x slice logged:
