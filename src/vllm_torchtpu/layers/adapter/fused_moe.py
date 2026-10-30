@@ -218,7 +218,10 @@ def _build_fused_moe_custom_op(
         hidden_scale = args[-1]
         if hidden_scale is None:
             return torch.empty_like(hidden_states)
-        return hidden_states.new_empty(hidden_states.shape, dtype=hidden_scale.dtype)
+        # Quantized rows may come as [T, H // 128, 128] row tiles.
+        return hidden_states.new_empty(
+            hidden_states.flatten(1).shape, dtype=hidden_scale.dtype
+        )
 
     fused_moe_kernel_impl.register_fake(_fake_fused_moe)
 

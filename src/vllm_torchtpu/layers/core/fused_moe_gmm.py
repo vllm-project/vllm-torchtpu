@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import math
 
 import jax
 from jax import numpy as jnp
@@ -47,7 +48,10 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
     token_block_alignment,
 )
-from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import (
+    ragged_gather_rows,
+    ragged_gather_v2,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -551,7 +555,12 @@ def prepare_routed_gmm_inputs(
                 token_indices_sorted, x_scale = jax.lax.optimization_barrier(
                     (token_indices_sorted, x_scale)
                 )
-            x = ragged_gather_v2(
+            gather = (
+                ragged_gather_rows
+                if hidden_states_local.ndim == 3
+                else ragged_gather_v2
+            )
+            x = gather(
                 hidden_states_local,
                 token_indices_sorted,
                 jnp.array([0], dtype=jnp.int32),
@@ -853,8 +862,21 @@ def fused_moe_func(
     if w2_scale is not None and w2_scale.ndim == 3:
         w2_scale = jnp.expand_dims(w2_scale, 2)
 
-    num_tokens, hidden_size = hidden_states.shape
+    num_tokens = hidden_states.shape[0]
+    hidden_size = math.prod(hidden_states.shape[1:])
     act_dtype = hidden_states.dtype if hidden_scale is None else hidden_scale.dtype
+    if hidden_states.ndim == 3:
+        # Quantized rows as [T, H // 128, 128] row tiles (`quantize_moe_input`).
+        # Only the SparseCore ragged permute reads them as they are.
+        if hidden_scale is None:
+            raise ValueError("Row tiles carry quantized rows; pass their scales.")
+        if not uses_ragged_permute(
+            num_tokens * topk,
+            use_ep=use_ep,
+            use_sparse_core=use_sparse_core,
+            onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+        ):
+            hidden_states = hidden_states.reshape(num_tokens, hidden_size)
 
     # NVFP4 weights arrive as native float4_e2m1fn in gmm_v2's K-major layout
     # (unpacked once at load; see fused_moe.load_kmajor_fp4). gmm_v2 picks the
