@@ -2543,8 +2543,8 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         )
         # Suffix by global DP rank to ensure distinct RaidenId and registry
         # entries across multi-node data parallel replicas.
-        if dp_rank:
-            self.raiden_job_name = f"{self.raiden_job_name}-dp{dp_rank}"
+        if self.dp_rank:
+            self.raiden_job_name = f"{self.raiden_job_name}-dp{self.dp_rank}"
 
         self._manager: RaidenOffloadingManager | None = None
         self._worker: RaidenStoreOffloadingWorker | None = None

@@ -4117,18 +4117,19 @@ class TestDenseDpIndex(unittest.TestCase):
     def setUp(self):
         _isolate_storage_env(self)
 
-    def test_dp_index_reaches_raiden_id_without_job_name_suffix(self):
+    def test_dp_index_reaches_raiden_id_and_job_name_suffix(self):
         from vllm_torchtpu.offload import raiden_store as rs
 
         spec = _build_spec({}, dp_rank=0, dp_rank_local=0, dp_index=2)
         self.assertEqual(spec.dp_rank, 2)
-        # Job-name suffix and port offset still follow data_parallel_rank.
-        self.assertEqual(spec.raiden_job_name, "vllm-offload-engine")
+        # Job-name suffix and RaidenId follow data_parallel_index; port offset
+        # still follows data_parallel_rank_local.
+        self.assertEqual(spec.raiden_job_name, "vllm-offload-engine-dp2")
         self.assertEqual(spec.raiden_controller_port, rs._DEFAULT_CONTROLLER_PORT)
 
         manager_kwargs, _ = _get_manager_and_worker(spec)
         self.assertEqual(manager_kwargs["dp_rank"], 2)
-        self.assertEqual(manager_kwargs["raiden_job_name"], "vllm-offload-engine")
+        self.assertEqual(manager_kwargs["raiden_job_name"], "vllm-offload-engine-dp2")
 
         store_kwargs: list[dict] = []
 
@@ -4151,8 +4152,7 @@ class TestDenseDpIndex(unittest.TestCase):
         (kwargs,) = store_kwargs
         job_name, _, _, data_replica_idx = kwargs["raiden_id"]
         self.assertEqual(data_replica_idx, 2)
-        self.assertEqual(job_name, "vllm-offload-engine")
-        self.assertNotIn("-dp2", job_name)
+        self.assertEqual(job_name, "vllm-offload-engine-dp2")
 
 
 if __name__ == "__main__":
