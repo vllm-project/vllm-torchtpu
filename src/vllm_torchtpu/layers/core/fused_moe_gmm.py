@@ -35,10 +35,12 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import (
     ragged_gather_reduce_v2,
 )
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
-    ragged_gather_reduce as ragged_gather_reduce_v3,
+    TOKEN_BLOCK,
+    ragged_gather_reduce_token_blocks,
+    token_block_alignment,
 )
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
-    token_block_alignment,
+    ragged_gather_reduce as ragged_gather_reduce_v3,
 )
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
 from vllm_torchtpu.logger import init_logger
@@ -251,22 +253,31 @@ def _counting_sort_positions(
     onehot = jax.nn.one_hot(
         sort_keys.reshape(-1, block), num_buckets, dtype=jnp.bfloat16
     )
+    pos, counts = _block_rank_positions(
+        onehot, jnp.tril(jnp.ones((block, block), jnp.bfloat16), -1)
+    )
+    return pos.reshape(-1)[:m], counts
+
+
+def _block_rank_positions(
+    onehot: jax.Array, precedes: jax.Array
+) -> tuple[jax.Array, jax.Array]:
+    """Sorted positions of one-hot keyed blocks of rows, and the bucket counts.
+
+    ``precedes[i, j]`` is 1 where row ``j`` of a block sorts before row ``i``
+    among equal keys; blocks precede each other in order.
+    """
+    block = precedes.shape[0]
     # The histogram rides along as one more row of the contraction the rank
     # matmul already performs. Exact: 0/1 summands, at most `block` of them.
-    lower = jnp.concatenate(
-        [
-            jnp.ones((1, block), jnp.bfloat16),
-            jnp.tril(jnp.ones((block, block), jnp.bfloat16), -1),
-        ],
-        axis=0,
-    )
+    lower = jnp.concatenate([jnp.ones((1, block), jnp.bfloat16), precedes], axis=0)
     both = jnp.einsum("ij,bje->bie", lower, onehot, preferred_element_type=jnp.float32)
     hist = both[:, 0, :]
     rank = both[:, 1:, :]
     counts = hist.sum(axis=0)
     base = (jnp.cumsum(hist, axis=0) - hist) + (jnp.cumsum(counts) - counts)
     pos = ((base[:, None, :] + rank) * onehot).sum(axis=2)
-    return pos.reshape(-1)[:m].astype(jnp.int32), counts.astype(jnp.int32)
+    return pos.astype(jnp.int32), counts.astype(jnp.int32)
 
 
 def _single_sort_permutation(
@@ -283,6 +294,111 @@ def _single_sort_permutation(
     sorted_indices = jnp.bitwise_and(packed, (1 << flat_bits) - 1)
     revert = jnp.zeros_like(pos).at[sorted_indices].set(pos, unique_indices=True)
     return sorted_indices, revert, sorted_indices // topk
+
+
+def _to_token_blocks(a: jax.Array, fill) -> jax.Array:
+    """``[tokens, topk]`` -> ``[token blocks, topk * TOKEN_BLOCK]``, slot-major.
+
+    Entry ``s * TOKEN_BLOCK + j`` of row ``b`` is slot ``s`` of token
+    ``b * TOKEN_BLOCK + j``; tokens past the end hold ``fill``. The router
+    emits ``[topk, tokens]``, which this reads lane-dense, where flattening
+    ``[tokens, topk]`` relayouts arrays ``topk`` lanes wide.
+    """
+    num_tokens, topk = a.shape
+    a = jnp.pad(a.T, ((0, 0), (0, -num_tokens % TOKEN_BLOCK)), constant_values=fill)
+    a = a.reshape(topk, -1, TOKEN_BLOCK).transpose(1, 0, 2)
+    return a.reshape(-1, topk * TOKEN_BLOCK)
+
+
+def _use_token_blocks(
+    num_tokens: int,
+    topk: int,
+    local_num_experts: int,
+    *,
+    use_ep: bool,
+    use_sparse_core: bool,
+    onehot_moe_permute_threshold: int,
+) -> bool:
+    """Whether routing runs in the token-block layout: the EP SparseCore ragged
+    path into the v3 combine, whose per-block metadata is that layout."""
+    num_buckets = local_num_experts + 1
+    padded_tokens = -(-num_tokens // TOKEN_BLOCK) * TOKEN_BLOCK
+    token_bits = max(1, (padded_tokens - 1).bit_length())
+    return (
+        ragged_gather_reduce is ragged_gather_reduce_v3
+        and use_ep
+        and use_sparse_core
+        and num_tokens * topk > onehot_moe_permute_threshold
+        and num_buckets <= topk * TOKEN_BLOCK
+        and num_buckets.bit_length() + token_bits < 31
+    )
+
+
+def prepare_token_block_gmm_inputs(
+    hidden_states_local: jax.Array,
+    topk_indices_local: jax.Array,
+    topk_weights_local: jax.Array,
+    *,
+    local_num_experts: int,
+    topk: int,
+    skip_padded_tokens: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``prepare_routed_gmm_inputs`` on the EP SparseCore ragged path, with the
+    per-route outputs (revert indices, weights, valid mask) in the
+    ``_to_token_blocks`` layout. ``x``, ``group_sizes``, the sorted tokens and
+    every route's revert index are the flat path's values.
+    """
+    num_tokens = hidden_states_local.shape[0]
+    indices = _to_token_blocks(topk_indices_local, -1)
+    weights = _to_token_blocks(topk_weights_local, 0)
+    valid_mask = indices >= 0
+    if skip_padded_tokens:
+        valid_mask &= weights != 0
+    sort_keys = jnp.where(valid_mask, indices, local_num_experts)
+
+    # A route precedes another in its bucket when the flat [tokens, topk]
+    # order puts it first: earlier token, or the same token and earlier slot.
+    block = sort_keys.shape[1]
+    entry = jax.lax.broadcasted_iota(jnp.int32, (block, block), 0)
+    other = jax.lax.broadcasted_iota(jnp.int32, (block, block), 1)
+
+    def flat_order(e):
+        return (e % TOKEN_BLOCK) * topk + e // TOKEN_BLOCK
+
+    argsort_revert_indices, counts = _block_rank_positions(
+        jax.nn.one_hot(sort_keys, local_num_experts + 1, dtype=jnp.bfloat16),
+        (flat_order(other) < flat_order(entry)).astype(jnp.bfloat16),
+    )
+    group_sizes_local = counts[:local_num_experts]
+
+    # Padded routes carry the sentinel key and tokens past the end, so they
+    # sort last and the slice leaves the flat path's sorted tokens.
+    row = jax.lax.broadcasted_iota(jnp.int32, sort_keys.shape, 0)
+    col = jax.lax.broadcasted_iota(jnp.int32, sort_keys.shape, 1)
+    tokens = row * TOKEN_BLOCK + col % TOKEN_BLOCK
+    token_bits = max(1, (sort_keys.size // topk - 1).bit_length())
+    packed = jax.lax.sort(
+        (jnp.left_shift(sort_keys, token_bits) | tokens).reshape(-1), is_stable=False
+    )
+    token_indices_sorted = jnp.bitwise_and(
+        packed[: num_tokens * topk], (1 << token_bits) - 1
+    )
+
+    valid_count = group_sizes_local.sum(dtype=jnp.int32)
+    x = ragged_gather_v2(
+        hidden_states_local,
+        token_indices_sorted,
+        jnp.array([0], dtype=jnp.int32),
+        valid_count[None],
+    )
+    return (
+        x,
+        group_sizes_local,
+        argsort_revert_indices,
+        weights,
+        valid_mask,
+        token_indices_sorted,
+    )
 
 
 def prepare_routed_gmm_inputs(
@@ -429,6 +545,7 @@ def moe_gmm(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
+    token_blocks: bool = False,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
@@ -452,9 +569,6 @@ def moe_gmm(
     packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
     gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
 
-    topk_weights = topk_weights_flat.reshape((num_tokens, topk))
-    valid_mask = valid_mask_flat.reshape((num_tokens, topk))
-
     gmm2_res = gmm_wrapper(
         gmm1_res,
         w2,
@@ -466,6 +580,20 @@ def moe_gmm(
         preferred_element_type=x.dtype,
         rhs_quant_dtype=rhs_quant_dtype,
     )
+    if token_blocks:
+        # Route metadata from `prepare_token_block_gmm_inputs`.
+        return ragged_gather_reduce_token_blocks(
+            gmm2_res,
+            argsort_revert_indices,
+            topk_weights_flat,
+            valid_mask_flat,
+            topk=topk,
+            num_tokens=num_tokens,
+        ).astype(x.dtype)
+
+    topk_weights = topk_weights_flat.reshape((num_tokens, topk))
+    valid_mask = valid_mask_flat.reshape((num_tokens, topk))
+
     # The destination-major kernel packs source indices into 20 bits and
     # processes 16-lane SparseCore tiles.
     use_local_ragged_combine = (
@@ -685,6 +813,35 @@ def fused_moe_func(
             hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
         )
 
+    token_blocks = _use_token_blocks(
+        num_tokens,
+        topk,
+        w1.shape[0],
+        use_ep=use_ep,
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+    )
+    if token_blocks:
+        routed = prepare_token_block_gmm_inputs(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            local_num_experts=w1.shape[0],
+            topk=topk,
+            skip_padded_tokens=skip_padded_tokens,
+        )
+    else:
+        routed = prepare_routed_gmm_inputs(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            local_num_experts=w1.shape[0],
+            topk=topk,
+            use_ep=use_ep,
+            use_sparse_core=use_sparse_core,
+            onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+            skip_padded_tokens=skip_padded_tokens,
+        )
     (
         x,
         group_sizes,
@@ -692,17 +849,7 @@ def fused_moe_func(
         topk_weights_flat,
         valid_mask,
         token_indices_sorted,
-    ) = prepare_routed_gmm_inputs(
-        hidden_states,
-        topk_ids,
-        topk_weights,
-        local_num_experts=w1.shape[0],
-        topk=topk,
-        use_ep=use_ep,
-        use_sparse_core=use_sparse_core,
-        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
-        skip_padded_tokens=skip_padded_tokens,
-    )
+    ) = routed
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(
         x,
@@ -724,5 +871,6 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
+        token_blocks=token_blocks,
     )
     return x[:num_tokens, :hidden_size]

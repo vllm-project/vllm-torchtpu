@@ -33,6 +33,8 @@ from vllm_torchtpu.kernels.sparse_core import core_map_helper
 _TOKEN_SUBCHUNK = 16
 _NUM_TOKEN_SUBCHUNKS = 4
 _TOKEN_BLOCK = _TOKEN_SUBCHUNK * _NUM_TOKEN_SUBCHUNKS
+# Destination tokens per row of `ragged_gather_reduce_token_blocks` operands.
+TOKEN_BLOCK = _TOKEN_BLOCK
 _ROUTE_INDEX_BITS = 20
 _ROUTE_INDEX_MASK = (1 << _ROUTE_INDEX_BITS) - 1
 
@@ -328,6 +330,19 @@ def _main_kernel(
     )
 
 
+def _uses_main_kernel(x: jax.Array) -> bool:
+    """Whether the SparseCore kernel serves ``x``; otherwise the fallback does."""
+    tpu_info = pltpu.get_tpu_info()
+    if (
+        tpu_info.sparse_core is None
+        or x.dtype != jnp.bfloat16
+        or x.shape[-1] % tpu_info.num_lanes != 0
+    ):
+        return False
+    dtype_bytes = jax.dtypes.itemsize_bits(x.dtype) // 8
+    return jnp.size(x) * dtype_bytes * 2 >= tpu_info.vmem_capacity_bytes * 0.6
+
+
 @functools.partial(jax.jit, static_argnames=("reduce_group_size",))
 def ragged_gather_reduce(
     x: jax.Array,
@@ -337,21 +352,7 @@ def ragged_gather_reduce(
     reduce_group_size: int,
 ) -> jax.Array:
     """Destination-major prototype for MoE output combine."""
-    sc_info = pltpu.get_tpu_info().sparse_core
-    if (
-        sc_info is None
-        or x.dtype != jnp.bfloat16
-        or x.shape[-1] % pltpu.get_tpu_info().num_lanes != 0
-    ):
-        return _fallback_implementation(
-            x,
-            indices,
-            topk_weights,
-            valid_rows_mask,
-            reduce_group_size,
-        )
-    dtype_bytes = jax.dtypes.itemsize_bits(x.dtype) // 8
-    if jnp.size(x) * dtype_bytes * 2 < pltpu.get_tpu_info().vmem_capacity_bytes * 0.6:
+    if not _uses_main_kernel(x):
         return _fallback_implementation(
             x,
             indices,
@@ -363,19 +364,8 @@ def ragged_gather_reduce(
     input_size = indices.size
     if input_size % reduce_group_size != 0:
         raise ValueError(f"{input_size=} must be divisible by {reduce_group_size=}")
-    # SparseCore row-packing views BF16 as pairs of rows.
-    if x.shape[0] % 2:
-        x = jnp.pad(x, ((0, 1), (0, 0)))
     num_tokens = input_size // reduce_group_size
-    hidden_size = x.shape[-1]
-    if x.shape[0] > 1 << _ROUTE_INDEX_BITS:
-        raise ValueError(
-            f"destination-major prototype supports at most "
-            f"{1 << _ROUTE_INDEX_BITS} source rows, got {x.shape[0]}"
-        )
-    num_column_partitions, num_row_partitions = partition_counts(
-        hidden_size, pltpu.get_tpu_info()
-    )
+    num_row_partitions = partition_counts(x.shape[-1], pltpu.get_tpu_info())[1]
 
     token_alignment = num_row_partitions * _TOKEN_BLOCK
     padded_num_tokens = _align_to(num_tokens, token_alignment)
@@ -391,20 +381,112 @@ def ragged_gather_reduce(
 
     num_blocks = padded_num_tokens // _TOKEN_BLOCK
     metadata_block_size = _TOKEN_BLOCK * reduce_group_size
-    indices_blocks = indices_2d.reshape(num_blocks, metadata_block_size)
-    valid_blocks = valid_2d.reshape(num_blocks, metadata_block_size)
     destination_template = jnp.repeat(
         jnp.arange(_TOKEN_BLOCK, dtype=jnp.int32), reduce_group_size
     )
-    destination_blocks = jnp.broadcast_to(destination_template, indices_blocks.shape)
+    return _combine_token_blocks(
+        x,
+        indices_2d.reshape(num_blocks, metadata_block_size),
+        weights_2d.reshape(num_blocks, metadata_block_size),
+        valid_2d.reshape(num_blocks, metadata_block_size),
+        destination_template,
+        num_tokens=num_tokens,
+        topk=reduce_group_size,
+    )
 
-    # A stable boolean partition keeps routes for each destination adjacent
+
+@functools.partial(jax.jit, static_argnames=("topk", "num_tokens"))
+def ragged_gather_reduce_token_blocks(
+    x: jax.Array,
+    indices: jax.Array,
+    topk_weights: jax.Array,
+    valid_rows_mask: jax.Array,
+    *,
+    topk: int,
+    num_tokens: int,
+) -> jax.Array:
+    """``ragged_gather_reduce`` on routes in the token-block layout.
+
+    Row ``b`` of each ``[blocks, topk * TOKEN_BLOCK]`` operand holds the routes
+    of tokens ``[b * TOKEN_BLOCK, (b + 1) * TOKEN_BLOCK)``, slot-major: entry
+    ``s * TOKEN_BLOCK + j`` is slot ``s`` of token ``j`` of the block. That is
+    the kernel's own per-block metadata order up to a permutation inside the
+    row, so it is consumed as is. A token's routes still accumulate in slot
+    order, as in ``ragged_gather_reduce``.
+    """
+    num_blocks, metadata_block_size = indices.shape
+    if metadata_block_size != topk * _TOKEN_BLOCK:
+        raise ValueError(f"{indices.shape=} is not [blocks, {topk} * {_TOKEN_BLOCK}]")
+    if not _uses_main_kernel(x):
+
+        def token_major(a):
+            a = a.reshape(num_blocks, topk, _TOKEN_BLOCK).transpose(0, 2, 1)
+            return a.reshape(-1)[: num_tokens * topk]
+
+        return _fallback_implementation(
+            x,
+            token_major(indices),
+            token_major(topk_weights),
+            token_major(valid_rows_mask),
+            topk,
+        )
+
+    num_row_partitions = partition_counts(x.shape[-1], pltpu.get_tpu_info())[1]
+    block_padding = _align_to(num_blocks, num_row_partitions) - num_blocks
+    if block_padding:
+        indices, topk_weights, valid_rows_mask = (
+            jnp.pad(a, ((0, block_padding), (0, 0)))
+            for a in (indices, topk_weights, valid_rows_mask)
+        )
+    destination_template = jnp.tile(jnp.arange(_TOKEN_BLOCK, dtype=jnp.int32), topk)
+    return _combine_token_blocks(
+        x,
+        indices,
+        topk_weights,
+        valid_rows_mask,
+        destination_template,
+        num_tokens=num_tokens,
+        topk=topk,
+    )
+
+
+def _combine_token_blocks(
+    x: jax.Array,
+    indices_blocks: jax.Array,
+    weights_blocks: jax.Array,
+    valid_blocks: jax.Array,
+    destination_template: jax.Array,
+    *,
+    num_tokens: int,
+    topk: int,
+) -> jax.Array:
+    """Run the kernel on routes grouped by destination block.
+
+    ``destination_template`` is each row entry's token within its block. The
+    number of blocks is a multiple of the kernel's row partitions.
+    """
+    sc_info = pltpu.get_tpu_info().sparse_core
+    # SparseCore row-packing views BF16 as pairs of rows.
+    if x.shape[0] % 2:
+        x = jnp.pad(x, ((0, 1), (0, 0)))
+    hidden_size = x.shape[-1]
+    if x.shape[0] > 1 << _ROUTE_INDEX_BITS:
+        raise ValueError(
+            f"destination-major prototype supports at most "
+            f"{1 << _ROUTE_INDEX_BITS} source rows, got {x.shape[0]}"
+        )
+    num_column_partitions, num_row_partitions = partition_counts(
+        hidden_size, pltpu.get_tpu_info()
+    )
+    num_blocks = indices_blocks.shape[0]
+    padded_num_tokens = num_blocks * _TOKEN_BLOCK
+    destination_blocks = jnp.broadcast_to(destination_template, indices_blocks.shape)
+    # A stable boolean partition keeps each destination's routes in row order
     # while placing the exact valid prefix first in every destination block.
     route_order = jnp.argsort(~valid_blocks, axis=1, stable=True)
     compact_valid = jnp.take_along_axis(valid_blocks, route_order, axis=1)
     route_indices = jnp.take_along_axis(indices_blocks, route_order, axis=1)
     route_destinations = jnp.take_along_axis(destination_blocks, route_order, axis=1)
-    weights_blocks = weights_2d.reshape(num_blocks, metadata_block_size)
     route_weights = jnp.take_along_axis(weights_blocks, route_order, axis=1)
     route_indices = jnp.where(compact_valid, route_indices, 0).astype(jnp.int32)
     route_destinations = jnp.where(compact_valid, route_destinations, 0).astype(
@@ -453,7 +535,7 @@ def ragged_gather_reduce(
             num_row_partitions=num_row_partitions,
             num_column_partitions=num_column_partitions,
             blocks_per_row_partition=blocks_per_row_partition,
-            topk=reduce_group_size,
+            topk=topk,
         ),
         out_type=jax.ShapeDtypeStruct((padded_num_tokens, hidden_size), jnp.bfloat16),
         compiler_params=pltpu.CompilerParams(
