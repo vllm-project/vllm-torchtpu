@@ -45,6 +45,9 @@ class KernelConfig:
     b16_compact_experts: bool = True
     shared_expert_finishers: bool = True
     compact_overflow: bool = True
+    # Grouped MXFP4 routes (B8-B128): plan the expert visit order and row lists
+    # once per layer instead of rescanning routes every expert pair.
+    expert_plan: bool = True
     b4_attention_gather: bool = True
     fused_cache_commit: bool = True
     decode_no_hlo_calls: bool = True  # no deduplicated HLO calls at B8..B128, DP B2/B4

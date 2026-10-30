@@ -452,6 +452,7 @@ def _quantized_expert_dot(
     *,
     block_major=False,
     dot_tile=None,
+    active_rows=None,
 ):
     """Multiply by one resident MXFP4 matrix or reblocked FP8 matrix.
 
@@ -497,6 +498,9 @@ def _quantized_expert_dot(
         raise ValueError("Expert weights must use packed MXFP4 or reblocked FP8")
 
     split_small_contraction = contraction_size == 768 and block_major
+    if active_rows is not None and not split_small_contraction:
+        raise ValueError("active_rows applies to the block-major 768 contraction")
+    rows_out = slice(None) if active_rows is None else slice(0, active_rows)
     block_size = 256 if split_small_contraction else min(MXFP4_BLOCK, contraction_size)
 
     static_tiles = MXFP4_STATIC_TILE > 0 and not split_small_contraction
@@ -535,6 +539,9 @@ def _quantized_expert_dot(
             activation = source[
                 :, pl.ds(pl.multiple_of(start, activation_alignment), size)
             ].astype(jnp.bfloat16)
+        if active_rows is not None:
+            # Rows are independent: project only the live leading rows.
+            activation = activation[:active_rows]
         if dot_tile and not split_small_contraction and size > dot_tile:
             # Split only the masked MXU products. Keep all scale-block partials
             # in block order and perform the same FP32 reduction as
@@ -581,7 +588,7 @@ def _quantized_expert_dot(
             total = scaled[0:1]
             for block in range(1, size // 32):
                 total = total + scaled[block : block + 1]
-            accumulator[...] += total
+            accumulator[rows_out] += total
         elif split_small_contraction:
             left = jnp.where(
                 scale_block_mask[:, None, :],
@@ -594,7 +601,7 @@ def _quantized_expert_dot(
                 (((2,), (0,)), ((), ())),
                 preferred_element_type=jnp.float32,
             )
-            accumulator[...] += jnp.sum(
+            accumulator[rows_out] += jnp.sum(
                 partial * scale[:, None, :], axis=0
             )
         else:
@@ -638,6 +645,7 @@ def _paired_expert_gate_up(
     *,
     second_source=None,
     active_capacity=None,
+    dot_split=None,
 ):
     """Run two resident expert gate/up projections.
 
@@ -758,12 +766,28 @@ def _paired_expert_gate_up(
             active = rows if active_capacity is None else active_capacity
             columns = values.shape[1] // 2
             for half in range(2):
-                partial = jax.lax.dot_general(
-                    left[half * rows:half * rows + active],
-                    values[:, half * columns:(half + 1) * columns],
-                    (((2,), (0,)), ((), ())),
-                    preferred_element_type=jnp.float32,
-                )
+                weights = values[:, half * columns:(half + 1) * columns]
+                if dot_split and dot_split < size:
+                    # Split only the masked MXU products (each scale block
+                    # lies in one split): fewer masked rows per weight tile.
+                    # The partials and their reduction are unchanged.
+                    pieces = []
+                    for offset in range(0, size, dot_split):
+                        blocks = slice(offset // 32, (offset + dot_split) // 32)
+                        pieces.append(jax.lax.dot_general(
+                            left[half * rows:half * rows + active, blocks, offset:offset + dot_split],
+                            weights[offset:offset + dot_split],
+                            (((2,), (0,)), ((), ())),
+                            preferred_element_type=jnp.float32,
+                        ))
+                    partial = jnp.concatenate(pieces, axis=1)
+                else:
+                    partial = jax.lax.dot_general(
+                        left[half * rows:half * rows + active],
+                        weights,
+                        (((2,), (0,)), ((), ())),
+                        preferred_element_type=jnp.float32,
+                    )
                 result = jnp.sum(
                     partial * scale[None, :, half * columns:(half + 1) * columns], axis=1
                 )
@@ -785,6 +809,33 @@ def _paired_expert_gate_up(
     tile_size = MXFP4_PAIR_TILE
     for start in range(0, contraction_size, tile_size):
         tile(start, min(tile_size, contraction_size - start))
+
+
+def _single_expert_gate_up(source, packed, scales, accumulator, contraction_size, active, tile_size):
+    """One expert's MXFP4 gate/up of ``source`` rows [:active] into
+    ``accumulator`` rows [:active], columns [:width].
+
+    The per-row products, scale reduction and tile accumulation order are those
+    of _paired_expert_gate_up / _paired_order_expert_gate_up (rows are
+    independent), so the bucket size does not change any live row's result.
+    """
+    width = packed.shape[-1]
+    total = None
+    for start in range(0, contraction_size, tile_size):
+        size = min(tile_size, contraction_size - start)
+        values = tpu.bitcast(packed[pl.ds(start // 8, size // 8), :],
+                             jnp.float4_e2m1fn).astype(jnp.float8_e4m3fn)
+        exponents = scales[pl.ds(start // 32, size // 32), :].astype(jnp.uint32)
+        scale = jax.lax.bitcast_convert_type(exponents << 23, jnp.float32)
+        activation = source[:, pl.ds(start, size)].astype(jnp.bfloat16)[:active]
+        mask = jnp.arange(size // 32)[:, None] == jnp.arange(size)[None, :] // 32
+        left = jnp.where(mask[None], activation[:, None, :], jnp.bfloat16(0))
+        partial = jax.lax.dot_general(left, values, (((2,), (0,)), ((), ())),
+                                      preferred_element_type=jnp.float32)
+        result = jnp.sum(partial * scale[None], axis=1)
+        # 0 + first tile is exact: the same sum as accumulating from zero.
+        total = result if total is None else total + result
+    accumulator[0:active, 0:width] = total
 
 
 def _paired_order_expert_gate_up(source, packed, scales, accumulator, contraction_size, tile_size):
@@ -1461,7 +1512,24 @@ def _run_routed_expert_stream(
             )
             finish_shared_expert(index, slot, 0)
 
-    if group_pending_routes:
+    # KernelConfig.expert_plan: grouped MXFP4 routes build the whole visit
+    # order and per-expert row lists once (vector work, one VMEM->SMEM copy);
+    # the loop then reads scalars instead of rescanning routes, and stages /
+    # scatters rows by index instead of one-hot products. Same products in the
+    # same order as the selector loop, so outputs are bit-identical.
+    planned = (
+        EXPERT_PLAN and group_pending_routes and expert_gate_up_vmem.dtype == jnp.uint32
+        and (
+            (batch_size == 8 and compact_capacity == 1 and not compact_only)
+            or (batch_size in (16, 32, 64, 96, 128) and compact_capacity == 8
+                and compact_only and compact_overflow and share_compact_finish)
+        )
+    )
+    # Planned row-list slots per expert (more rows take the selector passes).
+    plan_slots = PLAN_SLOTS if batch_size >= 64 and compact_capacity == 8 else 8
+    if planned:
+        pair_count = None
+    elif group_pending_routes:
         # Each iteration serves every pending route of its two experts, so the
         # loop needs one iteration per two distinct experts, not per two
         # routes (local expert ids are < 128).
@@ -1479,8 +1547,495 @@ def _run_routed_expert_stream(
         # visited more than once: bound the loop by the route count.
         pair_count = (jnp.sum(local_route_counts) + 1) // 2
 
+    def run_planned_routes(table_vmem, table_smem, weight_vmem, mask_vmem, plan_semaphore, plan_tile_vmem):
+        """The grouped-route loop over a precomputed plan (see ``planned``).
+
+        ``table_smem`` rows 0..7: [c, e] the c-th routed row (ascending) of
+        local expert e; row 8: [k] the k-th visited expert (ascending ids);
+        row 9: [e] expert e's row count; row 10: lane 0 the distinct experts.
+        ``weight_vmem`` [c, e]: that row's route weight; ``mask_vmem`` [r, e]:
+        row r routes to expert e (FP32 0/1).
+        """
+        lanes = jax.lax.broadcasted_iota(jnp.int32, (batch_size, 128), 1)
+        valid = valid_routes
+        # Route weights exactly as the selector loop: probability / total.
+        weights = selected_probabilities / probability_totals[:, None]
+        mask = jnp.zeros((batch_size, 128), jnp.float32)
+        row_weights = jnp.zeros((batch_size, 128), jnp.float32)
+        for route_slot in range(selected_expert_count):
+            hit = (selected_experts[:, route_slot:route_slot + 1] == lanes) & valid[:, route_slot:route_slot + 1]
+            mask = jnp.where(hit, jnp.float32(1), mask)
+            row_weights = jnp.where(hit, weights[:, route_slot:route_slot + 1], row_weights)
+        mask_vmem[...] = mask
+        counts = jnp.sum(mask, axis=0, keepdims=True)  # [1, 128], exact
+        used = (counts > 0).astype(jnp.float32)
+        rows = jax.lax.broadcasted_iota(jnp.int32, (batch_size, batch_size), 0)
+        columns = jax.lax.broadcasted_iota(jnp.int32, (batch_size, batch_size), 1)
+        # Exclusive prefix count of each expert's rows (exact small integers).
+        before = _dot((columns < rows).astype(jnp.bfloat16), mask.astype(jnp.bfloat16))
+        row_ids = jax.lax.broadcasted_iota(jnp.int32, (batch_size, 128), 0).astype(jnp.float32)
+        for position in range(plan_slots):
+            at = (before == position) & (mask > 0)
+            table_vmem[position:position + 1, :] = jnp.sum(
+                jnp.where(at, row_ids, 0.0), axis=0, keepdims=True
+            ).astype(jnp.int32)
+            weight_vmem[position:position + 1, :] = jnp.sum(
+                jnp.where(at, row_weights, 0.0), axis=0, keepdims=True
+            )
+        expert_rows = jax.lax.broadcasted_iota(jnp.int32, (128, 128), 0)
+        expert_columns = jax.lax.broadcasted_iota(jnp.int32, (128, 128), 1)
+        # rank[e]: used experts below e; order[k]: the expert of rank k.
+        rank = _dot(used.astype(jnp.bfloat16), (expert_rows < expert_columns).astype(jnp.bfloat16))
+        visit = ((rank == expert_rows.astype(jnp.float32)) & (used > 0)).astype(jnp.bfloat16)
+        expert_ids = jnp.broadcast_to(
+            jax.lax.broadcasted_iota(jnp.int32, (1, 128), 1).astype(jnp.bfloat16), (16, 128)
+        )
+        order = jax.lax.dot_general(
+            expert_ids, visit, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
+        )[:1]
+        table_vmem[plan_slots:plan_slots + 1, :] = order.astype(jnp.int32)
+        table_vmem[plan_slots + 1:plan_slots + 2, :] = counts.astype(jnp.int32)
+        table_vmem[plan_slots + 2:plan_slots + 3, :] = jnp.broadcast_to(
+            jnp.sum(used, axis=1, keepdims=True), (1, 128)
+        ).astype(jnp.int32)
+        plan_copy = tpu.make_async_copy(table_vmem, table_smem, plan_semaphore)
+        plan_copy.start()
+        # B8 has no compact tiles: per-expert row tiles use a scoped one.
+        tile_source = first_compact_source_vmem if compact_capacity > 1 else plan_tile_vmem
+        if compact_capacity == 1 and PLAN_B8_TILES:
+            plan_tile_vmem[...] = jnp.zeros(plan_tile_vmem.shape, jnp.float32)
+        if compact_capacity > 1:
+            # Rows past an expert's count are never scattered; keep them finite.
+            first_compact_source_vmem[...] = jnp.zeros(first_compact_source_vmem.shape, jnp.float32)
+            second_compact_source_vmem[...] = jnp.zeros(second_compact_source_vmem.shape, jnp.float32)
+        plan_copy.wait()
+        distinct = table_smem[plan_slots + 2, 0]
+
+        def expert_vectors(expert):
+            """Selector-loop operands of one expert: active rows, slot mask."""
+            active = jnp.sum(jnp.where(lanes == expert, mask_vmem[...], 0.0), axis=1) > 0
+            slot_mask = valid & (selected_experts == expert)
+            return active, slot_mask
+
+        def stage_row(row, destination):
+            """Copy source row ``row`` (a scalar) into the one-row ``destination``."""
+            if "stage" in PLAN_DEBUG_SKIP:
+                return
+            if batch_size % 16:
+                block = source[:, :expert_input_size].astype(jnp.float32)
+                within = jax.lax.broadcasted_iota(jnp.int32, block.shape, 0) == row
+                destination[...] = jnp.sum(
+                    jnp.where(within, block, 0.0), axis=0, keepdims=True
+                ).astype(destination.dtype)
+                return
+            block = source[pl.ds(pl.multiple_of(row // 16 * 16, 16), 16), :expert_input_size]
+            gather_indices = jnp.full((1, expert_input_size), row % 16, jnp.int16)
+            destination[...] = jnp.take_along_axis(
+                block, gather_indices, axis=0, mode="promise_in_bounds",
+            ).astype(destination.dtype)
+
+        def stage_rows(expert, count, destination, offset=0):
+            @pl.loop(0, count)
+            def stage(position):
+                stage_row(table_smem[offset + position, expert], destination.at[pl.ds(position, 1)])
+
+        def expert_weights(expert, offset=0):
+            """[8, 1] route weights of the expert's compact rows offset.."""
+            weights = weight_vmem[pl.ds(pl.multiple_of(offset, 8), 8), :] if plan_slots > 8 else weight_vmem[...]
+            return jnp.sum(
+                jnp.where(lanes[:8] == expert, weights, 0.0), axis=1, keepdims=True
+            )
+
+        def finish_planned_singleton(expert, compact_row, column, slot):
+            gate_up = gate_up_accumulator[
+                compact_row : compact_row + 1,
+                column : column + 2 * expert_width,
+            ].astype(jnp.bfloat16).astype(jnp.float32)
+            middle = _gated_activation(gate_up[:, :expert_width], gate_up[:, expert_width:])
+            gate_up_accumulator[compact_row : compact_row + 1, :expert_width] = middle.astype(jnp.float32)
+            copies = copy_expert(expert, slot, gate_up=False)
+            copies.down.wait()
+            copies.down_scales.wait()
+            expert_dot(
+                gate_up_accumulator.at[compact_row : compact_row + 1, :expert_width],
+                expert_down_vmem.at[slot],
+                expert_down_scale_vmem.at[slot],
+                down_accumulator.at[:1],
+                expert_width,
+                expert_output_size,
+                block_major=True,
+            )
+            probability = jnp.sum(expert_weights(expert)[:1])
+            row = table_smem[0, expert]
+            output_row = expert_output.at[pl.ds(row, 1), :expert_output_size]
+            output_row[...] += down_accumulator[:1].astype(jnp.bfloat16).astype(jnp.float32) * probability
+
+        def finish_planned_compact(expert, count, first_row, column, slot):
+            if isinstance(first_row, int):
+                rows = slice(first_row, first_row + compact_capacity)
+                columns = slice(column, column + 2 * expert_width)
+            else:
+                rows = pl.ds(pl.multiple_of(first_row, 8), compact_capacity)
+                columns = pl.ds(pl.multiple_of(column, 128), 2 * expert_width)
+            gate_up = gate_up_accumulator[
+                rows, columns
+            ].astype(jnp.bfloat16).astype(jnp.float32)
+            middle = _gated_activation(gate_up[:, :expert_width], gate_up[:, expert_width:])
+            gate_up_accumulator[rows, :expert_width] = middle.astype(jnp.float32)
+            copies = copy_expert(expert, slot, gate_up=False)
+            copies.down.wait()
+            copies.down_scales.wait()
+            if "down" not in PLAN_DEBUG_SKIP:
+                expert_dot(
+                    gate_up_accumulator.at[rows, :expert_width],
+                    expert_down_vmem.at[slot],
+                    expert_down_scale_vmem.at[slot],
+                    down_accumulator.at[:compact_capacity],
+                    expert_width,
+                    expert_output_size,
+                    block_major=True,
+                )
+            down_accumulator[:compact_capacity] = (
+                down_accumulator[:compact_capacity].astype(jnp.bfloat16).astype(jnp.float32)
+                * expert_weights(expert)
+            )
+
+            @pl.loop(0, 0 if "scatter" in PLAN_DEBUG_SKIP else count)
+            def scatter(position):
+                row = table_smem[position, expert]
+                output_row = expert_output.at[pl.ds(row, 1), :expert_output_size]
+                output_row[...] += down_accumulator[pl.ds(position, 1), :]
+
+        def process_planned_expert(expert, count, slot, offset=0, wait=True):
+            """Stage, project and scatter rows offset .. offset + count - 1
+            (count <= C) of one expert, sized to the smallest of the 1/2/4/8-row
+            buckets (rows are independent)."""
+            copies = copy_expert(expert, slot)
+            if wait:
+                copies.gate_up.wait()
+                copies.gate_up_scales.wait()
+            stage_rows(expert, count, tile_source, offset)
+            previous = 0
+            for capacity in (1, 2, 4, 8):
+                @pl.when((count > previous) & (count <= capacity))
+                def project(capacity=capacity):
+                  if "gateup" not in PLAN_DEBUG_SKIP:
+                    _single_expert_gate_up(
+                        tile_source,
+                        expert_gate_up_vmem.at[slot],
+                        expert_gate_up_scale_vmem.at[slot],
+                        gate_up_accumulator,
+                        expert_input_size,
+                        capacity,
+                        MXFP4_PAIR_TILE,
+                    )
+                  if "act" not in PLAN_DEBUG_SKIP:
+                    gate_up = gate_up_accumulator[0:capacity, 0:2 * expert_width].astype(
+                        jnp.bfloat16).astype(jnp.float32)
+                    middle = _gated_activation(gate_up[:, :expert_width], gate_up[:, expert_width:])
+                    gate_up_accumulator[0:capacity, :expert_width] = middle.astype(jnp.float32)
+                  if True:
+                    if wait:
+                        copies.down.wait()
+                        copies.down_scales.wait()
+                  if "down" not in PLAN_DEBUG_SKIP:
+                    expert_dot(
+                        gate_up_accumulator.at[:8, :expert_width],
+                        expert_down_vmem.at[slot],
+                        expert_down_scale_vmem.at[slot],
+                        down_accumulator.at[:8],
+                        expert_width,
+                        expert_output_size,
+                        block_major=True,
+                        # Sub-tile row counts cost relayouts: 2-8 rows run
+                        # the whole eight-row tile (stale rows are unused).
+                        active_rows=1 if capacity == 1 else PLAN_DOWN_ROWS.get(capacity),
+                    )
+                    down_accumulator[0:capacity] = (
+                        down_accumulator[0:capacity].astype(jnp.bfloat16).astype(jnp.float32)
+                        * expert_weights(expert, offset)[:capacity]
+                    )
+                previous = capacity
+
+            @pl.loop(0, 0 if "scatter" in PLAN_DEBUG_SKIP else count)
+            def scatter(position):
+                row = table_smem[offset + position, expert]
+                output_row = expert_output.at[pl.ds(row, 1), :expert_output_size]
+                output_row[...] += down_accumulator[pl.ds(position, 1), :]
+
+        @pl.loop(0, (distinct + 1) // 2)
+        def run_planned_pair(iteration):
+          if progress is not None:
+            progress(iteration)
+          with _phase("e_iteration"):
+            select_scope = _phase_start("e_select")
+            first_index = 2 * iteration
+            has_second = first_index + 1 < distinct
+            # Order entries past the distinct count are expert 0 (unused).
+            first_expert = table_smem[plan_slots, first_index]
+            second_expert = table_smem[plan_slots, first_index + 1]
+            third_expert = table_smem[plan_slots, first_index + 2]
+            fourth_expert = table_smem[plan_slots, first_index + 3]
+            first_row_count = table_smem[plan_slots + 1, first_expert]
+            second_row_count = jnp.where(has_second, table_smem[plan_slots + 1, second_expert], 0)
+            current_base_slot = (iteration % 2) * 2
+            next_base_slot = ((iteration + 1) % 2) * 2
+            first_copies = copy_expert(first_expert, current_base_slot)
+            second_copies = copy_expert(second_expert, current_base_slot + 1)
+
+            @pl.when((first_index + 2 < distinct) & (iteration != 0))
+            def prefetch_third():
+                _start_async_copies(copy_expert(third_expert, next_base_slot))
+
+            @pl.when((first_index + 3 < distinct) & (iteration != 0))
+            def prefetch_fourth():
+                _start_async_copies(copy_expert(fourth_expert, next_base_slot + 1))
+
+            _phase_end(select_scope)
+
+            def wait_gate_up(copies):
+                copies.gate_up.wait()
+                copies.gate_up_scales.wait()
+
+            compact_pair = has_second & (first_row_count == 1) & (second_row_count == 1)
+
+            @pl.when(compact_pair)
+            @_scoped("e_single_pair")
+            def execute_compact_pair():
+                wait_gate_up(first_copies)
+                wait_gate_up(second_copies)
+                stage_row(table_smem[0, first_expert], first_single_source)
+                stage_row(table_smem[0, second_expert], second_single_source)
+                _paired_expert_gate_up(
+                    first_single_source,
+                    expert_gate_up_vmem,
+                    expert_gate_up_scale_vmem,
+                    gate_up_accumulator.at[:2],
+                    current_base_slot,
+                    current_base_slot + 1,
+                    expert_input_size,
+                    second_source=second_single_source,
+                )
+                finish_planned_singleton(first_expert, 0, 0, current_base_slot)
+                finish_planned_singleton(second_expert, 1, 2 * expert_width, current_base_slot + 1)
+
+            if compact_capacity > 1 and PLAN_PER_EXPERT:
+                # Two single-row experts keep the paired gate/up above.
+                @pl.loop(0, jnp.where(compact_pair, 0, jnp.where(has_second, 2, 1)))
+                def each_expert(index):
+                    first = index == 0
+                    expert = jnp.where(first, first_expert, second_expert)
+                    count = jnp.where(first, first_row_count, second_row_count)
+                    slot = current_base_slot + index
+
+                    @pl.when(count <= compact_capacity)
+                    @_scoped("e_compact")
+                    def compact():
+                        process_planned_expert(expert, count, slot)
+
+                    if plan_slots > compact_capacity:
+                        @pl.when((count > compact_capacity) & (count <= plan_slots))
+                        @_scoped("e_planned_passes")
+                        def planned_passes():
+                            copies = copy_expert(expert, slot)
+                            for copy in (copies.gate_up, copies.gate_up_scales, copies.down, copies.down_scales):
+                                copy.wait()
+
+                            @pl.loop(0, (count + compact_capacity - 1) // compact_capacity)
+                            def run_pass(index):
+                                offset = index * compact_capacity
+                                process_planned_expert(
+                                    expert, jnp.minimum(count - offset, compact_capacity), slot,
+                                    offset, wait=False,
+                                )
+
+                    @pl.when(count > plan_slots)
+                    @_scoped("e_passes")
+                    def passes():
+                        active, slot_mask = expert_vectors(expert)
+                        run_expert_in_passes(
+                            active, slot_mask, copy_expert(expert, slot), count, slot,
+                            paired_gate=compact_overflow,
+                        )
+                return
+
+            compact_tail = ~has_second & (first_row_count == 1)
+
+            @pl.when(compact_tail)
+            @_scoped("e_single_tail")
+            def execute_compact_tail():
+                wait_gate_up(first_copies)
+                stage_row(table_smem[0, first_expert], first_single_source)
+                expert_dot(
+                    first_single_source,
+                    expert_gate_up_vmem.at[current_base_slot],
+                    expert_gate_up_scale_vmem.at[current_base_slot],
+                    gate_up_accumulator.at[:1, : 2 * expert_width],
+                    expert_input_size,
+                    2 * expert_width,
+                )
+                finish_planned_singleton(first_expert, 0, 0, current_base_slot)
+
+            if compact_capacity == 1 and PLAN_B8_TILES:
+                # B8: other pairs run each expert on its own row tile.
+                @pl.loop(0, jnp.where(compact_pair | compact_tail, 0, jnp.where(has_second, 2, 1)))
+                def each_expert(index):
+                    first = index == 0
+                    process_planned_expert(
+                        jnp.where(first, first_expert, second_expert),
+                        jnp.where(first, first_row_count, second_row_count),
+                        current_base_slot + index,
+                    )
+                return
+
+            if compact_capacity == 1:
+                # B8: experts with several rows run on the whole batch tile.
+                @pl.when(has_second & ~compact_pair)
+                @_scoped("e_pass_pair")
+                def execute_full_pair():
+                    wait_gate_up(first_copies)
+                    wait_gate_up(second_copies)
+                    _paired_expert_gate_up(
+                        source,
+                        expert_gate_up_vmem,
+                        expert_gate_up_scale_vmem,
+                        gate_up_accumulator,
+                        current_base_slot,
+                        current_base_slot + 1,
+                        expert_input_size,
+                    )
+                    finish_expert(*expert_vectors(first_expert), first_copies, 0, current_base_slot)
+                    finish_expert(
+                        *expert_vectors(second_expert), second_copies,
+                        2 * expert_width, current_base_slot + 1,
+                    )
+
+                @pl.when(~has_second & (first_row_count != 1))
+                def execute_full_tail():
+                    wait_gate_up(first_copies)
+                    expert_dot(
+                        source,
+                        expert_gate_up_vmem.at[current_base_slot],
+                        expert_gate_up_scale_vmem.at[current_base_slot],
+                        gate_up_accumulator.at[:, : 2 * expert_width],
+                        expert_input_size,
+                        2 * expert_width,
+                    )
+                    finish_expert(*expert_vectors(first_expert), first_copies, 0, current_base_slot)
+                return
+
+            multi_pair = (
+                has_second & ~compact_pair
+                & (first_row_count <= compact_capacity)
+                & (second_row_count <= compact_capacity)
+            )
+
+            @pl.when(multi_pair)
+            @_scoped("e_multi_pair")
+            def execute_compact_multi_pair():
+                wait_gate_up(first_copies)
+                wait_gate_up(second_copies)
+                stage_rows(first_expert, first_row_count, first_compact_source_vmem)
+                stage_rows(second_expert, second_row_count, second_compact_source_vmem)
+                largest = jnp.maximum(first_row_count, second_row_count)
+                previous = 1
+                for capacity in (2, 4, 8):
+                    @pl.when((largest > previous) & (largest <= capacity))
+                    @_scoped(f"e_capacity_{capacity}")
+                    def execute_capacity(capacity=capacity):
+                        if "gateup" in PLAN_DEBUG_SKIP:
+                            return
+                        _paired_expert_gate_up(
+                            first_compact_source_vmem,
+                            expert_gate_up_vmem,
+                            expert_gate_up_scale_vmem,
+                            gate_up_accumulator.at[:2 * compact_capacity],
+                            current_base_slot,
+                            current_base_slot + 1,
+                            expert_input_size,
+                            second_source=second_compact_source_vmem,
+                            active_capacity=capacity,
+                            dot_split=PLAN_DOT_SPLIT.get(capacity),
+                        )
+                    previous = capacity
+
+            multi_tail = (
+                ~has_second & (first_row_count != 1) & (first_row_count <= compact_capacity)
+            )
+
+            @pl.when(multi_tail)
+            def execute_compact_multi_tail():
+                wait_gate_up(first_copies)
+                stage_rows(first_expert, first_row_count, first_compact_source_vmem)
+                expert_dot(
+                    first_compact_source_vmem,
+                    expert_gate_up_vmem.at[current_base_slot],
+                    expert_gate_up_scale_vmem.at[current_base_slot],
+                    gate_up_accumulator.at[:compact_capacity, : 2 * expert_width],
+                    expert_input_size,
+                    2 * expert_width,
+                )
+
+            @pl.when(multi_pair | multi_tail)
+            @_scoped("e_multi_finish")
+            def execute_compact_finish():
+                if PLAN_UNROLL_FINISH:
+                    finish_planned_compact(first_expert, first_row_count, 0, 0, current_base_slot)
+
+                    @pl.when(has_second)
+                    def finish_second():
+                        finish_planned_compact(
+                            second_expert, second_row_count, compact_capacity,
+                            2 * expert_width, current_base_slot + 1,
+                        )
+                    return
+
+                @pl.loop(0, jnp.where(has_second, 2, 1))
+                def selected_expert(index):
+                    first = index == 0
+                    finish_planned_compact(
+                        jnp.where(first, first_expert, second_expert),
+                        jnp.where(first, first_row_count, second_row_count),
+                        index * compact_capacity,
+                        index * 2 * expert_width,
+                        current_base_slot + index,
+                    )
+
+            @pl.when(has_second & ~compact_pair & ~multi_pair)
+            @_scoped("e_pass_pair")
+            def execute_noncompact_pair():
+                active, slot_mask = expert_vectors(first_expert)
+                run_expert_in_passes(
+                    active, slot_mask, first_copies, first_row_count, current_base_slot,
+                    paired_gate=compact_overflow,
+                )
+                active, slot_mask = expert_vectors(second_expert)
+                run_expert_in_passes(
+                    active, slot_mask, second_copies, second_row_count, current_base_slot + 1,
+                    paired_gate=compact_overflow,
+                )
+
+            @pl.when(~has_second & (first_row_count > compact_capacity))
+            def execute_noncompact_tail():
+                active, slot_mask = expert_vectors(first_expert)
+                run_expert_in_passes(
+                    active, slot_mask, first_copies, first_row_count, current_base_slot,
+                )
+
     @pl.when(~routes_are_shared)
     def run_divergent_routes():
+        if planned:
+            pl.run_scoped(
+                run_planned_routes,
+                tpu.VMEM((plan_slots + 8, 128), jnp.int32),
+                tpu.SMEM((plan_slots + 8, 128), jnp.int32),
+                tpu.VMEM((plan_slots, 128), jnp.float32),
+                tpu.VMEM((batch_size, 128), jnp.float32),
+                tpu.SemaphoreType.DMA,
+                tpu.VMEM((8, expert_input_size) if compact_capacity == 1 and PLAN_B8_TILES else (8, 128),
+                         jnp.float32),
+            )
+            return
         # Reuse the choices already made for the next four-slot prefetch.
         # Other batch/routing combinations use the selector loop.
         carry_routes = (
@@ -5944,6 +6499,17 @@ SHARED_EXPERT_FINISHERS = _config().shared_expert_finishers
 # finish overflowing experts in eight-row passes; without the full-batch
 # fallback the expert loop fits in IMEM next to its predecessor.
 COMPACT_OVERFLOW = _config().compact_overflow
+EXPERT_PLAN = _config().expert_plan
+# Microbenchmark-only ablation of the planned loop (invalid results).
+PLAN_DEBUG_SKIP = frozenset()
+PLAN_UNROLL_FINISH = False
+# expert_plan: split masked gate/up products by capacity (bit-exact).
+PLAN_DOT_SPLIT = {}
+# expert_plan at B16+: one expert at a time in 1/2/4/8-row buckets.
+PLAN_PER_EXPERT = True
+PLAN_SLOTS = 16
+PLAN_DOWN_ROWS = {}
+PLAN_B8_TILES = True
 SHARED_SHARDS = _config().shared_shards
 # KernelConfig.kda_staged=True (above B8, no attention DP): stage the KDA input
 # and feature-gate projections in VMEM; with a state stream (above B16) the
