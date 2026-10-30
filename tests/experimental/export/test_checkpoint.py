@@ -142,6 +142,24 @@ def test_per_rank_tensors_are_sharded_over_tensor_parallel_ranks(
     assert sharding == ["tp"] + [None] * (len(shape) - 1)
 
 
+@pytest.mark.parametrize(
+    "name,shape,expected",
+    [
+        # The MTP predictor's fc is column-parallel; FP8 requantization drops the
+        # attributes that say so, so the name has to.
+        ("model.fc.weight", [4096, 2048], [None, "tp"]),
+        ("model.fc.weight_scale", [2048], ["tp"]),
+        ("model.layers.0.mlp.fc1.weight", [4096, 2048], [None, None]),
+    ],
+)
+def test_the_mtp_fc_is_sharded_like_a_column_parallel_layer(
+    name: str, shape: list[int], expected: list[str | None]
+) -> None:
+    from vllm_torchtpu.experimental.export import weight_mapper
+
+    assert weight_mapper.infer_weight_sharding(name, shape, tp_size_hint=2) == expected
+
+
 def test_save_checkpoint_writes_zarr_v2_arrays(tmp_path: Path) -> None:
     pytest.importorskip("orbax.checkpoint")
     ts = pytest.importorskip("tensorstore")
