@@ -722,6 +722,13 @@ def _ragged_plan(
     return pack_tiles, source_rows, selection_rows
 
 
+def _take_with_dynamic_fill(values, indices, fill_value):
+    """Gather metadata with a dynamic out-of-bounds value."""
+    selected = jnp.take(values, indices, mode="fill", fill_value=0)
+    valid = (indices >= -len(values)) & (indices < len(values))
+    return jnp.where(valid, selected, jnp.asarray(fill_value, values.dtype))
+
+
 def _request_tiles(starts, offset, size, query_block):
     local = jnp.clip(starts, offset, offset + size)
     counts = (jnp.diff(local) + query_block - 1) // query_block
@@ -732,13 +739,13 @@ def _request_tiles(starts, offset, size, query_block):
     requests = jnp.searchsorted(cumulative, slots, side="right")
     previous = jnp.concatenate((jnp.zeros(1, jnp.int32), cumulative))
     first = (
-        jnp.take(local, requests, mode="fill", fill_value=offset + size)
+        _take_with_dynamic_fill(local, requests, offset + size)
         + (slots - jnp.take(previous, requests, mode="fill", fill_value=0))
         * query_block
     )
     ends = jnp.minimum(
         first + query_block,
-        jnp.take(local, requests + 1, mode="fill", fill_value=offset + size),
+        _take_with_dynamic_fill(local, requests + 1, offset + size),
     )
     return (
         jnp.where(slots < total, first, offset + size),
@@ -830,10 +837,8 @@ def _ragged_prefill(
 
         def pack(i, output):
             tile_slots = cursor + i * pack_tiles + jnp.arange(pack_tiles)
-            tile_first = jnp.take(
-                first, tile_slots, mode="fill", fill_value=offset + size
-            )
-            tile_end = jnp.take(ends, tile_slots, mode="fill", fill_value=offset + size)
+            tile_first = _take_with_dynamic_fill(first, tile_slots, offset + size)
+            tile_end = _take_with_dynamic_fill(ends, tile_slots, offset + size)
             indices = tile_first[:, None] + jnp.arange(query_block)[None, :]
             valid = (tile_slots[:, None] < stop) & (indices < tile_end[:, None])
             # Positive out-of-bounds indices are dropped, including unused tail tiles.
