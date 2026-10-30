@@ -285,6 +285,20 @@ def ring_handoff() -> bool:
     return envs.TPU_PP_HANDOFF == "ring"
 
 
+def _take_draft_token_ids(self: Any) -> None:
+    """``MultiprocExecutor.take_draft_token_ids`` under a pipeline.
+
+    A pipeline admits prefill-only MTP alone (pp_validation): its drafts
+    exist to fill the draft layer's KV, and no step consumes them. The
+    engine asks with a blocking RPC right after dispatching a step, which
+    the last stage answers only once that step is done; under the wave,
+    asking the workers would also deadlock, as a stage can still sit in that
+    step's hand-off, waiting for a push that only a wait on the step's
+    future sends.
+    """
+    return None
+
+
 def patch_executor_for_pp_handoff(vllm_config: Any) -> None:
     """Install the engine side of the hand-off ``TPU_PP_HANDOFF`` selects."""
     if ring_handoff():
@@ -310,15 +324,7 @@ def patch_executor_for_pp_ring(vllm_config: Any) -> None:
 
     if getattr(MultiprocExecutor, "_tpu_pp_ring_patch", False):
         return
-
-    def take_draft_token_ids(self):
-        # A pipeline admits prefill-only MTP alone (pp_validation): its
-        # drafts exist to fill the draft layer's KV, and no step consumes
-        # them. The engine asks with a blocking call right after dispatching
-        # a step, which the last stage answers only once that step is done.
-        return None
-
-    MultiprocExecutor.take_draft_token_ids = take_draft_token_ids
+    MultiprocExecutor.take_draft_token_ids = _take_draft_token_ids
     MultiprocExecutor._tpu_pp_ring_patch = True
     logger.info(
         "PP ring: engine side installed, message ring %d chunks",
@@ -365,18 +371,9 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
         future = _PushFuture(inner, self, state, state.last_step, state.real_steps)
         return future if non_block else future.result()
 
-    def take_draft_token_ids(self):
-        # A pipeline admits prefill-only MTP alone (pp_validation): its
-        # drafts exist to fill the draft layer's KV, and no step consumes
-        # them. Asking the workers would also deadlock. The engine asks with
-        # a blocking RPC right after dispatching a step, while a stage can
-        # still sit in that step's hand-off, waiting for a push that only a
-        # wait on the step's future sends.
-        return None
-
     MultiprocExecutor.execute_model = execute_model
     MultiprocExecutor.sample_tokens = sample_tokens
-    MultiprocExecutor.take_draft_token_ids = take_draft_token_ids
+    MultiprocExecutor.take_draft_token_ids = _take_draft_token_ids
     MultiprocExecutor._tpu_pp_wave_patch = True
     logger.info(
         "PP wave: engine push and settle installed, message ring %d chunks",

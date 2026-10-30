@@ -447,8 +447,13 @@ def patch_engine_core_for_lazy_push(vllm_config: Any) -> None:
         vllm_config is None
         or not envs.TPU_PP_LAZY_PUSH
         or vllm_config.parallel_config.pipeline_parallel_size <= 2
-        or ring_handoff()
     ):
+        return
+    if ring_handoff():
+        logger.warning_once(
+            "PP lazy push is off: the stages hand off point to point "
+            "(TPU_PP_HANDOFF=ring)."
+        )
         return
     from vllm.v1.engine.core import EngineCore
 

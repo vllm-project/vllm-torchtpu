@@ -291,7 +291,7 @@ def test_every_forward_reaches_the_last_stage(monkeypatch, stages, side):
         assert ring.forwards == len(forwards)
         assert ring.sent == (len(forwards) if stage < stages - 1 else 0)
         assert ring.posted_through == (1 + len(forwards) if stage > 0 else 0)
-        assert ring.consumed_through == ring.posted_through
+        assert ring.landed_through == 1 + len(forwards)
 
 
 def test_columns_hand_off_to_the_same_column(monkeypatch):
@@ -496,44 +496,113 @@ def test_receives_are_posted_off_the_thread_that_runs_the_step(monkeypatch):
 
 
 class _Watched(_Transport):
-    """Records, with each receive posted, the last transfer whose receives
-    a forward of ``ring`` had taken by then."""
+    """Records, with each receive posted, the last transfer whose forward
+    on ``ring`` had completed by then."""
 
     def __init__(self):
         super().__init__()
         self.ring = None
-        self.taken_at_post = []
+        self.landed_at_post = []
 
     def irecv(self, tensor, src, tag):
         transfer, index = divmod(tag, len(self.ring.carried))
-        self.taken_at_post.append((transfer, index, self.ring.consumed_through))
+        self.landed_at_post.append((transfer, index, self.ring.landed_through))
         return super().irecv(tensor, src, tag)
 
 
+class _HeldFence:
+    """A device fence that completes when the test sets ``done``, raising
+    ``error`` if the test set one."""
+
+    def __init__(self):
+        self.done = threading.Event()
+        self.error = None
+
+    def synchronize(self):
+        if not self.done.wait(TIMEOUT):
+            raise TimeoutError("a fence never completed")
+        if self.error is not None:
+            raise self.error
+
+
+def _hold_fences(monkeypatch):
+    """Makes every fence the ring records a _HeldFence; returns them in the
+    order they are recorded."""
+    fences = []
+
+    def record_fence():
+        fences.append(_HeldFence())
+        return fences[-1]
+
+    monkeypatch.setattr(pp_ring, "_fence", record_fence)
+    return fences
+
+
 @pytest.mark.parametrize("side", [False, True], ids=["activations", "with_side"])
-def test_a_step_of_many_forwards_keeps_seven_receives_ahead(monkeypatch, side):
+def test_a_step_of_many_forwards_keeps_seven_receives_outstanding(monkeypatch, side):
     transport, rings = _build(monkeypatch, stages=2, side=side, transport=_Watched())
+    fences = _hold_fences(monkeypatch)
     second = transport.ring = rings[1, 0]
     carried = len(second.carried)
     # the transfers whose receive calls fit in seven
     ahead = 7 // carried
     second.begin_step([8] * 9)
     assert _until(lambda: second.posted_through == ahead)
-    # the next waits until a forward takes a receive
-    assert not _until(lambda: second.posted_through > ahead, seconds=0.3)
-    for taken in range(1, 10):
+    # forwards that took their receives free nothing until they complete
+    for _ in range(ahead):
         second.start_forward(8)
         second.end_forward(None, 8)
-        want = min(9, taken + ahead)
+    assert not _until(lambda: second.posted_through > ahead, seconds=0.3)
+    for completed in range(1, 10 - ahead):
+        fences[completed - 1].done.set()
+        want = ahead + completed
         assert _until(lambda want=want: second.posted_through == want)
-    calls = [(transfer, index) for transfer, index, _ in transport.taken_at_post]
-    assert calls == [(t, i) for t in range(1, 10) for i in range(carried)]
-    for transfer, index, taken in transport.taken_at_post:
-        # a transfer beyond the first ``ahead`` only once the forwards had
-        # taken the receives before it, never more than seven calls ahead
-        assert taken >= transfer - ahead
-        assert (transfer - 1 - taken) * carried + index + 1 <= 7
+        second.start_forward(8)
+        second.end_forward(None, 8)
+    for fence in fences:
+        fence.done.set()
     second.close()
+    assert second.landed_through == 9
+    calls = [(transfer, index) for transfer, index, _ in transport.landed_at_post]
+    assert calls == [(t, i) for t in range(1, 10) for i in range(carried)]
+    for transfer, index, landed in transport.landed_at_post:
+        # a transfer beyond the first ``ahead`` only once the forwards before
+        # it had completed, never more than seven calls outstanding
+        assert landed >= transfer - ahead
+        assert (transfer - 1 - landed) * carried + index + 1 <= 7
+
+
+def test_a_send_thread_failure_fails_a_forward_waiting_for_its_receive(monkeypatch):
+    _, rings = _build(monkeypatch, stages=2)
+    fences = _hold_fences(monkeypatch)
+    second = rings[1, 0]
+    second.begin_step([8] * 9)
+    assert _until(lambda: second.posted_through == 7)
+    for _ in range(7):
+        second.start_forward(8)
+        second.end_forward(None, 8)
+    errors = []
+
+    def eighth_forward():
+        try:
+            second.start_forward(8)
+        except RuntimeError as exc:
+            errors.append(exc)
+
+    forward = threading.Thread(target=eighth_forward, daemon=True)
+    forward.start()
+    forward.join(0.3)
+    # it waits for a receive the posting thread holds back
+    assert forward.is_alive()
+    fences[0].error = RuntimeError("program allocation failed")
+    fences[0].done.set()
+    forward.join(TIMEOUT)
+    assert not forward.is_alive()
+    (error,) = errors
+    assert "the send thread failed" in str(error)
+    assert str(error.__cause__) == "program allocation failed"
+    assert _until(lambda: not second._post_thread.is_alive())
+    assert not second._to_post
 
 
 def test_closing_drops_receives_that_wait_for_room(monkeypatch):

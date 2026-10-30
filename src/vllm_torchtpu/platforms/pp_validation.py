@@ -203,13 +203,13 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
     from vllm_torchtpu import envs
     from vllm_torchtpu.distributed.pp_push import ring_handoff
 
-    if ring_handoff() and envs.TPU_PP_RING_DEPTH < 1:
-        # A stage queues at most this many forwards for the next one; with
-        # none it could hand nothing on.
-        raise ValueError(
-            f"TPU_PP_RING_DEPTH must be at least 1, got {envs.TPU_PP_RING_DEPTH}."
-        )
     if ring_handoff():
+        if envs.TPU_PP_RING_DEPTH < 1:
+            # A stage queues at most this many forwards for the next one; with
+            # none it could hand nothing on.
+            raise ValueError(
+                f"TPU_PP_RING_DEPTH must be at least 1, got {envs.TPU_PP_RING_DEPTH}."
+            )
         # Counts one receive per forward; the ring checks again with the
         # tensors the model hands on.
         from vllm_torchtpu.distributed.pp_ring import check_ring_receives
