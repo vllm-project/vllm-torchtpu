@@ -105,14 +105,14 @@ def _request(request_id: str, tokens: list[int]) -> Request:
 def _run(
     manager: KVCacheManager, request: Request, eagle: bool = False, decode: int = 1
 ) -> tuple[int, list]:
-    """Admit, prefill stopping at the prompt's last hash boundary (the align
-    split's checkpoint stop; one unit earlier with EAGLE), then decode.
-    Returns the hit and the CoW pairs."""
+    """Admit, prefill in B-token chunks (one Mamba checkpoint per block),
+    then decode. Returns the hit and the CoW pairs."""
     manager.new_step_starts()
     blocks, hit = manager.get_computed_blocks(request)[:2]
     prompt = request.num_tokens
-    checkpoint = prompt // B * B - (B if eagle else 0)
-    stops = sorted({checkpoint, prompt} - {0})
+    # Mamba align: state is materialized at every block (B) boundary a chunk
+    # ends on; stop at each so every boundary has a checkpoint.
+    stops = sorted(set(range(B, prompt, B)) | {prompt})
     start, first = hit, True
     copies = []
     for end in stops:
@@ -128,7 +128,8 @@ def _run(
             )
             is not None
         )
-        copies += manager.take_kv_cache_block_copies() or []
+        pairs, _retained = manager.take_kv_cache_block_copies()
+        copies += pairs
         first = False
         request.num_computed_tokens = start = end
     for i in range(decode):
@@ -151,7 +152,9 @@ def test_flag_off_rounds_hits_to_dcp_block(patched, monkeypatch, dcp):
     prompt_a = list(range(dcp * B + 3 * B + 8))
     _run(manager, _request("a", prompt_a))
     hit, copies = _run(manager, _request("b", prompt_a[: dcp * B + 3 * B + 2] + [9] * 20))
-    assert hit == dcp * B
+    # Five shared hash units; the hit rounds down to a D*B multiple (4B at
+    # both D=2 and D=4), never the odd 5B the flag would allow.
+    assert hit == (5 * B) // (dcp * B) * (dcp * B)
     assert copies == []
 
 
@@ -179,23 +182,21 @@ def test_prompt_tail_hit_inside_dcp_block_with_cow(patched, monkeypatch, dcp):
     assert attention_b[1].block_id != attention_a[1].block_id
 
 
-@pytest.mark.parametrize("fine", [True, False])
-def test_eagle_drop_is_one_hash_unit(patched, monkeypatch, fine):
-    # D=4: A's prompt-tail entry at 7B; EAGLE drops one unit (B) to 6B, which
-    # is inside the second 4B block. Without the flag the hit rounds to 4B.
-    dcp = 4
-    _flags(monkeypatch, dcp=dcp, fine=fine)
+@pytest.mark.parametrize("dcp", [2, 4])
+def test_eagle_drop_is_one_hash_unit(patched, monkeypatch, dcp):
+    # The MTP draft main-KV group is at B (the hash unit) and is the only
+    # EAGLE group; the D*B target group is not. So the EAGLE margin/drop is B
+    # with the flag on, as it is without it, and the flag survives EAGLE.
+    _flags(monkeypatch, dcp=dcp, fine=True)
     manager = _manager(dcp, eagle=True)
-    boundary = 7 * B
-    prompt_a = list(range(boundary + 8))
-    _run(manager, _request("a", prompt_a), eagle=True)
-    hit, copies = _run(
-        manager,
-        _request("b", _shared_then_diverge(boundary + 4, boundary + 40)),
-        eagle=True,
-    )
-    assert hit == (6 * B if fine else 4 * B)
-    assert len(copies) == (1 if fine else 0)
+    coordinator = manager.coordinator
+    assert coordinator.enable_partial_hash_hits
+    eagle = [g for g in coordinator.attention_groups if g.use_eagle]
+    assert len(eagle) == 1
+    assert eagle[0].spec.block_size == B == coordinator.hash_block_size
+    target = coordinator.single_type_managers[1]
+    assert target.block_size == dcp * B
+    assert not target.use_eagle
 
 
 @pytest.mark.parametrize("seq_tail", [True, False])
