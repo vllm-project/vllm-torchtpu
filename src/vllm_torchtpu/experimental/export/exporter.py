@@ -496,32 +496,62 @@ def _mtp_requested(cfg: api.TextOnlyLLMExportConfig) -> bool:
     )
 
 
+# A model that drafts with MTP lists the MTP layer's own weights among its
+# `abstract_params`, named as in the checkpoint.
+_MTP_PARAM_PREFIX = "mtp."
+
+
+def _mtp_user_inputs(
+    cfg: api.TextOnlyLLMExportConfig, bucket_size: int
+) -> list[tuple[str, tuple[int, ...]]]:
+    """`(name, shape)` of the int32 user inputs of `mtp_draft_bucket{B}`."""
+    return [
+        *_user_inputs(cfg, bucket_size),
+        (_MTP_LAST_TOKEN_INDICES, (cfg.max_num_seqs,)),
+    ]
+
+
+@trace("export.mtp_params")
 def _mtp_params(
-    model: api.ExportableTextOnlyLLM, params_map: Mapping[str, Any]
+    model: api.ExportableTextOnlyLLM, params: Mapping[str, Any]
 ) -> tuple[dict[str, Any], list[str]]:
     """The MTP layer's own weights, and every weight `mtp_draft` reads, in order.
 
-    The shared weights (embedding, LM head) bind the target's slots, so the
-    artifact stores them once; a shared name must be one of the target's.
+    The own weights are the `mtp.` ones of `params`, the model's
+    `abstract_params`. The target weights `mtp_draft` shares (embedding, LM
+    head) are read off its graph: the smallest bucket is lowered once with every
+    candidate, as for the forward. A shared weight binds the target's slot, so
+    the artifact stores it once.
     """
-    for method in (
-        "mtp_abstract_params",
-        "mtp_shared_params",
-        "mtp_abstract_states",
-        "mtp_draft",
-    ):
+    for method in ("mtp_abstract_states", "mtp_draft"):
         if not callable(getattr(model, method, None)):
             raise ValueError(
                 f"speculative_config method 'mtp' needs a model with {method}()"
             )
-    own = dict(model.mtp_abstract_params())  # type: ignore[attr-defined]
-    shared = list(model.mtp_shared_params())  # type: ignore[attr-defined]
-    target = model.abstract_params()
-    if clash := sorted(set(own) & set(target)):
-        raise ValueError(f"MTP parameters reuse target parameter names: {clash}")
-    if missing := sorted(set(shared) - set(target)):
-        raise ValueError(f"MTP shares parameters the target does not have: {missing}")
-    return own, shared + list(own)
+    own = {n: s for n, s in params.items() if n.startswith(_MTP_PARAM_PREFIX)}
+    if not own:
+        raise ValueError(
+            "speculative_config method 'mtp' needs the MTP layer's weights among "
+            "abstract_params(), but it has no 'mtp.' parameters"
+        )
+    cfg = model.export_config
+    bucket = min(cfg.token_buckets)
+    user_inputs = _mtp_user_inputs(cfg, bucket)
+    names = [n for n in params if n not in own] + list(own)
+    mlir_text = tpu_lowering.lower_torch_mtp_draft_to_mlir(
+        model,
+        user_inputs=user_inputs,
+        weight_names=names,
+        params_map=_norm_params(params),
+        state_specs=list(model.mtp_abstract_states()),  # type: ignore[attr-defined]
+        hidden_states=api.ShapeDtypeStruct(
+            (bucket, cfg.hidden_size), tpu_lowering.dtype_name(cfg.dtype)
+        ),
+        bucket_size=bucket,
+    )
+    read = _main_args_read(mlir_text)
+    names = [n for i, n in enumerate(names) if len(user_inputs) + i in read]
+    return {n: own[n] for n in names if n in own}, names
 
 
 def _export_text_only_llm_functions(
@@ -809,10 +839,7 @@ def _export_mtp_draft(
 
     variants: dict[str, Any] = {}
     for b_idx, bucket_size in enumerate(cfg.token_buckets):
-        user_inputs = [
-            *_user_inputs(cfg, bucket_size),
-            (_MTP_LAST_TOKEN_INDICES, (cfg.max_num_seqs,)),
-        ]
+        user_inputs = _mtp_user_inputs(cfg, bucket_size)
         hidden = api.ShapeDtypeStruct((bucket_size, cfg.hidden_size), act_dtype_str)
         mlir = tpu_lowering.lower_torch_mtp_draft_to_mlir(
             model,
@@ -1033,18 +1060,24 @@ def export(
     tp_size = cfg.tensor_parallel_size
     dp_size = int(getattr(cfg, "data_parallel_size", 1) or 1)
     pp_size = int(getattr(cfg, "pipeline_parallel_size", 1) or 1)
-    params_map = _params_read_by_forward(model, model.abstract_params())
+    all_params = model.abstract_params()
+    mtp_requested = _mtp_requested(cfg)
+    params_map = _params_read_by_forward(
+        model,
+        {
+            n: s
+            for n, s in all_params.items()
+            if not (mtp_requested and n.startswith(_MTP_PARAM_PREFIX))
+        },
+    )
     mtp_own: dict[str, Any] = {}
     mtp_weight_names: list[str] = []
-    if _mtp_requested(cfg):
-        mtp_own, mtp_weight_names = _mtp_params(model, params_map)
-        target = model.abstract_params()
-        # A shared weight the forward does not read (e.g. an untied LM head is
-        # kept anyway) still needs its slot.
+    if mtp_requested:
+        mtp_own, mtp_weight_names = _mtp_params(model, all_params)
+        # Every weight mtp_draft reads needs a slot, a shared one the forward
+        # does not read included.
         for name in mtp_weight_names:
-            if name not in mtp_own and name not in params_map:
-                params_map[name] = target[name]
-        params_map = {**params_map, **mtp_own}
+            params_map.setdefault(name, all_params[name])
     constant_names_fn = getattr(model, "constant_names", None)
     constants = frozenset(
         constant_names_fn() if callable(constant_names_fn) else ()

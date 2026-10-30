@@ -1906,19 +1906,17 @@ def test_zero_temperature_rows_take_the_argmax() -> None:
 
 
 class _TinyMtpExportableLLM(_TinyTorchExportableLLM):
-    """The tiny model with an MTP layer: its own `mtp.fc`, the target's embedding
-    and LM head, and one paged KV state."""
+    """The tiny model with an MTP layer: its own `mtp.fc` among its parameters,
+    the target's embedding and LM head, and one paged KV state."""
 
-    def mtp_abstract_params(self) -> Mapping[str, api.ShapeDtypeStruct]:
+    def abstract_params(self) -> Mapping[str, api.ShapeDtypeStruct]:
         cfg = self._cfg
         return {
+            **super().abstract_params(),
             "mtp.fc.weight": api.ShapeDtypeStruct(
                 (2 * cfg.hidden_size, cfg.hidden_size), cfg.dtype
-            )
+            ),
         }
-
-    def mtp_shared_params(self) -> Sequence[str]:
-        return ["model.embed_tokens.weight", "lm_head.weight"]
 
     def mtp_abstract_states(self) -> Sequence[api.ShapeDtypeStruct]:
         cfg = self._cfg
@@ -1953,6 +1951,55 @@ class _TinyMtpExportableLLM(_TinyTorchExportableLLM):
         return list(kv_caches), logits.argmax(dim=-1).to(torch.int32).view(-1, 1)
 
 
+class _ReadTracker(torch.Tensor):
+    """A lowering argument that records, in `reads`, whether any op used it."""
+
+    reads: set[int]
+    arg_index: int
+
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        flat, _ = torch.utils._pytree.tree_flatten((args, kwargs))
+        for a in flat:
+            if isinstance(a, _ReadTracker):
+                a.reads.add(a.arg_index)
+        with torch._C.DisableTorchFunctionSubclass():
+            return func(*args, **kwargs)
+
+
+def _mock_lower_reading_used_args(
+    fn: Any,
+    arg_specs: Sequence[api.ShapeDtypeStruct],
+    *,
+    donate_argnums: Sequence[int] = (),
+    module_name: str | None = None,
+) -> str:
+    """Like `_mock_lower_torch_callable_to_mlir`, but `@main` reads only the
+    arguments that `fn` used, as the traced graph of a real lowering does."""
+    reads: set[int] = set()
+
+    def tracked(*args: torch.Tensor) -> Any:
+        wrapped = []
+        for i, a in enumerate(args):
+            t = a.as_subclass(_ReadTracker)
+            t.reads, t.arg_index = reads, i
+            wrapped.append(t)
+        return fn(*wrapped)
+
+    mlir = _mock_lower_torch_callable_to_mlir(
+        tracked, arg_specs, donate_argnums=donate_argnums, module_name=module_name
+    )
+    return "\n".join(
+        line
+        for line in mlir.split("\n")
+        if not (
+            "optimization_barrier" in line
+            and int(line.split("%arg")[1].split(")")[0]) not in reads
+        )
+    )
+
+
 def _export_mtp(tmp_path: Path, model_cls: type = _TinyMtpExportableLLM) -> str:
     cfg = api.TextOnlyLLMExportConfig(
         model_name="tiny-torch",
@@ -1975,7 +2022,7 @@ def _export_mtp(tmp_path: Path, model_cls: type = _TinyMtpExportableLLM) -> str:
     with mock.patch.object(
         tpu_lowering,
         "lower_torch_callable_to_mlir",
-        side_effect=_mock_lower_torch_callable_to_mlir,
+        side_effect=_mock_lower_reading_used_args,
     ):
         exporter.export(model_cls(cfg), out_dir)
     return out_dir
@@ -2023,6 +2070,9 @@ def test_mtp_draft_follows_the_contract(tmp_path) -> None:
     )
     assert by_name["lm_head.weight"]["index"] == logits_slots["lm_head.weight"]
     assert "mtp.fc.weight" not in forward_slots
+    # mtp_draft takes the weights it reads: the shared ones, then its own.
+    weights = [i["name"] for i in variant["inputs"] if i["argument_type"] == "weight"]
+    assert weights == ["model.embed_tokens.weight", "lm_head.weight", "mtp.fc.weight"]
     assert by_name["mtp.fc.weight"]["index"] not in forward_slots.values()
 
     # The MTP KV is a donated state numbered after the target's.
@@ -2037,8 +2087,20 @@ def test_mtp_draft_follows_the_contract(tmp_path) -> None:
 
 
 def test_mtp_needs_a_model_that_drafts(tmp_path) -> None:
-    with pytest.raises(ValueError, match="mtp_abstract_params"):
+    with pytest.raises(ValueError, match="mtp_abstract_states"):
         _export_mtp(tmp_path, model_cls=_TinyTorchExportableLLM)
+
+
+class _TinyMtpWithoutWeights(_TinyMtpExportableLLM):
+    """Drafts, but its parameters have no `mtp.` layer."""
+
+    def abstract_params(self) -> Mapping[str, api.ShapeDtypeStruct]:
+        return _TinyTorchExportableLLM.abstract_params(self)
+
+
+def test_mtp_needs_the_mtp_layer_among_the_parameters(tmp_path) -> None:
+    with pytest.raises(ValueError, match="no 'mtp.' parameters"):
+        _export_mtp(tmp_path, model_cls=_TinyMtpWithoutWeights)
 
 
 def test_validator_rejects_mtp_draft_missing_a_bucket(tmp_path) -> None:
