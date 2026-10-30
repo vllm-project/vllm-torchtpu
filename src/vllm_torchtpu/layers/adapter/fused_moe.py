@@ -22,11 +22,11 @@ import torch
 from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.kernels.megablox.gmm_v2 import (
-    LHS_SCALE_TRAILER_COLS,
-    quantize_lhs_rows,
+from vllm_torchtpu.kernels.megablox.gmm_v2 import LHS_SCALE_TRAILER_COLS
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import (
+    pack_row_pairs,
+    quantize_token_quads,
 )
-from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import pack_row_pairs
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     quantize_to_native_fp4_kmajor,
@@ -298,7 +298,7 @@ def _get_quantize_rows_op() -> Callable:
     global _quantize_rows_op
     if _quantize_rows_op is None:
         _quantize_rows_op = pallas.jax_op(
-            "pallas::moe_quantize_lhs_rows", quantize_lhs_rows
+            "pallas::moe_quantize_token_quads", quantize_token_quads
         )
         _quantize_rows_op.register_fake(
             lambda x: x.new_empty(
@@ -313,8 +313,9 @@ def quantize_hidden_rows(hidden_states: torch.Tensor) -> torch.Tensor:
     """bf16 ``[n, h]`` quantized to the fp8 rows the MoE's first matmul reads.
 
     Exactly the values and scales that matmul computes from the bf16 rows
-    (`gmm_v2.quantize_lhs_rows`), at half their bytes, as int32 row quads that
-    a collective and the dispatch move in their native tiling.
+    (`gmm_v2.quantize_lhs_rows`), at half their bytes, as int32 token quads
+    (`ragged_gather_v2.quantize_token_quads`) that a collective moves in their
+    native tiling and the dispatch gathers one row's bytes at a time.
     """
     return _get_quantize_rows_op()(hidden_states)
 

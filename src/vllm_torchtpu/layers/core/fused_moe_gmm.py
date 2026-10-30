@@ -48,7 +48,7 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import (
     pack_row_quads,
     ragged_gather_v2,
     unpack_row_pairs,
-    unpack_row_quads,
+    unpack_token_quads,
 )
 from vllm_torchtpu.logger import init_logger
 
@@ -308,8 +308,12 @@ def prepare_routed_gmm_inputs(
     onehot_moe_permute_threshold: int = 0,
     skip_padded_tokens: bool = False,
     packed_hidden_states_local: jax.Array | None = None,
+    packed_token_cols: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
+
+    ``packed_token_cols``: ``packed_hidden_states_local`` holds int8 rows as
+    `ragged_gather_v2.pack_token_quads` token quads.
 
     For non-EP runs `topk_indices_local` is always non-negative, so the
     valid-mask path computed below is a no-op (jnp.where on an all-True
@@ -415,6 +419,7 @@ def prepare_routed_gmm_inputs(
                 valid_count[None],
                 out_dtype=hidden_states_local.dtype,
                 packed_out=hidden_states_local.dtype == jnp.int8,
+                token_cols=packed_token_cols,
             )
     elif hidden_states_local.dtype == jnp.int8:
         x = pack_row_quads(hidden_states_local[token_indices_sorted])
@@ -643,8 +648,8 @@ def fused_moe_func(
 
     ``hidden_packed`` says ``hidden_states`` holds bf16 rows as
     `ragged_gather_v2.pack_row_pairs` int32. ``hidden_quantized`` says it holds
-    them as `gmm_v2.quantize_lhs_rows` int32, which the first matmul takes in
-    place of quantizing the bf16 rows itself, for the same result.
+    them as `ragged_gather_v2.quantize_token_quads` int32: the rows the first
+    matmul would quantize the bf16 rows to, which it takes in their place.
 
     For linear EP placement, ``experts_start`` is the first global expert id
     owned by this shard, passed as a 0-d int32 array (real traced data, not a
@@ -673,7 +678,9 @@ def fused_moe_func(
     if hidden_quantized:
         # As above; this view's rows are the int8 bytes of the fp8 rows.
         packed_hidden_states = hidden_states
-        hidden_states = unpack_row_quads(hidden_states)
+        hidden_states = unpack_token_quads(
+            hidden_states, hidden_states.shape[1] - LHS_SCALE_TRAILER_COLS
+        )
 
     # Convert 3D scale [experts, blocks, N] to 4D [experts, blocks, 1, N]
     # expected by gmm_v2.
@@ -756,6 +763,7 @@ def fused_moe_func(
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         skip_padded_tokens=skip_padded_tokens,
         packed_hidden_states_local=packed_hidden_states,
+        packed_token_cols=hidden_size if hidden_quantized else None,
     )
     if hidden_quantized:
         # x stays the int32 row quads gmm_v2 reads the fp8 rows through.

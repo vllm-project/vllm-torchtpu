@@ -21,6 +21,12 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
+from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    LHS_SCALE_TRAILER_COLS,
+    PREQUANTIZED_LHS_BLOCK_SIZE,
+    QUANTIZE_LHS_BLOCK_ROWS,
+    _quantize_lhs_rows_kernel,
+)
 from vllm_torchtpu.kernels.sparse_core import core_map_helper
 
 
@@ -334,6 +340,52 @@ def unpack_token_quads(packed: jax.Array, token_cols: int) -> jax.Array:
         ],
         axis=1,
     )
+
+
+def store_token_quads(quads_ref: jax.Ref, o_ref: jax.Ref, token_cols: int):
+    """In a TensorCore kernel: store row quads ``quads_ref`` as token quads."""
+    words = token_cols // 4
+    lanes = TOKEN_QUAD_LANES
+    for b in range(token_cols // TOKEN_QUAD_COLS):
+        rows = transpose_byte_quads(
+            tuple(
+                quads_ref[:, pl.ds(TOKEN_QUAD_COLS * b + lanes * j, lanes)]
+                for j in range(4)
+            )
+        )
+        for k, row in enumerate(rows):
+            o_ref[:, pl.ds(words * k + lanes * b, lanes)] = row
+    o_ref[:, token_cols:] = quads_ref[:, token_cols:]
+
+
+def _quantize_token_quads_kernel(x_ref, o_ref, quads_ref):
+    _quantize_lhs_rows_kernel(x_ref, quads_ref)
+    store_token_quads(quads_ref, o_ref, x_ref.shape[1])
+
+
+def quantize_token_quads(x: jax.Array, interpret: bool = False) -> jax.Array:
+    """`gmm_v2.quantize_lhs_rows`, stored as token quads.
+
+    The same values and scale trailer, bit for bit: ``unpack_token_quads(
+    quantize_token_quads(x), k)`` equals ``unpack_row_quads(quantize_lhs_rows(
+    x))``. `ragged_gather_v2` with ``token_cols=k`` turns a gather of these
+    rows back into the row quads `gmm_v2` reads.
+    """
+    rows, k = x.shape
+    assert x.dtype == jnp.bfloat16 and rows % 4 == 0, (x.dtype, rows)
+    assert k % PREQUANTIZED_LHS_BLOCK_SIZE == 0, k
+    block = min(QUANTIZE_LHS_BLOCK_ROWS, rows)
+    out_cols = k + LHS_SCALE_TRAILER_COLS
+    return pl.pallas_call(
+        _quantize_token_quads_kernel,
+        out_shape=jax.ShapeDtypeStruct((rows // 4, out_cols), jnp.int32),
+        grid=(pl.cdiv(rows, block),),
+        in_specs=[pl.BlockSpec((block, k), lambda i: (i, 0))],
+        out_specs=pl.BlockSpec((block // 4, out_cols), lambda i: (i, 0)),
+        scratch_shapes=[pltpu.VMEM((block // 4, out_cols), jnp.int32)],
+        interpret=interpret,
+        name="moe_quantize_token_quads",
+    )(x)
 
 
 def token_quads_kernel(
