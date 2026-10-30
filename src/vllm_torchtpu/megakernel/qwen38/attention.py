@@ -117,6 +117,7 @@ def local_attention(
     k_scale,
     v_scale,
     cores=1,
+    interleave=CHUNK,
     q_norm=None,
     rope=None,
     rotary_dim=0,
@@ -128,8 +129,9 @@ def local_attention(
     ``[tokens, Hkv * D]`` (FP8 with static scales ``k_scale`` / ``v_scale``,
     ``tokens`` a multiple of :data:`CHUNK`), ``q_flat`` / ``q_start`` as
     :func:`chunk_bounds` takes them. The keys are ``cores`` cores' blocks of
-    ``tokens / cores`` rows (core-major, as gathered), flat chunk ``j`` being
-    chunk ``j // cores`` of core ``j % cores``. Rows that see no key are zero.
+    ``tokens / cores`` rows (core-major, as gathered), dealt in runs of
+    ``interleave`` keys: flat run ``j`` is run ``j // cores`` of core
+    ``j % cores``. Rows that see no key are zero.
     ``interpret`` runs the kernel on the host.
 
     With ``q_norm`` (``[D]``) and ``rope`` (:func:`rope_tables`' ``(cos,
@@ -144,7 +146,8 @@ def local_attention(
     group = q_heads // kv_heads
     chunks = rows // CHUNK
     per_core = tokens // cores
-    assert BLOCK % CHUNK == 0 and tokens % BLOCK == 0 and per_core % CHUNK == 0
+    assert BLOCK % CHUNK == 0 and tokens % BLOCK == 0
+    assert BLOCK % interleave == 0 and per_core % interleave == 0
     lo, hi, whole_lo, whole_hi = chunk_bounds(q_flat, q_start, tokens)
     q_scale = sm_scale * math.log2(math.e)
     fused = q_norm is not None
@@ -177,19 +180,20 @@ def local_attention(
         start = start_ref[pl.ds(c, 1), :].reshape(CHUNK, 1, 1)
 
         def kv_copies(h, j, slot):
-            """Head ``h``'s keys and values of block ``j``: its chunks, each
+            """Head ``h``'s keys and values of block ``j``: its runs, each
             from the core holding it."""
             lanes = pl.ds(pl.multiple_of(h * dim, dim), dim)
+            runs = BLOCK // interleave
             copies = []
-            for part in range(per):
-                chunk = j * per + part
-                offset = lax.rem(chunk, cores) * per_core + chunk // cores * CHUNK
-                keys = pl.ds(pl.multiple_of(offset, CHUNK), CHUNK)
+            for part in range(runs):
+                run = j * runs + part
+                offset = lax.rem(run, cores) * per_core + run // cores * interleave
+                keys = pl.ds(pl.multiple_of(offset, interleave), interleave)
                 for i, (src, dst) in enumerate(((k_hbm, k_vmem), (v_hbm, v_vmem))):
                     copies.append(
                         pltpu.make_async_copy(
                             src.at[keys, lanes],
-                            dst.at[slot, pl.ds(part * CHUNK, CHUNK)],
+                            dst.at[slot, pl.ds(part * interleave, interleave)],
                             kv_sems.at[i, slot],
                         )
                     )
@@ -462,6 +466,7 @@ def stage_attention(
     *,
     sm_scale,
     kv_layout,
+    interleave,
     q_norm,
     rotary_dim,
     eps,
@@ -473,10 +478,11 @@ def stage_attention(
     ``k`` / ``v`` ``[tokens, heads, D]`` (BF16, the stage's rank-major rows
     along ``axis``), ``kv_cache`` as
     ``pcp_streaming_rpa.wrapper.sharded_pcp_ragged_paged_attention`` takes it
-    (unit KV scales) and the step's :func:`attention_plan`. Every core
-    gathers every new key and value (``prologue.all_gather`` over ``ring``)
-    and runs :func:`local_attention` on its rows; each core writes the rows
-    of the cache pages it owns, as the streaming kernel captures them."""
+    (unit KV scales) and the step's :func:`attention_plan`; the stage deals
+    its rows in runs of ``interleave`` tokens. Every core gathers every new
+    key and value (``prologue.all_gather`` over ``ring``) and runs
+    :func:`local_attention` on its rows; each core writes the rows of the
+    cache pages it owns, as the streaming kernel captures them."""
     from jax.sharding import PartitionSpec as P
 
     from vllm_torchtpu.megakernel.qwen38.prologue import all_gather
@@ -498,6 +504,7 @@ def stage_attention(
             k_scale=1.0,
             v_scale=1.0,
             cores=cores,
+            interleave=interleave,
             q_norm=q_norm,
             rope=(cos, sin),
             rotary_dim=rotary_dim,

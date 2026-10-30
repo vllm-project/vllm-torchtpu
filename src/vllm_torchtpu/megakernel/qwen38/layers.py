@@ -419,6 +419,7 @@ def attention_mixer(
             plan,
             sm_scale=d.head_dim**-0.5,
             kv_layout=kv_layout,
+            interleave=g.chunk,
             q_norm=w["q_norm"],
             rotary_dim=d.rotary_dim,
             eps=d.eps,
