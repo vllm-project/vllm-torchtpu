@@ -68,6 +68,7 @@ from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4Config, Mxfp4MoEM
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.tpu_communicator import gather_topk
 from vllm_torchtpu.layers.adapter import moe_routing
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
@@ -438,8 +439,6 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             or moe.dp_size == 1
             or moe.is_sequence_parallel
             or moe.pcp_size > 1
-            # Routing below sees only the gathered rows' count and dtype.
-            or layer.custom_routing_function is not None
         ):
             return None
 
@@ -855,25 +854,16 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None,
     ) -> torch.Tensor:
-        """vLLM's naive DP dispatch and combine around the GMM path, with this
-        rank's rows quantized before the gather instead of inside the GMM."""
+        """The routed-first DP dispatch and combine around the GMM path, with
+        this rank's rows quantized before the gather instead of inside the GMM."""
+        topk_weights, topk_ids = moe_routing.route(
+            layer, x, router_logits, input_ids=input_ids
+        )
         dp_group = get_dp_group()
         rows, rows_scale = self._dispatch_quantizer(x)
         rows = dp_group.all_gather(rows, dim=0)
         rows_scale = dp_group.all_gather(rows_scale, dim=0)
-        router_logits = dp_group.all_gather(router_logits, dim=0)
-        # The model hands an owning layer its own rows' ids; hash routing
-        # reads the gathered rows'.
-        if (
-            input_ids is not None
-            and getattr(layer, "hash_indices_table", None) is not None
-        ):
-            input_ids = dp_group.all_gather(input_ids, dim=0)
-        # Routing reads its hidden states only for their row count and dtype.
-        gathered_x = x.new_empty((rows.shape[0], 0))
-        topk_weights, topk_ids = moe_routing.route(
-            layer, gathered_x, router_logits, input_ids=input_ids
-        )
+        topk_weights, topk_ids = gather_topk(dp_group, topk_weights, topk_ids)
         out = fused_moe_gmm(
             hidden_states=rows,
             w1=layer.w13_weight,

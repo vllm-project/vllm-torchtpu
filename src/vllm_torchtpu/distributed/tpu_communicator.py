@@ -49,7 +49,7 @@ def _gather_hidden_states(
     return group.all_gather(_pin_compact_tiling_op(hidden_states), dim=0)
 
 
-def _gather_topk(
+def gather_topk(
     group: GroupCoordinator, topk_weights: torch.Tensor, topk_ids: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """All-gather the top-k weights and ids as one int32 collective.
@@ -124,7 +124,7 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         if group is None:
             return hidden_states, topk_weights, topk_ids
         hidden_states = _gather_hidden_states(group, hidden_states)
-        topk_weights, topk_ids = _gather_topk(group, topk_weights, topk_ids)
+        topk_weights, topk_ids = gather_topk(group, topk_weights, topk_ids)
         return hidden_states, topk_weights, topk_ids
 
     def combine(
