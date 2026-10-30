@@ -48,6 +48,7 @@ def _scheduler(
     scheduler = TpuPipelineChunkScheduler.__new__(TpuPipelineChunkScheduler)
     scheduler._cost = cost
     scheduler._step_limit = step_limit
+    scheduler._step_target = None
     scheduler._pp_size = 8
     scheduler.waiting = list(waiting)
     scheduler.kv_holding_waiting = list(kv_holding_waiting)
@@ -294,6 +295,46 @@ def test_the_step_limit_keeps_a_prompt_whole_when_halves_are_no_faster():
         scheduler.waiting = [_request(0, 8192, f"w{i}") for i in range(3)]
         scheduler.schedule()
         assert scheduler._step_limit == 8192
+
+
+def _pipeline_model() -> StepCostModel:
+    # A PP4 x PCP8 prefill stage's costs (ms): eighth-step buckets, a
+    # history attention slope.
+    linear = {
+        4480: 104.0,
+        8960: 138.0,
+        13440: 173.0,
+        17920: 215.0,
+        22400: 261.0,
+        26880: 307.0,
+        31360: 354.0,
+        32768: 354.0,
+    }
+    return StepCostModel(sorted(linear), linear, 8e-8, 1.1 * 354.0, 4480)
+
+
+def test_a_lone_long_prompt_sizes_its_chunks_to_leave_the_pipeline_soonest():
+    model = _pipeline_model()
+    scheduler = _scheduler(cost=model, running=[_request(0, 131072)])
+    scheduler._pp_size = 4
+    target = scheduler._lone_prompt_target()
+    assert target is not None and target < model.target_ms
+    lockstep = pp_chunk_scheduler._lockstep_ms
+    assert lockstep(model, 0, 131072, target, 4) < lockstep(
+        model, 0, 131072, model.target_ms, 4
+    )
+
+
+def test_other_work_keeps_the_models_target():
+    model = _pipeline_model()
+    for running, waiting in (
+        ([_request(0, 131072)], [_request(0, 8192, "w")]),
+        ([_request(0, 131072), _decode("d")], []),
+        ([_request(0, 20000)], []),  # within one full step
+    ):
+        scheduler = _scheduler(cost=model, running=running, waiting=waiting)
+        scheduler._pp_size = 4
+        assert scheduler._lone_prompt_target() is None
 
 
 def test_schedule_resets_the_step_accounting():

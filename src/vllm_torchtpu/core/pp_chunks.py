@@ -225,6 +225,7 @@ class StepCostModel:
         step_squares: float,
         step_limit: int | None = None,
         step_schedule: int = 0,
+        target_ms: float | None = None,
     ) -> int:
         """Largest chunk of a request with ``prefix`` computed tokens and
         ``remaining`` tokens to prefill that keeps a step already holding
@@ -235,9 +236,10 @@ class StepCostModel:
         room, since a run of tiny steps costs more than the balance it buys;
         ``step_limit`` keeps the step within a smaller bucket, and with a
         schedule capacity the chunk's attention pairs must fit beside the
-        ``step_schedule`` pairs already in the step. 0 when nothing
-        fits."""
+        ``step_schedule`` pairs already in the step; ``target_ms`` replaces
+        the model's target. 0 when nothing fits."""
         best = 0
+        target = self.target_ms if target_ms is None else target_ms
         attn = self.attn_ms_per_token_pair
         floor = min(remaining, self.buckets[-1] // 4)
         for bucket in self.buckets:
@@ -246,7 +248,7 @@ class StepCostModel:
             room = bucket - step_tokens
             if room <= 0:
                 continue
-            spare = self.target_ms - self.step_ms(bucket, step_pairs, step_squares)
+            spare = target - self.step_ms(bucket, step_pairs, step_squares)
             if spare < 0:
                 continue
             fit = min(remaining, room)

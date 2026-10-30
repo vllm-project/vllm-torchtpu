@@ -64,6 +64,7 @@ class TpuPipelineChunkScheduler(Scheduler):
         super().__init__(*args, **kwargs)
         self._cost: StepCostModel | None = None
         self._step_limit: int | None = None
+        self._step_target: float | None = None
         self._pp_size = 1
         self._mamba_split = self.need_mamba_block_aligned_split
         self.need_mamba_block_aligned_split = True
@@ -95,6 +96,7 @@ class TpuPipelineChunkScheduler(Scheduler):
         self._step_schedule = 0
         self._seeded = set()
         self._step_limit = self._pending_step_limit()
+        self._step_target = self._lone_prompt_target()
         # Every running request past its prefill with a token left to
         # compute takes it this step; count them before the loop sizes any
         # prefill chunk. A request whose last chunk is still in flight has
@@ -161,6 +163,39 @@ class TpuPipelineChunkScheduler(Scheduler):
                 limit, soonest = share, done_ms
         return limit
 
+    def _lone_prompt_target(self) -> float | None:
+        """The step time to size chunks against when one prompt longer than
+        a full step is all the pending work: the stages advance in lockstep,
+        so the prompt leaves the pipeline about ``stages - 1`` of its longest
+        steps after its work, and steps of equal time keep that short. Of
+        targets between the smallest step and the full one, the one whose
+        chunks the model gets through the pipeline soonest is taken. None
+        (the model's target) otherwise."""
+        cost = self._cost
+        if cost is None:
+            return None
+        pending = []
+        for queue in (self.running, self.waiting, self.kv_holding_waiting):
+            for request in queue:
+                if request.num_computed_tokens < _prefill_end(request):
+                    pending.append(request)
+                elif request.num_tokens > request.num_computed_tokens:
+                    return None  # a decode shares the steps
+        if len(pending) != 1:
+            return None
+        prefix = pending[0].num_computed_tokens
+        end = _prefill_end(pending[0])
+        if end - prefix <= cost.buckets[-1]:
+            return None
+        low = min(cost.linear_ms.values())
+        best, soonest = None, math.inf
+        for i in range(_TARGETS + 1):
+            target = low + (cost.target_ms - low) * i / _TARGETS
+            done = _lockstep_ms(cost, prefix, end, target, self._pp_size)
+            if done <= soonest:
+                best, soonest = target, done
+        return best
+
     def _mamba_block_aligned_split(
         self,
         request: Any,
@@ -186,6 +221,7 @@ class TpuPipelineChunkScheduler(Scheduler):
                 self._step_squares,
                 self._step_limit,
                 self._step_schedule,
+                self._step_target,
             )
             if cap == 0 and self._step_prefill_tokens == 0:
                 # The first prefill chunk of a step always advances.
@@ -216,6 +252,28 @@ class TpuPipelineChunkScheduler(Scheduler):
         if self._cost is not None:
             self._step_schedule += self._cost.pairs(num_new_tokens, start)
         return num_new_tokens
+
+
+_TARGETS = 24  # step targets a lone prompt's chunks are tried against
+
+
+def _lockstep_ms(
+    cost: StepCostModel, prefix: int, end: int, target: float, stages: int
+) -> float:
+    """Modelled time for positions ``[prefix, end)`` of one prompt to leave
+    a lockstep pipeline of ``stages`` stages, its chunks sized against
+    ``target``: each wave lasts as long as the slowest step in flight."""
+    times = []
+    while prefix < end:
+        chunk = cost.chunk(prefix, end - prefix, 0, 0.0, 0.0, target_ms=target)
+        chunk = chunk or min(end - prefix, cost.granularity)
+        bucket = next((b for b in cost.buckets if b >= chunk), cost.buckets[-1])
+        times.append(cost.step_ms(bucket, float(chunk) * prefix, float(chunk) * chunk))
+        prefix += chunk
+    return sum(
+        max(times[max(0, wave - stages + 1) : wave + 1])
+        for wave in range(len(times) + stages - 1)
+    )
 
 
 def profile_and_install_cost_model(scheduler: Any, executor: Any) -> None:
