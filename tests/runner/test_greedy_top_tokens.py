@@ -28,7 +28,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.sampling_params import StructuredOutputsParams
 
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
-from vllm_torchtpu.runner import greedy_top_tokens
+from vllm_torchtpu.runner import greedy_top_tokens, min_tokens
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
@@ -137,6 +137,7 @@ def _batch(*params, max_num_logprobs=None):
         all_greedy=all(p.temperature == 0 for p in params),
         max_num_logprobs=max_num_logprobs,
         req_ids=[*requests, None],
+        req_id_to_index={r: i for i, r in enumerate(requests)},
     )
     return input_batch, requests
 
@@ -193,6 +194,7 @@ def _runner(weight, speculative_config=None):
     runner.model = SimpleNamespace(compute_logits=lambda h: h @ weight.T)
     runner._greedy_head_owner = owner
     runner.speculative_config = speculative_config
+    runner._min_tokens = min_tokens.MinTokensTracker()
     return runner
 
 

@@ -16,6 +16,7 @@ structured_decoding's num_reqs sweep): shape order with and without
 TPU_PARALLEL_PRECOMPILE, and why rotating them is safe."""
 
 import contextlib
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -42,7 +43,7 @@ def _runner(seen):
         grammar_bitmask_cpu=torch.zeros(PADDINGS[-1], 1, dtype=torch.int32),
         structured_decode=lambda *args: args[2],
     )
-    return SimpleNamespace(
+    runner = SimpleNamespace(
         num_reqs_paddings=PADDINGS,
         device="cpu",
         _hidden_states_dtype=torch.float32,
@@ -54,6 +55,11 @@ def _runner(seen):
         structured_decoding_manager=manager,
         speculative_config=None,
     )
+    # The real helper; without a speculative config it yields no verify rows.
+    runner._verify_logits_paddings = types.MethodType(
+        TPUModelRunner._verify_logits_paddings, runner
+    )
+    return runner
 
 
 SWEEPS = [
