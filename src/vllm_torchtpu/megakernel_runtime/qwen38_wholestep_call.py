@@ -85,14 +85,16 @@ def wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
     An f32 GDN state (`VLLM_TPU_MK_GDN_REC_F32=1`) on the WIDE rows (17..47) misses by 0.43 MiB
     (j-f4f467fc: 64.37M at qwen38_mk_whole_b32; 2.16 MiB in tpu_bench_wholestep_call j-5ae41ffb,
     where one expert slot fell 8 KiB short): the chunked GDN state ring (f32 chunk 3 MiB) drops
-    from 3 to 2 buffers there; scheduling only."""
+    from 3 to 2 buffers there; scheduling only. Up to 16 rows (whole-state path, f32 `recb`) it
+    misses by 0.30 MiB (j-4aeaf924: 62.30M at qwen38_mk_whole_b16): one more expert slot."""
     if B >= 48:
         return segment_tiles(B, rings=(6, 4))
     if REC == F32 and B > 16:
         return segment_tiles(B).with_blocks({"gdn": {"gdn_bufs": 2}})
-    if B <= 16 and max_groups > 32768:
+    if B <= 16 and (max_groups > 32768 or REC == F32):
         nbe, nbd = ring_depths(B)
-        return segment_tiles(B, rings=(nbe - 1, nbd))
+        drop = int(max_groups > 32768) + int(REC == F32)
+        return segment_tiles(B, rings=(nbe - drop, nbd))
     return segment_tiles(B)
 
 
