@@ -397,3 +397,55 @@ def test_proposed_drafts_reach_next_inputs(device, k, mode):
     assert actual == expected, (
         "a non-verify chunk must carry its real proposals into the next step"
     )
+
+
+@pytest.mark.parametrize("num_groups", [1, 2])
+@pytest.mark.parametrize(
+    "width,rows,num_reqs",
+    [(4, 2, 2), (4, 4, 4), (4, 6, 3)],
+)
+def test_update_read_offsets_compiled_matches_eager(
+    device, num_groups, width, rows, num_reqs
+):
+    """_update_read_offsets_compiled scatters identical offsets to the CPU
+    reference across 1 vs 2 groups, rows < / == / > width, and padded tails."""
+    from vllm_torchtpu.runner import tpu_runner
+    from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
+
+    num_blocks = 24
+    raw_slots = [[2, 5, 8, 11], [14, 17, 19, 22]]
+    groups_cpu = [
+        torch.tensor(
+            [raw_slots[g][i] if i < num_reqs else 0 for i in range(width)],
+            dtype=torch.int32,
+        )
+        for g in range(num_groups)
+    ]
+    token_rows = [
+        [10, 11, 12, 13],
+        [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID, INVALID_TOKEN_ID],
+        [30, 31, INVALID_TOKEN_ID, INVALID_TOKEN_ID],
+        [40, 41, 42, INVALID_TOKEN_ID],
+        [50, 51, 52, 53],
+        [INVALID_TOKEN_ID] * 4,
+    ]
+    next_tokens_cpu = torch.tensor(token_rows[:rows], dtype=torch.int32)
+
+    expected = torch.full((num_blocks,), 7, dtype=torch.int32)
+    expected[0] = 0
+    tpu_runner._update_read_offsets_impl(
+        expected,
+        groups_cpu,
+        next_tokens_cpu,
+        torch.tensor(num_reqs, dtype=torch.int64),
+    )
+
+    actual = torch.full((num_blocks,), 7, dtype=torch.int32, device=device)
+    actual[0] = 0
+    tpu_runner._update_read_offsets_compiled(
+        actual,
+        [g.to(device) for g in groups_cpu],
+        next_tokens_cpu.to(device),
+        torch.tensor(num_reqs, dtype=torch.int64, device=device),
+    )
+    assert actual.cpu().tolist() == expected.tolist()
