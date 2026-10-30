@@ -107,6 +107,7 @@ if TYPE_CHECKING:
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
+    TPU_MOE_ONEHOT_COMBINE_SORTED: bool = False
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
@@ -1114,6 +1115,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # its dtype, alignment, and VMEM safety checks.
     "TPU_MOE_OWNER_OUTPUT_MODE": env_with_choices(
         "TPU_MOE_OWNER_OUTPUT_MODE", "off", ["off", "on"], case_sensitive=False
+    ),
+    # Dense one-hot combine (TPU_MOE_OWNER_OUTPUT_MODE off): build the
+    # [tokens, routes] combine matrix from the permute's sorted token ids, one
+    # entry per route, instead of a one-hot over [tokens, topk, routes] summed
+    # over topk (topk times the elementwise work, written to HBM and read back
+    # by the matmul). Same matrix entries.
+    "TPU_MOE_ONEHOT_COMBINE_SORTED": env_bool(
+        "TPU_MOE_ONEHOT_COMBINE_SORTED", default=False
     ),
     # Maximum hidden-state row count (after any EP all-gather) for dense
     # expert MoE. 0 disables it; larger shapes and unsupported layouts use
