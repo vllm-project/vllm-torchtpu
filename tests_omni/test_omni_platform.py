@@ -945,3 +945,397 @@ def test_ltx2_split_rope_tables_reused_for_coords_views(ltx2, table_syncs, infer
 def test_supports_talker_mtp_graph_capture_disabled():
     assert OmniTpuPlatform.supports_talker_mtp_graph_capture() is False
     assert OmniTpuPlatform().supports_talker_mtp_graph_capture() is False
+
+
+def test_set_and_unset_device_control_env_var_single_chip(monkeypatch):
+    monkeypatch.setattr(OmniTpuPlatform, "_saved_spawn_env", None)
+    monkeypatch.delenv("TPU_VISIBLE_CHIPS", raising=False)
+    monkeypatch.setenv("TPU_VISIBLE_DEVICES", "0")
+    monkeypatch.setenv("TPU_RUNTIME_METRICS_PORTS", "8431,8432")
+    monkeypatch.setenv("ALLOW_MULTIPLE_LIBTPU_LOAD", "0")
+    monkeypatch.setenv("DEBUG_TPU_LOCAL_RANK_OFFSET", "4")
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("RANK", "1")
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "localhost:29501")
+    monkeypatch.setenv("TORCH_TPU_TOPOLOGY", "2x1x1")
+    monkeypatch.setenv("TORCH_TPU_XPROF_SESSION_ID", "session-parent")
+
+    OmniTpuPlatform.set_device_control_env_var("2")
+    assert os.environ["TPU_VISIBLE_CHIPS"] == "2"
+    assert os.environ["TPU_VISIBLE_DEVICES"] == "2"
+    assert os.environ["TPU_RUNTIME_METRICS_PORTS"] == "8433"
+    assert os.environ["ALLOW_MULTIPLE_LIBTPU_LOAD"] == "1"
+    for cleared in (
+        "DEBUG_TPU_LOCAL_RANK_OFFSET",
+        "WORLD_SIZE",
+        "RANK",
+        "LOCAL_RANK",
+        "LOCAL_WORLD_SIZE",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+        "TORCH_TPU_TOPOLOGY",
+    ):
+        assert cleared not in os.environ
+
+    # Integer chip IDs work identically without overwriting _saved_spawn_env.
+    OmniTpuPlatform.set_device_control_env_var(3)
+    assert os.environ["TPU_VISIBLE_CHIPS"] == "3"
+    assert os.environ["TPU_VISIBLE_DEVICES"] == "3"
+    assert os.environ["TPU_RUNTIME_METRICS_PORTS"] == "8434"
+
+    OmniTpuPlatform.unset_device_control_env_var()
+    assert "TPU_VISIBLE_CHIPS" not in os.environ
+    assert os.environ["TPU_VISIBLE_DEVICES"] == "0"
+    assert os.environ["TPU_RUNTIME_METRICS_PORTS"] == "8431,8432"
+    assert os.environ["ALLOW_MULTIPLE_LIBTPU_LOAD"] == "0"
+    assert os.environ["DEBUG_TPU_LOCAL_RANK_OFFSET"] == "4"
+    assert os.environ["WORLD_SIZE"] == "2"
+    assert os.environ["RANK"] == "1"
+    assert os.environ["LOCAL_RANK"] == "1"
+    assert os.environ["LOCAL_WORLD_SIZE"] == "2"
+    assert os.environ["MASTER_ADDR"] == "127.0.0.1"
+    assert os.environ["MASTER_PORT"] == "29500"
+    assert os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == "localhost:29501"
+    assert os.environ["TORCH_TPU_TOPOLOGY"] == "2x1x1"
+    assert os.environ["TORCH_TPU_XPROF_SESSION_ID"] == "session-parent"
+
+    # A second unset call is idempotent and preserves restored outer env vars.
+    OmniTpuPlatform.unset_device_control_env_var()
+    assert os.environ["TPU_VISIBLE_DEVICES"] == "0"
+    assert os.environ["TPU_RUNTIME_METRICS_PORTS"] == "8431,8432"
+    assert os.environ["ALLOW_MULTIPLE_LIBTPU_LOAD"] == "0"
+
+
+def test_set_device_control_env_var_multi_chip_and_empty(monkeypatch):
+    monkeypatch.setattr(OmniTpuPlatform, "_saved_spawn_env", None)
+    for key in (
+        "TPU_VISIBLE_CHIPS",
+        "TPU_VISIBLE_DEVICES",
+        "TPU_RUNTIME_METRICS_PORTS",
+        "ALLOW_MULTIPLE_LIBTPU_LOAD",
+        "DEBUG_TPU_LOCAL_RANK_OFFSET",
+        "WORLD_SIZE",
+        "RANK",
+        "LOCAL_RANK",
+        "LOCAL_WORLD_SIZE",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+        "TORCH_TPU_TOPOLOGY",
+        "TORCH_TPU_XPROF_SESSION_ID",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    prepared_world_sizes: list[int] = []
+    monkeypatch.setattr(OmniTpuPlatform, "device_count", classmethod(lambda cls: 8))
+    monkeypatch.setattr(
+        OmniTpuPlatform,
+        "_prepare_singlehost_tpu_env",
+        classmethod(lambda cls, ws: prepared_world_sizes.append(ws)),
+    )
+
+    # Contiguous multi-chip slice uses DEBUG_TPU_LOCAL_RANK_OFFSET and never
+    # sets TPU_VISIBLE_DEVICES to a comma-separated list.
+    OmniTpuPlatform.set_device_control_env_var("4, 5, 6, 7")
+    assert os.environ["TPU_VISIBLE_CHIPS"] == "4,5,6,7"
+    assert "TPU_VISIBLE_DEVICES" not in os.environ
+    assert os.environ["TPU_RUNTIME_METRICS_PORTS"] == "8435,8436,8437,8438"
+    assert os.environ["ALLOW_MULTIPLE_LIBTPU_LOAD"] == "1"
+    assert os.environ["DEBUG_TPU_LOCAL_RANK_OFFSET"] == "4"
+    assert prepared_world_sizes == [4]
+
+    # Empty / None clears active chips and any inherited distributed bootstrap
+    # vars without running multi-host bootstrap.
+    os.environ["WORLD_SIZE"] = "4"
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "29500"
+    os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = "localhost:29501"
+    os.environ["TORCH_TPU_TOPOLOGY"] = "2x2x1"
+    for empty_val in ("", "   ", None):
+        OmniTpuPlatform.set_device_control_env_var(empty_val)
+        assert os.environ["TPU_VISIBLE_CHIPS"] == ""
+        assert os.environ["TPU_VISIBLE_DEVICES"] == ""
+        assert os.environ["TPU_RUNTIME_METRICS_PORTS"] == ""
+        assert "DEBUG_TPU_LOCAL_RANK_OFFSET" not in os.environ
+        assert "WORLD_SIZE" not in os.environ
+        assert "MASTER_ADDR" not in os.environ
+        assert "MASTER_PORT" not in os.environ
+        assert "TORCH_TPU_SLICEBUILDER_ADDRESSES" not in os.environ
+        assert "TORCH_TPU_TOPOLOGY" not in os.environ
+    assert prepared_world_sizes == [4]
+
+    OmniTpuPlatform.unset_device_control_env_var()
+    for key in (
+        "TPU_VISIBLE_CHIPS",
+        "TPU_VISIBLE_DEVICES",
+        "TPU_RUNTIME_METRICS_PORTS",
+        "ALLOW_MULTIPLE_LIBTPU_LOAD",
+        "DEBUG_TPU_LOCAL_RANK_OFFSET",
+    ):
+        assert key not in os.environ
+
+
+@pytest.mark.parametrize(
+    "bad_devices",
+    ["abc", "-1", "0,", ",1", "1,,2", "1,1", "0,2", "3,2", True, False],
+)
+def test_set_device_control_env_var_invalid_inputs_atomic(monkeypatch, bad_devices):
+    monkeypatch.setattr(OmniTpuPlatform, "_saved_spawn_env", None)
+    monkeypatch.setenv("TPU_VISIBLE_DEVICES", "0")
+    monkeypatch.delenv("TPU_VISIBLE_CHIPS", raising=False)
+
+    with pytest.raises(ValueError, match="Invalid TPU visible devices specification"):
+        OmniTpuPlatform.set_device_control_env_var(bad_devices)
+
+    assert OmniTpuPlatform._saved_spawn_env is None
+    assert "TPU_VISIBLE_CHIPS" not in os.environ
+    assert os.environ["TPU_VISIBLE_DEVICES"] == "0"
+
+
+def test_scoped_spawn_device_env_roundtrip(monkeypatch):
+    import threading
+
+    from vllm_omni.engine import stage_engine_startup
+
+    platform = OmniTpuPlatform()
+    monkeypatch.setattr(stage_engine_startup, "current_omni_platform", platform)
+    monkeypatch.setattr(OmniTpuPlatform, "_saved_spawn_env", None)
+    monkeypatch.delenv("TPU_VISIBLE_CHIPS", raising=False)
+    monkeypatch.delenv("TPU_RUNTIME_METRICS_PORTS", raising=False)
+    monkeypatch.setenv("ALLOW_MULTIPLE_LIBTPU_LOAD", "1")
+    monkeypatch.setenv("TPU_VISIBLE_DEVICES", "0")
+
+    lock = threading.Lock()
+    with stage_engine_startup.scoped_spawn_device_env(
+        "1", lock, stage_id=1, replica_id=0
+    ):
+        assert os.environ["TPU_VISIBLE_CHIPS"] == "1"
+        assert os.environ["TPU_VISIBLE_DEVICES"] == "1"
+        assert os.environ["TPU_RUNTIME_METRICS_PORTS"] == "8432"
+        assert os.environ["ALLOW_MULTIPLE_LIBTPU_LOAD"] == "1"
+
+    assert "TPU_VISIBLE_CHIPS" not in os.environ
+    assert "TPU_RUNTIME_METRICS_PORTS" not in os.environ
+    assert os.environ["TPU_VISIBLE_DEVICES"] == "0"
+    assert os.environ["ALLOW_MULTIPLE_LIBTPU_LOAD"] == "1"
+    assert OmniTpuPlatform._saved_spawn_env is None
+
+    # Also check restoration when TPU_VISIBLE_CHIPS was pre-set in parent
+    # (both multi-chip and same-chip cases): scoped_spawn_device_env's finally
+    # calls set_device_control_env_var(previous_visible_devices), which must
+    # restore the exact pre-spawn parent state without running multi-chip PjRt
+    # bootstrap in the parent orchestrator or leaving _saved_spawn_env dirty.
+    prepared_world_sizes: list[int] = []
+    monkeypatch.setattr(OmniTpuPlatform, "device_count", classmethod(lambda cls: 8))
+    monkeypatch.setattr(
+        OmniTpuPlatform,
+        "_prepare_singlehost_tpu_env",
+        classmethod(lambda cls, ws: prepared_world_sizes.append(ws)),
+    )
+    monkeypatch.setenv("TPU_VISIBLE_CHIPS", "0,1")
+    with stage_engine_startup.scoped_spawn_device_env(
+        "1", lock, stage_id=1, replica_id=0
+    ):
+        assert os.environ["TPU_VISIBLE_CHIPS"] == "1"
+        assert os.environ["TPU_VISIBLE_DEVICES"] == "1"
+        assert os.environ["TPU_RUNTIME_METRICS_PORTS"] == "8432"
+
+    assert os.environ["TPU_VISIBLE_CHIPS"] == "0,1"
+    assert os.environ["TPU_VISIBLE_DEVICES"] == "0"
+    assert "TPU_RUNTIME_METRICS_PORTS" not in os.environ
+    assert "DEBUG_TPU_LOCAL_RANK_OFFSET" not in os.environ
+    assert prepared_world_sizes == []
+    assert OmniTpuPlatform._saved_spawn_env is None
+
+    # Same-chip case: parent TPU_VISIBLE_CHIPS="0" and stage_visible_devices="0".
+    monkeypatch.setenv("TPU_VISIBLE_CHIPS", "0")
+    with stage_engine_startup.scoped_spawn_device_env(
+        "0", lock, stage_id=0, replica_id=0
+    ):
+        assert os.environ["TPU_VISIBLE_CHIPS"] == "0"
+        assert os.environ["TPU_VISIBLE_DEVICES"] == "0"
+        assert os.environ["TPU_RUNTIME_METRICS_PORTS"] == "8431"
+        assert os.environ["ALLOW_MULTIPLE_LIBTPU_LOAD"] == "1"
+
+    assert os.environ["TPU_VISIBLE_CHIPS"] == "0"
+    assert os.environ["TPU_VISIBLE_DEVICES"] == "0"
+    assert "TPU_RUNTIME_METRICS_PORTS" not in os.environ
+    assert OmniTpuPlatform._saved_spawn_env is None
+
+
+def _find_free_tpu_chips(num_chips: int, needed: int = 2) -> list[str]:
+    """Return unheld TPU chip IDs, preferring non-zero chips first."""
+    from tests.tpu_release import tpu_device_owners
+
+    owners = tpu_device_owners()
+    candidates = [*range(1, num_chips), 0]
+    free: list[str] = []
+    for chip_id in candidates:
+        vfio_path = f"/dev/vfio/{chip_id}"
+        accel_path = f"/dev/accel{chip_id}"
+        if os.path.exists(vfio_path):
+            try:
+                fd = os.open(vfio_path, os.O_RDWR)
+            except OSError:
+                continue
+            os.close(fd)
+        elif accel_path in owners:
+            continue
+        free.append(str(chip_id))
+        if len(free) == needed:
+            break
+    return free
+
+
+def _tpu_stage_probe_worker(barrier, result_queue, stage_id: int) -> None:
+    import os
+
+    import torch
+    import torch_tpu  # noqa: F401
+
+    if barrier is not None:
+        barrier.wait(timeout=60)
+    x = torch.full((4,), float(stage_id + 1), device=torch.device("tpu"))
+    y = (x * 2.0).cpu().tolist()
+    torch.accelerator.synchronize()
+    if barrier is not None:
+        barrier.wait(timeout=60)
+    result_queue.put(
+        (
+            stage_id,
+            os.environ.get("TPU_VISIBLE_CHIPS"),
+            os.environ.get("TPU_VISIBLE_DEVICES"),
+            os.environ.get("TPU_RUNTIME_METRICS_PORTS"),
+            os.environ.get("ALLOW_MULTIPLE_LIBTPU_LOAD"),
+            y,
+        )
+    )
+
+
+@pytest.mark.spawns_tpu_workers
+@pytest.mark.tpu_test
+def test_tpu_single_stage_subprocess_chip_pinning(monkeypatch):
+    import multiprocessing as mp
+    import threading
+
+    from vllm_omni.engine import stage_engine_startup
+
+    num_chips = OmniTpuPlatform.device_count()
+    if num_chips < 1:
+        pytest.skip("Requires at least 1 TPU chip")
+
+    free_chips = _find_free_tpu_chips(num_chips, needed=1)
+    if not free_chips:
+        pytest.skip(f"Requires 1 free TPU chip on {num_chips}-chip host")
+    chip_0 = free_chips[0]
+
+    platform = OmniTpuPlatform()
+    monkeypatch.setattr(stage_engine_startup, "current_omni_platform", platform)
+    monkeypatch.setattr(OmniTpuPlatform, "_saved_spawn_env", None)
+    monkeypatch.delenv("TPU_VISIBLE_CHIPS", raising=False)
+
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    lock = threading.Lock()
+
+    with stage_engine_startup.scoped_spawn_device_env(
+        chip_0, lock, stage_id=0, replica_id=0
+    ):
+        proc = ctx.Process(target=_tpu_stage_probe_worker, args=(None, result_queue, 0))
+        proc.start()
+
+    assert "TPU_VISIBLE_CHIPS" not in os.environ
+    assert OmniTpuPlatform._saved_spawn_env is None
+
+    proc.join(timeout=120)
+    assert proc.exitcode == 0, f"Stage child failed with exitcode {proc.exitcode}"
+
+    stage_id, chips, vis_dev, metrics_ports, multi_load, vals = result_queue.get(
+        timeout=10
+    )
+    assert (stage_id, chips, vis_dev, metrics_ports, multi_load, vals) == (
+        0,
+        chip_0,
+        chip_0,
+        str(8431 + int(chip_0)),
+        "1",
+        [2.0, 2.0, 2.0, 2.0],
+    )
+
+
+@pytest.mark.multichip
+@pytest.mark.spawns_tpu_workers
+@pytest.mark.tpu_test
+def test_tpu_two_stage_concurrent_subprocess_chip_isolation(monkeypatch):
+    import multiprocessing as mp
+    import threading
+
+    from vllm_omni.engine import stage_engine_startup
+
+    num_chips = OmniTpuPlatform.device_count()
+    if num_chips < 2:
+        pytest.skip(f"Requires at least 2 TPU chips, found {num_chips}")
+
+    free_chips = _find_free_tpu_chips(num_chips, needed=2)
+    if len(free_chips) < 2:
+        pytest.skip(
+            f"Requires 2 free TPU chips on {num_chips}-chip host, found {free_chips}"
+        )
+    chip_a, chip_b = free_chips[0], free_chips[1]
+
+    platform = OmniTpuPlatform()
+    monkeypatch.setattr(stage_engine_startup, "current_omni_platform", platform)
+    monkeypatch.setattr(OmniTpuPlatform, "_saved_spawn_env", None)
+
+    ctx = mp.get_context("spawn")
+    barrier = ctx.Barrier(2)
+    result_queue = ctx.Queue()
+    lock = threading.Lock()
+
+    with stage_engine_startup.scoped_spawn_device_env(
+        chip_a, lock, stage_id=0, replica_id=0
+    ):
+        proc_a = ctx.Process(
+            target=_tpu_stage_probe_worker, args=(barrier, result_queue, 0)
+        )
+        proc_a.start()
+
+    with stage_engine_startup.scoped_spawn_device_env(
+        chip_b, lock, stage_id=1, replica_id=0
+    ):
+        proc_b = ctx.Process(
+            target=_tpu_stage_probe_worker, args=(barrier, result_queue, 1)
+        )
+        proc_b.start()
+
+    proc_a.join(timeout=120)
+    proc_b.join(timeout=120)
+    assert proc_a.exitcode == 0, f"Stage 0 child failed with exitcode {proc_a.exitcode}"
+    assert proc_b.exitcode == 0, f"Stage 1 child failed with exitcode {proc_b.exitcode}"
+
+    results = {
+        stage_id: (chips, vis_dev, metrics_ports, multi_load, vals)
+        for stage_id, chips, vis_dev, metrics_ports, multi_load, vals in (
+            result_queue.get(timeout=10),
+            result_queue.get(timeout=10),
+        )
+    }
+    assert results[0] == (
+        chip_a,
+        chip_a,
+        str(8431 + int(chip_a)),
+        "1",
+        [2.0, 2.0, 2.0, 2.0],
+    )
+    assert results[1] == (
+        chip_b,
+        chip_b,
+        str(8431 + int(chip_b)),
+        "1",
+        [4.0, 4.0, 4.0, 4.0],
+    )
