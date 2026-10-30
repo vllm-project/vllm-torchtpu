@@ -387,8 +387,9 @@ def attention_plan(
     cache_shape,
     rotary_dim,
     theta,
+    history_runs=(),
 ):
-    """What every attention layer of a step without cached prefixes shares,
+    """What every attention layer of a step shares,
     from the metadata as the streaming kernel's wrapper takes it
     (``sharded_pcp_ragged_paged_attention``), ``rows`` per core and the
     core's cache shape ``cache_shape``:
@@ -396,8 +397,9 @@ def attention_plan(
     (:func:`chunk_bounds`), the runs of gathered rows its cache pages take
     (``[1, 3, runs]`` descriptors and their count, as the streaming kernel's
     writer takes them), the :func:`rope_tables` of its rows' ``positions``
-    (sharded along ``axis``), and whether any request has a cached prefix
-    (:func:`has_history`)."""
+    (sharded along ``axis``); for :func:`history_attention`, the rows' flat
+    positions among the requests' pooled keys and those keys' pages
+    (:func:`history_pages`); and the step's :func:`attention_path`."""
     from jax.sharding import PartitionSpec as P
 
     from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import wrapper
@@ -437,21 +439,80 @@ def attention_plan(
         segments, num_segments = wrapper._build_writeback_segment_descriptors(
             slots, slots.shape[0], kv_layout=kv_layout, page_size=page_size
         )
-        start = cu_q_lens[jnp.clip(mine.request_indices, 0, cu_q_lens.shape[0] - 1)]
+        requests = jnp.clip(mine.request_indices, 0, cu_q_lens.shape[0] - 1)
+        start = cu_q_lens[requests]
         q_flat = start + mine.absolute_positions
         q_start = jnp.where(mine.is_valid, start, q_flat + 1)
+        base = wrapper._per_token(
+            history_pages(kv_lens, page_indices, distribution, page_size, cores, 1)[1],
+            requests,
+        )
+        h_flat = base + mine.absolute_positions
+        h_start = jnp.where(mine.is_valid, base, h_flat + 1)
         cos, sin = rope_tables(positions, rotary_dim, theta)
-        return q_flat, q_start, segments[None], num_segments[None], cos, sin
+        return (
+            q_flat,
+            q_start,
+            segments[None],
+            num_segments[None],
+            cos,
+            sin,
+            h_flat,
+            h_start,
+        )
 
     plan = jax.shard_map(
         local,
         mesh=mesh,
         in_specs=(P(),) * 4 + (P(axis),),
-        out_specs=(P(axis),) * 6,
+        out_specs=(P(axis),) * 8,
         check_vma=False,
     )(kv_lens, page_indices, cu_q_lens, distribution, positions)
-    history = has_history(kv_lens, cu_q_lens, distribution).astype(jnp.int32)
-    return (*plan, history[None])
+    runs = max(history_runs, default=0)
+    pages, _, needed, limits = history_pages(
+        kv_lens, page_indices, distribution, page_size, cores, max(runs, 1)
+    )
+    gathered = history_runs if page_size == interleave else ()
+    path = attention_path(kv_lens, cu_q_lens, distribution, needed, gathered)
+    return (*plan, pages, limits, path[None])
+
+
+def history_pages(kv_lens, page_indices, distribution, page_size, cores, runs):
+    """Where :func:`history_attention` puts the step's requests' keys: each
+    core's pages of every request's positions ``[0, kv_len)`` in order,
+    request after request (``runs`` page ids, vLLM's null block past them),
+    each request's first flat key once every core's pages are gathered
+    (core-major, a page per run), how many pages per core they take, and per
+    run how many of its block's positions the request holds (core ``c``'s
+    page holds those past ``c * page_size``). A request's position ``x`` sits
+    at flat ``first + x``: a block of ``page_size * cores`` positions holds
+    one page on every core."""
+    span = page_size * cores
+    requests = kv_lens.shape[0]
+    tables = jnp.asarray(page_indices, jnp.int32).reshape(requests, -1)
+    active = jnp.arange(requests) < distribution[-1]
+    blocks = jnp.where(active, -(-kv_lens // span), 0).astype(jnp.int32)
+    ends = jnp.cumsum(blocks)
+    first = ends - blocks
+    run = jnp.arange(runs, dtype=jnp.int32)
+    owner = jnp.clip(jnp.searchsorted(ends, run, side="right"), 0, requests - 1)
+    column = jnp.clip(run - first[owner], 0, tables.shape[1] - 1)
+    live = run < ends[-1]
+    pages = jnp.where(live, tables[owner, column], 0)
+    limits = jnp.where(live, kv_lens[owner] - (run - first[owner]) * span, 0)
+    return pages, first * span, ends[-1], limits
+
+
+def attention_path(kv_lens, cu_q_lens, distribution, pages, history_runs):
+    """The step's attention path: 0 without a cached prefix (the step's keys
+    gathered, :func:`stage_attention`); ``1 + i`` when the requests' pooled
+    keys take at most ``history_runs[i]`` pages per core
+    (:func:`history_attention`); ``1 + len(history_runs)`` otherwise (the
+    streaming kernel)."""
+    path = jnp.int32(1 + len(history_runs))
+    for i, runs in reversed(list(enumerate(history_runs))):
+        path = jnp.where(pages <= runs, jnp.int32(1 + i), path)
+    return jnp.where(has_history(kv_lens, cu_q_lens, distribution), path, 0)
 
 
 def stage_attention(
@@ -521,7 +582,84 @@ def stage_attention(
         in_specs=(P(axis),) * 10,
         out_specs=(P(axis), P(axis)),
         check_vma=False,
-    )(q, k, v, kv_cache, *plan[:-1])
+    )(q, k, v, kv_cache, *plan[:6])
+
+
+def history_attention(
+    mesh,
+    ring,
+    axis,
+    q,
+    kv_cache,
+    plan,
+    *,
+    runs,
+    sm_scale,
+    interleave,
+    q_norm,
+    rotary_dim,
+    eps,
+):
+    """Attention of a prefill step whose requests have cached prefixes, over
+    the KV cache that already holds the step's new rows (:func:`write_kv`):
+    ``q`` as :func:`stage_attention` takes it, ``kv_cache`` SEQ_ALONG_LANE
+    pages of ``interleave`` tokens, ``plan`` the step's :func:`attention_plan`
+    with its requests' keys on at most ``runs`` pages per core. Every core
+    copies its pages of the requests' keys out of its cache (in
+    :func:`history_pages` order, zero past each request's length: a pooled
+    page holds whatever its slots last held), every core gathers them all
+    (``prologue.all_gather`` over ``ring``) and runs :func:`local_attention`
+    on its rows: no key is sent more than once."""
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.megakernel.qwen38.prologue import all_gather
+
+    cores = mesh.shape[axis]
+
+    def local(q, kv_cache, cos, sin, h_flat, h_start, pages, limits):
+        page = kv_cache.shape[-1]
+        held = limits[:runs, None] - lax.axis_index(axis) * page
+        live = jnp.arange(page)[None, :] < held
+        keys = pool_keys(kv_cache, pages[:runs])
+        keys = jnp.where(live.reshape(-1, 1), keys, jnp.zeros((), keys.dtype))
+        gathered = all_gather(keys, ring, axis)
+        width = gathered.shape[1] // 2
+        return local_attention(
+            q,
+            gathered[:, :width],
+            gathered[:, width:],
+            h_flat,
+            h_start,
+            sm_scale=sm_scale,
+            k_scale=1.0,
+            v_scale=1.0,
+            cores=cores,
+            interleave=interleave,
+            q_norm=q_norm,
+            rope=(cos, sin),
+            rotary_dim=rotary_dim,
+            eps=eps,
+        )
+
+    return jax.shard_map(
+        local,
+        mesh=mesh,
+        in_specs=(P(axis),) * 6 + (P(),) * 2,
+        out_specs=P(axis),
+        check_vma=False,
+    )(q, kv_cache, *plan[4:10])
+
+
+def pool_keys(kv_cache, pages):
+    """``[pages * page, 2 * heads * D]`` FP8: the keys then the values of
+    ``pages`` of a SEQ_ALONG_LANE cache (``[blocks, 2 * heads, D / 4, 4,
+    page]``, each head's key then value), a row per token, each head's
+    ``D`` lanes in head order, as :func:`stage_attention` gathers new rows."""
+    selected = kv_cache[pages]
+    count, pairs, words, packing, page = selected.shape
+    heads, dim = pairs // 2, words * packing
+    rows = selected.reshape(count, heads, 2, dim, page).transpose(0, 4, 2, 1, 3)
+    return rows.reshape(count * page, 2 * heads * dim)
 
 
 def write_kv(mesh, ring, axis, k, v, kv_cache, plan, *, kv_layout):

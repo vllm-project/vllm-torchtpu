@@ -72,9 +72,10 @@ from vllm_torchtpu.megakernel.qwen38.weights import StageWeights, load, syntheti
 logger = init_logger(__name__)
 
 AXIS = qlayers.PCP
-# The attention plan's specs (qlayers.attention_plan): per-core rows, runs and
-# rotary tables, a flag.
-PLAN_SPECS = (P(AXIS),) * 6 + (P(),)
+# The attention plan's specs (qlayers.attention_plan): per-core rows, runs,
+# rotary tables and pooled-key positions, the pooled keys' pages and their
+# requests' lengths in them, the path.
+PLAN_SPECS = (P(AXIS),) * 8 + (P(),) * 3
 Q_BLOCK = 256  # the PCP attention query tile (its VMEM scratch scales with it)
 _LAYER = re.compile(r"layers\.(\d+)\.")
 
@@ -170,7 +171,17 @@ class QwenPrefillStage:
             pool_block_tokens=self._pool_block_tokens,
             q_block=Q_BLOCK,
             seq_along_lane=_seq_along_lane(),
+            history_runs=self._history_runs(),
         )
+
+    def _history_runs(self) -> tuple[int, ...]:
+        """The pooled-key sizes (pages per core) a step with cached prefixes
+        gathers in: up to 64K and 128K keys, and a request at the model
+        length with a granule of others' beside it."""
+        span = self.chunk * self.cores
+        longest = -(-(self.config.max_model_len + self.granule * self.cores) // span)
+        sizes = {runs for runs in (64, 128) if runs < longest} | {-(-longest // 4) * 4}
+        return tuple(sorted(sizes))
 
     # ------------------------------------------------------------ PipelineStage
     def handoff_template(self) -> Mapping[str, tuple[tuple[int, ...], torch.dtype]]:

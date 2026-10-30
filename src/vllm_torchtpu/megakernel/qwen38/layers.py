@@ -88,6 +88,10 @@ class Geometry:
     seq_along_lane: bool  # the pool's pages are [heads, dim, tokens] (vLLM's HND)
     k_scale: float = 1.0  # the FP8 KV cache's scales (compiled in)
     v_scale: float = 1.0
+    # Pages per core of pooled keys a step with cached prefixes gathers
+    # (attention.history_attention), one compiled size each; more take the
+    # streaming kernel.
+    history_runs: tuple[int, ...] = ()
 
     @property
     def flat_rows(self) -> int:
@@ -273,6 +277,7 @@ def attention_plan(g: Geometry, mesh: Mesh, cache_shape, meta: Mapping[str, jax.
         cache_shape=cache_shape,
         rotary_dim=g.dims.rotary_dim,
         theta=g.dims.rope_theta,
+        history_runs=g.history_runs,
     )
 
 
@@ -425,10 +430,35 @@ def attention_mixer(
             eps=d.eps,
         )
 
-    # Without a cached prefix every core gathers the step's keys and values
-    # once instead of streaming them around the ring for every query tile.
+    def pooled(runs):
+        def run():
+            written = attention.write_kv(
+                mesh, g.ring, PCP, key, value, pool, plan, kv_layout=kv_layout
+            )
+            attended = attention.history_attention(
+                mesh,
+                g.ring,
+                PCP,
+                query_gate,
+                written,
+                plan,
+                runs=runs,
+                sm_scale=d.head_dim**-0.5,
+                interleave=g.chunk,
+                q_norm=w["q_norm"],
+                rotary_dim=d.rotary_dim,
+                eps=d.eps,
+            )
+            return attended, written
+
+        return run
+
+    # Every core gathers the keys and values once instead of streaming them
+    # around the ring for every query tile: the step's own without cached
+    # prefixes, the requests' pooled ones with them while they fit.
     if g.k_scale == g.v_scale == 1.0:
-        attended, pool = jax.lax.cond(plan[-1][0] > 0, streaming, gathered)
+        paths = [gathered, *(pooled(runs) for runs in g.history_runs), streaming]
+        attended, pool = jax.lax.switch(plan[-1][0], paths)
     else:
         attended, pool = streaming()
 
