@@ -246,6 +246,19 @@ def pooled_cache_specs(cfg):
                 f"{MAIN_KV_DCP_ENV} replaces vLLM's decode context parallelism; "
                 "keep decode_context_parallel_size=1"
             )
+        from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
+            PAIRED_KV_TILES,
+        )
+
+        # DCP prefill attends one table entry (dcp pages) per KV tile through
+        # the paired-page kernel; fail here, not in the first prefill.
+        if dcp * block_size not in PAIRED_KV_TILES or main.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                f"{MAIN_KV_DCP_ENV}={dcp} needs a prefill KV tile of {dcp} x "
+                f"{block_size}-row pages = {dcp * block_size} in the paired-page "
+                f"kernel's {PAIRED_KV_TILES} and an FP8 main KV cache; got "
+                f"{main.dtype}"
+            )
         dcp_owners = tuple(
             name
             for name in specs
