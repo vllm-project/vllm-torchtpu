@@ -8,6 +8,7 @@ or the fused sparse GQA decode kernel under VLLM_TPU_QSA_FUSED_SPARSE_DECODE.
 """
 
 import functools
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -38,9 +39,7 @@ def pack_rows(key, value, *, fp8, k_scale=1.0, v_scale=1.0):
     return joined
 
 
-def virtual_page_metadata(
-    blocks, lengths, table, *, ratio=4, page_size=128, dcp=None
-):
+def virtual_page_metadata(blocks, lengths, table, *, ratio=4, page_size=128, dcp=None):
     """Map selected logical groups to physical micro-pages; no KV gathering.
 
     ``dcp = (rank, D)`` (main-KV decode context parallel, ``rank`` an int32[1]
@@ -500,8 +499,10 @@ def _decode_attention(
     options = dict(kv_heads=kv_heads, ratio=ratio, k_scale=k_scale, v_scale=v_scale)
     if kv_head_offset:
         options["kv_head_offset"] = kv_head_offset
-    if not return_lse and dcp is None and (
-        envs.VLLM_TPU_QSA_FUSED_SPARSE_DECODE if fused is None else fused
+    if (
+        not return_lse
+        and dcp is None
+        and (envs.VLLM_TPU_QSA_FUSED_SPARSE_DECODE if fused is None else fused)
     ):
         result = fused_sparse_decode(q, gate, blocks, lengths, table, cache, **options)
         if result is not None:
@@ -540,7 +541,7 @@ def _prefill_attention(
     kv_head_offset=0,
     dcp=None,
     return_lse=False,
-):
+) -> Any:
     """With ``return_lse`` returns ``(out, lse, cache)`` (see
     ``block_sparse_gqa_attention``)."""
     from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
@@ -561,6 +562,15 @@ def _prefill_attention(
             query_block, query_tile = 256, None
         if query_tile and query_block % query_tile:
             query_tile = None
+    extra: dict[str, Any] = {}
+    if kv_head_offset:
+        extra["kv_head_offset"] = kv_head_offset
+    if query_tile:
+        extra["query_tile"] = query_tile
+    if dcp is not None:
+        extra["dcp"] = dcp
+    if return_lse:
+        extra["return_lse"] = True
     return block_sparse_gqa_attention(
         query,
         gate,
@@ -575,10 +585,7 @@ def _prefill_attention(
         kv_tile=kv_tile,
         k_scale=k_scale,
         v_scale=v_scale,
-        **({"kv_head_offset": kv_head_offset} if kv_head_offset else {}),
-        **({"query_tile": query_tile} if query_tile else {}),
-        **({"dcp": dcp} if dcp is not None else {}),
-        **({"return_lse": True} if return_lse else {}),
+        **extra,
     )
 
 
@@ -589,7 +596,9 @@ def _with_lse_channel(attend):
 
     def run(*args, **kwargs):
         out, lse, cache = attend(*args, **kwargs)
-        return jnp.concatenate([out.astype(jnp.float32), lse[..., None]], axis=-1), cache
+        return jnp.concatenate(
+            [out.astype(jnp.float32), lse[..., None]], axis=-1
+        ), cache
 
     return run
 
@@ -617,9 +626,14 @@ def dcp_combine(out_pair, lse_pair, gate, rank, *, out_dtype=jnp.bfloat16):
     lse_pair = jax.lax.dynamic_slice_in_dim(lse_pair, start, heads, axis=2)
     top = jnp.max(lse_pair, axis=0)
     finite = jnp.isfinite(top)
-    weight = jnp.where(finite[None], jnp.exp(lse_pair - jnp.where(finite, top, 0)[None]), 0)
+    weight = jnp.where(
+        finite[None], jnp.exp(lse_pair - jnp.where(finite, top, 0)[None]), 0
+    )
     total = jnp.sum(weight, axis=0)
-    out = jnp.sum(weight[..., None] * out_pair, axis=0) / jnp.where(total > 0, total, 1)[..., None]
+    out = (
+        jnp.sum(weight[..., None] * out_pair, axis=0)
+        / jnp.where(total > 0, total, 1)[..., None]
+    )
     gated = bf16(
         bf16(out).astype(jnp.float32)
         * bf16(jax.nn.sigmoid(gate.astype(jnp.float32))).astype(jnp.float32)
@@ -650,7 +664,7 @@ def qsa_attention(
     kv_head_offset=0,
     max_query_len=1,
     dcp=None,
-):
+) -> Any:
     """Route a decode prefix to per-row decode and the remaining rows to prefill.
 
     Decode rows run on batched RPA, or on the fused sparse GQA decode kernel
@@ -682,7 +696,11 @@ def qsa_attention(
         decode_fn, prefill_fn = decode_attention, _prefill_attention
     if len(query) <= (len(starts) - 1) * max_query_len:
         output, cache = decode_fn(query, gate, blocks, lengths, table, cache, **options)
-        return _split_lse_channel(output, lengths, cache) if dcp is not None else (output, cache)
+        return (
+            _split_lse_channel(output, lengths, cache)
+            if dcp is not None
+            else (output, cache)
+        )
 
     # RPA rows: one per request row, times the tokens a verify request holds.
     capacity = min(len(query), (len(starts) - 1) * max_query_len)

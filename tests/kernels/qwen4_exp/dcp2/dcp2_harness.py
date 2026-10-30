@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU equality harness for main-KV DCP-2 (VLLM_TPU_QSA_MAIN_KV_DCP=2).
+"""Equality harness for main-KV DCP-2 (VLLM_TPU_QSA_MAIN_KV_DCP=2).
 
-Layout (docs: ~/q38f/dcp/CONTRACT.md, integration lead 2d):
+Layout:
   D = 2, B = pool.shape[1]. A DCP main-KV table entry covers D*B tokens:
   token t of a request lives at page ``table[req, t // (D*B)]``, row ``t % B``
   on owner rank ``(t // B) % D``. The replicated layout keeps the same token at
@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import os
 
 import jax
 import jax.numpy as jnp
@@ -39,9 +38,6 @@ import numpy as np
 
 D = 2
 FP8 = jnp.float8_e4m3fn
-# DCP2_HARNESS_DEVICE=tpu: real Mosaic kernels (no interpret / RPA stand-in),
-# fp8 NaN poison everywhere a kernel must not use, TPU tolerances.
-ON_TPU = os.environ.get("DCP2_HARNESS_DEVICE", "cpu").lower() == "tpu"
 FP8_NAN_BYTE = 0x7F
 # 448, the largest finite E4M3. Poison for rows a correct kernel may LOAD but
 # must mask (rows past kv_len inside a fetched micro-page / tile, the null
@@ -49,6 +45,14 @@ FP8_NAN_BYTE = 0x7F
 # unmasked read swamps the softmax. NaN there would flag every kernel that
 # masks by multiplication, which the replicated kernels do too.
 FP8_SENTINEL_BYTE = 0x7E
+
+
+def on_tpu() -> bool:
+    """Whether the active JAX device is a TPU (lazy: safe during collection)."""
+    dev = jax.config.jax_default_device
+    if dev is not None:
+        return dev.platform == "tpu"
+    return jax.default_backend() == "tpu"
 
 
 # ----------------------------------------------------------------------------
@@ -193,8 +197,9 @@ def selected_token_ids(blocks, lengths, ratio):
     return np.where(valid, tokens, -1).reshape(n, -1).astype(np.int64)
 
 
-def reference_metadata(blocks, lengths, table, *, ratio=4, page_size, dcp=None,
-                       order="ascending"):
+def reference_metadata(
+    blocks, lengths, table, *, ratio=4, page_size, dcp=None, order="ascending"
+):
     """Expected ``virtual_page_metadata`` output: (pages [N, budget + 1],
     kv_lens [N], counts [N] of owned complete groups, tail_owned [N]).
 
@@ -211,7 +216,9 @@ def reference_metadata(blocks, lengths, table, *, ratio=4, page_size, dcp=None,
     kv_lens = np.zeros(n, np.int32)
     counts = np.zeros(n, np.int32)
     tail_owned = np.zeros(n, bool)
-    rank, size = (0, 1) if dcp is None else (int(np.asarray(dcp[0]).reshape(())), dcp[1])
+    rank, size = (
+        (0, 1) if dcp is None else (int(np.asarray(dcp[0]).reshape(())), dcp[1])
+    )
     span = size * page_size
     for i in range(n):
         complete = int(lengths[i]) // ratio
@@ -275,9 +282,23 @@ def _partial_chunk(q, rows, live, cache, k_scale, v_scale, *, kv_heads, kv_head_
     return out, lse.reshape(n, heads)
 
 
-def reference_attend(q, gate, blocks, lengths, table, cache, *, kv_heads, ratio,
-                     k_scale=1.0, v_scale=1.0, dcp=None, kv_head_offset=0,
-                     owner=owner_of_token, chunk=64):
+def reference_attend(
+    q,
+    gate,
+    blocks,
+    lengths,
+    table,
+    cache,
+    *,
+    kv_heads,
+    ratio,
+    k_scale=1.0,
+    v_scale=1.0,
+    dcp=None,
+    kv_head_offset=0,
+    owner=owner_of_token,
+    chunk=64,
+):
     """Attention over the row's selected tokens that this rank owns.
 
     Signature of the DCP attend adapters. Returns ``(out [N, H, D] f32
@@ -309,13 +330,18 @@ def reference_attend(q, gate, blocks, lengths, table, cache, *, kv_heads, ratio,
     live_p = np.pad(live, ((0, pad), (0, 0)))
     outs, lses = [], []
     for s in range(0, n + pad, chunk):
-        o, l = _partial_chunk(
-            qp[s : s + chunk], jnp.asarray(rows_p[s : s + chunk], jnp.int32),
-            jnp.asarray(live_p[s : s + chunk]), cache, jnp.float32(k_scale),
-            jnp.float32(v_scale), kv_heads=kv_heads, kv_head_offset=kv_head_offset,
+        o, lse_s = _partial_chunk(
+            qp[s : s + chunk],
+            jnp.asarray(rows_p[s : s + chunk], jnp.int32),
+            jnp.asarray(live_p[s : s + chunk]),
+            cache,
+            jnp.float32(k_scale),
+            jnp.float32(v_scale),
+            kv_heads=kv_heads,
+            kv_head_offset=kv_head_offset,
         )
         outs.append(o)
-        lses.append(l)
+        lses.append(lse_s)
     out = jnp.concatenate(outs)[:n]
     lse = jnp.concatenate(lses)[:n]
     # NaN query rows (padding) own no key: keep them 0 / -inf.
@@ -331,10 +357,10 @@ def reference_combine(out_pair, lse_pair, gate, rank, *, out_dtype=jnp.bfloat16)
     heads = heads_all // size
     r = int(np.asarray(rank).reshape(()))
     o = jnp.asarray(out_pair, jnp.float32)[:, :, r * heads : (r + 1) * heads]
-    l = jnp.asarray(lse_pair, jnp.float32)[:, :, r * heads : (r + 1) * heads]
-    m = jnp.max(l, 0)
+    lse_r = jnp.asarray(lse_pair, jnp.float32)[:, :, r * heads : (r + 1) * heads]
+    m = jnp.max(lse_r, 0)
     finite = jnp.isfinite(m)
-    w = jnp.where(finite[None], jnp.exp(l - jnp.where(finite, m, 0)[None]), 0)
+    w = jnp.where(finite[None], jnp.exp(lse_r - jnp.where(finite, m, 0)[None]), 0)
     total = w.sum(0)
     out = jnp.where(w[..., None] > 0, w[..., None] * o, 0).sum(0)
     out = out / jnp.where(total > 0, total, 1)[..., None]
@@ -344,15 +370,21 @@ def reference_combine(out_pair, lse_pair, gate, rank, *, out_dtype=jnp.bfloat16)
 def combine_lse(lse_pair):
     m = jnp.max(lse_pair, 0)
     finite = jnp.isfinite(m)
-    s = jnp.where(finite[None], jnp.exp(lse_pair - jnp.where(finite, m, 0)[None]), 0).sum(0)
-    return jnp.where(finite, jnp.where(finite, m, 0) + jnp.log(jnp.where(s > 0, s, 1)), -jnp.inf)
+    s = jnp.where(
+        finite[None], jnp.exp(lse_pair - jnp.where(finite, m, 0)[None]), 0
+    ).sum(0)
+    return jnp.where(
+        finite, jnp.where(finite, m, 0) + jnp.log(jnp.where(s > 0, s, 1)), -jnp.inf
+    )
 
 
 def gate_output(out, gate, live):
     """The replicated kernels' gate rounding (qsa_rpa / block_sparse)."""
     gated = bf16(
         bf16(out).astype(jnp.float32)
-        * bf16(jax.nn.sigmoid(jnp.asarray(gate).astype(jnp.float32))).astype(jnp.float32)
+        * bf16(jax.nn.sigmoid(jnp.asarray(gate).astype(jnp.float32))).astype(
+            jnp.float32
+        )
     )
     return jnp.where(live[..., None], gated, 0)
 
@@ -411,7 +443,10 @@ CPU_TOL = Tolerance()
 # running maxima, so bf16 rounding inside the kernels differs; held to the
 # same 2-ulp gated bar, with fp32-level checks relaxed to kernel precision.
 TPU_TOL = Tolerance(rtol=4e-3, atol=4e-3, lse_atol=1e-3, pregate_rel=4e-3)
-DEFAULT_TOL = TPU_TOL if ON_TPU else CPU_TOL
+
+
+def default_tol() -> Tolerance:
+    return TPU_TOL if on_tpu() else CPU_TOL
 
 
 def bf16_ulp(x):
@@ -439,8 +474,11 @@ def assert_no_nan(x, what):
     assert not len(bad), f"{what}: NaN leaked at {bad[:5].tolist()} ({len(bad)} total)"
 
 
-def check_partial(out, lse, ref_out, ref_lse, kv_lens, tol=DEFAULT_TOL, what="partial"):
+def check_partial(
+    out, lse, ref_out, ref_lse, kv_lens, tol: Tolerance | None = None, what="partial"
+):
     """One rank's (out, lse) vs the f32 reference restricted to owned keys."""
+    tol = default_tol() if tol is None else tol
     out = np.asarray(out)
     lse = np.asarray(lse)
     assert out.dtype == np.float32 and lse.dtype == np.float32, (out.dtype, lse.dtype)
@@ -448,7 +486,9 @@ def check_partial(out, lse, ref_out, ref_lse, kv_lens, tol=DEFAULT_TOL, what="pa
     assert not np.isnan(lse).any(), f"{what} lse NaN"
     empty = np.asarray(kv_lens) == 0
     assert np.all(out[empty] == 0), f"{what}: rows with no owned key must be 0"
-    assert np.all(np.isneginf(lse[empty])), f"{what}: rows with no owned key need lse=-inf"
+    assert np.all(np.isneginf(lse[empty])), (
+        f"{what}: rows with no owned key need lse=-inf"
+    )
     assert np.all(np.isfinite(lse[~empty])), f"{what}: owned rows need finite lse"
     ref_out, ref_lse = np.asarray(ref_out), np.asarray(ref_lse)
     np.testing.assert_allclose(out, ref_out, rtol=tol.rtol, atol=tol.atol, err_msg=what)
@@ -459,9 +499,10 @@ def check_partial(out, lse, ref_out, ref_lse, kv_lens, tol=DEFAULT_TOL, what="pa
     return diff_report(out, ref_out)
 
 
-def check_gated(actual, oracle, live, tol=DEFAULT_TOL, what="gated"):
+def check_gated(actual, oracle, live, tol: Tolerance | None = None, what="gated"):
     """Gated BF16 DCP output vs the replicated oracle: no NaN, exact zeros on
     rows no rank owns, |diff| <= max_ulp BF16 ulps elementwise."""
+    tol = default_tol() if tol is None else tol
     a = np.asarray(actual, np.float32)
     e = np.asarray(oracle, np.float32)
     assert a.shape == e.shape, (a.shape, e.shape)
@@ -478,18 +519,22 @@ def check_gated(actual, oracle, live, tol=DEFAULT_TOL, what="gated"):
     return rep
 
 
-def check_combined_prenorm(out_pair, lse_pair, ref_out, ref_lse, tol=DEFAULT_TOL):
+def check_combined_prenorm(
+    out_pair, lse_pair, ref_out, ref_lse, tol: Tolerance | None = None
+):
     """f32 merge of the partials vs the f32 full reference (pre-gate)."""
+    tol = default_tol() if tol is None else tol
     o = np.asarray(out_pair, np.float64)
-    l = np.asarray(lse_pair, np.float64)
-    m = l.max(0)
+    lse_p = np.asarray(lse_pair, np.float64)
+    m = lse_p.max(0)
     fin = np.isfinite(m)
-    w = np.where(fin[None], np.exp(l - np.where(fin, m, 0)[None]), 0)
+    w = np.where(fin[None], np.exp(lse_p - np.where(fin, m, 0)[None]), 0)
     merged = (w[..., None] * np.where(w[..., None] > 0, o, 0)).sum(0) / np.where(
         w.sum(0) > 0, w.sum(0), 1
     )[..., None]
-    np.testing.assert_allclose(merged, ref_out, rtol=tol.rtol, atol=tol.atol,
-                               err_msg="combined pre-gate")
+    np.testing.assert_allclose(
+        merged, ref_out, rtol=tol.rtol, atol=tol.atol, err_msg="combined pre-gate"
+    )
     lse = np.asarray(combine_lse(jnp.asarray(lse_pair)))
     rf = np.isfinite(ref_lse)
     np.testing.assert_array_equal(np.isfinite(lse), rf, "combined lse support")
@@ -521,7 +566,9 @@ class AttentionCase:
 
     @property
     def opts(self):
-        o = dict(kv_heads=1, ratio=self.ratio, k_scale=self.k_scale, v_scale=self.v_scale)
+        o = dict(
+            kv_heads=1, ratio=self.ratio, k_scale=self.k_scale, v_scale=self.v_scale
+        )
         if self.kv_head_offset:
             o["kv_head_offset"] = self.kv_head_offset
         return o
@@ -551,10 +598,25 @@ def random_blocks(rng, lengths, ratio, budget):
     return blocks
 
 
-def make_case(rng, *, row_lengths, row_req, seq_tokens, page_size=512, heads=3,
-              head_dim=256, ratio=4, budget=512, k_scale=0.375, v_scale=2.5,
-              num_pages=None, poison_tail=None, null_page=None, nan_rows=(),
-              kv_head_offset=0):
+def make_case(
+    rng,
+    *,
+    row_lengths,
+    row_req,
+    seq_tokens,
+    page_size=512,
+    heads=3,
+    head_dim=256,
+    ratio=4,
+    budget=512,
+    k_scale=0.375,
+    v_scale=2.5,
+    num_pages=None,
+    poison_tail=None,
+    null_page=None,
+    nan_rows=(),
+    kv_head_offset=0,
+):
     """Build both layouts and pools for the given rows.
 
     ``seq_tokens[r]``: KV rows request r has written (the max row length);
@@ -565,10 +627,11 @@ def make_case(rng, *, row_lengths, row_req, seq_tokens, page_size=512, heads=3,
     ``nan_rows``: query rows (padding) whose q/gate are NaN; their length
     must be 0.
     """
+    tpu = on_tpu()
     if poison_tail is None:
-        poison_tail = FP8_NAN_BYTE if ON_TPU else FP8_SENTINEL_BYTE
+        poison_tail = FP8_NAN_BYTE if tpu else FP8_SENTINEL_BYTE
     if null_page is None:
-        null_page = FP8_NAN_BYTE if ON_TPU else FP8_SENTINEL_BYTE
+        null_page = FP8_NAN_BYTE if tpu else FP8_SENTINEL_BYTE
     row_lengths = np.asarray(row_lengths, np.int32)
     row_req = np.asarray(row_req, np.int32)
     seq_tokens = np.asarray(seq_tokens, np.int64)
@@ -594,10 +657,19 @@ def make_case(rng, *, row_lengths, row_req, seq_tokens, page_size=512, heads=3,
         g[i] = np.nan
     starts = np.searchsorted(row_req, np.arange(len(alloc) + 1)).astype(np.int32)
     return AttentionCase(
-        q=jnp.asarray(q, jnp.bfloat16), gate=jnp.asarray(g, jnp.bfloat16),
-        blocks=random_blocks(rng, row_lengths, ratio, budget), lengths=row_lengths,
-        row_req=row_req, starts=starts, layout=layout, full_pool=full,
-        rank_pools=pools, heads=heads, ratio=ratio, k_scale=k_scale, v_scale=v_scale,
+        q=jnp.asarray(q, jnp.bfloat16),
+        gate=jnp.asarray(g, jnp.bfloat16),
+        blocks=random_blocks(rng, row_lengths, ratio, budget),
+        lengths=row_lengths,
+        row_req=row_req,
+        starts=starts,
+        layout=layout,
+        full_pool=full,
+        rank_pools=pools,
+        heads=heads,
+        ratio=ratio,
+        k_scale=k_scale,
+        v_scale=v_scale,
         kv_head_offset=kv_head_offset,
     )
 
@@ -614,8 +686,9 @@ def decode_case(rng, base_lengths, *, rows_per_seat=4, pad_rows=0, **kw):
     nan_rows = list(range(len(lengths), len(lengths) + pad_rows))
     lengths += [0] * pad_rows
     req += [len(base_lengths) - 1] * pad_rows
-    return make_case(rng, row_lengths=lengths, row_req=req, seq_tokens=seq,
-                     nan_rows=nan_rows, **kw)
+    return make_case(
+        rng, row_lengths=lengths, row_req=req, seq_tokens=seq, nan_rows=nan_rows, **kw
+    )
 
 
 def prefill_case(rng, chunks, **kw):
@@ -635,11 +708,17 @@ class AttentionResult:
     reports: dict
 
 
-def run_dcp_attention(case, attend=reference_attend, combine=None, tol=DEFAULT_TOL,
-                      check_partials=True):
+def run_dcp_attention(
+    case,
+    attend=reference_attend,
+    combine=None,
+    tol: Tolerance | None = None,
+    check_partials=True,
+):
     """Run both ranks through ``attend`` on their poisoned pools, combine for
     each TP rank's heads with ``combine`` (default qsa_rpa.dcp_combine) and
     check every stage against the references. Returns the gated outputs."""
+    tol = default_tol() if tol is None else tol
     if combine is None:
         from vllm_torchtpu.kernels.qwen4_exp import qsa_rpa
 
@@ -650,28 +729,57 @@ def run_dcp_attention(case, attend=reference_attend, combine=None, tol=DEFAULT_T
     partial = []
     for r in range(D):
         dcp = (rank_operand(r), D)
-        out, lse = attend(case.q, case.gate, case.blocks, case.lengths, case.dcp_rows,
-                          case.rank_pools[r], dcp=dcp, **opts)[:2]
+        out, lse = attend(
+            case.q,
+            case.gate,
+            case.blocks,
+            case.lengths,
+            case.dcp_rows,
+            case.rank_pools[r],
+            dcp=dcp,
+            **opts,
+        )[:2]
         partial.append((out, lse))
         if check_partials:
             if attend is reference_attend:
                 ref_out, ref_lse = out, lse  # same computation; contract checks only
             else:
                 ref_out, ref_lse = reference_attend(
-                    case.q, case.gate, case.blocks, case.lengths, case.dcp_rows,
-                    case.rank_pools[r], dcp=dcp, **opts)
+                    case.q,
+                    case.gate,
+                    case.blocks,
+                    case.lengths,
+                    case.dcp_rows,
+                    case.rank_pools[r],
+                    dcp=dcp,
+                    **opts,
+                )
             _, kv_lens, _, _ = reference_metadata(
-                case.blocks, case.lengths, case.dcp_rows, ratio=case.ratio,
-                page_size=b, dcp=(r, D))
+                case.blocks,
+                case.lengths,
+                case.dcp_rows,
+                ratio=case.ratio,
+                page_size=b,
+                dcp=(r, D),
+            )
             reports[f"partial{r}"] = check_partial(
-                out, lse, ref_out, ref_lse, kv_lens, tol, what=f"rank {r} partial")
+                out, lse, ref_out, ref_lse, kv_lens, tol, what=f"rank {r} partial"
+            )
     out_pair = jnp.stack([jnp.asarray(p[0], jnp.float32) for p in partial])
     lse_pair = jnp.stack([jnp.asarray(p[1], jnp.float32) for p in partial])
     full_out, full_lse = reference_attend(
-        case.q, case.gate, case.blocks, case.lengths, case.full_rows, case.full_pool, **opts)
+        case.q,
+        case.gate,
+        case.blocks,
+        case.lengths,
+        case.full_rows,
+        case.full_pool,
+        **opts,
+    )
     if check_partials:
         reports["combined_f32"] = check_combined_prenorm(
-            out_pair, lse_pair, np.asarray(full_out), np.asarray(full_lse), tol)
+            out_pair, lse_pair, np.asarray(full_out), np.asarray(full_lse), tol
+        )
     h = case.heads
     gated = []
     for r in range(D):
@@ -684,31 +792,42 @@ def merge_pair(out_pair, lse_pair, rank, heads):
     """Float32 pre-gate merge of the pair for TP rank ``rank``'s heads (the
     math of dcp_combine before its gate)."""
     o = jnp.asarray(out_pair, jnp.float32)[:, :, rank * heads : (rank + 1) * heads]
-    l = jnp.asarray(lse_pair, jnp.float32)[:, :, rank * heads : (rank + 1) * heads]
-    m = jnp.max(l, 0)
+    lse_r = jnp.asarray(lse_pair, jnp.float32)[:, :, rank * heads : (rank + 1) * heads]
+    m = jnp.max(lse_r, 0)
     fin = jnp.isfinite(m)
-    w = jnp.where(fin[None], jnp.exp(l - jnp.where(fin, m, 0)[None]), 0)
+    w = jnp.where(fin[None], np.exp(lse_r - np.where(fin, m, 0)[None]), 0)
     total = w.sum(0)
     out = jnp.where(w[..., None] > 0, w[..., None] * o, 0).sum(0)
-    return out / jnp.where(total > 0, total, 1)[..., None], combine_lse(l)
+    return out / jnp.where(total > 0, total, 1)[..., None], combine_lse(lse_r)
 
 
-def check_pregate(merged_out, merged_lse, rep_out, rep_lse, live, tol=DEFAULT_TOL,
-                  what="pre-gate"):
+def check_pregate(
+    merged_out,
+    merged_lse,
+    rep_out,
+    rep_lse,
+    live,
+    tol: Tolerance | None = None,
+    what="pre-gate",
+):
     """Merged f32 DCP attention vs the replicated route's f32 pre-gate output
     (``return_lse=True`` without dcp): fp32-level agreement, same lse."""
+    tol = default_tol() if tol is None else tol
     a, e = np.asarray(merged_out, np.float32), np.asarray(rep_out, np.float32)
     assert_no_nan(a, what)
     live = np.asarray(live, bool)
     a, e = np.where(live[..., None], a, 0), np.where(live[..., None], e, 0)
     rep = diff_report(a, e)
     scale = np.abs(e).max(-1, keepdims=True)
-    rep["max_err_over_vector_max"] = float((np.abs(a - e) / np.maximum(scale, 1e-30)).max(initial=0))
+    rep["max_err_over_vector_max"] = float(
+        (np.abs(a - e) / np.maximum(scale, 1e-30)).max(initial=0)
+    )
     la, le = np.asarray(merged_lse)[live], np.asarray(rep_lse)[live]
     rep["lse_max_abs"] = float(np.abs(la - le).max(initial=0))
     assert rep["max_err_over_vector_max"] <= tol.pregate_rel, f"{what}: {rep}"
-    assert rep["lse_max_abs"] <= tol.lse_atol * max(1.0, float(np.abs(le).max(initial=1))), \
-        f"{what}: {rep}"
+    assert rep["lse_max_abs"] <= tol.lse_atol * max(
+        1.0, float(np.abs(le).max(initial=1))
+    ), f"{what}: {rep}"
     return rep
 
 
@@ -716,6 +835,11 @@ def replicated_gated(case, full_out, full_lse):
     """Gated BF16 of the f32 replicated reference, per TP rank."""
     h = case.heads
     live = np.isfinite(np.asarray(full_lse))
-    return [gate_output(full_out[:, r * h : (r + 1) * h], case.gate[:, r * h : (r + 1) * h],
-                        jnp.asarray(live[:, r * h : (r + 1) * h])).astype(jnp.bfloat16)
-            for r in range(D)]
+    return [
+        gate_output(
+            full_out[:, r * h : (r + 1) * h],
+            case.gate[:, r * h : (r + 1) * h],
+            jnp.asarray(live[:, r * h : (r + 1) * h]),
+        ).astype(jnp.bfloat16)
+        for r in range(D)
+    ]

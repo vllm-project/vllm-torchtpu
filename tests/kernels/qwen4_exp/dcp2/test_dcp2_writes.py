@@ -15,11 +15,11 @@ import numpy as np
 import pytest
 from dcp2_harness import (
     D,
-    random_fp8,
     build_layout,
     from_raw,
     owner_of_token,
     project_rank_pool,
+    random_fp8,
     rank_operand,
     raw,
 )
@@ -43,7 +43,9 @@ def write_inputs(seed, query_lens, contexts):
     num_pages = int(sum(-(-seq // B)) * 2 + requests * (cols + 1) + 4)
     layout = build_layout(rng, seq, B, num_pages)
     free = iter(layout.free_pages)
-    comp = np.array([[next(free) for _ in range(cols)] for _ in range(requests)], np.int32)
+    comp = np.array(
+        [[next(free) for _ in range(cols)] for _ in range(requests)], np.int32
+    )
     ring = np.array([next(free) for _ in range(requests)], np.int32)
     keep = sorted({0, *comp.ravel().tolist(), *ring.tolist()})
     full = random_fp8(rng, (num_pages, B, 1, 4, WIDTH))
@@ -72,22 +74,49 @@ def write_inputs(seed, query_lens, contexts):
 def call_writes(fn, pool, table, step, *, main_slot, max_query_len, dcp):
     s = step
     out = fn(
-        pool, s["k"], s["v"], s["raw"], s["positions"], s["nik"], s["trig"],
-        s["starts"], s["context"], s["ring_ids"], jnp.asarray(table),
-        s["compressed_table"], compress_ratio=RATIO, norm_eps=1e-6,
-        rotary_dim=ROTARY, k_scale=K_SCALE, v_scale=V_SCALE, main_slot=main_slot,
-        max_query_len=max_query_len, **({} if dcp is None else {"dcp": dcp}),
+        pool,
+        s["k"],
+        s["v"],
+        s["raw"],
+        s["positions"],
+        s["nik"],
+        s["trig"],
+        s["starts"],
+        s["context"],
+        s["ring_ids"],
+        jnp.asarray(table),
+        s["compressed_table"],
+        compress_ratio=RATIO,
+        norm_eps=1e-6,
+        rotary_dim=ROTARY,
+        k_scale=K_SCALE,
+        v_scale=V_SCALE,
+        main_slot=main_slot,
+        max_query_len=max_query_len,
+        **({} if dcp is None else {"dcp": dcp}),
     )
     return out[0]
 
 
-def check_dcp_writes(write_fn, query_lens, contexts, *, main_slot=-1, max_query_len=1,
-                     seed=0):
+def check_dcp_writes(
+    write_fn, query_lens, contexts, *, main_slot=-1, max_query_len=1, seed=0
+):
     """Run replicated vs DCP writes; raise AssertionError on any byte difference."""
-    layout, full, keep, step, positions, starts = write_inputs(seed, query_lens, contexts)
+    layout, full, keep, step, positions, starts = write_inputs(
+        seed, query_lens, contexts
+    )
     full_bytes = raw(full)
-    after = raw(call_writes(pooled_qsa.qsa_cache_writes, full, layout.full_table, step,
-                            main_slot=main_slot, max_query_len=max_query_len, dcp=None))
+    after = raw(
+        call_writes(
+            pooled_qsa.qsa_cache_writes,
+            full,
+            layout.full_table,
+            step,
+            main_slot=main_slot,
+            max_query_len=max_query_len,
+            dcp=None,
+        )
+    )
     assert not np.array_equal(after, full_bytes), "replicated write wrote nothing"
     owners = set()
     for r in range(len(contexts)):
@@ -96,18 +125,34 @@ def check_dcp_writes(write_fn, query_lens, contexts, *, main_slot=-1, max_query_
     for rank in range(D):
         initial = project_rank_pool(full_bytes, layout, rank, keep_pages=keep)
         want = project_rank_pool(after, layout, rank, keep_pages=keep)
-        got = raw(call_writes(write_fn, from_raw(initial), layout.dcp_table, step,
-                              main_slot=main_slot, max_query_len=max_query_len,
-                              dcp=(rank_operand(rank), D)))
+        got = raw(
+            call_writes(
+                write_fn,
+                from_raw(initial),
+                layout.dcp_table,
+                step,
+                main_slot=main_slot,
+                max_query_len=max_query_len,
+                dcp=(rank_operand(rank), D),
+            )
+        )
         if rank in owners:
             assert not np.array_equal(want, initial)
         bad = np.argwhere((got != want).reshape(got.shape[0], got.shape[1], -1).any(-1))
         if len(bad):
             page, row = bad[0]
-            kind = ("dcp-main" if page in layout.dcp_table else "replicated-main"
-                    if page in layout.full_table else "kept" if page in keep else "free")
+            kind = (
+                "dcp-main"
+                if page in layout.dcp_table
+                else "replicated-main"
+                if page in layout.full_table
+                else "kept"
+                if page in keep
+                else "free"
+            )
             raise AssertionError(
-                f"rank {rank}: {len(bad)} rows differ; first page {page} ({kind}) row {row}"
+                f"rank {rank}: {len(bad)} rows differ; "
+                f"first page {page} ({kind}) row {row}"
             )
 
 
@@ -118,16 +163,20 @@ production_writes = pooled_qsa.qsa_cache_writes
 # --- fault controls (each MUST be detected)
 def writes_also_unowned(pool, k, v, raw_keys, positions, *args, dcp, **kw):
     """Owned write, then also the partner's rows at (table[t // 2B], t % B)."""
-    pool, req, logical, valid = production_writes(pool, k, v, raw_keys, positions, *args,
-                                                  dcp=dcp, **kw)
+    pool, req, logical, valid = production_writes(
+        pool, k, v, raw_keys, positions, *args, dcp=dcp, **kw
+    )
     table = args[5]
     rank = int(np.asarray(dcp[0])[0])
     unowned = valid & ((logical // B) % D != rank)
     page = jnp.where(unowned, table[req, logical // (D * B)], len(pool))
-    rows = qsa_rpa.pack_rows(k, v, fp8=True, k_scale=kw["k_scale"], v_scale=kw["v_scale"])
+    rows = qsa_rpa.pack_rows(
+        k, v, fp8=True, k_scale=kw["k_scale"], v_scale=kw["v_scale"]
+    )
     slot = kw.get("main_slot", -1)
-    pool = pooled_qsa.write_main_cache(pool, rows, page, logical, unowned,
-                                       **({"slot": slot} if slot >= 0 else {}))
+    pool = pooled_qsa.write_main_cache(
+        pool, rows, page, logical, unowned, **({"slot": slot} if slot >= 0 else {})
+    )
     return pool, req, logical, valid
 
 
@@ -172,7 +221,8 @@ def test_owned_writes_prefill_chunk_2048(interpret):
 
 
 @pytest.mark.parametrize(
-    "fault", [writes_also_unowned, writes_flipped_owner, writes_replicated_span],
+    "fault",
+    [writes_also_unowned, writes_flipped_owner, writes_replicated_span],
     ids=lambda f: f.__name__,
 )
 def test_write_fault_controls_are_detected(interpret, fault):
@@ -192,7 +242,9 @@ def test_harness_projection_is_exact():
         for t in [0, n - 1, *range(0, n, 97)]:
             o = int(owner_of_token(t, B))
             src = full[layout.full_table[r, t // B], t % B]
-            np.testing.assert_array_equal(pools[o][layout.dcp_table[r, t // (2 * B)], t % B], src)
+            np.testing.assert_array_equal(
+                pools[o][layout.dcp_table[r, t // (2 * B)], t % B], src
+            )
             other = pools[1 - o][layout.dcp_table[r, t // (2 * B)], t % B]
             # The partner holds its own token at that slot (t +- B) or poison.
             partner = (t // (2 * B)) * 2 + (1 - o)

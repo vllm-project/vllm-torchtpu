@@ -383,7 +383,14 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         self.main_kv_dcp = 1
         dcp = int(envs.VLLM_TPU_QSA_MAIN_KV_DCP or 0)
         if dcp > 1 and pooled and ("mtp" not in prefix or envs.VLLM_TPU_QSA_MTP_KV_DCP):
-            assert dcp == 2 and tp_size % dcp == 0, "main-KV DCP supports pairs only"
+            if dcp != 2 or tp_size % (dcp * self.total_num_kv_heads) != 0:
+                raise ValueError(
+                    f"VLLM_TPU_QSA_MAIN_KV_DCP={dcp} requires dcp=2 and "
+                    f"tensor_parallel_size divisible by "
+                    f"2 * num_key_value_heads ({2 * self.total_num_kv_heads}), "
+                    f"got tensor_parallel_size={tp_size} and "
+                    f"num_key_value_heads={self.total_num_kv_heads}"
+                )
             self.main_kv_dcp = dcp
             self.register_buffer(
                 "dcp_rank",
@@ -524,6 +531,13 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         self._dcp_op = None
         self._token_shard_dcp_op = None
         if self.main_kv_dcp > 1:
+            if self._select_op is not None:
+                raise ValueError(
+                    "VLLM_TPU_QSA_MAIN_KV_DCP and VLLM_TPU_MEGAKERNEL cannot "
+                    "be enabled together: the megakernel's select op and "
+                    "whole-step cache writer assume replicated main-KV pages; "
+                    "unset VLLM_TPU_MEGAKERNEL or VLLM_TPU_QSA_MAIN_KV_DCP"
+                )
             from vllm.distributed import get_tp_group
 
             from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
@@ -542,10 +556,6 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 )
 
                 # VLLM_TPU_QSA_COMPRESSED_DCP: owned-group scoring, pair merge.
-                # The megakernel's whole-step writer still writes whole rows.
-                assert self._select_op is None, (
-                    "VLLM_TPU_QSA_COMPRESSED_DCP and VLLM_TPU_MEGAKERNEL are exclusive"
-                )
                 self._dcp_op = partial(
                     build_pooled_qsa_compressed_dcp_op(pair, self.main_kv_dcp),
                     kv_heads=self.num_kv_heads,
@@ -570,9 +580,12 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
 
                 # Under compressed DCP the draft attends the target's selection
                 # only: its own rows indexer would need the pair merge.
-                assert not compressed or self._shared_ops is not None, (
-                    "VLLM_TPU_QSA_COMPRESSED_DCP needs VLLM_TPU_QSA_DRAFT_SHARED_SELECTION"
-                )
+                if compressed and self._shared_ops is None:
+                    raise ValueError(
+                        "VLLM_TPU_QSA_COMPRESSED_DCP requires "
+                        "VLLM_TPU_QSA_DRAFT_SHARED_SELECTION=1 for MTP draft "
+                        "attention"
+                    )
                 self._rows_op = draft(False, True)
                 if self._shared_ops is not None:
                     self._shared_ops = (draft(True, False), draft(True, True))
@@ -839,7 +852,8 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         if token_shard and rows is None and token_shard_op is not None:
             # Takes precedence over the key-sharded indexer in this graph.
             op = partial(token_shard_op, shard_index=self.token_shard_index)
-        if getattr(self, "_dcp_op", None) is not None and rows is None:
+        dcp_op = getattr(self, "_dcp_op", None)
+        if dcp_op is not None and rows is None:
             # VLLM_TPU_QSA_MAIN_KV_DCP: this rank's main-KV rows, pair-combined.
             if token_shard and self._token_shard_dcp_op is not None:
                 op = partial(
@@ -848,7 +862,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                     dcp_rank=self.dcp_rank,
                 )
             else:
-                op = partial(self._dcp_op, dcp_rank=self.dcp_rank)
+                op = partial(dcp_op, dcp_rank=self.dcp_rank)
         shared_ops = getattr(self, "_shared_ops", None)
         source = getattr(self, "_selection_source", None)
         if shared is None and source is not None and shared_ops is not None:

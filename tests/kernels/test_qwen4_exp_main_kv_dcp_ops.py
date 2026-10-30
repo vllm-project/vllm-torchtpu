@@ -15,6 +15,8 @@ import pytest
 import test_qwen4_exp_mtp_draft_rows as mtp_rows
 import torch
 
+pytestmark = pytest.mark.tpu_test
+
 pytest.importorskip("torch_tpu")
 
 from vllm_torchtpu.layers.adapter.custom_ops import qsa_op  # noqa: E402
@@ -52,9 +54,17 @@ def _inputs(device, starts, context, tokens=8, seed=0):
         return jnp.asarray(rng.normal(0, 0.3, shape), jnp.bfloat16)
 
     requests, columns = len(context), 4
-    pool = jnp.zeros((4 + 3 * requests * columns, PAGE_ROWS, 1, 4, 256), jnp.float8_e4m3fn)
-    pages = np.arange(1, 1 + 2 * requests * columns, dtype=np.int32).reshape(2, requests, columns)
-    ring_ids = jnp.arange(1 + 2 * requests * columns, 1 + 2 * requests * columns + requests, dtype=jnp.int32)
+    pool = jnp.zeros(
+        (4 + 3 * requests * columns, PAGE_ROWS, 1, 4, 256), jnp.float8_e4m3fn
+    )
+    pages = np.arange(1, 1 + 2 * requests * columns, dtype=np.int32).reshape(
+        2, requests, columns
+    )
+    ring_ids = jnp.arange(
+        1 + 2 * requests * columns,
+        1 + 2 * requests * columns + requests,
+        dtype=jnp.int32,
+    )
     ring = rand((requests, 8, 128))
     tags = np.zeros((requests, 8, 2), np.int32)
     for row, c in enumerate(context):
@@ -63,23 +73,51 @@ def _inputs(device, starts, context, tokens=8, seed=0):
     write = jax.jit(mtp_rows.write_region, static_argnames=("tok0",))
     pool = write(pool, ring.reshape(requests, -1), ring_ids)
     token_bytes = int(np.prod(pool.shape[2:])) * pool.dtype.itemsize
-    pool = write(pool, jnp.asarray(tags).reshape(requests, -1), ring_ids, tok0=8 * 128 * 2 // token_bytes)
+    pool = write(
+        pool,
+        jnp.asarray(tags).reshape(requests, -1),
+        ring_ids,
+        tok0=8 * 128 * 2 // token_bytes,
+    )
     starts_np = np.asarray(starts, np.int32)
-    req = np.minimum(np.searchsorted(starts_np[1:], np.arange(tokens), side="right"), requests - 1)
-    positions = np.where(np.arange(tokens) < starts_np[-1],
-                         np.asarray(context)[req] + np.arange(tokens) - starts_np[req], 0)
+    req = np.minimum(
+        np.searchsorted(starts_np[1:], np.arange(tokens), side="right"), requests - 1
+    )
+    positions = np.where(
+        np.arange(tokens) < starts_np[-1],
+        np.asarray(context)[req] + np.arange(tokens) - starts_np[req],
+        0,
+    )
     angle = jnp.arange(4096)[:, None] * jnp.arange(32)[None, :] / 8192
-    trig = jnp.pad(jnp.concatenate([jnp.cos(angle), jnp.sin(angle)], 1), ((0, 0), (0, 64))).astype(jnp.bfloat16)
-    head = (rand((tokens, PAIR_HEADS * 256 * 2)), rand((tokens, KV_HEADS * 256)),
-            rand((tokens, KV_HEADS * 256)),
-            rand((tokens, 5 * 128)), rand((256,)), rand((256,)), rand((128,)), rand((128,)),
-            jnp.asarray(positions, jnp.int32), trig)
-    tail = (jnp.asarray(starts_np), jnp.asarray(context, jnp.int32),
-            jnp.pad(ring_ids[:, None], ((0, 0), (0, 31))).reshape(-1),
-            jnp.asarray(pages[0]), jnp.asarray(pages[1]))
+    trig = jnp.pad(
+        jnp.concatenate([jnp.cos(angle), jnp.sin(angle)], 1), ((0, 0), (0, 64))
+    ).astype(jnp.bfloat16)
+    head = (
+        rand((tokens, PAIR_HEADS * 256 * 2)),
+        rand((tokens, KV_HEADS * 256)),
+        rand((tokens, KV_HEADS * 256)),
+        rand((tokens, 5 * 128)),
+        rand((256,)),
+        rand((256,)),
+        rand((128,)),
+        rand((128,)),
+        jnp.asarray(positions, jnp.int32),
+        trig,
+    )
+    tail = (
+        jnp.asarray(starts_np),
+        jnp.asarray(context, jnp.int32),
+        jnp.pad(ring_ids[:, None], ((0, 0), (0, 31))).reshape(-1),
+        jnp.asarray(pages[0]),
+        jnp.asarray(pages[1]),
+    )
     # The pool stays on the host: step and select donate it (argument 10), so
     # every call gets its own device copy.
-    return [_torch(x, device) for x in head], _torch(pool, "cpu"), [_torch(x, device) for x in tail]
+    return (
+        [_torch(x, device) for x in head],
+        _torch(pool, "cpu"),
+        [_torch(x, device) for x in tail],
+    )
 
 
 def _run(step, select, attend, combine, head, pool, tail, rank):
@@ -91,16 +129,38 @@ def _run(step, select, attend, combine, head, pool, tail, rank):
     out = {}
     out["step"] = step(*head, pool(), *tail, rank, dcp_size=2, **OPTIONS)
     shards = [
-        select(*head, pool(), *tail, torch.tensor([s], dtype=torch.int32, device=rank.device),
-               rank, shard_size=SHARDS, dcp_size=2, **OPTIONS)
+        select(
+            *head,
+            pool(),
+            *tail,
+            torch.tensor([s], dtype=torch.int32, device=rank.device),
+            rank,
+            shard_size=SHARDS,
+            dcp_size=2,
+            **OPTIONS,
+        )
         for s in range(SHARDS)
     ]
     out["select"] = shards[0]
     new_pool, q, gate, lengths, req, starts, _ = shards[0]
     gathered = torch.cat([shard[-1] for shard in shards])
-    out["attend"] = attend(q, gate, lengths, req, starts, tail[3], tail[1], new_pool, gathered,
-                           rank, kv_heads=KV_HEADS, compress_ratio=RATIO, token_topk=TOPK,
-                           dcp_size=2, merged=True)
+    out["attend"] = attend(
+        q,
+        gate,
+        lengths,
+        req,
+        starts,
+        tail[3],
+        tail[1],
+        new_pool,
+        gathered,
+        rank,
+        kv_heads=KV_HEADS,
+        compress_ratio=RATIO,
+        token_topk=TOPK,
+        dcp_size=2,
+        merged=True,
+    )
     _, partial, lse, _ = out["step"]
     heads = partial.shape[1] // 2
     out_pair = torch.stack([partial, partial])
@@ -111,8 +171,13 @@ def _run(step, select, attend, combine, head, pool, tail, rank):
 
 
 def _shapes(out):
-    return {k: [tuple(t.shape) + (t.dtype,) for t in (v if isinstance(v, (tuple, list)) else (v,))]
-            for k, v in out.items()}
+    return {
+        k: [
+            tuple(t.shape) + (t.dtype,)
+            for t in (v if isinstance(v, (tuple, list)) else (v,))
+        ]
+        for k, v in out.items()
+    }
 
 
 @pytest.mark.parametrize(
@@ -137,7 +202,9 @@ def test_dcp_ops_build_and_run_on_tpu(starts, context):
     ops = qsa_op._dcp_ops()
     head, pool, tail = _inputs(device, starts, context)
     for r in (0, 1):
-        real = _run(*ops, head, lambda: pool.to(device), tail, torch.tensor([r], device=device))
+        real = _run(
+            *ops, head, lambda: pool.to(device), tail, torch.tensor([r], device=device)
+        )
         for name, value in real.items():
             for t in value if isinstance(value, (tuple, list)) else (value,):
                 assert t.device.type == device.type, name
@@ -148,7 +215,11 @@ def test_dcp_ops_build_and_run_on_tpu(starts, context):
 
         with FakeTensorMode(allow_non_fake_inputs=True) as mode:
             fake_pool = mode.from_tensor(pool.to(device))
-            fake = _run(*ops, [mode.from_tensor(t) for t in head], lambda: fake_pool,
-                        [mode.from_tensor(t) for t in tail],
-                        mode.from_tensor(torch.tensor([r], device=device)))
+            fake = _run(
+                *ops,
+                [mode.from_tensor(t) for t in head],
+                lambda fp=fake_pool: fp,
+                [mode.from_tensor(t) for t in tail],
+                mode.from_tensor(torch.tensor([r], device=device)),
+            )
         assert _shapes(fake) == _shapes(real)

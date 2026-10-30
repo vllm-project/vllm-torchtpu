@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Real-kernel DCP-2 gate on TPU (DCP2_HARNESS_DEVICE=tpu; skipped elsewhere).
+"""Real-kernel DCP-2 gate on TPU (marked ``tpu_test``; skipped off TPU).
 
 Mosaic batched RPA (served decode env) and the paired-page block-sparse
 prefill (kv_tile 1024 = 2 x 512, FP8, D256, 6 q heads per KV head) run per
@@ -12,11 +12,11 @@ same TPU: gated <= 2 BF16 ulps, pre-gate within TPU_TOL, no NaN.
 
 import numpy as np
 import pytest
-from dcp2_harness import ON_TPU, decode_case, prefill_case
+from dcp2_harness import decode_case, prefill_case
 from test_dcp2_decode import SEATS, check_case, production_rpa_attend
 from test_dcp2_prefill import check_production_prefill
 
-pytestmark = pytest.mark.skipif(not ON_TPU, reason="DCP2_HARNESS_DEVICE=tpu only")
+pytestmark = pytest.mark.tpu_test
 
 B = 512
 SERVED_DECODE_ENV = {
@@ -35,8 +35,9 @@ def test_tpu_decode_rpa(monkeypatch, rows, slot, served_env):
     if served_env:
         for k, v in SERVED_DECODE_ENV.items():
             monkeypatch.setenv(k, v)
-    case = decode_case(np.random.default_rng(rows + slot), SEATS[rows], pad_rows=4,
-                       kv_head_offset=slot)
+    case = decode_case(
+        np.random.default_rng(rows + slot), SEATS[rows], pad_rows=4, kv_head_offset=slot
+    )
     print(rows, slot, served_env, check_case(case, production_rpa_attend))
 
 
@@ -53,6 +54,10 @@ PREFILL = {
 @pytest.mark.parametrize("slot", [0, 1])
 @pytest.mark.parametrize("name", sorted(PREFILL))
 def test_tpu_prefill_block_sparse(name, slot):
-    case = prefill_case(np.random.default_rng(len(name) + slot), PREFILL[name], budget=512,
-                        kv_head_offset=slot)
+    case = prefill_case(
+        np.random.default_rng(len(name) + slot),
+        PREFILL[name],
+        budget=512,
+        kv_head_offset=slot,
+    )
     print(name, slot, check_production_prefill(case))

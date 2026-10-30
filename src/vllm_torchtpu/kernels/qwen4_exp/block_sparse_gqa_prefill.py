@@ -484,7 +484,7 @@ def _kernel(
             )
         output_tiles.append(jnp.concatenate(heads, axis=1))
     output_ref[...] = jnp.concatenate(output_tiles, axis=0).astype(output_ref.dtype)
-    if return_lse:
+    if return_lse and lse_ref is not None:
         # Natural-log sum of the scaled scores; -inf for a row with no key.
         lse_tiles = []
         for query_tile_index in range(num_query_tiles):
@@ -603,6 +603,7 @@ def block_sparse_gqa_prefill(
         raise ValueError("Query blocks above 256 rows must be 256-aligned")
     parts = max(1, query_block // 256)
     part_width = native_query_width // parts
+    owned_words = None
     if dcp:
         # One selection word covers ratio * 32 tokens, within one page's rows.
         word_tokens = jnp.arange(words, dtype=jnp.int32) * (ratio * 32)
@@ -620,7 +621,7 @@ def block_sparse_gqa_prefill(
             query_block=query_block // parts,
             width=part_width,
         )
-        if dcp:
+        if owned_words is not None:
             block_bits_native = block_bits_native * owned_words[None, :, None]
         part_bits = block_bits_native.reshape(nblocks, parts, words, part_width)
         if paired_pages:
@@ -661,7 +662,7 @@ def block_sparse_gqa_prefill(
         bitset = _scatter_bitset(
             blocks, lengths, ratio=ratio, groups=groups, words=words
         )
-        if dcp:
+        if owned_words is not None:
             bitset = bitset * owned_words[None, :]
 
         nblocks = tokens // query_block
@@ -749,7 +750,10 @@ def block_sparse_gqa_prefill(
                 pl.BlockSpec(memory_space=pltpu.HBM),
             ],
             out_specs=(
-                [out_spec, pl.BlockSpec((query_block, query_heads), lambda b, *_: (b, 0))]
+                [
+                    out_spec,
+                    pl.BlockSpec((query_block, query_heads), lambda b, *_: (b, 0)),
+                ]
                 if return_lse
                 else out_spec
             ),
@@ -937,6 +941,7 @@ def block_sparse_gqa_attention(
             jnp.where(live[:, None], lse, -jnp.inf),
             cache,
         )
+    assert not isinstance(output, tuple)
     output = bf16(
         bf16(output).astype(jnp.float32)
         * bf16(jax.nn.sigmoid(gate.astype(jnp.float32))).astype(jnp.float32)
@@ -967,10 +972,7 @@ def _prepare_metadata_bounded(
 ):
     tokens = blocks.shape[0]
     assert tokens % query_block == 0
-    dcp = dcp_rank is not None
-    if dcp and not (paired_pages and kv_tile == dcp_world * physical_page_size):
-        raise ValueError("DCP prefill needs paired pages, one table entry per KV tile")
-    groups = page_table.shape[1] * physical_page_size * dcp_world // ratio
+    groups = page_table.shape[1] * physical_page_size // ratio
     num_kv_tiles = (groups * ratio + kv_tile - 1) // kv_tile
     words_per_tile = kv_tile // (ratio * 32)
     words = ((num_kv_tiles * words_per_tile + 127) // 128) * 128

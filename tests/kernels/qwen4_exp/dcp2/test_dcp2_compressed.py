@@ -15,9 +15,9 @@ import numpy as np
 import pytest
 from dcp2_harness import (
     D,
-    ON_TPU,
     check_gated,
     from_raw,
+    on_tpu,
     poison_tail_rows,
     project_rank_pool,
     rank_operand,
@@ -25,13 +25,13 @@ from dcp2_harness import (
 )
 from test_dcp2_op import (
     DH,
-    H,
     K_SCALE,
     OP_CASES,
     RATIO,
     ROTARY,
     TOPK,
     V_SCALE,
+    H,
     _args,
     make_step,
     partial_kernels,  # noqa: F401 (fixture)
@@ -43,16 +43,40 @@ from vllm_torchtpu.kernels.qwen4_exp import dcp_select, pooled_qsa, qsa_rpa
 
 def _scores(lengths):
     g = jnp.arange(8192, dtype=jnp.float32)
-    return jnp.sin((g[None] + 1) * 12.9898 + lengths[:, None].astype(jnp.float32) * 78.233)
+    return jnp.sin(
+        (g[None] + 1) * 12.9898 + lengths[:, None].astype(jnp.float32) * 78.233
+    )
 
 
-def stub_select_dcp(query, pool, lengths, table, req, starts, context, *, ratio, block_topk,
-                    dcp=None, **kw):
+def stub_select_dcp(
+    query,
+    pool,
+    lengths,
+    table,
+    req,
+    starts,
+    context,
+    *,
+    ratio,
+    block_topk,
+    dcp=None,
+    **kw,
+):
     """``stub_select``'s scores; with ``dcp`` the rank's local top-k over its
     owned complete groups as ``(vals, pos)``."""
     if dcp is None:
-        return stub_select(query, pool, lengths, table, req, starts, context, ratio=ratio,
-                           block_topk=block_topk, **kw)
+        return stub_select(
+            query,
+            pool,
+            lengths,
+            table,
+            req,
+            starts,
+            context,
+            ratio=ratio,
+            block_topk=block_topk,
+            **kw,
+        )
     rank, size = dcp
     page = pool.shape[1]
     g = jnp.arange(8192, dtype=jnp.int32)
@@ -76,32 +100,71 @@ def lax_topk(bits, k):
 
 def check_compressed(query_lens, contexts, *, main_slot=0, max_query_len=1, seed=0):
     layout, full, keep, qgate, s, m, seq, starts = make_step(seed, query_lens, contexts)
-    opts = dict(compress_ratio=RATIO, token_topk=TOPK, norm_eps=1e-6, rotary_dim=ROTARY,
-                k_scale=K_SCALE, v_scale=V_SCALE, main_slot=main_slot,
-                max_query_len=max_query_len)
-    rep = [pooled_qsa.pooled_qsa_step(*_args(qgate[r], s, full, m, layout.full_table), **opts)
-           for r in range(D)]
+    opts = dict(
+        compress_ratio=RATIO,
+        token_topk=TOPK,
+        norm_eps=1e-6,
+        rotary_dim=ROTARY,
+        k_scale=K_SCALE,
+        v_scale=V_SCALE,
+        main_slot=main_slot,
+        max_query_len=max_query_len,
+    )
+    rep = [
+        pooled_qsa.pooled_qsa_step(
+            *_args(qgate[r], s, full, m, layout.full_table), **opts
+        )
+        for r in range(D)
+    ]
     pair_qgate = jnp.concatenate(qgate, axis=1)
     selects = []
     for r in range(D):
-        pool = poison_tail_rows(project_rank_pool(raw(full), layout, r, keep_pages=keep),
-                                layout, r, seq)
-        selects.append(pooled_qsa.pooled_qsa_compressed_dcp_select_step(
-            *_args(pair_qgate, s, from_raw(pool), m, layout.dcp_table), rank_operand(r),
-            dcp_size=D, **opts))
+        pool = poison_tail_rows(
+            project_rank_pool(raw(full), layout, r, keep_pages=keep), layout, r, seq
+        )
+        selects.append(
+            pooled_qsa.pooled_qsa_compressed_dcp_select_step(
+                *_args(pair_qgate, s, from_raw(pool), m, layout.dcp_table),
+                rank_operand(r),
+                dcp_size=D,
+                **opts,
+            )
+        )
     vals_pair = jnp.stack([x[6] for x in selects])
     pos_pair = jnp.stack([x[7] for x in selects])
-    att = dict(kv_heads=1, compress_ratio=RATIO, token_topk=TOPK, k_scale=K_SCALE,
-               v_scale=V_SCALE, main_slot=main_slot, max_query_len=max_query_len)
+    att = dict(
+        kv_heads=1,
+        compress_ratio=RATIO,
+        token_topk=TOPK,
+        k_scale=K_SCALE,
+        v_scale=V_SCALE,
+        main_slot=main_slot,
+        max_query_len=max_query_len,
+    )
     dcp = []
     for r in range(D):
         pool, q, gate, lengths, req, st, _, _ = selects[r]
-        dcp.append(pooled_qsa.pooled_qsa_compressed_dcp_attend_step(
-            q, gate, lengths, req, st, jnp.asarray(layout.dcp_table), m["context"], pool,
-            vals_pair, pos_pair, rank_operand(r), dcp_size=D, **att))
+        dcp.append(
+            pooled_qsa.pooled_qsa_compressed_dcp_attend_step(
+                q,
+                gate,
+                lengths,
+                req,
+                st,
+                jnp.asarray(layout.dcp_table),
+                m["context"],
+                pool,
+                vals_pair,
+                pos_pair,
+                rank_operand(r),
+                dcp_size=D,
+                **att,
+            )
+        )
     tokens = int(starts[-1])
     for r in range(D):
-        # Every rank merges the same global selection, equal to the replicated one as a set.
+        # Every rank merges the same global selection, equal to the replicated
+        # one as a set.
         got = np.sort(np.asarray(dcp[r][3])[:tokens], axis=1)
         want = np.sort(np.asarray(rep[r][2])[:tokens], axis=1)
         np.testing.assert_array_equal(got, want)
@@ -119,9 +182,14 @@ def check_compressed(query_lens, contexts, *, main_slot=0, max_query_len=1, seed
 
 
 @pytest.mark.parametrize("case", sorted(OP_CASES))
-def test_compressed_dcp_matches_replicated(interpret, rpa_stand_in, monkeypatch,
-                                           partial_kernels, case):
+def test_compressed_dcp_matches_replicated(
+    interpret,
+    rpa_stand_in,
+    monkeypatch,
+    partial_kernels,  # noqa: F811
+    case,
+):
     monkeypatch.setattr(pooled_qsa, "select_blocks", stub_select_dcp)
-    if not ON_TPU:
+    if not on_tpu():
         monkeypatch.setattr(dcp_select, "_sc_topk", lax_topk)
     print(case, check_compressed(**OP_CASES[case]))

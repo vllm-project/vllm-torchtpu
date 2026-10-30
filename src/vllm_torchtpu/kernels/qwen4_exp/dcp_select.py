@@ -51,7 +51,9 @@ def merge_threshold(vals_pair, pos_pair, k, *, topk=None):
     vals = jnp.moveaxis(vals_pair, 0, 1).reshape(t, d * width)
     pos = jnp.moveaxis(pos_pair, 0, 1).reshape(t, d * width)
     filled = pos != EMPTY
-    bits = jnp.where(filled, jax.lax.bitcast_convert_type(vals, jnp.int32), BITS_NEG_INF)
+    bits = jnp.where(
+        filled, jax.lax.bitcast_convert_type(vals, jnp.int32), BITS_NEG_INF
+    )
     key = monotone_key(bits)
     slots = topk(bits, k)
     taken = slots >= 0
@@ -89,6 +91,4 @@ def keep_mask(vals, pos, thr_val, thr_pos):
     """bool ``[T, k]``: which local entries are in the global top-``k``."""
     key = monotone_key(jax.lax.bitcast_convert_type(vals, jnp.int32))
     thr = monotone_key(jax.lax.bitcast_convert_type(thr_val, jnp.int32))[:, None]
-    return (pos != EMPTY) & (
-        (key > thr) | ((key == thr) & (pos <= thr_pos[:, None]))
-    )
+    return (pos != EMPTY) & ((key > thr) | ((key == thr) & (pos <= thr_pos[:, None])))

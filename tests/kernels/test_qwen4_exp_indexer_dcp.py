@@ -48,7 +48,10 @@ def reference_kernel(monkeypatch, interpret):  # noqa: F811
 def dcp_pools(args):
     """Per-rank pools / table: entry e of request r owns page r * E + e, whose
     first kernel pages hold that rank's block 2e + rank; everything else NaN."""
-    pool, table = np.asarray(args["pool"].astype(jnp.float32)), np.asarray(args["table"])
+    pool, table = (
+        np.asarray(args["pool"].astype(jnp.float32)),
+        np.asarray(args["table"]),
+    )
     reqs, cols = table.shape
     entries = -(-cols // 2)
     kernel_pages = pool.reshape(-1, 128 // RATIO // 2, *pool.shape[3:])
@@ -118,7 +121,9 @@ DECODE_CASES = {
 @pytest.mark.parametrize("case", sorted(DECODE_CASES))
 @pytest.mark.parametrize("data", ["integer", "normal"])
 @pytest.mark.parametrize("query_block", [0, 4])
-def test_dcp_decode_union_is_replicated(monkeypatch, reference_kernel, case, data, query_block):
+def test_dcp_decode_union_is_replicated(
+    monkeypatch, reference_kernel, case, data, query_block
+):
     q_lens, context, tokens = DECODE_CASES[case]
     args = inputs(len(case), q_lens, context, tokens, data)
     monkeypatch.setattr(pooled_qsa, "decode_query_chunk_size", lambda pages: 4)
@@ -143,6 +148,9 @@ def test_dcp_and_shard_are_exclusive(reference_kernel):
     args = inputs(1, [1], [100], 1)
     with pytest.raises(ValueError, match="exclusive"):
         pooled_qsa.select_blocks(
-            **args, ratio=RATIO, block_topk=BLOCK_TOPK, shard=(0, 2),
+            **args,
+            ratio=RATIO,
+            block_topk=BLOCK_TOPK,
+            shard=(0, 2),
             dcp=(jnp.array([0], jnp.int32), 2),
         )

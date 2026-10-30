@@ -46,7 +46,9 @@ def make_row(rng, n, kind):
     if kind == "random":
         return rng.standard_normal(n).astype(np.float32)
     if kind == "ties":
-        return rng.choice(np.float32([0.5, 0.25, 0.25, 1.0, -0.0, 0.0]), n).astype(np.float32)
+        return rng.choice(np.float32([0.5, 0.25, 0.25, 1.0, -0.0, 0.0]), n).astype(
+            np.float32
+        )
     if kind == "flat":
         return np.full(n, 0.125, np.float32)
     raise ValueError(kind)
@@ -57,7 +59,9 @@ def local_topk(vals, n, rank, k):
     order = sorted(owned, key=lambda g: (-key_of(vals[g : g + 1])[0], g))[:k]
     v = np.full(k, -np.inf, np.float32)
     p = np.full(k, EMPTY, np.int32)
-    perm = np.random.default_rng(len(order)).permutation(len(order))  # unsorted, like SC
+    perm = np.random.default_rng(len(order)).permutation(
+        len(order)
+    )  # unsorted, like SC
     for i, j in enumerate(perm):
         v[i] = vals[order[j]]
         p[i] = order[j]
@@ -83,8 +87,12 @@ def test_union_of_kept_entries_is_the_replicated_topk(kind, k):
         kept = set()
         for rank in range(2):
             mask = np.asarray(
-                keep_mask(jnp.asarray(vp[rank, t : t + 1]), jnp.asarray(pp[rank, t : t + 1]),
-                          thr_val[t : t + 1], thr_pos[t : t + 1])
+                keep_mask(
+                    jnp.asarray(vp[rank, t : t + 1]),
+                    jnp.asarray(pp[rank, t : t + 1]),
+                    thr_val[t : t + 1],
+                    thr_pos[t : t + 1],
+                )
             )[0]
             kept |= {int(p) for p in pp[rank, t][mask]}
         assert kept == replicated_topk(vals, n, k), (kind, k, n)
@@ -94,7 +102,17 @@ def test_negative_zero_ranks_below_positive_zero():
     k = 1
     vp = np.array([[[-0.0]], [[0.0]]], np.float32)
     pp = np.array([[[0]], [[B_GROUPS]]], np.int32)  # rank 0 has the lower id
-    thr_val, thr_pos = merge_threshold(jnp.asarray(vp), jnp.asarray(pp), k, topk=lax_like_topk)
-    keep0 = bool(np.asarray(keep_mask(jnp.asarray(vp[0]), jnp.asarray(pp[0]), thr_val, thr_pos))[0, 0])
-    keep1 = bool(np.asarray(keep_mask(jnp.asarray(vp[1]), jnp.asarray(pp[1]), thr_val, thr_pos))[0, 0])
+    thr_val, thr_pos = merge_threshold(
+        jnp.asarray(vp), jnp.asarray(pp), k, topk=lax_like_topk
+    )
+    keep0 = bool(
+        np.asarray(keep_mask(jnp.asarray(vp[0]), jnp.asarray(pp[0]), thr_val, thr_pos))[
+            0, 0
+        ]
+    )
+    keep1 = bool(
+        np.asarray(keep_mask(jnp.asarray(vp[1]), jnp.asarray(pp[1]), thr_val, thr_pos))[
+            0, 0
+        ]
+    )
     assert (keep0, keep1) == (False, True)

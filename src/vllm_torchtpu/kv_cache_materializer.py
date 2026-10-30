@@ -180,17 +180,26 @@ def _pool_attention_geometry(
                 break
         else:
             first = next(
-                (g for g in candidates if not isinstance(g.kv_cache_spec, MLAAttentionSpec)),
+                (
+                    g
+                    for g in candidates
+                    if isinstance(g.kv_cache_spec, FullAttentionSpec)
+                    and not isinstance(g.kv_cache_spec, MLAAttentionSpec)
+                ),
                 first,
             )
-            spec = first.kv_cache_spec
-            rows = spec.block_size // spec.tokens_per_state
-            return replace(spec, block_size=rows, tokens_per_state=1), first.backend, rows
-    spec = first.kv_cache_spec
+            full_spec = cast(FullAttentionSpec, first.kv_cache_spec)
+            rows = full_spec.block_size // (full_spec.tokens_per_state or 1)
+            return (
+                replace(full_spec, block_size=rows, tokens_per_state=1),
+                first.backend,
+                rows,
+            )
+    attn_spec = cast(AttentionSpec, first.kv_cache_spec)
     kernel_block_size = kernel_block_size_by_gid.get(
-        first.kv_cache_group_id, spec.block_size
+        first.kv_cache_group_id, attn_spec.block_size
     )
-    return spec, first.backend, kernel_block_size
+    return attn_spec, first.backend, kernel_block_size
 
 
 def layer_to_pool_index(kv_cache_config: KVCacheConfig) -> dict[str, int]:

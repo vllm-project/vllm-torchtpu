@@ -901,7 +901,9 @@ def _dcp_ops():
     )
     from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import dcp_combine_step
 
-    step = pallas.jax_op("qwen4_exp::pooled_qsa_dcp", pooled_qsa_dcp_step, donate_argnums=(10,))
+    step = pallas.jax_op(
+        "qwen4_exp::pooled_qsa_dcp", pooled_qsa_dcp_step, donate_argnums=(10,)
+    )
 
     def partial_shapes(qgate, nq, positions, pool, ratio, topk):
         tokens, head_dim = qgate.shape[0], nq.shape[0]
@@ -914,23 +916,75 @@ def _dcp_ops():
         )
 
     @step.register_fake
-    def step_fake(qgate, key, value, index_qk, nq, nk, niq, nik, positions, trig, pool,
-                  starts, context, ring_ids, main_table, compressed_table, dcp_rank,
-                  compress_ratio, token_topk, norm_eps, rotary_dim, dcp_size=2, k_scale=1.0,
-                  v_scale=1.0, compressed_slot=0, main_slot=-1, max_query_len=1):
+    def step_fake(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        dcp_rank,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        dcp_size=2,
+        k_scale=1.0,
+        v_scale=1.0,
+        compressed_slot=0,
+        main_slot=-1,
+        max_query_len=1,
+    ):
         return partial_shapes(qgate, nq, positions, pool, compress_ratio, token_topk)
 
     select = pallas.jax_op(
-        "qwen4_exp::pooled_qsa_token_select_dcp", pooled_qsa_token_select_dcp_step,
+        "qwen4_exp::pooled_qsa_token_select_dcp",
+        pooled_qsa_token_select_dcp_step,
         donate_argnums=(10,),
     )
 
     @select.register_fake
-    def select_fake(qgate, key, value, index_qk, nq, nk, niq, nik, positions, trig, pool,
-                    starts, context, ring_ids, main_table, compressed_table, shard_index,
-                    dcp_rank, compress_ratio, token_topk, norm_eps, rotary_dim, shard_size,
-                    dcp_size=2, k_scale=1.0, v_scale=1.0, compressed_slot=0, main_slot=-1,
-                    max_query_len=1):
+    def select_fake(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        shard_index,
+        dcp_rank,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        shard_size,
+        dcp_size=2,
+        k_scale=1.0,
+        v_scale=1.0,
+        compressed_slot=0,
+        main_slot=-1,
+        max_query_len=1,
+    ):
         tokens, head_dim = qgate.shape[0], nq.shape[0]
         heads = qgate.shape[1] // (2 * head_dim)
         return (
@@ -946,20 +1000,41 @@ def _dcp_ops():
         )
 
     attend = pallas.jax_op(
-        "qwen4_exp::pooled_qsa_shard_attend_dcp", pooled_qsa_shard_attend_dcp_step,
+        "qwen4_exp::pooled_qsa_shard_attend_dcp",
+        pooled_qsa_shard_attend_dcp_step,
         donate_argnums=(7,),
     )
 
     @attend.register_fake
-    def attend_fake(q, gate, lengths, req, starts, main_table, context, pool, gathered,
-                    dcp_rank, kv_heads, compress_ratio, token_topk, dcp_size=2, k_scale=1.0,
-                    v_scale=1.0, main_slot=-1, max_query_len=1, merged=False):
+    def attend_fake(
+        q,
+        gate,
+        lengths,
+        req,
+        starts,
+        main_table,
+        context,
+        pool,
+        gathered,
+        dcp_rank,
+        kv_heads,
+        compress_ratio,
+        token_topk,
+        dcp_size=2,
+        k_scale=1.0,
+        v_scale=1.0,
+        main_slot=-1,
+        max_query_len=1,
+        merged=False,
+    ):
         tokens = q.shape[0]
         return (
             torch.empty_like(pool),
             q.new_empty((tokens, q.shape[1], q.shape[2]), dtype=torch.float32),
             q.new_empty((tokens, q.shape[1]), dtype=torch.float32),
-            lengths.new_empty((tokens, token_topk + compress_ratio - 1), dtype=torch.int32),
+            lengths.new_empty(
+                (tokens, token_topk + compress_ratio - 1), dtype=torch.int32
+            ),
         )
 
     combine = pallas.jax_op("qwen4_exp::qsa_dcp_combine", dcp_combine_step)
@@ -997,10 +1072,11 @@ def build_pooled_qsa_dcp_op(pair_group, size: int):
         args[0] = pair_group.all_gather(qgate.contiguous(), dim=-1)
         updated, out, lse, blocks = step(*args, dcp_rank, dcp_size=size, **kwargs)
         args[10].copy_(updated)
-        return _dcp_finish(out, lse, qgate, head_dim, dcp_rank, pair_group, combine), blocks
+        return _dcp_finish(
+            out, lse, qgate, head_dim, dcp_rank, pair_group, combine
+        ), blocks
 
     return run
-
 
 
 @functools.cache
@@ -1030,40 +1106,131 @@ def _dcp_draft_ops():
     )
 
     @rows_op.register_fake
-    def rows_fake(qgate, key, value, index_qk, nq, nk, niq, nik, positions, trig, pool,
-                  starts, context, ring_ids, main_table, compressed_table, rows, dcp_rank,
-                  compress_ratio, token_topk, norm_eps, rotary_dim, dcp_size=2, k_scale=1.0,
-                  v_scale=1.0, compressed_slot=0, main_slot=-1, max_query_len=1):
-        return shapes(qgate, nq, positions, pool, rows.shape[0], compress_ratio, token_topk)
+    def rows_fake(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        rows,
+        dcp_rank,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        dcp_size=2,
+        k_scale=1.0,
+        v_scale=1.0,
+        compressed_slot=0,
+        main_slot=-1,
+        max_query_len=1,
+    ):
+        return shapes(
+            qgate, nq, positions, pool, rows.shape[0], compress_ratio, token_topk
+        )
 
     shared_op = pallas.jax_op(
-        "qwen4_exp::pooled_qsa_shared_dcp", pooled_qsa_shared_dcp_step, donate_argnums=(10,)
+        "qwen4_exp::pooled_qsa_shared_dcp",
+        pooled_qsa_shared_dcp_step,
+        donate_argnums=(10,),
     )
 
     @shared_op.register_fake
-    def shared_fake(qgate, key, value, index_qk, nq, nk, niq, nik, positions, trig, pool,
-                    starts, context, ring_ids, main_table, compressed_table, shared, dcp_rank,
-                    compress_ratio, token_topk, norm_eps, rotary_dim, dcp_size=2, k_scale=1.0,
-                    v_scale=1.0, compressed_slot=0, main_slot=-1, max_query_len=1, compressed_dcp=False):
-        return shapes(qgate, nq, positions, pool, shared.shape[0], compress_ratio, token_topk)
+    def shared_fake(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        shared,
+        dcp_rank,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        dcp_size=2,
+        k_scale=1.0,
+        v_scale=1.0,
+        compressed_slot=0,
+        main_slot=-1,
+        max_query_len=1,
+        compressed_dcp=False,
+    ):
+        return shapes(
+            qgate, nq, positions, pool, shared.shape[0], compress_ratio, token_topk
+        )
 
     shared_rows_op = pallas.jax_op(
-        "qwen4_exp::pooled_qsa_shared_rows_dcp", pooled_qsa_shared_rows_dcp_step,
+        "qwen4_exp::pooled_qsa_shared_rows_dcp",
+        pooled_qsa_shared_rows_dcp_step,
         donate_argnums=(10,),
     )
 
     @shared_rows_op.register_fake
-    def shared_rows_fake(qgate, key, value, index_qk, nq, nk, niq, nik, positions, trig,
-                         pool, starts, context, ring_ids, main_table, compressed_table, rows,
-                         shared, dcp_rank, compress_ratio, token_topk, norm_eps, rotary_dim,
-                         dcp_size=2, k_scale=1.0, v_scale=1.0, compressed_slot=0,
-                         main_slot=-1, max_query_len=1, compressed_dcp=False):
-        return shapes(qgate, nq, positions, pool, shared.shape[0], compress_ratio, token_topk)
+    def shared_rows_fake(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        rows,
+        shared,
+        dcp_rank,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        dcp_size=2,
+        k_scale=1.0,
+        v_scale=1.0,
+        compressed_slot=0,
+        main_slot=-1,
+        max_query_len=1,
+        compressed_dcp=False,
+    ):
+        return shapes(
+            qgate, nq, positions, pool, shared.shape[0], compress_ratio, token_topk
+        )
 
     return rows_op, shared_op, shared_rows_op
 
 
-def build_pooled_qsa_draft_dcp_op(pair_group, size: int, *, shared: bool, with_rows: bool):
+def build_pooled_qsa_draft_dcp_op(
+    pair_group, size: int, *, shared: bool, with_rows: bool
+):
     """The MTP draft's ops under VLLM_TPU_QSA_MTP_KV_DCP, as
     ``build_pooled_qsa_rows_op`` (``with_rows``, not ``shared``) or
     ``build_pooled_qsa_shared_op(with_rows)`` (``shared``), with the main KV
@@ -1087,7 +1254,9 @@ def build_pooled_qsa_draft_dcp_op(pair_group, size: int, *, shared: bool, with_r
         args[10].copy_(updated)
         # The combine gates each attended row with its token's gate.
         gate_rows = qgate[args[16].clamp_min(0)] if with_rows else qgate
-        return _dcp_finish(out, lse, gate_rows, head_dim, dcp_rank, pair_group, combine), blocks
+        return _dcp_finish(
+            out, lse, gate_rows, head_dim, dcp_rank, pair_group, combine
+        ), blocks
 
     return run
 
@@ -1103,15 +1272,41 @@ def _compressed_dcp_ops():
     )
 
     select = pallas.jax_op(
-        "qwen4_exp::pooled_qsa_compressed_dcp_select", pooled_qsa_compressed_dcp_select_step,
+        "qwen4_exp::pooled_qsa_compressed_dcp_select",
+        pooled_qsa_compressed_dcp_select_step,
         donate_argnums=(10,),
     )
 
     @select.register_fake
-    def select_fake(qgate, key, value, index_qk, nq, nk, niq, nik, positions, trig, pool,
-                    starts, context, ring_ids, main_table, compressed_table, dcp_rank,
-                    compress_ratio, token_topk, norm_eps, rotary_dim, dcp_size=2, k_scale=1.0,
-                    v_scale=1.0, compressed_slot=0, main_slot=-1, max_query_len=1):
+    def select_fake(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        dcp_rank,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        dcp_size=2,
+        k_scale=1.0,
+        v_scale=1.0,
+        compressed_slot=0,
+        main_slot=-1,
+        max_query_len=1,
+    ):
         tokens, head_dim = qgate.shape[0], nq.shape[0]
         heads = qgate.shape[1] // (2 * head_dim)
         k = token_topk // compress_ratio
@@ -1127,20 +1322,41 @@ def _compressed_dcp_ops():
         )
 
     attend = pallas.jax_op(
-        "qwen4_exp::pooled_qsa_compressed_dcp_attend", pooled_qsa_compressed_dcp_attend_step,
+        "qwen4_exp::pooled_qsa_compressed_dcp_attend",
+        pooled_qsa_compressed_dcp_attend_step,
         donate_argnums=(7,),
     )
 
     @attend.register_fake
-    def attend_fake(q, gate, lengths, req, starts, main_table, context, pool, vals_pair,
-                    pos_pair, dcp_rank, kv_heads, compress_ratio, token_topk, dcp_size=2,
-                    k_scale=1.0, v_scale=1.0, main_slot=-1, max_query_len=1):
+    def attend_fake(
+        q,
+        gate,
+        lengths,
+        req,
+        starts,
+        main_table,
+        context,
+        pool,
+        vals_pair,
+        pos_pair,
+        dcp_rank,
+        kv_heads,
+        compress_ratio,
+        token_topk,
+        dcp_size=2,
+        k_scale=1.0,
+        v_scale=1.0,
+        main_slot=-1,
+        max_query_len=1,
+    ):
         tokens = q.shape[0]
         return (
             torch.empty_like(pool),
             q.new_empty((tokens, q.shape[1], q.shape[2]), dtype=torch.float32),
             q.new_empty((tokens, q.shape[1]), dtype=torch.float32),
-            lengths.new_empty((tokens, token_topk + compress_ratio - 1), dtype=torch.int32),
+            lengths.new_empty(
+                (tokens, token_topk + compress_ratio - 1), dtype=torch.int32
+            ),
         )
 
     token_select = pallas.jax_op(
@@ -1150,14 +1366,60 @@ def _compressed_dcp_ops():
     )
 
     @token_select.register_fake
-    def token_select_fake(qgate, key, value, index_qk, nq, nk, niq, nik, positions, trig,
-                          pool, starts, context, ring_ids, main_table, compressed_table,
-                          shard_index, dcp_rank, compress_ratio, token_topk, norm_eps,
-                          rotary_dim, shard_size, dcp_size=2, k_scale=1.0, v_scale=1.0,
-                          compressed_slot=0, main_slot=-1, max_query_len=1):
-        out = select_fake(qgate, key, value, index_qk, nq, nk, niq, nik, positions, trig,
-                          pool, starts, context, ring_ids, main_table, compressed_table,
-                          dcp_rank, compress_ratio, token_topk, norm_eps, rotary_dim)
+    def token_select_fake(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        shard_index,
+        dcp_rank,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        shard_size,
+        dcp_size=2,
+        k_scale=1.0,
+        v_scale=1.0,
+        compressed_slot=0,
+        main_slot=-1,
+        max_query_len=1,
+    ):
+        out = select_fake(
+            qgate,
+            key,
+            value,
+            index_qk,
+            nq,
+            nk,
+            niq,
+            nik,
+            positions,
+            trig,
+            pool,
+            starts,
+            context,
+            ring_ids,
+            main_table,
+            compressed_table,
+            dcp_rank,
+            compress_ratio,
+            token_topk,
+            norm_eps,
+            rotary_dim,
+        )
         rows = qgate.shape[0] // shard_size
         return (*out[:6], out[6][:rows], out[7][:rows])
 
@@ -1201,19 +1463,36 @@ def build_pooled_qsa_compressed_dcp_op(pair_group, size: int):
             *args, dcp_rank, dcp_size=size, **kwargs
         )
         pool.copy_(updated)
-        vals_pair, pos_pair = _gathered_lists(vals, pos, pair_group, size, qgate.shape[0])
+        vals_pair, pos_pair = _gathered_lists(
+            vals, pos, pair_group, size, qgate.shape[0]
+        )
         attend_kwargs = {
             name: kwargs[name]
             for name in ("k_scale", "v_scale", "main_slot", "max_query_len")
             if name in kwargs
         }
         updated, out, lse, selected = attend(
-            q, gate, lengths, req, starts, args[14], args[12], pool, vals_pair, pos_pair,
-            dcp_rank, kv_heads=kv_heads, compress_ratio=kwargs["compress_ratio"],
-            token_topk=kwargs["token_topk"], dcp_size=size, **attend_kwargs,
+            q,
+            gate,
+            lengths,
+            req,
+            starts,
+            args[14],
+            args[12],
+            pool,
+            vals_pair,
+            pos_pair,
+            dcp_rank,
+            kv_heads=kv_heads,
+            compress_ratio=kwargs["compress_ratio"],
+            token_topk=kwargs["token_topk"],
+            dcp_size=size,
+            **attend_kwargs,
         )
         pool.copy_(updated)
-        return _dcp_finish(out, lse, qgate, head_dim, dcp_rank, pair_group, combine), selected
+        return _dcp_finish(
+            out, lse, qgate, head_dim, dcp_rank, pair_group, combine
+        ), selected
 
     return run
 
@@ -1237,8 +1516,12 @@ def build_pooled_qsa_token_shard_compressed_dcp_op(tp_group, pair_group, size: i
         args[0] = pair_group.all_gather(qgate.contiguous(), dim=-1)
         pool = args[10]
         updated, q, gate, lengths, req, starts, vals, pos = token_select(
-            *args, torch.div(shard_index, size, rounding_mode="floor"), dcp_rank,
-            shard_size=world // size, dcp_size=size, **kwargs,
+            *args,
+            torch.div(shard_index, size, rounding_mode="floor"),
+            dcp_rank,
+            shard_size=world // size,
+            dcp_size=size,
+            **kwargs,
         )
         pool.copy_(updated)
         vals_pair, pos_pair = _gathered_lists(vals, pos, tp_group, size, tokens)
@@ -1248,14 +1531,30 @@ def build_pooled_qsa_token_shard_compressed_dcp_op(tp_group, pair_group, size: i
             if name in kwargs
         }
         updated, out, lse, selected = attend(
-            q, gate, lengths, req, starts, args[14], args[12], pool, vals_pair, pos_pair,
-            dcp_rank, kv_heads=kv_heads, compress_ratio=kwargs["compress_ratio"],
-            token_topk=kwargs["token_topk"], dcp_size=size, **attend_kwargs,
+            q,
+            gate,
+            lengths,
+            req,
+            starts,
+            args[14],
+            args[12],
+            pool,
+            vals_pair,
+            pos_pair,
+            dcp_rank,
+            kv_heads=kv_heads,
+            compress_ratio=kwargs["compress_ratio"],
+            token_topk=kwargs["token_topk"],
+            dcp_size=size,
+            **attend_kwargs,
         )
         pool.copy_(updated)
-        return _dcp_finish(out, lse, qgate, head_dim, dcp_rank, pair_group, combine), selected
+        return _dcp_finish(
+            out, lse, qgate, head_dim, dcp_rank, pair_group, combine
+        ), selected
 
     return run
+
 
 def build_pooled_qsa_token_shard_dcp_op(tp_group, pair_group, size: int):
     """``build_pooled_qsa_token_shard_op`` with the DCP main-KV split."""
@@ -1299,6 +1598,8 @@ def build_pooled_qsa_token_shard_dcp_op(tp_group, pair_group, size: int):
             **attend_kwargs,
         )
         pool.copy_(updated)
-        return _dcp_finish(out, lse, qgate, head_dim, dcp_rank, pair_group, combine), selected
+        return _dcp_finish(
+            out, lse, qgate, head_dim, dcp_rank, pair_group, combine
+        ), selected
 
     return run

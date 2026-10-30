@@ -639,7 +639,9 @@ def test_prefill_pool_page_table_keeps_the_selection(
 
     def run():
         return np.asarray(
-            pooled_qsa.select_blocks(**args, ratio=RATIO, block_topk=BLOCK_TOPK, slot=slot)
+            pooled_qsa.select_blocks(
+                **args, ratio=RATIO, block_topk=BLOCK_TOPK, slot=slot
+            )
         )
 
     expected = run()

@@ -12,6 +12,7 @@ from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import virtual_page_metadata
 
 RATIO, B, D, BUDGET = 4, 32, 2, 16  # small page: 8 groups per page
 
+pytestmark = pytest.mark.tpu_test
 
 
 @pytest.fixture(autouse=True)
@@ -27,7 +28,9 @@ def _on_tpu():
 def test_dcp_metadata_keeps_owned_groups(seed):
     rng = np.random.default_rng(seed)
     rows, entries = 12, 6
-    table = rng.permutation(100)[: rows * entries].reshape(rows, entries).astype(np.int32)
+    table = (
+        rng.permutation(100)[: rows * entries].reshape(rows, entries).astype(np.int32)
+    )
     lengths = rng.integers(0, entries * D * B, size=rows).astype(np.int32)
     lengths[0] = 0
     blocks = np.full((rows, BUDGET), -5, np.int32)  # junk past count
@@ -41,8 +44,12 @@ def test_dcp_metadata_keeps_owned_groups(seed):
         pages, kv_lens, cu, _ = (
             np.asarray(x)
             for x in virtual_page_metadata(
-                jnp.asarray(blocks), jnp.asarray(lengths), jnp.asarray(table),
-                ratio=RATIO, page_size=B, dcp=(jnp.array([rank], jnp.int32), D),
+                jnp.asarray(blocks),
+                jnp.asarray(lengths),
+                jnp.asarray(table),
+                ratio=RATIO,
+                page_size=B,
+                dcp=(jnp.array([rank], jnp.int32), D),
             )
         )
         for i, L in enumerate(lengths):
@@ -65,6 +72,8 @@ def test_dcp_off_is_unchanged():
     lengths = jnp.asarray([18], jnp.int32)
     table = jnp.asarray([[7, 9]], jnp.int32)
     a = virtual_page_metadata(blocks, lengths, table, ratio=RATIO, page_size=B)
-    b = virtual_page_metadata(blocks, lengths, table, ratio=RATIO, page_size=B, dcp=None)
+    b = virtual_page_metadata(
+        blocks, lengths, table, ratio=RATIO, page_size=B, dcp=None
+    )
     for x, y in zip(a, b):
         np.testing.assert_array_equal(np.asarray(x), np.asarray(y))

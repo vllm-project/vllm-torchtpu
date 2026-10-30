@@ -8,7 +8,6 @@ Combine: merging two ranks' partial softmax attention (out, lse) equals the
 full softmax attention over the union of their keys.
 """
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -24,15 +23,16 @@ from vllm_torchtpu.kernels.qwen4_exp import pooled_qsa, qsa_rpa
 RATIO, ROTARY, WIDTH = 4, 64, 256
 
 
-def _writes(query_lens, contexts, dcp, seed=0):
+def _writes(query_lens, contexts, dcp):
     """Pool after qsa_cache_writes: replicated tables (dcp None) or 2B tables."""
-    rng = np.random.default_rng(seed)
     requests = len(contexts)
     starts = np.concatenate([[0], np.cumsum(query_lens)]).astype(np.int32)
     tokens = max(8, -(-int(starts[-1]) // 8) * 8)
     span = PAGE_ROWS * (dcp[1] if dcp else 1)
     columns = 4
-    pages = np.arange(1, 1 + requests * columns, dtype=np.int32).reshape(requests, columns)
+    pages = np.arange(1, 1 + requests * columns, dtype=np.int32).reshape(
+        requests, columns
+    )
     main = pages
     comp = pages + requests * columns
     ring = np.arange(PAGES - requests, PAGES, dtype=np.int32)
@@ -47,22 +47,43 @@ def _writes(query_lens, contexts, dcp, seed=0):
     trig = jnp.zeros((4096, 128), jnp.bfloat16)
     del span
     out, *_ = pooled_qsa.qsa_cache_writes(
-        pool, k, v, raw_keys, jnp.asarray(positions), jnp.ones((128,), jnp.bfloat16), trig,
-        jnp.asarray(starts), jnp.asarray(contexts, jnp.int32), jnp.asarray(ring),
-        jnp.asarray(main), jnp.asarray(comp), compress_ratio=RATIO, norm_eps=1e-6,
-        rotary_dim=ROTARY, dcp=dcp,
+        pool,
+        k,
+        v,
+        raw_keys,
+        jnp.asarray(positions),
+        jnp.ones((128,), jnp.bfloat16),
+        trig,
+        jnp.asarray(starts),
+        jnp.asarray(contexts, jnp.int32),
+        jnp.asarray(ring),
+        jnp.asarray(main),
+        jnp.asarray(comp),
+        compress_ratio=RATIO,
+        norm_eps=1e-6,
+        rotary_dim=ROTARY,
+        dcp=dcp,
     )
     return raw(out), starts, positions, main
 
 
 @pytest.mark.parametrize(
     "query_lens,contexts",
-    [([700, 4, 4], [100, 509, 1030]), ([4, 4, 4, 4], [37, 511, 512, 1500]), ([1000], [0])],
+    [
+        ([700, 4, 4], [100, 509, 1030]),
+        ([4, 4, 4, 4], [37, 511, 512, 1500]),
+        ([1000], [0]),
+    ],
 )
-def test_owned_rows_match_the_replicated_layout(interpret, query_lens, contexts):
+def test_owned_rows_match_the_replicated_layout(
+    interpret,  # noqa: F811
+    query_lens,
+    contexts,
+):
     want, starts, positions, main = _writes(query_lens, contexts, None)
     got = [
-        _writes(query_lens, contexts, (jnp.asarray([r], jnp.int32), 2))[0] for r in (0, 1)
+        _writes(query_lens, contexts, (jnp.asarray([r], jnp.int32), 2))[0]
+        for r in (0, 1)
     ]
     for r, (begin, end) in enumerate(zip(starts[:-1], starts[1:])):
         for t in range(begin, end):
@@ -84,7 +105,11 @@ def _attend(q, k, v, mask):
     p = np.where(np.isfinite(m), np.exp(s - np.where(np.isfinite(m), m, 0)), 0)
     den = p.sum(-1, keepdims=True)
     out = np.einsum("thk,khd->thd", p, v) / np.where(den > 0, den, 1)
-    lse = np.where(den[..., 0] > 0, np.log(np.where(den[..., 0] > 0, den[..., 0], 1)) + m[..., 0], -np.inf)
+    lse = np.where(
+        den[..., 0] > 0,
+        np.log(np.where(den[..., 0] > 0, den[..., 0], 1)) + m[..., 0],
+        -np.inf,
+    )
     return out, lse
 
 
@@ -105,7 +130,9 @@ def test_pair_combine_equals_full_attention():
     gate = jnp.full((tokens, heads // 2, dim), 30.0, jnp.bfloat16)  # sigmoid ~ 1
     for rank in (0, 1):
         got = np.asarray(
-            qsa_rpa.dcp_combine(out_pair, lse_pair, gate, jnp.asarray([rank], jnp.int32)),
+            qsa_rpa.dcp_combine(
+                out_pair, lse_pair, gate, jnp.asarray([rank], jnp.int32)
+            ),
             np.float32,
         )
         want = full[:, rank * 3 : rank * 3 + 3]

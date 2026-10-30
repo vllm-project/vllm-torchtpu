@@ -13,28 +13,33 @@ for path in (HERE, KERNEL_TESTS):
         sys.path.insert(0, path)
 
 
-ON_TPU = os.environ.get("DCP2_HARNESS_DEVICE", "cpu").lower() == "tpu"
+def _is_tpu_test(request: pytest.FixtureRequest) -> bool:
+    return request.node.get_closest_marker("tpu_test") is not None
 
 
 @pytest.fixture(autouse=True)
-def cpu_device():
-    """CPU mode runs on the CPU backend even on a TPU host (the pod pytest
+def cpu_device(request: pytest.FixtureRequest):
+    """CPU tests run on the CPU backend even on a TPU host (the pod pytest
     recipe sets JAX_PLATFORMS=tpu,cpu): default-precision TPU matmuls round
-    through bf16, far outside the 2-ulp bar the CPU oracles are held to."""
-    if ON_TPU:
+    through bf16, far outside the 2-ulp bar the CPU oracles are held to.
+    Tests marked ``tpu_test`` run on the TPU backend and skip if absent."""
+    import jax
+
+    if _is_tpu_test(request):
+        if jax.default_backend() != "tpu":
+            pytest.skip("requires TPU backend")
         yield
         return
-    import jax
 
     with jax.default_device(jax.devices("cpu")[0]):
         yield
 
 
 @pytest.fixture
-def interpret(monkeypatch):
+def interpret(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch):
     """Pallas kernels in the legacy interpret evaluator on CPU (TPU7x info);
-    a no-op under DCP2_HARNESS_DEVICE=tpu (real Mosaic kernels)."""
-    if ON_TPU:
+    a no-op for ``tpu_test`` items, which run the real Mosaic kernels."""
+    if _is_tpu_test(request):
         return
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
@@ -49,9 +54,25 @@ def interpret(monkeypatch):
     monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
 
 
-def reference_rpa_lse(queries, keys, values, kv_cache, kv_lens, page_indices,
-                      cu_q_lens, distribution, *, sm_scale, k_scale, v_scale,
-                      out_dtype, kv_layout, skip_kv_update, return_lse=False, **_):
+def reference_rpa_lse(
+    queries,
+    keys,
+    values,
+    kv_cache,
+    kv_lens,
+    page_indices,
+    cu_q_lens,
+    distribution,
+    *,
+    sm_scale,
+    k_scale,
+    v_scale,
+    out_dtype,
+    kv_layout,
+    skip_kv_update,
+    return_lse=False,
+    **_,
+):
     """test_qwen4_exp_paired_main_kv.reference_rpa (decode-only
     HEAD_ALONG_SUBLANE RPA; combined head 2h = K, 2h + 1 = V) plus the
     ``return_lse`` output (out, cache, lse [rows, heads], natural log)."""
@@ -68,7 +89,9 @@ def reference_rpa_lse(queries, keys, values, kv_cache, kv_lens, page_indices,
     lse_out = jnp.full(queries.shape[:2], -jnp.inf, jnp.float32)
     for seq in range(len(kv_lens)):
         pages = page_indices[seq * pages_per_seq : (seq + 1) * pages_per_seq]
-        cache = combined[pages].reshape(pages_per_seq * page_size, -1, combined.shape[-1])
+        cache = combined[pages].reshape(
+            pages_per_seq * page_size, -1, combined.shape[-1]
+        )
         key = cache[:, 0 : 2 * kv_heads : 2].astype(jnp.float32) * k_scale
         value = cache[:, 1 : 2 * kv_heads : 2].astype(jnp.float32) * v_scale
         visible = jnp.arange(len(cache)) < kv_lens[seq]
@@ -89,11 +112,11 @@ def reference_rpa_lse(queries, keys, values, kv_cache, kv_lens, page_indices,
 
 
 @pytest.fixture
-def rpa_stand_in(monkeypatch):
+def rpa_stand_in(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch):
     """Batched RPA cannot run in interpret mode: the decode-only reference the
     existing QSA tests use, extended with ``return_lse`` (set6's contract:
     ``wrapper.ragged_paged_attention(..., return_lse=True)`` -> out, cache, lse)."""
-    if ON_TPU:
+    if _is_tpu_test(request):
         return
     from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper
 

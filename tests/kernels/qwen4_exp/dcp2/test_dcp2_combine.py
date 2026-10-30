@@ -11,11 +11,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from dcp2_harness import (
-    DEFAULT_TOL,
     D,
     check_gated,
     combine_plain_average,
     combine_rank0_only,
+    default_tol,
     gate_output,
     rank_operand,
     reference_combine,
@@ -46,11 +46,13 @@ def pairs(seed):
 def full_merge(out, lse, rank):
     """Float64 merge, the mathematical target."""
     o = np.asarray(out, np.float64)[:, :, rank * H : (rank + 1) * H]
-    l = np.asarray(lse, np.float64)[:, :, rank * H : (rank + 1) * H]
-    m = l.max(0)
+    lse_r = np.asarray(lse, np.float64)[:, :, rank * H : (rank + 1) * H]
+    m = lse_r.max(0)
     fin = np.isfinite(m)
-    w = np.where(fin[None], np.exp(l - np.where(fin, m, 0)[None]), 0)
-    return (w[..., None] * o).sum(0) / np.where(w.sum(0) > 0, w.sum(0), 1)[..., None], fin
+    w = np.where(fin[None], np.exp(lse_r - np.where(fin, m, 0)[None]), 0)
+    return (w[..., None] * o).sum(0) / np.where(w.sum(0) > 0, w.sum(0), 1)[
+        ..., None
+    ], fin
 
 
 @pytest.mark.parametrize("rank", [0, 1])
@@ -74,7 +76,9 @@ def test_dcp_combine_empty_everywhere_is_zero():
     lse = jnp.full((D, 8, D * H), -jnp.inf, jnp.float32)
     gate = jnp.full((8, H, DH), jnp.nan, jnp.bfloat16)
     for rank in range(D):
-        got = np.asarray(qsa_rpa.dcp_combine(out, lse, gate, rank_operand(rank)), np.float32)
+        got = np.asarray(
+            qsa_rpa.dcp_combine(out, lse, gate, rank_operand(rank)), np.float32
+        )
         assert not np.isnan(got).any() and np.all(got == 0)
 
 
@@ -87,8 +91,9 @@ def test_dcp_combine_picks_own_heads():
         assert not np.array_equal(np.asarray(got), np.asarray(other))
 
 
-@pytest.mark.parametrize("fault", [combine_rank0_only, combine_plain_average],
-                         ids=lambda f: f.__name__)
+@pytest.mark.parametrize(
+    "fault", [combine_rank0_only, combine_plain_average], ids=lambda f: f.__name__
+)
 def test_combine_fault_controls_are_detected(fault):
     out, lse, gate = pairs(0)
     for rank in range(D):
@@ -96,5 +101,10 @@ def test_combine_fault_controls_are_detected(fault):
         merged, live = full_merge(out, lse, rank)
         oracle = gate_output(jnp.asarray(merged, jnp.float32), g, jnp.asarray(live))
         with pytest.raises(AssertionError):
-            check_gated(fault(out, lse, g, rank_operand(rank)), oracle, live,
-                        DEFAULT_TOL, what=fault.__name__)
+            check_gated(
+                fault(out, lse, g, rank_operand(rank)),
+                oracle,
+                live,
+                default_tol(),
+                what=fault.__name__,
+            )
