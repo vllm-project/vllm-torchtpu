@@ -202,19 +202,25 @@ class QwenPrefillStage:
     def _null_step(self, tokens: int, prefix: int) -> StepInput:
         """A step of one request of ``tokens`` new tokens after ``prefix``
         cached ones, whose block tables name only vLLM's null block (padding's
-        block, so no live KV or state is touched); zeros as the hand-off."""
+        block, so no live KV or state is touched). Its tokens and hand-off are
+        random: identical rows would all route to the same experts and time
+        the MoE at its worst."""
+        rng = np.random.default_rng(tokens * 7919 + prefix)
         request = RequestInput(
             req_id=f"qwen38-null-{tokens}-{prefix}",
             computed=prefix,
             scheduled=tokens,
-            token_ids=np.zeros(prefix + tokens, np.int32),
+            token_ids=rng.integers(0, VOCAB, prefix + tokens, dtype=np.int32),
             num_tokens=prefix + tokens,
             num_prompt_tokens=prefix + tokens,
             block_tables=tuple(np.zeros(w, np.int32) for w in self._table_widths),
         )
         step = StepInput(requests=[request])
         if not self.first_stage:
-            hidden = torch.zeros((self.rows(step), HIDDEN_SIZE), dtype=torch.bfloat16)
+            generator = torch.Generator().manual_seed(tokens * 7919 + prefix)
+            hidden = torch.randn(
+                (self.rows(step), HIDDEN_SIZE), generator=generator
+            ).to(torch.bfloat16)
             step.hidden = {HIDDEN_STATES: hidden.to("tpu")}
         return step
 
