@@ -252,6 +252,8 @@ if TYPE_CHECKING:
     VLLM_TPU_STALL_WATCHDOG_S: float = 0.0
     VLLM_TPU_POST_WARMUP_HOSTMEM: str = "off"
     VLLM_TPU_HOSTMEM_SAMPLE_S: float = 0.0
+    VLLM_TPU_EXEC_CALL_COUNT: bool = False
+    VLLM_TPU_EXEC_CALL_COUNT_S: float = 1200.0
     VLLM_TPU_VERIFY_FUSED: bool = False
     VLLM_TPU_VERIFY_FUSED_CHECK: int = 0
     VLLM_TPU_VERIFY_FUSED_CHECK_FAULT: int = 0
@@ -1547,6 +1549,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_POST_WARMUP_HOSTMEM": env_str("VLLM_TPU_POST_WARMUP_HOSTMEM", "off"),
     # >0: log host RSS / tcmalloc / pymalloc split every this many seconds.
     "VLLM_TPU_HOSTMEM_SAMPLE_S": env_float("VLLM_TPU_HOSTMEM_SAMPLE_S", 0.0),
+    # Count calls per loaded torch_tpu executable (runner/exec_calls.py); rank 0
+    # logs them every VLLM_TPU_EXEC_CALL_COUNT_S seconds after warmup.
+    "VLLM_TPU_EXEC_CALL_COUNT": env_bool("VLLM_TPU_EXEC_CALL_COUNT"),
+    "VLLM_TPU_EXEC_CALL_COUNT_S": env_float("VLLM_TPU_EXEC_CALL_COUNT_S", 1200.0),
     # Non-greedy spec verify as one program (tpu_runner._verify_fused_impl).
     "VLLM_TPU_VERIFY_FUSED": env_bool("VLLM_TPU_VERIFY_FUSED"),
     # Compare the fused verify and draft seed with the separate programs for

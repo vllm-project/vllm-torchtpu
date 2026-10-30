@@ -756,6 +756,9 @@ class TPUWorker(WorkerBase):
         from vllm_torchtpu import patch_registry
 
         patch_registry.apply("model_load", model_config=self.model_config)
+        from vllm_torchtpu.runner import exec_calls
+
+        exec_calls.install()
         self.model_runner.load_model()
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
@@ -771,6 +774,9 @@ class TPUWorker(WorkerBase):
         from vllm_torchtpu.runner import hostmem_release
 
         hostmem_release.after_warmup(self.rank)
+        from vllm_torchtpu.runner import exec_calls
+
+        exec_calls.after_warmup(self.rank)
         # The warmed worker holds a large static heap (model, compiled
         # executables, KV bookkeeping); freezing it keeps a gen-2 collection
         # from scanning those objects mid-step.
