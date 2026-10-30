@@ -26,7 +26,8 @@ from vllm_torchtpu.models.vllm.qwen4_exp.pd_identity import (
 
 def digest(weights):
     identity = LoadedWeightIdentity()
-    assert all(a is b for (_, a), (_, b) in zip(identity.observe(weights), weights))
+    for name, tensor in weights:
+        identity.add(name, tensor)
     return identity.finish()
 
 
@@ -50,13 +51,12 @@ def test_identity_order_shape_name_and_duplicate():
     assert digest([("a", a)]) != digest([("a", a.reshape(2, 6))])
     with pytest.raises(ValueError, match="Duplicate"):
         digest([("a", a), ("a", a)])
-    with pytest.raises(ValueError, match="contiguous CPU"):
-        digest([("a", a.T)])
+    assert digest([("a", a.T)]) == digest([("a", a.T.contiguous())])
     with pytest.raises(ValueError, match="successfully loaded"):
         LoadedWeightIdentity().finish()
 
 
-def ranks():
+def ranks() -> list[dict]:
     return [
         dict(
             rank=i,
@@ -88,7 +88,7 @@ def test_rank_identity_rejects_incomplete_or_inconsistent_peers(fault):
     elif fault == "state":
         rows[0]["state_flags"] = {}
     elif fault == "ple":
-        rows[0]["ple_checkpoint"] = "b" * 64
+        rows[0]["ple_checkpoint"] = None
     else:
         rows[0]["tp_rank"] = 2
     with pytest.raises(ValueError):
@@ -117,3 +117,12 @@ def test_rank_identity_requires_matching_ssm_dtype(ssm_dtype):
     )
     with pytest.raises(ValueError, match="state configuration"):
         canonical_rank_identity(rows, world_size=2)
+
+
+def test_rank_identity_allows_owned_ple_shards_but_keeps_them_in_peer_signature():
+    rows = ranks()
+    first = copy.deepcopy(canonical_rank_identity(rows, world_size=2))
+    rows[1]["ple_checkpoint"] = "c" * 64
+    changed = canonical_rank_identity(rows, world_size=2)
+    assert changed != first
+    assert changed["ranks"][1]["ple_checkpoint"] == "c" * 64

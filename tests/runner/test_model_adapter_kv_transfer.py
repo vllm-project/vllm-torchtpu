@@ -123,7 +123,7 @@ def test_qwen_pool_adapter_registers_materialized_carriers(monkeypatch, ssm_dtyp
             ple=SimpleNamespace(bind_pool=lambda raw: bound.update(ple=raw)),
         ),
         SimpleNamespace(
-            layer_type="full_attention",
+            layer_type="indexed_attention",
             self_attn=SimpleNamespace(
                 bind_pool=lambda main, index: bound.update(main=main, index=index)
             ),

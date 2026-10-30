@@ -573,6 +573,7 @@ class TestTpuPlatform:
             "TPUConnector",
             "TPURaidenConnector",
             "TPUMultiConnector",
+            "Qwen4ExpRaidenConnector",
         ],
     )
     @patch("vllm_torchtpu.patch_registry.apply")

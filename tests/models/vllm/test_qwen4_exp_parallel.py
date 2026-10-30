@@ -918,6 +918,23 @@ def test_model_streams_expert_and_shared_weights_through_upstream_loaders(
                 projection.weight_scale, projection.weight_scale_inv, rtol=0, atol=0
             )
     layer.self_attn.finalize_weights.assert_called_once()
+    if pd_identity and enable_ep:
+        before_identity = model.pd_loaded_weight_identity
+        unowned = prefix + "layers.0.mlp.experts.0.gate_proj.weight"
+        extra = torch.full((640, 256), 3, dtype=torch.float8_e4m3fn)
+        model.load_weights(iter([*source, (unowned, extra)]))
+        assert model.pd_loaded_weight_identity == before_identity
+        changed = [
+            (
+                name,
+                value + 1
+                if name.endswith("experts.7.gate_proj.weight_scale_inv")
+                else value,
+            )
+            for name, value in source
+        ]
+        model.load_weights(iter(changed))
+        assert model.pd_loaded_weight_identity != before_identity
     missing_name = prefix + "layers.0.mlp.experts.7.gate_proj.weight_scale_inv"
     incomplete = ((name, value) for name, value in source if name != missing_name)
     with pytest.raises(ValueError, match="expert checkpoint: 1 missing"):
@@ -987,3 +1004,177 @@ def test_pd_reuses_upstream_moe_without_precision_override(upstream_moe, transfe
     assert type(block) is Qwen3NextSparseMoeBlock
     assert "combine_dtype" not in vars(block.experts)
     assert block.experts.do_naive_dispatch_combine
+
+
+@pytest.mark.parametrize("storage", ["resident", "host", "shared"])
+@pytest.mark.parametrize("fp8", [False, True])
+def test_pd_identity_hashes_only_real_ple_checkpoint_overlap(
+    upstream_moe, monkeypatch, tmp_path, storage, fp8
+):
+    from typing import cast
+
+    from transformers import Qwen4ExpTextConfig
+    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+    from vllm.distributed import GroupCoordinator
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import ple_storage
+    from vllm_torchtpu.models.vllm.qwen4_exp.model import (
+        Qwen4ExpBackbone,
+        Qwen4ExpDecoderLayer,
+        Qwen4ExpForCausalLM,
+    )
+    from vllm_torchtpu.models.vllm.qwen4_exp.ple_host import SharedPLEOptions
+    from vllm_torchtpu.models.vllm.qwen4_exp.pooled_ple import Qwen4ExpPooledPLE
+    from vllm_torchtpu.models.vllm.qwen4_exp.qsa import Qwen4ExpQSA
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("CPU checkpoint loading executed a native lookup")
+
+    monkeypatch.setattr(ple_storage, "build_decode_op", lambda: forbidden)
+    monkeypatch.setattr(ple_storage, "build_raw_lookup_op", lambda *args: forbidden)
+    text = Qwen4ExpTextConfig.from_dict(
+        dict(
+            hidden_size=256,
+            ple_layer_ids=[1],
+            ngram_size=3,
+            heads_per_ngram=2,
+            ngram_vocab_size_base=10,
+            make_ngram_vocab_size_divisible_by=16,
+            split_ngram_parts=3,
+            ple_embed_dim=64,
+            ple_conv_kernel_size=4,
+            eos_token_id=3,
+            ple_embedding_dtype="float8_e4m3fn" if fp8 else None,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=128,
+            indexer_n_heads=2,
+            indexer_head_dim=64,
+            partial_rotary_factor=0.5,
+            indexer_kv_heads=1,
+            indexer_compress_ratio=4,
+            indexer_budget=64,
+            num_hidden_layers=2,
+            layer_types=["linear_attention", "indexed_attention"],
+        )
+    )
+    checkpoints = []
+    for variant in ("original", "unowned", "owned"):
+        with (
+            set_current_vllm_config(
+                VllmConfig(device_config=DeviceConfig(device="cpu"))
+            ),
+            set_default_torch_dtype(torch.bfloat16),
+        ):
+            model = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
+            nn.Module.__init__(model)
+            model._pd_weight_identity_enabled = True
+            model.model = Qwen4ExpBackbone.__new__(Qwen4ExpBackbone)
+            nn.Module.__init__(model.model)
+            layer = Qwen4ExpDecoderLayer.__new__(Qwen4ExpDecoderLayer)
+            nn.Module.__init__(layer)
+            layer.mlp = upstream_moe(1, True, 7, shared_fp8=False)
+            layer.layer_type = "indexed_attention"
+            layer.self_attn = Qwen4ExpQSA(
+                config=text, tp_rank=0, tp_size=1, max_model_len=16, device="cpu"
+            )
+            tp = NS(rank_in_group=0, world_size=1)
+            dp = NS(rank_in_group=7, world_size=8)
+            shared = (
+                SharedPLEOptions(tmp_path, variant, {"checkpoint": "tiny"}, 1)
+                if storage == "shared"
+                else None
+            )
+            layer.ple = Qwen4ExpPooledPLE(
+                text,
+                0,
+                None,
+                "model.layers.0.ple",
+                parallel=PLEParallel(tp, dp, embedding_across_dp=True),
+                table_group=cast(GroupCoordinator, dp),
+                cpu_offload=storage != "resident",
+                shared=shared,
+            )
+            model.model.layers = nn.ModuleList([layer])
+            weights = []
+            for projection, shape in (
+                ("gate", (640, 256)),
+                ("up", (640, 256)),
+                ("down", (256, 640)),
+            ):
+                prefix = f"model.layers.0.mlp.experts.7.{projection}_proj"
+                weights.extend(
+                    [
+                        (
+                            prefix + ".weight",
+                            torch.ones(shape, dtype=torch.float8_e4m3fn),
+                        ),
+                        (
+                            prefix + ".weight_scale_inv",
+                            torch.ones(
+                                (shape[0] // 128, shape[1] // 128), dtype=torch.float32
+                            ),
+                        ),
+                    ]
+                )
+            for field, shape in (
+                ("gate", (8, 256)),
+                ("shared_expert_gate", (1, 256)),
+                ("shared_expert.gate_proj", (640, 256)),
+                ("shared_expert.up_proj", (640, 256)),
+                ("shared_expert.down_proj", (256, 640)),
+            ):
+                weights.append(
+                    (
+                        f"model.layers.0.mlp.{field}.weight",
+                        torch.ones(shape, dtype=torch.bfloat16),
+                    )
+                )
+            for name, value in layer.self_attn.named_parameters():
+                weights.append(
+                    (f"model.layers.0.self_attn.{name}", torch.full_like(value, 0.25))
+                )
+            for name, value in layer.ple.named_parameters():
+                if name != "ple_embedding.ngram_embedding.weight":
+                    weights.append(
+                        (f"model.layers.0.ple.{name}", torch.full_like(value, 0.25))
+                    )
+            for name in (
+                "layer_multipliers",
+                "ngram_heads_vocab_sizes",
+                "ngram_heads_offsets",
+            ):
+                weights.append(
+                    (
+                        f"model.layers.0.ple.ple_embedding.{name}",
+                        layer.ple.ple_embedding.get_buffer(name).clone(),
+                    )
+                )
+            dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
+            rows = torch.arange(64 * 16).remainder(8).reshape(64, 16).to(dtype)
+            if variant == "unowned":
+                rows[:56] = 3
+            elif variant == "owned":
+                rows[60] = 5
+            weights.extend(
+                (
+                    f"model.layers.0.ple.ple_embedding.ngram_embedding.shard_{index}.weight",
+                    value,
+                )
+                for index, value in enumerate(rows.split(22))
+            )
+            before = [value.view(torch.uint8).clone() for _, value in weights]
+            try:
+                model.load_weights(iter(weights))
+                checkpoints.append(
+                    (model.pd_loaded_weight_identity, model.pd_loaded_ple_identity)
+                )
+                for (_, value), original in zip(weights, before):
+                    assert torch.equal(value.view(torch.uint8), original)
+            finally:
+                if isinstance(layer.ple.storage, ple_storage.HostPLETable):
+                    layer.ple.storage.close()
+    assert checkpoints[0] == checkpoints[1]
+    assert checkpoints[0][0] != checkpoints[2][0]
+    assert checkpoints[0][1] != checkpoints[2][1]

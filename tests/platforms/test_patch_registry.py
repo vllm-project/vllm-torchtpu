@@ -268,7 +268,7 @@ assert 'TPURaidenConnector' not in KVConnectorFactory._registry
 patch_registry.apply({stage!r})
 patch_registry.apply({stage!r})
 for name in ('TPURaidenConnector', 'TPUMultiConnector',
-             'TPURaidenOffloadingConnector'):
+             'TPURaidenOffloadingConnector', 'Qwen4ExpRaidenConnector'):
     assert KVConnectorFactory.get_connector_class_by_name(name).__name__ == name
 """
     result = subprocess.run(

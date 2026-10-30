@@ -14,6 +14,8 @@
 """Checkpoint-native text backbone with explicit TPU state/input ownership."""
 
 from collections.abc import Iterable, Sequence
+from contextlib import nullcontext
+from itertools import chain
 from typing import cast
 
 import torch
@@ -30,7 +32,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import (
     HasInnerState,
     IsHybrid,
@@ -38,6 +39,7 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.qwen3_next import Qwen3NextSparseMoeBlock
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.model_executor.parameter import BasevLLMParameter
+from vllm.models.qwen4_exp.common.ple import compute_ple_shard_overlap
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_torchtpu import envs
@@ -366,10 +368,12 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         self.pd_loaded_weight_identity = None
         self.pd_loaded_ple_identity = None
-        identity = LoadedWeightIdentity() if self._pd_weight_identity_enabled else None
-        if identity is not None:
-            weights = identity.observe(weights)
         parameters = dict(self.named_parameters())
+        identity = (
+            LoadedWeightIdentity(chain(parameters.values(), self.buffers()))
+            if self._pd_weight_identity_enabled
+            else None
+        )
         loaded, source = set(), set()
         moe_mapper = WeightsMapper(
             orig_to_new_stacked={
@@ -394,37 +398,75 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             if name in source:
                 raise ValueError(f"Duplicate checkpoint tensor {original}")
             source.add(name)
-            if name.startswith("model.layers."):
-                _, _, idx, family, relative = name.split(".", 4)
-                layer = layers[int(idx)]
-                if family == "mlp":
-                    targets = moe_loaders[int(idx)].load_weights(
-                        iter([(relative, weight)]), mapper=moe_mapper
-                    )
-                    loaded.update(
-                        f"model.layers.{idx}.mlp.{target}" for target in targets
-                    )
-                    continue
-                if family == "ple":
-                    assert layer.ple is not None
-                    layer.ple.load_checkpoint([(relative, weight)])
-                    continue
-                if family == "self_attn":
-                    layer.self_attn.load_weights([(relative, weight)])
-                    continue
-                if family == "linear_attn" and relative in gdn_map:
-                    mapped, shard = gdn_map[relative]
-                    target = f"model.layers.{idx}.linear_attn.{mapped}"
-                    param = parameters[target]
-                    cast(BasevLLMParameter, param).weight_loader(param, weight, shard)
-                    loaded.add(target)
-                    continue
-            if name not in parameters:
-                raise ValueError(f"Unknown Qwen4Exp checkpoint tensor {original}")
-            param = parameters[name]
-            loader = getattr(param, "weight_loader", default_weight_loader)
-            loader(param, weight)
-            loaded.add(name)
+            is_ple = name.startswith("model.layers.") and name.split(".", 4)[3] == "ple"
+            with (
+                identity.observe(name)
+                if identity is not None and not is_ple
+                else nullcontext()
+            ):
+                if name.startswith("model.layers."):
+                    _, _, idx, family, relative = name.split(".", 4)
+                    layer = layers[int(idx)]
+                    if family == "mlp":
+                        targets = moe_loaders[int(idx)].load_weights(
+                            iter([(relative, weight)]), mapper=moe_mapper
+                        )
+                        loaded.update(
+                            f"model.layers.{idx}.mlp.{target}" for target in targets
+                        )
+                        continue
+                    if family == "ple":
+                        assert layer.ple is not None
+                        layer.ple.load_checkpoint([(relative, weight)])
+                        if identity is not None:
+                            owned = weight
+                            shard_prefix = "ple_embedding.ngram_embedding.shard_"
+                            if relative.startswith(shard_prefix):
+                                index = int(
+                                    relative.removeprefix(shard_prefix).removesuffix(
+                                        ".weight"
+                                    )
+                                )
+                                table = layer.ple.storage
+                                parts = layer.ple.ple_embedding.split_ngram_parts
+                                rows = (table.org_vocab_size + parts - 1) // parts
+                                overlap = compute_ple_shard_overlap(
+                                    checkpoint_start=index * rows,
+                                    checkpoint_rows=weight.shape[0],
+                                    tp_start=table.shard_indices.org_vocab_start_index,
+                                    tp_end=table.shard_indices.org_vocab_end_index,
+                                )
+                                if overlap is None:
+                                    continue
+                                owned = weight.narrow(
+                                    0, overlap.source_start, overlap.row_count
+                                )
+                            identity.add(name, owned)
+                        continue
+                    if family == "self_attn":
+                        layer.self_attn.load_weights([(relative, weight)])
+                        if identity is not None and relative in (
+                            "_k_scale",
+                            "_v_scale",
+                        ):
+                            identity.add(name, weight)
+                        continue
+                    if family == "linear_attn" and relative in gdn_map:
+                        mapped, shard = gdn_map[relative]
+                        target = f"model.layers.{idx}.linear_attn.{mapped}"
+                        param = parameters[target]
+                        cast(BasevLLMParameter, param).weight_loader(
+                            param, weight, shard
+                        )
+                        loaded.add(target)
+                        continue
+                if name not in parameters:
+                    raise ValueError(f"Unknown Qwen4Exp checkpoint tensor {original}")
+                owner, field = name.rsplit(".", 1)
+                targets = AutoWeightsLoader(self.get_submodule(owner)).load_weights(
+                    [(field, weight)]
+                )
+                loaded.update(f"{owner}.{target}" for target in targets)
         for i, layer in enumerate(layers):
             prefix = f"model.layers.{i}.mlp."
             experts = layer.mlp.experts.routed_experts

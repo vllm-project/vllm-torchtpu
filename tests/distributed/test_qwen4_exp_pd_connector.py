@@ -16,6 +16,7 @@
 import threading
 import time
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
 
 import pytest
@@ -35,6 +36,9 @@ from .test_tpu_connector import (
     _make_raiden_worker,
     _make_vllm_config,
 )
+
+if TYPE_CHECKING:
+    from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
 
 
 @pytest.fixture(autouse=True)
@@ -154,16 +158,16 @@ def test_grouped_worker_replay_checks_secondary_pages(terminal, monkeypatch):
         local_block_ids=[10],
         group_block_ids=tables,
     )
-    worker._register_stage3_request_blocks_dsv4(meta)
+    worker._register_stage3_request_blocks_grouped(meta)
     if terminal:
         worker._poll_finished(engine)
         assert "request" not in worker._stage3_registered_sends
         assert worker._stage3_terminal_sends["request"].group_block_ids[1] == (20,)
-    worker._register_stage3_request_blocks_dsv4(meta)
+    worker._register_stage3_request_blocks_grouped(meta)
     assert len(facade.register_request_blocks_calls) == 1
     tables[1] = [21]
     with pytest.raises(ValueError, match="Conflicting"):
-        worker._register_stage3_request_blocks_dsv4(meta)
+        worker._register_stage3_request_blocks_grouped(meta)
     assert len(facade.register_request_blocks_calls) == 1
 
 
@@ -510,7 +514,7 @@ def test_qwen_register_runner_admits_actual_materialized_owners(
         model=SimpleNamespace(
             layers=[
                 SimpleNamespace(
-                    layer_type="full_attention",
+                    layer_type="indexed_attention",
                     self_attn=attention,
                 )
             ]
@@ -597,3 +601,92 @@ def test_qwen_register_runner_admits_actual_materialized_owners(
         assert (
             "moe_combine_dtype" not in payload["semantics"]["ranks"][0]["state_flags"]
         )
+
+
+@pytest.mark.parametrize("qwen", [False, True], ids=["dsv4", "qwen"])
+@pytest.mark.parametrize("changed", [False, True])
+def test_shared_consumer_replay_preserves_each_contract(monkeypatch, qwen, changed):
+    from dataclasses import replace
+    from unittest.mock import Mock
+
+    from vllm_torchtpu.distributed.kv_transfer.tpu_connector import _Stage3LoadMeta
+
+    monkeypatch.setenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER", "1")
+    monkeypatch.setenv("TPU_RAIDEN_DSV4_ADMISSION", "1" if not qwen else "0")
+    if qwen:
+        worker = qwen_worker(monkeypatch, producer=False)
+    else:
+        worker = _make_raiden_worker(
+            tp_rank=0, tp_size=1, is_producer=False, dp_size=8, block_size=1024
+        )
+        worker._stage3_dsv4_plan, _ = _dsv4_worker_plan(worker)
+        worker._raiden_controller_facade = _FakeRaidenControllerFacade()
+        worker._raiden_controller_address = "destination:27000"
+        worker._raiden_work_unit = SimpleNamespace(data_name="grouped")
+    assert worker._uses_stage3_grouped_pages()
+    worker._dispatch_stage3_load_submit = Mock()
+    tables = [[value] for value in range(10, 60 if qwen else 80, 10)]
+    first = _Stage3LoadMeta(
+        uuid=99,
+        num_tokens=128,
+        local_block_ids=[10],
+        source_req_id="source",
+        src_controller_address="source:27000",
+        src_job_name="prefill",
+        src_engine_id="source-engine",
+        src_data_replica_idx=0,
+        src_parallelism=1,
+        group_block_ids=tables,
+    )
+    meta = TPUConnectorMetadata()
+    cast(dict[str, _Stage3LoadMeta], meta.reqs_to_load)["destination"] = first
+    worker._submit_stage3_loads(meta, cast("KVCacheManager", _FakeRaidenEngine()))
+    assert worker._dispatch_stage3_load_submit.call_count == 1
+    submitted = worker._stage3_submitted_load_metas["destination"]
+    replay_tables = [list(pages) for pages in tables]
+    if changed:
+        replay_tables[1] = [21]
+    repeated = replace(first, group_block_ids=replay_tables)
+    cast(dict[str, _Stage3LoadMeta], meta.reqs_to_load)["destination"] = repeated
+    if qwen and changed:
+        with pytest.raises(ValueError, match="Conflicting grouped"):
+            worker._submit_stage3_loads(
+                meta, cast("KVCacheManager", _FakeRaidenEngine())
+            )
+    else:
+        worker._submit_stage3_loads(meta, cast("KVCacheManager", _FakeRaidenEngine()))
+    assert worker._dispatch_stage3_load_submit.call_count == 1
+    assert worker._stage3_submitted_load_metas["destination"] is submitted
+    assert submitted.group_block_ids == tables
+
+
+def test_non_grouped_replay_does_not_read_released_metadata(monkeypatch):
+    from unittest.mock import Mock
+
+    from vllm_torchtpu.distributed.kv_transfer.tpu_connector import _Stage3LoadMeta
+
+    worker = _make_raiden_worker(tp_rank=0, tp_size=1, is_producer=False)
+    worker._raiden_controller_facade = _FakeRaidenControllerFacade()
+    worker._raiden_controller_address = "destination:27000"
+    worker._raiden_work_unit = SimpleNamespace(data_name="ordinary")
+    worker._dispatch_stage3_load_submit = Mock()
+    worker._stage3_submitted_loads["destination"] = 99
+    worker._stage3_submitted_load_tokens["destination"] = 128
+    assert not worker._uses_stage3_grouped_pages()
+    assert not worker._stage3_submitted_load_metas
+    meta = TPUConnectorMetadata()
+    cast(dict[str, _Stage3LoadMeta], meta.reqs_to_load)["destination"] = (
+        _Stage3LoadMeta(
+            uuid=99,
+            source_req_id="source",
+            local_block_ids=[10],
+            num_tokens=128,
+            src_controller_address="source:27000",
+            src_job_name="prefill",
+            src_engine_id="source-engine",
+            src_data_replica_idx=0,
+            src_parallelism=1,
+        )
+    )
+    worker._submit_stage3_loads(meta, cast("KVCacheManager", _FakeRaidenEngine()))
+    worker._dispatch_stage3_load_submit.assert_not_called()
