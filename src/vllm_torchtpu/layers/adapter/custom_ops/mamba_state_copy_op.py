@@ -11,7 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Donating slot-to-slot copy for Mamba recurrent state arrays."""
+"""Custom operator for batched Mamba/GDN recurrent state slot copying on TPU.
+
+Copies accepted speculative token states and prefix-cached recurrent states
+between pool slots on device.
+"""
 
 import functools
 
@@ -31,9 +35,22 @@ from vllm_torchtpu.kernels import pool_adapters
 # counterpart of upstream vLLM's ``preprocess_mamba`` block copies.
 
 
+def _clamp_rows(idx: jax.Array, num_rows: int) -> jax.Array:
+    """Clamp host-provided copy indices into ``[0, num_rows)``.
+
+    The copy kernel does no bounds checks, so a garbage index (e.g. a stale or
+    torn host upload) would write outside the pool, possibly into weights.
+    Clamping keeps such a write inside the pool. Valid indices are unchanged.
+    It fuses into the copy program: no extra dispatch, no sync.
+    """
+    return jnp.clip(idx, 0, num_rows - 1).astype(idx.dtype)
+
+
 def _copy_fn(
     pool: jax.Array, src: jax.Array, dst: jax.Array
 ) -> tuple[jax.Array, jax.Array]:
+    src = _clamp_rows(src, pool.shape[0])
+    dst = _clamp_rows(dst, pool.shape[0])
     new_pool = pool_adapters.copy_blocks(pool, src, dst)
     return new_pool, src[0]
 
@@ -116,6 +133,8 @@ def _row_copy_fn(num_pools: int, split: int, step_rows: int):
         pool: jax.Array, src: jax.Array, dst: jax.Array
     ) -> tuple[jax.Array, jax.Array]:
         assert pool.shape[1] == rows, (pool.shape, rows)
+        src = _clamp_rows(src, pool.shape[0])
+        dst = _clamp_rows(dst, pool.shape[0])
         view = pool.reshape(pool.shape[0] * steps, step_rows, *pool.shape[2:])
         offsets = jnp.arange(steps, dtype=src.dtype)
         src_steps = (src[:, None] * steps + offsets).reshape(-1)

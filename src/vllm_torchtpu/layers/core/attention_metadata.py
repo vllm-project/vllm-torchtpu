@@ -11,13 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Device-resident attention and hybrid GDN metadata preparation for TPU Runner."""
+
 from __future__ import annotations
 
 import functools
+import os
 from dataclasses import dataclass, field
 from typing import Any, cast
 
 import jax
+import numpy as np
 import torch
 from vllm.distributed import get_pcp_group
 from vllm.utils.math_utils import cdiv
@@ -38,6 +42,10 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     SequenceLayoutDescriptor,
     SequenceLayoutKind,
 )
+
+_QX_STAGE_PRODUCTS_CACHE = os.environ.get(
+    "QX_STAGE_PRODUCTS_CACHE", "1"
+).strip().lower() in ("1", "true", "yes", "on")
 
 
 def attention_block_table_width(
@@ -184,6 +192,12 @@ class AttentionMetadataBuilderContext:
     # (state_indices, ckpt_indices | None) from the single
     # `_staged_walk_products_compiled` program; None -> per-group fallback.
     staged_mamba_products: dict | None = None
+    # Optional host-side bound `(seq_lens_hi_np[:num_reqs], max_rejected)` on
+    # active requests' sequence lengths so `stage_block_table_uploads` can reuse
+    # cached per-group block tables and mamba state/checkpoint indices whenever
+    # every active request's state block column `(seq_len - 1) // block_size` is
+    # invariant across `[seq_lens_hi - max_rejected, seq_lens_hi]`.
+    mamba_seq_lens_bounds: tuple[Any, int] | None = None
 
 
 def _staged_walk_products(
@@ -217,7 +231,8 @@ def _staged_walk_products(
                 in_row = (ckpt_offsets < t) & active.unsqueeze(1)
                 safe = torch.where(in_row, ckpt_offsets, torch.zeros_like(ckpt_offsets))
                 ckpts.append(torch.gather(tbl, 1, safe) * in_row)
-    return tuple(outs) + tuple(states) + tuple(ckpts)
+    stacked = (torch.stack(states, dim=0),) if len(states) > 1 else ()
+    return tuple(outs) + tuple(states) + tuple(ckpts) + stacked
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -231,12 +246,13 @@ def _staged_walk_products_compiled(
     """One device program for everything the metadata walk consumes:
     per-group block-table splits (graph outputs are distinct buffers, so no
     per-group eager clone) plus the unified-pool mamba state/checkpoint
-    gathers. `table_geom` is `((offset, num_reqs, num_blocks), ...)` in walk
+    gathers (and their stacked `[G, num_reqs]` tensor when `G > 1`).
+    `table_geom` is `((offset, num_reqs, num_blocks), ...)` in walk
     order; `mamba_geom` is `((table_geom_index, num_blocks, block_size),
     ...)`; both are static per padding bucket. Returns `tables... +
-    states... + (ckpts... if ckpt_window > 1)`. Issued for every staged walk
-    (dummy runs included) so warmup and lockstep ranks dispatch the same
-    program sequence.
+    states... + (ckpts... if ckpt_window > 1) + (stacked_states if G > 1)`.
+    Issued for every staged walk (dummy runs included) so warmup and lockstep
+    ranks dispatch the same program sequence.
     """
     return _staged_walk_products(
         staged_dev, seq_lens, table_geom, mamba_geom, ckpt_window
@@ -597,12 +613,17 @@ def stage_block_table_uploads(
         return
 
     total = sum(num_reqs_padded * tnb for _, _, tnb in entries)
-    # Per-walk buffer: TorchTPU reads the CPU source until the async H2D
-    # drains, so a later chunk or draft walk must not refill a shared scratch
-    # (see `stage_h2d_upload`).
-    flat = zeros_h2d_source(runner, total)
-
-    if ctx.position_ids_override is None:
+    scratch = runner._block_table_stage_cpu
+    if scratch is None or scratch.numel() < total:
+        scratch = torch.zeros(
+            (total,), dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
+        )
+        runner._block_table_stage_cpu = scratch
+    flat = scratch[:total]
+    if ctx.position_ids_override is not None:
+        # Dummy runs keep the zeroed scratch: same staged layout, null blocks.
+        flat.zero_()
+    else:
         offset = 0
         for _, block_table_obj, target_num_blocks in entries:
             rows = flat[offset : offset + num_reqs_padded * target_num_blocks].view(
@@ -612,10 +633,18 @@ def stage_block_table_uploads(
             rows[: ctx.num_reqs] = source[
                 ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
             ]
+            if ctx.num_reqs < num_reqs_padded:
+                rows[ctx.num_reqs :].zero_()
             offset += num_reqs_padded * target_num_blocks
-    # Dummy runs keep the zeroed buffer: same staged layout, null blocks.
 
-    staged_dev = stage_h2d_upload(runner, flat)
+    # Re-uploads only when the staged rows change; fallback to
+    # stage_h2d_upload for mock/test runners without _block_table_upload.
+    bt_upload = getattr(runner, "_block_table_upload", None)
+    staged_dev = (
+        bt_upload(flat, runner.device)
+        if bt_upload is not None
+        else stage_h2d_upload(runner, flat)
+    )
 
     # One compiled program splits the staged tensor into per-group tables
     # and derives every unified-pool mamba group's state/checkpoint indices
@@ -647,7 +676,70 @@ def stage_block_table_uploads(
         ctx.staged_block_tables = {gid: staged_dev[:length]}
         return
 
-    if staged_dev.device.type == "tpu":
+    if not mamba_geom:
+        bt_views_key = (
+            id(staged_dev),
+            tuple(table_geom),
+            tuple(gid for gid, _, _ in entries),
+        )
+        if getattr(runner, "_cached_staged_block_tables_key", None) == bt_views_key:
+            ctx.staged_block_tables = runner._cached_staged_block_tables
+            return
+
+    qx_key = None
+    qx_cached = None
+    if (
+        _QX_STAGE_PRODUCTS_CACHE
+        and mamba_geom
+        and ctx.position_ids_override is None
+        and ctx.mamba_seq_lens_bounds is not None
+    ):
+        bounds = ctx.mamba_seq_lens_bounds
+        if len(bounds) == 3:
+            sl_np, max_rej, sub_mask = bounds
+        else:
+            sl_np, max_rej = bounds
+            sub_mask = None
+        n = int(ctx.num_reqs)
+        if sl_np.shape[0] == n:
+            high = sl_np - 1
+            if max_rej > 0:
+                if sub_mask is not None:
+                    low = np.where(sub_mask, sl_np - max_rej - 1, high)
+                else:
+                    low = sl_np - max_rej - 1
+            else:
+                low = high
+            if np.all(low >= 0):
+                per_group_q: list[bytes] = []
+                in_same_block = True
+                for _, t, bs in mamba_geom:
+                    q_low = np.minimum(low // bs, t - 1)
+                    q_high = np.minimum(high // bs, t - 1)
+                    if not np.array_equal(q_low, q_high):
+                        in_same_block = False
+                        break
+                    per_group_q.append(q_low.tobytes())
+                if in_same_block:
+                    qx_key = (
+                        id(staged_dev),
+                        num_reqs_padded,
+                        n,
+                        tuple(table_geom),
+                        tuple(gid for gid, _, _ in entries),
+                        int(ctx.mamba_ckpt_window),
+                        tuple(mamba_geom),
+                        tuple(per_group_q),
+                    )
+                    cache_dict = getattr(runner, "_qx_stage_products", None)
+                    if cache_dict is not None:
+                        hit = cache_dict.get(qx_key)
+                        if hit is not None:
+                            qx_cached = hit[1]
+
+    if qx_cached is not None:
+        products = qx_cached
+    elif staged_dev.device.type == "tpu":
         products = _staged_walk_products_compiled(
             staged_dev,
             ctx.seq_lens,
@@ -655,6 +747,14 @@ def stage_block_table_uploads(
             tuple(mamba_geom),
             ctx.mamba_ckpt_window,
         )
+        if qx_key is not None:
+            cache_dict = getattr(runner, "_qx_stage_products", None)
+            if cache_dict is None:
+                cache_dict = {}
+                runner._qx_stage_products = cache_dict
+            elif len(cache_dict) >= 8:
+                cache_dict.clear()
+            cache_dict[qx_key] = (staged_dev, products)
     else:
         products = _staged_walk_products(
             staged_dev,
@@ -669,11 +769,23 @@ def stage_block_table_uploads(
     ctx.staged_block_tables = {
         gid: products[i] for i, (gid, _, _) in enumerate(entries)
     }
+    if not mamba_geom:
+        runner._cached_staged_block_tables_key = bt_views_key
+        runner._cached_staged_block_tables_dev = staged_dev
+        runner._cached_staged_block_tables = ctx.staged_block_tables
     if n_mamba:
         states = products[n_tables : n_tables + n_mamba]
         has_ckpt = ctx.mamba_ckpt_window > 1
-        ckpts = products[n_tables + n_mamba :] if has_ckpt else (None,) * n_mamba
+        ckpt_end = n_tables + 2 * n_mamba if has_ckpt else n_tables + n_mamba
+        ckpts = (
+            products[n_tables + n_mamba : ckpt_end] if has_ckpt else (None,) * n_mamba
+        )
         ctx.staged_mamba_products = {
             entries[ei][0]: (states[j], ckpts[j] if has_ckpt else None)
             for j, ei in enumerate(mamba_entry_indices)
         }
+        stacked_states = products[ckpt_end] if n_mamba > 1 else states[0]
+        stacked_ids = tuple(id(s) for s in states)
+        if gids is None:
+            ctx._stacked_mamba_groups = stacked_states
+            ctx._stacked_mamba_groups_ids = stacked_ids

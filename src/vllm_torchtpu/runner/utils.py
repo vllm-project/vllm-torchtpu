@@ -437,11 +437,22 @@ def _to_row_major(tensor: torch.Tensor) -> torch.Tensor:
     return device_tensor
 
 
-def relayout_rope_caches(model: torch.nn.Module):
-    """Re-materialize every rope cache with a row-major device layout."""
+def relayout_rope_caches(
+    model: torch.nn.Module, *, skip_modules: frozenset[int] | set[int] = frozenset()
+):
+    """Re-materialize every rope cache with a row-major device layout.
+
+    ``skip_modules``: ids of rope modules an earlier pass (the target's, when
+    ``model`` is the MTP draft) already relaid out; vLLM's ``get_rope`` shares
+    one instance across layers of the same geometry.
+    """
     num_changed = 0
+    num_shared = 0
     for name, module in model.named_modules():
         if not isinstance(module, RotaryEmbeddingBase):
+            continue
+        if id(module) in skip_modules:
+            num_shared += 1
             continue
         # The buffers on a rotary module that are indexed by position.
         caches: list[tuple[str, Any]] = [
@@ -464,7 +475,11 @@ def relayout_rope_caches(model: torch.nn.Module):
 
     if num_changed:
         _install_entry_layout_pin()
-    logger.info("Row-major relayouted %d rope caches", num_changed)
+    logger.info(
+        "Row-major relayouted %d rope caches (%d shared with an earlier pass)",
+        num_changed,
+        num_shared,
+    )
 
 
 def relayout_hash_tables(model: torch.nn.Module):
