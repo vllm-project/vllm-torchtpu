@@ -262,6 +262,7 @@ def test_pooled_qsa_continuation_across_manager_page_and_partial_pairs(fp8):
             jnp.pad(ring_ids[:, None], ((0, 0), (0, 31))).reshape(-1),
             main,
             comp,
+            request_distribution=jnp.array([0, 0, 2], jnp.int32),
             **options,
         )
         np.testing.assert_allclose(

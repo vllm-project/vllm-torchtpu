@@ -163,16 +163,20 @@ def test_qwen_adaptive_entry_masks_padding_and_matches_paired_prefill(fp8, ragge
         cache,
         jnp.array([0, 1] + [tokens - 3] * 7 if ragged_tail else [0, tokens], jnp.int32),
     )
+    input_bytes = [np.asarray(value).tobytes() for value in args]
+    distribution = jnp.array([1, 1, 2] if ragged_tail else [0, 0, 1], jnp.int32)
     compiled = (
         jax.jit(functools.partial(qsa_rpa.qsa_attention, kv_heads=2, ratio=4))
-        .lower(*args)
+        .lower(*args, request_distribution=distribution)
         .compile()
     )
     hlo = compiled.as_text()
-    assert "fused_qsa_decode" not in hlo
+    assert isinstance(hlo, str)
+    assert "fused_qsa_decode" in hlo
+    assert "conditional" in hlo
     if not ragged_tail:
         assert "sc_compact_grouped_prefill" in hlo
-    output, returned = compiled(*args)
+    output, returned = compiled(*args, request_distribution=distribution)
     reference, _ = jax.jit(
         functools.partial(
             block_sparse_gqa_prefill.block_sparse_gqa_attention,
@@ -187,3 +191,8 @@ def test_qwen_adaptive_entry_masks_padding_and_matches_paired_prefill(fp8, ragge
     np.testing.assert_array_equal(actual[lengths == 0], 0)
     assert np.linalg.norm(actual - expected) / np.linalg.norm(expected) < 0.01
     np.testing.assert_array_equal(np.asarray(returned).view(np.uint8), before)
+    assert [np.asarray(value).tobytes() for value in args] == input_bytes
+    assert (
+        np.asarray(compiled(*args, request_distribution=distribution)[0]).tobytes()
+        == np.asarray(output).tobytes()
+    )
