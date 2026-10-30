@@ -5,6 +5,7 @@ Graph-only protobuf fields follow openxla/xla's xla/service/hlo.proto.
 Unknown fields (including layouts and backend configs) round-trip unchanged.
 """
 
+import gc
 import heapq
 import json
 import threading
@@ -294,6 +295,37 @@ def rewrite_moe_schedule(blob: bytes) -> bytes | None:
     return module.SerializeToString() if changed else None
 
 
+_gc_lock = threading.Lock()
+_gc_depth = 0
+_gc_was_enabled = False
+
+
+def rewrite_moe_schedule_without_gc(blob: bytes) -> bytes | None:
+    """Run the rewrite with automatic cyclic GC deferred.
+
+    XLA invokes this pass synchronously on torch_tpu compile threads, which
+    are forbidden from touching thread-local context state. Parsing the HLO
+    allocates enough to trigger a collection, and that collection can free an
+    unrelated TPU tensor held in a reference cycle; torch_tpu 0.2.0's storage
+    deleter then reads the eager mode and aborts with
+    ``Check failed: allow_context_state_access``. Depth counting keeps GC off
+    until the last of several concurrent compile threads leaves.
+    """
+    global _gc_depth, _gc_was_enabled
+    with _gc_lock:
+        if _gc_depth == 0:
+            _gc_was_enabled = gc.isenabled()
+            gc.disable()
+        _gc_depth += 1
+    try:
+        return rewrite_moe_schedule(blob)
+    finally:
+        with _gc_lock:
+            _gc_depth -= 1
+            if _gc_depth == 0 and _gc_was_enabled:
+                gc.enable()
+
+
 _install_lock = threading.Lock()
 _installed = False
 
@@ -304,7 +336,7 @@ def install_moe_schedule() -> None:
     with _install_lock:
         if not _installed:
             xla.register_hlo_module_transformation(
-                rewrite_moe_schedule,
+                rewrite_moe_schedule_without_gc,
                 name="split_sc_moe_schedule",
                 platforms="tpu",
                 stage=xla.PipelineStage.PRE_SCHEDULER,
