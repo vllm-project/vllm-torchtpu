@@ -21,11 +21,32 @@ rank.
 """
 
 import torch
+from torch_tpu._internal import pallas
 from vllm.distributed.device_communicators.base_device_communicator import (
     All2AllManagerBase,
     DeviceCommunicatorBase,
 )
-from vllm.distributed.parallel_state import get_dp_group, get_ep_group
+from vllm.distributed.parallel_state import (
+    GroupCoordinator,
+    get_dp_group,
+    get_ep_group,
+)
+
+from vllm_torchtpu.kernels.compact_tiling import pin_compact_tiling
+
+_pin_compact_tiling_op = pallas.jax_op("pallas::pin_compact_tiling", pin_compact_tiling)
+_pin_compact_tiling_op.register_fake(lambda x: torch.empty_like(x))
+
+
+def _gather_hidden_states(
+    group: GroupCoordinator, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    """All-gather the token rows in the tiling the Pallas MoE kernels read.
+
+    Pinned on this rank's rows, any relayout XLA needs for the kernels runs
+    before the gather, on 1/world_size of the bytes it would move after it.
+    """
+    return group.all_gather(_pin_compact_tiling_op(hidden_states), dim=0)
 
 
 class TpuNullAll2AllManager(All2AllManagerBase):
@@ -60,7 +81,7 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         group = self._moe_group(is_sequence_parallel)
         if group is None:
             return hidden_states, router_logits
-        hidden_states = group.all_gather(hidden_states, dim=0)
+        hidden_states = _gather_hidden_states(group, hidden_states)
         router_logits = group.all_gather(router_logits, dim=0)
         return hidden_states, router_logits
 
@@ -79,7 +100,7 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         group = self._moe_group(is_sequence_parallel)
         if group is None:
             return hidden_states, topk_weights, topk_ids
-        hidden_states = group.all_gather(hidden_states, dim=0)
+        hidden_states = _gather_hidden_states(group, hidden_states)
         topk_weights = group.all_gather(topk_weights, dim=0)
         topk_ids = group.all_gather(topk_ids, dim=0)
         return hidden_states, topk_weights, topk_ids
