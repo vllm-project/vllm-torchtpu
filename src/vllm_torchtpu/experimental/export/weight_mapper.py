@@ -162,6 +162,8 @@ def infer_weight_sharding(
                 "f_b_proj",
                 "g_b_proj",
                 "attn_sink",
+                # The MTP predictor's column-parallel fc (Qwen3.5, Qwen3-Next).
+                ".fc.",
             )
         ):
             return ["tp"]
@@ -199,6 +201,7 @@ def infer_weight_sharding(
                 "f_b_proj",
                 "g_b_proj",
                 "compressor.fused_wkv_wgate",
+                ".fc.",
             )
         ):
             return [None, "tp"]
