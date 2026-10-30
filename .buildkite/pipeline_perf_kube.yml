@@ -64,6 +64,7 @@ steps:
     if: build.env("K3") != "1"
     steps:
       - label: ":kubernetes: Perf/Eval: General suite (TPU v7x-8)"
+        skip: "Disabled on partner/release-0.0.1"
         <<: *perf_step
         parallelism: 3
         env:

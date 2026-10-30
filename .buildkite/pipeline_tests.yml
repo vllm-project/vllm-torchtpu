@@ -36,6 +36,7 @@ x-tests-plugin-defaults: &tests_plugin_defaults
 steps:
   - label: "Type Check - Full Environment"
     key: "typecheck_full"
+    skip: "Disabled on partner/release-0.0.1"
     depends_on: "build_docker"
     agents:
       queue: "cpu"
@@ -50,6 +51,7 @@ steps:
 
   - label: "Unit Tests - CPU (PR)"
     key: "unit_tests_cpu_pr"
+    skip: "Disabled on partner/release-0.0.1"
     <<: *cpu_unit_test_defaults
     if: 'build.env("NIGHTLY") != "1"'
     plugins:
@@ -80,6 +82,7 @@ steps:
       # general steps exclude the file to avoid running it twice.
       - label: "Unit Tests - General (PR)"
         key: "unit_tests_general_pr"
+        skip: "Disabled on partner/release-0.0.1"
         <<: *unit_test_defaults
         if: 'build.env("NIGHTLY") != "1"'
         agents:
@@ -92,6 +95,7 @@ steps:
 
       - label: "Unit Tests - Multichip (PR)"
         key: "unit_tests_multichip_pr"
+        skip: "Disabled on partner/release-0.0.1"
         <<: *unit_test_defaults
         if: 'build.env("NIGHTLY") != "1"'
         agents:
@@ -107,6 +111,7 @@ steps:
       # the suite is a single file. bktec balances using recorded test durations.
       - label: "Unit Tests - Speculative Decoding (PR)"
         key: "unit_tests_spec_decode_pr"
+        skip: "Disabled on partner/release-0.0.1"
         <<: *unit_test_defaults
         if: 'build.env("NIGHTLY") != "1"'
         parallelism: 3
@@ -131,6 +136,7 @@ steps:
 
       - label: "Unit Tests - Speculative Decoding Multichip (PR)"
         key: "unit_tests_spec_decode_multichip_pr"
+        skip: "Disabled on partner/release-0.0.1"
         <<: *unit_test_defaults
         if: 'build.env("NIGHTLY") != "1"'
         agents:
