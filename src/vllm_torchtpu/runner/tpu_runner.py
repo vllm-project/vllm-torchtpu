@@ -2568,8 +2568,40 @@ class TPUModelRunner(GPUModelRunner):
             input_ids,
             cur_input_indices,
             pre_next_tokens_indices,
-            self._pre_async_results.next_tokens_tpu,
+            self._warmed_next_tokens(self._pre_async_results.next_tokens_tpu)
+            if envs.VLLM_TPU_WARMED_SUBSTITUTE_SOURCE
+            else self._pre_async_results.next_tokens_tpu,
         )
+
+    def _substitute_next_lens(self) -> list[int]:
+        """next_tokens lengths `_precompile_substitute_placeholder_token` warms."""
+        next_lens = list(self.num_reqs_paddings)
+        if self._is_async_drafter:
+            assert self.speculative_config is not None
+            next_lens.append(
+                self.max_num_reqs * (1 + self.speculative_config.num_speculative_tokens)
+            )
+        return sorted(set(next_lens))
+
+    def _warmed_next_tokens(self, next_tokens: torch.Tensor) -> torch.Tensor:
+        """`next_tokens` as the flat int64 source the precompile warmed: pad
+        to the next warmed length (the substitution never reads past the real
+        entries), so an odd source length (e.g. several chunks concatenated)
+        does not compile mid-run. Unchanged if no warmed length fits."""
+        n = next_tokens.numel()
+        lens = self.__dict__.get("_substitute_lens_cache")
+        if lens is None:
+            lens = self._substitute_next_lens()
+            self._substitute_lens_cache = lens
+        target = next((m for m in lens if m >= n), None)
+        if target is None:
+            return next_tokens
+        if next_tokens.dim() == 1 and n == target and next_tokens.dtype == torch.int64:
+            return next_tokens
+        flat = next_tokens.reshape(-1).to(torch.int64)
+        if target > n:
+            flat = torch.nn.functional.pad(flat, (0, target - n))
+        return flat
 
     def _flush_disjoint_async_results(self) -> None:
         if self._pre_async_results is None:
@@ -5182,7 +5214,19 @@ class TPUModelRunner(GPUModelRunner):
                     spec_logprobs=spec_logprobs_chunks,
                 )
 
-        if self.scheduler_config.async_scheduling:
+        # The previous step's sampled-token copy completes only behind this
+        # step's forward, so waiting on it here holds the draft's host-side
+        # preparation and launch until the forward finishes. Nothing the
+        # draft reads depends on the rollback it feeds (the draft seeds on
+        # device; host tokens are read for partial prefills only, i.e. from
+        # the prompt), so wait after the launch instead. With a KV connector
+        # keep the early wait: the save below relies on it.
+        defer_prev_wait = (
+            self.scheduler_config.async_scheduling
+            and envs.VLLM_TPU_DEFER_PREV_RESULTS_WAIT
+            and not has_kv_transfer_group()
+        )
+        if self.scheduler_config.async_scheduling and not defer_prev_wait:
             self._modify_prev_results()
 
         # Unified eagle3 draft propose -- ONE call serving both sync and async
@@ -5250,6 +5294,9 @@ class TPUModelRunner(GPUModelRunner):
                         return_device=is_async,
                         device_seed=device_seed,
                     )
+
+        if defer_prev_wait:
+            self._modify_prev_results()
 
         if self._is_dspark_pd_producer:
             assert isinstance(self.drafter, DFlashProposer)
@@ -6509,12 +6556,7 @@ class TPUModelRunner(GPUModelRunner):
         # buckets (non-spec / pure-async), plus the bounded stride-(1+K) span
         # async eagle3 parks (max_num_reqs*(1+K); see sample_tokens) so the spec
         # substitute doesn't recompile per real num_reqs.
-        next_lens = list(self.num_reqs_paddings)
-        if self._is_async_drafter:
-            assert self.speculative_config is not None
-            next_lens.append(
-                self.max_num_reqs * (1 + self.speculative_config.num_speculative_tokens)
-            )
+        next_lens = self._substitute_next_lens()
         with self._precompile_timed("substitute_placeholder_token"):
             for num_tokens in self.num_tokens_paddings:
                 input_ids = torch.zeros(num_tokens, dtype=torch.int32).to(self.device)

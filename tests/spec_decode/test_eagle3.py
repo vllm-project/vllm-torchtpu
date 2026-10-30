@@ -305,6 +305,12 @@ def _rank0_pcp_plan() -> SequenceLayoutPlan:
 
 
 class _CarryAggregationAfterGatherPlan:
+    # A non-default (PCP) layout: only those aggregate the gathered carries.
+    descriptor = SequenceLayoutDescriptor(
+        kind=SequenceLayoutKind.PARTIAL,
+        protocol=PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL,
+    )
+
     def __init__(self, events):
         self._events = events
 
@@ -576,8 +582,11 @@ def test_propose_delegates_carry_aggregation_after_gather():
 
     def record_gather(hidden, positions, last_hidden, gather_indices):
         events.append("gather")
-        assert gather_indices.cpu().tolist() == [0, 2]
-        return (hidden[:2], positions[:2], last_hidden[gather_indices])
+        # propose() passes the raw PCP-localized indices; the compiled gather
+        # clamps -1 (a row this rank does not own) itself.
+        assert gather_indices.cpu().tolist() == [-1, 2]
+        safe = gather_indices.clamp_min(0)
+        return (hidden[:2], positions[:2], last_hidden[safe])
 
     proposer._draft_gather_carries = record_gather
 

@@ -37,6 +37,9 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilderContext,
 )
+from vllm_torchtpu.layers.core.sequence_layout import (
+    DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
@@ -1190,6 +1193,18 @@ class Eagle3Proposer:
         ).argmax(dim=-1)
         return (draft_id + d2t[draft_id]).to(torch.int32)
 
+    def _device_constant(self, key, build) -> torch.Tensor:
+        """A small read-only device tensor that depends only on `key` (e.g.
+        the request count), uploaded once instead of every step."""
+        if not envs.VLLM_TPU_PROPOSE_DEVICE_CONSTANTS:
+            return build().to(self.runner.device)
+        cache = self.__dict__.setdefault("_device_constants", {})
+        t = cache.get(key)
+        if t is None:
+            t = build().to(self.runner.device)
+            cache[key] = t
+        return t
+
     @_static_shape_args
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _draft_gather_carries(
@@ -1204,6 +1219,7 @@ class Eagle3Proposer:
         # indexing), these three gathers are eager ops the DEFER_AND_FUSE path
         # fuses with the step's seq_lens/positions arithmetic into a per-context
         # program. index_select is value-identical to hidden[indices].
+        indices = indices.clamp_min(0)
         pos_carry = (
             torch.index_select(positions, 1, indices)
             if positions.ndim == 2
@@ -1379,24 +1395,28 @@ class Eagle3Proposer:
             # [p, h] / [p] carries + first-pass draft token, computed in compiled
             # regions (the three gathers, then lm-head+argmax) so torch-tpu's
             # eager DEFER_AND_FUSE path can't fuse them into per-context programs.
-            owner_mask = last_token_indices.ge(0)
-            safe_gather_indices = last_token_indices.clamp_min(0)
+            # The gathers clamp their indices themselves: a PCP-localized
+            # index is -1 for a row this rank does not own, and -1 would wrap
+            # to the buffer's last row. (Kept inside the compiled gathers so
+            # the clamp is not its own eager program every step.)
             if self._share_mtp_indices:
-                # Clamped, not raw: a PCP-localized index is -1 for a row this
-                # rank does not own, and -1 would wrap to the buffer's last row.
                 saved_topk_per_chunk.append(
-                    self._mtp_compact_and_save(safe_gather_indices)
+                    self._mtp_compact_and_save(last_token_indices.clamp_min(0))
                 )
             hidden_carry, positions_carry, last_hidden_carry = (
                 self._draft_gather_carries(
-                    hidden, positions, last_hidden, safe_gather_indices
+                    hidden, positions, last_hidden, last_token_indices
                 )
             )
-            last_hidden_carry = (
-                chunk.sequence_layout_plan.aggregate_request_aligned_tensor(
-                    last_hidden_carry, owner_mask
+            if (
+                chunk.sequence_layout_plan.descriptor
+                != DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
+            ):
+                last_hidden_carry = (
+                    chunk.sequence_layout_plan.aggregate_request_aligned_tensor(
+                        last_hidden_carry, last_token_indices.ge(0)
+                    )
                 )
-            )
             hidden_carry_per_chunk.append(hidden_carry)
             positions_carry_per_chunk.append(positions_carry)
             with set_model_tag("eagle_head"):
@@ -1479,11 +1499,19 @@ class Eagle3Proposer:
                     else runner.num_reqs_most_model_len
                 )
                 assert knr is not None
-                qsl_np = np.minimum(np.arange(knr + 1, dtype=np.int32), c.num_reqs)
-                loop_qsl_per_chunk.append(torch.from_numpy(qsl_np).to(runner.device))
+                n = c.num_reqs
+                loop_qsl_per_chunk.append(
+                    self._device_constant(
+                        ("loop_qsl", knr, n),
+                        lambda knr=knr, n=n: torch.from_numpy(
+                            np.minimum(np.arange(knr + 1, dtype=np.int32), n)
+                        ),
+                    )
+                )
                 loop_reqdist_per_chunk.append(
-                    torch.tensor(
-                        [c.num_reqs] * 3, dtype=torch.int32, device=runner.device
+                    self._device_constant(
+                        ("loop_reqdist", n),
+                        lambda n=n: torch.tensor([n] * 3, dtype=torch.int32),
                     )
                 )
 
@@ -1681,7 +1709,10 @@ class Eagle3Proposer:
                         nt,
                         num_draft_full,
                         chunk.attn_ctx.query_start_loc,
-                        torch.tensor(num_reqs, dtype=torch.int64, device=runner.device),
+                        self._device_constant(
+                            ("num_reqs", num_reqs),
+                            lambda: torch.tensor(num_reqs, dtype=torch.int64),
+                        ),
                     )
                 )
             else:
