@@ -43,9 +43,15 @@ def _compute_slot_update(
     #   and concatenated in stacked_weights order.
     # slot_index: [1] int32, the slot to write.
     # Returns N tensors shaped like stacked_weights.
+    slot_sizes = [math.prod(weights.shape[1:]) for weights in stacked_weights]
+    # Checked before the loop: a short slot_weights would otherwise fail in
+    # reshape with JAX's error instead of this one.
+    assert sum(slot_sizes) == slot_weights.shape[0], (
+        f"slot_weights holds {slot_weights.shape[0]} elements but the slots "
+        f"of stacked_weights hold {sum(slot_sizes)}"
+    )
     updated, offset = [], 0
-    for weights in stacked_weights:
-        slot_size = math.prod(weights.shape[1:])
+    for weights, slot_size in zip(stacked_weights, slot_sizes):
         new_slot = slot_weights[offset : offset + slot_size].reshape(
             (1, *weights.shape[1:])
         )
@@ -55,10 +61,6 @@ def _compute_slot_update(
             )
         )
         offset += slot_size
-    assert offset == slot_weights.shape[0], (
-        f"slot_weights holds {slot_weights.shape[0]} elements but the slots "
-        f"of stacked_weights hold {offset}"
-    )
     return updated
 
 
@@ -73,6 +75,18 @@ _slot_update_op.register_fake(
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _write_adapter_to_slot(
+    stacked_weights: list[torch.Tensor],
+    slot_weights: torch.Tensor,
+    slot_index: torch.Tensor,
+) -> None:
+    updated = _slot_update_op(stacked_weights, slot_weights, slot_index)
+    for weights, new_weights in zip(stacked_weights, updated):
+        # Writes the result back into the donated tensor. XLA aliases the
+        # output to that buffer, so no second copy of the weights is made.
+        weights.copy_(new_weights)
+
+
 def write_adapter_to_slot(
     stacked_weights: list[torch.Tensor],
     slot_weights: torch.Tensor,
@@ -85,10 +99,15 @@ def write_adapter_to_slot(
         stacked_weights: N tensors, the i-th shaped [max_loras, *slot_shape_i].
         slot_weights: [sum_i prod(slot_shape_i)], same dtype as
             stacked_weights.
-        slot_index: [1] int32, on the same device.
+        slot_index: [1] int32, on the same device. Must be in
+            [0, max_loras). The op cannot raise on a device value, and
+            dynamic_update_slice wraps a negative index and clamps an
+            out-of-range one, so a bad index overwrites another slot
+            without an error: with 4 slots, 7 and -1 both write slot 3.
     """
-    updated = _slot_update_op(stacked_weights, slot_weights, slot_index)
-    for weights, new_weights in zip(stacked_weights, updated):
-        # Writes the result back into the donated tensor. XLA aliases the
-        # output to that buffer, so no second copy of the weights is made.
-        weights.copy_(new_weights)
+    # Without this, a caller with grad enabled and one under no_grad would
+    # trace the writer twice: torch.compile guards on the grad mode it is
+    # entered with. Entering no_grad here, outside the compiled function,
+    # gives every caller the same trace.
+    with torch.no_grad():
+        _write_adapter_to_slot(stacked_weights, slot_weights, slot_index)

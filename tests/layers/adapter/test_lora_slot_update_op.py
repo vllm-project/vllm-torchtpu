@@ -75,12 +75,13 @@ def test_only_the_chosen_slot_is_replaced(slot):
         assert torch.equal(weights, expected)
 
 
-def test_slot_weights_larger_than_the_slots_are_rejected():
+@pytest.mark.parametrize("extra", [1, -1])
+def test_slot_weights_of_the_wrong_size_are_rejected(extra):
     stacked_weights = _stacked_weights()
-    _, slot_weights = _new_slots(stacked_weights)
+    size = sum(weights[0].numel() for weights in stacked_weights) + extra
 
     with pytest.raises(AssertionError, match="slot_weights holds"):
-        _compute_on_host(stacked_weights, torch.cat([slot_weights, torch.zeros(1)]), 0)
+        _compute_on_host(stacked_weights, torch.zeros(size), 0)
 
 
 # The tests below run on the chip, each in a spawned child, and
@@ -88,12 +89,15 @@ def test_slot_weights_larger_than_the_slots_are_rejected():
 
 
 def _write_on_tpu(stacked_weights, slot_weights, slot):
-    with torch.no_grad():
-        lora_slot_update_op.write_adapter_to_slot(
-            stacked_weights,
-            slot_weights,
-            torch.tensor([slot], dtype=torch.int32, device=TPU),
-        )
+    lora_slot_update_op.write_adapter_to_slot(
+        stacked_weights,
+        slot_weights,
+        torch.tensor([slot], dtype=torch.int32, device=TPU),
+    )
+
+
+def _xla_compiles():
+    return torch.tpu._get_cache_stats().num_compilations
 
 
 def _writes_match_the_host_result_on_tpu():
@@ -120,22 +124,25 @@ def _one_compile_serves_every_slot():
     stacked_weights = [weights.to(TPU) for weights in host_weights]
     _, slot_weights = _new_slots(host_weights)
     slot_weights = slot_weights.to(TPU)
-    _write_on_tpu(stacked_weights, slot_weights, 0)
+    with torch.no_grad():
+        _write_on_tpu(stacked_weights, slot_weights, 0)
     torch.accelerator.synchronize()
     graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
-    programs = torch.tpu._get_cache_requests()
+    compiles = _xla_compiles()
+    # With grad enabled, unlike the first write.
     for slot in range(1, NUM_SLOTS):
         _write_on_tpu(stacked_weights, slot_weights, slot)
     torch.accelerator.synchronize()
     assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == graphs
-    assert torch.tpu._get_cache_requests() == programs
+    assert _xla_compiles() == compiles
 
 
 @pytest.mark.tpu_test
 @pytest.mark.spawns_tpu_workers
 def test_one_compile_serves_every_slot():
-    """The slot is a program input, so writing another slot neither traces
-    again nor compiles another program."""
+    """The slot is a program input and the op enters no_grad itself, so
+    writing another slot, with grad enabled or not, neither traces again nor
+    compiles another program."""
     run_in_isolated_process(_one_compile_serves_every_slot)
 
 
@@ -152,7 +159,9 @@ def _write_holds_no_second_copy_of_the_stacked_tensors():
     _write_on_tpu(stacked_weights, slot_weights, 1)
     torch.accelerator.synchronize()
     extra = torch.accelerator.max_memory_allocated(TPU) - before
-    assert extra <= 16 * 2**20, extra
+    # A temporary the size of one slot (32 MiB) is allowed; a second copy of
+    # the stacked tensor (128 MiB) is not.
+    assert extra < stacked_weights[0].nbytes // 2, extra
 
 
 @pytest.mark.tpu_test
