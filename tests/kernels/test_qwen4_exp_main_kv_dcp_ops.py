@@ -36,8 +36,42 @@ def _torch(x, device):
     return torch.from_numpy(host.copy()).to(device)
 
 
-def _inputs(device):
-    head, pool, tail = mtp_rows._inputs(True, mtp_rows.STARTS, mtp_rows.CONTEXT)
+PAGE_ROWS = 512  # served main-KV rows per page: DCP kv tiles are 2 x 512
+
+
+def _inputs(device, starts, context, tokens=8, seed=0):
+    """Step inputs at the served page geometry (mtp_rows._inputs uses 1664-row
+    pages, which DCP's paired 1024-row kv tiles cannot cover)."""
+    rng = np.random.default_rng(seed)
+
+    def rand(shape):
+        return jnp.asarray(rng.normal(0, 0.3, shape), jnp.bfloat16)
+
+    requests, columns = len(context), 4
+    pool = jnp.zeros((4 + 3 * requests * columns, PAGE_ROWS, 1, 4, 256), jnp.float8_e4m3fn)
+    pages = np.arange(1, 1 + 2 * requests * columns, dtype=np.int32).reshape(2, requests, columns)
+    ring_ids = jnp.arange(1 + 2 * requests * columns, 1 + 2 * requests * columns + requests, dtype=jnp.int32)
+    ring = rand((requests, 8, 128))
+    tags = np.zeros((requests, 8, 2), np.int32)
+    for row, c in enumerate(context):
+        if c:
+            tags[row, :4, 0] = c - 1 - (c - 1 - np.arange(4)) % 4
+    write = jax.jit(mtp_rows.write_region, static_argnames=("tok0",))
+    pool = write(pool, ring.reshape(requests, -1), ring_ids)
+    token_bytes = int(np.prod(pool.shape[2:])) * pool.dtype.itemsize
+    pool = write(pool, jnp.asarray(tags).reshape(requests, -1), ring_ids, tok0=8 * 128 * 2 // token_bytes)
+    starts_np = np.asarray(starts, np.int32)
+    req = np.minimum(np.searchsorted(starts_np[1:], np.arange(tokens), side="right"), requests - 1)
+    positions = np.where(np.arange(tokens) < starts_np[-1],
+                         np.asarray(context)[req] + np.arange(tokens) - starts_np[req], 0)
+    angle = jnp.arange(4096)[:, None] * jnp.arange(32)[None, :] / 8192
+    trig = jnp.pad(jnp.concatenate([jnp.cos(angle), jnp.sin(angle)], 1), ((0, 0), (0, 64))).astype(jnp.bfloat16)
+    head = (rand((tokens, 24 * 256 * 2)), rand((tokens, 2 * 256)), rand((tokens, 2 * 256)),
+            rand((tokens, 5 * 128)), rand((256,)), rand((256,)), rand((128,)), rand((128,)),
+            jnp.asarray(positions, jnp.int32), trig)
+    tail = (jnp.asarray(starts_np), jnp.asarray(context, jnp.int32),
+            jnp.pad(ring_ids[:, None], ((0, 0), (0, 31))).reshape(-1),
+            jnp.asarray(pages[0]), jnp.asarray(pages[1]))
     return [_torch(x, device) for x in head], _torch(pool, device), [_torch(x, device) for x in tail]
 
 
@@ -73,7 +107,16 @@ def _shapes(out):
             for k, v in out.items()}
 
 
-def test_dcp_ops_build_and_run_on_tpu():
+@pytest.mark.parametrize(
+    "starts,context",
+    [
+        # Mixed prefill: two requests with history across a DCP entry, an idle slot.
+        ([0, 3, 7, 7], [1661, 1663, 0]),
+        # Decode-shaped: one token per request, histories on both DCP ranks.
+        ([0, 1, 2, 3], [1661, 900, 2047]),
+    ],
+)
+def test_dcp_ops_build_and_run_on_tpu(starts, context):
     """Op build + one real call each (both DCP ranks); outputs finite where
     expected and shaped exactly like the fakes say."""
     try:
@@ -84,7 +127,7 @@ def test_dcp_ops_build_and_run_on_tpu():
     if jax.default_backend() == "cpu":
         pytest.skip("needs the TPU backend")
     ops = qsa_op._dcp_ops()
-    head, pool, tail = _inputs(device)
+    head, pool, tail = _inputs(device, starts, context)
     for r in (0, 1):
         real = _run(*ops, head, pool, tail, torch.tensor([r], device=device))
         for name, value in real.items():
