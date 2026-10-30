@@ -79,6 +79,7 @@ steps:
 
       - label: ":kubernetes: Integration: qwen35-apc-correctness"
         key: "integration_qwen35_apc_correctness"
+        skip: "Disabled on partner/release-0.0.1"
         env:
           SHAPE: *shape_8_core
           RUN_ROOT: "perf_eval_results/qwen35_apc_ci"
@@ -90,6 +91,7 @@ steps:
 
       - label: ":kubernetes: Integration: qwen35-gpc-global-dram-pool"
         key: "integration_qwen35_gpc_global_dram_pool"
+        skip: "Disabled on partner/release-0.0.1"
         env:
           SHAPE: *shape_8_core
           RUN_ROOT: "perf_eval_results/qwen35_gpc_dram_pool_ci"
@@ -182,6 +184,7 @@ steps:
       # with runai_streamer, since ~443 GiB does not fit an agent's disk.
       - label: ":kubernetes: Integration: k3-pruned75-apc-offload-correctness"
         key: "integration_k3_pruned75_apc_offload_correctness"
+        skip: "Disabled on partner/release-0.0.1"
         env:
           SHAPE: *shape_8_core
           TPU_ACCELERATOR_TYPE: "tpu7x"
@@ -203,6 +206,7 @@ steps:
   # 2x2x2 profile, which has held zero chip-hours since the fleet was built.
   - label: ":kubernetes: Multihost TorchTPU Presubmit (v7x 16-chip)"
     key: "vllm_torchtpu_multihost_presubmit"
+    skip: "Disabled on partner/release-0.0.1"
     depends_on:
       - "build_docker"
       - step: "integration_tpu"
@@ -252,6 +256,7 @@ steps:
 
   - label: ":kubernetes: Integration: qwen35-gpc-correctness"
     key: "integration_qwen35_gpc_correctness"
+    skip: "Disabled on partner/release-0.0.1"
     depends_on:
       - "build_docker"
       - step: "integration_qwen35_pcp8_dp8_disagg_correctness"

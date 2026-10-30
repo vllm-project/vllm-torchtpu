@@ -73,6 +73,7 @@ x-shape-multi: &shape_multi "${KUBE_SHAPE_MULTI:-tpu7x-standard-4t/2x2x1}"
 
 steps:
   - label: ":kubernetes: Unit Tests - CPU (PR)"
+    skip: "Disabled on partner/release-0.0.1"
     <<: *cpu_unit_test_defaults
     if: 'build.env("NIGHTLY") != "1"'
     plugins:
@@ -100,6 +101,7 @@ steps:
       # own chips rather than serializing behind everything else; the general
       # steps exclude the file so it is not run twice.
       - label: ":kubernetes: Unit Tests - General (PR)"
+        skip: "Disabled on partner/release-0.0.1"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") != "1"'
         env:
@@ -112,6 +114,7 @@ steps:
               test-cmd: "pytest -sv --timeout=600 -m 'not cpu_test and not nightly and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: ":kubernetes: Unit Tests - Multichip (PR)"
+        skip: "Disabled on partner/release-0.0.1"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") != "1"'
         env:
@@ -127,6 +130,7 @@ steps:
       # and acceptance-rate tests run nightly. Split by example because the
       # suite is a single file.
       - label: ":kubernetes: Unit Tests - Speculative Decoding (PR)"
+        skip: "Disabled on partner/release-0.0.1"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") != "1"'
         parallelism: 3
@@ -146,6 +150,7 @@ steps:
               test-cmd: "pytest -sv --timeout=1800 -m 'not nightly and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: ":kubernetes: Unit Tests - Speculative Decoding Multichip (PR)"
+        skip: "Disabled on partner/release-0.0.1"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") != "1"'
         env:

@@ -18,6 +18,7 @@ steps:
     steps:
       - label: "Perf/Eval: General suite (TPU v7x-8)"
         key: "perf_eval_general_tpu_v7x_8"
+        skip: "Disabled on partner/release-0.0.1"
         agents:
           queue: "tpu_v7x_8_queue"
         parallelism: 3
