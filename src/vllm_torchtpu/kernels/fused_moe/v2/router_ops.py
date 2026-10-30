@@ -29,6 +29,7 @@ import functools
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 NEG = -3.0e38  # below any real softmax score (>=0); avoids inf
 
@@ -106,5 +107,6 @@ def pallas_select(scores, topk=10, block_rows=256, weight_scores=None, interpret
         in_specs=list(bs),
         out_specs=list(os),
         out_shape=list(out_shapes),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
         interpret=interpret,
     )(*operands)

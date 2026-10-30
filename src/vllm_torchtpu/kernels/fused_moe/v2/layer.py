@@ -545,7 +545,9 @@ def fused_ep_moe_v2(
         histogram the routing plan reads alongside the gathered payload.
         """
         scores = _apply_scoring_fn(gate_l, scoring_fn)
-        select_rows = MAX_ROUTING_BLOCK
+        select_rows = (
+            512 if (t_local >= 512 and t_local % 512 == 0) else MAX_ROUTING_BLOCK
+        )
         while t_local % select_rows:
             select_rows //= 2
         if hash_l is not None:
