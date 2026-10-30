@@ -1194,6 +1194,7 @@ def sparse_mla_attention_dcp(
     fused_exchange: bool = False,
     dcp_lane_ids: jax.Array | None = None,
     fused_merge: bool = False,
+    merge_pieces: bool = True,
 ) -> tuple[jax.Array, ...]:
     """Sparse MLA attention over a DCP position-sharded latent cache.
 
@@ -1241,6 +1242,9 @@ def sparse_mla_attention_dcp(
         num_heads // dcp_size, lkv_dim]` and f32 `[dcp_size * dcp_size,
         num_tokens * num_heads // dcp_size]`, each rank's `[dcp_size, ...]`
         block sender-major, partial rows past the real ones zero.
+      merge_pieces: TPU_DCP_MLA_MERGE_PIECES may split the output into the
+        merge's chunks. False for a caller that reads it whole: joining the
+        pieces is a copy.
 
     TPU_MLA_KV_WRITE_IN_GATHER: on fused-prep decode buckets the step's KV
     write is not a kernel of its own; the SparseCore gather that feeds the
@@ -1530,9 +1534,10 @@ def sparse_mla_attention_dcp(
         # TPU_DCP_MLA_MERGE_PIECES: one output buffer per merge chunk, so the
         # merge's reduce-scatter k waits only for the attention chunks that
         # produce its rows (mixed buckets with the in-kernel lse mask).
-        merge_pieces = 0
+        out_pieces = 0
         if (
-            envs.TPU_DCP_MLA_MERGE_PIECES
+            merge_pieces
+            and envs.TPU_DCP_MLA_MERGE_PIECES
             and not decode_bucket
             and mask_in_kernel
             and envs.TPU_MLA_SPARSE_SPLIT_Q
@@ -1542,7 +1547,7 @@ def sparse_mla_attention_dcp(
         ):
             from vllm_torchtpu.layers.adapter.cp_mla_attention import _merge_chunks
 
-            merge_pieces = _merge_chunks(topk_idx.shape[0])
+            out_pieces = _merge_chunks(topk_idx.shape[0])
         attn = sparse_mla_kernel.sparse_ragged_paged_attention(
             q,
             kv_cache_nope,
@@ -1585,7 +1590,7 @@ def sparse_mla_attention_dcp(
                 else ()
             ),
             decode_body_levers=_decode_body_levers(envs.TPU_MLA_DECODE_BODY_LEVERS),
-            out_pieces=merge_pieces,
+            out_pieces=out_pieces,
             out_pieces_gather_first=envs.TPU_DCP_MLA_MERGE_PIECES >= 3,
             **chunk_kwargs,
             **split_kwargs,

@@ -19,6 +19,8 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_UV_BEFORE_MERGE: bool = False
     TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS: int = 0
     TPU_DCP_MERGE_VSPACE_FUSED: bool = False
+    TPU_DCP_MLA_OPROJ_ALL_REDUCE: bool = False
+    TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS: int = 512
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
     TPU_DCP_LSE_MERGE_A2A_PACK: bool = False
     TPU_DCP_LSE_MERGE_A2A_REAL_ROWS: bool = False
@@ -173,6 +175,7 @@ if TYPE_CHECKING:
     TPU_PRECOMPILE_TRACE_FIRST: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_DCP_INDEXER_A2A_MERGE: bool = True
+    TPU_DCP_INDEXER_HIST_MERGE: bool = True
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = 4
     TPU_STREAMIDX_SMALL_BUCKET_BKVP: int | None = None
@@ -293,6 +296,7 @@ if TYPE_CHECKING:
     TPU_FUSED_ADD_RMSNORM_QUANT_MOE: bool = False
     TPU_MTP_EH_PROJ_TP: bool = False
     TPU_MTP_ONEHOT_AR: bool = True
+    TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS: int = 0
     TPU_SAMPLER_BSEARCH_RADIX_BITS: int = 0
     TPU_SAMPLER_FAST_TOP_P: bool = True
     TPU_SAMPLER_FUSED_CHAIN: bool = True
@@ -797,6 +801,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DCP8: P90 TTFT -10..-12% (the separate W_UV bmm, concat and relayouts
     # cost ~36 ms per 4096-token step).
     "TPU_DCP_MERGE_VSPACE_FUSED": env_bool("TPU_DCP_MERGE_VSPACE_FUSED"),
+    # Where W_UV is replicated over the DCP group (TPU_DCP_MLA_UV_BEFORE_MERGE),
+    # replicate o_proj too, so the backbone buckets that apply W_UV before the
+    # merge (TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS) and would reduce-scatter
+    # it (above TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS) skip the reduce-scatter: each
+    # rank runs o_proj on its weighted partial of every group head, and
+    # o_proj's all-reduce sums the ranks. Every other step keeps the merge and
+    # o_proj itself. Off by default: the replicated o_proj does not fit some
+    # served configs' HBM. A no-op without TPU_DCP_MLA_UV_BEFORE_MERGE,
+    # unless o_proj is FP8 from an FP8 checkpoint (requantized to a float8),
+    # and with an output gate. Costs one o_proj per layer of HBM.
+    "TPU_DCP_MLA_OPROJ_ALL_REDUCE": env_bool(
+        "TPU_DCP_MLA_OPROJ_ALL_REDUCE", default=False
+    ),
+    # Its o_proj and all-reduce run in chunks of this many tokens (a multiple
+    # of 128), pipelined: each chunk's all-reduce under the next chunk's
+    # o_proj. 0 = one chunk. A 512-token chunk's all-reduce is 6 MiB, over the
+    # 2 MiB SparseCore offload threshold of the GLM-5.2 AgentX recipe; there
+    # 512 beat 256, 768 and 1024 below 4096 tokens and tied at 4096.
+    "TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS": env_int(
+        "TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS", 512
+    ),
     # Sparse MLA split q (`sparse_ragged_paged_attention(q_pe=...)`): hand
     # q_nope and q_pe to the kernel as separate operands. The kernel joins
     # them in VMEM and its output aliases q_nope (512 wide), instead of the
@@ -1453,6 +1478,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Merge the DCP indexer candidates with an all-to-all over the token axis
     # instead of an all-gather over the candidate axis. Same result.
     "TPU_DCP_INDEXER_A2A_MERGE": env_bool("TPU_DCP_INDEXER_A2A_MERGE", default=True),
+    # Find the DCP indexer's global top-k in each chunk's SparseCore pass by
+    # summing its radix histograms over the ranks, instead of a local top-k,
+    # a candidate exchange and a merge, on the buckets that would take the
+    # all-to-all merge (TPU_DCP_INDEXER_A2A_MIN_TOKENS). Decode-sized buckets
+    # keep the all-gather merge: there the exchange rounds' latency outweighs
+    # the merge they save.
+    "TPU_DCP_INDEXER_HIST_MERGE": env_bool("TPU_DCP_INDEXER_HIST_MERGE", default=True),
     # Smallest padded token bucket that takes the all-to-all merge when
     # TPU_DCP_INDEXER_A2A_MERGE is on. The bucket is static, so each compiled
     # variant picks one merge with no runtime cost.
@@ -1953,6 +1985,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (~8 us) instead of XLA's all-gather (~14 us at 16 cores). Bitwise the
     # gather up to the sign of a zero: each element sums one block and 15 +0.
     "TPU_MTP_ONEHOT_AR": env_bool("TPU_MTP_ONEHOT_AR", default=True),
+    # MTP draft (DeepSeek-V3.2 / GLM-5.2 DSA): draft step 0 of a chunk with at
+    # least this many (padded) tokens runs in two passes. Pass 1 only writes the
+    # MTP layer's KV and indexer-K caches for every row; pass 2 runs the full
+    # layer on one row per request, the only rows a draft token is read from.
+    # Same draft tokens and caches, without the indexer, sparse attention, MoE
+    # and DCP merge of every other prefill row (spec_decode/mtp_kv_only.py).
+    # 0 (default) keeps the single full pass.
+    "TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS", 0
+    ),
     # Bits of the float32 threshold bisection resolved per vocab pass in
     # top-k/top-p masking (2**bits - 1 candidate thresholds per pass, same
     # result as 1 bit/pass since the predicate is monotonic). 0 = 1. Measured
