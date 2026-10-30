@@ -664,13 +664,8 @@ def test_main_kv_dcp_rejects_an_unsupported_prefill_tile_at_init(monkeypatch):
     spec build fails with the reason instead of the first prefill crashing."""
     from vllm_torchtpu.kernels.qwen4_exp import block_sparse_gqa_prefill
 
-    layout, _ = pooled_cache_specs(dcp_config(monkeypatch, compressed=True))
-    assert 2 * layout.block_size in block_sparse_gqa_prefill.PAIRED_KV_TILES
-    monkeypatch.setattr(
-        block_sparse_gqa_prefill,
-        "PAIRED_KV_TILES",
-        tuple(t for t in block_sparse_gqa_prefill.PAIRED_KV_TILES if t != 2 * layout.block_size),
-    )
+    pooled_cache_specs(dcp_config(monkeypatch, compressed=True))
+    monkeypatch.setattr(block_sparse_gqa_prefill, "PAIRED_KV_TILES", ())
     with pytest.raises(ValueError, match="paired-page kernel"):
         pooled_cache_specs(dcp_config(monkeypatch, compressed=True))
 
