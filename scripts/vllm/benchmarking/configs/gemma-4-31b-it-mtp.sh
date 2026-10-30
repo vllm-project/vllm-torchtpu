@@ -38,7 +38,7 @@ SPEC_WARMUP_PROMPTS=20
 SPEC_REPS=2
 BENCHMARK_TEMPERATURE=0
 
-EXTRA_SERVE_ARGS="--language-model-only --no-enable-prefix-caching --limit-mm-per-prompt '{\"image\":0,\"video\":0,\"audio\":0}'"
+EXTRA_SERVE_ARGS="--language-model-only --no-enable-prefix-caching --limit-mm-per-prompt {\"image\":0,\"video\":0,\"audio\":0}"
 
 export USE_BATCHED_RPA_LONGCTX=1
 export VLLM_KV_CACHE_LAYOUT=HND

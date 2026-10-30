@@ -129,19 +129,9 @@ def aggregate_spec_results(results_dir: Path) -> dict[int, dict[int, dict[str, A
                     durations.append(float(dur))
 
                 ar = r.get("spec_decode_acceptance_rate")
-                if (
-                    ar is None
-                    and "spec_decode_stats" in r
-                    and isinstance(r["spec_decode_stats"], dict)
-                ):
-                    ar = r["spec_decode_stats"].get("acceptance_rate")
                 if ar is not None:
-                    ar_val = float(ar)
-                    # Normalize if vLLM emitted it as a percentage (e.g. 52.3)
-                    # rather than a ratio (0.523).
-                    if ar_val > 1.0:
-                        ar_val = ar_val / 100.0
-                    acceptance_rates.append(ar_val)
+                    # vLLM bench serve writes this field in percent (0-100).
+                    acceptance_rates.append(float(ar) / 100.0)
 
                 comp = r.get("completed")
                 if comp is not None:

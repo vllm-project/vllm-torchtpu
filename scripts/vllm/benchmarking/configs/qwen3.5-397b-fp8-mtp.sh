@@ -39,7 +39,7 @@ SPEC_WARMUP_PROMPTS=20
 SPEC_REPS=2
 BENCHMARK_TEMPERATURE=0
 
-EXTRA_SERVE_ARGS="--language-model-only --no-enable-prefix-caching --limit-mm-per-prompt '{\"image\":0,\"video\":0}' '--default-chat-template-kwargs={\"enable_thinking\":false}'"
+EXTRA_SERVE_ARGS="--language-model-only --no-enable-prefix-caching --limit-mm-per-prompt {\"image\":0,\"video\":0} --default-chat-template-kwargs {\"enable_thinking\":false}"
 
 export TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1
 export TPU_ACCELERATOR_TYPE=tpu7x

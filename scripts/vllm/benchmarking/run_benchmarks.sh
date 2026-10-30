@@ -247,6 +247,9 @@ if [ "$BENCHMARK_MODE" != "spec_bench" ]; then
         echo "ERROR: RANGE_RATIO_STYLE must be 'symmetric' or 'min'"
         exit 1
     fi
+elif [ "$START_SERVER" != "1" ]; then
+    echo "ERROR: --host is not supported in spec_bench mode because each (BS, K) cell restarts vllm serve."
+    exit 1
 fi
 if ! [[ "$BENCHMARK_WARMUP_RUNS" =~ ^[0-9]+$ ]]; then
     echo "ERROR: BENCHMARK_WARMUP_RUNS must be a non-negative integer"
@@ -785,6 +788,30 @@ if [ -n "$MODEL_URI" ]; then
 else
     model_uri_json=null
 fi
+random_range_ratio_json=${RANDOM_RANGE_RATIO:-null}
+eval_tolerance_json=${EVAL_TOLERANCE:-null}
+spec_bench_config_json=""
+if [ "$BENCHMARK_MODE" = "spec_bench" ]; then
+    spec_bench_config_json=$(python3 -c '
+import json, sys
+_, method, draft_model, draft_tp, k_list, bs_list, dataset, category, num_prompts, warmup_prompts, reps = sys.argv
+fields = {
+    "benchmark_mode": "spec_bench",
+    "spec_method": method or None,
+    "spec_draft_model": draft_model or None,
+    "spec_draft_tp": int(draft_tp) if draft_tp else None,
+    "spec_k_list": k_list,
+    "spec_bs_list": bs_list,
+    "spec_bench_dataset": dataset or None,
+    "spec_bench_category": category,
+    "spec_num_prompts": int(num_prompts),
+    "spec_warmup_prompts": int(warmup_prompts),
+    "spec_reps": int(reps),
+}
+body = json.dumps(fields, indent=4)
+print("," + body[1:-2])
+' "$SPEC_METHOD" "$SPEC_DRAFT_MODEL" "$SPEC_DRAFT_TP" "$SPEC_K_LIST" "$SPEC_BS_LIST" "$SPEC_BENCH_DATASET" "$SPEC_BENCH_CATEGORY" "$SPEC_NUM_PROMPTS" "$SPEC_WARMUP_PROMPTS" "$SPEC_REPS")
+fi
 # lm-eval only reaches its key=value parser for a --gen_kwargs string with no
 # "{" in it; anything brace-shaped must be real JSON with double quotes. Those
 # quotes would close the string literal below, so encode rather than interpolate.
@@ -806,7 +833,7 @@ cat > "$RESULTS_DIR/config.json" << EOF
     "dataset_name": "$DATASET_NAME",
     "concurrency_options": "$CONCURRENCY_OPTIONS",
     "num_prompts": ${NUM_PROMPTS:-320},
-    "random_range_ratio": $RANDOM_RANGE_RATIO,
+    "random_range_ratio": $random_range_ratio_json,
     "range_ratio_style": "$RANGE_RATIO_STYLE",
     "benchmark_warmup_runs": $BENCHMARK_WARMUP_RUNS,
     "benchmark_temperature": $benchmark_temperature_json,
@@ -825,7 +852,7 @@ cat > "$RESULTS_DIR/config.json" << EOF
     "extra_lm_eval_model_args": "$EXTRA_LM_EVAL_MODEL_ARGS",
     "lm_eval_gen_kwargs": $lm_eval_gen_kwargs_json,
     "perf_tolerance": $PERF_TOLERANCE,
-    "eval_tolerance": $EVAL_TOLERANCE
+    "eval_tolerance": $eval_tolerance_json$spec_bench_config_json
 }
 EOF
 
