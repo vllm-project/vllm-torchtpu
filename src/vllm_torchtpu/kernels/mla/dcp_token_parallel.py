@@ -355,6 +355,15 @@ def gather_index_k(
     return g.reshape(layout.max_pages * dcp, *g.shape[2:])
 
 
+def own_rows(layout: TokenParallelLayout, x: jax.Array, rank: jax.Array) -> jax.Array:
+    """This rank's token-parallel rows of a replicated `[T, ...]` operand
+    (rows past `T` zero)."""
+    rows = layout.rows_per_rank(x.shape[0])
+    pad = [(0, layout.split_rows)] + [(0, 0)] * (x.ndim - 1)
+    start = layout.split_rows + rank * rows
+    return lax.dynamic_slice_in_dim(jnp.pad(x, pad), start, rows, axis=0)
+
+
 def heads_to_tokens(
     layout: TokenParallelLayout, x: jax.Array, axis_name: str
 ) -> jax.Array:
@@ -403,13 +412,15 @@ def sparse_mla_attention(
     write_kv: WriteKVFn,
     attend: AttendFn,
     rank_ids: jax.Array | None = None,
+    q_replicated: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Token-parallel sparse MLA for one layer (global view).
 
     Args:
       kv_cache_nope, kv_cache_rope: position shards over `axis_name`.
       q: `[dcp * T, h, D]`, each rank's `[T, h, D]` head slice of every row
-        (latent nope and rope concatenated).
+        (latent nope and rope concatenated); with `q_replicated`, `[T, H, D]`,
+        every head of every row on every rank (no all-to-all needed).
       kv_c_normed, k_pe: this step's latents, replicated; `write_kv` writes
         every row this rank owns before anything is gathered.
       flat_topk: `[dcp * R, K]`, each rank's rows' top-k as flat buffer rows
@@ -434,7 +445,10 @@ def sparse_mla_attention(
         g_nope, g_rope = gather_latent(
             layout, nope, rope, page_ids, jnp.sum(pages), axis_name
         )
-        q_tok = heads_to_tokens(layout, q, axis_name)
+        if q_replicated:
+            q_tok = own_rows(layout, q, rank)
+        else:
+            q_tok = heads_to_tokens(layout, q, axis_name)
         rr = rank_rows(layout, rank, q.shape[0], seq_lens, qsl, dist[2])
         out = attend(q_tok, g_nope, g_rope, topk, rr.num_rows)
         return nope, rope, tokens_to_heads(out, axis_name)
@@ -443,7 +457,8 @@ def sparse_mla_attention(
     return jax.shard_map(
         _local,
         mesh=mesh,
-        in_specs=(sharded, sharded, sharded, rep, rep, sharded, rep, rep, rep, rep)
+        in_specs=(sharded, sharded, rep if q_replicated else sharded)
+        + (rep, rep, sharded, rep, rep, rep, rep)
         + (sharded,) * len(extra),
         out_specs=(sharded, sharded, sharded),
         check_vma=False,
@@ -496,14 +511,7 @@ def indexer_topk(
         page_ids = gather_page_ids(layout, bt, pages, offsets, cache.shape[0])
         natural = gather_index_k(layout, cache, page_ids, jnp.sum(pages), axis_name)
         rr = rank_rows(layout, rank, num_tokens, seq_lens, qsl, dist[2])
-        start = layout.split_rows + rank * rows
-        pad = layout.split_rows
-        q_r = lax.dynamic_slice_in_dim(
-            jnp.pad(q, ((0, pad), (0, 0), (0, 0))), start, rows, axis=0
-        )
-        w_r = lax.dynamic_slice_in_dim(
-            jnp.pad(weights, ((0, pad), (0, 0))), start, rows, axis=0
-        )
+        q_r, w_r = own_rows(layout, q, rank), own_rows(layout, weights, rank)
         vpages_per_seq = bt.shape[0] // seq_lens.shape[0]
         table = natural_page_table(layout, rr, offsets, vpages_per_seq)
         positions = select_topk(q_r, w_r, natural, rr, table)

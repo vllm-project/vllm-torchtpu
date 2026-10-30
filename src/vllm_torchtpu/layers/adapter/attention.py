@@ -2938,6 +2938,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     k_pe_flat,
                     topk_indices,
                     attn_metadata,
+                    q_replicated=use_qrep,
                 )
             elif self.dcp_size > 1:
                 assert getattr(layer, "sparse_mla_dcp_op", None) is not None, (

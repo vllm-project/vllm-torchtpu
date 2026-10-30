@@ -1926,7 +1926,10 @@ class VllmTPUMLAAttention(MLAAttention):
             )
             if self.token_parallel_layout is not None:
                 self.sparse_mla_tp_op = dcp_token_parallel_op.build_attention_op(
-                    self, impl, self.token_parallel_layout
+                    self,
+                    impl,
+                    self.token_parallel_layout,
+                    q_replicated=bool(self.dcp_q_replicate),
                 )
             # TPU_MLA_DECODE_PROLOGUE: the variant that takes the raw q head
             # and ropes q_pe in the attention kernel (query replication only).

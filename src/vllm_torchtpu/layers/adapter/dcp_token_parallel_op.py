@@ -101,10 +101,15 @@ def check_config(vllm_config: Any, *, q_replicate: bool) -> None:
             "TPU_DCP_PREFILL_TOKEN_PARALLEL: speculative decoding is not "
             "supported (the drafter is traced once for every bucket)."
         )
-    if q_replicate:
+    if q_replicate and envs.TPU_MLA_DECODE_PROLOGUE:
         raise NotImplementedError(
-            "TPU_DCP_PREFILL_TOKEN_PARALLEL needs VLLM_DCP_Q_REPLICATE=0: it "
-            "moves the head-sharded q by all-to-all."
+            "TPU_DCP_PREFILL_TOKEN_PARALLEL does not take TPU_MLA_DECODE_PROLOGUE "
+            "(an un-roped q under query replication)."
+        )
+    if envs.TPU_DCP_MLA_UV_BEFORE_MERGE or envs.TPU_DCP_MLA_OPROJ_ALL_REDUCE:
+        raise NotImplementedError(
+            "TPU_DCP_PREFILL_TOKEN_PARALLEL returns merged latent outputs; it "
+            "does not take TPU_DCP_MLA_UV_BEFORE_MERGE / _OPROJ_ALL_REDUCE."
         )
     if envs.TPU_INDEXER_QB_OVERLAP:
         raise NotImplementedError(
@@ -259,13 +264,17 @@ def make_select_topk(
 
 
 def build_attention_op(
-    layer: Any, impl: Any, layout: dcp_token_parallel.TokenParallelLayout
+    layer: Any,
+    impl: Any,
+    layout: dcp_token_parallel.TokenParallelLayout,
+    q_replicated: bool,
 ):
     """The token-parallel sparse MLA op of `layer`: `(kv_cache, q, kv_c_normed,
     k_pe, flat_topk, seq_lens, block_tables, query_start_loc,
     request_distribution) -> [T, heads, kv_lora_rank]`, row `i` being step row
     `split_rows + i`. `q` is this rank's heads of every row, latent nope and
-    rope concatenated; the op writes every row's latents into the caches."""
+    rope concatenated -- or, with `q_replicated` (query replication), every
+    head of every row; the op writes every row's latents into the caches."""
     mesh = impl._dcp_mesh
     assert mesh is not None
     dcp, il = impl.dcp_size, impl.dcp_interleave_size
@@ -340,6 +349,7 @@ def build_attention_op(
             write_kv=write_kv,
             attend=attend,
             rank_ids=rank_ids,
+            q_replicated=q_replicated,
         )
 
     # Fixed arity per variant: torch custom-op schemas take no varargs.
@@ -397,11 +407,13 @@ def build_attention_op(
         )
 
     sharded, rep = P(DCP_AXIS_NAME), P()
-    in_specs = (sharded, sharded, sharded, rep, rep, sharded, rep, rep, rep, rep)
+    in_specs = (sharded, sharded, rep if q_replicated else sharded)
+    in_specs += (rep, rep, sharded, rep, rep, rep, rep)
     if rank_tensor is not None:
         in_specs += (sharded,)
     op = pcp_streaming_jax_op(
-        f"pallas::sparse_mla_tp_{layer.layer_name.replace('.', '_')}",
+        f"pallas::sparse_mla_tp_{layer.layer_name.replace('.', '_')}"
+        + ("_qrep" if q_replicated else ""),
         sparse_mla_tp if rank_tensor is None else sparse_mla_tp_rank,
         donate_argnums=(0, 1),
         mesh=mesh,
@@ -450,6 +462,7 @@ def build_attention_op(
         return out
 
     run.layout = layout  # type: ignore[attr-defined]
+    run.q_replicated = q_replicated  # type: ignore[attr-defined]
     return run
 
 
@@ -462,15 +475,22 @@ def attention(
     k_pe: torch.Tensor,
     topk_rows: torch.Tensor,
     attn_metadata: Any,
+    q_replicated: bool,
 ) -> torch.Tensor:
     """Sparse MLA of a split bucket: `[T, heads, kv_lora_rank]`, this rank's
-    heads, merged; what the DCP path returns for the same step."""
+    heads, merged; what the DCP path returns for the same step. `ql_nope` /
+    `q_pe` hold this rank's heads, or every head under query replication."""
     from vllm_torchtpu.layers.adapter.cp_mla_attention import (
         all_gather_q_nope_pe_heads,
         merge_lse_partials_scatter_heads,
     )
 
     tp_op = layer.sparse_mla_tp_op
+    if tp_op.q_replicated != q_replicated:
+        raise ValueError(
+            f"token-parallel op built for q_replicated={tp_op.q_replicated}, "
+            f"called with {q_replicated}"
+        )
     layout = tp_op.layout
     s = layout.split_rows
     num_tokens = ql_nope.shape[0]
@@ -479,9 +499,12 @@ def attention(
     seq_s, qsl_s, dist_s = dcp_rows_metadata(
         md.seq_lens, md.query_start_loc, md.request_distribution, s
     )
-    q_dcp, pe_dcp = all_gather_q_nope_pe_heads(
-        ql_nope[:s], q_pe[:s], layer.kv_lora_rank
-    )
+    if q_replicated:
+        q_dcp, pe_dcp = ql_nope[:s], q_pe[:s]
+    else:
+        q_dcp, pe_dcp = all_gather_q_nope_pe_heads(
+            ql_nope[:s], q_pe[:s], layer.kv_lora_rank
+        )
     partial, lse = layer.sparse_mla_dcp_op(
         kv_cache,
         q_dcp,
