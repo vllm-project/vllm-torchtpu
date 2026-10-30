@@ -1402,12 +1402,16 @@ class Qwen38SegmentDriver:
         n = n_req or rows // T
         mk_h = mk[0] if isinstance(mk, (tuple, list)) else mk
         st_h = stock[0] if isinstance(stock, (tuple, list)) else stock
-        eq = (runner.model.compute_logits(mk_h).argmax(-1)
-              == runner.model.compute_logits(st_h).argmax(-1)).float()[: n * T].reshape(n, T)
+        lm = runner.model.compute_logits(mk_h).float()[: n * T]
+        ls = runner.model.compute_logits(st_h).float()[: n * T]
+        eq = (lm.argmax(-1) == ls.argmax(-1)).float().reshape(n, T)
         agree = [round(float(v), 2) for v in eq.mean(-1).cpu()]
-        a, b = mk_pre.float()[: n * T], seg_pre.float()[: n * T]
-        scale = b.abs().mean().clamp_min(1e-6)
-        pre = [round(float(v), 4) for v in ((a - b).abs().reshape(n, T, -1).mean((1, 2)) / scale).cpu()]
+        self._margin_diag(lm, ls, mk_h.float()[: n * T], st_h.float()[: n * T], kw, n)
+        pre = None  # check=N: no cut reference
+        if mk_pre is not None:
+            a, b = mk_pre.float()[: n * T], seg_pre.float()[: n * T]
+            scale = b.abs().mean().clamp_min(1e-6)
+            pre = [round(float(v), 4) for v in ((a - b).abs().reshape(n, T, -1).mean((1, 2)) / scale).cpu()]
         bad = [q for q in range(n) if agree[q] < 0.5]
         meta = {}
         if bad:
@@ -1422,6 +1426,67 @@ class Qwen38SegmentDriver:
             "qwen38 whole-step shadow per-request rows=%d agree=%s pre_last_rel_vs_seg=%s bad=%s",
             rows, agree, pre, meta,
         )
+
+    # Context buckets (tokens) for the per-row hidden-state error.
+    _CTX_EDGES = (8192, 32768, 65536, 131072)
+    # Stock top-1 minus top-2 logit margin bins.
+    _MARGIN_EDGES = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
+
+    def _margin_diag(self, lm: Any, ls: Any, mk_h: Any, st_h: Any, kw: dict, n: int) -> None:
+        """Near-tie noise vs drift. Per checked row: the stock top1 - top2 logit margin, and
+        for a row whose top-1 differs, MK's pick's rank in the stock logits and |MK - stock|
+        at the stock top-1 token; per-row final-hidden relative error by request context.
+        Noise flips only at margins below the logit error and picks stock's runner-up; drift
+        flips at large margins or picks deep. Logs a summary every 50 checked steps."""
+        T = T_VERIFY
+        top2 = ls.topk(2, dim=-1)
+        margin = (top2.values[:, 0] - top2.values[:, 1]).cpu()
+        s_arg = top2.indices[:, 0]
+        m_arg = lm.argmax(-1)
+        flip = (m_arg != s_arg).cpu()
+        dlogit = (lm.gather(1, s_arg[:, None]) - ls.gather(1, s_arg[:, None])).abs()[:, 0].cpu()
+        rank = (ls > ls.gather(1, m_arg[:, None])).sum(-1).cpu()  # 0 = stock top-1
+        rel = ((mk_h - st_h).abs().mean(-1) / st_h.abs().mean(-1).clamp_min(1e-6)).cpu()
+        ctx = kw.get("context_lens")
+        ctx = ctx[:n].cpu() if isinstance(ctx, torch.Tensor) and ctx.numel() >= n else None
+        agg = self.__dict__.setdefault("_mdiag", dict(
+            steps=0, rows=0, flips=0, margin_all=[0] * 7, margin_flip=[0] * 7,
+            rank=[0] * 4, flip_over_dlogit=0, rel_ctx=[[0.0, 0] for _ in range(5)],
+        ))
+        import bisect
+
+        agg["steps"] += 1
+        flips = []
+        for r in range(n * T):
+            mb = bisect.bisect_right(self._MARGIN_EDGES, float(margin[r]))
+            agg["rows"] += 1
+            agg["margin_all"][mb] += 1
+            q = r // T
+            c = int(ctx[q]) if ctx is not None else -1
+            cb = bisect.bisect_right(self._CTX_EDGES, c) if c >= 0 else 0
+            agg["rel_ctx"][cb][0] += float(rel[r])
+            agg["rel_ctx"][cb][1] += 1
+            if flip[r]:
+                agg["flips"] += 1
+                agg["margin_flip"][mb] += 1
+                agg["rank"][min(int(rank[r]), 3)] += 1
+                agg["flip_over_dlogit"] += int(float(margin[r]) > float(dlogit[r]))
+                flips.append((r, round(float(margin[r]), 3), int(rank[r]),
+                              round(float(dlogit[r]), 3), c))
+        logger.info(
+            "qwen38 MK margin-diag rows=%d flips(row,margin,mk_rank_in_stock,dlogit,ctx)=%s "
+            "rel_per_row=%s", n * T, flips, [round(float(v), 3) for v in rel],
+        )
+        if agg["steps"] % 50 == 0:
+            logger.info(
+                "qwen38 MK margin-diag SUMMARY steps=%d rows=%d flips=%d margin_edges=%s "
+                "margin_all=%s margin_flip=%s mk_rank_in_stock[0,1,2,3+]=%s "
+                "flips_with_margin>dlogit=%d ctx_edges=%s mean_row_rel_by_ctx=%s",
+                agg["steps"], agg["rows"], agg["flips"], self._MARGIN_EDGES,
+                agg["margin_all"], agg["margin_flip"], agg["rank"], agg["flip_over_dlogit"],
+                self._CTX_EDGES,
+                [(round(t / k, 4) if k else None, k) for t, k in agg["rel_ctx"]],
+            )
 
     @staticmethod
     def _vs_stock(runner: Any, mk: Any, stock: Any) -> tuple[float, float, float]:
@@ -1518,6 +1583,8 @@ class Qwen38SegmentDriver:
         stock = runner.model(input_ids=input_ids, positions=positions, **kw)
         if not real:  # warmup: compile this bucket's shadow program, compare nothing
             return stock
+        self._log_per_request(runner, mk, stock, None, None, kw, positions,
+                              int(input_ids.shape[0]), 0)
         mk_h = mk[0] if isinstance(mk, (tuple, list)) else mk
         st_h = stock[0] if isinstance(stock, (tuple, list)) else stock
         d = (mk_h.float() - st_h.float()).abs()

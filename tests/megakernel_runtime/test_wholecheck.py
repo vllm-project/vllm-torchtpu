@@ -55,3 +55,24 @@ def test_vs_stock_counts_top1_agreement():
     mk[0] = torch.roll(mk[0], 1)
     rel, max_abs, agree = qd.Qwen38SegmentDriver._vs_stock(_runner(), (mk,), (stock,))
     assert agree == 7 / 8 and max_abs == 1.0 and rel > 0
+
+
+def test_margin_diag_reports_runner_up_flips_and_rel_by_context(caplog):
+    T, n, V = qd.T_VERIFY, 2, 8
+    ls = torch.zeros(n * T, V)
+    ls[:, 0], ls[:, 1] = 2.0, 1.9  # stock top-1 token 0, runner-up 1, margin 0.1
+    lm = ls.clone()
+    lm[3, 1] = 2.5  # row 3: MK picks stock's runner-up
+    h = torch.ones(n * T, 4)
+    kw = dict(context_lens=torch.tensor([1000, 50000]))
+    drv = object.__new__(qd.Qwen38SegmentDriver)
+    with caplog.at_level(logging.INFO):
+        for _ in range(50):
+            drv._margin_diag(lm, ls, h * 1.1, h, kw, n)
+    step = [r.getMessage() for r in caplog.records if "margin-diag rows" in r.getMessage()][0]
+    assert "(3, 0.1, 1, 0.0, 1000)" in step, step
+    summary = [r.getMessage() for r in caplog.records if "SUMMARY" in r.getMessage()][-1]
+    assert "flips=50" in summary and "mk_rank_in_stock[0,1,2,3+]=[0, 50, 0, 0]" in summary, summary
+    assert "flips_with_margin>dlogit=50" in summary, summary
+    # Request 0 (ctx 1000) in the first bucket, request 1 (ctx 50000) in the third.
+    assert "(0.1, 200), None, (0.1, 200)" in summary.replace("(None, 0)", "None"), summary
