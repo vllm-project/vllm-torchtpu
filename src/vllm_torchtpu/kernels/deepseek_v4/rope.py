@@ -1078,10 +1078,9 @@ def rope_quant_flat(
 # 8-row tiling of its bf16 [tokens, heads, head_dim] output.
 HEADS_PER_TILE = 16
 # Rows of x per grid step of `quantized_matmul_heads`.
-HEADS_BLOCK_ROWS = 256
-# Fewest rows routed to `quantized_matmul_heads`: its quantize + fp8 dot was
-# bit-exact against XLA's on device from 256 rows (c104), and is unchecked below.
-HEADS_MIN_ROWS = 256
+HEADS_BLOCK_ROWS = 512
+# Fewest rows routed to `quantized_matmul_heads`.
+HEADS_MIN_ROWS = 128
 # Table-row copies issued per iteration of the gather loop.
 HEADS_GATHER_UNROLL = 8
 
