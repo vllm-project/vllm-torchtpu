@@ -808,3 +808,78 @@ def test_empty_request_partition_keeps_output_and_skips_core(core_calls):
         )
     np.testing.assert_array_equal(result, sentinel)
     assert core_calls == []
+
+
+@pytest.mark.parametrize(
+    "starts,offset,size,query_block",
+    [
+        ([0, 3, 3, 131, 273, 273, 385, 385], 0, 273, 128),
+        ([0, 3, 3, 131, 273, 273, 385, 385], 17, 256, 128),
+        ([0, 3, 3, 131, 273, 273, 385, 385], 256, 129, 128),
+        ([0, 3, 3, 131, 273, 273, 385, 385], 380, 17, 128),
+        ([0, 3, 3, 131, 273, 273, 385, 385], 512, 17, 128),
+        ([0, 0, 0, 0], 0, 7, 8),
+    ],
+)
+def test_request_tiles_with_jit_offset_match_request_loop(
+    starts, offset, size, query_block
+):
+    compiled = jax.jit(
+        lambda boundaries, start: tc._request_tiles(
+            boundaries, start, size, query_block
+        )
+    )
+    first, ends, total = compiled(jnp.asarray(starts, jnp.int32), jnp.int32(offset))
+    wanted_first = np.full(size, offset + size, np.int32)
+    wanted_ends = wanted_first.copy()
+    tiles = []
+    for lo, hi in zip(starts[:-1], starts[1:], strict=True):
+        lo, hi = max(lo, offset), min(hi, offset + size)
+        for row in range(lo, hi, query_block):
+            tiles.append((row, min(row + query_block, hi)))
+    for index, (lo, hi) in enumerate(tiles):
+        wanted_first[index], wanted_ends[index] = lo, hi
+    assert int(total) == len(tiles)
+    np.testing.assert_array_equal(first, wanted_first)
+    np.testing.assert_array_equal(ends, wanted_ends)
+
+
+@pytest.mark.parametrize("fill", [0, 37, -29])
+def test_dynamic_metadata_fill_keeps_valid_negative_indices(fill):
+    values = np.array([11, 23, 47], np.int32)
+    indices = np.array([-99, -4, -3, -1, 0, 2, 3, 99], np.int32)
+    actual = jax.jit(tc._take_with_dynamic_fill)(
+        jnp.asarray(values), jnp.asarray(indices), jnp.int32(fill)
+    )
+    expected_values = [
+        values[int(index)] if -len(values) <= index < len(values) else fill
+        for index in indices
+    ]
+    np.testing.assert_array_equal(actual, np.asarray(expected_values, np.int32))
+    assert actual.dtype == jnp.int32
+
+
+def test_jit_ragged_offsets_keep_gate_owner_and_untouched_rows(core_calls):
+    args = inputs(385, [0, 3, 3, 131, 273, 385, 385])
+    sentinel = jnp.full_like(args[0], 13)
+    reference = np.asarray(expected(args))
+    before = np.asarray(args[5]).copy().view(np.uint8)
+    compiled = jax.jit(
+        lambda offset: adaptive._write_tc_chunk(
+            args[:5],
+            args[5],
+            args[6],
+            sentinel,
+            offset,
+            128,
+            kv_heads=2,
+            ratio=4,
+            kv_tile=128,
+        )
+    )
+    for offset in (0, 17, 257):
+        actual = compiled(jnp.int32(offset))
+        wanted = np.asarray(sentinel).copy()
+        wanted[offset : offset + 128] = reference[offset : offset + 128]
+        np.testing.assert_array_equal(actual, wanted)
+    np.testing.assert_array_equal(np.asarray(args[5]).view(np.uint8), before)
