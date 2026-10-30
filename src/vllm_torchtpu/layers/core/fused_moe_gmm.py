@@ -225,6 +225,11 @@ def gmm_wrapper(
 _COUNTING_SORT_BLOCK = 512
 
 
+# Tokens per block of the per-token rank matmul in the token-block layout. At
+# most this many buckets (see `_counting_sort_positions`).
+_RANK_BLOCK_TOKENS = 256
+
+
 def _counting_sort_positions(
     sort_keys: jax.Array, num_buckets: int
 ) -> tuple[jax.Array | None, jax.Array | None]:
@@ -329,8 +334,59 @@ def _use_token_blocks(
         and use_ep
         and use_sparse_core
         and num_tokens * topk > onehot_moe_permute_threshold
-        and num_buckets <= topk * TOKEN_BLOCK
+        and num_buckets <= _RANK_BLOCK_TOKENS
         and num_buckets.bit_length() + token_bits < 31
+    )
+
+
+def _token_block_positions(
+    sort_keys: jax.Array, num_buckets: int, topk: int
+) -> tuple[jax.Array, jax.Array]:
+    """``_counting_sort_positions`` of the flat keys, from token-block keys.
+
+    A route's rank among equal keys in the flat ``[tokens, topk]`` order is
+    that key's count over earlier tokens plus over earlier slots of its own
+    token. The first comes from a triangular matmul on per-token histograms,
+    so the MXU work scales with tokens rather than routes.
+    """
+    num_blocks = sort_keys.shape[0]
+    keys = sort_keys.reshape(num_blocks, topk, TOKEN_BLOCK)
+    onehot = jax.nn.one_hot(keys, num_buckets, dtype=jnp.bfloat16)
+    # Exact: at most `topk` per bucket, then integers below 2**24 in f32.
+    hist = onehot.sum(axis=1, dtype=jnp.float32).reshape(-1, num_buckets)
+    pad = -hist.shape[0] % _RANK_BLOCK_TOKENS
+    hist = jnp.pad(hist, ((0, pad), (0, 0))).reshape(
+        -1, _RANK_BLOCK_TOKENS, num_buckets
+    )
+    lower = jnp.concatenate(
+        [
+            jnp.ones((1, _RANK_BLOCK_TOKENS), jnp.bfloat16),
+            jnp.tril(jnp.ones((_RANK_BLOCK_TOKENS,) * 2, jnp.bfloat16), -1),
+        ],
+        axis=0,
+    )
+    both = jnp.einsum(
+        "ij,bje->bie",
+        lower,
+        hist.astype(jnp.bfloat16),
+        preferred_element_type=jnp.float32,
+    )
+    block_hist = both[:, 0, :]
+    counts = block_hist.sum(axis=0)
+    base = (jnp.cumsum(block_hist, axis=0) - block_hist) + (jnp.cumsum(counts) - counts)
+    # Where each token's routes of each key start in the sorted order.
+    start = (base[:, None, :] + both[:, 1:, :]).reshape(-1, num_buckets)
+    start = start[: num_blocks * TOKEN_BLOCK].reshape(
+        num_blocks, 1, TOKEN_BLOCK, num_buckets
+    )
+    pos = (start * onehot).sum(axis=3)
+    slot = jax.lax.broadcasted_iota(jnp.int32, (topk, topk), 0)
+    earlier_slot = jax.lax.broadcasted_iota(jnp.int32, (topk, topk), 1) < slot
+    same_key = keys[:, :, None, :] == keys[:, None, :, :]
+    pos += (same_key & earlier_slot[None, :, :, None]).sum(axis=2, dtype=jnp.int32)
+    return (
+        pos.astype(jnp.int32).reshape(num_blocks, topk * TOKEN_BLOCK),
+        counts.astype(jnp.int32),
     )
 
 
@@ -356,18 +412,8 @@ def prepare_token_block_gmm_inputs(
         valid_mask &= weights != 0
     sort_keys = jnp.where(valid_mask, indices, local_num_experts)
 
-    # A route precedes another in its bucket when the flat [tokens, topk]
-    # order puts it first: earlier token, or the same token and earlier slot.
-    block = sort_keys.shape[1]
-    entry = jax.lax.broadcasted_iota(jnp.int32, (block, block), 0)
-    other = jax.lax.broadcasted_iota(jnp.int32, (block, block), 1)
-
-    def flat_order(e):
-        return (e % TOKEN_BLOCK) * topk + e // TOKEN_BLOCK
-
-    argsort_revert_indices, counts = _block_rank_positions(
-        jax.nn.one_hot(sort_keys, local_num_experts + 1, dtype=jnp.bfloat16),
-        (flat_order(other) < flat_order(entry)).astype(jnp.bfloat16),
+    argsort_revert_indices, counts = _token_block_positions(
+        sort_keys, local_num_experts + 1, topk
     )
     group_sizes_local = counts[:local_num_experts]
 
