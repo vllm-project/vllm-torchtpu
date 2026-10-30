@@ -6532,35 +6532,35 @@ class TPUModelRunner(GPUModelRunner):
                         recover_u=warm_recover_u,
                         do_sampling=True,
                         topk_candidates=blocks,
-                        )
-                        synchronize_tensors(out)
-                    if getattr(self.drafter, "probabilistic", False):
-                        # Probabilistic drafting hands the sampler q as well:
-                        # a distinct graph per (apply_topk_topp, candidates).
-                        warm_draft_probs = torch.zeros(
-                            (num_tokens, self.vocab_size), dtype=torch.float32
-                        ).to(self.device)
-                        variants = [(True, 0), (False, 0)]
-                        if blocks:
-                            variants.append((True, blocks))
-                        for apply_topk_topp, candidates in variants:
-                            out = self.rejection_sampler(
-                                draft_token_ids=draft_token_ids,
-                                num_draft_tokens=draft_lengths,
-                                target_logits=target_logits_ng,
-                                bonus_token_ids=bonus_token_ids,
-                                segment_ids=segment_ids,
-                                group_indices=group_indices,
-                                max_draft_tokens=k,
-                                temperatures=warm_temps,
-                                top_k=warm_top_k,
-                                top_p=warm_top_p,
-                                accept_u=warm_accept_u,
-                                recover_u=warm_recover_u,
-                                do_sampling=True,
-                                topk_candidates=candidates,
-                                apply_topk_topp=apply_topk_topp,
-                                draft_probs=warm_draft_probs,
+                    )
+                    synchronize_tensors(out)
+                if getattr(self.drafter, "probabilistic", False):
+                    # Probabilistic drafting hands the sampler q as well:
+                    # a distinct graph per (apply_topk_topp, candidates).
+                    warm_draft_probs = torch.zeros(
+                        (num_tokens, self.vocab_size), dtype=torch.float32
+                    ).to(self.device)
+                    variants = [(True, 0), (False, 0)]
+                    if blocks:
+                        variants.append((True, blocks))
+                    for apply_topk_topp, candidates in variants:
+                        out = self.rejection_sampler(
+                            draft_token_ids=draft_token_ids,
+                            num_draft_tokens=draft_lengths,
+                            target_logits=target_logits_ng,
+                            bonus_token_ids=bonus_token_ids,
+                            segment_ids=segment_ids,
+                            group_indices=group_indices,
+                            max_draft_tokens=k,
+                            temperatures=warm_temps,
+                            top_k=warm_top_k,
+                            top_p=warm_top_p,
+                            accept_u=warm_accept_u,
+                            recover_u=warm_recover_u,
+                            do_sampling=True,
+                            topk_candidates=candidates,
+                            apply_topk_topp=apply_topk_topp,
+                            draft_probs=warm_draft_probs,
                         )
                         synchronize_tensors(out)
                 logger.info(
