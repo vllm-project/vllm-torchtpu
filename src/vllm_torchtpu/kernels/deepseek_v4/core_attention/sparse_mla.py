@@ -584,6 +584,7 @@ def _dense_attention_kernel(
     block_seqs_ref,  # [num_blocks] request of each block
     block_pages_ref,  # [num_blocks] KV pages each block reads
     kv_bounds_ref,  # [num_blocks] 1 + largest selected KV position per block
+    prefix_ref,  # [num_blocks] 1 if every token selected all of [0, its bound)
     # Input
     attention_sinks_ref,  # float32[num_q_heads]
     q_ref,  # [bq_sz, num_q_heads, head_dim]
@@ -636,8 +637,7 @@ def _dense_attention_kernel(
         # src is lane-replicated [rows, 128]; tile it to `shape`'s minor dim.
         return jnp.concatenate([src] * (shape[-1] // src.shape[-1]), axis=-1)
 
-    @pl.when(kv_step == 0)
-    def init():
+    def init_state():
         for t in range(bq_sz):
             rows = pl.ds(t * num_q_heads, num_q_heads)
             swa_m = swa_m_ref[t, :num_q_heads][:, None]
@@ -646,24 +646,41 @@ def _dense_attention_kernel(
             l_ref[rows, :] = jnp.broadcast_to(swa_l, (num_q_heads, 128))
         acc_ref[...] = swa_acc_ref[...].reshape(num_rows, head_dim).astype(jnp.float32)
 
-        # counts[x >> 7, x & 127] = how often the token selected position x,
-        # as a one-hot product on the MXU; -1 entries match no row.
-        def build_mask(t, carry):
-            row = topk_ref[pl.ds(t, 1), :]  # [1, topk]
-            hi = jnp.right_shift(row, _MASK_LANE_BITS)
-            lo = jnp.bitwise_and(row, _MASK_LANES - 1)
-            hi_onehot = lax.broadcasted_iota(jnp.int32, (mask_rows, topk), 0) == hi
-            lo_onehot = lax.broadcasted_iota(jnp.int32, (_MASK_LANES, topk), 0) == lo
-            counts = lax.dot_general(
-                hi_onehot.astype(jnp.float32),
-                lo_onehot.astype(jnp.float32),
-                (((1,), (1,)), ((), ())),
-                preferred_element_type=jnp.float32,
-            )
-            mask_ref[:, pl.ds(t, 1), :] = counts[:, None, :]
-            return carry
+    # counts[x >> 7, x & 127] = how often the token selected position x,
+    # as a one-hot product on the MXU; -1 entries match no row.
+    def build_mask(t, carry):
+        row = topk_ref[pl.ds(t, 1), :]  # [1, topk]
+        hi = jnp.right_shift(row, _MASK_LANE_BITS)
+        lo = jnp.bitwise_and(row, _MASK_LANES - 1)
+        hi_onehot = lax.broadcasted_iota(jnp.int32, (mask_rows, topk), 0) == hi
+        lo_onehot = lax.broadcasted_iota(jnp.int32, (_MASK_LANES, topk), 0) == lo
+        counts = lax.dot_general(
+            hi_onehot.astype(jnp.float32),
+            lo_onehot.astype(jnp.float32),
+            (((1,), (1,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
+        mask_ref[:, pl.ds(t, 1), :] = counts[:, None, :]
+        return carry
 
+    # Each branch initializes the running state itself, so that it overlaps
+    # with the mask build in one basic block.
+    is_prefix = prefix_ref[bq_idx] != 0
+
+    @pl.when((kv_step == 0) & jnp.logical_not(is_prefix))
+    def init_topk_mask():
+        init_state()
         lax.fori_loop(0, bq_sz, build_mask, None, unroll=DENSE_MASK_UNROLL)
+
+    # Where each token's selection is a whole prefix of the KV positions (the
+    # request is no longer than top-k), its mask is just its bound.
+    @pl.when((kv_step == 0) & is_prefix)
+    def init_prefix_mask():
+        init_state()
+        bound = jnp.max(topk_ref[...], axis=1, keepdims=True) + 1
+        lane = lax.broadcasted_iota(jnp.int32, (bq_sz, _MASK_LANES), 1)
+        for h in range(mask_rows):
+            mask_ref[h] = (lane < bound - h * _MASK_LANES).astype(jnp.float32)
 
     def load_page(j):
         nope_ref, rope_ref = nope_refs[j], rope_refs[j]
@@ -817,6 +834,10 @@ def _dense_attention(
     token_valid = jnp.arange(num_tokens) < num_valid_tokens
     token_bound = jnp.where(token_valid, jnp.max(topk_indices, axis=-1) + 1, 0)
     kv_bounds = jnp.max(token_bound.reshape(num_blocks, bq_sz), axis=1)
+    # Top-k positions are distinct, so as many of them as the bound means the
+    # token selected every position below it.
+    token_prefix = jnp.sum(topk_indices >= 0, axis=-1) == token_bound
+    block_prefix = jnp.all((token_prefix | ~token_valid).reshape(num_blocks, bq_sz), 1)
     block_pages = jnp.maximum(1, cdiv(kv_bounds, page_size))
 
     block_start = jnp.arange(num_blocks) * bq_sz
@@ -862,7 +883,7 @@ def _dense_attention(
             block_ids_ref,
             block_seqs_ref,
             block_pages_ref,
-            kv_bounds_ref,
+            *_,
         ):
             block = block_ids_ref[i]
             # A step past the block's last page repeats it; see `load_page`.
@@ -897,6 +918,7 @@ def _dense_attention(
         seq_ids_segment[::bq_sz].astype(jnp.int32),
         block_pages.astype(jnp.int32),
         kv_bounds.astype(jnp.int32),
+        block_prefix.astype(jnp.int32),
     )
     scope_name = f"SparseMLA-dense-bq_{bq_sz}-kvp_{kv_group}"
     kernel = jax.named_scope(scope_name)(
