@@ -1493,7 +1493,32 @@ def _run_routed_expert_stream(
         def unpack(choice):
             return (choice[0], *(value != 0 for value in choice[1:]))
 
-        if carry_routes:
+        # Grouped routes visit the used experts in ascending id order, each
+        # with all its routes, so the next expert is the lowest one not yet
+        # taken from ``used`` (one 128-lane row) rather than a reduction over
+        # every pending route.
+        plan_routes = carry_routes and group_pending_routes
+        expert_lanes = jax.lax.broadcasted_iota(jnp.int32, (1, 128), 1)
+
+        def plan_lowest(remaining):
+            # Expert ids are < 128, exact in FP32 (as next_expert's minimum);
+            # 128: the plan is exhausted.
+            lowest = jnp.min(jnp.where(remaining, expert_lanes.astype(jnp.float32), 128.0)).astype(jnp.int32)
+            return lowest, remaining & (expert_lanes != lowest)
+
+        def plan_choice(lowest):
+            has_expert = lowest < 128
+            expert = jnp.where(has_expert, lowest, 0)
+            selected_slot_mask = valid_routes & (selected_experts == lowest)
+            active_rows = jnp.any(selected_slot_mask, axis=1)
+            return (expert, active_rows, selected_slot_mask, selected_slot_mask, has_expert)
+
+        if plan_routes:
+            # The carry holds only the next two expert ids and the plan; their
+            # route masks are rebuilt when they run (no [B, 16] carries).
+            initial_first, initial_remaining = plan_lowest(used)
+            initial_second, initial_remaining = plan_lowest(initial_remaining)
+        elif carry_routes:
             initial_processed = jnp.zeros(selected_experts.shape, jnp.bool_)
             initial_first = next_expert(initial_processed)
             initial_second = next_expert(initial_processed | initial_first[3])
@@ -1503,36 +1528,44 @@ def _run_routed_expert_stream(
             progress(iteration)
           with _phase("e_iteration"):
             select_scope = _phase_start("e_select")
-            processed = processed_routes_vmem[:, :selected_expert_count] != 0
+            processed = None if plan_routes else processed_routes_vmem[:, :selected_expert_count] != 0
             (
                 first_expert,
                 first_rows,
                 first_slot_mask,
                 first_consumed,
                 has_first,
-            ) = unpack(carry[0]) if carry_routes else next_expert(processed)
+            ) = plan_choice(carry[0]) if plan_routes else unpack(carry[0]) if carry_routes else next_expert(processed)
             (
                 second_expert,
                 second_rows,
                 second_slot_mask,
                 second_consumed,
                 has_second,
-            ) = unpack(carry[1]) if carry_routes else next_expert(processed | first_consumed)
-            processed_after_pair = processed | first_consumed | second_consumed
+            ) = plan_choice(carry[1]) if plan_routes else unpack(carry[1]) if carry_routes else next_expert(processed | first_consumed)
+            if plan_routes:
+                third_lowest, remaining = plan_lowest(carry[2] != 0)
+                fourth_lowest, remaining = plan_lowest(remaining)
+                third_choice = (jnp.where(third_lowest < 128, third_lowest, 0), None, None, None, third_lowest < 128)
+                fourth_choice = (jnp.where(fourth_lowest < 128, fourth_lowest, 0), None, None, None, fourth_lowest < 128)
+            else:
+                processed_after_pair = processed | first_consumed | second_consumed
+                third_choice = next_expert(processed_after_pair)
+                fourth_choice = next_expert(processed_after_pair | third_choice[3])
             (
                 third_expert,
                 third_rows,
                 third_slot_mask,
                 third_consumed,
                 has_third,
-            ) = next_expert(processed_after_pair)
+            ) = third_choice
             (
                 fourth_expert,
                 fourth_rows,
                 fourth_slot_mask,
                 fourth_consumed,
                 has_fourth,
-            ) = next_expert(processed_after_pair | third_consumed)
+            ) = fourth_choice
 
             current_base_slot = (iteration % 2) * 2
             next_base_slot = ((iteration + 1) % 2) * 2
@@ -1845,18 +1878,26 @@ def _run_routed_expert_stream(
                 def execute_tail():
                     execute_full_tail()
 
-            processed_routes_vmem[:, :selected_expert_count] = jnp.where(
-                first_consumed | second_consumed,
-                jnp.int32(1),
-                processed_routes_vmem[:, :selected_expert_count],
-            )
+            if not plan_routes:
+                processed_routes_vmem[:, :selected_expert_count] = jnp.where(
+                    first_consumed | second_consumed,
+                    jnp.int32(1),
+                    processed_routes_vmem[:, :selected_expert_count],
+                )
+            if plan_routes:
+                return (third_lowest, fourth_lowest, remaining.astype(jnp.int32))
             if carry_routes:
                 return (
                     pack((third_expert, third_rows, third_slot_mask, third_consumed, has_third)),
                     pack((fourth_expert, fourth_rows, fourth_slot_mask, fourth_consumed, has_fourth)),
                 )
 
-        if carry_routes:
+        if plan_routes:
+            jax.lax.fori_loop(
+                0, pair_count, run_next_expert_pair,
+                (initial_first, initial_second, initial_remaining.astype(jnp.int32)),
+            )
+        elif carry_routes:
             jax.lax.fori_loop(0, pair_count, run_next_expert_pair, (pack(initial_first), pack(initial_second)))
         else:
             @pl.loop(0, pair_count)
