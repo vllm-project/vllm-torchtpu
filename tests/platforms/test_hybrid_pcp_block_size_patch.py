@@ -407,3 +407,22 @@ def test_no_prefix_cache_admits_950k_with_rank_local_capacity(pcp):
     assert manager.block_pool.get_num_free_blocks() == 1023
     # Normalization is local to the coordinator; physical storage is untouched.
     assert config.kv_cache_groups[-1].kv_cache_spec.block_size == 512
+
+
+@pytest.mark.parametrize("connector_enabled", [False, True])
+def test_pcp8_physical_512_keeps_global_checkpoint_4096(connector_enabled):
+    _patch_vllm_hybrid_pcp_block_sizes()
+    from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+
+    cache = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["attn"], _full_spec(block_size=512)),
+            KVCacheGroupSpec(["gdn"], _mamba_spec(block_size=512)),
+        ],
+    )
+    config = _config(
+        pcp=8, enable_prefix_caching=True, connector_enabled=connector_enabled
+    )
+    assert resolve_kv_cache_block_sizes(cache, config) == (4096, 4096)

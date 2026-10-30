@@ -35,7 +35,9 @@ class PcpStageMetadata:
     """Replicated schedule consumed by the PCP Pallas kernel.
 
     Stage arrays use the active prefix ``[:num_stages]``.  Each stage is one
-    request's intersection with one token-owner PCP interleave round.  The valid
+    request's intersection with a communication window of
+    ``pcp_size * comm_chunk_size`` tokens. Token ownership still follows the
+    outer interleave; a window can cover only part of an owner round.  The valid
     rows owned by rank ``r`` are contiguous in that rank's packed HBM shard and
     land in the aligned slot beginning at
     ``rank_recv_start[stage, r]`` in the receive window.  Tiles visit only the
@@ -57,6 +59,7 @@ class PcpStageMetadata:
     num_tiles: jax.Array
     tile_stage: jax.Array
     tile_row_in_stage: jax.Array
+    tile_source_rank: jax.Array
     projection_catchup_start: jax.Array
     projection_catchup_count: jax.Array
     projection_work_offset: jax.Array
@@ -81,6 +84,7 @@ class _BuilderState:
     stage_num_tiles: jax.Array
     tile_stage: jax.Array
     tile_row_in_stage: jax.Array
+    tile_source_rank: jax.Array
     tile_request_id: jax.Array
     tile_query_row_start: jax.Array
     tile_num_tokens: jax.Array
@@ -123,6 +127,28 @@ def _schedule_capacities(
     return max_stages, max_tiles
 
 
+def resolve_token_interleave_size(
+    pcp_size: int, comm_chunk_size: int, token_interleave_size: int | None
+) -> int:
+    """Require stages to partition owner rounds into contiguous token windows."""
+    owner_size = (
+        comm_chunk_size if token_interleave_size is None else token_interleave_size
+    )
+    if (
+        comm_chunk_size <= 0
+        or owner_size < comm_chunk_size
+        or owner_size % comm_chunk_size
+        or (pcp_size * comm_chunk_size) % owner_size
+    ):
+        raise ValueError(
+            "GDN communication chunk must divide token interleave and "
+            "PCP * communication chunk must be a multiple of token interleave: "
+            f"pcp_size={pcp_size}, comm_chunk_size={comm_chunk_size}, "
+            f"token_interleave_size={owner_size}"
+        )
+    return owner_size
+
+
 def compute_pcp_stage_metadata(
     cfg: config.GDNConfig,
     seq_lens: jax.Array,
@@ -136,6 +162,7 @@ def compute_pcp_stage_metadata(
     projection_token_block_size: int,
     num_qkv_out_blocks: int,
     num_projection_out_blocks: int,
+    token_interleave_size: int | None = None,
 ) -> tuple[memory_ref.MetadataRef, PcpStageMetadata]:
     """Build PCP metadata from the current public request metadata.
 
@@ -156,6 +183,7 @@ def compute_pcp_stage_metadata(
         state_indices,
         start_seq,
         end_seq,
+        token_interleave_size=token_interleave_size,
         token_owner_starts=token_owner_starts,
         request_absolute_starts=request_absolute_starts,
         pcp_size=pcp_size,
@@ -180,6 +208,7 @@ def _compute_pcp_stage_metadata_from_coordinates(
     projection_token_block_size: int,
     num_qkv_out_blocks: int,
     num_projection_out_blocks: int,
+    token_interleave_size: int | None = None,
 ) -> tuple[memory_ref.MetadataRef, PcpStageMetadata]:
     """Build live PCP stages and GDN tiles from independent coordinates.
 
@@ -197,6 +226,9 @@ def _compute_pcp_stage_metadata_from_coordinates(
         raise ValueError("PCP stage metadata requires pcp_size > 1.")
     if comm_chunk_size <= 0:
         raise ValueError("comm_chunk_size must be positive.")
+    token_interleave_size = resolve_token_interleave_size(
+        pcp_size, comm_chunk_size, token_interleave_size
+    )
     if projection_token_block_size <= 0:
         raise ValueError("projection_token_block_size must be positive.")
     if num_qkv_out_blocks <= 0:
@@ -246,6 +278,7 @@ def _compute_pcp_stage_metadata_from_coordinates(
         stage_num_tiles=jnp.zeros((max_stages,), dtype=int_dtype),
         tile_stage=jnp.zeros((max_tiles,), dtype=int_dtype),
         tile_row_in_stage=jnp.zeros((max_tiles,), dtype=int_dtype),
+        tile_source_rank=jnp.zeros((max_tiles,), dtype=int_dtype),
         tile_request_id=jnp.zeros((max_tiles,), dtype=int_dtype),
         tile_query_row_start=jnp.zeros((max_tiles,), dtype=int_dtype),
         tile_num_tokens=jnp.zeros((max_tiles,), dtype=int_dtype),
@@ -268,12 +301,12 @@ def _compute_pcp_stage_metadata_from_coordinates(
             token_owner_end,
             ranks,
             pcp_size=pcp_size,
-            comm_chunk_size=comm_chunk_size,
+            comm_chunk_size=token_interleave_size,
         ) - _rank_token_count_before(
             token_owner_begin,
             ranks,
             pcp_size=pcp_size,
-            comm_chunk_size=comm_chunk_size,
+            comm_chunk_size=token_interleave_size,
         )
         request_rank_starts = state.rank_row_offsets
         next_rank_offsets = request_rank_starts + rank_counts
@@ -289,13 +322,18 @@ def _compute_pcp_stage_metadata_from_coordinates(
 
         def _emit_window(carry):
             window, consumed, inner_state = carry
-            rank_chunk_begin = window + ranks * comm_chunk_size
-            rank_chunk_end = rank_chunk_begin + comm_chunk_size
-            overlap_begin = jnp.maximum(rank_chunk_begin, token_owner_begin)
-            overlap_end = jnp.minimum(rank_chunk_end, token_owner_end)
+            owner_round = window // (pcp_size * token_interleave_size)
+            rank_chunk_begin = (owner_round * pcp_size + ranks) * token_interleave_size
+            rank_chunk_end = rank_chunk_begin + token_interleave_size
+            overlap_begin = jnp.maximum(
+                jnp.maximum(rank_chunk_begin, window), token_owner_begin
+            )
+            overlap_end = jnp.minimum(
+                jnp.minimum(rank_chunk_end, window + round_size), token_owner_end
+            )
             valid_rows = jnp.maximum(overlap_end - overlap_begin, 0)
             dense_starts = jnp.cumsum(valid_rows, dtype=int_dtype) - valid_rows
-            recv_starts = ranks * comm_chunk_size
+            recv_starts = jnp.clip(rank_chunk_begin - window, 0, round_size)
             stage_tokens = jnp.sum(valid_rows, dtype=int_dtype)
             stage_query_begin = (
                 query_begin + jnp.maximum(window, token_owner_begin) - token_owner_begin
@@ -318,6 +356,7 @@ def _compute_pcp_stage_metadata_from_coordinates(
                     tile_cursor,
                     tile_stage,
                     tile_row,
+                    tile_source,
                     tile_req,
                     tile_query,
                     tile_size,
@@ -326,13 +365,14 @@ def _compute_pcp_stage_metadata_from_coordinates(
                 ) = rank_state
                 source_rows = valid_rows[source_rank]
                 source_num_tiles = pl.cdiv(source_rows, cfg.tile_size)
-                source_physical_row = source_rank * comm_chunk_size
+                source_physical_row = recv_starts[source_rank]
                 source_query_row = stage_query_begin + dense_starts[source_rank]
 
                 def _emit_tile(tile_in_rank, tile_state):
                     (
                         tile_stage,
                         tile_row,
+                        tile_source,
                         tile_req,
                         tile_query,
                         tile_size,
@@ -346,6 +386,7 @@ def _compute_pcp_stage_metadata_from_coordinates(
                     return (
                         tile_stage.at[tile].set(stage),
                         tile_row.at[tile].set(source_physical_row + source_offset),
+                        tile_source.at[tile].set(source_rank),
                         tile_req.at[tile].set(req),
                         tile_query.at[tile].set(query_row),
                         tile_size.at[tile].set(real_size),
@@ -360,6 +401,7 @@ def _compute_pcp_stage_metadata_from_coordinates(
                     (
                         tile_stage,
                         tile_row,
+                        tile_source,
                         tile_req,
                         tile_query,
                         tile_size,
@@ -373,6 +415,7 @@ def _compute_pcp_stage_metadata_from_coordinates(
                 tile_end,
                 tile_stage,
                 tile_row,
+                tile_source,
                 tile_req,
                 tile_query,
                 tile_size,
@@ -386,6 +429,7 @@ def _compute_pcp_stage_metadata_from_coordinates(
                     tile_begin,
                     inner_state.tile_stage,
                     inner_state.tile_row_in_stage,
+                    inner_state.tile_source_rank,
                     inner_state.tile_request_id,
                     inner_state.tile_query_row_start,
                     inner_state.tile_num_tokens,
@@ -415,6 +459,7 @@ def _compute_pcp_stage_metadata_from_coordinates(
                 stage_num_tiles=stage_num_tiles,
                 tile_stage=tile_stage,
                 tile_row_in_stage=tile_row,
+                tile_source_rank=tile_source,
                 tile_request_id=tile_req,
                 tile_query_row_start=tile_query,
                 tile_num_tokens=tile_size,
@@ -555,6 +600,7 @@ def _compute_pcp_stage_metadata_from_coordinates(
         num_tiles=result.stage_num_tiles,
         tile_stage=result.tile_stage,
         tile_row_in_stage=result.tile_row_in_stage,
+        tile_source_rank=result.tile_source_rank,
         projection_catchup_start=projection_catchup_start,
         projection_catchup_count=projection_catchup_count,
         projection_work_offset=projection_work_offset,

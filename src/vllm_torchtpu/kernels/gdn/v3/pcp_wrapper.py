@@ -149,8 +149,8 @@ def _compute_gdn_tile(
         stage_metadata_ref.tile_row_in_stage[p_id],
         16,
     )
-    source_rank = token_start // comm_chunk_size
-    source_offset = lax.rem(token_start, comm_chunk_size)
+    source_rank = stage_metadata_ref.tile_source_rank[p_id]
+    source_offset = token_start - stage_metadata_ref.rank_recv_start[stage, source_rank]
     source_row = stage_metadata_ref.rank_row_start[stage, source_rank]
     source_prefix = lax.rem(source_row, _TPU_TILE_ROWS)
     receive_group_stride = _qkv_receive_group_stride(
@@ -158,7 +158,9 @@ def _compute_gdn_tile(
         cfg.tile_size,
     )
     receive_group_start = (
-        source_rank * receive_group_stride + source_offset // _TPU_TILE_ROWS
+        stage_metadata_ref.rank_recv_start[stage, source_rank] // _TPU_TILE_ROWS
+        + source_rank * (receive_group_stride - comm_chunk_size // _TPU_TILE_ROWS)
+        + source_offset // _TPU_TILE_ROWS
     )
     tile_prefix = lax.rem(
         source_prefix + source_offset,
@@ -416,7 +418,11 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         local_groups = lax.select(is_local, valid_groups, 0)
         remote_groups = lax.select(is_local, 0, valid_groups)
         src_group = src_row // _TPU_TILE_ROWS
-        dst_group = rank * receive_group_stride
+        dst_group = stage_metadata_ref.rank_recv_start[
+            stage, rank
+        ] // _TPU_TILE_ROWS + rank * (
+            receive_group_stride - comm_chunk_size // _TPU_TILE_ROWS
+        )
 
         pltpu.make_async_copy(
             src_ref=projected_qkv_ref.at[
@@ -1275,6 +1281,7 @@ def _validate_compact_state_writeback_plan(state_plan: config.StateSourcePlan) -
         "kernel_size",
         "pcp_size",
         "comm_chunk_size",
+        "token_interleave_size",
         "mixed_tile_size",
         "compute_precision",
         "mesh_axis_names",
@@ -1308,6 +1315,7 @@ def fused_qkvz_projection_pcp_gdn(
     mesh_axis_names: tuple[str, ...],
     pcp_axis_name: str,
     state_plan: config.StateSourcePlan,
+    token_interleave_size: int | None = None,
     mixed_tile_size: int = 64,
     compute_precision: jnp.dtype = jnp.float32.dtype,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -1333,6 +1341,9 @@ def fused_qkvz_projection_pcp_gdn(
         )
     if comm_chunk_size <= 0:
         raise ValueError("comm_chunk_size must be positive.")
+    token_interleave_size = pcp_metadata.resolve_token_interleave_size(
+        pcp_size, comm_chunk_size, token_interleave_size
+    )
     dma_row_alignment = 8 * (4 // hidden_states.dtype.itemsize)
     if comm_chunk_size % dma_row_alignment != 0:
         raise ValueError(
@@ -1513,6 +1524,7 @@ def fused_qkvz_projection_pcp_gdn(
         end_seq=distribution[-1],
         pcp_size=pcp_size,
         comm_chunk_size=comm_chunk_size,
+        token_interleave_size=token_interleave_size,
         projection_token_block_size=projection_cfg.token_block_size,
         num_qkv_out_blocks=num_qkv_out_blocks,
         num_projection_out_blocks=num_projection_out_blocks,
@@ -1665,7 +1677,7 @@ def fused_qkvz_projection_pcp_gdn(
     carry_shapes = cfg.get_scratch_shape_dict()
     kernel_name = (
         "fused_pcp_qkvz_projection_gdn_per_seq_compact_qkv"
-        f"_c{comm_chunk_size}_p{pcp_size}_pooled"
+        f"_c{comm_chunk_size}_i{token_interleave_size}_p{pcp_size}_pooled"
     )
     # The compiler may retain more transient tiles as this limit rises. Use
     # the same 90% hardware budget as the production GMM kernels.

@@ -1076,6 +1076,16 @@ class KVCacheManager:
                     isinstance(kv_cache_spec, AttentionSpec)
                     and kernel_block_size is not None
                 ):
+                    if isinstance(kv_cache_spec, FullAttentionSpec):
+                        logger.info(
+                            "[PCP FA cache] group=%d kv_manager_block_size=%d "
+                            "kernel_block_size=%d pcp_size=%d interleave_size=%d",
+                            group.kv_cache_group_id,
+                            kv_cache_spec.block_size,
+                            kernel_block_size,
+                            self.runner.parallel_config.prefill_context_parallel_size,
+                            self.runner.parallel_config.cp_kv_cache_interleave_size,
+                        )
                     kv_cache_spec = kv_cache_spec.copy_with_new_block_size(
                         kernel_block_size
                     )

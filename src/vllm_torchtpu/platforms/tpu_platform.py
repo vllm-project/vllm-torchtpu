@@ -369,6 +369,8 @@ class TpuPlatform(Platform):
     ]
 
     additional_env_vars: list[str] = [
+        "PCP_FA_KERNEL_BLOCK_SIZE",
+        "PCP_GDN_COMM_CHUNK_SIZE",
         "TPU_CHIPS_PER_HOST_BOUNDS",
         "TPU_HOST_BOUNDS",
         "TPU_MULTIHOST_BACKEND",

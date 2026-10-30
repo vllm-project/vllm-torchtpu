@@ -704,6 +704,7 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
     pool_block_tokens,
     projection_dtype,
     weight_scheme,
+    interleave_size=16,
 ):
     """Cover PCP stage metadata, native BF16/FP8 projection, and pooled GDN."""
     lengths = np.asarray(lengths, dtype=np.int32)
@@ -721,7 +722,6 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
         (np.zeros((1,), dtype=np.int32), np.cumsum(lengths[:-1], dtype=np.int32))
     )
     np.testing.assert_array_equal(token_owner_starts, expected_owner_starts)
-    interleave_size = 16
     if token_owner_starts[1] % interleave_size != 0:
         # Request 1 begins inside rank 1's owner chunk [16, 32), while its
         # absolute continuation position is unrelated to that boundary.
@@ -1026,4 +1026,31 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
         expected_z,
         rtol=tolerance,
         atol=tolerance,
+    )
+
+
+@pytest.mark.parametrize("lengths", [(4096, 4096), (239, 867, 4097, 203)])
+@pytest.mark.parametrize(
+    "projection_dtype,weight_scheme",
+    [(jnp.bfloat16, "none"), (jnp.float8_e4m3fn, "channel")],
+)
+def test_independent_gdn_chunk_matches_non_pcp_baseline(
+    monkeypatch, lengths, projection_dtype, weight_scheme
+):
+    monkeypatch.setenv("PCP_GDN_COMM_CHUNK_SIZE", "128")
+    monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "NHD")
+    owner_starts = tuple(np.cumsum((0, *lengths[:-1])).tolist())
+    test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
+        8,
+        4,
+        32,
+        2048,
+        lengths,
+        owner_starts,
+        (110592,) * len(lengths),
+        jnp.float32,
+        1024,
+        projection_dtype,
+        weight_scheme,
+        interleave_size=256,
     )

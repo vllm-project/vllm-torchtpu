@@ -750,14 +750,30 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
         )
 
     @staticmethod
-    def get_supported_kernel_block_sizes():
+    def get_supported_kernel_block_sizes() -> list[int]:
+        config = get_current_vllm_config()
         if (
-            get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()
+            config.cache_config.get_resolved_kv_cache_layout()
             is VllmKVCacheLayout.LBHNC
-            and get_current_vllm_config().parallel_config.prefill_context_parallel_size
-            > 1
+            and config.parallel_config.prefill_context_parallel_size > 1
         ):
-            return [128, 256, 512, 1024, 2048, 4096]
+            supported = [128, 256, 512, 1024, 2048, 4096]
+            override = envs.PCP_FA_KERNEL_BLOCK_SIZE
+            if override is not None:
+                if override not in supported:
+                    raise ValueError(
+                        f"PCP_FA_KERNEL_BLOCK_SIZE={override} must be one of "
+                        f"{supported}"
+                    )
+                interleave = config.parallel_config.cp_kv_cache_interleave_size
+                if interleave <= 0 or interleave % 128 or override % interleave:
+                    raise ValueError(
+                        f"PCP_FA_KERNEL_BLOCK_SIZE={override} must be divisible by "
+                        f"cp_kv_cache_interleave_size={interleave}, which must be "
+                        "a positive multiple of 128"
+                    )
+                return [override]
+            return supported
         return [128, 256]
 
 

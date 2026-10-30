@@ -1103,3 +1103,56 @@ def test_streaming_default_q_tile_bounds_local_accumulator(
     kernel(None, query, None, None, None, None, None, None)
     assert captured["q_block_size"] == expected
     assert expected * (64 // tp) * head_dim * 4 <= 16 * 1024 * 1024
+
+
+@pytest.mark.parametrize("manager,expected", [(384, 128), (512, 512)])
+def test_pcp_kernel_page_default_selection(
+    monkeypatch, hnd_vllm_config_context, manager, expected
+):
+    from vllm.v1.worker.utils import select_common_block_size
+
+    monkeypatch.delenv("PCP_FA_KERNEL_BLOCK_SIZE", raising=False)
+    hnd_vllm_config_context.parallel_config.prefill_context_parallel_size = 8
+    assert (
+        select_common_block_size(manager, [PallasBatchedRPAAttentionBackend])
+        == expected
+    )
+
+
+def test_pcp_kernel_page_override_selection(monkeypatch, hnd_vllm_config_context):
+    from vllm.v1.worker.utils import select_common_block_size
+
+    monkeypatch.setenv("PCP_FA_KERNEL_BLOCK_SIZE", "256")
+    parallel = hnd_vllm_config_context.parallel_config
+    parallel.prefill_context_parallel_size = 8
+    parallel.cp_kv_cache_interleave_size = 128
+    assert select_common_block_size(512, [PallasBatchedRPAAttentionBackend]) == 256
+    with pytest.raises(ValueError, match="No common block size"):
+        select_common_block_size(384, [PallasBatchedRPAAttentionBackend])
+    parallel.prefill_context_parallel_size = 1
+    assert PallasBatchedRPAAttentionBackend.get_supported_kernel_block_sizes() == [
+        128,
+        256,
+    ]
+
+
+@pytest.mark.parametrize("override", ["0", "-128", "192", "not-an-int"])
+def test_pcp_kernel_page_rejects_invalid_override(
+    monkeypatch, hnd_vllm_config_context, override
+):
+    monkeypatch.setenv("PCP_FA_KERNEL_BLOCK_SIZE", override)
+    hnd_vllm_config_context.parallel_config.prefill_context_parallel_size = 8
+    with pytest.raises(ValueError):
+        PallasBatchedRPAAttentionBackend.get_supported_kernel_block_sizes()
+
+
+@pytest.mark.parametrize("interleave", [0, 64, 384, 512])
+def test_pcp_kernel_page_rejects_incompatible_interleave(
+    monkeypatch, hnd_vllm_config_context, interleave
+):
+    monkeypatch.setenv("PCP_FA_KERNEL_BLOCK_SIZE", "256")
+    parallel = hnd_vllm_config_context.parallel_config
+    parallel.prefill_context_parallel_size = 8
+    parallel.cp_kv_cache_interleave_size = interleave
+    with pytest.raises(ValueError, match="cp_kv_cache_interleave_size"):
+        PallasBatchedRPAAttentionBackend.get_supported_kernel_block_sizes()

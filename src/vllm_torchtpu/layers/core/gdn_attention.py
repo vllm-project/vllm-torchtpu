@@ -38,7 +38,10 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
 )
 from vllm_torchtpu.kernels.gdn.v3 import pcp_wrapper as gdn_v3_pcp_wrapper
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import get_mesh_shape_product
+
+logger = init_logger(__name__)
 
 _GDN_TP_AXIS_NAME = "tp"
 
@@ -1104,6 +1107,16 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
     recurrent_state_dtype: jnp.dtype = jnp.float32,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Fused QKVZ projection, PCP exchange, and GDN over the unified pool."""
+    comm_chunk_size = tpu_envs.PCP_GDN_COMM_CHUNK_SIZE
+    if comm_chunk_size is None:
+        comm_chunk_size = interleave_size
+    else:
+        logger.info_once(
+            "[PCP GDN] token_interleave_size=%d comm_chunk_size=%d pcp_size=%d",
+            interleave_size,
+            comm_chunk_size,
+            pcp_size,
+        )
     pcp_axis = "pcp"
     if pcp_axis not in mesh.axis_names:
         raise NotImplementedError("GDN pooled PCP prefill requires a pcp mesh axis.")
@@ -1253,7 +1266,8 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
             d_v=d_v,
             kernel_size=kernel_size,
             pcp_size=pcp_size,
-            comm_chunk_size=interleave_size,
+            comm_chunk_size=comm_chunk_size,
+            token_interleave_size=interleave_size,
             mesh_axis_names=tuple(mesh.axis_names),
             pcp_axis_name=pcp_axis,
             state_plan=state_plan,

@@ -342,3 +342,118 @@ def test_projection_schedule_catches_up_only_the_imbalanced_owner_rank():
         np.asarray(schedule.projection_work_offset_end),
         [84, 0, 0, 0, 0, 0, 0, 0],
     )
+
+
+@pytest.mark.parametrize("chunk", [64, 128])
+@pytest.mark.parametrize(
+    "lengths",
+    [[8192], [4096, 4096], [239, 867, 4097, 203], [1, 127, 128, 129, 255, 256, 257]],
+)
+def test_independent_chunk_preserves_outer_ownership_and_token_order(chunk, lengths):
+    from vllm_torchtpu.kernels.gdn.v3.pcp_wrapper import _qkv_receive_group_stride
+
+    pcp, owner, tile = 8, 256, 64
+    cfg = _cfg(batch_size=8192, tile_size=tile)
+    seq_lens, starts, states, distribution = _metadata_inputs(
+        lengths, [110592 + i for i in range(len(lengths))], max_num_seqs=8
+    )
+    metadata, schedule = pcp_metadata.compute_pcp_stage_metadata(
+        cfg,
+        seq_lens,
+        starts,
+        states,
+        distribution[0],
+        distribution[-1],
+        pcp_size=pcp,
+        comm_chunk_size=chunk,
+        token_interleave_size=owner,
+        projection_token_block_size=chunk,
+        num_qkv_out_blocks=pcp,
+        num_projection_out_blocks=2 * pcp,
+    )
+    tokens = np.arange(sum(lengths))
+    packed = [tokens[(tokens // owner) % pcp == rank] for rank in range(pcp)]
+    reconstructed = []
+    returned = [np.full(len(rows), -1) for rows in packed]
+    stride = _qkv_receive_group_stride(chunk, tile)
+    extra_groups = stride - chunk // 8
+    for stage in range(int(schedule.num_stages)):
+        assert int(schedule.num_tokens[stage]) <= pcp * chunk
+        receive = np.full(pcp * chunk, -1)
+        occupied_groups = set()
+        for rank in range(pcp):
+            row = int(schedule.rank_row_start[stage, rank])
+            count = int(schedule.rank_valid_rows[stage, rank])
+            slot = int(schedule.rank_recv_start[stage, rank])
+            receive[slot : slot + count] = packed[rank][row : row + count]
+            if count:
+                group = slot // 8 + rank * extra_groups
+                size = (row % 8 + count + 7) // 8
+                groups = set(range(group, group + size))
+                assert group + size <= pcp * stride
+                assert not groups & occupied_groups
+                occupied_groups.update(groups)
+        first = int(schedule.first_tile[stage])
+        for t in range(first, first + int(schedule.num_tiles[stage])):
+            row = int(schedule.tile_row_in_stage[t])
+            count = int(metadata.p_id_to_r_size.data[t])
+            logical = int(metadata.p_id_to_r_base.data[t])
+            rank = int(schedule.tile_source_rank[t])
+            np.testing.assert_array_equal(
+                receive[row : row + count], np.arange(logical, logical + count)
+            )
+            assert np.all((receive[row : row + count] // owner) % pcp == rank)
+            reconstructed.extend(receive[row : row + count])
+            # The speculative full-tile DMA read must also fit the receive buffer.
+            offset = row - int(schedule.rank_recv_start[stage, rank])
+            source = int(schedule.rank_row_start[stage, rank])
+            group = (
+                int(schedule.rank_recv_start[stage, rank]) // 8
+                + rank * extra_groups
+                + offset // 8
+            )
+            assert group + ((source + offset) % 8 + tile + 7) // 8 <= pcp * stride
+        for rank in range(pcp):
+            row = int(schedule.rank_row_start[stage, rank])
+            count = int(schedule.rank_valid_rows[stage, rank])
+            slot = int(schedule.rank_recv_start[stage, rank])
+            returned[rank][row : row + count] = receive[slot : slot + count]
+    np.testing.assert_array_equal(reconstructed, tokens)
+    for actual, expected in zip(returned, packed):
+        np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(
+        np.asarray(schedule.rank_active_row_end), [len(x) for x in packed]
+    )
+    assert int(np.asarray(metadata.p_id_is_first_tile.data).sum()) == len(lengths)
+    assert int(np.asarray(metadata.p_id_is_last_tile.data).sum()) == len(lengths)
+
+
+@pytest.mark.parametrize("chunk,owner", [(0, 256), (192, 256), (512, 256), (16, 256)])
+def test_independent_chunk_rejects_non_partitioning_windows(chunk, owner):
+    with pytest.raises(ValueError, match="communication chunk"):
+        pcp_metadata.resolve_token_interleave_size(8, chunk, owner)
+
+
+@pytest.mark.parametrize("interleave", [16, 128, 256])
+def test_unset_chunk_preserves_existing_owner_geometry(interleave):
+    assert pcp_metadata.resolve_token_interleave_size(8, interleave, None) == interleave
+
+
+@pytest.mark.parametrize("value,expected", [(None, None), ("", None), ("128", 128)])
+def test_gdn_chunk_environment_default_and_override(monkeypatch, value, expected):
+    from vllm_torchtpu import envs
+
+    if value is None:
+        monkeypatch.delenv("PCP_GDN_COMM_CHUNK_SIZE", raising=False)
+    else:
+        monkeypatch.setenv("PCP_GDN_COMM_CHUNK_SIZE", value)
+    assert expected == envs.PCP_GDN_COMM_CHUNK_SIZE
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "not-an-integer"])
+def test_gdn_chunk_environment_rejects_invalid_value(monkeypatch, value):
+    from vllm_torchtpu import envs
+
+    monkeypatch.setenv("PCP_GDN_COMM_CHUNK_SIZE", value)
+    with pytest.raises(ValueError):
+        _ = envs.PCP_GDN_COMM_CHUNK_SIZE
