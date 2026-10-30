@@ -329,6 +329,7 @@ class RaidenOffloadingManager(OffloadingManager):
         # Storage tier behind the host DRAM pool: raiden BackendConfigs from
         # `build_store_storage_backend_config`. Empty keeps the store DRAM-only.
         secondary_backend_configs: Sequence[object] = (),
+        dp_rank: int = 0,
         # Test overrides: allow injecting mock store instance and type bindings.
         store: Any = None,
         store_types: Any = None,
@@ -336,6 +337,11 @@ class RaidenOffloadingManager(OffloadingManager):
         assert kernel_physical_blocks_capacity == (
             offload_logical_blocks_capacity * device_block_size_factor
         )
+        if dp_rank < 0:
+            raise ValueError(
+                "TPURaidenOffloadingConnector: dp_rank must be non-negative "
+                f"(from parallel_config.data_parallel_index), got {dp_rank}."
+            )
         self._capacity_keys = offload_logical_blocks_capacity
         self._device_block_size_factor = device_block_size_factor
         self._key_namespace = key_namespace
@@ -376,7 +382,9 @@ class RaidenOffloadingManager(OffloadingManager):
             )
             store = store_types.KVCacheStore(
                 capacity=kernel_physical_blocks_capacity,
-                raiden_id=store_types.RaidenId(raiden_job_name, "0", "kv_cache", 0),
+                raiden_id=store_types.RaidenId(
+                    raiden_job_name, "0", "kv_cache", dp_rank
+                ),
                 # Transfer fanout is dynamically driven by registered workers.
                 num_shards=1,
                 shard_size_bytes=1,
@@ -2506,6 +2514,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         dp_rank_local = vllm_config.parallel_config.data_parallel_rank_local
         if dp_rank_local is None:
             dp_rank_local = dp_rank
+        self.dp_rank = vllm_config.parallel_config.data_parallel_index
         base_controller_port = int(
             self.extra_config.get("raiden_controller_port", _DEFAULT_CONTROLLER_PORT)
         )
@@ -2534,8 +2543,8 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         )
         # Suffix by global DP rank to ensure distinct RaidenId and registry
         # entries across multi-node data parallel replicas.
-        if dp_rank:
-            self.raiden_job_name = f"{self.raiden_job_name}-dp{dp_rank}"
+        if self.dp_rank:
+            self.raiden_job_name = f"{self.raiden_job_name}-dp{self.dp_rank}"
 
         self._manager: RaidenOffloadingManager | None = None
         self._worker: RaidenStoreOffloadingWorker | None = None
@@ -2589,6 +2598,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 kv_pool_group=self.kv_pool_group,
                 key_namespace=self.key_namespace,
                 secondary_backend_configs=secondary_backend_configs,
+                dp_rank=self.dp_rank,
             )
         return self._manager
 
