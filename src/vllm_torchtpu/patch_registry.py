@@ -134,6 +134,8 @@ PATCHES = (
     ),
     # API-server prompt tokenization (VLLM_TPU_SEGMENT_TOKENIZE).
     Patch("vllm_torchtpu.segment_tokenize:patch_renderer_segment_tokenize", _ACTIVE),
+    # API-server output detokenization (VLLM_TPU_DETOK_SUFFIX_PRIME).
+    Patch("vllm_torchtpu.detokenizer_suffix:patch_detokenizer_suffix_prime", _ACTIVE),
     # Model-specific patches.
     # Append patches for new models here with
     # stages=("platform_activation", "model_load") and model_config=True.
