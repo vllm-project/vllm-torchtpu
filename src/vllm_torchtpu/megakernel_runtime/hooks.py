@@ -43,6 +43,10 @@ class StepContext:
     inputs_embeds: Any = None
     intermediate_tensors: Any = None
     model_kwargs: Mapping[str, Any] | None = None
+    # The step's token ids when the runner fed the stock model
+    # `inputs_embeds` built from them alone (a multimodal-capable model, but
+    # no multimodal embeddings in this step); `None` otherwise.
+    token_ids: Any = None
 
 
 @contextlib.contextmanager

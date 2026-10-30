@@ -44,6 +44,8 @@ def fake_runner(
     enable_prefix_caching: bool = False,
     kv_transfer_config: Any = None,
     enable_eplb: bool = False,
+    supports_mm_inputs: bool = False,
+    multimodal_config: Any = None,
     mesh: Any = None,
     **extra: Any,
 ) -> SimpleNamespace:
@@ -62,7 +64,11 @@ def fake_runner(
         r, b = pairs[0] if max_model_len or len(pairs) == 1 else pairs[1]
         return r, (max_pages if max_model_len else b), 0
 
-    model_cfg = SimpleNamespace(hf_config=hf_config, enable_sleep_mode=False)
+    model_cfg = SimpleNamespace(
+        hf_config=hf_config,
+        enable_sleep_mode=False,
+        multimodal_config=multimodal_config,
+    )
     parallel_cfg = SimpleNamespace(
         tensor_parallel_size=int(tp_size),
         data_parallel_size=1,
@@ -98,7 +104,7 @@ def fake_runner(
         uses_mrope=bool(uses_mrope),
         enforce_eager=bool(enforce_eager),
         _unified_kv_layout=bool(unified_kv_layout),
-        supports_mm_inputs=False,
+        supports_mm_inputs=bool(supports_mm_inputs),
         lora_config=None,
         _pp_is_first=True,
         _pp_is_last=True,

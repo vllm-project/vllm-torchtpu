@@ -16,12 +16,13 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import functools
 import os
 import time
 import types
 import zlib
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import jax
@@ -69,10 +70,10 @@ logger = init_logger(__name__)
 
 _VLLM_STARTUP_MESSAGES: dict[str, str] = {
     "multimodal_inputs": (
-        "Megakernel requires text-only input_ids "
-        "(runner.supports_mm_inputs=True passes inputs_embeds; "
-        'pass --limit-mm-per-prompt \'{"image":0,"video":0}\' for '
-        "text-only serving); skipping."
+        "Megakernel serves text-only requests, and this server accepts "
+        "multimodal inputs; pass --language-model-only (or "
+        '--limit-mm-per-prompt \'{"image":0,"video":0}\') for text-only '
+        "serving; skipping."
     ),
     "lora_enabled": "Megakernel does not support LoRA adapters; skipping.",
     "pipeline_parallel": (
@@ -569,6 +570,45 @@ def _decline(code: str, detail: str) -> _rt.EligibilityResult:
     return _rt.EligibilityResult(False, code, f"Megakernel {detail}; skipping.")
 
 
+def _mm_limit_count(limit: Any) -> int:
+    """Item count of one `limit_mm_per_prompt` entry (an int, or vLLM's
+    per-modality options object / dict with a `count`)."""
+    if isinstance(limit, Mapping):
+        limit = limit.get("count", 1)
+    else:
+        limit = getattr(limit, "count", limit)
+    try:
+        return int(limit)
+    except (TypeError, ValueError):
+        return 1
+
+
+def _multimodal_inputs_possible(runner: Any) -> bool:
+    """Whether a request on this server can carry multimodal inputs.
+
+    `runner.supports_mm_inputs` alone over-reports: vLLM 0.32 turns on
+    `enable_mm_embeds` for every KV connector with a consumer role (CPU KV
+    offload uses `kv_role="kv_both"`), which makes a language-model-only
+    server look multimodal. Inputs can't occur when the model config is
+    language-model-only or every `limit_mm_per_prompt` entry is 0; the
+    per-step `inputs_embeds` check (`ProgramDriver._text_ctx`) stays as the
+    safety net either way.
+    """
+    if not bool(getattr(runner, "supports_mm_inputs", False)):
+        return False
+    vcfg = getattr(runner, "vllm_config", None)
+    m_cfg = getattr(vcfg, "model_config", None) or getattr(runner, "model_config", None)
+    mm_cfg = getattr(m_cfg, "multimodal_config", None)
+    if mm_cfg is None:
+        return True
+    if bool(getattr(mm_cfg, "language_model_only", False)):
+        return False
+    limits = getattr(mm_cfg, "limit_per_prompt", None)
+    if isinstance(limits, Mapping) and limits:
+        return any(_mm_limit_count(v) > 0 for v in limits.values())
+    return True
+
+
 def check_runner_capabilities(
     runner: Any, capabilities: frozenset[str], *, tp_size: int
 ) -> _rt.EligibilityResult | None:
@@ -591,8 +631,7 @@ def check_runner_capabilities(
     dp_fn = getattr(runner, "_dp_lockstep_enabled", None)
     rules: list[tuple[bool, str, str]] = [
         (
-            bool(getattr(runner, "supports_mm_inputs", False))
-            and "multimodal" not in caps,
+            _multimodal_inputs_possible(runner) and "multimodal" not in caps,
             "multimodal_inputs",
             "requires text-only input_ids (multimodal inputs)",
         ),
@@ -786,6 +825,8 @@ class ProgramDriver:
     """
 
     serving = True
+    # See `_text_ctx`; set per instance from the runner in `maybe_create`.
+    _text_embeds = False
 
     def __init__(
         self,
@@ -798,8 +839,12 @@ class ProgramDriver:
         fingerprint: str = "",
         codes: Sequence[str] = DECLINE_VOTE_CODES,
         backbone: Any = None,
+        text_embeds: bool = False,
     ) -> None:
         self.program, self.view = program, view
+        # The runner embeds text tokens for a multimodal-capable model that
+        # can't receive multimodal inputs here (see `_text_ctx`).
+        self._text_embeds = bool(text_embeds)
         self.tp_rank = int(tp_rank)
         self._display_name = str(getattr(program, "display_name", "") or "megakernel")
         self.fingerprint = fingerprint
@@ -913,6 +958,8 @@ class ProgramDriver:
             fingerprint=fprint,
             codes=codes,
             backbone=_runner_backbone(runner),
+            text_embeds=bool(getattr(runner, "supports_mm_inputs", False))
+            and not _multimodal_inputs_possible(runner),
         )
 
     @staticmethod
@@ -1103,6 +1150,20 @@ class ProgramDriver:
         ctx = StepContext(input_ids, positions, inputs_embeds, intermediate_tensors)
         return self._route(ctx, runner)
 
+    def _text_ctx(self, ctx: StepContext) -> StepContext:
+        """The step as the megakernel sees it: from its token ids when the
+        runner built `inputs_embeds` from text tokens alone (`ctx.token_ids`
+        set) on a server that can't receive multimodal inputs. Otherwise the
+        step is unchanged, and `inputs_embeds` sends it to the stock model."""
+        if (
+            self._text_embeds
+            and ctx.input_ids is None
+            and ctx.inputs_embeds is not None
+            and ctx.token_ids is not None
+        ):
+            return dataclasses.replace(ctx, input_ids=ctx.token_ids, inputs_embeds=None)
+        return ctx
+
     def _route(self, ctx: StepContext, runner: Any) -> bool:
         self._pending = None
         self.ab_calibrator.last_decision = ("stock_early", "stock")
@@ -1188,12 +1249,13 @@ class ProgramDriver:
         input_ids, positions = ctx.input_ids, ctx.positions
         inputs_embeds = ctx.inputs_embeds
         intermediate_tensors = ctx.intermediate_tensors
-        use_mk = self._route(ctx, runner)
+        mk_ctx = self._text_ctx(ctx)
+        use_mk = self._route(mk_ctx, runner)
         ab_t0 = time.perf_counter() if self.ab_calibrator.enabled else None
         if use_mk:
-            assert input_ids is not None and positions is not None
+            assert mk_ctx.input_ids is not None and positions is not None
             num_tok = int(positions.shape[-1])
-            out = self(input_ids, positions, num_tokens=num_tok, runner=runner)
+            out = self(mk_ctx.input_ids, positions, num_tokens=num_tok, runner=runner)
             if ab_t0 is not None:
                 if getattr(getattr(runner, "device", None), "type", None) == "tpu":
                     from vllm_torchtpu.utils import synchronize_tensors

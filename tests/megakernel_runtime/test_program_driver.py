@@ -454,6 +454,82 @@ def test_kv_connector_guard(kv: Any, code: str | None) -> None:
         assert driver_mod.check_runner_capabilities(runner, caps, tp_size=1) is None
 
 
+def _mm_cfg(lm_only: bool = False, limits: dict[str, Any] | None = None) -> Any:
+    return SimpleNamespace(language_model_only=lm_only, limit_per_prompt=limits or {})
+
+
+@pytest.mark.parametrize(
+    "supports, mm, possible",
+    [
+        (False, None, False),
+        (True, None, True),
+        (True, _mm_cfg(), True),
+        (True, _mm_cfg(lm_only=True), False),
+        (True, _mm_cfg(limits={"image": 0, "video": 0}), False),
+        (
+            True,
+            _mm_cfg(limits={"image": {"count": 0}, "video": SimpleNamespace(count=0)}),
+            False,
+        ),
+        (True, _mm_cfg(limits={"image": 1, "video": 0}), True),
+    ],
+)
+def test_multimodal_inputs_possible(supports: bool, mm: Any, possible: bool) -> None:
+    runner = testing.fake_runner(supports_mm_inputs=supports, multimodal_config=mm)
+    assert driver_mod._multimodal_inputs_possible(runner) is possible
+
+
+def test_kv_offload_on_a_text_only_server_is_not_a_multimodal_decline() -> None:
+    """vLLM 0.32 turns on `enable_mm_embeds` for a `kv_both` offload
+    connector, so a language-model-only server reports
+    `supports_mm_inputs=True`; the megakernel still serves it. A server that
+    really accepts multimodal inputs still declines."""
+    offload = _kv("TPURaidenOffloadingConnector")
+    text_only = _mm_cfg(lm_only=True, limits={"image": 0, "video": 0})
+    runner = testing.fake_runner(
+        kv_transfer_config=offload, supports_mm_inputs=True, multimodal_config=text_only
+    )
+    assert driver_mod.check_runner_capabilities(runner, _QWEN_CAPS, tp_size=1) is None
+    runner = testing.fake_runner(
+        kv_transfer_config=offload,
+        supports_mm_inputs=True,
+        multimodal_config=_mm_cfg(limits={"image": 1, "video": 0}),
+    )
+    res = driver_mod.check_runner_capabilities(runner, _QWEN_CAPS, tp_size=1)
+    assert res is not None and res.code == "multimodal_inputs"
+
+
+def test_text_only_server_serves_from_token_ids(
+    toy: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With `supports_mm_inputs=True` the runner feeds the stock model
+    `inputs_embeds`; on a text-only server the megakernel serves the step
+    from `ctx.token_ids`, and without them (multimodal embeddings in the
+    step) the step stays on the stock model."""
+    _no_group(monkeypatch)
+    _fwd_ctx(monkeypatch)
+    runner = _runner(
+        {"scale": 3.0},
+        supports_mm_inputs=True,
+        multimodal_config=_mm_cfg(lm_only=True),
+    )
+    drv = driver_mod.ProgramDriver.maybe_create(runner)
+    assert isinstance(drv, driver_mod.ProgramDriver) and drv._text_embeds
+    runner._megakernel = drv
+    drv.bind_and_warmup(runner)
+    ids = torch.arange(3, dtype=torch.int32)
+    emb = torch.zeros(3, 4)
+    pos = torch.zeros(3)
+    hit, out = drv.try_forward(runner, StepContext(None, pos, emb, token_ids=ids))
+    assert hit and torch.equal(out, ids.float() * 3.0 + 4)
+    assert drv.try_forward(runner, StepContext(None, pos, emb)) == (False, None)
+    assert drv.step_mix_tracker.counts == {"mk_t1_b4": 1}
+    # A driver for a server that may get multimodal inputs never swaps.
+    drv._text_embeds = False
+    ctx = StepContext(None, pos, emb, token_ids=ids)
+    assert drv.try_forward(runner, ctx) == (False, None)
+
+
 @pytest.mark.parametrize(
     "kw, code, cap",
     [

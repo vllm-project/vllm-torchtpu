@@ -394,6 +394,15 @@ def test_runner_normalizes_megakernel_output_like_stock(raw_idx: int) -> None:
     mk = forward_model(SimpleNamespace(_megakernel=drv, model=model), ids, pos)
     assert len(stock_calls) == 1, "a megakernel hit must not run the stock model"
     assert drv.ctx.input_ids is ids and drv.ctx.positions is pos
+    assert drv.ctx.token_ids is None
+    forward_model(
+        SimpleNamespace(_megakernel=drv, model=model),
+        None,
+        pos,
+        inputs_embeds=torch.zeros(3, 2),
+        megakernel_token_ids=ids,
+    )
+    assert drv.ctx.input_ids is None and drv.ctx.token_ids is ids
     assert type(mk) is type(stock) and len(mk) == len(stock) == 2
     assert mk[0] is stock[0]
     assert mk[1] is stock[1]

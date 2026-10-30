@@ -2152,7 +2152,7 @@ def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
             "unaligned_cache_layout",
             "_unified_kv_layout=True",
         ),
-        ({"multimodal_inputs": True}, "multimodal_inputs", "supports_mm_inputs=True"),
+        ({"multimodal_inputs": True}, "multimodal_inputs", "--language-model-only"),
         ({"lora_enabled": True}, "lora_enabled", "LoRA adapters"),
         ({"pipeline_parallel": True}, "pipeline_parallel", "single-stage pipeline"),
         ({"context_parallel": True}, "context_parallel", "PCP/DCP"),
