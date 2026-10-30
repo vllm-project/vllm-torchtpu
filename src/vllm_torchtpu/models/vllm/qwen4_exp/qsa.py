@@ -378,10 +378,11 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         )
         self.token_shard = self._token_shard_mode(tp_size, pooled, max_num_seqs)
         # VLLM_TPU_QSA_MAIN_KV_DCP: target layers split their main KV over TP
-        # rank pairs sharing a KV head; the MTP draft keeps whole pages.
+        # rank pairs sharing a KV head; the MTP draft keeps whole pages unless
+        # VLLM_TPU_QSA_MTP_KV_DCP splits it the same way.
         self.main_kv_dcp = 1
         dcp = int(envs.VLLM_TPU_QSA_MAIN_KV_DCP or 0)
-        if dcp > 1 and pooled and "mtp" not in prefix:
+        if dcp > 1 and pooled and ("mtp" not in prefix or envs.VLLM_TPU_QSA_MTP_KV_DCP):
             assert dcp == 2 and tp_size % dcp == 0, "main-KV DCP supports pairs only"
             self.main_kv_dcp = dcp
             self.register_buffer(
@@ -533,6 +534,25 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             self._dcp_op = partial(
                 build_pooled_qsa_dcp_op(pair, self.main_kv_dcp), **keywords
             )
+            if "mtp" in self.prefix:
+                from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
+                    build_pooled_qsa_draft_dcp_op,
+                )
+
+                # VLLM_TPU_QSA_MTP_KV_DCP: the draft's rows and shared-selection
+                # ops over its DCP main KV.
+                def draft(shared, with_rows):
+                    return partial(
+                        build_pooled_qsa_draft_dcp_op(
+                            pair, self.main_kv_dcp, shared=shared, with_rows=with_rows
+                        ),
+                        dcp_rank=self.dcp_rank,
+                        **keywords,
+                    )
+
+                self._rows_op = draft(False, True)
+                if self._shared_ops is not None:
+                    self._shared_ops = (draft(True, False), draft(True, True))
             if getattr(self, "token_shard", False):
                 self._token_shard_dcp_op = partial(
                     build_pooled_qsa_token_shard_dcp_op(
@@ -548,6 +568,9 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             envs.VLLM_TPU_QSA_INDEXER_SHARD
             and self.tp_size > 1
             and not (self.single_graph and envs.VLLM_TPU_QSA_INDEXER_SHARD_SKIP_SP)
+            # The key-sharded ops attend whole main-KV pages; under DCP they
+            # would take a DCP draft's rows path.
+            and self.main_kv_dcp == 1
         ):
             from vllm.distributed import get_tp_group
 
@@ -790,7 +813,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         if token_shard and rows is None and token_shard_op is not None:
             # Takes precedence over the key-sharded indexer in this graph.
             op = partial(token_shard_op, shard_index=self.token_shard_index)
-        if getattr(self, "_dcp_op", None) is not None and rows is None and not self.single_graph:
+        if getattr(self, "_dcp_op", None) is not None and rows is None:
             # VLLM_TPU_QSA_MAIN_KV_DCP: this rank's main-KV rows, pair-combined.
             if token_shard and self._token_shard_dcp_op is not None:
                 op = partial(

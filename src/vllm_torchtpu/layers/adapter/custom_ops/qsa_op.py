@@ -1002,6 +1002,95 @@ def build_pooled_qsa_dcp_op(pair_group, size: int):
     return run
 
 
+
+@functools.cache
+def _dcp_draft_ops():
+    """The MTP draft's DCP steps (VLLM_TPU_QSA_MTP_KV_DCP): ``rows``, ``shared``
+    and ``shared_rows``, each returning ``(pool, out, lse, selected)``."""
+    from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import (
+        pooled_qsa_rows_dcp_step,
+        pooled_qsa_shared_dcp_step,
+        pooled_qsa_shared_rows_dcp_step,
+    )
+
+    def shapes(qgate, nq, positions, pool, rows, compress_ratio, token_topk):
+        head_dim = nq.shape[0]
+        heads = qgate.shape[1] // (2 * head_dim)
+        return (
+            torch.empty_like(pool),
+            qgate.new_empty((rows, heads, head_dim), dtype=torch.float32),
+            qgate.new_empty((rows, heads), dtype=torch.float32),
+            positions.new_empty(
+                (rows, token_topk + compress_ratio - 1), dtype=torch.int32
+            ),
+        )
+
+    rows_op = pallas.jax_op(
+        "qwen4_exp::pooled_qsa_rows_dcp", pooled_qsa_rows_dcp_step, donate_argnums=(10,)
+    )
+
+    @rows_op.register_fake
+    def rows_fake(qgate, key, value, index_qk, nq, nk, niq, nik, positions, trig, pool,
+                  starts, context, ring_ids, main_table, compressed_table, rows, dcp_rank,
+                  compress_ratio, token_topk, norm_eps, rotary_dim, dcp_size=2, k_scale=1.0,
+                  v_scale=1.0, compressed_slot=0, main_slot=-1, max_query_len=1):
+        return shapes(qgate, nq, positions, pool, rows.shape[0], compress_ratio, token_topk)
+
+    shared_op = pallas.jax_op(
+        "qwen4_exp::pooled_qsa_shared_dcp", pooled_qsa_shared_dcp_step, donate_argnums=(10,)
+    )
+
+    @shared_op.register_fake
+    def shared_fake(qgate, key, value, index_qk, nq, nk, niq, nik, positions, trig, pool,
+                    starts, context, ring_ids, main_table, compressed_table, shared, dcp_rank,
+                    compress_ratio, token_topk, norm_eps, rotary_dim, dcp_size=2, k_scale=1.0,
+                    v_scale=1.0, compressed_slot=0, main_slot=-1, max_query_len=1):
+        return shapes(qgate, nq, positions, pool, shared.shape[0], compress_ratio, token_topk)
+
+    shared_rows_op = pallas.jax_op(
+        "qwen4_exp::pooled_qsa_shared_rows_dcp", pooled_qsa_shared_rows_dcp_step,
+        donate_argnums=(10,),
+    )
+
+    @shared_rows_op.register_fake
+    def shared_rows_fake(qgate, key, value, index_qk, nq, nk, niq, nik, positions, trig,
+                         pool, starts, context, ring_ids, main_table, compressed_table, rows,
+                         shared, dcp_rank, compress_ratio, token_topk, norm_eps, rotary_dim,
+                         dcp_size=2, k_scale=1.0, v_scale=1.0, compressed_slot=0,
+                         main_slot=-1, max_query_len=1):
+        return shapes(qgate, nq, positions, pool, shared.shape[0], compress_ratio, token_topk)
+
+    return rows_op, shared_op, shared_rows_op
+
+
+def build_pooled_qsa_draft_dcp_op(pair_group, size: int, *, shared: bool, with_rows: bool):
+    """The MTP draft's ops under VLLM_TPU_QSA_MTP_KV_DCP, as
+    ``build_pooled_qsa_rows_op`` (``with_rows``, not ``shared``) or
+    ``build_pooled_qsa_shared_op(with_rows)`` (``shared``), with the main KV
+    split over ``pair_group`` like ``build_pooled_qsa_dcp_op``. Takes a
+    trailing ``dcp_rank`` (int32 ``[1]``) keyword."""
+    assert shared or with_rows, "the all-token draft step is build_pooled_qsa_dcp_op"
+    rows_op, shared_op, shared_rows_op = _dcp_draft_ops()
+    step = (shared_rows_op if with_rows else shared_op) if shared else rows_op
+    _, _, _, combine = _dcp_ops()
+    extra = int(with_rows) + int(shared)
+    ints = (8, 11, 12, 13, 14, 15) + tuple(range(16, 16 + extra))
+
+    def run(*args, dcp_rank, **kwargs):
+        args = list(args)
+        for index in ints:
+            args[index] = args[index].to(torch.int32)
+        qgate = args[0]
+        head_dim = args[4].shape[0]
+        args[0] = pair_group.all_gather(qgate.contiguous(), dim=-1)
+        updated, out, lse, blocks = step(*args, dcp_rank, dcp_size=size, **kwargs)
+        args[10].copy_(updated)
+        # The combine gates each attended row with its token's gate.
+        gate_rows = qgate[args[16].clamp_min(0)] if with_rows else qgate
+        return _dcp_finish(out, lse, gate_rows, head_dim, dcp_rank, pair_group, combine), blocks
+
+    return run
+
 def build_pooled_qsa_token_shard_dcp_op(tp_group, pair_group, size: int):
     """``build_pooled_qsa_token_shard_op`` with the DCP main-KV split."""
     world = int(tp_group.world_size)
