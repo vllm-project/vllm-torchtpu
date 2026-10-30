@@ -4921,10 +4921,11 @@ class TPURaidenConnectorWorker:
             counts.append(len(pages))
         return tags, blocks, counts
 
-    def _register_stage3_request_blocks_dsv4(
-        self, metadata: TPUConnectorMetadata
-    ) -> None:
-        self._register_stage3_request_blocks_grouped(metadata)
+    @staticmethod
+    def _stage3_load_replay_matches(
+        submitted: _Stage3LoadMeta, repeated: _Stage3LoadMeta
+    ) -> bool:
+        return True
 
     def _register_stage3_request_blocks_grouped(
         self, metadata: TPUConnectorMetadata
@@ -5679,8 +5680,11 @@ class TPURaidenConnectorWorker:
                         "Conflicting duplicate Stage-3 load submission for "
                         f"req_id={destination_req_id}"
                     )
-                if self._uses_stage3_grouped_pages() and (
-                    self._stage3_submitted_load_metas[destination_req_id] != req_meta
+                if (
+                    self._uses_stage3_grouped_pages()
+                    and not self._stage3_load_replay_matches(
+                        self._stage3_submitted_load_metas[destination_req_id], req_meta
+                    )
                 ):
                     raise ValueError(
                         "Conflicting grouped Stage-3 load replay for "

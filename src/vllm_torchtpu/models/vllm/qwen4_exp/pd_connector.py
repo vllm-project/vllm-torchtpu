@@ -188,7 +188,7 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
             raise ValueError("Qwen PD GDN layout changed since model construction")
         scales = []
         for index, layer in enumerate(model.model.layers):
-            if layer.layer_type == "full_attention":
+            if layer.layer_type == "indexed_attention":
                 attention = layer.self_attn
                 k, v = attention._k_scale_float, attention._v_scale_float
                 if not all(math.isfinite(x) and x > 0 for x in (k, v)):
@@ -202,6 +202,8 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
                         "Qwen PD FP8 kernel scales differ from loaded buffers"
                     )
                 scales.append((index, k, v))
+        if not scales:
+            raise ValueError("Qwen PD requires loaded indexed-attention KV scales")
         parallel = self.vllm_config.parallel_config
         group = get_ep_group() if parallel.enable_expert_parallel else get_tp_group()
         config = model.config.to_dict()
@@ -264,6 +266,12 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
     @staticmethod
     def _uses_stage3_grouped_pages() -> bool:
         return True
+
+    @staticmethod
+    def _stage3_load_replay_matches(
+        submitted: _Stage3LoadMeta, repeated: _Stage3LoadMeta
+    ) -> bool:
+        return submitted == repeated
 
     def _local_raiden_transfer_rank(self) -> int:
         return self.tp_rank
