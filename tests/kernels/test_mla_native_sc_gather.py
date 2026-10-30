@@ -183,6 +183,79 @@ class NativeScGatherTest(absltest.TestCase):
                     np.asarray(gathered_rope)[:groups], expected_rope[:groups]
                 )
 
+    def test_ring_gather_matches_the_pipeline_gather(self):
+        """``ring_slots``: the DMA-ring serving writes the same live bytes as
+        the emit_pipeline one, padded and packed rope, unbounded, whole-round
+        and ragged (tail-guarded) live counts, and zero live rows."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("native-SC gather requires a TPU SparseCore")
+
+        pages, page_size = 64, 1024
+        cache_tokens = pages * page_size
+        query_tokens, topk = 64, 2048
+        count = query_tokens * topk
+        rng = np.random.default_rng(20261030)
+        nope_u8 = rng.integers(0, 256, (pages, page_size, 4, 128), np.uint8)
+        rope_u8 = rng.integers(0, 0x7E, (pages, page_size // 4, 4, 128), np.uint8)
+        rope_u8[..., 64:] = 0
+        nope_i32 = jnp.asarray(native_sc_cache_layout.pack_nope(nope_u8))
+        flat_rope_u8 = rope_u8.reshape(-1, 128)
+        ropes = {
+            False: jnp.asarray(native_sc_cache_layout.pack_rope_banded(rope_u8)),
+            True: jnp.asarray(
+                native_sc_cache_layout.pack_rope_packed(
+                    flat_rope_u8[:, :64].reshape(pages, page_size, 64)
+                )
+            ),
+        }
+        indices = jnp.asarray(
+            rng.integers(0, cache_tokens, count, dtype=np.int32).reshape(
+                query_tokens, topk
+            )
+        )
+        cases = [
+            (16, None, 1),
+            (8, None, 1),
+            (16, 0, 16 * topk),
+            (16, 64 * topk, 16 * topk),
+            (8, 20 * topk, 4 * topk),
+        ]
+        for packed in (False, True):
+            for atoms, num_live, live_multiple in cases:
+                with self.subTest(packed=packed, atoms=atoms, num_live=num_live):
+                    live_kwargs = (
+                        {}
+                        if num_live is None
+                        else dict(
+                            num_live_indices=jnp.int32(num_live),
+                            live_multiple=live_multiple,
+                        )
+                    )
+                    outs = [
+                        jax.block_until_ready(
+                            native_sc_gather.dsa_gather_native_sc(
+                                nope_i32,
+                                ropes[packed],
+                                indices,
+                                out_size=count,
+                                atoms_per_batch=atoms,
+                                packed_rope=packed,
+                                ring_slots=ring_slots,
+                                **live_kwargs,
+                            )
+                        )
+                        for ring_slots in (0, 4)
+                    ]
+                    rows = count if num_live is None else num_live
+                    groups = rows // native_sc_gather.ROPE_PACKING
+                    np.testing.assert_array_equal(
+                        np.asarray(outs[1][0])[:rows], np.asarray(outs[0][0])[:rows]
+                    )
+                    np.testing.assert_array_equal(
+                        np.asarray(outs[1][1])[:groups],
+                        np.asarray(outs[0][1])[:groups],
+                    )
+
     def test_exported_mlir_has_no_allocate_buffer(self):
         """Ensure native-SC gather lowers without AllocateBuffer custom calls.
 

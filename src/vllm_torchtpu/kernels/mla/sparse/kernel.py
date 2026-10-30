@@ -1231,6 +1231,7 @@ def prepare_outputs(
         "sparsecore_atoms_per_batch",
         "sparsecore_gather_wait_mode",
         "sparsecore_gather_pipelined",
+        "sparsecore_gather_ring_slots",
         "small_chunk_tokens",
         "small_chunk_batch_size",
         "small_chunk_live_gather",
@@ -1265,6 +1266,7 @@ def sparse_ragged_paged_attention(
     sparsecore_atoms_per_batch: int = 16,
     sparsecore_gather_wait_mode: str = "overlap_rope",
     sparsecore_gather_pipelined: bool = True,
+    sparsecore_gather_ring_slots: int = 4,
     small_chunk_tokens: int = 64,
     small_chunk_batch_size: int | None = 4,
     small_chunk_live_gather: bool = True,
@@ -1304,6 +1306,9 @@ def sparse_ragged_paged_attention(
         overlaps ROPE work.
       sparsecore_gather_pipelined: Whether to pipeline native SparseCore gather
         serving.
+      sparsecore_gather_ring_slots: Serve the native SparseCore gather with a
+        DMA ring of this many atoms (`dsa_gather_native_sc(ring_slots=...)`)
+        instead of its nested emit_pipeline; 0 keeps the pipeline. Same bytes.
       small_chunk_tokens: Chunks of at most this many tokens (the decode
         bucket) take the small-chunk path below; 0 disables it. Full
         `gather_and_attention_chunk_size` prefill chunks are unaffected.
@@ -1539,6 +1544,7 @@ def sparse_ragged_paged_attention(
             sparsecore_atoms_per_batch=sparsecore_atoms_per_batch,
             sparsecore_gather_wait_mode=sparsecore_gather_wait_mode,
             sparsecore_gather_pipelined=sparsecore_gather_pipelined,
+            sparsecore_gather_ring_slots=sparsecore_gather_ring_slots,
             small_chunk_tokens=effective_small_chunk_tokens,
             small_chunk_batch_size=small_chunk_batch_size,
             small_chunk_live_gather=small_chunk_live_gather,
@@ -1680,6 +1686,7 @@ def sparse_attention_chunk(
     sparsecore_atoms_per_batch: int = 16,
     sparsecore_gather_wait_mode: str = "overlap_rope",
     sparsecore_gather_pipelined: bool = True,
+    sparsecore_gather_ring_slots: int = 0,
     small_chunk_tokens: int = 0,
     small_chunk_batch_size: int | None = None,
     small_chunk_live_gather: bool = False,
@@ -1975,6 +1982,7 @@ def sparse_attention_chunk(
                 atoms_per_batch=gather_atoms,
                 wait_mode=sparsecore_gather_wait_mode,
                 serve_pipelined=sparsecore_gather_pipelined,
+                ring_slots=sparsecore_gather_ring_slots,
                 num_live_indices=num_live_capped,
                 live_multiple=kernel_batch_size * topk_cap,
                 packed_rope=packed_rope,
@@ -2009,6 +2017,7 @@ def sparse_attention_chunk(
                 atoms_per_batch=gather_atoms,
                 wait_mode=sparsecore_gather_wait_mode,
                 serve_pipelined=sparsecore_gather_pipelined,
+                ring_slots=sparsecore_gather_ring_slots,
                 packed_rope=packed_rope,
                 **live_kwargs,
             )
