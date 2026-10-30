@@ -362,6 +362,7 @@ def test_all_head_analytic_causal_duplicates_and_cache():
             functools.partial(
                 qsa_attention,
                 starts=jnp.arange(batch + 1, dtype=jnp.int32),
+                request_distribution=jnp.full((3,), batch, dtype=jnp.int32),
                 kv_heads=kv,
                 ratio=ratio,
                 k_scale=ks,

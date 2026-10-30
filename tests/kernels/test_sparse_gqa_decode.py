@@ -163,7 +163,10 @@ def _check_case(
     compiled = (
         jax.jit(
             functools.partial(
-                qsa_attention, starts=jnp.arange(batch + 1, dtype=jnp.int32), **opts
+                qsa_attention,
+                starts=jnp.arange(batch + 1, dtype=jnp.int32),
+                request_distribution=jnp.full((3,), batch, dtype=jnp.int32),
+                **opts,
             ),
             donate_argnums=(5,),
         )

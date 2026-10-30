@@ -18,6 +18,7 @@ metadata builders, model adapter, Torch bridge and TPU kernels are real.
 """
 
 from types import SimpleNamespace as NS
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -25,6 +26,7 @@ import numpy as np
 import pytest
 import torch
 from runner_input_test_utils import _BlockTable, _make_runner, _scheduler_output
+from vllm.v1.core.sched.output import SchedulerOutput
 
 from tests.models.vllm.qwen4_exp_test_utils import q4exp_text_config
 from tests.runner.test_qwen4_exp_pool import pool_config
@@ -33,6 +35,75 @@ from vllm_torchtpu.models.vllm.qwen4_exp.inputs import Qwen4ExpAdapter
 from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import pooled_cache_specs
 from vllm_torchtpu.runner.model_adapters import ModelInputSnapshot
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+
+@pytest.mark.parametrize("decode", [False, True])
+def test_equal_padded_buckets_follow_request_boundaries(monkeypatch, decode):
+    from vllm_torchtpu.kernels.qwen4_exp import qsa_rpa
+
+    counts = np.array([1, 1] if decode else [3, 5], np.int32)
+    contexts = [37, 1659] if decode else [0, 0]
+    runner = _make_runner(
+        num_computed_tokens=contexts,
+        prompt_tokens=[c + int(n) for c, n in zip(contexts, counts, strict=True)],
+        scheduled_tokens=counts.tolist(),
+        token_paddings=[8],
+        pcp_size=1,
+    )
+    prepared = TPUModelRunner._prepare_inputs(
+        cast(TPUModelRunner, runner),
+        cast(SchedulerOutput, _scheduler_output(counts.tolist())),
+        0,
+        int(np.count_nonzero(counts == 1)),
+    )
+    metadata = prepared[0]["layer.0"]
+    assert isinstance(metadata.query_start_loc, torch.Tensor)
+    assert isinstance(metadata.request_distribution, torch.Tensor)
+    starts = jnp.asarray(metadata.query_start_loc.numpy(), jnp.int32)
+    distribution = jnp.asarray(metadata.request_distribution.numpy(), jnp.int32)
+    np.testing.assert_array_equal(distribution, [2, 2, 2] if decode else [0, 0, 2])
+    lengths = jnp.array([37, 1659] + [0] * 6 if decode else list(range(1, 9)))
+    query = jnp.arange(128, dtype=jnp.float32).reshape(8, 2, 8)
+    gate = jnp.full_like(query, 0.25)
+    blocks = jnp.arange(8, dtype=jnp.int32)[:, None]
+    table = jnp.arange(8, dtype=jnp.int32)[:, None]
+    cache = jnp.arange(16, dtype=jnp.float32).reshape(2, 8)
+    seen = []
+
+    def attend(kind, q, g, ids, lens, pages, owner, *args, **kwargs):
+        seen.append(kind)
+        result = q + 2 * g + pages[:, :1, None]
+        return jnp.where((lens > 0)[:, None, None], result, 0), owner
+
+    monkeypatch.setattr(
+        qsa_rpa,
+        "rpa_attention",
+        lambda *a, **kw: attend("decode", *a, **kw),
+    )
+    monkeypatch.setattr(
+        qsa_rpa,
+        "_prefill_attention",
+        lambda *a, **kw: attend("prefill", *a, **kw),
+    )
+    monkeypatch.setattr(qsa_rpa.batching, "rpa_query_batch_size", lambda *a, **kw: 8)
+    with jax.disable_jit():
+        output, owner = qsa_rpa.qsa_attention(
+            query,
+            gate,
+            blocks,
+            lengths,
+            table,
+            cache,
+            starts,
+            request_distribution=distribution,
+            kv_heads=1,
+            ratio=4,
+        )
+    assert seen == ["decode" if decode else "prefill"]
+    expected = np.asarray(query) + 0.5 + np.arange(8)[:, None, None]
+    expected[int(counts.sum()) :] = 0
+    np.testing.assert_array_equal(output, expected)
+    assert owner is cache
 
 
 @pytest.mark.tpu_test
@@ -77,7 +148,9 @@ def test_runner_padded_decode_reaches_native_fused_attention(
         return {n: b.build(0, common) for n, b in zip(names, builders)}, None
 
     runner._build_attention_metadata = build
-    prepared = TPUModelRunner._prepare_inputs(runner, _scheduler_output([1, 1]), 0, 0)
+    prepared = TPUModelRunner._prepare_inputs(
+        runner, _scheduler_output([1, 1]), 0, len(contexts)
+    )
     adapter = Qwen4ExpAdapter(runner)
     metadata = adapter.prepare_inputs(
         ModelInputSnapshot(
@@ -120,11 +193,15 @@ def test_runner_padded_decode_reaches_native_fused_attention(
     producers[-1][:, :32] = 1
     for x in producers[:4]:
         x[2:] = torch.nan
-    tail = [metadata[n] for n in ("query_start_loc", "context_lens")]
-    tail += [prepared[0][names[1]].block_tables]
-    tail += [
-        metadata[n].reshape(-1) for n in ("main_block_table", "compressed_block_table")
-    ]
+    starts, context = (metadata[n] for n in ("query_start_loc", "context_lens"))
+    rings = prepared[0][names[1]].block_tables
+    main_table = prepared[0][names[0]].block_tables
+    distribution = prepared[0][names[0]].request_distribution
+    assert isinstance(rings, torch.Tensor)
+    assert isinstance(main_table, torch.Tensor)
+    assert isinstance(distribution, torch.Tensor)
+    assert distribution.tolist() == [2, 2, 2]
+    tail = [starts, context, rings, main_table, main_table, distribution]
     options = dict(compress_ratio=4, token_topk=2048, norm_eps=1e-6, rotary_dim=64)
 
     def array(x):
@@ -143,11 +220,17 @@ def test_runner_padded_decode_reaches_native_fused_attention(
         .compile()
         .as_text()
     )
-    assert "fused_qsa_decode" in hlo and "prefill_paired_pages" not in hlo
+    assert isinstance(hlo, str)
+    assert "fused_qsa_decode" in hlo
+    # Device request boundaries select among the compiled branches at runtime.
+    assert "conditional" in hlo
     query, _, _, gate, _, _ = produce(*args[:7], args[8], args[9], 1e-6, 64)
     tensor_args = [x.to("tpu") for x in producers]
-    tensor_tail = [x.to(torch.int32).to("tpu") for x in tail]
-    tensor_tail[-1] = tensor_tail[-2]
+    tensor_tail = [x.to(torch.int32).to("tpu") for x in (starts, context, rings)]
+    native_table = main_table.to(torch.int32).to("tpu")
+    tensor_tail.extend(
+        (native_table, native_table, distribution.to(torch.int32).to("tpu"))
+    )
     op = build_compact_pooled_qsa_op()
     compiled = torch.compile(op, backend="tpu", fullgraph=True)
     for label, function in (("direct", op), ("compiled", compiled)):
