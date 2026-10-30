@@ -28,7 +28,6 @@ import jax
 import jax.numpy as jnp
 import ml_dtypes
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import tpu as pltpu
 
 # A stdlib logger under vLLM's handlers, so the kernel still imports and runs
 # where vLLM is not installed.
@@ -139,67 +138,98 @@ SWEEP_ROWS = 16
 # fori_loop unroll of the fused kernel's sweep over the experts.
 SWEEP_UNROLL = 4
 
+# Tokens per strip of the fused kernel's sweep: its k running lists of
+# LIST_ROWS x SWEEP_LANES keys stay in vregs.
+SWEEP_LANES = 256
+
+# Sublanes of each running list: one f32 vreg per list and strip.
+LIST_ROWS = 8
+
 
 # Clamp floor of the fused kernel: NEG rounded to bf16, so that like every
 # bf16 logit it leaves the low 16 bits of its f32 pattern zero.
 NEG_BF16 = float(ml_dtypes.bfloat16(NEG))
 
-# Low bits of a fused-kernel sort key that carry the expert id.
-KEY_ID_BITS = 16
+# Expert ids above the 16 value bits of a fused-kernel sort key keep the key
+# under 2**30, a positive normal f32 bit pattern.
+MAX_EXPERTS = 1 << 14
+
+# Added to every sort key: the smallest normal f32 pattern, so that no key is
+# a denormal a flush-to-zero compare would tie.
+KEY_BASE = 1 << 23
+
+_SIGN = jnp.iinfo(jnp.int32).min
 
 
-def _flip(b: jax.Array) -> jax.Array:
-    """f32 bit pattern <-> int32 whose signed order is the float order.
-
-    Flips the magnitude bits of negatives; its own inverse."""
-    return b ^ ((b >> 31) & 0x7FFFFFFF)
-
-
-def _softmax_select_kernel(x_ref, w_ref, i_ref, k_ref, *, topk: int, n: int):
+def _softmax_select_kernel(x_ref, w_ref, i_ref, *, topk: int, n: int):
     """One block of tokens, expert-major: ``x_ref`` is ``[experts, tokens]``.
 
-    Every bf16 logit leaves the low ``KEY_ID_BITS`` of its f32 pattern zero,
-    so one int32 key per score holds the order-preserving value bits above
-    and ``n - 1 - id`` below: keys are unique, the largest key is the largest
-    logit and among equal logits the lowest expert id, so each pass is one
-    max per element. Pass 0 builds the keys into ``k_ref``; pass ``j`` takes
-    the largest key below pass ``j - 1``'s, so nothing is written back.
-    Only the final ``SWEEP_ROWS``-row max crosses sublanes.
+    A bf16 logit is the top 16 bits of its f32 pattern. Each score becomes
+    one sort key: its 16 order-preserving value bits, then ``n - 1 - id``,
+    plus ``KEY_BASE``. As an f32 the key is a positive normal number, so float
+    max/min order keys exactly like the integers: keys are unique, and the
+    largest is the largest logit and among equal logits the lowest expert id.
+
+    One sweep over the experts, ``SWEEP_LANES`` tokens at a time, inserts
+    each key into a descending list of ``topk`` per sublane (one min and one
+    max per level, all in vregs). The k largest of the ``LIST_ROWS`` lists
+    are then popped one sublane max at a time and decoded.
     """
     tb = x_ref.shape[1]
-    low = (1 << KEY_ID_BITS) - 1
-    lowest = jnp.iinfo(jnp.int32).min
-    sub = jax.lax.broadcasted_iota(jnp.int32, (SWEEP_ROWS, tb), 0)
-    init = jnp.full((SWEEP_ROWS, tb), lowest, jnp.int32)
+    lanes = min(SWEEP_LANES, tb)
+    id_bits = max(1, (n - 1).bit_length())
+    id_mask = (1 << id_bits) - 1
+    sub = jax.lax.broadcasted_iota(jnp.int32, (SWEEP_ROWS, lanes), 0)
 
-    def build(v, best):
-        r = pl.multiple_of(v * SWEEP_ROWS, SWEEP_ROWS)
-        x = x_ref[pl.ds(r, SWEEP_ROWS), :].astype(jnp.float32)
-        x = jnp.where(x > NEG_BF16, x, NEG_BF16)
-        # -0.0 would order below +0.0; the reference ties them.
-        x = jnp.where(x == 0.0, 0.0, x)
-        key = _flip(jax.lax.bitcast_convert_type(x, jnp.int32)) & ~low
-        key = key | (n - 1 - r - sub)
-        k_ref[pl.ds(r, SWEEP_ROWS), :] = key
-        return jnp.maximum(best, key)
+    def strip(c, carry):
+        col = pl.multiple_of(c * lanes, lanes)
 
-    best = jax.lax.fori_loop(0, n // SWEEP_ROWS, build, init, unroll=SWEEP_UNROLL)
-    keys = [jnp.max(best, axis=0, keepdims=True)]
-    for _ in range(1, topk):
-
-        def below(v, best, prev=keys[-1]):
+        def step(v, lists):
             r = pl.multiple_of(v * SWEEP_ROWS, SWEEP_ROWS)
-            key = k_ref[pl.ds(r, SWEEP_ROWS), :]
-            return jnp.maximum(best, jnp.where(key < prev, key, lowest))
+            x = x_ref[pl.ds(r, SWEEP_ROWS), pl.ds(col, lanes)].astype(jnp.float32)
+            x = jnp.where(x > NEG_BF16, x, NEG_BF16)
+            # -0.0 would order below +0.0; the reference ties them.
+            x = jnp.where(x == 0.0, 0.0, x)
+            b = jax.lax.bitcast_convert_type(x, jnp.int32)
+            # 16-bit unsigned order of the float: set the sign of positives,
+            # invert negatives.
+            value = jax.lax.shift_right_logical(b ^ ((b >> 31) | _SIGN), 16)
+            key = (value << id_bits) + (KEY_BASE + n - 1 - r - sub)
+            key = jax.lax.bitcast_convert_type(key, jnp.float32)
+            for h in range(0, SWEEP_ROWS, LIST_ROWS):
+                part = key[h : h + LIST_ROWS]
+                out = [jnp.maximum(lists[0], part)]
+                for k in range(1, topk):
+                    out.append(jnp.maximum(lists[k], jnp.minimum(lists[k - 1], part)))
+                lists = out
+            return tuple(lists)
 
-        best = jax.lax.fori_loop(
-            0, n // SWEEP_ROWS, below, init, unroll=SWEEP_UNROLL
+        lists = list(
+            jax.lax.fori_loop(
+                0,
+                n // SWEEP_ROWS,
+                step,
+                (jnp.zeros((LIST_ROWS, lanes), jnp.float32),) * topk,
+                unroll=SWEEP_UNROLL,
+            )
         )
-        keys.append(jnp.max(best, axis=0, keepdims=True))
-    for j, key in enumerate(keys):
-        i_ref[pl.ds(j, 1), :] = n - 1 - (key & low)
-        bits = _flip(jnp.where(key < 0, key | low, key & ~low))
-        w_ref[pl.ds(j, 1), :] = jax.lax.bitcast_convert_type(bits, jnp.float32)
+        for j in range(topk):
+            key = jnp.max(lists[0], axis=0, keepdims=True)
+            hit = lists[0] == key
+            lists = [jnp.where(hit, a, b) for a, b in zip(lists[1:], lists)] + [
+                jnp.where(hit, 0.0, lists[-1])
+            ]
+            key = jax.lax.bitcast_convert_type(key, jnp.int32) - KEY_BASE
+            i_ref[pl.ds(j, 1), pl.ds(col, lanes)] = n - 1 - (key & id_mask)
+            value = ((key >> id_bits) - 32768) << 16
+            bits = jnp.where(value < 0, value | 0xFFFF, value)
+            bits = bits ^ ((bits >> 31) & 0x7FFFFFFF)
+            w_ref[pl.ds(j, 1), pl.ds(col, lanes)] = jax.lax.bitcast_convert_type(
+                bits, jnp.float32
+            )
+        return carry
+
+    jax.lax.fori_loop(0, tb // lanes, strip, 0)
     # Softmax over the k selected logits: the full-row denominator cancels in
     # the renormalization. A row with no logit above the floor stays NaN.
     w = w_ref[...]
@@ -226,12 +256,19 @@ def select_softmax(
     rows, n = logits.shape
     if logits.dtype != jnp.bfloat16:
         raise ValueError(f"fused router top-k takes bf16 logits, got {logits.dtype}")
-    if n % SWEEP_ROWS or n > 1 << KEY_ID_BITS:
+    if n % SWEEP_ROWS or n > MAX_EXPERTS:
         raise ValueError(
             f"expert count {n} must be a multiple of {SWEEP_ROWS}, at most "
-            f"{1 << KEY_ID_BITS}"
+            f"{MAX_EXPERTS}"
         )
-    block = min(MAX_BLOCK_TOKENS, rows)
+    if MAX_BLOCK_TOKENS % SWEEP_LANES or SWEEP_ROWS % LIST_ROWS:
+        raise ValueError("fused router top-k tiling constants do not nest")
+    # A block wider than one strip is a whole number of strips.
+    block = (
+        rows
+        if rows <= SWEEP_LANES
+        else min(MAX_BLOCK_TOKENS, rows // SWEEP_LANES * SWEEP_LANES)
+    )
     w, i = pl.pallas_call(
         functools.partial(_softmax_select_kernel, topk=topk, n=n),
         grid=(pl.cdiv(rows, block),),
@@ -244,7 +281,6 @@ def select_softmax(
             jax.ShapeDtypeStruct((topk, rows), jnp.float32),
             jax.ShapeDtypeStruct((topk, rows), jnp.int32),
         ],
-        scratch_shapes=[pltpu.VMEM((n, block), jnp.int32)],
         interpret=interpret,
     )(logits.T)
     return w.T, i.T
