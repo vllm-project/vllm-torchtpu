@@ -756,6 +756,27 @@ def test_numerics_is_logged_and_fingerprinted(
     assert exact != approx
 
 
+def test_loaded_line_says_whose_numerics_it_reports(
+    toy: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A spec's `numerics` is its default profile's; a requested profile's own
+    numerics are only known to the program, which logs them at bind."""
+    note = driver_mod.loaded_numerics_note
+    assert note("approx", {}) == "spec numerics=approx (default profile)"
+    assert note("approx", {"profile": "p-exact"}) == (
+        "spec numerics=approx (default profile); requested profile=p-exact, "
+        "its numerics are logged at bind"
+    )
+    _no_group(monkeypatch)
+    with caplog.at_level(logging.INFO):
+        drv = driver_mod.ProgramDriver.maybe_create(_runner({"profile": "p-exact"}))
+    assert drv is not None
+    assert "loaded from toy_mk_plugin (spec numerics=exact (default profile); " in (
+        caplog.text
+    )
+    assert "requested profile=p-exact, its numerics are logged at bind" in caplog.text
+
+
 # --- collective_domain ------------------------------------------------------
 
 

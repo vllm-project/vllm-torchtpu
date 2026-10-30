@@ -863,6 +863,16 @@ _PROGRAM_METHODS = (
 )
 
 
+def loaded_numerics_note(spec_numerics: str, options: Mapping[str, Any]) -> str:
+    """The numerics part of the "plugin loaded" line. A spec's `numerics` is
+    its default profile's; a requested profile's own numerics are only known
+    to the program, which logs them at bind."""
+    note = f"spec numerics={spec_numerics} (default profile)"
+    if prof := options.get("profile"):
+        note += f"; requested profile={prof}, its numerics are logged at bind"
+    return note
+
+
 def _check_create_result(out: Any, ref: Any) -> _rt.EligibilityResult | None:
     """`create`'s decline, or `None` for a program; anything else raises."""
     if isinstance(out, Decline):
@@ -988,13 +998,11 @@ class ProgramDriver:
             )
             token = agreement_token(fprint, runtime_src_hash())
             logger.info(
-                "Megakernel plugin %s %s loaded from %s (numerics=%s%s, "
-                "fingerprint %s)",
+                "Megakernel plugin %s %s loaded from %s (%s, fingerprint %s)",
                 plugin.name,
                 plugin.version,
                 ref.module,
-                plugin.numerics,
-                f", profile={options['profile']}" if options.get("profile") else "",
+                loaded_numerics_note(plugin.numerics, options),
                 fprint[:16],
             )
             tp_size = view.tp_size
