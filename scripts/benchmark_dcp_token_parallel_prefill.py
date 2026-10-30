@@ -31,12 +31,14 @@ Needs a TPU with SparseCores. Usage:
 
 import argparse
 import json
+import os
 import time
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
+from jax.experimental import multihost_utils
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
@@ -58,6 +60,7 @@ AXIS = "dcp"
 HEADS, LKV, ROPE, TOPK = 64, 512, 64, 2048
 IDX_HEADS, IDX_DIM = 32, 128
 PAGE, IL, MAX_REQS = 256, 4, 64
+PREFIX_PIECE = 32768
 SAL = KVLayout.SEQ_ALONG_LANE
 
 
@@ -73,9 +76,113 @@ def _timeit(fn, *args, iters):
     return float(np.median(times)) * 1e3, out
 
 
+def _global(sharding, x):
+    """A global array of host value `x` (the same on every process)."""
+    x = np.asarray(x)
+    return jax.make_array_from_callback(x.shape, sharding, lambda i: x[i])
+
+
+def _host(x):
+    """A (possibly multi-host) global array, whole, on this host."""
+    if x.is_fully_addressable:
+        return np.asarray(x)
+    return np.asarray(multihost_utils.process_allgather(x, tiled=True))
+
+
 def _fp8(key, shape, scale):
     x = jax.random.normal(key, shape, jnp.float32) * scale
     return x.astype(jnp.float8_e4m3fn)
+
+
+def _collective_breakdown(mesh, lay, T, h, iters):
+    """Each collective of the split alone, on buffers of its served shape:
+    median time, bytes each device sends, effective GB/s, and how XLA lowered
+    it (the collective ops in the compiled HLO)."""
+    dcp = lay.dcp_size
+    rows = T // dcp
+    out = {}
+
+    def run(name, fn, x, sent_bytes):
+        f = jax.jit(
+            jax.shard_map(
+                fn, mesh=mesh, in_specs=P(AXIS), out_specs=P(AXIS), check_vma=False
+            )
+        )
+        t, _ = _timeit(f, x, iters=iters)
+        hlo = f.lower(x).compile().as_text()
+        ops = [
+            ln.strip()[:200]
+            for ln in hlo.splitlines()
+            if any(k in ln for k in ("all-to-all", "all-gather", "collective-permute"))
+            and "=" in ln
+        ][:4]
+        out[f"coll_{name}_ms"] = t
+        out[f"coll_{name}_GBps"] = sent_bytes / t / 1e6
+        out[f"coll_{name}_hlo_ops"] = ops
+        print(
+            f"  {name}: {t:.3f} ms, {sent_bytes / 1e6:.1f} MB sent, "
+            f"{sent_bytes / t / 1e6:.1f} GB/s, ops {ops}"
+        )
+
+    def zeros(shape, dtype):
+        return jax.jit(
+            lambda: jnp.zeros((dcp * shape[0], *shape[1:]), dtype),
+            out_shardings=NamedSharding(mesh, P(AXIS)),
+        )()
+
+    frac = (dcp - 1) / dcp
+    q = zeros((T, h, LKV + ROPE), jnp.bfloat16)
+    qb = T * h * (LKV + ROPE) * 2 * frac
+    run("noop", lambda x: x + 1, zeros((8, 128), jnp.float32), 1)
+    run("q_a2a_heads", lambda x: lax.all_to_all(x, AXIS, 0, 1, tiled=True), q, qb)
+    run(
+        "q_a2a_flat",
+        lambda x: lax.all_to_all(x.reshape(dcp, -1), AXIS, 0, 0, tiled=True),
+        q,
+        qb,
+    )
+    run(
+        "q_a2a_flat_u32",
+        lambda x: lax.all_to_all(
+            lax.bitcast_convert_type(x.reshape(dcp, -1, 2), jnp.uint32),
+            AXIS,
+            0,
+            0,
+            tiled=True,
+        ),
+        q,
+        qb,
+    )
+    o = zeros((rows, HEADS, LKV), jnp.bfloat16)
+    ob = rows * HEADS * LKV * 2 * frac
+    run("out_a2a_heads", lambda y: lax.all_to_all(y, AXIS, 1, 0, tiled=True), o, ob)
+    run(
+        "out_a2a_flat",
+        lambda y: lax.all_to_all(
+            y.reshape(rows, dcp, -1).swapaxes(0, 1).reshape(dcp, -1),
+            AXIS,
+            0,
+            0,
+            tiled=True,
+        ),
+        o,
+        ob,
+    )
+    for cap in sorted({8, 24, lay.max_pages}):
+        page = zeros((cap, PAGE, 128), jnp.uint32)
+        run(
+            f"latent_ag_{cap}p",
+            lambda x: lax.all_gather(x, AXIS, axis=0, tiled=True),
+            page,
+            cap * PAGE * 128 * 4 * (dcp - 1),
+        )
+    run(
+        "q_all_gather_dcp",
+        lambda x: lax.all_gather(x, AXIS, axis=1, tiled=True),
+        q,
+        qb * dcp,
+    )
+    return out
 
 
 def main():
@@ -90,6 +197,14 @@ def main():
     ap.add_argument("--out", default="")
     a = ap.parse_args()
 
+    if os.environ.get("NPROC"):
+        # Multi-host (one process per host): every process builds the same
+        # host data; mesh inputs are global arrays, results fetched back.
+        jax.distributed.initialize(
+            coordinator_address=os.environ["COORD"],
+            num_processes=int(os.environ["NPROC"]),
+            process_id=int(os.environ["TPU_WORKER_ID"]),
+        )
     devices = jax.devices()
     dcp = len(devices)
     mesh = Mesh(np.array(devices), (AXIS,))
@@ -124,6 +239,10 @@ def main():
         jnp.bfloat16
     )
 
+    lat, pe, idx_rec, q_idx, w_idx, q = (
+        np.asarray(x) for x in (lat, pe, idx_rec, q_idx, w_idx, q)
+    )
+
     # Step metadata: request 0 is the prefill chunk, the rest are padding.
     seq_lens = np.zeros(MAX_REQS, np.int32)
     seq_lens[0] = total
@@ -133,15 +252,7 @@ def main():
     perm = np.random.default_rng(0).permutation(pages_per_rank)[:n_vp]
     bt = np.zeros((MAX_REQS, n_vp + 1), np.int32)
     bt[0, :n_vp] = perm
-    meta = [jnp.asarray(x) for x in (seq_lens, bt.reshape(-1), qsl, dist)]
-    pre = [
-        jnp.asarray(x)
-        for x in (
-            np.array([prefix] + [0] * (MAX_REQS - 1), np.int32),
-            np.array([0] + [prefix] * MAX_REQS, np.int32),
-        )
-    ]
-
+    meta = [seq_lens, bt.reshape(-1), qsl, dist]
     # DCP shards hold the prefix; the ops under test write the chunk.
     nope_spec = kvu.SparseMLAKVCacheSpec.create(
         kvu.KVCacheType.NOPE, kvu.KVCacheLayout.SPARSECORE, pages_per_rank, PAGE, LKV
@@ -181,9 +292,11 @@ def main():
         return nope, rope, icache
 
     def zeros(shape, dtype):
-        return jax.device_put(jnp.zeros((dcp * shape[0], *shape[1:]), dtype), shd)
+        return jax.jit(
+            lambda: jnp.zeros((dcp * shape[0], *shape[1:]), dtype), out_shardings=shd
+        )()
 
-    nope0, rope0, icache_pre = jax.jit(
+    write_prefix = jax.jit(
         jax.shard_map(
             _write_prefix,
             mesh=mesh,
@@ -191,17 +304,28 @@ def main():
             out_specs=(P(AXIS),) * 3,
             check_vma=False,
         )
-    )(
-        zeros(nope_spec.shape, jnp.uint32),
-        zeros(rope_spec.shape, jnp.uint32),
-        zeros(idx_shape, jnp.uint8),
-        lat[:prefix],
-        pe[:prefix],
-        idx_rec[:prefix],
-        pre[0],
-        meta[1],
-        pre[1],
     )
+    nope0 = zeros(nope_spec.shape, jnp.uint32)
+    rope0 = zeros(rope_spec.shape, jnp.uint32)
+    icache_pre = zeros(idx_shape, jnp.uint8)
+    # The K writer takes at most PREFIX_PIECE rows per call.
+    for start in range(0, prefix, PREFIX_PIECE):
+        end = min(start + PREFIX_PIECE, prefix)
+        sl = np.zeros(MAX_REQS, np.int32)
+        sl[0] = end
+        cu = np.full(MAX_REQS + 1, end - start, np.int32)
+        cu[0] = 0
+        nope0, rope0, icache_pre = write_prefix(
+            nope0,
+            rope0,
+            icache_pre,
+            lat[start:end],
+            pe[start:end],
+            idx_rec[start:end],
+            sl,
+            meta[1],
+            cu,
+        )
     # The indexer ops expect this step's K already written (the adapter does).
     icache = jax.jit(
         jax.shard_map(
@@ -249,9 +373,25 @@ def main():
         jnp.zeros(nat_nope_spec.shape, jnp.uint32),
         jnp.zeros(nat_rope_spec.shape, jnp.uint32),
     )
-    nat_idx = jax.jit(
-        lambda c: coalesced_kv_append(c, idx_rec, one[0], nat_bt, one[1], SAL)
-    )(jnp.zeros(get_kv_cache_shape(nat_pages, PAGE, IDX_DIM, SAL), jnp.uint8))
+    nat_idx = jnp.zeros(get_kv_cache_shape(nat_pages, PAGE, IDX_DIM, SAL), jnp.uint8)
+    append = jax.jit(
+        lambda c, r, sl, cu: coalesced_kv_append(c, r, sl, nat_bt, cu, SAL)
+    )
+    for start in range(0, total, PREFIX_PIECE):
+        end = min(start + PREFIX_PIECE, total)
+        nat_idx = append(
+            nat_idx,
+            jnp.asarray(idx_rec[start:end]),
+            jnp.array([end], jnp.int32),
+            jnp.array([0, end - start], jnp.int32),
+        )
+
+    # Timed inputs live on device: replicated globals for the mesh, local
+    # arrays for the single-device references.
+    rep = NamedSharding(mesh, P())
+    meta = [_global(rep, x) for x in meta]
+    q_idx_g, w_idx_g = _global(rep, q_idx), _global(rep, w_idx)
+    lat_c, pe_c = _global(rep, lat[prefix:]), _global(rep, pe[prefix:])
 
     results = {"dcp": dcp, "tokens": T, "prefix": prefix, "rows_per_rank": rows}
     from vllm_torchtpu import envs
@@ -274,8 +414,8 @@ def main():
             lay, mesh, AXIS, c, qi, wi, *m, select_topk=select
         )
     )
-    t_tp_idx, flat = _timeit(tp_index, icache, q_idx, w_idx, *meta, iters=a.iters)
-    flat = np.asarray(flat).reshape(dcp, rows, TOPK).reshape(dcp * rows, TOPK)
+    t_tp_idx, flat = _timeit(tp_index, icache, q_idx_g, w_idx_g, *meta, iters=a.iters)
+    flat = _host(flat).reshape(dcp, rows, TOPK).reshape(dcp * rows, TOPK)
     n_tp = T - S
     ref_pos = np.asarray(
         jax.jit(
@@ -333,10 +473,10 @@ def main():
         )
 
     h = HEADS // dcp
-    q_sharded = jax.device_put(
-        q.reshape(T, dcp, h, -1).transpose(1, 0, 2, 3).reshape(dcp * T, h, -1), shd
+    q_sharded = _global(
+        shd, q.reshape(T, dcp, h, -1).transpose(1, 0, 2, 3).reshape(dcp * T, h, -1)
     )
-    flat_dev = jax.device_put(jnp.asarray(flat), shd)
+    flat_dev = _global(shd, flat)
     tp_attn = jax.jit(
         lambda n, r, qq, kc, kp, ft, *m: tp.sparse_mla_attention(
             lay,
@@ -358,13 +498,13 @@ def main():
         nope0,
         rope0,
         q_sharded,
-        lat[prefix:],
-        pe[prefix:],
+        lat_c,
+        pe_c,
         flat_dev,
         *meta,
         iters=a.iters,
     )
-    out_tp = np.asarray(out_tp, np.float32).reshape(dcp, T, h, LKV)
+    out_tp = _host(out_tp).astype(np.float32).reshape(dcp, T, h, LKV)
     out_tp = out_tp.transpose(1, 0, 2, 3).reshape(T, HEADS, LKV)[:n_tp]
 
     single = jax.jit(
@@ -381,7 +521,9 @@ def main():
             cache_layout="sparsecore",
         )[..., :LKV]
     )
-    t_single, out_single = _timeit(single, q[S:], jnp.asarray(ref_pos), iters=a.iters)
+    t_single, out_single = _timeit(
+        single, jnp.asarray(q[S:]), jnp.asarray(ref_pos), iters=a.iters
+    )
     out_single = np.asarray(out_single, np.float32)
     same_topk = np.array(
         [
@@ -426,7 +568,7 @@ def main():
         )
     )
     t_dcp_idx, local_topk = _timeit(
-        dcp_index, icache, q_idx, w_idx, *meta, iters=a.iters
+        dcp_index, icache, q_idx_g, w_idx_g, *meta, iters=a.iters
     )
 
     def gather_q(qs):
@@ -474,13 +616,13 @@ def main():
         nope0,
         rope0,
         q_sharded,
-        lat[prefix:],
-        pe[prefix:],
+        lat_c,
+        pe_c,
         local_topk,
         *meta,
         iters=a.iters,
     )
-    out_dcp = np.asarray(out_dcp, np.float32).reshape(dcp, T, h, LKV)
+    out_dcp = _host(out_dcp).astype(np.float32).reshape(dcp, T, h, LKV)
     out_dcp = out_dcp.transpose(1, 0, 2, 3).reshape(T, HEADS, LKV)[S:]
 
     # ---- f32 reference on sampled rows ----------------------------------
@@ -533,6 +675,43 @@ def main():
             _l, mesh=mesh, in_specs=P(AXIS), out_specs=P(AXIS), check_vma=False
         )(qq)
 
+    def index_pieces(c, qi, wi, *m, select_too):
+        def _l(c, qi, wi, sl, bt_, q_, d_):
+            pages, offs = tp.step_pages(lay, sl, q_, d_[2])
+            ids = tp.gather_page_ids(lay, bt_, pages, offs, c.shape[0])
+            nat = tp.gather_index_k(lay, c, ids, jnp.sum(pages), AXIS)
+            if not select_too:
+                return nat
+            rank = tp.rank_as_data(AXIS, dcp)
+            rr = tp.rank_rows(lay, rank, T, sl, q_, d_[2])
+            table = tp.natural_page_table(lay, rr, offs, bt_.shape[0] // sl.shape[0])
+            return select(qi[:rows], wi[:rows], nat, rr, table)
+
+        return jax.shard_map(
+            _l,
+            mesh=mesh,
+            in_specs=(P(AXIS),) + (P(),) * 6,
+            out_specs=P(AXIS),
+            check_vma=False,
+        )(c, qi, wi, *m)
+
+    t_igather, _ = _timeit(
+        jax.jit(lambda *x: index_pieces(*x, select_too=False)),
+        icache,
+        q_idx_g,
+        w_idx_g,
+        *meta,
+        iters=a.iters,
+    )
+    t_iboth, _ = _timeit(
+        jax.jit(lambda *x: index_pieces(*x, select_too=True)),
+        icache,
+        q_idx_g,
+        w_idx_g,
+        *meta,
+        iters=a.iters,
+    )
+    results.update(tp_index_gather_ms=t_igather, tp_index_gather_select_ms=t_iboth)
     t_gather, _ = _timeit(jax.jit(gather_only), nope0, rope0, *meta, iters=a.iters)
     t_a2a, _ = _timeit(jax.jit(a2a_only), q_sharded, iters=a.iters)
     t_qag, _ = _timeit(
@@ -548,6 +727,29 @@ def main():
         q_sharded,
         iters=a.iters,
     )
+    results.update(_collective_breakdown(mesh, lay, T, h, a.iters))
+    # The kernel alone, on this rank's gathered buffers and rows.
+    g_nope, g_rope = jax.jit(gather_only)(nope0, rope0, *meta)
+    q_tok = jax.jit(
+        jax.shard_map(
+            lambda x: tp.heads_to_tokens(lay, x, AXIS),
+            mesh=mesh,
+            in_specs=P(AXIS),
+            out_specs=P(AXIS),
+            check_vma=False,
+        )
+    )(q_sharded)
+    kernel_only = jax.jit(
+        jax.shard_map(
+            lambda qq, gn, gr, ft: attend(qq, gn, gr, ft, jnp.int32(rows)),
+            mesh=mesh,
+            in_specs=(P(AXIS),) * 4,
+            out_specs=P(AXIS),
+            check_vma=False,
+        )
+    )
+    t_kernel, _ = _timeit(kernel_only, q_tok, g_nope, g_rope, flat_dev, iters=a.iters)
+    results.update(tp_kernel_only_ms=t_kernel)
     results.update(
         tp_attention_ms=t_tp_attn,
         tp_indexer_ms=t_tp_idx,
@@ -560,7 +762,7 @@ def main():
     )
     for k_, v in results.items():
         print(f"  {k_}: {v}")
-    if a.out:
+    if a.out and jax.process_index() == 0:
         with open(a.out, "w") as f:
             json.dump(results, f, indent=1)
 
