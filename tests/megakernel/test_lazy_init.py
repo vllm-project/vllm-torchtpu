@@ -116,6 +116,9 @@ from vllm_torchtpu.megakernel import module_options
 assert {"gqa", "gdn", "moe"} <= set(module_options.registered_tunables())
 assert mk.find_model("qwen3_5") is not None
 assert "qwen35-baseline" in mk.list_profiles()
+# The fused pool I/O implementation registers on the first lookup.
+from vllm_torchtpu.megakernel.fused_io_hook import fused_io, fused_io_available
+assert fused_io_available() and fused_io() is not None
 print("OK")
 """
 

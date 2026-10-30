@@ -16,8 +16,9 @@
 The package `__init__` resolves names lazily, so importing `megakernel` no
 longer imports `megakernel.modules` (module tunables / debug options,
 registered by `Module.__init_subclass__`), `megakernel.models` or
-`megakernel.profiles` (built-in models and profiles). Registry lookups call
-`ensure_builtins()` first. A missing package (a partial tree, or one that
+`megakernel.profiles` (built-in models and profiles), or
+`megakernel.experimental` (the fused pool I/O implementation). Registry
+lookups call `ensure_builtins()` first. A missing package (a partial tree, or one that
 moved out) is skipped.
 """
 
@@ -30,11 +31,11 @@ _LOADED = False
 
 
 def ensure_builtins() -> None:
-    """Import the built-in model and profile modules once."""
+    """Import the built-in modules, models, profiles and fused pool I/O once."""
     global _LOADED
     if _LOADED:
         return
     _LOADED = True
-    for name in ("modules", "models", "profiles"):
+    for name in ("modules", "models", "profiles", "experimental"):
         with contextlib.suppress(ImportError):
             importlib.import_module(f"{__package__}.{name}")

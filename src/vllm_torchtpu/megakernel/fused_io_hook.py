@@ -16,19 +16,20 @@
 `GQAModule` and `GDNModule` never import `experimental.fused_pool_io`; when fused
 pool I/O is selected (`CacheExec.FUSED`) they call `fused_io()`, which returns
 the implementation that `experimental/fused_pool_io.py` registers on import
-(the package `__init__` imports `experimental`). Without a registered
+(loaded on the first lookup, `_builtins.ensure_builtins`). Without a registered
 implementation, `"auto"` fused selection falls back to split pool I/O
 (`fused_io_available()`), and an explicit fused build fails with
 `MegakernelConfigError`.
 
-This module depends only on `errors`, so importing the experimental helpers does
-not load any module.
+This module depends only on `errors` and `_builtins` (both stdlib at import), so
+importing the experimental helpers does not load any module.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Protocol
 
+from ._builtins import ensure_builtins
 from .errors import MegakernelConfigError
 
 if TYPE_CHECKING:
@@ -73,11 +74,13 @@ def register_fused_io(impl: FusedPoolIO) -> None:
 
 def fused_io_available() -> bool:
     """Whether a fused pool I/O implementation is registered."""
+    ensure_builtins()
     return _KEY in _REGISTRY
 
 
 def fused_io() -> FusedPoolIO:
     """Return the registered fused pool I/O helpers (used under `CacheExec.FUSED`)."""
+    ensure_builtins()
     impl = _REGISTRY.get(_KEY)
     if impl is None:
         raise MegakernelConfigError(
