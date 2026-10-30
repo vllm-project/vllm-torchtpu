@@ -92,7 +92,6 @@ if TYPE_CHECKING:
     TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
-    TPU_GDN_COMPACT_INPUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -450,8 +449,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_ENABLE_GDN_DYNAMIC_TILING": env_bool(
         "TPU_ENABLE_GDN_DYNAMIC_TILING", default=False
     ),
-    # Opt in to a separate Pallas projection-to-FP32 conversion kernel.
-    "TPU_GDN_COMPACT_INPUT": env_bool("TPU_GDN_COMPACT_INPUT", default=False),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4
     # eval config turns it on, since a prefilled assistant turn needs it.

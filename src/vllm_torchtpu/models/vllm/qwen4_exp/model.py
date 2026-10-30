@@ -42,8 +42,6 @@ from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.models.qwen4_exp.common.ple import compute_ple_shard_overlap
 from vllm.v1.kv_cache_interface import MambaSpec
 
-from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.qwen4_exp.gdn_input import prepare_gdn_input
 from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
     VllmGatedDeltaNetAttention,
 )
@@ -128,9 +126,6 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 vllm_config=cfg,
                 prefix=prefix + ".linear_attn",
                 gqa_interleaved_layout=False,
-                pooled_input_preparer=(
-                    prepare_gdn_input if envs.TPU_GDN_COMPACT_INPUT else None
-                ),
             )
         else:
             self.self_attn = Qwen4ExpQSA(

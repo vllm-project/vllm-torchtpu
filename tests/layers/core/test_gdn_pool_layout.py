@@ -42,18 +42,16 @@ def test_qwen35_layout_includes_conv_tile_padding(
     assert layout.required_bytes == (ssm_tokens + conv_tokens) * 1024
 
 
-@pytest.mark.parametrize("prepared", [False, True])
 @pytest.mark.parametrize("tp_size", [1, 2])
 @pytest.mark.parametrize("adapter_bridge", [False, True])
-def test_pooled_prepares_inside_real_shard_map(
-    monkeypatch, prepared, tp_size, adapter_bridge
+def test_pooled_inputs_stay_local_inside_real_shard_map(
+    monkeypatch, tp_size, adapter_bridge
 ):
     import jax
     import jax.numpy as jnp
     import numpy as np
     from jax.sharding import PartitionSpec as P
 
-    from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput
     from vllm_torchtpu.layers.adapter.custom_ops import gdn_attention_op
     from vllm_torchtpu.layers.core import gdn_attention
 
@@ -64,12 +62,6 @@ def test_pooled_prepares_inside_real_shard_map(
     projection = jnp.arange(4 * 512 * tp_size, dtype=jnp.bfloat16).reshape(
         4, 512 * tp_size
     )
-    prepared_shapes = []
-
-    def prepare_local(values):
-        prepared_shapes.append(values.shape)
-        return Conv1DInput(values.astype(jnp.float32)[:, None, :], values.dtype)
-
     pool = jnp.zeros((3, 256, 1, 4, 256), jnp.int8)
     specs, state_inputs = [], []
     shard_map = jax.shard_map
@@ -84,9 +76,8 @@ def test_pooled_prepares_inside_real_shard_map(
         assert kwargs["conv_dtype"] == jnp.dtype(jnp.float32)
         assert kwargs["recurrent_dtype"] == jnp.dtype(jnp.float32)
         state_inputs.append(states.shape)
-        values = inputs.values[:, 0] if isinstance(inputs, Conv1DInput) else inputs
-        dtype = inputs.output_dtype if isinstance(inputs, Conv1DInput) else inputs.dtype
-        return states, values[:, :256].astype(dtype)
+        assert inputs.shape == (4, 512)
+        return states, inputs[:, :256]
 
     monkeypatch.setattr(jax, "shard_map", record_map)
     monkeypatch.setattr(gdn_attention.gdn_v3_wrapper, "fused_conv1d_gdn", fused)
@@ -115,12 +106,10 @@ def test_pooled_prepares_inside_real_shard_map(
         kernel_size=4,
         pool_block_tokens=256,
         mesh=mesh,
-        prepare_input=prepare_local if prepared else None,
         recurrent_state_dtype=jnp.float32,
     )
     assert state_inputs and len(specs) == 1
     assert specs[0] == P(None, "model")
-    assert prepared_shapes == ([(4, 512)] if prepared else [])
     assert output.dtype == projection.dtype
     expected = (
         np.asarray(projection).reshape(4, tp_size, 512)[:, :, :256].reshape(4, -1)

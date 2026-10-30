@@ -80,23 +80,16 @@ class TestTpuCompilerCache:
         assert base != different_prefix
         assert base != different_mamba
 
-    @pytest.mark.parametrize(
-        "name,first,second",
-        [
-            ("ONEHOT_MOE_PERMUTE_THRESHOLD", "0", "4096"),
-            ("TPU_GDN_COMPACT_INPUT", "0", "1"),
-        ],
-    )
-    def test_tpu_hash_covers_plugin_compile_env(self, name, first, second):
+    def test_tpu_hash_covers_plugin_compile_env(self):
         from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
 
         with patch(
             "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
             return_value=[],
         ):
-            with patch.dict(os.environ, {name: first}):
+            with patch.dict(os.environ, {"ONEHOT_MOE_PERMUTE_THRESHOLD": "0"}):
                 disabled = compute_tpu_compilation_hash(self._config())
-            with patch.dict(os.environ, {name: second}):
+            with patch.dict(os.environ, {"ONEHOT_MOE_PERMUTE_THRESHOLD": "4096"}):
                 enabled = compute_tpu_compilation_hash(self._config())
 
         assert disabled != enabled
@@ -205,7 +198,6 @@ class TestTpuCompilerCache:
         assert {
             "vllm_torchtpu/kernels/quantized_matmul/blockwise_kernel.py",
             "vllm_torchtpu/kernels/pool_adapters.py",
-            "vllm_torchtpu/kernels/qwen4_exp/gdn_input.py",
             "vllm_torchtpu/models/vllm/qwen4_exp/ple_offload.py",
             "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
             "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
@@ -214,11 +206,10 @@ class TestTpuCompilerCache:
     @pytest.mark.parametrize(
         "relative",
         [
-            "vllm_torchtpu/kernels/qwen4_exp/gdn_input.py",
             "vllm_torchtpu/models/vllm/qwen4_exp/ple_offload.py",
         ],
     )
-    def test_runtime_hash_tracks_pooled_input_preparer_source(self, tmp_path, relative):
+    def test_runtime_hash_tracks_host_lookup_source(self, tmp_path, relative):
         from vllm_torchtpu.compilation import tpu_compiler
 
         relative = Path(relative)
