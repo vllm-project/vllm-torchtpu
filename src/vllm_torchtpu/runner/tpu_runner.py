@@ -631,6 +631,7 @@ class TPUModelRunner(GPUModelRunner):
     # Default for a runner built without __init__.
     _pp_wave: PPWave | None = None
     _dp_step_other_decode: bool = False
+    _native_kv_cache_owner: utils.NativeKVCacheLayer | None = None
 
     @property
     def _async_drafter(self) -> DFlashProposer | Eagle3Proposer:
@@ -1130,6 +1131,7 @@ class TPUModelRunner(GPUModelRunner):
         self._token_padding_state: token_padding.TokenPaddingState | None = None
         # Set at load when TPU_GREEDY_TOP_TOKENS is on.
         self._greedy_head_owner: torch.nn.Module | None = None
+        self._native_kv_cache_owner: utils.NativeKVCacheLayer | None = None
 
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank)
@@ -2241,7 +2243,10 @@ class TPUModelRunner(GPUModelRunner):
         """Whether the attention-shaped unified KV block pool is active
         and allocated.
         """
-        return bool(getattr(self, "kv_cache_raw_tensors", None))
+        return bool(
+            getattr(self, "_native_kv_cache_owner", None) is None
+            and getattr(self, "kv_cache_raw_tensors", None)
+        )
 
     def _apply_kv_cache_block_copies(self, copies) -> None:
         """Copy CoW blocks within each unified pool buffer page-locally.
@@ -2665,6 +2670,10 @@ class TPUModelRunner(GPUModelRunner):
             req_state.prev_num_draft_len = 0
         self._install_spec_token_room_guard()
         copies = scheduler_output.kv_cache_block_copies
+        if copies and getattr(self, "_native_kv_cache_owner", None) is not None:
+            raise NotImplementedError(
+                "CoW block copies are unsupported on custom NativeKVCacheLayer pools"
+            )
         use_page_local_copy = bool(copies and self.is_unified_pool_used())
         # Per-layer (non-pooled) attention caches, e.g. DCP fine-grained
         # prefix hits on an MLA model: copy with the same donating program.

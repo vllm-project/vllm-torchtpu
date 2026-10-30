@@ -87,7 +87,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner.kv_cache_dsv4 import DsV4KVCacheAllocator
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import NativeKVCacheLayer, synchronize_tensors
 
 if TYPE_CHECKING:
     from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
@@ -268,7 +268,9 @@ class KVCacheManager:
                     kv_cache_spec[layer_name] = spec
             # DSv4's attention, SWA, compressor and indexer caches all build
             # their own specs, as the reference does.
-            elif is_cache_for_ds_v4(attn_module):
+            elif is_cache_for_ds_v4(attn_module) or isinstance(
+                attn_module, NativeKVCacheLayer
+            ):
                 ds_v4_layers.add(layer_name)
                 spec = attn_module.get_kv_cache_spec(self.runner.vllm_config)
                 if spec is not None:
@@ -1474,13 +1476,32 @@ class KVCacheManager:
                 return spec.kv_cache_specs[layer_name]
             return spec
 
+        forward_context = (
+            self.runner.vllm_config.compilation_config.static_forward_context
+        )
+        native_layers = [
+            layer
+            for name in layer_name_to_spec
+            if isinstance(layer := forward_context.get(name), NativeKVCacheLayer)
+        ]
+        if 0 < len(native_layers) < len(layer_name_to_spec):
+            non_native = [
+                name
+                for name in layer_name_to_spec
+                if not isinstance(forward_context.get(name), NativeKVCacheLayer)
+            ]
+            raise NotImplementedError(
+                "Mixed NativeKVCacheLayer and non-native KV cache layers are "
+                f"not supported; non-native layers: {non_native}. Wrap all "
+                "KV-bearing layers in NativeKVCacheLayer subclasses."
+            )
+        use_native_kv = bool(native_layers)
         # DSv4's packed layout and cache overlays are handled entirely in
         # `_initialize_ds_v4_kv_cache`, so the loop below stays DSv4-free.
         # TODO(patemotter): replace per-model flags (`_unified_kv_layout`,
         # `_is_ds_v4`) with per-layout allocation dispatch around a shared tail.
-        _is_ds_v4 = any(
-            is_cache_for_ds_v4(module)
-            for module in self.runner.vllm_config.compilation_config.static_forward_context.values()  # noqa: E501
+        _is_ds_v4 = not use_native_kv and any(
+            is_cache_for_ds_v4(module) for module in forward_context.values()
         )
 
         # ---- Block-major KV Cache Initialization (VLLM_TPU_BLOCK_MAJOR_KV) ----
@@ -1499,6 +1520,7 @@ class KVCacheManager:
         # cross-layout cache corruption.
         self.runner._kv_cache_bundle = None
         self.runner._kv_cache_bundle_layer_index = {}
+        self.runner._native_kv_cache_owner = native_layers[0] if use_native_kv else None
         bundle_view_by_name: dict[str, torch.Tensor] = {}
         use_block_major = bool(envs.VLLM_TPU_BLOCK_MAJOR_KV)
         if use_block_major:
@@ -1509,6 +1531,8 @@ class KVCacheManager:
                 unsupported = "hybrid attention+mamba models"
             elif _is_ds_v4:
                 unsupported = "the DSv4 packed KV layout"
+            elif use_native_kv:
+                unsupported = "native KV cache layers"
             elif self.runner.parallel_config.prefill_context_parallel_size > 1:
                 unsupported = "prefill context parallelism"
             elif self.runner.parallel_config.pipeline_parallel_size > 1:
@@ -1585,7 +1609,18 @@ class KVCacheManager:
                 bundle.dtype,
             )
 
-        if _is_ds_v4:
+        native_materialized = None
+        if use_native_kv:
+            native_materialized = native_layers[0].materialize_kv_caches(
+                kv_cache_config,
+                self.runner.device,
+                self.runner.cache_config.get_resolved_kv_cache_layout(),
+            )
+            kv_caches.update(native_materialized.kv_caches)
+            self.runner.kv_cache_raw_tensors = native_materialized.raw_tensors
+            if native_materialized.raw_tensors:
+                synchronize_tensors(native_materialized.raw_tensors)
+        elif _is_ds_v4:
             self.ds_v4._initialize_ds_v4_kv_cache(
                 kv_cache_config, _per_layer_spec, kv_caches, kv_cache_config.num_blocks
             )
@@ -1635,7 +1670,12 @@ class KVCacheManager:
             return caches
 
         shared_attention_caches: dict[tuple[int, int], torch.Tensor] = {}
-        if share_attention_regions and not use_block_major and not _is_ds_v4:
+        if (
+            share_attention_regions
+            and not use_block_major
+            and not _is_ds_v4
+            and not use_native_kv
+        ):
             region_specs: dict[tuple[int, int], list[tuple[str, KVCacheSpec]]] = {}
             for tensor in kv_cache_config.kv_cache_tensors:
                 for index, name in enumerate(tensor.layers):
@@ -1670,7 +1710,9 @@ class KVCacheManager:
                     device=self.runner.device,
                 )
 
-        for kv_cache_tensor in [] if _is_ds_v4 else kv_cache_config.kv_cache_tensors:
+        for kv_cache_tensor in (
+            [] if (_is_ds_v4 or use_native_kv) else kv_cache_config.kv_cache_tensors
+        ):
             # Each descriptor names layers within the whole backing allocation;
             # its size is not a per-layer budget. TPU's separate typed caches
             # use the scheduler's block count and the normalized page geometry.
@@ -1793,7 +1835,7 @@ class KVCacheManager:
         # Reset kv_caches list (tpu_bind_kv_cache expects empty list)
         self.runner.kv_caches = []
 
-        if not use_block_major and not _is_ds_v4:
+        if not use_block_major and not _is_ds_v4 and not use_native_kv:
             check_kv_caches_cover_block_ids(
                 kv_caches,
                 kv_cache_config.kv_cache_tensors,
@@ -1805,8 +1847,23 @@ class KVCacheManager:
         # This is the native vLLM pattern and avoids the 'layer_id' attribute error
         utils.tpu_bind_kv_cache(
             kv_caches,
-            self.runner.vllm_config.compilation_config.static_forward_context,
+            forward_context,
             self.runner.kv_caches,
+            native_raw_cache=(
+                native_materialized.native_raw_cache
+                if native_materialized is not None
+                else None
+            ),
+            native_cache_layouts=(
+                native_materialized.native_cache_layouts
+                if native_materialized is not None
+                else None
+            ),
+            native_rope_pools=(
+                native_materialized.rope_pools
+                if native_materialized is not None
+                else None
+            ),
         )
 
         # Pre-build and cache bundled RPA kernels across all attention layers before

@@ -315,7 +315,10 @@ def _ep_dp_worker(monkeypatch, dp_size, expert_parallel, local, peer):
     worker.parallel_config = SimpleNamespace(
         data_parallel_size=1, enable_expert_parallel=expert_parallel
     )
-    worker.vllm_config = SimpleNamespace(kv_transfer_config=None)
+    worker.vllm_config = SimpleNamespace(
+        kv_transfer_config=None,
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
     worker.devices = []
     worker.model_runner = MagicMock(is_pooling_model=False)
     return worker

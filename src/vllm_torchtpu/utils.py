@@ -16,7 +16,7 @@ import os
 import time
 from collections.abc import Callable, Mapping, Sequence
 from functools import wraps
-from typing import Any, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import jax
 import torch
@@ -26,6 +26,10 @@ from vllm import utils
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
 GBYTES = 1024 * 1024 * 1024
 TPU_HEAD_SIZE_ALIGNMENT = 128
@@ -296,13 +300,108 @@ def time_function(func):
     return wrapper
 
 
+RawCachePool = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+
+
+class NativeKVCacheMaterialization(NamedTuple):
+    """Materialized KV cache buffers and pool descriptors for native TPU layers.
+
+    Unlike `kv_cache_materializer.MaterializedKVCache` (which tracks unified
+    single-tensor byte pools and `BlockMajorPoolLayout`), this tuple carries
+    typed `RawCachePool` entries (including split-page `(nope, rope)` tuples),
+    per-layer axis-order tuples, and optional companion RoPE pools consumed by
+    `tpu_bind_kv_cache`.
+    """
+
+    kv_caches: dict[str, torch.Tensor]
+    raw_tensors: list[torch.Tensor]
+    native_raw_cache: Mapping[str, RawCachePool] | None = None
+    native_cache_layouts: Mapping[str, tuple[Any, ...]] | None = None
+    rope_pools: Mapping[str, RawCachePool] | None = None
+
+
+class NativeKVCacheLayer:
+    """Protocol mixin for layers that materialize native TPU KV pools.
+
+    All KV-bearing layers in a model using `NativeKVCacheLayer` must inherit
+    from this mixin. During worker memory profiling and runner KV cache
+    initialization, the first `NativeKVCacheLayer` encountered in
+    `compilation_config.static_forward_context` iteration order is invoked once
+    on behalf of the whole model:
+    - `reserve_companion_memory` adjusts the available HBM budget before block
+      count derivation (e.g. for companion pools not sized by `KVCacheSpec`).
+    - `materialize_kv_caches` allocates the backing pools for all native layers
+      and returns a `NativeKVCacheMaterialization` whose `kv_caches` mapping
+      covers every layer name in `kv_cache_config`, and whose optional
+      `native_raw_cache` and `native_cache_layouts` mappings (when provided)
+      contain an entry for every bound `NativeKVCacheLayer` name (`rope_pools`
+      maps only layers that own a companion RoPE pool).
+    """
+
+    def bind_kv_cache(
+        self,
+        cache: Any,
+        *,
+        raw_cache: Any = None,
+        layout: Any = None,
+        rope_pool: Any = None,
+    ) -> None:
+        """Bind materialized KV cache views and raw pool descriptors to this layer.
+
+        Args:
+            cache: Primary per-layer KV cache tensor or sequence of views.
+            raw_cache: Optional `RawCachePool` backing tensor(s) for custom ops.
+            layout: Optional axis-order descriptor tuple for `raw_cache`.
+            rope_pool: Optional companion RoPE `RawCachePool` for split-page MLA.
+        """
+        self.kv_cache = cache
+        self._tpu_raw_cache = raw_cache
+        self._tpu_cache_layout = layout
+        self._tpu_rope_pool = rope_pool
+
+    def get_kv_cache_spec(self, vllm_config: "VllmConfig") -> "KVCacheSpec | None":
+        """Return the vLLM `KVCacheSpec` for this layer, or `None` if uncached."""
+        raise NotImplementedError
+
+    def materialize_kv_caches(
+        self,
+        kv_cache_config: "KVCacheConfig",
+        device: torch.device,
+        layout: Any,
+    ) -> NativeKVCacheMaterialization:
+        """Allocate backing KV cache pools for all native layers in the model."""
+        raise NotImplementedError
+
+    def reserve_companion_memory(
+        self,
+        vllm_config: "VllmConfig",
+        available: int,
+        *,
+        auto: bool = False,
+    ) -> int:
+        """Adjust available HBM bytes (`available`) for companion cache pools."""
+        return available
+
+    def zero_blocks(self, block_ids: Sequence[int]) -> None:
+        """Zero newly claimed logical KV cache block IDs across backing pools."""
+        del block_ids
+
+
 def tpu_bind_kv_cache(
     kv_caches: Mapping[str, torch.Tensor | Sequence[torch.Tensor]],
     forward_context: dict[str, Any],
     runner_kv_caches: list[torch.Tensor],
     num_attn_module: int = 1,
+    native_raw_cache: Mapping[str, RawCachePool] | None = None,
+    native_cache_layouts: Mapping[str, tuple[Any, ...]] | None = None,
+    native_rope_pools: Mapping[str, RawCachePool] | None = None,
 ) -> None:
-    """Bind kv_caches to ModelRunner and forward context."""
+    """Bind materialized `kv_caches` to `runner_kv_caches` and `forward_context`.
+
+    For layers implementing `NativeKVCacheLayer`, also forwards the per-layer
+    `native_raw_cache`, `native_cache_layouts`, and optional `native_rope_pools`
+    entries via `layer.bind_kv_cache(...)`.
+    """
     assert len(runner_kv_caches) == 0
 
     from collections import defaultdict
@@ -322,7 +421,35 @@ def tpu_bind_kv_cache(
                 runner_kv_caches.append(cast(torch.Tensor, cache))
 
     for layer_name, kv_cache in kv_caches.items():
-        forward_context[layer_name].kv_cache = kv_cache
+        layer = forward_context[layer_name]
+        if isinstance(layer, NativeKVCacheLayer):
+            if native_raw_cache is not None:
+                assert layer_name in native_raw_cache, (
+                    f"Missing native_raw_cache entry for {layer_name}"
+                )
+                raw_pool = native_raw_cache[layer_name]
+            else:
+                raw_pool = None
+            if native_cache_layouts is not None:
+                assert layer_name in native_cache_layouts, (
+                    f"Missing native_cache_layouts entry for {layer_name}"
+                )
+                layout = native_cache_layouts[layer_name]
+            else:
+                layout = None
+            rope_pool = (
+                native_rope_pools.get(layer_name)
+                if native_rope_pools is not None
+                else None
+            )
+            layer.bind_kv_cache(
+                kv_cache,
+                raw_cache=raw_pool,
+                layout=layout,
+                rope_pool=rope_pool,
+            )
+        else:
+            layer.kv_cache = kv_cache
 
 
 def synchronize_device() -> None:
