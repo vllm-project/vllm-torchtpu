@@ -2301,7 +2301,7 @@ def test_mla_preprocess_keeps_prefill_parameter_abi(monkeypatch):
     assert signatures[0] == signatures[1]
 
 
-def test_mla_tp2_gate_buffer_refresh_preserves_checkpoint_parameters():
+def test_mla_tp2_gate_packer_refresh_preserves_checkpoint_parameters():
     from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
     from vllm_torchtpu.models.vllm.kimi_k3.collective_ops import FusedPrefillCollectives
 
@@ -2332,12 +2332,15 @@ def test_mla_tp2_gate_buffer_refresh_preserves_checkpoint_parameters():
     group.mla_ops = lambda eps: (pack, op)
     layer.prefill_group = group
     original = layer.fused_qkv_a_proj.weight
-    for expected in (1, 2):
+    for _ in range(2):
         layer.prepare_sp_mla_gate()
-        assert layer.mla_attn.kimi_gate_weight.item() == expected
+        # The packed gate is built inside SP prefill graphs, never cached:
+        # a persistent copy would take KV-cache HBM that decode never reads.
+        assert layer.mla_attn.kimi_gate_weight is None
+        assert layer.mla_attn.kimi_pack_gate is pack
         assert layer.mla_attn.kimi_preprocess is op
         assert layer.fused_qkv_a_proj.weight is original
-    assert all(weight is original for weight in calls)
+    assert not calls
     assert not any("kimi_gate_weight" in key for key in layer.state_dict())
 
 
@@ -2393,6 +2396,87 @@ def test_mla_wrapper_uses_global_rows_after_local_preprocessing():
     torch.testing.assert_close(
         calls[0], torch.full((64, 384), 0.5, dtype=torch.bfloat16)
     )
+
+
+def _bare_mla_wrapper():
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        VllmTPUMultiHeadLatentAttentionWrapper,
+    )
+
+    wrapper = VllmTPUMultiHeadLatentAttentionWrapper.__new__(
+        VllmTPUMultiHeadLatentAttentionWrapper
+    )
+    nn.Module.__init__(wrapper)
+    wrapper.kimi_gate_weight = None
+    wrapper.kimi_pack_gate = None
+    wrapper.num_heads = 3
+    wrapper.v_head_dim = wrapper.qk_nope_head_dim = 128
+    wrapper.qk_rope_head_dim = 64
+    wrapper.qk_head_dim = 192
+    wrapper.q_lora_rank = 1536
+    wrapper.kv_lora_rank = 512
+    wrapper.gate_is_fused = True
+    wrapper.rotary_emb = None
+    wrapper.is_sparse = False
+    wrapper.dcp_q_replicate = False
+    wrapper.dcp_group_size = 1
+    wrapper.g_proj = None
+    wrapper.q_b_proj = lambda q: (torch.zeros(q.shape[0], 576, dtype=q.dtype), None)
+    wrapper.mla_attn = lambda q, kv, rope, *, output_shape, **kwargs: torch.ones(
+        output_shape, dtype=torch.bfloat16
+    )
+    return wrapper
+
+
+def test_mla_wrapper_decode_skips_sp_preprocessing():
+    """Without a prefill group the SP-only fused preprocessing is never used."""
+    wrapper = _bare_mla_wrapper()
+
+    def preprocess(*args):
+        raise AssertionError("decode buckets must not take the SP preprocessing")
+
+    wrapper.kimi_preprocess = preprocess
+    wrapper.kimi_pack_gate = preprocess
+    projected = []
+
+    def fused_qkv_a_proj(x):
+        projected.append(x.shape)
+        return torch.zeros(x.shape[0], 2496, dtype=x.dtype), None
+
+    wrapper.fused_qkv_a_proj = fused_qkv_a_proj
+    wrapper.q_a_layernorm = nn.Identity()
+    wrapper.kv_a_layernorm = nn.Identity()
+    wrapper.o_proj = lambda x: (x[:, :7], None)
+    result = wrapper(torch.arange(4), torch.empty(4, 7168, dtype=torch.bfloat16))
+    assert projected == [(4, 7168)]
+    assert result.shape == (4, 7)
+
+
+def test_mla_wrapper_packs_the_sp_gate_inside_the_graph():
+    wrapper = _bare_mla_wrapper()
+    weight = torch.empty(7168, 2496, dtype=torch.bfloat16)
+    packed = torch.empty(7168, 6144, dtype=torch.bfloat16)
+    wrapper.fused_qkv_a_proj = SimpleNamespace(weight=weight)
+    wrapper.q_a_layernorm = SimpleNamespace(weight=torch.empty(0))
+    wrapper.kv_a_layernorm = SimpleNamespace(weight=torch.empty(0))
+    wrapper.kimi_pack_gate = lambda w: packed if w is weight else None
+    seen = []
+
+    def preprocess(x, w, gate, qnorm, kvnorm, sequence_parallel):
+        seen.append((w, gate, sequence_parallel))
+        return tuple(
+            torch.zeros(64, n, dtype=torch.bfloat16) for n in (1536, 512, 64, 384)
+        )
+
+    wrapper.kimi_preprocess = preprocess
+    group = SimpleNamespace(project_reduce_scatter=lambda x, w: x[:2])
+    wrapper(
+        torch.arange(64),
+        torch.empty(2, 7168, dtype=torch.bfloat16),
+        prefill_group=group,
+    )
+    assert len(seen) == 1
+    assert seen[0][0] is weight and seen[0][1] is packed and seen[0][2] is True
 
 
 @pytest.mark.parametrize(

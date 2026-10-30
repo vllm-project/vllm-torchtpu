@@ -371,13 +371,19 @@ class MultiHeadLatentAttention(nn.Module):
         )
 
     def prepare_sp_mla_gate(self):
-        """Refresh the TP2 MLA gate buffer after checkpoint loading or reload."""
+        """Install the TP2 MLA gate packer after checkpoint loading or reload.
+
+        The packed gate is rebuilt inside each SP prefill graph instead of
+        being cached: a cached [7168, 6144] copy per MLA layer would cost
+        ~2 GiB of KV-cache HBM per core, and decode never reads it.
+        """
         group = self.prefill_group
         projection = self.fused_qkv_a_proj
         weight = getattr(projection, "weight", None)
         wrapper = self.mla_attn
         wrapper.kimi_preprocess = None
         wrapper.kimi_gate_weight = None
+        wrapper.kimi_pack_gate = None
         gate_fused = getattr(
             self, "gate_is_fused", getattr(self, "mla_gate_is_fused", False)
         )
@@ -394,8 +400,7 @@ class MultiHeadLatentAttention(nn.Module):
         if eps != self.kv_a_layernorm.variance_epsilon:
             raise ValueError("K3 MLA preprocessing requires matching norm epsilons")
         pack, wrapper.kimi_preprocess = group.mla_ops(eps)
-        with torch.no_grad():
-            wrapper.kimi_gate_weight = pack(weight)
+        wrapper.kimi_pack_gate = pack
 
     def forward(
         self,

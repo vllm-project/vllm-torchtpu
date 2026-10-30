@@ -568,12 +568,8 @@ def update_mla_kv_cache_jax(
         k_pe = jnp.squeeze(k_pe, axis=1)
     lkv_dim = ((kv_c_normed.shape[-1] + 127) // 128) * 128
     r_dim = ((k_pe.shape[-1] + 127) // 128) * 128
-    kv_c_padded = jnp.pad(
-        kv_c_normed, ((0, 0), (0, lkv_dim - kv_c_normed.shape[-1]))
-    )
-    k_pe_padded = jnp.pad(
-        k_pe, ((0, 0), (0, r_dim - k_pe.shape[-1]))
-    )
+    kv_c_padded = jnp.pad(kv_c_normed, ((0, 0), (0, lkv_dim - kv_c_normed.shape[-1])))
+    k_pe_padded = jnp.pad(k_pe, ((0, 0), (0, r_dim - k_pe.shape[-1])))
     kv_packed = jnp.concatenate([kv_c_padded, k_pe_padded], axis=-1)
     num_tokens = kv_packed.shape[0]
     if cache_kv.ndim == 4:
@@ -583,9 +579,7 @@ def update_mla_kv_cache_jax(
             kv_packed = jnp.pad(
                 kv_packed, ((0, 0), (0, aligned_dim - kv_packed.shape[-1]))
             )
-        _, seq_id, pos, valid = _row_positions(
-            num_tokens, seq_lens, query_start_loc
-        )
+        _, seq_id, pos, valid = _row_positions(num_tokens, seq_lens, query_start_loc)
         block_tables_2d = block_tables.reshape(seq_lens.shape[0], -1)
         max_pages_per_seq = block_tables_2d.shape[1]
         safe_page_idx = jnp.clip(pos // page_size, 0, max_pages_per_seq - 1)
@@ -593,23 +587,15 @@ def update_mla_kv_cache_jax(
             valid, block_tables_2d[seq_id, safe_page_idx], jnp.int32(OOB_PAGE)
         )
         slot = jnp.where(valid, pos % page_size, 0)
-        return cache_kv.at[
-            page, slot // kv_packing, slot % kv_packing
-        ].set(kv_packed)
+        return cache_kv.at[page, slot // kv_packing, slot % kv_packing].set(kv_packed)
     _, aligned_dim, page_size = cache_kv.shape
     if kv_packed.shape[-1] < aligned_dim:
-        kv_packed = jnp.pad(
-            kv_packed, ((0, 0), (0, aligned_dim - kv_packed.shape[-1]))
-        )
-    _, seq_id, pos, valid = _row_positions(
-        num_tokens, seq_lens, query_start_loc
-    )
+        kv_packed = jnp.pad(kv_packed, ((0, 0), (0, aligned_dim - kv_packed.shape[-1])))
+    _, seq_id, pos, valid = _row_positions(num_tokens, seq_lens, query_start_loc)
     block_tables_2d = block_tables.reshape(seq_lens.shape[0], -1)
     max_pages_per_seq = block_tables_2d.shape[1]
     safe_page_idx = jnp.clip(pos // page_size, 0, max_pages_per_seq - 1)
-    page = jnp.where(
-        valid, block_tables_2d[seq_id, safe_page_idx], jnp.int32(OOB_PAGE)
-    )
+    page = jnp.where(valid, block_tables_2d[seq_id, safe_page_idx], jnp.int32(OOB_PAGE))
     slot = jnp.where(valid, pos % page_size, 0)
     return cache_kv.at[page, :, slot].set(kv_packed)
 
@@ -810,12 +796,12 @@ class VllmTPUMLAAttention(MLAAttention):
 
     def _build_kv_cache_update_op(self):
         layer_id = (
-            getattr(self, "layer_name", "") or getattr(self, "prefix", "")
-        ).replace(".", "_").replace("/", "_")
-        op_name = f"pallas::mla_kv_cache_update_{layer_id}"
-        jax_op = pallas.jax_op(
-            op_name, update_mla_kv_cache_jax, donate_argnums=(0,)
+            (getattr(self, "layer_name", "") or getattr(self, "prefix", ""))
+            .replace(".", "_")
+            .replace("/", "_")
         )
+        op_name = f"pallas::mla_kv_cache_update_{layer_id}"
+        jax_op = pallas.jax_op(op_name, update_mla_kv_cache_jax, donate_argnums=(0,))
 
         def _fake(cache_kv, *args, **kwargs):
             return torch.empty_like(cache_kv)
@@ -914,6 +900,9 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             )
             assert self.g_proj is None, "Fused MLA gating cannot also use g_proj"
         self.kimi_preprocess = None
+        # Builds the K3 SP-prefill gate from fused_qkv_a_proj inside the graph
+        # when no packed copy is cached in kimi_gate_weight.
+        self.kimi_pack_gate = None
         self.register_buffer("kimi_gate_weight", None, persistent=False)
         # `Indexer` has no `register_oot` hook and is fully built by
         # `DeepseekV2MLAAttention` before this wrapper runs, so retype it in
@@ -982,14 +971,22 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         kv_lora = None
         output_gate = None
 
-        if self.kimi_preprocess is not None:
+        # The fused K3 preprocessing serves only token-sharded SP prefill;
+        # every other bucket takes the same projections as SP prefill off.
+        use_kimi_preprocess = (
+            self.kimi_preprocess is not None and prefill_group is not None
+        )
+        if use_kimi_preprocess:
+            gate_weight = self.kimi_gate_weight
+            if gate_weight is None:
+                gate_weight = self.kimi_pack_gate(self.fused_qkv_a_proj.weight)
             q_c, kv_c_normed, k_pe, output_gate = self.kimi_preprocess(
                 hidden_states,
                 self.fused_qkv_a_proj.weight,
-                self.kimi_gate_weight,
+                gate_weight,
                 self.q_a_layernorm.weight,
                 self.kv_a_layernorm.weight,
-                prefill_group is not None,
+                True,
             )
             q = self.q_b_proj(q_c)[0]
         elif self.q_lora_rank is not None:
@@ -1030,7 +1027,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
             q = self.q_proj(hidden_states)[0]
 
-        if self.kimi_preprocess is None:
+        if not use_kimi_preprocess:
             kv_c, k_pe = kv_lora.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )

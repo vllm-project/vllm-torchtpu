@@ -162,6 +162,131 @@ def graph_signature(graph: fx.GraphModule) -> tuple:
     return _signature(graph)
 
 
+def _input_spec(value: Any) -> Any:
+    """One placeholder's entry of :func:`_signature`; None when it has no value."""
+    if value is None:
+        return None
+    if not isinstance(value, torch.Tensor):
+        return type(value).__name__
+    dims = tuple("?" if isinstance(d, torch.SymInt) else int(d) for d in value.shape)
+    return (str(value.dtype), dims)
+
+
+def _placeholders(graph: fx.GraphModule) -> list[tuple[str, Any, Any]]:
+    """(name, input spec, SymInt expression or None) for every placeholder.
+
+    Unlike :func:`_placeholder_values` this keeps placeholders without a value,
+    so the list lines up one-to-one with the runnable's positional arguments.
+    """
+    entries = []
+    for node in graph.graph.nodes:
+        if node.op != "placeholder":
+            break
+        value = node.meta.get("example_value", node.meta.get("val"))
+        expr = value.node.expr if isinstance(value, torch.SymInt) else None
+        entries.append((node.name, _input_spec(value), expr))
+    return entries
+
+
+def _symint_at(expr: Any, size: int) -> int | None:
+    """A SymInt placeholder's value when every trace symbol takes ``size``."""
+    try:
+        expr = sympy.sympify(expr)
+        return int(expr.subs({symbol: size for symbol in expr.free_symbols}))
+    except (TypeError, ValueError, AttributeError, sympy.SympifyError):
+        return None
+
+
+def _output_spec(graph: fx.GraphModule) -> tuple:
+    """Input-spec-style description of what the graph returns."""
+    for node in graph.graph.nodes:
+        if node.op != "output":
+            continue
+        outputs = node.args[0] if node.args else ()
+        if not isinstance(outputs, (tuple, list)):
+            outputs = (outputs,)
+        return tuple(
+            _input_spec(item.meta.get("example_value", item.meta.get("val")))
+            if isinstance(item, fx.Node)
+            else type(item).__name__
+            for item in outputs
+        )
+    return ()
+
+
+def _outputs_match(stored: tuple, current: tuple) -> bool:
+    """Same outputs, a dim symbolic in one trace matching any size in the other."""
+
+    def match(a: Any, b: Any) -> bool:
+        if not (isinstance(a, tuple) and isinstance(b, tuple)):
+            return a == b
+        (a_dtype, a_dims), (b_dtype, b_dims) = a, b
+        return (
+            a_dtype == b_dtype
+            and len(a_dims) == len(b_dims)
+            and all(x == y or "?" in (x, y) for x, y in zip(a_dims, b_dims))
+        )
+
+    return len(stored) == len(current) and all(map(match, stored, current))
+
+
+# Dynamo names a lifted input after its source (``L['x']`` -> ``l_x_``, a
+# parameter -> ``l_self_modules_..._parameters_weight_``), which is the same in
+# every trace. Placeholders without the prefix are values a split graph passes
+# between its pieces, whose names carry no identity across traces.
+_SOURCE_PREFIX = "l_"
+
+
+def _argument_adapter(
+    stored: list[tuple[str, Any, Any]],
+    current: list[tuple[str, Any, Any]],
+    size: int | None,
+) -> list[tuple[bool, Any]] | None:
+    """How to build a stored runnable's arguments from the current graph's.
+
+    Two traces of one model can lift their inputs differently: one keeps a
+    SymInt for the token count that the other folded away, or a branch reads
+    the parameters in another order, or only a subset of them. Parameters and
+    model inputs keep their Dynamo source names across traces, so a stored
+    tensor input is taken from the current input of the same name and spec.
+    A stored SymInt input is a function of the trace symbols, and for a
+    single-size bucket every symbol is that size (the substitution vLLM's
+    ``create_concrete_args`` makes), so it is passed as a constant.
+
+    Returns ``(True, index)`` / ``(False, constant)`` per stored argument, or
+    None when some stored input has no counterpart.
+    """
+    if size is None:
+        return None
+    by_name = {
+        name: (index, spec)
+        for index, (name, spec, expr) in enumerate(current)
+        if expr is None and name.startswith(_SOURCE_PREFIX)
+    }
+    plan: list[tuple[bool, Any]] = []
+    for name, spec, expr in stored:
+        if expr is not None:
+            value = _symint_at(expr, size)
+            if value is None:
+                return None
+            plan.append((False, value))
+            continue
+        found = by_name.get(name)
+        if found is None or found[1] != spec:
+            return None
+        plan.append((True, found[0]))
+    return plan
+
+
+def _adapt(runnable: Callable[..., Any], plan: list[tuple[bool, Any]]):
+    def adapted(*args: Any) -> Any:
+        return runnable(
+            *(args[value] if from_input else value for from_input, value in plan)
+        )
+
+    return adapted
+
+
 # ---------------------------------------------------------------------------
 # Handing a bucket from the trace that cannot serve it to the one that can
 # ---------------------------------------------------------------------------
@@ -178,26 +303,47 @@ class BucketExecutables:
     """
 
     def __init__(self) -> None:
-        self._runnables: dict[tuple[str, str], tuple[Callable[..., Any], tuple]] = {}
+        self._runnables: dict[
+            tuple[str, str],
+            tuple[Callable[..., Any], tuple, list[tuple[str, Any, Any]], tuple],
+        ] = {}
         self.refused: set[int] = set()
         self.traces = 0
 
     def get(
-        self, cache_dir: str, key: str, graph: fx.GraphModule
+        self,
+        cache_dir: str,
+        key: str,
+        graph: fx.GraphModule,
+        size: int | None = None,
     ) -> Callable[..., Any] | None:
         found = self._runnables.get((cache_dir, key))
         if found is None:
             return None
-        runnable, signature = found
-        if signature != _signature(graph):
-            raise ShapeSpecializationError(
-                f"{key} was compiled by another trace of this model whose "
-                f"inputs differ ({signature} vs {_signature(graph)}). The "
-                "graph is split, so its subgraph boundaries move with the "
-                "specialization and a bucket cannot be handed between traces; "
-                "unset TPU_KERNEL_ITER_MODE to serve this model."
+        runnable, signature, stored, outputs = found
+        if signature == _signature(graph):
+            return runnable
+        plan = (
+            _argument_adapter(stored, _placeholders(graph), size)
+            if _outputs_match(outputs, _output_spec(graph))
+            else None
+        )
+        if plan is not None:
+            logger.info(
+                "[shape-variants] %s: adapting %d inputs of the current trace "
+                "to the %d inputs of the trace that compiled it",
+                key,
+                len(_placeholders(graph)),
+                len(plan),
             )
-        return runnable
+            return _adapt(runnable, plan)
+        raise ShapeSpecializationError(
+            f"{key} was compiled by another trace of this model whose "
+            f"inputs differ ({signature} vs {_signature(graph)}). The "
+            "graph is split, so its subgraph boundaries move with the "
+            "specialization and a bucket cannot be handed between traces; "
+            "unset TPU_KERNEL_ITER_MODE to serve this model."
+        )
 
     def put(
         self,
@@ -206,7 +352,12 @@ class BucketExecutables:
         graph: fx.GraphModule,
         runnable: Callable[..., Any],
     ) -> None:
-        self._runnables[(cache_dir, key)] = (runnable, _signature(graph))
+        self._runnables[(cache_dir, key)] = (
+            runnable,
+            _signature(graph),
+            _placeholders(graph),
+            _output_spec(graph),
+        )
 
     def needs_retrace(self, size: int) -> bool:
         """Whether a graph refused this bucket and no trace has built it yet.
@@ -247,7 +398,7 @@ def runnable_for(
     Refusing here leaves the bucket to the trace that owns it, which is the
     only one that can rebuild a wrapper matching the executable.
     """
-    ready = _session.get(cache_dir, key, graph) if _session else None
+    ready = _session.get(cache_dir, key, graph, size) if _session else None
     if ready is not None:
         logger.info("[shape-variants] %s handed over by an earlier trace", key)
         return ready

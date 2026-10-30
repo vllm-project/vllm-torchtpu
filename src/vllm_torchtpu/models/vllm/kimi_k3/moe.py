@@ -133,14 +133,19 @@ class KimiMoE(nn.Module):
         self.shared_group = None
         self.latent_sp_group = None
         self.pipe_chunks = int(os.environ.get("TPU_K3_MOE_PIPE_CHUNKS", "1"))
-        if envs.TPU_K3_SP_PREFILL:
+        self.sp_prefill = bool(envs.TPU_K3_SP_PREFILL)
+        if self.sp_prefill:
             self.prefill_group = FusedPrefillCollectives(prefix)
-            self.shared_group = get_intra_chip_group()
-            if self.shared_group is None or self.shared_group.world_size != 2:
+            chip_group = get_intra_chip_group()
+            if chip_group is None or chip_group.world_size != 2:
                 raise ValueError("K3 SP prefill needs a physical two-core chip group")
             # The intra-chip latent projections see token-sharded inputs here;
             # gather tokens through the custom op, which lowers symbolically.
-            self.latent_sp_group = TokenShardCollectives(self.shared_group)
+            self.latent_sp_group = TokenShardCollectives(chip_group)
+            # Shared experts stay TP32-sharded exactly as without SP prefill
+            # (shared_group None): a chip-local TP2 copy would replicate them
+            # on every chip, costing KV-cache HBM and decode weight reads. SP
+            # batches gather their tokens over TP32 inside KimiMLP instead.
         elif (
             self.use_ep
             and self.tp_size >= 8
@@ -269,10 +274,11 @@ class KimiMoE(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, sequence_parallel: bool = False
     ) -> torch.Tensor:
-        if (
-            sequence_parallel
-            or self.prefill_group is not None
-            or self.shared_group is not None
+        # Under SP prefill only the token-sharded buckets take the EP path;
+        # every other bucket runs the same fused MoE as SP prefill off.
+        if sequence_parallel or (
+            not getattr(self, "sp_prefill", False)
+            and (self.prefill_group is not None or self.shared_group is not None)
         ):
             return self._forward_expert_parallel(hidden_states, sequence_parallel)
         num_tokens, hidden_size = hidden_states.shape

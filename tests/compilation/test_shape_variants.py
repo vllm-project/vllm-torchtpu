@@ -146,6 +146,53 @@ class FakeTpuBackend:
         return FakeExecutable(rows, waves)
 
 
+@support_torch_compile(dynamic_arg_dims={"x": 0})
+class BranchParamModel(nn.Module):
+    """Each branch lifts a different set and order of parameters.
+
+    The small-token branch reads ``b`` then ``c`` and builds a token-count
+    tensor (so its trace keeps a SymInt input); the large one reads ``a``,
+    ``c`` and ``b``. This is the shape of K3 SP prefill vs decode buckets.
+    """
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+        self.a = nn.Parameter(torch.ones(HIDDEN, HIDDEN))
+        self.b = nn.Parameter(torch.ones(HIDDEN, 3))
+        self.c = nn.Parameter(torch.ones(3, HIDDEN))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[0] >= 2048:
+            return WAVE(x @ self.a) + (x @ self.c.T) @ self.b.T
+        rows = torch.arange(x.shape[0], dtype=x.dtype).unsqueeze(1)
+        return WAVE(x) + (x @ self.b) @ self.c + rows
+
+
+@dataclasses.dataclass
+class ArgCheckingExecutable(FakeExecutable):
+    """Also checks it is called with the inputs of the graph it was built for."""
+
+    expected: tuple = ()
+
+    def __call__(self, *args):
+        got = tuple(
+            tuple(a.shape) if isinstance(a, torch.Tensor) else type(a).__name__
+            for a in args
+        )
+        assert got == self.expected, (got, self.expected)
+        return super().__call__(*args)
+
+
+class ArgCheckingBackend(FakeTpuBackend):
+    def __call__(self, graph: fx.GraphModule, example_inputs):
+        fake = super().__call__(graph, example_inputs)
+        expected = tuple(
+            tuple(t.shape) if isinstance(t, torch.Tensor) else type(t).__name__
+            for t in example_inputs
+        )
+        return ArgCheckingExecutable(fake.rows, fake.waves, expected)
+
+
 @dataclasses.dataclass
 class Starts:
     """Traces vs artifact reloads.
@@ -414,6 +461,26 @@ def _split_graph_is_refused(cache_root):
 
 def test_split_graph_cannot_hand_buckets_between_traces(tmp_path):
     in_child(partial(_split_graph_is_refused, str(tmp_path)))
+
+
+def _traces_with_different_inputs_hand_buckets_over(cache_root):
+    config, _ = prepare(cache_root)
+    backend = ArgCheckingBackend()
+    tpu_compiler._tpu_backend = backend
+    model = build(BranchParamModel, config)
+    assert warm(model, config) == 1
+    assert [rows for rows, _ in backend.compiled] == BUCKETS
+
+    # The live graph is the large-bucket trace; the 16-token bucket it adopted
+    # still gets exactly the inputs of the trace that compiled it.
+    CALLS.clear()
+    for num_tokens in (16, 2048, 4096, 16):
+        assert run(model, config, num_tokens).shape[0] == num_tokens
+    assert [rows for rows, _ in CALLS] == [16, 2048, 4096, 16]
+
+
+def test_traces_with_different_inputs_hand_buckets_over(tmp_path):
+    in_child(partial(_traces_with_different_inputs_hand_buckets_over, str(tmp_path)))
 
 
 def _warm_start_reuses_the_cache(cache_root):
