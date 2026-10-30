@@ -126,11 +126,25 @@ def test_each_range_has_one_owner_per_host(compile_all_ranges, monkeypatch):
 
 
 def test_other_ranges_wait_for_their_owner(compile_all_ranges, monkeypatch):
+    monkeypatch.delenv("TPU_PRECOMPILE_PEER_WAIT_S", raising=False)
     calls = _compile(compile_all_ranges, monkeypatch, 0)
     assert calls == [(4096, 0.0)] + [
-        (end, tpu_compiler.PEER_WAIT_S)
-        for end in [32, 64, 128, 256, 512, 1024, 2048, 16]
+        (end, 600.0) for end in [32, 64, 128, 256, 512, 1024, 2048, 16]
     ]
+
+
+def test_peer_wait_is_configurable(compile_all_ranges, monkeypatch):
+    monkeypatch.setenv("TPU_PRECOMPILE_PEER_WAIT_S", "1800")
+    calls = _compile(compile_all_ranges, monkeypatch, 0)
+    assert {wait for _, wait in calls[1:]} == {1800.0}
+
+
+def test_negative_peer_wait_is_rejected(monkeypatch):
+    from vllm_torchtpu import envs
+
+    monkeypatch.setenv("TPU_PRECOMPILE_PEER_WAIT_S", "-1")
+    with pytest.raises(ValueError, match="TPU_PRECOMPILE_PEER_WAIT_S"):
+        _ = envs.TPU_PRECOMPILE_PEER_WAIT_S
 
 
 def test_every_rank_compiles_every_range(compile_all_ranges, monkeypatch):

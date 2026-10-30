@@ -83,14 +83,11 @@ class TpuCompilationHandle:
 
 _tpu_backend = TpuBackend()
 
-# How long a rank waits for the rank of its host that compiles a bucket, and
-# how often it looks. The wait is bounded for a peer that never saves the
-# artifact (its serialize() failed, it crashed, or it does not exist); the rank
-# then compiles the bucket itself. A single bucket compiles in well under this
-# even with every rank of the host compiling at once (~165 s for the biggest
-# Qwen3.5-397B bucket at DP8), so a timeout costs one redundant compile rather
-# than stalling startup for an hour.
-PEER_WAIT_S = 600.0
+# How often a rank looks for the artifact of the rank of its host that compiles
+# a bucket. How long it waits is TPU_PRECOMPILE_PEER_WAIT_S (default 600 s):
+# the wait is bounded for a peer that never saves the artifact (its serialize()
+# failed, it crashed, or it does not exist); the rank then compiles the bucket
+# itself.
 _PEER_POLL_S = 0.5
 # get_attr tensors up to this size are hashed by value; bigger ones, which are
 # weights rather than constants, by dtype and shape.
@@ -198,6 +195,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_PARALLEL_PRECOMPILE",
     "TPU_PRECOMPILE_BIGGEST_FIRST",
     "TPU_PRECOMPILE_PEER_REPLAY",
+    "TPU_PRECOMPILE_PEER_WAIT_S",
     # KV-transfer wiring: ports, socket paths, staging pool, pool sizes,
     # timeouts. Same reasoning as the Raiden group above. Every registry
     # entry not named here joins the cache key, so omitting these would

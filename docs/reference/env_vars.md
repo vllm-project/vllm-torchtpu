@@ -12,6 +12,7 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `VLLM_XLA_CHECK_RECOMPILATION` | `False` | Logs or raises when an unexpected XLA graph recompilation occurs after warmup. |
 | `TPU_PARALLEL_PRECOMPILE` | `False` | Enables parallel compilation during model warmup. |
 | `TPU_PRECOMPILE_PEER_REPLAY` | `False` | With `TPU_PARALLEL_PRECOMPILE`, each compile range is compiled by one rank of the host and replayed by the others from vLLM's compile cache. Requires the compile cache: startup fails with `VLLM_DISABLE_COMPILE_CACHE=1` (point `VLLM_CACHE_ROOT` at a temporary directory for a cold start with nothing kept across runs). |
+| `TPU_PRECOMPILE_PEER_WAIT_S` | `600` | With `TPU_PRECOMPILE_PEER_REPLAY`, seconds a rank waits for a range's owner to save it before compiling the range itself. Raise it if the biggest range takes longer than this to compile. |
 | `TPU_MULTIHOST_BACKEND` | `""` (`mp` default, or `"ray"`) | Selects the multi-host execution backend (`"ray"` uses `RayDistributedExecutor`; unset uses native multiprocessing `mp`). See [Multi-Host Serving](../user_guide/multihost.md). |
 | `TORCH_TPU_BASE_PORT` | `8070` | Base TCP port for `torch_tpu` worker slice-builder communication. |
 | `TORCH_TPU_MP_RENDEZVOUS_PORT` | `None` | Optional explicit TCP port for multi-host `mp` `TCPStore` rendezvous. |
