@@ -166,8 +166,8 @@ def _cpu_proxy(m: Any, memo: dict | None = None) -> Any:
 # `VLLM_TPU_MEGAKERNEL=...,nodonate=1`: the GDN pool is not donated to the segment op; it
 # writes a fresh pool that `_run` copies back into the live cache (bisecting a served hang).
 NO_DONATE = False
-# Largest whole-step bucket: its VMEM plan fits up to 64 rows (`wholestep_tiles`).
-WHOLE_MAX_ROWS = 64
+# Largest whole-step bucket: its VMEM plan fits up to 96 rows (`wholestep_tiles`).
+WHOLE_MAX_ROWS = 96
 # Model steps after warmup (verify steps; any step once disabled) by which a `whole=1`
 # server must have made a whole-step call.
 WHOLE_SELF_CHECK_STEPS = 200
