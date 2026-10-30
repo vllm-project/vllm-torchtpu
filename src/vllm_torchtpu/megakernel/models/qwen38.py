@@ -68,7 +68,7 @@ class Qwen38InnerGeometry(Qwen35Geometry):
         R, B, T, M = ex.R, ex.B, ex.T, ex.M
         assert self.att_every > self.L or self.L % self.att_every == 0
         assert self.NH % R == 0 and R % self.NKV == 0
-        assert self.E % R == 0 and B * self.TOPK <= 640 and 1 <= B <= M <= 64
+        assert self.E % R == 0 and B * self.TOPK <= 1280 and 1 <= B <= M <= 128
         assert self.E % 128 == 0 and self.E <= 1024 and (R & (R - 1)) == 0
         assert T >= 1 and B % T == 0, (B, T)
         for n in (self.H, self.HD, self.IR(R), self.ISR(R)):
