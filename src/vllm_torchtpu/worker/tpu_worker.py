@@ -768,6 +768,9 @@ class TPUWorker(WorkerBase):
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
         set_torch_threads_for_runtime()
+        from vllm_torchtpu.runner import hostmem_release
+
+        hostmem_release.after_warmup(self.rank)
         # The warmed worker holds a large static heap (model, compiled
         # executables, KV bookkeeping); freezing it keeps a gen-2 collection
         # from scanning those objects mid-step.

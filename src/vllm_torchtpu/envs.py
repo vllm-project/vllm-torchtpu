@@ -250,6 +250,8 @@ if TYPE_CHECKING:
     VLLM_TPU_PY_SAMPLER_S: float = 0.0
     VLLM_TPU_STAGE_ENTRIES_CACHE: bool = False
     VLLM_TPU_STALL_WATCHDOG_S: float = 0.0
+    VLLM_TPU_POST_WARMUP_HOSTMEM: str = "off"
+    VLLM_TPU_HOSTMEM_SAMPLE_S: float = 0.0
     VLLM_TPU_VERIFY_FUSED: bool = False
     VLLM_TPU_VERIFY_FUSED_CHECK: int = 0
     VLLM_TPU_VERIFY_FUSED_CHECK_FAULT: int = 0
@@ -1540,6 +1542,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Dump all processes' stacks when no step starts for N s with live
     # requests (stall_watchdog.py; read directly there, registered here).
     "VLLM_TPU_STALL_WATCHDOG_S": env_float("VLLM_TPU_STALL_WATCHDOG_S", 0.0),
+    # "release": return tcmalloc's free pages to the OS once warmup is done;
+    # runner/hostmem_release.py.
+    "VLLM_TPU_POST_WARMUP_HOSTMEM": env_str("VLLM_TPU_POST_WARMUP_HOSTMEM", "off"),
+    # >0: log host RSS / tcmalloc / pymalloc split every this many seconds.
+    "VLLM_TPU_HOSTMEM_SAMPLE_S": env_float("VLLM_TPU_HOSTMEM_SAMPLE_S", 0.0),
     # Non-greedy spec verify as one program (tpu_runner._verify_fused_impl).
     "VLLM_TPU_VERIFY_FUSED": env_bool("VLLM_TPU_VERIFY_FUSED"),
     # Compare the fused verify and draft seed with the separate programs for
