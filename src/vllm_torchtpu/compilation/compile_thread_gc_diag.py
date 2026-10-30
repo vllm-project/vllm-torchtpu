@@ -23,6 +23,7 @@ a pass thread, generation >= 1 elsewhere).
 import collections
 import gc
 import threading
+import weakref
 from typing import Any
 
 from vllm_torchtpu.logger import init_logger
@@ -95,6 +96,16 @@ def install_gc_watch() -> None:
 
 
 def _describe(obj: Any) -> str:
+    # DEBUG_SAVEALL keeps dead weakref proxies; touching one raises.
+    if type(obj) in weakref.ProxyTypes:
+        return f"dead {type(obj).__name__}"
+    try:
+        return _describe_live(obj)
+    except Exception as error:  # noqa: BLE001 - best-effort debug label
+        return f"{type(obj).__qualname__} (unprintable: {error})"
+
+
+def _describe_live(obj: Any) -> str:
     import torch
 
     if isinstance(obj, torch.Tensor):
@@ -133,10 +144,12 @@ def dump_tpu_garbage(
         gc.set_debug(previous)
     try:
         ids = {id(o) for o in garbage}
+        # issubclass(type(o)) rather than isinstance(o): the latter reads
+        # __class__ through a dead weakref proxy and raises ReferenceError.
         tensors = [
             o
             for o in garbage
-            if isinstance(o, torch.Tensor) and o.device.type == device_type
+            if issubclass(type(o), torch.Tensor) and o.device.type == device_type
         ]
         types = collections.Counter(type(o).__qualname__ for o in garbage)
         logger.info(

@@ -118,6 +118,29 @@ def test_dump_names_tensor_held_by_cycle(gc_enabled, records):
 
 
 @pytest.mark.cpu_test
+def test_dump_survives_dead_weakref_proxies(gc_enabled, records):
+    import weakref
+
+    class Target:
+        pass
+
+    class Holder:
+        pass
+
+    target = Target()
+    holder = Holder()
+    holder.self_ref = holder
+    holder.proxy = weakref.proxy(target)
+    holder.tensor = torch.zeros(2)
+    del holder, target
+
+    # The proxy is dead inside the saved garbage; inspecting it must not raise.
+    assert diag.dump_tpu_garbage("proxy", device_type="cpu") >= 1
+    assert any("phase=proxy" in r for r in records)
+    assert not gc.garbage
+
+
+@pytest.mark.cpu_test
 def test_dump_is_a_no_op_off_the_main_thread(records):
     result = []
     thread = threading.Thread(
